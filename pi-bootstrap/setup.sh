@@ -843,6 +843,42 @@ if [ -f "$SPAWN_GATE_SRC" ]; then
   cp -f "$SPAWN_GATE_SRC" "$DEST/bin/pi"
   chmod +x "$DEST/bin/pi" 2>/dev/null || true
   echo "    pi spawn-point gate installed at $DEST/bin/pi (#1884)"
+  # ── AND ITS INSTRUMENT, BESIDE IT (#2843) ────────────────────────────────────────────────
+  # The gate reads the fork floor from `capacity.sh` and ABSTAINS when it cannot find it. The
+  # installed `pi` is the path MOST launches take, and it is the one where the module was missing:
+  # measured 2026-10-25, a background worker through `nonblocking-dispatch.sh` logged the abstention
+  # 18 times in one run while the box reported 4,675 processes of headroom. So the two are installed
+  # as a PAIR — the resolver looks beside this file (after the explicit overrides), which makes the
+  # reading work with no environment variable at all; an env var is absent in a launchd/tmux/cron
+  # context while directory adjacency cannot be. A real copy, from the same source, for the #427/#1884
+  # reasons above: a symlink into a checkout dangles when the checkout moves, and a second
+  # definition could describe a different ceiling.
+  CAPACITY_SRC="$INFRA_ROOT/scripts/orchestrator-harness/capacity.sh"
+  if [ ! -f "$CAPACITY_SRC" ]; then
+    echo "ERROR: $CAPACITY_SRC is missing — the fork floor would then ABSTAIN on every launch through" >&2
+    echo "       the installed \`pi\`, which is a guard that silently does not run (#2843). Re-clone" >&2
+    echo "       agent-infra and re-run this script." >&2
+    exit 1
+  fi
+  cp -f "$CAPACITY_SRC" "$DEST/bin/capacity.sh"
+  chmod +x "$DEST/bin/capacity.sh" 2>/dev/null || true
+  echo "    fork-floor instrument installed at $DEST/bin/capacity.sh (#2843)"
+  # THE SELF-TEST, AT INSTALL TIME — the next placement drift fails HERE instead of in a WARN line
+  # nobody reads. Every resolver override is UNSET inside this subshell so what is measured is the
+  # PLACEMENT (the copy just written beside the gate), not an ambient `$O`/`$AGENT_INFRA_PATH` that
+  # would mask a broken install. `refused` PASSES: that is a real reading of a genuinely starved box,
+  # and failing the installer there would be a false block on the box that most needs the gate — the
+  # defect is `unknown`, i.e. an instrument that did not answer at all.
+  _cap_selftest="$( ( unset O SPAWN_GATE_HARNESS_DIR AGENT_INFRA_PATH
+    bash -c '. "$1"; spawn_fork_state _ss _dd; printf "%s|%s" "$_ss" "${CAP_GATE_MOD_PATH:-<none>}"' \
+      _ "$DEST/bin/pi" ) 2>/dev/null || true )"
+  case "${_cap_selftest%%|*}" in
+    ok|refused) echo "    fork-floor self-test: ${_cap_selftest%%|*} from ${_cap_selftest#*|}" ;;
+    *)
+      echo "ERROR: the INSTALLED pi cannot read its fork-floor instrument — self-test answered '${_cap_selftest%%|*}': ${_cap_selftest#*|}" >&2
+      echo "       Every \`pi\` launched through $DEST/bin/pi would silently skip the process-headroom floor (#2843)." >&2
+      exit 1 ;;
+  esac
   # A gate that is installed but NOT ahead of the real pi on PATH is a false install: it would report
   # success here while every spawn resolved past it. Say so at install time, when it is cheap to fix.
   case ":$PATH:" in

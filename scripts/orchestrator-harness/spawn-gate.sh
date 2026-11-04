@@ -1181,19 +1181,57 @@ BRIEF_GATE_SH=""
 # (a hand-copied shim, a fixture), the gate ABSTAINS and SAYS SO — the same polarity as the disk
 # probe's unreadable arm, and for the same reason: an instrument that cannot run must not be reported
 # as a refusal (that would stop every lane on a healthy box) NOR as a silent pass.
+#
+# ⛔ IT IS RESOLVED, NOT ASSUMED, AND THE SEARCH IS THE SAME EXPLICIT ONE `lane_bound_path` /
+# `brief_gate_lib` USE (#2843). The old two-candidate search (`$O`, then beside this file) found
+# nothing on THE PATH MOST LAUNCHES TAKE: installed as `pi` at `$HOME/.pi/agent/bin`, this file's own
+# directory holds no harness at all and `$O` is unset in a hand-written/interactive caller, so the
+# fork floor ABSTAINED on every such launch — MEASURED 2026-10-25 as 18 abstentions in one worker log
+# (`~/orchestrator/bg/t5163.log`) while the box reported 4,675 processes of headroom, and reproduced
+# 2026-10-28 from the installed shim itself. That is a guard that silently does not run, which is
+# #1884's defect with the volume turned down: not a refusal that is too strict, but a floor nobody
+# applies. So the instrument is looked for where an installer that ships it BESIDE the gate puts it,
+# and where the fleet's own copies already live. Order is PREFERENCE, not correctness:
+#   1. `SPAWN_GATE_HARNESS_DIR` — an explicit override for a caller that knows where its harness is
+#      (`$ORIGIN`-style relocatability, the convention an installer-shipped library follows: resolve
+#      beside the binary first, because an environment variable can be absent in a launchd/tmux/cron
+#      context while directory adjacency cannot);
+#   2. `$O` — the harness home (seeded by `install.sh`), which is what every call that sets it expects;
+#   3. BESIDE THIS FILE — where both installers now place `capacity.sh` next to the installed `pi`;
+#   4. `$AGENT_INFRA_PATH/scripts/orchestrator-harness` — the canonical repo copy;
+#   5. `$HOME/.pi/agent/scripts` — the farmed-copy directory;
+#   6. `$HOME/orchestrator` — the harness home when `$O` was never exported.
+# The chosen path is kept in `CAP_GATE_MOD_PATH` and the MISSES in `CAP_GATE_DETAIL`, so an abstention
+# names the candidates it tried instead of printing one cause for two (#2843 item 3: "no candidate
+# holds a file" and "sourcing the file failed" used to read identically, which is a two-hour grep).
 CAP_GATE_MOD_LOADED=0
+CAP_GATE_MOD_PATH=""
+CAP_GATE_DETAIL=""
 spawn_gate_load_capacity() {
   [ "${CAP_GATE_MOD_LOADED:-0}" = "1" ] && return 0
   declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
-  local d cand=""
-  for d in "${O:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
-    [ -n "$d" ] || continue
-    [ -f "$d/capacity.sh" ] && { cand="$d/capacity.sh"; break; }
+  local c here cand="" tried=""
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${SPAWN_GATE_HARNESS_DIR:+$SPAWN_GATE_HARNESS_DIR/capacity.sh}" \
+           "${O:+$O/capacity.sh}" \
+           "${here:+$here/capacity.sh}" \
+           "${AGENT_INFRA_PATH:+$AGENT_INFRA_PATH/scripts/orchestrator-harness/capacity.sh}" \
+           "${HOME:+$HOME/.pi/agent/scripts/capacity.sh}" \
+           "${HOME:+$HOME/orchestrator/capacity.sh}"; do
+    [ -n "$c" ] || continue
+    if [ -f "$c" ]; then cand="$c"; break; fi
+    tried="$tried${tried:+, }$c"
   done
-  [ -n "$cand" ] || return 1
+  if [ -z "$cand" ]; then
+    CAP_GATE_DETAIL="no capacity.sh was found — looked in: ${tried:-<no candidate path was built>}"
+    return 1
+  fi
   # shellcheck source=/dev/null
-  . "$cand" 2>/dev/null || return 1
-  declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
+  . "$cand" 2>/dev/null || :
+  if declare -f cap_procs_pair_vars >/dev/null 2>&1; then
+    CAP_GATE_MOD_LOADED=1; CAP_GATE_MOD_PATH="$cand"; CAP_GATE_DETAIL=""; return 0
+  fi
+  CAP_GATE_DETAIL="$cand was found but did not define cap_procs_pair_vars (sourcing it failed, or it is an incomplete/old copy) — tried before it: ${tried:-none}"
   return 1
 }
 
@@ -1209,7 +1247,7 @@ spawn_fork_state() {
   local _sf_sv="${1:-}" _sf_dv="${2:-}" _sf_p="" _sf_m="" _sf_h="" _sf_prc=0 _sf_src=""
   printf -v "$_sf_sv" '%s' 'unknown'; printf -v "$_sf_dv" '%s' 'no fork reading was taken'
   if ! spawn_gate_load_capacity; then
-    printf -v "$_sf_dv" '%s' 'capacity.sh is not reachable from this spawn gate, so fork headroom was NOT read'
+    printf -v "$_sf_dv" '%s' "capacity.sh is not reachable from this spawn gate, so fork headroom was NOT read — ${CAP_GATE_DETAIL:-no candidate path holds capacity.sh}"
     return 0
   fi
   if ! cap_procs_pair_vars _sf_p _sf_m _sf_src; then
@@ -1344,7 +1382,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       echo "[fork-gate] REFUSED $label: $_fdetail — no agent was started, so nothing was consumed. A fork refusal does NOT clear by waiting: this box is out of PROCESSES (agent-infra#2293), and it cannot be cleaned up from inside. Restart it from outside, or let its lanes drain; the controller re-dispatches elsewhere." >> "$log"
       return "$AGENT_FORK_REFUSED" ;;
     unknown)
-      echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. Check that capacity.sh sits beside this gate. Proceeding (an unreadable instrument is not a refusal)." >> "$log" ;;
+      # ⛔ THE REMEDY IS NAMED, because "check that capacity.sh sits beside this gate" was advice a
+      # reader could not act on without a grep: the detail now lists every candidate that was tried
+      # (#2843 item 3), and the remedy names the two placements that make it resolve.
+      echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. Ship capacity.sh beside this gate (both installers do) or point SPAWN_GATE_HARNESS_DIR at the harness home. Proceeding (an unreadable instrument is not a refusal)." >> "$log" ;;
   esac
   dpath="${DISK_GATE_PATH:-$PWD}"
   dfree="$(disk_free_mb "$dpath")"
@@ -1736,8 +1777,15 @@ reap_lane_venv() {
 #     what a spawn is — the exact shape (`pi --print` vs `-p` vs an alias) a caller could hide
 #     behind. The rescue route is the operator's, above.
 #   * A box where neither pi-bootstrap/setup.sh nor pi-bootstrap/cell-install.sh has run has no shim.
-#     Both install it (`$DEST/bin/pi`) and the cell installer byte-compares it on `--verify`, so the
-#     state is checked rather than assumed — but it is a state, and it is stated.
+#     Both install it (`$DEST/bin/pi`) **together with `capacity.sh` beside it** (#2843: the fork floor
+#     reads that module, so a shim installed without the instrument is a floor that abstains on every
+#     launch), both self-test that the installed pair resolves a fork reading, and the cell installer
+#     byte-compares both on `--verify`, so the state is checked rather than assumed — but it is a
+#     state, and it is stated.
+#   * The instrument's SEARCH is a preference order, so a box holding two copies reads the earlier one.
+#     That is inherited from `$O`-first (the fleet's live copy) and it is why the chosen path is kept in
+#     `CAP_GATE_MOD_PATH` and printed on an abstention: "which copy answered" must be a fact an operator
+#     can read, not an inference from which directories exist.
 #   * The DISK gate (#1765) is NOT here. Its reading is per-spawn (DISK_GATE_PATH is the worktree the
 #     agent will fill), which a shim cannot know: a spawn through the shim is disk-gated only when
 #     its caller runs through run_agent() above. Named residual, and it is the reason run_agent keeps
@@ -1778,14 +1826,26 @@ pi_gate_real() { # pi_gate_real <self-path>
   return 1
 }
 
-# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> — one append-only row per pi invocation.
-# ALLOWED runs are recorded too, for the reason the disk ledger states: a series that records only
-# refusals cannot answer "how close did we get", which is the question that would have caught both
-# incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd, caller.
+# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> <fork-state> — one append-only row per pi
+# invocation. ALLOWED runs are recorded too, for the reason the disk ledger states: a series that
+# records only refusals cannot answer "how close did we get", which is the question that would have
+# caught both incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd,
+# caller, fork.
+#
+# ⛔ THE TRAILING `fork=` FIELD IS #2843's OTHER HALF, AND IT IS AN APPEND, NOT A REPLACEMENT: the
+# first ten fields keep their positions and meanings, so every reader written before this row learned
+# about it keeps working (`pi_gate_refusal_count` reads `$2`; the suites read by column). It carries
+# the FORK STATE the gate actually obtained — `ok`, `refused`, or `unknown` — because an abstention
+# used to leave no durable trace at all: it was a WARN in one worker log, so a floor that had silently
+# stopped running was invisible to any series an operator could query, while a refusal was recorded.
+# With the column present, "did the fork floor run on yesterday's launches" is a `cut`/`awk` over the
+# ledger, and the #2843 regression shows up as a run of `fork=unknown` rows instead of a grep through
+# per-worker logs. The cost of the append is one column; the cost of its absence was a guard nobody
+# could see was off.
 # It writes to $HOME/.pi/agent/state (the durable per-box state dir that already holds locks/,
 # reviews/ and audit/) rather than to `$O`, because a hand-written runner — the exact caller this
 # mode exists for — is under no obligation to have `$O` set.
-pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller>
+pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<fork-state>]
   local dir f
   [ -n "${HOME:-}" ] || return 0
   dir="$HOME/.pi/agent/state"
@@ -1801,8 +1861,8 @@ pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller>
   if [ -f "$f" ] && [ "$(wc -c < "$f" 2>/dev/null || printf '0')" -ge "$PI_GATE_LEDGER_MAX_BYTES" ]; then
     mv -f "$f" "$f.1" 2>/dev/null || :
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$(date +%s)" "${1:-}" "${2:-}" "${3:-}" "$$" "${PPID:-0}" "${KIND:-}" "${TAG:-}" "${4:-}" "${5:-}" \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$(date +%s)" "${1:-}" "${2:-}" "${3:-}" "$$" "${PPID:-0}" "${KIND:-}" "${TAG:-}" "${4:-}" "${5:-}" "fork=${6:-unknown}" \
     >> "$f" 2>/dev/null || return 0
 }
 
@@ -1855,11 +1915,11 @@ pi_shim_main() {
       "$(( n + 1 ))" "${HOME:-<no HOME>}" >&2
     printf '[pi-gate]   remedy: this box is out of PROCESSES, so waiting for load will not help. Restart or drain the BOX from outside (agent-infra#2293); operator rescue is the real pi by absolute path (%s)\n' \
       "$real" >&2
-    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
+    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller" "$_fstate"
     exit "$PI_FORK_REFUSED"
   fi
   if [ "$_fstate" = "unknown" ]; then
-    printf '[pi-gate] WARN fork headroom UNREADABLE: %s — the fork floor cannot be enforced for this launch\n' "$_fdetail" >&2
+    printf '[pi-gate] WARN fork headroom UNREADABLE: %s — the fork floor cannot be enforced for this launch (ship capacity.sh beside this gate, or set SPAWN_GATE_HARNESS_DIR; the row below records fork=unknown)\n' "$_fdetail" >&2
   fi
   if ! can_spawn "$load"; then
     n="$(pi_gate_refusal_count)"
@@ -1875,10 +1935,10 @@ pi_shim_main() {
     # fix. See STATED LIMITS.
     printf '[pi-gate]   remedy: re-dispatch when the 1-min load falls below %s; operator rescue is the real pi by absolute path (%s) or an explicit MAX_LOAD\n' \
       "$MAX_LOAD" "$real" >&2
-    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller"
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "$_fstate"
     exit "$PI_GATE_REFUSED"
   fi
-  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller"
+  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller" "$_fstate"
   exec "$real" "$@"
 }
 

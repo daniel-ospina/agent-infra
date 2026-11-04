@@ -807,19 +807,33 @@ migrate_legacy_tools_farm() {
 # before the installer's own "no checkout" refusal could print — the exact false reason run 6 of
 # pi-bootstrap/tests/test-cell-install.sh exists to catch).
 install_spawn_gate() {
-  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi"
+  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi" \
+        cap_src="$INFRA_ROOT/scripts/orchestrator-harness/capacity.sh" cap_dst="$DEST/bin/capacity.sh"
   if [ ! -f "$src" ]; then
     die "$src is missing from the checkout — the pi spawn-point gate (#1884) cannot be installed, so a hand-written runner's \`pi\` would be ungated and silent"
   fi
+  # ⛔ THE GATE AND ITS INSTRUMENT ARE ONE INSTALL (#2843). The fork floor reads `capacity.sh`; a shim
+  # installed without the module beside it ABSTAINS on every launch through it, which is the path most
+  # launches take — measured 2026-10-25 as 18 abstentions in one worker log while the box had 4,675
+  # processes of headroom. Failing the install here is deliberate: a cell with no instrument has a
+  # fork floor that never runs, and that is the defect, not a degraded mode.
+  if [ ! -f "$cap_src" ]; then
+    die "$cap_src is missing from the checkout — the spawn-point gate would be installed WITHOUT the fork-floor instrument beside it, so the process-headroom floor would silently abstain on every launch (#2843)"
+  fi
   install_file "$src" "$dst" || die "could not install $dst"
   log_line "pi spawn-point gate installed at $dst (#1884)"
+  install_file "$cap_src" "$cap_dst" || die "could not install $cap_dst"
+  log_line "fork-floor instrument installed at $cap_dst (#2843)"
 }
 
 # Check (both modes; READ-ONLY). Byte-compared, not `[ -e ]`: a stale or hand-edited copy of a GATE
 # is worse than a missing one, because the missing one is loud while the stale one certifies a
-# ceiling it no longer applies.
+# ceiling it no longer applies. The instrument is held to the SAME standard and for the same reason:
+# a `capacity.sh` that has drifted from the reviewed one measures a ceiling nobody reviewed.
 guard_spawn_gate() {
-  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi"
+  local src="$INFRA_ROOT/scripts/orchestrator-harness/spawn-gate.sh" dst="$DEST/bin/pi" \
+        cap_src="$INFRA_ROOT/scripts/orchestrator-harness/capacity.sh" cap_dst="$DEST/bin/capacity.sh" \
+        selftest=""
   if [ ! -f "$src" ]; then
     fail "$src is missing from the checkout — verify cannot vouch for the spawn-point gate it did not read"
     return 0
@@ -830,6 +844,28 @@ guard_spawn_gate() {
     fail "pi spawn-point gate DIFFERS from the checkout: $dst (a stale or hand-edited copy — the ceiling it applies is not the one this install reviewed)"
   elif [ ! -x "$dst" ]; then
     fail "pi spawn-point gate is NOT EXECUTABLE: $dst — PATH would resolve past it to the real pi, silently"
+  fi
+  # THE INSTRUMENT BESIDE IT (#2843), checked as a file AND as a behaviour: the file comparison
+  # catches drift, and the self-test catches the placement/wiring failure that a byte-identical copy
+  # in the wrong place still has. Every resolver override is unset so the reading comes from the
+  # placement under test; `refused` is a PASS (a real reading of a genuinely starved box), `unknown`
+  # is the failure this arm exists for.
+  if [ ! -f "$cap_src" ]; then
+    fail "$cap_src is missing from the checkout — verify cannot vouch for a fork-floor instrument it did not read"
+    return 0
+  fi
+  if [ ! -f "$cap_dst" ]; then
+    fail "fork-floor instrument MISSING: $cap_dst — the installed \`pi\` would ABSTAIN on every launch, so the process-headroom floor would silently never run (#2843)"
+  elif ! cmp -s "$cap_src" "$cap_dst"; then
+    fail "fork-floor instrument DIFFERS from the checkout: $cap_dst (the ceiling it measures is not the one this install reviewed)"
+  elif [ -f "$dst" ]; then
+    selftest="$( ( unset O SPAWN_GATE_HARNESS_DIR AGENT_INFRA_PATH
+      bash -c '. "$1"; spawn_fork_state _ss _dd; printf "%s|%s" "$_ss" "${CAP_GATE_MOD_PATH:-<none>}"' \
+        _ "$dst" ) 2>/dev/null || true )"
+    case "${selftest%%|*}" in
+      ok|refused) : ;;
+      *) fail "the installed spawn-point gate ABSTAINS on its fork reading (self-test answered '${selftest%%|*}': ${selftest#*|}) — the process-headroom floor would silently not run (#2843)" ;;
+    esac
   fi
 }
 

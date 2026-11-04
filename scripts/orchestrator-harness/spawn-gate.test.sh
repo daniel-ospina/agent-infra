@@ -133,11 +133,21 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # `LANE_MEM_MB` is 512, so the token pair matches. That made this shard RED on `main` for every PR
   # that rebased onto it (found while rebasing #2323: `got_pi` carried `ai-drainer.sh`). Excluded by
   # name, with its own non-launcher assertion below — the same ruling, not a second exception class.
+  # ⛔ `orphaned-harness.sh` IS THE THIRD OF THE SAME CLASS (#2940), and it arrived the same way: it
+  # DETECTS orphaned lanes by reading `ps`/`systemctl`, and it quotes the flag pair in prose when it
+  # explains what a harness lane's COMM looks like. It launches nothing. Left in the census it made this
+  # EQUALITY permanently red, which is worse than a red check: a genuinely new ungated invoker added
+  # tomorrow would produce NO CHANGE in this arm's state, so the one event it exists to catch became
+  # indistinguishable from the background red (the inert-enforcer class). Excluded by name, with the
+  # prose-stripped non-launcher proof below — the same ruling, not a fourth exception class. The
+  # broader question the issue leaves open (should `scan_pi` ignore comments altogether?) is HIS to
+  # decide, not this suite's: the exclusion list is where the detector's own STATED LIMITS paragraph
+  # already says a bystander belongs.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -203,6 +213,13 @@ _nl_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
 _nl_code="$(sed 's/#.*//' "$HERE/ai-drainer.sh" 2>/dev/null)"
 if printf '%s' "$_nl_code" | grep -qE -e "$_nl_flag" && printf '%s' "$_nl_code" | grep -qF -- '--no-session'; then rc=1; else rc=0; fi
 ck "the excluded ai-drainer.sh is a NON-launcher in CODE (it only DISPATCHES gated dispatchers; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
+# …and for orphaned-harness.sh (#2940), by the same detector predicate: `sed 's/#.*//'` removes the
+# prose that matched, and the arm goes RED the moment a real launch is added to it in code. Asserted
+# rather than asserted-in-a-comment because this exclusion switches OFF the population check for a
+# file the load-gate policy is reasoned about from.
+_nl_code_o="$(sed 's/#.*//' "$HERE/orphaned-harness.sh" 2>/dev/null)"
+if printf '%s' "$_nl_code_o" | grep -qE -e "$_nl_flag" && printf '%s' "$_nl_code_o" | grep -qF -- '--no-session'; then rc=1; else rc=0; fi
+ck "the excluded orphaned-harness.sh is a NON-launcher in CODE (it only DETECTS orphaned lanes; the pi token pair lives in its prose), so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -1368,6 +1385,57 @@ ck "a FORK refusal outranks a simultaneous DISK and LOAD refusal — the externa
 runs="$(run_fork 400 15641)"
 [ "$runs" = "rc=0 started=1" ]; rc=$?
 ck "POSITIVE CONTROL: with headroom the SAME drive starts the agent (rc=0) — the gate is not always closed ($runs)" $rc
+
+# ── 11b) THE INSTRUMENT IS FOUND WHEREVER THE GATE IS INSTALLED (#2843) ────────────────
+# THE MEASURED DEFECT, not inferred: installed as `pi` at `$HOME/.pi/agent/bin`, the gate searched TWO
+# candidates (`$O`, then beside itself) and neither held `capacity.sh` — so `spawn_fork_state` answered
+# `unknown` on the path MOST launches take and the process-headroom floor never ran (measured
+# 2026-10-25: 18 abstentions in one worker log while the box reported 4,675 processes of headroom;
+# reproduced from the installed shim on 2026-10-28). The arms below drive the SHIPPED function against
+# a SHIM-SHAPED fixture — the artifact installed the way both installers install it — with every
+# ambient override UNSET, because an arm that passes on the ambient environment tests the box, not the
+# placement. `refused` is accepted wherever `ok` is: the reading is a property of the host, the
+# RESOLUTION is the property under test.
+SHIMDIR="$TMP/shiminst"; mkdir -p "$SHIMDIR" "$TMP/fakehome" "$TMP/ovr" "$TMP/ocap"
+cp "$GATE" "$SHIMDIR/pi"
+cp "$cap_abspath" "$SHIMDIR/capacity.sh"      # the placement both installers now make (#2843)
+cp "$cap_abspath" "$TMP/ovr/capacity.sh"      # the explicit override
+cp "$cap_abspath" "$TMP/ocap/capacity.sh"     # the harness home, which must keep priority
+probe_mod() { # probe_mod [VAR=value…] — the installed-shaped copy, ambient resolver inputs OFF
+  env -u O -u SPAWN_GATE_HARNESS_DIR -u AGENT_INFRA_PATH HOME="$TMP/fakehome" "$@" \
+    bash -c 'set -u; . "$1"; spawn_fork_state _s _d; printf "%s|%s|%s" "$_s" "${CAP_GATE_MOD_PATH:-<none>}" "$_d"' \
+    _ "$SHIMDIR/pi" 2>/dev/null
+}
+placed="$(probe_mod)"
+case "$placed" in
+  unknown\|*) rc=1 ;;
+  *"|$SHIMDIR/capacity.sh|"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "an installed shim FINDS the capacity.sh installed BESIDE it, with no \$O and no override set [${placed%%|*}|${placed#*|}]" $rc
+ovr="$(probe_mod SPAWN_GATE_HARNESS_DIR="$TMP/ovr")"
+case "$ovr" in *"|$TMP/ovr/capacity.sh|"*) rc=0 ;; *) rc=1 ;; esac
+ck "SPAWN_GATE_HARNESS_DIR is the explicit override and WINS over the copy beside the gate" $rc
+hom="$(probe_mod O="$TMP/ocap")"
+case "$hom" in *"|$TMP/ocap/capacity.sh|"*) rc=0 ;; *) rc=1 ;; esac
+ck "\$O keeps its precedence over the copy beside the gate (the fleet's live harness home is still preferred)" $rc
+# THE ABSTENTION MUST NAME WHAT IT TRIED. "capacity.sh is not reachable" with no list is a two-hour
+# grep: it cannot tell a MISPLACED copy from a MISSING one, and it prints one cause for two.
+NOCAP="$TMP/shimnocap"; mkdir -p "$NOCAP"; cp "$GATE" "$NOCAP/pi"
+miss="$(env -u O -u SPAWN_GATE_HARNESS_DIR -u AGENT_INFRA_PATH HOME="$TMP/fakehome" \
+  bash -c 'set -u; . "$1"; spawn_fork_state _s _d; printf "%s|%s" "$_s" "$_d"' _ "$NOCAP/pi" 2>/dev/null)"
+case "$miss" in unknown\|*'looked in:'*) rc=0 ;; *) rc=1 ;; esac
+ck "an unreachable instrument ABSTAINS (never a refusal, never a silent pass) AND names the candidates it tried" $rc
+case "$miss" in *"$NOCAP/capacity.sh"*) rc=0 ;; *) rc=1 ;; esac
+ck "…including the path beside the gate itself, so the reader can see where it should have been" $rc
+# …AND THE SECOND CAUSE IS NAMED SEPARATELY: a file that EXISTS but does not define the API is a
+# different fault from one that is absent, and reporting them as one sends the reader to the wrong fix.
+BADCAP="$TMP/shimbadcap"; mkdir -p "$BADCAP"; cp "$GATE" "$BADCAP/pi"
+printf '# fixture: an old or truncated copy — no cap_procs_pair_vars\n' > "$BADCAP/capacity.sh"
+bad="$(env -u O -u SPAWN_GATE_HARNESS_DIR -u AGENT_INFRA_PATH HOME="$TMP/fakehome" \
+  bash -c 'set -u; . "$1"; spawn_fork_state _s _d; printf "%s|%s" "$_s" "$_d"' _ "$BADCAP/pi" 2>/dev/null)"
+case "$bad" in unknown\|*'did not define cap_procs_pair_vars'*) rc=0 ;; *) rc=1 ;; esac
+ck "a capacity.sh that EXISTS but does not define the API is reported as THAT, not as 'not reachable'" $rc
 
 # POSITIVE CONTROL for the drives below: with a floor this filesystem meets, the agent RUNS.
 : > "$LOG"; : > "$PI_LOG"

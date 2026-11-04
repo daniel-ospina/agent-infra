@@ -62,6 +62,27 @@ SHIM="$TMP/shim/pi"
 cp "$GATE" "$SHIM"
 chmod +x "$SHIM"
 
+# ── the fork-floor INSTRUMENT, supplied deterministically (#2843) ────────────
+# The shim reads the process-headroom floor from `capacity.sh` (resolved beside the gate, from `$O`,
+# from SPAWN_GATE_HARNESS_DIR, from AMBIENT paths). This suite must not depend on the box it runs on,
+# so it supplies a module through THE EXPLICIT OVERRIDE — one of the candidates the fix added — that
+# chains to the REAL shipped module and then re-declares only its LEAVES. The arithmetic under test
+# (`cap_procs_pair_vars` → `cap_h_for_vars`) is therefore the shipped one; only the raw readings are
+# fixed. Without it, an arm that expects a LOAD refusal (76) would instead get a FORK refusal (73) on
+# any box genuinely short of pids — a suite whose verdict depends on the host's process count.
+CAPMOD="$TMP/capmod"
+mkdir -p "$CAPMOD"
+REAL_CAPACITY="$ROOT/scripts/orchestrator-harness/capacity.sh"
+cat > "$CAPMOD/capacity.sh" <<CAPEOF
+# fixture instrument: the shipped module, with its READINGS pinned
+. "$REAL_CAPACITY" 2>/dev/null || true
+cap_cgroup_pair_vars() { return 1; }
+cap_procs_live() { printf '%s' "\${FAKE_PROCS:-100}"; }
+cap_ulimit_u() { printf '%s' "\${FAKE_MAXP:-15641}"; }
+cap_maxprocperuid() { return 1; }
+cap_fork_probe() { return 0; }
+CAPEOF
+
 # ── THE CALLER THAT FAILED: a hand-written runner that sources nothing ────────
 # Verbatim in spirit to the runner that started three lanes on 2026-10-16: a shell, an item, and
 # `pi -p`. Nothing in this file knows that spawn-gate.sh exists — which is the whole point.
@@ -124,6 +145,7 @@ chmod +x "$LSHIMDIR/sysctl"
 run_shim() { # run_shim runner|direct [argv…]
   local how="$1"; shift
   PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" \
+  SPAWN_GATE_HARNESS_DIR="${SPAWN_GATE_HARNESS_DIR-$CAPMOD}" \
   PATH="$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
   bash -c '
     how="$1"; runner="$2"; shift 2
@@ -186,14 +208,44 @@ after="$(ledger_rows)"
   && pass "the row carries verdict=refused, the reading (999), the ceiling (10) and the item tag (t3)" \
   || fail "the ledger row does not record verdict/load/ceiling/tag: $(sed -n "${after}p" "$LEDGER" | cut -f2-4,8)"
 nf="$(sed -n "${after}p" "$LEDGER" | awk -F'\t' '{print NF}')"
-[ "$nf" = "10" ] && pass "the row has all 10 fields (epoch, verdict, load, max, pid, ppid, KIND, TAG, cwd, caller)" \
-  || fail "the ledger row has $nf fields, expected 10 — a truncated row cannot be counted reliably"
+[ "$nf" = "11" ] && pass "the row has all 11 fields (epoch, verdict, load, max, pid, ppid, KIND, TAG, cwd, caller, fork)" \
+  || fail "the ledger row has $nf fields, expected 11 — a truncated row cannot be counted reliably"
+# ⛔ THE FORK READING IS IN THE ROW (#2843). An abstention used to leave NO durable trace: it was a
+# WARN in one worker log, so "did the process-headroom floor actually run" could not be answered by
+# any series an operator can query — while a refusal was recorded. This is the column that turns the
+# regression into a `cut`/`awk` over rows instead of a grep through per-worker logs.
+[ "$(ledger_field "$after" 11)" = "fork=ok" ] \
+  && pass "the row records the FORK reading (fork=ok) — an abstention is now durable, not just a WARN line" \
+  || fail "the ledger row does not record the fork reading: got '$(ledger_field "$after" 11)', expected fork=ok"
 # The running count is in the message too: "counted" must be visible in the log line, not only in a
 # file an operator has to know to look for.
 reset_probe
 err="$(FAKE_LOAD=999 MAX_LOAD=10 run_shim runner 2>&1 >/dev/null)"
 grep -qE 'refusal #[0-9]+' <<<"$err" && pass "the refusal is NUMBERED, so a log line alone shows it was counted" \
   || fail "the refusal carries no refusal number: $(sed -n 2p <<<"$err")"
+
+# ── 3b. THE ABSTENTION IS DURABLE, AND IT NAMES WHAT IT TRIED (#2843) ───────
+# The defect this whole file guards against, in its quietest form: the instrument was not reachable
+# from the INSTALLED gate, so the fork floor answered `unknown` and the only trace was a WARN line in
+# one worker log (measured: 18 of them in one run while the box had 4,675 processes of headroom).
+# Both halves are pinned — the row must say `fork=unknown`, and the message must name the candidates,
+# because "capacity.sh is not reachable" with no list is the two-hour grep the issue records.
+reset_probe
+EMPTYD="$TMP/empty-harness"; mkdir -p "$EMPTYD"
+before="$(ledger_rows)"
+err="$(SPAWN_GATE_HARNESS_DIR="$EMPTYD" O= AGENT_INFRA_PATH= FAKE_LOAD=999 MAX_LOAD=10 run_shim runner 2>&1 >/dev/null)"
+after="$(ledger_rows)"
+grep -q 'fork headroom UNREADABLE' <<<"$err" \
+  && pass "an unreachable instrument is a LOUD WARN at the spawn point (not a silent pass)" \
+  || fail "the abstention printed nothing: $(head -2 <<<"$err")"
+grep -q 'looked in:' <<<"$err" \
+  && pass "…and it NAMES the candidate paths it tried (a misplaced copy is distinguishable from a missing one)" \
+  || fail "the abstention names no candidates — still the two-hour grep: $(head -1 <<<"$err")"
+[ "$(ledger_field "$after" 11)" = "fork=unknown" ] \
+  && pass "…and the abstention is RECORDED durably (fork=unknown) — a WARN line alone left no series to query" \
+  || fail "the abstention left no durable trace: field 11 = '$(ledger_field "$after" 11)'"
+[ "$after" -eq "$(( before + 1 ))" ] && pass "…in exactly one row, so the series stays countable" \
+  || fail "the abstaining launch wrote $(( after - before )) rows, expected 1"
 
 # ── 4. MAX_LOAD=0 still means "spawn nothing" (right semantics; they were simply unreached) ──
 reset_probe
@@ -363,6 +415,15 @@ for f in "$SETUP_SH" "$CELL_INSTALL"; do
   if grep -q 'scripts/orchestrator-harness/spawn-gate.sh' "$f" && grep -q 'DEST/bin' "$f"; then rc=0; else rc=1; fi
   label="$(basename "$f") installs the spawn-point gate as \$DEST/bin/pi"
   [ "$rc" -eq 0 ] && pass "$label" || fail "$label — the gate would reach no box through this installer"
+  # ⛔ AND ITS INSTRUMENT BESIDE IT (#2843). A gate installed alone ABSTAINS on the fork floor, which
+  # is a guard that silently does not run — the exact failure this section exists for. Both halves are
+  # asserted because the placement and the resolver are two independent things that must agree.
+  if grep -q 'scripts/orchestrator-harness/capacity.sh' "$f" && grep -q 'bin/capacity.sh' "$f"; then rc=0; else rc=1; fi
+  label="$(basename "$f") installs the fork-floor instrument as \$DEST/bin/capacity.sh"
+  [ "$rc" -eq 0 ] && pass "$label" || fail "$label — the installed gate would abstain on every launch"
+  grep -q 'spawn_fork_state' "$f"; rc=$?
+  label="$(basename "$f") SELF-TESTS the installed pair at install/verify time"
+  [ "$rc" -eq 0 ] && pass "$label" || fail "$label — the next placement drift would land in a log line nobody reads"
 done
 
 echo
