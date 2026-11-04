@@ -57,19 +57,16 @@ or the real launchd.
 once PER RECORDED LANE for three distinct reads: a lane-row `cputime_secs`, one `_observed` ->
 `scripts/lib/pid-identity.sh probe`, and a `cputime_secs` from the STATE snapshot write the
 enumeration runs for every recorded pid. For the two all-dead arms' seven records that measures
-14 + 7 = **21 real reads** (the abstaining-record arm carries one record, so its bound is 3).
-Those reads are about the FIXTURE's pid (`99999999`), not about `os.getpid()` — the earlier claim
-that they were all "about THIS process" held only while every arm carried at most one RECORD
-(the all-dead arms carry seven records that share a single pid, so a per-pid phrasing would say
-the old claim still held, which is the opposite of the point). The abstaining-record arm is
-independent of what they return (its lane is `pidStartSeconds`-absent, which abstains
-regardless); the TWO ALL-DEAD `_drive` arms (`rc_stale`, `rc_unv`) are NOT: each turns on
-`_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on a usable
-`ps` for a nonexistent pid. That dependency is named by the `CENSUS: PRECONDITION:` check, so a
-host-level `ps` failure surfaces AS THAT CHECK rather than as a silent pass — and the earlier
-"touches no real process table" guarantee would have hidden both facts. (The other all-dead
-coverage in this leg is PREDICATE-only — `lane_census()` called with literals — so it never
-reaches `_observed` at all.)
+14 + 7 = **21 real reads**; those target the FIXTURE's pid (`99999999`), so they are not "about
+THIS process". The abstaining-record arm is the one that reads `os.getpid()` (one record, bound 3)
+and it IS independent of what those reads return — its lane is `pidStartSeconds`-absent, which
+abstains regardless. The TWO ALL-DEAD `_drive` arms (`rc_stale`, `rc_unv`) are NOT independent:
+each turns on `_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on
+a usable `ps` for a nonexistent pid. That dependency is named by the `CENSUS: PRECONDITION:`
+check, so a host-level `ps` failure surfaces AS THAT CHECK rather than as a silent pass. (The
+other all-dead coverage in this leg is PREDICATE-only — `lane_census()` called with literals — so
+it never reaches `_observed` at all.) The earlier "touches no real process table" guarantee would
+have hidden all of this.
 """
 
 from __future__ import annotations
