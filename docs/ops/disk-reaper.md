@@ -493,6 +493,15 @@ headroom.
   the numeric reading by case **(b)**, `not-run` (a pass that selected another class) by case **(d)**, and
   `?` (a class that could not be set up) by case **(f)** — each with a mutant that must turn it red, so a
   value that stops being produced reddens instead of shipping as prose.
+  ⛔ **AND THE SAME ABSTENTION APPLIES ONE LEVEL UP, TO THE ROOT — added at this head after a reviewer
+  measured the hole.** `[ -d "$root" ]` needs only a stat, so it SUCCEEDS on a `_work` this process may
+  not READ (mode 0750/0711 owned by another user — plausible on a cell whose runners the root bring-up
+  installed while the reaper runs as `cmux`). `"$root"/*/` then expands to ITSELF, the loop body never
+  runs, and the pass printed `roots=1 candidates=0 kept=0 unmeasurable=0 census=ok`, exit 0 — the entry
+  point recorded `candidates_runner_work=0 verdict_runner_work=ok`, and an INERT class read HEALTHY. A root
+  whose listing cannot be read is now counted into the SAME `unmeasurable=` field
+  (`reason=unlistable`, named per root), so `candidates=` still reports what WAS seen while
+  `unmeasurable=` names what was not. Case **(l)** pins it, with its own mutant.
 * **A class that scanned NOTHING is not a pass.** With the globs set EXPLICITLY and no directory
   matching, the owner reports `census=no-roots` and the class records `misconfigured` +
   `candidates_runner_work=?`, exit 3 — the same rule (and shape) as `venv-no-repo`. With the DEFAULT
@@ -1156,17 +1165,18 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **11 cases and 15 mutants,
-26 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **12 cases and 16 mutants,
+28 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
 against the PRE-CHANGE tree (the base commit's
-`disk-reaper.sh` beside this owner) it reports **9 passed, 17 failed, 0 skipped**, and against this tree
-**26 passed, 0 failed, 0 skipped**: the discrimination is measured both ways, not asserted. (The 17 red on
-the pre-change tree are cases (a)—(h), (j) and (k) plus the **seven** entry-point mutants that cannot even
+`disk-reaper.sh` beside this owner) it reports **10 passed, 18 failed, 1 skipped**, and against this tree
+**28 passed, 0 failed, 3 skipped**: the discrimination is measured both ways, not asserted. (The 18 red on
+the pre-change tree are cases (a)—(h), (j), (k) and (l) plus the **seven** entry-point mutants that cannot even
 be applied there, because the arms they edit — including the `verdict_runner_work=` record line and the
 `unmeasurable_runner_work=` `?` polarity added at this revision — do not exist in that `disk-reaper.sh`;
-(i), (k)'s owner-side mutant, (j)'s two owner-side mutants and the owner-side mutants of (a)—(c)/(h) stay
+(i), (k)'s owner-side mutant, (j)'s two owner-side mutants, (l)'s owner-side mutant and the owner-side
+mutants of (a)—(c)/(h) stay
 green, which is the correct answer for a case whose subject is the owner.)
 
 ⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement — BY THE SUITE THAT ACTUALLY ASSERTS IT.**
@@ -1213,20 +1223,23 @@ suite below could not be read as covering it. It was then **run to completion at
 pass is preserved, `reason=toctou`) — the same case and the same count as the pre-change baseline, i.e.
 pre-existing and not this class's. That tally is recorded here as what it is — the classes suite's own
 result, on the fields it actually asserts — and **not** as this class's evidence, which it never was. The
-record fields are MEASURED at this head by case (b) (`26 passed, 0 failed, 0 skipped`); the caveat that
+record fields are MEASURED at this head by case (b) (`28 passed, 0 failed, 3 skipped` at this head on this
+box — it has real runner roots, so the (f) default-glob arm is skipped by name; the earlier
+`0 skipped` row was taken on a laptop and is not restated as this head's); the caveat that
 stood here for one revision is recorded rather than dropped silently, because "we could not measure it"
 and "it is fine" are different claims and only the first one was ever true.
 
-The measured transcript, `bash scripts/disk-reaper-runner-work.test.sh`:
+The measured transcript, `bash scripts/disk-reaper-runner-work.test.sh`, at this head on a box that HAS
+real runner roots (so the (f) default-glob arm is skipped by name, three times):
 
 ```
-  26 passed, 0 failed, 0 skipped
+  28 passed, 0 failed, 3 skipped
 ```
 
 and the same suite with `DR_REAPER=` the base commit's `disk-reaper.sh`:
 
 ```
-  9 passed, 17 failed, 0 skipped
+  10 passed, 18 failed, 1 skipped
 ```
 
 **The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
@@ -1238,19 +1251,19 @@ on a box told to have real runner roots so the skip path is taken (`<entry>` is 
 `mut-f` and `mut-u` are the mutant copies the suite makes in its own `$T`):
 
 ```
-  26 passed, 0 failed, 3 skipped
+  28 passed, 0 failed, 3 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-u/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
 ```
 
 **How those two numbers compose — `skipped` is ORTHOGONAL, so the arithmetic must not be "balanced".**
-`passed + failed` is the OUTCOME count (26 here: one line per case and per mutant). `skipped` is an
+`passed + failed` is the OUTCOME count (28 here: one line per case and per mutant). `skipped` is an
 independent count of arms that did not run: `skip()` neither increments nor decrements `PASS` — it records
 a reason in a file the outer runner reads at the end — and the arm's own pass line still lands, because the
 assertions beside the skip (the source check of the documented default list) still run. So
-`26 passed … 3 skipped` reads as **26 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
-`passed + skipped` legitimately EXCEEDS 26. ⛔ **A transcript is therefore never "corrected" on the grounds
+`28 passed … 3 skipped` reads as **28 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
+`passed + skipped` legitimately EXCEEDS 28. ⛔ **A transcript is therefore never "corrected" on the grounds
 that `passed + skipped` exceeds the outcome count.** An earlier revision of this section did exactly that,
 on the false premise that a skip must displace a pass, and replaced a correct transcript with
 `20 passed, 0 failed, 2 skipped` — a line no head of this suite can print; the same false premise then
@@ -1273,6 +1286,7 @@ three times, and "the same two skips" was already stale when it was written.
 | (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |
 | (j) | **a LIVE job's `_temp` is never a candidate**: `_work/_temp` — the vendor's `Combine(Work, "_temp")`, written once per step, so it goes stale while the checkout beside it stays fresh — SURVIVES a stale floor and is named (`reason=live-job-temp`); a vendor directory the table has never seen also survives and is named (`reason=vendor-namespace-unlisted`); and a genuinely dead checkout in the SAME pass is still reaped. This is the shipped defect the reviewer measured — a `REAP` row for `_work/_temp`, with the checkout gate working perfectly, which the disclosed residual does not cover | the `_temp` row is deleted (the prefix default still keeps the directory, so the case pins the ROW by its reason); and, separately, the vendor-namespace default is disabled |
 | (k) | **a `reap` ROW is honoured — the table's OTHER disposition is not inert**: a `_foo|reap|…` row is injected into a copy of the owner, and `_work/_foo` is REAPED (a `REAP`/`REAPED` row names it), while the four `retain` rows still hold at the same age with their own reason strings, an UNDECIDED dead checkout beside them is reaped in the same pass, and the pass record names the decided row (`reaped-by-table=_foo`). Measured before the fix: `_foo` came back `RETAINED … reason=vendor-namespace-unlisted` — "no WORK_LAYOUT row" about a name whose row was in the table — while its `job-dead` control was reaped, i.e. the disposition the script and this doc tell an operator to write was inert AND the log named the wrong cause | the table lookup is filtered to `retain` (the shipped bug: a `reap` row then matches nothing and falls through to the `_`-prefix default) |
+| (l) | **a root that cannot be LISTED is an abstention, never a measured zero.** `_work` is set to mode 0111 (stat-able and traversable, NOT listable) with a dead entry under it; the glob then expands to itself and reaches no entry. The pass must count `roots=1 candidates=0 unmeasurable=1`, EXIT 0 (an abstention is not a failure), NAME the root (`reason=unlistable`), carry it into the record as `unmeasurable_runner_work=1`, and — because nothing was classified — the dead entry must SURVIVE. Before this arm the same fixture reported `unmeasurable=0 census=ok`, exit 0, `verdict_runner_work=ok`: an inert class reading healthy. ⚠️ Skipped by name (not passed) when the suite runs **as root**, because `chmod` cannot deny root and the condition cannot be made | the `[ "$_seen" = 0 ] && ! root_is_listable "$root"` guard is deleted, restoring the measured-zero reading |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
