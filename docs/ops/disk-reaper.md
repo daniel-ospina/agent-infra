@@ -28,7 +28,7 @@ only code that deletes:
 | `venv` | `scripts/reap-lane-venvs.sh` (#1932 / #1949) | per-worktree `.venv`s whose lane is gone, proven by three liveness witnesses; fail-closed |
 | `worktree` | `scripts/pi-reap-worktrees.sh` (#1095) **+** `scripts/reap-abandoned-worktrees.sh` (#2542) | the first arm: clean, reachable, holder-free checkouts; merged heads are exempt from the 7-day floor. The second arm: abandoned LINKED worktree directories under a scratch root — age > 180 min **and** no live process's cwd/exe inside (see *The two classes that were missing* below) |
 | `duplicate-install` | `scripts/reap-duplicate-installs.sh` (#2542) | surplus copies of the same tool install (a runner family): only copies **proven idle** are removed, the newest is always kept, the last copy is never removed |
-| `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 3600 s), and `_work/_tool` / `_work/_actions` are deliberately retained |
+| `runner-work` | `scripts/reap-runner-work.sh` (2026-10-28, #3043 is the sibling sink) | the CI runners' `_work` checkout dirs — **19 G** measured in six dirs on a box at 98%: an entry is removed only when **nothing in it (its own top dir included) has been written for longer than the mtime floor** (default 3600 s), and the vendor's whole under-`_work` namespace is deliberately retained — `_temp`, `_actions`, `_tool`, `_update`, plus **any `_`-prefixed name the table has not seen** — from ONE declared table (`WORK_LAYOUT`), never a second literal list |
 
 ## Why one entry point
 
@@ -510,6 +510,16 @@ headroom.
 24 h ≈ 15 G** (c4's `/tmp` measured 48 G). That needs its own class and it is harder — a live lane's cwd
 can BE under `/tmp` (measured: a running `pi` lane cwd'd in `/tmp/cell-t3/.worktrees/…`), so an mtime
 floor alone is not proof of death. Filed as **#3043**, not implemented here.
+
+**UPDATE — merged base 2026-11-03 (#3272, `f2d40ef8`).** The *gitless* half of that population now DOES
+have an owner, so "nothing sweeps `/tmp`" is no longer true and this paragraph would otherwise be read as
+that claim: `scripts/reap-abandoned-worktrees.sh --include-gitless` (reached from the pass's abandoned
+arm, `DISK_REAPER_GITLESS=0` off-switch) sweeps a `/tmp/<name>` scratch tree with **no `.git` at all**,
+using the liveness witness the objection above asks for (a live-pid cwd/exe census, `reason=live-cwd`)
+plus a keep list (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`) and a
+per-pass cap (`REAP_AW_GITLESS_MAX`, default 10).
+What **#3043** still covers is the remainder: trees a `.git`-owned arm claims (those keep their own
+`open-pr`/`dirty` proofs) and everything the cap leaves for the next hour.
 
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
@@ -1543,13 +1553,17 @@ of that decision, not an optimisation.
   that needs a measured window on a Mac — which the Linux cells this was built for
   cannot provide.
 * **The general stale `/tmp` population** (c1: **148 826 entries > 24 h ≈ 15 G**; c4's `/tmp`
-  measured 48 G) — filed as **#3043**, not implemented. It is a different trade from
-  `class=runner-work`: a live lane's cwd can BE under `/tmp` (measured, a running `pi` lane cwd'd in
+  measured 48 G) — **the gitless half is implemented on the merged base, not here**: #3272
+  (`f2d40ef8`) added `--include-gitless` to `scripts/reap-abandoned-worktrees.sh`, reached from this
+  pass's abandoned arm (`DISK_REAPER_GITLESS=0` off-switch), so a `/tmp/<name>` tree with no `.git` is
+  swept once its liveness witness (a live-pid cwd/exe census) says no live process is in it. The
+  remainder is filed as **#3043** and is still not implemented: it is a different trade from
+  `class=runner-work` — a live lane's cwd can BE under `/tmp` (measured, a running `pi` lane cwd'd in
   `/tmp/cell-t3/.worktrees/…`), so an mtime floor is not proof of death, and a scratch copy is the only
-  artifact of an unfinished review. It needs a liveness witness (`scripts/lib/live-paths.sh`) plus an
-  owner ruling on what scratch counts as evidence — the same reversal-of-a-decision problem
-  `docs/ops/disk-consumers.md` G2 records. Do not "just add an age sweep": it would delete working
-  lanes' trees.
+  artifact of an unfinished review. Beyond #3272's cap (`REAP_AW_GITLESS_MAX`, default 10 per pass) and
+  the trees a `.git`-owned arm claims, it needs an owner ruling on what scratch counts as evidence — the
+  same reversal-of-a-decision problem `docs/ops/disk-consumers.md` G2 records. Do not "just add an age
+  sweep": it would delete working lanes' trees.
 
 ## Measured evidence (2026-10-18, cell-3, this box)
 
