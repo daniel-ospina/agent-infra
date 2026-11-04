@@ -135,7 +135,17 @@ mk_entry() { # <work-root> <name> <minutes-old> [size-mb]
     mkdir -p "$w/deep"
     printf 'job payload\n' >"$w/deep/file.txt"
     if [ "${4:-0}" -gt 0 ]; then
-        dd if=/dev/zero of="$w/deep/blob" bs=1m "count=$4" >/dev/null 2>&1 || true
+        # ⛔ `bs=1m` IS A BSD-ONLY SPELLING AND THE `|| true` THAT STOOD HERE HID IT (#3057 review, P1).
+        # GNU dd rejects it — `dd: invalid number: '1m'` — so on EVERY LINUX BOX (every cell) a fixture
+        # asking for "24 MB" was 12 KB: `deep/file.txt` and nothing else. The consequence is not cosmetic:
+        # any assertion about a NONZERO `df` delta was vacuous while still printing ✅, so case (v)'s
+        # "never blames another process" guard could never be reached (`df_raw` was always 0) and case
+        # (b)'s comment calling its fixture "24 MB of real bytes" was false. MEASURED at this head by
+        # driving this very helper: `du -sh` on the built entry gave `12K`.
+        # ⛔ 1024-based `bs`/`count` is the spelling BOTH dd dialects accept, and a failure is now a
+        # FIXTURE failure — `mk_entry` returns BEFORE printing its path, which is what makes
+        # `fixture_entry` report "could not be built" and redden the case instead of testing nothing.
+        dd if=/dev/zero of="$w/deep/blob" bs=1024 "count=$(( $4 * 1024 ))" >/dev/null 2>&1 || return 1
     fi
     # ⛔ AGE THE WHOLE TREE, NOT THE DIRECTORY. The gate is on the NEWEST CONTENT under the entry (a
     # running job writes there), so a fixture that aged only the top directory described a LIVE entry by
@@ -952,7 +962,12 @@ case_v() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead stub out st s ps_out
     # ── (v1) cut short on an ARMED pass, having already removed an entry ─────────────────────────────
     base="$T/v1.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-v1)"
-    fixture_entry dead "$work" job-killed 180 4 || return 1   # 3 h old, real bytes
+    fixture_entry dead "$work" job-killed 180 4 || return 1   # 3 h old, and REAL bytes
+    # ⛔ THE FIXTURE'S SIZE IS ASSERTED, because every `df`-delta assertion below is vacuous without it.
+    # This is what caught `bs=1m` (GNU dd rejects it, so this entry was 12 KB and `df_raw` was always 0):
+    # a future regression in the fixture is now a red case, not a silently unreachable assertion.
+    case_check "$([ "$(du -sk "$dead" 2>/dev/null | cut -f1)" -ge 3000 ] && echo 0 || echo 1)" \
+               "v1 the fixture holds REAL bytes (>= 3 MB), so the df-delta assertions that follow are reachable"
     stub="$T/v-stub-cut.$$.$RANDOM.sh"
     {
         printf '#!/usr/bin/env bash\n'
@@ -972,6 +987,12 @@ case_v() { # <entry-point> <owner>
                "v1 … and the note NAMES the cut, so an operator is told the removal count is unknown"
     case_check "$(grep -qF 'belongs to another process' <<<"$st" && echo 1 || echo 0)" \
                "v1 … and it never asserts that the class removed nothing and another process caused the df change"
+    # … and the POSITIVE half of that fix, asserted only when there IS a delta to attribute (so the check is
+    # never vacuous on a box whose `df` moved, and never flaky on one where another process cancelled it).
+    if grep -qE 'df_raw=[1-9][0-9]*MB' <<<"$out"; then
+        case_check "$(grep -qF 'MAY BE ITS OWN' <<<"$st" && echo 0 || echo 1)" \
+                   "v1 … and having OBSERVED a nonzero df delta, the note offers it as a POSSIBLE own reclaim (not as proof of another process)"
+    fi
     ps_out="$(DISK_REAPER_STATE_DIR="$s" bash "$pass" --print-status 2>/dev/null)"
     case_check "$(grep -qE '(^|\|)reaped_runner_work=\?(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
                "v1 … and --print-status RENDERS it, so the field has a reader and not only a writer"
@@ -1007,6 +1028,26 @@ case_v() { # <entry-point> <owner>
                "v3 a fully-answered pass that saw nothing vanish records gone_runner_work=0 — a MEASUREMENT"
     case_check "$(grep -q '^reaped_runner_work=0$' <<<"$st" && echo 0 || echo 1)" \
                "v3 … and reaped_runner_work=0, so an ANSWER clears the sentinel (the field is not a permanent ?)"
+    # ── (v4) A BUSY pass: entries reaped AND an entry vanished — the note must not speak for the PASS ──
+    # ⛔ MEASURED BEFORE THIS ARM: `reaped_runner_work=3` beside `note_runner_work=… nothing under them was
+    # measured and nothing was removed …`, i.e. the class's own cause channel asserting the opposite of its
+    # own count. `gone>0` with `reaped>0` is not a corner: it is every pass on a busy runner where one job
+    # finishes while other dead checkouts are correctly reaped.
+    base="$T/v4.$$.$RANDOM"; mkdir -p "$base"; s="$(uniqstate v4)"
+    stub="$T/v-stub-mixed.$$.$RANDOM.sh"
+    {
+        printf '#!/usr/bin/env bash\n'
+        printf 'printf "GONE   %%s/ghost reason=vanished\\n" "%s"\n' "$base"
+        printf 'printf "SUMMARY class=runner-work mode=apply globs=1 roots=2 candidates=4 reaped=3 kept=0 retained=0 failed=0 unmeasurable=0 gone=1 refused=0 min_age=3600s explicit=1 census=ok\\n"\n'
+        printf 'exit 0\n'
+    } >"$stub"; chmod +x "$stub"
+    PASS_OWNER="$stub"
+    run_pass "$pass" "$s" "$base/gh-runner*/_work" --apply --only runner-work >/dev/null 2>&1
+    st="$(status_of "$s")"
+    case_check "$(grep -q '^reaped_runner_work=3$' <<<"$st" && grep -q '^gone_runner_work=1$' <<<"$st" && echo 0 || echo 1)" \
+               "v4 a pass that reaped 3 AND saw 1 vanish records BOTH, so the two outcomes are not exclusive"
+    case_check "$(grep -qF 'nothing was removed' <<<"$st" && echo 1 || echo 0)" \
+               "v4 … and its note never says 'nothing was removed', which would contradict reaped_runner_work=3"
     return $((CASE_FAIL > 0))
 }
 
@@ -1255,6 +1296,10 @@ MUT_BV="/printf 'verdict_runner_work=/d"
 MUT_V_CS='s/if \[ "${HAVE_RW_REAPED:-0}" = 1 \]; then/if [ 1 = 1 ]; then/'
 MUT_V_GONE='s/^        \*) HAVE_RW_GONE=1; GONE_RW="\$_rw_gone" ;;$/        *) : ;;/'
 MUT_V_RR="/printf 'reaped_runner_work=/d"
+# (v4)'s arm: restore the shipped wording, which asserted about the WHOLE PASS that "nothing was removed"
+# on a pass that had recorded `reaped_runner_work=3`. The note is the class's cause channel, so a mutation
+# that makes it contradict the class's own count must redden.
+MUT_V_NOTE='s/nothing under them was measured or removed/nothing under them was measured and nothing was removed/'
 # ⛔ THE CARVE-OUT'S TWO SPELLINGS ARE ONE ARM: the derived table AND the runner-namespace default, so
 # the mutation removes both. Emptying only the table leaves `_tool`/`_actions`/`_temp` retained by the
 # `_`-prefix default and the case would pass on a tree with no table at all — the "mutant survived"
@@ -1594,6 +1639,11 @@ if apply_mutation "$REAPER" "$T/mut-v-rr/disk-reaper.sh" "$MUT_V_RR"; then
     expect_fail "v mutation: deleting reaped_runner_work= from the record turns the case RED (the removal count has no channel)" case_v "$T/mut-v-rr/disk-reaper.sh" "$OWNER"
 else
     bad "v mutation could not be applied (the reaped record line moved) — that field is not checked any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-v-note/disk-reaper.sh" "$MUT_V_NOTE"; then
+    expect_fail "v mutation: restoring 'nothing was removed' in the gone note turns the case RED (it contradicts reaped_runner_work=3)" case_v "$T/mut-v-note/disk-reaper.sh" "$OWNER"
+else
+    bad "v mutation could not be applied (the gone-note wording moved) — the mixed arm is not checked any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
