@@ -2430,8 +2430,8 @@ ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_
 # `_internal`, `landX`, `load:2` were dropped entirely, each leaving the derived set byte-identical to the
 # baseline so `derived == rows` passed with the word in NEITHER side. Widening the class again would be
 # the same mistake a third time. So the derivation imposes NO class on the word at all: it captures the
-# whole OPERAND and excludes only the forms that are not a new word (a quoted or `$`/`(`-prefixed
-# variable or command substitution, which is a replay, not a claim). A word the table has no row for then
+# whole OPERAND and excludes only the forms that are not a new word (a quoted VARIABLE or command
+# substitution, which is a replay, not a claim). A word the table has no row for then
 # arrives as ITSELF — however it is spelled — and REDS the equality instead of vanishing into a neighbour.
 _gatewords_derived_from() { # <dir> -> the gate words THIS deploy unit can record, space-separated
   {
@@ -2445,8 +2445,8 @@ _gatewords_derived_from() { # <dir> -> the gate words THIS deploy unit can recor
     # Already quote-delimited, so the quotes are the boundary; the value itself is unrestricted.
     sed -n '/^cap_refusal_gate()/,/^}/p' "$1/chain-merge.sh" 2>/dev/null \
       | grep -oE "printf '[^']*'" | sed "s/^printf '//; s/'$//"
-  } | sed "s/[\"']$//" \
-    | awk 'NF && $0 !~ /^["'"'"'$(]/' | sort -u | tr '\n' ' '
+  } | sed -e "s/^[\"']//" -e "s/[\"']$//" \
+    | awk 'NF && $0 !~ /^[$()]/' | sort -u | tr '\n' ' '
 }
 _capwords_derived="$(_gatewords_derived_from "$HERE")"
 _capwords_derived="${_capwords_derived% }"
@@ -2511,6 +2511,23 @@ printf '\n_cap_gate="$(cap_refusal_gate)"\n' >> "$_gw4/lane.sh"
 _gw4_out="$(_gatewords_derived_from "$_gw4")"
 [ "${_gw4_out% }" = "$_capwords_derived" ]; rc=$?
 ck "...while a REPLAY (\`_cap_gate=\"\$(...)\"\`, chain-merge.sh:259's own form) is still excluded, so the seam does not invent words (derived: '${_gw4_out:-<EMPTY>}')" $rc
+# ⛔ AND A QUOTED LITERAL IS NOT A REPLAY (P3, fourth fresh review of `9ede5e24`). The exclusion's first
+# cut dropped ANY quoted operand, so `_cap_gate="land2"` — which records the identical three-field line
+# as the unquoted form — was ABSORBED (derived byte-identical to baseline, equality GREEN) while the
+# unquoted spelling changed the set. Both spellings and both seams are driven here, because the natural
+# way to write the next seam-2 call is `lane_standdown_write "key" "$CAPACITY_YIELD_SECS"`.
+_gw5="$TMP/gatewords5"
+_gw5_bad=""
+for _gw5_case in 'seam1-dq|_cap_gate="land2"|land2' "seam1-sq|_cap_gate='land2'|land2" 'seam2-dq|lane_standdown_write "zzz2" "$CAPACITY_YIELD_SECS"|zzz2' 'seam2-sq|lane_standdown_write '\''zzz3'\'' "$CAPACITY_YIELD_SECS"|zzz3'; do
+  _gw5_tag="${_gw5_case%%|*}"; _gw5_rest="${_gw5_case#*|}"
+  _gw5_line="${_gw5_rest%%|*}"; _gw5_want="${_gw5_rest##*|}"
+  rm -rf "$_gw5"; mkdir -p "$_gw5"; cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw5/"
+  printf '\n%s\n' "$_gw5_line" >> "$_gw5/lane.sh"
+  _gw5_out="$(_gatewords_derived_from "$_gw5")"
+  case " $_gw5_out " in *" $_gw5_want "*) : ;; *) _gw5_bad="$_gw5_bad $_gw5_tag($_gw5_want)" ;; esac
+done
+[ -z "$_gw5_bad" ]; rc=$?
+ck "...and a QUOTED LITERAL is seen as the word it records, in both quote styles and on both seams — it is not a replay, so excluding it absorbed a gate the unquoted spelling would have caught (absorbed:${_gw5_bad:- none})" $rc
 # The operator-facing half: the load REMEDY must not be printed for a capability refusal.
 chain_probe capability
 [ "$CHAIN_REMEDY" = "refused at the capability gate" ]; rc=$?
