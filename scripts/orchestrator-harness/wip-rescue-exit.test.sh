@@ -412,35 +412,65 @@ grep -qx 'state=unpushed-only' "$mk" 2>/dev/null && grep -qx 'dirty=0' "$mk" 2>/
 ck "D7 …carrying the tree verdict, the dirty count, the porcelain section and a mechanically derived next step" $rc
 git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 # ⛔ D8-D10 NON-VACUITY FOR THE PUSH ITSELF: the same lane on its OWN branch (`durablepre`), driven
-# through the SHIPPED PRE-FIX helper (`origin/main`'s spawn-gate.sh, extracted from git rather than
-# hand-mutated), must leave the branch where it was and write no marker. This is the RED half, kept as
-# an arm so it can never silently stop discriminating — and it is the red→green evidence this change
-# was required to produce. A separate branch, because the D arm above already moved `durable` on
-# origin and reusing it would have measured the previous arm's push.
+# through a PRE-FIX CONTROL — this head's helper with the exit-path device calls REMOVED — must leave
+# the branch where it was and write no marker. This is the RED half, kept as an arm so it can never
+# silently stop discriminating — and it is the red→green evidence this change was required to produce.
+# A separate branch, because the D arm above already moved `durable` on origin and reusing it would
+# have measured the previous arm's push.
+#
+# ⛔ THE CONTROL IS DERIVED FROM THE SHIPPED FILE, NOT FROM AN `origin/main` REF (this PR's own red CI,
+# 2026-11-04). It used to be `git -C "$HERE" show origin/main:…spawn-gate.sh`. That ref does not exist
+# here and was never guaranteed: `actions/checkout` fetches **one commit, for the ref that triggered the
+# workflow** (its own README; `ci.yml`'s `bash-suites` job sets no `fetch-depth`), so the extraction
+# produced an EMPTY file, `. "$PRE/spawn-gate.sh"` defined nothing, and the arm's lane died with
+# `run_agent: command not found` — while D9 PASSED, because "no branch on origin" is vacuously true
+# over a lane that never ran. D9b is what caught it. Same defect class as DEFECT A above (a verdict
+# that is a function of the CHECKOUT rather than of the code), so it gets the same treatment: no base
+# ref, no network, a fixture built from the shipped file — the mechanism arm B already uses.
+#
+# WHAT THE MUTATION REMOVES, AND WHY IT IS FOUR LINES: the change's whole exit-path device is the local
+# marker reset, the marker write (two call sites, one per terminal path) and the push. The FUNCTIONS
+# stay, so the arm measures the WIRING. The count assertion makes a renamed call line fail loudly
+# instead of silently turning the control into a copy of the shipped helper (which D9 would then red —
+# fail-closed, but unnamed).
 PRE="$TMP/pre"; mkdir -p "$PRE"
 WT3="$TMP/wt3"
 git -C "$WT" worktree add -q "$WT3" -b durablepre 2>/dev/null
 pi_stub unpushed
-git -C "$HERE" show origin/main:scripts/orchestrator-harness/spawn-gate.sh > "$PRE/spawn-gate.sh" 2>/dev/null
+n_calls="$(grep -cE '^  (LANE_END_PUSH="running"|lane_end_marker "|lane_end_push ")' "$GATE")"
+ck "D8a the shipped helper really carries the exit-path device the control removes (4 call lines: 1 reset, 2 marker writes, 1 push) — so the mutation cannot be a no-op (measured: $n_calls)" \
+  $([ "$n_calls" = 4 ] && echo 0 || echo 1)
+grep -vE '^  (LANE_END_PUSH="running"|lane_end_marker "\$label" "\$rc" "\$cap"|lane_end_push "\$label" "\$log" "\$root" "\$br" "\$unpushed" "\$unpushed_ok")$' \
+  "$GATE" > "$PRE/spawn-gate.sh"
+# The control must be able to START, for the reason B1's sibling documents: `run_agent` refuses BEFORE
+# the spawn when `brief-gate.sh` / `repo-slug.sh` are unresolvable beside the helper, and a control that
+# never ran would make D9 pass for the wrong reason — the exact vacuity this arm was rewritten for.
 cp "$HERE/brief-gate.sh" "$HERE/repo-slug.sh" "$PRE/" 2>/dev/null
-[ -s "$PRE/spawn-gate.sh" ] && ! grep -q 'lane_end_push' "$PRE/spawn-gate.sh"; rc=$?
-ck "D8 the pre-fix helper was extracted from origin/main and really lacks the push (so the next arm measures the change, not git)" $rc
+bash -n "$PRE/spawn-gate.sh" \
+  && grep -q '^lane_end_push()' "$PRE/spawn-gate.sh" && grep -q '^lane_end_marker()' "$PRE/spawn-gate.sh" \
+  && ! grep -qE '^  (LANE_END_PUSH="running"|lane_end_marker "|lane_end_push ")' "$PRE/spawn-gate.sh"; rc=$?
+ck "D8b the control removed the CALLS and kept the FUNCTIONS, and the result still parses (so the next arm tests the wiring, not a broken file)" $rc
 seed3="$(git -C "$WT3" rev-parse HEAD)"
 : > "$O/logs/pre.log"; rm -f "$O/state/lane-exit-pre_fix.state"
-PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
+res3="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
   . "$1"
   cd "$2" || exit 2
   O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "pre fix" >>"$4.agent" 2>&1
-' _ "$PRE/spawn-gate.sh" "$WT3" "$O" "$O/logs/pre.log" "$PROMPT"
+  printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+' _ "$PRE/spawn-gate.sh" "$WT3" "$O" "$O/logs/pre.log" "$PROMPT")"
 arm "$O/logs/pre.log"
-ck "D9 …AND ORIGIN HAS NO durablepre BRANCH AT ALL after the pre-fix exit — the lane's commit stayed on this disk, which is the RED the change turned green" \
+ck "D8c the CONTROL lane itself ran (so D9 tests the removed push, not a refusal that never dispatched) ($res3)" \
+  $([ "$res3" = "rc=0 started=1" ] && echo 0 || echo 1)
+grep -q 'PI_RAN' "$O/pi5.log" 2>/dev/null; rcpi3=$?
+ck "D8d …and its stub agent really executed in the fixture worktree" $rcpi3
+ck "D9 …AND ORIGIN HAS NO durablepre BRANCH AT ALL after the control exit — the lane's commit stayed on this disk, which is the RED the change turned green" \
   $(! git -C "$BARE" rev-parse -q --verify refs/heads/durablepre >/dev/null 2>&1 && echo 0 || echo 1)
 ck "D9b …while the lane REALLY HAD an unpushed commit (head $(git -C "$WT3" rev-parse --short HEAD) != branch point $(git -C "$WT3" rev-parse --short "$seed3")), so D9 is not vacuous" \
   $([ "$(git -C "$WT3" rev-parse HEAD)" != "$seed3" ] && echo 0 || echo 1)
-ck "D10 …and NO resume marker is written, exactly as at origin/main — so D5/D6 are the change's, not git's" \
+ck "D10 …and NO resume marker is written, exactly as before the change — so D5/D6 are the change's, not git's" \
   $([ ! -e "$O/state/lane-exit-pre_fix.state" ] && echo 0 || echo 1)
 
 # ── N) THE TWO GATE PROPERTIES REVIEW CYCLE 1 BROKE, EACH WITH ITS OWN FIXTURE ─────────────────
