@@ -37,6 +37,14 @@ WT=".worktrees/adopt-$PR"
 # trusting it. It replaces the directory-name probe, which tested a NAME rather than a branch (#2033).
 wt_provision "$REPO" "$WT" "$BR" "origin/$BR"
 _wt_rc=$?
+if [ "$_wt_rc" = 4 ]; then
+  # ── THE PRE-START DISK REFUSAL (agent-infra#3395): nothing was created, so rc 77 makes this log
+  # name the DISK gate rather than a materialisation failure. `worktree add` was never ATTEMPTED —
+  # that is the property that makes the refusal free, and the reason it must not read as an add error.
+  echo "[adopt-fix $PR] $WT_RESULT" | tee -a "$O/logs/adopt-$PR.log"
+  echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — nothing created; reclaim space; this will NOT clear by waiting" | tee -a "$O/logs/adopt-$PR.log"
+  exit 77
+fi
 if [ "$_wt_rc" != 0 ]; then
   echo "[adopt-fix $PR] $WT_RESULT — cannot adopt $BR" | tee -a "$O/logs/adopt-$PR.log"
   exit 1
