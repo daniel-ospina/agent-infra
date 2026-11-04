@@ -1322,6 +1322,18 @@ lane_end_push() {
   # never an authority over the remote's own answer, and never a REASON to skip the other names.
   c="$(git -C "$root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
   [ -n "$c" ] && case "$_protected" in *" $c "*) ;; *) _protected="$_protected$c " ;; esac
+  # ⛔ AN UNKNOWN DEFAULT IS NOT "NO PROTECTED NAMES" (review cycle 2, finding 1 — REPRODUCED: with the
+  # remote's answer unavailable, `trunk` was pushed and `refs/heads/trunk` moved). The determining read is
+  # BOUNDED, so it returns empty on a transient failure *including its own timeout* — treating that empty
+  # as "nothing extra to protect" made the refusal hold only for a remote that answers, which is the
+  # fail-open this arm exists to close. The function one block up already states the doctrine for a
+  # different measurement ("`unmeasured` is NOT treated as zero"); it applies here verbatim. Both sources
+  # must fail before this refuses — a real clone always has one of them.
+  if [ -z "$def" ] && [ -z "$c" ]; then
+    LANE_END_PUSH="refused-unknown-default"
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but this run could NOT DETERMINE the remote's default branch — neither \`ls-remote --symref origin HEAD\` (bounded at 15 s; an empty answer is also what a TIMEOUT looks like) nor the clone's refs/remotes/origin/HEAD answered. Pushing anyway could move a landing branch, so NOTHING was pushed. Re-run once the remote answers, or push by hand if you know $sym is not the default" >> "$log" 2>/dev/null || true
+    return 0
+  fi
   case "$_protected" in
     *" $sym "*)
       LANE_END_PUSH="refused-protected"
@@ -1332,20 +1344,21 @@ lane_end_push() {
   # REMOTE (`ls-remote --symref origin HEAD`) and that read must itself be bounded (see the ordering note
   # beside the landing check). A missing library is a refusal for the whole network half — not for the
   # local checks above, which have already run.
-  # Bounded at 25 s (+15 s for the verification read): a `git push` of one lane's branch is seconds on a
-  # healthy link, and the whole exit path has to fit inside the 20 s + 15 s kill grace a launcher gives
-  # it. ⛔ THE NUMBERS ARE NOW DERIVED FROM THAT BUDGET, NOT CHOSEN BESIDE IT (review cycle 1, finding 4:
-  # 120 + 60 = 180 s was six to nine times the grace the comment itself cites, deferring the very
-  # artifact this change exists to produce). `bg-rescue-wip.sh` — the tool this mirrors — uses 45 s for
-  # its push; 25 s here is deliberately tighter because a lane's branch is one ref, not a tree walk.
-  # ⛔ AND THE LOCAL ARTIFACT IS WRITTEN BEFORE THE NETWORK CALL, by `terminal_wip_rescue` (`push=running`),
-  # so a signal during these two calls still leaves the marker on disk with everything measured.
-  out="$(tb_timeout 25 git -C "$root" push -u origin "HEAD:refs/heads/$sym" 2>&1)"; rc=$?
+  # ⛔ THE THREE NETWORK BOUNDS ARE ONE BUDGET, SUMMED (review cycle 2, finding 4). A launcher gives the
+  # exit path 20 s after TERM and 15 s more after KILL = 35 s, and the three calls of this whole function
+  # are exactly that: 15 s (the symref read above) + 15 s (the push below) + 5 s (the verifying read) =
+  # 35 s. `tb_timeout` is a bound, not a duration — a healthy push is sub-second, and `bg-rescue-wip.sh`
+  # (the tool this mirrors) allows itself 45 s for a whole TREE walk. Nothing here may exceed the grace,
+  # or the TERM lands mid-transfer and the marker freezes at `push=running` on exactly the slow links
+  # this exists for.
+  # ⛔ AND THE LOCAL ARTIFACT IS WRITTEN BEFORE ANY OF IT, by `terminal_wip_rescue` (`push=running`), so a
+  # signal during these calls still leaves the marker on disk with everything measured.
+  out="$(tb_timeout 15 git -C "$root" push -u origin "HEAD:refs/heads/$sym" 2>&1)"; rc=$?
   [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/[lane-exit]   /' >> "$log" 2>/dev/null
   if [ "$rc" -ne 0 ]; then
     LANE_END_PUSH="FAILED"
     if [ "$rc" = "124" ]; then
-      echo "[lane-exit] ⛔ label=$label: PUSH TIMED OUT after 25s — $unpushed commit(s) on $br are STILL only on this disk. This is not a rejection: the remote never answered" >> "$log" 2>/dev/null || true
+      echo "[lane-exit] ⛔ label=$label: PUSH TIMED OUT after 15s — $unpushed commit(s) on $br are STILL only on this disk. This is not a rejection: the remote never answered" >> "$log" 2>/dev/null || true
     else
       echo "[lane-exit] ⛔ label=$label: PUSH FAILED (exit $rc) — $unpushed commit(s) on $br are STILL only on this disk. The remote's own words are replayed above; a non-fast-forward means someone else moved the branch and this exit path will NOT force it" >> "$log" 2>/dev/null || true
     fi
@@ -1360,11 +1373,18 @@ lane_end_push() {
   # guarantee is `origin holds the sha we just measured`, so a mismatch is FAILED and says so.
   local mine
   mine="$(git -C "$root" rev-parse HEAD 2>/dev/null)"
-  LANE_END_ORIGIN="$(tb_timeout 15 git -C "$root" ls-remote --heads origin "refs/heads/$sym" 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
+  LANE_END_ORIGIN="$(tb_timeout 5 git -C "$root" ls-remote --heads origin "refs/heads/$sym" 2>/dev/null | sed -n '1s/[[:space:]].*//p')"
   if [ -z "$LANE_END_ORIGIN" ]; then
     LANE_END_PUSH="FAILED"
     echo "[lane-exit] ⛔ label=$label: the push reported success but origin does NOT hold refs/heads/$sym — do not trust the push's exit status here, the remote is the only verdict. $unpushed commit(s) are STILL only on this disk" >> "$log" 2>/dev/null || true
-  elif [ -n "$mine" ] && [ "$LANE_END_ORIGIN" != "$mine" ]; then
+  elif [ -z "$mine" ]; then
+    # ⛔ NO HEAD, NO VERDICT (review cycle 2, finding 2 — REPRODUCED: an unreadable HEAD made this arm
+    # claim `= this worktree's HEAD` over a matching-by-accident sha, recording push=pushed). `local mine`
+    # is already declared, so the old `-n "$mine"` guard bought no `set -u` safety — it only turned "could
+    # not read HEAD" into a PASS, which is the one direction this check must never take.
+    LANE_END_PUSH="FAILED"
+    echo "[lane-exit] ⛔ label=$label: the push exited 0 and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read — so nothing proves the remote holds THIS lane's commit. Recorded as FAILED rather than as a delivery; $unpushed commit(s) must be assumed still only on this disk" >> "$log" 2>/dev/null || true
+  elif [ "$LANE_END_ORIGIN" != "$mine" ]; then
     LANE_END_PUSH="FAILED"
     echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine — the push did NOT deliver this lane's commits (a pre-receive hook, a shim that exited 0, or a concurrent move). $unpushed commit(s) are STILL not on that ref; read the replayed push output above" >> "$log" 2>/dev/null || true
   else
@@ -1404,11 +1424,29 @@ lane_end_next() {
     printf 'retrieve the archive %s (local pin only — the OFF-BOX push is unconfirmed) before removing %s\n' \
       "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}"; return 0
   fi
-  if [ "${LANE_END_TREE:-}" = "dirty" ] || [ "${LANE_END_TREE:-}" = "cannot-verify" ] || [ "${LANE_END_TREE:-}" = "unpushed-only" ]; then
+  # ⛔ `unpushed-only` IS NOT A DIRTY TREE (review cycle 2, finding 3 — REPRODUCED). `at_risk=0` for a
+  # clean tree, so `rescue=nothing` deterministically and NO `refs/wip/<slug>` is ever created — yet this
+  # arm told the reader to fetch one, which fails. A tree whose branch is on origin has nothing to
+  # recover; say THAT, and name the sha the remote reported.
+  if [ "${LANE_END_TREE:-}" = "unpushed-only" ]; then
+    if [ "${LANE_END_PUSH:-}" = "pushed" ]; then
+      printf 'nothing to recover — the tree was clean and the branch IS on origin at %s (%s); re-dispatch from origin/%s\n' \
+        "${LANE_END_ORIGIN:-<sha>}" "${LANE_END_BRANCH:-<branch>}" "${LANE_END_BRANCH:-<branch>}"
+    else
+      printf 'the tree was clean but commit(s) on %s were not pushed (push=%s); the commits are in the local object store, not on origin — see the [lane-exit] line\n' \
+        "${LANE_END_BRANCH:-<branch>}" "${LANE_END_PUSH:-not-attempted}"
+    fi
+    return 0
+  fi
+  if [ "${LANE_END_TREE:-}" = "dirty" ] || [ "${LANE_END_TREE:-}" = "cannot-verify" ]; then
+    if [ "${LANE_END_RESCUE:-}" = "nothing" ]; then
+      printf 'the tree measured %s with rescue=nothing — read the [wip] line before removing %s; no archive ref is claimed here\n' \
+        "${LANE_END_TREE}" "${LANE_END_ROOT:-<unknown>}"; return 0
+    fi
     printf 'recover the uncommitted state: git fetch origin refs/wip/%s && git diff --stat HEAD FETCH_HEAD (%s); %s\n' \
       "$(printf '%s' "${LANE_END_BRANCH:-detached}" | tr '/' '-')" \
       "the archive commit's TREE is the worktree as it was left" \
-      "then re-dispatch — the branch is on origin"
+      "then re-dispatch"
     return 0
   fi
   # ⛔ THE COUNT IS READ, NEVER HARD-CODED (review P1: this arm printed `unpushed=0` as a literal, so a
@@ -1432,7 +1470,13 @@ lane_end_marker() {
   # so on a FULL DISK — the exact state this change exists for — a failed write left the EARLIER terminal's
   # `state=clean push=pushed head=<old sha>` sitting on disk while the ledger row described a dirty,
   # unpushed one. In-memory resetting cannot fix a fact written to disk; the file must go.
-  rm -f "$f" 2>/dev/null
+  # ⛔ ONLY ON THE FIRST WRITE OF THIS TERMINAL (review cycle 2, finding 5 — REPRODUCED). `rm` runs on
+  # EVERY call, including the final one AFTER the network half, so a failed `mktemp` there (ENOSPC's
+  # shape: unlink works, create does not) DELETED the `push=running` marker the pre-network write had
+  # just bought, leaving no artifact at all in the 92-98 %-disk condition this exists for. The flag is
+  # set at the top of `terminal_wip_rescue`, so stale content from a PREVIOUS terminal is still cleared
+  # before anything is measured.
+  if [ "${LANE_END_MARKER_FRESH:-0}" = "1" ]; then rm -f "$f" 2>/dev/null; fi
   if ! mkdir -p "$o_root/state" 2>/dev/null; then
     echo "[lane-exit] ⛔ label=$label: could not create $o_root/state — NO resume marker is being written for this terminal (check the disk: this is the 92-98% condition the marker exists for). The ledger row still records the facts; the per-lane artifact does not" >> "${LANE_END_LOG:-/dev/null}" 2>/dev/null || true
     return 0
@@ -1470,7 +1514,7 @@ lane_end_marker() {
     # ran and NO MARKER WAS WRITTEN for exactly the lanes that are safe to reclaim. Caught by arm D5
     # of `wip-rescue-exit.test.sh`, which is why that arm asserts the FILE and not the log line.
     :
-  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null || {
+  } > "$tmp" 2>/dev/null && mv -f "$tmp" "$f" 2>/dev/null && LANE_END_MARKER_FRESH=0 || {
     rm -f "$tmp" 2>/dev/null
     # The write tail used to swallow this (review cycle 1, finding 3): a silent failure leaves NO marker
     # and an operator who believes there is one. Loud, pointing at the disk, never at git.
@@ -1531,7 +1575,7 @@ terminal_wip_rescue() {
   # the capacity records. Resetting it after the hatch instead would have left the `not-measured` row
   # carrying a previous lane's `push=pushed`, which is the most dangerous value to mis-carry.
   LANE_END_BRANCH=""; LANE_END_HEAD=""; LANE_END_PUSH=""; LANE_END_ORIGIN=""
-  LANE_END_DIRTY=""; LANE_END_PORCELAIN=""; LANE_END_LOG="$log"
+  LANE_END_DIRTY=""; LANE_END_PORCELAIN=""; LANE_END_LOG="$log"; LANE_END_MARKER_FRESH=1
   if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
     LANE_END_TREE="not-measured"; LANE_END_RESCUE="DISABLED"
     echo "[wip] end label=$label rc=$rc cap=$cap tree=not-measured rescue=DISABLED — WIP_RESCUE_DISABLE=1 (an operator escape hatch, not a default): the tree at $root was NOT examined, so this lane's uncommitted work (if any) is on this disk only" >> "$log" 2>/dev/null || true
@@ -1651,7 +1695,8 @@ terminal_wip_rescue() {
   LANE_END_PORCELAIN="$st_out"
   LANE_END_DIRTY="$(printf '%s\n' "$st_out" | grep -c . 2>/dev/null)"; [ -n "$LANE_END_DIRTY" ] || LANE_END_DIRTY=0
   # ⛔ THE LOCAL HALF IS ON DISK **BEFORE** THE NETWORK CALL (review cycle 1, finding 4). The push and its
-  # verifying read can occupy the exit path for up to 40 s (25 + 15), against a launcher's 20 s + 15 s
+  # verifying read can occupy the exit path for up to 35 s (15 s symref + 15 s push + 5 s verify),
+  # against a launcher's 20 s + 15 s
   # kill grace — so a signal in that window used to lose the marker entirely, which is the artifact this
   # change exists to produce. Writing `push=running` first means that, even if everything after this line
   # is lost, the next reader still has the branch, head, tree verdict and porcelain listing, and a

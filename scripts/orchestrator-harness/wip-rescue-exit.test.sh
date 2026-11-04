@@ -140,6 +140,11 @@ git -C "$WT" config url."$BARE".insteadOf "$GHURL"
 printf 'seed\n' > "$WT/seed.txt"
 git -C "$WT" add seed.txt && git -C "$WT" commit -q -m seed
 git -C "$WT" push -q -u origin work
+# ⛔ THE REMOTE MUST STATE A DEFAULT FROM THE START. `lane_end_push` now REFUSES when it cannot determine
+# the landing branch (an unresolved default is UNKNOWN, not "nothing to protect" — review cycle 2,
+# finding 1), so a fixture whose bare HEAD pointed at an unborn `main` would refuse every push arm and
+# measure the refusal instead of the push.
+git -C "$WT" push -q origin HEAD:refs/heads/main
 BR="$(git -C "$WT" branch --show-current)"; SLUG="$(printf '%s' "$BR" | tr '/' '-')"
 
 # The creation back-pressure gate reads `gh` immediately before any spawn; supply the calm reading
@@ -444,11 +449,7 @@ ck "D10 …and NO resume marker is written, exactly as at origin/main — so D5/
 # compared `sym = def`. The union is now consulted, so a branch that is a landing branch under ANY
 # spelling is refused. The remote here states `main`; the lane sits on `master`.
 WT4="$TMP/wt4"
-git -C "$BARE" symbolic-ref HEAD refs/heads/main 2>/dev/null
-# A symref to a branch that does not exist is an UNBORN HEAD, and `ls-remote --symref` then prints
-# nothing at all — so the branch must EXIST for the fixture to state its default (measured: without
-# this line N0 was empty and the arm below was asserting the static union, not the remote's answer).
-git -C "$WT" push -q origin HEAD:refs/heads/main 2>/dev/null
+# (the remote's default, and the branch it names, were established in the fixture setup above)
 git -C "$WT" worktree add -q "$WT4" -b master 2>/dev/null
 hdr4="$(git ls-remote --symref "$BARE" HEAD 2>/dev/null | head -1)"
 case "$hdr4" in *'refs/heads/main'*) okhdr=0 ;; *) okhdr=1 ;; esac
@@ -491,6 +492,68 @@ grep -q 'the push did NOT deliver this lane' "$O/logs/shim.log"; rcn3=$?
 ck "N4 …and the exit path does NOT record push=pushed for it: a 0 exit from the push is not a delivery" $rcn3
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
+# ⛔ N6 — AN UNREADABLE REMOTE ANSWER IS UNKNOWN, NOT "NO PROTECTED NAMES" (review cycle 2, finding 1,
+# REPRODUCED: `trunk` was pushed and moved when the bounded symref read returned nothing). The shim makes
+# only that read fail.
+mkdir -p "$TMP/bin-nosymref"
+{ printf '#!/bin/sh\ncase " $* " in *" ls-remote --symref "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-nosymref/git"
+chmod +x "$TMP/bin-nosymref/git"
+git -C "$WT" worktree add -q "$TMP/wt5" -b trunk 2>/dev/null
+pi_stub unpushed_landing
+: > "$O/logs/unknown.log"
+PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" PI_LOG="$O/pi8.log" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "unknown default" >>"$4.agent" 2>&1
+' _ "$GATE" "$TMP/wt5" "$O" "$O/logs/unknown.log" "$PROMPT"
+arm "$O/logs/unknown.log"
+ck "N6 an unreadable default is REFUSED (refused-unknown-default), never pushed on {main,master} alone" \
+  $(grep -q 'refused-unknown-default' "$O/logs/unknown.log" && ! git -C "$BARE" rev-parse -q --verify refs/heads/trunk >/dev/null 2>&1 && echo 0 || echo 1)
+# ⛔ N7 — next= must not name an archive ref that cannot exist (review cycle 2, finding 3, REPRODUCED:
+# a clean, successfully-pushed tree was told to `git fetch origin refs/wip/…`, which fails).
+grep -q '^next=nothing to recover' "$O/state/lane-exit-unpushed_exit.state" 2>/dev/null \
+  && ! grep -q 'refs/wip/durable' "$O/state/lane-exit-unpushed_exit.state" 2>/dev/null; rcn7=$?
+ck "N7 a clean tree whose branch is on origin gets next='nothing to recover … IS on origin', not a fetch of a ref that was never created" $rcn7
+# ⛔ N8 — an unreadable HEAD is NOT a verification (review cycle 2, finding 2, REPRODUCED: a shim push plus
+# an unreadable HEAD recorded push=pushed and claimed '= this worktree HEAD').
+mkdir -p "$TMP/bin-nohead"
+{ printf '#!/bin/sh\ncase " $* " in *" rev-parse HEAD "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-nohead/git"
+chmod +x "$TMP/bin-nohead/git"
+PATH="$TMP/bin-nohead:$PATH" O="$O" bash -c '
+  . "$1"
+  LANE_END_LOG=/dev/null
+  lane_end_push "no head" /dev/null "$2" durable 1 1
+  printf "push=%s" "$LANE_END_PUSH"
+' _ "$GATE" "$WT2" 2>/dev/null > "$TMP/nohead.out"
+grep -q 'push=FAILED' "$TMP/nohead.out"; rcn8=$?
+ck "N8 …an unreadable HEAD records push=FAILED, never push=pushed (measured: $(head -c 60 "$TMP/nohead.out"))" $rcn8
+# ⛔ N9 — A FAILED LATER WRITE MUST NOT DELETE THIS TERMINAL'S OWN PRE-NETWORK MARKER (review cycle 2,
+# finding 5, REPRODUCED: an ENOSPC-shaped mktemp failure at the final write left NO marker at all).
+mkdir -p "$TMP/mkO/state"
+O="$TMP/mkO" bash -c '
+  . "$1"
+  LANE_END_LOG=/dev/null; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_DIRTY=0
+  LANE_END_MARKER_FRESH=1; LANE_END_PUSH=running
+  lane_end_marker "marker keep" 0 0
+  # ENOSPC'"'"'s shape, made deterministic: the directory refuses the NEXT create while the existing file
+  # (and its unlink) still works. Verified by N9b below, so a root run cannot pass this vacuously.
+  chmod 500 "$O/state"
+  # ⛔ THE INJECTION IS PROVEN INSIDE THE WINDOW IT IS USED IN (review cycle 3): the earlier version probed
+  # AFTER restoring 0700, so the create always succeeded and the arm passed whether or not the injection
+  # was real - an inert assertion, the very class this suite exists to refuse.
+  mktemp "$O/state/.probe.XXXXXX" >/dev/null 2>&1 && printf 'INJ=0\n' || printf 'INJ=1\n'
+  LANE_END_PUSH=pushed
+  lane_end_marker "marker keep" 0 0
+  chmod 700 "$O/state"
+' _ "$GATE" 2>/dev/null > "$TMP/n9.out"
+chmod 700 "$TMP/mkO/state" 2>/dev/null
+[ -s "$TMP/mkO/state/lane-exit-marker_keep.state" ] && grep -qx 'push=running' "$TMP/mkO/state/lane-exit-marker_keep.state"; rcn9=$?
+ck "N9 …and a failed FINAL marker write leaves the earlier one intact (push=running still on disk, not an absence)" $rcn9
+grep -q 'INJ=1' "$TMP/n9.out"; mkmk=$?
+ck "N9b …and the injection is real on THIS host (the in-window probe: a create in the 0500 state dir FAILED, so N9 cannot pass vacuously) [probe=$(head -1 "$TMP/n9.out" 2>/dev/null)]" $mkmk
 git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 
