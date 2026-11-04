@@ -491,8 +491,27 @@ prune_entry() { # <entry> <root>
     return 0
 }
 
+# root_is_listable <root> — 0 the listing ANSWERED (even with nothing in it), 1 it could not.
+# ⛔ AN UNREADABLE ROOT IS NOT AN EMPTY ROOT, and the difference is the whole point of this class.
+# `[ -d "$root" ]` needs only a stat, so it SUCCEEDS on a directory this process may not READ (mode
+# 0750/0711 owned by another user — plausible on a cell whose runners the root bring-up installed while
+# the reaper runs as `cmux`). `"$root"/*/` then expands to ITSELF, the loop body never runs, and the pass
+# would print `roots=1 candidates=0 kept=0 unmeasurable=0 census=ok`, exit 0 — the entry point would
+# record `candidates_runner_work=0 verdict_runner_work=ok` and an INERT class would read healthy. That is
+# the shape the header above forbids, one level ABOVE `entry_written_since`'s abstention, so it gets the
+# same answer: ASK, and when nothing answers, say so instead of printing a zero.
+# The probe is a bounded single-level listing through the same helper every other read uses, so a vanished
+# mount or a watchdog timeout is an abstention too.
+root_is_listable() { # <root>
+    local root="$1" probe="$SCRATCH/root.$$"
+    tb_timeout "$FIND_TIMEOUT" find "$root" -mindepth 1 -maxdepth 1 -print >"$probe" 2>/dev/null \
+        || { rm -f "$probe" 2>/dev/null; return 1; }
+    rm -f "$probe" 2>/dev/null
+    return 0
+}
+
 sweep_root() { # <_work root>
-    local root="$1" e
+    local root="$1" e _seen=0
     ROOTS=$((ROOTS + 1))
     for e in "$root"/*/; do
         e="${e%/}"
@@ -502,8 +521,17 @@ sweep_root() { # <_work root>
         # measured). A link is not a job's checkout; it is skipped silently, because naming every link in
         # every runner on every pass is noise.
         [ -d "$e" ] && [ ! -L "$e" ] || continue
+        _seen=1
         prune_entry "$e" "$root"
     done
+    # ⛔ THE ROOT ITSELF IS A MEASUREMENT. Only reached when the expansion produced NOTHING — the one case
+    # where "nothing is here" and "I could not look" are indistinguishable from the loop alone. Counted in
+    # the SAME abstention channel an unreadable ENTRY uses, so `candidates=` still reports what WAS seen
+    # while `unmeasurable=` names what was not, and `note_runner_work=` surfaces it end to end.
+    if [ "$_seen" = 0 ] && ! root_is_listable "$root"; then
+        UNMEASURABLE=$((UNMEASURABLE + 1))
+        log_line "KEPT   $root reason=unlistable (the root EXISTS but its listing could not be READ, so nothing under it was measured; an abstention, never an empty population)"
+    fi
     return 0
 }
 

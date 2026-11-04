@@ -40,8 +40,13 @@
 #                                                                 dirs (19 G measured on one cell at
 #                                                                 98%): an entry is removed ONLY when
 #                                                                 its newest CONTENT is older than the
-#                                                                 mtime floor, and `_work/_tool` /
-#                                                                 `_work/_actions` are retained
+#                                                                 mtime floor, and the runner's OWN
+#                                                                 `_work` namespace is retained — the
+#                                                                 set is DERIVED from `WORK_LAYOUT` in
+#                                                                 `scripts/reap-runner-work.sh`, which
+#                                                                 is its one declaration (see the class
+#                                                                 comment below); it is deliberately not
+#                                                                 restated here
 #
 # ⛔ IT NEVER DELETES A SINK ITSELF. The only recursive delete in this file is its OWN lock dir — by the
 # pass that acquired it, or a lock whose recorded owner is provably GONE and which is older than the
@@ -2376,8 +2381,11 @@ reap_runner_work() {
         ''|*[!0-9]*) : ;;                       # unanswered: `RW_UNMEAS` stays `?`, never an invented 0
         *) RW_UNMEAS="$_rw_unmeasurable"
            # A nonzero tally is NAMED in the note, because it is a decision an operator must be able to
-           # find without knowing the field exists: these entries were KEPT for want of an answer.
-           [ "$RW_UNMEAS" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${RW_UNMEAS} entr$( [ "$RW_UNMEAS" = 1 ] && printf 'y' || printf 'ies') KEPT as unreadable (the bounded walk could not answer, which is never proof of death); see unmeasurable_runner_work" ;;
+           # find without knowing the field exists: these entries/roots were KEPT for want of an answer.
+           # ⛔ "entries" ALONE IS INCOMPLETE AT THIS HEAD: the owner also counts a ROOT whose listing
+           # could not be read (`reason=unlistable`) into the same field, because that is the same
+           # abstention one level up — a root it could not look into was never measured either.
+           [ "$RW_UNMEAS" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${RW_UNMEAS} entr$( [ "$RW_UNMEAS" = 1 ] && printf 'y' || printf 'ies')/root$( [ "$RW_UNMEAS" = 1 ] && printf '' || printf 's') KEPT as unreadable (the bounded walk could not answer, which is never proof of death); see unmeasurable_runner_work" ;;
     esac
     # ⛔ AN EXPLICIT GLOB LIST THAT MATCHED NOTHING IS `misconfigured`, NEVER A MEASURED ZERO — the same
     # rule (and the same shape) as `venv-no-repo`: a class that scanned NOTHING is not a pass, and the

@@ -148,6 +148,40 @@ mk_entry() { # <work-root> <name> <minutes-old> [size-mb]
     printf '%s' "$w"
 }
 
+# ⛔ A FIXTURE THAT COULD NOT BE BUILT IS A CASE FAILURE — never a PASS, and never a VACUOUS assertion.
+# One wrapper closes a whole class of holes that a reviewer measured at this head, and it closes them for
+# EVERY call site at once because it becomes the only way an entry is created:
+#
+#  (1) `mk_entry` prints its path ONLY on success (it `return 1`s BEFORE the `printf`), so a caller that
+#      discarded its exit status got an EMPTY variable — and `[ ! -e "" ]` is **TRUE**, which made
+#      "the OLD entry WAS removed under --apply" PASS against a directory that had never been created.
+#      Every `[ ! -e "$dead" ]` / `[ -d "$live" ]` in this file is fed from an entry, so one check here
+#      covers the class instead of ten hand-written ones a future edit can forget.
+#  (2) `age_tree … || return $((CASE_FAIL > 0))` was an EARLY-EXIT guard copied from a case's FINAL line,
+#      where that expression is correct. At the HEAD of a case `CASE_FAIL` is still 0, so a fixture that
+#      could not be aged returned **0 = PASS** — `expect_pass` printed ✅ for a case whose assertions
+#      never ran. That is the same stale-mutation hole the docblock above calls out, on the fixture
+#      side. `fixture_age` returns 1 unconditionally on failure.
+#
+# ⛔ AND IT IS NOT A `$( )` WRAPPER THAT CALLS `case_check`: a command substitution runs in its OWN
+# subshell, so the increment would be discarded and the case would read PASS anyway — the same reason
+# `skip()` writes its reason to a file. `printf -v` assigns in the CALLER's shell.
+fixture_entry() { # <var-name> <work-root> <name> <minutes-old> [size-mb]
+    local __v="$1" __p; shift
+    __p="$(mk_entry "$@")"
+    if [ -z "$__p" ] || [ ! -d "$__p" ]; then
+        case_check 1 "fixture: the entry '$2' could not be built — this case's assertions would be vacuous, so it MUST NOT pass"
+        return 1
+    fi
+    printf -v "$__v" '%s' "$__p"
+}
+
+fixture_age() { # <path> <minutes> — aging a fixture is part of BUILDING it, so a failure is the case's
+    age_tree "$1" "$2" && return 0
+    case_check 1 "fixture: cannot age '$1' — an un-aged entry describes a LIVE job by this class's own definition, so the case would assert the opposite of what it built"
+    return 1
+}
+
 # uniqstate <tag> — a FRESH state dir per invocation. ⛔ NEVER A FIXED NAME: with one name, a real run
 # followed by a MUTANT run leaves the real pass's record in place whenever the mutant writes none, and
 # every assertion is then satisfied by the previous pass — measured: it is why the (f) mutation survived
@@ -195,8 +229,8 @@ case_a() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work out rc st young1 young2 s1 s2
     PASS_OWNER="$owner"
     base="$T/a.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-2)"
-    young1="$(mk_entry "$work" job-live 0 8)"      # written NOW: a job is running in it
-    young2="$(mk_entry "$work" job-busy 5)"        # 5 min: younger than the 60 min floor
+    fixture_entry young1 "$work" job-live 0 8 || return 1      # written NOW: a job is running in it
+    fixture_entry young2 "$work" job-busy 5 || return 1        # 5 min: younger than the 60 min floor
     s1="$(uniqstate a1)"; s2="$(uniqstate a2)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --dry-run --only runner-work)"; rc=$?
     case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "dry-run exits 0 with nothing to reap (rc=$rc)"
@@ -224,7 +258,7 @@ case_b() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead out rc st n freed s1 s2 s3 ps_out
     PASS_OWNER="$owner"
     base="$T/b.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-4)"
-    dead="$(mk_entry "$work" job-killed 180 24)"   # 3 h old, 24 MB of real bytes: a dead checkout
+    fixture_entry dead "$work" job-killed 180 24 || return 1   # 3 h old, 24 MB of real bytes: a dead checkout
     s1="$(uniqstate b1)"; s2="$(uniqstate b2)"; s3="$(uniqstate b3)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --dry-run --only runner-work)"; rc=$?
     case_check "$([ -d "$dead" ] && echo 0 || echo 1)" "the DRY RUN removed NOTHING (the dead entry is still there)"
@@ -283,7 +317,13 @@ case_b() { # <entry-point> <owner>
     # `|`-joined line", so a `^verdict_…$` grep "could never match". MEASURED FALSE: `print_status` emits
     # **43 lines, one `key=value` per line, with ZERO `|`**, and `grep -c '^verdict_runner_work=ok$'`
     # returns **1**. An anchored grep DOES match here, and the rest of the repo relies on exactly that
-    # (`cloud-cell-supervisor.sh:3973` parses this very output with `sed -n 's/^status=//p'`). The
+    # (`cloud-cell-supervisor.sh:4142` parses this very output with `sed -n 's/^status=//p'`). The
+    # ⛔ CITATION CORRECTED AT THIS HEAD: this line used to say `:3973`, and a reviewer checked it —
+    # `grep -n "sed -n 's/^status=//p'" scripts/cloud-cell-supervisor.sh` returns exactly ONE hit, at
+    # `:4142` (inside the delegate-status read `_dst="$(printf '%s\n' "$_drs" | sed -n … )"`); `:3973`
+    # is inside the controller-liveness probe and contains no such read. The CLAIM was true and its
+    # PROOF pointed at unrelated code — the exact defect this PR has shipped three times, so it is
+    # corrected rather than reworded.
     # field-boundary form below is therefore a harmless SUPERSET of the anchored one, kept because it is
     # what the reader-only mutant proves discriminates — NOT because the anchored form cannot work. The
     # real cause of the original red is the one named next: the suite runs `set -uo pipefail` (:59), and a
@@ -301,13 +341,13 @@ case_c() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead out rc s1
     PASS_OWNER="$owner"
     base="$T/c.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-6)"
-    dead="$(mk_entry "$work" job-abandoned 300)"
+    fixture_entry dead "$work" job-abandoned 300 || return 1
     # OLDER than the dead job: if the mtime gate alone decided, these would go first.
     mkdir -p "$work/_tool/node/20/bin" "$work/_actions/checkout/v4/dist"
     printf 'toolchain\n' >"$work/_tool/node/20/bin/node"
     printf 'action\n' >"$work/_actions/checkout/v4/dist/index.js"
-    age_tree "$work/_tool" 600 || return $((CASE_FAIL > 0))
-    age_tree "$work/_actions" 600 || return $((CASE_FAIL > 0))
+    fixture_age "$work/_tool" 600 || return 1
+    fixture_age "$work/_actions" 600 || return 1
     s1="$(uniqstate c1)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
     case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
@@ -335,19 +375,19 @@ case_j() { # <entry-point> <owner>
     PASS_OWNER="$owner"
     base="$T/j.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-8)"
     # a LIVE job: its checkout was written a moment ago, so the floor KEEPS it …
-    live="$(mk_entry "$work" job-live 0)"
+    fixture_entry live "$work" job-live 0 || return 1
     # … while `_temp` still holds this step's script and the job's command log, written before the floor
     mkdir -p "$work/_temp"
     printf '#!/bin/sh\nset -e\n' >"$work/_temp/2f1c9d4e-0000-4000-8000-000000000000.sh"
     printf 'step log\n' >"$work/_temp/commands.log"
-    age_tree "$work/_temp" 600 || return $((CASE_FAIL > 0))
+    fixture_age "$work/_temp" 600 || return 1
     # and a directory in the runner's `_` namespace that the layout table has never seen — the NEXT one
     # the vendor adds. It must arrive as a NAMED decision, not as another silent reap candidate.
     mkdir -p "$work/_vendor_added_later/x"
     printf 'staging\n' >"$work/_vendor_added_later/x/blob"
-    age_tree "$work/_vendor_added_later" 600 || return $((CASE_FAIL > 0))
+    fixture_age "$work/_vendor_added_later" 600 || return 1
     # the pairing: a genuinely dead checkout in the SAME pass, so this is not a blanket refusal
-    dead="$(mk_entry "$work" job-abandoned 300)"
+    fixture_entry dead "$work" job-abandoned 300 || return 1
     s1="$(uniqstate j1)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
     case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
@@ -398,13 +438,13 @@ case_k() { # <entry-point> <owner> — a `reap` row must be reaped, and nothing 
     variant="$T/k-var.$$.$RANDOM/reap-runner-work.sh"
     case_check "$(mk_reap_variant "$owner" "$variant" && echo 0 || echo 1)" \
                "the \`_foo|reap|…\` row could be written into a copy of the owner"
-    [ -x "$variant" ] || return $((CASE_FAIL > 0))
+    [ -x "$variant" ] || return 1
     PASS_OWNER="$variant"
     base="$T/k.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-9)"
     # the OPERATOR-DECIDED name: `_`-prefixed, so ONLY its own row can lift it out of the over-retain default
-    foo="$(mk_entry "$work" _foo 300)"
+    fixture_entry foo "$work" _foo 300 || return 1
     # the control: an UNDECIDED checkout, reaped in the same pass — the retention is not a blanket refusal
-    dead="$(mk_entry "$work" job-dead 300)"
+    fixture_entry dead "$work" job-dead 300 || return 1
     # and the four the table RETAINS, at the SAME age, so `reap` cannot be honoured by ignoring `retain`
     mkdir -p "$work/_temp" "$work/_actions/checkout/v4" "$work/_tool/node/20" "$work/_update/stage"
     printf 'step\n' >"$work/_temp/commands.log"
@@ -412,7 +452,7 @@ case_k() { # <entry-point> <owner> — a `reap` row must be reaped, and nothing 
     printf 'bin\n'  >"$work/_tool/node/20/node"
     printf 'mark\n' >"$work/_update/stage/marker"
     for d in _temp _actions _tool _update; do
-        age_tree "$work/$d" 600 || return $((CASE_FAIL > 0))
+        fixture_age "$work/$d" 600 || return 1
     done
     s1="$(uniqstate k1)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
@@ -443,7 +483,7 @@ case_d() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead out out2 st c s1 s2
     PASS_OWNER="$owner"
     base="$T/d.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-7)"
-    dead="$(mk_entry "$work" job-dead 200)"
+    fixture_entry dead "$work" job-dead 200 || return 1
     s1="$(uniqstate d1)"; s2="$(uniqstate d2)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --dry-run --only runner-work)"
     st="$(status_of "$s1")"
@@ -552,7 +592,7 @@ case_g() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead out rc fb s_home s_cfg st
     PASS_OWNER="$owner"
     base="$T/g.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-2)"
-    dead="$(mk_entry "$work" job-abandoned 120 4)"
+    fixture_entry dead "$work" job-abandoned 120 4 || return 1
     fb="$T/g.fb.$$.$RANDOM"; mkdir -p "$fb" "$T/tmpfs-g$$"
     s_home="$HOME/.pi/agent/state"; mkdir -p "$s_home"
     s_cfg="$base/configured"; mkdir -p "$s_cfg"
@@ -635,6 +675,52 @@ case_i() { # <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (l) an UNLISTABLE root is an ABSTENTION, never a measured zero ─────────────────────────────
+# ⛔ FOUND BY A REVIEW AT THIS HEAD, and it is this class's own rule applied one level UP. `[ -d "$root" ]`
+# needs only a stat, so it SUCCEEDS on a `_work` this process may not READ (mode 0750/0711 owned by
+# another user — plausible on a cell whose runners the root bring-up installed while the reaper runs as
+# `cmux`). `"$root"/*/` then expands to ITSELF, the loop body never runs, and before this arm the pass
+# printed `roots=1 candidates=0 kept=0 unmeasurable=0 census=ok`, exit 0; the entry point recorded
+# `candidates_runner_work=0 verdict_runner_work=ok`; and an INERT class read HEALTHY — the exact shape
+# this reaper exists to remove. The dead entry under the unreadable root must also SURVIVE, because
+# nothing was classified and this is a deleter.
+case_l() { # <entry-point> <owner>
+    local pass="$1" owner="$2" base work dead out rc s1 sum
+    PASS_OWNER="$owner"
+    base="$T/l.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-10)"
+    fixture_entry dead "$work" job-abandoned 300 || return 1
+    # 0111 = stat-able and traversable, NOT listable. A `chmod` cannot deny root, so the arm is SKIPPED
+    # there rather than asserted: a case that cannot make the condition is not a case (see `skip`).
+    chmod 0111 "$work" 2>/dev/null || { skip "(l) an UNLISTABLE root: chmod is unavailable on this host, so the arm was NOT measured"; return 0; }
+    if [ -r "$work" ]; then
+        chmod 0755 "$work" 2>/dev/null
+        skip "(l) an UNLISTABLE root: this process can read a mode-0111 directory anyway (running as root), so the arm was NOT measured"
+        return 0
+    fi
+    s1="$(uniqstate l1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    # RESTORE BEFORE ANY ASSERTION — a 0111 `_work` would defeat the trap's `rm -rf "$T"` on the way out.
+    chmod 0755 "$work" 2>/dev/null
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
+               "an abstention is not a FAILURE, so the pass exits 0 (rc=$rc)"
+    case_check "$([ -e "$dead" ] && echo 0 || echo 1)" \
+               "the dead entry under the unreadable root SURVIVED — nothing was classified, so nothing may be removed"
+    case_check "$(grep -qF 'roots=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… the root WAS counted (it exists), so this is not 'no population' (summary: ${sum:-<none>})"
+    case_check "$(grep -qF 'candidates=0 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… and nothing under it was reached"
+    case_check "$(grep -qF 'unmeasurable=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… counted as UNMEASURABLE, which is the abstention — not folded into a measured zero"
+    case_check "$(grep -qF 'reason=unlistable' <<<"$out" && echo 0 || echo 1)" \
+               "… and NAMED, so 'why is this still here' has an answer instead of a number an operator must guess at"
+    case_check "$(grep -qF 'unmeasurable_runner_work=1' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the entry point's RECORD carries it, so the abstention reaches the status channel (not just the log)"
+    case_check "$(grep -q 'note_runner_work=1 entry/root KEPT as unreadable' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the NOTE names it, so an operator finds it without knowing the field exists"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
@@ -679,6 +765,9 @@ MUT_U="s/^            misconfigured) printf '?' ;;$/            misconfigured) p
 # unlisted-vendor default, which is what makes the NEXT vendor directory safe.
 MUT_J1='/^_temp|retain|live-job-temp|/d'
 MUT_J2='s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
+# (l)'s arm: the whole "the root itself is a measurement" guard. Deleting it restores the measured-zero
+# reading a reviewer found at this head, so if this mutant ever survives the abstention has gone inert.
+MUT_L='s/^    if \[ "\$_seen" = 0 \] && ! root_is_listable "\$root"; then$/    if false; then/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -796,6 +885,13 @@ if apply_mutation "$REAPER" "$T/mut-u/disk-reaper.sh" "$MUT_U"; then
     expect_fail "u mutation: answering a misconfigured class with not-run turns (f) RED — the '?' polarity" case_f "$T/mut-u/disk-reaper.sh" "$OWNER"
 else
     bad "u mutation could not be applied (the unmeasurable polarity moved) — that field is not checked any more"
+fi
+
+expect_pass "l a root that cannot be LISTED is an abstention, never a measured zero" case_l "$REAPER" "$OWNER"
+if apply_mutation "$OWNER" "$T/mut-l/reap-runner-work.sh" "$MUT_L"; then
+    expect_fail "l mutation: deleting the root-is-a-measurement guard turns the case RED (it is an abstention, not a zero)" case_l "$REAPER" "$T/mut-l/reap-runner-work.sh"
+else
+    bad "l mutation could not be applied (the unlistable-root arm moved) — the case is not checking it any more"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
