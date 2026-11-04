@@ -3808,6 +3808,17 @@ ledger_all_live() {
 # for everything and reads exactly like a healthy FIFO — is what produced the measured beat.
 rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written, verified reorder
   local pool="${1:-}" queue="${2:-}" out="${3:-}" cnt="${4:-}"
+  # ⛔ THE INPUTS ARE CHECKED FOR SHAPE BEFORE ANYTHING IS DERIVED FROM THEM (review P1, cycle 4).
+  # `[ -s ]` alone answers "is the size non-zero", NOT "can this be read as a queue": an ABSENT queue
+  # and a queue that is a DIRECTORY both fall out of it differently, and each produced a false answer
+  # in practice — measured on the shipped function: a directory at candidates.txt made awk print
+  # `warning: … is a directory: skipped`, the rank then emitted the POOL's rows as if they were queued
+  # (count `0 2 -`, rc 0) and the caller reported it with the "pool ranked NONE of the 2 queued"
+  # sentence. Absent → reported as a MEASURED drained queue (#1931's prohibition). So: a queue that is
+  # not a readable REGULAR file is `priority-unreadable` (the caller's failure arm, which touches
+  # nothing), and the DRAINED word is reserved for an existing, readable, empty file.
+  [ -f "$queue" ] && [ -r "$queue" ] || return 1
+  [ -f "$pool" ] && [ -r "$pool" ] || return 1
   # ⛔ AN EMPTY QUEUE IS NOT AN UNREADABLE ONE (review P2). `[ -s ]` used to send it down the failure
   # arm, which would have printed `priority-unreadable` over a fully drained queue — the routine state
   # after a good pass — and re-used a failure word for "there is nothing to order". It is a SUCCESS
@@ -3819,11 +3830,18 @@ rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written,
   fi
   # The POOL is the second file on purpose: its line order IS the rank, so iterating it emits the
   # queued members in severity order without a second sort key.
+  # ⛔ THE FILES ARE TOLD APART BY NAME, NOT BY POSITION (review P1, cycle 4). `NR==FNR` means "first
+  # file" ONLY while the first file yields records: when it yields NONE (an empty read, a skipped
+  # argument) FNR stops incrementing, so on the FIRST pool record NR==FNR is TRUE and the whole POOL is
+  # taken for the QUEUE. Measured on the shipped program with an empty first file: it printed `200`,
+  # `300` and wrote `0 2 -` — i.e. the reorder would have INSTALLED pool rows into candidates.txt,
+  # adding membership, the one thing "order, never membership" forbids. `FILENAME == ARGV[1]` is the
+  # file's IDENTITY: it cannot be true for the pool, whatever the queue did or failed to read.
   awk -v cntf="$cnt" '
     # `qseen` collapses a DUPLICATE queue row (review P2 — the tail is emitted from this array). At the
     # main call site the queue was already deduped by the `awk !seen` above, so this is belt-and-braces;
     # it never drops a DISTINCT row, which is what "order, never membership" is about.
-    NR==FNR { if (!($0 in qseen)) { qseen[$0] = 1; qorder[++nq] = $0 } next }
+    FILENAME == ARGV[1] { if (!($0 in qseen)) { qseen[$0] = 1; qorder[++nq] = $0 } next }
     { if (($0 in qseen) && !($0 in done)) {
           done[$0] = 1; print; ranked++
           if (head == "") head = $0 } }
@@ -3846,6 +3864,16 @@ rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written,
     [0-9]*' '*) : ;;   # `<ranked> <unranked> <head|->`; the caller parses each FIELD strictly below
     *) return 1 ;;
   esac
+  # ⛔ AND MEMBERSHIP IS CHECKED, NOT ASSUMED FROM THE AWK BEING RIGHT (review P1, cycle 4). Every guard
+  # above reasons about ONE read of the queue; the install is a LATER, separate decision, and the file
+  # can change in between (the prune in orch-loop.sh truncates it IN PLACE, no `.refresh.lock`). So the
+  # ROW SET about to be installed is compared with the row set the queue holds NOW: a partial or torn
+  # read can then only ever FAIL the reorder, leaving the queue untouched, instead of installing a
+  # truncated queue and calling it an order. `sort -u` compares SETS only — it never contributes an
+  # ordering, which stays the pool's rank alone (#1178).
+  if [ "$(LC_ALL=C sort -u "$queue" 2>/dev/null)" != "$(LC_ALL=C sort -u "$out" 2>/dev/null)" ]; then
+    return 1
+  fi
   return 0
 }
 # queue_order_from_pool <O> -> writes $O/candidates.txt in pool order, prints what it did (or why not)
@@ -3877,8 +3905,12 @@ queue_order_from_pool() {
   # inode is silently REVERTED by our `mv`, so a dispatched id reappears in the queue; (b) worse, if the
   # read caught the truncate window the queue reads EMPTY, and an unconditional `mv` would put a
   # ZERO-BYTE file over the queue and destroy its MEMBERSHIP — the one thing "ORDER, NEVER MEMBERSHIP"
-  # forbids. The window is narrow and the failure is total, so it is closed by construction rather than
-  # argued down: an unchanged order is not a rewrite.
+  # forbids. ⛔ AND THIS IS NOT THE ONLY GUARD ON THAT WINDOW (review P1, cycle 4): `cmp` is a SECOND
+  # read, so it closes only the ordering where the file is still empty when it runs. The structural
+  # guard is the caller's — `rank_queue_by_pool` refuses a queue that is not a readable regular file and
+  # refuses an install whose ROW SET differs from the queue's — and this skip is the cheap case that
+  # also spares a needless inode swap.
+  _wrote=0
   if cmp -s "$o/.cand.ranked" "$o/candidates.txt"; then
     rm -f "$o/.cand.ranked" 2>/dev/null
   elif ! mv "$o/.cand.ranked" "$o/candidates.txt"; then
@@ -3886,18 +3918,32 @@ queue_order_from_pool() {
     echo "[refresh] priority-unreadable: the pool-ordered queue could not be moved into $o/candidates.txt — the queue on disk is UNCHANGED (the pre-reorder file, i.e. whatever the PREVIOUS pass left), so its order is UNVERIFIED this pass and its severity is UNKNOWN"
     rm -f "$o/.cand.ranked" "$o/.queue-rank" 2>/dev/null
     return 1
+  else
+    _wrote=1
   fi
   _r=0; _u=0; _h=""
   read -r _r _u _h < "$o/.queue-rank" 2>/dev/null || true
-  case "${_r:-}" in ''|*[!0-9]*) _r=0 ;; esac
-  case "${_u:-}" in ''|*[!0-9]*) _u=0 ;; esac
+  # ⛔ AN UNREADABLE COUNT IS UNKNOWN, NOT ZERO — even here (review P2, cycle 4). Coercing a bad field
+  # to 0 landed the state in the EMPTY arm below, which is the very "a drained queue" claim that
+  # `rank_queue_by_pool` now refuses a reorder to make (it validates the count's FORMAT before
+  # returning). The polarity has to stay fail-CLOSED at both ends: a field that does not parse means the
+  # count cannot be read, so the provenance is `priority-unreadable` and the order is unverified — not
+  # "nothing queued".
+  case "${_r:-}" in ''|*[!0-9]*) _r="" ;; esac
+  case "${_u:-}" in ''|*[!0-9]*) _u="" ;; esac
   case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
+  if [ -z "$_r" ] || [ -z "$_u" ]; then
+    QUEUE_ORDER_STATE="priority-unreadable"
+    echo "[refresh] priority-unreadable: the reorder's COUNT could not be read back from $o/.queue-rank — this pass cannot say whether anything was ranked, so the queue's order is UNVERIFIED (not a drained queue)"
+    rm -f "$o/.queue-rank" 2>/dev/null
+    return 1
+  fi
   rm -f "$o/.queue-rank" 2>/dev/null
   if [ "$_r" -eq 0 ] && [ "$_u" -eq 0 ]; then
     # Nothing queued at all: a drained queue, not a blind one. REACHABLE ONLY FROM THE DRAINED-QUEUE
-    # ARM of rank_queue_by_pool (which writes `0 0 -`), because that function now REFUSES a reorder
-    # whose count it cannot read — so an unreadable count can never be laundered into this success
-    # word (review P2). The coercion above is belt-and-braces for a count file edited under us.
+    # ARM of rank_queue_by_pool (which writes `0 0 -`), because that function REFUSES a reorder whose
+    # count it cannot read AND the strict field parse above refuses to launder a bad one into zero — so
+    # this success word can only ever be written for a measured, readable, EMPTY queue (review P2).
     QUEUE_ORDER_STATE="empty"
     echo "[refresh] queue order: the queue is EMPTY — there is nothing to order"
     return 0
@@ -3908,13 +3954,22 @@ queue_order_from_pool() {
   else
     # Not a silent degradation: nothing in the queue is ranked by the pool, so the ORDER MEANS NOTHING.
     # ⛔ AND IT IS NOT "ARRIVAL ORDER" EITHER (review P2). This arm rewrites the file with the rows in
-    # their EXISTING order (the awk's END loop over `qorder`), so the bytes are unchanged — after any
-    # earlier ranking pass, "existing order" IS that pass's severity order, not the append order the
-    # rows arrived in. Reachable in a routine state (`.pool` legitimately EMPTY with a non-empty queue),
-    # and it is the same typed-claim defect this PR already fixed one arm over. Say only what was
-    # verified: this pass established NO priority order, and the file keeps the order it already had.
+    # their EXISTING order (the awk's END loop over `qorder`) — after any earlier ranking pass, "existing
+    # order" IS that pass's severity order, not the append order the rows arrived in. Reachable in a
+    # routine state (`.pool` legitimately EMPTY with a non-empty queue), and it is the same typed-claim
+    # defect this PR already fixed one arm over.
+    # ⛔ AND WHETHER THE BYTES MOVED IS REPORTED, NOT ASSUMED (review P2, cycle 4). This arm CAN rewrite
+    # the file: `qseen` collapses a DUPLICATE row, so `300 9 300` comes out `300 9` and the install
+    # runs. The first version of this sentence said "byte-identical" unconditionally, which was false
+    # in exactly that case — a typed claim about a write this call had just performed. `_wrote` is the
+    # answer, from the `cmp`/`mv` that actually decided it.
     QUEUE_ORDER_STATE="priority-unreadable"
-    echo "[refresh] priority-unreadable: the pool ranked NONE of the $_u queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — candidates.txt keeps the order it ALREADY had (byte-identical; not re-derived here, and NOT this pass's arrival order either): read it as UNRANKED, never as \"severity-ordered\""
+    if [ "${_wrote:-0}" -eq 1 ]; then
+      _wrote_said="candidates.txt WAS rewritten in its existing order (duplicate rows collapsed; the SEQUENCE was not re-derived here, and is NOT this pass's arrival order either)"
+    else
+      _wrote_said="candidates.txt was left UNTOUCHED (byte-identical; the sequence was not re-derived here, and is NOT this pass's arrival order either)"
+    fi
+    echo "[refresh] priority-unreadable: the pool ranked NONE of the $_u queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
     echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry"
@@ -3957,8 +4012,19 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
       echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged) and the queue is empty, so dispatch has nothing to take"
     fi
     REFRESH_RECORDED=1
+    # ⛔ THE RECORD NAMES THE PROVENANCE IT ACTUALLY HAS, PER STATE (review P2, cycle 4). The literal used
+    # to read "the ORDER was re-derived from the pool: ${QUEUE_ORDER_STATE}", so a `priority-unreadable`
+    # pass — the one where the order could NOT be re-derived — composed into "…was re-derived from the
+    # pool: priority-unreadable": the same clause asserting both that it happened and that it did not,
+    # in the field that OUTLIVES the log line. One clause per state, chosen from the state.
+    case "${QUEUE_ORDER_STATE:-}" in
+      severity)            _skip_order_why="the ORDER was re-derived severity-first from the pool" ;;
+      empty)               _skip_order_why="nothing was queued, so there was no ORDER to derive" ;;
+      priority-unreadable) _skip_order_why="the ORDER could NOT be re-derived this pass — it is UNVERIFIED (whatever the PREVIOUS pass left, or unranked)" ;;
+      *)                   _skip_order_why="the ORDER's provenance was NOT recorded by this pass — treat it as UNVERIFIED" ;;
+    esac
     refresh_record_write ok skip 0 \
-      "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, and NO candidate added or dropped (the ORDER was re-derived from the pool: ${QUEUE_ORDER_STATE:-unknown}; a duplicate row, if the queue somehow carried one, is collapsed to its first occurrence)" \
+      "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, and NO candidate added or dropped ($_skip_order_why; a duplicate row, if the queue somehow carried one, is collapsed to its first occurrence)" \
       "judged=0" "backlog=$_skip_n" "handed=$_skip_head" "unusable="
     exit 0
   fi
