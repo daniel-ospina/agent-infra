@@ -157,7 +157,34 @@ mandate_missing() {
     [ -n "$spec" ] || continue
     name="${spec%%|*}"
     [ -n "$name" ] || continue
-    [ -f "$root/$name" ] || printf '%s\n' "$root/$name"
+    # ⛔ AN OCCUPIED PATH IS NOT AN ABSENT ONE (this change's review, P2, measured): a DIRECTORY sitting
+    # where a declared file belongs made `[ -f ]` false, so the verb printed it as MISSING and told the
+    # operator to SHIP a file the path cannot hold. That is the state-dir arm's own rule ("exists but is
+    # not a directory … a deployment fault, not an absence") applied one level up, where it was missing.
+    [ -e "$root/$name" ] && continue
+    printf '%s\n' "$root/$name"
+  done <<EOF
+$(mandate_files)
+EOF
+}
+
+# mandate_irregular — one absolute path per declared file whose PATH IS OCCUPIED by something that is not a
+# regular file (a directory, a FIFO, a device, a socket). A distinct fact from both absence and
+# unreadability, with a third remedy: neither `ship the file` nor `chmod` applies, the occupant must be
+# moved. Found by this change's review (P2, measured) as the one cell of the ABSENT/UNREADABLE table that
+# still answered with the wrong remedy.
+mandate_irregular() {
+  local root spec name
+  root="$(mandate_state_root)"
+  if mandate_state_root_undecidable; then return 0; fi
+  while IFS= read -r spec; do
+    [ -n "$spec" ] || continue
+    name="${spec%%|*}"
+    [ -n "$name" ] || continue
+    # `-e` true and `-f` false IS the occupied-by-a-non-file case. A dangling symlink is deliberately NOT
+    # here: `-e` is false for it, so it stays in the MISSING arm, where "ship the file" is the right answer
+    # (replacing the link is how you fix it).
+    if [ -e "$root/$name" ] && [ ! -f "$root/$name" ]; then printf '%s\n' "$root/$name"; fi
   done <<EOF
 $(mandate_files)
 EOF
@@ -196,7 +223,7 @@ EOF
 # and brief stay byte-for-byte what they were (an always-on banner is noise a reader learns to skip, and
 # a warning that is always printed is not a warning).
 mandate_preflight_line() {
-  local root path why missing unreadable
+  local root path why missing unreadable irregular
   root="$(mandate_state_root)"
   # ⛔ AN UNREADABLE STATE DIR MAKES `-f` FALSE FOR EVERY FILE UNDER IT, so testing the files first
   # reported the whole dir's contents as MISSING — a false ABSENCE claim about files that may be
@@ -210,7 +237,8 @@ mandate_preflight_line() {
   fi
   missing="$(mandate_missing)"
   unreadable="$(mandate_unreadable)"
-  [ -n "$missing$unreadable" ] || return 0
+  irregular="$(mandate_irregular)"
+  [ -n "$missing$unreadable$irregular" ] || return 0
   printf '%s\n' "$(mandate_sentinel)"
   printf '[mandate-preflight] ⛔ MANDATE-UNSATISFIABLE on this box (%s) — the lane was ORDERED to read this before working, and it cannot, so that instruction CANNOT be obeyed. Say so plainly in your report; do NOT claim to have read it (agent-infra#3377):\n' "$(hostname 2>/dev/null || printf 'this box')"
   while IFS= read -r path; do
@@ -225,6 +253,12 @@ EOF
   done <<EOF
 $unreadable
 EOF
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    printf '[mandate-preflight]   NOT-A-FILE %s — this path is occupied by something that is not a regular file, so shipping one cannot work and the remedy is neither a deployment nor a chmod: move the occupant aside (%s).\n' "$path" "$(mandate_why "${path##*/}")"
+  done <<EOF
+$irregular
+EOF
   printf '[mandate-preflight] There is NO provisioning path for these files today (they exist in no repo; #1193 owns the content, #3377 this report). Proceed with the BRIEF'"'"'s own text as the authority, and name this absence in your final message.\n'
 }
 
@@ -238,8 +272,12 @@ mandate_preflight_emit() {
   # to swallow the renderer's stderr, so a failure produced an empty `line` and the `[ -n ]` guard read it
   # as "every file is present" and returned 0 in silence — the exact defect this file exists to end. An
   # empty render is now only trusted AFTER the state has been re-read independently.
-  line="$(mandate_preflight_line 2>/dev/null)"
-  if [ -z "$line" ] && { [ -n "$(mandate_missing)$(mandate_unreadable)" ] || mandate_state_root_undecidable; }; then
+  # ⛔ AND THE ASSIGNMENT ITSELF MUST NOT ABORT A `set -e` CALLER (this change's review, P2, measured):
+  # a bare `v="$(cmd)"` takes the SUBSTITUTION's status, so a failing renderer terminated an `errexit`
+  # caller at THIS line — before the disclosure was appended and before the dispatch could start, which
+  # is the over-block the header forbids. `|| :` makes it a read, like every other write in this file.
+  line="$(mandate_preflight_line 2>/dev/null)" || :
+  if [ -z "$line" ] && { [ -n "$(mandate_missing)$(mandate_unreadable)$(mandate_irregular)" ] || mandate_state_root_undecidable; }; then
     line="$(printf '%s\n[mandate-preflight] CANNOT VERIFY %s: the mandate check reported the mandated files present-but-unreadable or missing, yet the renderer produced NOTHING — a cannot-verify is never a pass (agent-infra#3377).' "$(mandate_sentinel)" "$label")"
   fi
   # ⛔ THE GUARD IS CONTENT-AWARE, NOT PRESENCE-ONLY (this change's review, P2 — measured, and it is the
@@ -275,7 +313,12 @@ mandate_preflight_emit() {
   has_brief=""; brief_text=""; stamped=""; current=""
   if [ -n "$prompt" ] && [ -f "$prompt" ]; then
     has_brief=1
-    brief_text="$(cat "$prompt" 2>/dev/null)"
+    # ⛔ `[ -f ]` IS TRUE FOR A MODE-000 FILE, so the guard above passes and `cat` fails (this change's
+    # review, P2, measured: `set -e; . helper; mandate_preflight_emit …` printed no `REACHED-AFTER-EMIT`
+    # and exited 1). A bare assignment takes the substitution's status, so the caller died HERE — with the
+    # disclosure skipped and no dispatch. `|| :` makes an unreadable brief read as an empty one, which is
+    # the truthful answer: nothing can be claimed about what it already says.
+    brief_text="$(cat "$prompt" 2>/dev/null)" || :
     case "$brief_text" in *"$(mandate_sentinel)"*) stamped=1 ;; esac
     if [ -n "$line" ]; then case "$brief_text" in *"$line") current=1 ;; esac; fi
   fi
@@ -326,7 +369,7 @@ mandate_preflight_emit() {
   brief_payload="$line"
   if [ -n "$stamped" ]; then
     notice="$(printf '[mandate-preflight] ⤴ SUPERSEDES the mandate block(s) earlier in this brief: box state has CHANGED, so the block BELOW is the CURRENT reading and every earlier one is stale — use only what follows (agent-infra#3377).')"
-    brief_payload="$(printf '%s\n%s' "$notice" "$line")"
+    brief_payload="$(printf '%s\n%s' "$notice" "$line")" || :
   fi
   # ⛔ GROUP THE REDIRECT WITH THE COMMAND (#3377 review, P2): `printf … >> "$prompt" 2>/dev/null` applies
   # left-to-right, so the FAILING `>>` emitted its raw `: <path>: Permission denied` to the caller's stderr
@@ -353,6 +396,12 @@ mandate_verdict() {
   fi
   if [ -n "$(mandate_unreadable)" ]; then
     mandate_unreadable | sed 's/^/[mandate-preflight] CANNOT VERIFY (unreadable) /' >&2
+    return 2
+  fi
+  # ⛔ AN OCCUPIED PATH OUTRANKS MISSING for the same reason UNREADABLE does: "ship the file" cannot fix a
+  # path that something else already occupies, so answering 1 sends the operator at the wrong remedy.
+  if [ -n "$(mandate_irregular)" ]; then
+    mandate_irregular | sed 's/^/[mandate-preflight] CANNOT VERIFY (not a regular file) /' >&2
     return 2
   fi
   if [ -n "$(mandate_missing)" ]; then
