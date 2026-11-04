@@ -116,7 +116,7 @@ git -C "$AI_MAIN" fetch -q origin main 2>/dev/null || true
 REV="$(git -C "$AI_MAIN" rev-parse --short "$SRC_REF" 2>/dev/null)"
 [ -n "$REV" ] || { log "FATAL: cannot resolve $SRC_REF in $AI_MAIN"; exit 1; }
 rm -rf "$STAGE"; mkdir -p "$STAGE"
-git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness scripts/lib/lane-ceiling.sh | tar -x -C "$STAGE" || {
+git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness | tar -x -C "$STAGE" || {
   log "FATAL: could not extract the harness from $SRC_REF"; exit 1; }
 H="$STAGE/scripts/orchestrator-harness"
 [ -f "$H/claims.sh" ] || { log "FATAL: $SRC_REF has no claims.sh — refusing to deploy"; exit 1; }
@@ -295,22 +295,6 @@ for f in "$H"/*; do
   if [ -d "$f" ]; then cp -R "$f" "$O/"; else install_file "$f" "$O/$b"; fi
 done
 log "phase A: copied $(ls "$H" | grep -vc '^orch-loop.sh$') entries"
-# ⛔ THE LIBRARY THE FLAT DEPLOY NEEDS, INTO THE PATH install.sh PROBES (review P1, agent-infra#3146).
-# install.sh resolves two layouts: `../lib` from a checkout, and `./lib` BESIDE ITSELF on the deployed
-# tree. On the box `$O` IS the harness dir, so `$O/../lib` is `$HOME/lib` — a path no deploy writes —
-# and without this stage the mac path's one-line report and its drift check were DEAD there, on the
-# exact invocation (`bash ~/orchestrator/install.sh --restart`) that re-renders every limit from the
-# caller's environment and so is where a pin actually drifts. A ref that predates the library is not
-# a FATAL: the installer then takes its NAMED "report unavailable" branch, which is loud.
-if [ -f "$STAGE/scripts/lib/lane-ceiling.sh" ]; then
-  mkdir -p "$O/lib"
-  install_file "$STAGE/scripts/lib/lane-ceiling.sh" "$O/lib/lane-ceiling.sh"
-  cmp -s "$STAGE/scripts/lib/lane-ceiling.sh" "$O/lib/lane-ceiling.sh" \
-    || { log "FATAL: $O/lib/lane-ceiling.sh differs from $SRC_REF"; exit 1; }
-  log "phase A: staged $O/lib/lane-ceiling.sh (the path install.sh probes on the flat layout)"
-else
-  log "phase A: $SRC_REF has no scripts/lib/lane-ceiling.sh — install.sh will report the ceiling as unavailable (loud, not silent)"
-fi
 [ -f "$O/claims.sh" ] || { log "FATAL: claims.sh did not land in $O"; exit 1; }
 cmp -s "$H/claims.sh" "$O/claims.sh" || { log "FATAL: $O/claims.sh differs from $SRC_REF"; exit 1; }
 log "phase A VERIFIED: $O/claims.sh matches $SRC_REF ($(wc -c < "$O/claims.sh" | tr -d ' ') bytes)"
