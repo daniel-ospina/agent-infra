@@ -2340,17 +2340,24 @@ if [ -d "$DELTA_REPO" ]; then
   # empty upper bound with an empty base/classification/digest — AND the delta-inheriting carry
   # arm below became unreachable for exactly the shape it was written for. Each PR was green in
   # isolation; only the merged tree shows it. MEASURED RED before the fix.
-  # ⛔ "MALFORMED", NOT "ABSENT": a delta-over-delta LEGITIMATELY inherits a well-formed range from
-  # a predecessor whose evidence was `delta:A..B` (the `elif` arm that inherits a `delta:` claim
-  # copies it, and its own doc-comment demands that it do so). This fixture verifies no range, so
-  # ABSENCE is what it must see — but the pin must not call the inherited shape a defect, or it
-  # invites reverting to the vacuous `[ -z … ] ||` form that cannot fail on an empty record.
-  # ⛔ NON-VACUITY: the record must EXIST. `[ -z "$D_RANGE32" ]` is vacuously true for an empty
-  # `$D_REC32`, i.e. it would report "no malformed range" without having read a record at all.
+  # ⛔ ABSENCE, NOT "MALFORMED" (review finding, 2026-11-04). The first cut accepted
+  # EITHER absence OR a well-formed `40hex..40hex` range, on the theory that a
+  # delta-over-delta legitimately inherits one. THAT DISJUNCT IS DEAD IN THIS FIXTURE AND
+  # PURELY WIDENING: this record's predecessor carries `comment:9000001` (see
+  # `delta_write_record`), so the `elif` arm that inherits a `delta:` claim is never
+  # entered here — MEASURED: a mutant that fabricates a well-formed range from
+  # `DELTA_FROM` alone (plus a zeroed digest) leaves this vector GREEN, i.e. an
+  # assertion labelled "cannot poison the signed claim" passed over a record asserting a
+  # range nobody verified. So this fixture must see ABSENCE, and the inherited shape is
+  # pinned by value where it actually occurs — (33a9) asserts the exact inherited
+  # `delta_range`, and `scripts/record-review.test.sh` 21f-d asserts range/base/kind/digest.
+  # ⛔ NON-VACUITY: the record must EXIST. `[ -z "$D_RANGE32" ]` is vacuously true for an
+  # empty `$D_REC32`, i.e. it would report "no malformed range" without having read a
+  # record at all.
   D_RANGE_N32=""
   if [ -n "$D_REC32" ]; then D_RANGE_N32="$(grep -c '"delta_range"' <<<"$D_REC32" || true)"; fi
-  if [ -n "$D_REC32" ] && { [ "$D_RANGE_N32" = "0" ] || grep -qE '"delta_range":"[0-9a-f]{40}\.\.[0-9a-f]{40}"' <<<"$D_REC32"; }; then
-    pass "(33a6b) the delta record carries NO malformed delta_range (absent here — no range was verified; a delta-over-delta legitimately inherits 40-hex..40-hex) — a shared DELTA_FROM name cannot poison the signed claim"
+  if [ -n "$D_REC32" ] && [ "$D_RANGE_N32" = "0" ]; then
+    pass "(33a6b) the delta record carries NO delta_range at all (no range was verified here; the inherited shape is pinned by value in (33a9) and 21f-d) — a shared DELTA_FROM name cannot poison the signed claim"
   else
     fail "(33a6b) the delta record carries a MALFORMED delta_range (${D_RANGE_N32:-none} occurrence(s); record='$D_REC32')"
   fi

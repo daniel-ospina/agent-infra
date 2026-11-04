@@ -1670,15 +1670,30 @@ ${marker}"; else newbody="$marker"; fi
   # not trigger on — see the skip-footgun rule in the workflow header).
 post_marker_comment() { # <repo> <pr> <marker>
   local repo="$1" pr="$2" marker="$3"
-  local PR_EVIDENCE_COMMENTS_JQ="" HAVE_COMMENT=0 EXISTING_COMMENT_BODIES=""
+  local PR_EVIDENCE_COMMENTS_JQ="" HAVE_COMMENT=0 EXISTING_COMMENT_BODIES="" SIGVAL=""
   # ⛔ AN UNSIGNED MARKER IS NEVER PUBLISHED AS A COMMENT. The gate can never accept
   # one (it HMAC-verifies), and unlike the body a comment is PERMANENT. Enforced HERE,
   # at the single chokepoint, so no caller can forget it and no new call site can
   # reopen the hole. The unsigned path stays body-only, where its warning is loud.
+  # ⛔ AND IT IS THE SIGNATURE'S **SHAPE** THAT DECIDES, NOT THE SUBSTRING ` sig=`
+  # (review finding, 2026-11-04). The marker's one free-text field is `note=` — a
+  # `not-clean` record's `--findings-note`, validated only against quotes,
+  # backslashes and control characters — and it is interpolated BEFORE the
+  # signature. A substring test therefore admits an UNSIGNED marker whose note happens
+  # to read `… sig=deadbeef …`, publishing it to the PERMANENT channel this guard
+  # exists to protect, and it disagrees with the body site's #633 rerun gate, which
+  # tests `MARKER_SIGNED` exactly. The real signature is always appended LAST
+  # (`openssl dgst -sha256 -hmac … | awk '{print $NF}'`), so the tail after the final
+  # ` sig=` must be exactly 64 hex digits; anything shorter, longer or non-hex refuses.
   case "$marker" in
     *" sig="*) : ;;
     *) return 0 ;;
   esac
+  SIGVAL="${marker##* sig=}"
+  case "$SIGVAL" in
+    ''|*[!0-9a-f]*) return 0 ;;
+  esac
+  [ "${#SIGVAL}" -eq 64 ] || return 0
   # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
   # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
   # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract says a producer

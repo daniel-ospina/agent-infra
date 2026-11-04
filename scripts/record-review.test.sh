@@ -4776,6 +4776,60 @@ assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the r
 #     permanent, so it must never be published to that channel.
 AI_REVIEW_GATE_KEY="" STUB_COMMENT_CAPTURE="$T/ccap_d" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d an UNSIGNED marker is never published as a comment"
+# (d2) ⛔ THE SUBSTRING HOLE (review finding, 2026-11-04). The guard above was a
+#      substring test on ` sig=`, and the marker's only FREE-TEXT field is `note=` —
+#      a `not-clean` record's `--findings-note`, which the recorder validates against
+#      quotes/backslashes/control characters only. A note reading `… sig=deadbeef …`
+#      therefore satisfied the substring test on an UNSIGNED marker and published it to
+#      the PERMANENT comment channel that guard exists to protect. The guard now requires
+#      the tail after the LAST ` sig=` to be exactly 64 hex digits.
+#      NON-VACUOUS PAIR, same PR, same note: (d2) UNSIGNED must post 0, (d3) SIGNED must
+#      post 1 — so neither arm can pass on "a not-clean record never posts" (d3 would
+#      red) or on "the note text alone is enough" (d2 would red).
+NEG_D_EXTRA=(--findings 1 --findings-note '1 open P2 sig=deadbeef deadbeef')
+run_record_dcraft() { # <pr> <out-capture> [key — EMPTY STRING ⇒ unsigned, so use '-']
+    # ⛔ `${3-$AI_REVIEW_GATE_KEY}`, NOT `${3:-…}`: the signed arm below needs to pass an
+    # EMPTY key to mean UNSIGNED, and `:-` treats an empty argument as absent and
+    # substitutes the suite's key — which made the first cut of this vector "unsigned"
+    # ONLY in name (measured: the capture's marker ended ` sig=3509644a7…`, i.e. a real
+    # signature, and the vector reddened as it should have). The recorder resolves
+    # GATE_KEY from the env and falls back to $HOME/.pi/agent/.ai-review-gate-key; the
+    # suite's fake HOME has no such file, so an empty env key is genuinely unsigned.
+    local pr="$1" cap="$2" key="${3-$AI_REVIEW_GATE_KEY}"
+    : > "$LOG"; : > "$cap"; rm -f "$T/dcraft.err"
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        export STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+1 open P2: the retry loop re-reads the claim after the lock is released.'
+        export STUB_COMMENT_BODIES="" STUB_COMMENT_CAPTURE="$cap"
+        export AI_REVIEW_GATE_KEY="$key"
+        rc=0
+        bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+            --evidence "comment:${pr}01" "${NEG_D_EXTRA[@]}" 2>"$T/dcraft.err" || rc=$?
+        printf '%s' "$rc" > "$T/dcraft.rc"
+    ) 2>/dev/null || true
+    RECORD_RC="$(cat "$T/dcraft.rc" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$T/dcraft.err" 2>/dev/null || true)"
+}
+run_record_dcraft 424955 "$T/ccap_d2" ""
+assert_eq "$RECORD_RC" "0" "14.1d (d2) fixture: a not-clean record whose NOTE contains ' sig=' mints (rc 0)"
+assert_eq "$(dc_posts 424955)" "0" \
+    "14.1d (d2) an UNSIGNED marker whose free-text note CONTAINS ' sig=' is still never published as a comment"
+if [ -s "$T/ccap_d2" ]; then
+    bad "14.1d (d2) …and nothing was POSTed (captured: $(head -c 200 "$T/ccap_d2"))"
+else
+    ok "14.1d (d2) …and the comment channel captured no body at all"
+fi
+run_record_dcraft 424956 "$T/ccap_d3"
+assert_eq "$(dc_posts 424956)" "1" \
+    "14.1d (d3) the SAME note on a SIGNED marker DOES publish — the guard judges the signature's shape, not the note"
+if grep -qE 'note=1 open P2 sig=deadbeef deadbeef sig=[0-9a-f]{64}$' \
+    <<<"$(jq -r '.body // empty' "$T/ccap_d3" 2>/dev/null || true)"; then
+    ok "14.1d (d3) …and the published marker carries the note AND a real trailing 64-hex signature"
+else
+    bad "14.1d (d3) the published marker's tail is not \"note=… sig=<64 hex>\" (captured: $(head -c 300 "$T/ccap_d3" 2>/dev/null))"
+fi
 # (e) THE P2 PIN: when the BODY channel fails, the run that most needs the durable
 #     copy must still attempt it. Both failure arms used to `exit 5` before reaching
 #     the durable block, so the channel never fired in the only scenario it exists
