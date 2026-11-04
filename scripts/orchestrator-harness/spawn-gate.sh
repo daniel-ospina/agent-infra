@@ -1183,10 +1183,14 @@ LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 LANE_END_BRANCH=""      # the branch the tree is on (or `detached-<sha>`), never invented
 LANE_END_HEAD=""        # HEAD as measured at exit
 LANE_END_PUSH=""        # running | pushed | nothing | unmeasured | detached | FAILED | UNAVAILABLE
-                        #   | refused-protected | refused-main-checkout   (see lane_end_push)
+                        #   | refused-protected | refused-main-checkout | refused-unknown-default
+                        #   (see lane_end_push — `lane_end_next` reads THIS domain, so a value added
+                        #    there without an arm there silently loses its `next=` sentence)
 LANE_END_ORIGIN=""      # the sha origin/<branch> held AFTER the push: a read, not a claim
-LANE_END_DIRTY=""       # number of porcelain entries (the count the marker carries)
 LANE_END_PORCELAIN=""   # the `git status --porcelain -uall` listing itself, already read once above
+                        # (⛔ there is no separate dirty COUNT global: `lane_end_marker` derives it from
+                        # this listing, so a count in a second variable could disagree with the porcelain
+                        # section printed beside it, and nothing read the second one)
 LANE_BOUND_LIB=""       # resolved once, like LANE_WIP_RESCUE_SH
 
 # wip_rescue_path — resolve scripts/bg-rescue-wip.sh the way the other helpers are resolved. `$O` is
@@ -1287,7 +1291,19 @@ lane_end_push() {
   local gd cd
   gd="$(git -C "$root" rev-parse --git-dir 2>/dev/null)"
   cd="$(git -C "$root" rev-parse --git-common-dir 2>/dev/null)"
-  if [ -n "$gd" ] && [ -n "$cd" ] && [ "$gd" = "$cd" ]; then
+  # ⛔ AN UNREADABLE DISCRIMINATOR IS NOT "NOT A HUB" (review, PR #3399 P2). The check used to require
+  # BOTH reads to be non-empty before refusing, so a `--git-common-dir` that answered nothing (a git
+  # older than 2.5, a corrupt odb, a permission failure) fell straight through to the push — the same
+  # permissive default this function refuses 40 lines below for the default branch ("an unknown default
+  # is not 'no protected names'"). Two reads, two facts, two refusals: this arm refuses because the
+  # SHAPE is unknown, the next one because the shape is the hub's. Neither invents a reason it did not
+  # measure — the shape-unknown arm says the read failed, not that $root is a main checkout.
+  if [ -z "$gd" ] || [ -z "$cd" ]; then
+    LANE_END_PUSH="UNAVAILABLE"
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but this run could NOT establish whether $root is a lane worktree or the repo's MAIN CHECKOUT (git-dir='$gd' common-dir='$cd' — one of the two answered nothing), and a push of unknown shape could publish the hub's landing branch, which merges only through the rail. Nothing was pushed. Do NOT reap $root until this read works" >> "$log" 2>/dev/null || true
+    return 0
+  fi
+  if [ "$gd" = "$cd" ]; then
     LANE_END_PUSH="refused-main-checkout"
     echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but $root is the repo's MAIN CHECKOUT, not a lane worktree, so this exit path refuses to push from it ($sym may be the hub's landing branch, which merges only through the rail). Nothing was pushed. The hub's own commits are NOT this lane's to publish" >> "$log" 2>/dev/null || true
     return 0
@@ -1344,15 +1360,18 @@ lane_end_push() {
   # (`ls-remote --symref origin HEAD`, the read at the top of this function) and that read must itself be
   # bounded — which is why it carries `tb_timeout 15`. A missing library is a refusal for the whole
   # network half — not for the local checks above, which have already run.
-  # ⛔ THE THREE NETWORK BOUNDS ARE ONE BUDGET, SUMMED (review cycle 2, finding 4). A launcher gives the
-  # exit path 20 s after TERM and 15 s more after KILL = 35 s, and the three calls of this whole function
-  # are exactly that: 15 s (the symref read above) + 15 s (the push below) + 5 s (the verifying read) =
-  # 35 s. `tb_timeout` is a bound, not a duration — a healthy push is sub-second, and `bg-rescue-wip.sh`
-  # (the tool this mirrors) allows itself 45 s for a whole TREE walk. Nothing here may exceed the grace,
-  # or the TERM lands mid-transfer and the marker freezes at `push=running` on exactly the slow links
-  # this exists for.
-  # ⛔ AND THE LOCAL ARTIFACT IS WRITTEN BEFORE ANY OF IT, by `terminal_wip_rescue` (`push=running`), so a
-  # signal during these calls still leaves the marker on disk with everything measured.
+  # ⛔ THE BUDGET IS NOT 35 s OF GRACE, AND SAYING SO WAS WRONG (review, PR #3399 P2 — this comment, not
+  # the bound). Measured in this repo's own launchers: `fix-one.sh:588`, `merge-one.sh:279` and
+  # `merge-one.sh:316` are `sleep 20; kill -TERM; sleep 5; kill -KILL` — the 20 s is BEFORE the signal,
+  # so the post-TERM grace there is 5 s; `merge-one.sh:167` gives 15 s and `lane-reap.sh:236` gives 1 s.
+  # The three calls of this function are 15 s (the symref read above) + 15 s (the push below) + 5 s (the
+  # verifying read) = 35 s worst case, which therefore CAN exceed a 5 s grace. The direction that matters
+  # is the one already in place: `tb_timeout` is a bound, not a duration (a healthy push is sub-second,
+  # and `bg-rescue-wip.sh` — the tool this mirrors — allows itself 45 s for a whole TREE walk), the local
+  # artifact is written BEFORE any of it by `terminal_wip_rescue` (`push=running`), and a TERM
+  # mid-transfer therefore freezes the marker at `push=running`, which `lane_end_next` routes to MANUAL.
+  # Over-block, never fail-open: the reader is told not to reap, and the worst case is one un-reaped
+  # worktree rather than a lost branch.
   out="$(tb_timeout 15 git -C "$root" push -u origin "HEAD:refs/heads/$sym" 2>&1)"; rc=$?
   [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/[lane-exit]   /' >> "$log" 2>/dev/null
   if [ "$rc" -ne 0 ]; then
@@ -1414,6 +1433,15 @@ lane_end_next() {
     refused-protected|refused-main-checkout)
       printf 'commit(s) on %s were NOT pushed by the exit path (see why in the lane log); they survive the worktree being removed but not the volume — re-dispatch and push from a lane branch\n' \
         "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
+    # ⛔ ITS OWN ARM, NOT A FALL-THROUGH (review, PR #3399 P2). `refused-unknown-default` is assigned by
+    # `lane_end_push` and was in NEITHER case list, so it landed on the generic `unpushed-only` sentence
+    # below — "the commits are in the local object store, not on origin" — which drops the one fact that
+    # matters most here: they die with the volume. Same state class as the arm above, and the WEAKEST
+    # wording was landing on the state a reclaim pass most needs to refuse. The domain is read from
+    # `lane_end_push`'s assignments, never from prose (the same rule the rescue arms below record).
+    refused-unknown-default)
+      printf 'MANUAL — commit(s) on %s were NOT pushed because the remote default could not be read; do NOT reap %s until they are off-box. They survive the worktree being removed but NOT the volume — re-run once the remote answers, or push %s by hand\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
   esac
   case "${LANE_END_RESCUE:-}" in
     FAILED|UNAVAILABLE)
@@ -1602,7 +1630,7 @@ terminal_wip_rescue() {
   # the capacity records. Resetting it after the hatch instead would have left the `not-measured` row
   # carrying a previous lane's `push=pushed`, which is the most dangerous value to mis-carry.
   LANE_END_BRANCH=""; LANE_END_HEAD=""; LANE_END_PUSH=""; LANE_END_ORIGIN=""
-  LANE_END_DIRTY=""; LANE_END_PORCELAIN=""; LANE_END_LOG="$log"; LANE_END_MARKER_FRESH=1
+  LANE_END_PORCELAIN=""; LANE_END_LOG="$log"; LANE_END_MARKER_FRESH=1
   if [ "${WIP_RESCUE_DISABLE:-0}" = "1" ]; then
     LANE_END_TREE="not-measured"; LANE_END_RESCUE="DISABLED"
     echo "[wip] end label=$label rc=$rc cap=$cap tree=not-measured rescue=DISABLED — WIP_RESCUE_DISABLE=1 (an operator escape hatch, not a default): the tree at $root was NOT examined, so this lane's uncommitted work (if any) is on this disk only" >> "$log" 2>/dev/null || true
@@ -1720,7 +1748,6 @@ terminal_wip_rescue() {
   LANE_END_LOG="$log"
   LANE_END_BRANCH="$br"; LANE_END_HEAD="$(git -C "$root" rev-parse HEAD 2>/dev/null)"
   LANE_END_PORCELAIN="$st_out"
-  LANE_END_DIRTY="$(printf '%s\n' "$st_out" | grep -c . 2>/dev/null)"; [ -n "$LANE_END_DIRTY" ] || LANE_END_DIRTY=0
   # ⛔ THE LOCAL HALF IS ON DISK **BEFORE** THE NETWORK CALL (review cycle 1, finding 4). The push and its
   # verifying read can occupy the exit path for up to 35 s (15 s symref + 15 s push + 5 s verify),
   # against a launcher's 20 s + 15 s
