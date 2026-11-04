@@ -1455,8 +1455,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
     axis: "reap",
-    guardedBy: "scripts/pi-reap-worktrees.test.sh G2aa (keep-days 0 keeps everything; a non-numeric value skips the prune and NAMES the seam, never a silent guess)",
-    note: "how long a dated subdirectory of the gate (b) evidence archive is kept. `0` keeps everything, so the bound can be disabled without deleting anything — the opposite polarity of a floor, which is why it is reasoned about here rather than folded into the age floors above. A non-numeric value skips the prune entirely rather than defaulting to 0: defaulting to 0 on a garbage override would silently turn retention OFF, and defaulting to the 14 would silently destroy evidence an operator asked to keep.",
+    guardedBy: "scripts/pi-reap-worktrees.test.sh G2aa (keep-days 0 keeps everything; a non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 — the WHOLE pass, not a skipped prune — and the refusal NAMES the seam, never a silent guess)",
+    note: "how long a dated subdirectory of the gate (b) evidence archive is kept. `0` keeps everything, so the bound can be disabled without deleting anything — the opposite polarity of a floor, which is why it is reasoned about here rather than folded into the age floors above. A non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 (the startup `is_pos_int` sweep over its listed numeric seams, before any rule runs): the WHOLE pass aborts, so prune_preserve_archive is never reached — it is not a silent skip of the prune. That is deliberate: defaulting to 0 on a garbage override would silently turn retention OFF, and defaulting to the 14 would silently destroy evidence an operator asked to keep. Note the blast radius is the whole reaper and not this term — on a box already under disk pressure (#2159) the typo disables ALL reaping, which is why the refusal is pass-wide and names the seam.",
   },
   {
     name: "MIN_AGE",
