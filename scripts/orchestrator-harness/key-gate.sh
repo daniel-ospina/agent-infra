@@ -190,7 +190,16 @@ for f in FIELDS:
         raise SystemExit(0)
     if status == "cmd":
         cannot = True
-raise SystemExit(3 if cannot else 1)
+# ⛔ rc 4 IS ITS OWN ANSWER, AND IT IS NOT rc 1 (review cycle 2, P1, measured). An entry that EXISTS for
+# this provider but whose key resolves to nothing is NOT "no stored credential": pi hands the present
+# credential to `composeApiKeyAuth.resolve`, which delegates to the inherited provider handler
+# (`dist/core/provider-composer.js:283-294`) — that handler resolves the PROVIDER\x27s BUILT-IN env var
+# and never the models.json template. So on that box `pi` can still run on, say, `DEEPSEEK_API_KEY` while
+# the models.json template names something else entirely: answering rc 1 ("no credential, the
+# environment decides") made this gate REFUSE 82 a lane pi would have run, and told the operator to fix a
+# variable that was never consulted. The fallback chain is pi\x27s, not ours to model, so the honest
+# answer is "cannot say" — which asserts nothing and therefore cannot be wrong in either direction.
+raise SystemExit(3 if cannot else 4)
 '
 
 # key_gate_bounded <secs> <cmd...> — run a probe under a TIME BOUND (review round 4, P1, measured).
@@ -324,14 +333,23 @@ key_gate_stored_credential() {
   [ -n "$agent_dir" ] || return 1
   aj="$agent_dir/auth.json"
   # No `[ -r ]` pre-test, for the same reason as key_gate_var's (review round 5, P2): stat can block before
-  # the bound arms. An absent store makes the bounded open print nothing and answer "cannot say".
+  # the bound arms. ⛔ AN ABSENT STORE IS A POSITIVE "no credential" (rc 1), NOT "cannot say" (review cycle
+  # 2, P2 — this comment said the opposite of the code, and a later editor making the code match it would
+  # print `stored-credential-unresolvable` for a file that does not exist and go inert fleet-wide). The
+  # absent-file arm is the probe's `except` branch: `var` mode is silent, `store` mode is rc 1, because
+  # "this box has no store" is a datum we DID read.
   command -v python3 >/dev/null 2>&1 || return 1
   key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$aj" store "$prov" 2>/dev/null
   # rc 0 = a credential that RESOLVES; 3 = cannot say; anything else = no credential. The bound's own
   # kill status (143/124/…) lands in the "cannot say" bucket because it is not a positive "absent".
   local rc=$?
+  # 0 = a credential that RESOLVES · 1 = no entry for this provider · 3/4 = cannot say · anything else
+  # (a bound's 143/124/137, a crash) = cannot say too. ⛔ THE WILDCARD IS NOT rc 1 (review cycle 2, P2):
+  # folding "the read did not finish" into "no credential" refuses a box whose credential is in the
+  # store but whose store could not be read — the false-block direction this function's own header
+  # exists to prevent. Pinned by key-gate.test.sh 2j11/2j12.
   case "$rc" in
-    0|1|3) return "$rc" ;;
+    0|1) return "$rc" ;;
     *) return 3 ;;
   esac
 }

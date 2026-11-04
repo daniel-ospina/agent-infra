@@ -307,6 +307,19 @@ has "$(cat "$OWN_OUT" 2>/dev/null)" "reason=dry-run" "2j the older run's late tr
 hasnt "$(cat "$OWN_OUT" 2>/dev/null)" "signal:TERM" "2k …the killed run's verdict never reaches the run-scoped read"
 has "$(cat "$(LOG)" 2>/dev/null)" "a LATER dispatch of #3331 owns that file" "2l …and it SAYS so in the append-only transcript (naming a LATER dispatch, which is what it can observe), instead of dropping its own line silently"
 has "$(cat "$(LOG)" 2>/dev/null)" "outcome=died reason=signal:TERM" "2m …while its own outcome= line is still in the log (the transcript keeps every run)"
+# ⛔ AND THE DENY ARM OWES THE SAME LAST-LINE CONTRACT AS EVERY OTHER ARM (review cycle 2, P2, mutation-
+# verified). This is the only arm that reaches the owner-DENY branch, and it never called `check_terminal`,
+# so cycle 1's "the line is last in every arm" claim was pinned by NOTHING: re-echoing the explanation after
+# the line left the suite at 136/136 green, and `tail -1` (the documented history fallback) then answered
+# "nothing recorded" for a lane that HAD recorded one — the exact defect the reorder removed. `check_terminal`
+# asserts exactly-one-terminal-line AND last-line-is-terminal, so the deny arm is now measured, not assumed.
+# (the count is legitimately 2 here — this log carries TWO runs — so the deny arm pins the ORDER, which is
+# the thing cycle 1 changed: whatever else is in the file, a terminal line is what it ENDS with.)
+_DENY_LAST="$(tail -n 1 "$(LOG)" 2>/dev/null)"
+case "$_DENY_LAST" in
+  "outcome=died reason=signal:TERM "*) ck "2m2 the DENY arm's log still ENDS with the terminal line (prose cannot follow it)" 0 ;;
+  *) bad "2m2 the DENY arm's log does not end with the terminal line (got: '$_DENY_LAST')" ;;
+esac
 
 # ⛔ THE HANDOVER ORDER IS PART OF THE FIX (review round 6, P2, measured). Removing the verdict file BEFORE
 # stamping the token leaves a window in which an older run's trap still matches its own (old) token and writes

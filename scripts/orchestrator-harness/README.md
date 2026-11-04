@@ -2577,9 +2577,13 @@ written by whatever path the lane exited through, is what answers it:
 # ⛔ THE PATTERN IS ANCHORED TO THE CONTRACT SHAPE, NOT JUST THE PREFIX (review cycle 1, P2): the log is
 # also the AGENT'S TRANSCRIPT (`run_agent` appends `pi`'s stdout to the same file), so a bare
 # `grep -L '^outcome='` counts a lane as "reported" whenever ANY line in the transcript happens to start
-# with `outcome=` — e.g. a lane working on `lane.sh` quoting this very format. The anchored form asks the
-# question the sentence above claims: does the file END with a line this writer produced?
+# with `outcome=` — e.g. a lane working on `lane.sh` quoting this very format.
 grep -L '^outcome=\(done\|refused\|failed\|died\) reason=' "$O"/logs/lane-[0-9]*.log
+# ⛔ AND THAT IS STILL A CONTAINMENT TEST, NOT AN "ends with" TEST (review cycle 2, P2): `grep -L` answers
+# "no line anywhere in this file matches". A lane KILLed with SIGKILL whose transcript already contains a
+# quoted `outcome=failed reason=…` is therefore listed as reported — i.e. the census under-reports exactly
+# in the residual case above. When the question really is "did this file END with its own line", ask it:
+awk 'END{if ($0 !~ /^outcome=(done|refused|failed|died) reason=/) print FILENAME}' "$O"/logs/lane-[0-9]*.log
 # what did the CURRENT run of THIS lane do?  (an ABSENT file means no verdict yet)
 cat "$O/logs/lane-<N>.outcome"
 ```
@@ -2600,7 +2604,9 @@ whole change is about — would otherwise overwrite the file with ITS verdict wh
 fires, so each dispatch stamps `logs/lane-<N>.owner` and the trap writes the verdict only while it still
 owns it (the older run's line still lands in the append-only log, and it says in the log why).
 
-`grep -L` is the right reader for "is any log unaccounted for" because it asks about the WHOLE file.
+`grep -L` is the right reader for "did ANY line in this log report" because it asks about the WHOLE
+file; the `awk END` form above is the right reader for "did this log END with its own report", and the
+two answer different questions — the first can be satisfied by the transcript, the second cannot.
 There is ONE single-lane read, and it is `lane-<N>.outcome`; `tail -1` of the log is a FALLBACK for
 history only (a `lane.sh` that predates the per-run file), and it is wrong for a re-dispatched issue by
 construction — which is why the file above exists. Both forms are stated here because the earlier text
