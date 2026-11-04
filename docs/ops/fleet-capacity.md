@@ -370,8 +370,14 @@ above) and the same box reports its real slots and can restart its real registra
 `status --all` is scoped to **this box**: nothing in this repo reports runners **per cell** —
 `capacity.sh`'s probe knows host, cores, load, lanes and disk/memory and **nothing about runners**, and
 neither does the fleet inventory. Nor does any tool list the GitHub-side registry:
-`scripts/ci_runner_gate.sh --status` prints only the gate's mode (`mode=… repo=…`) and counts
-`ubuntu-latest` runners without naming them. The per-cell runner report #2373's clause 2 words is **not**
+`scripts/ci_runner_gate.sh --status` prints the gate's mode **and the capacity census** —
+`mode=… repo=… source=… capacity=…` followed by `runners= online_idle= online_busy= offline=
+demanding_idle= demanding_busy= label_ambiguity= demand= capability= detail="…"` — still without naming the
+runners, and `unmeasured` in every census key when the read produced nothing (a blank body is NOT a pool
+of zero runners: the page row the read layer emits is what distinguishes them). ⛔ **It exits 2 when
+either answer was a substitute or a failed read** (`source=` other than `runners`, or an unreadable
+census): a narrowed claim is never a success, and the manual verb reports the same states the scheduled
+pass does without sending an alarm of its own. The per-cell runner report #2373's clause 2 words is **not**
 delivered by this change; the registry itself is only readable directly, e.g.
 `gh api repos/<owner/name>/actions/runners --jq '.runners[] | {name, status, busy}'`. Within this box the
 table is complete, so a runner this box registered and

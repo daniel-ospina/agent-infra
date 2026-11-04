@@ -286,12 +286,11 @@ runner_census() {
   # without a second read. `.runners|type` is carried rather than assumed: a body that answers with
   # `.runners: null` is a SCHEMA change, not an empty pool, and must not be counted as one either.
   #
-  # ⛔ `\(` IS THE INTERPOLATION TOKEN AND A BARE `\` IS NOT A jq TOKEN (#3002 review P1). Written as
+  # ⛔ `\(` IS THE INTERPOLATION TOKEN; A BARE `\` IS NOT A jq TOKEN (#3002 review P1). Written as
   # `\(\.runners|type)` the whole program is a COMPILE error — jq exits 3 having read no input, so the
-  # read produced NOTHING on every box and this gate could never relabel again, while reporting a
-  # `runner_inventory:unreadable` alarm that blamed the token for our own grammar. Any edit here must
-  # be COMPILED, not eyeballed: `scripts/ci_runner_gate.test.sh` now runs every `--jq` this script ships
-  # through real `jq` (stub, "does not COMPILE"), so a recurrence reddens the suite instead of production.
+  # census produces nothing on every box and this gate can never relabel again while raising a false
+  # `unreadable` alarm. Any edit here is COMPILED by `scripts/ci_runner_gate.test.sh`, which runs every
+  # `--jq` this script ships through real jq, so a recurrence reddens the suite instead of production.
   gh api --paginate "$RUNNER_LIST_PATH" \
     --jq '("#page\t\(.runners|type)\t\(.runners|length)"), (.runners[] | "\(.status)\t\(.busy)\t\([.labels[].name]|join(","))\t\(.labels|length)")' 2>"$GH_ERR"
 }
