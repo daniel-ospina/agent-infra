@@ -268,7 +268,9 @@
 # dirt the clean gate tolerates, and it is deliberately narrow: a
 # reproducible-from-manifest artifact at the worktree ROOT. Ignored
 # (`!! path`) entries are tolerated ONE STEP FURTHER and only for the named
-# regenerable-cache classes (IGNORED_REGENERABLE): everything else ignored is
+# regenerable-cache classes (IGNORED_REGENERABLE) plus the two entries the FLEET ITSELF requires every
+# checkout to carry (lane evidence + the agent-infra pointer, IGNORED_LANE_EVIDENCE — those two are
+# ARCHIVED before removal, never silently dropped); everything else ignored is
 # `ignored-artifact` => PRESERVE. This matters because
 # `git worktree remove` does NOT refuse ignored files (verified): without the
 # ignored half of the gate, a worktree holding only a gitignored `.env` or
@@ -458,6 +460,14 @@
 #   dirty                  tracked/unparseable changes
 #   ignored-artifact       gitignored data that `git worktree remove` will NOT
 #                          refuse to delete
+#                          ⛔ EXCEPT the two entries the FLEET ITSELF MANDATES: the
+#                          lane report (`.worktree-report/`, `WORKTREE-REPORT.md`,
+#                          owner ruling #10220) and the agent-infra `scripts` SYMLINK
+#                          (#9475). Those are ARCHIVED into REAP_WT_PRESERVE_DIR and the
+#                          row continues to the ordinary merge/liveness gates — see
+#                          `preserve_before_removal` and IGNORED_LANE_EVIDENCE. Measured:
+#                          vetoing them held 70 worktrees / 20,557 MB on one cell while
+#                          the pass reclaimed ONE per hour (#10220 met #1932).
 #   status-*               the clean gate could not be evaluated => fail-closed
 #   open-pr                an open PR head branch
 #   main-proof-vanished    the ancestry proof that put this row in the removal
@@ -588,6 +598,9 @@
 #   REAP_WT_REPO_SLUG REAP_WT_PR_LIMIT
 #   REAP_WT_LANE_BRANCH_RE REAP_WT_GHOST_AGE_HOURS REAP_WT_STALE_INIT_SECONDS
 #   REAP_WT_WIP REAP_WT_WIP_AGE_HOURS REAP_WT_BACKUP_DIR REAP_WT_CLAIM_NS REAP_WT_CLAIM_TMP_NS
+#   REAP_WT_IGNORED_EVIDENCE REAP_WT_IGNORED_POINTER REAP_WT_PRESERVE REAP_WT_PRESERVE_DIR
+#     (lane evidence + the agent-infra pointer: what the FLEET requires every checkout to carry, and
+#      the gate (b) archive that lets such a checkout be reclaimed — see IGNORED_LANE_EVIDENCE)
 #   REAP_WT_MAIN_PROOF (auto|local) REAP_WT_MAIN_PUSH_URL
 #   REAP_WT_DISK_FLOOR_MB REAP_WT_INEFFECTIVE_MIN_EXAMINED REAP_WT_FREE_MB (test seam: an
 #   already-measured free-space witness, like REAP_WT_TREE_TS)
@@ -757,6 +770,53 @@ EPHEMERAL=" .venv node_modules __pycache__ .pytest_cache .mypy_cache .ruff_cache
 # Every name here is instead tool-scoped, so a nested match is still provably
 # regenerable.
 IGNORED_REGENERABLE=" __pycache__ .pytest_cache .mypy_cache .ruff_cache .tox .DS_Store node_modules .venv .ci-selection .longmemeval_cache .wrangler .playwright-mcp .ipynb_checkpoints htmlcov :memory: "
+
+# ── LANE EVIDENCE and the AGENT-INFRA POINTER (the two entries the FLEET REQUIRES) ────────────────
+# ⛔ MEASURED DEFECT THIS EXISTS FOR (2026-11-03, cell-3, this box at 90% used). The reaper was
+# armed, passing hourly and CORRECT — and reclaimed ONE worktree per pass against ~80 created per
+# day, because `ignored-artifact` (a PRESERVE rule) had become the largest bucket in its own
+# classification: `examined=133 classified=133 remove=1 preserved=132
+# reasons=ignored-artifact:70,…` — 70 rows holding **20,557 MB**, measured by summing `du` over the
+# paths the journal named.
+#
+# What those 70 carried, from that pass's own `proof=git-status --ignored` lines:
+#   `.worktree-report/ WORKTREE-REPORT.md`            35
+#   `.worktree-report/ WORKTREE-REPORT.md scripts`    12
+#   `scripts`                                          7
+#   `data/kind_index/*.npz`, `build/`, `dist/`, `.coverage`, `*.report.json`  ~16
+#
+# The first two names are the MANDATORY per-lane report (owner ruling 2026-10-28, #10220: "every lane
+# writes WORKTREE-REPORT.md before it exits") and they are GITIGNORED BY DESIGN ("Its files … are
+# gitignored and never committed"). `scripts` is the gitignored SYMLINK the AGENTS.md prereq requires
+# every checkout to materialise (`tools/link_agent_infra_scripts.py`, #9475).
+#
+# So the two rules the fleet added AFTER this file was written turned every worktree that OBEYS them
+# into a permanent resident: the more diligently a lane follows its own instructions, the less
+# reclaimable its checkout becomes. This is the second instance of the same shape — the
+# regenerable allowlist above records the first ("that protection … held 212 worktrees on the live
+# estate forever", measured 2026-10-11, fixed by allowlisting `__pycache__`).
+#
+# THE FIX IS NOT A WIDER ALLOWLIST. Lane evidence is neither operator data NOR regenerable, so the
+# only honest answer is to PRESERVE IT — archive it out of the tree — and then let the ordinary
+# merge/open-PR/liveness gates decide, exactly as they do for a clean checkout. That is gate (b) of
+# the removal path (`preserve_before_removal`), and it is why `clean_gate` may call a tree with only
+# these entries `clean` at all.
+#
+# ROOT-LEVEL ONLY, and every name must be SPACE-FREE: `lane_evidence_present` returns this list to a
+# caller that expands it UNQUOTED (like the ephemeral payload), so a name containing a space would
+# split and archive/delete the wrong thing. Both defaults satisfy that; keep it true.
+IGNORED_LANE_EVIDENCE="${REAP_WT_IGNORED_EVIDENCE- .worktree-report WORKTREE-REPORT.md }"
+# The agent-infra pointer. Tolerated ONLY when it really is a SYMLINK at the worktree root (`-L` is
+# checked in clean_gate): a real `scripts/` DIRECTORY is a checkout's own content and stays protected.
+IGNORED_POINTER="${REAP_WT_IGNORED_POINTER- scripts }"
+# Master switch for the preserve step. `REAP_WT_PRESERVE=0` restores the PRE-FIX behaviour exactly:
+# lane evidence vetoes again (`ignored-artifact`) and nothing is archived. The switch is honoured in
+# `clean_gate`, so the tolerance and the archive can never disagree — a row can only be called clean
+# because the thing that made it clean is about to be written down.
+REAP_WT_PRESERVE="${REAP_WT_PRESERVE:-1}"
+# Where the archive lands. Same root convention as REAP_WT_BACKUP_DIR (`$ORCH/state/…`), because the
+# two are the same promise: something was taken out of a checkout and a human may want it back.
+REAP_WT_PRESERVE_DIR="${REAP_WT_PRESERVE_DIR:-${O:-${HOME:-/tmp}/orchestrator}/state/reaped-evidence}"
 
 MODE=unknown
 LIST_ONLY=0
@@ -1011,6 +1071,45 @@ is_regenerable_ignored() {
     esac
     case "$IGNORED_REGENERABLE" in *" $base "*) return 0 ;; esac
     return 1
+}
+
+# is_lane_evidence_entry <entry> — true for a ROOT-level entry that is the MANDATORY per-lane report
+# (owner ruling 2026-10-28, #10220). ROOT only: a NESTED `.worktree-report/` is not the mandated
+# artifact and is operator data like any other.
+# It does NOT decide the row is clean on its own — `clean_gate` only consults it while archiving is
+# ARMED (`REAP_WT_PRESERVE != 0`), so a box that switched the archive off keeps the old veto.
+is_lane_evidence_entry() {
+    local p="${1%/}" base
+    base="${p##*/}"
+    [ "$p" = "$base" ] || return 1
+    case "$IGNORED_LANE_EVIDENCE" in *" $base "*) return 0 ;; esac
+    return 1
+}
+
+# is_agent_pointer_entry <path> <entry> — true for the gitignored `scripts` POINTER (#9475), and ONLY
+# when that entry is a SYMLINK. The distinction is load-bearing: the fleet's `scripts` is a symlink
+# into `$AGENT_INFRA_PATH/scripts` (a git symlink blob cannot hold the machine-local path), it is
+# reproduced by `tools/link_agent_infra_scripts.py`, and destroying it loses nothing. A real
+# DIRECTORY named `scripts/` is untracked content someone put there, and it must keep preserving —
+# admitting it would be the blanket rule this file's allowlist exists to avoid.
+is_agent_pointer_entry() { # <worktree-path> <entry>
+    local path="$1" p="${2%/}" base
+    base="${p##*/}"
+    [ "$p" = "$base" ] || return 1
+    case "$IGNORED_POINTER" in *" $base "*) return 0 ;; esac
+    [ -L "$path/$base" ] || return 1
+    return 0
+}
+
+# lane_evidence_present <path> — echo the ROOT-level lane-evidence entries present, space separated
+# (empty when none). Every name comes from IGNORED_LANE_EVIDENCE, which is space-free by construction,
+# so the caller may loop over this unquoted — the same discipline as `clean_gate`'s ephemeral payload.
+lane_evidence_present() {
+    local path="$1" e out=""
+    for e in $IGNORED_LANE_EVIDENCE; do
+        if [ -e "$path/$e" ] || [ -L "$path/$e" ]; then out="$out$e "; fi
+    done
+    printf '%s' "${out% }"
 }
 
 # is_scratch_path <path> — true for a LANE SCRATCH checkout (#2354).
@@ -1594,8 +1693,12 @@ clean_gate() {
                 if [ "${p%/}" = "$base" ] && is_ephemeral_name "$base"; then
                     eph="$eph$p "
                 elif [ "$xy" = '!!' ]; then
-                    # Ignored: non-blocking ONLY for pure regenerable cache.
-                    # Anything else is operator data and PRESERVES (G2b).
+                    # Ignored: non-blocking ONLY for pure regenerable cache, for the two entries the
+                    # FLEET ITSELF MANDATES (lane evidence + the agent-infra pointer, both archived or
+                    # valueless — see IGNORED_LANE_EVIDENCE above), or for nothing at all. Anything
+                    # else is operator data and PRESERVES (G2b).
+                    # ⛔ THE EVIDENCE/POINTER BRANCHES ARE GATED ON REAP_WT_PRESERVE, so the verdict
+                    # can never be `clean` for an entry that the removal path will not archive.
                     if is_regenerable_ignored "$p"; then
                         # TOLERATED AND DELIBERATELY NOT COLLECTED. Anything
                         # appended to the `clean` payload is later expanded
@@ -1609,6 +1712,15 @@ clean_gate() {
                         # `git worktree remove` (no --force) returns rc=0 with
                         # an ignored `__pycache__/` present, which is exactly why
                         # the ignored half of this gate exists at all.
+                        :
+                    elif [ "$REAP_WT_PRESERVE" != 0 ] && is_lane_evidence_entry "$p"; then
+                        # The MANDATORY per-lane report (#10220). Not collected into the payload and
+                        # not deleted blind: `preserve_before_removal` writes it into
+                        # $REAP_WT_PRESERVE_DIR before the checkout is destroyed.
+                        :
+                    elif [ "$REAP_WT_PRESERVE" != 0 ] && is_agent_pointer_entry "$path" "$p"; then
+                        # The gitignored `scripts` SYMLINK (#9475). A pointer carries no work: the
+                        # repo's own `tools/link_agent_infra_scripts.py` re-materialises it.
                         :
                     else
                         n=$((n + 1)); [ "$n" -le 3 ] && ignored="$ignored$p "
@@ -1626,6 +1738,109 @@ clean_gate() {
     else
         printf 'clean\t%s\n' "$(printf '%s' "$eph" | sed 's/ $//')"
     fi
+}
+
+# preserve_before_removal <path> <sha> <branch> <reason> -> prints the archive dir on success
+#
+# GATE (b) OF THE REMOVAL PATH: write down what the checkout still holds, THEN let the caller destroy
+# it. It is also the reason the two fleet-mandated ignored entries may be called `clean` at all — a
+# row is only non-vetoing because the thing that made it non-vetoing is about to be written here
+# (clean_gate consults REAP_WT_PRESERVE for exactly that reason).
+#
+# Writes <REAP_WT_PRESERVE_DIR>/<UTC date>/<slug>.<sha8>/ :
+#   lane-evidence.tar.gz  the ROOT lane-evidence entries that exist (the mandatory WORKTREE-REPORT.md
+#                         + .worktree-report/, #10220) — NOT collected into any deletion payload
+#   worktree.diff         `git diff HEAD`: the working tree vs its own HEAD
+#   worktree.status       `git status --porcelain`: what git thought was modified/untracked/ignored
+#   manifest.txt          identity (path, branch, sha, reason, time) + what was captured
+#
+# Returns 0 ONLY when every part that EXISTED at <path> is present in the archive. A partial capture
+# returns 1 and the caller must not remove — the same contract as backup_before_removal, and for the
+# same measured reason: a LANDED worktree can still hold uncommitted work a human wanted (a fixer
+# mid-edit when its PR auto-merged is the ordinary case).
+preserve_before_removal() { # <path> <sha> <branch> <reason>
+    local path="$1" sha="$2" br="$3" why="$4"
+    local slug day dir ev tarf out listed e rc ok=1
+    slug="$(printf '%s' "${br#refs/heads/}" | tr '/' '_')"
+    [ -n "$slug" ] || slug="detached"
+    day="$("$DATE_BIN" -u +%Y-%m-%d 2>/dev/null)" || day="undated"
+    dir="$REAP_WT_PRESERVE_DIR/$day/$slug.${sha:0:8}"
+    if ! mkdir -p "$dir" 2>/dev/null; then
+        log "PRESERVE-FAIL $path cannot create $dir"
+        return 1
+    fi
+    out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-presv.XXXXXX")" || return 1
+    tarf="$dir/lane-evidence.tar.gz"
+    rm -f "$tarf"
+
+    # ── the lane's own mandated evidence ─────────────────────────────────
+    ev="$(lane_evidence_present "$path")"
+    if [ -n "$ev" ]; then
+        # $ev is space-free ROOT names by construction (see IGNORED_LANE_EVIDENCE) — the same
+        # discipline the ephemeral payload relies on. `-C "$path"` keeps the member names relative.
+        # shellcheck disable=SC2086
+        run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -czf "$tarf" -C "$path" $ev
+        rc=$?
+        if [ "$rc" != 0 ]; then
+            log "PRESERVE-FAIL $path lane-evidence tar rc=$rc"
+            rm -f "$out" "$tarf"; return 1
+        fi
+        run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -tzf "$tarf"
+        rc=$?
+        listed="$(cat "$out" 2>/dev/null)"
+        if [ "$rc" != 0 ]; then
+            log "PRESERVE-FAIL $path lane-evidence tar VERIFY rc=$rc (unreadable archive)"
+            rm -f "$out" "$tarf"; return 1
+        fi
+        for e in $ev; do
+            case "$listed" in
+                *"$e"*) : ;;
+                *) log "PRESERVE-FAIL $path lane-evidence $e missing from the archive"; ok=0 ;;
+            esac
+        done
+        [ "$ok" = 1 ] || { rm -f "$out" "$tarf"; return 1; }
+    fi
+
+    # ── the diff and the status: what a human would ask for first ────────
+    # Written for EVERY removal, not only the evidence rows: gate (b) is a property of destroying a
+    # checkout, not of one gate. Both are bounded like every other git probe in this file.
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$dir/worktree.diff" "$GIT_BIN" -C "$path" \
+        -c core.quotepath=false diff HEAD --no-color
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        log "PRESERVE-FAIL $path git diff rc=$rc (the working tree could not be captured)"
+        rm -f "$out"; return 1
+    fi
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$dir/worktree.status" "$GIT_BIN" -C "$path" \
+        -c core.quotepath=false status --porcelain --untracked-files=normal
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        log "PRESERVE-FAIL $path git status rc=$rc (the working tree could not be captured)"
+        rm -f "$out"; return 1
+    fi
+
+    {
+        printf 'path=%s\n' "$path"
+        printf 'branch=%s\n' "${br:-<detached>}"
+        printf 'head=%s\n' "$sha"
+        printf 'reason=%s\n' "$why"
+        printf 'preserved_at=%s\n' "$("$DATE_BIN" -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+        printf 'lane_evidence=%s\n' "${ev:-<none>}"
+        printf 'restore=tar -xzf lane-evidence.tar.gz -C <checkout>   # then: git apply worktree.diff\n'
+    } >"$dir/manifest.txt" 2>/dev/null || { log "PRESERVE-FAIL $path manifest unwritable"; rm -f "$out"; return 1; }
+
+    rm -f "$out"
+    # Final verification, on the artefacts rather than on the exit codes.
+    [ -s "$dir/manifest.txt" ] || { log "PRESERVE-FAIL $path empty manifest at $dir"; return 1; }
+    [ -f "$dir/worktree.diff" ]   || { log "PRESERVE-FAIL $path no worktree.diff at $dir"; return 1; }
+    [ -f "$dir/worktree.status" ] || { log "PRESERVE-FAIL $path no worktree.status at $dir"; return 1; }
+    if [ -n "$ev" ] && [ ! -s "$tarf" ]; then
+        log "PRESERVE-FAIL $path lane evidence exists but $tarf is missing/empty"
+        return 1
+    fi
+    log "PRESERVED $path -> $dir (evidence=${ev:-none})"
+    printf '%s' "$dir"
+    return 0
 }
 
 # pr_state_load — ONE batched call for the whole pass, with an explicit
@@ -3268,7 +3483,8 @@ holder_recheck() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
-    local path="$1" sha="$2" eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
+    local path="$1" sha="$2" br="${3:-}" why="${4:-}" presv=""
+    local eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
 
     # Re-check #0 — THE HOLDER RULE, again (review round 1), and AGAIN as the LAST step before the
@@ -3332,6 +3548,21 @@ remove_one() {
     # the two `git status` calls and the ephemeral deletions (up to REAP_WT_REMOVE_TIMEOUT each)
     # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
     holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
+
+    # ── GATE (b): PRESERVE, THEN DESTROY ─────────────────────────────────
+    # Runs AFTER the last holder/liveness re-check (so a checkout that just came back to life is
+    # never even archived) and IMMEDIATELY BEFORE the fork that destroys — the narrowest window this
+    # file has. A capture that does not verify takes the PRESERVE arm (rc 2), never a removal: the
+    # whole point is that a LANDED checkout can still hold work a human wanted, and the lane-evidence
+    # tarball is the only copy of the mandatory per-lane report once the tree is gone.
+    if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
+        if ! presv="$(preserve_before_removal "$path" "$sha" "$br" "${why:-reclaimable}")"; then
+            REMOVE_SKIP_VERDICT="preserve-failed"
+            log "PRESERVE-SKIP $path the pre-removal capture did NOT verify — nothing removed"
+            rm -f "$out"; return 2
+        fi
+        log "PRESERVE-OK $path $presv"
+    fi
 
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
     rc=$?
@@ -4002,7 +4233,7 @@ run() {
                             rc=2
                         fi
                     else
-                        remove_one "$p" "$h"; rc=$?
+                        remove_one "$p" "$h" "$b" "$reason"; rc=$?
                     fi
                     case "$rc" in
                         0)

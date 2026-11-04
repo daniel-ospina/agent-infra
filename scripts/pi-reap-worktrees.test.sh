@@ -722,6 +722,10 @@ run_reaper() {
     REAP_WT_MAIN_REF="${REAP_WT_MAIN_REF_OVERRIDE:-}" \
     TAR_BIN="${TAR_BIN_OVERRIDE:-tar}" \
     REAP_WT_BACKUP_DIR="${REAP_WT_BACKUP_DIR_OVERRIDE:-}" \
+    REAP_WT_PRESERVE="${REAP_WT_PRESERVE_OVERRIDE:-1}" \
+    REAP_WT_PRESERVE_DIR="${REAP_WT_PRESERVE_DIR_OVERRIDE:-$T/$envname/preserve}" \
+    REAP_WT_IGNORED_EVIDENCE="${REAP_WT_IGNORED_EVIDENCE_OVERRIDE- .worktree-report WORKTREE-REPORT.md }" \
+    REAP_WT_IGNORED_POINTER="${REAP_WT_IGNORED_POINTER_OVERRIDE- scripts }" \
     MOVE_COUNTER="${MOVE_COUNTER:-}" \
     REAP_WT_REPO_SLUG="${REAP_WT_REPO_SLUG:-}" \
     REAP_WT_PR_LIMIT="${REAP_WT_PR_LIMIT_OVERRIDE:-1000}" \
@@ -996,6 +1000,117 @@ assert_dir "$WT_DATA" "G2e --apply preserves the non-cache ignored-artifact work
 assert_nodir "$WT_SPACE" "G2f --apply removes the spaced-cache worktree (no partial rm -rf of the tracked sibling)"
 assert_eq "$("$REAL_GIT" -C "$REPO" branch --list feat/g2-eph | wc -l | tr -d ' ')" "1" \
     "G2c branch ref survives the checkout removal"
+
+# ── G2g/G2h/G2i/G2x: LANE EVIDENCE — the two entries the FLEET ITSELF requires ────────
+# ⛔ THE MEASURED DEFECT THIS PINS (2026-11-03, cell-3 at 90% used). The reaper was ARMED, passing
+# hourly and CORRECT, and reclaimed ONE worktree per pass against ~80 created per day, because
+# `ignored-artifact` (a PRESERVE rule) was its own largest bucket:
+#   examined=133 classified=133 remove=1 preserved=132 reasons=ignored-artifact:70,…
+# — 70 rows holding 20,557 MB, and 54 of them carried exactly the two names below. They are the
+# entries the FLEET MANDATES every checkout to materialise and then GITIGNORES: the per-lane
+# `WORKTREE-REPORT.md` + `.worktree-report/` (owner ruling 2026-10-28, #10220) and the agent-infra
+# `scripts` SYMLINK (#9475). Obeying the fleet's own instructions made a checkout unreclaimable, so
+# the reaper's actuator could not deliver while every one of its gates read green.
+ENV_PV="$ENV-pv"
+REPO_PV="$(mk_repo "$ENV_PV")"
+printf '%s\n' '.worktree-report/' 'WORKTREE-REPORT.md' 'scripts' >"$REPO_PV/.gitignore"
+printf 'base2\n' >"$REPO_PV/base2.txt"
+"$REAL_GIT" -C "$REPO_PV" add .gitignore base2.txt
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO_PV" commit -qm ignore2
+mkdir -p "$T/$ENV_PV/agent-infra-scripts"
+mk_evidence() { # <worktree> <report-body> — the mandated lane residue, at the ROOT only
+    mkdir -p "$1/.worktree-report"
+    printf 'suite: bash tests/x\n' >"$1/.worktree-report/run.log"
+    printf '%s\n' "$2" >"$1/WORKTREE-REPORT.md"
+}
+# (1) LANDED: 0 commits ahead of main (the ancestry proof), and the ONLY dirt is the lane evidence.
+WT_EVID="$(add_named_wt "$REPO_PV" "$ENV_PV-evidence" feat/g2g-evidence)"
+mk_evidence "$WT_EVID" '# LANE REPORT
+preserve-me-42'
+ln -s "$T/$ENV_PV/agent-infra-scripts" "$WT_EVID/scripts"
+# (2) UNLANDED: the branch holds a commit main does not have, and its PR is OPEN.
+WT_UNL="$(add_named_wt "$REPO_PV" "$ENV_PV-unlanded" feat/g2h-unlanded)"
+mk_evidence "$WT_UNL" '# LANE REPORT
+unlanded'
+commit_in_wt "$WT_UNL" "$OLD_DATE" unlanded
+# (3) DIRTY but LANDED: merged, carries evidence, AND a tracked modification a human wanted.
+WT_DIRT="$(add_named_wt "$REPO_PV" "$ENV_PV-dirty" feat/g2i-dirty)"
+mk_evidence "$WT_DIRT" '# LANE REPORT
+dirty but landed'
+printf 'uncommitted work a human wanted\n' >>"$WT_DIRT/base.txt"
+PV_DIR="$T/$ENV_PV/preserve"
+# The open-PR veto only exists where the PR gate is APPLICABLE: a github.com origin (G5a's shape).
+# Without it the PR state is N/A and an aged unmerged checkout is reclaimed under `refs=branch-retained`
+# — a DIFFERENT, deliberate rule (G6b) that would make this case prove nothing about the fix.
+"$REAL_GIT" -C "$REPO_PV" remote add origin https://github.com/daniel-ospina/does-not-exist.git
+GH_PV="feat/g2h-unlanded"
+OUT="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT" "$WT_EVID")" "reason=reclaimable" \
+    "G2g evidence-only + the scripts SYMLINK => reclaimable, not ignored-artifact (the 70-row / 20.5 GB class)"
+assert_contains "$(row_for "$OUT" "$WT_UNL")" "reason=open-pr" \
+    "G2h an UNLANDED branch (open PR) is refused even though its evidence is identical"
+assert_contains "$(row_for "$OUT" "$WT_DIRT")" "reason=dirty" \
+    "G2i a dirty-but-LANDED checkout is refused (a landed tree can still hold work a human wanted)"
+assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "0" \
+    "G2g a DRY RUN archives nothing (dry-run first, always)"
+OUT="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_nodir "$WT_EVID" "G2g --apply removed the landed evidence-only checkout"
+assert_dir  "$WT_UNL"  "G2h --apply refused the unlanded checkout"
+assert_dir  "$WT_DIRT" "G2i --apply refused the dirty-but-landed checkout"
+assert_contains "$("$REAL_GIT" -C "$WT_DIRT" status --porcelain)" " M base.txt" \
+    "G2i the dirty checkout's diff is PRESERVED (the tree is kept, so the modification is still there)"
+assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "1" \
+    "G2g EXACTLY one archive exists — the two refused rows produced none"
+PVDIR="$(ls -d "$PV_DIR"/*/* 2>/dev/null | head -1)"
+assert_file "$PVDIR/manifest.txt" "G2g gate (b): a manifest was written BEFORE the checkout was destroyed"
+assert_file "$PVDIR/worktree.diff" "G2g gate (b): git diff HEAD was captured"
+assert_file "$PVDIR/worktree.status" "G2g gate (b): git status --porcelain was captured"
+assert_file "$PVDIR/lane-evidence.tar.gz" "G2g the mandatory per-lane report was ARCHIVED, not silently deleted"
+assert_contains "$(cat "$PVDIR/manifest.txt")" "path=$WT_EVID" "G2g the manifest names the checkout it came from"
+assert_contains "$(cat "$PVDIR/manifest.txt")" "head=$("$REAL_GIT" -C "$REPO_PV" rev-parse feat/g2g-evidence)" \
+    "G2g the manifest names the exact HEAD that was removed"
+assert_contains "$(cat "$PVDIR/manifest.txt")" "reason=reclaimable" "G2g the manifest names why"
+mkdir -p "$T/$ENV_PV/unpack"
+tar -xzf "$PVDIR/lane-evidence.tar.gz" -C "$T/$ENV_PV/unpack" 2>/dev/null
+assert_file "$T/$ENV_PV/unpack/WORKTREE-REPORT.md" "G2g the archive holds the report FILE"
+assert_file "$T/$ENV_PV/unpack/.worktree-report/run.log" "G2g the archive holds the report DIRECTORY"
+assert_contains "$(cat "$T/$ENV_PV/unpack/WORKTREE-REPORT.md" 2>/dev/null)" "preserve-me-42" \
+    "G2g the archived report is the lane's own CONTENT (a tarball that exists is not a capture)"
+assert_eq "$("$REAL_GIT" -C "$REPO_PV" rev-parse --verify -q feat/g2g-evidence | wc -l | tr -d ' ')" "1" \
+    "G2g the branch ref survives — removal is the CHECKOUT, never a branch"
+# ── IDEMPOTENCE: the same pass run twice must not remove or archive anything more ────────
+OUT2="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --apply --repo "$REPO_PV")"
+assert_contains "$OUT2" "removed=0" "G2g IDEMPOTENT: a second pass removes nothing"
+assert_eq "$(ls -d "$PV_DIR"/*/* 2>/dev/null | wc -l | tr -d ' ')" "1" \
+    "G2g IDEMPOTENT: a second pass writes no second archive"
+assert_dir "$WT_UNL" "G2h IDEMPOTENT: the unlanded checkout is still refused on the second pass"
+# ── G2x: the MUTANT that must turn this case RED ──────────────────────────────────
+# A case that cannot fail proves nothing (the rule `disk-reaper-classes.test.sh` is built on). The
+# mutant neuters the ONE predicate the fix is: the evidence tolerance in `clean_gate`. The same
+# fixture must then fall back to the old `ignored-artifact` PRESERVE. If it still reads
+# `reclaimable`, the assertions above are not measuring this change at all.
+WT_EVID2="$(add_named_wt "$REPO_PV" "$ENV_PV-evidence2" feat/g2x-evidence)"
+mk_evidence "$WT_EVID2" '# LANE REPORT
+mutant control'
+MUT="$T/$ENV_PV/pi-reap-worktrees.mutant.sh"
+sed 's/&& is_lane_evidence_entry "\$p"; then/\&\& false; then/' "$REAPER" >"$MUT"
+if cmp -s "$REAPER" "$MUT"; then
+    bad "G2x the MUTANT DID NOT APPLY (the evidence predicate moved) — the case cannot discriminate"
+else
+    ok "G2x mutant applied: the evidence predicate is neutered"
+fi
+OUT_M="$(FAKE_GH_REFS="$GH_PV" REAPER_OVERRIDE="$MUT" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_M" "$WT_EVID2")" "reason=ignored-artifact" \
+    "G2x MUTANT GOES RED: without the fix the evidence-only checkout is PRESERVED again (the 70-row class)"
+OUT_R="$(FAKE_GH_REFS="$GH_PV" run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_R" "$WT_EVID2")" "reason=reclaimable" \
+    "G2x CONTROL: the real script reads the SAME fixture as reclaimable (so the mutant difference is the code)"
+# The seam that restores the pre-fix policy, for a box that wants the old conservatism back.
+OUT_S="$(FAKE_GH_REFS="$GH_PV" REAP_WT_PRESERVE_OVERRIDE=0 run_reaper $ENV_PV --dry-run --repo "$REPO_PV")"
+assert_contains "$(row_for "$OUT_S" "$WT_EVID2")" "reason=ignored-artifact" \
+    "G2x REAP_WT_PRESERVE=0 restores the pre-fix veto exactly (the tolerance and the archive cannot disagree)"
+assert_contains "$(row_for "$OUT_S" "$WT_EVID2")" "WORKTREE-REPORT.md" \
+    "G2x …and the row still NAMES the offending entry, as it always did"
 
 # ── G3: reachable gate (detached HEAD only) ────────────────────────────
 ENV=G3; REPO="$(mk_repo $ENV)"
