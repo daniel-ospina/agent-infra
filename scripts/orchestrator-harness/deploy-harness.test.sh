@@ -415,7 +415,10 @@ say_case "11. the helper owns the verdict, so a caller cannot announce success o
 # (it sits after the copy-fail and verify-fail gates, which both `exit 1`).
 n_success_lines="$(grep -c 'harness deploy VERIFIED' "$DEPLOY")"
 [ "$n_success_lines" = "1" ] && ok "one success-notification site" || bad "$n_success_lines success-notification sites (expected 1)"
-n_verified_print="$(grep -c 'say "\$PROG: VERIFIED' "$DEPLOY")"
+# ⛔ THE PIN NAMES THE SHIPPED HELPER (#2910). It said `say "$PROG: VERIFIED`, so the rename to
+# `log_line` left it counting 0 and this arm reddened — the guard working, on a stale spelling. It pins
+# the CALL SITE, not the helper: match the message and accept either helper name.
+n_verified_print="$(grep -cE '(say|log_line) "\$PROG: VERIFIED' "$DEPLOY")"
 [ "$n_verified_print" = "1" ] && ok "one VERIFIED print site" || bad "$n_verified_print VERIFIED print sites (expected 1)"
 # The helper's non-comment lines are CAPTURED once and tested in the shell: a non-quiet grep piped
 # into `grep -q` is the #841/#864 SIGPIPE false-negative (the quiet grep exits early, the producer

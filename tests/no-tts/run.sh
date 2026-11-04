@@ -51,11 +51,16 @@ trap 'rm -rf "$T"' EXIT
 
 # ── the census: which files EXECUTE a shipped fragment? ─────────────────────────────────────────
 # stdin: repo-relative paths. A fragment runner is a file that cats a shell slice into a child shell.
+# ⛔ COMMENTS AND FIXTURES ARE NOT RUNNERS (#2910 review). Matching the raw file counted the prelude's own
+# usage example (a `#` line) and this shard's own mutation fixtures as fragment runners, so the census
+# read 3 where exactly 1 suite executes a fragment — and the non-vacuity arm below could have been
+# satisfied by PROSE even if every real runner stopped matching the shape. Comment lines are stripped
+# before matching, and this shard is excluded from its own census (its fixtures are deliberate).
 frag_runners() { # <paths on stdin>
   local f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    grep -qF 'cat "$FRAG"' "$f" 2>/dev/null && printf '%s\n' "$f"
+    grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -qF 'cat "$FRAG"' && printf '%s\n' "$f"
   done
 }
 # stdin: repo-relative paths. Offenders are fragment runners that do NOT source the one shared prelude —
@@ -64,12 +69,13 @@ frag_unadopted() { # <paths on stdin>
   local f
   while IFS= read -r f; do
     [ -n "$f" ] || continue
-    grep -qF 'cat "$FRAG"' "$f" 2>/dev/null || continue
-    grep -qF 'frag-stubs.sh' "$f" 2>/dev/null || printf '%s\n' "$f"
+    grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -qF 'cat "$FRAG"' || continue
+    grep -v '^[[:space:]]*#' "$f" 2>/dev/null | grep -qF 'frag-stubs.sh' || printf '%s\n' "$f"
   done
 }
 
 CENSUS="$(cd "$ROOT" && git ls-files -- '*.test.sh' 'scripts/*.sh' 'tests/*/run.sh' 'pi-bootstrap/tests/*.sh' 2>/dev/null \
+          | grep -vx 'tests/no-tts/run.sh' \
           | sed "s|^|$ROOT/|" | frag_runners)"
 if [ -n "$CENSUS" ]; then
   ok "the census found $(printf '%s\n' "$CENSUS" | wc -l | tr -d ' ') suite(s) that execute a shipped fragment: $(printf '%s' "$CENSUS" | sed "s|^$ROOT/||" | tr '\n' ' ')"

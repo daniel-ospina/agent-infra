@@ -4273,14 +4273,18 @@ grep -q 'set +a; export ORCH_FOREGROUND=0;' "$SUP" \
 # when the controller it waited for is GONE, so a `say "already running …"` placed AFTER it announced a pid
 # that no longer exists and returned 0 without launching anything — a clean pass over a cell with no
 # dispatcher. Every such answer must therefore sit in the NON-foreground arm of its branch (an `else`),
-# never on the path the handover returns to. RED on revert: putting the `say` back after the handover leaves
-# it outside an `else` and this pin reports the line.
+# never on the path the handover returns to. RED on revert: putting the `log_line` back after the
+# handover leaves it outside an `else` and this pin reports the line.
+# ⛔ THE PIN CARRIES THE SHIPPED HELPER'S NAME (#2910). It matched `/say "already running/`, so when the
+# helper was renamed `say` → `log_line` it selected ZERO candidate lines, the body never ran, and the
+# arm went on printing `ok` — a pin that cannot fail. The name it matches is the name the shipped script
+# uses; if that name ever changes again, this pin must change with it (or, better, match on the MESSAGE).
 say_case 'every "already running" answer sits in the NON-foreground arm (service mode falls through to launch)'
 _ar_bad="$(awk '
   { line[NR] = $0 }
   END {
     for (i = 1; i <= NR; i++) {
-      if (line[i] !~ /say "already running/) continue
+      if (line[i] !~ /log_line "already running/) continue
       found = 0
       for (j = i - 1; j >= 1 && j >= i - 9; j--) {
         # The answer is correct if it sits in the NON-foreground arm, which this file spells two ways: an

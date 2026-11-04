@@ -2667,12 +2667,25 @@ case "$(cat "$O/fix.err" 2>/dev/null)" in
   *'command not found'*) bad "§O: with the prelude the fragment still hit a missing command — the prelude does not cover it: $(head -2 "$O/fix.err")" ;;
   *) ok '§O: and it hit no missing command — the prelude covers every helper the shipped fragment invokes' ;;
 esac
-# …and the SYSTEM-binary layer is not `say`-only, so a fragment that shells out to one of these is caught
-# by the recorder rather than by a human in the room.
-case "$FRAG_SYSTEM_CALLS" in
-  *say*open*osascript*afplay*) ok '§O: the recorder covers the other macOS binaries a fragment could reach (open/osascript/afplay), not just `say`' ;;
-  *) bad "§O: a fragment could still reach a system binary unrecorded — FRAG_SYSTEM_CALLS='$FRAG_SYSTEM_CALLS' (#2910)" ;;
-esac
+# …and the SYSTEM-binary layer is REACHABLE — proved by RUNNING it, not by matching a string.
+# ⛔ THIS ARM WAS A STRING CHECK AND COULD NOT FAIL. It matched `FRAG_SYSTEM_CALLS` for the four words
+# `say open osascript afplay` while layer 1 stubbed three of them as FUNCTIONS; a function beats a PATH
+# lookup, so those three recorders were unreachable and every "reaches no system binary" claim about
+# them was green over nothing (#2910 review). Calling each binary WITH the prelude in place is the only
+# check that can tell the two layers apart: if a name ever migrates back into FRAG_STUBS it reddens here.
+if [ "$O_OK" = 1 ]; then
+  : > "$O/say.calls"
+  for _b in $FRAG_SYSTEM_CALLS; do
+    env PATH="$O/bin:/usr/bin:/bin" bash -c "${FRAG_STUBS}$_b \"§O syscall probe\"" >/dev/null 2>&1 || true
+  done
+  O_SYS="$(wc -l < "$O/say.calls" 2>/dev/null | tr -d ' ')"
+  O_WANT="$(printf '%s\n' $FRAG_SYSTEM_CALLS | wc -l | tr -d ' ')"
+  [ "${O_SYS:-0}" -eq "$O_WANT" ] \
+    && ok "§O: the recorder captures EVERY system binary in FRAG_SYSTEM_CALLS ($O_SYS/$O_WANT) with the prelude in place — layer 1 does not shadow layer 2" \
+    || bad "§O: layer 1 SHADOWS the recorder — only $O_SYS/$O_WANT of FRAG_SYSTEM_CALLS reached it, so an empty calls file is no evidence for the rest. A system binary name belongs in layer 2 only (#2910)"
+else
+  bad '§O: refusing the system-binary arm — `say` does not resolve to the recorder, so the recorder is not armed and its coverage proves nothing'
+fi
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"

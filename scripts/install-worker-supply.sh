@@ -52,7 +52,7 @@ MAX_REFILLS="${WORKER_SUPPLY_MAX_REFILLS:-2}"
 UNIT_NAME="eldato-worker-supply.service"
 SCRIPT=""
 
-say()  { printf '%s\n' "$*"; }
+log_line()  { printf '%s\n' "$*"; }
 ok()   { printf '  ✅ %s\n' "$*"; }
 warn() { printf '  ⚠️  %s\n' "$*" >&2; }
 err()  { printf '  ❌ %s\n' "$*" >&2; }
@@ -172,7 +172,7 @@ do_dry_run() {
     resolve_scope || exit 1
     tmp="$(mktemp "${TMPDIR:-/tmp}/worker-supply-unit.XXXXXX")" || die "REFUSING: no temp file"
     render "$tmp" || { rm -f "$tmp"; exit 1; }
-    say "scope=$SCOPE unit_dir=$UNIT_DIR script=$SCRIPT"
+    log_line "scope=$SCOPE unit_dir=$UNIT_DIR script=$SCRIPT"
     awk '{ printf "  %s\n", $0 }' "$tmp"
     rm -f "$tmp"
     return 0
@@ -232,7 +232,7 @@ do_status() {
     if [ -f "$dest" ]; then ok "installed: $dest"; else err "not installed: $dest"; rc=1; fi
     if $SYSTEMCTL is-enabled --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "enabled: yes"; else err "enabled: no"; rc=1; fi
     if $SYSTEMCTL is-active --quiet "$UNIT_NAME" >/dev/null 2>&1; then ok "active: yes"; else err "active: no"; rc=1; fi
-    [ -n "$SCRIPT" ] && { say "supervisor status:"; "$SCRIPT" status 2>&1 | sed 's/^/    /'; }
+    [ -n "$SCRIPT" ] && { log_line "supervisor status:"; "$SCRIPT" status 2>&1 | sed 's/^/    /'; }
     # ⛔ THE EXIT CODE MUST CARRY THE VERDICT, NOT JUST THE LAST TEST (review #2896 round 3). `--status`
     # printed `❌ not installed` / `❌ enabled: no` / `❌ active: no` and still exited 0 whenever the unit
     # FILE existed — so a caller that reads the code (a lane, a supervisor, `set -e`) was told "healthy"
@@ -259,7 +259,7 @@ while [ $# -gt 0 ]; do
         --status|status) MODE=status ;;
         --uninstall|uninstall) MODE=uninstall ;;
         -h|--help) awk 'NR>1 && /^set -uo pipefail/ { exit } NR>1 { sub(/^# ?/, ""); print }' "$0"; exit 0 ;;
-        *) say "usage: install-worker-supply.sh [--install|--dry-run|--status|--uninstall|--help]"; exit 2 ;;
+        *) log_line "usage: install-worker-supply.sh [--install|--dry-run|--status|--uninstall|--help]"; exit 2 ;;
     esac
     shift
 done

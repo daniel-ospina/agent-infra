@@ -35,17 +35,29 @@
 #      BINARY, so it survives our helper being renamed again, and asserting the calls file is empty is
 #      evidence about the real system rather than the absence of a crash.
 #
-# ⛔ `say` IS DELIBERATELY **NOT** IN `FRAG_STUBS`, AND THAT IS THE WHOLE POINT OF THE SPLIT.
-# Stubbing `say` here would shadow the recorder too, so "the calls file is empty" would be vacuous —
-# it would prove only that our own stub ran. `say` is a SYSTEM binary name (layer 2's business), not
-# one of our helper names (layer 1's), and the two lists change for different reasons: layer 1 tracks
-# this repo's code, layer 2 tracks macOS.
+# ⛔ NO SYSTEM BINARY NAME GOES IN `FRAG_STUBS`, AND THAT IS THE WHOLE POINT OF THE SPLIT. A stub here
+# would shadow the recorder too — a shell FUNCTION beats a PATH lookup — so "the calls file is empty"
+# would be vacuous: it would prove only that our own stub ran. `say`, `open`, `osascript` and `afplay`
+# are all SYSTEM binary names (layer 2's business), not our helper names (layer 1's), and the two
+# lists change for different reasons: layer 1 tracks this repo's code, layer 2 tracks macOS.
+#
+# MEASURED DEFECT, NOT A PREFERENCE (#2910 review): the first cut of this file carried
+# `open(){ :; }; osascript(){ :; }; afplay(){ :; }` in FRAG_STUBS as well. Layer 2's recorders for
+# those three were therefore UNREACHABLE — a fragment that opened an app or fired a script was
+# silenced by layer 1 and recorded nowhere, so "the calls file is empty" held for the wrong reason and
+# the `open/osascript/afplay` half of the guard could not fail. Verified: the same fragment run with
+# FRAG_STUBS recorded 0 calls, and with ONLY layer 2 recorded one per binary. Layer 2 already makes
+# all four quiet (the recorder exits 0), so listing them here bought nothing and cost the evidence.
+# `install-controller-service.test.sh` §O now proves reachability by RUNNING each binary with the
+# prelude in place, instead of matching a string that merely contains the four names.
 # ⛔ And `die` is never stubbed: it is BEHAVIOUR (it exits 1), not output, so stubbing it would silence
 # a fragment's real failure paths and turn an arm into a green over nothing.
 
 # Layer 1 — the names OUR shipped scripts define at file scope and a fragment may call.
-# `log_line` is the print helper (renamed from `say` in #2910 — see above).
-FRAG_STUBS='log_line(){ :; }; open(){ :; }; osascript(){ :; }; afplay(){ :; }; '
+# `log_line` is the print helper (renamed from `say` in #2910 — see above). It is the ONLY entry: every
+# other name a fragment may reach that can make a noise belongs to layer 2, whose recorder must stay
+# reachable so an assertion about it is evidence rather than silence.
+FRAG_STUBS='log_line(){ :; }; open(){ :; }; '
 
 # Layer 2 — the system binaries that make a NOISE or LAUNCH something. A fragment-runner recorder
 # should cover all of these; a suite-runner covering only `say` is stated at its own call site.

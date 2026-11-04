@@ -721,10 +721,20 @@ H="$T/h10b"; mkdir -p "$H"
 awk '/^cache_reaper_path\(\)/,/^}/' "$SUPERVISOR" >"$H/fn.sh"
 awk '/^reap_global_caches\(\)/,/^}/' "$SUPERVISOR" >>"$H/fn.sh"
 grep -q 'reap_global_caches()' "$H/fn.sh" || bad "could not extract reap_global_caches() from the supervisor (the test needs the SHIPPED bytes)"
+# ⛔ THE STUB MUST CARRY THE SHIPPED HELPER'S CURRENT NAME (#2910). This arm executes a SLICE of the
+# shipped supervisor in a child shell, so the supervisor's own print helper does not exist there. The
+# stub said `say()`, and the rename to `log_line` is exactly what broke it: the slice then ran against
+# `log_line: command not found`, the `3)` case lost the warning it asserts on, and — worse — the
+# `0|4|5|7` cases passed for the WRONG reason, because an error line on stderr satisfied
+# `assert_not_contains "warn:"`. Same class as #2911, one file over: a per-file stub list is a
+# convention and a convention gets forgotten (agent-infra#2910 review, P1).
+# ⛔ AND IT MUST PASS THE TEXT THROUGH — `lib/frag-stubs.sh`'s `log_line(){ :; }` is deliberately NOT used
+# here: that stub exists to keep a fragment QUIET while the arms assert on a PATH recorder, whereas THIS
+# arm asserts on the fragment's own OUTPUT, so a silencing stub would delete its own evidence.
 for want in 0 4 5 7 3; do
     printf '#!/bin/sh\nexit %s\n' "$want" >"$H/pi-cache-reap.sh"
     chmod +x "$H/pi-cache-reap.sh"
-    out="$(env HOME="$H" bash -c 'say() { printf "%s\n" "$*"; }; . "$1"; reap_global_caches' _ "$H/fn.sh" 2>&1)"
+    out="$(env HOME="$H" bash -c 'log_line() { printf "%s\n" "$*"; }; . "$1"; reap_global_caches' _ "$H/fn.sh" 2>&1)"
     case "$want" in
         0|4|5|7) assert_not_contains "$out" "warn:" "exit $want is NOT a failure: no warning is raised (4 = did not run, 5 = over bound and not acted on, 7 = DEFERRED)" ;;
         3)     assert_contains "$out" "warn: the cache reaper exited 3" "a fail-closed pass (exit 3) DOES warn, naming the status and the log" ;;
