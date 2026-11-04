@@ -1374,6 +1374,77 @@ d["mcpServers"]["tortoise"] = json.load(open(tpl))["mcpServers"]["tortoise"]
 json.dump(d, open(p, "w"), indent=2)
 PY
 
+# ⛔ INSTALL AND VERIFY MUST ALSO AGREE ABOUT A CREDENTIAL IN THE CLEAR. `usable()` accepted ANY
+# non-default url, so a remote http self-host carrying the template's credential header was PRESERVED
+# and marked `_selfHosted` while `--verify` refused it (`INSECURE_URL`) — the same "install preserves
+# what verify refuses" loop c990c780 closed for `type`, on the credential surface, where each repair
+# re-mints the config the verifier refuses. One rule on both sides: the arm INSTALLS and then VERIFIES.
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+t = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+t["url"] = "http://graph.example:8000/mcp"        # remote, plaintext, template's own credential
+# the credential header is the TEMPLATE's own, so this arm is about the SCHEME and cannot drift
+# from the canonical bytes the verifier accepts
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+run_verify
+rc=$?
+[ "$rc" -eq 0 ] && grep -q "OK:https://api.premiselabs.co/mcp/" "$LOG" \
+  && ok "install REPLACES a remote plaintext self-host carrying a credential, and --verify agrees (no unrecoverable loop)" \
+  || fail "install preserved (or verify refused) an entry that would send the credential over cleartext (verify rc=$rc) — the repair can never converge"
+# ⛔ ...AND THE LOOPBACK EXEMPTION IS AN IP-LITERAL TEST, NEVER A PREFIX TEST. `127.evil.com` is an
+# ordinary DNS name its owner can point anywhere, and `127.0.0.1@evil.example` is the loopback
+# spelling followed by userinfo and an ATTACKER'S host. A `startswith("127.")` exemption certified
+# both `SELFHOSTED:` rc=0 with the tenant key attached (measured).
+for LOOKALIKE in "http://127.evil.com/mcp/" "http://127.0.0.1@evil.example/mcp/"; do
+  python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" "$LOOKALIKE" <<'PY'
+import json, sys
+p, tpl, u = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(p))
+t = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+t["url"] = u
+t["_selfHosted"] = True
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+  run_verify
+  rc=$?
+  [ "$rc" -eq 1 ] && grep -q "carries a credential over a NON-https scheme" "$LOG" \
+    && ok "--verify refuses the lookalike host $LOOKALIKE (loopback is an IP test, not a prefix test)" \
+    || fail "--verify certified $LOOKALIKE — a host that merely STARTS with 127 was treated as loopback, and the tenant key would go to it in cleartext"
+done
+# ⛔ A MERGE MUST NOT WIDEN WHAT IT REPLACES. temp+`os.replace` hands the destination the TEMP file's
+# mode, so a hardened 0600 came back 0644 — on a credential-adjacent file, the wrong direction.
+python3 - "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = json.load(open(tpl))["mcpServers"]["tortoise"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+chmod 600 "$DEST/.mcp.json"
+run_install >/dev/null 2>&1
+[ "$(python3 -c 'import os,stat,sys; print(oct(stat.S_IMODE(os.stat(sys.argv[1]).st_mode)))' "$DEST/.mcp.json")" = "0o600" ] \
+  && ok "a merge PRESERVES the destination's mode (0600 in, 0600 out)" \
+  || fail "a merge WIDENED .mcp.json's mode — a credentialed config's permissions must not be a side effect of a re-sync"
+# ⛔ "NO READABLE ENTRY" IS NOT "NEEDS NO KEY". With .mcp.json unparseable the merge fails and the
+# credential note runs anyway; it used to assert "the tortoise entry declares no Authorization — a
+# self-hosted daemon needs none" about a file it had just failed to read (see graph_mcp_var's
+# NOENTRY/LITERAL markers).
+cp "$DEST/.mcp.json" "$TMP/mcp-keep.json"      # the arm corrupts the file next; keep a COPY to restore
+printf 'not json at all' > "$DEST/.mcp.json"
+run_install
+rc=$?
+[ "$rc" -ne 0 ] && grep -q "graph credential: UNKNOWN" "$LOG" \
+  && ! grep -qF "declares no Authorization" "$LOG" \
+  && ok "an unreadable .mcp.json is reported UNKNOWN, never as 'this entry needs no key'" \
+  || fail "a failed merge reported the credential state as 'no Authorization' for a file it could not read (rc=$rc) — the one diagnostic a reader uses to tell a working cell from a 401 one"
+cp "$TMP/mcp-keep.json" "$DEST/.mcp.json"      # restore from the COPY, not by re-reading an unparseable file
+
 # ⛔ THE INSTALL SIDE MUST ENFORCE THE HOSTED HEADER TOO. The verifier has three arms for it; the
 # merge carries its own copy of the predicate, so an install that PRESERVED a foreign variable would
 # write a config `--verify` refuses for ever — the unrecoverable disagreement.
