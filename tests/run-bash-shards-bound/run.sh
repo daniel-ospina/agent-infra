@@ -73,13 +73,23 @@ TMP="$(mktemp -d)"
 FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 # ⛔ AND THE FIXTURE MUST NOT INHERIT THE CALLER'S **RUNNER** ENV EITHER (agent-infra#3220, measured).
 # The fixtures below run the REAL runner, so every variable that runner reads is inherited input. Its
-# env contract is exactly three variables (scripts/run-bash-shards.sh:75-87): BASH_SHARD_SLICE,
-# SHARD_BOUND, BASH_SHARDS_BUDGET_SECS — so ALL THREE are cleared here, and the reason is that CI
-# exports the other two UNINVITED while one arm NEEDS the third absent:
-#   * `ci-main.yml:607-612` sets BASH_SHARDS_BUDGET_SECS=7800 in the STEP env of the `script-validate`
-#     job's bash-shards step (step-level, not job-level), and the slice arm below sets
-#     BASH_SHARD_SLICE=1/1 itself, so the pair hits the runner's deliberate "cannot be combined"
-#     refusal (scripts/run-bash-shards.sh:402-404, `exit 2`).
+# env contract is exactly three variables (scripts/run-bash-shards.sh): BASH_SHARD_SLICE, SHARD_BOUND,
+# BASH_SHARDS_BUDGET_SECS — so ALL THREE are cleared here. ⛔ THE REASON, RESTATED FOR WHAT CI EXPORTS
+# TODAY (agent-infra#2483): the workflows export exactly ONE of the three, `BASH_SHARD_SLICE`, in BOTH
+# lanes (ci-main.yml's `script-validate` is an 8-way slice now; ci.yml's `bash-suites` always was), and a
+# CALLER may export `SHARD_BOUND` — while two arms below need particular ones ABSENT (the third
+#     bullet records the history of the one CI no longer exports at all):
+#   * `SHARD_BOUND` must be absent for the default-bound arm (§3), which asserts the DEFAULT is used;
+#   * `BASH_SHARD_SLICE` is set by the slice arm itself, per call site (`1/1`), so an inherited value
+#     would silently override it.
+#   * HISTORY, carried so the unset cannot read as a stale flag: `script-validate` USED TO export
+#     BASH_SHARDS_BUDGET_SECS=7800 in its bash-shards
+#     STEP env. It no longer does (agent-infra#2483): main is an 8-way slice now, and the runner REFUSES
+#     the BUDGET+SLICE pairing outright (`scripts/run-bash-shards.sh`, `exit 2`), so the budget had to
+#     go. That does NOT relax this arm: the slice arm below still sets BASH_SHARD_SLICE=1/1 itself, and
+#     BOTH lanes now export BASH_SHARD_SLICE, so clearing it is load-bearing on both. Recorded rather
+#     than dropped — an unset whose stated pollution source no longer exists reads as a stale flag, and
+#     the next reader would delete it.
 #   * `ci.yml`'s `bash-suites` matrix exports BASH_SHARD_SLICE=<i>/<n> per shard and `shard_run_bounded`
 #     hands the shard its env unmodified, so an inherited slice makes every fixture run 1/n of its
 #     staged shards.
@@ -157,10 +167,15 @@ stage_fixture() {
 # output in a file.
 
 # ── 0. HERMETICITY: THE SUITE MUST NOT INHERIT THE CALLER'S RUNNER CONFIG (agent-infra#3220) ────
-# The false red this pins was red in BOTH lanes and green on every laptop: `script-validate` inherits
-# BASH_SHARDS_BUDGET_SECS=7800 and `bash-suites` inherits BASH_SHARD_SLICE=<i>/<n>`, and on main the
-# suite therefore reddened with "1 of 52" on EVERY run for four runs — read as flake, repaired by
-# nobody. The failure was never in CI's environment; it was that this suite's verdict DEPENDED on it.
+# The false red this pins was red in BOTH lanes and green on every laptop. MEASURED then: on main the
+# suite reddened `1 of 52` on EVERY run for four runs — read as flake, repaired by nobody — while a
+# laptop stayed 52/52. The failure was never in CI's environment; it was that this suite's verdict
+# DEPENDED on it.
+# ⛔ WHAT IT INHERITED HAS SINCE CHANGED SHAPE (agent-infra#2483), so this rationale is restated rather
+# than left to rot: `script-validate` was the only BUDGET lane (BASH_SHARDS_BUDGET_SECS=7800) and is now
+# a SLICED lane like `bash-suites`, because the runner refuses the BUDGET+SLICE pairing outright (`exit
+# 2`). So BOTH lanes now export BASH_SHARD_SLICE=<i>/<n>, and the unset below is load-bearing on both.
+# The arm itself is unchanged — only the pollution source it names.
 # (A third variable, SHARD_BOUND, is the same class and was measured after review: an inherited bound
 # reddens §3's default-bound arm. All three of the runner's env contract are cleared above and probed
 # here, so "hermetic" means the CONTRACT, not the two variables CI happens to export today.)

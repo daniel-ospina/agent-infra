@@ -15535,6 +15535,36 @@ grep -q "NO BASE COUNTERPART" "$SCEN/err" \
 # not a claim that no counterpart exists — see the note on `declared_base_equivalent`.
 # This is also where the base's EXEMPTED red is re-pinned on the UNMAPPED path: the answer
 # still has to name `script-validate` as the base's red.
+# ⛔ (m1)/(m2) — THE MATRIX-TO-MATRIX ARM (#3392). `declared_base_equivalent` now prints TWO candidates,
+# slice first, because main publishes one check PER SLICE since agent-infra#2483. Without an arm whose
+# base red is `script-validate (5)`, deleting that first candidate leaves every assertion above GREEN —
+# they all publish the bare name and therefore exercise only the legacy fallback — so the stronger
+# equivalence ("the SAME shard set") would be unobserved and could regress silently. That is the #2610
+# false-absence class one naming change away, which is exactly what this pair exists to abolish.
+echo "== 79b. the matrix base is mapped SLICE-TO-SLICE, not by the bare name (#3392) =="
+new_scen named-refusal-slice
+HEAD_NS="f9f90000000000000000000000000000000000ac"
+printf '%s\n' "$HEAD_NS" > "$SCEN/head"
+lane_fail "$HEAD_NS" 9911 > "$SCEN/runs-$HEAD_NS"
+: > "$SCEN/log-9911"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9911"
+write_pr_checks "$(check_run 5011 'bash-suites (5)' completed failure 9911)"
+# THE BASE'S OWN SURFACE, post-#2483: one check per slice, same slice number, same shard set.
+write_main_checks "$(check_run 4011 'script-validate (5)' completed failure 6111)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6111"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6111 push 'CI on main'
+{ main_red_n mainnr02 9912 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(m1) a MATRIX base (script-validate (5)) still BLOCKS the unattributable run (exit $rc)" \
+  || fail "(m1) the rail merged over an unattributable run against a matrix base"
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN/err" \
+  && pass "(m2) …and answers SLICE-TO-SLICE: base-caused via script-validate (5) ≡ bash-suites (5) — the same shard set" \
+  || fail "(m2) the slice-to-slice answer is missing (a bare-name-only mapping would print 'NO BASE COUNTERPART' here): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
+  && fail "(m2) …and does NOT fall back to the bare name when the base publishes the slice (the slice candidate must win)" \
+  || pass "(m2) …and the slice candidate WINS over the bare fallback when both would match"
 new_scen named-refusal-unmapped
 # The scenario dir is captured BY NAME because (n3) re-enters it later: `SCEN` is a global
 # that a later `new_scen` overwrites (the cycle-2 P1), and this arm must not inherit another.
