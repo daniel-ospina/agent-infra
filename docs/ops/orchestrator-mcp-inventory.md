@@ -3,6 +3,16 @@
 **Status:** Phase 1 deliverable. Ships **no code**. Phase 2 (14 tools, one PR, one CI run) does not
 start until this document is reviewed.
 
+> **Phase 2 has started, and it started somewhere other than tool 1 (2026-11-04).** The owner steer recorded
+> on #3382 puts the **lane state primitive** first: an orchestration MCP whose tools cannot answer *"did it
+> finish"* is a typed façade over blindness, and this fleet ran 26 lanes without being able to answer it for
+> any one of them. That primitive is [`lane-registry.md`](lane-registry.md) — `refs/lanes/*`, four states
+> (`RUNNING` / `DONE` / `FAILED` / `EXPIRED`), written by `spawn-gate.sh::run_agent`, read by two MCP tools
+> (`lane.list`, `lane.show`). It is **additive** to the 14 rows below rather than a replacement: it is the
+> evidence axis those rows have no access to, and `tools/fleet/liveness.py` remains the one liveness verdict.
+> **Every other tool in this inventory is still unimplemented, and the surface beyond the two read-only tools
+> is a contract change awaiting owner approval** (named in `lane-registry.md` §6).
+
 **The test this document must pass:** every proposed tool names an existing implementation as
 `file` + `function`; every tool that is *not* a wrapper names why no existing tool can serve; and a
 tool that duplicates an existing script without saying why is **deleted from the list** (see

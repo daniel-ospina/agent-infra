@@ -25,6 +25,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # arms are the assertion that the gate runs at all; delete this line and the whole file turns the gate
 # back on, which is how you prove the line is load-bearing rather than decorative.
 export LANE_PREFLIGHT=0
+# ⛔ AND THE LANE STATE REGISTRY IS OFF FOR THE SAME REASON (agent-infra#3382). `run_agent` now writes a
+# state record around every spawn, and its remote resolves from `$AGENT_INFRA_PATH` or the cwd — which in
+# these arms is a checkout whose origin is the REAL agent-infra. Left on, every arm that drives `run_agent`
+# would attempt a `git push` of a fixture lane into this repository (and spend the push bound doing it).
+# The registry's own arms re-enable it explicitly with their own isolated state root and their own bare
+# origin — so the switch is load-bearing and its arms are the assertion that the leg runs at all.
+export LANE_REGISTRY=0
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
@@ -3060,6 +3067,166 @@ unwired="${unwired# }"
 [ "$unwired" = "test-claims.sh test-crossbox.sh" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      unwired suites: [${unwired:-<none>}]"
 ck "the orchestrator-harness suites NOT executed by run-bash-shards.sh are exactly the two documented non-loop ones [$unwired]" $rc
+
+# ── the LANE STATE REGISTRY leg (agent-infra#3382) ────────────────────────────────────────────────
+# ⛔ WHAT THESE ARMS EXIST TO CATCH, in the order the failures actually happen:
+#   R1  the leg OFF by default in a fixture (above) writes NO record and cannot fail a spawn — the
+#       kill switch is load-bearing, not decorative
+#   R2  with the leg ON, a completed lane leaves a DONE record naming its artifacts — the exact
+#       question the fleet could not answer on 2026-11-04
+#   R3  a lane ended by the BOUND leaves FAILED, never DONE. A bound-killed lane recorded as DONE is
+#       the FALSE-DEATH defect in reverse: the fleet would stop re-dispatching a lane that produced
+#       nothing
+#   R4  a REGISTRY THAT CANNOT BE REACHED does not change the lane's exit code. A registry hiccup must
+#       never re-run a lane
+# ⛔ THE FIXTURE IS HERMETIC FOR THE REGISTRY AND EXPLICIT FOR THE OTHER GATES: its own state root, its
+# own bare `origin`, and `LANE_REGISTRY_REPO` pinned to that fixture — so nothing here can reach this
+# repository's refs, which is what makes `LANE_REGISTRY=0` above a belt rather than the only brace. The
+# CWD stays `$FIXREPO` (the GitHub-origin fixture the creation back-pressure gate reads, #2409): without
+# it every arm above answers 74 LAND-BACKLOG and would appear to be testing the registry.
+RREG="$TMP/registry"; mkdir -p "$RREG/state"
+git init -q --bare "$RREG/origin.git"
+git init -q "$RREG/work"
+git -C "$RREG/work" remote add origin "$RREG/origin.git"
+# ⛔ NOTHING TO chmod: the registry is invoked as `python3 <path>`, so an executable bit is not needed —
+# and the guard that used to sit here (`[ -x "$HERE/../lane_registry.py" ]`, i.e. `scripts/lane_registry.py`,
+# which does not exist) was always false, i.e. a setup line that silently no-ops in the very block whose
+# R4 comment condemns them.
+[ -f "$HERE/lane_registry.py" ] || { echo "FIXTURE: lane_registry.py missing beside this suite"; exit 1; }
+git -C "$RREG/work" config user.email lane@test
+git -C "$RREG/work" config user.name lane-test
+
+# ⛔ THE WALL IS 60s HERE, NOT THE 1s THE LOAD ARMS USE, AND THAT IS THE POINT OF R2/R3. A lane that
+# exits 0 having hit its cap is FAILED (correctly — the cap is what ended it), so a 1s cap makes every
+# completion arm report `cap-hit` and the DONE arm would test the cap, not the registry.
+rdrive() { # rdrive <label> <registry:0|1> [<cap seconds>] -> "rc=… started=…"
+  local label="$1" on="$2" cap="${3:-60}" extra=""
+  env PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 \
+      DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+      LANE_REGISTRY="$on" \
+      LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+      LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+      $extra \
+      bash -c '
+    BOUND="${8:-}"
+    CAP="${9:-60}"
+    . "$1"
+    cd "$7" || exit 2
+    LOAD="$2"; MAX_LOAD="$3"; LOG="$4"; PROMPT="$5"; LABEL="$6"
+    load1() { printf "%s" "$LOAD"; }
+    if [ -n "$BOUND" ]; then AGENT_BOUND_VERDICT="$BOUND"; fi
+    run_agent "$CAP" "$LOG" "$PROMPT" "$LABEL" >/dev/null 2>&1
+    rc=$?
+    printf "rc=%s started=%s" "$rc" "$AGENT_STARTED"
+  ' _ "$GATE" 0 10 "$LOG" "$PROMPT" "$label" "$FIXREPO" "${BOUND_VERDICT:-}" "$cap"
+}
+
+rlist() { # the registry's own reader, against the fixture origin only
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/origin.git" --json 2>/dev/null
+}
+
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+echo "PI_RAN" >> "$PI_LOG"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+
+# R1 — the switch. Leg off: no record may appear anywhere.
+# ⛔ `rc=$?` HERE READ THE DRIVER'S STATUS, NOT THE LANE'S: `rdrive`'s last command is `printf`, so the
+# check could never fail and only the `grep` half was falsifiable. The lane's own rc is parsed out of the
+# driver's output (`rc=… started=…`) instead.
+: > "$RREG/state/lanes.log"
+res="$(rdrive "registry-off" 0)"
+lanerc="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
+started="$(sed -n 's/.*started=\([0-9]*\).*/\1/p' <<<"$res")"
+lanes="$(rlist)"
+ck "R1 LANE_REGISTRY=0 leaves the spawn working and writes NO record [$(printf '%s' "$res")]" \
+   $([ "${lanerc:-x}" = "0" ] && [ "${started:-x}" = "1" ] && ! grep -q 'lane_id' <<<"$lanes" && echo 0 || echo 1)
+
+# R2 — a completed lane is DONE, with artifacts (this is the question the fleet could not ask).
+res="$(rdrive "registry-on" 1)"; rc=$?
+lanes="$(rlist)"
+state="$(python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("UNREADABLE"); raise SystemExit
+rows=[r for r in d.get("lanes",[]) if r["state"]!="RUNNING"]
+print(rows[0]["state"] if rows else "NONE")' <<<"$lanes" 2>/dev/null)"
+arts="$(python3 -c 'import json,sys
+d=json.load(sys.stdin); rows=[r for r in d.get("lanes",[]) if r["state"]!="RUNNING"]
+print(len(rows[0].get("artifacts") or []) if rows else 0)' <<<"$lanes" 2>/dev/null)"
+ck "R2 a completed lane leaves a DONE record naming its artifacts ($state artifacts=$arts)" \
+   $([ "$state" = "DONE" ] && [ "${arts:-0}" -ge 1 ] && echo 0 || echo 1)
+
+# R5 — the record names the REPO it was about (cross-repo visibility, §3.2).
+# ⛔ THIS ARM EXISTS BECAUSE THE FIELD WAS DEAD: `lane_registry_begin` computed `repo` twice and threw
+# both away, so every record shipped with no `repo` at all and `lane.list --repo owner/name` could never
+# match anything — a filter against a field nothing wrote. The fixture's origin is
+# `https://github.com/owner/repo.git`, so the record must say `owner/repo` or this reds.
+res="$(rdrive "registry-repo" 1)"; rc=$?
+repo_field="$(rlist | python3 -c 'import json,sys
+rows=[r for r in json.load(sys.stdin).get("lanes",[]) if r["state"]!="RUNNING"]
+print(rows[-1].get("repo") or "EMPTY")' 2>/dev/null)"
+ck "R5 the terminal record names its repo ($repo_field, want owner/repo)" \
+   $([ "$repo_field" = "owner/repo" ] && echo 0 || echo 1)
+
+# R3 — THE TERMINAL DECISION TABLE, driven at `lane_registry_end` directly.
+# ⛔ WHY NOT THROUGH A WHOLE SPAWN: the two inputs it reads (`AGENT_BOUND_VERDICT`, `AGENT_CAP_HIT`) are
+# set by code ABOVE it that `run_agent` itself RESETS at entry, so a fixture that pre-set them would be
+# testing `lane-bound.sh`. What is under test here is the MAPPING — a lane the bound ended, or one that
+# never started, must be FAILED and must say why; only a lane that really started, really exited 0 and
+# was ended by neither bound is DONE.
+r_end() { # r_end <started> <bound> <cap> <rc> -> "state reason"
+  env LANE_REGISTRY=1 LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+      LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+      STARTED="$1" BOUND="$2" CAP="$3" RCX="$4" \
+      bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$3"
+    [ "$BOUND" = "-" ] && BOUND=""      # the spec table spells "no bound" as - so it survives `set --`
+    AGENT_STARTED="$STARTED"; AGENT_BOUND_VERDICT="$BOUND"; AGENT_CAP_HIT="$CAP"
+    LANE_ID="$(python3 "$2" start --kind lane --tag 77 --pid $$ 2>>"$LOG" | tail -1)"
+    [ -n "$LANE_ID" ] || { echo "NONE no-id"; exit 0; }
+    lane_registry_end "$LANE_ID" "$RCX" "r3" "$LOG"
+    python3 "$2" show --lane-id "$LANE_ID" --json 2>/dev/null > "$LOG.show"
+    python3 - "$LOG.show" <<PY
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["state"], (d.get("reason") or "-"))
+PY
+  ' _ "$GATE" "$HERE/lane_registry.py" "$LOG" "$FIXREPO"
+}
+
+for spec in "1 stalled 0 0" "0 - 0 74" "1 - 1 143" "1 - 0 0" "1 - 0 7"; do
+  set -- $spec
+  rm -rf "$RREG/state/lanes" "$RREG/state/work.git"
+
+  out="$(r_end "$1" "$2" "$3" "$4")"
+  case "$spec" in
+    "1 stalled 0 0") want="FAILED bound:stalled" ;;
+    "0 - 0 74")      want="FAILED agent-never-started:rc=74" ;;
+    "1 - 1 143")     want="FAILED cap-hit:rc=143" ;;
+    "1 - 0 0")       want="DONE -" ;;
+    *)               want="FAILED exit:7" ;;
+  esac
+  [ "$out" = "$want" ]; rc3=$?
+  ck "R3 terminal-record mapping [started=$1 bound=$2 cap=$3 rc=$4] -> $out (want '$want')" $rc3
+done
+
+# R4 — an unreachable registry must not change the lane's exit code.
+# ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
+# so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
+# test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
+# that does not exist, with this box's local witness removed so no fallback can answer either.
+git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
+rm -rf "$RREG/state/lanes"
+res="$(rdrive "registry-unreachable" 1)"; rc=$?
+rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
+unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
+   $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
+git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

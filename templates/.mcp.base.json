@@ -11,7 +11,7 @@
       },
       "lazy": true,
       "idleTimeoutMs": 900000,
-      "purpose": "Perplexity Search API + SERP + GSC + HubSpot + Places (24 tools). RUNG 1 of the research skill's tool ladder — ~$0.005/query flat, never the $5-40 chat models",
+      "purpose": "Perplexity Search API + SERP + GSC + HubSpot + Places (24 tools). RUNG 1 of the research skill's tool ladder \u2014 ~$0.005/query flat, never the $5-40 chat models",
       "whenToLoad": "research/search tasks FIRST (prefer over web_search); also GSC, SERP, Places and HubSpot tasks. NOTE: requires a one-time `npm install` in mcp-servers/seo-intelligence per checkout, or the entry fails to spawn",
       "cost": "~$0.005/query flat; zero cost while sleeping (lazy)"
     },
@@ -26,9 +26,21 @@
         "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
         "TORTOISE_DB_URI": "docker://:@127.0.0.1:16379/tortoise"
       },
-      "purpose": "Memory graph (Tortoise) — cross-session knowledge",
+      "purpose": "Memory graph (Tortoise) \u2014 cross-session knowledge",
       "whenToLoad": "always (core)",
       "cost": "one python process (venv has fastmcp)"
+    },
+    "orchestrator": {
+      "command": "python3",
+      "args": [
+        "${AGENT_INFRA_PATH}/mcp-servers/orchestrator/server.py"
+      ],
+      "cwd": "${AGENT_INFRA_PATH}",
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "purpose": "Lane STATE records \u2014 lane.list / lane.show over refs/lanes/* (agent-infra#3382 slice 1). Four states only: RUNNING | DONE | FAILED | EXPIRED. Read-only.",
+      "whenToLoad": "whenever the question is 'did this lane finish?' / 'which lanes are running?' / 'what expired?' \u2014 i.e. any beat's lane census. NOT a substitute for tools/fleet/liveness.py (the one liveness verdict): the registry answers about the RECORD, liveness answers about the process.",
+      "cost": "zero while sleeping (lazy); 1 python process + 1 git fetch per call"
     },
     "playwright-browser": {
       "command": "npx",

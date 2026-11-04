@@ -2349,8 +2349,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       fi
     fi
   }
+  # ── THE STATE RECORD OPENS IMMEDIATELY BEFORE THE SPAWN (#3382) ─────────────────────────────
+  # Not earlier: the gates above can still refuse, and a refusal has its own record (FAILED,
+  # `agent-never-started`) rather than a RUNNING record that would read EXPIRED two hours later.
+  lane_registry_begin "$label" "${KIND:-lane}" "$log" "$t"
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
+  # …and the lease starts renewing as soon as there is a pid to watch. The beat loop exits on its own
+  # when the agent does; it is reaped explicitly on the far side of `wait` as well.
+  lane_registry_beat "$LANE_ID" "$log" "$pid"
   # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`
   # between the two launches left the watchdog in the CALLER's process group, so `-${w}` named a
   # group that did not exist and its `sleep "$t"` child (up to the lane's 40-minute wall limit) was
@@ -2460,6 +2467,9 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   if [ "$rc" = "$PI_GATE_REFUSED" ]; then
     AGENT_STARTED=0
     echo "[load-gate] REFUSED $label: the pi spawn point refused the launch (load >= max_load=$MAX_LOAD) — no agent started, nothing consumed; the [pi-gate] line above carries the reading and the caller, and the controller re-dispatches when load falls" >> "$log"
+    # The record must say WHY this lane ended, or its id sits RUNNING until the lease lapses and a peer
+    # reads EXPIRED — an abstention where a fact was available.
+    lane_registry_end "$LANE_ID" "$rc" "$label" "$log"
     return "$AGENT_LOAD_REFUSED"
   fi
   # …and the same for the spawn point's FORK refusal (agent-infra#2293): the band between this gate
@@ -2468,6 +2478,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   if [ "$rc" = "$PI_FORK_REFUSED" ]; then
     AGENT_STARTED=0
     echo "[fork-gate] REFUSED $label: the pi spawn point refused the launch (this box could not fork) — no agent started, nothing consumed; the [pi-gate] line above carries the reading, and this box needs an external restart or a drain" >> "$log"
+    lane_registry_end "$LANE_ID" "$rc" "$label" "$log"
     return "$AGENT_FORK_REFUSED"
   fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
@@ -2520,7 +2531,208 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # never changes `rc`: a lane's exit status and the fate of its worktree are different facts, and a
   # caller that conflated them would re-run a lane because a PUSH failed.
   terminal_wip_rescue "$label" "$rc" "$AGENT_CAP_HIT" "$log"
+  # ── THE TERMINAL RECORD (#3382) ───────────────────────────────────────────────────────────────
+  # ⛔ LAST, AND DELIBERATELY AFTER EVERY DIAGNOSTIC ABOVE — `AGENT_BOUND_VERDICT` and `AGENT_CAP_HIT` are
+  # only final here, and the DONE-vs-FAILED decision reads both. It is also after the WIP rescue, so a
+  # registry hiccup can never sit in front of saving a dying lane's work, and it can never change `rc`:
+  # a lane's exit status and its recorded verdict are two facts, and a caller that conflated them would
+  # re-run a lane because the registry was unreachable.
+  if [ -n "${LANE_BEAT_PID:-}" ]; then
+    kill "$LANE_BEAT_PID" 2>/dev/null; kill -TERM -- "-$LANE_BEAT_PID" 2>/dev/null
+    wait "$LANE_BEAT_PID" 2>/dev/null
+    LANE_BEAT_PID=""
+  fi
+  lane_registry_end "$LANE_ID" "$rc" "$label" "$log"
   return "$rc"
+}
+
+# ── THE LANE STATE REGISTRY (agent-infra#3382, owner steer 2026-11-04) ─────────────────────────────
+# The fleet ran 26 lanes and the orchestrator could not tell whether ANY single one had finished; every
+# verdict was an inference over a proxy (artifact byte count, `cmux vm exec` timing out, an empty
+# `git diff` from a fetch that never ran) and each proxy was WRONG at least once that night.
+#
+# ⛔ SO IT IS WIRED HERE, IN THE ONE FUNCTION EVERY WORKER GOES THROUGH, AND NOWHERE ELSE. `run_agent` is
+# the single agent invocation for `lane.sh`, `fix-one.sh` and `nonblocking-dispatch.sh` (this file's own
+# header states that, and `spawn-gate.test.sh` asserts the launch-path set as an EQUALITY). A per-caller
+# hook would be the drift #1720 removed — a launcher added tomorrow would silently not satisfy the
+# contract, which is the "remembered, not enforced" failure this registry exists to end.
+#
+# ⛔ AND IT MUST NOT BE ABLE TO REFUSE, DELAY OR CHANGE A SPAWN. Same rule as the uv pin below: a box with
+# an odd install must not stop starting lanes. Every call is best-effort (`|| true`), bounded, and its
+# failure is a WARN in the lane's log — never an exit code, never a `return`. A registry that could fail
+# a lane would be a bigger defect than the blindness it fixes.
+LANE_REGISTRY_PY=""
+# ⛔ `LANE_REGISTRY=0` IS THE DOCUMENTED OFF SWITCH, and it exists for the same reason `LANE_PREFLIGHT=0`
+# does: a TEST FIXTURE that drives `run_agent` must not publish lane records into a real repository. It is
+# off only for tests and for a box an operator has drained by hand — an ambient OFF is a fleet that cannot
+# answer "did it finish", so the WARN below is printed when the leg runs degraded, never silently.
+lane_registry_path() {
+  local c here
+  case "${LANE_REGISTRY:-1}" in 0|off|no|false) return 1 ;; esac
+  if [ -n "$LANE_REGISTRY_PY" ]; then printf '%s\n' "$LANE_REGISTRY_PY"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${O:-}/lane_registry.py" "$here/lane_registry.py" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/lane_registry.py" \
+           "${HOME:-}/.pi/agent/scripts/lane_registry.py"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    LANE_REGISTRY_PY="$c"
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
+# The python to run it with. `python3` first (both surfaces have it), then the harness's own fallbacks —
+# never a venv, because a lane venv does not exist yet at this point in the spawn.
+lane_registry_py() {
+  local c
+  for c in python3 python; do
+    command -v "$c" >/dev/null 2>&1 && { printf '%s\n' "$c"; return 0; }
+  done
+  return 1
+}
+
+# lane_registry_begin <label> [<kind>] — echoes the lane id, or nothing when the registry is unavailable.
+# ⛔ THE ID IS THE HANDLE AND IT IS EMITTED BEFORE THE SPAWN: a lane that dies in its first second still
+# has a record, which is the case the fleet could not see at all.
+LANE_ID=""
+LANE_BEAT_PID=""
+lane_registry_begin() {
+  local label="$1" kind="${2:-lane}" log="${3:-/dev/null}" wall="${4:-}"
+  local sh py id tag issue repo _url _slug_repo _start_rc budget
+  LANE_ID=""
+  # ⛔ RESET, NOT LEFT FROM THE PREVIOUS LANE. The early returns below (`registry off`, no helper, no
+  # python, a `start` that produced no usable id) do not touch it, so a lane whose record could not be
+  # opened inherited the PREVIOUS lane's beat process group — and `run_agent`'s reap would then
+  # `kill -TERM -- -<that pgid>`: a signal aimed at whatever now holds a recycled pid.
+  LANE_BEAT_PID=""
+  sh="$(lane_registry_path)" || { echo "[lane-registry] WARN $label: lane_registry.py not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts) — this lane is INVISIBLE to lane.list. Redeploy the harness." >> "${3:-/dev/null}"; return 0; }
+  py="$(lane_registry_py)" || { echo "[lane-registry] WARN $label: no python3/python on PATH — this lane is INVISIBLE to lane.list" >> "${3:-/dev/null}"; return 0; }
+  tag="${TAG:-0}"; issue=""
+  case "$tag" in ''|*[!0-9]*) : ;; *) issue="$tag" ;; esac
+  # ── the REPO, for cross-repo visibility (§3.2: ONE registry, and the record says which repo it was
+  # about). ⛔ THIS USED TO BE A DEAD PLACEHOLDER (`repo=""` assigned twice, the git call's result
+  # thrown away), so every record was published with no `repo` at all and `lane.list --repo o/n` could
+  # never match one — a filter against a field nothing ever wrote. Derive `owner/name` from the origin
+  # URL in either shape (`git@host:owner/name.git`, `https://host/owner/name.git`) and publish nothing
+  # when the shape is unrecognisable, because a wrong repo is worse than an absent one.
+  repo=""
+  if _url="$(git remote get-url origin 2>/dev/null)" && [ -n "$_url" ]; then
+    _slug_repo="$(printf '%s' "$_url" | sed -e 's#\.git$##' \
+                   | awk -F'[/:]' '{ if (NF >= 2) print $(NF-1)"/"$NF }')"
+    case "$_slug_repo" in
+      ''|/*|*/|*/*/*) : ;;          # empty, or more than the two components we expect
+      ?*/?*) repo="$_slug_repo" ;;
+    esac
+  fi
+  # ── the LEASE. It must OUTLIVE the lane, or the lane reads EXPIRED to a peer before its terminal record
+  # is written. Derived from the same wall bound the watchdog uses, plus a margin, rather than the module's
+  # 2 h default: a 3 h lane under a 2 h lease is a false death, and the whole point of the derivation is
+  # that no caller has to remember a number.
+  case "${wall:-}" in ''|*[!0-9]*) budget="" ;; *) budget=$((wall + 600)) ;; esac
+  # ⛔ `--tag` CARRIES THE LANE'S OWN NAME, NOT A PARSED ISSUE NUMBER: `fix-8721` and `chain-8721` are
+  # different lanes on the same number, and a registry that could not tell them apart would merge a
+  # fixer's end into a reviewer's start. `--kind` is the other half of that identity.
+  # ⛔ `|| id=""` COULD NEVER FIRE ON A PIPELINE: the substitution's status was `tail`'s, which is always 0,
+  # so a `start` that failed still handed back a printable line and the fallback was decoration. `2>&1` is
+  # deliberately NOT used — stderr must stay in the log — so the substitution is now NON-PIPELINED and `$?`
+  # is the VERB's own status (there is no PIPESTATUS to read here: `tail` was removed, not worked around).
+  id="$("$py" "$sh" start --kind "$kind" --tag "$tag" --pid "$$" ${issue:+--issue "$issue"} \
+        ${repo:+--repo "$repo"} ${budget:+--budget "$budget"} 2>>"${3:-/dev/null}")"
+  _start_rc=$?
+  id="$(printf '%s\n' "$id" | tail -1)"
+  # ⛔ A NON-ZERO `start` IS NOT A HANDLE. `6` (LOCAL_ONLY) still prints the id — it wrote this box's copy
+  # and failed to push — which is exactly the case where a beat could never renew a shared lease. Keep the
+  # id (the local record IS real and can still be closed), but say so.
+  if [ "$_start_rc" != "0" ]; then
+    echo "[lane-registry] WARN $label: start exited $_start_rc (6 = written here, NOT pushed — peers cannot see this lane until it is) — id=$id" >> "${3:-/dev/null}"
+  fi
+  case "${id:-}" in
+    ''|UNMEASURED*|*[!A-Za-z0-9._-]*) echo "[lane-registry] WARN $label: start produced no usable id (got '${id:-}') — this lane is INVISIBLE to lane.list" >> "${3:-/dev/null}"; LANE_ID=""; return 0 ;;
+  esac
+  LANE_ID="$id"
+  echo "[lane-registry] RUNNING $LANE_ID label=$label kind=$kind tag=$tag (registry=$sh)" >> "${3:-/dev/null}"
+  return 0
+}
+
+# lane_registry_end <lane-id> <rc> <label> <log> — the TERMINAL record. Never changes the caller's rc.
+# ⛔ THE VERDICT IS `DONE` ONLY WHEN ALL THREE HOLD: the agent really started, no bound ended it, and it
+# exited 0. A bound-killed or refused spawn recorded as DONE is the FALSE-DEATH defect in reverse — the
+# fleet would stop re-dispatching a lane that produced nothing.
+lane_registry_end() {
+  local id="$1" rc="$2" label="$3" log="$4" sh py why verb erc
+  [ -n "${id:-}" ] || return 0
+  sh="$(lane_registry_path)" || return 0
+  py="$(lane_registry_py)" || return 0
+  why=""
+  if [ "${AGENT_STARTED:-0}" != "1" ]; then
+    why="agent-never-started:rc=$rc"
+  elif [ -n "${AGENT_BOUND_VERDICT:-}" ]; then
+    why="bound:$AGENT_BOUND_VERDICT"
+  elif [ "${AGENT_CAP_HIT:-0}" = "1" ]; then
+    why="cap-hit:rc=$rc"
+  elif [ "${rc:-1}" != "0" ]; then
+    why="exit:$rc"
+  fi
+  # ARTIFACTS — a DONE record is REQUIRED to name what it produced (the primitive refuses an empty one),
+  # so the log path always rides along and the branch/HEAD are added when this cwd is a git worktree.
+  # ⛔ `x="$(cmd || echo '?')"` IS WRONG AND WAS MEASURED HERE: a FAILED `git rev-parse` still prints to
+  # stdout (`HEAD` for `--abbrev-ref`), so the substitution yields TWO words — the command's own line
+  # plus the fallback — and an UNQUOTED argument string then passes a stray `?` as a POSITIONAL argument
+  # (`error: unrecognized arguments: ? ?`, exit 2, and the terminal record is never published). Capture
+  # first, test the status, and only then fall back. The artifact is EVIDENCE, so a value we could not
+  # read must be absent rather than fabricated.
+  # ⛔ AND THE ARGUMENTS ARE AN ARRAY, NOT A STRING. They used to be concatenated into one unquoted
+  # variable, so a log path or worktree containing a space split into two arguments and the terminal
+  # record was refused (exit 2) — the lane then reads EXPIRED to every peer once its lease lapses, which
+  # is the silent-loss class this whole module exists to end. An array is one argument per element, by
+  # construction.
+  local -a artargs=()
+  artargs+=(--artifact "log:$log")
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    local _br _sha
+    _br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" && [ -n "$_br" ] && artargs+=(--artifact "branch:$_br")
+    _sha="$(git rev-parse HEAD 2>/dev/null)" && [ -n "$_sha" ] && artargs+=(--artifact "sha:$_sha")
+    artargs+=(--artifact "worktree:$(pwd)")
+  fi
+  if [ -z "$why" ]; then
+    verb="done"; why=""
+  else
+    verb="fail"; why="$why"
+  fi
+  # ⛔ `erc=$?` ON THE LINE IMMEDIATELY AFTER, never `$?` inside the message below: `$?` in a `case`
+  # scrutinee is expanded after the `case` word is evaluated, so the WARN would print the status of
+  # something else entirely — this suite's own header records the same defect turning three checks green
+  # on an empty file.
+  if [ "$verb" = "done" ]; then
+    "$py" "$sh" done --lane-id "$id" "${artargs[@]}" --exit-code "${rc:-0}" >/dev/null 2>>"$log"
+  else
+    "$py" "$sh" fail --lane-id "$id" --reason "$why" "${artargs[@]}" --exit-code "${rc:-1}" >/dev/null 2>>"$log"
+  fi
+  erc=$?
+  case "$erc" in
+    0) echo "[lane-registry] $verb $id label=$label" >> "$log" ;;
+    *) echo "[lane-registry] WARN $label: the TERMINAL record for $id was NOT published (rc=$erc) — this lane will read EXPIRED to a peer once its lease lapses. The record's verdict was: $verb $why. Publish by hand: $py $sh $verb --lane-id $id ..." >> "$log" ;;
+  esac
+  return 0
+}
+
+# lane_registry_beat <lane-id> <log> — renew the lease until the agent pid is gone. ONE extra short-lived
+# subshell per lane, TERM-trapped so a killed lane cannot leave it (or its `sleep`) holding the worktree
+# open — the same orphan rule the watchdog below states (#2033).
+lane_registry_beat() {
+  local id="$1" log="$2" pid="$3" every="${LANE_BEAT_S:-60}" sh py
+  [ -n "${id:-}" ] || return 0
+  sh="$(lane_registry_path)" || return 0
+  py="$(lane_registry_py)" || return 0
+  case "$every" in ''|*[!0-9]*|0*) every=60 ;; esac
+  ( trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
+    while kill -0 "$pid" 2>/dev/null; do
+      sleep "$every" & s=$!; wait "$s" 2>/dev/null
+      "$py" "$sh" beat --lane-id "$id" >/dev/null 2>>"$log" || true
+    done ) >/dev/null 2>&1 &
+  LANE_BEAT_PID=$!
+  return 0
 }
 
 # ── the lane venv teardown (agent-infra#1932) ─────────────────────────────────────────────────────
