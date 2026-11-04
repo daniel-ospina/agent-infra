@@ -82,6 +82,31 @@ fixture_live_controllers() { # -> "<pid> <root>" per line
     }'
 }
 
+# ── ephemeral-CI predicate ──────────────────────────────────────────────────────────────────────
+# ⛔ A CI RUNNER IS NOT A LIVE CELL — AND THIS GUARD COULD NOT TELL (agent-infra#3411). Every GitHub
+# Actions job sets `CI=true`. On the self-hosted runner the job's HOME is `/home/cmux` and its install
+# root sits under `/opt/gh-runner-ai-cell1-*`, so the RUNNER ITSELF legitimately lives under a root
+# `fixture_live_controllers` reads as an operator's cell: `script-validate` refused with EX_CONFIG
+# (78) on `main` and so on every shell-touching PR, naming a controller the job itself had started.
+# The refusal also contradicted its own remedy — it tells the operator to "Run it on a laptop or CI
+# instead", and then refused there.
+# ⛔ WHY THE ENV MARKER IS THE RIGHT DISCRIMINATOR, AND WHY IT IS NOT A NEW BYPASS. The hazard is a
+# PERSISTED operator cell: a fixture controller left there is indistinguishable from a real one
+# (#3011: 145 leaked controllers, load 39 on 8 cores) and the fleet reads the load as its own busy
+# signal. An ephemeral runner is discarded with the job, so there is no persisted cell to poison.
+# `CI` names exactly that difference and is read here as WHERE THIS PROCESS RUNS, never as a switch
+# that turns the guard off: the refusal arms in the contract suite drive `CI` unset, so a developer
+# running the suite on their own cell still gets 78 — and the deliberate opt-out that already exists
+# (`HARNESS_SUITE_ALLOW_LIVE_CELL=1`) remains the strictly stronger, explicitly-typed escape.
+# Deliberately NOT `GITHUB_ACTIONS`-only: the marker belongs to CI in general, and a provider list
+# would quietly re-arm the refusal on the next runner we adopt.
+fixture_is_ephemeral_ci() {
+  case "$(printf '%s' "${CI:-}" | tr '[:upper:]' '[:lower:]')" in
+    1 | true | yes) return 0 ;;
+  esac
+  return 1
+}
+
 fixture_guard_placement() { # [suite-name]
   local suite="${1:-this suite}" live n
   live="$(fixture_live_controllers)"
@@ -90,6 +115,15 @@ fixture_guard_placement() { # [suite-name]
   if [ "${HARNESS_SUITE_ALLOW_LIVE_CELL:-0}" = "1" ]; then
     printf '  ⚠️  %s: running on a LIVE cell (%s controller(s)) — allowed by HARNESS_SUITE_ALLOW_LIVE_CELL=1\n' \
       "$suite" "$n" >&2
+    return 0
+  fi
+  # ⛔ CHECKED BEFORE THE REFUSAL, AND IT IS A WARNING, NEVER SILENT: the exemption is about where
+  # the process runs, so it must still say that a cell-shaped root matched — an operator reading CI
+  # logs should be able to see the guard considered the hazard and why it allowed the run.
+  if fixture_is_ephemeral_ci; then
+    printf '  ⚠️  %s: %s controller(s) match a live cell root, but this is CI (an ephemeral runner), not an operator cell — allowed, not refused (agent-infra#3411)\n' \
+      "$suite" "$n" >&2
+    printf '%s\n' "$live" | sed 's/^/     (CI) pid /' >&2
     return 0
   fi
   {
