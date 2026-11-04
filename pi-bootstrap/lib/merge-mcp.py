@@ -34,9 +34,11 @@ THE RULES, in order:
      means a different AUTHORITY: a scheme-only change on the same host (`http://` for `https://`)
      is a typo, not a self-host, and is NOT preserved — marking it would hand `--verify` an
      exemption it honours while the live key crossed the wire in cleartext (`near_miss()`);
-   * anything else (a hosted url with no key, a literal key, an explicit non-http transport) is
-     REPLACED with the template's entry, because preserving it creates a config `--verify` must
-     refuse in perpetuity — a cell no repair can fix.
+   * anything else (a hosted url with no key, a literal key, a `headers` that is not a mapping,
+     an explicit non-http transport ON THE HOSTED URL) is REPLACED with the template's entry,
+     because preserving it creates a config `--verify` must refuse in perpetuity — a cell no
+     repair can fix. On a url the operator chose, a non-http `type` is their business and is
+     preserved with the entry (the client never reads `type`; see `usable()`).
 
 4. `--cell` installs the graph server ONLY. The template's other base servers are wrong for a
    cell, not merely unnecessary: `seo-intelligence` spawns
@@ -44,7 +46,10 @@ THE RULES, in order:
    `extensions/` only (manifest.json carries no `mcp-servers/`), so it cannot spawn;
    `brave-search`/`gemini` spawn without their keys; `playwright-browser` pulls an npx package
    onto a memory-constrained box. A catalog that advertises an unspawnable tool is worse than a
-   short catalog.
+   short catalog. ⛔ A base server the DESTINATION already declares is neither installed nor
+   removed: it is KEPT (a merge never clobbers, rule 2) and printed as `already declares …
+   KEPT`, because a NOTE that listed only the servers that were MISSING read as "the base
+   catalog is not installed" while an unspawnable entry sat in the file, certified.
 
 Every decision is printed as a `NOTE:` line so the caller can surface it; nothing here is silent.
 Exit 0 with the file written, 2 on bad usage, 3 when the template has no usable tortoise entry.
@@ -176,13 +181,27 @@ def usable(entry, want_url):
 
     `type` is optional: the client's `McpServerConfig` has no `type` field and selects the HTTP
     transport from `url` alone, so requiring it would refuse a config that works. An explicit
-    OTHER transport (`sse`/`stdio`) is a different thing and is refused.
+    OTHER transport (`sse`/`stdio`) disqualifies the HOSTED default, where `http` is the contract —
+    on the operator's OWN daemon (any non-default url) it is their business and is preserved: the
+    client never reads `type`, so refusing it there would destroy a config that works.
+
+    ⛔ `headers` MUST BE A MAPPING. A hand-edit (or a curl-style paste) can produce
+    `"headers": "Bearer …"`; `.get` on a str/list raises BEFORE the write, so the merge would exit
+    1 having changed nothing — and `--install` is the REPAIR path, so an entry in that shape could
+    never be fixed by the installer at all (the "config nothing can repair" this file exists to
+    prevent) while `--verify` reported an empty marker beside a traceback. It is unusable, so it is
+    REPLACED. `cell-install.sh`'s marker refuses the same shape BY NAME (`BADDERS:`).
     """
     if not isinstance(entry, dict) or entry.get("command"):
         return False, "command"
     leak = token_path(entry)
     if leak:
         return False, "literal@%s" % leak
+    # ⛔ SEE THE DOCSTRING: a `headers` that is not a mapping must be a REFUSAL (so the entry is
+    # replaced), never an AttributeError raised before the write.
+    headers = entry.get("headers")
+    if headers is not None and not isinstance(headers, dict):
+        return False, "headers"
     url = (entry.get("url") or "").strip()
     if not url:
         return False, "url"
@@ -192,7 +211,7 @@ def usable(entry, want_url):
     # config and point them at an endpoint they have no key for.
     if (entry.get("url") or "").strip() == (want_url or "").strip() and entry.get("type") not in (None, "http"):
         return False, "type"
-    auth = (entry.get("headers") or {}).get("Authorization") or ""
+    auth = (headers or {}).get("Authorization") or ""
     if auth and "${" not in auth:
         # a literal credential written into a shared config file is the leak, never the fix
         return False, "literal"
@@ -288,7 +307,8 @@ def main(argv):
                 # expands `process.env[NAME]` verbatim, with no alias mapping — and doing it silently
                 # is the repoint class this file exists to stop.
                 entry = dict(want)
-                cur_auth = ((cur.get("headers") or {}).get("Authorization") or "").strip()
+                cur_headers = cur.get("headers") if isinstance(cur.get("headers"), dict) else {}
+                cur_auth = (cur_headers.get("Authorization") or "").strip()
                 want_auth = ((want.get("headers") or {}).get("Authorization") or "").strip()
                 if cur_auth and cur_auth != want_auth:
                     entry["headers"] = dict(want.get("headers") or {}, Authorization=cur_auth)
@@ -315,6 +335,17 @@ def main(argv):
         dropped = sorted(k for k in base if k != "tortoise" and k not in have)
         if dropped:
             print("NOTE: not installed on a cell (they cannot spawn there): %s" % ", ".join(dropped))
+        # ⛔ KEPT, AND SAID OUT LOUD. A merge never clobbers (rule 2), so a base server this cell
+        # ALREADY declares survives — including one that cannot spawn here (a hand-edit, or a
+        # pre-`--cell` sync). Printing only the servers that were ABSENT made the log read as "the
+        # base catalog is not installed" while such an entry sat in the file, certified by --verify.
+        kept_off = sorted(k for k in base if k != "tortoise" and k in have)
+        if kept_off:
+            print(
+                "NOTE: this cell's .mcp.json already declares %s — KEPT (a merge never clobbers), but "
+                "none of them can spawn on a cell; remove the entry if you did not put it there"
+                % ", ".join(kept_off)
+            )
     else:
         for name, entry in base.items():
             if name != "tortoise":

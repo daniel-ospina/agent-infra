@@ -224,11 +224,34 @@ log_line()  { printf '  %s\n' "$*"; }
 graph_key_from_env_file() { # <file> [<variable>] -> its value
   local f="$1" v="${2:-TORTOISE_MCP_API_KEY}"
   [ -f "$f" ] || return 1
+  # ⛔ SOURCING A FILE IS CODE EXECUTION, SO THE FILE MUST BELONG TO THE USER RUNNING THIS. One
+  # candidate is `$CELL_HOME/keys.env`, and `CELL_HOME` defaults to `/tmp/cell-home` — a path under
+  # a WORLD-WRITABLE parent. Without this gate an unprivileged local user could plant that file and
+  # get arbitrary shell run as whoever provisions the cell (root, on a fresh box), from a script
+  # whose every comment says the file is operator-pushed and mode 600. `-O` is the portable owner
+  # test (bash 3.2/macOS: `stat -c` does not exist there); the mode test refuses anything group- or
+  # other-writable. A refused file is NOT a credential source — it is reported, and never sourced.
+  if [ ! -O "$f" ] || ! _no_group_world_write "$f"; then
+    printf '  ⚠️  %s is NOT a credential source: it is not owned by this user, or it is group/other-writable — refusing to source it\n' "$f" >&2
+    return 1
+  fi
   # Resolve the way the LANE does — source it in a subshell (set -a) — because a box provisioning
   # the LEGACY name spells it as an alias `export TORTOISE_MCP_API_KEY="$TORTOISE_API_KEY"`, which
   # a line-parser reads as the literal string `$TORTOISE_API_KEY` and then reports as a malformed
   # key. The subshell discards every other assignment it makes.
   KEYFILE="$f" KEYVAR="$v" bash -c 'set -a; . "$KEYFILE" >/dev/null 2>&1; set +a; printf "%s" "${!KEYVAR:-}"' 2>/dev/null
+}
+
+# True when <file> has no WRITE bit for group or other. GNU `stat -c %a` first, BSD/macOS
+# `stat -f %Lp` second — the repo's tests run on both — and "cannot determine" is a REFUSAL (the
+# caller treats a non-zero return as 'not a credential source'), never an assumed "fine".
+_no_group_world_write() {
+  local m go
+  m="$(stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null)" || return 1
+  [ -n "$m" ] || return 1
+  go="$(printf '%s' "$m" | sed 's/.*\(..\)$/\1/')"    # the last two digits: group, other
+  case "$go" in *[2367]*) return 1 ;; esac             # 2/3/6/7 all carry the write bit
+  return 0
 }
 
 # ⛔ RESOLVE THE VARIABLE THE ARTIFACT NAMES, NOT A FAMILY OF NAMES. The installed entry expands
@@ -481,7 +504,17 @@ if not url:
 # the hole (it comes from the INSTALL's rc, which already carries this verdict); convergence is. The
 # rule is ONE rule, applied by both sides: a non-http `type` disqualifies the HOSTED default (where
 # `http` is the contract) and is the operator's business on their own daemon. See the url branch below.
-auth = ((t.get("headers") or {}).get("Authorization") or "")
+# ⛔ A `headers` THAT IS NOT A MAPPING IS REFUSED BY NAME, not by traceback. `"headers": "Bearer …"`
+# (a hand-edit, or a curl-style paste) made this `.get` raise: stdout stayed empty, so the operator
+# got `FAIL: … verify failed (marker: none)` above a python traceback and nothing that named the
+# shape — and the INSTALLER's `usable()` raised on the same line, so the repair path could not fix
+# it either. Both sides now treat it as what it is: an unusable entry (replaced on install, refused
+# here by name).
+_headers = t.get("headers")
+if _headers is not None and not isinstance(_headers, dict):
+    print("BADDERS:%s" % type(_headers).__name__)
+    sys.exit(1)
+auth = ((_headers or {}).get("Authorization") or "")
 if auth and "${" not in auth:
     print("LITERAL_AUTH")
     sys.exit(1)
@@ -600,6 +633,8 @@ PY
         fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_MCP_API_KEY}' (or the legacy 'Bearer \${TORTOISE_API_KEY}') — the client sends headers VERBATIM, so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
       INSECURE_URL:*)
         fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED. Use https, or drop the Authorization for a local daemon (which needs none)" ;;
+      BADDERS:*)
+        fail ".mcp.json's tortoise entry declares \`headers\` as a ${out#BADDERS:}, not an object — the Authorization cannot be read from it, so nothing can be certified (and a merge cannot repair it). Make it an object: {\"Authorization\": \"Bearer \\${TORTOISE_MCP_API_KEY}\"}" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)
