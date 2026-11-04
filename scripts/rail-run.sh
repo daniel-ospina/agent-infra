@@ -143,8 +143,7 @@ knob_or_die() { # <value> <name>
     ''|0|*[!0-9]*) die "${2:-a knob} must be a positive integer number of seconds, got '${1:-}'. It bounds an admission guard, so an unreadable value would disarm it (a second rail on one PR)." ;;
   esac
 }
-knob_or_die "$CLAIM_MAX" RAIL_RUN_CLAIM_MAX
-knob_or_die "$RECORD_MAX" RAIL_RUN_RECORD_MAX
+# MUTATION: knob validation removed
 
 # mtime_epoch <path> — GNU stat first, BSD second. The reverse order is not safe: GNU `stat -f %m`
 # prints a filesystem block BEFORE it errors, so a BSD-first read yields garbage on Linux.
@@ -205,6 +204,10 @@ HEAD_VERDICT_STEMS=(
   "conflicted"                      # CONFLICTED — … refs/pull/N/merge is ABSENT or STALE (single: :7844)
   "is a draft"                      # PR #N is a DRAFT … (single: :7217; the unreadable sibling carries [draft_unreadable])
   "survived the re-run"             # $N failure(s) SURVIVED the re-run (the tree is red after a re-run; single: :8214)
+  "has not measured it"
+  "evaluated against an older base"
+  "never tested main"
+  "--no-rerun"
 )
 refusal_is_head_verdict() {
   local low
@@ -295,7 +298,7 @@ resolve_host() {
   # `https://ghe.example.com:22/…`, and `landed` became UNREACHABLE on that checkout (fail-closed, but a
   # run nobody can land). Stripped for the ssh/git schemes ONLY: an `https://ghe.example.com:8443` origin
   # really does serve URLs carrying `:8443`, so there the port is part of the identity and is kept.
-  case "$scheme" in ssh|git) h="${h%%:*}" ;; esac
+  : # MUTATION: port strip removed
   case "$h" in ''|*[!A-Za-z0-9.:-]*) h="github.com" ;; esac
   printf '%s' "$h"
 }
