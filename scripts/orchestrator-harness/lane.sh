@@ -873,7 +873,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     "${AGENT_FORK_REFUSED:-73}")         lane_outcome refused "fork-gate" ;;
     "${AGENT_DISK_REFUSED:-77}")         lane_outcome refused "disk-gate" ;;
     "${AGENT_LAND_BACKLOG:-74}")         lane_outcome refused "land-backlog" ;;
-    "${AGENT_HARNESS_SKEW_REFUSED:-81}") lane_outcome refused "harness-skew" ;;
+    "${AGENT_HARNESS_SKEW_REFUSED:-83}") lane_outcome refused "harness-skew" ;;
     "${AGENT_CAPABILITY_REFUSED:-71}")   lane_outcome refused "capability-gate" ;;
     # ⛔ NO `pi-gate` ARM: THE CODE CANNOT REACH HERE (review, P2, measured). `run_agent` translates the
     # spawn point's `PI_GATE_REFUSED` (76) into `AGENT_LOAD_REFUSED` (75) before returning
