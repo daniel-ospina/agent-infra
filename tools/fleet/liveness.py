@@ -286,21 +286,17 @@ LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown")
 # the fleet's existing two-sample span.
 LOG_WINDOW_MS = 30_000
 # The freeze window: how long EVERY signal must have been flat before a LIVE tree
-# is called ``frozen``. 45 min = `scripts/orchestrator-harness/lane-bound.sh`'s
-# `LANE_BOUND_IDLE_S` default (2700 s, `lane-bound.sh:172`) — the fleet's own
-# declared NO-PROGRESS allowance, and since agent-infra#2888 the bound that decides
-# wedged-vs-slow. Copied from there, so a long silent tool call is not read as death
-# by a second, unreviewed number.
-#
-# ⛔ NOT `LANE_REAP_LIVE_MIN`, AND NOT THE WALL. This comment once said the value was
-# `LANE_REAP_LIVE_MIN`'s 45 min "chosen above `lane.sh`'s 2400 s wall limit". Every
-# half was wrong: `LANE_REAP_LIVE_MIN` defaults to 125 min (`lane-reap.sh:176`), and
-# the lane's wall is `LANE_BACKSTOP_S` = 7200 s (`spawn-gate.sh:1480`), consumed as
-# the default in `lane.sh`'s `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}"` call —
-# so the number was described as sitting ABOVE a bound it actually sat 75 min below
-# (45 vs 120). The 45 min is the progress
-# allowance because that is the bound that asks the SAME question ("is this lane
-# still working?").
+# is called ``frozen``. `LANE_REAP_LIVE_MIN` default 45 min — already the reviewed
+# bound for "log advanced ⇒ live" — reused so ONE number answers one question
+# instead of a second, unreviewed one.
+# ⛔ IT IS **NOT** ABOVE THE WALL LIMIT ANY MORE, and the old rationale said it was.
+# `lane.sh` now runs `run_agent "${LANE_TIMEOUT:-3300}"` (``lane.sh:387``; its own
+# comment: "THE WALL LIMIT GREW BECAUSE THE JOB DID (3300s, was 2400s)") and
+# `lane-bound.sh`\'s `--wall` default is likewise 3300. So 2700 s is BELOW the wall
+# clock by 10 min, and the freeze window can fire on a lane still inside its allowance.
+# 45 min is still the right number — it is the REAPER\'s own kill threshold
+# (`lane-reap.sh` `LANE_REAP_LIVE_MIN`) and well above `lane-bound.sh`\'s 1200 s idle
+# bound — but for THAT reason, not for a wall-clock ordering that no longer holds.
 LOG_FREEZE_MS = 45 * 60 * 1000
 # The CPU tolerance: a delta at or below this is NOT progress. `LANE_REAP_CPU_TOL_CS`
 # default 10 (0.10 s) — a sub-0.1 s twitch is indistinguishable from a parked fork
@@ -316,17 +312,26 @@ BOUND_VERDICTS = ("finished", "stalled", "exceeded-wallclock")
 # child's REAL exit status in `rc=` on the same line, so `verdict=finished rc=7` is a
 # crashed lane. Measured: `lane-bound.sh run --log L -- sh -c 'exit 7'` →
 # `VERDICT verdict=finished … rc=7`. `BOUND_OK_RC` is the only set that may be read as
-# completion; `na` is `watch` mode's shape (the supervised pid's status is not the
-# bound's to report), and `0` is `run` mode's success.
+# completion; `0` is `run` mode's success.
+#
+# ⛔ `na` IS **NOT** COMPLETION EVIDENCE — it is the ABSENCE of exit-status evidence.
+# `lane-bound.sh` sets `V_RC=na` UNCONDITIONALLY in `watch` mode (`:397`), and `watch`
+# is the mode the fleet's ONLY launcher uses for EVERY lane/fixer/worker
+# (`spawn-gate.sh:1532` `run_agent` -> `lane-bound.sh watch`). `run` mode (which does
+# put the child's real status on the line) is never used by the fleet. So `rc=na`
+# carries no completion fact at all: reading it as OK made the `rc` conjunct INERT for
+# the axis's entire production population, and a crashed / OOM-killed / watchdog-killed
+# lane published `finished` — the exact false PASS the conjunct exists to remove.
+# `na` is therefore NOT in `BOUND_OK_RC`; it must be CORROBORATED by the launcher's own
+# `[timeout] agent pid=<pid> … rc=<n>` line (`parse_runner_line`), and only a
+# corroborated `rc=0` is `finished`.
 BOUND_FINISHED = frozenset({"finished"})
-BOUND_OK_RC = frozenset({"0", "na"})
+BOUND_OK_RC = frozenset({"0"})
 _BOUND_VERDICT_RE = None  # compiled lazily, so importing the module stays cheap
 _BOUND_RC_RE = None
 _BOUND_PID_RE = None
-# Presence of a `pid=` FIELD, whatever its value. Kept separate from `_BOUND_PID_RE` so
-# "the line names no incarnation" (ADOPT) and "the line names an unusable one" (DROP) stay
-# distinguishable — see `parse_bound_pid`.
-_BOUND_PID_FIELD_RE = None
+_BOUND_LINE_RE = None    # the `[lane-bound] VERDICT` MARKER alone (the line, not its token)
+_RUNNER_LINE_RE = None   # the LAUNCHER's own `[timeout] agent … rc=` exit-status line
 # `rc=` is captured on the SAME line, because a verdict without its exit status is
 # not a completion (see BOUND_OK_RC).
 
@@ -1103,9 +1108,77 @@ def _bound_verdict_re():
         # ` log=`) for `rc=` and take the LAST one.
         _BOUND_VERDICT_RE = _re.compile(r"\[lane-bound\]\s+VERDICT\b.*?\bverdict=([a-z][a-z-]*)")
         _BOUND_RC_RE = _re.compile(r"\brc=([0-9]+|na)\b")
-        _BOUND_PID_RE = _re.compile(r"\bpid=([0-9]+)\b")
-        _BOUND_PID_FIELD_RE = _re.compile(r"\bpid=")
+        globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=([0-9]+)\b")
+        # ⛔ THE MARKER ALONE, with NO token requirement. `_BOUND_VERDICT_RE` demands
+        # `verdict=` followed by `[a-z][a-z-]*`, so a FINAL line whose token is
+        # uppercase, empty, or spaced (`verdict = stalled`) produced NO match and the
+        # parser silently returned the PREVIOUS line's verdict — measured:
+        # `"…verdict=finished … rc=0\n…VERDICT verdict=None … rc=0"` -> ('finished','0').
+        # That is the stale-verdict false PASS the "last line wins" rule exists to stop,
+        # so the MARKER is located first and the token is read off THAT line only.
+        globals()["_BOUND_LINE_RE"] = _re.compile(r"\[lane-bound\]\s+VERDICT\b")
+        _BOUND_LINE_RE = globals()["_BOUND_LINE_RE"]
+        _BOUND_TOKEN_RE = _re.compile(r"\bverdict=([a-z][a-z-]*)")
+        globals()["_BOUND_TOKEN_RE"] = _BOUND_TOKEN_RE
+        # The LAUNCHER's exit-status line (`spawn-gate.sh:1583`):
+        #   [timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>
+        # It is the ONLY witness of the child's real status in `watch` mode, so it is
+        # what corroborates `rc=na` (see BOUND_OK_RC).
+        globals()["_RUNNER_LINE_RE"] = _re.compile(
+            r"\[timeout\]\s+agent\s+pid=(\d+)\b[^\n]*?\brc=([^\s]+)")
+        _RUNNER_LINE_RE = globals()["_RUNNER_LINE_RE"]
     return _BOUND_VERDICT_RE
+
+
+def _last_bound_line(text: str):
+    """The LAST ``[lane-bound] VERDICT`` LINE in ``text``, or ``None``.
+
+    ONE locator, shared by :func:`parse_bound_line` and :func:`parse_bound_pid`, so
+    "the line" cannot mean two different lines in the two parsers. It matches the
+    MARKER only — never the verdict token — so a final line the token regex cannot
+    match still *is* the final line, and its unreadable token yields "no verdict"
+    instead of silently promoting an earlier recognised one.
+    """
+    if not text:
+        return None
+    _bound_verdict_re()  # ensures the compiled globals exist
+    last = None
+    for m in _BOUND_LINE_RE.finditer(text):
+        last = m
+    if last is None:
+        return None
+    line_end = text.find("\n", last.start())
+    return text[last.start(): line_end if line_end >= 0 else len(text)]
+
+
+def parse_runner_line(text: str):
+    """``(pid, rc)`` from the LAST launcher ``[timeout] agent … rc=`` line, or ``("", None)``.
+
+    ⛔ WHY THIS EXISTS — THE `rc=na` HOLE. `lane-bound.sh` writes
+    ``VERDICT verdict=finished … rc=na`` UNCONDITIONALLY in ``watch`` mode
+    (``lane-bound.sh:397``), and ``watch`` is the mode ``spawn-gate.sh``'s ``run_agent``
+    uses for EVERY lane/fixer/worker (``spawn-gate.sh:1532``). ``run`` mode — the only
+    one that puts the child's real status on the bound line — is never used by the
+    fleet. So the bound line's ``rc`` can NEVER witness completion in production, and a
+    crashed / OOM-killed / watchdog-killed lane wrote exactly the same
+    ``verdict=finished rc=na``.
+
+    The real status IS written to the same log, one line later, by the caller:
+    ``[timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>``
+    (``spawn-gate.sh:1583``). That line is the corroborating witness for ``na``.
+
+    Last line wins (the log is appended to across dispatches), and ``pid`` is returned so
+    the caller can require it belong to the SAME incarnation as the bound line.
+    """
+    if not text:
+        return "", None
+    _bound_verdict_re()  # ensures the compiled globals exist
+    last = None
+    for m in _RUNNER_LINE_RE.finditer(text):
+        last = m
+    if last is None:
+        return "", None
+    return last.group(1), last.group(2)
 
 
 def parse_bound_line(text: str):
@@ -1129,19 +1202,28 @@ def parse_bound_line(text: str):
     # `VERDICT verdict=needs-review ... rc=0` parsed as `finished`, which is the
     # false-PASS class this axis exists to remove. An unrecognised final token is
     # "no verdict", never "the previous one".
-    last = None
-    for m in _bound_verdict_re().finditer(text):
-        last = m
-    if last is None:
+    #
+    # ⛔ THAT RULE IS ONLY TRUE IF THE *LINE* IS LOCATED, NOT THE TOKEN. Locating the
+    # last `verdict=<lowercase-token>` MATCH lets a final line the token regex cannot
+    # match — uppercase, empty, or spaced (`verdict = stalled`) — simply not exist, so
+    # an earlier `finished` is returned. Measured before this fix:
+    #   "…verdict=finished … rc=0\n…VERDICT verdict=FINISHED … rc=0" -> ('finished','0')
+    #   "…verdict=finished … rc=0\n…VERDICT tag=t pid=1 rc=0"     -> ('finished','0')
+    # Both are a stale false PASS. So: find the last MARKER, then read the token on
+    # that line, and an unreadable token there is NO VERDICT.
+    line = _last_bound_line(text)
+    if line is None:
         return "", None
-    verdict = last.group(1)
+    tok = _BOUND_TOKEN_RE.search(line) if globals().get("_BOUND_TOKEN_RE") else None
+    if tok is None:
+        # A FINAL marker whose token is missing/unparseable is "no verdict".
+        return "", None
+    verdict = tok.group(1)
     if verdict not in BOUND_VERDICTS:
         # An unrecognised FINAL token is "no verdict", never the previous one.
         return "", None
     # The `rc=` lives on the SAME line, before ` log=`. A missing/unparseable one is
     # None, which the verdict function turns into `finished-rc-unreadable`.
-    line_end = text.find("\n", last.start())
-    line = text[last.start(): line_end if line_end >= 0 else len(text)]
     head = line.split(" log=")[0]
     rcs = _bound_rc_re().findall(head)
     return (verdict, rcs[-1] if rcs else None)
@@ -1161,15 +1243,15 @@ def parse_bound_pid(text: str):
     """
     if not text:
         return ""
-    last = None
-    for m in _bound_verdict_re().finditer(text):
-        last = m
-    if last is None:
+    # The PID must come from the same LAST MARKER line `parse_bound_line` reads, or the
+    # two functions disagree about which line is "the line" (they did while each carried
+    # its own `last-match` loop — the defect `_bind_verdict` exists to prevent).
+    line = _last_bound_line(text)
+    if line is None:
         return ""
-    line_end = text.find("\n", last.start())
-    line = text[last.start(): line_end if line_end >= 0 else len(text)]
-    pid_head = line.split(" log=")[0]
-    pids = _bound_pid_re().findall(pid_head)
+    pids = _bound_pid_re().findall(line.split(" log=")[0])
+    # A pid is <= 7 digits (PID_MAX_DEFAULT 4194304). A longer token is not a pid, and
+    # `int()` on it raises "Exceeds the limit (4300 digits)" — an exception, not a state.
     if not pids:
         # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS NOT AN ABSENT ONE (review P2).
         # "Absent from the line" is the ADOPT row of the doc's binding table; "a pid that cannot
@@ -1210,6 +1292,18 @@ def _pid_within(root: int, child: int, *, hops: int = 64):
 
     The ppid chain is read from ``/proc`` where it exists and from ``ps`` otherwise.
     ``None`` (unverifiable) is NOT "no": the caller decides, and it fails closed.
+
+    ⛔ LIMITATION, STATED BECAUSE IT IS LOAD-BEARING: the chain is read from the LIVE
+    process table, and a verdict is only *used* when ``alive is False`` — i.e. when the
+    tree has already EXITED. Measured: a real parent/child pair returns ``True`` while
+    both are alive and ``None`` immediately after they exit, and ``None`` DROPS the
+    verdict (``unbound-bound-verdict``). So after exit only EXACT PID EQUALITY (the
+    ``child == root`` short-circuit) survives, and a verdict naming a genuine
+    DESCENDANT of the queried pid degrades to ``no-verdict``. That direction is the
+    safe one (an abstention, never a false PASS) and it is why the doc's binding table
+    says row 2 holds only while the tree is live. A durable identity (the launcher's
+    ``pid=``-carrying ``[timeout] agent`` line, or a dispatch/incarnation id on the
+    bound line) is the real fix and is a separate change.
     """
     if child == root:
         return True
@@ -1290,6 +1384,10 @@ class LogRead:
     alive: Optional[bool] = None        # process-tree existence: True/False/None
     verdict: str = ""               # BOUND_VERDICTS member, or ""
     rc: Optional[str] = None        # the bound's `rc=` on the same line: "0" | "na" | "7" …
+    # The LAUNCHER's own exit status for this lane (`[timeout] agent … rc=<n>`,
+    # `spawn-gate.sh:1583`). REQUIRED to corroborate `rc=na`, which is `watch` mode's
+    # shape and carries NO completion fact (see `BOUND_OK_RC`).
+    runner_rc: Optional[str] = None
     verdict_line_pid: str = ""      # the `pid=` on that line — the verdict's own incarnation
     verdict_source: str = ""        # "log" | "verdict-file" | "caller" | ""
     window_ms: int = LOG_WINDOW_MS
@@ -1371,6 +1469,38 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                     return Verdict("unknown", "finished-rc-unreadable",
                                    detail="verdict=finished but no rc= on the line; "
                                           "completion is undecidable")
+                if lr.rc == "na":
+                    # ⛔ `na` IS NOT COMPLETION — IT IS THE ABSENCE OF EXIT-STATUS
+                    # EVIDENCE. `lane-bound.sh watch` writes it UNCONDITIONALLY
+                    # (`:397`) and `watch` is what `spawn-gate.sh`'s `run_agent` uses
+                    # for EVERY lane/fixer/worker (`:1532`), so in the fleet's actual
+                    # population `finished` + `rc=na` is written by a lane that
+                    # COMPLETED and by a lane that CRASHED, was OOM-killed, or was
+                    # killed by the completion watchdog's 15 s TERM->KILL —
+                    # identically. Accepting `na` on its own made the `rc` conjunct
+                    # INERT for that whole population and published `finished` for a
+                    # crashed lane: the false PASS over lost work this conjunct exists
+                    # to remove.
+                    #
+                    # The real status IS in the same log, one line later, from the
+                    # caller: `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh:1583`).
+                    # Corroborate with it, and require it to describe THIS incarnation.
+                    if lr.runner_rc is None:
+                        return Verdict("unknown", "finished-rc-uncorroborated",
+                                       detail=("verdict=finished rc=na and no launcher "
+                                               "`[timeout] agent … rc=` line to corroborate "
+                                               "it; completion is undecidable")
+                                              + _also(lr.detail))
+                    if lr.runner_rc != "0":
+                        return Verdict("no-verdict", "bound-finished-runner-rc:%s" % lr.runner_rc,
+                                       detail=("verdict=finished rc=na but the launcher "
+                                               "reported rc=%s — the bound fired nothing, "
+                                               "yet the child did NOT complete" % lr.runner_rc)
+                                              + _also(lr.detail))
+                    return Verdict("finished", "bound-verdict:%s" % verdict,
+                                   detail=("verdict_source=%s rc=na runner_rc=0"
+                                           % (lr.verdict_source or "log"))
+                                          + _also(lr.detail))
                 if lr.rc not in BOUND_OK_RC:
                     return Verdict("no-verdict", "bound-finished-rc:%s" % lr.rc,
                                    detail=("verdict=finished rc=%s — the bound fired nothing, "
@@ -2510,6 +2640,26 @@ def gather_log_lane(
             lr.detail = " | ".join(x for x in (lr.detail, why) if x)
             lr.verdict, lr.rc = "", None
 
+    # ⛔ CORROBORATE `rc=na` FROM THE LAUNCHER'S OWN LINE. `na` is `watch` mode's
+    # unconditional shape (`lane-bound.sh:397`) and the fleet ALWAYS uses `watch`
+    # (`spawn-gate.sh:1532`), so it carries no completion fact — see `BOUND_OK_RC`. The
+    # child's real status is written to the SAME log by the caller as
+    # `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh:1583`). Read it here, and
+    # accept it only when it names THIS verdict's incarnation — a leftover line from an
+    # earlier dispatch appended to the same log is not this lane's exit status.
+    if lr.rc == "na" and lr.readable:
+        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))
+        if runner_rc is not None:
+            same_incarnation = ((runner_pid == lr.verdict_line_pid)
+                                if lr.verdict_line_pid else (runner_pid == str(pid)))
+            if same_incarnation:
+                lr.runner_rc = runner_rc
+            else:
+                lr.detail = " | ".join(x for x in (
+                    lr.detail,
+                    "runner-rc-unbound bound_pid=%s runner_pid=%s"
+                    % (lr.verdict_line_pid or "?", runner_pid)) if x)
+
     # S2, reading 1.
     cpu0 = subtree_cpu_cs(pid)
     if cpu0 is None:
@@ -2732,23 +2882,26 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # IS NOT. The census's own "not read" token is `?`, so a row whose pid column
             # was `?` aborted the WHOLE run with a traceback after printing only the rows
             # before it (measured: `?\t<log>\t0\t?\tfinished\t...` -> ValueError, rc=1).
-            def _num(idx):
-                # ⛔ "PRESENT BUT UNUSABLE" IS NOT "ABSENT" (cycle-6 review, P2). This used to
-                # return "" for BOTH, so a census row whose column 11 was the documented
-                # not-read token `?` fell through to the `else` arm below — the one the comment
-                # labels "Column 11 absent" — and the verdict was ADOPTED with
-                # `bound-verdict-without-pid`, claiming a binding the row never carried. The
-                # doc's binding table says the opposite (`docs/ops/fleet-liveness.md`: "a pid
-                # that cannot be resolved | unbound-bound-verdict | dropped → no-verdict", and
-                # the same five rules apply to column 11), and `_bind_verdict` already encodes
-                # it for `--verdict-file`. So the unresolvable token is reported as `?` and the
-                # ONE binding implementation decides — the two paths cannot drift again.
-                tok = f[idx].strip() if idx < len(f) else ""
-                if not tok:
-                    return ""
-                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"
+            def _pidtok(tok):
+                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10
+                        else "")
 
-            verdict_pid = _num(10)
+            def _num(idx):
+                return _pidtok(f[idx].strip() if idx < len(f) else "")
+
+            def _pidcol(idx):
+                # ⛔ "" IS "COLUMN ABSENT"; "?" IS "PRESENT BUT UNUSABLE". Collapsing
+                # the two (`_num` did) made a PRESENT-but-unreadable column 11 fall into
+                # the `else:` arm below — the one that ADOPTS an unbound verdict and says
+                # so — so a caller following the census's own documented "NOT READ"
+                # convention (`?`) had a previous dispatch's `finished` published, while
+                # `gather_log_lane` DROPPED the identical token. Same rule, same three
+                # outcomes, or the seam is the fail-open door.
+                if idx >= len(f):
+                    return ""
+                return _pidtok(f[idx].strip()) or "?"
+
+            verdict_pid = _pidcol(10)
             row_pid = _num(0)
             path = f[1] if len(f) > 1 else ""
             lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=_opt(3),
