@@ -2653,7 +2653,7 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
   const firstIsShellLike = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|env|nice|nohup|command|sudo|doas|setsid|stdbuf|time|timeout|exec|ionice|busybox|xargs|find|eval)$/.test(
     unqFirst.replace(/^.*\//, ""),
   );
-  if (sp && _wtPathNeedsExpansion(sp) && (pathShaped(sp) || /^["']?\$/.test(sp) || firstIsShellLike)) {
+  if (sp && _wtPathNeedsExpansion(sp) && (pathShaped(sp) || /^["']?\$/.test(sp))) {
     // Interpreter operand (`bash ./undo*.sh`, `sudo bash …`), or a bare path
     // that IS the first word (direct execution, `./undo*.sh`).
     //
