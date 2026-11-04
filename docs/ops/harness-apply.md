@@ -203,13 +203,18 @@ record's own `remedy=` field, untruncated — is: advance the pin
 controller from the pinned tree**.
 
 ⛔ **The command is RESOLVED to a path, not named.** Nothing in this fleet puts
-`cloud-cell-supervisor.sh` on `PATH` (`command -v` is empty on a deployed cell; the farm keeps
-it beside this pass at `~/.pi/agent/scripts/`), so a bare command name would be
-`command not found` on exactly the boxes the red fires on. The pass emits
+`cloud-cell-supervisor.sh` on `PATH` (`command -v` is empty on a deployed cell), so a bare command
+name would be `command not found` on exactly the boxes the red fires on. The pass emits
 `bash <path>` for the first of `$HARNESS_MATERIALISER`, `$HERE/cloud-cell-supervisor.sh`,
 `$O/cloud-cell-supervisor.sh`, `<repo>/scripts/cloud-cell-supervisor.sh` that exists, and says
 `NOT FOUND on this box — set HARNESS_MATERIALISER` when none does — never an implied command
 that cannot run.
+
+⛔ **`$HERE` is a bonus, not the guarantee.** `pi-bootstrap`'s `fleet_srcs` does NOT farm this
+file (`pi-bootstrap/setup.sh:442` names it a residual: *"in no array and a fresh farm gets the
+consumer without it"* — #1938), so a fresh farm carries it only when `install.sh` seeded that
+directory. The candidate a scheduler box reliably has is the LAST one: the pass's own unit exports
+`HARNESS_APPLY_REPO`, and that checkout carries `scripts/cloud-cell-supervisor.sh`.
 
 `detail=` is bounded at 240 characters, which is why `remedy=` and `preserved=` are
 separate fields: an operator-needed fact must never be at the mercy of a prose truncation

@@ -578,13 +578,22 @@ def harness_apply_record():
     # not found. (Round 14, P2: this comment used to say those refusals write `not-run:not-run`, which
     # nothing can produce — the changed `fleet_health.test.py` asserts the bare form, so the reader and
     # its own test contradicted each other inside one change.)
+    # ⛔ THE ALARM MUST NOT EAT THE REFUSAL BESIDE IT (review P2, #10114). Both arms below `return`
+    # before the refusal readers, and a box can be BOTH drifting and refused — the stale boxes this
+    # feature targets are the likeliest to be. Measured: a record carrying `rc=21 ahead=1
+    # action=refused-ahead` plus `harness=executes:/gone/abc` printed only the drift verdict, so the
+    # count of unlanded commits, the `preserved=` recovery path and the `remedy=` this change added were
+    # all dropped by the instrument whose job is to hand the operator the next action. Same facts, same
+    # fields, one message: the alarm LEADS with the finding it is about and still carries the record.
+    refusal = (f"action={kv.get('action', '?')} ahead={kv.get('ahead', '?')} "
+               f"preserved={kv.get('preserved', 'none')} remedy={kv.get('remedy', 'none')}")
     if token.startswith("executes:"):
         return (f"THE BOX EXECUTES A HARNESS TREE IT DOES NOT HAVE ({drift}) — deployed={deployed} "
-                f"ref={ref} rc={rc} action={kv.get('action', '?')}; redeploying the copy at rest does "
+                f"ref={ref} rc={rc} {refusal}; redeploying the copy at rest does "
                 f"not clear it", True)
     if token == "absent":
         return (f"record rc={rc} deployed={deployed} ref={ref} behind={behind} drift={drift} "
-                f"action={kv.get('action', '?')} — the deployed-drift check was NEVER RUN (no "
+                f"{refusal} — the deployed-drift check was NEVER RUN (no "
                 f"check-deployed-drift.sh was found), so nothing here measured whether the box runs "
                 f"this repo's code", True)
     # An EMPTY key is a record written before this field existed. NAMED, not alarmed: the next cadence

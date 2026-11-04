@@ -164,6 +164,13 @@ export function pinTreeDeployed(pin: string, home: string = process.env.HOME ?? 
  * "a live controller executes a GONE tree" is `check-deployed-drift.sh`'s `executes:` token, read
  * from process argv — NOT this banner, which reads a record. Reporting that fact from a record is
  * how a healthy box came to read as drifted.
+ * ⛔ AND THE REPAIR LINE NAMES A RESOLVED PATH (review P2, #10114). It used to print
+ * `scripts/harness-apply-pass.sh (or cloud-cell-supervisor.sh apply --force --pin-only)`: the first is
+ * CWD-relative (the banner never says where to stand) and the second is the BARE name this same change
+ * replaced with `bash <path>` in `harness-apply-pass.sh`'s `supervisor_cmd`, because nothing in this
+ * fleet puts it on `PATH`. A banner whose whole purpose is to replace a repair command that silently
+ * does nothing (`./sync.sh`) must not substitute one that fails for the same population — so it names
+ * the pass by the one path it already resolved: the checkout it was called with.
  */
 export function pinMismatchLines(repo: string, home: string = process.env.HOME ?? ""): string[] {
   const pin = pinnedSha(home);
@@ -174,7 +181,7 @@ export function pinMismatchLines(repo: string, home: string = process.env.HOME ?
   if (!pinTreeDeployed(pin, home)) return [];
   return [
     `[auto-sync]    ⛔ this checkout is at ${head} but the PIN is ${pin} — ./sync.sh advances THIS tree, not the harness the box EXECUTES.`,
-    `[auto-sync]    To advance the deployed harness: scripts/harness-apply-pass.sh (or cloud-cell-supervisor.sh apply --force --pin-only), then restart the controller from the pinned tree.`,
+    `[auto-sync]    To advance the deployed harness: bash ${repo}/scripts/harness-apply-pass.sh, then restart the controller from the pinned tree.`,
   ];
 }
 

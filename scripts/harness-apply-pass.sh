@@ -671,21 +671,22 @@ read_deployed_drift() {
 # supervisor_cmd — the repair verb the `deployed-drift` refusal RECORDS, as something an operator can
 # paste. ⛔ A REMEDY THAT DOES NOT RUN IS NOT A REMEDY (review P2, #10114). The sentence used to begin
 # with the bare name `cloud-cell-supervisor.sh`, and NOTHING in this fleet puts that name on PATH:
-# `command -v cloud-cell-supervisor.sh` is empty on a deployed cell, and the farm keeps it at
-# `~/.pi/agent/scripts/cloud-cell-supervisor.sh` (`pi-bootstrap`'s `fleet_srcs` farm). So the one
-# actionable output of a red that repeats every tick until someone acts was `command not found` on
-# exactly the population it fires on. Resolve an EXISTING file, in the order the fleet materialises it:
-# an explicit `HARNESS_MATERIALISER`, the farmed shape BESIDE this pass (`$HERE` — measured: the farm
-# carries both files in one directory), the deployed harness dir, then a checkout. Only when NOTHING
-# exists does it fall back to the bare name, and then it says the path is unknown instead of implying
-# a command that resolves.
+# `command -v cloud-cell-supervisor.sh` is empty on a deployed cell. So the one actionable output of a
+# red that repeats every tick until someone acts was `command not found` on exactly the population it
+# fires on. Resolve an EXISTING file, preferring a deployed copy over a checkout:
+# an explicit `HARNESS_MATERIALISER`, the file BESIDE this pass when a box carries it there
+# (`install.sh` seeds that directory; ⛔ `pi-bootstrap`'s `fleet_srcs` does NOT farm this file —
+# `setup.sh:442` names it a residual: "in no array and a fresh farm gets the consumer without it",
+# #1938 — so this candidate is a bonus, never the guarantee), the deployed harness dir, then the
+# checkout the pass GOVERNS — which is the candidate a scheduler box reliably has, because its unit
+# exports `HARNESS_APPLY_REPO`. Only when NOTHING exists does it fall back to naming the file and
+# saying the path is unknown, instead of implying a command that resolves.
 supervisor_cmd() {
     local c
     for c in "${HARNESS_MATERIALISER:-}" "$HERE/cloud-cell-supervisor.sh" "${O:-}/cloud-cell-supervisor.sh" "${REPO:-}/scripts/cloud-cell-supervisor.sh"; do
         [ -n "$c" ] && [ -f "$c" ] && { printf 'bash %s' "$c"; return 0; }
     done
-    printf 'cloud-cell-supervisor.sh (NOT FOUND on this box — set HARNESS_MATERIALISER)'
-}
+    printf 'cloud-cell-supervisor.sh (NOT FOUND on this box — set HARNESS_MATERIALISER)'}
 
 # finish — record the pass and ANSWER IT. The detail is printed in BOTH directions: a silent success
 # (`exit 0` with no line saying what it decided) is the shape that let a no-op and a refusal look
