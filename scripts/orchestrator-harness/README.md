@@ -5082,6 +5082,47 @@ belongs to `fix-one.sh`'s own three pre-agent deferrals (the cross-box refusal, 
 PR-owner takeover that could not complete), which is where it is written.
 
 
+### 7.2i The disk gate existed and ran one step too late (agent-infra#3395)
+
+Measured, cell-3, 98 % used / 3.5 GB free:
+
+```
+dispatch -> fatal: cannot create directory at 'tools/ts': No space left on device
+```
+
+The harness's disk gate was already correct and already fail-closed on a readable reading — but it
+lived inside `run_agent`, i.e. it ran AFTER `wt_provision` had materialised the lane's checkout. On a
+full volume it was never reached, so a full box presented as a **dead lane** rather than a named
+refusal. The dispatcher that produced that line (an ad-hoc pusher, `/tmp/robust_push.py`) printed
+`df=` in a log line and asserted nothing, because there was nothing for it to call: a `df` in a log
+is a REPORT, and a report is not a gate.
+
+Three surfaces now exist, and they are ONE predicate (`spawn-gate.sh`'s `disk_free_mb` /
+`disk_readable` / `disk_lane_need`), not three implementations:
+
+| surface | when it is asked | verdict |
+|---|---|---|
+| `run_agent` (live dispatch) | immediately before the agent starts | `REFUSED … DISK-NOHEADROOM` (unchanged, fail-OPEN on an unreadable probe) |
+| `wt_provision` → `wt_disk_admit` (PRE-START) | before `git worktree add`, i.e. before anything is created | `REFUSED-DISK(free=…, need=…, box=…)`, return **4**; callers map it to 77 (`AGENT_DISK_REFUSED`) |
+| `spawn-gate.sh --disk-admit <target>` (the VERB) | from a dispatcher that is not this tree's shell code | same lines, exit 0/77/64 |
+
+The PRE-START arm fails **CLOSED** on an unreadable `df` (`REFUSED-UNKNOWN free=?`): refusing before
+anything is created costs a re-dispatch, while the live arm's documented fail-open protects a running
+fleet. Two postures, one predicate, each with the reason this tree already gives for it.
+
+The per-lane requirement at that seam is the **worst case** (6,144 MB default), not the marginal tree
+(350 MB), plus the cell reserve (4x the dispatch floor = 2,000 MB) — so 8,144 MB, i.e. ~8.0 GB. The
+derivation is measured, not invented: two lanes consumed **11 GB in six minutes** (~5.5 GB each) on a
+cell whose `.worktrees` was 36.4 GB of 47 GB, and the check therefore takes the cell that will BUILD,
+not the box that decided. A box whose lanes are measured cheaper lowers `DISK_LANE_SELF_MB` /
+`DISK_LANE_RESERVE_MB` deliberately (the seams the live arm already documents).
+
+Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
+the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real
+worktree; `free == need` → admitted; `free - 1` → refused; an unreadable probe → `REFUSED-UNKNOWN`;
+and the verb prints `REFUSED-DISK(free=3.5GB, need=8.0GB, box=cell-3)` verbatim.
+
+
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
 Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, no review,

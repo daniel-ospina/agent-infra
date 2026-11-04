@@ -387,6 +387,230 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
   [ "$mb" -ge "$(disk_lane_need "${2:-0}" "${3:-0}" "${4:-0}")" ]
 }
 
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# ── THE PRE-START ADMISSION SEAM (agent-infra#3395) — the SAME predicate, READ BEFORE A WORKTREE
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# Everything above this line is the LIVE-DISPATCH arm: it runs inside `run_agent`, i.e. AFTER the
+# lane's worktree was materialised. #3395 measured what that ordering costs — a dispatch on cell-3
+# (98% used, 3.5 GB free) never reached `run_agent` at all, because the failure happened one step
+# earlier, in the worktree creation itself:
+#
+#   git worktree add -> fatal: cannot create directory at 'tools/ts': No space left on device
+#
+# and the dispatcher that produced it printed `df=` in a log line and asserted nothing. A `df` in a
+# log is a REPORT; a report is not a gate. So the same predicate is now ALSO callable from the one
+# place a lane checkout is created (`wt-lifecycle.sh`'s `wt_provision`, which every creation path in
+# this tree routes through: `dispatch-merge.sh`, `fix-one.sh`, `adopt-fix.sh`) and from a stable
+# verb, so a dispatcher that is not this tree's shell code (an ad-hoc pusher on another box) calls
+# THIS function instead of re-implementing `df`. That divergence — harness copy gated, ad-hoc copy
+# not — is the whole defect.
+#
+# ⛔ ONE PREDICATE, NOT TWO: `disk_admit` below reads through `disk_free_mb`, bounds through
+# `disk_worktree_need`/`disk_lane_need`, and classifies readability through `disk_readable` — the
+# same four functions the live arm uses. Nothing here re-derives a threshold.
+#
+# ⛔ POLARITY AT THIS SEAM IS FAIL-CLOSED, AND THAT IS NOT A CONTRADICTION OF THE LIVE ARM'S
+# FAIL-OPEN. The file states the distinction above: a PRE-START check may refuse at no cost, while a
+# probe that fails inside a LIVE dispatch path must not stop every lane on the box for ever. This is
+# the pre-start side — nothing has been consumed, no agent is running, and the caller releases its
+# claim — so an unreadable `df` answers REFUSED-UNKNOWN (77) and NAMES itself, exactly as #3395 and
+# #3231 require. The live arm's documented fail-open is deliberately left alone here: flipping it is
+# a fleet-wide availability decision, and it is #3231's for the fork floor, not a side effect of
+# this change.
+#
+# ── THE PER-LANE REQUIREMENT AT THIS SEAM, AND ITS DERIVATION ────────────────────────────────────
+# `self` (6144 MB by default), NOT the marginal `tree` (350 MB), plus the cell's reserve (4x the
+# dispatch floor). The file's own argument for why admission is bounded by `self` applies with full
+# force one step earlier: `tree` is only true while a WARM shared uv cache holds, and the cache is
+# exactly what gets pruned under pressure, so the lane admitted on the strength of the marginal
+# figure is the lane that materialises the whole venv. MEASURED (the #3395 record): two lanes
+# consumed 11 GB in six minutes (~5.5 GB each) on a cell whose `.worktrees` was 36.4 GB of 47 GB —
+# so a single dispatch needs GIGABYTES, and 6 GiB is the measured per-lane worst case already
+# recorded in this file's SELF term, not a new guess. The repo classifier (`python_target`) is NOT
+# consulted here because at this seam the lane's install step is the BRIEF's, not the checkout's: a
+# harness checkout whose lane is told to run a python suite pays the same 5.6 GB venv.
+# ⛔ AND IT IS AN OVERRIDE, WITH A STATED MEANING: `DISK_LANE_SELF_MB` / `DISK_LANE_RESERVE_MB` (the
+# seams this file already documents) set the number for a box whose lanes are MEASURED cheaper. A
+# misspelt/empty override derives the default rather than collapsing to 0 — an admission bound of 0
+# is the inert gate class `disk_floor_num`/`is_limit` exist to reject.
+
+# disk_box_id — WHICH BOX the reading belongs to, for the refusal line. `box=` is not decoration:
+# #3231's lesson is that a reading is only meaningful WITH the box it was taken on, and an operator
+# reading a refusal from a log aggregator has no other way to tell which cell refused.
+# Order: `DISK_BOX` (the deploy/operator seam — a name a human chose), then `CAP_BOXID` if the box's
+# supervisor exported it, then `capacity.sh`'s `cap_boxid` WHEN THAT FILE SITS BESIDE THIS ONE (the
+# fleet's own per-box identity: hardware uuid on the mac, routable IPv4 on the cells). `hostname -s`
+# is the LAST resort and it is a known-weak one — measured SHARED by every cmux cell (`cmux`) — so it
+# is printed rather than withheld: `box=cmux` still beats no box at all, and the reader can see it is
+# not a per-box name. An empty result is printed as UNIDENTIFIED, never dropped from the line.
+disk_box_id() {
+  local b=""
+  if [ -n "${DISK_BOX:-}" ]; then b="$DISK_BOX";
+  elif [ -n "${CAP_BOXID:-}" ]; then b="$CAP_BOXID";
+  else
+    case "${BASH_SOURCE[0]:-}" in
+      */*) if [ -f "${BASH_SOURCE[0]%/*}/capacity.sh" ]; then
+             b="$( ( . "${BASH_SOURCE[0]%/*}/capacity.sh" >/dev/null 2>&1; cap_boxid ) 2>/dev/null )" || b=""
+           fi ;;
+    esac
+    [ -n "$b" ] || b="$(hostname -s 2>/dev/null || hostname 2>/dev/null)" || b=""
+  fi
+  # No space or comma may reach the token: the line is parsed by `costs=$(…)`-style readers and by
+  # operators' greps, and `box=cell 3` would split into two tokens that mean nothing.
+  # ⛔ THE CASE MUST REPLACE, NOT MERELY DEFAULT (review round 1, P2 — MEASURED). The first version
+  # read `case "$b" in ''|*[!…]*) [ -n "$b" ] || b="UNIDENTIFIED" ;; esac`, so a value that CONTAINED
+  # an illegal character kept it: `DISK_BOX="cell 3"` printed `box=cell 3` — the exact two-token split
+  # the comment above promises cannot happen — and `DISK_BOX="cell,3 x"` printed verbatim. It is the
+  # same shape `capacity.sh`'s `cap_host` uses, and there the arm REPLACES; this one now does too.
+  case "$b" in ''|*[!A-Za-z0-9._:-]*) b="UNIDENTIFIED" ;; esac
+  printf '%s' "${b:-UNIDENTIFIED}"
+}
+
+# disk_free_mb_target <path> — free MiB on the filesystem that WILL hold <path>, which may not exist
+# yet (the worktree this admission is about). The nearest EXISTING ancestor is the honest answer for a
+# path that is about to be created ON THAT VOLUME, and it is the same rule `disk-floor.sh`'s
+# `disk_floor_free_mb` already applies to a state dir.
+# ⛔ IT WALKS ONLY WHILE THE PATH DOES **NOT** EXIST — NEVER PAST A `df` THAT FAILED (review round 1,
+# P2, MEASURED). The first version walked on any EMPTY reading, so a target whose own volume was
+# unmeasurable but whose ancestors answered produced ANOTHER volume's number and ADMITTED — the
+# opposite of the fail-closed claim this arm is documented with (measured: a `df` stub failing under
+# `<existing>/realparent` and answering 999999 MB for `/` made `disk_admit` return 0). A path under an
+# existing directory whose `df` fails therefore reaches "I cannot measure the volume this will land
+# on", which is UNREADABLE, not "/ has room". The single-component case (`/tm-1` → `${p%/*}` = "") is
+# clamped to `/` rather than to `.`: a relative `.` would measure the CALLER's cwd, a third volume.
+disk_free_mb_target() { # <path>
+  local p="${1:-.}" mb
+  while :; do
+    if [ -e "$p" ]; then
+      mb="$(disk_free_mb "$p")"
+      [ -n "$mb" ] && printf '%s\n' "$mb"
+      return 0
+    fi
+    case "$p" in ''|.|/) return 0 ;; esac
+    case "$p" in */*) p="${p%/*}"; [ -n "$p" ] || p="/" ;; *) p="." ;; esac
+  done
+}
+
+# disk_mb_gb <mb> — the human term for a refusal line, one decimal, ALWAYS printed with its unit.
+# `awk`'s `printf "%.1f"` (never `print int(…)`): the mawk OFMT/scientific-notation hazard this file
+# documents for `disk_free_mb` applies to every renderer, and a refusal that prints `3.5e+03MB` is a
+# refusal an operator cannot act on. An unreadable/absent value renders `?` — never `0`.
+disk_mb_gb() { # <mb>
+  case "${1:-}" in ''|*[!0-9]*) printf '%s' '?' ;; *) awk -v m="$1" 'BEGIN{printf "%.1fGB", m/1024}' ;; esac
+}
+
+# disk_worktree_need -> the MB a worktree CREATION must find free. See the derivation block above:
+# the lane's worst case, plus the cell's reserve (4x the dispatch floor).
+# ⛔ THE TWO TERMS ARE DERIVED ONCE, IN `disk_worktree_terms`, AND EVERY CONSUMER READS THEM FROM
+# THERE (review round 1, P2, MEASURED). The refusal message used to re-derive the reserve as
+# `$(( need - ${DISK_LANE_SELF_MB:-6144} ))` — i.e. it fed the RAW, UNVALIDATED env value into
+# arithmetic. `DISK_LANE_SELF_MB=12x` (or `6G`, or `6144MB`: all plausible operator spellings) then made
+# the REFUSAL ITSELF die with `need - 12x: value too great for base`: rc 1 (not the documented 77), an
+# EMPTY DISK_ADMIT_LINE, and a `--disk-admit` verb exiting 1 outside its own 0/77/64 contract. That is
+# the input class this file says it tolerates, so the validated terms are emitted in ONE place.
+disk_worktree_terms() { # -> "<self> <reserve>", both validated integers
+  local self reserve
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; else self=6144; fi
+  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve=$(( 10#$DISK_MIN_FREE_MB * 4 )); fi
+  printf '%s %s\n' "$self" "$reserve"
+}
+
+disk_worktree_need() { # -> the MB a worktree creation must find free
+  local self reserve
+  self="$(disk_worktree_terms | awk '{print $1}')"
+  reserve="$(disk_worktree_terms | awk '{print $2}')"
+  case "${self:-}" in ''|*[!0-9]*) self=6144 ;; esac
+  case "${reserve:-}" in ''|*[!0-9]*) reserve=0 ;; esac
+  # ⛔ AN EXPLICIT `0` IS HONOURED, exactly as `disk_lane_costs` honours it (the file's own word: the
+  # test seam neutralises the terms in one place, and 0 is a STATED choice). Only an ABSENT/garbled
+  # value derives the default, so a typo'd env cannot silently collapse the bound to nothing — while a
+  # suite that deliberately zeroes both terms gets a gate that admits, which is what lets it test the
+  # worktree lifecycle without depending on this host's free space.
+  printf '%s\n' "$(( self + reserve ))"
+}
+
+# disk_admit <target-path> [<label>] — THE PRE-START DISK ADMISSION.
+#   prints ONE line on a refusal (nothing on admission unless DISK_ADMIT_VERBOSE=1)
+#   returns 0 ADMITTED · 77 REFUSED (`DISK_ADMIT_VERDICT` says which arm)
+# The verdict is in THREE parts, and all three are load-bearing: `REFUSED-DISK` (a reading we took and
+# compared — the arithmetic is printed so it can be re-done from the line), `REFUSED-UNKNOWN` (a
+# reading we could NOT take — the pre-start fail-closed arm), and `free`/`need`/`box` as named terms.
+# A gate that refuses without stating what it measured is indistinguishable from a bug: this fleet has
+# read a CORRECT refusal as a false positive more than once (#3395's own record), and the numbers are
+# what make that impossible.
+#
+# ⛔ THE TOKEN CARRIES THE EXACT MEBIBYTES AS WELL AS THE ROUNDED GiB (review round 1, P2 — MEASURED).
+# One decimal on GiB is not enough to be unambiguous AT THE BOUNDARY: 8,143 MB and 8,144 MB both render
+# `8.0GB`, so the arm that refuses `free = need - 1` printed `free=8.0GB, need=8.0GB` — a correct
+# refusal that reads as free == need, i.e. exactly the false-positive reading this message exists to
+# prevent. The token keeps #3395's specified `free=<GiB>, need=<GiB>, box=<box>` prefix (asserted
+# verbatim by disk-admission.test.sh) and appends the raw figures inside the same parentheses.
+#
+# ⛔ NO `repo` PARAMETER, DELIBERATELY (review round 1, P2 — it was plumbed and unread, which made the
+# "ONE predicate" claim false by ~4x without saying so). This seam charges the lane's WORST CASE
+# (`self`) for ANY checkout, where the live arm classifies the checkout (`python_target`) and charges
+# the marginal `tree` when it can. That divergence is a DECISION, not an oversight: `tree` is true only
+# while a warm shared uv cache holds, and the cache is what gets pruned under pressure — so a seam that
+# admitted on the marginal figure would admit the lane that materialises the whole venv, and at this
+# step nothing has been spent yet (a refusal costs one re-dispatch). It is stated in README §7.2i, and
+# the cost of choosing it is named there too: a box at ~5 GB free refuses a harness lane the live gate
+# would have admitted, until an operator states a smaller worst case with DISK_LANE_SELF_MB.
+disk_admit() { # <target> [<label>]
+  local target="${1:-.}" label="${2:-disk-admit}" free need box self reserve
+  DISK_ADMIT_VERDICT="admit"
+  DISK_ADMIT_LINE=""
+  need="$(disk_worktree_need)"
+  self="$(disk_worktree_terms | awk '{print $1}')"
+  reserve="$(disk_worktree_terms | awk '{print $2}')"
+  box="$(disk_box_id)"
+  free="$(disk_free_mb_target "$target")"
+  if ! disk_readable "$free"; then
+    DISK_ADMIT_VERDICT="unknown"
+    DISK_ADMIT_LINE="[disk-admit] REFUSED-UNKNOWN $label: free=? need=$(disk_mb_gb "$need") box=$box target=$target — the free-space probe could not answer (no readable \`df\` for that path or its nearest EXISTING ancestor), so the lane's headroom CANNOT be verified. Nothing was created, no worktree, no branch; a PRE-START admission fails CLOSED (an unmeasurable box is not an empty one). Check PATH/'df' on this box, or pass the volume explicitly (agent-infra#3395/#3231)"
+    printf '%s\n' "$DISK_ADMIT_LINE"
+    return "$AGENT_DISK_REFUSED"
+  fi
+  if [ "$free" -lt "$need" ]; then
+    DISK_ADMIT_VERDICT="disk"
+    DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$free"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$free, need_mb=$need) $label: $free MB free on $target < ${need}MB required (one lane's measured worst case ${self}MB + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
+    printf '%s\n' "$DISK_ADMIT_LINE"
+    return "$AGENT_DISK_REFUSED"
+  fi
+  [ "${DISK_ADMIT_VERBOSE:-0}" = 1 ] && printf '[disk-admit] ADMITTED %s: free=%sMB need=%sMB box=%s target=%s\n' \
+    "$label" "$free" "$need" "$box" "$target"
+  return 0
+}
+
+# disk_admit_cli [--target P] [--repo P] [--label S] [P] — the VERB, for a caller that is not this
+# tree's shell code. WHY IT EXISTS (#3395): the failure this seam is written against was produced by
+# an AD-HOC dispatcher (`/tmp/robust_push.py`) that printed `df=` and asserted nothing, and no amount
+# of gating inside the harness stops the next ad-hoc script from doing the same — unless there is ONE
+# command it can call to ask the question. This is that command; the predicate behind it is the one
+# `run_agent` and `wt_provision` use, not a copy.
+# Exit: 0 admitted · 77 refused (the line on stdout names the arm and the numbers) · 64 usage.
+disk_admit_cli() {
+  local target="" label="disk-admit"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --target) [ $# -ge 2 ] || { printf 'disk-admit: --target needs a path\n' >&2; return 64; }; target="$2"; shift 2 ;;
+      --repo)   # ⛔ REMOVED, NOT ACCEPTED AND IGNORED: it was plumbed to `disk_admit` and never read
+                # (review round 1, P2), so an operator passing it would believe the checkout's class
+                # narrowed the bound. It does not — this seam charges the lane's worst case for ANY
+                # checkout, and that is stated in README §7.2i rather than implied by a dead flag.
+                printf 'disk-admit: --repo was removed: this seam charges one lane WORST CASE for any checkout (see README 7.2i); set DISK_LANE_SELF_MB to state a smaller one\n' >&2; return 64 ;;
+      --label)  [ $# -ge 2 ] || { printf 'disk-admit: --label needs a value\n' >&2; return 64; }; label="$2"; shift 2 ;;
+      -h|--help)
+        printf 'usage: spawn-gate.sh --disk-admit <target-path> [--label <text>]\n'
+        printf '  exit 0 = ADMITTED · 77 = REFUSED-DISK / REFUSED-UNKNOWN (the line names free, need and box) · 64 = usage\n'
+        return 0 ;;
+      -*) printf 'disk-admit: unknown option %s\n' "$1" >&2; return 64 ;;
+      *)  if [ -z "$target" ]; then target="$1"; else label="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$target" ] || { printf 'disk-admit: a target path is required (the volume the worktree will be written to)\n' >&2; return 64; }
+  disk_admit "$target" "$label"
+}
+
 # 1-min load average, integer. Empty when the probe fails (see can_spawn).
 # THE FIELD DIFFERS: /proc field 1 IS the 1-min load, while macOS `sysctl vm.loadavg` prints
 # `{ 1.70 1.90 2.00 }`, so field 2 is. One shared awk would therefore read the wrong field on one of
@@ -3338,7 +3562,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ONE message for BOTH arms that can refuse on headroom (the band branch below and the plain one):
   # two copies of a 4-line verdict is how the numbers in a log start disagreeing with the numbers in
   # the gate. It is rendered here, where the terms are, and printed where the decision is made.
-  _lane_nh_msg="[disk-gate] REFUSED $label: DISK-NOHEADROOM — this lane costs up to ${_lane_worst}MB (${_lane_tree}MB while the shared uv cache holds, ${_lane_self}MB if sharing is lost) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree:-?}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it"
+  # ⛔ AND IT CARRIES THE MACHINE-READABLE TOKEN TOO (agent-infra#3395): `REFUSED-DISK(free=, need=, box=)`
+  # is the form an operator's grep and the pre-start seam (`disk_admit`) share, so a reader never has
+  # to know WHICH of the two arms refused to find the numbers. Appended, never substituted: every
+  # existing reader of this line (and `[disk-gate]` grep) stays correct, and the token is one added
+  # fact rather than a re-wording of a sentence other tooling matches on.
+  _lane_nh_msg="[disk-gate] REFUSED $label: DISK-NOHEADROOM REFUSED-DISK(free=$(disk_mb_gb "${dfree:-}"), need=$(disk_mb_gb "$_lane_need"), box=$(disk_box_id)) — this lane costs up to ${_lane_worst}MB (${_lane_tree}MB while the shared uv cache holds, ${_lane_self}MB if sharing is lost) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree:-?}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it"
   # DURABLE, and written for ALLOWED runs too — a series that only records refusals cannot answer
   # "how close did we get", which is the question that would have caught either incident early.
   # Same append-only shape as walltime.tsv; a refusal writes a row here (unlike walltime, where a
@@ -4342,10 +4571,13 @@ reap_lane_venv() {
 #   * A box where neither pi-bootstrap/setup.sh nor pi-bootstrap/cell-install.sh has run has no shim.
 #     Both install it (`$DEST/bin/pi`) and the cell installer byte-compares it on `--verify`, so the
 #     state is checked rather than assumed — but it is a state, and it is stated.
-#   * The DISK gate (#1765) is NOT here. Its reading is per-spawn (DISK_GATE_PATH is the worktree the
-#     agent will fill), which a shim cannot know: a spawn through the shim is disk-gated only when
-#     its caller runs through run_agent() above. Named residual, and it is the reason run_agent keeps
-#     its own two gates rather than deferring to this one.
+#   * The DISK gate (#1765) is NOT here FOR A SPAWN. Its reading is per-spawn (DISK_GATE_PATH is the
+#     worktree the agent will fill), which a shim cannot know: a spawn through the shim is disk-gated
+#     only when its caller runs through run_agent() above. Named residual, and it is the reason
+#     run_agent keeps its own two gates rather than deferring to this one. ⛔ BUT THE PREDICATE IS
+#     REACHABLE FROM HERE AS A VERB (`--disk-admit <target>`, agent-infra#3395): it spawns nothing, so
+#     it is not a spawn to gate, and it is what a dispatcher outside this tree calls instead of
+#     re-implementing `df`. The PRE-START arm used by the worktree creation is `disk_admit` below.
 #   * `pi` invocations that never leave the current process — none exist today (there is no in-process
 #     API use of the harness's model calls), and if one appeared it would be outside every PATH gate.
 #   * ⛔ THE `task`/SUB-AGENT DISPATCH IS ANOTHER SPAWN POINT, AND IT DOES NOT PASS THROUGH PATH.
@@ -4429,6 +4661,18 @@ pi_gate_refusal_count() {
 pi_shim_main() {
   local self real load cwd caller n item
   self="${BASH_SOURCE[0]}"
+  # ── THE ADMISSION VERB, FIRST, AND BEFORE THE REAL-PI RESOLUTION (agent-infra#3395) ─────────────
+  # This mode spawns NOTHING, so it is not a spawn to gate: it answers "does this box have room for
+  # one more lane's worktree" for a caller that has no other way to ask (an ad-hoc pusher, a cron
+  # script, a human). It is deliberately reachable here rather than as a second file, for this
+  # file's own "ONE ARTIFACT, NOT TWO" reason — a wrapper that resolved the predicate by path could
+  # dangle, and a dangling admission check is the `df`-in-a-log-line this change exists to replace.
+  # ⛔ It is NOT a bypass: no argv spelling of `--disk-admit` runs an agent, so nothing is ungated.
+  if [ "${1:-}" = "--disk-admit" ]; then
+    shift
+    disk_admit_cli "$@"
+    exit $?
+  fi
   real="$(pi_gate_real "$self")" || {
     # FAIL CLOSED on an unresolvable pi, LOUD: running *some* pi we cannot identify is worse than
     # refusing to run one, and 127 is the shell's own "cannot execute" so a caller quoting the error

@@ -230,7 +230,20 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     fi
   fi
   wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
-  if [ "$?" != 0 ]; then
+  _wt_rc=$?
+  if [ "$_wt_rc" = 4 ]; then
+    # ── THE PRE-START DISK REFUSAL (agent-infra#3395) ─────────────────────────────────────────
+    # Nothing was created and no agent ran, so the attempt is REFUNDED and the exit code is the disk
+    # gate's own (77): `adopt-fix.sh` and `chain-merge.sh` both read 77 as "waiting will not clear
+    # this — reclaim space", and folding it into a generic rc=1 (the old `exit 1` below) is the
+    # misattribution #2721 fixed for the live arm. Measured cost of NOT distinguishing it: the
+    # operator is sent to wait for a load remedy that cannot arrive.
+    echo "[fix $PR] REFUSED before creating a worktree: $WT_RESULT" >> "$L.log"
+    echo "[fix $PR] REFUSED-DISK (nothing created, attempt refunded) — reclaim space; this will NOT clear by waiting" >> "$L.log"
+    refund_gate_attempt
+    exit "${AGENT_DISK_REFUSED:-77}"
+  fi
+  if [ "$_wt_rc" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
     # ⛔ REFUND HERE TOO (#3511). This arm exited without refunding while the branch refusal above
     # does. The rule is #1720's: a refusal that ran no fixer gives the attempt back — otherwise three

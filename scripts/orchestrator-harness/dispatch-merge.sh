@@ -372,6 +372,17 @@ for N in "$@"; do
   _wt_rc=$?
   case "$_wt_rc" in
     0) echo "#$N: worktree ok — $WT_RESULT" ;;
+    4) # ── THE DISK REFUSAL (agent-infra#3395) STOPS THE BATCH, NOT JUST THIS ISSUE ─────────────
+       # Every issue in this batch creates its worktree on the SAME volume, so a refusal here is a
+       # fact about the BOX: continuing would run the next `git worktree add` into the same full
+       # disk and produce the measured `fatal: cannot create directory …: No space left on device`,
+       # once per remaining issue. The refusal names its own numbers (free/need/box), the claim is
+       # released so the issue is not held for a box that cannot build it, and the batch stops.
+       echo "#$N: $WT_RESULT"
+       echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take #$N"
+       release_issue_claim_unspawned "$N"
+       drop_dispatched_rows "$N" 2>/dev/null || true
+       break ;;
     *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; drop_dispatched_rows "$N"; continue ;;
   esac
   WT_ABS="$REPO_ABS/.worktrees/$WT"

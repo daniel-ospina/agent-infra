@@ -57,6 +57,17 @@ assert_nobranch() { if [ -n "$("$REAL_GIT" -C "$1" rev-parse --verify -q "refs/h
 assert_registered()   { if "$REAL_GIT" -C "$1" worktree list --porcelain | grep -qxF "worktree $2"; then ok "$3"; else bad "$3 (not registered: $2)"; fi; }
 assert_unregistered() { if "$REAL_GIT" -C "$1" worktree list --porcelain | grep -qxF "worktree $2"; then bad "$3 (still registered: $2)"; else ok "$3"; fi; }
 
+# ⛔ THE DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395), AND THAT IS TEST HYGIENE,
+# NOT A CONVENIENCE. `wt_provision` now asks the ONE disk predicate before it creates anything, so
+# every arm below would otherwise depend on THIS HOST's free space: measured, on a cell with 8.4 GB
+# free the 6 GiB + reserve bound admits, and the same suite on a tighter box (or after its own
+# fixtures eat 2 GB) would refuse and report failures about worktrees that were never created.
+# That is the exact host-measuring defect `spawn-gate.test.sh` documents for its own `df` stub. The
+# gate's own behaviour is pinned in `disk-admission.test.sh`, which STUBS `df` and measures nothing
+# about this host; here both terms are zeroed through the documented seams, so these arms test the
+# lifecycle and only the lifecycle.
+export DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+
 REAL_GIT="$(command -v git)" || { echo "FATAL: git is required" >&2; exit 2; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/wt-lifecycle-test.XXXXXX")" || { echo "FATAL: no temp dir" >&2; exit 2; }
 T="$(cd "$T" && pwd -P)"
