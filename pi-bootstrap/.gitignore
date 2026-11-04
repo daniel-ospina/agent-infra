@@ -1,7 +1,0 @@
-pi-config/extensions/**/node_modules/
-pi-config/extensions/node_modules/
-
-# secrets defense-in-depth
-auth.json
-pi-keys.env
-*.env

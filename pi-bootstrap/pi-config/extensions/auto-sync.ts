@@ -1,1 +1,0 @@
-../../../extensions/auto-sync.ts

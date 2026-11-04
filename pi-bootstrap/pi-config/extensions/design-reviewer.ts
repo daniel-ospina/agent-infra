@@ -1,1 +1,0 @@
-../../../extensions/design-reviewer.ts
