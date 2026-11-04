@@ -85,6 +85,41 @@ printf '[lane-exec] %s cwd=%s brief=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$PWD
 lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
 printf '[agent] provider=%s model=%s label=lane-exec\n' "$lane_provider" "$lane_model" >> "$LOG"
 
+# ── THE UV PIN, BEFORE THE `exec` (agent-infra#2159) ────────────────────────────────────────────
+# `lane-exec.sh` execs `pi` directly (it does NOT route through `run_agent()`), and it is a LANE
+# launcher — the one such path that can materialise a per-worktree `.venv`. So it needs the pin in its
+# own right: without it a lane here inherits `UV_LINK_MODE`/`UV_CACHE_DIR` from the ambient env, and
+# `uv`'s default link mode is `clone` — a full copy on a filesystem that cannot clone. Measured
+# 2026-11-03: both unset on pi-cell-1 and pi-cell-4, ambient and after `keys.env`.
+# ⛔ NO BASE HOME, NO CACHE PIN. With `HOME` and `CELL_HOME` both empty, `uv_env_apply ""` resolves to
+# `/.cache/uv` — a root-level cache nobody created. Skipping the apply leaves uv's own default, which
+# is the pre-change behaviour.
+# ⛔ AND IT MUST NOT BE ABLE TO CHANGE WHAT RUNS: every step degrades (`|| true`), because this file's
+# contract is that it execs the agent — a missing helper is not a reason to fail a lane.
+# ⛔ EVERY SKIP PATH IS LOUD, INCLUDING THE ONES THAT SKIP. The first cut of this block only logged on
+# the SUCCESS path while its own comment claimed "the log says why" on the skip paths — a claim about a
+# log line that did not exist, which is the defect class this file's neighbours name ("a comment
+# claiming a guard that does not exist reads exactly like one that does"). Silence also cannot say
+# WHICH cause fired, and from the operator's side silence is indistinguishable from an older harness
+# that has no block at all. So each skip arm names itself, exactly as `spawn-gate.sh`'s seam does.
+_uvdir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _uvdir=""
+_uvbase="${CELL_HOME:-${HOME:-}}"
+if [ -z "$_uvdir" ] || [ ! -r "$_uvdir/uv-env.sh" ]; then
+  printf '[uv-env] WARN lane-exec: uv-env.sh not readable beside this helper (looked in %s) — this lane runs with NO cache/link-mode pin, so a venv it creates may be a full copy (#2159). Redeploy the harness.\n' "${_uvdir:-unresolved}" >> "$LOG"
+elif [ -z "$_uvbase" ]; then
+  printf '[uv-env] WARN lane-exec: neither CELL_HOME nor HOME is set, so there is no base to resolve a cache under — this lane runs with NO pin (uv own default). Not applying a root-level /.cache/uv.\n' >> "$LOG"
+else
+  # shellcheck source=/dev/null
+  . "$_uvdir/uv-env.sh" 2>/dev/null || true
+  if command -v uv_env_apply >/dev/null 2>&1; then
+    uv_env_apply "$_uvbase" 2>/dev/null || true
+    export UV_CACHE_DIR UV_LINK_MODE
+    printf '[uv-env] link_mode=%s cache_dir=%s defaulted=%s\n' "${UV_LINK_MODE:-<unset>}" "${UV_CACHE_DIR:-<unset>}" "${UV_ENV_DEFAULTED:-none}" >> "$LOG"
+  else
+    printf '[uv-env] WARN lane-exec: uv-env.sh is readable but defines no uv_env_apply (a truncated or version-skewed copy) — this lane runs with NO pin (#2159). Redeploy the harness.\n' >> "$LOG"
+  fi
+fi
+
 # ⛔ `exec` IS THE WHOLE POINT — do not wrap this in a function or a subshell, and do not background
 # it: either would introduce exactly the surviving wrapper this file exists to remove.
 # ⛔ `${arr[@]+"${arr[@]}"}` — bash 3.2 (the interpreter the launchd plist invokes) treats an EMPTY
