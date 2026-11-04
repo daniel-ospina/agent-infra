@@ -343,76 +343,41 @@ function selfdefault(nm, rhs,   m, head) {
   sub(/\}.*$/, "", m)
   return iscode(m) ? m : ""
 }
-# strip_comment(s) -> s with a trailing `#` comment removed, and ONLY a real one.
-# ⛔ A QUOTE-BLIND STRIP IS A FAIL-OPEN (review of `8af952e0`, P1 — measured). The first cut was
-# `sub(/[ \t]#.*$/, ...)`, which cuts at the first WHITESPACE-then-`#` with no quoting model — so a `#`
-# inside a QUOTED STRING truncated the line, and a genuine declaration AFTER it vanished: measured
-# through this predicate, `true && echo "a # b" && AGENT_NEW_GATE_REFUSED=83` gave 0 rows for the name
-# and RC=0 GREEN over a real duplicate of the skew code, while the same duplicate without the quoted
-# string was RED. That is the identical defect this scanner was rewritten to close (a declaration with
-# 0 rows), reintroduced by the arm written to stop a false red — so the strip has to know what a quote
-# is. bash's own rule, verified against the shell: a `#` begins a comment only when it begins a WORD
-# (line start, or an unquoted `[ \t;(]` before it) — `${X#*=}` (a name before it), `$#` and `echo a#b`
-# (no whitespace) are all NOT comments, and a `#` inside `"…"` or `'…'` is literal.
-# The word-start set is deliberately NARROWER than bash's: `)` is left out, because `x=(a)# hi` really
-# does NOT comment (measured) while `(echo a)# hi` does, and an ambiguous case must resolve to KEEPING
-# the text — over-keeping is a false RED (visible, and what the previous round complained about),
-# while over-stripping is a false GREEN (the fail-open this arm exists to prevent).
-# ⛔ THE QUOTE MODEL ALONE WAS STILL FAIL-OPEN (review of `f756d31b`, P1 — three measured shapes), because
-# it answered "is this `#` in a quote" from a WHOLE-PHYSICAL-LINE, quote-local state and knew nothing of
-# the constructs around it. Each shape below put a `#` that is NOT an outer comment on the same line as
-# (or the continuation line of) a real duplicate of the skew code, and the strip deleted the declaration:
-#   1. ANSI-C quoting `$'it\'s # here'` — `\'` IS an escape inside `$'…'`, so the quote closed early and
-#      the following ` #` was read as a comment. (In plain `'…'` nothing escapes, and that stays true.)
-#   2. a BACKTICK substitution — ``X=`printf %s 83 # c` `` — that `#` comments the INNER command only, and
-#      the outer line continues after the closing backtick.
-#   3. a quote OPENED on one line and CLOSED on the next — awk is line-based, so the continuation line's
-#      `#` looked unquoted. Measured through this predicate: all three gave 0 rows for the name and RC=0
-#      GREEN, while bash assigns 83 in every one (verified against the shell).
-# So the state is a STACK, carried ACROSS LINES per file (reset at FNR == 1) and nesting-aware, and a
-# `#` is stripped only in the OUTERMOST unquoted context — the only context where it really is this
-# line's comment. An unrecognised construct leaves text in place, which is the safe direction.
-SQ[0] = ""
-function strip_comment(s,   i, n, c, p) {
-  n = length(s)
-  for (i = 1; i <= n; i++) {
-    c = substr(s, i, 1)
-    if (SQ[SD] == "") {
-      if (c == "\\")  { i++; continue }                       # an unquoted backslash escapes the next char
-      if (c == "`")   { SD++; SQ[SD] = "bt";   continue }      # command substitution — a NESTED context
-      if (c == "\"")  { SD++; SQ[SD] = "dq";   continue }
-      if (c == "'")   { SD++; SQ[SD] = (((i > 1) && substr(s, i - 1, 1) == "$") ? "ansi" : "sq"); continue }
-      if (c == "#") {
-        p = (i == 1) ? "" : substr(s, i - 1, 1)
-        if (i == 1 || p ~ /[ \t;(]/) return substr(s, 1, i - 1)
-      }
-    } else if (SQ[SD] == "dq") {
-      if (c == "\\")  { i++; continue }                       # …and inside `"…"` it still does
-      if (c == "`")   { SD++; SQ[SD] = "bt"; continue }
-      if (c == "\"")  { if (SD > 0) SD--; continue }
-    } else if (SQ[SD] == "bt") {
-      if (c == "\\")  { i++; continue }
-      if (c == "`")   { if (SD > 0) SD--; continue }
-      # ⛔ A `#` INSIDE BACKTICKS IS NOT THIS LINE'S COMMENT. It comments the INNER command, and an
-      # inner comment runs to the end of the PHYSICAL LINE while the OUTER line carries on after the
-      # closing backtick — so stripping here would delete code that still runs. Measured: with the
-      # strip applied, a duplicate of 83 after such a backtick read GREEN with 0 rows while bash sets
-      # 83. Keeping the text is the fail-closed direction.
-    } else if (SQ[SD] == "sq") {
-      if (c == "'")   { if (SD > 0) SD--; continue }          # inside `'…'` NOTHING escapes…
-    } else if (SQ[SD] == "ansi") {
-      if (c == "\\")  { i++; continue }                       # …but `$'…'` (ANSI-C) DOES honour `\'`
-      if (c == "'")   { if (SD > 0) SD--; continue }
-    }
-  }
-  return s
-}
+# ⛔ THERE IS NO INLINE-COMMENT MODEL, AND THAT IS THE FIX — four attempts to write one each opened a
+# new FAIL-OPEN on the exact thing this scanner exists to catch (a duplicate gate code reading GREEN).
+# The history, each measured through this predicate, is the argument:
+#   1. `sub(/[ \t]#.*$/, ...)` — no quote model. A `#` inside `"…"` cut the line, and the declaration
+#      after it vanished: GREEN, 0 rows, over a real duplicate of the skew code.
+#   2. a per-line quote state — closed `$'it\'s'` at the escaped quote, took a BACKTICK's inner `#` as
+#      this line's comment, and forgot a quote opened on the previous line. Three shapes, all GREEN.
+#   3. a nesting-aware stack carried across lines, with no notion of a HEREDOC — and a heredoc body of
+#      prose (`it's a thing`) leaves the stack inside a quote for the REST OF THE FILE, so every later
+#      `#` reads as quoted and is stripped. Measured: `true && echo "a # b" && AGENT_NEW_GATE_REFUSED=83`
+#      appended to `fix-one.sh` read GREEN with 0 rows while bash assigns 83 — a regression on the head
+#      before it, and it also turned this file's own `true # …=83` control into a false RED in that file.
+#   4. the same stack plus heredocs — defeated by `$(…)`, which opens a NESTING quoting context: in
+#      `deploy-harness.sh:752` the `"` inside `$(sed -n 's/.*"payloadSha256"…')` closed and reopened the
+#      OUTER double quote, an odd count left the file in a bogus `sq`, and stripping silently switched
+#      itself off for the remaining 70 lines.
+# Each attempt was strictly harder than the last and each was defeated by the next construct down. That
+# is the signal: deciding "is this `#` a comment" requires a real bash parser, and a scanner that is
+# only PROBABLY right about comments is a scanner that can be made to lose a declaration.
+# SO NO TEXT IS DISCARDED. Whole-line comments (`^#`) are still skipped — bash never executes one, so
+# they cannot hide a declaration — and an INLINE `#` is simply scanned like any other text. An inline
+# comment that happens to name a family token therefore reads as an `unparseable`/foreign RED, which is
+# a FALSE RED and the one direction that is visible to a reader. It is the deliberate trade: refuse a
+# documented declaration rather than risk silently claiming nothing.
+# MEASURED before choosing it, not assumed: of the shipped tree's 1132 code lines carrying a word-start
+# `#`, ZERO have a family token in the comment tail — so this costs the real tree NOTHING, and the
+# real-tree scan is byte-identical (`claims=14`, `unparseable: none`, RC=0). A model would have bought
+# nothing it did not also risk.
+# This SUPERSEDES the earlier "an inline comment is documentation too" rule, which was added to silence
+# a false RED and is what produced fail-opens 1-4 above. A false RED is cheaper than a missed duplicate.
 function row(kind, name, v, f, ln) {
   if (iscode(v)) print kind, name, v + 0, f, ln
   else           print "unknown", name, v, f, ln
 }
 {
-  if (FNR == 1) { SD = 0; SQ[0] = "" }       # quote state is PER FILE, never carried between files
   if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
   f = basename(FILENAME)
   s = $0
@@ -430,18 +395,13 @@ function row(kind, name, v, f, ln) {
   # `printf -v` followed by a space is the same command as the glued form, so nothing else moves.
   scan = s
   gsub(/printf[ \t]+-v/, "printf -v ", scan)
-  # ⛔ AN INLINE COMMENT IS DOCUMENTATION TOO (review round 2, P2 — measured). Only WHOLE-LINE comments
-  # were skipped, so `true # AGENT_X_REFUSED=83` and `true # ${X:-81}` were REFUSED as
-  # `unparseable declaration: file:line` and as a stale default — false REDS produced by documentation,
-  # against the contract above ("A COMMENT line is documentation, not a declaration"). `valof` already
-  # treats `#` as a value terminator and this file's own `strip_comments` (`s/[[:space:]]#.*$//`) is the
-  # same rule, so the scan now applies it to the whole LINE. A `#` that is part of an expansion
-  # (`${X#*=}`, `${X##*/}`) has no whitespace before it and is untouched.
-  # ⛔ AND THE STRIP WAS QUOTE-BLIND, WHICH MADE IT A FAIL-OPEN (review of `8af952e0`, P1 — measured):
-  # `sub(/[ \t]#.*$/, ...)` cut at a `#` inside a QUOTED STRING, hiding a declaration after it. It is
-  # `strip_comment()` now, which tracks `"…"` / `'…'` and only removes a `#` at a word start. See its
-  # definition for the measurement and for why the word-start set is narrower than bash's.
-  scan = strip_comment(scan)
+  # ⛔ NO INLINE COMMENT IS STRIPPED — see the block above `row()` for the four measured fail-opens
+  # that each attempt to strip one produced. Discarding no text is what makes "nothing with an `=` can
+  # vanish" true by construction rather than by a model of bash that has to be right about `$'…'`,
+  # backticks, heredoc bodies, quotes spanning lines, and `$(…)` nesting — it was defeated by the
+  # fifth construct every time. The consequence, accepted deliberately: an inline comment naming a
+  # family token reads as a RED (a false red, the visible direction). Measured: 0 such lines exist in
+  # the shipped tree, so the real-tree scan is unchanged.
   # ⛔ THE NAMING CONVENTION IS ASSERTED, NOT ASSUMED (review of PR #3237, finding 1). The claim scan
   # below is anchored on the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED` namespace, so a gate code
   # declared under ANY OTHER NAME is invisible to it — measured: `AGENT_MEM_GATE=81`, a real duplicate
@@ -585,7 +545,22 @@ _codes_foreign_ok=""
 #        and this line is what makes it a declared alias instead of a second collision.
 _codes_sanctioned="78=BRIEF_GATE_UNAVAILABLE,PI_FORK_REFUSED 80=AGENT_BRIEF_REFUSED,BRIEF_GATE_REFUSED"
 
-refusal_codes() { awk -f "$TMP/refusal-codes.awk" "$1"/*.sh 2>/dev/null; }
+# ⛔ A FAILED SCAN IS NOT AN EMPTY ONE (review of `aab646c5`, P2 — measured). This was
+# `awk … 2>/dev/null`: awk's status was discarded and its diagnostics suppressed, so a file it could not
+# open (`chmod 000`, say) aborted the scan mid-list and the verdict came back `RC=0 claims=14
+# unparseable: none` — a CLEAN report over a population it had not read. The contract above is that an
+# unreadable declaration fails CLOSED; this is the same rule for an unreadable FILE. So the status is
+# checked and the diagnostic is left visible; a non-zero awk is an `unreadable` row that `codes_verdict`
+# reds on, never a quietly smaller scan.
+refusal_codes() {
+  _rc_out="$(awk -f "$TMP/refusal-codes.awk" "$1"/*.sh 2>"$TMP/refusal-codes.err")"
+  _rc_st=$?
+  if [ "$_rc_st" -ne 0 ]; then
+    printf 'unreadable\tawk\t(exit %s)\t%s\t0\n' \
+      "$_rc_st" "$(tr '\n\t' '  ' < "$TMP/refusal-codes.err" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-200)"
+  fi
+  printf '%s\n' "$_rc_out"
+}
 
 # codes_for_name <NAME> — the code a claim declares, or EMPTY when nothing here declares that name.
 # EMPTY therefore means "forward-declared", never "I could not read it": an unreadable declaration is
@@ -604,6 +579,15 @@ codes_verdict() {
     printf '%s\n' "$_cv_claims" | awk -F'\t' -v f="$_cv_f" '$4==f{n++} END{exit !(n>0)}' \
       || _cv_absent="$_cv_absent $_cv_f(declares no code)"
   done
+  # ⛔ A SCAN THAT COULD NOT RUN IS NOT A CLEAN SCAN (review of `aab646c5`, P2 — measured). `refusal_codes`
+  # reports a non-zero awk as an `unreadable` row; without this reader that row was simply ignored and the
+  # verdict came back GREEN over a population it had not read (`chmod 000` on a file sorting last was
+  # measured to do exactly that). Same rule as an unreadable declaration: fail CLOSED, and name it.
+  # ONE item, taken whole: the diagnostic is prose with spaces, so a `for` over it would word-split the
+  # message into one "scan-unreadable:" per word (measured on the first cut).
+  _cv_unread=""
+  _cv_ur="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unreadable"{print $3" "$4; exit}')"
+  [ -n "$_cv_ur" ] && _cv_unread=" scan-unreadable:$_cv_ur"
   _cv_unknown=""
   for _cv_u in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unknown"{print $4":"$2}' | sort -u); do
     case " $_codes_noncode " in *" $_cv_u "*) : ;; *) _cv_unknown="$_cv_unknown $_cv_u" ;; esac
@@ -667,13 +651,13 @@ codes_verdict() {
                   decl[$2] = $3 }
   ' | sort | tr '\n' ' ')"
   _cv_conf="${_cv_conf% }"
-  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale$_cv_foreign$_cv_conf" ] \
+  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale$_cv_foreign$_cv_conf$_cv_unread" ] \
      || [ "$_cv_shared" != "$_codes_sanctioned" ] || [ "$_cv_n" -eq 0 ]; then
     CODE_RC=1
   else
     CODE_RC=0
   fi
-  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale}${_cv_foreign:+ foreign:$_cv_foreign}${_cv_conf:+ conflicting-declarations: $_cv_conf} shared:${_cv_shared:- none}"
+  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none}${_cv_unread:+ $_cv_unread} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale}${_cv_foreign:+ foreign:$_cv_foreign}${_cv_conf:+ conflicting-declarations: $_cv_conf} shared:${_cv_shared:- none}"
 }
 
 # Computed here so every reader below shares ONE parse: the chain gate table, the coverage verdict,
@@ -2599,16 +2583,29 @@ ck "the scanner CLASSIFIES all $_resid_n RESIDUAL declaration shapes (array subs
 [ -z "${_resid_unred// /}" ]; rc=$?
 ck "...and EVERY one of them REDDENS the code check as a NAMED collision or 'unparseable declaration: file:line' — a shape that vanishes again fails HERE (green:${_resid_unred:- none})" $rc
 # (f1c) THE ANTIDOTE — a guard that reddens everything detects NOTHING, and every arm above would then
-# pass for the wrong reason. These lines are token-bearing or declaration-SHAPED and declare no code,
-# and TWO of them were FALSE REDS on the reviewed head (`be1`/`f2` fixes above): an element COMPARISON
-# was red when unquoted and silent when quoted (punctuation deciding a verdict), and an INLINE COMMENT
-# carrying a declaration was refused with `unparseable declaration: file:line`. A `#` inside an
-# expansion (`${X#*=}`) must survive the comment strip, which row 3 pins.
+# pass for the wrong reason. These lines are token-bearing or declaration-SHAPED and declare no code: an
+# element COMPARISON (which was red when unquoted and silent when quoted — punctuation deciding a
+# verdict), a `${X#*=}` strip, and a bare `exit "$X"`.
 _codemut_dir="$(_codemut residual-control)"
-printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\ntrue # AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
-ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip, a bare exit \"\$X\" and an INLINE COMMENT carrying a declaration all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
+ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip and a bare exit \"\$X\" all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1c2) ⛔ AN INLINE COMMENT NAMING A FAMILY TOKEN IS NOW REFUSED, AND THAT IS DELIBERATE. This is the
+# arm that stops the strip from coming back. Four attempts to model "is this `#` a comment" each failed
+# OPEN (see the block above `row()`), so no text is discarded any more — and the price is that a
+# commented-out declaration reads as a RED instead of being silently ignored. It is the visible
+# direction, and it costs the shipped tree nothing: measured, ZERO of its 1132 inline comments name a
+# family token. A future "helpful" re-introduction of the strip fails HERE, by name.
+_codemut_dir="$(_codemut inline-comment-decl)"
+printf '\ntrue # AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+# An `unparseable` row is named `unparseable declaration: <file>:<line>` (the contract's own form), not by
+# constant — assert THAT, since a red for some other reason would not prove this line was the one read.
+case "$CODE_MSG" in *"rejected: unparseable declaration: spawn-gate.sh:"*) rc=0 ;; *) rc=1 ;; esac
+[ "$CODE_RC" -eq 1 ] || rc=1
+ck "(no comment model) an INLINE COMMENT carrying a declaration is REFUSED as an unparseable declaration, not silently ignored — the deliberate cost of discarding no text at all (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f1d) ⛔ THE COMMENT STRIP MUST KNOW WHAT A QUOTE IS (review of `8af952e0`, P1 — measured). The strip
 # was `sub(/[ \t]#.*$/, ...)`, a first-whitespace-then-`#` cut with NO quoting model — so a `#` inside a
@@ -2625,10 +2622,10 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
 ck "(quote-blind comment) a declaration AFTER a quoted \`#\` is still READ and collides — a strip that cuts at the quoted \`#\` reads this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
 _codemut_dir="$(_codemut comment-quote-control)"
-printf "\necho \"a # b\"\necho 'a # b'\ntrue # AGENT_NEW_GATE_REFUSED=83\n" >> "$_codemut_dir/spawn-gate.sh"
+printf "\necho \"a # b\"\necho 'a # b'\n" >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
-ck "(quote-aware comment control) a \`#\` inside \"…\" or '…', and a real trailing comment on \`true\`, stay SILENT — the other direction of the same arm (rc=$CODE_RC; $CODE_MSG)" $rc
+ck "(quoted-# control) a \`#\` inside \"…\" or '…' that names no family token stays SILENT — the other direction of the same arm (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f1e) ⛔ A LONGER IDENTIFIER IS NOT A FAMILY TOKEN (review of `8af952e0`, P2 — measured). The claim
 # scan matches a PREFIX of the identifier and had no name boundary after the suffix, so
@@ -2647,16 +2644,15 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
 ck "(name boundary, other direction) a real declaration AFTER a longer identifier on the same line is still READ and collides — stepping over the identifier must not stop the scan (rc=$CODE_RC; $CODE_MSG)" $rc
 
-# (f1f) ⛔ THE COMMENT STRIP STILL FAILED OPEN ON THREE CONSTRUCTS (review of `f756d31b`, P1 — each
-# measured through this predicate and confirmed against the shell). A quote-local, whole-line state knew
-# nothing of the construct AROUND the `#`, so in every row below a real duplicate of 83 read GREEN with 0
-# rows while bash assigns 83:
-#   1. ANSI-C quoting `$'\''…'` — `\'` IS an escape inside `$'…'`, so the quote closed early;
-#   2. a BACKTICK substitution — a `#` in it comments the INNER command only, and the outer line continues
-#      after the closing backtick;
+# (f1f) ⛔ THESE THREE CONSTRUCTS EACH DEFEATED A SUCCESSIVE ATTEMPT AT A COMMENT MODEL (review of
+# `f756d31b` and `aab646c5`, P1 — each measured through this predicate and confirmed against the shell).
+# In every row a real duplicate of 83 read GREEN with 0 rows while bash assigns 83:
+#   1. ANSI-C quoting `$'…\'…'` — `\'` IS an escape inside `$'…'`, so a quote-local model closed early;
+#   2. a BACKTICK substitution — a `#` in it comments the INNER command only, and the outer line goes on;
 #   3. a quote OPENED on one line and CLOSED on the next — awk is line-based.
-# The strip is now a nesting-aware STACK carried across lines per file, and a `#` is removed only in the
-# outermost unquoted context. Three DRIVEN arms, one per construct — a regression in any one fails here.
+# There is no comment model any more (see the block above `row()`), so all three are READ for the trivial
+# reason that nothing is discarded. They stay as arms because they are the regression test FOR that
+# decision: re-introducing any strip that can lose text turns one of them GREEN and fails here.
 _codemut_dir="$(_codemut comment-ansi-c)"
 # A quoted heredoc, so the fixture is the LITERAL line bash would run — no printf escaping to get wrong.
 cat >> "$_codemut_dir/spawn-gate.sh" <<'PR_ANSI_C_ARM'
@@ -2675,6 +2671,19 @@ printf 'echo "usage: x\nb # c" && AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
 ck "(quote model: across lines) a declaration after a quote CLOSED on that line, when the quote was OPENED on the previous one, is still READ — awk is line-based, so per-line state read this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1g) ⛔ A SCAN THAT COULD NOT RUN IS NOT A CLEAN SCAN (review of `aab646c5`, P2 — measured). The
+# scan was `awk … 2>/dev/null` with its status discarded, so a file awk could not open aborted the scan
+# mid-list and the verdict came back `RC=0 claims=14 unparseable: none` — a CLEAN report over a
+# population it had not read. Pointed at a directory that does not exist, the glob does not expand, awk
+# fails, and the verdict must be a RED that NAMES the failure rather than an empty-claim red that says
+# nothing about the scan. (Root-proof: no chmod involved, which a root CI runner would defeat.)
+_codemut_dir="$TMP/no-such-scan-dir"
+rm -rf "$_codemut_dir"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"scan-unreadable:"*) rc=0 ;; *) rc=1 ;; esac
+[ "$CODE_RC" -eq 1 ] || rc=1
+ck "(scan integrity) a scan that could NOT run reports \`scan-unreadable\` and reds — it must never read as a clean, quietly smaller scan (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f) THE FAIL-CLOSED HALF: an assignment OPERATOR on a family token that is NOT in a declaration
 # position cannot be classified, so it must be RED and NAMED WITH ITS LINE — never dropped. This is the
