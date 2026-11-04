@@ -279,10 +279,11 @@ reporting healthy. `scripts/disk-reaper-run.sh` had zero coverage of `gh-runner`
 was unmeasurable by construction. Shipped as `class=runner-work` + `scripts/reap-runner-work.sh`
 (owner), with the mtime gate and the whole runner `_work` namespace (`_temp`, `_actions`, `_tool`,
 `_update`) retained from one declared table, a root whose listing cannot be read counted as an
-abstention rather than a measured zero (and a PARTLY-unreadable population as `census=partial`, never
-`verdict=ok`), and a cut-short dry sweep publishing no partial candidate
+abstention rather than a measured zero (a PARTLY-unreadable population as `census=partial`, never
+`verdict=ok`; an entry that vanishes mid-pass as `gone=`, never as doubt), and a cut-short dry sweep
+publishing no partial candidate
 count; its suite fails against the
-pre-change tree (20 passed / 27 failed, 1 skipped, measured at this head) and kills all 29 of its mutants
+pre-change tree (21 passed / 28 failed, 1 skipped, measured at this head) and kills all 30 of its mutants
 (`scripts/disk-reaper-runner-work.test.sh`).
 
 ### G9 — the stale `/tmp` sink (filed as **#3043**, deliberately NOT fixed with G8)

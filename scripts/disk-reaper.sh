@@ -2431,20 +2431,27 @@ reap_runner_work() {
     # initialised 0. The owner prints the SUMMARY in BOTH modes, so an ARMED pass answers a real count
     # instead of the structural 0 the worktree arm had to fix (#4529).
     # ⛔ A CENSUS THE OWNER COULD NOT TAKE IS `abstained`, AND IT MUST NOT LAND AS A MEASURED ZERO. The
-    # owner's `unmeasurable=` says how many entries/roots it could not read; when that is the WHOLE
-    # population it publishes `census=abstained` instead of `census=ok`, and NOTHING here may turn that
-    # into `candidates_runner_work=0 verdict_runner_work=ok` — the false PASS a review measured at this
-    # head (a mode-0111 `_work`: {ok=1, candidates=0, unmeasurable=1, verdict=ok}, dead entry survived).
+    # owner's `unmeasurable=` says how many entries/roots it could not read; when NOTHING was reached the
+    # owner publishes `census=abstained`, and NOTHING here may turn that into
+    # `candidates_runner_work=0 verdict_runner_work=ok` — the false PASS a review measured at this head
+    # (a mode-0111 `_work`: {ok=1, candidates=0, unmeasurable=1, verdict=ok}, dead entry survived).
     # The count stays UNKNOWN (`HAVE_RW_CAND=0` ⇒ `candidates_runner_work=?`) and the verdict is the
     # distinct token, so no reader keying on `ok` inherits a lie. rc stays 0: the owner abstained, it did
     # not fail, and turning a permission mismatch into an hourly red trains operators to ignore the unit.
+    # ⛔ THE NOTE NAMES WHAT THE OWNER REPORTED, NEVER A CAUSE IT CANNOT KNOW. An abstention is reached by
+    # TWO paths — an unlistable ROOT and an unreadable ENTRY — and the earlier wording asserted the first
+    # ("a matched _work root could not be listed") for both: MEASURED on a fully listable root whose only
+    # entry held a mode-0000 subtree (`roots=1 … census=abstained`), the record named a root permission
+    # problem that did not exist and pointed the operator at the wrong remedy. The remedy differs per
+    # path, so the note does not guess: it states the tally and says the count is unknown.
     if [ "$_rw_census" = "abstained" ]; then
-        log_line "disk-reaper: ⚠️  class=runner-work ABSTAINED — nothing under a matched _work root could be READ, so the owner's candidates=0 is an ABSTENTION, not a measurement (the entries were KEPT)"
-        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: a matched _work root could not be listed, so no entry was classified and the candidate count is UNKNOWN, not 0"
+        log_line "disk-reaper: ⚠️  class=runner-work ABSTAINED — nothing under a matched _work root could be CLASSIFIED (${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read), so the owner's candidates=0 is an ABSTENTION, not a measurement (the entries were KEPT)"
+        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read and nothing was classified, so the candidate count is UNKNOWN, not 0"
         RW_ABSTAINED=1
     fi
     # ⛔ A PARTLY-UNREADABLE POPULATION IS STILL AN ABSTENTION, ONE STATE OVER. `census=abstained` only
-    # covers the case where NOTHING was measured (`candidates=0`), so a pass that read one root and could
+    # covers the case where NOTHING was reached (`kept`/`retained`/`reaped`/`failed`/`gone` all zero, so no
+    # entry was classified), which is why a pass that read one root and could
     # not read another published `census=ok` and landed as `verdict_runner_work=ok` — MEASURED on two
     # roots (one readable with a dead entry, one mode 0111): `candidates=1 unmeasurable=1 census=ok`, so
     # the unread root's dead checkouts were invisible to the one field an operator reads. The count that
@@ -2478,12 +2485,19 @@ reap_runner_work() {
         case "; ${NOTE_RW:-};" in *"; $_rw_why;"*) : ;; *) NOTE_RW="${NOTE_RW}${NOTE_RW:+; }$_rw_why" ;; esac
     fi
     VERDICT_RW="$(class_verdict "$RC_RW")"
-    # ⛔ THE ABSTENTION IS A VERDICT, NOT A FOOTNOTE. `class_verdict 0` is `ok`, which is the one word
-    # this state must never publish; set AFTER the mapping so the two cannot drift apart.
-    [ "$RW_ABSTAINED" = 1 ] && VERDICT_RW="abstained"
-    # Same rule one state over: a PARTIAL census is not `ok` either. Set after the mapping for the same
-    # reason, and it can never collide with the abstention above (the owner publishes exactly one token).
-    [ "$RW_PARTIAL" = 1 ] && VERDICT_RW="partial"
+    # ⛔ THE CENSUS TOKEN NEVER OUTRANKS A REAL FAILURE. `removal-failed` (rc 4) and `fail-closed` (rc 3)
+    # CO-OCCUR with `census=partial` — one unreadable entry plus one removal that FAILED is exactly the
+    # state that produces both — and the earlier unconditional override replaced the failure with
+    # `partial`, which both readers then print under the benign ⚠️ symbol. MEASURED (one entry whose child
+    # is mode 0000, one whose child is mode 0555): rc=4, `verdict=partial`, and `removal-failed` survived
+    # only in `detail=`. `abstained` cannot collide (its owner exits 0), but the guard is written for the
+    # whole class of census tokens so a third one cannot reintroduce it: a verdict is replaced ONLY when
+    # the pass itself has nothing worse to say.
+    case "$VERDICT_RW" in
+        ok)
+            [ "$RW_ABSTAINED" = 1 ] && VERDICT_RW="abstained"
+            [ "$RW_PARTIAL" = 1 ] && VERDICT_RW="partial" ;;
+    esac
     DF_RW_OK="$MEASURED"; RAW_RW="$raw"
     if is_dry; then FREED_RW=0; else FREED_RW="$freed"; fi
     # The owner's `candidates=` is the count; the `REAP` rows carry the BYTES, so they are scanned for the
