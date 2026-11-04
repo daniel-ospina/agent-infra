@@ -1916,6 +1916,22 @@ cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
 # instead of the 71 this arm asserts (measured: 247 passed / 1 failed, the failure being this arm).
 # The subject here is the CAPABILITY resolver, so the validator that gates it must travel with the rig.
 cp "$HERE/brief-gate.sh" "$RES/brief-gate.sh"
+# ⛔ AND A CREDENTIAL, BECAUSE THE PROBE REFUSES BEFORE IT MEASURES WITHOUT ONE (#3237). This is the
+# ONLY arm that runs the REAL `cell-lane-preflight.sh`, and that helper gates on the provider key
+# BEFORE it spawns `pi` (`why=keys-unreadable`, exit 2 → the caller's 71). Every other arm presets
+# `CELL_PREFLIGHT_SH` with a canned verdict line, so this rig inherited its key from the HOST: a
+# developer box carries `DEEPSEEK_API_KEY` or `$CELL_HOME/keys.env`, a CI runner carries neither — so
+# the arm read the box's credential INVENTORY instead of the resolver, reddened every PR with `rc=71`
+# and NO `why=no-return` (the arm's own assertion), and the probe it exists to prove never ran.
+# Measured 2026-11-04 on run 41812409320 / job 126514662405: `(rc=71)`, red. Reproduced locally by
+# unsetting CELL_HOME and DEEPSEEK_API_KEY: `LANE_CAPABILITY=refused why=keys-unreadable path=<none>`.
+# The subject is still the CAPABILITY resolver, so the credential that gates it travels with the rig
+# for the same reason the validator above does — and the ambient copies are DROPPED for the same
+# reason `unset -f pi` below drops the suite's stub: a key that wins from the host puts the host back
+# into the measurement. The two names are the shipped default's leg (`provider=deepseek model=
+# deepseek-flash`) and the documented cold-class leg (`docs/providers.md` §8); a THIRD leg becoming
+# the default reddens this arm loudly instead of letting it pass for a box's sake.
+printf 'DEEPSEEK_API_KEY=sk-rig-not-a-credential\nVENICE_API_KEY=sk-rig-not-a-credential\n' > "$RES/keys.env"
 cat > "$RES/bin/pi" <<'PIHANG'
 #!/bin/sh
 case "$1" in --version) echo 9.9.9-stub; exit 0 ;; esac
@@ -1923,8 +1939,9 @@ sleep 600
 PIHANG
 chmod +x "$RES/bin/pi"
 : > "$LOG"
-env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
-  LANE_PREFLIGHT_BOUND=2 \
+env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND -u CELL_HOME -u DEEPSEEK_API_KEY -u VENICE_API_KEY \
+  PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
+  LANE_PREFLIGHT_BOUND=2 LANE_PREFLIGHT_KEYS="$RES/keys.env" \
   bash -c '
     . "$1"
     LOG="$2"; PROMPT="$3"
