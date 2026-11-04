@@ -9,8 +9,16 @@
 #
 # ⛔ DURABLE RULE — WHAT MAKES A WORKTREE "FINISHED" (do not re-derive this)
 # -------------------------------------------------------------------------
-# A worktree is FINISHED — and therefore reclaimable regardless of its age —
-# only on EVIDENCE, never on a name and never on a clock:
+# ⛔ THE BINDING STANDARD IS *COMMITS SURVIVE*, NOT "MERGED" AND NOT "PUSHED"
+# (#1095 §2/§9.8, re-decided by #2756 on 2026-10-24). A checkout may be removed
+# when deleting it cannot destroy work; the row must NAME the mechanism that
+# keeps the commits alive (`refs=merged` / `refs=branch-retained:<b>` /
+# `refs=reachable-from:<ref>` / `proof=pr-merged`). #1095 §2 states the rejected
+# alternative explicitly: a stricter survival test on the named-branch path
+# "would leave the 48-row class permanently unreclaimable".
+#
+# A worktree is FINISHED — and therefore reclaimable regardless of its age — only
+# on EVIDENCE, never on a name and never on a clock:
 #
 #   1. MERGED       its HEAD is an ancestor of the base (`git merge-base
 #                   --is-ancestor <head> <main>`, the same question as
@@ -28,28 +36,30 @@
 #                   on HEAD exists on no remote ref. This catches the one shape
 #                   merged-ness cannot: a checkout whose branch already landed
 #                   but which carries a further LOCAL commit on top.
-#                   ⛔ SCOPED TO THE REF-ONLY PATHS (rules 5/6 fall-through and
-#                   the aged tail), NOT to rule 3 (ancestor of main) or rule 4
-#                   (a MERGED PR naming this exact sha). Those two carry a
-#                   STRONGER survival proof than any ref we could name, and
-#                   `--not --remotes` is read against the SURVIVING remote refs:
+#                   ⛔ REPORTED, NOT BINDING (a reviewed P0, #2541 cycle 2 at
+#                   `8d7f1bc1`). It is printed as `unpushed=<n>` on the row that
+#                   decides an aged removal. It must NEVER veto one:
+#                   `--not --remotes` reads the SURVIVING remote-tracking refs, and
 #                   the routine squash merge deletes the remote branch, so after
-#                   `git fetch --prune` a fully landed checkout reads as
-#                   "1 unpushed commit". Vetoing rule 3/4 with this probe freezes
-#                   the whole merged class and misdiagnoses it (a reviewed P0,
-#                   #2541 cycle 2 at `8d7f1bc1`). The placement block in
-#                   classify_one states the same thing next to the code.
+#                   `git fetch --prune` a fully landed checkout reads as "1 unpushed
+#                   commit". As a veto it would freeze the whole named-branch class
+#                   — the class #1095 removed 48 of and #2756 pins as reclaimable
+#                   (G14i/G14j). An unreadable probe prints `unpushed=?`, never 0.
 #   4. NO STASH     the repo-global stash register names no entry for the
 #                   branch. Read as a REGISTER (one bounded read per pass),
 #                   never with `git stash` — see the lane-stash rule below.
+#                   ⛔ ALSO EVIDENCE, NOT A VETO, for the same reason: refs/stash
+#                   is repo-global and `git worktree remove` never touches it, so
+#                   the parked work survives the checkout. Printed as
+#                   `stash-held=<ref>` / `stash=?` on the same row.
 # plus the two standing vetoes: no live process holds the path, and the branch is
 # not an open PR head / live claim.
 #
 # Anything ambiguous is KEPT and the reason is NAMED. An aged-but-unmerged named
 # branch stays reclaimable (its commits survive on the branch ref — `git
 # worktree remove` deletes the CHECKOUT, never a ref), which is the measured
-# #1095 class; gate 2 applies to every path, and gates 3-4 apply to exactly the
-# paths that keep nothing but a ref — which is that class and not the merged one.
+# #1095 class; gates 3-4 add the two facts an operator needs to judge it
+# (`unpushed=`, `stash-held=`) without overriding that decision.
 #
 # ⛔ TWO THINGS THIS TOOL MUST NEVER DO
 #   1. NEVER touch a PRIMARY checkout — not the main worktree, not a bare repo,
@@ -284,8 +294,9 @@
 #   dirty | ignored-artifact | status-timeout | status-error > unreadable-head >
 #   open-pr > remote-only-ref | revocable-ref >
 #   rule 3 (merged) | rule 4 (PR-merged) | rule 5 (PR-closed) | rule 6 (no-PR) >
-#   detached-unreachable > unpushed-unverifiable | unpushed-commits >
-#   stranded-stash > too-recent > too-young > reclaimable
+#   detached-unreachable > too-recent > too-young > reclaimable
+#   (`unpushed=`/`stash-held=` are EVIDENCE printed on the tail rows, never a
+#   gate — see the DURABLE RULE above)
 #
 # PRESERVE reasons and why each one is not a bug:
 #   main-checkout          the shared checkout
@@ -323,11 +334,6 @@
 #                          refuse to delete
 #   status-*               the clean gate could not be evaluated => fail-closed
 #   open-pr                an open PR head branch
-#   unpushed-commits       HEAD carries >=1 commit reachable from no remote ref
-#                          — the one shape merged-ness cannot see
-#   unpushed-unverifiable  the unpushed probe could not be read => fail-closed
-#   stranded-stash         the stash register names an entry for this branch —
-#                          the lane may still have work parked for it
 #   too-recent             not older than the floor IN FORCE: --aged-days, or
 #                          REAP_WT_MERGED_AGE_DAYS for a merged / patch-equivalent /
 #                          PR-merged head, capped by REAP_WT_SCRATCH_AGE_DAYS for a
@@ -406,6 +412,14 @@ REAP_WT_BUDGET_SECONDS="${REAP_WT_BUDGET_SECONDS:-300}"
 # and restores strict `git worktree list` order. A caller whose assertion depends
 # on WHICH row the budget defers (the A7/A15 budget fixtures) pins 0.
 REAP_WT_ROTATE="${REAP_WT_ROTATE:-1}"
+# The rotation cursor, initialised HERE (not only in run()) because the footer and
+# the EXIT trap can be reached on a path that never got as far as the pass body —
+# under `set -u` an unset read is a crash, and a crash in the footer loses the
+# pass record. `WT_OFFSET` is the offset this pass STARTED at (the cursor), which
+# is what makes "did rotation run, and where is it now?" answerable.
+WT_OFFSET=""
+WT_ORDER=""
+OFFSET_FILE=""
 REAP_WT_LOCK_STALE_SECONDS="${REAP_WT_LOCK_STALE_SECONDS:-1800}"
 # The bound on ONE batched `gh pr list --state all` read (the whole pass). It must
 # exceed the LARGEST repo's total PR count, or the truncation refusal below fires on
@@ -1845,52 +1859,54 @@ classify_one() {
         return 0
     fi
 
-    # ── GATES 3 and 4 of the DURABLE RULE (#2541) — the survival proof for the
-    # paths whose ONLY mechanism is a ref we can name.
+    # ── THE EVIDENCE THIS PATH OWES THE OPERATOR (#2541 RESOLVED, #1095 §2/§9.8)
     #
-    # ⛔ PLACEMENT IS THE WHOLE CONTRACT, and it is why these sit HERE rather than
-    # before the removal rules. Rules 3 and 4 carry a survival proof that is
-    # STRONGER than a local branch ref:
-    #   * rule 3 — every commit on HEAD is contained in MAIN_REF, so no commit can
-    #     be lost whatever happens to a ref;
-    #   * rule 4 — a MERGED PR whose headRefOid IS this commit: GitHub durably
-    #     holds that sha (`pr_oid = "$sha"` is the whole warrant).
-    # Running gate 3 BEFORE them re-breaks a reviewed P0 (#2541 review cycle 2,
-    # `8d7f1bc1`): `rev-list --count HEAD --not --remotes` compares HEAD against the
-    # SURVIVING remote-tracking refs, and the routine squash merge deletes the
-    # remote branch, so after `git fetch --prune` a fully landed checkout reads as
-    # "1 unpushed commit" and the entire merged/squash class — the class this pass
-    # exists to reclaim — is frozen forever, misdiagnosed as unpushed work.
-    # Everything below this line removes on branch retention alone, so this is
-    # exactly where "did the work ever leave this machine?" is still the deciding
-    # evidence. An ambiguous reading preserves; nothing here is a vote.
-    local unp
-    if ! unp="$(unpushed_ahead "$path")"; then
-        printf 'preserve\tunpushed-unverifiable\t\trule=P proof=rev-list --count HEAD --not --remotes:unreadable — abstaining (a probe we cannot read is not a count of 0)\n'; return 0
-    fi
-    if [ "$unp" != 0 ]; then
-        printf 'preserve\tunpushed-commits\t\trule=P proof=rev-list --count HEAD --not --remotes=%s — %s commit(s) on HEAD exist on no remote ref (the work never left this machine; branch retention is the only copy)\n' "$unp" "$unp"; return 0
-    fi
+    # ⛔ THESE TWO PROBES DECIDE NOTHING, and that is a RECORDED DECISION, not an
+    # oversight. They used to VETO ("preserve on unpushed / on a stranded stash").
+    # They cannot, on this code: #1095 §9.8 records that the binding gate is
+    # *commits survive* — not "merged", and not "pushed" — and §2 states the
+    # alternative reading (a stricter survival test on the named-branch path)
+    # "would leave the 48-row class permanently unreclaimable", which is exactly
+    # what `rev-list --count HEAD --not --remotes != 0` does: it is true of every
+    # branch that was never pushed, and of every branch whose remote-tracking ref
+    # `git fetch --prune` removed after a squash merge. #2756 then decided this
+    # seam again (2026-10-24, AFTER this branch's gates were written) by REPLACING
+    # "is it pushed?" with PR state + ancestry + a 45-minute floor, and it pins
+    # the outcome: "an aged no-PR checkout is still reclaimed by the #1095 aged
+    # rule" (G14i/G14j). A veto here reverses that, so the evidence stays and the
+    # veto goes — with the two facts printed on the row that decides the removal.
+    #
+    # ⛔ PLACEMENT: here, after rules 3-6 and the detached check, so it lands on
+    # the paths whose survival mechanism is a REF we can name. Rules 3/4 name a
+    # stronger proof in their own row (`refs=merged` / `proof=pr-merged`), and
+    # putting a pushedness probe in front of them is the reviewed P0 of #2541
+    # cycle 2 (`8d7f1bc1`). An UNREADABLE probe is printed as `unpushed=?` —
+    # never as 0, which would be a false PASS dressed as evidence.
+    local unp stash_ev
+    unp="$(unpushed_ahead "$path")" || unp="?"
+    stash_ev=""
     case "$STASH_STATE" in
-        unreadable)
-            printf 'preserve\tstranded-stash\t\trule=P proof=git-log -g refs/stash:unreadable — abstaining (a register we cannot read is not a clear register)\n'; return 0 ;;
+        unreadable) stash_ev="stash=?" ;;
+        *) if detail="$(stranded_stash_for "$branch")"; then stash_ev="stash-held=${detail%%$'\t'*}"; fi ;;
     esac
-    if detail="$(stranded_stash_for "$branch")"; then
-        printf 'preserve\tstranded-stash\t\trule=P proof=refs/stash holds work for branch %s: %s\n' "${branch#refs/heads/}" "$detail"; return 0
-    fi
 
     # ── the age floor in force (already merged / patch-equivalent / scratch aware)
     if [ "$age_floor" -gt 0 ] && [ "$age_s" -le "$((age_floor * 86400))" ]; then
-        printf 'preserve\ttoo-recent\t\trule=P proof=age:%sd≤%sd(witness=%s) refs=%s\n' "$((age_s / 86400))" "$age_floor" "$wname" "$refs"
+        printf 'preserve\ttoo-recent\t\trule=P proof=age:%sd≤%sd(witness=%s) refs=%s unpushed=%s %s\n' "$((age_s / 86400))" "$age_floor" "$wname" "$refs" "$unp" "$stash_ev"
         return 0
     fi
     if [ "$young" = 1 ]; then
-        printf 'preserve\ttoo-young\t\trule=7 proof=age:%sm<%sm(witness=%s)\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname"
+        printf 'preserve\ttoo-young\t\trule=7 proof=age:%sm<%sm(witness=%s) unpushed=%s %s\n' "$((age_s / 60))" "$REAP_WT_MIN_AGE_MINUTES" "$wname" "$unp" "$stash_ev"
         return 0
     fi
 
-    printf 'remove\treclaimable\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm clean=disposable-only unref=%s,no-open-pr\n' \
-        "$eph" "$aged_note" "$refs" "$((age_s / 60))" "${stale_txt:-no-proc}"
+    # `unpushed=` is the count of commits on HEAD reachable from NO remote ref, and
+    # `stash-held=<ref>` says the repo-global stash register holds work for this
+    # branch. Both are EVIDENCE on this row, deliberately not vetoes — see the block
+    # above. The removal below takes the CHECKOUT only: `git worktree remove` never
+    # deletes a ref, so the branch (and refs/stash) still hold the work afterwards.
+    printf 'remove\treclaimable\t%s\trule=P proof=aged-floor(clean,holder-free,no-open-pr)%s refs=%s age=%sm unpushed=%s %s clean=disposable-only unref=%s,no-open-pr\n' \
+        "$eph" "$aged_note" "$refs" "$((age_s / 60))" "$unp" "$stash_ev" "${stale_txt:-no-proc}"
     return 0
 }
 
@@ -2003,7 +2019,7 @@ report_row() { # <verdict> <path> <reason> <detail>
 }
 
 print_footer() {
-    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED"
+    log "MODE=$MODE NOW=$1 AGED_DAYS=$REAP_WT_AGED_DAYS MIN_AGE_MINUTES=$REAP_WT_MIN_AGE_MINUTES WORKTREES=$WT_TOTAL ROTATE=$REAP_WT_ROTATE OFFSET=${WT_OFFSET:-?} REMOVE=$REMOVE_C PRESERVE=$PRESERVE_C REMOVED=$REMOVED FAILED=$FAILED LATE_PRESERVE=$LATE_PRESERVE DEFERRED=$DEFERRED GH=$GH_STATE CWD_PROBE=$([ "$CWD_DEGRADED" = 1 ] && printf degraded || printf ok) PRUNE_BLOCKED=$PRUNE_BLOCKED"
 }
 
 # ── main ───────────────────────────────────────────────────────────────

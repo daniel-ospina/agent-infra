@@ -531,8 +531,12 @@ import sys
 src, name, out = sys.argv[1:4]
 ANCHORS = {
     # (b): drop the UNCOMMITTED-FILES check, leaving the dirty row as "clean".
+    # THIS ANCHOR MUST CARRY the `rule=2 proof=` TEXT that #2756 added. When it
+    # drifted, the anchor matched 0 times here and the WHOLE M1 arm failed for the
+    # wrong reason — chmod on a file python never wrote — which reads as a reaper
+    # defect instead of a stale test anchor.
     "no-clean-gate": (
-        "        dirty)            printf \x27preserve\\tdirty\\t\\t%s\\n\x27 \"$cpay\"; return 0 ;;",
+        "        dirty)            printf \x27preserve\\tdirty\\t\\trule=2 proof=git-status --porcelain %s\\n\x27 \"$cpay\"; return 0 ;;",
         "        dirty)            eph=\"$cpay\" ;;   # MUTANT: clean gate dropped",
     ),
     # (c): drop the ANCESTRY requirement, so every branch gets the merged
@@ -540,16 +544,6 @@ ANCHORS = {
     "no-ancestry-gate": (
         "        [ \"$rc\" = 0 ] && merged=1",
         "        merged=1   # MUTANT: the ancestry requirement is dropped",
-    ),
-    # gate 3: drop the UNPUSHED-COMMIT check.
-    "no-unpushed-gate": (
-        "    if [ \"$unp\" != 0 ]; then",
-        "    if false; then   # MUTANT: gate 3 dropped",
-    ),
-    # gate 4: drop the STRANDED-STASH check.
-    "no-stash-gate": (
-        "    if detail=\"$(stranded_stash_for \"$branch\")\"; then",
-        "    if false && detail=\"$(stranded_stash_for \"$branch\")\"; then   # MUTANT: gate 4 dropped",
     ),
 }
 s = open(src).read()
@@ -2284,12 +2278,14 @@ merge_branch_into_main() {
     "$REAL_GIT" -C "$1" update-ref refs/remotes/origin/main "$("$REAL_GIT" -C "$1" rev-parse main)"
 }
 
-# ══════ E: FINISHED PROOF — merged ⇒ age-exempt, plus gates 3 and 4 ══════
+# ══════ E: FINISHED PROOF — merged ⇒ age-exempt, plus the unpushed/stash EVIDENCE ══════
 # Every fixture here carries a REAL pushable remote, because "unpushed" only
-# means something where a remote exists. Every HEAD is deliberately RECENT
-# (2 days), so under the pre-fix rules the age floor would hold EVERY row below:
-# the only thing that can reap E1 is the merged exemption, which is the rule
-# under test. No live worktree is ever touched — everything is under $T.
+# means something where a remote exists. E1–E3b carry a RECENT (2 days) HEAD, so
+# the only thing that can reap E1 is the merged exemption, which is the rule under
+# test. E4/E5 are AGED on purpose: the #2541 probes are EVIDENCE on the row that
+# decides an aged removal (never a veto — #1095 §2/§9.8, re-decided by #2756), so
+# their row must be past every keep-window for the evidence to be printed at all.
+# No live worktree is ever touched — everything is under $T.
 ENV=E; REPO="$(mk_repo_pushable $ENV)"
 
 # (a) merged + clean + no stash + RECENT HEAD => REAPABLE
@@ -2323,19 +2319,29 @@ push_branch "$REPO" feat/e-nopr
 "$REAL_GIT" -C "$REPO" checkout -q main
 WT_E3B="$T/$ENV-e3b"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E3B" feat/e-nopr
 
-# (d) branch MERGED, but the checkout carries a further UNPUSHED commit => KEPT
+# (d) branch MERGED, but the checkout carries a further UNPUSHED commit.
+# AGED so the row reaches the decision tail: `unpushed=1` is EVIDENCE there, and
+# the aged rule still reclaims it — the extra commit survives on the branch ref.
 "$REAL_GIT" -C "$REPO" checkout -q -b feat/e-unpushed main
-commit_in_wt "$REPO" "$RECENT_DATE" e4
+commit_in_wt "$REPO" "$OLD_DATE" e4
 push_branch "$REPO" feat/e-unpushed
 merge_branch_into_main "$REPO" feat/e-unpushed
 WT_E4="$T/$ENV-e4"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E4" feat/e-unpushed
-commit_in_wt "$WT_E4" "$RECENT_DATE" e4local   # exists on NO remote ref
+commit_in_wt "$WT_E4" "$OLD_DATE" e4local   # exists on NO remote ref
+E4_SHA="$("$REAL_GIT" -C "$WT_E4" rev-parse HEAD)"
 
-# (e) merged + clean, but the STASH REGISTER names the branch => KEPT
+# (e) clean, and the STASH REGISTER names the branch. The branch is NOT merged, so
+# the row reaches the tail; `stash-held=` is evidence there. The parked work lives
+# in refs/stash, which `git worktree remove` never touches — that is what the
+# assertion after --apply proves (a removal cannot destroy it).
 "$REAL_GIT" -C "$REPO" checkout -q -b feat/e-stash main
-commit_in_wt "$REPO" "$RECENT_DATE" e5
+commit_in_wt "$REPO" "$OLD_DATE" e5
 push_branch "$REPO" feat/e-stash
-merge_branch_into_main "$REPO" feat/e-stash
+# ⛔ `checkout main` BEFORE `worktree add`: a branch already checked out in the
+# primary worktree cannot be added again, and `worktree add` failing here leaves
+# NO record — which made this fixture's assertions pass VACUOUSLY (an absent row
+# satisfies assert_absent and fails assert_contains for the wrong reason).
+"$REAL_GIT" -C "$REPO" checkout -q main
 WT_E5="$T/$ENV-e5"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_E5" feat/e-stash
 register_stash "$REPO" feat/e-stash
 
@@ -2347,12 +2353,16 @@ assert_contains "$(row_for "$OUT" "$WT_E2")" "reason=dirty" \
     "E2 (b) merged but one uncommitted file => KEPT (dirty)"
 assert_contains "$(row_for "$OUT" "$WT_E3")" "reason=open-pr" \
     "E3 (c) unmerged branch with an open PR => KEPT"
-assert_contains "$(row_for "$OUT" "$WT_E3B")" "reason=too-recent" \
-    "E3b (c') unmerged+clean+recent => KEPT by ancestry (its sole guard)"
-assert_contains "$(row_for "$OUT" "$WT_E4")" "reason=unpushed-commits" \
-    "E4 (d) merged branch + one unpushed commit => KEPT"
-assert_contains "$(row_for "$OUT" "$WT_E5")" "reason=stranded-stash" \
-    "E5 (e) merged but the stash register names the branch => KEPT"
+assert_contains "$(row_for "$OUT" "$WT_E3B")" "reason=no-pr" \
+    "E3b (c') unmerged+clean+recent => KEPT, reason=no-pr (#2756 renamed this row from too-recent)"
+assert_contains "$(row_for "$OUT" "$WT_E4")" "unpushed=1" \
+    "E4 (d) a landed tip carrying a further LOCAL commit reports unpushed=1 (EVIDENCE, never a veto)"
+assert_contains "$(row_for "$OUT" "$WT_E4")" "reason=reclaimable" \
+    "E4 (d) ... and the aged rule still reclaims it: the commits survive on the branch ref (#1095 §9.8)"
+assert_contains "$(row_for "$OUT" "$WT_E5")" "stash-held=stash@{0}" \
+    "E5 (e) a stash register entry naming the branch is reported as stash-held= (EVIDENCE, never a veto)"
+assert_contains "$(row_for "$OUT" "$WT_E5")" "unpushed=0" \
+    "E5 (e) ... and the push state is reported separately: the branch itself was pushed"
 
 FAKE_GH_REFS="feat/e-pr" run_reaper $ENV --apply --repo "$REPO" >/dev/null 2>&1
 assert_nodir "$WT_E1" "E1 (a) --apply actually REMOVED the finished worktree"
@@ -2360,8 +2370,17 @@ assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/e-merged | wc -l 
     "E1 the branch ref SURVIVES removal (git worktree remove never deletes a ref)"
 assert_dir "$WT_E2" "E2 (b) --apply KEPT the uncommitted worktree"
 assert_dir "$WT_E3" "E3 (c) --apply KEPT the open-PR worktree"
-assert_dir "$WT_E4" "E4 (d) --apply KEPT the unpushed-commit worktree"
-assert_dir "$WT_E5" "E5 (e) --apply KEPT the stranded-stash worktree"
+# The probe is EVIDENCE, so removal is expected — and safe: `unpushed=1` says HEAD
+# carries a commit on no remote ref, but the branch ref (not the checkout) is what
+# holds it, and removal never touches a ref. Asserted on the OBJECT, not the row.
+assert_nodir "$WT_E4" "E4 (d) --apply reclaimed the aged checkout (the evidence did not veto it)"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q feat/e-unpushed | wc -l | tr -d ' ')" "1" \
+    "E4 (d) the branch ref survives removal"
+assert_eq "$("$REAL_GIT" -C "$REPO" cat-file -t "$E4_SHA" 2>/dev/null)" "commit" \
+    "E4 (d) the LOCAL-ONLY commit is still in the object DB — the branch ref is its handle"
+assert_nodir "$WT_E5" "E5 (e) --apply reclaimed the aged checkout whose branch had a stash entry"
+assert_eq "$("$REAL_GIT" -C "$REPO" rev-parse --verify -q refs/stash | wc -l | tr -d ' ')" "1" \
+    "E5 (e) refs/stash SURVIVES removal (repo-global, never touched by worktree remove)"
 
 # ── E-MUTATIONS: each new gate is load-bearing, proven by removing it ───
 # A mutant is a COPY of the reaper with ONE predicate deleted. If the fixture
@@ -2398,7 +2417,7 @@ push_branch "$REPO" feat/m2-nopr
 WT_M2PR="$T/$ENV-pr"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M2PR" feat/m2-pr
 WT_M2="$T/$ENV-nopr"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M2" feat/m2-nopr
 FAKE_GH_REFS="feat/m2-pr" OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$WT_M2")" "reason=too-recent" "M2 control: the real reaper KEEPS the unmerged branch"
+assert_contains "$(row_for "$OUT" "$WT_M2")" "reason=no-pr" "M2 control: the real reaper KEEPS the unmerged branch"
 FAKE_GH_REFS="feat/m2-pr" OUT="$(REAPER_OVERRIDE="$MUT2" run_reaper $ENV --dry-run --repo "$REPO")"
 assert_contains "$(row_for "$OUT" "$WT_M2")" "reason=reclaimable" \
     "M2 MUTATION: dropping the ancestry check WRONGLY reaps an UNMERGED branch => E3b is discriminating"
@@ -2444,68 +2463,80 @@ else
     bad "R3 both passes classified the same row first ($FIRST1) — the tail is starved"
 fi
 
-# ── M3/M4: gates 3 and 4 are load-bearing too ─────────────────────────
-# A gate with no mutation is a gate nobody has proved is connected to the
-# decision. These two prove E4 and E5 discriminate.
-MUT3="$T/mutant-no-unpushed-gate.sh"; mutate_reaper_anchored "$MUT3" no-unpushed-gate
-MUT4="$T/mutant-no-stash-gate.sh";  mutate_reaper_anchored "$MUT4" no-stash-gate
-
+# ── M3/M4: the unpushed/stash EVIDENCE must be real, both directions ──
+# These were GATE mutations until #2541's conflict with main was resolved: the
+# probes are EVIDENCE on the deciding row, not vetoes (#1095 §2/§9.8, re-decided
+# by #2756 — a keep-on-unpushed veto freezes the whole named-branch class, pinned
+# reclaimable by G14i/G14j), so a "drop the gate" mutation now proves nothing. The
+# honest property is DISCRIMINATION: the same fixture must read unpushed=1 with no
+# remote-tracking ref and unpushed=0 once the ref exists, and stash-held= only when
+# the register names the branch. A probe that cannot tell those apart, or that
+# reports 0 when it cannot read at all, is the false-PASS these arms exist for.
 ENV=M3; REPO="$(mk_repo_pushable $ENV)"
 "$REAL_GIT" -C "$REPO" checkout -q -b feat/m3-unpushed main
 commit_in_wt "$REPO" "$OLD_DATE" m3
 push_branch "$REPO" feat/m3-unpushed
 merge_branch_into_main "$REPO" feat/m3-unpushed
 WT_M3="$T/$ENV-wt"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M3" feat/m3-unpushed
-# AGED on purpose: gate 3 is evaluated BEFORE the age floor, so only an aged head
-# makes the mutation observable (a recent one falls through to `too-recent` and
-# the mutant would look innocent). This fixture therefore also pins the ORDER.
 commit_in_wt "$WT_M3" "$OLD_DATE" m3local        # exists on NO remote ref
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$WT_M3")" "reason=unpushed-commits" \
-    "M3 control: the real reaper KEEPS a landed-tip branch carrying an unpushed commit"
-OUT="$(REAPER_OVERRIDE="$MUT3" run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M3")" "unpushed=1" \
+    "M3 control: a landed-tip branch carrying a LOCAL-only commit reads unpushed=1"
 assert_contains "$(row_for "$OUT" "$WT_M3")" "reason=reclaimable" \
-    "M3 MUTATION: dropping gate 3 WRONGLY reaps it => E4 is discriminating"
-# fail-closed: an UNEVALUABLE remote probe is NOT the decidable "no remotes"
-# answer (rc 0, empty output) — that is the fail-OPEN reading this path exists to
-# avoid. Deliberately a SEPARATE, remote-less fixture: with the two remotes the
-# M3 fixture carries, the shimmed probe interacts with the open-PR slug probe and
-# the fixture stops isolating gate 3.
+    "M3 control: ... and the evidence does not veto the aged rule (#1095 §9.8)"
+# The SAME head with its remote-tracking ref present must read 0 — otherwise the
+# probe is a constant, not a count.
+mirror_origin_refs "$REPO"
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$WT_M3")" "unpushed=0" \
+    "M3 discrimination: once the commit is on a remote-tracking ref the same row reads unpushed=0"
+assert_absent "$(row_for "$OUT" "$WT_M3")" "unpushed=1" \
+    "M3 discrimination: and it no longer claims the work exists nowhere but here"
+# fail-closed as EVIDENCE: an UNEVALUABLE remote probe must never be printed as a
+# count of 0 — that is a false PASS dressed as a measurement. Deliberately a
+# SEPARATE, remote-less fixture: with the two remotes the M3 fixture carries, the
+# shimmed probe interacts with the open-PR slug probe and the fixture stops
+# isolating the unpushed probe.
 ENV=M3b; REPO="$(mk_repo $ENV)"
 WT_M3B="$(add_named_wt "$REPO" "$ENV-wt" feat/m3b)"
 commit_in_wt "$WT_M3B" "$OLD_DATE" m3b
 OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-fail-remote-probe" run_reaper $ENV --dry-run --repo "$REPO")"
-# The SAFETY property, asserted here: a broken remote probe must never reap.
+# The SAFETY property, asserted here: a broken probe is reported as UNKNOWN.
 # ⛔ NON-VACUOUS, BOTH DIRECTIONS (review P1, #2541). This arm was VACUOUS: the
 # shim was never added to the `chmod +x` list above, so its first exec failed
 # EACCES (rc 126), the pass died at `not a git repository` (exit 2) before
 # classifying anything, `row_for` returned "" and `assert_absent "" …` passed
-# unconditionally — it would have passed on a fail-OPEN gate 3 too. The previous
+# unconditionally — it would have passed on a fail-OPEN probe too. The previous
 # comment rationalized that symptom as "scaffolding". It was an executable bit.
 # With the shim executable the row EXISTS, so assert it does (the classification
-# ran at all) and that its reason is the fail-closed one, not merely "not
-# reclaimable" — an absent row can no longer satisfy this arm.
+# ran at all) before asserting anything about the token — an absent row can no
+# longer satisfy this arm.
 _M3B_ROW="$(row_for "$OUT" "$WT_M3B")"
 assert_contains "$_M3B_ROW" "$WT_M3B" \
     "M3b non-vacuity: the pass CLASSIFIED the worktree (an empty row would make the next line pass on anything)"
-assert_contains "$_M3B_ROW" "reason=unpushed-unverifiable" \
-    "M3b fail-closed: a broken remote probe is UNVERIFIABLE, and an unverifiable push state is never reaped (verified safe)"
-assert_absent "$_M3B_ROW" "reason=reclaimable" \
-    "M3b fail-closed: a broken remote probe must NOT reap (verified safe)"
+assert_contains "$_M3B_ROW" "unpushed=?" \
+    "M3b fail-closed: a broken remote probe is reported as UNKNOWN, never as a count"
+assert_absent "$_M3B_ROW" "unpushed=0" \
+    "M3b fail-closed: an unreadable probe is NEVER printed as 0 (that would be a false PASS)"
 
 ENV=M4; REPO="$(mk_repo_pushable $ENV)"
 "$REAL_GIT" -C "$REPO" checkout -q -b feat/m4-stash main
-commit_in_wt "$REPO" "$RECENT_DATE" m4
+commit_in_wt "$REPO" "$OLD_DATE" m4
 push_branch "$REPO" feat/m4-stash
-merge_branch_into_main "$REPO" feat/m4-stash
+# ⛔ `checkout main` BEFORE `worktree add` (see E5): a branch already checked out
+# in the primary worktree cannot be added again, and the silent failure turned the
+# control arm below into a vacuous pass.
+"$REAL_GIT" -C "$REPO" checkout -q main
 WT_M4="$T/$ENV-wt"; "$REAL_GIT" -C "$REPO" worktree add -q "$WT_M4" feat/m4-stash
+OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
+assert_absent "$(row_for "$OUT" "$WT_M4")" "stash-held=" \
+    "M4 control: with an EMPTY stash register the row claims no parked work"
 register_stash "$REPO" feat/m4-stash
 OUT="$(run_reaper $ENV --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$WT_M4")" "reason=stranded-stash" \
-    "M4 control: the real reaper KEEPS a merged worktree whose branch has a stash entry"
-OUT="$(REAPER_OVERRIDE="$MUT4" run_reaper $ENV --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$WT_M4")" "reason=reclaimable" \
-    "M4 MUTATION: dropping gate 4 WRONGLY reaps it => E5 is discriminating"
+assert_contains "$(row_for "$OUT" "$WT_M4")" "stash-held=stash@{0}" \
+    "M4 discrimination: the SAME row names the parked work once the register holds it"
+assert_contains "$(row_for "$OUT" "$WT_M4")" "unpushed=0" \
+    "M4 ... on a separate axis: the push state is reported independently of the stash"
 
 # ── P1: no catastrophic pattern substitution on a list-sized string ──────────
 # MEASURED (live, 564-record list, 72 KB): `${LIST//[[:space:]]/}` consumed
@@ -2534,10 +2565,20 @@ fi
 # ({{HOME}}, {{WORKTREE_HYGIENE_MODE}}, …) are the shipped form.
 if command -v python3 >/dev/null 2>&1; then
     _plist_bad=0
+    # ⛔ SUBSTITUTE THE PLACEHOLDERS FIRST — that is the form the installer WRITES
+    # and the only form launchd ever parses. Parsing the raw template red-lights
+    # any unit that carries a `{{VAR}}` inside an `<integer>` (plistlib coerces it
+    # with int(), Expat does not), which is a defect in the CHECK, not in the unit:
+    # `templates/launchd/harness-apply/com.eldato.harness-apply.plist` is exactly
+    # that, it is untouched by this PR, and it fails the raw parse on origin/main
+    # too. A check that cannot tell a template from its render is the false-PASS's
+    # twin — a false RED, and the one that gets a gate deleted.
     for _pl in "$SCRIPT_DIR/../templates/launchd"/*.plist "$SCRIPT_DIR/../templates/launchd"/*/*.plist; do
         [ -f "$_pl" ] || continue
-        python3 -c 'import plistlib,sys;plistlib.load(open(sys.argv[1],"rb"))' "$_pl" 2>/dev/null \
-            || { bad "P2 launchd template does not PARSE: ${_pl#"$SCRIPT_DIR/../"} — a malformed unit installs with empty ProgramArguments (silent no-op job)"; _plist_bad=$((_plist_bad + 1)); }
+        _render="$T/.plist-render.$$"; sed -E 's/\{\{[A-Za-z_][A-Za-z_0-9]*\}\}/0/g' "$_pl" >"$_render"
+        python3 -c 'import plistlib,sys;plistlib.load(open(sys.argv[1],"rb"))' "$_render" 2>/dev/null \
+            || { bad "P2 launchd template does not PARSE when rendered: ${_pl#"$SCRIPT_DIR/../"} — a malformed unit installs with empty ProgramArguments (silent no-op job)"; _plist_bad=$((_plist_bad + 1)); }
+        rm -f "$_render"
     done
     [ "$_plist_bad" -eq 0 ] && ok "P2 every launchd template parses as a property list (a malformed one installs a silent no-op unit)"
     # The SHIPPED form: placeholders substituted. `{{VAR}}` is the render input.

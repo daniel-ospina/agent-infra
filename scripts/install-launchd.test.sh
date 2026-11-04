@@ -499,8 +499,10 @@ done
 # template cannot raise both sides of the equation at once. This number went stale when #2047/#2053 added
 # `com.tortoise.worktree-hygiene` to the gated set (branch-reaper #1787 + worktree-reaper #1311 +
 # worktree-hygiene #2047), and the result was a RED `bash-suites` on main that had nothing to do with any
-# PR that touched it. Keep this list in step with `grep -l '{{TORTOISE_REPO}}' templates/launchd/*.plist`.
-assert_eq "$GATED_TEMPLATES1" "3" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047)"
+# PR that touched it. It went stale a SECOND time when #2307 added `com.tortoise.pr-doctor` to the gated
+# set without bumping this number (found while rebasing #2541; the fourth job is acknowledged below, not
+# derived). Keep this list in step with `grep -l '{{TORTOISE_REPO}}' templates/launchd/*.plist`.
+assert_eq "$GATED_TEMPLATES1" "4" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047 + pr-doctor #2307)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
