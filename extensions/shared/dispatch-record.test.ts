@@ -32,6 +32,7 @@ import { auditLedgerFile } from "./provider-failover.js";
 import {
   DISPATCH_RECORD_EVENT,
   DEFAULT_DISPATCH_CLASS,
+  appendedLineNamesRow,
   buildDispatchOutcomeRow,
   dispatchLedgerEnabled,
   recordDispatchOutcome,
@@ -382,6 +383,68 @@ test("recordDispatchOutcome: gate OFF → skipped (no row, no failure claim)", (
 	);
 	equal(result.ok, false);
 	equal(result.skipped, true, "explicitly disabled → skipped, not a failure");
+});
+
+test("#385 review fix: the read-back confirm matches the FULL row identity — a sibling orphan's line cannot confirm OUR failed write", () => {
+	// The confirmation scans the byte RANGE appended during the call, so a
+	// concurrent sibling's line lands in the same window. `event+dispatchId+
+	// attempt+reason` was sufficient while every row carried a fresh
+	// per-dispatch nonce and a per-leg ordinal. The child-side orphan settle
+	// (#385) is the first row class whose tuple DEGENERATES: `dispatchId` and
+	// `attempt` are INHERITED env, `reason` is the constant "orphan-killed", and
+	// subagent-tool children are spawned `--no-session` (so `childSessionId` is
+	// null for all of them). Two sibling orphans of one dispatch agree on all
+	// four — so a sibling's successful append would confirm OUR failed one and
+	// print `settle=recorded` for a row that was never written. The fields that
+	// tell those siblings apart are exactly childSessionId/parentPid/killedPids.
+	const base = {
+		extension: "task-heartbeat",
+		dispatchId: "n1",
+		parentSessionId: null,
+		childSessionId: null,
+		attempt: 1,
+		cwd: "/w",
+		branch: null,
+		headSha: null,
+		dirty: null,
+		dirtyPaths: null,
+		reason: "orphan-killed",
+		toolAgeMaxMs: null,
+		toolsInFlight: null,
+		everSawTool: null,
+		transcriptPath: null,
+		exitCode: 137,
+		dispatchClass: "task",
+		parentPid: 10,
+		killedPids: [1, 2],
+	};
+	const mine = buildDispatchOutcomeRow(base, new Date("2026-11-02T22:00:00.000Z"));
+	const sibling = buildDispatchOutcomeRow(
+		{ ...base, parentPid: 11, killedPids: [3] },
+		new Date("2026-11-02T22:00:00.000Z"),
+	);
+	const line = (r: typeof mine) => ({ event: DISPATCH_RECORD_EVENT, ...r }) as Record<string, unknown>;
+	equal(appendedLineNamesRow(line(mine), mine), true, "our own appended line matches");
+	equal(
+		appendedLineNamesRow(line(sibling), mine),
+		false,
+		"a sibling orphan's line does NOT match — the degenerated (dispatchId, attempt, reason) is not identity",
+	);
+	equal(
+		appendedLineNamesRow({ ...line(mine), parentPid: 99 }, mine),
+		false,
+		"parentPid is part of the identity",
+	);
+	equal(
+		appendedLineNamesRow({ ...line(mine), killedPids: [1] }, mine),
+		false,
+		"killedPids is part of the identity",
+	);
+	// …and the write path itself still confirms its own row against a REAL ledger.
+	// A SEPARATE agent dir, so this row can never pollute the spawn-level
+	// assertions that read the shared test ledger.
+	const written = recordDispatchOutcome(mine, { PI_CODING_AGENT_DIR: path.join(tmpDir, "agent-dir-385") });
+	equal(written.ok, true, `the real writer still confirms its own row (got ${JSON.stringify(written)})`);
 });
 
 // ── Spawn-level tests ────────────────────────────────────────────────

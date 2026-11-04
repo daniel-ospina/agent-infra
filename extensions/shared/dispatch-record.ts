@@ -346,12 +346,48 @@ function readAppendedLines(file: string, from: number, to: number): unknown[] {
 }
 
 /**
+ * Does an appended line name EXACTLY the row we tried to write?
+ *
+ * Extracted so the predicate itself is a unit-test target rather than an
+ * inline closure nobody can falsify without a real write failure.
+ *
+ * ⛔ WHY THE FULL IDENTITY, AND WHY `childSessionId`/`parentPid`/`killedPids`
+ * ARE PART OF IT. The confirmation is a read-back of a byte RANGE, so a
+ * concurrent sibling's line lands in the same window; matching too little
+ * makes a FAILED write read as `ok`. `event + dispatchId + attempt + reason`
+ * was sufficient while every row carried a fresh per-dispatch nonce and a
+ * per-leg ordinal. The #385 child-side settle is the first row class whose
+ * tuple DEGENERATES: `dispatchId`/`attempt` are inherited through the child's
+ * env and `reason` is the constant `orphan-killed`, while subagent-tool
+ * children are spawned `--no-session` (so `childSessionId` is null for all of
+ * them, and `extensions/subagent/index.ts` deliberately does not forward
+ * `TASK_DISPATCH_ATTEMPT`). Two sibling orphans of one dispatch can therefore
+ * agree on all four — and a sibling's successful append would then confirm OUR
+ * failed one, printing `settle=recorded` for a row that was never written. The
+ * fields that differ between those siblings are exactly these three.
+ */
+export function appendedLineNamesRow(
+  line: Record<string, unknown>,
+  row: DispatchOutcomeRow,
+): boolean {
+  return (
+    line.event === DISPATCH_RECORD_EVENT &&
+    line.dispatchId === row.dispatchId &&
+    line.childSessionId === row.childSessionId &&
+    line.attempt === row.attempt &&
+    line.reason === row.reason &&
+    line.parentPid === row.parentPid &&
+    JSON.stringify(line.killedPids ?? []) === JSON.stringify(row.killedPids ?? [])
+  );
+}
+
+/**
  * Write the outcome row through the SHARED ledger, then CONFIRM it landed.
  *
  * `appendLedger` swallows all exceptions, so success cannot be inferred from
  * it. Confirmation scans the byte range appended during this call for a line
- * matching OUR identity (event + dispatchId + attempt + reason) — robust to a
- * concurrent sibling appending around us, which "is it the last line?" is not.
+ * naming OUR row (`appendedLineNamesRow`) — robust to a concurrent sibling
+ * appending around us, which "is it the last line?" is not.
  */
 export function recordDispatchOutcome(
   row: DispatchOutcomeRow,
@@ -367,13 +403,7 @@ export function recordDispatchOutcome(
       return { ok: false, path, error: "ledger did not grow after append" };
     }
     const lines = readAppendedLines(path, before, after) as Array<Record<string, unknown>>;
-    const found = lines.some(
-      (l) =>
-        l.event === DISPATCH_RECORD_EVENT &&
-        l.dispatchId === row.dispatchId &&
-        l.attempt === row.attempt &&
-        l.reason === row.reason,
-    );
+    const found = lines.some((l) => appendedLineNamesRow(l as Record<string, unknown>, row));
     if (!found) return { ok: false, path, error: "appended row not found on read-back" };
     return { ok: true, path };
   } catch (err) {

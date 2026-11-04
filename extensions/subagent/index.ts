@@ -984,6 +984,19 @@ export async function runSingleAgent(
 				// the trailing arg). Key-specific ONLY — never a prefix sweep.
 				delete childEnv.AGENT_ALLOW_MAIN_EDITS;
 				delete childEnv.ELDATO_ALLOW_MAIN_EDITS;
+				// #385: `TASK_DISPATCH_ATTEMPT` is the builtin `task` tool's PER-LEG
+				// retry ordinal, and only that tool knows it. THIS dispatcher has no
+				// legs — it runs every child `--no-session` (no per-leg session id
+				// either), so a child that inherited the ENCLOSING task dispatch's
+				// ordinal through `...process.env` would write an orphan-kill settle
+				// row asserting a leg it never was: two siblings of one dispatch would
+				// come out byte-identical on every identity field, and a fleet reader
+				// counting orphan kills by the documented
+				// (dispatchId + childSessionId + attempt) key would merge them.
+				// Stripped so the child-side settle falls back to the contract's
+				// documented default instead of inheriting a false one
+				// (task-heartbeat.ts `buildOrphanSettleRow`). Key-specific ONLY.
+				delete childEnv.TASK_DISPATCH_ATTEMPT;
 				// #623 opt-in restore: re-add the hatch var(s) the controller itself
 				// carries for THIS dispatch only. A controller that is NOT
 				// env-hatched cannot opt a child in.

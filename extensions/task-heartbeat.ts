@@ -988,6 +988,32 @@ export interface OrphanSettleInput {
   /** The child's own arg vector (tests); default `process.argv.slice(1)`. */
   argv?: string[];
   cwd?: string;
+  /** The cwd RESOLVER (tests); default `process.cwd`. Exists so the
+   * deleted-directory path below is assertable without deleting this
+   * process's own cwd. */
+  getCwd?: () => string;
+}
+
+/**
+ * Resolve the cwd WITHOUT ever throwing.
+ *
+ * `process.cwd()` THROWS (`ENOENT`) when the directory has been deleted, and a
+ * dying dispatch child's cwd is its WORKTREE — which the fleet REAPS
+ * (`scripts/pi-reap-worktrees.sh`). Called unguarded from
+ * `buildOrphanSettleRow`, that throw discards the WHOLE row (reason,
+ * `parentPid`, `killedPids`, the dispatch identity) on exactly the population
+ * this record exists for: the watchdog fires *because* the parent vanished,
+ * and the worktree is reaped in the same window. Only a `settle=FAILED ENOENT`
+ * line would remain — the pre-fix silence plus a note.
+ *
+ * `""` therefore means "could not be resolved", the same never-guess rule as
+ * the `null` fields: an absent cwd is honest, a wrong one is not. */
+export function safeCwd(getCwd: (() => string) | undefined = undefined): string {
+  try {
+    return (getCwd ?? (() => process.cwd()))();
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -999,6 +1025,9 @@ export interface OrphanSettleInput {
  * What it names, and why each is knowable HERE and only here:
  *   · WHO  — `killedPids` (enumerated above) and `cwd` (the worktree the child
  *            was running in; the child IS the session, so no lookup needed).
+ *            `cwd` is resolved through `safeCwd()`: when the worktree has
+ *            already been reaped the field is `""` (unknown) and the row is
+ *            STILL written — the record must never be lost to a probe.
  *   · WHY  — `reason: "orphan-killed"` + `parentPid`: the parent pid that
  *            vanished. No postmortem is required to infer either.
  *   · WHEN — `ts`.
@@ -1039,7 +1068,7 @@ export function buildOrphanSettleRow(input: OrphanSettleInput): DispatchOutcomeR
       parentSessionId: null,
       childSessionId,
       attempt,
-      cwd: input.cwd ?? process.cwd(),
+      cwd: input.cwd ?? safeCwd(input.getCwd),
       branch: null,
       headSha: null,
       dirty: null,

@@ -39,6 +39,7 @@ import {
   getOrphanGraceMs,
   orphanWatchdogHooks,
   buildOrphanSettleRow,
+  safeCwd,
   ORPHAN_KILLED_REASON,
   ORPHAN_KILLED_EXIT_CODE,
   _resetWatchdogArmedForTests,
@@ -317,7 +318,7 @@ test("arm returns null when the gate is off", () => {
 
 section("settle record — an orphan kill is RECORDED (status, pids, parent, ts)");
 
-test("fireSequence writes the row BEFORE the kill and exits 137 (order: record → kill → exit)", async () => {
+test("fireSequence writes the row BEFORE the kill and exits 137 (order: record → log → kill → exit)", async () => {
   const real = { ...orphanWatchdogHooks };
   setPairEnv();
   process.env.ORPHAN_WATCHDOG_MIN_UPTIME_MS = "0";
@@ -342,7 +343,13 @@ test("fireSequence writes the row BEFORE the kill and exits 137 (order: record �
       order.push("exit");
       exitCode = code;
     };
-    orphanWatchdogHooks.appendLog = () => {};
+    orphanWatchdogHooks.appendLog = () => {
+      // The log line is the human-greppable half of the record, so its POSITION
+      // is part of the contract: it must come AFTER the settle row (a line that
+      // announces `status=orphan-killed` before anything was written is the
+      // "we said we killed but recorded nothing" shape) and BEFORE the kill.
+      order.push("log");
+    };
     _resetWatchdogArmedForTests();
     const handle = armOrphanWatchdog();
     ok(handle !== null, "watchdog should arm");
@@ -353,8 +360,8 @@ test("fireSequence writes the row BEFORE the kill and exits 137 (order: record �
 
     equal(
       order.join(","),
-      "record,kill,exit",
-      "the settle record must be written BEFORE the descendant kill, and the exit must still follow",
+      "record,log,kill,exit",
+      "the settle record must be written BEFORE the descendant kill (and the log line after the record, before the kill), and the exit must still follow",
     );
     equal(rows.length, 1, "exactly one settle row per firing");
     const row = rows[0];
@@ -451,6 +458,34 @@ test("buildOrphanSettleRow: unknown-at-settle values stay null/[] — never a co
   equal(bare.transcriptPath, null, "null means the --no-session degrade, not 'we did not look'");
   equal(bare.attempt, 1, "the contract's parent-side default when no dispatcher exported one");
   equal(bare.dispatchClass, "task");
+});
+
+test("a DELETED cwd (the reaped-worktree case) never discards the settle row", () => {
+  // `process.cwd()` throws ENOENT once its directory is gone, and a dying
+  // dispatch child's cwd IS its worktree — which `scripts/pi-reap-worktrees.sh`
+  // deletes. An unguarded call would throw inside the fire sequence's try and
+  // discard the WHOLE row (reason, parentPid, killedPids, identity) on exactly
+  // the population this record exists for. So: the resolver is guarded, and the
+  // row still lands, with `""` as the documented unknown.
+  const throwing = () => {
+    const err = new Error("ENOENT: no such file or directory, uv_cwd") as Error & { code?: string };
+    err.code = "ENOENT";
+    throw err;
+  };
+  equal(safeCwd(throwing), "", "an unresolvable cwd reads as unknown, never as a guess");
+  equal(safeCwd(() => "/w/tree"), "/w/tree", "and a resolvable one is passed through (the guard is not a bypass)");
+  const row = buildOrphanSettleRow({
+    parentPid: 4321,
+    killedPids: [11],
+    env: { TASK_HEARTBEAT_NONCE: "nonce-cwd" },
+    argv: ["pi"],
+    getCwd: throwing,
+  });
+  equal(row.cwd, "", "cwd is the documented unknown value");
+  equal(row.reason, "orphan-killed", "⛔ the ROW SURVIVES — that is the whole point");
+  equal(row.parentPid, 4321, "who: the parent whose disappearance caused the kill");
+  deepEqual(row.killedPids, [11], "who: the pids enumerated for the kill");
+  equal(row.dispatchId, "nonce-cwd", "and the dispatch identity is still joinable");
 });
 
 test("a FAILED settle record is diagnosed and never blocks the kill or the exit", async () => {
