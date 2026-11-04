@@ -552,7 +552,9 @@ headroom.
   read `ok`, so the entry point lifted `candidates_runner_work=0 verdict_runner_work=ok` and a box whose
   sink fills behind a permission mismatch read HEALTHY for ever — `fleet-health.py` alarms on the
   record's `ok`, not on `note_`. The owner now publishes **`census=abstained`** when `unmeasurable>0`
-  and `candidates=0`, and the entry point records **`candidates_runner_work=?`** with
+  **and NOTHING was reached** (`CAND+KEPT+RETAINED+REAPED+FAILED+GONE == 0`, so no entry was classified —
+  the `candidates=0` spelling of this gate is the version that was WRONG; see the reached-ness note
+  below), and the entry point records **`candidates_runner_work=?`** with
   **`verdict_runner_work=abstained`**. The pass still exits **0**: an abstention is not a failure of the
   pass, it is the pass saying it could not look, and an hourly red for a permission mismatch is the
   alarm-fatigue shape this family forbids — the RECORD is the alarm channel. Case **(l)** asserts the
@@ -1281,17 +1283,17 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **19 cases and 30 mutants,
-49 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **20 cases and 31 mutants,
+51 outcomes per box**, each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
-against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **21 passed,
-28 failed, 1 skipped**, and against this tree **49 passed, 0 failed, 3 skipped**: the discrimination is
-measured both ways, not asserted. (The red on the pre-change tree is 16 of the 19 cases — every case whose
+against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **22 passed,
+29 failed, 1 skipped**, and against this tree **51 passed, 0 failed, 3 skipped**: the discrimination is
+measured both ways, not asserted. (The red on the pre-change tree is 17 of the 20 cases — every case whose
 subject runs through the ENTRY POINT, which on that tree has no `class=runner-work` at all: (a), (b), (c),
-(d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r) and (s); the owner-only cases (i), (m) and (q)
-stay green — plus **12** mutants that cannot even be applied there, because the arms they edit do not exist
-in that tree. The 18 mutants that DO still apply are reported "caught" only because their case is already
+(d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r), (s) and (t); the owner-only cases (i), (m) and
+(q) stay green — plus **12** mutants that cannot even be applied there, because the arms they edit do not
+exist in that tree. The 19 mutants that DO still apply are reported "caught" only because their case is already
 red on that tree, so the green run above is the discriminating measurement, not that one.)
 
 ⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement — BY THE SUITE THAT ACTUALLY ASSERTS IT.**
@@ -1330,7 +1332,7 @@ reaps" was false in each clause. What was actually missing, stated so a reader c
 `--print-status` — the field's only READER — had **no assertion at all** anywhere in the suite (the only
 `print-status` reference in `runner-work.test.sh` is the one added at this revision). So it now reads `ok`
 on case (b)'s reaping pass (measured at this head), `--print-status` is asserted to RENDER it, and deleting
-the record line turns case (b) red: that mutation is (b)'s second, counted among the 29 above.
+the record line turns case (b) red: that mutation is (b)'s second, counted among the 30 above.
 The classes suite was **killed at 30 minutes with no result** on the box that measured this PR (load
 180–220), so at that point the record-field delta was **unmeasured** and a green run of the owner-level
 suite below could not be read as covering it. It was then **run to completion at load ~15 on the same
@@ -1338,7 +1340,7 @@ suite below could not be read as covering it. It was then **run to completion at
 pass is preserved, `reason=toctou`) — the same case and the same count as the pre-change baseline, i.e.
 pre-existing and not this class's. That tally is recorded here as what it is — the classes suite's own
 result, on the fields it actually asserts — and **not** as this class's evidence, which it never was. The
-record fields are MEASURED at this head by case (b) (`49 passed, 0 failed, 3 skipped` at this head on this
+record fields are MEASURED at this head by case (b) (`51 passed, 0 failed, 3 skipped` at this head on this
 box — it has real runner roots, so the (f) default-glob arm is skipped by name; the earlier
 `0 skipped` row was taken on a laptop and is not restated as this head's); the caveat that
 stood here for one revision is recorded rather than dropped silently, because "we could not measure it"
@@ -1348,20 +1350,22 @@ The measured transcript, `./scripts/disk-reaper-runner-work.test.sh`, at this he
 real runner roots (so the (f) default-glob arm is skipped by name, three times):
 
 ```
-  49 passed, 0 failed, 3 skipped
+  51 passed, 0 failed, 3 skipped
 ```
 
 and the same suite with `DR_REAPER=` `origin/main`'s `disk-reaper.sh` (the pre-change tree, beside this
 tree's owner):
 
 ```
-  21 passed, 28 failed, 1 skipped
+  22 passed, 29 failed, 1 skipped
 ```
 
 ⛔ **THESE TALLIES WERE RE-MEASURED BECAUSE THE SUITE CHANGED, NOT BECAUSE THE ARITHMETIC LOOKED WRONG.**
 This revision adds case **(r)**, case **(s)** (the vanished-entry race, with its own instrumented owner and
-mutant) and mutants `o2`, `r1`, `r2` and `s`, so the previous head's `43`/`31` rows describe a suite that no longer exists; both numbers above were taken by running the suite at this head,
-and the pre-change row is the same command with `DR_REAPER` pointed at the base commit — **15 cases and
+mutant), case **(t)** (the same race one level up — the ROOT — which was asserted only by prose until now)
+and mutants `o2`, `r1`, `r2`, `s` and `t`, so the previous head's `43`/`31` rows describe a suite that no
+longer exists; both numbers above were taken by running the suite at this head,
+and the pre-change row is the same command with `DR_REAPER` pointed at the base commit — **17 cases and
 12 unappliable mutants** are red there simply because the base entry point has no `class=runner-work` at
 all, and the `1 skip` (not 3) is because two of the three `(f)` invocation sites never get that far on a
 tree whose entry point refuses them earlier. That pre-change run is a discrimination check, not evidence:
@@ -1376,20 +1380,20 @@ on a box told to have real runner roots so the skip path is taken (`<entry>` is 
 `mut-f` and `mut-u` are the mutant copies the suite makes in its own `$T`):
 
 ```
-  49 passed, 0 failed, 3 skipped
+  51 passed, 0 failed, 3 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-u/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
 ```
 
 **How those two numbers compose — `skipped` is ORTHOGONAL, so the arithmetic must not be "balanced".**
-`passed + failed` is the OUTCOME count (49 here: one line per case and per mutant — 19 cases and 30
+`passed + failed` is the OUTCOME count (51 here: one line per case and per mutant — 20 cases and 31
 mutants). `skipped` is an
 independent count of arms that did not run: `skip()` neither increments nor decrements `PASS` — it records
 a reason in a file the outer runner reads at the end — and the arm's own pass line still lands, because the
 assertions beside the skip (the source check of the documented default list) still run. So
-`49 passed … 3 skipped` reads as **49 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
-`passed + skipped` legitimately EXCEEDS 49. ⛔ **A transcript is therefore never "corrected" on the grounds
+`51 passed … 3 skipped` reads as **51 outcomes, 0 of them failed, PLUS 3 arms that were not measured**, and
+`passed + skipped` legitimately EXCEEDS 51. ⛔ **A transcript is therefore never "corrected" on the grounds
 that `passed + skipped` exceeds the outcome count.** An earlier revision of this section did exactly that,
 on the false premise that a skip must displace a pass, and replaced a correct transcript with
 `20 passed, 0 failed, 2 skipped` — a line no head of this suite can print; the same false premise then
@@ -1423,12 +1427,13 @@ three times, and "the same two skips" was already stale when it was written.
 | (p) | **a root matched by TWO globs is swept ONCE.** `--glob` is repeatable, so a wildcard and a literal naming the same root is a normal operator spelling, and there was no root dedupe (`rw_df_targets` dedupes filesystems; this loop deduped nothing): measured `roots=2 candidates=2` for ONE entry with the same WOULD-REMOVE path logged twice — a population reported at twice its size and a to-free figure doubled by a spelling. A seen-set (a string, because bash 3.2 has no associative arrays) now dedupes roots and NAMES the skip, so a dedupe cannot be mistaken for a root that never matched | the `case " $SEEN_ROOTS "` guard is replaced by one that never matches, so the same root is swept once per glob and both counts double |
 | (r) | **a PARTLY-unreadable population is `census=partial`, with a LOWER-BOUND count — never `verdict=ok`.** Two roots, both holding a dead checkout; one set to mode 0111 (stat-able, not listable). Measured before the fix: `roots=2 candidates=1 unmeasurable=1 census=ok` ⇒ record `{candidates=1, unmeasurable=1, verdict=ok}`, i.e. one runner's whole `_work` sink unmeasured while the only field an operator reads said healthy — the abstention implemented only for the `candidates=0` case. Now the owner publishes `census=partial`, the record keeps the MEASURED count (`candidates_runner_work=1`, a lower bound) plus `unmeasurable_runner_work=1`, the verdict is `partial`, and the note says LOWER BOUND in as many words. The case also pins the DELETER's two halves: the readable root's dead checkout IS reaped (a partial census must not make the class inert) and the unreadable root's SURVIVES (nothing was classified there). ⛔ **AND IT PINS THE ORDINARY HEALTHY SHAPE, which the first version of this fix got wrong:** the same two roots with a FRESH checkout under the readable one (`kept=1 unmeasurable=1`) published `census=abstained`, whose note asserts *"no entry was classified"* about an entry that WAS classified — and a non-`ok` verdict on a cell that was fine. The gate is REACHED-ness (any entry classified ⇒ `partial`, `candidates` a lower bound that may be `0`; nothing classified ⇒ `abstained`), and the case drives both. ⚠️ Skipped by name (not passed) when the suite runs **as root**, because `chmod` cannot deny root | `else CENSUS=partial` is replaced by `else CENSUS=ok`, so a partly-read population is published as measured again; and, separately, the entry point's `VERDICT_RW=partial` override is removed, so the token lands as `ok` |
 | (s) | **an entry that VANISHES mid-pass is `GONE`, not `unmeasurable=`.** `find` on a path a runner deleted exits non-zero exactly like a permission failure, so a job finishing during the sweep (the runner removes its own `_work/<entry>`) was counted into `unmeasurable=` — and, with the census keyed on reached-ness, that alone is enough to publish a non-`ok` verdict on a pass that measured everything else. The two facts have different consequences (one says "I could not prove this checkout dead", the other says "there is nothing to prove"), so the walk re-stats before claiming an abstention and names `GONE … reason=vanished`, counted in its own `gone=` field and in NO other bucket. Driven by a copy of the REAL owner with the delete injected at the classification site — a race fixture, not a stub of the logic under test — which asserts the entry was already gone at classification (nothing reaped), `gone=1 unmeasurable=0 census=ok`, and `verdict_runner_work=ok`; the ROOT-level walk got the same distinction (`GONE … reason=vanished` instead of `reason=unlistable`), because the two-phase pass widens the discovery→sweep window | reverting the re-stat to `return 2` turns the case RED — a gone entry becomes an abstention again |
+| (t) | **a ROOT that VANISHES between discovery and sweep is `GONE`, not `unmeasurable=` — and this arm was covered by NOTHING.** (s) fixed the ENTRY site and the root walk got the same re-stat in the same commit, but the case drove only the entry, so a revert of the root branch to `reason=unlistable` kept every outcome green: an arm asserted only by prose, in the doc that requires a case to say when it has stopped checking something. It matters MORE at root level because the pass is TWO-PHASE, which widens the window — a runner teardown or a re-image between the phases left the pass claiming it could not LOOK at a root that is simply not there. Driven by an instrumented copy of the real owner that removes the queued root just before the sweep, so the REAL `root_is_listable` + re-stat run against a missing path; asserts `gone=1 unmeasurable=0 census=ok`, `verdict_runner_work=ok`, nothing reaped, and rc 0 | reverting the re-stat (`if [ ! -e "$root" ]` → `if false`) turns the case RED — a gone root becomes an abstention again |
 | (q) | **a SET-but-EMPTY `REAP_RW_EXPLICIT=` is a REFUSAL.** `${REAP_RW_EXPLICIT-0}` is right to keep UNSET distinct from SET — but a set-and-EMPTY value yields `""`, which is neither `1` nor `0`, so every `[ "$EXPLICIT" = 1 ]` read FALSE and an explicitly-asserted layout that matched nothing reported a MEASURED EMPTY POPULATION (`census=ok`, rc 0) instead of `census=no-roots` (rc 3) — the third spelling of the fail-open case (i) fixed, reopened through an emptied seam. A template that renders `REAP_RW_EXPLICIT=` must not disarm the assertion it carries. Asserts rc 3, the seam named, no census published, and the `EXPLICIT=1` control reaching the documented `no-roots` route | the `case "$EXPLICIT"` scrutinee is pinned to `0`, so the `0|1` arm is taken for every value and the emptied assertion is silently read as "not explicit" |
 
 The pre-existing suite (`disk-reaper.test.sh`) additionally scopes both owners' scratch roots to its
 own fixture: without that, a `--apply` assertion anywhere in it would sweep the machine's real `/tmp`
 (it did once, on this box, before the scoping was added).
-`scripts/disk-reaper.test.sh` — 713 assertions, run by the `disk-reaper` shard of
+`scripts/disk-reaper.test.sh` — 718 assertions, run by the `disk-reaper` shard of
 `run-bash-shards.sh`:
 
 | | |

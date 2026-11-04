@@ -2315,8 +2315,18 @@ fs_dev() { tb_timeout "$DU_TIMEOUT" "$DF_BIN" -Pk "$1" 2>/dev/null | awk 'NR==2 
 # ⛔ NO GLOB EXPANSION HERE, ON PURPOSE: expanding could match twelve roots on one filesystem and
 # re-measure it twelve times. The STATIC prefix (everything before the first metacharacter), walked up to
 # something that exists, is the path whose filesystem the roots will live on.
+# ⛔ AND THAT REQUIRES `set -f`: an UNQUOTED `for g in $RUNNER_GLOBS` performs pathname expansion as well
+# as word splitting, so on a box where `…/gh-runner*/_work` matched twelve roots this loop received twelve
+# WORDS — one `df` per matched root, exactly the twelve measurements the static-prefix walk exists to
+# avoid — and `${g%%[*?]*}` never saw a metacharacter to strip. MEASURED before the fix: two matching
+# roots produced two already-expanded words and two `dfs` on one filesystem. (The result stayed CORRECT,
+# because the `fs_dev` seen-set dedupes it; the cost the comment promises not to pay was paid anyway.)
+# `set -f` around the split gives one word per PATTERN; the previous state is restored, because a caller
+# that ran `set -f` itself must not have globbing silently re-enabled under it.
 rw_df_targets() {
-    local g p dev seen=" "
+    local g p dev seen=" " _had_f=0
+    case $- in *f*) _had_f=1 ;; esac
+    set -f
     for g in $RUNNER_GLOBS; do
         p="${g%%[*?]*}"
         [ -n "$p" ] || p="/"
@@ -2331,6 +2341,7 @@ rw_df_targets() {
         seen="$seen${dev:-?} "
         printf '%s\n' "$p"
     done
+    [ "$_had_f" = 1 ] || set +f
 }
 
 reap_runner_work() {

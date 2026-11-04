@@ -813,6 +813,42 @@ case_s() { # <entry-point> <owner — INSTRUMENTED: it deletes the entry at the 
     return $((CASE_FAIL > 0))
 }
 
+# ── (t) a ROOT that vanishes between discovery and sweep is GONE, not unlistable ──────────────
+# ⛔ THE SAME DISTINCTION AS (s), ONE LEVEL UP — AND IT WAS COVERED BY NOTHING. The root walk gained the
+# re-stat as part of (s)'s fix, but (s) drives the ENTRY site, so a revert of the root branch to
+# `reason=unlistable` kept every outcome green: an arm asserted only by prose. It matters MORE at root
+# level because the pass is TWO-PHASE, which widens the window between discovery and sweep — a runner
+# teardown or a re-image between the two phases left the pass claiming it could not LOOK at a root that
+# is simply not there. Driven by an instrumented copy of the real owner that removes the queued root just
+# before the sweep runs, so the REAL `root_is_listable` + re-stat run against a missing path. The mutant
+# then reverts the re-stat, which must redden the same fixture.
+case_t() { # <entry-point> <owner — INSTRUMENTED: it deletes the ROOT between discovery and sweep>
+    local pass="$1" owner="$2" base work out rc sum s1
+    PASS_OWNER="$owner"
+    base="$T/t.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-41)" || return 1
+    fixture_entry dead "$work" job-in-vanishing-root 300 || return 1
+    s1="$(uniqstate t1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    # ⛔ THE FIXTURE MUST HAVE ACTUALLY VANISHED THE ROOT, or every assertion below is satisfied by an
+    # ordinary pass over a root that is still there.
+    case_check "$(grep -qF 'REAPED' <<<"$out" && echo 1 || echo 0)" \
+               "the fixture ROOT was GONE before the sweep, so nothing under it was reaped (the race was driven)"
+    case_check "$(grep -qF 'GONE' <<<"$out" && grep -qF 'reason=vanished' <<<"$out" && echo 0 || echo 1)" \
+               "a root removed during the pass is NAMED reason=vanished, with its own row"
+    case_check "$(grep -qF 'gone=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… counted in its OWN field (summary: ${sum:-<none>})"
+    case_check "$(grep -qF 'unmeasurable=0 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… and NOT as unmeasurable — a root that is gone is a fact about the box, not a doubt about permissions"
+    case_check "$(grep -qF 'census=ok' <<<"$sum" && echo 0 || echo 1)" \
+               "… so the census stays ok: nothing was left unmeasured"
+    case_check "$(grep -q '^verdict_runner_work=ok$' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the class verdict is ok, so no operator is sent to look at a permission problem that does not exist"
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
+               "… and the pass exits 0 (rc=$rc)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── (m) an OUT-OF-RANGE floor is refused, and a leading-zero floor is normalised ────────────────
 # ⛔ THIS CASE EXISTS BECAUSE THE FLOOR IS THE ONLY GATE ON A `rm -rf`, so its REFUSAL path is as
 # load-bearing as its delete path — and it was unguarded. `num` accepts any digit string, so:
@@ -865,7 +901,7 @@ case_m() { # <entry-point> <owner>
 
 # ── (n) a CUT-SHORT sweep may not publish a PARTIAL candidate count ─────────────────────────────
 # The owner prints its `SUMMARY` unconditionally on every path that reaches the END of a pass
-# (`reap-runner-work.sh:614`), and it deliberately does NOT truncate a `--dry-run`
+# (the `print_summary` SUMMARY line, `reap-runner-work.sh`), and it deliberately does NOT truncate a `--dry-run`
 # (`REAP_RW_BUDGET_SECONDS` bounds `--apply` only — owner header, `reap-runner-work.sh:100-107`: "truncating
 # a dry pass would emit a SUMMARY candidates=N for a population LARGER than N, i.e. a partial count
 # presented as a total, which is the false-measurement shape this class's own `census=` refusal exists to
@@ -1230,6 +1266,11 @@ MUT_O2='s/^    print_summary refused$/    print_summary no-roots/'
 # during the pass does. `MUT_S` then reverts the guard under test, which must redden the same fixture.
 MUT_S_INSTRUMENT='s/^    entry_written_since "\$entry" "\$FLOOR_REF"; verdict=\$?/    rm -rf "$entry" 2>\/dev\/null; entry_written_since "$entry" "$FLOOR_REF"; verdict=$?/'
 MUT_S='s/; \[ -e "\$entry" \] || return 3; return 2; }$/; return 2; }/'
+# (t)'s TWO fixtures, the same construction one level up: the instrumented owner removes every QUEUED root
+# just before the sweep loop, so the real `root_is_listable` + re-stat run against a path that is gone.
+MUT_T_INSTRUMENT='s|^for _r in \$PENDING_ROOTS; do sweep_root "\$_r"; done$|for _r in $PENDING_ROOTS; do rm -rf "$_r" 2>/dev/null; done; for _r in $PENDING_ROOTS; do sweep_root "$_r"; done|'
+# … and the mutant reverts the root-level re-stat, so a gone root falls back into the `unlistable` arm.
+MUT_T='s/^        if \[ ! -e "\$root" \]; then$/        if false; then/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -1444,6 +1485,19 @@ if apply_mutation "$OWNER" "$T/mut-s-instrumented/reap-runner-work.sh" "$MUT_S_I
     fi
 else
     bad "s the vanishing fixture could not be built (the classification call moved) — the race arm is not covered"
+fi
+
+if apply_mutation "$OWNER" "$T/mut-t-instrumented/reap-runner-work.sh" "$MUT_T_INSTRUMENT"; then
+    expect_pass "t a ROOT that VANISHES during the pass is gone=, never unmeasurable= (not an abstention)" \
+        case_t "$REAPER" "$T/mut-t-instrumented/reap-runner-work.sh"
+    if apply_mutation "$T/mut-t-instrumented/reap-runner-work.sh" "$T/mut-t/reap-runner-work.sh" "$MUT_T"; then
+        expect_fail "t mutation: reverting the ROOT re-stat turns the case RED (a gone root becomes an abstention)" \
+            case_t "$REAPER" "$T/mut-t/reap-runner-work.sh"
+    else
+        bad "t mutation could not be applied (the vanished-root guard moved) — the arm is not checked any more"
+    fi
+else
+    bad "t the vanishing-root fixture could not be built (the sweep loop moved) — the race arm is not covered"
 fi
 
 # ⛔ THE TALLY SAYS HOW MANY ARMS WERE **SKIPPED**, not only how many passed: a total from
