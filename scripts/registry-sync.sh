@@ -800,7 +800,12 @@ identical_pairs() { # <store-blob-map> <hashed-pairs> <out> → `key<TAB>path`
   local map="$1" hashed="$2" out="$3" sm="$TMPD/sorted-map" sp="$TMPD/sorted-pairs"
   LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$map" > "$sm"
   LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$hashed" > "$sp"
-  join -t "$(printf '\t')" -1 1 -2 1 "$sm" "$sp" \
+  # LC_ALL=C is REQUIRED here, not stylistic: `join` compares with ITS OWN collation, so under the
+  # ambient locale it sees the C-sorted inputs as out of order, exits 1 and prints nothing — the
+  # pre-pass then silently finds zero identical pairs and every record takes the ~21-spawn path this
+  # function exists to remove. One mixed-case / leading-digit repo name in the 4,027-key set is
+  # enough to trigger it fleet-wide, and nothing surfaces it (the rc is not propagated).
+  LC_ALL=C join -t "$(printf '\t')" -1 1 -2 1 "$sm" "$sp" \
     | awk -F'\t' '$2 != "" && $2 == $4 { print $1 "\t" $3 }' > "$out"
   return 0
 }
