@@ -132,8 +132,15 @@ fi
 # is a LEGACY fallback, not the cell's home. ⛔ Absent is NOT fatal here: the helper only DISCLOSES box
 # state, so a `$O` predating it loses a warning, not a gate — the `run_agent` below then says CANNOT
 # VERIFY out loud rather than staying silent, which is the half that matters.
+# ⛔ THIS IS A COPY OF `spawn-gate.sh::mandate_preflight_lib`, AND THE COPY HAD ALREADY DIVERGED (this
+# change's review, P2): it carried no `MANDATE_PREFLIGHT_SH` entry, so an override that worked for lanes,
+# fixers and workers was SILENTLY IGNORED for the reviewer `pi` session — the two seams disagreed about
+# where the helper is on exactly the box that needed the override. The entry is added here, in the same
+# POSITION (first) and with the same `[ -f ]` condition, so the two lists are identical in effect; the
+# duplication itself stays a declared residual (`run_agent` is duplicated in both files, #2208), and any
+# future entry must be added to BOTH — `mandate-preflight.test.sh` §E6 pins that they agree.
 mandate_sh=""
-for _ms in "$O/mandate-preflight.sh" "$_M1_HERE/mandate-preflight.sh" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh" "${HOME:-}/.pi/agent/scripts/mandate-preflight.sh"; do
+for _ms in "${MANDATE_PREFLIGHT_SH:-}" "$O/mandate-preflight.sh" "$_M1_HERE/mandate-preflight.sh" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh" "${HOME:-}/.pi/agent/scripts/mandate-preflight.sh"; do
   [ -n "$_ms" ] && [ -f "$_ms" ] && { mandate_sh="$_ms"; break; }
 done
 REVIEW_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section reviewer)" || {

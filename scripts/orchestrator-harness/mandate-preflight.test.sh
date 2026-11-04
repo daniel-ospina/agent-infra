@@ -356,6 +356,45 @@ UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | unguarded_subs
 printf '  v="$(cmd)" || :\n' | unguarded_subs > /dev/null; [ $? -ne 0 ]; ck $? "control: a GUARDED assignment is NOT reported (the predicate is not always-true)"
 printf '  v="$(cmd)"\n' | unguarded_subs | grep -q .; ck $? "control: a BARE assignment IS reported (the arm can redden)"
 printf '  v="$(printf '\''%%s (%s)'\'' "$(hostname)")"\n' | unguarded_subs | grep -q .; ck $? "control: a NESTED / paren-bearing bare assignment IS reported — the shape the vacuous first cut could not match"
+# ── E1h: AN EMPTY NEEDLE MUST NEVER MATCH — the measured `case *""` hole (review P1) ────────────
+# `case "$x" in *"")` matches EVERY string. Both of the emit's idempotence tests keyed on a RENDERED
+# string, so one failed render meant "the brief already ends with this" about a brief that ends with
+# anything at all. Driven directly on the primitive, in both directions, because that is where the bug was.
+if bash -c '. "$1"; mandate_ends_with "ANY TEXT AT ALL" ""' _ "$HELPER"; then
+  bad "an EMPTY needle counts as a match — `case *\"\"` matches every string, so an unrendered claim reads as 'already stated'"
+else
+  ok "an EMPTY needle is NOT a match (an unrendered claim is never already stated)"
+fi
+bash -c '. "$1"; mandate_ends_with "prefix[block]" "[block]"' _ "$HELPER"; ck $? "a real needle at the END still matches (the arm above is not always-false)"
+if bash -c '. "$1"; mandate_ends_with "[block] then something else" "[block]"' _ "$HELPER"; then
+  bad "an EARLIER block counts as the brief's last statement — only the END may match"
+else
+  ok "a needle that is NOT at the end does not match (the block must be the brief's LAST statement)"
+fi
+# ── E1i: A RENDER THAT PRODUCES NOTHING MUST NOT READ AS "EVERY FILE PRESENT" (review P1) ─────────
+# The disclosure is rendered into `line`; when that render fails the OLD code took the empty result as
+# "nothing to declare" and — if a second read also failed — appended "BOTH mandated files are now PRESENT"
+# to a brief on a box where they are missing, i.e. #3377's false claim restored inside the fix. The
+# renderer is overridden here (a function override in the same shell, so no fixture is needed) to prove the
+# emit no longer answers an empty render with a present claim.
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+BRIEF1I="$TMP/brief-renderfail.txt"; printf '# a brief\n' > "$BRIEF1I"
+# ⛔ THE FIXTURE MUST BE STAMPED FIRST (MEASURED while writing this arm): on a FRESH brief the emit returns
+# early at `[ -n "$stamped" ] || return 0`, so a failed render appends nothing and the false-present branch
+# is never reached — the arm passed for the wrong reason and could not redden. The state that actually
+# produces the false claim is a brief that ALREADY carries a mandate block and whose box is still bad.
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" stamp' _ "$HELPER" "$TMP/renderfail.log" "$BRIEF1I" >/dev/null 2>&1
+grep -qF 'MISSING' "$BRIEF1I"; ck $? "E1i fixture: the brief is STAMPED with a real MISSING block before the failing render (the arm below needs that state)"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_line() { return 1; }; mandate_preflight_emit "$2" "$3" renderfail' \
+  _ "$HELPER" "$TMP/renderfail.log" "$BRIEF1I" >/dev/null 2>&1
+grep -qF 'CANNOT VERIFY' "$BRIEF1I"; ck $? "a render that produces NOTHING while the box is bad still tells the LANE it cannot verify"
+if grep -qF 'BOTH mandated files are now PRESENT' "$BRIEF1I"; then
+  bad "…but it ALSO claimed both files are now PRESENT while they are missing — a false claim is worse than the silence it replaced"
+else
+  ok "…and it does NOT claim they are present (the false-present branch is unreachable from a failed render)"
+fi
+# The last-resort literal must carry the ONE sentinel, or the block stops being idempotent on that path.
+grep -qF "line='$(bash -c '. "$1"; mandate_sentinel' _ "$HELPER")" "$HELPER"; ck $? "the last-resort literal's first line IS mandate_sentinel's value (the ONE marker cannot drift into two)"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
@@ -444,6 +483,15 @@ grep -qF 'mandate_preflight_emit "$log" "$prompt" "$label"' "$SPAWN";           
 grep -qF 'mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"' "$MERGE"; ck $? "merge-one.sh calls the SAME shared emit"
 grep -qF 'declare -F mandate_preflight_emit' "$SPAWN"; ck $? "spawn-gate.sh checks the helper is USABLE, not merely sourceable"
 grep -qF 'declare -F mandate_preflight_emit' "$MERGE"; ck $? "merge-one.sh checks the helper is USABLE too"
+# ── E6: THE TWO RESOLVERS MUST AGREE (review P2 — the copy had already diverged) ──────────────────
+# `run_agent` is duplicated (a declared residual, #2208), so the RESOLVER is duplicated too. The copy in
+# merge-one.sh was missing the `MANDATE_PREFLIGHT_SH` entry, which means an override honoured for lanes,
+# fixers and workers was silently ignored for the reviewer `pi` session — the two seams disagreed about
+# where the helper lives on exactly the box that needed the override. Pinned in both: the entry, and the
+# `[ -f ]` test that stops a STALE override short-circuiting to something that is not a file.
+grep -qF 'MANDATE_PREFLIGHT_SH' "$SPAWN"; ck $? "spawn-gate.sh's resolver honours MANDATE_PREFLIGHT_SH"
+grep -qF 'MANDATE_PREFLIGHT_SH' "$MERGE"; ck $? "merge-one.sh's resolver honours it TOO (the copy had diverged — an override that works for every lane but the reviewer)"
+grep -qF '[ -f "${MANDATE_PREFLIGHT_SH}" ]' "$SPAWN"; ck $? "…and spawn-gate.sh tests the override is a FILE, so a stale path falls through to the real candidates instead of degrading the disclosure to log-only"
 # The emit itself must be non-fatal on every branch.
 if awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -qE '\breturn [1-9]'; then
   bad "mandate_preflight_emit returns non-zero on some branch — callers would treat a disclosure as a refusal"
