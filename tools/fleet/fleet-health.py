@@ -185,7 +185,7 @@ def lane_census(alive, dead, pi_count, roster_size):
     ended pid): seven `PID DEAD` rows, NO census line, `✅ no suspects`, exit 0 from the lane section
     — while `ps` showed ~18 live `pi` processes. So the population decides, not the dead count.
 
-    ⛔ SILENT ARMS, EXHAUSTIVELY: `alive == roster_size` (every lane is a live bound incarnation,
+    ⛔ SILENT ARMS, EXHAUSTIVELY: `alive >= roster_size` (every lane is a live bound incarnation,
     whatever the process table says); or every lane conclusive with at least one attributed alive
     AND a MEASURED population (the roster accounts for at least one running process, so it is not
     contradicted); or every lane conclusive over a MEASURED-EMPTY population (the population can
@@ -216,7 +216,7 @@ def lane_census(alive, dead, pi_count, roster_size):
     claiming the clean one.
 
     ⛔ R2 IS SCOPED, AND THE SCOPING IS THE POINT (review cycle 12, finding 1). Above, R2 is
-    ONTOLOGICALLY about a population that WAS NOT READ. `alive == roster_size` is the one state whose
+    ONTOLOGICALLY about a population that WAS NOT READ. `alive >= roster_size` is the one state whose
     silence rests on a POSITIVE PER-LANE measurement instead: every rostered lane was bound to a live
     incarnation, so the box is accounted for without the table. Quoting R2 unscoped here would tell
     a reader to add `if pi_count is None: return UNVERIFIED` ABOVE the first arm — which would make
