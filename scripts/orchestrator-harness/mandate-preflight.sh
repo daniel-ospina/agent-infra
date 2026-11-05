@@ -571,20 +571,22 @@ _mandate_cli() {
         return 2
       fi
       mandate_missing ;;
-    # ⛔ THE FOURTH SURFACE OF THE SAME STATE, AND IT WAS THE ONE LEFT UNGUARDED (#3379 review cycle 8, P2,
-    # MEASURED). `--missing` above closes "rc 0 with an empty list" for a declaration that renders nothing;
-    # this verb renders the SAME empty bytes at rc 0 for the SAME state — byte-for-byte identical to the
-    # healthy answer — while `--check`, `--missing` and `--line` all answer CANNOT VERIFY. The doctrine is
-    # the file's own ("a cannot-verify is never a pass"), and the consequence here is concrete: a consumer
-    # that PROVISIONS from this list provisions nothing, silently — #3377's silence reached through the
-    # helper written to end it. Same guard, same answer, and the help text now says so too.
+    # ⛔ THE FOURTH SURFACE OF THE SAME STATE (#3379 review cycle 8, P2, MEASURED). `--missing` above
+    # closes "rc 0 with an empty list" for a declaration that renders nothing; this verb rendered the SAME
+    # empty bytes at rc 0 for the SAME state — byte-for-byte identical to the healthy answer — while
+    # `--check`, `--missing` and `--line` all answered CANNOT VERIFY. The doctrine is the file's own ("a
+    # cannot-verify is never a pass"), and the consequence here is concrete: a consumer that PROVISIONS from
+    # this list provisions nothing, silently — #3377's silence reached through the helper written to end it.
+    # ⛔ AND ONLY THE DECLARATION IS GUARDED HERE (review cycle 9, P2, MEASURED): this verb's FIRST version
+    # also refused when the STATE DIR was unresolvable, on the claim that the names "cannot be enumerated".
+    # That claim was false — `mandate_files` is a static here-doc that reads no box state and renders both
+    # lines at rc 0 in that state (measured 336 bytes) — so the second guard refused a service the tool
+    # delivers: a fail-closed over-block with an untrue sentence in its comment and its help text, and no
+    # exercise behind it. The declared NAMES are knowable when the declaration is readable; only their
+    # PRESENCE is a question about the box, and that question belongs to `--check`, `--missing` and `--line`.
     --files)
       if ! mandate_declaration_readable; then
         printf '[mandate-preflight] CANNOT VERIFY: the mandate declaration renders no names, so "no file is mandated" cannot be concluded (a cannot-verify is never an empty list). Use --check for the verdict.\n' >&2
-        return 2
-      fi
-      if mandate_state_root_undecidable; then
-        printf '[mandate-preflight] CANNOT VERIFY: the state dir cannot be resolved on this box, so the declared names cannot be enumerated (a cannot-verify is never an empty list). Use --check for the verdict.\n' >&2
         return 2
       fi
       mandate_files | cut -d'|' -f1 ;;
@@ -593,7 +595,7 @@ _mandate_cli() {
       printf '  --check    0 every mandated file present · 1 any missing (each named on stderr) · 2 CANNOT VERIFY\n'
       printf '  --line     the disclosure block appended to a brief (EMPTY when all are present)\n'
       printf '  --missing  the missing paths, one per line · 2 CANNOT VERIFY (a path occupied by a non-file, or a state dir that cannot be resolved — never an empty or silently short list for an unknown state)\n'
-      printf '  --files    the declared names, one per line · 2 CANNOT VERIFY (an unread declaration or an unresolvable state dir renders no names, and that is not "nothing is mandated")\n' ;;
+      printf '  --files    the declared names, one per line · 2 CANNOT VERIFY (only when the declaration itself renders no names — the names are static, so an unresolvable state dir does NOT block them)\n' ;;
     "")
       mandate_preflight_line ;;
     *)

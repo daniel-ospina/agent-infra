@@ -575,6 +575,19 @@ DECL_FILES_OUT="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; };
 mkstate
 FILES_OK="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --files 2>/dev/null' _ "$HELPER")"
 [ "$(printf '%s\n' "$FILES_OK" | grep -c .)" = "2" ]; ck $? "POSITIVE CONTROL: a readable declaration still lists both names at rc 0 ($(printf '%s\n' "$FILES_OK" | grep -c .) names) — the guard is not always-2"
+# ⛔ THE NAMES ARE STATIC, SO AN UNRESOLVABLE STATE DIR MUST NOT BLOCK THEM (#3379 review cycle 9, P2,
+# MEASURED). This verb's first version also answered 2 when the state dir could not be resolved, on the
+# claim that the names "cannot be enumerated" — false: `mandate_files` is a here-doc that reads no box state
+# and renders both lines (336 bytes) in exactly that state. So the guard refused a service the tool
+# delivers, fail-closed, with no exercise behind it. This arm is what keeps that over-block from returning:
+# a box whose state dir is unreadable still gets its declared names.
+UD2="$(mktemp -d)"; mkdir -p "$UD2/.pi/agent/state"; chmod 000 "$UD2/.pi/agent/state"
+FILES_UD="$(CELL_HOME="$UD2" bash -c '. "$1"; _mandate_cli --files 2>/dev/null' _ "$HELPER"; printf 'rc=%s' $?)"
+chmod 755 "$UD2/.pi/agent/state"; rm -rf "$UD2"
+case "$FILES_UD" in
+  *LANE-BRIEF-PREAMBLE.md*TORTOISE-GRAPH-BRIEF.md*'rc=0'*) ok "an UNRESOLVABLE state dir still yields the declared names at rc 0 — the names are static, and a presence question is not this verb's to answer" ;;
+  *) bad "--files withheld the declared names on a box whose STATE DIR is unreadable — an over-block: the list is static and knowable ($(printf '%s' "$FILES_UD" | tr '\n' ' '))" ;;
+esac
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
