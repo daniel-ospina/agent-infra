@@ -82,7 +82,8 @@ reaches:
 Every one of the fixture-based reads targets the FIXTURE's pid (`99999999`), so they are not "about
 THIS process". The abstaining-record and FULLY-ABSTAINING arms are the ones that read
 `os.getpid()`, and they ARE independent of what those reads return — their lanes are
-`pidStartSeconds`-absent, which abstains regardless (`_observed` is stubbed in both).
+`pidStartSeconds`-absent, which abstains regardless (`_observed` is stubbed in the
+FULLY-ABSTAINING arm only; the abstaining-record arm calls the REAL probe — hence its bound of 3).
 The TWO ALL-DEAD `_drive` arms (`rc_stale`, `rc_unv`) are NOT independent:
 each turns on `_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on
 a usable `ps` for a nonexistent pid. That dependency is named by the `CENSUS: PRECONDITION:`
