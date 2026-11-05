@@ -60,9 +60,13 @@ export O="$T/orch" CLAIM_STATE_DIR="$T/orch/state"
 # real registry and report "unclaimed" over a live claim — the bug the guard now refuses to have.
 # ⛔ AND SO ARE THE LEASE SEAMS, for the same reason one class further along (review round 1): case 10
 # pins the DEFAULT term, so a cell that legitimately raised the knob — the operation `claims.sh`
-# advertises — would get a FALSE RED on correct code. Measured before this `unset`: `CLAIM_BRANCH_TTL=18000`
-# turned case 10 into 2 failures over a lease that was doing exactly what it was told. Empty is safe:
-# `claims.sh` falls back to 14400 / 9600 on an empty or unparseable value.
+# advertises — would get a FALSE RED on correct code. Measured (round 7, this `unset` deleted and
+# `CLAIM_BRANCH_TTL=18000` exported): case 10 reddens on its default-lease arm, its printed-ceiling arm
+# and its over-ceiling clamp arm — a lease that was doing exactly what it was told, read as three
+# defects. The arms are NAMED rather than counted because a count rots the moment an arm is added:
+# round 1 wrote "2 failures" here, and by round 5 the same experiment reddened 3, so the sentence a
+# reader would re-run no longer reproduced. Empty is safe: `claims.sh` falls back to 14400 / 9600 on
+# an empty or unparseable value.
 unset CLAIM_REPO CLAIM_OWNER_HOST CLAIM_BRANCH_TTL CLAIM_TTL_MAX
 
 BR=integration/land-batch-2
@@ -274,16 +278,43 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # ⛔ AND IT MUST FAIL CLOSED (review round 6, P2). The first form of this arm was
 # `if grep -qE '…' ; then bad …; else ok …; fi`, which reports PASS for ANY non-zero grep status —
 # exit 2 (unreadable operand) included — and used `\b`, a GNU/BSD extension rather than POSIX ERE.
-# A guard that cannot answer must not read as clean, so the three exit codes are separated here.
-NAMING_RC=0
-grep -qE 'ceiling \(CLAIM_(TTL_MAX|ISSUE_TTL|TTL)([ )]|$)' "$T/acq.out" || NAMING_RC=$?
-if [ "$NAMING_RC" = "0" ]; then
-  bad "the clamp warning names another keying's knob AS this ceiling: $(cat "$T/acq.out")"
-elif [ "$NAMING_RC" = "1" ]; then
-  ok "the clamp warning does not name another keying's knob as this ceiling"
-else
-  bad "the not-another-knob guard could not evaluate the property (grep exit $NAMING_RC) — unreadable operand must not read as clean"
-fi
+# A guard that cannot answer must not read as clean, so the three outcomes are separated here.
+# ⛔ AND IT MUST NOT BE A SPELLING (review round 7, P1 + P2). Round 6's pattern terminated the knob
+# name with `([ )]|$)` — space, `)` or EOL — so the LEAST creative respelling, a SLASH, walked
+# straight through it: the exact former message `ceiling (CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s)`
+# printed `ok`, and so did a hybrid carrying both a wrong clause and the right one. Widening the
+# delimiter class only moves the same problem one respelling along. So this arm asserts the
+# PROPERTY instead: the clause INSIDE `ceiling ( … )` states the ceiling VALUE and nothing else —
+# every knob name lives in the "raise the ceiling for that keying ( … )" list that FOLLOWS — so the
+# clause must contain no `CLAIM_` name at all. No respelling of a knob can be a bare number.
+# ⛔ AND IT IS NON-VACUOUS (round 7, P2): `grep` returns 1 both for "found nothing" and "read
+# nothing", so an EMPTY message used to satisfy "does not name another knob". Here an absent clause
+# is its own outcome and it is RED, not green.
+CLAUSE_REPORT="$(awk '
+  { s = $0
+    while ((i = index(s, "ceiling (")) > 0) {
+      s = substr(s, i + 9)
+      j = index(s, ")")
+      if (j == 0) { unterminated = 1; break }
+      n++
+      c = substr(s, 1, j - 1)
+      if (c ~ /CLAIM_/) named = c
+      s = substr(s, j + 1)
+    } }
+  END {
+    if (unterminated) print "UNTERMINATED"
+    else if (n == 0) print "ABSENT"
+    else if (named != "") print "NAMES " named
+    else print "OK " n
+  }
+' "$T/acq.out" 2>/dev/null)"
+case "$CLAUSE_REPORT" in
+  "OK "*) ok "the ceiling clause states this keying's value and names no keying knob" ;;
+  ABSENT) bad "the clamp warning carries no 'ceiling ( … )' clause to evaluate — an empty or absent clause must not read as clean: $(cat "$T/acq.out")" ;;
+  UNTERMINATED) bad "the clamp warning's 'ceiling (' clause is unterminated — the property cannot be evaluated: $(cat "$T/acq.out")" ;;
+  "NAMES "*) bad "the clamp warning names a keying knob AS this ceiling inside 'ceiling ( … )': ${CLAUSE_REPORT#NAMES }" ;;
+  *) bad "the not-another-knob guard could not evaluate the property (awk said '${CLAUSE_REPORT}') — unreadable operand must not read as clean" ;;
+esac
 # ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2). The arm above measures the STAMPED
 # LEASE, never the printed ceiling — so a warning that stamps 14400 correctly while PRINTING 9600
 # misdirects the fixer exactly as before and stayed green. The number in the message is the `%ss`

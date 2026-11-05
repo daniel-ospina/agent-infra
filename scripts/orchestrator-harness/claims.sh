@@ -520,7 +520,9 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
 #      rename leaves every peer's roster stale in exactly that way, so abstaining is what keeps a
 #      rename from turning into a fleet-wide STEAL (under-reap: the lease still bounds it).
 # ⛔ PID REUSE IS AN UNDER-REAP, ON PURPOSE: a recycled pid reads alive and the claim simply runs to
-# its lease (bounded by CLAIM_TTL_MAX / CLAIM_ISSUE_TTL). The opposite polarity steals live work.
+# its lease (bounded by THAT KEYING'S OWN ceiling — CLAIM_TTL_MAX for the per-head/PR keys, 9600;
+# CLAIM_ISSUE_TTL for issue keys, 18000; CLAIM_BRANCH_TTL for branch keys, 14400). Naming only the
+# first two was wrong for branch keys, whose ceiling is neither. The opposite polarity steals live work.
 # ⛔ `ps -p` NOT `kill -0`: `kill -0` reports EPERM for a LIVE pid owned by another user, i.e. it
 # reads a running lane as dead and reclaims its claim.
 # ⛔ AND `ps` MUST BE PROVEN ABLE TO ANSWER AT ALL. `ps -p` has THREE outcomes — found, absent, and
