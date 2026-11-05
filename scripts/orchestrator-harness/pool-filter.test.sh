@@ -216,8 +216,15 @@ drive_site() { # <label> <fixed-string that identifies the site's jq argument> <
   if [ "$out" = "$want" ]; then ok=$((ok+1))
   else bad=$((bad+1)); echo "FAIL [composed call site] $label emitted '$out' - expected '$want'"; fi
 }
-# The three tier queries concatenate $POOL_JQ and append the tier prefix.
+# The three tier queries concatenate $POOL_JQ and append the tier prefix. ⛔ ALL THREE ARE DRIVEN,
+# not just one (review cycle 3, P2): pinning P0 alone left a site-local arm on P1 or P2 invisible —
+# measured, `--jq '.[]|'"$POOL_JQ"'|"2 \(.number)"|select((.title//"")|test("mcp";"i")|not)'`
+# at the P2 site returned `61 passed, 0 failed` while dropping 11 live P2 rows, and selftest's rank
+# pin reads only the RANK DIGIT, so it stays green too. A per-site arm is the drift class this PR
+# removes (T3); a comment claiming coverage that does not exist is what stops anyone looking.
 drive_site 'P0 tier' '|"0 \(.number)"' '0 900051'
+drive_site 'P1 tier' '|"1 \(.number)"' '1 900051'
+drive_site 'P2 tier' '|"2 \(.number)"' '2 900051'
 # The emergency floor reads it through its own local (its body is extracted alone).
 drive_site 'emergency floor' '"$pool_jq"' '900051'
 
@@ -243,6 +250,15 @@ if [ -n "$floor_bind" ] && [ "$(printf '%s\n' "$floor_bind" | grep -c .)" -eq 1 
 fi
 if [ "$floor_eff" = "$SEL" ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] the emergency floor's \`local pool_jq=\` does not resolve to the shared definition (got '${floor_eff:0:60}') - it must read \${POOL_JQ:?...} and never carry its own program"; fi
+
+# (a3) AND NO SECOND ASSIGNMENT TO THE SYMBOL (review cycle 3, P3). (a2) reads the `local` FORM; a
+# plain `pool_jq=…` on the next line assigns THROUGH that local (bash locals are function-scoped), so
+# the binding (a2) reads stays pristine and the site runs the private program anyway. Measured:
+# inserting `pool_jq='select((.assignees|length)==0)'` one line below the shipped binding kept this
+# suite at `61 passed, 0 failed`. So the SYMBOL carries exactly one assignment in the whole file.
+stray="$(grep -cE '^[[:space:]]*pool_jq=' "$RC" 2>/dev/null || true)"
+if [ "${stray:-0}" -eq 0 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [drift] ${stray:-0} extra \`pool_jq=\` assignment(s) besides the pinned \`local pool_jq=\` - the fourth site must carry no program of its own"; fi
 
 # (b) THE WHOLE PROGRAM IS PINNED, ONCE, BY WHOLE-TEXT EQUALITY (review cycle 4, P2). The three
 # per-arm pins that used to live here could each be defeated by an ARM APPENDED to the shared program:

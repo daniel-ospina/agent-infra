@@ -1408,8 +1408,12 @@ WEF="$T/weqfns.sh"
 # ⛔ THE EXTRACTED BODY DEPENDS ON THE SHIPPED POOL DEFINITION (tortoise#10951). `write_emergency_queue`
 # consults the pool predicate, which is the ONE `POOL_JQ=` line at the top of the shipped refresh — a
 # file-global that a bare function-body extraction does not carry. So the extraction carries it: without
-# this line the body dies on `POOL_JQ: unbound variable` under `set -u` and the P0 emergency class is
-# never produced (measured: 5 P13 failures, 0 on the same suite before the pool consolidation).
+# this line the body dies on the `${POOL_JQ:?…}` guard's NAMED message (`POOL_JQ is not in scope — a
+# consumer that extracts this function must also extract the POOL_JQ= line from the shipped refresh`),
+# and the P0 emergency class is never produced (measured: 5 P13 failures when the prepend was missing,
+# 0 on the same suite before the pool consolidation). ⛔ DO NOT LOOK FOR bash's bare `POOL_JQ: unbound
+# variable` — that is what the `:?` guard REPLACED, so a NAMED message is the correct outcome here
+# (measured, review cycle 3, P3).
 POOL_DEF="$(sed -n '/^POOL_JQ=/p' "$REFRESH")"
 if [ -z "$POOL_DEF" ]; then
   ck "P13(iii-b-1) (setup) the shipped refresh carries the pool definition the emergency writer needs" 1
