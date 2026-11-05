@@ -64,9 +64,14 @@ assert_unregistered() { if "$REAL_GIT" -C "$1" worktree list --porcelain | grep 
 # fixtures eat 2 GB) would refuse and report failures about worktrees that were never created.
 # That is the exact host-measuring defect `spawn-gate.test.sh` documents for its own `df` stub. The
 # gate's own behaviour is pinned in `disk-admission.test.sh`, which STUBS `df` and measures nothing
-# about this host; here both terms are zeroed through the documented seams, so these arms test the
-# lifecycle and only the lifecycle.
-export DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+# about this host; here all THREE terms are zeroed through the documented seams, so these arms test
+# the lifecycle and only the lifecycle.
+# ⛔ ALL THREE, NOT TWO (review P2, #3409). `disk_worktree_terms` defaults the TREE term to its
+# python default (350 MB) whenever `DISK_LANE_TREE_MB` is unstated, so zeroing only self+reserve left
+# `need = 350` and this suite still measured the host below a 350 MB floor — measured: a `df` stub
+# reporting 100 MB free printed 46 passed / 62 failed, every red on a provision that was merely
+# refused. `spawn-gate.test.sh` had always zeroed all three; these exports copied two.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 
 REAL_GIT="$(command -v git)" || { echo "FATAL: git is required" >&2; exit 2; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/wt-lifecycle-test.XXXXXX")" || { echo "FATAL: no temp dir" >&2; exit 2; }

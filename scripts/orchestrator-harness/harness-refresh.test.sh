@@ -26,9 +26,12 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # 6.5 GB free: 306 passed / 3 failed, each one `[disk-admit] REFUSED-DISK(free=6.5GB, need=8.0GB …)`
 # where the arm expected a spawn line, and the PARENT commit on the same box was 309/0. That is the
 # "test of the host rather than of the gate" defect `disk-admission.test.sh` denounces: the gate's own
-# behaviour is pinned there, with a stubbed `df`. Nothing here tests admission, so both documented
+# behaviour is pinned there, with a stubbed `df`. Nothing here tests admission, so all THREE documented
 # cost seams are zeroed (the same idiom `wt-lifecycle.test.sh` uses).
-export DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+# ⛔ ALL THREE, NOT TWO (review P2, #3409): `disk_worktree_terms` defaults the TREE term to 350 MB when
+# `DISK_LANE_TREE_MB` is unstated, so a two-term neutralisation still leaves `need = 350` and this rig
+# measures the host below that floor instead of testing the refresh path.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 RR="$HERE/harness-refresh.sh"
 LOOP="$HERE/orch-loop.sh"
 DM="$HERE/dispatch-merge.sh"

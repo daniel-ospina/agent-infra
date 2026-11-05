@@ -45,7 +45,10 @@ set -u
 # failure text then blames worktree materialisation). The idiom is the one `wt-lifecycle.test.sh` and
 # `harness-refresh.test.sh` already use; the gate's own behaviour is pinned in `disk-admission.test.sh`,
 # which STUBS `df` and therefore measures the gate rather than the host.
-export DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+# ⛔ ALL THREE TERMS, NOT TWO (review P2, #3409): `disk_worktree_terms` defaults the TREE term to 350 MB
+# when `DISK_LANE_TREE_MB` is unstated, so zeroing only self+reserve still left `need = 350` and C3 was
+# still decided by the host below that floor.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RT="$HERE/repo-target.sh"
