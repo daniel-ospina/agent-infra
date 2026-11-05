@@ -1752,7 +1752,7 @@ ck "  …fixture: the cut listing is genuinely truncated and still brace-unbalan
    "$([ -n "$_CUT" ] && [ "$(printf '%s' "$_CUT" | tr -cd '{' | wc -c | tr -d ' ')" -gt "$(printf '%s' "$_CUT" | tr -cd '}' | wc -c | tr -d ' ')" ] && echo 0 || echo 1)"
 L27="$(printf '%s' "$_CUT" | cap_parse_inventory 2>&1)"; RC=$?
 ck "(c5) a listing cut between objects is REFUSED, never read as a 2-machine fleet ($L27)" \
-   "$([ "$RC" -ne 0 ] && qF 'UNCLASSIFIED' "$L27" && ! printf '%s' "$L27" | grep -qE '^pi-c[0-9] ' && echo 0 || echo 1)"
+   "$([ "$RC" -ne 0 ] && qF 'UNCLASSIFIED' "$L27" && ! grep -qE '^pi-c[0-9] ' <<<"$L27" && echo 0 || echo 1)"
 L27C="$(printf '%s' "$_FULL" | cap_parse_inventory 2>&1)"
 ck "  …while the COMPLETE body of the same shape reads all 5 machines (so (c5) is not a blanket refusal)" \
    "$([ "$(printf '%s' "$L27C" | grep -cE '^pi-c[0-9] 10\.9\.9\.')" -eq 5 ] && echo 0 || echo 1)"
@@ -1848,15 +1848,15 @@ ck "  …mutation control: with plain arithmetic the same input prints NOTHING (
 # `place=h1 eligible=1` on the same bytes that must refuse (`probe_stale`).
 L31="$(printf '%s\n' "$(recb 10.0.0.1 08)" | cap_place cell-1 2>&1)"; RC=$?
 ck "(c9) cap_place refuses a record it cannot age, rather than placing on it ($L31)" \
-   "$([ "$RC" -ne 0 ] && qF 'refuse bound=probe_stale' "$L31" && ! printf '%s' "$L31" | grep -q '^place=' && echo 0 || echo 1)"
+   "$([ "$RC" -ne 0 ] && qF 'refuse bound=probe_stale' "$L31" && ! q '^place=' "$L31" && echo 0 || echo 1)"
 L31C="$(printf '%s\n' "$(recb 10.0.0.1 "$NOW")" | cap_place cell-1 2>&1)"
 ck "  …while the same box with a readable stamp PLACES (so (c9) is not a blanket refusal: $(printf '%s' "$L31C" | head -1))" \
-   "$(printf '%s' "$L31C" | grep -q '^place=' && echo 0 || echo 1)"
+   "$(q '^place=' "$L31C" && echo 0 || echo 1)"
 # (c9-mutant) NON-VACUITY: plain arithmetic in `cap_bound_hit` makes the same bytes PLACEABLE.
 sed 's|  age=$(( 10#$now - 10#$at ))|  age=$(( now - at ))|' "$CAP" > "$TMP/cap-octal-place.sh"
 L31M="$(printf '%s\n' "$(recb 10.0.0.1 08)" | bash -c '. "$1"; cap_place cell-1' _ "$TMP/cap-octal-place.sh" 2>/dev/null)"
 ck "  …mutation control: with plain arithmetic the same record is PLACED ($(printf '%s' "$L31M" | head -1))" \
-   "$(printf '%s' "$L31M" | grep -q '^place=' && echo 0 || echo 1)"
+   "$(q '^place=' "$L31M" && echo 0 || echo 1)"
 # (c10) ⛔ `0` IS NOT A BOUND (fresh review round 7, P2): GNU `timeout 0` means NO timeout, so a legal
 # `CAP_INVENTORY_TIMEOUT=0` dropped the bound on the arm every Linux cell takes. Deterministic: a
 # stand-in `timeout` records the SECONDS it was handed, so the arm asserts what the bound would be
@@ -1900,7 +1900,7 @@ sed 's|  _ttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"|  _ttl="${CAP_PROBE_TTL:-}"
 ck "  …the mutant really lost the validated TTL" "$([ "$(grep -c 'MUTANT: raw TTL' "$TMP/cap-rawttl.sh")" -eq 1 ] && echo 0 || echo 1)"
 L32M="$(printf '%s\n' "$_OLD3" | CAP_PROBE_TTL=15m bash -c '. "$1"; cap_place cmux' _ "$TMP/cap-rawttl.sh" 2>/dev/null)"
 ck "  …mutation control: with the raw TTL the same record is PLACED ($(printf '%s' "$L32M" | head -1))" \
-   "$(printf '%s' "$L32M" | grep -q '^place=' && echo 0 || echo 1)"
+   "$(q '^place=' "$L32M" && echo 0 || echo 1)"
 # (c12) ⛔ AND A BROKEN RTC, in the same both-readers shape: `at = now + 1e8` must not be PLACED.
 _FUT3="$(recb 10.0.0.1 "$(( NOW + 100000000 ))")"
 L33="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$_FUT3" 0)"; RC=$?
@@ -1909,7 +1909,7 @@ ck "(c12) a broken RTC refuses in BOTH readers: the line says why=clock-skew and
    "$([ "$RC" -eq 1 ] && qF 'why=clock-skew' "$L33" && qF 'refuse bound=probe_unreadable' "$L33P" && echo 0 || echo 1)"
 L33C="$(printf '%s\n' "$(recb 10.0.0.1 "$NOW")" | cap_place cmux 2>/dev/null)"
 ck "  …while a readable stamp PLACES (so (c12) is not a blanket refusal: $(printf '%s' "$L33C" | head -1))" \
-   "$(printf '%s' "$L33C" | grep -q '^place=' && echo 0 || echo 1)"
+   "$(q '^place=' "$L33C" && echo 0 || echo 1)"
 # (c13) ⛔ THE `timeout` ARM MUST KILL, NOT JUST ASK (fresh review round 9, P1). A child that ignores
 # SIGTERM defeated the bound: `timeout 1 sh -c 'trap "" TERM; sleep 10'` returned after 10 s while the
 # watchdog arm bounded the same child in 1 s — on the arm every Linux cell takes, in the function whose
@@ -1934,20 +1934,20 @@ _C14R="$TMP/chanrepo"; git init -q "$_C14R" 2>/dev/null
 git -C "$_C14R" remote add origin 'https://user:p@ss@github.com/daniel-ospina/agent-infra.git' 2>/dev/null
 L34="$(cap_fleet_line "$_C14R" 2>/dev/null)"
 ck "(c14) chan= carries the host, never the userinfo ($(printf '%s' "$L34" | grep -o 'chan=[^ ]*'))" \
-   "$(qF 'chan=github.com/daniel-ospina/agent-infra' "$L34" && ! printf '%s' "$L34" | grep -qE 'chan=[^ ]*(@|token|p@ss)' && echo 0 || echo 1)"
+   "$(qF 'chan=github.com/daniel-ospina/agent-infra' "$L34" && ! grep -qE 'chan=[^ ]*(@|token|p@ss)' <<<"$L34" && echo 0 || echo 1)"
 L34B="$(cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
 ck "  …and an unrelated direct call carries NO chan (no carry-over: $(printf '%s' "$L34B" | grep -c 'chan=') occurrence(s))" \
-   "$(! printf '%s' "$L34B" | grep -q 'chan=' && echo 0 || echo 1)"
+   "$(! q 'chan=' "$L34B" && echo 0 || echo 1)"
 sed 's|_chan="${_chan##\*@}"|_chan="${_chan#*@}"   # MUTANT: shortest @|' "$CAP" > "$TMP/cap-chanweak.sh"
 ck "  …the mutant really lost the longest-@ strip" "$([ "$(grep -c 'MUTANT: shortest @' "$TMP/cap-chanweak.sh")" -ge 1 ] && echo 0 || echo 1)"
 L34M="$(bash -c '. "$1"; cap_chan_of "$2"' _ "$TMP/cap-chanweak.sh" "$_C14R" 2>/dev/null)"
 ck "  …mutation control: with the shortest match the line carries the 'ss@…' FRAGMENT of the password (${L34M})" \
-   "$(printf '%s' "$L34M" | grep -qE 'ss@' && echo 0 || echo 1)"
+   "$(grep -qE 'ss@' <<<"$L34M" && echo 0 || echo 1)"
 # (c15) ⛔ A REFUSAL NAMES THE BOUND IT HIT, NOT THE SEAM AS TYPED (fresh review round 9, P2): with
 # `CAP_INVENTORY_TIMEOUT=00` the message said `timed out after 00s` after waiting 10 s.
 L35="$(CAP_INVENTORY_TIMEOUT=00 CAP_CMUX_LIST="sleep 12" cap_fleet_inventory 2>&1 | head -1)"
 ck "(c15) the timeout diagnostic names the APPLIED bound ($L35)" \
-   "$(qF 'timed out after 10s' "$L35" && ! printf '%s' "$L35" | grep -q 'after 00s' && echo 0 || echo 1)"
+   "$(qF 'timed out after 10s' "$L35" && ! q 'after 00s' "$L35" && echo 0 || echo 1)"
 # (c16) ⛔ A FIELD THE SHELL CANNOT REPRESENT IS A REFUSAL, NOT A PASS (fresh review round 10, P1). Every
 # gate is `[ "$x" -ge "$y" ]`, and an ERRORING test is FALSE: a record carrying a 20-digit `lpc` bypassed
 # the load ceiling (`[: …: integer expression expected` on a discarded stderr) and placement answered
@@ -1965,12 +1965,12 @@ sed 's|    \[ "${#v}" -le 12 \] \|\| return 1|    :   # MUTANT: no width guard|'
 ck "  …the mutant really lost the width guard" "$([ "$(grep -c 'MUTANT: no width guard' "$TMP/cap-nowidth.sh")" -ge 1 ] && echo 0 || echo 1)"
 L36M="$(printf '%s\n' "$_HUGE" | bash -c '. "$1"; cap_place cmux' _ "$TMP/cap-nowidth.sh" 2>/dev/null)"
 ck "  …mutation control: without it the same record is PLACED ($(printf '%s' "$L36M" | head -1))" \
-   "$(printf '%s' "$L36M" | grep -q '^place=' && echo 0 || echo 1)"
+   "$(q '^place=' "$L36M" && echo 0 || echo 1)"
 # (c16b) the wrapped stamp: a ref whose `at` overflows 2^64 must not read as "just published".
 _WRAP="$(recf cmux 8 56 0 120000 14000 18446744075502150016 400 15041 1)"
 L37="$(CAP_EXPECTED_BOXES="cell-1:$(printf '%s' "$_WRAP" | sed -n 's/.*boxid=\([^ ]*\).*/\1/p')" cap_fleet_line_from "$_WRAP" 0)"
 ck "(c16b) an overflowing stamp is REFUSED, never read as fresh ($L37)" \
-   "$(! printf '%s' "$L37" | grep -q 'published=1' && echo 0 || echo 1)"
+   "$(! q 'published=1' "$L37" && echo 0 || echo 1)"
 # (c17) ⛔ 137 IS A TIMEOUT ONLY IF THE BOUND ELAPSED (fresh review round 10, P2): a child that kills
 # ITSELF returned in 0 s and was relabelled `timed out after 10s`, while the watchdog said `exited 137`.
 _c17_rc=$(CAP_BOUND_IMPL=auto cap_bounded 10 sh -c 'kill -9 $$' >/dev/null 2>&1; echo $?)
@@ -2051,7 +2051,7 @@ _DUP='{"machines":[{"name":"pi-c1","status":"running","network":{"ipv4":"10.10.0
 _DIS='{"machines":[{"name":"pi-c1","status":"running","network":{"ipv4":"10.10.0.1"}},{"name":"pi-c2","status":"running","network":{"ipv4":"10.10.0.2"}}]}'
 L29="$(printf '%s' "$_DUP" | cap_parse_inventory 2>&1)"; RC=$?
 ck "(c7) a repeated address refuses the listing ($L29)" \
-   "$([ "$RC" -ne 0 ] && qF 'DUPLICATEKEY 10.10.0.1' "$L29" && ! printf '%s' "$L29" | grep -qE '^pi-c' && echo 0 || echo 1)"
+   "$([ "$RC" -ne 0 ] && qF 'DUPLICATEKEY 10.10.0.1' "$L29" && ! q '^pi-c' "$L29" && echo 0 || echo 1)"
 L29C="$(printf '%s' "$_DIS" | cap_parse_inventory 2>&1)"
 ck "  …while distinct addresses read both machines (so (c7) is not a blanket refusal)" \
    "$([ "$(printf '%s' "$L29C" | grep -cE '^pi-c[0-9] 10\.10\.0\.')" -eq 2 ] && echo 0 || echo 1)"
