@@ -250,6 +250,20 @@ EOF
 mandate_preflight_line() {
   local root path missing unreadable irregular cv_where
   root="$(mandate_state_root)"
+  # ⛔ AN UNREAD DECLARATION MUST NOT RENDER "NOTHING TO DISCLOSE" (#3379 review cycle 6, P1, MEASURED).
+  # This function tested the DIR and then the three collectors — and all three iterate `$(mandate_files)`,
+  # so a declaration that renders NOTHING empties the whole population and the renderer returned EMPTY at
+  # rc 0. Empty is this tool's own word for "every mandated file is present", and `--line` is the surface a
+  # LANE actually reads; the emit only survived because its `healthy` gate re-reads the state independently,
+  # i.e. the fix lived in the CALLER, not the surface. Cycle 2 closed this on `--check` and cycle 5 on
+  # `--missing`; this is the third surface of the same state. Reachable with no stub at all: a truncated or
+  # stale `$O` copy that lost the two `name|reason` SPEC lines still parses, and answers all of these.
+  if ! mandate_declaration_readable; then
+    printf '%s\n' "$(mandate_sentinel)"
+    printf '[mandate-preflight] ⛔ CANNOT VERIFY on this box (%s): the mandate declaration renders NO names, so no file was looked for and "nothing to disclose" cannot be concluded — a cannot-verify is NEVER a pass (agent-infra#3377). The remedy is a COMPLETE copy of this helper (a truncated or stale `$O` install), not a deployment and not a chmod.\n' \
+      "$(hostname 2>/dev/null || printf 'this box')"
+    return 0
+  fi
   # ⛔ AN UNREADABLE STATE DIR MAKES `-f` FALSE FOR EVERY FILE UNDER IT, so testing the files first
   # reported the whole dir's contents as MISSING — a false ABSENCE claim about files that may be
   # perfectly present, and the wrong remedy (`ship it` instead of `chmod`). The dir is tested FIRST and

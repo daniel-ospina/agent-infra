@@ -349,6 +349,46 @@ chmod 600 "$BRIEF1F" 2>/dev/null
 # line from it, and it is exercised by a control on each side (below) instead of being trusted.
 unguarded_subs() { grep -nE '^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*=("|)?\$\(' | grep -vE '\|\|[[:space:]]*:[[:space:]]*$'; }
 UNGUARDED="$(awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | unguarded_subs | sed 's/^/emit+/')"; [ -z "$UNGUARDED" ]; ck $? "every command-substitution assignment in the emit carries a guard against a set -e caller (unguarded:${UNGUARDED:- none})"
+# ── E1e-b / E1f-b / E1f-c: EVERY redirect failure is SUPPRESSED and RECORDED, not just swallowed ──────
+# E1e and E1f drove the same writes with `2>/dev/null`, so they could not see the defect those writes were
+# FIXED for: an ungrouped `printf … >> file` applies redirections left to right, so a failing `>>` writes its
+# own `line N: <path>: Permission denied` to the CALLER's stderr before any trailing suppression takes
+# effect. Measured in cycle 6: de-grouping any of the emit's three redirects, or deleting its append WARN,
+# left 138 passed / 0 failed. Each of the three is now driven with stderr CAPTURED.
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+BRIEF_R="$TMP/brief-444.txt"; printf '# a brief\n' > "$BRIEF_R"; chmod 444 "$BRIEF_R"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" ro444' _ "$HELPER" "$TMP/ro444.log" "$BRIEF_R" >/dev/null 2>"$TMP/ro444.err"
+if grep -q 'Permission denied' "$TMP/ro444.err" 2>/dev/null; then
+  bad "an UNWRITABLE brief leaked a raw bash error to the caller's stderr — the redirect must be GROUPED so its own failure is suppressible"
+else
+  ok "an UNWRITABLE brief leaks NOTHING to the caller's stderr (the redirect is grouped with the command)"
+fi
+grep -qF 'WARN ro444: could not append the mandate block' "$TMP/ro444.log"; ck $? "…and the LOG records that the LANE was NOT told (without it the success and failure paths read identically)"
+chmod 644 "$BRIEF_R"
+# the SUPERSESSION append: stamp a block on a missing box, provision it, then make the brief unwritable.
+BRIEF_S="$TMP/brief-supersede.txt"; printf '# a brief\n' > "$BRIEF_S"; : > "$TMP/sup1.log"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" sup1' _ "$HELPER" "$TMP/sup1.log" "$BRIEF_S" >/dev/null 2>&1
+: > "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; : > "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+chmod 444 "$BRIEF_S"; : > "$TMP/sup2.log"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" sup2' _ "$HELPER" "$TMP/sup2.log" "$BRIEF_S" >/dev/null 2>"$TMP/sup2.err"
+if grep -q 'Permission denied' "$TMP/sup2.err" 2>/dev/null; then
+  bad "the SUPERSESSION append leaked a raw bash error to the caller's stderr — the third grouped redirect, unguarded"
+else
+  ok "the SUPERSESSION append leaks NOTHING to the caller's stderr either"
+fi
+grep -qF 'WARN sup2: the brief at' "$TMP/sup2.log"; ck $? "…and it records that the supersession notice could NOT be appended (a stale block the lane would keep reading)"
+chmod 644 "$BRIEF_S"
+# the LOG write: E1e proved it cannot abort an errexit caller, this proves it cannot leak either.
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+LOG_R="$TMP/log-400.log"; : > "$LOG_R"; chmod 400 "$LOG_R"
+BRIEF_L="$TMP/brief-log400.txt"; printf '# a brief\n' > "$BRIEF_L"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" log400' _ "$HELPER" "$LOG_R" "$BRIEF_L" >/dev/null 2>"$TMP/log400.err"
+if grep -q 'Permission denied' "$TMP/log400.err" 2>/dev/null; then
+  bad "an UNWRITABLE log leaked a raw bash error to the caller's stderr — E1e drove this same write with stderr discarded, so it could not see it"
+else
+  ok "an UNWRITABLE log leaks NOTHING to the caller's stderr (its redirect is grouped too)"
+fi
+chmod 600 "$LOG_R"
 # ── E1g: THE CONTROL — the arm above can REDDEN, and does so on the shapes the vacuous version missed ──
 # Three arms, because a one-sided control only proves the predicate is not always-true: a bare assignment
 # must be REPORTED, a guarded one must NOT be, and a NESTED/`(`-bearing one — the exact shape the first
@@ -504,6 +544,21 @@ DECL_CHECK_RC="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; 
 [ "$DECL_CHECK_RC" = "2" ]; ck $? "…and --check agrees about that box, so no consumer can read one verb as clean while the other says cannot-verify"
 DECL_MISS_MSG="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --missing 2>&1 >/dev/null' _ "$HELPER")"
 case "$DECL_MISS_MSG" in *'CANNOT VERIFY'*) ok "…and --missing SAYS cannot-verify on stderr (silence was the defect)" ;; *) bad "…but --missing said nothing while answering 0 on an unread declaration" ;; esac
+# ── E1n: `--line` CANNOT CALL AN UNREAD DECLARATION "NOTHING TO DISCLOSE" (#3379 review cycle 6, P1) ──
+# The third surface of the state cycles 2 and 5 each fixed one of. `mandate_preflight_line` tested the dir
+# and then the three collectors, all of which iterate `$(mandate_files)`, so an empty declaration emptied
+# the population and the renderer returned EMPTY at rc 0 — this tool's own word for "every mandated file is
+# present" — on the surface a LANE actually reads. The emit survived only because its `healthy` gate
+# re-reads the state, i.e. the fix lived in the caller. Reachable without a stub: a truncated `$O` copy
+# that lost the two `name|reason` SPEC lines parses fine and answers this.
+DECL_LINE_OUT="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+case "$DECL_LINE_OUT" in
+  *'CANNOT VERIFY'*) ok "an unread declaration → --line renders a CANNOT VERIFY block, not an empty string (which IS the "all present" answer)" ;;
+  *) bad "…but --line rendered nothing for a declaration that names no files — the block a lane reads reads as CLEAN" ;;
+esac
+DECL_DEF_OUT="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli "" 2>/dev/null' _ "$HELPER")"
+case "$DECL_DEF_OUT" in *'CANNOT VERIFY'*) ok "…and the NO-ARG default action agrees (same renderer, so the two cannot drift)" ;; *) bad "…but the no-arg default action still rendered empty on an unread declaration" ;; esac
+case "$DECL_LINE_OUT" in *'MISSING'*) bad "…and it must NOT tell the operator to ship files on a box whose declaration could not be read" ;; *) ok "…and it never calls the files MISSING (the remedy is a complete helper, not a deployment)" ;; esac
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
