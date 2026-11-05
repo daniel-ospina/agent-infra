@@ -1405,7 +1405,18 @@ ck "P13(iii) [RED→GREEN] with no product candidate the floor had nothing to ap
 # refresh and driven here (the same `rest_list` seam P7 uses), so the class the floor consults is proven
 # to come from a LISTING and not from an assumption.
 WEF="$T/weqfns.sh"
-{ sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$WEF"
+# ⛔ THE EXTRACTED BODY DEPENDS ON THE SHIPPED POOL DEFINITION (agent-infra#10951). `write_emergency_queue`
+# consults the pool predicate, which is the ONE `POOL_JQ=` line at the top of the shipped refresh — a
+# file-global that a bare function-body extraction does not carry. So the extraction carries it: without
+# this line the body dies on `POOL_JQ: unbound variable` under `set -u` and the P0 emergency class is
+# never produced (measured: 5 P13 failures, 0 on the same suite before the pool consolidation).
+POOL_DEF="$(sed -n '/^POOL_JQ=/p' "$REFRESH")"
+if [ -z "$POOL_DEF" ]; then
+  ck "P13(iii-b) (setup) the shipped refresh carries the pool definition the emergency writer needs" 1
+else
+  ck "P13(iii-b) (setup) the shipped refresh carries the pool definition the emergency writer needs" 0
+fi
+{ printf '%s\n' "$POOL_DEF"; sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$WEF"
 [ -s "$WEF" ] && grep -q 'write_emergency_queue()' "$WEF"
 ck "P13(iii-b) (setup) the emergency writer extracts from the shipped refresh" $?
 weq() { # <O> <repo> <PRODUCT_REPOS> <rest_list-rc> [rows] [window-filled] [core-now] [core-reserve]

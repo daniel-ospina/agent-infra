@@ -54,7 +54,7 @@ set -u
 # ⛔ THIS LINE IS EXTRACTED VERBATIM BY `pool-filter.test.sh`, so it stays ONE single-quoted
 # assignment on ONE line. `\\s` is doubled because a jq string literal needs it doubled; `$L`
 # and `$n` are jq variables and stay unexpanded inside the single quotes.
-POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:(?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)(?:-[A-Za-z0-9]+)*\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
+POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed)(?:-[A-Za-z0-9]+)*\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
 OR_FROM_ENV="${OR:-}"
 # ⛔ "DECLARED" MEANS THE OPERATOR NAMED IT — NOT THAT THE VARIABLE IS PRESENT (#1977 review, P1).
 # `orch-loop.sh` EXPORTS `OR` on EVERY cycle, including the one where it fell back to its own default
@@ -5366,6 +5366,11 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   fi
   # LOCAL, not a top-level constant: product-floor.test.sh extracts THIS FUNCTION BODY alone and drives it.
   local EQ_LIMIT=100 EQ_PAGES=1 eq_need=0 eq_ok=0 eq_n=""
+  # ⛔ THE POOL PREDICATE IS THE FILE-GLOBAL ONE DEFINITION (#10951), AND THIS BODY IS EXTRACTED ALONE —
+  # so the dependency is declared HERE, where the extractor can see it: product-floor.test.sh prepends
+  # the shipped `POOL_JQ=` line to the extracted text. An extractor that forgets fails with a NAMED
+  # message instead of bash's bare "unbound variable", and the definition is never duplicated.
+  local pool_jq="${POOL_JQ:?POOL_JQ is not in scope — a consumer that extracts this function must also extract the POOL_JQ= line from the shipped refresh (agent-infra#10951)}"
   if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
     case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
       eq_need=$(( CORE_RESERVE + EQ_PAGES ))
@@ -5381,7 +5386,7 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
   # does — so it must not stand the floor down either.
   if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
-      --jq '.[]|'"$POOL_JQ"'|.number' \
+      --jq '.[]|'"$pool_jq"'|.number' \
       > "$o/.emergency-issues" 2>/dev/null; then
     if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then
       weq_degrade "$o" \

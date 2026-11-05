@@ -111,11 +111,14 @@ check_excluded 'standing-constraint label (#10175)' \
   "$(iss 10175 'ops(capture): the hosted capture cap is HELD deliberately — never override it; the switchover is a new graph on Pro, set as default and measured' 'P1-severe,standing-constraint')"
 check_excluded 'label is case-insensitive' \
   "$(iss 900005 'Retire the legacy door' 'Standing-Constraint')"
-# ⛔ THE `epic` LABEL IS NOT AN EXCLUSION — measured both ways. It gains nothing (all 7 epic-labelled
-# queue rows are also epic-TITLED, which the arm above already excludes) and it hides WORK:
-# tortoise#9701 carries the `epic` label on a `bug(tooling):` work row.
-check_included 'epic label on a work row (#9701)' \
-  "$(iss 9701 'bug(tooling): epic->child wiring is prose-only — audits read epics as childless (#1402 reported as zero children while 12 existed)' 'epic')"
+# ⛔ THE `epic` LABEL IS NOT AN EXCLUSION — and the measurement is that it changed NOTHING either way.
+# All 7 epic-labelled rows in the severity queue are also epic-TITLED, so the title arm already
+# excluded every one of them; the arm was a no-op. It is dropped as an UNPINNED label rather than
+# because it hid a live row: tortoise#9701 carries `epic` on a `bug(tooling):` work row but no
+# P0/P1/P2 label, so it was never in this population. The case below keeps that shape excluded from
+# ever being an exclusion reason: a work title plus the `epic` label must stay pickable.
+check_included 'epic label on a work title (not an exclusion)' \
+  "$(iss 9701 'bug(tooling): epic→child wiring is prose-only — audits read epics as childless (#1402 reported as zero children while 12 existed)' 'epic')"
 
 # ── 3. WORK TITLES — each must be INCLUDED (a filter that hides work is the worse defect) ────
 check_included 'feat(...)'    "$(iss 900010 'feat(4282): retire the five run_onboarding MCP tools (81 -> 76 live)')"
@@ -146,6 +149,12 @@ check_included 'epidemic: (forward-guard)'   "$(iss 900020 'epidemic: the gate s
 check_included 'map the ... (forward-guard)' "$(iss 900021 'map the query surface to the 26 canonical tools')"
 check_included 'lane reaper: (old-rule casualty)' "$(iss 900022 'lane reaper: the sweep never advances past a stale entry')"
 check_included 'analysis-paralysis (old-rule casualty)' "$(iss 900023 'analysis-paralysis fix: cap the review cycles')"
+# A decision REQUEST is a container by this file's own rule, and it was the ONE container-shaped title
+# the structural form missed in the live 179 (tortoise#3447, P2-moderate, unassigned). Pinned so
+# removing the arm is a conscious change.
+check_excluded 'decision needed: (#3447)' "$(iss 3447 'Decision needed: reinstate or drop the deferred [checks.loop_liveness] fly.toml check')"
+# …and `lane:` WITHOUT an id is not the umbrella form, so it stays work-shaped rather than guessed at.
+check_included 'lane: without an id' "$(iss 900024 'lane: the sweep never advances past a stale entry')"
 
 # ── 5. UNKNOWN SPELLINGS STAY PICKABLE (the documented failure direction) ────────────────────
 check_included 'unknown kind' "$(iss 900030 'thingamajig(scope): a kind nobody has enumerated yet')"
@@ -157,12 +166,11 @@ if [ -z "$badassign" ]; then ok=$((ok+1)); else bad=$((bad+1)); echo "FAIL [assi
 nullish="$(printf '[%s]' '{"number":900041,"title":null,"labels":null}' | jq -r ".[]|$SEL|1" 2>&1)"
 if [ "$nullish" = "1" ]; then ok=$((ok+1)); else bad=$((bad+1)); echo "FAIL [robustness] a null title/labels entry did not survive cleanly (out='$nullish')"; fi
 
-# ── 7. THE COMPOSED CALL-SITE PROGRAM — the shape `selftest.sh` extracts must survive ────────
-# ⛔ THIS IS THE PIN ADDED BY THE FIRST REVIEW CYCLE (P1). The definition alone passing does not
-# prove a CALL SITE works: the first cut emitted `|\"0 \(.number)`, and `selftest.sh:3856`
-# (`match($0,/\|"[0-9] /)`) then extracted NOTHING — reddening the #8465 tier-rank guard and
-# blinding it at the same time. Reproduce selftest's own extraction here, so the contract cannot
-# break silently again.
+# ── 7. THE COMPOSED CALL-SITE PROGRAMS — the shape `selftest.sh` extracts must survive ───────
+# ⛔ PINNED BY REVIEW CYCLE 1 (P1). The definition alone passing does not prove a CALL SITE works: an
+# earlier cut emitted `|\"0 \(.number)`, and `selftest.sh:3856` (`match($0,/\|"[0-9] /)`) then
+# extracted NOTHING — reddening the #8465 tier-rank guard and blinding it at once. Reproduce selftest's
+# own extraction here, so the contract cannot break silently again.
 RANKS="$(awk '{printf "%s", $0} /\\$/{next} {print ""}' "$RC" \
   | awk '/--label/{lab=""; for(i=1;i<=NF;i++) if($i=="--label") lab=$(i+1);
            if(match($0,/\|"[0-9] /)) print lab" -> "substr($0,RSTART+2,1)}' \
@@ -170,34 +178,51 @@ RANKS="$(awk '{printf "%s", $0} /\\$/{next} {print ""}' "$RC" \
 if [ "$RANKS" = "P0-blocker -> 0 P1-severe -> 1 P2-moderate -> 2" ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [selftest contract] the tier->rank pairs selftest.sh extracts came out '$RANKS' — expected 'P0-blocker -> 0 P1-severe -> 1 P2-moderate -> 2'"; fi
 
-# And the composed program must still behave: take the real P0 call site's jq argument, evaluate it
-# the way bash does (splicing the definition), and drive it over a fixture — a container must be
-# dropped and the rank prefix must be emitted.
-# The call site reads `--jq '.[]|'"$POOL_JQ"'|"0 \(.number)"'` — take everything from `--jq` to the
-# redirect, and let `eval` compose it exactly as bash does at run time.
-SITE="$(grep -m1 -e "--jq '\.\[\]|'" "$RC" | sed -e "s/^.*--jq //" -e "s/ 2>>.*//")"
-if [ -n "$SITE" ]; then
-  out="$(printf '[%s,%s]' \
-      "$(iss 900050 'epic(x): a container')" \
-      "$(iss 900051 'fix(y): work')" \
-    | POOL_JQ="$SEL" eval "jq -r $SITE" 2>&1)"
-  if [ "$out" = "0 900051" ]; then ok=$((ok+1))
-  else bad=$((bad+1)); echo "FAIL [composed call site] driving the real P0 jq argument emitted '$out' — expected '0 900051'"; fi
-else
-  bad=$((bad+1)); echo "FAIL [composed call site] could not locate a call-site jq argument to drive"
-fi
+# And EVERY call site must still behave. ⛔ BOTH shapes are driven: the three tier queries (which emit
+# `"<tier> <number>"`) and the emergency floor (which emits a bare `.number` and, by review cycle 2,
+# reads the program through its own `pool_jq` local because its body is extracted on its own).
+drive_site() { # <label> <fixed-string that identifies the site's jq argument> <expected output>
+  local label="$1" fixed="$2" want="$3" site out
+  # strip the leading `--jq `, a trailing ` 2>>…` redirect, and a trailing shell line-continuation `\`
+  site="$(grep -m1 -F -- "$fixed" "$RC" | sed -e "s/^.*--jq //" -e "s/[[:space:]]*2>>.*//" -e 's/[[:space:]]*\\$//')"
+  if [ -z "$site" ]; then bad=$((bad+1)); echo "FAIL [composed call site] $label - could not locate the jq argument"; return; fi
+  out="$(printf '[%s,%s]' "$(iss 900050 'epic(x): a container')" "$(iss 900051 'fix(y): work')" \
+    | POOL_JQ="$SEL" pool_jq="$SEL" eval "jq -r $site" 2>&1)"
+  if [ "$out" = "$want" ]; then ok=$((ok+1))
+  else bad=$((bad+1)); echo "FAIL [composed call site] $label emitted '$out' - expected '$want'"; fi
+}
+# The three tier queries concatenate $POOL_JQ and append the tier prefix.
+drive_site 'P0 tier' '|"0 \(.number)"' '0 900051'
+# The emergency floor reads it through its own local (its body is extracted alone).
+drive_site 'emergency floor' '"$pool_jq"' '900051'
 
-# ── 8. THE DRIFT PINS — one definition, four call sites, zero private copies ─────────────────
-# This is exactly the defect shape #10951 records: four inline copies that had already drifted
-# (P1/P2 excluded two of the six spellings P0 excluded), so a call site that regrows its own
-# container regex is a second definition of "work unit". The regex count is taken over `test("^`
-# rather than one spelling, so a FIFTH query writing `test("^(Epic|…` is caught too.
-regexes="$(grep -c 'test("^' "$RC" 2>/dev/null || true)"
-if [ "${regexes:-0}" -eq 1 ]; then ok=$((ok+1)); else bad=$((bad+1)); echo "FAIL [drift] $RC carries ${regexes:-0} 'test(\"^' container regex(es) — expected exactly 1 (the definition)"; fi
+# ── 8. THE DRIFT PINS — one definition, exactly four call sites, no private copies ───────────
+# (a) THE SHAPE PIN, not the identifier. `grep -c POOL_JQ` is satisfied by comments and by three of
+# four sites, so it cannot fail on a dropped call site — pinned by review cycle 2 (P1) after a mutation
+# that removed one site's filter still passed. This counts the exact splice text instead.
+sites="$(grep -cF -- "'\"\$POOL_JQ\"'" "$RC" 2>/dev/null || true)"
+local_sites="$(grep -cF -- "'\"\$pool_jq\"'" "$RC" 2>/dev/null || true)"
+if [ "${sites:-0}" -eq 3 ] && [ "${local_sites:-0}" -eq 1 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [drift] call sites splicing the definition: ${sites:-0} file-global + ${local_sites:-0} local - expected 3 + 1 (P0, P1, P2 and the emergency floor)"; fi
 
-sites="$(grep -c 'POOL_JQ' "$RC" 2>/dev/null || true)"
-# 1 definition + 4 call sites + at most 4 comment mentions = a generous ceiling; the floor is what matters.
-if [ "${sites:-0}" -ge 5 ]; then ok=$((ok+1)); else bad=$((bad+1)); echo "FAIL [drift] only ${sites:-0} POOL_JQ mention(s) — expected the definition plus at least 4 call sites"; fi
+# (b) THE TITLE IS READ IN EXACTLY ONE PLACE. A fifth query that writes its own container predicate —
+# `test(`, `match(`, `testmatch(` — has to touch `.title`, so this catches every spelling of the
+# regrown-copy defect without enumerating regex syntax.
+titles="$(grep -c '\.title' "$RC" 2>/dev/null || true)"
+if [ "${titles:-0}" -eq 1 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [drift] the issue title is read in ${titles:-0} places — expected 1 (the definition); a second place is a second definition of 'work unit'"; fi
+
+# (c) THE KIND SET IS PINNED. Widening the container arm to cover a work kind (`plan`, `audit`,
+# `spike`, …) leaves every inclusion fixture green while silently hiding that kind at runtime, so the
+# alternation itself is asserted: changing it requires editing THIS line — i.e. a reviewed test change,
+# which is what the definition comment promises.
+KINDS='(?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed'
+if grep -qF -- "$KINDS" "$RC"; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [membership] the container-kind set changed — update KINDS in this suite (and say why in the PR) rather than widening the rule silently"; fi
+
+# (d) THE LABEL ARM IS PINNED TO ONE MEMBER, for the same reason.
+if [ "$(grep -cF -- 'select(["standing-constraint"]|index($n))' "$RC" 2>/dev/null || true)" -eq 1 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [membership] the label arm is no longer exactly ['standing-constraint'] — a label exclusion hides work and must be a reviewed change"; fi
 
 echo "pool-filter: $ok passed, $bad failed"
 [ "$bad" -eq 0 ] || exit 1
