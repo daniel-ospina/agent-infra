@@ -6023,10 +6023,13 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
     "20.10 …but a SIGNED not-clean marker whose note contains ' sig=' IS still published (the fix must not over-block)"
 
 # ── 20.11 THE OTHER FAIL-CLOSED ARM: AN UNCOMPUTABLE HMAC IS NOT A MATCH ──────
-# (#3168 self-review, round 5.) `post_marker_comment` has TWO refusals past the
-# ` sig=` shape guard: the HMAC must COMPUTE (`[ -n "$_mexp" ] || return 0`, :1247)
-# and it must MATCH (`[ "$_mexp" != "$_msig" ]`, :1248). 20.10 pins the second.
-# The FIRST was pinned by NOTHING: the one-line mutant
+# (#3168 self-review, round 5.) `post_marker_comment` has THREE refusals past the
+# ` sig=` shape guard — no key configured (`[ -n "$_key" ] || return 0`, :1245),
+# the HMAC did not COMPUTE (`[ -n "$_mexp" ] || return 0`, :1247), and it did not
+# MATCH (`[ "$_mexp" != "$_msig" ]`, :1248). 20.10 pins the FIRST (:1245): its
+# negative drives `AI_REVIEW_GATE_KEY=""``, and its positive is a genuinely signed
+# marker that nothing refuses. The COMPUTE arm was pinned by NOTHING: the one-line
+# mutant
 # `[ -n "$_mexp" ] || return 0` → `[ -n "$_mexp" ] || _mexp="$_msig"` — i.e.
 # "if openssl produced nothing, treat that as a match" — left the suite at
 # PASS=1035 FAIL=0 (measured). That mutant is FAIL-OPEN on the guard whose whole
@@ -6082,6 +6085,58 @@ STUB_COMMENT_BODIES="" \
     run_record_neg "$DC_PR4" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
 assert_eq "$(dc_posts "$DC_PR4")" "1" \
     "20.11 …while the SAME conjunction with a WORKING openssl DOES publish (the arm is reached, not skipped)"
+
+# ── 20.12 THE MATCH ARM: A MARKER THAT DOES NOT VERIFY UNDER THIS KEY IS REFUSED ──
+# (#3168 re-review @ a3e78f942, P1.) `:1248` is the refusal that rejects a TAMPERED
+# marker or one signed under a ROTATED key — and it was pinned by NOTHING: replacing
+# `if [ "$_mexp" != "$_msig" ]; then` with `if false; then` left the whole suite at
+# PASS=1040 FAIL=0 (measured). 20.10 pins the no-key arm (:1245), 20.11 the
+# uncomputable arm (:1247); neither reaches :1248. No fixture in the suite signed
+# under one key and verified under another, so the arm was unreachable by the tests
+# at all — a fail-open with no signal, in the round that was opened to close one.
+# ⛔ THE DRIVER IS THE FLUSH, because it is the ONE path that delivers marker bytes
+# it did not mint: `flush_pending_markers` hands the pending file's contents to
+# `post_marker_comment` without re-signing them (:1348), which is exactly the
+# production shape of a rotated key. A mint-path vector cannot build this state,
+# since the run that signs is the run that verifies.
+DC_PR5=424352
+PEND_2012="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$DC_PR5.marker"
+M_2012="review recorded: reviews/$DC_PR5.json verdict=clean @ $SHA (daniel-ospina/agent-infra)"
+# THE FIXTURE IS CHECKED BEFORE IT IS JUDGED, and it is checked for the SIG being
+# PRESENT — a pending file without one would be refused by the SHAPE guard or the
+# no-key arm and the vector would be green for a reason unrelated to :1248.
+mkdir -p "$(dirname "$PEND_2012")"
+if printf '%s\n' "$(rb_marker "$DC_PR5" "$M_2012")" > "$PEND_2012" && command grep -qE ' sig=[0-9a-f]{64}$' "$PEND_2012"; then
+    ok "20.12 fixture: a pending marker SIGNED under the suite's key was written with a real sig= trailer"
+else
+    bad "20.12 fixture: the pending marker was not written, or carries no sig= — this vector would not reach :1248 (file: $(cat "$PEND_2012" 2>/dev/null))"
+fi
+# NEGATIVE: the SAME bytes, verified under a different key ⇒ no comment POST.
+rb_clear
+: > "$LOG"
+FL5_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
+    AI_REVIEW_GATE_KEY="rotated-key-not-the-signer" \
+    STUB_BODY="PR body — no review evidence yet" \
+    bash "$RECORD" --flush-pending "$DC_PR5" daniel-ospina/agent-infra 2>&1)" || true
+assert_contains "$FL5_OUT" "REFUSING to publish a marker" \
+    "20.12 an HMAC that does not MATCH is refused, and says so [out: $(printf '%s' "$FL5_OUT" | tr '\n' ' ')]"
+assert_eq "$(dc_posts "$DC_PR5")" "0" \
+    "20.12 a marker whose sig= does NOT verify under the configured key is never published (:1248, the match arm)"
+# POSITIVE (over-block control): the SAME bytes under the key that SIGNED them DO
+# publish. Without this half the vector above would also pass on an arm that refuses
+# every marker whose key is not byte-identical for any reason at all.
+if printf '%s\n' "$(rb_marker "$DC_PR5" "$M_2012")" > "$PEND_2012"; then
+    ok "20.12 fixture: the pending marker was re-written for the positive half"
+else
+    bad "20.12 fixture: the pending marker could not be RE-WRITTEN — the positive half would not run"
+fi
+: > "$LOG"
+FL6_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
+    AI_REVIEW_GATE_KEY="$TEST_GATE_KEY" \
+    STUB_BODY="PR body — no review evidence yet" \
+    bash "$RECORD" --flush-pending "$DC_PR5" daniel-ospina/agent-infra 2>&1)" || true
+assert_eq "$(dc_posts "$DC_PR5")" "1" \
+    "20.12 …but the SAME marker under the key that SIGNED it IS published (the arm is not an over-block)"
 
 DM_20_SENTINEL=1
 
