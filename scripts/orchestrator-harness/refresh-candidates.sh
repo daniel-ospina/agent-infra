@@ -2345,13 +2345,13 @@ rest_fail() {
 #   `[refresh]` tag (they both re-prefix what they collect, so a helper-side tag doubles it).
 rest_list() {
   local kind="${1:-}"; [ $# -gt 0 ] && shift
-  local repo="$OR" state="open" limit=30 label="" prog='.' ep q page=1 pages n tmp pf status more
+  local repo="$OR" state="open" limit=30 label="" prog='.' ep q page=1 pages n tmp pf status more sort="" dir=""
   if [ -z "$kind" ]; then
     echo "REST: rest_list needs a listing kind (issues|pulls)" >&2; return 1
   fi
   while [ $# -gt 0 ]; do
     case "$1" in
-      --repo|--state|--limit|--label|--jq)
+      --repo|--state|--limit|--label|--jq|--sort|--direction)
         # ⛔ A FLAG WITH NO VALUE IS A BROKEN CALL, NOT A DEFAULT. `shift 2` past the end does not
         # shift AT ALL in bash (measured: `set -- a; shift 2` → argc 1, rc 1), so the bare form spun
         # in this loop for ever — and this pass runs BACKGROUNDED, where a hang is invisible: the
@@ -2363,6 +2363,13 @@ rest_list() {
           --limit) limit="$2" ;;
           --label) label="$2" ;;
           --jq)    prog="$2" ;;
+          # ⛔ WHICH END OF THE COLLECTION `--limit` KEEPS IS PART OF THE QUESTION, NOT A PREFERENCE
+          # (agent-infra#2019, review cycle 1 P1). The provider's default order is created-DESCENDING,
+          # so an unqualified window keeps the NEWEST rows — the opposite end from the one the pool
+          # ranks (`sort -k1,1n -k2,2n`, oldest-first inside a tier). A caller that ranks by age must
+          # therefore SAY oldest-first, or a truncated tier silently loses its OLDEST members.
+          --sort)      sort="$2" ;;
+          --direction) dir="$2" ;;
         esac
         shift 2 ;;
       # ⛔ AN UNMODELLED FLAG IS AN ERROR, NOT A DROP: silently ignoring one turns a narrow query into
@@ -2382,6 +2389,11 @@ rest_list() {
   # ⛔ THE LABEL IS URL-ENCODED. An unencoded space or `&` truncates the query and the tier then reads
   # as EMPTY — "no work" — which is the #8465 priority inversion through another door.
   [ -n "$label" ] && q="$q&labels=$(printf '%s' "$label" | jq -Rr @uri)"
+  # ⛔ THE ORDER GOES IN THE QUERY, so the WINDOW — not a post-hoc slice — is the end the caller asked
+  # for: `--limit 200 --sort created --direction asc` is "the 200 OLDEST", which is what paging an
+  # ascending collection and truncating to `limit` delivers.
+  [ -n "$sort" ] && q="$q&sort=$(printf '%s' "$sort" | jq -Rr @uri)"
+  [ -n "$dir" ]  && q="$q&direction=$(printf '%s' "$dir" | jq -Rr @uri)"
   case "$limit" in
     ''|*[!0-9]*)
       echo "REST: --limit '$limit' is not a number — refusing to page an unbounded $kind listing" >&2
@@ -2490,14 +2502,23 @@ rest_list() {
   # Accepted for `.open_iss` because that loss only NARROWS: fewer issues are visible to the reaper,
   # so fewer un-blacklists (never more). `.pr_brs` (kind=pulls) is unfiltered, so the #1705 `has_pr`
   # check is unaffected.
-  # ⛔ THE TIER WINDOWS HAVE THE SAME SHAPE AND THAT ARGUMENT DOES NOT COVER THEM. They carry
-  # `labels=`, so each window is one labelled subset rather than the whole backlog — but it is still a
-  # created-DESC window, so a tier with more open labelled issues than its bound puts the OLDEST ones
-  # permanently outside `.pool`, and `.pool` is ranked OLDEST-FIRST. Measured 2026-10-17: open
-  # `P2-moderate` is 430 on agent-infra against the 200 bound below, so that tier IS over its window.
+  # ⛔ THE TIER WINDOWS HAVE THE SAME SHAPE, AND THE ORDER THEY ASK IN IS THE FIX (agent-infra#2019,
+  # review cycle 1 P1). They carry `labels=`, so each window is one labelled subset rather than the
+  # whole backlog — but it is still a window, and an UNSORTED one is created-DESCENDING, so it keeps
+  # the NEWEST rows and pushes the OLDEST ones permanently outside `.pool`. `.pool` is ranked
+  # OLDEST-FIRST (the `sort -k1,1n -k2,2n` below), so that direction is exactly backwards: it loses the
+  # members the ranking values most. Measured 2026-10-17: open `P2-moderate` was 430 on agent-infra
+  # against the 200 bound; 2026-11-05 it is 450. So the tier IS over its window, and before this fix
+  # every queued P2 older than the newest 200 read as "unranked" — which, once the queue's order is
+  # derived from `.pool`, would have pinned the OLDEST queued P2s to the TAIL on every pass, forever
+  # (the window only moves further away as the board grows).
+  # ⛔ SO EACH TIER ASKS OLDEST-FIRST (`--sort created --direction asc`), and truncation now loses the
+  # NEWEST rows instead. That is the end the ranking does not need, and it is the one that makes the
+  # unranked TAIL correct by construction: a queued row that fell out of a tier window is NEWER than
+  # every ranked row of its tier, so "after all ranked rows, in arrival order" is the ordering
+  # AGE-SECOND actually asks for. With the unsorted window the same placement was an INVERSION of it.
   # The BOUNDS are unchanged from the GraphQL form (`gh issue list --label … --limit 300/200/200` had
-  # the same three windows), so this change neither introduces nor widens the truncation — it is
-  # stated here because the paragraph above would otherwise read as "the tiers are complete".
+  # the same three windows), so the SPEND is untouched — only the end that is kept changes.
   # The alternative — fetching `limit` PROJECTED rows — means paging past the budget on the shared
   # core bucket this change exists to protect. The gh-rest adapter makes exactly that trade the other
   # way (`gh-rest/gh:229,238` page the whole collection, then `:157` drops PR rows and `:158` slices
@@ -3569,13 +3590,20 @@ touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 # PARTIAL can NAME the tiers that were read instead of only the ones that failed.
 rm -f "$O/.pool-err" "$O/.pool-read"
 {
-  if rest_list issues --repo "$OR" --state open --limit 300 --label P0-blocker \
+  # ⛔ EVERY TIER WINDOW IS ASKED OLDEST-FIRST (`--sort created --direction asc`), because the pool
+  # ranks AGE-SECOND (oldest-first inside a tier) and a truncated window must lose the end the ranking
+  # does not need. See the "TIER WINDOWS" paragraph above `rest_list` for the measurement and the
+  # consequence of getting this direction wrong — it is not a preference.
+  # ⛔ THE FILTER STAYS THE SHARED `$POOL_JQ` (#10951). This rebase merged this change against main's
+  # single-definition refactor, which had collapsed four drifted copies into one; spelling the jq out
+  # again here would restore the drift it removed, so the epoch below is the ONLY addition.
+  if rest_list issues --repo "$OR" --state open --limit 300 --label P0-blocker --sort created --direction asc \
     --jq '.[]|'"$POOL_JQ"'|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
   else echo "P0-blocker" >> "$O/.pool-err"; fi
-  if rest_list issues --repo "$OR" --state open --limit 200 --label P1-severe \
+  if rest_list issues --repo "$OR" --state open --limit 200 --label P1-severe --sort created --direction asc \
     --jq '.[]|'"$POOL_JQ"'|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
   else echo "P1-severe" >> "$O/.pool-err"; fi
-  if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate \
+  if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate --sort created --direction asc \
     --jq '.[]|'"$POOL_JQ"'|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 # ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
