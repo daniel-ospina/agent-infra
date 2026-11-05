@@ -303,7 +303,8 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # clause if no earlier decoy exists: measured on this head, "the branch ceiling (14400s) is documented
 # here. lease ttl %ss exceeds this keying ceiling (9600s) — clamped. …" ran 43 passed, 0 failed while a
 # fixer reads 9600. The contract is ONE clause, so any second `ceiling (` — before OR after it — is RED.
-CLAUSE_REPORT="$(awk '
+clause_report() { # <message-file> -> the arm's structured verdict (see the comment above)
+awk '
   { msg = $0
     s = msg
     while ((i = index(s, "ceiling (")) > 0) {
@@ -337,7 +338,9 @@ CLAUSE_REPORT="$(awk '
     else if (n != 1) print "MULTIPLE " n
     else print "OK " firstval
   }
-' "$T/acq.out" 2>/dev/null)"
+' "$1" 2>/dev/null
+}
+CLAUSE_REPORT="$(clause_report "$T/acq.out")"
 case "$CLAUSE_REPORT" in
   "OK "*) ok "the clamp warning names a keying knob ONLY in the candidate list" ;;
   ABSENT) bad "the clamp warning carries no 'ceiling ( … )' clause to evaluate — an empty or absent clause must not read as clean: $(cat "$T/acq.out")" ;;
@@ -374,12 +377,27 @@ if [ -n "$L2" ]; then lease_arm "an over-ceiling request clamps to CLAIM_BRANCH_
 # raising the env var raises the DEFAULT and the CEILING together. Two literals cannot prove that: a
 # mutant that hardcodes the ceiling (`_claim_acquire_at … "14400"`) leaves every arm above green,
 # because it only differs once the knob MOVES. Here it moves: with CLAIM_BRANCH_TTL=20000 an
-# over-ceiling request must clamp to 20000, not to 14400. Measured with the split-knob mutant: this
-# arm is the ONLY one that reddens.
+# over-ceiling request must clamp to 20000, not to 14400. Measured with the split-knob mutant
+# (`_claim_acquire_at … "$CLAIM_BRANCH_TTL" "14400"`): this arm AND the DEFAULT arm below both
+# redden, because a hardcoded ceiling caps a raised default too — plus, since round 11, the
+# knob-follows value arm, which raises that tally to three. It said "this arm is the ONLY one that
+# reddens" until round 11: true when measured in round 2, and rotted the moment round 3 added the arm
+# below — the "a count rots the moment an arm is added" defect this file's `unset` comment records.
 NOW=$(date +%s)
 CLAIM_BRANCH_TTL=20000 acquire_from owner "$BR_LEASE_KNOB" 999999
 L3="$(lease_of refs/claims/branch-integration-lease-knob)"
 if [ -n "$L3" ]; then lease_arm "CLAIM_BRANCH_TTL=20000 raises the CEILING too — one knob, not a split term" 20000 "$L3"; else bad "no lease_until on the env-raised claim ref"; fi
+# ⛔ AND THE PRINTED NUMBER MUST FOLLOW THE KNOB TOO (review round 11, P2). The value arm above runs
+# with `CLAIM_BRANCH_TTL` UNSET, so it pins the literal `14400s` and cannot tell a `%ss`-from-`$max`
+# message from one that hardcodes `14400s`: measured, a message that always prints `ceiling (14400s)`
+# ran 43 passed, 0 failed — and it prints a number that is NOT the ceiling the moment this same case
+# raises the knob to 20000, which is exactly the misdirection ("a fixer reads a number that is not
+# the ceiling") the arm exists to catch. The knob has moved HERE, so the number must move with it.
+KNOB_CLAUSE_REPORT="$(clause_report "$T/acq.out")"
+case "$KNOB_CLAUSE_REPORT" in
+  "OK 20000s") ok "the printed ceiling FOLLOWS the knob (20000s) — it is the keying's \$max, not a literal" ;;
+  *) bad "the printed ceiling did not follow CLAIM_BRANCH_TTL=20000 — report '${KNOB_CLAUSE_REPORT}' (a hardcoded number passes every arm that runs at the default): $(cat "$T/acq.out")" ;;
+esac
 # ⛔ AND THE OTHER HALF OF THE SAME PROPERTY (review round 3, P2): the CEILING following the knob does
 # not prove the DEFAULT does. The default arm above runs with the knob UNSET, where a hardcoded
 # `${3:-14400}` is indistinguishable from `$CLAIM_BRANCH_TTL` — measured, that mutant left EVERY
