@@ -394,7 +394,7 @@ graph_key_resolve() {
   # and cell-4: HOME=/home/cmux), and the launcher sources $HOME/keys.env. CELL_HOME follows
   # because it is where THIS script installs, and on some images the two differ.
   local f base
-  # ⛔ `${HOME:-}`, NOT `$HOME`. This function runs under `set -uo pipefail` (line 205), so a
+  # ⛔ `${HOME:-}`, NOT `$HOME`. This function runs under `set -uo pipefail` (line 209), so a
   # HOME-less context — systemd/launchd units, `sudo -u`, `env -i`, a CI step — aborted the WHOLE
   # verifier here with `HOME: unbound variable`, skipping `guard_tools_dir`, `guard_spawn_gate`,
   # `guard_gh_shim` and the `LAYER VERIFIED` verdict: a correctly-installed cell could not be
@@ -675,6 +675,14 @@ def redact(value):
 # put a PASSWORD in the bring-up log — a log that gets pasted into issues and PRs fleet-wide. Every
 # url-echoing marker goes through this: the userinfo is replaced wholesale, because its whole content
 # is secret-or-irrelevant, and nothing after it is touched (the host is the actionable part).
+# ⛔ "EVERY" WAS FALSE WHEN IT WAS WRITTEN (#3374 review, round 12 P2): `URL_NOT_DEFAULT` — the marker
+# that fires for the COMMON case, an entry that differs from the template — printed the raw url, so
+# `URL_NOT_DEFAULT:https://alice:hunter2@evil.example/mcp/` put the password in the run log while the
+# `USERINFO` and `INSECURE_URL` arms, on the *same* url, printed `<redacted>`. It goes through here
+# now, and `WRONG_AUTH` (a header, not a url) does NOT go through either one — see the note at its
+# branch: `redact()` masks only `tt_`/`tk_` shapes, so a header is WITHHELD down to the `${VAR}` name it
+# names, or to a sentence that withholds it. If you add a marker that echoes a url or a header, it is
+# your job to route it through `shown_url`/`redact`, or to withhold — nothing enforces it.
 def shown_url(u):
     u = u if isinstance(u, str) else str(u)
     head, sep, tail = u.partition("://")
@@ -894,6 +902,35 @@ HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$
 # ⛔ KEEP IN SYNC WITH `merge-mcp.py` — an arm in pi-bootstrap/tests/test-cell-install.sh pins BOTH
 # constants to the SHIPPED template, so neither can drift away from the endpoint it names.
 HOSTED_DEFAULT_URL = "https://api.premiselabs.co/mcp/"
+
+
+def _endpoint_key(u):
+    """`scheme://host[:non-default-port]` + the rest — the IDENTITY of an endpoint (MUST MATCH
+    `merge-mcp.py`'s `endpoint_key`, which carries the full rationale).
+
+    ⛔ BYTE EQUALITY IS NOT ENDPOINT IDENTITY (#3374 review, round 12 P2). The client's parser drops
+    a DEFAULT port, so `https://api.premiselabs.co:443/mcp/` and `…co:/mcp/` are the SAME endpoint as
+    `HOSTED_DEFAULT_URL`; comparing bytes made them "somewhere the operator did not ask for", which
+    routed them to the `_selfHosted` exemption and SKIPPED the hosted credential requirement
+    entirely. Measured: the canonical spelling is refused `WRONG_AUTH`, the `:443` spelling of the
+    same entry is certified `SELFHOSTED:` rc=0 and the note then says "a self-hosted daemon needs
+    none" about the hosted host. Only 443/https and 80/http are dropped — a non-default port is the
+    documented self-host shape and stays distinct.
+    """
+    s = (u or "").strip()
+    m = re.match(r"^([a-z][a-z0-9+.\-]*)://(?:[^/?#]*@)?(\[[^\]]*\]|[^/?#:]*)(?::(\d*))?", s, re.I)
+    if not m:
+        return s                       # an unparseable url compares by its own bytes
+    scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    # ⛔ USERINFO FORCES THE KEY TO DIFFER — never let a spoof url key to the hosted endpoint by
+    # DROPPING it (MUST MATCH `merge-mcp.py`). Otherwise `https://user:pw@api.premiselabs.co/mcp/`
+    # takes the hosted path and skips the arm that refuses userinfo outright.
+    authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    prefix = "userinfo@" if "@" in authority else ""
+    if port == "" or (port is not None and ((scheme == "https" and port == "443")
+                                            or (scheme == "http" and port == "80"))):
+        port = None
+    return "%s%s://%s%s%s" % (prefix, scheme, host, (":" + port) if port else "", s[m.end():])
 # ⛔ A DIFFERING url is not automatically fine, and a MISSING Authorization is not automatically
 # broken: the two questions are linked. Accepting any non-empty http url let a cell whose endpoint
 # was a typo (or copied from another box) be certified LAYER VERIFIED while pointing at nothing — a
@@ -911,12 +948,12 @@ HOSTED_DEFAULT_URL = "https://api.premiselabs.co/mcp/"
 #   `want_url != HOSTED_DEFAULT_URL`       → the operator asked for a NON-hosted endpoint, so the
 #                                            entry they got is that endpoint, certified BY NAME.
 _selfhosted_shape = False
-if want_url and url != want_url:
+if want_url and _endpoint_key(url) != _endpoint_key(want_url):
     if not t.get("_selfHosted"):
-        print("URL_NOT_DEFAULT:%s" % url)
+        print("URL_NOT_DEFAULT:%s" % shown_url(url))
         sys.exit(1)
     _selfhosted_shape = True
-elif want_url and want_url.strip() != HOSTED_DEFAULT_URL:
+elif want_url and _endpoint_key(want_url) != _endpoint_key(HOSTED_DEFAULT_URL):
     # The TEMPLATE requests a non-hosted endpoint and the cell points exactly there: the operator
     # declared it once, in the file this cell was built from, so no per-box `_selfHosted` is owed.
     _selfhosted_shape = True
@@ -960,7 +997,20 @@ else:
         print("NOAUTH")
         sys.exit(1)
     if not HOSTED_AUTH.match(auth.strip()):
-        print("WRONG_AUTH:%s" % auth)
+        # ⛔ THE HEADER IS NOT PRINTED, AND `redact()` WAS NOT ENOUGH (#3374 review, round 12 P2).
+        # `redact()` masks `tt_`/`tk_` SHAPES only, so `WRONG_AUTH:Bearer ${TORTOISE_MCP_API_KEY}
+        # hunter2NOTATOKEN` — a trailing literal on an otherwise-correct header, which is what a bad
+        # paste or a merge of two headers produces — went into a bring-up log that gets pasted into
+        # issues fleet-wide. ⛔ A BARE LITERAL NEVER REACHES HERE (it is `LITERAL_AUTH`, one branch up,
+        # which prints no value at all), so that is NOT the shape this arm is for: measured on the
+        # PRE-FIX marker, this header printed in full, and this block prints the variable alone.
+        # What an operator actually needs is WHICH VARIABLE was named, and a `${VAR}` name is not a
+        # secret; anything else is withheld, because a literal in that position IS the secret.
+        # Measured: the arm that pins this asserts the secret is ABSENT from the log, not that the
+        # marker is present.
+        _m = re.match(r"^Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)", (auth or "").strip())
+        print("WRONG_AUTH:%s" % (("${%s}" % _m.group(1)) if _m
+                                 else "<a literal, not a ${VAR} reference — value withheld>"))
         sys.exit(1)
     print("OK:%s:%s" % (shown_url(url), auth))
 PY
@@ -1508,15 +1558,31 @@ copy_repo_path() {
   fi
 }
 
-# merge_tortoise_is_hosted <merged .mcp.json> <template .mcp.base.json>
-#   True only when the file that was JUST WRITTEN points its `tortoise` entry at the template's
-#   (hosted) url and does not carry the `_selfHosted` marker. The merge may legitimately keep a
-#   machine's own url, so this is what the install summary line reports — the ARTIFACT, never the
-#   intent of having run a merge. A file that cannot be read is NOT the hosted default: the
-#   caller's other line is the honest one, and the verifier refuses such a cell by name.
+# ⛔ THE BASH SIDE OF THE SAME CONSTANT, FOR THE ONE CALLER THAT CANNOT SEE THE MARKER'S PYTHON
+# (#3374 review, round 12 P3). Bash and the marker's python are two languages in one file, so
+# `$HOSTED_DEFAULT_URL` — a PYTHON name — is unbound in the shell (`set -u` then aborts the whole
+# install). MUST MATCH the marker's `HOSTED_DEFAULT_URL` above and `merge-mcp.py`'s; the pin arm in
+# pi-bootstrap/tests/test-cell-install.sh checks EVERY assignment in all of those files against the
+# SHIPPED template, so this spelling cannot drift from the endpoint it names.
+GRAPH_HOSTED_DEFAULT_URL="https://api.premiselabs.co/mcp/"
+
+
+# merge_tortoise_is_hosted <merged .mcp.json> <template .mcp.base.json> <hosted-default-url>
+#   True only when the file that was JUST WRITTEN points its `tortoise` entry at the HOSTED endpoint
+#   and does not carry the `_selfHosted` marker. The merge may legitimately keep a machine's own url,
+#   so this is what the install summary line reports — the ARTIFACT, never the intent of having run a
+#   merge. A file that cannot be read is NOT the hosted default: the caller's other line is the honest
+#   one, and the verifier refuses such a cell by name.
+#   ⛔ THE THIRD ARGUMENT IS WHY THE SENTENCE CAN BE TRUE (#3374 review, round 12 P3). The predicate
+#   compared the written file against the TEMPLATE's url, so with a self-hosting template a cell that
+#   correctly matched its own `localhost` daemon satisfied it and the summary printed "hosted tortoise
+#   entry installed" over an entry pointing at localhost — the same "a sentence that calls a LAN
+#   address 'the hosted host'" defect round 11 fixed one file over. `merge-mcp.py` asks this question
+#   against `HOSTED_DEFAULT_URL`, never the template, and so does this now; a non-hosted endpoint
+#   falls to the caller's "NOT the hosted default" line, which is the true one.
 merge_tortoise_is_hosted() {
-  python3 - "$1" "$2" <<'MCPHOSTED' >/dev/null 2>&1
-import json, sys
+  python3 - "$1" "$2" "$3" <<'MCPHOSTED' >/dev/null 2>&1
+import json, re, sys
 try:
     with open(sys.argv[1], encoding="utf-8") as fh:
         have = (json.load(fh).get("mcpServers") or {}).get("tortoise") or {}
@@ -1526,10 +1592,28 @@ except Exception:
     sys.exit(1)
 if not isinstance(have, dict) or not isinstance(want, dict):
     sys.exit(1)
+
+def key(u):
+    # MUST MATCH `_endpoint_key` above — a default port is not part of an endpoint's identity.
+    s = (u or "").strip()
+    m = re.match(r"^([a-z][a-z0-9+.\-]*)://(?:[^/?#]*@)?(\[[^\]]*\]|[^/?#:]*)(?::(\d*))?", s, re.I)
+    if not m:
+        return s
+    scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    # ⛔ USERINFO FORCES THE KEY TO DIFFER — never let a spoof url key to the hosted endpoint by
+    # DROPPING it (MUST MATCH `merge-mcp.py`). Otherwise `https://user:pw@api.premiselabs.co/mcp/`
+    # takes the hosted path and skips the arm that refuses userinfo outright.
+    authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    prefix = "userinfo@" if "@" in authority else ""
+    if port == "" or (port is not None and ((scheme == "https" and port == "443")
+                                            or (scheme == "http" and port == "80"))):
+        port = None
+    return "%s%s://%s%s%s" % (prefix, scheme, host, (":" + port) if port else "", s[m.end():])
+
 sys.exit(
     0
-    if (have.get("url") or "").strip() == (want.get("url") or "").strip()
-    and (want.get("url") or "").strip()
+    if key(have.get("url")) == key(sys.argv[3])
+    and key(want.get("url")) == key(sys.argv[3])
     and not have.get("_selfHosted")
     else 1
 )
@@ -1634,7 +1718,7 @@ PY
       # rc=0 alone this line then told the operator the HOSTED entry was installed, the opposite of
       # what the artifact says. Reading the merged file back is the same discipline the layer
       # verification below uses: a claim about an artifact is checked against the artifact.
-      if merge_tortoise_is_hosted "$DEST/.mcp.json" "$mcp_src"; then
+      if merge_tortoise_is_hosted "$DEST/.mcp.json" "$mcp_src" "$GRAPH_HOSTED_DEFAULT_URL"; then
         log_line ".mcp.json: hosted tortoise entry installed (cell-local servers preserved)"
       else
         log_line ".mcp.json: merged, but the tortoise entry is NOT the hosted default (see the NOTE above) — cell-local servers preserved"

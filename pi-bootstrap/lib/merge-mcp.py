@@ -169,6 +169,57 @@ def authority_of(url):
     return (m.group(1) + (":" + port if port is not None else "")).lower()
 
 
+def endpoint_key(url):
+    """`scheme://host[:non-default-port]` + the rest — the IDENTITY of an endpoint, as the client parses it.
+
+    ⛔ BYTE EQUALITY IS NOT ENDPOINT IDENTITY (#3374 review, round 12 P2). `HOSTED_DEFAULT_URL` is
+    ONE SPELLING of the hosted endpoint, and the client's parser (`new URL`, WHATWG) reads several
+    others as the SAME endpoint: it DROPS A DEFAULT PORT, so `https://api.premiselabs.co:443/mcp/`
+    and `https://api.premiselabs.co:/mcp/` both normalise to `https://api.premiselabs.co/mcp/`
+    (measured with node v24: `.href` is the canonical form for both). The "does this entry need the
+    hosted credential?" question compared BYTES, so every non-canonical spelling fell through to the
+    `url != want_url` branch — the SELF-HOST exemption — and was PRESERVED, marked `_selfHosted`,
+    and then certified `SELFHOSTED:` with NO credential check at all. Measured on the real repair
+    path: an entry at the HOSTED HOST declaring `Bearer ${SOME_OTHER_VAR}` (which expands to an
+    EMPTY Bearer — the #3275/#3289 401 this whole change exists to close) was REPLACED in its
+    canonical spelling and CERTIFIED in its `:443` one, and `--verify` then printed the
+    "a self-hosted daemon needs none" sentence about the hosted endpoint.
+
+    ⛔ ONLY A *DEFAULT* PORT IS DROPPED. A non-default port is a genuinely different endpoint and the
+    documented self-host shape (`http://localhost:8000/mcp`, an operator's daemon on `:8443`), so
+    `:8443` stays distinct and preserved — `authority_of`'s docstring records the regression that
+    came from conflating the two.
+
+    ⛔ AN UNPARSEABLE url FALLS BACK TO ITS OWN BYTES. Returning `""` for both sides would make two
+    DIFFERENT scheme-less urls compare EQUAL, which is the same class of false certification one
+    level down.
+    """
+    u = (url or "").strip()
+    m = _URL_PARTS.match(u)
+    if not m:
+        return u
+    scheme = u.split("://", 1)[0].lower()
+    host = m.group(1).lower()
+    port = m.group(2)
+    # ⛔ A KEY MUST NEVER EQUAL THE HOSTED ONE BY *DROPPING* USERINFO (#3374 review, round 12 P2).
+    # The authority class above skips `user[:pw]@`, so without this an entry at
+    # `https://user:pw@api.premiselabs.co/mcp/` would key to the HOSTED endpoint — taking the hosted
+    # path and skipping the arm that refuses userinfo outright. A userinfo is NEVER part of an
+    # endpoint's identity here: it forces the key to DIFFER, so such an entry stays on the
+    # self-host/replace path where its reachability is judged. The marker is a literal word, not the
+    # userinfo, so no secret can ever reach a key (keys are never printed; the rule still costs one word).
+    authority = u.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    prefix = "userinfo@" if "@" in authority else ""
+    # WHATWG drops a DEFAULT port; an empty one (the bare `host:` spelling) is no port at all.
+    if port == "" or (port is not None and ((scheme == "https" and port == "443")
+                                            or (scheme == "http" and port == "80"))):
+        port = None
+    key = "%s%s://%s" % (prefix, scheme, host)
+    if port:
+        key += ":" + port
+    return key + u[m.end():]
+
+
 # WHATWG URL's forbidden HOST code points. A host containing one is not "a spelling of a host" —
 # the client's parser refuses it outright (`new URL(...)` -> ERR_INVALID_URL), so a predicate that
 # calls it usable certifies an endpoint no request can be built from.
@@ -218,10 +269,18 @@ def authority_names_a_host(authority):
     exited 0, i.e. LAYER VERIFIED over an entry that points at nothing. That is the same false green
     the scheme-less `BADURL:` arm exists to close; this arm is the rest of it.
 
-    THE RULE IS THE CLIENT'S PARSER, NOT A GUESS. Each refusal below is a shape `new URL(u)` in the
+    THE RULE IS THE CLIENT'S PARSER, NOT A GUESS. Most refusals below are shapes `new URL(u)` in the
     mcp-client THROWS on (measured: `ERR_INVALID_URL` for the empty host, the space, the non-numeric
-    port, `:65536`, `:-1` and a percent-encoded host) — so refusing it cannot over-block a config
-    that works, because no request can be constructed from it either. The shapes the client ACCEPTS
+    port, `:65536`, `:-1`) — so refusing those cannot over-block a config that works, because no
+    request can be constructed from them either. TWO ARE DELIBERATE OVER-BLOCKS, and saying so is the
+    point of this paragraph (#3374 review, round 12 P3): `:0` parses fine in the client and is refused
+    by `_port_ok`'s `1 <= int(port)`, and a PERCENT-ENCODED host parses too — it DECODES (measured:
+    `https://api.premiselabs.co%2eevil.example/mcp/` reads as host
+    `api.premiselabs.co.evil.example`) — and is refused here because a percent-encoded host is a SPOOF
+    SHAPE, not an endpoint someone typed. Both converge (a refused entry is REPLACED by the merge), so
+    neither is a repair loop; but this paragraph used to claim every refusal below was a client
+    throw, which was false, and a false justification is what the next column of refusals gets built
+    on. The shapes the client ACCEPTS
     are accepted here: a bare trailing `host:` (URL reads it as no port), a trailing root dot
     (`api.example.`), an underscore (`my_host`), an IDN (punycoded by URL), and `[<ipv6>]:port`.
     The empty-labeled and alnum-free forms the client parses but DNS cannot resolve (`.`, `-`,
@@ -268,9 +327,15 @@ def _port_ok(port):
 def near_miss(url, want_url):
     """True when `url` is the DEFAULT endpoint spelled differently (SAME AUTHORITY).
 
-    A self-host is a DIFFERENT HOST — that is what makes it a self-host. Same host with a different
-    path (or a missing trailing slash) is a typo, or a copy that got mangled, and preserving it means
-    the box points at an endpoint nobody meant to configure.
+    A self-host is a DIFFERENT AUTHORITY — host, or the same host on a NON-DEFAULT port (`:8443` is
+    the documented own-daemon shape, and `authority_of` keeps the port deliberately). Same authority
+    with a different path (or a missing trailing slash) is a typo, or a copy that got mangled, and
+    preserving it means the box points at an endpoint nobody meant to configure.
+    ⛔ "DIFFERENT HOST" IS WHAT THIS SAID (#3374 review, round 12 P3) while the comparand below KEEPS
+    THE PORT — so a same-host different-port entry is a self-host by this code, not "a different
+    host", and the sentence contradicted `authority_of`'s own docstring one function up. A *DEFAULT*
+    port is the other case: it does not make a different endpoint at all, and `endpoint_key()` is
+    what decides that.
 
     ⛔ THE SCHEME IS PART OF THE SPELLING **AND IT IS DELIBERATELY NOT COMPARED** — the comparison
     below is on the AUTHORITY ALONE (`authority_of()` drops the scheme AND any userinfo, and KEEPS the
@@ -550,7 +615,7 @@ def usable(entry, want_url):
         # refuses and `--install` then exits non-zero on — a bring-up that can never converge, which
         # is exactly the "config `--verify` must refuse in perpetuity" this function exists to stop.
         return False, "insecure"
-    if url != want_url:
+    if endpoint_key(url) != endpoint_key(want_url):
         # a self-hosted daemon may need no key at all (docs/quickstart-selfhosted.md), and its
         # header may legitimately name a different variable — it is the operator's daemon.
         return True, ""
