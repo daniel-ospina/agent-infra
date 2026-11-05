@@ -574,13 +574,20 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     the MANUAL block above the `archived-local` and `refs/wip/*` reporters while still NAMING the archive
     it found. Every MANUAL arm NAMES the other domain's MANUAL fact instead of returning alone — a refused
     push beside a failed archive says both, and says that re-running the rescue cannot fix the branch.
-    ⛔ **AND NO MANUAL ARM MAY ASSERT AN ABSENCE IT DID NOT MEASURE.** Three verdicts had that shape and
-    now say only what was established: `push=running` is what the PRE-NETWORK marker holds when the lane
-    is killed mid-push, so it says the push had not returned — never that the commits "exist only on this
-    disk", which the same row's own `unpushed=0` would contradict; `not-a-worktree` is not a verdict about
-    any worktree (nothing was examined — the cause is the CALLER's pointer, so `next=` names `WIP_PATH=` as
-    the remedy); and `rescue=UNAVAILABLE` means the rescuer was not FOUND, so `next=` says to install it
-    rather than "re-run bg-rescue-wip.sh", a command that cannot be run.
+    ⛔ **AND NO MANUAL ARM MAY ASSERT AN ABSENCE IT DID NOT MEASURE.** Four verdicts had that shape and
+    now say only what was established: `push=unmeasured` means the `rev-list --count` FAILED, so it says the
+    count could not be read rather than that the commits "exist only on this disk" (the enumeration that
+    failed is not evidence of existence); `push=running` is what the PRE-NETWORK marker holds when the lane
+    is killed mid-push, so it says the push had not returned — never that the commits exist only here, which
+    the same row's own `unpushed=0` would contradict; `not-a-worktree` is not a verdict about any worktree
+    (nothing was examined — the cause is the CALLER's pointer, so `next=` names `WIP_PATH=` as the remedy);
+    and `rescue=UNAVAILABLE` means the rescuer was not FOUND, so `next=` says to install it rather than
+    "re-run bg-rescue-wip.sh", a command that cannot be run. ⛔ **AND THE OTHER DOMAINS' MANUAL FACTS ARE
+    APPENDED BY SHARED HELPERS, NOT RE-TYPED PER ARM** (`lane_end_rescue_caveat`, `lane_end_tree_caveat`):
+    four consecutive review cycles each found a fresh arm that dropped one — a refused push silencing the
+    archive, the archive silencing the refused push, a reporter silencing `cannot-verify`, and finally
+    `cannot-verify` itself being dropped by every MANUAL push and rescue arm because its own arm sits below
+    them. A caveat expressed once cannot get a case list subtly different.
   * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
     writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
