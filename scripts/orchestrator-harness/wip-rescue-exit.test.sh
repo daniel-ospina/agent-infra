@@ -2242,21 +2242,52 @@ echo
 # canon.git's refs/heads/trunk moved 613382f..b4e6ab9 (fast forward) while the same terminal recorded
 # `push=FAILED` "does NOT hold refs/heads/trunk". THIS ARM FAILS IF THE FIX IS REMOVED: with the reads
 # back on `origin` the protected set is mirror's `main`, `trunk` is not in it, and canon's trunk moves.
+#
+# ⛔ A FIXTURE MAY NOT DEPEND ON THE BOX'S GLOBAL GIT IDENTITY (review round 5, P0 — REPRODUCED).
+# Every `git commit` in N44/N44g/N44h needs `user.name`/`user.email`. THIS box carries them in
+# `~/.gitconfig`, so the arms passed here for twenty-odd cycles — and the CI runner carries NEITHER, so
+# `git commit` there dies with `fatal: empty ident name (for <runner@…>) not allowed`, the `&&` chain
+# short-circuits, the bare repos stay empty, `git worktree add -q … trunk` fails, `lane_end_push` is
+# handed a directory that does not exist, and the terminal records `push=detached` — a verdict about a
+# DYING LANE, produced by a FIXTURE that never got built. Measured on run 42084291355 job 127445961182
+# (`wip-rescue-exit.test.sh: 212 passed, 6 failed` → N44a N44c N44d N44g0 N44g N44g2) and reproduced on
+# this box, byte-identical, with `GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_SYSTEM=/dev/null HOME=<empty>`.
+# ⛔ N44h did NOT red there, which is worse than a red: its fixture also failed to build and the arm
+# still reported ✅, because a clone with no commit and no `origin` lands on `refused-pushurl-unresolved`
+# by a different route. A green arm over a broken fixture is the class this suite exists to refuse.
+# Set in the REPO (not per-command) for the reason recorded at the top of this file: `bg-rescue-wip.sh`
+# builds its archive with `git commit-tree`, which needs an identity of its OWN, so `-c user.email=…` on
+# the command that commits does not cover an arm that later archives. And the two arms below assert the
+# fixture is REAL, so a fixture that fails to build reds a `…prep` arm instead of six arms blaming the code.
+fixture_ident() { git -C "$1" config user.name t && git -C "$1" config user.email t@t; }
+is_oid() { printf '%s' "$1" | grep -qE '^[0-9a-f]{40}$'; }
 n44="$TMP/n44"; mkdir -p "$n44"
 git init -q --bare "$n44/mirror.git" && git init -q --bare "$n44/canon.git"
 git -C "$n44/mirror.git" symbolic-ref HEAD refs/heads/main
 git -C "$n44/canon.git" symbolic-ref HEAD refs/heads/trunk
-git init -q "$n44/seed" && git -C "$n44/seed" commit -q --allow-empty -m base \
+git init -q "$n44/seed" && fixture_ident "$n44/seed" && git -C "$n44/seed" commit -q --allow-empty -m base \
   && git -C "$n44/seed" branch -M main && git -C "$n44/seed" commit -q --allow-empty -m m2 \
   && git -C "$n44/seed" push -q "$n44/mirror.git" main:main \
   && git -C "$n44/seed" checkout -q -b trunk && git -C "$n44/seed" commit -q --allow-empty -m t2 \
   && git -C "$n44/seed" push -q "$n44/canon.git" trunk:trunk && rm -rf "$n44/seed"
 git clone -q "$n44/mirror.git" "$n44/wk" 2>/dev/null
+# The lane worktree's commits below read the COMMON config, i.e. this clone's — set once, here.
+fixture_ident "$n44/wk"
 git -C "$n44/wk" remote set-url --push origin "$n44/canon.git"
 git -C "$n44/wk" fetch -q "$n44/canon.git" trunk:trunk
 git -C "$n44/wk" worktree add -q "$n44/wt" trunk
 git -C "$n44/wt" commit -q --allow-empty -m "a lane's unpushed work"
-n44_before="$(git -C "$n44/canon.git" rev-parse refs/heads/trunk)"
+# ⛔ THE FIXTURE IS ASSERTED BEFORE ANY VERDICT IS READ FROM IT (review round 5, P0 — REPRODUCED).
+# `git rev-parse <ref>` writes the LITERAL ARGUMENT to stdout when the ref does not resolve, and exits
+# 128 — so on the broken-fixture path (the CI runner, no git identity) `n44_before` was the STRING
+# `refs/heads/trunk` and `n44_after` was the same string, i.e. N44b compared two error echoes and
+# reported ✅ "the landing branch did NOT move (refs/hea before, refs/hea after)" — a green assertion
+# over a ref that never existed, holding up the one arm that proves the P0 bypass cannot recur.
+# The last two N44 arms do not have this hole and this one does not inherit it: the sha must be 40-hex
+# and the worktree must exist, or the arms that follow are measuring nothing.
+n44_before="$(git -C "$n44/canon.git" rev-parse refs/heads/trunk 2>/dev/null)"
+{ is_oid "$n44_before" && [ -d "$n44/wt" ]; }; rcn44prep=$?
+ck "N44prep the fixture is REAL — canon.git holds a 40-hex trunk ($n44_before) and the lane worktree exists" $rcn44prep
 : > "$O/logs/pushurl.log"
 O="$O" bash -c '
   . "$1"
@@ -2301,7 +2332,7 @@ git init -q --bare "$n44g/A.git" && git init -q --bare "$n44g/B.git" && git init
 git -C "$n44g/A.git" symbolic-ref HEAD refs/heads/main
 git -C "$n44g/B.git" symbolic-ref HEAD refs/heads/trunk
 git -C "$n44g/C.git" symbolic-ref HEAD refs/heads/main
-git init -q "$n44g/seed" && git -C "$n44g/seed" commit -q --allow-empty -m base && git -C "$n44g/seed" branch -M main
+git init -q "$n44g/seed" && fixture_ident "$n44g/seed" && git -C "$n44g/seed" commit -q --allow-empty -m base && git -C "$n44g/seed" branch -M main
 for r in A B C; do git -C "$n44g/seed" push -q "$n44g/$r.git" main:main; done
 git -C "$n44g/seed" checkout -q -b trunk && git -C "$n44g/seed" commit -q --allow-empty -m t2
 # trunk must be reachable through A too, so the WORKTREE can be created the ordinary way; A is not a
@@ -2310,6 +2341,7 @@ git -C "$n44g/seed" push -q "$n44g/A.git" trunk:trunk
 git -C "$n44g/seed" push -q "$n44g/B.git" trunk:trunk && git -C "$n44g/seed" push -q "$n44g/C.git" trunk:trunk
 rm -rf "$n44g/seed"
 git clone -q "$n44g/A.git" "$n44g/wk" 2>/dev/null
+fixture_ident "$n44g/wk"
 git -C "$n44g/wk" config "url.$n44g/B.git.pushInsteadOf" "$n44g/A.git"
 git -C "$n44g/wk" config "url.$n44g/C.git.insteadOf" "$n44g/B.git"
 git -C "$n44g/wk" fetch -q origin trunk:trunk
@@ -2318,7 +2350,7 @@ git -C "$n44g/wt" commit -q --allow-empty -m "a lane's unpushed work"
 n44g_target="$(git -C "$n44g/wt" remote get-url --push origin)"
 n44g_proof="$(git -C "$n44g/wt" ls-remote --get-url "$n44g_target")"
 n44g_before="$(git -C "$n44g/B.git" rev-parse refs/heads/trunk 2>/dev/null)"
-ck "N44g0 …the fixture really is chained (push target ${n44g_target##*/}, fetch expansion ${n44g_proof##*/} — they must DIFFER, or this arm cannot see the class)" "$([ "$n44g_target" != "$n44g_proof" ] && echo 0 || echo 1)"
+ck "N44g0 …the fixture really is chained AND real (push target ${n44g_target##*/}, fetch expansion ${n44g_proof##*/}, trunk $n44g_before — they must DIFFER, and trunk must be a 40-hex sha, or this arm cannot see the class)" "$([ "$n44g_target" != "$n44g_proof" ] && is_oid "$n44g_before" && echo 0 || echo 1)"
 : > "$O/logs/chain.log"
 O="$O" bash -c '
   . "$1"
@@ -2343,8 +2375,9 @@ git -C "$n44g/wk" worktree remove --force "$n44g/wt" 2>/dev/null
 # remedy.
 n44h="$TMP/n44h"; mkdir -p "$n44h"
 git init -q --bare "$n44h/only.git" && git -C "$n44h/only.git" symbolic-ref HEAD refs/heads/main
-git init -q "$n44h/seed" && git -C "$n44h/seed" commit -q --allow-empty -m base && git -C "$n44h/seed" push -q "$n44h/only.git" HEAD:main && rm -rf "$n44h/seed"
+git init -q "$n44h/seed" && fixture_ident "$n44h/seed" && git -C "$n44h/seed" commit -q --allow-empty -m base && git -C "$n44h/seed" push -q "$n44h/only.git" HEAD:main && rm -rf "$n44h/seed"
 git clone -q "$n44h/only.git" "$n44h/wk" 2>/dev/null
+fixture_ident "$n44h/wk"
 git -C "$n44h/wk" worktree add -q "$n44h/wt" -b lone 2>/dev/null
 git -C "$n44h/wt" commit -q --allow-empty -m "a lane's unpushed work"
 git -C "$n44h/wt" remote remove origin 2>/dev/null
