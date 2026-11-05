@@ -297,8 +297,9 @@ LOG_WINDOW_MS = 30_000
 # half was wrong: `LANE_REAP_LIVE_MIN` defaults to 125 min (`lane-reap.sh:176`), and
 # the lane's wall is `LANE_BACKSTOP_S` = 7200 s (`spawn-gate.sh:1480`), consumed as
 # the default at `lane.sh:486` — so the number was described as sitting ABOVE a
-# bound it actually sat 80 min below. The 45 min is the progress allowance because
-# that is the bound that asks the SAME question ("is this lane still working?").
+# bound it actually sat 75 min below (45 vs 120). The 45 min is the progress
+# allowance because that is the bound that asks the SAME question ("is this lane
+# still working?").
 LOG_FREEZE_MS = 45 * 60 * 1000
 # The CPU tolerance: a delta at or below this is NOT progress. `LANE_REAP_CPU_TOL_CS`
 # default 10 (0.10 s) — a sub-0.1 s twitch is indistinguishable from a parked fork

@@ -1667,8 +1667,8 @@ instead of a second, unreviewed one.
 and the file contradicted itself: `LANE_REAP_LIVE_MIN` defaults to **125 min** (stated correctly in
 §11.3) and the lane's wall is `LANE_BACKSTOP_S` = **7200 s** (`spawn-gate.sh:1480`, consumed as the
 default at `lane.sh:486`) — so the number was described as sitting above a bound it actually sat
-80 min below. The source of the 45 min is the progress allowance, because that is the bound that
-asks the same question.
+75 min below (45 vs 120). The source of the 45 min is the progress allowance, because that is the
+bound that asks the same question.
 
 **A NEGATIVE DELTA IS A BROKEN READING, NOT A FLAT ONE.** A stable subtree cannot *lose* CPU, so a
 negative delta means one of the two reads was incomplete (a child exited between the samples, a
