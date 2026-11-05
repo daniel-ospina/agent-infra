@@ -57,18 +57,23 @@
 #                    and answering `head`/`carry` there is the false PASS #3440
 #                    measured (#3355: a clean attestation over 7 red checks). The
 #                    remedy is to fix or re-run the failing checks — NOT a re-review.
-#     surface-unknown 8 (#3440) the recorded sha's check surface COULD NOT BE READ (a
-#                    refused gh/API read, or no repo resolvable). A failed read is its
-#                    own answer and never a green one (#2342's rule, applied to this
+#     surface-unknown 8 (#3440) the head's check surface COULD NOT BE READ (a refused
+#                    gh/API read, or no repo resolvable). A failed read is its own
+#                    answer and never a green one (#2342's rule, applied to this
 #                    question) — RETRY once the budget/transport recovers.
-#   `red-base-owned` (exit 0) is the fourth surface outcome: the recorded head IS red,
-#   but every red group also reproduces on the PR's base, so it is the BASE's red and
-#   the rail — not this verb — owns that decision (#3322/#3715 reproduce base reds with
-#   evidence). It is exit 0 because the RECORD does cover what would merge and no
-#   re-review is owed, but the answer is a DISTINCT token and the groups are NAMED on
-#   stderr: never a bare green. An EMPTY surface and an IN-FLIGHT one keep the normal
-#   token and are named loudly on stderr — neither is green, and #2342 records why an
-#   absent surface must not become a refusal here.
+#     red-base-owned 0 (#3440) the fourth surface outcome: the head IS red, but every red
+#                    group also reproduces on the PR's base, so it is the BASE's red. Exit
+#                    0 because the RECORD still covers what would merge and no re-review
+#                    is owed — but it is a DISTINCT token, never a bare green, and the
+#                    groups are NAMED on stderr. WHO VERIFIES the base ownership depends
+#                    on where this runs: on a rail repo the rail re-measures base reds
+#                    against its own reproduction (#3322/#3715); in gate mode nothing else
+#                    does, which is a NAMED RESIDUAL, not a guarantee.
+#   The SHA judged is the one that would MERGE: on the head-bound arm that is the recorded
+#   sha, on the `carry` arm it is the LIVE head (review round 2 — a green recorded head
+#   with a red live head must not answer `carry`). An EMPTY surface and an IN-FLIGHT one
+#   keep the normal token and are named loudly on stderr — neither is green, and #2342
+#   records why an absent surface must not become a refusal here.
 #
 #     norecord    4  no record for this PR/repo — there is no verdict to carry
 #                    (with no repo resolved: no unique `<owner>-<repo>-<pr>.json`
@@ -2885,15 +2890,24 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   # #3715 machinery is the strong version (it re-runs the lane on the base); this reads
   # the base's check-runs and says so, and an UNMEASURABLE base is attributed to the PR
   # (fail closed) rather than waved through.
-  cc_surface_gate() { # <recd field> <live field> -> 0 = the caller may print its answer
-    local recd="$1" live="$2" out="" rc=0 verdict="" red="" bsha="" bout="" brc=0 bred=""
+  cc_surface_gate() { # <sha to JUDGE> <recd field> <live field> -> 0 = the caller may print its answer
+    # ⛔ WHICH SHA IS JUDGED (review of #3440, round 2, BLOCKING). The first version always read
+    # `$CC_HEAD` — the RECORDED head — and that is wrong on the `carry` arm, where the recorded
+    # head and the LIVE head differ BY CONSTRUCTION (the head arm took equality just above). The
+    # answer that arm publishes is a LICENCE ("the reviewed diff is unchanged — land it"), and the
+    # head that lands is the LIVE one: a green recorded head with a red live head (the ordinary
+    # `gh pr update-branch` / base-refresh shape) answered `carry`/exit 0, so check (c) passed and
+    # merge-one went looking for a 20-40 minute review over a red tree — the exact purchase this
+    # change forbids ("a red check is not a review finding"). So the CALLER names the sha, and the
+    # carry arm names the LIVE head; on the head-bound arm the two are identical.
+    local jsha="$1" recd="$2" live="$3" out="" rc=0 verdict="" red="" bsha="" bout="" brc=0 bred=""
     local total=0 owned=0 k="" notowned="" why=""
     if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
       printf 'surface-unknown\t%s\t%s\n' "$recd" "$live"
-      echo "record-review.sh --check-carry: ⛔ (#3440) the check surface of ${CC_HEAD:0:12}… could not be READ — no repo was resolved${REPO:+ ($REPO)} (the check-runs read is repo-scoped, and a PR number alone does not name one). An unread surface is NOT a green one, so this record is not reported as mergeable. Pass it positionally: record-review.sh --check-carry $PR owner/repo" >&2
+      echo "record-review.sh --check-carry: ⛔ (#3440) the check surface of ${jsha:0:12}… could not be READ — no repo was resolved${REPO:+ ($REPO)} (the check-runs read is repo-scoped, and a PR number alone does not name one). An unread surface is NOT a green one, so this record is not reported as mergeable. Pass it positionally: record-review.sh --check-carry $PR owner/repo" >&2
       exit 8
     fi
-    out="$(check_surface_scan "$CC_HEAD" 2>/dev/null)" || rc=$?
+    out="$(check_surface_scan "$jsha" 2>/dev/null)" || rc=$?
     verdict="${out%%$'\n'*}"
     case "$verdict" in
       red) : ;;
@@ -2904,13 +2918,13 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
         # "unreadable" about an unnamed verdict (it did, before this arm existed, which is also
         # why the mutation pin could not tell the two apart).
         printf 'surface-unknown\t%s\t%s\n' "$recd" "$live"
-        echo "record-review.sh --check-carry: ⛔ (#3440) the check surface of ${CC_HEAD:0:12}… COULD NOT BE READ (the API read was refused, rc=$rc). A failed read is its own answer, never a green one — this is NOT a changed artifact and NOT a re-review. RETRY once the budget window or the transport recovers (#2342's rule for the carry veto, applied to the mergeable answer)." >&2
+        echo "record-review.sh --check-carry: ⛔ (#3440) the check surface of ${jsha:0:12}… COULD NOT BE READ (the API read was refused, rc=$rc). A failed read is its own answer, never a green one — this is NOT a changed artifact and NOT a re-review. RETRY once the budget window or the transport recovers (#2342's rule for the carry veto, applied to the mergeable answer)." >&2
         exit 8 ;;
       empty)
-        echo "record-review.sh --check-carry: ⚠️ (#3440) ${CC_HEAD:0:12}… carries NO readable check run after excluding ${RECORD_REVIEW_RED_EXCLUDE}. That is NOT green: an absent surface is not evidence of anything, so the answer below is about the record's IDENTITY only. Do not report this head as verified-green (#2342 records the same treatment for the carry veto)." >&2
+        echo "record-review.sh --check-carry: ⚠️ (#3440) ${jsha:0:12}… carries NO readable check run after excluding ${RECORD_REVIEW_RED_EXCLUDE}. That is NOT green: an absent surface is not evidence of anything, so the answer below is about the record's IDENTITY only. Do not report this head as verified-green (#2342 records the same treatment for the carry veto)." >&2
         return 0 ;;
       in_flight)
-        echo "record-review.sh --check-carry: ⚠️ (#3440) ${CC_HEAD:0:12}… has check run(s) still IN FLIGHT. Not red, and not yet green either: the answer below certifies the record's IDENTITY, not the tree's health. Re-ask (or let the rail re-check) once the surface completes." >&2
+        echo "record-review.sh --check-carry: ⚠️ (#3440) ${jsha:0:12}… has check run(s) still IN FLIGHT. Not red, and not yet green either: the answer below certifies the record's IDENTITY, not the tree's health. Re-ask (or let the rail re-check) once the surface completes." >&2
         return 0 ;;
       green) return 0 ;;
       *)
@@ -2920,7 +2934,7 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
         # a pass (the rail adopted it after an unrecognised conclusion merged a PR), and a
         # future edit to the scan is the realistic way this arm becomes live.
         printf 'surface-unknown\t%s\t%s\n' "$recd" "$live"
-        echo "record-review.sh --check-carry: ⛔ (#3440) the check surface of ${CC_HEAD:0:12}… returned an UNRECOGNISED verdict '$verdict' — an unclassified answer is not a green one, so nothing is certified here. This is a defect in the READER or the recorder, not in the PR: re-run after updating the toolchain." >&2
+        echo "record-review.sh --check-carry: ⛔ (#3440) the check surface of ${jsha:0:12}… returned an UNRECOGNISED verdict '$verdict' — an unclassified answer is not a green one, so nothing is certified here. This is a defect in the READER or the recorder, not in the PR: re-run after updating the toolchain." >&2
         exit 8 ;;
     esac
     red="$(printf '%s\n' "$out" | command sed -n '2,$p')"
@@ -2959,8 +2973,8 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     done <<< "$red"
     if [ "$total" -gt 0 ] && [ "$owned" -eq "$total" ]; then
       printf 'red-base-owned\t%s\t%s\n' "$recd" "$live"
-      echo "record-review.sh --check-carry: ⛔ (#3440) ${CC_HEAD:0:12}… is RED, and every red group ALSO reproduces on the base ${bsha:0:12}… — so this is BASE-OWNED, not this PR's. You are accepting: $(printf '%s\n' "$red" | command tr '\n' ' ')." >&2
-      echo "   The record DOES cover the artifact that would merge (that is what the answer on stdout reports), so nothing here is stale and no review is owed. Mergeability is the RAIL's call: it reproduces base reds on the base with evidence and exempts only what it measured (#3322/#3715), which is a stricter test than this one. Not silent — named, which is the point of #3440." >&2
+      echo "record-review.sh --check-carry: ⛔ (#3440) ${jsha:0:12}… is RED, and every red group ALSO reproduces on the base ${bsha:0:12}… — so this is BASE-OWNED, not this PR's. You are accepting: $(printf '%s\n' "$red" | command tr '\n' ' ')." >&2
+      echo "   The record DOES cover the artifact that would merge (that is what the answer on stdout reports), so nothing here is stale and no review is owed. WHO VERIFIES the base ownership depends on where this runs: on a RAIL repo the rail re-measures base reds against its own reproduction and exempts only what it measured (#3322/#3715), a stricter test than the same-name comparison used here; in GATE mode nothing else re-measures it, so this comparison IS the only evidence and it is a NAMED RESIDUAL (it cannot tell a group failing on the base for one reason from the same group failing here for another). Not silent — named, which is the point of #3440." >&2
       exit 0
     fi
     printf 'red-surface\t%s\t%s\n' "$recd" "$live"
@@ -2973,7 +2987,7 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     else
       why="not reproduced on the base ${bsha:0:12}…: ${notowned}"
     fi
-    echo "record-review.sh --check-carry: ⛔ (#3440) ${CC_HEAD:0:12}… is RED and the red is NOT shown base-owned — ${why}." >&2
+    echo "record-review.sh --check-carry: ⛔ (#3440) ${jsha:0:12}… is RED and the red is NOT shown base-owned — ${why}." >&2
     echo "   Red group(s): $(printf '%s\n' "$red" | command tr '\n' ' ')." >&2
     echo "   This record may still cover the artifact, but it does NOT cover a tree whose checks are failing: an attestation that reads as merge-ready over a red surface is the false PASS #3440 measured (#3355 was attested clean over 7 red checks). NOT MERGEABLE — fix or re-run the failing checks, then re-record. A re-review is not the remedy for a broken build." >&2
     exit 7
@@ -3038,7 +3052,7 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     # so it is where the surface must be read. It answers `head` only when the surface is
     # not red (or is red base-owned, which is named); otherwise it prints its own verdict
     # and exits, so this arm can never say "nothing is stale" over a red tree again.
-    cc_surface_gate "${CC_DIFF:--}" "${DIFF_HASH:--}"
+    cc_surface_gate "$CC_HEAD" "${CC_DIFF:--}" "${DIFF_HASH:--}"
     printf 'head\t%s\t%s\n' "${CC_DIFF:--}" "${DIFF_HASH:--}"
     echo "record-review.sh --check-carry: the record is bound to the CURRENT head (${CC_HEAD:0:12}…) — nothing is stale and nothing needs re-review." >&2
     exit 0
@@ -3073,8 +3087,10 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     exit 3
   fi
   if [ "$CC_DIFF" = "$DIFF_HASH" ]; then
-    # (#3440) The SECOND licence-reading answer — same gate, same four outcomes.
-    cc_surface_gate "$CC_DIFF" "$DIFF_HASH"
+    # (#3440) The SECOND licence-reading answer — same gate, same four outcomes, but the sha
+    # judged is the LIVE head: this arm only runs when the recorded head is NOT the live one, and
+    # the live head is what would merge (review round 2, BLOCKING).
+    cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"
     printf 'carry\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
     echo "record-review.sh --check-carry: the reviewed DIFF is UNCHANGED (diff_sha256 ${CC_DIFF:0:12}… matches the PR's live diff) — the merge gate CARRIES this record across the head move (${CC_HEAD:-the earlier head}${CC_HEAD:+ }…). Do NOT re-review and do NOT mint a fresh record: land it. [source: $CC_ORIGIN]" >&2
     exit 0

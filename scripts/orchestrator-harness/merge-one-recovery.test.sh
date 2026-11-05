@@ -377,6 +377,19 @@ rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "the cap (3) did NOT park
 ck "RED→GREEN(exit-3): a red surface that persists to the cap PARKS instead of re-looping" $rc
 rc=0; log_has "ABORT: the check surface is RED" || { rc=1; note "the park does not say why: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
 ck "…and the abort line names the red surface, not a mystery" $rc
+# The counter being UNWRITABLE must PARK, not loop: a best-effort write makes the bound an INERT
+# ENFORCER (the count is never persisted, so the cap can never fire). Same shape as the sibling
+# diffreadcount vector, and it is the one arm a `|| true` would silently neutralise.
+# ── review round 2: this arm was unpinned (a `|| true` mutant left the suite green) ──
+mkmrg; mkrecorder; write_record "$HEAD" clean
+mkdir -p "$MRG/o/state/redsurfacecount-$PR"   # a DIRECTORY where the counter file must go
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-surface FAKE_CC_RC=7)"
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "an unwritable red-surface counter did NOT park — the bound is best-effort and cannot fire"; }
+ck "RED→GREEN(exit-3): an UNWRITABLE red-surface counter parks instead of re-looping for ever" $rc
+rc=0; log_has "redsurfacecount-$PR is unwritable" || { rc=1; note "the abort does not name the unwritable counter: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the abort names the counter path" $rc
+rmdir "$MRG/o/state/redsurfacecount-$PR" 2>/dev/null || true
+
 # A READABLE answer clears the streak: alternating red/head must not accumulate strikes.
 mkmrg; mkrecorder; write_record "$HEAD" clean
 printf '%s 2\n' "$HEAD" > "$MRG/o/state/redsurfacecount-$PR"

@@ -1380,7 +1380,7 @@ c_carry_ask() {
   # (`red-surface`) and a surface that could not be READ (`surface-unknown`) refuse
   # below: those are the false PASSes #3440 measured.
   if [[ "$rc" -eq 0 && "$tok" == "red-base-owned" ]]; then
-    C_CARRY_WHY="diff unchanged (${recd:0:12}… = ${live:0:12}…); the head's check surface is RED but BASE-OWNED — the producer named the groups in its own output above, and the merge rail re-measures base reds against its own reproduction before it merges anything (#3322/#3715). This gate passing is not a claim that the head is green"
+    C_CARRY_WHY="diff unchanged (${recd:0:12}… = ${live:0:12}…); the head's check surface is RED but BASE-OWNED — the producer named the groups in its own output above. On a rail repo the rail re-measures base reds against its own reproduction before it merges anything (#3322/#3715); in gate mode this same-name comparison is the only evidence and is a named residual. This gate passing is not a claim that the head is green"
     return 0
   fi
   case "$rc:$tok" in
@@ -2389,7 +2389,7 @@ run_checks() {
         # own verdict, not a whole-text rescan — see the ONE-WRITER note above.
         C_CARRIED_PASS="code-review record CARRIED from ${C_CARRIED_HEAD:0:12}… — diff unchanged (diff_sha256 ${C_CARRIED_DIFF:0:12}…)"
         if [[ "$C_CARRY_TOKEN" == "red-base-owned" ]]; then
-          C_CARRIED_PASS="$C_CARRIED_PASS; ⛔ the head's CHECK SURFACE IS RED but BASE-OWNED (#3440) — every red group also reproduces on the base (the producer named them in its own output above, relayed from its stderr by check (c)). This gate passing is NOT a claim that the head is green: base ownership here is the PRODUCER's same-name comparison, and on a rail repo the rail re-measures it against its own reproduction (#3322/#3715) before it exempts anything — in gate mode nothing else does, which is a named residual, not a guarantee"
+          C_CARRIED_PASS="$C_CARRIED_PASS; ⛔ the head's CHECK SURFACE IS RED but BASE-OWNED (#3440) — every red group also reproduces on the base (the producer named them in its own output above). This gate passing is NOT a claim that the head is green: base ownership here is the PRODUCER's same-name comparison, and on a rail repo the rail re-measures it against its own reproduction (#3322/#3715) before it exempts anything — in gate mode nothing else does, which is a named residual, not a guarantee"
         fi
         grade_c_record "$C_CARRIED_VERDICT" "$C_CARRIED_PASS"
       elif [[ "$C_CARRY_RC" -eq 1 ]]; then
@@ -5712,7 +5712,13 @@ $big_filler"
     printf '⏭️  #3315 contract pin SKIPPED — record-review.sh is not beside this gate (%s), so there is nothing to compare the stub against.\n' "$RECORD_REVIEW_SH"
   else
     C3315_CONTRACT_BAD=0
-    for C3315_PAIR in "carry:0" "head:0" "carry-patch:6" "fresh:1" "unreadable:3" "norecord:4" "nodigest:5"; do
+    # ⛔ EVERY PAIR THE GATE CLASSIFIES (review of #3440, round 2). The list stopped at the seven
+    # pre-#3440 verdicts while `c_carry_ask` already classified TEN, and the green line claimed the
+    # set — so the three surface pairs could drift (a renamed token or a renumbered exit) with this
+    # pin green. The count printed below is derived from this list, never hardcoded.
+    C3315_PAIRS="carry:0 head:0 red-base-owned:0 carry-patch:6 fresh:1 unreadable:3 norecord:4 nodigest:5 red-surface:7 surface-unknown:8"
+    C3315_PAIR_N=0
+    for C3315_PAIR in $C3315_PAIRS; do
       C3315_TOK="${C3315_PAIR%%:*}"; C3315_CODE="${C3315_PAIR#*:}"
       # (1) the header still documents `<token> <spaces> <exit> <description>`
       if ! grep -qE "^#     ${C3315_TOK}[[:space:]]+${C3315_CODE}[[:space:]]" "$RECORD_REVIEW_SH"; then
@@ -5720,17 +5726,18 @@ $big_filler"
         C3315_CONTRACT_BAD=$((C3315_CONTRACT_BAD + 1))
       fi
       # (2) the producer still PRINTS the token on its documented line
+      C3315_PAIR_N=$((C3315_PAIR_N + 1))
       if ! grep -qF "printf '${C3315_TOK}\t" "$RECORD_REVIEW_SH"; then
         printf '❌ #3315 contract: %s no longer prints `%s<TAB>…` — the gate parses that line, so a renamed token would leave every arm green and production red\n' "${RECORD_REVIEW_SH##*/}" "$C3315_TOK" >&2
         C3315_CONTRACT_BAD=$((C3315_CONTRACT_BAD + 1))
       fi
     done
     if [[ "$C3315_CONTRACT_BAD" -eq 0 ]]; then
-      printf '✅ #3315 contract: the real producer still DOCUMENTS and PRINTS all seven verdict/exit pairs the gate classifies (carry:0 head:0 carry-patch:6 fresh:1 unreadable:3 norecord:4 nodigest:5) — the FAIL_ALL stub cannot drift from it silently\n'
+      printf '✅ #3315/#3440 contract: the real producer still DOCUMENTS and PRINTS all %s verdict/exit pairs the gate classifies (%s) — the FAIL_ALL stub cannot drift from it silently\n' "$C3315_PAIR_N" "$C3315_PAIRS"
     else
       selffail=$((selffail + 1))
     fi
-    unset C3315_CONTRACT_BAD C3315_PAIR C3315_TOK C3315_CODE
+    unset C3315_CONTRACT_BAD C3315_PAIR C3315_TOK C3315_CODE C3315_PAIRS C3315_PAIR_N
   fi
 
   # Run the exit check AFTER the #1611 guards, so a failure there is reported
