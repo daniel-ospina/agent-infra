@@ -438,7 +438,7 @@ a killed worker cannot take the controller down with it.
 | File | Meaning |
 |---|---|
 | `heartbeat` | epoch seconds, rewritten every cycle — the liveness probe |
-| `state/refresh-last` | the last refresh pass's OWN outcome (agent-infra#2229): `result=ok|fail|running`, `stage=` (startup/provision/list/persist/preflight/budget/judge/skip/handoff), `rc=`, `at=`, `repo=`, `why=`, `cmd=` (the command that failed), plus `judged=`/`queued=`/`backlog=`/`handed=`/`queue_readable=`/`unusable=`. Written by `refresh-candidates.sh` as a `result=running` TOMBSTONE at entry and then the outcome at most once, with an exit nobody converted recorded as a FAILURE by its `EXIT` trap (rc=0 included) — and read by `orch-loop.sh`, which may print `skipped (…)` only for `result=ok`. A record without a known `result=` is UNREADABLE and reads as BLOCKED, never as a healthy pass |
+| `state/refresh-last` | the last refresh pass's OWN outcome (agent-infra#2229): `result=ok|fail|running`, `stage=` (startup/provision/list/persist/preflight/budget/judge/skip/handoff), `rc=`, `at=`, `repo=`, `why=`, `cmd=` (the command that failed), plus `judged=`/`queued=`/`backlog=`/`handed=`/`queue_readable=` (success records only)`unusable=`. Written by `refresh-candidates.sh` as a `result=running` TOMBSTONE at entry and then the outcome at most once, with an exit nobody converted recorded as a FAILURE by its `EXIT` trap (rc=0 included) — and read by `orch-loop.sh`, which may print `skipped (…)` only for `result=ok`. A record without a known `result=` is UNREADABLE and reads as BLOCKED, never as a healthy pass |
 | `.refresh-unrecorded` | the pass's FALLBACK marker: written into `$O` whenever a `state/refresh-last` write fails (an unwritable `state/`), removed by the next successful write. Its PRESENCE means "a pass finished and its outcome is not on disk" — the record underneath is an EARLIER pass and is not this cycle's health — so `orch-loop.sh` reads it BEFORE the record and prints `BLOCKED`, quoting the marker's own `stage=`, `rc=` and `why=` (a marker with `rc=0` is a SUCCESS whose record failed) |
 | `state/queue-state` | what the last pool READ saw, with the epoch of the read — `EMPTY`, `READ(<n>)`, `PARTIAL(<tiers>)` or `UNREADABLE`. `orch-loop.sh` prints it in the cycle line as `queue=$(queue_state_token)`, so a refresh that could not read the pool (`queue=UNREADABLE`) is never mistaken for a fleet with nothing to do (`queue=EMPTY`); an absent file reads `UNKNOWN`, never `EMPTY` (agent-infra#1931) |
 | `.orch.lock` | atomic single-instance lock (noclobber create); stale locks are reclaimed |
@@ -4658,7 +4658,8 @@ cannot guess:
   `repo=`, `why=`, `cmd=` (the command that failed), plus `judged=`/`queued=`/`backlog=`/`handed=`/
   `queue_readable=` (the pass's own `1|0` readability witness — the two unmeasured-depth shapes publish
   the same `backlog=UNKNOWN` with an empty `handed=`, so this is the only field that says which one it
-  is)/`unusable=`. Written as a `result=running` tombstone at entry and then the outcome at most once —
+  is; recorded on the SUCCESS record, so a `fail` or `running` record carries none, as does any record
+  predating the field)/`unusable=`. Written as a `result=running` tombstone at entry and then the outcome at most once —
   including for an exit nobody converted, which the pass's own `EXIT` trap records as a FAILURE (rc=0
   included). It is the only thing the caller reads; a log line scrolls away. If the write itself fails
   (`state/` unwritable) the pass leaves `$O/.refresh-unrecorded` instead, and the caller reports THAT.

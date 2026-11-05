@@ -2249,9 +2249,13 @@ else
   _drv_scan "$_drv_m"
   _mut_hits="$_drv_unpinned"
   # ⛔ the SPLIT driver is the one flagged — the first `bash -c` in the file, i.e. #1 here — not "some" driver
-  if [ -n "$_mut_hits" ] && [ "$_drv_total" -eq "$_drv_expect" ] && grep -q '#1' <<< "$_mut_hits"; then
+  # ⛔ EXACT compare, not `grep '#1'`: `_mut_hits` is a list of ` #N` tokens, so a substring test accepts
+  # `#10`..`#14` — five of the fourteen drivers — and reports success while naming the wrong one
+  # (review P3, cycle 20). The population is not re-tested here: the check above owns it, and repeating it
+  # made THIS check report "the split driver was not flagged" when the real cause was "a driver was added".
+  if [ "$_mut_hits" = " #1" ]; then
     ok "drivers: non-vacuity — the SPLIT, prologue-stripped driver is caught and named ($_mut_hits)"
-  else bad "drivers: the split driver was not flagged as expected (total=$_drv_total pin='${_mut_hits:-none}')"; fi
+  else bad "drivers: expected driver #1 to be the ONLY flagged one, got '${_mut_hits:-none}'"; fi
   # CONTROL: split the SAME driver's payload but KEEP the prologue — the pin must stay GREEN, so it is
   # firing on the missing prologue and not merely on the multi-line shape.
   _drv_r="$T/suite-driver-split-with-prologue.sh"
@@ -2265,9 +2269,9 @@ else
   if cmp -s "$0" "$_drv_r" 2>/dev/null; then bad "drivers: the control mutation did not apply — the awk anchor drifted"
   else
     _drv_scan "$_drv_r"
-    if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then
+    if [ -z "$_drv_unpinned" ]; then
       ok "drivers: control — a driver split the SAME way but KEEPING \`set -u\` stays GREEN (the pin fires on the prologue, not the shape)"
-    else bad "drivers: control failed — the pin reds on the SHAPE rather than the missing prologue (${_drv_unpinned:-none}, total=$_drv_total)"; fi
+    else bad "drivers: control failed — the pin flags a driver that HAS the prologue (${_drv_unpinned})"; fi
   fi
   _drv_total="$_drv_saved_total"; _drv_unpinned="$_drv_saved_unpin"
 fi

@@ -1591,11 +1591,12 @@ ck "non-vacuity: the pre-fix \`_backlog_n=0\` re-parse turns a failed depth read
 main_handoff wcfailg wcfail-garbage
 if [ "$MHRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$MHOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
+   && grep -q 'queue_readable=1' <<<"$MHOUT" \
    && grep -q 'the depth and the head are UNKNOWN' <<<"$MHOUT" \
    && ! grep -q 'could NOT be READ' <<<"$MHOUT" \
    && ! grep -q 'backlog now  issues' <<<"$MHOUT" \
    && ! grep -q 'backlog=0' <<<"$MHOUT"; then rc=0
-else rc=1; echo "      readable/depth-fail/garbage-head: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (want 'the queue WAS read' + 'the depth and the head are UNKNOWN'; NOT 'could NOT be READ', NOT an empty 'backlog now', NOT backlog=0)"; fi
+else rc=1; echo "      readable/depth-fail/garbage-head: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (want 'the queue WAS read' + queue_readable=1 + 'the depth and the head are UNKNOWN'; NOT 'could NOT be READ', NOT an empty 'backlog now', NOT backlog=0)"; fi
 ck "a READABLE queue whose depth read fails AND whose head is unparsable is not called unreadable, and the depth ECHO names it UNKNOWN" $rc
 # NON-VACUITY: drop the witness (key the last arm on the emptiness of its outputs again) — the state goes
 # back to being described as an unreadable file.
