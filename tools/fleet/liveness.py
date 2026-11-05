@@ -296,8 +296,9 @@ LOG_WINDOW_MS = 30_000
 # `LANE_REAP_LIVE_MIN`'s 45 min "chosen above `lane.sh`'s 2400 s wall limit". Every
 # half was wrong: `LANE_REAP_LIVE_MIN` defaults to 125 min (`lane-reap.sh:176`), and
 # the lane's wall is `LANE_BACKSTOP_S` = 7200 s (`spawn-gate.sh:1480`), consumed as
-# the default at `lane.sh:486` — so the number was described as sitting ABOVE a
-# bound it actually sat 75 min below (45 vs 120). The 45 min is the progress
+# the default in `lane.sh`'s `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}"` call —
+# so the number was described as sitting ABOVE a bound it actually sat 75 min below
+# (45 vs 120). The 45 min is the progress
 # allowance because that is the bound that asks the SAME question ("is this lane
 # still working?").
 LOG_FREEZE_MS = 45 * 60 * 1000
@@ -1065,7 +1066,15 @@ def _bound_rc_re():
 
 
 def _bound_verdict_re():
-    global _BOUND_VERDICT_RE
+    # ⛔ ALL THREE, DECLARED `global`, ASSIGNED DIRECTLY (review P2). This block lazy-inits the
+    # sibling patterns that `_bound_rc_re` / `_bound_pid_re` consume, so it must bind them in the
+    # MODULE namespace. It used to do that for two of the three through `globals()[...]` while the
+    # third was a plain assignment under a `global _BOUND_VERDICT_RE` declaration — which made
+    # `_BOUND_RC_RE = _re.compile(...)` a LOCAL, compiling the pattern twice and discarding one.
+    # It happened to work only because the `globals()` write came first, so deleting that line as
+    # "redundant with the next one" would have silently broken `_bound_rc_re`'s
+    # `assert _BOUND_RC_RE is not None`. Three entries, one idiom, nothing to trip over.
+    global _BOUND_VERDICT_RE, _BOUND_RC_RE, _BOUND_PID_RE
     if _BOUND_VERDICT_RE is None:
         import re as _re
         # ⛔ THE VERDICT TOKEN AND THE `rc=` ARE PARSED SEPARATELY, for three reasons
@@ -1079,9 +1088,8 @@ def _bound_verdict_re():
         # So: match the token alone, then scan that line's HEAD (everything before
         # ` log=`) for `rc=` and take the LAST one.
         _BOUND_VERDICT_RE = _re.compile(r"\[lane-bound\]\s+VERDICT\b.*?\bverdict=([a-z][a-z-]*)")
-        globals()["_BOUND_RC_RE"] = _re.compile(r"\brc=([0-9]+|na)\b")
         _BOUND_RC_RE = _re.compile(r"\brc=([0-9]+|na)\b")
-        globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=([0-9]+)\b")
+        _BOUND_PID_RE = _re.compile(r"\bpid=([0-9]+)\b")
     return _BOUND_VERDICT_RE
 
 

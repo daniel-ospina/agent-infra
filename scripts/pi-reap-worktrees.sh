@@ -3066,8 +3066,18 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # exit 0, `verdict=idle` — a pass that removes nothing and reports the HEALTHY verdict. The
     # parent commit carries zero bare `$HOME` in this file; every sibling uses `${HOME:-…}`.
     local home="${HOME:-}"
-    # `${home:+"$home/.harness-path"}`: SET-but-EMPTY must not probe `/.harness-path`.
-    for rec in "${HARNESS_PIN_FILE:-}" "${CELL_HOME:-$home}/.harness-path" ${home:+"$home/.harness-path"}; do
+    # ⛔ AN EMPTY PREFIX MUST NOT PROBE THE ROOT (review P2). `${home:+"$home/.harness-path"}` guards the
+    # THIRD entry only; the second, `${CELL_HOME:-$home}/.harness-path`, has NO such guard, so with BOTH
+    # `CELL_HOME` and `HOME` unset-or-empty it expands to `/.harness-path` and this file probes it —
+    # exactly the shape the note claims the loop refuses. The consequence is bounded (a root-path
+    # record can only ever PRESERVE), but it is a READ no caller asked for, taken in the one function
+    # whose whole subject is not taking reads it was not given. So the entry is built only when a
+    # prefix exists, and an empty one is skipped by the same `[ -n "$rec" ]` every other empty gets.
+    local cellpin=""
+    if [ -n "${CELL_HOME:-}" ] || [ -n "$home" ]; then
+        cellpin="${CELL_HOME:-$home}/.harness-path"
+    fi
+    for rec in "${HARNESS_PIN_FILE:-}" "$cellpin" ${home:+"$home/.harness-path"}; do
         [ -n "$rec" ] || continue
         [ -r "$rec" ] || continue
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"

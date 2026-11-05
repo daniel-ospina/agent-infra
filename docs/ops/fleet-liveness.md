@@ -429,7 +429,9 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**31 tests with 38 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**T1–T31 — 31 tests with 38 paired mutations**, this
+> block's own counts rather than the file's; the file's measured total is stated in the regression
+> contract at the end of this document: the
 > #1178/#5389 verdict suite is **T1–T24** and the #1777 claim evidence is **T25–T31**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
 > #1777 block, so definition order is not label order) and by the
@@ -810,8 +812,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 31 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (38)
+python3 tools/fleet/liveness.test.py               # 50 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (69)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
@@ -1666,9 +1668,9 @@ instead of a second, unreviewed one.
 `LANE_REAP_LIVE_MIN`'s value "chosen above `lane.sh`'s 2400 s wall limit". Every half was wrong,
 and the file contradicted itself: `LANE_REAP_LIVE_MIN` defaults to **125 min** (stated correctly in
 §11.3) and the lane's wall is `LANE_BACKSTOP_S` = **7200 s** (`spawn-gate.sh:1480`, consumed as the
-default at `lane.sh:486`) — so the number was described as sitting above a bound it actually sat
-75 min below (45 vs 120). The source of the 45 min is the progress allowance, because that is the
-bound that asks the same question.
+default in `lane.sh`'s `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}"` call) — so the number
+was described as sitting above a bound it actually sat 75 min below (45 vs 120). The source of the
+45 min is the progress allowance, because that is the bound that asks the same question.
 
 **A NEGATIVE DELTA IS A BROKEN READING, NOT A FLAT ONE.** A stable subtree cannot *lose* CPU, so a
 negative delta means one of the two reads was incomplete (a child exited between the samples, a
@@ -1816,8 +1818,8 @@ hand the token over and have a previous dispatch's outcome published on the surf
 fleet reader's home. A row whose `verdict_pid` does not resolve inside the queried tree is dropped to
 `no-verdict` exactly as in `gather_log_lane`.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (49 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (68 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (50 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (69 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder). Their paired mutations re-introduce the exact pre-fix behaviours — the
