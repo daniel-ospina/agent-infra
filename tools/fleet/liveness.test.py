@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-four tests with ninety-nine paired mutations: every mutation re-
+Fifty-four tests with one hundred paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 54 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (99)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (100)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2843,6 +2843,24 @@ def t54():
         shutil.rmtree(os.path.join(d, "\u00b2\u00b3"))
         os.makedirs(os.path.join(d, "600"))
 
+        # (f2) ⛔ THE OTHER HALF OF THAT GUARD, AND it is LOAD-BEARING ON A REAL `/proc`:
+        # its top level holds files AND dirs that are ASCII and not digits — `dma`,
+        # `net`, `self`, `thread-self`, `cpuinfo`, … Without `isdigit()` the guard admits
+        # `net`, `open('/proc/net/stat')` is ENOTDIR, and the WHOLE reading abstains —
+        # permanently, on every Linux invocation. Case (f) pins `isascii()`; this pins
+        # `isdigit()`, which nothing exercised before.
+        os.makedirs(os.path.join(d, "self"))
+        with open(os.path.join(d, "self", "stat"), "w", encoding="utf-8") as fh:
+            fh.write(stat_line(0, "odd", 1, 1, 1))
+        try:
+            m = liv._proc_cpu_cs(d)
+            check(set(m) == {500, 700},
+                  "an ASCII non-digit name (`self`) is SKIPPED, never int()'d; got %r"
+                  % (m,))
+        except ValueError as exc:
+            check(False, "an ASCII non-digit name must not reach int(): %s" % exc)
+        shutil.rmtree(os.path.join(d, "self"))
+
         # (h) ⛔ ESRCH FROM THE READ. `open()` can succeed while the pid then exits, so
         # `.read()` raises `ProcessLookupError` — the same "genuinely GONE" fact as a
         # missing file, one syscall later. A fixture cannot produce that race, so `open`
@@ -3633,6 +3651,13 @@ MUTATIONS = [
         "an ESRCH from the READ is not caught, so it falls into the generic OSError clause "
         "and abstains the whole reading instead of treating the pid as gone (one unrelated "
         "process exiting blanks the lane's CPU signal)",
+    ),
+    Mutation(
+        "T54", "module",
+        '        if not (name.isascii() and name.isdigit() and len(name) <= 10):',
+        '        if not (name.isascii() and len(name) <= 10):',
+        "the `isdigit()` conjunct is dropped, so `net`/`self`/`dma` reach `open(root/net/stat)` "
+        "-> ENOTDIR -> the WHOLE reading abstains on every real `/proc`",
     ),
     Mutation(
         "T51", "module",
