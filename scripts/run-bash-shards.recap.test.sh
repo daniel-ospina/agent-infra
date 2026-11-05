@@ -59,6 +59,17 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 FIXTURE_LIVE_ROOTS=
 export FIXTURE_LIVE_ROOTS
 
+# ⛔ AND IT MUST NOT INHERIT THE LANE'S SLICE EITHER (#2741 root 2a, measured 2026-11-05). The
+# shipped runner reads `BASH_SHARD_SLICE`, and the PR lane exports it into every `bash-suites` job
+# (`.github/workflows/ci.yml`: `BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}`).
+# This fixture's list is THREE shards, so an inherited `8/8` makes the narrowed copy refuse —
+# correctly — with "asks for 8 slice(s) of 3 listed shard(s)" (exit 2), while ARM 2 asserts exit 1
+# plus a recap: `PASS 3 · FAIL 9`. That reds EVERY sharded PR on a tree that changed nothing, and
+# it is invisible on `main` only because `main` runs the list UNSHARDED (the variable is unset).
+# Same defect class as the `#3011` guard above: a verdict that depends on the machine instead of on
+# the runner. No arm here drives a slice, so this suite never wanted one.
+unset BASH_SHARD_SLICE
+
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/shard-recap.XXXXXX")" || {
   echo "❌ run-bash-shards.recap: cannot create a temp dir — refusing to report on a suite that did not run"
   exit 2
