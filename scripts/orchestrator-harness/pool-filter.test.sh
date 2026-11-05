@@ -204,8 +204,8 @@ if [ "$RANKS" = "P0-blocker -> 0 P1-severe -> 1 P2-moderate -> 2" ]; then ok=$((
 else bad=$((bad+1)); echo "FAIL [selftest contract] the tier->rank pairs selftest.sh extracts came out '$RANKS' — expected 'P0-blocker -> 0 P1-severe -> 1 P2-moderate -> 2'"; fi
 
 # And EVERY call site must still behave. ⛔ BOTH shapes are driven: the three tier queries (which emit
-# `"<tier> <number>"`) and the emergency floor (which emits a bare `.number` and, by review cycle 2,
-# reads the program through its own `pool_jq` local because its body is extracted on its own).
+# `"<tier> <number>"`) and the emergency floor (which emits a bare `.number` and reads the program
+# through its own `pool_jq` local because its body is extracted on its own).
 drive_site() { # <label> <fixed-string that identifies the site's jq argument> <expected output>
   local label="$1" fixed="$2" want="$3" site out
   # strip the leading `--jq `, a trailing ` 2>>…` redirect, and a trailing shell line-continuation `\`
@@ -216,16 +216,29 @@ drive_site() { # <label> <fixed-string that identifies the site's jq argument> <
   if [ "$out" = "$want" ]; then ok=$((ok+1))
   else bad=$((bad+1)); echo "FAIL [composed call site] $label emitted '$out' - expected '$want'"; fi
 }
-# The three tier queries concatenate $POOL_JQ and append the tier prefix. ⛔ ALL THREE ARE DRIVEN,
-# not just one (review cycle 3, P2): pinning P0 alone left a site-local arm on P1 or P2 invisible —
-# measured, `--jq '.[]|'"$POOL_JQ"'|"2 \(.number)"|select((.title//"")|test("mcp";"i")|not)'`
-# at the P2 site returned `61 passed, 0 failed` while dropping 11 live P2 rows, and selftest's rank
-# pin reads only the RANK DIGIT, so it stays green too. A per-site arm is the drift class this PR
-# removes (T3); a comment claiming coverage that does not exist is what stops anyone looking.
+ck_site() { # <label> <fixed-string that identifies the site> <expected WHOLE jq argument>
+  local label="$1" fixed="$2" want="$3" got
+  got="$(grep -m1 -F -- "$fixed" "$RC" | sed -e "s/^.*--jq //" -e "s/[[:space:]]*2>>.*//" -e 's/[[:space:]]*\\$//')"
+  if [ -z "$got" ]; then bad=$((bad+1)); echo "FAIL [composed call site] $label - could not locate the jq argument"; return; fi
+  if [ "$got" = "$want" ]; then ok=$((ok+1))
+  else bad=$((bad+1)); echo "FAIL [composed call site] $label carries '$got' - expected EXACTLY '$want' (the shared splice and NOTHING else)"; fi
+}
+SPLICE_POOL="'\"\$POOL_JQ\"'"
+SPLICE_LOCAL="'\"\$pool_jq\"'"
+# ⛔ EVERY CALL SITE'S WHOLE ARGUMENT IS PINNED BY EQUALITY — NOT BY BEHAVIOUR ON A FIXTURE (review
+# cycle 4, P2 — measured). Driving a site on a TWO-ROW fixture cannot see a private arm that does not
+# happen to match the fixture's one work row: `|select((.title//"")|test("mcp";"i")|not)` PREPENDED to
+# the emit at the P2 site left this suite at `64 passed, 0 failed` while dropping 11 LIVE P2 rows, and
+# the same prepended arm at the floor site dropped live P0 #4282 — the emergency class stopped being
+# able to stand itself down. An APPENDED arm only red the behavioural pin because it crashed jq on a
+# string. Equality reds on any appended arm, any prepended arm and any re-spelt splice, whatever the
+# fixture says — and it is the same shape §8(b) uses for the definition itself.
+ck_site 'P0 tier' '|"0 \(.number)"' "'.[]|${SPLICE_POOL}|\"0 \\(.number)\"'"
+ck_site 'P1 tier' '|"1 \(.number)"' "'.[]|${SPLICE_POOL}|\"1 \\(.number)\"'"
+ck_site 'P2 tier' '|"2 \(.number)"' "'.[]|${SPLICE_POOL}|\"2 \\(.number)\"'"
+ck_site 'emergency floor' '"$pool_jq"' "'.[]|${SPLICE_LOCAL}|.number'"
+# …and the composed program must still RUN and emit the right shape (quoting, not just bytes).
 drive_site 'P0 tier' '|"0 \(.number)"' '0 900051'
-drive_site 'P1 tier' '|"1 \(.number)"' '1 900051'
-drive_site 'P2 tier' '|"2 \(.number)"' '2 900051'
-# The emergency floor reads it through its own local (its body is extracted alone).
 drive_site 'emergency floor' '"$pool_jq"' '900051'
 
 # ── 8. THE DRIFT PINS — one definition, exactly four call sites, no private copies ───────────
@@ -251,14 +264,16 @@ fi
 if [ "$floor_eff" = "$SEL" ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] the emergency floor's \`local pool_jq=\` does not resolve to the shared definition (got '${floor_eff:0:60}') - it must read \${POOL_JQ:?...} and never carry its own program"; fi
 
-# (a3) AND NO SECOND ASSIGNMENT TO THE SYMBOL (review cycle 3, P3). (a2) reads the `local` FORM; a
-# plain `pool_jq=…` on the next line assigns THROUGH that local (bash locals are function-scoped), so
-# the binding (a2) reads stays pristine and the site runs the private program anyway. Measured:
-# inserting `pool_jq='select((.assignees|length)==0)'` one line below the shipped binding kept this
-# suite at `61 passed, 0 failed`. So the SYMBOL carries exactly one assignment in the whole file.
-stray="$(grep -cE '^[[:space:]]*pool_jq=' "$RC" 2>/dev/null || true)"
-if [ "${stray:-0}" -eq 0 ]; then ok=$((ok+1))
-else bad=$((bad+1)); echo "FAIL [drift] ${stray:-0} extra \`pool_jq=\` assignment(s) besides the pinned \`local pool_jq=\` - the fourth site must carry no program of its own"; fi
+# (a3) AND THE SYMBOL CARRIES EXACTLY ONE ASSIGNMENT — COUNTED IN EVERY SPELLING (review cycle 3 P3,
+# widened by cycle 4 P2). (a2) reads the `local` FORM; a plain `pool_jq=…`, a `pool_jq+=…` or a
+# `printf -v pool_jq` on the next line assigns THROUGH that local (bash locals are function-scoped), so
+# the binding (a2) reads stays pristine and the site runs the private arm anyway. Measured: each of the
+# three spellings left this suite at `64 passed, 0 failed`, and the `+=` arm drops live P0s at the
+# floor. So the SYMBOL — not the `local` line — carries exactly one assignment in the whole file.
+assigns="$(grep -cE '^[[:space:]]*(local[[:space:]]+)?pool_jq[+]?=' "$RC" 2>/dev/null || true)"
+printf_v="$(grep -cE 'printf[[:space:]]+-v[[:space:]]+pool_jq' "$RC" 2>/dev/null || true)"
+if [ "${assigns:-0}" -eq 1 ] && [ "${printf_v:-0}" -eq 0 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [drift] the fourth site must carry exactly ONE assignment to pool_jq in any spelling (found ${assigns:-0} assignment(s) and ${printf_v:-0} printf -v) - a private program there regrows the drift this file removes"; fi
 
 # (b) THE WHOLE PROGRAM IS PINNED, ONCE, BY WHOLE-TEXT EQUALITY (review cycle 4, P2). The three
 # per-arm pins that used to live here could each be defeated by an ARM APPENDED to the shared program:

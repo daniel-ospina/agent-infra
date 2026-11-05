@@ -5408,8 +5408,9 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   # (#10951), so the floor and the tiers cannot describe different populations. Do not restate the rule
   # here: a restated rule is the second copy this consolidation removed.
   #
-  # The pool's unassigned guard still applies to this tier (an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
-  # does — so it must not stand the floor down either.
+  # The pool's unassigned guard still applies to this tier: an ASSIGNED P0 is someone else's work, and
+  # it cannot be dispatched by this box no matter what the floor does — so it must not stand the floor
+  # down either.
   if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
       --jq '.[]|'"$pool_jq"'|.number' \
       > "$o/.emergency-issues" 2>/dev/null; then
