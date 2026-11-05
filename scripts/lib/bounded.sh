@@ -139,6 +139,14 @@ tb_watchdogs_reap() {
 # (the same discipline `run_agent` records for its own `set -m`), and the negative-pid kill still reaches
 # the group afterwards. A shell that refuses `set -m` falls back to the direct-child kill, so this is a
 # strict improvement on every host rather than a new dependency.
+# ⛔ THE GUARANTEE IS THE COMMAND'S OWN PROCESS GROUP, AND IT IS NOT TRANSITIVE (review cycle 20, P2 —
+# MEASURED). A command that itself calls `tb_timeout` enables job control in ITS shell too, so the inner
+# command is a NEW group leader and is not a member of the group this timer signals: measured
+# `tb_timeout 2 bash -c '. bounded.sh; tb_timeout 30 bash -c "sleep 8 & sleep 8"'` returns at 8 s, not
+# 2 s (identical before and after this fix). So the bound bounds the DIRECT command and everything that
+# stays in its group — it does NOT bound a nested `tb_timeout`. No in-tree caller nests today (the
+# reaper's delegates and `conflict-rebase-timer.sh`'s python do not re-enter it), so no caller currently
+# reads a guarantee it does not hold; the residue is tracked rather than glossed.
 tb_watchdog() {
     local secs="$1"; shift
     local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 jobctl=0
