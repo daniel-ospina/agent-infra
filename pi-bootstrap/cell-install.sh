@@ -299,16 +299,23 @@ try:
     if not isinstance(t, dict):
         raise ValueError("tortoise entry is not an object")
     auth = (t.get("headers") or {}).get("Authorization") or ""
+    # ⛔ THE TYPE CHECK BELONGS INSIDE THE `try` (#3374 review P3). `auth.strip()` sat OUTSIDE it, so
+    # `"Authorization": 12345` raised AttributeError, the `2>/dev/null` on this command swallowed the
+    # traceback and printed NOTHING — which the caller renders as GRAPH_NOAUTH, i.e. "this entry
+    # declares no Authorization" about an entry that declares one. `--verify` independently fails
+    # BADAUTH:int, so no LAYER VERIFIED follows; the mis-statement is confined to the note.
+    if not isinstance(auth, str):
+        raise ValueError("Authorization is not a string")
+    if not auth.strip():
+        sys.exit(0)                 # no Authorization AT ALL: the documented self-host shape
+    if "${" not in auth:
+        print("LITERAL")            # a literal credential --verify refuses (LITERAL_AUTH)
+        sys.exit(0)
+    name = auth.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
+    print(name)
 except Exception:
     print("NOENTRY")                # unreadable / no such entry — NOT "declares no Authorization"
     sys.exit(0)
-if not auth.strip():
-    sys.exit(0)                     # no Authorization AT ALL: the documented self-host shape
-if "${" not in auth:
-    print("LITERAL")                # a literal credential --verify refuses (LITERAL_AUTH)
-    sys.exit(0)
-name = auth.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
-print(name)
 ' "$DEST/.mcp.json" 2>/dev/null
 }
 
@@ -351,16 +358,22 @@ graph_key_resolve() {
   # HOME first: that is the home a live lane on a cell actually runs in (measured on cell-3
   # and cell-4: HOME=/home/cmux), and the launcher sources $HOME/keys.env. CELL_HOME follows
   # because it is where THIS script installs, and on some images the two differ.
-  local f
+  local f base
   # ⛔ `${HOME:-}`, NOT `$HOME`. This function runs under `set -uo pipefail` (line 205), so a
   # HOME-less context — systemd/launchd units, `sudo -u`, `env -i`, a CI step — aborted the WHOLE
   # verifier here with `HOME: unbound variable`, skipping `guard_tools_dir`, `guard_spawn_gate`,
   # `guard_gh_shim` and the `LAYER VERIFIED` verdict: a correctly-installed cell could not be
   # certified, and the abort lands AFTER `.mcp.json verify: OK` so the log looks like a graph
   # problem. `${CELL_HOME:-}` too — it is assigned from `${CELL_HOME:-$HOME}` elsewhere, but this
-  # loop must not depend on that. An empty candidate is skipped, not stat'd as `""`.
-  for f in "${HOME:-}/keys.env" "${CELL_HOME:-}/keys.env"; do
-    [ -n "$f" ] && [ "$f" != "keys.env" ] || continue
+  # loop must not depend on that.
+  # ⛔ AN EMPTY BASE YIELDS NO CANDIDATE AT ALL (#3374 review P3). The loop used to be
+  # `for f in "${HOME:-}/keys.env" "${CELL_HOME:-}/keys.env"` with `[ "$f" != "keys.env" ] || continue`
+  # beside it — a clause that can NEVER fire (both candidates are absolute), while the state it was
+  # written for (an unset base) produced `/keys.env`, which WAS stat'd. Iterate the BASES and skip the
+  # empty one: no candidate, nothing stat'd, and no dead condition in a security-relevant loop.
+  for base in "${HOME:-}" "${CELL_HOME:-}"; do
+    [ -n "$base" ] || continue
+    f="$base/keys.env"
     [ -f "$f" ] || continue
     val="$(graph_key_from_env_file "$f" "$GRAPH_VAR")"
     GRAPH_KEY_SRC="$f ($GRAPH_VAR)"
