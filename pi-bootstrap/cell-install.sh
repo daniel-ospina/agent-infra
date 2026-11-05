@@ -287,11 +287,16 @@ _no_group_world_write() {
 #             existence of an entry that is not there.
 #   LITERAL — an `Authorization` that is NOT env-indirect: a credential written into the shared file,
 #             which `--verify` refuses (LITERAL_AUTH). It is not "no authorization" either.
-#   BADSHAPE — the entry EXISTS and the file reads fine, but its `Authorization` is not a string
-#             (`12345`), so there is no variable to resolve; `--verify` refuses it (BADAUTH:int).
-#             Reporting this as NOENTRY was the mirror of the bug above: it told an operator that a
-#             perfectly healthy `.mcp.json` could not be read, and pointed at recreating the file
-#             instead of at the line that is wrong (#3374 review, round 8).
+#   BADSHAPE — the entry EXISTS and the file reads fine, but its SHAPE is one `--verify` refuses: a
+#             non-string `Authorization` (BADAUTH:int), a `headers` value that is not an object
+#             (BADDERS:str/list/…). The marker carries the name the VERIFIER prints, so the two
+#             renderers cannot contradict each other about the same file. Reporting these as NOENTRY
+#             ("there is no readable tortoise entry") was the mirror of the bug above: it told an
+#             operator that a perfectly healthy `.mcp.json` could not be read, and pointed at
+#             recreating the file instead of at the line that is wrong (#3374 review, rounds 8-10).
+#             The carried name is the resolver's OWN finding (headers/Authorization only) — `--verify`
+#             may name an EARLIER rung of its own precedence (SECRET_IN_FILE, STDIO, …), which is why
+#             the note says "the shape it names" rather than promising a specific marker.
 # Only a real entry with no `Authorization` key at all is the self-host shape.
 graph_mcp_var() {
   [ -f "$DEST/.mcp.json" ] || { printf 'NOENTRY'; return 0; }
@@ -418,11 +423,11 @@ graph_credential_state() {
     return 0
   fi
   if [ "$GRAPH_LITERAL" -eq 1 ]; then
-    printf 'LITERAL — the tortoise entry carries a literal credential in the shared file; --verify refuses it (LITERAL_AUTH)'
+    printf 'LITERAL — the tortoise entry carries a NON-ENV-INDIRECT Authorization (no ${…} to expand; a literal token, or a whitespace-only one), which --verify refuses (LITERAL_AUTH)'
     return 0
   fi
   if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
-    printf 'UNKNOWN — the tortoise entry is malformed (%s), so there is no variable to resolve; --verify refuses it by that name' "${GRAPH_BADSHAPE_WHY:-shape}"
+    printf 'UNKNOWN — the tortoise entry is malformed (%s), so there is no variable to resolve; --verify refuses it by the shape it names' "${GRAPH_BADSHAPE_WHY:-shape}"
     return 0
   fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
@@ -448,7 +453,11 @@ graph_credential_note() {
     return 0
   fi
   if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
-    log_line "⚠️  graph credential: UNKNOWN — the tortoise entry is malformed (${GRAPH_BADSHAPE_WHY:-shape}), so there is no variable to resolve; --verify REFUSES this file by that name and --install replaces the entry"
+    # ⛔ NO PROMISE ABOUT THE REPAIR (#3374 review, round 10). "--install replaces the entry" is FALSE on
+    # the only path this note prints on: it is reached on --install when the MERGE FAILED (rc!=0, file
+    # unchanged), so the entry is still malformed precisely BECAUSE nothing could replace it. Say what
+    # is true — verify refuses it, by the shape it names.
+    log_line "⚠️  graph credential: UNKNOWN — the tortoise entry is malformed (${GRAPH_BADSHAPE_WHY:-shape}), so there is no variable to resolve; --verify REFUSES this file by the shape it names (which may be an earlier check than this one). The provenance line above says whether the merge wrote the entry or left it as it found it"
     return 0
   fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then

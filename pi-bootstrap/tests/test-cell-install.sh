@@ -2159,13 +2159,18 @@ rm -f "$CELL_HOME/keys.env"
 # reddened, so nothing was hidden — but the sentence an operator reads on a red was broken, and a
 # SUITE must never execute a word it is only trying to print. Escaped at both sites; this guard is
 # what keeps the next one from being written, and it is a plain line scan, not a parse.
+# ⛔ AND IT SCANS EVERY POSITION, NOT LINE-START (#3374 review, round 10). The first version anchored
+# on `^[[:space:]]*(\|\| )?` and therefore inspected only 243 of the file's 411 `ok`/`fail` call
+# sites — it missed the suite's DOMINANT `[ … ] && ok "…"` form entirely, i.e. it would have stayed
+# silent on the shape an author is most likely to write. The pattern is now position-independent; the
+# message says "any line", which is what it now means.
 bad_bt="$(awk -v bt="$(printf '\140')" '
-  /^[[:space:]]*(\|\|[[:space:]]*)?(ok|fail) "/ {
+  $0 !~ /^[[:space:]]*#/ && (index($0, "ok \"") > 0 || index($0, "fail \"") > 0) {
     s = $0; gsub("\\\\" bt, "", s)
     if (index(s, bt) > 0) printf "%d:%s\n", NR, $0
   }' "${BASH_SOURCE[0]}")"
 [ -z "$bad_bt" ] \
-  && ok "no unescaped backtick inside any ok/fail message (one there would EXECUTE from inside the assertion)" \
+  && ok "no unescaped backtick inside ANY ok/fail message on any line (one there would EXECUTE from inside the assertion)" \
   || fail "an ok/fail message carries an unescaped backtick, so the suite executes it: $bad_bt"
 
 # ⛔ A MALFORMED ENTRY IS ITS OWN STATE, NOT "no readable entry" AND NOT "needs no key" (#3374 review
