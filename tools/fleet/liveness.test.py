@@ -1575,6 +1575,25 @@ def t36():
     v = liv.evaluate(ev(log_read=LR(alive=False, verdict="finished")))
     check(v.state == "unknown" and v.reason == "log-read-on-session-query",
           "a log read on a session query is refused by name; got %s/%s" % (v.state, v.reason))
+    # (c) THE TREE'S STEP 2/3 SLOTS ARE EVIDENCE ON THE SAME AXIS (rebase union of #3382).
+    #     Neither side of that merge wrote this clause: on main the two slots did not
+    #     exist, and on the #3382 branch this guard did not — so a union that left them
+    #     off lets the log axis silently DISCARD a CPU delta or in-flight child the
+    #     caller handed us. Same #1777 B7 shape, introduced by the merge itself.
+    for kw in ({"cpu": liv.CpuSample(advanced=True, delta_s=1.5)},
+               {"child": liv.ChildEvidence(sid="c-1", in_flight=True)}):
+        q = liv.Evidence(log_read=LR(alive=True, size_delta=0, cpu_delta_cs=0, age_ms=H), **kw)
+        v = liv.evaluate(q)
+        check(v.state == "unknown" and v.reason == "log-read-on-session-query",
+              "a log read beside %s is refused by name; got %s/%s"
+              % (sorted(kw), v.state, v.reason))
+    # (d) AND THE INERT DIRECTION: `None` is NOT evidence, so an explicit None slot
+    #     must not trip the refusal — otherwise the new clause would silently disable
+    #     the whole log axis for every caller that constructs Evidence positionally.
+    v = liv.evaluate(liv.Evidence(log_read=LR(alive=True, size_delta=0, cpu_delta_cs=0,
+                                              age_ms=H), cpu=None, child=None))
+    check(v.reason != "log-read-on-session-query",
+          "an explicit None CPU/child slot is not evidence; got %s/%s" % (v.state, v.reason))
 
 
 @test("T37 the bound's verdict is PARSED, and only a verdict WITH A CLEAN rc means finished")
@@ -2358,6 +2377,7 @@ MUTATIONS = [
         '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
         '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
         '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '                or ev.cpu is not None or ev.child is not None \\\n'
         '                or not ev.ps_ok or not ev.store_ok:\n',
         '        if False:\n',
         "the log axis accepts a query that ALSO carries session/claim evidence, so a log "
@@ -2368,10 +2388,12 @@ MUTATIONS = [
         '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
         '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
         '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '                or ev.cpu is not None or ev.child is not None \\\n'
         '                or not ev.ps_ok or not ev.store_ok:\n',
         '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
         '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
-        '                or ev.tool is not None or ev.jsonl_turn is not None:\n',
+        '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
+        '                or ev.cpu is not None or ev.child is not None:\n',
         "the masking refusal ignores the SESSION AXIS'S ABSTENTIONS, so a log read "
         "resolves over `unknown/ps-unreadable` — and a `frozen` log read then CONVICTS "
         "a lane on the evidence it discarded (the #1777 B7 shape on a new axis)",
