@@ -518,7 +518,7 @@ PATH="$TMP/bin-shim:$TMP/bin:$PATH" PI_LOG="$O/pi7.log" bash -c '
 arm "$O/logs/shim.log"
 ck "N3 the push shim really lies (origin/durable did NOT move to the lane's head: $(git -C "$BARE" rev-parse --short refs/heads/durable 2>/dev/null) vs $(git -C "$WT2" rev-parse --short HEAD))" \
   $([ "$(git -C "$BARE" rev-parse refs/heads/durable 2>/dev/null)" != "$(git -C "$WT2" rev-parse HEAD)" ] && echo 0 || echo 1)
-grep -q 'the push did NOT deliver this lane' "$O/logs/shim.log"; rcn3=$?
+grep -q "this lane's commits are NOT on that ref" "$O/logs/shim.log" && grep -q 'push=FAILED' "$O/state/lane-exit-shim.state"; rcn3=$?
 ck "N4 …and the exit path does NOT record push=pushed for it: a 0 exit from the push is not a delivery" $rcn3
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
@@ -1589,14 +1589,19 @@ nx27c="$( bash -c '
 case "$nx27c" in MANUAL*) rcn27c=0 ;; *) rcn27c=1 ;; esac
 case "$nx27c" in *"do NOT reap"*) : ;; *) rcn27c=1 ;; esac
 case "$nx27c" in *"refs/wip-local/develop"*) : ;; *) rcn27c=1 ;; esac
-ck "N27c a REFUSED push over a LOCAL-ONLY archive is MANUAL / do-not-reap and still names the pin — the reporter no longer runs above the MANUAL arm [${nx27c:0:72}]" $rcn27c
+# ⛔ AND IT MUST SAY THE PIN HAS NO OFF-BOX COPY (review cycle 16, P2 — REPRODUCED). This arm is the one
+# written FOR the fleet's worst state, and it named the raw `rescue=` value while omitting the fact that
+# makes the state worst — so a reclaimer on a cell was told to "recover … from the rescue ref", a pin that
+# dies with the volume. N27c/N27d asserted only `MANUAL*` and could not see the omission.
+case "$nx27c" in *"no off-box copy"*) : ;; *) rcn27c=1 ;; esac
+ck "N27c a REFUSED push over a LOCAL-ONLY archive is MANUAL / do-not-reap, still names the pin AND says the pin has no off-box copy [${nx27c:0:72}]" $rcn27c
 nx27d="$( bash -c '
   . "$1"
   LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=refused-protected
   LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
   lane_end_next' _ "$GATE" 2>/dev/null )"
-case "$nx27d" in MANUAL*"do NOT reap"*) rcn27d=0 ;; *) rcn27d=1 ;; esac
-ck "N27d …the same holds for refused-protected (the pair is one arm, so it is asserted as one)" $rcn27d
+case "$nx27d" in MANUAL*"do NOT reap"*"no off-box copy"*) rcn27d=0 ;; *) rcn27d=1 ;; esac
+ck "N27d …the same holds for refused-protected, including the no-off-box-copy fact (the pair is one arm, so it is asserted as one)" $rcn27d
 # ⛔ N33 — A TIMED-OUT PUSH IS NOT A MEASURED ABSENCE EITHER (review cycle 12, P2). `rc=124` means the
 # TIMER KILLED THE CLIENT — the ref may already have been applied server-side — yet the log said "STILL only
 # on this disk", contradicting itself in one breath ("the remote never answered") and breaking this file's
@@ -1806,8 +1811,12 @@ n37b="$( bash -c '
 case "$n37b" in *"rescue TOOL itself was not found"*) rcn37b=0 ;; *) rcn37b=1 ;; esac
 case "$n37b" in *"re-run bg-rescue-wip.sh"*) rcn37b=1 ;; *) : ;; esac
 ck "N37b …and rescue=UNAVAILABLE says the TOOL was not found, never 're-run bg-rescue-wip.sh' (which cannot be run) [${n37b:0:64}]" $rcn37b
-case "$n37" in *"homes that were tried"*) rcn37c=1 ;; *) rcn37c=0 ;; esac
-ck "N37c …and its remedy does not point at log content that does not exist — the not-a-worktree line names a REASON, not a list of homes" $rcn37c
+# ⛔ POSITIVE, NOT A STALE-PHRASE HUNT (review cycle 16, P2 — REPRODUCED). The first cut asserted only that
+# "homes that were tried" was ABSENT, so it passed on a line that named NO reason at all — a mutation that
+# deleted the whole reason list stayed green. A negative assertion about one phrase is not the property the
+# label claims; this one fails if the reason list is removed.
+case "$n37" in *"not inside a repository at all"*|*"not its root"*|*"unreadable"*) rcn37c=0 ;; *) rcn37c=1 ;; esac
+ck "N37c …and it names the REASON it could not be examined (positively — deleting the reason list turns THIS red, where a stale-phrase hunt stayed green)" $rcn37c
 # ⛔ N38 — `push=unmeasured` IS NOT A MEASURED ABSENCE (review cycle 15, P2 — REPRODUCED). It means the
 # `rev-list --count` FAILED, and it sat in the "exist only on this disk" arm — asserting existence from the
 # enumeration that failed, beside its own `unpushed=?`, while the LOG for the same terminal abstains. A
@@ -1860,6 +1869,72 @@ n41="$( bash -c '
   lane_end_next' _ "$GATE" 2>/dev/null )"
 case "$n41" in *"not on origin"*) rcn41=1 ;; *"asserts neither delivery nor absence"*) rcn41=0 ;; *) rcn41=1 ;; esac
 ck "N41 the dead unpushed-only else ABSTAINS instead of inventing a verdict and an absence [${n41:0:58}]" $rcn41
+# ⛔ N42 — `FAILED` MAY NOT ASSERT THE STRONGEST ABSENCE (review cycle 16, P2 — REPRODUCED). It is assigned
+# from a measurement where the remote ANSWERED holding a DIFFERENT sha — and the same artifact prints
+# `branch_on_origin=<sha>`, so "exist only on this disk" contradicted the line above it; when that sha was a
+# DESCENDANT (a peer push or a rail merge of our commits) the absence was simply false.
+n42="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=FAILED
+  LANE_END_ORIGIN=deadbeefcafe; LANE_END_HEAD=1234567abcd
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n42" in *"exist only on this disk"*) rcn42a=1 ;; *"deadbeefcafe"*) rcn42a=0 ;; *) rcn42a=1 ;; esac
+ck "N42a a FAILED whose origin reported a DIFFERENT sha names that sha and does not claim the commits exist only on this disk [${n42:0:62}]" $rcn42a
+n42b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=FAILED
+  LANE_END_ORIGIN=""; LANE_END_HEAD=1234567abcd
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n42b" in *"does NOT hold refs/heads/develop"*"do NOT reap"*) rcn42b=0 ;; *) rcn42b=1 ;; esac
+ck "N42b …while the arm that DID establish an absent ref says exactly that, and still refuses a reclaim" $rcn42b
+# ⛔ N43 — A NON-ZERO PUSH IS VERIFIED, NOT TRUSTED (review cycle 16, P2 — REPRODUCED, and an R2 violation).
+# The rc≠0 path assigned FAILED and said "STILL only on this disk" without reading the remote — the one
+# thing R2 forbids. A non-zero exit covers a rejected ref, a transport failure, a hook, and a server that
+# APPLIED the ref and then failed to report; only the first establishes absence.
+mkdir -p "$TMP/bin-rej"
+# push exits 1 (a rejection) and the VERIFY read is the REAL git, so the remote can answer.
+# \u26d4 THE SHIM MUST NOT BREAK THE SYMREF READ: `lane_end_push` reads `ls-remote --symref origin HEAD`
+# BEFORE the push to decide the protected set, and a shim that fails every `ls-remote` makes the whole arm
+# `refused-unknown-default` — which is why the first cut of this arm never reached the code it tests.
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-rej/git"
+chmod +x "$TMP/bin-rej/git"
+git -C "$WT" worktree add -q "$TMP/wt12" -b rejbase 2>/dev/null
+git -C "$TMP/wt12" commit -q --allow-empty -m "base of rejbase"
+git -C "$TMP/wt12" push -q origin HEAD:refs/heads/rejbase 2>/dev/null    # origin really holds an OLDER sha
+git -C "$TMP/wt12" commit -q --allow-empty -m "an unpushed commit on top"
+rej_old="$(git -C "$TMP/wt12" rev-parse HEAD~1)"
+: > "$O/logs/rejected.log"; rm -f "$O/state/lane-exit-rejected.state"
+PATH="$TMP/bin-rej:$PATH" O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=rejbase
+  lane_end_push "rejected" "$3" "$2" rejbase 1 1
+  printf "push=%s origin=%s\n" "$LANE_END_PUSH" "$LANE_END_ORIGIN"
+' _ "$GATE" "$TMP/wt12" "$O/logs/rejected.log" > "$TMP/n43.out" 2>&1
+grep -qx "push=FAILED origin=$rej_old" "$TMP/n43.out"; rcn43a=$?
+ck "N43a a NON-ZERO push is VERIFIED against the remote, so FAILED carries the sha the remote reported rather than an unread absence [$(cat "$TMP/n43.out" 2>/dev/null | tr -d '\n')]" $rcn43a
+grep -q 'origin holds refs/heads/rejbase at' "$O/logs/rejected.log"; rcn43b=$?
+ck "N43b …and the log replays what the REMOTE answered (the sha it holds), which is the only thing that establishes a non-delivery" $rcn43b
+# and when the VERIFY read cannot answer on a non-zero push, the verdict is neither delivery nor absence.
+# Match ONLY `ls-remote --heads` so the pre-push symref read still answers (see N43a's note).
+mkdir -p "$TMP/bin-rej2"
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 1 ;; *" ls-remote --heads "*) exit 7 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-rej2/git"
+chmod +x "$TMP/bin-rej2/git"
+: > "$O/logs/unreported.log"
+PATH="$TMP/bin-rej2:$PATH" O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=rejbase
+  lane_end_push "unreported" "$3" "$2" rejbase 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+  lane_end_next > "$4"
+' _ "$GATE" "$TMP/wt12" "$O/logs/unreported.log" "$TMP/n43.next" > "$TMP/n43b.out" 2>&1
+grep -qx 'push=push-unreported' "$TMP/n43b.out"; rcn43c=$?
+ck "N43c …and a non-zero push whose read ALSO cannot answer records push=push-unreported — never FAILED, which would assert an absence nobody read" $rcn43c
+case "$(cat "$TMP/n43.next" 2>/dev/null)" in MANUAL*"does NOT know"*"do NOT reap"*) rcn43d=0 ;; *) rcn43d=1 ;; esac
+ck "N43d …and next= refuses a reclaim while asserting it does NOT know what origin holds [$(cut -c1-56 "$TMP/n43.next" 2>/dev/null)]" $rcn43d
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
