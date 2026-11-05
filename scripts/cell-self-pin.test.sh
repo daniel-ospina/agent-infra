@@ -855,6 +855,18 @@ refuses_dropin 'lives in a DASH-TRUNCATED drop-in dir (cell-.service.d)' "$(drop
 # by hand is most likely to use. MEASURED: deleting `/run` and `/usr/lib` from that list left this suite at
 # 240 ok / 0 failed, so nothing pinned the enumeration at all.
 roots_out="$(runat "$T/home" CELL_SELF_PIN_DROPIN_ROOTS= bash "$PIN" --print-dropin-roots 2>&1)"
+# ⛔ AND THE LIST WAS STILL A SUBSET OF WHAT systemd MERGES (round-4 review, P1). `systemd-analyze
+# unit-paths` on systemd 255 prints TWELVE entries; MEASURED with a probe drop-in and
+# `systemd-analyze verify --root`, the four `.control`/`.attached` roots below DO merge a
+# `<unit>.d/*.conf` over the unit — and none of them was scanned, so a hostile drop-in there was applied
+# by systemd and read by nothing: #3194's false PASS one directory over, in the load path `systemd.unit(5)`
+# Table 1 ranks ABOVE /etc/systemd/system. The four-name leg above could not see a root that is MISSING.
+for _r in /etc/systemd/system.control /run/systemd/system.control /etc/systemd/system.attached /run/systemd/system.attached; do
+  case "$roots_out" in
+    *"$_r"*) ok "…and the drop-in gate SCANS ${_r} — a .control/.attached root systemd MERGES over the unit (measured)" ;;
+    *) bad "the drop-in gate does not scan ${_r}: a drop-in there is merged over the rendered unit by systemd and read by NOTHING — #3194's false PASS in the dbus-managed load path — [$roots_out]" ;;
+  esac
+done
 for _r in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system; do
   case "$roots_out" in
     *"$_r"*) ok "…and the drop-in gate SCANS ${_r} — a systemd SYSTEM unit directory it merges for this unit" ;;
@@ -908,6 +920,16 @@ refuses_dropin 'declares WorkingDirectory= in a TIMER drop-in (the key is inert 
   "$(dropin_doctor timerwd 'WorkingDirectory=/srv/harness-current' 'cell-self-pin.timer.d')" 'Unknown key name'
 refuses_dropin 'declares a RootDirectory= in a TIMER drop-in (the key is inert there)' \
   "$(dropin_doctor timerroot 'RootDirectory=/srv/harness-current' 'cell-self-pin.timer.d')" 'Unknown key name'
+# ⛔ AND THE IDENTITY ARMS ARE THE SAME CLASS (round-4 review, P2). `User=` and `DynamicUser=` were added
+# to this reader with a SERVICE's reason ("the pass would run as that user", "cannot show that the pass
+# still runs as the owner") — both false in a `[Timer]`, where every `[Service]`-only key is inert
+# (`systemd-analyze verify`: "Unknown key name 'User' in section 'Timer', ignoring.", measured). One
+# family guard now covers the whole set, so these two legs pin the reason and any future service-only arm
+# inherits it.
+refuses_dropin 'declares User=root in a TIMER drop-in (the key is inert there)' \
+  "$(dropin_doctor timeruser 'User=root' 'cell-self-pin.timer.d')" 'IGNORES it in a [Timer]'
+refuses_dropin 'declares DynamicUser=yes in a TIMER drop-in (the key is inert there)' \
+  "$(dropin_doctor timerdyn 'DynamicUser=yes' 'cell-self-pin.timer.d')" 'IGNORES it in a [Timer]'
 # ⛔ THE IDENTITY ALLOWANCE WAS ADVERTISED AND NEVER READ (round-13 review, P1). This section's own header
 # says a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)" — and `verify_unit` refuses any `User=`
 # that is not the owner of `$CELL_HOME` because that is the identity whose git can answer for the tree the

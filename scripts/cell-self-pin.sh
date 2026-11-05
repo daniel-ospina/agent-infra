@@ -1394,10 +1394,19 @@ verify_timer() { # <rendered timer> [expected Unit= target]
 # very defect class (#3194's drop-in) this section exists for. The dirs are enumerated from systemd's own
 # rule rather than a list of the paths somebody happened to think of.
 # ⛔ THE ROOT LIST MUST BE systemd's OWN LOAD PATH, AND IT WAS THREE PATHS SOMEBODY THOUGHT OF. On systemd
-# 255 `systemd-analyze unit-paths` lists `/etc/systemd/system`, `/run/systemd/system`,
-# `/usr/local/lib/systemd/system` and `/usr/lib/systemd/system` as SYSTEM unit directories, and
+# 255 `systemd-analyze unit-paths` lists TWELVE entries; the ones that merge a `<unit>.d/*.conf` over a unit
+# are the seven below (MEASURED with a probe drop-in planted under each root and `systemd-analyze verify
+# --root`: `etc/systemd/system.control`, `run/systemd/system.control`, `etc/systemd/system.attached`,
+# `run/systemd/system.attached`, `/etc/systemd/system`, `/usr/local/lib/systemd/system` and
+# `/usr/lib/systemd/system` all merged; `run/systemd/transient` and the three `generator` entries did not).
 # `systemd.unit(5)` Table 1 puts `/usr/local/lib/systemd/system` — "System units installed by the
-# administrator" — ABOVE `/usr/lib/systemd/system`. The list below omitted it, so a legacy
+# administrator" — ABOVE `/usr/lib/systemd/system`, and lists the `.control`/`.attached` entries as
+# "Persistent and transient configuration created using the dbus API", which is ABOVE `/etc/systemd/system`.
+# ⛔ AND THIS LIST WAS ALREADY WRONG TWICE: it once omitted `/usr/local/lib/systemd/system`, and then it
+# omitted all four `.control`/`.attached` roots — each time leaving a directory systemd DOES merge read by
+# nothing, i.e. #3194's false PASS in the one function whose job is to close it (rounds 5 and 4 of review).
+# The static paths stay (an installer must work with no `systemd-analyze` on the box); what changed is that
+# the set is now the MEASURED merge set rather than the four somebody happened to write down. The list below omitted it, so a legacy
 # `cell-self-pin.service.d/*.conf` carrying the very `WorkingDirectory=/tmp/cell-ai` this change exists to
 # remove was merged OVER the rendered unit by systemd and read by NOTHING, while `--install` printed
 # "installed — ONE actuator on this pin" and exited 0: the exact false PASS this section exists to close,
@@ -1413,8 +1422,12 @@ verify_timer() { # <rendered timer> [expected Unit= target]
 # (measured at this head, round-3 review P2: rc=0 with `CELL_SELF_PIN_DROPIN_ROOTS="$T/root with space"`,
 # while the same drop-in in a space-free root is refused). The seam is a LIST OF EQUALITY-KNOWN PATHS, so
 # its separator has to be one that cannot be a path character.
-SYSTEMD_UNIT_ROOTS="/etc/systemd/system
+SYSTEMD_UNIT_ROOTS="/etc/systemd/system.control
+/run/systemd/system.control
+/etc/systemd/system
+/etc/systemd/system.attached
 /run/systemd/system
+/run/systemd/system.attached
 /usr/local/lib/systemd/system
 /usr/lib/systemd/system
 /lib/systemd/system"
@@ -1582,14 +1595,24 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
       bad "the installed drop-in ${f} names the provisioning clone (/tmp/cell-ai) — a drop-in OVERRIDES the rendered unit, so rewriting only the unit cannot remove that path; remove ${f} and re-run (a pin unit needs no drop-in)"; return 1
     fi
     for _c in $(directive_names "$body"); do
+      # ⛔ A TIMER HAS NO PAYLOAD, SO THE WHOLE [Service]-ONLY FAMILY IS INERT IN ITS DROP-IN — and the
+      # per-name arms below state SERVICE causes ("it refuses to start the unit", "systemd enters that root
+      # BEFORE the payload runs", "the pass would run as that user"), every one of which is FALSE for a
+      # `.timer`. MEASURED: `systemd-analyze verify` answers "Unknown key name 'User' in section 'Timer',
+      # ignoring." for `[Timer] User=root`, and the same for DynamicUser/WorkingDirectory/RootDirectory.
+      # The refusal is right either way (an inert key that reads as configuration is a green no-op), so the
+      # verdict does not change — only the CAUSE, which is the difference between an operator deleting the
+      # right line and hunting a failure mode a timer cannot have (round-4 review, P2). Guarding the FAMILY
+      # here rather than branching each arm is deliberate: this file has fixed "closed by one name" three
+      # times, and a new service-only arm added later is covered without another review.
+      if [ "$is_timer" -eq 1 ]; then
+        case "$_c" in
+          WorkingDirectory|RootDirectory|RootImage|Exec*|SuccessExitStatus|DynamicUser|User|Environment|EnvironmentFile|UnsetEnvironment|PassEnvironment)
+            bad "the installed drop-in ${f} declares ${_c}= in a TIMER drop-in — that directive is [Service]-only, so systemd IGNORES it in a [Timer] section (measured: \"Unknown key name '…' in section 'Timer', ignoring.\") and no value of it can change what the pin does; the line has NO effect and reads as configuration the manager discards — remove ${f}"; return 1 ;;
+        esac
+      fi
       case "$_c" in
         WorkingDirectory)
-          if [ "$is_timer" -eq 1 ]; then
-            # A TIMER executes nothing, so this key is INERT here: systemd drops it in silence and the line
-            # only survives review looking like a constraint on the clock. Refused for what it is, with a
-            # cause that is true for THIS unit type.
-            bad "the installed drop-in ${f} declares WorkingDirectory= in a TIMER drop-in — systemd answers \"Unknown key name 'WorkingDirectory' in section 'Timer', ignoring.\", so the line has NO effect and reads as configuration the manager discards; a timer fires the unit and needs no working directory — remove ${f}"; return 1
-          fi
           bad "the installed drop-in ${f} declares WorkingDirectory= — it refuses to start the unit when the directory is gone (EXIT_CHDIR 200), which is the defect this change replaces; remove ${f}"; return 1 ;;
         Condition*)
           bad "the installed drop-in ${f} declares ${_c}= — a failed condition SKIPS the unit and leaves it green; remove ${f}"; return 1 ;;
@@ -1597,9 +1620,6 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
           # The same "never began" class as `WorkingDirectory=`, one syscall over: systemd enters that root
           # before the payload runs. Refused in the drop-in path too, because a drop-in is merged OVER the
           # unit and an operator reading the unit will never see it.
-          if [ "$is_timer" -eq 1 ]; then
-            bad "the installed drop-in ${f} declares ${_c}= in a TIMER drop-in — that key is [Service]-only, so systemd ignores it here (measured: \"Unknown key name … in section 'Timer', ignoring.\"); the line has NO effect and reads as configuration the manager discards — remove ${f}"; return 1
-          fi
           bad "the installed drop-in ${f} declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant is a unit that never began; remove ${f}"; return 1 ;;
         Exec*)
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
@@ -1613,8 +1633,9 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
           bad "the installed drop-in ${f} declares DynamicUser= — this gate does not read its value, so it cannot show that the pass still runs as the owner of CELL_HOME (the identity whose git can answer for the tree it pins); an allocated or otherwise unverified identity is the drop-in User=root defect one directive over — remove ${f}"; return 1 ;;
         User)
           # ⛔ THE ONE DIRECTIVE THIS FUNCTION'S OWN COMMENT ADVERTISED AS ALLOWED AND NEVER READ. The
-          # header above says a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)", while the rule it
-          # introduces is that a drop-in MAY NOT re-open a class `verify_unit` closed — and `verify_unit`
+          # header above used to say a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)" — that
+          # sentence is now restricted to the ONE identity that can pin, and the rule it introduces is that a
+          # drop-in MAY NOT re-open a class `verify_unit` closed — and `verify_unit`
           # refuses any `User=` that is not the owner of `$CELL_HOME`, because that is the identity whose
           # git can answer for the tree this pass pins. MEASURED: a drop-in carrying `User=root` installed
           # **rc=0** and printed "installed — ONE actuator on this pin" — the exact #3194 outcome
@@ -1656,7 +1677,7 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
           bad "the installed drop-in ${f} declares ${_c}= — it re-targets or re-schedules the timer/unit pair this verification installed (a pin that silently never runs is #3194's symptom), or is a unit-level directive this check cannot honour; remove ${f}"; return 1 ;;
         Environment)
           # ⛔ A DROP-IN MAY ADJUST IDENTITY, AND THAT ALLOWANCE IS EXACTLY ONE VARIABLE WIDE. The
-          # comment above this function names the remedy as `User=` and `Environment=HOME=` — so allow
+          # comment above this function names the remedy as `User=` (naming the owner) and `Environment=HOME=` — so allow
           # `HOME=` and refuse EVERY other `Environment=` assignment, rather than blocklisting the names
           # this file happens to know (`CELL_HOME`, `HARNESS_PIN_FILE`, `HARNESS`, `HARNESS_PIN_DIR`, …).
           # A blocklist here is the "family closed by one name" defect this file already fixed twice:
@@ -1669,7 +1690,7 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
             case $_kv in
               HOME=*) ;;
               *)
-                bad "the installed drop-in ${f} sets 'Environment=${_kv%%=*}=' — a drop-in OVERRIDES the rendered unit, so an environment value other than HOME= can re-point the pass at a different pin record than the controller; a drop-in may adjust IDENTITY (User=, Environment=HOME=), never the base or the record it reads; remove ${f}"; return 1 ;;
+                bad "the installed drop-in ${f} sets 'Environment=${_kv%%=*}=' — a drop-in OVERRIDES the rendered unit, so an environment value other than HOME= can re-point the pass at a different pin record than the controller; a drop-in may adjust IDENTITY only to the owner of CELL_HOME (User=) and HOME=, never the base or the record it reads; remove ${f}"; return 1 ;;
             esac
           done ;;
       esac
