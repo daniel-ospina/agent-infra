@@ -2861,19 +2861,19 @@ function _wtScanLine(line, carry) {
       out += ch; i++; atWordStart = true; continue;
     }
     if (ch === "<" && line[i + 1] === "<") {
-      let j = i + 2;
-      if (line[j] === "-") j++;
-      while (line[j] === " " || line[j] === "\t") j++;
-      let q = null;
-      if (line[j] === "'" || line[j] === '"') { q = line[j]; j++; }
-      let d = "";
-      // An UNQUOTED delimiter is a shell word: it stops at whitespace / shell
-      // metacharacters, NOT at the first non-word char. Stopping early (`<<E-O-F`
-      // → delimiter `E`) left the terminator unmatched, so the body swallowed
-      // every following line — including a later discard (reviewer round-6 P1).
-      while (j < line.length && (q ? line[j] !== q : !/[\s;&|<>(){}'"\\]/.test(line[j]))) { d += line[j]; j++; }
-      if (q && line[j] === q) j++;
-      if (d && delim === null) { delim = d; delimQuoted = q; }
+      // ⏔ ONE heredoc-word scanner (#3444 review cycle 4). This scan had its own word
+      // class — it stopped at `\s` (a SUPERSET of bash's blanks: `\r`, `\v`, `\f`, NBSP are
+      // WORD characters) and refused `{`, so `<<EOS\rX` computed the PREFIX `EOS` and
+      // `<<EO{F` computed `EO`. No line ever equals a prefix, the masker swallowed to EOF,
+      // and a later `git checkout -- dirty.txt` became INVISIBLE to the M5 discard gate
+      // (measured ALLOWED at the real handler; pre-existing, byte-identical to origin/main).
+      // An UNPROVABLE word (line continuation, `$'…'`) emits a bare `<<` and masks nothing,
+      // which scans the body as code — the fail-closed direction.
+      const hd = heredocDelimiterAt(line, i + 2);
+      const provable = !!(hd && hd.delim && !hd.continuation);
+      const d = provable ? hd.delim : "";
+      if (d && delim === null) { delim = d; delimQuoted = hd.quoted ? "'" : null; }
+      const j = provable ? hd.end : i + 2;
       // Re-emit the delimiter so the walker's `<<` + operand skip consumes the
       // placeholder, never the next real command token. An opener with no
       // delimiter (`<<` in arithmetic) emits bare `<<`.
@@ -3431,7 +3431,12 @@ function _wtHeredocDelimiterWord(text, from) {
   let i = from;
   while (i < n) {
     const ch = text[i];
-    if (/\s|;|\||&|\(|\)|<|>/.test(ch)) break;   // unquoted metacharacter ends the word
+    // `\s` is NOT bash's blank set: `\r`, `\v`, `\f` and NBSP are ordinary WORD
+    // characters to the shell, so treating them as terminators computes a strict
+    // PREFIX of bash's delimiter and blanks a line bash runs as a COMMAND
+    // (#3444 review cycle 3, measured at the handler: `<<EOS\r`/`<<EOS\v`
+    // laundered both a LOCAL reset AND a LOCAL tracked write).
+    if (/[ \t\n;|&()<>]/.test(ch)) break;   // blank or unquoted metacharacter ends the word
     if (ch === "\\") {
       if (text[i + 1] === "\n") { i += 2; continue; }          // line continuation
       if (text[i + 1] === "\r" && text[i + 2] === "\n") { i += 3; continue; }
@@ -3466,6 +3471,43 @@ function _wtHeredocDelimiterWord(text, from) {
     i++;
   }
   return { raw, end: i };
+}
+
+/**
+ * #3444 (review cycle 4): the delimiter at `from` (the character after `<<`), read
+ * as the SHELL WORD it is. Exported so `index.ts`'s heredoc masker and the
+ * remote-context stripper cannot disagree about where a body ends — they did,
+ * and both scanners carried the SAME defect (`\s` is a superset of bash's blank
+ * set, so `<<EOS\rX`/`<<EOS\vX`/NBSP computed a strict PREFIX of the delimiter;
+ * bash ends the body EARLY and runs the following lines as COMMANDS, while the
+ * masker swallowed them and a LOCAL `ls > tracked.txt` became invisible to the
+ * tracked-write gate — measured at the handler).
+ *
+ * `continuation` is TRUE when a backslash ends the TEXT THE CALLER PASSED — i.e.
+ * the word is incomplete INSIDE the caller's window, so its value cannot be
+ * established from what was handed over and the caller must treat the heredoc as
+ * UNPROVABLE (stay unmasked / stay gated) rather than guess. The window matters:
+ * for a LINE-scoped caller (the heredoc maskers) it is end-of-LINE, and
+ * `<<EOS\` + newline really does continue in bash; for a FULL-TEXT caller
+ * (`_wtSegments`) the word legitimately continues onto the next line and is
+ * resolved there, which is what bash does (`<<EOS\` + `git` ⇒ delimiter `EOSgit`).
+ * `continuation` then only fires at end-of-INPUT, where nothing follows to launder.
+ * @param {string} text
+ * @param {number} from index of the character AFTER `<<`
+ * @returns {{delim: string|null, dash: boolean, end: number, continuation: boolean}}
+ */
+export function heredocDelimiterAt(text, from) {
+  const s = String(text ?? "");
+  let j = Math.max(0, from | 0);
+  const dash = s[j] === "-";
+  if (dash) j++;
+  while (j < s.length && (s[j] === " " || s[j] === "\t")) j++;
+  const hw = _wtHeredocDelimiterWord(s, j);
+  const continuation = /\\$/.test(hw.raw);
+  // `quoted` is what makes the body DATA rather than a locally-expanded here-doc
+  // (`<<'EOF'` / `<<"EOF"`): `_stripQuotedHeredocBodies` needs exactly that bit, and
+  // reading it here keeps ONE word scan rather than a second reconstruction.
+  return { delim: _wtDelimiterValue(hw.raw), dash, end: hw.end, continuation, quoted: /['"]/.test(hw.raw) };
 }
 
 /**
@@ -3544,14 +3586,15 @@ function _wtSegments(text) {
     if ((ch === "<" || ch === ">") && text[i + 1] === "(") { i = _wtSkipBalanced(text, i + 1); continue; }
     // Heredoc (`<<`, `<<-`) — NOT the here-string `<<<`, which is a plain word.
     if (ch === "<" && text[i + 1] === "<" && text[i + 2] !== "<") {
-      const dash = text[i + 2] === "-";
       if (redirectAt < 0) redirectAt = i;
-      let j = i + (dash ? 3 : 2);
-      while (j < n && (text[j] === " " || text[j] === "\t")) j++;
-      const hw = _wtHeredocDelimiterWord(text, j);
-      const delim = _wtDelimiterValue(hw.raw);
-      heredocs.push({ delim, dash, provable: delim !== null });
-      i = hw.end;
+      // ⛔ via the SAME wrapper every other reader uses (#3444 review cycle 4), so this
+      // reader inherits the shared word scan and the `continuation` rule. Because this
+      // caller passes the WHOLE text, a `<<EOS\\` + newline word is resolved across the
+      // line exactly as bash does (delimiter `EOSgit`); `continuation` fires only at
+      // end-of-input, where the heredoc is unterminated and the segment stays gated.
+      const hd = heredocDelimiterAt(text, i + 2);
+      heredocs.push({ delim: hd.delim, dash: hd.dash, provable: hd.delim !== null && !hd.continuation });
+      i = hd.end;
       continue;
     }
     if (ch === "<") {
@@ -3749,18 +3792,100 @@ function _wtRemotePayloadIndex(toks) {
  * @param {string} text
  * @returns {boolean}
  */
+/**
+ * #3444: the shell words of a prefix, each DEQUOTED (quotes and backslash escapes
+ * removed, `$'…'` marked dynamic), with the ones sitting in COMMAND position
+ * flagged. Quote-splitting is the point: `e''val`, `sourc""e` and `x="eval"` are
+ * the SAME resolution builtin spelled so a literal scan does not read it
+ * (#3444 review cycle 3, measured — the shadow really was built and run locally).
+ * @param {string} text
+ * @returns {Array<{word: string, cmd: boolean}>}
+ */
+function _wtDequotedWords(text) {
+  const s = String(text ?? "");
+  const n = s.length;
+  const out = [];
+  let cur = "";
+  let have = false;
+  let cmd = true;                    // a command word may appear here
+  const flush = () => { if (have) out.push({ word: cur, cmd }); cur = ""; have = false; };
+  for (let i = 0; i < n; i++) {
+    const ch = s[i];
+    if (ch === "\\") {
+      if (s[i + 1] === "\n") { i++; continue; }
+      if (s[i + 1] === "\r" && s[i + 2] === "\n") { i += 2; continue; }
+      cur += s[i + 1] ?? "";
+      have = true;
+      i++;
+      continue;
+    }
+    if (ch === "$" && s[i + 1] === "'") {           // ANSI-C: not a literal word
+      cur += "\u0000DYN";
+      have = true;
+      i += 2;
+      while (i < n) {
+        if (s[i] === "\\") { i += 2; continue; }
+        if (s[i] === "'") break;
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'") {
+      have = true;
+      i++;
+      while (i < n && s[i] !== "'") { cur += s[i]; i++; }
+      continue;
+    }
+    if (ch === '"') {
+      have = true;
+      i++;
+      while (i < n && s[i] !== '"') {
+        if (s[i] === "\\") { cur += s[i + 1] ?? ""; i += 2; continue; }
+        cur += s[i];
+        i++;
+      }
+      continue;
+    }
+    if (/[ \t\n\r;|&()<>]/.test(ch)) {
+      flush();
+      if (/[;|&()<>\n\r]/.test(ch)) cmd = true;
+      continue;
+    }
+    cur += ch;
+    have = true;
+    if (ch === "#" && cur === "#") { /* body of a comment is not a command word */ }
+  }
+  flush();
+  // Command position propagates through assignments and the wrappers that run
+  // their argv verbatim, and stops at the first real command word.
+  let atCmd = true;
+  const flagged = [];
+  for (const tok of out) {
+    if (atCmd) flagged.push(tok.word);
+    if (atCmd && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tok.word)) continue;          // assignment keeps it
+    if (atCmd && /^(?:export|builtin|command|env|exec|sudo|doas|nice|time|nohup)$/.test(tok.word)) continue;
+    atCmd = false;
+  }
+  return flagged;
+}
+
 function _wtMayRedefineTransport(text) {
   const s = String(text ?? "");
   if (!s) return false;
-  return /(?:^|[;&|(){}\s'"$])(?:function\s+)?(?:cmux|ssh|docker)\s*\(\s*\)/.test(s) ||
+  if (/(?:^|[;&|(){}\s'"$])(?:function\s+)?(?:cmux|ssh|docker)\s*\(\s*\)/.test(s) ||
     /\bfunction\s+(?:cmux|ssh|docker)\b/.test(s) ||
-    /\balias\s+(?:-[A-Za-z]+\s+)*(?:cmux|ssh|docker)\s*=/.test(s) ||
-    /(?:^|[;&|(){}\s!])\s*(?:builtin\s+|command\s+|exec\s+)?\\?\.\s+\S/.test(s) ||
+    /\balias\s+(?:-[A-Za-z]+\s+)*(?:cmux|ssh|docker)\s*=/.test(s)) return true;
+  // The resolution builtins, read through QUOTING: a word whose dequoted form is
+  // `eval`/`source`/`.` anywhere the shell would resolve a name, and an
+  // assignment whose dequoted value is one of them (`x="eval"`, `export x='.'`).
+  const words = _wtDequotedWords(s);
+  if (words.some((w) => w === "eval" || w === "source" || w === ".")) return true;
+  if (words.some((w) => {
+    const m = /^[A-Za-z_][A-Za-z0-9_]*=([\s\S]*)$/.exec(w);
+    return m !== null && /^(?:eval|source|\.)$/.test(m[1]);
+  })) return true;
+  return /(?:^|[;&|(){}\s!])\s*(?:builtin\s+|command\s+|exec\s+)?\\?\.\s+\S/.test(s) ||
     /(?:^|[;&|(){}\s])(?:eval|source)\s/.test(s) ||
-    // A variable ASSIGNED the resolution builtin (`x=eval` / `x=source` / `x=.`)
-    // is the same constructed-definition channel, one indirection further out:
-    // `x=eval; $x 'ss''h() { "${@:3}"; }'; ssh cell-a -- <verb>` built the shadow
-    // from a spelling no literal scan reads (#3444 review cycle 3, measured).
     /(?:^|[\s;&|(){])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:eval|source|\.)\s*(?:$|[;&|)\s])/.test(s);
 }
 
@@ -8905,7 +9030,6 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
     // Quote-aware scan: a `<<` inside "…"/'…' prose is NOT a heredoc marker
     // (cycle-13 P1 — `cat <<EOF && echo "pass <<token"` must not add a bogus
     // delimiter that swallows the region to EOF).
-    const qre = /<<(-)?[ \t]*(?:"([^"]*)"|'([^']*)'|([^|&;()<>\s'"]+))/;
     let p2q = 0;
     let sq = false, dq = false;
     while (p2q < line.length) {
@@ -8914,21 +9038,24 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
       if (dq) { if (c === "\\") p2q += 2; else { if (c === '"') dq = false; p2q++; } continue; }
       if (c === "'") { sq = true; p2q++; continue; }
       if (c === '"') { dq = true; p2q++; continue; }
-      if (c === "<" && line[p2q + 1] === "<") {
-        const mq = qre.exec(line.slice(p2q));
-        if (mq) {
+      if (c === "<" && line[p2q + 1] === "<" && line[p2q + 2] !== "<" && line[p2q - 1] !== "<") {
+        // ⛔ ONE heredoc-word scanner (#3444 review cycle 4). The class-based regex that
+        // used to read this delimiter stopped at `\s` (a SUPERSET of bash's blanks: `\r`,
+        // `\v`, `\f` and NBSP are WORD characters to the shell), so `bash <<EOS\rX` computed
+        // the delimiter `EOS`: no line ever equals it, the walk swallowed to EOF, and
+        // `ls > tracked.txt` on the next line became INVISIBLE to the tracked-write gate
+        // (measured — and identically on `origin/main`, i.e. this arm's own pre-existing
+        // defect, not #3444's). A line-continued or unprovable delimiter leaves the heredoc
+        // UNMASKED, so the body is walked as code (fail-closed).
+        const hd = heredocDelimiterAt(line, p2q + 2);
+        if (hd && hd.delim && !hd.continuation) {
           // cycle-16 P1: a `<<` whose delimiter is all-digits or is followed
-          // by `))` (after optional ws) is an ARITHMETIC SHIFT, not a heredoc
-          // (`$((1 << 2))`, `(( a << b ))`, incl. multi-line forms where the
-          // (( opener sits on an earlier line and the same-line guard can't
-          // see it). Rejecting keeps the rest of the command from being
-          // swallowed as an unterminated "body".
-          const dqEnd = p2q + mq[0].length;
-          let dx = dqEnd;
+          // by `))` (after optional ws) is an ARITHMETIC SHIFT, not a heredoc.
+          let dx = hd.end;
           while (dx < line.length && (line[dx] === " " || line[dx] === "\t")) dx++;
-          if ((line[dx] === ")" && line[dx + 1] === ")") || (mq[4] !== undefined && /^[0-9]+$/.test(mq[4]))) return null;
-          delims.push({ d: mq[2] ?? mq[3] ?? mq[4], tabStrip: !!mq[1] });
-          p2q = dqEnd;
+          if ((line[dx] === ")" && line[dx + 1] === ")") || /^[0-9]+$/.test(hd.delim)) return null;
+          delims.push({ d: hd.delim, tabStrip: hd.dash });
+          p2q = hd.end;
           continue;
         }
       }
@@ -9477,15 +9604,26 @@ export function bashWriteTargetsResolved(command, sessionCwd = process.cwd()) {
             if (qq) { if (c2 === qq) qq = null; scan++; continue; }
             if (c2 === "'" || c2 === '"') { qq = c2; scan++; continue; }
             if (c2 === "<") {
-              const m = /^<<(-)?[ \t]*(?:"([^"]*)"|'([^']*)'|([^|&;()<>\s'"]+))/.exec(s.slice(scan, lineEndAt));
-              if (m && !(s[scan + 2] === "<")) { hm = m; break; }
+              // ⛔ ONE heredoc-word scanner (#3444 review cycle 4). This arm carried its own
+              // copy of the class regex whose word set stopped at `\s` — a SUPERSET of bash's
+              // blanks (`\r`, `\v`, `\f`, NBSP are WORD characters) — so `python3 - <<EOS\rX`
+              // computed the delimiter `EOS`, no line ever equals it, and the body ran past the
+              // real terminator: a python `open("tracked.txt","w")` there was never resolved
+              // (measured fail-open, pre-existing). Same scanner as every other reader; a
+              // continued or unprovable delimiter yields no `hm`, so the arm falls back to its
+              // segment-end behaviour (the narrower, fail-closed reading).
+              const hd = heredocDelimiterAt(s.slice(0, lineEndAt), scan + 2);
+              if (hd && hd.delim && !hd.continuation && !(s[scan + 2] === "<")) {
+                hm = { delim: hd.delim, dash: hd.dash };
+                break;
+              }
             }
             scan++;
           }
         }
         if (hm) {
-          const delim = hm[2] ?? hm[3] ?? hm[4];
-          const tabStrip = !!hm[1];
+          const delim = hm.delim;
+          const tabStrip = !!hm.dash;
           const bodyStart = nl === -1 ? n : nl + 1;
           const lines = s.slice(bodyStart).split("\n");
           for (let li = 0; li < lines.length; li++) {

@@ -291,6 +291,77 @@ console.log("\n── Part A: `stripRemoteContexts` — what is remote, what is 
   expectEq("A60 `ssh -o KnownHostsCommand=…` (a LOCAL command) → not exempt",
     strip(`ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`),
     `ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`);
+
+  // ── A61–A68: the cycle-4 fail-open class (fresh-context review, cycle 3) ────
+  // `\s` is NOT bash's blank set. `\r`, `\v`, `\f` and NBSP are ordinary WORD
+  // characters to the shell, so a scan that stops at them computes a strict
+  // PREFIX of bash's delimiter — bash terminates EARLY, we keep scanning, and
+  // the lines bash runs as COMMANDS are blanked as "remote stdin". The tail must
+  // survive for each of the four characters (measured laundered at the handler).
+  for (const [label, d] of [
+    ["A61 CR in the delimiter word", "\r"],
+    ["A62 VT in the delimiter word", "\v"],
+    ["A63 FF in the delimiter word", "\f"],
+    ["A64 NBSP in the delimiter word", "\u00a0"],
+  ]) {
+    const out = strip(`cmux vm exec cell-a -- bash <<EOS${d}X\nEOS${d}X\n${RESET}\nEOS`);
+    expectTrue(`${label}: the LOCAL tail SURVIVES`, out.includes(RESET), `got ${JSON.stringify(out)}`);
+  }
+  // Quote-SPLITTING is the same resolution channel written so no literal scan
+  // reads it: bash dequotes the word, so `e''val`, `sourc""e` and `x="eval"` all
+  // resolve the builtin and build the shadow locally.
+  for (const [label, cmd] of [
+    ["A65 `x=\"eval\"` (quoted assignment)", `x="eval"; $x 'ss''h() { :; }'; ssh cell-a -- ${RESET}`],
+    ["A66 `export x='eval'`", `export x='eval'; $x 'ss''h() { :; }'; ssh cell-a -- ${RESET}`],
+    ["A67 `e''val` (quote-split builtin)", `e''val 'ss''h() { :; }'; ssh cell-a -- ${RESET}`],
+    ["A68 `sourc\"\"e` (quote-split builtin)", `sourc""e /tmp/defs-3444.sh; ssh cell-a -- ${RESET}`],
+  ]) {
+    expectEq(`${label} → not provable, unchanged`, strip(cmd), cmd);
+  }
+  // A71–A73: the THIRD delimiter reader — the python-stdin arm of
+  // `bashWriteTargetsResolved` — shares the same scanner now. With a CR / NBSP /
+  // escaped-space delimiter it used to truncate the word to a prefix, so the python
+  // body ran past its REAL terminator and an `open()` write was never resolved
+  // (measured fail-open at the tracked-write gate; pre-existing, not #3444's own arm).
+  const resolver = (await import(pathToFileURL(CG).href)).bashWriteTargetsResolved;
+  // The discriminating shape: the python body contains a line `EOS` (inside a triple-quoted
+  // string), so a delimiter truncated to `EOS` ends the body THERE and leaves the real
+  // `open(…)` write outside it — where bash, whose delimiter is the WHOLE word, keeps the
+  // write inside the body. LF is the control: bash ends at that inner line too.
+  const pyCase = (d) => `python3 - <<EOS${d}\ns = """\nEOS\n"""\nopen("tracked.txt","w").write("x")\nEOS${d}`;
+  for (const [label, d, expectResolved] of [
+    ["A71 CR", "\rX", true], ["A72 NBSP", "\u00a0X", true], ["A73 escaped space", "\\ X", true],
+    ["A74 control: LF (bash also ends at the inner line)", "", false],
+  ]) {
+    const dir = realpathSync(mkdtempSync(join(tmpdir(), "rc-3444-py-")));
+    const hits = resolver(pyCase(d), dir).map((x) => x.resolvedPath);
+    const got = hits.includes(join(dir, "tracked.txt"));
+    expectTrue(`${label} python-stdin heredoc: write ${expectResolved ? "IS" : "is NOT"} resolved (bash's body)`,
+      got === expectResolved, JSON.stringify(hits));
+    rmSync(dir, { recursive: true, force: true });
+  }
+  // A75–A77: the FOURTH delimiter reader — `_wtScanLine`, which feeds
+  // `stripHeredocData` → the M5 discard gate and the #1919 nested-worktree check —
+  // now shares the same word scan. Its word class stopped at `\s` and refused `{`,
+  // so `<<EOS\rX` computed `EOS` and `<<EO{F` computed `EO`: no line ever equals a
+  // prefix, the masker swallowed to EOF, and a later `git checkout -- dirty.txt`
+  // was invisible (measured ALLOWED at the handler; pre-existing on origin/main).
+  const discards = (await import(pathToFileURL(CG).href)).extractWorkingTreeDiscards;
+  for (const [label, opener, closer] of [
+    ["A75 CR in the delimiter", "cat <<EOS\rX", "EOS\rX"],
+    ["A76 `{` in the delimiter (not a metacharacter)", "cat <<EO{F", "EO{F"],
+    ["A77 quote-split delimiter (`E\"O\"S`)", 'cat <<E"O"S', "EOS"],
+  ]) {
+    const cmd = `${opener}\nbody\n${closer}\ngit checkout -- dirty.txt`;
+    const found = discards(cmd).length > 0;
+    expectTrue(`${label}: the discard AFTER the real terminator is seen`, found, "the masker swallowed it");
+  }
+  // control: an unterminated heredoc really swallows the rest, so nothing runs
+  expectTrue("A78 control: an unterminated heredoc still hides the discard (bash runs nothing)",
+    discards("cat <<'EOS'\nbody\ngit checkout -- dirty.txt").length === 0);
+  // …and the read-through QUOTING does not become a blanket `eval`/`.` ban:
+  expectEq("A69 control: `git status .` stays untouched", strip("git status ."), "git status .");
+  expectEq("A70 control: `git commit -m eval` stays untouched", strip("git commit -m eval"), "git commit -m eval");
 }
 
 // ── Part B: the REAL handler, in a hermetic MAIN checkout ─────────────────
@@ -433,6 +504,10 @@ async function partB() {
       ["B33 escaped-space heredoc delimiter then a LOCAL reset", `cmux vm exec cell-a -- bash <<EOS\\ \nEOS \n${RESET}\nEOS`],
       ["B34 `. <file>` after a NEWLINE, then a dispatch", `printf 'x\\n' > /tmp/defs-3444.sh\ntrue\n. /tmp/defs-3444.sh\nssh cell-a -- ${RESET}`],
       ["B35 ssh -o KnownHostsCommand running HERE", `ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`],
+      ["B36 CR in the heredoc delimiter launching HERE", `cmux vm exec cell-a -- bash <<EOS\rX\nEOS\rX\n${RESET}\nEOS`],
+      ["B37 NBSP in the delimiter hiding a LOCAL tracked write", `cmux vm exec cell-a -- bash <<EOS\u00a0X\nEOS\u00a0X\nls > tracked.txt\nEOS`],
+      ["B38 x=\"eval\" building the shadow HERE", `x="eval"; $x 'ss''h() { :; }'; ssh cell-a -- ${RESET}`],
+      ["B39 e''val building the shadow HERE", `e''val 'ss''h() { :; }'; ssh cell-a -- ${RESET}`],
     ]) {
       const r = await bash(cmd);
       expectTrue(`${label} → STILL REFUSED`, !allowed(r), "was ALLOWED — the remote boundary laundered a LOCAL operation");
@@ -496,9 +571,11 @@ try {
 //      fail-open shapes the review found are ALLOWED again. M1/M2 cannot redden
 //      these: `identity` is STRICTER, so a fail-open pin needs a mutant that
 //      reintroduces the fail-open.
-//   M4 the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the command-resolution
+//   M4 the CYCLE-3/4 proofs (ANSI-C `$'…'` parsing, the command-resolution
 //      variable prefix, ssh's local-execution argv, the heredoc delimiter's WORD
-//      scan, the `.`-command ban and `KnownHostsCommand`) — same reason as M3.
+//      scan and its BLANK-ONLY terminator set, the `.`-command ban, the QUOTED
+//      resolution spellings `e''val`/`x="eval"`, `KnownHostsCommand`) — same
+//      reason as M3.
 // Opt-in, its own CI step (the same construction as the discard-gate suite).
 if (process.argv.includes("--mutations")) {
   console.log("\n── Part M: mutation evidence — reverting the fix reddens the pins ──");
@@ -605,8 +682,8 @@ if (process.argv.includes("--mutations")) {
         // (a) the delimiter's quote removal → back to plain quote stripping, and
         // (b) the `$'…'`-form unprovability bail → removed (the cycle-2 defect),
         // (c) the unprovable/unterminated-heredoc refusal → removed.
-        ["heredocs.push({ delim, dash, provable: delim !== null });",
-         "heredocs.push({ delim: _wtUnquoteWord(hw.raw), dash, provable: true });"],
+        ["return { delim: _wtDelimiterValue(hw.raw), dash, end: hw.end, continuation, quoted: /['\"]/.test(hw.raw) };",
+         "return { delim: hw.raw, dash, end: hw.end, continuation: false, quoted: /['\"]/.test(hw.raw) };"],
         ["if (/\\$['\"]/.test(s)) return null;", "if (false) return null;"],
         ["if (seg.unprovable || seg.bodies.some((b) => !b.terminated)) continue;",
          "if (false) continue;"],
@@ -669,11 +746,13 @@ if (process.argv.includes("--mutations")) {
       }
     }
 
-    // M4 — the CYCLE-3 fail-open class, reintroduced (#3444 review cycle 3).
+    // M4 — the CYCLE-3/4 fail-open class, reintroduced (#3444 review cycles 3–4).
     // M1/M2/M3 cannot redden these pins: each reverts a DIFFERENT proof. This
-    // mutant removes only the three proofs that stop a LOCAL execution from
-    // being read as remote — ANSI-C quoting, the resolution-variable prefix, and
-    // ssh's own local-execution argv — and requires B27–B30 to be ALLOWED again.
+    // mutant removes the proofs that stop a LOCAL execution from being read as
+    // remote — ANSI-C quoting, the resolution-variable prefix, ssh's own
+    // local-execution argv, the heredoc delimiter's WORD scan and its BLANK-ONLY
+    // terminator set, the `.`-command ban, the QUOTED resolution spellings and
+    // `KnownHostsCommand` — and requires B27–B30 and B33–B39 to be ALLOWED again.
     {
       const anchors = [
         // (a) ANSI-C `$'…'` handling in the SEGMENTER (the `while (i < n)` copy;
@@ -688,16 +767,26 @@ if (process.argv.includes("--mutations")) {
          "for (let j = i + 1; false && j < sep; j++) {\n      const raw = word(j);\n      if (/^-F/.test(raw) || raw === \"--config\") return -1;"],
         // (d) the heredoc delimiter's WORD scan (cycle 3b): back to "stop at the
         // first whitespace, no escapes" — the strict-PREFIX delimiter.
-        ["if (/\\s|;|\\||&|\\(|\\)|<|>/.test(ch)) break;   // unquoted metacharacter ends the word",
-         "if (/\\s/.test(ch)) break;   // MUTANT (cycle 3b): whitespace-only scan"],
+        ["if (/[ \\t\\n;|&()<>]/.test(ch)) break;   // blank or unquoted metacharacter ends the word",
+         "if (/\\s/.test(ch)) break;   // MUTANT: whitespace-class scan"],
+        // (g) the QUOTED resolution spellings (cycle 4).
+        ["const words = _wtDequotedWords(s);", "const words = [];"],
         ["if (ch === \"\\\\\") {\n      if (text[i + 1] === \"\\n\") { i += 2; continue; }          // line continuation",
          "if (false) {\n      if (text[i + 1] === \"\\n\") { i += 2; continue; }          // line continuation"],
         // (e) the `.`-command ban in EVERY position (cycle 3b).
-        ["    /(?:^|[;&|(){}\\s!])\\s*(?:builtin\\s+|command\\s+|exec\\s+)?\\\\?\\.\\s+\\S/.test(s) ||\n",
-         "    false ||\n"],
+        ["  return /(?:^|[;&|(){}\\s!])\\s*(?:builtin\\s+|command\\s+|exec\\s+)?\\\\?\\.\\s+\\S/.test(s) ||\n",
+         "  return false ||\n"],
         // (f) ssh's remaining local-execution option (cycle 3b).
         ["/^(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match)$/",
          "/^(?:proxycommand|localcommand|permitlocalcommand|match)$/"],
+        // (i) the FOURTH delimiter reader (`_wtScanLine` → `stripHeredocData`), back to
+        // its own class-based word read (cycle 4).
+        ["const hd = heredocDelimiterAt(line, i + 2);",
+         "const hd = (() => { let k = i + 2; if (line[k] === \"-\") k++; while (line[k] === \" \" || line[k] === \"\\t\") k++; const st = k; while (k < line.length && !/[\\s;&|<>(){}'\"\\\\]/.test(line[k])) k++; const raw = line.slice(st, k); return { delim: raw || null, dash: false, end: k, continuation: false, quoted: false }; })();"],
+        // (h) the THIRD delimiter reader — the python-stdin arm — back to its own
+        // whitespace-class regex (cycle 4).
+        ["const hd = heredocDelimiterAt(s.slice(0, lineEndAt), scan + 2);",
+         "const hd = (() => { const m0 = /^<<(-)?[ \\t]*(?:\"([^\"]*)\"|'([^']*)'|([^|&;()<>\\s'\"]+))/.exec(s.slice(scan, lineEndAt)); return m0 ? { delim: m0[2] ?? m0[3] ?? m0[4], dash: !!m0[1], continuation: false } : null; })();"],
       ];
       let mutated = SRC;
       let applied = 0;
@@ -729,15 +818,43 @@ if (process.argv.includes("--mutations")) {
             ["M4  B28 ANSI-C quoting hiding a LOCAL tracked write", `cmux vm exec cell-a -- ls $'\\'' > tracked.txt`],
             ["M4  B29 PATH-shimmed transport", `PATH=/tmp/shim:$PATH ssh cell-a -- ${RESET}`],
             ["M4  B30 ssh -o ProxyCommand", `ssh -o ProxyCommand='${RESET}' cell-a -- ls`],
-            ["M4  B33 escaped-space heredoc delimiter + LOCAL reset", `cmux vm exec cell-a -- bash <<EOS\\ \nEOS \n${RESET}\nEOS`],
             ["M4  B34 `.` after a NEWLINE then a dispatch", `printf 'x\\n' > /tmp/defs-3444.sh\ntrue\n. /tmp/defs-3444.sh\nssh cell-a -- ${RESET}`],
             ["M4  B35 ssh -o KnownHostsCommand", `ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`],
+            ["M4  B36 CR in the delimiter word", `cmux vm exec cell-a -- bash <<EOS\rX\nEOS\rX\n${RESET}\nEOS`],
+            ["M4  B38 x=\"eval\" shadow", `x="eval"; $x 'ss''h() { :; }'; ssh cell-a -- ${RESET}`],
           ]) {
             process.chdir(hub);
             const r = await toolCall({ toolName: "bash", input: { command: cmd } }, undefined);
             const blocked = !!r && r.block === true;
             expectTrue(`${label}: with the cycle-3 proofs reverted the pin goes RED (allowed again)`,
               !blocked, "still BLOCKED — the pin is not the thing holding this fix");
+          }
+          // …and the WORD-SCAN pins (A53–A64) must go RED: with the break set back to
+          // the whitespace class the delimiter is a strict PREFIX, so the body runs past
+          // its real terminator and the LOCAL tail disappears from the text every gate reads.
+          {
+            const mutCG0 = await import(pathToFileURL(join(mutIndex, "..", "classify-git.mjs")).href);
+            const cr = mutCG0.stripRemoteContexts(`cmux vm exec cell-a -- bash <<EOS\rX\nEOS\rX\n${RESET}\nEOS`);
+            expectTrue("M4  A61 CR in the delimiter: the LOCAL tail disappears (A61 goes RED)",
+              !cr.includes(RESET), JSON.stringify(cr));
+          }
+          // …and the THIRD delimiter reader (A71–A73) must go RED too: with the word
+          // scan reverted to the whitespace class, a CR delimiter truncates to a prefix,
+          // the python body runs past its real terminator, and the write is NOT resolved.
+          {
+            const mutCG = await import(pathToFileURL(join(mutIndex, "..", "classify-git.mjs")).href);
+            const dir = realpathSync(mkdtempSync(join(tmpdir(), "rc-m4-py-")));
+            const cmd = `python3 - <<EOS\rX\ns = """\nEOS\n"""\nopen("tracked.txt","w").write("x")\nEOS\rX`;
+            const hits = mutCG.bashWriteTargetsResolved(cmd, dir).map((x) => x.resolvedPath);
+            expectTrue("M4  A71 python-stdin heredoc: with the word scan reverted the write is NOT resolved (A71 goes RED)",
+              !hits.includes(join(dir, "tracked.txt")), JSON.stringify(hits));
+            rmSync(dir, { recursive: true, force: true });
+          }
+          // …and the FOURTH reader (A75–A77) must go RED too.
+          {
+            const mutCG2 = await import(pathToFileURL(join(mutIndex, "..", "classify-git.mjs")).href);
+            const found = mutCG2.extractWorkingTreeDiscards("cat <<EOS\rX\nbody\nEOS\rX\ngit checkout -- dirty.txt").length > 0;
+            expectTrue("M4  A75 heredoc masker: with its word scan reverted the discard is INVISIBLE (A75 goes RED)", !found);
           }
         } finally {
           process.chdir(prevCwd);

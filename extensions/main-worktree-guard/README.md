@@ -677,10 +677,11 @@ for the same reason; 10 is a deliberate OVER-BLOCK that cannot hide a discard):
    fail-closed rather than allowed (see the payload paragraphs below). That is a
    refusal, not a reading, and it is listed here because it can over-block a
    command that runs nothing.
-8. A heredoc delimiter that the SHELL would EXPAND (`<<$X`, ``<<`cmd` ``, `<<\X`) is
-   not recognised by the masker, so such a body is scanned as code (unchanged; its
-   terminator cannot be known statically — the same reason residual 2 needs
-   builtin-aware tracking).
+8. A heredoc delimiter that this masker does not reconstruct (`<<$X`, ``<<`cmd` ``, `<<\X`)
+   is not recognised, so such a body is scanned as code. Bash performs QUOTE REMOVAL
+   ONLY on the delimiter word — it does not expand it — so the terminator IS the literal
+   word; the masker simply does not reconstruct every spelling, and scanning the body as
+   code is the fail-closed side of that gap (it can over-block, never hide a write).
 9. Measured, PRE-EXISTING (`origin/main`-identical), NOT closed here — named so they
    are not mistaken for coverage:
    * an ESCAPED or ANSI-C `$` in a deferred payload (`bash -c "\$P"`, `bash -c $'\x24P'`)
@@ -692,9 +693,14 @@ for the same reason; 10 is a deliberate OVER-BLOCK that cannot hide a discard):
      that verdict exactly (see the payload paragraphs).
 
 10. Two measured OVER-BLOCKS, taken deliberately because the alternative is a fail-open:
-   * a heredoc delimiter with an ESCAPED trailing space (`cat <<EOF\ `) really makes the
-     rest of the command body, so nothing runs — but the masker ends the body at a line
-     `EOF` and reads a later line as code. Over-block only: in that shape bash runs nothing.
+   * a heredoc delimiter with an ESCAPED trailing space (`cat <<EOF\ `): bash's delimiter
+     IS `EOF ` (the escaped space is part of the word), so the lines AFTER an `EOF ` line
+     really run. Every masker now reads the delimiter through `heredocDelimiterAt`
+     (`_wtMaskHeredocBodies`, the `bashWriteTargetsResolved` walk and its python-stdin arm,
+     and `_wtScanLine` → `stripHeredocData`), so all of them end the body at bash's
+     terminator (#3444 review cycle 4, measured before the change: a following
+     `ls > tracked.txt` was invisible to the tracked-write gate, and `<<EOS\rX`, `<<EO{F`
+     and `<<E"O"S` each hid a real `git checkout -- dirty.txt` from the M5 discard gate).
    * an ESCAPED `$` in a payload whose name holds the discarding script (`bash -c "\$P"`)
      gives the child a literal unset `$P`, so the substituted spelling blocks a command that
      runs nothing — but the EXPORTED form (`export P=./undo.sh; bash -c "\$P"`) really does
@@ -1706,6 +1712,8 @@ classifier and the full invocation walk).
 | `. <file>` in ANY command position (after a newline, `builtin . …`, `command . …`, `\. …`, `{ . …; }`, `! . …`) | **not exempt** | the ban must hold wherever a command word can sit — the previous rule only read string start and `;&\|`, so a sourced `ssh()` built the shadow one line down (review cycle 3b, measured: the reset ran HERE) |
 | `x=eval; $x 'ss''h() { … }'; ssh …` (assignment indirection) | **not exempt** | a variable ASSIGNED the resolution builtin is the same constructed-definition channel one hop further out (review cycle 3b, measured) |
 | `ssh -o KnownHostsCommand=…` | **not exempt** | it runs a LOCAL command during host-key verification, like `ProxyCommand` (measured on OpenSSH 9.6p1) |
+| a delimiter word containing `\r`, `\v`, `\f` or NBSP (`<<EOS\rX`) | **the tail stays gated** | `\s` is NOT bash's blank set — those four are ordinary WORD characters, so a scan that stops at them computes a strict PREFIX and bash terminates the body EARLY while we keep scanning (measured: both a LOCAL reset AND a LOCAL tracked write laundered) |
+| `e''val …` / `sourc""e …` / `x="eval"; $x …` | **not exempt** | bash DEQUOTES the word, so a quote-split builtin or a quoted assignment value resolves the same channel; the ban reads words dequoted and in command position (#3444 review cycle 4) |
 
 **The separator is REQUIRED.** `ssh host git …` (no `--`) is NOT recognised:
 the boundary must be explicit to be provable. Likewise `ssh -- git …` (no host
@@ -1731,11 +1739,16 @@ be redefined is a name that can resolve locally. (h) A leading command-RESOLUTIO
 assignment (`PATH=… ssh …`) and ssh's own local-execution/local-file argv
 (`-o ProxyCommand|LocalCommand|PermitLocalCommand`, `-F`, `-E`) keep the segment
 gated: the transport word is no longer provable (#3444 review cycle 3). (i) The
-heredoc delimiter is scanned as a shell WORD (escapes, quotes, line continuation),
-but a delimiter the SHELL would EXPAND (`<<$X`, `` <<`cmd` ``) stays unprovable and
-gated. (j) `.`/`eval`/`source` are banned in every command position, but a
-resolution builtin reached through an UNASSIGNED expansion (`$X` where `X` only
-becomes `eval` inside a function body) is still out of surface.
+heredoc delimiter is scanned as a shell WORD with bash's BLANK-ONLY terminator set
+(` \t\n` plus the metacharacters) by ONE shared function, `heredocDelimiterAt`, which
+every reader consumes (the remote-context stripper, the tracked-write walk and its
+python-stdin arm, `index.ts`'s masker, and `_wtScanLine` → `stripHeredocData`), so no
+two of them can disagree about where a body ends; a LINE-CONTINUED delimiter (`<<EOS\`
+at EOL) or a `$'…'` value leaves the heredoc unprovable and gated/unmasked. (j) The
+resolution builtins are read through quoting (`e''val`, `x="eval"`, `export
+x='.'`), but a resolution builtin reached through an UNASSIGNED expansion (`$X`
+where `X` only becomes `eval` inside a function body) or through an ANSI-C escape
+(`x=$'.'`, `$'\x2e' f`) is still out of surface.
 
 **A limitation of the premise, stated rather than implied.** The exemption
 assumes the transport really leaves this box. `ssh localhost -- …` and
@@ -1758,7 +1771,7 @@ fix in four independent ways and requires the paired pins to go RED:
 | M1 | the RECOGNISER (`stripRemoteContexts` → identity) | A1–A6, and the classifier's verdict on the surviving text |
 | M2 | the CALL SITE (the handler's strip → identity, in a temp copy of `index.ts`) | the four measured field cases, at the real handler |
 | M3 | the strip's PROOF (delimiter value, `$'…'` bail, unprovable-heredoc bail, redefinition bail, bare-word head) | B15–B21, B24, B25 — the fail-open shapes both review cycles found |
-| M4 | the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the resolution-variable prefix refusal, ssh's local-execution argv refusal, the heredoc delimiter's WORD scan, the `.`-command ban, `KnownHostsCommand`) | B27–B30, B33–B35 — a LOCAL reset/write read as remote, a PATH-shimmed transport, `ssh -o ProxyCommand`, an escaped-space delimiter, a sourced definition, `-o KnownHostsCommand` |
+| M4 | the CYCLE-3/4 proofs (ANSI-C `$'…'` parsing, the resolution-variable prefix refusal, ssh's local-execution argv refusal, the heredoc delimiter's WORD scan and its blank-only terminator set, the `.`-command ban, the quoted resolution spellings, `KnownHostsCommand`) | B27–B30, B33–B39 — a LOCAL reset/write read as remote, a PATH-shimmed transport, `ssh -o ProxyCommand`, an escaped-space/CR/NBSP delimiter, a sourced or quote-split definition, `-o KnownHostsCommand` |
 
 M1/M2 cannot redden the fail-open pins (`identity` is *stricter*); M3 and M4
 exist so a guard that keeps local text gateable has mutation evidence too.

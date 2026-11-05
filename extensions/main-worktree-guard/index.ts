@@ -211,6 +211,11 @@ let stripHeredocData: (text: string, codeBodies?: unknown[] | null) => string = 
 // all-local gating, which is the fail-CLOSED direction (never a silent
 // relaxation of every gate at once).
 let stripRemoteContexts: (command: string) => string = (c) => c;
+// #3444 (review cycle 4): the ONE heredoc-delimiter word scanner, shared with the
+// remote-context stripper. Fail-safe default: null = "no heredoc seen", i.e. the
+// body is scanned as CODE — the fail-closed direction (a masker that masks too
+// little over-blocks; one that masks too much HIDES a local write).
+let heredocDelimiterAt: (text: string, from: number) => { delim: string | null; dash: boolean; end: number; continuation: boolean } | null = () => null;
 // #618/#621: TARGET-aware checkout classification (the shared mechanism both
 // hub-write issues consume). Fail-safe defaults: inert (null/[]) so a failed
 // import NEVER false-blocks — the write gates degrade to today's behavior.
@@ -366,6 +371,7 @@ try {
   // by test-module-load.mjs Part A. A missing export leaves the identity, so a
   // stale module keeps TODAY's gating rather than relaxing it.
   if (typeof _m5.stripRemoteContexts === "function") stripRemoteContexts = _m5.stripRemoteContexts;
+  if (typeof _m5.heredocDelimiterAt === "function") heredocDelimiterAt = _m5.heredocDelimiterAt;
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
@@ -1754,11 +1760,17 @@ function _wtMaskHeredocBodies(text: string): string {
         // and the identifier-shaped `cat <<< x` was ALREADY open on origin/main). Hence
         // `line[c - 1] !== "<"` as well: an opener starts at the FIRST `<` of its run.
         if (arith === 0 && ch === "<" && line[c + 1] === "<" && line[c + 2] !== "<" && line[c - 1] !== "<") {
-          const hm = /^<<-?\s*(?:'([^']*)'|"([^"]*)"|([^\s;&|<>()'"`$\\]+))/.exec(line.slice(c));
-          if (hm) {
-            const delim = hm[1] ?? hm[2] ?? hm[3] ?? "";
-            if (delim) hits.push({ delim, strip: /^<<-/.test(hm[0]) });
-          }
+          // ⛔ ONE heredoc-word scanner (#3444 review cycle 4). The regex this replaced
+          // read the delimiter with a `\s`-superset word class and refused `$`/`\`, so
+          // `<<EOS\rX` (also `\v`, `\f`, NBSP) computed a strict PREFIX of bash's
+          // delimiter: bash ends the body EARLY and runs the next lines as COMMANDS while
+          // this masker swallowed them, so a LOCAL `ls > tracked.txt` was invisible to the
+          // tracked-write gate (measured ALLOWED at the real handler). The word is now read
+          // by the same scanner the remote-context arm uses; a LINE-CONTINUED word
+          // (`<<EOS\` at EOL) or an unprovable value leaves the heredoc UNMASKED, which
+          // scans the body as code — the fail-closed direction.
+          const hd = heredocDelimiterAt(line, c + 2);
+          if (hd && hd.delim && !hd.continuation) hits.push({ delim: hd.delim, strip: hd.dash });
         }
         atWordStart = /\s/.test(ch);
       }
