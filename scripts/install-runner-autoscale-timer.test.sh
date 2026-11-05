@@ -2060,6 +2060,13 @@ fi
 OUT="$(run_install Linux "$D6" --install)"; RC=$?
 assert_eq "$RC" 1 "an adopted pin containing a BACKSLASH is REFUSED (the readiness verb refuses the same artifact)"
 assert_contains "$OUT" "contains a backslash" "naming the renderer rule it breaks"
+# ⛔ AND THE READER'S BACKSLASH RULE IS ITS OWN RULE: the writer's refusal above justifies itself with "the
+# readiness verb refuses the same artifact", so that half needs a case too (measured before: deleting the
+# reader's backslash rule left the suite green, while the whitespace one reds it). The artifact is
+# hand-written here because the WRITER now refuses to create this state — which is the point.
+OUT="$(run_install Linux "$D6" --status)"; RC=$?
+assert_eq "$RC" 1 "and --status refuses that SAME artifact, which is what the writer's message promises"
+assert_contains "$OUT" "BACKSLASH" "naming the backslash rule in the reader"
 # ⛔ AND THE PREVIEW/DISARM PATH DOES NOT HIDE IT: `--disarm` renders DISARMED (the pin is inert), so it must
 # still succeed — that exemption is separately pinned below.
 # ⛔ AND THE MAC ARM MUST NOT BE A FALSE BLOCK: a plist <string> is neither split on whitespace nor
@@ -2070,9 +2077,15 @@ D7="$T/c67g"; fresh "$D7"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
 run_install Darwin "$D7" --install >/dev/null 2>&1; ENVV=()
 box_sed_i "s|<string>$PROV3</string>|<string>$SPDIR/inst.sh</string>|g" "$D7/$LABEL.plist"
+# ⛔ PRECONDITION, because these assertions expect rc=0: a NO-OP edit would satisfy them for the wrong
+# reason (measured before this was added: replacing both Mac-arm edits with no-ops left `PASS=493 FAIL=0`).
+assert_eq "$(plist_env "$D7/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$SPDIR/inst.sh" \
+    "precondition: the whitespace pin landed in the PLIST"
 OUT="$(run_install Darwin "$D7" --install)"; RC=$?
 assert_eq "$RC" 0 "a launchd pin containing whitespace is NOT refused (no false block on the Mac arm)"
 box_sed_i "s|<string>$SPDIR/inst.sh</string>|<string>$PCTDIR/inst.sh</string>|g" "$D7/$LABEL.plist"
+assert_eq "$(plist_env "$D7/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$PCTDIR/inst.sh" \
+    "precondition: the '%' pin landed in the PLIST (a no-op edit would make the next line meaningless)"
 OUT="$(run_install Darwin "$D7" --install)"; RC=$?
 assert_eq "$RC" 0 "nor is a launchd pin containing '%' (a plist is not specifier-expanded)"
 # ⛔ AND `--disarm` IS EXEMPT: it renders DISARMED, so the pin is inert — refusing there did not protect
