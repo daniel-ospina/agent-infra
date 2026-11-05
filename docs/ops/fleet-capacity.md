@@ -248,7 +248,9 @@ idle across four running cells.
 line, emitted on every controller cycle EXCEPT the fork-exhausted one (that arm must be built from
 shell builtins, because a failed fork terminates the shell — the box is visible through its peers'
 lines instead) and on every drainer tick that OWNS THE LOCK (so a tick that skips a guard still
-reports the fleet):
+reports the fleet). A **HELD** cycle still reports it: the disk-floor hold emits the line before its
+nap, because a box holding for bytes is exactly a *skipping* cycle and grepping `fleet:` on it must not
+read as "instrument not deployed".
 
 ```
 fleet: expected=5 published=3 INELIGIBLE=3 extra=1 (pi-cell-3, pi-cell-4, pi-cell-1) src=cmux
@@ -316,22 +318,42 @@ completeness, so a `$( )` caller still gets the reading.
 
 Seams (all opt-in; a box that sets none calls the provider): `CAP_EXPECTED_BOXES`, `CAP_EXPECTED`,
 `CAP_CMUX_BIN` (path to the provider CLI), `CAP_CMUX_LIST` (an operator's own inventory command line,
-e.g. a bounded wrapper). The `cmux` call is unbounded on purpose (`timeout` does not exist on macOS; see
-`scripts/check-portability-traps.sh`'s `timeout-absent-on-macos`), and the sibling reader
-`lane-artifacts.sh` calls `cmux vm list` the same way.
+e.g. a bounded wrapper), `CAP_INVENTORY_TIMEOUT` (seconds, default 10).
+
+⛔ **THE INVENTORY CALL IS BOUNDED, AND A TIMEOUT IS A NAMED READING.** `cmux vm list --json` is a
+NETWORK call: unbounded, a wedged provider hangs the **drainer tick that holds the lock** — every later
+tick then exits `SKIP: drainer already running` and the box stops topping up — and it sits on every
+controller cycle. `timeout` is GNU and macOS ships it nowhere, so the bound walks `timeout` →
+`gtimeout` → a bash-native watchdog (the same contract as `repo-authority.sh`'s `_gh_bounded`); a
+timeout reads `provider-inventory-unreadable(<cmd> timed out after <n>s)`, never a quiet fleet. The
+sibling reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this
+line's path.
 
 A provider that lists **zero** running machines reads as `provider-inventory-unparseable`, not
 `expected=0`: the reader cannot tell an empty listing from one it failed to parse, and guessing zero
 would hide the parse failure (an operator in that state pins `CAP_EXPECTED=0`, which is an explicit
-claim rather than an inference).
+claim rather than an inference). The same rule covers a machine the extractor **cannot classify**: only
+a status READ as `stopped` is treated as parked, and an unreadable/unknown status (or a case variant
+such as `Running`) refuses the WHOLE listing rather than shrinking `expected` — a smaller denominator
+reads as a whole fleet, which is the false PASS this line exists to kill.
+
+⛔ **A CELL HAS NO PROVIDER CLI, SO A CELL MUST PIN ITS EXPECTATION.** `cmux vm list` exists on the Mac
+that runs the VMs; a cell is a headless Linux VM with no app and no `cmux` binary
+(`pi-bootstrap/cell-install.sh`). With no seam set, a cell's line therefore reads
+`expected=UNKNOWN published=N INELIGIBLE=unknown why=provider-inventory-unavailable` on every cycle —
+the fail-closed direction, and information-free. That is honest, not healthy: **the reconciliation only
+produces a number where an expectation exists.** A cell that should reconcile must pin
+`CAP_EXPECTED_BOXES` (`pi-cell-1:10.238.144.2,pi-cell-2:10.238.144.6,…`, the roster whose keys are the
+very `network.ipv4` values `cap_boxid` publishes under) or, if only the count is known,
+`CAP_EXPECTED=<n>` (which reports `INELIGIBLE=unknown`, because a count cannot name who is missing).
 
 owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
 `cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —
 no second read) and `ai-drainer.sh` (once per tick that owns the lock, **before** any guard that can
 skip, so a skipping tick still reports the fleet). The controller emits it on every cycle with a
-READABLE probe — including the cycle whose own probe failed — and deliberately not on the
-fork-exhausted cycle, which is built from shell builtins only because a failed fork terminates the
-shell; a fork-starved box is seen by its PEERS' lines instead.
+READABLE probe — including the cycle whose own probe failed — plus the DISK-HELD cycle, and
+deliberately not on the fork-exhausted cycle, which is built from shell builtins only because a failed
+fork terminates the shell; a fork-starved box is seen by its PEERS' lines instead.
 
 ## 7. The self-dispatch proof
 

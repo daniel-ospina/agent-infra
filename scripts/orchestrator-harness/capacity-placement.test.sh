@@ -1426,10 +1426,18 @@ ck "(i) an explicit COUNT reports expected=4 and INELIGIBLE=unknown — never a 
 # ⛔ AND BOTH BRANCHES THAT HAVE A READING MUST EMIT IT (review round 3): a `grep -q` can only see that
 # SOME site exists, so deleting the probe-unreadable emission — the whole point of the round-2 addition —
 # left this arm green. The count is asserted, and then the branch membership structurally.
-ck "(j) orch-loop.sh emits the line on BOTH branches that have a reading (normal cycle AND probe-unreadable)" \
-   "$([ "$(grep -cF 'cap_fleet_line_from "${CAP_FLEET:-}"' "$LOOP")" -eq 2 ] && qF 'CAP_FLEET_RC=$?' "$(cat "$LOOP")" && echo 0 || echo 1)"
+ck "(j) orch-loop.sh emits the line on EVERY cycle arm that has a reading (healthy, probe-unreadable, disk-held)" \
+   "$([ "$(grep -cF 'cap_fleet_line_from "${CAP_FLEET:-}"' "$LOOP")" -eq 3 ] && qF 'CAP_FLEET_RC=$?' "$(cat "$LOOP")" && echo 0 || echo 1)"
 ck "  …the second emission is INSIDE the probe-unreadable branch (a box whose own probe failed still reports the fleet)" \
    "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{exit} f && /\$\(cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
+# ⛔ AND THE HEALTHY-CYCLE HALF IS ASSSERTED STRUCTURALLY, NOT BY A FILE-WIDE COUNT (fresh review, P2).
+# `grep -c == 2` cannot tell the two byte-identical emissions apart: MOVING the healthy-cycle call into
+# another branch (e.g. the fork-exhausted arm, as a plausible future "fix" for that cycle going silent)
+# keeps the count at 2 and keeps the elif-arm green while the normal cycle is silent.
+ck "  …the FIRST emission is inside the healthy (else) arm — not merely counted somewhere in the file" \
+   "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{f=2; next} f==2 && /CAP_VERDICT=/{exit} f==2 && /\$\(cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
+ck "  …and the DISK-HELD cycle reports the fleet too (a skipping cycle is not a silent one)" \
+   "$(awk '/^  if \[ "\${_df_rc:-0}" = "1" \]; then/{f=1; next} f && /^    continue$/{exit} f && /\$\(cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
 ck "  …and cap_place still receives that same read (the line cannot disagree with placement about who is visible)" \
    "$(qF 'printf '"'"'%s\n'"'"' "${CAP_FLEET:-}" "$CAP_REC" | cap_place' "$(cat "$LOOP")" && echo 0 || echo 1)"
 DRAINER="$HERE/ai-drainer.sh"
@@ -1528,6 +1536,47 @@ ck "(r) an inventory with NO running machine is expected=UNKNOWN why=provider-in
 L18M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-empty-inventory-ok.sh" 2>&1)"
 ck "  …mutation control: let an empty inventory answer 'zero boxes' and the SAME assertion no longer holds ($L18M)" \
    "$(qF 'expected=UNKNOWN' "$L18M" && qF 'why=provider-inventory-unparseable' "$L18M" && echo 1 || echo 0)"
+# (s) ⛔ A MACHINE THE EXTRACTOR CANNOT CLASSIFY IS FATAL FOR THE WHOLE LISTING (fresh review, P1).
+# Treating an unreadable/unknown `status` like `stopped` SHRANK the denominator silently — measured on a
+# four-machine listing where one carried `"status":"Running"`: `expected=2 … INELIGIBLE=1`, rc 0, no
+# `why=`, two running boxes dropped. A smaller `expected` reads as a whole fleet, which is the exact
+# false PASS #3446 exists to kill. Only a status READ as `stopped` is parked.
+INVU="$TMP/inventory-3446-unclassified.json"
+printf '%s\n' '{"machines":[{"id":"vm-1","name":"pi-cell-1","status":"running","network":{"ipv4":"10.0.0.1"}},{"id":"vm-2","name":"pi-cell-2","status":"Running","network":{"ipv4":"10.0.0.2"}}]}' > "$INVU"
+L19="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INVU" cap_fleet_line_from "" 0)"; RC=$?
+I19="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INVU" cap_fleet_inventory 2>&1)"; IRC=$?
+# The line carries the TOKEN (`why=<reason>`); the parenthesised detail — which is where the count lives
+# — is `cap_fleet_inventory`'s own answer, so it is asserted there rather than parsed off the line.
+ck "(s) a machine whose status cannot be classified refuses the WHOLE listing — never a smaller expected ($L19)" \
+   "$([ "$RC" -eq 1 ] && qF 'expected=UNKNOWN' "$L19" && qF 'why=provider-inventory-unparseable' "$L19" && ! qF 'expected=1' "$L19" && echo 0 || echo 1)"
+ck "  …and the reason NAMES how many objects it could not classify (rc=$IRC: $I19)" \
+   "$([ "$IRC" -eq 1 ] && qF '1 machine object(s) could not be classified' "$I19" && echo 0 || echo 1)"
+# (s-mutant) NON-VACUITY: revert the classification guard in a COPY (the pre-fix `!= running => skip`)
+# and the same listing must read `expected=1` — i.e. (s)'s own predicate no longer holds.
+sed 's/if (st != "running") { bad++; continue }/if (st != "running") continue/' "$CAP" > "$TMP/cap-skip-unclassified.sh"
+L19M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INVU" bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-skip-unclassified.sh" 2>&1)"
+ck "  …mutation control: skip what cannot be classified and the SAME listing reads expected=1 ($L19M)" \
+   "$(qF 'expected=1' "$L19M" && ! qF 'expected=UNKNOWN' "$L19M" && echo 0 || echo 1)"
+# (t) ⛔ THE PROVIDER CALL IS A NETWORK CALL AND IS BOUNDED (fresh review, P2). Unbounded, a wedged
+# provider hangs the DRAINER TICK WHILE IT HOLDS THE LOCK — every later tick then exits `SKIP: drainer
+# already running` and the box stops topping up — and it sits on every controller cycle. `timeout` is
+# GNU and macOS ships it nowhere, so the bound walks timeout -> gtimeout -> a bash watchdog.
+_t0="$(date +%s)"
+L20="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="sleep 12" CAP_INVENTORY_TIMEOUT=1 cap_fleet_line_from "" 0)"
+I20="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="sleep 12" CAP_INVENTORY_TIMEOUT=1 cap_fleet_inventory 2>&1)"
+_t1="$(date +%s)"; _dt=$(( _t1 - _t0 ))
+ck "(t) a hanging provider is reported in ${_dt}s (bound honoured, no wedged lock-holder) ($L20)" \
+   "$([ "$_dt" -lt 10 ] && qF 'expected=UNKNOWN' "$L20" && qF 'why=provider-inventory-unreadable' "$L20" && echo 0 || echo 1)"
+ck "  …and the reason names the TIMEOUT and the bound, not a refused provider ($I20)" \
+   "$(qF 'timed out after 1s' "$I20" && echo 0 || echo 1)"
+# (t-mutant) NON-VACUITY: drop the bound in a copy and the SAME call takes the provider's full 12s —
+# which is what a wedged provider would cost the tick that owns the lock.
+{ cat "$CAP"; printf '\ncap_bounded() { shift; "$@"; }\n'; } > "$TMP/cap-unbounded.sh"
+_t0m="$(date +%s)"
+L20M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="sleep 12" CAP_INVENTORY_TIMEOUT=1 bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-unbounded.sh" 2>&1)"
+_t1m="$(date +%s)"; _dtm=$(( _t1m - _t0m ))
+ck "  …mutation control: with the bound removed the same call takes ${_dtm}s (so (t) is load-bearing)" \
+   "$([ "$_dtm" -ge 11 ] && echo 0 || echo 1)"
 
 
 echo

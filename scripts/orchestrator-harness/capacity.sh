@@ -285,6 +285,13 @@ CAP_EXPECTED_BOXES="${CAP_EXPECTED_BOXES:-}"   # explicit roster: `<label>:<boxi
 CAP_EXPECTED="${CAP_EXPECTED:-}"               # explicit expected COUNT (names unattributable)
 CAP_CMUX_BIN="${CAP_CMUX_BIN:-}"               # path to the provider CLI (default: resolved)
 CAP_CMUX_LIST="${CAP_CMUX_LIST:-}"             # the inventory command LINE (default: `<cmux> vm list --json`)
+# ⛔ THE INVENTORY CALL IS A NETWORK CALL AND IT IS BOUNDED (fresh review, P2). `cmux vm list --json`
+# talks to the provider; unbounded, a wedged provider hangs the DRAINER TICK THAT HOLDS THE LOCK — every
+# later tick then exits `SKIP: drainer already running` and the box stops topping up entirely — and it
+# sits on every controller cycle too. `timeout` is GNU and macOS ships it nowhere, so the bound is
+# `timeout` -> `gtimeout` -> a bash-native watchdog (the same contract as `repo-authority.sh`'s
+# `_gh_bounded` for the identical macOS constraint). A timeout is a NAMED reading, never a zero.
+CAP_INVENTORY_TIMEOUT="${CAP_INVENTORY_TIMEOUT:-10}"  # seconds
 CAP_NS="${CAP_NS:-refs/boxes}"                 # the namespace peers publish under
 CAP_HOST="${CAP_HOST:-}"                       # identity seam (default: hostname -s)
 CAP_BOXID="${CAP_BOXID:-}"                     # per-box identity seam (default: derived, see cap_boxid)
@@ -1191,13 +1198,40 @@ cap_cmux_bin() {
   return 1
 }
 
+# cap_bounded <secs> <cmd...> — `timeout` -> `gtimeout` -> a bash-native watchdog (rc 124 on timeout).
+# ⛔ THE THIRD ARM IS THE macOS CASE, NOT A COURTESY: `timeout` is GNU coreutils and macOS ships it
+# nowhere (`gtimeout` only with Homebrew), so on the platform this fleet runs its inventory from neither
+# of the first two can fire. The watchdog's own output is redirected because a `$( )` caller reads until
+# every holder of the pipe's write end closes it — a bare `( sleep; kill ) &` would turn a bound into a
+# `sleep <secs>` floor on every healthy probe. No `sleep` at all => run direct rather than fake a 124.
+cap_bounded() {
+  local s="${1:-}"; shift 2>/dev/null || true
+  [ "$#" -gt 0 ] || return 2
+  case "$s" in ''|*[!0-9]*) s=10 ;; esac
+  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
+  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
+  command -v sleep >/dev/null 2>&1 || { "$@"; return $?; }
+  local _p _w _rc
+  "$@" & _p=$!
+  { sleep "$s"; kill -9 "$_p"; } >/dev/null 2>&1 & _w=$!
+  wait "$_p" 2>/dev/null; _rc=$?
+  if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
+  return "$_rc"
+}
+
 # cap_parse_inventory — PURE: the provider's machine listing (JSON) on stdin -> `<name> <ipv4|->` per
 # RUNNING machine, in listing order. rc 1 when the input carried no machine it could read.
 # ⛔ IT IS A FIELD EXTRACTOR, NOT A JSON PARSER, AND IT REFUSES RATHER THAN GUESSES. The listing is a
 # flat array of flat machine objects (`name`, `status`, `network:{ipv4,…}`), so each object is split on
-# `},{` and two string fields are read. An object this cannot read is SKIPPED (never invented), a
-# missing `ipv4` is reported as `-` (a real state: the box is expected, its key is underivable), and
-# "nothing readable" is rc 1 so the caller can say `expected=UNKNOWN` instead of `expected=0`.
+# `},{` and two string fields are read. A missing `ipv4` is reported as `-` (a real state: the box is
+# expected, its key is underivable), and "nothing readable" is rc 1 so the caller can say
+# `expected=UNKNOWN` instead of `expected=0`.
+# ⛔ AN OBJECT IT CANNOT **CLASSIFY** IS FATAL FOR THE WHOLE LISTING (fresh review, P1). Treating an
+# unreadable/absent `status` (or an absent `name`) like `stopped` shrank the denominator silently:
+# MEASURED on a listing of four running machines where one carried `"status":"Running"` and one
+# carried no `status` key at all — `expected=2 published=1 INELIGIBLE=1 (pi-cell-3)`, rc 0, no `why=`,
+# two running boxes DROPPED. A smaller `expected` reads as a whole fleet, which is the exact false PASS
+# this line exists to kill; only a `status` that WAS READ as something other than `running` is parked.
 # ⛔ `status` IS PART OF THE TEST: a STOPPED machine is not expected to publish, so counting it would
 # manufacture an INELIGIBLE out of a box the operator deliberately parked.
 cap_parse_inventory() {
@@ -1214,35 +1248,62 @@ cap_parse_inventory() {
     END {
       if (buf == "") exit 1
       n = split(buf, m, /}[ \t]*,[ \t]*\{/)
-      got = 0
+      got = 0; bad = 0; acc = ""
       for (i = 1; i <= n; i++) {
-        if (jget(m[i], "status") != "running") continue
+        # A fragment carrying neither machine field is not a machine object (the wrapper head, or an
+        # empty array) — that is not an unclassifiable OBJECT.
+        if (m[i] !~ /"name"[ \t]*:/ && m[i] !~ /"status"[ \t]*:/) continue
+        st = jget(m[i], "status")
         nm = jget(m[i], "name")
-        if (nm == "") continue
+        if (st == "" || nm == "") { bad++; continue }
+        # ⛔ ONLY A STATUS THAT WAS **READ** AS `stopped` IS PARKED. Anything else that is not
+        # literally `running` (a case variant, a status this extractor has never seen, a `starting`)
+        # is UNCLASSIFIABLE, not parked: dropping it shrinks `expected`, and a smaller denominator
+        # reads as a whole fleet — the exact false PASS this line exists to kill.
+        if (st == "stopped") continue
+        if (st != "running") { bad++; continue }
         ip = jget(m[i], "ipv4")
-        printf "%s %s\n", nm, (ip == "" ? "-" : ip)
+        acc = acc nm " " (ip == "" ? "-" : ip) "\n"
         got = 1
       }
+      # ⛔ A REFUSED LISTING PRINTS NO PARTIAL LIST: the whole answer is UNKNOWN, so a caller can never
+      # read the objects it happened to classify as the fleet that exists. (The count rides on the one
+      # line the caller parses.)
+      if (bad > 0) { print "UNCLASSIFIED " bad; exit 1 }
       if (!got) exit 1
+      printf "%s", acc
     }'
 }
 
 # cap_fleet_inventory -> the provider's running boxes (`<name> <ipv4|->` lines, rc 0), or ONE line
 # `UNKNOWN <reason>` (rc 1). The reason is a TOKEN an operator can grep, plus a parenthesised detail.
 cap_fleet_inventory() {
-  local out rc bin cmd
+  local out rc bin cmd prc detail
   if [ -n "${CAP_CMUX_LIST:-}" ]; then
     # An operator-pinned command LINE (its own wrapper, possibly bounded). Word-split on purpose.
     # shellcheck disable=SC2086
-    out="$($CAP_CMUX_LIST </dev/null 2>/dev/null)"; rc=$?
+    out="$(cap_bounded "$CAP_INVENTORY_TIMEOUT" $CAP_CMUX_LIST </dev/null 2>/dev/null)"; rc=$?
     cmd="$CAP_CMUX_LIST"
   else
-    bin="$(cap_cmux_bin)" || { printf 'UNKNOWN provider-inventory-unavailable(no cmux: $CAP_CMUX_BIN, PATH and /Applications/cmux.app/Contents/Resources/bin all refused)\n'; return 1; }
-    out="$("$bin" vm list --json </dev/null 2>/dev/null)"; rc=$?
+    bin="$(cap_cmux_bin)" || { printf 'UNKNOWN provider-inventory-unavailable(no cmux: $CAP_CMUX_BIN, PATH and /Applications/cmux.app/Contents/Resources/bin all refused — a cell carries no provider CLI, so pin CAP_EXPECTED_BOXES or CAP_EXPECTED there)\n'; return 1; }
+    out="$(cap_bounded "$CAP_INVENTORY_TIMEOUT" "$bin" vm list --json </dev/null 2>/dev/null)"; rc=$?
     cmd="$bin vm list --json"
   fi
+  # ⛔ A TIMEOUT IS ITS OWN READING (rc 124, both the `timeout`/`gtimeout` arms and the watchdog agree),
+  # because "the provider did not answer in BOUNDED time" sends an operator somewhere different from
+  # "the provider refused".
+  [ "$rc" -ne 124 ] || { printf 'UNKNOWN provider-inventory-unreadable(%s timed out after %ss — CAP_INVENTORY_TIMEOUT)\n' "$cmd" "$CAP_INVENTORY_TIMEOUT"; return 1; }
   [ "$rc" -eq 0 ] || { printf 'UNKNOWN provider-inventory-unreadable(%s exited %s)\n' "$cmd" "$rc"; return 1; }
-  out="$(printf '%s' "$out" | cap_parse_inventory)" || out=""
+  out="$(printf '%s' "$out" | cap_parse_inventory)"; prc=$?
+  if [ "$prc" -ne 0 ]; then
+    # The parser names HOW MANY objects it could not classify; carry that onto the line rather than
+    # reporting the strictly weaker "nothing could be read" (which is also what a parked fleet says).
+    case "${out:-}" in
+      'UNCLASSIFIED '*) detail="${out#UNCLASSIFIED } machine object(s) could not be classified (an unreadable status or name) — a parse failure is not a parked fleet" ;;
+      *)                detail="no running machine could be read from it" ;;
+    esac
+    printf 'UNKNOWN provider-inventory-unparseable(%s answered, but %s)\n' "$cmd" "$detail"; return 1
+  fi
   case "${out:-}" in
     '') printf 'UNKNOWN provider-inventory-unparseable(%s answered, but no running machine could be read from it)\n' "$cmd"; return 1 ;;
   esac

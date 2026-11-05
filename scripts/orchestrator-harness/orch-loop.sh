@@ -3519,6 +3519,17 @@ while true; do
       printf '[cycle] disk_held (cycle-record.sh absent — this state is NOT recorded anywhere)\n' >> "$LOG" 2>/dev/null || true
     fi
     _nap="$(( 10#${CYC:-240} + (10#${CYC:-240} / 5) ))"
+    # ⛔ A HELD CYCLE STILL REPORTS THE FLEET (fresh review, P2 — agent-infra#3446). This `continue`
+    # exits ~2,200 lines BEFORE the capacity block, so a disk-held cycle used to emit no `fleet:` line
+    # at all while §6a and the harness README claimed the reading is taken on "every cycle except the
+    # fork-exhausted one". A box holding for disk is precisely a SKIPPING cycle — the state the line
+    # exists to keep visible — and grepping for `fleet:` on such a box read as "instrument not
+    # deployed". The fork-starved arm above is the ONE exclusion, for a different reason (it must be
+    # builtins-only); this arm already forks freely through `disk_floor_gate`.
+    if [ "${CAPACITY:-0}" = "1" ]; then
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
+      echo "[capacity] $(cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
+    fi
     fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
     continue
   fi
