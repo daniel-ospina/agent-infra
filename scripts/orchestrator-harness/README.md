@@ -555,11 +555,16 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     and then moved repository B's landing branch (reproduced: B's `refs/heads/trunk` moved
     `613382f..b4e6ab9` while the same terminal recorded `push=FAILED` "does NOT hold
     refs/heads/trunk"). `lane_end_push` therefore resolves origin's push url ONCE
-    (`git remote get-url --push --all origin`) and BOTH network READS address it; the push still goes
-    through `git push origin` so git's own rewrite is applied exactly once, as `cleanup-stale-branches.sh`
-    does for the same reason. A push url set that is not exactly one is `push=refused-pushurl-divergent`:
-    guessing which repository receives the ref is the fail-open this refusal exists to close. A DETACHED
-    head is `push=detached`:
+    (`git remote get-url --push --all origin`), **proves** it (`git ls-remote --get-url` must expand to the
+    same URL — otherwise a read of it is a FETCH, which re-applies `url.<base>.insteadOf` on top of the
+    resolved push url while `git push origin` does not, so the landing set and the verify would describe
+    repository C while the ref was written to B), and only then uses it for BOTH network reads; the push
+    still goes through `git push origin` so git's own rewrite is applied exactly once, as
+    `cleanup-stale-branches.sh` does for the same reason. An unprovable endpoint refuses:
+    `push=refused-pushurl-divergent` (more than one push url, or the expansion differs) and
+    `push=refused-pushurl-unresolved` (the resolution itself failed — including a checkout with no
+    `origin`, whose disagreement is NOT a divergence and gets its own remedy). A DETACHED head is
+    `push=detached`:
     nothing is invented, and the marker tells a reclaim pass to refuse that worktree. ⛔ **AND AN
     UNANSWERED VERIFY IS NOT AN ABSENT REF** — `push=verify-unanswered` means the push exited 0 and the
     verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
@@ -606,6 +611,7 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
     writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
     `branch`, `head`, `root`, `unpushed`, `push`, `branch_on_origin` (the sha the REMOTE reported),
+    `push_url` (the repository those verdicts are about, so a divergence is readable after the fact),
     `rescue`, `wip_ref`, `dirty`, `ended`, `next` (mechanically derived) and a `porcelain:` section. A
     path that returned BEFORE the measurement writes `state=not-measured` and `next=MANUAL — …did NOT
     measure`, never a clean bill of health: the hatch is an escape, not a licence to claim a reading
