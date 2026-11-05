@@ -783,13 +783,19 @@ nx4="$( bash -c '
   lane_end_next' _ "$GATE" 2>/dev/null )"
 case "$nx4" in MANUAL*"uncommitted work"*) rcn23d=0 ;; *) rcn23d=1 ;; esac
 ck "N23d …and a DIRTY tree with a refused push names the uncommitted work even when no rescue value is set (the weak branch-only sentence is no longer reachable over an un-archived tree)" $rcn23d
+# ⛔ N23e — A CLEAN TREE IS THE SAME RISK, SO IT GETS THE SAME KEYWORD (review cycle 11, P2 — the arm used
+# to pin the OPPOSITE). `refused-protected` on an `unpushed-only` tree returned a reporter sentence with no
+# `MANUAL`, while `refused-unknown-default` on the IDENTICAL state (commits on this disk only) is hoisted
+# into the MANUAL case — so a consumer filtering on this file's own MANUAL convention reclaimed the one
+# worktree and refused the other over the same fact. N23 was right that the rescue fact must not be
+# silenced; it was wrong that the branch fact may be spoken without the keyword.
 nx5="$( bash -c '
   . "$1"
   LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH=refused-protected
   LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
   lane_end_next' _ "$GATE" 2>/dev/null )"
-case "$nx5" in MANUAL*) rcn23e=1 ;; *"NOT pushed"*) rcn23e=0 ;; *) rcn23e=1 ;; esac
-ck "N23e …while a CLEAN (unpushed-only) tree keeps the short branch sentence — the union adds MANUAL only where a reclaim could destroy work" $rcn23e
+case "$nx5" in MANUAL*"NOT pushed"*"do NOT reap"*) rcn23e=0 ;; *) rcn23e=1 ;; esac
+ck "N23e …and a CLEAN (unpushed-only) tree with a refused push NOW gets MANUAL / do-not-reap too — the keyword follows the RISK (commits on this disk only), not the tree verdict [${nx5:0:72}]" $rcn23e
 # ⛔ N24 — A "ZERO" NOBODY READ IS NOT A MEASURED ZERO, IN THE MARKER TOO (review cycle 8, P2).
 # `LANE_END_UNPUSHED` is reset to `0` before the hatch can return, so a not-measured terminal wrote
 # `unpushed=0` — a count published as measured, one line above `state=not-measured`, in the artifact a
@@ -1483,5 +1489,84 @@ git -C "$BARE" rev-parse -q --verify refs/heads/twoterm >/dev/null 2>&1; rcn22e=
 ck "N22 a SECOND terminal in the SAME shell carries NO stale push verdict from the first (first genuinely pushed -> origin/twoterm $(git -C "$BARE" rev-parse --short refs/heads/twoterm 2>/dev/null); second: $(sed -n '2p' "$TMP/n22.out" 2>/dev/null | cut -c1-30))" \
   $([ "$rcn22a" -eq 0 ] && [ "$rcn22b" -eq 0 ] && [ "$rcn22c" -eq 0 ] && [ "$rcn22d" -eq 0 ] && [ "$rcn22e" -eq 0 ] && echo 0 || echo 1)
 echo
+# ── N30–N32 — REVIEW CYCLE 11: THREE PLACES THAT CLAIMED MORE THAN THEY MEASURED ────────────────
+# ⛔ N30 — AN UNANSWERED VERIFY IS NOT AN ABSENT REF (review cycle 11, P1 — REPRODUCED). The verifying
+# `ls-remote --heads` is the TIGHTEST bound on the exit path (5 s) and it decides the same question the
+# push just decided, so on a congested link a DELIVERED push was recorded `push=FAILED` together with
+# "$unpushed commit(s) are STILL only on this disk". The arm makes the remote ANSWER for the push and
+# says NOTHING for the verify — the exact split between "the ref is absent" and "nobody answered" — and
+# asserts both halves: the branch really IS on origin (so `FAILED` would be a fabricated absence), and
+# the artifact says UNVERIFIED rather than absent.
+git -C "$WT" worktree add -q "$TMP/wt9" -b verifyun 2>/dev/null
+git -C "$TMP/wt9" commit -q --allow-empty -m "unpushed for the verify-unanswered arm" 2>/dev/null
+mkdir -p "$TMP/bin-nohdr"
+{ printf '#!/bin/sh\ncase " $* " in *" ls-remote --heads "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-nohdr/git"
+chmod +x "$TMP/bin-nohdr/git"
+: > "$O/logs/unanswered.log"; rm -f "$O/state/lane-exit-unanswered.state"
+PATH="$TMP/bin-nohdr:$PATH" O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=verifyun
+  lane_end_push "unanswered" "$3" "$2" verifyun 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+  lane_end_next > "$4"
+  LANE_END_LOG="$3"; LANE_END_MARKER_FRESH=1
+  lane_end_marker "unanswered" 0 300
+' _ "$GATE" "$TMP/wt9" "$O/logs/unanswered.log" "$TMP/n30.next" > "$TMP/n30.out" 2>&1
+vhead="$(git -C "$TMP/wt9" rev-parse HEAD)"
+# NON-VACUITY: the push DID reach origin, so "still only on this disk" is exactly the false sentence here.
+git -C "$BARE" rev-parse -q --verify refs/heads/verifyun >/dev/null 2>&1 \
+  && [ "$(git -C "$BARE" rev-parse refs/heads/verifyun 2>/dev/null)" = "$vhead" ]; rcn30a=$?
+ck "N30a the fixture's push really DID land (origin/verifyun = $(git -C "$BARE" rev-parse --short refs/heads/verifyun 2>/dev/null), the lane's head) — so the verdict below is about the READ, not the push" $rcn30a
+grep -qx 'push=verify-unanswered' "$TMP/n30.out"; rcn30b=$?
+ck "N30b …and an UNANSWERED verifying read records push=verify-unanswered — never push=FAILED and never push=pushed (it measured NEITHER delivery nor loss)" $rcn30b
+! grep -q 'push=FAILED' "$TMP/n30.out" && grep -q 'did not answer' "$O/logs/unanswered.log"; rcn30c=$?
+ck "N30c …the log says the read did not answer, and nowhere claims the commits are 'STILL only on this disk'" $rcn30c
+case "$(cat "$TMP/n30.next" 2>/dev/null)" in MANUAL*"did NOT establish"*) rcn30d=0 ;; *) rcn30d=1 ;; esac
+ck "N30d …and next= is MANUAL / 'did NOT establish' — the worktree is still not reaped, but the artifact does not assert the absence it could not measure [$(cut -c1-60 "$TMP/n30.next" 2>/dev/null)]" $rcn30d
+grep -qx 'push=verify-unanswered' "$O/state/lane-exit-unanswered.state" 2>/dev/null; rcn30e=$?
+ck "N30e …and the MARKER carries the same verdict, so the artifact a reclaim pass reads agrees with the log" $rcn30e
+# ⛔ N31 — THE `archived-local` REPORTER MAY NOT ASSERT AN ABSENCE THE PUSH DID NOT MEASURE (review cycle
+# 11, P2 — REPRODUCED). It ended "…so the commits on <br> are not on origin either" WHATEVER the push did,
+# so with `push=pushed` the artifact contradicted its own `push=pushed` / `branch_on_origin=<sha>`. Same
+# class D4b closed in the lane LOG, left open in the artifact. Both fixed directions AND the untouched one
+# are asserted, so this cannot regress into either silence or over-claim.
+al_pushed="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=pushed
+  LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  LANE_END_ORIGIN=deadbeefcafe
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$al_pushed" in *"not on origin either"*) rcn31a=1 ;; *deadbeefcafe*) rcn31a=0 ;; *) rcn31a=1 ;; esac
+ck "N31a archived-local + push=pushed does NOT say the branch is missing from origin — it names the sha the remote reported [${al_pushed:0:70}]" $rcn31a
+al_nothing="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=nothing
+  LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$al_nothing" in *"not on origin either"*) rcn31b=1 ;; *'unpushed=0'*) rcn31b=0 ;; *) rcn31b=1 ;; esac
+ck "N31b …nor with push=nothing, where every commit on the head is already on a remote ref (unpushed=0) [${al_nothing:0:70}]" $rcn31b
+al_other="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=not-attempted
+  LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$al_other" in *"not on origin either"*) rcn31c=0 ;; *) rcn31c=1 ;; esac
+ck "N31c …while a push that was NOT attempted still says so — the branch fact is not silenced to make the wording easier [${al_other:0:60}]" $rcn31c
+# ⛔ N32 — THE CLEAN VERDICT CARRIES ITS OWN SCOPE (review cycle 11, P2). `clean` is measured over the paths
+# git does NOT ignore, and that caveat lived only in the lane LOG — which this file itself calls secondary.
+# A lane whose only copy of its work is an ignored file read `state=clean` and was handed an affirmative
+# "may be removed" with no scope attached.
+sc="$( bash -c '
+  . "$1"
+  LANE_END_TREE=clean; LANE_END_RESCUE=nothing; LANE_END_PUSH=pushed
+  LANE_END_UNPUSHED=0; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$sc" in *'does NOT ignore'*) rcn32a=0 ;; *) rcn32a=1 ;; esac
+ck "N32a the clean \"may be removed\" verdict names what it measured (the paths git does NOT ignore), so the artifact cannot state more safety than the enumeration covered" $rcn32a
+case "$sc" in *"may be removed once its PR is terminal"*) rcn32b=0 ;; *) rcn32b=1 ;; esac
+ck "N32b …and it is still an affirmative verdict where that is warranted — the scope was added, not the removal replaced by an abstention" $rcn32b
+echo
+
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
