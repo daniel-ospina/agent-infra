@@ -10318,41 +10318,100 @@ function _rbBacktickRegionEnd(s, from) {
   return close < 0 ? s.length : close + 1;
 }
 
-/** `'EOF'` / `"EOF"` / `\EOF` → `EOF` (the word the shell compares a heredoc
- *  terminator against). */
+/** SHELL QUOTE REMOVAL for a heredoc delimiter word: `'EOF'` / `"EOF"` /
+ *  `$'EOF'` / `$"EOF"` / `E"OS"` / `\EOF` → `EOF` (the word the shell compares a
+ *  terminator against). This is quote REMOVAL, not expansion: bash leaves
+ *  `$X`, `${X}`, `` `…` `` and `~` LITERAL in a delimiter (measured), and the
+ *  remover agrees.
+ *
+ *  ⛔ It must be real quote removal, not a pair of `slice(1, -1)` calls: `<<$'EOS'`
+ *  and `<<E"OS"` used to keep their quotes, so the terminator never matched, the
+ *  mask ran to end-of-string and every LOCAL command after the real terminator
+ *  was hidden (review #3478 cycle 4 P0).
+ *  @returns {string|null} null when the word holds a construct this remover
+ *    cannot resolve — the caller then leaves the command UNMASKED (fail-closed). */
 function _rbUnquoteDelim(word) {
-  let t = String(word ?? "").trim();
-  if (t.length >= 2 && (t[0] === "'" || t[0] === '"') && t[t.length - 1] === t[0]) t = t.slice(1, -1);
-  return t.replace(/\\/g, "");
+  const t = String(word ?? "").trim();
+  const ANSI = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\v", e: "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+  let out = "";
+  let i = 0;
+  while (i < t.length) {
+    const c = t[i];
+    if (c === "'") {                                  // single quotes: literal
+      const e = t.indexOf("'", i + 1);
+      if (e < 0) return null;
+      out += t.slice(i + 1, e);
+      i = e + 1;
+      continue;
+    }
+    if (c === '"') {                                  // double quotes: \ only for $ ` " \ and newline
+      i++;
+      let closed = false;
+      while (i < t.length) {
+        if (t[i] === "\\" && i + 1 < t.length && '$`"\\\n'.includes(t[i + 1])) { out += t[i + 1]; i += 2; continue; }
+        if (t[i] === '"') { closed = true; i++; break; }
+        out += t[i++];
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (c === "$" && t[i + 1] === "'") {              // ANSI-C quoting
+      i += 2;
+      let closed = false;
+      while (i < t.length) {
+        if (t[i] === "\\" && i + 1 < t.length) {
+          const nx = t[i + 1];
+          // `\c` in ANSI-C: a known escape maps, anything else is taken literally.
+          out += Object.prototype.hasOwnProperty.call(ANSI, nx) ? ANSI[nx] : nx;
+          i += 2;
+          continue;
+        }
+        if (t[i] === "'") { closed = true; i++; break; }
+        out += t[i++];
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (c === "$" && t[i + 1] === '"') { i++; continue; }   // $"…": the `"` branch handles the body
+    if (c === "\\") {
+      if (i + 1 >= t.length) return null;
+      out += t[i + 1]; i += 2; continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
 }
 
 /** The source range of a heredoc folded around `delim`: `bodyStart` is the first
- *  character of the BODY, `termStart` the first character of the TERMINATOR line
- *  and `afterTerm` the newline that ends it (or end-of-string when the terminator
- *  never appears — the shell would swallow the rest of the input too). The
- *  terminator line is NOT part of the body: masking it would leave a heredoc no
- *  downstream parser can close, and the next local command would be swallowed as
- *  body data (a fail-open).
+ *  character of the BODY (the caller supplies it from the TOKEN stream — the first
+ *  top-level newline token — because a `\`+newline continuation or a quote that
+ *  spans a newline joins the LOGICAL line, and cutting at the first PHYSICAL
+ *  newline dropped the joined remainder of a local command; review #3478 cycle 4
+ *  P0), `termStart` the first character of the TERMINATOR line and `afterTerm`
+ *  the newline that ends it (or end-of-string when the terminator never appears —
+ *  the shell would swallow the rest of the input too). The terminator line is NOT
+ *  part of the body: masking it would leave a heredoc no downstream parser can
+ *  close, and the next local command would be swallowed as body data (a
+ *  fail-open).
  *  `stripTabs` mirrors `<<-` (leading TABS are ignored) — plain `<<` requires the
  *  terminator at column 0, and accepting an indented one would end the mask
  *  early and expose the rest of the remote script as local text. */
-function _rbHeredocBodyRange(s, from, delim, stripTabs = false) {
-  if (!delim) return { bodyStart: from, termStart: from, afterTerm: from };
-  const nl = s.indexOf("\n", from);
-  if (nl < 0) return { bodyStart: s.length, termStart: s.length, afterTerm: s.length };
-  const bodyStart = nl + 1;
-  let lineStart = bodyStart;
+function _rbHeredocBodyRange(s, bodyStart, delim, stripTabs = false) {
+  if (!delim) return { bodyStart, termStart: bodyStart, afterTerm: bodyStart };
+  const body = Math.max(0, Math.min(bodyStart, s.length));
+  let lineStart = body;
   while (lineStart <= s.length) {
     const end = s.indexOf("\n", lineStart);
     const line = end < 0 ? s.slice(lineStart) : s.slice(lineStart, end);
     const candidate = stripTabs ? line.replace(/^\t+/, "") : line;
     if (candidate === delim) {
-      return { bodyStart, termStart: lineStart, afterTerm: end < 0 ? s.length : end };
+      return { bodyStart: body, termStart: lineStart, afterTerm: end < 0 ? s.length : end };
     }
     if (end < 0) break;
     lineStart = end + 1;
   }
-  return { bodyStart, termStart: s.length, afterTerm: s.length };
+  return { bodyStart: body, termStart: s.length, afterTerm: s.length };
 }
 
 /** Could `prefix` REDEFINE a transport name — or build a definition no text scan
@@ -10487,6 +10546,7 @@ export function maskRemoteExecPayloads(command) {
   let out = "";
   let last = 0;            // source offset already emitted
   let masking = false;     // inside a masked payload run
+  let payloadEmitted = false; // the placeholder has been written at least once
   let verbatimNextWord = null; // true | "heredoc" — the redirect operand is text, not payload
   const verbatimTo = (end) => {
     if (end > last) out += s.slice(last, end);
@@ -10499,6 +10559,7 @@ export function maskRemoteExecPayloads(command) {
       if (start > last) { out += s.slice(last, start); last = start; }
       out += ` ${REMOTE_PAYLOAD_PLACEHOLDER}`;
       masking = true;
+      payloadEmitted = true;
     }
     if (end > last) last = end;
   };
@@ -10552,27 +10613,40 @@ export function maskRemoteExecPayloads(command) {
         // tail used to be DROPPED (not masked — dropped), so `cmux vm exec c --
         // sh -s <<'EOS'; git worktree add loc` and `… <<'EOS' > a.txt` went from
         // BLOCKED to ALLOWED (review #3478 cycle 3 P0).
-        const nl = s.indexOf("\n", tk.end);
-        const body = _rbHeredocBodyRange(s, tk.end, _rbUnquoteDelim(tk.text), verbatimNextWord === "heredoc");
-        if (nl < 0) {                    // no newline ⇒ no body: nothing here is payload
+        // ⛔ And the body starts after the LOGICAL line, not the first PHYSICAL
+        // newline: a `\`+newline continuation or a quote spanning a newline joins
+        // the command line, and cutting at the physical newline dropped the joined
+        // remainder — a local write, hidden (review #3478 cycle 4 P0). The token
+        // stream already absorbs both, so the first `\n` OP token is the boundary.
+        const delim = _rbUnquoteDelim(tk.text);
+        if (delim === null) return s;    // unreadable delimiter word ⇒ gate as before
+        let nlAt = -1;
+        for (let j = k + 1; j < tokens.length; j++) {
+          // A heredoc's body ALWAYS begins after the next newline — separators on
+          // the delimiter line (`;`, `&&`, `|`, `>`) do not move it, they are that
+          // line's LOCAL tail. Do not stop at them.
+          if (tokens[j].op && tokens[j].text === "\n") { nlAt = tokens[j].start; break; }
+        }
+        if (nlAt < 0) {                  // no logical newline ⇒ no body: not payload
           verbatimTo(s.length);
           endMask();
           verbatimNextWord = null;
           k++;
           continue;
         }
-        if (nl > last) { out += s.slice(last, nl); last = nl; }   // delimiter-line tail: LOCAL
+        const body = _rbHeredocBodyRange(s, nlAt + 1, delim, verbatimNextWord === "heredoc");
+        if (nlAt > last) { out += s.slice(last, nlAt); last = nlAt; }   // delimiter-line tail: LOCAL
         // The heredoc can be the payload ITSELF (`ssh cell <<'EOS'` — no payload
         // word), in which case the placeholder has not been emitted yet. It goes
         // where the BODY was, on its own line, so the heredoc stays parseable.
-        const needPlaceholder = !masking;
+        const needPlaceholder = !payloadEmitted;
         if (body.termStart > last) last = body.termStart;                       // body: masked
         // The newline that separated the delimiter word from the body is gone with
         // it. Keep ONE: without it the terminator line would fuse onto the
         // delimiter word (`<<'EOS'EOS`), no downstream parser could close the
         // heredoc, and the following LOCAL command would read as body text.
         out += needPlaceholder ? `\n ${REMOTE_PAYLOAD_PLACEHOLDER}\n` : "\n";
-        masking = true;
+        if (needPlaceholder) payloadEmitted = true;
         if (body.afterTerm > last) { out += s.slice(body.termStart, body.afterTerm); last = body.afterTerm; }
         // A heredoc operator ends its simple command; what follows is LOCAL text.
         endMask();
@@ -10600,41 +10674,62 @@ export function maskRemoteExecPayloads(command) {
   return out;
 }
 
-/** Does `text` pipe a masked placeholder INTO a command that may run it — a shell
- *  or an interpreter wrapper? Those are the shapes where the payload would be
- *  executed by THIS shell, so the mask must not hide it.
- *  Scoped to ONE simple command (`;`/`&&`/`||`/newline split), so an unrelated
- *  local `… | bash` in another command does not disable the mask.
+/** Does `text` pipe a masked placeholder into a command that may RUN what it
+ *  reads? Those are the shapes where the payload would be executed by THIS shell,
+ *  so the mask must not hide it.
  *
- *  ⛔ An allow-list of shells alone is NOT enough (review #3478 cycle 3 P0): the
- *  head can be decorated (`|& bash`, `| (bash -s)`, `| { bash; }`, `| ! bash`),
- *  carry a variable or a quote (`| "$SHELL"`), or be a multi-word launcher
- *  (`| busybox sh`). A stage head this scan cannot READ is treated as a shell —
- *  the command is then left unmasked, which only re-gates it (fail closed). */
+ *  ⛔ POLARITY: this is a CLOSED allow-list of consumers that cannot execute their
+ *  stdin, and everything else BAILS (leaves the command unmasked ⇒ today's
+ *  gating). A shell allow-list was tried first and lost three times, because a
+ *  head can be decorated (`|& bash`, `| (bash)`, `| { bash; }`), carry a variable
+ *  (`| "$SHELL"`, `| { S=bash; $S -s; }`), be launcher-wrapped (`| timeout 5
+ *  bash`), sit behind its own redirection (`| > /tmp/f bash -s`), or continue on
+ *  the next line (`|<NL> bash`) — an open list can never be complete, and every
+ *  miss was a local execution the #709 arm could not see (review #3478 cycles 3-4).
+ *  A false bail only re-gates a command; a false allow EXECUTES it.
+ *  @returns {boolean} true ⇒ do NOT mask. */
 function _rbFeedsLocalShell(text) {
   const ph = REMOTE_PAYLOAD_PLACEHOLDER;
-  const WRAPPERS = new Set(["env", "exec", "sudo", "command", "nice", "nohup", "time", "stdbuf", "xargs", "busybox", "setsid", "doas", "chroot"]);
-  const isShell = (w) => /^(?:\S*\/)?(?:ba|z|k|da|a|c|mk)?sh$/.test(w) || /^(?:python[0-9.]*|perl|ruby|node|awk|tclsh|lua)$/.test(w);
-  for (const cmd of text.split(/;|&&|\|\||\n/)) {
+  // Commands that consume stdin as DATA and cannot run it as a program.
+  const DATA_CONSUMERS = new Set([
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "tac", "tee", "head", "tail",
+    "wc", "sort", "uniq", "cut", "tr", "nl", "jq", "base64", "base32", "xxd", "od", "hexdump",
+    "split", "diff", "comm", "paste", "join", "fold", "fmt", "expand", "columns", "column",
+    "md5sum", "sha1sum", "sha256sum", "sha512sum", "cksum", "strings", "zcat", "gunzip",
+    "bzcat", "xzcat", "rev", "seq", "numfmt", "csvtool", "yq",
+  ]);
+  // A pipeline continued on the next line is ONE pipeline — do not split there.
+  const joined = text.replace(/\|&?\s*\n/g, "|");
+  for (const cmd of joined.split(/;|&&|\|\||\n/)) {
     if (!cmd.includes(ph)) continue;
-    // `|&` splits like `|` — otherwise the stage head is `& bash`, which no
-    // allow-list matches and the bail silently did not fire.
     const stages = cmd.split(/\|&?/);
     for (let idx = 1; idx < stages.length; idx++) {
       if (!stages.slice(0, idx).some((st) => st.includes(ph))) continue;
-      const raw = stages[idx].trim();
-      if (!raw) continue;                            // dangling `|` — nothing runs there
-      const stripped = raw.replace(/^[!({]+/, "").replace(/[)}];*&*$/, "").trim();
-      if (!stripped) return true;                    // `| ( … )`-shaped: unreadable
-      // A head carrying a quote, a variable or a substitution is a command this
-      // scan cannot see (`"$SHELL"`, `$(which bash)`) — treat it as a shell.
-      if (/["'`$]/.test(stripped.split(/\s+/)[0])) return true;
-      const words = stripped.split(/\s+/).filter(Boolean);
+      const words = stages[idx].trim().split(/\s+/).filter(Boolean);
       let j = 0;
-      // Skip redirections / leading assignments before the command word.
-      while (j < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[j]) || /^\d*[<>]/.test(words[j]) || words[j] === "!")) j++;
-      if (j >= words.length) continue;
-      if (WRAPPERS.has(words[j]) || isShell(words[j])) return true;
+      // Skip leading assignments / `!`. A REDIRECTION here also swallows its
+      // TARGET word (`| > /tmp/f bash -s` used to resolve its head to `/tmp/f`).
+      while (j < words.length) {
+        const w = words[j];
+        if (w === "!") { j++; continue; }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) { j++; continue; }
+        if (/^\d*[<>]|^&>/.test(w)) {
+          // `> file` / `2> file` / `&> file` take the next word; `>&N` / `>|f` do not.
+          const takesNext = !/^\d*(?:>&|<&)\d+$/.test(w) && !/^\d*>>?\S/.test(w);
+          j += takesNext ? 2 : 1;
+          continue;
+        }
+        break;
+      }
+      if (j >= words.length) continue;              // dangling `|` — nothing runs there
+      let head = words[j];
+      head = head.replace(/^[!({]/, "").replace(/[)}]*$/, "");
+      if (!head) return true;
+      // De-decorated command words only — a quote, `$`, or a path prefix means
+      // this scan cannot tell what runs (`"$SHELL"`, `$(which bash)`, `/tmp/x`).
+      if (/["'`$]/.test(head)) return true;
+      const base = head.includes("/") ? head.slice(head.lastIndexOf("/") + 1) : head;
+      if (!DATA_CONSUMERS.has(base)) return true;
     }
   }
   return false;

@@ -32,15 +32,18 @@
 //   Part B — BEHAVIORAL: the REAL index.ts handler, driven against a hermetic
 //            hub. Each pinned case asserts BOTH directions: the remote form is
 //            ALLOWED and the SAME command run locally is still REFUSED.
-//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): NINE mutants are
+//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): TWELVE mutants are
 //            built in a TEMP copy of this extension and each must redden the
 //            specific assertion it reverts — the pre-fix identity mask, an
 //            over-reaching mask that ignores separators, a swallowed heredoc
 //            terminator, a split unquoted-backtick region, a quote-scanned
 //            comment, an ANSI-C quote read as a plain quote, a piped payload
 //            that blinds the local-shell arm, a dropped heredoc delimiter-line
-//            tail, and a `|&` stage not split. The leg FAILS (never skips green)
-//            when the real-module loader is unavailable, because it is evidence.
+//            tail, a pipe-head SHELL ALLOW-LIST (the pre-inversion polarity), a
+//            heredoc body cut at the physical newline, a delimiter word without
+//            quote removal, and a pipe bail that skips no redirection target. The
+//            leg FAILS (never skips green) when the real-module loader is
+//            unavailable, because it is evidence.
 //
 // Run: node extensions/main-worktree-guard/test-remote-context.mjs
 //      node extensions/main-worktree-guard/test-remote-context.mjs --mutations
@@ -438,12 +441,74 @@ for (const c of [
 // …while a redirect-only ssh form is STILL not a boundary (its write is local).
 expect("A23b: `ssh cell > a.txt` stays unmasked", mask(`ssh cell > a.txt`), `ssh cell > a.txt`);
 
-// A24: a heredoc used as the payload must still present a closeable heredoc — the
-// placeholder is its own body line, never fused onto the terminator.
+// A25 (#3478 review cycle 4 P0): the heredoc body starts after the LOGICAL line,
+// not the first PHYSICAL newline. A `\`+newline continuation (or a quote spanning
+// a newline) joins the command line, so cutting at the physical newline dropped
+// the joined remainder — a local write, hidden.
+for (const [c, must] of [
+  [`cmux vm exec c -- sh -s <<'EOS'; \\\necho hacked > a.txt\nbody\nEOS`, "echo hacked > a.txt"],
+  [`cmux vm exec c -- sh -s <<'EOS'; \\\ngit worktree add loc\nbody\nEOS`, "git worktree add loc"],
+  [`ssh cell <<'EOS'; \\\ngit worktree add loc\nbody\nEOS`, "git worktree add loc"],
+  [`cmux vm exec c -- sh -s <<'EOS'; echo "a\nb" && git worktree add loc\nbody\nEOS`, "git worktree add loc"],
+]) {
+  expectTrue(`A25: a CONTINUED delimiter line keeps its local remainder — ${JSON.stringify(c)}`,
+    mask(c).includes(must), JSON.stringify(mask(c)));
+  expectTrue(`A25: …and the body is still masked — ${JSON.stringify(c)}`,
+    mask(c).includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(mask(c)));
+}
+
+// A26 (#3478 review cycle 4 P0): a heredoc delimiter word goes through SHELL QUOTE
+// REMOVAL, so `<<$'EOS'`, `<<$"EOS"`, `<<E"OS"` and `<<\EOS` all terminate at
+// `EOS`. Before, the quotes were kept, no terminator matched, and the mask ran to
+// end-of-string — hiding every LOCAL command after the real terminator.
+for (const [c, must] of [
+  [`cmux vm exec c -- sh -s <<$'EOS'\nbody\nEOS\necho hacked > a.txt`, "echo hacked > a.txt"],
+  [`cmux vm exec c -- sh -s <<$"EOS"\nbody\nEOS\ngit worktree add loc`, "git worktree add loc"],
+  [`cmux vm exec c -- sh -s <<E"OS"\nbody\nEOS\ngit worktree add loc`, "git worktree add loc"],
+  [`cmux vm exec c -- sh -s <<\\EOS\nbody\nEOS\ngit worktree add loc`, "git worktree add loc"],
+  [`ssh cell <<$'EOS'\nbody\nEOS\ngit worktree add loc`, "git worktree add loc"],
+]) {
+  expectTrue(`A26: a QUOTED delimiter still terminates at the plain word — ${JSON.stringify(c)}`,
+    mask(c).includes(must), JSON.stringify(mask(c)));
+}
+// …while an EXPANSION in a delimiter stays literal (bash does not expand it), so the
+// heredoc terminates at `$X` and the next line is still local text.
+expectTrue("A26b: `<<$X` is literal, so the next line is preserved",
+  mask(`cmux vm exec c -- sh -s <<$X\nbody\n$X\ngit worktree add loc`).includes("git worktree add loc"),
+  JSON.stringify(mask(`cmux vm exec c -- sh -s <<$X\nbody\n$X\ngit worktree add loc`)));
+
+// A27 (#3478 review cycle 4 P0): the piped-payload rule is a CLOSED allow-list of
+// consumers that cannot execute stdin — every other stage head bails to gating.
+for (const c of [
+  `cmux vm exec cell -- printf 'git checkout -- a.txt' | > /tmp/f bash -s`,
+  `cmux vm exec cell -- printf 'git checkout -- a.txt' | timeout 5 bash -s`,
+  `cmux vm exec cell -- printf 'git checkout -- a.txt' |\n bash -s`,
+  `cmux vm exec cell -- printf 'git checkout -- a.txt' | { S=bash; $S -s; }`,
+  `cmux vm exec cell -- printf 'git checkout -- a.txt' | (python3 -c 'import sys')`,
+  `cmux vm exec cell -- printf 'git checkout -- a.txt' | awk '{print}'`,
+  `cmux vm exec cell -- printf 'git checkout -- a.txt' | sed ''`,
+]) {
+  expectTrue(`A27: a stage head that may RUN its stdin is not masked — ${JSON.stringify(c)}`,
+    mask(c).includes("git checkout -- a.txt"), JSON.stringify(mask(c)));
+}
+// …and a proven DATA consumer still lets the payload be masked.
+for (const c of [
+  `cmux vm exec cell -- printf x | grep y`,
+  `cmux vm exec cell -- printf x | cat`,
+  `cmux vm exec cell -- printf x | /usr/bin/grep y`,
+  `cmux vm exec cell -- printf x | wc -l`,
+  `cmux vm exec cell -- printf x | sort | uniq -c`,
+]) {
+  expectTrue(`A27b: a DATA consumer does not disable the mask — ${JSON.stringify(c)}`,
+    mask(c).includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(mask(c)));
+}
+
+// A28: a payload-word heredoc emits the placeholder ONCE (the body placeholder is
+// for the `ssh cell <<'EOS'` shape, where there is no payload word to mask).
 {
-  const out = mask(`ssh cell <<'EOS'\ngit worktree add rev\nEOS`);
-  expectTrue("A24: the placeholder replaces the BODY, on its own line",
-    /<<'EOS'\n _remote_payload_\nEOS/.test(out), JSON.stringify(out));
+  const out = mask(`cmux vm exec c -- sh -s <<'EOS'\nbody\nEOS`);
+  expect("A28: exactly ONE placeholder for a payload-word heredoc",
+    out.split(REMOTE_PAYLOAD_PLACEHOLDER).length - 1, 1);
 }
 
 
@@ -664,9 +729,39 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("B19: a `|&` payload into a local shell is REFUSED", blocked(b19),
       "allowed — the `|&` stage head was not recognised");
 
+    // B21 (#3478 review cycle 4 P0): the piped-payload bail must be a CLOSED
+    // allow-list — these stage heads run what they read, so the mask must not
+    // hide the seed and the pre-fix #709 refusal must still stand.
+    for (const c of [
+      `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | > /tmp/f bash -s`,
+      `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | timeout 5 bash -s`,
+    ]) {
+      const r = await real.bash(c);
+      expectTrue(`B21: a stage that RUNS its stdin is still REFUSED — ${JSON.stringify(c)}`,
+        blocked(r), `allowed: ${reasonOf(r).split("\n")[0]}`);
+    }
+    // ⛔ NOT pinned here, and deliberately (measured, not assumed): a stage head the
+    // guard's OWN #709 arm cannot recognise either (`| { S=bash; $S -s; }`, a
+    // variable indirection) is allowed — and it was allowed before this PR too, on
+    // the raw command. The mask now leaves such a command UNMASKED (verified at the
+    // mask level, A27), so this PR neither creates nor fixes that gap; asserting a
+    // refusal here would be asserting behaviour the guard never had.
+    //
+    // The same honesty applies to two DOWNSTREAM parser limits found while writing
+    // these pins (also pre-existing, also fail-closed in the guard's favour, so out
+    // of this diff's scope and recorded in the README): a `\`+newline continuation
+    // on a heredoc's DELIMITER line, and a quoted heredoc delimiter (`<<$'EOS'`).
+    // The MASK keeps the local tail visible for both (A25/A26) — but the guard's
+    // own heredoc parsing then reads that tail as body, so neither form was ever
+    // refused, before or after this PR.
+
+    // B24 (#3478 review cycle 4): a data-consumer stage still allows the mask, so a
+    // legitimate piped remote command stays ALLOWED.
+    const b24 = await real.bash("cmux vm exec cell-a -- printf 'x' | grep y");
+    expectTrue("B24 control: a data-consumer pipe is ALLOWED", !blocked(b24), `blocked: ${reasonOf(b24).split("\n")[0]}`);
+
     // B20 (#3478 review cycle 3 P2): a value flag with an ATTACHED value
-    // (`-p22`, `-L8080:host:80`, `-oK=V`) must not swallow the host — the boundary
-    // was lost entirely and a legitimate remote dispatch stayed refused.
+    // (`-p22`, `-L8080:host:80`, `-oK=V`) must not swallow the host.
     const b20 = await real.bash("ssh -p22 cell-a 'git worktree add rev-9999'");
     expectTrue("B20: `ssh -p22 <host> '<payload>'` is ALLOWED (boundary recognised)", !blocked(b20),
       `blocked: ${reasonOf(b20).split("\n")[0]}`);
@@ -810,23 +905,65 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "heredoc delimiter-line tail dropped",
           kind: "mask",
           revert: (src) => src.replace(
-            "        if (nl > last) { out += s.slice(last, nl); last = nl; }   // delimiter-line tail: LOCAL",
+            "        if (nlAt > last) { out += s.slice(last, nlAt); last = nlAt; }   // delimiter-line tail: LOCAL",
             "        // MUTANT: delimiter-line tail dropped",
           ),
           maskProbe: "cmux vm exec cell-a -- sh -s <<'EOS'; git worktree add rev-9999\nbody\nEOS",
           check: (out) => !String(out).includes("git worktree add rev-9999"),
         },
         {
-          // #3478 review cycle 3 P0: a `|&` stage head is `& bash`, which the
-          // allow-list missed. Reverting the `|&` split (back to split on `|`)
-          // makes A22 and B19 go RED.
-          label: "pipe-amp not split",
+          // #3478 review cycles 3-4 P0: `_rbFeedsLocalShell` must BAIL (not mask)
+          // unless the downstream stage is a proven data consumer. Reverting it to
+          // the shell allow-list makes A22/B21 and B19 go RED.
+          label: "pipe head allow-list (shells only)",
           kind: "mask",
           revert: (src) => src.replace(
-            "    const stages = cmd.split(/\\|&?/);",
-            "    const stages = cmd.split(\"|\");",
+            "      const base = head.includes(\"/\") ? head.slice(head.lastIndexOf(\"/\") + 1) : head;\n      if (!DATA_CONSUMERS.has(base)) return true;",
+            "      const base = head.includes(\"/\") ? head.slice(head.lastIndexOf(\"/\") + 1) : head;\n      if (!/^(?:ba|z|k|da|a)?sh$|^(?:python[0-9.]*|perl|ruby|node|awk|tclsh|lua)$/.test(base)) continue;",
           ),
-          maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' |& bash -s`,
+          maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | timeout 5 bash -s`,
+          check: (out) => !String(out).includes("git checkout"),
+        },
+        {
+          // #3478 review cycle 4 P0: the body starts after the LOGICAL line; a
+          // `\`+newline continuation joins it. Reverting to the first PHYSICAL
+          // newline drops the joined remainder — A25 and B22 go RED.
+          label: "heredoc body cut at physical newline",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "          if (tokens[j].op && tokens[j].text === \"\\n\") { nlAt = tokens[j].start; break; }",
+            "          if (tokens[j].op && tokens[j].text === \"\\n\") { nlAt = s.indexOf(\"\\n\", tk.end); break; }",
+          ),
+          maskProbe: "cmux vm exec c -- sh -s <<'EOS'; \\\ngit worktree add loc\nbody\nEOS",
+          check: (out) => !String(out).includes("git worktree add loc"),
+        },
+        {
+          // #3478 review cycle 4 P0: the delimiter word needs SHELL QUOTE REMOVAL.
+          // Reverting to `slice(1, -1)` keeps the quotes of `$'EOS'`, no terminator
+          // matches, and the mask runs past the real one — A26 and B23 go RED.
+          label: "delimiter word not unquoted",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "        const delim = _rbUnquoteDelim(tk.text);",
+            "        const delim = String(tk.text ?? \"\").trim().replace(/^'|'$/g, \"\");  // MUTANT: quote-pair slice only",
+          ),
+          maskProbe: "cmux vm exec c -- sh -s <<$'EOS'\nbody\nEOS\ngit worktree add loc",
+          check: (out) => !String(out).includes("git worktree add loc"),
+        },
+        {
+          // #3478 review cycle 4 P0: the pipe bail must skip a redirection's TARGET
+          // word (`| > /tmp/f bash -s`). Without that skip the head resolves to
+          // `/tmp/f`, `bash` is never examined, and the payload is masked.
+          label: "pipe redirect target not skipped",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "          const takesNext = !/^\\d*(?:>&|<&)\\d+$/.test(w) && !/^\\d*>>?\\S/.test(w);\n          j += takesNext ? 2 : 1;",
+            "          j += 1;  // MUTANT: target word not skipped",
+          ),
+          // The probe's redirect TARGET is deliberately a name that LOOKS like a
+          // data consumer (`/tmp/grep`): with the target skipped the real head is
+          // `bash` (bail); without the skip the head IS `/tmp/grep` (masked).
+          maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | > /tmp/grep bash -s`,
           check: (out) => !String(out).includes("git checkout"),
         },
       ];
