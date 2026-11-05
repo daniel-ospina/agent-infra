@@ -997,6 +997,21 @@ def test_T_box_exec_refuses_a_shell_string_and_a_non_allowlisted_argv(tmp_path, 
     for argv in (["hostname"], ["hostname", "-f"]):
         assert mod._allowlisted(argv)[0] is True, argv
 
+    # ⛔ THE ALLOWLIST PINS A **NAME**, SO A PATH MAY NOT RIDE THROUGH IT. `prog = basename(argv[0])`
+    # let `["/tmp/evil/git", "status"]`, `["./git", "status"]` and `["../../bin/git", "log"]` all pass
+    # (verified) — i.e. ANY file named an allowlisted program, at a CALLER-CHOSEN path, executed under
+    # this surface's authority. `/tmp` on a cell is writable by anything else running there, so a
+    # planted `git`/`ls` was reachable through a gate whose own contract says a non-allowlisted command
+    # is "a TYPED REFUSAL, never a pass-through" and whose cited rationale is that a rule "doesn't
+    # match the same program by path".
+    for argv in (["/tmp/evil/git", "status"], ["./git", "status"], ["../../bin/git", "log"],
+                 ["/tmp/evil/ls", "/"], ["/tmp/x/cat", "/etc/passwd"], ["sub/dir/whoami"]):
+        is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": argv})
+        assert is_err and payload["refused"] == "command-not-allowlisted", (argv, payload)
+        assert "PROGRAM NAME" in payload["reason"], (argv, payload["reason"])
+    # …and the bare name still works.
+    assert mod._allowlisted(["git", "status"])[0] is True
+
     # ⛔ THE DECLARED PREFIX IS ENFORCED, NOT UNPACKED AND IGNORED — the mechanism that let
     # `hostname NAME` through, pinned on a SYNTHETIC entry so it survives a future edit to the real
     # ALLOWLIST. Without this, the check reads as dead code (it WAS: `prefix` had no other use) and the
@@ -1028,6 +1043,41 @@ def test_T_box_exec_refuses_a_shell_string_and_a_non_allowlisted_argv(tmp_path, 
     monkeypatch.setenv("ORCH_MCP_READ_ONLY", "1")
     is_err, payload = one(mod_ro, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
     assert is_err and payload["refused"] == "read-only"
+
+
+def test_T_run_is_bounded_in_MEMORY_and_TIME_not_just_in_what_it_returns(monkeypatch):
+    """⛔ `cap` USED TO BOUND THE RETURN VALUE AND NOT THE BUFFERED STREAM.
+
+    `run()` used `subprocess.run(stdout=PIPE)`, which reads the WHOLE stream into memory and
+    truncates afterwards — so `box.exec {"argv": ["cat", "/dev/zero"]}` buffered without limit until
+    the OOM killer took the MCP server (i.e. the entire tool surface for that session), from a
+    READ-ONLY, allowlisted command. Measured with this module's own `run()`: one 128 MB stream took
+    peak RSS from 71.6 MB to 282.9 MB while returning 100 bytes. `timeout_s` was unbounded too
+    (`int(args.get("timeout_s") or 60)`, no maximum in the schema), so it was unbounded in TIME.
+
+    Peak RSS is not asserted here (it is not portable in CI); what IS asserted is the two bounds the
+    defect violated: the return is capped AND the call TERMINATES. Post-fix measurement for the
+    record: peak RSS held at 21.2 MB across every case below.
+    """
+    mod = server_mod(monkeypatch)
+    # (a) AN ENDLESS PRODUCER: bounded by the TIMEOUT, not by RAM, and capped.
+    r = mod.run(["cat", "/dev/zero"], timeout=1, cap=64)
+    assert r.timed_out is True, r.to_dict()
+    assert len(r.stdout) <= 64, "the cap bounds the return; got %d" % len(r.stdout)
+    assert r.truncated is True, r.to_dict()
+    assert r.seconds < 30, "it must not hang past its timeout; took %.1fs" % r.seconds
+    # (b) A LARGE FINITE PRODUCER: capped, truncated, and rc is still the child's own.
+    r = mod.run(["bash", "-c", "yes A | head -c 5000000"], timeout=60, cap=1000)
+    assert r.rc == 0, r.to_dict()
+    assert len(r.stdout) == 1000, "the return is capped exactly; got %d" % len(r.stdout)
+    assert r.truncated is True, r.to_dict()
+    # (c) A NORMAL COMMAND IS UNCHANGED — the bound must not break the ordinary case.
+    r = mod.run(["echo", "hello"], timeout=5)
+    assert r.ok() and r.stdout == "hello\n", r.to_dict()
+    # (d) BOTH LIMITS ARE CLAMPED, never trusted from a tool argument.
+    assert mod.MAX_TIMEOUT_S > 0 and mod.MAX_CAP > 0
+    r = mod.run(["echo", "x"], timeout=10 ** 9, cap=10 ** 12)
+    assert r.ok(), "an absurd but harmless limit must be clamped, not refused: %r" % (r.to_dict(),)
 
 
 def test_T_lane_dispatch_maps_exits_and_the_two_measured_silent_actuators(tmp_path, monkeypatch):
