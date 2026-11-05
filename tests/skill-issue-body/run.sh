@@ -73,8 +73,11 @@
 #      collision class. A stdin sentinel (`-F -`, `/dev/stdin`) is not a shared path and is exempt;
 #      a committed read-only template path IS flagged, because the arm tests `not derived`, not
 #      `shared writable temp` (over-block, deliberate).
-#   C  the canonical example (skills/issue-creation) carries the citation for both rules
-#   D  the guard README's backdoor table names --body-file as the SANCTIONED route, "not a bypass"
+#   C  the canonical example (skills/issue-creation) carries the citation for both rules, plus the
+#      recipe halves: call1-path, call2-write, body-quoted, derivation-unique
+#   D  the guard README names --body-file as the SANCTIONED route, "not a bypass" — AND the row's
+#      OWN example is the taught shape (not an inline body, not a literal path), and its title
+#      sentence still states the residual
 #   E  BOTH guard classifiers still separate the two shapes (inline → block, file → allow)
 #   M  MUTATIONS: inline revert, literal-path revert, shipped-files-clean control, citation strip,
 #      canonical inline revert, census membership, prose warning, fence run-length/tilde, --title
@@ -351,6 +354,10 @@ canon_reasons_missing() {
   #   call1-path   — a line that PRINTS the derived path, BEFORE the gh call, so the `write` tool has
   #                  a target. Deleting it left the canonical example unrunnable and the shard green.
   #   recipe-var   — the fresh-shell-broken `VAR=…` + `--body-file "$VAR"` recipe (see the scanner).
+#   call2-write  — the instruction to WRITE the body, AFTER the path-printing call (round 6).
+#   body-quoted  — the derived path is QUOTED, so a TMPDIR with a space cannot split the argument.
+#   derivation-unique — the lane-uniqueness token is in the --body-file VALUE, not only in the echo
+#                  (a `$`-carrying SHARED path passes arm B2 by construction — round 6).
   # ⛔ call1-path checks the DERIVATION, not just the word: an `echo "/tmp/pi-issue-body-shared.md"`
   # satisfies "prints a path" while reintroducing the #729 shared-name collision the derivation exists
   # to prevent (round 3 measured exactly that staying green).
@@ -362,6 +369,41 @@ canon_reasons_missing() {
     }
     END { exit(gh_at_echo ? 0 : 1) }
   ' "$f" 2>/dev/null || miss="$miss call1-path"
+  # ⛔ CALL 2 — the `write`-tool instruction ITSELF. Round 6 measured that deleting it stayed green
+  # (41/0) while this arm's own message promises the write tool "has a target": call 1 prints one,
+  # but nothing then told the reader to WRITE the body. CALL 1's comment mentions the `write` tool
+  # too ("so the `write` tool has something to write to"), so the match is gated on `printed` — only
+  # a mention AFTER the path has been printed can be the instruction.
+  awk '
+    {
+      if (!printed && /echo/ && /pi-issue-body-/ && /git rev-parse/) printed = 1
+      if (!wrote && printed && /^[ \t]*#/ && /[Ww]rite/ && /write.*tool|tool.*write/) wrote = 1
+      # ⛔ The verdict is a FLAG, not `exit` inside the rule: `exit` jumps to END, and an END that
+      # itself exits would overwrite this status (measured while writing this arm — it reported a
+      # real instruction as missing).
+      if (!ghseen && /issue[ \t]+create/) { ghseen = 1; res = (printed && wrote) ? 0 : 1 }
+    }
+    END { exit(ghseen && res == 0 ? 0 : 1) }
+  ' "$f" 2>/dev/null || miss="$miss call2-write"
+  # ⛔ QUOTING — an UNQUOTED derived path breaks on any TMPDIR containing a space, a case this shard
+  # measures elsewhere (TMPDIR="/tmp/tmp with space"). Round 6 measured that removing the quotes
+  # from all five skills left the suite GREEN, and no other arm sees it: the literal arm skips values
+  # containing `$`, and the recipe arm only looks for a `VAR=` assignment.
+  awk '
+    { if ($0 ~ /^[ \t]*#/) next }
+    { if (index($0, "--body-file \"${")) ok = 1 }
+    END { exit(ok ? 0 : 1) }
+  ' "$f" 2>/dev/null || miss="$miss body-quoted"
+  # ⛔ THE LANE-UNIQUENESS TOKEN must be in the --body-file VALUE, not only in the printed path.
+  # Replacing the derivation with a derived-looking SHARED path -- `--body-file "$(pwd)/pi-issue-body.md"`,
+  # `--body-file "$(git rev-parse --show-toplevel)/pi-issue-body.md"` -- keeps the `$` that arm B2's
+  # literal check deliberately skips, so the #729 collision returns with the suite GREEN (measured,
+  # round 6: both spellings passed 41/0). The derivation IS the rule, so the token is what is pinned.
+  awk '
+    { if ($0 ~ /^[ \t]*#/) next }
+    { if (index($0, "--body-file") && index($0, "--absolute-git-dir")) ok = 1 }
+    END { exit(ok ? 0 : 1) }
+  ' "$f" 2>/dev/null || miss="$miss derivation-unique"
   [ -n "$(canon_recipe_absent "$f")" ] && miss="$miss recipe-var"
   printf '%s' "$miss"
 }
@@ -388,7 +430,26 @@ readme_route_absent() {
   # `--title`-only check was satisfied by the EXAMPLE and let the deletion of the residual sentence pass
   # (measured: M13). `--label` appears nowhere else in that table, so it is the discriminator.
   RT="$(awk '/^## Escape hatches/{f=1;next} /^Rule of thumb:/{f=0} f' "$r" 2>/dev/null)"
-  printf '%s\n' "$RT" | grep -q -- '--title' || printf '%s\n' "$r(title-residual)"
+  # ⛔ THE ROW MUST SHOW THE TAUGHT SHAPE, not merely contain the word. The two greps above are
+  # satisfied by the row's FIRST column (`gh … --body-file <path>`), so the row's own EXAMPLE could
+  # be reverted to the inline `--body "…"` or to a fixed `/tmp` path while every arm stayed GREEN
+  # (measured, round 6: both reverts passed 41/0). The example is a table CELL, i.e. prose, so the
+  # fenced scanner cannot see it — these checks on the cell are its only pin.
+  ROUTE_CMD="$(printf '%s\n' "$RT" | tr '`' '\n' | grep -F 'gh issue create' | head -1)"
+  if [ -z "$ROUTE_CMD" ]; then
+    printf '%s\n' "$r(route-example)"
+  else
+    # the value must be DERIVED and QUOTED (`"${…`), the shape the skills teach
+    printf '%s' "$ROUTE_CMD" | grep -qE -- '--body-file[= ]+"?\$\{?' || printf '%s\n' "$r(route-path)"
+    # and never the inline body this whole change removes
+    printf '%s' "$ROUTE_CMD" | grep -qE -- '(^|[ ])--body[ =]' && printf '%s\n' "$r(route-inline)"
+  fi
+  # ⛔ The TITLE residual is read from the RESIDUAL, not from the example: a bare `--title` grep is
+  # satisfied by the example command in the neighbouring cell, so deleting the title half of the
+  # sentence stayed green (measured, round 6: M20, label-only residual, 41/0). The `[^|]*` keeps a
+  # flag in one cell from borrowing a refusal word from another.
+  printf '%s\n' "$RT" | grep -qE -- '--title[^|]*(classifies|refused|scanned|blocked|forbidden)' \
+    || printf '%s\n' "$r(title-residual)"
   printf '%s\n' "$RT" | grep -qi -- 'label' || printf '%s\n' "$r(label-residual)"
 }
 
@@ -490,7 +551,7 @@ OFFENDERS="$(printf '%s\n' "$CENSUS" | inline_body_offenders)"
 # ── B2: no LITERAL body path (the #729 collision class) ────────────────────────────────────────
 LITOFF="$(printf '%s\n' "$CENSUS" | literal_path_offenders)"
 [ -z "$LITOFF" ] \
-  && ok 'and every one of them names a DERIVED body path (`$BODY`), not a literal one — two concurrent lanes cannot overwrite each other'"'"'s body between the write and the gh call (#729)' \
+  && ok 'and every one of them names a DERIVED body path (${TMPDIR:-/tmp}/…-$(git rev-parse --absolute-git-dir …).md), not a literal one — a literal path is shared by every lane on the box, so concurrent lanes could publish each other'"'"'s body (#729)' \
   || bad "literal body path(s): $(printf '%s' "$LITOFF" | sed "s|$ROOT/||g" | tr '\n' ' ') — a body path that is not DERIVED is shared by every lane on the box, so concurrent lanes can publish each other text (#729)"
 
 # ── B3: NO skill anywhere teaches the fresh-shell-broken `VAR=` recipe ─────────────────────────
@@ -514,7 +575,7 @@ EOF
 # ── C: the canonical example carries the reasons, not just the shape ────────────────────────────
 C_MISS="$(canon_reasons_missing "$ROOT/$CANON")"
 [ -z "$C_MISS" ] \
-  && ok "$CANON teaches --body-file, cites why on both counts (#3445 the gated shape, #729 the derived path), prints the derived path in an earlier call so the write tool has a target, and never uses the fresh-shell-broken `VAR=\u2026` recipe — the shape travels with the reason, so the next editor cannot revert it as style" \
+  && ok "$CANON teaches --body-file, cites why on both counts (#3445 the gated shape, #729 the derived path), prints the derived path in an earlier call so the write tool has a target AND instructs the write with it, quotes the path, and never uses the fresh-shell-broken VAR=… recipe — the shape travels with the reason, so the next editor cannot revert it as style" \
   || bad "$CANON is missing:$C_MISS — without the cited reasons the shape reads as formatting and gets tidied away; without the path-printing call the example is UNRUNNABLE (the write tool has no target); with `VAR=` + `--body-file \"\$VAR\"` the path is empty by the time gh runs (every bash call is a fresh shell)"
 
 # ── D: the guard README documents the route (and does not call it an escape) ────────────────────
@@ -567,6 +628,37 @@ PROBE
   esac
 else
   bad "$CLASSIFIER is missing — the premise arm cannot run, so the exemption this shard teaches is unverified"
+fi
+
+# ── E4: the command the SKILL ACTUALLY PRINTS is allowed — a replica is not evidence ───────────
+# Arm E above probes a command HARD-CODED in this file. Nothing kept that replica in sync with the
+# shipped example, so a destructive verb added to the canonical --title — the exact residual BOTH
+# files warn about, and a plausible edit on a skill whose whole subject is guard false-blocks —
+# left the suite GREEN (measured, round 6: 41/0 with the verb in the taught title). Read the real
+# command out of the file (the `issue create` line plus its `\`-continuations) and probe THAT: a
+# replica proves the shape CAN be filed, only the shipped text proves it IS.
+if [ -f "$CLASSIFIER" ]; then
+  SHIPPED_CMD="$(awk '
+    /^[ \t]*(`{3,}|~{3,})/ { fence = !fence; next }
+    !fence { next }
+    !collect && /issue[ \t]+create/ { collect = 1 }
+    collect {
+      line = $0
+      cont = (line ~ /\\[ \t\r]*$/)
+      sub(/\\[ \t\r]*$/, "", line)
+      printf "%s ", line
+      if (!cont) exit
+    }
+  ' "$ROOT/$CANON")"
+  if [ -z "$SHIPPED_CMD" ]; then
+    bad "could not read the taught \`issue create\` command out of $CANON — a shipped-example arm that measures nothing is a vacuous green"
+  else
+    SHIPPED_VERDICTS="$(node "$T/probe.mjs" "$CLASSIFIER" "$SHIPPED_CMD" 2>/dev/null || echo probe-failed)"
+    case "$SHIPPED_VERDICTS" in
+      allow*allow*) ok "E4: the command $CANON ACTUALLY PRINTS classifies '$SHIPPED_VERDICTS' on both classifiers — the shipped example is FILABLE, not just the replica this shard carries" ;;
+      *) bad "the command $CANON actually prints classifies '$SHIPPED_VERDICTS', not allow* on both — the EXAMPLE the skill hands an agent is REFUSED; arm E's replica cannot see that (measured: a destructive verb in the taught --title left the suite green)" ;;
+    esac
+  fi
 fi
 
 # ── E3: the TITLE/LABEL residual is MEASURED, not merely asserted ───────────────────────────────

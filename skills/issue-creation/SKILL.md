@@ -44,8 +44,9 @@ For trivial fixes with zero ambiguity, skip sections 2–4 and create directly:
 
 ```bash
 # CALL 1 of 3 — learn the path first, so the `write` tool has something to write to.
-# It is lane-unique (#729): a fixed /tmp name lets two concurrent lanes publish EACH
-# OTHER's body. Echo it; do not keep it in a variable (see below).
+# It is unique to this CHECKOUT (#729): a fixed /tmp name lets two concurrent lanes publish
+# EACH OTHER's body. (Two sessions in the SAME checkout still share this one — the #729
+# residual, not something this path fixes.) Echo it; do not keep it in a variable (see below).
 echo "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
 
 # CALL 2 of 3 — write the body to THAT path with the `write` tool.
@@ -65,13 +66,13 @@ exactly those. Passed by file, the body never enters the command string, so noth
 property the guard states for its own payloads: *"File / module / stdin payloads are NOT
 content-gated here"*). Write the body in its own call and `gh issue create` in another; the same
 rule covers any issue/PR body (see `commit-workflow/workflow/02-commit-pr.md`, including the `#729`
-path derivation). Run it **inside the repo**: the name is lane-unique because of
+path derivation). Run it **inside the repo**: the name is unique per checkout because of
 `git rev-parse --absolute-git-dir`, so from outside a git repo that substitution yields one shared
-name for every lane on the box.
+name for every lane on the box (and two sessions in the same checkout share it by construction).
 
 ⚠️ **The title and label are ALSO part of the command string.** `--body-file` moves the *body* out of
 it; a `--title "… git pull --ff-only …"` is still scanned, and is still refused. And unlike a hub
-block, **filing from a worktree does not lift it** (measured: a plain `echo` merely *mentioning* the
+block, **filing from a worktree does not lift the title refusal** (measured: a plain `echo` merely *mentioning* the
 verb is refused from a linked worktree — the refuse happens because no git invocation can be
 resolved in a mention, so the arm cannot worktree-exempt it). So a report whose TITLE names a
 destructive verb keeps the verb in the body and words the title around it ("false block on a

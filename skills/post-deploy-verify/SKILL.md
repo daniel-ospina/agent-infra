@@ -168,8 +168,8 @@ reserved for issue numbers), so a skipped surface is never reported without sayi
 Dedup by checking for existing open issues with title prefix `clickthrough-failure:`.
 
 ```bash
-# Write the failure report to a file with the `write` tool first, to a lane-unique path (never a
-# fixed /tmp name — #729); an inline --body is part of the shell command string and is scanned
+# Write the failure report to a file with the `write` tool first, to a path unique to this checkout
+# (never a fixed /tmp name — #729); an inline --body is part of the shell command string and is scanned
 # for destructive git verbs, so a report quoting one is unfilable that way (#3445). Then:
 # Repeat the derivation INLINE in the gh call — every bash tool call is a fresh shell, so a
 # `BODY=…` set on an earlier line would be EMPTY here:

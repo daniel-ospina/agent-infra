@@ -662,8 +662,8 @@ agent-browser errors 2>&1
    Auto-filing follow-up issue...
 ```
 
-Auto-file a follow-up issue. **Write the body with the `write` tool first**, to a lane-unique
-path (never a fixed /tmp name — #729). An inline `--body "…"` is part of the shell command
+Auto-file a follow-up issue. **Write the body with the `write` tool first**, to a path unique to
+this checkout (never a fixed /tmp name — #729). An inline `--body "…"` is part of the shell command
 string and is scanned for destructive git verbs, so a body that quotes one is unfilable that way
 (#3445). The body must carry:
 

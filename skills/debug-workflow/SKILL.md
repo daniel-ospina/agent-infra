@@ -63,8 +63,8 @@ Pipeline-gated debugging — classifies bug complexity and routes through issue-
 Classify bug complexity and route through `issue-workflow`:
 
 ```bash
-# Create a bug issue — write the body with the `write` tool first, to a lane-unique path
-# (never a fixed /tmp name — #729), then pass the PATH:
+# Create a bug issue — write the body with the `write` tool first, to a path unique to this
+# checkout (never a fixed /tmp name — #729), then pass the PATH:
 # Repeat the derivation INLINE in the gh call — every bash tool call is a fresh shell, so a
 # `BODY=…` set on an earlier line would be EMPTY here:
 gh issue create --title "Bug: <symptom>" --label "bug,complexity:<tier>" \

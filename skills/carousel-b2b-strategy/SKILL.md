@@ -211,8 +211,8 @@ mv "docs/carousels/$slug/status.yaml.tmp" "docs/carousels/$slug/status.yaml"
 ### Step 2 — Create Tracking Issue
 
 ```bash
-# Write the brief to a file with the `write` tool first, to a lane-unique path (never a
-# fixed /tmp name — #729); an inline --body is part of the shell command string and is
+# Write the brief to a file with the `write` tool first, to a path unique to this checkout
+# (never a fixed /tmp name — #729); an inline --body is part of the shell command string and is
 # scanned for destructive git verbs, so a brief quoting one is unfilable that way (#3445):
 # Repeat the derivation INLINE in the gh call — every bash tool call is a fresh shell, so a
 # `BODY=…` set on an earlier line would be EMPTY here:
