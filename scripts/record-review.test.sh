@@ -4679,7 +4679,7 @@ fi
 #     PART OF THE PIN: this PR anchors ONE site, `post_marker()` (its presence test).
 #     The recorder's APPEND decision and its MARKER_PRESENT re-read were ALREADY `-qxF`
 #     on main (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
-#     → :4643 and :4781), so claiming all three "moved from `grep -qF` to `grep -qxF`"
+#     → :4643, :4727 and :4781), so claiming all three "moved from `grep -qF` to `grep -qxF`"
 #     is FALSE — and a false "we changed this" is how a later reader concludes the
 #     older sites need anchoring too, or that this diff is bigger than it is. What
 #     WHAT THE VECTOR BELOW ACTUALLY PINS (corrected — #3168 re-review finding 6):
@@ -6067,9 +6067,9 @@ DC_PR4=424347
 rb_clear
 : > "$LOG"
 # ⛔ THE SINK IS `STUB_CAPTURE` — the BODY-PATCH capture, NOT `STUB_COMMENT_CAPTURE`.
-# The bytes are identical (the marker is built once and both channels carry it), so the
-# shape assertion is sound either way, but naming the wrong sink is the noun class this
-# PR exists to remove: the PATCH body is what this vector reads, so a reader sent to the
+# The bytes are identical ONLY WHERE BOTH SINKS FIRE — and this vector asserts `dc_posts == 0`,
+# so the comment channel carries NOTHING here. Naming the wrong sink is the noun class this PR
+# exists to remove: the PATCH body is what this vector reads, so a reader sent to the
 # comment sink would find an empty file and conclude the fixture had failed.
 STUB_CAPTURE="$T/negcap_2011" STUB_COMMENT_BODIES="" PATH="$NOHMAC_BIN:$PATH" \
     run_record_neg "$DC_PR4" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
