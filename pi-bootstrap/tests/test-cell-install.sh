@@ -2183,8 +2183,10 @@ run_install
 python3 - "$DEST/.mcp.json" <<'PY' && ok "install REPLACES a hosted entry naming a foreign variable (install and verify agree)" \
   || fail "install preserved a hosted header naming a variable the client cannot resolve — --verify refuses it, so the cell can never be repaired"
 import json, sys
-auth = (((json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}).get("headers") or {}).get("Authorization") or ""
-sys.exit(0 if "TORTOISE_API_KEY" in auth or "TORTOISE_MCP_API_KEY" in auth else 1)
+auth = (((json.load(open(sys.argv[1], encoding="utf-8")).get("mcpServers", {}) or {}).get("tortoise", {}) or {}).get("headers") or {}).get("Authorization") or ""
+# EXACT — see the re-sync arm below: a substring test on the legacy name is satisfied by the standard
+# one, so it cannot see the rewrite it is meant to forbid.
+sys.exit(0 if auth == "Bearer ${TORTOISE_MCP_API_KEY}" else 1)
 PY
 
 # ⛔ THE HOSTED HEADER MUST BE THE CANONICAL SHAPE, not merely "contains ${". The client sends
@@ -2262,9 +2264,15 @@ run_install
 python3 - "$DEST/.mcp.json" <<'PY' && ok "a re-sync KEEPS an entry's own credential variable (a legacy-named entry is not silently rewritten)" \
   || fail "a re-sync rewrote a working legacy-named Authorization to the standard variable — on a legacy-name-only box that is an empty Bearer"
 import json, sys
-t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+# ⛔ AN EXACT COMPARE, NOT A SUBSTRING (#3374 review, round 10 P2). `"TORTOISE_API_KEY" in auth` is
+# TRUE of `Bearer ${TORTOISE_MCP_API_KEY}` — the standard name CONTAINS the legacy one — so this arm
+# stayed green under exactly the regression its own `fail` sentence names (a re-sync rewriting the
+# entry to the standard variable on a legacy-name-only box, i.e. an empty Bearer and a 401). The
+# behaviour was correct; the assertion could not see it break. Same rule as the arm above, which
+# accepted either name and so had a dead first conjunct.
+t = (json.load(open(sys.argv[1], encoding="utf-8")).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
 auth = (t.get("headers") or {}).get("Authorization") or ""
-sys.exit(0 if "TORTOISE_API_KEY" in auth else 1)
+sys.exit(0 if auth == "Bearer ${TORTOISE_API_KEY}" else 1)
 PY
 run_verify
 [ $? -eq 0 ] && ok "--verify accepts the kept legacy-named entry (install and verify agree)" \

@@ -102,7 +102,7 @@ PY
 # it — the surface probe below and the non-vacuity check in the R5 python.
 WRITE_TOOLS="tortoise_create_point tortoise_create_operator"
 served_list() {   # served_list — POST tools/list, write the names to $TMP/served.json, print them
-  python3 - "$PORT" "$TMP/served.json" <<'PY'
+  python3 - "$PORT" "$TMP/served.json" "$TMP/served-schema.json" <<'PY'
 import json, sys, urllib.request
 body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
 req = urllib.request.Request("http://127.0.0.1:%s/" % sys.argv[1], data=body,
@@ -110,6 +110,17 @@ req = urllib.request.Request("http://127.0.0.1:%s/" % sys.argv[1], data=body,
 tools = json.load(urllib.request.urlopen(req, timeout=5))["result"]["tools"]
 names = sorted(t["name"] for t in tools if isinstance(t, dict) and t.get("name"))
 json.dump(names, open(sys.argv[2], "w"))
+# The ARGUMENTS half of the surface, beside the names (#3374 review P2). Written from the served
+# `inputSchema`, so the argument arm below compares against the SERVER's declarations and never
+# against a hand-kept copy.
+schema = {}
+for t in tools:
+    if isinstance(t, dict) and t.get("name"):
+        s = t.get("inputSchema") or {}
+        props = s.get("properties")
+        if isinstance(props, dict):
+            schema[t["name"]] = {"properties": sorted(props), "required": sorted(s.get("required") or [])}
+json.dump(schema, open(sys.argv[3], "w"))
 print(",".join(names))
 PY
 }
@@ -257,6 +268,54 @@ ok_op = op == {
 ok_pt = pt.get("kind") == "evidence" and bool((pt.get("content") or "").strip())
 sys.exit(0 if ok_op and ok_pt else 1)
 PY
+# ⛔ THE PIN ABOVE IS AGAINST A HAND-WRITTEN EXPECTATION, NOT AGAINST THE SERVED SCHEMA (#3374
+# review, round 10 P2). It asserts `semantics` and not `label` because someone wrote that dict — so
+# the suite proves the client agrees with ITS AUTHOR, which is a different question from whether it
+# agrees with the SERVER. Measured on 2026-11-05 the served surface does declare `semantics` (and
+# does NOT declare `label`), so the client is RIGHT; but nothing in the suite could have caught it if
+# it were wrong, and that is the defect class this whole suite exists for — one level up. The arm
+# below closes it with the SERVER's own `inputSchema`: every argument KEY a recorded call sends must
+# be a property that tool declares, and every `required` property must be present on the write path.
+# A rename on either side (the client's or the server's) now reddens the suite instead of shipping.
+_arg_schema() { python3 - "$1" "$2" <<'PY'
+import json, sys
+schema = json.load(open(sys.argv[2]))
+seen, bad = set(), []
+for line in open(sys.argv[1]):
+    b = json.loads(line)
+    if b.get("method") != "tools/call":
+        continue
+    p = b.get("params") or {}
+    name, args = p.get("name", "-"), p.get("arguments") or {}
+    seen.add(name)
+    decl = schema.get(name)
+    if decl is None:
+        continue          # no measured schema for this tool: the NAME arm above already covers it
+    undeclared = sorted(k for k in args if k not in decl["properties"])
+    if undeclared:
+        bad.append("%s sends undeclared %s" % (name, ",".join(undeclared)))
+    missing_req = sorted(r for r in decl["required"] if r not in args)
+    if missing_req:
+        bad.append("%s omits required %s" % (name, ",".join(missing_req)))
+# NON-VACUITY: with no call carrying a schema'd tool, an empty `bad` would mean "nothing checked".
+schema_seen = sorted(seen & set(schema))
+if not schema_seen:
+    bad.append("(VACUOUS: no recorded call targets a tool with a measured schema)")
+print(" | ".join(bad))
+PY
+}
+bad_args="$(_arg_schema "$TMP/calls.jsonl" "$TMP/served-schema.json")"
+[ $? -eq 0 ] && [ -z "$bad_args" ] \
+  && pass "every recorded tools/call sends only properties the SERVED inputSchema declares (names AND arguments agree with the server, not with this file)" \
+  || fail "a recorded call's arguments do not match the SERVED schema — $bad_args. On tortoise_create_operator that means the predicate is dropped or rejected AFTER the point was written while the verb exits 0"
+# THE CONTROL: the same checker must CATCH a call spelled the old way. Without this the arm above can
+# be satisfied by a checker that never inspects anything (an unreadable schema, a key-name typo in
+# the lookup) — a green that measures the checker's silence rather than the client's correctness.
+printf '%s\n' '{"method":"tools/call","params":{"name":"tortoise_create_operator","arguments":{"op_type":"IMPL","source_id":"a","target_ids":["b"],"label":"supports"}}}' > "$TMP/calls-badlabel.jsonl"
+bad_args="$(_arg_schema "$TMP/calls-badlabel.jsonl" "$TMP/served-schema.json")"
+printf '%s' "$bad_args" | grep -q 'undeclared label' \
+  && pass "…and the checker CATCHES the 'label' spelling the defect shipped (it is not declared — the served property is 'semantics')" \
+  || fail "the argument checker did NOT catch a call sending 'label' instead of 'semantics' (got: '${bad_args}') — the arm above is then measuring its own silence, which is the very 'pins against belief' defect it was added to close"
 # ⛔ THE HERE-DOC LIVES IN A FUNCTION BODY, NEVER INSIDE THE `$( )` (#2248, #2930). bash 3.2's
 # substitution scanner walks the body as if it were code, so a here-doc nested in a command
 # substitution desynchronises the parse state for the REST OF THE FILE. Measured on the real
