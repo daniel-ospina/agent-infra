@@ -86,8 +86,8 @@ is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
 # own words. And an UNSEARCHABLE `state/` has NO number to render — see the provenance note above: the
 # value beside it is the window that could not be searched, so the brief must say the age is
 # unmeasured rather than print that window as a stall age (the same shape `drain_stall_token` uses,
-# which renders `?` for this provenance, and the same rule the `PRDISP_SPAWNS` arm BELOW — line 285,
-# not above — applies to an unmeasured count).
+# which renders `?` for this provenance, and the same rule the `PRDISP_SPAWNS` arm BELOW — not the one
+# above — applies to an unmeasured count).
 case "$AGESRC" in
   synth)      AGEMIN_TXT=">=${AGEMIN}" ;;
   unmeasured) AGEMIN_TXT="an UNMEASURED number of" ;;

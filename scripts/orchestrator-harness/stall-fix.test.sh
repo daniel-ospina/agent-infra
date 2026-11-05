@@ -467,14 +467,27 @@ echo "── §F the age's PROVENANCE reaches both sinks this script owns ──
 # `age_min=/agesrc=` ledger row an operator reads after an incident — must say which one they got,
 # because a worker quotes the premise back in its report and the ledger is the durable record.
 # The pre-fix `case` accepted only `synth|measured` and silently rewrote `unmeasured` to `measured`,
-# which asserted a reading this box never took on BOTH surfaces. Two mutations, and the arms they
-# redden are the §F ones below (`f2`/`f3`), NOT the §B verdict arms at lines 134/144 — a maintainer
-# who follows a pointer to `b1`/`b2` sees them stay green and wrongly concludes §F is vacuous.
-#   · delete the `unmeasured` alternative from the `case` at stall-fix.sh:54 → all FOUR of `f3`'s
-#     asserts redden (measured: 77 passed, 4 failed);
-#   · drop only the `unmeasured)` render at stall-fix.sh:82 → `f3`'s premise-line pair reddens
-#     (measured: 79 passed, 2 failed).
-# No §B verdict arm changes in either mutation.
+# which asserted a reading this box never took on BOTH surfaces.
+#
+# ⛔ THIS NOTE CITES CODE BY NAME, NEVER BY LINE NUMBER (review cycles 2 and 3 of #3181, 2026-11-03).
+# Two cycles in a row found a pointer here that had silently gone stale: every edit ABOVE a cited line
+# shifts it, so a maintainer who follows the number lands on a comment or a blank line, mutates
+# nothing, sees every arm stay green, and concludes §F is vacuous when it is not. The §B verdict arms
+# (`b1`/`b2`) are NOT involved in any mutation below — a pointer there is what produced that earlier
+# false conclusion.
+#
+# MUTATIONS, MEASURED AT THIS HEAD — each named by the rule it breaks, not by a line to edit:
+#   · the `*)` arm of the age-provenance `case` back to `AGESRC=measured`
+#       → 81 passed, 3 failed: all three of `f4`'s asserts;
+#   · the `unmeasured)` arm of the brief-text `case` replaced by the bare `$AGEMIN`
+#       → 81 passed, 3 failed: `f3`'s premise pair AND `f4`'s premise assert;
+#   · the `synth)` arm of the brief-text `case` replaced by the bare `$AGEMIN`
+#       → `f2`'s premise assert reddens.
+#
+# AND ONE DELIBERATE NO-OP, stated so it is not mistaken for vacuity: deleting the `unmeasured`
+# alternative from the ACCEPT LIST alone changes NOTHING (84 passed, 0 failed), because the `*)` arm
+# already maps every non-accepted value to `unmeasured`. The accept list NAMES the vocabulary; the
+# `*)` arm is the GUARANTEE. Use one of the three mutations above to prove §F discriminates.
 brief_of() { cat "$1"/state/briefs/stall-fix-*.md 2>/dev/null || true; }
 
 D="$(new_o f1)"; stub "$D" "$STUB_OK_TOUCH"
@@ -500,7 +513,8 @@ case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and it is NOT rewritte
 # the `:-measured` default, so only a value the caller SUPPLIED can reach the `*)` arm. Before the fix
 # that arm wrote `measured`, so `_AGESRC=<anything unknown>` put "no PR merged in 90 minutes" in the
 # worker's premise and `agesrc=measured` in the ledger — the same false measurement, reachable by a
-# fourth provenance. Set the `*)` arm back to `measured` and both asserts below redden.
+# fourth provenance. Set the `*)` arm back to `measured` and all THREE asserts below redden
+# (measured: 81 passed, 3 failed).
 D="$(new_o f4)"; stub "$D" "$STUB_OK_TOUCH"
 OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
        _AGESRC=banana bash "$SH" 3 90 2>&1)"
