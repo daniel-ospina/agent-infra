@@ -276,6 +276,27 @@ hasnt "$(cat "$(LOG)" 2>/dev/null)" "credential \$" \
     "1f3c …nor does any line call the credential MISSING for a verdict about the FILE"
 has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
     "1f4 …it names the FILE the operator must repair or delete"
+# ⛔ AND THE SECOND STORE REASON HAS ITS OWN ARM (round 24, P2, measured): `auth-store-unreadable` is a DIFFERENT arm
+# of the gate (`key-gate.sh`'s rc 6), and the token/prose guards above were written for `store-invalid` only — deleting
+# the `KEY_GATE_REASON="auth-store-unreadable"` assignment left BOTH suites fully green, because the gate's PRINTED
+# line carries the reason as a literal while the lane token silently fell back to `credential-missing` and both prose
+# lines took the `*` branch ("$VAR holds no value ... put the credential where this lane's own env sources it") — the
+# misattribution rounds 22-23 removed for the other reason, restored by a one-line deletion.
+mk_arm storeunreadable; WT="$ARMWT"
+printf '{not json\n' > "$ARMDIR/home/.pi/agent/auth.json"
+PI_MARK="$ARMDIR/pi-ran"; export PI_MARK
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi 2>/dev/null || true
+drive "$WT"
+check_terminal "1g" refused "key-gate:auth-store-unreadable" 82
+eqv "$(printf '%s' "$(lastline | sed -n 's/.*reason=\(key-gate:[^ ]*\).*/\1/p')" | awk -F: '{print $2}')" \
+    "auth-store-unreadable" \
+    "1g2 the token carries the unreadable-STORE reason, not the credential-missing default"
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment this lane would run with" \
+    "1g3 …and no line prescribes exporting the variable for a verdict about the FILE"
+has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
+    "1g4 …while the remedy names auth.json, which is what has to be repaired"
+[ ! -s "$PI_MARK" ]; ck "1g5 pi was never spawned for an unreadable store" $?
 [ ! -s "$PI_MARK" ]; ck "1f5 pi was never spawned for a store verdict" $?
 
 # ── 1y: THE ESCAPE IS ARGV, AND THE ENVIRONMENT ROUTE IS RETIRED (review, P1, measured) ─────────

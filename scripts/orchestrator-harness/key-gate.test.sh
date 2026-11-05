@@ -1007,6 +1007,28 @@ has "$OUT" "reason=auth-store-unreadable" \
     "8W4 …under its own reason, so a fleet scan counts the FILE as the cause"
 hasnt "$OUT" "stored-credential-unresolvable" \
     "8W5 …not the cannot-say an unreadable-but-resolvable entry gets"
+
+# ⛔ AND THE BOX-DEFAULT ARM CONSULTS THE STORE BEFORE THE TEMPLATE, LIKE THE LANE PATH HAS SINCE ROUND 21 (round 24,
+# P2, measured): the empty-template early return ran first, so on the NORMAL cell shape (a `models.json` that does not
+# declare a built-in provider) one box answered `--probe` -> REFUSED `reason=store-invalid` while
+# `--probe --box-default` -> `check=skipped reason=cannot-resolve-provider-credential`. The README advertises the
+# box-default arm as refusing an unusable pin, and on that shape it structurally could not.
+HPT3="$(mkset boxnotemplate '{}' "$SET_PROVR")"
+printf '{"deepseek":{"key":"sk_legacy_no_type"}}\n' > "$HPT3/.pi/agent/auth.json"
+OUT="$(run_box_at "$HPT3" "$T/nocwd" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8W6 no models.json template + an unusable store still REFUSES the pin (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=store-invalid" \
+    "8W7 …naming the STORE, because pi reads it first"
+hasnt "$OUT" "cannot-resolve-provider-credential" \
+    "8W8 …and never filing a provable pi death under the provisioning-detail reason"
+# ...and the template gate still applies when the store has NOTHING to say, which is what the early return existed for.
+HPT4="$(mkset boxnotemplateok '{}' "$SET_PROVR")"
+OUT="$(run_box_at "$HPT4" "$T/nocwd" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8W9 no template AND an empty store is still the plain cannot-say (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "reason=cannot-resolve-provider-credential" \
+    "8W10 …so moving the gate below the store did not remove it"
 # ⛔ AND THE STORE IS PROBED BEFORE THE TEMPLATE, NOT ONLY BEFORE THE ENVIRONMENT (round 21, P1, measured). A
 # `models.json` need not declare a built-in provider - that is the NORMAL cell shape - and pi reads `auth.json`
 # FIRST, so gating this refusal behind "the template is resolvable" reported an unusable store entry as
@@ -1368,6 +1390,22 @@ has "$OUT" "auth.json does not PARSE" \
     "8L5b …naming the FILE as the thing to repair, which is the remedy that works"
 hasnt "$OUT" "holds an entry for this provider" \
     "8L5c …and it does NOT claim the file holds an entry — the false fact the cannot-say line asserted"
+# ⛔ AND IT IS ONE LINE WITH THE RIGHT WORDS IN IT (round 24, P2, measured): the format string had NINE arguments and
+# EIGHT specifiers (`%%s` is a literal `%s`, not a conversion), so bash RECYCLED the format and printed the refusal a
+# SECOND time — with the label replaced by the agent dir, every field empty, `/auth.json` as the path, and the agent dir
+# where `export $VAR` belonged. Every arm above is a substring match, so none of them saw a doubled line.
+eqv "$(printf '%s\n' "$OUT" | grep -c 'result=REFUSED')" "1" \
+    "8L14 the refusal prints EXACTLY ONE line — the surplus argument cannot recycle the format"
+# (The export clause lives on the LANE-path line, so this drives `key_gate_assert` — the box-default line above has no
+# export clause at all, and reading it for one was the first cut.')
+OUTL="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HCR" KG_GATE="$KG" bash -c 'set -u
+         . "$KG_GATE" || exit 99
+         key_gate_assert t "$HOME" ""' 2>&1)"
+has "$OUTL" 'export $KG_CANARY_KEY' \
+    "8L15 …naming the VARIABLE in the export clause, not the literal %%s"
+hasnt "$OUTL" "repair KG_CANARY_KEY/auth.json" \
+    "8L16 …with the path in the repair clause and the variable in the export clause, not swapped"
+
 # ⛔ AND A FILE CARRYING A NON-JSON NUMERIC CONSTANT IS THE SAME FILE, NOT A VALID ONE (round 23, P2, measured):
 # `JSON.parse` REJECTS `Infinity`/`-Infinity`/`NaN`; Python's `json.loads` accepts them and `inf > 0` is true, so the
 # reader graded `{"key": Infinity}` as a usable credential and `contextWindow: Infinity` as a valid models.json — a
@@ -1381,6 +1419,30 @@ has "$OUT" "reason=auth-store-unreadable" \
     "8L7 …because JSON.parse refuses the constant, so pi cannot read the file at all"
 hasnt "$OUT" "reason=store-invalid" \
     "8L8 …and it is not misfiled as an entry pi could see but not take a key from"
+# ⛔ AN EMPTY STORE IS AN EMPTY STORE, NOT AN UNREADABLE ONE (round 24, P1, measured): pi's `parseStorageData` opens
+# with `if (!content) { return {}; }` (`auth-storage.js:301-305`) and `settings-manager.js:262-267` does the same, so a
+# 0-byte `auth.json` (an interrupted atomic write, `touch`, `: > auth.json`) leaves pi running on the ENVIRONMENT. The
+# reader raised on it instead, and the store arm mapped every parse failure to rc 6 — REFUSING 82 a box pi runs, with a
+# remedy ("repair or delete auth.json") about a file that is not the problem.
+HEM2="$(mkset storeempty "$TWO_JSON" ABSENT)"
+: > "$HEM2/.pi/agent/auth.json"
+OUT="$(run_gate "$HEM2" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8L9 a 0-BYTE auth.json is not a refusal — pi runs on the environment (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+    "8L10 …so the variable the template names is asserted, as on a box with no store at all"
+hasnt "$OUT" "auth-store-unreadable" \
+    "8L11 …and the file is not reported as broken"
+# ⛔ AND THE SAME FOR NON-UTF-8 BYTES (round 24, P1, measured): Node decodes with U+FFFD replacement and never throws
+# (`readFileSync(path, "utf-8")`, `auth-storage.js:175`), so a latin-1 `key` is an ordinary string to pi. Python raised
+# UnicodeDecodeError, which the store arm turned into the same false 82.
+HL1="$(mkset storelatin1 "$TWO_JSON" ABSENT)"
+printf '{"venice":{"type":"api_key","key":"sk-caf\351-fixture"}}\n' > "$HL1/.pi/agent/auth.json"
+OUT="$(run_gate "$HL1" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8L12 a NON-UTF-8 auth.json is not a refusal — pi decodes it with replacement (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "auth-store-unreadable" \
+    "8L13 …so a latin-1 credential file does not block a lane pi would run"
 # pi parses models.json as JSONC (`stripJsonComments(stripBom(...))`, `model-config.js:116`); a comment must not make
 # the gate blind on a file pi uses — that is a fail-open on the exact defect #3331 exists to remove.
 HJC="$(mkset jsoncmodels "$TWO_JSON" ABSENT)"
@@ -1519,6 +1581,8 @@ tiersnull|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m
 overridetiersnull|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"cost":{"tiers":null}}}}}}
 overridectx|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"contextWindow":"big"}}}}}
 authHeader|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","authHeader":"yes"}}}
+nonfinite|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","contextWindow":1e999}]}}}
+nonfinitecost|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","maxTokens":1e999}]}}}
 infinity|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","contextWindow":Infinity}]}}}
 infinitycost|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","cost":{"input":Infinity,"output":2,"cacheRead":0,"cacheWrite":0}}]}}}
 nan|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","maxTokens":NaN}]}}}
