@@ -527,11 +527,14 @@ reads as "the pool is clean" rather than as a refusal. So the one command an ope
 for answers "nothing to do".
 
 **Retiring a surplus is an OPERATIONAL step with a human decision in it** — no verb in this repo
-removes a live registration, and the drain below is not one. ⚠️ **`RUNNER_ROOT` must be passed**, or
-the first command refuses: its default is `/tmp/actions-runner`, while the installs this section is
-about live under `/opt`, and a partial pool is a hard refusal
-(`cannot-measure why=pool-root-incomplete`, rc 2) — ⚠️ `status` still prints the table it could see
-and *then* refuses, so never read that table as this box's pool.
+removes a live registration, and the drain below is not one. ⚠️ **`RUNNER_ROOT` must be passed**: its
+default is `/tmp/actions-runner`, while the installs this section is about live under `/opt`, and a
+root that excludes a **LIVE** listener is a hard refusal
+(`cannot-measure why=pool-root-incomplete`, rc 2) — ⚠️ `status` prints the table it could see and
+*then* refuses. ⛔ That refusal fires **only for a LIVE listener**: when every listener outside the
+root is **DEAD** the read is silently EMPTY instead (`slots=0`, rc 0 — the caveat in §8 above),
+which is exactly the state step 3b is about — so never read a bare `status` under the default root
+as this box's pool.
 
 ```bash
 # 1. LIST this box's installs — RUNNER_ROOT is REQUIRED (default root cannot see /opt)
@@ -563,12 +566,13 @@ RUNNER_ROOT=/opt bash scripts/ci_runner_pool.sh status --all
 #     pass until someone deletes that unit file or fixes the path with a drop-in (the audit reads
 #     unit files and their drop-ins, last `WorkingDirectory=` winning — so the finding clears when
 #     the file goes, not only when the same name is re-registered).
-sudo /opt/<name>/svc.sh uninstall     # ⚠️ run it FROM the install dir — see below
-#     `svc.sh` resolves RUNNER_ROOT=$(pwd) and ./bin/actions.runner.service.template against the
-#     CALLER's cwd, and its pre-flight ("Must run from runner root or install is corrupt") fires
-#     BEFORE the command dispatch — so from the repo root it exits 1 having done nothing, with an
-#     error that misdirects at the install. (`svc.sh install` has the same requirement.)
-#     Use:  (cd /opt/<name> && sudo ./svc.sh uninstall)
+(cd /opt/<name> && sudo ./svc.sh uninstall)     # ⚠️ the cd is REQUIRED, not decoration — see below
+#     `svc.sh` resolves RUNNER_ROOT=$(pwd) and its template at the relative
+#     ./bin/actions.runner.service.template, and its pre-flight ("Must run from runner root or
+#     install is corrupt") fires BEFORE the command dispatch. So `sudo /opt/<name>/svc.sh uninstall`
+#     run from any other cwd — including this repo's root — exits 1 having done NOTHING, with an
+#     error that misdirects at the install instead of at the caller's directory.
+#     (`svc.sh install` has the same requirement.)
 #     (for a 2(b) listener there is no unit — nothing to remove here)
 
 # 4. REMOVE the registration. This needs a REMOVE token, which is a different token kind from
