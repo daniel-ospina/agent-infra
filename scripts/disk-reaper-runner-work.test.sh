@@ -816,8 +816,8 @@ case_l() { # <entry-point> <owner>
 # before claiming an abstention. Driven with an INSTRUMENTED copy of the real owner — the delete is
 # injected at the classification site so the REAL `entry_written_since` runs against a missing path; that
 # is a race fixture, not a stub of the logic under test. The mutant then reverts the guard itself.
-case_s() { # <entry-point> <owner — INSTRUMENTED: it deletes the entry at the classification site>
-    local pass="$1" owner="$2" base work dead out rc sum s1
+case_s() { # <entry-point> <owner — INSTRUMENTED: it deletes the entry at the classification site> [<owner — INSTRUMENTED: it deletes it at the REMOVAL site>]
+    local pass="$1" owner="$2" owner_rm="${3:-}" base work dead out rc sum s1 s2
     PASS_OWNER="$owner"
     base="$T/s.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-40)"
     fixture_entry dead "$work" job-vanishing 300 || return 1
@@ -840,6 +840,32 @@ case_s() { # <entry-point> <owner — INSTRUMENTED: it deletes the entry at the 
                "… and the class verdict is ok, so no operator is sent to look at a permission problem that does not exist"
     case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
                "… and the pass exits 0 (rc=$rc)"
+    # ── (s2) THE REMOVAL WINDOW — the third vanish site, and it was the UNGUARDED one ──────────────
+    # ⛔ `rm -rf` EXITS 0 FOR A PATH THAT NO LONGER EXISTS (measured: `rm -rf /tmp/does-not-exist` → rc 0),
+    # so the first version counted a checkout the runner cleaned up between the re-probe and the `rm` as
+    # THIS class's removal. `reaped=` is not cosmetic: the entry point uses it to unlock df attribution,
+    # so the pass claimed BYTES for a deletion it never performed, and the REAPED row asserted "no
+    # content written for >= N s" about an entry that simply vanished — the same false claim the two
+    # `GONE … reason=vanished*` sites above exist to prevent. Driven identically to (s) (an instrumented
+    # copy of the REAL owner), one statement later.
+    if [ -n "$owner_rm" ]; then
+        PASS_OWNER="$owner_rm"
+        base="$T/s2.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-49)"
+        fixture_entry dead "$work" job-vanishing-at-rm 300 || return 1
+        s2="$(uniqstate s2)"
+        out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s2" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+        sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+        case_check "$(grep -qF 'reason=vanished-at-removal' <<<"$out" && echo 0 || echo 1)" \
+                   "s2 an entry that vanishes between the re-probe and the rm is NAMED reason=vanished-at-removal"
+        case_check "$(grep -qF 'gone=1 ' <<<"$sum" && echo 0 || echo 1)" \
+                   "s2 … counted as gone= (summary: ${sum:-<none>})"
+        case_check "$(grep -qF 'reaped=0 ' <<<"$sum" && echo 0 || echo 1)" \
+                   "s2 … and NOT as reaped: the class does not claim a deletion it did not perform"
+        case_check "$(grep -qF 'REAPED' <<<"$out" && echo 1 || echo 0)" \
+                   "s2 … and no REAPED row is printed for it (no false 'no content written for >= N s')"
+        case_check "$(grep -qF 'unmeasurable=0 ' <<<"$sum" && echo 0 || echo 1)" \
+                   "s2 … and not unmeasurable either — a gone checkout is a fact about the runner, not a doubt about the box"
+    fi
     return $((CASE_FAIL > 0))
 }
 
@@ -1419,6 +1445,17 @@ MUT_O2='s/^    print_summary refused$/    print_summary no-roots/'
 # during the pass does. `MUT_S` then reverts the guard under test, which must redden the same fixture.
 MUT_S_INSTRUMENT='s/^    entry_written_since "\$entry" "\$FLOOR_REF"; verdict=\$?/    rm -rf "$entry" 2>\/dev\/null; entry_written_since "$entry" "$FLOOR_REF"; verdict=$?/'
 MUT_S='s/; \[ -e "\$entry" \] || return 3; return 2; }$/; return 2; }/'
+# (s2) THE THIRD VANISH SITE — the REMOVAL window, which was the one left unguarded (#3057 review, P2).
+# Same construction as (s), moved one statement down: the instrumented owner deletes the entry immediately
+# BEFORE the removal guard, so the REAL guard answers against a path that no longer exists — which is
+# exactly a runner finishing a job in that window. `MUT_S_REMOVE` then reverts the guard to the shape
+# that treated `rm -rf` as proof of removal, which must redden the same fixture.
+MUT_S_REMOVE_INSTRUMENT='s|^            if \[ ! -e "\$entry" \] && \[ ! -L "\$entry" \]; then$|            rm -rf "$entry" 2>/dev/null; if [ ! -e "$entry" ] \&\& [ ! -L "$entry" ]; then|'
+# ⛔ `if false` — NOT `if true`: the reverted form must be the PRE-FIX CODE PATH (no existence pre-check,
+# so the fall-through `rm -rf \&\& [ ! -e ]` credits a vanished entry as REAPED). `if true` would instead
+# send EVERY removal down the GONE branch, which the case cannot tell from the fix, and the mutant
+# survives — measured.
+MUT_S_REMOVE='s|if \[ ! -e "\$entry" \] && \[ ! -L "\$entry" \]; then$|if false; then|'
 # (t)'s TWO fixtures, the same construction one level up: the instrumented owner removes every QUEUED root
 # just before the sweep loop, so the real `root_is_listable` + re-stat run against a path that is gone.
 MUT_T_INSTRUMENT='s|^for _r in \$PENDING_ROOTS; do sweep_root "\$_r"; done$|for _r in $PENDING_ROOTS; do rm -rf "$_r" 2>/dev/null; done; for _r in $PENDING_ROOTS; do sweep_root "$_r"; done|'
@@ -1638,6 +1675,21 @@ if apply_mutation "$OWNER" "$T/mut-s-instrumented/reap-runner-work.sh" "$MUT_S_I
     fi
 else
     bad "s the vanishing fixture could not be built (the classification call moved) — the race arm is not covered"
+fi
+
+# (s2) THE REMOVAL WINDOW — driven the same way as (s), one statement later, because `rm -rf` returning 0
+# for an already-missing path made a vanished checkout indistinguishable from one this class removed.
+if apply_mutation "$OWNER" "$T/mut-s2-instrumented/reap-runner-work.sh" "$MUT_S_REMOVE_INSTRUMENT"; then
+    expect_pass "s2 an entry that VANISHES between the re-probe and the rm is gone=, never REAPED" \
+        case_s "$REAPER" "$T/mut-s-instrumented/reap-runner-work.sh" "$T/mut-s2-instrumented/reap-runner-work.sh"
+    if apply_mutation "$T/mut-s2-instrumented/reap-runner-work.sh" "$T/mut-s2/reap-runner-work.sh" "$MUT_S_REMOVE"; then
+        expect_fail "s2 mutation: reverting the pre-rm existence guard turns the case RED (a vanished entry is credited as reaped)" \
+            case_s "$REAPER" "$T/mut-s-instrumented/reap-runner-work.sh" "$T/mut-s2/reap-runner-work.sh"
+    else
+        bad "s2 mutation could not be applied (the pre-rm existence guard moved) — the arm is not checked any more"
+    fi
+else
+    bad "s2 the removal-window fixture could not be built (the pre-rm guard moved) — the race arm is not covered"
 fi
 
 if apply_mutation "$OWNER" "$T/mut-t-instrumented/reap-runner-work.sh" "$MUT_T_INSTRUMENT"; then
