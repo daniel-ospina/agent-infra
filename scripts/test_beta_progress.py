@@ -1440,8 +1440,19 @@ def test_a_malformed_fix_repo_entry_is_unavailable_not_a_typeerror(monkeypatch, 
     `return None`. The dedupe now runs AFTER validation, so every malformed entry takes the honest
     `unavailable` path.
     """
-    monkeypatch.setattr(bp, "gh",
-                        lambda *a: [pr(900)] if a[:2] == ("pr", "list") else [])
+    # ⛔ THE TRACKER PAIR MUST BE VALID, OR THIS TEST PINS NOTHING (#3457 review round 15). It used
+    # to answer `[pr(900)]` for BOTH windows; when `pr()`'s `merged` default became `None` (round
+    # 14), the MERGED row was refused by the mandatory-`mergedAt` clause, `compute()` returned None
+    # BEFORE the `FIX_REPOS` loop, and the historic `dict.fromkeys`-before-validation bug went
+    # invisible: re-applying it left 42/42 GREEN, where at `da437ada3` it redded (measured). A
+    # fixture that short-circuits ahead of the code under test is the same false PASS in the other
+    # direction.
+    def fake_gh(*a):
+        if a[:2] != ("pr", "list"):
+            return []
+        return [pr(900)] if a[a.index("--state") + 1] == "open" else [pr(900, merged=LONG_AGO)]
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
     # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO (#3457 review round 10). Every entry in this
     # loop is rejected BEFORE a read, so the fallback never ran -- but the tracker pair's own REST
     # arm does, and a mutant that forces it sent this test to the REAL api.github.com (measured on
@@ -1565,6 +1576,17 @@ def test_a_fix_repo_listed_twice_is_read_once(monkeypatch, no_cache):
     assert windows == {"open": "500", "merged": "400"}, (
         "the fix-repo windows must be the tracker's windows (open 500 / merged 400), got %r"
         % (windows,))
+    # ⛔ AND THE MERGED READ MUST ASK FOR THE STAMP (#3457 review round 15). `mergedAt` is
+    # MANDATORY in a merged window, so dropping it from the `--json` list would make every merged
+    # read refuse — and, because `_repo_prs` then falls back, silently move all four lists onto the
+    # un-layer'd REST arm forever. Nothing asserted the field list, so both such edits left 42/42
+    # GREEN (measured). This is the one place the field list is observable.
+    for a in calls:                    # EVERY list, the TRACKER's included
+        if a[:2] == ("pr", "list") and a[a.index("--state") + 1] == "merged":
+            assert "mergedAt" in a[a.index("--json") + 1], (
+                "a merged read does not ask for `mergedAt` (%r) — every row it returns will be "
+                "refused by the mandatory-stamp rule, and the read will silently live on the REST "
+                "fallback with nothing red" % (a,))
 
 
 def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_cache):
@@ -1593,10 +1615,14 @@ def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_
 
     for bad_row in (
             "fix/10114",                                                  # a str, not a row
-            {"number": 3368, "title": {"a": 1}, "headRefName": "fix/x"},   # dict title
-            {"number": 3368, "title": "t", "headRefName": ["fix/x"]},      # list ref
-            {"number": {"n": 1}, "title": "t", "headRefName": "fix/x"},    # non-int number
-            {"number": True, "title": "t", "headRefName": "fix/x"},        # bool is not a number
+            # ⛔ EVERY CASE HERE CARRIES A VALID `mergedAt` (#3457 review round 15). Without a
+            # stamp the MERGED window refused each row first, so the branch under test was never
+            # the one that refused: deleting the `title`/`headRefName` clause left 42/42 GREEN
+            # (measured). A valid stamp makes the type branch the ONLY possible refusal.
+            {"number": 3368, "title": {"a": 1}, "headRefName": "fix/x", "mergedAt": LONG_AGO},
+            {"number": 3368, "title": "t", "headRefName": ["fix/x"], "mergedAt": LONG_AGO},
+            {"number": {"n": 1}, "title": "t", "headRefName": "fix/x", "mergedAt": LONG_AGO},
+            {"number": True, "title": "t", "headRefName": "fix/x", "mergedAt": LONG_AGO},
             # ⛔ THE `mergedAt` GATE TOO. `_repo_prs` requests `mergedAt` for a non-open window, so a
             # non-str there is the documented shape violation -- and it was the one branch of that
             # gate with no test, so deleting it left the suite green.

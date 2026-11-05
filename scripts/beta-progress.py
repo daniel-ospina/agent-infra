@@ -637,8 +637,9 @@ def _shape_pr_rows(rows, state):
 
     ⛔ PRESENCE IS NOT SHAPE — TYPES INCLUDED, and that is why this is not `isinstance(rows, list)`:
     `number` must be an int that is not a bool (a bool IS an int, and `covered(True)` would search
-    for `1`), the two fields `covered()` REGEXES must be strings when present, and `mergedAt` must
-    be a string when present (a falsy non-str there silently under-counts `merged_today`).
+    for `1`), the two fields `covered()` REGEXES must be strings when present, and in a MERGED
+    window `mergedAt` must be PRESENT and a NON-EMPTY string (`""` and `null` both collapse with
+    `(p.get("mergedAt") or "")` and report `merged_today: 0` — a number, not a refusal).
     ⛔ AND `state` IS THE ONE THING THE CALLER KNOWS: an OPEN list carries no `mergedAt`, so
     demanding the key there would refuse every valid read. The tier rows pass `"open"` and rely on
     the `number` check, which is exactly the field `covered(r["number"])` indexes them by.
