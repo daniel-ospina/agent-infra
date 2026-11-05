@@ -700,6 +700,25 @@ for n4k_v in verify-unanswered push-unreported push-killed verify-ancestry-unmea
 done
 [ -z "$n4k_miss" ] && grep -q 'MIGHT exist only locally' <<< "$n4k_body"; rcn4k=$?
 ck "N4k the [wip] NOTE abstains for EVERY abstaining push verdict, not just the three it was written for (${n4k_miss:-none missing}) — a verdict added to the domain must be found in all THREE consumers, not the two that were remembered" $rcn4k
+# ⛔ N4m — `FAILED` MAY NOT SIT IN THE NOTE'S ABSENCE ARM (review round 5, P2 — REPRODUCED). It is the
+# THIRD consumer of a verdict that carries TWO measurements and it was the last one that did not split
+# them: the remote ANSWERED and the ref is ABSENT (establishes "not on origin") vs the remote answered
+# holding a DIFFERENT sha (this lane's commits may well BE on origin — a peer push, or a rail merge of
+# them). Reproduced with a peer force-moving `refs/heads/reused` to an unrelated sha while the lane's
+# commit really was pushed under `refs/heads/other`: this NOTE — the LAST line of the lane log, the order
+# an operator reads — said the commits "exist ONLY locally and were NOT pushed" over a commit
+# `git ls-remote origin other` answered with, while the `[lane-exit]` line above it declined to claim it.
+# Static for the same reason N4k is: driving this NOTE needs a non-fast-forward fixture AND a peer move
+# inside the verify window, and what went stale is the SHAPE of the arm, not the sentence.
+n4m_ok=""
+grep -qE '^        FAILED\)$' <<< "$n4k_body" && n4m_ok="$n4m_ok FAILED-arm"
+grep -q 'branch_on_origin=\$LANE_END_ORIGIN' <<< "$n4k_body" && n4m_ok="$n4m_ok splits-on-origin"
+grep -q 'some OTHER ref was NOT measured' <<< "$n4k_body" && n4m_ok="$n4m_ok abstains"
+# control: the honest sentence must still exist for the ref-ABSENT half — deleting the split by deleting
+# the sentence would pass the three greps above.
+grep -q 'branch_on_origin empty' <<< "$n4k_body" && n4m_ok="$n4m_ok keeps-the-absence-half"
+case "$n4m_ok" in *FAILED-arm*splits-on-origin*abstains*keeps-the-absence-half*) rcn4m=0 ;; *) rcn4m=1 ;; esac
+ck "N4m …and the NOTE splits FAILED on what the remote actually holds, rather than re-asserting the absence the [lane-exit] line above declines [$n4m_ok]" $rcn4m
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
 # ⛔ N6 — AN UNREADABLE REMOTE ANSWER IS UNKNOWN, NOT "NO PROTECTED NAMES" (review cycle 2, finding 1,
@@ -750,6 +769,28 @@ PATH="$TMP/bin-nohead:$PATH" O="$O" bash -c '
 ' _ "$GATE" "$WT2" 2>/dev/null > "$TMP/nohead.out"
 grep -q 'push=verify-head-unreadable' "$TMP/nohead.out" && ! grep -q 'push=pushed' "$TMP/nohead.out"; rcn8=$?
 ck "N8 …an unreadable HEAD records verify-head-unreadable, never push=pushed and never FAILED (measured: $(head -c 60 "$TMP/nohead.out")) — FAILED asserted a comparison that was never made" $rcn8
+# ⛔ N8c — AND THAT ARM MAY NOT ASSERT AN EXIT STATUS IT NEVER MEASURED (review round 5, P2 —
+# REPRODUCED). `verify-head-unreadable` is reachable with a NON-ZERO push — the rc≠0/rc=0 split above
+# covers only the arm where the verify read ALSO got no answer — so a push that failed but whose ref DOES
+# exist on the remote (a server that applied the ref and then failed to report, or a rejected re-push of
+# an already-delivered one) lands here. The sentence hardcoded "the push exited 0", in the arm added to
+# stop exactly this class of false claim; measured with a shim whose `push` exits 1 and whose
+# `rev-parse HEAD` exits 1 against an origin that really holds the ref. `lane_end_next`'s arm for this
+# verdict never made the claim, so only the log was wrong — which is the line an operator reads first.
+mkdir -p "$TMP/bin-nohead1"
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 1 ;; *" rev-parse HEAD "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-nohead1/git"
+chmod +x "$TMP/bin-nohead1/git"
+: > "$TMP/rcnohead.log"
+PATH="$TMP/bin-nohead1:$PATH" O="$O" bash -c '
+  . "$1"
+  LANE_END_LOG=/dev/null
+  lane_end_push "no head rc" "$3" "$2" durable 1 1
+  printf "push=%s" "$LANE_END_PUSH"
+' _ "$GATE" "$WT2" "$TMP/rcnohead.log" 2>/dev/null > "$TMP/rcnohead.out"
+grep -q 'push=verify-head-unreadable' "$TMP/rcnohead.out" \
+  && grep -q 'the push exited 1' "$TMP/rcnohead.log" \
+  && ! grep -q 'the push exited 0' "$TMP/rcnohead.log"; rcn8c=$?
+ck "N8c …and its log names the exit status it MEASURED (push rc=1 → 'the push exited 1'), never a hardcoded 0 [$(grep -o 'the push exited [0-9?]*' "$TMP/rcnohead.log" 2>/dev/null | head -1)]" $rcn8c
 # ⛔ N8b — AND THE ARTIFACT MAY NOT TURN THAT MISSING COMPARISON INTO A MEASURED ABSENCE (review round 4,
 # P1 — REPRODUCED). `FAILED` used to carry this arm, and both consumers split only on `branch_on_origin`,
 # so a HEAD that could not be read was published as "which is not the HEAD this terminal measured
@@ -826,14 +867,27 @@ n_ver=$(grep -c 'tb_timeout 5 git -C "$root" ls-remote --heads' "$GATE" 2>/dev/n
 # ⛔ CONTINUATIONS ARE JOINED AND COMMENTS STRIPPED BEFORE THE SCAN (review cycle 6, gap B: a call split by
 # a line continuation — natural for a long refspec — was seen by neither the bounded nor the unbounded
 # count, so `git -C "$root" \` + `fetch origin` on the next line shipped green).
-joined=$(awk '
-  /^lane_end_push\(\)/,/^}/ {
-    if ($0 ~ /^[[:space:]]*#/) next
-    line = line $0
-    if ($0 ~ /\\$/) { sub(/\\$/, "", line); next }
-    print line; line = ""
-  }' "$GATE" 2>/dev/null)
-n_net=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g' | grep -cE 'git -C "\$root".*\b(push|fetch|ls-remote)\b')
+# ⛔ ONE DEFINITION OF THE SCAN, RUN TWICE — against the gate AND against a mutant of it (review round 5,
+# P1 — MEASURED). N14 and its own control (N14scan) had SEPARATE copies of this pipeline, so reverting
+# N14's exemption to the old substring form left the control GREEN: measured, that mutant printed
+# `222 passed, 0 failed`. A control that does not share the expression cannot see a regression in it —
+# the control was asserting its own copy of the rule, which is the "one fact, two expressions" defect in
+# the instrument rather than in the code. One function, two files passed to it.
+n14_scan() { # n14_scan <gate-file> -> "<network> <local-config> <at-bound-position> <unbounded>"
+  local j segs n l b
+  j=$(awk '
+    /^lane_end_push\(\)/,/^}/ {
+      if ($0 ~ /^[[:space:]]*#/) next
+      line = line $0
+      if ($0 ~ /\\$/) { sub(/\\$/, "", line); next }
+      print line; line = ""
+    }' "$1" 2>/dev/null)
+  segs=$(printf '%s\n' "$j" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
+  n=$(printf '%s\n' "$segs" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | wc -l | tr -d ' ')
+  l=$(printf '%s\n' "$segs" | grep -c 'git -C "\$root" remote get-url' | tr -d ' ')
+  b=$(printf '%s\n' "$segs" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | grep -cE 'tb_timeout[[:space:]]+[0-9]+[[:space:]]+git -C "\$root"' | tr -d ' ')
+  printf '%s %s %s %s\n' "$n" "$l" "$b" "$((n - b))"
+}
 # ⛔ COUNTED PER COMMAND SEGMENT, NOT PER LINE (review cycle 7: joining continuations made a bounded and an
 # unbounded call share one line, so `tb_timeout … ls-remote … \` + `&& git -C "$root" fetch origin` read as
 # bounded — a fail-open the join CREATED). Every segment that contains a network verb must carry its own
@@ -846,13 +900,42 @@ n_net=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g'
 # The exclusion is SEGMENT-precise and COUNTED: exactly one such segment is expected, so a future real verb
 # cannot be smuggled in under the same shape — dropping the `--push` flag turns n_local to 0 and reds this
 # arm, and an unbounded fetch/push/ls-remote is still counted because it never matches `remote get-url`.
-NET_SEGS=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
-n_local=$(printf '%s\n' "$NET_SEGS" | grep -c 'git -C "\$root" remote get-url')
-n_net=$(printf '%s\n' "$NET_SEGS" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | wc -l)
-n_unbounded=$(printf '%s\n' "$NET_SEGS" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | grep -cv 'tb_timeout')
+n14_res="$(n14_scan "$GATE")"
+n_net=$(printf '%s\n' "$n14_res" | awk '{print $1}')
+n_local=$(printf '%s\n' "$n14_res" | awk '{print $2}')
+n_bounded_pos=$(printf '%s\n' "$n14_res" | awk '{print $3}')
+n_unbounded=$(printf '%s\n' "$n14_res" | awk '{print $4}')
+# ⛔ THE EXEMPTION IS THE BOUND'S COMMAND POSITION, NOT THE WORD SOMEWHERE IN THE SEGMENT (review round 5,
+# P1 — REPRODUCED). The test was `grep -cv 'tb_timeout'`: a SUBSTRING match over the whole segment, so the
+# word appearing anywhere exempted the call — including in a trailing COMMENT, which the awk above does not
+# strip (it skips full-line `#` only). Measured by injecting
+#   out2="$(git -C "$root" fetch origin 2>/dev/null)"  # tb_timeout
+# immediately above the bounded push: `n_net=5 n_unbounded=0` → N14 GREEN over an UNBOUNDED fetch on the
+# exit path. That is the one thing R3 exists to forbid, and it turns a dying lane into a worktree nobody
+# can reap. The positive form is the shape every real call in `lane_end_push` actually has —
+# `tb_timeout <secs> git -C "$root" <verb>` — so a comment can no longer pay for a call, while a bound on a
+# DIFFERENT command still counts as unbounded (`,` `;` `&&` already split segments in `n14_scan`). The
+# direction of the false verdict is now over-block, never fail-open. The expression lives in `n14_scan`
+# ONLY, so the control below runs the same one.
 [ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
   && [ "$n_net" -ge 3 ] && [ "$n_unbounded" = 0 ] && [ "$n_local" = 1 ]; rcn14=$?
-ck "N14 …every NETWORK call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net network, $n_local local config read)" $rcn14
+ck "N14 …every NETWORK call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net network, $n_local local config read, $n_bounded_pos at bound position)" $rcn14
+# ⛔ N14c — THE ARM ABOVE MUST BE ABLE TO SEE THE CLASS IT EXISTS FOR (review round 5, P1 — REPRODUCED).
+# The substring form passed this suite for twenty-odd cycles while an unbounded `fetch` with a trailing
+# `# tb_timeout` comment was invisible to it, so the assertion is now pinned against a MUTANT of the very
+# function it scans: inject that exact call into a copy of the gate and require the same scan to count an
+# unbounded network call. Without this, a future narrowing of the regex would go green on silence.
+n14_mut="$TMP/n14mut"; mkdir -p "$n14_mut"
+awk '{ print }
+  !done && /tb_timeout 15 git -C "\$root" push/ {
+    print "  out2=\"$(git -C \"$root\" fetch origin 2>/dev/null)\"  # tb_timeout"; done=1
+  }' "$GATE" > "$n14_mut/gate.sh" 2>/dev/null
+grep -q 'fetch origin 2>/dev/null)"  # tb_timeout' "$n14_mut/gate.sh" 2>/dev/null; n14_inj=$?
+# ⛔ THE SAME `n14_scan`, ON THE MUTANT — this is what makes the control real. If the exemption ever goes
+# back to a substring test, field 4 here reads 0 over an unbounded `fetch` and N14scan reds.
+n14_mut_unb=$(n14_scan "$n14_mut/gate.sh" | awk '{print $4}')
+[ "$n14_inj" -eq 0 ] && [ "$n14_mut_unb" -ge 1 ]; rcn14scan=$?
+ck "N14scan …and the arm can SEE an unbounded call a trailing comment pretends to bound (injected: 1 fetch, counted unbounded: $n14_mut_unb) — a substring exemption cannot pass this" $rcn14scan
 # ⛔ N14b — THE BOUND MUST BOUND **WALL CLOCK**, NOT ONLY SPELLING (review cycle 10, P2 — REPRODUCED).
 # N14 is a TEXT SCAN by construction, so it cannot see this class at all, and on a Linux host GNU
 # `timeout` hides it: `tb_watchdog` used to `kill -9 "$pid"` — the DIRECT child only — so a command that
