@@ -554,14 +554,18 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
     (`next=MANUAL … did NOT establish`); it is a distinct verdict from `push=FAILED` (the remote ANSWERED
     and the ref is absent) exactly as the symref read on the same path already refuses to read silence as
-    "no protected names". `push=push-timed-out` is the same honesty for a push whose CLIENT WAS KILLED:
+    "no protected names". `push=push-killed` is the same honesty for a push whose CLIENT WAS KILLED:
     the timer signalled it (`rc=124`) or, on the fleet's internal watchdog with no sentinel, it was
     SIGKILLed (`rc=137`), so the ref may already have been applied server-side and the terminal asserts
     neither delivery nor loss — `FAILED` is reserved for an answer the remote actually gave. ⛔ **THE
     CLASS, NOT ONE INTEGER:** `tb_bound_tmp` degrades to "no sentinel" when its scratch dir cannot be
     made — the full-disk state this feature exists for — and `bounded.sh` then returns the killed child's
     status, so keying on `124` alone left the most likely shape recording `FAILED` over an absence nobody
-    measured.
+    measured. ⛔ **AND THE VERDICT NAMES ONLY THE MEASUREMENT:** `137` is not the timer's signature
+    either — `timeout 1 sh -c 'kill -9 $$'` returns it through GNU `timeout` with the timer never firing,
+    and an OOM killer on these boxes produces it with no timer at all — so the value says `push-killed`
+    and the LOG carries the code and says which cause is *not* established. Claiming "TIMED OUT after 15s"
+    for an OOM kill would be a cause the exit path cannot know, written into the durable artifact.
   * ⛔ **THE ARM ORDER IN `lane_end_next` IS A SAFETY PROPERTY, NOT A STYLE CHOICE** — any domain that says
     `MANUAL` outranks a domain that only reports, and a reporter placed above a MANUAL arm silences it.
     Three separate review cycles have now found the same defect in a neighbouring arm, so it is stated
@@ -570,6 +574,13 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     the MANUAL block above the `archived-local` and `refs/wip/*` reporters while still NAMING the archive
     it found. Every MANUAL arm NAMES the other domain's MANUAL fact instead of returning alone — a refused
     push beside a failed archive says both, and says that re-running the rescue cannot fix the branch.
+    ⛔ **AND NO MANUAL ARM MAY ASSERT AN ABSENCE IT DID NOT MEASURE.** Three verdicts had that shape and
+    now say only what was established: `push=running` is what the PRE-NETWORK marker holds when the lane
+    is killed mid-push, so it says the push had not returned — never that the commits "exist only on this
+    disk", which the same row's own `unpushed=0` would contradict; `not-a-worktree` is not a verdict about
+    any worktree (nothing was examined — the cause is the CALLER's pointer, so `next=` names `WIP_PATH=` as
+    the remedy); and `rescue=UNAVAILABLE` means the rescuer was not FOUND, so `next=` says to install it
+    rather than "re-run bg-rescue-wip.sh", a command that cannot be run.
   * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
     writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
