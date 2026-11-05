@@ -42,12 +42,15 @@
          "loaded". A path that exists and cannot be READ is worse than a path that is absent, because
          absence is refused loudly by `verify_targets` and unreadability is refused by nobody.
          setup.sh's `fleet_srcs` array delivers this file, and it does so NESTED because that is the
-         path this plist names (line above) — `install-launchd.sh` refuses a target that does not
-         resolve. ⛔ NOT because of any `$SELF_DIR`-relative sibling lookup: `worker-supply.sh` sets
-         `HERE` and never reads it, and the sibling an earlier draft of this sentence credited
+         path this plist names — `install-launchd.sh` refuses a target that does not resolve. NOT
+         because of any `$SELF_DIR`-relative sibling lookup: this job's own script sets `HERE` and
+         never reads it, and the sibling an earlier draft of this sentence credited
          (`cloud-cell-supervisor.sh`) is in NO farm array, so it is missing nested AND flat. A false
          justification outlives the shape it described, which is why the corrected reason is written
-         out (fresh review of #3413, P3). `verify_targets` now also refuses a TCC-protected target.
+         out (fresh review of #3413).
+         `verify_targets` now verdicts a TCC-protected EXEC target: that unit is SKIPPED loudly and any
+         already-installed copy is UNLOADED and removed, so this defect cannot come back as an
+         armed-and-dead job even if someone points the path back at the checkout.
 
          ⛔ THE BOUNDS ARE IN THE PLIST, NOT INHERITED. A launchd job gets neither the operator's shell
          env nor its rc files, so an unset variable silently keeps the script's default — and for THIS
