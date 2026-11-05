@@ -1949,23 +1949,40 @@ def test_merged_today_counts_a_pr_merged_at_exactly_midnight_utc(monkeypatch):
     NOT), and the calendar is FROZEN rather than read: `MERGED_TODAY`'s own comment exists so a
     midnight-straddling run cannot flake, and a boundary test that read the live clock would red
     for the clock instead of for the code.
+
+    ⛔ AND THE STUB DELEGATES ITS ARGUMENT, which is the difference between pinning the OPERATOR
+    and pinning the BOUNDARY (#3457 review round 17). The first form answered `gmtime()` with the
+    frozen instant for ANY argument, so it could not see a boundary derived from the wrong
+    instant: `today = time.strftime(…, time.gmtime(time.time() - 86400))` — yesterday's midnight
+    as the boundary, an INFLATED `merged_today` — left the suite 43/43 GREEN. `time()`
+    is frozen to the same instant and `gmtime(secs)` really delegates, so a wrong derivation is a
+    wrong answer here rather than an invisible one.
     """
     import datetime
     import time as _time
 
+    epoch = 1_790_000_000
+    instant = _time.gmtime(epoch)
+
     class _Frozen:                      # a closure over `_time`, NOT a module-level class
         """`bp.time` with a PINNED calendar, delegating the stopwatch to the real module.
 
-        Only `gmtime`/`strftime` are frozen — the day boundary is the only thing under test.
-        `monotonic()` must stay REAL, or the phase clock becomes unreachable and the test would
-        be pinning a different program from the one that ships.
+        `gmtime`/`strftime`/`time` answer from the pinned instant; everything else — `monotonic()`
+        above all, which the phase clock budgets on — stays REAL. Freezing the stopwatch would
+        make `_PHASE_DEADLINE` unreachable and pin a different program from the one that ships.
         """
 
-        def __init__(self, instant):
+        def __init__(self, instant, epoch):
             self._instant = instant
+            self._epoch = epoch
 
-        def gmtime(self, *_a):
-            return self._instant
+        def time(self):
+            return float(self._epoch)
+
+        def gmtime(self, secs=None):
+            # ⛔ DELEGATE THE ARGUMENT, do not discard it: this is what makes a boundary
+            # derived from the WRONG instant observable instead of invisible.
+            return self._instant if secs is None else _time.gmtime(secs)
 
         def strftime(self, fmt, tm):
             return _time.strftime(fmt, tm)
@@ -1973,7 +1990,6 @@ def test_merged_today_counts_a_pr_merged_at_exactly_midnight_utc(monkeypatch):
         def __getattr__(self, name):
             return getattr(_time, name)
 
-    instant = _time.gmtime(1_790_000_000)
     day = datetime.datetime(instant.tm_year, instant.tm_mon, instant.tm_mday,
                             tzinfo=datetime.timezone.utc)
     at_midnight = day.strftime("%Y-%m-%dT00:00:00Z")        # == the module's own `today`
@@ -1988,7 +2004,12 @@ def test_merged_today_counts_a_pr_merged_at_exactly_midnight_utc(monkeypatch):
 
     monkeypatch.setattr(bp, "gh", fake_gh)
     monkeypatch.setattr(bp, "_rest_prs", lambda *a, **kw: [])
-    monkeypatch.setattr(bp, "time", _Frozen(instant))
+    monkeypatch.setattr(bp, "time", _Frozen(instant, epoch))
+    # ⛔ THE STUB'S OWN FIDELITY, ASSERTED RATHER THAN PROMISED. The phase clock budgets on
+    # `monotonic()`; a stub that froze it would leave `_PHASE_DEADLINE` unreachable and this test
+    # would be pinning a different program from the one that ships.
+    assert abs(bp.time.monotonic() - _time.monotonic()) < 5, (
+        "the frozen stub must delegate `monotonic()` to the REAL module")
 
     out = bp.compute()
     assert out is not None
