@@ -138,6 +138,15 @@ os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 # ⛔ ONE CLOCK FOR THE WHOLE READ PHASE (see `PHASE_BUDGET_S`). `compute()` opens it and restores
 # the previous value when it returns; `gh()` derives its child's timeout from what is LEFT of it.
 # None means "no phase in flight", so a direct call (a test, a REPL) keeps the old fixed timeout.
+# ⛔ AND IT IS MEASURED ON `time.monotonic()`, NOT ON THE WALL CLOCK (#3457 review round 6). A
+# budget answered by `time.time()` is answered by a clock that STEPS: an NTP correction or a resume
+# from sleep moves it, and the two directions are both wrong — a forward step truncates every
+# remaining read (a spurious `unavailable`), and a backward step GROWS what is left, so the phase
+# outlives its own constant, which is the one property it exists to hold. Every other bounded read
+# in this tree already budgets on the monotonic clock (`turn-end.py`'s `BOUNCE_BUDGET_S`,
+# `pr-doctor.py`'s `CONFIRM_WINDOW_S`, `merge-queue.py`), and this is the same kind of number.
+# The WALL clock stays where the value is a TIMESTAMP (`out["ts"]`, the cache's age) — those must
+# match the reader's calendar, not the process's uptime.
 _PHASE_DEADLINE = None
 
 
@@ -149,7 +158,7 @@ class _phase_clock:
     def __enter__(self):
         global _PHASE_DEADLINE
         self._prev = _PHASE_DEADLINE
-        _PHASE_DEADLINE = time.time() + PHASE_BUDGET_S
+        _PHASE_DEADLINE = time.monotonic() + PHASE_BUDGET_S
         return _PHASE_DEADLINE
 
     def __exit__(self, *_exc):
@@ -168,7 +177,7 @@ def gh(*args):
     """
     tmo = 120.0
     if _PHASE_DEADLINE is not None:
-        left = _PHASE_DEADLINE - time.time()
+        left = _PHASE_DEADLINE - time.monotonic()
         if left <= 0:
             return None
         tmo = min(tmo, left)
@@ -251,7 +260,8 @@ REST_BUDGET_S = 30
 # lists + two fix-repo PR lists + two issue lists), giving each an effective 16.7 s.
 # 60 s is chosen from the slack band this step really has, and the band is stated with its FLOOR
 # rather than only its ceiling: the step holds 40-90 s at the end of a normal pass, and the harness
-# floors a tick's residual at 20 s (`heartbeat-loop.sh:414`: `[ "$r" -lt 20 ] && r=20`). So the
+# floors a tick's residual at 20 s (the `remaining()` helper in `heartbeat-loop.sh`: `[ "$r" -lt 20 ]
+# && r=20`). So the
 # honest claim is: **the clock FIRES whenever at least 60 s remain**, which is the band's middle and
 # up — and below that the tick can still be killed with no line, because a bound cannot fire before
 # the kill that precedes it. What the constant must NOT do is exceed the band's TOP, where it would
@@ -313,7 +323,7 @@ def _token():
     # spending the last seconds of a pass on a credential lookup is how the tick outlives its kill.
     tmo = 5.0
     if _PHASE_DEADLINE is not None:
-        left = _PHASE_DEADLINE - time.time()
+        left = _PHASE_DEADLINE - time.monotonic()
         if left <= 0:
             return ""
         tmo = min(tmo, left)
@@ -513,7 +523,7 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
         return None
     path = "open" if state == "open" else "closed"
     if deadline is None:
-        deadline = time.time() + REST_BUDGET_S
+        deadline = time.monotonic() + REST_BUDGET_S
     # ⛔ ONE RETRY ON A REPEAT (#2142 review). A repeat proves the list moved DURING the read,
     # and on a box running ~17 concurrent gh clients most movers are churn that a SECOND attempt
     # reads cleanly -- so the read is attempted once more BEFORE it refuses. The cost is bounded
@@ -527,7 +537,7 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
         numbers = set()   # the identity both call sites count; a REPEAT means the list moved
         repeated = False  # set by the repeat detector; only THIS attempt is abandoned by it
         while seen < limit:
-            remaining = deadline - time.time()
+            remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return None           # budget spent -- refuse, never return a short window
             url = ("https://api.github.com/repos/%s/pulls?state=%s&sort=updated&direction=desc"
@@ -673,7 +683,7 @@ def _compute():
     # refusing box MULTIPLY the phase's worst case by the read count and outlive the tick's own
     # `run_bounded` kill -- which prints NOTHING, the failure that budget exists to prevent. With
     # one extra repo this is FOUR reads, not the two the earlier form of this comment described.
-    rest_deadline = time.time() + REST_BUDGET_S
+    rest_deadline = time.monotonic() + REST_BUDGET_S
     if _PHASE_DEADLINE is not None:
         # ⛔ THE REST BUDGET IS A CHILD OF THE PHASE CLOCK, not a peer of it: a slow `gh` read has
         # already spent part of the phase, and REST may not spend that part a second time.
@@ -745,13 +755,19 @@ def _compute():
     #     missing from THIS FILE's projection -- ALSO FALSE for the same reason: `_repo` already
     #     holds it. THE ACTUAL GAP is that `headRepository` is the HEAD/FORK repo, not necessarily
     #     the repo the row lands in (and `baseRepository` is not in `gh pr list`'s field list at
-    #     all), and that a bare `#N` in a title or branch has no referent at all -- the only field
-    #     naming one is `closingIssuesReferences`, which these PRs do not use. Matching a bare
-    #     number against the rows of EVERY repo we read is therefore the same unqualified match
-    #     this comment has just argued against, one level further out. So the successor is
-    #     per-row REFERENT resolution (a qualified match with the referent's repo), which needs a
-    #     signal these reads do not carry -- a follow-up by ABSENCE OF SIGNAL, not by missing
-    #     fields. Until then the optimistic error stands: a
+    #     all), and that a bare `#N` in a title or branch names no referent. ⛔ THE REFERENT FIELD
+    #     EXISTS AND WAS MEASURED, so this is not a missing field either: `closingIssuesReferences`
+    #     is accepted by `gh pr list`, and it does carry the referent's repo (0 of the 197
+    #     populated rows among 400 merged agent-infra rows had a null `repository`, measured
+    #     2026-11-05). What it does NOT do is cover the rows that matter here: the colliding rows
+    #     cite the tracker BARE, so they close nothing and their `closingIssuesReferences` is
+    #     EMPTY (#3368 and #3313 both measured [] while their titles carry `(#10114)`; only #3333
+    #     has a ref, and it is agent-infra#3309). Matching a bare number against the rows of EVERY
+    #     repo we read is therefore the same unqualified match this comment has just argued
+    #     against, one level further out. So the successor is per-row REFERENT resolution (a
+    #     qualified match with the referent's repo), which these rows carry no signal for -- a
+    #     follow-up by ABSENCE OF SIGNAL ON THE COLLIDING ROWS, not by an absent field and not by
+    #     an absent projection. Until then the optimistic error stands: a
     #     fix-repo row citing an in-range number marks the same-numbered tortoise unit covered.
     # ⛔ A REFUSED READ IS NOT "NO PR": with no second source it returns None so the whole line
     # reads `unavailable`, exactly as a failed tracker read does. Inflating `without` from an
