@@ -15892,7 +15892,7 @@ else
   fail "(p) rail-exit.test.sh FAILED — see its output above"
 fi
 
-# ── (q) EVERY `--jq` LITERAL IN THE RAIL MUST COMPILE ─────────────────────────
+# ── (q) EVERY `--jq` PROGRAM IN THE RAIL MUST COMPILE ──────────────────────────
 # #2598's sibling, and the reason #2598's own repro could not find it: `wait_for_run`'s
 # RE-RUN read carried an UNTERMINATED jq string — one closing `"` short:
 #
@@ -15919,25 +15919,42 @@ fi
 # (`github.com/itchyny/gojq v0.12.19` in gh 2.102.0), while this guard compiles with the
 # **jq 1.7** binary. The grammars coincide on every expression the rail uses today, but
 # they are DIFFERENT parsers: a jq-1.7-only construct could pass here and still be
-# rejected by gojq. Closing that would need a gojq binary, which this fleet does not
-# have, so the gap is stated rather than papered over — the direction of the remaining
-# risk is false PASS, and it is bounded to constructs that appear in NEITHER parser's
-# common subset. (Do not "fix" this comment back into "exactly what gh does": it is not.)
+# rejected by gojq, so the remaining risk direction is FALSE PASS. This does NOT need a
+# gojq binary, and an earlier draft of this comment claimed it did — a review cycle
+# falsified that against the tree, which already carries the pattern:
+# `tests/admin-merge-evidence-contract/run.sh` (~:778-790) compiles a generated program on
+# the LIVE engine with `gh api /rate_limit --jq "$PROG"` and PRINTS a skip when gh is
+# unavailable. That is the shape to adopt here if this residual ever needs closing; it is
+# left open deliberately, because a network+auth dependency in THIS suite would turn a
+# deterministic static check into one that silently skips on a box without auth.
+# (Do not "fix" this comment back into "exactly what gh does": it is not.)
 #
-# ⛔ FAIL-CLOSED: a missing `jq`, or an EMPTY population, is a FAILURE. An empty scan is
-# never a clean scan, and a guard that silently skips is the inert-enforcer class this
-# repo keeps re-learning.
+# ⛔ FAIL-CLOSED, THREE WAYS: a missing `jq` is a FAILURE; an EMPTY population is a
+# FAILURE; and a population BELOW `JQ_LITERAL_FLOOR` is a FAILURE. An empty scan is never
+# a clean scan, and a guard over a shrunken population reports a pass it did not earn.
 JQ_LITERALS_TMP="$TMP/jq-literals.txt"
+# FORM 1 — the single-quoted literal, which is where the original bug was.
 { grep -o -- "--jq '[^']*'" "$ROOT/scripts/admin-merge.sh" \
     | sed "s/^--jq '//; s/'\$//" ; } > "$JQ_LITERALS_TMP" 2>/dev/null || true
-# THE VARIABLE-HELD PROGRAMS. A `--jq "$VAR"` is invisible to the literal scan above, and
+# FORM 2 — the UNQUOTED bare-token program (`--jq .nameWithOwner`). A review cycle caught
+# the first draft declaring "every --jq program" while covering only FORM 1 and the
+# variables: SIX call sites (`.nameWithOwner`, `.headRefOid`, `.isDraft`, `.baseRefName`,
+# `.url`, `.sha`) were never compiled. Comment lines are stripped first, so a prose mention
+# of `--jq .isDraft` cannot enter the population; a quoted form is excluded by the first
+# character class so it is not counted twice.
+{ grep -v '^[[:space:]]*#' "$ROOT/scripts/admin-merge.sh" \
+    | grep -oE -- "--jq [^'\"[:space:]][^[:space:]]*" \
+    | sed 's/^--jq //' ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
+# FORM 3 — THE VARIABLE-HELD PROGRAMS. A `--jq "$VAR"` is invisible to both scans above, and
 # there are THREE such programs — `LANE_RUN_JQ`, `FIRST_CHECKS_JQ`, `LANE_RUN_GUARD_JQ`.
 # They are the SAME SHAPE as the expression this section exists for (`.[] | "\(…)\t…”`),
 # so a typo in any of them produces the identical silent-unobservable failure. The first
-# draft of this guard covered only `LANE_RUN_JQ` and its comment called it "the one
-# expression the rail passes as a VARIABLE" — a review cycle falsified that against the
-# script, and the scan is now generic (`^[A-Z_]+_JQ=`), so a FOURTH such program is
-# guarded the day it is added without anyone remembering this section exists.
+# draft covered only `LANE_RUN_JQ` and called it "the one expression the rail passes as a
+# VARIABLE"; a review cycle falsified that against the script. The scan is generic WITHIN
+# THE `_JQ` NAMING CONVENTION — ⛔ that is the limit of the claim, and it is stated rather
+# than overclaimed: a fourth program named `JQ_FILTER=`, `*_PROG=` or `*_EXPR=` would be
+# added and silently unguarded. The floor below is what catches a SHRINK; it cannot catch
+# a wholly new naming convention, and no static scan of a shell script can.
 { grep -oE "^[A-Z_]+_JQ='[^']*'" "$ROOT/scripts/admin-merge.sh" \
     | sed "s/^[A-Z_]*_JQ='//; s/'\$//" ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
 # `grep -c . <empty file>` prints `0` AND exits 1, so the old `|| echo 0` appended a
@@ -15945,13 +15962,22 @@ JQ_LITERALS_TMP="$TMP/jq-literals.txt"
 # then raised "integer expression expected" (condition FALSE), fell through to the else
 # branch, found nothing to compile and reported a PASS — i.e. the empty-population arm was
 # DEAD and inverted into a false PASS, the exact fail-open class this section claims to
-# close. Verified: `grep -c . empty >/dev/null || echo 0` yields `0\n0`. Normalise instead.
+# close. MEASURED: `grep -c . empty 2>/dev/null || echo 0` yields `0\n0`; add the
+# `>/dev/null` and grep's own `0` is discarded, so the same command yields just `0`.
+# Normalise instead of relying on either.
 JQ_LITERAL_COUNT="$(grep -c . "$JQ_LITERALS_TMP" 2>/dev/null || true)"
 case "$JQ_LITERAL_COUNT" in '' | *[!0-9]*) JQ_LITERAL_COUNT=0 ;; esac
+# THE FLOOR. MEASURED at this head: 15 (FORM 1) + 6 (FORM 2) + 3 (FORM 3) = 24. A review
+# cycle showed that without it, converting the population down to ONE program still printed
+# a pass — a guard over 1 of 24 reporting success. ⛔ RAISE this when the rail gains
+# programs; never lower it to make a red go green.
+JQ_LITERAL_FLOOR=24
 if ! command -v jq >/dev/null 2>&1; then
   fail "(q) the rail's --jq compile guard needs jq and jq is NOT on PATH — refusing to skip"
 elif [ "$JQ_LITERAL_COUNT" -eq 0 ]; then
   fail "(q) the --jq scan found NOTHING in scripts/admin-merge.sh — an empty scan is never a clean scan"
+elif [ "$JQ_LITERAL_COUNT" -lt "$JQ_LITERAL_FLOOR" ]; then
+  fail "(q) the --jq scan found only $JQ_LITERAL_COUNT program(s), below the $JQ_LITERAL_FLOOR floor — the population SHRANK, so this pass would not have earned its claim (raise the floor only when the rail gains programs)"
 else
   JQ_BAD=0
   while IFS= read -r jq_expr; do
@@ -15959,13 +15985,13 @@ else
     # `def … ; empty` — compiled in full, never invoked (see the header note).
     if ! jq -n "def _probe: ($jq_expr); empty" >/dev/null 2>&1; then
       JQ_BAD=$((JQ_BAD + 1))
-      echo "   ❌ unparseable --jq literal: $jq_expr"
+      echo "   ❌ unparseable --jq program: $jq_expr"
     fi
   done < "$JQ_LITERALS_TMP"
   if [ "$JQ_BAD" -eq 0 ]; then
-    pass "(q) every --jq program in the rail COMPILES ($JQ_LITERAL_COUNT checked, literals + variable-held)"
+    pass "(q) every --jq program in the rail COMPILES ($JQ_LITERAL_COUNT checked = quoted literals + unquoted tokens + \`*_JQ\` variables)"
   else
-    fail "(q) $JQ_BAD rail --jq literal(s) do not compile — gh fails EVERY read that uses one"
+    fail "(q) $JQ_BAD rail --jq program(s) do not compile — gh fails EVERY read that uses one"
   fi
 fi
 
