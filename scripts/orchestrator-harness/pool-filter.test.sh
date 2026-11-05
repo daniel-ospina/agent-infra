@@ -225,32 +225,23 @@ local_sites="$(grep -cF -- "'\"\$pool_jq\"'" "$RC" 2>/dev/null || true)"
 if [ "${sites:-0}" -eq 3 ] && [ "${local_sites:-0}" -eq 1 ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] call sites splicing the definition: ${sites:-0} file-global + ${local_sites:-0} local - expected 3 + 1 (P0, P1, P2 and the emergency floor)"; fi
 
-# (b) THE TITLE IS READ IN EXACTLY ONE PLACE. A fifth query that writes its own container predicate —
-# `test(`, `match(`, `testmatch(` — has to touch `.title`, so this catches every spelling of the
-# regrown-copy defect without enumerating regex syntax.
-titles="$(grep -c '\.title' "$RC" 2>/dev/null || true)"
-if [ "${titles:-0}" -eq 1 ]; then ok=$((ok+1))
-else bad=$((bad+1)); echo "FAIL [drift] the issue title is read in ${titles:-0} places — expected 1 (the definition); a second place is a second definition of 'work unit'"; fi
-
-# (c) THE KIND SET IS PINNED **EXACTLY**, not by substring (review cycle 3, P2). A substring pin is
-# additive-blind: appending `|plan` to the OUTER alternation left the suite at `56 passed, 0 failed`
-# — green over a widening that hides a whole work kind — while the comment claimed the opposite. The
-# whole title regex is pinned instead, so ANY change to a member, to the structural requirement, or to
-# the enumerated qualifier requires editing THIS line. That is the reviewed test change the definition
-# comment promises.
-TITLE_RE_WANT='^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)'
-TITLE_RE_GOT="$(grep -m1 '^POOL_JQ=' "$RC" | sed -e 's/.*|test("//' -e 's/";"i").*//')"
-if [ "$TITLE_RE_GOT" = "$TITLE_RE_WANT" ]; then ok=$((ok+1))
-else bad=$((bad+1)); echo "FAIL [membership] the container-title regex changed — update TITLE_RE_WANT in this suite (and say why in the PR) rather than widening the rule silently"; echo "    got:  $TITLE_RE_GOT"; echo "    want: $TITLE_RE_WANT"; fi
-
-# (d) THE LABEL ARM IS PINNED TO ONE MEMBER AND ONE SELECT, **by OCCURRENCE COUNT, not by substring**
-# (review cycle 3, P2). A substring pin survived an APPENDED second label select at `56 passed, 0 failed`,
-# so a second label exclusion could ride in green. `grep -c` counts LINES and the whole program is ONE
-# line, so the count must be taken per OCCURRENCE (`grep -o … | wc -l`) or an appended arm is invisible.
-lo="$(grep -oF -- 'map(.name|ascii_downcase)' "$RC" 2>/dev/null | wc -l | tr -d ' ')"
-lo2="$(grep -oF -- 'select(["standing-constraint"]|index($n))' "$RC" 2>/dev/null | wc -l | tr -d ' ')"
-if [ "${lo:-0}" -eq 1 ] && [ "${lo2:-0}" -eq 1 ]; then ok=$((ok+1))
-else bad=$((bad+1)); echo "FAIL [membership] the label arm is not exactly one select of ['standing-constraint'] (label reads=${lo:-0}, select sites=${lo2:-0}, expected 1 and 1) — a label exclusion hides work and must be a reviewed change"; fi
+# (b) THE WHOLE PROGRAM IS PINNED, ONCE, BY WHOLE-TEXT EQUALITY (review cycle 4, P2). The three
+# per-arm pins that used to live here could each be defeated by an ARM APPENDED to the shared program:
+# `grep -c '\.title'` counts LINES and the whole program is ONE line, so a second `.title` arm read as
+# 1; a substring pin on the alternation survived `|plan` appended to the outer group; and an appended
+# second label select (or a fourth arm on a field nothing counted — `.milestone`) read as one select.
+# Measured at the prior head: appending `|select(((.title//"")|ascii_downcase|startswith("spike")|not))`
+# left the suite at `62 passed, 0 failed` while `spike(events): …` was silently DROPPED. Pinning the
+# whole assignment subsumes every one of those: a second arm, a re-spelled label exclusion, an arm on
+# an uncounted field, a reordering, a widened member and a changed qualifier ALL red here.
+#
+# ⛔ SO: CHANGING THE POOL RULE REQUIRES EDITING `POOL_PROG_WANT` BELOW, and that edit is the reviewed
+# test change the definition comment promises. If you are here because this check failed, the question
+# is not "how do I make it green" — it is "am I deliberately changing what counts as a work unit, and
+# have I said why in the PR?" `refs #8465` is what it costs when that question goes unasked.
+POOL_PROG_WANT='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
+if [ "$SEL" = "$POOL_PROG_WANT" ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [membership] the pool program changed — update POOL_PROG_WANT in this suite (and say why in the PR) rather than widening, narrowing or re-arming the rule silently"; echo "    got:  $SEL"; echo "    want: $POOL_PROG_WANT"; fi
 
 echo "pool-filter: $ok passed, $bad failed"
 [ "$bad" -eq 0 ] || exit 1
