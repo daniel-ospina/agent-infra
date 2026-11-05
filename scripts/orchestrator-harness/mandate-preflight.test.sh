@@ -935,6 +935,26 @@ esac
 # option was deleted). Anchor on the EXECUTED line, indented and alone.
 grep -qE '^[[:space:]]+set -u$' "$HELPER"; ck $? "the EXECUTABLE branch sets -u as the header requires (anchored on the executed line, not on the comment that names it)"
 
+# ── E5d: THE REMEDY TEXT, AND THE CANDIDATE PRECEDENCE (#3379 review cycle 23, P2, MEASURED) ──────────
+# Five more measured-green reverts. Four are the REMEDY half of a diagnosis: the state exists because its
+# remedy differs from the alternatives', and the arms pinned the tag and the path but never the remedy, so
+# each could become a diagnosis with no next step. The fifth is rank: the resolvers' candidate ORDER.
+grep -qF 'The remedy is a COMPLETE copy of this helper' "$HELPER"; ck $? "the unread-declaration block keeps its REMEDY (a truncated/stale \$O copy — reachable with no stub, and the only actionable content there)"
+grep -qF 'remedy is a mode fix, NOT a missing deployment' "$HELPER"; ck $? "the UNREADABLE line keeps its remedy (a mode fix) — the whole reason the state is distinguished from MISSING"
+grep -qF 'move the occupant aside' "$HELPER"; ck $? "the NOT-A-FILE line keeps its remedy (move the occupant) — the third state exists BECAUSE neither ship nor chmod applies"
+grep -qF 'no search/execute bit on it or on a parent directory, or it is not a directory' "$HELPER"; ck $? "the undecidable-state verdict names WHICH faults to look for (the operator's only cue)"
+# ⛔ PRECEDENCE IS THE POINT OF AN ORDERED LIST (this change's own P2, one variable over): a stale legacy copy
+# ranked ahead of the box's deployed `$O` is exactly the short-circuit that was fixed. The suite pinned which
+# candidates EXIST and that each is file-tested, never their RANK — so moving the legacy farmed path ahead of
+# `$O` left 203/0 on BOTH seams.
+_mp_rank() { # <file> <for-regex> <earlier-marker> <later-marker> → 0 when earlier precedes later
+  awk -v r="$2" -v a="$3" -v b="$4" '$0 ~ r {buf=$0; while (buf !~ /do[[:space:]]*$/ && (getline nx) > 0) buf=buf" "nx; i=index(buf,a); j=index(buf,b); if (i == 0 || j == 0) {print "MISS"; exit} print (i < j ? "OK" : "REVERSED"); exit}' "$1"
+}
+SP_RANK="$(_mp_rank "$SPAWN" '^[[:space:]]*for c in .*mandate-preflight\.sh' '${O:-}/' '.pi/agent/scripts')"
+M1_RANK="$(_mp_rank "$MERGE" '^[[:space:]]*for _ms in .*mandate-preflight\.sh' '$O/' '.pi/agent/scripts')"
+[ "$SP_RANK" = "OK" ]; ck $? "spawn-gate.sh ranks the box's \$O copy AHEAD of the legacy ~/.pi/agent/scripts one (measured $SP_RANK; a reordering that puts the stale farmed copy first used to pass)"
+[ "$M1_RANK" = "OK" ]; ck $? "…and merge-one.sh ranks them the same way (measured $M1_RANK — the two seams must agree on ORDER, not just membership)"
+
 # ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
 # ⛔ CYCLE 1'S ARMS WERE VACUOUS (measured in cycle 2): they grepped for the STRING `MANDATE_PREFLIGHT_SH`,
 # which the explanatory COMMENT above the resolver also contains — so reverting the whole merge-one.sh fix
