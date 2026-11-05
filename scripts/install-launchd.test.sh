@@ -814,6 +814,33 @@ PLIST
       unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
       bash "$INSTALLER" 2>&1 )
 }
+# Same, but the unit carries launchd's `Program` key instead of a ProgramArguments array — the shape
+# whose launcher the guard must file-type-check as well as TCC-check.
+probe_install_program() { # <home> <program-path> → installer stdout+stderr; rc is the installer's
+    local home="$1" prog="$2"
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>Program</key><string>$prog</string>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
+    rm -f "$home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    ( export HOME="$home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$PROBE_DIR"
+      export AGENTS_DIR="$home/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
 mkfakehome "$PROBE_HOME"
 mkdir -p "$PROBE_HOME/Documents/checkout/scripts"
 PROBE_DEAD="$PROBE_HOME/Documents/checkout/scripts/tcc-dead.sh"
@@ -1308,6 +1335,65 @@ OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_EMPTY" 2>&1)"; RC=$?
 set -e
 assert_eq "$RC" "1" "§7c a 0-BYTE executed target fails the install (execve gives ENOEXEC)"
 assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why"
+
+# (c25) the LAUNCHER is `execve`d too, so the same file-type guarantee must apply to it — and it must
+# additionally be EXECUTABLE, because launchd hands this path to the kernel rather than to an
+# interpreter. Without this arm a `Program` that is a DIRECTORY, a 0-byte file, or a readable
+# non-executable file installed as `installed + loaded` and died 126/127 on every tick: the same
+# category-A false PASS, on the one argument class the TCC model was newly taught to read (review of
+# #3413, round 8 — measured on the previous head at rc=0 / `installed + loaded` for all four shapes).
+PROBE_LAUNCH_DIR="$PROBE_HOME/.pi/agent/scripts"   # a DIRECTORY: exists, but execve gives EACCES
+PROBE_LAUNCH_EMPTY="$PROBE_HOME/.pi/agent/scripts/empty-launcher"
+: > "$PROBE_LAUNCH_EMPTY"; chmod +x "$PROBE_LAUNCH_EMPTY"
+PROBE_LAUNCH_NOX="$PROBE_HOME/.pi/agent/scripts/noexec-launcher.sh"
+mkstub "$PROBE_LAUNCH_NOX"; chmod 644 "$PROBE_LAUNCH_NOX"
+for _probe_l in "$PROBE_LAUNCH_DIR" "$PROBE_LAUNCH_EMPTY" "$PROBE_LAUNCH_NOX"; do
+    set +e
+    OUT="$(probe_install_program "$PROBE_HOME" "$_probe_l" 2>&1)"; RC=$?
+    set -e
+    assert_eq "$RC" "1" "§7c a non-executable-file launcher FAILS the install ($(basename "$_probe_l"))"
+    assert_contains "$OUT" "unreadable or not an executable regular file" "§7c …and names the launcher, not a target (no verdict-2 skip)"
+    if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+        bad "§7c …so it is NOT installed ($(basename "$_probe_l"))"
+    else
+        ok "§7c …so it is NOT installed ($(basename "$_probe_l"))"
+    fi
+done
+chmod 755 "$PROBE_LAUNCH_NOX"
+# POSITIVE CONTROL — the arm must not become a blanket refusal of every launcher.
+set +e
+OUT="$(probe_install_program "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c control: an EXECUTABLE regular-file launcher still installs"
+assert_not_contains "$OUT" "unreadable or not an executable regular file" "§7c …with no launcher complaint"
+
+# (c26) `env -S '<cmd>'` must classify with the SAME rules as the space form, in BOTH directions.
+# A bare `startswith("/")` test made the two disagree: `--script=<TCC>` got no verdict at all (the
+# unit installed — fail-open), and a `--repo <TCC>` value was filed as EXEC (the unit was skipped and
+# DISARMED, while the space form warns and installs — a false refusal of a runnable unit). Both
+# measured on the previous head against the space form (review of #3413, round 8).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "/bin/bash --script=$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -S '--script=<TCC>' does not fail the install"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …env -S '--script=<TCC>' is EXECUTED code, as in the space form (no longer invisible)"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is SKIPPED, not installed with no verdict"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and nothing is installed for it (the fail-open this closes)"
+else
+    ok "§7c …and nothing is installed for it (the fail-open this closes)"
+fi
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_HOME/.pi/agent/scripts/probe-ok.sh --repo $PROBE_HOME/Documents/checkout" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -S '--repo <TCC dir>' does not fail the install"
+assert_contains "$OUT" "WARN TCC-protected data argument" "§7c …env -S '--repo <TCC>' is DATA, as in the space form (not a false refusal)"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so a runnable unit is NOT skipped and disarmed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
 
 # (c4) `env -i bash <script>`: an option AND env's program hop both sit before the script.
 set +e
