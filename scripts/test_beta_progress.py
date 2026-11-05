@@ -2051,6 +2051,41 @@ def test_merged_today_counts_a_pr_merged_at_exactly_midnight_utc(monkeypatch):
         % (out["merged_today"],))
 
 
+def test_rest_prs_with_no_deadline_is_clamped_to_a_live_phase_clock(monkeypatch):
+    """⛔ `deadline=None` MUST NOT OUTLIVE THE PHASE CLOCK (#3457 review round 21).
+
+    The default was a bare `REST_BUDGET_S`, so a caller omitting the deadline got 30 s even with
+    2 s left on the phase — and the module's "ONE clock bounds the WHOLE phase" then held only
+    while every caller remembered to clamp (`_compute` does: `min(rest_deadline, _PHASE_DEADLINE)`).
+    A bound a callee holds only when its caller remembers is not a bound; the shipped call sites
+    are unaffected, and this removes the trap for the next read someone adds.
+
+    Both halves are asserted because they fail in opposite directions: a LIVE clock shortens the
+    request timeout, a SPENT one refuses without spending a request at all.
+    """
+    seen = []
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")          # bypass the credential refusal
+    monkeypatch.setattr(bp, "_rest_get_json",
+                        lambda url, tok, timeout=None: (seen.append(timeout) or []))
+
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 2)
+    assert bp._rest_prs("open", limit=100) == []
+    assert seen and seen[0] <= 2.1, (
+        "the request timeout %r was not clamped to the 2 s the phase has left" % (seen[0],))
+
+    seen.clear()
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() - 1)
+    assert bp._rest_prs("open", limit=100) is None, "a spent phase clock must REFUSE the read"
+    assert seen == [], "a spent phase clock still issued a request"
+
+    # ...and with NO phase in flight the pre-existing default budget is unchanged.
+    seen.clear()
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", None)
+    assert bp._rest_prs("open", limit=100) == []
+    assert seen == [bp.REST_TIMEOUT_S], (
+        "without a phase clock the read keeps its own per-request timeout, got %r" % (seen,))
+
+
 # ── the PRODUCER'S contract: a failed read is UNKNOWN (None), never an empty list ──
 def test_gh_returns_None_on_any_failure_and_never_an_empty_list(monkeypatch):
     """⛔ MUTATION-SURVIVED (measured 2026-11-03) BEFORE THIS TEST EXISTED.
