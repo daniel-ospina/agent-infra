@@ -35,12 +35,22 @@ import urllib.request
 REPO = "daniel-ospina/tortoise"
 # ⛔ THE TRACKER IS NOT THE ONLY REPO A FIX LANDS IN (tortoise#10951). `REPO` is where the ISSUES
 # live; it is not where every fix is written. This backlog is worked by the harness, whose PRs are
-# under `agent-infra`, so a single-repo PR read counts "landed elsewhere" as "nobody is on it".
-# MEASURED 2026-11-05: #10114 was reported `without_pr` — the number a lane charter reads — while
-# agent-infra#3368 (`fix(reaper): the harness PIN TREE is a holder, not residue (#10114)`) was OPEN
-# and agent-infra#3333 folded it. A lane was one step from rebuilding it. This metric decides what
-# the fleet builds next and is the number the owner reads for "beta ships when p0/p1 are merged",
-# so an absent PR may only ever come from a repo that ANSWERED.
+# under `agent-infra`, so a single-repo PR read cannot see the PR a fix actually lives in. This
+# metric decides what the fleet builds next and is the number the owner reads for "beta ships when
+# p0/p1 are merged", so an absent PR may only ever come from a repo that ANSWERED.
+# ⛔ WHAT WAS MEASURED, AND WHAT WAS NOT — the first draft of this comment over-claimed it, and
+# tortoise#11020's own correction comment is the record. #10114 is NOT reported `without_pr` today:
+# it is covered BY ACCIDENT, by a MERGED tracker PR (#10250, merged 2026-10-29) whose title carries
+# `10114`. That accident is bounded -- the merged window is the newest 400 rows (#9658..#11039 on
+# 2026-11-05) -- so when #10250 scrolls out, #10114 becomes `without_pr` WHILE agent-infra#3368
+# (`fix(reaper): the harness PIN TREE is a holder, not residue (#10114)`) is still OPEN, and a lane
+# reads "no PR, you are the path" about live work. Measured flips from this change on the day of
+# authoring: ZERO. This is therefore a DECAY fix: it removes the accident that was hiding the
+# defect, and prevents the future mis-charter; it is not correcting a wrong number today.
+# ⛔ AND THE DECAY HAS ALREADY BITTEN ONCE. Re-measured the same day with this change applied:
+# agent-infra#3467 (`fix(10951): the pool filter was four copies that had drifted`) appeared in the
+# OPEN window, and tortoise P1 #10951 flipped from `without_pr` to `with_pr` — 1 live flip, not 0.
+# `#10114` is still covered only by the #10250 accident, so it is the NEXT one due.
 # ⛔ `open_prs` keeps its old meaning (the TRACKER's open PRs) — the extra repos feed `covered()`
 # ONLY, so widening the gap count cannot silently move the headline number.
 FIX_REPOS = (REPO, "daniel-ospina/agent-infra")
@@ -118,10 +128,45 @@ GH_LAYER_ENV = ({"GH_REST_REAL_GH": _PIN, "GH_LIMIT_REAL_GH": _PIN}
 os.environ.setdefault("GH_LIMIT_NO_WAIT", "1")
 
 
+# ⛔ ONE CLOCK FOR THE WHOLE READ PHASE (see `PHASE_BUDGET_S`). `compute()` opens it and restores
+# the previous value when it returns; `gh()` derives its child's timeout from what is LEFT of it.
+# None means "no phase in flight", so a direct call (a test, a REPL) keeps the old fixed timeout.
+_PHASE_DEADLINE = None
+
+
+class _phase_clock:
+    """Bound every `gh()` inside the block by ONE deadline, and restore what was there before."""
+
+    __slots__ = ("_prev",)
+
+    def __enter__(self):
+        global _PHASE_DEADLINE
+        self._prev = _PHASE_DEADLINE
+        _PHASE_DEADLINE = time.time() + PHASE_BUDGET_S
+        return _PHASE_DEADLINE
+
+    def __exit__(self, *_exc):
+        global _PHASE_DEADLINE
+        _PHASE_DEADLINE = self._prev
+        return False
+
+
 def gh(*args):
-    """Return parsed JSON, or None on ANY failure. None means UNKNOWN, never empty."""
+    """Return parsed JSON, or None on ANY failure. None means UNKNOWN, never empty.
+
+    ⛔ BOUNDED BY THE PHASE CLOCK WHEN ONE IS OPEN. Each read used to get a flat 120 s, so the
+    phase's worst case grew with the NUMBER of reads -- which is exactly the shape that makes
+    adding a repo a regression. A spent clock REFUSES rather than spawning: `None` is the honest
+    `unavailable`, and `unavailable` is a line, where a killed tick prints nothing at all.
+    """
+    tmo = 120.0
+    if _PHASE_DEADLINE is not None:
+        left = _PHASE_DEADLINE - time.time()
+        if left <= 0:
+            return None
+        tmo = min(tmo, left)
     try:
-        r = subprocess.run([GH, *args], capture_output=True, text=True, timeout=120,
+        r = subprocess.run([GH, *args], capture_output=True, text=True, timeout=tmo,
                            env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
     except Exception:
         return None
@@ -169,10 +214,23 @@ REST_PER_PAGE = 100   # GitHub's ceiling for /pulls -- the honest bound on ONE r
 # would under-count
 # `merged_today`, which is the error this fallback must not add.
 REST_TIMEOUT_S = 15   # per request
-# ⛔ ONE BUDGET FOR THE PAIR, not per read: `compute()` creates the deadline and hands it to both.
-# 30 s is ~7x the measured latency (0.43 s/call, 9 calls ~4 s) and sits well inside the tick's
-# 40-90 s of residual slack. Per-read budgets would double it to 90 s and spend the slack.
+# ⛔ ONE BUDGET FOR THE REST PHASE, not per read: `compute()` creates the deadline and hands it to
+# the tracker PAIR *and* to every fix-repo read (`FIX_REPOS`) — FOUR reads at 500/400 rows, up to 18
+# pages. 30 s is ~4x the measured latency (0.43 s/call, ~7.7 s for 18 pages) and sits inside the
+# tick's 40-90 s of residual slack. A PER-READ budget is what this rules out: four 30 s reads is
+# 120 s of REST alone, which spends the slack and then some.
 REST_BUDGET_S = 30
+# ⛔ AND REST IS NOT THE WHOLE PHASE. `gh()` reads are NOT on `rest_deadline`; they were bounded
+# only by `gh()`'s own flat 120 s, so the phase's worst case was (PR lists + issue lists) x 120 s =
+# 480 s BEFORE this change — already past the 390 s `run_bounded` kill (`scripts/heartbeat-loop.sh`:
+# `TARGET` 540 - `IN_PASS_RESERVE` 150). The two fix-repo PR lists added here take it to 720 s: the
+# tick is killed and the box prints NOTHING, the one outcome the shared budget exists to prevent.
+# So ONE clock bounds the WHOLE phase: `compute()` opens it (`_phase_clock`), `gh()` derives every
+# child's timeout from what is LEFT of it, and the REST deadline is clamped to it. The bound is a
+# CONSTANT of the phase — adding a fix repo cannot EXTEND it, it only spends it.
+# 40 s is the FLOOR of that 40-90 s slack band, chosen so the phase provably fits even when the step
+# has no slack left; the measured cost is ~4 s for the REST arm and ~1 s per `gh` read.
+PHASE_BUDGET_S = 40
 
 
 def _token():
@@ -348,9 +406,9 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
     that cannot be read -- or a read whose SHARED deadline (`deadline`, an epoch-seconds
     instant the caller owns; None = no bound) has passed -- returns None for the WHOLE read; a
     partial list is indistinguishable from a complete one at the call site. The deadline is a
-    caller-supplied `deadline`, not a per-read budget: `compute()` gives both reads of a pair
-    the SAME one, because a per-read budget doubles the phase's worst case inside a tick that
-    is killed (see `REST_BUDGET_S`).
+    caller-supplied `deadline`, not a per-read budget: `compute()` gives the tracker PAIR **and
+    every fix-repo read** the SAME one, because a per-read budget MULTIPLIES the phase's worst
+    case by the number of reads, inside a tick that is killed (see `REST_BUDGET_S`).
 
     ⛔ THE OFFSET WINDOW IS A LIVE ORDER, SO A ROW THAT MOVES DURING THE READ MAKES THE READ
     UNCERTIFIABLE -- and the read REFUSES rather than returning the window.
@@ -499,7 +557,11 @@ def _repo_prs(repo, state, limit, deadline):
     (`{"message": "Not Found"}`) or a list of non-dicts. `covered()` then calls `.get()` on a str
     and RAISES, `main()` catches it, and the box prints a traceback and `unavailable` on EVERY
     refresh for as long as that payload persists -- a whole metric lost to one repo's odd answer.
-    Same rule `_rest_prs` already applies per row: the documented shape, or it is not a row.
+    ⛔ AND PRESENCE IS NOT SHAPE — this is the SAME per-row rule `_rest_prs` applies, TYPES
+    INCLUDED (`number` an int that is not a bool, the two fields `covered()` REGEXES strings when
+    present, `mergedAt` a string when present). `isinstance(r, dict)` alone let a row with a dict
+    `title` through this gate and then raised inside `covered()`'s `pat.search()` — the exact
+    traceback this function's docstring claims to prevent.
     """
     fields = ("number,title,headRefName" if state == "open"
               else "number,title,headRefName,mergedAt")
@@ -509,12 +571,32 @@ def _repo_prs(repo, state, limit, deadline):
         rows = _rest_prs(state, limit=limit, deadline=deadline, repo=repo)
     if rows is None:
         return None
-    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+    if not isinstance(rows, list):
         return None
+    for r in rows:
+        if not isinstance(r, dict):
+            return None
+        n = r.get("number")
+        if not isinstance(n, int) or isinstance(n, bool):
+            return None
+        # ⛔ THE TWO FIELDS THAT REACH A REGEX. `covered()` runs `pat.search()` over both, so a
+        # non-str here is a TypeError out of the WHOLE metric, not a row to skip.
+        for key in ("title", "headRefName"):
+            if r.get(key) is not None and not isinstance(r.get(key), str):
+                return None
+        if state != "open" and r.get("mergedAt") is not None \
+                and not isinstance(r.get("mergedAt"), str):
+            return None
     return rows
 
 
 def compute():
+    """The metric, or None. Every read inside it shares ONE clock (see `PHASE_BUDGET_S`)."""
+    with _phase_clock():
+        return _compute()
+
+
+def _compute():
     openpr = gh("pr", "list", "--repo", REPO, "--state", "open", "--limit", "500",
                 "--json", "number,title,headRefName")
     merged = gh("pr", "list", "--repo", REPO, "--state", "merged", "--limit", "400",
@@ -529,9 +611,14 @@ def compute():
     # so this arm claims no more than that a FAILURE never leaves a half-re-read pair.
     # ⛔ ONE BUDGET FOR THE WHOLE REST PHASE, not one per read (see the invariant above). The
     # tracker pair and every fix-repo read draw on the SAME deadline: a per-read budget would let a
-    # refusing box double the phase's worst case and outlive the tick's own `run_bounded` kill --
-    # which prints NOTHING, the failure that budget exists to prevent.
+    # refusing box MULTIPLY the phase's worst case by the read count and outlive the tick's own
+    # `run_bounded` kill -- which prints NOTHING, the failure that budget exists to prevent. With
+    # one extra repo this is FOUR reads, not the two the earlier form of this comment described.
     rest_deadline = time.time() + REST_BUDGET_S
+    if _PHASE_DEADLINE is not None:
+        # ⛔ THE REST BUDGET IS A CHILD OF THE PHASE CLOCK, not a peer of it: a slow `gh` read has
+        # already spent part of the phase, and REST may not spend that part a second time.
+        rest_deadline = min(rest_deadline, _PHASE_DEADLINE)
     if openpr is None or merged is None:
         deadline = rest_deadline                    # the pair shares it
         ro = _rest_prs("open", limit=500, deadline=deadline)
@@ -553,27 +640,50 @@ def compute():
     # monotonically as fixes complete. The tracker's own list counts merged rows for exactly this
     # reason, so the two lists now agree on what coverage means.
     # ⛔ AND `covered()` CANNOT TELL WHICH REPO A ROW CAME FROM, so a fix repo's bare `#N` is read
-    # as the TRACKER's issue N. Measured 2026-11-05 against the live lists: ZERO false covers --
-    # the only match is #10114. It is latent, not live, and it is named here because it fails
-    # OPTIMISTICALLY: an agent-infra PR closing its OWN issue would silently mark the same-numbered
-    # tortoise unit covered, and nobody would build it. The bare numbers that matter are tortoise P1
-    # #2281/#2513/#4917/#4051/#4282/#5064/#5087/#5090/#5095/#5333, all below agent-infra's current
-    # range and rising into it. If that ever fires, the fix is a qualified match (`tortoise#N` /
-    # issue URL), not a wider one.
+    # as the TRACKER's issue N. That fails OPTIMISTICALLY -- the issue reads covered and nobody
+    # builds it -- so the risk is stated as MEASURED rather than as it first read:
+    #   * 2026-11-05 against the live lists (agent-infra open 46 + merged 400, window #1986..#3481):
+    #     TWO colliding tracker units, #10114 and #10951, and BOTH are TRUE covers. Zero false
+    #     covers that day -- but that is a fact about WHICH ROWS THE WINDOW RETURNED, not a property
+    #     of this change, so it is not a guarantee to lean on.
+    #   * The risk is STRUCTURAL and already IN RANGE, not "below the current numbering". agent-infra
+    #     is numbered in the SAME sequence as tortoise and its newest PR is #3481, so tortoise P1s
+    #     #2281 and #2513 are ALREADY inside its range -- an agent-infra PR on its own issue #2513
+    #     collides TODAY. The other eight (#4051/#4282/#4917/#5064/#5087/#5090/#5095/#5333) are
+    #     ABOVE that range: each becomes a scheduled collision as agent-infra's counter passes it.
+    #     (The earlier form of this comment had that direction inverted; it is corrected here rather
+    #     than silently reworded, because it is the record of what was believed.)
+    #   * THE MITIGATION IS NOT A QUALIFIED MATCH. `tortoise#N` / issue-URL matching was the first
+    #     suggestion and it would UNDO this change: agent-infra#3368's title carries the bare
+    #     `(#10114)` that this PR exists to see, so requiring a qualifier restores the `without_pr`
+    #     that charters a lane to rebuild landed work. What is applied instead is narrower and
+    #     safe in exactly one direction: a fix-repo row whose bare `#N` EQUALS THE ROW'S OWN NUMBER
+    #     is that row referring to itself, so it is not a cover (`covered()` below). That closes the
+    #     dominant class -- every fix-repo branch named after its own numbered issue -- and it cannot
+    #     stop covering a genuine cross-reference, which is never to the row's own number.
+    #   * LEFT OPEN, stated: an agent-infra row that cross-references a DIFFERENT agent-infra issue
+    #     whose number is also an open tortoise P0/P1 still reads as a cover. Narrowing that needs a
+    #     per-row repo identity, which neither endpoint returns.
     # ⛔ A REFUSED READ IS NOT "NO PR": with no second source it returns None so the whole line
     # reads `unavailable`, exactly as a failed tracker read does. Inflating `without` from an
     # unreadable repo is the fail-open direction, and it is the one that misdirects a lane into
     # duplicate work.
     fix_prs = []
-    for _repo in dict.fromkeys(FIX_REPOS):          # dedupe: a repo listed twice is one read
-        if _repo == REPO:
-            continue
-        # ⛔ A FIX_REPOS ENTRY IS A CONTRACT, NOT A HINT. A falsy or malformed one must be
+    seen = []
+    for _repo in FIX_REPOS:
+        # ⛔ VALIDATE FIRST, DEDUPE SECOND. `dict.fromkeys(FIX_REPOS)` used to run ABOVE this check,
+        # so an UNHASHABLE entry (a list, a dict) raised `TypeError` out of `compute()` instead of
+        # taking the documented `return None` -- the traceback-and-no-line path the shape gate
+        # exists to prevent (#3457 review).
+        # ⛔ AND A FIX_REPOS ENTRY IS A CONTRACT, NOT A HINT. A falsy or malformed one must be
         # UNREADABLE, never silently substituted: `--repo None` raises, and the REST path's
         # `repo or REPO` would then hand back the TRACKER's `/pulls` under the fix repo's name --
         # a wrong list that still looks complete, which is the one thing this path may not do.
         if not isinstance(_repo, str) or _repo.count("/") != 1 or not all(_repo.split("/")):
             return None
+        if _repo == REPO or _repo in seen:
+            continue      # dedupe: a repo listed twice is ONE read, never two
+        seen.append(_repo)
         for _state, _limit in (("open", 500), ("merged", 400)):
             rows = _repo_prs(_repo, _state, _limit, rest_deadline)
             if rows is None:
@@ -585,7 +695,17 @@ def compute():
 
     def covered(n):
         pat = re.compile(r"(?<![\d])%d(?![\d])" % n)
-        for p in openpr + merged + fix_prs:
+        for p in openpr + merged:
+            if pat.search(p.get("headRefName") or "") or pat.search(p.get("title") or ""):
+                return True
+        for p in fix_prs:
+            # ⛔ A ROW CITING ITS OWN NUMBER IS NOT COVERING A TRACKER ISSUE (see the false-cover
+            # block above). agent-infra numbers ITS OWN issues and PRs in the same sequence, so its
+            # branch `fix/2513-pool-filter` cites agent-infra#2513 -- never tortoise#2513. Skipping
+            # the self-reference closes the dominant class WITHOUT the qualified match that would
+            # stop covering the bare `(#10114)` this change exists to see.
+            if p.get("number") == n:
+                continue
             if pat.search(p.get("headRefName") or "") or pat.search(p.get("title") or ""):
                 return True
         return False
