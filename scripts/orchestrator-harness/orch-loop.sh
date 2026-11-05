@@ -2049,6 +2049,8 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   at="$(refresh_record_field at "$rec")"
   qrec="$(refresh_record_field queued "$rec")"
   hrec="$(refresh_record_field handed "$rec")"
+  # the writer's readability witness: 1 = it read the queue, 0 = it could not, "" = a record predating it
+  rqread="$(refresh_record_field queue_readable "$rec")"
   case "${qrec:-}" in ''|*[!0-9]*) qrec="" ;; esac
   case "${hrec:-}" in ''|*[!0-9]*) hrec="" ;; esac
   # ⛔ `2>/dev/null` DOES NOT SUPPRESS A FAILED REDIRECTION (review finding): the shell reports
@@ -2182,17 +2184,23 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       if [ "$_bl_state" = "UNKNOWN" ]; then
         # ⛔ THE THIRD STATE (review P2, cycle 15): the queue's depth could not be measured HERE, so
         # "EMPTY" is a claim about a file nobody read. ⛔ AND THE CLAUSE ABOUT THE PASS IS READ FROM THE
-        # RECORD, NOT TYPED (review P3, cycle 17): the writer distinguishes THREE states — the queue was
-        # unreadable, it was readable but its DEPTH read failed (it records `backlog=UNKNOWN` WITH
-        # `handed=<head>`), and it recorded no depth at all — and one sentence asserted "the last refresh
-        # pass … failed to read it" for all three. A non-empty `handed=` is positive proof the pass READ
-        # the queue, so that clause was falsifiable from the record beside it.
+        # RECORD, NOT TYPED (review P3, cycle 17; CORRECTED cycle 18). The writer has FOUR shapes that
+        # reach here with no measured depth, and TWO of them mean opposite things: the queue could NOT be
+        # read, and the queue WAS read but neither its DEPTH nor its HEAD could be measured — both publish
+        # `backlog=UNKNOWN` with an empty `handed=`, so those two fields cannot tell a reader which one it
+        # is (a review proved this by driving the record the writer emits for the second shape and getting
+        # the first shape's clause). `queue_readable=` is the writer's own witness and settles it; a record
+        # written before that field existed is only known to carry no depth and no head, and that is all
+        # that may be claimed of it.
+        # A measured HEAD outranks the witness (it proves both readability and which issue was handed).
         if [ -n "$hrec" ]; then
           _pass_said="the last refresh pass READ the queue (it recorded head #$hrec) but could not measure its DEPTH"
-        elif [ "${brec:-}" = "UNKNOWN" ]; then
-          _pass_said="the last refresh pass also could not read the queue"
         else
-          _pass_said="the last refresh record states no depth at all"
+          case "${rqread:-}" in
+            0) _pass_said="the last refresh pass also could NOT read the queue" ;;
+            1) _pass_said="the last refresh pass READ the queue but measured neither its DEPTH nor a head" ;;
+            *) _pass_said="the last refresh record carries no measured depth and no head" ;;
+          esac
         fi
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured by THIS cycle, and %s, so this is NOT known to be an empty queue: work may be queued and unread | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$_pass_said" "$prtail"
