@@ -623,9 +623,22 @@ def disk_reaper_record():
         return (f"record is STALE: last pass {age}s ago (bound {stale}s) — the job is scheduled but is not running",
                 True)
     if ok == "1":
+        # ⛔ THE CAUSE IS NOT DERIVED FROM `freed_mb_unmeasured=` (#3057 review, P2). That field answers
+        # WHOSE reclaim was not measured; the REASON is split in the pass's own `detail=`
+        # (`df could not measure …` vs `owner never answered its ledger …`), because a cut-short sweep has
+        # a mount that DID answer. Synthesising "df could not measure" from the list here re-asserted the
+        # exact false cause the record had just stopped claiming — one reader over.
+        # ⛔ SO THE REASON IS PRINTED FROM THE FIELD THAT HOLDS IT — and printed HERE, because this branch
+        # used to drop `detail=` entirely while every sibling branch prints it. That was not cosmetic:
+        # `ok=1` beside an unmeasured class IS reachable (measured: `DF_BIN=/nonexistent/df --apply --only
+        # venv` records `ok=1 rc=0 freed_mb=unmeasured detail=df could not measure the reclaim for: venv`),
+        # so dropping detail left the fleet panel naming the CLASS and losing the CAUSE. A benign pass
+        # (`detail=ok`) still gains no noise, the same polarity `_class_note` uses for class verdicts.
         unm = kv.get("freed_mb_unmeasured", "")
+        det = kv.get("detail", "") or ""
+        why = f" detail={det}" if det and det != "ok" else ""
         return (f"record ok=1 rc={kv.get('rc', '?')} freed_mb={kv.get('freed_mb', '?')}"
-                f"{f' (df could not measure: {unm})' if unm else ''} age={age}s{_class_note(kv)}", False)
+                f"{f' freed_mb_unmeasured={unm}' if unm else ''}{why} age={age}s{_class_note(kv)}", False)
     # ⛔ A ROUTINE OUTCOME IS NOT A FLEET ALARM. rc 6 (a delegate DEFERRED the pass because the box is
     # busy — the lock was held, or a live tool holds the cache) and rc 5 (a DRY RUN that found work it
     # would do) are the states the runbook tells operators to EXPECT on a healthy busy cell; alarming on

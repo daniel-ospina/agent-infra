@@ -1047,7 +1047,22 @@ actually cover" — the first question after `DISK_REAPER_REPOS` changes.
 class, and **`not-run`** when the class never ran at all (a missing delegate, no repo to scan). Neither
 is a zero: the pass prints `freed_df=unmeasured` and records the classes in `freed_mb_unmeasured=` plus
 the `detail` line. A reader must treat both sentinels as "no measurement", never as a byte count (the
-supervisor prints the raw value; the total is the sum of the classes that WERE measured).
+supervisor prints the raw value).
+
+⛔ **AND THE PASS TOTAL FOLLOWS THE SAME RULE, FOR EVERY CAUSE (#3057 review).** When ANY class's figure
+is `unmeasured` — `df` silent, the owner silent, a class that could not be set up — an APPLY pass records
+`freed_mb=unmeasured` and `freed_mb_total=unmeasured`, because a sum with an unconfirmed term is not a
+measurement and `alert=under-reclaim` asserts on that sum ("the pass RAN and did not keep up", which a
+total that silently counted an unknown as 0 would raise against a class that DID keep up). The measured
+part is not lost: the pass-end line prints it as `freed_df=unmeasured (measured classes: NMB)`, the sum of
+the classes that WERE measured. **A DRY RUN IS THE EXCEPTION**: it removed nothing, so `freed_mb=0` there
+is a real measurement and is recorded as one.
+
+⛔ **`detail=` NAMES THE CAUSE, and the two causes are not interchangeable.** `df could not measure the
+reclaim for:` — the mount did not answer. `owner never answered its ledger for:` — a sweep was cut short
+at `CLASS_TIMEOUT`, so `df` ANSWERED and the class's own ledger did not; blaming `df` there sends an
+operator to the mount for a cut-short ledger. `freed_mb_unmeasured=` stays a single list either way
+("whose reclaim was not measured" has one answer); only the reason is split.
 
 ⛔ **The worktree class is REPORTED, not just counted.** `pi-reap-worktrees.sh` ends every pass with
 ONE machine-readable line —

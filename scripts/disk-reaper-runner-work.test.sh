@@ -1091,6 +1091,20 @@ case_v() { # <entry-point> <owner>
     ps_out="$(DISK_REAPER_STATE_DIR="$s" bash "$pass" --print-status 2>/dev/null)"
     case_check "$(grep -qE '(^|\|)reaped_runner_work=\?(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
                "v1 … and --print-status RENDERS it, so the field has a reader and not only a writer"
+    # ⛔ AND THE HEADLINE REACHES THAT READER TOO — the commit's own MOTIVE was a `--print-status` that
+    # rendered `freed_mb=0` beside `freed_mb_runner_work=unmeasured`, and until this line the suite pinned
+    # every surface of the fix EXCEPT the one it was made for (#3057 review, P2: a claim whose motivating
+    # surface is unasserted is a claim that can silently regress). `--print-status` echoes the field
+    # verbatim (`log_line "freed_mb=$freed"`), so a record that says `unmeasured` must reach the operator
+    # as `unmeasured` and never as a coerced 0.
+    case_check "$(grep -qE '(^|\|)freed_mb=unmeasured(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
+               "v1 … and --print-status RENDERS the unmeasured HEADLINE, never a coerced 0 (it printed: $(grep -oE '(^|\|)freed_mb=[^|]*' <<<"$ps_out" | head -1))"
+    # ⛔ AND THE LOG LINE'S PER-CLASS FIELDS SHARE ONE VOCABULARY WITH THE PASS-END LINE ON STDOUT. This
+    # pass is `--only runner-work`, so uv/venv/worktree/duplicate-install were never SELECTED: the stdout
+    # line renders them `not-run` while the log line dumped the raw counters as `uv=0 venv=0 …` — one
+    # pass telling two surfaces two different things about whether a class even ran.
+    case_check "$(grep -q 'uv=not-run' "$s/disk-reaper.log" 2>/dev/null && echo 0 || echo 1)" \
+               "v1 … and the pass-end LOG renders a DESELECTED class as not-run, not as a measured-looking 0 (log: $(grep -o 'uv=[^ ]*' "$s/disk-reaper.log" 2>/dev/null | head -1))"
     # ── (v2) a VANISHED population must not read as an empty sink ──────────────────────────────────
     base="$T/v2.$$.$RANDOM"; mkdir -p "$base"; s="$(uniqstate v2)"
     stub="$T/v-stub-gone.$$.$RANDOM.sh"

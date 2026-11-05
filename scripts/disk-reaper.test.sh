@@ -1469,6 +1469,13 @@ assert_contains "$ST" "df could not measure" "T42 ... and its detail says so ins
 assert_contains "$ST" "freed_mb_venv=unmeasured" "T42 ... while still refusing to print a measured 0 for it"
 OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
 assert_contains "$OUT" "freed_mb_unmeasured=venv" "T42 --print-status surfaces it too"
+# ⛔ AND THE PASS TOTAL FOLLOWS, FOR EVERY CAUSE, NOT JUST THE UNATTRIBUTABLE OWNER (#3057 review, P2).
+# The rule this file states — "a sum with an unconfirmed term is not a measurement" — was implemented for
+# `runner-work` alone, so THIS arm (the one T42 drives) still recorded `freed_mb=0` beside
+# `freed_mb_venv=unmeasured`: a confident total for a pass whose reclaim is unknown. Measured, before the
+# fix, on exactly this command line.
+assert_contains "$ST" "freed_mb=unmeasured" "T42 ... and the pass TOTAL is unmeasured too, never a sum with an unknown added as 0"
+assert_absent "$ST" "freed_mb=0" "T42 ... so no surface publishes a measured 0 for this pass"
 
 # ── T43: a worktree checkout under a path with a SPACE is measured at its real path (cycle 6, P2) ─
 ENVNAME=t43

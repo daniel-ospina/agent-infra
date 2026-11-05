@@ -2761,17 +2761,39 @@ for _cv in VENV WT UV DUP RW; do
     { [ "$_cw" = 1 ] || [ "$_cv_verdict" = misconfigured ]; } || continue
     [ "$_ch" = 1 ] || CAND_TOTAL="?"
 done
+# ⛔ ONE PREDICATE OVER ALL FIVE CLASSES, NOT A FLAG PER CLASS (#3057 review, P2). The rule stated below —
+# "a sum with an unconfirmed term is not a measurement" — is about the SUM, so it cannot be implemented
+# for `runner-work` alone: a class whose `df` never answered is `DF_*_OK=0` with its `FREED_*` left at the
+# initialised `0`, and the total then publishes a confident number built on an unconfirmed zero. Measured
+# on the arm this suite already drives (`DF_BIN=/nonexistent/df --apply --only venv`) before this fix:
+# `freed_mb=0` beside `freed_mb_unmeasured=venv` and `freed_mb_venv=unmeasured` — the exact "measured zero
+# that is not a measurement" this pass has now removed on five surfaces, one per round. `UNMEASURED` is
+# the ONE list that answers "was anything in this total not measured", for EVERY cause (df silent, owner
+# silent, setup failure), so the total asks THAT and not a per-class flag that a sixth class could miss.
+# ⛔ A DRY RUN IS EXEMPT AND MUST STAY NUMERIC: it removed nothing, so `freed_mb=0` there is a
+# MEASUREMENT (T11 pins it, `scripts/disk-reaper.test.sh`).
+_total_unmeasured=0
+if ! is_dry && [ -n "$UNMEASURED" ]; then _total_unmeasured=1; fi
+# The sum of the classes that WERE measured — a coerced 0 is not a measurement, so it is not a term.
+_measured_total=0
+for _mc in UV VENV WT DUP RW; do
+    eval "_mok=\${DF_${_mc}_OK:-0}; _mfreed=\${FREED_${_mc}:-0}"
+    if [ "$_mok" = 1 ]; then _measured_total=$(( _measured_total + _mfreed )); fi
+done
+# ⛔ `_pc` IS DEFINED BEFORE THE BRANCH, NOT INSIDE IT: the pass-end `log` line below renders every class
+# field with it, and that line runs on a DRY RUN too — defined in the `else`, it made the dry-run log line
+# "command not found", i.e. the surface that is supposed to say what happened said nothing.
+# third arg: was the class SELECTED at all? not-run is a third state, distinct from both
+# "measured zero" and "unmeasured".
+_pc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
+        [ "${1:-0}" = 1 ] && printf '%sMB' "$2" || printf 'unmeasured'; }
 if is_dry; then
     log_line "disk-reaper: pass end mode=dry-run verdict=$verdict freed_df=0MB would_free_du=$(( WOULD_UV + WOULD_VENV + WOULD_WT + WOULD_DUP + WOULD_RW ))MB candidates=$CAND_TOTAL — NOTHING was removed"
 else
-    # third arg: was the class SELECTED at all? not-run is a third state, distinct from both
-    # "measured zero" and "unmeasured".
-    _pc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
-            [ "${1:-0}" = 1 ] && printf '%sMB' "$2" || printf 'unmeasured'; }
     _unmwhy=""
     [ -n "$DF_UNM" ] && _unmwhy="df could not measure: $DF_UNM"
     [ -n "$LEDGER_UNM" ] && _unmwhy="${_unmwhy}${_unmwhy:+ — }owner never answered its ledger: $LEDGER_UNM"
-    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner-work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW"))${_unmwhy:+ — $_unmwhy (not a measured zero)}"
+    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$_measured_total" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner-work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW"))${_unmwhy:+ — $_unmwhy (not a measured zero)}"
 fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
@@ -2813,8 +2835,9 @@ record_body() {
     # ⛔ AND THE HEADLINE TOTAL IS THE FIELD READERS USE (#3057 review, P2). `freed_mb_total` carries
     # this honesty but NOTHING reads it, while `freed_mb=` is what `--print-status`, `tools/fleet/fleet-health.py`
     # and the supervisor all name — so a 0 there is a confident zero on the surface that matters, for a
-    # pass that deleted bytes nobody counted. A sum with an unconfirmed term is not a measurement.
-    if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then printf 'freed_mb=unmeasured\n'; else printf 'freed_mb=%s\n' "$TOTAL"; fi
+    # pass that deleted bytes nobody counted. A sum with an unconfirmed term is not a measurement, and
+    # `_total_unmeasured` asks that of EVERY class's cause, not just the unattributable-owner one.
+    if [ "${_total_unmeasured:-0}" = 1 ]; then printf 'freed_mb=unmeasured\n'; else printf 'freed_mb=%s\n' "$TOTAL"; fi
     printf 'freed_mb_unmeasured=%s\n' "$UNMEASURED"
     # In a dry run nothing was removed, so 0 is measured, not unmeasured.
     _rc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
@@ -2941,16 +2964,16 @@ record_body() {
     case "${_kb:-}" in ''|*[!0-9]*) : ;; *) _free_mb=$(( _kb / 1024 )) ;; esac
     # ⛔ A DRY RUN HAS NOT FREED ANYTHING: printing `freed_mb_total=0` there is a measured-looking
     # zero for a pass that never intended to reclaim (review of #3278).
-    # ⛔ AND AN UNATTRIBUTABLE CLASS MAKES THE SUM UNKNOWABLE — `FREED_RW` is a 0 the owner never
-    # confirmed, so the sum would under-count a class that may have freed gigabytes, which is exactly
-    # the premise `alert=under-reclaim` asserts ("the pass RAN and did not keep up"). The class's own
-    # field is already `unmeasured`; the total and the alert must not contradict it.
-    if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then printf 'freed_mb_total=unmeasured\n'
+    # ⛔ AND AN UNMEASURED CLASS MAKES THE SUM UNKNOWABLE — its `FREED_*` is a 0 nobody confirmed, so the
+    # sum under-counts a class that may have freed gigabytes, which is exactly the premise
+    # `alert=under-reclaim` asserts ("the pass RAN and did not keep up"). The class's own field is already
+    # `unmeasured`; the total and the alert must not contradict it. ONE predicate, every cause.
+    if [ "${_total_unmeasured:-0}" = 1 ]; then printf 'freed_mb_total=unmeasured\n'
     elif is_dry; then printf 'freed_mb_total=not-applicable\n'
     else printf 'freed_mb_total=%s\n' "$_freed_total"; fi
     printf 'free_mb_root=%s\n' "$_first_root"
     printf 'free_mb=%s\n' "${_free_mb:-unmeasured}"
-    if [ "${RW_FREED_UNATTRIB:-0}" != 1 ] && ! is_dry && [ -n "$_free_mb" ] && [ "$_free_mb" -lt "$_low_free" ] && [ "$_freed_total" -lt "$_urb_min" ]; then
+    if [ "${_total_unmeasured:-0}" != 1 ] && ! is_dry && [ -n "$_free_mb" ] && [ "$_free_mb" -lt "$_low_free" ] && [ "$_freed_total" -lt "$_urb_min" ]; then
         printf 'alert=under-reclaim\n'
         printf 'alert_detail=freed_mb=%s (< %s) while free_mb=%s (< %s) — the pass RAN and did not keep up\n' \
                "$_freed_total" "$_urb_min" "$_free_mb" "$_low_free"
@@ -2986,14 +3009,16 @@ write_record "$RECORD_DIR" 2>/dev/null \
              # over an un-writable state dir.
              [ "$verdict" = 3 ] || verdict=4; }
 # ⛔ THE PASS-END LOG LINE IS THE THIRD WRITER OF THE SAME FIGURE, and it was still publishing the sum (#3057
-# review, P2). `freed_mb=$TOTAL` computes straight from a sum that added an UNCONFIRMED `0` for the
-# unattributed class, so this line said `freed_mb=0` while the record written a few lines above it said
+# review, P2). `freed_mb=$TOTAL` computes straight from a sum that added an UNCONFIRMED `0` for an
+# unmeasured class, so this line said `freed_mb=0` while the record written a few lines above it said
 # `freed_mb=unmeasured` — two surfaces of ONE pass disagreeing about whether anybody measured it, and the log
-# is what a postmortem reads. `runner_work=` is that same class figure and follows the same rule; leaving
-# either numeric here is the defect this PR has now fixed on four surfaces in a row, each time on a surface
-# an operator reads first.
-_freed_log="$TOTAL"; _rw_log="$FREED_RW"
-if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then _freed_log="unmeasured"; _rw_log="unmeasured"; fi
-log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$_freed_log uv=$FREED_UV venv=$FREED_VENV worktree=$FREED_WT duplicate_install=$FREED_DUP runner_work=$_rw_log candidates=$CAND_TOTAL ===="
+# is what a postmortem reads. It follows the SAME predicate as the record, or the two disagree again.
+# ⛔ AND THE PER-CLASS FIELDS USE `_pc`, because the raw counters made this line disagree with its own
+# sibling on stdout: a `--only venv` pass printed `uv=0 venv=0 worktree=0 duplicate_install=0` here while
+# the pass-end stdout line rendered `uv=not-run …`, and a df-failed class printed `venv=0` here while the
+# record said `freed_mb_venv=unmeasured`. One pass, one vocabulary — `not-run`/`unmeasured`/`NMB`.
+_freed_log="$TOTAL"
+if [ "${_total_unmeasured:-0}" = 1 ]; then _freed_log="unmeasured"; fi
+log "==== pass end mode=$MODE_TEXT verdict=$verdict freed_mb=$_freed_log uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate_install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner_work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW") candidates=$CAND_TOTAL ===="
 
 exit "$verdict"
