@@ -204,11 +204,32 @@ for _h in $_used; do
             ;;
     esac
 done
+
+# ⛔ AND THE GENERAL DETECTOR, because the list above is an EXPLICIT VOCABULARY, not a derivation —
+# it recognises the helper names this suite uses today, so a NEW helper called before it is defined
+# would still slip through (review of #3405 round 5, P3). bash hands every unresolved command to this
+# hook, so any undefined helper — whatever it is called — is caught, counted, and reported.
+# ⛔ bash runs this handler in a SUBSHELL, so a counter variable would be lost (measured: the hook
+# fired and the summary still read 0). The record is therefore a FILE, and the summary reads it.
+# ⛔ `|| /dev/null` WOULD FAIL OPEN (review of #3422, P3): if the record cannot be created, every
+# undefined command is recorded nowhere and the summary reads 0 — the false-PASS shape returns silently
+# on exactly the box where the harness is degraded. An unusable record therefore fails the run instead.
+_MISSING_LOG="$(mktemp "${TMPDIR:-/tmp}/pi-reap-missing.XXXXXX")" || {
+    echo "  ❌ harness bug: cannot create the undefined-command record — the detector cannot run"; exit 1; }
+# ⛔ TRAP CHAINING: `trap` REPLACES rather than chains, so registering the record cleanup here and the
+# fixture cleanup below would leave only the LAST one installed — which leaked one file per run into
+# $TMPDIR (measured: 13 orphans at a ~5-18 min cadence) on the very suite whose subject is reclaiming
+# disk. There is exactly ONE EXIT trap, below, and it removes both.
+command_not_found_handle() {
+    printf '%s\n' "$1" >>"$_MISSING_LOG" 2>/dev/null
+    printf '  ❌ harness bug: undefined command: %s\n' "$1" >&2
+    return 127
+}
 T="$(mktemp -d "${TMPDIR:-/tmp}/pi-reap-worktree-test.XXXXXX")"
 # Resolve T once: git records RESOLVED worktree paths (/tmp/x is stored as
 # /private/tmp/x), so every expectation must compare resolved-to-resolved.
 T="$(cd "$T" && pwd -P)"
-trap 'rm -rf "$T"' EXIT
+trap 'rm -f "$_MISSING_LOG"; rm -rf "$T"' EXIT
 
 REAL_GIT="$(command -v git)"
 [ -n "$REAL_GIT" ] || { echo "git is required" >&2; exit 1; }
@@ -2446,6 +2467,428 @@ assert_absent "$OUT" "the checkout changed" \
     "A21d an unevaluable probe is NOT reported as a checkout change"
 assert_contains "$(footer $ENV)" "FAILED=0" "A21d the probe failure is not reported as a removal failure"
 assert_dir "$WT_LATED" "A21d the worktree is preserved"
+
+# A21e — the POST-ARCHIVE re-check (review of #3405 round 5, P3). Gate (b) spends four bounded forks
+# between re-check #2 and the fork, so a `clean` verdict captured before the archive does not prove the
+# checkout is clean NOW — and the archive's own `git status` does not list ignored entries, so a file
+# that appears during the archive would be destroyed with the tree and not even recorded as evidence.
+# The shim writes after the Nth `status` probe, so the probe that first sees it is N+1; the archive's
+# own status is the probe before the post-archive gate, which is what makes FAKE_LATE_ON point at the
+# window gate (b) opened.
+ENV=A21e; REPO="$(mk_late_repo $ENV)"
+WT_LATEE="$(add_named_wt "$REPO" "$ENV-late" feat/a21e-late)"
+mkdir -p "$WT_LATEE/.venv/bin"; printf 'py\n' >"$WT_LATEE/.venv/bin/python"
+rm -f "$T/$ENV/cnt-e"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEE/.env" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-e" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21e a file that appears DURING the archive is still a PRESERVE (not a removal)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "post-archive re-check not clean (ignored-artifact" \
+    "A21e …caught by the POST-ARCHIVE re-check specifically (the log names which one)"
+assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21e the footer counts the late preserve"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21e nothing was removed"
+assert_file "$WT_LATEE/.env" "A21e the late ignored file SURVIVED (the exposure gate (b) opened)"
+assert_dir "$WT_LATEE" "A21e the worktree is still on disk"
+# MUTANT: drop the post-archive re-check and the same fixture LOSES the file — which is what makes the
+# assertions above load-bearing rather than incidental.
+MUT5="$T/$ENV/pi-reap-worktrees.mutant-post-archive.sh"
+awk '
+    /RE-CHECK #2 AGAIN, AFTER THE ARCHIVE/ { skip = 1 }
+    skip && /^        fi$/ { skip = 0; next }
+    !skip { print }
+' "$REAPER" >"$MUT5"
+if cmp -s "$REAPER" "$MUT5"; then
+    bad "A21e the POST-ARCHIVE MUTANT DID NOT APPLY — the re-check is unverified"
+else
+    ok "A21e mutant applied: the post-archive re-check is removed"
+fi
+WT_LATEE2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21e-late2)"
+mkdir -p "$WT_LATEE2/.venv/bin"; printf 'py\n' >"$WT_LATEE2/.venv/bin/python"
+rm -f "$T/$ENV/cnt-e2"
+OUT="$(REAPER_OVERRIDE="$MUT5" GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEE2/.env" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-e2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_LATEE2" "A21e MUTANT GOES RED: without the post-archive re-check the checkout IS removed"
+assert_nofile "$WT_LATEE2/.env" "A21e …taking the late ignored file with it (the exposure this closes)"
+
+# A21f — LANE EVIDENCE THAT APPEARS DURING THE ARCHIVE (review of #3422, P2). `clean_gate` tolerates
+# IGNORED_LANE_EVIDENCE because `preserve_before_removal` is ABOUT TO archive it — a precondition that is
+# SPENT once the archive has run. Re-applying that tolerance blind after the archive means a
+# `WORKTREE-REPORT.md` created during it reads as `clean`, the removal proceeds, and the lane's mandatory
+# report — the class gate (b) exists for — is destroyed without ever being captured. Measured before the
+# fix: same fixture and probe index, `.env` => PRESERVE, `WORKTREE-REPORT.md` => REMOVED with
+# `evidence=none`.
+ENV=A21f; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence'
+WT_LATEF="$(add_named_wt "$REPO" "$ENV-late" feat/a21f-late)"
+mkdir -p "$WT_LATEF/.venv/bin"; printf 'py\n' >"$WT_LATEF/.venv/bin/python"
+rm -f "$T/$ENV/cnt-f"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEF/WORKTREE-REPORT.md" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-f" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21f lane evidence created during the archive is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence changed after the archive" \
+    "A21f …and the log names the reason (the archived set and the current set differ)"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21f nothing was removed"
+assert_contains "$(footer $ENV)" "LATE_PRESERVE=1" "A21f it is counted as a late preserve"
+assert_file "$WT_LATEF/WORKTREE-REPORT.md" "A21f the lane's MANDATORY report SURVIVED"
+assert_dir "$WT_LATEF" "A21f the worktree is still on disk"
+# MUTANT: drop the archived-vs-current comparison and the same fixture loses the report.
+MUT6="$T/$ENV/pi-reap-worktrees.mutant-evidence.sh"
+awk '
+    # ⛔ THE ANCHOR IS THE COMMENT THAT INTRODUCES THE BLOCK, so it must track the wording (this
+    # exact arm went vacuous once when a reorder reworded it — `cmp -s` below is what caught it).
+    /TOLERATES THE LANE EVIDENCE/ { skip = 1 }
+    skip && /ev_sig_now/ { seen = 1 }
+    skip && seen && /^        fi$/ { skip = 0; seen = 0; next }
+    !skip { print }
+' "$REAPER" >"$MUT6"
+if cmp -s "$REAPER" "$MUT6"; then
+    bad "A21f the LANE-EVIDENCE MUTANT DID NOT APPLY — the comparison is unverified"
+else
+    ok "A21f mutant applied: the archived-vs-current comparison is removed"
+fi
+WT_LATEF2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21f-late2)"
+mkdir -p "$WT_LATEF2/.venv/bin"; printf 'py\n' >"$WT_LATEF2/.venv/bin/python"
+rm -f "$T/$ENV/cnt-f2"
+OUT="$(REAPER_OVERRIDE="$MUT6" GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEF2/WORKTREE-REPORT.md" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-f2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_LATEF2" "A21f MUTANT GOES RED: without the comparison the checkout IS removed"
+assert_nofile "$WT_LATEF2/WORKTREE-REPORT.md" "A21f …taking the mandatory report with it"
+
+# A21g — A FILE CREATED *INSIDE* THE TOLERATED DIRECTORY DURING THE ARCHIVE (review of #3422, P2). The
+# root-NAME comparison is blind to this (`.worktree-report` is `.worktree-report` whatever appears under
+# it), and the fleet's own fixture writes the mandated report INSIDE that directory — so the exact loss
+# the comparison was added for still happened one path segment down. The captured MEMBER listing is now
+# compared with the listing at the gate.
+ENV=A21g; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21g)'
+WT_LATEG="$(add_named_wt "$REPO" "$ENV-late3" feat/a21g-late)"
+mkdir -p "$WT_LATEG/.venv/bin" "$WT_LATEG/.worktree-report"
+printf 'py\n' >"$WT_LATEG/.venv/bin/python"
+printf 'stage1\n' >"$WT_LATEG/.worktree-report/run.log"
+rm -f "$T/$ENV/cnt-g"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-late-ignored" FAKE_LATE_FILE="$WT_LATEG/.worktree-report/late.md" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-g" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21g a file created INSIDE the tolerated dir during the archive is a PRESERVE"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21g …caught by the SIGNATURE comparison, not the name comparison"
+assert_file "$WT_LATEG/.worktree-report/late.md" "A21g the late file inside the tolerated dir SURVIVED"
+assert_dir "$WT_LATEG" "A21g the worktree is still on disk"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21g nothing was removed"
+
+# A21h — A MEMBER THAT ALREADY EXISTED AND WAS APPENDED TO during the archive (review of #3422 round 9,
+# P2). A NAME comparison cannot see this, and it is the ordinary shape: the lane regenerates
+# `run.log`/`WORKTREE-REPORT.md` while the archive is being taken, so the tarball holds stage 1 and the
+# removal destroys stage 2. The signature carries `<crc> <size> <path>` per file, so any rewrite or
+# append differs.
+ENV=A21h; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21h)'
+WT_H="$(add_named_wt "$REPO" "$ENV-late" feat/a21h-late)"
+mkdir -p "$WT_H/.venv/bin" "$WT_H/.worktree-report"
+printf 'py\n' >"$WT_H/.venv/bin/python"
+printf 'stage1\n' >"$WT_H/.worktree-report/run.log"
+cat >"$T/bin/git-append-late" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do
+    if [ "$a" = "status" ]; then
+        "${REAL_GIT_BIN:-git}" "$@"; rc=$?
+        if [ -n "${FAKE_LATE_COUNTER:-}" ] && [ -n "${FAKE_LATE_FILE:-}" ]; then
+            c=0; [ -f "$FAKE_LATE_COUNTER" ] && c="$(cat "$FAKE_LATE_COUNTER")"
+            c=$((c + 1)); printf '%s\n' "$c" >"$FAKE_LATE_COUNTER"
+            [ "$c" -ge "${FAKE_LATE_ON:-1}" ] && printf 'stage2 appended during the archive\n' >>"$FAKE_LATE_FILE"
+        fi
+        exit "$rc"
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-append-late"
+rm -f "$T/$ENV/cnt-h"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_H/.worktree-report/run.log" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-h" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21h an APPEND to an already-captured member is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21h …caught by the signature (a name comparison cannot see it)"
+assert_contains "$(cat "$WT_H/.worktree-report/run.log" 2>/dev/null)" "stage2 appended during the archive" \
+    "A21h the appended content SURVIVED (the archive only ever held stage 1)"
+assert_dir "$WT_H" "A21h the worktree is still on disk"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21h nothing was removed"
+# MUTANT for the SIGNATURE comparison itself (covers A21g AND A21h: both are shapes a name comparison
+# cannot see). Removing just the signature block must lose the appended content.
+MUT7="$T/$ENV/pi-reap-worktrees.mutant-signature.sh"
+awk '
+    /AND NEITHER ARE THE ROOT NAMES ON THEIR OWN/ { skip = 1 }
+    skip && /ev_sig_now/ { seen = 1 }
+    skip && seen && /^        fi$/ { skip = 0; seen = 0; next }
+    !skip { print }
+' "$REAPER" >"$MUT7"
+if cmp -s "$REAPER" "$MUT7"; then
+    bad "A21h the SIGNATURE MUTANT DID NOT APPLY — the archive-signature gate is unverified"
+else
+    ok "A21h mutant applied: the signature comparison is removed"
+fi
+WT_H2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21h-late2)"
+mkdir -p "$WT_H2/.venv/bin" "$WT_H2/.worktree-report"
+printf 'py\n' >"$WT_H2/.venv/bin/python"
+printf 'stage1\n' >"$WT_H2/.worktree-report/run.log"
+rm -f "$T/$ENV/cnt-h2"
+OUT="$(REAPER_OVERRIDE="$MUT7" GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_H2/.worktree-report/run.log" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-h2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"
+assert_nodir "$WT_H2" "A21h MUTANT GOES RED: without the signature comparison the checkout IS removed"
+assert_absent "$(cat "$WT_H2/.worktree-report/run.log" 2>/dev/null)" "stage2 appended during the archive" \
+    "A21h …and the content appended during the archive is GONE (the archive only holds stage 1)"
+# A21j — A LARGE EVIDENCE SET IS COMPARED IN FULL, WITH NO CAP AND NO RED (review of #3422 rounds 10/11,
+# P1/P2). The listing is now streamed into `| cksum`, so there is no size limit to cross: the earlier cap
+# had no honest polarity — `head -c` on a `pipefail` pipeline made a READABLE tree red forever via
+# SIGPIPE, and "over the cap ⇒ PRESERVE" made the row permanently unreclaimable while the pass reported
+# success (inert-but-green). Both arms below fail if a cap comes back: a large set that is stable must be
+# RECLAIMED, and an append to the LAST-sorting member of that same set must still be CAUGHT (a truncated
+# listing would compare equal).
+ENV=A21j; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21j)'
+mk_set() { # mk_set <worktree> — a set large enough that a truncating cap would hide the last member
+    local wt="$1" i=0
+    mkdir -p "$wt/.venv/bin" "$wt/.worktree-report"
+    printf 'py\n' >"$wt/.venv/bin/python"
+    while [ "$i" -lt 300 ]; do
+        printf 'x\n' >"$wt/.worktree-report/a-$(printf '%03d' "$i").log"; i=$((i + 1))
+    done
+    printf 'stage1\n' >"$wt/.worktree-report/z-last.log"
+}
+WT_J="$(add_named_wt "$REPO" "$ENV-late" feat/a21j-late)"
+mk_set "$WT_J"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21j a LARGE evidence set does not red the pass (no SIGPIPE: exit 0, not 4)"
+assert_nodir "$WT_J" "A21j …and it IS reclaimed: there is no cap, so nothing is permanently unreclaimable"
+WT_J2="$(add_named_wt "$REPO" "$ENV-late2" feat/a21j-late2)"
+mk_set "$WT_J2"
+rm -f "$T/$ENV/cnt-j2"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$WT_J2/.worktree-report/z-last.log" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-j2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21j an append to the LAST-sorting member of a large set is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21j …caught: the digest covers the WHOLE set (a truncated listing would compare equal)"
+assert_contains "$(cat "$WT_J2/.worktree-report/z-last.log" 2>/dev/null)" "appended during the archive" \
+    "A21j …and the appended content SURVIVED"
+assert_dir "$WT_J2" "A21j …with the worktree still on disk"
+
+# A21k — the tolerated roots are compared, in the right SHAPE (review of #3422 rounds 10/11/12).
+# Two shapes, one pass. (a) a DIRECTORY root is walked with a TRAILING-SLASH operand (`find` does not
+# follow its operand without it). (b) a SYMLINKED root is compared AS A LINK, never followed — and that
+# arm needs a fixture that FLIPS if the code follows the link: the target lives OUTSIDE the checkout and
+# is APPENDED TO during the archive, so a following implementation sees a changed digest and PRESERVES,
+# while a link-fingerprinting one sees an unchanged link and reclaims (review of #3422 round 12, P2: the
+# earlier arg-grepping assertion could not fail under any implementation).
+ENV=A21k; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21k)'
+mkdir -p "$T/$ENV-evidence"; printf 'keep me\n' >"$T/$ENV-evidence/report.md"
+WT_K="$(add_named_wt "$REPO" "$ENV-dir" feat/a21k-dir)"
+mkdir -p "$WT_K/.venv/bin" "$WT_K/.worktree-report"; printf 'py\n' >"$WT_K/.venv/bin/python"
+printf 'stage1\n' >"$WT_K/.worktree-report/run.log"
+WT_K2="$(add_named_wt "$REPO" "$ENV-link" feat/a21k-link)"
+mkdir -p "$WT_K2/.venv/bin"; printf 'py\n' >"$WT_K2/.venv/bin/python"
+ln -s "$T/$ENV-evidence" "$WT_K2/.worktree-report"
+cat >"$T/bin/find-recording" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >>"${FIND_ARGS_LOG:?}"
+exec find "$@"
+SHIM
+chmod +x "$T/bin/find-recording"
+: >"$T/$ENV/find-args"
+rm -f "$T/$ENV/cnt-k2"
+OUT="$(REAP_WT_FIND_BIN="$T/bin/find-recording" FIND_ARGS_LOG="$T/$ENV/find-args" \
+    GIT_BIN_OVERRIDE="$T/bin/git-append-late" FAKE_LATE_FILE="$T/$ENV-evidence/report.md" \
+    FAKE_LATE_COUNTER="$T/$ENV/cnt-k2" FAKE_LATE_ON=4 run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+if grep -qF '.worktree-report/' "$T/$ENV/find-args" 2>/dev/null; then
+    ok "A21k a DIRECTORY evidence root is walked with a TRAILING-SLASH operand (its content is compared)"
+else
+    bad "A21k the walk did not use a trailing-slash operand on the directory root — content uncompared"
+fi
+assert_contains "$(cat "$T/$ENV-evidence/report.md" 2>/dev/null)" "appended during the archive" \
+    "A21k the fixture really changed the link TARGET during the archive (else the arm below is vacuous)"
+assert_nodir "$WT_K2" \
+    "A21k a SYMLINKED root is COMPARED AS A LINK — a target changed mid-archive does not preserve (following it would)"
+assert_absent "$(cat "$T/$ENV/reap.log")" "could not be walked" \
+    "A21k neither shape is diagnosed as an unwalkable tree"
+assert_eq "$RC" "0" "A21k the pass completes cleanly with both root shapes (no fabricated RED)"
+assert_nodir "$WT_K" "A21k the directory-root worktree is reclaimed"
+assert_contains "$(cat "$T/$ENV-evidence/report.md" 2>/dev/null)" "keep me" \
+    "A21k …and the thing the symlink pointed at is still there"
+assert_absent "$(cat "$T/$ENV/reap.log")" "vanished during the archive" \
+    "A21k the waived-precondition note does NOT fire for these removals (no false positive)"
+
+# A21l — A DANGLING tolerated symlink is compared AS A LINK, never followed (review of #3422 round 11,
+# P2). `fs_isdir_bounded` is `[ -d ]`, false for a dangling link, so the walk took the file arm and
+# `cksum` through the broken target failed — turning a benign entry into exit 4 RED on EVERY pass, with
+# the false diagnosis "evidence could not be walked", when the removal destroys nothing (a dangling link
+# has no content). The link's target string is what is compared on both sides.
+ENV=A21l; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21l)'
+WT_L="$(add_named_wt "$REPO" "$ENV-late" feat/a21l-late)"
+mkdir -p "$WT_L/.venv/bin"; printf 'py\n' >"$WT_L/.venv/bin/python"
+ln -s "$T/$ENV-does-not-exist" "$WT_L/.worktree-report"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+if [ "$RC" = 4 ]; then
+    bad "A21l a DANGLING evidence symlink reds the pass (exit 4) — that would repeat every pass forever"
+else
+    ok "A21l a DANGLING evidence symlink does NOT red the pass (got rc=$RC)"
+fi
+assert_absent "$(cat "$T/$ENV/reap.log")" "could not be walked" \
+    "A21l …and it is not logged as an unwalkable tree (the diagnosis names what actually happened)"
+assert_nodir "$WT_L" "A21l a dangling link holds nothing, so the checkout is still reclaimed"
+assert_absent "$(cat "$T/$ENV/reap.log")" "vanished during the archive" \
+    "A21l …and a removal with no surviving root does NOT log the vanished-evidence note (review round 12, P3)"
+
+# A21m — A REMOVAL WITH NO TOLERATED EVIDENCE LOGS NO "vanished" NOTE (review of #3422 round 13, P3).
+# `ev_before` keeps `lane_evidence_present`'s empty-string "no evidence" encoding while its neighbours use
+# the manifest's `<none>`, so without normalisation the waived-precondition note fires on EVERY ordinary
+# removal — and it is the only signal for a genuinely waived before-signature. This fixture has no
+# tolerated evidence at all, which is the shape the other fixtures cannot produce (they all have one
+# before AND after the archive, so the note's branch is unreachable for them).
+ENV=A21m; REPO="$(mk_late_repo $ENV)"
+WT_M="$(add_named_wt "$REPO" "$ENV-late" feat/a21m-late)"
+mkdir -p "$WT_M/.venv/bin"; printf 'py\n' >"$WT_M/.venv/bin/python"
+OUT="$(run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_nodir "$WT_M" "A21m a checkout with NO tolerated evidence is reclaimed"
+assert_eq "$RC" "0" "A21m ...cleanly"
+assert_absent "$(cat "$T/$ENV/reap.log")" "vanished during the archive" \
+    "A21m ...and the 'vanished' note does NOT fire when there was nothing to vanish (no false positive)"
+
+# A21n — RETARGETING A LINK DURING THE ARCHIVE IS CAUGHT (review of #3422 round 13, P3). A21k/A21l prove a
+# link is not FOLLOWED, but both pass if the signature drops the target string entirely (`link <path>`
+# alone) — and `tar` stores the target, so a retarget during the archive is exactly the loss the gate is
+# for. The link is retargeted between the two signatures, which a target-less line cannot see.
+ENV=A21n; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21n)'
+mkdir -p "$T/$ENV-a" "$T/$ENV-b"
+printf 'first\n' >"$T/$ENV-a/report.md"; printf 'second\n' >"$T/$ENV-b/report.md"
+WT_N="$(add_named_wt "$REPO" "$ENV-late" feat/a21n-late)"
+mkdir -p "$WT_N/.venv/bin"; printf 'py\n' >"$WT_N/.venv/bin/python"
+ln -s "$T/$ENV-a" "$WT_N/.worktree-report"
+cat >"$T/bin/git-retarget-late" <<'SHIM'
+#!/usr/bin/env bash
+for a in "$@"; do
+    if [ "$a" = "status" ]; then
+        "${REAL_GIT_BIN:-git}" "$@"; rc=$?
+        if [ -n "${FAKE_LATE_COUNTER:-}" ] && [ -n "${FAKE_RETARGET_TO:-}" ] && [ -n "${FAKE_RETARGET_LINK:-}" ]; then
+            c=0; [ -f "$FAKE_LATE_COUNTER" ] && c="$(cat "$FAKE_LATE_COUNTER")"
+            c=$((c + 1)); printf '%s\n' "$c" >"$FAKE_LATE_COUNTER"
+            [ "$c" -ge "${FAKE_LATE_ON:-1}" ] && ln -sfn "$FAKE_RETARGET_TO" "$FAKE_RETARGET_LINK" 2>/dev/null
+        fi
+        exit "$rc"
+    fi
+done
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-retarget-late"
+rm -f "$T/$ENV/cnt"
+OUT="$(GIT_BIN_OVERRIDE="$T/bin/git-retarget-late" FAKE_LATE_COUNTER="$T/$ENV/cnt" FAKE_LATE_ON=4 \
+    FAKE_RETARGET_LINK="$WT_N/.worktree-report" FAKE_RETARGET_TO="$T/$ENV-b" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+assert_eq "$RC" "0" "A21n a link RETARGETED during the archive is a PRESERVE (exit 0)"
+assert_contains "$(cat "$T/$ENV/reap.log")" "lane evidence CHANGED during the archive" \
+    "A21n ...CAUGHT: the signature carries the link's TARGET, not just its name"
+assert_dir "$WT_N" "A21n ...the worktree is still on disk"
+assert_contains "$(footer $ENV)" "REMOVED=0" "A21n ...nothing was removed"
+
+# A21o — A PROBE THAT NEVER ANSWERED IS NOT "ABSENT" (review of #3422 round 14, P2). The probes are
+# predicates, so 1 is their only legitimate "no"; 124/125/137/126/127 all mean the probe never answered.
+# Whitelisting just `124|125` left the rest reading as "absent", which DROPS the root from the digest at
+# rc 0 — an inert comparison that compares equal to itself forever (measured upstream: two trees, one
+# appended to, both digesting to `4294967295 0`) — and on the `lane_evidence_present` side it skips the
+# archive entirely. A functional fixture needs a `sh` shim on PATH that answers 137 to the link probe;
+# THAT DESTABILISES THE HARNESS (measured: run_reaper rc 127 with an empty log, because the shim also
+# intercepts the reaper's own `sh -c` predicates), so the invariant is pinned at the source instead:
+# every probe arm must end in a catch-all, and the presence probe must mean exactly 1 by "absent".
+# Removing either turns this RED (verified against both mutants).
+SIGFN="$(awk '/^evidence_signature\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$REAPER")"
+if [ -z "$SIGFN" ]; then
+    bad "A21o could not extract evidence_signature from the reaper — the assertion below would be vacuous"
+else
+    n_catch="$(printf '%s\n' "$SIGFN" | grep -cE '^ *\*\) exit 3 ;;' || true)"
+    assert_eq "$n_catch" "3" "A21o all THREE probe arms end in a catch-all (any non-0/1 status is RED, not 'absent')"
+    # `case`, not `printf | grep -q`: a quiet grep exits at the first match, the producer takes SIGPIPE,
+    # and under `pipefail` the pipeline reports FAILURE precisely when the pattern WAS found (#841/#864) —
+    # the false-negative this repo has a dedicated guard for. The guard is why this arm is written twice.
+    case "$SIGFN" in
+        *'124|125) exit 3'*)
+            bad "A21o the probe arms whitelist 124|125 again — 137/126/127 would read as 'absent' and drop the root" ;;
+        *)
+            ok "A21o …and no arm whitelists just 124|125" ;;
+    esac
+    # ⛔ THE INNER-LINK GUARD NEEDS ITS OWN ARM (review of #3422, P3 — MEASURED). It is a `||` on a
+    # command substitution inside the `find -exec sh -c` string, NOT a `*) exit 3 ;;` arm, so the count
+    # above does not move when it is deleted (verified: deleting it still counts 3). The doc row used to
+    # credit A21o's catch-all count with pinning it, which was false — this arm is what makes the claim
+    # true. The needle goes in a VARIABLE so its `)` cannot terminate the `case` pattern.
+    READLINK_GUARD='readlink "$l")" || exit 3'
+    case "$SIGFN" in
+        *"$READLINK_GUARD"*)
+            ok "A21o an inner link's readlink that FAILS is a walk failure (RED), not a 'link -> ' line that compares equal to itself" ;;
+        *)
+            bad "A21o the inner link's `readlink` fallback is GONE — a failing readlink would emit 'link X -> ' forever, equal to itself" ;;
+    esac
+fi
+LANEFN="$(awk '/^lane_evidence_present\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$REAPER")"
+case "$LANEFN" in
+    *'if [ "$rc" != 1 ]'*)
+        ok "A21o the presence probe treats ONLY 1 as 'absent' (every other non-zero => !unreadable => RED)" ;;
+    *)
+        bad "A21o the presence probe no longer means exactly 1 by 'absent' — a 137 would skip the archive" ;;
+esac
+
+# A21i — A SIGNATURE THAT CANNOT BE TAKEN IS A RED PASS, NOT A SILENT PRESERVE (review of #3422 round 9,
+# P2). `fs_bounded_out` emits nothing on a non-zero rc, so discarding the rc made "the walk failed" look
+# like "the set is empty": every evidence-bearing row became permanently unreclaimable while the pass
+# reported success — the inert-but-green class this whole PR is about.
+ENV=A21i; REPO="$(mk_late_repo $ENV)"
+printf '.worktree-report/\nWORKTREE-REPORT.md\n' >>"$REPO/.gitignore"
+"$REAL_GIT" -C "$REPO" add .gitignore
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" "$REAL_GIT" -C "$REPO" commit -qm 'ignore lane evidence (A21i)'
+WT_I="$(add_named_wt "$REPO" "$ENV-late" feat/a21i-late)"
+mkdir -p "$WT_I/.venv/bin" "$WT_I/.worktree-report"
+printf 'py\n' >"$WT_I/.venv/bin/python"
+printf 'stage1\n' >"$WT_I/.worktree-report/run.log"
+cat >"$T/bin/find-broken" <<'SHIM'
+#!/usr/bin/env bash
+# A walk that FAILS (like a hung/unreadable mount): emits nothing and returns non-zero.
+printf 'find: cannot walk\n' >&2
+exit 2
+SHIM
+chmod +x "$T/bin/find-broken"
+OUT="$(PATH="$T/bin:$PATH" REAP_WT_FIND_BIN="$T/bin/find-broken" run_reaper $ENV --apply --repo "$REPO")"; RC=$?
+if [ "$RC" = "4" ]; then
+    ok "A21i an unwalkable evidence tree is a FAILED removal (exit 4, RED) — not a silent permanent preserve"
+else
+    bad "A21i an unwalkable evidence tree must be RED (exit 4), got rc=$RC"
+fi
+assert_contains "$(cat "$T/$ENV/reap.log")" "could not be walked" "A21i …and the log names the cause"
+
+
+
+# …AND THE ORDERING THE INSERTION DEPENDS ON (review of #3422, P3): the doc row claims
+# `holder_recheck` stays the LAST probe before the fork. Nothing else asserts it, and it is the reason
+# the block is safe to insert here at all, so it is pinned on the source itself.
+_pa_line="$(grep -n 'post-archive re-check not clean' "$REAPER" | head -1 | cut -d: -f1)"
+_hr_line="$(grep -n 'holder_recheck "\$path" "\$sha" ||' "$REAPER" | tail -1 | cut -d: -f1)"
+_fork_line="$(grep -n 'worktree remove "\$path"' "$REAPER" | head -1 | cut -d: -f1)"
+if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
+        && [ "$_pa_line" -lt "$_hr_line" ] && [ "$_hr_line" -lt "$_fork_line" ]; then
+    ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays last before the fork"
+else
+    bad "A21e gate ORDER regressed: post-archive=$_pa_line holder_recheck=$_hr_line fork=$_fork_line"
+fi
 
 # ── A22: a LOCAL TAG is not a survival mechanism either (re-review) ────
 # The first F3 fix blacklisted only refs/remotes/*. A blacklist cannot be
@@ -4822,6 +5265,21 @@ OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j-ctl" HARNESS_PIN_FILE="$T/$ENV/pinfile-none"
 assert_nodir "$WT_CONTROL" "G15j …and a checkout with no pin record at either reading is still removed"
 
 echo ""
+# ⛔ AND IT MUST NOT FAIL OPEN WHEN THE RECORD CANNOT BE READ (review of #3422, P3): the creation
+# arm above only covers `mktemp`; an unreadable/removed record makes `wc -l` yield nothing, which the
+# old `|| _missing_n=0` turned into "no undefined commands" — green. An unreadable record is a FAILURE.
+if [ ! -r "$_MISSING_LOG" ]; then
+    FAIL=$((FAIL + 1)); _missing_n=0
+    echo "  ❌ harness bug: the undefined-command record is unreadable ($_MISSING_LOG) — the detector cannot report"
+else
+    _missing_n="$(wc -l <"$_MISSING_LOG" | tr -d ' ')"
+    [ -n "$_missing_n" ] || _missing_n=0
+fi
+if [ "$_missing_n" != 0 ]; then
+    FAIL=$((FAIL + _missing_n))
+    echo "  ❌ $_missing_n command(s) were UNDEFINED — those assertions never ran:"
+    sed 's/^/       /' "$_MISSING_LOG"
+fi
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
