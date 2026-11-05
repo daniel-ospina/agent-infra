@@ -201,7 +201,8 @@ ck "a failed \`df\` on the nearest EXISTING ancestor is REFUSED, not walked past
 case "$OUT" in *'REFUSED-UNKNOWN'*) rc=0 ;; *) rc=1 ;; esac
 ck "…and it is REFUSED-UNKNOWN — a parent's free space is not this volume's" $rc
 
-# ── E) THE VERB: a dispatcher that is not this tree's shell code calls the same predicate ────────echo
+# ── E) THE VERB: a dispatcher that is not this tree's shell code calls the same predicate ────────
+echo
 echo "── E) the verb: spawn-gate.sh --disk-admit <target> ──"
 VOUT="$( env PATH="$T/bin-ok:$PATH" FAKE_DF_AVAIL_MB=3584 DISK_BOX=cell-3 DISK_MIN_FREE_MB=500 \
          bash "$GATE" --disk-admit "$REPO/.worktrees/verb-tm" )"; vrc=$?
@@ -453,13 +454,18 @@ case "$H2OUT5" in
   *'REL=[12]'*) ok "H2) an IN-WINDOW id whose CHAIN started is not released (CHAIN_IDS half, driven)" ;;
   *) bad "H2) the CHAIN_IDS half of the guard is INERT — an in-window chained id is released (got: $H2OUT5)" ;;
 esac
-# (3) the CHAIN_IDS half of the same guard — a chain was started even though the lane spawn failed.
-H2OUT2="$(drive_rel 11 "" "10" 10 11 12)"
+# (3) the CHAIN_IDS half, protecting a WHOLE REMAINDER — the id must sit INSIDE the at-or-after
+# window for the guard to be the thing that skips it (cycle 3, P1 — MEASURED). The earlier form of this
+# arm protected id `10`, which is BEFORE `$N`=11, so the `_dm_seen` window skipped it and the guard
+# never ran: it printed ✅ while the CHAIN_IDS half was DEAD under a functionally-removed half whose
+# token was still printed. Chaining 11 AND 12 makes the correct answer `REL=[]`, which ONLY the guard
+# can produce — a weakened guard releases one or both.
+H2OUT2="$(drive_rel 11 "" "11 12" 10 11 12)"
 case "$H2OUT2" in
-  *'REL=[11 12]'*) ok "H2) a live CHAIN's claim is protected too (CHAIN_IDS half of the guard)" ;;
-  *) bad "H2) the CHAIN_IDS half of the guard is gone — an id whose chain STARTED can have its claim released (got: $H2OUT2)" ;;
+  *'REL=[]'*) ok "H2) a live CHAIN protects its WHOLE remainder — 11 and 12 are both chained, so nothing is released" ;;
+  *) bad "H2) the CHAIN_IDS guard does not protect the chained remainder — a released claim lets a peer duplicate live work (got: $H2OUT2)" ;;
 esac
-# (3) everything BEFORE $N is never touched, even with nothing spawned (the `_dm_seen` window).
+# (4) everything BEFORE $N is never touched, even with nothing spawned (the `_dm_seen` window).
 #     This is what the round-5 `for _dm in "$N" "$@"` regression breaks: `$N` first sets _dm_seen on
 #     iteration 1, so the at-or-after guard opens for ids EARLIER than $N too.
 H2OUT3="$(drive_rel 11 "" "" 10 11 12)"
