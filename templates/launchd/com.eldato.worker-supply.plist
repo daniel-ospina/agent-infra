@@ -41,8 +41,11 @@
          `/bin/bash: …: Operation not permitted` — `last exit code=126` — while the inventory read
          "loaded". A path that exists and cannot be READ is worse than a path that is absent, because
          absence is refused loudly by `verify_targets` and unreadability is refused by nobody.
-         setup.sh's `fleet_srcs` array delivers this file (nested, so `$SELF_DIR`-relative sibling
-         resolution keeps working), and `verify_targets` now refuses a TCC-protected target too.
+         setup.sh's `fleet_srcs` array delivers this file (nested, mirroring the repo's
+         `scripts/orchestrator-harness/` layout), and `verify_targets` now verdicts a TCC-protected
+         EXEC target: that unit is SKIPPED loudly and any already-installed copy is UNLOADED and
+         removed, so this defect cannot come back as an armed-and-dead job even if someone points the
+         path back at the checkout.
 
          ⛔ THE BOUNDS ARE IN THE PLIST, NOT INHERITED. A launchd job gets neither the operator's shell
          env nor its rc files, so an unset variable silently keeps the script's default — and for THIS
