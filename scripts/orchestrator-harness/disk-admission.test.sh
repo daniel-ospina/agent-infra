@@ -392,18 +392,30 @@ esac
 # LIVE lane's or chain's claim and lets a peer duplicate in-flight work). A census cannot see a loop
 # that releases the wrong set; this executes it.
 #
+# SCOPE, STATED PLAINLY: what is DRIVEN here is the RELEASE LOOP (and its dispatched.txt drop). The
+# arm's `break` — "the batch stops" — is still only TOKEN-CENSUSED by arm H above; it is not driven,
+# and this header must not imply otherwise.
+#
 # The release loop is EXTRACTED FROM THE SHIPPED SCRIPT and run with injected state, so the assertion
 # is on BEHAVIOUR and survives a refactor of the surrounding case arm. Same idiom, and the same
 # anti-pipeline rule, as the `dmrecount` arms in repo-target.test.sh.
 echo
-echo "── H2) the batch-stop arm releases EXACTLY the unspawned remainder, and stops ──"
+echo "── H2) the batch-stop arm releases EXACTLY the unspawned remainder (batch-stop itself: arm H) ──"
 _relblock="$(awk '/^[[:space:]]*_dm_unspawned=""/{f=1} f{print} f&&/drop_dispatched_rows/{exit}' "$HERE/dispatch-merge.sh")"
 case "$_relblock" in
   *release_issue_claim_unspawned*)
-    case "$_relblock" in
-      *SPAWNED_IDS*|*CHAIN_IDS*) ok "H2) the release loop is extractable from dispatch-merge.sh (so H2 cannot be vacuous)" ;;
-      *) bad "H2) the extracted block has no SPAWNED_IDS/CHAIN_IDS guard — a live lane's claim is releasable"; _relblock="" ;;
-    esac ;;
+    # ⛔ A CONJUNCTION, NOT AN ALTERNATION (review cycle 2, P1). `*SPAWNED_IDS*|*CHAIN_IDS*` accepted
+    # EITHER token, so dropping `CHAIN_IDS` from the guard — round 3's actual regression — still
+    # satisfied it. Both halves must be present or the tokens below prove nothing.
+    _has_sp=0; _has_ch=0
+    case "$_relblock" in *SPAWNED_IDS*) _has_sp=1 ;; esac
+    case "$_relblock" in *CHAIN_IDS*) _has_ch=1 ;; esac
+    if [ "$_has_sp" -eq 1 ] && [ "$_has_ch" -eq 1 ]; then
+      ok "H2) the release loop is extractable and carries BOTH halves of the live-work guard (SPAWNED_IDS + CHAIN_IDS)"
+    else
+      bad "H2) the extracted block is missing part of the live-work guard (SPAWNED_IDS=$_has_sp CHAIN_IDS=$_has_ch) — a live lane's or chain's claim is releasable"
+      _relblock=""
+    fi ;;
   *) bad "H2) the batch-stop release loop is no longer extractable — fix this harness, do not trust the arms below"; _relblock="" ;;
 esac
 drive_rel() { # <N> <spawned> <chain> <all-ids...> -> "REL=[…] DROP=[…]"
@@ -424,7 +436,24 @@ case "$H2OUT" in
   *'DROP=[11 12]'*) ok "H2) …and drops exactly those dispatched.txt rows, so no phantom dispatched work" ;;
   *) bad "H2) the batch-stop arm dropped the wrong dispatched.txt rows (got: $H2OUT)" ;;
 esac
-# (2) the CHAIN_IDS half of the same guard — a chain was started even though the lane spawn failed.
+# (2) THE GUARD, DRIVEN — and the protected id must sit INSIDE the at-or-after window.
+# ⛔ MEASURED (review cycle 2, P1): the first version of (1)/(2) protected id `10`, which is BEFORE
+# `$N`=11, so the `[ "$_dm_seen" -eq 1 ] || continue` window skipped it and the
+# `case " $SPAWNED_IDS $CHAIN_IDS " in *" $_dm "*)` guard NEVER RAN. Both arms printed ✅ for
+# protection they did not verify: a NEUTERED guard (`case " … " in *) : ;; esac`, tokens intact) and a
+# half-deleted one (`CHAIN_IDS` dropped) both left the suite at 53/0. An in-window id is what makes the
+# guard the only thing that can skip it.
+H2OUT4="$(drive_rel 11 "11" "" 10 11 12)"
+case "$H2OUT4" in
+  *'REL=[12]'*) ok "H2) an IN-WINDOW id whose LANE is live is not released (SPAWNED_IDS half, driven)" ;;
+  *) bad "H2) the SPAWNED_IDS half of the guard is INERT — an in-window lived id is released (got: $H2OUT4)" ;;
+esac
+H2OUT5="$(drive_rel 11 "" "11" 10 11 12)"
+case "$H2OUT5" in
+  *'REL=[12]'*) ok "H2) an IN-WINDOW id whose CHAIN started is not released (CHAIN_IDS half, driven)" ;;
+  *) bad "H2) the CHAIN_IDS half of the guard is INERT — an in-window chained id is released (got: $H2OUT5)" ;;
+esac
+# (3) the CHAIN_IDS half of the same guard — a chain was started even though the lane spawn failed.
 H2OUT2="$(drive_rel 11 "" "10" 10 11 12)"
 case "$H2OUT2" in
   *'REL=[11 12]'*) ok "H2) a live CHAIN's claim is protected too (CHAIN_IDS half of the guard)" ;;
