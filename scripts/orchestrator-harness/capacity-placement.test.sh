@@ -1468,7 +1468,12 @@ ck "(k) an unreadable clock reports published=UNREADABLE why=clock-unreadable, n
 # is the pre-fix one — `now=0` — must certify the fleet on the same input. The previous control replayed
 # the pre-fix snippet by hand, which asserted something about the TEST's own text and passed even on an
 # empty module.
-sed 's/unk_pub=1; why="${why:-clock-unreadable}"/now=0/' "$CAP" > "$TMP/cap-badclock.sh"
+# ⛔ AND THE SKEW GUARD GOES WITH IT (fresh review round 4): with the clock arm reverted to `now=0`,
+# a 2001-dated record sorts as a huge NEGATIVE age, which the new clock-skew refusal would catch — so
+# reverting the one guard does not reproduce the pre-fix shape. Both arms go, and (k)'s own predicate
+# must then fail.
+sed -e 's/unk_pub=1; why="${why:-clock-unreadable}"/now=0/' \
+    -e 's|        unk_pub=1; why="${why:-clock-skew}"; break|        :|' "$CAP" > "$TMP/cap-badclock.sh"
 L11M="$(CAP_NOW=garbage CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-badclock.sh" "$(recb 10.0.0.1 1000000000)" 2>&1)"
 ck "  …mutation control: put the pre-fix clock arm back and the SAME input certifies the fleet ($L11M)" \
    "$(case "$L11M" in *'published=1'*'INELIGIBLE=0'*) echo 0 ;; *) echo 1 ;; esac)"
@@ -1680,6 +1685,71 @@ CAPMUT
 L23M="$(CAP_EXPECTED=99999999999999999999 bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-precount.sh" 2>/dev/null)"
 ck "  …mutation control: drop the range guard and the SAME seam reads expected=0 ($L23M)" \
    "$(qF 'expected=0' "$L23M" && echo 0 || echo 1)"
+# (c2) ⛔ A TTL THE SHELL CANNOT COMPARE IS NOT "EVERY RECORD IS FRESH" (fresh review round 4, P2).
+# `[ "$age" -gt "$CAP_PROBE_TTL" ]` with a duration typo (`15m`) FAILS, the stale branch is skipped,
+# and every record counts fresh: MEASURED, a 100,000,000-second-old record read `published=1
+# INELIGIBLE=0`, rc 0, with the only diagnostic on a stderr both emitters discard.
+_OLD_AT=$(( NOW - 100000000 ))
+L24="$(CAP_PROBE_TTL=15m CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 "$_OLD_AT")" 0)"; RC=$?
+ck "(c2) an uncomparable TTL refuses the reading, never certifies it ($L24)" \
+   "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L24" && qF 'why=ttl-unreadable' "$L24" && ! qF 'published=1' "$L24" && echo 0 || echo 1)"
+L24N="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 "$_OLD_AT")" 0)"
+ck "  …while a NUMERIC TTL reads the same record as stale (so the fixture is real: $L24N)" \
+   "$(qF 'published=0' "$L24N" && qF 'stale=(cell-1)' "$L24N" && echo 0 || echo 1)"
+# (c2-mutant) NON-VACUITY: the pre-fix TTL arm (no validation) counts that record as PUBLISHED.
+sed 's|unk_pub=1; why="${why:-ttl-unreadable}"|:|' "$CAP" > "$TMP/cap-prettl.sh"
+L24M="$(CAP_PROBE_TTL=15m CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-prettl.sh" "$(recb 10.0.0.1 "$_OLD_AT")" 2>/dev/null)"
+ck "  …mutation control: without the TTL guard the same record reads published=1 ($L24M)" \
+   "$(qF 'published=1' "$L24M" && echo 0 || echo 1)"
+# (c3) ⛔ A STAMP BEYOND THE WINDOW IN THE FUTURE IS AN UNREADABLE AGE, NOT PERPETUAL FRESHNESS (fresh
+# review round 4, P2). The old clamp made `age<0` into 0, so a box with a broken RTC read `published=1`
+# for ever — and kept reading published AFTER it died. A small skew is still normal and still clamps.
+_FUT_AT=$(( NOW + 100000000 ))
+L25="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 "$_FUT_AT")" 0)"; RC=$?
+ck "(c3) a record dated past now+TTL refuses the reading (why=clock-skew), never 'published' ($L25)" \
+   "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L25" && qF 'why=clock-skew' "$L25" && echo 0 || echo 1)"
+L25S="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 "$(( NOW + 2 ))")" 0)"
+ck "  …while a 2-second skew (two boxes, two clocks) is still PUBLISHED ($L25S)" \
+   "$(qF 'published=1' "$L25S" && echo 0 || echo 1)"
+# (c3-mutant) NON-VACUITY: the pre-fix clamp certifies the broken-RTC record.
+sed 's|        unk_pub=1; why="${why:-clock-skew}"; break|        :|' "$CAP" > "$TMP/cap-preskew.sh"
+L25M="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-preskew.sh" "$(recb 10.0.0.1 "$_FUT_AT")" 2>/dev/null)"
+ck "  …mutation control: with the clamp restored the same record reads published=1 ($L25M)" \
+   "$(qF 'published=1' "$L25M" && echo 0 || echo 1)"
+# (w2) ⛔ THE BOUND MUST NOT DEPEND ON `mktemp` (fresh review round 4, P2). Round 3's
+# `mktemp || _tmp=""` fell back to inheriting stdout, restoring the exact pipe hazard: with a `mktemp`
+# that exits 1, a 1 s bound took the child's full 6 s. The path is now built without `mktemp`.
+BADBIN="$TMP/badbin"; mkdir -p "$BADBIN"
+printf '%s\n' '#!/bin/sh' 'exit 1' > "$BADBIN/mktemp"; chmod +x "$BADBIN/mktemp"
+_w0b="$(date +%s)"
+CAP_BOUND_IMPL=watchdog CAP_INVENTORY_TIMEOUT=1 CAP_CMUX_LIST="$HOLD" PATH="$BADBIN:$PATH" cap_fleet_inventory >/dev/null 2>&1
+_w1b="$(date +%s)"; _dwb=$(( _w1b - _w0b ))
+ck "(w2) the watchdog still bounds with mktemp BROKEN on PATH (${_dwb}s, not 8s)" \
+   "$([ "$_dwb" -lt 5 ] && echo 0 || echo 1)"
+# (w2-mutant) NON-VACUITY: the round-3 body (mktemp || inherit) takes the full 8s under the same PATH.
+{ cat "$CAP"; cat <<'CAPMUT'
+cap_bounded() {
+  local s="${1:-}"; shift 2>/dev/null || true
+  local _p _w _rc _tmp=""
+  _tmp="$(mktemp "${TMPDIR:-/tmp}/cap-bounded.XXXXXX" 2>/dev/null)" || _tmp=""
+  if [ -n "$_tmp" ]; then
+    "$@" >"$_tmp" 2>/dev/null & _p=$!
+  else
+    "$@" & _p=$!
+  fi
+  { sleep "$s"; kill -9 "$_p" 2>/dev/null; } >/dev/null 2>&1 & _w=$!
+  wait "$_p" 2>/dev/null; _rc=$?
+  if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
+  [ -z "$_tmp" ] || { cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; }
+  return "$_rc"
+}
+CAPMUT
+} > "$TMP/cap-mktemp-fallback.sh"
+_w0c="$(date +%s)"
+CAP_BOUND_IMPL=watchdog CAP_INVENTORY_TIMEOUT=1 CAP_CMUX_LIST="$HOLD" PATH="$BADBIN:$PATH" bash -c '. "$1"; cap_fleet_inventory' _ "$TMP/cap-mktemp-fallback.sh" >/dev/null 2>&1
+_w1c="$(date +%s)"; _dwc=$(( _w1c - _w0c ))
+ck "  …mutation control: the mktemp-or-inherit fallback takes ${_dwc}s (so (w2) is load-bearing)" \
+   "$([ "$_dwc" -ge 7 ] && echo 0 || echo 1)"
 
 
 echo

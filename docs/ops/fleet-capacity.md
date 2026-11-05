@@ -329,7 +329,9 @@ controller cycle. `timeout` is GNU and macOS ships it nowhere, so the bound walk
 timeout reads `provider-inventory-unreadable(<cmd> timed out after <n>s)`, never a quiet fleet. The
 watchdog (the macOS arm) writes the child's stdout to a FILE rather than to the caller's own: `kill`
 reaches the direct pid only, so a descendant the provider left behind would otherwise keep the caller's
-`$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. The sibling
+`$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. That path does
+NOT depend on `mktemp` (a per-process name is built by the shell), because a `mktemp` that fails would
+otherwise have to fall back to inheriting stdout — the very hazard — or silently un-bound the caller. The sibling
 reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this line's path.
 
 ⛔ **THE CHANNEL READ IS BOUNDED FOR THE SAME REASON.** `cap_read_fleet`'s `git ls-remote` is a network
@@ -365,6 +367,15 @@ very `network.ipv4` values `cap_boxid` publishes under) or, if only the count is
 line certified `expected=0 published=1 INELIGIBLE=0` — the `expected=0` false PASS the instrument
 forbids. A count must be a whole number of at most four digits with no leading zero beyond `0` itself
 (`expected-count-unusable`), and `CAP_EXPECTED=0` remains the one explicit, operator-made zero.
+
+⛔ **THE SAME RULE FOR THE FRESHNESS COMPARISON.** `CAP_PROBE_TTL` must be whole seconds: a duration
+typo (`15m`) makes `[ age -gt TTL ]` fail, which would skip the stale branch and count EVERY record
+fresh — measured, a 100,000,000-second-old record read `published=1`, rc 0, with the only diagnostic on
+a stderr both emitters discard. An uncomparable TTL refuses the reading (`why=ttl-unreadable`), exactly
+as an unreadable clock does. A stamp more than the window in the FUTURE is likewise not a clock
+disagreement — a box with a broken RTC would otherwise read `published=1` for ever, and keep reading it
+after it died — so it refuses as `why=clock-skew`; a second or two of skew between two boxes is normal
+and still clamps to "just published".
 
 owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
 `cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —

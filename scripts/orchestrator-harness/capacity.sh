@@ -1234,17 +1234,19 @@ cap_bounded() {
     if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
   fi
   command -v sleep >/dev/null 2>&1 || { "$@"; return $?; }
-  local _p _w _rc _tmp=""
-  _tmp="$(mktemp "${TMPDIR:-/tmp}/cap-bounded.XXXXXX" 2>/dev/null)" || _tmp=""
-  if [ -n "$_tmp" ]; then
-    "$@" >"$_tmp" 2>/dev/null & _p=$!
-  else
-    "$@" & _p=$!          # no mktemp: the timeout still binds, the pipe hazard is stated above
-  fi
+  # ⛔ THE CHILD NEVER INHERITS OUR STDOUT, NOT EVEN WHEN `mktemp` FAILS (fresh review round 4, P2).
+  # Round 3's `mktemp … || _tmp=""` fallback fell back to `"$@" &`, which restored the exact pipe
+  # hazard the file was created to remove: `kill -9` reaches the direct pid only, so a descendant keeps
+  # the caller's `$( )` open. MEASURED with a `mktemp` that exits 1: a 1 s bound took the child's full
+  # 6 s. The path is built without `mktemp` (per-process, single call), and a redirect that cannot be
+  # created fails the child — a named non-zero reading — rather than silently un-bounding the caller.
+  local _p _w _rc
+  _tmp="${TMPDIR:-/tmp}/cap-bounded.$$.$RANDOM"
+  "$@" >"$_tmp" 2>/dev/null & _p=$!
   { sleep "$s"; kill -9 "$_p" 2>/dev/null; } >/dev/null 2>&1 & _w=$!
   wait "$_p" 2>/dev/null; _rc=$?
   if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
-  [ -z "$_tmp" ] || { cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; }
+  cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
   return "$_rc"
 }
 
@@ -1449,6 +1451,14 @@ cap_fleet_line_from() {
   case "${now:-}" in
     ''|*[!0-9]*) unk_pub=1; why="${why:-clock-unreadable}" ;;
   esac
+  # ⛔ AND A TTL THE SHELL CANNOT COMPARE IS NOT "EVERY RECORD IS FRESH" (fresh review round 4, P2).
+  # `[ "$age" -gt "$CAP_PROBE_TTL" ]` with a non-numeric seam (`CAP_PROBE_TTL=15m` — a duration typo
+  # this repo has recorded before) FAILS, the stale branch is skipped, and EVERY record is counted
+  # fresh: MEASURED, a 100,000,000-second-old record read `published=1 INELIGIBLE=0`, rc 0, with the
+  # only diagnostic on a stderr both emitters discard. Same shape as the clock arm above.
+  case "${CAP_PROBE_TTL:-}" in
+    ''|*[!0-9]*) unk_pub=1; why="${why:-ttl-unreadable}" ;;
+  esac
 
   # THE PUBLISHED SIDE: fresh + attributable records. A record that is merely STALE is NOT published —
   # that box stopped republishing, which is exactly the state a dead controller produces.
@@ -1460,7 +1470,16 @@ cap_fleet_line_from() {
       cap_boxid_ok "$bid" || continue
       at="$(cap_kv "$rec" at)"
       case "$at" in ''|*[!0-9]*) continue ;; esac
-      age=$(( now - at )); [ "$age" -lt 0 ] && age=0
+      age=$(( now - at ))
+      # ⛔ A STAMP BEYOND THE FRESHNESS WINDOW IN THE FUTURE IS NOT A CLOCK DISAGREEMENT — IT IS AN
+      # UNREADABLE AGE (fresh review round 4, P2). A second or two between two boxes' clocks is normal
+      # and clamps to 'just published'; a record dated past `now + CAP_PROBE_TTL` would otherwise be
+      # certified PUBLISHED for ever (a box with a broken RTC read `published=1` and keeps reading
+      # published after it dies). Refuse the reading, in the same vocabulary as the clock arm.
+      if [ "$age" -lt 0 ] && [ $(( 0 - age )) -gt "$CAP_PROBE_TTL" ]; then
+        unk_pub=1; why="${why:-clock-skew}"; break
+      fi
+      [ "$age" -lt 0 ] && age=0
       case "$fresh" in *" $bid "*) continue ;; esac
       if [ "$age" -gt "$CAP_PROBE_TTL" ]; then
         case "$staleids" in *" $bid "*) : ;; *) staleids="$staleids$bid " ;; esac
