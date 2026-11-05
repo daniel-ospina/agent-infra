@@ -814,8 +814,8 @@ fails without its fix):
 python3 tools/fleet/liveness.test.py               # 52 tests
 python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (92)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
-python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
-python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
+python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
+python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
