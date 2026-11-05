@@ -152,7 +152,9 @@ function logicalLines(runValue) {
  * ⚠️ DECLARED OVER-BLOCK (category B, accepted): a guard step that runs the call inside a multi-line
  * script (`set -e` on line 1, the call on line 2) is now REFUSED, although it would execute. The
  * remedy is a second step, and the refusal says so. That direction is a loud false block; the other
- * direction was a silent false PASS, which is the class this whole file exists to refuse.
+ * direction was a silent false PASS, which is the class this whole file exists to refuse. An ABSOLUTE
+ * path (`/repo/scripts/…`, `$PWD/scripts/…`) is refused for the same reason — it is not a value this
+ * guard can certify, because the string alone cannot say which tree it lands in.
  */
 function exactlyInvokes(job, canonical) {
   return (job.steps || []).some((s) => {
@@ -161,10 +163,14 @@ function exactlyInvokes(job, canonical) {
     if (lines.length !== 1) return false;
     const m = CALL_RE.exec(lines[0]);
     if (!m) return false;
-    // A CANONICAL REPO PATH, not a basename (#3235 review, P3): `bash scripts/nested/check-ci-lane-parity.sh`
-    // names a DIFFERENT file and must not satisfy the walk. An absolute path and a `./` prefix are the
-    // intended allowances; CALL_RE already strips `./`.
-    return m[1] === canonical || m[1].endsWith("/" + canonical);
+    // ⛔ EXACTLY the canonical repo-relative path — not a SUFFIX of it (#3235 review, P2, measured).
+    // `p.endsWith("/" + canonical)` still accepted a DECOY: `bash docs/scripts/check-ci-lane-parity.sh`
+    // with a same-named stub in `docs/` exited 0 while the real guard — and, on the live path, the
+    // MUTATION SELF-TEST, the program that kills this guard's mutants — executed nowhere. A suffix
+    // test cannot distinguish "the same file" from "a file whose path ends the same way", and only
+    // equality can. `CALL_RE` already normalises a `./` prefix and quoting, which are the spellings
+    // that genuinely name the same file.
+    return m[1] === canonical;
   });
 }
 
@@ -183,18 +189,34 @@ const runsSelfTestScript = (job) => exactlyInvokes(job, SELFTEST_CANON);
  *   hole the denominator rule closes, on the other side of the slash (#3235 review, P1).
  */
 function checkSliceValue(label, file, id, where, v) {
-  if (!v.includes("strategy.job-total")) {
+  // ⛔ EXACT EXPRESSIONS, NOT SUBSTRINGS (#3235 review, P3, measured). `includes("matrix.shard")`
+  // accepted `${{ matrix.shard && 1 }}/${{ strategy.job-total }}` — which evaluates to `1/8` on every
+  // arm, so all eight run slice 1 and 142 of the 163 suites never run, at rc 0. The identical
+  // substring bug on the denominator side is `${{ strategy.job-total && 8 }}`. Whitespace inside the
+  // expression is insignificant, so it is normalised; nothing else is.
+  const parts = v.split("/");
+  const squash = (s) => String(s).replace(/\s+/g, "");
+  if (parts.length !== 2) {
     refuse(
       `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
         v
-      )} — the denominator must be strategy.job-total, GitHub's own count of this matrix, or a widened/narrowed matrix leaves slices NO arm runs while every arm still passes its own set assertion; exiting 2`
+      )} — it must be exactly '<index>/<count>' built from '\${{ matrix.shard }}/\${{ strategy.job-total }}'; exiting 2`
     );
   }
-  if (!v.includes("matrix.shard")) {
+  const numerator = squash(parts[0]);
+  const denominator = squash(parts[1]);
+  if (denominator !== "${{strategy.job-total}}") {
     refuse(
       `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
         v
-      )} — the NUMERATOR must be matrix.shard, the one per-arm index the axis assertion pins to 1..N: any other numerator sends EVERY arm to the same slice, so that slice runs N times, the other N-1 run by nobody, and each arm still passes its own set assertion; exiting 2`
+      )} — the denominator must be exactly '\${{ strategy.job-total }}', GitHub's own count of this matrix, or a widened/narrowed matrix leaves slices NO arm runs while every arm still passes its own set assertion; exiting 2`
+    );
+  }
+  if (numerator !== "${{matrix.shard}}") {
+    refuse(
+      `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
+        v
+      )} — the NUMERATOR must be exactly '\${{ matrix.shard }}', the one per-arm index the axis assertion pins to 1..N: any other numerator evaluates the SAME on every arm, so one slice runs N times, the other N-1 run by nobody, and each arm still passes its own set assertion; exiting 2`
     );
   }
 }
@@ -207,7 +229,14 @@ function checkSliceValue(label, file, id, where, v) {
  */
 function refusalKeys(node) {
   const bad = [];
-  const KEYS = ["if", "needs", "continue-on-error"];
+  // ⛔ `working-directory` IS IN THIS FAMILY (#3235 review, P2, measured). It rewrites what the
+  // step's `run` resolves against, so the SAME bare call `bash scripts/check-ci-lane-parity.sh` can
+  // execute a DIFFERENT file: with `working-directory: tests` and a stub at
+  // `tests/scripts/check-ci-lane-parity.sh`, the guard printed "runs the guard and is unconditional"
+  // and exited 0 while the real gate never ran — invisible to a `run:`-text assertion, because the
+  // text is byte-identical. The `defaults.run.working-directory` spelling is covered by
+  // deepForbiddenKeys, the same way `defaults.run.shell` is.
+  const KEYS = ["if", "needs", "continue-on-error", "working-directory"];
   for (const k of KEYS) if (Object.prototype.hasOwnProperty.call(node, k)) bad.push(k);
   if (Object.prototype.hasOwnProperty.call(node, "shell")) {
     if (String(node.shell).trim() !== "bash") bad.push("shell");
@@ -246,6 +275,9 @@ function deepForbiddenKeys(node, path, out) {
     if (/^CI_LANE_/.test(k) || STARTUP_INJECTION_KEYS.test(k)) out.push(`${path}.${k}`);
     // workflow-level `defaults:` — reaches every job, so it is not enough to scan the audited one.
     if (k === "shell" && /\.defaults\.run$/.test(path) && String(v).trim() !== "bash") {
+      out.push(`${path}.${k}`);
+    }
+    if (k === "working-directory" && /\.defaults\.run$/.test(path)) {
       out.push(`${path}.${k}`);
     }
     deepForbiddenKeys(v, `${path}.${k}`, out);
@@ -308,6 +340,53 @@ function checkLane(label, workflowFile, jobName) {
         `${file} narrows its 'pull_request:' trigger with ${shape} — a filter can stop this lane running on a PR's commits while its parity assertion stays green; the bare 'pull_request:' is the form this lane needs (exiting 2)`
       );
     }
+  } else {
+    // ⛔ THE MAIN LANE'S TRIGGER WAS NEVER CHECKED (#3235 review, P2, pre-existing and measured):
+    // this file's header lists "a trigger that cannot fire" among the exit-2 refusals, but the arm
+    // only existed for the PR lane. Narrowing ci-main's `on.push.branches:` to `['nothing/**']`
+    // exited 0 — the guard certifying parity over a lane that never executes.
+    // A push lane legitimately filters `branches:`, so the VALUE is not refused the way the PR
+    // lane's `pull_request:` value is; what is refused is a document with no `push:` at all, and a
+    // filter that cannot match the base branch this lane is named for.
+    const on = wf.on;
+    const hasPush =
+      on === "push" ||
+      (Array.isArray(on) && on.includes("push")) ||
+      (on && typeof on === "object" && !Array.isArray(on) && Object.prototype.hasOwnProperty.call(on, "push"));
+    if (!hasPush) {
+      refuse(
+        `${file} has no 'push:' trigger — the main lane would never run, so nothing it calls can gate a merge; exiting 2`
+      );
+    }
+    const pushValue = on && typeof on === "object" && !Array.isArray(on) ? on.push : null;
+    const branches =
+      pushValue && typeof pushValue === "object" && !Array.isArray(pushValue) ? pushValue.branches : undefined;
+    if (Array.isArray(branches) && branches.length > 0) {
+      // GitHub's `*` does not cross `/` and `**` does; that is the whole of the semantics modelled
+      // here, and it is the minimum needed to answer "could this filter ever fire for 'main'"
+      // without enumerating filter keys.
+      const matchesMain = (pattern) => {
+        const p = String(pattern).trim();
+        if (p === "") return false;
+        const re = new RegExp(
+          "^" +
+            p
+              .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+              .replace(/\*\*/g, "\u0000")
+              .replace(/\*/g, "[^/]*")
+              .replace(/\u0000/g, ".*") +
+            "$"
+        );
+        return re.test("main");
+      };
+      if (!branches.some(matchesMain)) {
+        refuse(
+          `${file} narrows its 'push:' trigger to branches [${branches.join(
+            ", "
+          )}] — none of which can match this lane's base branch 'main', so the lane would never run while its parity assertion stays green; exiting 2`
+        );
+      }
+    }
   }
 
   const job = wf.jobs && Object.prototype.hasOwnProperty.call(wf.jobs, jobName) ? wf.jobs[jobName] : undefined;
@@ -365,8 +444,19 @@ function checkLane(label, workflowFile, jobName) {
     const runsGuard = guardMentioning.some(([, jj]) => runsGuardScript(jj));
     const runsSelfTest = guardMentioning.some(([, jj]) => runsSelfTestScript(jj));
     if (!runsGuard) {
+      // ⛔ THE DIAGNOSIS MUST BE TRUE, or the over-block is unhelpful as well as loud (#3235 review,
+      // P3). "NO job runs the guard" is the wrong sentence for a job that DOES run it — just not as
+      // the bare call (a `set -e` line above it). Both are refusals; they need different remedies.
+      const mentioned = Object.entries(wf.jobs || {}).some(
+        ([, jj]) =>
+          jj &&
+          typeof jj === "object" &&
+          (jj.steps || []).some((s) => typeof s?.run === "string" && s.run.includes("check-ci-lane-parity"))
+      );
       refuse(
-        `${label}: ${file} calls ${RUNNER} but NO job runs the lane-parity guard itself (\`check-ci-lane-parity\`) — the gate is not running on the lane it guards, and every other assertion in this file would stay green; exiting 2`
+        mentioned
+          ? `${label}: ${file} calls ${RUNNER} but NO step invokes the lane-parity guard as its OWN COMMAND \`bash scripts/check-ci-lane-parity.sh\` — a job mentions it, but inside a larger script, a heredoc, a comment or a conditional, and only a bare call's exit code is the step's. Put the guard on its OWN STEP; exiting 2`
+          : `${label}: ${file} calls ${RUNNER} but NO job runs the lane-parity guard itself (\`check-ci-lane-parity\`) — the gate is not running on the lane it guards, and every other assertion in this file would stay green; exiting 2`
       );
     }
     // ⛔ THE SELF-TEST IS THE PROGRAM THAT KILLS THIS GUARD'S MUTANTS, and `tests/ci-lane-parity/run.sh`
@@ -557,11 +647,12 @@ function checkBounds(label, workflowFile) {
     // the rule only ever looked at step `env`. Collected from the JOB and from every STEP, and the
     // result also decides whether this job is audited as a slice-feeding job at all.
     // ⚠️ DECLARED RESIDUAL, not silently dropped: an `env:`-shaped declaration is the complete
-    // mechanism this guard can READ (workflow, job, step — all three are validated). A slice
-    // COMPUTED IN SHELL and written to `$GITHUB_ENV` by an earlier step is not a declaration, and
-    // catching it would mean modelling what a `run:` script does — the section-#666 line this file
-    // does not cross. It is a visible code change in the diff, and the runner's own runtime
-    // contract (count <= listed, exact-set reconciliation) is the backstop for the ones it can see.
+    // mechanism this guard can READ (`env:` at workflow, job, step AND the job's `container:` — all
+    // four are validated). A slice COMPUTED IN SHELL and written to `$GITHUB_ENV` by an earlier step
+    // is not a declaration, and catching it would mean modelling what a `run:` script does — the
+    // section-#666 line this file does not cross. It is a visible code change in the diff, and the
+    // runner's own runtime contract (count <= listed, exact-set reconciliation) is the backstop for
+    // the ones it can see.
     const sliceDecls = [];
     const collectSlice = (node, where) => {
       if (!node || typeof node !== "object" || Array.isArray(node)) return;
@@ -572,6 +663,10 @@ function checkBounds(label, workflowFile) {
       }
     };
     collectSlice(j, "the JOB's env");
+    // ⛔ AND THE JOB'S CONTAINER ENV (#3235 review, P2, measured). `container: { image, env }` is a
+    // fourth `env:`-shaped location that reaches every step of the job; with the step's `env:`
+    // deleted and the slice moved there, a `/12` left 52 of 163 suites unrun at rc 0.
+    collectSlice(j.container, "the job CONTAINER's env");
     steps.forEach((s, i) => collectSlice(s, `step #${i + 1}'s env`));
 
     // ── THE JOB BOUND, WHEN ONE IS DECLARED ────────────────────────────────────────────────

@@ -1501,7 +1501,7 @@ if cmp -s "$MAIN" "$TMP/ci-main-slice12.yml"; then
   fail "the stale-denominator mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$TMP/ci-main-slice12.yml" "$PR"
-  if [ "$RC" -eq 2 ] && grep -q 'strategy.job-total' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -qF "the denominator must be exactly" <<<"$OUT" && grep -qF '${{ matrix.shard }}/12' <<<"$OUT"; then
     pass "a hard-coded slice denominator exits 2 (a stale /N leaves slices no arm runs)"
   else
     fail "a hard-coded slice denominator returned rc $RC (want 2): $OUT"
@@ -1549,9 +1549,12 @@ fi
 # guard-covering walk used `s.run.includes("check-ci-lane-parity")`, which matches TEXT: rewriting the
 # guard step to a `run: |` block whose only line is the commented-out call left the guard exiting 0
 # while still printing "runs the guard and is unconditional and blocking" — the gate switched off with
-# every gate reporting green. Two mutations below (a comment, and the same text inside an `echo`),
-# plus the false-block control: a MULTI-LINE `run:` whose call IS a logical line must still be
-# accepted, so the arm pins "must be executed", never "must be a one-line scalar".
+# every gate reporting green. Five mutations below (a comment, the same text inside an `echo`, a
+# heredoc BODY, a NON-EXECUTED `if` branch, and a multi-line script), each of which was measured
+# ACCEPTED by the intermediate "one logical line shaped `bash <path>`" scan — and the `./`-prefix
+# control, which names the SAME program and must stay accepted.
+# ⚠️ The multi-line case is a DECLARED OVER-BLOCK: the arm asserts it is REFUSED (rc 2), not accepted.
+# The step must BE the bare call — a loud false block (category B) rather than a silent false PASS.
 awk '/^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
        print "        run: |"; print "          # bash scripts/check-ci-lane-parity.sh"; next }
      { print }' "$PR" >"$TMP/ci-pr-guardcomment.yml"
@@ -1559,7 +1562,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardcomment.yml"; then
   fail "the commented-guard mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardcomment.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
     pass "a COMMENTED-OUT guard step is not an invocation (rc 2) — a mention is not a gate"
   else
     fail "a commented-out guard step satisfied the guard (rc $RC — want 2): $OUT"
@@ -1581,7 +1584,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardecho.yml"; then
   fail "the echo-guard mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardecho.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
     pass "an ECHO whose text names the guard is a mention, not an invocation (rc 2)"
   else
     fail "an echo of the guard name satisfied the guard (rc $RC — want 2): $OUT"
@@ -1598,7 +1601,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardheredoc.yml"; then
   fail "the heredoc mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardheredoc.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
     pass "a guard call inside a HEREDOC BODY is text, not an invocation (rc 2)"
   else
     fail "a heredoc-bodied guard call satisfied the guard (rc $RC — want 2): $OUT"
@@ -1611,7 +1614,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardiffalse.yml"; then
   fail "the if-false mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardiffalse.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
     pass "a guard call inside a NON-EXECUTED branch is not an invocation (rc 2)"
   else
     fail "an if-false-bodied guard call satisfied the guard (rc $RC — want 2): $OUT"
@@ -1627,7 +1630,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardmultiline.yml"; then
   fail "the multi-line mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardmultiline.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
     pass "a MULTI-LINE guard step is refused (the declared over-block: the step must BE the bare call)"
   else
     fail "a multi-line guard step returned rc $RC (want 2 — the documented over-block): $OUT"
@@ -1641,7 +1644,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardnested.yml"; then
   fail "the nested-path mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardnested.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
     pass "a same-named guard in ANOTHER DIRECTORY is a different program (rc 2)"
   else
     fail "a nested same-named guard satisfied the walk (rc $RC — want 2): $OUT"
@@ -1805,7 +1808,7 @@ if cmp -s "$MAIN" "$TMP/ci-main-numerator.yml"; then
   fail "the numerator mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$TMP/ci-main-numerator.yml" "$PR"
-  if [ "$RC" -eq 2 ] && grep -qF 'the NUMERATOR must be matrix.shard' <<<"$OUT" && grep -qF '1/${{ strategy.job-total }}' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -qF 'the NUMERATOR must be exactly' <<<"$OUT" && grep -qF '1/${{ strategy.job-total }}' <<<"$OUT"; then
     pass "a slice whose NUMERATOR is not matrix.shard exits 2 (every arm would run the same slice)"
   else
     fail "a constant numerator returned rc $RC (want 2): $OUT"
@@ -1849,6 +1852,169 @@ else
   else
     fail "a correct workflow-level slice was refused (rc $RC — want 0): $OUT"
   fi
+fi
+
+# ── ROUND 3 OF THE SAME LOOP: six more openings, including two DECOY BYPASSES ──────────────────
+# Each mutant below was measured GREEN (rc 0) on the previous head.
+
+# ⛔ (m) A SUFFIX IS NOT THE SAME FILE (#3235 review, P2, measured). Round 2 replaced a basename test
+# with `endsWith("/" + canonical)`, which still accepts a DECOY: `bash docs/scripts/check-ci-lane-parity.sh`
+# with a same-named stub in `docs/` exited 0 while the real guard never ran — and the self-test variant
+# did the same on the live path, silencing the program that kills this guard's mutants. Only EQUALITY
+# can tell "the same file" from "a path that ends the same way".
+sed 's|^        run: bash scripts/check-ci-lane-parity\.sh$|        run: bash docs/scripts/check-ci-lane-parity.sh|' \
+  "$PR" >"$TMP/ci-pr-guarddecoy.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guarddecoy.yml"; then
+  fail "the decoy-guard mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guarddecoy.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+    pass "a DECOY at docs/scripts/… with the same name is a different program (rc 2)"
+  else
+    fail "a decoy guard path satisfied the walk (rc $RC — want 2): $OUT"
+  fi
+fi
+sed 's|^        run: bash tests/ci-lane-parity/run\.sh$|        run: bash docs/tests/ci-lane-parity/run.sh|' \
+  "$PR" >"$TMP/ci-pr-selftestdecoy.yml"
+if cmp -s "$PR" "$TMP/ci-pr-selftestdecoy.yml"; then
+  fail "the decoy-self-test mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-selftestdecoy.yml"
+  # ⛔ THE REQUIREMENT ITSELF IS LIVE-ONLY (`isLive`), so a fixture cannot red on it. What CAN be
+  # pinned here is the SHARED matcher: a decoy path must not make the job a self-test runner, which is
+  # visible in the per-job note. If `exactlyInvokes` accepted the suffix, the note flips to
+  # "runs the guard's MUTATION SELF-TEST" and this assertion reds.
+  if [ "$RC" -eq 0 ] && grep -qF "runs the guard and is unconditional and blocking" <<<"$OUT" \
+     && ! grep -qF "MUTATION SELF-TEST" <<<"$OUT"; then
+    pass "a decoy SELF-TEST at docs/tests/… is not counted as the self-test (shared matcher, suffix rejected)"
+  else
+    fail "a decoy self-test path was accepted by the matcher (rc $RC): $OUT"
+  fi
+fi
+
+# ⛔ (n) `working-directory` REWRITES WHAT `run:` RESOLVES AGAINST (#3235 review, P2, measured). With
+# `working-directory: tests` and a stub at `tests/scripts/check-ci-lane-parity.sh`, the SAME bare call
+# text executed the stub and the guard exited 0 — invisible to any `run:`-text assertion, because the
+# text is byte-identical. It joins if/needs/continue-on-error/shell as a key that changes how a step
+# runs, and `defaults.run.working-directory` (which reaches every job) is refused document-wide.
+awk '{ if ($0 ~ /^  bash-suites-gate:$/) { print; print "    working-directory: tests"; next } print }' \
+  "$PR" >"$TMP/ci-pr-wdir.yml"
+if cmp -s "$PR" "$TMP/ci-pr-wdir.yml"; then
+  fail "the working-directory mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-wdir.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'working-directory' <<<"$OUT"; then
+    pass "a job-level 'working-directory' is refused (the bare call would resolve to another file)"
+  else
+    fail "a working-directory on the guard job returned rc $RC (want 2): $OUT"
+  fi
+fi
+{ printf 'defaults:\n  run:\n    working-directory: tests\n'; cat "$PR"; } >"$TMP/ci-pr-wdirdefaults.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-wdirdefaults.yml"
+if [ "$RC" -eq 2 ] && grep -q 'defaults.run.working-directory' <<<"$OUT"; then
+  pass "workflow-level defaults.run.working-directory is refused (it reaches every job)"
+else
+  fail "defaults.run.working-directory returned rc $RC (want 2): $OUT"
+fi
+
+# ⛔ (o) THE JOB'S CONTAINER ENV IS A FOURTH `env:` LOCATION (#3235 review, P2, measured).
+# `container: { image, env }` reaches every step of the job, so a `/12` there — with the step's own
+# `env:` deleted — left 52 of 163 suites unrun at rc 0.
+awk '{ a[NR] = $0 }
+     END {
+       dropfrom = 0; dropto = 0
+       for (i = 1; i <= NR; i++)
+         if (a[i] == "        env:") {
+           j = i + 1
+           while (j <= NR && a[j] ~ /^          #/) j++
+           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+         }
+       for (i = 1; i <= NR; i++) {
+         if (i >= dropfrom && i <= dropto) continue
+         print a[i]
+         if (a[i] == "    timeout-minutes: 80") {
+           print "    container:"; print "      image: ubuntu:22.04"; print "      env:"
+           print "        BASH_SHARD_SLICE: ${{ matrix.shard }}/12"
+         }
+       }
+     }' "$MAIN" >"$TMP/ci-main-containerenv.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-containerenv.yml"; then
+  fail "the container-env mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-containerenv.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "the job CONTAINER's env" <<<"$OUT"; then
+    pass "a slice declared in the job's CONTAINER env is read too → rc 2 (the fourth location)"
+  else
+    fail "a container-env slice returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (p) A SUBSTRING TEST ON THE EXPRESSION IS THE BUG IT CONDEMNS (#3235 review, P3, measured).
+# `${{ matrix.shard && 1 }}` MENTIONS matrix.shard and evaluates to 1 on every arm, so all eight run
+# slice 1 and 142 of 163 suites never run — at rc 0. Same on the denominator side.
+sed 's|\${{ matrix.shard }}/\${{ strategy.job-total }}|${{ matrix.shard \&\& 1 }}/${{ strategy.job-total }}|' \
+  "$MAIN" >"$TMP/ci-main-hostilenum.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-hostilenum.yml"; then
+  fail "the hostile-numerator mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-hostilenum.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF 'the NUMERATOR must be exactly' <<<"$OUT"; then
+    pass "a numerator that MENTIONS matrix.shard but does not use it is refused (rc 2)"
+  else
+    fail "a hostile numerator returned rc $RC (want 2): $OUT"
+  fi
+fi
+sed 's|\${{ matrix.shard }}/\${{ strategy.job-total }}|${{ matrix.shard }}/${{ strategy.job-total \&\& 8 }}|' \
+  "$MAIN" >"$TMP/ci-main-hostileden.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-hostileden.yml"; then
+  fail "the hostile-denominator mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-hostileden.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF 'the denominator must be exactly' <<<"$OUT"; then
+    pass "a denominator that MENTIONS strategy.job-total but pins 8 is refused (rc 2)"
+  else
+    fail "a hostile denominator returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (q) THE MAIN LANE'S TRIGGER WAS NEVER VALIDATED (#3235 review, P2, pre-existing and measured).
+# This file's header lists "a trigger that cannot fire" among the exit-2 refusals, but the arm only
+# existed for the PR lane — so narrowing ci-main's `on.push.branches:` to `['nothing/**']` exited 0,
+# the guard certifying parity over a lane that never executes.
+awk 'BEGIN { skip = 0 }
+     /^  push:$/ { skip = 1; next }
+     skip == 1 && /^    branches:/ { skip = 2; next }
+     skip == 2 { next }
+     { print }' "$MAIN" >"$TMP/ci-main-nopush.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-nopush.yml"; then
+  fail "the no-push-by-trigger mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-nopush.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q "has no 'push:' trigger" <<<"$OUT"; then
+    pass "a main lane with NO push: trigger exits 2 (it would never run)"
+  else
+    fail "a push-less main lane returned rc $RC (want 2): $OUT"
+  fi
+fi
+sed "s|^    branches: \[main, 'integration/\*\*'\]$|    branches: ['nothing-matches-this/**']|" \
+  "$MAIN" >"$TMP/ci-main-badbranches.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-badbranches.yml"; then
+  fail "the bad-branches mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-badbranches.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q 'none of which can match' <<<"$OUT"; then
+    pass "a push: branches filter that cannot match 'main' exits 2 (the lane would never run)"
+  else
+    fail "an unmatchable branches filter returned rc $RC (want 2): $OUT"
+  fi
+fi
+printf 'name: x\non:\n  push:\n    branches: [main]\njobs:\n  script-validate:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n      - run: bash tests/ci-lane-parity/run.sh\n' \
+  >"$TMP/ci-main-pushok.yml"
+guard_rc "$TMP/ci-main-pushok.yml" "$PR"
+if [ "$RC" -eq 0 ]; then
+  pass "control: a bare 'branches: [main]' push trigger is accepted (no false block on a filter)"
+else
+  fail "a legitimate push branches filter was refused (rc $RC — want 0): $OUT"
 fi
 
 # ROOT-CAUSE PIN. The guard refusing the polluted document does not prove the PARSER is fixed —
