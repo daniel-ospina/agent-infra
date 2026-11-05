@@ -2801,20 +2801,25 @@ SIGFN="$(awk '/^evidence_signature\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$REAPE
 if [ -z "$SIGFN" ]; then
     bad "A21o could not extract evidence_signature from the reaper — the assertion below would be vacuous"
 else
-    n_catch="$(printf '%s\n' "$SIGFN" | grep -cE '^ *\*\) exit 3 ;;')"
+    n_catch="$(printf '%s\n' "$SIGFN" | grep -cE '^ *\*\) exit 3 ;;' || true)"
     assert_eq "$n_catch" "3" "A21o all THREE probe arms end in a catch-all (any non-0/1 status is RED, not 'absent')"
-    if printf '%s\n' "$SIGFN" | grep -qE '124\|125\) exit 3'; then
-        bad "A21o the probe arms whitelist 124|125 again — 137/126/127 would read as 'absent' and drop the root"
-    else
-        ok "A21o …and no arm whitelists just 124|125"
-    fi
+    # `case`, not `printf | grep -q`: a quiet grep exits at the first match, the producer takes SIGPIPE,
+    # and under `pipefail` the pipeline reports FAILURE precisely when the pattern WAS found (#841/#864) —
+    # the false-negative this repo has a dedicated guard for. The guard is why this arm is written twice.
+    case "$SIGFN" in
+        *'124|125) exit 3'*)
+            bad "A21o the probe arms whitelist 124|125 again — 137/126/127 would read as 'absent' and drop the root" ;;
+        *)
+            ok "A21o …and no arm whitelists just 124|125" ;;
+    esac
 fi
 LANEFN="$(awk '/^lane_evidence_present\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$REAPER")"
-if printf '%s\n' "$LANEFN" | grep -qF 'if [ "$rc" != 1 ]'; then
-    ok "A21o the presence probe treats ONLY 1 as 'absent' (every other non-zero => !unreadable => RED)"
-else
-    bad "A21o the presence probe no longer means exactly 1 by 'absent' — a 137 would skip the archive"
-fi
+case "$LANEFN" in
+    *'if [ "$rc" != 1 ]'*)
+        ok "A21o the presence probe treats ONLY 1 as 'absent' (every other non-zero => !unreadable => RED)" ;;
+    *)
+        bad "A21o the presence probe no longer means exactly 1 by 'absent' — a 137 would skip the archive" ;;
+esac
 
 # A21i — A SIGNATURE THAT CANNOT BE TAKEN IS A RED PASS, NOT A SILENT PRESERVE (review of #3422 round 9,
 # P2). `fs_bounded_out` emits nothing on a non-zero rc, so discarding the rc made "the walk failed" look
