@@ -197,8 +197,18 @@ def lane_census(alive, dead, pi_count, roster_size):
     `✅ no suspects` with no census line, while the same box with a working `ps` printed STALE
     ROSTER. The read FAILING flipped the verdict from ALARM to CLEAN — the fail-open direction, and
     a direct violation of R2 ("`pi_count is None` ⇒ abstain: no mismatch, no clean claim, never
-    `0`"). An all-dead roster over an unreadable table genuinely cannot be distinguished from an
-    idle fleet, so it now says exactly that instead of claiming the clean one.
+    `0`") FOR ANY ROSTER THAT IS NOT FULLY LIVE. An all-dead roster over an unreadable table
+    genuinely cannot be distinguished from an idle fleet, so it now says exactly that instead of
+    claiming the clean one.
+
+    ⛔ R2 IS SCOPED, AND THE SCOPING IS THE POINT (review cycle 12, finding 1). Above, R2 is
+    ONTOLOGICALLY about a population that WAS NOT READ. `alive == roster_size` is the one state whose
+    silence rests on a POSITIVE PER-LANE measurement instead: every rostered lane was bound to a live
+    incarnation, so the box is accounted for without the table. Quoting R2 unscoped here would tell
+    a reader to add `if pi_count is None: return UNVERIFIED` ABOVE the first arm — which would make
+    every healthy box with a degraded `ps` alarm forever, the un-clearable false alarm review cycle
+    10 exists to prevent. `alive >= roster_size` is therefore the ONE exemption from R2, and it is
+    the only arm whose silence does not depend on the population at all.
 
     ⛔ …AND THE DIAGNOSIS MUST NOT CONTRADICT THE ROWS IT SITS BENEATH (review cycle 9, finding 1).
     That arm was gated on `established >= roster_size`, so it also fired when SOME lanes were ALIVE
