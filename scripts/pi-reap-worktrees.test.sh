@@ -251,9 +251,22 @@ case " $* " in
         # could not. A failed re-probe is the removal path's own fail-closed branch (review round 10,
         # P1/P2), and without a way to produce one on the ps side neither arm could exist.
         if [ -f "$FAKE_PS_SEQ_DIR/$N.fail" ]; then exit 1; fi
-        if [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then cat "$FAKE_PS_SEQ_DIR/$N"; exit 0; fi
+        # `N.hook` runs AFTER reading N is served. The sequenced table can express a probe whose
+        # ANSWER changed, but not a FILE another process writes between two readings — which is
+        # exactly the pin record's shape (`cloud-cell-supervisor.sh` re-writes $HARNESS_PIN_FILE on
+        # `apply`). Without this seam the removal-time pin re-probe cannot be told apart from the
+        # classification-time one, and an inert gate would pass its own test.
+        if [ -f "$FAKE_PS_SEQ_DIR/$N" ]; then
+            cat "$FAKE_PS_SEQ_DIR/$N"
+            [ -f "$FAKE_PS_SEQ_DIR/$N.hook" ] && bash "$FAKE_PS_SEQ_DIR/$N.hook"
+            exit 0
+        fi
         last="$(ls "$FAKE_PS_SEQ_DIR" 2>/dev/null | grep -E '^[0-9]+$' | sort -n | tail -1)"
-        if [ -n "$last" ] && [ -f "$FAKE_PS_SEQ_DIR/$last" ]; then cat "$FAKE_PS_SEQ_DIR/$last"; exit 0; fi
+        if [ -n "$last" ] && [ -f "$FAKE_PS_SEQ_DIR/$last" ]; then
+            cat "$FAKE_PS_SEQ_DIR/$last"
+            [ -f "$FAKE_PS_SEQ_DIR/$last.hook" ] && bash "$FAKE_PS_SEQ_DIR/$last.hook"
+            exit 0
+        fi
     fi ;;
 esac
 echo "1 0 /sbin/launchd"
@@ -4763,6 +4776,50 @@ assert_absent "$OUT" "unbound variable" \
     "G15i an unset HOME does not abort the classifier (set -u)"
 assert_contains "$(row_for "$OUT" "$NHWT")" "reason=pin-tree" \
     "G15i …and the pin tree is still classified, not left as a blank row"
+
+# G15j: THE PIN RECORD IS ASKED AGAIN AT REMOVAL TIME, LIKE EVERY OTHER HOLDER ─────────────────
+# `holder_recheck` exists because "classify_one decides from holders that existed minutes ago on a
+# big box", and it re-applies `holders_live` for exactly that reason. `pin_tree_match` had ONE call
+# site — classification — so the one holder `/proc` CANNOT show was never re-read, and it is a FILE
+# another process writes at arbitrary times (`cloud-cell-supervisor.sh` re-writes
+# `$HARNESS_PIN_FILE` on `apply`). A record written inside the removal window named nothing at
+# classification and was ignored at removal; for a custom `HARNESS_PIN_DIR` the shape backstop does
+# not cover it, the record is the ONLY protection, and the consequence is the #10114 class: this
+# box's executable tree deleted.
+#
+# The fixture makes the two readings differ by MUTATING THE RECORD, not the process table: reading
+# #1 (classification) runs with no record at all, and the `2.hook` seam writes it as reading #2
+# (the removal re-probe) is served. The pre-fix tree removes the checkout.
+ENV=pin_tree_removal; REPO="$(mk_repo $ENV)"
+WT_RELATE="$(add_named_wt "$REPO" "$ENV-plain" feat/g15j-plain)"
+mkdir -p "$WT_RELATE/.venv"; printf 'x\n' >"$WT_RELATE/.venv/marker"
+# The record names the reaper's own `HARNESS_PIN_FILE` — the file the supervisor rewrites — and is
+# written only once the removal-time probe runs.
+mkdir -p "$T/seq-g15j"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g15j/1"
+cp "$T/seq-g15j/1" "$T/seq-g15j/2"
+cat >"$T/seq-g15j/2.hook" <<HOOK
+#!/usr/bin/env bash
+printf '%s\n' "$(cd "$WT_RELATE" && pwd -P)/scripts/orchestrator-harness" >"$T/$ENV/pinfile"
+HOOK
+mkdir -p "$WT_RELATE/scripts/orchestrator-harness"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j" HARNESS_PIN_FILE="$T/$ENV/pinfile" \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (pin-tree)" \
+    "G15j a pin record written AFTER classification STOPS the delete"
+assert_dir "$WT_RELATE" "G15j …the checkout survives, so the re-probe is not inert"
+# The NEGATIVE control: the same fixture with no record written at either reading is REMOVED —
+# otherwise the arm above would pass on a reaper that simply never deletes anything. This also
+# proves the fixture is not being preserved by the shape backstop (`$ENV-plain` carries no
+# `harness` component) or by an accidental holder.
+WT_CONTROL="$(add_named_wt "$REPO" "$ENV-ctl" feat/g15j-control)"
+mkdir -p "$WT_CONTROL/.venv"; printf 'x\n' >"$WT_CONTROL/.venv/marker"
+mkdir -p "$T/seq-g15j-ctl"
+printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g15j-ctl/1"
+cp "$T/seq-g15j-ctl/1" "$T/seq-g15j-ctl/2"
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j-ctl" HARNESS_PIN_FILE="$T/$ENV/pinfile-none" \
+    REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
+assert_nodir "$WT_CONTROL" "G15j …and a checkout with no pin record at either reading is still removed"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
