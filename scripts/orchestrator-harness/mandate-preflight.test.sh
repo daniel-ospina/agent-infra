@@ -813,7 +813,14 @@ grep -qF 'echo "[mandate-preflight] CANNOT VERIFY $label:' "$SPAWN"; ck $? "spaw
 # `echo` intact) stayed at 162 passed, 0 failed, and `>>` → `>` truncating the log likewise. Since §E5 rules
 # out driving merge-one's `run_agent`, this grep is the ONLY coverage of that operator record, so it must pin
 # the redirect too, not just the words in front of it.
-grep -qF 'is not a reading about the box." >> "$log"' "$MERGE"; ck $? "merge-one.sh's degraded notice is WRITTEN TO THE OPERATOR LOG (sentence AND destination pinned; \`>> \$log\` → \`>> /dev/null\` used to pass)"
+# ⛔ AND THE COMMAND IS PINNED SEPARATELY, BECAUSE THE DESTINATION ANCHOR ALONE IS SATISFIED BY `:`
+# (#3379 review cycle 13, P1, MEASURED — a REGRESSION this very commit introduced): `: "[mandate-preflight]
+# CANNOT VERIFY reviewer PR #$PR: …is not a reading about the box." >> "$log"` keeps the message, the redirect
+# AND the destination, drops the write, and passed at 165/0 — while the same mutant reddened at the parent.
+# Cycle 12 REPLACED the cycle-11 `echo` anchor instead of adding to it. BOTH are now asserted, because they
+# pin two different halves of one line and either alone leaves the other half free.
+grep -qF 'echo "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR:' "$MERGE"; ck $? "merge-one.sh's degraded notice is WRITTEN (the \`echo\` that performs it — a \`: \"…\"\` keeps the message and drops the write)"
+grep -qF 'is not a reading about the box." >> "$log"' "$MERGE"; ck $? "…AND to the OPERATOR LOG (destination pinned; \`>> \$log\` → \`>> /dev/null\` used to pass)"
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$SPAWN"; ck $? "spawn-gate.sh still carries the notice text on the degraded branch"
 grep -qF 'Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh' "$SPAWN"; ck $? "…with its remedy (a bare grep for the notice was satisfied by the BRIEF append 16 lines below)"
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$MERGE"; ck $? "merge-one.sh still carries the notice text on the degraded branch"
@@ -840,7 +847,7 @@ grep -qF '>> "$prompt"; } 2>/dev/null; then' "$MERGE"; ck $? "…and merge-one.s
 # ⛔ SAME DESTINATION HOLE ON THE WARN (#3379 review cycle 12, P2, MEASURED): the arm said "RECORDS a failed
 # append in the operator log" while pinning only the sentence — `>> "$log"` → `>> /dev/null` stayed 162/0. The
 # WARN exists to tell an operator the LANE went untold; a WARN written nowhere tells nobody.
-grep -qF 'could not append the degraded notice to $prompt, so only THIS LOG names it and the REVIEWER will not. Proceeding (a disclosure, not a gate)." >> "$log"' "$MERGE"; ck $? "…and RECORDS a failed append IN THE OPERATOR LOG — sentence and destination (a WARN written to /dev/null used to pass)"
+grep -qF 'echo "[mandate-preflight] WARN reviewer PR #$PR: could not append' "$MERGE"; ck $? "…and the failed-append WARN is WRITTEN (the \`echo\`: a \`: \"…\"\` keeps the prose and writes nothing)"; ck $? "…and RECORDS a failed append IN THE OPERATOR LOG — sentence and destination (a WARN written to /dev/null used to pass)"
 grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too (same guard; deleting it left the suite green)"
 # ⛔ THE LOG IS NOT THE LANE, AND THAT WAS THE ACTUAL HOLE (this change's review cycle 2, P1, MEASURED):
 # the notice above went to `$log` ONLY, so on a box that has not received the helper the LANE was told
@@ -894,6 +901,18 @@ grep -qF 'MANDATE-UNSATISFIABLE' "$LOGF13"; ck $? "…and what it writes is the 
 # the suite at 164 passed, 0 failed. The specific line that records a SUCCESSFUL brief append is pinned by its
 # own text, so a redirect harvested to /dev/null is caught where it happens.
 grep -qF 'named the absence IN THE BRIEF as well' "$LOGF13"; ck $? "…including the line that records the brief append SUCCEEDED (its own redirect to /dev/null used to pass: the log still had other content)"
+
+# ⛔ THE NO-BRIEF BRANCH WAS NEVER DRIVEN AT ALL — NEITHER ITS TEXT NOR ITS DESTINATION (#3379 review cycle 13,
+# P2, MEASURED): every call site in this suite passes a real brief, so `{ echo "… no brief file to append to
+# …" >> "$log"; }` → `>> /dev/null` stayed at 165 passed, 0 failed, and the in-source claim "every other emit
+# redirect is covered" was false. That record is the one that says THE LANE WAS NEVER TOLD — the loudest
+# piece of silence this file exists to end — so it is driven: an emit with an explicit empty brief argument,
+# then the log read back.
+LOGF14="$TMP/emit-nobrief.log"; : > "$LOGF14"
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "" nobrief' _ "$HELPER" "$LOGF14" >/dev/null 2>&1
+grep -qF 'no brief file to append to' "$LOGF14"; ck $? "an emit with NO brief WRITES the no-brief WARN to the operator log (the branch was never driven; \`>> /dev/null\` used to pass)"
+grep -qF 'the LANE will not see it' "$LOGF14"; ck $? "…and says the LANE will not see it — the consequence, which is the whole point of the record"
 
 # The emit itself must be non-fatal on every branch.
 if awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -qE '\breturn [1-9]'; then
