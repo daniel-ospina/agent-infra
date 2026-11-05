@@ -1183,7 +1183,7 @@ LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 LANE_END_BRANCH=""      # the branch the tree is on (or `detached-<sha>`), never invented
 LANE_END_HEAD=""        # HEAD as measured at exit
 LANE_END_PUSH=""        # running | pushed | nothing | unmeasured | detached | verify-unanswered | push-unreported
-                        #   | push-killed |
+                        #   | push-killed | verify-ancestry-unmeasured
                         #   refused-main-checkout | refused-protected | refused-unknown-default |
                         #   refused-pushurl-divergent | refused-pushurl-unresolved | FAILED | UNAVAILABLE
 LANE_END_PUSH_URL=""    # the repository the push would have reached (origin's PROVEN push target), so every
@@ -1336,6 +1336,14 @@ lane_end_push() {
   # (2) NEVER THE LANDING BRANCH. A push of the default branch from an exit hook is a merge-gate
   # BYPASS: every landing on this fleet goes through the rail + a recorded attestation, and a branch ref
   # moved by a dying lane's cleanup is exactly the hole those gates exist to close.
+  # ⛔ THE SCRATCH HANDLE IS PRIMED IN **THIS** SHELL, NOT LEFT TO THE SUBSHELLS (review round 2, P2 —
+  # REPRODUCED). Every bounded call in this function is CAPTURED — `proof="$(tb_timeout …)"`,
+  # `out="$(tb_timeout … git push …)"`, `vraw="$(tb_timeout …)"` — and `tb_bound_tmp` lazily creates its
+  # `mktemp -d` inside whatever shell first calls it. In a command substitution that is the SUBSHELL, so
+  # each captured call minted its OWN directory and orphaned it when the substitution exited, while the
+  # parent's `TB_BOUND_TMP` stayed empty — measured: captured calls left one `bounded.*` dir EACH and
+  # `tb_bound_cleanup` in the parent removed none of them. Creating it here means every subshell INHERITS
+  # the handle and reuses that one directory, which the `tb_bound_cleanup` calls below then release.
   # ⛔ IT REFUSES ON THE **UNION**, NOT ON THE FIRST NAME THAT RESOLVES (review cycle 1, finding 1 — a
   # REPRODUCED fail-open). Choosing `origin/HEAD` *or else* `main`/`master` and comparing `sym = def`
   # refused exactly one of them: with `origin/HEAD = origin/main` a lane on **master** pushed, and — the
@@ -1435,12 +1443,15 @@ lane_end_push() {
   if [ -z "$def" ]; then
     LANE_END_PUSH="refused-unknown-default"
     echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but this run could NOT DETERMINE the remote's default branch — \`ls-remote --symref <push url> HEAD\` on the repository the push would actually reach ($pushurl) (bounded at 15 s; an empty answer is also what a TIMEOUT looks like) answered nothing. The clone's cached refs/remotes/origin/HEAD says '${c:-<none>}', and that is a CACHE, not an answer: a default that has been renamed leaves it stale (a plain \`git fetch\` does not re-point it), so it is honoured only as one MORE name to refuse on, never as proof of what the remote's default is. Pushing anyway could move a landing branch, so NOTHING was pushed. Re-run once the remote answers, or push by hand if you know $sym is not the default" >> "$log" 2>/dev/null || true
+    declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
+  declare -F tb_bound_tmp >/dev/null 2>&1 && tb_bound_tmp
   case "$_protected" in
     *" $sym "*)
       LANE_END_PUSH="refused-protected"
       echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but $sym is a LANDING branch of this remote (checked against:$_protected) and this exit path will NOT push it — a landing branch moves only through the repo's merge rail with a recorded review, and a push from a dying lane would bypass both. Nothing was pushed; the commits are in the local object store" >> "$log" 2>/dev/null || true
+      declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
       return 0 ;;
   esac
   # ⛔ THE BOUND IS RESOLVED *BEFORE* ANY NETWORK CALL, because the landing-branch check asks the REMOTE
@@ -1451,8 +1462,11 @@ lane_end_push() {
   # the bound). Measured in this repo's own launchers: `fix-one.sh:588`, `merge-one.sh:279` and
   # `merge-one.sh:316` are `sleep 20; kill -TERM; sleep 5; kill -KILL` — the 20 s is BEFORE the signal,
   # so the post-TERM grace there is 5 s; `merge-one.sh:167` gives 15 s and `lane-reap.sh:236` gives 1 s.
-  # The three calls of this function are 15 s (the symref read above) + 15 s (the push below) + 5 s (the
-  # verifying read) = 35 s worst case, which therefore CAN exceed a 5 s grace. The direction that matters
+  # The FOUR bounded calls of this function are 5 s (the push-target proof, which contacts nothing but is
+  # bounded so an unbounded `ls-remote` of ANY shape cannot exist) + 15 s (the symref read above) + 15 s
+  # (the push below) + 5 s (the verifying read) = **40 s** worst case, which therefore CAN exceed a 5 s
+  # grace. (It was stated as 35 s over "three calls" before review round 2 noticed the proof read was
+  # missing from the sum — the claim is load-bearing, since it is compared against the launchers' graces.) The direction that matters
   # is the one already in place: `tb_timeout` is a bound, not a duration (a healthy push is sub-second,
   # and `bg-rescue-wip.sh` — the tool this mirrors — allows itself 45 s for a whole TREE walk), the local
   # artifact is written BEFORE any of it by `terminal_wip_rescue` (`push=running`), and a TERM
@@ -1500,6 +1514,7 @@ lane_end_push() {
     case "$rc" in 124|137)
       LANE_END_PUSH="push-killed"
       echo "[lane-exit] ⛔ label=$label: PUSH CLIENT KILLED (rc=$rc) — $(case "$rc" in 124) printf 'the timer fired at its bound';; 137) printf 'the client was SIGKILLed, and WHICH signal sent it is not measurable from here (an OOM kill on a full disk looks identical), so the 15s bound is NOT proven to have fired';; esac), so this terminal did NOT establish whether origin received the $unpushed commit(s) on $br. The push may have been applied server-side before the kill, and it may not: this is NOT a rejection and NOT a measured absence. Re-run \`git -C $root ls-remote --heads ${pushurl:-origin} refs/heads/$sym\` before re-pushing, and do NOT reap this worktree until that read answers" >> "$log" 2>/dev/null || true
+      declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
       return 0 ;;
     esac
     # ⛔ AND A NON-ZERO EXIT IS NOT A MEASURED ABSENCE EITHER (review cycle 16, P2 — REPRODUCED, and an
@@ -1562,22 +1577,32 @@ lane_end_push() {
     LANE_END_PUSH="FAILED"
     echo "[lane-exit] ⛔ label=$label: the push exited 0 and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read — so nothing proves the remote holds THIS lane's commit. Recorded as FAILED rather than as a delivery; $unpushed commit(s) must be assumed still only on this disk" >> "$log" 2>/dev/null || true
   elif [ "$LANE_END_ORIGIN" != "$mine" ]; then
-    # ⛔ A DIFFERENT SHA IS TWO FACTS, AND ONLY ONE OF THEM IS A NON-DELIVERY (review of PR #3399, P2 —
+    # ⛔ A DIFFERENT SHA IS THREE FACTS, AND ONLY ONE OF THEM IS A NON-DELIVERY (review of PR #3399, P2 —
     # REPRODUCED). This arm used to record `FAILED` on inequality ALONE and say "this lane's commits are NOT
     # on that ref", listing "a concurrent move" as one of its own causes — while asserting the opposite of
     # what a concurrent move means. The verify read happens ~1 RTT after the push, on an account 22
     # concurrent landers share and a rail that fast-forwards branches: if a peer or the rail advanced the
     # ref INSIDE that window, origin's sha is our commit's DESCENDANT and every one of this lane's commits
-    # IS on that ref. Ancestry is decidable and LOCAL (no network), so it is measured instead of assumed;
-    # only rc=0 establishes it, so an inconclusive `merge-base` stays conservative (`FAILED`).
+    # IS on that ref. Ancestry is decidable and LOCAL (no network), so it is measured instead of assumed.
+    # ⛔ AND `merge-base` HAS THREE OUTCOMES, NOT TWO (review round 2, P1 — REPRODUCED). `--is-ancestor`
+    # exits 0, 1 (measured, NOT an ancestor) — and **128** when the object is not in THIS repository at all,
+    # which is the NORMAL shape for the very case this arm exists for: a peer advanced the ref and this lane
+    # never fetched, so the peer's commit is unknown locally. Measured: `--is-ancestor M D` → `fatal: Not a
+    # valid commit name 99040f0` rc=128 before the fetch, rc=0 after it. Treating every non-zero as "not an
+    # ancestor" therefore printed the false absence claim for a genuine descendant — the exact defect the
+    # `rc=0` half of this fix removed, left in the other half. So only rc=1 is a MEASURED non-delivery; an
+    # inconclusive read (128, or anything else) gets its own verdict that asserts neither.
     local anc_rc=0
     git -C "$root" merge-base --is-ancestor "$mine" "$LANE_END_ORIGIN" 2>/dev/null || anc_rc=$?
     if [ "$anc_rc" -eq 0 ]; then
       LANE_END_PUSH="pushed"
       echo "[lane-exit] pushed $br → origin refs/heads/$br — $unpushed commit(s) that existed only on this disk are now off-box. Origin holds $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine): a peer push or the rail advanced the ref inside the verify window, and the commits it advanced over are this lane's" >> "$log" 2>/dev/null || true
-    else
+    elif [ "$anc_rc" -eq 1 ]; then
       LANE_END_PUSH="FAILED"
       echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine, and $mine is NOT an ancestor of what origin holds (merge-base --is-ancestor rc=$anc_rc) — so this lane's commits are not on that ref (a pre-receive hook, a shim that exited 0, or a concurrent move to an unrelated sha). Whether they are on some OTHER ref is not measured here; read the replayed push output above" >> "$log" 2>/dev/null || true
+    else
+      LANE_END_PUSH="verify-ancestry-unmeasured"
+      echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree does NOT HAVE that object (merge-base --is-ancestor rc=$anc_rc), so ANCESTRY COULD NOT BE MEASURED — this terminal asserts NEITHER delivery NOR loss for $unpushed commit(s) on that branch. The usual cause is a peer or the rail advancing the ref to a commit this lane never fetched. Fetch it and look before reaping: git -C $root fetch ${pushurl:-origin} refs/heads/$sym, then git -C $root merge-base --is-ancestor $mine FETCH_HEAD" >> "$log" 2>/dev/null || true
     fi
   else
     LANE_END_PUSH="pushed"
@@ -1716,6 +1741,15 @@ lane_end_next() {
     UNAVAILABLE|detached|refused-unknown-default|refused-pushurl-divergent|refused-pushurl-unresolved)
       printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. They survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s%s\n' \
         "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" \
+        "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
+    # ⛔ AN ANCESTRY THAT COULD NOT BE MEASURED IS NOT A NON-DELIVERY (review round 2, P1 — REPRODUCED). The
+    # remote ANSWERED with a sha this worktree does not even have (`--is-ancestor` exited 128), so no relation
+    # was established. Every sentence in this file that says "was NOT delivered" would be a claim the
+    # terminal cannot make from that read; the honest answer names the read it still needs.
+    verify-ancestry-unmeasured)
+      printf 'MANUAL — the remote ANSWERED and holds refs/heads/%s at %s, which this worktree does NOT have, so ANCESTRY COULD NOT BE MEASURED: the commit(s) from this lane may or may not be on it, and this artifact asserts NEITHER delivery NOR loss. The usual cause is a peer or the rail advancing the ref. Fetch it and look before reaping %s — git -C %s fetch origin refs/heads/%s, then git -C %s merge-base --is-ancestor %s FETCH_HEAD%s%s\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ORIGIN:-<sha>}" "${LANE_END_ROOT:-<unknown>}" \
+        "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_HEAD:-<unknown>}" \
         "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
   esac
   # ⛔ AND THE ONE MANUAL ARM THAT DID NOT UNION THE OTHER DOMAIN NOW DOES (review cycle 13, P2 — REPRODUCED).
@@ -1997,7 +2031,7 @@ lane_end_push_caveat() {
       printf ' — AND the unpushed-commit count on %s could NOT be read (push=unmeasured), so whether those commits exist anywhere but this disk is NOT established either way — read it yourself (`git -C %s rev-list --count HEAD --not --remotes`, the SAME endpoint-free enumeration this terminal used, so it answers the same question instead of a narrower one about a single remote that may not even carry the branch)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" ;;
     UNAVAILABLE|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
       printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
-    verify-unanswered|push-unreported|push-killed)
+    verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured)
       printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
     running)
       printf ' — AND this marker was written BEFORE the push step returned (push=running), so the branch push at %s established NOTHING either way, which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" ;;
@@ -2305,7 +2339,8 @@ terminal_wip_rescue() {
   LANE_END_BRANCH="$br"; LANE_END_HEAD="$(git -C "$root" rev-parse HEAD 2>/dev/null)"
   LANE_END_PORCELAIN="$st_out"
   # ⛔ THE LOCAL HALF IS ON DISK **BEFORE** THE NETWORK CALL (review cycle 1, finding 4). The push and its
-  # verifying read can occupy the exit path for up to 35 s (15 s symref + 15 s push + 5 s verify),
+  # verifying read can occupy the exit path for up to 40 s (5 s push-target proof + 15 s symref + 15 s
+  # push + 5 s verify),
   # against a launcher's 20 s + 15 s
   # kill grace — so a signal in that window used to lose the marker entirely, which is the artifact this
   # change exists to produce. Writing `push=running` first means that, even if everything after this line

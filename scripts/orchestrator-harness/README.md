@@ -542,10 +542,14 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     worktree are different facts;
   * `unpushed-only` is MEASURED, NAMED **and now PUSHED** (`lane_end_push`, #3396 — the half #2834 left
     owed). `bg-rescue-wip.sh` archives only a NON-EMPTY `git status` and never moves a branch, so the
-    branch half is its own function: `git push -u origin HEAD:refs/heads/<branch>`, bounded (15 s push
-    + 15 s symref + 5 s verify = 35 s, the whole network budget, via
+    branch half is its own function: `git push origin HEAD:refs/heads/<branch>`, bounded (5 s push-target
+    proof + 15 s symref + 15 s push + 5 s verify = 40 s, the whole network budget, via
     `lib/bounded.sh`), **never forced**, and **verified by reading the remote** (`ls-remote`) rather than
-    by the push's exit status — transport success is not delivery. It fires only when the measured
+    by the push's exit status — transport success is not delivery. ⛔ **AND NO `-u`:** an upstream belongs
+    to the lane's own setup, not to a dying terminal, and `-u` writes `branch.<b>.remote`/`.merge` into
+    the repository's SHARED config — which in a linked worktree is what every PEER worktree reads, so one
+    lane's exit would silently give another a `git pull`/`git push` default it never configured. It fires
+    only when the measured
     unpushed count is > 0, so the majority of lanes cost no network call. It REFUSES, loudly and by name,
     to push from a hub checkout (`--git-dir` == `--git-common-dir`) or onto the landing branch, because
     either would publish a ref that only the merge rail may move. ⛔ **AND THE READ AND THE WRITE MUST
@@ -587,7 +591,10 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     `pushed` (verified by reading the remote back, and it now also covers a remote that a PEER
     fast-forwarded inside the verify window — ancestry is measured with `git merge-base --is-ancestor`,
     because a descendant sha means our commits ARE on the ref and recording `FAILED` there would be a
-    durable false absence), `nothing` (the unpushed count read 0 — a statement about the LOCAL
+    durable false absence), `verify-ancestry-unmeasured` (the remote ANSWERED with a sha this worktree
+    does not HAVE, so `--is-ancestor` exited 128 and no relation was established — a DIFFERENT fact from
+    `FAILED`, and the abstaining verdict for it: `FAILED` is only for the measured `rc=1`),
+    `nothing` (the unpushed count read 0 — a statement about the LOCAL
     `refs/remotes/*` CACHE, not about the remote, which is why the sentence says so), `unmeasured`,
     `detached`, `verify-unanswered`, `push-unreported`, `push-killed`, `FAILED` (the remote ANSWERED and
     the ref is absent or holds an unrelated sha), and the refusals: `refused-main-checkout` (a hub's
