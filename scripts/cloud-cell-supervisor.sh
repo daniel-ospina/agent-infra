@@ -2463,6 +2463,148 @@ cmd_check_provenance() {
 }
 
 # ── check: can this cell actually run a controller? ─────────────────────────────
+# ── the provider CREDENTIAL STORE — a box that cannot answer a prompt must not print a green check ──
+# (agent-infra#2024) MEASURED 2026-11-05 on all five cells: `~/.pi/agent/auth.json` — pi's PERSISTED
+# credential store — was `{}` (2 bytes), and `cell-install.sh` deliberately does not touch it. A launch
+# that does not source `keys.env` then prints `Use /login to log into a provider via OAuth or API key`
+# and exits in ~8 s, which a launch verifier reads as "ran": seven lanes on one box each produced a
+# log of EXACTLY 304 bytes and no process, while the controller reported RUNNING and the box was idle
+# for hours. A repaired box answers from a CLEAN SHELL with `DEEPSEEK_API_KEY` unset — the store is
+# the only source that survives a launch which sources nothing.
+#
+# ⛔ READ-ONLY HERE, AND THAT IS THE DESIGN. The WRITER is `cloud-cell-bringup.sh`'s
+# check_provider_store, which materialises the store from the box's OWN `keys.env` (never from the
+# repo or a template — the decision at `pi-bootstrap/cell-install.sh:125` and
+# `extensions/auto-sync.ts:20`). A `check` that MINTED credentials would be a second writer of the
+# cell's identity, and two writers of one secret are how a repaired box and a certified box drift
+# apart. So this verb judges, and names the one command that repairs.
+#
+# ⛔ THE CONDITION IS EXACTLY "empty AND keys.env cannot repair it", and the second half is not a
+# loophole for an ambient export. A lane sources `$ENV_FILE` itself (`lane-env.sh`), so a key the file
+# carries IS a delivered credential and refusing it would be a false block; but an export that lives
+# only in an operator's shell does NOT reach a worker (tmux serves the server's environment — the
+# same rule this file already applies to AI_REVIEW_GATE_KEY), so it can neither repair the store nor
+# justify a green check.
+# The provider→variable pairs are the SAME list `cloud-cell-bringup.sh` carries, deliberately
+# duplicated for the reason that file states: both scripts are pushed STANDALONE onto a cell, with no
+# library to source. This side only READS them; adding a provider is one entry in each.
+SUP_AUTH_STORE_PROVIDERS="deepseek:DEEPSEEK_API_KEY anthropic:ANTHROPIC_API_KEY openai:OPENAI_API_KEY openrouter:OPENROUTER_API_KEY"
+
+# sup_provider_var <provider> — the variable `keys.env` carries that provider's key in. Non-zero for
+# a provider this file does not know, which is reported as NOT VERIFIED rather than refused: pi
+# supports far more providers than a cell's lane needs, and guessing a refusal out of ignorance is a
+# false block on a healthy box.
+sup_provider_var() {
+  local pair
+  for pair in $SUP_AUTH_STORE_PROVIDERS; do
+    [ "${pair%%:*}" = "${1:-}" ] && { printf '%s\n' "${pair#*:}"; return 0; }
+  done
+  return 1
+}
+
+# sup_store_state <auth.json> <provider> -> present | absent | empty | unreadable
+# `empty` covers the measured shapes (absent file, 0 bytes, whitespace only, `{}`). `unreadable` is a
+# file that is not a JSON object we can read — reported, never "repaired" from here (read-only verb).
+# ── what a STORE ENTRY has to look like before this check will call it a credential ─────────
+# pi's own loader decides this, and it is stricter than "there is a `key` field" (pi's
+# `core/auth-storage`: an `api_key` entry whose `key` is a NON-STRING, or an entry with no `type` at
+# all, makes pi THROW when it reads the file; an `api_key` entry whose `key` resolves to nothing
+# falls back to its `env` map; an `oauth` entry carries `access`/`refresh`/`expires` and no `key`).
+# So:
+#   usable := api_key with a non-blank STRING key, OR api_key with a non-empty env map,
+#             OR oauth with a non-blank string access token.
+# This is the SAME program `cloud-cell-bringup.sh` carries (there, next to the only writer), and it
+# must stay the same: the two verbs certifying one box from two different answers is the drift this
+# whole gate exists to avoid.
+SUP_STORE_ENTRY_USABLE_JQ='
+  def nonblank_string: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
+  if type != "object" then false
+  elif .type == "api_key" then
+    ((.key? | nonblank_string)
+     or (((.env? // null) | type) == "object" and (((.env // {}) | length) > 0)))
+  elif .type == "oauth" then (.access? | nonblank_string)
+  else false end'
+
+# sup_store_state <auth.json> <provider> -> present | other | malformed | absent | empty | unreadable
+#   present    a credential for this provider that pi can USE
+#   other      an entry of a type this check does not judge (`oauth`, or something newer) — it may
+#              well be a working credential, and only pi can say, so it is NOT a refusal
+#   malformed  an entry pi will THROW on when it reads the store (an `api_key` with a non-string or
+#              blank key, or an entry with no `type`): the store authenticates NOBODY
+#   absent     the file is a JSON object with entries, but none for this provider
+#   empty      absent file, 0 bytes, WHITESPACE ONLY, or `{}` — the measured defect
+#   unreadable not a JSON object at all (a scalar, an array, or unparseable)
+sup_store_state() {
+  local auth="$1" prov="$2" st
+  if [ ! -e "$auth" ] || [ ! -s "$auth" ] || ! grep -q '[^[:space:]]' "$auth" 2>/dev/null; then
+    printf 'empty\n'; return 0
+  fi
+  st="$(jq -r --arg p "$prov" "
+      if type != \"object\" then \"unreadable\"
+      elif length == 0 then \"empty\"
+      elif (.[\$p] // null) == null then \"absent\"
+      elif (.[\$p] | ${SUP_STORE_ENTRY_USABLE_JQ}) then \"present\"
+      elif (((.[\$p] | type) == \"object\") and (((.[\$p].type // \"\") | IN(\"api_key\", \"oauth\")))) then
+        (if .[\$p].type == \"oauth\" then \"other\" else \"malformed\" end)
+      elif ((.[\$p] | type) == \"object\") and ((.[\$p] | has(\"type\"))) then \"other\"
+      else \"malformed\" end" "$auth" 2>/dev/null)"
+  case "$st" in
+    present|other|malformed|absent|empty|unreadable) printf '%s\n' "$st" ;;
+    *)                                              printf 'unreadable\n' ;;
+  esac
+}
+
+# sup_env_file_carries <VAR> — 0 iff $ENV_FILE NAMES that variable AND the value it put in this shell
+# is non-blank. Both halves matter: `keys.env` naming it with an empty assignment is the whitespace
+# case this file already refuses for AI_REVIEW_GATE_KEY (an empty value shadows nothing and supplies
+# nothing), and a value the file does not carry at all is the ambient-export case above.
+sup_env_file_carries() {
+  local v
+  [ -f "${ENV_FILE:-}" ] || return 1
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" "$ENV_FILE" 2>/dev/null || return 1
+  v="$(printenv "$1" 2>/dev/null)" || v=""
+  [ -n "$(printf '%s' "$v" | tr -d '[:space:]')" ]
+}
+
+# check_provider_store <provider> — the gate. Refuses a box with NO usable stored credential and NO
+# delivered one; otherwise states which source the credential comes from (silence is how the measured
+# box read healthy for hours).
+check_provider_store() {
+  local prov="${1:-deepseek}" auth st var
+  auth="$CELL_HOME/.pi/agent/auth.json"
+  st="$(sup_store_state "$auth" "$prov")"
+  case "$st" in
+    present)
+      # ⛔ SAY WHAT WAS READ, NOT WHAT FOLLOWS FROM IT. This verb is read-only and has no probe, so
+      # the honest claim is about the FILE ("pi reads the store first, so the key need not be in the
+      # environment"), never "a launch answers" — which only a call can establish.
+      log_line "ok: the provider store holds a '$prov' credential ($auth) — pi consults the store FIRST, so a launch does not need the key in its environment"
+      return 0 ;;
+    other)
+      log_line "ok: the provider store holds a '$prov' entry of a type this check does not judge ($auth) — whether it resolves is pi's answer alone, so NOTHING is asserted about it"
+      return 0 ;;
+    malformed)
+      die "$auth has a '$prov' entry pi cannot READ (an api_key entry needs a non-blank STRING key or a non-empty env map; an entry with no \"type\" is invalid) — pi THROWS on this file, so NO provider in it can authenticate and every lane dies at startup. Do not delete it blindly (it is the cell's identity). Fix the entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move the file aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
+    unreadable)
+      die "$auth exists but is not a readable JSON object, so this check cannot say whether '$prov' has a credential — and CANNOT-VERIFY IS NOT A PASS. It is also pi's credential store: do not delete it blindly. Inspect it (it should be a JSON object such as {\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}); if it is unusable, move it aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
+  esac
+  if ! var="$(sup_provider_var "$prov")"; then
+    log_line "      provider store: NOT VERIFIED — this file does not know which variable carries a '$prov' key ($auth is $st), so it cannot say whether the cell can answer. Verify by execution: HOME=\$HOME pi -p 'reply with exactly PROVIDER_OK'"
+    return 0
+  fi
+  if sup_env_file_carries "$var"; then
+    # Delivered by the file a lane sources itself, so the box CAN answer — refusing would be a false
+    # block. It is still stated, because the store is the durable half and the bring-up is what makes
+    # it survive a launch that sources nothing.
+    log_line "warn: the provider store has no usable '$prov' credential ($auth is $st); the key comes from $ENV_FILE instead."
+    log_line "      That IS a delivered credential — a lane sources \$ENV_FILE itself — so this is not a refusal."
+    log_line "      To make it durable (a launch that sources nothing still answers): re-run the bring-up,"
+    log_line "      which materialises the store from \$ENV_FILE: HOME=\$HOME CELL_HOME=\$CELL_HOME bash cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  die "this box CANNOT ANSWER A PROMPT, so 'check' must not certify it: the provider credential store at $auth has no usable '$prov' credential ($st), and $ENV_FILE carries no $var to repair it from. pi consults the STORE first and then the environment, so with neither a lane exits with 'No API key found for $prov' — a ~300-byte log and no process, which a launch verifier reads as a successful launch (agent-infra#2024). FIX: put $var=<the key> in $ENV_FILE and re-run the bring-up (it materialises the store from the box's own keys.env — never from the repo or a template), then re-run this check. An ambient export is NOT a substitute: tmux serves a worker the SERVER's environment, so a key that lives only in your shell does not reach the lane."
+}
+
 cmd_check() {
   validate_scope
   [ -d "$CELL_HOME" ] && [ -w "$CELL_HOME" ] || die "HOME=$CELL_HOME missing or not writable"
@@ -2577,6 +2719,12 @@ cmd_check() {
     esac
   fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
+  # ── can this box ANSWER A PROMPT? (agent-infra#2024) ─────────────────────────────────────────
+  # Placed with the other SINGLE-VALUE preconditions (gh auth, repo, disk) and before the long
+  # provisioning probes: a box whose lanes die at pi startup must be refused here, not discovered as
+  # silence after `start` has blessed it. See `check_provider_store` for the predicate and why this
+  # verb READS the store while the bring-up is the one that WRITES it.
+  check_provider_store "$lane_provider"
   # ⛔ RESOLVE THE CHECKOUT BEFORE ANYTHING READS IT. Every verdict below is about THIS repo, and an
   # unresolved $REPO used to reach `die "no git repo at "` — an error naming an empty path, for a
   # value the operator never set. assert_repo() derives it or refuses with one actionable line, and

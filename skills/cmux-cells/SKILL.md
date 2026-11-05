@@ -8,7 +8,7 @@ status: live
 tags: [fleet, cmux, cells, dispatch, capacity, recovery, harness]
 summary: "How to provision, measure, recover, and dispatch on cmux cloud cells, and how work actually lands from them."
 created: 2026-10-19
-updated: 2026-10-28
+updated: 2026-11-05
 ---
 
 > ⛔ **This skill MUST be read in full — not skimmed.** Every section below is a measurement that cost a lost lane, a
@@ -64,12 +64,13 @@ check `[lane-bound] KILL` and `dmesg | grep -ci 'killed process'` before blaming
 `pgrep -f "pi -p"` for liveness: it matches your own command line. **And what actually made cell lanes run is the launch
 directory — see below.**
 
-**⚠️ One thing is still missing after a verified install — plus a trap for boxes installed before the fix:**
+**⚠️ Still missing after a verified install — plus a trap for boxes installed before the fix:**
 
 | missing | symptom | fix |
 |---|---|---|
 | **`gh` shim** | every lane logs `#984 argv-level gh shim not found — only the string scanner is active`; the merge gate runs degraded and cannot verify the evidence it demands | **fixed in `pi-bootstrap/cell-install.sh` (agent-infra#2164, closed 2026-10-24)**: it installs the shim at `$HOME/.pi/agent/scripts/gh-shim/gh` and **fails the install** if it is missing. A manual `ln -sf … $HOME/.pi/agent/shims/gh` is a *legacy* workaround for a box installed before that — do not present it as the plan |
-| **capture extension** | `capture: BLOCKED (N queued, 402 quota)` on stdout blocks turns and corrupts the bringup probe (a healthy box reports `FATAL: provider probe failed`) | move `$HOME/.pi/agent/extensions/tortoise-capture*` aside (agent-infra#2147); `TORTOISE_CAPTURE=0` does **not** disable it |
+| **`auth.json` — the provider credential store** | every lane dies in ~8 s printing `Use /login to log into a provider via OAuth or API key` / `No API key found for deepseek`: a **~300-byte log and no process**, which a launch verifier reads as "ran" (measured 2026-11-05 on **all five cells: `auth.json` was `{}`, 2 bytes**; seven lanes on one box were all recorded as launched and all dead) | **`scripts/cloud-cell-bringup.sh --check` (agent-infra#2024)**: when the store is missing/empty and `keys.env` carries a provider key it **materialises it from that box's own `keys.env`** (`{"deepseek":{"type":"api_key",…}}`, mode 600) in **both** the cell home and the account home, and **reports it as a REPAIR by name**. It **REFUSES** (never guesses) when `keys.env` carries no provider key, and it never takes a key from the repo or a template — `cell-install.sh` still does not touch the store (`cell-install.sh:125`) and nothing syncs (`auto-sync.ts:20`), so this is *materialisation of a secret already on the box*, not a copy. `cloud-cell-supervisor.sh check` **refuses to print `CELL CAN RUN A CONTROLLER`** on a box with no store credential and no `keys.env` key. Verify by artifact, from a clean shell: `HOME=$CELL_HOME pi -p "reply with exactly PROVIDER_OK"` → `PROVIDER_OK` and nothing else |
+| **capture extension** (and every suffixed copy of it) | `capture: BLOCKED (N queued, 402 quota)` / `paused N (attempts; continues in the background)` on stdout blocks turns and corrupts the bringup probe (a healthy box reports `FATAL: provider probe failed`) | **denied by name PATTERN in BOTH homes (agent-infra#2147)**: `cell-install.sh` removes `tortoise-capture*` from `$HOME/.pi/agent/extensions` **and** from every home `cloud-cell-bringup.sh` declares as this cell's (`CELL_ALT_HOMES`), and `--verify` fails naming each copy. Measured 2026-11-05: **1 / 0 / 7 / 3 / 2 copies survived** an exact-name, one-home deny. `TORTOISE_CAPTURE=0` does **not** disable it |
 
 Verify activation by **artifact**, never by a banner:
 
@@ -78,6 +79,18 @@ for f in .pi/agent/scripts/record-review.sh .pi/agent/scripts/gh-shim/gh; do [ -
 echo "scripts=$(ls $HOME/.pi/agent/scripts|wc -l) ext=$(ls $HOME/.pi/agent/extensions|wc -l) skills=$(ls $HOME/.pi/agent/skills|wc -l)"
 git -C /tmp/cell-ai rev-parse --short HEAD    # the version, not the claim
 ```
+
+⛔ **AND VERIFY THE BOX CAN ACTUALLY ANSWER — from a shell that sources NOTHING** (+#2024). Every check above
+reads an installed FILE; none of them proves a lane can get a token. This is the one that does, and it must print
+exactly one line:
+
+```bash
+HOME=/tmp/cell-home pi -p "reply with exactly PROVIDER_OK"     # → PROVIDER_OK, no trailing noise
+```
+
+An empty `auth.json` (`{}`, 2 bytes) makes that command exit in ~8 s with `No API key found for deepseek` and a
+~300-byte log — which a verifier that only checks the log exists reads as a successful launch. `cloud-cell-bringup.sh
+--check` materialises the store from the box's own `keys.env` (§1 table) and refuses if it cannot.
 
 A cell is "on main" only if `git -C /tmp/cell-ai rev-list --count HEAD..origin/main` is **0**.
 

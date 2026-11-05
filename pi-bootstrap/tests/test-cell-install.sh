@@ -72,6 +72,15 @@
 #       it is there (the false BLOCK). NOTE: every arm reads a PER-RUN log ($LOG is truncated at the
 #       start of each driven run), because append-only made two of these assertions vacuous (#2166
 #       review).
+#   (m) the DENY is enforced BY PATTERN and across BOTH HOMES a cell runs under (#2147, run 3) —
+#       `pi` loads `extensions/*.ts|*.js` and any subdirectory holding an index, so a
+#       `tortoise-capture.bak.ts`, a `tortoise-capture.old/index.ts` or a `cmux-session.disabled.js`
+#       WAS being loaded while an exact-name deny certified the box (measured 2026-11-05: 1 / 0 / 7 /
+#       3 / 2 surviving copies across the five cells). Both halves are pinned: `--verify` refuses
+#       each copy NAMING ITS PATH, `--install` removes it (otherwise verify→install→verify loops
+#       forever), a copy in the cell's OTHER home is caught when the bring-up declares it — and an
+#       UNDECLARED home is neither scanned nor touched, because on a laptop that home is a
+#       developer's own working `tortoise-capture` and deleting it would be a destructive guess.
 #
 # Hermetic: the repo is read ONLY, CELL_HOME is a temp dir, npm is stubbed (no network —
 # same shape as test-setup-no-nesting.sh). The stub answers for real deps, and it also
@@ -1419,6 +1428,112 @@ run_install >/dev/null 2>&1
 [ -x "$SHIM_DST" ] \
   && ok "the fixture restored the installed shim after the ABSENT arm" \
   || fail "the ABSENT arm left the cell without an installed shim — later sections would measure the wrong tree"
+
+# -------------------------------------------------------------------------
+hdr "run 3: the deny is enforced BY PATTERN, across EVERY home the cell runs under (#2147)"
+# MEASURED 2026-11-05, five cells: the deny was NAME-scoped (one exact path) and PER-HOME (only
+# $DEST), and denied copies survived BOTH ways — 1 / 0 / 7 / 3 / 2 per box. `pi` discovers extensions
+# by RULE (`dist/core/extensions/loader.js`: any top-level `extensions/*.ts`/`*.js`, and any
+# subdirectory holding `index.ts`/`index.js`), so every arm below is a copy that WAS being LOADED
+# while the exact-name test certified the box.
+# These arms are the sibling of run 2b, one axis over: 2b proves the deny does not depend on
+# manifest.json; this run proves it does not depend on the SPELLING of the path or on which home the
+# copy happens to live in.
+run_alt_verify() {   # <alt-home>  — the shipped read-back WITH the cell's other home declared
+  : > "$LOG"
+  echo "---- cell-install --verify (CELL_ALT_HOMES=$1) ----" >> "$LOG"
+  CELL_HOME="$CELL_HOME" CELL_ALT_HOMES="$1" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
+    bash "$INSTALLER" --verify >> "$LOG" 2>&1
+}
+run_alt_install() {  # <alt-home>
+  : > "$LOG"
+  echo "---- cell-install --install (CELL_ALT_HOMES=$1) ----" >> "$LOG"
+  CELL_HOME="$CELL_HOME" CELL_ALT_HOMES="$1" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
+    bash "$INSTALLER" --install >> "$LOG" 2>&1
+}
+
+# (3a) A SUFFIXED copy in $DEST. `tortoise-capture.bak.ts` is a top-level `*.ts` — pi loads it.
+echo '// a suffixed copy pi WOULD load' > "$DEST/extensions/tortoise-capture.bak.ts"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "FAIL: $CAPTURE_LINE" "$LOG" \
+  && ok "--verify FAILS, with the named line, on a SUFFIXED capture copy (tortoise-capture.bak.ts)" \
+  || fail "--verify certified a suffixed capture copy the exact-name deny cannot see: $(grep -m1 -E 'capture|FAIL' "$LOG")"
+grep -q 'tortoise-capture.bak.ts' "$LOG" \
+  && ok "…and names the offending PATH, so the operator knows which copy to remove" \
+  || fail "the refusal does not name the suffixed copy — an operator cannot act on it"
+run_install >/dev/null 2>&1
+{ [ ! -e "$DEST/extensions/tortoise-capture.bak.ts" ]; } \
+  && ok "--install REMOVES the suffixed copy (the deny repairs, it does not only report)" \
+  || fail "a suffixed capture copy SURVIVED --install — the verify half would loop: refuse, install, refuse"
+
+# (3b) A suffixed copy of the other denied entry, with the `.ts` inside the suffix rather than after
+# it: `cmux-session.disabled.js` shares the STEM, which is why the match is on the stem and not on
+# the literal entry name.
+echo '// a suffixed copy of the surface-absent deny' > "$DEST/extensions/cmux-session.disabled.js"
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -q 'denied extension is PRESENT on the cell: extensions/cmux-session.disabled.js' "$LOG" \
+  && ok "--verify refuses a suffixed cmux-session copy (stem match, not a literal name match)" \
+  || fail "--verify certified cmux-session.disabled.js"
+run_install >/dev/null 2>&1
+[ ! -e "$DEST/extensions/cmux-session.disabled.js" ] \
+  && ok "--install removes the suffixed cmux-session copy too" \
+  || fail "a suffixed cmux-session copy survived --install"
+
+# (3c) A file that merely MENTIONS the denied name is NOT a copy of it, and must not be refused:
+# this is the over-block direction, and a deny that fires on it would fail a healthy cell.
+echo 'notes about tortoise-capture, which lives in the checkout' > "$DEST/extensions/tortoise-capture-notes.txt"
+# …and neither is a DIRECTORY pi would not index. `pi` loads `extensions/<dir>` only when it holds an
+# `index.ts`/`index.js`; a directory of notes is inert, and `--install` would `rm -rf` it if the
+# predicate were just the name prefix.
+mkdir -p "$DEST/extensions/tortoise-capture-noindex"
+echo 'notes' > "$DEST/extensions/tortoise-capture-noindex/README.md"
+# ⛔ DRIVEN THROUGH `--install`, because the DELETE is the risk: `--verify` cannot remove anything,
+# so an arm that only verified would never see the damage a prefix-wide sweep does.
+run_install >/dev/null 2>&1
+run_verify \
+  && ok "--verify does NOT refuse an unrelated file/directory that merely starts with the denied name (no over-block)" \
+  || fail "--verify refused an unrelated path whose name starts with tortoise-capture — the pattern is too broad: $(grep -m1 'FAIL' "$LOG")"
+[ -d "$DEST/extensions/tortoise-capture-noindex" ] && [ -f "$DEST/extensions/tortoise-capture-notes.txt" ] \
+  && ok "…and neither path was DELETED by --install (the sweep matches pi's loadable shapes, not the name alone)" \
+  || fail "--install DELETED an inert path for its name alone — the sweep's predicate is too broad"
+rm -rf "$DEST/extensions/tortoise-capture-notes.txt" "$DEST/extensions/tortoise-capture-noindex"
+
+# (3d) A copy in the CELL'S OTHER HOME. #2916's two-home state is the measured cause: the operating
+# home kept its copies while the installer scanned the account home.
+ALT_HOME="$TMP/alt-home"
+ALT_DEST="$ALT_HOME/.pi/agent"
+mkdir -p "$ALT_DEST/extensions/tortoise-capture.old"
+echo '// a copy left in the OTHER home' > "$ALT_DEST/extensions/tortoise-capture.old/index.ts"
+run_alt_verify "$ALT_HOME"
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "FAIL: $CAPTURE_LINE" "$LOG" \
+  && ok "--verify FAILS on a copy in the DECLARED other home (CELL_ALT_HOMES), with the named line" \
+  || fail "--verify certified a capture copy in the cell's other home: $(grep -m1 -E 'capture|FAIL' "$LOG")"
+grep -q "$ALT_DEST/extensions/tortoise-capture.old" "$LOG" \
+  && ok "…and names the path in that home, so the operator edits the right tree" \
+  || fail "the refusal does not name the copy's path in the other home"
+run_alt_install "$ALT_HOME" >/dev/null 2>&1
+{ [ ! -e "$ALT_DEST/extensions/tortoise-capture.old" ]; } \
+  && ok "--install removes the copy from the other home (the sweep reaches both trees)" \
+  || fail "a capture copy in the other home SURVIVED --install — verify would loop forever on this cell"
+# ⛔ AND THE DEFAULT MUST NOT TOUCH AN UNDECLARED HOME. This is the LAPTOP case: a developer's own
+# `~/.pi/agent/extensions/tortoise-capture` is a working feature there, so an installer that swept the
+# ambient $HOME unconditionally would DELETE it. The extra homes are declared by the bring-up (the
+# only path that certifies a cell), never guessed.
+mkdir -p "$ALT_DEST/extensions/tortoise-capture"
+echo '// the operator home the installer was NOT told about' > "$ALT_DEST/extensions/tortoise-capture/index.ts"
+run_verify \
+  && ok "with NO CELL_ALT_HOMES the installer neither refuses nor touches an undeclared home (no laptop deletion)" \
+  || fail "--verify refused a home it was never told about — the scan is guessing homes: $(grep -m1 'FAIL' "$LOG")"
+[ -e "$ALT_DEST/extensions/tortoise-capture/index.ts" ] \
+  && ok "…and the undeclared home's extension is still there (the default is non-destructive)" \
+  || fail "the installer DELETED an extension from a home it was not told about"
+rm -rf "$ALT_HOME"
+run_verify >/dev/null 2>&1 \
+  && ok "the cell verifies clean again once the suffixed and other-home copies are gone" \
+  || fail "--verify still fails after the copies were removed: $(grep -m1 'FAIL' "$LOG")"
 
 # -------------------------------------------------------------------------
 hdr "syntax"
