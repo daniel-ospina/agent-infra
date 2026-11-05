@@ -1400,14 +1400,17 @@ evidence: every mutant it reports "caught" is caught only because its case is al
 ⛔ **A RUN AS ROOT IS ALSO A MEASURED, NON-GREEN-NEUTRAL OUTCOME, and it used to be a FALSE PASS.** Cases
 (g), (l) and (r) exist to make a directory unreadable or unwritable, which `chmod` cannot do to root: each
 now calls `skip()` and returns `CASE_SKIPPED`, which `expect_pass`/`expect_fail` map to a `⏭` line instead
-of ✅ — so the arm is on the `skipped:` channel and NOT in the outcome tally, and its five mutants are
-reported as "NOT measured" rather than as `MUTANT SURVIVED`. Measured on this box under
+of ✅ — so the arm is on the `skipped:` channel and NOT in the outcome tally, and its SIX mutants are
+reported as "NOT measured" rather than as `MUTANT SURVIVED` (five of them did report `MUTANT SURVIVED`
+before the sentinel; `(g)`'s read "caught" only because `(g)` itself was red there). Measured on this box under
 `unshare -r --map-root-user`: **47 passed, 0 failed, 12 skipped, exit 0**, with zero `MUTANT SURVIVED`
 lines. Before the sentinel the same run printed `50 passed, 6 failed, 10 skipped, exit 1` — five of those
 reds being "MUTANT SURVIVED: the arm is not covered by this case" about arms that WERE covered and merely
 could not be built, i.e. a suite blaming its own coverage for a host limitation, on a box that reports
 healthy. `passed + the skipped CASE lines` still totals 56; the 12 skips are 3 `(f)` sites + 9 case
-invocations ((g)/(l)/(r) each reached three times).
+invocations — `(l)` four times (real + `l`/`l2`/`l3`), `(r)` three times (real + `r1`/`r2`), and `(g)`
+twice (real + its single mutant). The per-case split is STRUCTURAL — it is the number of times each case is
+reached from the registration block — so it is derived from that block, not taken from a lucky run.
 
 **The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
 run on a box that HAS real runner roots — its whole subject is the default list, so there is nothing to
