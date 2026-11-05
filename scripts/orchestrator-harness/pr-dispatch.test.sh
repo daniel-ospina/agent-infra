@@ -1435,7 +1435,13 @@ STUBFIX
     [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
   }
   if [ "$(id -u)" = "0" ]; then
-    echo "  ⏭  UNPROVEN-ON(root): the unsearchable-`state/` leg cannot be built for a privileged user (`-r` is always true), so the producer side of 'unmeasured' is UNMEASURED here — the consumer side is pinned by §F in stall-fix.test.sh"
+    # ⛔ THE BACKTICKS ARE ESCAPED, AND THAT IS NOT COSMETIC (review cycle 4 of #3380, 2026-11-05, P3):
+    # inside a DOUBLE-quoted string an unescaped `state/` is COMMAND SUBSTITUTION, so on the one host
+    # class this branch exists for the disclosure printed "/tmp/…: state/: No such file or directory"
+    # and "-r: command not found" and then garbled its own sentence, while `bash -n` stayed clean and
+    # no gate looked. Measured by running this exact line with an uid-0 stub
+    # (`bash /tmp/probe-root-line.sh`) — the escape is what makes it a sentence instead of a script.
+    echo "  ⏭  UNPROVEN-ON(root): the unsearchable-\`state/\` leg cannot be built for a privileged user (\`-r\` is always true), so the producer side of 'unmeasured' is UNMEASURED here — the consumer side is pinned by §F in stall-fix.test.sh"
   else
     _o="$(stallfix_dispatch_unreadable_state)"
     [ "$_o" = "1|unmeasured" ] && ok "…and an UNSEARCHABLE state/ dispatches with agesrc=unmeasured — the third provenance reaches BOTH sinks, not a synthesised measurement" \

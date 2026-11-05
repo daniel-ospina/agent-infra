@@ -486,16 +486,19 @@ echo "── §F the age's PROVENANCE reaches both sinks this script owns ──
 # (`b1`/`b2`) are NOT involved in any mutation below — a pointer there is what produced that earlier
 # false conclusion.
 #
-# MUTATIONS, MEASURED AT THIS HEAD — each named by the rule it breaks, not by a line to edit:
+# MUTATIONS, MEASURED AT THIS HEAD — each named by the rule it breaks, not by a line to edit. The
+# counts are re-measured whenever a leg is ADDED, because they go stale the moment the suite grows: an
+# earlier revision of this note still said "81 passed, 3 failed" after `f5` existed (measured at that
+# head: 5 failed, not 3), and the pass count happened to stay 81 because it is `86 - failures`.
 #   · the `*)` arm of the age-provenance `case` back to `AGESRC=measured`
-#       → 81 passed, 3 failed: all three of `f4`'s asserts;
+#       → 81 passed, 5 failed: all three of `f4`'s asserts AND both of `f5`'s;
 #   · the `unmeasured)` arm of the brief-text `case` replaced by the bare `$AGEMIN`
-#       → 81 passed, 3 failed: `f3`'s premise pair AND `f4`'s premise assert;
+#       → 82 passed, 4 failed: `f3`'s premise pair, `f4`'s premise assert AND `f5`'s;
 #   · the `synth)` arm of the brief-text `case` replaced by the bare `$AGEMIN`
-#       → `f2`'s premise assert reddens.
+#       → 85 passed, 1 failed: `f2`'s premise assert.
 #
 # AND ONE DELIBERATE NO-OP, stated so it is not mistaken for vacuity: deleting the `unmeasured`
-# alternative from the ACCEPT LIST alone changes NOTHING (84 passed, 0 failed), because the `*)` arm
+# alternative from the ACCEPT LIST alone changes NOTHING (86 passed, 0 failed), because the `*)` arm
 # already maps every non-accepted value to `unmeasured`. The accept list NAMES the vocabulary; the
 # `*)` arm is the GUARANTEE. Use one of the three mutations above to prove §F discriminates.
 brief_of() { cat "$1"/state/briefs/stall-fix-*.md 2>/dev/null || true; }
@@ -520,11 +523,11 @@ case "$(ledger_of "$D")" in *"age_min=90	agesrc=unmeasured"*) ck 0 "…and the d
 case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; *) ck 0 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; esac
 
 # ⛔ AN UNRECOGNISED PROVENANCE IS NOT `measured` (review cycle 2, 2026-11-03, P2). Unset is handled by
-# the `:-measured` default, so only a value the caller SUPPLIED can reach the `*)` arm. Before the fix
+# the `-measured` default, so only a value the caller SUPPLIED can reach the `*)` arm. Before the fix
 # that arm wrote `measured`, so `_AGESRC=<anything unknown>` put "no PR merged in 90 minutes" in the
 # worker's premise and `agesrc=measured` in the ledger — the same false measurement, reachable by a
-# fourth provenance. Set the `*)` arm back to `measured` and all THREE asserts below redden
-# (measured: 81 passed, 3 failed).
+# fourth provenance. Set the `*)` arm back to `measured` and all FIVE asserts below redden
+# (measured: 81 passed, 5 failed — these three AND `f5`'s two).
 D="$(new_o f4)"; stub "$D" "$STUB_OK_TOUCH"
 OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
        _AGESRC=banana bash "$SH" 3 90 2>&1)"
