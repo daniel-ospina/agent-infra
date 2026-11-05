@@ -1398,6 +1398,91 @@ import json, sys
 t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
 sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
 PY
+# ⛔ THE INSTALLER MUST NOT PRESERVE A URL `--verify` REFUSES (#3374 review P2). The `_selfHosted`
+# exemption only certifies an ABSOLUTE http(s) url (`BADURL:`), and the merge's `usable()` did not
+# apply that floor — so `--install` (the REPAIR path `cloud-cell-bringup.sh` runs after a verify
+# refusal: verify → install → verify) PRESERVED a scheme-less url, marked it `_selfHosted`, and
+# handed back a file the very next verify refused. The bring-up could NEVER converge: it died loudly
+# on a config its own installer had just re-created. Measured on the real repair path, and the reason
+# `usable()` now carries the verifier's floor rather than a second opinion about it.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"type": "http", "url": "localhost:8000/mcp", "_selfHosted": True}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "install REPLACES a scheme-less tortoise url instead of preserving it (the verifier's own BADURL floor)" \
+  || fail "install preserved a SCHEME-LESS url — --verify refuses the file the installer just wrote, so verify → install → verify never converges"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
+PY
+run_verify
+[ $? -eq 0 ] && ok "...and the repair CONVERGES: the file install wrote is one --verify certifies" \
+  || fail "verify still refuses the entry install just wrote — the repair path is a loop, not a repair"
+# ⛔ USERINFO IN THE AUTHORITY IS A HOST-SPOOF SHAPE (#3374 review P1).
+# `https://api.premiselabs.co@evil.example/mcp/` resolves to **evil.example** while its authority
+# BEGINS with the hosted host. `near_miss`/`host_typo` read the authority verbatim, so this was "a
+# genuine self-host": the merge PRESERVED it (key and all), marked it `_selfHosted`, and `--verify`
+# then certified `SELFHOSTED:` — the live tenant key, sent to an attacker's host with this repo's
+# blessing. `host_of()` strips userinfo (the rule `_loopback` already applied), and the shape is
+# REPLACED rather than certified: a credential belongs in `headers`, never in the authority.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselabs.co@evil.example/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a USERINFO host-spoof of the hosted host is REPLACED, never certified with the key attached" \
+  || fail "install preserved a userinfo URL whose real host is an attacker's — --verify then certifies SELFHOSTED: and the tenant key leaves the box"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
+PY
+# ⛔ A NON-OBJECT `tortoise` IS OPERATOR CONTENT, AND IT VANISHED SILENTLY (#3374 review P2). Every
+# sibling container shape names its replacement and keeps the bytes; this one was replaced with no
+# `NOTE:` and no `.bak` — against the merge's own "nothing here is silent" contract.
+rm -f "$DEST/.mcp.json.bak"
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = ["/x/python3", "-m", "tortoise.mcp_server"]
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+[ -f "$DEST/.mcp.json.bak" ] && grep -qF "REPLACED a list tortoise entry" "$LOG" \
+  && ok "a non-object tortoise entry is REPLACED BY NAME, and its bytes are kept as .bak" \
+  || fail "install replaced a hand-written non-object tortoise entry SILENTLY — no NOTE, no backup, and --verify then reports NOENTRY over a file the installer rewrote"
+python3 - "$DEST/.mcp.json.bak" <<'PY' && ok "...and the .bak really holds the replaced entry (a backup that is not the old bytes is a lie)" \
+  || fail "the .bak does not hold the entry the merge replaced"
+import json, sys
+sys.exit(0 if (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise") == ["/x/python3", "-m", "tortoise.mcp_server"] else 1)
+PY
+# ⛔ THE TEMPLATE WAS THE ONE INPUT WHOSE FAILURE WAS A PYTHON TRACEBACK (#3374 review P2). Every other
+# unreadable shape is a NAMED refusal; a missing or CORRUPT template raised straight out of `main`
+# (rc=1, `FileNotFoundError:` on stderr) while the docstring documents 0 / 2 / 3. It is reachable:
+# `setup.sh` guards only `[ -f ]`, so a corrupt template printed a traceback under `set -e`.
+printf '{oops' > "$TMP/corrupt-template.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/corrupt-template.json" "$DEST/.mcp.json" --cell > "$TMP/badtpl.out" 2>&1
+rc=$?
+[ "$rc" -eq 3 ] && grep -qF 'FATAL: cannot read the template' "$TMP/badtpl.out" \
+  && ! grep -q 'Traceback' "$TMP/badtpl.out" \
+  && ok "an UNPARSEABLE template is a named FATAL with the documented exit 3, not a traceback" \
+  || fail "a corrupt template produced rc=$rc / a traceback instead of the documented named refusal (exit 3) — setup.sh then aborts with Python internals"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/absent-template.json" "$DEST/.mcp.json" --cell > "$TMP/notpl.out" 2>&1
+rc=$?
+[ "$rc" -eq 3 ] && grep -qF 'FATAL: cannot read the template' "$TMP/notpl.out" && ! grep -q 'Traceback' "$TMP/notpl.out" \
+  && ok "...and a MISSING template takes the same named path (a missing file is not a crash)" \
+  || fail "a missing template produced rc=$rc / a traceback instead of a named FATAL (exit 3)"
 # ...while a GENUINE self-host stays preserved: the rule "a different host is a real self-host" is
 # recorded, and this arm is what keeps the lookalike fix from quietly overriding it.
 python3 - "$DEST/.mcp.json" <<'PY'
