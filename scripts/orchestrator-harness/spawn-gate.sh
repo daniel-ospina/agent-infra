@@ -1377,6 +1377,17 @@ lane_end_push() {
   # equal before any read is trusted, and an unprovable endpoint refuses rather than being read anyway.
   # `git ls-remote --get-url` contacts nothing.
   local pushurl="" pushurl_n=0 _pu proof=""
+  # ⛔ THE SCRATCH HANDLE IS PRIMED HERE — BEFORE THE FIRST BOUNDED CALL, NOT AFTER THE SECOND (review
+  # round 3, P2 — REPRODUCED). Every bounded call in this function is CAPTURED — `proof="$(tb_timeout …)"`,
+  # `def="$(tb_timeout …)"`, `out="$(tb_timeout … git push …)"`, `vraw="$(tb_timeout …)"` — and
+  # `tb_bound_tmp` lazily creates its `mktemp -d` inside whatever shell first calls it. In a command
+  # substitution that is the SUBSHELL, so a captured call mints its OWN directory and orphans it when the
+  # substitution exits, while the parent's `TB_BOUND_TMP` stays empty and `tb_bound_cleanup` removes
+  # nothing. Measured when the prime sat one call later: two orphaned `bounded.*` dirs per lane exit.
+  # Creating it here means every subshell INHERITS the handle and reuses that one directory, which the
+  # `tb_bound_cleanup` calls on each exit below then release. (`disk-reaper.sh` primes at exactly this
+  # point, immediately after sourcing, for the same reason.)
+  declare -F tb_bound_tmp >/dev/null 2>&1 && tb_bound_tmp
   pushurl="$(git -C "$root" remote get-url --push --all origin 2>/dev/null)" || pushurl=""
   while IFS= read -r _pu; do [ -n "$_pu" ] && pushurl_n=$((pushurl_n + 1)); done <<< "$pushurl"
   # ⛔ THREE CAUSES, THREE SENTENCES (review cycle 18, P2 — REPRODUCED). `0 found` used to share the
@@ -1387,12 +1398,14 @@ lane_end_push() {
     LANE_END_PUSH="refused-pushurl-unresolved"
     LANE_END_PUSH_URL="<unresolved: get-url --push answered nothing>"
     echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but origin's push target could NOT BE RESOLVED — \`git -C $root remote get-url --push --all origin\` answered nothing (no origin remote, an unreadable config, or a git too old for the flag). Nothing was pushed, and no read was attempted either: with no resolved target there is nothing to prove the landing-branch set or the verifying read against. Configure a remote named origin for this checkout, or push the branch by hand from a lane branch (\`git push <url> HEAD:refs/heads/$sym\`); the commits stay in the local object store" >> "$log" 2>/dev/null || true
+    declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
   if [ "$pushurl_n" -ne 1 ]; then
     LANE_END_PUSH="refused-pushurl-divergent"
     LANE_END_PUSH_URL="$(printf '%s' "$pushurl" | tr '\n' ' ')"
     echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but origin resolves to $pushurl_n push URLs ($(printf '%s' "$pushurl" | tr '\n' ' ')) — and a lane's exit path may not GUESS which repository receives its ref, so NOTHING was pushed. \`git remote get-url --push --all origin\` must print exactly one URL" >> "$log" 2>/dev/null || true
+    declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
   # ⛔ THE PROOF, AND A MISSING ANSWER IS A REFUSAL (not "assume equal"). An empty expansion means the
@@ -1446,7 +1459,6 @@ lane_end_push() {
     declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
-  declare -F tb_bound_tmp >/dev/null 2>&1 && tb_bound_tmp
   case "$_protected" in
     *" $sym "*)
       LANE_END_PUSH="refused-protected"
@@ -1746,10 +1758,19 @@ lane_end_next() {
     # remote ANSWERED with a sha this worktree does not even have (`--is-ancestor` exited 128), so no relation
     # was established. Every sentence in this file that says "was NOT delivered" would be a claim the
     # terminal cannot make from that read; the honest answer names the read it still needs.
+    # ⛔ THE REMEDY NAMES THE REPOSITORY THE VERDICT IS ABOUT, NOT `origin` (review round 3, P1 —
+    # REPRODUCED). `LANE_END_PUSH_URL` exists so that "every remedy printed beside a push verdict names the
+    # repo the verdict is about" — and every sibling arm uses `${LANE_END_PUSH_URL:-origin}`. This one
+    # hardcoded `origin`, whose FETCH url is a different repository whenever `remote.origin.pushurl`
+    # diverges (a case `lane_end_push` deliberately supports). Measured with url=fetch.git and
+    # pushurl=push.git: the artifact prescribed `git fetch origin refs/heads/advlane`, which failed
+    # `couldn't find remote ref` — the operator would run the artifact's own command and be told the branch
+    # does not exist, when the repository the verdict is about has it.
     verify-ancestry-unmeasured)
-      printf 'MANUAL — the remote ANSWERED and holds refs/heads/%s at %s, which this worktree does NOT have, so ANCESTRY COULD NOT BE MEASURED: the commit(s) from this lane may or may not be on it, and this artifact asserts NEITHER delivery NOR loss. The usual cause is a peer or the rail advancing the ref. Fetch it and look before reaping %s — git -C %s fetch origin refs/heads/%s, then git -C %s merge-base --is-ancestor %s FETCH_HEAD%s%s\n' \
+      printf 'MANUAL — the remote ANSWERED and holds refs/heads/%s at %s, which this worktree does NOT have, so ANCESTRY COULD NOT BE MEASURED: the commit(s) from this lane may or may not be on it, and this artifact asserts NEITHER delivery NOR loss. The usual cause is a peer or the rail advancing the ref. Fetch it and look before reaping %s — git -C %s fetch %s refs/heads/%s, then git -C %s merge-base --is-ancestor %s FETCH_HEAD%s%s\n' \
         "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ORIGIN:-<sha>}" "${LANE_END_ROOT:-<unknown>}" \
-        "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_HEAD:-<unknown>}" \
+        "${LANE_END_ROOT:-<unknown>}" "${LANE_END_PUSH_URL:-origin}" "${LANE_END_BRANCH:-<unknown>}" \
+        "${LANE_END_ROOT:-<unknown>}" "${LANE_END_HEAD:-<unknown>}" \
         "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
   esac
   # ⛔ AND THE ONE MANUAL ARM THAT DID NOT UNION THE OTHER DOMAIN NOW DOES (review cycle 13, P2 — REPRODUCED).
@@ -2361,10 +2382,16 @@ terminal_wip_rescue() {
       case "${LANE_END_PUSH:-}" in
         pushed)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br existed ONLY locally and the exit path PUSHED them to origin refs/heads/$br (see the [lane-exit] line above) — bg-rescue-wip.sh archives UNCOMMITTED work only, so the branch push is what covers this case" >> "$log" ;;
-        verify-unanswered|push-unreported|push-killed)
-          # ⛔ SAME RULE AS THE ARTIFACT (review cycles 11 and 12): neither verdict measured delivery OR
-          # loss, so the log may not say "were NOT pushed" any more than `next=` may say "exist only on
+        verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured)
+          # ⛔ SAME RULE AS THE ARTIFACT (review cycles 11 and 12): none of these verdicts measured delivery
+          # OR loss, so the log may not say "were NOT pushed" any more than `next=` may say "exist only on
           # this disk". The reader is told exactly what was and was not established.
+          # ⛔ AND THE DOMAIN IS FOUR VALUES, NOT THREE (review round 3, P1 — REPRODUCED):
+          # `verify-ancestry-unmeasured` was added to `lane_end_next` and `lane_end_push_caveat` but NOT to
+          # this third consumer of the `push=` domain, so it fell to the arm below and printed "exist ONLY
+          # locally and were NOT pushed" in the same terminal whose marker said "asserts NEITHER delivery
+          # NOR loss" — a false measured absence, which is the one class this whole feature exists to
+          # remove. Every consumer of the domain has to be found, not just the two that were remembered.
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br MIGHT exist only locally — push=${LANE_END_PUSH}, so this terminal did NOT establish either way (see the [lane-exit] line above). Do not read 'nothing at risk' as 'the lane's work is on origin', and do not read this as a measured loss" >> "$log" ;;
         *)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br exist ONLY locally and were NOT pushed — push=${LANE_END_PUSH:-not-attempted}, and the [lane-exit] line above says why. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted, and they do not survive a cell's volume being discarded either. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log" ;;
