@@ -649,6 +649,27 @@ n_unbounded=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|
 [ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
   && [ "$n_net" -ge 3 ] && [ "$n_unbounded" = 0 ]; rcn14=$?
 ck "N14 …every network call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net)" $rcn14
+# ⛔ N14b — THE BOUND MUST BOUND **WALL CLOCK**, NOT ONLY SPELLING (review cycle 10, P2 — REPRODUCED).
+# N14 is a TEXT SCAN by construction, so it cannot see this class at all, and on a Linux host GNU
+# `timeout` hides it: `tb_watchdog` used to `kill -9 "$pid"` — the DIRECT child only — so a command that
+# FORKED a transport helper left the grandchild alive, and because every caller here captures
+# (`out="$(tb_timeout … 2>&1)"`) the orphan held the CAPTURE PIPE and the substitution blocked for as
+# long as the orphan lived. Measured on the pre-fix library: `tb_timeout 3` over a command that
+# backgrounds a `sleep 8` → 8 s captured, 3 s redirected; against a real black-holed `git push` → 131 s
+# for a declared 15 s. macOS is the host this library exists FOR (no GNU timeout), so the defect was
+# invisible on every CI runner and live on the operator's own orchestrator. The fix signals the process
+# GROUP (`set -m` + `kill -9 -pgid`), which is what GNU timeout does.
+# ⛔ `TB_TIMEOUT_FORCE_INTERNAL=1` IS PART OF THE ARM: without it this host's GNU `timeout` would run and
+# the arm would measure the WORKAROUND, passing on the broken library (the seam the library documents).
+n14b_s=$(date +%s)
+TB_TIMEOUT_FORCE_INTERNAL=1 bash -c '
+  . "$1"
+  out="$(tb_timeout 2 bash -c "( sleep 9 ) & sleep 9" 2>&1)"
+  printf "rc=%s\n" "$?"' _ "$HERE/../lib/bounded.sh" >/dev/null 2>&1
+n14b_e=$(( $(date +%s) - n14b_s ))
+# 2 s bound + 4 s slack; the pre-fix library needs 9 s, so the arm discriminates with room to spare.
+[ "$n14b_e" -le 6 ]; rcn14b=$?
+ck "N14b …and the bound bounds WALL CLOCK: a CAPTURED command whose grandchild outlives the kill still returns at the bound (${n14b_e}s for a 2 s bound — 9 s before the process-group fix)" $rcn14b
 # ⛔ N15 — THE HUB REFUSAL IS READ, NOT INHERITED (review cycle 4, gap 3: F7 executes the shape but no arm
 # ever greps `refused-main-checkout`, so deleting the block left the suite green — the merge-gate bypass
 # the comment names, undetected).
