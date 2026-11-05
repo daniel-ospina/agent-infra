@@ -157,9 +157,21 @@ tb_watchdogs_reap() {
 # WATCHDOG is forked with job control OFF so it stays in the CALLER's group, where the caller's group
 # signal reaches it, and its trap FORWARDS that TERM to the command's group — GNU `timeout`'s behaviour,
 # which is what the header above says this replicates.
+# which is what the header above says this replicates.
+# ⛔ AND THE FORWARDED TERM IS ESCALATED, BECAUSE THE TWO-STAGE REAP IS THE FLEET'S CONTRACT (review of PR
+# #3399, P2 — REPRODUCED). A reaper sends `kill -TERM -- -<pgid>`, waits a grace, then `kill -KILL --
+# -<pgid>`. Ungrouping the command — which is what lets the TIMER reach a transport helper — means the
+# second stage no longer has that command in the caller's group, so a command that IGNORES TERM would
+# survive the whole reap. The watchdog survives a TERM (it traps it) and is still in the caller's group, so
+# it is what carries the escalation: forward TERM, wait a bounded grace, then SIGKILL the command's group.
+# The grace is deliberately short (2 s) so it lands inside the fleet's 5 s TERM→KILL gaps
+# (`merge-one.sh`, `fix-one.sh`); `lane-reap.sh`'s 1 s gap may close first, and that residue is STATED
+# below rather than glossed. ⛔ THE ONE RESIDUE NOTHING CAN CARRY: a KILL-ONLY reap — the watchdog is
+# SIGKILLed with the group before any trap can run, so the command is left to its own bound. GNU `timeout`
+# has the identical property, which is why the fleet reaps in two stages.
 tb_watchdog() {
     local secs="$1"; shift
-    local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 jobctl=0
+    local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 jobctl=0 g=0
     TB_BOUND_N=$((TB_BOUND_N + 1))
     if tb_bound_tmp; then
         sentinel="$TB_BOUND_TMP/s.$TB_BOUND_N"
@@ -186,7 +198,17 @@ tb_watchdog() {
         # full-disk shape where no scratch dir could be made): the parent writes it BEFORE it signals this
         # watchdog, so its presence means "the command already finished — forward nothing", which also
         # closes the reap window in which `$pid` could have been reused by an unrelated process.
-        trap 'kill "$s" 2>/dev/null; if { [ -z "$done_flag" ] || [ ! -e "$done_flag" ]; } && kill -0 "$pid" 2>/dev/null; then kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; fi; exit 0' TERM INT
+        # ⛔ AND THE FORWARD IS ESCALATED (see the paragraph above the function): TERM, a bounded 2 s grace,
+        # then SIGKILL to the same group — otherwise a command that ignores TERM outlives a two-stage reap,
+        # because it is no longer in the caller's group for the KILL stage to reach.
+        trap 'kill "$s" 2>/dev/null
+              if { [ -z "$done_flag" ] || [ ! -e "$done_flag" ]; } && kill -0 "$pid" 2>/dev/null; then
+                  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+                  g=0
+                  while [ "$g" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.2 2>/dev/null || break; g=$((g + 1)); done
+                  if kill -0 "$pid" 2>/dev/null; then kill -9 "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null; fi
+              fi
+              exit 0' TERM INT
         sleep "$secs" &
         s=$!
         wait "$s" 2>/dev/null
