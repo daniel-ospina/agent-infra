@@ -202,6 +202,23 @@ bash "$GATE" --mutation-missing "$TMP/mut-fenced.txt" 2>/dev/null | grep -qx 'MU
 printf '## MUTATION ATTRIBUTION\n\n| assertion (file:line) | mutant | reddened row | observed |\n|---|---|---|---|\n| a:1 | sed s/x/y/ | §A | ❌ rc=1 |\n' > "$TMP/mut-hdr-decorated-full.txt"
 miss="$(bash "$GATE" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
 [ -z "$miss" ]; ck $? "(xiv) POSITIVE CONTROL: a decorated header WITH a real data row is ADMITTED — the position rule excludes the header, never the table (got '$miss')"
+# ── CYCLE 2: THE CARRIER THE RECORDER ACTUALLY FEEDS, AND THE TWO DIRECTIONS OF OVER-BLOCK. The
+#    escape reversal runs here because `evidence_fetch` hands this program a `jq @tsv` body; a fix that
+#    only handles a REAL CR/LF file fixes the fixture, not the path that mints records.
+printf '## MUTATION ATTRIBUTION\\r\\n\\r\\n| assertion | mutant | reddened row | observed |\\r\\n|---|---|---|---|\\r\\n' > "$TMP/mut-tsv-crlf.txt"
+[ "$(grep -c '' "$TMP/mut-tsv-crlf.txt")" = "1" ]; ck $? "fixture: the CRLF+@tsv carrier is ONE line of literal \\r\\n escapes (the shape jq @tsv emits)"
+bash "$GATE" --mutation-missing "$TMP/mut-tsv-crlf.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xv) the SAME header-plus-rule table through the @tsv carrier is REFUSED (an escaped \\r left unreversed made the RULE the data row)"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a:1 | sed s/a\\nb// | t §A | rc=1 |\n' > "$TMP/mut-literal-escape.txt"
+grep -q 's/a\\nb//' "$TMP/mut-literal-escape.txt"; ck $? "fixture: a real multi-line artifact whose CELL contains a literal backslash-n (a newline-editing mutant)"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-literal-escape.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xvi) …is ADMITTED — un-escaping a REAL multi-line body splits that cell and REFUSES an honest row (got '$miss')"
+printf '## Review\n\n~~~text\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| example | example | example | ok |\n~~~\n' > "$TMP/mut-tilde.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-tilde.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xvii) a QUOTE inside a tilde fence is quoted too — CommonMark has two fence characters, and the paste-back shape is the same"
+printf '## MUTATION ATTRIBUTION\n\n    | assertion | mutant | reddened row | observed |\n    |---|---|---|---|\n    | example | example | example | ok |\n' > "$TMP/mut-indented.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-indented.txt" 2>/dev/null | grep -qE 'MUTATION-(ROWS|MUTANT-COLUMN)'; ck $? "(xviii) …and a 4-SPACE INDENTED table under a real heading is an indented CODE BLOCK, not a data row — REFUSED (which token is secondary: the quoted block supplies neither a column nor a row)"
+printf '  ## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a | b | c | d |\n' > "$TMP/mut-indented-heading.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-indented-heading.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xix) a heading indented by 1–3 spaces is a HEADING (Markdown) and its table is ADMITTED — requiring column 0 would deadlock an honest verdict until it is reflowed (got '$miss')"
 
 # ── §G THE MUTATION PROOF: each §F assertion above must be able to FAIL. Same discipline as §C — the
 # mutant is derived FROM THE SHIPPED FILE so it tracks it, and the transformation is itself asserted.
@@ -263,6 +280,63 @@ cmp -s "$GATE" "$TMP/mutant-fence.sh"; rc=$?
 bash -n "$TMP/mutant-fence.sh"; ck $? "§G …and the fence mutant still parses"
 miss="$(bash "$TMP/mutant-fence.sh" --mutation-missing "$TMP/mut-fenced.txt" 2>/dev/null)"
 [ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xiii) now FAILS — the mutant admits a paste-back of the worked example (got '$miss')"
+
+# §F(xv) — the `\r` half of the escape reversal. Emptying that branch's body makes a `\r` fall
+# through unchanged, which is the pre-fix behaviour on the @tsv carrier: the escaped CR survives as a
+# cell, `|---|` stops being all-separator, and the RULE becomes the data row.
+sed 's/if (nx == "r")  { out = out "\\r"; i++; continue }/if (nx == "r")  { }  # MUTANT: the escaped CR is not reversed/' "$GATE" > "$TMP/mutant-tsvcr.sh"
+cmp -s "$GATE" "$TMP/mutant-tsvcr.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the escaped-CR mutation REALLY changed the file (the un-escape anchor still matches)"
+bash -n "$TMP/mutant-tsvcr.sh"; ck $? "§G …and the escaped-CR mutant still parses"
+miss="$(bash "$TMP/mutant-tsvcr.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the escaped-CR mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-tsvcr.sh" --mutation-missing "$TMP/mut-tsv-crlf.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xv) now FAILS — the @tsv carrier admits the vacuous table again (got '$miss')"
+
+# §F(xvi) — the single-record DETECTION. Dropping it applies the reversal to real multi-line bodies
+# too, which un-escapes a literal `\n` inside a cell and splits the row: an honest verdict refused.
+sed 's/if (nraw == 1 || (nraw == 2 \&\& RAW\[2\] == "")) buf = _unescape(buf)/buf = _unescape(buf)  # MUTANT: un-escape unconditionally/' "$GATE" > "$TMP/mutant-uncond.sh"
+cmp -s "$GATE" "$TMP/mutant-uncond.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the single-record mutation REALLY changed the file (the detection anchor still matches)"
+bash -n "$TMP/mutant-uncond.sh"; ck $? "§G …and the single-record mutant still parses"
+miss="$(bash "$TMP/mutant-uncond.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the single-record mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-uncond.sh" --mutation-missing "$TMP/mut-literal-escape.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xvi) now FAILS — the honest row is refused over a cell that merely mentions a newline edit (got '$miss')"
+
+# §F(xvii) — the tilde fence. The mutant stops recognising `~~~`, so the quoted block parses as a
+# claim. §F(xviii) has its own mutant because the indented block is a different markdown construct.
+# ⛔ AND EVERY MUTANT BELOW IS PROVEN TO STILL *ANSWER*: a sed that fails to apply leaves an EMPTY
+# program, which `bash -n` accepts and which admits everything — a false green this suite hit once.
+sed 's@|| line ~ /^\[ \\t\]\*~~~/@|| 0@' "$GATE" > "$TMP/mutant-tilde.sh"
+cmp -s "$GATE" "$TMP/mutant-tilde.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the tilde-fence mutation REALLY changed the file (the fence regex anchor still matches)"
+bash -n "$TMP/mutant-tilde.sh"; ck $? "§G …and the tilde-fence mutant still parses"
+miss="$(bash "$TMP/mutant-tilde.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the tilde-fence mutant still ANSWERS (a control is admitted, so it is a mutation and not a broken program; got '$miss')"
+miss="$(bash "$TMP/mutant-tilde.sh" --mutation-missing "$TMP/mut-tilde.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xvii) now FAILS — the mutant admits a quoted block fenced with tildes (got '$miss')"
+
+# §F(xviii) — the 4-space INDENTED block: same paste-back, no fence at all.
+sed 's@if (line ~ /^\[ \\t\]\[ \\t\]\[ \\t\]\[ \\t\]/) continue@if (0) continue@' "$GATE" > "$TMP/mutant-indent.sh"
+cmp -s "$GATE" "$TMP/mutant-indent.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the indented-block mutation REALLY changed the file (the indent anchor still matches)"
+bash -n "$TMP/mutant-indent.sh"; ck $? "§G …and the indented-block mutant still parses"
+miss="$(bash "$TMP/mutant-indent.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the indented-block mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-indent.sh" --mutation-missing "$TMP/mut-indented.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xviii) now FAILS — the mutant reads the indented code block as a data row (got '$miss')"
+
+# §F(xix) — the heading indent allowance. Narrowing it back to column 0 refuses a Markdown-valid
+# indented heading, which is the false block the allowance exists to remove.
+sed 's@if (sind <= 3) { nh@if (sind <= 0) { nh@' "$GATE" > "$TMP/mutant-hindent.sh"
+cmp -s "$GATE" "$TMP/mutant-hindent.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the heading-indent mutation REALLY changed the file (the indent-allowance anchor still matches)"
+bash -n "$TMP/mutant-hindent.sh"; ck $? "§G …and the heading-indent mutant still parses"
+miss="$(bash "$TMP/mutant-hindent.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the heading-indent mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-hindent.sh" --mutation-missing "$TMP/mut-indented-heading.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xix) now FAILS — a 2-space-indented heading is refused as if there were no block (got '$miss')"
 
 echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"

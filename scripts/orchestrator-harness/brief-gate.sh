@@ -257,13 +257,40 @@ function _cells(s, arr,   n, i, x, k, tmp) {
   }
   return k
 }
+# ── THE @tsv REVERSAL, IN ONE PASS (#3442 review, P1/P2). `evidence_fetch` hands this program a
+# `jq @tsv` body, which escapes BACKSLASH, TAB, NEWLINE and CARRIAGE RETURN. Reversing them with
+# successive gsubs is wrong in both directions: `\\n` (a literal backslash the author typed before
+# an n) would become a newline, and a real `\r` left escaped keeps its two characters, so a
+# `|---|\r` RULE is not an all-separator row and becomes the DATA row. One left-to-right scan gets
+# every pair right, and unknown escapes pass through unchanged.
+function _unescape(s,   out, i, n, c, nx) {
+  out = ""; n = length(s)
+  for (i = 1; i <= n; i++) {
+    c = substr(s, i, 1)
+    if (c == "\\" && i < n) {
+      nx = substr(s, i + 1, 1)
+      if (nx == "\\") { out = out "\\"; i++; continue }
+      if (nx == "n")  { out = out "\n"; i++; continue }
+      if (nx == "r")  { out = out "\r"; i++; continue }
+      if (nx == "t")  { out = out "\t"; i++; continue }
+    }
+    out = out c
+  }
+  return out
+}
 BEGIN { buf = ""; ins = 0; depth = 0; sec = 0; none = 0; hdr = 0; row = 0; fence = 0; hl = 0 }
 { buf = buf $0 "\n" }
 END {
   if (length(buf) == 0) { print "EMPTY"; exit }
   # @tsv reverses here, not in the caller: a consumer that un-escaped first would be a SECOND
   # definition of the artifact format, and the two would drift.
-  gsub(/\\n/, "\n", buf)
+  # ⛔ AND THE ESCAPED CARRIER IS DETECTED, NEVER ASSUMED. An HONEST artifact may carry a literal
+  # backslash-n inside a cell (a mutant that edits a newline is a normal mutant). Un-escaping a REAL
+  # multi-line body would turn that cell into a line break, split the row, and REFUSE a reviewer
+  # whose row is right there — a false block whose message names the wrong cause. So the reversal
+  # runs only when the body is ONE record, which is exactly what `jq @tsv` produces.
+  nraw = split(buf, RAW, "\n")
+  if (nraw == 1 || (nraw == 2 && RAW[2] == "")) buf = _unescape(buf)
   nl = split(buf, L, "\n")
   for (i = 1; i <= nl; i++) {
     # ⛔ CR BEFORE ANYTHING ELSE: a body that travelled through a CRLF carrier has a trailing \r on
@@ -277,13 +304,24 @@ END {
     # cannot open the section either. An UNBALANCED fence swallows the rest of the artifact, which
     # fails CLOSED (no heading/rows ⇒ refused) — the safe direction, stated so it is not a surprise.
     # (No apostrophes in this program: it is a single-quoted bash string.)
-    if (line ~ /^[ \t]*```/) { fence = !fence; continue }
+    if (line ~ /^[ \t]*```/ || line ~ /^[ \t]*~~~/) { fence = !fence; continue }
     if (fence) continue
+    # ⛔ AN INDENTED CODE BLOCK IS QUOTED TOO (4+ leading whitespace, CommonMark). Same reasoning as
+    # the fence: the reviewer is handed a filled row to copy, and an indented paste would otherwise
+    # satisfy the contract. Written as four literal whitespace characters, not `{4,}`, because an
+    # older BSD awk on 3.2-era hosts is a supported reader.
+    if (line ~ /^[ \t][ \t][ \t][ \t]/) continue
     lc = tolower(line); nh = 0
-    if (lc ~ /^#+/) { match(lc, /^#+/); nh = RLENGTH }
+    # A MARKDOWN HEADING MAY BE INDENTED BY UP TO 3 SPACES. Refusing an indented `## MUTATION
+    # ATTRIBUTION` deadlocks an honest verdict until it is reflowed, which is a false block.
+    if (match(lc, /^[ \t]*#+/)) {
+      hh = substr(lc, RSTART, RLENGTH); gsub(/[ \t]+/, "", hh)
+      sind = length(substr(lc, RSTART, RLENGTH)) - length(hh)
+      if (sind <= 3) { nh = length(hh); htxt = substr(lc, RSTART + RLENGTH) }
+    }
     # A heading at or above the section closes it (subsections stay inside it).
     if (ins && nh > 0 && nh <= depth) ins = 0
-    if (!ins && nh > 0 && lc ~ /^#+[ \t]*mutation[ -]attribution/) { ins = 1; depth = nh; sec = 1; continue }
+    if (!ins && nh > 0 && htxt ~ /^[ \t]*mutation[ -]attribution/) { ins = 1; depth = nh; sec = 1; continue }
     if (!ins) continue
 
     l = line
