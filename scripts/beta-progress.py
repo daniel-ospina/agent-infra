@@ -716,8 +716,15 @@ def _compute():
     #     re-invented.
     #   * SO THE FALSE-COVER RISK IS OPEN AND UNMITIGATED, deliberately. The correct successor is a
     #     PER-ROW REPO IDENTITY (each row's own repo, so a bare `#N` from a fix repo can be matched
-    #     against that repo's issues or rejected); neither `gh pr list` nor `/pulls` returns it
-    #     today, so it is a follow-up, not a heuristic. Until then the optimistic error stands: a
+    #     against that repo's issues or rejected). ⛔ THE SOURCE IS AVAILABLE -- an earlier form of
+    #     this comment said neither read returns it, and that was FALSE when checked against the
+    #     primitives: `gh pr list --json headRepository,headRepositoryOwner,isCrossRepository`
+    #     offers it, and `/pulls` rows carry `head.repo.full_name` (measured 2026-11-05 against this
+    #     repo: `{"head_ref":"mcp-3382-phase2","head_repo":"daniel-ospina/agent-infra"}`). What
+    #     is missing is this FILE's projection -- `_repo_prs` asks for three fields and `_rest_prs`
+    #     keeps four -- so adopting it means widening both projections and the `covered()` match, a
+    #     larger diff than the defect being fixed. It is therefore a follow-up by SCOPE, not by
+    #     impossibility. Until then the optimistic error stands: a
     #     fix-repo row citing an in-range number marks the same-numbered tortoise unit covered.
     # ⛔ A REFUSED READ IS NOT "NO PR": with no second source it returns None so the whole line
     # reads `unavailable`, exactly as a failed tracker read does. Inflating `without` from an
