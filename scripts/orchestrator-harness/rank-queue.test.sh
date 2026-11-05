@@ -1304,14 +1304,16 @@ skip_drive() {  # <label> <queue-setup: absent|empty|rows|garbage|dir> -> sets S
 skip_drive absent absent
 if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && grep -q 'queue_readable=0' <<<"$SDOUT" \
    && ! grep -q 'the queue is empty' <<<"$SDOUT"; then rc=0
-else rc=1; echo "      skip/absent: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (want could NOT be READ + backlog=UNKNOWN)"; fi
+else rc=1; echo "      skip/absent: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (want could NOT be READ + backlog=UNKNOWN + queue_readable=0)"; fi
 ck "SKIP arm: an ABSENT queue is unreadable, never empty (driven)" $rc
 skip_drive dir dir
 if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && grep -q 'queue_readable=0' <<<"$SDOUT" \
    && ! grep -q 'No such file or directory' <<<"$SDOUT"; then rc=0
-else rc=1; echo "      skip/dir: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a DIRECTORY is unreadable: could NOT be READ + backlog=UNKNOWN, no stderr leak)"; fi
+else rc=1; echo "      skip/dir: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a DIRECTORY is unreadable: could NOT be READ + backlog=UNKNOWN + queue_readable=0, no stderr leak)"; fi
 ck "SKIP arm: a queue that is a DIRECTORY is unreadable, and its depth is UNKNOWN (driven)" $rc
 # ⛔ A READABLE FILE WHOSE DEPTH READ FAILS IS NOT AN UNREADABLE FILE (review P2, cycle 14). Both states
 # leave `_skip_n` empty; the arm reported both as "not a readable regular file" while the SAME record
@@ -1319,13 +1321,15 @@ ck "SKIP arm: a queue that is a DIRECTORY is unreadable, and its depth is UNKNOW
 skip_drive wcfail wcfail
 if [ "$SDRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$SDOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && grep -q 'queue_readable=1' <<<"$SDOUT" \
    && ! grep -q 'could NOT be READ' <<<"$SDOUT" \
    && ! grep -q 'the queue is empty' <<<"$SDOUT"; then rc=0
-else rc=1; echo "      skip/wcfail: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a readable file whose depth read fails: 'the queue WAS read' + backlog=UNKNOWN, NOT 'could NOT be READ', NOT empty)"; fi
+else rc=1; echo "      skip/wcfail: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a readable file whose depth read fails: 'the queue WAS read' + backlog=UNKNOWN + queue_readable=1, NOT 'could NOT be READ', NOT empty)"; fi
 ck "SKIP arm: a READABLE file whose DEPTH read fails says the queue WAS read, with backlog=UNKNOWN (driven)" $rc
 skip_drive unreadable-depth wcfail-garbage
 if [ "$SDRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$SDOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && grep -q 'queue_readable=1' <<<"$SDOUT" \
    && ! grep -q 'could NOT be READ' <<<"$SDOUT" \
    && ! grep -q 'the queue is empty' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/wcfail-garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (readable + depth failed + unparsable head: 'the queue WAS read', NOT 'could NOT be READ', NOT empty)"; fi
@@ -1333,8 +1337,9 @@ ck "SKIP arm: readable + depth failed + unparsable head is still a READ queue, w
 skip_drive unreadable mode000
 if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && grep -q 'queue_readable=0' <<<"$SDOUT" \
    && ! grep -q 'Permission denied' <<<"$SDOUT"; then rc=0
-else rc=1; echo "      skip/mode000: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a regular file with no read bit: could NOT be READ + backlog=UNKNOWN, no 'Permission denied')"; fi
+else rc=1; echo "      skip/mode000: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a regular file with no read bit: could NOT be READ + backlog=UNKNOWN + queue_readable=0, no 'Permission denied')"; fi
 ck "SKIP arm: a REGULAR file with NO READ BIT is unreadable, and leaks no 'Permission denied' (driven)" $rc
 # NON-VACUITY: the pre-fix fail-open re-parse (`_skip_n=0`) turns the depth-read failure into a MEASURED
 # zero — "the queue is empty (0 rows)" with `backlog=0` over two rows on disk.
