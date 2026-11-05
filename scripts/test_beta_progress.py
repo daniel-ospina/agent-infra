@@ -1316,12 +1316,71 @@ def test_a_malformed_fix_repo_entry_is_unavailable_not_a_typeerror(monkeypatch, 
     """
     monkeypatch.setattr(bp, "gh",
                         lambda *a: [pr(900)] if a[:2] == ("pr", "list") else [])
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO (#3457 review round 10). Every entry in this
+    # loop is rejected BEFORE a read, so the fallback never ran -- but the tracker pair's own REST
+    # arm does, and a mutant that forces it sent this test to the REAL api.github.com (measured on
+    # a copy: 31 live `/pulls` requests, 39.9 s, and the test still PASSED). The suite must not
+    # spend the bucket `REST_BUDGET_S` exists to ration.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
     for bad in (None, "", "agent-infra", "daniel-ospina/agent-infra/extra", "daniel-ospina/",
                 ["daniel-ospina/agent-infra"], {"repo": "daniel-ospina/agent-infra"}):
         monkeypatch.setattr(bp, "FIX_REPOS", (bp.REPO, bad))
         assert bp.compute() is None, (
             "%r must be UNREADABLE (return None), never a TypeError and never a silent "
             "substitution of the tracker" % (bad,))
+
+
+def test_an_empty_object_issue_read_is_unavailable_not_a_zero_line(monkeypatch, no_cache):
+    """⛔ THE WORST NON-LIST PAYLOAD IS THE ISSUE READ'S `{}` (#3457 review round 10).
+
+    `{}` iterates to NOTHING, so there is no row to reject: `len({})` is 0 and the tier renders
+    `0 open, 0 with PR, 0 NONE` — a WRONG NUMBER rather than `unavailable`, and `main()` CACHES it
+    for the whole 1800 s TTL. Measured on the shipped module before the gate: an issue read that
+    answered `{}` printed `P0 0 open (0 with PR, 0 NONE) | P1 0 open (0 with PR, 0 NONE)`, i.e.
+    "beta has no open P0/P1" — the single most misleading line this instrument can print.
+
+    The fix-repo path got this gate in this PR; the three tracker/issue reads did not, and `gh` can
+    exit 0 with a JSON object (`{"message": "Not Found"}`) exactly as it can for a PR list.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+        return {}                                   # rc 0, an empty JSON OBJECT
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+    assert bp.compute() is None, (
+        "an answered non-list ISSUE read must be `unavailable`, never a cached zero line")
+
+
+def test_an_answered_non_list_tracker_pr_read_engages_the_rest_fallback(monkeypatch, no_cache):
+    """⛔ A DICT IS TRUTHY AND SIZED, SO `is None` NEVER FIRES ON IT (#3457 review round 10).
+
+    Measured before the gate: an open read answered `{"message": "Not Found"}` against a good
+    merged list printed `... | 1 open PRs, 0 merged today` — `len(dict)` == 1 — and never reached
+    the REST fallback, which is the failure this file's whole second-source exists to prevent.
+    The tracker reads now apply the SAME rule the fix-repo path already had: a non-list answer is
+    a FAILED read, so the second source is tried; if that refuses too, the line is `unavailable`.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            return {"message": "Not Found"}         # rc 0, wrong shape, TRUTHY
+        return []
+
+    spent = []
+
+    def refusing_rest(state, limit=100, deadline=None, repo=None):
+        spent.append(state)
+        return None
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", refusing_rest)
+
+    assert bp.compute() is None, (
+        "a malformed-but-answered tracker list is a FAILED read, never `1 open PRs`")
+    assert "open" in spent, (
+        "the second source was never asked — a non-list answer must trigger the fallback, not be "
+        "counted through `len()`")
 
 
 def test_a_fix_repo_listed_twice_is_read_once(monkeypatch, no_cache):
