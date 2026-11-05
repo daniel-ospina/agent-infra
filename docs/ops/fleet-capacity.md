@@ -333,6 +333,11 @@ reaches the direct pid only, so a descendant the provider left behind would othe
 `$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. That path does
 NOT depend on `mktemp` (a per-process name is built by the shell), because a `mktemp` that fails would
 otherwise have to fall back to inheriting stdout — the very hazard — or silently un-bound the caller.
+And the FILE applies to **every** arm, not just the watchdog: `timeout` / `gtimeout` — what every Linux
+cell (and macOS with coreutils) takes — used to hand the child the caller's stdout, so a descendant that
+escaped the child's process group held the caller's `$( )` past the bound (measured: 1 s bound, 12 s
+caller block). The bound exists so the reading can be taken inside the drainer's tick lock, so that leak
+was a wedge, not a slow read.
 Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
 `wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
 `exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /
@@ -373,6 +378,11 @@ line certified `expected=0 published=1 INELIGIBLE=0` — the `expected=0` false 
 forbids. A count must be a whole number of at most four digits with no leading zero beyond `0` itself
 (`expected-count-unusable`), and `CAP_EXPECTED=0` remains the one explicit, operator-made zero.
 
+⛔ **A NUMERIC TTL OUT OF RANGE IS THE SAME HOLE AS AN UNCOMPARABLE ONE.** Twenty digits make
+`[ "$age" -gt "$CAP_PROBE_TTL" ]` error, so the stale branch never runs and every record counts fresh —
+measured `expected=3 published=1 INELIGIBLE=2`, rc 0 where the truth is `published=0 INELIGIBLE=3
+stale=(cell-1)`. The TTL is whole seconds, at most ten digits, no leading zero.
+
 ⛔ **THE SAME RULE FOR THE FRESHNESS COMPARISON.** `CAP_PROBE_TTL` must be whole seconds: a duration
 typo (`15m`) makes `[ age -gt TTL ]` fail, which would skip the stale branch and count EVERY record
 fresh — measured, a 100,000,000-second-old record read `published=1`, rc 0, with the only diagnostic on
@@ -391,6 +401,16 @@ and still clamps to "just published".
   the mark it had just been handed: measured, two machines under one key with one of them dead read
   `expected=1 published=1 INELIGIBLE=0` rc 0 while placement refused the same bytes. It now refuses as
   `why=identity-collision`: the line and placement must not disagree about who is visible.
+- **A channel-legal `at` must not kill the line.** `at=08` passes the digit check and bash reads it as
+  BAD OCTAL, so the *assignment* aborted — no line at all, against the contract that says one is printed
+  in every case, and the drainer then named a false cause (`why=capacity.sh-incomplete — a STALE copy:
+  re-seed $O`). The age arithmetic is `10#`-prefixed (and a non-digit `now` refuses), so a malformed peer
+  record costs that record's freshness, never the fleet's reading.
+- **Two machines behind one address is a collision, not a typo.** The expected-side dedupe ("the same box
+  named twice is one box") is right for a roster row and wrong for the provider inventory, where the key
+  is `network.ipv4`: measured, 5 running machines with one reusing another's address read
+  `expected=4 published=1 INELIGIBLE=3`, rc 0 — a live machine invisible to the instrument built to stop
+  exactly that. The listing now refuses (`DUPLICATEKEY <addr>`) instead of picking a winner.
 - **A truncated listing is not a shorter fleet.** The round-3 fix caught a body that hid objects inside
   one fragment; a body CUT between objects runs off the end, leaves nothing hidden, and passed every
   check — measured on a 5-machine listing cut after object 2: `expected=2 published=2 INELIGIBLE=0`, rc

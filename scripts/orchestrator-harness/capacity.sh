@@ -924,7 +924,15 @@ cap_lpc_human() { awk -v x="${1:-0}" 'BEGIN{printf "%.2f", x/100}'; }
 cap_bound_hit() {
   local r="${1:-}" now="${2:-}" at age lpc disk mem forkb boxb
   cap_valid_base_record "$r" || { printf 'probe_unreadable'; return 0; }
-  at="$(cap_kv "$r" at)"; age=$(( now - at ))
+  at="$(cap_kv "$r" at)"
+  # ⛔ `at` IS CHANNEL-CONTROLLED AND `08` IS NOT ZERO (fresh review round 6, P1). `case ''|*[!0-9]*`
+  # accepts `08`, but bash reads it as BAD OCTAL: the ASSIGNMENT aborts, so the caller gets NO LINE AT
+  # ALL (the contract says the line is printed in every case) and the drainer then names a false cause
+  # (`why=capacity.sh-incomplete — a STALE copy: re-seed $O`) that sends the operator to the wrong
+  # repair. `10#` is the arithmetic, and a non-digit `now` is a refusal, not a guess.
+  case "$at" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
+  case "$now" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
+  age=$(( 10#$now - 10#$at ))
   [ "$age" -lt 0 ] && age=0
   if [ "$age" -gt "$CAP_PROBE_TTL" ]; then printf 'probe_stale'; return 0; fi
   # 0. IDENTITY — before fork, disk, load and memory, because every other bound is a statement ABOUT A
@@ -1229,24 +1237,38 @@ cap_bounded() {
   local s="${1:-}" impl="${CAP_BOUND_IMPL:-auto}"; shift 2>/dev/null || true
   [ "$#" -gt 0 ] || return 2
   case "$s" in ''|*[!0-9]*) s=10 ;; esac
+  # ⛔ THE CHILD NEVER INHERITS OUR STDOUT — ON EVERY ARM, NOT JUST THE WATCHDOG (fresh review round 6,
+  # P1). `kill` reaches the direct pid only, so a descendant the provider left behind keeps the caller's
+  # `$( )` open past the bound. Rounds 3-4 fixed that inside the WATCHDOG arm only, and the `timeout` /
+  # `gtimeout` arms — which is what every Linux cell (and macOS with coreutils) takes — still handed the
+  # child the pipe: MEASURED, a child that `setsid`s a `sleep 12` held the caller for the full 12 s under
+  # a 1 s bound, while the same command through the watchdog arm returned in 1 s. This bound exists so the
+  # reading can be taken INSIDE the drainer's tick lock, so the leak is a wedge, not a slow read. The
+  # destination is a per-process file (no `mktemp`: a `mktemp` that fails must never fall back to
+  # inheriting the pipe), and a redirect that cannot be created fails the command — a named non-zero.
+  local _tmp _to _p _w _rc
+  _tmp="${TMPDIR:-/tmp}/cap-bounded.$$.$RANDOM"
   if [ "$impl" != "watchdog" ]; then
-    if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
-    if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
+    if command -v timeout >/dev/null 2>&1; then
+      timeout "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; return "$_rc"
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+      gtimeout "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; return "$_rc"
+    fi
   fi
-  command -v sleep >/dev/null 2>&1 || { "$@"; return $?; }
-  # ⛔ THE CHILD NEVER INHERITS OUR STDOUT, NOT EVEN WHEN `mktemp` FAILS (fresh review round 4, P2).
-  # Round 3's `mktemp … || _tmp=""` fallback fell back to `"$@" &`, which restored the exact pipe
-  # hazard the file was created to remove: `kill -9` reaches the direct pid only, so a descendant keeps
-  # the caller's `$( )` open. MEASURED with a `mktemp` that exits 1: a 1 s bound took the child's full
-  # 6 s. The path is built without `mktemp` (per-process, single call), and a redirect that cannot be
-  # created fails the child — a named non-zero reading — rather than silently un-bounding the caller.
+  # No `sleep` at all: nothing here can bound anything, so say so with a command that cannot hang by a
+  # mechanism this function removed — it is the ONE arm where the caller waits for the child itself.
+  command -v sleep >/dev/null 2>&1 || {
+    "$@" >"$_tmp" 2>/dev/null; _rc=$?
+    cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; return "$_rc"
+  }
   # ⛔ AND THE TIMEOUT IS DECIDED BY A SENTINEL, NOT BY `kill -0` (fresh review round 5, P2). Liveness
   # was read AFTER `wait`, when the watchdog subshell had not necessarily exited yet: 40 timed runs of
   # `cap_bounded 1 sleep 5` on the watchdog arm gave rc 124 26 times and rc 137 14 times, and the
   # emitter then says `why=channel-unreadable`/`exited 137` instead of the documented `channel-timeout`.
   # The watchdog marks the file BEFORE it kills, so the verdict cannot be lost to a race.
-  local _p _w _rc
-  _tmp="${TMPDIR:-/tmp}/cap-bounded.$$.$RANDOM"
   _to="${TMPDIR:-/tmp}/cap-bounded-to.$$.$RANDOM"
   rm -f "$_to" 2>/dev/null
   "$@" >"$_tmp" 2>/dev/null & _p=$!
@@ -1323,11 +1345,24 @@ cap_parse_inventory() {
         if (st == "stopped") continue
         if (st != "running") { bad++; continue }
         ip = jget(m[i], "ipv4")
+        # ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
+        # expected-side dedupe ("the same box named twice is one box") is right for a roster row and
+        # WRONG for the provider inventory, where the key is `network.ipv4`: it silently dropped the
+        # second machine from `expected` AND from the name list — measured, 5 running machines with
+        # pi-cell-2 reusing the address of pi-cell-1 read `expected=4 published=1 INELIGIBLE=3` rc 0, so a
+        # live machine became invisible to the instrument built to stop exactly that (round 5 graded the
+        # same smaller-denominator shape P1). Refuse the listing instead of picking a winner.
+        if (ip != "") {
+          if ((ip in ipseen) && ipseen[ip] != nm) dup = ip
+          else ipseen[ip] = nm
+        }
         acc = acc nm " " (ip == "" ? "-" : ip) "\n"
         got = 1
       }
       # The structural check: more `status` keys than objects means the splitter did not split.
       if (nstatus > objs) bad += (nstatus - objs)
+      # A repeated address under two names: the listing cannot say which machine publishes for it.
+      if (dup != "") { print "DUPLICATEKEY " dup; exit 1 }
       # ⛔ A REFUSED LISTING PRINTS NO PARTIAL LIST: the whole answer is UNKNOWN, so a caller can never
       # read the objects it happened to classify as the fleet that exists. (The count rides on the one
       # line the caller parses.)
@@ -1362,6 +1397,7 @@ cap_fleet_inventory() {
     # reporting the strictly weaker "nothing could be read" (which is also what a parked fleet says).
     case "${out:-}" in
       'UNCLASSIFIED '*) detail="${out#UNCLASSIFIED } machine object(s) could not be classified (an unreadable status or name) — a parse failure is not a parked fleet" ;;
+      'DUPLICATEKEY '*) detail="two machines report the same address (${out#DUPLICATEKEY }) — a key that names two boxes cannot say which one publishes" ;;
       *)                detail="no running machine could be read from it" ;;
     esac
     printf 'UNKNOWN provider-inventory-unparseable(%s answered, but %s)\n' "$cmd" "$detail"; return 1
@@ -1478,6 +1514,15 @@ cap_fleet_line_from() {
   case "${CAP_PROBE_TTL:-}" in
     ''|*[!0-9]*) unk_pub=1; why="${why:-ttl-unreadable}" ;;
   esac
+  # …AND A NUMERIC TTL THE SHELL CANNOT COMPARE EITHER (fresh review round 6, P2): `[ "$age" -gt
+  # "$CAP_PROBE_TTL" ]` errors on 20 digits, so the stale branch never runs and every record counts
+  # fresh — the same hole the COUNT arm closes with a magnitude bound. Whole seconds, ≤ 10 digits (the
+  # bound is set well above any real window — 99999999 s is a legitimate "do not age it out" seam the
+  # suite uses — and well below the width at which the comparison stops working).
+  case "${CAP_PROBE_TTL:-}" in
+    0?*) unk_pub=1; why="${why:-ttl-unreadable}" ;;
+  esac
+  [ "${#CAP_PROBE_TTL}" -le 10 ] || { unk_pub=1; why="${why:-ttl-unreadable}"; }
 
   # THE PUBLISHED SIDE: fresh + attributable records. A record that is merely STALE is NOT published —
   # that box stopped republishing, which is exactly the state a dead controller produces.
@@ -1497,7 +1542,11 @@ cap_fleet_line_from() {
       if [ "$(cap_kv "$rec" collide)" = "1" ]; then unk_pub=1; why="${why:-identity-collision}"; break; fi
       at="$(cap_kv "$rec" at)"
       case "$at" in ''|*[!0-9]*) continue ;; esac
-      age=$(( now - at ))
+      # ⛔ `10#`: a leading-zero `at` (`08`) is CHANNEL-LEGAL and makes plain arithmetic ABORT the whole
+      # function — no line printed, against a documented contract that says one is printed in every case
+      # (fresh review round 6, P1; measured end-to-end: `capacity.sh: line 1500: 08: value too great for
+      # base`, rc 1, and the drainer then blamed a STALE capacity.sh copy).
+      age=$(( 10#$now - 10#$at ))
       # ⛔ A STAMP BEYOND THE FRESHNESS WINDOW IN THE FUTURE IS NOT A CLOCK DISAGREEMENT — IT IS AN
       # UNREADABLE AGE (fresh review round 4, P2). A second or two between two boxes' clocks is normal
       # and clamps to 'just published'; a record dated past `now + CAP_PROBE_TTL` would otherwise be
@@ -1680,7 +1729,8 @@ cap_ref_deletable() {
   cap_valid_base_record "$orec" || return 1
   cap_ledger_has "$ledger" "$oref" && return 0                  # (a) proven ours
   oat="$(cap_kv "$orec" at)"; case "$oat" in ''|*[!0-9]*) oat=0 ;; esac
-  age=$(( now - oat )); [ "$age" -lt 0 ] && age=0
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  age=$(( 10#$now - 10#$oat )); [ "$age" -lt 0 ] && age=0
   [ "$age" -gt "$CAP_PROBE_TTL" ] && return 0                   # (b) stale
   return 1
 }

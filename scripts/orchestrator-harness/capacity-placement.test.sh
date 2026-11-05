@@ -1773,6 +1773,96 @@ while [ "$_t2_i" -lt 12 ]; do
 done
 ck "(t2) 12/12 timed runs report the TIMEOUT verdict (rc 124), never a lost-signal rc ($_t2_bad misses)" \
    "$([ "$_t2_bad" -eq 0 ] && echo 0 || echo 1)"
+# (a3) ⛔ THE BOUND'S stdout ISOLATION APPLIES TO EVERY ARM, NOT JUST THE WATCHDOG (fresh review round 6,
+# P1). Rounds 3-4 gave the child a FILE inside the watchdog arm only; `timeout`/`gtimeout` — what every
+# Linux cell takes — still handed it the caller's pipe, so a descendant the child left behind held the
+# caller's `$( )` past the bound: measured, a 1 s bound blocked the caller for 12 s on the `auto` arm
+# while the same command through the watchdog arm returned in 1 s. This bound exists so the reading can be
+# taken INSIDE the drainer's tick lock, so a leak here is a wedge, not a slow read.
+# ⚠️ The descendant must ESCAPE the child's process group: GNU `timeout` signals the GROUP, so a plain
+# `&` child dies with it and never reproduced the leak (measured: 1 s, i.e. the control read green).
+# `setsid` is the escape and it is absent on macOS, so this arm is SKIPPED BY NAME there rather than
+# silently passing.
+if command -v setsid >/dev/null 2>&1; then
+printf '%s\n' '#!/bin/bash' 'setsid bash -c "sleep 6; echo late" &' 'sleep 6' > "$TMP/leaky-child.sh"; chmod +x "$TMP/leaky-child.sh"
+_a3_0="$(date +%s)"; _a3_out="$(CAP_BOUND_IMPL=auto cap_bounded 1 "$TMP/leaky-child.sh")"; _a3_rc=$?
+_a3_1="$(date +%s)"; _a3_d=$(( _a3_1 - _a3_0 ))
+ck "(a3) the auto (timeout/gtimeout) arm does not leak a descendant's pipe (${_a3_d}s, not 12s; rc=$_a3_rc)" \
+   "$([ "$_a3_d" -lt 5 ] && [ "$_a3_rc" -eq 124 ] && echo 0 || echo 1)"
+# (a3-mutant) NON-VACUITY: the pre-fix function (arm 1 inherits stdout) takes the full 12 s.
+{ cat "$CAP"; cat <<'CAPMUT'
+cap_bounded() {
+  local s="${1:-}" impl="${CAP_BOUND_IMPL:-auto}"; shift 2>/dev/null || true
+  case "$s" in ''|*[!0-9]*) s=10 ;; esac
+  if [ "$impl" != "watchdog" ]; then
+    if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
+    if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
+  fi
+  command -v sleep >/dev/null 2>&1 || { "$@"; return $?; }
+  local _p _w _rc
+  _tmp="${TMPDIR:-/tmp}/cap-bounded.$$.$RANDOM"
+  "$@" >"$_tmp" 2>/dev/null & _p=$!
+  { sleep "$s"; kill -9 "$_p" 2>/dev/null; } >/dev/null 2>&1 & _w=$!
+  wait "$_p" 2>/dev/null; _rc=$?
+  if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
+  cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
+  return "$_rc"
+}
+CAPMUT
+} > "$TMP/cap-inherit-arm1.sh"
+_a3b_0="$(date +%s)"
+_a3b_out="$(CAP_BOUND_IMPL=auto bash -c '. "$1"; cap_bounded 1 "$2"' _ "$TMP/cap-inherit-arm1.sh" "$TMP/leaky-child.sh")"
+_a3b_1="$(date +%s)"; _a3b_d=$(( _a3b_1 - _a3b_0 ))
+ck "  …mutation control: the inheriting arm 1 takes ${_a3b_d}s (so (a3) is load-bearing)" \
+   "$([ "$_a3b_d" -ge 5 ] && echo 0 || echo 1)"
+else
+ck "(a3) SKIPPED BY NAME: no setsid on this host, so a descendant cannot escape the process group that GNU timeout signals (macOS)" "0"
+fi
+# (c6) ⛔ `at=08` IS CHANNEL-LEGAL AND MUST NOT KILL THE LINE (fresh review round 6, P1). The digit check
+# accepts it, bash reads it as BAD OCTAL, the ASSIGNMENT aborts and `cap_fleet_line_from` prints NOTHING —
+# against a documented contract that a line is printed in every case; the drainer then named a false cause
+# (`why=capacity.sh-incomplete — a STALE copy: re-seed $O`). `10#` fixes the arithmetic.
+L28="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 08)" 0 2>/dev/null)"; RC=$?
+ck "(c6) a leading-zero `at` still prints a line (rc=$RC: ${L28:-<NOTHING>})" \
+   "$([ "$RC" -eq 0 ] && qF 'fleet: expected=1' "$L28" && qF 'INELIGIBLE=1' "$L28" && echo 0 || echo 1)"
+# (c6-mutant) NON-VACUITY: plain arithmetic aborts the assignment and the line disappears.
+sed 's|age=$(( 10#$now - 10#$at ))|age=$(( now - at ))|' "$CAP" > "$TMP/cap-octal.sh"
+ck "  …the mutant really lost the `10#` arithmetic" "$([ "$(grep -c 'age=$(( now - at ))' "$TMP/cap-octal.sh")" -ge 1 ] && echo 0 || echo 1)"
+L28M="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-octal.sh" "$(recb 10.0.0.1 08)" 2>/dev/null)"
+ck "  …mutation control: with plain arithmetic the same input prints NOTHING (${L28M:-<nothing>})" \
+   "$([ -z "$L28M" ] && echo 0 || echo 1)"
+# (c7) ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
+# expected-side dedupe is right for a roster row and wrong for the provider inventory, where the key is
+# `network.ipv4`: 5 running machines with pi-cell-2 reusing the address of pi-cell-1 read
+# `expected=4 published=1 INELIGIBLE=3` rc 0 — a live machine invisible to the instrument built to catch
+# exactly that. The listing now refuses (`DUPLICATEKEY`) rather than picking a winner.
+_DUP='{"machines":[{"name":"pi-c1","status":"running","network":{"ipv4":"10.10.0.1"}},{"name":"pi-c2","status":"running","network":{"ipv4":"10.10.0.1"}}]}'
+_DIS='{"machines":[{"name":"pi-c1","status":"running","network":{"ipv4":"10.10.0.1"}},{"name":"pi-c2","status":"running","network":{"ipv4":"10.10.0.2"}}]}'
+L29="$(printf '%s' "$_DUP" | cap_parse_inventory 2>&1)"; RC=$?
+ck "(c7) a repeated address refuses the listing ($L29)" \
+   "$([ "$RC" -ne 0 ] && qF 'DUPLICATEKEY 10.10.0.1' "$L29" && ! printf '%s' "$L29" | grep -qE '^pi-c' && echo 0 || echo 1)"
+L29C="$(printf '%s' "$_DIS" | cap_parse_inventory 2>&1)"
+ck "  …while distinct addresses read both machines (so (c7) is not a blanket refusal)" \
+   "$([ "$(printf '%s' "$L29C" | grep -cE '^pi-c[0-9] 10\.10\.0\.')" -eq 2 ] && echo 0 || echo 1)"
+# (c7-mutant) NON-VACUITY: without the duplicate gate the same listing silently drops a machine.
+sed 's|if (dup != "") { print "DUPLICATEKEY " dup; exit 1 }|if (0) { }   # MUTANT: no dup gate|' "$CAP" > "$TMP/cap-nodup.sh"
+ck "  …the mutant really lost the duplicate gate" "$([ "$(grep -c 'MUTANT: no dup gate' "$TMP/cap-nodup.sh")" -eq 1 ] && echo 0 || echo 1)"
+L29M="$(printf '%s' "$_DUP" | bash -c '. "$1"; cap_parse_inventory' _ "$TMP/cap-nodup.sh" 2>&1)"
+ck "  …mutation control: without the gate the same listing reads 2 machines under one key ($L29M)" \
+   "$([ "$(printf '%s' "$L29M" | grep -cE '^pi-c[0-9] ')" -eq 2 ] && echo 0 || echo 1)"
+# (c8) ⛔ A NUMERIC TTL THE SHELL CANNOT COMPARE IS THE SAME HOLE AS THE COUNT (fresh review round 6,
+# P2): 20 digits makes `[ "$age" -gt "$CAP_PROBE_TTL" ]` error, the stale branch never runs and every
+# record counts fresh — measured `expected=3 published=1 INELIGIBLE=2` rc 0 where the truth (TTL=900) is
+# `published=0 INELIGIBLE=3 stale=(cell-1)`. Seconds only, ≤ 7 digits, no leading zero.
+L30="$(CAP_PROBE_TTL=99999999999999999999 CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 "$_OLD_AT")" 0)"; RC=$?
+ck "(c8) an out-of-range TTL refuses the reading, never certifies it ($L30)" \
+   "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L30" && qF 'why=ttl-unreadable' "$L30" && echo 0 || echo 1)"
+# (c8-mutant) NON-VACUITY: without the magnitude bound the same TTL counts the old record as published.
+sed 's|\[ "${#CAP_PROBE_TTL}" -le 10 \] \|\| { unk_pub=1; why="${why:-ttl-unreadable}"; }|[ 1 -eq 1 ]   # MUTANT: no TTL magnitude bound|' "$CAP" > "$TMP/cap-ttlrange.sh"
+ck "  …the mutant really lost the TTL magnitude bound" "$([ "$(grep -c 'MUTANT: no TTL magnitude bound' "$TMP/cap-ttlrange.sh")" -eq 1 ] && echo 0 || echo 1)"
+L30M="$(CAP_PROBE_TTL=99999999999999999999 CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-ttlrange.sh" "$(recb 10.0.0.1 "$_OLD_AT")" 2>/dev/null)"
+ck "  …mutation control: without the bound the same TTL reads the old record as published ($L30M)" \
+   "$(qF 'published=1' "$L30M" && echo 0 || echo 1)"
 # (w2) ⛔ THE BOUND MUST NOT DEPEND ON `mktemp` (fresh review round 4, P2). Round 3's
 # `mktemp || _tmp=""` fell back to inheriting stdout, restoring the exact pipe hazard: with a `mktemp`
 # that exits 1, a 1 s bound took the child's full 6 s. The path is now built without `mktemp`.
