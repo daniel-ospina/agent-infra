@@ -2064,6 +2064,67 @@ rc=$?
 [ "$rc" -eq 0 ] && [ -f "$TMP/tpl-real-dest.json" ] \
   && ok "...and the SHIPPED template still installs (rc=0) — the new guard refuses unusable templates, not all of them" \
   || fail "the shipped template was refused (rc=$rc, '$(head -1 "$TMP/tpl-real.out" | cut -c1-70)') — validating the template must not block the one template every box installs"
+# ⛔ AND THE OTHER FALSE-BLOCK DIRECTION, WHICH THE SHIPPED-TEMPLATE CONTROL CANNOT SEE (#3374 review
+# P1). The control above only proves the SHIPPED template installs, so a guard that refuses every
+# SELF-HOST template satisfied it — and those are the templates the docs tell operators to write
+# (`templates/.mcp.base.json`'s own `_comment`, `pi-bootstrap/SETUP-NEW-MACHINE.md`,
+# tortoise's `docs/quickstart-selfhosted.md`: "a local daemon needs none"). Measured at 3db7779f4:
+# `{"type":"http","url":"http://localhost:8000/mcp"}` exited `FATAL … (nokey)` rc=3, and because
+# setup.sh's merge call was bare under `set -e` the WHOLE layer was skipped (no extensions, no skills,
+# no farm). At `origin/main` the same template installed rc=0. Each arm below therefore asserts BOTH
+# halves of the answer — the merge INSTALLS the operator's own endpoint, and `--verify` CERTIFIES the
+# file it wrote (convergence, not just a non-refusal).
+_MARKER_FN2="$TMP/graph_mcp_marker_p1.sh"
+sed -n '/^graph_mcp_marker()/,/^}/p' "$ROOT/pi-bootstrap/cell-install.sh" > "$_MARKER_FN2"
+for _case in loopback:'{"type": "http", "url": "http://localhost:8000/mcp"}' \
+             loopback-sse:'{"type": "sse", "url": "http://localhost:8000/mcp"}' \
+             loopback-ipv6:'{"type": "http", "url": "http://[0:0:0:0:0:0:0:1]:8000/mcp"}'; do
+  _name="${_case%%:*}"; _entry="${_case#*:}"
+  _tpl="$TMP/selfhost-${_name}.json"; _dst="$TMP/selfhost-${_name}-dest.json"; rm -f "$_dst"
+  python3 - "$ROOT/templates/.mcp.base.json" "$_tpl" "$_entry" <<'PY'
+import json, sys
+base, out, entry = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(base))
+d["mcpServers"]["tortoise"] = json.loads(entry)
+json.dump(d, open(out, "w"), indent=2)
+PY
+  python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$_tpl" "$_dst" --cell > "$TMP/selfhost-${_name}.out" 2>&1
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    fail "a SELF-HOST template (${_name}) was refused (rc=$rc, '$(head -1 "$TMP/selfhost-${_name}.out" | cut -c1-80)') — the docs tell operators to point url at their own daemon; refusing it leaves the box with no graph AND, because setup.sh aborts on this, no layer either"
+    continue
+  fi
+  _mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_dst" "$_tpl" 2>&1)"; _mrc=$?
+  # The operator's own endpoint is certified BY NAME, never as the hosted default (which would demand
+  # a credential it does not need), and the installed entry is the one the operator wrote.
+  if [ "$_mrc" -eq 0 ] && grep -qF 'SELFHOSTED:' <<<"$_mk" \
+     && python3 -c 'import json,sys; sys.exit(0 if json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]["url"]==json.load(open(sys.argv[2]))["mcpServers"]["tortoise"]["url"] else 1)' "$_dst" "$_tpl"; then
+    ok "a SELF-HOST template (${_name}) INSTALLS and the file it wrote is CERTIFIED SELFHOSTED — the repair path converges, and the hosted credential is not demanded of a daemon that needs none"
+  else
+    fail "a self-host template installed but \`--verify\` answered '${_mk}' (rc=$_mrc) — install wrote a file verify refuses, so verify → install → verify can never converge"
+  fi
+done
+# ⛔ THE HOSTED DEFAULT IS NOW A DEFINED FACT IN TWO LANGUAGES, SO PIN IT TO THE ARTIFACT IT NAMES.
+# `HOSTED_DEFAULT_URL` in merge-mcp.py and in cell-install.sh must both equal the endpoint the SHIPPED
+# template declares — otherwise the constant silently diverges from the template every box installs,
+# and "is this the hosted endpoint?" starts answering about an endpoint nobody uses.
+_pin_out="$(python3 - "$ROOT" <<'PY'
+import json, re, sys
+root = sys.argv[1]
+tpl = json.load(open(root + "/templates/.mcp.base.json"))["mcpServers"]["tortoise"]["url"]
+bad = []
+for rel in ("pi-bootstrap/lib/merge-mcp.py", "pi-bootstrap/cell-install.sh"):
+    m = re.search(r'^HOSTED_DEFAULT_URL = "([^"]+)"', open(root + "/" + rel).read(), re.M)
+    if not m:
+        bad.append(rel + ": no HOSTED_DEFAULT_URL")
+    elif m.group(1) != tpl:
+        bad.append("%s: %r != template %r" % (rel, m.group(1), tpl))
+print("; ".join(bad))
+PY
+)"
+[ -z "$_pin_out" ] \
+  && ok "HOSTED_DEFAULT_URL is the SHIPPED template's endpoint in BOTH languages (merge-mcp.py and cell-install.sh) — 'the hosted default' cannot drift away from the endpoint every box installs" \
+  || fail "HOSTED_DEFAULT_URL has drifted from templates/.mcp.base.json: $_pin_out — the constant that decides whether an entry needs the hosted credential no longer names the hosted endpoint"
 # ⛔ THE DESTINATION READ WAS THE LAST BARE `open()` IN THIS FILE (#3374 review, round 10 P2).
 # `except ValueError` caught the JSONDecodeError and let every OSError through, so an unreadable
 # `.mcp.json` escaped as a TRACEBACK with the undocumented rc=1 while the docstring advertises 0/2/3 —
@@ -2097,6 +2158,20 @@ rc=$?
 [ "$rc" -eq 0 ] && [ -f "$TMP/dangling-target.json" ] && [ -L "$TMP/dangling-dest.json" ] \
   && ok "a DANGLING-SYMLINK destination is written THROUGH the link (rc=0, target created) — measured, not the FATAL branch" \
   || fail "a dangling-symlink destination produced rc=$rc with \$([ -f "$TMP/dangling-target.json" ] && echo a target || echo NO target) — the OSError branch cannot see this shape (os.path.exists follows the link), so the code comment must not claim it"
+# ⛔ THE WRITE WAS THE LAST PATH IN THIS FILE THAT WAS NOT A NAMED REFUSAL (#3374 review P3). Every READ
+# shape above is named; an unwritable destination DIRECTORY raised straight out of `main` —
+# `PermissionError … dst.json.tmp.<pid>`, rc=1, Python internals — against a docstring advertising
+# 0/2/3, and it did so AFTER a `NOTE:` line had printed, so the log read as a partly-successful merge.
+# A mode-0500 directory is the fixture: the file may be writable while its directory is not, which is
+# exactly the shape the temp-file write hits. `chmod` is restored below so the suite can clean up.
+RODEST="$TMP/ro-dest"
+mkdir -p "$RODEST" && chmod 500 "$RODEST"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$RODEST/dst.json" --cell > "$TMP/ro-dest.out" 2>&1
+rc=$?
+chmod 700 "$RODEST"
+[ "$rc" -eq 3 ] && grep -qF 'cannot write' "$TMP/ro-dest.out" && grep -qF 'NOT written' "$TMP/ro-dest.out" && ! grep -q 'Traceback' "$TMP/ro-dest.out" \
+  && ok "an UNWRITABLE destination directory is a named FATAL (exit 3) that states nothing was written — not a traceback with the undocumented rc=1" \
+  || fail "an unwritable destination produced rc=$rc / '$(head -1 "$TMP/ro-dest.out" | cut -c1-70)' — the documented contract is 0/2/3 and the log must not read as a partly-successful merge"
 # ...and an unreadable-by-PERMISSION REGULAR file is REPLACED, not refused, and the bytes it
 # discards are BACKED UP. Two directions are asserted, because the first draft of this arm only
 # asserted "a `.bak` exists" and thereby certified a WARNING: `_keep_backup` needs READ on the source,
@@ -2654,6 +2729,30 @@ rc=$?
   && ok "…and the SAME file at 0600 DOES resolve (the gate refuses the mode, not the path)" \
   || fail "the ownership/mode gate refused a 0600 file of the right owner (rc=$rc) — a false block on a correctly-provisioned cell"
 rm -f "$CELL_HOME/keys.env"
+# ⛔ THE OWNERSHIP HALF OF THAT GATE HAD NO ARM AT ALL (#3374 review P3). The arms above exercise
+# `_no_group_world_write` only — both fixtures are files THIS USER CREATED, so `-O` is trivially true
+# for them, and deleting `[ ! -O "$f" ]` from the gate left the suite green. That is the half that
+# refuses a `keys.env` PLANTED BY ANOTHER LOCAL USER under the world-writable `/tmp/cell-home` — the
+# exact attack the gate's own comment describes, and the one a mode test cannot see (a planted 0600
+# file owned by somebody else passes it). Driven directly against a real file owned by ANOTHER user,
+# which needs no privileges to find: `/etc/hostname` is root-owned and 0644, so the MODE half passes
+# and only the OWNERSHIP half can refuse it. Reverting the gate to mode-only turns this arm red.
+CREDFN="$TMP/graph_key_from_env_file.sh"
+sed -n '/^graph_key_from_env_file()/,/^}/p;/^_no_group_world_write()/,/^}/p' "$ROOT/pi-bootstrap/cell-install.sh" > "$CREDFN"
+FOREIGN="${FOREIGN_CRED_PROBE:-/etc/hostname}"
+if [ -f "$FOREIGN" ] && [ ! -O "$FOREIGN" ]; then
+  cred_out="$(bash -c 'source "$1"; graph_key_from_env_file "$2" TORTOISE_MCP_API_KEY; printf "rc=%s" "$?"' _ "$CREDFN" "$FOREIGN" 2>&1 || true)"
+  # NO PIPE INTO `grep -q` (#841/#864): a quiet consumer exits on first match and `pipefail` turns a
+  # MATCH into a FAILURE. Same rule as every other arm in this file.
+  if grep -qF "$FOREIGN is NOT a credential source" <<<"$cred_out" && grep -qF 'rc=1' <<<"$cred_out"; then
+    ok "a credential file owned by ANOTHER user is refused on OWNERSHIP alone (it is 0644, so the mode half passes — only -O can say no)"
+  else
+    fail "a credential source owned by another user was NOT refused (got: $cred_out) — the ownership half of the gate is not enforced, so a file planted by another local user under /tmp/cell-home would be SOURCED as the provisioning user"
+  fi
+else
+  # Not silently green: an absent probe file is reported as the unproven thing it is.
+  ok "UNPROVEN-ON(no foreign-owned probe file at $FOREIGN): the OWNERSHIP half of the credential-source gate was not exercised"
+fi
 # ⛔ `usable()` AND THE VERIFIER MUST BE TOTAL OVER ARBITRARY JSON. A hand-edit can produce
 # `"Authorization": 12345` or `"url": 123`; both used to raise (TypeError / AttributeError) BEFORE
 # the write, so the merge exited 1 with the file unchanged and `--verify` left an empty marker — the

@@ -82,6 +82,25 @@ import sys
 # certifiable (and so PRESERVED, by install) before this was pinned.
 HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$")
 
+# ⛔ THE HOSTED DEFAULT IS A FIXED FACT, NOT "WHATEVER THE TEMPLATE HAPPENS TO SAY". `usable()` asks
+# two different questions and they must not be answered from one value:
+#   (i)  "is this entry the HOSTED endpoint?" — then it needs the env-indirect credential and its
+#        `type` must be `http`, because that endpoint answers 401 without a key; and
+#   (ii) "what endpoint does the operator WANT?" — the template's own `url`, which a self-host
+#        operator is DOCUMENTED to point at their own daemon (SETUP-NEW-MACHINE.md, tortoise's
+#        `docs/quickstart-selfhosted.md`).
+# Passing the template's url as (i) made it a tautology: `url != want_url` was never true for the
+# template, so `usable()`'s two self-host exemptions — the ones its own docstring exists to protect
+# ("would declare the DOCUMENTED self-host config 'unusable'") — were UNREACHABLE for the one input
+# this file INSTALLS. Measured at 3db7779f4: a template declaring
+# `{"type":"http","url":"http://localhost:8000/mcp"}` (no headers — "a local daemon needs none")
+# exited `FATAL … UNUSABLE tortoise entry (nokey)` rc=3, and because setup.sh calls this under
+# `set -e`, the ENTIRE pi layer was skipped — no extensions, no skills, no farm (so not even
+# record-review.sh). At `origin/main` 404e7b9c8 the same template installed rc=0. (#3374 review P1.)
+# ⛔ KEEP IN SYNC WITH `cell-install.sh`'s HOSTED_DEFAULT_URL — one endpoint, two languages, and an
+# arm in pi-bootstrap/tests/test-cell-install.sh pins BOTH to the SHIPPED template so neither drifts.
+HOSTED_DEFAULT_URL = "https://api.premiselabs.co/mcp/"
+
 # The SAME shape the verifier scans for. It is applied to the WHOLE candidate entry, not just its
 # Authorization header: a token pasted into `env`, `_comment` or any other field is still a credential
 # in a shared 0644 file, and `--verify` refuses that file — so an install that PRESERVED it would
@@ -420,6 +439,12 @@ def credential_in_the_clear(url):
 def usable(entry, want_url):
     """Can a lane actually use this entry? Returns (ok, reason-for-refusal).
 
+    ⛔ `want_url` IS THE **HOSTED** ENDPOINT (a fixed fact), never the template's own url, and this
+    function is the ONE place that asks "does this entry need the hosted credential?". Two shapes
+    were once conflated: "is this the hosted endpoint" (needs a key; `type` must be `http`) and
+    "what endpoint does the operator want" (the template's url). Passing the template's url made
+    the self-host exemption below a tautology for the one input this file INSTALLS.
+
     ⛔ WELL-FORMEDNESS IS URL-AWARE, and getting this wrong is the bug this file exists to avoid.
     The HOSTED endpoint with no `Authorization` is a guaranteed 401, so it is unusable. A
     SELF-HOSTED daemon needs no key at all — `tortoise`'s own `docs/quickstart-selfhosted.md`
@@ -661,7 +686,11 @@ def main(argv):
     # contradicts R2 of this change's own contract: no credential is ever written into a shared
     # config file. The verifier already refuses these shapes, so validating here is what makes the
     # two sides agree — one predicate, both directions, on the template as well as the cell's copy.
-    _want_ok, _want_why = usable(want, want["url"].strip())
+    # ⛔ `want_url` IS THE **HOSTED** ENDPOINT, NOT THE TEMPLATE'S OWN URL. It answers "does this entry
+    # need the hosted credential?", and the hosted endpoint is a FIXED fact (`HOSTED_DEFAULT_URL`) —
+    # passing `want["url"]` here made every self-host comparison a tautology and refused the
+    # template the docs tell self-host operators to write (see HOSTED_DEFAULT_URL's note).
+    _want_ok, _want_why = usable(want, HOSTED_DEFAULT_URL)
     if not _want_ok:
         sys.stderr.write(
             "FATAL: %s declares an UNUSABLE tortoise entry (%s) — a template is the thing this file "
@@ -706,7 +735,11 @@ def main(argv):
     # 2/3. tortoise
     cur = have.get("tortoise")
     if isinstance(cur, dict) and not cur.get("command"):
-        ok_entry, why = usable(cur, (want.get("url") or "").strip())
+        # ⛔ `HOSTED_DEFAULT_URL`, NOT the template's url: "does this entry need the hosted
+        # credential?" is about the HOSTED endpoint only. With the template's url here, a cell
+        # already pointing at the operator's own daemon on a self-host template demanded a key it
+        # does not need and was rewritten toward an endpoint the operator never chose.
+        ok_entry, why = usable(cur, HOSTED_DEFAULT_URL)
         if ok_entry and near_miss((cur.get("url") or "").strip(), (want.get("url") or "").strip()):
             # ⛔ A TYPO IS NOT A SELF-HOST, AND THE INSTALLER MUST NOT BLESS ONE. Marking ANY
             # differing url `_selfHosted` let this file certify the exact config `--verify`'s
@@ -904,9 +937,29 @@ def main(argv):
         if os.path.exists(dst_real):
             os.chmod(tmp, stat.S_IMODE(os.stat(dst_real).st_mode))
         os.replace(tmp, dst_real)
+    except OSError as exc:
+        # ⛔ THE WRITE WAS THE LAST BARE PATH IN THIS FILE (#3374 review P3). Every READ shape is a
+        # named refusal, but an unwritable destination directory raised straight out of `main` —
+        # `PermissionError … dst.json.tmp.<pid>`, rc=1 — while the docstring advertises 0/2/3, and it
+        # did so AFTER a `NOTE:` line had printed, so the log read as a partly-successful merge and
+        # the operator was handed Python internals. Measured: `mkdir ro && chmod 500 ro` → rc=1.
+        # Named, exit 3 (this file's "an input I cannot use" code), and it states the one thing that
+        # matters when the write failed: the previous file is unchanged.
+        sys.stderr.write(
+            "FATAL: cannot write %s (%s) — the merged config was NOT written and the previous file "
+            "is byte-identical to before this run. Check the DIRECTORY's ownership and write "
+            "permission (the file itself may be writable while its directory is not).\n"
+            % (dst_path, exc)
+        )
+        return 3
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
+        # the unlink must not mask the return above: a directory that refuses the write often
+        # refuses the delete too, and raising HERE would replace a named exit 3 with a traceback.
+        try:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+        except OSError:
+            pass
     return 0
 
 

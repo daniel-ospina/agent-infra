@@ -857,6 +857,21 @@ def authority_names_a_host(authority):
 # while `LAYER VERIFIED` printed a green credential line beside it. Both names are allowed, nothing
 # else is, and the scheme is required.
 HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$")
+# ⛔ THE HOSTED DEFAULT IS A FIXED FACT, NOT "WHATEVER THE TEMPLATE HAPPENS TO SAY" — and getting
+# this wrong is a false BLOCK on the one configuration the docs tell self-host operators to write.
+# This marker asks two different questions and they must not be answered from one value:
+#   (i)  "is this the HOSTED endpoint?" — then it needs the env-indirect credential and its `type`
+#        must be `http` (that endpoint answers 401 without a key); and
+#   (ii) "does this cell point where the operator wants?" — the template's own `url`, which a
+#        self-host operator is DOCUMENTED to point at their own daemon (SETUP-NEW-MACHINE.md:181-183,
+#        tortoise's `docs/quickstart-selfhosted.md`).
+# Using the template's url for (i) made it a tautology: a self-host template installed the operator's
+# own entry and this marker then demanded the hosted credential for it (`NOAUTH`) — install wrote a
+# file verify refused, so `verify → install → verify` could never converge. merge-mcp.py answers the
+# same two questions from the same two values (its own HOSTED_DEFAULT_URL). (#3374 review P1.)
+# ⛔ KEEP IN SYNC WITH `merge-mcp.py` — an arm in pi-bootstrap/tests/test-cell-install.sh pins BOTH
+# constants to the SHIPPED template, so neither can drift away from the endpoint it names.
+HOSTED_DEFAULT_URL = "https://api.premiselabs.co/mcp/"
 # ⛔ A DIFFERING url is not automatically fine, and a MISSING Authorization is not automatically
 # broken: the two questions are linked. Accepting any non-empty http url let a cell whose endpoint
 # was a typo (or copied from another box) be certified LAYER VERIFIED while pointing at nothing — a
@@ -865,10 +880,25 @@ HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$
 # tortoise docs/quickstart-selfhosted.md), which merge-mcp.py then "repairs" by repointing it.
 # So: the hosted default REQUIRES the env-indirect header; any other url requires the operator to
 # have said so with `_selfHosted: true`, and is then reported BY NAME rather than silently passed.
+# ⛔ "THE HOSTED DEFAULT" IS `HOSTED_DEFAULT_URL`, NOT `want_url` (#3374 review P1). With `want_url`
+# there, a template that points at the operator's OWN daemon made (ii) and (i) the same value, so the
+# cell's correctly-installed self-host entry fell to the hosted branch and was refused `NOAUTH` — a
+# false block, and a repair loop that could never converge. The two questions now have two answers:
+#   `url != want_url`                      → the cell points somewhere the operator did not ask for
+#                                            (needs `_selfHosted`); and
+#   `want_url != HOSTED_DEFAULT_URL`       → the operator asked for a NON-hosted endpoint, so the
+#                                            entry they got is that endpoint, certified BY NAME.
+_selfhosted_shape = False
 if want_url and url != want_url:
     if not t.get("_selfHosted"):
         print("URL_NOT_DEFAULT:%s" % url)
         sys.exit(1)
+    _selfhosted_shape = True
+elif want_url and want_url.strip() != HOSTED_DEFAULT_URL:
+    # The TEMPLATE requests a non-hosted endpoint and the cell points exactly there: the operator
+    # declared it once, in the file this cell was built from, so no per-box `_selfHosted` is owed.
+    _selfhosted_shape = True
+if _selfhosted_shape:
     # ⛔ `_selfHosted` IS AN EXEMPTION, NOT A LICENCE TO CERTIFY ANY STRING (#3374 review P2). The
     # branch used to print SELFHOSTED and exit 0 for ANY marked url — including a SCHEME-LESS one
     # (`localhost:8000/mcp`), which `new URL()` in the client reads with protocol `localhost:` and no

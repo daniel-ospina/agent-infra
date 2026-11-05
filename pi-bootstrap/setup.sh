@@ -185,7 +185,15 @@ PY
     echo "    models-store.json copied (python3 not found - plain copy)"
   fi
 }
-merge_mcp
+# ⛔ A FAILED `.mcp.json` MERGE MUST NOT TAKE THE WHOLE LAYER WITH IT (#3374 review P1). This call
+# used to be BARE under `set -e`, so an unusable template aborted setup.sh AT THE CONFIG STEP —
+# measured with this script at 3db7779f4: rc=1 and `~/.pi/agent` was LITERALLY EMPTY (no extensions,
+# no skills, no agents, and no farm — so not even record-review.sh, the tool the merge rail needs),
+# while the only message was "the previous config is untouched". A refusal belongs to the CONFIG, not
+# to the machine: the layer is installed, the previous `.mcp.json` is kept byte-identical, the error
+# is named loudly, and this script STILL exits non-zero (below) so a bring-up cannot call it success.
+_mcp_merge_failed=0
+merge_mcp || _mcp_merge_failed=1
 merge_settings
 merge_models
 merge_models_store
@@ -1182,6 +1190,15 @@ if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
 else
   echo ""
   echo "    ⚠️  farm drift NOT verified — $INFRA_ROOT/scripts/check-farm-drift.sh is absent"
+fi
+
+if [ "$_mcp_merge_failed" -ne 0 ]; then
+  echo ""
+  echo "⛔ .mcp.json WAS NOT MERGED — the template declares a tortoise entry no lane could use, or"
+  echo "   the merge could not run (the FATAL/ERROR line above names which). The rest of the pi"
+  echo "   layer IS installed and usable; your existing .mcp.json is byte-identical to before this"
+  echo "   run, so the graph is whatever it already was. Fix templates/.mcp.base.json, then re-run."
+  exit 1
 fi
 
 echo ""
