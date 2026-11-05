@@ -979,6 +979,43 @@ def test_T_box_exec_refuses_a_shell_string_and_a_non_allowlisted_argv(tmp_path, 
         assert is_err and payload["refused"] == "command-not-allowlisted", (esc, payload)
         assert "write" in payload["reason"], (esc, payload["reason"])
 
+    # ⛔ `hostname` WITH A BARE ARGUMENT *RENAMES THE BOX*. `hostname NAME` and `hostname -F <file>` are
+    # the SETTER form; `ALLOWLIST["hostname"] = ([], 1)` bounds only the COUNT, so both passed a gate
+    # whose refusal text says the surface is "allowlisted for READING". A rename is not cosmetic here:
+    # `lane_registry.short_host()` is baked into every record's `host` and every minted `lane_id`, so
+    # the box's new records stop matching its existing ones and host-scoped claim/ownership reads
+    # degrade to abstentions. Verified ALLOWED before this arm existed.
+    for argv in (["hostname", "pwned-cell"], ["hostname", "-F/etc/hostname"],
+                 ["hostname", "-F", "/etc/hostname"]):
+        is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": argv})
+        assert is_err and payload["refused"] == "command-not-allowlisted", (argv, payload)
+        # The two-argument `-F <file>` form is refused EARLIER, by `max_args` — also correct, and also
+        # a reason that names no falsehood, so only the flag-gate cases are asserted on their wording.
+        if len(argv) == 2:
+            assert "host name" in payload["reason"], (argv, payload["reason"])
+    # …and the QUERY forms still work (a gate that refuses its own purpose is also broken).
+    for argv in (["hostname"], ["hostname", "-f"]):
+        assert mod._allowlisted(argv)[0] is True, argv
+
+    # ⛔ THE DECLARED PREFIX IS ENFORCED, NOT UNPACKED AND IGNORED — the mechanism that let
+    # `hostname NAME` through, pinned on a SYNTHETIC entry so it survives a future edit to the real
+    # ALLOWLIST. Without this, the check reads as dead code (it WAS: `prefix` had no other use) and the
+    # next reader deletes it.
+    monkeypatch.setitem(mod.ALLOWLIST, "ps", (["-eo", "pid"], 3))
+    assert mod._allowlisted(["ps", "-eo", "pid"])[0] is True
+    assert mod._allowlisted(["ps", "-ef"])[0] is False, "the declared prefix must be required"
+    assert mod._allowlisted(["ps", "-eo", "pid", "-x"])[0] is True      # beyond the prefix: bounded
+    assert mod._allowlisted(["ps", "-eo", "pid", "-x", "-y"])[0] is False  # max_args
+
+    # ⛔ AND THE WRITE-ESCAPE BAN IS SCOPED TO `git`, the one allowlisted program with a
+    # caller-NAMED output file. Applying it to every program false-blocked a READ-ONLY call and
+    # stated a falsehood doing it: GNU `df --output=FIELD_LIST` only selects COLUMNS
+    # (`df --output=source` writes nothing), so a legitimate diagnostic was refused with "writes a
+    # file the caller names" — wrong about the command and wrong about the reason.
+    assert mod._allowlisted(["df", "-h", "--output=source"])[0] is True
+    assert mod._allowlisted(["df", "/"])[0] is True
+    assert mod._allowlisted(["free", "-h"])[0] is True
+
     # …and an ALLOWLISTED argv runs, with the five typed fields
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname", "-s"]})
     assert is_err is False, payload
