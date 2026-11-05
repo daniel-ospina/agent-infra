@@ -257,7 +257,13 @@ ok_op = op == {
 ok_pt = pt.get("kind") == "evidence" and bool((pt.get("content") or "").strip())
 sys.exit(0 if ok_op and ok_pt else 1)
 PY
-bad="$(python3 - "$TMP/calls.jsonl" "$TMP/served.json" "$WRITE_TOOLS" <<'PY'
+# ⛔ THE HERE-DOC LIVES IN A FUNCTION BODY, NEVER INSIDE THE `$( )` (#2248, #2930). bash 3.2's
+# substitution scanner walks the body as if it were code, so a here-doc nested in a command
+# substitution desynchronises the parse state for the REST OF THE FILE. Measured on the real
+# 3.2.57 parser (`bash:3.2@sha256:b6252c62…`): this suite reported `line 298: syntax error:
+# unexpected end of file` — the EOF, 30 lines below the defect — while parsing fine under bash 5.
+# `/bin/bash` on macOS IS 3.2.57, so the suite was unrunnable on the harness's own platform.
+_r5_bad() { python3 - "$TMP/calls.jsonl" "$TMP/served.json" "$WRITE_TOOLS" <<'PY'
 import json, sys
 ADVERTISED = set(json.load(open(sys.argv[2])))
 seen, bad = set(), []
@@ -276,7 +282,8 @@ if missing:
     bad.append("(NOT EXERCISED: %s)" % ",".join(missing))
 print(",".join(sorted(set(bad))))
 PY
-)"
+}
+bad="$(_r5_bad)"
 if [ $? -ne 0 ]; then
   # ⛔ AN UNREADABLE SURFACE IS A RED, NOT AN EMPTY `bad` (#3374 review P2 class). Before this, a
   # failed python wrote nothing to stdout, `bad` came back EMPTY, and the arm below printed
