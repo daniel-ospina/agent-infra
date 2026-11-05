@@ -341,13 +341,17 @@ BOUND_VERDICTS = ("finished", "stalled", "exceeded-wallclock")
 # completion; `0` is `run` mode's success.
 #
 # ⛔ `na` IS **NOT** COMPLETION EVIDENCE — it is the ABSENCE of exit-status evidence.
-# `lane-bound.sh` sets `V_RC=na` UNCONDITIONALLY in `watch` mode (its own `V_RC=na`), and `watch`
-# is the mode the fleet's ONLY launcher uses for EVERY lane/fixer/worker
-# (`spawn-gate.sh`'s `run_agent` -> `lane-bound.sh watch`). `run` mode (which does)
-# put the child's real status on the line) is never used by the fleet. So `rc=na`
-# carries no completion fact at all: reading it as OK made the `rc` conjunct INERT for
-# the axis's entire production population, and a crashed / OOM-killed / watchdog-killed
-# lane published `finished` — the exact false PASS the conjunct exists to remove.
+# `lane-bound.sh` sets `V_RC=na` UNCONDITIONALLY in `watch` mode (its own `V_RC=na`), and
+# `watch` is what `spawn-gate.sh`'s `run_agent` passes for EVERY lane/fixer/worker.
+# `run` mode is the only one that puts the child's real status on the bound line, and
+# nothing in the fleet invokes it. ⛔ AND `spawn-gate.sh` IS NOT THE ONLY LAUNCHER:
+# `merge-one.sh`'s reviewer run is its own plain sleep watchdog that never invokes
+# `lane-bound.sh`, so it writes NO bound line at all (the launcher witness is the only
+# status evidence it has — see ``gather_log_lane``). Neither path can put a completion
+# fact in `rc=na`. So `rc=na` carries no completion fact at all: reading it as OK made the
+# `rc` conjunct INERT for the axis's entire production population, and a crashed /
+# OOM-killed / watchdog-killed lane published `finished` — the exact false PASS the
+# conjunct exists to remove.
 # `na` is therefore NOT in `BOUND_OK_RC`; it must be CORROBORATED by the launcher's own
 # `[timeout] agent pid=<pid> … rc=<n>` line (`parse_runner_line`), and only a
 # corroborated `rc=0` is `finished`.
@@ -1262,15 +1266,21 @@ def parse_runner_line(text: str):
     if not text:
         return "", None
     _bound_verdict_re()  # ensures the compiled globals exist
-    # ⛔ A `[timeout] agent` LINE WITH NO `pid=` TOKEN IS NOT A LAUNCHER REPORT. The
-    # watchdog writes PROSE with the same prefix — the mechanism-3 line this axis's own
-    # doc quotes: `[task] sub-agent (pid N) completed but did not exit within 15s — killing
-    # (completion watchdog)`. Taking
-    # the LAST marker unconditionally made that prose the witness: it has no `pid=`, so it
+    # ⛔ A `[timeout] agent` LINE WITH NO `pid=` TOKEN IS NOT A LAUNCHER REPORT. A
+    # TRUNCATED or garbled write can carry the marker with no status token, and taking
+    # the LAST marker unconditionally made that line the witness: it has no `pid=`, so it
     # became `"?"` (asserting a pid token existed) and it SHADOWED an earlier readable
     # launcher line, downgrading a corroborated `finished` to `unknown`. Only a marker
     # line that carries a `pid=` is a launcher report; `"?"` stays reserved for a `pid=`
     # that is PRESENT and unusable (`0x1f`, empty value, non-ASCII, over-long).
+    #
+    # ⛔ AND THE COMPLETION WATCHDOG'S PROSE NEVER REACHES HERE AT ALL. Its real line is
+    # `[task] sub-agent (pid N) completed but did not exit within 15s — killing
+    # (completion watchdog)` (`extensions/builtin-tools/index.ts`, whose default `logFn`
+    # prefixes `[task] `), so it carries no `[timeout] agent` marker to match — it is
+    # ABSENT to this parser, not present-but-unusable. An earlier revision of this
+    # comment claimed the watchdog shared the marker and was skipped for its missing
+    # `pid=`: that was wrong (it never matched), and doc §13.4 states the correct guard.
     last = None
     for m in _RUNNER_MARKER_RE.finditer(text):
         line_end = text.find("\n", m.start())

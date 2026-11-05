@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with eighty-eight paired mutations: every mutation re-
+Fifty-two tests with ninety-two paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. Seven of them pin the #1254 TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -3224,8 +3224,8 @@ MUTATIONS = [
         '                if rc == "na":',
         '                if False and rc == "na":',
         "the `rc=na` corroboration is dropped, so `watch` mode's unconditional token — the "
-        "shape the fleet's ONLY launcher writes for every lane — is no longer required to "
-        "be witnessed by the caller's rc line",
+        "shape `spawn-gate.sh`'s `run_agent` writes for every lane via `lane-bound.sh "
+        "watch` — is no longer required to be witnessed by the caller's rc line",
     ),
     Mutation(
         "T37", "module",
