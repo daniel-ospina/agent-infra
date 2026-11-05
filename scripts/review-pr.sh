@@ -225,6 +225,38 @@ fi
 [ -f "$RECORDER" ] && [ -x "$RECORDER" ] \
   || die "$E_RECORD" "recorder '$RECORDER' is not a regular executable file — refusing to pay for a review whose record step cannot run"
 
+# ── THE NON-VACUITY CONTRACT (agent-infra#3442) ─────────────────────────────────
+# Since #3442 the RECORDER refuses to mint a fresh `clean` verdict over an artifact that carries no
+# `## MUTATION ATTRIBUTION` block, so a review bought through THIS tool must (a) be TOLD to produce one
+# and (b) have it forwarded into the evidence comment. Without both, every clean review from this seam
+# paid for a review and then died at the record step — the block must come from the REVIEWER, and this
+# is the only place its output becomes the artifact. The shape is rendered from the SAME validator the
+# recorder calls, so the shape taught and the shape demanded cannot drift (the "one parser, two
+# consumers" rule `record-review.sh` states for itself).
+BRIEF_GATE="${REVIEW_PR_BRIEF_GATE:-}"
+if [ -z "$BRIEF_GATE" ]; then
+  _bg_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+  if [ -x "$_bg_dir/orchestrator-harness/brief-gate.sh" ]; then BRIEF_GATE="$_bg_dir/orchestrator-harness/brief-gate.sh"
+  elif [ -x "$_bg_dir/brief-gate.sh" ]; then BRIEF_GATE="$_bg_dir/brief-gate.sh"
+  elif [ -x "$HOME/.pi/agent/scripts/brief-gate.sh" ]; then BRIEF_GATE="$HOME/.pi/agent/scripts/brief-gate.sh"
+  fi
+fi
+MUTATION_SECTION=""
+if [ -n "$BRIEF_GATE" ] && [ -x "$BRIEF_GATE" ]; then
+  MUTATION_SECTION="$(bash "$BRIEF_GATE" --mutation-section 2>/dev/null || true)"
+fi
+if [ -z "$MUTATION_SECTION" ]; then
+  # ⛔ A MISSING VALIDATOR IS ANNOUNCED, NEVER SILENT. The recorder still fails closed on its own, so
+  # this is not a fail-open — but a reviewer who was never told would produce an artifact that cannot be
+  # recorded, and the operator would read that as a review defect instead of a harness skew.
+  err "$PROG: brief-gate.sh not found (looked beside this script, its orchestrator-harness/ and \$HOME/.pi/agent/scripts) — the reviewer will be given the block's REQUIRED shape inline, and the record will refuse if the validator cannot answer. Provision it (\`bash scripts/orchestrator-harness/install.sh\`)."
+  MUTATION_SECTION='## MUTATION ATTRIBUTION — one row per NEW assertion, or one `NO NEW ASSERTIONS: <why>` line
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `<file>:<line>` — "<the behaviour it protects>" | <the edit that reverts it> | <suite> <arm> | <the red row>, rc=<n> |'
+fi
+
 # ── 1) EVIDENCE: repo + head, from the PR object itself ───────────────────────
 # `env -u GH_REPO` is load-bearing, not hygiene: an ambient GH_REPO is a global
 # selector that makes gh answer about a repo nobody named (#2235/#2238), and the
@@ -704,6 +736,13 @@ notes are welcome under CLEAN and are listed above the verdict line.
 
 Print nothing after the verdict line. Do not write, commit, push, merge, or
 comment on GitHub: the caller posts your findings.
+
+$MUTATION_SECTION
+
+⛔ THIS BLOCK IS PART OF YOUR OUTPUT, above the verdict line, and the caller forwards it
+VERBATIM into the recorded artifact. A verdict without it is INCOMPLETE, not clean: since
+agent-infra#3442 the recorder REFUSES to mint a clean record over an artifact that carries no
+attribution block, so a clean verdict with no block is discarded rather than recorded.
 $(if [ -n "$t" ]; then cat <<TAIL
 
 ## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
@@ -2302,6 +2341,27 @@ if [ "$VERDICT" = clean ]; then
       else
         printf '⚠️ **Scope of this review:** the diff exceeded the single-argument prompt budget and was TRUNCATED to its first %s characters in the reviewer prompt; the reviewer was told to fetch the remainder itself and the `diff-tail:` digest was verified against this diff before this comment existed — it is the SHA-256 of this run’s random nonce followed by the full diff’s final line, so it cannot be precomputed from the prompt or from any text the PR supplies, which establishes that the reviewer held the fetched tail line. It cannot establish that the remainder was READ (the producer it names prints 64 hex, not the diff), so treat the verdict as covering the diff the reviewer reports against, while the RECORD binds the full diff hash.\n\n' "$DIFF_CAP"
       fi
+    fi
+    # ⛔ THE ATTRIBUTION BLOCK IS FORWARDED VERBATIM (agent-infra#3442). This body IS the artifact
+    # `record-review.sh` scans, and the recorder now refuses a `clean` mint without the block; the
+    # reviewer's own text is the only honest source for it, so it is carried through rather than
+    # paraphrased. Extracted from the transcript, heading to the next heading (the verdict line ends it).
+    MUTATION_BLOCK="$(
+      awk '
+        { lc = tolower($0) }
+        !ins && lc ~ /^[ \t]*#+[ \t]*mutation[ -]attribution/ { ins = 1; print; next }
+        ins && lc ~ /^[ \t]*#+/ { exit }
+        ins && lc ~ /^[ \t]*(clean|issues)[^a-z]?[ \t]*$/ { exit }
+        ins { print }
+      ' "$LOG" 2>/dev/null
+    )"
+    if [ -n "$MUTATION_BLOCK" ]; then
+      printf '%s\n\n' "$MUTATION_BLOCK"
+    else
+      # ⛔ NAMED, NOT OMITTED: an artifact that silently lacks the block reads as a review that found
+      # nothing to say about mutation, and the recorder's exit-3 refusal would then look like a harness
+      # bug. This states the cause where the reader (and the operator reading the refusal) will see it.
+      printf '⚠️ **No MUTATION ATTRIBUTION block was produced for this revision** — the reviewer output carried none, so this artifact CANNOT be recorded as `clean` under agent-infra#3442 (the recorder refuses it, exit 3). The verdict above stands as a comment only; re-run with a reviewer that emits the block.\n\n'
     fi
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
     printf 'Its findings are its own output, posted verbatim (in this comment, or in the non-blocking notes comment named below).\n'

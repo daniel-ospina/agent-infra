@@ -278,7 +278,7 @@ function _unescape(s,   out, i, n, c, nx) {
   }
   return out
 }
-BEGIN { buf = ""; ins = 0; depth = 0; sec = 0; none = 0; hdr = 0; row = 0; fence = 0; hl = 0 }
+BEGIN { buf = ""; ins = 0; depth = 0; sec = 0; none = 0; hdr = 0; row = 0; fence = 0; hl = 0; blk = 0 }
 { buf = buf $0 "\n" }
 END {
   if (length(buf) == 0) { print "EMPTY"; exit }
@@ -325,9 +325,18 @@ END {
     if (!ins) continue
 
     l = line
+    # ⛔ A BLOCKQUOTE IS QUOTED MATERIAL TOO (#3442 review cycle 4, P2). Fences and 4-space blocks were
+    # skipped; `>` was not, so pasting the worked row one character away satisfied the contract.
+    if (l ~ /^[ \t]*>/) continue
     sub(/^[ \t]+/, "", l)
     sub(/^[-*+][ \t]+/, "", l)
     sub(/^(\*\*|__)/, "", l)
+    # ⛔ A ROW COUNTS ONLY INSIDE THE CONTIGUOUS TABLE THE HEADER OPENED (#3442 review cycle 4, P1).
+    # was section-wide, so a summary table placed BELOW a header-only attribution donated the row —
+    # the same vacuity as the above-table case, mirrored. In GFM a table ends at the first line that is
+    # not a table line (a blank line included), so anything after that is a DIFFERENT table and its
+    # rows are not rows of this attribution table.
+    if (l !~ /\|/) blk = 0
     if (tolower(l) ~ /^no new assertions:/ && length(l) > 0) {
       r = l; sub(/^[^:]*:/, "", r); gsub(/^[ \t]+/, "", r); gsub(/[ \t]+$/, "", r)
       if (length(r) > 0) none = 1
@@ -342,19 +351,30 @@ END {
       k = _cells(l, C)
       if (k >= 2) {
         t = tolower(l)
-        # ⛔ THE HEADER RESETS `row` (#3442 review cycle 3, P1). A table ABOVE the header (a "what I
-        # ran" summary is the normal shape) sets `row` while `hl` is still 0, and a later header-only
-        # attribution table then inherited that row — the vacuous table, admitted. Finding the header
-        # starts the attribution over: from here only a row BELOW it counts.
-        if (t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) { hdr = 1; hl = i; row = 0 }
+        # ⛔ THE HEADER OPENS THE ONLY TABLE THAT COUNTS (#3442 review cycles 3 and 4, P1). A table
+        # ABOVE the header (a "what I ran" summary is the normal shape) and one BELOW it are both
+        # different tables, and neither donates the row the attribution must carry itself: `blk` is set
+        # ONLY here and cleared by the first line that is not a table line, so `row` can only be set
+        # inside the contiguous table this header opened. (A separate `row = 0` reset was removed when
+        # `blk` landed: with `blk` gating every row, the reset could never fire — the state it guarded
+        # against is unreachable, and a dead guard is a guard no mutant can falsify.)
+        # ⛔ A DATA ROW NAMING ALL THREE COLUMNS IS NOT A HEADER (#3442 review cycle 4, P2). The reset
+        # used to fire on ANY pipe line naming all three words — including a DATA ROW that mentions them,
+        # which is the natural row in a review of THIS change — wiping the count it had just contributed
+        # and refusing an honest artifact that visibly carried two rows. No `!hdr` guard is needed to keep
+        # that true: `blk` gates every row, so the only thing a re-detected header could do is move `hl`,
+        # and a row rejected by `hl` cannot be one already counted. A guard that cannot change a verdict is
+        # a guard no mutant can falsify, so it is not there (cycle-4 review).
+        if (t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) { hdr = 1; hl = i; blk = 1 }
         allsep = 1
         for (j = 1; j <= k; j++) { if (C[j] !~ /^:?-+:?$/) allsep = 0 }
         # The header row is not a data row, and a `|---|` rule is not either. Both would otherwise
         # satisfy "has a row" on a table whose every data row was deleted. ⛔ BY POSITION, NOT BY
         # TEXT (review of #3442, P1): matching the first cell against the literal `assertion` admits
         # every DECORATED header — `| assertion (file:line) | mutant | … |` — as a data row, which is
-        # the same vacuous table the index was added to refuse. Rows count only AFTER the header.
-        if (!allsep && k >= 3 && i > hl) row = 1
+        # the same vacuous table the index was added to refuse. Rows count only AFTER the header, and
+        # only while that table is still open.
+        if (!allsep && k >= 3 && i > hl && blk) row = 1
       }
     }
   }
