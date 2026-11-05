@@ -250,6 +250,60 @@ else
   bad "zero-padded PR took its own lease (rc=$rc) — two rails can run on one PR"
 fi
 
+# ── 9b. THE START-TIME LADDER ITSELF, WITH `validate_rail_bounds` OUT OF THE WAY ──
+# ⛔ WHY THIS EXISTS (review of the #3294 rebase, P2). `tests/admin-merge/run.sh`'s (q3) arms
+# drive the WHOLE rail, and `main()` calls `validate_rail_bounds` ~370 lines BEFORE the first
+# `rail_guard_poll` — so those arms are satisfied by `validate_rail_bounds` alone and stay
+# green if `rail_attempt_start`'s ladder is DELETED. That is the inert-enforcer-in-a-test class
+# this file exists to refuse, so the ladder is exercised HERE, directly, where nothing else can
+# answer for it. Each arm asserts the SPECIFIC message, not just the exit code: `0` and
+# `019864` share `rc=2` and were told apart only by which branch caught them.
+harness "$TMPROOT/ladder.sh" 'rail_attempt_start; echo "PROCEEDED"'
+_lad() { # _lad <expected-substring> <label> <knob-assignment>...
+  local want="$1" label="$2"; shift 2
+  env "$@" bash "$TMPROOT/ladder.sh" > "$TMPROOT/lad.out" 2>&1
+  local rc=$?
+  if [ "$rc" -eq 2 ] && grep -qF -- "$want" "$TMPROOT/lad.out" \
+     && ! grep -q PROCEEDED "$TMPROOT/lad.out"; then
+    ok "rail_attempt_start refuses $label by NAME (rc=2, \"$want\")"
+  else
+    bad "rail_attempt_start accepted (rc=$rc) or mis-named $label — expected \"$want\""
+  fi
+}
+_lad 'must be a POSITIVE integer number of seconds' 'a non-numeric deadline' \
+  ADMIN_MERGE_RAIL_DEADLINE=10m
+_lad 'beyond the usable integer range' 'an OVER-RANGE deadline (before any comparison)' \
+  ADMIN_MERGE_RAIL_DEADLINE=99999999999999999999999
+_lad 'a zero bound refuses EVERY attempt at its first poll' 'a ZERO deadline (its own message, not the leading-zero one)' \
+  ADMIN_MERGE_RAIL_DEADLINE=0
+_lad 'a LEADING ZERO is ambiguous' 'a LEADING-ZERO deadline' \
+  ADMIN_MERGE_RAIL_DEADLINE=019864
+_lad 'not an integer epoch' 'a non-numeric start seam' \
+  ADMIN_MERGE_RAIL_STARTED_AT=notanepoch
+_lad 'beyond the usable integer range' 'an OVER-RANGE start seam' \
+  ADMIN_MERGE_RAIL_STARTED_AT=999999999999999999999999
+_lad 'a LEADING ZERO is ambiguous (octal vs decimal)' 'a LEADING-ZERO start seam' \
+  ADMIN_MERGE_RAIL_STARTED_AT=01767000000
+
+# ⛔ AN OVERFLOWING *DERIVED* CEILING MUST NOT NAME A KNOB THE OPERATOR NEVER SET (finding
+# 3 of the same review). Every phase knob is legal on its own (<= TIMING_KNOB_MAX) while their
+# SUM is not, and the old code refused with `ADMIN_MERGE_RAIL_DEADLINE='<the sum>'` — sending
+# the operator to a variable that is not the cause and cannot raise the ceiling.
+if env ADMIN_MERGE_FIRST_CHECKS_CEILING=999999999 ADMIN_MERGE_RERUN_BUDGET=999999999 \
+     bash "$TMPROOT/ladder.sh" > "$TMPROOT/lad-der.out" 2>&1; then
+  bad "an OVERFLOWING derived ceiling was accepted"
+elif grep -q 'refusing the DERIVED whole-attempt ceiling' "$TMPROOT/lad-der.out" \
+     && ! grep -q "refusing ADMIN_MERGE_RAIL_DEADLINE=" "$TMPROOT/lad-der.out"; then
+  ok "an overflowing DERIVED ceiling is refused naming the PHASE knobs, never the operator knob it is not"
+else
+  bad "an overflowing derived ceiling blamed ADMIN_MERGE_RAIL_DEADLINE — a knob the operator never set"
+fi
+
+# ⛔ AND THE TTL RELATION IS STILL ENFORCED ONCE BOTH NUMBERS EXIST: a TTL that does not
+# OUTLIVE the bound lets a rail's lease be stolen mid-attempt by a later rail.
+_lad 'the lease TTL must EXCEED the whole-attempt bound' 'a TTL shorter than the bound' \
+  ADMIN_MERGE_RAIL_DEADLINE=100 ADMIN_MERGE_LOCK_TTL=50
+
 printf '\n%s passed, %s failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
 exit 0

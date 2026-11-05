@@ -15913,10 +15913,10 @@ set +e
 SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
   run_admin_here 42 --main-runs 1 >/dev/null 2>&1
 set -e
-grep -q 'CLAMPED to the reachable 2500s' "$SCEN/err" \
+grep -q 'CLAMPED to the reachable 3400s' "$SCEN/err" \
   && pass "(q2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
   || fail "(q2) an unreachable deadline was accepted silently — a bound that can never fire"
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2500s, 42\)' "$SCEN/err" \
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/3400s, 42\)' "$SCEN/err" \
   && pass "(q2) the refusal reports the CLAMPED bound, never the unused 33664s" \
   || fail "(q2) the refusal reported a bound the rail did not use"
 
@@ -15950,8 +15950,8 @@ SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
 p4_rc=$?
 set -e
 grep -q 'CLAMPED to now' "$SCEN/err" \
-  && pass "(q4)) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
-  || fail "(q4)) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
+  && pass "(q4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
+  || fail "(q4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
 grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
   && fail "(q4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
   || pass "(q4) …and it produced no spurious refusal (rc=$p4_rc)"
@@ -15974,16 +15974,30 @@ for bads in 999999999999999999999999 01767000000 notanepoch; do
 done
 
 # (q6) THE INSPECTION SURFACE REPORTS THE BOUND IN FORCE (review cycle 2 P2). It
-# used to print the DEFAULT, so `--print-bounds` said 20254 while a real run used
+# used to print the DEFAULT, so `--print-bounds` said 21454 while a real run used
 # 500 — "reported bound ≠ bound used" in the one field an operator greps.
 SCEN="$TMP/scen-p6"; mkdir -p "$SCEN"
 SUITE_RAIL_DEADLINE=500 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
 grep -q '^rail-deadline=500' "$SCEN/out" \
-  && pass "(q6) --print-bounds reports the bound IN FORCE (500), not the 20254 default" \
+  && pass "(q6) --print-bounds reports the bound IN FORCE (500), not the 21454 default" \
   || fail "(q6) --print-bounds does not report the bound in force — the operator is sent to a number the rail is not using"
 grep -q '^rail-deadline-source=' "$SCEN/out" \
   && pass "(q6) --print-bounds carries the derivation, so the number is auditable" \
   || fail "(q6) --print-bounds has no rail-deadline-source line"
+# ⛔ COMPUTED, NOT PINNED (review of the rebase, P2). The property is "the addends the line
+# PRINTS sum to the total it PRINTS" — so read both out of the line and add them here. A pinned
+# literal would go stale on any default change (it already did: the line once listed
+# `SELF_EDIT_WAIT` once while the derivation used it TWICE, and printed 20254 beside a 20554
+# bound), and a stale literal is exactly what this arm exists to catch.
+_pb_line="$(grep '^rail-deadline-source=' "$SCEN/out" || true)"
+_pb_terms="$(printf '%s\n' "$_pb_line" | sed -nE \
+  's/.*FIRST_CHECKS_CEILING ([0-9]+)s \+ RERUN_BUDGET ([0-9]+)s \+ 2 x SELF_EDIT_WAIT ([0-9]+)s \+ MERGE_REF_WAIT ([0-9]+)s \+ REPRO_TIMEOUT ([0-9]+)s = ([0-9]+)s.*/\1 \2 \3 \4 \5 \6/p')"
+read -r _pb_fc _pb_rb _pb_se _pb_mr _pb_rp _pb_tot <<< "$_pb_terms"
+if [ -n "${_pb_tot:-}" ] && [ $(( _pb_fc + _pb_rb + 2 * _pb_se + _pb_mr + _pb_rp )) -eq "$_pb_tot" ]; then
+  pass "(q6) the derivation's own ADDENDS sum to the bound it prints (${_pb_fc}+${_pb_rb}+2x${_pb_se}+${_pb_mr}+${_pb_rp}=${_pb_tot}) — auditable means arithmetic, not a gesture"
+else
+  fail "(q6) the printed derivation does not add up to the printed bound (terms='${_pb_terms:-<unparsed>}') — reported != used, one field over"
+fi
 
 # #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
 # file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is
@@ -16005,17 +16019,17 @@ else
 fi
 
 # (q7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
-# (review cycle 3, P2). (q6)) pins 500, which is BELOW the ceiling, so it never
+# (review cycle 3, P2). (q6) pins 500, which is BELOW the ceiling, so it never
 # exercised the clamp — and the clamp branch is exactly where the surface printed
-# the raw 33664 beside a refusal that enforced 20254.
+# the raw 33664 beside a refusal that enforced the reachable ceiling.
 SCEN="$TMP/scen-p7"; mkdir -p "$SCEN"
 SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
-grep -q '^rail-deadline=2500 (CLAMPED from 33664)' "$SCEN/out" \
-  && pass "(q7)) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
-  || fail "(q7)) the inspection surface reports a bound the rail is not using"
+grep -q '^rail-deadline=3400 (CLAMPED from 33664)' "$SCEN/out" \
+  && pass "(q7) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
+  || fail "(q7) the inspection surface reports a bound the rail is not using"
 grep -q '^rail-deadline=33664' "$SCEN/out" \
-  && fail "(q7)) it printed the RAW knob — the #3287 value the clamp exists to reject" \
-  || pass "(q7)) it does NOT print the raw unreachable value"
+  && fail "(q7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
+  || pass "(q7) it does NOT print the raw unreachable value"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
