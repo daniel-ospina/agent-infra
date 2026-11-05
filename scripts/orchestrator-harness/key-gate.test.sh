@@ -1368,6 +1368,19 @@ has "$OUT" "auth.json does not PARSE" \
     "8L5b …naming the FILE as the thing to repair, which is the remedy that works"
 hasnt "$OUT" "holds an entry for this provider" \
     "8L5c …and it does NOT claim the file holds an entry — the false fact the cannot-say line asserted"
+# ⛔ AND A FILE CARRYING A NON-JSON NUMERIC CONSTANT IS THE SAME FILE, NOT A VALID ONE (round 23, P2, measured):
+# `JSON.parse` REJECTS `Infinity`/`-Infinity`/`NaN`; Python's `json.loads` accepts them and `inf > 0` is true, so the
+# reader graded `{"key": Infinity}` as a usable credential and `contextWindow: Infinity` as a valid models.json — a
+# `check=ok` naming a variable from a file pi DISCARDED (`model-config.js:118-131`). `parse_constant` closes it.
+HINF="$(mkset storeinfinity "$TWO_JSON" "$SET_UNPROV")"
+printf '{"deepseek":{"type":"api_key","key":Infinity}}\n' > "$HINF/.pi/agent/auth.json"
+OUT="$(run_box_at "$HINF" "$T/nocwd")"; rc="$(rc_of "$OUT")"
+ck "8L6 a store carrying Infinity is unreadable, not a usable entry (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=auth-store-unreadable" \
+    "8L7 …because JSON.parse refuses the constant, so pi cannot read the file at all"
+hasnt "$OUT" "reason=store-invalid" \
+    "8L8 …and it is not misfiled as an entry pi could see but not take a key from"
 # pi parses models.json as JSONC (`stripJsonComments(stripBom(...))`, `model-config.js:116`); a comment must not make
 # the gate blind on a file pi uses — that is a fail-open on the exact defect #3331 exists to remove.
 HJC="$(mkset jsoncmodels "$TWO_JSON" ABSENT)"
@@ -1506,6 +1519,9 @@ tiersnull|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m
 overridetiersnull|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"cost":{"tiers":null}}}}}}
 overridectx|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"contextWindow":"big"}}}}}
 authHeader|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","authHeader":"yes"}}}
+infinity|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","contextWindow":Infinity}]}}}
+infinitycost|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","cost":{"input":Infinity,"output":2,"cacheRead":0,"cacheWrite":0}}]}}}
+nan|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","maxTokens":NaN}]}}}
 providercompat|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":"no"}}}
 modelOverrides|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":[]}}}
 schema|{"$schema":5,"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY"}}}
