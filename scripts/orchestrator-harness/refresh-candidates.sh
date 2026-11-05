@@ -24,11 +24,23 @@ set -u
 #
 # TWO ARMS, because two different facts need expressing:
 #   1. THE TITLE KIND, marked STRUCTURALLY — the kind token followed by `(` or `:`, optionally
-#      with a `-qualifier` (`epic-scope:`), or the `lane <id>:` umbrella form. The structural
-#      requirement is what makes the rule safe: the bare prefix this replaced also dropped WORK —
-#      `analysis-paralysis fix: …` (as `analysis`) and `lane reaper: …` (as `lane`). `analysis`
+#      with the ONE qualifier this repo uses (`epic-scope:`), or the `lane <id>:` umbrella form. The
+#      structural requirement is what makes the rule safe: the bare prefix this replaced also dropped
+#      WORK — `analysis-paralysis fix: …` (as `analysis`) and `lane reaper: …` (as `lane`). `analysis`
 #      and `investigation` are legacy members of the old rule that no live row currently uses; they
 #      stay because the old rule carried them and dropping them would be an unreviewed widening.
+#      ⛔ THE QUALIFIER IS ENUMERATED, NOT `-[A-Za-z0-9]+` (review cycle 3, P1). An unbounded
+#      qualifier silently DROPPED real work: `tracking-id: …`, `design-tokens: …`, `arch-lint: …`,
+#      `map-cache: …`, `measure-latency: …`, `coord-lock: …`, `residual-risk: …`,
+#      `requirement-ids: …` all match `<kind>-<word>:` and were excluded, with no `.pool-err` and a
+#      healthy-looking count — the exact silent-disappearance failure (#8465) this file exists to
+#      prevent. Adding a second qualifier is a TEST change (see `pool-filter.test.sh` §1), never a
+#      runtime guess.
+#      ⛔ AND A BARE `epic` WITH NO SEPARATOR IS DELIBERATELY **PICKABLE** (review cycle 3, P2): the
+#      pre-fix P0 rule excluded `epic of the v4 selection workstream` and `epic — end-to-end proof …`
+#      by prefix; the structural requirement now INCLUDES both, because excluding by bare prefix is
+#      what dropped `epidemic:` and `analysis-paralysis fix:` — hiding work is the worse direction.
+#      Pinned as an inclusion in the suite so the trade-off is a decision, not an omission.
 #   2. THE DECLARED LABEL — `standing-constraint`, and that label only. A standing constraint
 #      CANNOT be told from work by its title, and must not be inferred from its prose, so the
 #      declaration is the only honest marker (the same lesson #10902 records for folds: declare the
@@ -54,7 +66,7 @@ set -u
 # ⛔ THIS LINE IS EXTRACTED VERBATIM BY `pool-filter.test.sh`, so it stays ONE single-quoted
 # assignment on ONE line. `\\s` is doubled because a jq string literal needs it doubled; `$L`
 # and `$n` are jq variables and stay unexpanded inside the single quotes.
-POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed)(?:-[A-Za-z0-9]+)*\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
+POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
 OR_FROM_ENV="${OR:-}"
 # ⛔ "DECLARED" MEANS THE OPERATOR NAMED IT — NOT THAT THE VARIABLE IS PRESENT (#1977 review, P1).
 # `orch-loop.sh` EXPORTS `OR` on EVERY cycle, including the one where it fell back to its own default
@@ -2436,7 +2448,8 @@ rest_list() {
     page=$((page + 1))
   done
   # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a labelled PR becomes a DISPATCH CANDIDATE: the tier
-  # programs below only require "no assignee and a non-epic title", so it would be queued as
+  # programs below apply the shared `POOL_JQ` definition (#10951) and a PR title rarely carries a
+  # container kind, so it would be queued as
   # `0 <PR#>`, land in `dispatched.txt`, and get a lane spawned for a PR number the pass never
   # adjudicated as an issue. The REAPER is exposed to the same rows for an unrelated reason —
   # `has_pr` (below) keys on PR head-BRANCH names, not on numbers, so a PR row whose branch does not
@@ -5382,8 +5395,11 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
       fi ;;
     esac
   fi
-  # The same reachability filter the pool applies to this tier (unassigned, not an epic/lane/decision title):
-  # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
+  # ⛔ THE CONTAINER DEFINITION IS NOT IN THIS BLOCK — it is the single `POOL_JQ=` line near the top
+  # (#10951), so the floor and the tiers cannot describe different populations. Do not restate the rule
+  # here: a restated rule is the second copy this consolidation removed.
+  #
+  # The pool's unassigned guard still applies to this tier (an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
   # does — so it must not stand the floor down either.
   if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
       --jq '.[]|'"$pool_jq"'|.number' \

@@ -1412,9 +1412,9 @@ WEF="$T/weqfns.sh"
 # never produced (measured: 5 P13 failures, 0 on the same suite before the pool consolidation).
 POOL_DEF="$(sed -n '/^POOL_JQ=/p' "$REFRESH")"
 if [ -z "$POOL_DEF" ]; then
-  ck "P13(iii-b) (setup) the shipped refresh carries the pool definition the emergency writer needs" 1
+  ck "P13(iii-b-1) (setup) the shipped refresh carries the pool definition the emergency writer needs" 1
 else
-  ck "P13(iii-b) (setup) the shipped refresh carries the pool definition the emergency writer needs" 0
+  ck "P13(iii-b-1) (setup) the shipped refresh carries the pool definition the emergency writer needs" 0
 fi
 { printf '%s\n' "$POOL_DEF"; sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$WEF"
 [ -s "$WEF" ] && grep -q 'write_emergency_queue()' "$WEF"

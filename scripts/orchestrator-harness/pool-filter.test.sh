@@ -155,6 +155,26 @@ check_included 'analysis-paralysis (old-rule casualty)' "$(iss 900023 'analysis-
 check_excluded 'decision needed: (#3447)' "$(iss 3447 'Decision needed: reinstate or drop the deferred [checks.loop_liveness] fly.toml check')"
 # …and `lane:` WITHOUT an id is not the umbrella form, so it stays work-shaped rather than guessed at.
 check_included 'lane: without an id' "$(iss 900024 'lane: the sweep never advances past a stale entry')"
+# ⛔ THE QUALIFIER IS BOUNDED (review cycle 3, P1). An `(?:-[A-Za-z0-9]+)*` qualifier excluded every
+# `<kind>-<word>:` title, so these four — a correlation-id propagation task, a palette extraction, a
+# lint bug and an unbounded LRU — were silently DROPPED at runtime with no `.pool-err` and a
+# healthy-looking count. They are pinned as INCLUSIONS so re-widening the qualifier reds here.
+check_included 'tracking-id: (hyphenated work, not a qualifier)' \
+  "$(iss 900025 'tracking-id: propagate the correlation id through the funnel')"
+check_included 'design-tokens: (hyphenated work)' \
+  "$(iss 900026 'design-tokens: extract the palette into one module')"
+check_included 'arch-lint: (hyphenated work)' \
+  "$(iss 900027 'arch-lint: the rule misfires on fixtures')"
+check_included 'map-cache: (hyphenated work)' \
+  "$(iss 900028 'map-cache: the LRU is unbounded')"
+# ⛔ A BARE `epic` WITH NO SEPARATOR IS DELIBERATELY PICKABLE (review cycle 3, P2). The pre-fix P0
+# rule excluded these two by prefix; the structural requirement includes them, because excluding by
+# bare prefix is what dropped `epidemic:` and `analysis-paralysis fix:` — hiding work is the worse
+# direction. Pinned so the trade-off reads as a decision rather than as an omission.
+check_included 'epic of ... (bare epic, no separator)' \
+  "$(iss 900029 'epic of the v4 selection workstream')"
+check_included 'epic — ... (bare epic, no separator)' \
+  "$(iss 900031 'epic — end-to-end proof the workstream works')"
 
 # ── 5. UNKNOWN SPELLINGS STAY PICKABLE (the documented failure direction) ────────────────────
 check_included 'unknown kind' "$(iss 900030 'thingamajig(scope): a kind nobody has enumerated yet')"
@@ -212,17 +232,25 @@ titles="$(grep -c '\.title' "$RC" 2>/dev/null || true)"
 if [ "${titles:-0}" -eq 1 ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] the issue title is read in ${titles:-0} places — expected 1 (the definition); a second place is a second definition of 'work unit'"; fi
 
-# (c) THE KIND SET IS PINNED. Widening the container arm to cover a work kind (`plan`, `audit`,
-# `spike`, …) leaves every inclusion fixture green while silently hiding that kind at runtime, so the
-# alternation itself is asserted: changing it requires editing THIS line — i.e. a reviewed test change,
-# which is what the definition comment promises.
-KINDS='(?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed'
-if grep -qF -- "$KINDS" "$RC"; then ok=$((ok+1))
-else bad=$((bad+1)); echo "FAIL [membership] the container-kind set changed — update KINDS in this suite (and say why in the PR) rather than widening the rule silently"; fi
+# (c) THE KIND SET IS PINNED **EXACTLY**, not by substring (review cycle 3, P2). A substring pin is
+# additive-blind: appending `|plan` to the OUTER alternation left the suite at `56 passed, 0 failed`
+# — green over a widening that hides a whole work kind — while the comment claimed the opposite. The
+# whole title regex is pinned instead, so ANY change to a member, to the structural requirement, or to
+# the enumerated qualifier requires editing THIS line. That is the reviewed test change the definition
+# comment promises.
+TITLE_RE_WANT='^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)'
+TITLE_RE_GOT="$(grep -m1 '^POOL_JQ=' "$RC" | sed -e 's/.*|test("//' -e 's/";"i").*//')"
+if [ "$TITLE_RE_GOT" = "$TITLE_RE_WANT" ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [membership] the container-title regex changed — update TITLE_RE_WANT in this suite (and say why in the PR) rather than widening the rule silently"; echo "    got:  $TITLE_RE_GOT"; echo "    want: $TITLE_RE_WANT"; fi
 
-# (d) THE LABEL ARM IS PINNED TO ONE MEMBER, for the same reason.
-if [ "$(grep -cF -- 'select(["standing-constraint"]|index($n))' "$RC" 2>/dev/null || true)" -eq 1 ]; then ok=$((ok+1))
-else bad=$((bad+1)); echo "FAIL [membership] the label arm is no longer exactly ['standing-constraint'] — a label exclusion hides work and must be a reviewed change"; fi
+# (d) THE LABEL ARM IS PINNED TO ONE MEMBER AND ONE SELECT, **by OCCURRENCE COUNT, not by substring**
+# (review cycle 3, P2). A substring pin survived an APPENDED second label select at `56 passed, 0 failed`,
+# so a second label exclusion could ride in green. `grep -c` counts LINES and the whole program is ONE
+# line, so the count must be taken per OCCURRENCE (`grep -o … | wc -l`) or an appended arm is invisible.
+lo="$(grep -oF -- 'map(.name|ascii_downcase)' "$RC" 2>/dev/null | wc -l | tr -d ' ')"
+lo2="$(grep -oF -- 'select(["standing-constraint"]|index($n))' "$RC" 2>/dev/null | wc -l | tr -d ' ')"
+if [ "${lo:-0}" -eq 1 ] && [ "${lo2:-0}" -eq 1 ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [membership] the label arm is not exactly one select of ['standing-constraint'] (label reads=${lo:-0}, select sites=${lo2:-0}, expected 1 and 1) — a label exclusion hides work and must be a reviewed change"; fi
 
 echo "pool-filter: $ok passed, $bad failed"
 [ "$bad" -eq 0 ] || exit 1

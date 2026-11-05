@@ -46,9 +46,12 @@ issue (open, labelled P0/P1/P2, unassigned)
   │                           a title-kind arm (epic/decision/design/coord/measure/analysis/
   │                           investigation/requirement/tracking/residual/map/arch/OWNER DECISION,
   │                           plus the `decision needed:` request form — each only when marked
-  │                           structurally as `kind:` or `kind(...)`) or the `lane <id>:` umbrella
+  │                           structurally as `kind:` or `kind(...)`, with `epic-scope:` the one
+  │                           enumerated `-qualifier`) or the `lane <id>:` umbrella
   │                           form, and a declared `standing-constraint` label. Unknown spellings
-  │                           stay pickable on purpose — ORDERED BY SEVERITY FIRST,
+  │                           stay pickable on purpose, and so does a BARE kind with no separator
+  │                           (`epic of …`) — excluding by bare prefix is what dropped `epidemic:`
+  │                           — ORDERED BY SEVERITY FIRST,
   │                           then issue number (tortoise#8465/#8467).
   │                           A bare `sort -n` on the numbers alone ordered by AGE, which put
   │                           hundreds of P2s ahead of the eligible P0s.
