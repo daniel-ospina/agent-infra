@@ -32,7 +32,7 @@
 //   Part B — BEHAVIORAL: the REAL index.ts handler, driven against a hermetic
 //            hub. Each pinned case asserts BOTH directions: the remote form is
 //            ALLOWED and the SAME command run locally is still REFUSED.
-//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): SEVENTEEN mutants are
+//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): NINETEEN mutants are
 //            built in a TEMP copy of this extension and each must redden the
 //            specific assertion it reverts — the pre-fix identity mask, an
 //            over-reaching mask that ignores separators, a swallowed heredoc
@@ -573,6 +573,43 @@ for (const c of [
   expect("A33: an array literal is not masked", mask(c), c);
 }
 
+// A34 (#3478 review cycle 6 P0): a COMMAND SUBSTITUTION whose body is the boundary
+// hands remote stdout to a command THIS shell runs. `_rbFeedsLocalShell` only sees
+// `|` stages and the `<(` bail only process substitution, so this was masked while
+// origin/main refused it (#1919).
+for (const c of [
+  `bash -c $(cmux vm exec cell-a -- sh -c 'git worktree add rev-9')`,
+  `sh -c $(cmux vm exec cell-a -- sh -c 'git worktree add rev-9')`,
+  `$(cmux vm exec cell-a -- sh -c 'git worktree add rev-9')`,
+  `env bash -c $(cmux vm exec cell-a -- sh -c 'git worktree add rev-9')`,
+  `python3 -c $(cmux vm exec cell-a -- sh -c 'x')`,
+]) {
+  expect("A34: a substitution that feeds a LOCAL command is NOT masked", mask(c), c);
+}
+// …while a pure ASSIGNMENT has no consumer here and stays masked.
+for (const c of [
+  `x=$(cmux vm exec cell-a -- printf x)`,
+  `X=$(cmux vm exec cell-a -- printf x); echo done`,
+]) {
+  expectTrue(`A34b: a substitution consumed by nobody stays masked — ${JSON.stringify(c)}`,
+    mask(c).includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(mask(c)));
+}
+// …and a DATA consumer consuming it still allows the mask.
+expectTrue("A34c: a substitution fed to grep is still masked",
+  mask(`grep $(cmux vm exec cell-a -- printf x) file`).includes(REMOTE_PAYLOAD_PLACEHOLDER),
+  JSON.stringify(mask(`grep $(cmux vm exec cell-a -- printf x) file`)));
+
+// A35 (#3478 review cycle 6 P2): a `\`+newline INSIDE a delimiter word is DELETED by
+// bash (not a newline). Emitting the newline computed a delimiter the shell never
+// uses, so no terminator matched and the mask ran to end-of-string.
+for (const c of [
+  `cmux vm exec cell-a -- sh -s <<EO\\\nS\n:\nEOS\ngit worktree add cont1\n`,
+  `cmux vm exec cell-a -- sh -s <<"EO\\\nS"\n:\nEOS\ngit worktree add cont2\n`,
+]) {
+  expectTrue(`A35: a continued delimiter word still terminates at EOS — ${JSON.stringify(c)}`,
+    /git worktree add cont[12]/.test(mask(c)), JSON.stringify(mask(c)));
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // Part B — BEHAVIORAL: the real index.ts handler against a hermetic hub
@@ -902,14 +939,9 @@ if (typeof stripTypeScriptTypes !== "function" ||
           // level, because that is the unit the revert changes.
           label: "unquoted backtick region split",
           kind: "mask",
-          revert: (src) => src.replace(
-            "      // #3444 review (#3478 P0): an UNQUOTED backtick region is ONE word. Taking\n" +
-            "      // only the opening token let the region's remaining words fall into the\n" +
-            "      // mask, and `` `git reset --hard` `` is executed by THIS shell.\n" +
-            "      if (c === \"`\") { localSubst = true; i = _rbBacktickRegionEnd(s, i); text = s.slice(start, i); continue; }",
-            "      // MUTANT: only the opening backtick token is kept\n" +
-            "      if (c === \"`\") { localSubst = true; text += c; i++; continue; }",
-          ),
+          revert: (src) => src
+            .split("i = _rbBacktickRegionEnd(s, i)").join("i = i + 1")
+            .replace("  if (out !== s && _rbSubstFeedsShell(out)) return s;", "  // MUTANT: no substitution bail"),
           maskProbe: "cmux vm exec cell-a -- `git reset --hard`",
           check: (out) => !String(out).includes("git reset --hard"),
         },
@@ -979,8 +1011,8 @@ if (typeof stripTypeScriptTypes !== "function" ||
           label: "pipe head allow-list (shells only)",
           kind: "mask",
           revert: (src) => src.replace(
-            "      const base = head.includes(\"/\") ? head.slice(head.lastIndexOf(\"/\") + 1) : head;\n      if (!DATA_CONSUMERS.has(base)) return true;",
-            "      const base = head.includes(\"/\") ? head.slice(head.lastIndexOf(\"/\") + 1) : head;\n      if (!/^(?:ba|z|k|da|a)?sh$|^(?:python[0-9.]*|perl|ruby|node|awk|tclsh|lua)$/.test(base)) continue;",
+            "      if (!_rbIsDataConsumer(head)) return true;",
+            "      if (!/^(?:ba|z|k|da|a)?sh$|^(?:python[0-9.]*|perl|ruby|node|awk|tclsh|lua)$/.test(head)) continue;",
           ),
           maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | timeout 5 bash -s`,
           check: (out) => !String(out).includes("git checkout"),
@@ -1091,6 +1123,30 @@ if (typeof stripTypeScriptTypes !== "function" ||
           ),
           maskProbe: `bash <(cmux vm exec c -- printf 'git checkout -- a.txt')`,
           check: (out) => !String(out).includes("git checkout"),
+        },
+        {
+          // #3478 review cycle 6 P0: a substitution that feeds a LOCAL command runs
+          // the remote stdout HERE. Without the bail it is masked — A34 goes RED.
+          label: "substitution feeding a local command not bailed",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "  if (out !== s && _rbSubstFeedsShell(out)) return s;",
+            "  // MUTANT: no substitution bail",
+          ),
+          maskProbe: `bash -c $(cmux vm exec cell-a -- sh -c 'git worktree add rev-9')`,
+          check: (out) => !String(out).includes("git worktree add rev-9"),
+        },
+        {
+          // #3478 review cycle 6 P2: `\`+newline inside a delimiter word is DELETED by
+          // bash. Emitting a newline computes a word the shell never uses, so the
+          // terminator never matches and the mask eats everything after — A35 RED.
+          label: "delimiter continuation kept as newline",
+          kind: "mask",
+          revert: (src) => src
+            .split('if (t[i + 1] === "\\n") { i += 2; continue; }')
+            .join("/* MUTANT: continuation kept as newline */"),
+          maskProbe: "cmux vm exec cell-a -- sh -s <<EO\\\nS\n:\nEOS\ngit worktree add cont1\n",
+          check: (out) => !String(out).includes("git worktree add cont1"),
         },
       ];
 

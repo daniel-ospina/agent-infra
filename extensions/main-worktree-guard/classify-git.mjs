@@ -10354,7 +10354,8 @@ function _rbUnquoteDelim(word) {
       i++;
       let closed = false;
       while (i < t.length) {
-        if (t[i] === "\\" && i + 1 < t.length && '$`"\\\n'.includes(t[i + 1])) { out += t[i + 1]; i += 2; continue; }
+        if (t[i] === "\\" && t[i + 1] === "\n") { i += 2; continue; }   // bash DELETES `\`+newline
+        if (t[i] === "\\" && i + 1 < t.length && '$`"\\'.includes(t[i + 1])) { out += t[i + 1]; i += 2; continue; }
         if (t[i] === '"') { closed = true; i++; break; }
         out += t[i++];
       }
@@ -10388,6 +10389,10 @@ function _rbUnquoteDelim(word) {
     if (c === "$" && t[i + 1] === '"') { i++; continue; }   // $"…": the `"` branch handles the body
     if (c === "\\") {
       if (i + 1 >= t.length) return null;
+      // A `\`+newline is DELETED by bash, not turned into a newline: emitting the
+      // newline computed a delimiter the shell never uses, so no terminator matched
+      // and the mask ran to end-of-string (review #3478 cycle 6 P2).
+      if (t[i + 1] === "\n") { i += 2; continue; }
       out += t[i + 1]; i += 2; continue;
     }
     out += c;
@@ -10717,7 +10722,91 @@ export function maskRemoteExecPayloads(command) {
   // #3478 cycle 5 P0). `_rbFeedsLocalShell` only inspects `|` stages, so bail here:
   // a false bail only re-gates, a false allow EXECUTES.
   if (out !== s && /[<>]\(/.test(out)) return s;
+  // \u26d4 A substitution whose body is the payload runs the remote stdout HERE.
+  if (out !== s && _rbSubstFeedsShell(out)) return s;
   return out;
+}
+
+// Commands that consume stdin (or an argument) as DATA and cannot run it as a
+// program. ONE list, shared by the pipe bail and the substitution bail.
+const _RB_DATA_CONSUMERS = new Set([
+  "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "tac", "tee", "head", "tail",
+  "wc", "sort", "uniq", "cut", "tr", "nl", "jq", "base64", "base32", "xxd", "od", "hexdump",
+  "split", "diff", "comm", "paste", "join", "fold", "fmt", "expand", "columns", "column",
+  "md5sum", "sha1sum", "sha256sum", "sha512sum", "cksum", "strings", "zcat", "gunzip",
+  "bzcat", "xzcat", "rev", "seq", "numfmt", "csvtool", "yq",
+]);
+const _rbIsDataConsumer = (w) =>
+  _RB_DATA_CONSUMERS.has(String(w).includes("/") ? String(w).slice(String(w).lastIndexOf("/") + 1) : String(w));
+
+/** The source index just past the substitution region opening at `from` (`$(` or a
+ *  backtick). Depth-counts parentheses, skipping single/double-quoted spans, so a
+ *  nested `$(` inside does not end it early. Returns end-of-string when unclosed. */
+function _rbSubstEnd(s, from) {
+  if (s[from] === "\u0060") {
+    const close = s.indexOf("\u0060", from + 1);
+    return close < 0 ? s.length : close + 1;
+  }
+  let depth = 0;
+  for (let i = from + 1; i < s.length; i++) {
+    const c = s[i];
+    if (c === "'") { const e = s.indexOf("'", i + 1); if (e < 0) return s.length; i = e; continue; }
+    if (c === '"') { i++; while (i < s.length && s[i] !== '"') { if (s[i] === "\\") i++; i++; } continue; }
+    if (c === "\\") { i++; continue; }
+    if (c === "(") depth++;
+    else if (c === ")") { if (depth === 0) return i + 1; depth--; }
+  }
+  return s.length;
+}
+
+/** \u26d4 A COMMAND SUBSTITUTION whose body IS the remote boundary hands the remote
+ *  stdout to a command THIS shell runs: `bash -c $(cmux vm exec \u2026)`, `sh -c \u2026`,
+ *  or a bare `$(cmux \u2026)` at COMMAND POSITION. `_rbFeedsLocalShell` only inspects
+ *  `|` stages and the process-substitution bail only `<(`/`>(`, so this shape was
+ *  masked while `origin/main` refused it (#1919) \u2014 a local execution hidden by the
+ *  mask (review #3478 cycle 6 P0).
+ *
+ *  Polarity is the same CLOSED one: bail unless the substitution's enclosing
+ *  command word is a proven data consumer. An ASSIGNMENT (`x=$(cmux \u2026 )`) has no
+ *  command word \u2014 nothing consumes it here \u2014 so it stays masked; the two-step
+ *  `x=\u2026; eval \$x` is beyond any single-string scan (documented residual, same
+ *  class as `bash /tmp/f`).
+ *  @returns {boolean} true \u21d2 do NOT mask. */
+function _rbSubstFeedsShell(text) {
+  const ph = REMOTE_PAYLOAD_PLACEHOLDER;
+  const s = String(text ?? "");
+  for (let i = 0; i < s.length; i++) {
+    const open = s[i] === "$" && s[i + 1] === "(";
+    if (!open && s[i] !== "\u0060") continue;
+    const region = s.slice(i, _rbSubstEnd(s, i));
+    if (!region.includes(ph)) continue;
+    // The enclosing simple command: back to the previous top-level separator.
+    const prefix = s.slice(0, i);
+    const cut = Math.max(prefix.lastIndexOf(";"), prefix.lastIndexOf("&&"), prefix.lastIndexOf("||"),
+      prefix.lastIndexOf("|"), prefix.lastIndexOf("\n"), prefix.lastIndexOf("("));
+    const seg = prefix.slice(cut + 1).trim();
+    if (!seg) return true;                            // command position ⇒ EXECUTES
+    const words = seg.split(/\s+/).filter(Boolean);
+    const nonAssign = words.filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    if (nonAssign.length === 0) continue;              // pure assignment ⇒ stays masked
+    let j = 0;
+    while (j < words.length) {
+      const w = words[j];
+      if (w === "!") { j++; continue; }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) { j++; continue; }
+      if (/^\d*[<>]|^&>/.test(w)) {
+        const takesNext = !/^\d*(?:>&|<&)\d+$/.test(w) && !/^\d*>>?\S/.test(w);
+        j += takesNext ? 2 : 1;
+        continue;
+      }
+      break;
+    }
+    if (j >= words.length) return true;
+    let head = words[j].replace(/^[!({]/, "").replace(/[)}]*$/, "");
+    if (!head || /["'\u0060$]/.test(head)) return true;
+    if (!_rbIsDataConsumer(head)) return true;
+  }
+  return false;
 }
 
 /** Does `text` pipe a masked placeholder into a command that may RUN what it
@@ -10736,14 +10825,6 @@ export function maskRemoteExecPayloads(command) {
  *  @returns {boolean} true ⇒ do NOT mask. */
 function _rbFeedsLocalShell(text) {
   const ph = REMOTE_PAYLOAD_PLACEHOLDER;
-  // Commands that consume stdin as DATA and cannot run it as a program.
-  const DATA_CONSUMERS = new Set([
-    "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "tac", "tee", "head", "tail",
-    "wc", "sort", "uniq", "cut", "tr", "nl", "jq", "base64", "base32", "xxd", "od", "hexdump",
-    "split", "diff", "comm", "paste", "join", "fold", "fmt", "expand", "columns", "column",
-    "md5sum", "sha1sum", "sha256sum", "sha512sum", "cksum", "strings", "zcat", "gunzip",
-    "bzcat", "xzcat", "rev", "seq", "numfmt", "csvtool", "yq",
-  ]);
   // A pipeline continued on the next line is ONE pipeline — do not split there.
   const joined = text.replace(/\|&?\s*\n/g, "|");
   for (const cmd of joined.split(/;|&&|\|\||\n/)) {
@@ -10774,8 +10855,7 @@ function _rbFeedsLocalShell(text) {
       // De-decorated command words only — a quote, `$`, or a path prefix means
       // this scan cannot tell what runs (`"$SHELL"`, `$(which bash)`, `/tmp/x`).
       if (/["'`$]/.test(head)) return true;
-      const base = head.includes("/") ? head.slice(head.lastIndexOf("/") + 1) : head;
-      if (!DATA_CONSUMERS.has(base)) return true;
+      if (!_rbIsDataConsumer(head)) return true;
     }
   }
   return false;
