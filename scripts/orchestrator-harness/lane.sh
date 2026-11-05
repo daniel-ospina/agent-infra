@@ -804,7 +804,14 @@ else
     echo "[lane $N] NOT started: the KEY gate could not be RUN ($O/state not writable) — see $O/logs/lane-$N.log" >&2
     exit 78
   fi
-  key_gate_assert "lane $N" "${HOME:-}" > "$KEY_GATE_OUT" 2>&1; KEY_GATE_RC=$?
+  # ⛔ THE MODEL PAIR IS PASSED EXPLICITLY, SO THE GATE AND THE SPAWN CANNOT DISAGREE (agent-infra#3443).
+  # `run_agent` builds `pi -p --provider "${PI_LANE_PROVIDER:-deepseek}" --model "${PI_LANE_MODEL:-deepseek-flash}"`
+  # — the provider is ALWAYS explicit there, even when the model id carries its own `provider/` prefix. A
+  # gate that resolved the provider from the prefix would therefore assert one provider's credential while
+  # `pi` was handed another: green gate, dead lane (the false-PASS polarity). Passing both halves here makes
+  # the agreement structural instead of a coincidence of two defaults, and it is why the gate's own
+  # prefix rule is reserved for a probe that names no provider.
+  key_gate_assert "lane $N" "${HOME:-}" "${PI_LANE_PROVIDER:-deepseek}" "${PI_LANE_MODEL:-deepseek-flash}" > "$KEY_GATE_OUT" 2>&1; KEY_GATE_RC=$?
   tee -a "$O/logs/lane-$N.log" < "$KEY_GATE_OUT"
   rm -f "$KEY_GATE_OUT" 2>/dev/null || true
   if [ "$KEY_GATE_RC" -ne 0 ] && [ "$KEY_GATE_RC" != "$KEY_GATE_REFUSED" ]; then
@@ -816,16 +823,28 @@ else
     exit 78
   fi
   if [ "$KEY_GATE_RC" -ne 0 ]; then
-    # The reason token names the VARIABLE, so a fleet scan can count the missing names without reading
-    # prose: `grep -h '^outcome=refused reason=key-gate' $O/logs/lane-*.log`.
-    lane_outcome refused "key-gate:${KEY_GATE_REASON:-credential-missing}:${KEY_GATE_VAR:-unknown}"
+    # The reason token names the VARIABLE and the MODEL, so a fleet scan can count the missing names and
+    # the model they were for without reading prose: `grep -h '^outcome=refused reason=key-gate'
+    # $O/logs/lane-*.log`. ⛔ THE MODEL IS IN THE TOKEN BECAUSE THE FAILURE IS NAMED AFTER IT (agent-infra#3443:
+    # `No API key found for the selected model.`) — a token carrying only the variable answers a question the
+    # operator did not ask when the variable was the wrong one to look at.
+    lane_outcome refused "key-gate:${KEY_GATE_REASON:-credential-missing}:${KEY_GATE_VAR:-unknown}:${KEY_GATE_MODEL:-unknown}"
     # ⛔ THE REFUSAL YIELDS THE ITEM (review round 3, P2). A key refusal is a property of THIS box, so a
     # peer that HAS the credential can take the work — and without this record `chain-merge.sh` has
     # nothing to read, so it waits out its 90 minutes holding the cross-box claim while every peer's
     # pre-flight sees COLLISION (the R8 defect the record exists to remove). `capability` writes one for
     # exactly this reason; the words below say what the stand-down buys, the way `land`/`skew` do.
+    # ⛔ THE SENTENCE FOLLOWS THE REASON (round 22, P2, measured): a `store-invalid`/`auth-store-unreadable` refusal is a
+    # verdict about `auth.json`, and telling the operator to "put the credential in the environment" sends them to the
+    # one thing the refusal already measured as NOT the problem (`export $VAR` does not rescue either shape).
+    case "${KEY_GATE_REASON:-credential-missing}" in
+      store-invalid|auth-store-unreadable)
+        KEY_GATE_REMEDY="a property of THIS box's credential STORE — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-<agent dir>}/auth.json, which pi reads before anything else, and neither exporting the variable nor a models.json template rescues it; repair or delete that file" ;;
+      *)
+        KEY_GATE_REMEDY="a property of THIS box — the [key-gate] lines above name the variable and every candidate file. The remedy HERE is to put the credential in the environment lanes run with" ;;
+    esac
     if lane_standdown_write key "$CAPACITY_YIELD_SECS"; then
-      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=key) — the credential is a property of THIS box, so chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min and a peer that has the key can claim it; this box will not re-win it while the yield is live. The remedy HERE is to put the credential in the environment lanes run with (the [key-gate] lines above name the variable and every candidate file)." >> "$O/logs/lane-$N.log"
+      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=key) — the credential is ${KEY_GATE_REMEDY}." >> "$O/logs/lane-$N.log"
     else
       echo "[lane $N] WARN: could not write $capacity_record — the refusal still releases the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
     fi
