@@ -6187,6 +6187,15 @@ FLE_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" AI_REVIEW_GATE_
     bash "$RECORD" --flush-pending "$FLE_PR" daniel-ospina/agent-infra 2>&1)" || FLE_RC=$?
 assert_eq "$(dc_posts "$FLE_PR")" "0" \
     "20.13 with NO key resolvable, a marker whose sig= only matches the EMPTY key is never published (:1245, fail CLOSED)"
+# ⛔ ARM SPECIFICITY, not just the count: :1248 ALSO refuses this marker (its sig= is a
+# genuine HMAC, but not of the configured key — there is no configured key), so a
+# 0-post count alone cannot say WHICH refusal fired. :1245 returns SILENTLY; :1248
+# prints the loud REFUSING line. Asserting the loud line's ABSENCE names the arm, and
+# the count assertion above is what fails if a regression makes either arm stop
+# refusing. (Positive-first discipline: the count must already be 0 for this to mean
+# anything, and `assert_eq` above runs first.)
+assert_not_contains "$FLE_OUT" "REFUSING to publish a marker" \
+    "20.13 …and the refusal came from the KEY-UNSET arm (:1245, silent), not from the match arm (:1248, loud) [out: $(printf '%s' "$FLE_OUT" | tr '\n' ' ')]"
 assert_eq "$FLE_RC" "0" \
     "20.13 …and the keyless flush still delivers the BODY copy (rc 0) — the refusal is not fatal"
 
