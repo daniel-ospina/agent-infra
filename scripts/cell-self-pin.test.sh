@@ -932,6 +932,19 @@ refuses_dropin 'declares User=root in a TIMER drop-in (the key is inert there)' 
   "$(dropin_doctor timeruser 'User=root' 'cell-self-pin.timer.d')" 'IGNORES it in a [Timer]'
 refuses_dropin 'declares DynamicUser=yes in a TIMER drop-in (the key is inert there)' \
   "$(dropin_doctor timerdyn 'DynamicUser=yes' 'cell-self-pin.timer.d')" 'IGNORES it in a [Timer]'
+# ⛔ AND A DROP-IN MAY NOT CARRY `[Install]` — THE ENABLEMENT PATH WAS THE LAST DOOR (round-6 review, P1).
+# systemd applies `[Install]` at ENABLE time, so no load-time rule above can see it, and `WantedBy=` is a
+# LIST with the same empty-assignment RESET this file already refuses elsewhere. MEASURED on systemd 255:
+# `[Install]` + `WantedBy=` in a timer drop-in makes `systemctl enable` answer "The unit files have no
+# installation config" and exit **0** while creating NO symlink — so the install prints its positive claim
+# over a pin that is never enabled. Two legs: the EMPTY list-reset (the measured spelling) and a NON-empty
+# `WantedBy=` (a drop-in cannot add enablement the rendered unit does not already declare).
+refuses_dropin 'carries [Install] with an EMPTY WantedBy= (a LIST RESET; enable exits 0 and creates no link)' \
+  "$(dropin_doctor installreset '[Install]
+WantedBy=' 'cell-self-pin.timer.d')" 'NO symlink'
+refuses_dropin 'carries [Install] at all (systemd applies it at ENABLE time, not load time)' \
+  "$(dropin_doctor installsec '[Install]
+WantedBy=timers.target' 'cell-self-pin.service.d')" 'NO symlink'
 # ⛔ THE IDENTITY ALLOWANCE WAS ADVERTISED AND NEVER READ (round-13 review, P1). This section's own header
 # says a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)" — and `verify_unit` refuses any `User=`
 # that is not the owner of `$CELL_HOME` because that is the identity whose git can answer for the tree the

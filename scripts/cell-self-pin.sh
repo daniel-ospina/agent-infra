@@ -1400,7 +1400,9 @@ verify_timer() { # <rendered timer> [expected Unit= target]
 # `/usr/local/lib/systemd/system` and `/usr/lib/systemd/system`. `run/systemd/transient` and the three
 # `generator` entries did NOT merge in that measurement, so they are deliberately not listed (listing a
 # directory that cannot hold an effective drop-in would only add a refusal surface). The ninth entry,
-# `/lib/systemd/system`, is the same directory as `/usr/lib/systemd/system` on a non-usrmerge host.
+# `/lib/systemd/system`, is the same directory as `/usr/lib/systemd/system` on a USRMERGE host (`ls -ld /lib`
+# -> `usr/lib` there) and a distinct real load path on a non-usrmerge one — which is the only reason it
+# earns a line: listing it costs nothing where they alias, and is load-bearing where they do not.
 # `systemd.unit(5)` Table 1 puts `/usr/local/lib/systemd/system` — "System units installed by the
 # administrator" — ABOVE `/usr/lib/systemd/system`, and lists the `.control`/`.attached` entries as
 # "Persistent and transient configuration created using the dbus API", which is ABOVE `/etc/systemd/system`.
@@ -1591,6 +1593,20 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
     # merged OVER the unit and an operator reading the unit will never see it.
     refuse_raw_text_tricks "the installed drop-in ${f}" "$body" || return 1
     refuse_env_reset "the installed drop-in ${f}" "$body" || return 1
+    # ⛔ A DROP-IN MAY NOT CARRY `[Install]` AT ALL, AND THIS WAS THE LAST DOOR IN THE ENABLEMENT PATH.
+    # systemd applies `[Install]` at ENABLE time, not at load time, so none of the load-time rules above
+    # can see it — and `WantedBy=`/`RequiredBy=` are LISTS with the same empty-assignment RESET this file
+    # already refuses for `Environment=` and `SuccessExitStatus=`. MEASURED on systemd 255: a
+    # `cell-self-pin.timer.d/*.conf` carrying `[Install]` + `WantedBy=` makes `systemctl enable` answer
+    # "The unit files have no installation config (WantedBy=, RequiredBy=…)" and exit **0** while creating
+    # NO symlink, so `--install` prints its positive claim and exits 0 over a pin that is never enabled —
+    # #3194's "never runs, every surface green", one boot later, through the drop-in half of the effective
+    # unit. (The control with the drop-in removed reads `enabled` and has the symlink.) Refused by SECTION
+    # rather than by key, because the whole section is meaningless here: the rendered unit already declares
+    # the enablement, and a drop-in can only reset or duplicate it.
+    if printf '%s\n' "$(unit_section "$body" Install)" | grep -qv '^[[:space:]]*$'; then
+      bad "the installed drop-in ${f} carries an [Install] section — systemd applies that at ENABLE time, where an empty WantedBy=/RequiredBy= is a LIST RESET that makes 'systemctl enable' exit 0 and create NO symlink (measured: \"The unit files have no installation config\", rc=0), so 'installed' would print over a pin that is never enabled; the rendered unit already declares its enablement — remove ${f}"; return 1
+    fi
     refuse_env_mutators "the installed drop-in ${f}" "$body" || return 1
     if [[ $body =~ (^|[[:space:]=])/(private/)?(var/)?tmp/cell-ai(/|[[:space:]]|$) ]]; then
       bad "the installed drop-in ${f} names the provisioning clone (/tmp/cell-ai) — a drop-in OVERRIDES the rendered unit, so rewriting only the unit cannot remove that path; remove ${f} and re-run (a pin unit needs no drop-in)"; return 1
