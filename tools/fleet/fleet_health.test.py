@@ -539,9 +539,16 @@ def leg_lane_census(mod):
         "CENSUS: a FULLY-live roster is silent whatever the process table says",
         "CENSUS: …and silent even when that table cannot be read at all",
     )
-    # ⛔ A MISSING FUNCTION IS A RED, NOT A TRACEBACK. The pre-fix module has no `lane_census`,
-    # and this suite must report that as failed checks so the red control can key on the ❌
-    # markers — a crash would leave stdout without them and read as "no red happened".
+    # ⛔ A MISSING FUNCTION IS A RED IN THE PREDICATE BLOCK, AND THE LIMIT OF THAT IS STATED HERE
+    # (review cycle 14, finding 2). The pre-fix module has no `lane_census`, and this block reports
+    # that as failed checks (❌ on stdout) so the red control can key on the markers rather than on a
+    # silent exit. ⛔ IT DOES NOT MAKE THE WHOLE LEG CRASHPROOF: the `_drive` arms below call
+    # `main()`, which cannot run without the symbol, so a module missing `lane_census` would abort
+    # there — AFTER these ❌ markers have been printed. That is bounded, not read as "no red": every
+    # mutation in `MUTATIONS` KEEPS the symbol (the neuter mutant makes it return None), so no
+    # control run is affected. The PAIR and PRODUCER blocks are guarded so they survive a `None`
+    # function; the `_drive` arms deliberately are not, because there is nothing honest to fabricate
+    # in its place (the checks assert BOTH presence and absence of the same markers).
     fn = getattr(mod, "lane_census", None)
     if fn is None:
         for msg in PREDICATE:
@@ -692,10 +699,10 @@ def leg_lane_census(mod):
         # checks and silently dropping them from the control's verdict. The literal fallbacks carry
         # the same SHAPES the real notes do; that the real notes exist at all is already pinned by
         # PREDICATE[2]/[7] above, so a fallback here cannot mask a missing note.
-        mixed_note = (fn(1, 6, None, 7) or
+        mixed_note = ((fn(1, 6, None, 7) if fn else None) or
                       "LANE CENSUS UNVERIFIED: 1 of the 7 rostered lanes is alive and 6 are "
                       "DEAD/absent, but the process table could not be read — x")
-        all_dead_note = (fn(0, 7, None, 7) or
+        all_dead_note = ((fn(0, 7, None, 7) if fn else None) or
                          "LANE CENSUS UNVERIFIED: all 7 rostered lanes are DEAD/absent and the "
                          "process table could not be read — an idle fleet and a stale roster are "
                          "indistinguishable here, so this is NOT a clean result")

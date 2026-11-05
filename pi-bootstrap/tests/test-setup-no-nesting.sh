@@ -1871,6 +1871,22 @@ time.sleep(60)' "$zpid_file" &
 open(sys.argv[1], "a").close()
 os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   write_prom_store "$$"
+  # ⛔ MAKE THE CPU-DELTA BRANCH DETERMINISTIC (review cycle 14, finding 1). The strict anchor below
+  # requires the lane to be filed as a SUSPECT, and the ladder files one only when it prints a `**`
+  # verdict. It prints the `(identity unmatched — not attributable)` form instead whenever the
+  # recorded pid CONSUMED CPU — so whether this leg passed depended on whether a whole-second
+  # `ps -o cputime=` tick landed between run (g) and this one. That is not a fixture, it is a race.
+  # Seeding the previous snapshot with an IMPOSSIBLY LARGE cpu seconds makes the delta negative, so
+  # the ladder deterministically prints `** SUSPECT: quiet Ns AND no CPU consumed **` and the leg
+  # asserts its stated property rather than whichever branch the host happened to take.
+  # (review cycle 14 also found the previous relaxation WRONG: accepting the
+  # `quiet … identity unmatched — not attributable` row made this leg pass on a body whose summary
+  # read `✅ no suspects` over a 20-minute-stale lane — the exact state its own header says must fail.
+  # The relaxation is gone; only the suspect bullet is accepted again.)
+  mkdir -p "$phome/.pi/agent/state"
+  python3 -c 'import json,sys,time
+json.dump({sys.argv[2]: {"cpu": 1e9, "at": time.time()}}, open(sys.argv[1], "w"))' \
+    "$phome/.pi/agent/state/fleet-health-prev.json" "$$"
   out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: off-fence + stale transcript read PID DEAD"
@@ -1878,19 +1894,10 @@ os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   # census now files `- census: LANE CENSUS MISMATCH ...` in the same list, so on any box with a
   # running `pi` process the generic token is satisfied by the CENSUS ALONE — even when this
   # lane's suspect was dropped, which is exactly the regression this leg exists to catch. Keyed on
-  # the lane bullet so only the lane's own suspect can satisfy it.
-  # ⛔ AND THE LADDER'S VERDICT, NOT ONLY ITS SUSPECT FORM (review cycle 13, finding 3). The new
-  # anchor required a SUSPECT bullet, but the ladder deliberately does not PRODUCE one when the
-  # abstaining lane's recorded pid did consume CPU: the row then reads
-  # `PID ? (off-fence) | quiet 1388s, CPU +1.0s (identity unmatched — not attributable)`, which is
-  # the abstention NOT suppressing the ladder — the very property this leg asserts. A whole-second
-  # `ps -o cputime=` tick between runs (g) and (h) made the leg red and print "read as clean" over a
-  # row that is explicitly not clean. Both are accepted; a row with NO ladder verdict, or a body
-  # whose only bullet is the census's, still fails.
-  elif grep -q "PID ? (off-fence)" <<<"$out" &&
-       { grep -qE '^[[:space:]]+- B1:' <<<"$out" ||
-         grep -qE 'PID \? \(off-fence\) \| (quiet|\*\*)' <<<"$out"; }; then
-    echo "ok: $label an abstaining lane with a stale transcript keeps the ladder's verdict (the abstention does not suppress it)"
+  # the lane bullet so only the lane's own suspect can satisfy it. The delta is seeded above, so the
+  # bullet is deterministic and no relaxation is needed.
+  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -qE '^[[:space:]]+- B1:' <<<"$out"; then
+    echo "ok: $label an abstaining lane with a stale transcript stays a SUSPECT (the abstention does not suppress the ladder)"
   else
     fail "$label: abstention SUPPRESSED the suspect ladder — a stale lane read as clean: $(grep -E '^B1 |no suspects' <<<"$out")"
   fi
