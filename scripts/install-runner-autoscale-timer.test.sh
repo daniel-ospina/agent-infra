@@ -1860,7 +1860,9 @@ rm -f "$ALT"
 
 # ── T65: the launchd arm carries the SAME record guard, and NOTHING pinned it ──────────────
 # `do_install_launchd` calls `refuse_report_only_over_record` exactly as the systemd arm does
-# (`:1443` vs `:1344`), and T11/T22/T64 all exercise the systemd path — the suite's Darwin
+# (line numbers are deliberately NOT cited here: each edit to the installer shifts them, and a stale
+# citation in a comment is the same defect this case exists to catch), and T11/T22/T64 all exercise the
+# systemd path — the suite's Darwin
 # invocations contained no `--report-only` run at all, so DELETING the launchd call measured
 # `PASS=437 FAIL=0`, identical to head: on a Mac that guard could vanish and CI would stay green while
 # `--report-only` shipped the forced-DISARMED plist over a live dated record. Same arrangement as T64
