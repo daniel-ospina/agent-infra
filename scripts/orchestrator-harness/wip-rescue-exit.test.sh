@@ -639,18 +639,52 @@ ck "N4i …and the exit path writes NO upstream for the lane's branch — a dyin
 # cleaned up nothing — measured: two orphaned `bounded.*` dirs per lane exit, which is the accumulation this
 # feature exists to stop. `TB_TIMEOUT_FORCE_INTERNAL=1` is part of the arm: without it this host's GNU
 # `timeout` runs and the arm would measure a path that never touches the scratch dir at all.
-rm -rf "$N4E-tmp"; mkdir -p "$N4E-tmp"
-: > "$O/logs/n4j.log"
-TMPDIR="$N4E-tmp" TB_TIMEOUT_FORCE_INTERNAL=1 bash -c '
-  . "$1"
-  lane_end_push n4j "$2" "$3" advlane 1 1
-  printf "push=%s\n" "$LANE_END_PUSH"
-' _ "$GATE" "$O/logs/n4j.log" "$N4E-lane" 2>/dev/null > "$TMP/n4j.out"
-n4j_dirs="$(ls -d "$N4E-tmp"/bounded.* 2>/dev/null | wc -l | tr -d ' ')"
-# non-vacuity: the internal path really ran and really made the dir (else the count proves nothing)
-grep -q 'bounded\.' "$O/logs/n4j.log" 2>/dev/null || :
-[ "${n4j_dirs:-1}" -eq 0 ] && grep -q 'push=' "$TMP/n4j.out"; rcn4j=$?
-ck "N4j …and the bounded scratch dir is RELEASED rather than orphaned (${n4j_dirs:-?} \`bounded.*\` dirs left after a real exit-path push — the prime covers the proof and symref reads, not just the last two)" $rcn4j
+# ⛔ AND THE REFUSAL PATHS ARE THE ONES THAT NEED IT MOST (review round 4, P2 — REPRODUCED). The first cut
+# drove ONE successful push, so the `tb_bound_cleanup` calls on `refused-pushurl-unresolved`,
+# `refused-pushurl-divergent` and `refused-protected` could all be deleted with the suite still green —
+# measured, deleting 12 of the 13 cleanups left `217 passed`. Each of those returns is on the exit path of a
+# lane that DID create the scratch dir (the prime runs before the push-target resolution), so a dropped
+# cleanup leaks one dir per terminal on exactly the hosts this feature exists for. The loop below drives the
+# three refusals that are constructible from this fixture, each with a FRESH `TMPDIR`, and requires zero
+# leftover dirs in all of them. (`refused-unknown-default` and `push-killed` need a git shim to force the
+# symref/exit-code shape and are covered by the same single statement — the failure they would catch is
+# identical, so they are noted rather than duplicated.)
+n4j_case() { # n4j_case <tag> <root> <branch> -> "push=<v> dirs=<n>"
+  local tag="$1" rt="$2" br="$3" d out v
+  d="$N4E-tmp-$tag"; rm -rf "$d"; mkdir -p "$d"
+  out="$(TMPDIR="$d" TB_TIMEOUT_FORCE_INTERNAL=1 bash -c '
+    . "$1"
+    lane_end_push "$4" /dev/null "$2" "$3" 1 1
+    printf "push=%s\n" "$LANE_END_PUSH"
+  ' _ "$GATE" "$rt" "$br" "$tag" 2>/dev/null | tail -1)"
+  v="$(printf '%s' "$out" | sed -n 's/^push=//p')"
+  printf 'push=%s dirs=%s' "${v:-<none>}" "$(ls -d "$d"/bounded.* 2>/dev/null | wc -l | tr -d ' ')"
+}
+n4j_ok="$(n4j_case ok "$N4E-lane" advlane)"# the lane must have FETCHED for the ancestry to be measurable — otherwise this path is
+# `verify-ancestry-unmeasured`, not `pushed`, and the arm would measure the wrong branch.
+git -C "$N4E-lane" fetch -q origin 2>/dev/null
+n4j_ok="$(n4j_case ok "$N4E-lane" advlane)"
+# a REFUSAL constructible from this fixture: no `origin` at all -> the push target cannot be resolved.
+git -C "$N4E-lane" remote remove origin 2>/dev/null
+n4j_unres="$(n4j_case unres "$N4E-lane" advlane)"
+git -C "$N4E-lane" remote add origin "$GHURL" 2>/dev/null
+# and TWO push urls -> the exit path may not guess which repository receives its ref. TWO, because a
+# single `--add --push` only REPLACES the default pushurl and leaves the count at 1 (measured: that
+# variant recorded refused-unknown-default instead, so the arm would have measured the wrong refusal).
+git -C "$N4E-lane" config --add remote.origin.pushurl "$N4E-origin.git"
+git -C "$N4E-lane" config --add remote.origin.pushurl /tmp/n4j-a.git
+n4j_div="$(n4j_case div "$N4E-lane" advlane)"
+git -C "$N4E-lane" config --unset-all remote.origin.pushurl 2>/dev/null
+# and a LANDING branch -> the push is refused before any network write.
+git -C "$N4E-hub" checkout -q -b n4j-hubside 2>/dev/null
+git -C "$N4E-hub" worktree add -q "$N4E-main" main 2>/dev/null
+n4j_prot="$(n4j_case prot "$N4E-main" main)"
+rm -f /tmp/n4j-a.git
+case "$n4j_ok"  in 'push=pushed dirs=0')                        rcn4j=0 ;; *) rcn4j=1 ;; esac
+case "$n4j_unres" in 'push=refused-pushurl-unresolved dirs=0')  : ;; *) rcn4j=1 ;; esac
+case "$n4j_div"  in 'push=refused-pushurl-divergent dirs=0')     : ;; *) rcn4j=1 ;; esac
+case "$n4j_prot" in 'push=refused-protected dirs=0')             : ;; *) rcn4j=1 ;; esac
+ck "N4j …and the bounded scratch dir is RELEASED on the success path AND on every refusal that runs after the prime (ok=[$n4j_ok] unres=[$n4j_unres] div=[$n4j_div] prot=[$n4j_prot]) — a dropped cleanup leaks one dir per lane exit" $rcn4j
 # ⛔ N4k — EVERY CONSUMER OF THE `push=` DOMAIN, NOT JUST THE TWO THAT WERE REMEMBERED (review round 3,
 # P1 — REPRODUCED). `verify-ancestry-unmeasured` was added to `lane_end_next` and to
 # `lane_end_push_caveat`, but NOT to the `[wip] NOTE` case in `terminal_wip_rescue` — the THIRD consumer —
@@ -660,9 +694,12 @@ ck "N4j …and the bounded scratch dir is RELEASED rather than orphaned (${n4j_d
 # needs a full cap/clean-tree fixture, and what went stale is not the sentence but the DOMAIN LIST — the
 # list is what this pins.
 n4k_body="$(awk '/^terminal_wip_rescue\(\)/,/^}/' "$GATE" 2>/dev/null)"
-[ "$(grep -c 'verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured' <<< "$n4k_body")" = 1 ] \
-  && grep -q 'MIGHT exist only locally' <<< "$n4k_body"; rcn4k=$?
-ck "N4k the [wip] NOTE abstains for EVERY abstaining push verdict, not just the three it was written for — a verdict added to the domain must be found in all THREE consumers, not the two that were remembered" $rcn4k
+n4k_miss=""
+for n4k_v in verify-unanswered push-unreported push-killed verify-ancestry-unmeasured verify-head-unreadable; do
+  grep -q "$n4k_v" <<< "$n4k_body" || n4k_miss="$n4k_miss $n4k_v"
+done
+[ -z "$n4k_miss" ] && grep -q 'MIGHT exist only locally' <<< "$n4k_body"; rcn4k=$?
+ck "N4k the [wip] NOTE abstains for EVERY abstaining push verdict, not just the three it was written for (${n4k_miss:-none missing}) — a verdict added to the domain must be found in all THREE consumers, not the two that were remembered" $rcn4k
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
 # ⛔ N6 — AN UNREADABLE REMOTE ANSWER IS UNKNOWN, NOT "NO PROTECTED NAMES" (review cycle 2, finding 1,
@@ -711,8 +748,21 @@ PATH="$TMP/bin-nohead:$PATH" O="$O" bash -c '
   lane_end_push "no head" /dev/null "$2" durable 1 1
   printf "push=%s" "$LANE_END_PUSH"
 ' _ "$GATE" "$WT2" 2>/dev/null > "$TMP/nohead.out"
-grep -q 'push=FAILED' "$TMP/nohead.out"; rcn8=$?
-ck "N8 …an unreadable HEAD records push=FAILED, never push=pushed (measured: $(head -c 60 "$TMP/nohead.out"))" $rcn8
+grep -q 'push=verify-head-unreadable' "$TMP/nohead.out" && ! grep -q 'push=pushed' "$TMP/nohead.out"; rcn8=$?
+ck "N8 …an unreadable HEAD records verify-head-unreadable, never push=pushed and never FAILED (measured: $(head -c 60 "$TMP/nohead.out")) — FAILED asserted a comparison that was never made" $rcn8
+# ⛔ N8b — AND THE ARTIFACT MAY NOT TURN THAT MISSING COMPARISON INTO A MEASURED ABSENCE (review round 4,
+# P1 — REPRODUCED). `FAILED` used to carry this arm, and both consumers split only on `branch_on_origin`,
+# so a HEAD that could not be read was published as "which is not the HEAD this terminal measured
+# (<unknown>): the commit(s) from this lane were NOT delivered to that ref" — a fabricated absence.
+n8b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_PUSH=verify-head-unreadable; LANE_END_ORIGIN=deadbeefcafe
+  LANE_END_HEAD=; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=durable
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n8b" in MANUAL*'NO COMPARISON WAS MADE'*'NEITHER delivery NOR loss'*) rcn8b=0 ;; *) rcn8b=1 ;; esac
+case "$n8b" in *'were NOT delivered'*|*'NOT on that ref'*) rcn8b=1 ;; esac
+ck "N8b …and next= says NO COMPARISON WAS MADE / asserts neither, and never claims non-delivery [${n8b:0:70}]" $rcn8b
 # ⛔ N8b — and the FIXTURE, not the assertion, is what makes N8 discriminate (cycle 3: the fixture's tree
 # was BEHIND origin/durable, so the pre-fix run died at the non-fast-forward rejection and never reached the
 # unreadable-HEAD branch — the arm passed identically before the fix). This asserts the precondition that
@@ -857,10 +907,10 @@ n14c_child="$(cat "$TMP/n14c-child.pid" 2>/dev/null)"
 ck "N14c the probe is a real caller-group shape (pgid ${n14c_pgid:-?} = pid ${n14c_pid:-?}) and ITS OWN bounded command is running (pid ${n14c_child:-?}) — so the signal below is the fleet's own shape" $rcn14c
 kill -TERM -"${n14c_pid:-0}" 2>/dev/null
 sleep 2
-kill -0 "${n14c_child:-0}" 2>/dev/null; rcn14d=$?
-[ "$rcn14d" -ne 0 ]; rcn14d=$?
+kill -0 "$n14c_child" 2>/dev/null; rcn14d=$?
+[ "$rcn14d" -ne 0 ] && [ -n "${n14c_child:-}" ]; rcn14d=$?
 ck "N14d …and a caller group-TERM reaches the bounded command: the pid THIS arm started is GONE (pre-fix it survived at ppid 1 for its whole bound — the watchdog was ungrouped with it and its trap forwarded nothing)" $rcn14d
-kill -9 "${n14c_child:-0}" 2>/dev/null
+[ -n "${n14c_child:-}" ] && kill -9 "$n14c_child" 2>/dev/null
 # ⛔ AND THE ESCALATION: a command that IGNORES the forwarded TERM must not outlive the reap either, or
 # ungrouping it would have hidden it from the reaper's second (KILL) stage.
 cat > "$TMP/n14e-probe.sh" <<'N14EPROBE'
@@ -879,10 +929,16 @@ sleep 2
 n14e_child="$(cat "$TMP/n14e-child.pid" 2>/dev/null)"
 kill -TERM -"${n14e_pid:-0}" 2>/dev/null
 sleep 3
-kill -0 "${n14e_child:-0}" 2>/dev/null; rcn14e=$?
-[ "$rcn14e" -ne 0 ]; rcn14e=$?
+kill -0 "$n14e_child" 2>/dev/null; rcn14e=$?
+[ "$rcn14e" -ne 0 ] && [ -n "${n14e_child:-}" ]; rcn14e=$?
 ck "N14e …and a TERM-IGNORING command is ESCALATED to SIGKILL by the watchdog, so ungrouping it did not hide it from the reaper's second stage (pid ${n14e_child:-?})" $rcn14e
-kill -9 "${n14e_child:-0}" "${n14c_child:-0}" 2>/dev/null
+# ⛔ NEVER DEFAULT A PID TO `0` (review round 4, P1 — REPRODUCED). `kill -9 "${pid:-0}"` with no pid sends the
+# signal to PROCESS GROUP 0 = the caller's own group: measured, it KILLED THE SUITE mid-run (rc=137, no RESULT
+# line). And `kill -0 0` SUCCEEDS against that group, so the "is it gone?" arms reported GONE while the bounded
+# command was still alive — a false PASS built on the missing datum, on the very boxes (a full disk) where the
+# pid file may not be written. Guard the emptiness; never substitute a pid.
+for n14_p in ${n14e_child:-} ${n14c_child:-}; do [ -n "$n14_p" ] && kill -9 "$n14_p" 2>/dev/null; done
+:
 # ⛔ N15 — THE HUB REFUSAL IS READ, NOT INHERITED (review cycle 4, gap 3: F7 executes the shape but no arm
 # ever greps `refused-main-checkout`, so deleting the block left the suite green — the merge-gate bypass
 # the comment names, undetected).
@@ -2343,7 +2399,7 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
 # ⛔ ONE DEFINITION OF THE MATRIX'S PUSH DOMAIN, SO THE COMPLETENESS ARM BELOW CAN COMPARE AGAINST IT
 # (review round 3, P1). It used to be inline in the `for`, which is why a 16th verdict could be added to
 # `lane_end_push` and silently never exercised.
-n45_push_domain="pushed nothing running unmeasured detached verify-unanswered push-unreported push-killed verify-ancestry-unmeasured FAILED UNAVAILABLE refused-unknown-default refused-protected refused-main-checkout refused-pushurl-divergent refused-pushurl-unresolved"
+n45_push_domain="pushed nothing running unmeasured detached verify-unanswered push-unreported push-killed verify-ancestry-unmeasured verify-head-unreadable FAILED UNAVAILABLE refused-unknown-default refused-protected refused-main-checkout refused-pushurl-divergent refused-pushurl-unresolved"
   for n45_push in $n45_push_domain; do
     for n45_rescue in nothing FAILED UNAVAILABLE archived-local refs/wip/develop; do
       n45_out="$( bash -c '
@@ -2351,6 +2407,7 @@ n45_push_domain="pushed nothing running unmeasured detached verify-unanswered pu
         LANE_END_TREE="$4"; LANE_END_RESCUE="$3"; LANE_END_PUSH="$2"
         LANE_END_UNPUSHED=1; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
         LANE_END_PUSH_URL=/srv/repo.git; LANE_END_REF=refs/wip/develop; LANE_END_ORIGIN="$5"
+        LANE_END_HEAD="$5"
         lane_end_next' _ "$GATE" "$n45_push" "$n45_rescue" "$n45_tree" "$n45_sha" 2>/dev/null )"
       n45_cell="$n45_tree/$n45_push/$n45_rescue"
       n45_all="$n45_all$n45_out"$'\n'
@@ -2423,12 +2480,23 @@ n45_push_domain="pushed nothing running unmeasured detached verify-unanswered pu
       # `unmeasured` remedy names the root and then the enumeration's tail, and NEITHER was asserted:
       # dropping the root argument renders `git -C  rev-list …` and transposing the two renders
       # `git -C develop … origin//tmp/wt..HEAD`, both measured `bad:[none]` with the rescue and tree
-      # caveats swallowed. `git -C ` occurs at most ONCE PER SENTENCE — measured, it appears in 20 of
-      # the 450 cells / 8 of the 90 distinct sentences, and from TWO sites in source (this arm and the
-      # unreachable helper) — so it is a safe anchor on the PER-SENTENCE uniqueness, not on a
-      # product-wide count of one. The
-      # enumeration is asserted by its distinctive tail rather than by `rev-list --count ` alone, because
-      # the same sentence also quotes the NARROWER `origin/<b>..HEAD` form it is contrasted against.
+      # caveats swallowed.
+      # ⛔ AND "AT MOST ONCE PER SENTENCE" IS FALSE FOR THE ARM ADDED IN ROUND 3 (review round 4, P1 —
+      # REPRODUCED): `verify-ancestry-unmeasured` names `git -C` TWICE (the `fetch` and the `merge-base`),
+      # so asserting only that EVERY `git -C ` is followed by the root let the SECOND one be emptied
+      # undetected — deleting one argument left the suite at 217 passed while the sentence rendered
+      # `… then git -C  — AND the uncommitted work … merge-base --is-ancestor  FETCH_HEAD`, i.e. an empty
+      # root slot, the caveat spliced into the middle of the command, and an empty ancestry sha. So the
+      # assertion is now on the COUNT of root-bearing occurrences matching the count of `git -C ` in the
+      # sentence, which covers both arms without hard-coding either number.
+      n45_gitc="$(printf '%s' "$n45_out" | grep -o 'git -C ' | wc -l | tr -d ' ')"
+      n45_gitroot="$(printf '%s' "$n45_out" | grep -o 'git -C /tmp/wt ' | wc -l | tr -d ' ')"
+      [ "${n45_gitc:-0}" = "${n45_gitroot:-0}" ] || n45_bad="$n45_bad $n45_cell(gitroot-slot)"
+      # …and the ancestry REMEDY's own two slots, which the count check alone cannot see (an emptied
+      # ancestry sha still leaves every `git -C ` root-bearing).
+      case "$n45_out" in
+        *'merge-base --is-ancestor '*) case "$n45_out" in *'merge-base --is-ancestor '"$n45_sha"' FETCH_HEAD'*) : ;; *) n45_bad="$n45_bad $n45_cell(ancestry-slot)" ;; esac ;;
+      esac
       case "$n45_out" in *'git -C '*) case "$n45_out" in *'git -C /tmp/wt '*) : ;; *) n45_bad="$n45_bad $n45_cell(gitroot-slot)" ;; esac ;; esac
       case "$n45_out" in *'read it yourself'*) case "$n45_out" in *'rev-list --count HEAD --not --remotes'*) : ;; *) n45_bad="$n45_bad $n45_cell(enum-trap)" ;; esac ;; esac
       # ⛔ THE CAVEAT UNION ARGUMENT IS A SLOT TOO, AND NOTHING ASSERTED IT (review cycle 24, P3 —
@@ -2481,12 +2549,12 @@ ck "N45b …and the matrix really reaches distinct arms (${n45_distinct:-0} dist
 # while the sentence rendered the root into the sha slot and an empty sha into the `git -C` slot. That is
 # precisely the class this matrix exists to catch, defeated by a list nobody re-derived. So the domain is
 # now DERIVED from the source and every assigned value must appear in the list.
-n45_derived="$(grep -o 'LANE_END_PUSH="[a-z][a-z-]*"' "$GATE" 2>/dev/null | sed 's/.*="//; s/"$//' | sort -u)"
+n45_derived="$(grep -o 'LANE_END_PUSH="[^"$][^"]*"' "$GATE" 2>/dev/null | sed 's/.*="//; s/"$//' | sort -u)"
 n45_missing=""
 for n45_v in $n45_derived; do
   grep -q "\\b${n45_v}\\b" <<< "$n45_push_domain" 2>/dev/null || n45_missing="$n45_missing $n45_v"
 done
-[ -z "$n45_missing" ] && [ -n "$n45_derived" ]; n45_bad3=$?
+[ -z "$n45_missing" ] && [ -n "$n45_derived" ] && [ "$(printf '%s\n' $n45_derived | wc -l | tr -d ' ')" -ge 16 ]; n45_bad3=$?
 ck "N45c …and every push verdict the CODE can assign is in the matrix's list, derived from source (${n45_derived_count:-$(printf '%s\n' $n45_derived | wc -l | tr -d ' ')} values${n45_missing:+, MISSING:$n45_missing}) — so a new verdict cannot be forgotten the way this one was" $n45_bad3
 echo
 
