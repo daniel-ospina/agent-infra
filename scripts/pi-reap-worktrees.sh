@@ -2749,6 +2749,15 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         [ -r "$rec" ] || continue
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"
         [ -n "$rec_t" ] || continue
+        # ⛔ THE RECORD'S OWN CONTENT IS HELD TO THE SAME ABSOLUTENESS RULE (#10114 review P1), and the
+        # asymmetry was the tell: the ARM that names the record is guarded above (`:2702`) with the
+        # stated reason "a CWD-relative candidate that IS read", while the CONTENT it reads was not.
+        # `$canon` is absolute (`pwd -P`), so a RELATIVE record can only ever match through `rec_c` —
+        # and `rec_c` resolves it with `cd "$(dirname …)"`, i.e. against the REAPER'S WORKING
+        # DIRECTORY. One box, one record, two cwds, two verdicts; the wrong one is rule 3, which
+        # REMOVES the tree the box executes. Discarded rather than resolved by guesswork, so the
+        # verdict cannot move with the caller (G15o asserts the discard, G15-M7 the discrimination).
+        case "$rec_t" in /?*) : ;; *) continue ;; esac
         # ⛔ THE RECORD IS NORMALISED BEFORE IT IS COMPARED (#10114 review P1). `$canon` comes from
         # `pwd -P`, but a record is taken VERBATIM — so a record spelled through a symlink never
         # matched, and only the shape backstop masked it. That is the shipped Darwin spelling
