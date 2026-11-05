@@ -1340,8 +1340,8 @@ c_carry_resolve() { # <pr-body> <commit-messages> <pr> <repo> <current-head> [<a
 #   ⛔ FAIL-CLOSED POLARITY, NOT A VOCABULARY MATCH. The pass condition is an
 #   ALLOW-LIST of one; an unknown token, an empty answer, a usage error, a
 #   recorder that is absent or unreadable, or a token paired with the wrong exit
-#   code is a REFUSAL. That is deliberate: `--check-carry` documents seven
-#   verdicts today, and a producer that grows an eighth must not be able to make
+#   code is a REFUSAL. That is deliberate: `--check-carry` documents TEN
+#   verdicts today, and a producer that grows an eleventh must not be able to make
 #   this gate green by having produced a token nobody here classified.
 #   (#3440) The allow-list is now TWO tokens, both named explicitly: `carry` and
 #   `red-base-owned` (the record covers the artifact and the only reds reproduce on
