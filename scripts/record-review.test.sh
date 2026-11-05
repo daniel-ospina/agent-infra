@@ -5890,9 +5890,18 @@ echo ""
 # An earlier draft of this header said "Every vector below FAILS without its guard,
 # and the mutation matrix at the end proves that by breaking each guard". That was an
 # OVER-CLAIM, and this file refutes it in three places:
-#   (a) the matrix dispatches 12 cells (`MUTATION-MATRIX(12/12)`), NOT one cell per
-#       arm — its own closing line says the rest are "pinned by refusal vectors only,
-#       not by a mutant";
+#   (a) the matrix dispatches ONE CELL PER ARM THAT HAS A MUTANT, NOT one cell per
+#       refusal vector; its own closing line says the rest are "pinned by refusal
+#       vectors only, not by a mutant". ⛔ NO COUNT IS QUOTED HERE, DELIBERATELY — not
+#       as a digit and not spelled out: an earlier draft of this very comment said
+#       "12 cells (`MUTATION-MATRIX(12/12)`)", and the same commit that added cell M15
+#       left that literal describing the PRE-commit state, so the quoted token was
+#       produced by no run at all. Writing "13" instead, or spelling it out, recreates
+#       the identical staleness the next time a cell is added or retired (M13 was
+#       already retired once, for claiming coverage it did not have). The suite DERIVES
+#       the count and prints `MUTATION-MATRIX($MM_OK/$MM)`, so this comment names the
+#       SHAPE and lets the run carry the number. (Found in review round 2 of PR #3401 —
+#       by the reviewer, in the very header written to remove stale measurements.)
 #   (b) `mrc` has NO mutant and says so at its own vector: removing that test does not
 #       flip the outcome, so M13 was deleted rather than left claiming coverage it did
 #       not have;
