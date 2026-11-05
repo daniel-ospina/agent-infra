@@ -198,6 +198,12 @@ def strip_jsonc(txt):
     return txt
 
 
+def _reject_constant(tok):
+    # ⛔ THE THREE TOKENS `JSON.parse` REFUSES AND PYTHON ACCEPTS (round 23, P2, measured). Raising ValueError puts
+    # them on the same path as any other parse failure, which is the answer pi gives: "discarded", not "valid".
+    raise ValueError("non-JSON numeric constant: %s" % tok)
+
+
 def read_json(path, jsonc=False):
     """R14: pi reads these files with stripBom (and stripJsonComments for models.json) - auth-storage.js:175,305,426,
     settings-manager.js:266, trust-manager.js, model-config.js:116. Python json.load rejects a BOM, so the same file pi
@@ -207,7 +213,13 @@ def read_json(path, jsonc=False):
         txt = f.read()
     if jsonc:
         txt = strip_jsonc(txt)
-    return json.loads(txt)
+    # ⛔ JSON.parse REJECTS `Infinity`/`-Infinity`/`NaN`, PYTHON\x27S json.loads ACCEPTS THEM (round 23, P2, measured):
+    # pi parses models.json/auth.json with a bare `JSON.parse` (`model-config.js:118-131`, `auth-storage.js:301-306`), so
+    # a document carrying `"contextWindow": Infinity` is DISCARDED by pi while this reader returned a value
+    # `_ok_num` graded admissible (`inf > 0`) - a `check=ok` naming a variable from a file pi never loaded, the exact
+    # false-PASS class this file exists to prevent. `parse_constant` is the hook Python offers for precisely those
+    # three tokens; `1e999` (which JSON.parse also turns into Infinity) stays accepted on both sides, as measured.
+    return json.loads(txt, parse_constant=_reject_constant)
 
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -1076,6 +1088,11 @@ key_gate_selected_model() { # <model> <explicit-provider>
       # No matching provider is authenticated.` - a green gate over a model pi will not run. Resolving a bare id
       # needs the model registry and the auth state, so both named shapes abstain and `--provider` is the way to a
       # verdict. An INHERITED model keeps `deepseek`, because `run_agent` really does pass that as `--provider`.
+      # ⛔ ⛔ AND WHERE THE `$PI_LANE_PROVIDER` BRANCH ABOVE IS ACTUALLY REACHED (round 23, P3, measured): `lane.sh` now passes
+      # the pair POSITIONALLY (four arguments), so production never exercises it — only `--probe` and any future
+      # 3-argument caller do. It is a probe convenience, and the arms that pin it (`7c*`/`7f*`) pin the FUNCTION, not
+      # the branch; a lane does not depend on this precedence and cannot, since the provider it is handed is the one
+      # `run_agent` will spawn with.
       case "${1:-}" in
         "") p="deepseek" ;;
         *) p="" ;;
@@ -1138,7 +1155,11 @@ key_gate_settings_pair() { # <file>
 key_gate_box_default() {
   local home="${1:-}" cwd="${2:-}" agent_dir sj="" pj="" out trust rest arc=0 prc=0 use_pj use_sj
   local ascope="" pscope=""
-  local ap="" am="" apmask="aa" ammask="aa" pp="" pm="" pmask="aa" dp dm src psrc msrc
+  # ⛔ NO MASK FOR THE AGENT HALF (round 23, P3, measured): `apmask`/`ammask` were declared and written and NEVER
+  # read - the agent-dir file is the merge BASE, so only `pmask`/`pscope` decide (`key_gate_box_default`'s merge
+  # below). They are gone rather than left as names that read as protection: "dead code in a gate is worse than a
+  # missing arm".
+  local ap="" am="" pp="" pm="" pmask="aa" dp dm src psrc msrc
   agent_dir="$(key_gate_agent_dir "$home" "$cwd")"
   [ -n "$agent_dir" ] || { printf 'unreadable\t\t\t%s\n' "<no-agent-dir>"; return 0; }
   sj="$agent_dir/settings.json"
@@ -1146,7 +1167,8 @@ key_gate_box_default() {
     if [ -n "$out" ]; then
       ap="${out%%$'\t'*}"; rest="${out#*$'\t'}"
       am="${rest%%$'\t'*}"; rest="${rest#*$'\t'}"
-      ammask="${rest%%$'\t'*}"; ascope="${rest#*$'\t'}"
+      # the agent half needs no mask: it is the BASE the project half merges onto (round 23, P3)
+      ascope="${rest#*$'\t'}"
     fi
   else
     arc=3
