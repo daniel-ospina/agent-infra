@@ -289,17 +289,27 @@ lane".
 `UNMEASURED`, not `not_found` — the lane may simply be on a box this read cannot see.
 
 **Both are reads. There is no flag that makes the server write**, and the surface is **pinned by a test**
-(`test_S3_the_surface_is_EXACTLY_two_read_only_tools`): adding a third tool reddens CI. That is what makes
-"do not expand the surface without owner approval" enforceable rather than aspirational.
+(`test_S3_the_surface_is_EXACTLY_the_approved_set_with_all_four_annotations`, which replaced
+`test_S3_the_surface_is_EXACTLY_two_read_only_tools` when Phase 2 landed): the pin is now the **exact
+approved set** — 11 tools / 12 names — and every tool's **four** MCP annotations, so a thirteenth name or a
+tool that omits an annotation reddens CI. That is what makes "do not expand the surface without owner
+approval" enforceable rather than aspirational.
 
 The server reports `registry_sha256` on `initialize` and on every payload, so a **stale deployed copy is
 detectable** (#3382 invariant 5; the incident is #3016's 151-commits-behind checkout whose `scripts/` was
-older than the box claimed).
+older than the box claimed). **And it now refuses to start** when any wrapped module is missing (exit 3,
+naming it) — `instrument_versions()` lists each module's path + sha256, and a missing one is a refusal, not
+a degraded answer.
 
-⛔ **Proposed, NOT approved — Phase 2 of #3382, awaiting an owner decision:** `lane.tree`,
+⛔ **BUILT IN PHASE 2 — the surface below is no longer proposed, and three of the names are not tools:**
+`lane.tree` **merged into** `lane.list`/`lane.show` (`tree: true`), `lane.message` **dropped**
+(`safe-send.sh`/`orch-send.sh` already serve it end to end), `verify.independent` **deferred** to its own
+issue. What shipped, with each tool's wrap target and the half that had to be written: see
+[`orchestrator-mcp-inventory.md`](orchestrator-mcp-inventory.md) **§5.10**.
+<!-- former text, kept so the change is legible rather than silent:
 `lane.artifact`, `lane.dispatch`, `lane.message`, `box.exec`, `fleet.census`, `pr.queue`, `claim.check`,
 `review.record`, `verify.independent`, `closure.audit`, `reminder.*`, `beat.checkpoint`. Their wrap targets
-are inventoried in [`orchestrator-mcp-inventory.md`](orchestrator-mcp-inventory.md) §5; none is built here.
+are inventoried in `orchestrator-mcp-inventory.md` §5; none is built here. -->
 
 ---
 
