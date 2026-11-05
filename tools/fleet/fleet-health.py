@@ -235,7 +235,9 @@ def lane_census(alive, dead, pi_count, roster_size):
         # to decide is whether that roster still describes the box — the population does that:
         #   * UNREADABLE table (`None`)  -> undecidable: an idle fleet and a stale roster look the
         #                                  same, so it is named, NOT rendered as the clean one;
-        #   * MEASURED empty table       -> nothing is running; the roster is fully resolved;
+        #   * MEASURED empty table       -> the population has NOTHING TO CONTRADICT: with no lane
+        #                                  live (tested FIRST, below) the resolved roster is the
+        #                                  whole picture and there is nothing to reconcile against;
         #   * some lane alive            -> the roster accounts for at least one running process;
         #   * every lane DEAD while pi runs -> a STALE ROSTER (this is the branch cycle 6 lacked).
         if pi_count is None:
@@ -247,9 +249,21 @@ def lane_census(alive, dead, pi_count, roster_size):
                     "DEAD/absent, but the process table could not be read — the population "
                     "cannot be reconciled against the roster, so this is NOT a clean result"
                     % (alive, roster_size, dead))
-        if pi_count <= 0:
-            return None
+        # ⛔ A POSITIVE PER-LANE READ IS TESTED **BEFORE** THE EMPTY POPULATION (review cycle 16,
+        # finding 1) — the ORDER is the fix, not a style choice. The two counts measure DIFFERENT
+        # predicates: `alive` is the identity probe binding a RECORDED PID to a live incarnation
+        # (the pid exists and its start time matches); `pi_count` counts `ps` rows whose argv0
+        # BASENAME is exactly `pi`. A lane launched through a wrapper or an interpreter records
+        # argv0 `node`/`bash`, so `alive > 0` beside a MEASURED-EMPTY population is a NORMAL state,
+        # not a contradiction. The previous ordering let the `pi_count <= 0` arm answer it first,
+        # justified by a comment — "nothing is running" — that is provably FALSE whenever a lane is
+        # live: a lane positively bound to a live incarnation IS a running process. Measured before
+        # the reorder: `lane_census(2, 5, 0, 7)` and `lane_census(2, 1, 0, 7)` both returned None
+        # through that arm. Same verdict, honest reason, and the exemption can no longer be split
+        # from the arm it governs by a later edit.
         if alive:
+            return None
+        if pi_count <= 0:
             return None
         return ("LANE CENSUS STALE ROSTER: all %d rostered lanes are DEAD/absent but %d pi "
                 "process(es) are running — the roster names NONE of them, so it no longer "
@@ -260,8 +274,11 @@ def lane_census(alive, dead, pi_count, roster_size):
                 "verdict (%d alive, %d dead) and the process table could not be read — the scan "
                 "is UNMEASURED, not clean" % (established, roster_size, alive, dead))
     if pi_count <= 0:
-        # Nothing is running at all: an inconclusive roster cannot mislead about a box with no
-        # processes, so there is nothing to reconcile against.
+        # The population is MEASURED EMPTY, so it can CONTRADICT nothing — a MISMATCH needs at least
+        # one pi process the roster does not account for. ⛔ NOT "nothing is running at all" (review
+        # cycle 16, finding 1): `alive` may be non-zero here (e.g. `lane_census(2, 1, 0, 7)`), for the
+        # argv0 reason documented in the complete-roster arm above. An inconclusive roster cannot
+        # mislead about a box whose population contradicts nothing.
         return None
     return ("LANE CENSUS MISMATCH: %d pi process(es) running but only %d of the %d rostered lanes "
             "has a conclusive verdict (%d alive, %d dead) — the roster is stale on this box or "

@@ -58,7 +58,7 @@ patched for the duration of a leg and restored in a `finally`, so nothing touche
 or the real launchd.
 
 ⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
-(**seven** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
+(**eight** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
 once PER RECORDED LANE for three distinct reads: a lane-row `cputime_secs`, one `_observed` ->
 `scripts/lib/pid-identity.sh probe`, and a `cputime_secs` from the STATE snapshot write the
 enumeration runs for every recorded pid. Per recorded lane that is 3; what each arm actually
@@ -69,8 +69,8 @@ reaches:
   * the TWO HOLDER arms (`rc_live`, `rc_liveu`) — seven records: 2 × 7 = **14 each**, because
     `_observed` is stubbed to `holder`, so only the two `cputime_secs` reads per record remain;
   * the abstaining-record arm — one record reading `os.getpid()`, bound 3;
-  * the two default-store arms — no ROSTERED record (`_drive`'s default store holds two
-    non-rostered sessions), so they reach the table **zero** times.
+  * the THREE default-store arms (`pi=9`, `pi=None`, `pi=0`) — no ROSTERED record (`_drive`'s
+    default store holds two non-rostered sessions), so they reach the table **zero** times.
 
 Every one of the fixture-based reads targets the FIXTURE's pid (`99999999`), so they are not "about
 THIS process". The abstaining-record arm is the one that reads `os.getpid()`
@@ -543,6 +543,8 @@ def leg_lane_census(mod):
         "CENSUS: an all-dead roster over an UNREADABLE table is UNVERIFIED, never clean",
         "CENSUS: a FULLY-live roster is silent whatever the process table says",
         "CENSUS: …and silent even when that table cannot be read at all",
+        "CENSUS: a live lane outranks a MEASURED-EMPTY population at a COMPLETE roster",
+        "CENSUS: …and at an INCOMPLETE one — an empty population contradicts nothing",
     )
     # ⛔ A MISSING FUNCTION IS A RED IN THE PREDICATE BLOCK, AND THE LIMIT OF THAT IS STATED HERE
     # (review cycle 14, finding 2). The pre-fix module has no `lane_census`, and this block reports
@@ -586,6 +588,14 @@ def leg_lane_census(mod):
         # UNREADABLE table is silent (the roster IS the box) where a partly-live one is UNVERIFIED.
         check(fn(7, 0, 18, 7) is None, PREDICATE[8])
         check(fn(7, 0, None, 7) is None, PREDICATE[9])
+        # ⛔ A LIVE LANE OUTRANKS A MEASURED-EMPTY POPULATION (review cycle 16, finding 1). These two
+        # shapes were SILENT but pinned by nothing, and their silence rested on a comment that
+        # claimed "nothing is running" while a lane was provably live. The verdict is deliberate
+        # (`alive` is an identity-probe read of a RECORDED pid; `pi_count` counts a DIFFERENT
+        # predicate — argv0 basename exactly `pi` — so a wrapped/interpreter launch legitimately
+        # yields 0), and the pins are what stop the exemption from being split from its arm.
+        check(fn(2, 5, 0, 7) is None, PREDICATE[10])
+        check(fn(2, 1, 0, 7) is None, PREDICATE[11])
         # ⛔ "A CONCLUSIVE VERDICT" IS NOT "THE ROSTER ACCOUNTS FOR THE BOX" (review cycle 7,
         # finding 1). This check used to read `check(fn(0, 7, 1, 7) is None, "an ACCURATE roster
         # whose lanes have all exited raises nothing")` — and that LABEL WAS FALSE: with
