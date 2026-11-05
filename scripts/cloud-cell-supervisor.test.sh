@@ -809,7 +809,7 @@ AUTH="$F/home/.pi/agent/auth.json"
 # absence (the idiom this suite already uses: never two absences).
 cellcheck 0
 case "$CC_OUT" in
-  *"the provider store holds a 'deepseek' credential"*) ok "check: reads the store and names the credential it found" ;;
+  *"the provider store holds a usable 'deepseek' credential"*) ok "check: reads the store and names the credential it found" ;;
   *) bad "check: never reported the provider store it is supposed to read — output: $CC_OUT" ;;
 esac
 # (b) Empty store, but `keys.env` carries the key: delivered, so the box CAN answer — a WARN, not a
@@ -861,7 +861,7 @@ cellcheck 0
 [ "$CC_RC" -ne 0 ] && ok "check REFUSES a store entry pi cannot read (key is not a string)" \
                    || bad "check counted a malformed entry as a usable credential — pi throws on that file"
 case "$CC_OUT" in
-  *"pi cannot READ"*) ok "…naming the entry, not the provider or the network" ;;
+  *"pi REJECTS"*) ok "…naming the entry, not the provider or the network" ;;
   *) bad "the malformed-entry refusal is not explained: $CC_OUT" ;;
 esac
 # (f) An OAUTH entry WITH an access token is a real credential pi can use (`auth-storage` accepts
