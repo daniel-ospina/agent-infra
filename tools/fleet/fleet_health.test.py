@@ -719,8 +719,13 @@ def leg_lane_census(mod):
         # notes with `fn()` alone made this block CRASH under the red control's "neuter" mutant
         # (which makes `lane_census` return None), aborting the leg BEFORE the three paired `_drive`
         # checks and silently dropping them from the control's verdict. The literal fallbacks carry
-        # the same SHAPES the real notes do; that the real notes exist at all is already pinned by
-        # PREDICATE[2]/[7] above, so a fallback here cannot mask a missing note.
+        # the same SHAPES the real notes do; that the real notes exist at all is already pinned,
+        # so a fallback here cannot mask a missing note. ⛔ CITE THE RIGHT PINS (review cycle 18,
+        # finding 2): `PREDICATE[2]` pins the UNRECONCILED shape `fn(0,0,None,7)` and `PREDICATE[7]`
+        # pins the ALL-DEAD note — neither is the MIXED shape `fn(1,6,None,7)` behind `mixed_note`
+        # below. What pins that one is the "PARTLY-live roster over an UNREADABLE table" pair above
+        # (which goes red under every mutant that silences the mixed arm), and PREDICATE[7] pins the
+        # all-dead fallback's counterpart.
         mixed_note = ((fn(1, 6, None, 7) if fn else None) or
                       "LANE CENSUS UNVERIFIED: 1 of the 7 rostered lanes is alive and 6 are "
                       "DEAD/absent, but the process table could not be read — x")

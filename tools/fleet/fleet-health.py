@@ -255,9 +255,12 @@ def lane_census(alive, dead, pi_count, roster_size):
         # (review cycle 17, finding 1 — the earlier wording here claimed this reorder was "the fix"
         # and that a pin "stops the exemption being split from its arm". Both claims were FALSE: BOTH
         # arms `return None`, so the ORDER IS UNOBSERVABLE through the verdict, and a verdict-level
-        # pin cannot see it. Measured against the pre-fix MODULE (the shipped base, which is a
-        # DIFFERENT thing from this ordering): 37 of the leg's census checks are red, so the pins are
-        # sensitive to the FIX and blind to the ORDER. So this is stated for what it is —
+        # pin cannot see it. Measured against the pre-fix MODULE on a box whose identity probe
+        # resolves (the shipped base — a DIFFERENT thing from this ordering): `71 passed, 37 failed`
+        # = 32 `CENSUS` + 4 `EXITLINE` + 1 ambient `HARNESS`, i.e. 36 census checks red (the 37th
+        # `❌` is the ambient HARNESS failure, red on the UNMUTATED module too — quoting 37 as a
+        # CENSUS count is the same two-populations conflation this file exists to keep apart). So
+        # the pins are sensitive to the FIX and blind to the ORDER. This is stated for what it is —
         # the comment now matches the code it sits on, and the exemption sits adjacent to the arm it
         # governs so the two cannot drift apart unnoticed. The value is the HONEST REASON and the
         # PINS below, not an ordering guarantee.
