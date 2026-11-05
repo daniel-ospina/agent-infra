@@ -323,6 +323,13 @@ _check_refusal "MAX=8 MAX_TOTAL=0"  "REFUSED: MAX_TOTAL="  "aggregate clause '[ 
 _check_refusal "INTERVAL=abc"       "REFUSED: INTERVAL="   "spins against the shared REST bucket"
 _check_refusal "INTERVAL=0"         "REFUSED: INTERVAL="   "not a POSITIVE integer"
 _check_refusal "RED_CAP=abc"        "REFUSED: RED_CAP="    "silently truncates the red list"
+# …and the three knobs #3489 adds (plus COOLDOWN_TRANSIENT_S, which was unvalidated for the same reason
+# and is compared in the same arithmetic: a non-numeric value makes `[ "$age" -lt "$_cool" ]` an ERROR,
+# which reads as FALSE — i.e. no cooldown at all, re-railing/re-reviewing every pass).
+_check_refusal "REVIEW_COOLDOWN_S=abc" "REFUSED: REVIEW_COOLDOWN_S=" "no cooldown at all"
+_check_refusal "REVIEW_COOLDOWN_S=0"   "REFUSED: REVIEW_COOLDOWN_S=" "already being reviewed"
+_check_refusal "REVIEW_PER_PASS=abc"   "REFUSED: REVIEW_PER_PASS="   "not a non-negative integer"
+_check_refusal "COOLDOWN_TRANSIENT_S=abc" "REFUSED: COOLDOWN_TRANSIENT_S=" "is not a positive integer"
 
 # ⛔ THE RAIL-VERDICT DIRECTORY IS A PRECONDITION TOO — and its absence used to be invisible: a launch
 # whose redirect cannot be opened returns 0 to the caller, so the log said `launching rail` for a rail
@@ -550,6 +557,182 @@ _redout=$(PATH="$_badbin:$PATH" python3 "$_pysrc" daniel-ospina/tortoise 1 2>"$_
 [ "$_redout" = "$(printf 'red\t9\tat-head')" ] \
   || bad "RED_CAP=1 must be spent on the ATTESTED red (#9 \u2014 the rail can land it) and NOT on the unattested #8, which no review could help until its head changes (got: '$_redout')"
 rm -rf "$_pydir" "$_badbin" "$_sutlog"
+
+# ══ THE REVIEW STEP: THE THREE STATES, EACH NAMED FOR THE FAILURE IT PREVENTS (#3489) ═════════════
+# The loop itself cannot be executed here (it is `while :` around a live gh/ps/supervisor pass — see the
+# header), so this section drives the SHIPPED functions the review branch is built from, in the order the
+# loop calls them, against a stubbed `gh` and a stubbed reviewer. What each arm pins is stated with it.
+eval "$(sed -n '/^review_state() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^review_dispatched_at() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^review_action() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^review_should_defer() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^publish_review_state() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^run_review() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^launch_review() {/,/^}$/p' "$SUT")"
+for _fn in review_state review_dispatched_at review_action review_should_defer publish_review_state run_review launch_review; do
+  command -v "$_fn" >/dev/null || { echo "FATAL: $_fn not found in $SUT"; exit 2; }
+done
+# ⛔ `run_review` MUST BE EXPORTED IN THE SUT, and this arm is not decoration: `launch_review` runs it
+# inside `nohup bash -c`, which cannot see a shell function that was not exported. Un-exported, the child
+# dies with "command not found", the wrapper never writes `REVIEW-EXIT` (the wrapper IS the wrapper), and
+# every dispatched review reads as `none` — i.e. the head is re-dispatched every pass, which is the paid
+# thrash the state machine exists to prevent. Measured here first: without the export, these arms fail.
+grep -qx 'export -f run_review' "$SUT" \
+  || bad "run_review must be exported in $SUT — launch_review calls it through 'bash -c', so an unexported wrapper makes every dispatch invisible"
+export -f run_review
+REVIEW_COOLDOWN_S=2700
+COOLDOWN_TRANSIENT_S=900
+LAUNCH_VERIFY_S=1
+# ⛔ THE STUB `gh` IS A RECORDING ONE: `pr view … --json comments` replays what has been posted, and
+# `pr comment` APPENDS to the replay — so "does a second cycle add a second marker?" is answered by the
+# stub's own state, not by a hand-written expectation.
+_ghdir=$(mktemp -d); mkdir -p "$_ghdir/bin"
+COMMENTS="$_ghdir/comments.txt"; POSTED="$_ghdir/posted.txt"; : > "$COMMENTS"; : > "$POSTED"
+export COMMENTS POSTED
+cat > "$_ghdir/bin/gh" <<'GH'
+#!/bin/bash
+case "$1 $2" in
+  "pr view")   if [ "${GH_READ_FAILS:-0}" = 1 ]; then exit 1; fi; cat "$COMMENTS" ;;
+  "pr comment") shift 3; _b=""
+                while [ "$#" -gt 0 ]; do case "$1" in --body) _b=$2; shift 2;; *) shift;; esac; done
+                printf '%s\n' "$_b" >> "$COMMENTS"; printf '%s\n' "$_b" >> "$POSTED" ;;
+  *) exit 2 ;;
+esac
+GH
+chmod +x "$_ghdir/bin/gh"
+_oldpath=$PATH
+PATH="$_ghdir/bin:$PATH"
+_rdir=$(mktemp -d)
+H=3333333333333333333333333333333333333333
+_marker_count() { grep -cF -- "<!-- auto-rail-review:$1" "$POSTED" 2>/dev/null || true; }
+
+# ── STATE 1 — ATTESTED AT HEAD: the rail runs, no reviewer is dispatched ──────────────────────────
+# (Pinned where the decision is MADE, in the search arms above: `green 7 at-head`.) What this arm adds
+# is the other half — that the review branch is NOT entered, and cannot launch a rail of its own.
+_branch=$(sed -n '/if \[ "\$_att" != at-head \]; then/,/^      # The rail writes its verdict/p' "$SUT")
+[ -n "$_branch" ] || bad "could not locate the review branch in $SUT — the arms below would then pin nothing"
+case "$_branch" in
+  *launch_rail*) bad "the REVIEW branch must not launch a rail: the rail refuses a PR with no head-bound record in one line and burns a MAX slot, which is exactly what this change stops. (The rail IS launched on the at-head path, further down.)" ;;
+esac
+case "$_branch" in
+  *launch_review*) ;;
+  *) bad "the review branch must DISPATCH the reviewer — without it a mergeable, unattested PR still has no owner (#3489)" ;;
+esac
+case "$_branch" in
+  *publish_review_state*) ;;
+  *) bad "the review branch must PUBLISH the state on the PR — a state only this log knows is indistinguishable from waiting on a lane" ;;
+esac
+# …and a dispatch may never be invisible: the IN-FLIGHT marker is published BEFORE the launch. The two
+# call shapes are named exactly, because a looser match is satisfied by the found-issues publish further
+# up the branch — measured: deleting the in-flight publish entirely left a loose order assertion GREEN.
+_pub_ln=$(printf '%s\n' "$_branch" | grep -nF 'publish_review_state "$repo" "$pr" review-in-flight "$head"' | head -1 | cut -d: -f1)
+_lau_ln=$(printf '%s\n' "$_branch" | grep -nF 'launch_review "$repo" "$pr" "$head" "$_rout"' | head -1 | cut -d: -f1)
+[ -n "$_pub_ln" ] && [ -n "$_lau_ln" ] && [ "$_pub_ln" -lt "$_lau_ln" ] \
+  || bad "the in-flight marker must be published BEFORE the reviewer is dispatched (in-flight publish at line ${_pub_ln:-MISSING}, launch at line ${_lau_ln:-MISSING}) — a launch that is never announced leaves a dispatched, paid review invisible on the PR"
+# The review cooldown key is the HEAD, not the PR: keyed on the PR alone, a new head would inherit the
+# old head's record and the loop would hold a fixable PR for REVIEW_COOLDOWN_S for no reason.
+_rout_line=$(sed -n 's/^[[:space:]]*_rout="\(.*\)"$/\1/p' "$SUT")
+case "$_rout_line" in
+  *'$pr-$head.out') ;;
+  *) bad "the review record must be keyed by the HEAD (got '$_rout_line') — that key IS the head-keyed cooldown this step reuses" ;;
+esac
+
+# ── STATE 2 — ABSENT OR STALE AT HEAD: a reviewer IS dispatched, and the marker appears ONCE ─────
+_rout="$_rdir/review-acme-widget-42-$H.out"
+[ "$(review_state "$_rout")" = none ] \
+  || bad "a head with NO dispatch record must read 'none', not 'pending' — 'pending' makes the loop WAIT ${REVIEW_COOLDOWN_S}s on a review nobody ever dispatched (this is the PR #3486 state, and it would be indistinguishable from progress)"
+review_action "$(review_state "$_rout")" 0; [ $? -eq 1 ] \
+  || bad "an unattested head with no dispatch must DISPATCH NOW (rc 1) — any other answer leaves #3489 in place"
+publish_review_state acme/widget 42 review-in-flight "$H" || bad "the in-flight marker must publish"
+[ "$(_marker_count 'review-in-flight')" = 1 ] || bad "the in-flight marker must appear exactly ONCE (got $(_marker_count 'review-in-flight'))"
+# ⛔ THE IDEMPOTENCE ARM: a second cycle in the SAME state must add nothing. Without it the loop posts
+# a fresh marker every 180 s, which is how a state marker becomes noise nobody reads — and the reviewer
+# it announces is dispatched once, so the duplicate would also be a false claim about a second run.
+publish_review_state acme/widget 42 review-in-flight "$H"
+[ "$(_marker_count 'review-in-flight')" = 1 ] \
+  || bad "re-running in the same state added a SECOND marker (got $(_marker_count 'review-in-flight')) — the marker is keyed by state+head precisely so a re-run is a no-op"
+# …and a DIFFERENT head is a different key: a new dispatch after a push must be visible.
+publish_review_state acme/widget 42 review-in-flight 4444444444444444444444444444444444444444
+[ "$(_marker_count 'review-in-flight')" = 2 ] \
+  || bad "a NEW head must be able to publish its own in-flight state (got $(_marker_count 'review-in-flight')) — a state marker that outlives its head reads as a live review of code nobody is reviewing"
+# ⛔ A FAILED READ MUST NOT POST. This script has no `pipefail`: a `gh` that cannot run leaves the read
+# empty, which reads as "no marker" and posts a duplicate on EVERY pass — the thrash produced by the
+# check that implements idempotence. Measured pattern (round 5-6 of this file): a fail-open in the guard.
+GH_READ_FAILS=1 publish_review_state acme/widget 42 review-in-flight "$H" && bad "an unreadable comment list must NOT publish (a blind post is a duplicate every pass)"
+[ "$(_marker_count 'review-in-flight')" = 2 ] || bad "an unreadable comment list posted anyway (got $(_marker_count 'review-in-flight'))"
+unset GH_READ_FAILS
+
+# ── THE BURST BOUND: one repo cannot empty its whole queue into paid reviewers in one pass ───────
+# Measured while implementing this: agent-infra had 8 mergeable PRs with NO record and 16 with a STALE one,
+# tortoise 4 and 12 — 40 mergeable PRs this step now owns. The per-repo cap in this file counts LIVE RAILS
+# (reviews are not `admin-merge` processes), so it cannot bound a review burst.
+REVIEW_PER_PASS=1
+review_should_defer 0 && bad "with nothing dispatched this pass, the first review must DISPATCH (the bound must not stall the queue)"
+review_should_defer 1 || bad "with this repo's one dispatch spent, the next review must DEFER (REVIEW_PER_PASS=1) — otherwise the first pass starts one paid reviewer per mergeable-unattested PR"
+REVIEW_PER_PASS=2
+review_should_defer 1 && bad "REVIEW_PER_PASS must be READ, not hardcoded to 1 (the counter is what bounds the burst)"
+review_should_defer 2 || bad "at the raised cap the bound must still bite"
+REVIEW_PER_PASS=1
+# …and the counter must be RESET PER REPO, or the second repo of every pass gets no reviews at all.
+grep -qE '^[[:space:]]*_rdispatched=0$' "$SUT" \
+  || bad "the per-pass review counter must be RESET per repo (a bare _rdispatched=0 before the candidate loop) — spent on repo A, it would silently deny repo B every pass"
+grep -qE '^[[:space:]]*_rdispatched=\$\{\{[^}]*\}\}|^[[:space:]]*_rdispatched=\$\(\(' "$SUT" \
+  || bad "the per-pass review counter must be INCREMENTED after a dispatch — a counter that is never incremented makes REVIEW_PER_PASS inert (an unbounded burst with a bound in the source)"
+# ── STATE 3 — REVIEW IN FLIGHT: the next cycle WAITS (no second dispatch, no second marker) ──────
+# ⛔ THE ANTI-THRASH ARM. This is the state a slow review is in for 5-30 minutes, i.e. 2-10 passes.
+_fakerev=$(mktemp); printf '#!/bin/bash\necho "reviewing"\nsleep 30\n' > "$_fakerev"; chmod +x "$_fakerev"
+REVIEW_SCRIPT="$_fakerev"
+launch_review acme/widget 42 "$H" "$_rout" || bad "the dispatch must start (record written, child alive)"
+[ "$(review_state "$_rout")" = pending ] \
+  || bad "a dispatch that has produced no exit line is PENDING (got '$(review_state "$_rout")') — a live review read as a failure gets a duplicate paid for next pass"
+review_action pending 0; [ $? -eq 0 ] || bad "a fresh pending review must WAIT (no second dispatch)"
+review_action pending $(( REVIEW_COOLDOWN_S - 1 )); [ $? -eq 0 ] || bad "one second INSIDE the cooldown must still WAIT — the boundary is the whole arm"
+review_action pending $(( REVIEW_COOLDOWN_S + 1 )); [ $? -eq 1 ] || bad "a pending review past the cooldown must be RETRIED — `review-pr.sh` caps itself at 1800 s, so 2700 s of silence is not a slow review, it is a dead one, and waiting for ever is a stall"
+# the second cycle publishes nothing (same state+head), and the age comes from the RECORD
+publish_review_state acme/widget 42 review-in-flight "$H"
+[ "$(_marker_count 'review-in-flight')" = 2 ] || bad "the waiting cycle added a marker (got $(_marker_count 'review-in-flight'))"
+_ep=$(review_dispatched_at "$_rout")
+case "${_ep:-}" in ''|*[!0-9]*) bad "the dispatch epoch must be readable from the record (got '${_ep:-}')" ;; esac
+# ⛔ mtime IS NOT THE DISPATCH TIME: a reviewer that keeps writing output keeps refreshing mtime, so an
+# mtime-keyed cooldown would never age out on exactly the reviews that are slowest.
+touch -t 200001010000 "$_rout"
+_ep2=$(review_dispatched_at "$_rout")
+[ "$_ep2" = "$_ep" ] && [ "$_ep2" -gt 946684800 ] \
+  || bad "the dispatch age must come from the RECORD, not the file's mtime (record=$_ep after touch=$_ep2)"
+rm -f "$_fakerev"
+
+# ── THE OUTCOME IS DURABLE: the wrapper writes the exit line UNCONDITIONALLY ────────────────────
+# A background child's status is unobservable from a later pass, so `review-pr.sh`'s rc IS the outcome
+# and must be recorded by the wrapper — including when the reviewer never really ran.
+_rev_issues=$(mktemp); printf '#!/bin/bash\necho "P0 something"\nexit 7\n' > "$_rev_issues"; chmod +x "$_rev_issues"
+_r2="$_rdir/r2.out"; run_review "$_rev_issues" 42 acme/widget "$_r2"
+[ "$(review_state "$_r2")" = issues ] || bad "rc=7 (the reviewer FOUND ISSUES) must read as 'issues' (got '$(review_state "$_r2")')"
+review_action issues 0; [ $? -eq 2 ] \
+  || bad "a head the reviewer already REJECTED must be TERMINAL — re-dispatching it buys the SAME verdict again, for ever, at review prices (this is the paid loop the state machine exists to prevent)"
+publish_review_state acme/widget 42 review-found-issues "$H"
+[ "$(_marker_count 'review-found-issues')" = 1 ] || bad "the found-issues state must be published once (got $(_marker_count 'review-found-issues'))"
+_rev_clean=$(mktemp); printf '#!/bin/bash\nexit 0\n' > "$_rev_clean"; chmod +x "$_rev_clean"
+_r3="$_rdir/r3.out"; run_review "$_rev_clean" 42 acme/widget "$_r3"
+[ "$(review_state "$_r3")" = clean ] || bad "rc=0 must read as 'clean' (got '$(review_state "$_r3")')"
+review_action clean 0; [ $? -eq 2 ] \
+  || bad "a CLEAN review whose marker the body does not carry yet must not be re-dispatched — re-running the recorder is the remedy, and a fresh review neither helps nor is honest"
+_rev_load=$(mktemp); printf '#!/bin/bash\nexit 75\n' > "$_rev_load"; chmod +x "$_rev_load"
+_r4="$_rdir/r4.out"; run_review "$_rev_load" 42 acme/widget "$_r4"
+[ "$(review_state "$_r4")" = retry ] || bad "rc=75 (a load refusal: nothing was consumed) must read as 'retry' (got '$(review_state "$_r4")')"
+review_action retry 0; [ $? -eq 0 ] || bad "a load refusal must WAIT out the short retry window, not re-dispatch into a still-busy box"
+review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )); [ $? -eq 1 ] || bad "a refusal past the short window must be retried"
+# ⛔ A REVIEWER THAT DIES AT ONCE STILL LEAVES AN OUTCOME. `bash /nonexistent` exits 127; without the
+# unconditional exit line the state would be `pending` for ever and the head would never be retried.
+_r5="$_rdir/r5.out"; run_review /nonexistent/reviewer.sh 42 acme/widget "$_r5"
+[ "$(review_state "$_r5")" = retry ] \
+  || bad "a reviewer that never ran must leave a RETRYABLE outcome (got '$(review_state "$_r5")') — a permanent 'pending' is a head nobody will ever look at again"
+# ── AND A DISPATCH THAT CANNOT EVEN RECORD ITSELF CONSUMES NOTHING (mirrors `launch_rail`) ──────
+: > "$_sutlog"
+launch_review acme/widget 42 "$H" /proc/no/such/dir/r6.out 2>/dev/null && bad "a dispatch that cannot write its record must not read as started"
+grep -q 'REVIEW-LAUNCH-FAILED' "$_sutlog" || bad "the failed dispatch must name itself in the log (a dispatch nobody records is a review nobody knows about)"
+rm -f "$_rev_issues" "$_rev_clean" "$_rev_load"
+PATH=$_oldpath
+rm -rf "$_ghdir" "$_rdir"
 
 [ "$fail" = 0 ] && echo "PASS: per-repo accounting launches a starved repo's candidate, identifies repos by owner/name, still bounds one repo, counts unknown load against everyone, and verifies its launches"
 exit "$fail"

@@ -107,6 +107,32 @@ case "${RED_CAP}" in ''|*[!0-9]*)
 LAUNCH_VERIFY_S=${LAUNCH_VERIFY_S:-3}
 case "${LAUNCH_VERIFY_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: LAUNCH_VERIFY_S='${LAUNCH_VERIFY_S}' is not a non-negative integer" >> "$LOG"; exit 3;; esac
+COOLDOWN_TRANSIENT_S=${COOLDOWN_TRANSIENT_S:-900}
+case "${COOLDOWN_TRANSIENT_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: COOLDOWN_TRANSIENT_S='${COOLDOWN_TRANSIENT_S}' is not a positive integer" >> "$LOG"; exit 3;; esac
+# ⛔ A DISPATCHED REVIEW IS NOT A RAILED VERDICT, so it does not take the 15-minute transient retry.
+# `review-pr.sh` is a PAID, multi-minute reviewer process that caps ITSELF at 1800 s and then
+# SIGTERMs (SIGKILL after `REVIEW_PR_KILL_GRACE`, default 15 s). A dispatch that has shown no exit
+# line for 2700 s is therefore certainly not running any more — re-dispatching before that would pay
+# for a SECOND review of the same head while the first is still working. 2700 = 1800 + 900 of margin.
+# This is the SAME head-keyed cooldown the rail path uses (the key is the head, in the state file's
+# name and in its dispatch line); it is a separate window only because a review is a different unit
+# of work from a rail.
+REVIEW_COOLDOWN_S=${REVIEW_COOLDOWN_S:-2700}
+case "${REVIEW_COOLDOWN_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a positive integer — a non-numeric window makes every review-dispatch comparison a syntax error, i.e. no cooldown at all" >> "$LOG"; exit 3;; esac
+[ "$REVIEW_COOLDOWN_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a POSITIVE integer — 0 re-dispatches a paid reviewer every pass over a head that is already being reviewed" >> "$LOG"; exit 3; }
+# ⛔ AND A REVIEW IS NOT A RAIL: DO NOT EMPTY THE QUEUE IN ONE PASS. Measured on this box while
+# implementing this: agent-infra had 8 mergeable PRs with NO record and 16 with a STALE one, tortoise 4
+# and 12 — 40 mergeable PRs this step is now the owner of. The per-repo cap below is a LIVE-RAIL count,
+# so it cannot bound a review burst (reviews are not `admin-merge` processes), and the first pass would
+# otherwise start ~10 concurrent paid reviewers on a 10-core box. `review-pr.sh` honours `spawn-gate.sh`
+# (rc 75 when the box is loaded) and that refusal is retried, but relying on the load gate to be the only
+# bound makes the burst a policy-by-accident. One review per repo per pass, counted and published: the
+# rest are marked `awaiting-review` ON THE PR, so a PR waiting its turn is still not invisible.
+REVIEW_PER_PASS=${REVIEW_PER_PASS:-1}
+case "${REVIEW_PER_PASS}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: REVIEW_PER_PASS='${REVIEW_PER_PASS}' is not a non-negative integer — 0 is legal and means 'publish awaiting-review and dispatch nothing' (it disables the review arm rather than the bound), a non-number makes the comparison an ERROR, which reads as FALSE, i.e. no bound at all" >> "$LOG"; exit 3;; esac
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
 #    PARALLEL    defaulted to `/tmp/jobs2/rail-parallel.sh`              -> MISSING
@@ -162,21 +188,6 @@ COOLDOWN_S=${COOLDOWN_S:-21600}
 # the SAME head, and this actuator would not look at it for six hours. The same holds for a stale
 # attestation being re-recorded and for main going green. So: a verdict that can only be changed by a
 # NEW HEAD (CONFLICTED, DRAFT) keeps the long cooldown; every other verdict gets the short one.
-COOLDOWN_TRANSIENT_S=${COOLDOWN_TRANSIENT_S:-900}
-case "${COOLDOWN_TRANSIENT_S}" in ''|*[!0-9]*)
-  echo "$(date -u +%FT%TZ) REFUSED: COOLDOWN_TRANSIENT_S='${COOLDOWN_TRANSIENT_S}' is not a positive integer" >> "$LOG"; exit 3;; esac
-# ⛔ A DISPATCHED REVIEW IS NOT A RAILED VERDICT, so it does not take the 15-minute transient retry.
-# `review-pr.sh` is a PAID, multi-minute reviewer process that caps ITSELF at 1800 s and then
-# SIGTERMs (SIGKILL after `REVIEW_PR_KILL_GRACE`, default 15 s). A dispatch that has shown no exit
-# line for 2700 s is therefore certainly not running any more — re-dispatching before that would pay
-# for a SECOND review of the same head while the first is still working. 2700 = 1800 + 900 of margin.
-# This is the SAME head-keyed cooldown the rail path uses (the key is the head, in the state file's
-# name and in its dispatch line); it is a separate window only because a review is a different unit
-# of work from a rail.
-REVIEW_COOLDOWN_S=${REVIEW_COOLDOWN_S:-2700}
-case "${REVIEW_COOLDOWN_S}" in ''|*[!0-9]*)
-  echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a positive integer — a non-numeric window makes every review-dispatch comparison a syntax error, i.e. no cooldown at all" >> "$LOG"; exit 3;; esac
-[ "$REVIEW_COOLDOWN_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a POSITIVE integer — 0 re-dispatches a paid reviewer every pass over a head that is already being reviewed" >> "$LOG"; exit 3; }
 # ⛔ THE RAIL DIRECTORIES ARE PRECONDITIONS, NOT DECORATION. Every launch writes its verdict into
 # `$RAIL_DIR`, and the cooldown logic READS it; a `mkdir` whose status nobody checks, and a redirect that
 # cannot be opened, both leave the ledger recording "railed" for a rail that never ran — measured cycle 4
@@ -596,13 +607,25 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
 #     7  the reviewer FOUND ISSUES — not recorded, findings posted as the comment
 #     8  the head moved during the review        9  the record/artifact arm failed
 #     75 a spawn-point load refusal (nothing was consumed)
+# ⛔ A STALE RECORD IS TREATED AS "NO ATTESTATION FOR THE HEAD THAT WOULD MERGE", WHICH IS A DELIBERATE
+# COST, STATED RATHER THAN HIDDEN. `record-review.sh --check-carry` would sometimes answer that the
+# reviewed DIFF is unchanged and the record carries (#3315) — and in that case this actuator buys a
+# review the recorder says nobody needs. It is bought anyway, for two reasons: (a) deciding that a record
+# covers what would merge is the GATE's predicate, not this actuator's, and re-deriving it here would be
+# a second definition of "unchanged" for the same contract — the one thing `--check-carry` exists to
+# prevent; (b) the two errors are not symmetric: a fresh review of an unchanged diff costs one review and
+# one pass, while a wrong carry records a verdict over a diff nobody read. `review-pr.sh` also exits 5
+# ("a clean record already exists at this head") when the record is in fact current, so the repeat case
+# costs nothing at all.
 # ⛔ 7 IS TERMINAL AT THIS HEAD, AND THAT IS THE POINT: re-dispatching a head the reviewer already
 # rejected pays for the SAME verdict again for ever. The fix is a new head, and a new head is a
 # different key (the file is named for the head), so a new head gets a review by construction.
 review_state() {  # $1 = the review's output file; prints none|pending|clean|issues|retry
   [ -f "$1" ] || { printf 'none\n'; return 0; }
   local rc
-  rc=$(sed -n 's/^REVIEW-EXIT rc=\([0-9][0-9]*\)$/\1/p' "$1" 2>/dev/null | tail -1)
+  # `tail` FIRST: the exit line is the LAST line, and a reviewer transcript is tens of KB that every pass
+  # would otherwise re-read in full while the review is pending.
+  rc=$(tail -20 "$1" 2>/dev/null | sed -n 's/^REVIEW-EXIT rc=\([0-9][0-9]*\)$/\1/p' | tail -1)
   # ⛔ NO EXIT LINE IS *PENDING*, NOT *FAILED*: the child may be mid-review, or may not have reached the
   # line yet. Reading it as failed is exactly how a live 20-minute review gets a duplicate next pass.
   [ -n "$rc" ] || { printf 'pending\n'; return 0; }
@@ -615,7 +638,7 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
 # The dispatch epoch, from the record the PARENT wrote — never the file's mtime, which a reviewer that
 # keeps writing output would keep refreshing and which would therefore never age out.
 review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or nothing
-  sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | tail -1
+  head -1 "$1" 2>/dev/null | sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p'
 }
 # ── THE ACTION, IN ONE PLACE ───────────────────────────────────────────────────────────────────────
 # rc 0 = WAIT (a review is already owed at this head), 1 = DISPATCH now, 2 = TERMINAL at this head (a
@@ -634,6 +657,13 @@ review_action() {  # $1 = state (from review_state), $2 = seconds since dispatch
     retry)   [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0; return 1;;
     *)       return 1;;
   esac
+}
+# rc 0 = defer this dispatch (this repo's per-pass burst is spent), 1 = dispatch now.
+# A DRIVEN function, not `[ "$n" -ge "$REVIEW_PER_PASS" ]` inline at the loop: the loop cannot be executed
+# by the suite, so an inline bound is a line nothing pins — and a bound that silently stops bounding
+# (a `-gt` flipped, the counter reset in the wrong place) turns the burst back on with the suite green.
+review_should_defer() {  # $1 = reviews already dispatched for THIS repo in THIS pass
+  [ "${1:-0}" -ge "$REVIEW_PER_PASS" ]
 }
 # ── PUBLISHING THE STATE ON THE PR, IDEMPOTENTLY ───────────────────────────────────────────────────
 # ⛔ THIS IS THE PART THAT ACTUALLY KILLS THE DEFECT: `mergeable=MERGEABLE state=BLOCKED
@@ -836,6 +866,9 @@ PY
     # rail nobody can attribute is unknown load, and a report that omits it reads as "none".
     read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
     log_line "$repo pass: candidates=$(wc -l < "$_cand") cand_bytes=$(wc -c < "$_cand" 2>/dev/null || echo MISSING) rails_on_repo=$_own rails_live=$_total unattributed=$_unk max=$MAX max_total=$MAX_TOTAL"
+    # The per-pass review budget is PER REPO (the same scope as MAX): another repo's reviews must not
+    # starve this one's, and this one's must not leak into the next repo's pass.
+    _rdispatched=0
     while IFS=$'\t' read -r _kind pr _att; do
       [ -z "${pr:-}" ] && continue
       if denied "$repo" "$pr"; then log_line "$repo #$pr DENIED — duplicate-pair member or contradictory PR pending a decision"; continue; fi
@@ -897,7 +930,7 @@ PY
         case "${_rdat:-}" in ''|*[!0-9]*) _rage=0;; *) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;; esac
         review_action "$_rstate" "$_rage"; _ract=$?
         if [ "$_ract" -eq 0 ]; then
-          log_line "$repo #$pr review $_rstate $(( _rage / 60 ))m ago at $head — waiting, not re-dispatching (a slow review is not a stuck one)"
+          log_line "$repo #$pr review $_rstate at $head — dispatched $(( _rage / 60 ))m ago, within its ${REVIEW_COOLDOWN_S}s window; waiting, not re-dispatching (a slow review is not a stuck one)"
           continue
         fi
         if [ "$_ract" -eq 2 ]; then
@@ -909,8 +942,16 @@ PY
           fi
           continue
         fi
+        # ⛔ THE BURST BOUND, AND IT PUBLISHES WHILE IT WAITS: a PR queued behind this repo's own
+        # reviews must still not look like a PR waiting on a lane.
+        if review_should_defer "$_rdispatched"; then
+          publish_review_state "$repo" "$pr" awaiting-review
+          log_line "$repo #$pr AWAITING-REVIEW ($_att at $head) — $_rdispatched review(s) already dispatched for this repo this pass (cap $REVIEW_PER_PASS); this head is next in the queue"
+          continue
+        fi
         publish_review_state "$repo" "$pr" review-in-flight "$head"
         launch_review "$repo" "$pr" "$head" "$_rout" || continue
+        _rdispatched=$(( _rdispatched + 1 ))
         continue
       fi
       # The rail writes its verdict into rails/auto-<owner>-<repo>-<pr>.out. Computed ONCE, before the
