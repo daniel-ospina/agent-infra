@@ -1400,16 +1400,21 @@ pre-removal re-probe, which no existing case can drive behaviourally — see the
 **69 outcomes** in total (case (s) is driven TWICE, at its two vanish sites), each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
-against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **28 passed,
-40 failed, 3 skipped**, and against this tree **69 passed, 0 failed, 8 skipped**: the discrimination is
+against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **29 passed,
+40 failed, 5 skipped**, and against this tree **69 passed, 0 failed, 8 skipped**: the discrimination is
 measured both ways, not asserted. (The red on the pre-change tree is 20 of the 23 case runs — every case whose
 subject runs through the ENTRY POINT, which on that tree has no `class=runner-work` at all: (a), (b), (c),
 (d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r), (s) BOTH arms, (t), (v) and (w); the owner-only cases (i), (m) and
-(q) stay green — plus **18** mutants that cannot even be applied there, because the arms they edit do not
-exist in that tree. The 21 mutants that DO still apply are reported "caught" only because their case is already
+(q) stay green — plus **20** mutants that cannot even be applied there, because the arms they edit do not
+exist in that tree. The 23 mutants that DO still apply are reported "caught" only because their case is already
 red on that tree, so the green run above is the discriminating measurement, not that one. The two rows
-COMPOSE: 20 red case outcomes + 20 unappliable mutants = the 40 failures, and 22 applicable mutants (each
-"caught") + the 3 owner-only cases + the 3 top-level assertions = the 28 passes.)
+COMPOSE: 20 red case outcomes + 20 unappliable mutants = the 40 failures, and 23 applicable mutants (each
+"caught") + the 3 owner-only cases + the 3 top-level assertions = the 29 passes.)
+⛔ **THESE ARE NOT FIXED NUMBERS — re-derive them.** The failure row is stable, but the SKIP count is a
+function of the host AND the tree: 8 on a box with real runner roots for this tree, 5 on the pre-change tree
+(two `(f)` sites, `f4` twice — the base entry point records no measured `duplicate-install` figure — and
+`v1`), plus one per case-(v) invocation whose pass observed no `df` delta. A row that quotes a skip count
+without saying which box produced it is how this paragraph was wrong at three consecutive heads.
 
 ⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement — BY THE SUITE THAT ACTUALLY ASSERTS IT.**
 The class's **record fields** at the ENTRY-POINT level (`freed_mb_runner_work=`,
@@ -1483,11 +1488,12 @@ case **(v)** (the two tallies the record used to drop, four arms) and mutants `o
 numbers above were taken by running the suite at this head,
 and the pre-change row is the same command with `DR_REAPER` pointed at the base commit — **20 case outcomes and
 18 unappliable mutants** are red there simply because the base entry point has no `class=runner-work` at
-all, and it reports **3 skips, not 8**, for two DIFFERENT reasons: only one of the eight `(f)` invocation
-sites gets that far on a tree whose entry point refuses them earlier, and case (v)'s conditional positive
+all, and it reports **5 skips, not 8**, for THREE reasons: only two of the eight `(f)` invocation sites get
+that far on a tree whose entry point refuses them earlier; `f4`'s two-class arm cannot measure there (the
+base entry point records no measured `duplicate-install` figure); and case (v)'s conditional positive
 half fires DETERMINISTICALLY there — the base entry point emits no `df_raw` at all, so the arm that needs a
-nonzero delta can never run and now says so instead of vanishing (measured: `28 passed, 40 failed,
-3 skipped`, one of the skips being `v1 positive half`). That pre-change run is a discrimination check, not
+nonzero delta can never run and now says so instead of vanishing (measured: `29 passed, 40 failed,
+5 skipped`, one of the skips being `v1 positive half`). That pre-change run is a discrimination check, not
 evidence: every mutant it reports "caught" is caught only because its case is already red.
 
 ⛔ **A RUN AS ROOT IS ALSO A MEASURED, NON-GREEN-NEUTRAL OUTCOME, and it used to be a FALSE PASS.** Cases

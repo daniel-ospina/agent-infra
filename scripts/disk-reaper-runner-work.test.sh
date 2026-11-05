@@ -760,7 +760,7 @@ case_f() { # <entry-point> <owner>
         # ⛔ `skip`, NOT `case_check 0` — the arm did NOT run, so it must not be reported as one that did.
         # The case's own status still comes from assertions that DID run (the reach arm above), so the tally
         # stays honest in both directions.
-        skip "(f) default-glob half, entry point $pass — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted by REACH instead"
+        skip "(f) empty-population half, entry point $pass — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted by REACH instead"
     else
         out="$(DISK_REAPER_STATE_DIR="$s2" REAP_RW_STATE_DIR="$s2" BOUNDED_LIB="$HERE/lib/bounded.sh" \
                RUNNER_WORK_REAPER="${PASS_OWNER:-}" bash "$pass" --dry-run --only runner-work 2>&1)"; rc=$?
