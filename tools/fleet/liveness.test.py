@@ -1446,12 +1446,20 @@ def t24_length_truncated_call_is_not_a_tool():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# THE LOG-LANE AXIS (T32–T38) — a lane that writes a log and no transcript
+# THE LOG-LANE AXIS (T32–T51) — a lane that writes a log and no transcript
 # ══════════════════════════════════════════════════════════════════════════
+# 20 tests, in the same groups the §13 regression contract states (keep the two
+# in step — a banner naming only T32–T38 told a reader the axis was 7 tests and
+# left T43–T51 covered by nothing the owning section named):
+#   T32–T38 VERDICT · T39–T42 ACQUISITION · T43–T44 BINDING · T45–T46 drop-reason
+#   + census binding · T47–T49 broken readings + fact-naming · T50 the
+#   abstention-masking refusal · T51 the `/proc` reader's own abstention.
+#
 # These are the MUTATION tests the 2026-11-03 measurement demands. Each one is
-# stated so that it FAILS against the pre-fix behaviour (a reader keyed on the
-# log's mtime, with one state for "not growing"): the paired Mutation below
-# re-introduces exactly that behaviour and the suite reports the test RED.
+# stated so that it FAILS against the pre-fix behaviour (for the VERDICT group
+# that behaviour is a reader keyed on the log's mtime, with one state for "not
+# growing"): the paired Mutation below re-introduces exactly that behaviour and
+# the suite reports the test RED.
 def LR(**kw):
     base = dict(readable=True, present=True, path="/tmp/L-x.log")
     base.update(kw)
