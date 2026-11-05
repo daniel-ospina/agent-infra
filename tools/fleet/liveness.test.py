@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-three tests with ninety-three paired mutations: every mutation re-
+Fifty-four tests with ninety-six paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -17,8 +17,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 53 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (93)
+    python3 tools/fleet/liveness.test.py                # the 54 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (96)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2745,6 +2745,90 @@ def t53():
           "a descendant present in ppid but missing from cpu abstains too, never shrinks")
 
 
+@test("T54 the `/proc` reader ABSTAINS on an unreadable/truncated member, never shrinks")
+def t54():
+    # ⛔ THE BRANCH THAT HAD NO EXECUTION AT ALL. `_proc_cpu_cs` read the real `/proc`
+    # through a local literal, so its failure polarity could only be ASSERTED — and two
+    # of its branches shrank the tree instead of abstaining, which is how a busy tree
+    # reads flat → `frozen`. The root is now a seam (the pattern `successor_preflight.py`
+    # ships as `DEFAULT_PROC_ROOT`), so the polarity is EXECUTED here.
+    d = tempfile.mkdtemp(prefix="liv-proc-")
+    try:
+        def stat_line(pid, comm, ppid, utime, stime):
+            # fields 3..15 (13 tokens): state ppid pgrp session tty_nr tpgid flags
+            # minflt cminflt majflt cmajflt utime stime  — so rest[11]/rest[12] are
+            # utime/stime exactly as the reader indexes them.
+            toks = ["S", str(ppid)] + ["0"] * 9 + [str(utime), str(stime)]
+            return "%d (%s) %s\n" % (pid, comm, " ".join(toks))
+
+        def write(pid, text):
+            with open(os.path.join(d, str(pid), "stat"), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        for p in (500, 600, 700):
+            os.makedirs(os.path.join(d, str(p)))
+
+        # (a) a fully-readable tree: 500 -> 600 -> 700.
+        write(500, stat_line(500, "lane", 1, 1, 2))
+        write(600, stat_line(600, "pi", 500, 3, 4))
+        write(700, stat_line(700, "tool", 600, 5, 6))
+        m = liv._proc_cpu_cs(d)
+        check(m is not None and set(m) == {500, 600, 700},
+              "the fixture is read; got %r" % (m,))
+        cs = lambda u, s: (u + s) * 100 // liv._CLK_TCK
+        check(m[700][0] == 600, "ppid is field 4 via rest[1]; got %r" % (m[700],))
+        check(m[700][1] == cs(5, 6),
+              "cpu is utime+stime via rest[11]/rest[12]; got %r" % (m[700],))
+        check(liv.subtree_cpu_cs(500, proc_root=d) == cs(1, 2) + cs(3, 4) + cs(5, 6),
+              "the whole tree sums; got %r" % (liv.subtree_cpu_cs(500, proc_root=d),))
+
+        # (b) a `comm` containing ')' must not shift the field decode (rfind).
+        write(700, stat_line(700, "tool) x", 600, 5, 6))
+        m = liv._proc_cpu_cs(d)
+        check(m[700][0] == 600 and m[700][1] == cs(5, 6),
+              "`comm` may contain ')'; the LAST ')' is the split; got %r" % (m[700],))
+
+        # (c) ⛔ A TRUNCATED row must ABSTAIN, not detach the pid with ppid=0. This is
+        # the residual shrink: (0, None) removed the pid AND its subtree from the walk.
+        write(600, "600 (pi) S 500 0 0\n")
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "a truncated stat row must RAISE _ProcUnreadable, not shrink")
+        except liv._ProcUnreadable:
+            check(True, "a truncated stat row abstains the read")
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller ABSTAINS rather than returning a short total; got %r"
+              % (liv.subtree_cpu_cs(500, proc_root=d),))
+        # ⛔ AND IT ABSTAINS EVEN FOR A PID THE COARSER `ps` WOULD HAPPILY ANSWER.
+        # Without this, "abstain" and "silently fall back to ps" are indistinguishable in
+        # the fixture (neither ps nor the fixture knows pid 500), so the fallback the
+        # `_ProcUnreadable` class exists to forbid would mutate GREEN. pid 1 always exists
+        # on this host, so a fallback returns a NUMBER here and the assertion reddens.
+        check(liv.subtree_cpu_cs(1, proc_root=d) is None,
+              "an unread member ABSTAINS — it must not fall back to `ps` for a live pid; "
+              "got %r" % (liv.subtree_cpu_cs(1, proc_root=d),))
+
+        # (d) PRESENT BUT UNREADABLE (a directory where `stat` should be) is the same
+        # abstention — uid-independent, so it holds for root too.
+        write(600, stat_line(600, "pi", 500, 3, 4))
+        os.remove(os.path.join(d, "600", "stat"))
+        os.makedirs(os.path.join(d, "600", "stat"))
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "an unreadable stat must RAISE _ProcUnreadable")
+        except liv._ProcUnreadable:
+            check(True, "an unreadable stat abstains the read")
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller abstains, NEVER falling back to the coarser `ps`")
+
+        # (e) NO procfs at all is a DIFFERENT fact: it is `None`, so the caller may fall
+        # back to `ps` (macOS). The two must not collapse into one answer.
+        check(liv._proc_cpu_cs(os.path.join(d, "nope-not-here")) is None,
+              "a missing procfs is None (fallback), not an abstention")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -3447,6 +3531,28 @@ MUTATIONS = [
         "an unread member is SKIPPED instead of abstaining, so the subtree total shrinks "
         "and a busy tree reads flat -> `frozen` (the invariant `_sum_subtree` states and "
         "the `ps` path honours; `_proc_cpu_cs` used to violate it)",
+    ),
+    Mutation(
+        "T54", "module",
+        '            raise _ProcUnreadable("unreadable %s/%s/stat" % (root, name))',
+        '            continue',
+        "an UNREADABLE `/proc` member is dropped from the population instead of "
+        "abstaining, so the subtree total shrinks and a busy tree reads flat -> `frozen`",
+    ),
+    Mutation(
+        "T54", "module",
+        '            raise _ProcUnreadable("truncated %s/%s/stat" % (root, name))',
+        '            out[int(name)] = (0, None)\n            continue',
+        "a TRUNCATED stat row is stored with ppid rewritten to 0 — detaching the pid and "
+        "its whole subtree from the walk, with its cpu=None unreachable — the residual "
+        "shrink that survived the first fix",
+    ),
+    Mutation(
+        "T54", "module",
+        '    except _ProcUnreadable:\n        return None',
+        '    except _ProcUnreadable:\n        proc = None',
+        "an unreadable `/proc` member FALLS BACK to the coarser `ps` instead of abstaining, "
+        "which reads the same blind spot at whole-second resolution and returns a number",
     ),
     Mutation(
         "T51", "module",

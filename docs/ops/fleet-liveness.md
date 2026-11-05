@@ -429,9 +429,9 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**53 tests with 93 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**54 tests with 96 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
-> suite is **T32–T53**. The ids are
+> suite is **T32–T54**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
 > #1777 block, so definition order is not label order) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
@@ -811,8 +811,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 53 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (93)
+python3 tools/fleet/liveness.test.py               # 54 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (96)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -1662,8 +1662,9 @@ is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is the fleet's *
 no-progress allowance**, copied rather than invented: `lane-bound.sh`'s `--idle` default
 (`LANE_BOUND_IDLE_S` = 2700 s, `scripts/orchestrator-harness/lane-bound.sh`) and
 `DEFAULT_PROGRESS_AGE_MS` = 2_700_000 ms (`extensions/shared/heartbeat-progress-edges.ts`). `frozen`
-asks the same question `--idle` answers — *no progress on any signal* — so it takes that bound rather
-than a second, unreviewed one.
+**borrows that DURATION, not that measurement**: the allowance is taken because the fleet already
+declared it, not because the two agree — `--idle` resets its clock on EITHER signal, so the two
+instruments CAN disagree (the consequence is stated below), and `frozen` is not a licence to kill.
 
 **It is NOT `LANE_REAP_LIVE_MIN`** (125 min, `agent-infra#2888`), and an earlier revision of this
 paragraph said it was. That window is decided on log **mtime alone**, so it must sit *above* the 2 h
@@ -1921,11 +1922,11 @@ so it never is.
 ⛔ **A CENSUS `rc=na` ROW IS `unknown`, NOT `finished`.** The census carries no launcher line, so it has
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (53 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (93 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (54 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (96 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
-`--log-census` decoder); T43–T53 are the 2026-11-04 binding / corroboration / abstention rounds. Their paired mutations re-introduce the exact pre-fix behaviours — the
+`--log-census` decoder); T43–T54 are the 2026-11-04 binding / corroboration / abstention rounds. Their paired mutations re-introduce the exact pre-fix behaviours — the
 dropped progress veto, the exited process falling into the freeze ladder, the missing window, the
 absent log as a death witness, the log axis masking a session query, every bound verdict reading
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped
