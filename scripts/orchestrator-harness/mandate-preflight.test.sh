@@ -461,7 +461,12 @@ chmod 644 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
 case "$WHY_UR" in
   *"READ §0 and §0b of this file FIRST"*) ok "…and the UNREADABLE renderer carries the reason as well" ;;
   *UNREADABLE*) bad "the UNREADABLE renderer dropped the reason (mandate_why is not reaching it)" ;;
-  *) : ;;
+  # ⛔ A SILENT SKIP IS NOT A VACUITY GUARD (#3379 review cycle 19, P3, MEASURED): this branch used to be
+  # `*) : ;;`, which prints and counts NOTHING — so a render that never reached this arm made it DISAPPEAR
+  # from the count rather than pass or fail (measured: reverting `mandate_unreadable`'s predicate left 185
+  # counted arms instead of 186, and this arm simply gone). Reach is pinned elsewhere (§D reddens), but an
+  # arm that can vanish is not an arm. It now fails loudly.
+  *) bad "the UNREADABLE render never produced a block at all, so nothing about its reason was tested" ;;
 esac
 rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; mkdir -p "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
 WHY_NF="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
@@ -469,8 +474,33 @@ rm -rf "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
 case "$WHY_NF" in
   *"READ §0 and §0b of this file FIRST"*) ok "…and the NOT-A-FILE renderer carries it" ;;
   *NOT-A-FILE*) bad "the NOT-A-FILE renderer dropped the reason (mandate_why is not reaching it)" ;;
-  *) : ;;
+  *) bad "the NOT-A-FILE render never produced a block at all (an arm that can vanish is not an arm)" ;;
 esac
+
+# ── E1q: `--files` EMITS NAMES, NOT `name|reason` (#3379 review cycle 19, P2, MEASURED) ─────────
+# The projection `mandate_files | cut -d'|' -f1` was unpinned: reverting it to bare `mandate_files` left
+# 186/0 while the verb's output became `LANE-BRIEF-PREAMBLE.md|a dispatch brief may open with …` — a
+# documented output shape (`--help`: "the declared names, one per line") silently broken, on the verb whose
+# stated consumer PROVISIONS from it. A consumer splitting on the field would create files with prose names.
+mkstate
+FILES_PROJ="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --files 2>/dev/null' _ "$HELPER")"
+case "$FILES_PROJ" in
+  *'|'*) bad "--files emitted the declaration's REASON field too — a provisioning consumer would take prose as a filename" ;;
+  *) ok "--files emits NAMES ONLY (the projection is pinned; a revert to bare mandate_files used to pass)" ;;
+esac
+NALIAS="$(printf '%s\n' "$FILES_PROJ" | grep -c '^LANE-BRIEF-PREAMBLE\.md$')"
+[ "$NALIAS" = "1" ]; ck $? "--and the first name is exactly LANE-BRIEF-PREAMBLE.md on its own line (measured $NALIAS)"
+
+# ── E1r: TWO CLI CONTRACTS WITH NO ARM (#3379 review cycle 19, P3, MEASURED) ─────────────────────
+# `--check`'s MISSING tag and the unknown-argument rc are both documented contracts and neither was tested:
+# reverting `mandate_missing | sed 's|^|[mandate-preflight] MISSING |'` to bare `mandate_missing` left 186/0
+# (bare paths on stderr, breaking the file's own "every line is tagged" contract), and `return 78` → `return 1`
+# for an unknown verb also stayed green.
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+CHECK_ERR="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --check 2>&1 >/dev/null' _ "$HELPER")"
+case "$CHECK_ERR" in *'[mandate-preflight] MISSING'*) ok "--check TAGS each missing path on stderr (the log contract; an untagged bare path used to pass)" ;; *) bad "--check wrote an UNTAGGED path to stderr — the line is not identifiable as a mandate reading" ;; esac
+bash "$HELPER" --bogus-verb >/dev/null 2>&1; BOGUS_RC=$?
+[ "$BOGUS_RC" = "78" ]; ck $? "an UNKNOWN argument answers 78, the repo's config-error convention (measured rc=$BOGUS_RC; \`return 1\` used to pass)"
 
 # ── E1i: A RENDER THAT PRODUCES NOTHING MUST NOT READ AS "EVERY FILE PRESENT" (review P1) ─────────
 # The disclosure is rendered into `line`; when that render fails the OLD code took the empty result as
