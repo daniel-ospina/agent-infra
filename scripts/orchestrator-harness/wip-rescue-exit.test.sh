@@ -2190,7 +2190,10 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
       # `unmeasured` remedy names the root and then the enumeration's tail, and NEITHER was asserted:
       # dropping the root argument renders `git -C  rev-list …` and transposing the two renders
       # `git -C develop … origin//tmp/wt..HEAD`, both measured `bad:[none]` with the rescue and tree
-      # caveats swallowed. `git -C ` occurs exactly once in the product, so it is a safe anchor. The
+      # caveats swallowed. `git -C ` occurs at most ONCE PER SENTENCE — measured, it appears in 20 of
+      # the 450 cells / 8 of the 90 distinct sentences, and from TWO sites in source (this arm and the
+      # unreachable helper) — so it is a safe anchor on the PER-SENTENCE uniqueness, not on a
+      # product-wide count of one. The
       # enumeration is asserted by its distinctive tail rather than by `rev-list --count ` alone, because
       # the same sentence also quotes the NARROWER `origin/<b>..HEAD` form it is contrasted against.
       case "$n45_out" in *'git -C '*) case "$n45_out" in *'git -C /tmp/wt '*) : ;; *) n45_bad="$n45_bad $n45_cell(gitroot-slot)" ;; esac ;; esac
@@ -2201,7 +2204,8 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
       # format — and the matrix reported `bad:[none]` while the suite stayed at 200 passed. The other
       # domain's MANUAL fact vanished silently, which is the rule this file states four separate times.
       # ⛔ THE INVERSE IS FALSE AND IS DELIBERATELY NOT ASSERTED: "every MANUAL arm must carry both
-      # caveats" was measured WRONG — 142 cells legitimately omit them, because their arms return above
+      # caveats" was measured WRONG — 138 distinct cells legitimately omit them (142 requirement
+      # failures: 4 cells miss BOTH the rescue and the tree caveat), because their arms return above
       # the caveat mechanism (and `not-a-worktree` / `not-measured` return above this arm entirely, so
       # they never emit the phrase below at all). The anchor is therefore this arm's OWN phrase, and only
       # the caveat for the value THAT CELL set is required.
