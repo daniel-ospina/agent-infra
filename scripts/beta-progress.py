@@ -463,8 +463,9 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
     trade, and `merged_today` stays exact while a day's merges (plus the abandoned rows updated
     beside them) fit inside it. A page
     that cannot be read -- or a read whose SHARED deadline (`deadline`, an instant on the SAME
-    clock as `time.monotonic()`, which is what every caller here uses; None = no bound) has passed
-    -- returns None for the WHOLE read; a
+    clock as `time.monotonic()`, which is what every caller here uses; `None` opens a FRESH
+    `REST_BUDGET_S` budget — it is NOT "unbounded", and no caller in this file passes it) has
+    passed -- returns None for the WHOLE read; a
     partial list is indistinguishable from a complete one at the call site. The deadline is a
     caller-supplied `deadline`, not a per-read budget: `compute()` gives the tracker PAIR **and
     every fix-repo read** the SAME one, because a per-read budget MULTIPLIES the phase's worst
@@ -625,8 +626,10 @@ def _shape_pr_rows(rows, state):
     on a str and RAISES, and `len()` turns the payload into a NUMBER. Four rounds of review each
     found one more consumer that had only half this rule (#3457 rounds 9-12): the fix-repo list,
     then the tracker's list-level check, then the fix-repo's non-list path, then the ISSUE rows.
-    Every read that produces rows now calls it: the two tracker PR lists, the two fix-repo lists
-    (before the REST fallback AND on the fallback's answer), and both tier reads.
+    Every read that produces rows is gated by it OR by `_rest_prs`'s own copy, whichever is
+    upstream: the two tracker PR lists and the two fix-repo lists call it here (the fix-repo path
+    BEFORE its REST fallback and again on the fallback's answer), the tier reads call it, and the
+    TRACKER's REST fallback reaches it only through `_rest_prs`, which validates as it pages.
     ⛔ IT IS NOT THE ONLY COPY OF THE PER-ROW RULE, and saying so would be false: `_rest_prs` keeps
     its own, because it validates AS IT PAGES — a bad row on page 3 must refuse before page 4 is
     paid for, which a post-hoc gate cannot do. That copy is upstream and stricter in timing, not a
@@ -656,8 +659,15 @@ def _shape_pr_rows(rows, state):
         for key in ("title", "headRefName"):
             if r.get(key) is not None and not isinstance(r.get(key), str):
                 return None
-        if state != "open" and r.get("mergedAt") is not None \
-                and not isinstance(r.get("mergedAt"), str):
+        # ⛔ AND IN A MERGED WINDOW THE KEY IS MANDATORY (#3457 review round 13). The lenient form
+        # ("a string WHEN PRESENT") let a merged row with no `mergedAt` — or an explicit `null` —
+        # through, and `merged_today` then UNDER-COUNTS through `(p.get("mergedAt") or "")` instead
+        # of the read refusing: measured, a merged window of one such row yields
+        # `merged_today: 0` and CACHES it for the TTL. Every row of a `--state merged` read is
+        # merged by construction and `_rest_prs` filters unmerged rows out, so an absent key is a
+        # PARTIAL payload, not a shape we can render. (The `open` state is the exception that
+        # justifies the split: an OPEN list carries no `mergedAt` at all.)
+        if state != "open" and not isinstance(r.get("mergedAt"), str):
             return None
     return rows
 

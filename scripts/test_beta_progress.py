@@ -1300,6 +1300,28 @@ def test_a_non_list_tracker_list_of_non_dicts_is_unavailable_not_a_count(monkeyp
         "a non-str `mergedAt` must refuse the read, not UNDER-count `merged_today` through "
         "`(p.get(\"mergedAt\") or \"\")`")
 
+    # ⛔ AND AN ABSENT OR NULL `mergedAt` IS MANDATORY-IN-A-MERGED-WINDOW (#3457 review round 13).
+    # The lenient form ("a string WHEN PRESENT") let these through, and every row of a `gh pr list
+    # --state merged` read is merged BY CONSTRUCTION — so an absent key is a PARTIAL payload, and
+    # `merged_today` reported 0 for it and cached that for the TTL (measured). `_rest_prs` filters
+    # unmerged rows out and always emits a string, so nothing legitimate reaches this shape.
+    for absent in ({}, {"mergedAt": None}):
+        def fake_gh_partial(*args, _absent=absent):
+            if args[:2] == ("pr", "list"):
+                if args[args.index("--repo") + 1] != bp.REPO:
+                    return []
+                if args[args.index("--state") + 1] == "open":
+                    return []
+                row = {"number": 3, "title": "a merged PR", "headRefName": "fix/3-x"}
+                row.update(_absent)
+                return [row]
+            return []
+
+        monkeypatch.setattr(bp, "gh", fake_gh_partial)
+        assert bp.compute() is None, (
+            "a merged-window row with %r must refuse the read — `merged_today` must not report 0 "
+            "for a payload it could not fully read" % (absent,))
+
 
 def test_the_merged_fix_repo_window_alone_covers_a_landed_fix(monkeypatch, no_cache):
     """⛔ THE MERGED HALF IS THE WHOLE POINT, AND IT WAS UNTESTED.
