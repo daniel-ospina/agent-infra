@@ -1806,6 +1806,60 @@ n37b="$( bash -c '
 case "$n37b" in *"rescue TOOL itself was not found"*) rcn37b=0 ;; *) rcn37b=1 ;; esac
 case "$n37b" in *"re-run bg-rescue-wip.sh"*) rcn37b=1 ;; *) : ;; esac
 ck "N37b …and rescue=UNAVAILABLE says the TOOL was not found, never 're-run bg-rescue-wip.sh' (which cannot be run) [${n37b:0:64}]" $rcn37b
+case "$n37" in *"homes that were tried"*) rcn37c=1 ;; *) rcn37c=0 ;; esac
+ck "N37c …and its remedy does not point at log content that does not exist — the not-a-worktree line names a REASON, not a list of homes" $rcn37c
+# ⛔ N38 — `push=unmeasured` IS NOT A MEASURED ABSENCE (review cycle 15, P2 — REPRODUCED). It means the
+# `rev-list --count` FAILED, and it sat in the "exist only on this disk" arm — asserting existence from the
+# enumeration that failed, beside its own `unpushed=?`, while the LOG for the same terminal abstains. A
+# promisor/partial clone fails `rev-list --count` while `status` still reads the worktree, so this is
+# reachable, not theoretical.
+n38="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=unmeasured; LANE_END_UNPUSHED="?"
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n38" in MANUAL*"could NOT be read"*"does NOT know"*) rcn38a=0 ;; *) rcn38a=1 ;; esac
+case "$n38" in *'exist only on this disk'*) rcn38a=1 ;; *) : ;; esac
+ck "N38a push=unmeasured is MANUAL and says the count could NOT be read — it does not assert the commits exist only on this disk from the enumeration that failed [${n38:0:60}]" $rcn38a
+# ⛔ N39 — THE DURABLE `push-killed` SENTENCE MAY NOT NAME A CAUSE EITHER (review cycle 15, P2 —
+# REPRODUCED). Cycle 14 made the LOG rc-specific and left `next=` saying "the push at the exit path TIMED
+# OUT", which `137` does not establish — `timeout 1 sh -c 'kill -9 $$'` returns 137 with the timer never
+# firing, and an OOM kill looks identical. The README declares this fixed; the artifact is what a consumer
+# reads, and N33c's pattern (MANUAL*"did NOT establish"*) was satisfied by the old sentence too.
+n39="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=push-killed
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n39" in MANUAL*"CLIENT WAS KILLED"*"did NOT establish"*) rcn39=0 ;; *) rcn39=1 ;; esac
+case "$n39" in *"TIMED OUT"*) rcn39=1 ;; *) : ;; esac
+ck "N39a …and the push-killed next= is CAUSE-NEUTRAL — it says the client was killed and names no cause, because 137 does not establish one [${n39:0:60}]" $rcn39
+# ⛔ N40 — `cannot-verify` IS A MANUAL FACT OF ITS OWN (review cycle 15, P2 — REPRODUCED). It says the
+# listing was not PROVEN complete, so unseen paths are in neither the porcelain section nor any archive —
+# a fact no other field of next= carries — and every MANUAL push arm and both MANUAL rescue arms dropped it
+# because the tree arm sits BELOW them. Four cycles in a row found a new arm breaking the file's own
+# "a MANUAL arm may not silence another domain's MANUAL fact" rule; the caveat is now expressed ONCE.
+for n40v in "dirty nothing FAILED" "dirty FAILED pushed" "dirty UNAVAILABLE pushed" "dirty archived-local running"; do
+  set -- $n40v
+  n40="$( bash -c '
+    . "$1"
+    LANE_END_TREE=cannot-verify; LANE_END_RESCUE="$2"; LANE_END_PUSH="$3"
+    LANE_END_REF=refs/wip-local/x; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+    lane_end_next' _ "$GATE" "$2" "$3" 2>/dev/null )"
+  case "$n40" in *"NOT PROVEN complete"*) rcn40=0 ;; *) rcn40=1 ;; esac
+  ck "N40 cannot-verify's MANUAL fact survives a MANUAL push/rescue verdict (rescue=$2 push=$3) — no arm may silence another domain's MANUAL fact [${n40:0:58}]" $rcn40
+done
+# ⛔ N41 — THE DEAD `unpushed-only` ELSE MUST ABSTAIN (review cycle 15, P2 — REPRODUCED). `unpushed-only`
+# requires a READABLE count and every non-`pushed` value is consumed by an arm above, so this branch fires
+# only for a push value no path produces — and it still said "not on origin" with an invented
+# `${LANE_END_PUSH:-not-attempted}`. Same dead-branch shape R5 was raised for one arm up.
+n41="$( bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH=""
+  LANE_END_UNPUSHED=2; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n41" in *"not on origin"*) rcn41=1 ;; *"asserts neither delivery nor absence"*) rcn41=0 ;; *) rcn41=1 ;; esac
+ck "N41 the dead unpushed-only else ABSTAINS instead of inventing a verdict and an absence [${n41:0:58}]" $rcn41
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
