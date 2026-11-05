@@ -594,6 +594,22 @@ root_is_listable() { # <root>
 
 sweep_root() { # <_work root>
     local root="$1" e _seen=0
+    # ⛔ RE-ASSERT THE ROOT'S IDENTITY AT SWEEP TIME, NOT ONLY AT ADMISSION (#3057 review, P2). This pass
+    # is two-phase ON PURPOSE (every root is classified before the first delete), so the `-d`/`! -L`
+    # assertions made in discovery are already STALE when this runs. An operator freeing a full runner
+    # disk — the exact action a box at 98 % invites — moves `_work` aside and leaves a symlink behind, and
+    # `"$root"/*/` then expands THROUGH it: the sweep classifies, and `rm -rf`s, a tree OUTSIDE the
+    # population it was told to sweep. The per-ENTRY loop below already refuses a link; the root needed
+    # the same sentence, and it is the same TOCTOU this owner re-probes for every entry before the `rm`.
+    # ⛔ AND A VANISHED ROOT IS NOT THIS CASE — `-e` first, so a root removed between the two phases still
+    # takes the GONE path below (`reason=vanished`, its own field, `unmeasurable` untouched): a fact about
+    # the box, not a doubt about it. This branch is only for a root that EXISTS but is no longer a plain
+    # directory, which is an abstention (nothing under it was measured), never an empty population.
+    if [ -e "$root" ] && { [ -L "$root" ] || [ ! -d "$root" ]; }; then
+        UNMEASURABLE=$((UNMEASURABLE + 1))
+        log_line "KEPT   $root reason=root-changed-since-discovery (it EXISTS but is no longer a plain directory: a root replaced between discovery and the sweep is not followed — nothing under it was measured, which is an abstention and never an empty population)"
+        return 0
+    fi
     ROOTS=$((ROOTS + 1))
     for e in "$root"/*/; do
         e="${e%/}"

@@ -2715,6 +2715,10 @@ TOTAL=$(( FREED_UV + FREED_VENV + FREED_WT + FREED_DUP + FREED_RW ))
 UNMEASURED=""; DF_UNM=""; LEDGER_UNM=""
 _um() { UNMEASURED="${UNMEASURED}${UNMEASURED:+, }$1"; }
 _um_df() { _um "$1"; DF_UNM="${DF_UNM}${DF_UNM:+, }$1"; }
+# Adds to the PUBLISHED list only when the class is not already named there. One class can be unmeasured
+# for two reasons at once (a setup failure whose `df` ALSO could not answer), and a list that names it
+# twice is a list an operator reads as two classes.
+_um_uniq() { case ",$UNMEASURED," in *",$1,"*) : ;; *) _um "$1" ;; esac; }
 [ "${DF_UV_OK:-0}"  = 1 ] || _um_df uv
 [ "${DF_VENV_OK:-0}" = 1 ] || _um_df venv
 [ "${DF_WT_OK:-0}" = 1 ] || _um_df worktree
@@ -2731,6 +2735,29 @@ if [ "${DF_RW_OK:-0}" = 1 ]; then :; else
     _um runner-work
     if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then LEDGER_UNM="runner-work"; else DF_UNM="${DF_UNM}${DF_UNM:+, }runner-work"; fi
 fi
+# ⛔ A CLASS THAT COULD NOT BE SET UP IS THE THIRD CAUSE, AND IT WAS THE ONE THIS LIST COULD NOT SEE
+# (#3057 review, P2). Every setup-failure arm pins `DF_<C>_OK=1` — deliberately, so `detail=` does not
+# blame `df` for a failure `df` did not cause — and that same pin is the ONLY input this list had, so a
+# class that never ran contributed its initialised `0` to TOTAL while its own field said `not-run` and
+# its candidate count said `?`. MEASURED (`--apply --only runner-work`, explicit seam matching nothing,
+# `DISK_REAPER_LOW_FREE_MB=999999999`): `freed_mb=0` beside `freed_mb_runner_work=not-run` and
+# `alert=under-reclaim` → "the pass RAN and did not keep up" about a pass whose only class never ran,
+# contradicting the sentence this file's own doc writes about the total ("`df` silent, the owner silent,
+# a class that could not be set up"). The predicate is the one `CAND_TOTAL` below already uses —
+# `misconfigured` means SELECTED BUT UNMEASURED, which is why `WANT=0` alone cannot be read as "never
+# selected" — so the pass's two totals cannot disagree again.
+# ⛔ NOT EVERY `misconfigured` CLASS BELONGS HERE. The worktree class stays `misconfigured` when its
+# REGISTERED arm could not be set up while its ABANDONED arm ran AND measured a reclaim; it then has a
+# real measurement (`WANT_WT=1`, a numeric `freed_mb_worktree`), so tainting the total with it would
+# report `unmeasured` on a pass whose every running class answered — the opposite misreport.
+for _cv in uv venv worktree duplicate-install runner-work; do
+    case "$_cv" in
+        uv) _ck=UV ;; venv) _ck=VENV ;; worktree) _ck=WT ;;
+        duplicate-install) _ck=DUP ;; runner-work) _ck=RW ;;
+    esac
+    eval "_cver=\${VERDICT_$_ck:-not-run}; _cw=\${WANT_$_ck:-0}"
+    if [ "$_cver" = misconfigured ] && [ "$_cw" = 0 ]; then _um_uniq "$_cv"; fi
+done
 # ⛔ AN UNANSWERABLE TOTAL IS `?`, NOT THE INITIALISED ZERO. `CAND_*` are initialised to 0 and are
 # only lifted to a sentinel on the CLASS line, so a fail-closed class printed `candidates=?` on its own
 # line and the pass-end line then summed the zeroes into a confident `candidates=0` — the last line of

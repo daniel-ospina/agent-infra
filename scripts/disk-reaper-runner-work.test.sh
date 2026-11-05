@@ -620,6 +620,31 @@ case_f() { # <entry-point> <owner>
                "detail= names the cause, so the operator knows what to fix"
     case_check "$(grep -q '^note_runner_work=no runner _work root matched' <<<"$st" && echo 0 || echo 1)" \
                "and the class's own note field carries it too"
+    # ⛔ THE ARMED HALF, WHICH THE DRY ARM STRUCTURALLY CANNOT SEE (#3057 review, P2). A dry run records
+    # `freed_mb_total=not-applicable` BY DESIGN, so the defect only exists on an `--apply` pass — which is
+    # exactly the pass the installed unit runs. MEASURED before the fix: `freed_mb=0` beside
+    # `freed_mb_runner_work=not-run` and `candidates_runner_work=?`, plus `alert=under-reclaim` —
+    # "the pass RAN and did not keep up" about a pass whose only class never ran — while
+    # `detail=cannot run: runner-work-no-root` said the opposite on the line above. `DISK_REAPER_LOW_FREE_MB`
+    # is driven past any real free space so the alert WOULD fire on the shipped predicate; the assertion is
+    # that it does not, because nothing was measured. The seam is explicit and matches nothing, so an
+    # ARMED pass still removes nothing.
+    s3="$(uniqstate f3)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 DISK_REAPER_LOW_FREE_MB=999999999 \
+           run_pass "$pass" "$s3" "$base/nope-*/_work" --apply --only runner-work)"; rc=$?
+    st="$(status_of "$s3")"
+    case_check "$([ "$rc" = 3 ] && echo 0 || echo 1)" \
+               "an ARMED pass with a class that could not be set up still fails closed (rc=$rc, expected 3)"
+    case_check "$(grep -q '^freed_mb_runner_work=not-run$' <<<"$st" && echo 0 || echo 1)" \
+               "… the class that never ran published not-run, never a measured 0"
+    case_check "$(grep -q '^freed_mb_total=unmeasured$' <<<"$st" && echo 0 || echo 1)" \
+               "… and the pass TOTAL follows it: a sum with a class that never ran is not a measurement (freed_mb_total=$(sed -n 's/^freed_mb_total=//p' <<<"$st"))"
+    case_check "$(grep -q '^freed_mb=unmeasured$' <<<"$st" && echo 0 || echo 1)" \
+               "… on the HEADLINE field too, which is what every reader and every alarm names"
+    case_check "$(grep -q '^alert=under-reclaim$' <<<"$st" && echo 1 || echo 0)" \
+               "… and NO under-reclaim alert, so 'the pass ran and did not keep up' is not asserted about a pass that never ran the class"
+    case_check "$(grep -q '^detail=.*cannot run: runner-work-no-root' <<<"$st" && echo 0 || echo 1)" \
+               "… while detail= still names the cause, so the operator knows what to fix"
     # ⛔ THE OTHER HALF: THE DEFAULT GLOBS MATCHING NOTHING IS **NOT** A FAILURE. A box with no runners
     # has an EMPTY POPULATION, which is a measurement (`roots=0`); painting it red every hour is the
     # alarm-fatigue shape this family forbids. Proven here so the refusal arm cannot swallow it.
@@ -1388,6 +1413,41 @@ case_q() { # <owner>
     return $((CASE_FAIL > 0))
 }
 
+# ── (w) a ROOT REPLACED between discovery and the sweep is NOT followed ──────────────────────
+# ⛔ THE PASS IS TWO-PHASE ON PURPOSE (every root is classified before the first delete), so every
+# assertion discovery made about a root is stale by the time the sweep runs. An operator freeing a full
+# runner disk — the action a box at 98 % invites — moves `_work` aside and leaves a symlink behind, and
+# `"$root"/*/` then expands THROUGH it: the sweep classifies, and `rm -rf`s, a tree OUTSIDE the population
+# it was told to sweep. The per-ENTRY loop already refuses a link; the ROOT needed the same sentence.
+# Driven by an INSTRUMENTED owner that makes the swap at the phase boundary (a real race cannot be
+# asserted), then reverted by `MUT_W` — the same construction (s)/(t) use for the other two windows.
+case_w() { # <entry-point> <owner — INSTRUMENTED: it turns the ROOT into a symlink after discovery>
+    local pass="$1" owner="$2" base work dead out rc sum s1
+    PASS_OWNER="$owner"
+    base="$T/w.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-51)" || return 1
+    fixture_entry dead "$work" job-in-moved-root 300 || return 1
+    s1="$(uniqstate w1)"
+    out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
+    sum="$(grep -o 'SUMMARY class=runner-work .*' <<<"$out" | head -1)"
+    # ⛔ THE FIXTURE MUST HAVE ACTUALLY SWAPPED THE ROOT, or every assertion below is satisfied by an
+    # ordinary pass over a root that is still a plain directory.
+    case_check "$([ -L "$work" ] && echo 0 || echo 1)" \
+               "the fixture ROOT is a SYMLINK at sweep time — the swap was DRIVEN, not assumed"
+    case_check "$(grep -qF 'reason=root-changed-since-discovery' <<<"$out" && echo 0 || echo 1)" \
+               "… and it is NAMED as changed since discovery, so 'why is this still here' has an answer"
+    case_check "$(grep -qF 'unmeasurable=1 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… counted as an ABSTENTION: nothing under it was measured (summary: ${sum:-<none>})"
+    case_check "$(grep -qF 'gone=0 ' <<<"$sum" && echo 0 || echo 1)" \
+               "… and NOT as gone: the root is there, it is just not a plain directory any more"
+    case_check "$(grep -qF 'REAPED' <<<"$out" && echo 1 || echo 0)" \
+               "… and NOTHING under it was REAPED — the sweep did not follow the link out of the population"
+    case_check "$([ -e "$dead" ] && echo 0 || echo 1)" \
+               "… measured on the entry itself: the tree the link points at is UNTOUCHED"
+    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" \
+               "… and an abstention is not a failure of the pass, so it exits 0 (rc=$rc)"
+    return $((CASE_FAIL > 0))
+}
+
 # ── the mutations ──────────────────────────────────────────────────────────────────────────────
 # One per arm, each a single-token edit to the real source. `apply_mutation` also symlinks the pieces a
 # copy needs to resolve (lib/, the owners) so a mutant fails for ITS reason, never for a missing file.
@@ -1515,6 +1575,15 @@ MUT_S_REMOVE='s|if \[ ! -e "\$entry" \] && \[ ! -L "\$entry" \]; then$|if false;
 MUT_T_INSTRUMENT='s|^for _r in \$PENDING_ROOTS; do sweep_root "\$_r"; done$|for _r in $PENDING_ROOTS; do rm -rf "$_r" 2>/dev/null; done; for _r in $PENDING_ROOTS; do sweep_root "$_r"; done|'
 # … and the mutant reverts the root-level re-stat, so a gone root falls back into the `unlistable` arm.
 MUT_T='s/^        if \[ ! -e "\$root" \]; then$/        if false; then/'
+# (w)'s INSTRUMENT + mutation. The root swap cannot be raced deterministically, so the instrumented owner
+# performs it exactly at the phase boundary — the state a re-image, a runner teardown or an operator moving
+# a full runner disk aside produces between discovery and the sweep. `MUT_W` then reverts the sweep-time
+# re-assertion, which must follow the link and redden the same fixture.
+MUT_W_INSTRUMENT='s|^for _r in \$PENDING_ROOTS; do sweep_root "\$_r"; done$|for _r in $PENDING_ROOTS; do mv "$_r" "$_r.real" 2>/dev/null \&\& ln -s "$_r.real" "$_r" 2>/dev/null; done; for _r in $PENDING_ROOTS; do sweep_root "$_r"; done|'
+MUT_W='s/^    if \[ -e "\$root" \] && { \[ -L "\$root" \] || \[ ! -d "\$root" \]; }; then$/    if false; then/'
+# (f)'s second mutant, on the ENTRY POINT: the THIRD cause removed from the unmeasured list, restoring the
+# shape that added a class which never ran as a measured 0 and then asserted an under-reclaim on that sum.
+MUT_F3='s/^    if \[ "\$_cver" = misconfigured \] && \[ "\$_cw" = 0 \]; then _um_uniq "\$_cv"; fi$/    :/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -1587,6 +1656,11 @@ if apply_mutation "$REAPER" "$T/mut-f/disk-reaper.sh" "$MUT_F2"; then
     expect_fail "f mutation: deleting the no-root refusal arm turns the case RED" case_f "$T/mut-f/disk-reaper.sh" "$OWNER"
 else
     bad "f mutation could not be applied (the no-root arm moved) — the case is not checking it any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-f3/disk-reaper.sh" "$MUT_F3"; then
+    expect_fail "f mutation: dropping the setup-failure cause from the unmeasured list turns the case RED (a class that never ran is added as a measured 0)" case_f "$T/mut-f3/disk-reaper.sh" "$OWNER"
+else
+    bad "f mutation could not be applied (the setup-failure cause arm moved) — the pass TOTAL is not checked any more"
 fi
 
 expect_pass "g a FULL-DISK fallback pass still hands this owner a writable dir" case_g "$REAPER" "$OWNER"
@@ -1757,6 +1831,19 @@ if apply_mutation "$OWNER" "$T/mut-t-instrumented/reap-runner-work.sh" "$MUT_T_I
     fi
 else
     bad "t the vanishing-root fixture could not be built (the sweep loop moved) — the race arm is not covered"
+fi
+
+if apply_mutation "$OWNER" "$T/mut-w-instrumented/reap-runner-work.sh" "$MUT_W_INSTRUMENT"; then
+    expect_pass "w a ROOT replaced by a symlink between discovery and the sweep is NOT followed (abstain, never reap)" \
+        case_w "$REAPER" "$T/mut-w-instrumented/reap-runner-work.sh"
+    if apply_mutation "$T/mut-w-instrumented/reap-runner-work.sh" "$T/mut-w/reap-runner-work.sh" "$MUT_W"; then
+        expect_fail "w mutation: reverting the sweep-time root re-assertion turns the case RED (the sweep follows the link out of the population)" \
+            case_w "$REAPER" "$T/mut-w/reap-runner-work.sh"
+    else
+        bad "w mutation could not be applied (the sweep-time root re-assertion moved) — the arm is not checked any more"
+    fi
+else
+    bad "w the swapped-root fixture could not be built (the sweep loop moved) — the race arm is not covered"
 fi
 
 expect_pass "v the two tallies the record used to drop — a cut-short DELETE is ?, a VANISHED sink is gone=" case_v "$REAPER" "$OWNER"
