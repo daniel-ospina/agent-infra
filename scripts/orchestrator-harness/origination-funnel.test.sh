@@ -944,6 +944,53 @@ case "$OUT_DRIVE" in
   *) ok "empty: and it is not BLOCKED (nothing is broken)" ;;
 esac
 
+# ── 4a2) AN UNMEASURABLE DEPTH IS NOT AN EMPTY QUEUE (review P2, cycle 15) ─────
+# The gate re-measured the depth itself and coerced a failed read to `0`, so a queue it could not read
+# printed "the queue is EMPTY … drained work, not a stalled origin" while the pass's own record said
+# `backlog=UNKNOWN` — the #1931 polarity, one layer out from where this PR just fixed it. Both states are
+# covered: the beat cannot measure AND the record has nothing, and the beat cannot measure while the
+# record DOES carry a measurement.
+mk_case ok-depth-unknown
+mk_tool_clean "$D"
+printf 'garbage-head\n300\n200\n' > "$D/o/candidates.txt"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$D/bin/wc"; chmod +x "$D/bin/wc"
+mkdir -p "$D/o/state"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=0\nbacklog=UNKNOWN\nhanded=\n' "$(date +%s)" > "$D/o/state/refresh-last"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+case "$OUT_DRIVE" in
+  *"the queue is EMPTY"*) bad "depth-unknown: the gate claimed the queue is EMPTY over a depth nobody measured — $OUT_DRIVE" ;;
+  *) ok "depth-unknown: no 'the queue is EMPTY' claim when the depth could not be measured" ;;
+esac
+case "$OUT_DRIVE" in
+  *"DEPTH of the queue could not be measured"*) ok "depth-unknown: the line names the depth as unmeasured" ;;
+  *) bad "depth-unknown: the line does not say the depth is unknown — $OUT_DRIVE" ;;
+esac
+# NON-VACUITY: the pre-fix fail-open — a failed depth read COERCED to 0, and the record's UNKNOWN ignored.
+FNSM="$T/origination-fns-coerce.sh"
+sed -e 's/^      '"''"'|\*\[!0-9\]\*) _bl_state="UNKNOWN" ;;$/      '"''"'|*[!0-9]*) backlog=0; _bl_state="READ" ;;/' \
+    -e 's/^    UNKNOWN) _bl_state="UNKNOWN" ;;$/    UNKNOWN) : ;;/' "$FNS" > "$FNSM" 2>/dev/null
+if cmp -s "$FNS" "$FNSM" 2>/dev/null; then bad "depth-unknown: the coerce-to-zero mutation did not apply — the sed anchor drifted"
+else
+  OUT_M="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSM" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  case "$OUT_M" in
+    *"the queue is EMPTY"*) ok "depth-unknown: non-vacuity — coercing the failed read to 0 restores the EMPTY claim" ;;
+    *) bad "depth-unknown: the REVERTED gate did not reproduce the defect — $OUT_M" ;;
+  esac
+fi
+# and the record's own measurement is USED when the beat cannot take one
+mk_case ok-depth-recorded
+mk_tool_clean "$D"
+printf 'garbage-head\n300\n200\n' > "$D/o/candidates.txt"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$D/bin/wc"; chmod +x "$D/bin/wc"
+mkdir -p "$D/o/state"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=2\nbacklog=2\nhanded=300\nhanded_why=judged CLEAN\n' "$(date +%s)" > "$D/o/state/refresh-last"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+case "$OUT_DRIVE" in
+  *"the queue is EMPTY"*|*"nothing to defer"*) bad "depth-recorded: the gate read a 2-row queue as empty/undrained-and-idle — $OUT_DRIVE" ;;
+  *"skipped ("*) ok "depth-recorded: the pass's own backlog=2 is used, so a queued candidate still reads as deferred" ;;
+  *) bad "depth-recorded: unexpected line — $OUT_DRIVE" ;;
+esac
+
 # ── 4b) 'nothing to defer' REPORTS THE PASS'S OWN NUMBERS, NOT THE QUEUE'S ─────
 # The ordinary drain state: the pass queued 3, dispatch took all 3. The record carries `queued=3` and
 # `handed=42`; a line that infers "queued 0" from the empty queue sends an operator after origination
