@@ -183,8 +183,51 @@ drive "$WT"
 eqv "$LANE_RC" "82" "1a a lane whose \$HOME models.json names a variable the environment does not hold exits 82 — the key gate's OWN code, not 72/75/80"
 has "$(cat "$(LOG)" 2>/dev/null)" "[key-gate] lane 3331 check=fail result=REFUSED reason=credential-missing var=$KEYVAR" \
     "1b the log names the missing variable and where the name came from"
+# ⛔ AND THE LANE'S REMEDY PRINTS THE WORKING INVOCATION (round 10, P2, measured): #3443's item 1 is that the
+# remedy is the MODEL FLAG, and only the BOX-DEFAULT refusal had an arm for it — deleting the clause from the
+# `credential-missing` line left both suites green. This is the line a lane log carries, so it is the one an
+# operator actually reads at 3am.
+has "$(cat "$(LOG)" 2>/dev/null)" 'pi -p --no-session --provider deepseek --model deepseek-flash' \
+    "1b2 …and the remedy gives the exact working invocation, not \"source keys.env\""
 [ ! -s "$PI_MARK" ]; ck "1c pi was NEVER spawned — the refusal is BEFORE the agent, so no model call was spent" $?
 check_terminal "1d" refused "key-gate:credential-missing:$KEYVAR" 82
+# ⛔ AND THE TERMINAL TOKEN NAMES THE MODEL, NOT ONLY THE VARIABLE (agent-infra#3443). The failure this
+# gate front-runs is named after the MODEL (`No API key found for the selected model.`), so a token
+# carrying only `$VAR` sends an operator to a credential that may never have been the question — and this
+# is the line a fleet scan greps, not the prose above it. The mutant (reverting the token to
+# `key-gate:<reason>:<VAR>`) reddens 1d4/1d5 and nothing else (1d2/1d3 are the epoch/yield arms).
+_kginfo="$(lastline | sed -n 's/.*reason=\(key-gate:[^ ]*\).*/\1/p')"
+eqv "$(printf '%s' "$_kginfo" | awk -F: '{print NF}')" "4" \
+    "1d4 the key-gate reason token carries FOUR fields — reason, variable AND the MODEL"
+# ⛔ A LITERAL, NOT THE AMBIENT `$PI_LANE_MODEL` (review round 2, P3, measured): the lane subprocess is launched
+# with `env -u PI_LANE_PROVIDER -u PI_LANE_MODEL`, so the token ALWAYS carries the built-in default — while an
+# ambient `PI_LANE_MODEL` (which `README.md` tells operators to put in `keys.env`, and a controller session
+# re-sources) made this arm fail on a correctly-behaving gate.
+eqv "$(printf '%s' "$_kginfo" | awk -F: '{print $4}')" "deepseek-flash" \
+    "1d5 …and the fourth is the model the gate asserted (the built-in default, since the lane runs env-scrubbed)"
+# ⛔ lane.sh PASSES BOTH HALVES, AND THE CLAIM IS THE ONE THE ARM CAN ACTUALLY MAKE (round 11, P3, measured).
+# The round-8 version said the pre-change 2-arg call "answers about venice here". After round 10's rule — the
+# `provider/` prefix decides only for a model that was NAMED, never one inherited from `$PI_LANE_MODEL` — that
+# became FALSE: both shapes resolve `deepseek`, the log text is byte-identical, and the arm could not distinguish
+# any implementation (a surviving mutant dressed as a guard). So:
+#   • the BEHAVIOURAL arm stays and keeps what it really proves — a prefixed ambient model is asserted against
+#     the provider the lane will hand pi (`deepseek`), not the prefix;
+#   • the CALL SHAPE is asserted statically, because no fixture can observe it: `lane.sh` sources the gate from
+#     its own directory, so a stub cannot be injected, and the four-argument call is the fact that would regress.
+#     This is a source check on purpose and says so — it reddens if lane.sh stops passing the resolved pair.
+mk_arm pair; PI_MARK="$ARMDIR/pi-ran"; export PI_MARK
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi 2>/dev/null || true
+drive "$ARMWT" PI_LANE_MODEL=venice/whatever
+eqv "$LANE_RC" "82" "1e a prefixed PI_LANE_MODEL still refuses on the LANE's own provider, as pi would run it"
+has "$(cat "$(LOG)" 2>/dev/null)" "[key-gate] lane 3331 check=fail result=REFUSED reason=credential-missing var=$KEYVAR provider=deepseek model=venice/whatever" \
+    "1e2 …naming deepseek, the provider run_agent will hand pi, rather than the id's venice/ prefix"
+[ ! -s "$PI_MARK" ]; ck "1e3 pi was never spawned" $?
+# ⛔ SOURCE CHECK, DECLARED AS ONE. `lane.sh` must call the gate with the RESOLVED pair (four arguments); the
+# pre-change 2-arg call is the regression this line exists to catch, and it is invisible at runtime.
+_gkcall="$(grep -c 'key_gate_assert "lane \$N" "${HOME:-}" "${PI_LANE_PROVIDER:-deepseek}" "${PI_LANE_MODEL:-deepseek-flash}"' "$LANE" 2>/dev/null || true)"
+eqv "${_gkcall:-0}" "1" \
+    "1e4 lane.sh calls the gate with FOUR arguments — label, home, resolved provider, model — so the gate and the spawn cannot disagree"
 # ⛔ THE REFUSAL YIELDS THE ITEM (review round 3, P2). `chain-merge.sh`'s ONLY early bail-out reads
 # `state/capacity-refused-<N>`, and the key gate refuses 270 lines BEFORE the arm that writes it — so
 # without this record the chain waits its full 90 minutes holding `refs/claims/issue-<N>` for a PR that
