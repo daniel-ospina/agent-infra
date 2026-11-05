@@ -114,13 +114,18 @@ def test_graphql_failure_uses_rest_and_still_counts_merged_today(monkeypatch, no
     assert out is not None
     assert out["open_prs"] == 2
     assert out["merged_today"] == 1
-    # BOTH lists were re-read over REST, at the windows the GraphQL calls ask for, and the PAIR
-    # shares ONE deadline: a per-read budget doubles the phase's worst case inside a tick that is
-    # killed (the doc states the shared budget as a rule, so the suite must hold it).
+    # BOTH lists were re-read over REST, at the windows the GraphQL calls ask for, and the whole
+    # READ PHASE shares ONE deadline: a per-read budget multiplies the phase's worst case by the
+    # number of reads inside a tick that is killed (the doc states the shared budget as a rule, so
+    # the suite must hold it).
     assert ("open", 500) in rest_calls
     assert ("merged", 400) in rest_calls
     assert deadlines[0] is not None
-    assert deadlines[0] == deadlines[1], "the pair must share one deadline"
+    # ⛔ ALL of them, not just the tracker pair. Asserting only that `deadlines[0] == deadlines[1]`
+    # left each fix-repo read free to take a FRESH budget (measured: passing `None` instead of
+    # `rest_deadline` to `_repo_prs` kept 25/25 green) -- the per-read budget the rule bans.
+    assert len(deadlines) == 4, "tracker pair + both fix-repo reads, not %d" % len(deadlines)
+    assert len(set(deadlines)) == 1, "every REST read must share ONE clock: %r" % (deadlines,)
 
     assert bp.main() == 0
     printed = capsys.readouterr().out
@@ -1008,18 +1013,30 @@ def test_a_limit_that_is_not_a_multiple_of_100_keeps_the_page_offsets_sound(monk
 
 # ══ THE GAP COUNT MUST SEE THE REPO THE FIX LANDS IN (tortoise#10951) ═══════════════
 # `REPO` is the TRACKER. It is not the repo every fix lands in: tortoise's P0/P1 backlog is
-# worked by the harness (agent-infra), whose PRs live under a different repo. Measured
-# 2026-11-05: #10114 was reported `without_pr`, and the lane chartered off that number was
-# about to rebuild it — while agent-infra #3368 (`fix(reaper): the harness PIN TREE is a
-# holder, not residue (#10114)`) was OPEN and #3333 folded it. A metric that reads a single
-# repo's PR list turns "landed elsewhere" into "nobody is on it", and this is the number the
+# worked by the harness (agent-infra), whose PRs live under a different repo. A metric that reads a
+# single repo's PR list turns "landed elsewhere" into "nobody is on it", and this is the number the
 # owner reads to decide whether beta ships.
+# ⛔ NOT A NOISE THE PRE-FIX COUNT IS MAKING TODAY. On 2026-11-05 #10114 reads `with_pr` anyway --
+# a MERGED tracker PR (#10250) carries its number -- so `main` prints the same gap set with and
+# without this change. These tests are COUNTERFACTUAL regression guards: they pin the rule that a
+# fix-repo PR is a landing path, which becomes load-bearing the moment #10250 scrolls out of the
+# newest-400 merged window, and they are red on `main` because the MECHANISM is absent, not because
+# a number moved. (The first draft of this header claimed #10114 was reported `without_pr`, which
+# tortoise#11020's own correction comment retracts; restated as measured rather than deleted.)
 def _issue_rows(*numbers):
     return [{"number": n} for n in numbers]
 
 
-def _gh_by_repo(monkeypatch, tracker_open, tracker_merged, other_open):
-    """A `gh` whose answer depends on `--repo`, which is what the defect is about."""
+def _gh_by_repo(monkeypatch, tracker_open, tracker_merged, other_open, other_merged=None):
+    """A `gh` whose answer depends on `--repo` AND on `--state`, which is what the defect is about.
+
+    ⛔ THE FIX REPO'S TWO WINDOWS ARE SEPARATE ARGUMENTS ON PURPOSE. When one list answers both
+    states, an assertion that `without == 0` cannot say WHICH window produced the cover -- and the
+    mutant `for _state, _l in (...): rows = _repo_prs(...); if _state == "open": fix_prs.extend(rows)`
+    keeps the whole suite green (measured on the first draft). `other_merged` therefore defaults to
+    an EMPTY window: a test that means "the OPEN window covers this" cannot be satisfied by the
+    merged one, and the merged window has its own test below.
+    """
     calls = []
 
     def fake_gh(*args):
@@ -1029,7 +1046,7 @@ def _gh_by_repo(monkeypatch, tracker_open, tracker_merged, other_open):
             state = args[args.index("--state") + 1]
             if repo == bp.REPO:
                 return tracker_open if state == "open" else tracker_merged
-            return other_open
+            return other_open if state == "open" else ([] if other_merged is None else other_merged)
         label = args[args.index("--label") + 1]
         return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": (10951,)}[label])
     monkeypatch.setattr(bp, "gh", fake_gh)
@@ -1039,9 +1056,15 @@ def _gh_by_repo(monkeypatch, tracker_open, tracker_merged, other_open):
 def test_a_fix_in_another_repo_is_a_landing_path_not_a_gap(monkeypatch, no_cache):
     """#10114: no tortoise PR, an OPEN agent-infra PR whose TITLE carries `(#10114)`.
 
-    The pre-fix count called that a gap. The assertion is not "the number changed" — it is
-    that an OPEN PR referencing the issue, in the repo the fix is actually written in, makes
-    `without` ZERO, because that is the fact a lane charter reads.
+    ⛔ A COUNTERFACTUAL GUARD, not a reproduced flip: `main` prints the SAME gap set today (see
+    the section header). The assertion is not "the number changed" — it is that an OPEN PR
+    referencing the issue, in the repo the fix is actually written in, makes `without` ZERO,
+    because that is the fact a lane charter reads. What is red on `main` is the MECHANISM; what
+    becomes red later is the number, the moment the merged tracker PR that covers #10114 by
+    accident leaves the 400-row window.
+
+    The fix repo's merged window is EMPTY here on purpose: this test grades the OPEN half only, so
+    a read that asked for `--state open` and nothing else would still pass it.
 
     ⛔ NO `FIX_REPOS` PIN HERE, ON PURPOSE. The shipped default already names agent-infra, and
     pinning it made the red-first run die on `AttributeError: no attribute 'FIX_REPOS'` against
@@ -1177,3 +1200,199 @@ def test_a_malformed_fix_repo_payload_is_unavailable_not_a_traceback(monkeypatch
     assert bp.compute() is None, (
         "a malformed fix-repo payload must not raise out of compute(), and must not be read as "
         "a complete list")
+
+
+def test_the_merged_fix_repo_window_alone_covers_a_landed_fix(monkeypatch, no_cache):
+    """⛔ THE MERGED HALF IS THE WHOLE POINT, AND IT WAS UNTESTED.
+
+    A PR in a fix repo does NOT close a TRACKER issue, so the issue stays open AFTER the fix
+    merges. Read only OPEN rows and #10114 becomes `without_pr` the moment agent-infra#3368 merges
+    — "no PR, you are the path" about work that had LANDED, which is strictly worse than the open
+    case this change exists to fix.
+
+    ⛔ THIS TEST IS THE ONE THAT KILLS THE FETCH-AND-DISCARD MUTANT. The first draft asserted only
+    that a `--state merged` call was MADE, so
+
+        for _state, _l in (("open", 500), ("merged", 400)):
+            rows = _repo_prs(...)
+            if _state == "open": fix_prs.extend(rows)      # merged rows fetched, then dropped
+
+    kept 25/25 green. Here the OPEN window is EMPTY and the fix PR exists ONLY in the merged one,
+    so `without == 0` can only come from the merged rows actually being USED.
+    """
+    other = "daniel-ospina/agent-infra"
+    _gh_by_repo(
+        monkeypatch,
+        tracker_open=[pr(900)],
+        tracker_merged=[],
+        other_open=[],
+        other_merged=[pr(3368, merged=MERGED_TODAY, ref="fix/10114-pin-tree-is-a-holder",
+                          title="fix(reaper): the harness PIN TREE is a holder (#10114)")])
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "a MERGED fix-repo PR is a landing path — reading only the OPEN window would report a "
+        "landed fix as a gap and charter a lane to rebuild it")
+    # And the fix must not become optimistic in the other direction: #10951 has no PR in any window.
+    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}
+
+
+def test_a_fix_repo_row_citing_its_own_number_is_not_a_cover(monkeypatch, no_cache):
+    """⛔ agent-infra NUMBERS ITS OWN ISSUES AND PRs IN THE SAME SEQUENCE AS THE TRACKER.
+
+    Its PR `fix/2513-pool-filter` cites agent-infra#2513 — NOT tortoise#2513, which is a different
+    issue with the same number. `covered()` cannot tell which repo a row came from, so a bare match
+    fails OPTIMISTICALLY: the tortoise issue reads covered and nobody builds it. The rule applied is
+    the narrowest one that cannot break the fix: a row whose match EQUALS THE ROW'S OWN NUMBER is
+    referring to itself, so it is not a cover.
+
+    ⛔ THE QUALIFIED MATCH (`tortoise#N`) IS DELIBERATELY NOT USED: agent-infra#3368's title carries
+    the BARE `(#10114)` that this change exists to see, so requiring a qualifier would restore the
+    `without_pr` that charters a lane to rebuild landed work.
+    """
+    other = "daniel-ospina/agent-infra"
+
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            state = args[args.index("--state") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if state == "open" else []
+            if state != "open":
+                return []
+            return [
+                # agent-infra's OWN issue 2513 — a DIFFERENT issue from tortoise#2513.
+                pr(2513, ref="fix/2513-pool-filter", title="fix(2513): the pool filter, one def"),
+                # a cross-reference to a different number still covers, as it must (#10114).
+                pr(4000, ref="fix/pin-tree", title="fix(reaper): the PIN TREE (#10114)"),
+            ]
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": (2513,)}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    out = bp.compute()
+    assert out is not None
+    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}, (
+        "agent-infra#2513 cites ITS OWN issue; tortoise#2513 is not covered by it")
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "the self-number rule must NOT stop a genuine cross-reference (3368 cites 10114)")
+
+
+def test_a_malformed_fix_repo_entry_is_unavailable_not_a_typeerror(monkeypatch, no_cache):
+    """⛔ `dict.fromkeys(FIX_REPOS)` RAN BEFORE THE `owner/name` VALIDATION.
+
+    An UNHASHABLE entry (a list, a dict) therefore raised `TypeError` out of `compute()` — the
+    traceback-and-no-line path the shape gate exists to prevent — instead of the documented
+    `return None`. The dedupe now runs AFTER validation, so every malformed entry takes the honest
+    `unavailable` path.
+    """
+    monkeypatch.setattr(bp, "gh",
+                        lambda *a: [pr(900)] if a[:2] == ("pr", "list") else [])
+    for bad in (None, "", "agent-infra", "daniel-ospina/agent-infra/extra", "daniel-ospina/",
+                ["daniel-ospina/agent-infra"], {"repo": "daniel-ospina/agent-infra"}):
+        monkeypatch.setattr(bp, "FIX_REPOS", (bp.REPO, bad))
+        assert bp.compute() is None, (
+            "%r must be UNREADABLE (return None), never a TypeError and never a silent "
+            "substitution of the tracker" % (bad,))
+
+
+def test_a_fix_repo_listed_twice_is_read_once(monkeypatch, no_cache):
+    """The dedupe is load-bearing on the BUDGET, not only on tidiness: a repo listed twice used to
+    be one read via `dict.fromkeys`, and moving validation ahead of it must not lose that."""
+    other = "daniel-ospina/agent-infra"
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        if args[:2] == ("pr", "list"):
+            return [pr(900)] if args[args.index("--repo") + 1] == bp.REPO else []
+        return []
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "FIX_REPOS", (bp.REPO, other, other))
+
+    assert bp.compute() is not None
+    reads = [a for a in calls
+             if a[:2] == ("pr", "list") and a[a.index("--repo") + 1] == other]
+    assert len(reads) == 2, "one repo, two windows — got %d reads: %r" % (len(reads), reads)
+
+
+def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_cache):
+    """⛔ `isinstance(r, dict)` ALONE IS NOT THE SHAPE GATE ITS DOCSTRING CLAIMS.
+
+    `covered()` runs `pat.search()` over `title` and `headRefName`, so a row that IS a dict but
+    carries a non-str in either field raised `TypeError: expected string or bytes-like object` out
+    of `compute()` — the traceback this gate says it prevents. `_rest_prs` already refuses such a
+    row per page; `_repo_prs` now applies the same rule, TYPES INCLUDED.
+    """
+    other = "daniel-ospina/agent-infra"
+
+    def payload(bad_row):
+        def fake_gh(*args):
+            if args[:2] == ("pr", "list"):
+                repo = args[args.index("--repo") + 1]
+                state = args[args.index("--state") + 1]
+                if repo == bp.REPO:
+                    return [pr(900)] if state == "open" else []
+                return [bad_row] if state == "open" else []
+            return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[
+                args[args.index("--label") + 1]])
+        return fake_gh
+
+    for bad_row in (
+            "fix/10114",                                                  # a str, not a row
+            {"number": 3368, "title": {"a": 1}, "headRefName": "fix/x"},   # dict title
+            {"number": 3368, "title": "t", "headRefName": ["fix/x"]},      # list ref
+            {"number": {"n": 1}, "title": "t", "headRefName": "fix/x"},    # non-int number
+            {"number": True, "title": "t", "headRefName": "fix/x"},        # bool is not a number
+    ):
+        monkeypatch.setattr(bp, "gh", payload(bad_row))
+        monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+        assert bp.compute() is None, (
+            "a row of the wrong shape must REFUSE the read, not raise out of compute(): %r"
+            % (bad_row,))
+
+
+def test_a_spent_phase_clock_refuses_the_read_instead_of_spawning(monkeypatch):
+    """⛔ THE PHASE CLOCK IS WHAT KEEPS THE WORST CASE CONSTANT AS REPOS ARE ADDED.
+
+    Every `gh()` read used to get a flat 120 s, so the phase's worst case grew with the NUMBER of
+    reads: 4 reads (2 PR lists + 2 issue lists) was already 480 s against a 390 s `run_bounded`
+    kill, and the two fix-repo PR lists added here take it to 720 s — the tick is killed and the
+    box prints NOTHING. With one clock, a spent budget REFUSES (None → the honest `unavailable`
+    line) instead of spawning a read it cannot bound.
+    """
+    spawned = []
+    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: spawned.append(a))
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() - 1)
+
+    assert bp.gh("pr", "list", "--repo", bp.REPO) is None
+    assert spawned == [], "a spent clock must refuse, not spawn a read it cannot bound"
+
+
+def test_the_phase_clock_bounds_the_rest_deadline_and_is_then_restored(monkeypatch, no_cache):
+    """⛔ REST IS A CHILD OF THE PHASE CLOCK, NOT A PEER OF IT.
+
+    A slow `gh` read has already spent part of the phase; REST may not spend that part a second
+    time, or the two budgets are additive and the tick dies anyway. And the clock must be
+    RESTORED — a deadline left behind would silently bound every later `gh()` call to nothing.
+    """
+    monkeypatch.setattr(bp, "gh", lambda *a: None if a[:2] == ("pr", "list") else [])
+    deadlines = []
+
+    def fake_rest(state, limit=100, deadline=None, repo=None):
+        deadlines.append(deadline)
+        return []
+
+    monkeypatch.setattr(bp, "_rest_prs", fake_rest)
+    monkeypatch.setattr(bp, "PHASE_BUDGET_S", 5)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", None)
+
+    started = bp.time.time()
+    assert bp.compute() is not None
+    assert deadlines, "the REST arm never ran"
+    assert all(d is not None for d in deadlines)
+    assert max(deadlines) <= started + 5 + 1, (
+        "a REST read was given a budget that outlives the phase clock: %r" % (deadlines,))
+    assert bp._PHASE_DEADLINE is None, "the phase clock must be RESTORED, never left spent"
