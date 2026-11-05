@@ -1096,7 +1096,7 @@ esac
 # while the queue is STILL unreadable — restoring the read bit first would send the drive down the
 # `skipped` arm and grade nothing).
 FNSRZ="$T/origination-fns-recorded-rev.sh"
-sed 's/^      elif \[ "\$_bl_state" != "READ" \]; then$/      elif false; then/' "$FNS" > "$FNSRZ" 2>/dev/null
+sed 's/^      elif \[ "\$_bl_state" = "RECORDED" \]; then$/      elif false; then/' "$FNS" > "$FNSRZ" 2>/dev/null
 if cmp -s "$FNS" "$FNSRZ" 2>/dev/null; then bad "recorded-zero: the arm-removal mutation did not apply — the sed anchor drifted"
 else
   OUT_M="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSRZ" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
@@ -1106,6 +1106,56 @@ else
   esac
 fi
 chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+# ⛔ THE ARITY CHECK (review P2, cycle 22): a `printf` given MORE arguments than the format has specs
+# RECYCLES the format over the surplus, so one mangled sentence became TWO beats in the log — the second
+# asserting `recorded backlog=` with nothing after it — and the first lost its `| PR path:` to a bare issue
+# number. Every other assertion here is a substring match on one line, which is exactly why nothing caught
+# it; this one counts LINES and requires the prtail to survive, for BOTH values of `handed=`.
+_recorded_line_check() {   # $1 = handed value → sets OUT_DRIVE
+  mk_case "ok-arity-$2"
+  mk_tool_clean "$D"
+  printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+  mkdir -p "$D/o/state"
+  printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=0\nqueued=0\nbacklog=0\nhanded=%s\nqueue_readable=1\n' "$(date +%s)" "$1" > "$D/o/state/refresh-last"
+  OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+}
+_recorded_line_check 4242 withhead
+_n_dispatch="$(printf '%s\n' "$OUT_DRIVE" | grep -c '^\[dispatch\]' || true)"
+[ "$_n_dispatch" = "1" ] && ok "arity/handed=4242: the beat printed exactly ONE [dispatch] line (a surplus printf argument would recycle the format into a second)" \
+  || bad "arity/handed=4242: $_n_dispatch [dispatch] lines — printf recycled the format over a surplus argument: $OUT_DRIVE"
+case "$OUT_DRIVE" in
+  *"| PR path: stub PR path"*) ok "arity/handed=4242: the sentence keeps its \`| PR path:\` (a mis-counted argument puts the head issue number there)" ;;
+  *) bad "arity/handed=4242: the prtail was displaced — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"recorded backlog=0 and handed #4242"*) ok "arity/handed=4242: the recorded count and head are both stated, once" ;;
+  *) bad "arity/handed=4242: the recorded count/head sentence is malformed — $OUT_DRIVE" ;;
+esac
+_recorded_line_check "" withouthead
+_n_dispatch="$(printf '%s\n' "$OUT_DRIVE" | grep -c '^\[dispatch\]' || true)"
+[ "$_n_dispatch" = "1" ] && ok "arity/handed=: the beat printed exactly ONE [dispatch] line" \
+  || bad "arity/handed=: $_n_dispatch [dispatch] lines — printf recycled the format: $OUT_DRIVE"
+case "$OUT_DRIVE" in
+  *"recorded backlog=0 and handed nothing"*) ok "arity/handed=: the empty-head wording is stated, once" ;;
+  *) bad "arity/handed=: the empty-head wording is malformed — $OUT_DRIVE" ;;
+esac
+# ⛔ AND A RECORDED COUNT ABOVE ZERO IS NOT A PRESENT-TENSE DEFERRAL (review P3, cycle 22): the count arms
+# were keyed on `backlog -gt 0` alone, so the pass's number printed "N usable candidate(s) queued" under
+# `skipped (`, whose documented meaning is a claim about NOW.
+mk_case ok-recorded-count
+mk_tool_clean "$D"
+printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+mkdir -p "$D/o/state"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=2\nhanded=300\nqueue_readable=1\n' "$(date +%s)" > "$D/o/state/refresh-last"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+case "$OUT_DRIVE" in
+  "skipped ("*) bad "recorded-count: a recorded count under \`skipped (\` claims a usable candidate IS deferred right now (the queue was not read) — $OUT_DRIVE" ;;
+  *"N usable candidate(s) queued"*) bad "recorded-count: the present-tense count sentence used the pass's number — $OUT_DRIVE" ;;
+  *"recorded backlog=2"*) ok "recorded-count: the count is attributed to the pass, with its own prefix" ;;
+  *) bad "recorded-count: the recorded count got no attributing sentence — $OUT_DRIVE" ;;
+esac
 # ── 4a3) THE `running` ARM'S EMPTY SENTENCE IS GATED TOO (review P2, cycle 16) ──
 # `backlog` is 0 by INITIALISATION when the depth could not be read, and the in-flight branch tested
 # `[ "$backlog" -gt 0 ]` alone — so a queue behind a mode-000 file, holding rows, printed "the queue is
@@ -1221,7 +1271,10 @@ printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nw
 OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
 case "$OUT_DRIVE" in
   *"the queue is EMPTY"*|*"nothing to defer"*) bad "depth-recorded: the gate read a 2-row queue as empty/undrained-and-idle — $OUT_DRIVE" ;;
-  *"skipped ("*) ok "depth-recorded: the pass's own backlog=2 is used, so a queued candidate still reads as deferred" ;;
+  # ⛔ AND IT IS A `deferred (`, NOT A `skipped (` (review P3, cycle 22): the count is the PASS's, written
+  # earlier, while this cycle measured nothing — `skipped (` asserts a usable candidate IS deferred now.
+  *"deferred ("*"recorded backlog=2"*) ok "depth-recorded: the pass's own backlog=2 is used, under a prefix that attributes it to the pass" ;;
+  *"skipped ("*) bad "depth-recorded: a RECORDED count read as 'skipped (' — that prefix claims a candidate is deferred NOW — $OUT_DRIVE" ;;
   *) bad "depth-recorded: unexpected line — $OUT_DRIVE" ;;
 esac
 
@@ -2255,7 +2308,7 @@ _drv_scan() {   # $1 = file to scan → sets _drv_total, _drv_unpinned
 # The population is pinned to a COUNT rather than floored: a line-based scan with a floor let a driver
 # evaded it simply by being REFORMATTED across two lines, which is the defect this section exists to
 # catch (review P3, cycle 18).
-_drv_expect=16
+_drv_expect=18
 _drv_scan "$0"
 if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked, count pinned)"
 else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}) or a population of $_drv_total where $_drv_expect are declared — a driver that skips the prologue, or leaves the population, is invisible here"; fi

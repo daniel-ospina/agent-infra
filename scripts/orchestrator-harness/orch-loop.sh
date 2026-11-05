@@ -2172,9 +2172,18 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       "${REFRESH_TRIED:-none}" "$_skew_run" "${REFRESH_SELF_DIR:-?}" \
       "$tailnote" "$why" "$lanes" "$workers" "$prtail"
   elif [ "${result:-}" = "ok" ]; then
-    if [ "$backlog" -gt 0 ]; then
+    # ⛔ THE COUNT ARMS ARE KEYED ON THE WITNESS TOO (review P3, cycle 22). `backlog -gt 0` was tested
+    # before every state arm, so a RECORDED count (the pass's number, written at some earlier time) printed
+    # "deferred: N usable candidate(s) queued" in the PRESENT TENSE under the `skipped (` prefix — whose
+    # documented meaning is "a pass succeeded AND a usable candidate IS deferred", a claim about now —
+    # while `head #?` on the same line admitted this cycle had read nothing. `READ` keeps the measured
+    # sentence; a recorded count gets its own, attributing the number.
+    if [ "$backlog" -gt 0 ] && [ "$_bl_state" = "READ" ]; then
       printf '[dispatch] skipped (%s) lanes=%s workers=%s — deferred: %s usable candidate(s) queued, head #%s (refresh ok, %s) | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
+    elif [ "$backlog" -gt 0 ]; then
+      printf '[dispatch] deferred (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s, which is the PASS'"'"'s count and not a measurement now (so the prefix is not `skipped`, which would assert a usable candidate IS deferred) | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$backlog" "$prtail"
     else
       # ⛔ WHAT THE PASS RECORDED, NOT WHAT THE QUEUE IMPLIES (review P1, two reviewers). The first
       # version said “the last refresh pass queued 0 usable candidate(s)” because the queue is empty
@@ -2204,7 +2213,7 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
         fi
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured by THIS cycle, and %s, so this is NOT known to be an empty queue: work may be queued and unread | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$_pass_said" "$prtail"
-      elif [ "$_bl_state" != "READ" ]; then
+      elif [ "$_bl_state" = "RECORDED" ]; then
         # ⛔ A RECORDED ZERO IS NOT A MEASUREMENT OF NOW (review P3, cycle 21). `RECORDED` means this beat
         # could NOT read the queue and `backlog` is the PASS's number, but it passed the
         # `_bl_state != UNKNOWN` test above — so a beat that had just failed to open the queue printed
@@ -2212,8 +2221,16 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
         # written at some earlier time. The EMPTY word below is now reachable only from `READ`. (No
         # shipped path can yet produce "record ok/backlog=0" with rows on disk — the pass writes both —
         # but that invariant is enforced by nothing, which is exactly why the sentence must not rely on it.)
+        # ⛔ ONE ARGUMENT PER SPEC (review P2, cycle 22). This sentence was written with EIGHT arguments
+        # for SEVEN `%s` — `"${hrec:+handed #$hrec}" "${hrec:-handed nothing}"` were meant to be one — and
+        # `printf` RECYCLES the format over a surplus argument: the beat emitted a SECOND, fabricated
+        # `[dispatch]` line with `recorded backlog=` empty, and the first line's `| PR path:` slot carried
+        # the head issue number. Every check in the suite was a substring match on one line, so nothing saw
+        # it. The word is built once, and the fixtures now assert the line COUNT and the surviving prtail.
+        _handed_word="handed nothing"
+        [ -n "$hrec" ] && _handed_word="handed #$hrec"
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s and %s, so that is the PASS'"'"'s count, not a measurement of the queue now — it is NOT evidence the queue is empty | PR path: %s\n' \
-          "$why" "$lanes" "$workers" "$age" "$backlog" "${hrec:+handed #$hrec}" "${hrec:-handed nothing}" "$prtail"
+          "$why" "$lanes" "$workers" "$age" "$backlog" "$_handed_word" "$prtail"
       elif [ -n "$hrec" ]; then
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY now; the last refresh pass (%s) recorded queued=%s and handed #%s to dispatch, so this is drained work, not a stalled origin | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$age" "${qrec:-?}" "$hrec" "$prtail"
@@ -2256,9 +2273,12 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       # beat said EMPTY.
       printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured, so this is NOT known to be an empty queue (work may be queued and unread); a refresh pass wrote its start marker %s and has recorded no outcome yet, so this is work in progress, not a drained queue | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$age" "$prtail"
-    elif [ "$backlog" -gt 0 ]; then
+    elif [ "$backlog" -gt 0 ] && [ "$_bl_state" = "READ" ]; then
       printf '[dispatch] deferred (%s) lanes=%s workers=%s — %s usable candidate(s) queued, head #%s; a refresh pass wrote its start marker %s and has recorded no outcome yet. A deferral whose origination is UNPROVEN: do not read this as a healthy pass | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
+    elif [ "$backlog" -gt 0 ]; then
+      printf '[dispatch] deferred (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s, which is the PASS'"'"'s count and not a measurement now; a refresh pass wrote its start marker and has recorded no outcome yet, so origination is UNPROVEN | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$backlog" "$prtail"
     else
       # The empty-queue-yet-fresh case: the pass is in flight and has not queued anything YET. That is
       # the ordinary state for a healthy pass on a short backlog, so it must not be BLOCKED.
