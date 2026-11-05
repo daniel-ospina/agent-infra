@@ -4200,15 +4200,26 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     # MEASURED-empty claim over a queue this pass could not read — and then wrote `backlog=0` into the
     # durable record. That is the #1931 polarity the input guard above is there to enforce, reintroduced
     # one layer up. The queue is READ, or the sentence says it could not be.
-    _skip_head=""; _skip_n=""; _skip_backlog=""
+    # ⛔ THREE DIFFERENT FAILURES, THREE DIFFERENT SENTENCES (review P2, cycle 14). `_skip_n` is EMPTY in
+    # two unrelated states — the file was never readable, and the file WAS readable but the DEPTH read
+    # failed (`wc` absent, a shim, a file swapped between the two reads) — and this arm reported both as
+    # "not a readable regular file". Measured: a readable two-row queue with a failing `wc` printed the
+    # unreadable sentence while the SAME record carried `handed=300`, i.e. the pass named the file
+    # unreadable and published a row it had just read out of it. `_skip_readable` is the witness of the
+    # guard, so the sentence can name the state that actually happened.
+    _skip_head=""; _skip_n=""; _skip_backlog=""; _skip_readable=0
     if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+      _skip_readable=1
       _skip_head="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
       case "$_skip_head" in ''|*[!0-9]*) _skip_head="" ;; esac
       _skip_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
       case "$_skip_n" in ''|*[!0-9]*) _skip_n="" ;; esac
     fi
-    if [ -z "$_skip_n" ]; then
+    if [ "$_skip_readable" -eq 0 ]; then
       echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged), and the queue could NOT be READ ($O/candidates.txt is not a readable regular file), so this pass cannot say what dispatch would take"
+      _skip_backlog="UNKNOWN"
+    elif [ -z "$_skip_n" ]; then
+      echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged); the queue WAS read ($O/candidates.txt is a readable regular file${_skip_head:+, head #$_skip_head}) but its DEPTH could not be measured, so this pass cannot say how many rows dispatch has to take — the depth is UNKNOWN, and this is NOT an empty queue"
       _skip_backlog="UNKNOWN"
     # ⛔ THE EMPTY WORD IS DECIDED BY THE MEASUREMENT, NOT BY THE HEAD (fresh-context review, P2).
     # This arm used to be `elif [ -n "$_skip_head" ]` with a bare `else` that said "the queue is EMPTY",
@@ -5967,7 +5978,13 @@ if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
 else
   _backlog_n=""; _head_issue=""
 fi
-if [ -n "$_head_issue" ]; then
+# ⛔ A KNOWN HEAD DOES NOT IMPLY A MEASURED DEPTH (review P2, cycle 14). This arm was `if [ -n
+# "$_head_issue" ]` alone, and `_backlog_n` is EMPTY when only the DEPTH read failed (a `wc` shim, a file
+# swapped between the two reads) — so the pass printed `(queue depth ; …)` and wrote `backlog=` with NO
+# VALUE into `state/refresh-last`: an unmeasured field rendered silently, which is the polarity the rest
+# of this file forbids. Measured on the shipped lines: `RECORD: … queue depth ; head #300 … backlog=
+# handed=300`. The depth is now part of the arm's condition, and the mixed state says so.
+if [ -n "$_head_issue" ] && [ -n "$_backlog_n" ]; then
   # ⛔ THE ORDER CLAIM IS READ, NEVER TYPED (review P1). This sentence used to say "highest-ranked …
   # severity order" unconditionally, so it was FALSE in exactly the two cases the writer had just
   # declared unreadable — a queue the pool ranked nothing in, and a reorder that failed. The pre-change
@@ -6016,6 +6033,14 @@ if [ -n "$_head_issue" ]; then
     "pass completed; queue depth $_backlog_n; head #$_head_issue is what dispatch takes next" \
     "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=$_head_issue" \
     "handed_why=$_head_why" "unusable=$(unusable_summary)"
+elif [ -n "$_head_issue" ]; then
+  # The head was read, the depth was not. Both facts are recorded — the head as `handed=`, the depth as
+  # `UNKNOWN` — because a `backlog=` with no value asserts a measurement this pass did not make.
+  echo "[refresh] handed to dispatch: #$_head_issue — the queue's HEAD was read but its DEPTH could not be measured, so the depth is UNKNOWN (the head is still what dispatch takes first; judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
+  REFRESH_RECORDED=1
+  refresh_record_write ok handoff 0 \
+    "pass completed; head #$_head_issue is what dispatch takes next, but the queue's DEPTH could not be measured (UNKNOWN)" \
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=$_head_issue" "unusable=$(unusable_summary)"
 # ⛔ THE EMPTY WORD HANGS OFF THE MEASUREMENT ON **BOTH** ARMS (review P2, cycle 12). The SKIP arm's fix
 # was applied here only halfway: `elif [ -n "$_backlog_n" ]` is true for ANY measured depth, and
 # `_head_issue` is deliberately SANITISED above, so a readable queue holding rows whose head is not a
