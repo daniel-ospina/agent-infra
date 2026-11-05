@@ -891,6 +891,18 @@ grep -qF 'mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"' "$MERGE"; 
 grep -qF '_mp_sh="$(mandate_preflight_lib)"' "$SPAWN"; ck $? "spawn-gate.sh CALLS its resolver into _mp_sh (a name-grep was satisfied by the declaration)"
 grep -qF 'declare -F mandate_preflight_emit' "$SPAWN"; ck $? "spawn-gate.sh checks the helper is USABLE, not merely sourceable"
 grep -qF 'declare -F mandate_preflight_emit' "$MERGE"; ck $? "merge-one.sh checks the helper is USABLE too"
+# ── E5b: THE TWO HALVES OF THE "helper is UNUSABLE" DIAGNOSTIC (#3379 review cycle 21, P3, MEASURED) ──
+# Both seams carry a reason string and a redirect on the sourcing line, and all four were unpinned: deleting
+# `2>>"$log"` from EITHER `. "$helper"` call left 193/0 (bash's own `.: <path>: line N:` would go to the
+# CALLER's stderr untagged — the "untagged bash error escaping run_agent's log contract" these same lines
+# were written to fix), and collapsing `at $<path> is unusable` to a constant "not found" left 193/0 while
+# the log then prescribes the WRONG REMEDY: "not found" says sync a missing file, "at <path> is unusable" says
+# the file is present and the copy is bad. Both are source pins for §E5's stated reason.
+grep -qF '. "$_mp_sh" 2>>"$log"' "$SPAWN"; ck $? "spawn-gate.sh sends the helper's own sourcing errors to the LOG (untagged bash errors escaping to the caller was the defect)"
+grep -qF '. "$mandate_sh" 2>>"$log"' "$MERGE"; ck $? "…and merge-one.sh does the same on the reviewer seam"
+grep -qF '_mp_why="at $_mp_sh is unusable"' "$SPAWN"; ck $? "spawn-gate.sh names WHICH helper is unusable (a constant 'not found' prescribes the wrong remedy: sync vs replace)"
+grep -qF '_mt_why="at $mandate_sh is unusable"' "$MERGE"; ck $? "…and merge-one.sh does too"
+
 # ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
 # ⛔ CYCLE 1'S ARMS WERE VACUOUS (measured in cycle 2): they grepped for the STRING `MANDATE_PREFLIGHT_SH`,
 # which the explanatory COMMENT above the resolver also contains — so reverting the whole merge-one.sh fix
