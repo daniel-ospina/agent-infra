@@ -332,7 +332,8 @@ _BOUND_RC_RE = None
 _BOUND_PID_RE = None
 _BOUND_LINE_RE = None    # the `[lane-bound] VERDICT` MARKER alone (the line, not its token)
 _BOUND_RC_PRESENT_RE = None  # `rc=` presence only — "absent" vs "present but unreadable"
-_RUNNER_MARKER_RE = None  # the LAUNCHER's `[timeout] agent pid=` line (location only)
+_RUNNER_MARKER_RE = None  # the LAUNCHER's `[timeout] agent` line (location only, no allow-list)
+_RUNNER_PID_TOKEN_RE = None  # the `pid=` token read off that line
 _RUNNER_RC_TOKEN_RE = None  # the status token read off that line
 # `rc=` is captured on the SAME line, because a verdict without its exit status is
 # not a completion (see BOUND_OK_RC).
@@ -1145,11 +1146,17 @@ def _bound_verdict_re():
         #   [timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>
         # It is the ONLY witness of the child's real status in `watch` mode, so it is
         # what corroborates `rc=na` (see BOUND_OK_RC).
-        # The MARKER (pid only) locates the line; the STATUS is read off that line
-        # separately, so "no line" and "line present, status unreadable" stay distinct.
-        globals()["_RUNNER_MARKER_RE"] = _re.compile(
-            r"\[timeout\]\s+agent\s+pid=(\d{1,10})\b")
+        # ⛔ THE LOCATOR CARRIES NO ALLOW-LIST. It used to be `pid=(\d{1,10})`, so a
+        # line whose pid token was unusable (`0x1f`, `?`, empty, 11 digits) never
+        # matched and the parser returned `("", None)` — the shape reserved for "NO line
+        # at all" — and the verdict then asserted "no corroborating launcher reading"
+        # over a log that DEMONSTRABLY had one (with a readable `rc=`). The pid is read
+        # off the located line separately and an unusable one is `"?"`, this module's
+        # existing present-but-unusable token (`parse_bound_pid`, census `_pidcol`).
+        globals()["_RUNNER_MARKER_RE"] = _re.compile(r"\[timeout\]\s+agent\b")
         _RUNNER_MARKER_RE = globals()["_RUNNER_MARKER_RE"]
+        globals()["_RUNNER_PID_TOKEN_RE"] = _re.compile(r"\bpid=(\S*)")
+        _RUNNER_PID_TOKEN_RE = globals()["_RUNNER_PID_TOKEN_RE"]
         globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\brc=(\d{1,3})\b")
         _RUNNER_RC_TOKEN_RE = globals()["_RUNNER_RC_TOKEN_RE"]
     return _BOUND_VERDICT_RE
@@ -1223,8 +1230,12 @@ def parse_runner_line(text: str):
         return "", None
     line_end = text.find("\n", last.start())
     line = text[last.start(): line_end if line_end >= 0 else len(text)]
+    pm = _RUNNER_PID_TOKEN_RE.search(line)
+    pid_tok = pm.group(1) if pm else ""
+    pid = (pid_tok if (pid_tok.isascii() and pid_tok.isdigit()
+                       and len(pid_tok) <= 10) else "?")
     tok = _RUNNER_RC_TOKEN_RE.search(line)
-    return last.group(1), (tok.group(1) if tok else None)
+    return pid, (tok.group(1) if tok else None)
 
 def parse_bound_line(text: str):
     """``(verdict, rc)`` from the LAST ``[lane-bound] VERDICT`` line, or ``("", None)``.
@@ -1388,7 +1399,11 @@ def _parent_of(pid: int):
                              timeout=30).stdout.decode("utf-8", "replace").strip()
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return int(out) if out.isdigit() else None
+    # ⛔ `.isdigit()` admits non-ASCII digits and a 5000-digit run; `int()` raises on
+    # both, where this helper's contract is `None`. It reaches this on the BINDING path
+    # after the tree exits (`/proc` gone -> `ps`), i.e. exactly when a terminal state is
+    # being decided.
+    return (int(out) if (out.isascii() and out.isdigit() and len(out) <= 10) else None)
 
 
 def parse_bound_verdict(text: str) -> str:
@@ -2596,6 +2611,8 @@ def _cpu_time_cs(text: str) -> Optional[int]:
         d, _, body = body.partition("-")
         if not (d.isascii() and d.isdigit()):
             return None
+        if not (d.isascii() and d.isdigit() and len(d) <= 6):
+            return None
         days = int(d)
     frac = 0
     if "." in body:
@@ -2607,7 +2624,13 @@ def _cpu_time_cs(text: str) -> Optional[int]:
     # `.isdigit()` admits non-ASCII digits (`\u00b2`), which `int()` then REJECTS —
     # so the guard passed and the parse raised, where this function's contract is
     # `None` on an unreadable read (and `subtree_cpu_cs` promises the same).
-    if not 1 <= len(fields) <= 3 or not all(f.isascii() and f.isdigit() for f in fields):
+    # ⛔ A DIGIT RUN LONGER THAN THIS IS NOT A TIME. `.isdigit()` admits 5000 digits, and
+    # `int()` then raises "Exceeds the limit (4300 digits)" — where this function's
+    # contract, and `subtree_cpu_cs`'s, is `None` on an unreadable read. `a63acffd` closed
+    # the non-ASCII-digit door here and left the length hazard open; a `time=` field can
+    # never legitimately exceed 6 digits in any component.
+    if (not 1 <= len(fields) <= 3
+            or not all(f.isascii() and f.isdigit() and len(f) <= 6 for f in fields)):
         return None
     vals = [int(f) for f in fields]
     if len(vals) == 1:
@@ -2744,7 +2767,12 @@ def gather_log_lane(
     # earlier dispatch appended to the same log is not this lane's exit status.
     if lr.rc == "na" and lr.readable:
         runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))
-        if runner_pid and runner_rc is None:
+        if runner_pid == "?":
+            # The launcher line EXISTS but names no usable pid, so it can never be bound
+            # to this incarnation — say so, rather than implying there is no line.
+            lr.detail = " | ".join(x for x in (
+                lr.detail, "runner-pid-unreadable runner_pid=?") if x)
+        elif runner_pid and runner_rc is None:
             # A launcher line IS present but its status is unreadable: name THAT fact, not
             # the absence of the line. The state is the same (no witness -> abstain), but
             # the detail is what a reader diagnoses from.

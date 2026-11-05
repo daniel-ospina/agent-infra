@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with eighty-three paired mutations: every mutation re-
+Fifty-one tests with eighty-six paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (83)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (86)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1779,6 +1779,13 @@ def t39():
         # permanently unreadable there.
         "0:00.50": 50, "1:02.33": 6233, "1:02:03.45": 372345,
         "": None, "garbage": None, "1:99": None, "1:02:60": None,
+        # ⛔ A DIGIT RUN LONGER THAN ANY REAL `time=` FIELD IS NOT A TIME. `.isdigit()`
+        # admits 5000 digits and `int()` then raises "Exceeds the limit (4300 digits)" —
+        # where this function's contract, and `subtree_cpu_cs`'s, is `None`. The DAYS
+        # component is bounded too, so the raise cannot come back through that field.
+        "9" * 5000: None, ("9" * 4301) + "-00:01": None,
+        "9" * 7: None, ("9" * 7) + "-00:01:00": None,
+        "\u00b2:00": None, "1:\u00b200": None,
     }
     for text, want in cases.items():
         got = liv._cpu_time_cs(text)
@@ -2488,6 +2495,15 @@ def t51():
         check(liv.parse_runner_line("[timeout] agent pid=%d wall_limit=1s" % dead)
               == (str(dead), None),
               "a launcher line with NO status is the same distinction")
+        # ⛔ A LAUNCHER LINE WITH AN UNUSABLE `pid=` IS STILL A LINE. The LOCATOR used to
+        # carry the pid allow-list, so such a line never matched and the verdict asserted
+        # "no corroborating reading" over a log that had one (with a readable `rc=`).
+        for bad_pid in ("0x1f", "?", "", "11111111111"):
+            got = liv.parse_runner_line(
+                "[timeout] agent pid=%s wall_limit=1s rc=0" % bad_pid)
+            check(got == ("?", "0"),
+                  "a line with an unusable pid is PRESENT and its rc is still read; %r"
+                  % (got,))
         # …and the LOG-LEVEL detail names the fact rather than the absence.
         write(dead, "0x0")
         lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
@@ -2499,6 +2515,19 @@ def t51():
               % (v.detail,))
         check("no CORROBORATING launcher" in (v.detail or ""),
               "the static sentence claims no corroborating reading, not no line; got %r"
+              % (v.detail,))
+        # ⛔ …and an UNUSABLE pid is its own fact: named, and NEVER adopted (it can never
+        # equal the verdict's own pid, so it falls to the abstention, not a completion).
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                     "elapsed=61s log=%s\n" % (dead, log))
+            fh.write("[timeout] agent pid=0x1f wall_limit=3300s elapsed=61s rc=0\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown",
+              "a line with an unusable pid is NEVER adopted; got %s" % v.state)
+        check("runner-pid-unreadable" in (v.detail or ""),
+              "…and the detail says a line EXISTS with an unusable pid; got %r"
               % (v.detail,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -2973,8 +3002,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T49", "module",
-        '    if not 1 <= len(fields) <= 3 or not all(f.isascii() and f.isdigit() for f in fields):',
-        '    if not 1 <= len(fields) <= 3 or not all(f.isdigit() for f in fields):',
+        '            or not all(f.isascii() and f.isdigit() and len(f) <= 6 for f in fields)):',
+        '            or not all(f.isdigit() and len(f) <= 6 for f in fields)):',
         "a non-ASCII digit passes .isdigit() and raises in int(), where _cpu_time_cs' "
         "contract is None on an unreadable read (the Mac `ps` path)",
     ),    Mutation(
@@ -3144,6 +3173,29 @@ MUTATIONS = [
         '                if not (body.isascii() and body.isdigit()):',
         "an IMPLAUSIBLE census number (40 digits) is accepted as a reading again, so a "
         "runaway `size_delta`/`age_ms` becomes a state and is interpolated whole",
+    ),
+    # ── round 8: the launcher LOCATOR, and an unbounded digit run reaching int() ──────
+    Mutation(
+        "T51", "module",
+        'globals()["_RUNNER_MARKER_RE"] = _re.compile(r"\\[timeout\\]\\s+agent\\b")',
+        'globals()["_RUNNER_MARKER_RE"] = _re.compile(r"\\[timeout\\]\\s+agent\\s+pid=(\\d{1,10})\\b")',
+        "the LOCATOR carries the pid allow-list again, so a launcher line with an unusable "
+        "pid never matches and the verdict asserts \"no corroborating reading\" over a log "
+        "that has one",
+    ),
+    Mutation(
+        "T51", "module",
+        '        elif runner_pid and runner_rc is None:',
+        '        elif False:',
+        "the \"present but unreadable\" runner fact is dropped, so the detail reverts to "
+        "claiming no launcher line exists",
+    ),
+    Mutation(
+        "T39", "module",
+        '        if not (d.isascii() and d.isdigit() and len(d) <= 6):',
+        '        if not (d.isascii() and d.isdigit()):',
+        "the DAYS field is unbounded again, so a long digit run raises where the contract "
+        "is `None`",
     ),
 ]
 

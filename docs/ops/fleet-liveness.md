@@ -429,7 +429,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**51 tests with 83 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**51 tests with 86 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
 > suite is **T32–T51**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
@@ -812,7 +812,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 51 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (83)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (86)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
@@ -1733,6 +1733,7 @@ that line (`parse_runner_line` → `LogRead.runner_rc`):
 | `rc=na` | `rc=<non-zero>` | **`no-verdict`** (`bound-finished-runner-rc:<n>`) — the bound fired nothing, yet the child did NOT complete |
 | `rc=na` | **absent** | **`unknown`** (`finished-rc-uncorroborated`) — an abstention, never an assumed success |
 | `rc=na` | **present, but naming another incarnation** | **`unknown`** — the witness is not this lane's (`runner-rc-unbound` in `detail`) |
+| `rc=na` | **present, but its `pid=` is unusable** (`0x1f`, `?`, empty, over-long) | **`unknown`** — a line EXISTS but names no incarnation (`runner-pid-unreadable` in `detail`), and it is never adopted |
 | `rc=na` | present but its `rc` is **unreadable** (not a 1–3 digit status, e.g. `0x0`, `exit:0`, a runaway token) | **`unknown`** (`finished-rc-uncorroborated`, and `detail` names `runner-rc-unreadable`) — an unreadable status is not a negative fact, and it is **not** the same fact as an absent line |
 | `rc=7` | (not consulted) | **`no-verdict`** (`bound-finished-rc:7`) |
 | `rc=` **present but unreadable** (`0x0`, a runaway token, …) | (not consulted) | **`unknown`** (`finished-rc-unreadable`, `detail` says the `rc=` was **PRESENT and UNREADABLE**) |
@@ -1882,7 +1883,7 @@ so it never is.
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
 Regression contract: `python3 tools/fleet/liveness.test.py` (51 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (83 mutations, each of which must make its paired
+`python3 tools/fleet/liveness.test.py --mutations` (86 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder); T43–T51 are the 2026-11-04 binding / corroboration / abstention rounds. Their paired mutations re-introduce the exact pre-fix behaviours — the
