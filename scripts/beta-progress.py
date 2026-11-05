@@ -239,19 +239,25 @@ REST_BUDGET_S = 30
 # `TARGET` 540 - `IN_PASS_RESERVE` 150). The two fix-repo PR lists added here take it to 720 s: the
 # tick is killed and the box prints NOTHING, the one outcome the shared budget exists to prevent.
 # So ONE clock bounds the WHOLE phase: `compute()` opens it (`_phase_clock`), `gh()` derives every
-# child's timeout from what is LEFT of it, and the REST deadline is clamped to it. The bound is a
-# CONSTANT of the phase — adding a fix repo cannot EXTEND it, it only spends it.
+# child's timeout from what is LEFT of it, `_rest_prs` clamps its deadline to it, and `_token()`'s
+# own `gh auth token` spawn draws on it too (`_token` is called by `_rest_prs` BEFORE the deadline
+# check, so a spent clock has to refuse there as well). The bound is a CONSTANT of the phase —
+# adding a fix repo cannot EXTEND it, it only spends it.
 # ⛔ SIZED FROM THE PHASE'S OWN SLACK — AND THAT IS NOT THE SAME NUMBER AS A READ'S LATENCY. An
 # earlier draft sized this at 100 s by borrowing `objective.py`'s `QUEUE_READ_MAX_S`, and it was
 # wrong twice over: (a) 100 s sits ABOVE the 40-90 s this step actually has left inside the tick, so
 # the clock could never fire before `run_bounded` killed the tick — it was an INERT ENFORCER that
 # looked like protection; and (b) it borrowed a bound for ONE read to cover SIX (two tracker PR
 # lists + two fix-repo PR lists + two issue lists), giving each an effective 16.7 s.
-# 60 s is chosen from the slack band this step really has: it fires INSIDE the 40-90 s window, so a
-# slow phase prints `unavailable` instead of being killed with no line; and it is ~5-6x the MEASURED
-# phase on this box (the six reads took 0.7-3.3 s each, ~8-12 s end to end, against ~4 s for the
-# REST arm); and it is exactly 2x `REST_BUDGET_S`, so the REST arm fits inside it rather than being
-# clipped by it.
+# 60 s is chosen from the slack band this step really has, and the band is stated with its FLOOR
+# rather than only its ceiling: the step holds 40-90 s at the end of a normal pass, and the harness
+# floors a tick's residual at 20 s (`heartbeat-loop.sh:414`: `[ "$r" -lt 20 ] && r=20`). So the
+# honest claim is: **the clock FIRES whenever at least 60 s remain**, which is the band's middle and
+# up — and below that the tick can still be killed with no line, because a bound cannot fire before
+# the kill that precedes it. What the constant must NOT do is exceed the band's TOP, where it would
+# be inert in every case (that was the 100 s draft). It is ~5-6x the MEASURED phase on this box (the
+# six reads took 0.7-3.3 s each, ~8-12 s end to end, against ~4 s for the REST arm); and it is
+# exactly 2x `REST_BUDGET_S`, so the REST arm fits inside it rather than being clipped by it.
 # ⛔ THE RESIDUAL, STATED RATHER THAN BOUNDED AWAY: `objective.py` measures 63 s for ONE `gh` read at
 # 13 lanes, and SIX such reads (378 s) cannot fit this step's slack in ANY implementation — that is a
 # pre-existing property of the heartbeat, not something this constant can fix. What the clock buys is
@@ -299,6 +305,18 @@ def _token():
     it does not need to be: the block-level token already IS gh's answer. No branch can return
     another account's token, which is the property this function has to hold.
     """
+    # ⛔ THE PHASE CLOCK BOUNDS THIS SPAWN TOO (#3457 review round 5). `gh auth token` is a `gh`
+    # CHILD on a flat 5 s, and `_rest_prs` resolves the token BEFORE it looks at its deadline, so
+    # without this the phase's worst case was `PHASE_BUDGET_S + 5 s` on exactly the gh-refusing box
+    # the clock exists for -- and "ONE clock bounds the WHOLE phase" was false by those 5 s.
+    # A SPENT clock REFUSES (`""` -> the REST read returns None -> the honest `unavailable`):
+    # spending the last seconds of a pass on a credential lookup is how the tick outlives its kill.
+    tmo = 5.0
+    if _PHASE_DEADLINE is not None:
+        left = _PHASE_DEADLINE - time.time()
+        if left <= 0:
+            return ""
+        tmo = min(tmo, left)
     for var in ("GH_TOKEN", "GITHUB_TOKEN"):
         if os.environ.get(var):
             return os.environ[var]
@@ -331,7 +349,7 @@ def _token():
         pass
     try:
         r = subprocess.run([GH, "auth", "token", "--hostname", "github.com"],
-                           capture_output=True, text=True, timeout=5,
+                           capture_output=True, text=True, timeout=tmo,
                            env={**os.environ, **GH_LAYER_ENV} if GH_LAYER_ENV else None)
         if r.returncode == 0:
             return (r.stdout or "").strip()
@@ -692,7 +710,8 @@ def _compute():
     #     the LOW end of the open tortoise backlog (#2281, #2513) is ALREADY inside it -- an
     #     agent-infra PR on its own issue #2513 collides TODAY. Every tracker unit numbered ABOVE
     #     agent-infra's counter becomes a scheduled collision as that counter passes it, and the
-    #     open backlog is ~31 units (14 P0 + 17 P1 on 2026-11-05), almost all of them above it.
+    #     open backlog is ~34 units (17 P0 + 17 P1, re-measured 2026-11-05 after this block was
+    #     first written with a stale 14/17 split), almost all of them above it.
     #     ⛔ NO EXPLICIT LIST OF NUMBERS HERE, DELIBERATELY: an earlier draft enumerated eight of
     #     them and got the surface wrong in three ways (four were `P0-blocker` rather than
     #     `P1-severe`, ten open P1s above the range were missing, and the "newest PR" it pinned was
@@ -714,17 +733,25 @@ def _compute():
     #     worth it, and it made this block argue both that a false gap is the worst error and that it
     #     is the cheap one. Removed rather than documented; the measurement is kept so it is not
     #     re-invented.
-    #   * SO THE FALSE-COVER RISK IS OPEN AND UNMITIGATED, deliberately. The correct successor is a
-    #     PER-ROW REPO IDENTITY (each row's own repo, so a bare `#N` from a fix repo can be matched
-    #     against that repo's issues or rejected). ⛔ THE SOURCE IS AVAILABLE -- an earlier form of
-    #     this comment said neither read returns it, and that was FALSE when checked against the
-    #     primitives: `gh pr list --json headRepository,headRepositoryOwner,isCrossRepository`
-    #     offers it, and `/pulls` rows carry `head.repo.full_name` (measured 2026-11-05 against this
-    #     repo: `{"head_ref":"mcp-3382-phase2","head_repo":"daniel-ospina/agent-infra"}`). What
-    #     is missing is this FILE's projection -- `_repo_prs` asks for three fields and `_rest_prs`
-    #     keeps four -- so adopting it means widening both projections and the `covered()` match, a
-    #     larger diff than the defect being fixed. It is therefore a follow-up by SCOPE, not by
-    #     impossibility. Until then the optimistic error stands: a
+    #   * SO THE FALSE-COVER RISK IS OPEN AND UNMITIGATED, deliberately -- AND THE REASON IS THE
+    #     REFERENT, NOT THE ROW. `_repo_prs` is called FROM the loop that knows which repo it is
+    #     reading (`_repo`), so the row's OWN repo is already in hand at the append site; what no
+    #     read of the row can say is what a BARE `#N` in its title REFERS TO. Two corrections are
+    #     recorded here because earlier forms of this comment gave the wrong reason twice:
+    #     (a) it once said neither read returns a repo identity -- FALSE: `/pulls` rows carry
+    #     `head.repo.full_name` (measured 2026-11-05: `{"head_ref":"mcp-3382-phase2",
+    #     "head_repo":"daniel-ospina/agent-infra"}`) and `gh pr list --json` offers
+    #     `headRepository,headRepositoryOwner,isCrossRepository`; and (b) it then said the datum is
+    #     missing from THIS FILE's projection -- ALSO FALSE for the same reason: `_repo` already
+    #     holds it. THE ACTUAL GAP is that `headRepository` is the HEAD/FORK repo, not necessarily
+    #     the repo the row lands in (and `baseRepository` is not in `gh pr list`'s field list at
+    #     all), and that a bare `#N` in a title or branch has no referent at all -- the only field
+    #     naming one is `closingIssuesReferences`, which these PRs do not use. Matching a bare
+    #     number against the rows of EVERY repo we read is therefore the same unqualified match
+    #     this comment has just argued against, one level further out. So the successor is
+    #     per-row REFERENT resolution (a qualified match with the referent's repo), which needs a
+    #     signal these reads do not carry -- a follow-up by ABSENCE OF SIGNAL, not by missing
+    #     fields. Until then the optimistic error stands: a
     #     fix-repo row citing an in-range number marks the same-numbered tortoise unit covered.
     # ⛔ A REFUSED READ IS NOT "NO PR": with no second source it returns None so the whole line
     # reads `unavailable`, exactly as a failed tracker read does. Inflating `without` from an
