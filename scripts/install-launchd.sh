@@ -457,27 +457,132 @@ job_label() {
     basename "$1" .plist
 }
 
-# Print absolute-path ProgramArguments entries, one per line (python3
-# plistlib; PlistBuddy fallback — macOS guaranteed to have one of them).
+# The plist READER, resolved independently of the CALLER'S PATH. The installer deliberately PINS a
+# PATH for the jobs it renders and a caller may hand it a filtered one (§ the all-shim fixture), so a
+# reader that only answers `command -v` disappears exactly when the install is being verified. That
+# is not a hypothetical: it turned every job into a FAIL in that fixture once "could not read" became
+# a refusal. python3 lives in a standard location on every supported box; PlistBuddy is the fallback.
+plist_python() {
+    local c
+    for c in "$(command -v python3 2>/dev/null)" /usr/bin/python3 /usr/local/bin/python3 \
+             /opt/homebrew/bin/python3; do
+        [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    return 1
+}
+
+# Print absolute-path ProgramArguments entries as `<kind>\t<path>`, one per line
+# (python3 plistlib; PlistBuddy fallback — macOS guarantees one of them).
+#
+# `kind` is `exec` for what the job actually RUNS and `data` for every absolute value its work merely
+# READS. That split is the difference between "launchd cannot EXECUTE this job" and "this job's work
+# cannot read its input": only the former is a reason not to install the unit (see verify_targets).
+#
+# ⛔ THE DATA CLASS IS NARROW ON PURPOSE: an absolute element is `data` ONLY when it is the
+# VALUE of one of a FEW KNOWN long options that carry something the job's work only READS
+# (`--repo <path>`, `--root <path>` — `DATA_OPTIONS` below). `--script <path>` is deliberately NOT
+# one of them: the reaper launcher OPENS that path and pipes it to `bash -s`, so the value IS the
+# executed code, and a TCC-protected one is a dead UNIT rather than dead work.
+# point: a data argument misread as `exec` costs a loud SKIP of one unit (friction), while an
+# executed script misread as `data` arms a unit launchd cannot start — the exact defect this guard
+# exists for. Two cheaper rules were falsified in review: "before the first `-`" filed
+# `/bin/bash -e <script>` as data, and "the first non-option token is the script" filed
+# `python3 -W error <script>` and `bash -o pipefail <script>` as data, because an option's VALUE
+# looked like the script. No positional rule can tell `-W error` from `-e script` without knowing
+# each option's arity, so this one does not guess: it calls something data only when a long option
+# literally introduced it. (`/usr/bin/env bash <script>` and `env -i bash <script>` need no special
+# case: neither token is introduced by a long option, so both are `exec`.)
+#
+# ⛔ A RETURN OF NON-ZERO MEANS "COULD NOT READ", NEVER "NO TARGETS" (#1743). An unparseable plist and
+# a plist with no absolute argument must not arrive at the caller as the same empty string — that was
+# an empty-as-PASS, where a rendered plist launchd could not parse installed UNVERIFIED. They are now
+# separated: non-zero = unreadable, zero + empty output = read but nothing to verify (and
+# verify_targets refuses on ITS OWN zero-iteration count, so neither half depends on the other).
 plist_program_args() {
-    local plist="$1" out
-    if command -v python3 >/dev/null 2>&1; then
-        out="$(python3 - "$plist" 2>/dev/null <<'PY' || true
+    local plist="$1" out rc=0 py
+    if py="$(plist_python)"; then
+        out="$("$py" - "$plist" 2>/dev/null <<'PY'
 import plistlib, sys
 try:
     with open(sys.argv[1], "rb") as f:
         d = plistlib.load(f)
-    for a in d.get("ProgramArguments", []):
-        if isinstance(a, str) and a.startswith("/"):
-            print(a)
 except Exception:
-    pass
+    sys.exit(3)                      # UNREADABLE — not "no targets"
+args = d.get("ProgramArguments")
+if not isinstance(args, list):
+    sys.exit(4)                      # no ProgramArguments array to verify
+DATA_OPTIONS = {"--repo", "--root"}   # long options whose VALUE the job's work only READS
+for i, a in enumerate(args):
+    if not isinstance(a, str):
+        continue
+    # `--opt=<path>` carries its value INSIDE the token, so it must be split before the
+    # starts-with-"/" test -- otherwise the shipped `--script=<path>` / `--repo=<path>` spellings
+    # (pi-reap-worktrees-launchd.py accepts either form) are invisible to this whole check.
+    if a.startswith("--") and "=" in a:
+        name, val = a.split("=", 1)
+        if val.startswith("/"):
+            print("%s\t%s" % ("data" if name in DATA_OPTIONS else "exec", val))
+        continue
+    if not a.startswith("/"):
+        continue
+    if i == 0:
+        print("launcher\t" + a)
+        continue
+    prev = args[i - 1] if isinstance(args[i - 1], str) else ""
+    print("%s\t%s" % ("data" if prev in DATA_OPTIONS else "exec", a))
 PY
-)"
-        if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+)" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            [ -n "$out" ] && printf '%s\n' "$out"
+            return 0
+        fi
+        # rc=3/4 (unparseable / no array) → try the other guaranteed reader before giving up.
     fi
-    /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" 2>/dev/null \
-        | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*=[[:space:]]*//p' | grep '^/' || true
+    # THE READER IS A SEAM SO THE FALLBACK IS TESTABLE. On Linux `/usr/libexec/PlistBuddy` does not
+    # exist, so without this the awk arm below would be exercised by NO test -- and the two readers
+    # must agree, because a plist python3 cannot parse is read by this one. A bogus override makes
+    # the check refuse (no reader -> "cannot read"), which is the fail-closed direction.
+    local buddy="${INSTALL_LAUNCHD_PLISTBUDDY:-/usr/libexec/PlistBuddy}" raw
+    [ -x "$buddy" ] || return 1
+    raw="$("$buddy" -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 1
+    [ -n "$raw" ] || return 1
+    # The PlistBuddy reader applies the SAME rule (an absolute element is `data` only when the
+    # previous element is a long option), so the two readers cannot disagree about a plist that one
+    # of them can parse and the other cannot. PlistBuddy wraps an array in `Array {` / `}` lines,
+    # which the awk below skips.
+    out="$(printf '%s\n' "$raw" | awk '
+        BEGIN { seen = 0; prev = ""; n = 0; dv["--repo"] = 1; dv["--root"] = 1 }
+        # PlistBuddy wraps an array in `Array {` / `}` on their own lines.
+        /^[[:space:]]*(Array)?[[:space:]]*\{[[:space:]]*$/ { next }
+        /^[[:space:]]*\}[[:space:]]*$/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            sub(/^(Arg)?[0-9]+[[:space:]]*=[[:space:]]*/, "", line)
+            # an EMPTY element emits nothing but still OCCUPIES an argv slot, so prev/n advance
+            # for it exactly as the python reader does -- otherwise the two readers disagree about
+            # which element is argv[0] (`["", "/script"]` was `exec` in python, `launcher` here).
+            if (line == "") { prev = ""; n++; next }
+            seen = 1
+            name = ""; val = ""
+            if (line ~ /^--.*=/) {
+                name = line; sub(/=.*/, "", name)
+                val = line;  sub(/^[^=]*=/, "", val)
+            }
+            # same rule as the python reader (keep the two in step)
+            if (name != "") {
+                if (val ~ /^\//) printf "%s\t%s\n", ((name in dv) ? "data" : "exec"), val
+            } else if (line ~ /^\//) {
+                printf "%s\t%s\n", (n == 0 ? "launcher" : ((prev in dv) ? "data" : "exec")), line
+            }
+            prev = line
+            n++
+        }
+        END { if (!seen) exit 1 }
+    ')" || return 1
+    [ -n "$out" ] && printf '%s\n' "$out"
+    return 0
 }
 
 # ── the TCC-protected tree (#427) ─────────────────────────────────────────
@@ -487,7 +592,7 @@ PY
 #
 #   com.eldato.worker-supply        runs=1766  last exit code=126
 #   com.eldato.objective-reminder   runs=44    last exit code=126
-#   com.eldato.controller-watchdog  runs=0     last exit code=126
+#   com.eldato.controller-watchdog  runs=1     last exit code=126
 #   com.tortoise.queue-reconcile    runs=n/a   last exit code=2
 #
 # and every one of them logged the same sentence, 27,322 times for the first:
@@ -515,11 +620,14 @@ PY
 # sits outside the TCC tree and is silently dead on the documented default
 # (`~/Documents/GitHub/agent-infra`), which is why `verify_targets` used to pass it.
 #
-# WHAT THIS GUARD DOES **NOT** COVER, stated so it is not read as a clean bill of health: a job whose
-# *work* touches a `~/Documents` checkout (a `--repo` argument, a `WorkingDirectory`, a `git` call)
-# is just as dead from launchd's context even when its own script is farmed and readable. That is the
-# same root, it is NOT fixable by a path swap here, and it is recorded on #427 rather than papered
-# over.
+# WHAT THIS GUARD DOES **NOT** COVER, stated so it is not read as a clean bill of health:
+#   * a job whose *work* touches a `~/Documents` checkout (a `--repo` argument, a `WorkingDirectory`,
+#     a `git` call) is just as dead from launchd's context even when its own script is farmed and
+#     readable -- the same root, NOT fixable by a path swap here, recorded on #427 rather than papered
+#     over. Those arguments get a WARN (verdict 0), never a refusal.
+#   * a TCC path hidden INSIDE a non-absolute token (`python3 -c 'exec(open(".../Documents/x").read())'`)
+#     is invisible to this check: it classifies ProgramArguments ELEMENTS, not payloads. Measured
+#     (review P3, round 4): such a unit installs with no WARN at all. No shipped template does it.
 tcc_protected_roots() {
     printf '%s\n' \
         "$HOME/Documents" \
@@ -528,64 +636,195 @@ tcc_protected_roots() {
         "$HOME/Library/Mobile Documents"
 }
 
-# is_tcc_protected <absolute path> → 0 when launchd cannot read it.
+# physical_path <path> → the path with every symlink component resolved, or non-zero.
+#
+# `pwd -P` alone resolves only the DIRECTORY, which was the first draft's hole: a farm entry that is
+# itself a symlink into the protected tree (`~/.pi/agent/scripts/x.sh -> ~/Documents/…/x.sh`, the
+# shape `pi-bootstrap/setup.sh` deliberately replaces with real copies) has an unresolvable-by-pwd
+# basename and passed the guard. `readlink` is POSIX (macOS ships it without `-f`), so the loop is
+# explicit rather than a `realpath -f` dependency; the hop bound stops a symlink cycle from hanging
+# the installer.
+physical_path() {
+    local p="$1" n=0 t d b
+    while [ -L "$p" ]; do
+        [ "$n" -lt 40 ] || return 1
+        t="$(readlink "$p" 2>/dev/null)" || return 1
+        [ -n "$t" ] || return 1
+        case "$t" in
+            /*) p="$t" ;;
+            *)  d="$(CDPATH= cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)" || return 1
+                p="$d/$t" ;;
+        esac
+        n=$((n + 1))
+    done
+    d="$(CDPATH= cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)" || return 1
+    b="$(basename -- "$p")"
+    printf '%s/%s\n' "$d" "$b"
+}
+
+# tcc_protected_root <absolute path> → prints the protected ROOT that matched; non-zero when none.
 #
 # TWO resolutions are compared, and BOTH are required:
-#   * the PHYSICAL path of the target, for the reason `launchd_path` does — it is the TARGET that TCC
-#     gates, so a symlink pointing INTO the protected tree is dead while one pointing OUT of it is fine;
+#   * the PHYSICAL path of the target (symlinks included), for the reason `launchd_path` does — it is
+#     the TARGET that TCC gates, so a symlink pointing INTO the protected tree is dead while one
+#     pointing OUT of it is fine;
 #   * the PHYSICAL path of each ROOT, because the roots are built from `$HOME` and `$HOME` itself is
 #     commonly reached through a symlinked ancestor (`/tmp` → `/private/tmp` on macOS). Measured on
 #     this suite's own fixture: HOME=/tmp/… resolved to /private/tmp/…, the literal prefix never
 #     matched, and the guard PASSED the exact TCC-dead target it exists to refuse.
 # A path whose directory cannot be resolved falls back to the literal, and the literal `case` still
 # matches — an unresolvable path must never be the way past this guard.
-is_tcc_protected() {
-    local arg="$1" arg_phys="" dir phys root root_phys candidate
-    dir="$(dirname -- "$arg")"
-    if phys="$(CDPATH= cd -- "$dir" 2>/dev/null && pwd -P)"; then
-        arg_phys="$phys/$(basename -- "$arg")"
-    fi
+# Printing the ROOT (not just a boolean) is what lets verify_targets tell "this launcher holds a grant
+# for THAT tree" from "this launcher holds a grant for a DIFFERENT tree": Documents and Desktop are
+# separate grants, and a boolean verdict asserted "same tree" for both.
+tcc_protected_root() {
+    local arg="$1" arg_phys="" root root_phys candidate
+    arg_phys="$(physical_path "$arg" 2>/dev/null)" || arg_phys=""
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         for candidate in "$arg" "$arg_phys"; do
             [ -n "$candidate" ] || continue
-            case "$candidate" in "$root" | "$root"/*) return 0 ;; esac
+            case "$candidate" in "$root" | "$root"/*) printf '%s\n' "$root"; return 0 ;; esac
         done
         root_phys=""
-        if root_phys="$(CDPATH= cd -- "$root" 2>/dev/null && pwd -P)" && [ "$root_phys" != "$root" ]; then
+        if root_phys="$(physical_path "$root" 2>/dev/null)" && [ "$root_phys" != "$root" ]; then
             for candidate in "$arg" "$arg_phys"; do
                 [ -n "$candidate" ] || continue
-                case "$candidate" in "$root_phys" | "$root_phys"/*) return 0 ;; esac
+                case "$candidate" in "$root_phys" | "$root_phys"/*) printf '%s\n' "$root"; return 0 ;; esac
             done
         fi
     done < <(tcc_protected_roots)
     return 1
 }
 
+# is_tcc_protected <absolute path> → 0 when launchd cannot read it (the boolean form of the above).
+is_tcc_protected() { tcc_protected_root "$1" >/dev/null; }
+
+# is_shebang_script <path> → 0 when the file is a `#!` SCRIPT rather than a binary.
+#
+# THIS IS THE DIFFERENCE BETWEEN A LAUNCHER THAT HOLDS A TCC GRANT AND ONE THAT DOES NOT. #1311
+# measured that `{{TORTOISE_REPO}}/.venv/bin/python` (a BINARY) runs from inside `~/Documents` and can
+# read a checkout there. A `#!` script at argv[0] is different in kind: the kernel hands it to its
+# interpreter, so the binary that READS it is `/bin/bash` — which #427 measured IS denied, exit 126.
+# Without this distinction a shebang launcher inside the tree installs armed-and-dead.
+is_shebang_script() {
+    [ -f "$1" ] || return 1
+    [ "$(head -c 2 -- "$1" 2>/dev/null)" = "#!" ]
+}
+
+
 # Verify every absolute path in ProgramArguments resolves AND is readable from the launchd context
 # (catches broken symlinks — e.g. provider-latency-tripwire.sh pointing at a not-yet-pulled checkout,
 # fixed by re-running setup.sh — and TCC-protected targets, fixed by farming).
-# $1 = rendered plist FILE. Prints offending targets; exits 1 if any.
+#
+# ⛔ THREE VERDICTS, because the three failure classes have different REMEDIES — and folding them into
+# one exit status conflated "fix the install" with "this box can never run this unit":
+#
+#   0  every target resolves and is reachable from launchd (possibly with WARNs, below)
+#   1  a target is MISSING, or the plist cannot be read — fixable by re-running setup.sh/sync.sh, so
+#      the install FAILS and the operator is told to repair the farm
+#   2  every target exists, and an EXECUTED target sits in a TCC root while the unit's LAUNCHER does
+#      not — NOT fixable by any install step (#427), so that ONE unit is skipped loudly (and any copy
+#      a previous run armed is disarmed) while the rest of the install proceeds
+#
+# ⛔ THE LAUNCHER IS THE DISCRIMINATOR, AND BOTH HALVES ARE MEASURED, not inferred:
+#   * #427: a launchd-spawned `/bin/bash` cannot READ a script under `~/Documents` — exit 126
+#     "Operation not permitted", 27,322 log lines for worker-supply. TCC is PER-BINARY.
+#   * #1311: the CHECKOUT'S OWN INTERPRETER (`{{TORTOISE_REPO}}/.venv/bin/python`) does run from there
+#     — the worktree reaper logs `WORKTREES=454 … GH=ok` — and `pi-reap-worktrees-launchd.py` reads the
+#     script itself and pipes it to `bash -s` precisely because bash's own read is denied.
+# So a TCC-root path is only known-DEAD when the process that must read it is a non-TCC binary (a
+# launchd `bash`). A unit whose LAUNCHER is inside the tree holds the access, is installed, and gets a
+# loud WARN instead — refusing (or deleting) it would take a working daily reaper off the box on the
+# documented default, which is the regression this rule exists to avoid.
+#
+# ⛔ AND ONLY THE EXECUTED COMMAND IS VERDICT-2; A TCC-PROTECTED DATA ARGUMENT WARNS. The guard exists
+# so that a job launchd cannot START is never armed — not so that a job whose INPUT is unreachable is
+# treated as uninstallable. THREE shipped templates pass `--repo {{TORTOISE_REPO}}` (plus
+# `corruption-canary` passing `--root {{SWARM_ROOT}}`), and TORTOISE_REPO defaults to
+# `~/Documents/GitHub/tortoise` on the documented box, so refusing data arguments reddened the whole
+# installer there: `install_job … || fail=1` → exit 1, and `sync.sh` (`set -euo pipefail`, installer
+# run unguarded) died before its cost-config and parity gates.
+# The existence check stays unconditional (pre-existing behaviour, and a missing target is a broken
+# install whoever reads it).
+# $1 = rendered plist FILE. Prints offending targets. Returns 0 / 1 / 2 as above.
 verify_targets() {
-    local arg bad=0
-    while IFS= read -r arg; do
+    # ⛔ THE ITERATION COUNT IS PART OF THE CHECK, not decoration: "the feeder emitted nothing" and
+    # "every target verified" were the same observable before #1743, and the repo's own detector
+    # reported this function as an empty-as-PASS for exactly that reason. The feeder's return code
+    # covers "could not read"; this covers "read, and had nothing verifiable in it".
+    local kind arg root args_out bad=0 tcc_exec=0 tcc_launcher=0 launcher_root="" n=0
+    if ! args_out="$(plist_program_args "$1")"; then
+        echo "    cannot read ProgramArguments: $1" >&2
+        echo "        a plist that does not parse is NOT an empty target list — nothing was" >&2
+        echo "        verified, so the job cannot be armed." >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r kind arg; do
         [ -n "$arg" ] || continue
+        n=$((n + 1))
         if [ ! -e "$arg" ]; then
             echo "    broken target: $arg" >&2
             bad=1
             continue
         fi
-        if is_tcc_protected "$arg"; then
-            echo "    TCC-protected target: $arg" >&2
-            echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427);" >&2
-            echo "        it starts this job and bash exits 126 'Operation not permitted', which" >&2
-            echo "        reads as 'installed' to every instrument that only checks existence." >&2
-            echo "        Render the FARMED copy ({{HOME}}/.pi/agent/scripts/…) and declare it in" >&2
-            echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
-            bad=1
-        fi
-    done < <(plist_program_args "$1")
-    return "$bad"
+        is_tcc_protected "$arg" || continue
+        case "$kind" in
+            launcher)
+                if is_shebang_script "$arg"; then
+                    # A `#!` script is read by ITS INTERPRETER (/bin/bash), which #427 measured is
+                    # denied -- exactly the shape of the four units this whole change exists for.
+                    echo "    TCC-protected target: $arg" >&2
+                    echo "        this unit's LAUNCHER is a SHEBANG SCRIPT inside a TCC root, so the" >&2
+                    echo "        kernel hands it to its interpreter -- and #427 measured a launchd bash" >&2
+                    echo "        cannot read such a path (exit 126 'Operation not permitted'). A BINARY" >&2
+                    echo "        there can hold its own grant (#1311); a script cannot hold one at all." >&2
+                    tcc_exec=1
+                    continue
+                fi
+                tcc_launcher=1
+                launcher_root="$(tcc_protected_root "$arg")"
+                echo "    WARN TCC-root launcher: $arg" >&2
+                echo "        this unit RUNS a binary from inside a TCC-protected tree. #1311 measured" >&2
+                echo "        that the checkout's own interpreter does run from there (the worktree" >&2
+                echo "        reaper logs WORKTREES=454 … GH=ok), while #427 measured that a launchd" >&2
+                echo "        \`bash\` cannot READ such a path (exit 126). TCC is PER-BINARY, so" >&2
+                echo "        this is NOT a refusal: the unit installs. Verify with \`launchctl print\`." >&2
+                ;;
+            data)
+                echo "    WARN TCC-protected data argument: $arg" >&2
+                echo "        launchd is measured to deny a non-TCC binary this path (#427), and this" >&2
+                echo "        value is one the job's work READS (not the code it runs), so the unit" >&2
+                echo "        still installs: the part of its work that reads this value is dead. That" >&2
+                echo "        is #427's recorded class, and refusing here blocked every other job on" >&2
+                echo "        the documented default box (--repo under ~/Documents)." >&2
+                ;;
+            *)
+                root="$(tcc_protected_root "$arg")"
+                if [ -n "$launcher_root" ] && [ "$root" = "$launcher_root" ]; then
+                    echo "    WARN TCC-protected target: $arg" >&2
+                    echo "        inside the SAME TCC tree as this unit's launcher ($root), which #1311" >&2
+                    echo "        measured can run from there — installing, not skipping (see the" >&2
+                    echo "        launcher note). A DIFFERENT tree is a different grant and IS refused." >&2
+                    continue
+                fi
+                echo "    TCC-protected target: $arg" >&2
+                echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427);" >&2
+                echo "        it starts this job and bash exits 126 'Operation not permitted', which" >&2
+                echo "        reads as 'installed' to every instrument that only checks existence." >&2
+                echo "        Render the FARMED copy ({{HOME}}/.pi/agent/scripts/…) and declare it in" >&2
+                echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
+                tcc_exec=1
+                ;;
+        esac
+    done <<< "$args_out"
+    if [ "$n" -eq 0 ]; then
+        echo "    no absolute ProgramArguments entry was verified: $1" >&2
+        return 1
+    fi
+    [ "$bad" -eq 0 ] || return 1
+    [ "$tcc_exec" -eq 0 ] || return 2
+    return 0
 }
 
 job_loaded() {
@@ -622,11 +861,41 @@ install_job() {
     fi
 
     rendered="$(render "$template")"
-    # Broken script target → refuse to install a dead job (hard failure).
+    # Broken / unreadable target → FAIL (fixable: re-run setup.sh). A TCC-protected EXEC target →
+    # SKIP this unit loudly (not fixable on this box, #427) and keep installing the rest.
     tmp="$(mktemp)" || return 1
     printf '%s' "$rendered" > "$tmp"
-    if ! verify_targets "$tmp"; then
+    verify_targets "$tmp"
+    local vrc=$?
+    if [ "$vrc" -ne 0 ]; then
         rm -f "$tmp"
+        if [ "$vrc" -eq 2 ]; then
+            echo "  SKIP $label: launchd cannot READ this unit's target — a macOS TCC root (#427)." >&2
+            echo "        It must not stay ARMED: an installed unit that exits 126 'Operation not" >&2
+            echo "        permitted' reads as 'installed' to every instrument that only checks" >&2
+            echo "        existence, which is worse than an absent one. No install step changes this" >&2
+            echo "        box's layout — fix it by farming the target, or on #427 for the job's WORK." >&2
+            # A SKIP MUST DISARM WHAT A PREVIOUS RUN ARMED (review P2). Returning before the
+            # install/remove path left an already-installed+loaded plist in place, so the unit kept
+            # exiting 126 on every tick while this run reported "nothing is installed for it" -- the
+            # exact divergence between the report and reality that the guard exists to remove.
+            # REACHABLE BY CONSTRUCTION, and this PR's own measurement is the proof: a box running
+            # the PREVIOUS installer armed worker-supply / objective-reminder / controller-watchdog
+            # from `{{AGENT_INFRA_PATH}}` (inside `~/Documents`) and they exited 126 for 7 hours.
+            # Reverting any of the three farmed paths, or any future template edit that points a
+            # bash-launched script back into the tree, lands in exactly that state -- installed,
+            # loaded, dead -- and this run must take it OFF. (The two `com.tortoise.*` reapers are
+            # NOT that case: their argv[0] is a BINARY inside the tree, which #1311 measured holds
+            # the grant.)
+            if [ -f "$installed" ]; then
+                launchctl bootout "$DOMAIN" "$installed" 2>/dev/null || true
+                rm -f "$installed"
+                echo "        The previously installed unit was UNLOADED and removed." >&2
+            else
+                echo "        Nothing is installed for this unit." >&2
+            fi
+            return 0
+        fi
         echo "  FAIL $label: script target(s) above are missing or unreachable from launchd —" >&2
         echo "        fix the farm/checkout first (run sync.sh / pi-bootstrap setup.sh), then re-run." >&2
         echo "        Refusing to install: a unit launchd cannot start reads as 'armed' and does" >&2
