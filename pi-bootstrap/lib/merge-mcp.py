@@ -544,6 +544,34 @@ def main(argv):
                 % (type(exc).__name__, exc, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
             )
             dst = {}
+        except OSError as exc:
+            # ⛔ A DESTINATION THAT CANNOT BE READ IS NOT AN UNPARSEABLE ONE, AND IT WAS THE LAST
+            # BARE READ IN THIS FILE (#3374 review, round 10 P2). `except ValueError` caught the
+            # `JSONDecodeError` and let every `OSError` through, so an unreadable `.mcp.json` — a
+            # DIRECTORY at the path, an EACCES, a dangling symlink — escaped as a traceback with the
+            # UNDOCUMENTED rc=1, while the docstring advertises 0/2/3 and `--verify` names exactly
+            # this shape (`UNREADABLE:`). Measured: `mkdir dst.json; merge-mcp.py tpl dst.json` →
+            # `IsADirectoryError` traceback, rc=1. Reachable from the repair loop
+            # (`cloud-cell-bringup.sh`: verify → install → verify), which then dies on Python
+            # internals for a file the verifier had just named correctly.
+            # A path that is not a regular file cannot be `os.replace`d into either, so it is not a
+            # REPLACE to attempt: it is a FATAL, named, exit 3 — the same "cannot read this config"
+            # answer the template guard gives. An unreadable-by-PERMISSION regular file keeps its
+            # bytes (there may be hand-written work in them) and IS replaced, exactly like the
+            # unparseable shape above.
+            if not os.path.isfile(dst_path):
+                sys.stderr.write(
+                    "FATAL: %s is not a readable config file (%s: %s) — a directory, a broken "
+                    "symlink or an unreadable path cannot be replaced, so nothing was written. "
+                    "Move it aside and re-run.\n"
+                    % (dst_path, type(exc).__name__, exc)
+                )
+                return 3
+            print(
+                "NOTE: REPLACED an UNREADABLE .mcp.json (%s: %s); the previous file was saved as %s"
+                % (type(exc).__name__, exc, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
+            )
+            dst = {}
     # ⛔ A TEMPLATE THAT PARSES BUT IS THE WRONG **SHAPE** WAS STILL A TRACEBACK. Guarding `json.load`
     # alone left `tpl.get` on a list (or `base.get` on a non-object `mcpServers`) raising straight out
     # of `main` — rc=1 and Python internals, the very contract the guard above declares closed. A
@@ -576,6 +604,31 @@ def main(argv):
             "FATAL: %s declares a tortoise url of type %s, not a non-empty string — the merge and "
             "`--verify` both read it as the hosted endpoint, so nothing can be compared against it\n"
             % (tpl_path, type(want.get("url")).__name__)
+        )
+        return 3
+    # ⛔ THE TEMPLATE'S OWN ENTRY WAS NEVER RUN THROUGH `usable()` (#3374 review, round 10 P1).
+    # `usable()` is total over every entry this file REPLACES or PRESERVES, but `want` went straight
+    # into `.mcp.json` on every branch — so a template that is not a config a lane could use was
+    # INSTALLED VERBATIM, and the shared config file is exactly where the one unforgivable thing can
+    # land. Measured (merge rc=0 in both cases):
+    #   template Authorization "Bearer tt_AAAABBBBCCCCDDDD"  -> written into .mcp.json verbatim
+    #   template url http://api.premiselabs.co/mcp/           -> installed as the hosted default
+    # `--verify` then REFUSES the file the installer just wrote (SECRET_IN_FILE / INSECURE_URL /
+    # NOTHTTP), and the repair path cannot converge: the next `--install` sees that literal, replaces
+    # it with `want`, and writes the same literal back — a repair loop that prints "REPLACED an
+    # unusable tortoise entry with the hosted default" while producing the unusable entry. It also
+    # contradicts R2 of this change's own contract: no credential is ever written into a shared
+    # config file. The verifier already refuses these shapes, so validating here is what makes the
+    # two sides agree — one predicate, both directions, on the template as well as the cell's copy.
+    _want_ok, _want_why = usable(want, want["url"].strip())
+    if not _want_ok:
+        sys.stderr.write(
+            "FATAL: %s declares an UNUSABLE tortoise entry (%s) — a template is the thing this file "
+            "INSTALLS, so an entry no lane could use must be refused here rather than written into "
+            "a shared config: a literal credential, a non-https endpoint carrying one, a missing "
+            "Authorization on the hosted default, a foreign credential variable, or a non-http "
+            "transport. Fix the template; nothing was written.\n"
+            % (tpl_path, _want_why)
         )
         return 3
 
