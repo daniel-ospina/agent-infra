@@ -6200,6 +6200,18 @@ if [ ! -e "$F_HOME/.pi/agent/.ai-review-gate-key" ] && [ -s "$FLE_PEND" ]; then
 else
     bad "20.13 fixture: a key file exists at \$HOME/.pi/agent/.ai-review-gate-key, or the marker is absent — the vector would not be keyless"
 fi
+# ⛔ THE SIGNATURE'S SHAPE MUST BE ASSERTED TOO, or this pin goes silently INERT (P3,
+# round-9 review — the same gap §20.12 closes above). If `openssl dgst -hmac ""` ever
+# produced no digest, `FLE_SIG_EMPTY` would be empty, the marker would end ` sig=`,
+# :1229's shape guard would refuse it (0 posts) and ALL THREE assertions below would
+# still pass — the zero count, the delivery line, and rc 0 — while mutant D (the
+# :1245 deletion this vector exists to catch) would also stay green. A premise that
+# is never asserted is a pin that can rot without notice.
+if command grep -qE -- " sig=[0-9a-f]{64}$" "$FLE_PEND"; then
+    ok "20.13 fixture: the empty-key sig= is a well-formed 64-hex trailer, so :1229's shape guard is NOT what refuses it"
+else
+    bad "20.13 fixture: the marker's sig= is not 64 hex (did openssl produce no digest?) — the :1229 shape guard would refuse it and this pin would be inert"
+fi
 : > "$LOG"
 FLE_RC=0
 FLE_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" AI_REVIEW_GATE_KEY="" \
