@@ -460,7 +460,10 @@ and still clamps to "just published".
   claims "both sides known and attributable", and the named cause sends the operator to restart a
   controller whose record is merely malformed. An unreadable record (or one whose `at` cannot be
   parsed) now refuses as `why=record-unreadable`, the same answer the collision arm gives: the line and
-  placement must not disagree about who is visible.
+  placement must not disagree about who is visible. The rule covers a record with **no attributable key**
+  too (an older peer writes no `boxid`; `cap_parse_lsremote` passes it through, `cap_place` refuses it
+  as `bound=box_unknown`): the line used to drop it and claim the box was missing, and now refuses as
+  `why=box-unreadable`.
 
 - **A collided key is not a published box.** `cap_parse_lsremote` already marks such a record
   (`collide=1`) and `cap_place` refuses the whole evaluation on it (`bound=identity_collision`),
@@ -491,7 +494,10 @@ and still clamps to "just published".
   line's own `published − extra = expected − INELIGIBLE` invariant broken by a display-only label. The
   label is normalised to the token charset (the one `cap_ref_token` applies to a roster row); an
   ADDRESS carrying whitespace is refused with the listing, because it is the join key and a key that
-  cannot be one token can never match a published record.
+  cannot be one token can never match a published record. The **collision compare keeps the raw name**:
+  normalising it first made `pi cell 2` and `pi_cell_2` compare equal, so two distinct machines behind
+  one address collapsed into one expected entry — the exact false PASS the duplicate-address gate
+  (`DUPLICATEKEY`) exists to stop, and one this change briefly re-opened.
 
 owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
 `cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —

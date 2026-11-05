@@ -2143,10 +2143,12 @@ ck "  …and the line reconciles: expected=1 published=1 INELIGIBLE=0 with no ph
    "$([ "$RC" -eq 0 ] && qF 'expected=1' "$L47" && qF 'published=1' "$L47" && qF 'INELIGIBLE=0' "$L47" \
       && ! qF '(' "$L47" && echo 0 || echo 1)"
 # (c24-mutant) NON-VACUITY: without the label normalisation the same listing names a phantom box.
-# The replacement is a VALID awk no-op (`nm = nm`), not `:` — awk has no empty statement, and an
-# earlier draft of this arm mutated the program into a syntax error, which reddened the control for
-# the wrong reason (the listing refused as unparseable instead of mis-splitting).
-sed 's|        nm = labeltok(nm)|        nm = nm   # MUTANT: no label normalise|' "$CAP" > "$TMP/cap-rawlabel.sh"
+# The replacement is a VALID awk no-op (`nm = raw`, i.e. the un-normalised name), not `:` — awk has no
+# empty statement, and an earlier draft of this arm mutated the program into a syntax error, which
+# reddened the control for the wrong reason (the listing refused as unparseable instead of splitting).
+# ⛔ The target is the ASSIGNMENT (`nm = labeltok(raw)`), not the helper: a mutant that rewrote
+# `labeltok` itself would also change the collision compare's input and could pass for the wrong reason.
+sed 's@        nm = labeltok(raw)@        nm = raw   # MUTANT: no label normalise@' "$CAP" > "$TMP/cap-rawlabel.sh"
 ck "  …the mutant really lost the label normalisation" "$([ "$(grep -c 'MUTANT: no label normalise' "$TMP/cap-rawlabel.sh")" -eq 1 ] && echo 0 || echo 1)"
 L47M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $_INVSP" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-rawlabel.sh" "$(recb 10.8.0.1 "$NOW")" 2>/dev/null)"
 ck "  …mutation control: without it the same listing reads INELIGIBLE=1 naming 'pi' ($L47M)" \
@@ -2157,6 +2159,46 @@ ck "  …mutation control: without it the same listing reads INELIGIBLE=1 naming
 L48="$(printf '%s' '{"machines":[{"name":"pi-1","status":"running","network":{"ipv4":"10.8.0.1 10.8.0.2"}}]}' | cap_parse_inventory 2>&1)"; RC=$?
 ck "(c25) a whitespace-bearing ADDRESS refuses the listing, never a key that cannot join ($L48)" \
    "$([ "$RC" -ne 0 ] && qF 'UNCLASSIFIED' "$L48" && ! grep -qE '^pi-1 ' <<<"$L48" && echo 0 || echo 1)"
+# (c25-mutant) NON-VACUITY: drop the address guard and the unjoinable key is emitted as if it were one.
+sed 's|^        if (ip != "" && ip ~ .*{ bad++; continue }$|        if (0) { }   # MUTANT: no address guard|' "$CAP" > "$TMP/cap-rawaddr.sh"
+ck "  …the mutant really lost the address guard" "$([ "$(grep -c 'MUTANT: no address guard' "$TMP/cap-rawaddr.sh")" -eq 1 ] && echo 0 || echo 1)"
+L48M="$(printf '%s' '{"machines":[{"name":"pi-1","status":"running","network":{"ipv4":"10.8.0.1 10.8.0.2"}}]}' | bash -c '. "$1"; cap_parse_inventory' _ "$TMP/cap-rawaddr.sh" 2>&1)"
+ck "  …mutation control: without it the same listing emits the split key ($L48M)" \
+   "$(case "$L48M" in *'10.8.0.1 10.8.0.2'*) echo 0 ;; *) echo 1 ;; esac)"
+# (c26) ⛔ THE COLLISION GATE COMPARES THE **RAW** NAME, THE OUTPUT USES THE TOKEN ONE (fresh review
+# round 13, P2). Normalising the name BEFORE the `ipseen[ip] != nm` test defeated the round-6 collision
+# gate: `pi cell 2` and `pi_cell_2` normalise to the SAME token, so two distinct machines behind one
+# address compared EQUAL and collapsed into one expected entry — measured, both lines read `pi_cell_2
+# 10.8.0.9` rc 0 where the pre-fix build refused `DUPLICATEKEY 10.8.0.9` rc 1. A key two live boxes
+# answer to is the false PASS that gate exists to stop.
+_INVDUP2='{"machines":[{"name":"pi cell 2","status":"running","network":{"ipv4":"10.8.0.9"}},{"name":"pi_cell_2","status":"running","network":{"ipv4":"10.8.0.9"}}]}'
+L49="$(printf '%s' "$_INVDUP2" | cap_parse_inventory 2>&1)"; RC=$?
+ck "(c26) names that are token-EQUAL but distinct still collide on one address ($L49)" \
+   "$([ "$RC" -ne 0 ] && qF 'DUPLICATEKEY 10.8.0.9' "$L49" && ! qF 'pi_cell_2 10.8.0.9' "$L49" && echo 0 || echo 1)"
+# (c26-mutant) NON-VACUITY: compare the NORMALISED name and the same listing passes as one box.
+sed 's|^        raw = nm$|        raw = labeltok(nm)   # MUTANT: compare normalised|' "$CAP" > "$TMP/cap-dupnorm.sh"
+ck "  …the mutant really compares the normalised name" "$([ "$(grep -c 'MUTANT: compare normalised' "$TMP/cap-dupnorm.sh")" -eq 1 ] && echo 0 || echo 1)"
+L49M="$(printf '%s' "$_INVDUP2" | bash -c '. "$1"; cap_parse_inventory' _ "$TMP/cap-dupnorm.sh" 2>&1)"; RCM=$?
+ck "  …mutation control: comparing the token lets two boxes share one key ($L49M rc=$RCM)" \
+   "$([ "$RCM" -eq 0 ] && [ "$(printf '%s\n' "$L49M" | grep -c 'pi_cell_2 10.8.0.9')" -eq 2 ] && echo 0 || echo 1)"
+# (c27) ⛔ A RECORD WITH NO ATTRIBUTABLE KEY IS NOT "THIS BOX IS NOT PUBLISHING" (fresh review round 13,
+# P2 — the same class one `continue` further in). An older peer's record carries no `boxid` (pre-#2707;
+# `cap_parse_lsremote` passes it through) and `cap_place` REFUSES those bytes (`bound=box_unknown`),
+# while the line dropped the record and claimed `published=0 INELIGIBLE=1 (cell-1)` rc 0 — a membership
+# claim, and "both sides attributable", about a record whose owner cannot be named.
+_NOBID="$(printf '%s\t%s' 'x' "refs/boxes/cell-1/${NOW}-8-1-0-99999-99999" | cap_parse_lsremote)"
+ck "  …fixture: the pre-#2707 record really has no key and placement refuses it (control)" \
+   "$([ -n "$_NOBID" ] && ! qF 'boxid=' "$_NOBID" \
+      && [ "$(printf '%s\n' "$_NOBID" | cap_place cell-1 | head -1 | cut -d' ' -f1-2)" = "refuse bound=box_unknown" ] && echo 0 || echo 1)"
+L50="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$_NOBID" 0)"; RC=$?
+ck "(c27) an unattributable record refuses the reading, never 'this box is not publishing' ($L50)" \
+   "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L50" && qF 'why=box-unreadable' "$L50" && echo 0 || echo 1)"
+# (c27-mutant) NON-VACUITY: restore the pre-fix `|| continue` and the box is reported as missing.
+sed 's@if ! cap_boxid_ok "$bid"; then unk_pub=1; why="${why:-box-unreadable}"; break; fi@cap_boxid_ok "$bid" || continue@' "$CAP" > "$TMP/cap-noboxid.sh"
+ck "  …the mutant really restored the pre-fix drop" "$([ "$(grep -c 'cap_boxid_ok "$bid" || continue' "$TMP/cap-noboxid.sh")" -eq 1 ] && echo 0 || echo 1)"
+L50M="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-noboxid.sh" "$_NOBID" 2>/dev/null)"; RCM=$?
+ck "  …mutation control: dropping the record asserts 'not publishing' rc 0 ($L50M rc=$RCM)" \
+   "$([ "$RCM" -eq 0 ] && qF 'published=0' "$L50M" && qF 'INELIGIBLE=1' "$L50M" && echo 0 || echo 1)"
 # (c8) ⛔ A NUMERIC TTL THE SHELL CANNOT COMPARE IS THE SAME HOLE AS THE COUNT (fresh review round 6,
 # P2): 20 digits makes `[ "$age" -gt "$CAP_PROBE_TTL" ]` error, the stale branch never runs and every
 # record counts fresh — measured `expected=3 published=1 INELIGIBLE=2` rc 0 where the truth (TTL=900) is

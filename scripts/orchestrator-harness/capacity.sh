@@ -1465,7 +1465,15 @@ cap_parse_inventory() {
         # under, so a value that cannot be one token cannot match any published record — the object is
         # UNCLASSIFIABLE (which refuses the listing) rather than a key that silently never joins.
         if (ip != "" && ip ~ /[ \t]/) { bad++; continue }
-        nm = labeltok(nm)
+        # ⛔ THE COLLISION COMPARE RUNS ON THE **RAW** NAME, THE OUTPUT ON THE TOKEN ONE (fresh review
+        # round 13, P2). Normalising `nm` BEFORE the `ipseen[ip] != nm` test below defeated that gate:
+        # `pi cell 2` and `pi_cell_2` normalise to the SAME token, so two distinct machines behind one
+        # address compared equal and collapsed into one expected entry — MEASURED both `pi_cell_2
+        # 10.8.0.9` rc 0 where the pre-fix build refused `DUPLICATEKEY 10.8.0.9` rc 1. A key that two
+        # live boxes answer to is the false PASS the gate exists to stop, so the comparison keeps the
+        # name the provider actually sent and only the emitted label is normalised.
+        raw = nm
+        nm = labeltok(raw)
         # ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
         # expected-side dedupe ("the same box named twice is one box") is right for a roster row and
         # WRONG for the provider inventory, where the key is `network.ipv4`: it silently dropped the
@@ -1474,8 +1482,8 @@ cap_parse_inventory() {
         # live machine became invisible to the instrument built to stop exactly that (round 5 graded the
         # same smaller-denominator shape P1). Refuse the listing instead of picking a winner.
         if (ip != "") {
-          if ((ip in ipseen) && ipseen[ip] != nm) dup = ip
-          else ipseen[ip] = nm
+          if ((ip in ipseen) && ipseen[ip] != raw) dup = ip
+          else ipseen[ip] = raw
         }
         acc = acc nm " " (ip == "" ? "-" : ip) "\n"
         got = 1
@@ -1660,7 +1668,14 @@ cap_fleet_line_from() {
       # below: the line and placement must not disagree about who is visible.
       if ! cap_valid_base_record "$rec"; then unk_pub=1; why="${why:-record-unreadable}"; break; fi
       bid="$(cap_kv "$rec" boxid)"
-      cap_boxid_ok "$bid" || continue
+      # ⛔ A RECORD WITH NO ATTRIBUTABLE KEY IS NOT "THIS BOX IS NOT PUBLISHING" EITHER (fresh review
+      # round 13, P2 — the same class one `continue` further in). An older peer's record carries no
+      # `boxid` (a pre-#2707 writer; `cap_parse_lsremote` passes it through) and `cap_place` REFUSES
+      # those bytes (`bound=box_unknown`) — while this loop dropped the record and the line asserted
+      # `published=0 INELIGIBLE=1 (cell-1)` rc 0, i.e. a membership claim and "both sides attributable"
+      # about a record whose owner cannot be named. The line must not disagree with placement about who
+      # is visible, so an unattributable record refuses the reading and says why.
+      if ! cap_boxid_ok "$bid"; then unk_pub=1; why="${why:-box-unreadable}"; break; fi
       # ⛔ A COLLIDED KEY IS NOT A PUBLISHED BOX (fresh review round 5, P1). `cap_parse_lsremote` marks
       # such a record (`collide=1`, `capacity.sh:cap_parse_lsremote`) and `cap_place` refuses the WHOLE
       # evaluation on it (`bound=identity_collision`) — because two machines under one key mean the
