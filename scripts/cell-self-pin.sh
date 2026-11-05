@@ -296,12 +296,16 @@ pinned_head() {
 
 # mend_record <target> — repoint a MISSING/EMPTY record at the tree `apply` just created for <target>.
 # ⛔ WHY THIS EXISTS, precisely: `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch
-# (cloud-cell-supervisor.sh:2137 sets `HARNESS_APPLIED=unchanged` for a pin already at the tip; :2160 is
+# (cloud-cell-supervisor.sh:2293 sets `HARNESS_APPLIED=unchanged` for a pin already at the tip; :2316 is
 # the only write). So `apply --force --pin-only` on a box whose record was lost exits 0, writes NOTHING
 # and reports `unchanged` — leaving this pass reading an empty record on every tick, for ever. That is
 # #3133 (merged) one layer up: an unhealable RED is as useless as a false GREEN, and the recorded answer
 # is the one `harness-apply-pass.sh` already uses — MEND the record to what the box actually runs, and
 # report it with the code that vocabulary already owns (11, `mended`).
+# ⛔ AND THESE LINE NUMBERS ARE A LOAD-BEARING CLAIM, NOT A PROSE NICETY: a reader deciding whether the hole
+# above is real is being told where to look, so a pointer into the wrong function says "check here" about
+# code that does not do the thing. They were `:2137`/`:2160`, correct at `eb7e4e81`, and were shifted by
+# later merges from main (round-13 review, P2) — re-derived by grep at this head, not guessed.
 # ⛔ AND IT MENDS ONLY FROM THE PIN ROOT. The tree it records is the per-commit worktree `apply` itself
 # created for <target> (`$HARNESS_PIN_DIR/<sha12>`), exactly as `harness_apply` would have named it —
 # never an operator's ad-hoc checkout, and never a tree that is not AT the target.
@@ -346,7 +350,7 @@ check_pin_resolution() { # <layer repo> <target commit> — 0 when the pin verb'
 }
 
 do_pass() {
-  local dry="${1:-}" layer repo sup target applied now rc fetch_branch fetch_ref
+  local dry="${1:-}" layer repo sup target applied now rc fetch_branch fetch_ref fetch_err
   # ⛔ THE ONE-ACTOR INVARIANT IS RE-CHECKED ON EVERY TICK, BUT IT IS NOT THE FIRST THING THE TICK DOES.
   # `retire_actuator` DISABLES the shipped timer, and the first version of this call sat ABOVE
   # `resolve_layer`, `supervisor_in`, the `cd`, the fetch and the ref check — every one of which can exit
@@ -384,8 +388,14 @@ do_pass() {
   # (the `--status-nofetch` reading and every other reader of the tracking ref depend on it), and the second
   # lands this very fetch in the run-private ref — see `PIN_FETCH_REF_BASE` for why `FETCH_HEAD` is not ours
   # and why the destination is keyed by source.
-  git fetch -q origin "$fetch_branch" "+${fetch_branch}:${fetch_ref}" 2>/dev/null \
-    || loud 2 fetch-failed "git fetch origin ${fetch_branch} failed in ${repo} — an unreadable ref is never treated as current"
+  # ⛔ AND GIT'S OWN REASON IS THE ONE THING THIS LINE MUST NOT THROW AWAY. It was `2>/dev/null`, so the
+  # RED said only "git fetch … failed" — the exact pattern this file's own comment at `:142-147` names as
+  # why "the journal could not even say why" an earlier pin tick failed: the operator got a boolean where
+  # git had already written `fatal: could not read Username for 'https://github.com'` / `Could not resolve
+  # host`. `-q` suppresses progress on stdout, so stdout stays discarded and stderr is CAPTURED into the
+  # refusal rather than deleted.
+  fetch_err="$(git fetch -q origin "$fetch_branch" "+${fetch_branch}:${fetch_ref}" 2>&1 >/dev/null)" \
+    || loud 2 fetch-failed "git fetch origin ${fetch_branch} failed in ${repo} — an unreadable ref is never treated as current; git's own reason: ${fetch_err:-<git wrote nothing to stderr>}"
   # ⛔ DECIDE ON THE COMMIT THE FETCH BROUGHT — NOT ON THE KNOB'S SPELLING. `git rev-parse "$HARNESS_REF"`
   # resolves whatever that spelling names LOCALLY, and a fetch of `main` only moves
   # `refs/remotes/origin/main`: so `HARNESS_REF=refs/heads/main` (or a bare `main`) read the STALE local
@@ -502,7 +512,7 @@ do_pass() {
 }
 
 do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = UNRESOLVED (repo vocabulary)
-  local layer sup target rec_head mode="${1:-fetch}" last="<none recorded>" dup unknown fetch_failed=0 fetch_branch fetch_ref
+  local layer sup target rec_head mode="${1:-fetch}" last="<none recorded>" dup unknown fetch_failed=0 fetch_branch fetch_ref status_fetch_err
   [ -f "$O/self-pin.last" ] && last="$(tail -1 "$O/self-pin.last" 2>/dev/null)"
   printf 'cell-self-pin\n  CELL_HOME      %s\n  pin record     %s -> %s\n  pin root       %s\n  pinned HEAD    %s\n  stamp (legacy) %s -> %s\n  last outcome   %s\n' \
     "$CELL_HOME" "$HARNESS_PIN_FILE" "$(head -1 "$HARNESS_PIN_FILE" 2>/dev/null || echo '<absent>')" \
@@ -538,10 +548,13 @@ do_status() { # [fetch|nofetch] — read-only; exit 0 = current, 1 = DRIFT, 2 = 
       nofetch) printf '  (%s NOT fetched — the reading below may be STALE)\n' "$HARNESS_REF" ;;
       *) fetch_branch="$(ref_fetch_branch)" || loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} names another remote's tracking ref, and every fetch in this pass is hardcoded to the 'origin' remote — this reading would be taken from ORIGIN's branch and reported under a ref the operator never asked about; use origin/<branch> or refs/remotes/origin/<branch>"
          fetch_ref="$(pin_fetch_ref "$fetch_branch")"
-         if git -C "$layer" fetch -q origin "$fetch_branch" "+${fetch_branch}:${fetch_ref}" 2>/dev/null; then
+         # ⛔ AND HERE TOO: `2>/dev/null` deleted git's own reason, so the ONE LINE that tells an operator
+         # "this reading is not a green" could not say why the fetch failed. Captured, not discarded — the
+         # same rule the tick's refusal follows.
+         if status_fetch_err="$(git -C "$layer" fetch -q origin "$fetch_branch" "+${fetch_branch}:${fetch_ref}" 2>&1 >/dev/null)"; then
            printf '  (%s fetched just now)\n' "$HARNESS_REF"
          else
-           printf '  (git fetch FAILED in %s — the reading below is against an UNREFRESHED local ref; this is not a green)\n' "$layer"
+           printf "  (git fetch FAILED in %s — the reading below is against an UNREFRESHED local ref; this is not a green; git's own reason: %s)\n" "$layer" "${status_fetch_err:-<git wrote nothing to stderr>}"
            fetch_failed=1
          fi ;;
     esac
@@ -1225,7 +1238,16 @@ verify_timer() { # <rendered timer> [expected Unit= target]
     case "$_c" in
       Condition*) bad "the rendered timer declares ${_c}= — a failed condition SKIPS the timer and leaves it GREEN, so the pin never runs and nothing reds; a missing layer must be a RED payload exit, not a skip"; return 1 ;;
       RootDirectory|RootImage|WorkingDirectory)
-        bad "the rendered timer declares ${_c}= — a bootstrap-time path or root on the one unit whose job is to survive that directory going away (EXIT_CHDIR / 203 leave the pin stopped with every surface green)"; return 1 ;;
+        # ⛔ THE ARM IS RIGHT AND THE REASON THIS FILE GAVE FOR IT WAS FALSE — corrected rather than removed,
+        # because a directive a render BELIEVES it configured is the false-PASS class this whole file is
+        # about, whether or not systemd acts on it. The old text cited `EXIT_CHDIR / 203`, which is a
+        # SERVICE failure mode: measured, `systemd-analyze verify` answers `Unknown key name
+        # 'WorkingDirectory' in section 'Timer', ignoring.` — the key is INERT in `[Timer]`, it cannot cause
+        # CHDIR or 203 because a timer executes nothing. What it does do is survive review looking like a
+        # constraint on the pin's clock while the manager drops it in silence, so it is refused for what it
+        # is: a no-op that reads as configuration. (a timer needs no working directory and no root — the
+        # timer fires the unit and the unit's own rules govern the payload's cwd.)
+        bad "the rendered timer declares ${_c}= — that key is a [Service]-only directive, so systemd answers 'Unknown key name '${_c}' in section 'Timer', ignoring.' and the line has NO effect: it survives review as if it constrained the clock while the manager drops it in silence, which is a green no-op on the one surface that must not lie; a timer fires the unit and needs no working directory and no root — delete the line"; return 1 ;;
     esac
   done
   # ⛔ EXACTLY ONE `Unit=`, AND IT MUST NAME THE PASS. systemd defaults a MISSING `Unit=` to the same-name
@@ -1364,52 +1386,110 @@ verify_timer() { # <rendered timer> [expected Unit= target]
 # so a leg that cannot write them proves nothing about the enumeration — and MEASURED, deleting `/run` and
 # `/usr/lib` from this list left the suite at 240 ok / 0 failed, i.e. nothing pinned it at all.
 SYSTEMD_UNIT_ROOTS="/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system"
-dropin_dirs() { # <unit-dir> <unit-name> — every directory systemd merges for this unit
-  local unit_dir="$1" name="$2" root base svc short seen=" " d
+# ⛔ THE ROOT LIST AND THE ENUMERATION UNDER ONE ROOT ARE TWO DIFFERENT QUESTIONS, and collapsing them into
+# one function made the FIRST one unaskable — which is how an unsearchable root became a PASS (see
+# `verify_dropins`). `dropin_roots` answers "where does systemd look"; `dropin_dirs` answers "which drop-in
+# directories exist under THIS root". The root list is the input to a SEARCHABILITY check, so it has to be
+# reachable even when nothing under the root can be listed.
+dropin_roots() { # <unit-dir> — systemd's own search order, the unit dir first
+  local unit_dir="$1" root
+  printf '%s\n' "$unit_dir"
+  for root in ${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS}; do
+    printf '%s\n' "$root"
+  done
+}
+
+dropin_dirs() { # <root> <unit-name> — every drop-in directory systemd merges FROM THIS ROOT
+  local root="$1" name="$2" base svc short seen=" " d
   svc="${name##*.}"
   base="${name%.*}"
-  for root in "$unit_dir" ${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS}; do
-    [ -d "$root" ] || continue
-    # the unit's OWN drop-in directory is `<unit>.<type>.d` (the full name), not `<unit>.d`
-    for d in "$root/$name.d" "$root/$svc.d"; do
-      case "$seen" in *" $d "*) continue ;; esac
-      if [ -d "$d" ]; then seen="$seen$d "; printf '%s\n' "$d"; fi
-    done
-    # dash truncation: cell-self-pin.service -> cell-self-.service.d, cell-.service.d
-    short="$base"
-    while :; do
-      case "$short" in *-*) ;; *) break ;; esac
-      short="${short%-*}"; short="${short%-}"
-      [ -n "$short" ] || break
-      d="$root/${short}-.${svc}.d"
-      case "$seen" in *" $d "*) continue ;; esac
-      if [ -d "$d" ]; then seen="$seen$d "; printf '%s\n' "$d"; fi
-    done
+  # the unit's OWN drop-in directory is `<unit>.<type>.d` (the full name), not `<unit>.d`
+  for d in "$root/$name.d" "$root/$svc.d"; do
+    case "$seen" in *" $d "*) continue ;; esac
+    if [ -d "$d" ]; then seen="$seen$d "; printf '%s\n' "$d"; fi
+  done
+  # dash truncation: cell-self-pin.service -> cell-self-.service.d, cell-.service.d
+  short="$base"
+  while :; do
+    case "$short" in *-*) ;; *) break ;; esac
+    short="${short%-*}"; short="${short%-}"
+    [ -n "$short" ] || break
+    d="$root/${short}-.${svc}.d"
+    case "$seen" in *" $d "*) continue ;; esac
+    if [ -d "$d" ]; then seen="$seen$d "; printf '%s\n' "$d"; fi
+  done
+}
+
+# root_decidable <path> — 0 when this run can DECIDE whether <path> exists.
+# ⛔ `[ -e "$root" ]` IS AN ANSWER, NOT A READING, AND IT IS NOT ALWAYS A TRUE ONE. `stat` needs every
+# component of the path to be SEARCHABLE, so a root whose PARENT is mode 000 answers `-e` FALSE — "absent"
+# — when the truth is "this run cannot see". Treating that as an absent root is the same false PASS one
+# level up from the one `verify_dropins` was just taught to refuse: measured, `$T/par` at 000 with
+# `$T/par/root/cell-self-pin.service.d/legacy.conf` carrying `WorkingDirectory=/tmp/cell-ai` installs
+# rc=0 and nothing in the run mentions the file. So the ancestors are checked first: an ancestor that
+# exists but cannot be searched makes the child's existence UNDECIDABLE, and undecidable is a REFUSAL.
+root_decidable() { # <path>
+  local p="$1" d
+  [ -e "$p" ] && return 0
+  d="$p"
+  while :; do
+    d="$(dirname "$d")"
+    if [ -e "$d" ]; then
+      [ -x "$d" ] && return 0
+      return 1
+    fi
+    [ "$d" = "/" ] && return 0
+    [ "$d" = "." ] && return 0
   done
 }
 
 verify_dropins() { # <unit-dir> <unit-name>
-  local _dir f
-  for _dir in $(dropin_dirs "$1" "$2"); do
-    # ⛔ A DIRECTORY THIS RUN CANNOT SEARCH IS NOT A DIRECTORY WITH NO DROP-INS. `dropin_dirs` enumerates a
-    # directory on `[ -d ]`, which needs only the PARENT to be searchable — so a drop-in directory the
-    # installer can see but cannot open expanded `"$_dir"/*.conf` to nothing, the loop body never ran, and
-    # this function reported PASS. Systemd still merges a `.conf` from a directory this run could not read:
-    # an unreadable legacy drop-in passed as COMPLIANT while carrying the very `WorkingDirectory=` this
-    # change removes. A guard on the feeder, not a count of an expansion that already lost the evidence.
-    if [ ! -r "$_dir" ] || [ ! -x "$_dir" ]; then
-      bad "the drop-in directory ${_dir} (mode $(ls -ld "$_dir" 2>/dev/null | cut -c1-10)) cannot be READ/SEARCHED by this run, so its .conf files were never inspected — systemd can still load one from it, and 'nothing found here' is not 'nothing installed'; fix its permissions (or remove it) and re-run"; return 1
+  local _root _dir f _seen=" "
+  # ⛔ AN UNSEARCHABLE ROOT IS NOT A ROOT WITH NO DROP-INS — and it was, because the enumeration tested
+  # `[ -d "$root" ]`, which stats the entry itself and needs only the PARENT to be searchable. MEASURED:
+  # a root at mode 000 carrying `cell-self-pin.service.d/legacy.conf` with `WorkingDirectory=/tmp/cell-ai`
+  # under it installed **rc=0**, and nothing in the run mentioned the file. A 000-mode directory still
+  # stats true, so the root was PROCEEDED PAST, not skipped — `[ -d "$root/$name.d" ]` then failed for
+  # every candidate under it and "no drop-ins found" was reported about a directory this run could not
+  # open. systemd (root, and not bound by this run's permissions) merges whatever is inside. So the verdict
+  # is taken on the ROOT, once, BEFORE anything under it is enumerated — a root that exists but cannot be
+  # searched is a REFUSAL, never an empty result.
+  # ⛔ AND THE ROOT LIST IS READ, NOT WORD-SPLIT. `for _root in $(dropin_roots …)` splits on IFS, so a
+  # unit dir containing a space became several bogus roots that each failed `-e` and were skipped — the
+  # enumeration would then report PASS while never looking at the real directory. One path per line.
+  while IFS= read -r _root; do
+    if ! root_decidable "$_root"; then
+      bad "the systemd unit root ${_root} cannot be DECIDED by this run — a parent directory of it is not searchable, so 'it does not exist' and 'this run cannot see it' are the same answer here, and systemd (which is not bound by this run's permissions) may well be merging a ${2}.d/*.conf from it; fix the permissions on that parent (or remove the tree) and re-run"; return 1
     fi
-    for f in "$_dir"/*.conf; do
-      [ -f "$f" ] || continue
-      verify_dropin_file "$f" || return 1
+    if [ -e "$_root" ]; then
+      if [ ! -d "$_root" ]; then
+        bad "the systemd unit root ${_root} exists but is NOT a directory, so this run cannot tell whether a drop-in for $2 lives in it — remove it (or make it the directory systemd's own unit-path list expects) and re-run"; return 1
+      fi
+      if [ ! -r "$_root" ] || [ ! -x "$_root" ]; then
+        bad "the systemd unit root ${_root} (mode $(ls -ld "$_root" 2>/dev/null | cut -c1-10)) cannot be READ/SEARCHED by this run, so it was never enumerated — systemd can still merge a ${2}.d/*.conf from it, and 'nothing found here' is not 'nothing installed'; fix its permissions (or remove it) and re-run"; return 1
+      fi
+    fi
+    for _dir in $(dropin_dirs "$_root" "$2"); do
+      # ⛔ AND THE SAME RULE ONE LEVEL DOWN: a drop-in DIRECTORY this run cannot read/enter expands
+      # `"$_dir"/*.conf` to nothing, the loop body never ran, and this function reported PASS over a
+      # directory whose contents systemd still merges. A guard on the feeder, not a count of an expansion
+      # that already lost the evidence.
+      case "$_seen" in *" $_dir "*) continue ;; esac
+      _seen="$_seen$_dir "
+      if [ ! -r "$_dir" ] || [ ! -x "$_dir" ]; then
+        bad "the drop-in directory ${_dir} (mode $(ls -ld "$_dir" 2>/dev/null | cut -c1-10)) cannot be READ/SEARCHED by this run, so its .conf files were never inspected — systemd can still load one from it, and 'nothing found here' is not 'nothing installed'; fix its permissions (or remove it) and re-run"; return 1
+      fi
+      for f in "$_dir"/*.conf; do
+        [ -f "$f" ] || continue
+        verify_dropin_file "$f" || return 1
+      done
     done
-  done
+  done < <(dropin_roots "$1")
   return 0
 }
 
 verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the search-path loop stays a loop
-  local f="$1" body _c _kv grep_rc
+  local f="$1" body _c _kv grep_rc _expect_user _n_user _u
     # ⛔ A READ THAT FAILED IS NOT A FILE WITH NOTHING IN IT, and that is the whole false PASS: `grep`'s
     # exit status used to be DISCARDED, so a drop-in this run could not read (0600 and root-owned, an I/O
     # error) produced an EMPTY body, every rule below passed on nothing, and `--install` went on to print
@@ -1463,6 +1543,42 @@ verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the 
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
         SuccessExitStatus)
           bad "the installed drop-in ${f} declares SuccessExitStatus= — it would widen the unit's green vocabulary past 0/11, which is a false PASS; remove ${f}"; return 1 ;;
+        User)
+          # ⛔ THE ONE DIRECTIVE THIS FUNCTION'S OWN COMMENT ADVERTISED AS ALLOWED AND NEVER READ. The
+          # header above says a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)", while the rule it
+          # introduces is that a drop-in MAY NOT re-open a class `verify_unit` closed — and `verify_unit`
+          # refuses any `User=` that is not the owner of `$CELL_HOME`, because that is the identity whose
+          # git can answer for the tree this pass pins. MEASURED: a drop-in carrying `User=root` installed
+          # **rc=0** and printed "installed — ONE actuator on this pin" — the exact #3194 outcome
+          # (`UNRESOLVED(no-layer)` every tick, root's git refusing the cell user's checkout as dubious
+          # ownership) reached by applying this file's own documented migration. Worse than a dead pin: the
+          # payload lives under `$CELL_HOME/.pi/agent/scripts`, owned by the cell user, so a root-runnable
+          # artifact executes bytes that user can replace.
+          # ⛔ AND AN EMPTY `User=` IS THE SAME DEFECT, not a harmless reset: `systemd.exec(5)` restores the
+          # manager's default identity, which for a SYSTEM unit is root. `$(directive …)` cannot see it (an
+          # empty value and an absent one both yield the empty string), so the value is read as RAW LINES
+          # through a process substitution, which preserves an empty field.
+          # Derived here, never passed in, so the drop-in rule and the rendered-unit rule cannot disagree
+          # about the expected owner.
+          _expect_user="$(cell_home_owner)" \
+            || { bad "cannot determine the owner of CELL_HOME ('${CELL_HOME}') to verify the drop-in ${f}'s User= against — refusing rather than accepting an identity nothing can check"; return 1; }
+          _n_user=0
+          while IFS= read -r _u; do
+            _n_user=$((_n_user + 1))
+            [ "$_u" = "$_expect_user" ] && continue
+            if [ -z "$_u" ]; then
+              bad "the installed drop-in ${f} declares an EMPTY User= — systemd resets to the manager's DEFAULT identity, which for a system unit is root, and root's git cannot answer for the tree this pass pins (dubious ownership), so every tick REDs with the unit still reporting installed; a drop-in may adjust IDENTITY, and the only installable identity here is '${_expect_user}', the owner of CELL_HOME; remove ${f}"; return 1
+            fi
+            bad "the installed drop-in ${f} declares User='${_u}' — it is merged OVER the rendered unit, so the pass would run as that user instead of '${_expect_user}', the owner of CELL_HOME; the pin would then fail on every tick (that identity's git cannot answer for the tree) while this install reported success; a drop-in may adjust IDENTITY, never to an identity that cannot pin; remove ${f}"; return 1
+          done < <(printf '%s\n' "$body" | sed -n 's/^[[:space:]]*User[[:space:]]*=[[:space:]]*//p')
+          # ⛔ AND THERE IS DELIBERATELY NO `$_n_user -eq 0` ARM. This arm only runs for a name
+          # `directive_names` matched, and that regex (`^[[:space:]]*User[[:space:]]*=.*`) requires the
+          # same `=` this `sed` splits on, so the sed always yields at least one line — an EMPTY value
+          # included, which is what the process substitution is for. Such a branch could never fire; a
+          # refusal arm no leg can reach is exactly what this file refuses elsewhere, so it is not
+          # written at all (round-14 review, P2). `_n_user` is kept as the count that the loop fills,
+          # so a future rule can assert on it without re-deriving it.
+          ;;
         Unit|On*)
           # ⛔ A TIMER DROP-IN CAN RE-TARGET OR RE-SCHEDULE THE PIN. `Unit=` names the unit the timer
           # activates and the `On*=` family sets when it fires, so a drop-in carrying either makes the timer
