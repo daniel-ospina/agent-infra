@@ -193,6 +193,16 @@ check_included 'epic of ... (bare epic, no separator)' \
   "$(iss 900029 'epic of the v4 selection workstream')"
 check_included 'epic — ... (bare epic, no separator)' \
   "$(iss 900031 'epic — end-to-end proof the workstream works')"
+# ⛔ THE SAME TRADE-OFF APPLIES TO `analysis` AND `investigation`, AND IT WAS UNPINNED (review, P3).
+# §1 pins the SEPARATOR forms (`analysis: …`, `investigation: …`) as excluded, and the definition
+# comment says these two kinds are "carried"; under the structural requirement the BARE spelling has
+# no separator and is therefore PICKABLE. That is the correct direction — excluding a bare prefix is
+# what dropped `analysis-paralysis fix:` — but it is a real behaviour CHANGE for these two kinds, so
+# it is pinned as an inclusion here rather than left to be read as parity with the old rule.
+check_included 'analysis (bare, no separator)' \
+  "$(iss 900032 'analysis of the recall loss across the two stores')"
+check_included 'investigation (bare, no separator)' \
+  "$(iss 900033 'investigation into the container reaper double-fire')"
 
 # ── 5. UNKNOWN SPELLINGS STAY PICKABLE (the documented failure direction) ────────────────────
 check_included 'unknown kind' "$(iss 900030 'thingamajig(scope): a kind nobody has enumerated yet')"
@@ -216,7 +226,7 @@ RANKS="$(awk '{printf "%s", $0} /\\$/{next} {print ""}' "$RC" \
 if [ "$RANKS" = "P0-blocker -> 0 P1-severe -> 1 P2-moderate -> 2" ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [selftest contract] the tier->rank pairs selftest.sh extracts came out '$RANKS' — expected 'P0-blocker -> 0 P1-severe -> 1 P2-moderate -> 2'"; fi
 
-# ── 7. THE COMPOSED CALL-SITE STATEMENTS ────────────────────────────────────────────────────
+# ── 8. THE COMPOSED CALL-SITE STATEMENTS ────────────────────────────────────────────────────
 # ⛔ EVERYTHING BELOW READS THE CONTINUATION-JOINED SOURCE, AND PINS WHAT FOLLOWS THE ARGUMENT TOO.
 # A pin that greps ONE LINE cannot see an arm moved onto a continuation, and one that strips a
 # redirect greedily cannot see a post-filter. Both measured (review cycle 5, P1) — each left this
@@ -270,7 +280,7 @@ SPLICE_LOCAL="'\"\$pool_jq\"'"
 # `64 passed, 0 failed` while dropping 11 LIVE P2 rows, and the same arm at the floor dropped live P0
 # #4282. An APPENDED arm only red the behavioural pin because it crashed jq on a string, which is not
 # the property anyone wants. Equality reds on any prepended arm, any appended arm and any re-spelt
-# splice, whatever the fixture says — the same shape §8(b) uses for the definition itself.
+# splice, whatever the fixture says — the same shape §9(b) uses for the definition itself.
 A0="'.[]|${SPLICE_POOL}|\"0 \\(.number)\"'"
 A1="'.[]|${SPLICE_POOL}|\"1 \\(.number)\"'"
 A2="'.[]|${SPLICE_POOL}|\"2 \\(.number)\"'"
@@ -280,7 +290,7 @@ pin_site 'P1 tier' '|"1 \(.number)"' "$A1" '2>>"$O/.pool-err"; then echo "P1-sev
 pin_site 'P2 tier' '|"2 \(.number)"' "$A2" '2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"' '2 900051'
 pin_site 'emergency floor' '"$pool_jq"' "$AF" '> "$o/.emergency-issues" 2>/dev/null; then' '900051'
 
-# ── 8. THE DRIFT PINS — one definition, one binding, four call sites, no private copies ─────
+# ── 9. THE DRIFT PINS — one definition, one binding, four call sites, no private copies ─────
 # (a) THE SPLICE CENSUS. `grep -c POOL_JQ` is satisfied by comments and by three of four sites, so it
 # cannot fail on a dropped call site — pinned by review cycle 2 (P1) after a mutation that removed one
 # site's filter still passed. This counts the exact splice text instead, comments excluded.
@@ -316,16 +326,16 @@ else bad=$((bad+1)); echo "FAIL [drift] the emergency floor's \`local pool_jq=\`
 # independent verbs, and each of the last four left this suite at `66 passed, 0 failed` while giving
 # the floor its own program (bash locals are function-scoped, so all of them assign THROUGH the pinned
 # binding and leave it pristine). So the invariant is stated on the SYMBOL: the only two lines that may
-# mention `pool_jq` are the binding (a2) and the one splice §7 pins. A third mention is a private
+# mention `pool_jq` are the binding (a2) and the one splice §8 pins. A third mention is a private
 # program by construction, whatever spelling produced it.
 pq_lines="$(printf '%s\n' "$NONCOMMENT" | grep -c 'pool_jq' 2>/dev/null || true)"
 if [ "${pq_lines:-0}" -eq 2 ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] \`pool_jq\` is mentioned on ${pq_lines:-0} non-comment line(s) - expected exactly 2 (the binding and the floor's splice); any third mention is a private pool program"; fi
 
 # (b2) THE DEFINITION SYMBOL CENSUS — `POOL_JQ` IS MENTIONED ON EXACTLY FIVE NON-COMMENT LINES
-# (review cycle 5, P2). §8(b) pins the TEXT of the column-0 assignment, so an INDENTED second
+# (review cycle 5, P2). §9(b) pins the TEXT of the column-0 assignment, so an INDENTED second
 # statement — `  POOL_JQ="${POOL_JQ}|select((.title//"")|test("mcp";"i")|not)"` — appended to the
-# program while ndef stayed 1, SEL stayed pristine, and §8(b) compared the pristine line to itself:
+# program while ndef stayed 1, SEL stayed pristine, and §9(b) compared the pristine line to itself:
 # measured `66 passed, 0 failed` at both suites with all FOUR sites then running the narrowed program.
 # The census counts the definition, the three tier splices and the floor's binding — a second
 # assignment, an `+=`, or any new mention reds wherever it sits and however it is spelled.

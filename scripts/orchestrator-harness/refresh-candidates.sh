@@ -66,6 +66,14 @@ set -u
 # failure is SILENT DISAPPEARANCE (#8465), so adding a container kind is a TEST change, never a
 # runtime guess. Measured effect of the whole change on the live queue: 192 → 179 pickable, and
 # NOT ONE issue newly included — it can withhold a container, never hide work.
+# ⛔ AND THE WITHHELD SET IS NOT ONLY A POOL COUNT (review, P3). The same predicate now also decides the
+# EMERGENCY CLASS (`write_emergency_queue` below consults it), so a P0-TITLED container leaves the
+# emergency class too: tortoise#10977 `tracking: making the hosted graph usable …` carries `P0-blocker`
+# and is withheld, which means the product floor can stand down on a pass whose only unassigned P0 is a
+# container. That is the CORRECT consequence under the decision above (a tracking umbrella is not a
+# dispatchable unit, and the floor exists to weigh dispatchable work), but "it can withhold a container"
+# reads as a queue-size claim, and this one changes a FLOOR DECISION — so it is named here rather than
+# left to be inferred from the count.
 #
 # ⛔ `owner-decision` IS DELIBERATELY NOT IN THE LABEL ARM. Its description says "not for the
 # lane or orchestrator", but it is applied to real work rows — `fix(mcp): tortoise_create_source
