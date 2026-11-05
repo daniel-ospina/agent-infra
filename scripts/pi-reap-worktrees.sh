@@ -3123,8 +3123,11 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # not an accident (`templates/systemd/eldato-pr-repair.service`, "they stay separate units with
     # separate names and separate installers"). So the two production invokers of the reaper do NOT
     # carry `HARNESS_PIN`: the repair unit, and the doctor's hygiene role, which resolves the pin tree
-    # from `$HARNESS_PIN_DIR` and never names `$HARNESS_PIN_FILE` (the only readers of that one are
-    # `install.sh` and `harness-apply-pass.sh`).
+    # from `$HARNESS_PIN_DIR` and never names `$HARNESS_PIN_FILE`. ⛔ NOT an enumeration: a "the only
+    # readers of that one are …" draft was FALSE (a `grep` also puts `harness-refresh.sh`,
+    # `check-deployed-drift.sh`, `orchestrator-bringup.sh`, `cloud-cell-supervisor.sh`, `harness-exec.sh`
+    # and `orch-pin-exec.sh` among the readers), and a false enumeration here is the defect class this
+    # PR exists to remove. The claim is about the DOCTOR, so it is stated as one.
     # What is true of the two scripts named above is only that neither EXPORTS it; the plist is the
     # exporter, so "neither exports it" is not evidence about the reaper's environment. It IS inert in
     # exactly two measured contexts: the plist-launched scheduled disk reaper, whose WHOLE

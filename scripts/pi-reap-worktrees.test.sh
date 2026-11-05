@@ -732,7 +732,7 @@ run_reaper() {
     # assertion it protects passed against the exact pre-fix spelling. A test that bypassed this helper
     # to hand-roll `env -u HOME` lost every other seam (see G15i). So the seams stay ONE list and the
     # unset is applied LAST, by `env`, to the same list: the `HOME=` assignment reaches `env`, and
-    # `--unset=HOME` removes it before bash starts. The array is NEVER empty (it carries a no-op name on
+    # `-u HOME` removes it before bash starts. The array is NEVER empty (it carries a no-op name on
     # the default path) because `"${arr[@]}"` on an empty array is an unbound-variable error under
     # `set -u` in bash 3.2, which this suite must run on.
     # `-u NAME`, not `--unset=NAME`: BSD/macOS `env` has no long options, and it answers an unknown
@@ -5355,18 +5355,30 @@ assert_contains "$(row_for "$OUT" "$DIRWT")" "UNREADABLE" \
 # the empty `head` result, which is the right end state and is exactly what G15-M12 asserts), so the
 # FIFO is the disjunct's remaining reason to exist and it is driven here.
 # ⛔ BOUNDED, DELIBERATELY, AND NOT WITH `timeout` (not in BSD userland): a bare run would hang the
-# SUITE rather than fail a leg, so the pair is driven by a background `sleep` + `kill`, and a bound
-# that fires is an assertion failure, never a silent pass. ⛔ THE OUTPUT GOES TO A FILE, NOT THROUGH
-# `$( )`: a command substitution is a SUBSHELL, so a status the helper set would be lost and the
-# caller would read an unbound variable (measured — the first draft of this helper did exactly that).
+# SUITE rather than fail a leg, so the pair is driven by a `sleep` + `kill`, and a bound that fires is
+# an assertion failure, never a silent pass. ⛔ THE OUTPUT GOES TO A FILE, NOT THROUGH `$( )`: a command
+# substitution is a SUBSHELL, so a status the helper set would be lost and the caller would read an
+# unbound variable (measured — the first draft of this helper did exactly that).
+# ⛔ AND THE BOUND MUST KILL THE WHOLE PROCESS GROUP, NOT THE JOB HANDLE. `run_reaper` is a FUNCTION
+# whose last act is `env … bash <reaper>`, and the blocked `head` sits THREE levels below `$pid` — so a
+# `kill -9 "$pid"` reaps the wrapper and leaves `head` blocked in `open()` FOR EVER, with the FIFO
+# already unlinked so nothing can ever unblock it. That is not theoretical: the first draft of this
+# helper leaked one 4-process chain per suite run, MEASURED as two live chains 8m14s and 1m34s old after
+# two runs. `set -m` gives each background job its OWN process group, which is what makes the group
+# kill reach it.
 _bounded_reap() { # <secs> <shell-command> <outfile> -> exit status IS the reaper's (137 = killed)
     local secs="$1" cmd="$2" out="$3" pid killer rc
+    set -m
     eval "$cmd" >"$out" 2>&1 &
     pid=$!
-    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    ( sleep "$secs"; kill -9 -- "-$pid" 2>/dev/null ) >/dev/null 2>&1 &
     killer=$!
+    set +m
     wait "$pid" 2>/dev/null; rc=$?
-    kill -9 "$killer" 2>/dev/null; wait "$killer" 2>/dev/null
+    # …and the killer gets its own group too, so its `sleep` cannot outlive it and late-fire `kill` at a
+    # pid the system has since reused.
+    kill -9 -- "-$killer" 2>/dev/null
+    wait "$killer" 2>/dev/null
     return "$rc"
 }
 ENV=pin_tree_fiforec
