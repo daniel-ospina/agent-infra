@@ -1289,8 +1289,8 @@ review_record_carry_candidates() {
 #   the ones tried, and exhausting it is REPORTED as a refusal.
 c_carry_resolve() { # <pr-body> <commit-messages> <pr> <repo> <current-head> [<admitted-comment-markers>]
   local body="$1" commits="$2" pr="$3" repo="$4" head="$5" ctext="${6:-}"
-  local cands ph pd pv n=0 tried=0 nodhead="" why="" whyhead=""
-  C_CARRIED_HEAD=""; C_CARRIED_DIFF=""; C_CARRIED_VERDICT=""; C_CARRY_WHY=""; C_NODIGEST_HEAD=""; C_REFUSED_HEAD=""
+  local cands ph pd pv n=0 tried=0 nodhead="" why="" whyhead="" relay=""
+  C_CARRIED_HEAD=""; C_CARRIED_DIFF=""; C_CARRIED_VERDICT=""; C_CARRY_WHY=""; C_NODIGEST_HEAD=""; C_REFUSED_HEAD=""; C_CARRY_RELAY=""
   # The PR body first, then commit messages, then the ADMITTED comment markers —
   # the same precedence the head-bound resolution uses, minus the record file (a
   # record cannot be carried by content identity alone: it carries no marker, and
@@ -1318,10 +1318,16 @@ c_carry_resolve() { # <pr-body> <commit-messages> <pr> <repo> <current-head> [<a
       return 0
     fi
     # The FIRST refusal is the NEWEST candidate's — a reason from a marker
-    # further down the list would describe evidence that is not the newest.
-    if [[ -z "$why" ]]; then why="$C_CARRY_WHY"; whyhead="$ph"; fi
+    # further down the list would describe evidence that is not the newest. The producer's
+    # red-group lines travel WITH that reason, so they are stashed here and relayed once below:
+    # printing them per ask would repeat the block and could leave groups above a message that
+    # describes a different candidate's cause (#3440 review, nit 4).
+    if [[ -z "$why" ]]; then why="$C_CARRY_WHY"; whyhead="$ph"; relay="$C_CARRY_RELAY"; fi
   done <<<"$cands"
   C_CARRY_WHY="$why"; C_NODIGEST_HEAD="$nodhead"; C_REFUSED_HEAD="$whyhead"
+  # ONCE, immediately above the refusal that check (c) will print — which is what makes that
+  # refusal's "named in the producer's own output above" true. Empty for every non-surface cause.
+  c_carry_relay_red "$relay"
   if [[ "$tried" -gt 0 ]]; then
     if [[ -z "$C_CARRY_WHY" ]]; then
       C_CARRY_WHY="the carry predicate could not be run for any candidate marker"
@@ -1352,15 +1358,57 @@ c_carry_resolve() { # <pr-body> <commit-messages> <pr> <repo> <current-head> [<a
 #   is a verb this gate can only get from a producer at this revision; a recorder
 #   too old to understand it exits 2 with no verdict line, which lands on the
 #   catch-all refusal and names the tooling fault instead of grading the PR.
+
+# c_carry_relay_red <producer-stderr-text> — echo the producer's own red-group lines into THIS
+# gate's output. `record-review.sh --check-carry` writes the groups it is accepting or refusing to
+# stderr; for a required status check (GATE mode) that is the only place an operator can learn
+# WHICH check is failing, so discarding it left the gate's own "named in the producer's output
+# above" claim with nothing above it (#3440 review of `554d272`, P2). NO PIPE (#841/#864): a
+# here-string feeds the loop.
+c_carry_relay_red() { # <producer-stderr-text>
+  local ln=""
+  [[ -n "$1" ]] || return 0
+  while IFS= read -r ln; do
+    case "$ln" in
+      *"Red group(s):"* | *"You are accepting:"*) echo "      $ln" ;;
+    esac
+  done <<< "$1"
+}
+
 c_carry_ask() {
-  local pr="$1" repo="$2" rh="$3" rd="$4" out="" rc=0 tok="" recd="" live=""
+  local pr="$1" repo="$2" rh="$3" rd="$4" out="" rc=0 tok="" recd="" live="" cerr="" errf=""
   C_CARRY_TOKEN=""
   C_CARRY_WHY=""
+  # The producer's red-group lines, for the CALLER to relay once (see C_CARRY_RELAY in
+  # c_carry_resolve). Relaying them here instead would print them once PER CANDIDATE ASKED and,
+  # worse, above a refusal whose reason came from a DIFFERENT candidate — so the text would
+  # contradict the message it is supposed to support (#3440 review, nit 4).
+  C_CARRY_RELAY=""
   if [[ ! -f "$RECORDER" || ! -r "$RECORDER" ]]; then
     C_CARRY_WHY="the carry predicate could not be EXECUTED — record-review.sh is not readable beside this gate (looked at $RECORDER), so whether the reviewed diff is unchanged is UNVERIFIABLE, and an unverifiable carry is refused"
     return 1
   fi
-  out="$(bash "$RECORDER" --check-carry "$pr" "$repo" --recorded-diff "$rd" --recorded-head "$rh" 2>/dev/null)" || rc=$?
+  # ⛔ THE PRODUCER'S STDERR IS KEPT, NOT THROWN AWAY (#3440 review of `554d272`, P2). Two
+  # messages below tell the operator the red groups were "named in the producer's own output
+  # above" — while this line used to discard that output with `2>/dev/null`. `record-review.sh`
+  # writes every red-group line to STDERR, so in GATE mode (the population where check (c) is a
+  # required status check and no rail re-measures anything) the one datum an operator needs was
+  # never present. Capture it here and relay it in the red arms below, which is what makes those
+  # claims TRUE rather than merely reassuring.
+  errf="$(mktemp "${TMPDIR:-/tmp}/pcc-carry-ask.XXXXXX" 2>/dev/null)" || errf=""
+  if [[ -n "$errf" ]]; then
+    out="$(bash "$RECORDER" --check-carry "$pr" "$repo" --recorded-diff "$rd" --recorded-head "$rh" 2>"$errf")" || rc=$?
+    cerr="$(command cat "$errf" 2>/dev/null || true)"
+    command rm -f "$errf" 2>/dev/null || true
+  else
+    # No temp file: fall back to discarding, and the relay below is simply empty. A read builtin
+    # is used instead of a pipeline throughout — a producer piped into a quiet reader can take
+    # SIGPIPE under this repo's `pipefail` (#841/#864).
+    out="$(bash "$RECORDER" --check-carry "$pr" "$repo" --recorded-diff "$rd" --recorded-head "$rh" 2>/dev/null)" || rc=$?
+  fi
+  # Relay ONLY the lines that NAME a group (or name the set being accepted). Everything else on the
+  # producer's stderr is its own diagnostic and would drown the gate's output; a transport warning
+  # must not be dressed up as a finding either.
   if [[ -n "$out" ]]; then
     # The producer's documented line, FIRST line only: `<verdict>\t<record
     # digest|->\t<live digest|status>`. A recorder that printed diagnostics
@@ -1380,6 +1428,8 @@ c_carry_ask() {
   # (`red-surface`) and a surface that could not be READ (`surface-unknown`) refuse
   # below: those are the false PASSes #3440 measured.
   if [[ "$rc" -eq 0 && "$tok" == "red-base-owned" ]]; then
+    # A SUCCESS terminal: c_carry_resolve stops here, so relaying now is relaying once.
+    c_carry_relay_red "$cerr"
     C_CARRY_WHY="diff unchanged (${recd:0:12}… = ${live:0:12}…); the head's check surface is RED but BASE-OWNED — the producer named the groups in its own output above. On a rail repo the rail re-measures base reds against its own reproduction before it merges anything (#3322/#3715); in gate mode this same-name comparison is the only evidence and is a named residual. This gate passing is not a claim that the head is green"
     return 0
   fi
@@ -1413,7 +1463,9 @@ c_carry_ask() {
       # (#3440) THE FALSE PASS THIS ISSUE MEASURED. The diff may be identical and the
       # record may be perfectly valid — the TREE is broken, and this gate must not be
       # greener than the truth. Refusing here reddens the PR's own CI on a red the PR
-      # caused, which is exactly what a red check should do.
+      # caused, which is exactly what a red check should do. The red-group lines are
+      # STASHED, not printed: the caller relays them only for the refusal it reports.
+      C_CARRY_RELAY="$cerr"
       C_CARRY_WHY="the JUDGED head's CHECK SURFACE IS RED (the JUDGED head is the LIVE head the producer would merge — this gate asks about an EARLIER head, so the recorded head is NOT the one judged; an unread live head answers 'surface-unknown' below, never a substitution) and the red is NOT shown base-owned (the producer named the red group(s) in its own output above) — the record may cover the artifact, but it does not cover a tree whose checks are failing, and passing here would be the false PASS of #3440 (#3355 was attested clean over 7 red checks). Fix or re-run the failing checks — a re-review is not the remedy for a broken build" ;;
     8:surface-unknown)
       C_CARRY_WHY="the JUDGED head's check surface could NOT BE READ (the producer answered 'surface-unknown': a refused gh/API read, an unreadable PR HEAD identity — in which case no sha was judged at all and the RECORDED head was NOT substituted — or no repo resolvable for the check-runs query). A read that FAILED is not a green surface, so nothing is certified here — this is a transport/budget fault, not a fault of the PR, and the remedy is to RE-RUN this gate, not to change the code" ;;
@@ -2389,7 +2441,7 @@ run_checks() {
         # own verdict, not a whole-text rescan — see the ONE-WRITER note above.
         C_CARRIED_PASS="code-review record CARRIED from ${C_CARRIED_HEAD:0:12}… — diff unchanged (diff_sha256 ${C_CARRIED_DIFF:0:12}…)"
         if [[ "$C_CARRY_TOKEN" == "red-base-owned" ]]; then
-          C_CARRIED_PASS="$C_CARRIED_PASS; ⛔ the head's CHECK SURFACE IS RED but BASE-OWNED (#3440) — every red group also reproduces on the base (the producer named them in its own output above). This gate passing is NOT a claim that the head is green: base ownership here is the PRODUCER's same-name comparison, and on a rail repo the rail re-measures it against its own reproduction (#3322/#3715) before it exempts anything — in gate mode nothing else does, which is a named residual, not a guarantee"
+          C_CARRIED_PASS="$C_CARRIED_PASS; ⛔ the head's CHECK SURFACE IS RED but BASE-OWNED (#3440) — every red group also reproduces on the base (the producer named them in its own output above, relayed from its stderr by check (c)). This gate passing is NOT a claim that the head is green: base ownership here is the PRODUCER's same-name comparison, and on a rail repo the rail re-measures it against its own reproduction (#3322/#3715) before it exempts anything — in gate mode nothing else does, which is a named residual, not a guarantee"
         fi
         grade_c_record "$C_CARRIED_VERDICT" "$C_CARRIED_PASS"
       elif [[ "$C_CARRY_RC" -eq 1 ]]; then
@@ -3452,9 +3504,15 @@ case "${PCC3315_MODE:-carry}" in
   nodigest)    printf 'nodigest\t-\t-\n'; exit 5 ;;
   unreadable)  printf 'unreadable\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 3 ;;
   carry-patch) printf 'carry-patch\t%s\t%s\n' "${PCC3315_DIGEST:-}" cccccccccccc; exit 6 ;;
-  # (#3440) the three CHECK-SURFACE verdicts, modelled exactly as the producer emits them.
-  red-base-owned) printf 'red-base-owned\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
-  red-surface)  printf 'red-surface\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 7 ;;
+  # (#3440) the three CHECK-SURFACE verdicts, modelled exactly as the producer emits them —
+  # INCLUDING the red-group lines it writes to STDERR, because check (c) now RELAYS them
+  # (see c_carry_relay_red): its pass/refusal text tells the operator the groups were named
+  # "in the producer's own output above", and before that relay existed the gate threw that
+  # stderr away with `2>/dev/null` (review of `554d272`, P2). Passes 33/34 pin the relay.
+  red-base-owned) printf 'record-review.sh --check-carry: RED, and every red group ALSO reproduces on the base — You are accepting: CI|verify\n' >&2
+                  printf 'red-base-owned\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
+  red-surface)  printf 'record-review.sh --check-carry: RED and NOT shown base-owned — Red group(s): CI|bash-suites (3)\n' >&2
+                printf 'red-surface\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 7 ;;
   surface-unknown) printf 'surface-unknown\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 8 ;;
   # THE PREDICATE'S REAL PREDICATE, MODELLED: `carry` only for the digest it was
   # minted over, `fresh` for anything else. Without this mode a stub that answers
@@ -3537,7 +3595,7 @@ C3315_STUB_EOF
     rm -f "$log"
   }
   echo ""
-  echo "== SIMULATION: passes 15–31b (#3315: check (c) consults the carry) =="
+  echo "== SIMULATION: passes 15–35 (#3315 × #3440: check (c) consults the carry) =="
   # ⛔ HERMETIC KEY STATE (found the hard way). `review_gate_key` falls back to
   # ~/.pi/agent/.ai-review-gate-key, so these cases inherited whatever key the BOX
   # happened to hold. Measured: with a key file present, pass 30 (an admitted comment
@@ -3693,6 +3751,47 @@ C3315_STUB_EOF
   # not a code change and not a re-review.
   c3315_case "pass 35: 'surface-unknown' ⇒ check (c) FAILS CLOSED, naming a RETRY (#3440)" \
     surface-unknown "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'could NOT BE READ'
+  # 33/34 — THE PRODUCER'S RED GROUPS REACH THIS GATE'S OWN LOG (review of `554d272`, P2).
+  # Both messages say the groups were named in the producer's output "above", and the gate used
+  # to discard that stderr entirely, so in GATE mode — where check (c) IS the required status
+  # check and no rail re-measures anything — the operator could not see WHICH check was red. The
+  # stub writes the producer's real stderr shape and the assertion demands it in the log.
+  # MUTANT: restore `2>/dev/null` on the producer call and both vectors go red.
+  c3315_case "pass 36: the producer's BASE-OWNED group line is RELAYED into the gate's log (#3440)" \
+    red-base-owned "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" pass 'You are accepting: CI|verify'
+  c3315_case "pass 37: the producer's RED group line is RELAYED into the gate's log (#3440)" \
+    red-surface "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'Red group(s): CI|bash-suites (3)'
+  # 38 — THE RELAY FIRES ONCE, ABOVE THE REFUSAL IT SUPPORTS (review of this change, nit 4). With TWO
+  # stale markers check (c) asks the producer twice, but it reports only the NEWEST candidate's
+  # refusal; relaying inside c_carry_ask printed the identical group block once per ASK, and an
+  # older candidate's groups could appear above a message describing a different cause. The relay
+  # is now stashed per ask and printed once, immediately above the reported refusal.
+  # MUTANT: move the relay back into c_carry_ask's `7:red-surface` arm → the count below becomes 2.
+  {
+    PR_BODY="Fixes #1
+$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")"
+    LABELS="complexity:standard"
+    SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
+    COMMIT_MSGS="$(rec_marker_d clean "$(printf 'e%.0s' {1..40})" "$(printf 'd%.0s' {1..64})")"
+    FILES=$'added\tdocs/plans/2026-10-17-issue-3315-carry.md\t'
+    FILES_EXPECTED=1
+    FAILURES=0
+    C35_LOG="$(mktemp /tmp/pipeline-3315once.XXXXXX)"
+    export PCC3315_MODE=red-surface PCC3315_DIGEST="$C3315_DIGEST" PCC3315_ARGV_LOG="$C3315_ARGV" PCC3315_CARRY_ONLY="$C3315_DIGEST"
+    RECORDER="$C3315_STUB"
+    run_checks > "$C35_LOG" 2>&1 || true
+    RECORDER="$C3315_STUB"
+    unset PCC3315_MODE PCC3315_DIGEST PCC3315_ARGV_LOG PCC3315_CARRY_ONLY
+    C35_N="$(grep -cF 'Red group(s): CI|bash-suites (3)' "$C35_LOG" 2>/dev/null || true)"
+    if [[ "${C35_N:-0}" -eq 1 ]]; then
+      echo "  ✅ pass 38: the producer's red-group lines are RELAYED exactly ONCE, above the refusal they support"
+    else
+      echo "  ❌ pass 38: the red-group lines appeared ${C35_N:-0} time(s), wanted 1 — the relay is per-ASK, not per-REPORT" >&2
+      C3315_FAILS=$((C3315_FAILS + 1))
+    fi
+    command rm -f "$C35_LOG"
+    unset C35_LOG C35_N
+  }
   unset PCC3315_CARRY_ONLY
   HOME="$C3315_HOME_SAVE"
   if [ "$C3315_KEY_SAVE" = "__unset__" ]; then unset AI_REVIEW_GATE_KEY; else AI_REVIEW_GATE_KEY="$C3315_KEY_SAVE"; fi
@@ -5640,7 +5739,7 @@ $big_filler"
   unset reval_sh pipeline_repo_root pipeline_wf pipeline_is_self 2>/dev/null || true
 
   # ── #3315 — CHECK (c) CONSULTS THE CARRY: run the FAIL_ALL arms for real ───
-  # The vectors themselves live in the FAIL_ALL block (passes 15–26), the same
+  # The vectors themselves live in the FAIL_ALL block (passes 15–34), the same
   # way #1356's clean-low vectors do — and for the same reason (#991): CI runs
   # SELF_TEST and never FAIL_ALL, so a vector that only lives there is executed by
   # nothing and pins nothing. This subprocess run is what puts them in front of
@@ -5658,6 +5757,7 @@ $big_filler"
     PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
     GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$SELF_SRC" >"$C3315_LOG" 2>&1 || C3315_RC=$?
   C3315_MISS=0
+  C3315_N=0
   for C3315_WANT in \
     'pass 15: an earlier-head marker' \
     'pass 15b: the predicate was asked about the MARKER' \
@@ -5682,7 +5782,14 @@ $big_filler"
     'pass 32: an earlier-head comment marker for ANOTHER REPO is NOT a carry candidate' \
     "pass 33: 'red-base-owned'" \
     "pass 34: 'red-surface'" \
-    "pass 35: 'surface-unknown'" ; do
+    "pass 35: 'surface-unknown'" \
+    'pass 36: the producer'\''s BASE-OWNED group line is RELAYED' \
+    'pass 37: the producer'\''s RED group line is RELAYED' \
+    'pass 38: the producer'\''s red-group lines are RELAYED exactly ONCE' ; do
+    # The count is DERIVED from this list, never a literal: a hardcoded total is how a
+    # vector that is added — or silently deleted — leaves the report claiming coverage it
+    # no longer has (#3440 review round 2).
+    C3315_N=$((C3315_N + 1))
     grep -qF -- "  ✅ $C3315_WANT" "$C3315_LOG" || { C3315_MISS=$((C3315_MISS + 1)); printf '   missing: ✅ %s\n' "$C3315_WANT" >&2; }
   done
   # ⛔ THE CHILD'S STATUS IS ASSERTED TOO (review of #3440, BLOCKING). The label list above can
@@ -5691,10 +5798,10 @@ $big_filler"
   # list does not name yet. FAIL_ALL exits 1 by design (it ends BLOCKED), 2 when any of its own
   # assertion groups fails — so `> 1` is the suite reporting a failure, and it must redden here.
   if [[ "$C3315_MISS" -eq 0 && "${C3315_RC:-0}" -le 1 ]]; then
-    printf '✅ #3315/#3440: all 24 carry-arm vectors ran green — the carry PASSES (newest evidence first, body before commit messages), an admitted PR COMMENT carries while an unattested or foreign-repo one does not, and a base-owned red is NAMED; a changed diff / unreadable diff / no record / no digest / rebase / crashing or prose-printing predicate / absent recorder / foreign-repo marker / carried clean-micro marker / carry-with-a-non-zero-exit / head-answer / PR-CAUSED red surface / UNREADABLE check surface each FAIL CLOSED\n'
+    printf '✅ #3315/#3440: all %s carry-arm vectors ran green — the carry PASSES (newest evidence first, body before commit messages), an admitted PR COMMENT carries while an unattested or foreign-repo one does not, and a base-owned red is NAMED; a changed diff / unreadable diff / no record / no digest / rebase / crashing or prose-printing predicate / absent recorder / foreign-repo marker / carried clean-micro marker / carry-with-a-non-zero-exit / head-answer / PR-CAUSED red surface / UNREADABLE check surface each FAIL CLOSED, and the producer\047s own red-group lines are RELAYED into this gate\047s log\n' "$C3315_N"
   else
     printf '❌ #3315/#3440: %s carry-arm vector(s) missing or red (FAIL_ALL rc=%s — anything above 1 is the suite reporting its own failure) — check (c)'"'"'s carry contract is unpinned\n' "$C3315_MISS" "$C3315_RC" >&2
-    grep -E 'pass 1[5-9]|pass 2[0-9]|❌ \[c\]' "$C3315_LOG" >&2 || true
+    grep -E 'pass 1[5-9]|pass (2[0-9]|3[0-9])|❌ \[c\]' "$C3315_LOG" >&2 || true
     selffail=$((selffail + 1))
   fi
   rm -f "$C3315_LOG"

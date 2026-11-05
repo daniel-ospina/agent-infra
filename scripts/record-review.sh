@@ -2642,7 +2642,16 @@ fi
 # live defect: every `--check-carry` invocation answered `surface-unknown` (exit 8),
 # because an undefined function is simply a non-zero status in a `$( )` here.
 # CAUGHT BY THE SUITE (§21.5/§21.6 answered 8 where they expected 0/7), not by reading.
-RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE-ai-review-gate ai-review-gate-tests}"
+# ⛔ NOT OVERRIDABLE FROM AMBIENT ENV (#3440 review of `988d0968`, category A). The exclusion
+# was `${RECORD_REVIEW_RED_EXCLUDE-…}` — a default that any caller's environment could REPLACE,
+# including with the name of the very job that is failing. `--check-carry` then reads the surface
+# GREEN and answers `head`/`carry` (exit 0 = a merge licence), and check (c) passes on it: a gate
+# defeated by ambient env, which this repo classes category A (a bypass), and the only defeat
+# mechanism the surface read has. The exclusion itself is a recorded decision (#1590) and stays —
+# only its ambient override goes. A consumer that genuinely needs a different set edits this line
+# (the script is copied into consumer repos and is pinned/sanctioned there), so nothing is lost but
+# the silent, per-invocation override.
+RECORD_REVIEW_RED_EXCLUDE="ai-review-gate ai-review-gate-tests"
 # ── check_surface_scan — THE ONE POLARITY IMPLEMENTATION (#3440) ───────────
 # Everything above applies; this function is the SAME read, generalised so that the
 # record writer and `--check-carry` can share it instead of growing a second and third
@@ -2664,6 +2673,14 @@ RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE-ai-review-gate ai-review-
 #     the latter two), and REFUSES `red` (as `red-surface`/`red-base-owned`) and `unreadable`
 #     (as `surface-unknown`). An unreadable surface must never be recorded as anything
 #     resembling green, and neither must an empty one — the record says `unknown` for both.
+# ⛔ NAMED RESIDUAL: THE GROUPING KEY IS `(app.slug, name)`, NOT `(app.slug, workflow, name)`.
+# `AGENTS.md` §"Reading verification state" says the healthy-tree reader must group by the workflow
+# too, because two workflows can publish the SAME job name and a name-only key lets the newest
+# attempt of one mask the other — a FALSE GREEN. This reader inherits the rail's narrower key,
+# which is an accepted residual FOR THE MERGE RAIL, but this function does not decide a merge: it
+# authorises a licence (`head`/`carry`) and a refusal, so the exposure is real and is tracked as
+# #3480 (category A) rather than silently inherited. Stated, so the next reader does not take the
+# narrower key for parity with the documented rule.
 check_surface_scan() { # <sha>
   local raw
   if ! raw="$(command gh api "repos/$REPO/commits/$1/check-runs?per_page=100&filter=all" \
@@ -2673,6 +2690,14 @@ check_surface_scan() { # <sha>
     return 2                       # UNREADABLE — not red, and NOT “not red” either
   fi
   [ -n "$raw" ] || { printf 'empty\n'; return 0; }
+  # ⛔ AND `empty` IS ALSO THE ANSWER FOR A SURFACE WHOSE ROWS ARE ALL EXCLUDED (#3440 review of
+  # `554d272`, P2). The guard above only catches an EMPTY RESPONSE; a head whose only run is the
+  # excluded `ai-review-gate` returned rows, so the awk fell through to `green` — a record asserting
+  # `check_surface:green` about a surface whose only observed check is RED, and no NOT-GREEN line
+  # from `--check-carry`, both contradicting this function's own contract (line 2467: `empty` is
+  # "no non-excluded group exists on this commit") and the
+  # mint-path comment. See the `nseen` counter in the awk END block: nothing OBSERVABLE is `empty`,
+  # never `green`.
   printf '%s\n' "$raw" | awk -F'|' -v excl="$RECORD_REVIEW_RED_EXCLUDE" '
     { # A literal pipe inside a check name (a matrix job named `shard 1 | slow`) shifts
       # every later field, so the row cannot be grouped. DISCARDING it is the #1353
@@ -2694,9 +2719,15 @@ check_surface_scan() { # <sha>
     END {
       n = split(excl, ex, " ")
       for (i = 1; i <= n; i++) if (ex[i] != "") skip[ex[i]] = 1
-      nred = 0; ninf = 0
+      nred = 0; ninf = 0; nseen = 0
       for (k in st) {
+        # `nseen` counts the groups this reader can actually SEE, i.e. after the exclusion. A
+        # surface of nothing but excluded rows is `empty` (nothing observable), never `green`:
+        # `green` is a positive statement that everything observed passed, and here nothing was
+        # observed at all. Both are non-refusing at clause E, so no decision changes — the datum
+        # the RECORD carries does (#3440 review of `554d272`, P2).
         if (skip[substr(k, index(k, "|") + 1)]) continue
+        nseen++
         # IN FLIGHT means a status the API NAMES as in flight. Every other status —
         # including one whose spelling this code has never seen — is judged by its
         # conclusion under the allow-list, so an unrecognised status with a null
@@ -2717,6 +2748,7 @@ check_surface_scan() { # <sha>
         print "red"
         for (i = 1; i <= nred; i++) print reds[i]
       } else if (ninf > 0) print "in_flight"
+      else if (nseen == 0) print "empty"
       else print "green"
     }'
 }
@@ -2893,7 +2925,14 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   #       this question). The remedy is RETRY, not a re-review.
   #   in flight                 → the normal answer + a loud NOT-YET-GREEN line: the
   #       question here is the record's IDENTITY, and an in-flight surface is neither
-  #       red nor a certificate. The rail re-checks before it merges.
+  #       red nor a certificate. ⛔ THE ANSWER IS NOT BACKSTOPPED, AND THIS USED TO CLAIM IT
+  #       WAS (#3440 review of `554d272`, P2). It said "the rail re-checks before it merges",
+  #       which is true on a RAIL repo and FALSE for the population that actually consumes this
+  #       answer: in GATE mode (merge-one.sh's step 4 on a consumer repo) nothing re-measures the
+  #       surface, so a check that completes RED after the licence is never observed. The POLICY is
+  #       kept deliberately — refusing an unfinished surface would deadlock every lane that asks
+  #       mid-CI, and "not finished" is not evidence of red (#2342) — but it is a NAMED RESIDUAL
+  #       here, exactly as base attribution is, rather than a guarantee that does not hold.
   #
   # ⛔ BASE ATTRIBUTION IS A CHEAP APPROXIMATION, NAMED. A red group is "base-owned"
   # when the SAME (app, name) group is also red on the PR's CURRENT base sha. The rail's
@@ -2934,7 +2973,7 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
         echo "record-review.sh --check-carry: ⚠️ (#3440) ${jsha:0:12}… carries NO readable check run after excluding ${RECORD_REVIEW_RED_EXCLUDE}. That is NOT green: an absent surface is not evidence of anything, so the answer below is about the record's IDENTITY only. Do not report this head as verified-green (#2342 records the same treatment for the carry veto)." >&2
         return 0 ;;
       in_flight)
-        echo "record-review.sh --check-carry: ⚠️ (#3440) ${jsha:0:12}… has check run(s) still IN FLIGHT. Not red, and not yet green either: the answer below certifies the record's IDENTITY, not the tree's health. Re-ask (or let the rail re-check) once the surface completes." >&2
+        echo "record-review.sh --check-carry: ⚠️ (#3440) ${jsha:0:12}… has check run(s) still IN FLIGHT. Not red, and not yet green either: the answer below certifies the record's IDENTITY, not the tree's health. Re-ask once the surface completes — and note the residual this answer carries: the surface is NOT re-read before a merge in GATE mode (only a rail repo re-measures it), so a check that completes RED later is not caught by anything here." >&2
         return 0 ;;
       green) return 0 ;;
       *)
@@ -4208,7 +4247,13 @@ delta_measure() { # <from-sha> <to-sha> ; prints facts to stdout. Never decides.
 # can therefore no longer match. #6213 measured exactly this transition: the gate went
 # SUCCESS -> FAILURE seven seconds after the rail moved the head. The veto asks whether
 # the TREE is independently red, so a red the carry itself explains is not evidence.
-# Override with RECORD_REVIEW_RED_EXCLUDE (space-separated check names).
+# ⛔ THE LIST IS FIXED IN CODE, AND THAT IS THE FIX — NOT AN OVERLOOKED CONFIGURATION.
+# It was `${RECORD_REVIEW_RED_EXCLUDE-…}` until #3440's review of `988d0968`: an ambient override
+# let ANY caller REPLACE the list — including with the name of the job that was failing — so
+# `--check-carry` read the surface green and answered `head`/exit 0 over a red head. A gate
+# defeated from the environment is category A (a bypass), so the override is gone and setting this
+# variable now does nothing. The exclusion ITSELF is the recorded decision (#1590) and is
+# unchanged; to change the set, edit this line in the copy your repo ships.
 #
 # KNOWN, DELIBERATE DIVERGENCE from the rail's version of this rule: the rail also reads
 # legacy commit `/status`. This reads `/check-runs` only, so a red posted as a legacy

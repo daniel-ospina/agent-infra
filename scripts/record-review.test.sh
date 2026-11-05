@@ -5781,6 +5781,10 @@ EV_REF="comment:42495501"
 #   21.14 with NO repo resolvable the answer is surface-unknown (8), never a green
 #   21.15 the surface fields are VOLATILE in the #1709 rec 7 identity — + MUTATION PIN
 #   21.16 an UNREAD live head never answers from the RECORDED one — + 2 MUTATION PINS
+#   21.17 an ALL-EXCLUDED surface is `empty`, never `green` — + MUTATION PIN (review of
+#         `554d272`, P2: the early guard only caught an EMPTY RESPONSE)
+#   21.18 an ambient RED_EXCLUDE cannot hide a red from the licence — + MUTATION PIN
+#         (review of `988d0968`: a gate disabled by ambient env is category A)
 # ⛔ THE EVIDENCE BODY IS A §20 FIXTURE (a deliberately NOT-CLEAN artifact, used to pin the
 # falsified-evidence refusal) and the shared runner does not clear it, so every mint below
 # would be refused with "the named review evidence could not be verified" — a decision about
@@ -6298,6 +6302,103 @@ if grep -q '"check_surface":"green"' <<<"$S21_REC10"; then
     bad "21.10 a failed read was recorded as GREEN"
 else
     ok "21.10 …and NOT 'green'"
+fi
+# 21.17 A SURFACE WHOSE ROWS ARE ALL EXCLUDED IS `empty`, NOT `green` — review of `554d272`, P2.
+# The early guard caught only an EMPTY RESPONSE, so a head whose only run is the excluded
+# `ai-review-gate` fell through to `green`: the record asserted `check_surface:green` about a
+# surface whose only observed check is RED (contradicting the scan's own contract, line 2467, and
+# the mint-path comment), and `--check-carry` printed NO not-green line where the design promises
+# one. "Nothing observable" must never be worded as "everything observed passed".
+s21_rows "$S21_HEAD" 'ai-review-gate|ai-review-gate|99|completed|failure'
+s21_rows "$S21_BASE" "$S21_GREEN" "$S21_GREEN2"
+s21_rec 425018 "$S21_HEAD"
+s21_run 425018
+assert_eq "$CC_RC" "0" "21.17 an all-excluded surface keeps the normal answer (the exclusion is a recorded decision, not a refusal)"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "NO readable check run" "21.17 …and is LOUD that nothing observable is not green (it used to be silently 'green')"
+export STUB_CHECKS_ROWS_DIR="$S21_ROWS"
+rm -f "$S21_FILE-425020.json"   # the MINT under test must create it: a pre-existing record
+# with the same deterministic identity makes the mint a #1709 rec 7 NO-OP, so the file would
+# keep the shape below and the assertion would measure nothing.
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425020
+S21_REC20="$(cat "$S21_FILE-425020.json" 2>/dev/null || echo)"
+if [ ! -s "$S21_FILE-425020.json" ]; then
+    bad "21.17 fixture: the mint wrote NO record (rc=$RECORD_RC, err=$(printf '%s' "$RECORD_ERR" | command tail -3))"
+fi
+assert_contains "$S21_REC20" '"check_surface":"unknown"' "21.17 an all-excluded surface records 'unknown', never 'green'"
+if grep -q '"check_surface":"green"' <<<"$S21_REC20"; then
+    bad "21.17 a surface with NOTHING observable was recorded as GREEN"
+else
+    ok "21.17 …and NOT 'green'"
+fi
+# (a) MUTATION PIN — revert the `nseen == 0` branch and the SAME fixture records `green`.
+S21_MUT18="$S21_MUTDIR/record-review-s21-excludedgreen.sh"
+cp "$RECORD" "$S21_MUT18"
+if grep -qF 'else if (nseen == 0) print "empty"' "$S21_MUT18"; then
+    sed -i.bak 's#else if (nseen == 0) print "empty"#else if (nseen == 0) print "green"#' "$S21_MUT18"
+    rm -f "$S21_MUT18.bak"
+    if cmp -s "$RECORD" "$S21_MUT18"; then
+        bad "21.17 mutation: the sed did not apply — re-anchor it rather than dropping the pin"
+    else
+        printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+            "425021" "$S21_HEAD" "$S21_SHA" "$S21_REPO" > "$S21_FILE-425021.json"
+        S21_RECORD_SAVE="$RECORD"
+        RECORD="$S21_MUT18"
+        EV_REF="comment:7391001" run_record "$S21_REPO" 425021
+        RECORD="$S21_RECORD_SAVE"
+        S21_REC21="$(cat "$S21_FILE-425021.json" 2>/dev/null || echo)"
+        # ⛔ NO PIPE (#841/#864) — here-string, the transform the exceptions file records.
+        if grep -q '"check_surface":"green"' <<<"$S21_REC21"; then
+            ok "21.17 MUTATION PIN: with the 'nothing observable' branch reverted the record says check_surface=green over the SAME excluded-only surface — the branch is load-bearing"
+        else
+            bad "21.17 mutation NOT caught (record: $S21_REC21) — 21.17 would pass on a reader that calls an unobservable surface green"
+        fi
+    fi
+else
+    bad "21.17 the 'nothing observable is empty' branch is gone — re-anchor the pin"
+fi
+
+# 21.18 AN AMBIENT `RECORD_REVIEW_RED_EXCLUDE` CANNOT HIDE A RED — review of `988d0968`, and it is
+# category A, not a nit: "disable a gate by ambient env" is a BYPASS. The exclusion used to be
+# `${RECORD_REVIEW_RED_EXCLUDE-…}`, so any caller could REPLACE it — including with the name of the
+# very job that is failing — and `--check-carry` then read the surface GREEN and answered `head` /
+# exit 0 (a merge licence), which check (c) passes on. The exclusion itself is a recorded decision
+# (#1590) and is unchanged; only the silent per-invocation override is gone.
+s21_rows "$S21_HEAD" "$S21_GREEN" 'CI|verify|12|completed|failure'   # only `verify` is RED on the head
+s21_rows "$S21_BASE" "$S21_GREEN" "$S21_GREEN2"
+s21_rec 425022 "$S21_HEAD"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    RECORD_REVIEW_RED_EXCLUDE="verify" \
+    STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 \
+    STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+    STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+    bash "$RECORD" --check-carry 425022 "$S21_REPO" 2>"$T/s21-err")" || CC_RC=$?
+assert_eq "$CC_RC" "7" "21.18 an ambient RED_EXCLUDE naming the failing job still answers exit 7 (a gate cannot be disabled from the environment)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "red-surface" "21.18 …with its own token, never 'head'"
+# (a) MUTATION PIN — restore the `${VAR-default}` override and the SAME invocation answers `head`/0.
+S21_MUT19="$S21_MUTDIR/record-review-s21-envoverride.sh"
+cp "$RECORD" "$S21_MUT19"
+if grep -qxF 'RECORD_REVIEW_RED_EXCLUDE="ai-review-gate ai-review-gate-tests"' "$S21_MUT19"; then
+    sed -i.bak 's#^RECORD_REVIEW_RED_EXCLUDE="ai-review-gate ai-review-gate-tests"$#RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE-ai-review-gate ai-review-gate-tests}"#' "$S21_MUT19"
+    rm -f "$S21_MUT19.bak"
+    if cmp -s "$RECORD" "$S21_MUT19"; then
+        bad "21.18 mutation: the sed did not apply — re-anchor it rather than dropping the pin"
+    else
+        S21_RC19=0
+        HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+            RECORD_REVIEW_RED_EXCLUDE="verify" \
+            STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 \
+            STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+            STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+            bash "$S21_MUT19" --check-carry 425022 "$S21_REPO" >/dev/null 2>&1 || S21_RC19=$?
+        if [ "$S21_RC19" -eq 0 ]; then
+            ok "21.18 MUTATION PIN: with the ambient override restored the same invocation answers exit 0 over the SAME red head — the override was a bypass, not a convenience"
+        else
+            bad "21.18 mutation NOT caught (rc=$S21_RC19, wanted 0) — 21.18 would pass without the pin"
+        fi
+    fi
+else
+    bad "21.18 the constant exclusion assignment is gone — re-anchor the pin"
 fi
 unset STUB_CHECKS_ROWS_DIR
 rm -rf "$S21_ROWS"
