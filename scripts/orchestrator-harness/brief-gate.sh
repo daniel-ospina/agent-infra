@@ -31,6 +31,47 @@
 # incidents each skipped, and the rung line is what stops "research" from degrading into "I thought
 # about it" — rung 3 (`web_fetch`) is always available, so the field is never unsatisfiable.
 #
+# ── THE SECOND CONTRACT, AND WHY IT LIVES IN THIS FILE (#3442) ───────────────────────────────────
+# For role `reviewer` there is a THIRD requirement, on top of the two above:
+#
+#   3. a `MUTATION ATTRIBUTION` heading (any case, any `#` depth) — for role `reviewer` only —
+#      carrying EITHER
+#        `NO NEW ASSERTIONS: <why>`   the diff adds no assertion at all, or
+#        a table whose header names `assertion`, `mutant` and `reddened`, plus at least one data
+#        row with >=3 non-empty cells.
+#
+# WHY. Review had NO contract requiring that a new assertion CAN FAIL, so a PR could be reviewed
+# clean three times on the strength of a guard whose test stays GREEN with the bug restored, and
+# nothing on the path noticed. Measured in ONE night across five PRs (agent-infra#3442, and the
+# instances are recorded in `docs/ops/review-non-vacuity-baseline.md`):
+#   #3355  a liveness leg no `Mutation` ever produced — the CI shard never exercised it
+#   #3368  `assert_absent "unbound variable"` stayed GREEN because the fixture set `CELL_HOME`
+#   #3368  deleting the whole record-based probe left both gates green on a PREFIX match
+#   #3374  a phrase `cell-install.sh` prints UNCONDITIONALLY was grepped from the whole log
+#   #3355  `ceiling == 3` could not be reddened — the value is capped regardless
+# #3368's own review named the root verbatim: "No mutation leg for the new gate — which is exactly
+# how findings 1 and 2 survived three recorded clean reviews." The ABSENCE of the mutation leg is
+# not a missing test; it is why the vacuous assertions went undetected.
+#
+# WHY HERE, AND NOT IN A NEW MODULE. `brief-gate.sh` is already the ONE place a dispatch contract is
+# decided, is already presence-required in `check-single-source.sh`'s EXECUTED set, and is already
+# installed on every box. A new `mutation-attribution.sh` that the gate SOURCED would put every
+# dispatch on that box behind a file nothing installs — the `lane-env.sh` failure (#3060) exactly.
+#
+# WHY THE VERDICT SIDE READS THIS SAME PARSER. `record-review.sh` refuses to mint a FRESH `clean`
+# verdict over a review artifact that carries no such block (`--mutation-missing` below is its
+# input). That file is the ONLY place a comment becomes a clean claim, so gating it is what turns
+# "the reviewer was told" into "the verdict cannot be minted without it" — the #2258 argument, one
+# layer down: a rule that lives only in the brief is exactly as strong as the weakest reviewer.
+#
+# ⚠️ WHAT THIS BUYS, PRECISELY — the same limit the research contract states, and it must be stated
+# or a green run will be read as more than it is. The check is PRESENCE AND SHAPE, never SUBSTANCE:
+# it cannot tell a mutant that really reddens the named row from one the author invented, and it
+# cannot tell an EQUIVALENT mutant from a killed one (undecidable in general — `cacm.acm.org/research/
+# how-do-java-mutation-tools-differ/`, and the classic adoption blocker in the mutation-testing
+# literature). What it removes is the measured failure mode: a clean verdict with NO attribution at
+# all, which is indistinguishable from a guard nobody ever tried to break.
+#
 # ── FAIL-CLOSED, ALWAYS ──────────────────────────────────────────────────────────────────────────
 # A missing brief, an unreadable brief, an EMPTY brief, an unknown role, or a validator that cannot
 # run all REFUSE. There is no "skip the gate" flag, no environment variable that turns it off, and
@@ -83,16 +124,46 @@ BRIEF_GATE_TOOLS='perplexity, web_search, web_fetch, context7'
 # ⛔ THE PARSE IS ONE awk PASS ON PURPOSE. It is the same shape #2148's suite drives and it needs no
 # python at dispatch time — a gate that adds an interpreter to every spawn is a gate that will
 # eventually be "temporarily" worked around on the box that lacks one.
-brief_gate_missing() { # brief_gate_missing <brief-file|->
+brief_gate_missing() { # brief_gate_missing <brief-file|-> [role]
+  local f="${1:--}" role="${2:-lane}" toks="" body=""
+  if [ "$f" != "-" ] && { [ ! -e "$f" ] || [ ! -r "$f" ]; }; then
+    printf 'NO-FILE\n'
+    return 0
+  fi
+  if [ "$f" = "-" ]; then
+    # ⛔ STDIN IS READ ONCE, HERE, AND RE-FED TO EVERY PASS. Two awks reading `-` in sequence would
+    # leave the second one at EOF, and a role that needs both contracts would then report the first
+    # as satisfied and the second as absent on the SAME input — a refusal that depends on how many
+    # times the caller happened to pipe the brief. (The trailing newline is restored because command
+    # substitution strips it, and awk drops a final line that carries none.)
+    body="$(cat)"
+    if [ -z "$body" ]; then printf 'EMPTY\n'; return 0; fi
+    toks="$(printf '%s\n' "$body" | awk "$BRIEF_GATE_AWK")"
+    [ -z "$toks" ] || printf '%s\n' "$toks"
+    if [ "$role" = "reviewer" ]; then printf '%s\n' "$body" | awk "$BRIEF_GATE_MUTATION_AWK"; fi
+  else
+    if [ ! -s "$f" ]; then printf 'EMPTY\n'; return 0; fi
+    toks="$(awk "$BRIEF_GATE_AWK" "$f")"
+    [ -z "$toks" ] || printf '%s\n' "$toks"
+    if [ "$role" = "reviewer" ]; then awk "$BRIEF_GATE_MUTATION_AWK" "$f"; fi
+  fi
+}
+
+# brief_gate_mutation_missing <brief-or-artifact-file|-> — the NON-VACUITY contract alone (#3442),
+# with NO research requirement. This is the verb `record-review.sh` calls on a review ARTIFACT: an
+# artifact is not a brief, so asking it for `RESEARCH FIRST` would refuse every honest review. One
+# parser, two consumers, so the shape the brief teaches and the shape the record demands cannot
+# drift apart.
+brief_gate_mutation_missing() { # brief_gate_mutation_missing <file|->
   local f="${1:--}"
   if [ "$f" != "-" ] && { [ ! -e "$f" ] || [ ! -r "$f" ]; }; then
     printf 'NO-FILE\n'
     return 0
   fi
   if [ "$f" = "-" ]; then
-    awk "$BRIEF_GATE_AWK"
+    awk "$BRIEF_GATE_MUTATION_AWK"
   else
-    awk "$BRIEF_GATE_AWK" "$f"
+    awk "$BRIEF_GATE_MUTATION_AWK" "$f"
   fi
 }
 
@@ -156,6 +227,78 @@ END {
 }
 '
 
+# ── THE NON-VACUITY PARSER (#3442) ────────────────────────────────────────────
+# Deliberately a SEPARATE program from the one above, for two reasons that are both load-bearing:
+#
+#   1. IT MUST READ THE WHOLE INPUT BEFORE IT DECIDES, and the research parser must not. The same
+#      program is run over a reviewer's BRIEF (real newlines) and over a review ARTIFACT as
+#      `record-review.sh` reads it — a GitHub comment body arrives @tsv-ESCAPED, so its newlines are
+#      the two literal characters `\` + `n` and the whole comment is ONE awk record. A line-oriented
+#      scan would then never see a heading at a line start and would refuse every honest artifact.
+#      So this program buffers, un-escapes `\n`, and re-scans: one code path, both carriers.
+#      (The sibling file already paid for this lesson — `verify_review_evidence`'s record-marker arm
+#      had to widen `^` to `(^|\\n)` for exactly this reason.)
+#   2. The research schema must keep behaving EXACTLY as it does today. Wrapping two contracts in one
+#      END block is how a change to one silently re-opens the other.
+#
+# Globals: `sec` (the heading exists), `none` (a NO NEW ASSERTIONS claim with a reason), `hdr` (a
+# table header naming assertion + mutant + reddened) and `row` (a data row with >=3 non-empty cells).
+# Tokens are printed only when the contract is unmet, one per line, so the caller can teach each.
+# shellcheck disable=SC2016
+BRIEF_GATE_MUTATION_AWK='
+function _cells(s, arr,   n, i, x, k, tmp) {
+  n = split(s, tmp, "|"); k = 0
+  for (i = 1; i <= n; i++) {
+    x = tmp[i]
+    gsub(/^[ \t`*_]+/, "", x); gsub(/[ \t`*_]+$/, "", x)
+    if (length(x) > 0) { k++; arr[k] = x }
+  }
+  return k
+}
+BEGIN { buf = ""; ins = 0; depth = 0; sec = 0; none = 0; hdr = 0; row = 0 }
+{ buf = buf $0 "\n" }
+END {
+  if (length(buf) == 0) { print "EMPTY"; exit }
+  # @tsv reverses here, not in the caller: a consumer that un-escaped first would be a SECOND
+  # definition of the artifact format, and the two would drift.
+  gsub(/\\n/, "\n", buf)
+  nl = split(buf, L, "\n")
+  for (i = 1; i <= nl; i++) {
+    line = L[i]; lc = tolower(line); nh = 0
+    if (lc ~ /^#+/) { match(lc, /^#+/); nh = RLENGTH }
+    # A heading at or above the section closes it (subsections stay inside it).
+    if (ins && nh > 0 && nh <= depth) ins = 0
+    if (!ins && nh > 0 && lc ~ /^#+[ \t]*mutation[ -]attribution/) { ins = 1; depth = nh; sec = 1; continue }
+    if (!ins) continue
+
+    l = line
+    sub(/^[ \t]+/, "", l)
+    sub(/^[-*+][ \t]+/, "", l)
+    sub(/^(\*\*|__)/, "", l)
+    if (tolower(l) ~ /^no new assertions:/ && length(l) > 0) {
+      r = l; sub(/^[^:]*:/, "", r); gsub(/^[ \t]+/, "", r); gsub(/[ \t]+$/, "", r)
+      if (length(r) > 0) none = 1
+    }
+    if (l ~ /^\|/) {
+      k = _cells(l, C)
+      if (k >= 2) {
+        t = tolower(l)
+        if (t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) hdr = 1
+        allsep = 1
+        for (j = 1; j <= k; j++) { if (C[j] !~ /^:?-+:?$/) allsep = 0 }
+        # The header row is not a data row, and a `|---|` rule is not either. Both would otherwise
+        # satisfy "has a row" on a table whose every data row was deleted.
+        if (!allsep && k >= 3 && tolower(C[1]) != "assertion") row = 1
+      }
+    }
+  }
+  if (!sec) { print "MUTATION-ATTRIBUTION"; exit }
+  if (none) exit
+  if (!hdr) { print "MUTATION-MUTANT-COLUMN"; exit }
+  if (!row) print "MUTATION-ROWS"
+}
+'
+
 # brief_gate_verify <brief-file|-> [role] — 0 = allowed, REFUSED with the teaching message, or
 # UNAVAILABLE. Prints NOTHING on success (a silent pass is a pass; the callers already log).
 brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
@@ -169,7 +312,7 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
       return "$BRIEF_GATE_UNAVAILABLE" ;;
   esac
   # stdin is INHERITED through the command substitution, so `-` reads the caller's pipe.
-  miss="$(brief_gate_missing "$f")"
+  miss="$(brief_gate_missing "$f" "$role")"
   [ -n "$miss" ] || return 0
 
   # ── THE REFUSAL MUST TEACH (delivery D) ───────────────────────────────────────────────────────
@@ -188,11 +331,17 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
       RUNG)      lines="${lines}  • \`RUNG: <1|2|3> — <tool>\` — which rung of the research ladder, naming the tool (one of: ${BRIEF_GATE_TOOLS})${nl}" ;;
       CONTRADICTION-TEST)
                  lines="${lines}  • \`CONTRADICTION TEST:\` — which RECORDED DECISION covers this work, quoted; or that none does${nl}" ;;
+      MUTATION-ATTRIBUTION)
+                 lines="${lines}  • a \`## MUTATION ATTRIBUTION\` section — per NEW assertion, the mutant that reverts the fix and the row it turns RED; or \`NO NEW ASSERTIONS: <why>\` when the diff adds none (#3442)${nl}" ;;
+      MUTATION-MUTANT-COLUMN)
+                 lines="${lines}  • …its table header must name \`assertion\`, \`mutant\` and \`reddened\` — a table of prose is not an attribution${nl}" ;;
+      MUTATION-ROWS)
+                 lines="${lines}  • …and it needs at least ONE data row (\`| <assertion> | <mutant> | <reddened row> | <observed> |\`), or a \`NO NEW ASSERTIONS: <why>\` line${nl}" ;;
     esac
   done <<< "$miss"
 
   {
-    printf '[brief-gate] REFUSED — this dispatch carries NO research contract. NOTHING WAS STARTED: no model call, no session, no claim.\n'
+    printf '[brief-gate] REFUSED — this dispatch does not carry its full contract. NOTHING WAS STARTED: no model call, no session, no claim.\n'
     printf '[brief-gate]   brief: %s   role: %s\n' "$f" "$role"
     printf '[brief-gate] missing:\n%s' "$lines"
     printf '[brief-gate] add exactly this to the brief, fill the <…> slots, and re-dispatch\n'
@@ -244,29 +393,84 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
     decision, it is NOT a candidate for adoption: reopen the decision and argue it in its own home;
     never adopt over it.
 BRIEF
+  # ⛔ THE NON-VACUITY CONTRACT IS FOR THE REVIEWER ROLE ONLY (#3442), and the canonical block is a
+  # WORKED EXAMPLE, not a template: its table is filled in, so a reviewer sees the shape it must
+  # produce rather than a `<slot>` it can leave as written. `fixtures/mutation-attribution/` carries
+  # the same shape for the two suite classes the issue measured (a bash suite and a python mutation
+  # harness) so the copyable form exists where a suite's own author will look for it.
+  if [ "$role" = "reviewer" ]; then brief_gate_mutation_section; fi
+}
+
+# brief_gate_mutation_section — the canonical NON-VACUITY block (#3442). ONE home: the reviewer's
+# brief splices it, `record-review.sh`'s refusal points at it, and `--section reviewer` prints it, so
+# the shape the gate teaches and the shape the recorder demands cannot diverge.
+brief_gate_mutation_section() {
+  cat <<'MUTBRIEF'
+
+## MUTATION ATTRIBUTION — every NEW assertion names the mutant that reddens it (agent-infra#3442)
+
+A clean verdict is a claim that the new guards CAN FAIL — and until #3442 nothing on the path asked
+anyone to show it. Five PRs in one night were reviewed clean over assertions that would have stayed
+GREEN with the bug restored; the mutation leg was simply ABSENT, and absence is invisible to every
+other review check. Do this pass LAST, immediately before you return a clean verdict.
+
+For EVERY assertion the diff ADDS OR CHANGES that claims to protect a behaviour, state the edit that
+reverts that behaviour and the row that goes RED. Rows are one line each:
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/x.sh:120` — "the gate refuses an empty brief" | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `❌ … REFUSED with 80 (got 0)`, rc=1 |
+
+If the diff adds no assertion at all, say so instead of leaving the table out — one labelled line:
+
+NO NEW ASSERTIONS: docs-only — the diff touches `docs/ops/*.md` and no executable assertion.
+
+⛔ THREE RULES, and rule 3 is a FINDING, never a nit:
+1. A mutant per NEW GUARD — not per file, not per PR. An assertion that encodes a fix gets its own row.
+2. The catch must be ATTRIBUTABLE. A mutant that reddens the suite through an UNRELATED row is not a
+   proof: name the row that names the behaviour (measured: #3355's first review found a mutation that
+   anchored the repair-arm `continue` instead of the liveness leg it was supposed to protect).
+3. An assertion whose value cannot vary under ANY mutation of the diff is dead weight that actively
+   misleads the next reader into thinking the guard is covered. Make it reachable or delete it. A
+   comment explaining why it cannot fail is NOT a fix.
+
+⛔ "I read the diff and it looks right" is not this pass, and a suite that passes on the pre-fix code
+is not evidence the fix is tested. A verdict with no attribution block is INCOMPLETE, not clean: the
+recorder refuses to mint `clean` over it (`record-review.sh`, exit 3).
+MUTBRIEF
 }
 
 # brief_gate_line [role] — ONE line for the lane log, so the mandate is visible in what an operator
 # greps, exactly like `reviewer_preflight_line` (#2148). The long form is in the brief.
 brief_gate_line() { # brief_gate_line [role]
   local role="${1:-lane}"
+  if [ "$role" = "reviewer" ]; then
+    printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80). [gate] #3442 non-vacuity: a CLEAN verdict must also carry a MUTATION ATTRIBUTION block — per new assertion, the mutant that reverts it and the row that goes RED (or `NO NEW ASSERTIONS: <why>`). A verdict without it is INCOMPLETE, not clean, and record-review.sh refuses to mint `clean` over it.'
+    return 0
+  fi
   printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80).'
 }
 
 # ── CLI: for callers, for tests, and for a human who wants the exact text ────────────────────────
 #   bash brief-gate.sh --check <file|-> [role]   → 0 pass · 80 refused (message on stderr) · 78 cannot verify
-#   bash brief-gate.sh --missing <file|->        → the missing tokens, one per line
+#   bash brief-gate.sh --missing <file|-> [role]  → the missing tokens, one per line
+#   bash brief-gate.sh --mutation-missing <file|-> → the NON-VACUITY tokens alone (the artifact verb;
+#                                                   `record-review.sh` calls this on a review comment)
 #   bash brief-gate.sh --section [role]          → the canonical brief block
+#   bash brief-gate.sh --mutation-section        → the canonical NON-VACUITY block alone
 #   bash brief-gate.sh --line [role]             → the one-line disclosure
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --check)   shift; brief_gate_verify "${1:--}" "${2:-lane}" ;;
-    --missing) shift; brief_gate_missing "${1:--}" ;;
+    --missing) shift; brief_gate_missing "${1:--}" "${2:-lane}" ;;
+    --mutation-missing) shift; brief_gate_mutation_missing "${1:--}" ;;
     --section) shift; brief_gate_section "${1:-lane}" ;;
+    --mutation-section) brief_gate_mutation_section ;;
     --line)    shift; brief_gate_line "${1:-lane}" ;;
     *)
       printf 'usage: %s --check <brief-file|-> [lane|fixer|reviewer|worker]\n' "$0" >&2
-      printf '       %s --missing <brief-file|-> | --section [role] | --line [role]\n' "$0" >&2
+      printf '       %s --missing <brief-file|-> [role] | --mutation-missing <file|->\n' "$0" >&2
+      printf '       %s --section [role] | --mutation-section | --line [role]\n' "$0" >&2
       exit "$BRIEF_GATE_UNAVAILABLE" ;;
   esac
 fi

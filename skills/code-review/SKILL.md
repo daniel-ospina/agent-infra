@@ -1549,6 +1549,12 @@ Found N issues:
 
 2. ...
 
+## MUTATION ATTRIBUTION — every NEW assertion names the mutant that reddens it (agent-infra#3442)
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| <file:line> — "<the behaviour it guards>" | <the edit that reverts it> | <the suite row that goes RED> | <the failing line + rc> |
+
 🤖 Generated with [Pi](https://pi.dev)
 
 <sub>- If this code review was useful, please react with 👍. Otherwise, react with 👎.</sub>
@@ -1561,8 +1567,27 @@ Or if no issues:
 
 No issues found. Checked for bugs, guidance compliance, historical context, and prior PR comments.
 
+## MUTATION ATTRIBUTION — every NEW assertion names the mutant that reddens it (agent-infra#3442)
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| <file:line> — "<the behaviour it guards>" | <the edit that reverts it> | <the suite row that goes RED> | <the failing line + rc> |
+
 🤖 Generated with [Pi](https://pi.dev)
 ```
+
+> ⛔ **MUTATION ATTRIBUTION is REQUIRED, not decoration (agent-infra#3442).** For every assertion the
+> diff ADDS or CHANGES, name the mutant that reverts the behaviour and the row it turns RED — the
+> catch must be ATTRIBUTABLE to that row, not merely to the suite. An assertion whose value cannot
+> vary under any mutation of the diff is a **finding**, not a nit: make it reachable or delete it.
+> When the diff adds no assertion at all, replace the table with one line:
+> `NO NEW ASSERTIONS: <why — the paths touched and what they contain>`.
+> A verdict that carries no block is **INCOMPLETE, not clean**: `record-review.sh` refuses to mint a
+> fresh `clean` record over it (exit 3), so the merge gate cannot go green without it. Five PRs in one
+> night were reviewed clean over guards that stay GREEN with the bug restored —
+> `docs/ops/review-non-vacuity-baseline.md`. Why this is safe: the block is attributed to the row that
+> names the behaviour. The shape lives in
+> `scripts/orchestrator-harness/fixtures/mutation-attribution/` — one worked example per suite class.
 
 **Link format:** `https://github.com/<owner>/<repo>/blob/<full sha>/<file>#L<start>-L<end>`. Require full SHA, provide 1 line of context before and after the issue.
 

@@ -368,10 +368,31 @@ if [ "$1" = "api" ]; then
         # `evidence_fetch` review arm always emits it.
         _state=""
         case "$*" in *"/pulls/"*"reviews/"*|*"/reviews/"*) _state="$(printf '\t')${STUB_REVIEW_STATE:-APPROVED}" ;; esac
+        # ⛔ THE DEFAULT BODY CARRIES THE #3442 MUTATION-ATTRIBUTION BLOCK, AND THAT IS A FIXTURE
+        # CONTRACT CHANGE, NOT A FICTURE THAT WAS TUNED TO STAY GREEN. Before agent-infra#3442 a
+        # `clean` record could name ANY artifact, so "Reviewed the diff; no issues found." was
+        # sufficient; the contract now requires the artifact to say WHICH mutant reddens WHICH row,
+        # and an arm about the STATE/parent/postdate machinery must not be refused by the arm about
+        # non-vacuity (it would then be green for a reason unrelated to what it pins — the
+        # unrelated-row trap #3442 itself names). `unset` vs `empty` still differs: only an UNset
+        # STUB_EVIDENCE_BODY gets the block, because an explicitly EMPTY body is its own adversarial
+        # vector (§13q2) and must stay expressible.
+        if [ -z "${STUB_EVIDENCE_BODY+x}" ]; then
+            _body="Reviewed the diff; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| test.sh:12 the gate refuses an empty brief | sed s/rc=80/rc=0/ x.sh | section A (i) | rc=0, wanted 80 |
+"
+        else
+            _body="$STUB_EVIDENCE_BODY"
+        fi
         printf '%s\t%s\t%s%s\n' \
             "${STUB_EVIDENCE_AT:-2026-01-02T03:04:05Z}" \
             "$_parent" \
-            "$(printf '%s' "${STUB_EVIDENCE_BODY-Reviewed the diff; no issues found.}" | awk '{ gsub(/\\/,"\\\\"); gsub(/\t/,"\\t"); printf "%s\\n", $0 }')" \
+            "$(printf '%s' "$_body" | awk '{ gsub(/\\/,"\\\\"); gsub(/\t/,"\\t"); printf "%s\\n", $0 }')" \
             "$_state"
         exit 0
     fi
@@ -4203,6 +4224,21 @@ RECORD_ERR="$(cat "$T/err-13k" 2>/dev/null || true)"
 assert_eq "$RECORD_RC" "3" "13k the #784 fail-open arm with NO evidence is refused (an API failure is not an exemption)"
 [ ! -f "$(Q2 424743)" ] && ok "13k no record minted while the head was unverifiable" || bad "13k minted a record from an unverifiable head"
 
+# ── agent-infra#3442 — THE MUTATION-ATTRIBUTION FIXTURE ─────────────────────────────────────────
+# The contract changed: a FRESH `clean` record now requires its artifact to carry the
+# `## MUTATION ATTRIBUTION` block (`verify_review_evidence`'s last arm), because five PRs in one night
+# were reviewed clean over assertions that stay GREEN with the bug restored. Every arm below whose
+# SUBJECT is something else (the state arm, the Outcome: precision arm, the over-block guards) must
+# therefore carry the block, or it would be refused by the non-vacuity arm and would report a green
+# for a reason unrelated to what it pins — the unrelated-row trap #3442 rule 2 names. This is the
+# SHAPE only; the parser is `brief-gate.sh --mutation-missing` and the arms that pin the shape itself
+# live in the "#3442" block at the end of this section.
+VACUITY_BLOCK='## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| test.sh:12 the gate refuses an empty brief | sed s/rc=80/rc=0/ x.sh | section A (i) | rc=0, wanted 80 |'
+
 # 13l — DECLARED OUT OF SCOPE, PINNED. The gate proves an artifact EXISTS on
 # this PR, postdates the head, and does not assert NOT-CLEAN. It does NOT prove
 # the artifact is a REVIEW: a bot or CI comment that describes no review
@@ -4213,12 +4249,25 @@ assert_eq "$RECORD_RC" "3" "13k the #784 fail-open arm with NO evidence is refus
 # changing shape. What the gate does close is the SILENT path (naming the
 # current head with no argument at all — 13a): naming a non-review artifact is
 # a deliberate act, which is the bar.
+# ⛔ #3442 NARROWS THE RESIDUAL WITHOUT CLOSING IT, AND SAYS WHICH: the artifact must now carry an
+# attribution block, so a bare bot comment is no longer clean evidence — but a bot comment that
+# CARRIES one still is, and that is the arm below. The declared limit is unchanged (the gate still
+# does not judge whether the artifact is a review); what changed is that the artifact must say
+# something only a review could say.
 rm -f "$(Q2 424744)"
-EV_REF="comment:42474401" run_record_ev 424744 STUB_EVIDENCE_BODY="🤖 Mergify: your pull request has been merged automatically."
-assert_eq "$RECORD_RC" "0" "13l (DECLARED OUT OF SCOPE) a non-review artifact is ACCEPTED — the gate checks artifact, not review"
+EV_REF="comment:42474401" run_record_ev 424744 STUB_EVIDENCE_BODY="🤖 Mergify: your pull request has been merged automatically.
+
+$VACUITY_BLOCK"
+assert_eq "$RECORD_RC" "0" "13l (DECLARED OUT OF SCOPE, NARROWED by #3442) a non-review artifact CARRYING the block is still ACCEPTED — the gate checks artifact, not review"
 R13L="$(cat "$(Q2 424744)" 2>/dev/null || true)"
 assert_contains "$R13L" '"evidence":"comment:42474401"' "13l the record names the non-review artifact it accepted"
 assert_contains "$R13L" '"mint":"fresh"' "13l the looser path is still a fresh mint (provenance unaffected)"
+# ⛔ …and the SAME bot comment WITHOUT the block is now refused, which is the half #3442 adds. Asserted
+# in the same vector so a later edit to the arm above cannot re-open the bare-bot-comment route.
+rm -f "$(Q2 424794)"
+EV_REF="comment:42479401" run_record_ev 424794 STUB_EVIDENCE_BODY="🤖 Mergify: your pull request has been merged automatically."
+assert_eq "$RECORD_RC" "3" "13l a bare bot comment (no attribution block) is REFUSED as clean evidence (#3442)"
+[ ! -f "$(Q2 424794)" ] && ok "13l no record minted from a bare bot comment" || bad "13l minted a record from a bare bot comment"
 
 
 # 13m — the review skills' OWN unresolved-exit templates. Found by the #7391
@@ -4254,7 +4303,9 @@ Found 3 issues:
 2. missing repo guard (guidance)
 3. stale comment (quality)
 
-All three fixed in 9f1a2b3."
+All three fixed in 9f1a2b3.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13m2 the clean template (issues FOUND then FIXED) still records (rc 0)"
 R13M2="$(cat "$(Q2 424746)" 2>/dev/null || true)"
 assert_contains "$R13M2" '"evidence":"comment:42474601"' "13m2 the clean review artifact is what the record names"
@@ -4277,7 +4328,9 @@ assert_contains "$R13M2" '"evidence":"comment:42474601"' "13m2 the clean review 
 and an unresolved entity name is raised only from the recorder — this is not clean-up code, it is
 the guard itself.
 
-One test failed on origin/main and passes here."
+One test failed on origin/main and passes here.
+
+$VACUITY_BLOCK"
   assert_eq "$RECORD_RC" "0" "13n an explicit Outcome: CLEAN outranks prose mentioning not-clean/failed (rc 0)"
   R13N="$(cat "$(Q2 424747)" 2>/dev/null || true)"
   assert_contains "$R13N" '"evidence":"comment:42474701"' "13n the clean artifact is what the record names"
@@ -4340,7 +4393,9 @@ assert_eq "$RECORD_RC" "3" "13m3 'Requires Human Input' is refused (rc 3)"
 rm -f "$(Q2 424748)"
 EV_REF="comment:42474801" run_record_ev 424748 STUB_EVIDENCE_BODY="### Code review
 
-No issues remain after the fixes in 9f1a2b3."
+No issues remain after the fixes in 9f1a2b3.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "13m4 a clean review saying 'No issues remain' still records (rc 0)"
 
 # 13m5 — the OTHER FOUR unresolved prefixes from the file that OWNS the
@@ -4428,7 +4483,9 @@ EV_REF="review:42475901" run_record_ev 424759 STUB_EVIDENCE_BODY="Reviewed the d
 assert_eq "$RECORD_RC" "3" "13q a CHANGES_REQUESTED review is refused (rc 3)"
 [ ! -f "$(Q2 424759)" ] && ok "13q no record written for a CHANGES_REQUESTED review" || bad "13q wrote a record for a CHANGES_REQUESTED review"
 rm -f "$(Q2 424760)"
-EV_REF="review:42476001" run_record_ev 424760 STUB_EVIDENCE_BODY="Reviewed the diff." STUB_REVIEW_STATE="COMMENTED"
+EV_REF="review:42476001" run_record_ev 424760 STUB_EVIDENCE_BODY="Reviewed the diff.
+
+$VACUITY_BLOCK" STUB_REVIEW_STATE="COMMENTED"
 assert_eq "$RECORD_RC" "0" "13q control: the same body under COMMENTED still records (rc 0)"
 
 # 13q2 — the EMPTY-BODY parse is its own adversarial case, and it defeated the
@@ -4444,14 +4501,115 @@ for _q2_state in CHANGES_REQUESTED DISMISSED PENDING; do
     rm -f "$(Q2 $_q2_pr)"
     EV_REF="review:${_q2_pr}01" run_record_ev "$_q2_pr" STUB_EVIDENCE_BODY="" STUB_REVIEW_STATE="$_q2_state"
     assert_eq "$RECORD_RC" "3" "13q2 an EMPTY-BODY $_q2_state review is refused (rc 3)"
+    # ⛔ ATTRIBUTABLE, NOT MERELY RED (#3442 rule 2 applied to this suite's own arm). Since #3442 there
+    # are TWO arms that can refuse an empty-body review — the state veto above and the non-vacuity arm
+    # at the end — so an exit-code-only assertion would stay green on a mutant that deleted the state
+    # veto. Naming the state in the refusal is what keeps THIS arm pinning the state.
+    case "$RECORD_ERR" in
+      *"is a $_q2_state review"*) ok "13q2 …and the refusal NAMES the $_q2_state state (the state veto, not the non-vacuity arm)" ;;
+      *) bad "13q2 …the refusal did not name the $_q2_state state: $(printf '%.160s' "$RECORD_ERR")" ;;
+    esac
     [ ! -f "$(Q2 $_q2_pr)" ] && ok "13q2 no record written for an empty-body $_q2_state review" || bad "13q2 wrote a record for an empty-body $_q2_state review"
 done
 rm -f "$(Q2 424764)"
 EV_REF="review:42476401" run_record_ev 424764 STUB_EVIDENCE_BODY="" STUB_REVIEW_STATE="APPROVED"
-assert_eq "$RECORD_RC" "0" "13q2 control: an empty-body APPROVED review still records (rc 0)"
+# ⛔ #3442 CHANGES THE CONTROL, AND SAYS SO: an EMPTY body can no longer be clean evidence (a clean
+# claim must carry the attribution block), so the control's SUBJECT — that the empty-field parse
+# preserves `state` instead of collapsing it into `body` — is now pinned by the REASON rather than by
+# the exit code. If the `%%`/`#` split regressed, `body` would become "APPROVED" and the refusal would
+# come from the STATE arm (or from no arm at all); if the split works, the only arm left to refuse an
+# empty APPROVED review is the non-vacuity one. That is a STRONGER assertion than "rc 0", not a weaker
+# one, and the CHANGES_REQUESTED/DISMISSED/PENDING loop above now asserts its own reason the same way.
+assert_eq "$RECORD_RC" "3" "13q2 control: an empty-body APPROVED review is refused by the NON-VACUITY arm, not the state arm (rc 3)"
+case "$RECORD_ERR" in *"MUTATION ATTRIBUTION"*) ok "13q2 …and the refusal NAMES the non-vacuity arm (so the empty body was parsed as empty, not as the state)" ;; *) bad "13q2 …the refusal did not name the non-vacuity arm: $(printf '%.160s' "$RECORD_ERR")" ;; esac
 rm -f "$(Q2 424765)"
 EV_REF="review:42476501" run_record_ev 424765 STUB_EVIDENCE_BODY="" STUB_REVIEW_STATE="COMMENTED"
-assert_eq "$RECORD_RC" "0" "13q2 control: an empty-body COMMENTED review still records (rc 0)"
+assert_eq "$RECORD_RC" "3" "13q2 control: an empty-body COMMENTED review is refused by the NON-VACUITY arm (rc 3)"
+case "$RECORD_ERR" in *"MUTATION ATTRIBUTION"*) ok "13q2 …and that refusal names the non-vacuity arm too" ;; *) bad "13q2 …the COMMENTED refusal did not name the non-vacuity arm" ;; esac
+
+# ── 13v — agent-infra#3442: THE NON-VACUITY ARM, DRIVEN, WITH ITS OWN MUTANT ────────────────────
+# The claim: a FRESH `clean` verdict cannot be minted over a review artifact that never says which
+# mutant reddens which assertion. Three arms (admit / exempt / refuse) and then the mutant that
+# reverts the fix, so the suite proves the arm can FAIL rather than asserting that a string exists.
+echo "── 13v. the non-vacuity contract on the record path (#3442) ──────────────────"
+VACU_POS=424780
+rm -f "$(Q2 $VACU_POS)"
+EV_REF="comment:${VACU_POS}01" run_record_ev "$VACU_POS"
+assert_eq "$RECORD_RC" "0" "13v1 an artifact carrying the attribution table MINTS clean (rc 0) — and this proves the @tsv un-escape, since the stub always escapes newlines"
+assert_contains "$(cat "$(Q2 $VACU_POS)" 2>/dev/null)" '"evidence":"comment:'"${VACU_POS}"'01"' "13v1 …and the record names that artifact"
+VACU_NONE=424781
+rm -f "$(Q2 $VACU_NONE)"
+EV_REF="comment:${VACU_NONE}01" run_record_ev "$VACU_NONE" STUB_EVIDENCE_BODY="### Code review
+
+No issues found — the diff is docs-only.
+
+## MUTATION ATTRIBUTION
+NO NEW ASSERTIONS: docs-only, the diff touches docs/ops/*.md and no executable assertion."
+assert_eq "$RECORD_RC" "0" "13v2 the NO NEW ASSERTIONS exemption is REACHABLE (rc 0) — a docs-only review is not deadlocked by this gate"
+VACU_BAD=424782
+rm -f "$(Q2 $VACU_BAD)"
+EV_REF="comment:${VACU_BAD}01" run_record_ev "$VACU_BAD" STUB_EVIDENCE_BODY="### Code review
+
+No issues found. Checked for bugs and guidance compliance. I read the new test and it looks right.
+
+## MUTATION ATTRIBUTION
+I thought about whether the new assertion could fail."
+assert_eq "$RECORD_RC" "3" "13v3 a clean claim whose attribution block states NO mutant is REFUSED (rc 3) — 'I thought about it' is not an attribution"
+[ ! -f "$(Q2 $VACU_BAD)" ] && ok "13v3 no record minted from a prose-only attribution" || bad "13v3 minted a record from a prose-only attribution"
+case "$RECORD_ERR" in *"MUTATION-"*) ok "13v3 …and the refusal NAMES the missing shape (MUTATION-*), so the remedy is legible" ;; *) bad "13v3 …the refusal did not name the missing shape: $(printf '%.160s' "$RECORD_ERR")" ;; esac
+# ⛔ MUTATE THE SHIPPED FILE, NOT THE TEST — the §13b idiom one screen up. The mutant neuters the one
+# call that decides, which is exactly the pre-#3442 code: `verify_review_evidence` then has no
+# question to ask about non-vacuity, and 13v3's refusal must become an ACCEPTANCE.
+VACU_MUT="$T/record-review-nonvacuity-mutant.sh"
+# ⛔ THE MUTANT LIVES BESIDE A COPY OF THE VALIDATOR, ON PURPOSE. `verify_review_evidence` resolves
+# `brief-gate.sh` from four homes and REFUSES when none of them has it (a cannot-verify is never a
+# pass), so a mutant in a bare temp dir would fail closed for the WRONG reason and the arm below would
+# report the fail-closed path instead of the removed check. The symlink supplies the real validator via
+# the `$SELF`-adjacent home — which also exercises the FLAT (installed `$O`) shape of that ladder.
+ln -sfn "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" "$T/brief-gate.sh"
+# …and the recorder resolves `lib/diff-normalize.py` from ITS OWN directory (DIFF_NORMALIZER) in the
+# mode that runs the whole script. This arm does not need that (see the seam below), but the symlink
+# stays: the next reader who drives the mutant end-to-end must not hit a failure that has nothing to
+# do with the arm under test.
+ln -sfn "$SCRIPT_DIR/lib" "$T/lib"
+sed 's|^\(  ma_miss="\$(printf .*--mutation-missing - 2>/dev/null)"$\)|  ma_miss=""  # MUTANT: the pre-3442 code, which asked nothing|' "$RECORD" > "$VACU_MUT"
+if cmp -s "$RECORD" "$VACU_MUT"; then bad "13v MUTANT: the sed anchor no longer matches — the mutation is not applied, so the arm below would prove nothing"; else ok "13v MUTANT: the non-vacuity check is really removed from the shipped recorder"; fi
+bash -n "$VACU_MUT" && ok "13v MUTANT: the mutant still parses (it fails for the contract, not for a syntax error)" || bad "13v MUTANT: the mutant does not parse"
+# ⛔ THE SEAM IS `verify_review_evidence` ITSELF, NOT THE WHOLE RECORDER, and that is a deliberate
+# choice about ATTRIBUTION (#3442 rule 2). Driving `record-review.sh` end-to-end adds the diff-digest
+# read, the marker post and the record write between the mutation and the observable, and any of those
+# returning non-zero would look exactly like "the mutation did not flip the arm". The file is SOURCED
+# here — its main block is guarded by `BASH_SOURCE == $0` precisely so a test can do this — and the
+# function that decides is called directly, so the only thing that differs between the two rows is the
+# mutation. Both rows use the SAME fixture, and the fixture is the one 13v3 refused.
+VACU_PRE=424783
+export STUB_EVIDENCE_BODY="### Code review
+
+No issues found.
+
+## MUTATION ATTRIBUTION
+I thought about whether the new assertion could fail."
+run_verify_direct() { # <script-to-source> -> the evidence gate's rc
+    (
+        export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+        export STUB_EVIDENCE_PR=$VACU_PRE STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        rc=0
+        bash -c '. "$1" >/dev/null 2>&1; REPO="daniel-ospina/agent-infra"; PR="$2"; SHA="$3"; verify_review_evidence "comment:$2"01 "$3" clean >/dev/null' \
+            _ "$1" "$VACU_PRE" "$SHA" 2>/dev/null || rc=$?
+        printf '%s' "$rc"
+    )
+}
+VACU_SHIPPED_RC="$(run_verify_direct "$RECORD")"
+assert_eq "$VACU_SHIPPED_RC" "1" "13v MUTANT control: the SHIPPED gate refuses the prose-only attribution at the function (rc $VACU_SHIPPED_RC)"
+VACU_MUT_RC="$(run_verify_direct "$VACU_MUT")"
+assert_eq "$VACU_MUT_RC" "0" "13v ⛔ MUTATION: with the non-vacuity check removed, the SAME fixture is ADMITTED (rc $VACU_MUT_RC) — so 13v3 reddens ON THIS ARM, not on an unrelated one"
+unset STUB_EVIDENCE_BODY
+rm -f "$(Q2 $VACU_PRE)"
+# POLARITY CONTROL, and it is an EXISTING arm rather than a new one: §20.0 mints a `not-clean` record
+# over an artifact that carries NO attribution block ('## Review — NOT CLEAN …', no table). A negative
+# verdict legitimately has no kill table, so this arm is what reddens if the non-vacuity check ever
+# leaks into the negative path. Named here so the polarity skip is a DECISION with an assertion, not
+# an accident a later reader has to infer from the code's statement order.
 
 # 13n — T15: the evidence value must NOT be smuggled in through the ENVIRONMENT.
 # The gate reads it from argv only; a caller that exports EVIDENCE and passes no

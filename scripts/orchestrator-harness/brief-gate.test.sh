@@ -143,6 +143,80 @@ bash "$TMP/mutant-refuse.sh" --check "$CANON" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "MUTATION (other direction): 'a complete brief passes' FAILS when the gate refuses everything (rc=$rc)"
 
 echo
+echo "§F the NON-VACUITY contract (#3442) — the reviewer brief must carry a mutation attribution"
+# ── WHAT THIS SECTION PINS. A clean REVIEW was the one claim in the system nobody had to prove could
+# fail, so five PRs in one night were reviewed clean over assertions that stay GREEN with the bug
+# restored (docs/ops/review-non-vacuity-baseline.md). The gate now demands the block from the REVIEWER
+# role, and `record-review.sh` calls the SAME parser on a review artifact, so these arms are the shape
+# half of that contract. §G is the mutation proof that they can FAIL.
+REV_CANON="$TMP/canonical-reviewer.txt"; bash "$GATE" --section reviewer > "$REV_CANON"
+# The block is the LAST section of the canonical reviewer brief, so dropping from its heading to EOF
+# yields a brief that is complete in every OTHER respect — the fixture that isolates this requirement.
+sed '/^## MUTATION ATTRIBUTION/,$d' "$REV_CANON" > "$TMP/reviewer-no-mutation.txt"
+grep -q '^CONTRADICTION TEST:' "$TMP/reviewer-no-mutation.txt"; ck $? "fixture: the reviewer brief WITHOUT the block is otherwise complete (research + contradiction test intact)"
+bash "$GATE" --check "$TMP/reviewer-no-mutation.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(i) a REVIEWER brief with NO mutation attribution is REFUSED with 80 (got $rc)"
+bash "$GATE" --missing "$TMP/reviewer-no-mutation.txt" reviewer 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "…and the missing token NAMES the block (MUTATION-ATTRIBUTION)"
+# ⛔ THE OTHER DIRECTION, and it is what keeps this from being a wall on every dispatch: the identical
+# brief is a VALID brief for a non-reviewer role, so the requirement is scoped to the role that makes
+# the claim — not to the file.
+bash "$GATE" --check "$TMP/reviewer-no-mutation.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(ii) the SAME brief is still admitted for role 'lane' — the requirement belongs to the role, not the file (got $rc)"
+bash "$GATE" --check "$REV_CANON" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(iii) the canonical reviewer brief PASSES (the gate cannot refuse its own advice) (got $rc)"
+# …and the one-line disclosure a reviewer's lane log carries names it too, or an operator grepping the
+# log sees the research contract and would not know the verdict half exists.
+bash "$GATE" --line reviewer | grep -q '3442'; ck $? "(iv) the reviewer one-line disclosure names the non-vacuity contract"
+bash "$GATE" --line lane | grep -q '3442'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(iv-b) …and the LANE line does not (the block is not demanded of a lane brief)"
+# ── the parser, on the four shapes the artifact side can actually be in.
+printf '## MUTATION ATTRIBUTION\n\nI read the diff and it looks right.\n' > "$TMP/mut-prose.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-prose.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(v) a heading with prose and no table is REFUSED (a heading alone is not an attribution)"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | note | what I checked |\n|---|---|---|\n| a | b | c |\n' > "$TMP/mut-nocol.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-nocol.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(vi) a table whose header never names the mutant is REFUSED (the attribution key is the column, not the prose)"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row |\n|---|---|---|\n' > "$TMP/mut-norow.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(vii) a header with EVERY data row deleted is REFUSED (a header is not a kill)"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and adds no assertion.\n' > "$TMP/mut-none.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-none.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(viii) the NO NEW ASSERTIONS exemption is REACHABLE — a diff that adds no assertion is not deadlocked (got '$miss')"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS:\n' > "$TMP/mut-none-empty.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-none-empty.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(viii-b) …but a BARE 'NO NEW ASSERTIONS:' with no reason is REFUSED (an unexplained exemption is how the block becomes a rubber stamp)"
+# ⛔ THE CARRIER THE RECORD PATH ACTUALLY USES: a GitHub comment body arrives @tsv-ESCAPED, so its
+# newlines are the two characters `\n` and the whole artifact is ONE awk record. A line-oriented
+# parser finds no heading there and would refuse EVERY honest review — the `13v1` arm in
+# record-review.test.sh proves the same thing end-to-end; this pins the parser half where it lives.
+printf '%s' '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the diff adds no assertion.\n' > "$TMP/mut-tsv.txt"
+[ "$(grep -c '' "$TMP/mut-tsv.txt")" = "1" ]; ck $? "fixture: the escaped carrier really is ONE line (otherwise this arm proves nothing about @tsv)"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-tsv.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(ix) a ONE-LINE @tsv-escaped body is parsed (the review-artifact carrier; got '$miss')"
+bash "$GATE" --mutation-missing "$TMP/does-not-exist-mut.txt" 2>/dev/null | grep -qx 'NO-FILE'; ck $? "(x) an UNREADABLE artifact is refused as NO-FILE, never admitted (fail-closed)"
+
+# ── §G THE MUTATION PROOF: each §F assertion above must be able to FAIL. Same discipline as §C — the
+# mutant is derived FROM THE SHIPPED FILE so it tracks it, and the transformation is itself asserted.
+echo
+echo "§G NON-VACUITY of §F — removing the requirement makes §F's refusals pass, and the mutant is alive"
+# ⛔ NO TRAILING COMMENT IN THE REPLACEMENT: `if false  # MUTANT…` swallows the `; then` that follows
+# on the same line and yields a mutant that fails to PARSE — a mutation that fails for the wrong reason.
+sed 's/if \[ "$role" = "reviewer" \]/if false/' "$GATE" > "$TMP/mutant-no-role.sh"
+cmp -s "$GATE" "$TMP/mutant-no-role.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the role mutation REALLY changed the file (both role tests still match the anchor)"
+grep -c 'if false; then' "$TMP/mutant-no-role.sh" | grep -qx '4'; ck $? "§G …and it replaced ALL FOUR role tests (two parse branches + the section render + the disclosure), which is the pre-#3442 behaviour: nothing asked"
+bash -n "$TMP/mutant-no-role.sh"; ck $? "§G the mutant still parses — a program, not a syntax error"
+bash "$TMP/mutant-no-role.sh" --check "$TMP/reviewer-no-mutation.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "§G ⛔ MUTATION: §F(i) 'a reviewer brief with no attribution is REFUSED' now FAILS — the mutant admits it (rc=$rc)"
+bash "$TMP/mutant-no-role.sh" --check "$REV_CANON" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "§G …and the control still passes, so the flip is the missing requirement and not a broken fixture (rc=$rc)"
+# …and the OTHER direction on the PARSER half: a mutant that stops requiring the mutant COLUMN makes
+# §F(vi) — the single most load-bearing arm, since a table with no mutant column is the shape a real
+# reviewer writes when it believes prose is enough — pass.
+sed 's/^  if (!hdr) { print "MUTATION-MUTANT-COLUMN"; exit }$/  if (0) { print "x"; exit }  # MUTANT: the column is not required/' "$GATE" > "$TMP/mutant-no-column.sh"
+cmp -s "$GATE" "$TMP/mutant-no-column.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the column mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-no-column.sh"; ck $? "§G …and the column mutant still parses"
+miss="$(bash "$TMP/mutant-no-column.sh" --mutation-missing "$TMP/mut-nocol.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(vi) 'a table whose header never names the mutant is REFUSED' now FAILS — the mutant admits it (got '$miss')"
+
+echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
 # ── the stub `pi` records every invocation, so "refused" is proven by ABSENCE, and the admitted
 #    control proves the machinery under it actually works (a negative assert alone passes on a tree
@@ -217,7 +291,11 @@ res="$(drive_m1 "$TMP/no-contradiction.txt")"
 [ "$res" = "rc=80 started=0" ]; ck $? "merge-one.sh's run_agent REFUSES an invalid reviewer brief: 80, started=0 ($res)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and the reviewer model was NOT invoked"
-res="$(drive_m1 "$CANON")"
+# ⛔ THE POSITIVE CONTROL USES THE REVIEWER BRIEF, NOT `$CANON` (agent-infra#3442): merge-one.sh's
+# `run_agent` gates role `reviewer`, and since #3442 a reviewer brief must carry the mutation block.
+# Driving the LANE canonical brief here stopped being a control the moment the contract landed — it
+# now proves the gate fires, which the arm ABOVE already covers.
+res="$(drive_m1 "$REV_CANON")"
 [ "$res" = "rc=0 started=1" ]; ck $? "POSITIVE CONTROL: merge-one.sh's run_agent runs the reviewer for a valid brief ($res)"
 grep -q 'PI_RAN' "$PI_LOG"; ck $? "…and the stub pi really ran there too"
 
@@ -582,7 +660,23 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
 # superset), independently of any branch. Declared here because an equality that is red on its own
 # base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+#
+# ⛔ THE PRE-EXISTING DIVERGENCE IS NOW DECLARED, NOT MERELY NOTED (agent-infra#3442 measured it a
+# second time: `main` at d5c6dc75 reported `118 passed, 1 failed`, the failure being THIS arm). Five
+# referencers had arrived without a declaration — `check-farm-drift.sh` and `cloud-cell-supervisor.sh`
+# (both name the gate when explaining what a box carries), `key-gate.sh` (same, for the spawn order),
+# `nonblocking-dispatch.test.sh` (drives the dispatcher, which gates), and `record-review.sh`, which
+# since #3442 calls the VALIDATOR rather than merely naming it. They are declared below on the list's
+# own terms. An equality that is red on its own base is not a signal; this makes it one again.
+#
+# ⛔ AND #3442 ADDS FOUR MEMBERS OF ITS OWN, declared for the same reason: `record-review.sh` (calls
+# `brief-gate.sh --mutation-missing`), `record-review.test.sh` and
+# `mutation-attribution.test.sh` (both DRIVE that parser), and the two `fixtures/mutation-attribution/`
+# documents (they name the parser where a suite's author copies the shape from). Declared rather than
+# filtered out of the scan: a filter on a directory would silently absorb the next caller that happens
+# to live there, which is the "gate that cannot see the thing it exists for" shape this list exists
+# to prevent.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
