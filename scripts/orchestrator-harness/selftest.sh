@@ -3900,9 +3900,35 @@ if [ -s "$REFRESH" ]; then
   # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
   # both functions are contiguous there, and a terminator anchor cannot silently capture half the file.
   awk '/^rank_queue_by_pool\(\) \{/{f=1} f && /^# The previous pass.s record/{exit} f' "$REFRESH" > "$TMP/qorder-fns.sh"
-  # Fail closed if an extraction found nothing, or lost the file it is supposed to exercise.
+  # ⛔ THE EXTRACTION'S EXTENT IS CHECKED, NOT ASSUMED (review P2, cycle 6). The gate below used to ask
+  # only that the block be non-empty and CONTAIN the definition, so a DRIFTED terminator anchor — awk
+  # then runs to EOF and captures every remaining line of the file — still satisfied it. Over-capture is
+  # harmless today, but it made the two suites DISAGREE about what a broken anchor looks like:
+  # `rank-queue.test.sh` additionally requires the block's last line to be `}`, so the same drift reddens
+  # there and stayed GREEN here. Measured on a drifted terminator: this check reported 3 passed / 0
+  # failed. The extent is now compared with the SOURCE — the block must be exactly the lines from the
+  # start anchor up to (excluding) the terminator — so neither an over-capture nor a drifted start can
+  # pass, and the failure is named instead of being absorbed into three anonymous FAILs.
+  _qo_start="$(grep -n '^rank_queue_by_pool() {' "$REFRESH" 2>/dev/null | head -1 | cut -d: -f1)"
+  _qo_term="$(grep -n "^# The previous pass.s record" "$REFRESH" 2>/dev/null | head -1 | cut -d: -f1)"
+  _qo_n="$(wc -l < "$TMP/qorder-fns.sh" 2>/dev/null | tr -d ' ')"
+  _qo_extent=1
+  if [ -n "$_qo_start" ] && [ -n "$_qo_term" ] && [ -n "$_qo_n" ]; then
+    case "${_qo_start}${_qo_term}${_qo_n}" in
+      *[!0-9]*) _qo_extent=1 ;;
+      *) [ "$_qo_n" -eq "$(( _qo_term - _qo_start ))" ] && _qo_extent=0 ;;
+    esac
+  fi
+  # Fail closed if an extraction found nothing, lost the file it is supposed to exercise, or captured
+  # more than the anchor pair says it should.
+  _qo_ok=1
   if [ -s "$TMP/tail.sh" ] && grep -q 'candidates\.txt' "$TMP/tail.sh" \
-     && grep -q '^queue_order_from_pool() {' "$TMP/qorder-fns.sh"; then
+     && grep -q '^queue_order_from_pool() {' "$TMP/qorder-fns.sh" \
+     && [ "$_qo_extent" -eq 0 ]; then _qo_ok=0; fi
+  if [ "$_qo_ok" -ne 0 ]; then
+    echo "      extraction REFUSED: qorder-fns=$_qo_n line(s), expected $([ -n "$_qo_start" ] && [ -n "$_qo_term" ] && printf '%s' "$(( _qo_term - _qo_start ))" || printf 'an exact anchor extent') from the anchors (start=${_qo_start:-MISSING} terminator=${_qo_term:-MISSING}) — a drifted anchor over-captures or captures nothing, and this half must not read green while the sibling suite reddens"
+  fi
+  if [ "$_qo_ok" -eq 0 ]; then
     # Redirect $O at the SOURCE rather than editing paths: `awk -v` passes the fixture dir without any
     # shell quoting of `$O` on the command line. Escape it first — in awk's gsub REPLACEMENT `&` means
     # the matched text and `\x` is an escape, so a `&` or `\\` in $TMP would corrupt the generated

@@ -217,6 +217,43 @@ mut_set="$(sort -n "$DR/out" 2>/dev/null | uniq | tr '\n' ' ' | sed 's/ *$//')"
 [ -n "$mut_set" ] && [ "$mut_set" != "$before_set" ] && rc=0 || { rc=1; echo "      mutated ranker emitted '$mut_set' (queue set '$before_set') — the tail-dropping mutation is inert, so 1c proves nothing"; }
 ck "non-vacuity: the tail-dropping ranker's ROW SET really does differ from the queue's (the condition the install refuses on)" $rc
 
+# ── 2c) THE FILES ARE TOLD APART BY IDENTITY, NOT BY POSITION (review P2, cycle 6) ──
+# `NR == FNR` means "the FIRST file" only while that file yields records. `orch-loop.sh` prunes
+# candidates.txt with an in-place truncate (`open(path,"w")`) and takes no `.refresh.lock`, so a read can
+# begin against a NON-EMPTY queue and reach the awk as a ZERO-RECORD first file; with `NR == FNR` the
+# first POOL row then satisfies the test and the whole pool is taken for the queue — pool rows emitted
+# as queue rows, i.e. MEMBERSHIP added, the one thing "order, never membership" forbids. The shipped
+# `FILENAME == ARGV[1]` is the file's IDENTITY and cannot be true for the pool whatever the queue did.
+# ⚠️ This is pinned against the shipped AWK TEXT, because the state is unobservable through
+# `queue_order_from_pool`: its empty-queue arm returns before the awk ever runs, so ONLY the race
+# reaches this line. Driving the program itself is the only honest way to pin it — and reverting it to
+# `NR == FNR` leaves every other check in this suite green (measured: 23 passed / 0 failed), so nothing
+# above this point covers it.
+DRQ="$TMP/file-identity"; mkdir -p "$DRQ"
+awk -v sq="$(printf '\047')" '
+  index($0, "awk -v cntf=") { f = 1; i = index($0, sq); if (i) $0 = substr($0, i + 1) }
+  f && index($0, "close(cntf) }") { i = index($0, sq); if (i) $0 = substr($0, 1, i - 1); print; exit }
+  f { print }
+' "$FNS" > "$DRQ/rank.awk" 2>/dev/null
+grep -q 'FILENAME == ARGV\[1\]' "$DRQ/rank.awk" 2>/dev/null && mutated=1 || mutated=0
+[ "$mutated" -eq 1 ] && rc=0 || { rc=1; echo "      could not extract the shipped awk program (no FILENAME test found in $FNS)"; }
+ck "the shipped ranker's awk program can be extracted for direct drive (it still tells the files apart by identity)" $rc
+printf '' > "$DRQ/empty"
+printf '200\n300\n' > "$DRQ/pool"
+awk -v cntf="$DRQ/cnt-empty" -f "$DRQ/rank.awk" "$DRQ/empty" "$DRQ/pool" > "$DRQ/out-empty" 2>/dev/null
+[ ! -s "$DRQ/out-empty" ] && rc=0 || { rc=1; echo "      a ZERO-RECORD first file emitted $(tr '\n' ' ' < "$DRQ/out-empty") — pool rows are being taken for the queue"; }
+ck "a ZERO-RECORD first file emits NOTHING — the pool is never mistaken for the queue (count '$(cat "$DRQ/cnt-empty" 2>/dev/null)')" $rc
+# NON-VACUITY: the pre-hardening test must exhibit the defect on this very fixture, or the two checks
+# above assert nothing about the code that is actually shipped.
+sed 's/FILENAME == ARGV\[1\]/NR == FNR/' "$DRQ/rank.awk" > "$DRQ/rank-nrfnr.awk"
+grep -q 'NR == FNR' "$DRQ/rank-nrfnr.awk" && mutated=1 || mutated=0
+[ "$mutated" -eq 1 ] && rc=0 || { rc=1; echo "      the NR==FNR mutation did not apply"; }
+ck "the NR==FNR mutation applied to the extracted program" $rc
+awk -v cntf="$DRQ/cnt-mut" -f "$DRQ/rank-nrfnr.awk" "$DRQ/empty" "$DRQ/pool" > "$DRQ/out-mut" 2>/dev/null
+if [ "$(tr '\n' ' ' < "$DRQ/out-mut" | sed 's/ *$//')" = "200 300" ] && [ "$(cat "$DRQ/cnt-mut" 2>/dev/null)" = "0 2 -" ]; then rc=0
+else rc=1; echo "      NR==FNR gave '$(tr '\n' ' ' < "$DRQ/out-mut" | sed 's/ *$//')' / '$(cat "$DRQ/cnt-mut" 2>/dev/null)' (want the pool installed as the queue: '200 300' / '0 2 -')"; fi
+ck "non-vacuity: NR==FNR INSTALLS the pool as the queue on a zero-record first file — the identity test is load-bearing, not cosmetic" $rc
+
 # ── 3) THE UNRANKED TAIL KEEPS ITS OWN RELATIVE ORDER ────────────────────────
 # Two ranked rows (200, 300) and two unranked (9, 7) INTERLEAVED in the queue: the tail must come out in
 # the order the queue had them (9 then 7), not reversed and not numerically sorted.
@@ -230,6 +267,52 @@ drive tail "$FNS" '9
 got="$(cat "$TMP/tail/order" 2>/dev/null)"
 [ "$got" = "200 300 9 7" ] && rc=0 || { rc=1; echo "      got '$got' (want '200 300 9 7')"; }
 ck "unranked rows sit at the TAIL in their existing relative order (pool '200,300' over '9,300,7,200' -> '200 300 9 7')" $rc
+
+# ── 3b) THE COUNTS ARE PART OF THE PRODUCT, NOT DECORATION (review P1, cycle 6) ───────────────────
+# The PR body and ARCHITECTURE.md both advertise that unranked rows are "KEPT at the TAIL and counted",
+# and that printed count is the ONLY thing that lets an unranked population be distinguished from a
+# ranked one in the log. NOTHING pinned it: measured on the shipped script, removing the parenthetical
+# from the severity line AND deleting the WARN line outright left this suite at `23 passed, 0 failed`.
+# A safety property whose only regression path is a silent one-line edit is exactly the false PASS this
+# PR exists to close elsewhere, so both prints are pinned here on the SAME fixture as 3), with the
+# VALUES asserted (2 ranked / 2 unranked), so a count that stops counting reddens as well.
+tail_out="$(cat "$TMP/tail/out" 2>/dev/null)"
+case "$tail_out" in
+  *"(2 pool-ranked, 2 unranked at the tail)"*) rc=0 ;;
+  *) rc=1; echo "      the severity line does not carry the measured counts (want '(2 pool-ranked, 2 unranked at the tail)'); out: $(printf '%s' "$tail_out" | head -c 240)" ;;
+esac
+ck "the severity-first line PRINTS the counts — '2 pool-ranked, 2 unranked at the tail' for pool '200,300' over queue '9,300,7,200'" $rc
+case "$tail_out" in
+  *"WARN queue order: 2 queued candidate(s) are not ranked"*) rc=0 ;;
+  *) rc=1; echo "      the unranked-population WARN is missing (want 'WARN queue order: 2 queued candidate(s) are not ranked'); out: $(printf '%s' "$tail_out" | head -c 240)" ;;
+esac
+ck "an unranked population is ANNOUNCED — 'WARN queue order: 2 queued candidate(s) are not ranked', so it can never read as a fully ranked queue" $rc
+
+# 3c) NON-VACUITY of 3b: strip both prints from the source the suite drives and confirm the mutant's
+#     output no longer carries them. Without this, 3b could be satisfied by the fixture rather than by
+#     the shipped print. This is the same removal that was measured GREEN before this check existed.
+MUT_NOCOUNT="$TMP/fns-nocount.sh"
+sed -e 's/ (\$_r pool-ranked, \$_u unranked at the tail)//' \
+    -e '/WARN queue order: \$_u queued candidate(s)/d' "$FNS" > "$MUT_NOCOUNT"
+case "$(cat "$MUT_NOCOUNT" 2>/dev/null)" in
+  *'pool-ranked, $_u unranked'*|*'WARN queue order: $_u queued'*) mutated=1 ;;
+  *) mutated=0 ;;
+esac
+[ "$mutated" -eq 0 ] && rc=0 || { rc=1; echo "      the count/WARN mutation did not apply — a sed anchor drifted"; }
+ck "the count-stripping mutation applied to the extracted source (both anchors still match it)" $rc
+drive mut-nocount "$MUT_NOCOUNT" '9
+300
+7
+200
+' '200
+300
+'
+nc_out="$(cat "$TMP/mut-nocount/out" 2>/dev/null)"
+case "$nc_out" in
+  *'pool-ranked'*|*'WARN queue order'*) rc=1; echo "      the mutant still prints a count/WARN — 3b cannot discriminate"; out_tail="$(printf '%s' "$nc_out" | grep -o 'pool-ranked\|WARN queue order' | head -2 | tr '\n' ' ')"; echo "      still present: $out_tail" ;;
+  *) rc=0 ;;
+esac
+ck "non-vacuity: with both prints removed the 3b assertions go RED (the removal is visible, not absorbed)" $rc
 
 # ── 4) A POOL THAT RANKS NOTHING IS `priority-unreadable`, NOT ARRIVAL-AS-SEVERITY ──
 # The silent degradation: a ladder returning "no priority" for everything reads exactly like a healthy
@@ -344,10 +427,18 @@ fi
 ck "a reorder whose COUNT cannot be verified FAILS instead of reporting a drained queue (positive pair: a real count succeeds)" $rc
 
 # ── 7) THE WIRING CANNOT GO INERT — the false-PASS this suite was written for ──
-# The first cut of this change DEFINED both functions ~1,337 lines BELOW the skip arm that calls one, so
-# on every skipped pass bash resolved the call to nothing (`command not found`, absorbed by `|| true`)
-# and the reorder never ran. A definition that lives after its call site is indistinguishable from no
-# function at all at runtime, and every assertion above still passes because they supply their own call.
+# The first cut of this change (`70ea113c`) left both definitions OUTSIDE the region the sibling check
+# DRIVES: `selftest.sh` builds its fixture from the `^done < "$O/.pool"` anchor onward, and on that
+# commit `rank_queue_by_pool`/`queue_order_from_pool` sat at 3709/3742 against an anchor at 4827 — i.e.
+# ~1,085 lines ABOVE it — so in the driven copy bash resolved the call to nothing (`command not found`,
+# absorbed by `|| true`) and the reorder never ran. A definition that lives outside the region a drive
+# executes is indistinguishable from no function at all at runtime, and every assertion above still
+# passes because they supply their own call.
+# ⛔ THE DIRECTION AND THE ANCHOR IN THIS COMMENT WERE CORRECTED (review P2, cycle 6). It used to say
+# "DEFINED both functions ~1,337 lines BELOW the skip arm" — measured false on `70ea113c`: the
+# definition was at 3742 and the skip-arm call at 3803, so it was 61 lines ABOVE that call. The ~1,337
+# magnitude is the definition → MAIN-call distance (1,467 at HEAD, `:3813` → `:5280`), not the defect.
+# The assertion below is sound either way; only the story it told was wrong.
 #
 # ⛔ POSITION IS NOT REACHABILITY (review P1, cycle 3). Pinning only "both calls sit below the
 # definition" leaves the DEFECT IT NAMES alive: moving the skip arm's call BELOW that arm's own
