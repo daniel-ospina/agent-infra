@@ -1889,6 +1889,40 @@ OUT="$(run_install Darwin "$D" --report-only)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "control: the same refusal on the launchd arm when the seam IS exported"
 rm -f "$ALT"
 
+# ── T66: a routine install that would REPOINT the pool says so, on both arms ─────────────
+# `note_repo_change` runs on both install verbs and NOTHING pinned it: deleting both call sites
+# measured `PASS=446 FAIL=0`, exit 0. What it exists to prevent is silent: `RUNNER_AUTOSCALE_REPO`
+# defaults to daniel-ospina/tortoise, so a routine `--install` from a shell that does not export the
+# seam converges a DIFFERENT pool than the one the box was armed against, with the artifact, the
+# record and `--status` all agreeing — the note is the only thing that tells the operator.
+say_case "T66 a routine install that would repoint the pool names it, instead of doing it silently"
+D="$T/c66"; fresh "$D"; rm -f "$ARM"
+run_install Linux "$D" --install >/dev/null 2>&1
+assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "o/r" \
+    "precondition: the artifact converges the pool the box was installed with"
+# Control: the SAME pool is silent. Without this the case would pass on a note that always fires.
+OUT="$(run_install Linux "$D" --install)"; RC=$?
+assert_eq "$RC" 0 "control: re-installing the same pool exits 0"
+assert_absent "$OUT" "note: the installed artifact converges repo" "…and prints no repointing note"
+# The note: this shell resolves a different pool than the artifact converges.
+ENVV=(RUNNER_AUTOSCALE_REPO="other/pool")
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_contains "$OUT" "note: the installed artifact converges repo 'o/r'" \
+    "the note names the pool the ARTIFACT converges"
+assert_contains "$OUT" "repoints the capacity pass to 'other/pool'" "and the one THIS invocation resolves"
+assert_contains "$OUT" "RUNNER_AUTOSCALE_REPO='o/r'" "with the exact command that keeps the old pool"
+assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "other/pool" \
+    "and the artifact really was repointed — the note is not advice the install ignores"
+# The launchd arm carries its own call site; pin it too, or only the systemd half is covered.
+D2="$T/c66d"; fresh "$D2"
+run_install Darwin "$D2" --install >/dev/null 2>&1
+assert_contains "$(plist_args "$D2/$LABEL.plist")" "o/r" "precondition: the plist converges the installed pool"
+ENVV=(RUNNER_AUTOSCALE_REPO="other/pool")
+OUT="$(run_install Darwin "$D2" --install)"; RC=$?; ENVV=()
+assert_contains "$OUT" "note: the installed artifact converges repo 'o/r'" \
+    "the launchd arm prints the same note (the second call site)"
+assert_contains "$(plist_args "$D2/$LABEL.plist")" "other/pool" "and its plist is repointed too"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
