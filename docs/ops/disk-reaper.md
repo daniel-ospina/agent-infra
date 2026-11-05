@@ -535,14 +535,18 @@ headroom.
     **MAY BE ITS OWN (unattributed)**, never as proof that another process caused it, while
     `reaped_runner_work=?` tells a reader the removal count is not a measurement. ⛔ **AND THE BYTES ARE
     `unmeasured` TOO, not a measured `0 MB`** (#3057 review): `freed_mb_runner_work=unmeasured`, with
-    `freed_mb_unmeasured` naming `runner-work` and `freed_mb_total=unmeasured` — because the total is a sum
-    with this class's unconfirmed `0` in it, and that total is the figure `alert=under-reclaim` asserts on,
-    so the alert is suppressed for a pass whose class figure nobody measured. A stub that deleted 40 MB
-    reported a *confident* zero there while the note admitted the figure was unknown; the note being the
-    only surface that said so is the same "measured zero that is not a measurement" this class's `?`
-    polarity exists to remove. The class line names the MISSING
-    LEDGER as the cause (`df ANSWERED, but the owner never did`), not "df could not answer", which would
-    point an operator at the wrong component.
+    `freed_mb_unmeasured` naming `runner-work` — a stub that deleted 40 MB reported a *confident* zero there
+    while the note admitted the figure was unknown, and the note being the only surface that said so is the
+    same "measured zero that is not a measurement" this class's `?` polarity exists to remove.
+    ⛔ **AND EVERY SURFACE THAT READS THE FIGURE FOLLOWS IT**, because fixing one field at a time left the
+    same lie one step over, each time on a surface an operator reads FIRST: `freed_mb=` (the pass total that
+    `--print-status`, `tools/fleet/fleet-health.py` and the supervisor all name — `freed_mb_total` is read
+    by nothing) is `unmeasured`; `alert=under-reclaim` is not asserted on a sum containing an unconfirmed
+    `0`, since that total is its whole premise ("the pass RAN and did not keep up"); and the REASON is
+    split, so `detail=` and the pass-end line say **owner never answered its ledger: runner-work**, not
+    "df could not measure" — `df` ANSWERED here, and blaming it points an operator at the mount for a
+    cut-short ledger. `freed_mb_unmeasured` still lists `runner-work` (one answer to "whose reclaim was not
+    measured"); only the cause is separated.
   * **Without `gone=`, an EMPTY sink and a VANISHED one were the same record.** The owner counts a
     disappeared entry/root into `gone=` and feeds it into its census decision, and cases **(s)**/**(t)**
     exist to keep that out of `unmeasurable=` — a gone root is a fact about the box, not a doubt about

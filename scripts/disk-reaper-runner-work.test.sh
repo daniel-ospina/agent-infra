@@ -1048,6 +1048,20 @@ case_v() { # <entry-point> <owner>
     # up"). The alert is suppressed on this pass for the same reason.
     case_check "$(grep -q '^freed_mb_total=unmeasured$' <<<"$st" && echo 0 || echo 1)" \
                "v1 … and freed_mb_total is unmeasured too, never a sum with an unknown silently added as 0 (freed_mb_total=$(sed -n 's/^freed_mb_total=//p' <<<"$st"))"
+    # ⛔ AND THE HEADLINE TOTAL TOO — `freed_mb_total` is read by NOTHING, while `freed_mb=` is what
+    # `--print-status`, `fleet-health.py` and the supervisor all name. Fixing the unread field and leaving
+    # the read one at 0 is the same defect one surface over (measured: `--print-status` rendered
+    # `freed_mb=0` beside `freed_mb_runner_work=unmeasured` for a pass that deleted 20 MB).
+    case_check "$(grep -q '^freed_mb=unmeasured$' <<<"$st" && echo 0 || echo 1)" \
+               "v1 … and the HEADLINE freed_mb= is unmeasured too, because that is the field every reader and every alarm names (freed_mb=$(sed -n 's/^freed_mb=//p' <<<"$st"))"
+    # ⛔ AND `detail=` MUST NOT BLAME `df`. It is the headline `cloud-cell-supervisor.sh` prints for a
+    # not-healthy pass and the field `fleet-health.py` shows on an alarm — so "df could not measure" there
+    # sends an operator to the mount for a CUT-SHORT LEDGER, while the class line in the same pass says
+    # `df ANSWERED, but the owner never did`. Two causes, two sentences.
+    case_check "$(grep -qF 'owner never answered its ledger for: runner-work' <<<"$st" && echo 0 || echo 1)" \
+               "v1 … and detail= names the MISSING LEDGER as the cause of the unmeasured figure"
+    case_check "$(grep -qF 'df could not measure the reclaim for: runner-work' <<<"$st" && echo 1 || echo 0)" \
+               "v1 … and never blames df, which answered (detail: $(sed -n 's/^detail=//p' <<<"$st"))"
     case_check "$(grep -qF 'NOT ATTRIBUTABLE' <<<"$out" && echo 0 || echo 1)" \
                "v1 … and the class line blames the MISSING LEDGER, not 'df could not answer' — a false cause with a wasted remedy"
     case_check "$(grep -qF 'belongs to another process' <<<"$st" && echo 1 || echo 0)" \

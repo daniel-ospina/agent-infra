@@ -2712,12 +2712,25 @@ else
 fi
 
 TOTAL=$(( FREED_UV + FREED_VENV + FREED_WT + FREED_DUP + FREED_RW ))
-UNMEASURED=""
-[ "${DF_UV_OK:-0}"  = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }uv"
-[ "${DF_VENV_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }venv"
-[ "${DF_WT_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }worktree"
-[ "${DF_DUP_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }duplicate-install"
-[ "${DF_RW_OK:-0}" = 1 ] || UNMEASURED="${UNMEASURED}${UNMEASURED:+, }runner-work"
+UNMEASURED=""; DF_UNM=""; LEDGER_UNM=""
+_um() { UNMEASURED="${UNMEASURED}${UNMEASURED:+, }$1"; }
+_um_df() { _um "$1"; DF_UNM="${DF_UNM}${DF_UNM:+, }$1"; }
+[ "${DF_UV_OK:-0}"  = 1 ] || _um_df uv
+[ "${DF_VENV_OK:-0}" = 1 ] || _um_df venv
+[ "${DF_WT_OK:-0}" = 1 ] || _um_df worktree
+[ "${DF_DUP_OK:-0}" = 1 ] || _um_df duplicate-install
+# ⛔ `UNMEASURED` IS ONE LIST WITH TWO CAUSES, and the surfaces that EXPLAIN it must not collapse them
+# (#3057 review, P2): `DF_UNM` = `df` could not answer; `LEDGER_UNM` = `df` ANSWERED and the OWNER never
+# did (a sweep cut short at CLASS_TIMEOUT), so the delta exists and merely cannot be attributed. Blaming
+# `df` for the second sends an operator to the mount for a cut-short ledger — the false cause the class
+# line was already fixed to avoid, still asserted on the pass-end line and on `detail=`, which is the
+# headline `cloud-cell-supervisor.sh` prints and the field `fleet-health.py` shows on an alarm.
+# `UNMEASURED` stays the PUBLISHED list (`freed_mb_unmeasured=`): "whose reclaim was not measured" has
+# one answer either way; only the REASON differs, and only the reason is what the operator acts on.
+if [ "${DF_RW_OK:-0}" = 1 ]; then :; else
+    _um runner-work
+    if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then LEDGER_UNM="runner-work"; else DF_UNM="${DF_UNM}${DF_UNM:+, }runner-work"; fi
+fi
 # ⛔ AN UNANSWERABLE TOTAL IS `?`, NOT THE INITIALISED ZERO. `CAND_*` are initialised to 0 and are
 # only lifted to a sentinel on the CLASS line, so a fail-closed class printed `candidates=?` on its own
 # line and the pass-end line then summed the zeroes into a confident `candidates=0` — the last line of
@@ -2755,7 +2768,10 @@ else
     # "measured zero" and "unmeasured".
     _pc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
             [ "${1:-0}" = 1 ] && printf '%sMB' "$2" || printf 'unmeasured'; }
-    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner-work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW"))${UNMEASURED:+ — df could not measure: $UNMEASURED (not a measured zero)}"
+    _unmwhy=""
+    [ -n "$DF_UNM" ] && _unmwhy="df could not measure: $DF_UNM"
+    [ -n "$LEDGER_UNM" ] && _unmwhy="${_unmwhy}${_unmwhy:+ — }owner never answered its ledger: $LEDGER_UNM"
+    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$TOTAL" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner-work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW"))${_unmwhy:+ — $_unmwhy (not a measured zero)}"
 fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────
@@ -2774,7 +2790,8 @@ DETAIL=""
 [ -n "$NOTE_DUP" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_DUP"
 [ -n "$NOTE_RW" ] && DETAIL="${DETAIL}${DETAIL:+; }$NOTE_RW"
 [ -n "$MISCONFIG" ] && DETAIL="${DETAIL}${DETAIL:+; }cannot run: ${MISCONFIG}"
-[ -n "$UNMEASURED" ] && DETAIL="${DETAIL}${DETAIL:+; }df could not measure the reclaim for: ${UNMEASURED} (not a measured zero)"
+[ -n "$LEDGER_UNM" ] && DETAIL="${DETAIL}${DETAIL:+; }owner never answered its ledger for: ${LEDGER_UNM} (not a measured zero)"
+[ -n "$DF_UNM" ] && DETAIL="${DETAIL}${DETAIL:+; }df could not measure the reclaim for: ${DF_UNM} (not a measured zero)"
 # The fallback is part of the VERDICT, not a footnote beside it: a reader who sees a record must be
 # able to tell that it came from a pass whose configured state dir was unusable (agent-infra#2443).
 [ -n "$STATE_DIR_PRIMARY_NOTE" ] && DETAIL="${DETAIL}${DETAIL:+; }state dir $STATE_DIR_PRIMARY was unusable (${STATE_DIR_PRIMARY_NOTE}) — this pass ran on $STATE_DIR, and so did its delegates"
@@ -2793,7 +2810,11 @@ record_body() {
     printf 'rc=%s\n' "$verdict"
     printf 'classes=%s\n' "$ONLY"
     printf 'watchdog=%s\n' "${TB_TIMEOUT_KIND:-unknown}"
-    printf 'freed_mb=%s\n' "$TOTAL"
+    # ⛔ AND THE HEADLINE TOTAL IS THE FIELD READERS USE (#3057 review, P2). `freed_mb_total` carries
+    # this honesty but NOTHING reads it, while `freed_mb=` is what `--print-status`, `tools/fleet/fleet-health.py`
+    # and the supervisor all name — so a 0 there is a confident zero on the surface that matters, for a
+    # pass that deleted bytes nobody counted. A sum with an unconfirmed term is not a measurement.
+    if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then printf 'freed_mb=unmeasured\n'; else printf 'freed_mb=%s\n' "$TOTAL"; fi
     printf 'freed_mb_unmeasured=%s\n' "$UNMEASURED"
     # In a dry run nothing was removed, so 0 is measured, not unmeasured.
     _rc() { [ "${3:-1}" = 1 ] || { printf 'not-run'; return 0; }
