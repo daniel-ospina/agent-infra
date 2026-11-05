@@ -3111,7 +3111,7 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # exporter, so "neither exports it" is not evidence about the reaper's environment. It IS inert in
     # exactly two measured contexts: the plist-launched scheduled disk reaper, whose
     # `EnvironmentVariables` carry `HOME`/`PATH` and not this key
-    # (`templates/launchd/reaper/com.eldato.disk-reaper.plist:57-60`), and a cell, which names the same
+    # (`templates/launchd/reaper/com.eldato.disk-reaper.plist:57-62`), and a cell, which names the same
     # sha record `HARNESS_PIN_RECORD` (`cloud-cell-bringup.sh:90`). Where it IS set but keeps the
     # installer's default it derives `$HOME`, contributing the same candidate as the third source — so
     # the arm earns its place on the box that points the sha record somewhere ELSE, which
@@ -3190,8 +3190,14 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"
         [ -n "$rec_t" ] || continue
         # ⛔ THE RECORD'S OWN CONTENT IS HELD TO THE SAME ABSOLUTENESS RULE (#10114 review P1), and the
-        # asymmetry was the tell: the ARM that names the record is guarded above (`:3127`) with the
-        # stated reason "a CWD-relative candidate that IS read", while the CONTENT it reads was not.
+        # asymmetry was the tell: the ARM that names the record is guarded above — the
+        # `case "$pin_root" in /?*)` line in `pin_tree_match` — with the stated reason "a CWD-relative
+        # candidate that IS read", while the CONTENT it reads was not.
+        # NAMED, NOT CITED BY LINE: this reference has now been wrong TWICE, both times because the
+        # reference itself had moved — `:2702` was the guard on the pre-rebase commit, and the fix for
+        # that (`:3127`) was falsified by the 14 comment lines that same fix ADDED above it, which put
+        # the guard at `:3141`. A line number in a file this edit amends is a citation that cannot
+        # survive its own repair.
         # `$canon` is absolute (`pwd -P`), so a RELATIVE record can only ever match through `rec_c` —
         # and `rec_c` resolves it with `cd "$(dirname …)"`, i.e. against the REAPER'S WORKING
         # DIRECTORY. One box, one record, two cwds, two verdicts; the wrong one is rule 3, which
