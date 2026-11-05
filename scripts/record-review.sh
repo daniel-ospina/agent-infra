@@ -1135,7 +1135,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_from_sha="" sfr="" range_ok=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_sep="" stated_from_sha="" sfr="" range_ok=""
   local _self="" _extra=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
@@ -1489,9 +1489,22 @@ $m"
       fi
     fi
     if [ "$DELTA_KIND" != "merge-only" ]; then
-    stated_from=""; stated_to=""
-    if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})\.\.([0-9a-f]{12,40}) ]]; then
-      stated_from="${BASH_REMATCH[1]}"; stated_to="${BASH_REMATCH[2]}"
+    stated_from=""; stated_to=""; stated_sep=""
+    # ⛔ TWO-DOT **AND** THREE-DOT, because the arm below is an anti-fail-open check and
+    # a one-character difference in the ARTIFACT must not be able to route around it
+    # (review finding, PR #3401). Reading only `..` made a body that states a NARROWER
+    # range in the three-dot form fall through to the bare-needle fallback below —
+    # which accepts an artifact that names B alone — so an artifact DECLARING it
+    # covered `fa28418...3e011ea` was accepted for a wider recorded range, silently,
+    # while the identical body in the two-dot form was refused. Three dots is not a
+    # tolerated spelling invented here: it is this repo's own range notation in the
+    # `gh api compare/<base>...<head>` reads (:772, :2731). Git's three-dot means
+    # `merge-base(A,B)..B`, so treating it as `A..B` is the CONSERVATIVE reading — it
+    # still requires `stated_from` to be an ancestor of the recorded A, and refuses
+    # otherwise. The separator is CAPTURED rather than normalised, so the refusal
+    # quotes the notation the artifact actually used instead of misquoting it back.
+    if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})(\.\.\.?)([0-9a-f]{12,40}) ]]; then
+      stated_from="${BASH_REMATCH[1]}"; stated_sep="${BASH_REMATCH[2]}"; stated_to="${BASH_REMATCH[3]}"
     fi
     if [ -n "$stated_to" ]; then
       range_ok=0
@@ -1509,7 +1522,7 @@ $m"
       fi
       [ "$range_ok" = 1 ] && body_claim=1
       if [ "$range_ok" -ne 1 ]; then
-        echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}..${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts." >&2
+        echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts." >&2
         return 1
       fi
     else

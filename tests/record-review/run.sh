@@ -2252,9 +2252,15 @@ if [ -d "$DELTA_REPO" ]; then
   # accepts `<PR>.json` when the repo-qualified key is absent; the predecessor reads used `$FILE`
   # only, so a legacy-only record was refused with "the superseded record carries no evidence" —
   # FALSE (the run had just read it) and its printed remedy is the full re-review `--delta` exists
-  # to remove. This case was UNREACHABLE before the fix (the run exited 3), so reverting
-  # `${D_REC:-$FILE}` to `$FILE` in `_carry_src` reddens exactly this vector — MEASURED. ⛔ NOT
-  # "either read": this fixture's predecessor carries `evidence:"comment:7102"`, so the
+  # to remove. This case was UNREACHABLE before the fix (the run exited 3).
+  # ⛔ WHAT REVERTING `${D_REC:-$FILE}` → `$FILE` IN `_carry_src` ACTUALLY REDDENS, MEASURED
+  # 2026-11-04 in review of PR #3401: **TWO** vectors, not one — (33a7) *and* (33a9), rc=3 with no
+  # record written for both. An earlier draft of this comment claimed "reddens exactly this
+  # vector"; that was FALSE, and it was the same over-claim class the sibling comment about
+  # "either read" warns against — the reason both readings share a site is that both fixtures
+  # plant a LEGACY-KEY predecessor, so both depend on `_carry_src`. State the population, not the
+  # vector that happens to be adjacent.
+  # ⛔ NOT "either read": this fixture's predecessor carries `evidence:"comment:7102"`, so the
   # `delta:`-inheritance branch is never entered and cannot exercise `_cd_src` (that read has its
   # own vector, (33a9)). `_prior_src` is still unpinned — declared, not claimed. A comment that
   # says "either read" is the same overclaim class as counting a suite green that never ran the path.

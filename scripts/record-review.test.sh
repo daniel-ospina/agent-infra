@@ -5883,11 +5883,25 @@ echo ""
 # 21. DELTA EVIDENCE: --evidence delta:<A>..<B>[+<artifact>]
 #
 # A delta attestation claims "at head B a reviewer reviewed exactly the commits
-# A..B and nothing else changed in the authored diff". Every vector below FAILS
-# without its guard, and the mutation matrix at the end proves that by breaking
-# each guard in a scratch copy of the recorder and naming the vector that goes
-# RED. A delta that can be minted for ANY two shas is worse than no delta: it is
-# a signature with no content, so the refusal vectors are the deliverable.
+# A..B and nothing else changed in the authored diff". A delta that can be minted
+# for ANY two shas is worse than no delta: it is a signature with no content, so the
+# refusal vectors are the deliverable.
+# ⛔ WHAT THE MUTATION MATRIX PROVES, STATED EXACTLY (corrected in review of PR #3401).
+# An earlier draft of this header said "Every vector below FAILS without its guard,
+# and the mutation matrix at the end proves that by breaking each guard". That was an
+# OVER-CLAIM, and this file refutes it in three places:
+#   (a) the matrix dispatches 12 cells (`MUTATION-MATRIX(12/12)`), NOT one cell per
+#       arm — its own closing line says the rest are "pinned by refusal vectors only,
+#       not by a mutant";
+#   (b) `mrc` has NO mutant and says so at its own vector: removing that test does not
+#       flip the outcome, so M13 was deleted rather than left claiming coverage it did
+#       not have;
+#   (c) M1b deliberately measures the OPPOSITE (that the A==B arm is REDUNDANT because
+#       the empty-diff arm already refuses it), so it cannot be a "fails without its
+#       guard" cell; and 21f asserts of itself that it pins the SHAPE guard, not arm (2).
+# So: every refusal vector must REACH its refusal on the SHIPPED bytes — that part is
+# the deliverable — and mutation coverage is claimed ONLY for the cells the matrix
+# actually dispatches. A vector's own comment says which kind it is.
 # ═════════════════════════════════════════════════════════════════════════
 echo "── 21. delta evidence: a RANGE-scoped verdict ─────────────────"
 ORIG_PWD="$(pwd)"   # §21 cds into its fixture repo; a later §22 must not inherit that cwd
@@ -5953,10 +5967,16 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
 # is reachable from the PR's base — the LANE authored nothing. Without the
 # base-aware classification this vector is REFUSED as "authored", which is the
 # 8-re-reviews-for-zero-authored-lines cost agent-infra#3245 measured.
-# A merge-only delta EXTENDS an attestation, so the lane's earlier record at A1 is
-# planted first (review of this change reproduced the zero-evidence mint that
-# skipped exactly this premise: with no record at A, `clean` was minted for a head
-# whose authored content nobody had reviewed).
+# ⛔ WHAT MAKES THIS VECTOR ACCEPT, STATED EXACTLY (corrected in review of PR #3401).
+# An earlier draft said "the lane's earlier record at A1 is planted first". It is NOT:
+# the body below only `rm -f`s any predecessor, and acceptance is driven ENTIRELY by
+# the API cover `+comment:42510001` satisfying the merge-only mandatory-cover arm.
+# The premise that comment described has since been RETIRED: the local-record read was
+# deleted as a forgery vector, and a cover-less merge-only delta is now refused by the
+# missing-cover arm — which is what 21h1 and 21h6 pin (measured: `delta:A1..HEAD` with
+# no cover exits 3, "EXTENDS an attestation and can never create one"). A justification
+# that describes a premise the vector does not establish, and that its own neighbours
+# refute, is the false-justification class these comments exist to prevent.
 EP=425100; rm -f "$(Q2 $EP)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
 run_record_delta $EP "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42510001" \
@@ -6486,6 +6506,34 @@ assert_eq "$RECORD_RC" "3" "21h15 a body stating a NARROWER range is refused (rc
 assert_contains "$RECORD_ERR" "states a DIFFERENT range" "21h15 the refusal names the contradiction"
 [ -f "$(Q2 $EH18)" ] && bad "21h15 no record was written" || ok "21h15 no record was written"
 
+# 21h15b THE SAME CONTRADICTION IN THE **THREE-DOT** FORM. This is the vector that
+#       pins the separator, and it exists because the two-dot-only parse was a real
+#       fail-open (found in review of PR #3401): the body quoted `delta:<A1>...<HEAD>`,
+#       the regex could not match `...`, `stated_to` stayed empty, and control fell to
+#       the bare-needle fallback that accepts an artifact naming B ALONE — so an
+#       artifact DECLARING it covered the narrower A1..HEAD was accepted for the wider
+#       BASE..HEAD, silently, while the identical body in two-dot form was refused.
+#       ⛔ THREE DOTS IS NOT A FABRICATED SPELLING, which is what makes this a defect
+#       rather than an unusual input: it is this repo's own range notation on the
+#       `gh api compare/<base>...<head>` reads, so a reviewer quoting a range in that
+#       form is following the repo's own convention.
+#       DISCRIMINATION: on the pre-fix recorder (two-dot only) this vector records at
+#       rc 0 — see mutation cell M15 below, which reverts the separator and asserts
+#       exactly that acceptance. So the vector FAILS without the guard on its own
+#       terms, not merely by comparison with its sibling.
+EH18B=425175; rm -f "$(Q2 $EH18B)"
+run_record_delta $EH18B "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42517501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1...$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "21h15b a THREE-DOT body stating a NARROWER range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "21h15b the refusal names the contradiction"
+# The refusal must quote the notation the ARTIFACT used. A message that normalised
+# `...` to `..` would misquote the artifact back at its author, which is how a caller
+# concludes the tool read something it did not.
+assert_contains "$RECORD_ERR" "delta:${DG_A1:0:12}...${DG_HEAD:0:12}" \
+    "21h15b the refusal quotes the artifact's OWN three-dot notation, not a normalised two-dot"
+[ -f "$(Q2 $EH18B)" ] && bad "21h15b no record was written" || ok "21h15b no record was written"
+
 # 21h16 A COVER THAT NAMES **A ALONE** ALSO SATISFIES THE CLAIM (the other half of
 #       21h14). A verdict written BEFORE B existed cannot name B at all, so demanding
 #       the range would make the printed remedy unreachable in exactly the ordering
@@ -6623,6 +6671,15 @@ mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_
 #       NARROWER range satisfy the claim for a wider one (21h15).
 MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
 mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+# M15 — THE SEPARATOR. Reverting the parse to two-dot-only makes the same narrower
+#       range ACCEPTABLE again when the artifact writes it in the three-dot form, so
+#       this cell asserts the ACCEPTANCE the pre-fix recorder produced. It is the
+#       fails-if-removed proof for 21h15b, and it is deliberately NOT redundant with
+#       M14: M14 breaks the ancestry test that runs AFTER a match, M15 breaks the
+#       MATCH itself, and only M15 exercises the fall-through path that silently
+#       accepted the contradiction.
+MUT="$(mk_mutant sepdots 'delta:([0-9a-f]{12,40})(\.\.\.?)([0-9a-f]{12,40})' 'delta:([0-9a-f]{12,40})(\.\.)([0-9a-f]{12,40})')"
+mut_check "M15 three-dot range separator" 425176 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42517601" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1...$DG_HEAD only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 21h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
