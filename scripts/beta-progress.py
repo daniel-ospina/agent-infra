@@ -736,7 +736,9 @@ def _compute():
     # failed, BOTH lists are re-read over REST: once one read has failed the survivor may
     # itself be a degraded read, so pairing a REST count with it would compare two
     # DIFFERENTLY-WRONG reads of one metric. The cross-list consumer that makes that unsafe is
-    # `covered()`, which walks `openpr + merged` together (`merged_today` reads `merged` alone).
+    # `covered()`, which walks `openpr + merged + fix_prs` together (`merged_today` reads `merged`
+    # alone) -- THREE lists since #3457, which is why the fix-repo lists' per-state fallback is
+    # disclosed in the docs as a TRADE and not as a second half of this guarantee.
     # Same source or no metric -- scoped to THIS re-read: where the workspace has the gh layer's
     # REST adapter the OPEN read is already REST while MERGED is GraphQL (see the block above),
     # so this arm claims no more than that a FAILURE never leaves a half-re-read pair.
