@@ -200,7 +200,10 @@ echo "§G NON-VACUITY of §F — removing the requirement makes §F's refusals p
 sed 's/if \[ "$role" = "reviewer" \]/if false/' "$GATE" > "$TMP/mutant-no-role.sh"
 cmp -s "$GATE" "$TMP/mutant-no-role.sh"; rc=$?
 [ "$rc" -ne 0 ]; ck $? "§G the role mutation REALLY changed the file (both role tests still match the anchor)"
-grep -c 'if false; then' "$TMP/mutant-no-role.sh" | grep -qx '4'; ck $? "§G …and it replaced ALL FOUR role tests (two parse branches + the section render + the disclosure), which is the pre-#3442 behaviour: nothing asked"
+# ⛔ NO PIPE: `grep -c` writes its count ONCE at EOF, but a `| grep -q` consumer exits on the
+# first match — the SIGPIPE/#841 idiom, refused by `scripts/check-no-sigpipe-grep.sh` (this
+# line was the `sigpipe-grep` red on PR #3481). Test the count directly instead.
+[ "$(grep -c 'if false; then' "$TMP/mutant-no-role.sh" || true)" = "4" ]; ck $? "§G …and it replaced ALL FOUR role tests (two parse branches + the section render + the disclosure), which is the pre-#3442 behaviour: nothing asked"
 bash -n "$TMP/mutant-no-role.sh"; ck $? "§G the mutant still parses — a program, not a syntax error"
 bash "$TMP/mutant-no-role.sh" --check "$TMP/reviewer-no-mutation.txt" reviewer >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "§G ⛔ MUTATION: §F(i) 'a reviewer brief with no attribution is REFUSED' now FAILS — the mutant admits it (rc=$rc)"
