@@ -205,6 +205,28 @@ got_tree="$(scan_pi 'scripts/*')"
 [ "$got_tree" = "$EXPECTED_PI_TREE" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      tree-wide pi-invokers found: [${got_tree:-<none>}]"
 ck "the tree-wide pi-invokers are exactly [${EXPECTED_PI_TREE}] (cloud-cell-bringup.sh + lane-exec.sh declared)" $rc
+
+# ⛔ THE REVIEWER'S MODEL IS PINNED FROM THE SAME PAIR AS `run_agent`, AND NOTHING ELSE (#3413).
+# `review-pr.sh` hardcoded `--provider deepseek --model deepseek-v4-flash`. `deepseek-v4-flash` is a
+# LEGACY alias that answers NOTHING on the box, so the highest-value reviewer on the box came up,
+# loaded its extensions, produced ZERO assistant turns and exited 0 — `rc=0` with no verdict, the one
+# shape a gate must never fail in. `merge-one.sh`'s `run_agent` was fixed for the identical defect
+# (#2208) and its comment states the invariant: "Keep the two defaults IDENTICAL: a lane must not run
+# a different model than its reviewer." Restoring the legacy literal left EVERY suite green, because
+# nothing asserted on this argv — it held by convention only. Structural pin on purpose (launching a
+# real agent would make this suite non-hermetic), asserted as THREE halves so each one has its own
+# mutant: the two-variable argv, and each resolved default.
+_pi_line="$(grep -n 'exec env -u AI_REVIEW_GATE_KEY' "$ROOT/scripts/review-pr.sh" 2>/dev/null)"
+case "$_pi_line" in
+  *'--provider "$LANE_PROVIDER" --model "$LANE_MODEL"'*deepseek-v4-flash*) rc=1 ;;
+  *'--provider "$LANE_PROVIDER" --model "$LANE_MODEL"'*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "review-pr.sh spawns the reviewer with \$LANE_PROVIDER/\$LANE_MODEL — never a hardcoded model literal (#3413)" $rc
+grep -q 'PI_LANE_PROVIDER:-deepseek' "$ROOT/scripts/review-pr.sh" && rc=0 || rc=1
+ck "review-pr.sh resolves the provider from PI_LANE_PROVIDER, default deepseek (identical to run_agent, #2208)" $rc
+grep -q 'PI_LANE_MODEL:-deepseek-flash' "$ROOT/scripts/review-pr.sh" && rc=0 || rc=1
+ck "review-pr.sh resolves the model from PI_LANE_MODEL, default deepseek-flash (the alias that ANSWERS)" $rc
 # ⛔ lane-exec.sh (#2163) is the SPAWN-POINT-GATED launcher: it `exec`s `pi`, so it has no wrapper to
 # route through run_agent() and no place to apply the DISK gate (which is per-worktree and therefore
 # a caller's business, the same named residual cloud-cell-bringup.sh carries). The LOAD gate reaches
