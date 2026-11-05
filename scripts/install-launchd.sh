@@ -526,6 +526,31 @@ prog = d.get("Program")
 pargs = d.get("ProgramArguments")
 def absolute(v):
     return isinstance(v, str) and v.startswith("/")
+def env_split(str_):
+    # `env -S`'s own grammar: whitespace separates arguments and a BACKSLASH escapes the next character
+    # (`\\_` is a literal space, env's documented way to embed one). A plain str.split() leaves
+    # `bash\\_/path/x.sh` as ONE token that does not start with "/", so the executed script goes
+    # unclassified (fresh review of #3413, P3).
+    out = []
+    cur = ""
+    i = 0
+    while i < len(str_):
+        ch = str_[i]
+        if ch == "\\" and i + 1 < len(str_):
+            cur += " " if str_[i + 1] == "_" else str_[i + 1]
+            i += 2
+            continue
+        if ch.isspace():
+            if cur:
+                out.append(cur)
+                cur = ""
+            i += 1
+            continue
+        cur += ch
+        i += 1
+    if cur:
+        out.append(cur)
+    return out
 if not isinstance(pargs, list) and not absolute(prog):
     sys.exit(4)                      # neither key names anything verifiable
 argv = pargs if isinstance(pargs, list) else []
@@ -553,11 +578,14 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
             if a in ("-S", "--split-string") or a.startswith("--split-string="):
                 if "=" in a:
                     cmd = a.split("=", 1)[1]
+                    skipped.add(i)      # the ELEMENT carries the command line: mark it consumed, or the
+                                        # loop below re-reads it as `--opt=<value>` and emits the whole
+                                        # string as ONE path ("broken target: /bin/bash /x.sh").
                 else:
                     i += 1
                     cmd = argv[i] if i < len(argv) and isinstance(argv[i], str) else ""
                     skipped.add(i)
-                for tok in cmd.split():
+                for tok in env_split(cmd):
                     if tok.startswith("/"):
                         print("exec\t" + tok)
                 break
@@ -608,13 +636,15 @@ plist_program_args() {
         fi
         # rc=3/4 (unparseable / no usable key) → try the other guaranteed reader before giving up.
     fi
-    # ⛔ THE FALLBACK IS DELIBERATELY MORE CONSERVATIVE, and that is stated rather than papered over:
-    # without python3 the roles cannot be derived, so EVERY absolute ProgramArguments element is
-    # treated as EXECUTED, `Program` is not read, and there is no `env` hop. The cost is a false SKIP
-    # on a PlistBuddy-only host (a unit that might have installed is skipped loudly); the alternative
-    # cost is arming a unit launchd cannot start. THE SEAM (`INSTALL_LAUNCHD_PLISTBUDDY`) exists so
-    # this arm is reachable from a test at all — on Linux `/usr/libexec/PlistBuddy` does not exist,
-    # and a branch no test can reach is a branch nobody knows still works.
+    # ⛔ THE FALLBACK CANNOT KNOW ROLES, so it emits `unknown` and says so: without python3 there are
+    # no DATA_OPTIONS, no `env` hop and no `Program` read. `unknown` still carries the TCC verdict (a
+    # unit launchd cannot read must never be armed) but NOT the file-type verdict — a directory-valued
+    # `--repo` is legitimate, and calling it an "unreadable executed target" aborted the whole install
+    # on a PlistBuddy-only host, which is the #3413 P1-A failure all over again. The cost of `unknown`
+    # is a false SKIP there (a unit that might have installed is skipped loudly).
+    # THE SEAM (`INSTALL_LAUNCHD_PLISTBUDDY`) exists so this arm is reachable from a test at all — on
+    # Linux `/usr/libexec/PlistBuddy` does not exist, and a branch no test can reach is a branch nobody
+    # knows still works.
     local buddy="${INSTALL_LAUNCHD_PLISTBUDDY:-/usr/libexec/PlistBuddy}" raw
     [ -x "$buddy" ] || return 1
     raw="$("$buddy" -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 1
@@ -631,7 +661,10 @@ plist_program_args() {
             sub(/^(Arg)?[0-9]+[[:space:]]*=[[:space:]]*/, "", line)
             if (line == "") next
             seen = 1
-            if (line ~ /^\//) printf "exec\t%s\n", line
+            # `unknown` = absolute, role NOT derivable without python (no DATA_OPTIONS, no env hop, no
+            # Program). verify_targets gives it the TCC verdict but not the file-type one: a
+            # directory-valued `--repo` is legitimate, and failing it aborted the whole install.
+            if (line ~ /^\//) printf "unknown\t%s\n", line
         }
         END { if (!seen) exit 1 }
     ')" || return 1
@@ -878,24 +911,26 @@ verify_targets() {
             bad=1
             continue
         fi
-        # ⛔ READABILITY AND FILE-TYPE ARE PART OF THE SAME GUARANTEE, for EVERY executed target and not
-        # only for a launcher inside a TCC tree (fresh review of #3413, P3): the premise of this whole
-        # change is that existence is not readability, and `[ -e ]` alone left a `chmod 000` script —
-        # or a DIRECTORY at argv[0] — installing an armed, dead unit outside any TCC root. A data
-        # argument is exempt: it is not executed, and #427's data class is a WARN.
-        case "$kind" in
-            launcher | exec)
-                if [ ! -f "$arg" ] || [ ! -r "$arg" ]; then
-                    echo "    unreadable or not a regular file: $arg" >&2
-                    echo "        launchd would start this unit and the interpreter would die (126/127)," >&2
-                    echo "        which reads as 'installed' to every instrument that only checks existence." >&2
-                    bad=1
-                    continue
-                fi ;;
-        esac
-        is_tcc_protected "$arg" || continue
+        # ⛔ THE TCC VERDICT COMES FIRST. A 0-byte or non-regular file INSIDE a TCC root is verdict 2
+        # (skip that unit, disarm any copy) — the class this whole change exists for — not verdict 1:
+        # a FAIL aborts the install and takes `sync.sh` with it.
+        if is_tcc_protected "$arg"; then
+            case "$kind" in
+                unknown)
+                    # role unknown (PlistBuddy fallback): the TCC verdict applies, the file-type one
+                    # cannot — a directory-valued `--repo` is legitimate.
+                    echo "    TCC-protected target: $arg" >&2
+                    echo "        the role cannot be derived without python3, so this is treated as" >&2
+                    echo "        EXECUTED: launchd cannot read it (#427) and arming it would exit 126." >&2
+                    tcc_exec=1
+                    ;;
+                *) ;;   # launcher/exec/data handled below, in the same block
+            esac
+            [ "$kind" = "unknown" ] && continue
+        fi
         case "$kind" in
             launcher)
+                if ! is_tcc_protected "$arg"; then continue; fi
                 if grant="$(launcher_grant_root "$arg")"; then
                     case "$grants" in *" $grant "*) ;; *) grants="$grants$grant " ;; esac
                     echo "    WARN TCC-root launcher: $arg" >&2
@@ -917,6 +952,7 @@ verify_targets() {
                 tcc_exec=1
                 ;;
             data)
+                if ! is_tcc_protected "$arg"; then continue; fi
                 echo "    WARN TCC-protected data argument: $arg" >&2
                 echo "        launchd is measured to deny a non-granted binary this path (#427), and" >&2
                 echo "        this value is one the job's work READS (not the code it runs), so the" >&2
@@ -926,6 +962,22 @@ verify_targets() {
                 continue
                 ;;
             *)
+                # NON-TCC executed target: the file-type/readability guarantee applies here (existence
+                # is not readability). A TCC one was already verdicted above.
+                if ! is_tcc_protected "$arg"; then
+                    # `unknown` (no python3) + a DIRECTORY: a directory cannot be executed, so this is a
+                    # data value the fallback could not name. Failing it aborted the whole install on a
+                    # PlistBuddy-only host (the #3413 P1-A failure again).
+                    if [ "$kind" = "unknown" ] && [ -d "$arg" ]; then continue; fi
+                    if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ]; then
+                        echo "    unreadable or not a regular file: $arg" >&2
+                        echo "        launchd would start this unit and the interpreter would die" >&2
+                        echo "        (126/127), which reads as 'installed' to every instrument that" >&2
+                        echo "        only checks existence." >&2
+                        bad=1
+                    fi
+                    continue
+                fi
                 root="$(tcc_protected_root "$arg")"
                 case "$grants" in
                     *" $root "*)
