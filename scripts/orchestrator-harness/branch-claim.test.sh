@@ -235,6 +235,25 @@ echo "== 10. the DEFAULT branch lease is CLAIM_BRANCH_TTL (14400s), and it is it
 lease_of() { # <ref> -> the claim commit's lease_until epoch
   git --git-dir="$T/origin.git" log -1 --format=%s "$1" 2>/dev/null | sed -n 's/.*lease_until=\([0-9]*\).*/\1/p'
 }
+grep_is() { # <want: match|absent> <ERE> <file> <what the assertion proves>
+  # ⛔ GREP HAS THREE OUTCOMES AND A TWO-ARM `if` FOLDS TWO OF THEM TOGETHER (review round 6, P2).
+  # 0 = matched, 1 = did not match, 2 = COULD NOT READ the file (missing path, unusable pattern, IO
+  # error). The clamp-message arms below were `if grep -qE …; then bad; else ok; fi`, so rc=2 printed
+  # `ok  the clamp warning does not name another keying's knob as this ceiling` over a measurement that
+  # never ran — measured, against a missing file. And two sibling arms were written `grep … || bad …`
+  # with NO success arm, so the assertion they carry was invisible: deleting the line changed neither
+  # the verdict nor the `%d passed` count. Here `want` says which of match/absent is the PASSING
+  # outcome, an unreadable file is a FAILURE either way, and every arm has an explicit success arm.
+  local want="$1" pat="$2" file="$3" what="$4" rc=0
+  grep -qE -- "$pat" "$file" 2>/dev/null || rc=$?
+  case "$rc:$want" in
+    0:match)  ok "$what" ;;
+    1:absent) ok "$what" ;;
+    0:absent) bad "$what — the pattern MATCHED: $(grep -m1 -E -- "$pat" "$file" 2>/dev/null)" ;;
+    1:match)  bad "$what — no match for /$pat/ in: $(cat "$file" 2>/dev/null)" ;;
+    *)        bad "$what — grep could not read $file (rc=$rc); the assertion did not run" ;;
+  esac
+}
 lease_arm() { # <label> <expected-seconds> <lease_until-epoch>
   # ⛔ THE TOLERANCE IS WIDE ENOUGH TO SURVIVE A LOADED BOX, NOT A TIGHT CLOCK. `NOW` is taken
   # immediately before EVERY acquire (see each arm), so the delta can only exceed the term by that one
@@ -262,8 +281,8 @@ if [ -n "$L1" ]; then lease_arm "the DEFAULT lease is the branch key's own 14400
 # so — not to CLAIM_TTL_MAX (9600). A clamp to 9600 shreds 44 % of a batch's term silently.
 NOW=$(date +%s)
 acquire_from owner "$BR_LEASE_CEIL" 999999
-grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is clamped LOUDLY, not silently" \
-  || bad "no clamp warning for an over-ceiling branch ttl: $(cat "$T/acq.out")"
+grep_is match 'exceeds this keying ceiling' "$T/acq.out" \
+  "an over-ceiling ttl is clamped LOUDLY, not silently"
 # ⛔ AND IT MUST NOT NAME ANOTHER KEYING'S KNOB AS THE CEILING (review round 2, P2; round 5 widened
 # it). The warning used to read "(CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s)" — for a branch key BOTH
 # names are wrong (9600 / 18000), so a fixer was sent to raise a knob that is not the ceiling. Two
@@ -271,21 +290,21 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # defeated by a respelling — "ceiling (CLAIM_ISSUE_TTL = 14400s) — clamped. Candidates: … CLAIM_BRANCH_TTL"
 # mentions this keying AND avoids the old spelling while still naming the wrong ceiling. So the
 # assertion is on the PROPERTY: the clause inside `ceiling ( … )` must not be another keying's knob.
-if grep -qE 'ceiling \(CLAIM_(TTL_MAX|ISSUE_TTL|TTL)\b' "$T/acq.out"; then
-  bad "the clamp warning names another keying's knob AS this ceiling: $(cat "$T/acq.out")"
-else
-  ok "the clamp warning does not name another keying's knob as this ceiling"
-fi
+# ⛔ `\b` IS NOT POSIX ERE (`bash32-parse` may pass while a BSD grep reads it literally, which would
+# turn this ABSENT assertion into a permanent pass), so the word boundary is spelled as the character
+# class that follows the knob instead.
+grep_is absent 'ceiling \(CLAIM_(TTL_MAX|ISSUE_TTL|TTL)([^A-Z_]|$)' "$T/acq.out" \
+  "the clamp warning does not name another keying's knob as this ceiling"
 # ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2). The arm above measures the STAMPED
 # LEASE, never the printed ceiling — so a warning that stamps 14400 correctly while PRINTING 9600
 # misdirects the fixer exactly as before and stayed green. The number in the message is the `%ss`
 # argument, and it must equal this keying's ceiling.
-grep -q 'ceiling (14400s)' "$T/acq.out" \
-  || bad "the clamp warning does not print this keying's ceiling (14400s): $(cat "$T/acq.out")"
+grep_is match 'ceiling \(14400s\)' "$T/acq.out" \
+  "the clamp warning prints this keying's ceiling (14400s)"
 # ⛔ AND THE GUARD IS NOT A SINGLE LITERAL (review round 3, P2): the message must also name THIS
 # keying's variable among the candidates it suggests raising.
-grep -q 'CLAIM_BRANCH_TTL' "$T/acq.out" \
-  || bad "the clamp warning does not name CLAIM_BRANCH_TTL as a ceiling candidate: $(cat "$T/acq.out")"
+grep_is match 'CLAIM_BRANCH_TTL' "$T/acq.out" \
+  "the clamp warning names CLAIM_BRANCH_TTL as a ceiling candidate"
 L2="$(lease_of refs/claims/branch-integration-lease-ceiling)"
 if [ -n "$L2" ]; then lease_arm "an over-ceiling request clamps to CLAIM_BRANCH_TTL (14400), NOT to CLAIM_TTL_MAX (9600)" 14400 "$L2"; else bad "no lease_until on the over-ceiling claim ref"; fi
 # ⛔ THE KNOB ARM — ONE KNOB, NOT TWO (review round 2, P2). The comment in `claims.sh` claims that

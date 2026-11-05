@@ -3775,8 +3775,8 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(18000s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive,
-and to 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
+(18000s — raised 10800s → 14400s by #2029, whose merge phase lengthened the wait the lease must
+outlive, and 14400s → 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
 #2999) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
 `CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
 `CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
@@ -3833,7 +3833,8 @@ claim-reaper.sh --records             # what this box has reclaimed, and why
 Every claim passes the same ladder, each rung FAIL-CLOSED: **identity** (the claim names a
 `<box>:<pid>`) → **lease** (it parses: an unparseable lease is LIVE and is never re-examined for
 orphanhood, per `_claim_acquire_at`) → **age** (the claim's own commit time is older than `--min-age`,
-default 10800s = `CLAIM_ISSUE_TTL`) → **host** (the holder is this box, one of its former names, or a
+default 10800s — `claim-reaper.sh`'s own `CR_MIN_AGE`, NOT `CLAIM_ISSUE_TTL` (18000s); the rungs below it
+prove a holder is gone, so this is a floor, not the protection) → **host** (the holder is this box, one of its former names, or a
 host declared on `CLAIM_DEAD_HOSTS` **with an expired lease**) → **pid** (`ps` first proves it can see
 *this* process, then reports the holder absent) → **work** (ISSUE claims only: no live process
 references the issue and none sits in a checkout carrying it — because an issue claim is minted by the
@@ -3934,7 +3935,7 @@ reap. The decisions that are not obvious:
   every exit path** (clean merge, failed merge, the 90-minute "no PR appeared" timeout, and — see
   §7.2d — a capacity refusal, where it exits at once rather than waiting) through
   a trap, fenced on the commit this box pushed; a box that dies mid-lane leaves it to the lease,
-  which is sized (`CLAIM_ISSUE_TTL`, default 4 h since #2029) to cover lane + chain — releasing early is the
+  which is sized (`CLAIM_ISSUE_TTL`, default 5 h = 18000s: 4 h since #2029, 5 h since #2999) to cover lane + chain — releasing early is the
   normal path, so the lease only runs its full length when the box is gone.
 - **The pre-flight now CONSULTS it, and fails CLOSED.** `refresh-candidates.sh` calls
   `claim_issue_preflight` after a clean tool verdict and branches on its **exit code**, never on

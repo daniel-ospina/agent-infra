@@ -57,8 +57,9 @@
 #   1 IDENTITY   the claim records a `<host>:<pid>` and this reader can read it. Otherwise
 #                UNIDENTIFIABLE — reported, never released. ("Probably dead" is not an identity.)
 #   2 LEASE      the lease parses (decision (a)). Otherwise UNREADABLE-LEASE — reported, never released.
-#   3 AGE        the claim's own COMMIT TIME is older than `--min-age` (default 10800s = CLAIM_ISSUE_TTL,
-#                the longest shipped lease). Otherwise TOO-YOUNG. Age is read from the claim COMMIT,
+#   3 AGE        the claim's own COMMIT TIME is older than `--min-age` (default 10800s, this tool's own
+#                `CR_MIN_AGE` — NOT `CLAIM_ISSUE_TTL`, which is 18000s, so this is a floor and the rungs
+#                below it are what protect a live claim). Otherwise TOO-YOUNG. Age is read from the claim COMMIT,
 #                never from a file mtime: an mtime is when this checkout last touched the ref.
 #   4 HOST       the holder's box is THIS box (its current name, its probed real name, or a FORMER name
 #                it has carried — claims.sh:claim_former_hosts). A box we cannot query is
@@ -140,7 +141,8 @@ claim-reaper.sh — release a claim ONLY when its holder is demonstrably GONE.
 
 Options
   --max N        at most N releases per pass (default 3)
-  --min-age S    claim must be older than S seconds (default 10800 = CLAIM_ISSUE_TTL)
+  --min-age S    claim must be older than S seconds (default 10800 = this tool's CR_MIN_AGE,
+                 NOT CLAIM_ISSUE_TTL, which is 18000)
   --repo DIR     the repository whose origin holds refs/claims/* (default: claims.sh's resolution)
   --state DIR    where releases are recorded (default: claims.sh's CLAIM_STATE_DIR). The directory
                  must EXIST and be writable for --release: an unrecorded release is not performed.
