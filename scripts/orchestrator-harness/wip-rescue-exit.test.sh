@@ -849,10 +849,45 @@ n_net=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g'
 NET_SEGS=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
 n_local=$(printf '%s\n' "$NET_SEGS" | grep -c 'git -C "\$root" remote get-url')
 n_net=$(printf '%s\n' "$NET_SEGS" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | wc -l)
-n_unbounded=$(printf '%s\n' "$NET_SEGS" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | grep -cv 'tb_timeout')
+# ⛔ THE EXEMPTION IS THE BOUND'S COMMAND POSITION, NOT THE WORD SOMEWHERE IN THE SEGMENT (review round 5,
+# P1 — REPRODUCED). The test was `grep -cv 'tb_timeout'`: a SUBSTRING match over the whole segment, so the
+# word appearing anywhere exempted the call — including in a trailing COMMENT, which the awk above does not
+# strip (it skips full-line `#` only). Measured by injecting
+#   out2="$(git -C "$root" fetch origin 2>/dev/null)"  # tb_timeout
+# immediately above the bounded push: `n_net=5 n_unbounded=0` → N14 GREEN over an UNBOUNDED fetch on the
+# exit path. That is the one thing R3 exists to forbid, and it turns a dying lane into a worktree nobody
+# can reap. The positive form below is the shape every real call in `lane_end_push` actually has —
+# `tb_timeout <secs> git -C "$root" <verb>` — so a comment can no longer pay for a call, while a bound on a
+# DIFFERENT command still counts as unbounded (`,` `;` `&&` already split segments above). The direction of
+# the false verdict is now over-block, never fail-open.
+n_bounded_pos=$(printf '%s\n' "$NET_SEGS" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | grep -cE 'tb_timeout[[:space:]]+[0-9]+[[:space:]]+git -C "\$root"')
+n_unbounded=$((n_net - n_bounded_pos))
 [ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
   && [ "$n_net" -ge 3 ] && [ "$n_unbounded" = 0 ] && [ "$n_local" = 1 ]; rcn14=$?
-ck "N14 …every NETWORK call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net network, $n_local local config read)" $rcn14
+ck "N14 …every NETWORK call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net network, $n_local local config read, $n_bounded_pos at bound position)" $rcn14
+# ⛔ N14c — THE ARM ABOVE MUST BE ABLE TO SEE THE CLASS IT EXISTS FOR (review round 5, P1 — REPRODUCED).
+# The substring form passed this suite for twenty-odd cycles while an unbounded `fetch` with a trailing
+# `# tb_timeout` comment was invisible to it, so the assertion is now pinned against a MUTANT of the very
+# function it scans: inject that exact call into a copy of the gate and require the same scan to count an
+# unbounded network call. Without this, a future narrowing of the regex would go green on silence.
+n14_mut="$TMP/n14mut"; mkdir -p "$n14_mut"
+awk '{ print }
+  !done && /tb_timeout 15 git -C "\$root" push/ {
+    print "  out2=\"$(git -C \"$root\" fetch origin 2>/dev/null)\"  # tb_timeout"; done=1
+  }' "$GATE" > "$n14_mut/gate.sh" 2>/dev/null
+grep -q 'fetch origin 2>/dev/null)"  # tb_timeout' "$n14_mut/gate.sh" 2>/dev/null; n14_inj=$?
+n14_mut_joined=$(awk '
+  /^lane_end_push\(\)/,/^}/ {
+    if ($0 ~ /^[[:space:]]*#/) next
+    line = line $0
+    if ($0 ~ /\\$/) { sub(/\\$/, "", line); next }
+    print line; line = ""
+  }' "$n14_mut/gate.sh" 2>/dev/null)
+n14_mut_unb=$(printf '%s\n' "$n14_mut_joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g' \
+  | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' \
+  | grep -cvE 'tb_timeout[[:space:]]+[0-9]+[[:space:]]+git -C "\$root"')
+[ "$n14_inj" -eq 0 ] && [ "$n14_mut_unb" -ge 1 ]; rcn14scan=$?
+ck "N14scan …and the arm can SEE an unbounded call a trailing comment pretends to bound (injected: 1 fetch, counted unbounded: $n14_mut_unb) — a substring exemption cannot pass this" $rcn14scan
 # ⛔ N14b — THE BOUND MUST BOUND **WALL CLOCK**, NOT ONLY SPELLING (review cycle 10, P2 — REPRODUCED).
 # N14 is a TEXT SCAN by construction, so it cannot see this class at all, and on a Linux host GNU
 # `timeout` hides it: `tb_watchdog` used to `kill -9 "$pid"` — the DIRECT child only — so a command that

@@ -994,14 +994,6 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   {
-    name: "REAP_WT_PRESERVE_KEEP_DAYS",
-    owners: ["scripts/pi-reap-worktrees.sh"],
-    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
-    axis: "retention",
-    guardedBy: "scripts/pi-reap-worktrees.test.sh G2aa + the EV/ENV_AA arms (#3405 review round 2, P2; override seam REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE: G2aa pins the refusal for an unusable value and the ENV_AA arms pin 0 = keep everything and the prune of every archive root)",
-    note: "#3405 — the retention bound on the lane-evidence ARCHIVE, the new sink the reaper's reclaim path writes into. The archive made the reclaim path able to accumulate: `REAP_WT_PRESERVE_DIR` and each of `REAP_WT_PRESERVE_FALLBACKS` grow one `YYYY-MM-DD/` directory per pass, so without a bound the reaper traded a full volume for a full state dir. Only DATED subdirectories are candidates, pruned oldest-first under the pass lock, and 0 keeps everything — an operator-safe value, since the failure direction of a wrong prune is losing the evidence a reclaim left behind. It prunes EVERY root an archive can land in (configured AND fallbacks), because a bounded configured root with an unbounded fallback is unbounded exactly on the box whose data volume is full. Registered rather than exempted because it IS a retention bound in the same family as REAP_WT_AGED_DAYS / REAP_WT_MERGED_AGE_DAYS above, and this registry is the one place a reader can see a retention floor move.",
-  },
-  {
     name: "REAP_WT_BUDGET_SECONDS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_BUDGET_SECONDS:-300}",
@@ -1451,6 +1443,28 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "reap",
     guardedBy: "scripts/pi-reap-worktrees.test.sh G6e + G6f (rule 7, too-young)",
     note: "the reaper's too-young rule: NOTHING younger than this is removable, whatever else the rules say. It is the one clause that protects work a lane is actively writing, so it outranks the merged/aged/classification rules rather than being weighed beside them (#2756). NOTE the citation is deliberately only pi-reap-worktrees.test.sh: scripts/disk-reaper.test.sh:170 sets REAP_WT_MIN_AGE_MINUTES=0 in its own wrapper, i.e. it DISABLES rule 7 so its fixtures are not gated by it — it neither pins the 45 nor the behaviour, and citing it here would be a guard claim that reads backwards.",
+  },
+  // — the #2788 root, reached again by #3405's second reaper bound —
+  // Measured 2026-11-04 at `9f7d20bd`: a clean detached `origin/main` worktree goes RED on the same
+  // reverse scan with `REAP_WT_PRESERVE_KEEP_DAYS`, i.e. red for every PR cut from that base and not
+  // attributable to any diff. Registered (not exempted): it IS a reap-axis bound whose value a change
+  // must be visible on, and it protects a `rm -rf` target chosen by a string, so the registry is
+  // exactly where a future edit of its default has to show up.
+  // ⛔ THIS ENTRY IS A VERBATIM COPY OF PR #3431's, WHOSE WHOLE JOB IS THIS ONE REGISTRATION (review
+  // round 5, P2 — the first cut was a SECOND, DIVERGENT registration: `axis: "retention"` against this
+  // one's `"reap"`, a different `guardedBy` and a different `note`, citing an `EV_` arm that does not
+  // exist). Nothing rejects a duplicate — `forwardViolations` is per-term and the test builds a Map by
+  // name — so the second copy would have validated silently and the two records could have drifted
+  // apart. Copied rather than rewritten so that whichever PR lands second merges to a no-op instead of
+  // to a contradiction, and so this PR's `verify` can go green on a red main without inventing a
+  // rival account of the same bound.
+  {
+    name: "REAP_WT_PRESERVE_KEEP_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
+    axis: "reap",
+    guardedBy: "scripts/pi-reap-worktrees.test.sh G2aa (keep-days 0 keeps everything; a non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 — the WHOLE pass, not a skipped prune — and the refusal NAMES the seam, never a silent guess)",
+    note: "how long a dated subdirectory of the gate (b) evidence archive is kept. `0` keeps everything, so the bound can be disabled without deleting anything — the opposite polarity of a floor, which is why it is reasoned about here rather than folded into the age floors above. A non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 (the startup `is_pos_int` sweep over its listed numeric seams, before any rule runs): the WHOLE pass aborts, so prune_preserve_archive is never reached — it is not a silent skip of the prune. That is deliberate: defaulting to 0 on a garbage override would silently turn retention OFF, and defaulting to the 14 would silently destroy evidence an operator asked to keep. Note the blast radius is the whole reaper and not this term — on a box already under disk pressure (#2159) the typo disables ALL reaping, which is why the refusal is pass-wide and names the seam.",
   },
   {
     name: "MIN_AGE",
