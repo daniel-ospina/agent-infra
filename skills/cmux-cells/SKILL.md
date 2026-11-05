@@ -484,7 +484,7 @@ killed 37 processes *and the tmux server*, losing every lane. The gate would hav
   halves separately (`--provider deepseek --model deepseek-flash`). Verify with `pi --list-models` before dispatch.
   ⛔ **AND AN UNPROVISIONED PIN IS A SILENT SUBSTITUTION, NOT A DEATH — do not diagnose it as one.** `pi` uses the
   `settings.json` startup pair ONLY when that provider is provisioned (`findInitialModel` step 3 requires
-  `hasConfiguredAuth`) and otherwise falls through to the first model it does find — so a box pinned to an unprovisioned
+  `hasConfiguredAuth`) and otherwise falls through to step 4 of `findInitialModel` — the first model with a valid key, preferring the known default model of that provider — so a box pinned to an unprovisioned
   model runs a model nobody pinned, silently, and spends tokens on it. Since #3443 `lane.sh` prints the model it asserted
   (`[key-gate] … model=<id> …`) and emits `check=warn reason=box-default-not-provisioned model=… var=…` when the box's
   STARTUP pair is unusable — that line is about a **bare `pi`** (one with no model flag) and it does not stop the lane,
