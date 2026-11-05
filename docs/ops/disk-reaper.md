@@ -1214,11 +1214,15 @@ prints `SUMMARY class=runner-work … candidates=<n> … census=ok` in BOTH mode
 a real count; `census=no-roots` (an EXPLICIT glob list that matched nothing) is `misconfigured` + `?`
 rather than a `0`; `census=refused` (a matched root REFUSED because its basename is not `_work`) is
 `misconfigured` + `?` with its own `runner-work-root-refused` token, so the record names the seam rather
-than a glob that matched; and **`census=abstained`** (nothing under a matched root could be read, so the
+than a glob that matched; and **`census=abstained`** (nothing under a matched root could be measured, so the
 population was never measured) is `?` plus `verdict_runner_work=abstained` at rc 0, while
-**`census=partial`** (SOME of the population could not be read) keeps the measured count as a LOWER
+**`census=partial`** (SOME of the population could not be measured) keeps the measured count as a LOWER
 BOUND and answers `verdict_runner_work=partial` — in both cases a zero nothing measured is not a zero,
-and a non-`ok` verdict never lands as `ok`.
+and a non-`ok` verdict never lands as `ok`. ⛔ **AND BOTH NOTES STATE THE TALLY WITHOUT PICKING A CAUSE**
+(#3057 review cycles 2–3): `unmeasurable=` has three causes — an unreadable entry, an unlistable root, and
+a root **replaced** between discovery and the sweep — so a note that says "could not be read" names a
+permissions fault that may not exist and aims the operator at the wrong remedy (restore the swapped
+`_work` vs `chmod`), which is the same defect this file records for the class line's cause.
 
 `watchdog=` names the mechanism that bounded the pass (`timeout`, `gtimeout` or
 `internal`, see **Bounded execution** above), so "the bound was real" is answerable

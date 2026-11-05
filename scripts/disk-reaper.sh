@@ -2507,8 +2507,15 @@ reap_runner_work() {
     # WAS measured is kept (it is a LOWER BOUND, and withdrawing it would hide real work), and the
     # verdict is the distinct token, so nothing keying on `ok` inherits the lie. rc stays 0.
     if [ "$_rw_census" = "partial" ]; then
-        log_line "disk-reaper: ⚠️  class=runner-work census PARTIAL — ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read, so candidates=$_rw_cand is a LOWER BOUND, not the population (the unreadable ones were KEPT)"
-        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census is PARTIAL: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read, so the candidate count is a LOWER BOUND"
+        # ⛔ THE SAME "NAME WHAT YOU KNOW" RULE AS THE ABSTAINED ARM (#3057 review cycle 3, P2): the owner's
+        # `unmeasurable=` has THREE causes (an unreadable entry, an unlistable root, a root REPLACED under the
+        # pass), and this note said "could not be read" for all of them — MEASURED on a partly-swapped
+        # population: `kept=1 unmeasurable=1 census=partial` rendered as "1 entry/root could not be read",
+        # sending an operator to a permissions fault that did not exist while the real state (a `_work` moved
+        # aside, so that half of the class is INERT) appeared nowhere. It states the tally and the possible
+        # causes, and never picks one.
+        log_line "disk-reaper: ⚠️  class=runner-work census PARTIAL — ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be MEASURED (read failure, watchdog, or a root that changed under the pass), so candidates=$_rw_cand is a LOWER BOUND, not the population (the unmeasured ones were KEPT)"
+        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census is PARTIAL: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be measured (read failure, watchdog, or a root that changed under the pass), so the candidate count is a LOWER BOUND"
         RW_PARTIAL=1
     fi
     if [ "$_rw_census" = "ok" ] || [ "$_rw_census" = "partial" ]; then

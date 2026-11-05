@@ -1246,6 +1246,17 @@ case_r() { # <entry-point> <owner>
                "… with the unmeasured root carried in the record, so the gap is findable without reading the log"
     case_check "$(grep -qF 'census is PARTIAL' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
                "… and the NOTE states the count is a LOWER BOUND, which is the sentence that makes the number honest"
+    # ⛔ AND IT DOES NOT PICK A CAUSE IT CANNOT KNOW (#3057 review cycle 3, P2). The owner's `unmeasurable=`
+    # has THREE causes — an unreadable entry, an unlistable root, and a root REPLACED between discovery and
+    # the sweep — and this note said "could not be read" for all of them. MEASURED on a partly-swapped
+    # population (one good root, one `_work` moved aside and replaced by a symlink): the record read
+    # "1 entry/root could not be read", i.e. a permissions fault that did not exist, while the real state —
+    # that half of the class is INERT and the disk stays full — appeared nowhere. The note states the tally
+    # and the possible causes instead; case (w) pins the third cause at the owner, this pins the wording.
+    case_check "$(grep -qF 'could not be measured (read failure, watchdog, or a root that changed under the pass)' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and names the possible causes rather than asserting a read failure"
+    case_check "$(grep -qF 'could not be read' <<<"$(status_of "$s1")" && echo 1 || echo 0)" \
+               "… and never claims the walk 'could not be read', which a replaced root would make a falsehood"
     case_check "$([ ! -e "$dead_good" ] && echo 0 || echo 1)" \
                "… the readable root's dead checkout was REAPED — a partial census must not make the class inert"
     case_check "$([ -e "$dead_unread" ] && echo 0 || echo 1)" \
