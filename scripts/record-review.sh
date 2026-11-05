@@ -1154,9 +1154,9 @@ ${marker}"; else newbody="$marker"; fi
 # post_marker_comment <repo> <pr> <marker> -> ALWAYS 0 (best-effort, never fatal)
 #
 # agent-infra#1224, PRODUCER HALF — the consumer half shipped in the gate in 2026-09,
-# and docs/ai-review-gate.md carried "Producer status: the producer half is NOT
-# deployed" for a month. Everything below is why this is not optional, and it lives
-# at the FUNCTION because every caller (the mint path, both failure arms,
+# and daniel-ospina/tortoise:docs/ai-review-gate.md STILL carries "Producer status:
+# the producer half is NOT deployed" a month on. Everything below is why this is not
+# optional, and it lives at the FUNCTION because every caller (the mint path, both failure arms,
 # --flush-pending and --recover-body) must publish the same channel with the same
 # guarantees:
 #
@@ -2678,8 +2678,8 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
   # that lacks the file may still have the verdict in the registry (minted on a
   # peer box), or in the PR body's SIGNED marker. An admitted PR COMMENT can carry a MARKER too — but
-  # ⛔ NO VERB RECOVERS A RECORD FROM ONE: marker text arrives from :835, :846 or :1276, and BOTH
-  # --evidence arms REFUSE it at :905, so that copy helps the GATE. A REVIEW comment is fine at :835/:846.
+  # ⛔ NO VERB RECOVERS A RECORD FROM ONE: marker text arrives from :835, :843, :846 or :1276, and ALL
+  # THREE --evidence arms REFUSE it at :905, so that copy helps the GATE. A clean artifact is fine there.
   CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
   if [ -n "$REPO" ]; then
     if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
@@ -4844,8 +4844,8 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # success over an invisible record.
     marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy this arm prints below WILL FIND NOTHING and will report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
     # ⛔ THE DURABLE CHANNEL IS ATTEMPTED HERE, BEFORE THE exit 5 (agent-infra#3168
-    # review P2). This arm and the PATCH-failure arm below are the ONLY scenarios
-    # the durable channel exists for, and both used to `exit 5` before reaching it —
+    # review P2). This arm and the PATCH-failure arm below are the two where the
+    # body channel has ALREADY failed, and both used to `exit 5` before reaching it —
     # so the copy that survives a body-channel failure was never created by the one
     # run that needed it. The permission split makes it real: the body post needs
     # `pull-requests:write` while the comment needs `issues:write`, so a token

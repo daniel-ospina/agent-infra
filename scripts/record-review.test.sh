@@ -6350,7 +6350,7 @@ assert_ne "" "$_rr_docblock" \
     "21.1 the post_marker_comment doc block is findable (prerequisite for the vectors below)"
 assert_eq "$(printf '%s\n' "$_rr_docblock" | grep -cE '^[[:space:]]+(#|[^[:space:]])' || true)" "0" \
     "21.1 every line between the doc comment and the function is a COLUMN-0 comment (the stale 2-space indented duplicate is gone)"
-assert_eq "$(grep -cF 'docs/ai-review-gate.md carried' "$RRS" || true)" "1" \
+assert_eq "$(grep -cF 'tortoise:docs/ai-review-gate.md STILL carries' "$RRS" || true)" "1" \
     "21.1 the PRODUCER-HALF rationale appears ONCE in the recorder (the duplicate block was merged, not duplicated)"
 assert_contains "$_rr_docblock" "BODY MIRROR STAYS" \
     "21.1 …and the doc block still documents the body mirror (the duplicate was MERGED, not deleted)"
