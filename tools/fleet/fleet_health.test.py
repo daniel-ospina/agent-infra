@@ -543,7 +543,7 @@ def leg_lane_census(mod):
         "CENSUS: an all-dead roster over an UNREADABLE table is UNVERIFIED, never clean",
         "CENSUS: a FULLY-live roster is silent whatever the process table says",
         "CENSUS: …and silent even when that table cannot be read at all",
-        "CENSUS: a live lane outranks a MEASURED-EMPTY population at a COMPLETE roster",
+        "CENSUS: a live lane is silent beside a MEASURED-EMPTY population at a COMPLETE roster",
         "CENSUS: …and at an INCOMPLETE one — an empty population contradicts nothing",
     )
     # ⛔ A MISSING FUNCTION IS A RED IN THE PREDICATE BLOCK, AND THE LIMIT OF THAT IS STATED HERE
@@ -588,12 +588,15 @@ def leg_lane_census(mod):
         # UNREADABLE table is silent (the roster IS the box) where a partly-live one is UNVERIFIED.
         check(fn(7, 0, 18, 7) is None, PREDICATE[8])
         check(fn(7, 0, None, 7) is None, PREDICATE[9])
-        # ⛔ A LIVE LANE OUTRANKS A MEASURED-EMPTY POPULATION (review cycle 16, finding 1). These two
-        # shapes were SILENT but pinned by nothing, and their silence rested on a comment that
-        # claimed "nothing is running" while a lane was provably live. The verdict is deliberate
-        # (`alive` is an identity-probe read of a RECORDED pid; `pi_count` counts a DIFFERENT
-        # predicate — argv0 basename exactly `pi` — so a wrapped/interpreter launch legitimately
-        # yields 0), and the pins are what stop the exemption from being split from its arm.
+        # ⛔ THESE TWO SHAPES WERE SILENT AND PINNED BY NOTHING (review cycle 16, finding 1), and their
+        # silence rested on a comment claiming "nothing is running" while a lane was provably live.
+        # The verdict is deliberate — `alive` is an identity read of the RECORDED incarnation (pid +
+        # start, no requirement that it be the `pi` binary) while `pi_count` counts only argv0
+        # basename `pi` — so the two reads are different predicates over different things.
+        # ⛔ WHAT THESE PINS DO NOT BUY (review cycle 17, finding 1): they pin the VERDICT for these
+        # shapes, NOT the order of the two arms. Both arms `return None`, so the order is unobservable
+        # through any input; an earlier revision of this comment claimed otherwise and was wrong —
+        # these checks pass against the pre-reorder module too, measurably.
         check(fn(2, 5, 0, 7) is None, PREDICATE[10])
         check(fn(2, 1, 0, 7) is None, PREDICATE[11])
         # ⛔ "A CONCLUSIVE VERDICT" IS NOT "THE ROSTER ACCOUNTS FOR THE BOX" (review cycle 7,

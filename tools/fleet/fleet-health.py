@@ -188,10 +188,12 @@ def lane_census(alive, dead, pi_count, roster_size):
     ⛔ SILENT ARMS, EXHAUSTIVELY: `alive == roster_size` (every lane is a live bound incarnation,
     whatever the process table says); or every lane conclusive with at least one attributed alive
     AND a MEASURED population (the roster accounts for at least one running process, so it is not
-    contradicted); or every lane conclusive over a MEASURED-EMPTY population (nothing is running,
-    so a resolved roster cannot mislead); or `pi_count <= 0` on an inconclusive roster (same
-    reason). Nothing else is silent — in particular a conclusive-with-a-live-lane roster over an
-    UNREADABLE table is UNVERIFIED, not silent (see the arm below).
+    contradicted); or every lane conclusive over a MEASURED-EMPTY population (the population can
+    CONTRADICT nothing, and no lane is live — see the argv0 note in that arm); or `pi_count <= 0` on
+    an inconclusive roster (a MISMATCH needs at least one pi process the roster does not account
+    for, so an empty population has nothing to object to). Nothing else is silent — in particular a
+    conclusive-with-a-live-lane roster over an UNREADABLE table is UNVERIFIED, not silent (see the
+    arm below).
 
     ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
     table cannot be read, returning None would render that state identically to `pi_count == 0`
@@ -249,18 +251,29 @@ def lane_census(alive, dead, pi_count, roster_size):
                     "DEAD/absent, but the process table could not be read — the population "
                     "cannot be reconciled against the roster, so this is NOT a clean result"
                     % (alive, roster_size, dead))
-        # ⛔ A POSITIVE PER-LANE READ IS TESTED **BEFORE** THE EMPTY POPULATION (review cycle 16,
-        # finding 1) — the ORDER is the fix, not a style choice. The two counts measure DIFFERENT
-        # predicates: `alive` is the identity probe binding a RECORDED PID to a live incarnation
-        # (the pid exists and its start time matches); `pi_count` counts `ps` rows whose argv0
-        # BASENAME is exactly `pi`. A lane launched through a wrapper or an interpreter records
-        # argv0 `node`/`bash`, so `alive > 0` beside a MEASURED-EMPTY population is a NORMAL state,
-        # not a contradiction. The previous ordering let the `pi_count <= 0` arm answer it first,
-        # justified by a comment — "nothing is running" — that is provably FALSE whenever a lane is
-        # live: a lane positively bound to a live incarnation IS a running process. Measured before
-        # the reorder: `lane_census(2, 5, 0, 7)` and `lane_census(2, 1, 0, 7)` both returned None
-        # through that arm. Same verdict, honest reason, and the exemption can no longer be split
-        # from the arm it governs by a later edit.
+        # ⛔ THE EXEMPTION IS TESTED BEFORE THE EMPTY-POPULATION ARM, AND IT IS BEHAVIOUR-NEUTRAL
+        # (review cycle 17, finding 1 — the earlier wording here claimed this reorder was "the fix"
+        # and that a pin "stops the exemption being split from its arm". Both claims were FALSE: BOTH
+        # arms `return None`, so the ORDER IS UNOBSERVABLE through the verdict, and a verdict-level
+        # pin cannot see it. Measured: the head's pins all pass against the PARENT module, and the
+        # suite is green with the arms put back the wrong way. So this is stated for what it is —
+        # the comment now matches the code it sits on, and the exemption sits adjacent to the arm it
+        # governs so the two cannot drift apart unnoticed. The value is the HONEST REASON and the
+        # PINS below, not an ordering guarantee.
+        #
+        # The reason the two reads may disagree is NOT a wrapper/interpreter argv0 — the fleet's own
+        # `pi` presents argv0 exactly `pi` (measured: 20 `ps` rows, all basename `pi`; the
+        # process-title rewrite means no interpreter prefix appears). It is that the two reads are
+        # DIFFERENT PREDICATES over DIFFERENT things: `alive` is an identity check on the RECORDED
+        # incarnation — the hook store's `pid` + `pidStartSeconds`, fenced by `liveness.probe_pid` —
+        # and NOTHING requires that process to be the `pi` binary; `pi_count` counts only `ps` rows
+        # whose argv0 basename is exactly `pi`. A lane whose recorded pid is a wrapper, a tmux
+        # client, or any other non-`pi` incarnation is therefore legitimately `alive` while adding
+        # nothing to `pi_count`. `alive > 0` beside a MEASURED-EMPTY population is that state, not a
+        # contradiction — and the previous ordering answered it with a comment ("nothing is
+        # running") that is provably FALSE whenever a lane is live: a lane positively bound to a
+        # live incarnation IS a running process. Measured before this: `lane_census(2, 5, 0, 7)` and
+        # `lane_census(2, 1, 0, 7)` both returned None through that arm.
         if alive:
             return None
         if pi_count <= 0:
