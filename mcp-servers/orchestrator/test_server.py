@@ -1078,6 +1078,55 @@ def test_T_run_is_bounded_in_MEMORY_and_TIME_not_just_in_what_it_returns(monkeyp
     assert mod.MAX_TIMEOUT_S > 0 and mod.MAX_CAP > 0
     r = mod.run(["echo", "x"], timeout=10 ** 9, cap=10 ** 12)
     assert r.ok(), "an absurd but harmless limit must be clamped, not refused: %r" % (r.to_dict(),)
+    # ⛔ AND A DEGENERATE VALUE FALLS BACK TO THE DEFAULT, NEVER TO THE MAXIMUM. `cap < 0` was mapped
+    # to `MAX_CAP`, i.e. a nonsense-low request produced the LARGEST buffer — the wrong direction for
+    # the very bound this fix imposes.
+    assert mod.run(["echo", "x"], timeout=-5).ok(), "a negative timeout is the default, not a refusal"
+    assert len(mod.run(["echo", "x"], cap=-1).stdout) == len("x\n"), "a negative cap is the default"
+
+
+def test_T_the_clamp_never_rewrites_a_declared_call_site():
+    """⛔ THE MAXIMUM MUST COVER THE LARGEST DECLARED CALL SITE, OR IT SILENTLY REWRITES IT.
+
+    `pr_state` asks for `timeout=400.0` (the whole-board `gh` read). A `MAX_TIMEOUT_S` of 300 turned
+    a slow-but-legitimate read into a FALSE `UNMEASURED(... timeout after 300s)` — the exact failure
+    class (#3382 invariant 1: unknown is not zero) this PR exists to remove, introduced by its own
+    bound. Two declarations contradicted each other and nothing tested it, so this arm parses the
+    module's own call sites and reds if any declares more than the clamp allows.
+    """
+    import re
+    src = open(_SERVER, encoding="utf-8").read()
+    mod = _load(_SERVER, "orchestrator_mcp_limits")
+    timeouts = [float(x) for x in re.findall(r"\btimeout=([0-9]+(?:\.[0-9]+)?)\b", src)]
+    caps = [int(x) for x in re.findall(r"\bcap=([0-9]+)\b", src)]
+    assert timeouts, "the scan found no timeout= literals — the regex has drifted"
+    assert max(timeouts) <= mod.MAX_TIMEOUT_S, (
+        "a call site declares timeout=%s but MAX_TIMEOUT_S=%s, so the clamp silently shortens it "
+        "(a slow-but-legitimate read becomes a false UNMEASURED)" % (max(timeouts), mod.MAX_TIMEOUT_S))
+    assert max(caps) <= mod.MAX_CAP, (
+        "a call site declares cap=%s but MAX_CAP=%s" % (max(caps), mod.MAX_CAP))
+
+
+def test_T_the_cap_bounds_ALLOCATION_not_only_the_return(monkeypatch):
+    """⛔ THE PREVIOUS ARM COULD NOT FAIL. It asserted the two properties the OLD code already had —
+    the return was already capped (`_decode(exc.stdout, cap)`) and the call already terminated
+    (`timeout=`) — so reverting the whole fix left it green (verified: the pre-fix `subprocess.run`
+    body passed it). `tracemalloc` makes the actual regression observable and portable, and it
+    discriminates by ~8,500x: peak 0.2 MB fixed vs 1,709.4 MB reverted, same `cap=64`,
+    `cat /dev/zero`, `timeout=1`.
+    """
+    import tracemalloc
+    mod = server_mod(monkeypatch)
+    tracemalloc.start()
+    try:
+        tracemalloc.reset_peak()
+        mod.run(["cat", "/dev/zero"], timeout=1, cap=64)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert peak < 5_000_000, (
+        "`cap` must bound ALLOCATION, not only the return — an endless producer buffered %.1f MB "
+        "while returning 64 bytes, which is how `box.exec` OOMed the server" % (peak / 1e6))
 
 
 def test_T_lane_dispatch_maps_exits_and_the_two_measured_silent_actuators(tmp_path, monkeypatch):
