@@ -6052,6 +6052,11 @@ chmod +x "$NOHMAC_BIN/openssl"
 DC_PR4=424347
 rb_clear
 : > "$LOG"
+# ⛔ THE SINK IS `STUB_CAPTURE` — the BODY-PATCH capture, NOT `STUB_COMMENT_CAPTURE`.
+# The bytes are identical (the marker is built once and both channels carry it), so the
+# shape assertion is sound either way, but naming the wrong sink is the noun class this
+# PR exists to remove: the PATCH body is what this vector reads, so a reader sent to the
+# comment sink would find an empty file and conclude the fixture had failed.
 STUB_CAPTURE="$T/negcap_2011" STUB_COMMENT_BODIES="" PATH="$NOHMAC_BIN:$PATH" \
     run_record_neg "$DC_PR4" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
 # POSITIVE FIXTURE ASSERTIONS FIRST — a 0-post count proves nothing on a run that
@@ -6064,7 +6069,7 @@ NEG_CAP_2011="$(jq -r '.body // empty' "$T/negcap_2011" 2>/dev/null || true)"
 if [ -n "$NEG_CAP_2011" ] && command grep -qF -- "note=quoted sig=$FAKE_SIG" <<<"$NEG_CAP_2011"; then
     ok "20.11 fixture: the UNSIGNED marker ends in a ' sig=<64hex>' shape, so the shape guard is satisfied and ONLY the HMAC can refuse it"
 else
-    bad "20.11 fixture: the posted marker carries no ' sig=' trailer — the vector would judge the shape guard, not the uncomputable-HMAC arm (capture: $NEG_CAP_2011)"
+    bad "20.11 fixture: the marker PATCHed into the PR body carries no ' sig=' trailer — the vector would judge the shape guard, not the uncomputable-HMAC arm (capture: $NEG_CAP_2011)"
 fi
 assert_eq "$(dc_posts "$DC_PR4")" "0" \
     "20.11 an UNCOMPUTABLE HMAC is never treated as a match — nothing is published when openssl produces nothing"
