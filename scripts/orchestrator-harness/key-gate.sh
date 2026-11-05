@@ -219,10 +219,17 @@ def read_json(path, jsonc=False):
     # ⛔ AND THE SAME FOR NON-UTF-8 BYTES (round 24, P1, measured): Node decodes with U+FFFD replacement and never
     # throws (`readFileSync(path, "utf-8")`, `auth-storage.js:175`), so a latin-1 `key` is an ordinary string to pi
     # while Python raised UnicodeDecodeError -> rc 6 -> a false 82. `errors="replace"` is exactly Node\x27s behaviour.
-    with open(path, encoding="utf-8-sig", errors="replace") as f:
-        txt = f.read()
-    if not txt:
+    # ⛔ EMPTINESS IS A PROPERTY OF THE BYTES, NOT OF THE DECODED TEXT (round 25, P1, measured): pi tests the RAW
+    # string (`parseStorageData`\x27s `if (!content) { return {}; }`, `auth-storage.js:301-305`) and only strips the BOM
+    # inside the `JSON.parse` call - so a file containing ONLY a BOM is NON-EMPTY and unparseable to pi
+    # (`Unexpected end of JSON input`, fatal), while decoding it as `utf-8-sig` first turned it into "" and this rule
+    # called it an empty store: gate `check=ok`, lane dead. Reading bytes first keeps the 0-byte answer (pi: `{}`) and
+    # hands the BOM-only shape to the parser, which is the answer pi gives.
+    with open(path, "rb") as f:
+        raw = f.read()
+    if not raw:
         return {}
+    txt = raw.decode("utf-8-sig", errors="replace")
     if jsonc:
         txt = strip_jsonc(txt)
     # ⛔ JSON.parse REJECTS `Infinity`/`-Infinity`/`NaN`, PYTHON\x27S json.loads ACCEPTS THEM (round 23, P2, measured):
@@ -521,7 +528,7 @@ if sys.argv[2] == "var":
             if not isinstance(v, dict):
                 return False
             for x in v.values():
-                if x is None or isinstance(x, (str, int, float, bool)):
+                if x is None or isinstance(x, (str, bool)) or _number(x):
                     continue
                 # `$var` is an ENUM (`thinking.enabled|thinking.effort|thinking.budget`, `required`), and
                 # `omitWhenOff` is a boolean (round 21, P2, measured: pi DISCARDS
@@ -538,7 +545,7 @@ if sys.argv[2] == "var":
         # DISCARDS the document and the provider disappears from `--list-models`, so the gate certified a variable
         # from a file pi never loaded).
         def _num_or_str(x):
-            return isinstance(x, str) or (not isinstance(x, bool) and isinstance(x, (int, float)))
+            return isinstance(x, str) or _number(x)
 
         def _ok_price_map(v):
             # `max_price` types its NAMED leaves `number|string` and carries NO `additionalProperties: false`, so an
@@ -551,13 +558,13 @@ if sys.argv[2] == "var":
 
         def _ok_percentiles(v):
             # throughput/latency -> `anyOf number | {p50,p75,p90,p99: number}`, same no-additionalProperties rule
-            if not isinstance(v, bool) and isinstance(v, (int, float)):
+            if _number(v):
                 return True
             if not isinstance(v, dict):
                 return False
-            return all(
-                not isinstance(v[k], bool) and isinstance(v[k], (int, float))
-                for k in ("p50", "p75", "p90", "p99") if k in v)
+            # ⛔ `_number`, NOT A LOCAL TUPLE CHECK (round 25, P2, measured): `preferred_min_throughput: 1e999` (and a
+            # non-finite percentile) make pi discard the document; accepting them here certified the credential.
+            return all(_number(v[k]) for k in ("p50", "p75", "p90", "p99") if k in v)
 
         def _ok_sort(v):
             # `anyOf string | {by: string, partition: string|null}`, neither key required
@@ -756,8 +763,15 @@ if sys.argv[2] == "var":
     raise SystemExit(0)
 
 # MODE=store
+# ⛔ `null` IS NOT "NO STORED CREDENTIAL" (round 25, P1, measured): a whole-document `null` parses fine, and pi then
+# evaluates `readState.data[provider]` on it - `Credential store read failed for <provider>: Cannot read properties of
+# null (reading \x27<provider>\x27)`, exit 1, WITH the provider key exported. The old reader folded every non-dict into the
+# POSITIVE "there is no credential here" (rc 1), so the gate fell through to the environment and printed `check=ok`
+# - and the false fact "auth.json has NO entry for this provider" - over a lane that dies. The other non-dict shapes
+# are genuinely safe and stay rc 1: `[]` reaches the provider (measured 401), because indexing an array yields
+# `undefined`, not a throw.
 if not isinstance(doc, dict):
-    raise SystemExit(1)
+    raise SystemExit(6 if doc is None else 1)
 entry = doc.get(sys.argv[3])
 # ⛔ rc 5 = THE STORE ENTRY IS INVALID, AND THAT IS ITS OWN ANSWER (round 19, P1, measured).
 # An entry pi cannot take a key from SHADOWS the environment instead of falling back to it, and that is the
@@ -1477,14 +1491,14 @@ key_gate_box_default_assert() {
     else
       pprov=""; pmodel=""
     fi
-    printf '[key-gate] %s check=warn reason=box-default-not-provisioned box_default=%s model=%s provider=%s var=%s settings_json=%s — this box pins its STARTUP model to %s, and $%s holds no value here, so a `pi` launched with NO model flag will NOT start on %s: pi uses the saved default only when the provider is provisioned and otherwise falls through to the first model it finds — so it either runs a model nobody pinned and spends tokens on it (the #2208 silent-substitution class), or, when NO provider is provisioned at all, exits 1 with `No API key found for the selected model.` %s Pin a PROVISIONED defaultProvider/defaultModel in settings.json, or launch with `--provider … --model …` (agent-infra#3443)\n' \
+    printf '[key-gate] %s check=warn reason=box-default-not-provisioned box_default=%s model=%s provider=%s var=%s settings_json=%s — this box pins its STARTUP model to %s, and $%s holds no value here, so a `pi` launched with NO model flag will NOT start on %s: pi uses the saved default only when the provider is provisioned and otherwise falls through to step 4 of `findInitialModel` — the first model with a valid key, preferring the known default model of that provider — so it either runs a model nobody pinned and spends tokens on it (the #2208 silent-substitution class), or, when NO provider is provisioned at all, exits 1 with `No API key found for the selected model.` %s Pin a PROVISIONED defaultProvider/defaultModel in settings.json, or launch with `--provider … --model …` (agent-infra#3443)\n' \
       "$label" "$dm" "$dm" "$prov" "$missing" "$sj" "$dm" "$missing" "$dm" \
       "$( [ -n "$pprov" ] && printf 'THIS LANE PINS provider=%s model=%s, so this line does not stop it — every bare `pi` on this box is affected.' "$pprov" "$pmodel" )"
     return 0
   fi
   printf '[key-gate] %s check=fail result=REFUSED reason=box-default-not-provisioned model=%s box_default=%s provider=%s var=%s settings_json=%s models_json=%s candidates=%s\n' \
     "$label" "$dm" "$dm" "$prov" "$missing" "$sj" "${agent_dir:+$agent_dir/models.json}" "$cands"
-  printf '[key-gate] %s: the STARTUP model this box pins (%s under provider %s) resolves its credential from $%s, which holds no value here — so the pin is NOT USABLE and `pi` will not start on it: it uses a saved default only when the provider is provisioned and otherwise runs the first model it finds (`findInitialModel`) — a model nobody pinned, silently and at cost (the #2208 class) — or, if NOTHING is provisioned, exits 1 with `No API key found for the selected model.` This is a verdict about the PIN, NOT a claim that the box cannot run an agent. Pin a provisioned pair in settings.json (or export %s, or point ENV_FILE at a file that does). ⛔ AND NOTE THE OTHER HALF: sourcing a keys file is NOT the general remedy for this class — measured on cell-5 (agent-infra#3443) the keys file held only GH_TOKEN — no model key at all — and what actually worked was the MODEL FLAG `pi -p --no-session --provider %s --model %s` — but note it fixes the LANE\x27s invocation only: on THIS arm the printed pair is the one that has no credential, so export %s (or pin a provisioned pair) before running it.\n' \
+  printf '[key-gate] %s: the STARTUP model this box pins (%s under provider %s) resolves its credential from $%s, which holds no value here — so the pin is NOT USABLE and `pi` will not start on it: it uses a saved default only when the provider is provisioned and otherwise falls through to step 4 of `findInitialModel` — the first model with a valid key, preferring the known default model of that provider — a model nobody pinned, silently and at cost (the #2208 class) — or, if NOTHING is provisioned, exits 1 with `No API key found for the selected model.` This is a verdict about the PIN, NOT a claim that the box cannot run an agent. Pin a provisioned pair in settings.json (or export %s, or point ENV_FILE at a file that does). ⛔ AND NOTE THE OTHER HALF: sourcing a keys file is NOT the general remedy for this class — measured on cell-5 (agent-infra#3443) the keys file held only GH_TOKEN — no model key at all — and what actually worked was the MODEL FLAG `pi -p --no-session --provider %s --model %s` — but note it fixes the LANE\x27s invocation only: on THIS arm the printed pair is the one that has no credential, so export %s (or pin a provisioned pair) before running it.\n' \
     "$label" "$dm" "$prov" "$missing" "$missing" "$prov" "$dm" "$missing"
   return "$KEY_GATE_REFUSED"
 }
