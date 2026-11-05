@@ -100,6 +100,19 @@ check_excluded 'tracking:'          "$(iss 2820 'tracking: memory-substrate prob
 check_excluded 'residual(...)'      "$(iss 7524 'residual(extractor): the boundary NER/POS/syntax residuals have no live tracker')"
 check_excluded 'map(...)'           "$(iss 5313 'map(pricing): every place tied to the pricing model — the blast radius')"
 check_excluded 'arch(...)'          "$(iss 4333 'arch(storage): own the storage architecture — node volume + the true per-node cost')"
+# ⛔ THE FULL WORD IS A MEMBER TOO, AND IT WAS MISSING (acceptance cycle, P1). The arm carried `arch`,
+# and an alternation member is only excluded when the token is followed by `(` or `:`, so
+# `architecture:` and `architecture(...)` were PICKED. Measured on the live agent-infra queue —
+# #1295 `architecture: the fleet is not a lifecycle owner — abandoned cmux lanes have no ownership
+# signal`, open, unassigned, `P2-moderate`, whose own body says it "is an architecture decision, not a
+# bug fix". agent-infra is a GRADED population here (the harness derives `OR` from the checkout's own
+# origin), so a container there is dispatched exactly like one in tortoise.
+# ⛔ THE PLURAL CLASS (`epics:`, `decisions:`) IS PICKED ON PURPOSE: no live row uses it, and adding an
+# unmeasured member is the runtime guess this definition refuses to make.
+check_excluded 'architecture: spelled out'   "$(iss 1295 'architecture: the fleet is not a lifecycle owner — abandoned cmux lanes have no ownership signal')"
+check_excluded 'architecture(...) spelled out' \
+  "$(iss 900006 'architecture(storage): own the storage architecture')"
+
 check_excluded 'leading whitespace' "$(iss 900002 '   epic: indented by a human, still a container')"
 # Legacy members of the OLD rule — kept, so dropping one is a reviewed change. (No live row in the
 # measured tortoise queue used them; agent-infra#1425 DOES use `analysis(`, which is why the kind
@@ -349,7 +362,7 @@ else bad=$((bad+1)); echo "FAIL [drift] ${priv:-0} \`--jq\` program(s) carry a s
 # test change the definition comment promises. If you are here because this check failed, the question
 # is not "how do I make it green" — it is "am I deliberately changing what counts as a work unit, and
 # have I said why in the PR?" `refs #8465` is what it costs when that question goes unasked.
-POOL_PROG_WANT='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
+POOL_PROG_WANT='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|architecture|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
 if [ "$SEL" = "$POOL_PROG_WANT" ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [membership] the pool program changed — update POOL_PROG_WANT in this suite (and say why in the PR) rather than widening, narrowing or re-arming the rule silently"; echo "    got:  $SEL"; echo "    want: $POOL_PROG_WANT"; fi
 

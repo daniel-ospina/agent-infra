@@ -44,7 +44,8 @@ issue (open, labelled P0/P1/P2, unassigned)
   │                           CONTAINER issues, by ONE definition (`POOL_JQ=`, top of the script,
   │                           shared by all three tiers and the emergency floor — tortoise#10951):
   │                           a title-kind arm (epic/decision/design/coord/measure/analysis/
-  │                           investigation/requirement/tracking/residual/map/arch/OWNER DECISION,
+  │                           investigation/requirement/tracking/residual/map/arch/architecture/
+  │                           OWNER DECISION,
   │                           plus the `decision needed:` request form — each only when marked
   │                           structurally as `kind:` or `kind(...)`, with `epic-scope:` the one
   │                           enumerated `-qualifier`) or the `lane <id>:` umbrella
