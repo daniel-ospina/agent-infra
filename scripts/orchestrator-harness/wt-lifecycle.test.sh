@@ -479,6 +479,31 @@ assert_contains "$OUT" "rc=1" "L5d a checkout on ANOTHER branch is preserved"
 assert_contains "$OUT" "feat/other-17" "L5d the reason names the branch it is actually on"
 assert_dir "$REPO/.worktrees/tm-17" "L5d the checkout survives"
 
+# ⛔ L6/L7 ALSO PIN `MAX_LOAD`, AND THAT IS THE SAME CLASS OF FIXTURE DEFECT (measured 2026-11-03 while
+# reviewing #3331). Both arms read "the lane REACHED its agent" from the ABSENCE of a land-backlog line,
+# so a LOAD refusal (75) — which the ambient load on a busy box produces, with no other symptom — reaps
+# the 0-commit worktree and reddens L7's three assertions. The arm is about the EXIT TRAP, not the load
+# gate; a fixture whose verdict depends on the runner's 1-minute load average is a false red on a busy
+# runner and a false green on an idle one (the rule `capacity-transfer.test.sh` states for the same
+# gate). This pins the box to "not loaded" explicitly.
+#
+# ⛔ L6/L7 DECLARE THE MODEL-CREDENTIAL GATE OFF, BY NAME AND ON PURPOSE (agent-infra#3331). Both arms
+# replace `pi` with a STUB, so the credential is not what they measure — and `lane.sh` now asserts the
+# credential immediately before it spawns the agent. Without this, the arm's verdict would depend on
+# whether the RUNNER has a key (a false red on a fresh box, a false green on a provisioned one) instead
+# of on the trap it exists to test. The escape is loud: the lane log carries
+# `[key-gate] … check=skipped reason=--key-gate-off`, and `lane-outcome.test.sh` proves the gate refuses
+# by default (82) — so this line cannot hide a broken gate, only omit an unrelated assertion.
+#
+# ⛔ L6/L7 ALSO PIN `ENV_FILE` TO A FIXTURE-OWNED (ABSENT) FILE, FOR THE SAME REASON ONE VARIABLE UP.
+# `lane.sh` dots `lane-env.sh`, which sources `${ENV_FILE:-$HOME/keys.env}`, and the CONTROLLER exports
+# `ENV_FILE` — so a run on a real box inherits that box's `keys.env`, which carries `PATH` and `HOME`.
+# Sourcing it lands AFTER `lane.sh:65` prepended `$O/gh-rest`, so it DISPLACES the fixture's `gh`
+# adapter (`mk_lane_box`) and hands the real repository's state to the #2409 creation gate: MEASURED
+# 2026-11-04 while rebasing #3342 onto main, both arms refused with `land-backlog] REFUSED` because the
+# gate read `41 open / 0.9 landings per hour` from the live repo instead of the fixture's `0`. Pinning
+# the seam keeps the arm a statement about the TRAP, not about how busy the fleet is that morning.
+#
 # ── L6: the SHIPPED lane.sh trap does the same, end to end ─────────────
 # The lane is executed for real: a stub `pi` returns immediately (so no model is called), the lane
 # produces no commit and no push, and its EXIT trap must take the worktree and branch back.
@@ -495,9 +520,9 @@ printf '#!/bin/bash\nexit 0\n' >"$T/$ENV/o/bin/pi"; chmod +x "$T/$ENV/o/bin/pi"
 mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/dev/null
 OUT="$( cd "$REPO/.worktrees/tm-15" && \
-        O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
-        REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." \
-        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" "$@"' "$LANE" 15 feat/15-tm "$LANE_OR" 2>&1 )"
+        O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" ENV_FILE="$T/$ENV/keys.env" \
+        REAP_LANE_VENV_DISABLE=1 AGENT_INFRA_PATH="$T/.." MAX_LOAD=999999 \
+        bash -c 'pi() { exit 0; }; export -f pi; exec bash "$0" --key-gate-off "$@"' "$LANE" 15 feat/15-tm "$LANE_OR" 2>&1 )"
 assert_contains "$(cat "$T/$ENV/o/logs/lane-15.log" 2>/dev/null)" "exited" "L6 the shipped lane.sh ran to its exit path"
 # The repo-identity gate must not be what refused: with the target naming this box's origin it must
 # PASS, otherwise "the trap reaped an empty checkout" is a statement about a lane that never started.
@@ -531,9 +556,9 @@ export -f pi
 SH
 mk_lane_box "$T/$ENV/o" "$REPO"
 in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
-( cd "$REPO/.worktrees/tm-16" && O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" \
-  REAP_LANE_VENV_DISABLE=1 \
-  bash -c '. "$1"; exec bash "$2" 16 feat/16-tm "$3"' _ "$T/$ENV/o/stub-pi.sh" "$LANE" "$LANE_OR" \
+( cd "$REPO/.worktrees/tm-16" && O="$T/$ENV/o" PATH="$T/$ENV/o/bin:$PATH" ENV_FILE="$T/$ENV/keys.env" \
+  REAP_LANE_VENV_DISABLE=1 MAX_LOAD=999999 \
+  bash -c '. "$1"; exec bash "$2" --key-gate-off 16 feat/16-tm "$3"' _ "$T/$ENV/o/stub-pi.sh" "$LANE" "$LANE_OR" \
   >/dev/null 2>&1 )
 assert_not_contains "$(cat "$T/$ENV/o/logs/lane-16.log" 2>/dev/null)" "land-backlog] REFUSED" \
     "L7 the lane REACHED its agent (the creation gate did not refuse the fixture)"

@@ -533,7 +533,8 @@ script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane
 script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
 script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
 script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py
-script:record-review.sh script:repo-target.sh script:session-postmortem.sh script:turn-classify.py
+script:record-review.sh script:repo-target.sh script:session-postmortem.sh script:tortoise_graph_client.py
+script:turn-classify.py
 script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
 lib:pid-identity.sh lib:transcript-patterns.sh
@@ -552,6 +553,17 @@ other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
 # `install-disk-reaper-timer.sh` + `disk-reaper.sh` without the entry point the unit calls — the exact
 # #1552/#1899 shape). It is DELIVERED — `fleet_srcs` is what puts it at $DEST/scripts/disk-reaper-run.sh
 # — so this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry.
+#
+# `script:tortoise_graph_client.py` joined on 2026-11-03 (agent-infra#3253): `tortoise-graph.sh` — the
+# ONE way a lane reads/writes the hosted graph — execs it as the SIBLING
+# `$(dirname "$0")/tortoise_graph_client.py`, and BOTH are now declared in `fleet_srcs`, so a fresh
+# $DEST/scripts gets a client whose second half exists. It is DELIVERED — that array is what puts it at
+# $DEST/scripts/tortoise_graph_client.py — so this is a re-pin of the derived population, NOT a
+# `LANE_PRODUCERS_EXEMPT` entry. Verified against the CODE (#1899): the exec site is
+# `scripts/tortoise-graph.sh`'s `exec python3 "$(dirname "$0")/tortoise_graph_client.py"`.
+# Measured 2026-11-03 on the cmux box, which carried a HAND-COPIED (never farmed) client at
+# /tmp/cell-home/.pi/agent/scripts: `check-farm-drift.sh` reported both files STALE and NOT
+# farm-declared, exit 3 (a deploy cannot fix it) — the state this declaration removes.
 #
 # `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
 # the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
