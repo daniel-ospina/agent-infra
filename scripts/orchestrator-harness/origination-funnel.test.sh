@@ -1523,15 +1523,25 @@ esac
 # The bracket appended to the BLOCKED / died / SEED-SKEW arms said "N usable candidate(s) still queued"
 # whenever `backlog > 0` — including when the number is the RECORD's and this cycle read nothing. Same
 # defect as the caller's own arms, which refuse it one line up.
+# ⛔ A RECORD THE WRITER ACTUALLY PRODUCES (review P3, cycle 25): no `refresh_fail` call site passes
+# `backlog=` — a `fail` record carries none — so a `result=fail` + `backlog=5` fixture modelled an
+# impossible state and the reachable arms stayed ungraded.
 mkdir -p "$T/mask-rec/state"
-printf 'result=fail\nstage=preflight\nrc=1\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=none of the 3 judged candidate(s) produced a usable verdict — failing surface(s): issue-assignee-holder:3\nbacklog=5\n' "$(date +%s)" > "$T/mask-rec/state/refresh-last"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=judged CLEAN\n' "$(date +%s)" > "$T/mask-rec/state/refresh-last"
+: > "$T/mask-rec/.refresh-unrecorded"
+printf 'stage=handoff\nrc=1\nat=%s\nwhy=record write failed\n' "$(date +%s)" >> "$T/mask-rec/.refresh-unrecorded"
 printf '7\n8\n' > "$T/mask-rec/candidates.txt"; chmod 000 "$T/mask-rec/candidates.txt"
 drive_gate "$T/mask-rec" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
 chmod 644 "$T/mask-rec/candidates.txt" 2>/dev/null || true
 case "$OUT_DRIVE" in
   *"5 usable candidate(s) still queued from an earlier pass"*) bad "tailnote: a RECORDED count (this cycle read nothing) printed 'still queued' in the present tense — $OUT_DRIVE" ;;
-  *"the last pass recorded 5 queued; THIS cycle could not measure the queue"*) ok "tailnote: a recorded count is attributed, and its deferral called UNPROVEN" ;;
+  *"the record on disk says 5 queued; THIS cycle could not measure the queue"*) ok "tailnote: the recorded count is attributed to the ARTEFACT, and its deferral called UNPROVEN" ;;
   *) bad "tailnote: the recorded count got no gate at all — $OUT_DRIVE" ;;
+esac
+# and it must not name a pass, on an arm whose own sentence says the record was NOT written by the last one
+case "$OUT_DRIVE" in
+  *"the last pass recorded"*) bad "tailnote: the bracket credits 'the last pass' on the arm that says the record is an EARLIER pass — $OUT_DRIVE" ;;
+  *) ok "tailnote: the bracket does not credit a pass the arm beside it says did not write the record" ;;
 esac
 # the MEASURED case still says "still queued" (the guard does not silence the real one)
 mkdir -p "$T/mask-meas/state"

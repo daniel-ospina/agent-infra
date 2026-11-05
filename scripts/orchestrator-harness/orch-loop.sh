@@ -2113,7 +2113,11 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   if [ "$backlog" -gt 0 ] && [ "$_bl_state" = "READ" ]; then
     tailnote=" [$backlog usable candidate(s) still queued from an earlier pass — deferred work exists, but origination is what is broken]"
   elif [ "$backlog" -gt 0 ]; then
-    tailnote=" [the last pass recorded $backlog queued; THIS cycle could not measure the queue, so deferred work is UNPROVEN rather than counted]"
+    # ⛔ ATTRIBUTED TO THE ARTEFACT, NOT TO A PASS (review P3, cycle 25). The arms that can print this are
+    # exactly the ones whose own sentence says the record was NOT written by the last pass ("the record on
+    # disk is an EARLIER pass", "written by NOTHING here") — so "the last pass recorded N" contradicted the
+    # clause beside it. The record is what is known; the pass that wrote it is not.
+    tailnote=" [the record on disk says $backlog queued; THIS cycle could not measure the queue, so deferred work is UNPROVEN rather than counted]"
   fi
   # ⛔ THE UNRECORDED-FAILURE MARKER COMES BEFORE EVERYTHING (review P1, two reviewers). When a pass
   # FAILS and cannot write its record (`$O/state` unwritable while `$O` is writable), the record still
