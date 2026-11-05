@@ -1240,13 +1240,21 @@ cap_bounded() {
   # the caller's `$( )` open. MEASURED with a `mktemp` that exits 1: a 1 s bound took the child's full
   # 6 s. The path is built without `mktemp` (per-process, single call), and a redirect that cannot be
   # created fails the child — a named non-zero reading — rather than silently un-bounding the caller.
+  # ⛔ AND THE TIMEOUT IS DECIDED BY A SENTINEL, NOT BY `kill -0` (fresh review round 5, P2). Liveness
+  # was read AFTER `wait`, when the watchdog subshell had not necessarily exited yet: 40 timed runs of
+  # `cap_bounded 1 sleep 5` on the watchdog arm gave rc 124 26 times and rc 137 14 times, and the
+  # emitter then says `why=channel-unreadable`/`exited 137` instead of the documented `channel-timeout`.
+  # The watchdog marks the file BEFORE it kills, so the verdict cannot be lost to a race.
   local _p _w _rc
   _tmp="${TMPDIR:-/tmp}/cap-bounded.$$.$RANDOM"
+  _to="${TMPDIR:-/tmp}/cap-bounded-to.$$.$RANDOM"
+  rm -f "$_to" 2>/dev/null
   "$@" >"$_tmp" 2>/dev/null & _p=$!
-  { sleep "$s"; kill -9 "$_p" 2>/dev/null; } >/dev/null 2>&1 & _w=$!
+  { sleep "$s"; : >"$_to"; kill -9 "$_p" 2>/dev/null; } >/dev/null 2>&1 & _w=$!
   wait "$_p" 2>/dev/null; _rc=$?
-  if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
-  cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
+  [ -e "$_to" ] && _rc=124
+  kill "$_w" 2>/dev/null
+  cat "$_tmp" 2>/dev/null; rm -f "$_tmp" "$_to" 2>/dev/null
   return "$_rc"
 }
 
@@ -1286,6 +1294,17 @@ cap_parse_inventory() {
       # invisible. So `\r` is dropped, and a listing that still hides objects in one fragment is
       # caught structurally: the number of `"status"` keys must equal the number of machine objects.
       gsub(/\r/, "", buf)
+      # ⛔ A TRUNCATED LISTING IS NOT A SHORTER FLEET (fresh review round 5, P1). The `\r` fix above
+      # caught one class of unsplit body; a body CUT SHORT passed every check, because the cut runs off
+      # the end rather than hiding objects in one fragment: a 5-machine body cut inside the 3rd object
+      # left fragments 1 and 2 classifiable, `nstatus == objs`, and the line read `expected=2
+      # published=2 INELIGIBLE=0` rc 0 — the whole-fleet-healthy shape, from a listing that named two
+      # of five machines. A JSON body is balanced, so completeness is checked structurally: every `{`
+      # has its `}` and every `[` its `]`. (The live CLI emits `{"machines":[…]}` — `]}` — so neither
+      # shape is assumed; only BALANCE is.)
+      _cb = buf; nb = gsub(/\{/, "", _cb); _cb = buf; nbc = gsub(/\}/, "", _cb)
+      _cb = buf; nk = gsub(/\[/, "", _cb); _cb = buf; nkc = gsub(/\]/, "", _cb)
+      if (nb != nbc || nk != nkc) { print "UNCLASSIFIED 1"; exit 1 }
       _cp = buf; nstatus = gsub(/"status"[ \t]*:/, "", _cp)
       n = split(buf, m, /}[ \t]*,[ \t]*\{/)
       got = 0; bad = 0; objs = 0; acc = ""
@@ -1468,6 +1487,14 @@ cap_fleet_line_from() {
       cap_valid_base_record "$rec" || continue
       bid="$(cap_kv "$rec" boxid)"
       cap_boxid_ok "$bid" || continue
+      # ⛔ A COLLIDED KEY IS NOT A PUBLISHED BOX (fresh review round 5, P1). `cap_parse_lsremote` marks
+      # such a record (`collide=1`, `capacity.sh:cap_parse_lsremote`) and `cap_place` refuses the WHOLE
+      # evaluation on it (`bound=identity_collision`) — because two machines under one key mean the
+      # last writer masks the other, which is exactly #3446's dead-box-reads-as-present. The line was
+      # dropping the datum it had just been handed: MEASURED, two machines under one key with one of
+      # them dead read `expected=1 published=1 INELIGIBLE=0` rc 0 while `cap_place` refused the same
+      # bytes. The line and placement must not disagree about who is visible.
+      if [ "$(cap_kv "$rec" collide)" = "1" ]; then unk_pub=1; why="${why:-identity-collision}"; break; fi
       at="$(cap_kv "$rec" at)"
       case "$at" in ''|*[!0-9]*) continue ;; esac
       age=$(( now - at ))

@@ -1716,6 +1716,59 @@ sed 's|        unk_pub=1; why="${why:-clock-skew}"; break|        :|' "$CAP" > "
 L25M="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-preskew.sh" "$(recb 10.0.0.1 "$_FUT_AT")" 2>/dev/null)"
 ck "  …mutation control: with the clamp restored the same record reads published=1 ($L25M)" \
    "$(qF 'published=1' "$L25M" && echo 0 || echo 1)"
+# (c4) ⛔ A COLLIDED KEY IS NOT A PUBLISHED BOX (fresh review round 5, P1). `cap_parse_lsremote` marks
+# such a record `collide=1` and `cap_place` refuses the whole evaluation (`bound=identity_collision`),
+# because two machines under one key mean the last writer masks the other — #3446's own shape, reached
+# through a key the codebase records as having really collided. The line was dropping the mark it had
+# just been handed: two machines under one key, one of them dead, read `expected=1 published=1
+# INELIGIBLE=0` rc 0 while placement refused the SAME bytes.
+L26="$(CAP_EXPECTED_BOXES="cell-1:10.238.144.2" cap_fleet_line_from "$MARKED" 0)"; RC=$?
+ck "(c4) a record the reader marked collide=1 refuses the reading, never 'published' ($L26)" \
+   "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L26" && qF 'why=identity-collision' "$L26" && echo 0 || echo 1)"
+L26C="$(CAP_EXPECTED_BOXES="cell-1:10.238.144.2" cap_fleet_line_from "${MARKED% collide=1}" 0)"
+ck "  …while the SAME record without the mark is published (the fixture is otherwise valid: $L26C)" \
+   "$(qF 'published=1' "$L26C" && echo 0 || echo 1)"
+# (c4-mutant) NON-VACUITY: the pre-fix published loop ignores the collision mark and certifies the key.
+sed 's|then unk_pub=1; why="${why:-identity-collision}"; break; fi|then :; fi|' "$CAP" > "$TMP/cap-nocoll-line.sh"
+L26M="$(CAP_EXPECTED_BOXES="cell-1:10.238.144.2" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-nocoll-line.sh" "$MARKED" 2>/dev/null)"
+ck "  …mutation control: without the collision gate the same bytes read published=1 ($L26M)" \
+   "$(qF 'published=1' "$L26M" && echo 0 || echo 1)"
+# (c5) ⛔ A TRUNCATED LISTING IS NOT A SHORTER FLEET (fresh review round 5, P1). A body cut BETWEEN
+# objects passes the round-3 structural check (the cut runs off the end; nothing is hidden in one
+# fragment), so fragments 1-2 classify and `nstatus == objs` — measured on a 5-machine body cut after
+# object 2: `expected=2 published=2 INELIGIBLE=0` rc 0, the whole-fleet-healthy shape, naming 2 of 5
+# machines. Completeness is now structural: every `{` needs its `}`, every `[` its `]`.
+_FULL="{\"machines\":["; _i=1; while [ "$_i" -le 5 ]; do
+  _FULL="$_FULL{\"name\":\"pi-c$_i\",\"status\":\"running\",\"network\":{\"ipv4\":\"10.9.9.$_i\"}}"
+  [ "$_i" -lt 5 ] && _FULL="$_FULL,"; _i=$(( _i + 1 )); done; _FULL="$_FULL]}"
+_CUT="${_FULL%%,\{\"name\":\"pi-c3\"*}"
+ck "  …fixture: the cut listing is genuinely truncated and still brace-unbalanced" \
+   "$([ -n "$_CUT" ] && [ "$(printf '%s' "$_CUT" | tr -cd '{' | wc -c | tr -d ' ')" -gt "$(printf '%s' "$_CUT" | tr -cd '}' | wc -c | tr -d ' ')" ] && echo 0 || echo 1)"
+L27="$(printf '%s' "$_CUT" | cap_parse_inventory 2>&1)"; RC=$?
+ck "(c5) a listing cut between objects is REFUSED, never read as a 2-machine fleet ($L27)" \
+   "$([ "$RC" -ne 0 ] && qF 'UNCLASSIFIED' "$L27" && ! printf '%s' "$L27" | grep -qE '^pi-c[0-9] ' && echo 0 || echo 1)"
+L27C="$(printf '%s' "$_FULL" | cap_parse_inventory 2>&1)"
+ck "  …while the COMPLETE body of the same shape reads all 5 machines (so (c5) is not a blanket refusal)" \
+   "$([ "$(printf '%s' "$L27C" | grep -cE '^pi-c[0-9] 10\.9\.9\.')" -eq 5 ] && echo 0 || echo 1)"
+# (c5-mutant) NON-VACUITY: drop the balance check and the cut listing yields exactly 2 machines.
+sed 's|^      if (nb != nbc \|\| nk != nkc) { print "UNCLASSIFIED 1"; exit 1 }$|      if (0) { }   # MUTANT: no balance check|' "$CAP" > "$TMP/cap-nobalance.sh"
+ck "  …the mutant really lost the balance check" "$([ "$(grep -c 'MUTANT: no balance check' "$TMP/cap-nobalance.sh")" -eq 1 ] && echo 0 || echo 1)"
+L27M="$(printf '%s' "$_CUT" | bash -c '. "$1"; cap_parse_inventory' _ "$TMP/cap-nobalance.sh" 2>&1)"
+ck "  …mutation control: without the balance check the same cut reads 2 of 5 machines ($L27M)" \
+   "$([ "$(printf '%s' "$L27M" | grep -cE '^pi-c[0-9] ')" -eq 2 ] && echo 0 || echo 1)"
+# (t2) ⛔ THE TIMEOUT VERDICT IS A SENTINEL, NOT A `kill -0` RACE (fresh review round 5, P2). Liveness
+# was read AFTER `wait`, when the watchdog subshell had not necessarily exited: 40 timed runs of
+# `cap_bounded 1 sleep 5` gave rc 124 26 times and rc 137 14 times, and the emitter then loses the
+# NAME (`why=channel-unreadable` / `exited 137` instead of `channel-timeout`). The watchdog now marks
+# a file BEFORE it kills, so the verdict is never lost. (The pre-fix tally is measured, not asserted
+# in-suite: a flaky mutant is worse than none.)
+_t2_bad=0; _t2_i=0
+while [ "$_t2_i" -lt 12 ]; do
+  CAP_BOUND_IMPL=watchdog cap_bounded 1 sleep 5 >/dev/null 2>&1
+  [ "$?" -eq 124 ] || _t2_bad=$(( _t2_bad + 1 )); _t2_i=$(( _t2_i + 1 ))
+done
+ck "(t2) 12/12 timed runs report the TIMEOUT verdict (rc 124), never a lost-signal rc ($_t2_bad misses)" \
+   "$([ "$_t2_bad" -eq 0 ] && echo 0 || echo 1)"
 # (w2) ⛔ THE BOUND MUST NOT DEPEND ON `mktemp` (fresh review round 4, P2). Round 3's
 # `mktemp || _tmp=""` fell back to inheriting stdout, restoring the exact pipe hazard: with a `mktemp`
 # that exits 1, a 1 s bound took the child's full 6 s. The path is now built without `mktemp`.

@@ -292,8 +292,9 @@ VM listing — the reconciliation is `published − extra = expected − INELIGI
   the first two numbers sees equality.
 - **`why=`** — present only when a side is unknown, and it names the reason (`provider-inventory-
   unavailable`, `provider-inventory-unreadable`, `provider-inventory-unparseable`,
-  `expected-count-unparseable`, `expected-has-no-boxid`, `roster-empty`, `clock-unreadable`,
-  `channel-unreadable`). `expected-has-no-boxid` means the expectation was READ but cannot be matched
+  `expected-count-unparseable`, `expected-count-unusable`, `expected-has-no-boxid`, `roster-empty`,
+  `clock-unreadable`, `clock-skew`, `ttl-unreadable`, `identity-collision`, `channel-unreadable`,
+  `channel-timeout`). `expected-has-no-boxid` means the expectation was READ but cannot be matched
   record-for-record, so the line names what it can prove and says `INELIGIBLE=unknown` rather than a
   subtraction. Two of those are worth calling out because each was a fail-OPEN in the first
   cut of this line: an **unreadable clock** used to make every age negative (so every record looked
@@ -331,7 +332,11 @@ watchdog (the macOS arm) writes the child's stdout to a FILE rather than to the 
 reaches the direct pid only, so a descendant the provider left behind would otherwise keep the caller's
 `$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. That path does
 NOT depend on `mktemp` (a per-process name is built by the shell), because a `mktemp` that fails would
-otherwise have to fall back to inheriting stdout — the very hazard — or silently un-bound the caller. The sibling
+otherwise have to fall back to inheriting stdout — the very hazard — or silently un-bound the caller.
+Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
+`wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
+`exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /
+`channel-timeout`). The bound still fails closed either way — it is the NAME that was lost. The sibling
 reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this line's path.
 
 ⛔ **THE CHANNEL READ IS BOUNDED FOR THE SAME REASON.** `cap_read_fleet`'s `git ls-remote` is a network
@@ -376,6 +381,21 @@ as an unreadable clock does. A stamp more than the window in the FUTURE is likew
 disagreement — a box with a broken RTC would otherwise read `published=1` for ever, and keep reading it
 after it died — so it refuses as `why=clock-skew`; a second or two of skew between two boxes is normal
 and still clamps to "just published".
+
+⛔ **TWO MORE WAYS THE PUBLISHED SIDE USED TO COUNT SOMETHING IT HAD NOT ESTABLISHED.**
+
+- **A collided key is not a published box.** `cap_parse_lsremote` already marks such a record
+  (`collide=1`) and `cap_place` refuses the whole evaluation on it (`bound=identity_collision`),
+  because two machines under one key mean the last writer masks the other — which is #3446's own
+  shape, reached through a key this codebase records as having really collided. The line was dropping
+  the mark it had just been handed: measured, two machines under one key with one of them dead read
+  `expected=1 published=1 INELIGIBLE=0` rc 0 while placement refused the same bytes. It now refuses as
+  `why=identity-collision`: the line and placement must not disagree about who is visible.
+- **A truncated listing is not a shorter fleet.** The round-3 fix caught a body that hid objects inside
+  one fragment; a body CUT between objects runs off the end, leaves nothing hidden, and passed every
+  check — measured on a 5-machine listing cut after object 2: `expected=2 published=2 INELIGIBLE=0`, rc
+  0, naming two of five machines. Completeness is now structural: every `{` needs its `}`, every `[`
+  its `]` (the live provider emits `{"machines":[…]}` — `]}` — so only BALANCE is assumed, not shape).
 
 owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
 `cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —
