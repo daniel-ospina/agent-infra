@@ -1133,7 +1133,7 @@ post_marker() { # <repo> <pr> <marker> -> 0 present/posted, 1 post failed, 2 bod
   # present", so it PATCHed nothing, flush_pending_markers() `rm -f`'d the pending
   # file, and the caller printed "delivered the pending signed marker" (the wording
   # before #3168 — see the success line below, which now claims no signedness). Silent loss
-  # of the only copy of the signed bytes, reported as success (a false PASS).
+  # of the only copy of those bytes, reported as success (a false PASS).
   # ⛔ The here-string is also what makes the SIGPIPE class impossible here (#841/#864,
   # the idiom scripts/check-no-sigpipe-grep.sh guards): `grep -q` exits at the first
   # match, so a `producer | grep -q` pipeline over a body larger than the pipe buffer
@@ -1757,10 +1757,10 @@ if [ "$FLUSH_PENDING" -eq 1 ]; then
   fi
   if flush_pending_markers "$REPO" "$PR"; then
     # ⛔ NO SIGNEDNESS CLAIM (#3168 re-review P3): this arm is reached with MARKER_SIGNED=0
-    # too. The marker IS signed before it is persisted (the signing block runs above, and
-    # a keyed run's pending file does carry a `sig=` — measured), so the reason is NOT an
-    # ordering: it is that BOTH body-channel arms are reachable with MARKER_SIGNED=0 — no
-    # gate key, or openssl producing nothing, prints a warning and CONTINUES. The bytes a
+    # too. The SIGNING BLOCK runs ABOVE the persistence, so a KEYED run's pending file
+    # does carry a `sig=` — measured — and the reason is NOT an ordering: it is that
+    # BOTH body-channel arms are reachable with MARKER_SIGNED=0 — no gate key, or
+    # openssl producing nothing, prints a warning and CONTINUES. The bytes a
     # flush holds therefore need not carry a `sig=` at all, and `--flush-pending` cannot
     # know which case it is: it delivers whatever the pending file holds. This line used
     # to call them "the pending signed marker" — the same false noun the two exit-5 arms
@@ -4838,7 +4838,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     [ "$BODY" = "null" ] && BODY=""
   else
     # A FAILED READ IS NOT A REASON TO LOSE THE EVIDENCE (defect A). The marker is
-    # already signed and the record already written, so the bytes go to the PENDING
+    # already built and the record already written, so the bytes go to the PENDING
     # file first: a later `--flush-pending` (or any later run of this PR) delivers
     # them without a second review. Exit 5 names the state instead of reporting
     # success over an invisible record.
@@ -4910,7 +4910,7 @@ ${MISSING}"
       marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MISSING" || true
       # Same reasoning as the read-failure arm above (#3168 review P2): the PATCH
       # was refused, so the durable channel is the one that can still carry the
-      # signed bytes. Attempted BEFORE the exit, and "$MISSING" not "$MARKER" — it
+      # marker's bytes. Attempted BEFORE the exit, and "$MISSING" not "$MARKER" — it
       # is the exact line this run tried to deliver.
       post_marker_comment "$REPO" "$PR" "$MISSING" || true
       # ⛔ NO SIGNEDNESS CLAIM IN THE MESSAGE BELOW (#3168 re-review P2): like the
