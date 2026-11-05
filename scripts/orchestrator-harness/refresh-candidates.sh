@@ -3970,19 +3970,41 @@ queue_order_from_pool() {
   case "${_u:-}" in ''|*[!0-9]*) _u="" ;; esac
   case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
   if [ -z "$_r" ] || [ -z "$_u" ]; then
-    QUEUE_ORDER_STATE="priority-unreadable"
-    echo "[refresh] priority-unreadable: the reorder's COUNT could not be read back from $o/.queue-rank — this pass cannot say whether anything was ranked, so the queue's order is UNVERIFIED (not a drained queue)"
+    # ⛔ THE ORDER WAS DERIVED AND INSTALLED — ONLY THE COUNTS ARE UNKNOWN (review P2, cycle 10). This arm
+    # said `priority-unreadable`, whose word for the ORDER is "UNVERIFIED (whatever the PREVIOUS pass
+    # left)". That is FALSE here: the install above (or the byte-identical `cmp`) already decided the
+    # order, and this pass's own write is on disk. The name conflated "cannot report the COUNTS" with
+    # "did not re-derive the ORDER", and the skip arm quoted the latter into `why=` — the field that
+    # outlives the log. Two states, two words.
+    QUEUE_ORDER_STATE="severity-uncounted"
+    echo "[refresh] queue order: severity-first from the pool — the reorder was DERIVED AND INSTALLED, but its COUNT could not be read back from $o/.queue-rank, so how many rows the pool ranked is UNKNOWN (this is NOT a drained queue, and the order is THIS pass's, not the previous pass's)"
     rm -f "$o/.queue-rank" 2>/dev/null
-    return 1
+    return 0
   fi
   rm -f "$o/.queue-rank" 2>/dev/null
   if [ "$_r" -eq 0 ] && [ "$_u" -eq 0 ]; then
-    # Nothing queued at all: a drained queue, not a blind one. REACHABLE ONLY FROM THE DRAINED-QUEUE
-    # ARM of rank_queue_by_pool (which writes `0 0 -`), because that function REFUSES a reorder whose
-    # count it cannot read AND the strict field parse above refuses to launder a bad one into zero — so
-    # this success word can only ever be written for a measured, readable, EMPTY queue (review P2).
+    # Nothing queued at all: a drained queue, not a blind one. ⛔ AND THE CLAIM IS GROUNDED IN THE ARTEFACT,
+    # NOT IN THE COUNT ALONE (review P2, cycle 10). The count path is SHARED: a concurrent pass reaching
+    # its own drained arm writes `0 0 -` to this same `$o/.queue-rank` (and its own entry `rm -f`s it), so
+    # a zero here need not be OUR zero. "The queue is EMPTY" is a claim about candidates.txt, so it is
+    # only said when candidates.txt IS empty — otherwise the count is foreign, the ORDER this pass
+    # installed stands, and the counts are UNKNOWN.
+    if [ -s "$o/candidates.txt" ]; then
+      QUEUE_ORDER_STATE="severity-uncounted"
+      echo "[refresh] queue order: severity-first from the pool — the reorder was DERIVED AND INSTALLED, but the count read back from $o/.queue-rank says 0 queued while candidates.txt holds $(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ') row(s), so that count is NOT this queue's (a concurrent pass wrote its own) and how many rows the pool ranked is UNKNOWN (this is NOT a drained queue)"
+      return 0
+    fi
     QUEUE_ORDER_STATE="empty"
     echo "[refresh] queue order: the queue is EMPTY — there is nothing to order"
+    return 0
+  fi
+  # ⛔ AND THE HEAD IS GROUNDED THE SAME WAY (review P2, cycle 10): `_h` is called "the highest-ranked
+  # CLEAN entry still queued", which is a claim about the row at the TOP OF THE FILE. A head that is not
+  # that row is a foreign count, so the count's other fields cannot be trusted either.
+  _head_now="$(head -1 "$o/candidates.txt" 2>/dev/null || true)"
+  if [ -n "$_h" ] && [ "$_h" != "$_head_now" ]; then
+    QUEUE_ORDER_STATE="severity-uncounted"
+    echo "[refresh] queue order: severity-first from the pool — the reorder was DERIVED AND INSTALLED, but the count read back from $o/.queue-rank names head #$_h while candidates.txt's head is #${_head_now:-none}, so that count is NOT this queue's and how many rows the pool ranked is UNKNOWN"
     return 0
   fi
   if [ -n "$_h" ]; then
@@ -4082,6 +4104,21 @@ product_queue_follow() {
   echo "[refresh] queue order: candidates.product.txt re-sequenced onto the queue's order ($(wc -l < "$pf" 2>/dev/null | tr -d ' ') row(s)) — the product floor's head now comes from the same order dispatch walks"
   return 0
 }
+
+# skip_order_why <state> -> the provenance clause the SKIP arm's durable record composes (#2189 shape).
+# ⛔ ONE MAPPING, ONE PLACE (review P3, cycle 10): inlined in the skip arm, nothing pinned it — swapping
+# the `severity` and `empty` clauses left the whole suite GREEN, so the record that OUTLIVES the log could
+# assert "nothing was queued" about a queue this pass had just reordered. As a function it is driven
+# directly, one case per state, each against its own expected clause.
+skip_order_why() {
+  case "${1:-}" in
+    severity)            printf '%s' "the ORDER was re-derived severity-first from the pool" ;;
+    severity-uncounted)  printf '%s' "the ORDER was re-derived severity-first from the pool; the COUNTS could not be read back by this pass, so how many rows it ranked is UNKNOWN (the order itself is THIS pass's)" ;;
+    empty)               printf '%s' "nothing was queued, so there was no ORDER to derive" ;;
+    priority-unreadable) printf '%s' "the ORDER could NOT be re-derived this pass — it is UNVERIFIED (whatever the PREVIOUS pass left, or unranked)" ;;
+    *)                   printf '%s' "the ORDER's provenance was NOT recorded by this pass — treat it as UNVERIFIED" ;;
+  esac
+}
 # The previous pass's record, parsed strictly. Four fields, all required, none guessed.
 PREV_DIGEST=""; PREV_EPOCH=""; PREV_STATE=""; PREV_EXHAUSTED=""
 if [ -r "$POOL_TOKEN" ]; then
@@ -4155,12 +4192,12 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     # pass — the one where the order could NOT be re-derived — composed into "…was re-derived from the
     # pool: priority-unreadable": the same clause asserting both that it happened and that it did not,
     # in the field that OUTLIVES the log line. One clause per state, chosen from the state.
-    case "${QUEUE_ORDER_STATE:-}" in
-      severity)            _skip_order_why="the ORDER was re-derived severity-first from the pool" ;;
-      empty)               _skip_order_why="nothing was queued, so there was no ORDER to derive" ;;
-      priority-unreadable) _skip_order_why="the ORDER could NOT be re-derived this pass — it is UNVERIFIED (whatever the PREVIOUS pass left, or unranked)" ;;
-      *)                   _skip_order_why="the ORDER's provenance was NOT recorded by this pass — treat it as UNVERIFIED" ;;
-    esac
+    # ⛔ ONE HOP, ONE MAPPING (review P2, cycle 10). This used to be a `case` that re-mapped the four states
+    # onto `skip_order_why`'s own `case` — two mappings of the same thing, and only the second was pinned:
+    # swapping `severity`/`empty` HERE left the suite green while a `severity` pass composed "nothing was
+    # queued" into `why=` of the durable record. The dispatch is now the call itself, so there is no
+    # second table to drift from the first.
+    _skip_order_why="$(skip_order_why "${QUEUE_ORDER_STATE:-}")"
     refresh_record_write ok skip 0 \
       "the pass SKIPPED the per-candidate pre-flight: the pool, checked.txt and dispatched.txt are byte-identical to a pass that swept every candidate — nothing judged, and NO candidate added or dropped ($_skip_order_why; a duplicate row, if the queue somehow carried one, is collapsed to its first occurrence)" \
       "judged=0" "backlog=$_skip_backlog" "handed=$_skip_head" "unusable="

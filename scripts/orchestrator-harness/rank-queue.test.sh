@@ -861,11 +861,12 @@ rmdir "$PQ/o/candidates.product.txt" 2>/dev/null || true
 #        deletes it (its entry does `rm -f "$o/.queue-rank"`) — reachable, because the refresh lock is
 #        cleared by age and by the spawn-failure arms. A shimmed `mv` performs the real install and then
 #        models the race, so the code under test is untouched.
-count_race() {  # <name> <shim-body> -> sets CROUT / CRR (log, rc) for a real reorder of a 2-row queue
+count_race() {  # <name> <shim-body> [queue-content] -> sets CROUT / CRR / CRROWS for a real reorder
   local d="$TMP/count-$1"
   rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
-  printf '300\n200\n' > "$d/o/.pool"
-  printf '200\n300\n' > "$d/o/candidates.txt"
+  # '$3'/'-' = an EMPTY queue; '$4'/'-' = an EMPTY pool; omitted = the 2-row / ranked-pool default
+  if [ "${4:-}" = "-" ]; then : > "$d/o/.pool"; else printf '300\n200\n' > "$d/o/.pool"; fi
+  if [ "${3:-}" = "-" ]; then : > "$d/o/candidates.txt"; else printf '200\n300\n' > "$d/o/candidates.txt"; fi
   cat > "$d/bin/mv" <<SHIM
 #!/usr/bin/env bash
 $2
@@ -879,19 +880,100 @@ SHIM
   CRROWS="$(tr '\n' ' ' < "$d/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
 }
 count_race gone 'rm -f "$QRO/.queue-rank" 2>/dev/null || true'
-if [ "$CRR" -ne 0 ] && [ "$CRROWS" = "300 200" ] && printf '%s' "$CROUT" | grep -q 'priority-unreadable' \
-   && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY'; then rc=0
-else rc=1; echo "      count file GONE: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 240)' (want rc!=0, rows installed, priority-unreadable, NOT 'EMPTY')"; fi
-ck "a count file that VANISHES between the reorder and the read-back is UNREADABLE, not a measured EMPTY queue" $rc
+# ⛔ AND THE WORD IS `severity-uncounted`, NOT `priority-unreadable` (review P2, cycle 10): by this point the
+# install (or the byte-identical `cmp`) has already decided the ORDER, so "the order is UNVERIFIED (whatever
+# the PREVIOUS pass left)" would be a false statement about this pass's own write — and the skip arm copies
+# that clause into `why=`, the field that outlives the log.
+if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED' \
+   && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' && ! printf '%s' "$CROUT" | grep -q 'priority-unreadable'; then rc=0
+else rc=1; echo "      count file GONE: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (want rows installed, 'DERIVED AND INSTALLED', NOT 'EMPTY', NOT 'priority-unreadable')"; fi
+ck "a count file that VANISHES between the reorder and the read-back is UNKNOWN COUNTS over an INSTALLED order, not a measured EMPTY queue" $rc
 count_race bad 'printf "x 2 -\n" > "$QRO/.queue-rank"'
-if [ "$CRR" -ne 0 ] && printf '%s' "$CROUT" | grep -q 'priority-unreadable' \
+if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED' \
    && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY'; then rc=0
-else rc=1; echo "      malformed count: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 240)' (want priority-unreadable, NOT 'EMPTY')"; fi
+else rc=1; echo "      malformed count: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (want DERIVED AND INSTALLED, NOT 'EMPTY')"; fi
 ck "a MALFORMED count field is refused by the strict re-parse, never laundered to zero and read as EMPTY" $rc
+# ⛔ THE WRITE SHAPE OF THE SAME RACE (review P2, cycle 10). Deleting the count file was only half of it: the
+# other pass reaching ITS drained arm WRITES a well-formed `0 0 -` to the same shared path. Zero is a valid
+# count, so the strict parse cannot tell whose it is — and the pass then reported a MEASURED "the queue is
+# EMPTY" over the two rows it had just installed. The claim is now grounded in the artefact: EMPTY is said
+# only when candidates.txt IS empty.
+count_race foreign-zero 'printf "0 0 -\n" > "$QRO/.queue-rank"'
+if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' \
+   && printf '%s' "$CROUT" | grep -q "NOT this queue's"; then rc=0
+else rc=1; echo "      foreign zero: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a foreign '0 0 -' must NOT be read as EMPTY over rows this pass installed)"; fi
+ck "a FOREIGN zero count (another pass's drained arm, same shared path) is not read as EMPTY over rows this pass installed" $rc
+# a foreign count whose head does not name the queue's head is foreign too — the severity line's "head #N is
+# the highest-ranked CLEAN entry" is a claim about the row at the TOP OF THE FILE.
+count_race foreign-head 'printf "1 1 999999\n" > "$QRO/.queue-rank"'
+if [ "$CRR" -eq 0 ] && ! printf '%s' "$CROUT" | grep -q 'head #999999 is the highest-ranked' \
+   && printf '%s' "$CROUT" | grep -q 'candidates.txt.s head is'; then rc=0
+else rc=1; echo "      foreign head: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a head that is not candidates.txt's head must not be reported AS the head)"; fi
+ck "a count whose HEAD is not candidates.txt's head is refused, never reported as the highest-ranked CLEAN entry" $rc
 count_race good 'true'
-if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'severity-first from the pool'; then rc=0
-else rc=1; echo "      positive pair: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 240)' (the three fixtures above must not pass because the drive is broken)"; fi
-ck "positive pair: with the count file intact the same drive reports 'severity-first from the pool'" $rc
+if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'severity-first from the pool — head #300 is the highest-ranked' \
+   && printf '%s' "$CROUT" | grep -q '2 pool-ranked, 0 unranked'; then rc=0
+else rc=1; echo "      positive pair: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (the fixtures above must not pass because the drive is broken, and the grounding must not reject a REAL count)"; fi
+ck "positive pair: with the count file intact the same drive reports 'severity-first from the pool' with its counts" $rc
+# AND A GENUINELY DRAINED QUEUE STILL SAYS EMPTY — the grounding must not turn a real empty queue into
+# 'unknown counts' (the mirror failure this fix could easily have introduced).
+count_race drained 'true' '-' '-'
+if [ "$CRR" -eq 0 ] && [ -z "$CRROWS" ] && printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' \
+   && ! printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED'; then rc=0
+else rc=1; echo "      drained queue: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (an EMPTY queue must still say EMPTY)"; fi
+ck "a GENUINELY empty queue still reports 'the queue is EMPTY' — the artefact grounding does not turn a real empty into unknown counts" $rc
+# 12-y2) THE SKIP ARM'S PROVENANCE MAPPING, one case per state (#2201 shape). Inlined in the arm, nothing
+#        pinned it: swapping the `severity` and `empty` clauses left the suite GREEN, so the durable record
+#        could assert "nothing was queued" about a queue this pass had just reordered. Driven directly, so
+#        each state's clause is compared with the ONE that belongs to it — a swap reds, and every clause is
+#        asserted to be distinct from the others.
+SKIPWHY="$TMP/skipwhy.sh"
+{ cat "$FNS"; printf 'skip_order_why "$1"
+'; } > "$SKIPWHY"
+w_sev="$( ( cd "$TMP" && bash skipwhy.sh severity ) 2>/dev/null )"
+w_unc="$( ( cd "$TMP" && bash skipwhy.sh severity-uncounted ) 2>/dev/null )"
+w_emp="$( ( cd "$TMP" && bash skipwhy.sh empty ) 2>/dev/null )"
+w_pri="$( ( cd "$TMP" && bash skipwhy.sh priority-unreadable ) 2>/dev/null )"
+w_unk="$( ( cd "$TMP" && bash skipwhy.sh ) 2>/dev/null )"
+if printf '%s' "$w_sev" | grep -q 'the ORDER was re-derived severity-first from the pool' \
+   && ! printf '%s' "$w_sev" | grep -q 'nothing was queued' \
+   && printf '%s' "$w_unc" | grep -q 'the COUNTS could not be read back' \
+   && printf '%s' "$w_emp" | grep -q 'nothing was queued, so there was no ORDER to derive' \
+   && printf '%s' "$w_pri" | grep -q 'the ORDER could NOT be re-derived' \
+   && printf '%s' "$w_unk" | grep -q "provenance was NOT recorded" \
+   && [ "$(printf '%s\n%s\n%s\n%s\n%s' "$w_sev" "$w_unc" "$w_emp" "$w_pri" "$w_unk" | sort -u | wc -l)" -eq 5 ]; then rc=0
+else rc=1; echo "      why clauses: severity='$w_sev' uncounted='$w_unc' empty='$w_emp' pri='$w_pri' unknown='$w_unk' (want five DISTINCT clauses, each matching its own state)"; fi
+ck "the skip record's provenance clause is chosen PER STATE — five distinct clauses, each matching its own" $rc
+# 12-y3) AND THE ARM ACTUALLY CONSULTS IT WITH THE STATE IT HAS (review P2, cycle 10). 12-y2 drives the
+#        CLAUSE function; it says nothing about the dispatch into it. With the arm's `case` re-mapping the
+#        states (two tables for one thing), swapping `severity`/`empty` THERE left the suite GREEN while a
+#        severity pass composed "nothing was queued" into the durable record — the same false claim, one
+#        hop earlier. The dispatch is now the call itself; this check drives the SHIPPED assignment line
+#        with a stub clause function that echoes its own argument, so it passes only if the arm hands
+#        `skip_order_why` the state it recorded. A hardcoded clause, a re-mapping table, or a swapped
+#        state all red. Extraction fails CLOSED: no line, or more than one, is a red.
+MAPLINE="$(grep -c '^    _skip_order_why="$(skip_order_why' "$REFRESH" 2>/dev/null)"
+mapply=""
+[ "$MAPLINE" = "1" ] && mapply="$(grep '^    _skip_order_why="$(skip_order_why' "$REFRESH" | head -1)"
+if [ "$MAPLINE" = "1" ] && [ -n "$mapply" ]; then
+  MAPD="$TMP/mapdrive"; rm -rf "$MAPD"; mkdir -p "$MAPD"
+  { cat "$FNS"
+    printf 'skip_order_why() { printf "%%s" "$1"; }\n'
+    printf 'map_state() { QUEUE_ORDER_STATE="$1"; _skip_order_why="";\n%s\nprintf "%%s" "$_skip_order_why"; }\n' "$mapply"
+    printf 'map_state "$1"\n'
+  } > "$MAPD/drive.sh"
+  m_sev="$( ( cd "$MAPD" && bash drive.sh severity ) 2>/dev/null )"
+  m_unc="$( ( cd "$MAPD" && bash drive.sh severity-uncounted ) 2>/dev/null )"
+  m_emp="$( ( cd "$MAPD" && bash drive.sh empty ) 2>/dev/null )"
+  m_pri="$( ( cd "$MAPD" && bash drive.sh priority-unreadable ) 2>/dev/null )"
+  m_unk="$( ( cd "$MAPD" && bash drive.sh unrecorded-state ) 2>/dev/null )"
+  if [ "$m_sev" = "severity" ] && [ "$m_unc" = "severity-uncounted" ] \
+     && [ "$m_emp" = "empty" ] && [ "$m_pri" = "priority-unreadable" ] && [ "$m_unk" = "unrecorded-state" ]; then rc=0
+  else rc=1; echo "      arm dispatch: severity='$m_sev' uncounted='$m_unc' empty='$m_emp' pri='$m_pri' unknown='$m_unk' (want each state handed to skip_order_why AS ITSELF — including an unrecorded one, which the CLAUSE function then maps to its 'provenance was NOT recorded' arm, pinned by 12-y2)"; fi
+else
+  rc=1; echo "      could not extract exactly ONE \`_skip_order_why=\$(skip_order_why …)\` assignment from the skip arm (found $MAPLINE) — this check cannot grade the dispatch"
+fi
+ck "the SKIP arm hands skip_order_why the STATE it recorded (no second re-mapping table that can drift from it)" $rc
 # 12a) NON-VACUITY by MUTATION: make `product_queue_follow` a no-op (`return 0` as its first statement)
 #      and the stale-case assertion must RED — the product file stays a pass behind.
 MUT_NOFOLLOW="$TMP/fns-nofollow.sh"
