@@ -1979,6 +1979,64 @@ case "$out" in BADTPL:*) _named=1 ;; *) _named=0 ;; esac
 [ "$rc" -eq 1 ] && [ "$_named" -eq 1 ] && ! grep -q 'URL_NOT_DEFAULT' <<<"$out" \
   && ok "...and --verify names the TEMPLATE instead of blaming the cell's correct hosted entry" \
   || fail "a non-string template url made --verify answer '$out' — it must name the template, never assert the cell's correct entry is not the hosted shape"
+# ⛔ A TEMPLATE WITH NO `tortoise.url` CERTIFIED **ANY** URL, rc=0 (#3374 review, round 10 P1).
+# The only arm that refuses a wrong endpoint is `if want_url and url != want_url` — so an EMPTY
+# `want_url` (a template whose `tortoise` entry carries no `url`: the pre-#3374 stdio shape, a fork, a
+# hand-edit) skipped URL_NOT_DEFAULT/BADURL/NOHOST/USERINFO entirely and fell through to the
+# hosted-default `else`, which accepts any url whose Authorization is env-indirect. Measured before
+# the fix: a one-letter-typo host and `https://evil.example/mcp/` both returned `OK:<url>:…` rc=0 with
+# the tenant key attached — a false PASS of exactly the class this function exists to close, on the
+# box this PR is about. `merge-mcp.py` already REFUSES the same template (exit 3), so the two sides
+# DISAGREED about one file; both name it now, and `--verify` fails CLOSED: a template that cannot
+# establish the hosted default certifies NOTHING.
+printf '{"mcpServers":{"tortoise":{"type":"stdio","command":"python3","args":["-m","tortoise.mcp_server"]}}}' > "$TMP/tpl-nourl.json"
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http", "url": "https://api.premiselab.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$DEST/.mcp.json" "$TMP/tpl-nourl.json" 2>&1)"
+rc=$?
+case "$out" in BADTPL:no-url:*) _named=1 ;; *) _named=0 ;; esac
+[ "$rc" -eq 1 ] && [ "$_named" -eq 1 ] && ! grep -q '^OK:' <<<"$out" && ! grep -q 'Traceback' <<<"$out" \
+  && ok "a template declaring NO tortoise url certifies NOTHING (BADTPL:no-url:, rc=1) — it cannot pass a typo'd host through as OK" \
+  || fail "a url-less template produced rc=$rc / '${out:0:70}' — an empty template url NULLIFIES the comparison arm, so every url (including https://evil.example/mcp/) is certified OK with the tenant key attached"
+# ...and the CONTROL, so the arm above cannot pass for the wrong reason: the SAME typo'd host IS
+# refused when the template does declare a url. Without this, 'BADTPL for any template at all' would
+# satisfy the assertion above while the comparison arm stayed dead.
+out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" 2>&1)"
+rc=$?
+case "$out" in URL_NOT_DEFAULT:*) _ref=1 ;; *) _ref=0 ;; esac
+[ "$rc" -eq 1 ] && [ "$_ref" -eq 1 ] \
+  && ok "...and the same typo'd host IS refused against the real template (URL_NOT_DEFAULT) — the comparison arm is alive" \
+  || fail "the typo'd host was not refused against the shipped template (rc=$rc, '${out:0:70}') — the no-url arm above would then be passing vacuously"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/tpl-nourl.json" "$DEST/.mcp.json" --cell > "$TMP/nourl.out" 2>&1
+rc=$?
+[ "$rc" -eq 3 ] && grep -qF 'declares no usable tortoise entry' "$TMP/nourl.out" \
+  && ok "...and the MERGE refuses the same url-less template (exit 3) — install and verify agree about one file" \
+  || fail "the merge answered rc=$rc for the url-less template ('$(head -1 "$TMP/nourl.out" | cut -c1-60)') while --verify answered BADTPL:no-url — the two sides disagree about the same template"
+# ⛔ AN UNREADABLE `.mcp.json` WAS THE LAST BARE `open()` ON THE VERIFY PATH (#3374 review P2): every
+# sibling shape error (BADROOT/BADSERVERS/BADDERS/NOTJSON) is a NAMED refusal, but the read itself
+# raised straight out, so stdout was EMPTY and `verify_graph_mcp` printed `FAIL … (marker: none)`
+# over a traceback. A directory is used as the unreadable target because it raises in EVERY
+# environment (an EACCES arm needs a non-root runner to mean anything).
+mkdir -p "$TMP/unreadable-config.json"
+out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$TMP/unreadable-config.json" "$ROOT/templates/.mcp.base.json" 2>&1)"
+rc=$?
+case "$out" in UNREADABLE:*) _named=1 ;; *) _named=0 ;; esac
+[ "$rc" -eq 1 ] && [ "$_named" -eq 1 ] && ! grep -q 'Traceback' <<<"$out" \
+  && ok "an UNREADABLE .mcp.json is a named refusal (UNREADABLE:, rc=1), not a traceback with an empty marker" \
+  || fail "an unreadable .mcp.json produced rc=$rc / '${out:0:70}' — an empty stdout becomes 'marker: none' in the bring-up log, which names no cause and is the instrument defect this file's marker set exists to close"
+# ...and the operator-facing sentence exists for it. The marker is only half the contract: a marker
+# no `case` arm matches falls to the generic "could not be certified" and loses the remedy.
+grep -q 'could not be READ at all' "$ROOT/pi-bootstrap/cell-install.sh" \
+  && ok "...and verify_graph_mcp has an arm for it that carries the remedy (no generic 'could not be certified')" \
+  || fail "UNREADABLE: has no case arm in verify_graph_mcp — the operator gets the generic sentence and no remedy"
 # ⛔ A MARKER IS ECHOED INTO LOGS THAT GET PASTED INTO ISSUES (#3374 review, round 2 P3). `redact()`
 # only matches `tt_`/`tk_` token shapes, so `INSECURE_URL:http://user:hunter2@evil.example/mcp/` put
 # a PASSWORD in the bring-up log while correctly refusing the entry. Every url-echoing marker now

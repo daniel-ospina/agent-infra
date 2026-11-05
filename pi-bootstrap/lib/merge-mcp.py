@@ -509,7 +509,15 @@ def main(argv):
     # CORRUPT template printed a traceback and aborted the sync there. Named here, at the one exit
     # code the docstring already reserves for a template this file cannot use (#3374 review P2).
     try:
-        tpl = json.load(open(tpl_path))
+        # ⛔ EXPLICIT utf-8, NOT THE LOCALE ENCODING. The shipped template carries non-ASCII (`—` in
+        # `_comment`/`purpose`), and text-mode `open()` uses the locale's encoding — `PYTHONUTF8=0`
+        # with a C/POSIX locale is `ascii`, and this read then dies on its own byte 503
+        # (`UnicodeDecodeError`), reported here as a FATAL template the operator will not believe is
+        # broken. Modern CPython coerces a C locale to UTF-8, so a default host does not bite; a
+        # service unit or a pinned-off environment does. `cell-install.sh`'s
+        # `merge_tortoise_is_hosted` already reads with an explicit encoding — this is the same rule
+        # at the other 4 sites, so the two sides cannot disagree about a healthy file.
+        tpl = json.load(open(tpl_path, encoding="utf-8"))
     except (OSError, ValueError) as exc:
         sys.stderr.write(
             "FATAL: cannot read the template %s (%s: %s)\n" % (tpl_path, type(exc).__name__, exc)
@@ -529,7 +537,7 @@ def main(argv):
     dst = {}
     if os.path.exists(dst_path):
         try:
-            dst = json.load(open(dst_path))
+            dst = json.load(open(dst_path, encoding="utf-8"))
         except ValueError as exc:
             print(
                 "NOTE: REPLACED an UNPARSEABLE .mcp.json (%s: %s); the previous file was saved as %s"
@@ -793,7 +801,7 @@ def main(argv):
     dst_real = os.path.realpath(dst_path)
     tmp = "%s.tmp.%d" % (dst_real, os.getpid())
     try:
-        with open(tmp, "w") as fh:
+        with open(tmp, "w", encoding="utf-8") as fh:
             # ⛔ `ensure_ascii=False`: the default re-encodes every non-ASCII character as a `\uXXXX`
             # escape, so a machine whose `.mcp.json` carries a literal `—` (the shipped
             # `templates/.mcp.base.json` does) gets that line REWRITTEN on every sync — byte churn in
