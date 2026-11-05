@@ -2016,10 +2016,52 @@ assert_contains "$OUT" "TRANSIENT SCRATCH" "with the same message class as the s
 D6="$T/c67f"; fresh "$D6"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
 run_install Linux "$D6" --install >/dev/null 2>&1; ENVV=()
-# ⛔ THE BACKSLASH AND WHITESPACE ARMS ARE ABSENT FROM `refuse_adopted_provisioner` BY DESIGN — see its
-# comment: `sed_escape_repl` makes a backslash render literally, and `Environment=` cannot carry a space, so
-# no adopted value can violate either rule. What IS reachable is the `%` specifier on the systemd arm (and
-# its ABSENCE on the Mac arm, which must not be a false block) — both pinned below and above.
+# ⛔ THE BACKSLASH AND WHITESPACE ARMS ARE REACHABLE AND ARE PINNED HERE. An earlier revision deleted them
+# on the argument that no case could reach them — wrong twice over: `Environment=` CAN carry a space
+# (`artifact_env_value` reads everything after the FIRST `=`, measured), and a backslash can be written into
+# the artifact by anything that is not `sed`. With the arms gone, the writer exited 0 while `--status`
+# exited 1 on the SAME artifact, which is the divergence this whole case exists to prevent.
+SPDIR="$T/home/sp dir"; mkdir -p "$SPDIR"; printf '#!/bin/sh\n' >"$SPDIR/inst.sh"; chmod +x "$SPDIR/inst.sh"
+box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$SPDIR/inst.sh|" "$D6/$UNIT_NAME.service"
+if ! grep -qF "PROVISIONER=$SPDIR/inst.sh" "$D6/$UNIT_NAME.service"; then
+    bad "precondition: the whitespace pin landed in the artifact (a no-op edit would make the next assertion meaningless)"
+else
+    ok "precondition: the whitespace pin landed in the artifact"
+fi
+OUT="$(run_install Linux "$D6" --install)"; RC=$?
+assert_eq "$RC" 1 "an adopted pin containing WHITESPACE is REFUSED on systemd (it splits the rendered unit)"
+assert_contains "$OUT" "contains whitespace" "naming that rule"
+OUT="$(run_install Linux "$D6" --status)"; RC=$?
+assert_eq "$RC" 1 "and --status refuses that artifact too, so writer and reader AGREE"
+BSDIR="$T/home/bs\\dir"; mkdir -p "$BSDIR"; printf '#!/bin/sh\n' >"$BSDIR/inst.sh"; chmod +x "$BSDIR/inst.sh"
+# ⛔ WRITTEN WITH python, NOT `box_sed_i`: sed consumes the backslash IN THE REPLACEMENT, so the artifact
+# would carry a backslash-free path and the case would prove nothing (that is how the first attempt at this
+# assertion passed for the wrong reason).
+python3 - "$D6/$UNIT_NAME.service" "$BSDIR/inst.sh" <<'PYEOF'
+import sys
+path, val = sys.argv[1], sys.argv[2]
+import re
+t = open(path).read()
+# ⛔ THE RENDERED LINE IS QUOTED: `Environment="RUNNER_AUTOSCALE_PROVISIONER=<value>"`. An unquoted match
+# silently edits nothing, which is exactly what the precondition below exists to catch.
+# ⛔ A LAMBDA REPLACEMENT, NOT A STRING: a backslash in the VALUE would otherwise be read as a regex
+# escape (`bad escape \\d`) and the edit would silently not happen.
+t2, n = re.subn(r'^Environment="?RUNNER_AUTOSCALE_PROVISIONER=.*$',
+                lambda m: 'Environment="RUNNER_AUTOSCALE_PROVISIONER=' + val + '"', t, flags=re.M)
+if n != 1:
+    raise SystemExit("expected exactly one PROVISIONER Environment line, found %d" % n)
+open(path, "w").write(t2)
+PYEOF
+if grep -qF 'bs\dir' "$D6/$UNIT_NAME.service"; then
+    ok "precondition: the backslash pin landed in the artifact"
+else
+    bad "precondition: the backslash pin landed in the artifact (a no-op edit would make the next assertion meaningless)"
+fi
+OUT="$(run_install Linux "$D6" --install)"; RC=$?
+assert_eq "$RC" 1 "an adopted pin containing a BACKSLASH is REFUSED (the readiness verb refuses the same artifact)"
+assert_contains "$OUT" "contains a backslash" "naming the renderer rule it breaks"
+# ⛔ AND THE PREVIEW/DISARM PATH DOES NOT HIDE IT: `--disarm` renders DISARMED (the pin is inert), so it must
+# still succeed — that exemption is separately pinned below.
 # ⛔ AND THE MAC ARM MUST NOT BE A FALSE BLOCK: a plist <string> is neither split on whitespace nor
 # specifier-expanded, so BOTH values below must install there. These are also the assertions that pin the
 # `[ "$TARGET" != "launchd" ]` scoping — deleting it over-blocked the Mac arm and left the suite green.

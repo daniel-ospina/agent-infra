@@ -1333,24 +1333,22 @@ refuse_root_invocation() {
 # actually be rendered, once it exists.
 refuse_adopted_provisioner() {
     [ -n "$PROVISIONER" ] || return 0
-    # ⛔ NO BACKSLASH OR WHITESPACE ARM HERE, AND THE OMISSION IS THE POINT. Neither rule can be VIOLATED by
-    # an adopted value: `sed_escape_repl` escapes `&`, `\\` and `|`, so a backslash in the pin renders
-    # literally (the pre-selection loop refuses it for an ENV-SUPPLIED value, which is where an operator's
-    # typo arrives), and `Environment=` is a space-separated key=value list, so a pin containing a space
-    # cannot round-trip through the artifact at all — the reader sees its first token, which is not a
-    # readable file, so adoption SKIPS it. Measured: deleting either arm left the suite at `PASS=482
-    # FAIL=0`, i.e. no case can produce their input. A rule no case can reach, sitting where it looks like
-    # protection, is the dead-code shape this PR spent a round deleting. The two arms below ARE reachable and
-    # are pinned in both directions.
+        # ⛔ BOTH ARMS ARE THE WRITER'S OWN RULES, AND THE WRITER MUST APPLY THEM TO THE VALUE IT RENDERS.
+    # ⛔ AN EARLIER REVISION DELETED THEM ON THE ARGUMENT THAT NO CASE COULD REACH THEM. THAT ARGUMENT WAS
+    # WRONG, AND IT MADE THE WRITER DIVERGE FROM ITS READER AGAIN — measured: with these arms gone,
+    # `--install` exited 0 over an artifact whose adopted pin carried a space or a backslash ("already
+    # carries … kept, changed=0") while `--status` exited 1 on that same artifact (`WHITESPACE` /
+    # `BACKSLASH`). The reasoning failed on two facts: `sed_escape_repl` escapes the value, so a backslash
+    # would RENDER — but the reader still refuses that artifact, so the writer must too; and
+    # `artifact_env_value` reads everything after the FIRST `=`, so a space DOES round-trip through
+    # `Environment=` (measured: the full '/…/sp dir/inst.sh' comes back). "No test reaches it" was also
+    # not "no value can violate it" — those are different claims, and only the second would justify deletion.
+    case "$PROVISIONER" in
+        *\\*) err "REFUSING: the provisioner pin this install would render contains a backslash — the artifact is rendered with sed, where a backslash is an escape, and the readiness verb refuses the same artifact"; return 1 ;;
+    esac
     if [ "${TARGET:-}" != "launchd" ]; then
-        # ⛔ NO WHITESPACE ARM HERE, ON PURPOSE. `Environment=` is a SPACE-SEPARATED key=value list, so the
-        # artifact cannot round-trip a pin containing a space — the reader sees only the first token, which
-        # is not a readable file, so adoption SKIPS it and there is no adopted value left to judge. The
-        # env-seam spelling of the same pin is already refused by `refuse_systemd_unsafe_values` before any
-        # verb runs. An arm here would be code no case can reach (measured: deleting it left the suite
-        # green, because nothing can produce the input), and unreachable code that looks like a guard is
-        # worse than none. `%` IS reachable and IS pinned in both directions.
         case "$PROVISIONER" in
+            *[[:space:]]*) err "REFUSING: the provisioner pin this install would render contains whitespace — systemd splits the rendered unit on it, so the job would never run, and the readiness verb refuses the same artifact"; return 1 ;;
             *%*) err "REFUSING: the provisioner pin this install would render contains '%', which systemd expands as a specifier at load time (%h, %i, %n) — the rendered path would differ from the real one"; return 1 ;;
         esac
     fi
