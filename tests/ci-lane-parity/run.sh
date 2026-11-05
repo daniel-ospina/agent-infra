@@ -1562,7 +1562,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardcomment.yml"; then
   fail "the commented-guard mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardcomment.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
     pass "a COMMENTED-OUT guard step is not an invocation (rc 2) — a mention is not a gate"
   else
     fail "a commented-out guard step satisfied the guard (rc $RC — want 2): $OUT"
@@ -1584,7 +1584,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardecho.yml"; then
   fail "the echo-guard mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardecho.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
     pass "an ECHO whose text names the guard is a mention, not an invocation (rc 2)"
   else
     fail "an echo of the guard name satisfied the guard (rc $RC — want 2): $OUT"
@@ -1601,7 +1601,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardheredoc.yml"; then
   fail "the heredoc mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardheredoc.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
     pass "a guard call inside a HEREDOC BODY is text, not an invocation (rc 2)"
   else
     fail "a heredoc-bodied guard call satisfied the guard (rc $RC — want 2): $OUT"
@@ -1614,7 +1614,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardiffalse.yml"; then
   fail "the if-false mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardiffalse.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
     pass "a guard call inside a NON-EXECUTED branch is not an invocation (rc 2)"
   else
     fail "an if-false-bodied guard call satisfied the guard (rc $RC — want 2): $OUT"
@@ -1630,7 +1630,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardmultiline.yml"; then
   fail "the multi-line mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardmultiline.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
     pass "a MULTI-LINE guard step is refused (the declared over-block: the step must BE the bare call)"
   else
     fail "a multi-line guard step returned rc $RC (want 2 — the documented over-block): $OUT"
@@ -1644,7 +1644,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guardnested.yml"; then
   fail "the nested-path mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guardnested.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
     pass "a same-named guard in ANOTHER DIRECTORY is a different program (rc 2)"
   else
     fail "a nested same-named guard satisfied the walk (rc $RC — want 2): $OUT"
@@ -1868,7 +1868,7 @@ if cmp -s "$PR" "$TMP/ci-pr-guarddecoy.yml"; then
   fail "the decoy-guard mutation did not change the file (the arm would be vacuous)"
 else
   guard_rc "$MAIN" "$TMP/ci-pr-guarddecoy.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as its OWN COMMAND' <<<"$OUT"; then
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
     pass "a DECOY at docs/scripts/… with the same name is a different program (rc 2)"
   else
     fail "a decoy guard path satisfied the walk (rc $RC — want 2): $OUT"
@@ -1879,16 +1879,34 @@ sed 's|^        run: bash tests/ci-lane-parity/run\.sh$|        run: bash docs/t
 if cmp -s "$PR" "$TMP/ci-pr-selftestdecoy.yml"; then
   fail "the decoy-self-test mutation did not change the file (the arm would be vacuous)"
 else
+  # ⛔ THE REQUIREMENT ITSELF IS LIVE-ONLY (`isLive`), so a fixture cannot red on it — and the FIRST
+  # version of this arm was DECORATIVE for that reason: it decoyed only the SELF-TEST step of a job
+  # that still runs the REAL guard, so the per-job note read "runs the guard" whichever way the
+  # self-test matcher behaved (measured by the round-4 reviewer: it stayed GREEN on the pre-fix suffix
+  # matcher). The single-decoy fixture below therefore legitimately stays at rc 0; the arm is the
+  # BOTH-decoys fixture after it, where a suffix-accepting matcher would leave a guard-carrying job
+  # behind (rc 0) and the exact-path matcher sees no guard at all (rc 2).
   guard_rc "$MAIN" "$TMP/ci-pr-selftestdecoy.yml"
-  # ⛔ THE REQUIREMENT ITSELF IS LIVE-ONLY (`isLive`), so a fixture cannot red on it. What CAN be
-  # pinned here is the SHARED matcher: a decoy path must not make the job a self-test runner, which is
-  # visible in the per-job note. If `exactlyInvokes` accepted the suffix, the note flips to
-  # "runs the guard's MUTATION SELF-TEST" and this assertion reds.
-  if [ "$RC" -eq 0 ] && grep -qF "runs the guard and is unconditional and blocking" <<<"$OUT" \
-     && ! grep -qF "MUTATION SELF-TEST" <<<"$OUT"; then
-    pass "a decoy SELF-TEST at docs/tests/… is not counted as the self-test (shared matcher, suffix rejected)"
+  if [ "$RC" -ne 0 ]; then
+    fail "the single-decoy self-test fixture should still be accepted (the guard step is intact), got rc $RC: $OUT"
   else
-    fail "a decoy self-test path was accepted by the matcher (rc $RC): $OUT"
+    awk '/^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
+           print "        run: bash docs/scripts/check-ci-lane-parity.sh"; next }
+         { print }' "$TMP/ci-pr-selftestdecoy.yml" >"$TMP/ci-pr-bothdecoy.yml"
+    if cmp -s "$TMP/ci-pr-selftestdecoy.yml" "$TMP/ci-pr-bothdecoy.yml"; then
+      fail "the both-decoys mutation did not change the file (the arm would be vacuous)"
+    else
+      guard_rc "$MAIN" "$TMP/ci-pr-bothdecoy.yml"
+      # Both decoy paths still CONTAIN the guard's name, so the truthful diagnosis is the
+      # "mentions it, but NOT as that value — the path differs from the canonical repo-relative one"
+      # branch. What matters is that a suffix-accepting matcher would have left a guard-carrying job
+      # behind and returned rc 0 (the single-decoy fixture above proves that is the live difference).
+      if [ "$RC" -eq 2 ] && grep -q 'NOT as that value' <<<"$OUT"; then
+        pass "with BOTH steps decoyed no step invokes the guard (the self-test matcher rejects a suffix too)"
+      else
+        fail "a decoyed self-test was still counted as a program this job runs (rc $RC — want 2): $OUT"
+      fi
+    fi
   fi
 fi
 
@@ -2015,6 +2033,78 @@ if [ "$RC" -eq 0 ]; then
   pass "control: a bare 'branches: [main]' push trigger is accepted (no false block on a filter)"
 else
   fail "a legitimate push branches filter was refused (rc $RC — want 0): $OUT"
+fi
+
+# ── ROUND 4: the push filter, the expression spelling, and two over-blocks that were false blocks ──
+
+# ⛔ (r) THE PUSH FILTER IS AN ALLOWLIST, NOT A KEY-BY-KEY ENUMERATION (#3235 review, P2, measured).
+# Resolving only `branches:` accepted FOUR spellings that make the main lane unable to fire for
+# `main`, all at rc 0: `branches-ignore: ['**']`, `branches: ['**', '!main']` (a negation — GitHub's
+# documented "every branch except …"), `paths: ['docs/**']`, `paths-ignore: ['**']`. Only `branches:`
+# is accepted now, so a key GitHub adds later is refused by default rather than escaping silently.
+push_i=0
+for push_shape in "branches-ignore: ['**']" "branches: ['**', '!main']" "paths: ['docs/**']" "paths-ignore: ['**']"; do
+  push_i=$((push_i + 1))
+  awk -v repl="    $push_shape" '
+    BEGIN { done = 0 }
+    /^    branches: \[main, .integration\/\*\*.?\]$/ && !done { print repl; done = 1; next }
+    { print }' "$MAIN" >"$TMP/ci-main-pushfilter$push_i.yml"
+  if cmp -s "$MAIN" "$TMP/ci-main-pushfilter$push_i.yml"; then
+    fail "the push-filter mutation '$push_shape' did not change the file (the arm would be vacuous)"
+  else
+    guard_rc "$TMP/ci-main-pushfilter$push_i.yml" "$PR"
+    if [ "$RC" -eq 2 ] && grep -qE 'filters its .push:. trigger with|negates branches' <<<"$OUT"; then
+      pass "a push filter '$push_shape' is refused (it can stop the lane firing for main)"
+    else
+      fail "the push filter '$push_shape' returned rc $RC (want 2): $OUT"
+    fi
+  fi
+done
+
+# ⛔ (s) AND `+` MUST NOT BE ESCAPED (#3235 review, P3, measured): GitHub documents it as "one or more
+# of the preceding character", which is exactly a regex `+`, so escaping it refused the VALID filter
+# `ma+in` — a false block in the very matcher that exists to catch a never-firing lane.
+awk 'BEGIN { done = 0 }
+     /^    branches: \[main, .integration\/\*\*.?\]$/ && !done {
+       print "    branches: [ma+in, " sprintf("%c", 39) "integration/**" sprintf("%c", 39) "]"; done = 1; next }
+     { print }' "$MAIN" >"$TMP/ci-main-pushplus.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-pushplus.yml"; then
+  fail "the '+'-glob control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-pushplus.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: 'ma+in' is a valid filter that matches main and is accepted (no false block)"
+  else
+    fail "the valid filter 'ma+in' was refused (rc $RC — want 0): $OUT"
+  fi
+fi
+
+# ⛔ (t) `$ {{ … }}` IS NOT AN EXPRESSION (#3235 review, P3, measured). Squashing ALL whitespace made
+# `$ {{ matrix.shard }}` pass the exact-expression test, although GitHub does not recognise it — the
+# runner receives the literal text. Bounded (the runner still refuses at runtime) but the guard was
+# certifying a slice expression that cannot evaluate per-arm. Only whitespace INSIDE the braces is
+# insignificant.
+sed 's|\${{ matrix.shard }}|$ {{ matrix.shard }}|' "$MAIN" >"$TMP/ci-main-dollarsplit.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-dollarsplit.yml"; then
+  fail "the '$ {{' mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-dollarsplit.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF 'the NUMERATOR must be exactly' <<<"$OUT"; then
+    pass "'\''$ {{ matrix.shard }}'\'' is refused (it is not an expression, only whitespace inside the braces is)"
+  else
+    fail "a '$ {{' expression returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (u) `defaults.run.working-directory: .` IS THE IDENTITY (#3235 review, P3, measured) — it resolves
+# to the same directory GitHub would use anyway, so the blanket `working-directory` refusal made it a
+# FALSE BLOCK with no rewrite behind it. The real rewrite (`tests`) stays refused (arm (n)).
+{ printf 'defaults:\n  run:\n    working-directory: .\n'; cat "$MAIN"; } >"$TMP/ci-main-wdirdot.yml"
+guard_rc "$TMP/ci-main-wdirdot.yml" "$PR"
+if [ "$RC" -eq 0 ]; then
+  pass "control: defaults.run.working-directory '.' is the identity and is accepted (no false block)"
+else
+  fail "'working-directory: .' was refused (rc $RC — want 0): $OUT"
 fi
 
 # ROOT-CAUSE PIN. The guard refusing the polluted document does not prove the PARSER is fixed —

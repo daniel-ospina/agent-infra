@@ -151,10 +151,10 @@ function logicalLines(runValue) {
  *
  * ⚠️ DECLARED OVER-BLOCK (category B, accepted): a guard step that runs the call inside a multi-line
  * script (`set -e` on line 1, the call on line 2) is now REFUSED, although it would execute. The
- * remedy is a second step, and the refusal says so. That direction is a loud false block; the other
- * direction was a silent false PASS, which is the class this whole file exists to refuse. An ABSOLUTE
- * path (`/repo/scripts/…`, `$PWD/scripts/…`) is refused for the same reason — it is not a value this
- * guard can certify, because the string alone cannot say which tree it lands in.
+ * remedy is to put the guard on its own step. An ABSOLUTE path (`/repo/scripts/…`, `$PWD/scripts/…`)
+ * and a `..`-containing path are refused for the same reason — the string alone cannot say which tree
+ * it lands in — and their remedy is the repo-relative spelling. Both directions are a loud false
+ * block; the direction that was open was a silent false PASS, which is the class this file refuses.
  */
 function exactlyInvokes(job, canonical) {
   return (job.steps || []).some((s) => {
@@ -195,7 +195,13 @@ function checkSliceValue(label, file, id, where, v) {
   // substring bug on the denominator side is `${{ strategy.job-total && 8 }}`. Whitespace inside the
   // expression is insignificant, so it is normalised; nothing else is.
   const parts = v.split("/");
-  const squash = (s) => String(s).replace(/\s+/g, "");
+  // ⛔ EXACT EXPRESSIONS, MATCHED AS EXPRESSIONS — not by squashing ALL whitespace (#3235 review,
+  // P3, measured). `$ {{ matrix.shard }}` squashes to `${{matrix.shard}}` and passed, although GitHub
+  // does not recognise it: the runner receives the literal text and refuses at runtime, so the hole
+  // was bounded, but the guard was certifying a slice expression that cannot evaluate per-arm. The
+  // only whitespace that is insignificant is the whitespace INSIDE the braces.
+  const NUM_RE = /^\s*\$\{\{\s*matrix\.shard\s*\}\}\s*$/;
+  const DEN_RE = /^\s*\$\{\{\s*strategy\.job-total\s*\}\}\s*$/;
   if (parts.length !== 2) {
     refuse(
       `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
@@ -203,16 +209,16 @@ function checkSliceValue(label, file, id, where, v) {
       )} — it must be exactly '<index>/<count>' built from '\${{ matrix.shard }}/\${{ strategy.job-total }}'; exiting 2`
     );
   }
-  const numerator = squash(parts[0]);
-  const denominator = squash(parts[1]);
-  if (denominator !== "${{strategy.job-total}}") {
+  const numerator = parts[0];
+  const denominator = parts[1];
+  if (!DEN_RE.test(denominator)) {
     refuse(
       `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
         v
       )} — the denominator must be exactly '\${{ strategy.job-total }}', GitHub's own count of this matrix, or a widened/narrowed matrix leaves slices NO arm runs while every arm still passes its own set assertion; exiting 2`
     );
   }
-  if (numerator !== "${{matrix.shard}}") {
+  if (!NUM_RE.test(numerator)) {
     refuse(
       `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
         v
@@ -278,7 +284,9 @@ function deepForbiddenKeys(node, path, out) {
       out.push(`${path}.${k}`);
     }
     if (k === "working-directory" && /\.defaults\.run$/.test(path)) {
-      out.push(`${path}.${k}`);
+      // `.` is the identity: it resolves to the same directory GitHub would use anyway, so refusing
+      // it would be a false block with no rewrite behind it (#3235 review, P3, measured).
+      if (String(v).trim() !== "." && String(v).trim() !== "./") out.push(`${path}.${k}`);
     }
     deepForbiddenKeys(v, `${path}.${k}`, out);
   }
@@ -359,19 +367,48 @@ function checkLane(label, workflowFile, jobName) {
       );
     }
     const pushValue = on && typeof on === "object" && !Array.isArray(on) ? on.push : null;
+    // ⛔ AN ALLOWLIST, NOT A KEY-BY-KEY ENUMERATION (#3235 review, P2, measured). Resolving only
+    // `branches:` accepted four spellings that make the lane unable to fire for `main` —
+    // `branches-ignore: ['**']`, `branches: ['**', '!main']`, `paths: ['docs/**']`,
+    // `paths-ignore: ['**']` — all at rc 0. The PR lane already recorded the lesson one screen up
+    // ("Refusing the value wholesale also retires the key-by-key enumeration"); the push lane cannot
+    // refuse its whole value, since `branches:` is legitimate, so it accepts ONLY that one key. Any
+    // key GitHub adds later is refused by default instead of silently escaping the arm.
+    if (pushValue && typeof pushValue === "object" && !Array.isArray(pushValue)) {
+      const extra = Object.keys(pushValue).filter((k) => k !== "branches");
+      if (extra.length > 0) {
+        refuse(
+          `${file} filters its 'push:' trigger with [${extra.join(
+            " "
+          )}] — those can stop this lane running for a push to 'main' while its parity assertion stays green (and a key this guard does not enumerate would be worse, so none is accepted); only 'branches:' is allowed here, exiting 2`
+        );
+      }
+    }
     const branches =
       pushValue && typeof pushValue === "object" && !Array.isArray(pushValue) ? pushValue.branches : undefined;
     if (Array.isArray(branches) && branches.length > 0) {
+      // A `!` entry is NEGATION: `branches: ['**', '!main']` matches everything EXCEPT main, i.e. the
+      // documented spelling for "never runs for the branch this lane gates".
+      const negated = branches.filter((b) => String(b).trim().startsWith("!"));
+      if (negated.length > 0) {
+        refuse(
+          `${file} negates branches [${negated.join(
+            ", "
+          )}] in its 'push:' filter — a '!main' entry EXCLUDES the branch this lane gates, so the lane would never run while its parity assertion stays green; exiting 2`
+        );
+      }
       // GitHub's `*` does not cross `/` and `**` does; that is the whole of the semantics modelled
       // here, and it is the minimum needed to answer "could this filter ever fire for 'main'"
-      // without enumerating filter keys.
+      // without enumerating filter keys. `+` is deliberately NOT escaped: GitHub documents it as
+      // "one or more of the preceding character", which is exactly what a regex `+` is, so escaping
+      // it refused the valid filter `ma+in` (#3235 review, P3, measured).
       const matchesMain = (pattern) => {
         const p = String(pattern).trim();
         if (p === "") return false;
         const re = new RegExp(
           "^" +
             p
-              .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+              .replace(/[.^${}()|[\]\\]/g, "\\$&")
               .replace(/\*\*/g, "\u0000")
               .replace(/\*/g, "[^/]*")
               .replace(/\u0000/g, ".*") +
@@ -455,7 +492,7 @@ function checkLane(label, workflowFile, jobName) {
       );
       refuse(
         mentioned
-          ? `${label}: ${file} calls ${RUNNER} but NO step invokes the lane-parity guard as its OWN COMMAND \`bash scripts/check-ci-lane-parity.sh\` — a job mentions it, but inside a larger script, a heredoc, a comment or a conditional, and only a bare call's exit code is the step's. Put the guard on its OWN STEP; exiting 2`
+          ? `${label}: ${file} calls ${RUNNER} but NO step invokes the lane-parity guard as the bare call \`bash scripts/check-ci-lane-parity.sh\` — a job mentions it, but NOT as that value: either it sits inside a larger script, a heredoc, a comment or a conditional, or the path differs from the canonical repo-relative one (an absolute or '..'-containing path is a declared over-block). Both remedies are the same: the guard on its OWN STEP, using the repo-relative path; exiting 2`
           : `${label}: ${file} calls ${RUNNER} but NO job runs the lane-parity guard itself (\`check-ci-lane-parity\`) — the gate is not running on the lane it guards, and every other assertion in this file would stay green; exiting 2`
       );
     }
