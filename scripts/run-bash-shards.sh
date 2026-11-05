@@ -916,10 +916,13 @@ shard_kill_group() {
 # ⚠️ STATED RESIDUAL: the `kill -0` / `ps -o stat=` reads in `shard_watchdog` also name the WRAPPER. It
 # proxies the shard faithfully (it exits when its foreground child does, and is then this driver's zombie
 # until `wait` reaps it, which is the `Z*` case the bound already handles), but between the shard's exit
-# and the wrapper's own is a short window where the read is `S` — so a shard finishing at the very
-# instant of the bound can be named a TIMEOUT. It is cosmetic (the rc is still the shard's and the group
-# is already gone); restoring exact pid identity would mean inlining the `env -u` at the `&` site, which
-# moves the string the three ci-lane-parity mutants pin — the P0 this branch already had to repair once.
+# and the wrapper's own is a short window where the read is `S`. ⛔ WHAT THAT COSTS, stated honestly: the
+# watchdog then writes the timeout marker, and the marker branch below DISCARDS `shard_bg_rc`, prints
+# `⏱ SHARD TIMEOUT` and returns 124 — so a shard that finished in time is reported as a TIMEOUT and the
+# run goes RED. It is a FALSE-RED RACE, not a false pass and not cosmetic (a plausible first draft said
+# "cosmetic" because the rc was assumed intact; it is not on that path). Restoring exact pid identity
+# would mean inlining the `env -u` at the `&` site, which moves the string the three ci-lane-parity
+# mutants pin — the P0 this branch already had to repair once.
 shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"; }
 
 shard_run_bounded() {
