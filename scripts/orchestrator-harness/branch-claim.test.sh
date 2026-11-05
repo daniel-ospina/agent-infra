@@ -279,8 +279,8 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # `if grep -qE '…' ; then bad …; else ok …; fi`, which reports PASS for ANY non-zero grep status —
 # exit 2 (unreadable operand) included — and used `\b`, a GNU/BSD extension rather than POSIX ERE.
 # A guard that cannot answer must not read as clean, so the three outcomes are separated here.
-# ⛔ AND IT MUST NOT BE A SPELLING (review round 7, P1 + P2). Round 6's pattern terminated the knob
-# name with `([ )]|$)` — space, `)` or EOL — so the LEAST creative respelling, a SLASH, walked
+# ⛔ AND IT MUST NOT BE A SPELLING (review round 7, P1 + P2). The pattern as it stood terminated the
+# knob name with `([ )]|$)` — space, `)` or EOL — so the LEAST creative respelling, a SLASH, walked
 # straight through it: the exact former message `ceiling (CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s)`
 # printed `ok`, and so did a hybrid carrying both a wrong clause and the right one. Widening the
 # delimiter class only moves the same problem one respelling along. So this arm asserts the
@@ -290,8 +290,17 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # ⛔ AND IT IS NON-VACUOUS (round 7, P2): `grep` returns 1 both for "found nothing" and "read
 # nothing", so an EMPTY message used to satisfy "does not name another knob". Here an absent clause
 # is its own outcome and it is RED, not green.
+# ⛔ AND THE CLAUSE IS NOT THE WHOLE MESSAGE (round 8, P2 — the round-7 review MEASURED this hole
+# rather than assuming it). Guarding only the parenthetical still passed a message that put the wrong
+# ceiling OUTSIDE it: "… ceiling (14400s) — clamped. The ceiling is CLAIM_ISSUE_TTL. Raise the ceiling
+# for that keying (CLAIM_TTL_MAX / CLAIM_ISSUE_TTL / CLAIM_BRANCH_TTL) …" ran 43 passed, 0 failed. The
+# misdirection is what the arm exists to catch, and the parentheses are not where a fixer's eye lands.
+# So the property covers the message: a `CLAIM_` name may appear ONLY in the candidate list — nothing
+# before the literal "Raise the ceiling for that keying (" may name a knob at all. If that sentence is
+# ever reworded the arm reddens (fail-CLOSED: a contract the test does not recognise is not a pass).
 CLAUSE_REPORT="$(awk '
-  { s = $0
+  { msg = $0
+    s = msg
     while ((i = index(s, "ceiling (")) > 0) {
       s = substr(s, i + 9)
       j = index(s, ")")
@@ -300,19 +309,24 @@ CLAUSE_REPORT="$(awk '
       c = substr(s, 1, j - 1)
       if (c ~ /CLAIM_/) named = c
       s = substr(s, j + 1)
-    } }
+    }
+    p = index(msg, "Raise the ceiling for that keying (")
+    head = (p > 0) ? substr(msg, 1, p - 1) : msg
+    if (head ~ /CLAIM_/) outside = head }
   END {
     if (unterminated) print "UNTERMINATED"
     else if (n == 0) print "ABSENT"
     else if (named != "") print "NAMES " named
+    else if (outside != "") print "BEFORE-LIST " outside
     else print "OK " n
   }
 ' "$T/acq.out" 2>/dev/null)"
 case "$CLAUSE_REPORT" in
-  "OK "*) ok "the ceiling clause states this keying's value and names no keying knob" ;;
+  "OK "*) ok "the clamp warning states this keying's value and names a keying knob only in the candidate list" ;;
   ABSENT) bad "the clamp warning carries no 'ceiling ( … )' clause to evaluate — an empty or absent clause must not read as clean: $(cat "$T/acq.out")" ;;
   UNTERMINATED) bad "the clamp warning's 'ceiling (' clause is unterminated — the property cannot be evaluated: $(cat "$T/acq.out")" ;;
   "NAMES "*) bad "the clamp warning names a keying knob AS this ceiling inside 'ceiling ( … )': ${CLAUSE_REPORT#NAMES }" ;;
+  "BEFORE-LIST "*) bad "the clamp warning names a keying knob as the ceiling OUTSIDE the candidate list: ${CLAUSE_REPORT#BEFORE-LIST }" ;;
   *) bad "the not-another-knob guard could not evaluate the property (awk said '${CLAUSE_REPORT}') — unreadable operand must not read as clean" ;;
 esac
 # ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2). The arm above measures the STAMPED

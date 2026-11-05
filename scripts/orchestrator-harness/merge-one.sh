@@ -1237,23 +1237,30 @@ REV_STARTED=1
 # Nothing warns when a reviewer is censored at 1800 s; that is a KNOWN gap recorded here rather than a
 # claim about a warning nobody emits.
 #
-# It is not fixed here because the bound is not free to raise ALONE: `CLAIM_LEASE=$(( REVIEW_TIMEOUT +
-# 1200 ))` below, and `claims.sh` CLAMPS any lease above that keying's ceiling — `CLAIM_TTL_MAX`, 9600
-# — so the largest reviewer bound whose claim is NOT clamped is `9600 - 1200` = 8400 s. Raising
-# REVIEW_TIMEOUT past 8400 would give a reviewer still running while its claim, clamped to 9600,
-# expires — a second lane free to take the claim mid-review, which is the exact silent-park `claims.sh`
-# guards against.
-# ⛔ CORRECTION (review round 7, P2 — VERIFIED): this block used to read `CLAIM_TTL_MAX - 1200` =
-# **6000** s, and to conclude that the 7200 s backstop "would produce a 7200 s reviewer holding a claim
-# that expires at 6000". That arithmetic is from when `CLAIM_TTL_MAX` was 7200; #2999 raised it to
-# 9600 and left this sentence behind, so the conclusion was false on both of its numbers: the clamp
-# threshold is 8400, and a 7200 s bound yields an 8400 s lease which is NOT clamped at all. It is the
-# same stale-9600 arithmetic this PR corrects in `claims.sh` and its README, in the third place it was
-# live. What is actually true now: the 7200 s backstop is INSIDE the headroom (8400 ≤ 9600), so the
-# clamp is no longer the reason this bound stays at 1800 — raising it is simply a change nobody has
-# made. The two numbers are still one decision (raise `CLAIM_TTL_MAX` with the reviewer bound, in one
-# change, with `claim-orphan.test.sh` re-derived), because a bound above 8400 reintroduces the clamp.
-# Tracked on agent-infra#2888 (comment), not as a peer issue: same root cause, different call site.
+# It is not fixed here because the bound is not free to raise ALONE. `CLAIM_LEASE` is
+# `$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))` at :364 ABOVE this block — `_gw` is the gate wait,
+# default 900 s (30 × 30) but a box may set it up to 86400 — and `claims.sh` CLAMPS any lease ABOVE
+# that keying's ceiling `CLAIM_TTL_MAX` (9600); `_claim_acquire_at`'s test at claims.sh:1151 is a
+# STRICT `-gt`. So the reviewer bound stays un-clamped only while
+# `REVIEW_TIMEOUT + _gw + 300 <= 9600` — 8400 s at the default 900 s gate wait, but only 5700 s on a
+# box running `GATE_POLL_SECS=60`, which is the point of sizing from the EFFECTIVE wait (see:60 above).
+# Past that threshold the lease is pinned at 9600 and the clamp erodes the post-review headroom,
+# reaching ZERO at `REVIEW_TIMEOUT` = 9600; only ABOVE 9600 does the claim actually expire under a
+# reviewer that is still running — a second lane free to take the claim mid-review, which is the
+# exact silent-park `claims.sh` guards against.
+# ⛔ CORRECTION (review round 7, P2 — re-verified against claims.sh:1151 and merge-one.sh:364): this
+# block used to read `CLAIM_TTL_MAX - 1200` = **6000** s, and to conclude that the 7200 s backstop
+# "would produce a 7200 s reviewer holding a claim that expires at 6000". That arithmetic is from when
+# `CLAIM_TTL_MAX` was 7200; #2999 raised it to 9600, so the threshold is 8400 at the default gate wait
+# and the conclusion was false on both of its numbers — a 7200 s bound yields an 8400 s lease, which
+# is NOT clamped at all. It is the same stale-9600 arithmetic this PR corrects in `claims.sh` and its
+# README, in the third place it was live. What is true now: the 7200 s backstop is INSIDE the
+# headroom at the default gate wait (8400 <= 9600), so the clamp is no longer the reason this bound
+# stays at 1800 — raising it is simply a change nobody has made. The two numbers are still one
+# decision (raise `CLAIM_TTL_MAX` with the reviewer bound, in one change, with `claim-orphan.test.sh`
+# re-derived), because a bound past the threshold pins the lease at 9600 and spends the merge
+# headroom. Tracked on agent-infra#2888 (comment), not as a peer issue: same root cause, different
+# call site.
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
 AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN

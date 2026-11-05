@@ -1161,8 +1161,13 @@ _claim_acquire_at() {
     # misdirection this block's own prose correction exists to remove. What the message now does: it
     # states the CEILING VALUE inside `ceiling ( … )` and nothing else, then lists the three ceiling
     # variables as CANDIDATES for "raise the ceiling for that keying". No caller names its variable —
-    # `_claim_acquire_at` receives only `ref/ttl/dflt/max` (claims.sh:836, 1079, 1088, 1098) — so the
-    # list is a literal here, and the assertions that pin it live in `branch-claim.test.sh` case 10.
+    # `_claim_acquire_at` receives only `ref/ttl/dflt/max` — so the list is a literal here, and the
+    # assertions that pin it live in `branch-claim.test.sh` case 10. ⛔ AND THE CALL SITES ARE NAMED,
+    # NOT NUMBERED (review round 7, P2): this comment used to cite line numbers
+    # (836/1079/1088/1098), which were exact at fe99acb92 and became WRONG the moment round 7
+    # inserted two lines above them — stale references shipped by the very commit that exists to
+    # remove stale references. The four callers are `claim_branch_acquire`, `claim_acquire`,
+    # `claim_issue_acquire` and `claim_pr_acquire`, in that order; names cannot rot.
     printf '[claims] lease ttl %ss exceeds this keying ceiling (%ss) — clamped. Raise the ceiling for that keying (CLAIM_TTL_MAX / CLAIM_ISSUE_TTL / CLAIM_BRANCH_TTL) if its timeout was raised (agent-infra#2094).\n' \
       "$ttl" "$max" >&2
     ttl="$max"
