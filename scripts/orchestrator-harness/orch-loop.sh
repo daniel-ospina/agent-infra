@@ -765,7 +765,7 @@ done
 # found` on the controller's stderr, and a line that over-reports ineligibility rather than certifying
 # a fleet. What this gate exists to stop is the SILENT false pass, and that is what the names below
 # cover.
-if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars cap_fleet_line_from cap_expected_src cap_expected_boxes cap_fleet_inventory cap_cmux_bin cap_parse_inventory >/dev/null 2>&1; then CAPACITY=1; else
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars cap_fleet_line_from cap_chan_of cap_expected_src cap_expected_boxes cap_fleet_inventory cap_cmux_bin cap_parse_inventory >/dev/null 2>&1; then CAPACITY=1; else
   CAPACITY=0
   [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars/cap_fleet_line_from/cap_expected_src/cap_expected_boxes/cap_fleet_inventory/cap_cmux_bin/cap_parse_inventory) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, this box publishes NOTHING to peers, and nothing reconciles EXPECTED against PUBLISHED (the #3446 fleet line is not emitted, so a dead box reads the same as a full one)\n' >> "$LOG" 2>/dev/null || true
 fi
@@ -3528,7 +3528,8 @@ while true; do
     # builtins-only); this arm already forks freely through `disk_floor_gate`.
     if [ "${CAPACITY:-0}" = "1" ]; then
       CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
-      echo "[capacity] $(cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
+      CAP_CHAN_V="$(cap_chan_of "$REPO")"
+      echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
     fi
     fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
     continue
@@ -5734,7 +5735,8 @@ PY
       # side only if the channel itself is unreadable, which `cap_fleet_line_from "" 2` would say). Here
       # the channel is READ, and this box's own missing record simply does not count as published.
       CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
-      echo "[capacity] $(cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
+      CAP_CHAN_V="$(cap_chan_of "$REPO")"
+      echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
       # ⛔ THE ONE PATH THAT DOES NOT TAKE IT IS THE FORK-EXHAUSTED ONE ABOVE, deliberately: every step
       # of `cap_fleet_line_from` forks (`date`, `cmux`, `git`), and that arm is built from BUILTINS ONLY
       # because a failed fork terminates the shell (see FORK HEADROOM). A fork-starved box therefore
@@ -5762,7 +5764,8 @@ PY
       # `expected=0`, and never `published=0` for a read that failed. `CAP_FLEET_RC` is passed in so an
       # unreadable channel says `published=UNREADABLE`; a `published=0` here would be a false claim of a
       # quiet fleet of one. (The fork-exhausted cycle above does not take it — builtins only, see there.)
-      echo "[capacity] $(cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
+      CAP_CHAN_V="$(cap_chan_of "$REPO")"
+      echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
       # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.
       CAP_VERDICT="$(printf '%s\n' "${CAP_FLEET:-}" "$CAP_REC" | cap_place "$(cap_host)")" || true
       case "${CAP_VERDICT:-}" in

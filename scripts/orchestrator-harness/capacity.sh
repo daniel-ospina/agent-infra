@@ -922,7 +922,7 @@ cap_lpc_human() { awk -v x="${1:-0}" 'BEGIN{printf "%.2f", x/100}'; }
 # The order is fixed so a refusal names a STABLE reason for a given fleet state, and it is
 # FORK -> DISK -> LOAD -> MEMORY (see the FORK HEADROOM header for why this order and not another).
 cap_bound_hit() {
-  local r="${1:-}" now="${2:-}" at age lpc disk mem forkb boxb
+  local r="${1:-}" now="${2:-}" at age lpc disk mem forkb boxb _ttl
   cap_valid_base_record "$r" || { printf 'probe_unreadable'; return 0; }
   at="$(cap_kv "$r" at)"
   # ⛔ `at` IS CHANNEL-CONTROLLED AND `08` IS NOT ZERO (fresh review round 6, P1). `case ''|*[!0-9]*`
@@ -933,8 +933,16 @@ cap_bound_hit() {
   case "$at" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
   case "$now" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
   age=$(( 10#$now - 10#$at ))
+  # ⛔ THE PLACEMENT PATH REFUSES ON THE SAME TWO DATUMS THE LINE REFUSES ON (fresh review round 9, P1).
+  # An unusable TTL and a stamp beyond the window in the FUTURE are both "this record cannot be aged":
+  # unguarded, `[ "$age" -gt "15m" ]` errored and `cap_place` placed on the record — measured
+  # `place=h1 eligible=1` on bytes the line reports as `published=UNREADABLE why=ttl-unreadable`, and a
+  # broken-RTC record (`at = now + 1e8`) placed the same way. Both are `probe_unreadable`.
+  _ttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"
+  [ -n "$_ttl" ] || { printf 'probe_unreadable'; return 0; }
+  if [ "$age" -lt 0 ] && [ $(( 0 - age )) -gt "$_ttl" ]; then printf 'probe_unreadable'; return 0; fi
   [ "$age" -lt 0 ] && age=0
-  if [ "$age" -gt "$CAP_PROBE_TTL" ]; then printf 'probe_stale'; return 0; fi
+  if [ "$age" -gt "$_ttl" ]; then printf 'probe_stale'; return 0; fi
   # 0. IDENTITY — before fork, disk, load and memory, because every other bound is a statement ABOUT A
   # BOX and this read is what makes the box nameable. An unattributable record is refused here, named,
   # rather than judged on its reading.
@@ -1121,7 +1129,7 @@ cap_record_from_ref() {
 # marks and `place=cmux` — a false PASS in this detector. `ncpu` is ALWAYS compared; `boot` only when both
 # readings are known.
 cap_parse_lsremote() {
-  awk -v ns="$CAP_NS" -v now="$(cap_now)" -v ttl="$CAP_PROBE_TTL" '
+  awk -v ns="$CAP_NS" -v now="$(cap_now)" -v ttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")" '
     function rec_for(ref,   p, seg, nseg, h, bid, rest, n, f, i, lpc, r) {
       p = ref; sub("^" ns "/", "", p)
       if (p == ref) return ""                       # not in our namespace
@@ -1239,6 +1247,24 @@ cap_cmux_bin() {
 # arm every Linux cell takes and made the two arms disagree (fresh review rounds 7-8). Whole seconds,
 # 1..999999999; anything else — empty, non-numeric, zero in any spelling, out of range — is the 10 s
 # fallback, and the ONE place that decides is the same one the diagnostics print.
+# cap_ttl_secs <seam-value> -> the freshness window in seconds, or EMPTY when the seam is unusable.
+# ⛔ ONE VALIDATED TTL, CONSULTED BY EVERY READER (fresh review round 9, P1). The line validated
+# `CAP_PROBE_TTL` in three places while `cap_bound_hit` — the function that decides PLACEMENT — used it
+# raw: with `CAP_PROBE_TTL=15m` (the duration typo this file already records) the line refused
+# (`why=ttl-unreadable`) and `cap_place` PLACED on the same bytes (`place=h1 eligible=1`, plus a bash
+# error on stderr), i.e. the controller routed to a record whose age it could not compute — the dead-box-
+# reads-as-present shape this whole change exists to kill. `cap_parse_lsremote` had the third variant:
+# awk reads `15m` as 15, silently shrinking the collision window from 900 s to 15 s.
+cap_ttl_secs() {
+  local n
+  case "${1:-}" in ''|*[!0-9]*) return 0 ;; esac
+  case "$1" in 0?*) return 0 ;; esac
+  [ "${#1}" -le 10 ] || return 0
+  n=$(( 10#$1 ))
+  [ "$n" -ge 0 ] || return 0
+  printf '%s' "$n"
+}
+
 cap_bound_secs() {
   local n
   case "${1:-}" in ''|*[!0-9]*) printf '10'; return 0 ;; esac
@@ -1265,14 +1291,24 @@ cap_bounded() {
   # inheriting the pipe), and a redirect that cannot be created fails the command — a named non-zero.
   local _tmp _to _p _w _rc
   _tmp="${TMPDIR:-/tmp}/cap-bounded.$$.$RANDOM"
+  # ⛔ AND THE `timeout` ARM KILLS, NOT JUST ASKS (fresh review round 9, P1). A child that IGNORES SIGTERM
+  # ignored the bound: `timeout 1 sh -c 'trap "" TERM; sleep 10'` returned after the child's full 10 s
+  # (rc 124, so the verdict looked right) while the watchdog arm bounded the same child in 1 s — on the
+  # arm every Linux cell takes, in the function whose stated reason for existing is that the reading is
+  # taken INSIDE the drainer's tick lock. `-k` sends SIGKILL one second after the TERM, and the
+  # kill-after status (137) is normalised to the documented 124 so a refusal keeps its NAME.
   if [ "$impl" != "watchdog" ]; then
     if command -v timeout >/dev/null 2>&1; then
-      timeout "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
-      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; return "$_rc"
+      timeout -k 1 "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
+      case "$_rc" in 137) _rc=124 ;; esac
+      return "$_rc"
     fi
     if command -v gtimeout >/dev/null 2>&1; then
-      gtimeout "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
-      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; return "$_rc"
+      gtimeout -k 1 "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
+      case "$_rc" in 137) _rc=124 ;; esac
+      return "$_rc"
     fi
   fi
   # No `sleep` at all: nothing here can bound anything, so say so with a command that cannot hang by a
@@ -1523,23 +1559,14 @@ cap_fleet_line_from() {
   case "${now:-}" in
     ''|*[!0-9]*) unk_pub=1; why="${why:-clock-unreadable}" ;;
   esac
-  # ⛔ AND A TTL THE SHELL CANNOT COMPARE IS NOT "EVERY RECORD IS FRESH" (fresh review round 4, P2).
-  # `[ "$age" -gt "$CAP_PROBE_TTL" ]` with a non-numeric seam (`CAP_PROBE_TTL=15m` — a duration typo
-  # this repo has recorded before) FAILS, the stale branch is skipped, and EVERY record is counted
+  # ⛔ AND A TTL THE SHELL CANNOT COMPARE IS NOT "EVERY RECORD IS FRESH" (fresh review rounds 4, 6 and
+  # 9). `[ "$age" -gt "$CAP_PROBE_TTL" ]` with a non-numeric seam (`15m`), a numeric-but-out-of-range one
+  # (20 digits) or a leading-zero one FAILS, the stale branch is skipped, and EVERY record is counted
   # fresh: MEASURED, a 100,000,000-second-old record read `published=1 INELIGIBLE=0`, rc 0, with the
-  # only diagnostic on a stderr both emitters discard. Same shape as the clock arm above.
-  case "${CAP_PROBE_TTL:-}" in
-    ''|*[!0-9]*) unk_pub=1; why="${why:-ttl-unreadable}" ;;
-  esac
-  # …AND A NUMERIC TTL THE SHELL CANNOT COMPARE EITHER (fresh review round 6, P2): `[ "$age" -gt
-  # "$CAP_PROBE_TTL" ]` errors on 20 digits, so the stale branch never runs and every record counts
-  # fresh — the same hole the COUNT arm closes with a magnitude bound. Whole seconds, ≤ 10 digits (the
-  # bound is set well above any real window — 99999999 s is a legitimate "do not age it out" seam the
-  # suite uses — and well below the width at which the comparison stops working).
-  case "${CAP_PROBE_TTL:-}" in
-    0?*) unk_pub=1; why="${why:-ttl-unreadable}" ;;
-  esac
-  [ "${#CAP_PROBE_TTL}" -le 10 ] || { unk_pub=1; why="${why:-ttl-unreadable}"; }
+  # only diagnostic on a stderr both emitters discard. ONE predicate (`cap_ttl_secs`) decides, and
+  # `cap_bound_hit` / `cap_parse_lsremote` consult the SAME one.
+  TTL_S="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"
+  [ -n "$TTL_S" ] || { unk_pub=1; why="${why:-ttl-unreadable}"; }
 
   # THE PUBLISHED SIDE: fresh + attributable records. A record that is merely STALE is NOT published —
   # that box stopped republishing, which is exactly the state a dead controller produces.
@@ -1569,12 +1596,12 @@ cap_fleet_line_from() {
       # and clamps to 'just published'; a record dated past `now + CAP_PROBE_TTL` would otherwise be
       # certified PUBLISHED for ever (a box with a broken RTC read `published=1` and keeps reading
       # published after it dies). Refuse the reading, in the same vocabulary as the clock arm.
-      if [ "$age" -lt 0 ] && [ $(( 0 - age )) -gt "$CAP_PROBE_TTL" ]; then
+      if [ "$age" -lt 0 ] && [ $(( 0 - age )) -gt "${TTL_S:-900}" ]; then
         unk_pub=1; why="${why:-clock-skew}"; break
       fi
       [ "$age" -lt 0 ] && age=0
       case "$fresh" in *" $bid "*) continue ;; esac
-      if [ "$age" -gt "$CAP_PROBE_TTL" ]; then
+      if [ "$age" -gt "${TTL_S:-900}" ]; then
         case "$staleids" in *" $bid "*) : ;; *) staleids="$staleids$bid " ;; esac
         continue
       fi
@@ -1664,14 +1691,26 @@ EOF2
 
 # cap_fleet_line <repo> -> read the channel, then the ONE line. rc: 2 when `cap_read_fleet` could not
 # read it (the line still prints `published=UNREADABLE`), otherwise cap_fleet_line_from's rc.
+# cap_chan_of <repo> -> the attributable channel string for `chan=` (no scheme, no userinfo, no `.git`).
+# ⛔ ONE DERIVATION, USED BY EVERY EMITTER (fresh review round 9, P2): the drainer took the field and the
+# controller's three emissions did not, so the controller's `published=0` stayed unattributable — the very
+# gap `chan=` was added for. The userinfo strip is `##*@` (LONGEST match) because a password may itself
+# contain `@`: the shortest-match form left `chan=ss@host` on a line logged every tick.
+cap_chan_of() {
+  local repo="${1:-.}" _o _chan
+  _o="$(git -C "$repo" remote get-url origin 2>/dev/null)" || _o=""
+  _chan="${_o#*://}"; _chan="${_chan##*@}"; _chan="${_chan%.git}"
+  printf '%s' "${_chan:-$repo}"
+}
+
 cap_fleet_line() {
   local repo="${1:-.}" fleet rrc frc _o _chan
-  _o="$(git -C "$repo" remote get-url origin 2>/dev/null)" || _o=""
-  # ⛔ NO CREDENTIAL ON THE LINE, AND NO CARRY-OVER (fresh review round 8, P2). `https://x-access-token:…@`
-  # origins are a CI convention this repo already guards against elsewhere; printing one would write the
-  # token into the drainer's log on every tick. And a module-global leaked the LAST call's channel onto
-  # an unrelated `cap_fleet_line_from`, so the value is passed on the one command that read a repo.
-  _chan="${_o#*://}"; _chan="${_chan#*@}"; _chan="${_chan%.git}"
+  # ⛔ NO CREDENTIAL ON THE LINE, AND NO CARRY-OVER (fresh review rounds 8-9, P2). `https://x-access-
+  # token:…@` origins are a CI convention this repo already guards against elsewhere; printing one would
+  # write the token into the drainer's log on every tick. And a module-global leaked the LAST call's
+  # channel onto an unrelated `cap_fleet_line_from`, so the value is passed on the one command that read
+  # a repo (see `cap_chan_of`).
+  _chan="$(cap_chan_of "$repo")"
   fleet="$(cap_read_fleet "$repo" 2>/dev/null)"; rrc=$?
   CAP_CHAN="${_chan:-$repo}" cap_fleet_line_from "$fleet" "$rrc"; frc=$?
   [ "$rrc" -eq 0 ] || return 2

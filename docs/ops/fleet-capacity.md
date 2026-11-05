@@ -312,8 +312,18 @@ VM listing — the reconciliation is `published − extra = expected − INELIGI
   the ambient `REPO`); otherwise this drainer's own `SEED_REPO` **only when its origin IS** the
   `REPO_SLUG` the drainer already knows — the comparison the old default assumed instead of checking;
   otherwise `why=channel-unverified`. The units render `FLEET_REPO` (`install-drainer-timer.sh` →
-  `DRAINER_FLEET_REPO`, default `DRAINER_SEED_REPO`), so a deployed cell takes the middle path on a
-  fleet whose seed checkout shares the queue origin and refuses on one where it does not.
+  `DRAINER_FLEET_REPO`, default `DRAINER_SEED_REPO`), so a cell installed by `install-drainer-timer.sh`
+  takes the **first** path — the unit sets the variable explicitly — while the origin comparison protects
+  every other caller (a hand-run tick, the macOS arm, a box whose unit predates this). A cell whose
+  `DRAINER_SEED_REPO` points at a foreign repo still READS it (attributable via `chan=`), it does not
+  refuse: bounded, and stated rather than implied.
+- **One TTL predicate, consulted by BOTH readers.** `cap_bound_hit` (placement) and the line validate the
+  window through the same helper (`cap_ttl_secs`), and `cap_parse_lsremote` hands awk the VALIDATED
+  number — unvalidated, a duration typo made the line refuse while placement PLACED on the same bytes
+  (`place=h1 eligible=1`), and made awk read `15m` as **15**, silently shrinking the collision window
+  from 900 s to 15 s. A record whose age cannot be computed, or whose stamp is more than one window in
+  the FUTURE, is `probe_unreadable` to placement and `clock-skew`/`ttl-unreadable` to the line — never a
+  hidden difference between "may this box take work" and "is this box publishing".
 
 **The polarity is the point**, and it is the same rule the fleet already applies to check-runs (a
 missing check is not a green check):
@@ -355,6 +365,9 @@ was a wedge, not a slow read. A `CAP_*_TIMEOUT` is normalised NUMERICALLY — `0
 "no timeout" to GNU `timeout` while the watchdog arm treats them as an instant expiry, so every all-zero
 spelling, any non-number and anything outside 1…999999999 is the 10 s fallback, decided by ONE helper
 (`cap_bound_secs`) that the timeout DIAGNOSTICS also print (`timed out after 10s`, never `after 0s`).
+The `timeout` arm also KILLS (`-k 1`), because a child that ignores SIGTERM otherwise ran its full
+lifetime under a 1 s bound (measured: 10 s) while the watchdog arm bounded it in 1 s; the kill-after
+status is normalised to 124 so a refusal keeps its name.
 Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
 `wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
 `exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /

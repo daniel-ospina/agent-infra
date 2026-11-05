@@ -1429,15 +1429,15 @@ ck "(i) an explicit COUNT reports expected=4 and INELIGIBLE=unknown — never a 
 ck "(j) orch-loop.sh emits the line on EVERY cycle arm that has a reading (healthy, probe-unreadable, disk-held)" \
    "$([ "$(grep -cF 'cap_fleet_line_from "${CAP_FLEET:-}"' "$LOOP")" -eq 3 ] && qF 'CAP_FLEET_RC=$?' "$(cat "$LOOP")" && echo 0 || echo 1)"
 ck "  …the second emission is INSIDE the probe-unreadable branch (a box whose own probe failed still reports the fleet)" \
-   "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{exit} f && /\$\(cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
+   "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{exit} f && /cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
 # ⛔ AND THE HEALTHY-CYCLE HALF IS ASSSERTED STRUCTURALLY, NOT BY A FILE-WIDE COUNT (fresh review, P2).
 # `grep -c == 2` cannot tell the two byte-identical emissions apart: MOVING the healthy-cycle call into
 # another branch (e.g. the fork-exhausted arm, as a plausible future "fix" for that cycle going silent)
 # keeps the count at 2 and keeps the elif-arm green while the normal cycle is silent.
 ck "  …the FIRST emission is inside the healthy (else) arm — not merely counted somewhere in the file" \
-   "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{f=2; next} f==2 && /CAP_VERDICT=/{exit} f==2 && /\$\(cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
+   "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{f=2; next} f==2 && /CAP_VERDICT=/{exit} f==2 && /cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
 ck "  …and the DISK-HELD cycle reports the fleet too (a skipping cycle is not a silent one)" \
-   "$(awk '/^  if \[ "\${_df_rc:-0}" = "1" \]; then/{f=1; next} f && /^    continue$/{exit} f && /\$\(cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
+   "$(awk '/^  if \[ "\${_df_rc:-0}" = "1" \]; then/{f=1; next} f && /^    continue$/{exit} f && /cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
 ck "  …and cap_place still receives that same read (the line cannot disagree with placement about who is visible)" \
    "$(qF 'printf '"'"'%s\n'"'"' "${CAP_FLEET:-}" "$CAP_REC" | cap_place' "$(cat "$LOOP")" && echo 0 || echo 1)"
 DRAINER="$HERE/ai-drainer.sh"
@@ -1697,7 +1697,7 @@ L24N="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.
 ck "  …while a NUMERIC TTL reads the same record as stale (so the fixture is real: $L24N)" \
    "$(qF 'published=0' "$L24N" && qF 'stale=(cell-1)' "$L24N" && echo 0 || echo 1)"
 # (c2-mutant) NON-VACUITY: the pre-fix TTL arm (no validation) counts that record as PUBLISHED.
-sed 's|unk_pub=1; why="${why:-ttl-unreadable}"|:|' "$CAP" > "$TMP/cap-prettl.sh"
+sed 's|  TTL_S="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"|  TTL_S="${CAP_PROBE_TTL:-}"   # MUTANT: raw TTL|' "$CAP" > "$TMP/cap-prettl.sh"
 L24M="$(CAP_PROBE_TTL=15m CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-prettl.sh" "$(recb 10.0.0.1 "$_OLD_AT")" 2>/dev/null)"
 ck "  …mutation control: without the TTL guard the same record reads published=1 ($L24M)" \
    "$(qF 'published=1' "$L24M" && echo 0 || echo 1)"
@@ -1851,7 +1851,9 @@ ck "  …mutation control: with plain arithmetic the same record is PLACED ($(pr
 # stand-in `timeout` records the SECONDS it was handed, so the arm asserts what the bound would be
 # GIVEN rather than how long a fixture happened to sleep.
 mkdir -p "$TMP/fakebin"
-printf '%s\n' '#!/bin/sh' 'printf "%s" "$1" > "$FAKE_ARG"' 'shift' 'exec "$@"' > "$TMP/fakebin/timeout"
+# Records the DURATION, whatever flags precede it (`-k 1 10 cmd` → 10): the arm grades the bound the
+# command would actually be given.
+printf '%s\n' '#!/bin/sh' 'prev=""' 'for a in "$@"; do [ "$a" = "-k" ] && { prev=k; continue; }; if [ "$prev" = k ]; then prev=; continue; fi; printf "%s" "$a" > "$FAKE_ARG"; break; done' 'exec "$@"' > "$TMP/fakebin/timeout"
 chmod +x "$TMP/fakebin/timeout"
 FAKE_ARG="$TMP/fakebin/arg" PATH="$TMP/fakebin:$PATH" CAP_BOUND_IMPL=auto cap_bounded 0 true >/dev/null 2>&1
 _c10_arg="$(cat "$TMP/fakebin/arg" 2>/dev/null)"
@@ -1872,6 +1874,69 @@ FAKE_ARG="$TMP/fakebin/arg" PATH="$TMP/fakebin:$PATH" CAP_BOUND_IMPL=auto bash -
 _c10m="$(cat "$TMP/fakebin/arg" 2>/dev/null)"
 ck "  …mutation control: without the normalisation timeout is handed '${_c10m:-<none>}'" \
    "$([ "${_c10m:-}" = "00" ] && echo 0 || echo 1)"
+# (c11) ⛔ THE PLACEMENT PATH REFUSES ON THE SAME TWO DATUMS THE LINE REFUSES ON (fresh review round 9,
+# P1). `cap_bound_hit` used `CAP_PROBE_TTL` raw, so with a duration typo the LINE said
+# `published=UNREADABLE why=ttl-unreadable` while `cap_place` PLACED on the same bytes
+# (`place=h1 eligible=1`) — the controller then routed to a record whose age it could not compute, which
+# is the dead-box-reads-as-present shape this change exists to kill.
+_OLD3="$(recb 10.0.0.1 "$(( NOW - 100000000 ))")"
+L32="$(CAP_PROBE_TTL=15m CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$_OLD3" 0)"; RC=$?
+L32P="$(printf '%s\n' "$_OLD3" | CAP_PROBE_TTL=15m cap_place cmux 2>/dev/null)"
+ck "(c11) an unusable TTL refuses in BOTH readers: the line ($L32) and placement ($(printf '%s' "$L32P" | head -1))" \
+   "$([ "$RC" -eq 1 ] && qF 'why=ttl-unreadable' "$L32" && qF 'refuse bound=probe_unreadable' "$L32P" && echo 0 || echo 1)"
+# (c11-mutant) NON-VACUITY: with the raw comparison back, placement PLACES on the same bytes.
+sed 's|  _ttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"|  _ttl="${CAP_PROBE_TTL:-}"   # MUTANT: raw TTL|' "$CAP" > "$TMP/cap-rawttl.sh"
+ck "  …the mutant really lost the validated TTL" "$([ "$(grep -c 'MUTANT: raw TTL' "$TMP/cap-rawttl.sh")" -eq 1 ] && echo 0 || echo 1)"
+L32M="$(printf '%s\n' "$_OLD3" | CAP_PROBE_TTL=15m bash -c '. "$1"; cap_place cmux' _ "$TMP/cap-rawttl.sh" 2>/dev/null)"
+ck "  …mutation control: with the raw TTL the same record is PLACED ($(printf '%s' "$L32M" | head -1))" \
+   "$(printf '%s' "$L32M" | grep -q '^place=' && echo 0 || echo 1)"
+# (c12) ⛔ AND A BROKEN RTC, in the same both-readers shape: `at = now + 1e8` must not be PLACED.
+_FUT3="$(recb 10.0.0.1 "$(( NOW + 100000000 ))")"
+L33="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$_FUT3" 0)"; RC=$?
+L33P="$(printf '%s\n' "$_FUT3" | cap_place cmux 2>/dev/null)"
+ck "(c12) a broken RTC refuses in BOTH readers: the line says why=clock-skew and placement refuses" \
+   "$([ "$RC" -eq 1 ] && qF 'why=clock-skew' "$L33" && qF 'refuse bound=probe_unreadable' "$L33P" && echo 0 || echo 1)"
+L33C="$(printf '%s\n' "$(recb 10.0.0.1 "$NOW")" | cap_place cmux 2>/dev/null)"
+ck "  …while a readable stamp PLACES (so (c12) is not a blanket refusal: $(printf '%s' "$L33C" | head -1))" \
+   "$(printf '%s' "$L33C" | grep -q '^place=' && echo 0 || echo 1)"
+# (c13) ⛔ THE `timeout` ARM MUST KILL, NOT JUST ASK (fresh review round 9, P1). A child that ignores
+# SIGTERM defeated the bound: `timeout 1 sh -c 'trap "" TERM; sleep 10'` returned after 10 s while the
+# watchdog arm bounded the same child in 1 s — on the arm every Linux cell takes, in the function whose
+# reason for existing is that the reading is taken INSIDE the drainer's tick lock. `-k 1` now escalates.
+printf '%s\n' '#!/bin/bash' 'trap "" TERM' 'sleep 10' > "$TMP/term-ignorer.sh"; chmod +x "$TMP/term-ignorer.sh"
+_c13_0="$(date +%s)"; CAP_BOUND_IMPL=auto cap_bounded 1 "$TMP/term-ignorer.sh" >/dev/null 2>&1; _c13_rc=$?
+_c13_1="$(date +%s)"; _c13_d=$(( _c13_1 - _c13_0 ))
+ck "(c13) a TERM-ignoring child is still bounded (${_c13_d}s, rc=$_c13_rc — the verdict keeps its NAME)" \
+   "$([ "$_c13_d" -lt 5 ] && [ "$_c13_rc" -eq 124 ] && echo 0 || echo 1)"
+# (c13-mutant) NON-VACUITY: without `-k` the same child runs its full lifetime.
+sed 's|      timeout -k 1 "$s" "$@"|      timeout "$s" "$@"   # MUTANT: no kill-after|' "$CAP" > "$TMP/cap-nokill.sh"
+ck "  …the mutant really lost the kill-after" "$([ "$(grep -c 'MUTANT: no kill-after' "$TMP/cap-nokill.sh")" -eq 1 ] && echo 0 || echo 1)"
+_c13b_0="$(date +%s)"
+CAP_BOUND_IMPL=auto bash -c '. "$1"; cap_bounded 1 "$2"' _ "$TMP/cap-nokill.sh" "$TMP/term-ignorer.sh" >/dev/null 2>&1
+_c13b_1="$(date +%s)"; _c13b_d=$(( _c13b_1 - _c13b_0 ))
+ck "  …mutation control: without it the child runs ${_c13b_d}s (so (c13) is load-bearing)" \
+   "$([ "$_c13b_d" -ge 5 ] && echo 0 || echo 1)"
+# (c14) ⛔ `chan=` CARRIES NO CREDENTIAL AND NO CARRY-OVER (fresh review rounds 8-9, P2). The origin is a
+# CI convention (`https://x-access-token:…@`), and a password may itself contain `@`; and a module-global
+# leaked the LAST call's channel onto an unrelated `cap_fleet_line_from`.
+_C14R="$TMP/chanrepo"; git init -q "$_C14R" 2>/dev/null
+git -C "$_C14R" remote add origin 'https://user:p@ss@github.com/daniel-ospina/agent-infra.git' 2>/dev/null
+L34="$(cap_fleet_line "$_C14R" 2>/dev/null)"
+ck "(c14) chan= carries the host, never the userinfo ($(printf '%s' "$L34" | grep -o 'chan=[^ ]*'))" \
+   "$(qF 'chan=github.com/daniel-ospina/agent-infra' "$L34" && ! printf '%s' "$L34" | grep -qE 'chan=[^ ]*(@|token|p@ss)' && echo 0 || echo 1)"
+L34B="$(cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
+ck "  …and an unrelated direct call carries NO chan (no carry-over: $(printf '%s' "$L34B" | grep -c 'chan=') occurrence(s))" \
+   "$(! printf '%s' "$L34B" | grep -q 'chan=' && echo 0 || echo 1)"
+sed 's|##\*@|#*@   # MUTANT: shortest @|' "$CAP" > "$TMP/cap-chanweak.sh"
+ck "  …the mutant really lost the longest-@ strip" "$([ "$(grep -c 'MUTANT: shortest @' "$TMP/cap-chanweak.sh")" -ge 1 ] && echo 0 || echo 1)"
+L34M="$(bash -c '. "$1"; cap_chan_of "$2"' _ "$TMP/cap-chanweak.sh" "$_C14R" 2>/dev/null)"
+ck "  …mutation control: with the shortest match the line would carry '${L34M}' (a secret fragment)" \
+   "$(printf '%s' "$L34M" | grep -qE 'ss@|p@ss' && echo 0 || echo 1)"
+# (c15) ⛔ A REFUSAL NAMES THE BOUND IT HIT, NOT THE SEAM AS TYPED (fresh review round 9, P2): with
+# `CAP_INVENTORY_TIMEOUT=00` the message said `timed out after 00s` after waiting 10 s.
+L35="$(CAP_INVENTORY_TIMEOUT=00 CAP_CMUX_LIST="sleep 12" cap_fleet_inventory 2>&1 | head -1)"
+ck "(c15) the timeout diagnostic names the APPLIED bound ($L35)" \
+   "$(qF 'timed out after 10s' "$L35" && ! printf '%s' "$L35" | grep -q 'after 00s' && echo 0 || echo 1)"
 # (c7) ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
 # expected-side dedupe is right for a roster row and wrong for the provider inventory, where the key is
 # `network.ipv4`: 5 running machines with pi-cell-2 reusing the address of pi-cell-1 read
@@ -1899,7 +1964,7 @@ L30="$(CAP_PROBE_TTL=99999999999999999999 CAP_EXPECTED_BOXES="cell-1:10.0.0.1" c
 ck "(c8) an out-of-range TTL refuses the reading, never certifies it ($L30)" \
    "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L30" && qF 'why=ttl-unreadable' "$L30" && echo 0 || echo 1)"
 # (c8-mutant) NON-VACUITY: without the magnitude bound the same TTL counts the old record as published.
-sed 's|\[ "${#CAP_PROBE_TTL}" -le 10 \] \|\| { unk_pub=1; why="${why:-ttl-unreadable}"; }|[ 1 -eq 1 ]   # MUTANT: no TTL magnitude bound|' "$CAP" > "$TMP/cap-ttlrange.sh"
+sed 's|  \[ "${#1}" -le 10 \] \|\| return 0|  :   # MUTANT: no TTL magnitude bound|' "$CAP" > "$TMP/cap-ttlrange.sh"
 ck "  …the mutant really lost the TTL magnitude bound" "$([ "$(grep -c 'MUTANT: no TTL magnitude bound' "$TMP/cap-ttlrange.sh")" -eq 1 ] && echo 0 || echo 1)"
 L30M="$(CAP_PROBE_TTL=99999999999999999999 CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-ttlrange.sh" "$(recb 10.0.0.1 "$_OLD_AT")" 2>/dev/null)"
 ck "  …mutation control: without the bound the same TTL reads the old record as published ($L30M)" \
