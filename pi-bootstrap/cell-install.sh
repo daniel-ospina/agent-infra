@@ -315,7 +315,15 @@ denied_extension_copies() { # <agent-dir>
   for d in "${DENY_EXTENSIONS[@]}"; do
     stem="$(denied_extension_stem "$d")"
     for f in "$dir/$stem"*; do
+      # ⛔ TWO CLAUSES, because the deny has two subjects.
+      # (1) THE DENIED ENTRY ITSELF, at its own name, however it currently resolves. `-e` follows a
+      # symlink, so `-L` is what catches a DANGLING link at exactly this path — and a dangling link
+      # must still be removed/refused even though pi would not load it TODAY: it is the deny path, it
+      # costs one `ln -sf` to become a loaded extension again, and the install half removing it is
+      # what keeps verify from looping (refuse -> install-that-cannot-repair -> refuse forever).
       { [ -e "$f" ] || [ -L "$f" ]; } || continue
+      if denied_extension "$(basename "$f")"; then printf '%s\n' "$f"; continue; fi
+      # (2) ANY OTHER COPY pi would LOAD — the suffixed/dir shapes an exact-name deny cannot see.
       loadable_extension_entry "$f" || continue
       printf '%s\n' "$f"
     done
