@@ -191,14 +191,16 @@ def lane_census(alive, dead, pi_count, roster_size):
     contradicted); or every lane conclusive over a MEASURED-EMPTY population (the population can
     CONTRADICT nothing, and no lane is live — see the argv0 note in that arm); or a MEASURED-EMPTY
     population on an inconclusive roster (a MISMATCH needs at least one pi process the roster does
-    not account for, so an empty population has nothing to object to). ⛔ THAT SILENT ARM IS
-    `pi_count == 0`, NOT `pi_count <= 0` (review cycle 18, finding 4): `None` is not a small number,
-    it is a population that WAS NOT READ, and it returns UNRECONCILED immediately above — the same
-    `None`/`0` collapse this file exists to keep apart, which the old wording reproduced in prose
-    while the code got it right. Nothing else is silent — in particular a conclusive roster that is
-    PARTLY live (`0 < alive < roster_size`) over an UNREADABLE table is UNVERIFIED, not silent (see
-    the arm below); a FULLY-live one is the first arm's exemption, which is why that arm is stated
-    as `>=` and not `==` (review cycle 21).
+    not account for, so an empty population has nothing to object to). ⛔ `None` IS NOT IN THAT ARM
+    (review cycle 18, finding 4): it is a population that WAS NOT READ, and it returns UNRECONCILED
+    immediately above — before either `pi_count <= 0` guard is reached. That ORDERING is the fix;
+    the guards' `<= 0` form is otherwise the measured-zero arm, and the producer never yields a
+    negative, so the only reachable input through it is `0`.
+    Nothing else is silent — in particular a conclusive roster that is PARTLY live
+    (`0 < alive < roster_size`) over an UNREADABLE table is UNVERIFIED, not silent (see the arm
+    below), while a FULLY-live roster is the first arm's exemption. That arm is written `>=` to also
+    cover `alive > roster_size` (`lane_census(8, 0, None, 7)` is silent), not because `==` would
+    change the fully-live cell.
 
     ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
     table cannot be read, returning None would render that state identically to `pi_count == 0`
