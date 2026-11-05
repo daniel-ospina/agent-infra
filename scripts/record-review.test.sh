@@ -6074,35 +6074,51 @@ fi
 # (f) MUTATION PIN — THE PRE-FIX CODE, EXACTLY: the guard removed AND the recorded head
 # substituted for the unread one. This is the fail-open the finding names ("silently falls back to
 # the record"), so the pin asserts the OLD answer rather than merely "something else happened".
+# ⛔ THE TWO seds ARE ASSERTED INDIVIDUALLY, AND THE LICENCE'S SOURCE IS PART OF THE PIN (fresh
+# review of 1cc874984, P2). A single `cmp` against the original cannot tell a TWO-PART mutation from
+# a one-part one, and the one-part mutant (guard removed, gate call untouched) ALSO answers
+# `carry`/0 — for a different reason: a blank sha reaches `cc_surface_gate` and the scan's EMPTY arm
+# is a PASS (#2342), which is what pin (b) covers. Measured: with only the guard sed applied, this
+# pin printed its "the substitution IS the fail-open" line while the substitution was not present.
+# So the ok requires BOTH rewrites AND that the run actually READ the RECORDED head's check surface
+# — that read is the proof the green came from the record and not from the blank-sha pass.
 S21_MUT16A="$S21_MUTDIR/record-review-s21-unreadfallback.sh"
 cp "$RECORD" "$S21_MUT16A"
 sed -i.bak 's#^  if \[ -z "\$CC_LIVE_HEAD" \]; then$#  if false; then#' "$S21_MUT16A"
 sed -i.bak 's#^    cc_surface_gate "\$CC_LIVE_HEAD" "\$CC_DIFF" "\$DIFF_HASH"$#    cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"#' "$S21_MUT16A"
 rm -f "$S21_MUT16A.bak"
-if cmp -s "$RECORD" "$S21_MUT16A"; then
-    bad "21.16(a) mutation: neither sed applied — re-anchor the pin"
+if grep -qF -- 'if [ -z "$CC_LIVE_HEAD" ]; then' "$S21_MUT16A" \
+   || ! grep -qF -- 'cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"' "$S21_MUT16A"; then
+    bad "21.16(a) mutation: the TWO-PART pre-fix rewrite did not apply (the guard must be GONE and the fallback RESTORED) — re-anchor the pin"
 else
+    : > "$LOG"
     s21_unread "$S21_MUT16A"
-    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ]; then
-        ok "21.16(a) MUTATION PIN: restoring the fallback over an UNREAD live head answers 'carry'/0 on the GREEN recorded head — the recorded-head substitution IS the fail-open"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ] \
+       && grep -qF -- "commits/$S21_STALE/check-runs" "$LOG" 2>/dev/null; then
+        ok "21.16(a) MUTATION PIN: restoring the fallback over an UNREAD live head answers 'carry'/0 AND the run reads the RECORDED head's check surface — the recorded-head substitution IS the fail-open"
     else
-        bad "21.16(a) mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — the answer is not produced by the fallback"
+        bad "21.16(a) mutation NOT caught (rc=$CC_RC, out=$CC_OUT, recorded-head check-runs reads=$(grep -cF -- "commits/$S21_STALE/check-runs" "$LOG" 2>/dev/null)) — either the answer is not 'carry'/0 or the licence did not come from the RECORDED head"
     fi
 fi
 # (g) AND THE GUARD ALONE IS LOAD-BEARING — not merely "we happen to pass the right variable".
 # With only the guard deleted, `cc_surface_gate ""` is what runs; the scan's `empty` arm is a PASS
-# (#2342), so the same stub answers `carry`/0. Correctness must not rest on the real API turning a
-# blank sha into a 422 — measured here so the guard cannot be tidied away as redundant.
+# (#2342), so the same stub answers `carry`/0 — and the log shows the BLANK-SHA url, which is what
+# proves the licence came from the empty pass and not from the record. Correctness must not rest on
+# the real API turning a blank sha into a 422 — measured here so the guard cannot be tidied away as
+# redundant.
 S21_MUT16B="$S21_MUTDIR/record-review-s21-noguard.sh"
 cp "$RECORD" "$S21_MUT16B"
 sed -i.bak 's#^  if \[ -z "\$CC_LIVE_HEAD" \]; then$#  if false; then#' "$S21_MUT16B"
 rm -f "$S21_MUT16B.bak"
-if cmp -s "$RECORD" "$S21_MUT16B"; then
+if grep -qF -- 'if [ -z "$CC_LIVE_HEAD" ]; then' "$S21_MUT16B" \
+   || ! grep -qF -- 'cc_surface_gate "$CC_LIVE_HEAD" "$CC_DIFF" "$DIFF_HASH"' "$S21_MUT16B"; then
     bad "21.16(b) mutation: the sed did not apply — re-anchor the pin"
 else
+    : > "$LOG"
     s21_unread "$S21_MUT16B"
-    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ]; then
-        ok "21.16(b) MUTATION PIN: without the guard the blank sha reaches cc_surface_gate and the same unread head answers 'carry'/0 — the refusal is OURS, not the transport's"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ] \
+       && grep -qF -- "commits//check-runs" "$LOG" 2>/dev/null; then
+        ok "21.16(b) MUTATION PIN: without the guard the BLANK sha reaches cc_surface_gate and the same unread head answers 'carry'/0 via the scan's empty pass — the refusal is OURS, not the transport's"
     else
         bad "21.16(b) mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — the guard is not what produces 21.16"
     fi
