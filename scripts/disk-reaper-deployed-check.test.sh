@@ -307,7 +307,7 @@ import sys
 p = sys.argv[1]
 b = open(p, "rb").read()
 assert b.endswith(b"\n"), "the stamp should end with a newline"
-assert b"lib/live-paths.sh" in b, "the last pinned file should be live-paths.sh"
+assert b.splitlines()[-1].endswith(b"  lib/live-paths.sh"), "the LAST pinned file must be live-paths.sh — this arm's whole power is that the truncation removes ITS line, and a `FILES` reorder must RED here rather than quietly disarm the arm"
 open(p, "wb").write(b.rstrip(b"\n"))
 PYTRUNC
 if [ -n "$(tail -c1 "$REC")" ]; then ok "D14 the record's trailing newline was REMOVED"; else bad "D14 the truncation DID NOT APPLY — the arm is unverified"; fi
