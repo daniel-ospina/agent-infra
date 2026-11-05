@@ -70,7 +70,9 @@ sha256() {
     fi
 }
 
-say() { [ "${QUIET:-0}" = 1 ] || printf '%s\n' "$*"; }
+# ⛔ NOT `say` (agent-infra #2910): on macOS that is /usr/bin/say, so a missed definition is a
+# voice on the speaker rather than a log line. `emit` cannot collide with a system binary.
+emit() { [ "${QUIET:-0}" = 1 ] || printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
 MODE=check
@@ -137,7 +139,7 @@ if [ "$MODE" = stamp ]; then
         warn "  remedy: fix the read/permission problem, then: $PROG --stamp --source <agent-infra checkout>"
         exit 1
     fi
-    say "STAMPED $RECORD (dir=$DIR source=${SOURCE:--} commit=$src_commit)"
+    emit "STAMPED $RECORD (dir=$DIR source=${SOURCE:--} commit=$src_commit)"
     exit 0
 fi
 
@@ -229,7 +231,7 @@ while read -r digest name _rest || [ -n "${digest:-}${name:-}" ]; do
             drift=1; continue
         fi
     fi
-    say "same      $name $now"
+    emit "same      $name $now"
 # ⛔ `read` DOES NOT RUN ITS BODY FOR A FINAL LINE WITHOUT A TRAILING NEWLINE (review of #3422, P2).
 # A truncated record — the delta's own stated threat model — therefore dropped its last line here while
 # the awk reconciliation read it normally: `deployed ok (8 files)`, exit 0, with a pinned delegate
@@ -260,5 +262,5 @@ if [ "$drift" != 0 ]; then
     warn "SUMMARY deployed drift detected — the copy that RUNS is not the copy that was farmed (or not the checkout's). Re-farm, then: $PROG --stamp --source <checkout>"
     exit 1
 fi
-say "SUMMARY deployed ok ($checked files${SOURCE:+; matches $SOURCE})"
+emit "SUMMARY deployed ok ($checked files${SOURCE:+; matches $SOURCE})"
 exit 0
