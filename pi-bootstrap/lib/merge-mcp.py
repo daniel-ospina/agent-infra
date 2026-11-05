@@ -51,8 +51,20 @@ THE RULES, in order:
    KEPT`, because a NOTE that listed only the servers that were MISSING read as "the base
    catalog is not installed" while an unspawnable entry sat in the file, certified.
 
+   * a NON-OBJECT `tortoise` (a hand-written list, a bare string) is REPLACED and NAMED, and the
+     bytes are kept as `.bak`: it is operator content, the same class rules 3's container cases
+     protect, and it was the one shape this file deleted without a `NOTE:` — a contract violation
+     against the line below (#3374 review P2).
+
+   ⛔ EVERY url this file PRESERVES must be an ABSOLUTE `http(s)` url, because that is the minimum
+   `cell-install.sh --verify` will certify for the `_selfHosted` exemption it honours (`BADURL`).
+   Preserving anything weaker makes the repair path non-convergent: `cloud-cell-bringup.sh` runs
+   verify → install → verify, so an install that keeps a scheme-less url hands back a file the very
+   next verify refuses, for ever (#3374 review P2, measured).
+
 Every decision is printed as a `NOTE:` line so the caller can surface it; nothing here is silent.
-Exit 0 with the file written, 2 on bad usage, 3 when the template has no usable tortoise entry.
+Exit 0 with the file written, 2 on bad usage, 3 when the template cannot be read or has no usable
+tortoise entry.
 """
 from __future__ import annotations
 
@@ -94,6 +106,21 @@ def token_path(node, trail=""):
     return ""
 
 
+def host_of(url):
+    """The HOST of `url` — scheme, port and any USERINFO removed.
+
+    ⛔ USERINFO IS NOT THE HOST, and this is the same rule `_loopback` already applies below. Reading
+    the authority verbatim made `https://api.premiselabs.co@evil.example/mcp/` — whose real host is
+    **evil.example** — look like "a genuine self-host" to both `near_miss` and `host_typo`, so the
+    merge PRESERVED it and marked it `_selfHosted`, `--verify` certified `SELFHOSTED:`, and the
+    entry's `Bearer ${TORTOISE_MCP_API_KEY}` went to the attacker's host with this repo's blessing.
+    Two predicates in one file disagreeing about what "the host" is, is the defect; this is the one
+    definition (#3374 review P1).
+    """
+    m = re.match(r"^[a-z][a-z0-9+.\-]*://(?:[^/?#]*@)?([^/?#:]*)", url or "", re.I)
+    return m.group(1).lower() if m else ""
+
+
 def near_miss(url, want_url):
     """True when `url` is the DEFAULT endpoint spelled differently (SAME AUTHORITY).
 
@@ -112,12 +139,9 @@ def near_miss(url, want_url):
     a scheme-sensitive comparison makes the cleartext spelling a DIFFERENT url, i.e. a self-host to
     preserve and mark — the exact direction this function exists to refuse.
     """
-    def host(u):
-        m = re.match(r"^[a-z][a-z0-9+.\-]*://([^/]+)", u or "", re.I)
-        return m.group(1).lower() if m else ""
     if not url or not want_url or url == want_url:
         return False
-    uh, wh = host(url), host(want_url)
+    uh, wh = host_of(url), host_of(want_url)
     return bool(wh) and uh == wh
 
 
@@ -155,10 +179,7 @@ def host_typo(url, want_url, floor=3):
     address, a company domain), so this does NOT override the recorded rule that "a genuine
     self-host is a different host and is preserved" — it only stops a LOOKALIKE from inheriting it.
     """
-    def host(u):
-        m = re.match(r"^[a-z][a-z0-9+.\-]*://([^/:]+)", u or "", re.I)
-        return m.group(1).lower() if m else ""
-    uh, wh = host(url), host(want_url)
+    uh, wh = host_of(url), host_of(want_url)
     if not uh or not wh or uh == wh:
         return False
     return _edit_distance(uh, wh, floor) < floor
@@ -274,6 +295,25 @@ def usable(entry, want_url):
     if not isinstance(url, str) or not url.strip():
         return False, "url"
     url = url.strip()
+    # ⛔ AN ABSOLUTE http(s) url IS THE FLOOR, BECAUSE IT IS THE VERIFIER'S (`BADURL:`). `--verify`
+    # refuses the `_selfHosted` exemption on a scheme-less url — the client's `new URL()` reads
+    # `localhost:8000/mcp` as protocol `localhost:` with no host, so the cell points at nothing —
+    # and a merge that PRESERVED one handed back a file the next verify refuses. Measured on the
+    # real repair path (`cloud-cell-bringup.sh`: verify → install → verify): it never converged.
+    # A refusal here makes the repair REPLACE the entry, which is the only converging answer.
+    if not re.match(r"^https?://[^/?#]+", url, re.I):
+        return False, "badurl"
+    # ⛔ USERINFO IN THE AUTHORITY MAKES THE OPERATOR'S INTENT UNREADABLE, AND IT IS THE SHAPE A
+    # HOST-SPOOF TAKES: `https://api.premiselabs.co@evil.example/mcp/` resolves to **evil.example**
+    # while its authority BEGINS with the hosted host. `near_miss`/`host_typo` now read the REAL
+    # host (`host_of`, which strips userinfo exactly as `_loopback` already did), so such an entry
+    # is not a TYPO of the default — but it is also not the DELIBERATE different endpoint those
+    # rules exist to preserve, and preserving it minted `--verify`'s `SELFHOSTED:` certification on
+    # an entry still carrying `Bearer ${TORTOISE_MCP_API_KEY}`: the tenant key to an attacker's host,
+    # blessed by this repo (#3374 review P1). A credential belongs in `headers`, never in the
+    # authority, so this shape is REPLACED with the hosted default rather than certified.
+    if re.match(r"^[a-z][a-z0-9+.\-]*://[^/?#]*@", url, re.I):
+        return False, "userinfo"
     # `type` is only disqualifying for the HOSTED default. The client's McpServerConfig has no
     # `type` field at all (it selects StreamableHTTP from `url` alone), so a self-hosted entry that
     # spells `type: "sse"` for its own daemon WORKS — replacing it would destroy the operator's
@@ -324,7 +364,20 @@ def main(argv):
         return 2
     tpl_path, dst_path = args
 
-    tpl = json.load(open(tpl_path))
+    # ⛔ THE TEMPLATE IS THE ONE INPUT WHOSE FAILURE WAS A PYTHON TRACEBACK. Every other unreadable
+    # shape in this file is a NAMED refusal with a documented exit code — while `json.load` on a
+    # missing or corrupt template raised straight out of `main`, so a caller got `FileNotFoundError:`
+    # / `JSONDecodeError:` on stderr and rc=1, a contract the docstring does not advertise (0/2/3).
+    # It is reachable: `setup.sh` guards only `[ -f ]` before calling this under `set -e`, so a
+    # CORRUPT template printed a traceback and aborted the sync there. Named here, at the one exit
+    # code the docstring already reserves for a template this file cannot use (#3374 review P2).
+    try:
+        tpl = json.load(open(tpl_path))
+    except (OSError, ValueError) as exc:
+        sys.stderr.write(
+            "FATAL: cannot read the template %s (%s: %s)\n" % (tpl_path, type(exc).__name__, exc)
+        )
+        return 3
     # ⛔ UNPARSEABLE IS THE LAST CONTAINER SHAPE THAT COULD NOT BE REPAIRED. `json.load` raised
     # `JSONDecodeError` (a `ValueError`) BEFORE the write, so `--install` — the repair path
     # `cloud-cell-bringup.sh` runs on a verify failure — exited 1 having changed nothing, and the
@@ -487,14 +540,28 @@ def main(argv):
         else:
             print(
                 "NOTE: REPLACED an unusable tortoise entry (reason: %s — the hosted endpoint needs an "
-                "env-indirect Authorization, no entry may carry a literal key, and a credential may not "
-                "be sent to a non-loopback url over a non-https scheme) with the hosted "
-                "default; a preserved one could never be repaired" % why
+                "env-indirect Authorization, no entry may carry a literal key, a credential may not "
+                "be sent to a non-loopback url over a non-https scheme, EVERY preserved url must "
+                "be an absolute http(s) url, and no url may carry USERINFO in its authority (that is "
+                "what a host-spoof looks like, and it is the minimum `--verify` will certify) with the "
+                "hosted default; a preserved one could never be repaired" % why
             )
             have["tortoise"] = want
     else:
         if isinstance(cur, dict):
             print("NOTE: replaced the legacy stdio tortoise entry with the hosted http entry")
+        elif cur is not None:
+            # ⛔ A NON-OBJECT `tortoise` IS OPERATOR CONTENT, and this branch used to REPLACE it with
+            # no `NOTE:` at all — against this file's own contract ("nothing here is silent") and
+            # unlike every sibling container shape, which names the replacement AND keeps the bytes.
+            # A hand-written `["/x/python3", "-m", "tortoise.mcp_server"]` vanished without a word,
+            # and `--verify` then reported `NOENTRY:` over a file the installer had just rewritten
+            # (#3374 review P2).
+            print(
+                "NOTE: REPLACED a %s tortoise entry (not a JSON object) with the hosted http entry; "
+                "the previous file was saved as %s.bak" % (type(cur).__name__, dst_path)
+            )
+            _keep_backup(dst_path)
         have["tortoise"] = want
 
     # 4. which of the template's other servers to install
