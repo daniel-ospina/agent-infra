@@ -1450,14 +1450,18 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
   // attributable to any diff. Registered (not exempted): it IS a reap-axis bound whose value a change
   // must be visible on, and it protects a `rm -rf` target chosen by a string, so the registry is
   // exactly where a future edit of its default has to show up.
-  // ⛔ THIS ENTRY IS A VERBATIM COPY OF PR #3431's, WHOSE WHOLE JOB IS THIS ONE REGISTRATION (review
-  // round 5, P2 — the first cut was a SECOND, DIVERGENT registration: `axis: "retention"` against this
-  // one's `"reap"`, a different `guardedBy` and a different `note`, citing an `EV_` arm that does not
-  // exist). Nothing rejects a duplicate — `forwardViolations` is per-term and the test builds a Map by
-  // name — so the second copy would have validated silently and the two records could have drifted
-  // apart. Copied rather than rewritten so that whichever PR lands second merges to a no-op instead of
-  // to a contradiction, and so this PR's `verify` can go green on a red main without inventing a
-  // rival account of the same bound.
+  // ⛔ THIS ENTRY IS A BYTE-IDENTICAL COPY OF THE ONE PR #3431 REGISTERS, WHOSE WHOLE JOB IS THIS
+  // REGISTRATION (review round 5, P2 — the first cut was a SECOND, DIVERGENT registration: `axis:
+  // "retention"` against this one's `"reap"`, a different `guardedBy` and a different `note`, citing an
+  // `EV_` arm that does not exist). Nothing rejects a duplicate — `forwardViolations` is per-term and the
+  // test builds a Map by name — so the second copy would have validated silently and the two records could
+  // have drifted apart. The OBJECT below is copied verbatim so no reader can find two accounts of one
+  // bound; ⛔ AND THE MERGE IS NOT A NO-OP — saying it was would be the same kind of false claim this
+  // registry exists to prevent (review round 6, P2 — measured with `git merge-file`: the object alone
+  // merges clean, but this comment block is unique to this branch, so the two hunks collide and the merge
+  // is a one-line conflict resolved by deleting whichever copy loses). This PR needs the entry because
+  // `verify` is red on `origin/main` itself until one lands; #3431 is the dedicated fix, so whichever lands
+  // second should drop its own copy.
   {
     name: "REAP_WT_PRESERVE_KEEP_DAYS",
     owners: ["scripts/pi-reap-worktrees.sh"],
