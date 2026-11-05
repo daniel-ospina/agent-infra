@@ -645,10 +645,21 @@ n_net=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g'
 # unbounded call share one line, so `tb_timeout … ls-remote … \` + `&& git -C "$root" fetch origin` read as
 # bounded — a fail-open the join CREATED). Every segment that contains a network verb must carry its own
 # `tb_timeout`.
-n_unbounded=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g' | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -cv 'tb_timeout')
+# ⛔ AND `remote get-url` IS NOT A NETWORK CALL, SO COUNTING IT HERE WAS A FALSE RED (review cycle 17, P2 —
+# REPRODUCED). The verb regex matches the `--push` FLAG in `remote get-url --push --all origin`, which reads
+# config and touches no socket. The exit path resolves origin's push url with it precisely so the
+# landing-branch read and the verifying read address the repository the push actually reaches (see
+# lane_end_push's push-url block), and the false positive failed this arm on a correctly-bounded path.
+# The exclusion is SEGMENT-precise and COUNTED: exactly one such segment is expected, so a future real verb
+# cannot be smuggled in under the same shape — dropping the `--push` flag turns n_local to 0 and reds this
+# arm, and an unbounded fetch/push/ls-remote is still counted because it never matches `remote get-url`.
+NET_SEGS=$(printf '%s\n' "$joined" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
+n_local=$(printf '%s\n' "$NET_SEGS" | grep -c 'git -C "\$root" remote get-url')
+n_net=$(printf '%s\n' "$NET_SEGS" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | wc -l)
+n_unbounded=$(printf '%s\n' "$NET_SEGS" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | grep -cv 'tb_timeout')
 [ "$n_bound" = 1 ] && [ "$n_sym" = 1 ] && [ "$n_ver" = 1 ] \
-  && [ "$n_net" -ge 3 ] && [ "$n_unbounded" = 0 ]; rcn14=$?
-ck "N14 …every network call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net)" $rcn14
+  && [ "$n_net" -ge 3 ] && [ "$n_unbounded" = 0 ] && [ "$n_local" = 1 ]; rcn14=$?
+ck "N14 …every NETWORK call on the exit path is BOUNDED (15/15/5) — no unbounded and no continuation-split one (found $n_net network, $n_local local config read)" $rcn14
 # ⛔ N14b — THE BOUND MUST BOUND **WALL CLOCK**, NOT ONLY SPELLING (review cycle 10, P2 — REPRODUCED).
 # N14 is a TEXT SCAN by construction, so it cannot see this class at all, and on a Linux host GNU
 # `timeout` hides it: `tb_watchdog` used to `kill -9 "$pid"` — the DIRECT child only — so a command that
@@ -1935,6 +1946,64 @@ grep -qx 'push=push-unreported' "$TMP/n43b.out"; rcn43c=$?
 ck "N43c …and a non-zero push whose read ALSO cannot answer records push=push-unreported — never FAILED, which would assert an absence nobody read" $rcn43c
 case "$(cat "$TMP/n43.next" 2>/dev/null)" in MANUAL*"does NOT know"*"do NOT reap"*) rcn43d=0 ;; *) rcn43d=1 ;; esac
 ck "N43d …and next= refuses a reclaim while asserting it does NOT know what origin holds [$(cut -c1-56 "$TMP/n43.next" 2>/dev/null)]" $rcn43d
+echo
+
+# ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).
+# `git push origin` honours remote.origin.pushurl and `url.<base>.pushInsteadOf`; `ls-remote origin` honours
+# remote.origin.url. When they diverge the landing-branch set came from repository A while the ref was
+# written to repository B — and B's LANDING BRANCH moved. Reproduced on this commit before the fix:
+# canon.git's refs/heads/trunk moved 613382f..b4e6ab9 (fast forward) while the same terminal recorded
+# `push=FAILED` "does NOT hold refs/heads/trunk". THIS ARM FAILS IF THE FIX IS REMOVED: with the reads
+# back on `origin` the protected set is mirror's `main`, `trunk` is not in it, and canon's trunk moves.
+n44="$TMP/n44"; mkdir -p "$n44"
+git init -q --bare "$n44/mirror.git" && git init -q --bare "$n44/canon.git"
+git -C "$n44/mirror.git" symbolic-ref HEAD refs/heads/main
+git -C "$n44/canon.git" symbolic-ref HEAD refs/heads/trunk
+git init -q "$n44/seed" && git -C "$n44/seed" commit -q --allow-empty -m base \
+  && git -C "$n44/seed" branch -M main && git -C "$n44/seed" commit -q --allow-empty -m m2 \
+  && git -C "$n44/seed" push -q "$n44/mirror.git" main:main \
+  && git -C "$n44/seed" checkout -q -b trunk && git -C "$n44/seed" commit -q --allow-empty -m t2 \
+  && git -C "$n44/seed" push -q "$n44/canon.git" trunk:trunk && rm -rf "$n44/seed"
+git clone -q "$n44/mirror.git" "$n44/wk" 2>/dev/null
+git -C "$n44/wk" remote set-url --push origin "$n44/canon.git"
+git -C "$n44/wk" fetch -q "$n44/canon.git" trunk:trunk
+git -C "$n44/wk" worktree add -q "$n44/wt" trunk
+git -C "$n44/wt" commit -q --allow-empty -m "a lane's unpushed work"
+n44_before="$(git -C "$n44/canon.git" rev-parse refs/heads/trunk)"
+: > "$O/logs/pushurl.log"
+O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=trunk
+  lane_end_push "pushurl" "$3" "$2" trunk 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$n44/wt" "$O/logs/pushurl.log" > "$TMP/n44.out" 2>&1
+n44_after="$(git -C "$n44/canon.git" rev-parse refs/heads/trunk)"
+grep -qx 'push=refused-protected' "$TMP/n44.out"; rcn44a=$?
+ck "N44a a fetch/push url DIVERGENCE cannot hide the push repository's landing branch — canon's trunk (its default) is refused (recorded: $(cat "$TMP/n44.out" 2>/dev/null | tr -d '\n'))" $rcn44a
+[ "$n44_before" = "$n44_after" ]; rcn44b=$?
+ck "N44b …and the landing branch did NOT move (${n44_before:0:8} before, ${n44_after:0:8} after) — this is the assertion that goes RED if the reads go back to remote.origin.url" $rcn44b
+grep -q 'push target =' "$O/logs/pushurl.log"; rcn44c=$?
+ck "N44c …and the log NAMES the repository every verdict below is about (the divergence was invisible before, which is why the damage could not be read after the fact)" $rcn44c
+# ⛔ N44d — A push url set that is not EXACTLY one cannot be resolved to a single repository (review cycle
+# 17, P2). Picking one would be the same guess, one level up, so it REFUSES and the refusal is MANUAL.
+git -C "$n44/wk" remote set-url --push --add origin "$n44/mirror.git"
+: > "$O/logs/pushurl2.log"
+O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=trunk
+  lane_end_push "pushurl2" "$3" "$2" trunk 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+  lane_end_next > "$4"
+' _ "$GATE" "$n44/wt" "$O/logs/pushurl2.log" "$TMP/n44.next" > "$TMP/n44d.out" 2>&1
+grep -qx 'push=refused-pushurl-divergent' "$TMP/n44d.out"; rcn44d=$?
+ck "N44d …and TWO push urls refuse rather than picking one ($(cat "$TMP/n44d.out" 2>/dev/null | tr -d '\n'))" $rcn44d
+[ "$n44_before" = "$(git -C "$n44/canon.git" rev-parse refs/heads/trunk)" ]; rcn44e=$?
+ck "N44e …nothing was pushed anywhere by that refusal (canon's trunk still ${n44_before:0:8})" $rcn44e
+case "$(cat "$TMP/n44.next" 2>/dev/null)" in MANUAL*"do NOT reap"*) rcn44f=0 ;; *) rcn44f=1 ;; esac
+ck "N44f …and next= is MANUAL / do-not-reap, so a reclaimer is told to refuse that worktree [$(cut -c1-60 "$TMP/n44.next" 2>/dev/null)]" $rcn44f
+git -C "$n44/wk" worktree remove --force "$n44/wt" 2>/dev/null
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
