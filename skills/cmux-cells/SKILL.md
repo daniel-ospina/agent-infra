@@ -85,8 +85,13 @@ reads an installed FILE; none of them proves a lane can get a token. This is the
 exactly one line:
 
 ```bash
-HOME=/tmp/cell-home pi -p "reply with exactly PROVIDER_OK"     # → PROVIDER_OK, no trailing noise
+env -i HOME=/tmp/cell-home PATH="$PATH" pi -p "reply with exactly PROVIDER_OK"   # → PROVIDER_OK, no trailing noise
 ```
+
+⛔ **`env -i` IS THE POINT, not decoration.** An operator shell on a cell already carries
+`DEEPSEEK_API_KEY`, so a plain `HOME=… pi -p …` answers even when the store is `{}` — the exact false
+pass #2024 is about. The clean shell is what proves the STORE supplies the credential; if this fails
+while the plain form succeeds, the store is the thing that is missing.
 
 An empty `auth.json` (`{}`, 2 bytes) makes that command exit in ~8 s with `No API key found for deepseek` and a
 ~300-byte log — which a verifier that only checks the log exists reads as a successful launch. `cloud-cell-bringup.sh

@@ -289,14 +289,20 @@ cell_agent_dirs() {
 has_pi_manifest() { # <package.json> — 0 iff it declares pi.extensions (pi's own entry list)
   [ -f "${1:-}" ] || return 1
   python3 - "$1" <<'PYEOF' 2>/dev/null
-import json, sys
+import json, os, sys
 try:
     doc = json.load(open(sys.argv[1]))
 except Exception:
     sys.exit(1)
 pi = doc.get("pi")
 ext = pi.get("extensions") if isinstance(pi, dict) else None
-sys.exit(0 if isinstance(ext, list) and len(ext) > 0 else 1)
+if not isinstance(ext, list) or not ext:
+    sys.exit(1)
+# pi's `resolveExtensionEntries` also requires at least one DECLARED path that RESOLVES — a
+# package.json naming a file that is not there falls through to the index check and loads nothing,
+# so such a directory is not a copy of anything and must not be swept.
+base = os.path.dirname(os.path.abspath(sys.argv[1]))
+sys.exit(0 if any(isinstance(e, str) and e and os.path.exists(os.path.join(base, e)) for e in ext) else 1)
 PYEOF
 }
 
@@ -316,6 +322,22 @@ loadable_extension_entry() {
   return 1
 }
 
+# denied_shipped_names — the extension ship-list, normalised (trailing slash stripped), one name per
+# line. Cached for the run: the manifest does not change under us, and `read_manifest_entries` is
+# python-backed. Read in a SUBSHELL so its own `die` cannot end the caller.
+# ⛔ WHY THE SWEEP NEEDS IT: without an exemption, a manifest entry whose name merely shares a denied
+# STEM (e.g. `<stem>-helper.ts`) would be INSTALLED by the ship-list loop and then DELETED by the
+# sweep below — `--verify` would then fail `extension MISSING` on every run, and the cell could never
+# be provisioned. A name the repo actually SHIPS is not a copy of the denied entry.
+DENIED_SHIPPED_CACHE=""
+denied_shipped_names() {
+  if [ -z "$DENIED_SHIPPED_CACHE" ]; then
+    DENIED_SHIPPED_CACHE="$(read_manifest_entries 2>/dev/null | sed 's:/$::')"
+    [ -n "$DENIED_SHIPPED_CACHE" ] || DENIED_SHIPPED_CACHE="__unreadable__"
+  fi
+  printf '%s\n' "$DENIED_SHIPPED_CACHE"
+}
+
 # denied_extension_copies <agent-dir> — every copy of a DENIED extension in that home that `pi`
 # would actually LOAD, one absolute path per line.
 # The name match is a PREFIX of the entry's stem (`tortoise-capture*`), which is what covers every
@@ -323,8 +345,32 @@ loadable_extension_entry() {
 # `<stem>-old/`. It is combined with `loadable_extension_entry` so the match is the SHAPES pi loads,
 # not "any file whose name starts with the stem" — the difference is the arm that proves a
 # `<stem>-notes.txt` beside the extension is neither refused nor deleted.
+# denied_copy_variant <basename> <stem> — 0 iff <basename> is the STEM plus a COPY MARKER, i.e. a
+# suffixed/renamed copy of the denied entry rather than a different extension that happens to share
+# the prefix. The markers are the shapes copies actually take, and the list is deliberately explicit:
+#   <stem>                     (empty remainder)
+#   <stem>.ts | .js            (the entry itself, re-spelled)
+#   <stem>.bak[.ts] | -bak     .old | -old | .orig | .copy | .save | .keep | .dist | .local | .tmp
+#   <stem>[.-_]disabled[.ts]   <stem>-off
+#   <stem>.1 | -2 | _3 …       (numbered copies)
+# ⛔ A name that does not reduce to one of these is NOT swept: `<stem>-helper.ts` is a different
+# extension, and the sweep is allowed to `rm -rf`.
+denied_copy_variant() {
+  local base="${1%/}" stem="${2%/}" rest
+  rest="${base#"$stem"}"
+  [ "$rest" = "$base" ] && return 1          # does not start with the stem at all
+  rest="${rest//.ts/}"; rest="${rest//.js/}"  # an extension suffix is not a marker
+  rest="${rest#.}"; rest="${rest#-}"; rest="${rest#_}"
+  [ -z "$rest" ] && return 0
+  case "$rest" in
+    bak|backup|old|orig|copy|save|keep|dist|local|tmp|disabled|off) return 0 ;;
+  esac
+  case "$rest" in [0-9]|[0-9][0-9]) return 0 ;; esac
+  return 1
+}
+
 denied_extension_copies() { # <agent-dir>
-  local dir="${1%/}/extensions" d stem f
+  local dir="${1%/}/extensions" d stem f fbase
   [ -d "$dir" ] || return 0
   for d in "${DENY_EXTENSIONS[@]}"; do
     stem="$(denied_extension_stem "$d")"
@@ -336,8 +382,16 @@ denied_extension_copies() { # <agent-dir>
       # costs one `ln -sf` to become a loaded extension again, and the install half removing it is
       # what keeps verify from looping (refuse -> install-that-cannot-repair -> refuse forever).
       { [ -e "$f" ] || [ -L "$f" ]; } || continue
-      if denied_extension "$(basename "$f")"; then printf '%s\n' "$f"; continue; fi
+      fbase="$(basename "$f")"
+      if denied_extension "$fbase"; then printf '%s\n' "$f"; continue; fi
       # (2) ANY OTHER COPY pi would LOAD — the suffixed/dir shapes an exact-name deny cannot see.
+      # ⛔ AND ONLY A COPY: a bare name PREFIX is not enough. `<stem>-helper.ts` is a DIFFERENT,
+      # loadable extension, and deleting it would be the over-block direction (the sweep can
+      # `rm -rf`) — and if the repo SHIPS such a name, install would ship it and this sweep delete
+      # it, so `--verify` would fail `extension MISSING` on every run and the cell could never be
+      # provisioned. So the remainder must be a copy MARKER, and a ship-list row is never a copy.
+      if denied_shipped_names | grep -Fxq "$fbase"; then continue; fi
+      denied_copy_variant "$fbase" "$stem" || continue
       loadable_extension_entry "$f" || continue
       printf '%s\n' "$f"
     done

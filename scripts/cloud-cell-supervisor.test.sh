@@ -903,6 +903,27 @@ rm -f "$F/keys.env"; seed_provider_store "$F/home"
 cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "the fixture verifies again once its store is restored (the seed is live, not inert)" \
                    || bad "the restored fixture still refuses — later arms would measure the wrong state: $CC_OUT"
+# (i) A PROVIDER THIS FILE DOES NOT LIST must still be judged. `PI_LANE_PROVIDER=zai` is a real
+# fixture in this repo (key-gate.test.sh), and an earlier "this file does not know the variable, so
+# NOT VERIFIED" path printed the banner over a box with `{}` and an empty keys.env — the #2024 death,
+# re-opened for every provider outside a four-name table. The variable is DERIVED now, and "no
+# credential at all" is a refusal whatever the provider is called.
+rm -f "$AUTH"
+CC_OUT="$(PROBE_RC=0 TORTOISE_REPO= TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai2024-zai-$$" \
+          PI_LANE_PROVIDER=zai \
+          O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$CC_REF" \
+          PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"; CC_RC=$?
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES an UNLISTED lane provider with no stored credential and no keys.env key" \
+                   || bad "check certified a box with no credential for PI_LANE_PROVIDER=zai (rc=$CC_RC)"
+case "$CC_OUT" in
+  *"ZAI_API_KEY"*) ok "…naming the DERIVED variable (ZAI_API_KEY), so the remedy is achievable" ;;
+  *) bad "the refusal does not name the derived variable — the operator cannot act on it: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) bad "check printed the CELL CAN RUN banner over a keyless zai box" ;;
+  *) ok "…and never prints the CELL CAN RUN banner for it" ;;
+esac
+seed_provider_store "$F/home"
 
 # ⛔ Issue 3 (#1748 review): the provisioning probe runs in the OPERATOR's shell, but the controller
 # session gets a tmux-server environment plus a re-source of $ENV_FILE — so an ambient-only

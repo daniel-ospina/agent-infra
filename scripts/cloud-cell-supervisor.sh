@@ -2490,84 +2490,69 @@ cmd_check_provenance() {
 # library to source. This side only READS them; adding a provider is one entry in each.
 SUP_AUTH_STORE_PROVIDERS="deepseek:DEEPSEEK_API_KEY anthropic:ANTHROPIC_API_KEY openai:OPENAI_API_KEY openrouter:OPENROUTER_API_KEY"
 
-# sup_provider_var <provider> — the variable `keys.env` carries that provider's key in. Non-zero for
-# a provider this file does not know, which is reported as NOT VERIFIED rather than refused: pi
-# supports far more providers than a cell's lane needs, and guessing a refusal out of ignorance is a
-# false block on a healthy box.
+# sup_provider_var <provider> — the variable `keys.env` carries that provider's key in. The four
+# explicit pairs are the fleet's own; ANY other provider derives pi's convention
+# (`<PROVIDER>_API_KEY`, upper-cased, non-alphanumerics to `_`). ⛔ DERIVED, NOT UNKNOWN: a
+# `PI_LANE_PROVIDER` of `zai` is a real fixture in this repo, and a table lookup made this verb
+# unable to judge it at all — it printed the CELL CAN RUN banner over a box with no credential.
 sup_provider_var() {
-  local pair
+  local prov="${1:-}" pair
   for pair in $SUP_AUTH_STORE_PROVIDERS; do
-    [ "${pair%%:*}" = "${1:-}" ] && { printf '%s\n' "${pair#*:}"; return 0; }
+    [ "${pair%%:*}" = "$prov" ] && { printf '%s\n' "${pair#*:}"; return 0; }
   done
-  return 1
+  [ -n "$prov" ] || return 1
+  printf '%s_API_KEY\n' "$(printf '%s' "$prov" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9\n' '_' | sed 's/_*$//')"
 }
 
-# sup_store_state <auth.json> <provider> -> present | absent | empty | unreadable
-# `empty` covers the measured shapes (absent file, 0 bytes, whitespace only, `{}`). `unreadable` is a
-# file that is not a JSON object we can read — reported, never "repaired" from here (read-only verb).
-# ── what a STORE ENTRY has to look like before this check will call it a credential ─────────
-# pi's own loader decides this, and it is stricter than "there is a `key` field" (pi's
-# `core/auth-storage`: an `api_key` entry whose `key` is a NON-STRING, or an entry with no `type` at
-# all, makes pi THROW when it reads the file; an `api_key` entry whose `key` resolves to nothing
-# falls back to its `env` map; an `oauth` entry carries `access`/`refresh`/`expires` and no `key`).
-# So:
-#   usable := api_key with a non-blank STRING key, OR api_key with a non-empty env map,
-#             OR oauth with a non-blank string access token.
-# This is the SAME program `cloud-cell-bringup.sh` carries (there, next to the only writer), and it
-# must stay the same: the two verbs certifying one box from two different answers is the drift this
-# whole gate exists to avoid.
-SUP_STORE_ENTRY_USABLE_JQ='
-  def nonblank_string: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
-  if type != "object" then false
-  elif .type == "api_key" then
-    ((.key? | nonblank_string)
-     or (((.env? // null) | type) == "object" and (((.env // {}) | length) > 0)))
-  elif .type == "oauth" then (.access? | nonblank_string)
-  else false end'
 
-# sup_store_state <auth.json> <provider> -> present | other | malformed | absent | empty | unreadable
-#   present    a credential for this provider that pi can USE
-#   other      an entry of a type this check does not judge (`oauth`, or something newer) — it may
-#              well be a working credential, and only pi can say, so it is NOT a refusal
-#   malformed  an entry pi will THROW on when it reads the store (an `api_key` with a non-string or
-#              blank key, or an entry with no `type`): the store authenticates NOBODY
-#   absent     the file is a JSON object with entries, but none for this provider
-#   empty      absent file, 0 bytes, WHITESPACE ONLY, or `{}` — the measured defect
-#   unreadable not a JSON object at all (a scalar, an array, or unparseable)
 # ── what a STORE ENTRY has to look like before this check will call it a credential ─────────
-# ⛔ pi's OWN RULE, read from its source (`dist/core/auth-storage.js`), not guessed:
-#   * `load()` VALIDATES every entry and THROWS on the whole file if one is invalid;
-#   * `api_key` is valid with `key` undefined-or-STRING and `env` undefined-or-an-object-of-strings;
-#   * `oauth` is valid only with `access` AND `refresh` STRINGS and a FINITE numeric `expires`;
-#   * `read()` returns a credential only when it YIELDS A KEY: an `api_key` entry with no key (or a
-#     blank one) is a VALID file that supplies NOTHING — the provider then falls through to the
-#     process environment, which a cell lane does not have;
-#   * any other `type` is invalid (`Invalid auth.json credential for provider …`).
-# This copy is READ-ONLY, and it is the SAME program cloud-cell-bringup.sh carries (there, beside the
-# only writer). The two must not drift: one box certified from two different answers is the defect
-# this gate exists to remove.
-SUP_STORE_ENTRY_STATE_JQ='
+# ⛔ pi's OWN RULE, read from its source and then EXERCISED against pi (`dist/core/auth-storage.js`,
+# `ReadOnlyAuthStorage.load()`): it validates EVERY entry and THROWS on the whole file if any one is
+# invalid — so one bad entry makes every provider unreadable, which a cell then experiences as
+# `No API key found for <provider>` (the #2024 death). Per pi:
+#   * `api_key`  needs `key` absent-or-STRING and `env` absent-or-an-object whose values are ALL
+#                strings (`env: null`, an array, or a non-string value is INVALID);
+#   * `oauth`    needs `access` AND `refresh` STRINGS and a FINITE numeric `expires`;
+#   * any other `type`, or a non-object entry, is INVALID.
+# And `read()` returns a credential only when it YIELDS A KEY: an `api_key` with no key (or a blank
+# one) is a VALID file that supplies NOTHING — the provider then falls through to the environment a
+# cell lane does not have.
+# ⛔ VALIDITY IS WHOLE-FILE (every entry); USABILITY is per-provider. Validating only the wanted
+# provider is a fail-open: `{"deepseek":{valid},"openai":false}` certified a store pi throws on.
+# This copy is READ-ONLY, and it must stay the SAME program `cloud-cell-bringup.sh` carries (there,
+# beside the only writer): one box certified from two different answers is the defect this gate
+# exists to remove.
+SUP_STORE_ENTRY_VALID_JQ='
   def nbstring: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
-  def valid_env: (. == null) or ((type == "object") and ([.[] | type == "string"] | all));
-  if type != "object" then "malformed"
-  elif .type == "api_key" then
-    (if (.key | nbstring) then "present"
-     elif (((.key == null) or ((.key | type) == "string")) and ((.env | valid_env))) then "merge"
-     else "malformed" end)
-  elif .type == "oauth" then
-    (if ((.access | nbstring) and (.refresh | nbstring) and ((.expires | type) == "number")) then "present"
-     else "malformed" end)
-  else "malformed" end'
+  def valid_env: ((has("env") | not)
+                  or (((.env | type) == "object")
+                      and ([(.env // {})[] | (type == "string")] | all)));
+  (type == "object") and (
+    ((.type == "api_key")
+      and ((.key == null) or ((.key | type) == "string"))
+      and valid_env)
+    or ((.type == "oauth")
+        and (.access | nbstring) and (.refresh | nbstring)
+        and ((.expires | type) == "number") and ((.expires | isinfinite) | not))
+  )'
+
+# sup_store_entry_usable_jq <provider> — the per-provider question, on a file already known VALID.
+sup_store_entry_usable_jq() {
+  local p="${1:-}"
+  printf '(.[%s] // null) as $e | ($e != null) and (\n' "\"$p\""
+  printf '  (($e.type == "api_key") and ($e.key | type == "string") and ((($e.key | gsub("^\\\\s+|\\\\s+$"; "")) | length) > 0))\n'
+  printf '  or ($e.type == "oauth"))'
+}
 
 # sup_store_state <auth.json> <provider> -> present | mergeable | malformed | empty | unreadable
 #   present    a credential for this provider that pi can USE
-#   mergeable  the file is sound and the provider has no usable key (no entry, or an api_key entry
-#              with no/blank key) — so a key could be ADDED, which is the bring-up's job
-#   malformed  pi THROWS reading this file, so NO provider in it can authenticate
+#   mergeable  the file is VALID and this provider has no usable key (no entry, or an api_key with no
+#              or blank key) — a key could be ADDED, which is the bring-up's job
+#   malformed  pi THROWS reading this file (any invalid entry anywhere), so NO provider in it works
 #   empty      absent file, 0 bytes, WHITESPACE ONLY, or `{}` — the measured defect
 #   unreadable not a JSON object at all (a scalar, an array, or unparseable)
 sup_store_state() {
-  local auth="$1" prov="$2" st
+  local auth="$1" prov="$2"
   if [ ! -e "$auth" ] || [ ! -s "$auth" ] || ! grep -q '[^[:space:]]' "$auth" 2>/dev/null; then
     printf 'empty\n'; return 0
   fi
@@ -2577,14 +2562,13 @@ sup_store_state() {
   if jq -e 'length == 0' "$auth" >/dev/null 2>&1; then
     printf 'empty\n'; return 0
   fi
-  st="$(jq -r --arg p "$prov" "
-      if (.[\$p] // null) == null then \"merge\"
-      else (.[\$p] | ${SUP_STORE_ENTRY_STATE_JQ}) end" "$auth" 2>/dev/null)" || st=""
-  case "$st" in
-    present)         printf 'present\n' ;;
-    merge|absent)    printf 'mergeable\n' ;;
-    *)               printf 'malformed\n' ;;
-  esac
+  if ! jq -e "([to_entries[] | .value | ${SUP_STORE_ENTRY_VALID_JQ}] | all)" "$auth" >/dev/null 2>&1; then
+    printf 'malformed\n'; return 0
+  fi
+  if jq -e "$(sup_store_entry_usable_jq "$prov")" "$auth" >/dev/null 2>&1; then
+    printf 'present\n'; return 0
+  fi
+  printf 'mergeable\n'
 }
 
 # sup_env_file_carries <VAR> — 0 iff $ENV_FILE NAMES that variable AND the value it put in this shell
@@ -2616,15 +2600,18 @@ check_provider_store() {
     malformed)
       # pi's `load()` validates EVERY entry and throws on the whole file, so this claim is about the
       # FILE and it is true: one invalid entry makes every provider unreadable.
-      die "$auth holds an entry pi REJECTS when it reads the file (an api_key needs a string key and an env map of strings; an oauth needs access+refresh strings and a finite numeric expires; any other type is invalid) — pi throws, so NO provider in this file can authenticate and every lane dies at startup. Do not delete it blindly (it is the cell's identity): fix the offending entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move the file aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
+      die "$auth holds an entry pi REJECTS when it reads the file (api_key: a string key and an env map of STRINGS; oauth: access+refresh strings and a finite numeric expires; any other type is invalid) — pi throws, so NO provider in this file can authenticate and every lane dies at startup. Do not delete it blindly (it is the cell's identity): fix the offending entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move the file aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
     unreadable)
       die "$auth exists but is not a readable JSON object, so this check cannot say whether '$prov' has a credential — and CANNOT-VERIFY IS NOT A PASS. It is also pi's credential store: do not delete it blindly. Inspect it (it should be a JSON object such as {\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}); if it is unusable, move it aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
   esac
-  if ! var="$(sup_provider_var "$prov")"; then
-    log_line "      provider store: NOT VERIFIED — this file does not know which variable carries a '$prov' key ($auth is $st), so it cannot say whether the cell can answer. Verify by execution: HOME=\$HOME pi -p 'reply with exactly PROVIDER_OK'"
-    return 0
-  fi
-  if sup_env_file_carries "$var"; then
+  # From here the store is sound but this provider has no usable key.
+  var="$(sup_provider_var "$prov")"
+  # ⛔ AN EMPTY STORE IS A REFUSAL WHATEVER THE PROVIDER IS CALLED. `sup_provider_var` derives the
+  # conventional variable for ANY provider, but even where it cannot, "no credential at all" leaves
+  # pi nothing to authenticate with — and this verb's own doctrine twenty lines up is that
+  # CANNOT-VERIFY IS NOT A PASS. An earlier version took the `NOT VERIFIED … return 0` path here and
+  # printed CELL CAN RUN A CONTROLLER over a box with `{}` and an empty keys.env.
+  if [ -n "$var" ] && sup_env_file_carries "$var"; then
     # Delivered by the file a lane sources itself, so the box CAN answer — refusing would be a false
     # block. It is still stated, because the store is the durable half and the bring-up is what makes
     # it survive a launch that sources nothing.
@@ -2634,7 +2621,7 @@ check_provider_store() {
     log_line "      which materialises the store from \$ENV_FILE: HOME=\$HOME CELL_HOME=\$CELL_HOME bash cloud-cell-bringup.sh --check"
     return 0
   fi
-  die "this box CANNOT ANSWER A PROMPT, so 'check' must not certify it: the provider credential store at $auth has no usable '$prov' credential ($st), and $ENV_FILE carries no $var to repair it from. pi consults the STORE first and then the environment, so with neither a lane exits with 'No API key found for $prov' — a ~300-byte log and no process, which a launch verifier reads as a successful launch (agent-infra#2024). FIX: put $var=<the key> in $ENV_FILE and re-run the bring-up (it materialises the store from the box's own keys.env — never from the repo or a template), then re-run this check. An ambient export is NOT a substitute: tmux serves a worker the SERVER's environment, so a key that lives only in your shell does not reach the lane."
+  die "this box CANNOT ANSWER A PROMPT, so 'check' must not certify it: the provider credential store at $auth has no usable '$prov' credential ($st), and $ENV_FILE carries no ${var:-provider key} to repair it from. pi consults the STORE first and then the environment, so with neither a lane exits with 'No API key found for $prov' — a ~300-byte log and no process, which a launch verifier reads as a successful launch (agent-infra#2024). FIX: put ${var:-the provider key}=<the key> in $ENV_FILE and re-run the bring-up (it materialises the store from the box's own keys.env — never from the repo or a template), then re-run this check. An ambient export is NOT a substitute: tmux serves a worker the SERVER's environment, so a key that lives only in your shell does not reach the lane."
 }
 
 cmd_check() {

@@ -1493,6 +1493,13 @@ echo 'notes' > "$DEST/extensions/tortoise-capture-noindex/README.md"
 # needs `pi.extensions`, else it falls through to the index check and loads nothing.
 mkdir -p "$DEST/extensions/tortoise-capture-data"
 printf '{"name":"capture-data","version":"1.0.0"}\n' > "$DEST/extensions/tortoise-capture-data/package.json"
+# …and a `<stem>-helper.ts` is a DIFFERENT, loadable extension, not a copy of the denied one: the
+# sweep may `rm -rf`, so the remainder has to reduce to a copy MARKER, not merely start with a dash.
+printf '// a different, loadable extension sharing the prefix\n' > "$DEST/extensions/tortoise-capture-helper.ts"
+# …nor is a directory whose `pi.extensions` names a file that is NOT THERE: pi falls through to the
+# index check and loads nothing, so it is not a copy either.
+mkdir -p "$DEST/extensions/tortoise-capture-pkgmissing"
+printf '{"name":"x","pi":{"extensions":["missing.js"]}}\n' > "$DEST/extensions/tortoise-capture-pkgmissing/package.json"
 # ⛔ DRIVEN THROUGH `--install`, because the DELETE is the risk: `--verify` cannot remove anything,
 # so an arm that only verified would never see the damage a prefix-wide sweep does.
 run_install >/dev/null 2>&1
@@ -1501,10 +1508,13 @@ run_verify \
   || fail "--verify refused an unrelated path whose name starts with tortoise-capture — the pattern is too broad: $(grep -m1 'FAIL' "$LOG")"
 [ -d "$DEST/extensions/tortoise-capture-noindex" ] && [ -f "$DEST/extensions/tortoise-capture-notes.txt" ] \
   && [ -f "$DEST/extensions/tortoise-capture-data/package.json" ] \
-  && ok "…and none of the inert paths was DELETED by --install (the sweep matches pi's loadable shapes, not the name alone)" \
-  || fail "--install DELETED an inert path for its name alone — the sweep's predicate is too broad"
+  && [ -f "$DEST/extensions/tortoise-capture-helper.ts" ] \
+  && [ -f "$DEST/extensions/tortoise-capture-pkgmissing/package.json" ] \
+  && ok "…and none of the non-copies was DELETED by --install (a copy MARKER is required, not just the prefix)" \
+  || fail "--install DELETED a path that is not a copy of the denied entry — the sweep's predicate is too broad"
 rm -rf "$DEST/extensions/tortoise-capture-notes.txt" "$DEST/extensions/tortoise-capture-noindex" \
-       "$DEST/extensions/tortoise-capture-data"
+       "$DEST/extensions/tortoise-capture-data" "$DEST/extensions/tortoise-capture-helper.ts" \
+       "$DEST/extensions/tortoise-capture-pkgmissing"
 
 # (3d) A copy in the CELL'S OTHER HOME. #2916's two-home state is the measured cause: the operating
 # home kept its copies while the installer scanned the account home.

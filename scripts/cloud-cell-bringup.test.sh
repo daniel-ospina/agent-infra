@@ -710,6 +710,44 @@ br ok normal --check
   && ok "…and the entry was left BYTE-IDENTICAL (the cell's identity is never overwritten)" \
   || bad "the bring-up overwrote an entry it could not read"
 
+# (j) A WHOLE-FILE INVALID STORE — an invalid entry for a provider NOBODY asked about still makes pi
+# THROW on the whole file (measured against pi's own `ReadOnlyAuthStorage.load()`), so it must be
+# refused rather than certified on the strength of the provider this run happens to want.
+printf '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":false}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an INVALID entry for ANOTHER provider REFUSES the cell (pi throws on the file)" \
+                   || bad "bring-up certified a store pi throws on because the wanted provider looked fine"
+[ "$(cat "$AUTH")" = '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":false}' ] \
+  && ok "…and the file was left BYTE-IDENTICAL" \
+  || bad "the bring-up rewrote a store it should have refused"
+
+# (k) A ROTATED KEY: the store WINS over keys.env (pi reads the store first), so a stale stored key
+# shadows a good one and the probe 401s. The repair must not overwrite the credential, but it must
+# SAY the store is what won — otherwise the operator is told to push a key that cannot take effect.
+printf '{"deepseek":{"type":"api_key","key":"sk_stale_in_store"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "sk_stale_in_store" ] \
+  && ok "an existing stored key is NOT overwritten by the delivered one (a decision, not a repair)" \
+  || bad "the repair overwrote an existing credential"
+case "$BR_OUT" in
+  *"DIFFERENT 'deepseek' key"*) ok "…and the SHADOW is reported by name, so a rotation is diagnosable" ;;
+  *) bad "a stale stored key shadows keys.env silently — the operator would chase the wrong half: $BR_OUT" ;;
+esac
+
+# (l) AN UNLISTED LANE PROVIDER is DERIVED, not refused-on-unknown: `PI_LANE_PROVIDER=zai` +
+# `ZAI_API_KEY` in keys.env must materialise a `zai` entry. A four-name table made both verbs unable
+# to judge `zai` — the supervisor passed a keyless box and the bring-up prescribed an edit its loop
+# would never read (review round 3).
+rm -f "$AUTH"
+printf 'ZAI_API_KEY=sk_zai_fixture\n' > "$T/keys-zai.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-zai.env" BR_EXTRA_ENV="PI_LANE_PROVIDER=zai" br ok normal --check
+[ "$(jq -r '.zai.key // ""' "$AUTH" 2>/dev/null)" = "sk_zai_fixture" ] \
+  && ok "an unlisted provider (zai) is materialised from its DERIVED variable (ZAI_API_KEY)" \
+  || bad "PI_LANE_PROVIDER=zai was not materialised — the derived-variable path is broken: $(jq -c . "$AUTH" 2>/dev/null)"
+
 # restore a healthy store for every arm after this block
 rm -f "$AUTH"
 printf '%s\n' "$TOK_BODY" > "$TOK"
