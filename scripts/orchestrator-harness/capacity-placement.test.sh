@@ -1577,6 +1577,54 @@ L20M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="sleep 12" CAP_INVEN
 _t1m="$(date +%s)"; _dtm=$(( _t1m - _t0m ))
 ck "  …mutation control: with the bound removed the same call takes ${_dtm}s (so (t) is load-bearing)" \
    "$([ "$_dtm" -ge 11 ] && echo 0 || echo 1)"
+# (v) ⛔ THE SPLITTER MUST NOT SHRINK THE LISTING EITHER (fresh review round 2, P2). The objects are
+# split on `},{`; a byte at the boundary other than space/tab — `\r` from a CRLF listing is the
+# realistic one — left the WHOLE listing as ONE fragment, so only the FIRST machine was read:
+# MEASURED as `expected=1 published=1 INELIGIBLE=0`, a whole-fleet-healthy line with a live box
+# invisible. Normalise, and REFUSE a listing whose `"status"` keys outnumber its objects (a split
+# that did not happen).
+INVCR="$TMP/inventory-3446-crlf.json"
+printf '%s\r\n' '{"machines":[{"name":"pi-cell-1","status":"running","network":{"ipv4":"10.0.0.1"}},' '{"name":"pi-cell-2","status":"running","network":{"ipv4":"10.0.0.2"}}]}' > "$INVCR"
+L21="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INVCR" cap_fleet_line_from "" 0)"; RC=$?
+ck "(v) a CRLF-separated listing is read in full — never a shrunken expected ($L21)" \
+   "$([ "$RC" -eq 0 ] && qF 'expected=2' "$L21" && qF 'published=0' "$L21" && ! qF 'expected=1' "$L21" && echo 0 || echo 1)"
+# (v-mutant) NON-VACUITY, with BOTH defences reverted (the pre-fix splitter): the same bytes then read
+# `expected=1` — the shrunken-denominator shape — so (v) is grading the fix and not the fixture.
+sed -e 's|gsub(/\\r/, "", buf)|{ }|' -e 's|if (nstatus > objs) bad += (nstatus - objs)|{ }|' "$CAP" > "$TMP/cap-presplit.sh"
+L21M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INVCR" bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-presplit.sh" 2>&1)"
+ck "  …mutation control: the pre-fix splitter reads the same bytes as expected=1 ($L21M)" \
+   "$(qF 'expected=1' "$L21M" && echo 0 || echo 1)"
+# (w) ⛔ THE BOUND MUST BIND A CHILD THAT LEAVES A DESCENDANT BEHIND (fresh review round 2, P2).
+# `kill -9` reaches the DIRECT pid; a descendant the provider left (`( … ) &`, a wrapper, an `ssh`)
+# inherits the caller's stdout and keeps `$( )` open past the bound — MEASURED: the pre-fix watchdog
+# returned after the child's FULL 8s with rc 124, i.e. it bounded nothing on the only arm macOS can
+# reach. The child now writes to a FILE, so no descendant can hold the reader. `CAP_BOUND_IMPL`
+# forces the third arm (CI is Linux, where `timeout` wins — the arm the fleet depends on is macOS).
+HOLD="$TMP/hold-stdout.sh"
+printf '%s\n' '#!/bin/bash' '( sleep 8; echo late ) &' 'sleep 8' > "$HOLD"; chmod +x "$HOLD"
+_w0="$(date +%s)"
+HEREDOC_LINE="$(CAP_BOUND_IMPL=watchdog CAP_INVENTORY_TIMEOUT=1 CAP_CMUX_LIST="$HOLD" cap_fleet_inventory 2>&1)"
+_w1="$(date +%s)"; _dw=$(( _w1 - _w0 ))
+ck "(w) the WATCHDOG arm bounds a child that leaves a descendant holding stdout (${_dw}s, not 8s: $HEREDOC_LINE)" \
+   "$([ "$_dw" -lt 5 ] && qF 'timed out after 1s' "$HEREDOC_LINE" && echo 0 || echo 1)"
+# (w-mutant) NON-VACUITY: the PRE-FIX watchdog body (child inherits stdout) takes the full 8s.
+{ cat "$CAP"; cat <<'CAPMUT'
+cap_bounded() {
+  local s="${1:-}"; shift 2>/dev/null || true
+  local _p _w _rc
+  "$@" & _p=$!
+  { sleep "$s"; kill -9 "$_p"; } >/dev/null 2>&1 & _w=$!
+  wait "$_p" 2>/dev/null; _rc=$?
+  if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
+  return "$_rc"
+}
+CAPMUT
+} > "$TMP/cap-inherit-stdout.sh"
+_w0m="$(date +%s)"
+CAP_BOUND_IMPL=watchdog CAP_INVENTORY_TIMEOUT=1 CAP_CMUX_LIST="$HOLD" bash -c '. "$1"; cap_fleet_inventory' _ "$TMP/cap-inherit-stdout.sh" >/dev/null 2>&1
+_w1m="$(date +%s)"; _dwm=$(( _w1m - _w0m ))
+ck "  …mutation control: the pre-fix watchdog inherits stdout and takes ${_dwm}s (so (w) is load-bearing)" \
+   "$([ "$_dwm" -ge 7 ] && echo 0 || echo 1)"
 
 
 echo

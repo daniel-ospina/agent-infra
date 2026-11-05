@@ -292,6 +292,10 @@ CAP_CMUX_LIST="${CAP_CMUX_LIST:-}"             # the inventory command LINE (def
 # `timeout` -> `gtimeout` -> a bash-native watchdog (the same contract as `repo-authority.sh`'s
 # `_gh_bounded` for the identical macOS constraint). A timeout is a NAMED reading, never a zero.
 CAP_INVENTORY_TIMEOUT="${CAP_INVENTORY_TIMEOUT:-10}"  # seconds
+# ⛔ WHICH ARM OF THE BOUND TO USE: `auto` (default) walks it, `watchdog` FORCES the third arm. The third
+# arm is the macOS case and CI is Linux, so without a seam the arm the fleet actually depends on could
+# never be graded — the same reason the drainer suite pins `DRAINER_OS` instead of inheriting `uname`.
+CAP_BOUND_IMPL="${CAP_BOUND_IMPL:-auto}"      # auto | watchdog
 CAP_NS="${CAP_NS:-refs/boxes}"                 # the namespace peers publish under
 CAP_HOST="${CAP_HOST:-}"                       # identity seam (default: hostname -s)
 CAP_BOXID="${CAP_BOXID:-}"                     # per-box identity seam (default: derived, see cap_boxid)
@@ -1201,21 +1205,35 @@ cap_cmux_bin() {
 # cap_bounded <secs> <cmd...> — `timeout` -> `gtimeout` -> a bash-native watchdog (rc 124 on timeout).
 # ⛔ THE THIRD ARM IS THE macOS CASE, NOT A COURTESY: `timeout` is GNU coreutils and macOS ships it
 # nowhere (`gtimeout` only with Homebrew), so on the platform this fleet runs its inventory from neither
-# of the first two can fire. The watchdog's own output is redirected because a `$( )` caller reads until
-# every holder of the pipe's write end closes it — a bare `( sleep; kill ) &` would turn a bound into a
-# `sleep <secs>` floor on every healthy probe. No `sleep` at all => run direct rather than fake a 124.
+# of the first two can fire. No `sleep` at all => run direct rather than fake a 124.
+# ⛔ THE WATCHDOG WRITES THE CHILD'S STDOUT TO A FILE, AND THAT IS LOAD-BEARING (fresh review, P2).
+# `kill -9 "$_p"` reaches the DIRECT pid only, so a descendant the provider left behind (a wrapper, an
+# `ssh`, `( … ) &`) inherits our stdout and keeps the CALLER'S `$( )` pipe open past the bound: MEASURED
+# with `timeout`/`gtimeout` removed from PATH, `cap_bounded 2 bash -c '( sleep 20; echo late ) & sleep 20'`
+# returned after the FULL 20s with rc 124 — a bound that bounds nothing on the only arm macOS can reach.
+# Giving the child a file instead of our stdout means no descendant can hold the reader open; the bytes
+# are `cat`ed after the wait, and a lingering grandchild is then the provider's business, not a wedge in
+# the drainer tick that holds the lock.
 cap_bounded() {
-  local s="${1:-}"; shift 2>/dev/null || true
+  local s="${1:-}" impl="${CAP_BOUND_IMPL:-auto}"; shift 2>/dev/null || true
   [ "$#" -gt 0 ] || return 2
   case "$s" in ''|*[!0-9]*) s=10 ;; esac
-  if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
-  if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
+  if [ "$impl" != "watchdog" ]; then
+    if command -v timeout >/dev/null 2>&1; then timeout "$s" "$@"; return $?; fi
+    if command -v gtimeout >/dev/null 2>&1; then gtimeout "$s" "$@"; return $?; fi
+  fi
   command -v sleep >/dev/null 2>&1 || { "$@"; return $?; }
-  local _p _w _rc
-  "$@" & _p=$!
-  { sleep "$s"; kill -9 "$_p"; } >/dev/null 2>&1 & _w=$!
+  local _p _w _rc _tmp=""
+  _tmp="$(mktemp "${TMPDIR:-/tmp}/cap-bounded.XXXXXX" 2>/dev/null)" || _tmp=""
+  if [ -n "$_tmp" ]; then
+    "$@" >"$_tmp" 2>/dev/null & _p=$!
+  else
+    "$@" & _p=$!          # no mktemp: the timeout still binds, the pipe hazard is stated above
+  fi
+  { sleep "$s"; kill -9 "$_p" 2>/dev/null; } >/dev/null 2>&1 & _w=$!
   wait "$_p" 2>/dev/null; _rc=$?
   if kill -0 "$_w" 2>/dev/null; then kill "$_w" 2>/dev/null; else _rc=124; fi
+  [ -z "$_tmp" ] || { cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; }
   return "$_rc"
 }
 
@@ -1247,12 +1265,22 @@ cap_parse_inventory() {
     { buf = buf $0 }
     END {
       if (buf == "") exit 1
+      # ⛔ NORMALISE BEFORE SPLITTING, AND REFUSE A SPLIT THAT DID NOT HAPPEN (fresh review, P2).
+      # The split is on `},{` with spaces/tabs allowed between; ANY other byte at the boundary (`\r`
+      # from a CRLF listing, a stray separator) left the WHOLE listing as ONE fragment, which yields
+      # only the FIRST machine — `got=1`, rc 0, no `why=`. MEASURED: two running machines, CRLF
+      # separated -> `expected=1 published=1 INELIGIBLE=0`, a whole-fleet-healthy line with a live box
+      # invisible. So `\r` is dropped, and a listing that still hides objects in one fragment is
+      # caught structurally: the number of `"status"` keys must equal the number of machine objects.
+      gsub(/\r/, "", buf)
+      _cp = buf; nstatus = gsub(/"status"[ \t]*:/, "", _cp)
       n = split(buf, m, /}[ \t]*,[ \t]*\{/)
-      got = 0; bad = 0; acc = ""
+      got = 0; bad = 0; objs = 0; acc = ""
       for (i = 1; i <= n; i++) {
         # A fragment carrying neither machine field is not a machine object (the wrapper head, or an
         # empty array) — that is not an unclassifiable OBJECT.
         if (m[i] !~ /"name"[ \t]*:/ && m[i] !~ /"status"[ \t]*:/) continue
+        objs++
         st = jget(m[i], "status")
         nm = jget(m[i], "name")
         if (st == "" || nm == "") { bad++; continue }
@@ -1266,6 +1294,8 @@ cap_parse_inventory() {
         acc = acc nm " " (ip == "" ? "-" : ip) "\n"
         got = 1
       }
+      # The structural check: more `status` keys than objects means the splitter did not split.
+      if (nstatus > objs) bad += (nstatus - objs)
       # ⛔ A REFUSED LISTING PRINTS NO PARTIAL LIST: the whole answer is UNKNOWN, so a caller can never
       # read the objects it happened to classify as the fleet that exists. (The count rides on the one
       # line the caller parses.)

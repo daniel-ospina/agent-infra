@@ -326,8 +326,10 @@ tick then exits `SKIP: drainer already running` and the box stops topping up —
 controller cycle. `timeout` is GNU and macOS ships it nowhere, so the bound walks `timeout` →
 `gtimeout` → a bash-native watchdog (the same contract as `repo-authority.sh`'s `_gh_bounded`); a
 timeout reads `provider-inventory-unreadable(<cmd> timed out after <n>s)`, never a quiet fleet. The
-sibling reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this
-line's path.
+watchdog (the macOS arm) writes the child's stdout to a FILE rather than to the caller's own: `kill`
+reaches the direct pid only, so a descendant the provider left behind would otherwise keep the caller's
+`$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. The sibling
+reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this line's path.
 
 A provider that lists **zero** running machines reads as `provider-inventory-unparseable`, not
 `expected=0`: the reader cannot tell an empty listing from one it failed to parse, and guessing zero
@@ -335,7 +337,10 @@ would hide the parse failure (an operator in that state pins `CAP_EXPECTED=0`, w
 claim rather than an inference). The same rule covers a machine the extractor **cannot classify**: only
 a status READ as `stopped` is treated as parked, and an unreadable/unknown status (or a case variant
 such as `Running`) refuses the WHOLE listing rather than shrinking `expected` — a smaller denominator
-reads as a whole fleet, which is the false PASS this line exists to kill.
+reads as a whole fleet, which is the false PASS this line exists to kill. A listing the SPLITTER could
+not separate is refused the same way (a `"status"` key count higher than the object count means objects
+are still hiding inside one fragment — the CRLF shape), so an unread listing can never arrive as a
+short fleet.
 
 ⛔ **A CELL HAS NO PROVIDER CLI, SO A CELL MUST PIN ITS EXPECTATION.** `cmux vm list` exists on the Mac
 that runs the VMs; a cell is a headless Linux VM with no app and no `cmux` binary
