@@ -32,12 +32,36 @@ import traceback
 import urllib.parse
 import urllib.request
 
-REPO = "daniel-ospina/tortoise"
+DEFAULT_REPO = "daniel-ospina/tortoise"
+REPO = DEFAULT_REPO
 # ⛔ `--repo` EXISTS BECAUSE `fleet_census(repos)` CANNOT BE A WRAPPER OF A MODULE THAT TAKES NO
 # ARGUMENTS (#3382 row 4, docs/ops/orchestrator-mcp-inventory.md §5.0 V4 / §7.7). It is a PARAMETER on
 # the existing derivation, never a second one: `compute()` still owns every P0/P1/coverage rule and
 # reads this global. Defaulted to the same repo, so the beat's call (which passes no argv) is unchanged.
+#
+# ⛔ AND `--repo` MUST NOT BE ABLE TO RELABEL ANOTHER REPO'S NUMBERS. The cache is one file on one box
+# and the payload it stores used to carry no repo identity at all, while the render stamped
+# `payload["repo"] = REPO` on whatever it read. So for the whole TTL (~15 beats of 16) a
+# `--repo owner/other` call returned the CACHED tortoise figures labelled `owner/other` — a figure
+# attributed to a repo it was never measured on — and, in the other direction, a missing call wrote
+# other-repo numbers into the shared file that the no-arg beat then rendered as tortoise's `DELIVERY:`
+# line. `mcp-servers/orchestrator/server.py::_census` is exactly that caller: it fans out over
+# `repos` with `["--repo", repo, "--json"]`. Three things make it impossible: the payload NAMES the
+# repo it measured, a cache whose `repo` does not match is a MISS, and the file is keyed per repo.
 CACHE = os.path.expanduser("~/.pi/agent/state/beta-progress.json")
+
+
+def _cache_path():
+    """The cache file for the CURRENT `REPO`.
+
+    The DEFAULT repo keeps the historical path byte-for-byte, because that file has other READERS
+    (`scripts/merge-queue.py` opens it directly) and the beat that writes it passes no `--repo`. Any
+    other repo gets its own file, so a fan-out cannot overwrite the beat's state.
+    """
+    if REPO == DEFAULT_REPO:
+        return CACHE
+    root, ext = os.path.splitext(CACHE)
+    return "%s.%s%s" % (root, REPO.replace("/", "__"), ext or ".json")
 TTL = 1800  # was 3600; halved so the worst-case lag is 30m, at ~2x the API cost (still cheap)
 # ⛔ A CACHE `ts` MAY NOT BE IN THE FUTURE. Clock skew between the writer and the reader is real,
 # so a little is allowed and no more; see the validator in `main()` for why the bound is not
@@ -507,7 +531,8 @@ def compute():
                 return True
         return False
 
-    out = {"ts": int(time.time()), "open_prs": len(openpr), "merged_today": merged_today}
+    out = {"ts": int(time.time()), "repo": REPO,
+           "open_prs": len(openpr), "merged_today": merged_today}
     for tier, label in (("p0", "P0-blocker"), ("p1", "P1-severe")):
         # ⛔ STILL GRAPHQL, and NOT covered by the fallback above: where the layer's REST adapter
         # is absent (#1978 -- the cells) a refusal here returns None and the WHOLE line still
@@ -561,8 +586,9 @@ def main(argv=None):
             return 2
         i += 1
     data = None
+    _cache_path_now = _cache_path()
     try:
-        with open(CACHE) as fh:
+        with open(_cache_path_now) as fh:
             cached = json.load(fh)
         # ⛔ A CACHE THIS VERSION CANNOT RENDER IS NOT A CACHE. The cache-hit path is the one
         # taken on ~15 beats out of 16 (TTL 1800 s, heartbeat every ~2 min), and it is ABOVE the
@@ -598,7 +624,16 @@ def main(argv=None):
                           for tier in ("p0", "p1"))):
             cached = None
         if cached is not None and time.time() - cached.get("ts", 0) < TTL:
-            data = cached
+            # ⛔ A CACHE THAT NAMES A DIFFERENT REPO IS NEVER THIS REPO'S ANSWER. And an UNLABELLED
+            # cache is only this repo's when it is the BASE file (`REPO == DEFAULT_REPO`), which is
+            # the one path the label-less writer ever used — so that inference is provable, not
+            # hopeful. Any other repo reads its own repo-keyed file (`_cache_path()`), so it can
+            # never inherit the beat's figures.
+            _cr = cached.get("repo")
+            if (_cr is not None and _cr != REPO) or (_cr is None and REPO != DEFAULT_REPO):
+                cached = None
+            else:
+                data = cached
     except Exception as exc:
         # ⛔ NOT SILENT (#2142 review). The beat discards stderr, so this costs nothing where it
         # matters and is the ONLY reason an operator hand-running the script gets -- a genuine
@@ -638,7 +673,7 @@ def main(argv=None):
             print("DELIVERY: unavailable (metrics read failed)")
             return 0
         try:
-            with open(CACHE, "w") as fh:
+            with open(_cache_path_now, "w") as fh:
                 json.dump(data, fh)
         except Exception:
             pass

@@ -713,8 +713,9 @@ class Evidence:
     #
     # `cpu` carries STEP 2's result as the tree states it — the cumulative-CPU delta over TWO samples
     # with a STATED tolerance — never `ps -o pcpu` (a lifetime average: the tree's measured 3-of-73
-    # case). `attributable` is `lane-status.py::lane_cpu_busy`'s exactly-one-lane-to-one-process guard:
-    # False means the sample exists but cannot be attributed, which is an abstention, not a park.
+    # case). There is NO `attributable` field: `lane-status.py::lane_cpu_busy`'s exactly-one-lane-to-
+    # one-process guard is expressed as `advanced is None` ("sampled, but not attributable"), which is
+    # an abstention and never a park. `CpuSample`'s own fields are the whole contract.
     cpu: Optional["CpuSample"] = None
     child: Optional["ChildEvidence"] = None
     now_ms: int = 0
@@ -1666,10 +1667,18 @@ def evaluate(ev: Evidence) -> Verdict:
     #      worthless. `advanced is not True` (including the three-valued `None`) falls through: an
     #      unattributable sample must never be read as a park, and must never be read as progress.
     if ev.cpu is not None and ev.cpu.advanced is True:
+        # ⛔ AN UNREAD NUMBER RENDERS `?`, NEVER `0` — the rule `_n()` states a few lines down. The MCP
+        # path always constructs `CpuSample(advanced=…, delta_s=None, window_ms=None)`, so `or 0.0`
+        # printed `cpu +0.00s over 0s` beside a `running-quiet` state: the module's own
+        # contradicting-evidence class (the `bytes_delta=-990` fix), and a claim that a tolerance was
+        # measured over a window that was never sampled.
         return Verdict("running-quiet", "cpu-advanced", holder_pid=holder.pid,
-                       detail=("cpu +%.2fs over %.0fs (tolerance %.2fs)"
-                               % (ev.cpu.delta_s or 0.0, (ev.cpu.window_ms or 0) / 1000.0,
-                                  ev.cpu.tolerance_s)))
+                       detail=("cpu +%s over %s"
+                               % (_n(None if ev.cpu.delta_s is None else "%.2fs" % ev.cpu.delta_s),
+                                  _n(None if ev.cpu.window_ms is None
+                                     else "%.0fs" % (ev.cpu.window_ms / 1000.0)))
+                               + ("" if ev.cpu.delta_s is None
+                                  else " (tolerance %.2fs)" % ev.cpu.tolerance_s)))
 
     if ev.tool is not None and ev.tool.tools_in_flight > 0 and not tool_veto_expired(ev.tool):
         # Quiet is never a stall: the tool veto holds until the watchdog's own
