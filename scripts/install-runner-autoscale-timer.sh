@@ -1321,6 +1321,37 @@ refuse_root_invocation() {
     return 1
 }
 
+# refuse_adopted_provisioner — judge the pin THAT WAS ADOPTED, AFTER adoption supplied it.
+# ⛔ THE PREDICATE IS SCOPED TO `PROVISIONER` ON PURPOSE. `PROVISIONER` is adopted from the installed
+# artifact, so it is the one value whose magnitude is not known until the verbs run; every OTHER value is
+# the writer's own and the pre-selection `refuse_unusable_target` already judged it. Judging the ARTIFACT's
+# whole declared set here would REFUSE A REPAIR THE MESSAGE ITSELF RECOMMENDS: an artifact whose declared
+# HOME sits in a mktemp tree is rendered fresh with the writer's own HOME, so re-installing it is the FIX,
+# not the crime — measured, the too-broad form refused that re-install (`rc=1`, artifact unrepaired) and
+# also blocked `--disarm` on the same box (`rc=1` STILL ARMED, record stranded). Apply the SAME rules the
+# writers already apply to this field — backslash, and on systemd `%`/whitespace — to the value that will
+# actually be rendered, once it exists.
+refuse_adopted_provisioner() {
+    [ -n "$PROVISIONER" ] || return 0
+    case "$PROVISIONER" in
+        *\\*) err "REFUSING: the provisioner pin this install would render contains a backslash — the artifact is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
+    esac
+    if [ "${TARGET:-}" != "launchd" ]; then
+        case "$PROVISIONER" in
+            *[[:space:]]*) err "REFUSING: the provisioner pin this install would render contains whitespace — systemd splits the rendered unit on it, so the job would never run"; return 1 ;;
+            *%*) err "REFUSING: the provisioner pin this install would render contains '%', which systemd expands as a specifier at load time (%h, %i, %n) — the rendered path would differ from the real one"; return 1 ;;
+        esac
+    fi
+    if is_transient_scratch "$PROVISIONER"; then
+        err "REFUSING: the provisioner pin this install would render is inside TRANSIENT SCRATCH SPACE: PROVISIONER=$PROVISIONER"
+        err "That tree is removed before the first tick, so every pass reports 'no provisioner' and the box can"
+        err "never ADD capacity — the same inert-enforcer shape the writers refuse to CREATE. Re-install from a"
+        err "durable checkout, or set RUNNER_AUTOSCALE_PROVISIONER to a durable path."
+        return 1
+    fi
+    return 0
+}
+
 # warn_provisioner_reach — the FILL-half warning, emitted where the FACT is known.
 # ⛔ IT USED TO RUN IN `do_install` BEFORE TARGET SELECTION, i.e. BEFORE `adopt_installed_provisioner`
 # had had any chance to supply the pin from the artifact. Measured consequence on a re-install that
@@ -1370,13 +1401,14 @@ do_install_systemd() {
     refuse_report_only_over_record || return 1
     refuse_systemd_unsafe_values || return 1
     adopt_installed_provisioner
-    # ⛔ THE GUARD RUNS AGAIN AFTER ADOPTION, BECAUSE ADOPTION CAN INTRODUCE THE VERY STATE IT REFUSES.
-    # Only `PROVISIONER` is adopted, and it is adopted HERE — so the pre-selection pass judged an EMPTY
-    # value on exactly the re-install the adoption exists for. Measured before this second pass: an
-    # artifact declaring a mktemp-tree provisioner was ADOPTED, re-rendered and installed with `exit 0`,
+    # ⛔ THE PIN IS JUDGED AGAIN AFTER ADOPTION, BECAUSE ADOPTION CAN INTRODUCE THE VERY STATE THE WRITER
+    # REFUSES TO CREATE. `PROVISIONER` is adopted HERE, so the pre-selection `refuse_unusable_target`
+    # judged an EMPTY value on exactly the re-install the adoption exists for. Measured before this pass:
+    # an artifact declaring a mktemp-tree provisioner was ADOPTED, re-rendered and installed with `exit 0`,
     # and `--status` on that same artifact then exited 1 ("points into TRANSIENT SCRATCH SPACE") — the
-    # writer certifying what its own reader reds. One predicate, both readers, after the value exists.
-    refuse_transient_installed_artifact "$(artifact_path_for_target)" || return 1
+    # writer certifying what its own reader reds. See `refuse_adopted_provisioner` for why the predicate
+    # is scoped to this one field rather than re-judging the whole artifact.
+    refuse_adopted_provisioner || return 1
     warn_provisioner_reach
     note_repo_change
 
@@ -1476,7 +1508,7 @@ do_install_launchd() {
     adopt_installed_state_dir
     refuse_report_only_over_record || return 1
     adopt_installed_provisioner
-    refuse_transient_installed_artifact "$(artifact_path_for_target)" || return 1
+    refuse_adopted_provisioner || return 1
     warn_provisioner_reach
     note_repo_change
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
@@ -2224,7 +2256,7 @@ do_status() {
                 if [ "$TARGET" != "launchd" ]; then
                     case "${dv#*=}" in
                         *[[:space:]]*) err "the installed artifact declares ${dv%%=*} containing WHITESPACE — systemd splits the rendered unit on it, so the job does not run as written"; rc=1 ;;
-                        *%*) err "the installed artifact declares ${dv%%=*} containing '%', which systemd expands as a SPECIFIER at load time (%h, %i, %n) — the job is handed a value that is not the one on disk, and `last_tick` then stays silent in the path the pass actually logs to"; rc=1 ;;
+                        *%*) err "the installed artifact declares ${dv%%=*} containing '%', which systemd expands as a SPECIFIER at load time (%h, %i, %n) — the job is handed a value that is not the one on disk, and 'last_tick' then stays silent in the path the pass actually logs to"; rc=1 ;;
                     esac
                 fi
             done

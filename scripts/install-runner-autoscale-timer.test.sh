@@ -1972,6 +1972,44 @@ assert_contains "$OUT" "PROVISIONER=$TPROV" "and the value it adopted"
 assert_absent "$OUT" "changed=1" "with nothing rendered or installed"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "and --status already refused it, so writer and reader now AGREE"
+# ⛔ THE PREDICATE IS SCOPED TO `PROVISIONER`, AND THAT SCOPING IS THE DIFFERENCE BETWEEN A GUARD AND A
+# FALSE BLOCK. An artifact whose declared HOME sits in a mktemp tree is rendered FRESH with the writer's
+# own HOME, so re-installing it is the REPAIR — a guard that judged the artifact's whole declared set here
+# refused that repair (rc=1, artifact unrepaired) and blocked `--disarm` too (rc=1 STILL ARMED, record
+# stranded). Both are pinned below, because "refuse more" is not a fix.
+D3="$T/c67b"; fresh "$D3"; rm -f "$ARM"
+OUT="$(run_install Linux "$D3" --install)"; RC=$?
+assert_eq "$RC" 0 "precondition: the artifact installs"
+box_sed_i 's|^Environment=HOME=.*|Environment=HOME=/tmp/tmp.ra-home.$$|' "$D3/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D3" --install)"; RC=$?
+assert_eq "$RC" 0 "a re-install REPAIRS an artifact whose declared HOME is transient (it is re-rendered with the writer's HOME)"
+assert_absent "$OUT" "TRANSIENT SCRATCH" "and does not refuse the repair it exists to perform"
+OUT="$(run_install Linux "$D3" --disarm)"; RC=$?
+assert_eq "$RC" 0 "--disarm still works over that artifact (the too-broad guard stranded the record here)"
+# …while the value that IS rendered is still judged: a '%' pin is a systemd specifier, on adoption too.
+# ⛔ THE PIN MUST EXIST TO BE ADOPTED AT ALL (`adopt_installed_provisioner` requires a readable file), so a
+# nonexistent '/opt/pc%h/inst.sh' would prove nothing — the case would pass because adoption SKIPPED it.
+# And it must be the artifact's pin BEFORE any re-render drops it: a re-install that cannot resolve one
+# writes the artifact WITHOUT a pin, so this needs its own fixture, installed with a pin.
+PCTDIR="$T/home/pc%h"; mkdir -p "$PCTDIR"; printf '#!/bin/sh\n' >"$PCTDIR/inst.sh"; chmod +x "$PCTDIR/inst.sh"
+D5="$T/c67c"; fresh "$D5"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Linux "$D5" --install >/dev/null 2>&1; ENVV=()
+assert_contains "$(cat "$D5/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV3" \
+    "precondition: the percent-case fixture carries a pin to adopt"
+box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$PCTDIR/inst.sh|" "$D5/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D5" --install)"; RC=$?
+assert_eq "$RC" 1 "an ADOPTED pin containing '%' is refused (systemd expands it at load time)"
+assert_contains "$OUT" "contains '%'" "naming the specifier rule it breaks"
+# The launchd guard has to be pinned on its OWN arm, or deleting it leaves the suite green.
+D4="$T/c67e"; fresh "$D4"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Darwin "$D4" --install >/dev/null 2>&1; ENVV=()
+box_sed_i "s|<string>$PROV3</string>|<string>$SCRATCH/inst.sh</string>|g" "$D4/$LABEL.plist"
+OUT="$(run_install Darwin "$D4" --install)"; RC=$?
+assert_eq "$RC" 1 "a launchd re-install refuses a transient ADOPTED pin too (this arm had no case)"
+assert_contains "$OUT" "TRANSIENT SCRATCH" "with the same message class as the systemd arm"
+
 # The launchd arm adopts too, and deleting that call left the suite green — so pin it here.
 D2="$T/c67d"; fresh "$D2"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
