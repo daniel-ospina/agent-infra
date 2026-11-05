@@ -349,11 +349,17 @@ wt_disk_admit() {
         # log (a different file) can quote it without the reader having to join two logs.
         WT_RESULT="${DISK_ADMIT_LINE:-}"
         # ⛔ AN UN-NAMED REFUSAL IS `REFUSED-UNKNOWN`, NOT `REFUSED-DISK` (review round 6, P3 —
-        # MEASURED). Both callers choose their remedy from THIS token (`fix-one.sh` and `adopt-fix.sh`
-        # match `*REFUSED-UNKNOWN*`, everything else gets "reclaim space"), so labelling the one branch
-        # that exists BECAUSE the measurement is unavailable as a DISK refusal sent the operator to
-        # reclaim space for a probe failure or a version skew — the #2721 wrong-cause class, arriving
-        # through the fallback this time.
+        # MEASURED). ALL THREE callers choose their remedy from THIS token (`fix-one.sh`,
+        # `adopt-fix.sh` and `dispatch-merge.sh` match `*REFUSED-UNKNOWN*`, everything else gets
+        # "reclaim space"), so labelling the one branch that exists BECAUSE the measurement is
+        # unavailable as a DISK refusal sent the operator to reclaim space for a probe failure or a
+        # version skew — the #2721 wrong-cause class, arriving through the fallback this time.
+        # ⛔ THE COUNT IN THIS COMMENT IS LOAD-BEARING (review round 8, P2 — MEASURED). It said "Both
+        # callers", so when the remedy was made verdict-selected it was fixed in the two files the
+        # comment named and `dispatch-merge.sh` — a real `wt_provision` caller, listed as one in this
+        # PR's own description — kept hardcoding "reclaim space" for a version skew. A comment that
+        # states a POPULATION must name it exhaustively or derive it; `disk-admission.test.sh`'s arm I
+        # now derives this one from the source and requires the selector in every caller's rc-4 arm.
         [ -n "$WT_RESULT" ] || WT_RESULT="REFUSED-UNKNOWN(free=?, need=?, box=$(disk_box_id 2>/dev/null || printf 'UNIDENTIFIED')): disk_admit refused without naming its numbers — a gate that refuses without stating what it measured is indistinguishable from a bug, so the caller is told the measurement is MISSING (and is NOT told to reclaim space: an unmeasured volume is not a full one)"
         wt_log provision "$WT_RESULT"
         return 1
