@@ -2476,7 +2476,242 @@ grep -q "pr merge 44 --admin" "$SCEN/calls" \
   && pass "#3715: …and the merge proceeds" \
   || fail "#3715: no merge after a clearance that should have happened"
 
-# ── 5. extraction failure is fail-closed (the vacuous-pass guard) ─────────
+# --- 4c (ter). #3415: a BASH SHARD is reproduced by a SECOND RUNNER -------
+# `bash-shard::<path>` is the ONE non-nodeid family that names an EXECUTABLE
+# ARTIFACT: the path IS the shard script, so `bash <path>` on a pristine base
+# worktree answers the only question that matters — does the BASE fail this
+# shard? Until #3415 that family was excluded from the reproduction by BOTH the
+# candidate filter and the argv filter, so a shard red the base owned could never
+# be cleared: every PR was blocked for a red main itself has, with no refusal that
+# named a cause and no measurement that could ever clear it.
+#
+# WHAT THESE CASES PIN, in the order the guarantee is built:
+#   1. a shard that FAILS on the base is CLEARED and the PR merges — through the
+#      PRODUCTION path (a real `git worktree add` of the base OID and a real
+#      `bash <path>` in it), not through a seam;
+#   2. a shard that PASSES on the base still BLOCKS (the PR broke it) — same
+#      fixture, base exit code 0. (1) and (2) together are the DISCRIMINATOR:
+#      neither can be satisfied by "the shard is never measured" or by
+#      "every shard is cleared";
+#   3. a shard the PR ADDS does not exist on the base, and its ABSENCE must never
+#      read as "the base fails it" (exit 127 under a naive rule would clear a
+#      failure the PR introduced — the fail-open direction);
+#   4. a shard KILLED by the mandatory bound (SIGALRM, 142) is not a measurement —
+#      the exit status is the BOUND's verdict, not the shard's;
+#   5. an attacker-influenced token (`../../…`) is REFUSED, not executed;
+#   6. the two runners' argv never cross: a shard id is not handed to pytest
+#      (exit 4 having run NOTHING), and a pytest capture cannot volunteer one.
+#
+# The base tree is a REAL COMMIT IN THE SCENARIO (`repro_base_shard`), because
+# the production path materialises it with `git worktree add --detach <oid>`.
+repro_base_shard() {  # <repo-relative path> <exit-code>
+  local p="$1" code="$2"
+  mkdir -p "$SCEN/$(dirname "$p")"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# #3415 fixture: the BASE tree%ss OWN run of this shard. It records that it RAN, so the\n' "'"
+    printf '# scenario can prove the base was MEASURED, not assumed.\n'
+    printf 'printf "ran\\n" >> %q\n' "$SCEN/base-shard-ran"
+    printf 'exit %s\n' "$code"
+  } > "$SCEN/$p"
+  git -C "$SCEN" add -- "$p" >/dev/null 2>&1
+  git -C "$SCEN" -c user.email=suite@example.invalid -c user.name=suite \
+      commit -q -m "base tree: $p exits $code" >/dev/null 2>&1
+  git -C "$SCEN" rev-parse HEAD > "$SCEN/main-sha"
+}
+
+# run_admin_repro <pytest-seam> <shard-seam> <rail args…> — the TWO #3715 seams,
+# either omitted when empty (an OMITTED seam means the PRODUCTION path for that
+# arm, which is what case 1 needs). The rail runs with ITS CWD SET TO THE SCENARIO,
+# because the production path materialises the base with `git worktree add` in
+# `$PWD` — a scenario base commit does not exist in the suite's own checkout, so
+# running elsewhere would make every production-path case fail closed for a
+# reason the assertions do not name.
+run_admin_repro() {
+  local pseam="$1" sseam="$2"; shift 2
+  local -a env_args=(
+    "SCEN=$SCEN" "ADMIN_MERGE_GH=$FAKE" "CI_FAILURE_SET_GH=$FAKE"
+    "ADMIN_MERGE_POLL_INTERVAL=0" "ADMIN_MERGE_HEAD_READ_SLEEP=0" "ADMIN_MERGE_VERIFY_POLL=0"
+    "ADMIN_MERGE_FIRST_CHECKS_WAIT=${SUITE_FIRST_CHECKS_WAIT:-0}"
+    "ADMIN_MERGE_FIRST_CHECKS_CEILING=${SUITE_FIRST_CHECKS_CEILING:-${SUITE_FIRST_CHECKS_WAIT:-}}"
+    "ADMIN_MERGE_FIRST_CHECKS_POLL=${SUITE_FIRST_CHECKS_POLL:-1}"
+    "ADMIN_MERGE_MERGE_REF_WAIT=${SUITE_MERGE_REF_WAIT:-0}"
+  )
+  [ -n "$pseam" ] && env_args+=("ADMIN_MERGE_REPRO_CMD=$pseam")
+  [ -n "$sseam" ] && env_args+=("ADMIN_MERGE_REPRO_SHARD_CMD=$sseam")
+  ( cd "$SCEN" && env "${env_args[@]}" bash "$ADM" "$@" >"$SCEN/out" 2>"$SCEN/err" )
+  return $?
+}
+
+# A `bash-suites (n)` capture carrying `run-bash-shards.sh`'s per-shard line — the
+# shape `scripts/ci_exemption.py` turns into `bash-shard::<path>` (#2643).
+log_failed_shard() { printf 'bash-suites (1)\tBash shards\t2026-11-05T19:27:54.0000000Z ❌ failed shard: %s\n' "$1"; }
+
+new_scen repro-shard-base-owned
+SHARD_BO='tests/fixture-shard-red-on-base.sh'
+repro_base_shard "$SHARD_BO" 1            # THE BASE's own run of this shard FAILS
+HEAD_SBO="f1f1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SBO" > "$SCEN/head"
+lane_fail "$HEAD_SBO" 3401 > "$SCEN/runs-$HEAD_SBO"
+log_failed_shard "$SHARD_BO" > "$SCEN/log-3401"
+cp "$SCEN/log-3401" "$SCEN/log-after-3401"   # the PR's retry reports the SAME shard
+lane_fail mainbo 3402 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3402"
+# NO SEAM AT ALL: this exercises the real worktree, the real `bash <path>`, and the
+# real containment check. `run_admin_cwd` also gives the rail the scenario AS ITS
+# CHECKOUT, which the production path needs in order to materialise the base.
+run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "#3415: a shard the BASE fails no longer blocks the PR (exit 0)" \
+  || { fail "#3415: a base-owned bash shard STILL BLOCKS (exit $rc) — the reproduction never measured it"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+[ -f "$SCEN/base-shard-ran" ] \
+  && pass "#3415: the shard was EXECUTED in the base tree (measured, not inferred)" \
+  || fail "#3415: the base shard never ran — the clearance (if any) did not come from a measurement"
+grep -q "^   pre-existing: bash-shard::$SHARD_BO" "$SCEN/err" \
+  && pass "#3415: the base-owned shard is reported pre-existing by its full id" \
+  || { fail "#3415: the cleared shard was not reported pre-existing"; grep -n 'pre-existing\|reproduced' "$SCEN/err" | sed 's/^/      /' | head; }
+grep -q "reproduced on the base" "$SCEN/comment" \
+  && pass "#3415: the evidence comment records the base reproduction of a SHARD" \
+  || fail "#3415: the posted evidence does not record the shard reproduction"
+grep -q "pr merge 42 --admin" "$SCEN/calls" \
+  && pass "#3415: the merge proceeds once a base-owned shard is cleared" \
+  || fail "#3415: no --admin merge after a base-owned shard clearance"
+
+# (2) THE OTHER HALF OF THE DISCRIMINATOR — same fixture, base exit code 0.
+# "The base PASSES this shard" is the measurement that keeps the PR blocked; a
+# runner that cleared on either verdict, or that never looked, passes (1) and
+# fails here — which is why both directions are asserted.
+new_scen repro-shard-pr-caused
+SHARD_PC='tests/fixture-shard-pr-broke.sh'
+repro_base_shard "$SHARD_PC" 0             # THE BASE is GREEN; the PR is not
+HEAD_SPC="f2f2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SPC" > "$SCEN/head"
+lane_fail "$HEAD_SPC" 3411 > "$SCEN/runs-$HEAD_SPC"
+log_failed_shard "$SHARD_PC" > "$SCEN/log-3411"
+cp "$SCEN/log-3411" "$SCEN/log-after-3411"
+lane_fail mainpc 3412 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3412"
+run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a shard the PR broke still BLOCKS (exit $rc)" \
+  || { fail "#3415: a PR-CAUSED shard was cleared because the base PASSES it — the polarity is inverted"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+[ -f "$SCEN/base-shard-ran" ] \
+  && pass "#3415: …and the base shard really did run (the block rests on a measurement)" \
+  || fail "#3415: the PR-caused case blocked without the base being measured — the assertion is vacuous"
+grep -qF -- "bash-shard::$SHARD_PC" "$SCEN/err" \
+  && pass "#3415: the surviving refusal NAMES the shard still in the residual" \
+  || fail "#3415: the PR-caused shard vanished from the refusal"
+grep -q "^   pre-existing: bash-shard::$SHARD_PC" "$SCEN/err" \
+  && fail "#3415: a shard the base PASSES was reported pre-existing" \
+  || pass "#3415: …and it is NOT reported pre-existing"
+grep -q -- '--admin' "$SCEN/calls" \
+  && fail "#3415: a merge was attempted over a PR-caused shard" \
+  || pass "#3415: no merge over a PR-caused shard"
+
+# (3) A SHARD THE PR ADDS. `bash <absent path>` exits 127; under the rule "non-zero
+# means the base fails it" that would CLEAR the PR's own new failure. Absence on
+# the base is not a verdict about it.
+new_scen repro-shard-added-by-pr
+repro_base_shard 'tests/fixture-unrelated-shard.sh' 1   # a base commit exists; the file below does not
+SHARD_ADD='tests/fixture-shard-only-on-the-pr.sh'
+HEAD_SAD="f3f3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SAD" > "$SCEN/head"
+lane_fail "$HEAD_SAD" 3421 > "$SCEN/runs-$HEAD_SAD"
+log_failed_shard "$SHARD_ADD" > "$SCEN/log-3421"
+cp "$SCEN/log-3421" "$SCEN/log-after-3421"
+lane_fail mainad 3422 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3422"
+run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a shard the PR ADDS is never cleared by its ABSENCE on the base (exit $rc)" \
+  || { fail "#3415: an ABSENT-on-base shard was cleared — exit 127 read as 'the base fails it' (fail-open)"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "the base tree has no" "$SCEN/err" \
+  && pass "#3415: the refusal says the base does not HAVE the shard, not that it passes it" \
+  || fail "#3415: the absent-shard case was not reported as such"
+grep -q "^   pre-existing: bash-shard::$SHARD_ADD" "$SCEN/err" \
+  && fail "#3415: an absent shard was reported pre-existing" \
+  || pass "#3415: …and nothing was reported pre-existing"
+
+# (4) THE BOUND IS NOT THE SHARD'S VERDICT. `perl alarm` kills the run; the exit
+# status is then 142 (SIGALRM) and says nothing about whether the base fails the
+# shard. Read as a failure it would clear a PR-caused red because the base is slow.
+new_scen repro-shard-bound
+repro_base_sha                             # a PINNED base OID: a ref name is refused upstream
+SHARD_BD='tests/fixture-shard-slow.sh'
+HEAD_SBD="f4f4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SBD" > "$SCEN/head"
+lane_fail "$HEAD_SBD" 3431 > "$SCEN/runs-$HEAD_SBD"
+log_failed_shard "$SHARD_BD" > "$SCEN/log-3431"
+cp "$SCEN/log-3431" "$SCEN/log-after-3431"
+lane_fail mainbd 3432 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3432"
+run_admin_repro "" 'exit 142' 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a shard KILLED by the bound is not a clearance (exit $rc)" \
+  || { fail "#3415: SIGALRM (142) was read as 'the base fails this shard'"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "KILLED by the" "$SCEN/err" \
+  && pass "#3415: the refusal names the BOUND as the reason the shard could not be measured" \
+  || fail "#3415: the bound-killed shard was not reported as a non-measurement"
+grep -q "^   pre-existing: bash-shard::$SHARD_BD" "$SCEN/err" \
+  && fail "#3415: a bound-killed shard was reported pre-existing" \
+  || pass "#3415: …and nothing was cleared"
+
+# (5) THE TOKEN IS ATTACKER-INFLUENCED and it becomes an ARGV. A capture can print
+# `❌ failed shard: ../../…`; executing it would run a script outside the base tree.
+# The shard seam is `exit 1`, so if the token were executed it WOULD clear — the
+# assertion therefore fails if the refusal is removed, not merely if it changes.
+new_scen repro-shard-traversal
+repro_base_sha
+EVIL='../../etc/agent-infra-3415-evil.sh'
+HEAD_SEV="f5f5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SEV" > "$SCEN/head"
+lane_fail "$HEAD_SEV" 3441 > "$SCEN/runs-$HEAD_SEV"
+log_failed_shard "$EVIL" > "$SCEN/log-3441"
+cp "$SCEN/log-3441" "$SCEN/log-after-3441"
+lane_fail mainev 3442 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3442"
+run_admin_repro "" 'exit 1' 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a traversal token is not cleared (exit $rc)" \
+  || { fail "#3415: a '../../…' shard token was EXECUTED and cleared the residual"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "does not name a repo-relative script" "$SCEN/err" \
+  && pass "#3415: the refusal names the token as unexecutable rather than silently skipping it" \
+  || fail "#3415: the traversal token was not refused by name"
+
+# (6) THE ARGV BOUNDARY. A shard id handed to pytest makes it exit 4 having run
+# NOTHING, which would abort the nodeid arm and clear nothing; a pytest CAPTURE
+# that volunteers a shard id must clear nothing either. One mixed residual pins
+# both, and the shard still clears through its OWN runner — so the assertion
+# fails if the shard is routed to the wrong arm (it would be blocked) or if the
+# boundary is dropped (the pytest input log would carry it).
+new_scen repro-shard-argv
+repro_base_sha
+SHARD_AV='tests/fixture-shard-mixed.sh'
+NODE_AV='tests/test_genuinely_new_3415.py::test_pr_broke_it'
+HEAD_SAV="f6f6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SAV" > "$SCEN/head"
+lane_fail "$HEAD_SAV" 3451 > "$SCEN/runs-$HEAD_SAV"
+{ log_failed "$NODE_AV"; log_failed_shard "$SHARD_AV"; } > "$SCEN/log-3451"
+cp "$SCEN/log-3451" "$SCEN/log-after-3451"
+lane_fail mainav 3452 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3452"
+repro_script_log "$SCEN/repro-log.sh" "$NODE_AV" "$SCEN/repro-request.txt"
+run_admin_repro "bash $SCEN/repro-log.sh" 'exit 1' 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+grep -qF -- "bash-shard::$SHARD_AV" "$SCEN/repro-request.txt" \
+  && fail "#3415: the shard id was handed to pytest — it would exit 4 having run NOTHING" \
+  || pass "#3415: the shard id is NOT in the pytest runner's input"
+grep -qF -- "$NODE_AV" "$SCEN/repro-request.txt" \
+  && pass "#3415: …while the nodeid beside it IS (the boundary is a split, not a drop)" \
+  || { fail "#3415: the pytest arm was handed nothing — the boundary dropped the nodeid too"; sed 's/^/      /' "$SCEN/repro-request.txt" 2>/dev/null; }
+grep -q "^   pre-existing: bash-shard::$SHARD_AV" "$SCEN/err" \
+  && pass "#3415: the shard clears through the SHARD runner in a mixed residual" \
+  || { fail "#3415: the shard did not clear through its own runner in a mixed residual (exit $rc)"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "^   pre-existing: $NODE_AV" "$SCEN/err" \
+  && pass "#3415: …and the nodeid still clears through the pytest runner" \
+  || fail "#3415: the pytest arm stopped clearing once the shard arm existed"
+
+# ── 5. extraction failure is fail-closed (the vacuous-pass guard) ──────────
 echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pass) =="
 new_scen vacuous
 HEAD_VAC="dddd000000000000000000000000000000000000"
