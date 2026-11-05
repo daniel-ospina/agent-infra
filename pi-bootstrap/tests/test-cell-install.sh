@@ -1489,6 +1489,10 @@ echo 'notes about tortoise-capture, which lives in the checkout' > "$DEST/extens
 # predicate were just the name prefix.
 mkdir -p "$DEST/extensions/tortoise-capture-noindex"
 echo 'notes' > "$DEST/extensions/tortoise-capture-noindex/README.md"
+# …nor is a directory with a package.json that carries NO pi manifest: pi's `resolveExtensionEntries`
+# needs `pi.extensions`, else it falls through to the index check and loads nothing.
+mkdir -p "$DEST/extensions/tortoise-capture-data"
+printf '{"name":"capture-data","version":"1.0.0"}\n' > "$DEST/extensions/tortoise-capture-data/package.json"
 # ⛔ DRIVEN THROUGH `--install`, because the DELETE is the risk: `--verify` cannot remove anything,
 # so an arm that only verified would never see the damage a prefix-wide sweep does.
 run_install >/dev/null 2>&1
@@ -1496,9 +1500,11 @@ run_verify \
   && ok "--verify does NOT refuse an unrelated file/directory that merely starts with the denied name (no over-block)" \
   || fail "--verify refused an unrelated path whose name starts with tortoise-capture — the pattern is too broad: $(grep -m1 'FAIL' "$LOG")"
 [ -d "$DEST/extensions/tortoise-capture-noindex" ] && [ -f "$DEST/extensions/tortoise-capture-notes.txt" ] \
-  && ok "…and neither path was DELETED by --install (the sweep matches pi's loadable shapes, not the name alone)" \
+  && [ -f "$DEST/extensions/tortoise-capture-data/package.json" ] \
+  && ok "…and none of the inert paths was DELETED by --install (the sweep matches pi's loadable shapes, not the name alone)" \
   || fail "--install DELETED an inert path for its name alone — the sweep's predicate is too broad"
-rm -rf "$DEST/extensions/tortoise-capture-notes.txt" "$DEST/extensions/tortoise-capture-noindex"
+rm -rf "$DEST/extensions/tortoise-capture-notes.txt" "$DEST/extensions/tortoise-capture-noindex" \
+       "$DEST/extensions/tortoise-capture-data"
 
 # (3d) A copy in the CELL'S OTHER HOME. #2916's two-home state is the measured cause: the operating
 # home kept its copies while the installer scanned the account home.

@@ -2534,23 +2534,56 @@ SUP_STORE_ENTRY_USABLE_JQ='
 #   absent     the file is a JSON object with entries, but none for this provider
 #   empty      absent file, 0 bytes, WHITESPACE ONLY, or `{}` — the measured defect
 #   unreadable not a JSON object at all (a scalar, an array, or unparseable)
+# ── what a STORE ENTRY has to look like before this check will call it a credential ─────────
+# ⛔ pi's OWN RULE, read from its source (`dist/core/auth-storage.js`), not guessed:
+#   * `load()` VALIDATES every entry and THROWS on the whole file if one is invalid;
+#   * `api_key` is valid with `key` undefined-or-STRING and `env` undefined-or-an-object-of-strings;
+#   * `oauth` is valid only with `access` AND `refresh` STRINGS and a FINITE numeric `expires`;
+#   * `read()` returns a credential only when it YIELDS A KEY: an `api_key` entry with no key (or a
+#     blank one) is a VALID file that supplies NOTHING — the provider then falls through to the
+#     process environment, which a cell lane does not have;
+#   * any other `type` is invalid (`Invalid auth.json credential for provider …`).
+# This copy is READ-ONLY, and it is the SAME program cloud-cell-bringup.sh carries (there, beside the
+# only writer). The two must not drift: one box certified from two different answers is the defect
+# this gate exists to remove.
+SUP_STORE_ENTRY_STATE_JQ='
+  def nbstring: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
+  def valid_env: (. == null) or ((type == "object") and ([.[] | type == "string"] | all));
+  if type != "object" then "malformed"
+  elif .type == "api_key" then
+    (if (.key | nbstring) then "present"
+     elif (((.key == null) or ((.key | type) == "string")) and ((.env | valid_env))) then "merge"
+     else "malformed" end)
+  elif .type == "oauth" then
+    (if ((.access | nbstring) and (.refresh | nbstring) and ((.expires | type) == "number")) then "present"
+     else "malformed" end)
+  else "malformed" end'
+
+# sup_store_state <auth.json> <provider> -> present | mergeable | malformed | empty | unreadable
+#   present    a credential for this provider that pi can USE
+#   mergeable  the file is sound and the provider has no usable key (no entry, or an api_key entry
+#              with no/blank key) — so a key could be ADDED, which is the bring-up's job
+#   malformed  pi THROWS reading this file, so NO provider in it can authenticate
+#   empty      absent file, 0 bytes, WHITESPACE ONLY, or `{}` — the measured defect
+#   unreadable not a JSON object at all (a scalar, an array, or unparseable)
 sup_store_state() {
   local auth="$1" prov="$2" st
   if [ ! -e "$auth" ] || [ ! -s "$auth" ] || ! grep -q '[^[:space:]]' "$auth" 2>/dev/null; then
     printf 'empty\n'; return 0
   fi
+  if ! jq -e 'type == "object"' "$auth" >/dev/null 2>&1; then
+    printf 'unreadable\n'; return 0
+  fi
+  if jq -e 'length == 0' "$auth" >/dev/null 2>&1; then
+    printf 'empty\n'; return 0
+  fi
   st="$(jq -r --arg p "$prov" "
-      if type != \"object\" then \"unreadable\"
-      elif length == 0 then \"empty\"
-      elif (.[\$p] // null) == null then \"absent\"
-      elif (.[\$p] | ${SUP_STORE_ENTRY_USABLE_JQ}) then \"present\"
-      elif (((.[\$p] | type) == \"object\") and (((.[\$p].type // \"\") | IN(\"api_key\", \"oauth\")))) then
-        (if .[\$p].type == \"oauth\" then \"other\" else \"malformed\" end)
-      elif ((.[\$p] | type) == \"object\") and ((.[\$p] | has(\"type\"))) then \"other\"
-      else \"malformed\" end" "$auth" 2>/dev/null)"
+      if (.[\$p] // null) == null then \"merge\"
+      else (.[\$p] | ${SUP_STORE_ENTRY_STATE_JQ}) end" "$auth" 2>/dev/null)" || st=""
   case "$st" in
-    present|other|malformed|absent|empty|unreadable) printf '%s\n' "$st" ;;
-    *)                                              printf 'unreadable\n' ;;
+    present)         printf 'present\n' ;;
+    merge|absent)    printf 'mergeable\n' ;;
+    *)               printf 'malformed\n' ;;
   esac
 }
 
@@ -2578,13 +2611,12 @@ check_provider_store() {
       # ⛔ SAY WHAT WAS READ, NOT WHAT FOLLOWS FROM IT. This verb is read-only and has no probe, so
       # the honest claim is about the FILE ("pi reads the store first, so the key need not be in the
       # environment"), never "a launch answers" — which only a call can establish.
-      log_line "ok: the provider store holds a '$prov' credential ($auth) — pi consults the store FIRST, so a launch does not need the key in its environment"
-      return 0 ;;
-    other)
-      log_line "ok: the provider store holds a '$prov' entry of a type this check does not judge ($auth) — whether it resolves is pi's answer alone, so NOTHING is asserted about it"
+      log_line "ok: the provider store holds a usable '$prov' credential ($auth) — pi consults the store FIRST, so a launch does not need the key in its environment"
       return 0 ;;
     malformed)
-      die "$auth has a '$prov' entry pi cannot READ (an api_key entry needs a non-blank STRING key or a non-empty env map; an entry with no \"type\" is invalid) — pi THROWS on this file, so NO provider in it can authenticate and every lane dies at startup. Do not delete it blindly (it is the cell's identity). Fix the entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move the file aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
+      # pi's `load()` validates EVERY entry and throws on the whole file, so this claim is about the
+      # FILE and it is true: one invalid entry makes every provider unreadable.
+      die "$auth holds an entry pi REJECTS when it reads the file (an api_key needs a string key and an env map of strings; an oauth needs access+refresh strings and a finite numeric expires; any other type is invalid) — pi throws, so NO provider in this file can authenticate and every lane dies at startup. Do not delete it blindly (it is the cell's identity): fix the offending entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move the file aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
     unreadable)
       die "$auth exists but is not a readable JSON object, so this check cannot say whether '$prov' has a credential — and CANNOT-VERIFY IS NOT A PASS. It is also pi's credential store: do not delete it blindly. Inspect it (it should be a JSON object such as {\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}); if it is unusable, move it aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
   esac

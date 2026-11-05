@@ -875,16 +875,29 @@ case "$CC_OUT" in
   *"credential"*) ok "…reporting it as a credential pi can use" ;;
   *) bad "the oauth entry was not reported as a credential: $CC_OUT" ;;
 esac
-# (g) An entry of a type this file does NOT know is not a refusal either: whether it resolves is pi's
-# answer, so the only honest line says exactly that (a guess in either direction is a defect).
+# (g) An entry of a type pi does not know is NOT "undecidable": pi's `load()` rejects it, so the whole
+# file throws and NO provider in it authenticates. Treating it as "cannot judge, pass" would be a
+# green `check` over a box whose every `pi` call dies at load.
 printf '{"deepseek":{"type":"some_future_scheme","blob":"x"}}\n' > "$AUTH"
 cellcheck 0
-[ "$CC_RC" -eq 0 ] && ok "check PASSES a store entry of a type it does not know (no false block)" \
-                   || bad "check false-blocked an unrecognised credential type (rc=$CC_RC): $CC_OUT"
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES an entry of a type pi rejects (it is not 'cannot judge')" \
+                   || bad "check certified a store pi throws on (rc=$CC_RC): $CC_OUT"
 case "$CC_OUT" in
-  *"does not judge"*) ok "…and states that it did not judge it, rather than asserting either way" ;;
-  *) bad "the unknown-type entry was silently treated as judged: $CC_OUT" ;;
+  *"pi REJECTS"*) ok "…naming the validation pi applies, so the operator can fix the entry" ;;
+  *) bad "the unknown-type refusal does not explain itself: $CC_OUT" ;;
 esac
+# (h) A VALID api_key entry with NO key is a sound file that supplies NOTHING (`read()` yields no key,
+# so the provider falls through to the environment a cell lane does not have). It must not be read as
+# a credential — and it must not be a refusal either when `keys.env` can supply the key.
+printf '{"deepseek":{"type":"api_key","env":{"DEEPSEEK_API_KEY":"from-env-map"}}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check refuses a keyless api_key entry when keys.env carries no key (it is not a credential)" \
+                   || bad "check read an api_key entry with no key as a usable credential (pi's read() yields nothing for it)"
+printf 'DEEPSEEK_API_KEY=sk_fixture_only\n' > "$F/keys.env"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "…and passes it when keys.env delivers the key (the bring-up can merge one in)" \
+                   || bad "check false-blocked a keyless entry on a box whose keys.env carries the key (rc=$CC_RC): $CC_OUT"
+rm -f "$F/keys.env"
 # restore the fixture for every arm after this block
 rm -f "$F/keys.env"; seed_provider_store "$F/home"
 cellcheck 0

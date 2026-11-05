@@ -563,36 +563,52 @@ keys_env_has_value() {
 }
 
 # ── what a STORE ENTRY has to look like before this script will call it a credential ────────────
-# pi's own loader decides this, and it is stricter than "there is a `key` field" (pi's
-# `core/auth-storage`: an `api_key` entry whose `key` is a NON-STRING, or an entry with no `type` at
-# all, makes pi THROW on read; an `api_key` entry whose `key` resolves to nothing falls back to its
-# `env` map; an `oauth` entry carries `access`/`refresh`/`expires` and has no `key` at all). So the
-# predicate is pi's:
-#   usable := api_key with a non-blank STRING key, OR api_key with a non-empty env map,
-#             OR oauth with a non-blank string access token.
-# ⛔ WHY THE SAME WORDING LIVES IN cloud-cell-supervisor.sh: its `check` must reach the same verdict
-# on the same file, or the bring-up can print CELL READY on a box `check` refuses. That copy is
-# READ-ONLY (this file is the only writer), and it is duplicated for the reason the ENV_SENTINEL
-# guard above gives — both scripts are pushed STANDALONE onto a cell, with no library to source.
-STORE_ENTRY_USABLE_JQ='
-  def nonblank_string: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
-  if type != "object" then false
+# ⛔ THIS IS pi's OWN RULE, READ FROM ITS SOURCE, not a guess (`dist/core/auth-storage.js`):
+#   * `load()` VALIDATES every entry and THROWS on the whole file if one is invalid — so an invalid
+#     entry anywhere makes EVERY provider unreadable, which is why the refusal below is file-level;
+#   * `api_key` is valid with `key` undefined-or-STRING and `env` undefined-or-an-object-of-strings;
+#   * `oauth` is valid only with `access` AND `refresh` STRINGS and a FINITE numeric `expires`;
+#   * `read()` returns a credential only when it YIELDS A KEY: an `api_key` entry with no `key` (or a
+#     blank one) is a VALID file that supplies NOTHING, so the provider falls through to the process
+#     environment — and on a cell whose launch sources nothing, that is the #2024 death;
+#   * any other `type` is invalid (`Invalid auth.json credential for provider …`).
+# So:
+#   present     pi can authenticate from this entry
+#   merge       a VALID api_key entry that supplies no key (no `key`, or a blank one): the store is
+#               sound and the key may be ADDED to it without replacing anything — it is not a
+#               credential until it has one
+#   malformed   pi throws on the file; nothing in it can authenticate
+STORE_ENTRY_STATE_JQ='
+  def nbstring: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
+  def valid_env: (. == null) or ((type == "object") and ([.[] | type == "string"] | all));
+  if type != "object" then "malformed"
   elif .type == "api_key" then
-    ((.key? | nonblank_string)
-     or (((.env? // null) | type) == "object" and (((.env // {}) | length) > 0)))
-  elif .type == "oauth" then (.access? | nonblank_string)
-  else false end'
+    (if (.key | nbstring) then "present"
+     elif (((.key == null) or ((.key | type) == "string")) and ((.env | valid_env))) then "merge"
+     else "malformed" end)
+  elif .type == "oauth" then
+    (if ((.access | nbstring) and (.refresh | nbstring) and ((.expires | type) == "number")) then "present"
+     else "malformed" end)
+  else "malformed" end'
 
-# store_provider_state <auth.json> <provider> -> present | other | absent | empty | unreadable
+# store_entry_state <auth.json> <provider> -> absent | present | merge | malformed
+store_entry_state() {
+  local auth="$1" prov="$2" st
+  st="$(jq -r --arg p "$prov" "
+      if (.[\$p] // null) == null then \"absent\"
+      else (.[\$p] | ${STORE_ENTRY_STATE_JQ}) end" "$auth" 2>/dev/null)" || st=""
+  case "$st" in
+    present|merge|malformed|absent) printf '%s\n' "$st" ;;
+    *)                              printf 'malformed\n' ;;
+  esac
+}
+
+# store_provider_state <auth.json> <provider> -> present | mergeable | malformed | absent | empty | unreadable
 #   present    the store holds a credential for this provider that pi can USE
-#   other      an entry exists for this provider of a TYPE this script does not write (`oauth`, or
-#              something newer) — it carries material this script could never recreate, so it is
-#              LEFT ALONE; whether it resolves is pi's answer, not this file's
-#   malformed  an entry exists that pi will THROW on when it reads the store (an `api_key` with a
-#              non-string or blank key, or an entry with no `type` at all) — not a credential, and
-#              not something to overwrite: the store is broken for EVERY provider, so it is refused
-#              with its own diagnosis rather than replaced
-#   absent     the file is a JSON object with entries, but none for this provider
+#   mergeable  the file is sound but this provider has no usable key (no entry, or an api_key entry
+#              with no/blank key) — a key may be ADDED, and nothing needs replacing
+#   malformed  pi THROWS when it reads this file, so NO provider in it can authenticate
+#   absent     (folded into mergeable; kept out of the refusal path on purpose)
 #   empty      the measured defect and every shape of it: absent file, 0 bytes, WHITESPACE ONLY, `{}`
 #   unreadable not a JSON object at all (a scalar, an array, or unparseable) — never clobbered
 store_provider_state() {
@@ -600,18 +616,18 @@ store_provider_state() {
   if [ ! -e "$auth" ] || [ ! -s "$auth" ] || ! grep -q '[^[:space:]]' "$auth" 2>/dev/null; then
     printf 'empty\n'; return 0
   fi
-  st="$(jq -r --arg p "$prov" "
-      if type != \"object\" then \"unreadable\"
-      elif length == 0 then \"empty\"
-      elif (.[\$p] // null) == null then \"absent\"
-      elif (.[\$p] | ${STORE_ENTRY_USABLE_JQ}) then \"present\"
-      elif (((.[\$p] | type) == \"object\") and (((.[\$p].type // \"\") | IN(\"api_key\", \"oauth\")))) then
-        (if .[\$p].type == \"oauth\" then \"other\" else \"malformed\" end)
-      elif ((.[\$p] | type) == \"object\") and ((.[\$p] | has(\"type\"))) then \"other\"
-      else \"malformed\" end" "$auth" 2>/dev/null)"
+  if ! jq -e 'type == "object"' "$auth" >/dev/null 2>&1; then
+    printf 'unreadable\n'; return 0
+  fi
+  if jq -e 'length == 0' "$auth" >/dev/null 2>&1; then
+    printf 'empty\n'; return 0
+  fi
+  st="$(store_entry_state "$auth" "$prov")"
   case "$st" in
-    present|other|malformed|absent|empty|unreadable) printf '%s\n' "$st" ;;
-    *)                                              printf 'unreadable\n' ;;
+    present)        printf 'present\n' ;;
+    merge)          printf 'mergeable\n' ;;
+    absent)         printf 'mergeable\n' ;;
+    *)              printf 'malformed\n' ;;
   esac
 }
 
@@ -620,13 +636,13 @@ store_provider_state() {
 # "A file exists" is not the question (`{}` is the measured defect), and neither is "some provider
 # has a key" when the consumer uses one provider — the caller decides which question it is asking.
 store_has_credential() {
-  local auth="$1" prov="${2:-}" st
+  local auth="$1" prov="${2:-}"
   [ -s "$auth" ] || return 1
   if [ -n "$prov" ]; then
-    st="$(store_provider_state "$auth" "$prov")"
-    case "$st" in present|other) return 0 ;; *) return 1 ;; esac
+    [ "$(store_provider_state "$auth" "$prov")" = present ] && return 0
+    return 1
   fi
-  jq -e "type == \"object\" and ([to_entries[] | .value | ${STORE_ENTRY_USABLE_JQ}] | any)" \
+  jq -e "type == \"object\" and ([to_entries[] | .value | ${STORE_ENTRY_STATE_JQ}] | any(. == \"present\"))" \
     "$auth" >/dev/null 2>&1
 }
 
@@ -638,33 +654,38 @@ store_has_body() {
   [ -s "${1:-}" ] && grep -q '[^[:space:]]' "$1" 2>/dev/null
 }
 
-# write_store_entry <auth.json> <provider> <VAR> — add ONE entry, PRESERVING every other key.
+# write_store_entry <auth.json> <provider> <VAR> — add ONE provider's key, PRESERVING every other key
+# AND every other field of that provider's entry (`env`, an existing `type`).
 # ⛔ THE SECRET NEVER REACHES AN ARGV. `/proc/<pid>/cmdline` is world-readable on Linux, so a
 # `jq --arg key "$SECRET"` would publish the cell's credential to every local reader for the length
 # of the call; the value is taken from the environment instead (`$ENV[$var]`), which only the owning
-# uid can read. The temporary file is created under `umask 077`, REGISTERED with the secret-lifetime
-# trap (an interrupted run must not leave a raw key beside the store), and renamed into place only
-# after it parses as JSON and carries the entry — so a failed write can neither truncate nor
-# half-write a store.
+# uid can read. The temp file is created by `mktemp` under `umask 077` (so two concurrent runs cannot
+# delete each other's in-flight file), is REGISTERED with the secret-lifetime trap, and is renamed
+# into place only after it parses as JSON and carries the key — so a failed write can neither truncate
+# nor half-write a store.
 write_store_entry() {
   local auth="$1" prov="$2" var="$3" tmp
-  tmp="$auth.bringup.$$"
-  # A temp file left by a KILLED earlier run is a credential on disk: sweep this script's own prefix
-  # before adding another.
-  rm -f "$auth".bringup.* 2>/dev/null
+  # Stale temps from a KILLED earlier run are credentials on disk. Swept by AGE, never blindly: an
+  # unconditional `rm -f "$auth".bringup.*` would delete the in-flight file of a CONCURRENT run.
+  find "$(dirname "$auth")" -maxdepth 1 -name "$(basename "$auth").bringup.*" -mmin +60 \
+       -exec rm -f {} + 2>/dev/null
+  tmp="$(umask 077; mktemp "$auth.bringup.XXXXXX" 2>/dev/null)" \
+    || { tmp="$auth.bringup.$$"; ( umask 077; : > "$tmp" ) 2>/dev/null || return 1; }
   register_secret "$tmp"
   ( umask 077
     if store_has_body "$auth"; then
       jq --arg p "$prov" --arg v "$var" \
-         '.[$p] = {type: "api_key", key: (($ENV[$v] // "") | gsub("^\\s+|\\s+$"; ""))}' "$auth"
+         '.[$p] = ((.[$p] // {}) + {type: "api_key", key: (($ENV[$v] // "") | gsub("^\\s+|\\s+$"; ""))})' "$auth"
     else
       jq -n --arg p "$prov" --arg v "$var" \
          '{($p): {type: "api_key", key: (($ENV[$v] // "") | gsub("^\\s+|\\s+$"; ""))}}'
     fi > "$tmp" ) || { rm -f "$tmp" 2>/dev/null; return 1; }
-  # THE PRODUCT IS VALIDATED BEFORE IT REPLACES ANYTHING: non-empty, parseable, and carrying the
-  # entry that was asked for. A writer that trusts its own output is how a 0-byte store gets a
-  # `REPAIRED` line over it.
-  if ! { [ -s "$tmp" ] && jq -e --arg p "$prov" '(type == "object") and (has($p))' "$tmp" >/dev/null 2>&1; }; then
+  # THE PRODUCT IS VALIDATED BEFORE IT REPLACES ANYTHING: non-empty, parseable, and carrying a
+  # non-blank key for the provider that was asked for. A writer that trusts its own output is how a
+  # 0-byte store gets a `REPAIRED` line over it.
+  if ! { [ -s "$tmp" ] && jq -e --arg p "$prov" \
+           '(type == "object") and ((.[$p].key // "") | (type == "string") and ((gsub("^\\s+|\\s+$"; "")) | length) > 0)' \
+           "$tmp" >/dev/null 2>&1; }; then
     rm -f "$tmp" 2>/dev/null
     return 1
   fi
@@ -676,12 +697,11 @@ write_store_entry() {
 
 # repair_provider_store <home> <provider> — bring that home's store up to "pi can answer as
 # <provider>", and say what it did.
-# Returns 0 when the store lets pi authenticate as <provider> (it already did, or one was just
-# written, or an entry this script must not judge is already there), 2 when it does not and
-# `$ENV_FILE` carries nothing usable to materialise from (the refusal datum), 1 for a write failure.
-# It never returns 0 over a store with no credential: that is the false green this fixes.
+# Returns 0 when the store lets pi authenticate as <provider> (it already did, or a key was just
+# added), 2 when it does not and `$ENV_FILE` carries nothing usable to materialise from (the refusal
+# datum), 1 for a write failure. It never returns 0 over a store with no usable credential.
 repair_provider_store() {
-  local home="${1%/}" want="${2:-deepseek}" auth st pair prov var wrote=0
+  local home="${1%/}" want="${2:-deepseek}" auth st pair prov var
   [ -n "$home" ] || return 2
   auth="$(auth_store_path "$home")"
   if [ ! -d "$(dirname "$auth")" ]; then
@@ -692,13 +712,6 @@ repair_provider_store() {
     st="$(store_provider_state "$auth" "$prov")"
     case "$st" in
       present) continue ;;
-      other)
-        # An entry that exists and is not a shape this script may replace — pi's own `oauth` record
-        # is the realistic case, and it carries a refresh token this script could never recreate.
-        # REPLACING it would destroy the cell's identity (the decision at cell-install.sh:125), so it
-        # is left alone and reported; whether it RESOLVES is pi's answer, not this file's.
-        log_line "provider store: $auth already holds a '$prov' entry this script does not materialise — leaving it UNTOUCHED (replacing it would destroy a credential it cannot recreate)"
-        continue ;;
       unreadable)
         # The store is the cell's identity (decision at cell-install.sh:125). A file we cannot read as
         # a JSON object is never replaced: doing so would destroy credentials this script does not
@@ -706,12 +719,15 @@ repair_provider_store() {
         log_line "FATAL: the provider store at $auth is not a readable JSON object — refusing to replace the cell's identity. Inspect it by hand (it should be a JSON object, e.g. {\"deepseek\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move it aside deliberately and re-run." >&2
         return 1 ;;
       malformed)
-        # pi THROWS when it reads this entry, so the store authenticates NOBODY — and the remedy is
-        # not to overwrite it: the entry may be one keystroke away from valid, and a cell's store is
-        # the identity this script must not destroy. Refuse, name it, and leave the edit to a human.
-        log_line "FATAL: the provider store at $auth has a '$prov' entry pi cannot READ (an api_key entry needs a non-blank STRING key, or a non-empty env map; an entry with no \"type\" is invalid) — pi throws on this file, so NO provider in it can authenticate. Refusing to overwrite the cell's identity: fix the entry by hand (or move the file aside deliberately) and re-run." >&2
+        # pi's `load()` validates EVERY entry and throws on the whole file, so an invalid entry
+        # anywhere makes every provider unreadable — and the remedy is not to overwrite it: the entry
+        # may be one keystroke away from valid, and a cell's store is the identity this script must
+        # not destroy. Refuse, name it, and leave the edit to a human.
+        log_line "FATAL: the provider store at $auth holds an entry pi REJECTS when it reads the file (an api_key needs a string key and an env map of strings; an oauth needs access+refresh strings and a finite numeric expires; any other type is invalid) — pi throws, so NO provider in this file can authenticate. Refusing to overwrite the cell's identity: fix the offending entry by hand (or move the file aside deliberately) and re-run." >&2
         return 1 ;;
     esac
+    # `mergeable` and `empty` reach here: the file is sound (or absent) and this provider simply has
+    # no usable key, so a key may be ADDED without replacing anything.
     # Only a key `$ENV_FILE` NAMES **and gives a value** is a source. An ambient export is not (the
     # image pre-sets a stale key), and a blank assignment is a placeholder — materialising either
     # would mint a store pi accepts and the provider rejects.
@@ -721,27 +737,52 @@ repair_provider_store() {
       continue
     fi
     write_store_entry "$auth" "$prov" "$var" || return 1
-    wrote=$((wrote + 1))
     log_line "REPAIRED provider store: $auth — added '$prov' from $ENV_FILE, mode 600. This is a REPAIR of the store pi READS, not a copy: the key was already on this box, and nothing was taken from a checkout."
   done
-  # ⛔ NO `wrote > 0` SHORTCUT: a write attempt is not a materialisation. The store is asked, and its
-  # answer is the one the caller acts on.
+  # ⛔ THE STORE IS ASKED, NOT THE WRITER: a write attempt is not a materialisation.
   store_has_credential "$auth" "$want" && return 0
   return 2
+}
+
+# account_home — this box's ACCOUNT home, from the passwd record (the same fallback `_one_home_want`
+# uses), normalised and existence-checked. Empty when it cannot be resolved.
+# ⛔ WHY NOT `$HOME_ORIG`: on a COMPLIANT cell `HOME_ORIG` IS `CELL_HOME` (the one-home gate refuses
+# anything else), so deriving the second home from it made both second-home legs dead code exactly
+# where they were measured. The real second home is the ACCOUNT home — `/home/cmux` while the state
+# home is `/tmp/cell-home` — which a `pi` run with the default HOME reads, and which #2147 measured
+# holding 1/0/7/3/2 denied copies while the installer scanned only the state home.
+# FIXTURE SEAM, declared rather than hidden: the account home is read from the passwd record, which a
+# hermetic suite cannot pin — and resolving it "for real" inside a suite would write a fixture
+# credential into the DEVELOPER's own `~/.pi/agent/auth.json` and sweep their extensions, which is the
+# destructive false positive this whole file refuses to risk. When `CELL_ACCOUNT_HOME` is SET (even to
+# the empty string) it replaces the resolver entirely; the shipped default is the passwd record.
+account_home() {
+  local acct=""
+  if [ -n "${CELL_ACCOUNT_HOME+set}" ]; then
+    [ -n "${CELL_ACCOUNT_HOME:-}" ] && [ -d "$CELL_ACCOUNT_HOME" ] || return 0
+    ( cd "$CELL_ACCOUNT_HOME" 2>/dev/null && pwd -P )
+    return 0
+  fi
+  acct="$(getent passwd "$(id -un)" 2>/dev/null | awk -F: 'NR==1{print $6}')"
+  [ -n "$acct" ] || acct="$(cd ~"$(id -un)" 2>/dev/null && pwd -P)"
+  [ -n "$acct" ] && [ -d "$acct" ] || return 0
+  ( cd "$acct" 2>/dev/null && pwd -P )
 }
 
 # check_provider_store <provider> — repair BOTH homes, then refuse a cell that still has no
 # credential FOR THE PROVIDER THE CONSUMER USES.
 # WHY A PROVIDER AND NOT "any credential": the box is judged on whether a lane can authenticate, and
-# a lane uses ONE provider (`PI_LANE_PROVIDER`; this bring-up's own probe uses deepseek). A store
-# holding only `openai` answers a different question, and accepting it here is exactly how the
-# bring-up and `cloud-cell-supervisor.sh check` would drift apart on the same box.
+# a lane uses ONE provider (`PI_LANE_PROVIDER`). A store holding only `openai` answers a different
+# question, and accepting it here is exactly how the bring-up and `cloud-cell-supervisor.sh check`
+# would drift apart on the same box.
 # WHY BOTH HOMES: a lane's `pi` reads `$CELL_HOME/.pi/agent/auth.json` (the session forces HOME),
 # while an OPERATOR's `pi` — the one a hand-run verification uses — reads the ACCOUNT home's. The
 # measured hand-fix wrote both; a repair that wrote only one leaves a box where the same command
 # answers or dies depending on who runs it.
+# ⛔ CALLED FROM main() AFTER `check_one_home env`, not from `check_provider`: a run that is about to
+# be REFUSED for its home layout must not first write a credential into the operator's own home.
 check_provider_store() {
-  local want="${1:-deepseek}" st other=""
+  local want="${1:-deepseek}" st other
   repair_provider_store "$CELL_HOME" "$want"; st=$?
   case "$st" in
     0) ;;   # the store holds a usable credential; any repair is already reported above
@@ -752,11 +793,11 @@ check_provider_store() {
   esac
   # The ACCOUNT home is repaired too, but a failure there is NOT fatal: lanes run under
   # $CELL_HOME, so a read-only account home costs an operator a hand-run `pi`, not a lane.
-  if [ -n "${HOME_ORIG:-}" ] && [ "${HOME_ORIG%/}" != "${CELL_HOME%/}" ] && [ -d "$HOME_ORIG" ]; then
-    other="$(auth_store_path "$HOME_ORIG")"
-    repair_provider_store "$HOME_ORIG" "$want"; st=$?
+  other="$(account_home)"
+  if [ -n "$other" ] && [ "$other" != "$(cd "$CELL_HOME" 2>/dev/null && pwd -P)" ]; then
+    repair_provider_store "$other" "$want"; st=$?
     [ "$st" -eq 0 ] \
-      || warn "the ACCOUNT home's provider store at $other was NOT repaired (rc=$st) — lanes are unaffected (they run under $CELL_HOME), but a hand-run 'pi' with HOME=$HOME_ORIG may still answer with 'No API key found'"
+      || warn "the ACCOUNT home's provider store at $(auth_store_path "$other") was NOT repaired (rc=$st) — lanes are unaffected (they run under $CELL_HOME), but a hand-run 'pi' with HOME=$other may still answer with 'No API key found'"
   fi
 }
 
@@ -775,10 +816,6 @@ check_provider() {
   else
     warn "no $ENV_FILE — push one with: cmux vm push --secret <m> <local> $ENV_FILE --mode 600"
   fi
-  # BEFORE the probe, because the probe is what a dead store corrupts: it answers from the ENV the
-  # bring-up just sourced, so it can pass on a box whose lanes still die (they are launched with no
-  # source at all). The store is the thing a lane actually reads, so the store is what is checked.
-  check_provider_store
   # ⛔ THE ENV VAR IS NOT THE ONLY SOURCE, AND NOT EVEN THE FIRST ONE (agent-infra#3331's lesson in
   # `key-gate.sh`'s header): pi consults the STORE first and only then the environment. Now that the
   # store is repaired above, a box with a populated store and no key in its shell is a WORKING box —
@@ -1152,10 +1189,12 @@ check_operational_layer() {
   # both homes (`HOME_ORIG` is captured before `setup_home` repoints HOME), so the declaration is
   # made here. Measured 2026-11-05: 1 / 0 / 7 / 3 / 2 denied copies survived across the five cells,
   # in the operating home and under suffixed names the exact-name test could not see.
-  local alt_homes=""
-  if [ -n "${HOME_ORIG:-}" ] && [ "${HOME_ORIG%/}" != "${CELL_HOME%/}" ] && [ -d "$HOME_ORIG" ]; then
-    alt_homes="${HOME_ORIG%/}"
-  fi
+  # The ACCOUNT home (`/home/cmux` on a cell), NOT `$HOME_ORIG`: on a COMPLIANT cell HOME_ORIG is
+  # CELL_HOME — the one-home gate refuses anything else — so an alt home derived from it was dead
+  # code precisely where #2147 measured the surviving copies.
+  local alt_homes
+  alt_homes="$(account_home)"
+  [ "$alt_homes" = "$(cd "$CELL_HOME" 2>/dev/null && pwd -P)" ] && alt_homes=""
   local out rc=0
   out="$(CELL_HOME="$CELL_HOME" CELL_ALT_HOMES="$alt_homes" INFRA_ROOT="$root" bash "$installer" --verify 2>&1)" || rc=$?
   if [ "$rc" -ne 0 ]; then
@@ -2274,6 +2313,15 @@ main() {
       # (later steps rewrite WORKDIR/HARNESS_PIN_DIR, and a check that reads them afterwards grades
       # its own repair).
       check_one_home env
+      # AFTER the one-home gate, DELIBERATELY (agent-infra#2024 review): the store repair WRITES a
+      # credential, so running it before the home predicate would mint a key into the operator's own
+      # `~/.pi/agent/auth.json` on a run that is then refused for its home layout. Before this line,
+      # nothing may write; after it, the box has been accepted as a cell.
+      # It is also the gate the provider PROBE cannot be: the probe answers from the ENVIRONMENT this
+      # bring-up sourced, so it passes on a box whose LANES still die (they source nothing). The
+      # store is what a lane actually reads, so the store is what is checked — and the provider is
+      # the one the lanes use.
+      check_provider_store "${PI_LANE_PROVIDER:-deepseek}"
       check_gh
       check_repo
       check_dispatch

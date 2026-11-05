@@ -247,6 +247,12 @@ export HOME="$T/home"
 # would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
 # SYSTEMD_UNIT_DIR above; the shipped default is what cloud-cell-bringup.verify.test.sh's red arms use.
 export CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root
+# The account home is a passwd-record lookup — which a suite cannot pin, and which would resolve to
+# the RUNNER's own home: the store repair would then write a fixture credential into the developer's
+# ~/.pi/agent and the deny sweep would look at their extensions. Pinned EMPTY here (the second-home
+# leg is then inert); each arm that exercises it sets it explicitly. Same kind of seam as
+# SYSTEMD_UNIT_DIR / SWAP_SUDO / CELL_VOLATILE_ROOTS above.
+export CELL_ACCOUNT_HOME=""
 export SYSTEMCTL="$STUB/systemctl"
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
@@ -614,11 +620,12 @@ esac
 
 # (d) MERGE, NOT REPLACE (+ the second home, #2916/#2147). The cell home already holds an entry this
 # script knows nothing about; the account home has no store at all. A repair must keep the first and
-# materialise the second — and `HOME_ORIG` is the only way to reach the home lanes do NOT run under.
+# materialise the second — and the ACCOUNT home (passwd record, pinned here by CELL_ACCOUNT_HOME) is
+# the home lanes do NOT run under.
 printf '{"zai":{"type":"api_key","key":"sk_keep_me"}}\n' > "$AUTH"
 mkdir -p "$T/otherhome"
 printf '%s\n' "$TOK_BODY" > "$TOK"
-BR_EXTRA_ENV="HOME=$T/otherhome" br ok normal --check
+BR_EXTRA_ENV="CELL_ACCOUNT_HOME=$T/otherhome" br ok normal --check
 [ "$(jq -r '.zai.key // ""' "$AUTH" 2>/dev/null)" = "sk_keep_me" ] \
   && ok "an entry the bring-up did not write is PRESERVED across the repair (merge, never replace)" \
   || bad "the repair DROPPED an existing entry — the cell's identity was overwritten"
@@ -629,15 +636,24 @@ BR_EXTRA_ENV="HOME=$T/otherhome" br ok normal --check
   && ok "the ACCOUNT home's store was materialised too (both homes — a lane and an operator read different ones)" \
   || bad "only ONE home was repaired: 'HOME=<account> pi' still answers 'No API key found'"
 
-# (f) THE SOURCE IS keys.env, NOT THE ENVIRONMENT. An ambient key is present and DIFFERENT; the store
-# must carry the keys.env value. This is the arm that would catch a repair rewritten to read the
-# ambient export (which is how the image's stale key would end up minted into every cell).
+# (f) THE SOURCE IS keys.env, NOT THE ENVIRONMENT — and the arm has to be built so it can TELL.
+# An earlier version exported an ambient DEEPSEEK_API_KEY and asserted the store got keys.env's value
+# — which was vacuous: sourcing keys.env OVERWRITES the ambient variable, so BOTH implementations
+# print the same thing. Here keys.env carries no deepseek key at all and the ambient decoy is the
+# only one in the process: a repair that read the environment would write it, and this asserts it
+# does not (it must refuse instead).
 rm -f "$AUTH"
+printf 'ANTHROPIC_API_KEY=\n' > "$T/keys-nodeepseek.env"
 printf '%s\n' "$TOK_BODY" > "$TOK"
-BR_EXTRA_ENV="DEEPSEEK_API_KEY=sk_ambient_decoy" br ok normal --check
-[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
-  && ok "the store took the value from keys.env even with a DIFFERENT ambient key exported" \
-  || bad "the store carries the ambient value, not keys.env's — the repair reads the environment, which is not a source"
+BR_ENV_FILE="$T/keys-nodeepseek.env" BR_EXTRA_ENV="DEEPSEEK_API_KEY=sk_ambient_decoy" br ok normal --check
+if [ ! -e "$AUTH" ] || [ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" != "sk_ambient_decoy" ]; then
+  ok "an AMBIENT-only key is never materialised into the store (keys.env is the only source)"
+else
+  bad "the store carries the AMBIENT value — the repair reads the environment, which is not a source"
+fi
+[ "$BR_RC" -ne 0 ] \
+  && ok "…and the run REFUSES rather than certifying a box whose only key is ambient" \
+  || bad "the bring-up certified a cell whose credential exists only in the operator's shell"
 
 # (f) A WHITESPACE-ONLY store is `{}` wearing spaces: pi throws on it, so it needs repair — and the
 # writer must REPLACE it, not write THROUGH it. `jq '.[$p]=…' <whitespace file>` reads NO input, emits

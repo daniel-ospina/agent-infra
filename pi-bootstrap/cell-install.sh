@@ -286,6 +286,20 @@ cell_agent_dirs() {
 # entries. ⛔ THIS IS WHAT KEEPS THE DENY FROM OVER-BLOCKING: a `tortoise-capture-notes.txt` sitting
 # beside the extension is NOT a copy of it (pi never reads it), and refusing OR DELETING it would be
 # the false-positive direction — the sweep below can `rm -rf`, so the predicate has to be exact.
+has_pi_manifest() { # <package.json> — 0 iff it declares pi.extensions (pi's own entry list)
+  [ -f "${1:-}" ] || return 1
+  python3 - "$1" <<'PYEOF' 2>/dev/null
+import json, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+pi = doc.get("pi")
+ext = pi.get("extensions") if isinstance(pi, dict) else None
+sys.exit(0 if isinstance(ext, list) and len(ext) > 0 else 1)
+PYEOF
+}
+
 loadable_extension_entry() {
   local f="${1:-}"
   if [ -L "$f" ] && [ ! -e "$f" ]; then
@@ -295,7 +309,7 @@ loadable_extension_entry() {
     return 1
   fi
   if [ -d "$f" ]; then
-    [ -f "$f/index.ts" ] || [ -f "$f/index.js" ] || [ -f "$f/package.json" ]
+    [ -f "$f/index.ts" ] || [ -f "$f/index.js" ] || has_pi_manifest "$f/package.json"
     return
   fi
   case "$f" in *.ts|*.js) return 0 ;; esac
