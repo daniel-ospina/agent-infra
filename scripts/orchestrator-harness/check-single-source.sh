@@ -72,7 +72,7 @@ SHARED_EXCLUDED_NOTE="fork arm covers the curated SHARED set (${SHARED// /, }); 
 # it stops every dispatch); origin/main adds brief-gate.sh (#2258), repo-target.sh (#2724/#2694) and
 # harness-provenance.sh. A file executed from the installed $O that is absent from this list is a
 # divergence nothing byte-compares.
-EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh mandate-preflight.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh stall-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh lane-env.sh"
+EXECUTED="orch-loop.sh harness-refresh.sh rail-refusal.sh spawn-gate.sh brief-gate.sh refresh-candidates.sh claims.sh nonblocking-dispatch.sh worker-terminal.sh wt-lifecycle.sh lane.sh lane-merge.sh lane-bound.sh merge-rate.sh install.sh report.sh repo-authority.sh repo-slug.sh repo-target.sh live-ownership.sh ci-queue.sh dispatch-merge.sh chain-merge.sh merge-one.sh fix-one.sh adopt-fix.sh stall-fix.sh merged-not-closed.sh check-deployed-drift.sh check-port-drift.sh harness-provenance.sh key-gate.sh lane-env.sh"
 # …`stall-fix.sh` (#2929) joins the EXECUTED half on the list's own test: `orch-loop.sh` runs it as
 # `bash "$O/stall-fix.sh"` on every stalled pass, and this list byte-compares only files that are
 # PRESENT — so before this line a `$O` WITHOUT it produced NO divergence. The shipped escalation would
