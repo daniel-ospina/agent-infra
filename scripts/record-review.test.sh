@@ -6035,10 +6035,13 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
 #           faked with the source-text pin an earlier round removed (14.1d(g)).
 #   :1229  `_msig` is not 64 hex   → UNPINNED, and safely so: it only short-circuits a
 #           comparison that :1245/:1248 then refuse anyway, so whether a comment is posted is
-#           identical with it or without it. ⛔ AND IT IS SILENT: deleting it moves the refusal DOWN to
-#           :1248, which prints the loud REFUSING line — the change is SILENT→LOUD, not one
-#           loud line becoming another. (An earlier draft of this entry said "changes WHICH
-#           loud line prints"; that was false, measured, and corrected here.)
+#           identical with it or without it. ⛔ AND IT IS SILENT WHEN A KEY RESOLVES: deleting
+#           it then moves the refusal DOWN to :1248, which prints the loud REFUSING line —
+#           SILENT→LOUD, not one loud line becoming another. On the KEYLESS shape (the one
+#           14.1d(d) drives) the refusal lands at :1245 instead and stays SILENT, so the
+#           silent→loud change is NOT general: it holds only where a key resolves. Both
+#           shapes measured. (An earlier draft said "changes WHICH loud line prints" with no
+#           qualifier; false, measured, corrected.)
 #   :1245  no key resolved         → pinned by 20.13 (its count assertion pins the refusal;
 #           its assertion on the ABSENCE of the loud line names which arm fired).
 #   :1247  the HMAC did not COMPUTE → its FAIL-OPEN REWRITE (`|| _mexp="$_msig"`) is PINNED
@@ -6257,7 +6260,7 @@ PWF_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
     bash "$RECORD" "$PWF_PR" "$SHA" clean daniel-ospina/agent-infra \
         --evidence "comment:7391001" 2>"$PWF_ERRF")" || PWF_RC=$?
 PWF_ERR="$(cat "$PWF_ERRF" 2>/dev/null || true)"
-rm -f "$PWF_PENDDIR"; mkdir -p "$PWF_PENDDIR"
+rm -rf "$PWF_PENDDIR" 2>/dev/null || true; mkdir -p "$PWF_PENDDIR" 2>/dev/null || true
 if [ ! -f "$PWF_PENDDIR" ] && [ -d "$PWF_PENDDIR" ]; then
     ok "20.14 restore: the pending dir is usable again for later vectors"
 else
@@ -6278,6 +6281,45 @@ assert_contains "$PWF_ERR" "WHETHER THESE BYTES ARE ON DISK DEPENDS ON THE PERSI
     "20.14 …and the exit-5 message makes its 'kept in <path>' claim CONDITIONAL on that warning, instead of asserting it"
 assert_contains "$PWF_ERR" "If it DID appear, NOTHING was written" \
     "20.14 …naming the failed-write case and where the bytes then live (only in the warning)"
+# ⛔ …AND IT MUST NOT CLAIM TO BE THE **ONLY** COPY. The durable-comment call at :4857 runs
+# BEFORE this message and, on success, prints "review evidence posted … as a durable
+# comment" — so "exists ONLY inside that warning line" was false on exactly the run this
+# vector drives (measured with a probe: COMMENT_POSTS=1 AND SAYS_ONLY=1 on unmodified
+# code). The exclusivity is now explicitly disclaimed, and this pins the disclaimer.
+assert_not_contains "$PWF_ERR" "exists ONLY inside that warning line" \
+    "20.14 …and it does NOT claim the warning is the only surviving copy (the durable comment above may hold the same bytes)"
+
+# ── 20.14b THE **PATCH**-FAILURE ARM, which 20.14 does NOT reach ───────────────
+# (#3168 round-10 review, P2.) §20.14 drives `STUB_BODY_FAIL=1`, i.e. the GET arm, and
+# both of that arm's lines could be reverted with BOTH suites green — the §20.14 header
+# said "both body-channel failure arms" and the coverage was one. Measured before this
+# vector: `:4910` → `|| true` = PASS=1057 FAIL=0, and `:4923` restored to the
+# unconditional form = PASS=1057 FAIL=0 (and run.sh green). The PATCH arm is the one
+# with a SECOND persist attempt before it (:4887, persist-first), so it also needs its
+# own message assertions — the conditional there is keyed to THIS arm's warning.
+PWF2_PR=424358
+PWF2_ERRF="$T/pwferr2"
+: > "$PWF2_ERRF"
+rm -rf "$PWF_PENDDIR" 2>/dev/null || true
+printf 'not a directory\n' > "$PWF_PENDDIR"
+PWF2_RC=0
+PWF2_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
+    STUB_EVIDENCE_PR="$PWF2_PR" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra" \
+    STUB_EVIDENCE_BODY='**Outcome: CLEAN — no blocking issues found.**' \
+    STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
+    STUB_CAPTURE="$T/pwfcap2" \
+    bash "$RECORD" "$PWF2_PR" "$SHA" clean daniel-ospina/agent-infra \
+        --evidence "comment:7391001" 2>"$PWF2_ERRF")" || PWF2_RC=$?
+PWF2_ERR="$(cat "$PWF2_ERRF" 2>/dev/null || true)"
+rm -rf "$PWF_PENDDIR" 2>/dev/null || true; mkdir -p "$PWF_PENDDIR" 2>/dev/null || true
+assert_eq "$PWF2_RC" "5" \
+    "20.14b the PATCH-failure arm's exit code is unchanged when the persist fails (rc 5) [err: $(printf '%s' "$PWF2_ERR" | tr '\n' '|' | cut -c1-160)]"
+assert_contains "$PWF2_ERR" "could NOT persist the pending marker" \
+    "20.14b …the PATCH arm's lost write is REPORTED too (this is the line no vector reached)"
+assert_contains "$PWF2_ERR" ">>> review recorded: reviews/$PWF2_PR.json" \
+    "20.14b …and its marker text is reproduced, so the only copy survives in the log"
+assert_contains "$PWF2_ERR" "persist line THIS ARM PRINTED DECIDES THIS LINE'S TRUTH" \
+    "20.14b …and its 'kept verbatim' line is keyed to THIS arm's persist warning, not to the :4887 one before the PATCH"
 
 DM_20_SENTINEL=1
 
