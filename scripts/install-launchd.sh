@@ -540,21 +540,39 @@ elif argv and absolute(argv[0]):
     launchers.append(argv[0])
     skipped.add(0)
 # env [OPTS] [NAME=VALUE]... COMMAND [ARG]... — COMMAND is the executed binary, not env.
+#
+# AND `-S` / `--split-string` IS A COMMAND LINE, not an option value: `env -S '<prog> <script>'` execs
+# `<prog>` on `<script>`, so its absolute tokens are EXECUTED and are classified as such. Without this
+# the guard saw only an option, skipped the string, and installed a unit whose script lives in a TCC
+# tree with NO verdict at all (fresh review of #3413, P3).
 if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
-    for i in range(1, len(argv)):
+    i = 1
+    while i < len(argv):
         a = argv[i]
-        if not isinstance(a, str):
-            continue
-        if a.startswith("-") or ("=" in a and not a.startswith("/")):
-            continue
-        # the FIRST positional token is env's program, absolute or not. A RELATIVE one (bash,
-        # python3) is resolved through PATH and cannot be checked here, so it is not promoted — but
-        # the scan still STOPS here, because the next absolute token is that program's script, not a
-        # second program.
-        if a.startswith("/"):
-            launchers.append(a)
-            skipped.add(i)
-        break
+        if isinstance(a, str):
+            if a in ("-S", "--split-string") or a.startswith("--split-string="):
+                if "=" in a:
+                    cmd = a.split("=", 1)[1]
+                else:
+                    i += 1
+                    cmd = argv[i] if i < len(argv) and isinstance(argv[i], str) else ""
+                    skipped.add(i)
+                for tok in cmd.split():
+                    if tok.startswith("/"):
+                        print("exec\t" + tok)
+                break
+            if a.startswith("-") or ("=" in a and not a.startswith("/")):
+                i += 1
+                continue
+            # the FIRST positional token is env's program, absolute or not. A RELATIVE one (bash,
+            # python3) is resolved through PATH and cannot be checked here, so it is not promoted —
+            # but the scan still STOPS here, because the next absolute token is that program's script,
+            # not a second program.
+            if a.startswith("/"):
+                launchers.append(a)
+                skipped.add(i)
+            break
+        i += 1
 for l in launchers:
     print("launcher\t" + l)
 for i, a in enumerate(argv):
@@ -714,8 +732,11 @@ physical_path() {
 #     commonly reached through a symlinked ancestor (`/tmp` → `/private/tmp` on macOS). Measured on
 #     this suite's own fixture: HOME=/tmp/… resolved to /private/tmp/…, the literal prefix never
 #     matched, and the guard PASSED the exact TCC-dead target it exists to refuse.
-# A path whose directory cannot be resolved falls back to the literal, and the literal `case` still
-# matches — an unresolvable path must never be the way past this guard.
+# A path whose directory cannot be resolved falls back to the literal (and the case-insensitive
+# `case` still matches) — an unresolvable path must never be the way past this guard. A path that DOES
+# resolve is judged ONLY by where it resolves to: the literal spelling is a fallback, never a second
+# chance to match, or a `~/Documents/alias -> ~/outside/live.sh` would be refused as well as refused
+# never (both are wrong: that unit starts fine).
 # And the comparison is CASE-INSENSITIVE (`nocasematch`, saved and restored): APFS is
 # case-insensitive by default, so `~/documents/x` is `~/Documents/x` to the kernel while a literal
 # `case` read them as different paths — measured, both spellings PASSED the guard.
@@ -723,24 +744,28 @@ tcc_protected_root() {
     local arg="$1" arg_phys="" root root_phys candidate found="" _nm=0
     # ⛔ CASE-INSENSITIVE, because APFS is case-insensitive by DEFAULT: `~/documents/x` IS
     # `~/Documents/x` on the volume every Mac in this fleet runs, and a literal-prefix `case` let the
-    # variant through — measured (fresh review of #3413, third round): `$HOME/Documents/x` REFUSED
-    # while `$HOME/documents/x` and `$HOME/DOCUMENTS/x` both PASSED, with `[ -e ]` satisfied and TCC
-    # still denying them. `nocasematch` is bash 3.1+ (macOS ships 3.2, so `${v,,}` is not available),
-    # and it is SAVED AND RESTORED so the caller's matching semantics are unchanged. The loop sets a
-    # result instead of returning early, so there is no path that skips the restore.
+    # variant through — measured (fresh review of #3413): `$HOME/Documents/x` REFUSED while
+    # `$HOME/documents/x` and `$HOME/DOCUMENTS/x` both PASSED, with `[ -e ]` satisfied and TCC still
+    # denying them. `nocasematch` is bash 3.1+ (macOS ships 3.2, so `${v,,}` is not available), and it
+    # is SAVED AND RESTORED so the caller's matching semantics are unchanged. The loop sets a result
+    # instead of returning early, so there is no path that skips the restore.
     shopt -q nocasematch && _nm=1
     shopt -s nocasematch
     arg_phys="$(physical_path "$arg" 2>/dev/null)" || arg_phys=""
+    # ⛔ THE LITERAL SPELLING IS A FALLBACK, NOT AN ALTERNATIVE (fresh review of #3413, P2). When the
+    # path RESOLVES, WHERE it resolves to is the only thing TCC gates — so `~/Documents/alias` ->
+    # `~/outside/live.sh` is READABLE, and matching the literal spelling as well skipped that unit AND
+    # disarmed it: a working unit booted out and deleted because of how its path was spelled. The
+    # literal is used only when nothing could be resolved (an unresolvable path must never be a way
+    # past the guard).
+    candidate="${arg_phys:-$arg}"
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         [ -z "$found" ] || continue
         root_phys="$(physical_path "$root" 2>/dev/null)" || root_phys="$root"
-        for candidate in "$arg_phys" "$arg"; do
-            [ -n "$candidate" ] || continue
-            case "$candidate" in
-                "$root_phys" | "$root_phys"/*) found="$root_phys"; break ;;
-            esac
-        done
+        case "$candidate" in
+            "$root_phys" | "$root_phys"/*) found="$root_phys" ;;
+        esac
     done < <(tcc_protected_roots)
     [ "$_nm" -eq 1 ] || shopt -u nocasematch
     [ -n "$found" ] || return 1
@@ -853,6 +878,21 @@ verify_targets() {
             bad=1
             continue
         fi
+        # ⛔ READABILITY AND FILE-TYPE ARE PART OF THE SAME GUARANTEE, for EVERY executed target and not
+        # only for a launcher inside a TCC tree (fresh review of #3413, P3): the premise of this whole
+        # change is that existence is not readability, and `[ -e ]` alone left a `chmod 000` script —
+        # or a DIRECTORY at argv[0] — installing an armed, dead unit outside any TCC root. A data
+        # argument is exempt: it is not executed, and #427's data class is a WARN.
+        case "$kind" in
+            launcher | exec)
+                if [ ! -f "$arg" ] || [ ! -r "$arg" ]; then
+                    echo "    unreadable or not a regular file: $arg" >&2
+                    echo "        launchd would start this unit and the interpreter would die (126/127)," >&2
+                    echo "        which reads as 'installed' to every instrument that only checks existence." >&2
+                    bad=1
+                    continue
+                fi ;;
+        esac
         is_tcc_protected "$arg" || continue
         case "$kind" in
             launcher)

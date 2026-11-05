@@ -1161,7 +1161,8 @@ chmod 000 "$PROBE_UNREADABLE"
 set +e
 OUT="$(probe_install "$PROBE_HOME" "$PROBE_UNREADABLE" 2>&1)"; RC=$?
 set -e
-assert_line "$OUT" '^    TCC-protected target: ' "§7c an UNREADABLE launcher inside a TCC root is refused (cannot-read is not a binary)"
+assert_eq "$RC" "1" "§7c an UNREADABLE launcher is refused — cannot-read is never a binary"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …and the refusal NAMES unreadability (not a TCC guess)"
 if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
     bad "§7c …and the unit is not installed"
 else
@@ -1192,6 +1193,63 @@ assert_eq "$RC" "0" "§7c a shebang launcher whose interpreter is a TCC BINARY d
 assert_contains "$OUT" "RUNS a binary from inside $PROBE_HOME/Documents" "§7c …because the grant is the INTERPRETER's, named by root"
 assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so it is not skipped"
 
+# (c18) `env -S '<cmd>'` / `env --split-string=<cmd>`: the value is a COMMAND LINE, so its absolute
+# tokens are executed and must be classified. Treating it as an option value installed a unit whose
+# script lives in a TCC tree with NO verdict at all (fresh review of #3413, P3).
+for _probe_s in -S --split-string; do
+    if [ "$_probe_s" = "-S" ]; then
+        set +e
+        OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+        set -e
+    else
+        set +e
+        OUT="$(probe_install "$PROBE_HOME" /usr/bin/env "--split-string=/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+        set -e
+    fi
+    assert_line "$OUT" '^    TCC-protected target: ' "§7c env $_probe_s '<cmd with a TCC script>' is classified (the string is a command line, not an option value)"
+    if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+        bad "§7c …so nothing is installed for it ($_probe_s)"
+    else
+        ok "§7c …so nothing is installed for it ($_probe_s)"
+    fi
+done
+
+# (c19) a DIRECTORY at an executed position: existence alone armed it (`[ -e ]` is satisfied, and the
+# interpreter dies 126/127). This is the PR's own premise applied to every path, not only a TCC one.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c a DIRECTORY at an executed position fails the install (not a regular file)"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why"
+
+# (c20) a `chmod 000` executed target OUTSIDE any TCC root: readable-only-inside-TCC was the last
+# surviving form of "existence is not readability".
+PROBE_NOREAD="$PROBE_HOME/.pi/agent/scripts/noread.sh"
+printf '#!/bin/bash\nexit 0\n' > "$PROBE_NOREAD"; chmod 000 "$PROBE_NOREAD"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_NOREAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c an unreadable executed target OUTSIDE a TCC root fails the install"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …so 'existence is not readability' holds for every path"
+chmod 755 "$PROBE_NOREAD"
+
+# (c21) a symlink that lives under a TCC root but RESOLVES OUTSIDE it is READABLE, so it must install —
+# matching the literal spelling as well as the physical one skipped AND DISARMED a unit that starts
+# (fresh review of #3413, P2).
+: > "$PROBE_HOME/.pi/agent/scripts/live-outside.sh"
+chmod +x "$PROBE_HOME/.pi/agent/scripts/live-outside.sh"
+ln -sfn "$PROBE_HOME/.pi/agent/scripts/live-outside.sh" "$PROBE_HOME/Documents/checkout/alias-out.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/Documents/checkout/alias-out.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a \$HOME/Documents symlink that RESOLVES outside the tree is readable and installs"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …it is NOT skipped (matching the literal spelling disarmed a working unit)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
+
 # (c4) `env -i bash <script>`: an option AND env's program hop both sit before the script.
 set +e
 OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -i bash "$PROBE_DEAD" 2>&1)"; RC=$?
@@ -1203,8 +1261,9 @@ assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is no
 # it as executed, so the unit is SKIPPED rather than armed. This is a deliberate cost, stated: the
 # guard cannot tell a positional value from an inline program's script, and arming a unit launchd
 # cannot start is the defect this exists for, so the doubt resolves to "do not install".
+: > "$PROBE_HOME/Documents/checkout/positional-data.txt"
 set +e
-OUT="$(probe_install "$PROBE_HOME" /bin/bash -c 'echo hi' "$PROBE_HOME/Documents/checkout" 2>&1)"; RC=$?
+OUT="$(probe_install "$PROBE_HOME" /bin/bash -c 'echo hi' "$PROBE_HOME/Documents/checkout/positional-data.txt" 2>&1)"; RC=$?
 set -e
 assert_eq "$RC" "0" "§7c a positional TCC value does not fail the install"
 assert_line "$OUT" '^    TCC-protected target: ' "§7c …and resolves to a SKIP, not an armed unit (doubt goes to do-not-install)"
