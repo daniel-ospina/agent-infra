@@ -994,6 +994,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   {
+    name: "REAP_WT_PRESERVE_KEEP_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
+    axis: "retention",
+    guardedBy: "scripts/pi-reap-worktrees.test.sh G2aa + the EV/ENV_AA arms (#3405 review round 2, P2; override seam REAP_WT_PRESERVE_KEEP_DAYS_OVERRIDE: G2aa pins the refusal for an unusable value and the ENV_AA arms pin 0 = keep everything and the prune of every archive root)",
+    note: "#3405 — the retention bound on the lane-evidence ARCHIVE, the new sink the reaper's reclaim path writes into. The archive made the reclaim path able to accumulate: `REAP_WT_PRESERVE_DIR` and each of `REAP_WT_PRESERVE_FALLBACKS` grow one `YYYY-MM-DD/` directory per pass, so without a bound the reaper traded a full volume for a full state dir. Only DATED subdirectories are candidates, pruned oldest-first under the pass lock, and 0 keeps everything — an operator-safe value, since the failure direction of a wrong prune is losing the evidence a reclaim left behind. It prunes EVERY root an archive can land in (configured AND fallbacks), because a bounded configured root with an unbounded fallback is unbounded exactly on the box whose data volume is full. Registered rather than exempted because it IS a retention bound in the same family as REAP_WT_AGED_DAYS / REAP_WT_MERGED_AGE_DAYS above, and this registry is the one place a reader can see a retention floor move.",
+  },
+  {
     name: "REAP_WT_BUDGET_SECONDS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_BUDGET_SECONDS:-300}",
