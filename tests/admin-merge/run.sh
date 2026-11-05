@@ -15970,13 +15970,24 @@ JQ_LITERALS_TMP="$TMP/jq-literals.txt"
 # …and the SAME form under the `--jq=PROG` separator, which the fleet's own gh shim
 # implements (`scripts/orchestrator-harness/gh-rest/gh:284`, `--jq=*)`), so a rail author
 # can reach for it. Zero sites in the rail today, which is exactly why it would otherwise
-# go unnoticed. A `--jq="$VAR"` is SKIPPED here (`grep -v '^\$'`) because FORM 3 owns
-# variable resolution and a bare `$VAR` would otherwise be reported as an unparseable
-# program. Quote stripping is deliberately loose — leading and trailing quotes are removed
-# independently — because the census only needs the program text, not the quoting style.
+# go unnoticed.
+# ⛔ QUOTE-AWARE, THREE PASSES — the first attempt at this scan used `[^[:space:]]+`, which
+# stops at the first INTERIOR SPACE, so `--jq='.items[] | .bogus(  '` was captured as
+# `.items[]`, compiled clean, and reported a PASS over a program gh rejects on every read.
+# A review cycle caught it: a truncated capture is worse than no capture, because it turns
+# a DECLARED gap into a silent FALSE PASS for the exact bug class this section exists for.
+# Each quoted form is therefore captured to its OWN closing quote; only a genuinely bare
+# token falls back to the space-delimited class. A `--jq="$VAR"` is SKIPPED (`grep -v '^\$'`)
+# because FORM 3 owns variable resolution and a bare `$VAR` would otherwise be reported as
+# an unparseable program.
+{ grep -oE -- "--jq='[^']*'" "$ROOT/scripts/admin-merge.sh" \
+    | sed -e "s/^--jq='//" -e "s/'\$//" ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
+{ grep -oE -- '--jq="[^"]*"' "$ROOT/scripts/admin-merge.sh" \
+    | sed -e 's/^--jq="//' -e 's/"$//' \
+    | grep -v '^\$' ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
 { grep -v '^[[:space:]]*#' "$ROOT/scripts/admin-merge.sh" \
-    | grep -oE -- "--jq=[^[:space:]]+" \
-    | sed -e 's/^--jq=//' -e "s/^'//" -e "s/'\$//" -e 's/^"//' -e 's/"$//' \
+    | grep -oE -- "--jq=[^'\"[:space:]][^[:space:]]*" \
+    | sed 's/^--jq=//' \
     | grep -v '^\$' ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
 # FORM 3 — THE VARIABLE-HELD PROGRAMS. A `--jq "$VAR"` is invisible to both scans above, and
 # there are THREE such programs — `LANE_RUN_JQ`, `FIRST_CHECKS_JQ`, `LANE_RUN_GUARD_JQ`.
