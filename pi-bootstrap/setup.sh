@@ -607,9 +607,16 @@ fi
 # logged `Operation not permitted` and exited 126 on every tick while `launchctl list` said "loaded".
 # Those three templates now name the FARMED path, which makes this array the delivery mechanism the
 # units depend on (#2053's rule for worktree-hygiene-sweep.sh, applied to the same failure).
-# ⛔ NESTED NAMES ARE KEPT NESTED (`orchestrator-harness/…`): `watchdog-loop.sh` resolves the cell
-# supervisor as `$(dirname $0)/../cloud-cell-supervisor.sh`, so flattening the farm would silently
-# break that fallback. The copy leg creates the parent directory for exactly this reason.
+# ⛔ NESTED NAMES ARE KEPT NESTED (`orchestrator-harness/…`): the farm destination mirrors the repo's
+# own `scripts/orchestrator-harness/` layout, because that is the layout every `$SELF_DIR`-relative
+# resolution site in these files assumes. ⚠️ MEASURED, not assumed: `watchdog-loop.sh:316` is the only
+# such site (`$SELF_DIR/../cloud-cell-supervisor.sh`) and `worker-supply.sh` sets a `HERE` (:108) it
+# never reads — and the supervisor it looks for is in NO farm array (the paragraph above on this array
+# names that as a residual owned by #1938), so on a farmed box that fallback finds nothing whether the
+# entry is nested or flat. The nesting is therefore NOT a claim that the fallback works today; it is
+# kept because flattening would silently put every `$SELF_DIR/../` site one directory off and turn
+# #1938's undecided delivery question into an unrecorded layout change. The copy leg creates the parent
+# directory so a nested entry actually lands.
 fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh tortoise-graph.sh tortoise_graph_client.py objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
