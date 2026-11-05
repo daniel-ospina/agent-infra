@@ -1313,7 +1313,7 @@ The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` �
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
 against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **22 passed,
-34 failed, 1 skipped**, and against this tree **56 passed, 0 failed, 3 skipped**: the discrimination is
+34 failed, 2 skipped**, and against this tree **56 passed, 0 failed, 3 skipped**: the discrimination is
 measured both ways, not asserted. (The red on the pre-change tree is 18 of the 21 cases — every case whose
 subject runs through the ENTRY POINT, which on that tree has no `class=runner-work` at all: (a), (b), (c),
 (d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r), (s), (t) and (v); the owner-only cases (i), (m) and
@@ -1384,7 +1384,7 @@ and the same suite with `DR_REAPER=` `origin/main`'s `disk-reaper.sh` (the pre-c
 tree's owner):
 
 ```
-  22 passed, 34 failed, 1 skipped
+  22 passed, 34 failed, 2 skipped
 ```
 
 ⛔ **THESE TALLIES WERE RE-MEASURED BECAUSE THE SUITE CHANGED, NOT BECAUSE THE ARITHMETIC LOOKED WRONG.**
@@ -1395,9 +1395,24 @@ case **(v)** (the two tallies the record used to drop, four arms) and mutants `o
 numbers above were taken by running the suite at this head,
 and the pre-change row is the same command with `DR_REAPER` pointed at the base commit — **18 cases and
 16 unappliable mutants** are red there simply because the base entry point has no `class=runner-work` at
-all, and the `1 skip` (not 3) is because two of the three `(f)` invocation sites never get that far on a
-tree whose entry point refuses them earlier. That pre-change run is a discrimination check, not evidence:
-every mutant it reports "caught" is caught only because its case is already red.
+all, and it reports **2 skips, not 3**, for two DIFFERENT reasons: only one of the three `(f)` invocation
+sites gets that far on a tree whose entry point refuses them earlier, and case (v)'s conditional positive
+half fires DETERMINISTICALLY there — the base entry point emits no `df_raw` at all, so the arm that needs a
+nonzero delta can never run and now says so instead of vanishing (measured: `22 passed, 34 failed,
+2 skipped`, one of the skips being `v1 positive half`). That pre-change run is a discrimination check, not
+evidence: every mutant it reports "caught" is caught only because its case is already red.
+
+⛔ **A RUN AS ROOT IS ALSO A MEASURED, NON-GREEN-NEUTRAL OUTCOME, and it used to be a FALSE PASS.** Cases
+(g), (l) and (r) exist to make a directory unreadable or unwritable, which `chmod` cannot do to root: each
+now calls `skip()` and returns `CASE_SKIPPED`, which `expect_pass`/`expect_fail` map to a `⏭` line instead
+of ✅ — so the arm is on the `skipped:` channel and NOT in the outcome tally, and its five mutants are
+reported as "NOT measured" rather than as `MUTANT SURVIVED`. Measured on this box under
+`unshare -r --map-root-user`: **47 passed, 0 failed, 12 skipped, exit 0**, with zero `MUTANT SURVIVED`
+lines. Before the sentinel the same run printed `50 passed, 6 failed, 10 skipped, exit 1` — five of those
+reds being "MUTANT SURVIVED: the arm is not covered by this case" about arms that WERE covered and merely
+could not be built, i.e. a suite blaming its own coverage for a host limitation, on a box that reports
+healthy. `passed + the skipped CASE lines` still totals 56; the 12 skips are 3 `(f)` sites + 9 case
+invocations ((g)/(l)/(r) each reached three times).
 
 **The tally names SKIPS separately, because a skip is not a pass.** Case (f)'s default-glob half cannot
 run on a box that HAS real runner roots — its whole subject is the default list, so there is nothing to
@@ -1445,7 +1460,10 @@ exact defect the skip channel exists to remove. It now calls `skip()` with its r
 is 16 MB (large enough that cancellation is unlikely, small enough to stay cheap), so a healthy run
 reports **3** skips and a run whose delta was cancelled reports that many MORE, each with its reason on
 the `skipped:` lines. **A tally whose skip count exceeds 3 is therefore not a regression** — read the
-reasons before assuming one.
+reasons before assuming one. The count is a function of the HOST and the TREE, not of the suite's health:
+**3** on a normal box with runner roots, **2** on the pre-change tree (one `(f)` site, plus case (v)'s arm
+firing deterministically there), **up to 9 more** on a box that runs as root (the `(g)/(l)/(r)` case skips
+above), and one more per case-(v) invocation whose pass observed no delta.
 
 | case | proves | mutant that must turn it red |
 |---|---|---|
@@ -1455,7 +1473,7 @@ reasons before assuming one.
 | (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one — whose record then answers `unmeasurable_runner_work=not-run`, the documented polarity for an unselected class, never a number | `want_class runner-work` → `true` |
 | (e) | an unknown `--only` value is refused, the valid list names `runner-work`, and a near-miss (`runner`) is refused too | the valid list is shortened in the refusal |
 | (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) — and the RECORD answers `?` for both `candidates_runner_work=` and `unmeasurable_runner_work=`, a class that measured nothing claiming no number at all. On a box with REAL runner roots (a cell) the default-glob half is **SKIPPED by name and counted on the `skipped` line — not as an outcome, and never as a pass** (the case itself still passes or fails on the source assertions beside the skip) — the documented default list is then asserted from the source — and `(b)` pins that the record carries the owner's `unmeasurable=` tally | the `census=no-roots` arm is deleted; and, separately, the `unmeasurable_runner_work=` `?` polarity answers `not-run` |
-| (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
+| (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to. ⚠️ **Skipped by name (not passed) when the suite runs as root** — `chmod` cannot deny root, so the unwritable state dir cannot be created and there would be nothing to measure | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
 | (h) | a SET-but-EMPTY glob list is a refusal at **both** layers (the entry point's seam and the owner's), never "scan nothing for ever" — `${X:-default}` would substitute the *widest* sweep for an emptied value, and this class's output is deletions | the entry point's empty-glob arm never matches; and, separately, the owner's |
 | (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |
 | (j) | **a LIVE job's `_temp` is never a candidate**: `_work/_temp` — the vendor's `Combine(Work, "_temp")`, written once per step, so it goes stale while the checkout beside it stays fresh — SURVIVES a stale floor and is named (`reason=live-job-temp`); a vendor directory the table has never seen also survives and is named (`reason=vendor-namespace-unlisted`); and a genuinely dead checkout in the SAME pass is still reaped. This is the shipped defect the reviewer measured — a `REAP` row for `_work/_temp`, with the checkout gate working perfectly, which the disclosed residual does not cover | the `_temp` row is deleted (the prefix default still keeps the directory, so the case pins the ROW by its reason); and, separately, the vendor-namespace default is disabled |

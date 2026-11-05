@@ -75,6 +75,9 @@ skip() { # <reason — say WHICH arm and WHY it could not run>
     printf '  ⏭  SKIPPED: %s\n' "$1"
     printf '%s\n' "$1" >>"$SKIP_LOG"
 }
+# The sentinel a case returns when its SUBJECT could not be built on this host. `expect_pass`/`expect_fail`
+# map it to a `⏭` line that is neither a pass nor a failure — see the comment on `expect_pass`.
+CASE_SKIPPED=200
 # `case_check` runs INSIDE a case (a subshell): it prints and counts locally, and the case's own failure
 # count decides the subshell's status. It deliberately does not touch PASS/FAIL — the OUTER runner counts
 # one line per case, so a mutant run can never inflate the real tally.
@@ -83,9 +86,18 @@ case_check() { # <0|1> <message>
     if [ "$1" = 0 ]; then printf '     · %s\n' "$2"; return 0; fi
     printf '     ✗ %s\n' "$2"; CASE_FAIL=$((CASE_FAIL + 1)); return 1
 }
-expect_pass() { local label="$1"; shift; if ( CASE_FAIL=0; "$@" ); then ok "$label"; else bad "$label"; fi; }
-expect_fail() { local label="$1"; shift
-    if ( CASE_FAIL=0; "$@" ); then bad "$label — MUTANT SURVIVED: the arm is not covered by this case"
+expect_pass() { local label="$1" rc; shift; ( CASE_FAIL=0; "$@" ); rc=$?
+    # ⛔ A CASE THAT SKIPPED ITS SUBJECT IS NOT A PASS (#3057 review, P2). A case whose fixture cannot be
+    # built on this host calls `skip()` and returns `CASE_SKIPPED`; it used to `return 0`, so on a ROOT box
+    # (l)/(r) printed ✅ having run ZERO assertions, their five mutants then reported "MUTANT SURVIVED: the
+    # arm is not covered by this case" — a false coverage claim about arms that were merely UNMEASURABLE —
+    # and the suite exited 1. `skip()` has already written the reason to the `skipped:` channel; this only
+    # keeps the OUTCOME tally honest, which is what the doc's "skipped by name (not passed)" always said.
+    if [ "$rc" = "${CASE_SKIPPED:-200}" ]; then printf '  ⏭  %s\n' "$label"; return 0; fi
+    if [ "$rc" = 0 ]; then ok "$label"; else bad "$label"; fi; }
+expect_fail() { local label="$1" rc; shift; ( CASE_FAIL=0; "$@" ); rc=$?
+    if [ "$rc" = "${CASE_SKIPPED:-200}" ]; then printf '  ⏭  %s — the CASE skipped, so this mutant arm was NOT measured\n' "$label"; return 0; fi
+    if [ "$rc" = 0 ]; then bad "$label — MUTANT SURVIVED: the arm is not covered by this case"
     else ok "$label"; fi; }
 
 [ -f "$REAPER" ] || { printf 'FATAL: %s missing — this suite tests the entry point\n' "$REAPER"; exit 1; }
@@ -650,6 +662,14 @@ case_g() { # <entry-point> <owner>
     s_home="$HOME/.pi/agent/state"; mkdir -p "$s_home"
     s_cfg="$base/configured"; mkdir -p "$s_cfg"
     chmod 555 "$s_home" "$s_cfg"
+    # ⛔ `chmod` CANNOT DENY ROOT, so on a root box the unwritable state dir this case exists for is never
+    # created: the pass writes to the CONFIGURED dir, the fallback is never exercised, and every assertion
+    # below measures nothing (measured: (g) reddened there). Skip BY NAME rather than assert nothing.
+    if [ -w "$s_home" ] || [ -w "$s_cfg" ]; then
+        chmod 755 "$s_home" "$s_cfg" 2>/dev/null
+        skip "(g) a FULL-DISK fallback: chmod cannot make a directory unwritable for this process (running as root), so the arm was NOT measured"
+        return $CASE_SKIPPED
+    fi
     # ⛔ NO run_pass HERE: its whole job is to PIN the owner's own seams, and pinning them is what this
     # case must NOT do — the export under test is the pass's, and an explicit pin would mask its absence.
     out="$(cd "$T" && DISK_REAPER_STATE_DIR="$s_cfg" DISK_REAPER_TMPFS_ROOT="$T/tmpfs-g$$" \
@@ -744,11 +764,11 @@ case_l() { # <entry-point> <owner>
     fixture_entry dead "$work" job-abandoned 300 || return 1
     # 0111 = stat-able and traversable, NOT listable. A `chmod` cannot deny root, so the arm is SKIPPED
     # there rather than asserted: a case that cannot make the condition is not a case (see `skip`).
-    chmod 0111 "$work" 2>/dev/null || { skip "(l) an UNLISTABLE root: chmod is unavailable on this host, so the arm was NOT measured"; return 0; }
+    chmod 0111 "$work" 2>/dev/null || { skip "(l) an UNLISTABLE root: chmod is unavailable on this host, so the arm was NOT measured"; return $CASE_SKIPPED; }
     if [ -r "$work" ]; then
         chmod 0755 "$work" 2>/dev/null
         skip "(l) an UNLISTABLE root: this process can read a mode-0111 directory anyway (running as root), so the arm was NOT measured"
-        return 0
+        return $CASE_SKIPPED
     fi
     s1="$(uniqstate l1)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
@@ -1000,7 +1020,7 @@ case_v() { # <entry-point> <owner>
         case_check "$(grep -qF 'MAY BE ITS OWN' <<<"$st" && echo 0 || echo 1)" \
                    "v1 … and having OBSERVED a nonzero df delta, the note offers it as a POSSIBLE own reclaim (not as proof of another process)"
     else
-        skip "v1 positive half, entry point <entry>/disk-reaper.sh — this pass observed NO df delta (another process moved df inside the window), so the 'MAY BE ITS OWN' wording was NOT measured"
+        skip "v1 positive half, entry point $pass — this pass printed no nonzero df_raw, so no own-reclaim delta was observed (either another process cancelled it, or the pass emitted no df_raw at all); the 'MAY BE ITS OWN' wording was NOT measured"
     fi
     ps_out="$(DISK_REAPER_STATE_DIR="$s" bash "$pass" --print-status 2>/dev/null)"
     case_check "$(grep -qE '(^|\|)reaped_runner_work=\?(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
@@ -1079,11 +1099,11 @@ case_r() { # <entry-point> <owner>
     unreadable="$(mk_work "$base" gh-runner-x64-31)"; fixture_entry dead_unread "$unreadable" job-hung 300 || return 1
     # 0111 = stat-able and traversable, NOT listable — the permission mismatch this class's header names
     # as plausible. `chmod` cannot deny root, so the arm is SKIPPED there rather than asserted.
-    chmod 0111 "$unreadable" 2>/dev/null || { skip "(r) a PARTLY-UNREADABLE population: chmod is unavailable on this host, so the arm was NOT measured"; return 0; }
+    chmod 0111 "$unreadable" 2>/dev/null || { skip "(r) a PARTLY-UNREADABLE population: chmod is unavailable on this host, so the arm was NOT measured"; return $CASE_SKIPPED; }
     if [ -r "$unreadable" ]; then
         chmod 0755 "$unreadable" 2>/dev/null
         skip "(r) a PARTLY-UNREADABLE population: this process can read a mode-0111 directory anyway (running as root), so the arm was NOT measured"
-        return 0
+        return $CASE_SKIPPED
     fi
     s1="$(uniqstate r1)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
