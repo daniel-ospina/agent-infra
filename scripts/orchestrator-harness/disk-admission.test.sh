@@ -692,6 +692,98 @@ case "$_chainok" in
   *) bad "H4) the chain-start branch is no longer extractable — fix this harness, do not trust H4" ;;
 esac
 
+# ═══ I. A NEUTRALISATION THAT LEAVES A TERM ARMED STILL MEASURES THE HOST ═════════════════════════
+# ⛔ MEASURED (review P2, #3409). FOUR terms decide admission — the floor (#1765) and the three lane
+# terms (#2721) — and `disk_worktree_terms` DEFAULTS the TREE term to its python default (350 MB)
+# whenever `DISK_LANE_TREE_MB` is unstated, while `spawn-gate.sh` coerces a `DISK_MIN_FREE_MB=0` floor
+# back to 500 (`[ "$x" -ge 1 ] || x=500`, because a 0 floor is a gate that can never refuse). So a
+# suite neutralising only SELF and RESERVE still refuses on a box below 350 MB, and one that writes
+# the floor as `=0` still refuses below 500 MB — measuring the HOST while its comment claims the
+# opposite. Measured: three suites copied two of the four terms; a 100 MB `df` stub turned
+# `wt-lifecycle.test.sh` into 46 passed / 62 failed, every red on a provision that was merely refused.
+# The gate was right; the SUITES lied about what they had turned off. `spawn-gate.test.sh` had always
+# named all four (`DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0`),
+# which is why it was immune. This pins the CLASS, not the three files: the next copy-paste inherits it.
+echo
+echo "── I) every suite that neutralises the disk admission zeroes all FOUR terms ──"
+# The matcher is a FUNCTION, not an inline pipeline, so the positive controls below drive the SAME code
+# the census uses. A census whose matcher nothing exercises is the false-PASS shape this file refuses.
+NEUTRAL_LANE_TERMS='DISK_LANE_(SELF|RESERVE|TREE)_MB=0'
+neutralisation_offenders() { # <file>... -> "file:NN: <command> [missing: …]" for each neutralising COMMAND missing a term
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    # ⛔ THE UNIT IS A LOGICAL COMMAND, NOT A PHYSICAL LINE (measured, #3409). A `\`-continued arm
+    # states `DISK_MIN_FREE_MB=…` on the line ABOVE its lane terms; a line-based scan flagged five
+    # such arms in `spawn-gate.test.sh` that were already complete, i.e. it would have been deleted as
+    # a cry-wolf — the failure mode this whole file exists against, one level up. Continuations are
+    # joined BEFORE the match, so the census sees what bash sees.
+    awk -v FILE="$f" -v PAT="$NEUTRAL_LANE_TERMS" '
+      function trimleft(s) { sub(/^[ \t]+/, "", s); return s }
+      {
+        cmd = $0; start = NR
+        while (cmd ~ /\\$/) {
+          if ((getline nxt) <= 0) break
+          sub(/\\$/, " ", cmd); cmd = cmd " " nxt
+        }
+        if (cmd !~ PAT) next
+        # PROSE IS NOT A NEUTRALISATION: a comment quoting the incomplete shape to condemn it must not
+        # be flagged, or the census reds on the text that explains it and gets deleted with the check.
+        if (substr(trimleft(cmd), 1, 1) == "#") next
+        missing = ""
+        if (cmd ~ /DISK_MIN_FREE_MB=0([^0-9]|$)/)
+          missing = missing " DISK_MIN_FREE_MB=<nonzero: 0 is COERCED back to 500>"
+        else if (cmd !~ /DISK_MIN_FREE_MB=[^ ]/)
+          missing = missing " DISK_MIN_FREE_MB=<nonzero>"
+        # The contract is NAME IT, not "set it to 0": an arm that deliberately holds a term at a
+        # non-zero value (`spawn-gate.test.sh` varies TREE at 100/2000 to pin the live arm) is a
+        # legitimate member — what it may not do is leave a term UNSET, because unset is what DEFAULTS
+        # (TREE to 350, SELF to 6,144, the floor to 500) and that re-introduces the host dependency.
+        # ⛔ THE VALUE MAY BE A VARIABLE (`DISK_MIN_FREE_MB="$floor"` in the floor arms, `"${4:-1}"`
+        # in run_fork): the assertion is that the term is STATED, so the test is "a non-empty value
+        # follows `=`", not "a digit follows it" — the digit form flagged two complete, variable-driven
+        # arms (measured). An EMPTY assignment is still flagged: `DISK_LANE_TREE_MB=` fails `is_limit`
+        # and defaults to 350, i.e. it neutralises nothing.
+        if (cmd !~ /DISK_LANE_TREE_MB=[^ ]/)    missing = missing " DISK_LANE_TREE_MB=<explicit>"
+        if (cmd !~ /DISK_LANE_SELF_MB=[^ ]/)    missing = missing " DISK_LANE_SELF_MB=<explicit>"
+        if (cmd !~ /DISK_LANE_RESERVE_MB=[^ ]/) missing = missing " DISK_LANE_RESERVE_MB=<explicit>"
+        if (missing != "") printf "%s:%d: %s [missing:%s]\n", FILE, start, substr(cmd, 1, 220), missing
+      }' "$f"
+  done
+}
+# the population is BOUNDED: this directory's own suites, no recursion
+_off="$(neutralisation_offenders "$HERE"/*.test.sh)"
+[ -z "$_off" ] \
+  && ok "I) no suite leaves a disk-admission term armed: every neutralising line names the floor (=1) and all three lane terms" \
+  || bad "I) a suite neutralises the disk admission but LEAVES A TERM ARMED, so it measures the host after all:
+$_off"
+_neut="$(grep -hcE "$NEUTRAL_LANE_TERMS" "$HERE"/*.test.sh 2>/dev/null | awk '{s+=$1} END {print s+0}')"
+[ "$_neut" -ge 30 ] \
+  && ok "I) …and the census saw $_neut neutralising line(s) across the suite population (floor 30 — an empty scan is not a clean scan)" \
+  || bad "I) only $_neut neutralising line(s) seen, floor 30 — the population shrank or the pattern stopped matching, so the arm above is vacuous"
+# POSITIVE CONTROLS. The fixtures are DERIVED from the complete line by dropping one term, never
+# written out literally: a literal incomplete export in this file's own source would be a TRUE
+# positive against the census above (correctly — and unhelpfully, since it is a fixture, not a
+# neutralisation of anything). Order matters: TREE first and the FLOOR last, so `#* ` drops TREE and
+# `% *` drops the floor.
+mkdir -p "$T/neut"
+_terms4="DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 DISK_MIN_FREE_MB=1"
+printf 'export %s\n' "$_terms4" > "$T/neut/complete.test.sh"
+printf 'export %s\n' "${_terms4#* }" > "$T/neut/no-tree.test.sh"
+printf 'export %s\n' "${_terms4% *}" > "$T/neut/no-floor.test.sh"
+printf 'export %s\n' "${_terms4%DISK_MIN_FREE_MB=1}DISK_MIN_FREE_MB=0" > "$T/neut/zero-floor.test.sh"
+if [ -z "$(neutralisation_offenders "$T/neut/complete.test.sh")" ]; then
+  ok "I) …a COMPLETE four-term neutralisation is NOT flagged (the census is not red on its own remedy, which is how a real check gets deleted)"
+else
+  bad "I) a correct four-term neutralisation WAS flagged — the matcher is too broad and would be removed, taking the real check with it"
+fi
+for _fx in no-tree no-floor zero-floor; do
+  case "$(neutralisation_offenders "$T/neut/$_fx.test.sh")" in
+    ?*) ok "I) POSITIVE CONTROL: a '$_fx' neutralisation IS flagged (the matcher is not blind to the defect it exists for)" ;;
+    *) bad "I) POSITIVE CONTROL FAILED: a '$_fx' neutralisation was NOT flagged — the census above proves nothing" ;;
+  esac
+done
+
 echo
 echo "── results: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
