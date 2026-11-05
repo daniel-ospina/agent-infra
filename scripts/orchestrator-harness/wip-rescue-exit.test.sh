@@ -1546,13 +1546,19 @@ al_nothing="$( bash -c '
   lane_end_next' _ "$GATE" 2>/dev/null )"
 case "$al_nothing" in *"not on origin either"*) rcn31b=1 ;; *'unpushed=0'*) rcn31b=0 ;; *) rcn31b=1 ;; esac
 ck "N31b …nor with push=nothing, where every commit on the head is already on a remote ref (unpushed=0) [${al_nothing:0:70}]" $rcn31b
+# ⛔ N31c — PIN THE LANDING PLACE OF A FUTURE VERDICT (review cycle 14, P2). `archived-local` is assigned only
+# AFTER `lane_end_push` has run, so `LANE_END_PUSH` is always one of the declared values here and the old
+# fallback was DEAD — yet it said "the commits on <br> are not on origin either", i.e. the exact absence
+# cycle 11 removed, waiting for the first value nobody classified. This arm therefore drives a value that is
+# deliberately OUTSIDE the declared domain and asserts the ABSTENTION, not an absence claim: that is the
+# behaviour a future verdict inherits.
 al_other="$( bash -c '
   . "$1"
   LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=not-attempted
   LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
   lane_end_next' _ "$GATE" 2>/dev/null )"
-case "$al_other" in *"not on origin either"*) rcn31c=0 ;; *) rcn31c=1 ;; esac
-ck "N31c …while a push that was NOT attempted still says so — the branch fact is not silenced to make the wording easier [${al_other:0:60}]" $rcn31c
+case "$al_other" in *"not on origin either"*) rcn31c=1 ;; *"asserts neither delivery nor absence"*) rcn31c=0 ;; *) rcn31c=1 ;; esac
+ck "N31c …while an UNCLASSIFIED push value makes the reporter ABSTAIN rather than assert an absence — the branch a future verdict lands on [${al_other:0:60}]" $rcn31c
 # ⛔ N32 — THE CLEAN VERDICT CARRIES ITS OWN SCOPE (review cycle 11, P2). `clean` is measured over the paths
 # git does NOT ignore, and that caveat lived only in the lane LOG — which this file itself calls secondary.
 # A lane whose only copy of its work is an ignored file read `state=clean` and was handed an affirmative
@@ -1613,14 +1619,21 @@ PATH="$TMP/bin-124:$PATH" O="$O" bash -c '
   LANE_END_LOG="$3"; LANE_END_MARKER_FRESH=1
   lane_end_marker "timedout" 0 300
 ' _ "$GATE" "$TMP/wt10" "$O/logs/timedout.log" "$TMP/n33.next" > "$TMP/n33.out" 2>&1
-grep -qx 'push=push-timed-out' "$TMP/n33.out"; rcn33a=$?
-ck "N33a a push whose TIMER fired (rc=124) records push=push-timed-out — a distinct verdict from push=FAILED (the remote ANSWERED and the ref is absent)" $rcn33a
-! grep -q 'STILL only on this disk' "$O/logs/timedout.log" && grep -q 'TIMED OUT' "$O/logs/timedout.log" \
+grep -qx 'push=push-killed' "$TMP/n33.out"; rcn33a=$?
+ck "N33a a push whose TIMER fired (rc=124) records push=push-killed — a distinct verdict from push=FAILED (the remote ANSWERED and the ref is absent), and a name that asserts only what was MEASURED" $rcn33a
+! grep -q 'STILL only on this disk' "$O/logs/timedout.log" && grep -q 'timer fired at its bound' "$O/logs/timedout.log" \
   && grep -q 'did NOT establish' "$O/logs/timedout.log"; rcn33b=$?
 ck "N33b …and the log says the delivery was NOT established, never the self-contradicting 'never answered … STILL only on this disk'" $rcn33b
+# ⛔ N33g — THE LOG MAY NOT NAME A CAUSE THE CODE CANNOT ESTABLISH (review cycle 14, P2 — REPRODUCED). `137`
+# is not the timer's signature: `timeout 1 sh -c 'kill -9 $$'` returns it THROUGH GNU timeout with the timer
+# never firing, and an OOM killer on a full disk produces it with no timer at all. So the 137 sentence must
+# not claim the 15s bound fired, while the 124 sentence must say the timer did — same verdict, different
+# prose, because that is the only part the exit path can actually know.
+! grep -q 'TIMED OUT after 15s' "$O/logs/timedout.log" && grep -q 'timer fired at its bound' "$O/logs/timedout.log"; rcn33g=$?
+ck "N33g the rc=124 sentence no longer speaks in a fixed 'TIMED OUT after 15s' voice — it names the timer as what fired [$(grep -o 'timer fired at its bound' "$O/logs/timedout.log" | head -1)]" $rcn33g
 case "$(cat "$TMP/n33.next" 2>/dev/null)" in MANUAL*"did NOT establish"*) rcn33c=0 ;; *) rcn33c=1 ;; esac
 ck "N33c …and next= is MANUAL / 'did NOT establish' — not reaped, and not told to stop reaping for a loss nobody measured [$(cut -c1-58 "$TMP/n33.next" 2>/dev/null)]" $rcn33c
-grep -qx 'push=push-timed-out' "$O/state/lane-exit-timedout.state" 2>/dev/null; rcn33d=$?
+grep -qx 'push=push-killed' "$O/state/lane-exit-timedout.state" 2>/dev/null; rcn33d=$?
 ck "N33d …and the MARKER carries the same verdict, so artifact and log agree" $rcn33d
 # ⛔ N34 — THE LEDGER COLUMN AND THE MARKER ARE ONE DERIVATION (review cycle 12, P2 — REPRODUCED). The TSV
 # wrote the raw `${LANE_END_UNPUSHED:-0}`, and `terminal_wip_rescue` resets that global to 0 BEFORE both
@@ -1679,10 +1692,11 @@ PATH="$TMP/bin-137:$PATH" O="$O" bash -c '
   lane_end_push "killed" "$3" "$2" killed 1 1
   printf "push=%s\n" "$LANE_END_PUSH"
 ' _ "$GATE" "$TMP/wt11" "$O/logs/killed.log" > "$TMP/n33e.out" 2>&1
-grep -qx 'push=push-timed-out' "$TMP/n33e.out"; rcn33e=$?
-ck "N33e a push the INTERNAL watchdog SIGKILLed (rc=137, no sentinel — the full-disk shape) also records push=push-timed-out, not FAILED" $rcn33e
-! grep -q 'STILL only on this disk' "$O/logs/killed.log" && grep -q 'did NOT establish' "$O/logs/killed.log"; rcn33f=$?
-ck "N33f …and its log asserts neither delivery nor loss, so the 137 shape cannot claim the absence the 124 fix removed" $rcn33f
+grep -qx 'push=push-killed' "$TMP/n33e.out"; rcn33e=$?
+ck "N33e a push the INTERNAL watchdog SIGKILLed (rc=137, no sentinel — the full-disk shape) also records push=push-killed, not FAILED" $rcn33e
+! grep -q 'STILL only on this disk' "$O/logs/killed.log" && grep -q 'did NOT establish' "$O/logs/killed.log" \
+  && grep -q 'SIGKILLed' "$O/logs/killed.log" && ! grep -q 'fired at its bound' "$O/logs/killed.log"; rcn33f=$?
+ck "N33f …and its log asserts neither delivery nor loss, and does NOT claim the 15s bound fired — which signal sent it is not measurable from here" $rcn33f
 # ⛔ N27e — THE ONE MANUAL ARM THAT DID NOT UNION THE OTHER DOMAIN (review cycle 13, P2 — REPRODUCED).
 # `rescue=FAILED` printed "uncommitted work is NOT archived … re-run bg-rescue-wip.sh" and returned BEFORE the
 # refused-push arms, so `push=refused-main-checkout` — the documented `fix-one.sh` no-`WIP_PATH` hub case —
@@ -1743,6 +1757,55 @@ rm -rf "$TMP/n35bO"
   lane_end_record n35b 0 10' _ "$GATE" "$TMP/n35bO" 2>/dev/null )
 awk -F'\t' 'NR==1{exit !($8=="?")}' "$TMP/n35bO/state/lane-end.tsv"; rcn35c=$?
 ck "N35c …and a genuinely UNMEASURED count on a cannot-verify row still publishes '?' — the fix keys on the count, not the tree" $rcn35c
+# ⛔ N28e — THE HOISTED cannot-verify SENTENCE MAY NOT CONTRADICT ITSELF EITHER (review cycle 14, P2 —
+# REPRODUCED). It carried a HARD-CODED "`rescue=nothing` means the rescue did not certify it" beside an
+# INTERPOLATED `rescue=%s`, so with `rescue=refs/wip/develop` one line said both "rescue=refs/wip/develop"
+# and "rescue=nothing" — telling the reader NO archive exists while naming one. N28c/N28d assert MANUAL,
+# do-not-reap and that the ref appears; neither asserts the rescue value the sentence claims, so the
+# contradiction was invisible to them. This arm pins the absence of the literal.
+al_cv="$( bash -c '
+  . "$1"
+  LANE_END_TREE=cannot-verify; LANE_END_RESCUE=archived-local
+  LANE_END_REF=refs/wip-local/cvdemo; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$al_cv" in *'`rescue=nothing`'*) rcn28e=1 ;; *'rescue=archived-local'*) rcn28e=0 ;; *) rcn28e=1 ;; esac
+ck "N28e …and the sentence names the rescue value it actually holds — the hard-coded 'rescue=nothing' clause is gone [${al_cv:0:64}]" $rcn28e
+# ⛔ N36 — `push=running` IS NOT A MEASURED LOSS (review cycle 14, P2 — REPRODUCED). The pre-network marker
+# sets it BEFORE the push step, so it is what survives a kill in that window — and it was folded into the
+# MANUAL push case whose sentence says the commits "exist only on this disk", printed beside `unpushed=0`:
+# a loss claim contradicted by the same artifact's own count.
+n36="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=""; LANE_END_PUSH=running; LANE_END_UNPUSHED=0
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n36" in MANUAL*"unpushed=0"*"did NOT establish"*) rcn36a=0 ;; *) rcn36a=1 ;; esac
+ck "N36a a pre-network marker (push=running, unpushed=0) is MANUAL and asserts NEITHER delivery NOR loss — it does not claim the commits exist only on this disk [$n36]" $rcn36a
+case "$n36" in *'exist only on this disk'*) rcn36b=1 ;; *) rcn36b=0 ;; esac
+ck "N36b …and specifically never carries the unmeasured-loss sentence, which the same row's own unpushed=0 contradicts" $rcn36b
+# ⛔ N37 — `not-a-worktree` HAD NO ARM AND INHERITED THE RESCUE ARM (review cycle 14, P2 — REPRODUCED). The
+# rescue sentence asserts uncommitted work EXISTS at the root and prescribes re-running a rescuer that never
+# ran. The cause is the CALLER's pointer, and the remedy it now names is the one that works.
+n37="$( bash -c '
+  . "$1"
+  LANE_END_TREE=not-a-worktree; LANE_END_RESCUE=UNAVAILABLE
+  LANE_END_UNPUSHED="?"; LANE_END_ROOT=/tmp/not-a-wt
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n37" in MANUAL*) rcn37a=0 ;; *) rcn37a=1 ;; esac
+case "$n37" in *"WIP_PATH"*) : ;; *) rcn37a=1 ;; esac
+case "$n37" in *"NOT archived"*) rcn37a=1 ;; *) : ;; esac
+ck "N37a not-a-worktree is MANUAL, names the CALLER's remedy (WIP_PATH) and does not assert work that was never examined [${n37:0:64}]" $rcn37a
+# ⛔ N37b — UNAVAILABLE IS NOT FAILED (review cycle 14, P2). A rescuer that was NOT FOUND cannot be "re-run",
+# and the log for that same terminal already names the homes that were searched. README requires the two be
+# told apart; the artifact said "re-run bg-rescue-wip.sh" for both.
+n37b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=UNAVAILABLE; LANE_END_PUSH=pushed; LANE_END_UNPUSHED=0
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n37b" in *"rescue TOOL itself was not found"*) rcn37b=0 ;; *) rcn37b=1 ;; esac
+case "$n37b" in *"re-run bg-rescue-wip.sh"*) rcn37b=1 ;; *) : ;; esac
+ck "N37b …and rescue=UNAVAILABLE says the TOOL was not found, never 're-run bg-rescue-wip.sh' (which cannot be run) [${n37b:0:64}]" $rcn37b
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
