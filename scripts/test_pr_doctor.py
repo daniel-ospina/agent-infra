@@ -541,6 +541,76 @@ def test_spawn_argv_DECLARES_the_repair_kind(monkeypatch):
     assert argv[-2] == str(pr.SPAWN_TIMEOUT_S)
 
 
+def test_the_spawn_bound_is_a_BACKSTOP_SEAM_not_a_hardcoded_cap():
+    """agent-infra#2888: the bound is a configurable backstop, and its DEFAULT sits ABOVE the
+    fleet's own no-progress allowance.
+
+    The defect this pins: `SPAWN_TIMEOUT_S = 2400` was hardcoded and handed to the worker as its kill
+    deadline, 5 minutes SHORTER than the 2700 s no-progress allowance the fleet already declares — so
+    the wall killed a lane before anything could ask whether it was working. Measured 2026-10-27/28:
+    five of five `prfix` lanes ended at `elapsed == cap` with zero commits, 144 KB of finished work
+    between them; `walltime.tsv` read median = p90 = 2400 s for the kind. A bound at the MEDIAN of the
+    population it bounds is censoring it, not trimming it.
+
+    ⛔ THE ORDERING IS THE ASSERTION, not the literal: a future edit may re-size the backstop, and it
+    may NOT put it back below the allowance — that ordering is the defect, whatever number carries it.
+    """
+    assert pr.SPAWN_BACKSTOP_ENV == "PRD_SPAWN_BACKSTOP_S"
+    assert pr.SPAWN_TIMEOUT_S == pr.DEFAULT_SPAWN_BACKSTOP_S, (
+        "SPAWN_TIMEOUT_S must resolve from the seam; with no env set it is the default")
+    # The allowance is read from ITS owner (lane-bound.sh), never restated here: a second threshold
+    # for "how long may a lane show no progress" is the finding this whole change exists to remove.
+    lb = (_HARNESS / "lane-bound.sh").read_text()
+    m = re.search(r'num_or "\$\{LANE_BOUND_IDLE_S:-\}" (\d+)', lb)
+    assert m, "lane-bound.sh no longer declares the progress allowance in a readable shape"
+    allowance_s = int(m.group(1))
+    assert pr.SPAWN_TIMEOUT_S > allowance_s, (
+        f"the wall backstop ({pr.SPAWN_TIMEOUT_S}s) is NOT above the progress allowance "
+        f"({allowance_s}s): the wall would pre-empt the progress bound, which is exactly the "
+        f"censoring agent-infra#2888 removed")
+    # ...and the doctrine value it must agree with, so this cannot drift on its own.
+    edges = (_REPO / "extensions" / "shared" / "heartbeat-progress-edges.ts").read_text()
+    block = edges.split('name: "DEFAULT_PROGRESS_AGE_MS"', 1)[1]
+    doc_ms = int(re.search(r'value: "=\s*([0-9_]+);', block).group(1).replace("_", ""))
+    assert allowance_s == doc_ms // 1000, (
+        f"lane-bound's progress allowance ({allowance_s}s) is not the fleet's declared no-progress "
+        f"allowance ({doc_ms // 1000}s): two numbers for one concept is how the shipped pair came "
+        f"to kill a lane five minutes before the allowance could fire")
+    # The harness seam and this module's default are one number in two languages; a drift between
+    # them would silently make the argv lie about the bound the worker actually ran under.
+    gate = (_HARNESS / "spawn-gate.sh").read_text()
+    seam = int(re.search(r'LANE_BACKSTOP_S="\$\{LANE_BACKSTOP_S:-([0-9]+)\}"', gate).group(1))
+    assert seam == pr.DEFAULT_SPAWN_BACKSTOP_S, (
+        f"pr-doctor's default ({pr.DEFAULT_SPAWN_BACKSTOP_S}s) != spawn-gate's LANE_BACKSTOP_S "
+        f"({seam}s): the value in the argv would not be the value the lane ran under")
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "0", "-5", "abc", "10m", "2.5"])
+def test_a_malformed_backstop_seam_never_disarms_the_bound(raw):
+    """A typo must not unbind every repair lane on the box.
+
+    `0`-means-off is the `task` family's convention for a PER-DISPATCH dial an operator turns off on
+    purpose; this is the DEFAULT for every `prfix` spawn, where an unbounded lane and a typo'd one
+    are the same reading. So every malformed shape takes the default, asserted in both directions
+    (the default is returned, and an explicit override still wins).
+    """
+    os.environ[pr.SPAWN_BACKSTOP_ENV] = raw
+    try:
+        assert pr._positive_int_env(pr.SPAWN_BACKSTOP_ENV, 7200) == 7200
+        assert pr._positive_int_env(pr.SPAWN_BACKSTOP_ENV, 7200) > 2700
+    finally:
+        del os.environ[pr.SPAWN_BACKSTOP_ENV]
+
+
+def test_the_backstop_seam_is_HONOURED_when_it_is_a_real_number():
+    """The seam has to work, not just default well — the control that makes the test above honest."""
+    os.environ[pr.SPAWN_BACKSTOP_ENV] = "5400"
+    try:
+        assert pr._positive_int_env(pr.SPAWN_BACKSTOP_ENV, 7200) == 5400
+    finally:
+        del os.environ[pr.SPAWN_BACKSTOP_ENV]
+
+
 def test_dispatch_invokes_the_background_spawn_argv(monkeypatch, tmp_path):
     calls = []
     monkeypatch.setattr(pr, "STATE_DIR", str(tmp_path))

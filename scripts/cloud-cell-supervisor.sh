@@ -18,8 +18,13 @@
 # because a gate an agent can defeat with an export is not a gate.
 #
 # Runs ON THE CELL (Linux). Usage:
-#   bash cloud-cell-supervisor.sh check|start|stop|status|logs|apply|prune
+#   bash cloud-cell-supervisor.sh check|start|stop|status|capacity|logs|apply|prune
 #                                  |doctor|merge|reap|hygiene
+#
+#   capacity   print the box's ONE lane-ceiling line — `cpus=N MAX_LANES=M mem_ceiling=K`,
+#           `pinned=`/`drift=` when a pin exists — and exit. This is the only way to see whether
+#           a cell's `keys.env` disagrees with the derivation WITHOUT starting anything, so it is
+#           named here and not only in the dispatch's usage string (agent-infra#3146).
 #
 #   apply   fetch agent-infra main and PIN this cell's harness to it (agent-infra#1745). This is the
 #           whole of "apply the proper harness"; `start` runs it before every launch, so it is
@@ -283,6 +288,157 @@ workers_maybe_live() {
 WORKER_ENV_NAMES="AI_REVIEW_GATE_KEY HOME O DEEPSEEK_API_KEY PATH"
 
 log_line() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# LANE CEILING — DERIVED on this delivery path too, and a PIN THAT DISAGREES IS LOUD (#3146)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# THE RULING IS NOT CHANGED HERE. `MAX_LANES` is DERIVED, not configured: floor(ncpu × 5/2), the
+# fleet's 2026-10-17 lane ruling (docs/ops/ai-drainer.md:49, docs/ops/fleet-harness-baseline.md:137
+# — "Do not 'fix' a per-box MAX_LANES"). Memory is the drainer's SEPARATE second ceiling
+# (target = min(cpu_ceiling, mem_ceiling)); it is REPORTED here and never applied here, because a
+# memory floor quietly narrowing the lane count would reverse that ruling as a side effect.
+#
+# WHY THIS FILE NEEDED IT AT ALL. Every other delivery path DERIVES the number: install.sh:87
+# renders it into the mac plist, orch-loop.sh:243 and spawn-gate.sh:91 derive it at start. This one
+# — the CELL path — derived it ZERO times: the cell's number is a hand-pushed `keys.env` constant,
+# sourced into this shell, so nothing ever compared it to the derivation. Measured 2026-10-30:
+# cell-3 is 4 cores (derives 10) and its keys.env carried 20, while its memory ceiling was 3 — it
+# ran 10 lanes, thrashed, and killed lanes with ENOSPC. Two delivery paths, one of which could
+# drift with nothing going red. This block is the missing comparison and the missing one-line
+# report (`cpus=N MAX_LANES=M mem_ceiling=K`), so a box whose lane count exceeds its memory ceiling
+# is visible rather than inferred from a thrash.
+#
+# ⛔ PINNED MIRROR, NOT A SOURCE. This file is farmed into a runtime dir and copied outside any
+# checkout (see the note above `_proc_start_epoch`), so it cannot source scripts/lib/lane-ceiling.sh.
+# The derivation below is that library's, mirrored. ⛔ THE DRIFT ARM IS IN
+# orchestrator-harness/selftest.sh (§ "LANE CEILING"), which runs BOTH under the same stubbed probes
+# and reddens on any divergence — name it exactly: a comment that points at a suite which does not
+# contain the arm leaves the next editor pinning nothing. (It is behavioural rather than the
+# byte-identity `pin_dirty` uses because the two bodies legitimately differ in naming; what must not
+# differ is what they ANSWER, which is what the parity scenarios assert — the CPU-probe ladder AND
+# the memory formula, the latter at a NON-DEFAULT MEM_BUDGET_PCT/LANE_MEM_MB. At the default 75%/512MB
+# a missing clamp is INVISIBLE: this mirror shipped without the drainer's clamps and every probe arm
+# stayed green while it printed 5x the ceiling ai-drainer.sh enforces.
+_lane_is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+_lane_is_limit() { _lane_is_num "${1:-}" && [ "${#1}" -le 9 ]; }
+# Sets LANE_CPU_N / LANE_CPU_MECH in this shell. Order is install.sh:46's, unchanged: sysctl (macOS)
+# → nproc (GNU) → getconf (POSIX; present on both, and the only one a minimal Linux userland keeps).
+_lane_probe_raw() {
+  local n
+  LANE_CPU_MECH=""; LANE_CPU_N=""
+  n="$(sysctl -n hw.ncpu 2>/dev/null)" && [ -n "$n" ] && _lane_is_limit "$n" && { LANE_CPU_MECH=sysctl; LANE_CPU_N="$((10#$n))"; }
+  if [ -z "$LANE_CPU_MECH" ]; then
+    n="$(nproc 2>/dev/null)" && [ -n "$n" ] && _lane_is_limit "$n" && { LANE_CPU_MECH=nproc; LANE_CPU_N="$((10#$n))"; }
+  fi
+  if [ -z "$LANE_CPU_MECH" ]; then
+    n="$(getconf _NPROCESSORS_ONLN 2>/dev/null)" && [ -n "$n" ] && _lane_is_limit "$n" && { LANE_CPU_MECH=getconf; LANE_CPU_N="$((10#$n))"; }
+  fi
+  if [ -z "$LANE_CPU_MECH" ]; then
+    # ⛔ LOUD FALLBACK — a constant is never reported as a measurement.
+    log_line "WARN: the CPU count could not be read (sysctl hw.ncpu, nproc and getconf all failed) — falling back to 4 cores, so MAX_LANES derives to 10. This is a CONSTANT, not a measurement." >&2
+    LANE_CPU_MECH=fallback; LANE_CPU_N=4
+  fi
+  [ "$LANE_CPU_N" -ge 1 ] || {
+    log_line "WARN: the CPU probe ($LANE_CPU_MECH) answered 0 — a 0-valued probe is a FAILED probe, not 'no cores'. Falling back to 4 cores." >&2
+    LANE_CPU_MECH=fallback; LANE_CPU_N=4
+  }
+  return 0
+}
+# floor(ncpu × 5/2): 10 cores → 25, 8 → 20, 4 → 10. The fallback of 10 covers a FAILED or absurd
+# derivation only — never a pin.
+_lane_derive() { # $1 = ncpu
+  local n="${1:-}" d
+  _lane_is_limit "$n" || return 1
+  d=$(( 10#$n * 5 / 2 ))
+  [ "$d" -ge 1 ] && [ "$d" -le 999999999 ] || d=10
+  printf '%s\n' "$d"
+}
+# The drainer's own formula and the drainer's own env names (ai-drainer.sh:44), so a pin on one box
+# is honoured by both. REPORTED, never applied: application belongs to the drainer.
+_lane_mem_avail_mb() {
+  local p="${LC_PROC_MEMINFO:-/proc/meminfo}" mb
+  if [ -n "${MEM_AVAIL_MB:-}" ]; then
+    case "$MEM_AVAIL_MB" in ''|*[!0-9]*) ;; *) printf '%s\n' "$((10#$MEM_AVAIL_MB))"; return 0 ;; esac
+  fi
+  if [ -r "$p" ]; then
+    mb="$(awk '/^MemAvailable:/ {a=$2} /^MemFree:/ {f=$2} /^Cached:/ {c=$2}
+              END {if (a!="") v=a; else if (f!="" && c!="") v=f+c; else exit 1
+                   printf "%d", v/1024}' "$p" 2>/dev/null)" || return 1
+  else
+    mb="$(vm_stat 2>/dev/null | awk '/page size of/ {ps=$8} /Pages free/ {gsub(/[.]/,"",$3); f=$3}
+          /Pages inactive/ {gsub(/[.]/,"",$3); i=$3}
+          END {if (ps=="") ps=16384; if (f=="" || i=="") exit 1
+               printf "%d", (f+i)*ps/1048576}')" || return 1
+  fi
+  case "$mb" in ''|*[!0-9]*) return 1 ;; esac
+  printf '%s\n' "$mb"
+}
+_lane_mem_ceiling() { # $1 = mem_avail_mb → "?" when unreadable; $1 unused + $2=formula → the formula it used
+  local avail="${1:-}" floor_mb budget lane_mb usable
+  floor_mb="${MIN_MEM_FREE_MB:-512}"; budget="${MEM_BUDGET_PCT:-75}"; lane_mb="${LANE_MEM_MB:-512}"
+  _lane_is_num "$floor_mb" || floor_mb=512
+  _lane_is_num "$budget"   || budget=75
+  _lane_is_num "$lane_mb"  || lane_mb=512
+  # ⛔ THE DRAINER'S OWN CLAMPS, not just non-numeric coercion (review P1). `ai-drainer.sh:228-231`
+  # clamps LANE_MEM_MB to >= 1 and MEM_BUDGET_PCT into [1,100] BEFORE its `_capacity_target`, so those
+  # are the numbers it ACTS on. This mirror had only the coercion, so a cell `keys.env` carrying
+  # MEM_BUDGET_PCT=500 reported (9000-512) x 500/100 / 512 = 82 lanes where the drainer holds 16 — and
+  # because the thrash WARN below compares the pin against THIS number, a box pinned at 20 on a real
+  # ceiling of 16 read as "inside its ceiling" and the warning the change exists to add went SILENT.
+  # The library (scripts/lib/lane-ceiling.sh) got these clamps; a mirror without them is exactly the
+  # #1178 "two contracts for one safety rule" the drift arm below exists to prevent — and it could
+  # not see it: every arm ran at the default 75, where neither copy clamps.
+  [ "$budget" -ge 1 ]   || budget=1
+  [ "$budget" -le 100 ] || budget=100
+  [ "$lane_mb" -ge 1 ]  || lane_mb=1
+  # The formula AS PRINTED, from the same clamped values — a WARN that quotes the raw environment
+  # (`MEM_BUDGET_PCT=500%`) beside a ceiling computed from 100% names a formula nobody used.
+  if [ "${2:-}" = formula ]; then
+    printf '(MemAvailable - %sMB) x %s%% / %sMB\n' "$((10#$floor_mb))" "$((10#$budget))" "$((10#$lane_mb))"
+    return 0
+  fi
+  _lane_is_num "${avail:-}" || { printf '?\n'; return 1; }
+  usable=$(( (10#$avail - 10#$floor_mb) * 10#$budget / 100 ))
+  [ "$usable" -ge 0 ] || usable=0
+  printf '%s\n' "$(( usable / 10#$lane_mb ))"
+}
+# The ONE line, at every start. `pinned=`/`drift=` appear only when a pin exists, and drift is
+# named with the file that carries it. ⛔ A pin is NEVER rewritten here: it is the operator's, and a
+# tool that overwrites it turns a visible disagreement into a silent one.
+lane_ceiling_report() {
+  local pin="${MAX_LANES:-}" ncpu derived avail memceil
+  _lane_probe_raw; ncpu="$LANE_CPU_N"
+  derived="$(_lane_derive "$ncpu")" || derived=10
+  avail="$(_lane_mem_avail_mb 2>/dev/null)" || avail=""
+  memceil="$(_lane_mem_ceiling "$avail" 2>/dev/null)" || memceil="?"
+  if [ -z "$pin" ]; then
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH (derived: 2.5 x cores — no pin)"
+    return 0
+  fi
+  case "$pin" in
+    ''|*[!0-9]*)
+      log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin DRIFT — the pin is not a whole number, so it cannot be the lane ceiling it names. Fix the MAX_LANES line in ${ENV_FILE:-keys.env}."
+      return 0 ;;
+  esac
+  # ⛔ A DIGIT STRING IS NOT A MAGNITUDE (the `is_limit` rule this repo applies to every other limit).
+  # `$((10#$pin))` on a 20-digit pin WRAPS rather than erroring, so the report would print a wrapped
+  # number as fact and the memory comparison below would compute a garbage slot count — the same
+  # class install.sh:1176 names ("passed the class test, and … lost the lane cap").
+  if ! _lane_is_limit "$pin"; then
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin DRIFT — the pin is not a magnitude (more than nine digits), so it cannot be the lane ceiling it names; it is NOT evaluated and NOT applied. Fix the MAX_LANES line in ${ENV_FILE:-keys.env}."
+    return 0
+  fi
+  if [ "$((10#$pin))" = "$derived" ]; then
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin (agrees with the derivation)"
+  else
+    log_line "capacity: cpus=$ncpu MAX_LANES=$derived mem_ceiling=$memceil cpu_probe=$LANE_CPU_MECH pinned=$pin DRIFT — the pin disagrees with 2.5 x $ncpu cores (=$derived) and stays in force; the ruling is that MAX_LANES is DERIVED, not configured, so remove the MAX_LANES line from ${ENV_FILE:-keys.env} unless this box is deliberately carved out (docs/ops/fleet-harness-baseline.md:137). Reported, never overwritten."
+  fi
+  if [ "$memceil" != "?" ] && [ "$memceil" -lt "$((10#$pin))" ]; then
+    log_line "WARN: the pinned MAX_LANES=$pin EXCEEDS this box's memory ceiling ($memceil lanes — $(_lane_mem_ceiling '' formula)): the drainer holds the real target at $memceil, so the extra $((10#$pin - memceil)) lane slot(s) are a thrash risk, not capacity (measured: cell-3 ran 10 lanes against a ceiling of 3 and was killed with ENOSPC, agent-infra#3146)"
+  fi
+  return 0
+}
+cmd_capacity() { lane_ceiling_report; }
 die() { log_line "FATAL: $*" >&2; exit 1; }
 
 # ── the TARGET checkout: the operator's value, else DERIVED from a real checkout ───────────────
@@ -2490,7 +2646,14 @@ cmd_check() {
   # `. "$SELF/spawn-gate.sh" || exit 78`, and dispatch-merge.sh runs `bash '$O/lane.sh'`, so `$SELF` is
   # `$O` — a cell without it has its every lane die at startup while `check` printed the green banner.
   # install.sh:812 already required it; this list did not.
-  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
+  # ⛔ AND EVERY HELPER `lane.sh` REFUSES *LOUDLY* WITHOUT BELONGS HERE TOO (review round 3, P2, verified
+  # `grep -c` = 0 for all four on the pre-change tree). `lane.sh` sources each of these with
+  # `. "$SELF/<f>" || { …; exit 78; }`, so a $O missing one makes EVERY dispatch on the box die at
+  # startup — while this list, whose own comment says it exists to prevent exactly that false PASS,
+  # certified the box runnable. `key-gate.sh` (#3331) and `lane-env.sh` (#3060) are the two newest;
+  # `brief-gate.sh` (#2258) and `wt-lifecycle.sh` (#2033) are older instances of the same class and were
+  # equally absent, so they are added with it rather than left as the next thing to be found by hand.
+  for w in orch-loop.sh harness-refresh.sh claims.sh repo-authority.sh repo-slug.sh repo-target.sh spawn-gate.sh gate-policy.sh reviewer-preflight.sh brief-gate.sh wt-lifecycle.sh lane-env.sh key-gate.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh cloud-cell-doctor.sh lane-merge.sh merge-rate.sh lane-reap.sh; do
     [ -f "$O/$w" ] || missing="$missing $w"
   done
   [ -z "$missing" ] || die "worker scripts missing from $O:$missing — run 'start' (it seeds $O) or, for a verified redeploy: bash '$HARNESS'/deploy-harness.sh --src '$HARNESS' --o '$O'"
@@ -2818,6 +2981,11 @@ end_loop_pid() { # [<pid> <ident>]
 
 # ── start: controller under tmux (the launchd substitution) ─────────────────────
 cmd_start() {
+  # ⛔ THE BOX'S LANE CEILING, IN ONE LINE, BEFORE ANYTHING STARTS (#3146). `$ENV_FILE` is already
+  # sourced into this shell by this point, so a `keys.env` MAX_LANES pin is visible here — and this
+  # is the ONLY place a cell's ceiling is ever compared to the derivation. A warning at start is the
+  # whole point: cell-3's 20-against-a-derivation-of-10 was invisible until it thrashed.
+  lane_ceiling_report
   # Refuse a bad SCOPE before anything starts or is written (validate_scope is also the first thing
   # cmd_check does below — this call is what keeps the refusal ahead of the $O seed).
   validate_scope
@@ -3791,6 +3959,14 @@ cmd_stop() {
 }
 cmd_status() {
   local cpids own foreign
+  # ⛔ NOT HERE — the ceiling line goes LAST in this verb (review P2). Two callers read the HEAD of
+  # `status`: `report.sh:114` keeps `head -4` (its first four lines were `controller:` → `supervision:`
+  # → `state dir:` → `queue:`) and `bin/harness:428` keeps `head -1` and matches `controller: RUNNING`.
+  # Leading with `capacity:` pushed the `queue:` line — the #1901 signal that answers "is this cell
+  # pointed at the repo it grades?" — out of report.sh's window, and made bin/harness's `head -1` a
+  # line no arm of its `case` recognises, so a HEALTHY cell was reported as "cannot determine" (a
+  # false UNKNOWN, which that reader treats as not-a-pass). The ceiling is CONTEXT, not the verdict;
+  # `cmd_start` still reports it FIRST, where "before anything starts" is the whole point.
   cpids="$(seen_controller_pids)" \
     || die "cannot read the process table (ps) — refusing to report a controller state from an unreadable read"
   own="$(owned_controller_pids)" \
@@ -4049,6 +4225,9 @@ cmd_status() {
     log_line "  roles: UNKNOWN — cloud-cell-doctor.sh not found (run: $0 apply)"
     [ -f "$ROLES_DIR/.desired" ] && rrc=1
   fi
+  # The ceiling, as the LAST line of `status` — after the verdict, never ahead of the head-1/head-4
+  # readers (see the note at the top of this function).
+  lane_ceiling_report
   return "$rrc"
 }
 
@@ -4477,6 +4656,153 @@ exclude_root_add() { # <absolute path>
   if [ -n "${EXCLUDE_ROOTS:-}" ]; then EXCLUDE_ROOTS="$EXCLUDE_ROOTS"$'\n'"$1"; else EXCLUDE_ROOTS="$1"; fi
 }
 
+# ⛔ HELD BY A LIVE PROCESS — THE READING A PIN FILE CANNOT MAKE.
+# MEASURED 2026-11-02: a controller (systemd MainPID, uptime 4d 05:12:10) was executing
+# `…/harness-next/709dfb06eac2/scripts/orchestrator-harness/orch-loop.sh` with that file open on
+# fd 255 (inode 1241401, links=0). The pin file had since advanced, so `709dfb06eac2` read as
+# "superseded" — and the superseded-pin sweep below `rm -rf`'d it **2 h 32 min after that
+# controller started**. The tree's disappearance did not stop the loop: bash keeps executing the
+# unlinked inode, so a live service was left running source that exists nowhere. The pre-fix
+# predicate compared the pin FILE and `$HARNESS` — it never read the process table — while a
+# LATER arm of this same function logged "a LIVE process holds it" from a cwd census. An actuator
+# contradicting its own observation, inside one function.
+# WHY THE OBVIOUS CHECKS CANNOT SEE THIS. `pgrep -f <path>` matches the command LINE, and the
+# loop's argv names `orch-loop.sh` by the path it was STARTED with — not the tree we enumerate —
+# besides self-matching the shell that runs the check. A directory's link count says nothing
+# about use: an unlinked inode is still held, and still executing. The kernel's own symlinks are
+# the only complete read — /proc/<pid>/cwd, /proc/<pid>/fd/*, /proc/<pid>/exe — each with the
+# kernel's trailing " (deleted)" stripped, because a holder whose tree was ALREADY deleted still
+# names the path we are about to reclaim, and matching the stripped form is the safe direction.
+# rows in an ARRAY, not a temp file: no census file to leave behind (this verb exists to stop a disk
+# leak), no write-failure path (an ENOSPC — the state the hourly reaper fires in — would have
+# silently dropped rows while the row counter still said "a real census"), and no per-row open.
+# A PARTIAL READ IS STILL A REAL CENSUS (the reasoning `scripts/lib/live-paths.sh` already records:
+# refusing on a partial read makes every sweep permanently inert on a real box, where root's
+# processes are unreadable), so a gap is DISCLOSED on the decision line — `unreadable=<n>`, counted
+# as a pid whose fd directory this uid cannot list — rather than unblocking every reclaim. Only a
+# census with NO rows at all is a cannot-verify, and that fails closed.
+# ONE CENSUS PER PASS, plus a FRESH one immediately before a removal (see cmd_prune): a holder can
+# appear between candidates, and "re-measure at the moment of action" is the fleet rule.
+PIN_ROWS=(); PIN_CENSUS_RC=""; PIN_CENSUS_PIDS=0; PIN_CENSUS_UNREADABLE=0
+PIN_HOLD_PID=""; PIN_HOLD_KIND=""; PIN_HOLD_WHY=""
+pin_live_census() { # fills $PIN_ROWS (kind TAB pid TAB path); rc 1 = no census could be read at all
+  local proc="${PIN_PROC_ROOT:-/proc}" f pid link path tok seen=0 T=$'\t' lp_line nonarg=0
+  # ⛔ `$'\t'` IS NOT EXPANDED INSIDE DOUBLE QUOTES — measured in review: the row came out as the
+  # literal `cwd$'\t'<pid>$'\t'<path>`, so every row failed to split and the guard reported "unheld"
+  # for a tree a live process was sitting in (the fix's own bug, caught by the proof run). One TAB
+  # variable, expanded by the shell.
+  PIN_ROWS=(); PIN_CENSUS_PIDS=0; PIN_CENSUS_UNREADABLE=0; PIN_HOLD_WHY=""
+  if [ "${PIN_CENSUS_UNAVAILABLE:-0}" = 1 ]; then          # test seam: drive the fail-closed arm
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="forced-unavailable (PIN_CENSUS_UNAVAILABLE=1)"; return 1
+  fi
+  # ⛔ THE PROBE ITSELF IS VERIFIED BEFORE IT IS TRUSTED. `readlink` supplies EVERY cwd/fd/exe row —
+  # the three arms that cover the 2026-11-02 shape. Measured in review: with `readlink` failing, the
+  # argv rows alone still satisfied "a real census", so the sweep reported a disclosure identical to
+  # the healthy case and then deleted a tree a live process was sitting in. An argv-only census cannot
+  # see an fd holder, so a missing probe is a cannot-verify — never "nothing is live".
+  command -v readlink >/dev/null 2>&1 || {
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="readlink is not on PATH — the cwd/fd/exe probe cannot be read, so only argv would be visible"; return 1; }
+  for f in "$proc"/[0-9]*; do
+    [ -d "$f" ] || continue
+    pid="${f##*/}"; seen=$((seen+1))
+    for link in "$f/cwd" "$f/exe"; do
+      path="$(readlink "$link" 2>/dev/null)" || continue
+      path="${path% (deleted)}"; path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
+      case "$path" in /*) PIN_ROWS+=("${link##*/}$T$pid$T$path"); nonarg=$((nonarg+1)) ;; esac
+    done
+    # ONE fork for the whole fd table (not one per descriptor), and ONE builtin read for argv —
+    # a path a live process NAMES is held just as surely as one its cwd or an fd resolves to.
+    if ! { [ -d "$f/fd" ] && [ -r "$f/fd" ]; }; then
+      PIN_CENSUS_UNREADABLE=$((PIN_CENSUS_UNREADABLE+1))
+    else
+      while IFS= read -r path; do
+        path="${path% (deleted)}"; path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
+        case "$path" in /*) PIN_ROWS+=("fd$T$pid$T$path"); nonarg=$((nonarg+1)) ;; esac
+      done < <(readlink "$f"/fd/* 2>/dev/null)
+    fi
+    if [ -r "$f/cmdline" ]; then
+      while IFS= read -r -d '' tok; do
+        # ⛔ AN ABSOLUTE PATH CAN ARRIVE ATTACHED (`--repo=/abs/tree`, `ENV=/abs/tree`). A `/*` test
+        # alone missed those spellings — `lib/live-paths.sh` records the measured consequence: "the
+        # tree was reaped while a live process had it in argv". So the value after the first `=` is
+        # tested too, and a RELATIVE token (no leading `/` at all) is resolved against the pid's own
+        # cwd at match time, the same way `git -C wt-x` names a tree with no `/` in it.
+        tok="${tok//$'\n'/ }"; tok="${tok//$'\t'/ }"
+        case "$tok" in
+          /*) PIN_ROWS+=("arg$T$pid$T$tok") ;;
+          -*=/*) PIN_ROWS+=("arg$T$pid$T${tok#*=}") ;;
+          *=/*) PIN_ROWS+=("arg$T$pid$T${tok#*=}") ;;
+          */*) PIN_ROWS+=("relarg$T$pid$T$tok") ;; # a RELATIVE path (contains `/`): joined to its cwd
+          *) ;;                                   # a bare word/flag — the cwd arm already covers a pid
+                                                  # sitting in the tree, so this arm does not fork per token
+        esac
+      done < "$f/cmdline" 2>/dev/null
+    fi
+  done
+  # ⛔ NO /proc IS NOT "NOTHING IS LIVE" — and it is also not a licence to go inert. macOS (a platform
+  # this script runs on) has no /proc, and a pin sweep that preserved every tree forever would restore
+  # the per-commit disk leak #1745 exists to stop. `lsof` is the census arm `scripts/lib/live-paths.sh`
+  # already carries for exactly this gap (its own header: "the macOS/container arm falls through to
+  # `lsof` and succeeds"). It reports cwd AND open files, so it covers the fd-255 shape too. This arm
+  # can only ADD evidence — zero rows still fails closed — so it can never cause a removal that the
+  # /proc walk would not have made.
+  if [ "${#PIN_ROWS[@]}" -eq 0 ] && command -v lsof >/dev/null 2>&1; then
+    local lp_pid=""
+    while IFS= read -r lp_line; do
+      case "$lp_line" in
+        p*) lp_pid="${lp_line#p}"; case "$lp_pid" in ''|*[!0-9]*) lp_pid="" ;; esac ;;
+        n*) [ -n "$lp_pid" ] || continue
+            path="${lp_line#n}"; path="${path% (deleted)}"
+            path="${path//$'\n'/ }"; path="${path//$'\t'/ }"
+            case "$path" in /*) PIN_ROWS+=("lsof$T$lp_pid$T$path"); nonarg=$((nonarg+1)) ;; esac ;;
+      esac
+    done < <(lsof -n -P -w -F pn 2>/dev/null)
+    [ "${#PIN_ROWS[@]}" -gt 0 ] && PIN_CENSUS_PIDS="$(printf '%s\n' "${PIN_ROWS[@]}" | cut -d"$T" -f2 | sort -u | wc -l | tr -d ' ')"
+  fi
+  # ⛔ AN ARGV-ONLY CENSUS IS NOT A CENSUS. Measured in review: with the `readlink` probe failing, the
+  # argv rows alone satisfied "a real census", the disclosure looked identical to the healthy case, and
+  # the sweep deleted a tree a live process was sitting in — because argv can NEVER show an fd holder.
+  # So a census with no cwd/exe/fd/lsof row at all is a cannot-verify and fails CLOSED.
+  if [ "$nonarg" -eq 0 ]; then
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="no cwd/exe/fd row could be read from $proc (probe broken?) — an argv-only census cannot see an fd holder"; return 1
+  fi
+  if [ "${#PIN_ROWS[@]}" -eq 0 ]; then
+    PIN_CENSUS_RC=1; PIN_HOLD_WHY="$proc yielded no readable cwd/fd/exe/argv entry (and no lsof census)"; return 1
+  fi
+  # `$seen` counts /proc/<pid> DIRECTORY ENTRIES — it is 0 on the very platform the lsof arm exists for,
+  # so an unconditional assignment would print "census_pids=0" for a census of 100k rows.
+  [ "$PIN_CENSUS_PIDS" = 0 ] && PIN_CENSUS_PIDS="$seen"
+  PIN_CENSUS_RC=0; return 0
+}
+
+# pin_held_by_process <dir> -> 0 held (sets PIN_HOLD_PID/PIN_HOLD_KIND), 1 provably unheld, 2 cannot check
+# Matched as a PATH PREFIX in ONE direction only: a descriptor or argv token INSIDE the tree holds the
+# tree. A row in a SIBLING tree does not (nothing below recurses into a sibling), and a row for a PARENT
+# directory does not either — the removal takes THIS tree, never its parent. #2573's review found the
+# reverse direction (a held root excluding its siblings) on this very file; the bound is the same here.
+pin_held_by_process() {
+  local real kind pid path row cand
+  real="$(cd "$1" 2>/dev/null && pwd -P)" || real=""
+  PIN_HOLD_PID=""; PIN_HOLD_KIND=""; PIN_HOLD_WHY=""
+  pin_live_census || return 2
+  for row in "${PIN_ROWS[@]}"; do
+    IFS=$'\t' read -r kind pid path <<< "$row"
+    [ -n "$path" ] || continue
+    # A relative token is resolved against ITS OWN pid's cwd — the one reading a bare `git -C wt-x`
+    # needs, and the reason a relative name is not silently dropped.
+    if [ "$kind" = relarg ]; then
+      local rcwd; rcwd="$(readlink "${PIN_PROC_ROOT:-/proc}/$pid/cwd" 2>/dev/null)" || continue
+      path="${rcwd%/}/${path#./}"
+      kind=arg
+    fi
+    for cand in "$1" "$real"; do
+      [ -n "$cand" ] || continue
+      case "$path" in "$cand"|"$cand"/*) PIN_HOLD_PID="$pid"; PIN_HOLD_KIND="$kind"; return 0 ;; esac
+    done
+  done
+  return 1
+}
+
 cmd_prune() {
   local caches_only=0 do_scratch=0 days="$SCRATCH_DAYS" a
   EXCLUDE_ROOTS=""
@@ -4551,7 +4877,33 @@ cmd_prune() {
           *) log_line "prune: NOT reclaiming $d — its name does not resolve to a commit in ${HARNESS_REPO:-<unresolved>}, so it is not provably a pin of ours"
              continue ;;
         esac
-        log_line "prune: reclaiming superseded harness pin $d"
+        # ⛔ THE OBSERVATION IS TAKEN AT THE MOMENT OF ACTION, AND IT OUTRANKS THE PIN FILE.
+        # "The pin file names a newer commit" answers *superseded*; it does not answer *unheld*.
+        # This is the arm whose absence deleted a live controller's tree on 2026-11-02.
+        pin_held_by_process "$d"; _hrc=$?
+        # ⛔ ALLOW-LIST POLARITY: ONLY 0 and 1 are outcomes we understand. Any other status (127 = the
+        # helper was renamed away, 126, a signal) is a cannot-verify and PRESERVES. A `case` with no
+        # `*)` arm would make every status except exactly 2 mean DELETE — the fail-open this family
+        # has removed elsewhere, inverted on the one path that `rm -rf`s.
+        case "$_hrc" in
+          0) log_line "prune: PRESERVED($d, held-by-${PIN_HOLD_KIND}:${PIN_HOLD_PID}) — a live process holds this tree, so it is NOT reclaimed whatever the pin file says"
+             continue ;;
+          1) ;;   # provably unheld by the pass census — re-measured below, immediately before removal
+          *) log_line "prune: PRESERVED($d, check-unavailable:${PIN_HOLD_WHY:-process census yielded status $_hrc}) — cannot prove it unheld, so it is NOT reclaimed (fail closed)"
+             continue ;;
+        esac
+        # RE-MEASURE AT THE MOMENT OF ACTION. The pass census was taken before this candidate's turn;
+        # a holder can appear between candidates (a controller restarting mid-sweep is exactly how the
+        # 2026-11-02 tree became occupied). Only candidates that already passed pay this second walk.
+        pin_held_by_process "$d"; _hrc=$?
+        case "$_hrc" in
+          0) log_line "prune: PRESERVED($d, held-by-${PIN_HOLD_KIND}:${PIN_HOLD_PID}) — a live process took this tree during the pass; NOT reclaimed"
+             continue ;;
+          1) ;;
+          *) log_line "prune: PRESERVED($d, check-unavailable:${PIN_HOLD_WHY:-re-measure yielded status $_hrc}) — cannot prove it unheld at the moment of removal (fail closed)"
+             continue ;;
+        esac
+        log_line "prune: reclaiming superseded harness pin $d (no live process holds it: census_pids=${PIN_CENSUS_PIDS} unreadable_fd_tables=${PIN_CENSUS_UNREADABLE})"
         # Deregister as well as delete. A bare `git worktree prune` is banned (#1141), so the removal
         # must be PATH-SCOPED — but a removal that only `rm -rf`'d left a phantom `worktree list`
         # entry plus its admin dir behind, one per pin forever, on the very verb that exists to stop a
@@ -4631,6 +4983,7 @@ cmd_prune() {
 }
 
 case "${1:-status}" in
+  capacity) cmd_capacity ;;
   check)   cmd_check ;;
   start)   cmd_start ;;
   apply)   shift; cmd_apply "$@" ;;
@@ -4642,5 +4995,5 @@ case "${1:-status}" in
   merge)   shift; cmd_merge "$@" ;;
   reap)    shift; cmd_reap "$@" ;;
   hygiene) shift; cmd_hygiene "$@" ;;
-  *) log_line "usage: $0 check|start|stop|status|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
+  *) log_line "usage: $0 check|start|stop|status|capacity|logs|apply|prune|doctor|merge|reap|hygiene"; exit 2 ;;
 esac

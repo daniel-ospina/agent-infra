@@ -24,7 +24,9 @@ The graph-write operations in this skill are identical for every Tortoise deploy
 
 ### Hosted (cloud)
 
-Your agent reaches the graph through the Tortoise **MCP server** at `https://api.premiselabs.co/mcp/`, authenticated with a Bearer API key (`TORTOISE_API_KEY`). If you installed the skills via the onboarding wizard, the MCP server is already wired — `claude mcp add tortoise` (or the `.mcp.json` snippet: `{"type": "http", "url": "https://api.premiselabs.co/mcp/", "headers": {"Authorization": "Bearer ${TORTOISE_API_KEY}"}}`). Every operation below maps to a `tortoise_*` MCP tool. No local database, SDK, `.env`, or graph-scripts.
+Your agent reaches the graph through the Tortoise **MCP server** at `https://api.premiselabs.co/mcp/`, authenticated with a Bearer API key (`TORTOISE_MCP_API_KEY`; the client falls back to `TORTOISE_API_KEY`, which USUALLY carries the same token — `skills/research/SKILL.md` records it measured identical, Bearer → `200` — but where that name carries the REST token instead the endpoint may REJECT it). If you installed the skills via the onboarding wizard, the MCP server is already wired — `claude mcp add tortoise` (or the `.mcp.json` snippet: `{"type": "http", "url": "https://api.premiselabs.co/mcp/", "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}}`). Every operation below maps to a `tortoise_*` MCP tool. No local database, SDK or `.env` — and outside a fleet box, no graph scripts either (on a fleet box, the farmed client below is the preferred route).
+
+⛔ **PREFER THE CLI ON A FLEET BOX.** The MCP entry's `Authorization` header is env-expanded by the pi process, so in a long-lived process started before the key existed it expands to EMPTY and every call fails `Unauthorized: invalid or missing Bearer token` — measured 2026-11-02 on a cell that CARRIES the key (agent-infra#3253). The same tools are reachable through `~/.pi/agent/scripts/tortoise-graph.sh` (farmed by `pi-bootstrap/setup.sh`; `scripts/tortoise-graph.sh` where that pointer resolves), which reads the key AT CALL TIME: `tortoise-graph.sh evidence 'MEASURED: …' --to <id>` / `decision` / `search` / `get` / `health`. Same MCP tools underneath, so the operation names below are unchanged.
 
 ### Self-hosted
 
@@ -36,6 +38,7 @@ The write operations appear once in this skill (by operation name). Invoke them 
 
 | Operation | Hosted — MCP tool | Self-hosted — SDK |
 |---|---|---|
+| _(reads, and the `evidence`/`decision` writes)_ | `~/.pi/agent/scripts/tortoise-graph.sh <verb>` — preferred ON A FLEET BOX, reads the key at call time. Verbs it implements: `health`, `search`, `get`, `stats`, `evidence`, `decision`; any other verb exits 2 `unknown verb`, so the mutations below have NO CLI verb (use the MCP tool or the SDK) | n/a |
 | Create point | `tortoise_create_point` | `sdk.create_point(kind, content)` |
 | Create operator (IMPL/NAND edge) | `tortoise_create_operator` | `sdk.create_operator(op_type, src, [targets])` |
 | Mitigate operator | `tortoise_mitigate_operator` | `sdk.mitigate_operator(id, reason, strength)` |

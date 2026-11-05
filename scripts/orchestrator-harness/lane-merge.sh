@@ -130,8 +130,14 @@ POLL_S="${LANE_MERGE_POLL:-120}";      is_limit "$POLL_S" || POLL_S=120      # o
 # i.e. the merge phase is bounded at 3240s of the 3300s clock, and a lane that implements within its
 # reserve reaches BOTH bounds. A cycle that needs longer is not a lane failure: it hands off as
 # WAITING_* (exit 11) and the next invocation resumes the SAME counter.
+# ⛔ AND THE CLOCK ITSELF IS THE LANE'S, READ FROM THE SAME SEAM (#2888 review, P2/P3 — verified). It
+# said `${LANE_TIMEOUT:-3300}` while `lane.sh` hands the lane `${LANE_TIMEOUT:-$LANE_BACKSTOP_S}` = 7200 s
+# — and `lane.sh` does not export `LANE_TIMEOUT`, so the merge phase permanently spent ~45% of the clock
+# the lane now owns. That is the opposite of what the paragraph above claims ("DERIVED from the lane's own
+# wall clock"). `LANE_BACKSTOP_S` IS exported by spawn-gate.sh, so this child reads the lane's real bound:
+#     7200 - 1500 (check wait) - 900 (implementation reserve) = 4800s / 120s = 40 chunks
 IMPL_RESERVE_S="${LANE_MERGE_IMPL_RESERVE:-900}"; is_limit "$IMPL_RESERVE_S" || IMPL_RESERVE_S=900
-LANE_WALL_S="${LANE_TIMEOUT:-3300}";              is_limit "$LANE_WALL_S" || LANE_WALL_S=3300
+LANE_WALL_S="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"; is_limit "$LANE_WALL_S" || LANE_WALL_S=7200
 # The divisor is floored at the shipped chunk length: LANE_MERGE_POLL=0 is a legitimate value (a chunk
 # that exits at once at its deadline), and dividing by it would break the arithmetic below instead of
 # yielding a bound.

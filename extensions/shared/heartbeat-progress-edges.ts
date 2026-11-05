@@ -794,6 +794,16 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "how old a reaper lock must be before a DEAD owner's lock is broken; a LIVE owner holds it outright whatever the directory age",
   },
   {
+    name: "LANE_BACKSTOP_S",
+    owners: ["scripts/orchestrator-harness/spawn-gate.sh"],
+    value: "${LANE_BACKSTOP_S:-7200}",
+    axis: "kill",
+    overrides: ["LANE_BACKSTOP_S=7200"],
+    guardedBy:
+      "scripts/orchestrator-harness/lane-bound.test.sh (i0) — the backstop is ABOVE the progress allowance, spawn-gate.sh EXPORTS it, and the consumers that outlive a lane (ai-drainer.sh, chain-merge.sh, pr-doctor.py's PRD_SPAWN_BACKSTOP_S) resolve the same number; the bound itself is DRIVEN through run_agent by (h)/(h3)",
+    note: "agent-infra#2888 — the ONE absolute backstop for a dispatch lane, in seconds, consumed by lane.sh, fix-one.sh and nonblocking-dispatch.sh. It is deliberately not the PRIMARY bound: lane-bound.sh's 2700 s PROGRESS allowance decides wedged-vs-slow, and this number (7200, PROVISIONAL) must sit strictly ABOVE it or the backstop pre-empts the bound it is supposed to back up — the shipped pair was wall 2400 < allowance 2700, which is precisely how a flat 40-minute cap came to censor ≥50% of repair lanes at their median. Registered here because a NEW stall bound must not land unregistered: the reverse scan is the only thing that makes a second, silent threshold visible.",
+  },
+  {
     name: "REAP_MIN_S",
     owners: ["scripts/orchestrator-harness/cloud-cell-doctor.sh"],
     value: "${REAP_MIN_S:-2700}",
@@ -869,6 +879,22 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
       "[ \"${#CLAIM_SNAPSHOT_MAX_AGE}\" -le 9 ] || CLAIM_SNAPSHOT_MAX_AGE=900 ;;",
     ],
     note: "#2466 — how stale a claim snapshot may be and still be believed (900 s ≈ 3.75 cycles at the shipped CYC=240). THREE shapes reach `claim-unreadable` and the bound governs only the third: no file at all, a header whose own fetch field says `failed` (refused at ANY age, because that test is the `if` and the age test only the `elif` — the bound must never be read as re-admitting a failed read), and an `ok` header older than this bound. The second declaration is the is_limit-style coercion that drops a zero/overflowing value back to 900, so an overflowing bound cannot make `[ -gt ]` error and turn the age test FALSE — an errored test is FALSE, which here would fail OPEN by believing every snapshot forever; it is recorded so a third assignment cannot shadow the default unnoticed.",
+  },
+  {
+    name: "LANE_ARM_SNAPSHOT_MAX_AGE",
+    owners: ["scripts/lane-arm.sh"],
+    value: "\"${LANE_ARM_SNAPSHOT_MAX_AGE_OPT:-$(( BUDGET * 2 ))}\"",
+    axis: "hygiene",
+    guardedBy: NONE,
+    note: "how old the reading a lane-arm pass publishes may be WHEN IT BECOMES CURRENT (default 2 x --budget = 480 s), reachable as `--max-snapshot-age`. Applied twice: before the renderer (cheap refusal) and again at PUBLISH, which is the binding arm because it also covers the renderer's own bounded run — the stamp in the queue header is rewritten to that same number so the field and the gate cannot disagree. ⛔ DERIVED, NOT A LITERAL, AND THAT WAS THE FIX (2026-10-31 review): over a 240 s sampler budget a literal 900 was a bound the code could not reach — the sample is hard-killed at its budget, so `sa` is always < BUDGET — i.e. an inert enforcer advertising protection it never gave. The derivation makes the ceiling the pass's own structural worst case (sample bound + renderer bound), so it binds exactly when a pass overruns what its own bounds permit, and it does not silently loosen when an operator raises --budget. Deliberately NOT named `MAX_AGE`: that symbol is a REGISTERED term owned by `scripts/monitor-worker.sh` (a worker-log freshness bound at `${2:-60}`), and the reverse scan refused the collision — one name over two unrelated numbers is the divergence this registry exists to surface. Co-owner registration instead would be a lie: the forward check requires the SAME value in every owner. The `_OPT` suffix on the CLI variable keeps this the ONE declaration of the term, so the override fragment is the default assignment rather than a second declaration.",
+  },
+  {
+    name: "LANE_ARM_LOCK_REAP_S",
+    owners: ["scripts/lane-arm.sh"],
+    value: "$(( BUDGET * 2 + 60 ))",
+    axis: "reap",
+    guardedBy: NONE,
+    note: "how old a lane-arm pass's LOCK file may be before the next pass reaps it, default 2 x --budget + 60 s. ⛔ THE INEQUALITY IS THE POINT (2026-10-31 review): this bound must EXCEED the longest legitimate pass (2 x BUDGET, sample plus renderer), or a second fire reaps a LIVE lock and the two passes interleave their artefacts — one pass's snapshot published beside the other's queue. A fixed 900 against a `--budget 1200` pass (2400 s worst case) did exactly that, measured; deriving it from the budget makes the inequality structural instead of a constant an operator can outgrow. ⛔ LOCK OWNERSHIP IS A PID, NOT THIS AGE: the lock records its holder and a pid that no longer exists is stale IMMEDIATELY, so a SIGKILLed pass no longer makes every fire for the whole window print 'skipping' and exit 0 (under Type=oneshot, SUCCESS with nothing produced — the no-op-gate shape). This bound is only the last resort for a lock whose holder this pass cannot identify at all.",
   },
   // — gate axis: the merge-priority gate's measured EVIDENCE AGES (#2040) —
   //
@@ -1041,6 +1067,26 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "hygiene",
     guardedBy: NONE,
     note: "#1932 (review of PR #1949) — the STATED free-disk floor the reaper's per-pass capacity line asserts against (2 GiB = one MEASURED lane env, ~1.85 GB of real non-shared disk per lane), so 'above the floor' means 'one more lane still fits'. Registered rather than left as a bare constant because it bounds how much of the box the fleet may consume, and a bound only the reaper knows about is invisible to the audit that exists to notice exactly that. It ASSERTS, it does not reclaim: a breach exits 5 (the reaper's own `over-bound` code — `disk-reaper.sh` KEEPS that 5 since agent-infra#2156 landed, so an apply pass records `rc=3 verdict_venv=fail-closed` and a dry run records `rc=5 verdict_venv=over-bound`; the old `worst_rc` drop of 5 that recorded `rc=0 verdict=ok` is gone, do not restate it) and is named on the report, and no live lane's env is ever deleted to get back above it. Unlike the age floor this is a SPACE bound, so it answers to the hygiene axis (disk reapers that are not agent-stall detectors), not retention.",
+  },
+  {
+    name: "STALL_FIX_BRIEF_MAX_AGE_MIN",
+    owners: ["scripts/orchestrator-harness/stall-fix.sh"],
+    value: "${STALL_FIX_BRIEF_MAX_AGE_MIN:-1440}",
+    axis: "retention",
+    guardedBy:
+      "scripts/orchestrator-harness/stall-fix.test.sh §E (the sinks are BOUNDED) — a brief past this floor is PRUNED while a neighbouring file the script does not own is left alone, an explicit 0 is CLAMPED so a 2 h-old brief SURVIVES (unclamped it is the eviction), the clamped default still prunes a genuinely OLD brief (the clamp is not an off-switch), and a NON-NUMERIC bound falls back to the default and still prunes rather than making the sweep a no-op; the SAME bound prunes the per-dispatch worker REPORT (§E2) and the worker TRANSCRIPT under `$O/bg/stallfix-*` (§E3, scoped so another lane's transcript is never touched), which are the largest two sinks; §E4 drives the FLOOR — a value BELOW the worker's own liveness pin is RAISED to it, so a knob of 5 cannot prune a LIVE worker's `.pid` (its survival is what keeps `wt_in_use` able to see that worker), while a transcript older than the raised floor is still pruned (the floor is not an off-switch); the 1440 value itself is pinned by THIS registry's forward check",
+    overrides: ["STALL_FIX_BRIEF_MAX_AGE_MIN=1440", 'STALL_FIX_BRIEF_MAX_AGE_MIN="$STALL_FIX_PIN_MIN"'],
+    note: "#2929 — how long a rendered stall brief under `state/` may live before the next dispatch prunes it (24 h, and the bound is CLAMPED to a positive number with 1440 as the fallback, so neither `0` nor a typo can turn the sweep into either an off-switch or a no-op). Registered rather than exempted because it IS a retention bound on exactly the population `#2929` measured — one brief per `DRAIN_STALL_FIX_EVERY` stalled PASSES (~120 files/day, unbounded, on a box that is stalled BECAUSE nothing lands) — and a bound only the dispatcher knows about is invisible to the audit that exists to notice precisely that. The clamp is the half that matters: it is the same shape `mp_recent_land` carries, and `0` here would mean 'prune every brief I just wrote'. ⛔ THE SECOND OVERRIDE IS A FLOOR, NOT A DEFAULT: this knob is RAISED to `STALL_FIX_PIN_MIN` because the prune and the liveness pin guard the SAME files — see that term.",
+  },
+  {
+    name: "STALL_FIX_PIN_MIN",
+    owners: ["scripts/orchestrator-harness/stall-fix.sh"],
+    value: null,
+    axis: "retention",
+    overrides: ["STALL_FIX_PIN_MIN=35"],
+    guardedBy:
+      "scripts/orchestrator-harness/stall-fix.test.sh §D (an AGED pidfile lifts the pin: a stale pid the kernel recycled cannot freeze the worktree forever) + §E4 (the retention prune cannot evict a LIVE worker's `.pid`, which is what keeps `wt_in_use` able to see that worker)",
+    note: "#2929 (fresh-context review of #3181, P1) — DERIVED, so `value: null`: `(DRAIN_STALL_FIX_TIMEOUT + 300) / 60`, i.e. a worker's own maximal wall clock plus its launch grace (35 min at the 1800 s default). It is the age past which a `$O/bg/stallfix-*.pid` cannot describe a live worker — `.rc` is written on the dispatcher's exit path, NOT on SIGKILL/OOM/reboot, and no reaper in this tree DELETES a `$O/bg/*.pid`, so without an age bound a recycled pid pins the shared worktree forever and a days-long stall gets `file:line` reports resolved against a frozen tree. Registered rather than left as a bare constant because it is ALSO the retention floor `STALL_FIX_BRIEF_MAX_AGE_MIN` is raised to, and the two bounds were INDEPENDENT before this: a retention knob below the pin deleted the live worker's own pidfile, after which the pin found nothing and the tree was re-pointed under a worker still reading it. One derived constant now answers both, so they cannot disagree again.",
   },
   // — heartbeat axis: the laptop-only orchestrator heartbeat's lane-classifier
   //   bounds (scripts/orchestrator-heartbeat.sh, landed from the laptop layer in
@@ -1428,10 +1474,10 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     name: "IDLE_S",
     owners: ["scripts/orchestrator-harness/lane-bound.sh"],
     value: "IDLE_S=\"\"",
-    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 1200)"'],
+    overrides: ['IDLE_S="$2"', 'IDLE_S="$(num_or "${LANE_BOUND_IDLE_S:-}" 2700)"'],
     axis: "kill",
     guardedBy: NONE,
-    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 1200 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
+    note: "lane-bound's idle bound — the `stalled` clause that kills a lane whose output has not grown and whose CPU has not advanced for this long. THREE declaration lines, and the REGISTERED DEFAULT IS THE THIRD: the first is the empty initializer (kept first so `-n` can distinguish \"unset by any seam\" from \"explicitly empty\"), the second is the `--idle` CLI override, and the third resolves the env seam `LANE_BOUND_IDLE_S` against the 2700 s literal — which is why `value` pins the initializer and the two seams are recorded as overrides. `guardedBy: NONE` is deliberate and not a gap: the CLI/env seam is exercised by the lane-bound suite through its ENV spelling (`LANE_BOUND_IDLE_S=2`), which never mentions the bare symbol, so citing that file here would be the exact misattribution the citation test refuses. The literals and the declaration count are pinned by this registry's forward check.",
   },
   {
     name: "MIN_SESSION_AGE_S",
@@ -1467,6 +1513,12 @@ export const STALL_SCAN_EXEMPTIONS: readonly Exemption[] = [
     rationale:
       "a MEASURED age in seconds — how old the cached CI-queue reading is (0 on a fresh read, the record's own `at=` delta on a cache hit) — printed in the verdict token so an operator can judge it. It is never a bound: the freshness DECISION is `CIQ_STALE_MAX`/`CIQ_TTL`, and the age is compared against them, not used as one. The `_AGE` suffix rule matches its initializer/assignment lines. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE is exempted (#2333 review)",
     owner: "#2426",
+  },
+  {
+    symbol: "LANE_ARM_SNAPSHOT_AGE",
+    rationale:
+      "a MEASURED age in seconds — the wall time a lane-arm pass spent obtaining its own sample, exported to the queue renderer and stamped into the queue header as `snapshot_age=<N>s` so a reader can judge the datum's currency. It is never a bound: the freshness DECISION is LANE_ARM_SNAPSHOT_MAX_AGE (registered on its own row above), and this age is what that bound is COMPARED AGAINST. The `_AGE` suffix rule matches the `export LANE_ARM_SNAPSHOT_AGE` line. Registering it as a term would put a measurement in a vocabulary of bounds, exactly as CR_AGE and CIQ_AGE are exempted — the failure this exemption guards against is a stamp that reads zero seconds on every row because it was arithmetic rather than a measurement, which is fixed by measuring it, never by registering it",
+    owner: "#1567",
   },
   {
     symbol: "DEFAULT_TASK_RUNS_MAX_AGE_MS",

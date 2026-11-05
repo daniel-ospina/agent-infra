@@ -1577,13 +1577,14 @@ FAKE
     sed -n '/^drain_stall_label() {/,/^}/p' "$ORCH"
   } > "$TMP/drain_helpers.sh"
   DO="$TMP/drainO"; mkdir -p "$DO/state"
-  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP]
+  _drain() { # _drain <land-age-minutes> [MERGE_STALL_MIN] [PRDISP_SPAWNS] [PRDISP_TOP] [MERGE_PRIORITY_MAX_AGE_MIN]
     ( set -u
       O="$DO"; LOG="$TMP/drain.log"; : > "$LOG"; UPN_WORK=50
       PRDISP_ACTS=3
       PRDISP_TOP=""
       if [ "${3+x}" = x ]; then PRDISP_SPAWNS="$3"; fi
       if [ "${4+x}" = x ]; then PRDISP_TOP="$4"; fi
+      if [ "${5+x}" = x ]; then MERGE_PRIORITY_MAX_AGE_MIN="$5"; else unset MERGE_PRIORITY_MAX_AGE_MIN; fi
       . "$TMP/drain_helpers.sh"
       rm -f "$DO"/state/merged-*.done
       if [ -n "${1:-}" ]; then
@@ -1646,6 +1647,90 @@ PYEOF
   grep -q '^passes=2$' "$DO/state/drain-stall" \
     && { echo "  ok …and a second stalled pass COUNTS itself (pass 2) rather than restarting at 1"; PASS=$((PASS+1)); } \
     || { echo "  ❌ the pass counter did not advance: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1)); }
+  # ⛔ ASK 2 OF #2929, AND THIS LEG FAILS ON THE UNFIXED BLOCK: a state dir with **NO `merged-*.done`
+  # AT ALL** — a fresh cell, a box after state loss, any box that has never landed — beside un-owned
+  # PRs. The gate used to SKIP on an empty answer, so the log stayed empty AND no artifact was written:
+  # the dead-man's switch could not report the one state it most exists for. `_drain ''` creates no
+  # marker at all, so removing the applied fix in the shipped block reddens HERE, by name.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain '' 180 0)"
+  # ⛔ THE LITERAL MADE THIS ARM UNREACHABLE (review P2, 2026-11-01). The shipped line is `no land
+  # marker inside the ${_wbound}m window at all`, so the fragment `no land marker inside the window`
+  # could never match it: the arm was DEAD, and had the STALLED shape ever been the one taken this leg
+  # would have fallen to the `*)` arm below and reported "an unexpected verdict" on a correct tree —
+  # a red on a green box, in the very leg added for #2929 ask 2. The window's own bound sits between
+  # "the" and "window", so the pattern spans it. (The DEADLOCK arm is what `_drain '' 180 0` actually
+  # produces, since spawns=0; this arm exists for the same empty answer WITH workers running.)
+  case "$_out" in
+    *"DRAIN DEADLOCK"*"STARTED NO WORKER"*) echo "  ok a box that has NEVER landed (no merged-*.done at all) escalates — the empty answer IS the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    *"DRAIN STALLED"*"no land marker inside the "*"m window at all"*) echo "  ok a markerless box names the empty answer as the stall (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    "") echo "  ❌ a state dir with NO land marker produced NO line at all — the escalation is disabled by the exact condition it exists for (#2929): '$_out'"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a markerless box produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if [ -s "$DO/state/drain-stall" ] && grep -q '^passes=1$' "$DO/state/drain-stall"; then
+    echo "  ok …and it WRITES the escalation record (state/drain-stall), so the next pass still knows"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a markerless box left no escalation artifact (#2929 ask 2): $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ THE SAME EMPTY ANSWER **WITH WORKERS RUNNING** takes the OTHER stall arm, and until this leg
+  # existed nothing in the suite could reach it: `_drain '' <min> 0` always lands on DEADLOCK, so the
+  # STALLED-with-a-synthesised-age arm was only ever covered by a hand-run. Driven here so the
+  # synthesised age, its "at least" label and the window it is derived from are all pinned.
+  rm -f "$DO/state/drain-stall"
+  _out="$(_drain '' 180 2)"
+  case "$_out" in
+    *"DRAIN STALLED"*"no land marker inside the "*"m window at all"*) echo "  ok a markerless box WITH workers running escalates as STALLED and says the age is only a floor (#2929 ask 2)"; PASS=$((PASS+1)) ;;
+    *"drain alive"*) echo "  ❌ a markerless box reported 'drain alive' when workers ran — an empty answer is not an all-clear: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ a markerless box with 2 spawns produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  if grep -q '^agesrc=synth$' "$DO/state/drain-stall" 2>/dev/null; then
+    echo "  ok …and the record carries agesrc=synth, so the status token can print the bound as '>='"; PASS=$((PASS+1))
+  else
+    echo "  ❌ a synthesised age was not recorded as such: $(cat "$DO/state/drain-stall" 2>/dev/null)"; FAIL=$((FAIL+1))
+  fi
+  # ⛔ AN UNSEARCHABLE STATE DIR IS NOT A MEASURED ABSENCE (review P2, #3181). `find` on a missing or
+  # unreadable `state/` returns the SAME empty answer as "nothing landed", so the line would report a
+  # fact about this box's markers that it never read. Driven by removing the dir, so `find` cannot run.
+  # The ESCALATION must still be taken (#2929's ruling: an absence is unmeasurable in both directions
+  # after a state loss, so silence is the wrong side) — only the CLAIM narrows.
+  rm -f "$DO/state/drain-stall"
+  rmdir "$DO/state" 2>/dev/null || true
+  _out="$(_drain '' 180 2)"
+  mkdir -p "$DO/state"
+  case "$_out" in
+    *"no land marker inside"*) echo "  ❌ an UNSEARCHABLE state dir was reported as a MEASURED absence: $_out"; FAIL=$((FAIL+1)) ;;
+    *"could not be searched"*) echo "  ok an UNSEARCHABLE state dir says the absence was not measured, instead of asserting one"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unsearchable state dir produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  case "$_out" in
+    *"DRAIN STALLED"*) echo "  ok …and the escalation is STILL taken (an unmeasurable absence must not silence it, #2929)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an unsearchable state dir SILENCED the escalation: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ⛔ THE SYNTHESISED AGE MUST NOT DISAGREE WITH THE WINDOW THAT WAS SEARCHED (fresh-context review,
+  # 2026-11-02). `mp_recent_land` refuses a `0` bound (`find -mmin -0` matches nothing, so it falls
+  # back to 180x2 = 360m) and this block's copy of the knob had no such clamp: an empty answer then
+  # printed `no PR merged in 0m … the 0m window`, i.e. a claim about a window the FUNCTION searched
+  # at 360m — the age the empty answer supports is 360m. Driven with the knob at 0.
+  _out="$(_drain '' 180 2 0 0)"
+  case "$_out" in
+    *"no PR merged in 360m"*) echo "  ok MERGE_PRIORITY_MAX_AGE_MIN=0 is clamped to 180 like the reader's own bound (the age names 360m, not 0m)"; PASS=$((PASS+1)) ;;
+    *"no PR merged in 0m"*|*"the 0m window"*) echo "  ❌ MERGE_PRIORITY_MAX_AGE_MIN=0 printed an age of 0m for a window searched at 360m: $_out"; FAIL=$((FAIL+1)) ;;
+    *) echo "  ❌ MERGE_PRIORITY_MAX_AGE_MIN=0 produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  # ...and a magnitude that OVERFLOWS `_wmin * 2` makes `_wbound` NEGATIVE, so the synthesised age is
+  # printed as `no PR merged in -2m` and recorded as `age=-2` — an age the empty answer cannot support
+  # (and a nonsense a reader cannot tell from a clock fault).
+  _out="$(_drain '' 180 2 0 9223372036854775807)"
+  case "$_out" in
+    *"in -2m"*|*"in -1m"*|*"in -0m"*) echo "  ❌ an OVERFLOWED window bound printed a NEGATIVE age: $_out"; FAIL=$((FAIL+1)) ;;
+    *"no PR merged in 360m"*) echo "  ok an OVERFLOWED window bound falls back to the default instead of printing a negative age"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ an overflowed window bound produced an unexpected verdict: $_out"; FAIL=$((FAIL+1)) ;;
+  esac
+  _out="$(_drain 5 180 0 0 0)"
+  case "$_out" in
+    *"drain alive"*) echo "  ok …and a FRESH land is still 'drain alive' with the knob at 0 (polarity unchanged)"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ a fresh land with MERGE_PRIORITY_MAX_AGE_MIN=0 did not read 'drain alive': $_out"; FAIL=$((FAIL+1)) ;;
+  esac
   _out="$(_drain 200 180 4)"
   case "$_out" in
     *"DRAIN STALLED"*"spawned 4 worker(s)"*) echo "  ok a stall that DID spawn workers names them (a LAND problem, not an idle one)"; PASS=$((PASS+1)) ;;
@@ -1710,6 +1795,41 @@ PYEOF
     case "$_g" in
       *"drain=DEADLOCK(passes=3"*"no_land=240m"*"spawns=0"*) echo "  ok the cycle status line carries the escalation (passes, land age, spawns)"; PASS=$((PASS+1)) ;;
       *) echo "  ❌ the status token lost its evidence: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ A SYNTHESISED AGE MUST NOT RENDER AS A MEASUREMENT (review P2, #3181). `agesrc=synth` is the
+    # ONLY thing that makes the token print `>=`, and until this leg nothing drove that rendering: an
+    # inverted or misspelled guard in `drain_stall_token` left the whole suite green while the status
+    # line — the one line every reader parses — presented a window's lower BOUND as "when this box last
+    # landed". That is the exact claim `agesrc` exists to prevent. A record with NO `agesrc` field (the
+    # leg above, and every marker written before this change) must keep rendering measured.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=synth\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=>=360m"*) echo "  ok a SYNTHESISED age prints as a bound (no_land=>=360m)"; PASS=$((PASS+1)) ;;
+      *"no_land=360m"*) echo "  ❌ a synthesised age was printed as a MEASUREMENT: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ❌ the token lost the synthesised age: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # …and a MEASURED age keeps the exact `no_land=<age>m` shape every existing reader parses.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=measured\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=>="*) echo "  ❌ a MEASURED age was printed as a bound: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"no_land=360m"*) echo "  ok a MEASURED age keeps the exact no_land=<age>m shape (no '>=')"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ the token lost the measured age: '$_g'"; FAIL=$((FAIL+1)) ;;
+    esac
+    # ⛔ AN UNMEASURED AGE IS NOT A SMALLER BOUND (fresh-context review of #3181, 2026-11-02, P2).
+    # `agesrc=unmeasured` is written when `state/` could not be SEARCHED — no marker search happened, so
+    # the number in `age=` is the window that could not be searched, not a reading and not a floor. The
+    # token must print `?`. Without this leg the provenance fell through the `synth|measured` pair into
+    # the default arm and rendered the unsearched window as a measured age — a claim about this box that
+    # nothing took, on the one line every reader parses.
+    printf 'at=%s\npasses=3\nage=360\nagesrc=unmeasured\nunowned=9\nspawns=0\nacts=2\n' "$(date +%s)" > "$DO/state/drain-stall"
+    _g="$(_tk)"
+    case "$_g" in
+      *"no_land=?"*) echo "  ok an UNMEASURED age prints as '?', not as a number and not as a bound"; PASS=$((PASS+1)) ;;
+      *"no_land=>"*) echo "  ❌ an UNMEASURED age was printed as a BOUND (nothing was searched): '$_g'"; FAIL=$((FAIL+1)) ;;
+      *"no_land=360m"*) echo "  ❌ an UNMEASURED age was printed as a MEASUREMENT: '$_g'"; FAIL=$((FAIL+1)) ;;
+      *) echo "  ❌ the token lost the unmeasured reading: '$_g'"; FAIL=$((FAIL+1)) ;;
     esac
     # ⛔ THE LABEL IS THE MARKER'S OWN MEASUREMENT, NOT ITS EXISTENCE (review c-1, P1). BOTH stall arms
     # write this file: the DEADLOCK arm records `spawns=0`, and the STALLED arm records the workers it
@@ -3507,15 +3627,15 @@ else
       SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
       for _a in "$@"; do export "$_a"; done
       eval "$GV"
-      printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" )
+      printf '%s\t%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-<EMPTY>}" "${LF_VERDICT:-<unset>}" )
   }
   _t="$(gv)"; _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
   [ "$_why" = "<open>" ] && echo "  ok (v1) a box with no gate reports NO winner" && PASS=$((PASS+1)) \
     || { echo "  ❌ (v1) a clean box reported a winner: $_why"; FAIL=$((FAIL+1)); }
-  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Ten tokens is the arm count
+  # ⛔ EVERY ARM IS ON THE LINE, in evaluation order, on the IDLE case. Eleven tokens is the arm count
   # this block has; an arm DELETED from the vector while its predicate stays reddens here.
   _missing=""
-  for _arm in 'merge-priority' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
+  for _arm in 'merge-priority' 'landing-floor=' 'fork=' 'fork_bound=' 'lanes=' 'load=' 'placement=' 'ci-queue=' 'slots=' 'swap=' 'mem='; do
     case "$_vec" in *"$_arm"*) ;; *) _missing="$_missing $_arm" ;; esac
   done
   [ -z "$_missing" ] && echo "  ok (v2) every gate arm has its own verdict on the idle line" && PASS=$((PASS+1)) \
@@ -3570,6 +3690,131 @@ ARMS
   if grep -qE '^[[:space:]]*elif ' <<<"$GV"; then
     echo "  ❌ (v9) an \`elif\` is back inside the vector block — the first arm masks the rest again"; FAIL=$((FAIL+1))
   else echo "  ok (v9) the arms are independent guards, not a masking chain"; PASS=$((PASS+1)); fi
+  # ── THE LANDING FLOOR: A WIP LIMIT ON TOTAL OPEN PRs (2026-11-03) ────────────────────────────
+  # ⛔ WHAT THIS GRADES AND WHY IT NEEDS ITS OWN TESTS: `merge-priority` counts UN-OWNED PRs, and a
+  # lane CLAIMS the PR it opens — so producing more work drives the gate's own input toward zero.
+  # Measured 2026-11-03: 68 open on agent-infra and 37 on tortoise read `merge-priority=clear` while
+  # the 2h ratio was 14 opened : 3 merged. The floor reads TOTAL open, which no other arm does.
+  _why="$(gv OPEN_N=68 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(68*) echo "  ok (v10) the landing floor CLOSES the issue path on total WIP (68 >= 25)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v10) 68 open PRs did not arm the landing floor (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  _why="$(gv OPEN_N=4 LANDING_FLOOR=25 | cut -f1)"
+  [ "$_why" = "<open>" ] && echo "  ok (v11) below the floor the issue path stays OPEN (4 < 25)" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v11) a drained queue was still gated: $_why"; FAIL=$((FAIL+1)); }
+  # ⛔ THE BOUNDARY IS INCLUSIVE, and it is the off-by-one that decides a whole fleet's mode.
+  _why="$(gv OPEN_N=25 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(25*) echo "  ok (v12) the boundary is inclusive (25 >= 25 arms the floor)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v12) the floor boundary is off by one (25 vs 25 gave: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ POLARITY, BOTH ARMS FAIL CLOSED: an unreadable count must DRAIN, never open the gate. The
+  # leading-zero case is the specific trap this file has been bitten by (`[ 08 -ge 25 ]` reads 8).
+  _why="$(gv OPEN_N='' LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(open*) echo "  ok (v13) an UNREADABLE open count drains (fails closed)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v13) an unreadable count OPENED the issue path: $_why"; FAIL=$((FAIL+1)) ;; esac
+  _why="$(gv OPEN_N=08 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(open*) echo "  ok (v14) a leading-zero count is UNREADABLE, not 8 (the base-0 trap)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v14) a leading-zero count was read as a valid number: $_why"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ AN OUT-OF-RANGE COUNT IS THE ARM'S ONE REMAINING FAIL-OPEN INPUT: `[` ERRORS at or above 2^63
+  # and an ERRORED test is FALSE, which OPENS the gate. `is_limit` bounds it in the loop, but it is
+  # NOT in scope inside this extracted block — so the bound must live in the block, and it is graded
+  # here rather than trusted.
+  _why="$(gv OPEN_N=99999999999999999999 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    landing-floor\(open*) echo "  ok (v16) an out-of-range count drains instead of erroring the test open" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v16) a 2^63+ count OPENED the gate (errored test read as FALSE): $_why"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE EMERGENCY DOOR MUST COVER **EVERY** BRANCH (review round 3, P2). It used to live in the
+  # deepest `else`, so the fail-closed branches never consulted it — the arm's stated contract was
+  # false on 3 of 5 branches. These two cases drive the door from the UNREADABLE and out-of-range
+  # branches specifically, which is where a broken listing actually lands.
+  _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=''; FORK_STARVED=0; FORK_WHY=""
+         CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
+         L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
+         SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+         LANDING_FLOOR=25; O=/nonexistent; BATCH=1
+         floor_emergency() { printf 'red-tree(#1234)'; }
+         eval "$GV" >/dev/null 2>&1
+         printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-}" ) )"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  [ "$_why" = "<open>" ] && echo "  ok (v19) the emergency door covers the UNREADABLE branch too" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v19) an emergency did not stand the floor down on an UNREADABLE count: $_why"; FAIL=$((FAIL+1)); }
+  _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=99999999999999999999; FORK_STARVED=0
+         FORK_WHY=""; CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0
+         LANES=0; MAX_LANES=20; L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none
+         CIQ=0; CIQ_RC=1; CIQ_VER=""; SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0
+         MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512; LANDING_FLOOR=25; O=/nonexistent; BATCH=1
+         floor_emergency() { printf 'red-tree(#1234)'; }
+         eval "$GV" >/dev/null 2>&1
+         printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-}" ) )"
+  _why="$(printf '%s' "$_t" | cut -f1)"
+  [ "$_why" = "<open>" ] && echo "  ok (v20) …and the out-of-range branch too" && PASS=$((PASS+1)) \
+    || { echo "  ❌ (v20) an emergency did not stand the floor down on an out-of-range count: $_why"; FAIL=$((FAIL+1)); }
+  # ⛔ THE RED-TREE / P0 DOOR IS A CALL, NOT A COMMENT: with `floor_emergency` in scope and returning a
+  # reason, the floor must STAND DOWN. Driven by supplying the function the block calls.
+  _why="$( gv OPEN_N=68 LANDING_FLOOR=25 )"  # baseline: no floor_emergency in scope => the floor arms
+  case "$_why" in
+    landing-floor*) : ;;  # baseline only — the assertion is the stand-down below
+    *) echo "  ❌ (v17) baseline: the floor did not arm without an emergency (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  _t="$( GVX=1; ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=68; FORK_STARVED=0; FORK_WHY=""
+         CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
+         L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
+         SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+         LANDING_FLOOR=25; O=/nonexistent; BATCH=1
+         floor_emergency() { printf 'red-tree(#1234)'; }
+         eval "$GV" >/dev/null 2>&1
+         printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${GATE_VEC:-}" ) )"
+  _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
+  if [ "$_why" = "<open>" ]; then
+    echo "  ok (v17) a red-tree emergency STANDS THE FLOOR DOWN (the door is real, not a claim)" && PASS=$((PASS+1))
+  else
+    echo "  ❌ (v17) a red-tree emergency did not stop the floor: winner=$_why"; FAIL=$((FAIL+1))
+  fi
+  case "$_vec" in
+    *'landing-floor=exempt('*) echo "  ok (v18) …and the exemption is NAMED in the vector, not silent" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v18) the floor stood down without naming why: $_vec"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ FIRST-WINS IS PRESERVED: the floor is ADDITIVE. When merge-priority already holds the gate, the
+  # floor must not steal the label — the operator must keep seeing the ORIGINAL reason.
+  _why="$(gv GATE_WHY='merge-priority(3 un-owned of 68 open PR(s) — PRs before issues)' OPEN_N=68 LANDING_FLOOR=25 | cut -f1)"
+  case "$_why" in
+    merge-priority*) echo "  ok (v15) the floor never displaces an earlier winner (merge-priority keeps the label)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v15) the floor changed the WINNER instead of adding an arm (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ THE VISIBILITY LINE IS THE ARTIFACT. A silent threshold is the same defect class as a silent
+  # reaper, so the cycle's numbers are pinned at the SOURCE, not merely described in a comment.
+  wpin "the cycle logs OPEN_PRS/FLOOR/FLOOR_VERDICT/MODE every cycle" "$ORCH" 'OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} FLOOR_VERDICT=${LF_VERDICT:-?} → MODE('
+  # ⛔ THE EXEMPTION MUST BE NAMED ON THE DISPATCH PATH (review round 4, P2). `GATE_VEC` prints only on
+  # the idle path, so an exempted cycle that then DISPATCHED showed `MODE(produce) BINDING(none)` with
+  # the reason nowhere — the silent-threshold defect, one field over. v21 drives the exemption and
+  # asserts it is named in the vector, which is what feeds `FLOOR_VERDICT`.
+  _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=68; FORK_STARVED=0; FORK_WHY=""
+         CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
+         L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
+         SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
+         LANDING_FLOOR=25; O=/nonexistent; BATCH=1
+         floor_emergency() { printf 'red-tree(#1234)'; }
+         eval "$GV" >/dev/null 2>&1
+         printf '%s\t%s\n' "${GATE_WHY:-<open>}" "${LF_VERDICT:-<unset>}" ) )"
+  _v="$(printf '%s' "$_t" | cut -f2)"
+  case "$_v" in
+    exempt*) echo "  ok (v21) an exempted cycle NAMES the exemption (so the log can print it)" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v21) the exemption is unnamed, so an exempted dispatch reads BINDING(none): [$_v]"; FAIL=$((FAIL+1)) ;; esac
+  # ⛔ ALL FIVE VERDICT PATHS MUST CARRY `LF_VERDICT`, NOT JUST THE EXEMPT ONE (review round 5, P2).
+  # The line prints `FLOOR_VERDICT=${LF_VERDICT:-?}`, so a path that forgets to set it prints `?` on
+  # EVERY ordinary cycle — and v21 alone did not notice (measured: dropping LF_VERDICT from REFUSE,
+  # ok and both fail-closed branches left the whole suite green). One assertion per path, driven
+  # through the same extracted block.
+  for _c in '68|REFUSE(' '4|ok(' "''|UNKNOWN" '99999999999999999999|UNKNOWN(out-of-range)'; do
+    _lf="${_c%%|*}"; _want="${_c#*|}"
+    case "$_want" in REFUSE\(|ok\() _want="$_want" ;;
+      UNKNOWN\(out-of-range) _want='UNKNOWN(out-of-range)' ;;
+      UNKNOWN) _want='UNKNOWN' ;;
+    esac
+    _got="$(gv OPEN_N="$_lf" LANDING_FLOOR=25 | cut -f3)"
+    case "$_got" in
+      "$_want"*) echo "  ok (v22) OPEN_N='${_lf}' sets LF_VERDICT=$_want (the printed field is never '?')" && PASS=$((PASS+1)) ;;
+      *) echo "  ❌ (v22) OPEN_N='${_lf}' left LF_VERDICT=[$_got], expected [${_want}...] — the cycle line would print FLOOR_VERDICT=?"; FAIL=$((FAIL+1)) ;; esac
+  done
   # ── the two mutants ────────────────────────────────────────────────────────────────────────────
   mut_gv() { # <name> <old> <new> -> path to the mutant block
     printf '%s\n' "$GV" > "$TMP/gv-$1.in"

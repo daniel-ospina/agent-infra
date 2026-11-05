@@ -283,6 +283,11 @@ fi
 # on a laptop/CI (no controller executes from a cell root) and refuses with EX_CONFIG (78) — a
 # REFUSAL, not a test failure — unless HARNESS_SUITE_ALLOW_LIVE_CELL=1 is set. `--list`/`--list-sweeps`
 # above exit before this point on purpose: they execute nothing, so they stay readable everywhere.
+# ⛔ AND CI IS ITSELF AN ALLOWED PLACE TO RUN THEM (agent-infra#3411): a runner that happens to live
+# under a cell-shaped root (`HOME=/home/cmux` on the self-hosted runner) matched the guard and was
+# refused, so no shell-touching PR could clear its red. `CI` truthy now WARNS and allows (the helper
+# owns that decision, so the two lanes cannot disagree about it); an operator session has `CI` unset
+# and is still refused with 78.
 # shellcheck source=orchestrator-harness/fixture-hermetic.sh
 . "$SHARD_ROOT/scripts/orchestrator-harness/fixture-hermetic.sh"
 # ⛔ FAIL CLOSED ON THE SOURCE ITSELF. A `command not found` here would exit 127 once and then let

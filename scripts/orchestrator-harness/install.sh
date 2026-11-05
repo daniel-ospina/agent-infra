@@ -84,6 +84,9 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # is the loop's decision, not the renderer's. The pin reaches the controller through $ENV_FILE, and
 # cloud-cell-supervisor.sh:1198 records why it has to: the tmux SERVER supplies a new session's
 # environment, so an exported ceiling is silently dropped and would revert to its default.
+# The incoming value, before the default is filled in: a PIN and a DERIVATION are different facts
+# and the report below names which one this run has (#3146).
+_MAX_LANES_PIN="${MAX_LANES:-}"
 MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 # ⛔ BOUND THE DERIVATION, NOT A PINNED VALUE — and only the derivation CAN be out of range here:
 # `_NCPU` is `is_limit`-bounded to nine digits, and `* 5 / 2` carries that to TEN (999999999 ->
@@ -174,6 +177,80 @@ START_TIMEOUT="${START_TIMEOUT:-30}"
 die() { echo "❌ $*" >&2; exit 1; }
 ok()  { echo "  ✓ $*"; }
 warn(){ echo "  ⚠️  $*"; }
+
+# ── THE MAC DELIVERY PATH REPORTS AND CHECKS THE SAME DERIVATION THE CELL PATH DOES (#3146) ──────
+# Two delivery paths decide a box's lane ceiling — this renderer writes it into the plist, and a
+# cell's is a hand-pushed `keys.env` constant — and only this one derived it, so the cell could
+# drift with nothing going red (measured: cell-3, 4 cores, derived 10, keys.env carried 20 against a
+# memory ceiling of 3; it ran 10 lanes and was killed with ENOSPC). ⛔ THE RULING IS UNCHANGED:
+# MAX_LANES stays floor(ncpu × 5/2), derived above exactly as before. What is added is that the
+# derivation is REPORTED and a pin that disagrees with it is LOUD, on both paths.
+# `scripts/lib/lane-ceiling.sh` is the ONE implementation of the parts around the number: the probe's
+# mechanism, the memory ceiling, the one-line report, and the drift comparison.
+# ⛔ TWO LAYOUTS, BOTH RESOLVED (review P1). This file runs from a CHECKOUT — `<repo>/scripts/
+# orchestrator-harness/install.sh`, library at `../lib` — and from the deployed mac tree, where
+# `deploy-mac-orchestrator.sh` stages `scripts/orchestrator-harness` FLAT into `$O` and the operator
+# runs the documented `bash ~/orchestrator/install.sh --restart`. Probing ONLY `../lib` made the
+# report and the drift check DEAD on that second path: `$O/../lib` is `$HOME/lib`, which no deploy
+# writes, so the box's documented restart took the "unavailable" branch on every run and the drift
+# check never ran exactly where a pin actually drifts. So both are probed — `../lib` (checkout) and
+# `./lib` (the flat deploy, which stages `$O/lib/lane-ceiling.sh`) — and `./lib` is the only path a
+# deploy can put it at, because `$O` IS the harness dir (`$O/../lib` is `$HOME/lib`, still nothing).
+# ⛔ THE `cd` GUARD IS LOAD-BEARING (review P0) — and it is NOT `|| true`: an earlier draft said
+# `|| true`, and a comment that names code which is not here is how the next editor deletes the real
+# guard, so this one quotes the shipped expression. This file runs under `set -euo pipefail` (line 22),
+# and the probe below `cd`s into a candidate directory that OFTEN DOES NOT EXIST (`$HOME/lib` on the
+# deployed tree): an unguarded `X="$(cd … && pwd)"` returns 1 there, which `set -e` turns into a
+# silent `exit 1` BEFORE the plist is rendered. The library is an OBSERVABILITY aid; it must never be
+# able to stop an install. selftest.sh proves BOTH halves: the shipped block completes with no library
+# at all, and a scratch copy with the guard deleted ABORTS under the same `set -euo pipefail`.
+_LANECAP_HERE="$(dirname "${BASH_SOURCE[0]}")"
+_LANECAP_LIB=""; _LANECAP_PROBED=""
+for _lc_rel in ../lib lib; do
+  # `../lib` = a CHECKOUT; `lib` = the FLAT deploy (`$O` IS the harness dir, so `$O/lib` is the only
+  # path a deploy can place the library at).
+  _lc_dir="$(cd "$_LANECAP_HERE/$_lc_rel" 2>/dev/null && pwd)" || _lc_dir=""
+  [ -n "$_lc_dir" ] || { _LANECAP_PROBED="$_LANECAP_PROBED${_LANECAP_PROBED:+, }$_LANECAP_HERE/$_lc_rel (absent)"; continue; }
+  _LANECAP_PROBED="$_LANECAP_PROBED${_LANECAP_PROBED:+, }$_lc_dir/lane-ceiling.sh"
+  if [ -z "$_LANECAP_LIB" ] && [ -f "$_lc_dir/lane-ceiling.sh" ]; then _LANECAP_LIB="$_lc_dir/lane-ceiling.sh"; fi
+done
+if [ -f "$_LANECAP_LIB" ]; then
+  # shellcheck source=../lib/lane-ceiling.sh
+  . "$_LANECAP_LIB"
+  # ⛔ THE REPORT DESCRIBES THE NUMBER THIS SCRIPT RENDERED, so it is computed from `_NCPU` — the
+  # probe that produced MAX_LANES above — and NOT from a second probe (review P2). The library's
+  # probe accepts a value only when it is non-empty AND `lc_is_limit`-valid, while this file's `||`
+  # chain can be satisfied by an EMPTY-but-SUCCESSFUL `sysctl` and then fall to 4: two probes of
+  # different shape would let the report print `cpus=8 MAX_LANES=10` — a pair that cannot both be
+  # true — and grade the operator's pin against cores the renderer never used.
+  _LC_MEM="$(lc_mem_ceiling "$(lc_mem_avail_mb 2>/dev/null)" 2>/dev/null)" || _LC_MEM="?"
+  ok "capacity: cpus=$_NCPU MAX_LANES=$MAX_LANES mem_ceiling=${_LC_MEM:-?}$([ -n "$_MAX_LANES_PIN" ] && printf ' pinned=%s' "$_MAX_LANES_PIN")"
+  ok "          MAX_LANES is DERIVED (floor(ncpu x 5/2)); mem_ceiling is the drainer's second ceiling — REPORTED here, applied only by ai-drainer.sh"
+  if [ -n "$_MAX_LANES_PIN" ]; then
+    # ⛔ rc 2 IS NOT rc 1 (review P3): `lc_drift` returns 2 when the pin is not a usable magnitude, and
+    # folding that into DRIFT prints "MAX_LANES='abc' is pinned, but the derivation for 8 cores is 20"
+    # — a comparison that was never made, because there is no value to compare. Both are defects and
+    # both are reported; the message says WHICH (the supervisor's report draws the same distinction).
+    if lc_drift "$_MAX_LANES_PIN" "$_NCPU" >/dev/null 2>&1; then :
+    else
+      _lc_rc=$?
+      _lc_derived="$(lc_derive_max_lanes "$_NCPU")" || _lc_derived="?"
+      if [ "$_lc_rc" -eq 2 ]; then
+        warn "UNUSABLE PIN: MAX_LANES='$_MAX_LANES_PIN' is pinned, but it is not a whole-number magnitude (at most nine digits), so it cannot be the lane ceiling it names and NO comparison with the derivation was made. The derivation for $_NCPU cores is $_lc_derived. The pin stays in force — it is yours, and a renderer that rewrote it would turn a visible disagreement into a silent one — but MAX_LANES is DERIVED, not configured (docs/ops/fleet-harness-baseline.md:137): fix or remove the pin unless this box is deliberately carved out."
+      else
+        warn "DRIFT: MAX_LANES='$_MAX_LANES_PIN' is pinned, but the derivation for $_NCPU cores is $_lc_derived. The pin stays in force — it is yours, and a renderer that rewrote it would turn a visible disagreement into a silent one — but MAX_LANES is DERIVED, not configured (docs/ops/fleet-harness-baseline.md:137): remove the pin unless this box is deliberately carved out."
+      fi
+    fi
+  fi
+else
+  # ⛔ A MISSING LIBRARY IS SAID OUT LOUD, never silently skipped — and it NAMES the paths it probed
+  # (review P3: clearing `_LANECAP_LIB` to "" on failure printed "—  is missing", so the observability
+  # half of this feature named nothing), and it does NOT claim a pinned number was derived (review P2:
+  # `MAX_LANES=30 is still the derived value` on an 8-core box whose derivation is 20 — false whenever
+  # the pin supplied the number).
+  _lc_what="$([ -n "$_MAX_LANES_PIN" ] && printf 'the OPERATOR PIN (not re-derived)' || printf 'still the derived value')"
+  warn "lane-ceiling report unavailable — none of these exists: ${_LANECAP_PROBED:-<harness dir unresolved>} (the harness dir was materialised without scripts/lib). MAX_LANES=$MAX_LANES is $_lc_what; the one-line report and the drift check did not run."
+fi
 
 # ── the LABEL guard: a non-default label is a sandbox seam, never a real install ─────────────
 # ⛔ A FUNCTION, NOT AN INLINE `if`, FOR ONE REASON: the decision has to be DRIVEN by selftest in both
@@ -1068,6 +1145,18 @@ esac
 # whose message ("this box RUNS …") describes a fact it never tested. So the evidence is the rendered
 # plist launchd will actually load: its ProgramArguments program, read with the same parser the
 # post-render assertion uses. No installed plist => nothing is running that could be lost => no refusal.
+#
+# ⛔ THE STABLE RESOLVER IS DEFINED HERE, BEFORE THIS GATE, BECAUSE THE GATE MUST EXEMPT IT BY NAME
+# (agent-infra#3309 review, P1). It is seeded into `$O` by THIS installer and is deliberately absent
+# from every pin that predates this commit — so the bare test below ("the installed program is a
+# basename the pinned tree does not carry") is TRUE for it on the second run, and the installer
+# refused its own fresh install with a diagnosis that is factually false for this file ("a LIVE-ONLY
+# TCC wrapper … the content must LAND first (PR #2020)"): measured, rc=78 on a re-run, leaving the box
+# un-rerunnable until the next pin advance. The exemption is the SEEDED NAME (`STABLE_PROG`'s
+# basename), never an assumption that the file lives in `$HARNESS` — the whole point of #3309 is that
+# the stable program does NOT live in the moving pin.
+STABLE_PROG="$O/orch-pin-exec.sh"
+STABLE_PROG_NAME="${STABLE_PROG##*/}"
 LIVE_ENTRY=""; _live_prog=""
 if [ -f "$PLIST" ]; then
   _live_prog="$(plist_program "$PLIST")"
@@ -1084,7 +1173,12 @@ if [ -f "$PLIST" ]; then
   fi
   # In scope only when the installed program is a script the PIN does not carry AND that file is on
   # disk. A plist naming a deleted path is a different failure (start's, not this installer's).
-  if [ -n "${_live_base:-}" ] && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
+  # ⛔ AND NEVER THE STABLE RESOLVER (agent-infra#3309 review, P1): it is the program THIS installer
+  # renders, it is seeded by this installer, and it is by design absent from a pin that predates the
+  # commit introducing it — so without this exemption the SECOND run of a successful install is
+  # refused with the TCC-wrapper diagnosis below, which describes nothing on this box.
+  if [ -n "${_live_base:-}" ] && [ "${_live_base}" != "$STABLE_PROG_NAME" ] \
+     && [ ! -f "$HARNESS/$_live_base" ] && [ -f "${_live_prog:-/nonexistent}" ]; then
     LIVE_ENTRY="$_live_base"
   fi
 fi
@@ -1092,6 +1186,36 @@ if [ -n "$LIVE_ENTRY" ]; then
   pin_refuse "the INSTALLED launchd job runs a LIVE-ONLY entrypoint that the pinned tree does not carry: its program is ${_live_prog:-?} (${LIVE_ENTRY}), and $HARNESS/$LIVE_ENTRY does not exist. That file exists in NO commit - it keeps the controller inside the tmux pane that holds the macOS Full Disk Access grant (docs/ops/fleet-harness-baseline.md section 3.1) - so rendering the pin's $HARNESS_ENTRY now would silently drop it and every candidate would be refused with 'could not build claim commit'. The content must LAND first (PR #2020 lifts it). Nothing was installed; the previous plist is untouched."
 fi
 ok "program: $HARNESS/$HARNESS_ENTRY (pinned; selected from the pin, not from \$O)"
+
+# ── THE STABLE LAUNCHD PROGRAM (agent-infra#3309) ────────────────────────────────────────────────
+# ⛔ THE PLIST NO LONGER NAMES THE PIN. `$HARNESS` is `<pin root>/<sha12>`, a HASH-NAMED snapshot that
+# harness-refresh.sh garbage-collects as the pin advances, and launchd reads ProgramArguments ONCE at
+# bootstrap. So a plist naming `$HARNESS/$HARNESS_ENTRY` is correct at install time and DEAD after the
+# next pin move: every tick `No such file or directory`, exit 127, `launchctl list` still `loaded`.
+# Measured on this box 2026-11-02: the loop did not run for ~15 hours, `launchd.err` repeated one
+# stale-looking line, and a 15-hour-old candidates.txt (194 entries) was read as a full queue.
+#
+# The program is therefore a STABLE path in the deployed dir, whose bytes are a fixed RESOLVER: it
+# reads the pin dir record on every tick and execs whatever it names. That is the only shape that
+# survives a pin advance, because launchd cannot re-read the plist when the pin moves.
+# ⛔ NOT the #2231 defect coming back: the stub is seeded from the PINNED TREE on every run (never
+# hand-written into $O), it holds no controller logic to diverge, and the assertion below refuses the
+# install unless the stub, run now, resolves to the pin's own entrypoint.
+# (`STABLE_PROG` itself is defined above the live-only gate, which must exempt it by name.)
+# Prefer the pinned tree (after this lands the pin carries it); fall back to the installer's checkout so
+# a box installing ON the commit that introduces it is not blocked by a pin that predates it.
+_PIN_EXEC_SRC="$HARNESS/orch-pin-exec.sh"
+[ -f "$_PIN_EXEC_SRC" ] || _PIN_EXEC_SRC="$HERE/orch-pin-exec.sh"
+[ -f "$_PIN_EXEC_SRC" ] || die "orch-pin-exec.sh not found in the pinned tree ($HARNESS) or this checkout ($HERE) — the stable launchd program cannot be seeded, and rendering the pin path instead is exactly the #3309 defect"
+# ⛔ STAGE-THEN-RENAME (same rule as the other $O seeds): a plain `cp` truncates the target first, so a
+# concurrent KeepAlive tick could exec a half-written stub and die with a syntax error.
+mkdir -p "$O" || die "cannot create \$O ($O)"
+_PIN_EXEC_TMP="$O/.orch-pin-exec.$$"
+cp "$_PIN_EXEC_SRC" "$_PIN_EXEC_TMP" || { rm -f "$_PIN_EXEC_TMP"; die "cannot stage $STABLE_PROG from $_PIN_EXEC_SRC"; }
+chmod +x "$_PIN_EXEC_TMP" || { rm -f "$_PIN_EXEC_TMP"; die "cannot make $STABLE_PROG executable"; }
+bash -n "$_PIN_EXEC_TMP" || { rm -f "$_PIN_EXEC_TMP"; die "the seeded stable entrypoint does not parse — refusing to install a program that would crash-loop under KeepAlive"; }
+mv -f "$_PIN_EXEC_TMP" "$STABLE_PROG" || { rm -f "$_PIN_EXEC_TMP"; die "cannot install $STABLE_PROG"; }
+ok "stable launchd program: $STABLE_PROG (resolves the pin on every tick — #3309)"
 
 # ── render plist ─────────────────────────────────────────────────────────────────
 echo "==> rendering $PLIST"
@@ -1244,6 +1368,7 @@ RENDER="$PLIST.new.$$"
 trap 'rm -f "$RENDER"' EXIT
 sed \
   -e "s|__HARNESS__|$(esc "$HARNESS")|g" \
+  -e "s|__PROGRAM__|$(esc "$STABLE_PROG")|g" \
   -e "s|__ENTRY__|$(esc "$HARNESS_ENTRY")|g" \
   -e "s|__HARNESS_PIN__|$(esc "$HARNESS_PIN")|g" \
   -e "s|__HARNESS_PIN_FILE__|$(esc "$HARNESS_PIN_FILE")|g" \
@@ -1292,13 +1417,46 @@ fi
 # runnable where plutil does not exist (the CI Linux runner stubs it), and an extract that silently
 # returns nothing there would turn this assertion into a no-op — a false PASS of exactly the class it
 # exists to prevent.
-PROGRAM_WANT="$(xml_esc "$HARNESS/$HARNESS_ENTRY")"
+PROGRAM_WANT="$(xml_esc "$STABLE_PROG")"
 PROGRAM_GOT="$(plist_program "$RENDER")"
 [ -n "$PROGRAM_GOT" ] || { rm -f "$RENDER"; die "the rendered plist declares no ProgramArguments program — launchd would load a job with nothing to exec (parse: $(plist_program "$RENDER"))" ; }
 if [ "$PROGRAM_GOT" != "$PROGRAM_WANT" ]; then
   rm -f "$RENDER"
-  die "REFUSED (pin): the rendered job would exec '$PROGRAM_GOT' but the pin resolved '$PROGRAM_WANT' — the plist and the pin disagree, and starting this job would run a tree the pin does not name. Nothing was installed (the previous plist is untouched)."
+  die "REFUSED (pin): the rendered job would exec '$PROGRAM_GOT' but the stable program is '$PROGRAM_WANT' (which must resolve to '$HARNESS/$HARNESS_ENTRY') — the plist and the pin disagree, and starting this job would run a program the stable resolver does not name. Nothing was installed (the previous plist is untouched)."
 fi
+# ⛔ STABILITY, ASSERTED ON THE RENDERED FILE (agent-infra#3309). Two independent claims, both read
+# back from the plist rather than from this script's variables:
+#   1. the program is NOT inside the pin root — a path under `<pin root>/<sha12>` is garbage-collected
+#      as the pin advances, and launchd cannot follow it. This is the defect itself.
+#   2. the program RESOLVES to the pin's own entrypoint RIGHT NOW — via the stub's --resolve-only, so
+#      what is checked is the behaviour launchd will get, not the installer's bookkeeping.
+# A relative or empty program fails (2) because --resolve-only would not be runnable at all.
+case "$PROGRAM_GOT" in
+  # ⛔ `${HARNESS_PIN_DIR%/}` — `HARNESS_PIN_DIR` is OPERATOR-SUPPLIED (`:836`) and a trailing slash made
+  # the pattern `/x/harness//*`, which matches NOTHING: the guard silently disabled itself for exactly
+  # the operator who typed the path with a slash. (agent-infra#3309 review, P2)
+  "${HARNESS_PIN_DIR%/}"/*)
+    rm -f "$RENDER"
+    die "REFUSED (#3309): the rendered job execs '$PROGRAM_GOT', which is INSIDE the harness pin root ($HARNESS_PIN_DIR). That tree is hash-named and garbage-collected as the pin advances, so this plist would die 'No such file or directory' (exit 127) on the next pin move while launchd still reported it loaded. Nothing was installed." ;;
+esac
+[ -f "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): the rendered job execs '$STABLE_PROG' but that file does not exist — launchd would load a job that exits 127 on every tick. Nothing was installed." ; }
+[ -x "$STABLE_PROG" ] || { rm -f "$RENDER"; die "REFUSED (#3309): '$STABLE_PROG' is not executable — launchd would fail to spawn it. Nothing was installed." ; }
+# ⛔ GUARDED, LIKE THE SIBLING AT THE `start` SEAM (agent-infra#3309 review, P1). This is an unguarded
+# `$( … )` in a file that sets `set -euo pipefail` (`:22`), and the resolver's OWN failure path is
+# `die` → exit 127 — so an unresolvable pin aborted the installer at rc=127 with NO diagnostic at all
+# and the refusal below could never print. In the change whose premise is "the real defect was
+# silence", the guard's own failure path was silent. `|| _PIN_EXEC_RESOLVED=""` makes the rc=0 path
+# of the substitution irrelevant and lets the refusal run; stderr is CAPTURED, not discarded, so the
+# resolver's `PIN-EXEC: DEAD-SUPERVISOR:` line reaches the operator in the message.
+_PIN_EXEC_ERR="$RENDER.pinerr"
+_PIN_EXEC_RESOLVED="$(/bin/bash "$STABLE_PROG" --resolve-only 2>"$_PIN_EXEC_ERR")" || _PIN_EXEC_RESOLVED=""
+_PIN_EXEC_WHY="$(tr '\n' ' ' < "$_PIN_EXEC_ERR" 2>/dev/null || true)"
+rm -f "$_PIN_EXEC_ERR"
+if [ "$_PIN_EXEC_RESOLVED" != "$HARNESS/$HARNESS_ENTRY" ]; then
+  rm -f "$RENDER"
+  die "REFUSED (#3309): the stable program '$STABLE_PROG' resolves to '${_PIN_EXEC_RESOLVED:-<nothing>}' but the pin is '$HARNESS/$HARNESS_ENTRY' — the plist would run a tree the pin does not name, or nothing at all.${_PIN_EXEC_WHY:+ The resolver said: ${_PIN_EXEC_WHY% }} Nothing was installed (the previous plist is untouched). Run it by hand to see why: /bin/bash '$STABLE_PROG' --resolve-only"
+fi
+ok "plist program is STABLE ($STABLE_PROG) and resolves to the pin ($_PIN_EXEC_RESOLVED)"
 # ⛔ IS THE LOADED JOB ON THIS RENDER? Recorded BEFORE the mv, because that is the only moment the file
 # content exists — and it is what makes this installer safe on a live box (agent-infra#1975 item 3): a
 # validation run that renders the same bytes must not disturb a healthy production controller.
@@ -1405,7 +1563,27 @@ DRIFTED=""
 # startup warning. That is exactly the partial-reseed drift this list exists to catch.
 # gate-policy.sh (#2319) is the same class and is REQUIRED now: every pi-spawning carrier sources it
 # and `exit 78`s without it, so a $O copy predating it stops every lane and every merge on the box.
-for f in orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh; do
+# stall-fix.sh (#2929) is EXECUTED BY THE CONTROLLER from `$O` on every stalled drain pass, and an
+# absent-or-half-synced copy is exactly the class this list exists to catch: a NEW orch-loop.sh beside
+# an OLD file set prints `DRAIN STALL -> STALL FIX MISSING` once per pass and dispatches nobody — the
+# escalation records the stall and does nothing with it, which is the defect it was written to close.
+# orch-pin-exec.sh (#3309) is the opposite end of the same class and the reason the list is walked at
+# all: it is the STABLE program the plist execs (see the STABLE_PROG block above), so a `$O` copy that
+# drifted from the pin is the one file whose divergence turns every launchd tick into exit 127 while
+# `launchctl list` still reports the job `loaded`. It is also a $O seed, so it belongs here.
+# key-gate.sh (#3331) is the same class for the same reason, one gate later: `lane.sh` sources it
+# fail-loud and refuses to start a lane whose model credential nothing asserts, so a $O without it stops
+# every dispatch on the box — and the refusal is *meant* to be loud, which is why the DRIFT must be
+# detected here rather than discovered as a box-wide standstill with nothing naming the cause.
+# ⛔ EVERY NAME HERE IS MAINTAINED, NONE IS EITHER/OR: `stall-fix.sh` came from #2929,
+# `orch-pin-exec.sh` from #3309, `key-gate.sh`/`lane-env.sh` from #3331. No side of any of those
+# merges was a superset of another — dropping one leaves a file its caller executes UNCHECKED,
+# which is the exact defect this list exists to catch. Merge conflicts here resolve as a UNION.
+# lane-env.sh (#3060) is the SAME defect already live one line up in `lane.sh`: that file sources it and
+# `exit 78`s without it, and it was in NEITHER list (review of #3331, verified `grep -c` = 0 on both), so
+# a $O deployed before #3060 — or half-synced — stops every lane while this check reports no divergence
+# and the operator is told nothing. Presence + byte comparison is all this list does, so it is one word.
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh lane-env.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1687,7 +1865,14 @@ LC_HB_STALE="${LC_HB_STALE:-$(( CYC * 2 + 300 ))}"
 # the command reports success. It is one `-f` test away from being knowable, so it is refused here.
 case "$ACTION" in
   start|restart)
-    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")"; ;;
+    # ⛔ #3309: THE PLIST NO LONGER NAMES $O/launchd-controller.sh, AND NO LONGER NAMES THE PIN. It execs
+    # the stable resolver, which execs the PIN's entrypoint. So BOTH ends are checked here: the resolver
+    # (seeded by this installer, above) and the pin's entrypoint (resolved now, exactly as launchd will).
+    # A missing resolver bootstraps a job the fleet reads as `loaded` while it exits 127 forever.
+    [ -f "$STABLE_PROG" ] || die "$STABLE_PROG is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Re-run this installer to re-seed it."
+    _pin_prog="$(/bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)" || _pin_prog=""
+    [ -n "$_pin_prog" ] && [ -f "$_pin_prog" ] || die "$LABEL's stable program $STABLE_PROG cannot resolve the pin's controller (got '${_pin_prog:-<nothing>}') — refusing to start a job that would exit 127 on every cycle. Check the pin record ($HARNESS_PIN_FILE) and re-run."
+    [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and the worker surface execs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")" ;;
 esac
 case "$ACTION" in
   start)   lc_ensure  "$LABEL" "$PLIST" "$O" "$PLIST_CHANGED" "$START_TIMEOUT" "$LC_HB_STALE" || exit 1 ;;

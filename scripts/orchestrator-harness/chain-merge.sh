@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and returns 0 iff THIS dispatch was refused by a gate
+cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew|key` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -106,10 +106,13 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and retur
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk), not a gate: an unrecognised value is reported as
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 harness-skew / 82 key), not a gate: an
+  # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
-  # fleet-wide idleness R8 removes. `fork` is named rather than folded into `load` because its remedy is
+  # fleet-wide idleness R8 removes. ⛔ THE PARENTHESISED LIST IS THE RETURN CONTRACT ABOVE, NOT A COMMENT:
+  # it named six values while the `case` below had seven (review cycle 1, P2), which is how a reader ends
+  # up implementing the #2991 fold the next paragraph is about. `fork` is named rather than folded into `load` because its remedy is
   # the OPPOSITE of a load wait — the box must be restarted or drained from OUTSIDE (agent-infra#2293) —
   # and a chain that told its caller "load" would send the operator to wait for a retry the box cannot
   # even spawn. Its code is 73, NOT 74: 74 is the land-backlog gate below, and two gates that share a
@@ -133,6 +136,12 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew` and retur
     land) printf 'land' ;;
     capability) printf 'capability' ;;
     skew) printf 'skew' ;;
+    # ⛔ `key` IS THE MODEL-CREDENTIAL REFUSAL (agent-infra#3331), and it belongs HERE for the same reason
+    # `capability` does: it is a property of THIS box (this box's lane environment holds no credential
+    # for the provider), so the item must travel to a peer that has one. Without the name in this
+    # normaliser it folded into `*` -> `load`, which is the #2991 defect exactly: a bool number, a peer
+    # yield, and an operator reading "load" about a missing key.
+    key) printf 'key' ;;
     *) printf 'load' ;;
   esac
   return 0
@@ -281,10 +290,19 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # The chain still stops here (no PR can appear), and the EXIT trap still releases
       # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
       skew) _cap_rc=81 ;;
+      # 82 is key-gate.sh's KEY_GATE_REFUSED (#3331): the lane REFUSED before spawning the agent because
+      # its environment holds no model credential for the provider. Named rather than folded, for the
+      # same reason as every other arm: an operator told 75 waits for load to fall on a box whose
+      # credential never arrives, and this box will not re-win the item while the record's yield lives.
+      # Tolerant `:-82` like the other constants, so a `$O` whose key-gate.sh predates the code cannot
+      # turn a refusal into an unbound-variable abort.
+      key)  _cap_rc="${KEY_GATE_REFUSED:-82}" ;;
       *)    _cap_rc=75 ;;
     esac
     if [ "$_cap_gate" = "land" ]; then
       echo "[chain $N] land-backlog: lane-$N was refused because the repo's open-PR backlog is over its own landing ceiling (#2409), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This is NOT a capacity transfer: the backlog is repo-wide, so handing the issue to a peer box would not clear it — the remedy is to LAND the open queue (or dispatch a P0-blocker / base-red repair, which are exempt)" >> "$LOG"
+    elif [ "$_cap_gate" = "key" ]; then
+      echo "[chain $N] credential refusal: lane-$N was refused before its agent started because the lane's environment holds no model credential for its provider (key-gate.sh, exit ${_cap_rc}), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This IS a capacity transfer in the one sense that matters here: the credential is a property of THIS box, so a peer that HAS one can take the item — the remedy is to put the key in the environment lanes run with ([key-gate] line in logs/lane-$N.log names the variable and every candidate file), not to wait" >> "$LOG"
     elif [ "$_cap_gate" = "skew" ]; then
       echo "[chain $N] harness mismatch: lane-$N was refused because the lane's caller and the deployed cell-lane-preflight.sh disagree (a usage/version skew, or a corrupt copy), so the capability probe measured nothing — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: every box running the same helper pair refuses identically, so handing the issue to a peer would only circulate it — the remedy is to sync the pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever lanes run" >> "$LOG"
     else
@@ -375,8 +393,15 @@ _phase_age() {
 }
 _PHASE_AGE="$(_phase_age)"
 # The lane's own wall clock bounds how long its marker can mean anything (LANE_TIMEOUT, +60s slack).
-_PHASE_STALE_AFTER="${LANE_TIMEOUT:-3300}"
-case "$_PHASE_STALE_AFTER" in ''|*[!0-9]*|0[0-9]*) _PHASE_STALE_AFTER=3300 ;; esac
+# ⛔ THAT CLOCK IS `LANE_BACKSTOP_S`, NOT 3300 ANY MORE (agent-infra#2888). The wall stopped being the
+# lane's PRIMARY bound — the progress allowance (45 min) is — and the backstop above it is 7200 s. A
+# literal 3300 here would declare a still-working lane's merge marker STALE at 56 minutes while the
+# lane may legitimately run to its 2 h backstop, and this block's response to a stale marker is to
+# DELETE it and review at the tip — i.e. two processes on one PR. `LANE_BACKSTOP_S` is exported by
+# `spawn-gate.sh`, so a lane's chain inherits the operator's override; the literal is the fallback for
+# a chain started outside a lane shell, and `lane-bound.test.sh` (i0) pins it to that seam.
+_PHASE_STALE_AFTER="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"
+case "$_PHASE_STALE_AFTER" in ''|*[!0-9]*|0[0-9]*) _PHASE_STALE_AFTER=7200 ;; esac
 _PHASE_STALE_AFTER=$(( _PHASE_STALE_AFTER + 60 ))
 if [ -f "$PR_PHASE" ] && [ "$_PHASE_AGE" -ge 0 ] && [ "$_PHASE_AGE" -gt "$_PHASE_STALE_AFTER" ]; then
   echo "[chain $N] STALE merge-phase marker (age ${_PHASE_AGE}s > lane wall limit ${_PHASE_STALE_AFTER}s) — the lane is gone; reviewing at the tip now" >> "$LOG"

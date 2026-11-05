@@ -79,7 +79,7 @@ There is **no worktree-scoped stash** in git: `git stash push` has no `--ref`/pe
 
 ## Escaping the main-checkout guard (deliberate mid-session escalation)
 
-If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note `git checkout main` and `git pull --ff-only` are M4-sanctioned and need no window — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
+If a session is **guard-blocked but functional** — alive, issuing tool calls, stranded in the shared main checkout where the guard refuses the ops needed to un-strand (in-hub `checkout -b`, `commit`, foreign pushes, edits) — note the branch pair is M4-sanctioned and needs no window, but on a dirty hub it cannot CLEAR the dirt (`git checkout main` may refuse or carry the change along; `git pull --ff-only` may fast-forward or refuse) — the marker's named-path restore is what clears it — it can open a **sanctioned, bounded, audited, session-scoped** window with one touch:
 
 ```bash
 # must be its OWN bash tool call inside a guard-loaded session
@@ -343,8 +343,15 @@ agents in the hub) is prevented by discipline, not just guards:
 
 ### Stranded main checkout — terminal one-liner when M4 does NOT sanction (#206)
 
-- **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, and the op needed to un-strand is OUTSIDE the M4 recovery allowlist — `reset --hard`, force ops, or a tree the pull cannot fast-forward) is unrecoverable FROM the agent — the guard's escape hatches are env-only (`AGENT_ALLOW_MAIN_EDITS=1`) and cannot be set on a running process. Agent-side `git checkout main` and `git pull --ff-only` are themselves M4-sanctioned recovery ops needing no window (see the #1484 contract below).
-- **Fix (the sanctioned recovery when M4 blocks):** the human runs ONE command in a **terminal** (terminals are not intercepted by the guard):
+- **Problem:** A main checkout stuck behind/stranded (auto-sync can't ff-pull, and the op needed to un-strand is OUTSIDE the M4 recovery allowlist — `reset --hard`, force ops, or a tree the pull cannot fast-forward) used to be unrecoverable FROM the agent — the env hatch (`AGENT_ALLOW_MAIN_EDITS=1`) cannot be set on a running process; the TTL marker's named-path restore window is the agent-side route for DIRT, and the branch one-liner below is for an off-main AND CLEAN hub. Agent-side `git checkout main` and `git pull --ff-only` are themselves M4-sanctioned recovery ops needing no window (see the #1484 contract below).
+- **Fix (the sanctioned recovery when M4 blocks):** pick the route that matches the STATE — `git status --porcelain` tells you which. On a **dirty** hub a branch switch is NOT the recovery: `git checkout main && git pull --ff-only` cannot clear the dirt (`git checkout main` may refuse or carry the change along; `git pull --ff-only` may fast-forward or refuse), which is exactly the loop that stranded the checkout for ~12h on 2026-11-02. Clear the dirt instead, from the hub, under an active escape hatch (`AGENT_ALLOW_MAIN_EDITS=1` at session start, or the `~/.pi/agent/.allow-main-edits` marker), naming the paths:
+  ```bash
+  cd <repo> && git status --porcelain
+  git restore --staged --worktree <path>   # 'M ' staged
+  git restore <path>                       # ' M' worktree
+  mv <path> /tmp/                          # '??' untracked (git clean stays refused)
+  ```
+  Only an **off-main AND clean** hub wants the branch route, run by the human in a **terminal** (terminals are not intercepted by the guard):
   ```bash
   cd <repo> && git checkout main && git pull --ff-only
   ```
@@ -363,20 +370,36 @@ sequence, in order:
    The guard's M4 gate is now ACTIVE in an off-main/dirty hub: only sanctioned
    recovery ops pass (`git checkout main`, `git pull --ff-only`, `git fetch`,
    `git status/log`, `git worktree add/list/prune`, `git push origin
-   <checked-out-branch>`, marker touch). Feature ops (`commit`, `checkout -b`,
-   foreign pushes, edits) are BLOCKED — even under the TTL marker (only
-   `AGENT_ALLOW_MAIN_EDITS=1` disables M4).
+   <checked-out-branch>`, marker touch) — **plus, under an active TTL marker, the
+   named-path restore window**: ONE bare `git checkout -- <named path>` /
+   `git restore [--staged] [--worktree] <named path>` run from the hub (this is
+   what clears DIRT; a whole-tree `.`/glob/brace/`..` operand, a wrapper, a
+   compound or a `-C`/`GIT_DIR` retarget stays refused). Feature ops (`commit`,
+   `checkout -b`, foreign pushes, edits) are BLOCKED — even under the TTL marker
+   (only `AGENT_ALLOW_MAIN_EDITS=1` disables M4).
 2. **Preserve WIP** — if the stranded branch has commits that are not on
    origin, the ONE allowed M4 push preserves them before any checkout:
    ```bash
    git push origin <stranded-branch>   # the sanctioned WIP-preservation carve-out
    ```
-3. **Recover** — the sanctioned terminal one-liner (human terminal, #206):
-   ```bash
-   cd <repo> && git checkout main && git pull --ff-only
-   ```
-   Agent-side, `git checkout main` and `git pull --ff-only` are M4-sanctioned
-   and run directly (no marker needed).
+3. **Recover** — pick the route that matches the STATE (`git status --porcelain`):
+   - **DIRTY hub** → a branch switch cannot clear it (it may refuse or carry the dirt
+     along, and
+     the pair cannot clear it, whether or not the hub is already on `main`).
+   Clear the dirt with the
+     marker's named-path window, from the hub:
+     ```bash
+     git restore --staged --worktree <path>   # 'M ' staged
+     git restore <path>                       # ' M' worktree
+     mv <path> /tmp/                          # '??' untracked (git clean stays refused)
+     ```
+   - **OFF-MAIN and CLEAN hub** → the sanctioned terminal one-liner (human
+     terminal, #206):
+     ```bash
+     cd <repo> && git checkout main && git pull --ff-only
+     ```
+     Agent-side, `git checkout main` and `git pull --ff-only` are M4-sanctioned
+     and run directly (no marker needed).
 4. **Never escape via nested pi** — do NOT relaunch a nested/background `pi`
    to get around M4; the script backdoor is closed and the only full bypass is
    the env flag at session start. If the lane needs to keep working, use
