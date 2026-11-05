@@ -3757,6 +3757,21 @@ holder_recheck() {
         log "REMOVE-SKIP $path a holder is live AGAIN (${HL_VERDICT} pid=${HL_DETAIL}) — nothing removed, preserved"
         return 2
     fi
+    # ⛔ THE PIN RECORD IS RE-PROBED HERE TOO, NOT ONLY AT CLASSIFICATION (cycle-5 review, P2).
+    # `pin_tree_match` had exactly ONE call site — `classify_one` — while this function exists
+    # precisely because "classify_one decides from holders that existed minutes ago on a big box"
+    # and the same evidence must be consulted AT REMOVAL TIME. `holders_live` was re-applied that
+    # way; the pin record was not. It is the one holder `/proc` CANNOT show, and it is a FILE
+    # another process writes at arbitrary times (`cloud-cell-supervisor.sh` re-writes
+    # $HARNESS_PIN_FILE on `apply`), so a record written inside the removal window named nothing at
+    # classification and would be ignored now. For a custom `HARNESS_PIN_DIR` the shape backstop
+    # (`*/harness[/…]`) does not cover it — the record is the only protection — and the consequence
+    # is the #10114 class: this box's executable tree deleted.
+    if pin_tree_match "$rcanon"; then
+        REMOVE_SKIP_VERDICT="${PIN_VERDICT:-pin-tree}"
+        log "REMOVE-SKIP $path it is NOW a ${PIN_VERDICT:-pin-tree} (${PIN_PROOF:-re-probed at removal}) — nothing removed, preserved"
+        return 2
+    fi
     return 0
 }
 

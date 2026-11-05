@@ -4764,6 +4764,7 @@ assert_absent "$OUT" "unbound variable" \
 assert_contains "$(row_for "$OUT" "$NHWT")" "reason=pin-tree" \
     "G15i …and the pin tree is still classified, not left as a blank row"
 
+
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
 [ "$FAIL" -eq 0 ] || exit 1

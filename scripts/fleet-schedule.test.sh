@@ -1326,6 +1326,47 @@ out="$(run_v15 1800)"; rc=$?
   || bad "a marker dated years ahead excused the stale tick (rc=$rc): $out"
 grep -q 'BUSY' <<<"$out" && bad "a future-dated marker was reported as a running job: $out" \
   || ok "no future-dated marker is reported as a running job"
+# ⛔ A NON-FINITE START IS NOT AN EXEMPTION EITHER — AND THIS ONE WAS A FALSE PASS (cycle-5 review,
+# P1). EVERY comparison against NaN is False, so `started=NaN` walked through BOTH guards above
+# (`nan <= 0` did not drop it, `nan > now + slack` did not drop it) and through the clamp, because
+# `min(deadline, nan + …)` returns `deadline` when `nan < deadline` is False. The marker's own
+# SELF-DECLARED deadline therefore survived unclamped, the marker read as LIVE, and `--verify`
+# certified a WEDGED loop `SCHEDULE VERIFIED` rc=0 — exactly the unbounded exemption the two guards
+# above say cannot exist. `json.load` parses `NaN`, and the reachable inputs are the ones this file
+# already names: hand-edit, foreign writer, restored state dir. Dropping it fails CLOSED.
+python3 - "$FLEET_SCHEDULE_STATE" <<'PYNAN'
+import json, os, sys, time
+state = sys.argv[1]
+os.makedirs(os.path.join(state, "busy"), exist_ok=True)
+now = time.time()
+# `deadline` is self-declared and huge; without the finite gate it survives the clamp untouched.
+json.dump({"label": "com.test.echo", "started": float("nan"),
+           "deadline": now + 10 ** 12}, open(os.path.join(state, "busy", "com.test.echo.json"), "w"))
+PYNAN
+out="$(run_v15 1800)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a NaN start is dropped, not an unbounded exemption (rc=1)" \
+  || bad "a NaN start excused the stale tick — --verify certified a wedged loop (rc=$rc): $out"
+grep -q 'BUSY' <<<"$out" && bad "a NaN-started marker was reported as a running job: $out" \
+  || ok "no NaN-started marker is reported as a running job"
+# ⛔ AND A BIG-INT DEADLINE MUST NOT RAISE OUT OF --verify (cycle-5 review, P1). `json.load` returns
+# an arbitrary-precision int for an integer literal, so a marker holding `10**400` made
+# `float(entry["deadline"])` raise OverflowError — an ArithmeticError, NOT a ValueError, so the
+# marker-parsing except tuple did not cover it. It aborted the check for every job after the broken
+# marker instead of naming it: verbatim the defect `_finite` was added for on the stamp arm.
+python3 - "$FLEET_SCHEDULE_STATE" <<'PYBIG'
+import json, os, sys, time
+state = sys.argv[1]
+os.makedirs(os.path.join(state, "busy"), exist_ok=True)
+now = time.time()
+json.dump({"label": "com.test.echo", "started": now - 60, "deadline": 10 ** 400},
+          open(os.path.join(state, "busy", "com.test.echo.json"), "w"))
+PYBIG
+out="$(run_v15 1800)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a big-int busy deadline is dropped, not raised out of --verify (rc=1)" \
+  || bad "a big-int deadline did not fail closed (rc=$rc): $out"
+case "$out" in *OverflowError*|*Traceback*) bad "a big-int deadline RAISED out of --verify: $out" ;; *) ok "…and it did not raise a traceback out of the verifier" ;; esac
+grep -q 'BUSY' <<<"$out" && bad "a big-int-deadline marker was reported as a running job: $out" \
+  || ok "no big-int-deadline marker is reported as a running job"
 kill "$fakepid" 2>/dev/null
 
 # ── 16. an annual (multi-entry) calendar must keep a NEXT occurrence ───────────────────────
