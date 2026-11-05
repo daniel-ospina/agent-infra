@@ -126,7 +126,10 @@ jobs:
     # #2055: a bound, so a hung `docker run` fails fast and names itself. MEASURED: the whole sweep
     # is ~5 s for 331 files plus a cold image pull (~2 s) — 10 min is ~100x that and cannot
     # false-block, while still being far below the range where a hang holds the runner.
-    timeout-minutes: 10
+    # ⛔ 30, NOT 10 (#3174 review): its steps bound 10 + 5 + 5 = 20, so a 10 min JOB bound sat below
+    # their sum — and a job-level trip is `cancelled` (NON-RED to the rail), which could pre-empt the
+    # red step that actually hung. Same defect, same fix, as ci-main.yml's `bash32-parse-guard`.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10

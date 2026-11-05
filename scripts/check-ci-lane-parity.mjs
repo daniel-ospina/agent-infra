@@ -49,8 +49,14 @@ import { parseWorkflowYaml } from "./workflow-yaml.mjs";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const env = process.env;
 
-const PR_WORKFLOW = env.CI_LANE_PR_WORKFLOW || resolve(ROOT, ".github/workflows/ci.yml");
-const MAIN_WORKFLOW = env.CI_LANE_MAIN_WORKFLOW || resolve(ROOT, ".github/workflows/ci-main.yml");
+// The repo's OWN lane documents. A write to these is a write to the live gate; a fixture (or a
+// mutation of one of these files, copied elsewhere) is audited by the same assertions but is not the
+// live document — see the self-test absence rule in checkLane.
+const DEFAULT_PR_WORKFLOW = resolve(ROOT, ".github/workflows/ci.yml");
+const DEFAULT_MAIN_WORKFLOW = resolve(ROOT, ".github/workflows/ci-main.yml");
+
+const PR_WORKFLOW = env.CI_LANE_PR_WORKFLOW || DEFAULT_PR_WORKFLOW;
+const MAIN_WORKFLOW = env.CI_LANE_MAIN_WORKFLOW || DEFAULT_MAIN_WORKFLOW;
 const PR_JOB = env.CI_LANE_PR_JOB || "bash-suites";
 const MAIN_JOB = env.CI_LANE_MAIN_JOB || "script-validate";
 const RUNNER = env.CI_LANE_RUNNER || "scripts/run-bash-shards.sh";
@@ -127,6 +133,101 @@ function logicalLines(runValue) {
 }
 
 /**
+ * Does this job invoke `canonical` AS THE STEP'S OWN COMMAND?
+ *
+ * ⛔ NOT A SUBSTRING TEST, AND NOT A LINE SCAN EITHER (#3235 review, P1, measured twice).
+ * `s.run.includes("check-ci-lane-parity")` matched PROSE, so a commented-out guard step read green.
+ * A "one logical line shaped `bash <path>`" scan then matched UNEXECUTED text: `run: |` +
+ * `cat >/dev/null <<'EOF'` + the call + `EOF` was ACCEPTED, and so was `if false; then \<call\>; fi`
+ * — both measured rc 0 with the gate reporting it runs. A mini shell parser is exactly the
+ * semantics-modelling #666 retired ("two review rounds found six working bypasses and the second
+ * round's were created by the first round's fixes").
+ *
+ * So this uses the ONE technique the file already records for the runner call site (#666 item 6a):
+ * a TRIMMED-LINE EQUALITY. The step's `run` value must BE the bare call — exactly one logical line,
+ * and that line must be `bash <canonical path>`. Only a bare call's exit code is the step's, so
+ * heredocs, `if`/`for` bodies, tails, pipes, `env bash …` and variable indirection all fall out at
+ * once instead of being enumerated.
+ *
+ * ⚠️ DECLARED OVER-BLOCK (category B, accepted): a guard step that runs the call inside a multi-line
+ * script (`set -e` on line 1, the call on line 2) is now REFUSED, although it would execute. The
+ * remedy is to put the guard on its own step. An ABSOLUTE path (`/repo/scripts/…`, `$PWD/scripts/…`)
+ * and a `..`-containing path are refused for the same reason — the string alone cannot say which tree
+ * it lands in — and their remedy is the repo-relative spelling. Both directions are a loud false
+ * block; the direction that was open was a silent false PASS, which is the class this file refuses.
+ */
+function exactlyInvokes(job, canonical) {
+  return (job.steps || []).some((s) => {
+    if (!s || typeof s !== "object" || Array.isArray(s) || typeof s.run !== "string") return false;
+    const lines = logicalLines(s.run);
+    if (lines.length !== 1) return false;
+    const m = CALL_RE.exec(lines[0]);
+    if (!m) return false;
+    // ⛔ EXACTLY the canonical repo-relative path — not a SUFFIX of it (#3235 review, P2, measured).
+    // `p.endsWith("/" + canonical)` still accepted a DECOY: `bash docs/scripts/check-ci-lane-parity.sh`
+    // with a same-named stub in `docs/` exited 0 while the real guard — and, on the live path, the
+    // MUTATION SELF-TEST, the program that kills this guard's mutants — executed nowhere. A suffix
+    // test cannot distinguish "the same file" from "a file whose path ends the same way", and only
+    // equality can. `CALL_RE` already normalises a `./` prefix and quoting, which are the spellings
+    // that genuinely name the same file.
+    return m[1] === canonical;
+  });
+}
+
+const GUARD_CANON = "scripts/check-ci-lane-parity.sh";
+const SELFTEST_CANON = "tests/ci-lane-parity/run.sh";
+const runsGuardScript = (job) => exactlyInvokes(job, GUARD_CANON);
+const runsSelfTestScript = (job) => exactlyInvokes(job, SELFTEST_CANON);
+
+/**
+ * Validate ONE `BASH_SHARD_SLICE` declaration. Both halves are load-bearing:
+ *
+ * - the DENOMINATOR must be `strategy.job-total` (GitHub's own count) or the width goes stale;
+ * - the NUMERATOR must be `matrix.shard`, or EVERY arm runs the SAME slice. `1/${{ strategy.job-total }}`
+ *   measured rc 0 and leaves 142 of 163 suites unrun while each arm still passes its own set
+ *   assertion, because every process derives its expected set from its OWN index — the identical
+ *   hole the denominator rule closes, on the other side of the slash (#3235 review, P1).
+ */
+function checkSliceValue(label, file, id, where, v) {
+  // ⛔ EXACT EXPRESSIONS, NOT SUBSTRINGS (#3235 review, P3, measured). `includes("matrix.shard")`
+  // accepted `${{ matrix.shard && 1 }}/${{ strategy.job-total }}` — which evaluates to `1/8` on every
+  // arm, so all eight run slice 1 and 142 of the 163 suites never run, at rc 0. The identical
+  // substring bug on the denominator side is `${{ strategy.job-total && 8 }}`. Whitespace inside the
+  // expression is insignificant, so it is normalised; nothing else is.
+  const parts = v.split("/");
+  // ⛔ EXACT EXPRESSIONS, MATCHED AS EXPRESSIONS — not by squashing ALL whitespace (#3235 review,
+  // P3, measured). `$ {{ matrix.shard }}` squashes to `${{matrix.shard}}` and passed, although GitHub
+  // does not recognise it: the runner receives the literal text and refuses at runtime, so the hole
+  // was bounded, but the guard was certifying a slice expression that cannot evaluate per-arm. The
+  // only whitespace that is insignificant is the whitespace INSIDE the braces.
+  const NUM_RE = /^\s*\$\{\{\s*matrix\.shard\s*\}\}\s*$/;
+  const DEN_RE = /^\s*\$\{\{\s*strategy\.job-total\s*\}\}\s*$/;
+  if (parts.length !== 2) {
+    refuse(
+      `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
+        v
+      )} — it must be exactly '<index>/<count>' built from '\${{ matrix.shard }}/\${{ strategy.job-total }}'; exiting 2`
+    );
+  }
+  const numerator = parts[0];
+  const denominator = parts[1];
+  if (!DEN_RE.test(denominator)) {
+    refuse(
+      `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
+        v
+      )} — the denominator must be exactly '\${{ strategy.job-total }}', GitHub's own count of this matrix, or a widened/narrowed matrix leaves slices NO arm runs while every arm still passes its own set assertion; exiting 2`
+    );
+  }
+  if (!NUM_RE.test(numerator)) {
+    refuse(
+      `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
+        v
+      )} — the NUMERATOR must be exactly '\${{ matrix.shard }}', the one per-arm index the axis assertion pins to 1..N: any other numerator evaluates the SAME on every arm, so one slice runs N times, the other N-1 run by nobody, and each arm still passes its own set assertion; exiting 2`
+    );
+  }
+}
+
+/**
  * A step's failure must be able to fail the RUN: reject the keys that make a step or job not run,
  * or that rewrite how `run:` executes, or that could configure this guard from inside the job it
  * audits. These are KEY-NAME assertions on parsed objects — a quoted or flow-style spelling is the
@@ -134,7 +235,14 @@ function logicalLines(runValue) {
  */
 function refusalKeys(node) {
   const bad = [];
-  const KEYS = ["if", "needs", "continue-on-error"];
+  // ⛔ `working-directory` IS IN THIS FAMILY (#3235 review, P2, measured). It rewrites what the
+  // step's `run` resolves against, so the SAME bare call `bash scripts/check-ci-lane-parity.sh` can
+  // execute a DIFFERENT file: with `working-directory: tests` and a stub at
+  // `tests/scripts/check-ci-lane-parity.sh`, the guard printed "runs the guard and is unconditional"
+  // and exited 0 while the real gate never ran — invisible to a `run:`-text assertion, because the
+  // text is byte-identical. The `defaults.run.working-directory` spelling is covered by
+  // deepForbiddenKeys, the same way `defaults.run.shell` is.
+  const KEYS = ["if", "needs", "continue-on-error", "working-directory"];
   for (const k of KEYS) if (Object.prototype.hasOwnProperty.call(node, k)) bad.push(k);
   if (Object.prototype.hasOwnProperty.call(node, "shell")) {
     if (String(node.shell).trim() !== "bash") bad.push("shell");
@@ -174,6 +282,11 @@ function deepForbiddenKeys(node, path, out) {
     // workflow-level `defaults:` — reaches every job, so it is not enough to scan the audited one.
     if (k === "shell" && /\.defaults\.run$/.test(path) && String(v).trim() !== "bash") {
       out.push(`${path}.${k}`);
+    }
+    if (k === "working-directory" && /\.defaults\.run$/.test(path)) {
+      // `.` is the identity: it resolves to the same directory GitHub would use anyway, so refusing
+      // it would be a false block with no rewrite behind it (#3235 review, P3, measured).
+      if (String(v).trim() !== "." && String(v).trim() !== "./") out.push(`${path}.${k}`);
     }
     deepForbiddenKeys(v, `${path}.${k}`, out);
   }
@@ -235,6 +348,82 @@ function checkLane(label, workflowFile, jobName) {
         `${file} narrows its 'pull_request:' trigger with ${shape} — a filter can stop this lane running on a PR's commits while its parity assertion stays green; the bare 'pull_request:' is the form this lane needs (exiting 2)`
       );
     }
+  } else {
+    // ⛔ THE MAIN LANE'S TRIGGER WAS NEVER CHECKED (#3235 review, P2, pre-existing and measured):
+    // this file's header lists "a trigger that cannot fire" among the exit-2 refusals, but the arm
+    // only existed for the PR lane. Narrowing ci-main's `on.push.branches:` to `['nothing/**']`
+    // exited 0 — the guard certifying parity over a lane that never executes.
+    // A push lane legitimately filters `branches:`, so the VALUE is not refused the way the PR
+    // lane's `pull_request:` value is; what is refused is a document with no `push:` at all, and a
+    // filter that cannot match the base branch this lane is named for.
+    const on = wf.on;
+    const hasPush =
+      on === "push" ||
+      (Array.isArray(on) && on.includes("push")) ||
+      (on && typeof on === "object" && !Array.isArray(on) && Object.prototype.hasOwnProperty.call(on, "push"));
+    if (!hasPush) {
+      refuse(
+        `${file} has no 'push:' trigger — the main lane would never run, so nothing it calls can gate a merge; exiting 2`
+      );
+    }
+    const pushValue = on && typeof on === "object" && !Array.isArray(on) ? on.push : null;
+    // ⛔ AN ALLOWLIST, NOT A KEY-BY-KEY ENUMERATION (#3235 review, P2, measured). Resolving only
+    // `branches:` accepted four spellings that make the lane unable to fire for `main` —
+    // `branches-ignore: ['**']`, `branches: ['**', '!main']`, `paths: ['docs/**']`,
+    // `paths-ignore: ['**']` — all at rc 0. The PR lane already recorded the lesson one screen up
+    // ("Refusing the value wholesale also retires the key-by-key enumeration"); the push lane cannot
+    // refuse its whole value, since `branches:` is legitimate, so it accepts ONLY that one key. Any
+    // key GitHub adds later is refused by default instead of silently escaping the arm.
+    if (pushValue && typeof pushValue === "object" && !Array.isArray(pushValue)) {
+      const extra = Object.keys(pushValue).filter((k) => k !== "branches");
+      if (extra.length > 0) {
+        refuse(
+          `${file} filters its 'push:' trigger with [${extra.join(
+            " "
+          )}] — those can stop this lane running for a push to 'main' while its parity assertion stays green (and a key this guard does not enumerate would be worse, so none is accepted); only 'branches:' is allowed here, exiting 2`
+        );
+      }
+    }
+    const branches =
+      pushValue && typeof pushValue === "object" && !Array.isArray(pushValue) ? pushValue.branches : undefined;
+    if (Array.isArray(branches) && branches.length > 0) {
+      // A `!` entry is NEGATION: `branches: ['**', '!main']` matches everything EXCEPT main, i.e. the
+      // documented spelling for "never runs for the branch this lane gates".
+      const negated = branches.filter((b) => String(b).trim().startsWith("!"));
+      if (negated.length > 0) {
+        refuse(
+          `${file} negates branches [${negated.join(
+            ", "
+          )}] in its 'push:' filter — a '!main' entry EXCLUDES the branch this lane gates, so the lane would never run while its parity assertion stays green; exiting 2`
+        );
+      }
+      // GitHub's `*` does not cross `/` and `**` does; that is the whole of the semantics modelled
+      // here, and it is the minimum needed to answer "could this filter ever fire for 'main'"
+      // without enumerating filter keys. `+` is deliberately NOT escaped: GitHub documents it as
+      // "one or more of the preceding character", which is exactly what a regex `+` is, so escaping
+      // it refused the valid filter `ma+in` (#3235 review, P3, measured).
+      const matchesMain = (pattern) => {
+        const p = String(pattern).trim();
+        if (p === "") return false;
+        const re = new RegExp(
+          "^" +
+            p
+              .replace(/[.^${}()|[\]\\]/g, "\\$&")
+              .replace(/\*\*/g, "\u0000")
+              .replace(/\*/g, "[^/]*")
+              .replace(/\u0000/g, ".*") +
+            "$"
+        );
+        return re.test("main");
+      };
+      if (!branches.some(matchesMain)) {
+        refuse(
+          `${file} narrows its 'push:' trigger to branches [${branches.join(
+            ", "
+          )}] — none of which can match this lane's base branch 'main', so the lane would never run while its parity assertion stays green; exiting 2`
+        );
+      }
+    }
   }
 
   const job = wf.jobs && Object.prototype.hasOwnProperty.call(wf.jobs, jobName) ? wf.jobs[jobName] : undefined;
@@ -261,10 +450,7 @@ function checkLane(label, workflowFile, jobName) {
   const guardMentioning = [];
   for (const [id, j] of Object.entries(wf.jobs || {})) {
     if (!j || typeof j !== "object") continue;
-    const mentionsGuard = (j.steps || []).some((s) =>
-      typeof s?.run === "string" && (s.run.includes("check-ci-lane-parity") || s.run.includes("ci-lane-parity/run.sh"))
-    );
-    if (mentionsGuard) guardMentioning.push([id, j]);
+    if (runsGuardScript(j) || runsSelfTestScript(j)) guardMentioning.push([id, j]);
   }
   for (const [id, j] of guardMentioning) {
     const gbad = [...refusalKeys(j)];
@@ -276,7 +462,59 @@ function checkLane(label, workflowFile, jobName) {
       );
       process.exit(2);
     }
-    note(`   ✅ ${label}: job '${id}' runs the guard and is unconditional and blocking`);
+    note(`   ✅ ${label}: job '${id}' ${runsGuardScript(j) ? "runs the guard" : "runs the guard's MUTATION SELF-TEST"} and is unconditional and blocking`);
+  }
+
+  // ⛔ AND THE GUARD **AND ITS SELF-TEST** MUST STILL BE THERE (#3174 review, measured). The walk
+  // above is NAME-FREE on purpose so a synthetic fixture is not refused for lacking a job NAME — but
+  // that also means a document carrying the shard call and NO guard step was GREEN: a copy of
+  // ci-main.yml with the whole `script-validate-gate` job DELETED exited 0, i.e. the job that runs the
+  // gate could be removed while every assertion in this file still passed.
+  // ⛔ THEY ARE COUNTED SEPARATELY, because they are two different programs: deleting only the
+  // MUTATION SELF-TEST step from BOTH lanes also exited 0 (review cycle 2, mutation E) — and
+  // `tests/ci-lane-parity/run.sh` declares `# shard: off` precisely BECAUSE a dedicated step runs it,
+  // so once that step is gone the suite that kills guard mutants executes NOWHERE.
+  const callsRunner = stepRuns(job).some((v) =>
+    logicalLines(v).some((l) => l.includes(RUNNER))
+  );
+  if (callsRunner) {
+    const runsGuard = guardMentioning.some(([, jj]) => runsGuardScript(jj));
+    const runsSelfTest = guardMentioning.some(([, jj]) => runsSelfTestScript(jj));
+    if (!runsGuard) {
+      // ⛔ THE DIAGNOSIS MUST BE TRUE, or the over-block is unhelpful as well as loud (#3235 review,
+      // P3). "NO job runs the guard" is the wrong sentence for a job that DOES run it — just not as
+      // the bare call (a `set -e` line above it). Both are refusals; they need different remedies.
+      const mentioned = Object.entries(wf.jobs || {}).some(
+        ([, jj]) =>
+          jj &&
+          typeof jj === "object" &&
+          (jj.steps || []).some((s) => typeof s?.run === "string" && s.run.includes("check-ci-lane-parity"))
+      );
+      refuse(
+        mentioned
+          ? `${label}: ${file} calls ${RUNNER} but NO step invokes the lane-parity guard as the bare call \`bash scripts/check-ci-lane-parity.sh\` — a job mentions it, but NOT as that value: either it sits inside a larger script, a heredoc, a comment or a conditional, or the path differs from the canonical repo-relative one (an absolute or '..'-containing path is a declared over-block). Both remedies are the same: the guard on its OWN STEP, using the repo-relative path; exiting 2`
+          : `${label}: ${file} calls ${RUNNER} but NO job runs the lane-parity guard itself (\`check-ci-lane-parity\`) — the gate is not running on the lane it guards, and every other assertion in this file would stay green; exiting 2`
+      );
+    }
+    // ⛔ THE SELF-TEST IS THE PROGRAM THAT KILLS THIS GUARD'S MUTANTS, and `tests/ci-lane-parity/run.sh`
+    // declares `# shard: off` BECAUSE a dedicated step runs it — so deleting that one step makes the
+    // suite that catches a gutted guard execute NOWHERE. Measured (review cycle 2, mutation E):
+    // deleting it from BOTH lanes exited 0.
+    // It is required only when auditing the repo's OWN workflow: the suite builds most fixtures by
+    // line-filtering the real files, so a mutation aimed at the CALL SITE can legitimately drop this
+    // step, and demanding it from those copies would red the fixture rather than the property. The
+    // failing direction therefore has no arm in this suite, stated here rather than implied — the
+    // LIVE arm exercises the passing direction against the real file.
+    const isLive =
+      workflowFile === (label === "PR" ? DEFAULT_PR_WORKFLOW : DEFAULT_MAIN_WORKFLOW);
+    if (isLive && !runsSelfTest) {
+      refuse(
+        `${label}: ${file} calls ${RUNNER} but NO job runs its MUTATION SELF-TEST (\`tests/ci-lane-parity/run.sh\`) — that suite declares '# shard: off' because this step is what runs it, so deleting the step leaves the program that kills guard mutants executing nowhere; exiting 2`
+      );
+    }
+    note(
+      `   ✅ ${label}: the runner's lane also runs the guard${isLive ? " AND its mutation self-test" : ""}`
+    );
   }
 
   // THE CALL SITE. The step's `run` value must BE the bare call — ONE logical line, exactly it.
@@ -373,8 +611,217 @@ function checkRunner() {
   return { shards: shards.length, globs: globs.length };
 }
 
+/**
+ * GitHub's `strategy.job-total` for a matrix, when this guard can DERIVE it.
+ *
+ * `job-total` is the CARTESIAN PRODUCT of every axis, so it is only computable when every axis is a
+ * plain list and nothing reshapes the grid. `include:`/`exclude:` are refused rather than modelled:
+ * `include` overlays a matching combination in one case and appends a new one in another, and a
+ * partial model of that would report a coverage count the runner does not agree with — the one
+ * number this assertion exists to trust. Refusing is the fail-closed direction and costs nothing:
+ * neither lane uses either key, and a slice-feeding matrix needs only the `shard:` axis.
+ */
+function matrixJobTotal(matrix) {
+  const keys = Object.keys(matrix);
+  for (const k of keys) {
+    if (k === "include" || k === "exclude") {
+      return { ok: false, why: `it spells the matrix with '${k}:'` };
+    }
+  }
+  let value = 1;
+  for (const k of keys) {
+    if (!Array.isArray(matrix[k])) {
+      return { ok: false, why: `axis '${k}' is not a list` };
+    }
+    value *= matrix[k].length;
+  }
+  return { ok: true, value };
+}
+
+/**
+ * STEP-vs-JOB BOUNDS, AND MATRIX MEMBERSHIP — the two ways a sliced job reads GREEN over a hole.
+ *
+ * ⛔ A JOB-LEVEL `jobs.<id>.timeout-minutes` trip is reported `cancelled`, which this repo's rail
+ * reads NON-RED (`scripts/admin-merge.sh` NON_RED_CONC); a STEP-level trip is `failure` = red. So a
+ * job whose bound sits AT OR BELOW the sum of its own step bounds lets the non-red conclusion win the
+ * race — the fail-open both lanes' bound comments exist to close. Not hypothetical: measured on this
+ * tree at #3174's review, `bash32-parse-guard` (ci-main.yml) and `bash32-parse` (ci.yml) both carried
+ * a 10 min JOB bound over 10 + 5 + 5 = 20 min of steps, and nothing anywhere reddened it. For those
+ * two jobs the consequence is specific and bad: the rail reads the trip as non-red AND
+ * `auto-file-on-failure` is `if: failure()`, which does not fire for a `cancelled` need — so the
+ * 3.2 red signal could go quiet with no red and no filed issue.
+ *
+ * ⛔ AND A MATRIX IS A COVERAGE CLAIM THE RUNNER CANNOT CHECK. `BASH_SHARD_SLICE` is `<index>/<count>`
+ * with count = `strategy.job-total`, so the axis must be exactly 1..N and DISTINCT: an axis of
+ * `[1,1,2,…,7]` leaves slice 8 run by NOBODY while every arm still passes its own set assertion
+ * (each process only knows its own index). Measured: `[1,1,2,3,4,5,6,7]` was accepted before this.
+ */
+function checkBounds(label, workflowFile) {
+  const wf = parse(workflowFile);
+  const file = base(workflowFile);
+  const jobs = (wf && wf.jobs) || {};
+
+  // ⛔ THE WORKFLOW'S OWN `env:` REACHES EVERY JOB, so it is a third place a slice can be declared
+  // (#3235 review, P2, measured: a workflow-level `/12` left 52 of 163 suites unrun at rc 0). It is
+  // validated ONCE here rather than per job, because a workflow-level slice does NOT make every job
+  // in the file a slice-feeding job — only the runner's arm is, and demanding a `shard:` axis from
+  // every unrelated job would be a false block.
+  const wfEnv = wf && wf.env && typeof wf.env === "object" && !Array.isArray(wf.env) ? wf.env : undefined;
+  if (wfEnv && Object.prototype.hasOwnProperty.call(wfEnv, "BASH_SHARD_SLICE")) {
+    checkSliceValue(label, file, "(every job)", "the WORKFLOW's env", String(wfEnv.BASH_SHARD_SLICE));
+  }
+
+  for (const [id, j] of Object.entries(jobs)) {
+    if (!j || typeof j !== "object" || Array.isArray(j)) continue;
+    const steps = Array.isArray(j.steps) ? j.steps : [];
+    const callsRunner = steps.some(
+      (s) => s && typeof s === "object" && typeof s.run === "string" && s.run.includes(RUNNER)
+    );
+    // ⛔ EVERY PLACE A SLICE CAN BE SET, NOT JUST A STEP'S `env:` (#3235 review, P2, measured). A
+    // JOB-level `env:` reaches every one of the job's steps, so the same slice key placed there
+    // bypassed the denominator rule below entirely — a slice with a hard-coded denominator of 12 on
+    // an 8-wide matrix left 4/12 of the list run by nobody while this guard stayed green, because
+    // the rule only ever looked at step `env`. Collected from the JOB and from every STEP, and the
+    // result also decides whether this job is audited as a slice-feeding job at all.
+    // ⚠️ DECLARED RESIDUAL, not silently dropped: an `env:`-shaped declaration is the complete
+    // mechanism this guard can READ (`env:` at workflow, job, step AND the job's `container:` — all
+    // four are validated). A slice COMPUTED IN SHELL and written to `$GITHUB_ENV` by an earlier step
+    // is not a declaration, and catching it would mean modelling what a `run:` script does — the
+    // section-#666 line this file does not cross. It is a visible code change in the diff, and the
+    // runner's own runtime contract (count <= listed, exact-set reconciliation) is the backstop for
+    // the ones it can see.
+    const sliceDecls = [];
+    const collectSlice = (node, where) => {
+      if (!node || typeof node !== "object" || Array.isArray(node)) return;
+      const e = node.env;
+      if (!e || typeof e !== "object" || Array.isArray(e)) return;
+      if (Object.prototype.hasOwnProperty.call(e, "BASH_SHARD_SLICE")) {
+        sliceDecls.push([where, String(e.BASH_SHARD_SLICE)]);
+      }
+    };
+    collectSlice(j, "the JOB's env");
+    // ⛔ AND THE JOB'S CONTAINER ENV (#3235 review, P2, measured). `container: { image, env }` is a
+    // fourth `env:`-shaped location that reaches every step of the job; with the step's `env:`
+    // deleted and the slice moved there, a `/12` left 52 of 163 suites unrun at rc 0.
+    collectSlice(j.container, "the job CONTAINER's env");
+    steps.forEach((s, i) => collectSlice(s, `step #${i + 1}'s env`));
+
+    // ── THE JOB BOUND, WHEN ONE IS DECLARED ────────────────────────────────────────────────
+    if (Object.prototype.hasOwnProperty.call(j, "timeout-minutes")) {
+      const raw = j["timeout-minutes"];
+      const jobBound = Number(raw);
+      if (!Number.isFinite(jobBound)) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares a non-numeric timeout-minutes (${JSON.stringify(raw)}) — a bound this guard cannot evaluate is not a bound, and the file's own doctrine is that a workflow this guard cannot read is not a pass; exiting 2`
+        );
+      }
+      // ⛔ EVERY STEP OF A BOUNDED JOB MUST CARRY ITS OWN BOUND. Deleting ONE step bound is the
+      // cheapest way to re-open this whole class: the hang then trips the JOB bound, which is
+      // `cancelled` = NON-RED to the rail, and `auto-file-on-failure` is `if: failure()` so nothing
+      // is even filed. Measured (review cycle 2, mutation A): deleting the shard step's
+      // `timeout-minutes` from this very job left the guard GREEN — and that step is now main's
+      // ONLY red-producing bound, since #3174 removed BASH_SHARDS_BUDGET_SECS.
+      const unbounded = steps
+        .map((s, i) => [i, s])
+        .filter(([, s]) => !s || typeof s !== "object" || !Number.isFinite(Number(s["timeout-minutes"])))
+        .map(([i, s]) => {
+          const what = s && typeof s === "object" ? s.name || s.uses || "(unnamed)" : "(not a mapping)";
+          return `#${i + 1} ${what}`;
+        });
+      if (unbounded.length > 0) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares timeout-minutes ${jobBound} but step(s) ${unbounded.join(
+            ", "
+          )} carry NO finite step bound — a hang in one of them trips the JOB bound, reported 'cancelled' and read NON-RED, so the gate goes quiet instead of red; exiting 2`
+        );
+      }
+      const stepBounds = steps.map((s) => Number(s["timeout-minutes"]));
+      const sum = stepBounds.reduce((a, b) => a + b, 0);
+      if (jobBound <= sum) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares timeout-minutes ${jobBound} but its steps bound ${sum} min in total (${stepBounds.join(" + ")}) — a job-level trip is reported 'cancelled', which the merge rail reads NON-RED, so the non-red conclusion can pre-empt the red step that actually hung; exiting 2`
+        );
+      }
+    }
+
+    // ── THE SLICE EXPRESSION AND THE AXIS IT FEEDS ────────────────────────────────────────
+    // The axis alone is NOT the coverage claim: `BASH_SHARD_SLICE` is `<index>/<count>` and the
+    // runner TRUSTS `count` (it only refuses count > listed). So a stale `/12` over an 8-wide matrix
+    // leaves 4/12 of the list run by nobody while every arm still passes its own reconciliation
+    // (measured, review cycle 2 mutation D → the guard stayed green). The denominator must be
+    // GitHub's own count, which is the only spelling that cannot go stale.
+    sliceDecls.forEach(([where, v]) => checkSliceValue(label, file, id, where, v));
+
+    // ── THE MATRIX IS THE COVERAGE CLAIM, AND IT MUST AGREE WITH THE DENOMINATOR ─────────
+    // A matrix is not automatically a SLICE: only a job that feeds the runner is audited here, so an
+    // unrelated `shard:` axis elsewhere is not refused by a rule it has nothing to do with (review
+    // cycle 2, P2-4).
+    //
+    // ⛔ BUT THE AXIS ALONE IS NOT THE CLAIM — `strategy.job-total` IS THE CARTESIAN PRODUCT OF
+    // EVERY AXIS, so a SECOND axis multiplies the denominator while the `shard:` axis stays N: with
+    // `shard: [1..8]` plus `os: [ubuntu-latest, ubuntu-22.04]`, `job-total` is 16 and slices 9-16 are
+    // run by NO arm while every arm still passes its own set assertion, because each process only
+    // knows its own index (#3235 review, P1, measured — the guard exited 0). Comparing the shard
+    // axis' width to the computed `job-total` is therefore part of the same assertion, not a second
+    // one: `shard:` must BE the matrix (every other axis contributes exactly one combination).
+    // ⛔ AND THE MATRIX SPELLING MAY NOT ROUTE AROUND IT (#3235 review, P2, measured). Gating the
+    // whole block on `Array.isArray(matrix.shard)` skipped it for the identical matrix spelled
+    // `include:` (where `matrix.shard` is `undefined`), so the check is on the JOB feeding a slice
+    // and the spelling is either certifiable or refused — a matrix this guard cannot count is not
+    // a pass.
+    const feedsSlice = callsRunner || sliceDecls.length > 0;
+    const matrix = j.strategy && typeof j.strategy === "object" ? j.strategy.matrix : undefined;
+    if (feedsSlice && matrix !== undefined) {
+      if (!matrix || typeof matrix !== "object" || Array.isArray(matrix)) {
+        refuse(
+          `${label}: job '${id}' in ${file} feeds the shard runner but its strategy.matrix is not a mapping (${JSON.stringify(
+            matrix
+          )}) — this guard cannot say which slices run; exiting 2`
+        );
+      }
+      const axis = matrix.shard;
+      if (!Array.isArray(axis)) {
+        refuse(
+          `${label}: job '${id}' in ${file} feeds the shard runner but its matrix declares no 'shard: [...]' LIST (keys: [${Object.keys(
+            matrix
+          ).join(" ")}]) — BASH_SHARD_SLICE's denominator is strategy.job-total, so the shard axis must be written as a plain list this guard can count; a matrix spelled with 'include:'/'exclude:' (or with no shard axis at all) cannot be certified, and a slice that NO arm runs is a green hole; exiting 2`
+        );
+      }
+      if (axis.length === 0) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares 'shard: []' — a ZERO-ARM matrix creates no jobs at all, so the entire sweep is ungated while this check reports parity, and every axis assertion below is vacuously true at N=0; exiting 2`
+        );
+      }
+      const total = matrixJobTotal(matrix);
+      if (!total.ok) {
+        refuse(
+          `${label}: job '${id}' in ${file} feeds the shard runner but this guard cannot compute strategy.job-total from its matrix (${total.why}) — a count this guard cannot derive is not a coverage proof; exiting 2`
+        );
+      }
+      if (total.value !== axis.length) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares a ${axis.length}-arm 'shard:' axis inside a matrix whose strategy.job-total is ${total.value} — job-total is the product of EVERY axis, so slices ${axis.length + 1}..${total.value} are run by NO arm while every arm still passes its own set assertion (each process only knows its own index); the shard axis must be the matrix; exiting 2`
+        );
+      }
+      const nums = axis.map((v) => Number(v));
+      const want = Array.from({ length: axis.length }, (_, i) => i + 1);
+      const sorted = [...nums].sort((a, b) => a - b);
+      const okSet = sorted.every((v, i) => v === want[i]);
+      if (!okSet) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares matrix 'shard: [${axis.join(
+            ", "
+          )}]' — the axis must be exactly 1..${axis.length}, distinct: BASH_SHARD_SLICE's denominator is strategy.job-total, so a duplicate or a gap leaves a slice that NO arm runs while every arm still passes its own set assertion; exiting 2`
+        );
+      }
+    }
+  }
+}
+
 const prCount = checkLane("PR", PR_WORKFLOW, PR_JOB);
 const mainCount = checkLane("main", MAIN_WORKFLOW, MAIN_JOB);
+checkBounds("PR", PR_WORKFLOW);
+checkBounds("main", MAIN_WORKFLOW);
 const { shards, globs } = checkRunner();
 
 if (rc === 0 && prCount >= 1 && mainCount >= 1) {
