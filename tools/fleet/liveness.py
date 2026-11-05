@@ -1112,13 +1112,6 @@ def _bound_pid_re():
     return _BOUND_PID_RE
 
 
-def _bound_pid_field_re():
-    global _BOUND_PID_FIELD_RE
-    if _BOUND_PID_FIELD_RE is None:
-        _bound_verdict_re()
-    return _BOUND_PID_FIELD_RE
-
-
 def _bound_rc_re():
     global _BOUND_RC_RE
     if _BOUND_RC_RE is None:
@@ -1137,18 +1130,18 @@ def _bound_rc_present_re():
 
 
 def _bound_verdict_re():
-    # ⛔ ALL THREE, DECLARED `global`, ASSIGNED DIRECTLY (review P2). This block lazy-inits the
-    # sibling patterns that `_bound_rc_re` / `_bound_pid_re` consume, so it must bind them in the
-    # MODULE namespace. It used to do that for two of the three through `globals()[...]` while the
-    # third was a plain assignment under a `global _BOUND_VERDICT_RE` declaration — which made
-    # `_BOUND_RC_RE = _re.compile(...)` a LOCAL, compiling the pattern twice and discarding one.
-    # It happened to work only because the `globals()` write came first, so deleting that line as
-    # "redundant with the next one" would have silently broken `_bound_rc_re`'s
-    # `assert _BOUND_RC_RE is not None`. Four entries, one idiom, nothing to trip over.
-    # The fourth (`_BOUND_PID_FIELD_RE`) records that a `pid=` FIELD was present at all, which
-    # `_BOUND_PID_RE` alone cannot distinguish from the field being absent — see
-    # `parse_bound_pid`'s DROP-vs-ADOPT split.
-    global _BOUND_VERDICT_RE, _BOUND_RC_RE, _BOUND_PID_RE, _BOUND_PID_FIELD_RE
+    # ⛔ DECLARED `global`, ASSIGNED DIRECTLY (review P2). This block lazy-inits the sibling
+    # patterns that `_bound_rc_re` / `_bound_pid_re` consume, so it must bind them in the MODULE
+    # namespace. It once did that through `globals()[...]` for the siblings while the verdict
+    # pattern itself was a plain assignment under a `global _BOUND_VERDICT_RE` declaration — which
+    # made `_BOUND_RC_RE = _re.compile(...)` a LOCAL, compiling the pattern twice and discarding
+    # one. It happened to work only because the `globals()` write came first, so deleting that
+    # line as "redundant with the next one" would have silently broken `_bound_rc_re`'s
+    # `assert _BOUND_RC_RE is not None`. Three entries, one idiom, nothing to trip over.
+    # (There is no `_BOUND_PID_FIELD_RE`: a `pid=` field that is PRESENT but unusable is detected
+    # by the TOKEN allow-list in `parse_bound_pid`, which is why `_BOUND_PID_RE` captures `\S*`
+    # rather than `[0-9]+` — and why "present but unusable" and "absent" stay distinguishable.)
+    global _BOUND_VERDICT_RE, _BOUND_RC_RE, _BOUND_PID_RE
     if _BOUND_VERDICT_RE is None:
         import re as _re
         # ⛔ THE VERDICT TOKEN AND THE `rc=` ARE PARSED SEPARATELY, for three reasons
@@ -1168,7 +1161,6 @@ def _bound_verdict_re():
         # thing was interpolated into `reason`; bounding it makes an unreadable status
         # ABSTAIN (`rc=None` -> `finished-rc-unreadable` -> `unknown`), which is the same
         # doctrine the runner line and the census column follow. `na` is kept verbatim.
-        globals()["_BOUND_RC_RE"] = _re.compile(r"\brc=([0-9]{1,10}|na)\b")
         _BOUND_RC_RE = _re.compile(r"\brc=([0-9]{1,10}|na)\b")
         # Presence only (no allow-list) — tells "absent" from "present but unreadable".
         globals()["_BOUND_RC_PRESENT_RE"] = _re.compile(r"\brc=")

@@ -2905,6 +2905,47 @@ def t54():
         shutil.rmtree(d, ignore_errors=True)
 
 
+@test("T55 the masking refusal covers the session axis's ABSTENTIONS, not only its evidence")
+def t55():
+    """⛔ AN ABSTENTION IS EVIDENCE TOO (#1777 B7 on the log axis).
+
+    `ps_ok=False` / `store_ok=False` ARE the session axis answering: they are the
+    `unknown/ps-unreadable` and `unknown/store-unreadable` abstentions. The masking
+    guard listed only the POSITIVE session fields, so a log read resolved over a
+    FAILED read — and because the log axis CAN reach `frozen`, that did not merely
+    mask the abstention, it CONVICTED a lane on evidence it had just discarded.
+
+    ⛔ THIS TEST WAS LOST IN THE #3404 TRAIN REBASE AND IS RE-LANDED HERE AS T55.
+    The train merged the guard into `evaluate` but not into this suite, and the PR's
+    own T50 is the LOG_STATES vocabulary test — so the guard was pinned by nothing and
+    deleting `not ev.ps_ok or not ev.store_ok` left the suite at PASS/FAIL=0.
+    Measured before this test was restored: the guard removed -> PASS=54 FAIL=0.
+    """
+    lr_working = LR(alive=True, size_delta=7, transcript_grew=True, cpu_delta_cs=99,
+                    age_ms=10, window_ms=liv.LOG_WINDOW_MS)
+    lr_frozen = LR(alive=True, size_delta=0, transcript_grew=False, cpu_delta_cs=0,
+                   age_ms=liv.LOG_FREEZE_MS + H, window_ms=liv.LOG_WINDOW_MS)
+
+    # CONTROL FIRST — the guard must not be made non-vacuous by refusing everything.
+    check(liv.evaluate(liv.Evidence(log_read=lr_working)).state == "working",
+          "a log read with NO session evidence still resolves (it is not refused for existing)")
+    check(liv.evaluate(liv.Evidence(log_read=lr_frozen)).state == "frozen",
+          "…including the convicting state, which is legitimate on a CLEAN log-only query")
+
+    for label, e in (
+            ("working + ps_ok=False", liv.Evidence(log_read=lr_working, ps_ok=False)),
+            ("working + store_ok=False", liv.Evidence(log_read=lr_working, store_ok=False)),
+            # The discriminating one: without the fix this returns `frozen`, i.e. the log
+            # axis CONVICTS on the exact reading it discarded.
+            ("frozen + ps_ok=False", liv.Evidence(log_read=lr_frozen, ps_ok=False)),
+            ("frozen + store_ok=False", liv.Evidence(log_read=lr_frozen, store_ok=False)),
+    ):
+        v = liv.evaluate(e)
+        check(v.state == "unknown" and v.reason == "log-read-on-session-query",
+              "a log read over a session ABSTENTION (%s) is refused by name; got %s/%s"
+              % (label, v.state, v.reason))
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -2953,7 +2994,7 @@ MUTATIONS = [
         "read can mask it (the #1777 B7 shape, reconstructed on the new axis)",
     ),
     Mutation(
-        "T50", "module",
+        "T55", "module",
         '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
         '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
         '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
@@ -3328,8 +3369,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T43", "module",
-        '        if _bound_pid_field_re().search(pid_head):\n            return "?"',
-        '        if False:\n            return "?"',
+        '    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
+        '    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else ""',
         "a `pid=` field that is PRESENT but unparseable (a FOREIGN / hand-edited verdict "
         "file, a restored state dir, or a future producer — NOT the shipped writer, which "
         "refuses a non-numeric `--pid`) is collapsed into \"no pid at all\", so the verdict "
@@ -3493,8 +3534,8 @@ MUTATIONS = [
     # its own mutation, since either copy alone produced the same observable state.)
     Mutation(
         "T37", "module",
-        'globals()["_BOUND_RC_RE"] = _re.compile(r"\\brc=([0-9]{1,10}|na)\\b")',
-        'globals()["_BOUND_RC_RE"] = _re.compile(r"\\brc=([0-9]+|na)\\b")',
+        '        _BOUND_RC_RE = _re.compile(r"\\brc=([0-9]{1,10}|na)\\b")',
+        '        _BOUND_RC_RE = _re.compile(r"\\brc=([0-9]+|na)\\b")',
         "an UNBOUNDED rc token matches a runaway value that then reads as a status and "
         "is interpolated whole into the reason",
     ),
