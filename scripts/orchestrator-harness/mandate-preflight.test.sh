@@ -903,6 +903,38 @@ grep -qF '. "$mandate_sh" 2>>"$log"' "$MERGE"; ck $? "…and merge-one.sh does t
 grep -qF '_mp_why="at $_mp_sh is unusable"' "$SPAWN"; ck $? "spawn-gate.sh names WHICH helper is unusable (a constant 'not found' prescribes the wrong remedy: sync vs replace)"
 grep -qF '_mt_why="at $mandate_sh is unusable"' "$MERGE"; ck $? "…and merge-one.sh does too"
 
+# ── E5c: THE REMAINING DIAGNOSTIC HALVES AND THE ONE INSTRUCTION THE LANE READS (#3379 review cycle 22) ─
+# Six more measured-green reverts, all on lines an operator or the LANE actually reads:
+#   * merge-one's `_md_last="$(tail -n 1 "$prompt")"` — the DATUM the idempotence guard compares. Replacing it
+#     with `cat`/`head -n 1` left 197/0 while the arms that claim to cover it pin the COMPARISON, not the
+#     datum: the guard then never matches, so the reviewer seam re-appends its notice on every dispatch and
+#     the brief grows without bound — the "five dispatches, five notices" defect, free on the one seam that
+#     cannot be driven here.
+#   * the NOT-FOUND arm of the reason ternary, on BOTH seams (cycle 21 pinned only its `at … unusable`
+#     sibling). On the un-provisioned box — the population #3377 measured — this is the arm taken, and its
+#     only actionable content is the four search locations.
+#   * the closing line the LANE reads. Inverting "There is NO provisioning path" → "a provisioning path"
+#     left 197/0: the sentence that tells the lane what to do with the absence is the surface this PR exists
+#     to deliver, and nothing could see it flip.
+#   * `mandate_why`'s `${spec#*|}` → `${spec#|}`, which leaks the NAME into the reason field
+#     (`— LANE-BRIEF-PREAMBLE.md|a dispatch brief may open …`) while cycle 18's arms still matched, because
+#     they grep the reason as a SUBSTRING of a string that still contains it.
+#   * the executable branch's `set -u`, which the file's header states as a requirement.
+# Source pins for §E5's stated reason; the last two are source pins because nothing can drive them.
+grep -qF '_md_last="$(tail -n 1 "$prompt" 2>/dev/null)"' "$MERGE"; ck $? "merge-one.sh's idempotence guard compares the brief's LAST LINE (the DATUM was free; pinning the comparison is not pinning it)"
+grep -qF '_mp_why="not found (looked in \$O, this helper'"'"'s dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts)"' "$SPAWN"; ck $? "spawn-gate.sh's NOT-FOUND reason names the FOUR PLACES it looked (the only actionable content on an un-provisioned box)"
+grep -qF '_mt_why="not found (looked in $O,' "$MERGE"; ck $? "…and merge-one.sh's not-found reason keeps its search locations"
+grep -qF 'There is NO provisioning path for these files today' "$HELPER"; ck $? "the block's CLOSING INSTRUCTION still tells the lane there is NO provisioning path (inverting it is a silent wrong instruction on the surface this PR exists to deliver)"
+WHY_FIELD="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_why LANE-BRIEF-PREAMBLE.md' _ "$HELPER" 2>/dev/null)"
+case "$WHY_FIELD" in
+  *'|'*) bad "mandate_why returned the NAME as well as the reason — the field split leaked (a revert of \${spec#*|} to \${spec#|} reads as pinned because the reason is still a substring)" ;;
+  *) case "$WHY_FIELD" in *"READ §0 and §0b"*) ok "mandate_why returns the REASON ALONE, with no '|' and no name prefix (the field split is pinned, not just the substring)" ;; *) bad "mandate_why returned no reason at all" ;; esac ;;
+esac
+# ⛔ AND A GREP FOR `set -u` IS SATISFIED BY THE HEADER COMMENT THAT NAMES IT (#3379 review cycle 22,
+# MEASURED — my first version of this very arm passed on the prose at line 86 while the executable branch's
+# option was deleted). Anchor on the EXECUTED line, indented and alone.
+grep -qE '^[[:space:]]+set -u$' "$HELPER"; ck $? "the EXECUTABLE branch sets -u as the header requires (anchored on the executed line, not on the comment that names it)"
+
 # ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
 # ⛔ CYCLE 1'S ARMS WERE VACUOUS (measured in cycle 2): they grepped for the STRING `MANDATE_PREFLIGHT_SH`,
 # which the explanatory COMMENT above the resolver also contains — so reverting the whole merge-one.sh fix

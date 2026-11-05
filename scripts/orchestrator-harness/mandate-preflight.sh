@@ -395,6 +395,13 @@ mandate_preflight_emit() {
   # appended "BOTH mandated files are now PRESENT and readable on this box" to a brief on a box where they
   # are missing. That is #3377's false claim restored inside the code written to end it. `healthy` is now
   # a POSITIVE determination and it is the only way into that branch; "cannot prove clean" is not clean.
+  # ⛔ `mandate_declaration_readable` IS DELIBERATE, UNREACHABLE DEFENCE AND THAT IS SAID OUT LOUD (#3379
+  # review cycle 22, P3, MEASURED): with the fix in place `mandate_preflight_line` already returns a
+  # non-empty CANNOT-VERIFY block for an unread declaration, so `[ -z "$line" ]` is false there and this leg
+  # cannot be the one that decides. Deleting it leaves the suite green (measured), and that is CORRECT —
+  # it changes no observable behaviour. It stays as a second belt for the renderer, and no arm can pin it
+  # because there is nothing to observe; the legs that DO decide (`! mandate_state_root_undecidable`, the
+  # three collectors) are each pinned.
   healthy=""
   if [ -z "$line" ] && ! mandate_state_root_undecidable && mandate_declaration_readable \
      && [ -z "$(mandate_missing)$(mandate_unreadable)$(mandate_irregular)" ]; then healthy=1; fi
