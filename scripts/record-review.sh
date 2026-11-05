@@ -1310,7 +1310,7 @@ post_marker_comment() { # <repo> <pr> <marker>
       # --recover-body never posts a body at all, --flush-pending runs this function
       # BEFORE its own body post, and both failure arms reach it having failed the
       # body channel. Only the mint path has the body saved. Both failure arms print
-      # their own body-channel message on the line above, so an assertion about the
+      # their own body-channel message on their own lines, so an assertion about the
       # body here contradicted them during exactly the 403 / spent-token window an
       # operator is debugging. Each caller already reports its
       # own body-channel outcome; this line reports ONLY what this function knows.

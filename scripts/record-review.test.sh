@@ -5234,8 +5234,8 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       comment BEFORE the body PATCH, so a keyed marker survives), reported as success —
 #       reached not just by
 #       --flush-pending but by EVERY later minting run. The predicate must match
-#       the gate's line-anchored `^…$` admission, exactly like the three sites the
-#       main change already anchored. ⛔ ASSERTS THE TRANSPORT (a PATCH was issued),
+#       the gate's line-anchored `^…$` admission, exactly like the three sites ALREADY
+#       anchored on main (`:4643`, `:4727`, `:4781`). ⛔ ASSERTS THE TRANSPORT (a PATCH was issued),
 #       not the exit code: the destructive mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
     PEND14F="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424340.marker"
