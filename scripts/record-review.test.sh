@@ -4681,7 +4681,7 @@ fi
 #     on main (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
 #     → :4643, :4727 and :4781), so claiming all three "moved from `grep -qF` to `grep -qxF`"
 #     is FALSE — and a false "we changed this" is how a later reader concludes the
-#     older sites need anchoring too, or that this diff is bigger than it is. What
+#     older sites need anchoring too, or that this diff is bigger than it is.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS (corrected — #3168 re-review finding 6):
 #     the BODY-APPEND site (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`), which is
 #     ALREADY `-qxF` on main (`git show origin/main:scripts/record-review.sh`
