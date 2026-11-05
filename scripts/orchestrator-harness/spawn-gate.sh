@@ -1911,7 +1911,20 @@ lane_end_rescue_caveat() {
 # caller), delivery unestablished, or the marker predates the push.
 lane_end_push_caveat() {
   case "${LANE_END_PUSH:-}" in
-    FAILED|UNAVAILABLE|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
+    # ⛔ `FAILED` MAY NOT SIT IN THE ABSENCE GROUP (review cycle 20, P2). It is assigned from TWO
+    # measurements with opposite meanings: the remote ANSWERED and the ref is ABSENT (the only one that
+    # establishes "not on origin"), and the remote answered holding a DIFFERENT sha — where our
+    # commits may well be on origin (a descendant: a peer push, or a rail merge of them). The `next=` arm
+    # itself splits on `branch_on_origin` for exactly this reason, and this helper re-asserted the claim
+    # that arm had stopped making. Latent today (every MANUAL push verdict returns above the helper's call
+    # sites), which is the hazard a shared helper exists to remove rather than host.
+    FAILED)
+      if [ -n "${LANE_END_ORIGIN:-}" ]; then
+        printf ' — AND the remote holds refs/heads/%s at a DIFFERENT sha (push=FAILED, branch_on_origin=%s), so the commits from this lane did NOT reach that ref; whether they are on some OTHER ref is not measured here, and re-running the rescue does NOT fix it' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ORIGIN}"
+      else
+        printf ' — AND the commit(s) on %s are NOT on origin either (push=FAILED), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}"
+      fi ;;
+    UNAVAILABLE|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
       printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
     verify-unanswered|push-unreported|push-killed)
       printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;

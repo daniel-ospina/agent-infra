@@ -2084,7 +2084,7 @@ git -C "$n44h/wk" worktree remove --force "$n44h/wt" 2>/dev/null
 # the branch appended after "lane log". Two arms were in that state and NO arm asserted the shape of the
 # output — the suite printed the corrupt line and stayed green. This drives the full PUSH x RESCUE matrix
 # and reads the product, so it covers every arm and every future one.
-n45_bad=""
+n45_bad=""; n45_all=""
 for n45_push in pushed nothing running unmeasured detached verify-unanswered push-unreported push-killed \
                 FAILED UNAVAILABLE refused-unknown-default refused-protected refused-main-checkout \
                 refused-pushurl-divergent refused-pushurl-unresolved; do
@@ -2096,16 +2096,47 @@ for n45_push in pushed nothing running unmeasured detached verify-unanswered pus
       LANE_END_PUSH_URL=/srv/repo.git; LANE_END_REF=refs/wip/develop; LANE_END_ORIGIN=deadbeef
       lane_end_next' _ "$GATE" "$n45_push" "$n45_rescue" 2>/dev/null )"
     n45_cell="$n45_push/$n45_rescue"
+    n45_all="$n45_all$n45_out
+"
     # 1. one sentence, not the same sentence twice
     n45_n="$(printf '%s' "$n45_out" | grep -o 'MANUAL' | grep -c . )"
     [ "${n45_n:-0}" -gt 1 ] && n45_bad="$n45_bad $n45_cell(x$n45_n)"
-    # 2. no specifier dropped a URL/path into a REF slot, and none was left unfilled
-    case "$n45_out" in *'refs/heads//'*|*'refs/heads/developdevelop'*|*'origin//'*|*'%s'*) n45_bad="$n45_bad $n45_cell(mangled-ref)" ;; esac
+    # 2. no specifier dropped a URL/path into a REF slot, and none was left unfilled.
+    # ⛔ AN UNFILLED SPECIFIER IS INVISIBLE TO A `%s` SEARCH (review cycle 20, P2 — MEASURED). bash fills a
+    # MISSING argument with the EMPTY string and warns about nothing: `printf 'a %s b %s\n' one` prints
+    # `a one b `. So the surplus-argument defect this arm was written for is caught by the MANUAL count
+    # below, while the OPPOSITE defect — an argument deleted from the list — is caught by nothing: measured
+    # on a mutant with the branch argument deleted from `push-unreported`, the durable sentence reads
+    # `…--heads /srv/repo.git refs/heads/ answers` and, with a rescue value, splices the caveat INTO the
+    # command the reader is told to run — while the `%s` and `refs/heads//` patterns both stay silent.
+    # The empty-slot shapes are therefore asserted EXPLICITLY, for each of the three interpolated slots
+    # (the ref, the url, the root).
+    # ⛔ AND THE ASSERTION IS POSITIVE, NOT A HUNT FOR ONE MANGLED PHRASE (review cycle 20, P2 — MEASURED).
+    # A negative list misses shapes nobody enumerated: with the branch argument deleted, the empty slot
+    # renders as `refs/heads/` immediately before a BACKTICK, which `refs/heads/ ` (with a space) does not
+    # match — the arm stayed green on exactly the defect it was extended to catch. So each interpolated
+    # slot must carry its VALUE: if the sentence names a ref at all it must name `refs/heads/develop`, if
+    # it names a remote read it must name the url the cell set, and if it says `reap` it must say the root.
+    # An empty slot, a URL in the ref slot, and a doubled value all fail these, in any future wording.
+    case "$n45_out" in *'refs/heads/'*) case "$n45_out" in *'refs/heads/develop'*) : ;; *) n45_bad="$n45_bad $n45_cell(ref-slot)" ;; esac ;; esac
+    case "$n45_out" in *'--heads '*) case "$n45_out" in *'--heads /srv/repo.git'*) : ;; *) n45_bad="$n45_bad $n45_cell(url-slot)" ;; esac ;; esac
+    # The root legitimately appears as "reap IT" in several arms, so a positive substitution is WRONG here
+    # (it reds a correct sentence). An EMPTY slot is what must not happen, and empty is only ever
+    # visible as the field running into a space or a backtick.
+    case "$n45_out" in *'reap  '*|*'reap `'*) n45_bad="$n45_bad $n45_cell(root-slot)" ;; esac
+    case "$n45_out" in *'%s'*) n45_bad="$n45_bad $n45_cell(unfilled-specifier)" ;; esac
     # 3. a push verdict's caveat may not print an EMPTY verdict (`push=` with nothing after it)
     case "$n45_out" in *'push=)'*|*'push=,'*|*'push= '*) n45_bad="$n45_bad $n45_cell(empty-verdict)" ;; esac
   done
 done
 ck "N45 every push x rescue cell produces ONE well-formed next= sentence — no duplicated sentence, no URL in a ref slot, no unfilled specifier [bad:${n45_bad:-none}]" "$([ -z "$n45_bad" ] && echo 0 || echo 1)"
+# ⛔ N45b — AND THE MATRIX MUST NOT BE VACUOUS (review cycle 20, P2). An arm that drives 75 cells which
+# all fall into ONE sentence proves nothing about the other arms. The distinct-sentence count is the
+# non-vacuity floor: below it, a verdict has stopped reaching its own arm (a reorder, or a missing case).
+n45_bad2=0
+n45_distinct="$(printf '%s\n' "$n45_all" 2>/dev/null | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
+[ "${n45_distinct:-0}" -ge 6 ] || n45_bad2=1
+ck "N45b …and the matrix really reaches distinct arms (${n45_distinct:-0} distinct next= sentences, floor 6) — a floor below 1 would make N45 vacuous" $n45_bad2
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
