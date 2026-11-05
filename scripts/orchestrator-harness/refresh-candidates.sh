@@ -4015,11 +4015,14 @@ queue_order_from_pool() {
     # a zero here need not be OUR zero. "The queue is EMPTY" is a claim about candidates.txt, so it is
     # only said when candidates.txt IS empty — otherwise the count is foreign, the ORDER this pass
     # installed stands, and the counts are UNKNOWN.
-    if [ -s "$o/candidates.txt" ]; then
-      QUEUE_ORDER_STATE="severity-uncounted"
-      echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank says 0 queued while candidates.txt holds $(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ') row(s), so that count is NOT this queue's (a concurrent pass wrote its own) and both the totals and whether the pool ranked ANY are UNKNOWN (this is NOT a drained queue)"
-      return 0
-    fi
+    # ⛔ NO `candidates.txt` GUARD HERE — IT COULD NEVER FIRE (review P2, cycle 14). A version of this arm
+    # tested `[ -s "$o/candidates.txt" ]` to keep a foreign `0 0` from being read as "the queue is EMPTY"
+    # over rows this pass had installed. Measured: it is unreachable and deleting it changes nothing.
+    # `_rows_now` is `awk END{print NR+0}` over that same file, so reaching `_r = _u = 0` already implies
+    # the totals cross-check read `_rows_now` as 0; a candidates.txt holding rows would have failed
+    # `_r + _u != _rows_now` and returned above, and an unreadable one is caught by the `-z "$_rows_now"`
+    # arm. So that state is covered by THE TOTALS CHECK, which is the guard to redden in a test — not by
+    # a shape test here. (Kept as a named absence: an enforcer that can never fire is worse than none.)
     QUEUE_ORDER_STATE="empty"
     echo "[refresh] queue order: the queue is EMPTY — there is nothing to order"
     return 0

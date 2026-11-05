@@ -38,8 +38,12 @@
 #      would otherwise derive it — so without check 12 the floor's head could be chosen by a sequence the
 #      pass no longer maintains (order only; the row set is compared, never changed).
 #   6. The WIRING: both call sites exist and both follow the definitions, so the reorder cannot go inert
-#      the way the first cut of this change did (defined after the skip arm's call site, line ~1337
-#      apart — `command not found`, absorbed).
+#      the way the first cut of this change did. ⛔ THAT DEFECT IS STATED BACKWARDS IF IT SAYS "defined
+#      after the call site": measured on `70ea113c`, `rank_queue_by_pool()` was at 3709,
+#      `queue_order_from_pool()` at 3742, and the skip-arm call at 3810 — i.e. ~68 lines ABOVE it, not
+#      below. What actually broke was that both definitions sat OUTSIDE the region `selftest.sh` drives,
+#      so that drive invoked an undefined command (`command not found`, absorbed). (~1,337 is the
+#      definition→MAIN-call distance, a different number, and it is not the one that matters here.)
 #
 # HOW THE CHECKS ARE WRITTEN. Every check drives the SHIPPED functions, extracted from
 # `refresh-candidates.sh` itself — never a re-implementation, which would pass just as well on the
@@ -920,6 +924,11 @@ ck "a MALFORMED count field is refused by the strict re-parse, never laundered t
 # count, so the strict parse cannot tell whose it is — and the pass then reported a MEASURED "the queue is
 # EMPTY" over the two rows it had just installed. The claim is now grounded in the artefact: EMPTY is said
 # only when candidates.txt IS empty.
+# ⛔ NAME THE GUARD THAT ACTUALLY FIRES (review P2, cycle 14). This fixture is caught by the TOTALS
+# cross-check, not by a `candidates.txt` test: `_r = _u = 0` against a 2-row queue fails `_r + _u ==
+# _rows_now` FIRST, so the `0 0` branch is never even reached. Stated because a later reader of this
+# fixture would otherwise believe a queue-shape guard protects it, and editing the totals check would
+# then neither redden this test nor be caught by the thing it appears to rely on.
 count_race foreign-zero 'printf "0 0 -\n" > "$QRO/.queue-rank"'
 if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' \
    && printf '%s' "$CROUT" | grep -q "NOT this queue's"; then rc=0
