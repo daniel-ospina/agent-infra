@@ -965,6 +965,72 @@ case "$OUT_DRIVE" in
   *"DEPTH of the queue could not be measured"*) ok "depth-unknown: the line names the depth as unmeasured" ;;
   *) bad "depth-unknown: the line does not say the depth is unknown — $OUT_DRIVE" ;;
 esac
+
+# ── 4a2b) THE CLAUSE ABOUT THE PASS IS READ FROM THE RECORD (review P2, cycle 18) ──
+# One sentence asserted "the last refresh pass … failed to read it" for EVERY no-depth shape. The writer
+# publishes FOUR, and two of them mean opposite things while carrying identical `backlog=UNKNOWN` +
+# empty `handed=`: the queue could NOT be read, and the queue WAS read but neither DEPTH nor HEAD could
+# be measured. `queue_readable=` is the only field that separates them.
+_pass_clause() {   # $1 = record body (beyond the common header) → the printed line
+  mk_case ok-passclause
+  mk_tool_clean "$D"
+  printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$D/bin/wc"; chmod +x "$D/bin/wc"
+  mkdir -p "$D/o/state"
+  { printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=0\n' "$(date +%s)"
+    printf '%b' "$1"; } > "$D/o/state/refresh-last"
+  O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1
+  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+}
+_drive_pass_clause() { OUT_PC="$(_pass_clause "$1")"; }
+
+# (a) the pass READ the queue and recorded the head it handed: say so, and name the head
+_drive_pass_clause 'backlog=UNKNOWN\nhanded=300\nqueue_readable=1\n'
+case "$OUT_PC" in
+  *"READ the queue (it recorded head #300)"*) ok "pass-clause: a record that proves the pass read the queue (+head) is reported as READ" ;;
+  *) bad "pass-clause: a read-with-head record was not reported as READ — $OUT_PC" ;;
+esac
+# (b) the pass could NOT read the queue: the ONLY shape that may say so
+_drive_pass_clause 'backlog=UNKNOWN\nhanded=\nqueue_readable=0\n'
+case "$OUT_PC" in
+  *"also could NOT read the queue"*) ok "pass-clause: a record whose witness says unreadable is reported as NOT read" ;;
+  *) bad "pass-clause: an unreadable record was not reported as such — $OUT_PC" ;;
+esac
+# (c) THE SHAPE THAT SHIPPED WRONG: readable, but neither depth nor head measured — must NOT say "could not read"
+_drive_pass_clause 'backlog=UNKNOWN\nhanded=\nqueue_readable=1\n'
+case "$OUT_PC" in
+  *"could NOT read the queue"*|*"failed to read"*) bad "pass-clause: a record whose witness says the queue WAS read was reported as unreadable — $OUT_PC" ;;
+  *"READ the queue but measured neither its DEPTH nor a head"*) ok "pass-clause: a readable-but-unmeasured record is reported as READ, not unreadable" ;;
+  *) bad "pass-clause: a readable-but-unmeasured record got no accurate clause — $OUT_PC" ;;
+esac
+# (d) a record predating the witness: claim only what it carries
+_drive_pass_clause 'handed=\n'
+case "$OUT_PC" in
+  *"could NOT read the queue"*|*"failed to read"*|*"states no depth at all"*) bad "pass-clause: a witness-less record licensed a clause it cannot support — $OUT_PC" ;;
+  *"carries no measured depth and no head"*) ok "pass-clause: a witness-less record claims only the absence it actually carries" ;;
+  *) bad "pass-clause: a witness-less record got no accurate clause — $OUT_PC" ;;
+esac
+
+# NON-VACUITY: the pre-fix typed clause reddens (b),(c),(d) — one sentence for four shapes.
+FNSC="$T/origination-fns-typedclause.sh"
+# the pre-fix shape: NO branch at all, one typed sentence for every record
+awk 'BEGIN{done=0} /^        # A measured HEAD outranks the witness/ && !done {print "        _pass_said=\"the last refresh pass failed to read it\""; done=1; skip=1; next} skip==1 {if ($0 ~ /^        fi$/) {skip=0; next} next} {print}' "$FNS" > "$FNSC" 2>/dev/null
+if cmp -s "$FNS" "$FNSC" 2>/dev/null; then bad "pass-clause: the typed-clause mutation did not apply — the awk anchor drifted"
+else
+  _pc_mut() {
+    mk_case ok-passclause-m
+    mk_tool_clean "$D"
+    printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$D/bin/wc"; chmod +x "$D/bin/wc"
+    mkdir -p "$D/o/state"
+    { printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=0\n' "$(date +%s)"
+      printf '%b' "$1"; } > "$D/o/state/refresh-last"
+    O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSC" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1
+    chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+  }
+  if _pc_mut 'backlog=UNKNOWN\nhanded=\nqueue_readable=1\n' | grep -q "failed to read it"; then ok "pass-clause: non-vacuity — the pre-fix typed clause returns, and reddens the readable shape"
+  else bad "pass-clause: the reverted clause did not reproduce the defect — the mutation is not exercising the branch"; fi
+fi
 # NON-VACUITY: the pre-fix fail-open — a failed depth read COERCED to 0, and the record's UNKNOWN ignored.
 FNSM="$T/origination-fns-coerce.sh"
 sed -e 's/^      '"''"'|\*\[!0-9\]\*) _bl_state="UNKNOWN" ;;$/      '"''"'|*[!0-9]*) backlog=0; _bl_state="READ" ;;/' \
@@ -2099,17 +2165,49 @@ echo
 # `set -u` is NOT inherited by a child `bash -c`, so a driver without it reports an unbound reference in
 # the graded arms GREEN while production aborts (rc=1, KeepAlive loop — this file's own `dispatch_funnel`
 # note records exactly that crash). The sibling suites hold this invariant; this one did not.
-_drv_total=0; _drv_unpinned=""
-while IFS= read -r _line; do
-  case "$_line" in *"bash -c"*) : ;; *) continue ;; esac
-  case "$_line" in *"dispatch_gate_line"*|*"dispatch_funnel"*) : ;; *) continue ;; esac
-  # the unbound-probe driver below is deliberately run BOTH ways — it is the mutation, not a fixture
-  case "$_line" in *"FNS_P"*) continue ;; esac
-  _drv_total=$(( _drv_total + 1 ))
-  case "$_line" in *"bash -c 'set -u;"*) : ;; *) _drv_unpinned="$_drv_unpinned line${_drv_total}" ;; esac
-done < "$0"
-if [ "$_drv_total" -ge 10 ] && [ -z "$_drv_unpinned" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked)"
-else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}); checked $_drv_total — an unbound reference in a graded arm is fatal in production and invisible here"; fi
+# ⛔ THE SCAN IS A FUNCTION OF A FILE, so the mutation below is graded by the SAME code that grades the
+# real suite — running the mutant as a nested suite would re-enter this section and recurse forever.
+_drv_scan() {   # $1 = file to scan → sets _drv_total, _drv_unpinned
+  local _file="$1" _rest _pay _args
+  _drv_total=0; _drv_unpinned=""
+  _rest="$(sed -n '1,/THE DRIVERS RUN IN THE MODE/p' "$_file")"
+  while :; do
+    case "$_rest" in *"bash -c"*) : ;; *) break ;; esac
+    _rest="${_rest#*bash -c}"
+    case "$_rest" in *"' _ "*) : ;; *) break ;; esac
+    _pay="${_rest%%"' _ "*}"
+    _args="${_rest#*"' _ "}"; _args="${_args%%$'\n'*}"
+    _rest="${_rest#*"' _ "}"
+    case "$_pay" in *dispatch_gate_line*|*dispatch_funnel*) : ;; *) continue ;; esac
+    # the unbound-probe driver below is deliberately run BOTH ways — it is the mutation, not a fixture
+    case "$_args" in *"FNS_P"*) continue ;; esac
+    _drv_total=$(( _drv_total + 1 ))
+    case "$_pay" in *"set -u;"*) : ;; *) _drv_unpinned="$_drv_unpinned #${_drv_total}" ;; esac
+  done
+}
+# ⛔ THE PAYLOAD IS WHAT IS BETWEEN THE QUOTES, not everything up to the next `bash -c` — otherwise a
+# non-driver call (`refresh_on_exit`, `refresh_can_record`) is credited with the `dispatch_*` call that
+# merely appears LATER in the file, and the population drifts for the wrong reason. The scan is bounded to
+# the FIXTURE region, because this section's own text (and the mutant's grep pattern) contain `bash -c`.
+# The population is pinned to a COUNT rather than floored: a line-based scan with a floor let a driver
+# evaded it simply by being REFORMATTED across two lines, which is the defect this section exists to
+# catch (review P3, cycle 18).
+_drv_expect=14
+_drv_scan "$0"
+if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked, count pinned)"
+else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}) or a population of $_drv_total where $_drv_expect are declared — a driver that skips the prologue, or leaves the population, is invisible here"; fi
+# NON-VACUITY: delete the prologue from ONE driver and break its command over two lines — the shape that
+# defeated the line-based scan must now be caught, by this same scan.
+_drv_m="$T/suite-driver-mutant.sh"
+awk 'BEGIN{done=0} !done && /bash -c .set -u; .*dispatch_gate_line/ {sub(/set -u; /, ""); print; print ""; done=1; next} {print}' "$0" > "$_drv_m" 2>/dev/null
+if cmp -s "$0" "$_drv_m" 2>/dev/null; then bad "drivers: the stripped-prologue mutation did not apply — the awk anchor drifted"
+else
+  _drv_saved_total="$_drv_total"; _drv_saved_unpin="$_drv_unpinned"
+  _drv_scan "$_drv_m"
+  if [ -n "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "drivers: non-vacuity — a prologue-stripped driver is caught by the joined scan ($_drv_unpinned)"
+  else bad "drivers: a driver stripped of \`set -u\` still passed the pin (total=$_drv_total unpinned='${_drv_unpinned:-none}')"; fi
+  _drv_total="$_drv_saved_total"; _drv_unpinned="$_drv_saved_unpin"
+fi
 # NON-VACUITY: an unbound reference in a graded arm must be VISIBLE to this suite. Inject one and drive it
 # both ways — with the prologue it aborts (what production would do), without it the arm reports green.
 FNS_P="$T/origination-fns-unbound.sh"
