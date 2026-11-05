@@ -655,6 +655,17 @@ if want_url and url != want_url:
     if not _su or _su.group(1).lower() not in ("http", "https"):
         print("BADURL:%s" % url)
         sys.exit(1)
+    # ⛔ USERINFO IN THE AUTHORITY IS NOT A SELF-HOST, IT IS A SPOOF SPELLING (#3374 review P1). The
+    # real host is the part AFTER the `@` — `https://api.premiselabs.co@evil.example/mcp/` is
+    # **evil.example** — and this branch used to certify it `SELFHOSTED:` with the entry's
+    # `Bearer ${TORTOISE_MCP_API_KEY}` still attached, i.e. LAYER VERIFIED over the tenant key going to
+    # an attacker's host. It is also NOT a config that works: the client cannot even build a request
+    # from a url with credentials (`new Request('http://u:p@h/')` throws "Request cannot be constructed
+    # from a URL that includes credentials"). `merge-mcp.py`'s `usable()` refuses the same shape, so
+    # the repair REPLACES it — verify and install must not disagree in either direction.
+    if re.match(r"^[a-z][a-z0-9+.\-]*://[^/?#]*@", url or "", re.I):
+        print("USERINFO:%s" % url)
+        sys.exit(1)
     # A self-hosted entry is certified BY NAME, and its own transport spelling is part of what the
     # operator chose: the client selects StreamableHTTP from `url` alone and never reads `type`, so
     # refusing `sse` here would refuse a config that WORKS (and that install preserves on purpose).
@@ -703,6 +714,8 @@ PY
         fail ".mcp.json's tortoise url is a ${out#URLTYPE:}, not a string — nothing can be resolved from it, so nothing can be certified (a re-install replaces the entry)" ;;
       BADURL:*)
         fail ".mcp.json's tortoise entry is marked _selfHosted but its url (${out#BADURL:}) is not an absolute http(s) url — the client builds a transport from it, so this cell points at nothing. Write the full url (e.g. http://localhost:8000/mcp)" ;;
+      USERINFO:*)
+        fail ".mcp.json's tortoise url (${out#USERINFO:}) carries USERINFO in its authority — the host that answers is the part AFTER '@', so an entry spelled like the hosted endpoint with '@evil.example' after it sends \${TORTOISE_MCP_API_KEY} to evil.example. The client cannot even build a request from a url with credentials. Write a plain url and keep the key in \$HOME/keys.env" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)

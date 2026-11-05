@@ -88,6 +88,14 @@ HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$
 # re-write a config it then refuses, forever, saying nothing.
 TOKEN = re.compile(r"\b(t[tk])_[A-Za-z0-9]{10,}")
 
+# The ONE parse of a url's `host[:port]`, for the three predicates that must agree about it
+# (`host_of`, `authority_of`, and — through `authority_of` — `near_miss`). Groups: 1 = host (an IPv6
+# literal keeps its brackets and is therefore ONE token), 2 = port (None when absent, `""` when the
+# url spells a bare `host:`).
+_URL_PARTS = re.compile(
+    r"^[a-z][a-z0-9+.\-]*://(?:[^/?#]*@)?(\[[^\]]*\]|[^/?#:]*)(?::(\d*))?", re.I
+)
+
 
 def token_path(node, trail=""):
     """Path of the first literal-looking credential inside `node`, or "" (mirrors the verifier)."""
@@ -116,9 +124,30 @@ def host_of(url):
     entry's `Bearer ${TORTOISE_MCP_API_KEY}` went to the attacker's host with this repo's blessing.
     Two predicates in one file disagreeing about what "the host" is, is the defect; this is the one
     definition (#3374 review P1).
+
+    ⛔ AN IPv6 LITERAL IS ONE TOKEN: `[::1]` and `[::2]` must not both read as `[`, which is what a
+    `[^/?#:]*` host class did — it stops at the first colon INSIDE the brackets, so every IPv6
+    address collapsed to the same string and any comparison built on this would have called two
+    distinct hosts equal (#3374 review P2).
     """
-    m = re.match(r"^[a-z][a-z0-9+.\-]*://(?:[^/?#]*@)?([^/?#:]*)", url or "", re.I)
+    m = _URL_PARTS.match(url or "")
     return m.group(1).lower() if m else ""
+
+
+def authority_of(url):
+    """`host[:port]` — RFC 3986's authority with the userinfo removed.
+
+    ⛔ THIS IS THE COMPARAND `near_miss` NEEDS, AND `host_of` ALONE IS NOT IT. Dropping the port made
+    `https://api.premiselabs.co:8443/mcp/` — an operator's OWN daemon on a non-default port — compare
+    equal to the hosted default and get REPLACED as "a typo", which it is not: the port is part of the
+    endpoint. A self-host differing only by port is preserved and named, exactly as it was before the
+    userinfo fix (#3374 review P2 — a regression that fix introduced).
+    """
+    m = _URL_PARTS.match(url or "")
+    if not m:
+        return ""
+    port = m.group(2)
+    return (m.group(1) + (":" + port if port is not None else "")).lower()
 
 
 def near_miss(url, want_url):
@@ -129,19 +158,19 @@ def near_miss(url, want_url):
     the box points at an endpoint nobody meant to configure.
 
     ⛔ THE SCHEME IS PART OF THE SPELLING **AND IT IS DELIBERATELY NOT COMPARED** — the comparison
-    below is on the AUTHORITY ALONE (`host()` drops the scheme), so `http://host/mcp` and
-    `https://host/mcp` are the SAME spelling: a near-miss of the default, which is REPLACED by it.
-    That is what keeps a scheme-only typo OUT of the `_selfHosted` exemption — the exemption
-    `--verify` honours, on an entry that carries a live `Bearer ${TORTOISE_MCP_API_KEY}`, so
-    `http://api.premiselabs.co/mcp/` marked `_selfHosted` would go on to meet the verifier's own
-    https floor with the key on a cleartext transport (`--verify` refuses it as INSECURE_URL, which
-    is the second line of defence, not the first). ⛔ DO NOT "FIX" THIS BY COMPARING THE SCHEME:
-    a scheme-sensitive comparison makes the cleartext spelling a DIFFERENT url, i.e. a self-host to
-    preserve and mark — the exact direction this function exists to refuse.
+    below is on the AUTHORITY ALONE (`authority_of()` drops the scheme AND any userinfo, and KEEPS the
+    port), so `http://host/mcp` and `https://host/mcp` are the SAME spelling: a near-miss of the
+    default, which is REPLACED by it. That is what keeps a scheme-only typo OUT of the `_selfHosted`
+    exemption — the exemption `--verify` honours, on an entry that carries a live
+    `Bearer ${TORTOISE_MCP_API_KEY}`, so `http://api.premiselabs.co/mcp/` marked `_selfHosted` would go
+    on to meet the verifier's own https floor with the key on a cleartext transport (`--verify` refuses
+    it as INSECURE_URL, which is the second line of defence, not the first). ⛔ DO NOT "FIX" THIS BY
+    COMPARING THE SCHEME: a scheme-sensitive comparison makes the cleartext spelling a DIFFERENT url,
+    i.e. a self-host to preserve and mark — the exact direction this function exists to refuse.
     """
     if not url or not want_url or url == want_url:
         return False
-    uh, wh = host_of(url), host_of(want_url)
+    uh, wh = authority_of(url), authority_of(want_url)
     return bool(wh) and uh == wh
 
 
@@ -227,17 +256,24 @@ def _keep_backup(path):
     forbid. Best-effort and LOUD on failure: a backup that cannot be written must not turn the
     repair path back into the thing that cannot converge. The destination's mode is carried over, so
     a credential-adjacent file does not get WIDER by being backed up.
+    ⛔ THE PORT IS PART OF THE ENDPOINT, AND THE MESSAGE MUST NAME THE FILE THAT EXISTS. `_keep_backup`
+    writes beside the RESOLVED path (a dotfiles-SYMLINKED `.mcp.json` is the common case this branch
+    exists for), so printing `<dst>.bak` sent the operator to a path with nothing in it while the
+    bytes sat beside the symlink's target (#3374 review P2). The return value is where they went.
     """
     import shutil
     real = os.path.realpath(path)
     if not os.path.exists(real):
-        return
+        return ""
+    dst = real + ".bak"
     try:
-        shutil.copy2(real, real + ".bak")
+        shutil.copy2(real, dst)
         if os.path.exists(real):
-            os.chmod(real + ".bak", stat.S_IMODE(os.stat(real).st_mode))
+            os.chmod(dst, stat.S_IMODE(os.stat(real).st_mode))
     except OSError as exc:                        # pragma: no cover — environment-dependent
         sys.stderr.write("WARNING: could not back up %s (%s) — continuing the repair\n" % (path, exc))
+        return ""
+    return dst
 
 
 def credential_in_the_clear(url):
@@ -395,12 +431,25 @@ def main(argv):
             dst = json.load(open(dst_path))
         except ValueError as exc:
             print(
-                "NOTE: REPLACED an UNPARSEABLE .mcp.json (%s: %s); the previous file was saved as %s.bak"
-                % (type(exc).__name__, exc, dst_path)
+                "NOTE: REPLACED an UNPARSEABLE .mcp.json (%s: %s); the previous file was saved as %s"
+                % (type(exc).__name__, exc, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
             )
-            _keep_backup(dst_path)
             dst = {}
-    base = tpl.get("mcpServers") or {}
+    # ⛔ A TEMPLATE THAT PARSES BUT IS THE WRONG **SHAPE** WAS STILL A TRACEBACK. Guarding `json.load`
+    # alone left `tpl.get` on a list (or `base.get` on a non-object `mcpServers`) raising straight out
+    # of `main` — rc=1 and Python internals, the very contract the guard above declares closed. A
+    # shape this file cannot read is the same answer as a file it cannot parse: NAMED, exit 3 (#3374
+    # review P2).
+    base = tpl.get("mcpServers") if isinstance(tpl, dict) else None
+    if base is None:
+        base = {}
+    if not isinstance(tpl, dict) or not isinstance(base, dict):
+        sys.stderr.write(
+            "FATAL: the template %s is not a config this file can read (root is %s, `mcpServers` is %s "
+            "— both must be JSON objects)\n"
+            % (tpl_path, type(tpl).__name__, type(base).__name__)
+        )
+        return 3
     want = base.get("tortoise")
     if not isinstance(want, dict) or not want.get("url"):
         sys.stderr.write("FATAL: %s declares no usable tortoise entry\n" % tpl_path)
@@ -416,20 +465,18 @@ def main(argv):
     # nothing can parse is not a config, but it may be hand-written work someone wants back.
     if not isinstance(dst, dict):
         print(
-            "NOTE: REPLACED a %s .mcp.json ROOT (not a JSON object); the previous file was saved as %s.bak"
-            % (type(dst).__name__, dst_path)
+            "NOTE: REPLACED a %s .mcp.json ROOT (not a JSON object); the previous file was saved as %s"
+            % (type(dst).__name__, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
         )
-        _keep_backup(dst_path)
         dst = {}
     servers = dst.get("mcpServers")
     if servers is None:
         servers = {}
     if not isinstance(servers, dict):
         print(
-            "NOTE: REPLACED a %s `mcpServers` (not a JSON object); the previous file was saved as %s.bak"
-            % (type(servers).__name__, dst_path)
+            "NOTE: REPLACED a %s `mcpServers` (not a JSON object); the previous file was saved as %s"
+            % (type(servers).__name__, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
         )
-        _keep_backup(dst_path)
         have = {}
     else:
         have = dict(servers)
@@ -559,9 +606,9 @@ def main(argv):
             # (#3374 review P2).
             print(
                 "NOTE: REPLACED a %s tortoise entry (not a JSON object) with the hosted http entry; "
-                "the previous file was saved as %s.bak" % (type(cur).__name__, dst_path)
+                "the previous file was saved as %s"
+                % (type(cur).__name__, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
             )
-            _keep_backup(dst_path)
         have["tortoise"] = want
 
     # 4. which of the template's other servers to install
