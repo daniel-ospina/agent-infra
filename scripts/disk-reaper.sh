@@ -2365,7 +2365,7 @@ rw_df_targets() {
 }
 
 reap_runner_work() {
-    local out rc line path size why cands="" rows="" all_c=0 freed=0 raw=0 MEASURED=1 rec=""
+    local out rc line path size why cands="" rows="" all_c=0 freed=0 raw=0 MEASURED=1 rec="" RW_FREED_UNATTRIB=0 _rw_dfdesc=""
     local tgt before after d _rw_line="" _rw_cand="" _rw_roots="" _rw_census="" _rw_reaped=""
     local _rw_retained="" _rw_failed="" _rw_kept="" _rw_why="" _rw_unmeasurable="" _rw_retained_names=""
     if [ -z "$RUNNER_WORK_REAPER_PATH" ]; then
@@ -2546,6 +2546,14 @@ reap_runner_work() {
             _rw_why="CUT SHORT (rc=$rc): reap-runner-work.sh never answered reaped=, so what it removed is UNMEASURED"
             [ "$raw" != 0 ] && _rw_why="$_rw_why — the ${raw}MB df change MAY BE ITS OWN (unattributed; this is NOT proof another process caused it)"
             NOTE_RW="${NOTE_RW}${NOTE_RW:+; }$_rw_why"
+            # ⛔ AND THE BYTES ARE UNATTRIBUTABLE, NOT ZERO (#3057 review, P2). `reaped_runner_work=?` alone
+            # was not enough: this arm still published `freed=0` under `DF_RW_OK=$MEASURED`, so the record read
+            # `freed_mb_runner_work=0` — a MEASURED zero — for a sweep that really did delete an entry and
+            # whose `df` delta may well be its own. The note was then the only place that admitted the figure
+            # was unknown, and `freed_mb_unmeasured` (which the pass total and the under-reclaim sum read)
+            # stayed empty. MEASURED before the flag: a stub owner removes 20 MB and exits 124 ⇒
+            # `freed_mb=0  freed_mb_unmeasured=  freed_mb_runner_work=0  reaped_runner_work=?`.
+            RW_FREED_UNATTRIB=1
         fi
         freed=0
     fi
@@ -2569,6 +2577,10 @@ reap_runner_work() {
             [ "$RW_PARTIAL" = 1 ] && VERDICT_RW="partial" ;;
     esac
     DF_RW_OK="$MEASURED"; RAW_RW="$raw"
+    # ⛔ AN UNANSWERED LEDGER LEAVES THE CLASS'S FIGURE UNATTRIBUTABLE, so it is `unmeasured` and not a 0.
+    # `_rc` renders `unmeasured`, and `freed_mb_unmeasured` then NAMES runner-work so no reader — and no
+    # under-reclaim sum — inherits a fabricated zero from a pass that deleted something it could not count.
+    [ "${RW_FREED_UNATTRIB:-0}" = 1 ] && DF_RW_OK=0
     if is_dry; then FREED_RW=0; else FREED_RW="$freed"; fi
     # The owner's `candidates=` is the count; the `REAP` rows carry the BYTES, so they are scanned for the
     # would-free figure and the named list. ⛔ A row whose size the owner could not measure (`?`) is still
@@ -2616,7 +2628,15 @@ reap_runner_work() {
         if [ "${DF_RW_OK:-0}" = 1 ]; then
             log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=${FREED_RW}MB df_raw=${RAW_RW}MB (df delta) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_REAPED" "$REAPED_RW") gone=$(_tally_num "$HAVE_RW_GONE" "$GONE_RW") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
         else
-            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=unmeasured df_raw=? (df could not answer — this is NOT a measured zero) candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_REAPED" "$REAPED_RW") gone=$(_tally_num "$HAVE_RW_GONE" "$GONE_RW") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
+            # ⛔ TWO DIFFERENT REASONS, never one sentence for both: `df` COULD NOT ANSWER, versus `df`
+            # answered and the ledger is what is missing. The second is the CUT-SHORT arm, where blaming
+            # `df` would be a false cause with a wasted remedy (#3057 review, P2).
+            if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then
+                _rw_dfdesc="df_raw=${RAW_RW}MB (df ANSWERED, but the owner never did — the delta is NOT ATTRIBUTABLE, so none of it is reported as a measured zero)"
+            else
+                _rw_dfdesc="df_raw=? (df could not answer — this is NOT a measured zero)"
+            fi
+            log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=apply freed_df=unmeasured $_rw_dfdesc candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") reaped=$(_tally_num "$HAVE_RW_REAPED" "$REAPED_RW") gone=$(_tally_num "$HAVE_RW_GONE" "$GONE_RW") retained=${_rw_retained:-?} unmeasurable=$RW_UNMEAS min_age=${RUNNER_MIN_AGE}s roots=${_rw_roots:-?}"
         fi
     fi
     return 0
