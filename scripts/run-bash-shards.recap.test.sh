@@ -77,16 +77,27 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 # whose list is three entries long. Dropped here, PRINTED so a lane reading the job log can see the
 # value was dropped on purpose instead of wondering why a slice did nothing.
 #
-# ⛔ AND IT IS NOT THE ONLY NAME THAT LEAKS — this line must clear the runner's WHOLE env contract,
+# ⛔ AND IT IS NOT THE ONLY NAME THAT LEAKS — this line clears the runner's WHOLE env contract,
 # not just the one that reddened first (review of this change, cycle 2, P1). The two lanes export
 # DIFFERENT knobs for the SAME runner: `ci.yml`'s `bash-suites` exports `BASH_SHARD_SLICE`, and
 # `ci-main.yml`'s `script-validate` exports `BASH_SHARDS_BUDGET_SECS: '7800'` for the whole step, so
 # every shard inherits it on main's lane too (`shard_run_bounded` hands a shard its environment
-# unchanged). A positive budget and a slice do not compose — `run-bash-shards.sh` refuses the pair
-# by name — so ARM 3's slice would then hit THAT refusal instead of the one it pins, and the arm
-# reddened on main's lane. Measured with only `BASH_SHARDS_BUDGET_SECS=7800` (the `script-validate`
-# shape): `PASS 12 · FAIL 1` — ARM 3, on a diff whose subject is a red no diff can cause.
-# It is the line `tests/run-bash-shards-bound/run.sh` §0 already spells, for exactly this reason.
+# unchanged). Two independent reasons the fixture must own none of them:
+#   * the P1 — a positive budget and a slice do not compose, and `run-bash-shards.sh` refuses the
+#     pair BY NAME. Before ARM 3's child was isolated with `env -u`, the inherited budget made the
+#     arm meet THAT refusal instead of the slice one it pins, and it reddened on main's lane:
+#     measured pre-fix (`9b7ed763`) with only `BASH_SHARDS_BUDGET_SECS=7800` inherited,
+#     `PASS 12 · FAIL 1` — ARM 3. That specific arm red is now fixed by the `env -u` on the child
+#     (which isolates exactly one variable); it is NOT fixed by this `unset`, and this `unset` is
+#     not what the arm red measured.
+#   * the contract hygiene — no FIXTURE should run under the outer job's budget or bound at all.
+#     The fixture is ~3 s against a 1800 s default; inheriting `BASH_SHARDS_BUDGET_SECS=7800` or
+#     `SHARD_BOUND=5` makes its verdict depend on the outer job's timing, which is the same "a red
+#     no diff can cause" shape one layer down. `tests/run-bash-shards-bound/run.sh` §0 clears the
+#     identical set for exactly this reason.
+# Stated this way round because a reader who tries to reproduce the arm red on the SHIPPED tree
+# cannot — the `env -u` now prevents it — and a rationale that cannot be reproduced reads as an
+# unfounded claim in a file whose evidence is measurements.
 if [ -n "${BASH_SHARD_SLICE:-}" ] || [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ] || [ -n "${SHARD_BOUND:-}" ]; then
   echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE:-}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS:-}' SHARD_BOUND='${SHARD_BOUND:-}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header)"
 fi
@@ -278,7 +289,7 @@ SOUT="$(cat "$TMP/sliced.out" 2>/dev/null)"
 # control drift away from the value it claims to describe and still pass.
 SLICE_COUNT="${SLICE_CONTROL##*/}"
 if [ "$SRC" -eq 2 ] && grep -q "asks for $SLICE_COUNT slice(s) of 3 listed shard(s)" <<<"$SOUT"; then
-  ok "(mutation) the SAME fixture WITH BASH_SHARD_SLICE=$SLICE_CONTROL REFUSES (rc 2) — the hazard ARM 2 is protected from is real"
+  ok "(mutation) the SAME fixture WITH BASH_SHARD_SLICE=$SLICE_CONTROL REFUSES (rc 2) — the hazard the fixtures are protected from is real"
 else
   bad "(mutation) a sliced fixture run exited $SRC and did not name the slice refusal — ARM 2's isolation would then be described by nothing: $(tr '\n' '|' <<<"$SOUT" | cut -c1-300)"
 fi

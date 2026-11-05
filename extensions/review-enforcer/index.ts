@@ -192,7 +192,7 @@ function isGhLimitLayer(dir: string): boolean {
  * 11 of 12 live lane `pi` processes did NOT have it on PATH, so they resolved
  * `~/.pi/agent/shims/gh` and then the real `gh`, bypassing all of it — while the same box's
  * `gh-limit` events log recorded 839 `gh-core-floor … read refused` events and ZERO
- * `read-cache hit`, ZERO `single-flight: shared`, ZERO `conditional: 304`. `--stats` said
+ * `read-cache hit`, ZERO `single-flight: shared`, ZERO `conditional: 304`.
  * `--stats` said `averted=0`. The bucket was exhausted (`core 0/5000`) with `graphql 4159/5000`.
  * The log line is `read-cache: <class> hit — within its <n>s TTL`, so `rg -c 'read-cache: .* hit'`
  * is the re-verification — the literal string `read-cache hit` is never emitted.
