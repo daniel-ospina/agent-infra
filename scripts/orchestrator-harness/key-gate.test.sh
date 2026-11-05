@@ -968,6 +968,23 @@ ck "8y a pin whose credential is already in the STORE is not refused (rc=${rc:-<
    "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
 has "$OUT" "check=skipped reason=stored-credential box_default=venice-uncensored" \
     "8y2 …and the probe still prints a reading, so 'usable via the store' is distinguishable from 'did nothing'"
+# ⛔ AND IT NAMES THE TEMPLATE VARIABLE IT IS TALKING ABOUT (round 22, P3, measured): the round-21 cut printed
+# `$<none>` twice — asserting, on a `models.json` that names a real variable, that the file names none — and a bare
+# `$%s` when the name list was empty. Both are false facts printed by a line an operator reads to decide what to fix.
+# (The TEMPLATE mention lives on the LANE-path line, so the fixture is driven through `key_gate_assert` — a line
+# no other arm reads for its wording.)
+HSK2="$(mkset lanestoreok "$TWO_JSON" ABSENT)"
+printf '{"venice":{"type":"api_key","key":"sk_stored_fixture"}}\n' > "$HSK2/.pi/agent/auth.json"
+printf '{"providers":{"venice":{"apiKey":"$KG_TMPL_VAR","models":[{"id":"venice-uncensored"}]}}}\n' > "$HSK2/.pi/agent/models.json"
+OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HSK2" KG_GATE="$KG" KG_HOME="$HSK2" bash -c 'set -u
+         . "$KG_GATE" || exit 99
+         key_gate_assert t "$KG_HOME" venice venice-uncensored' 2>&1)"
+has "$OUT" "template that names \$KG_TMPL_VAR" \
+    "8y3 …naming the REAL template variable, not \$<none>"
+hasnt "$OUT" "\$<none>" \
+    "8y4 …and never the sentinel, which reads as a fact about the template"
+hasnt "$OUT" "names \$," \
+    "8y5 …nor a bare \$ where a variable name belongs"
 # ⛔ AND THE BOX-DEFAULT PATH HAS THE SAME ORDER (round 20, P1, measured): one box, the pin provisioned in the
 # ENVIRONMENT and an unusable store entry, answered `check=ok box_default=…` while `pi` refuses that provider.
 SET_PROVR='{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}'
@@ -978,6 +995,18 @@ ck "8W a pin in the ENV but an unusable STORE is refused, not called ok (rc=${rc
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=store-invalid" \
     "8W2 …naming the store, which is what pi resolves first"
+# ⛔ AND AN UNPARSEABLE STORE REFUSES THE BOX-DEFAULT PIN TOO (round 22, P2, measured): the rc-6 answer was
+# threaded through the LANE call site only in the same round, and a box-default probe that skipped it would tell a
+# provisioning script this box is fine while every `pi -p` on it dies. Both sites, or the measurement is half a gate.
+HCR2="$(mkset boxcorruptstore "$TWO_JSON" "$SET_PROVR")"
+printf 'not json at all\n' > "$HCR2/.pi/agent/auth.json"
+OUT="$(run_box_at "$HCR2" "$T/nocwd" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8W3 an UNPARSEABLE store refuses the box-default pin (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=auth-store-unreadable" \
+    "8W4 …under its own reason, so a fleet scan counts the FILE as the cause"
+hasnt "$OUT" "stored-credential-unresolvable" \
+    "8W5 …not the cannot-say an unreadable-but-resolvable entry gets"
 # ⛔ AND THE STORE IS PROBED BEFORE THE TEMPLATE, NOT ONLY BEFORE THE ENVIRONMENT (round 21, P1, measured). A
 # `models.json` need not declare a built-in provider - that is the NORMAL cell shape - and pi reads `auth.json`
 # FIRST, so gating this refusal behind "the template is resolvable" reported an unusable store entry as
@@ -1321,13 +1350,24 @@ hasnt "$OUT" "result=REFUSED" \
 # ⛔ AND A STORE THAT DOES NOT PARSE AT ALL IS CANNOT-SAY, NOT "NO CREDENTIAL" (round 14, P1): rc 1 is the POSITIVE
 # "there is no credential in that store", and folding a parse failure into it REFUSED 82 a box pi runs. pi reads the
 # store with stripBom and then JSON.parse; a file with garbage in it is a store this gate did not read.
+# ⛔ AND AN UNPARSEABLE STORE IS A REFUSAL, NOT A CANNOT-SAY (round 22, P2, measured — this REPLACES the
+# round-14 answer). `parseStorageData` is a bare `JSON.parse` (`auth-storage.js:306-312`), so pi answers
+# `Credential store read failed for <provider>: Expected property name ...` and EXITS — measured with and without the
+# provider key exported, for every provider. The cannot-say line said "holds an entry for this provider whose value
+# this gate cannot resolve (a `!command`, an `oauth` credential …)" about a file that holds NO entry at all, and the
+# skip let a certain death through. rc 1 (the POSITIVE "there is no credential here") stays wrong for the same
+# reason it was wrong in round 14: a store this gate did not read is not a store it read as empty.
 HCR="$(mkset corruptstore "$TWO_JSON" "$SET_UNPROV")"
 printf 'not json at all\n' > "$HCR/.pi/agent/auth.json"
 OUT="$(run_box_at "$HCR" "$T/nocwd")"; rc="$(rc_of "$OUT")"
-ck "8L4 an UNPARSEABLE auth.json refuses nothing (rc=${rc:-<none>})" \
-   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
-has "$OUT" "check=skipped reason=stored-credential-unresolvable" \
-    "8L5 …it reports that it could not resolve the store, which is a different answer from 'no credential'"
+ck "8L4 an UNPARSEABLE auth.json is REFUSED — the death pi prints for it is certain (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "$CODEGREP" ] && echo 0 || echo 1)"
+has "$OUT" "check=fail result=REFUSED reason=auth-store-unreadable" \
+    "8L5 …with its own reason, not the stored-credential-unresolvable skip it used to print"
+has "$OUT" "auth.json does not PARSE" \
+    "8L5b …naming the FILE as the thing to repair, which is the remedy that works"
+hasnt "$OUT" "holds an entry for this provider" \
+    "8L5c …and it does NOT claim the file holds an entry — the false fact the cannot-say line asserted"
 # pi parses models.json as JSONC (`stripJsonComments(stripBom(...))`, `model-config.js:116`); a comment must not make
 # the gate blind on a file pi uses — that is a fail-open on the exact defect #3331 exists to remove.
 HJC="$(mkset jsoncmodels "$TWO_JSON" ABSENT)"
@@ -1412,6 +1452,12 @@ has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
 # `No API key found for deepseek.` — and with the variable unset it refused 82 a box pi runs on its built-in
 # provider. R17 pinned `contextWindow`; these are the rest of the typed surface, one arm each, because the mirror
 # is only as good as the keys it names.
+# ⛔ AND EVERY ROUTING LEAF IS TYPED PER KEY — THESE ROWS ARE A MEASURED DIFFERENTIAL (round 22, P1). The round-21
+# `_ok_routing` tested leaf KINDS, so it accepted `allow_fallbacks:"yes"`, `order:"x"`, `max_price:{"prompt":null}`,
+# `sort:true` and `vercelGatewayRouting.only:"x"` — every one of which makes pi DISCARD the whole document
+# (`Invalid models.json schema`), so the provider vanishes from `--list-models` while the gate certified a variable
+# from a file pi never loaded. A mutation sweep of the routing sub-schema found 30 such mismatches; rows are those.
+# (Comments belong HERE, not inside the heredoc: the loop reads it, so a `#` line becomes a case — measured.)
 while IFS='|' read -r _n _body; do
   [ -n "$_n" ] || continue
   HH="$(mkset "schema-$_n" "$TWO_JSON" ABSENT)"
@@ -1464,8 +1510,37 @@ providercompat|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":"no"
 modelOverrides|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":[]}}}
 schema|{"$schema":5,"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY"}}}
 modelapi|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","api":""}]}}}
+routingallowfallbacks|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"allow_fallbacks":"yes"}}}}}
+routingrequireparams|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"require_parameters":"yes"}}}}}
+routingzdr|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"zdr":1}}}}}
+routingdistillable|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"enforce_distillable_text":"yes"}}}}}
+routingorder|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"order":"x"}}}}}
+routingonly|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"only":"x"}}}}}
+routingignore|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"ignore":"x"}}}}}
+routingquantizations|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"quantizations":"x"}}}}}
+routingmaxprice|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"max_price":{"prompt":null}}}}}}
+routingsort|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"sort":true}}}}}
+routingsortby|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"sort":{"by":5}}}}}}
+routingvercelonly|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"vercelGatewayRouting":{"only":"x"}}}}}
+routingvercelorder|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"vercelGatewayRouting":{"order":["a",1]}}}}}
 CASES
-# ⛔ AND THE POSITIVE CONTROL: the SAME fields, VALID, must still pass — a mirror that rejects a legal template is
+# ⛔ AND THE ROUTING LEAVES ARE TYPED BY NAME, WITH UNKNOWN KEYS LEGAL (round 22, P2, measured on the compiled
+# schema: `openRouterRouting`, `max_price`, `sort` and the percentile blocks carry NO `additionalProperties: false`,
+# so an unknown key there is legal at ANY type). Iterating every value was the first, over-strict cut: `max_price:
+# {"weird":true}` and `sort:{"partition":null}` are files pi LOADS, and calling them cannot-say is the #3331
+# silence — blindness on a loadable file, the mirror image of the false-ok class above and just as silent.
+for _pair in 'maxpriceextra|{"max_price":{"prompt":1,"weird":true}}' \
+             'sortextra|{"sort":{"by":"price","weird":true}}' \
+             'sortpartitionnull|{"sort":{"by":"price","partition":null}}' \
+             'percentileextra|{"preferred_min_throughput":{"p90":70,"weird":"x"}}'; do
+  _field="${_pair%%|*}"; _body="${_pair#*|}"
+  HRE="$(mkset "routingloadable-$_field" "$TWO_JSON" ABSENT)"
+  printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":%s},"models":[{"id":"m"}]}}}\n' "$_body" > "$HRE/.pi/agent/models.json"
+  OUT="$(run_gate "$HRE" KG_CANARY_KEY=v)"
+  has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+      "8M34.$_field an unknown key inside a routing block is legal — pi loads that file, so the credential is asserted"
+done
+# AND THE POSITIVE CONTROL: the SAME fields, VALID, must still pass — a mirror that rejects a legal template is
 # the false-82 polarity this whole file is written against, and it is the easier mistake to make when adding checks.
 # ⛔ AND THE MIRROR MUST NOT INVENT RULES pi DOES NOT HAVE (round 19, P3, measured): `ThinkingLevelMap` and
 # `ModelPromptCache` type only their named keys and carry no `additionalProperties: false`, so an UNKNOWN key there
@@ -1500,7 +1575,7 @@ for _pair in 'minthroughput|{"openRouterRouting":{"preferred_min_throughput":100
   has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
       "8M27.$_field a NUMERIC openRouterRouting leaf is legal — pi loads it, so the credential is still asserted"
 done
-printf '%s\n' '{"$schema":"https://pi.dev/schemas/models.json","providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","name":"DeepSeek","baseUrl":"https://api.deepseek.com","api":"openai-completions","authHeader":false,"headers":{"x-tag":"1"},"compat":{"supportsStore":true},"modelOverrides":{"m":{"contextWindow":1024}},"models":[{"id":"m","name":"M","api":"openai-completions","baseUrl":"https://api.deepseek.com","reasoning":true,"thinkingLevelMap":{"high":"high"},"input":["text","image"],"inputLimits":{"maxRequestBytes":1024,"images":{"maxPerMessage":2}},"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"tiers":[{"inputTokensAbove":1000,"input":1,"output":2,"cacheRead":0,"cacheWrite":0}]},"promptCache":{"short":60,"long":300},"contextWindow":128000,"maxTokens":8192,"samplingParams":{"temperature":0.2},"samplingParamsByThinkingLevel":{"high":{"temperature":0.9}},"headers":{"y":"2"},"compat":{"supportsStore":true}}]}}}' > "$HVA/.pi/agent/models.json"
+printf '%s\n' '{"$schema":"https://pi.dev/schemas/models.json","providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","name":"DeepSeek","baseUrl":"https://api.deepseek.com","api":"openai-completions","authHeader":false,"headers":{"x-tag":"1"},"compat":{"supportsStore":true,"openRouterRouting":{"allow_fallbacks":true,"order":["a","b"],"max_price":{"prompt":1,"completion":"2"},"data_collection":"deny","sort":"throughput","preferred_min_throughput":{"p90":70},"preferred_max_latency":2.5},"vercelGatewayRouting":{"only":["x"],"order":["y"]}},"modelOverrides":{"m":{"contextWindow":1024}},"models":[{"id":"m","name":"M","api":"openai-completions","baseUrl":"https://api.deepseek.com","reasoning":true,"thinkingLevelMap":{"high":"high"},"input":["text","image"],"inputLimits":{"maxRequestBytes":1024,"images":{"maxPerMessage":2}},"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"tiers":[{"inputTokensAbove":1000,"input":1,"output":2,"cacheRead":0,"cacheWrite":0}]},"promptCache":{"short":60,"long":300},"contextWindow":128000,"maxTokens":8192,"samplingParams":{"temperature":0.2},"samplingParamsByThinkingLevel":{"high":{"temperature":0.9}},"headers":{"y":"2"},"compat":{"supportsStore":true}}]}}}' > "$HVA/.pi/agent/models.json"
 OUT="$(run_gate "$HVA" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
 ck "8M23 a models.json using every optional field VALIDLY still answers (rc=${rc:-<none>})" \
    "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
