@@ -1199,8 +1199,8 @@ post_marker_comment() { # <repo> <pr> <marker>
   # finding 1, exploited at runtime). The first version of this guard tested
   # `case "$marker" in *" sig="*)`, i.e. it decided "signed" from a SUBSTRING of the
   # marker. That is forgeable from an ordinary CLI flag: `--findings-note` is
-  # free-form (rejected only for `"`, `\` and control chars, :1606) and is spliced
-  # into the marker verbatim (:4749), so a key-less not-clean mint with
+  # free-form (rejected only for `"`, `\` and control chars, :1667) and is spliced
+  # into the marker verbatim (:4819), so a key-less not-clean mint with
   # `--findings-note 'quoted sig=<64hex>'` produced a marker containing ' sig=',
   # passed the guard, and POSTED itself permanently — measured: 1 POST against a
   # stub `gh` for an unsigned marker, while the same probe on a CLEAN unsigned
@@ -1209,16 +1209,16 @@ post_marker_comment() { # <repo> <pr> <marker>
   # `MARKER_SIGNED` is not the fix either: this function has five call sites and
   # flush_pending_markers / --recover-body do not have it in scope — which is
   # plausibly why the text match was written in the first place.
-  # So apply the file's OWN doctrine (:2816-2818): "a marker is EVIDENCE only when
-  # its `sig=` verifies over its own text". GATE_KEY is resolved GLOBALLY at :2800,
-  # above every call site, so this is authoritative everywhere and needs no new
-  # parameter. Split on the LAST ' sig=' — that is the real trailer, and it also
-  # keeps a note that legitimately contains ' sig=' working, because the genuine
-  # signature is appended after it. Any failure ⇒ no comment (fail closed).
-  # ⛔ `${GATE_KEY:-}`, NOT `$GATE_KEY` (#3168 re-review): `--flush-pending` and
-  # `--recover-body` dispatch BEFORE the global assignment at :2800, so under
-  # `set -u` a bare `$GATE_KEY` here aborts the whole flush (measured: 10 vectors
-  # red, "line 1218: GATE_KEY: unbound variable"). An unset key must read as
+  # So apply the file's OWN doctrine (:2886): "a marker is EVIDENCE only when
+  # its `sig=` verifies over its own text". The key is resolved GLOBALLY at :2870,
+  # but ⛔ that is NOT above every call site — so this function must never assume
+  # the global is in scope. Split on the LAST ' sig=' — that is the real trailer,
+  # and it also keeps a note that legitimately contains ' sig=' working, because
+  # the genuine signature is appended after it. Any failure ⇒ no comment (fail closed).
+  # ⛔ `${GATE_KEY:-}`, NOT `$GATE_KEY` (#3168 re-review): `--flush-pending`
+  # dispatches at :1744, BEFORE the global assignment at :2870, so under `set -u`
+  # a bare `$GATE_KEY` here aborts the whole flush (measured: 11 assertions red,
+  # "line 1239: GATE_KEY: unbound variable"). An unset key must read as
   # "unsigned" and fail CLOSED, never as a crash.
   case "$marker" in
     *" sig="*) ;;
@@ -1228,10 +1228,10 @@ post_marker_comment() { # <repo> <pr> <marker>
   _msig="${marker##* sig=}"
   [[ "$_msig" =~ ^[0-9a-f]{64}$ ]] || return 0
   # ⛔ RESOLVE THE KEY LOCALLY WHEN THE CALLER'S SCOPE PREDATES THE GLOBAL. The
-  # global is assigned at :2800, but `--flush-pending` dispatches at :1722 — long
+  # global is assigned at :2870, but `--flush-pending` dispatches at :1744 — long
   # before it — so a bare `$GATE_KEY` here was an `unbound variable` abort under
-  # `set -u` in the flush (measured: 10 vectors red), and taking the global's
-  # EMPTY value instead would silently fail CLOSED on a perfectly good signed
+  # `set -u` in the flush (measured: 11 assertions red, line 1239), and taking the
+  # global's EMPTY value instead would silently fail CLOSED on a good signed
   # marker, disabling the durable copy on the one path whose entire purpose is to
   # deliver it. Replicating the same resolution keeps this function authoritative
   # at every call site without moving a global the mint path deliberately
@@ -4856,7 +4856,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # published nothing — suite vector 14.1d(e) is the discriminator).
     post_marker_comment "$REPO" "$PR" "$MARKER" || true
     # ⛔ THE NOUN CARRIES NO SIGNEDNESS CLAIM (#3168 re-review P2): this arm is
-    # reached with MARKER_SIGNED=0 too (:4809-4821 — with no gate key the `else`
+    # reached with MARKER_SIGNED=0 too (:4831-4834 — with no gate key the `else`
     # branch warns and sets MARKER_SIGNED=0, then execution CONTINUES to the body
     # read below), so "the signed marker" named a property these bytes need not
     # have. It says "the marker".
@@ -4915,7 +4915,7 @@ ${MISSING}"
       post_marker_comment "$REPO" "$PR" "$MISSING" || true
       # ⛔ NO SIGNEDNESS CLAIM IN THE MESSAGE BELOW (#3168 re-review P2): like the
       # read-failure arm, this one is reached with MARKER_SIGNED=0 as well
-      # (:4809-4821 — no gate key warns and CONTINUES), so "the signed marker" named
+      # (:4831-4834 — no gate key warns and CONTINUES), so "the signed marker" named
       # a property the bytes on this path need not have. The marker is called "the
       # marker" — the caller's own warning line already said loudly whether it was
       # signed.

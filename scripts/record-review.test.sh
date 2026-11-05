@@ -4679,7 +4679,7 @@ fi
 #     PART OF THE PIN: this PR anchors ONE site, `post_marker()` (its presence test).
 #     The recorder's APPEND decision and its MARKER_PRESENT re-read were ALREADY `-qxF`
 #     on main (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
-#     → :4214 and :4352), so claiming all three "moved from `grep -qF` to `grep -qxF`"
+#     → :4643 and :4781), so claiming all three "moved from `grep -qF` to `grep -qxF`"
 #     is FALSE — and a false "we changed this" is how a later reader concludes the
 #     older sites need anchoring too, or that this diff is bigger than it is. What
 #     WHAT THE VECTOR BELOW ACTUALLY PINS (corrected — #3168 re-review finding 6):
@@ -4894,7 +4894,7 @@ assert_not_contains "$RECORD_ERR" "nothing carries the marker yet" "14.1d …and
 # ⛔ THE RETIRED PHRASINGS BELONG TO *THIS* ARM, NOT THE PATCH ARM (#3168 review
 #    cycle 4). "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message
 #    (`git show origin/main:scripts/record-review.sh | grep -n 'CI CANNOT SEE IT'`
-#    → :4201), so pinning its absence against the PATCH arm's stderr (14.10a3)
+#    → :4630), so pinning its absence against the PATCH arm's stderr (14.10a3)
 #    guarded an arm the phrase was never in — restoring it HERE kept the suite GREEN
 #    (measured). The assertions above prove this variable is populated before these
 #    negatives run, so none of them can pass on an empty capture.
@@ -4908,7 +4908,7 @@ assert_not_contains "$RECORD_ERR" "already admits the evidence" \
     "14.1d …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
 # 14.1d(h) ⛔ THE EXIT-5 NOUN (#3168 re-review, latest comment, P2). Both exit-5
 #      messages said "the signed marker" — but BOTH arms are reachable with
-#      `MARKER_SIGNED=0` (:4809-4821: no gate key warns and CONTINUES), so the
+#      `MARKER_SIGNED=0` (:4831-4834: no gate key warns and CONTINUES), so the
 #      adjective named a property those bytes need not have. These
 #      two vectors drive that exact conjunction (key unset + a refused body GET / a
 #      refused body PATCH) and are placed HERE, inside §14, because a fresh CLEAN
@@ -5989,8 +5989,8 @@ EV_REF="comment:42495501"
 # ── 20.10 THE DURABLE-COMMENT GUARD MUST VERIFY THE HMAC, NOT MATCH A SUBSTRING ──
 # (#3168 re-review finding 1 — EXPLOITED at runtime, which is why this is a
 # discriminator and not a smoke test.) `--findings-note` is FREE-FORM (rejected only
-# for `"`, `\` and control characters, :1606) and is spliced into the marker text
-# verbatim (:4749). So on the pre-fix tree a KEY-LESS not-clean mint whose note
+# for `"`, `\` and control characters, :1667) and is spliced into the marker text
+# verbatim (:4819). So on the pre-fix tree a KEY-LESS not-clean mint whose note
 # contained the token ` sig=` produced a marker with a FAKE 64-hex trailer that the
 # old `case "$marker" in *" sig="*)` guard ACCEPTED and published as a PERMANENT PR
 # comment — measured against a stub `gh`: 1 POST for that unsigned marker, versus 0
