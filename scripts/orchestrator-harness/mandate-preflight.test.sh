@@ -858,8 +858,8 @@ grep -qF 'echo "[mandate-preflight] CANNOT VERIFY $label:' "$SPAWN"; ck $? "spaw
 # AND the destination, drops the write, and passed at 165/0 — while the same mutant reddened at the parent.
 # Cycle 12 REPLACED the cycle-11 `echo` anchor instead of adding to it. BOTH are now asserted, because they
 # pin two different halves of one line and either alone leaves the other half free.
-grep -qF 'echo "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR:' "$MERGE"; ck $? "merge-one.sh's degraded notice is WRITTEN (the \`echo\` that performs it — a \`: \"…\"\` keeps the message and drops the write)"
-grep -qF 'is not a reading about the box." >> "$log"' "$MERGE"; ck $? "…AND to the OPERATOR LOG (destination pinned; \`>> \$log\` → \`>> /dev/null\` used to pass)"
+grep -qF 'echo "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR:' "$MERGE"; ck $? "merge-one.sh's degraded notice is WRITTEN (the echo that performs it - a colon keeps the message and drops the write)"
+grep -qF 'is not a reading about the box." >> "$log"' "$MERGE"; ck $? "…AND to the OPERATOR LOG (destination pinned; a redirect to /dev/null used to pass)"
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$SPAWN"; ck $? "spawn-gate.sh still carries the notice text on the degraded branch"
 grep -qF 'Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh' "$SPAWN"; ck $? "…with its remedy (a bare grep for the notice was satisfied by the BRIEF append 16 lines below)"
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$MERGE"; ck $? "merge-one.sh still carries the notice text on the degraded branch"
@@ -872,7 +872,15 @@ grep -qF 'orders a reviewer to read exist (#3377). Proceeding: a helper that can
 # one notice PER DISPATCH (measured 2 on two dispatches against 1 on the real tree), i.e. the unbounded
 # brief growth the emit's own guard exists to prevent, re-opened on the branch every un-provisioned box
 # takes. Deleting it left 121 passed, 0 failed.
+# ⛔ THREE PARTS, THREE PINS: the message, the COMMAND, and the destination (#3379 review cycle 14, P2,
+# MEASURED): `printf '%s\n' "…is not available to this spawn…" >> "$prompt"` → `: "…" >> "$prompt"` keeps every
+# word AND the redirect, drops the write, and left 169 passed, 0 failed. The message-only pin could not see it,
+# and §E5's limit means no behavioural arm can. The `printf` that performs the write is pinned here.
 grep -qF 'is not available to this spawn' "$MERGE"; ck $? "merge-one.sh APPENDS the notice to the brief, not only to the log (source pin, §E5's limit)"
+# (the `printf` now prepends the sentinel, so the pin follows the CODE — the command AND the message it
+# writes — rather than a shape that changed under it: the cycle-14 lesson that a pin must track the line
+# it guards, applied to a sibling commit that legitimately respelled that line.)
+grep -qF "if { printf '%s\\n%s\\n' '<!-- mandate-preflight #3377 -->' \"[mandate-preflight] CANNOT VERIFY reviewer PR #\$PR:" "$MERGE"; ck $? "…and the printf that PERFORMS that write is pinned (a colon keeps the prose and the redirect and writes nothing)"
 # ⛔ THE GUARD'S SHAPE CHANGED IN THIS CHANGE'S OWN FOURTH REVIEW (P2): the append is now an `if` branch so its
 # redirect failure can be REPORTED, so the pin follows the CODE it guards — `if ! grep … ; then` — rather
 # than the comment above it (the cycle-2 lesson: a pin satisfied by prose guards nothing).
@@ -886,7 +894,13 @@ grep -qF '>> "$prompt"; } 2>/dev/null; then' "$MERGE"; ck $? "…and merge-one.s
 # ⛔ SAME DESTINATION HOLE ON THE WARN (#3379 review cycle 12, P2, MEASURED): the arm said "RECORDS a failed
 # append in the operator log" while pinning only the sentence — `>> "$log"` → `>> /dev/null` stayed 162/0. The
 # WARN exists to tell an operator the LANE went untold; a WARN written nowhere tells nobody.
-grep -qF 'echo "[mandate-preflight] WARN reviewer PR #$PR: could not append' "$MERGE"; ck $? "…and the failed-append WARN is WRITTEN (the \`echo\`: a \`: \"…\"\` keeps the prose and writes nothing)"; ck $? "…and RECORDS a failed append IN THE OPERATOR LOG — sentence and destination (a WARN written to /dev/null used to pass)"
+# ⛔ TWO ANCHORS ON ONE LINE IS ONE ASSERTION PLUS A VACUOUS ONE (#3379 review cycle 14, P1, MEASURED — and
+# this was MY bug, introduced one commit earlier): `ck` CONSUMES `$?`, so a second `ck $?` after it tests the
+# FIRST grep's status again — always 0 — and can never fail. The arm therefore printed ✅ on the very mutant
+# its text named ("a WARN written to /dev/null used to pass"), while `>> "$log"` → `>> /dev/null` on this line
+# left the suite at 169/0. One `ck` per capture, and the destination is a capture of its own.
+grep -qF 'echo "[mandate-preflight] WARN reviewer PR #$PR: could not append' "$MERGE"; ck $? "…and the failed-append WARN is WRITTEN (the echo: a colon keeps the prose and writes nothing)"
+grep -qF 'Proceeding (a disclosure, not a gate)." >> "$log"' "$MERGE"; ck $? "…AND RECORDS it IN THE OPERATOR LOG (destination pinned separately; a second ck on one line is vacuous)" 
 grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too (same guard; deleting it left the suite green)"
 # ⛔ THE LOG IS NOT THE LANE, AND THAT WAS THE ACTUAL HOLE (this change's review cycle 2, P1, MEASURED):
 # the notice above went to `$log` ONLY, so on a box that has not received the helper the LANE was told
@@ -950,7 +964,7 @@ grep -qF 'named the absence IN THE BRIEF as well' "$LOGF13"; ck $? "…including
 LOGF14="$TMP/emit-nobrief.log"; : > "$LOGF14"
 mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
 CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "" nobrief' _ "$HELPER" "$LOGF14" >/dev/null 2>&1
-grep -qF 'no brief file to append to' "$LOGF14"; ck $? "an emit with NO brief WRITES the no-brief WARN to the operator log (the branch was never driven; \`>> /dev/null\` used to pass)"
+grep -qF 'no brief file to append to' "$LOGF14"; ck $? "an emit with NO brief WRITES the no-brief WARN to the operator log (the branch was never driven; a redirect to /dev/null used to pass)"
 grep -qF 'the LANE will not see it' "$LOGF14"; ck $? "…and says the LANE will not see it — the consequence, which is the whole point of the record"
 
 # The emit itself must be non-fatal on every branch.
@@ -989,6 +1003,16 @@ case " $_CSS_EXECUTED " in
   *' mandate-preflight.sh '*) ok "check-single-source.sh names it in the EXECUTED list itself, not merely in its comments (a \$O missing it is reported)" ;;
   *) bad "check-single-source.sh does NOT name mandate-preflight.sh in EXECUTED — a \$O that lost the helper would go unreported" ;;
 esac
+
+# ⛔ A META-ARM, BECAUSE THIS BUG WAS IN THE TEST FILE ITSELF (#3379 review cycle 14, P1, MEASURED): `ck`
+# CONSUMES `$?`, so `... ; ck $? "a"; ck $? "b"` tests the FIRST grep's status twice — the second assertion
+# reads `$?` of `ok`/`bad`, i.e. 0, and can never fail. I wrote exactly that, and the arm printed ✅ on the
+# very mutant its text named. No per-line pin can catch this class, because the damage is the nonexistent
+# assertion, not the regex; so the SHAPE is banned outright and this arm reddens if it ever returns.
+# (comment lines are excluded: the explanation of this very bug contains the banned shape as prose — measured,
+# it was the only hit, which is also a reminder that a prose match is not a code match.)
+DOUBLE_CK="$(grep -vE '^[[:space:]]*#' "$0" | grep -cE '(^|;)[[:space:]]*ck[[:space:]]+\$\?.*;[[:space:]]*ck[[:space:]]+\$\?' || true)"
+[ "${DOUBLE_CK:-0}" = "0" ]; ck $? "no line calls ck twice on one line (the second is vacuous: ck consumes the status - measured ${DOUBLE_CK:-0} such line(s))"
 
 echo
 printf 'mandate-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
