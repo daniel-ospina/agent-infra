@@ -700,6 +700,35 @@ else
 fi
 grep -qF 'STUB-PI-RAN' "$TMP/pi-ran3b.log" 2>/dev/null; ck $? "…and the agent STILL STARTED (a failed disclosure is never a gate)"
 chmod 644 "$BRIEF3B"
+# ── E3c: THE DEGRADED NOTICE IS RETIRABLE — a healed box must not keep a false instruction (#3379 P1) ──
+# The emit retires a stale block only through its SENTINEL (`stamped`). The degraded branch's notice is the
+# one shape EVERY un-provisioned box takes, and it carried no sentinel — so executing the remedy that very
+# line prints (`Sync it: cp …`) left the lane reading "treat every mandated file as unread … never claim to
+# have read one" as its LAST mandate claim, permanently, with nothing in the log. ARCHITECTURE.md states the
+# invariant ("ONE sentinel line … that every shape carries"); this was the one shape that broke it. Driven
+# end to end: degraded dispatch → heal the box → re-dispatch the SAME brief.
+mkdir -p "$TMP/home5/.pi/agent/state"
+BRIEF3C="$TMP/brief-heal.txt"; seam_brief "$BRIEF3C"
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran3c1.log" O="$TMP/O" CELL_HOME="$TMP/home5" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; cd "$2" || exit 2; mandate_preflight_lib() { return 1; }; run_agent 5 "$3" "$4" degraded' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam3c1.log" "$BRIEF3C" >/dev/null 2>&1
+grep -qF '<!-- mandate-preflight #3377 -->' "$BRIEF3C"; ck $? "the DEGRADED notice carries the sentinel line, like every other shape (without it no later dispatch can retire it)"
+grep -qF 'never claim to have read one' "$BRIEF3C"; ck $? "…and it is the notice the lane actually reads (a control on the arm above: it is not matching a stale brief)"
+: > "$TMP/home5/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; : > "$TMP/home5/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran3c2.log" O="$TMP/O" CELL_HOME="$TMP/home5" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; cd "$2" || exit 2; run_agent 5 "$3" "$4" healed' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam3c2.log" "$BRIEF3C" >/dev/null 2>&1
+grep -qF 'SUPERSEDES' "$BRIEF3C"; ck $? "…and once the box is provisioned the notice is RETIRED by a supersession block (the stale false instruction does not survive the remedy it printed)"
+case "$(tail -1 "$BRIEF3C")" in
+  *'never claim to have read one'*) bad "…but the brief's LAST line is still the stale degraded notice — the lane is still ordered to report a falsehood" ;;
+  *) ok "…and the stale claim is no longer the brief's last word" ;;
+esac
 # ── E4: THE POSITIVE CONTROL FOR THE SEAM — present files leave the brief untouched ───────────────
 mkdir -p "$TMP/home3/.pi/agent/state"
 : > "$TMP/home3/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"

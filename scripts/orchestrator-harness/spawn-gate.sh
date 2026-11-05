@@ -2442,7 +2442,14 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     # helper's own emit already refuses this shape (`mandate-preflight.sh`'s `if { printf … } 2>/dev/null`
     # with a WARN on the else); this is the same `if`/`else` in the seam.
     if ! grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null; then
-      if { printf '%s\n' "[mandate-preflight] CANNOT VERIFY $label: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"; } 2>/dev/null; then
+      # ⛔ AND IT CARRIES THE SENTINEL, LIKE EVERY OTHER SHAPE (#3379 review, P1, MEASURED). Without the
+      # marker the emit's content-aware guard (`stamped`) can NEVER retire this block: on a box that is later
+      # provisioned, the lane keeps reading "treat every mandated file as unread … never claim to have read
+      # one" as its LAST mandate claim, the log says nothing, and the remedy this very line prints (`Sync it:
+      # cp …`) is the trigger. `ARCHITECTURE.md` states the invariant — ONE sentinel line every shape
+      # carries — and this was the one shape that did not. The literal is written here because this is the
+      # branch where the helper is NOT sourceable, so `$(mandate_sentinel)` cannot be called.
+      if { printf '%s\n%s\n' '<!-- mandate-preflight #3377 -->' "[mandate-preflight] CANNOT VERIFY $label: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"; } 2>/dev/null; then
         :
       else
         { echo "[mandate-preflight] WARN $label: could not append the degraded notice to $prompt, so only THIS LOG names it and the LANE will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null || :

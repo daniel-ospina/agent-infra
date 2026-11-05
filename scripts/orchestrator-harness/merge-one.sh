@@ -211,7 +211,10 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
     # cannot retract it — redirections apply left to right) and NOTHING records that the reviewer was never
     # told, so the `CANNOT VERIFY` line above reads identically either way.
     if ! grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null; then
-      if { printf '%s\n' "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"; } 2>/dev/null; then
+      # ⛔ AND IT CARRIES THE SENTINEL — the sibling seam's fix, for the same measured reason (#3379
+      # review, P1): without the marker the emit's `stamped` guard can never retire this block, so a
+      # provisioned box keeps a false "treat every mandated file as unread" as the reviewer's last claim.
+      if { printf '%s\n%s\n' '<!-- mandate-preflight #3377 -->' "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"; } 2>/dev/null; then
         :
       else
         { echo "[mandate-preflight] WARN reviewer PR #$PR: could not append the degraded notice to $prompt, so only THIS LOG names it and the REVIEWER will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null || :
