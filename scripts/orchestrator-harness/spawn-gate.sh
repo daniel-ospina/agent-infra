@@ -1595,7 +1595,16 @@ lane_end_push() {
     # remote holds THIS lane's commit"). So the unmeasurable half gets its own verdict, which asserts
     # neither delivery nor loss and names the read that would settle it.
     LANE_END_PUSH="verify-head-unreadable"
-    echo "[lane-exit] ⛔ label=$label: the push exited 0 and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read ($unpushed commit(s) were counted, so the repository reads — a partial/promisor clone, a corrupt odb, or a permission problem on the ref). NO COMPARISON WAS MADE, so this terminal asserts NEITHER delivery NOR loss. Read it yourself before reaping: git -C $root rev-parse HEAD, then git -C $root merge-base --is-ancestor <that sha> $LANE_END_ORIGIN" >> "$log" 2>/dev/null || true
+    # ⛔ THE EXIT STATUS IS INTERPOLATED, NOT ASSUMED (review round 5, P2 — REPRODUCED). This arm is
+    # reachable with a NON-ZERO push: the rc≠0 / rc=0 split above covers only the arm where the verify read
+    # ALSO got no answer, so a push that reported failure but whose ref DOES exist on the remote (a server
+    # that applied the ref and then failed to report, or a rejected re-push of an already-delivered one)
+    # lands here — and this line, added in round 4 to stop exactly this class of false claim, hardcoded
+    # "the push exited 0". Reproduced with a `git` shim whose `push` exits 1 and whose `rev-parse HEAD`
+    # exits 1 against an origin that really holds the ref: the log said "the push exited 0" over a push
+    # that exited 1. `lane_end_next`'s arm for this verdict never makes that claim; this is the log only,
+    # but it is a fact this path never measured, in the arm written to stop exactly that.
+    echo "[lane-exit] ⛔ label=$label: the push exited ${PUSH_RC:-?} and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read ($unpushed commit(s) were counted, so the repository reads — a partial/promisor clone, a corrupt odb, or a permission problem on the ref). NO COMPARISON WAS MADE, so this terminal asserts NEITHER delivery NOR loss. Read it yourself before reaping: git -C $root rev-parse HEAD, then git -C $root merge-base --is-ancestor <that sha> $LANE_END_ORIGIN" >> "$log" 2>/dev/null || true
   elif [ "$LANE_END_ORIGIN" != "$mine" ]; then
     # ⛔ A DIFFERENT SHA IS THREE FACTS, AND ONLY ONE OF THEM IS A NON-DELIVERY (review of PR #3399, P2 —
     # REPRODUCED). This arm used to record `FAILED` on inequality ALONE and say "this lane's commits are NOT
@@ -2411,6 +2420,24 @@ terminal_wip_rescue() {
           # NOR loss" — a false measured absence, which is the one class this whole feature exists to
           # remove. Every consumer of the domain has to be found, not just the two that were remembered.
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br MIGHT exist only locally — push=${LANE_END_PUSH}, so this terminal did NOT establish either way (see the [lane-exit] line above). Do not read 'nothing at risk' as 'the lane's work is on origin', and do not read this as a measured loss" >> "$log" ;;
+        FAILED)
+          # ⛔ `FAILED` IS TWO MEASUREMENTS, AND THIS WAS THE THIRD CONSUMER THAT DID NOT SPLIT IT
+          # (review round 5, P2 — REPRODUCED). `lane_end_push` assigns it BOTH when the remote ANSWERED
+          # and the ref is ABSENT — the one thing that establishes "not on origin" — AND when the remote
+          # answered holding a DIFFERENT sha, where this lane's commits may well be ON origin (a peer
+          # push, or a rail merge of them). The `[lane-exit]` line three lines above the `case` already
+          # declines that claim, and `lane_end_push_caveat` and `lane_end_next` both split on
+          # `branch_on_origin` — this consumer is the one that feeds the operator's own reading of the
+          # run, i.e. the LAST line in the lane log. Reproduced with a peer force-moving
+          # `refs/heads/reused` to an unrelated sha while the lane's commit really was pushed under
+          # `refs/heads/other`: this arm printed "exist ONLY locally and were NOT pushed" over a commit
+          # `git ls-remote origin other` answered with. Whether the commits are on some OTHER ref is not
+          # measured here, so it is not claimed either way.
+          if [ -n "${LANE_END_ORIGIN:-}" ]; then
+            echo "[wip] NOTE label=$label: $unpushed commit(s) on $br are NOT on origin refs/heads/$br — the remote ANSWERED and holds that ref at a DIFFERENT sha (push=FAILED, branch_on_origin=$LANE_END_ORIGIN), so the commits from this lane did NOT reach that ref. Whether they are on some OTHER ref was NOT measured here. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted, and they do not survive a cell's volume being discarded either" >> "$log"
+          else
+            echo "[wip] NOTE label=$label: $unpushed commit(s) on $br exist ONLY locally and were NOT pushed — push=FAILED with branch_on_origin empty, i.e. the remote ANSWERED and does NOT hold refs/heads/$br, and the [lane-exit] line above says why. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted, and they do not survive a cell's volume being discarded either. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log"
+          fi ;;
         *)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br exist ONLY locally and were NOT pushed — push=${LANE_END_PUSH:-not-attempted}, and the [lane-exit] line above says why. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted, and they do not survive a cell's volume being discarded either. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log" ;;
       esac
