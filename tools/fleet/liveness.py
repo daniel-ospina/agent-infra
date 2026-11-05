@@ -2549,7 +2549,14 @@ def _proc_cpu_cs(root: str = PROC_ROOT) -> Optional[Dict[int, Tuple[int, Optiona
         return None
     out: Dict[int, Tuple[int, Optional[int]]] = {}
     for name in names:
-        if not name.isdigit():
+        # ⛔ `str.isdigit()` IS NOT A PID TEST. It is TRUE for non-ASCII digits (`\u00b2`,
+        # `\u0663`, …) that `int()` REJECTS — and the `int(name)` below sits OUTSIDE both
+        # try blocks, so such a name raised `ValueError` straight out of
+        # `subtree_cpu_cs` where the contract is "``None`` on any unreadable read". This is
+        # the same class #3449 files for three pre-existing sites; the allow-list here is
+        # the one the module's other pid parsers already use, so `int(name)` is safe by
+        # construction rather than by luck.
+        if not (name.isascii() and name.isdigit() and len(name) <= 10):
             continue
         try:
             raw = open(os.path.join(root, name, "stat"), "rb").read().decode("utf-8", "replace")
@@ -2558,6 +2565,14 @@ def _proc_cpu_cs(root: str = PROC_ROOT) -> Optional[Dict[int, Tuple[int, Optiona
             # is absent from the tree — the same fact the `ps` path gets when a row is
             # simply not there. (A child that exits mid-window loses its accumulated CPU
             # on both paths; that race is inherent to sampling, not a shrink we created.)
+            continue
+        except ProcessLookupError:
+            # ⛔ THE SAME FACT ONE SYSCALL LATER. `open()` succeeds while the pid exists,
+            # then `.read()` returns ESRCH because it exited in between — "genuinely gone",
+            # exactly what the arm above says. Without this arm it fell into the generic
+            # `OSError` clause and abstained the WHOLE reading, so an unrelated short-lived
+            # process exiting made this lane's CPU signal unreadable (measured 1 in 200
+            # full walks under a fork storm, mean walk 23.8 ms).
             continue
         except (OSError, ValueError):
             # ⛔ PRESENT BUT UNREADABLE IS NOT ABSENT. `_sum_subtree` promises ``None`` when

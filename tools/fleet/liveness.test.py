@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-four tests with ninety-six paired mutations: every mutation re-
+Fifty-four tests with ninety-nine paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 54 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (96)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (99)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2825,6 +2825,64 @@ def t54():
         # back to `ps` (macOS). The two must not collapse into one answer.
         check(liv._proc_cpu_cs(os.path.join(d, "nope-not-here")) is None,
               "a missing procfs is None (fallback), not an abstention")
+
+        # (f) ⛔ A PID NAMED WITH NON-ASCII DIGITS. `str.isdigit()` is TRUE for '\u00b2' and
+        # `int()` REJECTS it; the store below sits outside both try blocks, so such a name
+        # raised `ValueError` straight out of `subtree_cpu_cs`. Same class as #3449.
+        # (Case (d) left `600/stat` as a DIRECTORY, so the whole 600 entry is replaced.)
+        shutil.rmtree(os.path.join(d, "600"))
+        os.makedirs(os.path.join(d, "\u00b2\u00b3"))
+        with open(os.path.join(d, "\u00b2\u00b3", "stat"), "w", encoding="utf-8") as fh:
+            fh.write(stat_line(0, "odd", 1, 1, 1))
+        try:
+            m = liv._proc_cpu_cs(d)
+            check(set(m) == {500, 700},
+                  "a non-ASCII digit name is SKIPPED, not int()'d; got %r" % (m,))
+        except ValueError as exc:
+            check(False, "a non-ASCII digit name must not raise out of the reader: %s" % exc)
+        shutil.rmtree(os.path.join(d, "\u00b2\u00b3"))
+        os.makedirs(os.path.join(d, "600"))
+
+        # (h) ⛔ ESRCH FROM THE READ. `open()` can succeed while the pid then exits, so
+        # `.read()` raises `ProcessLookupError` — the same "genuinely GONE" fact as a
+        # missing file, one syscall later. A fixture cannot produce that race, so `open`
+        # is stubbed for exactly one path: without the arm it fell into the generic
+        # `OSError` clause and abstained the WHOLE reading (measured 1 in 200 full walks
+        # under a fork storm), so an unrelated process exiting blanked this lane's signal.
+        import builtins
+        real_open = builtins.open
+        target = os.path.join(d, "700", "stat")
+
+        class _Gone:
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        def _fake_open(path, *a, **k):
+            if str(path) == target:
+                return _Gone()
+            return real_open(path, *a, **k)
+
+        builtins.open = _fake_open
+        try:
+            m = liv._proc_cpu_cs(d)
+            check(set(m) == {500},
+                  "an ESRCH from the read is GONE (skipped), not unreadable; got %r" % (m,))
+        except liv._ProcUnreadable:
+            check(False, "an ESRCH from the read must NOT abstain the whole reading")
+        finally:
+            builtins.open = real_open
+
+        # (g) ⛔ A STAT LINE WITH NO ')' MUST ABSTAIN — the third failure branch, which had
+        # no fixture case and no mutation, so a `continue` there stayed GREEN while it
+        # dropped the row from the population without abstaining (the shrink class).
+        write(600, "600 pi S 500 0 0 0 0 0 0 0 0 3 4\n")
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "a stat line with no ')' must RAISE _ProcUnreadable")
+        except liv._ProcUnreadable:
+            check(True, "a paren-less stat line abstains the read")
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller abstains; got %r" % (liv.subtree_cpu_cs(500, proc_root=d),))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3553,6 +3611,28 @@ MUTATIONS = [
         '    except _ProcUnreadable:\n        proc = None',
         "an unreadable `/proc` member FALLS BACK to the coarser `ps` instead of abstaining, "
         "which reads the same blind spot at whole-second resolution and returns a number",
+    ),
+    Mutation(
+        "T54", "module",
+        '            raise _ProcUnreadable("unparseable %s/%s/stat" % (root, name))',
+        '            continue',
+        "a PAREN-LESS stat row is dropped from the population instead of abstaining — the "
+        "third failure branch, which had no fixture case and no mutation",
+    ),
+    Mutation(
+        "T54", "module",
+        '        if not (name.isascii() and name.isdigit() and len(name) <= 10):',
+        '        if not name.isdigit():',
+        "`str.isdigit()` admits non-ASCII digits that `int()` rejects, so a non-ASCII name "
+        "raises ValueError straight out of the reader (#3449's class)",
+    ),
+    Mutation(
+        "T54", "module",
+        '        except ProcessLookupError:',
+        '        except ZeroDivisionError:',
+        "an ESRCH from the READ is not caught, so it falls into the generic OSError clause "
+        "and abstains the whole reading instead of treating the pid as gone (one unrelated "
+        "process exiting blanks the lane's CPU signal)",
     ),
     Mutation(
         "T51", "module",
