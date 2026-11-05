@@ -161,14 +161,39 @@ O="${O:-$HOME/orchestrator}"
 # the predicate excludes by LABEL (`standing-constraint`), which a new prefix spelling cannot
 # dodge. That is #10902's rule: declare the property, do not infer it from prose.
 #
-# ⛔ NO `\b` IN THE PATTERN, AND THAT IS DELIBERATE. This regex is interpolated into a **jq string
-# literal** (`test("$QUEUE_CONTAINER_TITLE_RE")`), and jq parses `\b` in a string as the BACKSPACE
-# escape (U+0008) before the regex engine ever sees it. A `\b` here would therefore require a
-# literal backspace after the prefix, match NOTHING, and fail OPEN — the whole filter would become
-# a no-op while looking stricter. The `^` anchor is what makes the prefix test sufficient; the
-# escaping trap is pinned by `tests/queue-population-filter/run.sh` running the REAL jq program.
+# ⛔ NO BACKSLASH ANYWHERE IN THE PATTERN, AND THE TWO FAILURE DIRECTIONS DIFFER. This regex is
+# interpolated into a **jq string literal** (`test("$QUEUE_CONTAINER_TITLE_RE")`), so jq's string
+# parser consumes an escape BEFORE the regex engine sees it — and the two escapes do NOT behave alike
+# (both measured on jq 1.7, program in a file so no shell could confuse the result):
+#   `\b`  → jq decodes it to BACKSPACE (U+0008). `"epic: a container" | test("^epic\b|lane")`
+#           returns **false** — so the filter would match NOTHING and fail OPEN while looking stricter.
+#   `\(`  → jq decodes it as STRING-INTERPOLATION START. `test("^design\(|coord:")` is a **compile
+#           error, rc 3** — `rest_list` returns non-zero, the tier lands in `$O/.pool-err` and resolves
+#           to PARTIAL/UNREADABLE. That direction is fail-CLOSED, which is why it is the LESS dangerous
+#           of the two — but a tier silently degrading to `.pool-err` is still not a working gate.
+# Either way no tier may carry a backslash, which is exactly why the paren forms below are `[(]` and
+# not `\(`. The `^` anchor is what makes the prefix test sufficient, and both directions are pinned by
+# `tests/queue-population-filter/run.sh` running the REAL jq program.
+# ⛔ EACH STEM IS SPELLED THE WAY THE REPO WRITES ITS CONTAINERS, NEVER AS A BARE WORD. A bare
+# `design` / `measure` / `lane` also matches ordinary English and therefore HIDES real work —
+# measured over the whole open P0/P1/P2 population of `daniel-ospina/tortoise` +
+# `daniel-ospina/agent-infra`: bare `measure` swallowed
+# agent-infra#1220/#1221 ("Measure summarization latency…", "Measure long-context ANSWER QUALITY…")
+# and bare `lane` swallowed #2773/#1699 (real `lane-actions:` / `lane-watchdog.py:` BUGS). So, with
+# the instance that justifies each:
+#   epic                       bare — 15 instances, every one an epic (`epic:`, `epic-scope:`, `epic(`, `Epic:`)
+#   OWNER DECISION/decision    bare — every instance is a decision (`decision(fleet):`, `Decision needed:`)
+#   decide:                    the colon form — agent-infra#1613 ("a POLICY question, not a defect")
+#   tracking:                  the colon form — tortoise#2820 ("… problem map … (organize before fixing)")
+#   lane[ ]                    the SPACE form (`lane L3:`) is the container; `lane-<tool>` is a real bug ticket
+#   lane-liveness escalation   a scheduled AUTOMATED report (agent-infra#1559: "1 dead lane(s)" from
+#                              2026-10-02) — noise a coding lane cannot act on. Safe to name as a whole
+#                              phrase: the real tickets are `lane-actions:` / `lane-watchdog.py:`.
+#   design[(] measure[(] analysis[(]   the PAREN forms are containers; the bare words are not
+#   coord:                     the colon form (`coord: memory quality + cost`)
+#   investigation              bare — 0 instances in the population, kept as the original filter had it
 #: Container-title prefixes that are not units of work. Keep this the ONLY copy of the pattern.
-QUEUE_CONTAINER_TITLE_RE='^(epic|lane|OWNER DECISION|decision|design|coord|measure|analysis|investigation)'
+QUEUE_CONTAINER_TITLE_RE='^(epic|lane[ ]|OWNER DECISION|decision|decide:|design[(]|coord:|measure[(]|analysis[(]|investigation|tracking:|lane-liveness escalation)'
 #: The declaration a standing constraint carries, so it is excluded by a property and not a word.
 QUEUE_CONTAINER_LABEL='standing-constraint'
 #: The `select` fragment every pool/emergency query applies before it projects a row.

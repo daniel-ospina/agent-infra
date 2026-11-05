@@ -9,5 +9,13 @@
   {"number": 90001, "title": "fix(1234): a real work unit", "assignees": [], "labels": [{"name": "P1-severe"}]},
   {"number": 90002, "title": "fix(1235): a real-looking unit that DECLARES itself a standing constraint", "assignees": [], "labels": [{"name": "P1-severe"}, {"name": "standing-constraint"}]},
   {"number": 90003, "title": "feat(1236): a real unit already assigned to someone else", "assignees": [{"login": "someone"}], "labels": [{"name": "P1-severe"}]},
-  {"number": 90004, "title": "fix(1237): a real unit whose payload carries no labels key at all", "assignees": [], "labels": []}
+  {"number": 90004, "title": "fix(1237): a real unit whose payload carries no labels key at all", "assignees": []},
+  {"number": 90005, "title": "Measure summarization latency + time-to-first-byte at the 700K window (timeout sizing)", "assignees": [], "labels": [{"name": "P2-moderate"}]},
+  {"number": 90006, "title": "measure(tiering): the premise is unmeasured — are our queries actually answered", "assignees": [], "labels": [{"name": "P2-moderate"}]},
+  {"number": 90007, "title": "lane-actions: _is_linked_worktree reads an ANCESTOR's .git, so a real bug", "assignees": [], "labels": [{"name": "P1-severe"}]},
+  {"number": 90008, "title": "lane L3: extractor — the pipeline body", "assignees": [], "labels": [{"name": "P1-severe"}]},
+  {"number": 90009, "title": "fix(1238): a real unit whose payload carries no assignees key", "labels": [{"name": "P1-severe"}]},
+  {"number": 90010, "title": "decide: every PR is unlandable through the rail — a policy question, not a defect", "assignees": [], "labels": [{"name": "P2-moderate"}]},
+  {"number": 90011, "title": "tracking: memory-substrate problem map (organize before fixing)", "assignees": [], "labels": [{"name": "P2-moderate"}]},
+  {"number": 90012, "title": "lane-liveness escalation: 1 dead lane(s) (land-lane-4)", "assignees": [], "labels": [{"name": "P2-moderate"}]}
 ]
