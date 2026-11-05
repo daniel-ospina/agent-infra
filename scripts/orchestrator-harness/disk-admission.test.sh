@@ -13,7 +13,8 @@
 # not a gate.
 #
 # WHAT IS PINNED HERE, and why each one is a distinct failure mode:
-#   1. BELOW the requirement -> the NAMED refusal (`REFUSED-DISK(free=…, need=…, box=…)`), rc 77, and
+#   1. BELOW the requirement -> the NAMED refusal (`REFUSED-DISK(free=…, need=…, box=…)`), rc **4** at
+#      the SEAM (the callers map it to 77; see the ⛔ note above `ck`), and
 #      NO WORKTREE AND NO BRANCH (the refusal is free: nothing was attempted, so nothing to roll back);
 #   2. ABOVE it -> a real worktree. Without this arm every refusal below would pass on a gate that
 #      refuses unconditionally — the inert-gate mirror of the same defect;
@@ -423,7 +424,16 @@ census_pop() { # <dir> -> space-separated basenames of the files holding a wt_pr
   grep -rlE '^([^#]*[^[:alnum:]_.-])?wt_provision[[:space:]]' --include='*.sh' "$1" \
     | grep -v '\.test\.sh$' | while IFS= read -r _cf; do basename "$_cf"; done | sort | tr '\n' ' '
 }
-_census_pop="$(census_pop "$HERE")"
+# ⛔ ROOTED AT `scripts/`, NOT AT `$HERE` (review round 7, P2 — MEASURED). The arm's stated purpose is
+# that "a 4th ungated caller reds the suite", but a census rooted at the harness directory cannot see
+# one directory up — and `scripts/` is both the natural home for the README's own "move them onto
+# wt_provision" follow-up and the directory that already holds sibling checkout code
+# (`scratch-worktree.sh`, `admin-merge.sh`). Measured: a caller added as
+# `scripts/zz-outside-caller.sh` left this suite at 65 passed / 0 failed while the arm printed
+# "EXACTLY". The root is the repo's `scripts/` tree, so the same caller now reds here. The expected
+# population is unchanged by the wider root, because the three callers are the only files under
+# `scripts/` that invoke `wt_provision` at all.
+_census_pop="$(census_pop "$(cd "$HERE/.." && pwd)")"
 _census_want='adopt-fix.sh dispatch-merge.sh fix-one.sh '
 if [ "$_census_pop" = "$_census_want" ]; then
   ok "H) the wt_provision caller population is EXACTLY the censused set (${_census_want% })"
@@ -473,6 +483,43 @@ case "$_c77" in
     ok "H) adopt-fix.sh's exit-77 remedy names the PRE-START refusal and its own token, not only the live arm" ;;
   *) bad "H) adopt-fix.sh's exit-77 remedy does not name the #3395 pre-start refusal (REFUSED-DISK / REFUSED-UNKNOWN) — the operator is sent to a '[disk-gate] REFUSED' line that does not exist on that path" ;;
 esac
+
+# ⛔ THE VERDICT→REMEDY SELECTOR IS DRIVEN, NOT CENSUSED (review round 7, P2 — MEASURED). The `_c77`
+# arm above pins the exit-77 echo; the `case "$WT_RESULT" in …` selector that CHOOSES the remedy was
+# pinned by NOTHING. It is the #2721 wrong-cause class: both pre-start arms reach rc 4 carrying
+# REFUSED-UNKNOWN (an unreadable `df`, AND a half-deployed `$O` with no spawn-gate.sh), so a selector
+# that collapsed to the disk remedy would tell an operator to reclaim space for a broken probe — a
+# remedy that cannot arrive. Measured: deleting the selector from a scratch copy left the suite at
+# 65 passed / 0 failed, while the same class in `fix-one.sh` IS driven (H3). The fix exists twice and
+# was pinned once.
+#
+# The block is EXTRACTED FROM THE SHIPPED SCRIPT and EXECUTED with `$WT_RESULT` injected (the `arm_of`
+# idiom), so the assertion is on BEHAVIOUR and a regression breaks this arm rather than a copy of it.
+_af_sel="$(awk '/^[[:space:]]*case "\$WT_RESULT" in/{f=1} f{print} f&&/^[[:space:]]*esac[[:space:]]*$/{exit}' "$HERE/adopt-fix.sh")"
+if [ -z "$_af_sel" ]; then
+  bad "H) adopt-fix.sh's verdict-to-remedy selector is GONE or unextractable — two DIFFERENT causes would get one remedy"
+else
+  _af_remedy() { # <verdict> -> the lines the shipped selector produces for it
+    ( mkdir -p "$T/af-o/logs"; O="$T/af-o" PR=999 WT_RESULT="$1"; eval "$_af_sel" ) 2>&1
+  }
+  _af_unk="$(_af_remedy REFUSED-UNKNOWN)"
+  _af_dsk="$(_af_remedy REFUSED-DISK)"
+  case "$_af_unk" in
+    *REFUSED-UNKNOWN*probe*|*probe*REFUSED-UNKNOWN*)
+      ok "H) an UNREADABLE probe gets its own remedy (it names the probe), selected from the verdict" ;;
+    *) bad "H) adopt-fix.sh's REFUSED-UNKNOWN remedy does not name the PROBE — an unreadable df is reported as a full disk (the #2721 wrong-cause class)" ;;
+  esac
+  case "$_af_unk" in
+    *"reclaim space"*)
+      bad "H) the REFUSED-UNKNOWN remedy tells the operator to RECLAIM SPACE — that remedy cannot arrive for a broken probe or a half-deployed box" ;;
+    *) ok "H) …and it does NOT tell an unreadable probe to reclaim space" ;;
+  esac
+  case "$_af_dsk" in
+    *REFUSED-DISK*"reclaim space"*)
+      ok "H) a genuine DISK refusal still gets the reclaim-space remedy (so the selector is not inert the other way)" ;;
+    *) bad "H) adopt-fix.sh's REFUSED-DISK remedy is missing or no longer says to reclaim space — a real full disk would be sent down the wrong arm" ;;
+  esac
+fi
 
 # ═══ H2. THE BATCH-STOP ARM, DRIVEN ═════════════════════════════════════════════════════════════
 # ⛔ ARM H ABOVE IS A SOURCE CENSUS: it proves the token `break` sits inside the rc-4 arm. MEASURED

@@ -418,13 +418,21 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 # verb, so a dispatcher that is not this tree's shell code (an ad-hoc pusher on another box) calls
 # THIS function instead of re-implementing `df`. That divergence — harness copy gated, ad-hoc copy
 # not — is the whole defect.
-# ⚠️ SCOPE, STATED (review rounds 2 and 4, P3): those three are the LANE creation paths, not every
-# checkout this tree ever creates. Five scripts still call `git worktree add` directly and are NOT
+# ⚠️ SCOPE, STATED (review rounds 2, 4 and 7): those three are the LANE creation paths, not every
+# checkout this tree ever creates. MANY scripts still call `git worktree add` directly and are NOT
 # gated here — `stall-fix.sh` and `ai-drainer.sh` (throwaway / mend checkouts), `refresh-candidates.sh`,
-# `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance / hygiene checkouts). A named
-# residual whose ENOSPC behaviour this change does not alter, not a silent hole; the script-scoped
-# census is `grep -rln --include='*.sh' -e 'worktree add' scripts/`, and moving any of them onto
-# `wt_provision` (or the `--disk-admit` verb) is the follow-up.
+# `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance / hygiene checkouts), the
+# merge rail's own base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (on the live
+# scout path, via `refresh-candidates.sh`), among others.
+# ⛔ NO COUNT IS GIVEN HERE, DELIBERATELY (review round 7, P2 — MEASURED). This paragraph used to say
+# "Five scripts" and name exactly five. That number was FALSE: measured at that head, 26 non-test
+# scripts call `worktree add` directly and only 5 of them are harness files, i.e. ~21 ungated
+# production call sites, not five. A hand-maintained count rots, and a reader sizing the exposure
+# from it is off by 4x. ENUMERATE instead — this is the script-scoped census, and it deliberately
+# admits comments and `*.test.sh` so that it is a SUPERSET to audit rather than a list that can
+# silently shrink (filter `\.test\.sh$`, `retired/`, and the three gated callers):
+#     git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired
+# Moving any of them onto `wt_provision` (or the `--disk-admit` verb) is the follow-up.
 #
 # ⛔ ONE PREDICATE, ON TWO BOUNDS — AND THE DIFFERENCE IS STATED, NOT GLOSSED (review round 2, P2).
 # `disk_admit` reads through `disk_free_mb_target` → `disk_free_mb`, classifies readability through
