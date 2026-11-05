@@ -1036,7 +1036,10 @@ else
     O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSC" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1
     chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
   }
-  if _pc_mut 'backlog=UNKNOWN\nhanded=\nqueue_readable=1\n' | grep -q "failed to read it"; then ok "pass-clause: non-vacuity — the pre-fix typed clause returns, and reddens the readable shape"
+  # here-string, not a pipe: a quiet `grep -q` exits at its first match and the still-writing producer
+  # takes SIGPIPE, which under `pipefail` turns a MATCHING assertion into a failing one (#841)
+  _pc_out="$(_pc_mut 'backlog=UNKNOWN\nhanded=\nqueue_readable=1\n')"
+  if grep -q "failed to read it" <<< "$_pc_out"; then ok "pass-clause: non-vacuity — the pre-fix typed clause returns, and reddens the readable shape"
   else bad "pass-clause: the reverted clause did not reproduce the defect — the mutation is not exercising the branch"; fi
 fi
 # NON-VACUITY: the pre-fix fail-open — a failed depth read COERCED to 0, and the record's UNKNOWN ignored.
