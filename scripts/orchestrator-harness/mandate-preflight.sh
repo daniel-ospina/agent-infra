@@ -51,7 +51,21 @@
 #   mandate_preflight_line                      → 0+ lines; EMPTY when every mandate file is present
 #   mandate_missing                             → one absolute path per missing file
 #   mandate_unreadable                          → one absolute path per file that exists but cannot be READ
+#   mandate_irregular                           → one absolute path per file whose path is occupied by a non-file
 #   mandate_files                               → the declaration, one `name|why` per line (the ONE home)
+# ⛔ THE THREE COLLECTORS ANSWER A LIST, NOT A VERDICT (review cycle 10, P2, MEASURED). `mandate_missing`,
+# `mandate_unreadable` and `mandate_irregular` each iterate the DECLARATION and print what they did not find,
+# so when that declaration renders nothing they return EMPTY at rc 0 — indistinguishable from "nothing is
+# missing / unreadable / irregular" — while `--check`, `--missing` and `--files` all answer 2 on the same
+# box. That is the #3377 silence one layer down, and `mandate_unreadable`'s own comment makes the argument
+# for the undecidable state only. They are therefore MEANINGFUL ONLY BEHIND `mandate_declaration_readable`:
+# every in-tree caller is one of the guarded verbs, and a future consumer that sources this file and calls
+# a collector directly must test that predicate first (the `lane.sh`/#2148 precedent). The short-circuit at
+# the top of each states the invariant; it changes no output, because an unreadable declaration already
+# makes `-f`/`-e` false for every name — so it is DELIBERATELY behaviour-neutral and is not separately
+# pinnable (deleting it leaves the suite green, and that is correct: no observable changes). What IS pinned
+# is the contract: each collector answers nothing for an unread declaration, and still works behind a
+# readable one (a disabled collector reddens 28 arms).
 #   bash mandate-preflight.sh --check           → 0 all present · 1 any missing · 2 CANNOT VERIFY
 #   bash mandate-preflight.sh --line            → the disclosure block (empty when all present)
 #   bash mandate-preflight.sh --missing         → the missing paths, one per line
@@ -171,6 +185,11 @@ mandate_state_root_undecidable() {
 mandate_missing() {
   local root spec name
   root="$(mandate_state_root)"
+  # ⛔ AN UNREAD DECLARATION MAKES THIS COLLECTOR ANSWER "NOTHING FOUND" (review cycle 10, P2, MEASURED):
+  # it iterates the declaration, so an empty declaration empties the whole population and this returns
+  # empty at rc 0 — the same false-clean as the undecidable state dir, one cause over. Stated explicitly
+  # (it changes no output: `-f`/`-e` already fail for every name); the VERDICT belongs to the guarded verbs.
+  if ! mandate_declaration_readable; then return 0; fi
   if mandate_state_root_undecidable; then return 0; fi
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
@@ -195,6 +214,11 @@ EOF
 mandate_irregular() {
   local root spec name
   root="$(mandate_state_root)"
+  # ⛔ AN UNREAD DECLARATION MAKES THIS COLLECTOR ANSWER "NOTHING FOUND" (review cycle 10, P2, MEASURED):
+  # it iterates the declaration, so an empty declaration empties the whole population and this returns
+  # empty at rc 0 — the same false-clean as the undecidable state dir, one cause over. Stated explicitly
+  # (it changes no output: `-f`/`-e` already fail for every name); the VERDICT belongs to the guarded verbs.
+  if ! mandate_declaration_readable; then return 0; fi
   if mandate_state_root_undecidable; then return 0; fi
   while IFS= read -r spec; do
     [ -n "$spec" ] || continue
@@ -217,6 +241,11 @@ EOF
 mandate_unreadable() {
   local root spec name
   root="$(mandate_state_root)"
+  # ⛔ AN UNREAD DECLARATION MAKES THIS COLLECTOR ANSWER "NOTHING FOUND" (review cycle 10, P2, MEASURED):
+  # it iterates the declaration, so an empty declaration empties the whole population and this returns
+  # empty at rc 0 — the same false-clean as the undecidable state dir, one cause over. Stated explicitly
+  # (it changes no output: `-f`/`-e` already fail for every name); the VERDICT belongs to the guarded verbs.
+  if ! mandate_declaration_readable; then return 0; fi
   # ⛔ NOTHING CAN BE SAID ABOUT A FILE THROUGH A DIR THAT CANNOT BE SEARCHED, so this says nothing —
   # stated EXPLICITLY, as both siblings above do, because an implicit empty result is indistinguishable
   # from "nothing is unreadable" to the next reader. (This is a statement of the invariant, not a

@@ -588,6 +588,28 @@ case "$FILES_UD" in
   *LANE-BRIEF-PREAMBLE.md*TORTOISE-GRAPH-BRIEF.md*'rc=0'*) ok "an UNRESOLVABLE state dir still yields the declared names at rc 0 — the names are static, and a presence question is not this verb's to answer" ;;
   *) bad "--files withheld the declared names on a box whose STATE DIR is unreadable — an over-block: the list is static and knowable ($(printf '%s' "$FILES_UD" | tr '\n' ' '))" ;;
 esac
+# ⛔ `--help` IS THE CONTRACT AN OPERATOR READS, AND IT WAS INVISIBLE TO THIS SUITE (review cycle 10, P2,
+# MEASURED): `grep -c 'usage:' mandate-preflight.test.sh` was 0, so cycle 9's own fix — which existed to
+# remove an untrue sentence from BOTH the comment and the `--help` — could be reverted on the `--help` half
+# and stay at 151 passed, 0 failed. The comment half is inert; the help half is what tells a consumer what
+# rc 2 means. Both halves are pinned: the true sentence must be there, and the false one must not.
+HELP_OUT="$(bash "$HELPER" --help 2>&1)"
+case "$HELP_OUT" in *'the names are static'*) ok "--help states WHY --files can answer 2 (the declaration renders no names) — the true contract, not the withdrawn over-block" ;; *) bad "--help no longer explains when --files answers 2 — revertible prose with no red" ;; esac
+case "$HELP_OUT" in *'error_state_dir'*|*'unresolvable state dir … renders no names'*) bad "--help still claims the withdrawn over-block" ;; *) ok "…and it does NOT claim the withdrawn over-block (an unresolvable state dir does not block the names)" ;; esac
+# ⛔ THE THREE COLLECTORS ARE LISTS, NOT VERDICTS (review cycle 10, P2, MEASURED): each iterates the
+# declaration, so an unread declaration makes all three print nothing at rc 0 — the same false-clean the
+# guarded verbs answer 2 for. Driven directly, the way a future sourced consumer would call them.
+for _coll in mandate_missing mandate_unreadable mandate_irregular; do
+  _coll_out="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; '"$_coll"' 2>/dev/null' _ "$HELPER")"
+  [ -z "$_coll_out" ]; ck $? "$_coll answers NOTHING for an unread declaration (the contract in this file's header: meaningful only behind mandate_declaration_readable; the VERDICT is the guarded verbs' job)"
+done
+# ⛔ …AND THEY STILL WORK BEHIND IT (the positive control, or a collector that always returned nothing passes).
+mkstate
+: > "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+MISS_OK="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_missing' _ "$HELPER")"
+[ "$(printf '%s\n' "$MISS_OK" | grep -c .)" = "1" ]; ck $? "POSITIVE CONTROL: with a readable declaration and the preamble present, mandate_missing names exactly the ONE absent file (measured $(printf '%s\n' "$MISS_OK" | grep -c .)) — the collector is not disabled"
+MISS_ONE="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_missing' _ "$HELPER" | grep -c 'TORTOISE-GRAPH-BRIEF')"
+[ "$MISS_ONE" = "1" ]; ck $? "…and it names the file that IS missing (so the collector was not disabled)"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
