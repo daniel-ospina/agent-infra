@@ -535,10 +535,12 @@ headroom.
     **MAY BE ITS OWN (unattributed)**, never as proof that another process caused it, while
     `reaped_runner_work=?` tells a reader the removal count is not a measurement. ⛔ **AND THE BYTES ARE
     `unmeasured` TOO, not a measured `0 MB`** (#3057 review): `freed_mb_runner_work=unmeasured`, with
-    `freed_mb_unmeasured` naming `runner-work`, because the under-reclaim sum and the pass total read that
-    field and a stub that deleted 40 MB reported a *confident* zero there while the note admitted the
-    figure was unknown — the note being the only surface that said so is the same "measured zero that is
-    not a measurement" this class's `?` polarity exists to remove. The class line names the MISSING
+    `freed_mb_unmeasured` naming `runner-work` and `freed_mb_total=unmeasured` — because the total is a sum
+    with this class's unconfirmed `0` in it, and that total is the figure `alert=under-reclaim` asserts on,
+    so the alert is suppressed for a pass whose class figure nobody measured. A stub that deleted 40 MB
+    reported a *confident* zero there while the note admitted the figure was unknown; the note being the
+    only surface that said so is the same "measured zero that is not a measurement" this class's `?`
+    polarity exists to remove. The class line names the MISSING
     LEDGER as the cause (`df ANSWERED, but the owner never did`), not "df could not answer", which would
     point an operator at the wrong component.
   * **Without `gone=`, an EMPTY sink and a VANISHED one were the same record.** The owner counts a
