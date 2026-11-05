@@ -323,6 +323,10 @@ BOUND_OK_RC = frozenset({"0", "na"})
 _BOUND_VERDICT_RE = None  # compiled lazily, so importing the module stays cheap
 _BOUND_RC_RE = None
 _BOUND_PID_RE = None
+# Presence of a `pid=` FIELD, whatever its value. Kept separate from `_BOUND_PID_RE` so
+# "the line names no incarnation" (ADOPT) and "the line names an unusable one" (DROP) stay
+# distinguishable — see `parse_bound_pid`.
+_BOUND_PID_FIELD_RE = None
 # `rc=` is captured on the SAME line, because a verdict without its exit status is
 # not a completion (see BOUND_OK_RC).
 
@@ -1057,6 +1061,13 @@ def _bound_pid_re():
     return _BOUND_PID_RE
 
 
+def _bound_pid_field_re():
+    global _BOUND_PID_FIELD_RE
+    if _BOUND_PID_FIELD_RE is None:
+        _bound_verdict_re()
+    return _BOUND_PID_FIELD_RE
+
+
 def _bound_rc_re():
     global _BOUND_RC_RE
     if _BOUND_RC_RE is None:
@@ -1073,8 +1084,11 @@ def _bound_verdict_re():
     # `_BOUND_RC_RE = _re.compile(...)` a LOCAL, compiling the pattern twice and discarding one.
     # It happened to work only because the `globals()` write came first, so deleting that line as
     # "redundant with the next one" would have silently broken `_bound_rc_re`'s
-    # `assert _BOUND_RC_RE is not None`. Three entries, one idiom, nothing to trip over.
-    global _BOUND_VERDICT_RE, _BOUND_RC_RE, _BOUND_PID_RE
+    # `assert _BOUND_RC_RE is not None`. Four entries, one idiom, nothing to trip over.
+    # The fourth (`_BOUND_PID_FIELD_RE`) records that a `pid=` FIELD was present at all, which
+    # `_BOUND_PID_RE` alone cannot distinguish from the field being absent — see
+    # `parse_bound_pid`'s DROP-vs-ADOPT split.
+    global _BOUND_VERDICT_RE, _BOUND_RC_RE, _BOUND_PID_RE, _BOUND_PID_FIELD_RE
     if _BOUND_VERDICT_RE is None:
         import re as _re
         # ⛔ THE VERDICT TOKEN AND THE `rc=` ARE PARSED SEPARATELY, for three reasons
@@ -1090,6 +1104,7 @@ def _bound_verdict_re():
         _BOUND_VERDICT_RE = _re.compile(r"\[lane-bound\]\s+VERDICT\b.*?\bverdict=([a-z][a-z-]*)")
         _BOUND_RC_RE = _re.compile(r"\brc=([0-9]+|na)\b")
         _BOUND_PID_RE = _re.compile(r"\bpid=([0-9]+)\b")
+        _BOUND_PID_FIELD_RE = _re.compile(r"\bpid=")
     return _BOUND_VERDICT_RE
 
 
@@ -1153,8 +1168,20 @@ def parse_bound_pid(text: str):
         return ""
     line_end = text.find("\n", last.start())
     line = text[last.start(): line_end if line_end >= 0 else len(text)]
-    pids = _bound_pid_re().findall(line.split(" log=")[0])
+    pid_head = line.split(" log=")[0]
+    pids = _bound_pid_re().findall(pid_head)
     if not pids:
+        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS NOT AN ABSENT ONE (cycle-6 review,
+        # P2). "Absent from the line" is the ADOPT row of the doc's binding table; "a pid that
+        # cannot be resolved" is the DROP row. This returned "" for both, so a line carrying
+        # `pid=abc` — reachable directly, `lane-bound.sh --pid` takes the value verbatim — took the
+        # ADOPT arm and published a verdict whose binding was never checked. The module's own
+        # `_bind_verdict` already has the drop for a non-pid token (`invalid-bound-verdict-pid`);
+        # it was unreachable from this parser, which is what marks the intent. `"?"` reaches it.
+        # `\bpid=` does not match `ppid=` / `cpu_delta_cs=` (a word boundary needs a non-word
+        # char before `p`), so this only fires on a real `pid=` field.
+        if _bound_pid_field_re().search(pid_head):
+            return "?"
         return ""
     # A pid token is capped at 10 digits DEFENSIVELY, not because `PID_MAX_DEFAULT` (4194304)
     # is 7 digits long. The cap exists so `int()` below never sees a 4300-digit token and

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with seventy-one paired mutations: every mutation re-
+Fifty-one tests with seventy-two paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (70)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (72)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1985,6 +1985,31 @@ def t43():
         check("bound-verdict-without-pid" in liv.evaluate(liv.Evidence(log_read=lr)).detail,
               "and the PUBLISHED verdict says it is unbound (a reader cannot otherwise "
               "tell a verified binding from an unbound one)")
+        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS *NOT* AN ABSENT ONE (cycle-6
+        # review, P2). \"absent from the line\" is the ADOPT row of the doc's binding table;
+        # \"a pid that cannot be resolved\" is the DROP row — and `lane-bound.sh --pid` takes
+        # the value VERBATIM, so `pid=abc` is reachable from the shipped writer, not only from
+        # a hand-edit. Collapsing the two into `\"\"` published a verdict whose binding was never
+        # checked: the same fail-open class, one surface over from the census's column 11.
+        for tok in ("abc", "?", "0x10"):
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%s rc=0\n" % tok)
+            lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+            check(lr.verdict == "",
+                  "a PRESENT-but-unusable pid=%r is dropped, not adopted; got %r"
+                  % (tok, lr.verdict))
+            check("unbound-bound-verdict" in lr.detail,
+                  "and dropped with the SAME reason the census gives; got %r" % lr.detail)
+            check("bound-verdict-without-pid" not in lr.detail,
+                  "never claiming the field was absent when it was present; got %r" % lr.detail)
+        # …and the boundary is not over-broad: `ppid=` is not a `pid=` field, and a line with
+        # neither is still the ADOPT row. A `\\b` needs a non-word char before `p`, which is
+        # the one thing keeping this guard from swallowing a legitimate unbound line.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane ppid=77 rc=0\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check(lr.verdict == "finished",
+              "`ppid=` is not a `pid=` field — the line is still adopted; got %r" % (lr.verdict,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2704,6 +2729,15 @@ MUTATIONS = [
     ),
     Mutation(
         "T43", "module",
+        '        if _bound_pid_field_re().search(pid_head):\n            return "?"',
+        '        if False:\n            return "?"',
+        "a `pid=` field that is PRESENT but unparseable (e.g. `--pid abc`, which "
+        "`lane-bound.sh` takes verbatim) is collapsed into \"no pid at all\", so the verdict "
+        "is ADOPTED with the binding never checked — the binding table's DROP row published "
+        "as its ADOPT row, one surface over from the census's column 11",
+    ),
+    Mutation(
+        "T43", "module",
         '    if within is False:',
         '    if False:',
         "a verdict naming ANOTHER incarnation is adopted, so a previous dispatch's "
@@ -2757,6 +2791,14 @@ MUTATIONS = [
         '                 and lr.transcript_grew is None)',
         "a NEGATIVE byte delta is read as a FLAT reading instead of a broken one, so a log "
         "that was just truncated or rotated freezes a lane that is working",
+    ),
+    Mutation(
+        "T48", "module",
+        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
+        '                return tok if (tok.isascii() and tok.isdigit()) else "?"',
+        "the digit cap is gone, so an out-of-range row pid reaches int() BEFORE `_bind_verdict` "
+        "decides and raises ValueError (the 4300-digit conversion limit), taking the whole "
+        "census run down after printing only the rows before it",
     ),
     Mutation(
         "T48", "module",
