@@ -2096,13 +2096,16 @@ git -C "$n44h/wk" worktree remove --force "$n44h/wt" 2>/dev/null
 # Asserting PRESENCE catches a shifted or empty slot; it cannot see a TRANSPOSITION, because both values
 # are still somewhere in the string. Measured by swapping the root and origin arguments at the `pushed`
 # reporter: `… before removing deadbeef; … origin holds /tmp/wt`, and pin-slot + sha-slot BOTH passed.
-# Each sha-reporting shape therefore gets its OWN adjacency anchor, because a presence test cannot tell
-# which slot a value landed in. ⛔ `before removing ` is NOT an anchor on that list: 8 of the 450 cells
-# contain it and 6 of those already name the root there, but the `tree measured dirty with
-# rescue=nothing` arm names the root EARLIER in the sentence and then pronominalises it ("before removing
-# it") — so pinning root-adjacency to that phrase would red 2 cells of that one correct arm while
-# constraining 3 sentences. What catches a root in the sha slot is that the SHA is then missing from the
-# slot's own introducer, which is what the adjacency anchors below test.
+# Each sha-reporting shape therefore needs an adjacency anchor, because a presence test cannot tell
+# which slot a value landed in. TWO of the three have one (`sha-transposed` for `origin holds <sha>`,
+# `origin-at-transposed` for `origin at <sha> (<b>)`); the third, `holds refs/heads/<b> at <sha>`, does
+# NOT need a new one, because a transposition there puts `deadbeef` into the ref slot and the existing
+# `ref-slot` presence test reds it (measured: 20 cells). ⛔ `before removing ` is NOT an anchor either:
+# 8 of the 450 cells contain it and 6 of those already name the root there, but the `tree measured dirty
+# with rescue=nothing` arm names the root EARLIER in the sentence and then pronominalises it ("before
+# removing it") — so pinning root-adjacency to that phrase would red 2 cells of that one correct arm
+# while constraining 3 sentences. What catches a root in the sha slot is that the SHA is then missing
+# from the slot's own introducer, which is what the adjacency anchors below test.
 n45_sha=deadbeef
 n45_bad=""; n45_all=""
 for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured clean; do
@@ -2123,8 +2126,12 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
       # Seven of the ninety distinct sentences carry no `MANUAL` at all — the `retrieve the archive`
       # reporter arms, `recover the uncommitted state`, `nothing at risk`, `nothing to recover`, the
       # `tree measured dirty with rescue=nothing` arm and the clean-branch-push abstention — so for those
-      # cells this check could not fire at all, and they are exactly the arms the tree dimension just
-      # added. Measured: with one surplus argument added to the `archived-local`/`pushed` reporter, and
+      # cells this check could not fire at all. ⛔ THREE OF THOSE SEVEN ARE TREE-ONLY, NOT ALL SEVEN:
+      # `nothing at risk`, `nothing to recover` and the clean-branch-push abstention are reachable ONLY
+      # through the tree dimension; the rest already ran at round 1's `LANE_END_TREE=dirty`. Which round
+      # added an arm is not the point — a word-based count cannot see ANY sentence that lacks the word,
+      # whichever matrix reached it. Measured: with one surplus argument added to the
+      # `archived-local`/`pushed` reporter, and
       # separately to the final `nothing at risk` arm, the format re-ran and printed the sentence TWICE
       # while the `MANUAL` count, the `%s` search and both slot assertions stayed green. Every arm ends
       # its format in a single `\n`, so a re-run is always a SECOND LINE — the line count covers all of
@@ -2162,8 +2169,9 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
           case "$n45_out" in *"$n45_sha"*) : ;; *) n45_bad="$n45_bad $n45_cell(sha-slot)" ;; esac ;;
       esac
       # ADJACENCY — the only thing that separates a correct slot from a TRANSPOSED one (see the header).
-      # Each sha-reporting SHAPE gets its own anchor; a presence test cannot tell which slot took the value.
-      # ⛔ `origin at ` IS THE THIRD SHAPE AND NEEDED ITS OWN (review cycle 23, P3 — REPRODUCED). `sha-slot`
+      # TWO of the three sha-reporting shapes are anchored here; the third (`holds refs/heads/…`) is
+      # caught by the `ref-slot` presence test above, because a transposition puts the sha in the ref slot.
+      # ⛔ `origin at ` IS THE SECOND AND NEEDED ITS OWN (review cycle 23, P3 — REPRODUCED). `sha-slot`
       # passes a transposition here because the sha is still PRESENT: swapping the two arguments at the
       # unpushed-only sentence renders `origin at develop (deadbeef)` and measured `bad:[none]` over all
       # 450 cells. `origin at ` occurs only in that one arm, so the anchor cannot red another.
@@ -2187,12 +2195,35 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
       # the same sentence also quotes the NARROWER `origin/<b>..HEAD` form it is contrasted against.
       case "$n45_out" in *'git -C '*) case "$n45_out" in *'git -C /tmp/wt '*) : ;; *) n45_bad="$n45_bad $n45_cell(gitroot-slot)" ;; esac ;; esac
       case "$n45_out" in *'read it yourself'*) case "$n45_out" in *'rev-list --count HEAD --not --remotes'*) : ;; *) n45_bad="$n45_bad $n45_cell(enum-trap)" ;; esac ;; esac
+      # ⛔ THE CAVEAT UNION ARGUMENT IS A SLOT TOO, AND NOTHING ASSERTED IT (review cycle 24, P3 —
+      # REPRODUCED). `push=unmeasured` + `rescue=FAILED` renders the rescue caveat, but DELETING that one
+      # union argument leaves the sentence intact — 5 specifiers, 4 arguments, so bash does NOT re-run the
+      # format — and the matrix reported `bad:[none]` while the suite stayed at 200 passed. The other
+      # domain's MANUAL fact vanished silently, which is the rule this file states four separate times.
+      # ⛔ THE INVERSE IS FALSE AND IS DELIBERATELY NOT ASSERTED: "every MANUAL arm must carry both
+      # caveats" was measured WRONG — 142 cells legitimately omit them, because their arms return above
+      # the caveat mechanism (and `not-a-worktree` / `not-measured` return above this arm entirely, so
+      # they never emit the phrase below at all). The anchor is therefore this arm's OWN phrase, and only
+      # the caveat for the value THAT CELL set is required.
+      case "$n45_out" in *'could NOT be read (push=unmeasured)'*)
+        case "$n45_rescue" in
+          FAILED|UNAVAILABLE) case "$n45_out" in *"NOT archived either (rescue=$n45_rescue)"*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
+          archived-local) case "$n45_out" in *'archived to the LOCAL pin'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
+        esac
+        case "$n45_tree" in
+          cannot-verify) case "$n45_out" in *'NOT PROVEN complete'*) : ;; *) n45_bad="$n45_bad $n45_cell(tree-caveat)" ;; esac ;;
+        esac ;;
+      esac
       # ⛔ THE TWO NEGATIVE SHAPES ARE KEPT, NOT DROPPED (review cycle 22, P3). Neither fires on today's
       # product (0 of the 90 sentences match), so nothing measurable was lost when they fell out of the
       # rewrite — but an EMPTY root in a `reap`/`before removing` arm and an EMPTY push verdict are
       # defects a future arm can reintroduce, and dropping a guard without saying so is how a suite
-      # quietly narrows. They are cheap, they are arm-agnostic, and they stay.
-      case "$n45_out" in *'reap  '*|*'reap `'*) n45_bad="$n45_bad $n45_cell(root-slot)" ;; esac
+      # quietly narrows. They are cheap, they are arm-agnostic, and they stay. ⛔ AND THE `before
+      # removing` HALF WAS NOT ACTUALLY COVERED (review cycle 24, P3 — REPRODUCED): the pattern named only
+      # `reap`, so emptying the root at the `pushed` reporter's `before removing %s` rendered `… before
+      # removing ; the BRANCH is the good half …` with the matrix at `bad:[none]`. The empty forms of
+      # both phrases are now matched, which is what this comment always claimed.
+      case "$n45_out" in *'reap  '*|*'reap `'*|*'before removing ;'*|*'before removing `'*) n45_bad="$n45_bad $n45_cell(root-slot)" ;; esac
       case "$n45_out" in *'push=)'*|*'push=,'*|*'push= '*) n45_bad="$n45_bad $n45_cell(empty-verdict)" ;; esac
       case "$n45_out" in *'%s'*) n45_bad="$n45_bad $n45_cell(unfilled-specifier)" ;; esac
     done
