@@ -1553,7 +1553,7 @@ Found N issues:
 
 | assertion | mutant (the edit that reverts the fix) | reddened row | observed |
 |---|---|---|---|
-| <file:line> — "<the behaviour it guards>" | <the edit that reverts it> | <the suite row that goes RED> | <the failing line + rc> |
+| `scripts/x.sh:120` — "the gate refuses an empty brief" | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `❌ … REFUSED with 80 (got 0)`, rc=1 |
 
 🤖 Generated with [Pi](https://pi.dev)
 
@@ -1571,10 +1571,16 @@ No issues found. Checked for bugs, guidance compliance, historical context, and 
 
 | assertion | mutant (the edit that reverts the fix) | reddened row | observed |
 |---|---|---|---|
-| <file:line> — "<the behaviour it guards>" | <the edit that reverts it> | <the suite row that goes RED> | <the failing line + rc> |
+| `scripts/x.sh:120` — "the gate refuses an empty brief" | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `❌ … REFUSED with 80 (got 0)`, rc=1 |
 
 🤖 Generated with [Pi](https://pi.dev)
 ```
+
+> ⛔ The row in both templates above is a **WORKED example, not a `<slot>`**: paste the SHAPE, then
+> replace every cell with your own attribution. An unfilled template satisfies the parser (its cells
+> are non-empty) and that is the one paste a reviewer who skipped the pass is most likely to make —
+> a filled example at worst yields a shaped-but-fabricated row, which a reader can falsify, while an
+> unfilled one yields nothing a reader can even check (fresh-context review of #3442, P2-D).
 
 > ⛔ **MUTATION ATTRIBUTION is REQUIRED, not decoration (agent-infra#3442).** For every assertion the
 > diff ADDS or CHANGES, name the mutant that reverts the behaviour and the row it turns RED — the

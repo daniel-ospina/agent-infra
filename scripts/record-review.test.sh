@@ -29,6 +29,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RECORD="$SCRIPT_DIR/record-review.sh"
 
+# ⛔ THE RECORDER RESOLVES `brief-gate.sh` FOR THE NON-VACUITY ARM (agent-infra#3442) AND THIS SUITE
+# MUST NOT INHERIT WHERE IT LOOKS. The chain is `$SELF`-adjacent, `$AGENT_INFRA_PATH/scripts/
+# orchestrator-harness`, `~/.pi/agent/scripts`; most arms here drive a MUTANT COPY under `$T` (no
+# sibling gate) with a private `$HOME`, so the rung that answers is the AMBIENT one — and on a box whose
+# `$AGENT_INFRA_PATH` or installed copy is one generation behind, that gate answers 78 for the new verb
+# and the recorder correctly REFUSES. Measured: six arms whose subject is the diff digest, the 402 cap
+# or the carry went red on exactly that, from box state rather than from the code under test — the same
+# "a fixture that inherits ambient env cannot make a claim about isolation" defect this suite already
+# fixed once. Pinning the root to THIS tree is the isolation. It SUPPLIES a resolution root rather than
+# opening a gate (the `spawn-gate.test.sh` rule): the fail-closed case is still pinned, by 13v4's
+# stale-validator arm, which wins on the `$SELF`-adjacent rung ABOVE this one.
+export AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+
+
 PASS=0
 FAIL=0
 ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
@@ -4513,15 +4528,16 @@ for _q2_state in CHANGES_REQUESTED DISMISSED PENDING; do
 done
 rm -f "$(Q2 424764)"
 EV_REF="review:42476401" run_record_ev 424764 STUB_EVIDENCE_BODY="" STUB_REVIEW_STATE="APPROVED"
-# ⛔ #3442 CHANGES THE CONTROL, AND SAYS SO: an EMPTY body can no longer be clean evidence (a clean
-# claim must carry the attribution block), so the control's SUBJECT — that the empty-field parse
-# preserves `state` instead of collapsing it into `body` — is now pinned by the REASON rather than by
-# the exit code. If the `%%`/`#` split regressed, `body` would become "APPROVED" and the refusal would
-# come from the STATE arm (or from no arm at all); if the split works, the only arm left to refuse an
-# empty APPROVED review is the non-vacuity one. That is a STRONGER assertion than "rc 0", not a weaker
-# one, and the CHANGES_REQUESTED/DISMISSED/PENDING loop above now asserts its own reason the same way.
-assert_eq "$RECORD_RC" "3" "13q2 control: an empty-body APPROVED review is refused by the NON-VACUITY arm, not the state arm (rc 3)"
-case "$RECORD_ERR" in *"MUTATION ATTRIBUTION"*) ok "13q2 …and the refusal NAMES the non-vacuity arm (so the empty body was parsed as empty, not as the state)" ;; *) bad "13q2 …the refusal did not name the non-vacuity arm: $(printf '%.160s' "$RECORD_ERR")" ;; esac
+# ⛔ #3442 CHANGES THE CONTROL, AND THE MESSAGE NOW CLAIMS ONLY WHAT IT CAN PROVE (fresh-context
+# review of this change, P2-C). An EMPTY body can no longer be clean evidence (a clean claim must carry
+# the attribution block), so these two controls now assert the NON-VACUITY refusal. They do NOT claim
+# to pin the empty-field parse — an earlier revision said they did, and that claim was unfalsifiable:
+# if the `%%`/`#` split regressed and `body` became "APPROVED" (state empty), the non-vacuity arm
+# would emit the SAME text, so the assertion would be green in both worlds. The parse IS pinned — by
+# the CHANGES_REQUESTED/DISMISSED/PENDING loop above, whose assertion names the STATE (only the state
+# arm emits that word), so a collapsed parse reddens it.
+assert_eq "$RECORD_RC" "3" "13q2 control: an empty-body APPROVED review is refused by the NON-VACUITY arm (rc 3)"
+case "$RECORD_ERR" in *"MUTATION ATTRIBUTION"*) ok "13q2 …and the refusal names the non-vacuity arm (the state arm never fires for APPROVED)" ;; *) bad "13q2 …the refusal did not name the non-vacuity arm: $(printf '%.160s' "$RECORD_ERR")" ;; esac
 rm -f "$(Q2 424765)"
 EV_REF="review:42476501" run_record_ev 424765 STUB_EVIDENCE_BODY="" STUB_REVIEW_STATE="COMMENTED"
 assert_eq "$RECORD_RC" "3" "13q2 control: an empty-body COMMENTED review is refused by the NON-VACUITY arm (rc 3)"
@@ -4572,7 +4588,7 @@ ln -sfn "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" "$T/brief-gate.sh"
 # stays: the next reader who drives the mutant end-to-end must not hit a failure that has nothing to
 # do with the arm under test.
 ln -sfn "$SCRIPT_DIR/lib" "$T/lib"
-sed 's|^\(  ma_miss="\$(printf .*--mutation-missing - 2>/dev/null)"$\)|  ma_miss=""  # MUTANT: the pre-3442 code, which asked nothing|' "$RECORD" > "$VACU_MUT"
+sed 's|^\(  ma_miss="\$(printf .*--mutation-missing - 2>/dev/null)".*\)$|  ma_miss=""  # MUTANT: the pre-3442 code, which asked nothing|' "$RECORD" > "$VACU_MUT"
 if cmp -s "$RECORD" "$VACU_MUT"; then bad "13v MUTANT: the sed anchor no longer matches — the mutation is not applied, so the arm below would prove nothing"; else ok "13v MUTANT: the non-vacuity check is really removed from the shipped recorder"; fi
 bash -n "$VACU_MUT" && ok "13v MUTANT: the mutant still parses (it fails for the contract, not for a syntax error)" || bad "13v MUTANT: the mutant does not parse"
 # ⛔ THE SEAM IS `verify_review_evidence` ITSELF, NOT THE WHOLE RECORDER, and that is a deliberate
@@ -4605,6 +4621,33 @@ VACU_MUT_RC="$(run_verify_direct "$VACU_MUT")"
 assert_eq "$VACU_MUT_RC" "0" "13v ⛔ MUTATION: with the non-vacuity check removed, the SAME fixture is ADMITTED (rc $VACU_MUT_RC) — so 13v3 reddens ON THIS ARM, not on an unrelated one"
 unset STUB_EVIDENCE_BODY
 rm -f "$(Q2 $VACU_PRE)"
+# ── 13v4 — FOUND-BUT-UNANSWERABLE IS A CANNOT-VERIFY (fresh-context review of this change, P1 Y). ──
+# The first cut read the validator's STDOUT as the verdict and never its STATUS, so a `brief-gate.sh`
+# that predates `--mutation-missing` — the pre-#3442 CLI answers `printf usage >&2; exit 78` — produced
+# EMPTY stdout, which read as "the artifact is fine" and minted the record. This arm puts a STALE gate
+# in the mutant's own `$SELF`-adjacent home (the first rung of the recorder's ladder) and drives the
+# shipped caller, so the assertion is on the recorder, not on a hand-written predicate.
+# ⛔ A PLAIN COPY OF THE RECORDER LIVES IN `$T`, so the stale gate is its FIRST resolution rung. The
+# shipped `$RECORD` keeps `scripts/` as its first rung — where the REAL gate sits — so driving it would
+# test the real validator and the stale one would never be consulted (a fixture that cannot reach the
+# state it claims to test).
+cp "$RECORD" "$T/record-review-plain.sh"
+printf '#!/bin/sh\ncase "$1" in --check|--section|--line|--missing) exit 0;; *) echo "usage: $0 …" >&2; exit 78;; esac\n' > "$T/brief-gate.stale"
+rm -f "$T/brief-gate.sh"
+ln -sfn "$T/brief-gate.stale" "$T/brief-gate.sh"
+chmod +x "$T/brief-gate.stale"
+export STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
+VACU_STALE_RC="$(run_verify_direct "$T/record-review-plain.sh")"
+assert_eq "$VACU_STALE_RC" "1" "13v4 a STALE validator (one that predates --mutation-missing, exit 78) makes the recorder REFUSE, not mint (rc $VACU_STALE_RC) — a cannot-verify is never a pass"
+# …and the mutant that drops the status check is what re-opens the fail-open, so the arm above is
+# load-bearing on the line it names and not on the resolution ladder.
+VACU_RCMUT="$T/record-review-rc-mutant.sh"
+sed 's/^  if \[ "$ma_rc" -ne 0 \]; then$/  if false; then/' "$RECORD" > "$VACU_RCMUT"
+if cmp -s "$RECORD" "$VACU_RCMUT"; then bad "13v4 MUTANT: the sed anchor no longer matches — the status check is not removed, so the arm above proves nothing"; else ok "13v4 MUTANT: the status check is really removed from the shipped recorder"; fi
+VACU_RC_RC="$(run_verify_direct "$VACU_RCMUT")"
+assert_eq "$VACU_RC_RC" "0" "13v4 ⛔ MUTATION: with the status check removed, the SAME stale validator MINTS (rc $VACU_RC_RC) — the fail-open the review found, reproduced"
+unset STUB_EVIDENCE_BODY
+rm -f "$T/brief-gate.sh"; mv "$T/brief-gate.real" "$T/brief-gate.sh" 2>/dev/null || ln -sfn "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" "$T/brief-gate.sh"
 # POLARITY CONTROL, and it is an EXISTING arm rather than a new one: §20.0 mints a `not-clean` record
 # over an artifact that carries NO attribution block ('## Review — NOT CLEAN …', no table). A negative
 # verdict legitimately has no kill table, so this arm is what reddens if the non-vacuity check ever
