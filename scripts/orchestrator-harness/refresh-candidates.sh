@@ -5921,7 +5921,18 @@ fi
 if [ -s "$O/landed.txt" ]; then
   echo "[refresh] landed (awaiting verify/close or a re-scope), not queued: $(tr '\n' ' ' < "$O/landed.txt")"
 fi
-echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" | tr -d ' ') issues"
+# ⛔ BOTH DEPTH STATEMENTS OF A MAIN PASS ARE GUARDED, HERE AND AT THE HANDOFF — and this comment is the
+# EXTRACTION ANCHOR for rank-queue.test.sh's handoff drive (a positional anchor alone matched the SKIP
+# arm's identical `if [ -f ] && [ -r ]` guard 1,700 lines up, so that drive executed both arms).
+# ⛔ THE SAME GUARD AS THE HANDOFF'S (review P3, cycle 13). This line was left unguarded, so a queue that is
+# a directory printed `wc: 'standard input': Is a directory` to stderr AND `backlog now 0 issues` — a
+# MEASURED-zero claim over a queue the pass could not read, twenty-five lines above the arm that says
+# `the queue could NOT be READ … backlog=UNKNOWN`. One pass cannot say both; the read decides which.
+if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+  echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ') issues"
+else
+  echo "[refresh] checked $judged; backlog depth UNKNOWN — $O/candidates.txt is not a readable regular file, so this pass cannot say how deep the queue is (this is NOT an empty queue)"
+fi
 # ⛔ THE STARVED-PASS SUMMARY IS SEPARATE FROM THE COUNT ON PURPOSE. `checked 2` over a 203-issue pool
 # would otherwise read like a healthy pass that ran out of work; the pass stopped because it ran out of
 # BUDGET, and the two facts must not share one sentence (agent-infra#1736's vocabulary: READ/EMPTY are
@@ -6008,7 +6019,11 @@ if [ -n "$_head_issue" ]; then
 # plain number (a CRLF row, a `#1234`-prefixed row) printed "the queue is empty and this pass queued
 # nothing usable" and recorded `backlog=0` over those rows — the #1931 polarity this PR exists to close.
 # `_backlog_n` is the MEASURED depth; the head is a different question and gets its own honest answer.
-elif [ "$_backlog_n" -eq 0 ]; then
+# ⛔ AND THE TEST IS NOT ARITHMETIC ON AN EMPTY VALUE (review P3, cycle 13). `[ "$_backlog_n" -eq 0 ]` is
+# REACHED with `_backlog_n=""` (an unreadable or absent queue) and bash answers that with
+# `[: : integer expression expected` on stderr — one line above the sentence that explains the state, i.e.
+# the very noise class this PR fixed for `.queue-rank`. The `-n` conjunct short-circuits it.
+elif [ -n "$_backlog_n" ] && [ "$_backlog_n" -eq 0 ]; then
   echo "[refresh] handed to dispatch: NONE — the queue is empty and this pass queued nothing usable (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
