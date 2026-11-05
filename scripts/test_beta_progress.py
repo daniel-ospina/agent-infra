@@ -1030,6 +1030,26 @@ def test_gh_returns_None_on_any_failure_and_never_an_empty_list(monkeypatch):
             "rc=%r stdout=%r must be UNKNOWN (None) -- an empty list renders as a measured zero"
             % (rc, out))
 
+    # ⛔ …AND THE TWO `except` ARMS WERE STILL UNPINNED (review cycle 11, finding 1). Every case
+    # above hands `gh()` a COMPLETED command with empty-or-`[]` stdout, so it never reaches either
+    # exception path: `(0, "")` and `(0, "   \n")` short-circuit at the `if not out: return None`
+    # guard BEFORE the parse, and nothing makes `subprocess.run` raise. Measured: mutating EITHER
+    # arm's `return None` to the pre-fix `return []` left the suite at `22 passed` — the same
+    # mutation-survival this test exists to end, one arm over. Both are reachable in production:
+    # a truncated body, an HTML rate-limit page, or a layer warning on stdout takes the PARSE arm;
+    # a missing or unelevatable `gh` binary takes the SPAWN arm. Both mean UNKNOWN.
+    for out in ("not json", '{"truncated"', "<html>rate limited</html>"):
+        monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(0, out))
+        assert bp.gh("issue", "list") is None, (
+            "rc=0 stdout=%r is not JSON -- a parse failure is UNKNOWN, never an empty list" % out)
+
+    def _cannot_spawn(*a, **k):
+        raise OSError("gh is not on PATH")
+
+    monkeypatch.setattr(bp.subprocess, "run", _cannot_spawn)
+    assert bp.gh("issue", "list") is None, (
+        "a gh that could not be spawned is UNKNOWN -- the spawn arm must not render as []")
+
     # ... and a SUCCESSFUL read that genuinely returns [] is a real answer, not an abstention.
     monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(0, "[]"))
     assert bp.gh("issue", "list") == []

@@ -21,7 +21,7 @@ Restored by #1862 and pinned by this suite:
     python3 tools/fleet/fleet_health.test.py
     python3 tools/fleet/fleet_health.test.py --red-control
 
-RED CONTROL — five mutations of the shipped module, each written to a TEMP copy and re-imported
+RED CONTROL — six mutations of the shipped module, each written to a TEMP copy and re-imported
 (a mutation the suite does not catch is reported as a suite FAILURE). The first one is the
 pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
@@ -31,6 +31,9 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
                                                  (census-only; the same run prints 26 `❌`
                                                  lines because the ambient HARNESS failure is
                                                  included and is red on the UNMUTATED module too)
+  * drop `attributed` from main()                -> 3 paired CENSUS reds (the healthy-box arms)
+                                                 — the OPPOSITE polarity to the mutation above:
+                                                 it makes the census cry wolf on every live box
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -53,12 +56,22 @@ patched for the duration of a leg and restored in a `finally`, so nothing touche
 or the real launchd.
 
 ⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
-(**five** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
+(**seven** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
 once PER RECORDED LANE for three distinct reads: a lane-row `cputime_secs`, one `_observed` ->
 `scripts/lib/pid-identity.sh probe`, and a `cputime_secs` from the STATE snapshot write the
-enumeration runs for every recorded pid. For the two all-dead arms' seven records that measures
-14 + 7 = **21 real reads**; those target the FIXTURE's pid (`99999999`), so they are not "about
-THIS process". The abstaining-record arm is the one that reads `os.getpid()` (one record, bound 3)
+enumeration runs for every recorded pid. Per recorded lane that is 3; what each arm actually
+reaches:
+
+  * the TWO ALL-DEAD arms (`rc_stale`, `rc_unv`) — seven records: 14 + 7 = **21 each**, because
+    `_observed` runs through the REAL probe there;
+  * the TWO HOLDER arms (`rc_live`, `rc_liveu`) — seven records: 2 × 7 = **14 each**, because
+    `_observed` is stubbed to `holder`, so only the two `cputime_secs` reads per record remain;
+  * the abstaining-record arm — one record reading `os.getpid()`, bound 3;
+  * the two default-store arms — no ROSTERED record (`_drive`'s default store holds two
+    non-rostered sessions), so they reach the table **zero** times.
+
+Every one of the fixture-based reads targets the FIXTURE's pid (`99999999`), so they are not "about
+THIS process". The abstaining-record arm is the one that reads `os.getpid()`
 and it IS independent of what those reads return — its lane is `pidStartSeconds`-absent, which
 abstains regardless. The TWO ALL-DEAD `_drive` arms (`rc_stale`, `rc_unv`) are NOT independent:
 each turns on `_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on
