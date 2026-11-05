@@ -276,11 +276,17 @@ STATES = ("dead", "running-quiet", "wedged", "idle", "unknown")
 #              while the supervisor still calls the lane progressing).
 #   finished   the process tree is GONE and the lane WROTE A VERDICT that says
 #              its turn completed (``lane-bound.sh``'s own line).
-#   no-verdict the process tree is GONE and the lane wrote NO recognisable BOUND
-#              verdict — the bound never reported a completion, so completion is
-#              unassertable. ⛔ IT IS NOT "told us nothing": the LAUNCHER's own
-#              `rc=<n>` may be perfectly readable and is reported in ``detail``
-#              (``merge-one.sh`` has no bound at all — see ``gather_log_lane``).
+#   no-verdict the process tree is GONE and the lane's turn is NOT established as
+#              COMPLETE. ⛔ TWO ARMS REACH IT, and each says which in ``reason``:
+#              (a) ``process-gone-no-verdict`` — NO recognisable BOUND verdict was
+#                  written. This is NOT "told us nothing": the LAUNCHER's own
+#                  `rc=<n>` may be perfectly readable and is reported in
+#                  ``detail`` (`merge-one.sh` has no bound at all).
+#              (b) a verdict WAS written and says `verdict=finished`, but an `rc=`
+#                  — on the bound line or on the launcher's — shows the turn did
+#                  NOT complete: ``bound-finished-rc:<n>`` /
+#                  ``bound-finished-runner-rc:<n>``. That is the CRASHED lane the
+#                  `rc` conjunct exists to keep out of ``finished``.
 #              A NEW, honest state: it is what the 200–400 B artefacts of
 #              2026-11-03 were, and reading that shape as ``dead`` is the false
 #              negative this axis removes.
