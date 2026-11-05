@@ -2693,9 +2693,20 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # was `?` aborted the WHOLE run with a traceback after printing only the rows
             # before it (measured: `?\t<log>\t0\t?\tfinished\t...` -> ValueError, rc=1).
             def _num(idx):
+                # ⛔ "PRESENT BUT UNUSABLE" IS NOT "ABSENT" (cycle-6 review, P2). This used to
+                # return "" for BOTH, so a census row whose column 11 was the documented
+                # not-read token `?` fell through to the `else` arm below — the one the comment
+                # labels "Column 11 absent" — and the verdict was ADOPTED with
+                # `bound-verdict-without-pid`, claiming a binding the row never carried. The
+                # doc's binding table says the opposite (`docs/ops/fleet-liveness.md`: "a pid
+                # that cannot be resolved | unbound-bound-verdict | dropped → no-verdict", and
+                # the same five rules apply to column 11), and `_bind_verdict` already encodes
+                # it for `--verdict-file`. So the unresolvable token is reported as `?` and the
+                # ONE binding implementation decides — the two paths cannot drift again.
                 tok = f[idx].strip() if idx < len(f) else ""
-                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10
-                        else "")
+                if not tok:
+                    return ""
+                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"
 
             verdict_pid = _num(10)
             row_pid = _num(0)
@@ -2715,11 +2726,16 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # verdict is dropped (fail-closed), exactly as an unverifiable `verdict_pid`.
             # And an adopted-but-unbound row now DECLARES itself, the fifth rule.
             if lr.verdict:
-                if not row_pid:
+                if not row_pid or row_pid == "?":
                     # No readable pid to bind TO: the verdict cannot be attributed at
                     # all, so it is dropped (fail-closed).
                     why, note = ("unbound-bound-verdict query_pid=? source=census", "")
                 elif verdict_pid:
+                    # ⛔ `?` MEANS COLUMN 11 WAS PRESENT AND UNRESOLVABLE, and it is routed
+                    # through `_bind_verdict` (which drops it) rather than to the adopt arm
+                    # below. Those are different rows: `?` is the census's own not-read
+                    # token, and adopting it publishes a verdict whose binding was never
+                    # checked — the fail-open this block exists to close.
                     why, note = _bind_verdict(lr, int(row_pid))
                 else:
                     # Column 11 absent — the documented 10-column row. §13's table's

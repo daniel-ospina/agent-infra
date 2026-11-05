@@ -1819,7 +1819,7 @@ fleet reader's home. A row whose `verdict_pid` does not resolve inside the queri
 `no-verdict` exactly as in `gather_log_lane`.
 
 Regression contract: `python3 tools/fleet/liveness.test.py` (51 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (71 mutations, each of which must make its paired
+`python3 tools/fleet/liveness.test.py --mutations` (70 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder); T43–T44 are its BINDING (an appended log line left by an EARLIER dispatch is

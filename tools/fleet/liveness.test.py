@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (71)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (70)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2149,6 +2149,19 @@ def t48():
         rc, out = census("123456\t%s\t0\t?\tfinished\t0\t999999\t%d\t?\t0\n" % (log, size))
         check("bound-verdict-without-pid" in out,
               "an unbound adoption is declared on the census surface; got %r" % out)
+
+        # ⛔ COLUMN 11 PRESENT BUT UNRESOLVABLE IS NOT COLUMN 11 ABSENT (cycle-6 review, P2).
+        # `?` is this census's own not-read token, and it used to be collapsed into "absent",
+        # which took the ADOPT arm and published a verdict whose binding was never checked —
+        # with a detail claiming `bound-verdict-without-pid`, i.e. "about a line that DID carry
+        # a pid". The doc's binding table says a pid that cannot be resolved is DROPPED.
+        rc, out = census("123456\t%s\t0\t?\tfinished\t0\t999999\t%d\t?\t0\t?\n" % (log, size))
+        check("finished" not in out,
+              "an UNRESOLVABLE col-11 pid must DROP the verdict, not adopt it; got %r" % out)
+        check("bound-verdict-without-pid" not in out,
+              "and must not claim the pid was absent — it was present and unusable; got %r" % out)
+        check("unbound-bound-verdict" in out,
+              "it must drop with the SAME reason `--verdict-file` gives; got %r" % out)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2726,13 +2739,6 @@ MUTATIONS = [
         "(and but for that guard, int() would raise out of gather_log_lane)",
     ),
     Mutation(
-        "T48", "module",
-        '                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10',
-        '                return (tok if tok.isascii() and tok.isdigit()',
-        "a census row with an unbounded pid token raises in int() and takes the whole "
-        "run down after printing only the rows before it",
-    ),
-    Mutation(
         "T49", "module",
         '    if not 1 <= len(fields) <= 3 or not all(f.isascii() and f.isdigit() for f in fields):',
         '    if not 1 <= len(fields) <= 3 or not all(f.isdigit() for f in fields):',
@@ -2754,10 +2760,11 @@ MUTATIONS = [
     ),
     Mutation(
         "T48", "module",
-        '                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10',
-        '                return (tok if tok.isascii() and tok.isdigit()',
-        "int('?') raises, so one unreadable census row aborts the WHOLE run with a "
-        "traceback after printing only the rows before it",
+        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
+        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else ""',
+        "a col-11 pid that is PRESENT but unusable is collapsed into \"absent\", so the census "
+        "takes the ADOPT arm and publishes a verdict whose binding was never checked — the "
+        "fail-open the col-11 rule exists to close",
     ),
     Mutation(
         "T48", "module",

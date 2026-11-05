@@ -941,9 +941,25 @@ def loop_pid():
 
 
 def pid_alive(pid):
+    # ⛔ `OverflowError` IS NOT AN `OSError` (cycle-6 review, P2), and this is the SECOND place the
+    # same class bit this file: `os.kill(10 ** 400, 0)` raises `OverflowError`, so a pidfile written
+    # by a foreign writer / restored state dir / hand-edit escaped `pid_alive` entirely. The two
+    # callers below are both recovery paths, so the effect is the one `loop_pid`'s own comment calls
+    # out: `--status`, `--verify`, `--stop` AND `--start` all die on a traceback, and the cell's only
+    # scheduler can never come back (measured: `FAIL: --start: OverflowError: Python int too large
+    # to convert to C long`). The lock probe at `acquire_lock` raises instead of stealing the dead
+    # lock, so that job never runs again on any pass.
+    #
+    # The BOUND is the primary guard and `OverflowError` is only defence in depth: no real pid
+    # reaches 2**31, so an out-of-range value is corrupt by definition and "not alive" is the
+    # answer both callers need (a wedged loop restarts, a dead lock is stolen).
+    if not isinstance(pid, int) or pid <= 0 or pid > 2 ** 31 - 1:
+        return False
     try:
         os.kill(pid, 0)
         return True
+    except OverflowError:
+        return False
     except OSError as exc:
         return exc.errno == errno.EPERM
 

@@ -1217,6 +1217,57 @@ kill -0 "$bystander" 2>/dev/null \
   || bad "--stop did not record the OFF decision"
 kill "$bystander" 2>/dev/null
 
+# ── 13c. an OUT-OF-RANGE pid in loop.pid must not wedge every verb ─────────────────────────────
+# `loop_pid()` parses `int(...)` and hands the result to `pid_alive()`, which caught only
+# `OSError`. `os.kill(10 ** 400, 0)` raises `OverflowError` — an `ArithmeticError`, NOT an
+# `OSError` — so it escaped BOTH recovery callers: `loop_pid()` (used by --status/--verify/--stop/
+# --start/--install/--loop, i.e. every recovery command) and `acquire_lock()`'s probe (which then
+# raises instead of stealing a dead lock, so that job never runs again on any pass). The pidfile
+# is written by a foreign writer / restored state dir / hand-edit — the same producer this file's
+# own comments name for the 0-byte and short-write arms. Measured on the pre-fix tree:
+# `FAIL: --start: OverflowError: Python int too large to convert to C long`, i.e. the cell's only
+# scheduler could never come back.
+case_ "13c. an out-of-range pid in loop.pid is not a live loop and cannot wedge every verb"
+# The PREMISE, asserted rather than assumed: this is the exact exception class the fix is for.
+# Without it the case below could pass for an unrelated reason on some other interpreter.
+premise="$(python3 - <<'PYRANGE'
+import os, sys
+try:
+    os.kill(10 ** 400, 0)
+except OverflowError:
+    print("OverflowError" if not issubclass(OverflowError, OSError) else "WRONG-CLASS")
+except Exception as exc:
+    print(type(exc).__name__)
+PYRANGE
+)"
+[ "$premise" = "OverflowError" ] \
+  && ok "13c premise: an out-of-range pid raises OverflowError, which is NOT an OSError" \
+  || bad "13c premise is wrong on this interpreter (got '$premise') — the case below proves nothing"
+state_reset "$GOOD"
+printf '%s\n' "1000000000000000000000000000000000000000000" > "$FLEET_SCHEDULE_STATE/loop.pid"
+out="$(run "$GOOD" --status)"; rc=$?
+case "$out" in
+  *Traceback*|*OverflowError*) bad "--status died on a corrupt pidfile: $out" ;;
+  *) ok "--status survives an out-of-range pid in loop.pid" ;;
+esac
+out="$(run "$GOOD" --verify)"; rc=$?
+case "$out" in
+  *Traceback*|*OverflowError*) bad "--verify died on a corrupt pidfile: $out" ;;
+  *) ok "--verify survives an out-of-range pid in loop.pid" ;;
+esac
+# …and the recovery that matters: the loop must still be STARTABLE. A verb that merely avoids the
+# traceback but cannot bring the scheduler up leaves the cell just as dead.
+out="$(run "$GOOD" --start)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--start brings the loop up over an out-of-range pid (rc=0)" \
+  || bad "--start could not recover from an out-of-range pid (rc=$rc): $out"
+newpid13c="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+[ -n "$newpid13c" ] && [ "$newpid13c" != "1000000000000000000000000000000000000000000" ] \
+  && ok "loop.pid was rewritten to a REAL pid (the corrupt value did not survive)" \
+  || bad "loop.pid still holds the out-of-range value ($newpid13c)"
+kill -0 "$newpid13c" 2>/dev/null && ok "the loop it started is alive" \
+  || bad "--start claimed a loop that is not alive"
+run "$GOOD" --stop >/dev/null 2>&1
+
 # ── 14. --install must not race the loop's first tick ──────────────────────────────────────
 case_ "14. --install verifies a HEALTHY install whose loop is still in its first pass"
 RACE="$FIX/race"; mkdir -p "$RACE"; cp "$GOOD/RETIRED" "$RACE/RETIRED"
@@ -1362,8 +1413,17 @@ json.dump({"label": "com.test.echo", "started": now - 60, "deadline": 10 ** 400}
           open(os.path.join(state, "busy", "com.test.echo.json"), "w"))
 PYBIG
 out="$(run_v15 1800)"; rc=$?
-[ "$rc" -eq 1 ] && ok "a big-int busy deadline is dropped, not raised out of --verify (rc=1)" \
-  || bad "a big-int deadline did not fail closed (rc=$rc): $out"
+# ⛔ rc ALONE DOES NOT DISCRIMINATE HERE (cycle-6 review, P2). `main()`'s blanket
+# `except Exception` turns the uncaught OverflowError into exit 1 TOO, so a bare `rc -eq 1`
+# passed on the pre-fix tree while `--verify` was dying on a traceback rather than naming the
+# dropped marker. Measured: reverted, this arm read ✅ while its sibling traceback arm read ❌.
+# The stale-tick message is the positive control — it is only reachable if the marker was
+# DROPPED and the tick then read stale, which is the whole point of the fix.
+if [ "$rc" -eq 1 ] && grep -q 'stale after' <<<"$out"; then
+  ok "a big-int busy deadline is dropped (named stale tick), not raised out of --verify"
+else
+  bad "a big-int deadline did not fail closed as a stale tick (rc=$rc): $out"
+fi
 case "$out" in *OverflowError*|*Traceback*) bad "a big-int deadline RAISED out of --verify: $out" ;; *) ok "…and it did not raise a traceback out of the verifier" ;; esac
 grep -q 'BUSY' <<<"$out" && bad "a big-int-deadline marker was reported as a running job: $out" \
   || ok "no big-int-deadline marker is reported as a running job"
