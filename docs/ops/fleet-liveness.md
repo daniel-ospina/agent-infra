@@ -429,7 +429,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**55 tests with 103 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**55 tests with 104 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
 > suite is **T32–T55**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
@@ -812,7 +812,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 55 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (103)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (104)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -1750,7 +1750,8 @@ that line (`parse_runner_line` → `LogRead.runner_rc`):
 
 | bound line | launcher line (`[timeout] agent pid=<same pid> … rc=<n>`) | result |
 |---|---|---|
-| `rc=0` | (not consulted) | `finished` — `run` mode's own success witness |
+| `rc=0` | `rc=0`, or **absent** | `finished` — `run` mode's own success witness (nothing contradicts it) |
+| `rc=0` | `rc=<non-zero>` | **`no-verdict`** (`bound-finished-runner-rc:<n>`) — the CALLER reaped the child and says it did not complete, so the two lines disagree and **completion is not established**. `rc=0` reaches this row only from `run` mode (production is `watch`, where `V_RC=na`), a hand-edited `$log.lanebound`, or a foreign producer — exactly the population where a disagreement must resolve fail-closed |
 | `rc=na` | `rc=0` | `finished` — corroborated completion |
 | `rc=na` | `rc=<non-zero>` | **`no-verdict`** (`bound-finished-runner-rc:<n>`) — the bound fired nothing, yet the child did NOT complete |
 | `rc=na` | **absent** | **`unknown`** (`finished-rc-uncorroborated`) — an abstention, never an assumed success |
@@ -1760,6 +1761,14 @@ that line (`parse_runner_line` → `LogRead.runner_rc`):
 | `rc=na` | the COMPLETION WATCHDOG's line — `[task] sub-agent (pid N) completed but did not exit within 15s — killing (completion watchdog)` (`extensions/builtin-tools/index.ts`) | **absent to this parser, for a different reason**: it carries no `[timeout] agent` marker at all, so it is never a candidate. (An earlier revision of this row quoted that line with a `[timeout] agent` prefix — a shape **no producer writes** — and attributed its skip to the missing `pid=`, which is the wrong guard) |
 | `rc=na` | present but its `rc` is **unreadable** (not a 1–3 digit status, e.g. `0x0`, `exit:0`, a runaway token) | **`unknown`** (`finished-rc-uncorroborated`, and `detail` names `runner-rc-unreadable`) — an unreadable status is not a negative fact, and it is **not** the same fact as an absent line |
 | `rc=7` | (not consulted) | **`no-verdict`** (`bound-finished-rc:7`) |
+
+⛔ **THE LAUNCHER LINE IS CONSULTED FOR EVERY ACCEPTED `rc=`, NOT ONLY `na`.** An earlier revision
+left this table saying `(not consulted)` for `rc=0`, while the `no-verdict` row above it said a
+non-zero `rc=` "**on the bound line or on the launcher line**" is `no-verdict`. The two rules differ
+exactly when the bound line says `rc=0` and the caller's own line says otherwise, and the code
+implemented the narrower one — measured: `LogRead(verdict="finished", rc="0", runner_rc="7")`
+returned `finished`, a false PASS of precisely the class this axis exists to remove. Both the code
+and this row now follow the fail-closed reading, and T37 pins the disagreement.
 | `rc=` **present but unreadable** (`0x0`, a runaway token, …) | (not consulted) | **`unknown`** (`finished-rc-unreadable`, `detail` says the `rc=` was **PRESENT and UNREADABLE**) |
 | **no `rc=` at all** | (not consulted) | **`unknown`** (`finished-rc-unreadable`, `detail` says no readable `rc=` was **supplied**) |
 
@@ -1886,7 +1895,12 @@ ignored, so the census published `no-verdict` for that lane and exited 0 — the
 class with no signal that a flag had been discarded.
 
 `--log-census` takes the deltas **from the caller** (`?` = unread, which abstains) because a census
-that judged 76 lanes must not sleep 30 s per lane — the caller owns the two samples. Both shapes
+that judged 76 lanes must not sleep 30 s per lane — the caller owns the two samples. Because the
+census therefore never measures a sample span of its own, its rows publish `window_ms=?` (the same
+"NOT READ" convention as every other unread cell) rather than the module default, and a `?` CPU cell
+is reported as `cpu_unreadable=1` — never as `0` beside the `?` that contradicts it. It also takes
+**no** `--window-ms`: a flag that cannot change a delta the census does not take is refused with the
+other per-lane flags. Both shapes
 publish the same states from the same function; there is no state decided at the seam that
 `log_lane_verdict` does not decide.
 
@@ -1925,7 +1939,7 @@ so it never is.
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
 Regression contract: `python3 tools/fleet/liveness.test.py` (55 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (103 mutations, each of which must make its paired
+`python3 tools/fleet/liveness.test.py --mutations` (104 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder); T43–T54 are the 2026-11-04 binding / corroboration / abstention rounds;

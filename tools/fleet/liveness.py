@@ -1497,7 +1497,13 @@ class LogRead:
     runner_rc: Optional[str] = None
     verdict_line_pid: str = ""      # the `pid=` on that line — the verdict's own incarnation
     verdict_source: str = ""        # "log" | "verdict-file" | "caller" | ""
-    window_ms: int = LOG_WINDOW_MS
+    # ⛔ THE SAMPLE SPAN THE DELTAS WERE TAKEN OVER — and ``None`` is a REAL value:
+    # "this surface did not measure the window", which is the census's only honest
+    # answer (it takes its deltas from the caller). Rendering the module default here
+    # asserted a 30 s span the census never measured (review P1): measured,
+    # ``--log-census`` on a caller row published ``window_ms=30000`` while the caller
+    # had measured whatever it measured.
+    window_ms: Optional[int] = LOG_WINDOW_MS
     detail: str = ""
 
 
@@ -1653,6 +1659,26 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                                    detail=("verdict=finished rc=%s — the bound fired nothing, "
                                            "but the turn did NOT complete" % rc)
                                           + _also(lr.detail))
+                # ⛔ A NON-ZERO LAUNCHER `rc=` DEFEATS A CLEAN BOUND `rc=` TOO (review P1).
+                # The `na` arm above already corroborates against the launcher; this arm did
+                # not, so a bound line claiming `rc=0` published `finished` even when the
+                # CALLER — `spawn-gate.sh`, the process that actually reaped the child —
+                # reported a non-zero status. Measured before this guard:
+                # `LogRead(verdict="finished", rc="0", runner_rc="7")` -> `finished`.
+                # In WATCH mode (every lane/fixer/worker: `spawn-gate.sh`'s `run_agent`)
+                # `V_RC` is `na` unconditionally (`lane-bound.sh`), so `rc=0` reaches here
+                # only from `run` mode, a hand-edited `$log.lanebound`, or a foreign
+                # producer — exactly the population where a disagreement between the bound
+                # line and the caller's own line must resolve FAIL-CLOSED, not to success.
+                # §13.4 already stated this rule ("a `verdict=finished` whose `rc=` is
+                # non-zero, on the bound line or on the launcher line"); the code now
+                # implements it instead of the narrower bound-line-only reading.
+                if runner_rc is not None and runner_rc != "0":
+                    return Verdict("no-verdict", "bound-finished-runner-rc:%s" % runner_rc,
+                                   detail=("verdict=finished rc=%s but the launcher "
+                                           "reported rc=%s — the two disagree, so "
+                                           "completion is NOT established"
+                                           % (rc, runner_rc)) + _also(lr.detail))
                 return Verdict("finished", "bound-verdict:%s" % verdict,
                                detail=("verdict_source=%s rc=%s"
                                        % (lr.verdict_source or "log", rc))
@@ -1702,8 +1728,8 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         if "transcript" in kinds:
             numbers.append("transcript-grew")
         return Verdict("working", "progress:%s" % "+".join(kinds),
-                       detail="%s window_ms=%d tol_cs=%d"
-                              % (" ".join(numbers), lr.window_ms, cpu_tol_cs))
+                       detail="%s window_ms=%s tol_cs=%d"
+                              % (" ".join(numbers), _n(lr.window_ms), cpu_tol_cs))
 
     # (3) ANY single signal that could not be read is an ABSTENTION — never "flat".
     # ⛔ THE CONJUNCT IS `or`, AND THAT IS THE WHOLE SAFETY PROPERTY. With `and`, a
@@ -1740,10 +1766,10 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # neighbouring branches both print their numbers.
         return Verdict("unknown", "no-progress-signal-readable",
                        detail=("bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s "
-                               "cpu_unreadable=%s window_ms=%d"
+                               "cpu_unreadable=%s window_ms=%s"
                                % (_n(lr.size_delta), _n(lr.transcript_grew),
                                   _n(lr.cpu_delta_cs), int(bool(lr.cpu_unreadable)),
-                                  lr.window_ms)) + _also(lr.detail))
+                                  _n(lr.window_ms))) + _also(lr.detail))
     if lr.age_ms is None or lr.age_ms < 0:
         # ⛔ A NEGATIVE AGE IS A BROKEN READING, NOT "less than the freeze window". The
         # acquisition path clamps it (`max(0, …)`), so this is the census surface: with
@@ -1761,18 +1787,18 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # the sample span the deltas were taken over. One name for two numbers made a
         # machine reader unable to tell which it had received.
         return Verdict("working", "within-window",
-                       detail="bytes_delta=%s cpu_delta_cs=%s age_ms=%d freeze_ms=%d window_ms=%d"
+                       detail="bytes_delta=%s cpu_delta_cs=%s age_ms=%d freeze_ms=%d window_ms=%s"
                               % (_n(lr.size_delta), _n(lr.cpu_delta_cs), lr.age_ms, freeze_ms,
-                                 lr.window_ms))
+                                 _n(lr.window_ms)))
 
     # (5) FROZEN — live tree, ZERO progress on every signal: the log silent for the full
     # freeze window AND the sampled deltas flat over the sample window. The two durations
     # differ on purpose (§13.3 states the weaker evidence duration and its consequence).
     return Verdict("frozen", "no-progress",
                    detail="bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s tol_cs=%d "
-                          "age_ms=%d freeze_ms=%d window_ms=%d"
+                          "age_ms=%d freeze_ms=%d window_ms=%s"
                           % (_n(lr.size_delta), _n(lr.transcript_grew), _n(lr.cpu_delta_cs),
-                             cpu_tol_cs, lr.age_ms, freeze_ms, lr.window_ms))
+                             cpu_tol_cs, lr.age_ms, freeze_ms, _n(lr.window_ms)))
 
 
 def _n(v) -> str:
@@ -3186,8 +3212,18 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             verdict_pid = _pidcol(10)
             row_pid = _num(0)
             path = f[1] if len(f) > 1 else ""
-            lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=_opt(3),
-                         window_ms=window_ms, verdict=verdict,
+            # ⛔ THE CENSUS OWNS NO WINDOW AND MUST NOT NAME ONE (review P1). Its deltas
+            # come from the caller (column 3/4), so `window_ms` is passed as ``None`` —
+            # "not measured here" — rather than the module default, which told a reader
+            # the flat deltas spanned 30 s when the caller measured them over its own.
+            # ⛔ AND AN UNREAD CPU IS `cpu_unreadable=1`, NOT `0` (review P2). Column 4
+            # is `?` for NOT READ, which IS the unread case; leaving the flag at its
+            # `False` default made one detail line assert both "the CPU channel was not
+            # read" and "the CPU channel was not unread".
+            cpu_delta = _opt(3)
+            lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=cpu_delta,
+                         cpu_unreadable=(cpu_delta is None),
+                         window_ms=None, verdict=verdict,
                          # ⛔ THE `rc` ALLOW-LIST IS NOT RE-IMPLEMENTED HERE. It lives
                          # at ONE door — `log_lane_verdict`, which normalises an
                          # unreadable status to `None` -> `finished-rc-unreadable`

@@ -1446,14 +1446,25 @@ def t24_length_truncated_call_is_not_a_tool():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# THE LOG-LANE AXIS (T32–T51) — a lane that writes a log and no transcript
+# THE LOG-LANE AXIS (T32–T55) — a lane that writes a log and no transcript
 # ══════════════════════════════════════════════════════════════════════════
-# 20 tests, in the same groups the §13 regression contract states (keep the two
+# 24 tests, in the same groups the §13 regression contract states (keep the two
 # in step — a banner naming only T32–T38 told a reader the axis was 7 tests and
 # left T43–T51 covered by nothing the owning section named):
 #   T32–T38 VERDICT · T39–T42 ACQUISITION · T43–T44 BINDING · T45–T46 drop-reason
-#   + census binding · T47–T49 broken readings + fact-naming · T50 the
-#   abstention-masking refusal · T51 the `/proc` reader's own abstention.
+#   + census binding · T47–T49 broken readings + fact-naming · T50–T52 the
+#   corroboration and no-verdict population · T53–T54 the `/proc` reader's own
+#   abstentions · T55 the abstention-masking refusal.
+#
+# ⛔ THIS BANNER IS AN INDEX, SO IT IS PINNED BY THE TESTS IT NAMES. It carried the
+# PRE-REASSIGNMENT map for a round (`T32–T51`, `20 tests`, "T50 the
+# abstention-masking refusal · T51 the /proc reader's own abstention") after the
+# #3404 train rebase moved those behaviours to T54/T55 — and it pointed the reader
+# at T50, which is the `LOG_STATES` vocabulary pin and stays GREEN when the masking
+# guard is deleted. A stale index is how the guard shipped unpinned in the first
+# place, so the ids here are the measured ones: T50 = LOG_STATES vocabulary, T51 =
+# `gather_log_lane`'s `rc=na` witness, T52 = the no-bound-verdict population,
+# T53 = `_sum_subtree`, T54 = the `/proc` reader, T55 = the masking refusal.
 #
 # These are the MUTATION tests the 2026-11-03 measurement demands. Each one is
 # stated so that it FAILS against the pre-fix behaviour (for the VERDICT group
@@ -1669,6 +1680,26 @@ def t37():
               "`rc=na` + a launcher rc=%s is NOT finished; got %s" % (bad_rc, v.state))
         check(v.reason == "bound-finished-runner-rc:%s" % bad_rc,
               "the launcher's rc is named; got %r" % v.reason)
+    # ⛔ THE LAUNCHER IS CONSULTED FOR EVERY ACCEPTED `rc=`, NOT ONLY `na` (review P1).
+    # §13.4's `no-verdict` row says a non-zero `rc=` "on the bound line OR ON THE
+    # LAUNCHER LINE" is `no-verdict`, while its own `rc=0` row said the launcher is "not
+    # consulted" — and the code implemented the narrower one. Measured before this pin:
+    # `LogRead(verdict="finished", rc="0", runner_rc="7")` -> `finished`, a false PASS of
+    # exactly the class this axis exists to remove. `rc=0` only reaches here from `run`
+    # mode (production is `watch`: `V_RC=na`), a hand-edited `$log.lanebound`, or a foreign
+    # producer — the population where a disagreement must resolve FAIL-CLOSED.
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="0", runner_rc="7"))
+    check(v.state == "no-verdict" and v.reason == "bound-finished-runner-rc:7",
+          "`rc=0` + a launcher rc=7 DISAGREE, so completion is not established; got %s/%s"
+          % (v.state, v.reason))
+    # …and the agreement/absence directions still complete, so the guard is not a blanket
+    # refusal of the `run`-mode shape.
+    for ok_runner in ("0", None):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="0",
+                                    runner_rc=ok_runner))
+        check(v.state == "finished",
+              "`rc=0` with the launcher rc=%r still completes; got %s"
+              % (ok_runner, v.state))
     # ⛔ THE LAUNCHER LINE IS PARSED LAST-WINS, and its pid is what binds it to an
     # incarnation (an earlier dispatch's `[timeout]` line is still in the same log).
     check(liv.parse_runner_line(
@@ -1969,8 +2000,30 @@ def t41():
             # …and a REAL non-zero status still names itself, so the guard is not a
             # blanket abstain.
             "33\t%s\t0\t0\tfinished\t0\t3000000\t9\t?\t7\t33" % log,
+            # a FROZEN row, so the census's `window_ms=` assertion covers that branch too.
+            "40\t%s\t0\t0\t\t1\t3000000\t9\t0" % log,
         ])
         by_pid = {r[0]: (r[1], r[2]) for r in rows}
+        full = {r[0]: r for r in rows}
+        # ⛔ THE CENSUS OWNS NO SAMPLE WINDOW, SO IT MUST NOT NAME ONE (review P1). Its deltas
+        # come from the CALLER (columns 3/4), so the census never measures over a window at
+        # all — yet it interpolated the module default into every row's `detail`, telling a
+        # machine reader (whose contract is `window_ms=` = "the span the deltas were taken
+        # over") that flat deltas spanned 30 s. It now publishes `?`, the same "NOT READ"
+        # convention the row format uses everywhere else.
+        for row_pid in ("11", "25", "40"):
+            detail = full[row_pid][3] if len(full[row_pid]) > 3 else ""
+            check("window_ms=?" in detail,
+                  "a census row must not CLAIM a sample window it never measured (pid %s); "
+                  "got %r" % (row_pid, detail))
+        # ⛔ AND AN UNREAD CPU IS `cpu_unreadable=1`, NOT `0` (review P2). Column 4 is `?`
+        # for NOT READ, which IS the unread case; leaving the flag at its `False` default
+        # made one detail line assert both "the CPU channel was not read" and "the CPU
+        # channel was not unread".
+        d25 = full["25"][3] if len(full["25"]) > 3 else ""
+        check("cpu_delta_cs=?" in d25 and "cpu_unreadable=1" in d25,
+              "a `?` CPU cell must report cpu_unreadable=1, never 0 alongside it; got %r"
+              % (d25,))
         check(by_pid["11"] == ("working", "within-window"), "row 11: %r" % (by_pid["11"],))
         check(by_pid["12"][0] == "unknown",
               "an unreadable `alive` must ABSTAIN, not publish a terminal state; got %r"
@@ -3595,6 +3648,14 @@ MUTATIONS = [
         "over — a lying diagnostic, which is worse than a dropped flag",
     ),
     # ── round 5: the launcher status at the door, and a negative log age ───────────
+    Mutation(
+        "T37", "module",
+        '                if runner_rc is not None and runner_rc != "0":',
+        '                if False and runner_rc is not None and runner_rc != "0":',
+        "a CLEAN bound `rc=` stops consulting the launcher, so a bound line claiming `rc=0` "
+        "publishes `finished` while the CALLER's own line says the child exited non-zero — "
+        "the two disagree and completion is not established",
+    ),
     Mutation(
         "T37", "module",
         '        if (runner_rc is not None',
