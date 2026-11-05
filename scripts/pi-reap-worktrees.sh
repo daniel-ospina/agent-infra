@@ -365,10 +365,11 @@
 #   worktree-locked (an `initializing` lock older than REAP_WT_STALE_INIT_SECONDS is DETECTED here
 #   and the interrupted-add class stays pending) > unreadable-path | prunable > live-process >
 #   live-cwd > pin-tree | pin-tree-shape (#10114 — a HARNESS PIN TREE is a holder /proc cannot
-#   show, so it outranks every removal rule that can fire on a tree that still EXISTS — rules 3/4,
-#   which are the only REMOVE rules, and the residue gates below it; the only `remove` ABOVE it is the
-#   `prunable` arm, which fires only when the directory is already absent, and `unreadable-path` is a
-#   PRESERVE — so neither can destroy a pin tree. Rule 5 is a KEEP and removes nothing) >
+#   show, so it outranks EVERY removal rule that can fire on a tree that still EXISTS — rule 3, rule 4,
+#   the lane-residue gates and the rule=P aged floor, all of which sit BELOW it. This is not an
+#   enumeration to maintain: the list is `grep "printf 'remove"` on this file. The only `remove` ABOVE
+#   it is the `prunable` arm, which fires only when the directory is already absent, and
+#   `unreadable-path` is a PRESERVE — so neither can destroy a pin tree. Rule 5 is a KEEP) >
 #   live-claim > claim-unverified >
 #   interrupted-add[-unreachable] >
 #   dirty | ignored-artifact | status-timeout | status-error > abandoned-wip >
@@ -2634,8 +2635,12 @@ abstain_gate() {
 # was acting BY ITS OWN RULES, which is what makes this class invisible.
 #
 # A pin record is a HOLDER that /proc cannot show: between passes nothing has the tree as its cwd,
-# and the record is the ONLY thing that says the box needs the bytes. So this veto outranks rules
-# 3/4/5 exactly like `live-claim` — it is a preserve, never a removal.
+# and the record is the ONLY thing that says the box needs the bytes. So this veto outranks every
+# REMOVE rule exactly like `live-claim` — and, like it, it is a preserve that can never remove.
+# ⛔ NOT "rules 3/4/5": rule 5 is a KEEP (`preserve pr-closed-unmerged`, decision table above), and
+# the removal set is wider than 3/4 — the residue gates and the rule=P aged floor also REMOVE. The
+# authority is the code, so the list is `grep "printf 'remove" scripts/pi-reap-worktrees.sh`, not a
+# sentence here that a new rule can falsify.
 #
 # TWO PROBES, and the second exists because the first can be silent:
 #   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
@@ -2674,9 +2679,12 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # is exactly the box the shape backstop cannot save, because `HARNESS_PIN_DIR` is operator-settable
     # and a custom pin root need not be named `harness`.
     # ⛔ ITS BOUNDARY, DECLARED RATHER THAN IMPLIED — and MEASURED, because the first two drafts of this
-    # paragraph were both wrong in opposite directions. The arm is NORMALISED first, the same way
-    # `check-farm-drift.sh:194` had to be: strip trailing slashes, collapse `//`, and REQUIRE an absolute
-    # path. Without the collapse a `//`-spelled record strips to `<root>/.pi/agent/`, the `/.pi/agent`
+    # paragraph were both wrong in opposite directions. The arm is NORMALISED first — the same
+    # trailing-slash strip and `//` collapse `check-farm-drift.sh` needed and does above its `:201` —
+    # and then, UNLIKE it, REQUIRES an absolute path. `check-farm-drift.sh` keeps a RELATIVE spelling by
+    # rooting it at `.` (`.pi/agent) _pin_root="."`) because `--pin-file` is "documented with no
+    # absoluteness requirement" (`:182-183`); here the same spelling would derive a CWD-RELATIVE
+    # candidate that is actually READ, so the departure is deliberate and belongs in the record. Without the collapse a `//`-spelled record strips to `<root>/.pi/agent/`, the `/.pi/agent`
     # strip below then does not fire, and the derived candidate becomes `<root>/.pi/agent//.harness-path`
     # — a path the PRODUCTION layout never writes (the dir record lives at `<root>/.harness-path`), so the
     # box is a SILENT MISS and rule 3 removes the tree it executes. Without the trailing-slash strip the
