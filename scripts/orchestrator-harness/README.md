@@ -4834,9 +4834,16 @@ is a REPORT, and a report is not a gate.
 
 Three surfaces now exist, and they are ONE predicate — `spawn-gate.sh`'s `disk_free_mb` /
 `disk_readable` / `disk_worktree_terms` / `disk_worktree_need`, the SAME functions the live arm's
-`disk_lane_costs` / `disk_lane_need` are built on (the live arm adds the `max(tree, self)` choice, so
-it decides on the marginal cost when the shared cache holds; the PRE-START seam deliberately takes the
-worst case, since at that point the brief's install step is unknown):
+`disk_lane_costs` / `disk_lane_need` are built on. ⛔ BOTH BOUNDS ARE COMPUTED BY `disk_lane_need`
+(`max(tree, self) + reserve`), so the two seams cannot disagree about how much room one lane needs
+(review round 5, P2 — they did: the PRE-START seam ignored a stated `DISK_LANE_TREE_MB` and admitted
+at 2,064 MB a lane `run_agent` then refused at 22,000 MB, i.e. the worktree was materialised and the
+refusal arrived one step late — #3395's own defect, under a configured bound). What differs is the
+TERM each side feeds in: the live arm CLASSIFIES the checkout (`python_target`) and charges the
+marginal `tree` when the shared cache holds; the PRE-START seam does not classify (no `--repo`) and
+charges the stated `self` worst case, because at that point the brief's install step is unknown and
+`tree` is true only while the warm shared uv cache holds — the cache is what gets pruned under
+pressure. A `tree` the OPERATOR states for the cell is honoured on both sides.
 
 | surface | when it is asked | verdict |
 |---|---|---|
@@ -4853,8 +4860,9 @@ The PRE-START arm fails **CLOSED** on an unreadable `df` (`REFUSED-UNKNOWN free=
 anything is created costs a re-dispatch, while the live arm's documented fail-open protects a running
 fleet. Two postures, one predicate, each with the reason this tree already gives for it.
 
-The per-lane requirement at that seam is the **worst case** (6,144 MB default), not the marginal tree
-(350 MB), plus the cell reserve (4x the dispatch floor = 2,000 MB) — so 8,144 MB, i.e. ~8.0 GB. The
+The per-lane requirement at that seam is the **worst case** (6,144 MB default, or a larger
+`DISK_LANE_TREE_MB` if an operator states one), not the marginal tree (350 MB), plus the cell reserve
+(4x the dispatch floor = 2,000 MB) — so 8,144 MB at the shipped defaults, i.e. ~8.0 GB. The
 derivation is measured, not invented: two lanes consumed **11 GB in six minutes** (~5.5 GB each) on a
 cell whose `.worktrees` was 36.4 GB of 47 GB, and the check therefore takes the cell that will BUILD,
 not the box that decided. A box whose lanes are measured cheaper lowers `DISK_LANE_SELF_MB` /
