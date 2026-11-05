@@ -1371,13 +1371,13 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
 The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **22 case functions driven
-23 times + 39 mutants, 62 outcomes per box**, plus **2 top-level assertions on the owner's own source** (the
+23 times + 39 mutants, 62 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the
 pre-removal re-probe, which no existing case can drive behaviourally — see the comment at the assertion), so
-**64 outcomes** in total (case (s) is driven TWICE, at its two vanish sites), each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+**65 outcomes** in total (case (s) is driven TWICE, at its two vanish sites), each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
-against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **26 passed,
-38 failed, 2 skipped**, and against this tree **64 passed, 0 failed, 5 skipped**: the discrimination is
+against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **27 passed,
+38 failed, 2 skipped**, and against this tree **65 passed, 0 failed, 5 skipped**: the discrimination is
 measured both ways, not asserted. (The red on the pre-change tree is 20 of the 23 case runs — every case whose
 subject runs through the ENTRY POINT, which on that tree has no `class=runner-work` at all: (a), (b), (c),
 (d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r), (s) BOTH arms, (t), (v) and (w); the owner-only cases (i), (m) and
@@ -1431,7 +1431,7 @@ suite below could not be read as covering it. It was then **run to completion at
 pass is preserved, `reason=toctou`) — the same case and the same count as the pre-change baseline, i.e.
 pre-existing and not this class's. That tally is recorded here as what it is — the classes suite's own
 result, on the fields it actually asserts — and **not** as this class's evidence, which it never was. The
-record fields are MEASURED at this head by case (b) (`64 passed, 0 failed, 5 skipped` at this head on this
+record fields are MEASURED at this head by case (b) (`65 passed, 0 failed, 5 skipped` at this head on this
 box — it has real runner roots, so the (f) default-glob arm is skipped by name; the earlier
 `0 skipped` row was taken on a laptop and is not restated as this head's); the caveat that
 stood here for one revision is recorded rather than dropped silently, because "we could not measure it"
@@ -1441,14 +1441,14 @@ The measured transcript, `./scripts/disk-reaper-runner-work.test.sh`, at this he
 real runner roots (so the (f) default-glob arm is skipped by name, FIVE times):
 
 ```
-  64 passed, 0 failed, 5 skipped
+  65 passed, 0 failed, 5 skipped
 ```
 
 and the same suite with `DR_REAPER=` `origin/main`'s `disk-reaper.sh` (the pre-change tree, beside this
 tree's owner):
 
 ```
-  26 passed, 38 failed, 2 skipped
+  27 passed, 38 failed, 2 skipped
 ```
 
 ⛔ **THESE TALLIES WERE RE-MEASURED BECAUSE THE SUITE CHANGED, NOT BECAUSE THE ARITHMETIC LOOKED WRONG.**
@@ -1462,7 +1462,7 @@ and the pre-change row is the same command with `DR_REAPER` pointed at the base 
 all, and it reports **2 skips, not 5**, for two DIFFERENT reasons: only one of the five `(f)` invocation
 sites gets that far on a tree whose entry point refuses them earlier, and case (v)'s conditional positive
 half fires DETERMINISTICALLY there — the base entry point emits no `df_raw` at all, so the arm that needs a
-nonzero delta can never run and now says so instead of vanishing (measured: `26 passed, 38 failed,
+nonzero delta can never run and now says so instead of vanishing (measured: `27 passed, 38 failed,
 2 skipped`, one of the skips being `v1 positive half`). That pre-change run is a discrimination check, not
 evidence: every mutant it reports "caught" is caught only because its case is already red.
 
@@ -1490,7 +1490,7 @@ on a box told to have real runner roots so the skip path is taken (`<entry>` is 
 `mut-f`, `mut-f3`, `mut-f4` and `mut-u` are the mutant copies the suite makes in its own `$T`):
 
 ```
-  64 passed, 0 failed, 5 skipped
+  65 passed, 0 failed, 5 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f3/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
@@ -1499,14 +1499,14 @@ on a box told to have real runner roots so the skip path is taken (`<entry>` is 
 ```
 
 **How those two numbers compose — `skipped` is ORTHOGONAL, so the arithmetic must not be "balanced".**
-`passed + failed` is the OUTCOME count (64 here: one line per case run and per mutant — 22 case functions
+`passed + failed` is the OUTCOME count (65 here: one line per case run and per mutant — 22 case functions
 driven 23 times, and 39
-mutants — plus the 2 top-level assertions on the owner's own source). `skipped` is an
+mutants — plus the 3 top-level assertions on the owner's own source). `skipped` is an
 independent count of arms that did not run: `skip()` neither increments nor decrements `PASS` — it records
 a reason in a file the outer runner reads at the end — and the arm's own pass line still lands, because the
 assertions beside the skip (the source check of the documented default list) still run. So
-`64 passed … 5 skipped` reads as **64 outcomes, 0 of them failed, PLUS 5 arms that were not measured**, and
-`passed + skipped` legitimately EXCEEDS 64. ⛔ **A transcript is therefore never "corrected" on the grounds
+`65 passed … 5 skipped` reads as **65 outcomes, 0 of them failed, PLUS 5 arms that were not measured**, and
+`passed + skipped` legitimately EXCEEDS 65. ⛔ **A transcript is therefore never "corrected" on the grounds
 that `passed + skipped` exceeds the outcome count.** An earlier revision of this section did exactly that,
 on the false premise that a skip must displace a pass, and replaced a correct transcript with
 `20 passed, 0 failed, 2 skipped` — a line no head of this suite can print; the same false premise then

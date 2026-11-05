@@ -1872,6 +1872,19 @@ if grep -qF 'KEPT   $entry reason=toctou (a writer appeared during the pass' "$O
 else
     bad "… but the re-probe's KEPT arm is gone: a written-during-the-pass answer now falls through to rm -rf"
 fi
+# ⛔ A SYMLINKED `_work` ROOT MUST NOT READ AS "MATCHED NOTHING" (#3057 review, P1). A symlinked `_work`
+# is the file's own cited full-disk workaround, so this is a live shape, not a hypothetical: the old
+# `[ -d ] && [ ! -L ] || continue` dropped it BEFORE `_matched`, so `roots=0 candidates=0 census=ok` was
+# published with a note saying the glob "matched no runner _work root" — over a sink that was filling.
+# ⛔ STRUCTURAL, WITH THE LIMIT STATED: it proves the branch still sets `_matched` and counts the root as
+# UNMEASURED (which is what turns the census off `ok`), not that a fixture reaches it. Verified by hand
+# when this was written: a symlinked `_work` now gives `unmeasurable=1 … census=abstained`, rc 0, and the
+# entry point records `verdict_runner_work` non-ok. Recorded on PR #3057.
+if grep -qF 'reason=symlinked-root' "$OWNER"; then
+    ok "a SYMLINKED _work root is counted as UNMEASURED, so it cannot read as 'matched nothing' with census=ok"
+else
+    bad "the symlinked-root abstention is GONE: a symlinked _work (the documented full-disk workaround) reads as a measured empty population"
+fi
 
 if apply_mutation "$OWNER" "$T/mut-s-instrumented/reap-runner-work.sh" "$MUT_S_INSTRUMENT"; then
     expect_pass "s an entry that VANISHES during the pass is gone=, never unmeasurable= (not an abstention)" \

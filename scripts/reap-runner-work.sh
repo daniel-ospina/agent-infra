@@ -692,7 +692,27 @@ while IFS= read -r _g; do
     GLOBS_N=$((GLOBS_N + 1))
     _matched=0
     for _r in $_g; do
-        [ -d "$_r" ] && [ ! -L "$_r" ] || continue
+        # ⛔ A MATCHED ROOT THIS CLASS WILL NOT FOLLOW IS STILL A MATCHED ROOT (#3057 review, P1).
+        # `_work` as a SYMLINK is not hypothetical here — it is the file's own cited workaround for a
+        # full disk (`:601`, "moves `_work` aside and leaves a symlink behind"), i.e. exactly the box
+        # this class exists for. This line used to `continue` BEFORE setting `_matched`, so such a root
+        # was counted by NOTHING: no `roots=`, no `unmeasurable=`, no `refused=`, `_matched` stayed 0, and
+        # the pass printed `note: glob … matched no runner _work root on this box` — a FALSEHOOD, because
+        # the glob DID match — over a `roots=0 candidates=0 census=ok` that the entry point lifts to
+        # `verdict_runner_work=ok` / `ok=1`. The sink fills and nothing alarms: the inert-class-reads-
+        # healthy shape EVERY other refusal in this file was given a token to prevent.
+        # ⛔ IT IS AN ABSTENTION, NOT A REFUSAL, AND NOT A FOLLOW. Following a symlink inside a delete
+        # path is how `rm -rf` reaches a tree nobody named, so this class still will not follow one; but
+        # declining to measure is not the same as having measured nothing (the same distinction an
+        # UNLISTABLE root makes, and the census rule below already turns `unmeasurable>0` into
+        # `abstained`/`partial` — never `ok`). rc stays 0: the record is the alarm channel.
+        if [ -d "$_r" ] && [ -L "$_r" ]; then
+            _matched=1
+            UNMEASURABLE=$((UNMEASURABLE + 1))
+            log_line "UNMEASURED $_r reason=symlinked-root (the glob matched a _work namespace that is a SYMLINK; this class never follows one in a delete path, so its population was NOT measured — the sink may be filling behind it, and a symlinked _work is the documented full-disk workaround)"
+            continue
+        fi
+        [ -d "$_r" ] || continue
         _r="${_r%/}"
         # ⛔ THE NAME IS THE LAST GATE BEFORE `rm -rf`, AND IT WAS MISSING. This loop tested only
         # `-d` and `! -L`, so a seam ONE COMPONENT SHORT — `/opt/gh-runner*/` instead of

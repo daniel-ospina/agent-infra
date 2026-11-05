@@ -287,8 +287,13 @@ HAVE_RW_CAND=0
 # on the owner side, and rc stays 0 here, because the alarm channel is the RECORD (`verdict_runner_work`
 # + `candidates_runner_work=?`) and not the unit's colour — see the `ok=` contract at `record_body`.
 RW_ABSTAINED=0
-# 1 = the owner's census was PARTIAL: `unmeasurable>0` AND `candidates>0` — some of the population was
-# read and some was not. Distinct from `abstained` because the two need different words and the count is
+# 1 = the owner's census was PARTIAL: something WAS reached and something was not — the owner decides
+# this on REACHED-NESS (`candidates + kept + retained + reaped + failed + gone > 0`), NOT on
+# `candidates>0`. `partial` with `candidates=0` is therefore an ORDINARY HEALTHY shape (a fresh checkout
+# was read and an unlistable root was not), and this line said `unmeasurable>0 AND candidates>0` until a
+# review measured `roots=2 candidates=0 … unmeasurable=1 … census=partial` on exactly that fixture — the
+# same `candidates=0` conflation the owner's own block records as a bug it removed. Distinct from
+# `abstained` because the two need different words and the count is
 # still usable: the candidate tally IS a measurement of what was seen (published as a LOWER BOUND), while
 # the class verdict — the one field a reader keys on — must not be `ok`. Deliberately NOT a failure, for
 # the same reason `abstained` is not: rc stays 0 and the RECORD carries the alarm.
