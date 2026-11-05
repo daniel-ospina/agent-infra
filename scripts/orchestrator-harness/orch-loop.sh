@@ -296,9 +296,11 @@ MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
 # the landing rate rather than open a 68th PR.
 LANDING_FLOOR="${LANDING_FLOOR:-25}"
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
-# printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
-# backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
-# an old pass's numbers beside a newer `queue=` are a contradiction, not a measurement.
+# printing it as this cycle's decomposition. Two refresh cycles (a quiet box can legitimately go a few
+# cycles between records — NOT because the refresh needs a short backlog: the spawn test below is
+# `backlog < 6` **or** a funnel record older than `LATCH_MAX_AGE_MIN`, so a pass runs on a long queue
+# too, and has since that age latch landed, agent-infra#2019); past that, an old pass's numbers beside
+# a newer `queue=` are a contradiction, not a measurement.
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
@@ -2034,8 +2036,9 @@ refresh_cause_brief() {   # <snapshot>
 # died" look identical in the record. The only thing that separates them is TIME, and this file
 # already owns that bound — the stale-lock guard (20 min) — so a start marker younger than it is
 # reported as in-flight and an older one as a death. Without the bound a healthy 4-minute pass reads
-# BLOCKED for its whole duration on a box whose backlog is empty (i.e. the normal case, since the
-# refresh runs only while the backlog is short), and an alarm that cries wolf is the failure this PR
+# BLOCKED for its whole duration on any box mid-pass — the backlog's LENGTH does not gate it, because
+# the spawn test is `backlog < 6` OR a funnel record older than `LATCH_MAX_AGE_MIN` (#2019): a pass on
+# a 179-row queue is ordinary, not exceptional — and an alarm that cries wolf is the failure this PR
 # exists to remove.
 REFRESH_STALE_LOCK_MIN="${REFRESH_STALE_LOCK_MIN:-20}"
 case "$REFRESH_STALE_LOCK_MIN" in ''|*[!0-9]*) REFRESH_STALE_LOCK_MIN=20 ;; esac
@@ -2157,9 +2160,9 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   fi
   # ⛔ `skipped` IS A CLAIM IN TWO PARTS: a pass SUCCEEDED **and** a usable candidate is deferred. The
   # branches keep it honest in BOTH directions — a failed pass never prints it (the mask this fixes),
-  # and a healthy queue is never called BLOCKED merely because no pass has been needed yet (the
-  # refresh only runs while the backlog is short, so a box with 8 candidates queued and nothing
-  # failing must not alarm — it says `deferred`).
+  # and a healthy queue is never called BLOCKED merely because no pass has been needed yet (and a
+  # pass is not gated on a SHORT backlog — the spawn test is `backlog < 6` OR an age-latched record,
+  # #2019 — so a box with 8 candidates queued and nothing failing must not alarm: it says `deferred`).
   if [ -n "$unrec" ]; then
     printf '[dispatch] BLOCKED: a refresh pass finished and could not record its outcome (%s) — the record on disk is an EARLIER pass and is NOT the health of this cycle; read the marker: rc=0 means the pass SUCCEEDED and only its record failed%s | %s lanes=%s workers=%s | PR path: %s\n' \
       "$unrec" "$tailnote" "$why" "$lanes" "$workers" "$prtail"

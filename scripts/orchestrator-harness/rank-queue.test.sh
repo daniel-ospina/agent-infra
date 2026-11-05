@@ -24,8 +24,10 @@
 #   2. MEMBERSHIP is preserved — order only. Every DISTINCT queued row survives, and a row the pool does
 #      not rank sits at the TAIL in its existing order. Dropping it would silently discard a
 #      CLEAN-judged candidate, which is the failure "order, never membership" exists to forbid.
-#   3. A queue the pool ranks NOTHING is `priority-unreadable`, never arrival order read as severity —
-#      the silent degradation that produced the measured beat.
+#   3. A queue the pool ranks NOTHING is `unranked`, never arrival order read as severity — the silent
+#      degradation that produced the measured beat — and never the FAILURE word (`priority-unreadable`,
+#      which means the reorder did not run): the two need opposite operator answers, so they are pinned
+#      apart (review cycle 1, P2).
 #   4. An EMPTY queue is a neutral success in its own words, never the failure word (`priority-unreadable`
 #      over a fully drained queue — the routine state after a good pass — would be a false alarm).
 #   5. A reorder that FAILS leaves the file byte-identical AND names itself, so a failed write can never
@@ -348,7 +350,7 @@ case "$nc_out" in
 esac
 ck "non-vacuity: with both prints removed the 3b assertions go RED (the removal is visible, not absorbed)" $rc
 
-# ── 4) A POOL THAT RANKS NOTHING IS `priority-unreadable`, NOT ARRIVAL-AS-SEVERITY ──
+# ── 4) A POOL THAT RANKS NOTHING IS `unranked`, NOT ARRIVAL-AS-SEVERITY AND NOT THE FAILURE WORD ──
 # The silent degradation: a ladder returning "no priority" for everything reads exactly like a healthy
 # FIFO. The file must be left BYTE-IDENTICAL (it is not this function's business to drop what it cannot
 # rank) AND the state must be named, and the positive half — the `severity-first` claim — must be ABSENT.
@@ -365,7 +367,8 @@ same=1; [ "$sum_before" = "$sum_after" ] && same=0
 # IS severity, not arrival. The claim was therefore false in exactly the state a `.pool` that lists
 # nothing (routine) lands in, and this suite REQUIRED the false wording. Both halves are asserted here:
 # the honest word PRESENT, and `ARRIVAL order` ABSENT.
-if [ "$same" -eq 0 ] && grep -q 'priority-unreadable' "$TMP/norank/out" 2>/dev/null \
+if [ "$same" -eq 0 ] && grep -q 'unranked' "$TMP/norank/out" 2>/dev/null \
+   && ! grep -q 'priority-unreadable' "$TMP/norank/out" 2>/dev/null \
    && grep -q 'established NO priority order' "$TMP/norank/out" 2>/dev/null \
    && grep -q 'UNTOUCHED' "$TMP/norank/out" 2>/dev/null \
    && ! grep -q 'ARRIVAL order' "$TMP/norank/out" 2>/dev/null \
@@ -373,7 +376,7 @@ if [ "$same" -eq 0 ] && grep -q 'priority-unreadable' "$TMP/norank/out" 2>/dev/n
 else
   rc=1; echo "      same=$same; out: $(tr '\n' '|' < "$TMP/norank/out" 2>/dev/null | head -c 300)"
 fi
-ck "a pool ranking NONE of the queue says 'priority-unreadable', leaves the file byte-identical, names NO priority order and NOT 'ARRIVAL order', and never claims severity" $rc
+ck "a pool ranking NONE of the queue says 'unranked' (never the failure word), leaves the file byte-identical, names NO priority order and NOT 'ARRIVAL order', and never claims severity" $rc
 
 # 4b) POSITIVE PAIR: the same drive with a pool that DOES rank one row must claim severity-first — so the
 #     absence asserted above is not just a broken driver printing nothing.
@@ -1050,12 +1053,13 @@ for _sf in "foreign-zero:printf \"0 0 -\\n\" > \"\$QRO/.queue-rank\"" \
   else rc=1; echo "      state-$_sfn: rc=$CRR STATE='${CRSTATE:-<none>}' (want severity-uncounted: the order WAS derived)"; fi
   ck "the \`$_sfn\` read-back refusal leaves the state \`severity-uncounted\`, not the failure word" $rc
 done
-# and the ranked-none / failed arms are the opposite state — nothing was derived.
+# and the ranked-none arm is its OWN state, not the failure word — the two causes need opposite
+# answers (label drift / tier window vs. gh-auth, and whether anything on disk was verified this pass).
 count_race state-none 'true' '300
 200' '-'
-if [ "$CRR" -eq 0 ] && [ "$CRSTATE" = "priority-unreadable" ]; then rc=0
-else rc=1; echo "      state-none: rc=$CRR STATE='${CRSTATE:-<none>}' (want priority-unreadable: the pool ranked nothing)"; fi
-ck "a pool that ranked NOTHING leaves the state \`priority-unreadable\` — the discriminating partner of the pair above" $rc
+if [ "$CRR" -eq 0 ] && [ "$CRSTATE" = "unranked" ]; then rc=0
+else rc=1; echo "      state-none: rc=$CRR STATE='${CRSTATE:-<none>}' (want unranked: the pool ranked nothing, and the reorder DID run)"; fi
+ck "a pool that ranked NOTHING leaves the state \`unranked\` — the discriminating partner of the pair above, and NOT the failure word" $rc
 count_race state-good 'true'
 if [ "$CRR" -eq 0 ] && [ "$CRSTATE" = "severity" ]; then rc=0
 else rc=1; echo "      state-good: rc=$CRR STATE='${CRSTATE:-<none>}' (want severity)"; fi
@@ -1414,10 +1418,10 @@ ck "non-vacuity: re-keying the skip arm on \`\$_skip_head\` (the pre-fix shape) 
 # 12-y4) A REORDER THAT RANKED ROWS IS NOT "RANKED NONE" (review P3, cycle 12). The ranked-none arm was
 # keyed off `_h` — the count file's head, SANITISED to "" when it is not a plain issue number — so a
 # non-numeric queue row that the pool DID rank fell into the "the pool ranked NONE … this pass established
-# NO priority order … rewritten in its existing order" sentence and set `priority-unreadable`, whose
+# NO priority order … rewritten in its existing order" sentence and set the failure word, whose
 # durable `why=` says the order "could NOT be re-derived". Measured on the pre-fix code with queue
 # `aaa,bbb` and pool `bbb`: rows `bbb aaa` (a real reorder) described as "existing order", state
-# `priority-unreadable`. The rank COUNT is the witness; the head only says WHICH row leads.
+# `priority-unreadable` (now `unranked`). The rank COUNT is the witness; the head only says WHICH row leads.
 printf 'aaa\nbbb\n' > "$TMP/nonnum.o.txt" 2>/dev/null || true
 NND="$TMP/nonnum"; rm -rf "$NND"; mkdir -p "$NND/o"
 printf 'aaa\nbbb\n' > "$NND/o/candidates.txt" 2>/dev/null || true
@@ -1443,10 +1447,10 @@ else
   { drive_prologue; cat "$NNREV"
     printf 'queue_order_from_pool "$1"\nprintf "STATE=%%s\\n" "${QUEUE_ORDER_STATE:-}"\n'; } > "$NND2/drive.sh"
   ( cd "$NND2" && HOME="$NND2" bash drive.sh "$NND2/o" ) > "$NND2/out" 2>&1
-  if grep -q 'ranked NONE' "$NND2/out" 2>/dev/null && [ "$(sed -n 's/^STATE=//p' "$NND2/out" | tail -1)" = "priority-unreadable" ]; then rc=0
+  if grep -q 'ranked NONE' "$NND2/out" 2>/dev/null && [ "$(sed -n 's/^STATE=//p' "$NND2/out" | tail -1)" = "unranked" ]; then rc=0
   else rc=1; echo "      the REVERTED gate did not reproduce the defect — the fixture is not grading the _r key: '$(tr '\n' '|' < "$NND2/out" | head -c 220)'"; fi
 fi
-ck "non-vacuity: keying the arm off the head again (\`elif false\`) restores 'ranked NONE' + \`priority-unreadable\`" $rc
+ck "non-vacuity: keying the arm off the head again (\`elif false\`) restores 'ranked NONE' + the ranked-none state \`unranked\`" $rc
 
 # 12-z2) THE **MAIN** HANDOFF'S DEPTH READ — the skip arm's fix, mirrored (review P2, cycle 11).
 # `_backlog_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"` coerced a FAILED read to `0`, so an

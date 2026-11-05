@@ -3641,9 +3641,15 @@ pool_rc=$?
 # (orch-loop.sh's queue_state_token prints it together with its age, so a frozen value cannot pass
 # as a fresh one). It is the READ's state, not the backlog's: it stays true even when a later step of
 # this pass refuses, and it never overrides the fail-closed refusals below.
-# The ORDER's provenance for THIS pass (severity | priority-unreadable | empty). Declared here, beside
-# the pool read-state, because the handoff line at the end must report what the writer actually did
-# rather than assert severity over a pass whose reorder failed (review P1).
+# The ORDER's provenance for THIS pass (severity | severity-uncounted | unranked | priority-unreadable |
+# empty). Declared here, beside the pool read-state, because the handoff line at the end must report what
+# the writer actually did rather than assert severity over a pass whose reorder failed (review P1).
+# ⛔ `unranked` IS NOT `priority-unreadable`, and conflating them was a real defect (review cycle 1, P2):
+# `priority-unreadable` means the REORDER DID NOT RUN or was refused, so nothing on disk was verified this
+# pass; `unranked` means the reorder RAN and ranked NONE of the queue, so the sequence on disk IS this
+# pass's (the queue's pre-existing order) — it is simply not a priority decision. The two causes need
+# opposite operator answers (check gh/auth/rate-limit vs. check label drift / the tier windows), so one
+# word for both sends the reader after the wrong one.
 QUEUE_ORDER_STATE=""
 QUEUE_STATE_FILE="$O/state/queue-state"
 queue_state_write() {  # <STATE> — record what THIS pass learned about the pool, for the heartbeat
@@ -3721,8 +3727,9 @@ fi
 queue_state_write "$POOL_STATE"
 
 # ── DID ANYTHING THE PASS READS ACTUALLY MOVE? (agent-infra#1984, cause 2) ─────────────────────
-# The pass runs whenever the backlog is short — every cycle, i.e. far more often than the fleet's
-# state changes. Measured (counting shim, agent-infra): 14 core requests per pass are the listings
+# The pass runs every cycle when the backlog is short, and at least once per `LATCH_MAX_AGE_MIN`
+# when it is not (orch-loop.sh's age latch, #2019) — i.e. far more often than the fleet's state
+# changes. Measured (counting shim, agent-infra): 14 core requests per pass are the listings
 # themselves and, before the per-pass read memo (#1984 cause 1) and the board cache (#2022/#2050),
 # another ~120 were the SAME fleet reads and the SAME verdicts re-derived for the SAME candidates.
 # At a five-minute cadence that is the ~1,150 core calls/hour of pure re-reading the issue measures.
@@ -4093,13 +4100,13 @@ queue_order_from_pool() {
     # ⛔ AND THE POPULATION IS THE MEASURED DEPTH, NOT `_u` (review P3, cycle 12): `_u` is the count
     # file's own unranked field, and with `_r` 0 the two agree — but the sentence is a claim about the
     # QUEUE, so it says the queue's size, which `_rows_now` (and the totals cross-check above) verified.
-    QUEUE_ORDER_STATE="priority-unreadable"
+    QUEUE_ORDER_STATE="unranked"
     if [ "${_wrote:-0}" -eq 1 ]; then
       _wrote_said="candidates.txt WAS rewritten in its existing order (duplicate rows collapsed; the SEQUENCE was not re-derived here, and is NOT this pass's arrival order either)"
     else
       _wrote_said="candidates.txt was left UNTOUCHED (byte-identical; the sequence was not re-derived here, and is NOT this pass's arrival order either)"
     fi
-    echo "[refresh] priority-unreadable: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
+    echo "[refresh] unranked: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
     echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry"
@@ -4185,8 +4192,12 @@ skip_order_why() {
   case "${1:-}" in
     severity)            printf '%s' "the ORDER was re-derived severity-first from the pool" ;;
     severity-uncounted)  printf '%s' "the ORDER was derived from the pool by this pass; the COUNTS could not be read back, so both how many rows it ranked and WHETHER it ranked ANY are UNKNOWN (the order itself is THIS pass's)" ;;
+    # ⛔ THE REORDER RAN HERE (review cycle 1, P2). Its sentence said "could NOT be re-derived … UNVERIFIED",
+    # which is `priority-unreadable`'s meaning — and this arm is the one where the order WAS derived and the
+    # file may even have been rewritten. What it is not, is a PRIORITY decision: the pool ranked none of it.
+    unranked)            printf '%s' "the ORDER was derived from the pool by this pass and the pool ranked NONE of the queued rows, so the sequence is the queue's pre-existing order — UNRANKED, not a priority decision" ;;
     empty)               printf '%s' "nothing was queued, so there was no ORDER to derive" ;;
-    priority-unreadable) printf '%s' "the ORDER could NOT be re-derived this pass — it is UNVERIFIED (whatever the PREVIOUS pass left, or unranked)" ;;
+    priority-unreadable) printf '%s' "the ORDER could NOT be re-derived this pass (the reorder did not run, or was refused) — the file is UNVERIFIED (whatever the PREVIOUS pass left)" ;;
     *)                   printf '%s' "the ORDER's provenance was NOT recorded by this pass — treat it as UNVERIFIED" ;;
   esac
 }
@@ -6050,6 +6061,10 @@ case "${QUEUE_ORDER_STATE:-}" in
   # `handed_why=` in `state/refresh-last`, so the durable record contradicted the log line printed two
   # lines above it. The same conflation the writer fixed, one layer out.
   severity-uncounted) _head_rank="the entry at the head of the queue this pass derived — whether the pool ranked ANY row is UNKNOWN (the count could not be read back), so read this row's RANK as unknown, not as ranked by anything" ;;
+  # ⛔ AND THE RANKED-NONE PASS NEEDS ITS OWN WORDS TOO (review cycle 1, P2): the `*` arm below says
+  # "priority-unreadable: this pass established NO priority order", which is FALSE here — the reorder ran
+  # and is on disk. The row's rank is what is unknown, not the pass's write.
+  unranked) _head_rank="the entry at the head of the queue this pass derived, with the pool ranking NONE of its rows — so this row's RANK is unknown (unranked), not a priority decision" ;;
   *)        _head_rank="the entry at the head of the queue — priority-unreadable: this pass established NO priority order for the queue, so neither its severity nor its age rank is known, and it is not a priority decision" ;;
 esac
 case " ${QUEUED_THIS_PASS:-}" in
