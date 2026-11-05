@@ -82,20 +82,27 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 # DIFFERENT knobs for the SAME runner: `ci.yml`'s `bash-suites` exports `BASH_SHARD_SLICE`, and
 # `ci-main.yml`'s `script-validate` exports `BASH_SHARDS_BUDGET_SECS: '7800'` for the whole step, so
 # every shard inherits it on main's lane too (`shard_run_bounded` hands a shard its environment
-# unchanged). Three reasons, each readable in `run-bash-shards.sh`:
+# unchanged). TWO of the three are knobs a lane really exports, and each is a refusal waiting to
+# happen; the third is cleared so the suite is hermetic to the CONTRACT, not to today's two names:
 #   * a POSITIVE budget and a slice do not compose — the runner refuses the pair BY NAME, so an
 #     inherited budget makes a sliced ARM 3 meet THAT refusal instead of the slice one it pins. On
 #     the pre-fix head (`9b7ed763`, no `env -u` on the child) that reddened ARM 3 on main's lane:
 #     `PASS 12 · FAIL 1` with only `BASH_SHARDS_BUDGET_SECS=7800` inherited.
-#   * a SET-but-EMPTY budget is REFUSED as a missing value, not read as "no deadline". That is why
-#     the test below is PRESENCE (`+set`), never non-emptiness: `:-` would drop an empty inherited
-#     value silently and swallow a refusal the runner is entitled to make.
-#   * an inherited `SHARD_BOUND` puts the fixture's verdict on the outer job's clock.
+#   * a SET-but-EMPTY budget is REFUSED by the runner as a missing value, not read as "no deadline".
+#     Hence the test below is PRESENCE (`+set`), never non-emptiness — but for the NOTICE's sake,
+#     not the runner's: the `unset` is unconditional, so the value is dropped under either spelling
+#     and that refusal never happens here whatever the test says. What `:-` would cost is the
+#     SIGNAL: a set-but-empty inherited value would be dropped with nothing printed, and this
+#     notice is the only evidence a lane has that the drop happened at all.
+#   * `SHARD_BOUND` is the third name in the runner's contract. NO lane exports it today — `grep -rn
+#     SHARD_BOUND .github/` finds nothing — so this is contract hygiene rather than a leak anyone
+#     currently causes, and it is cleared for that reason alone.
 # TWO CLEARANCES, ON PURPOSE, and both remove the leaked budget before ARM 3's child starts: this
 # `unset`, and the `env -u` on that child. The `env -u` is what makes the arm answer ONE variable;
 # it is not the only thing standing between the budget and the arm, and this comment must not be
-# read as claiming it is. `tests/run-bash-shards-bound/run.sh` §0 clears the identical set and uses
-# the same `env -u` spelling per invocation.
+# read as claiming it is. `tests/run-bash-shards-bound/run.sh` §0 clears the identical set;
+# `tests/ci-lane-parity/run.sh` uses this same `env -u` spelling per invocation (e.g. `:998`,
+# `:1661`) — two different files, cited separately on purpose.
 if [ "${BASH_SHARD_SLICE+set}" = set ] || [ "${BASH_SHARDS_BUDGET_SECS+set}" = set ] || [ "${SHARD_BOUND+set}" = set ]; then
   echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE-<unset>}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS-<unset>}' SHARD_BOUND='${SHARD_BOUND-<unset>}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header). A bare dash (not colon-dash) is used in this echo for the same reason the test above is +set: a SET-but-EMPTY value must print as '' and an ABSENT one as <unset>, or the two are indistinguishable in the log this notice exists for."
 fi
