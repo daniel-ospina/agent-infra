@@ -2089,11 +2089,19 @@ git -C "$n44h/wk" worktree remove --force "$n44h/wt" 2>/dev/null
 # arms the ref/root checks were structurally inert — those sentences contain no `refs/heads/` and never say
 # `reap `. Measured on a copy with the ref argument deleted from the `pushed` reporter: `BAD:[none]` over
 # `retrieve the archive /tmp/wt (local pin only — no off-box copy) before removing deadbeef; the BRANCH is
-# the good half (push=pushed, origin holds ), so only the uncommitted work is local-only` — an empty sha
-# slot in the one sentence that is read before a reclaim. So the matrix is tree x push x rescue, and the
-# reporter arms get their own positive substitutions.
-# The fixture's origin sha, named ONCE and handed to the cell, so a proposal that changes the cell's
-# value can never leave the assertion below measuring a sha the sentence was never given.
+# the good half (push=pushed, origin holds ), so only the uncommitted work is local-only` — every slot
+# holding its neighbour's value and the sha slot empty, in the one sentence that is read before a reclaim.
+# So the matrix is tree x push x rescue, and the reporter arms get their own positive substitutions.
+# ⛔ AND ONE SENTENCE IS NOT ENOUGH TO ASSERT THE SHAPE OF A SENTENCE (review cycle 22, P2 — REPRODUCED).
+# Asserting PRESENCE catches a shifted or empty slot; it cannot see a TRANSPOSITION, because both values
+# are still somewhere in the string. Measured by swapping the root and origin arguments at the `pushed`
+# reporter: `… before removing deadbeef; … origin holds /tmp/wt`, and pin-slot + sha-slot BOTH passed.
+# The `sha-transposed` assertion below closes that, anchored on `origin holds ` — the one slot whose
+# introducer is unambiguous. ⛔ `before removing ` is NOT such an anchor: `the tree measured dirty with
+# rescue=nothing … the work is IN /tmp/wt. Read the [wip] line before removing it` names the root
+# EARLIER in the same sentence and then pronominalises it, so an anchor on that phrase reds two correct
+# arms. What catches a root in the sha slot is that the SHA is then missing from `origin holds `, which
+# is what `sha-transposed` tests; a root in the PIN slot is caught by `pin-slot` above.
 n45_sha=deadbeef
 n45_bad=""; n45_all=""
 for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured clean; do
@@ -2109,9 +2117,20 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
         lane_end_next' _ "$GATE" "$n45_push" "$n45_rescue" "$n45_tree" "$n45_sha" 2>/dev/null )"
       n45_cell="$n45_tree/$n45_push/$n45_rescue"
       n45_all="$n45_all$n45_out"$'\n'
-      # 1. one sentence, not the same sentence twice (a SURPLUS argument re-runs the whole format)
+      # 1. one sentence, not the same sentence twice (a SURPLUS argument re-runs the whole format).
+      # ⛔ COUNTING THE WORD `MANUAL` IS NOT COUNTING THE SENTENCES (review cycle 22, P2 — REPRODUCED).
+      # Seven of the ninety distinct sentences carry no `MANUAL` at all — the `retrieve the archive`
+      # reporter arms and the `nothing at risk` / `nothing to recover` arms — so for those cells this
+      # check could not fire, and they are exactly the arms the tree dimension just added. Measured: with
+      # one surplus argument added to the `archived-local`/`pushed` reporter, and separately to the final
+      # `nothing at risk` arm, the format re-ran and printed the sentence TWICE while the `MANUAL` count,
+      # the `%s` search and both slot assertions stayed green. Every arm ends its format in a single `\n`,
+      # so a re-run is always a SECOND LINE — the line count covers all of them. The `MANUAL` count is
+      # kept because it names the specific defect when it fires.
+      n45_lines="$(printf '%s' "$n45_out" | grep -c . )"
+      [ "${n45_lines:-0}" -gt 1 ] && n45_bad="$n45_bad $n45_cell(x${n45_lines}-lines)"
       n45_n="$(printf '%s' "$n45_out" | grep -o 'MANUAL' | grep -c . )"
-      [ "${n45_n:-0}" -gt 1 ] && n45_bad="$n45_bad $n45_cell(x$n45_n)"
+      [ "${n45_n:-0}" -gt 1 ] && n45_bad="$n45_bad $n45_cell(MANUALx$n45_n)"
       # 2. POSITIVE SUBSTITUTION, NOT A HUNT FOR ONE MANGLED PHRASE. bash fills a MISSING argument with
       # the empty string and warns about nothing (`printf 'a %s b %s\n' one` -> `a one b `), so an
       # unfilled specifier never leaves a literal `%s` and never yields `refs/heads//`. If the sentence
@@ -2122,22 +2141,40 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
       case "$n45_out" in *'--heads '*) case "$n45_out" in *'--heads /srv/repo.git'*) : ;; *) n45_bad="$n45_bad $n45_cell(url-slot)" ;; esac ;; esac
       case "$n45_out" in *'retrieve the archive '*) case "$n45_out" in *'retrieve the archive refs/wip/develop'*) : ;; *) n45_bad="$n45_bad $n45_cell(pin-slot)" ;; esac ;; esac
       # ⛔ THE SHA SLOT'S ANCHORS ARE THE PHRASINGS THAT ACTUALLY REPORT ONE (review cycle 22, P2 —
-      # MEASURED). Cycle 21 anchored this on `origin holds refs/heads/`, which appears ONLY in the
-      # `[lane-exit]` LOG echoes (spawn-gate.sh:1545,1548) and never in the `next=` product: driven over
-      # all 360 cells, 0 sentences contain it, so the arm could not fire — an inert assertion, i.e. exactly
-      # the blind-check defect this whole matrix exists to remove, reintroduced one line below the fix.
-      # The product reports an origin sha in THREE shapes, so each gets its own anchor: `holds refs/heads/<b>
-      # at <sha>` (the answered-remote MANUAL arm), `origin at <sha> (<b>)` (unpushed-only), and `origin
-      # holds <sha>` (the archived-local reporter). MEASURED over the 90 distinct sentences: 8 carry the
-      # sha behind `holds refs/heads/`, 1 behind `origin at `, 1 behind `origin holds ` — and `origin
-      # holds ` ALSO prefixes TWO ABSTAINING arms that report no sha BY DESIGN, `origin holds the commit(s)`
-      # (verify-unanswered) and `origin holds for <b>` (push-unreported), 8 sentences each. Those are
-      # excluded FIRST: a test that reds the truth is as broke as one that passes a lie.
+      # MEASURED). This assertion was first written anchored on `origin holds refs/heads/`, which appears
+      # ONLY in the `[lane-exit]` LOG echoes (spawn-gate.sh:1529,1545,1548) and NEVER in the `next=`
+      # product: driven over all 450 cells (6 trees x 15 pushes x 5 rescues), 0 sentences contain it, so
+      # the arm could not fire — a blind assertion, i.e. exactly the defect this matrix exists to remove.
+      # It was corrected here, before it was ever committed, so no earlier commit on this branch carries
+      # the inert form. The product reports an origin sha in THREE shapes, each with its own anchor:
+      # `holds refs/heads/<b> at <sha>` (the answered-remote MANUAL arm), `origin at <sha> (<b>`
+      # (unpushed-only), and `origin holds <sha>` (the archived-local reporter). MEASURED over the 90
+      # distinct sentences: 8 carry the sha behind `holds refs/heads/`, 1 behind `origin at `, 1 behind
+      # `origin holds `. And `origin holds ` ALSO prefixes TWO ABSTAINING arms that report no sha BY
+      # DESIGN — `origin holds the commit(s)` (verify-unanswered) and `origin holds for <b>`
+      # (push-unreported), 8 sentences each — so those are excluded FIRST: a test that reds the truth is
+      # as broken as one that passes a lie.
       case "$n45_out" in
         *'origin holds the '*|*'origin holds for '*) : ;;
         *'holds refs/heads/'*|*'origin at '*|*'origin holds '*)
           case "$n45_out" in *"$n45_sha"*) : ;; *) n45_bad="$n45_bad $n45_cell(sha-slot)" ;; esac ;;
       esac
+      # ADJACENCY — the only thing that separates a correct slot from a TRANSPOSED one (see the header).
+      case "$n45_out" in
+        *'origin holds '*)
+          case "$n45_out" in
+            *'origin holds the '*|*'origin holds for '*) : ;;
+            *'origin holds '"$n45_sha"*) : ;;
+            *) n45_bad="$n45_bad $n45_cell(sha-transposed)" ;;
+          esac ;;
+      esac
+      # ⛔ THE TWO NEGATIVE SHAPES ARE KEPT, NOT DROPPED (review cycle 22, P3). Neither fires on today's
+      # product (0 of the 90 sentences match), so nothing measurable was lost when they fell out of the
+      # rewrite — but an EMPTY root in a `reap`/`before removing` arm and an EMPTY push verdict are
+      # defects a future arm can reintroduce, and dropping a guard without saying so is how a suite
+      # quietly narrows. They are cheap, they are arm-agnostic, and they stay.
+      case "$n45_out" in *'reap  '*|*'reap `'*) n45_bad="$n45_bad $n45_cell(root-slot)" ;; esac
+      case "$n45_out" in *'push=)'*|*'push=,'*|*'push= '*) n45_bad="$n45_bad $n45_cell(empty-verdict)" ;; esac
       case "$n45_out" in *'%s'*) n45_bad="$n45_bad $n45_cell(unfilled-specifier)" ;; esac
     done
   done
