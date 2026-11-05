@@ -1602,8 +1602,8 @@ Three mechanisms, and mtime models only the third:
    lane is working hard.
 2. **A lane that finished without a verdict any reader recognised was indistinguishable from a
    crash.** `lane-bound.sh` had been writing one all along — see 13.3.
-3. **Real death** — the completion watchdog's `sub-agent completed but did not exit within 15s —
-   killing`, a provider stall, or a true hang.
+3. **Real death** — the completion watchdog's `[task] sub-agent (pid N) completed but did not exit
+   within 15s — killing (completion watchdog)` line, a provider stall, or a true hang.
 
 ### 13.2 The states, in the vocabulary of §1
 
@@ -1700,6 +1700,16 @@ sample. An unparseable `time=` row anywhere inside the subtree abstains the WHOL
 (`subtree_cpu_cs` → `None`) rather than shrinking it, because a smaller total is how a busy tree reads
 flat.
 
+⛔ **AND THE CONSEQUENCE OF THAT ASYMMETRY, SAID PLAINLY — the two instruments can DISAGREE.**
+`lane-bound.sh` resets its own no-progress clock on **EITHER** signal (`_lb_dbytes > 0 ||
+_lb_dcpu > TOL_CS`), so a lane whose CPU advanced 10 minutes ago is still *progressing* to the
+supervisor for another ~35 minutes; this axis sees a 50-minute-old log, a flat 30 s CPU delta, and
+answers `frozen`. **That is not a defect in either tool — they measure different spans — but it does
+mean `frozen` is NOT a licence to kill.** Anyone wiring a kill path to it must first close this gap
+(by sampling CPU across `LOG_FREEZE_MS` rather than `LOG_WINDOW_MS`), or they will kill a lane the
+supervisor still considers alive. `frozen` is a diagnosis for a human and for the re-dispatch
+question, and it is the same reason the state is not named `dead`.
+
 ### 13.4 The verdict the supervisor already writes
 
 `lane-bound.sh` emits **one** line per lane — to the log, to stdout, and to `--verdict-file`:
@@ -1725,16 +1735,16 @@ verdict whose `rc=` is missing or unparseable **abstains** (`finished-rc-unreada
 assuming success.
 
 ⛔ **`rc=na` IS NOT COMPLETION EVIDENCE — IT IS THE *ABSENCE* OF EXIT-STATUS EVIDENCE, AND IT MUST BE
-CORROBORATED.** `lane-bound.sh` sets `V_RC=na` **unconditionally** in `watch` mode (`lane-bound.sh:397`),
-and `watch` is the mode `spawn-gate.sh`'s `run_agent` uses for **every** lane/fixer/worker
-(`spawn-gate.sh:1532`); `run` mode — the only one that puts the child's real status on the bound line —
+CORROBORATED.** `lane-bound.sh` sets `V_RC=na` **unconditionally** in `watch` mode (its own
+`V_RC=na` assignment), and `watch` is the mode `spawn-gate.sh`'s `run_agent` uses for **every**
+lane/fixer/worker; `run` mode — the only one that puts the child's real status on the bound line —
 is never used by the fleet. In `watch` mode a lane that **completed** and a lane that **crashed / was
 OOM-killed / was killed by the completion watchdog's 15 s TERM→KILL** write the *identical*
 `verdict=finished rc=na`. Accepting `na` on its own therefore makes the `rc` conjunct **inert for the
 axis's entire production population** and publishes `finished` for a crashed lane.
 
 The real status *is* in the same log, one line later, from the caller:
-`[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh:1583`). `na` is therefore corroborated against
+`[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh`'s launcher line). `na` is therefore corroborated against
 that line (`parse_runner_line` → `LogRead.runner_rc`):
 
 | bound line | launcher line (`[timeout] agent pid=<same pid> … rc=<n>`) | result |
@@ -1745,7 +1755,8 @@ that line (`parse_runner_line` → `LogRead.runner_rc`):
 | `rc=na` | **absent** | **`unknown`** (`finished-rc-uncorroborated`) — an abstention, never an assumed success |
 | `rc=na` | **present, but naming another incarnation** | **`unknown`** — the witness is not this lane's (`runner-rc-unbound` in `detail`) |
 | `rc=na` | **present, but its `pid=` is unusable** (`0x1f`, `?`, empty, over-long) | **`unknown`** — a line EXISTS but names no incarnation (`runner-pid-unreadable` in `detail`), and it is never adopted |
-| `rc=na` | **a `[timeout] agent` line with NO `pid=` at all** (the mechanism-3 watchdog PROSE, e.g. `[timeout] agent completed but did not exit within 15s — killing`) | **not a launcher report** — it is skipped, so an earlier readable line still corroborates; it never shadows the witness and never claims a pid token existed |
+| `rc=na` | **a `[timeout] agent` line with NO `pid=` token at all** (a truncated or garbled write) | **not a launcher report** — it is skipped, so an earlier readable line still corroborates; it never shadows the witness and never claims a pid token existed |
+| `rc=na` | the COMPLETION WATCHDOG's line — `[task] sub-agent (pid N) completed but did not exit within 15s — killing (completion watchdog)` (`extensions/builtin-tools/index.ts`) | **absent to this parser, for a different reason**: it carries no `[timeout] agent` marker at all, so it is never a candidate. (An earlier revision of this row quoted that line with a `[timeout] agent` prefix — a shape **no producer writes** — and attributed its skip to the missing `pid=`, which is the wrong guard) |
 | `rc=na` | present but its `rc` is **unreadable** (not a 1–3 digit status, e.g. `0x0`, `exit:0`, a runaway token) | **`unknown`** (`finished-rc-uncorroborated`, and `detail` names `runner-rc-unreadable`) — an unreadable status is not a negative fact, and it is **not** the same fact as an absent line |
 | `rc=7` | (not consulted) | **`no-verdict`** (`bound-finished-rc:7`) |
 | `rc=` **present but unreadable** (`0x0`, a runaway token, …) | (not consulted) | **`unknown`** (`finished-rc-unreadable`, `detail` says the `rc=` was **PRESENT and UNREADABLE**) |
@@ -1753,6 +1764,18 @@ that line (`parse_runner_line` → `LogRead.runner_rc`):
 
 `test-gates.sh` already uses `NO-VERDICT` for exactly this shape (a review that ended and produced no
 usable verdict), so `no-verdict` reuses that name rather than inventing a parallel one.
+
+**The launcher line is read for EVERY readable log, not only for `rc=na`.** That restriction was a real
+false negative for the population that has **no bound at all**: `merge-one.sh`'s reviewer run is its own
+plain sleep watchdog which never invokes `lane-bound.sh` (that file says so itself), so it writes
+`[timeout] agent … rc=<n>` and **no** `[lane-bound] VERDICT` line — and `merge-one.sh` is named in this
+axis's population (§13's first paragraph). Under the `rc=na`-only gate that witness was discarded, and
+a reviewer run that had finished sat there as `no-verdict` whose `detail` asserted *"the process ended
+and told us nothing"* over a log that plainly said `rc=0`. It now reports what the launcher said, e.g.
+`… (the process ended and wrote NO bound verdict; the launcher reported rc=0 — so it did NOT tell us
+nothing, but completion stays undecidable without a bound verdict)`. ⛔ **The state stays `no-verdict`:**
+without a bound verdict there is no assertion that the bound fired nothing, so a launcher `rc=0` is
+EVIDENCE, never a completion — promoting it to `finished` is a separate claim this axis does not make.
 
 ⛔ **THE LAST STATUS LINE WINS, EVEN WHEN ITS TOKEN IS UNRECOGNISED.** Keeping the last *recognised*
 verdict would adopt a STALE earlier one when a future producer appends `verdict=needs-review` — read

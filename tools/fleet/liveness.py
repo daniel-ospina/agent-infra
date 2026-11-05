@@ -262,11 +262,18 @@ STATES = ("dead", "running-quiet", "wedged", "idle", "unknown")
 #              advanced inside the sample window. This is the state a long
 #              SILENT TOOL CALL must read: `pi -p` writes nothing to its log
 #              while a tool runs, so log age alone reported such a lane as not
-#              live (#…, the measured 50 %-look-dead class).
-#   frozen     the process tree is alive AND ZERO progress on EVERY signal for
-#              the full ``LOG_FREEZE_MS`` window. Both halves are required, and
-#              the window is echoed in ``Verdict.detail`` so no reader has to
-#              look it up.
+#              live (#1777, the measured 50 %-look-dead class).
+#   frozen     the process tree is alive AND ZERO progress on EVERY signal, with
+#              the LOG's silence spanning the full ``LOG_FREEZE_MS`` window and the
+#              SAMPLED signals (CPU, transcript) flat across ``LOG_WINDOW_MS``.
+#              ⛔ THE TWO DURATIONS DIFFER on purpose and are NOT the same claim:
+#              this is "no output for the freeze window AND no CPU in the sample
+#              window", never "no CPU for the freeze window". Both windows are
+#              echoed in ``Verdict.detail`` (``freeze_ms=``/``window_ms=``) so a
+#              reader can always tell which it received — §13.3 states the
+#              boundary and what it costs (``lane-bound.sh`` resets its own
+#              no-progress clock on EITHER signal, so this axis can say ``frozen``
+#              while the supervisor still calls the lane progressing).
 #   finished   the process tree is GONE and the lane WROTE A VERDICT that says
 #              its turn completed (``lane-bound.sh``'s own line).
 #   no-verdict the process tree is GONE and the lane wrote NO verdict at all —
@@ -326,7 +333,7 @@ BOUND_VERDICTS = ("finished", "stalled", "exceeded-wallclock")
 # ⛔ `na` IS **NOT** COMPLETION EVIDENCE — it is the ABSENCE of exit-status evidence.
 # `lane-bound.sh` sets `V_RC=na` UNCONDITIONALLY in `watch` mode (`:397`), and `watch`
 # is the mode the fleet's ONLY launcher uses for EVERY lane/fixer/worker
-# (`spawn-gate.sh:1532` `run_agent` -> `lane-bound.sh watch`). `run` mode (which does
+# (`spawn-gate.sh`'s `run_agent` -> `lane-bound.sh watch`). `run` mode (which does)
 # put the child's real status on the line) is never used by the fleet. So `rc=na`
 # carries no completion fact at all: reading it as OK made the `rc` conjunct INERT for
 # the axis's entire production population, and a crashed / OOM-killed / watchdog-killed
@@ -660,7 +667,7 @@ class Evidence:
     # the claim logic is reachable ONLY when a caller explicitly supplies it, so
     # the existing verdict ladder is unchanged (pinned by a test + mutation).
     claim_read: Optional[ClaimRead] = None
-    # The LOG-LANE evidence axis (#…). ``None`` for every session-lane caller, so
+    # The LOG-LANE evidence axis (#1777). ``None`` for every session-lane caller, so
     # the existing ladder is untouched — the log logic is reachable ONLY when a
     # caller explicitly says "this is a log lane" (pinned by a test AND a
     # mutation, the same shape as the claim axis).
@@ -1027,7 +1034,9 @@ def claim_verdict(cr: ClaimRead) -> Verdict:
 #      `NO-VERDICT` for exactly this shape in review verdicts; this axis adopts
 #      the same name rather than inventing a parallel one.
 #   3. real death: the completion watchdog's
-#      `sub-agent completed but did not exit within 15s — killing`, a provider
+#      `[task] sub-agent (pid N) completed but did not exit within 15s — killing
+#      (completion watchdog)` (`extensions/builtin-tools/index.ts`, the default
+#      `logFn` prefix), a provider
 #      stall, or a true hang — and `lane-bound.sh`'s own `verdict=stalled` /
 #      `verdict=exceeded-wallclock` lines ARE that death, reported.
 #
@@ -1065,8 +1074,10 @@ def claim_verdict(cr: ClaimRead) -> Verdict:
 # `ep_poll` reads exactly 0 cs; an active lane reads tens to hundreds.
 #
 # ⛔ AND THE DIRECTION OF EACH RULE IS THE SAFETY PROPERTY. Progress is a VETO
-# (it protects, it never convicts); ``frozen`` needs BOTH signals flat for the
-# FULL ``LOG_FREEZE_MS`` AND a live tree; an unreadable signal ABSTAINS
+# (it protects, it never convicts); ``frozen`` needs BOTH signals flat — the LOG
+# silent for the FULL ``LOG_FREEZE_MS`` and the sampled deltas flat over
+# ``LOG_WINDOW_MS`` (the two durations differ; §13.3) — plus a live tree; an
+# unreadable signal ABSTAINS
 # (``unknown``) and never becomes ``frozen`` or ``dead``; and absence of a log is
 # an ABSTENTION — never death.
 
@@ -1159,7 +1170,7 @@ def _bound_verdict_re():
         _BOUND_LINE_RE = globals()["_BOUND_LINE_RE"]
         _BOUND_TOKEN_RE = _re.compile(r"\bverdict=([a-z][a-z-]*)")
         globals()["_BOUND_TOKEN_RE"] = _BOUND_TOKEN_RE
-        # The LAUNCHER's exit-status line (`spawn-gate.sh:1583`):
+        # The LAUNCHER's exit-status line (`spawn-gate.sh`'s `[timeout] agent`):
         #   [timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>
         # It is the ONLY witness of the child's real status in `watch` mode, so it is
         # what corroborates `rc=na` (see BOUND_OK_RC).
@@ -1205,8 +1216,8 @@ def parse_runner_line(text: str):
 
     ⛔ WHY THIS EXISTS — THE `rc=na` HOLE. `lane-bound.sh` writes
     ``VERDICT verdict=finished … rc=na`` UNCONDITIONALLY in ``watch`` mode
-    (``lane-bound.sh:397``), and ``watch`` is the mode ``spawn-gate.sh``'s ``run_agent``
-    uses for EVERY lane/fixer/worker (``spawn-gate.sh:1532``). ``run`` mode — the only
+    (``lane-bound.sh``'s ``V_RC=na``), and ``watch`` is the mode ``spawn-gate.sh``'s
+    ``run_agent`` uses for EVERY lane/fixer/worker. ``run`` mode — the only
     one that puts the child's real status on the bound line — is never used by the
     fleet. So the bound line's ``rc`` can NEVER witness completion in production, and a
     crashed / OOM-killed / watchdog-killed lane wrote exactly the same
@@ -1214,7 +1225,8 @@ def parse_runner_line(text: str):
 
     The real status IS written to the same log, one line later, by the caller:
     ``[timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>``
-    (``spawn-gate.sh:1583``). That line is the corroborating witness for ``na``.
+    (``spawn-gate.sh``'s ``[timeout] agent`` line). That line is the corroborating
+    witness for ``na``.
 
     Last line wins (the log is appended to across dispatches), and ``pid`` is returned so
     the caller can require it belong to the SAME incarnation as the bound line.
@@ -1242,7 +1254,8 @@ def parse_runner_line(text: str):
     _bound_verdict_re()  # ensures the compiled globals exist
     # ⛔ A `[timeout] agent` LINE WITH NO `pid=` TOKEN IS NOT A LAUNCHER REPORT. The
     # watchdog writes PROSE with the same prefix — the mechanism-3 line this axis's own
-    # doc quotes: `[timeout] agent completed but did not exit within 15s — killing`. Taking
+    # doc quotes: `[task] sub-agent (pid N) completed but did not exit within 15s — killing
+    # (completion watchdog)`. Taking
     # the LAST marker unconditionally made that prose the witness: it has no `pid=`, so it
     # became `"?"` (asserting a pid token existed) and it SHADOWED an earlier readable
     # launcher line, downgrading a corroborated `finished` to `unknown`. Only a marker
@@ -1455,7 +1468,8 @@ class LogRead:
     verdict: str = ""               # BOUND_VERDICTS member, or ""
     rc: Optional[str] = None        # the bound's `rc=` on the same line: "0" | "na" | "7" …
     # The LAUNCHER's own exit status for this lane (`[timeout] agent … rc=<n>`,
-    # `spawn-gate.sh:1583`). REQUIRED to corroborate `rc=na`, which is `watch` mode's
+    # `spawn-gate.sh`'s `[timeout] agent` line). REQUIRED to corroborate `rc=na`, which is
+    # `watch` mode's
     # shape and carries NO completion fact (see `BOUND_OK_RC`).
     runner_rc: Optional[str] = None
     verdict_line_pid: str = ""      # the `pid=` on that line — the verdict's own incarnation
@@ -1509,8 +1523,10 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
     (a veto), then — only with both signals flat and the full window elapsed —
     ``frozen``. Every unreadable branch abstains. Nothing here can reach
     ``frozen`` without a LIVE tree, a STATED window, and ZERO progress on every
-    signal, and nothing can reach ``finished``/``no-verdict`` without positive
-    evidence that the tree is gone.
+    signal — the log silent for ``freeze_ms`` AND the sampled deltas flat over
+    ``window_ms``; the two durations differ and both are echoed in the detail —
+    and nothing can reach ``finished``/``no-verdict`` without positive evidence
+    that the tree is gone.
     """
     if lr is None:
         return Verdict("unknown", "no-log-read")
@@ -1590,7 +1606,8 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                     # to remove.
                     #
                     # The real status IS in the same log, one line later, from the
-                    # caller: `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh:1583`).
+                    # caller: `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh`'s launcher
+                    # line).
                     # Corroborate with it, and require it to describe THIS incarnation.
                     if runner_rc is None:
                         return Verdict("unknown", "finished-rc-uncorroborated",
@@ -1623,8 +1640,23 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                            detail=("verdict_source=%s rc=%s"
                                    % (lr.verdict_source or "log", _n(rc)))
                                   + _also(lr.detail))
+        # ⛔ NO BOUND VERDICT IS **NOT** THE SAME FACT AS "NO EVIDENCE". The population
+        # that has no bound at all (`merge-one.sh`) still writes the launcher line, so
+        # when `runner_rc` was read we must report it rather than asserting the process
+        # "told us nothing". The state stays `no-verdict`: without a bound verdict we
+        # cannot assert the bound fired nothing, so a launcher `rc=0` is EVIDENCE, not a
+        # completion — promoting it to `finished` is a separate claim this axis does not
+        # make (docs §13.5, and the `finished` rule that a bound verdict is required).
+        if runner_rc is not None:
+            return Verdict("no-verdict", "process-gone-no-verdict",
+                           detail=("bytes=%s age_ms=%s (the process ended and wrote NO bound "
+                                   "verdict; the launcher reported rc=%s — so it did NOT "
+                                   "tell us nothing, but completion stays undecidable "
+                                   "without a bound verdict)"
+                                   % (_n(lr.size), _n(lr.age_ms), runner_rc))
+                                  + _also(lr.detail))
         return Verdict("no-verdict", "process-gone-no-verdict",
-                       detail=("bytes=%s age_ms=%s (the process ended and told us nothing)"
+                       detail=("bytes=%s age_ms=%s (the process ended and wrote no verdict)"
                                % (_n(lr.size), _n(lr.age_ms)))
                               + ((" | " + lr.detail) if lr.detail else ""))
     if lr.alive is None:
@@ -1710,7 +1742,9 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                               % (_n(lr.size_delta), _n(lr.cpu_delta_cs), lr.age_ms, freeze_ms,
                                  lr.window_ms))
 
-    # (5) FROZEN — live tree, ZERO progress on every signal, full window elapsed.
+    # (5) FROZEN — live tree, ZERO progress on every signal: the log silent for the full
+    # freeze window AND the sampled deltas flat over the sample window. The two durations
+    # differ on purpose (§13.3 states the weaker evidence duration and its consequence).
     return Verdict("frozen", "no-progress",
                    detail="bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s tol_cs=%d "
                           "age_ms=%d freeze_ms=%d window_ms=%d"
@@ -2761,14 +2795,23 @@ def gather_log_lane(
             lr.detail = " | ".join(x for x in (lr.detail, why) if x)
             lr.verdict, lr.rc = "", None
 
-    # ⛔ CORROBORATE `rc=na` FROM THE LAUNCHER'S OWN LINE. `na` is `watch` mode's
-    # unconditional shape (`lane-bound.sh:397`) and the fleet ALWAYS uses `watch`
-    # (`spawn-gate.sh:1532`), so it carries no completion fact — see `BOUND_OK_RC`. The
-    # child's real status is written to the SAME log by the caller as
-    # `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh:1583`). Read it here, and
-    # accept it only when it names THIS verdict's incarnation — a leftover line from an
-    # earlier dispatch appended to the same log is not this lane's exit status.
-    if lr.rc == "na" and lr.readable:
+    # ⛔ READ THE LAUNCHER'S OWN LINE FOR **EVERY READABLE LOG** — NOT ONLY FOR `rc=na`.
+    # `na` is `watch` mode's unconditional shape (`lane-bound.sh`'s `V_RC=na`) and the
+    # fleet ALWAYS uses `watch` (`spawn-gate.sh`'s `run_agent`), so it carries no
+    # completion fact — see `BOUND_OK_RC`. The child's real status is written to the SAME
+    # log by the caller as `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh`'s launcher
+    # line). Accept it only when it names THIS lane's incarnation — a leftover line from
+    # an earlier dispatch appended to the same log is not this lane's exit status.
+    #
+    # ⛔ AND NOT ONLY WHEN A BOUND VERDICT EXISTS. `merge-one.sh`'s reviewer run is its OWN
+    # plain sleep watchdog that never invokes `lane-bound.sh` (stated in that file's own
+    # correction comment), so it writes the launcher line and NO bound line — and
+    # `merge-one.sh` is named in this axis's population (docs §13, first paragraph).
+    # Gating on `rc == "na"` discarded exactly that witness, so a finished reviewer run
+    # published `no-verdict/process-gone-no-verdict` with the detail "the process ended and
+    # told us nothing" while the log plainly said `rc=0`. Reading it always costs one
+    # `_log_tail` on a path that has already decided the tree is gone.
+    if lr.readable:
         runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))
         if runner_pid == "?":
             # The launcher line EXISTS but names no usable pid, so it can never be bound

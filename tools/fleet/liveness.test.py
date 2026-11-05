@@ -1495,7 +1495,7 @@ def t33():
               "an exited process that told us nothing reads `no-verdict`, got %s (age %d)"
               % (v.state, age))
         check(v.state != "frozen", "an exited process is TERMINAL, never frozen")
-        check("the process ended and told us nothing" in v.detail,
+        check("the process ended and wrote no verdict" in v.detail,
               "the detail says what happened; got %r" % v.detail)
     # And it is the SAME answer through the dispatcher a consumer calls.
     v = liv.evaluate(liv.Evidence(log_read=LR(alive=False, verdict="")))
@@ -1649,9 +1649,9 @@ def t37():
     check(v.state == "no-verdict", "a crashed lane under verdict=finished is NOT finished; got %s"
           % v.state)
     check(v.reason == "bound-finished-rc:7", "the rc is named; got %r" % v.reason)
-    # `na` is `watch` mode's UNCONDITIONAL shape (`lane-bound.sh:397`), and `watch` is
-    # the mode `spawn-gate.sh`'s `run_agent` uses for EVERY lane/fixer/worker
-    # (`:1532`). `run` mode — the only one that puts the child's real status on the
+    # `na` is `watch` mode's UNCONDITIONAL shape (`lane-bound.sh`'s `V_RC=na`), and `watch`
+    # is the mode `spawn-gate.sh`'s `run_agent` uses for EVERY lane/fixer/worker.
+    # `run` mode — the only one that puts the child's real status on the
     # bound line — is never used by the fleet. So `rc=na` carries NO completion fact:
     # a lane that COMPLETED and a lane that CRASHED / was OOM-killed / was killed by
     # the completion watchdog write the identical `verdict=finished rc=na`. Accepting
@@ -2494,8 +2494,8 @@ def t51():
 
         def write(runner_pid, runner_rc):
             with open(log, "w", encoding="utf-8") as fh:
-                # `lane-bound.sh watch` writes `rc=na` UNCONDITIONALLY (`:397`) — this is
-                # the fleet's real shape, not a contrivance.
+                # `lane-bound.sh watch` writes `rc=na` UNCONDITIONALLY (`V_RC=na`) — this
+                # is the fleet's real shape, not a contrivance.
                 fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
                          "elapsed=61s log=%s\n" % (dead, log))
                 fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=%s\n"
@@ -2576,27 +2576,98 @@ def t51():
         check("runner-pid-unreadable" in (v.detail or ""),
               "…and the detail says a line EXISTS with an unusable pid; got %r"
               % (v.detail,))
-        # ⛔ THE WATCHDOG'S PROSE CARRIES THE SAME PREFIX. Mechanism 3 in this axis's own
-        # doc is `[timeout] agent completed but did not exit within 15s — killing`. It has
-        # NO `pid=`, so it is not a launcher report: treating it as one made it the LAST
-        # marker, asserting a pid token existed AND shadowing the earlier readable line —
-        # downgrading a corroborated `finished` to `unknown`.
-        prose = "[timeout] agent completed but did not exit within 15s \u2014 killing"
-        check(liv.parse_runner_line(prose) == ("", None),
-              "the watchdog PROSE is not a launcher report; got %r"
-              % (liv.parse_runner_line(prose),))
+        # ⛔ THE COMPLETION-WATCHDOG LINE IS NOT A LAUNCHER REPORT — and the REAL shape is
+        # `[task] sub-agent (pid N) completed but did not exit within 15s — killing
+        # (completion watchdog)` (`extensions/builtin-tools/index.ts`, the default `logFn`
+        # prefix). An earlier revision of this fixture quoted a `[timeout] agent completed
+        # but did not exit …` line that NO producer writes. The real line is skipped because
+        # it carries no `[timeout] agent` marker at all — NOT because it lacks a `pid=` — and
+        # getting that backwards would mis-describe which guard is doing the work.
+        wd = ("[task] sub-agent (pid %d) completed but did not exit within 15s \u2014 "
+              "killing (completion watchdog)" % dead)
+        check(liv.parse_runner_line(wd) == ("", None),
+              "the REAL completion-watchdog line is not a launcher report; got %r"
+              % (liv.parse_runner_line(wd),))
+        # ⛔ AND THE SEPARATE, DEFENSIVE ARM: a `[timeout] agent` marker whose `pid=` token is
+        # ABSENT (a truncated or garbled write) is `absent`, never `present-but-unusable` —
+        # that second diagnosis belongs to a token that IS there and cannot be read
+        # (`runner-pid-unreadable`, above).
         check(liv.parse_runner_line("[timeout] agent wall_limit=1s rc=0") == ("", None),
               "a pid-less line is ABSENT, not present-but-unusable")
         with open(log, "w", encoding="utf-8") as fh:
             fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
                      "elapsed=61s log=%s\n" % (dead, log))
             fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=0\n" % dead)
-            fh.write(prose + "\n")
+            fh.write(wd + "\n")
+            fh.write("[timeout] agent wall_limit=1s rc=0\n")
         lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
         v = liv.evaluate(liv.Evidence(log_read=lr))
         check(v.state == "finished",
-              "trailing PROSE must not shadow the readable witness; got %s/%s"
+              "trailing non-launcher lines must not shadow the readable witness; got %s/%s"
               % (v.state, v.reason))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T52 a lane with NO bound verdict still REPORTS the launcher's rc (merge-one.sh)")
+def t52():
+    # ⛔ THE POPULATION WITH NO BOUND AT ALL. `merge-one.sh`'s reviewer run is its own plain
+    # sleep watchdog that never invokes `lane-bound.sh` (stated in that file's own correction
+    # comment), so a finished reviewer run writes `[timeout] agent … rc=0` and NO
+    # `[lane-bound] VERDICT` line — and `merge-one.sh` is named in this axis's population
+    # (§13, first paragraph). The gather step used to consult the launcher line ONLY when the
+    # bound line said `rc=na`, so for this population the witness was thrown away and the
+    # verdict published "the process ended and told us nothing" over a log that said rc=0.
+    d = tempfile.mkdtemp(prefix="liv-no-bound-")
+    try:
+        log = os.path.join(d, "merge-42.log")
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = child.pid
+        child.wait()
+
+        def write(line):
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("[merge 42] reviewer started\n")
+                if line:
+                    fh.write(line)
+
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=900s rc=0\n" % dead)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.verdict == "", "there is no bound line; got %r" % (lr.verdict,))
+        check(lr.runner_rc == "0",
+              "the launcher's rc is READ even with no bound verdict; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "no-verdict",
+              "no bound verdict is still an abstention, never `finished`; got %s/%s"
+              % (v.state, v.reason))
+        check("rc=0" in (v.detail or ""),
+              "…but the detail reports what the launcher SAID; got %r" % (v.detail,))
+        check("wrote NO bound verdict" in (v.detail or ""),
+              "…and names a missing BOUND verdict as the gap; got %r" % (v.detail,))
+
+        # A CRASHED reviewer is the same state and is still NOT `dead`: only the bound's own
+        # kill verdict is death. It is also not a completion.
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=900s rc=7\n" % dead)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "no-verdict",
+              "a crashed reviewer is not `dead` (no bound killed it); got %s" % v.state)
+        check("rc=7" in (v.detail or ""), "…and rc=7 is reported; got %r" % (v.detail,))
+
+        # NO launcher line at all keeps the old, honest answer.
+        write("")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check("wrote no verdict" in (v.detail or ""),
+              "with no witness at all the detail says so plainly; got %r" % (v.detail,))
+
+        # The junk-token rule is ONE door: it applies on this path too.
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=1s rc=0x0\n" % dead)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.runner_rc is None,
+              "an unreadable launcher token is NO witness on this path either; got %r"
+              % (lr.runner_rc,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3144,11 +3215,26 @@ MUTATIONS = [
     # ── the ACQUISITION half: T51 fails if either of these is dropped ────────────────
     Mutation(
         "T51", "module",
-        '    if lr.rc == "na" and lr.readable:',
-        '    if False and lr.rc == "na" and lr.readable:',
-        "gather_log_lane stops POPULATING the `rc=na` witness, so every completed "
+        '    if lr.readable:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        '    if False:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        "gather_log_lane stops POPULATING the launcher witness, so every completed "
         "watch-mode lane loses its corroboration and reads `unknown` — the pure verdict "
         "matrix stays green because T37 stacks the field by hand",
+    ),
+    # ── the NO-BOUND-VERDICT population (`merge-one.sh`): T52 fails if either is dropped ──
+    Mutation(
+        "T52", "module",
+        '        if runner_rc is not None:\n            return Verdict("no-verdict", "process-gone-no-verdict",',
+        '        if False:\n            return Verdict("no-verdict", "process-gone-no-verdict",',
+        "a lane with no bound verdict goes back to asserting it 'told us nothing' "
+        "over a log whose launcher line said rc=0 — the merge-one.sh false negative",
+    ),
+    Mutation(
+        "T52", "module",
+        '    if lr.readable:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        '    if lr.rc == "na" and lr.readable:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        "the launcher witness is consulted ONLY for `rc=na` again, which discards it for "
+        "every lane that has no bound line at all (`merge-one.sh`)",
     ),
     Mutation(
         "T51", "module",
@@ -3268,9 +3354,9 @@ MUTATIONS = [
         "T51", "module",
         '        if _RUNNER_PID_TOKEN_RE.search(cand) is None:',
         '        if False:',
-        "a marker line with NO `pid=` (the mechanism-3 watchdog PROSE) is taken as the "
-        "launcher report again: it asserts a pid token existed AND shadows an earlier "
-        "readable witness, downgrading a corroborated `finished` to `unknown`",
+        "a marker line with NO `pid=` token is taken as the launcher report again: it asserts "
+        "a pid token existed AND shadows an earlier readable witness, downgrading a "
+        "corroborated `finished` to `unknown`",
     ),
 ]
 
