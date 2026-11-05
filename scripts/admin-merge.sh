@@ -6741,7 +6741,17 @@ build_evidence() {
 # pytest is the same exit-4-having-run-nothing defect. Derive it, never respell
 # it, so a family added to either half cannot be forgotten by the runner.
 NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^runner::|^pipeline-compliance::'
-SHARD_REPRO_ID_RE='^bash-shard::'
+# ⛔ ONE LITERAL FOR THE FAMILY, because the ID PREFIX is respelled in two places
+# the rest cannot see: the pytest filter above, and the extraction that routes a
+# token to the shard arm (`sed -n 's/^<prefix>\(.*\)$/\1/p'`). A family whose
+# regex was widened while the extraction still spelled `bash-shard::` would be
+# excluded from the pytest argv AND never extracted — i.e. it would be silently
+# routed to NEITHER arm, which is exactly the permanently-unattributable defect
+# #3415 removes. So the prefix is stated once and derived from. (A SECOND
+# shard-shaped family still needs its own arm; this only makes the respelling
+# impossible.)
+SHARD_REPRO_ID_PREFIX='bash-shard::'
+SHARD_REPRO_ID_RE="^${SHARD_REPRO_ID_PREFIX}"
 PYTEST_REPRO_ID_RE="${SHARD_REPRO_ID_RE}|${NON_LOCAL_REPRO_ID_RE}"
 
 # repro_shard_path <token> — the repo-relative script a `bash-shard::<token>` id
@@ -6953,7 +6963,10 @@ reproduce_residual_on_base() {
   # to pytest would abort the run in exactly the same way.
   local nodeids shards
   nodeids="$(grep -Ev "$PYTEST_REPRO_ID_RE" "$residual" 2>/dev/null || true)"
-  shards="$(sed -n 's/^bash-shard::\(.*\)$/\1/p' "$residual" 2>/dev/null || true)"
+  # THE EXTRACTION DERIVES ITS PREFIX from the one literal (see
+  # `SHARD_REPRO_ID_PREFIX`): respelling it here is how a family ends up routed
+  # to neither arm.
+  shards="$(sed -n "s/^${SHARD_REPRO_ID_PREFIX}\\(.*\\)$/\\1/p" "$residual" 2>/dev/null || true)"
   [ -n "$nodeids" ] || [ -n "$shards" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
@@ -7110,7 +7123,7 @@ reproduce_residual_on_base() {
   # from one), and exit 0 is the answer that keeps the PR blocked.
   if [ -n "$shards" ]; then
     local token spath sraw s_rc=0 shard_seam="${ADMIN_MERGE_REPRO_SHARD_CMD:-}" shard_n=0
-    local tree_real="" dir_real=""
+    local tree_real="" leaf_real=""
     while IFS= read -r token; do
       [ -n "$token" ] || continue
       if ! spath="$(repro_shard_path "$token")"; then
@@ -7131,16 +7144,22 @@ reproduce_residual_on_base() {
           say_err "   stays refused (fail closed)."
           continue
         fi
-        # CONTAINMENT, because a TRACKED SYMLINK can point out of the worktree.
-        # Resolved through `pwd -P` on the DIRECTORY (the base tree is checked
-        # out, not authored here) and required to be inside it; a token that
-        # already resolved outside is not a measurement of the base.
+        # ⛔ CONTAINMENT RESOLVES THE LEAF, NOT ONLY ITS DIRECTORY — and a
+        # directory-only check is a FAIL-OPEN, measured in review: `-f` follows a
+        # symlink, so a TRACKED leaf `tests/x.sh -> /somewhere/else.sh` passed the
+        # directory test and its exit status was read as the base's verdict,
+        # clearing the PR's id. `Cwd::abs_path` resolves EVERY component (perl is
+        # already a hard dependency of this function for the alarm bound) — called
+        # FULLY QUALIFIED, because `-MCwd` does not export it on every perl, and an
+        # unresolved `abs_path` would refuse every shard instead of checking it.
+        # The resolved path must be inside the checked-out base; a path that cannot
+        # be resolved is refused, because unresolvable is not a measurement either.
         if [ -z "$tree_real" ]; then tree_real="$(cd "$cmd_dir" && pwd -P)"; fi
-        dir_real="$(cd "$cmd_dir" && cd "$(dirname "$spath")" 2>/dev/null && pwd -P)" || dir_real=""
-        case "$dir_real/" in
+        leaf_real="$(perl -MCwd -e 'print Cwd::abs_path($ARGV[0])' "$cmd_dir/$spath" 2>/dev/null)" || leaf_real=""
+        case "$leaf_real" in
           "$tree_real"/*) ;;
           *) say_err "admin-merge: (reproduction) '$spath' resolves OUTSIDE the base worktree"
-             say_err "   ($dir_real) — not executed, so it stays refused (fail closed)."
+             say_err "   (${leaf_real:-unresolvable}) — not executed, so it stays refused (fail closed)."
              continue ;;
         esac
       fi
@@ -7171,7 +7190,7 @@ reproduce_residual_on_base() {
       # even when every shard on the base passes.
       arms_ran=1
       [ "$s_rc" -eq 0 ] && continue
-      printf 'bash-shard::%s\n' "$token" >> "$reproduced_all"
+      printf '%s%s\n' "$SHARD_REPRO_ID_PREFIX" "$token" >> "$reproduced_all"
     done <<< "$shards"
   fi
 

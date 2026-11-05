@@ -2547,6 +2547,15 @@ run_admin_repro() {
 # shape `scripts/ci_exemption.py` turns into `bash-shard::<path>` (#2643).
 log_failed_shard() { printf 'bash-suites (1)\tBash shards\t2026-11-05T19:27:54.0000000Z ❌ failed shard: %s\n' "$1"; }
 
+# A pytest capture that VOLUNTEERS a shard id its argv never named: `ids --log`
+# recovers identities from ANYWHERE in a capture, so a shard can arrive from the
+# WRONG arm (the #1185 lesson, one family over). The shard line is printed
+# unconditionally, exactly as a hostile/composed capture would.
+repro_script_volunteer() {  # <path> <nodeid-to-echo> <shard-path-to-volunteer>
+  printf '#!/usr/bin/env bash\nsed "s/^/FAILED /"\nprintf "❌ failed shard: %%s\\n" %q\n' "$3" > "$1"
+  chmod +x "$1"
+}
+
 new_scen repro-shard-base-owned
 SHARD_BO='tests/fixture-shard-red-on-base.sh'
 repro_base_shard "$SHARD_BO" 1            # THE BASE's own run of this shard FAILS
@@ -2710,6 +2719,70 @@ grep -q "^   pre-existing: bash-shard::$SHARD_AV" "$SCEN/err" \
 grep -q "^   pre-existing: $NODE_AV" "$SCEN/err" \
   && pass "#3415: …and the nodeid still clears through the pytest runner" \
   || fail "#3415: the pytest arm stopped clearing once the shard arm existed"
+
+# (7) A TRACKED SYMLINK LEAF. `-f` FOLLOWS a symlink, so a check that resolved only
+# the shard's DIRECTORY let a leaf pointing out of the base tree be executed and its
+# exit status read as the base's verdict — clearing the PR's id (measured in review:
+# the directory-only arm left this case green). The base commit here carries
+# `tests/fixture-shard-symlinked-leaf.sh -> $TMP/outside-3415.sh` (exit 1).
+new_scen repro-shard-symlink-leaf
+SHARD_SL='tests/fixture-shard-symlinked-leaf.sh'
+printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/outside-3415.sh"   # OUTSIDE the base worktree
+mkdir -p "$SCEN/$(dirname "$SHARD_SL")"
+ln -s "$TMP/outside-3415.sh" "$SCEN/$SHARD_SL"
+git -C "$SCEN" add -- "$SHARD_SL" >/dev/null 2>&1
+git -C "$SCEN" -c user.email=suite@example.invalid -c user.name=suite \
+    commit -q -m "base tree: symlinked shard leaf" >/dev/null 2>&1
+git -C "$SCEN" rev-parse HEAD > "$SCEN/main-sha"
+HEAD_SSL="f7f7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SSL" > "$SCEN/head"
+lane_fail "$HEAD_SSL" 3461 > "$SCEN/runs-$HEAD_SSL"
+log_failed_shard "$SHARD_SL" > "$SCEN/log-3461"
+cp "$SCEN/log-3461" "$SCEN/log-after-3461"
+lane_fail mainssl 3462 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3462"
+run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a shard whose LEAF symlink resolves outside the base tree is not cleared (exit $rc)" \
+  || { fail "#3415: a symlinked shard leaf pointing OUTSIDE the base worktree was executed and cleared the residual (fail-open)"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "resolves OUTSIDE the base worktree" "$SCEN/err" \
+  && pass "#3415: the refusal names the containment violation" \
+  || fail "#3415: the leaf-symlink escape was not refused by name"
+grep -q "^   pre-existing: bash-shard::$SHARD_SL" "$SCEN/err" \
+  && fail "#3415: an escaping symlink was reported pre-existing" \
+  || pass "#3415: …and nothing was cleared"
+
+# (8) THE ARM-1 CAPTURE FILTER — the invariant the pytest arm's own comment asserts:
+# a shard id may clear ONLY by the shard arm having run that shard. Here the shard IS
+# a candidate (it is in the residual) and the base PASSES it, but the pytest capture
+# volunteers it — so if the arm-1 filter is dropped or downgraded the rail clears a
+# shard it never measured, and merges. The nodeid in the same capture proves the arm
+# ran, so a green here cannot come from "the reproduction did nothing".
+new_scen repro-shard-volunteered
+repro_base_sha
+SHARD_VOL='tests/fixture-shard-volunteered.sh'
+NODE_VOL='tests/test_genuinely_new_3415_vol.py::test_pr_broke_it'
+HEAD_SVL="f8f8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SVL" > "$SCEN/head"
+lane_fail "$HEAD_SVL" 3471 > "$SCEN/runs-$HEAD_SVL"
+{ log_failed "$NODE_VOL"; log_failed_shard "$SHARD_VOL"; } > "$SCEN/log-3471"
+cp "$SCEN/log-3471" "$SCEN/log-after-3471"
+lane_fail mainvol 3472 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3472"
+repro_script_volunteer "$SCEN/repro-vol.sh" "$NODE_VOL" "$SHARD_VOL"
+run_admin_repro "bash $SCEN/repro-vol.sh" 'exit 0' 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a shard VOLUNTEERED by the pytest capture does not clear (exit $rc)" \
+  || { fail "#3415: the pytest capture cleared a shard id its argv never named (the arm-1 filter is gone)"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "^   pre-existing: $NODE_VOL" "$SCEN/err" \
+  && pass "#3415: …the nodeid arm really ran and cleared its own id (so the arm was measured)" \
+  || fail "#3415: the nodeid arm cleared nothing — the fixture cannot distinguish the two arms"
+grep -q "^   pre-existing: bash-shard::$SHARD_VOL" "$SCEN/err" \
+  && fail "#3415: a shard the base PASSES was reported pre-existing off the pytest capture" \
+  || pass "#3415: …and the volunteered shard is NOT reported pre-existing"
+grep -qF -- "bash-shard::$SHARD_VOL" "$SCEN/err" \
+  && pass "#3415: the volunteered shard stays in the refusal (a capture is not a measurement of it)" \
+  || fail "#3415: the volunteered shard vanished from the refusal"
 
 # ── 5. extraction failure is fail-closed (the vacuous-pass guard) ──────────
 echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pass) =="
