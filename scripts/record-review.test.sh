@@ -2657,7 +2657,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:4226 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:4703 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here rotted once already, :4174 -> :4210, and this comment is not what makes
 #      the assertion true). One command answers it:
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
