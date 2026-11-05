@@ -2094,6 +2094,21 @@ box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$SCRAT
 OUT="$(run_install Linux "$D6" --disarm)"; RC=$?
 assert_eq "$RC" 0 "--disarm still succeeds over a transient adopted pin (the safe direction must not be the blocked one)"
 assert_absent "$OUT" "STILL ARMED" "…and does not strand the record"
+# ⛔ THE EXEMPTION IS `--disarm`, NOT THE FLAG: `--report-only` sets the SAME `FORCE_MODE_FLAG` while being a
+# WRITING verb, so a key on the flag skipped the guard for `--install --report-only`, which then wrote the
+# artifact with the transient pin (`changed=1`, exit 0) while `--status` refused that same artifact. Pinned
+# here, in the direction that was silent.
+box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$SCRATCH/inst.sh|" "$D6/$UNIT_NAME.service"
+BEFORE_SUM2="$(cksum < "$D6/$UNIT_NAME.service")"
+OUT="$(run_install Linux "$D6" --install --report-only)"; RC=$?
+assert_eq "$RC" 1 "--install --report-only REFUSES a transient adopted pin (it WRITES, so the --disarm exemption must not cover it)"
+assert_contains "$OUT" "TRANSIENT SCRATCH" "naming the class it would create"
+assert_eq "$(cksum < "$D6/$UNIT_NAME.service")" "$BEFORE_SUM2" "and the artifact was not re-rendered"
+# …and the '%' pin, the other value class the same exemption was hiding.
+box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$PCTDIR/inst.sh|" "$D6/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D6" --install --report-only)"; RC=$?
+assert_eq "$RC" 1 "--install --report-only also refuses a '%' adopted pin"
+
 
 # The launchd arm adopts too, and deleting that call left the suite green — so pin it here.
 D2="$T/c67d"; fresh "$D2"

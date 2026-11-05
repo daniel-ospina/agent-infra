@@ -1420,12 +1420,18 @@ do_install_systemd() {
     # and `--status` on that same artifact then exited 1 ("points into TRANSIENT SCRATCH SPACE") — the
     # writer certifying what its own reader reds. See `refuse_adopted_provisioner` for why the predicate
     # is scoped to this one field rather than re-judging the whole artifact.
-    # ⛔ `--disarm` IS EXEMPT. It forces a DISARMED render (`FORCE_MODE_FLAG="--dry-run"`), where the pin is
-    # inert — and refusing there does not protect anything, it STRANDS THE RECORD: measured, `--disarm` over
-    # an artifact carrying a transient adopted pin exited 1 with `STILL ARMED … the record was NOT removed`,
-    # leaving the box armed with a record nobody could remove without hand-editing. The safe direction must
-    # not be the blocked one; the next real install still refuses, and `--status` still reds the artifact.
-    [ -n "$FORCE_MODE_FLAG" ] || refuse_adopted_provisioner || return 1
+    # ⛔ `--disarm` IS EXEMPT — AND ONLY `--disarm`. It forces a DISARMED render (`FORCE_MODE_FLAG`), where
+    # the pin is inert, and refusing there does not protect anything: measured, `--disarm` over an artifact
+    # carrying a transient adopted pin exited 1 with `STILL ARMED … the record was NOT removed`, leaving the
+    # box armed with a record nobody could remove without hand-editing.
+    # ⛔ BUT `FORCE_MODE_FLAG` ALONE IS THE WRONG KEY, AND IT WAS MEASURED WRONG: `--report-only` sets the
+    # SAME flag (it also forces a DISARMED render) while being a WRITING verb — so keying on the flag skipped
+    # the guard for `--install --report-only`, which then exited 0 and wrote the artifact with the transient
+    # pin (`changed=1`) while `--status` exited 1 on it. That is the writer/reader divergence this guard
+    # exists to close, reachable again through a writing verb. The key is now the VERB, exactly as
+    # `refuse_report_only_over_record` keys on `REPORT_ONLY`: exempt only when the flag is set and the
+    # invocation is NOT `--report-only`.
+    if [ -n "$FORCE_MODE_FLAG" ] && [ "$REPORT_ONLY" != 1 ]; then :; else refuse_adopted_provisioner || return 1; fi
     warn_provisioner_reach
     note_repo_change
 
@@ -1525,12 +1531,18 @@ do_install_launchd() {
     adopt_installed_state_dir
     refuse_report_only_over_record || return 1
     adopt_installed_provisioner
-    # ⛔ `--disarm` IS EXEMPT. It forces a DISARMED render (`FORCE_MODE_FLAG="--dry-run"`), where the pin is
-    # inert — and refusing there does not protect anything, it STRANDS THE RECORD: measured, `--disarm` over
-    # an artifact carrying a transient adopted pin exited 1 with `STILL ARMED … the record was NOT removed`,
-    # leaving the box armed with a record nobody could remove without hand-editing. The safe direction must
-    # not be the blocked one; the next real install still refuses, and `--status` still reds the artifact.
-    [ -n "$FORCE_MODE_FLAG" ] || refuse_adopted_provisioner || return 1
+    # ⛔ `--disarm` IS EXEMPT — AND ONLY `--disarm`. It forces a DISARMED render (`FORCE_MODE_FLAG`), where
+    # the pin is inert, and refusing there does not protect anything: measured, `--disarm` over an artifact
+    # carrying a transient adopted pin exited 1 with `STILL ARMED … the record was NOT removed`, leaving the
+    # box armed with a record nobody could remove without hand-editing.
+    # ⛔ BUT `FORCE_MODE_FLAG` ALONE IS THE WRONG KEY, AND IT WAS MEASURED WRONG: `--report-only` sets the
+    # SAME flag (it also forces a DISARMED render) while being a WRITING verb — so keying on the flag skipped
+    # the guard for `--install --report-only`, which then exited 0 and wrote the artifact with the transient
+    # pin (`changed=1`) while `--status` exited 1 on it. That is the writer/reader divergence this guard
+    # exists to close, reachable again through a writing verb. The key is now the VERB, exactly as
+    # `refuse_report_only_over_record` keys on `REPORT_ONLY`: exempt only when the flag is set and the
+    # invocation is NOT `--report-only`.
+    if [ -n "$FORCE_MODE_FLAG" ] && [ "$REPORT_ONLY" != 1 ]; then :; else refuse_adopted_provisioner || return 1; fi
     warn_provisioner_reach
     note_repo_change
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
