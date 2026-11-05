@@ -2677,9 +2677,9 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   if [ "$CC_SUPPLIED" -eq 0 ]; then
   # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
   # that lacks the file may still have the verdict in the registry (minted on a
-  # peer box), or in the PR body's SIGNED marker. An admitted PR COMMENT can carry it too, but
-  # ⛔ THIS RECORDER CANNOT RECOVER FROM ONE (only the dedup reads comments, :1277; --recover-body
-  # reads the body alone, :3001/:3041) — the gate reads it, so the re-review is still not the only remedy.
+  # peer box), or in the PR body's SIGNED marker. An admitted PR COMMENT can carry a MARKER too, but
+  # ⛔ NO VERB RECOVERS A RECORD FROM ONE (only the dedup READ at :1276 reads marker text out of
+  # comments; --recover-body reads the body alone, :2988). A comment IS a working --evidence input (:835).
   CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
   if [ -n "$REPO" ]; then
     if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
