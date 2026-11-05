@@ -155,7 +155,15 @@ def pi_process_count():
 
 
 def lane_census(alive, dead, pi_count, roster_size):
-    """The census note, or None when every rostered lane carries a CONCLUSIVE verdict.
+    """The census note, or None when the census is RECONCILED.
+
+    ⛔ THE OLD SUMMARY LINE WAS FALSE IN BOTH DIRECTIONS (review cycle 13, finding 1). It read
+    "or None when every rostered lane carries a CONCLUSIVE verdict", and the code contradicts it
+    both ways: `lane_census(0, 0, 0, 7)` is silent with NO lane conclusive (a MEASURED-EMPTY
+    population cannot mislead about anything), and `lane_census(5, 2, None, 7)` returns a note with
+    EVERY lane conclusive (a complete roster over an UNREADABLE table is UNVERIFIED, never clean).
+    Silence is about whether the roster and the population AGREE, not about how many lanes resolved
+    — see SILENT ARMS, EXHAUSTIVELY below, which is the authority this line summarises.
 
     ⛔ SILENCE REQUIRES A CONCLUSION PER LANE, NOT A RECORD PER LANE (review cycle 2, finding 1).
     The previous form keyed silence on "the store has a record for some rostered lane", which
@@ -272,11 +280,23 @@ def census_exit_verdict(note, attributed, established, roster_size):
     was the only note reachable with a complete roster *until* UNVERIFIED became a second one. A
     pure function is used so the pairing is PINNED directly, instead of only being reachable through
     a live-pid fixture.
+
+    ⛔ AND THAT RULE APPLIES TO THE TAIL TOO (review cycle 13, finding 2). The two UNVERIFIED arms
+    were split by the `attributed` COUNT, so `census_exit_verdict()` could emit a tail its own note
+    excluded: handed the all-dead note
+    ("all 7 rostered lanes are DEAD/absent … an idle fleet and a stale roster are indistinguishable")
+    with a non-zero `attributed`, it printed "the population cannot be reconciled", which that note
+    explicitly is not. `main()` passes consistent arguments today, so this was latent, not yet a
+    wrong line — but it is the exact defect this function exists to prevent, so the discriminator is
+    now the NOTE's own words. `attributed`/`established`/`roster_size` are kept for the callers that
+    pass them and are deliberately NOT consulted here.
     """
     if note.startswith("LANE CENSUS STALE ROSTER"):
         return ("STALE ROSTER", "no rostered lane is a running pi process")
     if note.startswith("LANE CENSUS UNVERIFIED"):
-        if attributed:
+        # The note says which of the two shapes it is; the count cannot. "is alive and" appears only
+        # in the PARTLY-live note ("N of the M rostered lanes is alive and K are DEAD/absent").
+        if "is alive and" in note:
             # Some lanes ARE live: do not claim the box is dark, and do not claim it is idle.
             return ("UNVERIFIED", "the process table could not be read, so the population cannot "
                                   "be reconciled against the roster")

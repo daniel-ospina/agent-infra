@@ -21,7 +21,7 @@ Restored by #1862 and pinned by this suite:
     python3 tools/fleet/fleet_health.test.py
     python3 tools/fleet/fleet_health.test.py --red-control
 
-RED CONTROL — six mutations of the shipped module, each written to a TEMP copy and re-imported
+RED CONTROL — seven mutations of the shipped module, each written to a TEMP copy and re-imported
 (a mutation the suite does not catch is reported as a suite FAILURE). The first one is the
 pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
@@ -34,6 +34,8 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
   * drop `attributed` from main()                -> 3 paired CENSUS reds (the healthy-box arms)
                                                  — the OPPOSITE polarity to the mutation above:
                                                  it makes the census cry wolf on every live box
+  * split the UNVERIFIED tails on `attributed`   -> 2 paired EXITLINE reds (the tail must follow
+                                                 the note's words, not a count)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -679,10 +681,40 @@ def leg_lane_census(mod):
     else:
         w, t = pair("LANE CENSUS STALE ROSTER: x", 0, 7, 7)
         check(w == "STALE ROSTER" and "running pi process" in t, PAIR[0])
-        w, t = pair("LANE CENSUS UNVERIFIED: x", 1, 7, 7)
+        # ⛔ THESE TWO USE REAL NOTES, NOT THE SYNTHETIC `"LANE CENSUS UNVERIFIED: x"` (review cycle
+        # 13, finding 2). The synthetic placeholder carries NO shape, so the only thing that used to
+        # separate the two tails was the `attributed` count — the very correlation the function's
+        # docstring forbids. With the tail derived from the note, a shapeless note cannot exercise
+        # the mixed arm at all, and passing it here would only re-encode the old coupling.
+        # ⛔ …AND THEY MUST NOT DEPEND ON `lane_census` SUCCEEDING (review cycle 13). Building the
+        # notes with `fn()` alone made this block CRASH under the red control's "neuter" mutant
+        # (which makes `lane_census` return None), aborting the leg BEFORE the three paired `_drive`
+        # checks and silently dropping them from the control's verdict. The literal fallbacks carry
+        # the same SHAPES the real notes do; that the real notes exist at all is already pinned by
+        # PREDICATE[2]/[7] above, so a fallback here cannot mask a missing note.
+        mixed_note = (fn(1, 6, None, 7) or
+                      "LANE CENSUS UNVERIFIED: 1 of the 7 rostered lanes is alive and 6 are "
+                      "DEAD/absent, but the process table could not be read — x")
+        all_dead_note = (fn(0, 7, None, 7) or
+                         "LANE CENSUS UNVERIFIED: all 7 rostered lanes are DEAD/absent and the "
+                         "process table could not be read — an idle fleet and a stale roster are "
+                         "indistinguishable here, so this is NOT a clean result")
+        w, t = pair(mixed_note, 1, 7, 7)
         check(w == "UNVERIFIED" and "cannot be reconciled" in t and "idle fleet" not in t, PAIR[1])
-        w, t = pair("LANE CENSUS UNVERIFIED: x", 0, 7, 7)
+        w, t = pair(all_dead_note, 0, 7, 7)
         check(w == "UNVERIFIED" and "idle fleet" in t, PAIR[2])
+        # ⛔ THE TAIL FOLLOWS THE NOTE, NOT THE COUNT (review cycle 13, finding 2). Feeding the REAL
+        # all-dead note with a NON-ZERO `attributed` used to switch the tail to "the population
+        # cannot be reconciled" — a statement that note explicitly excludes (it says all lanes are
+        # DEAD/absent). `main()` passes consistent arguments today, so this was latent; the check
+        # pins the rule the function's docstring states.
+        w, t = pair(all_dead_note, 3, 7, 7)
+        check(w == "UNVERIFIED" and "idle fleet" in t and "cannot be reconciled" not in t,
+              "EXITLINE: an all-dead note keeps its idle-fleet wording even with a non-zero count")
+        # ... and the converse: the partly-live note keeps the reconciliation wording at count 0.
+        w, t = pair(mixed_note, 0, 7, 7)
+        check(w == "UNVERIFIED" and "cannot be reconciled" in t and "idle fleet" not in t,
+              "EXITLINE: a partly-live note keeps the reconciliation wording at count 0")
         w, t = pair("LANE CENSUS MISMATCH: x", 0, 1, 7)
         check(w == "INCOMPLETE" and "rows without a verdict" in t, PAIR[3])
 
@@ -905,6 +937,15 @@ MUTATIONS = [
      ["CENSUS: main() is SILENT over a fully-live roster — the healthy-box arm",
       "CENSUS: a fully-live roster still reports a clean scan (the census must not cry wolf)",
       "CENSUS: a fully-live roster exits 0 — a permanent false alarm is a false instrument too"]),
+    # ⛔ THE TAIL'S OWN RULE, PINNED THE SAME WAY (review cycle 13, finding 2). The discriminator is
+    # the NOTE's words; this mutant puts the `attributed` COUNT back, the correlation the function's
+    # own docstring forbids. It is latent today because `main()` passes consistent arguments, which
+    # is exactly why it needs a mutation rather than a fixture.
+    ("split the UNVERIFIED tails on `attributed` instead of the note",
+     _sub('        if "is alive and" in note:',
+          '        if attributed:  # MUTANT: back to the count'),
+     ["EXITLINE: an all-dead note keeps its idle-fleet wording even with a non-zero count",
+      "EXITLINE: a partly-live note keeps the reconciliation wording at count 0"]),
     ("drop the orphan row from REAPERS (the pre-#1862 module)",
      _sub('    ("com.eldato.pi-reap-orphans",     "orphan"),\n', ""),
      ["REGISTERED: %s is in REAPERS" % LABEL]),

@@ -1879,8 +1879,18 @@ os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   # running `pi` process the generic token is satisfied by the CENSUS ALONE — even when this
   # lane's suspect was dropped, which is exactly the regression this leg exists to catch. Keyed on
   # the lane bullet so only the lane's own suspect can satisfy it.
-  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -qE '^[[:space:]]+- B1:' <<<"$out"; then
-    echo "ok: $label an abstaining lane with a stale transcript stays a SUSPECT (the abstention does not suppress the ladder)"
+  # ⛔ AND THE LADDER'S VERDICT, NOT ONLY ITS SUSPECT FORM (review cycle 13, finding 3). The new
+  # anchor required a SUSPECT bullet, but the ladder deliberately does not PRODUCE one when the
+  # abstaining lane's recorded pid did consume CPU: the row then reads
+  # `PID ? (off-fence) | quiet 1388s, CPU +1.0s (identity unmatched — not attributable)`, which is
+  # the abstention NOT suppressing the ladder — the very property this leg asserts. A whole-second
+  # `ps -o cputime=` tick between runs (g) and (h) made the leg red and print "read as clean" over a
+  # row that is explicitly not clean. Both are accepted; a row with NO ladder verdict, or a body
+  # whose only bullet is the census's, still fails.
+  elif grep -q "PID ? (off-fence)" <<<"$out" &&
+       { grep -qE '^[[:space:]]+- B1:' <<<"$out" ||
+         grep -qE 'PID \? \(off-fence\) \| (quiet|\*\*)' <<<"$out"; }; then
+    echo "ok: $label an abstaining lane with a stale transcript keeps the ladder's verdict (the abstention does not suppress it)"
   else
     fail "$label: abstention SUPPRESSED the suspect ladder — a stale lane read as clean: $(grep -E '^B1 |no suspects' <<<"$out")"
   fi
