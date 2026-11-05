@@ -1517,8 +1517,11 @@ pin the seam to — and recording it as a passing check meant a CELL (which skip
 tally as a laptop on which every arm really ran. The skipped arms are now counted on
 their own line with their reason, so the two runs cannot be mistaken for each other. Measured AT THIS HEAD,
 on a box told to have real runner roots so the skip path is taken (`<entry>` is the entry point under test;
-`mut-f`, `mut-f3`, `mut-f4`, `mut-f5`, `mut-f5b`, `mut-f6` and `mut-u` are the mutant copies the suite makes
-in its own `$T`, each of which re-enters `case_f`):
+`mut-f`, `mut-f3`, `mut-f4`, `mut-f5`, `mut-f6` and `mut-u` are mutated copies of the ENTRY POINT made under
+the suite's own `$T`, so their skip line names that copy. ⛔ `mut-f5b` is a copy of the **OWNER**, and its
+`case_f` run passes `$REAPER` — so its skip names the REAL entry point, which is why `<entry>` appears TWICE
+and there is no `mut-f5b/disk-reaper.sh` line; an earlier revision of this block printed one, and no run of
+any head can produce it):
 
 ```
   69 passed, 0 failed, 8 skipped
@@ -1527,7 +1530,7 @@ in its own `$T`, each of which re-enters `case_f`):
     skipped: (f) empty-population half, entry point <suite $T>/mut-f3/disk-reaper.sh — …as above…
     skipped: (f) empty-population half, entry point <suite $T>/mut-f4/disk-reaper.sh — …as above…
     skipped: (f) empty-population half, entry point <suite $T>/mut-f5/disk-reaper.sh — …as above…
-    skipped: (f) empty-population half, entry point <suite $T>/mut-f5b/disk-reaper.sh — …as above…
+    skipped: (f) empty-population half, entry point <entry>/disk-reaper.sh — …as above… (the mut-f5b arm: an OWNER mutant, run against the real entry point)
     skipped: (f) empty-population half, entry point <suite $T>/mut-f6/disk-reaper.sh — …as above…
     skipped: (f) empty-population half, entry point <suite $T>/mut-u/disk-reaper.sh — …as above…
 ```
