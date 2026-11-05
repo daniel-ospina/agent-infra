@@ -862,16 +862,18 @@ roots_out="$(runat "$T/home" CELL_SELF_PIN_DROPIN_ROOTS= bash "$PIN" --print-dro
 # by systemd and read by nothing: #3194's false PASS one directory over, in the load path `systemd.unit(5)`
 # Table 1 ranks ABOVE /etc/systemd/system. The four-name leg above could not see a root that is MISSING.
 for _r in /etc/systemd/system.control /run/systemd/system.control /etc/systemd/system.attached /run/systemd/system.attached; do
-  case "$roots_out" in
-    *"$_r"*) ok "…and the drop-in gate SCANS ${_r} — a .control/.attached root systemd MERGES over the unit (measured)" ;;
-    *) bad "the drop-in gate does not scan ${_r}: a drop-in there is merged over the rendered unit by systemd and read by NOTHING — #3194's false PASS in the dbus-managed load path — [$roots_out]" ;;
-  esac
+  if printf '%s\n' "$roots_out" | grep -qxF "$_r"; then ok "…and the drop-in gate SCANS ${_r} — a .control/.attached root systemd MERGES over the unit (measured)"
+  else bad "the drop-in gate does not scan ${_r}: a drop-in there is merged over the rendered unit by systemd and read by NOTHING — #3194's false PASS in the dbus-managed load path — [$roots_out]"; fi
 done
+# ⛔ AND THE MATCH MUST BE THE WHOLE LINE. These four were SUBSTRING tests (`case "$roots_out" in *"$_r"*)`),
+# so `/etc/systemd/system` was satisfied by `/etc/systemd/system.control` and `/run/systemd/system` by
+# `/run/systemd/system.attached` — MEASURED: deleting `/etc/systemd/system` from the list, and then deleting
+# BOTH plain roots, left the suite at 411 ok / 0 failed. With `SYSTEMD_UNIT_DIR` redirected (every leg here,
+# and the documented case) the root list is the ONLY source for those two, so their removal shipped green
+# and re-opened #3194's drop-in false PASS silently. `grep -qxF` is the test that a leg can lose.
 for _r in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system; do
-  case "$roots_out" in
-    *"$_r"*) ok "…and the drop-in gate SCANS ${_r} — a systemd SYSTEM unit directory it merges for this unit" ;;
-    *) bad "the drop-in gate does not scan ${_r}: a legacy drop-in there is merged over the rendered unit and read by NOTHING, which is #3194's false PASS one directory over — [$roots_out]" ;;
-  esac
+  if printf '%s\n' "$roots_out" | grep -qxF "$_r"; then ok "…and the drop-in gate SCANS ${_r} — a systemd SYSTEM unit directory it merges for this unit"
+  else bad "the drop-in gate does not scan ${_r}: a legacy drop-in there is merged over the rendered unit and read by NOTHING, which is #3194's false PASS one directory over — [$roots_out]"; fi
 done
 # ⛔ AND EVERY OTHER LEG IS HERMETIC (round-12 review, P2). Unsetting the seam did NOT make the scan
 # hermetic: it fell back to the REAL roots above — measured at 151 reads of each real root per run,
@@ -1069,6 +1071,19 @@ if [ "$rc" -eq 0 ]; then
 else
   bad "REFUSED a drop-in root whose ancestor is a regular file — an absent path is not an undecidable one, and the refusal asserts a cause that is false: $out"
 fi
+# ⛔ AND A ROOT THAT IS ITSELF A REGULAR FILE IS A REFUSAL, NOT AN EMPTY RESULT — and the arm saying so had
+# no leg at all (round-5 review, P2: `if [ ! -d "$_root" ]` → `if false` left 411 ok / 0 failed). The fixture
+# above is the OPPOSITE case and must stay: a root under a file ancestor provably does not exist and is
+# accepted, while a path that IS a file is decided but cannot hold drop-ins, so a run that trusted it would
+# report "nothing found here" about something systemd resolves differently. `-e` is true, it is not a dir.
+u_file_root="$T/units-fileroot"; mkdir -p "$u_file_root"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$u_file_root" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
+         CELL_SELF_PIN_DROPIN_ROOTS="$regular_file_anc" PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "ACCEPTED a drop-in ROOT that is a regular FILE — 'nothing found here' was reported about a path systemd does not treat as a drop-in directory: $out"
+elif [[ $out == *'NOT a directory'* ]]; then
+  ok "…and a drop-in ROOT that is a regular FILE is REFUSED by name (a decided path that cannot hold drop-ins)"
+else bad "refused a file-shaped drop-in root for the WRONG reason: $out"; fi
 # ⛔ AND THE ENUMERATION'S OUTPUT MUST NOT BE WORD-SPLIT EITHER (round-14 review, P2). The root list was
 # fixed and its OUTPUT was not, so a unit dir containing a space was re-interpreted by the shell as two
 # paths: measured, this exact fixture either refused naming a directory that never existed (with a blank
