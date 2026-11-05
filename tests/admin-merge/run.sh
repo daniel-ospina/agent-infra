@@ -15892,7 +15892,7 @@ else
   fail "(p) rail-exit.test.sh FAILED — see its output above"
 fi
 
-# ── (q) EVERY `--jq` PROGRAM THE RAIL SPELLS INLINE MUST COMPILE ───────────────
+# ── (q) EVERY `--jq` PROGRAM IN THE THREE DECLARED FORMS MUST COMPILE ─────────
 # #2598's sibling, and the reason #2598's own repro could not find it: `wait_for_run`'s
 # RE-RUN read carried an UNTERMINATED jq string — one closing `"` short:
 #
@@ -15939,16 +15939,21 @@ fi
 # a clean scan, and a guard over a shrunken population reports a pass it did not earn.
 #
 # ⚠️ WHAT THIS IS, PRECISELY — a CENSUS OF THREE DECLARED FORMS, NOT A PROOF. It compiles
-# (1) single-quoted literals, (2) unquoted bare-token programs, (3) `*_JQ` assignments at
-# line start, optionally behind `export`/`readonly`/`local`/`declare`. Its known gaps are
-# stated rather than denied: a program held in a variable NOT named `*_JQ`, a program built
-# at runtime (`--jq "$(…)"`), and the `--jq=PROG` spelling (zero sites in the rail today)
-# are all outside it. Prose can also INFLATE the census — only WHOLE-LINE comments are
-# stripped, so a `say_err "… --jq .isDraft …"` string or a trailing `# … --jq .field`
-# comment contributes an entry that is not a call site. That is why the floor is a SHRINK
-# DETECTOR and not a completeness proof: it cannot tell 20 real programs + 4 prose from
-# 24 real ones. No static scan of a shell script can close that gap; the ceiling on this
-# guard is honest coverage of the forms the rail actually uses, which is what it has.
+# (1) single-quoted literals, (2) unquoted bare-token programs (under EITHER separator,
+# `--jq PROG` or `--jq=PROG`), (3) `*_JQ` assignments at line start, optionally behind
+# `export`/`readonly`/`local`/`declare`. Its known gaps are stated rather than denied: a
+# program held in a variable NOT named `*_JQ`, and a program built at runtime
+# (`--jq "$(…)"`), are outside it. Prose can also INFLATE the census — only WHOLE-LINE
+# comments are stripped, so a `say_err "… --jq .isDraft …"` string or a trailing
+# `# … --jq .field` comment contributes an entry that is not a call site. That is why the
+# floor is a SHRINK DETECTOR and not a completeness proof: it cannot tell 20 real programs
+# + 4 prose from 24 real ones. No static scan of a shell script can close that gap; the
+# ceiling on this guard is honest coverage of the forms the rail actually uses, which is
+# what it has. ⛔ THE TITLE AND THE VERDICT ARE SCOPED TO THOSE THREE FORMS ON PURPOSE —
+# a review cycle showed that an unscoped "every inline --jq program" was falsifiable by a
+# single `--jq=PROG` site (a spelling the fleet's own gh shim implements:
+# scripts/orchestrator-harness/gh-rest/gh:284). That form is NOW SCANNED, but the wording
+# stays scoped so the next unscanned spelling cannot make the claim false again.
 JQ_LITERALS_TMP="$TMP/jq-literals.txt"
 # FORM 1 — the single-quoted literal, which is where the original bug was.
 { grep -o -- "--jq '[^']*'" "$ROOT/scripts/admin-merge.sh" \
@@ -15962,6 +15967,17 @@ JQ_LITERALS_TMP="$TMP/jq-literals.txt"
 { grep -v '^[[:space:]]*#' "$ROOT/scripts/admin-merge.sh" \
     | grep -oE -- "--jq [^'\"[:space:]][^[:space:]]*" \
     | sed 's/^--jq //' ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
+# …and the SAME form under the `--jq=PROG` separator, which the fleet's own gh shim
+# implements (`scripts/orchestrator-harness/gh-rest/gh:284`, `--jq=*)`), so a rail author
+# can reach for it. Zero sites in the rail today, which is exactly why it would otherwise
+# go unnoticed. A `--jq="$VAR"` is SKIPPED here (`grep -v '^\$'`) because FORM 3 owns
+# variable resolution and a bare `$VAR` would otherwise be reported as an unparseable
+# program. Quote stripping is deliberately loose — leading and trailing quotes are removed
+# independently — because the census only needs the program text, not the quoting style.
+{ grep -v '^[[:space:]]*#' "$ROOT/scripts/admin-merge.sh" \
+    | grep -oE -- "--jq=[^[:space:]]+" \
+    | sed -e 's/^--jq=//' -e "s/^'//" -e "s/'\$//" -e 's/^"//' -e 's/"$//' \
+    | grep -v '^\$' ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
 # FORM 3 — THE VARIABLE-HELD PROGRAMS. A `--jq "$VAR"` is invisible to both scans above, and
 # there are THREE such programs — `LANE_RUN_JQ`, `FIRST_CHECKS_JQ`, `LANE_RUN_GUARD_JQ`.
 # They are the SAME SHAPE as the expression this section exists for (`.[] | "\(…)\t…”`),
@@ -16015,7 +16031,11 @@ else
     fi
   done < "$JQ_LITERALS_TMP"
   if [ "$JQ_BAD" -eq 0 ]; then
-    pass "(q) every inline --jq program in the rail COMPILES ($JQ_LITERAL_COUNT checked = quoted literals + unquoted tokens + `*_JQ` variables)"
+    # ⛔ BACKTICKS MUST BE ESCAPED. Inside a double-quoted argument they are command
+    # SUBSTITUTION, not text: an earlier revision left `*_JQ` bare, so every green run
+    # executed `*_JQ` as a command ("*_JQ: command not found" on stderr) and the verdict
+    # silently read "+  variables" with the form's name deleted. A review cycle caught it.
+    pass "(q) every --jq program in the three declared forms COMPILES ($JQ_LITERAL_COUNT checked = quoted literals + unquoted tokens + \`*_JQ\` variables)"
   else
     fail "(q) $JQ_BAD rail --jq program(s) do not compile — gh fails EVERY read that uses one"
   fi
