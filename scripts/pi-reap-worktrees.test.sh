@@ -983,6 +983,15 @@ ANCHORS = {
         "            /?*[[:space:]]|/?*[[:cntrl:]])\n",
         "            __mutant_record_trailing_junk_removed__)\n",
     ),
+    # (4e) the SAME junk on the SHA-RECORD SPELLING that feeds the fourth record source. `/` and `//` are
+    # normalised, but a trailing space makes the final `*/state/HARNESS-PIN` test fail, so the arm
+    # silently assigns `pin_root=""` and that source VANISHES with no proof. On the box where the derived
+    # source is the only one that can name the tree, the record would have named it and rule 3 removes it.
+    # Deleting the arm restores the silent drop; G15y and G15-M15 must red.
+    "no-pin-root-trailing-junk": (
+        "    case \"$pin_root\" in\n        *[[:space:]]|*[[:cntrl:]])\n            PIN_VERDICT=\"pin-tree\"",
+        "    case \"$pin_root\" in\n        __mutant_pin_root_trailing_junk__)\n            PIN_VERDICT=\"pin-tree\"",
+    ),
     # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
     # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
     # inside the alternate word); `${home:+$home/.harness-path}` is TWO, so a HOME containing a space
@@ -5430,6 +5439,33 @@ assert_eq "$(reason_token "$(row_for "$OUT" "$WSWT")")" "pin-tree" \
 assert_contains "$(row_for "$OUT" "$WSWT")" "will not TRIM" \
     "G15x …and the row says the path was refused rather than trimmed, so a real trailing space is not silently lost"
 
+# G15y: the SHA-RECORD SPELLING carries the same junk, and it is the one input whose junk makes a whole
+# record SOURCE disappear instead of a single record unplaceable. `/` and `//` are normalised, but a
+# trailing space makes the final `*/state/HARNESS-PIN` test fail, so the arm assigns `pin_root=""` in
+# SILENCE — no fail-closed arm, no proof — and the derived source is gone. Driven on the box where that
+# source is the ONLY one that can name the tree (custom pin root, not named `harness`, so the shape
+# backstop cannot save it), which is exactly the box the derivation was added for.
+ENV=pin_tree_wspin
+REPO="$(mk_repo "$ENV")"
+WSINWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WSINWT" HEAD
+WSINHOME="$T/$ENV/derived-home"
+mkdir -p "$WSINHOME/.pi/agent/state"
+printf '5b1b09aad2c1\n' >"$WSINHOME/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$WSINWT/scripts/orchestrator-harness" >"$WSINHOME/.harness-path"
+OUT="$(HARNESS_PIN_OVERRIDE="$WSINHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSINWT")")" "pin-tree" \
+    "G15y precondition: the clean sha-record spelling derives the root and PRESERVES, so the fixture can see it"
+OUT="$(HARNESS_PIN_OVERRIDE="$WSINHOME/.pi/agent/state/HARNESS-PIN " \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSINWT")")" "pin-tree" \
+    "G15y a sha-record spelling with a TRAILING SPACE PRESERVES instead of silently dropping the source"
+assert_contains "$(row_for "$OUT" "$WSINWT")" "will not be TRIMMED" \
+    "G15y …and the row says so, rather than the fourth source vanishing with no proof at all"
+
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
 # every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
@@ -5531,6 +5567,15 @@ OUT="$(REAPER_OVERRIDE="$MUTP14" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES
     run_reaper pin_tree_wsprec --dry-run --repo "$T/pin_tree_wsprec/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wsprec/pins/5b1b09aad2c1")")" "reclaimable" \
     "G15-M14 MUTATION: without the trailing-junk arm a ROOT-form record with a trailing space is compared verbatim, misses, and the tree is WRONGLY rule-3 residue => G15x is discriminating"
+# G15-M15: delete the sha-record trailing-junk arm. The mutant drops the derived source in silence, so on
+# a box whose tree is named only by that source the record is "no record" and rule 3 removes it.
+MUTP15="$T/mutant-no-pin-root-trailing-junk.sh"
+mutate_reaper_anchored "$MUTP15" no-pin-root-trailing-junk
+OUT="$(HARNESS_PIN_OVERRIDE="$T/pin_tree_wspin/derived-home/.pi/agent/state/HARNESS-PIN " \
+    REAPER_OVERRIDE="$MUTP15" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wspin --dry-run --repo "$T/pin_tree_wspin/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wspin/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M15 MUTATION: without the sha-record trailing-junk arm the derived source is dropped in silence and the tree is WRONGLY rule-3 residue => G15y is discriminating"
 
 # G15-M8: delete the FAIL-CLOSED arm for an unreadable record. The mutant answers like the pre-fix
 # `[ -r "$rec" ] || continue` did — an unreadable record reads as "no record" — so the tree the box

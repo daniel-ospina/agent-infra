@@ -3159,7 +3159,25 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # What still derives NOTHING, by construction: a `$HARNESS_PIN` that is not `…/state/HARNESS-PIN` at
     # all (a bare directory, a different file name), and any relative spelling. Those fall back to the
     # other three sources — the declared residual, not a covered case.
+    # ⛔ BUT A SPELLING THAT IS THE RIGHT FILE NAME PLUS JUNK IS NOT "A DIFFERENT FILE NAME" (#10114
+    # cycle 6, P2 — IN SURFACE, and the SAME class the record-content arm was just fixed for). `/` and
+    # `//` are normalised below, yet a trailing SPACE (or tab/CR) makes the final `*/state/HARNESS-PIN`
+    # test fail, so the arm silently assigns `pin_root=""` and the fourth record source DISAPPEARS — no
+    # fail-closed arm, no proof text. Reproduced: with the derived source the only one that can name the
+    # tree, `HARNESS_PIN=<root>/state/HARNESS-PIN` preserves and the SAME value plus one trailing space
+    # is `remove … rule=3`. The sha-record spelling WOULD have named the tree, so this is the declared
+    # surface verbatim, and the residual above reads as SHAPE-only ("a different file name") when the
+    # real gap is SPELLING.
+    # ⛔ REFUSED, NOT TRIMMED — the same polarity as the record-content arm, for the same reason: a
+    # path may legitimately end in a space, so trimming would trade one wrong verdict for another.
+    # G15y drives it, `no-pin-root-trailing-junk` deletes the arm and G15-M15 asserts the mutant reclaims.
     local pin_root="${HARNESS_PIN:-}"
+    case "$pin_root" in
+        *[[:space:]]|*[[:cntrl:]])
+            PIN_VERDICT="pin-tree"
+            PIN_PROOF="\$HARNESS_PIN ends in whitespace or a control character, so the record root it would derive cannot be placed — it will not be TRIMMED (a real path may end in a space); 'cannot place it' is not 'names something else'; failed CLOSED"
+            return 0 ;;
+    esac
     case "$pin_root" in /?*) : ;; *) pin_root="" ;; esac
     if [ -n "$pin_root" ]; then
         pin_root="$(printf '%s' "$pin_root" | tr -s '/')"   # collapse `//` — POSIX, no bashism
@@ -3307,10 +3325,13 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
                 # `basename` of a path with trailing space give a DIFFERENT path. Reproduced: the
                 # ROOT form `<tree>` + one trailing space is `remove … rule=3`, while the DESCENDANT
                 # form is safe only by accident (the `"$canon"/*` arm absorbs trailing junk). The root
-                # form is PRODUCTION-WRITTEN: `install.sh` accepts an explicit `HARNESS=<pin root>`
-                # ("an operator may pin a deliberate checkout") and `pin_write_record`s it as the dir
-                # record — and that same box is the one the shape backstop cannot save, since a custom
-                # pin root need not be named `harness`.
+                # form is PRODUCTION-WRITTEN: `install.sh:954-955` accepts an explicit `HARNESS` — the
+                # tree the JOB EXECs, NOT the pin root (`HARNESS_PIN_DIR` is a different variable: the root
+                # the per-commit worktrees are created under) — and records it with `pin_write_record` at
+                # `:1072`. The ROUTINE writer records the DESCENDANT form instead
+                # (`cloud-cell-supervisor.sh:2314-2316`), so the ROOT form arrives only through that
+                # explicit operator override — and that same box is the one the shape backstop cannot
+                # save, since a custom pin root need not be named `harness`.
                 # ⛔ NOT TRIMMED. A path may legitimately END in a space (G15l's spaced home is why this
                 # file never word-splits a record), so trimming would trade one wrong verdict for
                 # another. "Cannot place it as written" is a cannot-answer — and a probe that cannot
@@ -3322,11 +3343,15 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
             /?*) : ;;
             *)
                 PIN_VERDICT="pin-tree"
-                if [ -z "$rec_t" ]; then
-                    PIN_PROOF="pin record $rec is READABLE but names NOTHING — empty, or a write that failed after the redirect; 'no content' is not 'names something else'; failed CLOSED"
-                else
-                    PIN_PROOF="pin record $rec names '$rec_t', which this probe will not resolve against its own cwd — 'cannot place it' is not 'names something else'; failed CLOSED"
-                fi
+                case "$rec_t" in
+                    "")  PIN_PROOF="pin record $rec is READABLE but names NOTHING — empty, or a write that failed after the redirect; 'no content' is not 'names something else'; failed CLOSED" ;;
+                    # ⛔ A SHORT ABSOLUTE (only `/` can land here: `/?*` needs two characters) was never
+                    # cwd-RESOLVED, so its proof must not say it was. Fail closed either way — the proof
+                    # text is the only thing that differs, and a proof naming a mechanism that did not run
+                    # is the class this PR exists to remove.
+                    /?*)  PIN_PROOF="pin record $rec names '$rec_t', an absolute path this probe cannot place as written; 'cannot place it' is not 'names something else'; failed CLOSED" ;;
+                    *)    PIN_PROOF="pin record $rec names '$rec_t', which this probe will not resolve against its own cwd — 'cannot place it' is not 'names something else'; failed CLOSED" ;;
+                esac
                 return 0 ;;
         esac
         # ⛔ THE RECORD IS NORMALISED BEFORE IT IS COMPARED (#10114 review P1). `$canon` comes from
