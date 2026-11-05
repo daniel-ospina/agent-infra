@@ -54,11 +54,23 @@ reads an empty home and silently loses the merge path. (`scripts/cloud-cell-brin
 under the `HOME` a lane runs with; and the harness's own `lane-env.sh` sources `${ENV_FILE:-$HOME/keys.env}`, the redirected
 one. So the one setting that makes the operational layer work is the setting that hides the credential: `pi` starts, finds no
 key, and exits having done nothing. Since #3331 `lane.sh` REFUSES that shape before spawning `pi` — `[key-gate] … check=fail
-result=REFUSED var=<NAME>` naming the variable, the provider, `models.json` and every candidate file, exit **82** — and every
-lane log now ends with `outcome=<done|refused|failed|died> reason=<token>`. ⛔ **BUT THE KEY IS ONE OF FOUR FALSIFIED CAUSES,
-NOT THE CAUSE** (see “the launch directory” below): the same issue's record shows `keys.env` sourced, `api-key-errors=0`, and
-the lane STILL dying silently. Do not conclude “a key fixed it” from a green key gate — that gate closes the *reporting*
-half, it does not make a lane run. **If the terminal line is absent**, three things produce that: a box that predates #3331, a
+result=REFUSED var=<NAME> model=<id>` naming the variable, the provider, the model, `models.json` and every candidate file,
+exit **82** — and every lane log now ends with `outcome=<done|refused|failed|died> reason=<token>`. ⛔ **BUT THE KEY IS ONE OF
+FOUR FALSIFIED CAUSES, NOT THE CAUSE** (see “the launch directory” below): the same issue's record shows `keys.env` sourced,
+`api-key-errors=0`, and the lane STILL dying silently. Do not conclude “a key fixed it” from a green key gate — that gate
+closes the *reporting* half, it does not make a lane run.
+⛔ **AND ON A CELL THE KEYS FILE OFTEN CONTAINS NO KEY AT ALL — the fix is the MODEL FLAG (agent-infra#3443, measured
+2026-11-04 on cell-5).** `/home/cmux/keys.env` there held **only `GH_TOKEN`**; `pi` resolved NO usable model/provider and printed
+`No API key found for the selected model.` — ⛔ and read
+that sentence exactly: `pi` says *"the selected model"* only when the provider is `unknown` (`auth-guidance.js`), i.e. when no
+model resolved at all. An unprovisioned pin on a box that has SOME provisioned provider says something else and instead runs
+that model silently. What worked was the invocation — `pi -p --no-session --model deepseek/deepseek-flash` (with no
+`--provider`, spell the model as `provider/id`, which resolves unambiguously) — so **pin the pair; do not go looking for a keys file to
+source.** Since #3443 the gate also emits `check=warn reason=box-default-not-provisioned box_default=… model=… var=…` when the box's
+STARTUP model (`settings.json` `defaultProvider`/`defaultModel`) has no credential: that is about a bare `pi`, and it does
+not stop the lane, which pins its own pair. If the box sets `enabledModels`, `pi` picks the startup model from that SCOPE
+first — unless the pinned pair is itself in the scope — so the probe says `check=skipped reason=enabled-models-scoped` instead of answering from the pin — unset it (or
+launch with `--provider … --model …`) before trusting a green pin reading. **If the terminal line is absent**, three things produce that: a box that predates #3331, a
 lane the kernel or `lane-bound.sh` KILLed (no trap runs after SIGKILL), or a cleanup that outran the TERM→KILL grace — so
 check `[lane-bound] KILL` and `dmesg | grep -ci 'killed process'` before blaming provisioning. And never use
 `pgrep -f "pi -p"` for liveness: it matches your own command line. **And what actually made cell lanes run is the launch
@@ -434,29 +446,62 @@ tmux new-session -d -s <slug> \
 Measured 2026-10-19: driving the cells this way is how 23 lanes landed on one box (8 cores, **32 GB**) and the kernel
 killed 37 processes *and the tmux server*, losing every lane. The gate would have refused that spawn.
 
-- Model form is split: a launch with no `--provider` needs `provider/model` (`deepseek/deepseek-v4-flash`), while the
-  harness passes `--provider` and a bare `--model` (`deepseek-flash`) as two separate halves. A bare `--model` with no
-  provider falls back to the wrong provider.
-- ⛔ **`keys.env` IS NOT GUARANTEED TO CONTAIN AN API KEY.** Measured 2026-10-19: cell-1's file exported only
-  `REPO CYC MAX_FIX MIN_SWAP_FREE PATH …` and **no provider key at all** — the lanes that worked had the key in their
-  *ambient* environment (inherited from the tmux server), so a lane launched through `keys.env` alone died instantly with
-  `No API key found for deepseek.` and its log stopped at the banner. Before dispatching on any box:
+- Model form is split: a launch with no `--provider` may use `provider/model` (`deepseek/deepseek-v4-flash`), while the
+  harness passes `--provider` and a bare `--model` (`deepseek-flash`) as two separate halves — pass BOTH, because the
+  gate now asserts nothing about a prefixed id when nothing names a provider: pi infers such a prefix only when it names a
+  provider that HAS models and otherwise matches the whole string as a model id across every provider
+  (`model-resolver.js:322-345,388-420`), so `--model deepseek/x` can run under a DIFFERENT provider than the slash spells.
+- ⛔ **`keys.env` IS NOT GUARANTEED TO CONTAIN AN API KEY — AND ON A CELL IT USUALLY DOES NOT.** Measured
+  2026-10-19: cell-1's file exported only `REPO CYC MAX_FIX MIN_SWAP_FREE PATH …` and **no provider key at all**; measured
+  again 2026-11-04 on cell-5 (agent-infra#3443): `/home/cmux/keys.env` held **`GH_TOKEN` and nothing else**. The lanes that
+  worked had their key in the *ambient* environment (inherited from the tmux server), so a lane launched through `keys.env`
+  alone died instantly with `No API key found…` and its log stopped at the banner. Before dispatching on any box:
   ```bash
-  . $HOME/keys.env; [ -n "$DEEPSEEK_API_KEY" ] && echo key-ok || echo KEY-MISSING
+  [ -n "$DEEPSEEK_API_KEY" ] && echo key-ok || echo KEY-MISSING          # the AMBIENT env, which is what pi reads
+  ( unset DEEPSEEK_API_KEY; . "$HOME/keys.env"; [ -n "$DEEPSEEK_API_KEY" ] && echo file-has-key || echo FILE-HAS-NONE )
   ```
+  ⛔ **AND THAT SECOND LINE NEEDS ITS SUBSHELL** (measured, agent-infra#3443 review round 2). `env … . file` cannot work —
+  `.` is a shell builtin, so `env` reports `env: '.': Permission denied` (exit 126) and the test then prints
+  **`FILE-HAS-NONE` for a file that DOES hold the key**. That is the same false negative this section exists to remove,
+  printed by the check meant to catch it; the parenthesised subshell both isolates the sourced variables and returns the
+  right answer.
   and 60 s after launch check `grep -c 'No API key found' /tmp/cell-home/L-<slug>.log` — **0 is the pass condition**. A
   lane log that sits at ~5 KB without a tool call is almost always this, not a slow model.
+- ⛔ **AND THE FIX IS THE MODEL FLAG, NOT THE KEYS FILE — the half #3331 got wrong (agent-infra#3443, measured 2026-11-04 on
+  cell-5).** `pi` printed `No API key found for the selected model.` — a sentence that names **no provider**, which is what
+  `pi` says only when nothing was available to that process — so **sourcing `keys.env` cannot fix a file that holds no model
+  key at all**, and a key visible in *your* shell proves nothing about the lane's own environment. What worked on the same box was the
+  invocation, not the credential:
+  ```bash
+  pi -p --no-session --model deepseek/deepseek-flash …        # or --provider deepseek --model deepseek-flash
+  ```
+  So pin the pair — and read that sentence carefully, because the two id forms are not interchangeable: with **no**
+  `--provider`, spell the model as `provider/id` (`deepseek/deepseek-flash`), which is unambiguous; a bare id resolves unreservedly only when exactly one provider exposes it, and
+  with several matches it relies on exactly one of them being authenticated — otherwise it is rejected as ambiguous
+  (`resolveCliModel`'s exact-match fallback). The harness passes the two
+  halves separately (`--provider deepseek --model deepseek-flash`). Verify with `pi --list-models` before dispatch.
+  ⛔ **AND AN UNPROVISIONED PIN IS A SILENT SUBSTITUTION, NOT A DEATH — do not diagnose it as one.** `pi` uses the
+  `settings.json` startup pair ONLY when that provider is provisioned (`findInitialModel` step 3 requires
+  `hasConfiguredAuth`) and otherwise falls through to the first model it does find — so a box pinned to an unprovisioned
+  model runs a model nobody pinned, silently, and spends tokens on it. Since #3443 `lane.sh` prints the model it asserted
+  (`[key-gate] … model=<id> …`) and emits `check=warn reason=box-default-not-provisioned model=… var=…` when the box's
+  STARTUP pair is unusable — that line is about a **bare `pi`** (one with no model flag) and it does not stop the lane,
+  which pins its own pair. Also note `No API key found for the selected model.` and `No API key found for <provider>.` are
+  two different sentences: only the second names the provider whose credential is missing, and #3443 is the record of how
+  much was inferred from the first.
 - ⛔ **AND THE REDIRECTED `HOME` IS WHAT HIDES IT — the trap this bullet used to state only half of** (agent-infra#3331,
   measured 2026-11-02 on two cells). A lane MUST run with `HOME=$CELL_HOME` (default `/tmp/cell-home`), because the
   operational layer — `record-review.sh`, the gh shim, the extensions — lives under `$CELL_HOME/.pi/agent`. But the
   credential normally lives in the **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), and `lane-env.sh` sources
   `${ENV_FILE:-$HOME/keys.env}` — the *redirected* one. So **the single setting that makes the operational layer work is the
-  setting that hides the credential**, and the lane dies in seconds having done nothing. Two consequences for an operator:
-  source the key into the LAUNCH line (`HOME=/tmp/cell-home bash -lc '. /tmp/cell-home/keys.env; . /home/cmux/keys.env; …'`),
-  and read the lane's LAST log line before concluding anything — since #3331 `lane.sh` refuses a keyless environment
-  **before** spawning `pi` (`[key-gate] … result=REFUSED var=<NAME>`, exit **82**) and every lane log ends with
-  `outcome=<done|refused|failed|died> reason=<token>`. ⛔ but a log that STOPS is not proof of a key problem: the #3331
-  record falsified that, and the cause it VALIDATED is the launch directory (next bullet).
+  setting that hides the credential**, and the lane dies in seconds having done nothing. Three consequences for an operator:
+  launch with the harness (`lane.sh`/`lane-exec.sh`, which pin the pair) rather than a hand-written `pi` line; read the
+  lane's LAST log line before concluding anything — since #3331 `lane.sh` refuses a keyless environment **before** spawning
+  `pi` (`[key-gate] … result=REFUSED var=<NAME>`, exit **82**) and every lane log ends with
+  `outcome=<done|refused|failed|died> reason=<token>`; and ⛔ **do not treat "source `keys.env`" as the remedy** — that was
+  #3331's text and #3443 falsified it (the file can hold no key at all; the fix was the model flag, above). A log that
+  STOPS is not proof of a key problem either: the #3331 record falsified that, and the cause it VALIDATED is the launch
+  directory (next bullet).
 - ⛔ **`pgrep -f "pi -p"` IS NOT A LIVENESS TEST — IT MATCHES THE DIAGNOSTIC'S OWN COMMAND LINE.** Measured during the
   #3331 investigation: `pgrep -fc "pi -p|pi --"` returned **3 for a dead lane**, because the pattern appears in the
   command the operator just typed (and in any monitor that greps for it). It reported "alive" until the read was
