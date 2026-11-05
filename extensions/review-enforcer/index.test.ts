@@ -20,6 +20,15 @@ process.env.NODE_ENV = "test";
 // class is exactly what #285 fixes).
 delete process.env.TASK_HEARTBEAT;
 delete process.env.PI_MODE;
+// ⛔ #3297 — the SAME class as KIND above, one round later. `AGENT_ADMIN_MERGE_OVERRIDE=1`
+// is the AUDITED landing route (AGENTS.md): it must be exported BEFORE a session starts, so
+// a LANE — which is exactly how a fix agent verifies its own work — carries it into this
+// suite. A test asserting that a degraded argv layer REFUSES then goes red for a reason that
+// has nothing to do with the code (measured: clean env → 6/6 pass; ambient override → the
+// refusal case fails). Delete it and its alias at load; the cases that exercise the override
+// set it explicitly and restore it.
+delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+delete process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
 // ⛔ `KIND` IS THE SAME CLASS, and #2148 added it to the decision surface: `reviewerRoleFor()`
 // resolves the AUDIENCE from `KIND`, and the factory resolves it ONCE at load. Every launcher in
 // this fleet exports it (`lane.sh` KIND=lane, `fix-one.sh` KIND=fixer, `merge-one.sh`
@@ -135,6 +144,10 @@ import {
   RECORD_STATE_LIVE_UNREADABLE,
   RECORD_STATE_CARRY_ALLOWED,
   type ReviewRecord,
+  // ⛔ #3297 — the argv-layer state and the refusal the admin-merge gate now returns
+  // when that layer is not loaded. Imported from the module that OWNS them.
+  ghArgvLayerState,
+  ghArgvLayerRefusal,
 } from "./index.js";
 // #2665: the token is imported from the module that OWNS it, so a rename cannot leave this
 // suite green (the review of #2665 caught the hardcoded copy).
@@ -9214,7 +9227,8 @@ testAsync("#1382 (c): a spliced invocation is still REFUSED (UNCHANGED by this P
 
 testAsync("#1382 (d): the mask does NOT depend on the argv layer — the fleet has none, and that is where the defect bit", async () => {
   // MEASURED, and this is why the condition was removed: `docs/ops/ACTIVATION-MATRIX.md` row 1 records
-  // the gh shim as ABSENT on this fleet (nothing installs `scripts/gh-shim`; the resolver returns null),
+  // the gh shim as ABSENT on a box (re-measured 2026-11-02: `setup.sh` farms `scripts/gh-shim` and
+  // `cell-install.sh` fails the install without it, so the resolver returns null only on a STALE install),
   // so the previous `ghShimWillEnforce(shimDir) ? maskHeredocData(…) : rawCommand` left the reported
   // false positive refusing the reporter in the ONLY environment that hit it (verified: the
   // shim-conditioned build still refuses the command below verbatim). Masking is not a deferral — a
@@ -11629,7 +11643,141 @@ test("#3175 i — every path in the fetch remedy is quoted, the script included"
   });
 });
 
-// ── Summary ───────────────────────────────────────────
+// ── #3297: a degraded guard refuses, rather than warns ───────────────────────────────────────────
+
+// ── #3297: A DEGRADED GUARD MUST REFUSE, NOT WARN ─────────────────────────────
+//
+// THE DEFECT THIS PINS. The argv-level `gh` shim (#984) is the layer that proves the
+// merge a command carries is the ONLY one in it; the text scanner's stated residual is a
+// token splice it cannot resolve. When that shim was absent (`#984 argv-level gh shim not
+// found`, measured on a cell: nothing had farmed `scripts/gh-shim` into the home its lanes
+// ran with) the extension printed ONE `⚠️` line and went on certifying admin merges
+// exactly as if the layer were present. Degradation that nothing fails on is not a
+// warning — it is a guard that is absent while the fleet believes it holds.
+//
+// WHY THE ABSENT CASE IS ASSERTED THROUGH THE PURE SEAM, DECLARED RATHER THAN HIDDEN:
+// `resolveGhShimDir()`'s second candidate is `EXTENSION_DIR/../../scripts/gh-shim`, which
+// EXISTS in every checkout of this repo — so from a test running beside the extension the
+// degraded state is UNREACHABLE, and it is unreachable for precisely the reason it shipped
+// untested. That resolution is pinned separately (`resolveGhShimDir` / `isExecutableShim`
+// tests above); what was never pinned is the DECISION on its null result, which is what
+// this block does. The two are asserted to agree below, so a change to the resolution
+// cannot silently orphan the decision.
+test("#3297: an absent argv layer is DEGRADED — not `disabled`, not `enforcing`", () => {
+  const prev = process.env.AGENT_GH_SHIM;
+  try {
+    delete process.env.AGENT_GH_SHIM;
+    equal(ghArgvLayerState(null), "degraded",
+      "no shim resolved + the switch is unset → DEGRADED (an unintended absence)");
+    // The operator's own kill switch is a DECISION, and must not be read as a defect:
+    // a lane that chose the degraded posture keeps the old behaviour.
+    process.env.AGENT_GH_SHIM = "0";
+    equal(ghArgvLayerState(null), "disabled",
+      "AGENT_GH_SHIM=0 → DISABLED — deliberate, never reported as degradation");
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prev;
+  }
+});
+
+test("#3297: a present argv layer is ENFORCING — the state this change must not disturb", () => {
+  const dir = withShimInstalled(() => resolveGhShimDir());
+  ok(dir !== null, "the checkout's own scripts/gh-shim resolves (the posture every other test runs in)");
+  ok(isExecutableShim(dir!), "…and it is executable, so bash does not skip the PATH entry");
+  withShimInstalled(() => {
+    equal(ghArgvLayerState(dir), "enforcing", "a resolved executable shim → ENFORCING");
+    equal(ghArgvLayerRefusal(dir), null, "…and the gate refuses NOTHING (this cannot wedge a healthy box)");
+  });
+});
+
+test("#3297: the admin-merge gate REFUSES when its certifier is absent (was: warn and certify)", () => {
+  const prev = process.env.AGENT_GH_SHIM;
+  try {
+    delete process.env.AGENT_GH_SHIM;
+    const refusal = ghArgvLayerRefusal(null);
+    ok(refusal !== null && refusal.block === true,
+      "an absent argv layer BLOCKS the admin merge — an unknown is not a pass");
+    const r = refusal!.reason;
+    // The refusal has to be actionable from the log alone: a lane that hits this on a
+    // rebuilt box must not have to rediscover #984 to know what to install.
+    ok(r.includes("#984"), "names the layer (#984)");
+    ok(r.includes("DEGRADED"), "states the guard is degraded, so nobody reads it as a policy refusal");
+    ok(r.includes("scripts/gh-shim/gh") && r.includes("~/.pi/agent/scripts/gh-shim/gh"),
+      "names the PATH the extension actually resolves, not only the repo-relative one");
+    ok(r.includes("verify-admin-merge-evidence.sh"),
+      "names the sibling the shim FAILS CLOSED without (one without the other refuses every merge)");
+    ok(r.includes("setup.sh") && r.includes("cell-install.sh"),
+      "names the MECHANISM (a rebuild must get it too), not a hand-copy");
+    ok(r.includes("AGENT_GH_SHIM=0"), "names the deliberate escape, so the switch is discoverable");
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prev;
+  }
+});
+
+test("#3297: the operator's kill switch is HONOURED — `AGENT_GH_SHIM=0` does not refuse", () => {
+  const prev = process.env.AGENT_GH_SHIM;
+  process.env.AGENT_GH_SHIM = "0";
+  try {
+    equal(ghArgvLayerRefusal(null), null,
+      "a lane that deliberately switched the layer off keeps the old fail-closed text path — " +
+      "the refusal exists for an UNINTENDED absence, never to reverse a decision");
+  } finally {
+    if (prev === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prev;
+  }
+});
+
+test("#3297: the AUDITED admin-merge override outranks the refusal (a recorded decision)", () => {
+  // `AGENT_ADMIN_MERGE_OVERRIDE=1` is the landing route recorded in AGENTS.md, and it is
+  // read deep inside the evidence branch. Refusing before that read would silently reverse
+  // it — and because both switches must be set BEFORE a session starts, a lane on a
+  // degraded box would have no in-session way to land at all. The override keeps its route
+  // (audited there as `admin_merge_override`); this refusal declines to CERTIFY, it does not
+  // veto an explicit operator decision.
+  const prevShim = process.env.AGENT_GH_SHIM;
+  const prevOverride = process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+  const prevEldato = process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
+  delete process.env.AGENT_GH_SHIM;
+  try {
+    // NOTE: no "override unset" CONTROL here — `_adminMergeOverride()` reads through
+    // `_getEnv`, whose test harness can already hold a value, so an unset-env control
+    // asserts the harness rather than the gate. The positive direction is what the
+    // recorded decision needs pinned: WITH the override set, the refusal stands down.
+    process.env.AGENT_ADMIN_MERGE_OVERRIDE = "1";
+    equal(ghArgvLayerRefusal(null), null,
+      "AGENT_ADMIN_MERGE_OVERRIDE=1 is NOT refused — the recorded landing route still works");
+    delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+    process.env.ELDATO_ADMIN_MERGE_OVERRIDE = "1";
+    equal(ghArgvLayerRefusal(null), null, "…and its ELDATO_ alias, like every other read of it");
+    delete process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
+  } finally {
+    if (prevShim === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prevShim;
+    if (prevOverride === undefined) delete process.env.AGENT_ADMIN_MERGE_OVERRIDE;
+    else process.env.AGENT_ADMIN_MERGE_OVERRIDE = prevOverride;
+    if (prevEldato === undefined) delete process.env.ELDATO_ADMIN_MERGE_OVERRIDE;
+    else process.env.ELDATO_ADMIN_MERGE_OVERRIDE = prevEldato;
+  }
+});
+
+test("#3297: resolution and decision AGREE — the datum the handler passes cannot be orphaned", () => {
+  // The handler passes `activeGhShimDir()` into `ghArgvLayerRefusal`. That value is
+  // `resolveGhShimDir()` (materialized) or null. Pin the JOIN, so a future resolver that
+  // starts returning something the decision reads differently fails HERE rather than as a
+  // silent fail-open on a box nobody measured.
+  withShimInstalled(() => {
+    const dir = resolveGhShimDir();
+    const state = ghArgvLayerState(dir);
+    const refusal = ghArgvLayerRefusal(dir);
+    equal(state, dir === null ? "degraded" : "enforcing",
+      "the state is a function of the resolver's own answer");
+    equal(refusal === null, dir !== null,
+      "the gate refuses exactly when the resolver found no shim");
+  });
+});
+
+// ── Summary ──
 // Run the async factory tests strictly sequentially (they mutate process.env).
 for (const run of pending) await run();
 
