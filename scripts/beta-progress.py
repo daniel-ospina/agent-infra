@@ -622,15 +622,23 @@ def _shape_pr_rows(rows, state):
 
     ⛔ `gh` CAN EXIT 0 WITH A JSON OBJECT (`{"message": "Not Found"}`) OR A LIST OF NON-DICTS, and
     a dict is TRUTHY and sized — so an `is None` test never fires on it, `covered()` calls `.get()`
-    on a str and RAISES, and `len()` turns the payload into a NUMBER. Three rounds of review each
-    found one more consumer that had only half this rule (#3457 rounds 9-11): the fix-repo list,
-    then the tracker's list-level check, then the fix-repo's non-list path. It lives in ONE place
-    now, and every read calls it, so a fourth consumer cannot re-open the class.
+    on a str and RAISES, and `len()` turns the payload into a NUMBER. Four rounds of review each
+    found one more consumer that had only half this rule (#3457 rounds 9-12): the fix-repo list,
+    then the tracker's list-level check, then the fix-repo's non-list path, then the ISSUE rows.
+    Every read that produces rows now calls it: the two tracker PR lists, the two fix-repo lists
+    (before the REST fallback AND on the fallback's answer), and both tier reads.
+    ⛔ IT IS NOT THE ONLY COPY OF THE PER-ROW RULE, and saying so would be false: `_rest_prs` keeps
+    its own, because it validates AS IT PAGES — a bad row on page 3 must refuse before page 4 is
+    paid for, which a post-hoc gate cannot do. That copy is upstream and stricter in timing, not a
+    second policy; this one is what every caller gets whatever the transport.
 
     ⛔ PRESENCE IS NOT SHAPE — TYPES INCLUDED, and that is why this is not `isinstance(rows, list)`:
     `number` must be an int that is not a bool (a bool IS an int, and `covered(True)` would search
     for `1`), the two fields `covered()` REGEXES must be strings when present, and `mergedAt` must
     be a string when present (a falsy non-str there silently under-counts `merged_today`).
+    ⛔ AND `state` IS THE ONE THING THE CALLER KNOWS: an OPEN list carries no `mergedAt`, so
+    demanding the key there would refuse every valid read. The tier rows pass `"open"` and rely on
+    the `number` check, which is exactly the field `covered(r["number"])` indexes them by.
 
     Returns the rows, or None — never a partial list: a short window is indistinguishable from a
     complete one at every call site, which is the error class this file exists to refuse.
@@ -861,9 +869,13 @@ def _compute():
         # -- a wrong number, not `unavailable`, and `main()` CACHES it for the whole 1800 s TTL.
         # Measured: an issue read answered `{}` printed `P0 0 open (0 with PR, 0 NONE) | P1 0 open
         # (0 with PR, 0 NONE)`. The `for r in rows` below cannot catch it: there is no row to
-        # reject. Non-empty wrong payloads escaped only by accident (iterating a dict yields str
-        # keys, and `r["number"]` raises into `main()`'s handler), which is not a guard.
-        if not isinstance(rows, list):
+        # reject.
+        # ⛔ AND IT IS THE SHARED PREDICATE, NOT A SECOND ONE (#3457 review round 12). These rows
+        # are the ONLY ones whose `number` is dereferenced (`covered(r["number"])`), so the bool-is-
+        # not-an-int rule belongs here more than anywhere -- the first form of this block checked
+        # `isinstance(rows, list)` only, and a tier list of `True` reached `covered(True)`.
+        rows = _shape_pr_rows(rows, "open")
+        if rows is None:
             return None
         have = sum(1 for r in rows if covered(r["number"]))
         out[tier] = {"open": len(rows), "with_pr": have, "without": len(rows) - have}

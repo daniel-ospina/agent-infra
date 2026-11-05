@@ -1225,6 +1225,36 @@ def test_a_malformed_fix_repo_payload_is_unavailable_not_a_traceback(monkeypatch
         "the second source was never asked for the malformed fix repo — the shape gate ran before "
         "the fallback instead of as part of it")
 
+    # ⛔ AND A MALFORMED LIST MUST ASK IT TOO, not only a non-list (#3457 review round 12). The
+    # first form of this test glued a `{"message": ...}` OBJECT, which `_rest_prs` also refuses, so
+    # the round-11 mutant — fallback gated on `not isinstance(rows, list)` only — stayed green while
+    # the shipped code recovered `with_pr=1` on the same payload. Here the bad answer is a LIST of
+    # non-rows, which is the shape a `isinstance(rows, list)`-only fallback lets through to the gate
+    # AFTER it: the read comes back `None` instead of asking the second source.
+    def fake_gh_bad_list(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+            return ["nope", 42]                     # a LIST, of things that are not rows
+        return []
+
+    tried.clear()
+    monkeypatch.setattr(bp, "gh", fake_gh_bad_list)
+    answered = {"n": 0}
+
+    def answering_rest(state, limit=100, deadline=None, repo=None):
+        tried.append((repo, state))
+        answered["n"] += 1
+        return [pr(3368, ref="fix/10114-x", title="fix(reaper): the thing (#10114)")]
+
+    monkeypatch.setattr(bp, "_rest_prs", answering_rest)
+    assert bp.compute() is not None, (
+        "a malformed LIST from the fix repo must fall back to REST, not lose the line")
+    assert ("daniel-ospina/agent-infra", "open") in tried, (
+        "the second source was never asked for a malformed LIST — the gate ran after the fallback "
+        "again, one shape further out")
+
 
 def test_a_non_list_tracker_list_of_non_dicts_is_unavailable_not_a_count(monkeypatch, no_cache):
     """⛔ `len()` TURNS A BAD LIST INTO A NUMBER, AND ONLY `covered()` WOULD HAVE RAISED.
@@ -1241,6 +1271,13 @@ def test_a_non_list_tracker_list_of_non_dicts_is_unavailable_not_a_count(monkeyp
     """
     def fake_gh(*args):
         if args[:2] == ("pr", "list"):
+            # ⛔ REPO-DISCRIMINATING, AND THAT IS THE POINT (#3457 review round 12). The first form
+            # answered the malformed list for EVERY repo, so the FIX-REPO consumer refused it
+            # first and the assertion passed for the wrong reason: deleting BOTH tracker
+            # `_shape_pr_rows` call sites left 42/42 GREEN (measured). Only `FIX_REPOS == (REPO,)`
+            # made the tracker gate observable, which is not a test — it is a coincidence.
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []                          # the fix repo answers fine; ONLY the tracker is bad
             return ["nope", None, 42] if args[args.index("--state") + 1] == "open" else []
         return []                                    # both tiers EMPTY: `covered()` never runs
 
@@ -1252,6 +1289,8 @@ def test_a_non_list_tracker_list_of_non_dicts_is_unavailable_not_a_count(monkeyp
     # ...and the silent half: a `merged` row whose `mergedAt` is a dict, with an EMPTY open list.
     def fake_gh_merged(*args):
         if args[:2] == ("pr", "list"):
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []
             return [] if args[args.index("--state") + 1] == "open" \
                 else [{"number": 1, "title": "t", "headRefName": "r", "mergedAt": {}}]
         return []
@@ -1403,6 +1442,19 @@ def test_an_empty_object_issue_read_is_unavailable_not_a_zero_line(monkeypatch, 
     assert bp.compute() is None, (
         "an answered non-list ISSUE read must be `unavailable`, never a cached zero line")
 
+    # ⛔ AND THE ISSUE ROWS ARE THE ONLY ONES WHOSE `number` IS DEREFERENCED — so the shared
+    # predicate's bool-is-not-an-int rule belongs here most of all (#3457 review round 12). A tier
+    # list of `[{"number": True}]` used to pass the old `isinstance(rows, list)` gate and reach
+    # `covered(True)`, where `"%d" % True` is `"1"` — a cover decided by a searched-for `1`.
+    def fake_gh_bool(*args):
+        if args[:2] == ("pr", "list"):
+            return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+        return [{"number": True}]
+
+    monkeypatch.setattr(bp, "gh", fake_gh_bool)
+    assert bp.compute() is None, (
+        "a bool `number` on a tier row must refuse the read — `covered(True)` searches for '1'")
+
 
 def test_an_answered_non_list_tracker_pr_read_engages_the_rest_fallback(monkeypatch, no_cache):
     """⛔ A DICT IS TRUTHY AND SIZED, SO `is None` NEVER FIRES ON IT (#3457 review round 10).
@@ -1415,6 +1467,10 @@ def test_an_answered_non_list_tracker_pr_read_engages_the_rest_fallback(monkeypa
     """
     def fake_gh(*args):
         if args[:2] == ("pr", "list"):
+            # ⛔ REPO-DISCRIMINATING (#3457 review round 12): the tracker answers badly and the fix
+            # repo answers well, so ONLY the tracker's normalisation can produce this `None`.
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []
             return {"message": "Not Found"}         # rc 0, wrong shape, TRUTHY
         return []
 
