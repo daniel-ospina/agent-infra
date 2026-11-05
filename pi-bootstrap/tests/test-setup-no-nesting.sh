@@ -459,7 +459,7 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # held back only because `lane-status.py` is. #1553 declares both in `lane_root_srcs`; when it lands
 # both take the membership branch and this list becomes STALE, which the stale check below FAILS —
 # delete the entries then, so the exemption cannot outlive its reason.
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 repo-target.sh:#3174"
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 repo-target.sh:#3174 ai_pr_status.py:#2413"
 # `repo-target.sh` joined on 2026-11-01 (#3174) — a DISCLOSED GAP, not a delivery, and the reason is a
 # DERIVATION defect rather than a farm one. A farmed consumer names it through the ORCHESTRATOR payload
 # (`install-repair-service.sh`: `"$HERE/orchestrator-harness/repo-target.sh"` then `"$O/repo-target.sh"`),
@@ -527,7 +527,7 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
+script:ask-owner.py script:ai_pr_status.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
 script:disk-reaper.sh script:fleet-cost-report.sh script:goal-state.py script:harness-apply-pass.sh
 script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
 script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
@@ -541,6 +541,18 @@ lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py
 other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
+# `script:ai_pr_status.py` joined on 2026-11-04 with agent-infra#2413 (PR #3413), and it is a DISCLOSED
+# GAP rather than a delivery. Not a farm change: `objective-reminder.sh` became a FARMED consumer for
+# the first time in that PR (its template used to exec the checkout, which launchd cannot read under
+# TCC — the 126s the PR is about), so the derivation now sees its exec site. The producer is a
+# hardcoded default at `scripts/objective-reminder.sh:100` (TRIAGE_CMD defaults to
+# `$HOME/.pi/agent/scripts/ai_pr_status.py`) and NO ARRAY HERE CAN CARRY IT: `scripts/ai_pr_status.py`
+# does not exist in this repo, and the consumer's own row at `:75-76` says so ("it is NOT shipped by
+# this repo"). The consumer also guards it twice — `[ -f "$TRIAGE_CMD" ]` and `command -v python3`
+# (`:152-153`) — so a farm WITHOUT it loses an optional triage line, never delivery. That makes
+# `LANE_PRODUCERS_EXEMPT` the remedy the gate's own message names ("if no array can carry it"), owned
+# by #2413, whose subject is the objective-reminder's delivery leg. It cannot outlive its reason: the
+# stale-disclosure check FAILS the moment the exec site moves or the producer is delivered.
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
 # producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
