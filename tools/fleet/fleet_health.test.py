@@ -61,7 +61,7 @@ patched for the duration of a leg and restored in a `finally`, so nothing touche
 or the real launchd.
 
 ⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
-(**nine** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
+(**ten** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
 once PER RECORDED LANE for three distinct reads: a lane-row `cputime_secs`, one `_observed` ->
 `scripts/lib/pid-identity.sh probe`, and a `cputime_secs` from the STATE snapshot write the
 enumeration runs for every recorded pid. Per recorded lane that is 3; what each arm actually
@@ -72,14 +72,18 @@ reaches:
   * the TWO HOLDER arms (`rc_live`, `rc_liveu`) — seven records: 2 × 7 = **14 each**, because
     `_observed` is stubbed to `holder`, so only the two `cputime_secs` reads per record remain;
   * the abstaining-record arm — one record reading `os.getpid()`, bound 3;
+  * the FULLY-ABSTAINING arm (`observed="unreadable"`) — SEVEN records, every one reading
+    `os.getpid()`: 2 × 7 = **14**, because `_observed` is stubbed so only the two `cputime_secs`
+    reads per record remain;
   * the THREE default-store arms (`pi=9`, `pi=None`, `pi=0`) and the CORRUPT-STORE arm
     (`corrupt_store=True`) — no ROSTERED record (`_drive`'s default store holds two non-rostered
     sessions, and the corrupt store holds none at all), so they reach the table **zero** times.
 
 Every one of the fixture-based reads targets the FIXTURE's pid (`99999999`), so they are not "about
-THIS process". The abstaining-record arm is the one that reads `os.getpid()`
-and it IS independent of what those reads return — its lane is `pidStartSeconds`-absent, which
-abstains regardless. The TWO ALL-DEAD `_drive` arms (`rc_stale`, `rc_unv`) are NOT independent:
+THIS process". The abstaining-record and FULLY-ABSTAINING arms are the ones that read
+`os.getpid()`, and they ARE independent of what those reads return — their lanes are
+`pidStartSeconds`-absent, which abstains regardless (`_observed` is stubbed in both).
+The TWO ALL-DEAD `_drive` arms (`rc_stale`, `rc_unv`) are NOT independent:
 each turns on `_observed(99999999, 1000000000)` returning `absent` through the REAL probe, i.e. on
 a usable `ps` for a nonexistent pid. That dependency is named by the `CENSUS: PRECONDITION:`
 check, so a host-level `ps` failure surfaces AS THAT CHECK rather than as a silent pass. (The
