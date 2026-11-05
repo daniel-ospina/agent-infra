@@ -701,6 +701,35 @@ else
   rc=1; echo "      below-exit0='${below_exit0:-none}' commented='${commented:-none}' inline='${inline_commented:-none}' (want none/none/none) with queue call found in every fixture ('${q_live_a:-MISSING}'/'${q_live_b:-MISSING}'/'${q_live_c:-MISSING}')"
 fi
 ck "non-vacuity: the reachability pin reddens on a product call BELOW the arm's exit 0, on a full-line COMMENT, and on an INLINE-commented one" $rc
+# 12-x) WHERE THE CALLS SIT, not merely THAT they exist (review P2, cycle 9). Two positions carry the fix
+#        and neither was pinned:
+#        (a) the MAIN call must run BEFORE `write_product_queues`, which derives candidates.product.txt
+#            from candidates.txt's order at that moment — run the reorder after it and the product queue is
+#            built from the PRE-reorder order, so `floor_order` again takes its head from arrival order.
+#            Moving it below the split kept the suite GREEN at 42/0.
+#        (b) the skip arm's calls must run BEFORE the head/backlog read (`_skip_head=`), which reports the
+#            queue's head to the durable record; run them after and the record names a row that is no
+#            longer the head while asserting it is the highest-ranked CLEAN entry.
+#        ONE predicate, driven by both the shipped check and its reversed fixture — the lesson of 12-w0
+#        (a fixture that compares the numbers itself pins nothing but itself).
+before_ok() {  # <earlier-line> <later-line> -> true when BOTH were found AND the first precedes the second
+  [ -n "$1" ] && [ -n "$2" ] && [ "$1" -lt "$2" ]
+}
+main_call_line="$(grep -n '^queue_order_from_pool "\$O" || true' "$REFRESH" | head -1 | cut -d: -f1)"
+split_line="$(grep -nF 'write_product_queues "$O"' "$REFRESH" | head -1 | cut -d: -f1)"
+if before_ok "$main_call_line" "$split_line"; then rc=0
+else rc=1; echo "      main call '${main_call_line:-MISSING}' vs write_product_queues '${split_line:-MISSING}' — the reorder must run BEFORE the split (after it, the product queue is derived from the pre-reorder order)"; fi
+ck "the MAIN reorder runs BEFORE write_product_queues derives the product queue (call ${main_call_line:-?} < split ${split_line:-?})" $rc
+if ! before_ok "$split_line" "$main_call_line"; then rc=0
+else rc=1; echo "      reversed: before_ok accepted (split=${split_line:-none}, call=${main_call_line:-none}) — 'before' cannot be distinguished from 'present'"; fi
+ck "non-vacuity: the split/call ORDER pin reddens on the reversed pair (split '${split_line:-?}' before call '${main_call_line:-?}')" $rc
+head_read_line="$(grep -n '^    _skip_head=""' "$REFRESH" | head -1 | cut -d: -f1)"
+if before_ok "$pf_in_arm" "$head_read_line" && before_ok "$q_in_arm" "$head_read_line"; then rc=0
+else rc=1; echo "      skip calls queue='${q_in_arm:-MISSING}' product='${pf_in_arm:-MISSING}' vs head read '${head_read_line:-MISSING}' — both must precede it, or the record names a head the reorder has superseded"; fi
+ck "the SKIP arm's reorder AND follow run BEFORE the head/backlog read that the durable record quotes (both < ${head_read_line:-?})" $rc
+if ! before_ok "$head_read_line" "$q_in_arm"; then rc=0
+else rc=1; echo "      reversed: before_ok accepted head read '${head_read_line:-none}' before the queue call '${q_in_arm:-none}'"; fi
+ck "non-vacuity: the head-read ORDER pin reddens on the reversed pair (head read '${head_read_line:-?}' before call '${q_in_arm:-?}')" $rc
 # 12-w2) NON-VACUITY of the ORDER half, which the three fixtures above do NOT exercise (VGATE, cycle 9 —
 #        it verified the predicate reds on the shipped tree, but the suite never re-proved that red itself,
 #        so a rewrite of the comparison could go inert unnoticed). A REVERSED arm — product call BEFORE the
@@ -768,6 +797,28 @@ prod_c="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" 2>/dev/null | sed 's/ *$/
 if [ "$prod_c" = "300 777 555" ]; then rc=0
 else rc=1; echo "      product '$prod_c' (want '300 777 555': the queue's order first, the unknown rows KEPT after it in THEIR order — a sort would emit '300 555 777')"; fi
 ck "re-sequencing never changes the product file's ROW SET — a row candidates.txt does not hold is kept, not dropped" $rc
+# C2) THE ROW-SET REFUSAL ITSELF (review P3, cycle 9). C above pins that the AWK preserves the row set; it
+#     says nothing about the GUARD that refuses a write when the set differs — delete the guard and C still
+#     passes, so its red path had never run. Modelled with a `sort` shim that reports ONE EXTRA row when the
+#     product file is sorted (the file changing between the awk's read and the comparison is the only way
+#     the guard can fire, and a concurrent writer is how): the re-sequence must be REFUSED, the file keeps
+#     its old bytes, and the refusal names the row set.
+RS="$TMP/rowset"; rm -rf "$RS"; mkdir -p "$RS/o" "$RS/bin"
+printf '300\n200\n' > "$RS/o/candidates.txt"
+printf '200\n300\n' > "$RS/o/candidates.product.txt"
+cat > "$RS/bin/sort" <<'SHIM'
+#!/usr/bin/env bash
+# model a concurrent writer touching the product file between the two reads: one EXTRA row appears
+if [ "${!#}" = "$RS_PF" ]; then { /usr/bin/sort "$@"; printf '999999\n'; }; else exec /usr/bin/sort "$@"; fi
+SHIM
+chmod +x "$RS/bin/sort"
+{ echo 'QUEUE_ORDER_STATE=""'; cat "$FNS"; printf 'product_queue_follow "$1"\nexit $?\n'; } > "$RS/drive.sh"
+( cd "$RS" && HOME="$RS" RS_PF="$RS/o/candidates.product.txt" PATH="$RS/bin:$PATH" bash drive.sh "$RS/o" ) > "$RS/out" 2>&1
+rs_rows="$(tr '\n' ' ' < "$RS/o/candidates.product.txt" 2>/dev/null | sed 's/ *$//')"
+rs_tmp="$(ls -a "$RS/o" 2>/dev/null | grep -c '^\.product\.follow$')"
+if [ "$rs_rows" = "200 300" ] && [ "$rs_tmp" -eq 0 ] && grep -q 'would have CHANGED its row set' "$RS/out" 2>/dev/null; then rc=0
+else rc=1; echo "      row-set guard: rows '$rs_rows' (want '200 300', unmoved) temp-left=$rs_tmp out '$(tr '\n' '|' < "$RS/out" 2>/dev/null | head -c 240)'"; fi
+ck "the ROW-SET guard REFUSES the write when the product file's rows differ from what was read (nothing written, no temp)" $rc
 # D) AN ABSENT product file is the documented unmet-floor case: nothing is CREATED (that would
 #    manufacture product work from a classification this pass did not make).
 printf '200\n300\n' > "$PQ/o/candidates.txt"
@@ -791,6 +842,42 @@ if [ -d "$PQ/o/candidates.product.txt" ] && grep -q 'not a readable regular file
 else rc=1; echo "      unreadable product path: log '$(tr '\n' '|' < "$PQ/log5" 2>/dev/null | head -c 240)'; absent case said it too: $(grep -c 'not a readable regular file' "$PQ/log4" 2>/dev/null)"; fi
 ck "an UNREADABLE product queue is NAMED (and an ABSENT one stays silent) — the floor head is never left stale in silence" $rc
 rmdir "$PQ/o/candidates.product.txt" 2>/dev/null || true
+# 12-y) THE COUNT READ-BACK'S POLARITY (review P2 + P3, cycle 9). `.queue-rank` is written by
+#        `rank_queue_by_pool` and read back after the install; between those two moments a CONCURRENT pass
+#        deletes it (its entry does `rm -f "$o/.queue-rank"`) — reachable, because the refresh lock is
+#        cleared by age and by the spawn-failure arms. A shimmed `mv` performs the real install and then
+#        models the race, so the code under test is untouched.
+count_race() {  # <name> <shim-body> -> sets CROUT / CRR (log, rc) for a real reorder of a 2-row queue
+  local d="$TMP/count-$1"
+  rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
+  printf '300\n200\n' > "$d/o/.pool"
+  printf '200\n300\n' > "$d/o/candidates.txt"
+  cat > "$d/bin/mv" <<SHIM
+#!/usr/bin/env bash
+$2
+exec /usr/bin/mv "\$@"
+SHIM
+  chmod +x "$d/bin/mv"
+  { echo 'QUEUE_ORDER_STATE=""'; cat "$FNS"; printf 'queue_order_from_pool "$1"\nexit $?\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" PATH="$d/bin:$PATH" QRO="$d/o" bash drive.sh "$d/o" ) > "$d/out" 2>&1
+  CRR=$?
+  CROUT="$(cat "$d/out" 2>/dev/null)"
+  CRROWS="$(tr '\n' ' ' < "$d/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+}
+count_race gone 'rm -f "$QRO/.queue-rank" 2>/dev/null || true'
+if [ "$CRR" -ne 0 ] && [ "$CRROWS" = "300 200" ] && printf '%s' "$CROUT" | grep -q 'priority-unreadable' \
+   && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY'; then rc=0
+else rc=1; echo "      count file GONE: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 240)' (want rc!=0, rows installed, priority-unreadable, NOT 'EMPTY')"; fi
+ck "a count file that VANISHES between the reorder and the read-back is UNREADABLE, not a measured EMPTY queue" $rc
+count_race bad 'printf "x 2 -\n" > "$QRO/.queue-rank"'
+if [ "$CRR" -ne 0 ] && printf '%s' "$CROUT" | grep -q 'priority-unreadable' \
+   && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY'; then rc=0
+else rc=1; echo "      malformed count: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 240)' (want priority-unreadable, NOT 'EMPTY')"; fi
+ck "a MALFORMED count field is refused by the strict re-parse, never laundered to zero and read as EMPTY" $rc
+count_race good 'true'
+if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'severity-first from the pool'; then rc=0
+else rc=1; echo "      positive pair: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 240)' (the three fixtures above must not pass because the drive is broken)"; fi
+ck "positive pair: with the count file intact the same drive reports 'severity-first from the pool'" $rc
 # 12a) NON-VACUITY by MUTATION: make `product_queue_follow` a no-op (`return 0` as its first statement)
 #      and the stale-case assertion must RED — the product file stays a pass behind.
 MUT_NOFOLLOW="$TMP/fns-nofollow.sh"
