@@ -567,7 +567,7 @@ fi
 # different subject, and a fixture heavy enough that it would be the thing under test. So the greps are
 # a presence check on the delegate, never a claim that the delegate's behaviour is exercised here; that
 # dead-branch wrap is the disclosed residual of this suite.
-grep -qF 'mandate_preflight_lib' "$SPAWN";  ck $? "spawn-gate.sh still resolves the helper"
+grep -qF 'mandate_preflight_lib' "$SPAWN";  ck $? "spawn-gate.sh still defines its resolver"
 grep -qF 'mandate_sh="$_ms"; break;' "$MERGE"; ck $? "merge-one.sh still resolves the helper (its own run_agent copy)"
 grep -qF 'mandate_preflight_emit "$log" "$prompt" "$label"' "$SPAWN";           ck $? "spawn-gate.sh calls the shared emit"
 grep -qF 'mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"' "$MERGE"; ck $? "merge-one.sh calls the SAME shared emit"
@@ -604,13 +604,60 @@ grep -qF '[ -n "$_ms" ] && [ -f "$_ms" ]' "$MERGE"; ck $? "…and merge-one.sh t
 # green. And dropping the ASSIGNMENT (`mandate_sh="$_ms"; break;` → `break;`) left the same 102/0 while
 # the reviewer seam became PERMANENTLY LOG-ONLY: the loop ran, found nothing, `mandate_preflight_emit` was
 # never called, and every reviewer `pi` session got no block — #3377 restored on that seam with a green
-# suite. Each candidate is therefore pinned BY ITS OWN TOKEN (each appears exactly once per file), so any
-# dropped or reordered entry, and any divergence between the two lists, reddens.
+# suite.
+# ⛔ AND PINNING ONE FILE'S LIST PINS NOTHING ABOUT THE OTHER (this change's review cycle 2, P1, MEASURED):
+# the first fix ran this loop against `merge-one.sh` ONLY. Deleting `"${O:-}/mandate-preflight.sh"` from
+# `spawn-gate.sh`'s list left the suite at 110 passed, 0 failed — and `$O` is the entry the resolver's own
+# comment calls THE BOX'S HOME, the only candidate that resolves on a cell, so the disclosure would go
+# log-only on every lane, fixer and worker with a green suite. So BOTH files are pinned, EACH candidate by
+# its own token, and their candidate COUNTS are required to agree — a removal reddens a token pin, an
+# addition (a one-sided divergence) reddens the count.
+_mp_cand_count() { # _mp_cand_count <file> <start-marker> <end-marker> → `mandate-preflight.sh` tokens in the resolver's CODE
+  # ⛔ PROSE IS NOT A CANDIDATE (measured): the resolver's explanatory comment names `$O/mandate-preflight.sh`, so
+  # a whole-region count read 5 for spawn-gate against 4 for merge-one and the arm reddened on a healthy tree.
+  # Comment lines are skipped; only executed lines are counted.
+  awk -v s="$2" -v e="$3" 'index($0,s)==1{f=1} f && $0 ~ /^[[:space:]]*#/ {next} f{n+=gsub(/mandate-preflight\.sh/,"&")} f&&index($0,e)==1{print n; exit}' "$1"
+}
+SP_NCA="$(_mp_cand_count "$SPAWN" 'mandate_preflight_lib() {' '}')"
+M1_NCA="$(_mp_cand_count "$MERGE" 'mandate_sh=""' 'done')"
+[ "$SP_NCA" = "$M1_NCA" ]; ck $? "the two resolvers carry the SAME number of candidates (spawn-gate=$SP_NCA, merge-one=$M1_NCA) — a one-sided addition is a disagreement"
 for _mf_cand in '${MANDATE_PREFLIGHT_SH:-}' '$O/mandate-preflight.sh' '$_M1_HERE/mandate-preflight.sh' \
                 '${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh' \
                 '${HOME:-}/.pi/agent/scripts/mandate-preflight.sh'; do
   grep -qF -- "$_mf_cand" "$MERGE"; ck $? "merge-one.sh's candidate list still contains $_mf_cand (a dropped entry is a resolver disagreement, not a tidying)"
 done
+for _mf_cand in '${MANDATE_PREFLIGHT_SH:-}' '${O:-}/mandate-preflight.sh' '$here/mandate-preflight.sh' \
+                '${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh' \
+                '${HOME:-}/.pi/agent/scripts/mandate-preflight.sh'; do
+  grep -qF -- "$_mf_cand" "$SPAWN"; ck $? "spawn-gate.sh's candidate list still contains $_mf_cand (dropping \$O made the disclosure log-only on every cell)"
+done
+# ⛔ THE DEGRADED BRANCH IS THE ONE EVERY ALREADY-DEPLOYED BOX TAKES (this change's review cycle 2, P1,
+# MEASURED): replacing EITHER `else` body below with `:` left the suite at 110 passed, 0 failed, while
+# nothing at all was written — the silence #3377 exists to end. These are SOURCE pins, the same stated
+# limit §E5 carries for the delegate, because the branch is only reachable with the helper absent.
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$SPAWN"; ck $? "spawn-gate.sh still says CANNOT VERIFY when the helper is absent or unusable (deleting that notice restores the silence)"
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$MERGE"; ck $? "…and merge-one.sh says it too (the reviewer seam has no other notice on that path)"
+# merge-one's BRIEF append is a SOURCE pin for §E5's stated reason (its `run_agent` needs a PR, a chain
+# context and a merge queue, so its behaviour cannot be driven here) — but it is pinned to text ONLY the
+# append carries: deleting the append leaves the echo (and any grep for the notice) green, measured at
+# 120 passed, 0 failed before this arm existed. `is not available to this spawn` appears nowhere else.
+grep -qF 'is not available to this spawn' "$MERGE"; ck $? "merge-one.sh APPENDS the notice to the brief, not only to the log (source pin, §E5's limit)"
+# ⛔ THE LOG IS NOT THE LANE, AND THAT WAS THE ACTUAL HOLE (this change's review cycle 2, P1, MEASURED):
+# the notice above went to `$log` ONLY, so on a box that has not received the helper the LANE was told
+# nothing — #3377 exactly, on the population #3377 measured — and replacing BOTH notices with `:` left the
+# suite at 110 passed, 0 failed. Driven, not grepped: the real `run_agent`, with the resolver forced to
+# fail, must put CANNOT VERIFY in the argv the agent is launched with. The stub is what makes it a
+# mutation-catcher: delete either `printf … >> "$prompt"` and the launched argv loses the line.
+BRIEF5="$TMP/brief-nohelper.txt"; seam_brief "$BRIEF5"
+rm -f "$TMP/pi-ran5.log"
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran5.log" O="$TMP/O" CELL_HOME="$TMP/home2" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; mandate_preflight_lib() { return 1; }; cd "$2" || exit 2; run_agent 5 "$3" "$4" nohelper' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam5.log" "$BRIEF5" >/dev/null 2>&1
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$BRIEF5"; ck $? "an UNRESOLVABLE helper still tells the LANE it cannot verify (#3377's own population: a box without the helper)"
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$TMP/pi-ran5.log" 2>/dev/null; ck $? "…and the line is in the ARGV the agent was launched with, not only in a log the lane never reads"
 # The emit itself must be non-fatal on every branch.
 if awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -qE '\breturn [1-9]'; then
   bad "mandate_preflight_emit returns non-zero on some branch — callers would treat a disclosure as a refusal"
