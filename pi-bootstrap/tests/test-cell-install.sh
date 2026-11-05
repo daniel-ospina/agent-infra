@@ -1816,7 +1816,10 @@ PY
 # SAME predicate, install REPLACES each one — asserted, because a refusal with no repair is a cell
 # that can never converge.
 for _bad in 'https://:8443/mcp/' 'https://my daemon:8000/mcp' 'https://./mcp/' 'https://-/mcp/' \
-            'https://api.premiselabs.co:8443x/mcp/' 'https://api.premiselabs.co%40evil.example/mcp/'; do
+            'https://api.premiselabs.co:8443x/mcp/' 'https://api.premiselabs.co%40evil.example/mcp/' \
+            'https://host:65536/mcp/' 'https://host:-1/mcp/' 'https://a..b/mcp/' \
+            'https://api.premiselabs.co|evil.example/mcp/' 'https://a^b.example/mcp/' \
+            'https://a<b.example/mcp/' 'https://١.example/mcp/'; do
   python3 - "$DEST/.mcp.json" "$_bad" <<'PY'
 import json, sys
 p, u = sys.argv[1], sys.argv[2]
@@ -1839,6 +1842,77 @@ PY
     && ok "...and install REPAIRS it into the hosted default, so verify converges ($_bad)" \
     || fail "install did not converge from a no-host _selfHosted entry ($_bad): verify still fails (rc=$rc) — a cell that can never come up"
 done
+# ⛔ THE REFUSE SIDE ALONE IS HALF A GATE, AND THE OTHER HALF IS THE ONE THAT BREAKS A BOX (#3374
+# review, round 2 P3). A predicate that over-blocks does not fail safe — `merge-mcp.py` REPLACES
+# what it cannot certify, so refusing a spelling that WORKS silently destroys an operator's config
+# and repoints them at an endpoint they have no key for. Every shape below is one `new URL(u)`
+# ACCEPTS (measured), so it must stay certified AND preserved:
+#   bare `host:` (URL reads no port) · trailing root dot · underscore · IDN (punycoded by URL) ·
+#   an already-punycoded host · `[v6]:port` · loopback over plain http · a non-default port.
+for _good in 'https://localhost:8000/mcp' 'http://localhost:8000/mcp' \
+             'https://127.0.0.1:8000/mcp' 'http://[::1]:8000/mcp' \
+             'https://myhost.example./mcp/' 'https://my_host:8000/mcp' \
+             'https://host:/mcp/' 'https://münchen.example/mcp/' \
+             'https://xn--mnchen-3ya.example/mcp/' 'https://api.premiselabs.co:8443/mcp/'; do
+  python3 - "$DEST/.mcp.json" "$_good" <<'PY'
+import json, sys
+p, u = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "url": u, "_selfHosted": True,
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+  run_install
+  run_verify
+  rc=$?
+  [ "$rc" -eq 0 ] && grep -qF "SELFHOSTED:$_good" "$LOG" \
+    && ok "a usable self-host is PRESERVED and certified — no over-block ($_good)" \
+    || fail "a self-host the CLIENT accepts ($_good) was refused or replaced (rc=$rc) — a false block on a working config, and for a self-host the repair destroys it"
+done
+# ⛔ AND THE TWO COPIES MUST AGREE — THE FILE SAYS SO TWICE AND NOTHING CHECKED IT (#3374 review,
+# round 2 P3). `cell-install.sh`'s marker and `merge-mcp.py` both claim "the SAME predicate under the
+# SAME name", and drift in EITHER direction is a severe defect this PR exists to close: install
+# preserving what verify refuses is a cell that can never come up; install refusing what verify
+# accepts silently replaces a working self-host. Driven over one table through BOTH implementations.
+python3 - "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/pi-bootstrap/cell-install.sh" <<'PY' \
+  && ok "the marker's authority_names_a_host and merge-mcp.py's agree on every shape (no drift)" \
+  || fail "the two copies of authority_names_a_host DISAGREE — install and verify no longer judge the same url the same way"
+import importlib.util, re, sys
+table = ["https://api.premiselabs.co/mcp/", "http://localhost:8000/mcp", "https://127.0.0.1:8000/mcp",
+         "http://[::1]:8000/mcp", "http://[::2]:8000/mcp", "https://api.premiselabs.co./mcp/",
+         "https://my_host:8000/mcp", "https://host:/mcp/", "https://münchen.example/mcp/",
+         "https://xn--mnchen-3ya.example/mcp/", "https://:8443/mcp/", "https://my daemon:8000/mcp",
+         "https://./mcp/", "https://-/mcp/", "https://api.premiselabs.co:8443x/mcp/",
+         "https://api.premiselabs.co%40evil.example/mcp/", "https://host:65536/mcp/",
+         "https://host:-1/mcp/", "https://a..b/mcp/", "https://api.premiselabs.co|evil.example/mcp/",
+         "https://a^b.example/mcp/", "https://a<b.example/mcp/", "https://١.example/mcp/",
+         "https://api.premiselabs.co:8443/mcp/"]
+spec = importlib.util.spec_from_file_location("mm", sys.argv[1])
+mm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mm)
+# the marker's copy, exec'd from the heredoc it really runs from (not a paraphrase)
+src = open(sys.argv[2]).read()
+start = src.index("def _port_ok(")
+end = src.index("    return all(_label_ok(lab) for lab in labels)") + len("    return all(_label_ok(lab) for lab in labels)")
+ns = {"re": re, "ipaddress": __import__("ipaddress")}
+try:
+    import idna as _pkg
+    ns["idna"] = _pkg
+except ImportError:
+    pass
+exec(compile(src[start:end], "<marker>", "exec"), ns)
+marker_p = ns["authority_names_a_host"]
+for u in table:
+    m = re.match(r"^[a-z][a-z0-9+.\-]*://([^/?#]*)", u, re.I)
+    auth = m.group(1) if m else ""
+    if mm.authority_names_a_host(auth) != marker_p(auth):
+        print("DRIFT on %r: merge-mcp.py=%r marker=%r" % (
+            u, mm.authority_names_a_host(auth), marker_p(auth)), file=sys.stderr)
+        sys.exit(1)
+sys.exit(0)
+PY
 # ⛔ THE TEMPLATE READ WAS THE ONE REMAINING RAW TRACEBACK ON THE **VERIFY** SIDE (#3374 review P3).
 # `merge-mcp.py` got a named FATAL for a template that is missing, unparseable, or the wrong SHAPE;
 # the marker kept `json.load(open(...))` then `tpl.get(...)`, so all of them raised straight out and
@@ -1860,7 +1934,50 @@ for _tpl in "$TMP/tpl-corrupt.json" "$TMP/tpl-list.json" "$TMP/tpl-srv.json" "$T
     && ok "the verifier names an unusable TEMPLATE (BADTPL:) instead of raising — $(basename "$_tpl")" \
     || fail "an unusable template ($(basename "$_tpl")) produced rc=$rc / '${out:0:60}' instead of a named BADTPL refusal (a traceback in the marker leaves the operator with 'marker: none' and no cause)"
 done
-rm -f "$TMP/tpl-list.json" "$TMP/tpl-srv.json" "$TMP/tpl-corrupt.json" "$MARKER_FN"
+# ⛔ A TEMPLATE WHOSE `tortoise.url` IS NOT A STRING WAS A TRACEBACK ON ONE SIDE AND A **WRONG
+# SENTENCE** ON THE OTHER (#3374 review, round 2 P3). The merge's guard checked only that `url` was
+# TRUTHY, so `"url": 123` died at `(want.get("url") or "").strip()` — AttributeError, rc=1, file
+# unchanged, i.e. the repair path could not repair it. The verifier had the mirror: `want_url` became
+# an int, so `url != want_url` fired and `--verify` printed `URL_NOT_DEFAULT:` against the cell's
+# CORRECT hosted entry — a refusal sentence asserting the right config is wrong. Both name it now.
+printf '{"mcpServers":{"tortoise":{"url":123,"headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}}}' > "$TMP/tpl-inturl.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/tpl-inturl.json" "$DEST/.mcp.json" --cell > "$TMP/inturl.out" 2>&1
+rc=$?
+[ "$rc" -eq 3 ] && grep -qF 'declares a tortoise url of type int' "$TMP/inturl.out" && ! grep -q 'Traceback' "$TMP/inturl.out" \
+  && ok "a template whose tortoise url is not a string is a named FATAL (exit 3), not a traceback" \
+  || fail "a non-string template url produced rc=$rc / '$(head -1 "$TMP/inturl.out" | cut -c1-60)' — the repair path cannot run, which is the contract the template guard declares closed"
+out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$DEST/.mcp.json" "$TMP/tpl-inturl.json" 2>&1)"
+rc=$?
+case "$out" in BADTPL:*) _named=1 ;; *) _named=0 ;; esac
+[ "$rc" -eq 1 ] && [ "$_named" -eq 1 ] && ! grep -q 'URL_NOT_DEFAULT' <<<"$out" \
+  && ok "...and --verify names the TEMPLATE instead of blaming the cell's correct hosted entry" \
+  || fail "a non-string template url made --verify answer '$out' — it must name the template, never assert the cell's correct entry is not the hosted shape"
+# ⛔ A MARKER IS ECHOED INTO LOGS THAT GET PASTED INTO ISSUES (#3374 review, round 2 P3). `redact()`
+# only matches `tt_`/`tk_` token shapes, so `INSECURE_URL:http://user:hunter2@evil.example/mcp/` put
+# a PASSWORD in the bring-up log while correctly refusing the entry. Every url-echoing marker now
+# goes through `shown_url()`, which replaces the userinfo wholesale. Fails closed already — this is
+# a leak, not a false PASS, and a leak in a fleet-wide log is the one that outlives the run.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "url": "http://user:hunter2-secret@evil.example/mcp/", "_selfHosted": True,
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+for _kind in marker verify; do
+  if [ "$_kind" = marker ]; then
+    out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$DEST/.mcp.json" "$ROOT/templates/.mcp.base.json" 2>&1)"
+  else
+    run_verify; out="$(cat "$LOG")"
+  fi
+  case "$out" in *hunter2-secret*) _leak=1 ;; *) _leak=0 ;; esac
+  [ "$_leak" -eq 0 ] && ok "no credential reaches the log through $_kind (url userinfo is redacted)" \
+    || fail "$_kind echoed a url USERINFO into the log verbatim — the password lands in any issue or PR that pastes it"
+done
+rm -f "$TMP/tpl-list.json" "$TMP/tpl-srv.json" "$TMP/tpl-corrupt.json" "$TMP/tpl-inturl.json" "$MARKER_FN"
 # ⛔ A `headers` THAT IS NOT AN OBJECT IS REFUSED BY NAME **AND** REPAIRABLE BY INSTALL. `.get` on a
 # str/list raised before the write on the install side and left an EMPTY marker on the verify side,
 # so `--install` — the repair path — could not fix the entry either: the "config nothing can repair"
