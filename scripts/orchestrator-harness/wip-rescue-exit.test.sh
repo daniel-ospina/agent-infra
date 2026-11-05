@@ -542,6 +542,16 @@ PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" PI_LOG="$O/pi8.log" bash -c '
 arm "$O/logs/unknown.log"
 ck "N6 an unreadable default is REFUSED (refused-unknown-default), never pushed on {main,master} alone" \
   $(grep -q 'refused-unknown-default' "$O/logs/unknown.log" && ! git -C "$BARE" rev-parse -q --verify refs/heads/trunk >/dev/null 2>&1 && echo 0 || echo 1)
+# ⛔ N6b — THE VERDICT MUST ALSO REACH `next=` (review, PR #3399 P2). N6 above asserted the push verdict
+# only, so `refused-unknown-default` was assigned by `lane_end_push`, matched NO arm in `lane_end_next`,
+# and fell through to the generic `unpushed-only` sentence — which says "the commits are in the local
+# object store, not on origin" and never says they die with the VOLUME. Measured before the fix: the
+# marker read `next=the tree was clean but commit(s) on trunk were not pushed (push=refused-unknown-default)`
+# with no MANUAL and no do-not-reap. The reclaim pass reads `next=`, so this arm is the one that matters.
+mk6="$O/state/lane-exit-unknown_default.state"
+[ -s "$mk6" ] && grep -qx 'push=refused-unknown-default' "$mk6" \
+  && grep -q '^next=MANUAL' "$mk6" && grep -qi 'do NOT reap' "$mk6" && grep -qi 'volume' "$mk6"; rcn6b=$?
+ck "N6b …and next= is MANUAL with an explicit do-not-reap and the volume consequence, not the generic 'in the local object store' sentence [$(grep '^next=' "$mk6" 2>/dev/null | cut -c1-70)]" $rcn6b
 # ⛔ N7 — next= must not name an archive ref that cannot exist (review cycle 2, finding 3, REPRODUCED:
 # a clean, successfully-pushed tree was told to `git fetch origin refs/wip/…`, which fails).
 grep -q '^next=nothing to recover' "$O/state/lane-exit-unpushed_exit.state" 2>/dev/null \
@@ -573,7 +583,7 @@ ck "N8b …and the fixture precondition holds: WT2 is BEHIND origin/durable, so 
 mkdir -p "$TMP/trO/state"
 O="$TMP/trO" bash -c '
   . "$1"
-  LANE_END_LOG="$2/tr.log"; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_DIRTY=0
+  LANE_END_LOG="$2/tr.log"; LANE_END_ROOT=/x; LANE_END_BRANCH=b
   LANE_END_MARKER_FRESH=1; LANE_END_PUSH=running
   lane_end_marker "keeps whole" 0 0
   printf() { case "$1" in end=ok*) return 1 ;; esac; builtin printf "$@"; }
@@ -587,8 +597,7 @@ ck "N10 …a TRUNCATED write is refused by the end sentinel (the whole file stay
 # `fix-one.sh` runs `run_agent` more than once in one shell, so the marker is rewritten for a NEW terminal).
 O="$TMP/trO" bash -c '
   . "$1"
-  LANE_END_LOG=/dev/null; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_DIRTY=0
-  LANE_END_MARKER_FRESH=1; LANE_END_PUSH=pushed; LANE_END_TREE=clean
+  LANE_END_LOG=/dev/null; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_MARKER_FRESH=1; LANE_END_PUSH=pushed; LANE_END_TREE=clean
   lane_end_marker "twice" 0 0
   LANE_END_MARKER_FRESH=1; LANE_END_PUSH=refused-protected; LANE_END_TREE=dirty
   lane_end_marker "twice" 1 0
@@ -647,6 +656,32 @@ chk_hub=$(awk '/^lane_end_push\(\)/,/^}/' "$GATE" 2>/dev/null | grep -c 'LANE_EN
 [ "$chk_hub" = 1 ] && grep -q 'rev-parse --git-dir' "$GATE" 2>/dev/null \
   && grep -q 'rev-parse --git-common-dir' "$GATE" 2>/dev/null; rcn15=$?
 ck "N15 …a hub checkout (git-dir == git-common-dir) is refused BY NAME in lane_end_push, not merely skipped by luck" $rcn15
+# ⛔ N15b — AN UNREADABLE DISCRIMINATOR IS A REFUSAL, NOT "NOT A HUB" (review, PR #3399 P2). The guard
+# used to be `[ -n "$gd" ] && [ -n "$cd" ] && [ "$gd" = "$cd" ]`, so a read that answered NOTHING skipped the
+# hub refusal entirely and fell through to the push. N15 above only greps the block's existence, which
+# cannot see that: this arm makes ONE read fail and requires the lane to refuse. Reachability is depth
+# (`--git-common-dir` exists since git 2.5), and the point is not the odds — it is that inside one
+# function the same doctrine must not be applied to one measurement and skipped for the next.
+mkdir -p "$TMP/bin-nocommondir"
+{ printf '#!/bin/sh\ncase " $* " in *" --git-common-dir "*) exit 1 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-nocommondir/git"
+chmod +x "$TMP/bin-nocommondir/git"
+git -C "$WT" worktree add -q "$TMP/wtshape" -b shapeunknown 2>/dev/null
+pi_stub unpushed
+: > "$O/logs/shape.log"
+PATH="$TMP/bin-nocommondir:$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "shape unknown" >>"$4.agent" 2>&1
+' _ "$GATE" "$TMP/wtshape" "$O" "$O/logs/shape.log" "$PROMPT"
+arm "$O/logs/shape.log"
+grep -q 'could NOT establish whether' "$O/logs/shape.log" && ! git -C "$BARE" rev-parse -q --verify refs/heads/shapeunknown >/dev/null 2>&1; rcn15b=$?
+ck "N15b …and an UNREADABLE git-common-dir is REFUSED before any push (nothing reached origin), naming the failed read — not treated as 'therefore not a hub'" $rcn15b
+mk15b="$O/state/lane-exit-shape_unknown.state"
+[ -s "$mk15b" ] && grep -qx 'push=UNAVAILABLE' "$mk15b" && grep -q '^next=MANUAL' "$mk15b"; rcn15c=$?
+ck "N15c …and the artifact says push=UNAVAILABLE with next=MANUAL, so a reclaim pass cannot read an unknown shape as safe" $rcn15c
 # ⛔ N16 — THE CLONE-REF LEG OF THE LANDING CHECK (review cycle 4, gap 2): with the remote's own answer
 # unavailable, a clone whose refs/remotes/origin/HEAD still names the renamed default must refuse THAT name.
 git -C "$WT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk 2>/dev/null
@@ -717,7 +752,7 @@ ck "N18 …a failed state-dir create AND a failed mktemp both say so loudly (no 
 mkdir -p "$TMP/mkO/state"
 O="$TMP/mkO" bash -c '
   . "$1"
-  LANE_END_LOG=/dev/null; LANE_END_ROOT=/x; LANE_END_BRANCH=b; LANE_END_DIRTY=0
+  LANE_END_LOG=/dev/null; LANE_END_ROOT=/x; LANE_END_BRANCH=b
   LANE_END_MARKER_FRESH=1; LANE_END_PUSH=running
   lane_end_marker "marker keep" 0 0
   # ENOSPC'"'"'s shape, made deterministic: the directory refuses the NEXT create while the existing file
@@ -736,7 +771,6 @@ chmod 700 "$TMP/mkO/state" 2>/dev/null
 ck "N9 …and a failed FINAL marker write leaves the earlier one intact (push=running still on disk, not an absence)" $rcn9
 grep -q 'INJ=1' "$TMP/n9.out"; mkmk=$?
 ck "N9b …and the injection is real on THIS host (the in-window probe: a create in the 0500 state dir FAILED, so N9 cannot pass vacuously) [probe=$(head -1 "$TMP/n9.out" 2>/dev/null)]" $mkmk
-git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 git -C "$WT2" reset -q --hard "$seed2"; git -C "$WT2" clean -qfd
 
 # ── E) A MISSING RESCUER IS LOUD, NOT A SILENT SKIP ─────────────────────────────────────────────
