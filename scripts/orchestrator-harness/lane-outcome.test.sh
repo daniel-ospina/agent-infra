@@ -276,6 +276,23 @@ hasnt "$(cat "$(LOG)" 2>/dev/null)" "credential \$" \
     "1f3c …nor does any line call the credential MISSING for a verdict about the FILE"
 has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
     "1f4 …it names the FILE the operator must repair or delete"
+# ⛔ AND NO REMEDY NAMES A VARIABLE THAT DOES NOT EXIST (round 25, P3, measured): on a box with NO models.json template
+# the gate sets `KEY_GATE_VAR` to the literal `<none>`, and the store sentence below printed "exporting $<none>" — a
+# shell token, inside an instruction the operator is meant to follow. The clause is now dropped when there is no name.
+# (A REAL templateless fixture: with the fixture's own models.json present the sentence names a real variable, so the
+# first cut of this arm was green for the wrong reason — it must be driven on the shape that PRODUCES `<none>`.)
+mk_arm storenotemplate; WT="$ARMWT"
+rm -f "$ARMDIR/home/.pi/agent/models.json"
+printf '{"deepseek":{"key":"sk_legacy_no_type"}}\n' > "$ARMDIR/home/.pi/agent/auth.json"
+PI_MARK="$ARMDIR/pi-ran"; export PI_MARK
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi 2>/dev/null || true
+drive "$WT"
+check_terminal "1h" refused "key-gate:store-invalid:<none>" 82
+hasnt "$(cat "$(LOG)" 2>/dev/null)" 'exporting $<none>' \
+    "1f5 …and no remedy tells an operator to export the sentinel $<none>, on the shape that produces it"
+has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
+    "1h2 …while the remedy still names the file to repair"
 # ⛔ AND THE SECOND STORE REASON HAS ITS OWN ARM (round 24, P2, measured): `auth-store-unreadable` is a DIFFERENT arm
 # of the gate (`key-gate.sh`'s rc 6), and the token/prose guards above were written for `store-invalid` only — deleting
 # the `KEY_GATE_REASON="auth-store-unreadable"` assignment left BOTH suites fully green, because the gate's PRINTED
