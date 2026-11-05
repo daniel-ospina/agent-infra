@@ -3925,7 +3925,7 @@ remove_one() {
         # The post-archive cleanliness re-check exists to catch a gitignored NON-EPHEMERAL file that
         # appeared in the window ("would be deleted with the checkout — silently"). Capturing a
         # verdict in the `clean` position below is only worth anything if it is the LAST cleanliness
-        # read before the fork — and the evidence ladder that follows it is up to NINE bounded probes
+        # read before the fork — and the evidence ladder ABOVE it is up to NINE bounded probes
         # (the manifest read, `lane_evidence_present` once per tolerated root, and per root a link
         # probe + a directory probe + the walk in `evidence_signature`), EACH at
         # `REAP_WT_REMOVE_TIMEOUT` = 120 s, i.e. up to ~18 min at the defaults. A gate placed BEFORE
@@ -3978,15 +3978,20 @@ remove_one() {
                 rm -f "$out"; return 2
             fi
         elif [ "$ev_before" != "<none>" ]; then
-            # NOT silent (review of #3422 round 11, P3; condition corrected in review of #3422, P3):
-            # tolerated evidence that was there BEFORE the archive and GONE after it means the
-            # comparison's own precondition was waived. ⛔ THE OLD CONDITION ALSO REQUIRED
-            # `ev_before != ev_archived`, which made the note UNREACHABLE in exactly the ordering its
-            # own message describes: evidence present before the signature and still present at
-            # capture gives `ev_before == ev_archived`, and if the lane then removes it mid-archive
-            # the note was skipped silently — a waived gate that says nothing, which is the class this
-            # note exists to prevent. Nothing is lost (the archive holds what was captured), so this
-            # is not a preserve — but it is named.
+            # NOT silent (review of #3422 round 11, P3). ⛔ NO CLAUSE BEYOND "there was tolerated
+            # evidence and there is none now" IS NEEDED, and the round-15 review PROVED the removed
+            # `&& [ "$ev_before" != "$ev_archived" ]` clause was a no-op on every REACHABLE state:
+            # this branch is only entered when `ev_now` is `<none>`, and getting past the name
+            # comparison above with `ev_now == <none>` forces `ev_archived` to be empty or `<none>`,
+            # so for any `ev_before != <none>` the second clause is always TRUE. (Enumerated; the one
+            # combination where the two forms could differ takes the `if` branch above instead.)
+            # ⛔ AND THE CASE IT WAS SAID TO HIDE BEHIND IS NOT SILENT EITHER — evidence present at
+            # the signature AND at capture, then removed mid-archive, leaves `ev_now == <none>` while
+            # `ev_archived` is set, which the NAME comparison above returns as `REMOVE-SKIP … lane
+            # evidence changed after the archive`, not as a note. So the clause was redundant rather
+            # than harmful, and this branch is reachable whenever tolerated evidence vanished between
+            # capture and now. Nothing is lost (the archive holds what was captured), so this is not
+            # a preserve — but it is named.
             log "REMOVE-NOTE $path tolerated lane evidence vanished during the archive (was '$ev_before') — the before-signature is waived; what existed at capture time is in the archive"
         fi
         # ⛔ RE-CHECK #2 AGAIN, AFTER THE ARCHIVE (review of #3405 round 5, P3) — and DELIBERATELY THE
@@ -3996,7 +4001,11 @@ remove_one() {
         # admitted by a `clean` read taken BEFORE it existed — and the archive's own `git status` does
         # not list ignored entries, so it would not even be recorded as evidence. A `clean` captured in
         # the archive proves the checkout was clean at CAPTURE time; it does not prove it is clean now.
-        # Placed last, this is the one gate that closes the whole window the archive opened.
+        # Placed here, this narrows the window the archive opened from the ladder's ~18 min down to
+        # the `holder_recheck` probes below (~25 s at the defaults: `canonicalize`, the bounded `ps`
+        # reads and the bounded cwd probes). It does NOT close that last span — `holder_recheck` is a
+        # LIVENESS probe and cannot see a `.env` written during it — so the claim is "the last
+        # CLEANLINESS read is last but one", not "the window is closed".
         crumb="$(clean_gate "$path")"
         cverdict="${crumb%%$'\t'*}"
         cpay="${crumb#*$'\t'}"
