@@ -395,20 +395,72 @@ esac
 # drift in ungated and the census still reads green — the corpus-drift failure this repo already
 # guards by asserting populations as equalities (`spawn-gate.test.sh`'s pi-invoker equality,
 # `wt-lifecycle.test.sh` L9). The population is DERIVED from the source, so a new caller reds HERE.
-  # ⛔ NO `xargs -r`: it is a GNU EXTENSION with no macOS spelling, so this arm — the census of the
-  # `wt_provision` callers — died on the fleet's Darwin boxes with `illegal option -- r`, captured an
-  # EMPTY population and reported "population DRIFTED (found: '')" against an unmodified tree (review
-  # round 6, P2). That is the test-of-the-HOST class this PR fixes for `df` in three other suites,
-  # reintroduced as a test of the PLATFORM. The `grep -v` guarantees a non-empty stream on a real tree,
-  # and on an empty one `xargs` runs nothing either way — the `-r` bought nothing.
-_census_pop="$(grep -rlE '^[[:space:]]*(if[[:space:]]+)?wt_provision[[:space:]]' --include='*.sh' "$HERE" \
-  | grep -v '\.test\.sh$' | xargs -n1 basename | sort | tr '\n' ' ')"
+# ⛔ NO `xargs` AT ALL (review round 6, P2 — and round 7 corrected its reasoning). The round-6 note
+  # said `xargs -r` was dropped as a GNU extension because "on an empty one `xargs` runs nothing either
+  # way — the `-r` bought nothing". MEASURED round 7: that is FALSE. On empty input, GNU `xargs`
+  # WITHOUT `-r` still runs the command once with no arguments, so `basename` printed
+  # `Try 'basename --help' for more information.` to stderr — exposed by the doc-comment probe below,
+  # which is the one derivation input that legitimately matches NOTHING. `-r` bought exactly the
+  # empty-input behaviour it was removed for, and its absence is a stderr leak on a real path. A
+  # `while read` loop runs ZERO times on empty input on every platform, so the datum is kept and the
+  # extension is not needed.
+# ⛔ ONE DERIVATION, CALLED BY THE CENSUS AND BY ITS OWN NON-VACUITY PROOFS BELOW (the `arm_of`
+# idiom). A second copy of the regex would let the census regress while its proof still passed — the
+# round-3 defect that idiom was written for.
+#
+# ⛔ AND THE PATTERN MUST SEE EVERY SPELLING A NEW CALLER MAY USE (review round 7, P1 — MEASURED).
+# The round-6 pattern was anchored at line start and admitted only an optional literal `if `, so BOTH
+# plausible 4th-caller spellings were INVISIBLE while the census still read green:
+#     if ! wt_provision …        (`!` follows `if `)
+#     WT_RC=$(wt_provision …)    (the line starts with an assignment)
+# So the equality below proved "no new BARE caller appeared", not "no new caller appeared" — and the
+# three verified callers (adopt-fix.sh:38, dispatch-merge.sh:301, fix-one.sh:231) are all bare, which
+# is exactly what kept the hole hidden. The token is now matched wherever it STARTS A COMMAND: at line
+# start, or after any non-alphanumeric character (`$(`, `;`, `&&`, whitespace), with `[^#]*` unable to
+# cross a `#` so a commented-out call (wt-lifecycle.sh:365's own doc line) is not counted as a caller,
+# and `[^[:alnum:]_.-]` keeping longer words (`my_wt_provision`, `wt_provision_helper`) out.
+census_pop() { # <dir> -> space-separated basenames of the files holding a wt_provision CALL
+  grep -rlE '^([^#]*[^[:alnum:]_.-])?wt_provision[[:space:]]' --include='*.sh' "$1" \
+    | grep -v '\.test\.sh$' | while IFS= read -r _cf; do basename "$_cf"; done | sort | tr '\n' ' '
+}
+_census_pop="$(census_pop "$HERE")"
 _census_want='adopt-fix.sh dispatch-merge.sh fix-one.sh '
 if [ "$_census_pop" = "$_census_want" ]; then
   ok "H) the wt_provision caller population is EXACTLY the censused set (${_census_want% })"
 else
   bad "H) the wt_provision caller population DRIFTED — a caller is ungated (found: '${_census_pop% }', censused: '${_census_want% }'). Add it to arm H's list and to the rc-4 mapping."
 fi
+
+# ⛔ THE PATTERN'S COVERAGE IS DRIVEN, NOT ASSERTED IN A COMMENT (review round 7, P1 — MEASURED). The
+# equality above can only red for a spelling the pattern ALREADY SEES: measured on a scratch tree of
+# this head, injecting a 4th caller as `if ! wt_provision …` left the suite at 55 passed / 0 failed,
+# while the bare control red it. Each spelling therefore gets a probe file and the SAME `census_pop`,
+# so a regression in the derivation breaks the proof too.
+_pd="$T/census-probe"; mkdir -p "$_pd"
+for _probe in \
+  'bare:wt_provision "$R" "$W" "$B" "$BASE"' \
+  'if-bang:if ! wt_provision "$R" "$W" "$B" "$BASE"; then' \
+  'assignment:WT_RC=$(wt_provision "$R" "$W" "$B" "$BASE")'
+do
+  _name="${_probe%%:*}"; _body="${_probe#*:}"
+  printf '%s\n' "$_body" > "$_pd/zz-$_name.sh"
+  case "$(census_pop "$_pd")" in
+    *"zz-$_name.sh"*)
+      ok "H) the census SEES a caller written as '$_name' — a 4th caller in that spelling cannot drift in blind" ;;
+    *)
+      bad "H) the census is BLIND to a caller written as '$_name' — a 4th caller in that spelling would drift in ungated while the population still read green" ;;
+  esac
+  rm -f "$_pd/zz-$_name.sh"
+done
+# The other half, so the census does not red on PROSE: a doc line that merely names the seam is not a
+# call site, and `wt-lifecycle.sh` carries one (`# wt_provision <repo> …`).
+printf '%s\n' '# wt_provision <repo> <worktree-path> <branch> [base]' > "$_pd/zz-doc.sh"
+case "$(census_pop "$_pd")" in
+  *zz-doc.sh*)
+    bad "H) the census counts a DOC COMMENT as a caller — prose about the seam is not a call site, and this arm would red on an unmodified tree" ;;
+  *)
+    ok "H) the census does NOT count a doc comment that merely names wt_provision" ;;
+esac
 
 # ⛔ READ THE `echo` LINES ONLY, NEVER THE COMMENTS (review round 6, self-caught — MEASURED). The
 # first version of this pin extracted from the `elif` line onwards, so the COMMENT above the echo — which
