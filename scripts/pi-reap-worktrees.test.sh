@@ -921,8 +921,9 @@ ANCHORS = {
     ),
     # ── G15 (the harness pin-tree veto, #10114) ── ONE ANCHOR PER INPUT of the veto: the record probe,
     # the shape backstop, the `$HOME` guard, the sha-record derivation, the NORMALISATION of that derivation,
-    # the QUOTING of the `$HOME` element, the `$CELL_HOME` element, and the ABSOLUTENESS of the record
-    # content. ⛔ NO COUNT IN THIS SENTENCE ON PURPOSE: it read "four" over five entries and then "six"
+    # the QUOTING of the `$HOME` element, the `$CELL_HOME` element, the ABSOLUTENESS of the record
+    # content, the ABSOLUTENESS of the `pin_root` ARM, and the FAIL-CLOSED arm for an UNREADABLE record.
+    # ⛔ NO COUNT IN THIS SENTENCE ON PURPOSE: it read "four" over five entries and then "six"
     # over seven, and a numeral that has to be maintained by hand is a claim this file cannot keep true.
     # The dict is the count.
     # The veto shipped with no mutation leg at all, and that is precisely how two of its assertions
@@ -988,6 +989,26 @@ ANCHORS = {
     "no-cell-home-record": (
         "\"$cellpin\" \"${home:+\"$home/.harness-path\"}\"",
         "\"${home:+\"$home/.harness-path\"}\"",
+    ),
+    # (7) delete the ABSOLUTENESS guard on the `pin_root` ARM itself. ⛔ THE MISSING TWIN: (4c) above
+    # guards the record CONTENT and had a leg; the ARM that NAMES the record (`:3141`) is load-bearing
+    # for cwd-independence and had NEITHER a fixture NOR a leg — so a tidy-up could delete it and the
+    # suite stayed green. With it gone a RELATIVE `$HARNESS_PIN` derives a root from wherever the reaper
+    # was invoked: one box, two cwds, two verdicts, on a veto whose miss is a REMOVAL. G15r runs the same
+    # relative spelling from two cwds and asserts `reclaimable` from BOTH; this mutant answers `pin-tree`
+    # from the cwd where the relative path happens to resolve, and only there.
+    "no-pin-root-absoluteness": (
+        "    case \"$pin_root\" in /?*) : ;; *) pin_root=\"\" ;; esac",
+        "    :   # MUTANT: the $pin_root absoluteness guard is deleted",
+    ),
+    # (8) delete the FAIL-CLOSED arm for an UNREADABLE record. A bare `[ -r "$rec" ] || continue` made
+    # "cannot read it" and "it is not there" the same answer, so the ONE thing that says the box needs
+    # these bytes became "no evidence" and rule 3 removed the tree the box EXECUTES. Same class as
+    # `no-stash-unverifiable-arm` ("cannot read the register" read as "the register is clear") and as
+    # the truncated-scan arm in `holders_live`. Deleting the arm restores the fail-open; G15q must red.
+    "no-record-unreadable-failclosed": (
+        "            if [ -e \"$rec\" ] || [ -L \"$rec\" ] || { [ -d \"$_rdir\" ] && [ ! -x \"$_rdir\" ]; }; then",
+        "            if false; then   # MUTANT: the unreadable-record fail-closed arm is deleted",
     ),
 }
 s = open(src).read()
@@ -4862,6 +4883,16 @@ OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 
     run_reaper "$ENV" --dry-run --repo "$REPO")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$ROOTWT")")" "pin-tree-shape" \
     "G15h the pin ROOT itself (no <sha12> child, no record) is preserved by shape"
+# …and the SECOND variant this backstop names, `harness-next`. ⛔ IT WAS DRIVEN BY NO FIXTURE (review
+# cycle 5, P3): the `no-pin-tree-shape` anchor replaces the WHOLE four-way alternation, so deleting
+# just the two `harness-next` arms kept the suite green — the "a spelling no fixture drives" defect
+# this PR exists to remove, inside the backstop that rescues an unreadable record.
+NEXTWT="$T/$ENV/harness-next"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$NEXTWT" HEAD
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$NEXTWT")")" "pin-tree-shape" \
+    "G15h …and the harness-next variant is preserved by shape too (its two arms had NO fixture)"
 
 # G15i: `HOME` AND `CELL_HOME` BOTH UNSET — the ONLY configuration in which bare
 # `$HOME` aborts. `${CELL_HOME:-$HOME}` does NOT guard `$HOME`, and this file runs
@@ -5109,6 +5140,66 @@ OUT="$(cd "$T/$ENV" && REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MIN
 assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "reclaimable" \
     "G15o a RELATIVE record is DISCARDED, not resolved against the reaper's cwd (a cwd-dependent verdict on a veto whose miss is a removal)"
 
+# G15q: the UNREADABLE RECORD (review cycle 5, P2). `[ -r "$rec" ] || continue` made "cannot read
+# it" and "it is not there" the SAME answer, so the one record that says the box needs these bytes
+# became "no evidence" exactly when it could not be read — and rule 3 then removed the tree the box
+# EXECUTES. Same class as `no-stash-unverifiable-arm` ("cannot read the register" read as "the
+# register is clear") and as the truncated-scan arm in `holders_live`. The worktree path carries NO
+# `harness` component, so the shape backstop cannot mask the miss, and the first half asserts the
+# READABLE record preserves — without it the second half could be satisfied by a fixture that never
+# saw a record at all (the vacuity G15o was caught in).
+ENV=pin_tree_unreadable
+REPO="$(mk_repo "$ENV")"
+UNRWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$UNRWT" HEAD
+UNRREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$UNRWT/scripts/orchestrator-harness" >"$UNRREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$UNRWT")")" "pin-tree" \
+    "G15q precondition: the READABLE record preserves, so the fixture can see the record it unreads"
+if chmod 000 "$UNRREC" 2>/dev/null && [ -z "$(cat "$UNRREC" 2>/dev/null)" ]; then
+    OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper "$ENV" --dry-run --repo "$REPO")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$UNRWT")")" "pin-tree" \
+        "G15q an UNREADABLE record PRESERVES (cannot-read is NOT names-something-else)"
+    assert_contains "$(row_for "$OUT" "$UNRWT")" "UNREADABLE" \
+        "G15q …and the row says WHY, so the operator fixes permissions instead of losing the tree"
+else
+    echo "  → G15q unreadable-record leg skipped (chmod 000 did not block reading here)"
+fi
+chmod 644 "$UNRREC" 2>/dev/null || true
+
+# G15r: the `pin_root` ARM'S OWN ABSOLUTENESS (review cycle 5, P3). G15o/`no-record-absoluteness` pin
+# the guard on the record's CONTENT; the arm that NAMES the record is the same hazard and had NO
+# fixture at all — every `HARNESS_PIN_OVERRIDE` in this suite is absolute — so a tidy-up could delete
+# the guard at the top of `pin_tree_match` with the suite green. A relative `$HARNESS_PIN` that the
+# guard ACCEPTED would derive its root from wherever the reaper was invoked: one box, two cwds, two
+# verdicts, on a veto whose miss is a removal. Driven from BOTH cwds, because a single-cwd fixture
+# cannot tell a discarded record from a resolved one.
+ENV=pin_tree_relpinroot
+REPO="$(mk_repo "$ENV")"
+RPWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$RPWT" HEAD
+mkdir -p "$T/$ENV/pinroot/state"
+printf '%s\n' "$RPWT/scripts/orchestrator-harness" >"$T/$ENV/pinroot/.harness-path"
+printf '%s\n' "5b1b09aad2c1" >"$T/$ENV/pinroot/state/HARNESS-PIN"
+OUT="$(HARNESS_PIN_OVERRIDE="$T/$ENV/pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "pin-tree" \
+    "G15r precondition: the ABSOLUTE spelling derives the root and PRESERVES, so the fixture can see it"
+OUT="$(cd "$T/$ENV" && HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
+    "G15r a RELATIVE \$HARNESS_PIN is DISCARDED even from the cwd where it resolves"
+OUT="$(cd / && HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
+    "G15r …and from the cwd where it does not, so the verdict is not a function of the caller"
+
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
 # every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
@@ -5184,6 +5275,40 @@ OUT="$(cd "$T/pin_tree_relrec" && REAPER_OVERRIDE="$MUTP7" \
     run_reaper pin_tree_relrec --dry-run --repo "$T/pin_tree_relrec/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_relrec/opt/5b1b09aad2c1")")" "pin-tree" \
     "G15-M7 MUTATION: without the record absoluteness guard the RELATIVE record resolves against the reaper's cwd and PRESERVES, so G15o's discard assertion is discriminating (and the verdict is a function of the caller)"
+
+# G15-M8: delete the FAIL-CLOSED arm for an unreadable record. The mutant answers like the pre-fix
+# `[ -r "$rec" ] || continue` did — an unreadable record reads as "no record" — so the tree the box
+# EXECUTES falls to rule 3 and is RECLAIMED. ⛔ This is the assertion G15q exists for: "cannot read
+# the record" being read as "the record names something else", which is the same fail-open
+# `no-stash-unverifiable-arm` and the truncated-scan arm in `holders_live` were fixed for.
+MUTP8="$T/mutant-no-record-unreadable-failclosed.sh"
+mutate_reaper_anchored "$MUTP8" no-record-unreadable-failclosed
+UNRMUT="$T/pin_tree_unreadable/opt/5b1b09aad2c1"
+chmod 000 "$T/pin_tree_unreadable/home/.harness-path" 2>/dev/null || true
+if [ -z "$(cat "$T/pin_tree_unreadable/home/.harness-path" 2>/dev/null)" ]; then
+    OUT="$(REAPER_OVERRIDE="$MUTP8" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper pin_tree_unreadable --dry-run --repo "$T/pin_tree_unreadable/repo")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$UNRMUT")")" "reclaimable" \
+        "G15-M8 MUTATION: without the fail-closed arm an UNREADABLE record silently removes the tree => G15q is discriminating"
+else
+    echo "  → G15-M8 skipped (chmod 000 did not block reading here, so the mutant is unobservable)"
+fi
+chmod 644 "$T/pin_tree_unreadable/home/.harness-path" 2>/dev/null || true
+
+# G15-M9: delete the `pin_root` absoluteness guard. The mutant derives a root from a RELATIVE
+# `$HARNESS_PIN` resolved against the REAPER'S CWD, so the same tree is preserved when the reaper is
+# run where the relative path happens to resolve — a verdict that is a function of the caller. Driven
+# from the resolving cwd (where the mutant PRESERVES and the production code does not), which is the
+# only cwd where the two differ; G15r asserts BOTH cwds stay `reclaimable`.
+MUTP9="$T/mutant-no-pin-root-absoluteness.sh"
+mutate_reaper_anchored "$MUTP9" no-pin-root-absoluteness
+RPWT_M="$T/pin_tree_relpinroot/opt/5b1b09aad2c1"
+OUT="$(cd "$T/pin_tree_relpinroot" && REAPER_OVERRIDE="$MUTP9" \
+    HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_relpinroot --dry-run --repo "$T/pin_tree_relpinroot/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT_M")")" "pin-tree" \
+    "G15-M9 MUTATION: without the \$pin_root guard a RELATIVE spelling PRESERVES from the resolving cwd => G15r is discriminating"
 
 
 echo ""

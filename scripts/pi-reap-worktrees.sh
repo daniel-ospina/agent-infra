@@ -3070,7 +3070,7 @@ abstain_gate() {
 #       positive here costs DISK, never work: this probe can only PRESERVE.
 PIN_VERDICT=""; PIN_PROOF=""
 pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harness pin tree
-    local canon="$1" rec rec_t rec_c _t
+    local canon="$1" rec rec_t rec_c _t _rdir
     [ -n "$canon" ] || return 1
     PIN_VERDICT=""; PIN_PROOF=""
     # ⛔ `$HOME` IS GUARDED, AND THAT IS LOAD-BEARING (#10114 review P1). This file runs
@@ -3186,7 +3186,29 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     for rec in "${HARNESS_PIN_FILE:-}" "$cellpin" "${home:+"$home/.harness-path"}" "${pin_root:+"$pin_root/.harness-path"}"; do
 
         [ -n "$rec" ] || continue
-        [ -r "$rec" ] || continue
+        # ⛔ AN UNREADABLE RECORD IS NOT AN ABSENT ONE (#10114 review cycle 5, P2). A bare
+        # `[ -r "$rec" ] || continue` made the two indistinguishable, so the ONE thing that says the
+        # box needs these bytes read as "no evidence" the moment it could not be read — and rule 3 then
+        # removed the tree the box EXECUTES. That is the fail-open this PR exists to close, one step
+        # further out: `unreadable-path` is a PRESERVE everywhere else in this file (`:3346`, `:3351`),
+        # and `holders_live` was fixed to the same polarity when a TRUNCATED scan read as "no holder".
+        # A probe that cannot answer is not a NEGATIVE answer.
+        # ⛔ THE ASYMMETRY IS DELIBERATE: a record that is genuinely ABSENT still falls through. Its
+        # absence is EVIDENCE this probe is allowed to act on (it is what lets G15f reclaim a plain
+        # merged worktree, and preserving on absence would make the reaper inert). An UNREADABLE record
+        # is not evidence of anything, so it PRESERVES — a false positive here costs disk, never work.
+        # The fourth test covers the shape `-e` cannot see: a record under a directory that exists but
+        # cannot be searched (the TCC-protected / mixed-root case), where `[ -e ]` answers false for a
+        # path that is really there.
+        if [ ! -r "$rec" ]; then
+            _rdir="$(dirname "$rec")"
+            if [ -e "$rec" ] || [ -L "$rec" ] || { [ -d "$_rdir" ] && [ ! -x "$_rdir" ]; }; then
+                PIN_VERDICT="pin-tree"
+                PIN_PROOF="pin record $rec exists but is UNREADABLE (permissions?) — it may name this tree, and 'cannot read' is not 'names something else'; failed CLOSED"
+                return 0
+            fi
+            continue
+        fi
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"
         [ -n "$rec_t" ] || continue
         # ⛔ THE RECORD'S OWN CONTENT IS HELD TO THE SAME ABSOLUTENESS RULE (#10114 review P1), and the
