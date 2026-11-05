@@ -260,16 +260,39 @@
 #               itself is unreadable (the line still prints in every case: see cap_fleet_line_from)
 
 # ── seams (every one overridable so the suite is hermetic) ──────────────────────────────────────
-CAP_LPC_CEILING="${CAP_LPC_CEILING:-800}"      # hundredths of load-per-CPU => 8.00 (REFUSE line)
+# ⛔ A SEAM THE SHELL CANNOT COMPARE MUST NOT DISABLE ITS OWN GATE (fresh review round 11, P1). Every
+# comparison below is `[ "$x" -ge "$y" ]`, and an ERRORING test is FALSE — so a seam spelled the way the
+# docs themselves spell it in prose (`CAP_LPC_CEILING` = 8.00 load-per-cpu, the DECIMAL form) or a
+# 20-digit one made its gate error out, the diagnostic went to a stderr both emitters discard, and
+# placement answered `place=h1 … eligible=1` for a box that was over the ceiling, out of disk, out of
+# memory or unable to fork. ONE predicate, applied AT LOAD to every numeric ceiling/floor, so the gate
+# cannot be silently switched off by its own input: a value the shell cannot hold falls back to the
+# DEFAULT (never to 0, which would make every box ineligible — nor to the seam as typed) and says so on
+# stderr once, where a human running the command sees it. `cap_bound_secs` has done exactly this for the
+# timeout seams since round 8; this is the same shape for the placement bounds.
+cap_int_seam() {  # <name> <value> <default> -> the integer to APPLY, or the default (named)
+  case "${2:-}" in
+    ''|*[!0-9]*|0?*)
+      printf 'capacity.sh: %s=%s is not a plain integer (no sign, no decimal, no unit, no leading 0) — applying the default %s\n' \
+        "$1" "${2:-<empty>}" "$3" >&2
+      printf '%s' "$3"; return 0 ;;
+  esac
+  if [ "${#2}" -gt 12 ]; then
+    printf 'capacity.sh: %s=%s is beyond what this shell can represent — applying the default %s\n' "$1" "$2" "$3" >&2
+    printf '%s' "$3"; return 0
+  fi
+  printf '%s' "$((10#$2))"
+}
+CAP_LPC_CEILING="$(cap_int_seam CAP_LPC_CEILING "${CAP_LPC_CEILING:-800}" 800)"   # hundredths of load-per-CPU => 8.00 (REFUSE line)
 # ⛔ AND A SECOND, LOWER LINE — because "yield to the least-loaded peer" with no margin is a THRASH
 # machine: every box would stand down for any box that happens to be 1% idler, and the fleet would
 # dispatch nothing while all of it was healthy. `CAP_YIELD_AT_LPC` is the PREFER-ELSEWHERE line: a box
 # at or above it hands a candidate to a materially-less-loaded peer; a box below it TAKES the work,
 # whoever else is idler. That keeps throughput (a lightly-loaded box never stands down) while still
 # moving work OFF a box that is piling up — and it is a load-per-CPU line, never a lane count.
-CAP_YIELD_AT_LPC="${CAP_YIELD_AT_LPC:-400}"    # hundredths of load-per-CPU => 4.00
-CAP_MIN_DISK_MB="${CAP_MIN_DISK_MB:-500}"      # same floor spawn-gate.sh enforces before a spawn
-CAP_MIN_MEM_MB="${CAP_MIN_MEM_MB:-512}"        # same floor the controller's own mem gate uses
+CAP_YIELD_AT_LPC="$(cap_int_seam CAP_YIELD_AT_LPC "${CAP_YIELD_AT_LPC:-400}" 400)"  # hundredths of load-per-CPU => 4.00
+CAP_MIN_DISK_MB="$(cap_int_seam CAP_MIN_DISK_MB "${CAP_MIN_DISK_MB:-500}" 500)"      # same floor spawn-gate.sh enforces before a spawn
+CAP_MIN_MEM_MB="$(cap_int_seam CAP_MIN_MEM_MB "${CAP_MIN_MEM_MB:-512}" 512)"        # same floor the controller's own mem gate uses
 CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STALE, never eligible
 # ⛔ THE FORK MARGIN (agent-infra#2293): spare processes a box must still have before it may take
 # another lane. It is a MARGIN, not a cap: the incident's numbers are nowhere near it (cell-1 was
@@ -278,7 +301,7 @@ CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STA
 # git/gh/awk in the controller and its lanes -- and it is deliberately far below any healthy box's
 # reading so it cannot become the new Lane Cap Fetish the owner ruled out on 2026-10-17: nothing here
 # counts LANES, it asks whether this box can still SPAWN.
-CAP_MIN_FORK_HEADROOM="${CAP_MIN_FORK_HEADROOM:-200}"
+CAP_MIN_FORK_HEADROOM="$(cap_int_seam CAP_MIN_FORK_HEADROOM "${CAP_MIN_FORK_HEADROOM:-200}" 200)"
 # ⛔ THE EXPECTED SIDE OF THE FLEET LINE (#3446). Three seams, in the order cap_expected_boxes reads
 # them; every one is empty by default so nothing here changes a box that sets none of them.
 CAP_EXPECTED_BOXES="${CAP_EXPECTED_BOXES:-}"   # explicit roster: `<label>:<boxid>` or `<boxid>` tokens
@@ -803,6 +826,11 @@ cap_fork_bound() {
   p="$(cap_kv "$r" procs)"; m="$(cap_kv "$r" procs_max)"; f="$(cap_kv "$r" fork)"
   case "$p" in ''|*[!0-9]*) printf 'fork_unknown'; return 0 ;; esac
   case "$m" in ''|*[!0-9]*) printf 'fork_unknown'; return 0 ;; esac
+  # …and the fork pair gets the same width bound as every other numeric field (fresh review round 11):
+  # `cap_h_for` compares them, and an ERRORING comparison returns "unbounded" — the fail-OPEN direction
+  # for a box that cannot spawn. 12 digits is far above any real `ulimit -u`/proc count.
+  [ "${#p}" -le 12 ] || { printf 'fork_unknown'; return 0; }
+  [ "${#m}" -le 12 ] || { printf 'fork_unknown'; return 0; }
   case "$f" in
     '') printf 'fork_unknown'; return 0 ;;
     '1') : ;;
@@ -941,6 +969,13 @@ cap_bound_hit() {
   # repair. `10#` is the arithmetic, and a non-digit `now` is a refusal, not a guess.
   case "$at" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
   case "$now" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
+  # ⛔ THE CLOCK GETS THE SAME WIDTH BOUND, AND PLACEMENT MUST AGREE WITH THE LINE ABOUT IT (fresh review
+  # round 11, P2). The line refuses a `now` the shell cannot represent (`clock-unreadable`), but this
+  # path checked only that it was DIGITS: `CAP_NOW=18446744075502150016` wraps to the record's own `at`
+  # modulo 2^64, the age computes as 0, and placement certified `eligible=1` on bytes the line reports
+  # as UNREADABLE — the two readers disagreeing, which is the exact class rounds 9-10 closed for `at`.
+  [ "${#at}" -le 12 ] || { printf 'probe_unreadable'; return 0; }
+  [ "${#now}" -le 12 ] || { printf 'probe_unreadable'; return 0; }
   age=$(( 10#$now - 10#$at ))
   # ⛔ THE PLACEMENT PATH REFUSES ON THE SAME TWO DATUMS THE LINE REFUSES ON (fresh review round 9, P1).
   # An unusable TTL and a stamp beyond the window in the FUTURE are both "this record cannot be aged":

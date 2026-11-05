@@ -1772,12 +1772,17 @@ ck "  …mutation control: without the balance check the same cut reads 2 of 5 m
 # pre-fix body scored 60/60 rc 124 here (bare, `$( )`, and env-prefix invocations). So reverting the fix
 # would keep THIS arm green on this host; the arm exists to catch the hosts where the window really opens,
 # and the change stands on removing a scheduler dependence rather than on a reproduced failure.
-_t2_bad=0; _t2_i=0
+_t2_bad=0; _t2_i=0; _t2_rcs=""
 while [ "$_t2_i" -lt 12 ]; do
   CAP_BOUND_IMPL=watchdog cap_bounded 1 sleep 5 >/dev/null 2>&1
-  [ "$?" -eq 124 ] || _t2_bad=$(( _t2_bad + 1 )); _t2_i=$(( _t2_i + 1 ))
+  _t2_rc=$?
+  # ⛔ THE MISSING rc IS THE DIAGNOSIS (fresh review round 11). An earlier run of this suite scored 11/12
+  # under load and the arm said only "1 misses" — which is indistinguishable between the race this arm
+  # exists for (a lost sentinel) and a host artefact. Name the rc that was actually returned.
+  [ "$_t2_rc" -eq 124 ] && : || { _t2_bad=$(( _t2_bad + 1 )); _t2_rcs="$_t2_rcs $_t2_rc"; }
+  _t2_i=$(( _t2_i + 1 ))
 done
-ck "(t2) 12/12 timed runs report the TIMEOUT verdict (rc 124), never a lost-signal rc ($_t2_bad misses)" \
+ck "(t2) 12/12 timed runs report the TIMEOUT verdict (rc 124), never a lost-signal rc ($_t2_bad misses${_t2_rcs:+: rc${_t2_rcs}})" \
    "$([ "$_t2_bad" -eq 0 ] && echo 0 || echo 1)"
 # (a3) ⛔ THE BOUND'S stdout ISOLATION APPLIES TO EVERY ARM, NOT JUST THE WATCHDOG (fresh review round 6,
 # P1). Rounds 3-4 gave the child a FILE inside the watchdog arm only; `timeout`/`gtimeout` — what every
@@ -1974,6 +1979,69 @@ ck "(c17) a self-killed child is NOT reported as a timeout (rc=$_c17_rc, not 124
 _c17b_rc=$(CAP_BOUND_IMPL=auto cap_bounded 1 "$TMP/term-ignorer.sh" >/dev/null 2>&1; echo $?)
 ck "  …while the TERM-ignoring child still reports the timeout (rc=$_c17b_rc, and (c13) bounds its wall)" \
    "$([ "$_c17b_rc" -eq 124 ] && echo 0 || echo 1)"
+# (c18) ⛔ A CEILING THE SHELL CANNOT COMPARE SILENTLY DISABLES ITS OWN GATE (fresh review round 11, P1).
+# Every comparison is `[ "$x" -ge "$y" ]`, and an ERRORING test is FALSE: a seam spelled the way this
+# repo's own skills spell it in prose (`CAP_LPC_CEILING` = 8.00 load-per-cpu), or with a unit, or with 20
+# digits, made its gate error out — the diagnostic went to a stderr both emitters discard — and placement
+# answered `eligible=1` for a box that was over the ceiling, out of disk, out of memory, or unable to fork.
+# The seam is armed AT SOURCE (that is where it is normalised), so each arm sources a fresh subshell.
+plac() { # plac <file> <env-kv...> ; record on stdin
+  local f="$1"; shift
+  env "$@" bash -c '. "$1"; cap_place cmux' _ "$f" 2>/dev/null
+}
+_OVL="$(recf cmux 8 23840 0 120000 14000 "$NOW" 400 15041 1)"   # lpc=2980, over the 800 ceiling
+_DSK="$(recf cmux 8 56 0 100 14000 "$NOW" 400 15041 1)"          # disk=100, under a 500 floor
+_MEM="$(recf cmux 8 56 0 120000 100 "$NOW" 400 15041 1)"         # mem=100, under a 512 floor
+_FRK="$(recf cmux 8 56 0 120000 14000 "$NOW" 15041 15041 1)"     # procs=procs_max
+L38="$(printf '%s\n' "$_OVL" | plac "$CAP" CAP_LPC_CEILING=8.5)"
+ck "(c18) a DECIMAL ceiling is normalised, so the load gate still bites ($(printf '%s' "$L38" | head -1))" \
+   "$(q '^refuse bound=load_per_cpu' "$L38" && echo 0 || echo 1)"
+L39="$(printf '%s\n' "$_DSK" | plac "$CAP" CAP_MIN_DISK_MB=500G)"
+ck "  …a disk floor with a UNIT still refuses (disk=100)" \
+   "$(q '^refuse bound=disk' "$L39" && echo 0 || echo 1)"
+L40="$(printf '%s\n' "$_MEM" | plac "$CAP" CAP_MIN_MEM_MB=512MB)"
+ck "  …and a memory floor with a unit refuses a starved box (mem=100)" \
+   "$(q '^refuse bound=memory' "$L40" && echo 0 || echo 1)"
+L41="$(printf '%s\n' "$_FRK" | plac "$CAP" CAP_MIN_FORK_HEADROOM=0.2)"
+ck "  …and a decimal FORK margin refuses an exhausted box (procs=procs_max)" \
+   "$(q '^refuse bound=fork_headroom' "$L41" && echo 0 || echo 1)"
+L42="$(printf '%s\n' "$_OVL" | plac "$CAP" CAP_LPC_CEILING=99999999999999999999)"
+ck "  …and a 20-digit ceiling falls back to the DEFAULT (so the over-ceiling box is refused, not placed)" \
+   "$(q '^refuse bound=load_per_cpu' "$L42" && echo 0 || echo 1)"
+L43="$(printf '%s\n' "$(recf cmux 8 56 0 120000 14000 "$NOW" 400 15041 1)" | CAP_NOW="$NOW" plac "$CAP" CAP_LPC_CEILING=8.5)"
+ck "  …while a HEALTHY record still places under the same malformed ceiling (it is the gate, not a blanket refusal)" \
+   "$(q '^place=cmux' "$L43" && echo 0 || echo 1)"
+# (c18-mutant) NON-VACUITY: with the raw seam the SAME over-ceiling record is PLACED.
+sed 's|="$(cap_int_seam CAP_LPC_CEILING "${CAP_LPC_CEILING:-800}" 800)"|="${CAP_LPC_CEILING:-800}"|' "$CAP" > "$TMP/cap-rawlpc.sh"
+ck "  …the mutant really reinstated the raw seam" \
+   "$([ "$(grep -c '^CAP_LPC_CEILING="\${CAP_LPC_CEILING:-800}"' "$TMP/cap-rawlpc.sh")" -eq 1 ] && echo 0 || echo 1)"
+L38M="$(printf '%s\n' "$_OVL" | plac "$TMP/cap-rawlpc.sh" CAP_LPC_CEILING=8.5)"
+ck "  …mutation control: with the raw seam the SAME over-ceiling record is PLACED (${L38M%% *})" \
+   "$(q '^place=' "$L38M" && echo 0 || echo 1)"
+# (c19) ⛔ THE CLOCK IS A DATUM BOTH READERS AGE WITH, SO BOTH MUST REFUSE THE SAME BYTES (round 11, P2).
+# The line refused an unrepresentable `now` since round 10; `cap_place` read `CAP_NOW` straight through, so
+# `$((10#<20 digits>))` wrapped to the record's own `at`, the age computed as 0, and placement certified
+# `eligible=1` on precisely the bytes the line reports as `clock-unreadable`.
+_WREC="$(recf cmux 8 56 0 120000 14000 "$NOW" 400 15041 1)"
+L44L="$(CAP_NOW=18446744075502150016 CAP_EXPECTED_BOXES="cell-1:cmux" cap_fleet_line_from "$_WREC" 0 2>/dev/null)"
+L44P="$(printf '%s\n' "$_WREC" | plac "$CAP" CAP_NOW=18446744075502150016)"
+ck "(c19) an unrepresentable clock is UNREADABLE to the line and UNPLACEABLE to placement (one datum, one verdict)" \
+   "$(q 'why=clock-unreadable' "$L44L" && q '^refuse bound=probe_unreadable' "$L44P" && echo 0 || echo 1)"
+L44C="$(printf '%s\n' "$_WREC" | plac "$CAP" CAP_NOW="$NOW")"
+ck "  …while a representable clock still places (control: ${L44C%% *})" \
+   "$(q '^place=cmux' "$L44C" && echo 0 || echo 1)"
+# (c19-mutant) NON-VACUITY: drop the width guard and placement PLACES on the wrapped clock.
+sed 's|  \[ "${#now}" -le 12 \] \|\| { printf .probe_unreadable.; return 0; }|  :   # MUTANT: no clock width|' "$CAP" > "$TMP/cap-rawnow.sh"
+ck "  …the mutant really dropped the clock width guard" \
+   "$([ "$(grep -c 'MUTANT: no clock width' "$TMP/cap-rawnow.sh")" -eq 1 ] && echo 0 || echo 1)"
+L44M="$(printf '%s\n' "$_WREC" | plac "$TMP/cap-rawnow.sh" CAP_NOW=18446744075502150016)"
+ck "  …mutation control: without it placement PLACES on a wrapped clock (${L44M%% *})" \
+   "$(q '^place=' "$L44M" && echo 0 || echo 1)"
+# (c20) ⛔ PRESENT-BUT-STALE IS NOT ABSENT (fresh review round 11, P2). The per-cycle branch told the
+# operator to look in `$O` and the script directory for a file that IS `$O/capacity.sh` and was sourced.
+ck "(c20) the per-cycle message names a STALE instrument as PRESENT-but-INCOMPLETE, not missing" \
+   "$([ "$(grep -cF 'capacity.sh is PRESENT but INCOMPLETE' "$LOOP")" -eq 1 ] \
+      && qF 're-seed' "$(grep -A2 -F 'capacity.sh is PRESENT but INCOMPLETE' "$LOOP")" && echo 0 || echo 1)"
 # (c7) ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
 # expected-side dedupe is right for a roster row and wrong for the provider inventory, where the key is
 # `network.ipv4`: 5 running machines with pi-cell-2 reusing the address of pi-cell-1 read

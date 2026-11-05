@@ -325,6 +325,18 @@ VM listing — the reconciliation is `published − extra = expected − INELIGI
   published* AND never aged out, with both readers agreeing on the wrong thing. Every numeric field is
   bounded to 12 digits in the one helper both readers already call, which keeps `at` valid past 2286 and
   every reading well inside int64.
+- **A CEILING the shell cannot compare silently DISABLES its own gate — the other half of the same bug.**
+  The record-side width bound above protects the datum; the values it is compared **against** are seams
+  (`CAP_LPC_CEILING`, `CAP_MIN_DISK_MB`, `CAP_MIN_MEM_MB`, `CAP_MIN_FORK_HEADROOM`), and this repo's own
+  docs spell them in prose in the form that BREAKS them — `CAP_LPC_CEILING` = 8.00 load-per-cpu. A decimal,
+  a unit (`500G`, `512MB`), a leading zero or a 20-digit value makes every `[ "$x" -ge "$y" ]` error, the
+  gate vanishes into a discarded stderr, and placement answers `eligible=1` for a box over the ceiling, out
+  of disk, out of memory or unable to fork. One predicate at load (`cap_int_seam`) applies the **default**
+  and says so on stderr — never the seam as typed (a literal `8.5` would keep the gate broken) and never 0
+  (which would make every box ineligible). The clock is the same datum in a third place: `CAP_NOW` was read
+  straight into `$(( ))`, where 20 digits wrap modulo 2^64 to the record's own `at`, the age computes as 0,
+  and placement certifies precisely the bytes the line reports as `clock-unreadable` — so `now` is
+  width-bounded in `cap_bound_hit`, the one place both readers age a record.
 - **One TTL predicate, consulted by BOTH readers.** `cap_bound_hit` (placement) and the line validate the
   window through the same helper (`cap_ttl_secs`), and `cap_parse_lsremote` hands awk the VALIDATED
   number — unvalidated, a duration typo made the line refuse while placement PLACED on the same bytes

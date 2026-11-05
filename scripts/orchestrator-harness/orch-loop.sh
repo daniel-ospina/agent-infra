@@ -5779,7 +5779,16 @@ PY
       echo "[capacity] placement=$CAP_STATE place=${CAP_PLACE:-none} lpc_self=${CAP_LPC_SELF:-?} ceiling_lpc=${CAP_LPC_CEILING:-800}${CAP_BOUND:+ bound=$CAP_BOUND} — $( [ "$CAP_STATE" = refuse ] && printf 'REFUSED: %s' "${CAP_VERDICT:-?}" || printf '%s' "${CAP_VERDICT:-?}" )" >> "$LOG"
     fi
   else
-    echo "[capacity] capacity.sh is NOT available (looked in \$O and the script directory) — placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle" >> "$LOG"
+    # ⛔ PRESENT-BUT-INCOMPLETE IS NOT ABSENT (fresh review round 11, P2). This branch told the operator
+    # to look in `$O` and the script directory for a file that IS `$O/capacity.sh` and was sourced — so a
+    # STALE copy sent them to re-install instead of to re-seed, and the truthful line (printed ONCE at
+    # load, above) was long out of sight in the log. The drainer has named the two states apart since
+    # round 8; the controller half is the same two names.
+    if [ -n "${_cap_mod:-}" ]; then
+      echo "[capacity] capacity.sh is PRESENT but INCOMPLETE ($_cap_mod was sourced and defines none of the interface: a STALE copy) — re-seed \$O. Placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle, and the #3446 fleet line is NOT emitted" >> "$LOG"
+    else
+      echo "[capacity] capacity.sh is NOT available (looked in \$O and the script directory) — placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle" >> "$LOG"
+    fi
   fi
   # swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow. An UNREADABLE probe is
   # UNKNOWN and takes that same allow, for the reason above; unlike 0 it is a distinguishable state
