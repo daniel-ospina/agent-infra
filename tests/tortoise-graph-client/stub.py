@@ -22,14 +22,29 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 CTL, PORT = sys.argv[1], int(sys.argv[2])
 
-# The ADVERTISED tool list, as `tools/list` reports it (measured 2026-11-04: 69 tools). The suite
-# asserts every call the client makes is a member — that is R5, stated as data instead of prose.
+# The ADVERTISED tool list, as `tools/list` reports it (measured 2026-11-04: 69 tools — this stub
+# serves the SUBSET the client touches, which is what the suite needs). The suite asserts every call
+# the client makes is a member — that is R5, stated as data instead of prose.
+#
+# ⛔ IT IS WRITTEN TO `<ctl>/advertised.json` AT STARTUP AND THE TEST READS *THAT* (#3374 review P2).
+# The list used to be copied THREE times — here, in `run.sh`'s R5 arm, and in a dead `advertised()`
+# helper — so the arm compared the client against a hand-written list rather than against the surface
+# the stub actually serves, and the WRITE verbs were never driven at all: a client calling a retired
+# write handler kept R5 green. One list, emitted by the process that serves `tools/list`.
+#
+# `tortoise_create_operator` is here because the client's write path calls it (with the served
+# (op_type, source_id, target_ids, direction, semantics) signature). It was MISSING from this set,
+# which is exactly the drift the single-source rule exists to make impossible.
 ADVERTISED = {
     "tortoise_get_entity",
     "tortoise_overview",
     "tortoise_search",
     "tortoise_create_point",
+    "tortoise_create_operator",
 }
+
+with open(os.path.join(CTL, "advertised.json"), "w") as _fh:
+    json.dump(sorted(ADVERTISED), _fh)
 
 OK_POINT = '{"id":"pt_abc","content":"a point","pointKind":"statement"}'
 

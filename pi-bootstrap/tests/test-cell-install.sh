@@ -1245,10 +1245,13 @@ rm -f "$DEST/extensions/review-enforcer/cell-local-helper.ts"
 # lane: the LEGACY stdio entry (needs a checkout+venv+FalkorDB a cell does not have), a LITERAL
 # credential written into the shared file, and a missing file. Each must fail --verify.
 cp "$DEST/.mcp.json" "$DEST/.mcp.json.keep"
-# ⛔ THREE shapes, and each must be refused by ITS OWN rule. `literal` and `secret` are not the
-# same case: a literal Bearer hits LITERAL_AUTH, so an env-indirect header with a stray token
-# ELSEWHERE in the file is the only thing that reaches SECRET_IN_FILE — the rule that exists to
-# catch a key pasted into a shared file. With one shape serving both, the leak rule had no test.
+# ⛔ THREE shapes, and each must be refused by ITS OWN rule — the marker is the operator's remedy.
+# ⛔ `literal` DELIBERATELY USES A NON-`tt_`/`tk_` TOKEN (#3374 review P2). The whole-file leak scan
+# now runs BEFORE every shape exit (so a `tt_`/`tk_` literal in a stdio `command` cannot be echoed
+# into the log), which means a `tt_`-shaped Authorization is reported as SECRET_IN_FILE:<path> — the
+# stronger message, since it names where. LITERAL_AUTH is still the rule for a literal the token
+# pattern does not recognise (`sk-…`, a bare secret), and THAT is the case this shape now pins.
+# `secret` remains the env-indirect header + stray token elsewhere case.
 for shape in stdio literal secret; do
   python3 - "$DEST/.mcp.json" "$shape" <<'PY'
 import json, sys
@@ -1258,9 +1261,9 @@ t = d["mcpServers"]["tortoise"]
 if shape == "stdio":
     d["mcpServers"]["tortoise"] = {"command": "/x/.venv/bin/python3", "args": ["-m", "tortoise.mcp_server"]}
 elif shape == "literal":
-    # built at runtime on purpose: the POINT of this case is a literal token IN the file, and
-    # spelling one here would trip the transcript redactor without testing anything more.
-    t["headers"] = {"Authorization": "Bearer " + "t" + "t" + "_" + "A" * 24}
+    # a literal the tt_/tk_ token pattern does NOT match, so LITERAL_AUTH (not SECRET_IN_FILE) is the
+    # rule under test; built at runtime so the transcript redactor does not blank the fixture.
+    t["headers"] = {"Authorization": "Bearer " + "sk-" + "live_" + "A" * 24}
 else:
     # the header stays env-indirect, so LITERAL_AUTH does NOT fire; the token hides in a comment
     t["_comment"] = "pasted for convenience: " + "t" + "t" + "_" + "A" * 24
@@ -1305,6 +1308,44 @@ rc=$?
   || fail "--verify refused a leak in another server but blamed the tortoise entry (rc=$rc) — the operator is pointed at the entry that is right"
 cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
 rm -f "$DEST/.mcp.json.keep"
+# ⛔ A SECRET IN A FAIL LINE (#3374 review P2). The shape exits (STDIO/URLTYPE/…) ran BEFORE the
+# whole-file literal scan, so a legacy stdio entry carrying the key in its `command` was echoed
+# VERBATIM by the marker — which `verify_graph_mcp` prints into the bring-up log — and the leak was
+# never NAMED as a leak: the operator was told "not the hosted shape". Both directions are asserted
+# here: the leak is named by PATH, and the key does not appear anywhere in the log.
+LEAKKEY="t""t_""$(printf 'Z%.0s' $(seq 1 24))"    # runtime-built: a literal here would trip the redactor, not the verifier
+python3 - "$DEST/.mcp.json" "$LEAKKEY" <<'PY'
+import json, sys
+p, key = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"command": "python3 -m tortoise.mcp_server --key " + key}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "credential LITERAL is written into .mcp.json at tortoise.command" "$LOG" \
+  && ok "a literal key inside a legacy stdio COMMAND is named as a leak (SECRET_IN_FILE), not as 'the wrong shape'" \
+  || fail "a literal key in the stdio command was reported as a shape problem (rc=$rc) — the operator fixes the wrong thing and the leak stays"
+grep -qF "$LEAKKEY" "$LOG" \
+  && fail "the live key was ECHOED into the run log by the STDIO marker — a secret in a FAIL line is the leak, and the bring-up log carries it" \
+  || ok "...and the key never appears in the log (the marker is redacted, not echoed)"
+run_install                                              # re-converge on the hosted entry
+# ⛔ `_selfHosted` IS AN EXEMPTION, NOT A LICENCE TO CERTIFY ANY STRING (#3374 review P2). A
+# SCHEME-LESS url was certified SELFHOSTED rc=0; the client's `new URL()` reads `localhost:8000/mcp`
+# as protocol `localhost:` with NO host, so the cell points at nothing and still says LAYER VERIFIED.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"type": "http", "url": "localhost:8000/mcp", "_selfHosted": True}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -qF "is not an absolute http(s) url" "$LOG" \
+  && ok "a marked self-host with a SCHEME-LESS url is refused BY NAME (the exemption does not certify a string)" \
+  || fail "--verify certified a scheme-less self-hosted url (rc=$rc) — a cell pointing at nothing reports LAYER VERIFIED, and the client throws building a transport"
+run_install                                              # re-converge before the next section
 
 # ⛔ A TYPO IS NOT A SELF-HOST. Marking ANY differing url `_selfHosted` let the INSTALLER mint the
 # exemption `--verify` honours — so the "unmarked non-default url" refusal could never fire after a
@@ -1326,6 +1367,45 @@ python3 - "$DEST/.mcp.json" <<'PY' && ok "a near-miss of the hosted url is REPLA
 import json, sys
 t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
 sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
+PY
+# ⛔ A LOOKALIKE HOST IS A TYPO TOO (#3374 review P1). `near_miss` compares only the AUTHORITY, so a
+# host one letter off (`api.premiselab.co`) read as "a genuine self-host", was preserved AND marked
+# `_selfHosted` — and cloud-cell-bringup.sh runs verify → install → verify, so the repair minted the
+# very exemption `--verify` had just refused, on an entry still carrying `Bearer
+# ${TORTOISE_MCP_API_KEY}`. The live tenant key went to a host nobody vetted.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselab.co/mcp/",      # ONE letter short of the hosted host
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a LOOKALIKE of the hosted host is REPLACED with the default — a repair cannot mint the exemption --verify refused" \
+  || fail "install preserved and marked a host-level typo _selfHosted — --verify then certifies it, and the live tenant key is sent to a host nobody vetted (P1)"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
+PY
+# ...while a GENUINE self-host stays preserved: the rule "a different host is a real self-host" is
+# recorded, and this arm is what keeps the lookalike fix from quietly overriding it.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {"type": "http", "url": "http://localhost:8000/mcp"}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "...and a genuine self-host (localhost) is still preserved and marked (the lookalike rule is narrow)" \
+  || fail "the lookalike rule swallowed a GENUINE self-host — that reverses the recorded preserve-a-self-host behaviour"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "http://localhost:8000/mcp" and t.get("_selfHosted") is True else 1)
 PY
 # ...and a self-hosted entry that spells its OWN transport still works: the client never reads `type`
 # (it selects StreamableHTTP from `url` alone), so replacing it would destroy the operator's config.
