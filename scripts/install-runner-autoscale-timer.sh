@@ -1333,12 +1333,24 @@ refuse_root_invocation() {
 # actually be rendered, once it exists.
 refuse_adopted_provisioner() {
     [ -n "$PROVISIONER" ] || return 0
-    case "$PROVISIONER" in
-        *\\*) err "REFUSING: the provisioner pin this install would render contains a backslash — the artifact is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
-    esac
+    # ⛔ NO BACKSLASH OR WHITESPACE ARM HERE, AND THE OMISSION IS THE POINT. Neither rule can be VIOLATED by
+    # an adopted value: `sed_escape_repl` escapes `&`, `\\` and `|`, so a backslash in the pin renders
+    # literally (the pre-selection loop refuses it for an ENV-SUPPLIED value, which is where an operator's
+    # typo arrives), and `Environment=` is a space-separated key=value list, so a pin containing a space
+    # cannot round-trip through the artifact at all — the reader sees its first token, which is not a
+    # readable file, so adoption SKIPS it. Measured: deleting either arm left the suite at `PASS=482
+    # FAIL=0`, i.e. no case can produce their input. A rule no case can reach, sitting where it looks like
+    # protection, is the dead-code shape this PR spent a round deleting. The two arms below ARE reachable and
+    # are pinned in both directions.
     if [ "${TARGET:-}" != "launchd" ]; then
+        # ⛔ NO WHITESPACE ARM HERE, ON PURPOSE. `Environment=` is a SPACE-SEPARATED key=value list, so the
+        # artifact cannot round-trip a pin containing a space — the reader sees only the first token, which
+        # is not a readable file, so adoption SKIPS it and there is no adopted value left to judge. The
+        # env-seam spelling of the same pin is already refused by `refuse_systemd_unsafe_values` before any
+        # verb runs. An arm here would be code no case can reach (measured: deleting it left the suite
+        # green, because nothing can produce the input), and unreachable code that looks like a guard is
+        # worse than none. `%` IS reachable and IS pinned in both directions.
         case "$PROVISIONER" in
-            *[[:space:]]*) err "REFUSING: the provisioner pin this install would render contains whitespace — systemd splits the rendered unit on it, so the job would never run"; return 1 ;;
             *%*) err "REFUSING: the provisioner pin this install would render contains '%', which systemd expands as a specifier at load time (%h, %i, %n) — the rendered path would differ from the real one"; return 1 ;;
         esac
     fi
@@ -1367,10 +1379,12 @@ warn_provisioner_reach() {
         err "  runner and RE-REGISTER an orphaned one, but it can never ADD capacity (every pass with"
         err "  live < ceiling records 'no provisioner' and exits 3). Install from a checkout that carries"
         err "  tools/install-ci-runner-x64.sh, or set RUNNER_AUTOSCALE_PROVISIONER, to schedule a box that GROWS."
-    elif is_transient_scratch "$PROVISIONER"; then
-        err "WARNING: the pinned provisioner $PROVISIONER is inside a mktemp tree — after that directory goes,"
-        err "  the pass will report 'no provisioner' on every tick (repair-only). Install from a durable checkout."
     fi
+    # ⛔ THERE IS NO `is_transient_scratch` BRANCH HERE, AND THAT IS DELIBERATE. `refuse_adopted_provisioner`
+    # runs immediately before this on every verb that can reach it, and it RETURNS 1 on exactly that
+    # condition — so a warning arm here was UNREACHABLE dead code (measured: an instrumented copy printing
+    # a marker from it ran the whole suite with zero markers). A transient pin is a REFUSAL, not a warning;
+    # keeping a softer word here would also invite a reader to think the install proceeded.
     return 0
 }
 
@@ -1408,7 +1422,12 @@ do_install_systemd() {
     # and `--status` on that same artifact then exited 1 ("points into TRANSIENT SCRATCH SPACE") — the
     # writer certifying what its own reader reds. See `refuse_adopted_provisioner` for why the predicate
     # is scoped to this one field rather than re-judging the whole artifact.
-    refuse_adopted_provisioner || return 1
+    # ⛔ `--disarm` IS EXEMPT. It forces a DISARMED render (`FORCE_MODE_FLAG="--dry-run"`), where the pin is
+    # inert — and refusing there does not protect anything, it STRANDS THE RECORD: measured, `--disarm` over
+    # an artifact carrying a transient adopted pin exited 1 with `STILL ARMED … the record was NOT removed`,
+    # leaving the box armed with a record nobody could remove without hand-editing. The safe direction must
+    # not be the blocked one; the next real install still refuses, and `--status` still reds the artifact.
+    [ -n "$FORCE_MODE_FLAG" ] || refuse_adopted_provisioner || return 1
     warn_provisioner_reach
     note_repo_change
 
@@ -1508,7 +1527,12 @@ do_install_launchd() {
     adopt_installed_state_dir
     refuse_report_only_over_record || return 1
     adopt_installed_provisioner
-    refuse_adopted_provisioner || return 1
+    # ⛔ `--disarm` IS EXEMPT. It forces a DISARMED render (`FORCE_MODE_FLAG="--dry-run"`), where the pin is
+    # inert — and refusing there does not protect anything, it STRANDS THE RECORD: measured, `--disarm` over
+    # an artifact carrying a transient adopted pin exited 1 with `STILL ARMED … the record was NOT removed`,
+    # leaving the box armed with a record nobody could remove without hand-editing. The safe direction must
+    # not be the blocked one; the next real install still refuses, and `--status` still reds the artifact.
+    [ -n "$FORCE_MODE_FLAG" ] || refuse_adopted_provisioner || return 1
     warn_provisioner_reach
     note_repo_change
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }

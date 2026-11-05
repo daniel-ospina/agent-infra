@@ -2010,6 +2010,36 @@ OUT="$(run_install Darwin "$D4" --install)"; RC=$?
 assert_eq "$RC" 1 "a launchd re-install refuses a transient ADOPTED pin too (this arm had no case)"
 assert_contains "$OUT" "TRANSIENT SCRATCH" "with the same message class as the systemd arm"
 
+# ⛔ THE GUARD'S OTHER THREE RULES WERE PINNED BY NOTHING: deleting the backslash arm, deleting the
+# whitespace arm, or deleting the `[ "$TARGET" != "launchd" ]` scoping (i.e. OVER-BLOCKING the Mac arm)
+# each left the suite at `PASS=482 FAIL=0`. Each gets an assertion, in both directions where the arm differs.
+D6="$T/c67f"; fresh "$D6"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Linux "$D6" --install >/dev/null 2>&1; ENVV=()
+# ⛔ THE BACKSLASH AND WHITESPACE ARMS ARE ABSENT FROM `refuse_adopted_provisioner` BY DESIGN — see its
+# comment: `sed_escape_repl` makes a backslash render literally, and `Environment=` cannot carry a space, so
+# no adopted value can violate either rule. What IS reachable is the `%` specifier on the systemd arm (and
+# its ABSENCE on the Mac arm, which must not be a false block) — both pinned below and above.
+# ⛔ AND THE MAC ARM MUST NOT BE A FALSE BLOCK: a plist <string> is neither split on whitespace nor
+# specifier-expanded, so BOTH values below must install there. These are also the assertions that pin the
+# `[ "$TARGET" != "launchd" ]` scoping — deleting it over-blocked the Mac arm and left the suite green.
+SPDIR="$T/home/sp dir"; mkdir -p "$SPDIR"; printf '#!/bin/sh\n' >"$SPDIR/inst.sh"; chmod +x "$SPDIR/inst.sh"
+D7="$T/c67g"; fresh "$D7"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Darwin "$D7" --install >/dev/null 2>&1; ENVV=()
+box_sed_i "s|<string>$PROV3</string>|<string>$SPDIR/inst.sh</string>|g" "$D7/$LABEL.plist"
+OUT="$(run_install Darwin "$D7" --install)"; RC=$?
+assert_eq "$RC" 0 "a launchd pin containing whitespace is NOT refused (no false block on the Mac arm)"
+box_sed_i "s|<string>$SPDIR/inst.sh</string>|<string>$PCTDIR/inst.sh</string>|g" "$D7/$LABEL.plist"
+OUT="$(run_install Darwin "$D7" --install)"; RC=$?
+assert_eq "$RC" 0 "nor is a launchd pin containing '%' (a plist is not specifier-expanded)"
+# ⛔ AND `--disarm` IS EXEMPT: it renders DISARMED, so the pin is inert — refusing there did not protect
+# anything, it stranded the record (`STILL ARMED`, record on disk).
+box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$SCRATCH/inst.sh|" "$D6/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D6" --disarm)"; RC=$?
+assert_eq "$RC" 0 "--disarm still succeeds over a transient adopted pin (the safe direction must not be the blocked one)"
+assert_absent "$OUT" "STILL ARMED" "…and does not strand the record"
+
 # The launchd arm adopts too, and deleting that call left the suite green — so pin it here.
 D2="$T/c67d"; fresh "$D2"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
