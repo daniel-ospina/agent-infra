@@ -39,8 +39,10 @@
          `fleet_srcs` array now delivers it. The objection above is answered rather than ignored: if
          the farm is missing, `verify_targets` refuses the install LOUDLY (exit 1, nothing installed)
          instead of arming a unit that cannot start — which is the whole point of the guard.
-         ⛔ And `verify_targets` now also refuses a TCC-protected target, so this defect cannot be
-         reintroduced by a future edit that "simplifies" the path back to `{{AGENT_INFRA_PATH}}`.
+         ⛔ And `verify_targets` now also verdicts a TCC-protected EXEC target: that unit is SKIPPED
+         loudly and nothing is installed for it (a different verdict from a MISSING target, which
+         still fails the install), so this defect cannot be reintroduced as an armed-and-dead job by
+         a future edit that "simplifies" the path back to `{{AGENT_INFRA_PATH}}`.
 
          ⛔ THE SURFACE IDS ARE WRITTEN OUT, NOT INHERITED. A launchd job gets neither the operator's
          shell env nor its rc files, so an unset WS/SURFACE would fall back to the script's defaults —
