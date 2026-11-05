@@ -3781,8 +3781,10 @@ and to 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s,
 `CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
 `CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
 expire a live batch mid-flight (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
-case 10). *(These four numbers were stale here until review round 2: this paragraph still said 14400s
-for `CLAIM_ISSUE_TTL` and 7200s for `CLAIM_TTL_MAX`, and did not mention the branch keying at all.)* Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
+case 10). *(Corrected in a later round: this paragraph said 14400s for `CLAIM_ISSUE_TTL` and 7200s
+for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLAIM_TTL` (1800s) was
+never wrong.)*
+Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
 stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
 either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or

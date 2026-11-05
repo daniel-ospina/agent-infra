@@ -271,21 +271,38 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # defeated by a respelling — "ceiling (CLAIM_ISSUE_TTL = 14400s) — clamped. Candidates: … CLAIM_BRANCH_TTL"
 # mentions this keying AND avoids the old spelling while still naming the wrong ceiling. So the
 # assertion is on the PROPERTY: the clause inside `ceiling ( … )` must not be another keying's knob.
-if grep -qE 'ceiling \(CLAIM_(TTL_MAX|ISSUE_TTL|TTL)\b' "$T/acq.out"; then
+# ⛔ AND IT MUST FAIL CLOSED (review round 6, P2). The first form of this arm was
+# `if grep -qE '…' ; then bad …; else ok …; fi`, which reports PASS for ANY non-zero grep status —
+# exit 2 (unreadable operand) included — and used `\b`, a GNU/BSD extension rather than POSIX ERE.
+# A guard that cannot answer must not read as clean, so the three exit codes are separated here.
+NAMING_RC=0
+grep -qE 'ceiling \(CLAIM_(TTL_MAX|ISSUE_TTL|TTL)([ )]|$)' "$T/acq.out" || NAMING_RC=$?
+if [ "$NAMING_RC" = "0" ]; then
   bad "the clamp warning names another keying's knob AS this ceiling: $(cat "$T/acq.out")"
-else
+elif [ "$NAMING_RC" = "1" ]; then
   ok "the clamp warning does not name another keying's knob as this ceiling"
+else
+  bad "the not-another-knob guard could not evaluate the property (grep exit $NAMING_RC) — unreadable operand must not read as clean"
 fi
 # ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2). The arm above measures the STAMPED
 # LEASE, never the printed ceiling — so a warning that stamps 14400 correctly while PRINTING 9600
 # misdirects the fixer exactly as before and stayed green. The number in the message is the `%ss`
 # argument, and it must equal this keying's ceiling.
-grep -q 'ceiling (14400s)' "$T/acq.out" \
-  || bad "the clamp warning does not print this keying's ceiling (14400s): $(cat "$T/acq.out")"
+# Each arm below carries an `ok` as well as its `bad` (review round 6, P2): an assertion with only
+# the failure arm prints nothing on success and increments neither PASSES nor FAILS, so a green run
+# under-reports what executed and the arm can be deleted without moving any number.
+if grep -q 'ceiling (14400s)' "$T/acq.out"; then
+  ok "the clamp warning prints this keying's own ceiling (14400s)"
+else
+  bad "the clamp warning does not print this keying's ceiling (14400s): $(cat "$T/acq.out")"
+fi
 # ⛔ AND THE GUARD IS NOT A SINGLE LITERAL (review round 3, P2): the message must also name THIS
 # keying's variable among the candidates it suggests raising.
-grep -q 'CLAIM_BRANCH_TTL' "$T/acq.out" \
-  || bad "the clamp warning does not name CLAIM_BRANCH_TTL as a ceiling candidate: $(cat "$T/acq.out")"
+if grep -q 'CLAIM_BRANCH_TTL' "$T/acq.out"; then
+  ok "the clamp warning names CLAIM_BRANCH_TTL among the ceiling candidates"
+else
+  bad "the clamp warning does not name CLAIM_BRANCH_TTL as a ceiling candidate: $(cat "$T/acq.out")"
+fi
 L2="$(lease_of refs/claims/branch-integration-lease-ceiling)"
 if [ -n "$L2" ]; then lease_arm "an over-ceiling request clamps to CLAIM_BRANCH_TTL (14400), NOT to CLAIM_TTL_MAX (9600)" 14400 "$L2"; else bad "no lease_until on the over-ceiling claim ref"; fi
 # ⛔ THE KNOB ARM — ONE KNOB, NOT TWO (review round 2, P2). The comment in `claims.sh` claims that
