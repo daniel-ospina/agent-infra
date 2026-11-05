@@ -5468,6 +5468,55 @@ if [ -f "$CSS" ]; then
       || { rc=1; echo "      the brace spelling $_bshape exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') — pathish matches only the BARE \$HOME/\$PWD"; }
     ck "check-single-source: the brace spelling REPO=\"\${REPO:-$_bshape}\" is refused too" $rc
   done
+  # ⛔ THREE MORE WAYS AROUND THE ARM, EACH MEASURED TO PASS BEFORE ITS FIX (#3054 review, P2). They
+  # share one shape: a fixture planted in the throwaway copy that the SHIPPED gate must still name.
+  # ⛔ EACH HAS A MUTANT, and that is why they are arms rather than prose — each pins an `awk` guard
+  # that can be deleted without any other arm in this file noticing:
+  #   (a) a TRAILING COMMENT — `REPO="/tmp/cell-ai" # why` is how the defect is re-introduced WITH an
+  #       explanation. Without the comment strip the value never ends in a quote, so the quote-strip
+  #       never runs and it never looks like a path. MUTANT: `if (0)` on the strip (measured green).
+  #   (b) a DECLARATION PREFIX — `local REPO=…` / `readonly REPO=…`. Only `export` was stripped, so
+  #       every other prefix was invisible. MUTANT: narrow the strip back to `^export` (measured green).
+  #   (c) a BACKTICK COMMAND SUBSTITUTION — the SAME substitution as `$(pwd)` in its older spelling.
+  #       The arm asked only about `$(`, so this one walked through: a FAIL-OPEN. MUTANT: drop the
+  #       backtick from the command-substitution test (measured green).
+  # Every arm is asserted on LINE 2 as well as by exit code, so a run that happens to be red for some
+  # other hit in the same file cannot satisfy it for the wrong reason.
+  _tc='REPO="/tmp/cell-ai-tc" # the old cell default, re-introduced with an explanation'
+  _lc='local REPO="/tmp/cell-ai-local"'
+  _bc='REPO=`pwd`'
+  # ⛔ THREE MORE, EACH A MEASURED BYPASS OF THE ARM BEFORE ITS FIX (#3054 review, P2):
+  #   the `:=` operator — the family test matched `:-`/`-` only, and `sanctioned()` then read the
+  #       `${REPO` expansion as a value the file already holds;
+  #   a second command on the line — `REPO="/tmp/x"; export REPO` stopped the value ending in a
+  #       quote, exactly as a trailing comment did;
+  #   a `||` fallback inside the substitution — the unqualified pipe carve-out exempted it, and it is
+  #       the shape a script writes when it "should not fail".
+  _eq='REPO="${REPO:=/tmp/cell-ai-eq}"'
+  _sc='REPO="/tmp/cell-ai-semi"; export REPO'
+  _pc='REPO="$(git rev-parse --show-toplevel 2>/dev/null || echo /tmp/cell-ai-or)"'
+  for _cshape in "$_tc" "$_lc" "$_bc" "$_eq" "$_sc" "$_pc"; do
+    printf '#!/bin/bash\n%s\n' "$_cshape" > "$TMP/rpdef/h/zz-holdout2.sh"
+    out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -qE 'zz-holdout2\.sh:2:' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      the spelling [$_cshape] exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>')"; }
+    ck "check-single-source: the spelling [$_cshape] is refused too" $rc
+  done
+  # ⛔ A SCAN THAT DID NOT RUN IS NOT A CLEAN SCAN (#3054 review, P1 — a FALSE PASS). Both call sites
+  # threw away `awk`'s exit status, so a scanner that could not execute was read as "no hits": MEASURED,
+  # with `awk` stubbed to exit 127 over a tree carrying `REPO="${REPO:-$PWD}"`, the gate exited 0 and
+  # printed "ok: the REPO path-default arm scanned 72 + 103". The gate now answers UNKNOWN (rc 2 — the
+  # cannot-verify code, never a pass) and names the file. MUTANT: drop the `[ "$_scan_rc" -eq 0 ] ||`
+  # guard at either call site -> this arm goes green.
+  mkdir -p "$TMP/rpdef/fakebin"
+  printf '#!/bin/bash\nexit 127\n' > "$TMP/rpdef/fakebin/awk"
+  chmod +x "$TMP/rpdef/fakebin/awk"
+  printf 'REPO="${REPO:-$PWD}"\n' > "$TMP/rpdef/h/zz-holdout3.sh"
+  out="$(env -u O PATH="$TMP/rpdef/fakebin:$PATH" bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+  { [ "$rc" -ne 0 ] && grep -q 'scan FAILED' <<<"$out"; } && rc=0 \
+    || { rc=1; echo "      a broken awk exited $rc — an unrun scan read as clean: $(printf '%s\n' "$out" | grep -iE 'ok: the REPO|scan FAILED' | head -2)"; }
+  ck "check-single-source: an awk that cannot run is UNKNOWN (rc 2), never a clean scan" $rc
+  rm -f "$TMP/rpdef/h/zz-holdout3.sh"
   rm -rf "$TMP/rpdef"
 else
   ck "check-single-source.sh is shipped" 1

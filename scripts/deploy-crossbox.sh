@@ -67,8 +67,17 @@ done
 #   * a MISSING `repo-slug.sh` still dies here — it is not the stale shape, and no fast-forward is
 #     needed for a file every current checkout already ships;
 #   * a stale one (present, no `resolve_repo`) is DEFERRED, not refused;
-#   * a usable one resolves here, so a WRONG `REPO` still refuses BEFORE the controller is stopped —
+#   * a usable one resolves here, so a WRONG REPO still refuses BEFORE the controller is stopped —
 #     the property that makes this script safe to run while the loop is working.
+#
+# ⛔ THE PROPERTY IS CONDITIONAL, AND THE CONDITION IS NAMED HERE (#3054 review, P2). On a cell whose
+# harness predates `resolve_repo` the check CANNOT run yet, so a wrong-but-non-empty `$REPO` is judged
+# only AFTER step 2 — and by then step 1 has stopped the controller, leaving the cell with no loop
+# until an operator fixes REPO and re-runs. That residual is the price of not duplicating the resolver
+# (a private copy of the rule here is the defect this whole PR removes), so it is disclosed rather
+# than hidden. What CAN be refused early is refused early: an UNSET `$REPO` can never succeed on a
+# stale harness — the fast-forward supplies the resolver and the resolver then refuses it — so it is
+# stopped HERE, before anything is killed.
 [ -f "$H/repo-slug.sh" ] || die "repo-slug.sh missing from $H — cannot resolve REPO, and this script will not guess one"
 if grep -q '^resolve_repo()' "$H/repo-slug.sh" 2>/dev/null; then
   # shellcheck source=scripts/orchestrator-harness/repo-slug.sh
@@ -76,6 +85,10 @@ if grep -q '^resolve_repo()' "$H/repo-slug.sh" 2>/dev/null; then
   # Subshell: this pass only needs the VERDICT (a refusal already went to stderr), and discarding stdout
   # means no message can be mistaken for a path. The value the controller gets comes from the pass below.
   ( resolve_repo >/dev/null ) || exit $?
+else
+  # Not a guess about what REPO should be: a statement that NO value can work on this harness, so the
+  # controller must not be stopped for a run that is guaranteed to abandon it.
+  [ -n "${REPO:-}" ] || die "REPO is unset and $H/repo-slug.sh predates resolve_repo — the fast-forward would supply the resolver and the resolver would then REFUSE an unset REPO, so nothing has been stopped. Set REPO the ONE way this box has for it (the launchd plist's EnvironmentVariables on a Mac, the cell's keys.env), or pass --repo PATH"
 fi
 
 export HOME="$CELL_HOME"

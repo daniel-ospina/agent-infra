@@ -230,6 +230,27 @@ if [ -f "$CROSSBOX" ]; then
   cbrun PATH="$CELL/bin:$PATH" REPO="$REAL"
   { [ "$cb_rc" -ne 0 ] && ! grep -q 'resolve_repo' <<<"$cb_out" && grep -q 'git fetch failed' <<<"$cb_out"; }
   ck "B10 deploy-crossbox.sh: a STALE harness is DEFERRED, not refused — it reaches the fast-forward (rc=$cb_rc)" $?
+  # ⛔ AND THE ONE CASE THAT CAN NEVER WORK IS REFUSED *BEFORE* THE CONTROLLER IS STOPPED (#3054 review,
+  # P2). An UNSET `$REPO` on a stale harness cannot succeed: the fast-forward supplies the resolver and
+  # the resolver then refuses an unset REPO — so the controller would be stopped and the run would die
+  # with the cell's loop DOWN. `tmux` RECORDS its verbs, so the arm can see that nothing was killed;
+  # asserting only the exit code would pass on a run that stopped the loop first and refused second.
+  printf '#!/bin/bash\nprintf "%%s\\n" "$*" >> "%s"\nexit 0\n' "$CELL/tmux.verbs" > "$CELL/bin/tmux"; chmod +x "$CELL/bin/tmux"
+  # ⛔ THE RECORD FILE IS CREATED FIRST: an ABSENT file would satisfy `[ ! -s ]` and the arm would pass
+  # without ever proving that tmux was not asked to do anything.
+  : > "$CELL/tmux.verbs"
+  cb_out="$(cd / && env -u REPO AI="$CELL/cell-ai" CELL_HOME="$CELL/cell-home" PATH="$CELL/bin:$PATH" bash "$CROSSBOX" 2>&1)"; cb_rc=$?
+  { [ "$cb_rc" -ne 0 ] && grep -q 'REPO is unset' <<<"$cb_out" && [ ! -s "$CELL/tmux.verbs" ]; } && rc13=0 || rc13=1
+  ck "B13 deploy-crossbox.sh: REPO unset on a STALE harness refuses BEFORE killing the controller (rc=$cb_rc, tmux verbs=$(wc -l < "$CELL/tmux.verbs" 2>/dev/null || echo 0))" "$rc13"
+  # ⛔ AND A WRONG `$REPO` ON THAT SAME STALE HARNESS IS THE NAMED RESIDUAL, pinned so it cannot change
+  # silently: it is judgment the deferred pass owes, so the controller IS stopped and the refusal comes
+  # after the fast-forward. Pinned positively (the run reaches the fetch/ff rather than dying in the
+  # pre-flight) so that a LATER fix moving the refusal earlier reds here and the disclosure is updated.
+  : > "$CELL/tmux.verbs"
+  cb_out="$(cd / && env REPO="$NOPE" AI="$CELL/cell-ai" CELL_HOME="$CELL/cell-home" PATH="$CELL/bin:$PATH" bash "$CROSSBOX" 2>&1)"; cb_rc=$?
+  { [ "$cb_rc" -ne 0 ] && ! grep -q 'predates resolve_repo' <<<"$cb_out" && grep -q 'git fetch failed' <<<"$cb_out"; } && rc14=0 || rc14=1
+  ck "B14 deploy-crossbox.sh: a WRONG REPO on a stale harness is DEFERRED (the disclosed residual), not judged early (rc=$cb_rc)" "$rc14"
+  : > "$CELL/tmux.verbs"
   # ⛔ `--repo PATH` IS THE ONE INPUT AN SSH CALLER HAS ON A CELL (#3054 review, P1-2): the two
   # documented surfaces reach the CONTROLLER, not the pushing shell. It is still PROVEN — but only if
   # it actually REACHES the resolver, so both directions are pinned, with `REPO` UNSET (`env -u`) so
@@ -316,7 +337,11 @@ open(p, "w").write(s.replace(old, new))
   # form the arm's own comment named as covered). MEASURED against the pre-fix script at 637c21c19:
   # both passed GREEN (rc 0, "scanned 63+94") beside a `${REPO:-$PWD}` that reddened. An arm that
   # cannot fail is decoration, so this one is run against that pre-fix script too and FAILS there.
-  for _m5 in '$AI' '$(pwd)'; do
+  # ⛔ AND THE BACKTICK SPELLING OF THE SAME SUBSTITUTION (#3054 review, P2 — a FAIL-OPEN): the test
+  # asked only about `$(`, so `REPO=` + a backticked `pwd` passed the gate while `REPO="$(pwd)"`
+  # reddened. Closing one spelling of a command substitution and not the other is the
+  # "a PR or an agent can defeat it" class, so it is a mutant here beside `$(pwd)`.
+  for _m5 in '$AI' '$(pwd)' '`pwd`'; do
     mut_copy
     printf 'REPO="%s"\n' "$_m5" >> "$MUTDIR/pi-reap-worktrees.sh"
     mut_out="$(bash "$MUTDIR/orchestrator-harness/check-single-source.sh" 2>&1)"; mut_rc=$?

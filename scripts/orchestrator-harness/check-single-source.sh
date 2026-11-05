@@ -455,7 +455,20 @@ repo_path_default_hits() {
       if (v == "") return 1                              # `${REPO:-}` — no default at all
       if (v == "$(resolve_repo)") return 1                 # the ONE resolver
       if (v ~ /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/) return 1 # a slug, as `OR` takes
-      return 0
+      # ⛔ A LITERAL / HOME / `$PWD` PATH IS NEVER AN ALLOWED DEFAULT (#3054 review, P2). `sanctioned()`
+      # says "no `$` and no `$(`, so it is a positional or a literal" — correct for the RHS of a plain
+      # assignment, because `pathish()` has already graded those before it is asked. THIS function has no
+      # such pre-check, so delegating blindly to it accepted `REPO="${REPO:-/tmp/cell}"`: measured, the
+      # whole `REPO_DEFAULT_KNOWN` debt list went green (cloud-cell-doctor.sh reported "no longer carries
+      # a default"). The path question is asked HERE, first, for the same reason it is asked on the plain
+      # branch.
+      if (pathish(v)) return 0
+      # ⛔ THE REST OF THE QUESTION IS THE SAME ONE (#3054 review, P2). Before this, ANY other value was
+      # refused, so the two spellings disagreed ON THE SAME VALUE: MEASURED, `REPO="$HERE"` (a value the
+      # file itself MEASURED, which the contract of this arm sanctions) passed while
+      # `REPO="${REPO:-$HERE}"` was refused — and the comment further down invites exactly that spelling.
+      # Delegating means one rule with one answer, which is the property the two branches must share.
+      return sanctioned(v)
     }
     # ⛔ THE SAME QUESTION, NOW ASKED OF THE PLAIN-ASSIGNMENT SPELLING (#3054 review, P1).
     # `allowed_default` above was reached ONLY inside the `${REPO:-…}` branch, so the arm graded the
@@ -478,7 +491,13 @@ repo_path_default_hits() {
       # a SLUG DEFAULT — the exemption `allowed_default` already makes, so the two spellings agree:
       # `${FLEET_REPO:-daniel-ospina/agent-infra}` is a different defect (REPO-as-SLUG), not a path.
       if (v ~ /^\$\{[A-Za-z_][A-Za-z0-9_]*:?-[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+\}$/) return 1
-      if (v ~ /^[*?[]/ || index(v, "|") > 0) return 1              # a `case` PATTERN, not a value
+      if (v ~ /^[*?[]/) return 1                                   # a `case` PATTERN, not a value
+      # ⛔ A PIPE IS ONLY A PATTERN WHEN IT IS NOT A SUBSTITUTION (#3054 review, P2). An unqualified
+      # `index(v, "|")` exempted any value containing one, including the shape a script writes when it
+      # "should not fail": MEASURED, `REPO="$(git rev-parse --show-toplevel 2>/dev/null || echo
+      # /tmp/cell-ai)"` exited 0 — a `||` FALLBACK TO A PRIVATE DEFAULT wearing a pipe. A real `case`
+      # arm (`REPO=*|OR=*)`) carries no substitution, so the carve-out is kept for patterns only.
+      if (index(v, "|") > 0 && index(v, "$(") == 0 && index(v, "`") == 0) return 1
       # An ASSIGNMENT PREFIX ON A COMMAND (`REPO="$TMP/x" O="$TMP/o" env …`): the caller supplies the
       # value for ONE invocation — the `REPO="$1"` class. Recognised by a second `NAME=` after the
       # first word.
@@ -496,7 +515,13 @@ repo_path_default_hits() {
         if (nm != "REPO" && !(nm in own)) unknown = 1
       }
       if (named) return !unknown
-      if (index(v, "$(") == 0) return 1          # positionals and literals only
+      # ⛔ A BACKTICK IS THE SAME COMMAND SUBSTITUTION (#3054 review, P1 — a FAIL-OPEN). This test
+      # asked only about `$(`, so the identical substitution in its older spelling walked through:
+      # MEASURED on the shipped tree, `REPO=` + a backticked `pwd` exited 0, while `REPO="$(pwd)"`
+      # reddened — one spelling of one shape, and the gate named `$(pwd)` in its own comment as
+      # covered. Closing one spelling of a command substitution and not the other is the
+      # "a PR or an agent can defeat it" class, so both are asked about here.
+      if (index(v, "$(") == 0 && index(v, "`") == 0) return 1   # positionals and literals only
       # A COMMAND SUBSTITUTION THAT READS NOTHING is computed from AMBIENT state — `$(pwd)` is the
       # `$PWD` default one indirection over. One carve-out: a value ASKED OF THE REMOTE for the
       # owner/name slug (`nameWithOwner`) is never a wrong checkout path.
@@ -544,6 +569,19 @@ repo_path_default_hits() {
       # repeatedly (so `local -r REPO=` is seen too), then require the assignment itself.
       while (ln ~ /^(export|local|readonly|declare|typeset)([ \t]+-[A-Za-z]+)*[ \t]+/)
         sub(/^(export|local|readonly|declare|typeset)([ \t]+-[A-Za-z]+)*[ \t]+/, "", ln)
+      # ⛔ A SECOND COMMAND ON THE LINE IS HANDLED BY THE SEPARATOR STRIP ABOVE, NOT BY WIDENING THIS
+      # MATCHER (#3054 review, P2 — RE-OPENED AND REVERTED, with the measurement). A preceding
+      # `[ -z "${REPO:-}" ] && REPO=/tmp/cell-ai` is a real bypass of a leading `^REPO=` test, and this
+      # matcher was widened to `(^|[ \t;&|(){])REPO=` to close it. ⛔ MEASURED: that reddened 17
+      # HONEST sites in the shipped tree — the gate grading its OWN awk source (`…REPO=/)) {`), a
+      # diagnostic that quotes a command line (`die "… REPO=/home/cmux/tortoise) …"`), test fixtures
+      # whose printf argument IS an assignment, and reads written as `list="$(printf …)"`. A
+      # path-shape guard was tried and still caught the first two. The stated rule of this arm is that
+      # a gate which refuses honest trees is how a gate gets switched off, so the widening is REVERTED
+      # and the residual is named instead of paid for with false reds:
+      #   RESIDUAL: `&& REPO=/tmp/x` / `|| REPO="$AMBIENT"` — an assignment behind a separator — is not
+      #   graded here. The RUNTIME is unaffected (`resolve_repo` refuses any value that is not a
+      #   checkout), so what is lost is the coverage of the gate, not the safety of the box.
       if (ln !~ /^REPO=/) next
       val = ln
       sub(/^REPO=/, "", val)                              # the value, without the assignment
@@ -561,14 +599,36 @@ repo_path_default_hits() {
           if (substr(vnc, i, 1) == "\"" || substr(vnc, i, 1) == q39) nq++
         if (nq % 2 == 0) val = vnc
       }
+      # ⛔ NEITHER IS A SECOND COMMAND ON THE SAME LINE (#3054 review, P2): `REPO="/tmp/cell-ai";
+      # export REPO` is the same default with a trailing statement, and it stopped the value ending in
+      # a quote just as a comment did — MEASURED, it exited 0. Same balanced-quote guard, same reason:
+      # `REPO="/x; y"` is ONE path and cutting at the `;` would hide it.
+      # ⛔ `[;&|]+` IS A CLASS, NOT ONE CHARACTER: with `[;&|][^;&|]`, `a || b` does not match at the
+      # first `|` (the next char is also `|`), so the engine matches at the SECOND one and leaves a
+      # dangling `|` on the value — measured, that stopped `REPO="$(resolve_repo)" || exit $?` from
+      # being recognised as the resolver and reddened three shipped call sites.
+      vnc = val
+      if (sub(/[ \t]*[;&|]+[^;&|].*$/, "", vnc)) {
+        nq = 0
+        for (i = 1; i <= length(vnc); i++)
+          if (substr(vnc, i, 1) == "\"" || substr(vnc, i, 1) == q39) nq++
+        if (nq % 2 == 0) val = vnc
+      }
+      sub(/[ \t]+$/, "", val)
       # One layer of MATCHING quotes off, so `${REPO:-…}` is seen as the expansion it is (and not as a
       # string that happens to start with a quote). A value quoted only on one side is left alone.
       q = substr(val, 1, 1)
       if ((q == "\"" || q == q39) && length(val) > 1 && substr(val, length(val), 1) == q)
         val = substr(val, 2, length(val) - 2)
-      if (val ~ /^\$\{REPO:?-.*\}$/) {                  # ${REPO:-<default>} / ${REPO-<default>}
+      # ⛔ EVERY OPERATOR THAT CAN CARRY A DEFAULT, NOT JUST `:-` (#3054 review, P2). This matched
+      # `:-` and `-` only, so `REPO="${REPO:=/tmp/cell-ai}"` — the exact default this PR deletes, one
+      # character over — fell through to the plain-assignment branch, where `sanctioned()` read the
+      # `${REPO` expansion as "the value this file already holds" and exempted it: MEASURED, rc 0 vs rc 1 for
+      # the `:-` control. `=`, `:=`, `:?`, `?` and the `+` forms are all assignments-or-refusals the
+      # operator can hand a private path to.
+      if (val ~ /^\$\{REPO:?[-=+?]/) {                  # ${REPO:-…} ${REPO-…} ${REPO:=…} ${REPO:+…} …
         inner = val
-        sub(/^\$\{REPO:?-/, "", inner)
+        sub(/^\$\{REPO:?[-=+?]/, "", inner)
         sub(/\}$/, "", inner)
         if (allowed_default(inner)) next                   # no default, a slug, or the resolver: not this arm
         print FILENAME ":" FNR ": " $0
@@ -578,7 +638,11 @@ repo_path_default_hits() {
       # `${REPO:-…}` branch asks: not "does it look like a path" (which missed `$AI` and `$(pwd)`)
       # but "is this value the decision of the BOX, or a guess by this script".
       if (pathish(val)) { print FILENAME ":" FNR ": " $0; next }
-      if (index(val, "$") > 0 && !sanctioned(val)) print FILENAME ":" FNR ": " $0
+      # ⛔ A BACKTICK REACHES THE SAME QUESTION AS `$` (#3054 review, P1). This dispatch asked only
+      # about `$`, so ``REPO=`pwd` `` never even reached `sanctioned()` and no arm could see it — the
+      # value contains no dollar sign at all. The OLDER spelling of the same command substitution is
+      # the same defeat, so both open the gate here and `sanctioned` decides.
+      if ((index(val, "$") > 0 || index(val, "`") > 0) && !sanctioned(val)) print FILENAME ":" FNR ": " $0
     }
   ' "$@"
 }
@@ -620,7 +684,13 @@ for f in "$_dir"/*.sh; do
   _base="${f##*/}"
   case " $REPO_DEFAULT_KNOWN " in
     *" $_base "*)
-      _hits="$(repo_path_default_hits "$f")"
+      _hits="$(repo_path_default_hits "$f")"; _scan_rc=$?
+      # ⛔ A SCAN THAT DID NOT RUN IS NOT A CLEAN SCAN (#3054 review, P1 — a FALSE PASS). `awk`'s exit
+      # status was discarded at BOTH call sites, so a scanner that could not run was read as "no hits":
+      # MEASURED with awk stubbed to exit 127, a tree carrying `REPO="${REPO:-$PWD}"` still exited 0 and
+      # printed "ok: the REPO path-default arm scanned 72 + 103". `unknown` is rc 2 (cannot verify) and
+      # is never a pass, which is the only correct answer for a scan whose instrument failed.
+      [ "$_scan_rc" -eq 0 ] || unknown "the REPO path-default scan FAILED on $_base (repo_path_default_hits rc=$_scan_rc) — a scan that did not run is not a clean one"
       if [ -n "$_hits" ]; then
         _first_line="$(printf '%s\n' "$_hits" | head -1 | cut -d: -f2)"
         repo_known_hits="$repo_known_hits $_base:$_first_line"
@@ -629,9 +699,14 @@ for f in "$_dir"/*.sh; do
       fi
       continue ;;
   esac
-  # ⛔ READ WITH A HEREDOC, NOT A PIPE: a `… | while read` loop runs in a SUBSHELL, so `diverge` would
+  # ⛔ SCAN ONCE, INTO A VARIABLE, SO THE STATUS SURVIVES (#3054 review, P1 — the same FALSE PASS). A
+  # `$(…)` in a heredoc's body discards the status entirely; an assignment keeps it.
+  _hits="$(repo_path_default_hits "$f")"; _scan_rc=$?
+  [ "$_scan_rc" -eq 0 ] || unknown "the REPO path-default scan FAILED on $_base (repo_path_default_hits rc=$_scan_rc) — a scan that did not run is not a clean one"
+  # ⛔ READ FROM THE VARIABLE, NOT A PIPE: a `… | while read` loop runs in a SUBSHELL, so `diverge` would
   # increment a copy of `problems` and the arm could never make the check red — the inert-gate failure
-  # inside the arm that exists to catch it.
+  # inside the arm that exists to catch it. (A heredoc is a redirect, not a subshell, which is why it
+  # was used here; reading the already-captured variable keeps that property AND the exit status.)
   while IFS= read -r _hit; do
     [ -n "$_hit" ] || continue
     # ⛔ NO BACKTICKS IN THIS MESSAGE. It is a double-quoted string, so `…` would be COMMAND
@@ -640,7 +715,7 @@ for f in "$_dir"/*.sh; do
     # exactly on the red it exists to explain, and looks fine on every green run.
     diverge "REPO has a PRIVATE path default: $_hit — REPO is set ONCE per box (the launchd plist on a Mac, keys.env on a cell) and read through repo-slug.sh's resolve_repo, which REFUSES by name. A per-script default points every other box at a path it does not have, and \$PWD is / under launchd, which is a real directory that is not a repo."
   done <<EOF
-$(repo_path_default_hits "$f")
+$_hits
 EOF
 done
 done
