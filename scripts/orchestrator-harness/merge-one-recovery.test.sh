@@ -402,6 +402,25 @@ rc=0; merge_ran && { rc=1; note "a MERGE ran on a PR-caused red (via: $(merge_ra
 ck "RED→GREEN: …and merges nothing (a red the PR caused is not mergeable, whatever the gate says)" $rc
 rc=0; no_park || { rc=1; note "a single red cycle parked the head (the bound is 3): $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
 ck "RED→GREEN(exit-0): …and does NOT park on cycle 1/3 (a flaky shard re-runs green)" $rc
+# ⛔ THE GROUPS ARE LOGGED WHOLE, NOT TRUNCATED (#3440 review, nit 5). Six messages in `merge-one.sh`
+# promise that the failing groups are "named in the check-carry stderr in this log", but the generic
+# stderr line keeps only the first 800 bytes — a big red set, or an earlier diff-read warning, cuts
+# the one datum those messages promise. `_cc_ask` now also logs the `Red group(s):` /
+# `You are accepting:` lines untruncated. The preamble below is LONGER than that window, so the
+# first assertion proves the truncation is real and the second is the pin: delete the untruncated
+# line and it goes red.
+CC_PRE="$(printf 'x%.0s' $(seq 1 900))"
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-surface FAKE_CC_RC=7 \
+                 FAKE_CC_STDERR="${CC_PRE}
+   Red group(s): CI|verify CI|bash-suites (3).")"
+rc=0; CC_TRUNC="$(command sed -n '/check-carry stderr:/p' "$MRG/o/logs/merge-$PR.log" 2>/dev/null || true)"
+case "$CC_TRUNC" in *"Red group(s):"*) rc=1; note "the preamble did NOT push the group line past the 800-byte window, so this fixture cannot discriminate: $CC_TRUNC" ;; esac
+ck "NON-VACUITY: a >800-byte preamble really does push the group line out of the truncated stderr line" $rc
+unset CC_TRUNC
+rc=0; log_has "check-carry RED GROUPS (untruncated):" && log_has "Red group(s): CI|verify CI|bash-suites (3)" || { rc=1; note "the red groups were NOT logged untruncated, so the log's promise ('the groups are named in this log') is false again: $(tail -4 "$MRG/o/logs/merge-$PR.log" | cut -c1-200)"; }
+ck "RED→GREEN: …so the RED GROUPS are logged WHOLE, which is what the operator-facing messages promise" $rc
+unset CC_PRE
 
 mkmrg; mkrecorder; write_record "$HEAD" clean
 out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-base-owned FAKE_CC_RC=0)"

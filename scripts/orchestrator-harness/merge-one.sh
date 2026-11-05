@@ -933,10 +933,22 @@ _cc_ask() {
   # fell to the `*` arm and bought the 20-40 minute review this block removes. It also made the
   # DIFFREAD_TRIES bound inert in the one population it was added for. The two streams are captured
   # SEPARATELY and both are logged, so the diagnosis is not lost by fixing the token.
-  local out err errf
+  local out err errf groups cc_ln
   errf="${TMPDIR:-/tmp}/merge-$PR-cc.$$"
   out="$("$RECORDER" --check-carry "$PR" "$OR" 2>"$errf")"; CC_RC=$?
   err="$(cat "$errf" 2>/dev/null)"; rm -f "$errf" 2>/dev/null || true
+  # ⛔ THE RED-GROUP LINES ARE KEPT WHOLE, NOT TRUNCATED (#3440 review, nit 5). Six messages in this
+  # file promise the operator that the failing groups are "named in the check-carry stderr above / in
+  # this log", but the log line below keeps only the first 800 bytes — so a large red set, or an
+  # earlier diff-read warning, could push the one datum those messages promise out of the log. They
+  # are extracted from the RAW stderr, because the newline flattening below makes line-wise
+  # extraction impossible afterwards, with the same two markers check (c) relays.
+  groups=""
+  while IFS= read -r cc_ln; do
+    case "$cc_ln" in
+      *"Red group(s):"* | *"You are accepting:"*) groups="${groups}${groups:+; }${cc_ln}" ;;
+    esac
+  done <<< "$err"
   CC_TOKEN="${out%%$'\n'*}"; CC_TOKEN="${CC_TOKEN%%$'\t'*}"
   out="${out#*$'\n'}"
   # ⛔ NO PIPE (#841/#864: a producer into a quiet reader can take SIGPIPE and read as failure): the
@@ -945,6 +957,9 @@ _cc_ask() {
   out="${out//$'\n'/ }"; err="${err//$'\n'/ }"
   [ -n "$out" ] && echo "[merge $PR] check-carry rc=$CC_RC token=[${CC_TOKEN:-<none>}] says: ${out:0:400}" >> "$L.log"
   [ -n "$err" ] && echo "[merge $PR] check-carry stderr: ${err:0:800}" >> "$L.log"
+  # …and the groups, untruncated, so the promise the operator-facing messages make is honoured even
+  # when the 800-byte window above cut them off.
+  [ -n "$groups" ] && echo "[merge $PR] check-carry RED GROUPS (untruncated): $groups" >> "$L.log"
   # ⛔ A READABLE ANSWER BREAKS THE UNREADABLE STREAK (fresh review of #3037, P3-1). The cap in the
   # `3:unreadable` arm is head-keyed, so without this a box that recovered on cycle 2 and then hit a
   # single contended read on cycle 4 at the SAME head would inherit a count nobody can explain. The

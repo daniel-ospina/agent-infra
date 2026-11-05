@@ -3595,7 +3595,7 @@ C3315_STUB_EOF
     rm -f "$log"
   }
   echo ""
-  echo "== SIMULATION: passes 15–35 (#3315 × #3440: check (c) consults the carry) =="
+  echo "== SIMULATION: passes 15–38 (#3315 × #3440: check (c) consults the carry) =="
   # ⛔ HERMETIC KEY STATE (found the hard way). `review_gate_key` falls back to
   # ~/.pi/agent/.ai-review-gate-key, so these cases inherited whatever key the BOX
   # happened to hold. Measured: with a key file present, pass 30 (an admitted comment
@@ -5739,7 +5739,7 @@ $big_filler"
   unset reval_sh pipeline_repo_root pipeline_wf pipeline_is_self 2>/dev/null || true
 
   # ── #3315 — CHECK (c) CONSULTS THE CARRY: run the FAIL_ALL arms for real ───
-  # The vectors themselves live in the FAIL_ALL block (passes 15–34), the same
+  # The vectors themselves live in the FAIL_ALL block (passes 15–35), the same
   # way #1356's clean-low vectors do — and for the same reason (#991): CI runs
   # SELF_TEST and never FAIL_ALL, so a vector that only lives there is executed by
   # nothing and pins nothing. This subprocess run is what puts them in front of

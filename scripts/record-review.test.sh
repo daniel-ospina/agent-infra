@@ -5127,8 +5127,8 @@ else
 fi
 
 # 14.14 THE ALLOW-LIST POLARITY (review finding 1). The repo mandate (AGENTS.md
-#       §"Reading verification state" step 4, implemented by target_head_red in
-#       this same file) is: only success/neutral/skipped are green and
+#       §"Reading verification state" step 4, implemented by this file's `#633`
+#       rerun predicate) is: only success/neutral/skipped are green and
 #       cancelled/stale are non-red; EVERY OTHER conclusion is RED — including
 #       one GitHub has not documented and a null one. A CLOSED red-list
 #       (failure/cancelled/timed_out/action_required) read an unrecognised or
@@ -5157,7 +5157,9 @@ else
     ok "14.14c cancelled is non-red — no rerun"
 fi
 # 14.14d an unrecognised STATUS with a NULL conclusion is RED (in-flight is the
-#        named set only) — the same decision target_head_red makes.
+#        named set only) — the same decision the `#633` rerun predicate makes.
+#        (`target_head_red` was DELETED by #3440; cite the live predicate, never a
+#        name that no longer exists in record-review.sh.)
 STUB_BODY="PR body" run_record_633 424335 "$SHA" \
     '[{"name":"ai-review-gate","status":"something_new","conclusion":null,"id":613}]'
 grep -qF -- "actions/jobs/613/rerun" "$LOG" && ok "14.14d an unknown status with a NULL conclusion is RED" || bad "14.14d an unknown status read as pending/non-red (log: $(cat "$LOG"))"

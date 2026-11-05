@@ -80,8 +80,11 @@
 #   with a red live head must not answer `carry`). ⛔ NO SHA IS EVER SUBSTITUTED FOR IT: if
 #   the live head cannot be READ on the `carry` arm, the answer is `surface-unknown`/8, never
 #   a licence on the recorded head (review of 988d0968, BLOCKING). An EMPTY surface and an
-#   IN-FLIGHT one keep the normal token and are named loudly on stderr — neither is green,
-#   and #2342 records why an absent surface must not become a refusal here.
+#   IN-FLIGHT one keep the normal token and are named loudly on stderr — neither is green. NEITHER
+#   IS A REFUSAL EITHER, and the reason is the DEADLOCK one, not a decision of #2342's: refusing an
+#   absent surface would redden every head whose checks have not attached yet and would deadlock a
+#   required check whose only run is the excluded gate. #2342 governs the half this DOES honour —
+#   an empty/ratelimited answer must never be read as a GREEN tree (the record says `unknown`).
 #
 #     norecord    4  no record for this PR/repo — there is no verdict to carry
 #                    (with no repo resolved: no unique `<owner>-<repo>-<pr>.json`
@@ -2667,11 +2670,14 @@ RECORD_REVIEW_RED_EXCLUDE="ai-review-gate ai-review-gate-tests"
 # different facts, and the two consumers map them DIFFERENTLY — deliberately, and the
 # mapping is stated here because a future editor who guesses it wrong weakens a veto:
 #   · clause E (the carry veto) CONTINUES on `green`/`empty`/`in_flight`, REFUSES on `red`,
-#     and REFUSES on `unreadable` (its `rc` check). #2342 records why an EMPTY surface must
-#     not refuse there;
+#     and REFUSES on `unreadable` (its `rc` check). An EMPTY surface is not refused there because
+#     refusing it would deadlock a required check whose only run is the excluded gate (#2342
+#     governs only the other half: an empty answer is never evidence of GREEN, which the record
+#     honours by writing `unknown`);
 #   · `--check-carry` keeps the normal answer for `green`/`empty`/`in_flight` (loudly, for
-#     the latter two), and REFUSES `red` (as `red-surface`/`red-base-owned`) and `unreadable`
-#     (as `surface-unknown`). An unreadable surface must never be recorded as anything
+#     the latter two), and RESOLVES `red`: `red-surface` REFUSES it, while `red-base-owned` is a
+#     LICENCE (exit 0, the record does cover the artifact — §21.3), and `unreadable` becomes
+#     `surface-unknown`. An unreadable surface must never be recorded as anything
 #     resembling green, and neither must an empty one — the record says `unknown` for both.
 # ⛔ NAMED RESIDUAL: THE GROUPING KEY IS `(app.slug, name)`, NOT `(app.slug, workflow, name)`.
 # `AGENTS.md` §"Reading verification state" says the healthy-tree reader must group by the workflow
@@ -2915,11 +2921,12 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   #       this head; the red is the BASE's and reproducing base reds with evidence is
   #       the rail's decision (#3322/#3715), not a reason to buy a 20-40 minute
   #       review. Named, never silent — that is the whole difference #3440 asks for.
-  #   empty (the API ANSWERED)   → the normal answer + a loud NOT-GREEN line. #2342
-  #       records the decision this respects: an absent surface is not evidence of
-  #       anything, and refusing on it would redden every head whose checks have not
-  #       attached yet (and deadlock a required check whose only run is the excluded
-  #       ai-review-gate). It is reported as `unknown` in the RECORD, never `green`.
+  #   empty (the API ANSWERED)   → the normal answer + a loud NOT-GREEN line. The reason it is not
+  #       a REFUSAL is the DEADLOCK one, and it is stated as such rather than attributed to #2342
+  #       (which decides the opposite half, see below): refusing would redden every head whose
+  #       checks have not attached yet, and would deadlock a required check whose only run is the
+  #       excluded ai-review-gate. What #2342 DOES govern here is that such an answer is never
+  #       evidence of green — the record says `unknown`, never `green`.
   #   unreadable (the read FAILED) → `surface-unknown` exit 8. A refused read is its
   #       OWN answer and must not be laundered into a green one (#2342, applied to
   #       this question). The remedy is RETRY, not a re-review.
@@ -4423,7 +4430,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         exit 3
         else
         echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD'S CHECK SURFACE COULD NOT BE READ (UNREADABLE), so “not red” was never established." >&2
-        echo "   A carry re-binds a SIGNED verdict to a new head, so it needs the head's health READ and not merely un-refuted. An EMPTY surface (the API ANSWERED, nothing red) is deliberately not this state — check_surface_scan keeps the two apart and #2342's mapping lets empty through — but a REFUSED read is its own answer and nothing was established by it. Re-read the head's checks once the budget window resets, or re-review at ${CURRENT_HEAD:0:12}… and re-record." >&2
+        echo "   A carry re-binds a SIGNED verdict to a new head, so it needs the head's health READ and not merely un-refuted. An EMPTY surface (the API ANSWERED, and NOTHING OBSERVABLE is left after the exclusion — so `empty` can sit over an EXCLUDED red, which is why it is not a green answer) is deliberately not this state — check_surface_scan keeps the two apart, and an empty surface is never read as a green tree — but a REFUSED read is its own answer and nothing was established by it. Re-read the head's checks once the budget window resets, or re-review at ${CURRENT_HEAD:0:12}… and re-record." >&2
         exit 3
         fi
       fi
