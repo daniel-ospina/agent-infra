@@ -628,16 +628,77 @@ def test_I3b_the_liveness_axis_is_a_payload_extension_of_the_shipped_pair(tmp_pa
     # lane can never be dead (that ordering is a safety property, not an oversight).
     row = {"lane_id": "L1", "state": "RUNNING", "heartbeat_at": int(time_now()) - 3600,
            "budget_s": 600, "pid": os.getpid(), "worktree": "/tmp/wt1"}
-    lane_rows = [{"ws": "WS1", "cwd": "/tmp/wt1", "cpu_busy": True, "child": "kid-sid-1",
-                  "child_stale": False, "child_grew": True}]
+    # ⛔ THE FIXTURE SPEAKS THE PRODUCER'S OWN SCHEMA. It used to pass `cpu_busy` and a BOOLEAN
+    # `child_stale` — NEITHER of which `lane-status.py --json` emits. `cpu_busy` exists only as a
+    # `classify()` keyword there (the row's key is `cpu`), and `child_stale` is an AGE IN SECONDS. So
+    # this arm asserted that the join worked against an invented contract: it passed green over a
+    # production path where step 2 was permanently UNMEASURED and step 3's veto was dropped for any
+    # child older than one second. The keys here are exactly the row's.
+    lane_rows = [{"ws": "WS1", "cwd": "/tmp/wt1", "cpu": True, "cpu_any": True,
+                  "child": "kid-sid-1", "child_stale": 12, "child_grew": True}]
     got = reg.liveness.read(row, lane_rows, "stub", tree=True)
     assert got["state"] == "working", got          # step 3 veto: child in flight
     assert got["reason"] == "child-in-flight", got
-    assert got["evidence_source"]["step2"]["cpu_busy"] is True
+    assert got["evidence_source"]["step2"]["cpu"] is True
     assert got["children"]["child"] == "kid-sid-1"
     assert got["children"]["via"].startswith("liveness.gather")
     vocab = list(mod.Liveness.SURFACE) + ["dead"]
     assert got["state"] in vocab
+
+
+def test_I3c_the_join_reads_the_producers_real_schema(monkeypatch):
+    """The step-2/3 join is pinned against `lane-status.py`'s ACTUAL row keys, not a guessed contract.
+
+    Three defects this arm exists to catch, all measured on the pre-fix code:
+      1. `cpu_busy` is not a row key (the row carries `cpu` / `cpu_any`), so step 2 was always
+         `advanced=None` — permanently unmeasured — while the payload published
+         `source="lane-status.py::lane_cpu_busy"`, i.e. claimed a measurement nobody took.
+      2. `child_stale` is `int(time.time() - mtime)`, an AGE. `bool()` on it says "stale" for any
+         child older than one second, dropping the step-3 veto the step exists to provide.
+      3. An ABSENT `cpu` must abstain, never be reported as a measurement.
+    """
+    mod = server_mod(monkeypatch)
+    mods = mod.Modules()
+    reg = mod.Registry(mods)
+    row = {"lane_id": "L1", "state": "RUNNING", "heartbeat_at": int(time_now()) - 3600,
+           "budget_s": 600, "pid": os.getpid(), "worktree": "/tmp/wt1"}
+    # (1) a FRESH child (age 12 s, far under the producer's ABANDON_S) must VETO.
+    got = reg.liveness.read(row, [{"ws": "WS1", "cwd": "/tmp/wt1", "cpu": None,
+                                   "child": "kid-1", "child_stale": 12}], "stub", tree=True)
+    assert got["reason"] == "child-in-flight", got
+    # (2) an ABANDONED child (past ABANDON_S) must NOT veto — the ladder stays free to call it wedged.
+    got = reg.liveness.read(row, [{"ws": "WS1", "cwd": "/tmp/wt1", "cpu": None,
+                                   "child": "kid-1", "child_stale": mod.CHILD_ABANDON_S + 1}],
+                            "stub", tree=True)
+    assert got["reason"] != "child-in-flight", got
+    # (3) and with no `cpu` attribution the sample says UNMEASURED rather than claiming a source.
+    got = reg.liveness.read(row, [{"ws": "WS1", "cwd": "/tmp/wt1"}], "stub", tree=True)
+    step2 = got["evidence_source"]["step2"]
+    assert step2["cpu"] is None and "UNMEASURED" in step2["unmeasured"], step2
+
+
+def test_I3d_CHILD_ABANDON_S_mirrors_the_producer(monkeypatch):
+    """`CHILD_ABANDON_S` is a COPY of `lane-status.py`'s `ABANDON_S`, so it is pinned against it.
+
+    `lane-status.py` runs as a SUBPROCESS here, so the bound cannot be imported — it is re-declared,
+    which means it can drift. A drifted bound is silent by construction: too small and a live child
+    stops vetoing (the finding this whole step answers), too large and an abandoned record masks a
+    real wedge. This arm reads the producer's own definition and reds on any difference.
+    """
+    import re
+    src = open(os.path.join(_HERE, "..", "..", "scripts", "lane-status.py"),
+               encoding="utf-8").read()
+    m = re.search(r"^ABANDON_S\s*=\s*(.+?)\s*(?:#.*)?$", src, re.M)
+    assert m, "lane-status.py no longer defines ABANDON_S — the mirror must be re-derived"
+    expr = m.group(1)
+    # Only a literal product of ints is accepted: this must not become an eval of arbitrary source.
+    assert re.fullmatch(r"[0-9]+(?:\s*\*\s*[0-9]+)*", expr), (
+        "ABANDON_S is no longer an int literal product: %r — re-derive the mirror by hand" % expr)
+    want = 1
+    for part in expr.split("*"):
+        want *= int(part.strip())
+    got = server_mod(monkeypatch).CHILD_ABANDON_S
+    assert got == want, ("server.CHILD_ABANDON_S=%d != lane-status.py ABANDON_S=%d" % (got, want))
 
 
 def time_now():

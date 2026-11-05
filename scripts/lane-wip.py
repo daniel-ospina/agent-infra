@@ -124,12 +124,23 @@ def collect(key, chars=400, want=1):
                                    % (str(sid)[:8] or "<none>", SESS)))
     age_m = (time.time() - os.path.getmtime(path)) / 60.0
     turns_read = turns(path, want)
+    # ⛔ THE TRUNCATION MARKER IS APPLIED HERE, ONCE, so the prose and the JSON cannot disagree —
+    # the contract this payload exists to keep. The rewrite that introduced `collect()` dropped the
+    # `("…" if len(t) > chars)` the prose branch used to carry, so an operator could no longer tell a
+    # truncated turn from a complete one: the ONE thing `--chars` exists to make unambiguous.
+    # ⛔ AND `turns_truncated` NOW MEANS WHAT IT SAYS. It used to be set to `want` — the REQUESTED
+    # turn count — so a machine consumer reading it as a truncation flag was wrong on every call.
+    # The requested count is reported, correctly named, as `turns_requested`.
+    shown = [t[:chars] + ("\u2026" if len(t) > chars else "") for t in turns_read]
     return 0, dict(base, lane=row.get("lane"), ws=row.get("ws"), sid=sid, verdict=verdict,
                    session_file=path, session_age_m=round(age_m, 1),
-                   turns=[t[:chars] for t in turns_read],
-                   turns_truncated=want, route=("unfinished -> nudge it to CONTINUE that work; "
-                                                "finished -> hand it the next unheld item; "
-                                                "a question -> route it (ask-owner.py)"))
+                   turns=shown,
+                   turns_requested=want,
+                   turns_truncated=any(len(t) > chars for t in turns_read),
+                   chars=chars,
+                   route=("unfinished -> nudge it to CONTINUE that work; "
+                          "finished -> hand it the next unheld item; "
+                          "a question -> route it (ask-owner.py)"))
 
 
 def main():
