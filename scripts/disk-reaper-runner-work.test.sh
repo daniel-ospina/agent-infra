@@ -398,6 +398,18 @@ case_b() { # <entry-point> <owner>
     ps_out="$(DISK_REAPER_STATE_DIR="$s2" bash "$pass" --print-status 2>/dev/null)"
     case_check "$(grep -qE '(^|\|)verdict_runner_work=ok(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
                "… and --print-status RENDERS that verdict, so the field has a reader and not only a writer"
+    # ⛔ AND THE SIBLING `record_body` WRITES FOR THE **DUPLICATE-INSTALL** CLASS (#3057 review, P1).
+    # `verdict_duplicate_install=` is written every pass (`disk-reaper.sh`'s `record_body`) and PARSED out
+    # of this verb by `cloud-cell-supervisor.sh:4209`; nothing emitted it, so the supervisor's `_dr_dup`
+    # was permanently empty and its two trouble arms printed a literal `duplicate-install=?` — this
+    # record's own token for "could not measure" — over a class the record HAD answered. It survived
+    # review because the supervisor's suite HAND-WRITES the field into its fixture, so nothing checked
+    # that the producer emits it. This assertion is that check: it fails if the line is removed from
+    # `print_status`, and it is deliberately the WEAK form (renders at all, value present) rather than
+    # `=ok`, because which verdict this pass records for a class it was not asked to run is not this
+    # case's subject — that it is READABLE is.
+    case_check "$(grep -qE '^verdict_duplicate_install=.+$' <<<"$ps_out" && echo 0 || echo 1)" \
+               "… and --print-status RENDERS verdict_duplicate_install, so the supervisor parses a field the producer actually emits"
     return $((CASE_FAIL > 0))
 }
 

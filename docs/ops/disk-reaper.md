@@ -1421,7 +1421,7 @@ reaps" was false in each clause. What was actually missing, stated so a reader c
 `--print-status` — the field's only READER — had **no assertion at all** anywhere in the suite (the only
 `print-status` reference in `runner-work.test.sh` is the one added at this revision). So it now reads `ok`
 on case (b)'s reaping pass (measured at this head), `--print-status` is asserted to RENDER it, and deleting
-the record line turns case (b) red: that mutation is (b)'s second, counted among the 34 above.
+the record line turns case (b) red: that mutation is (b)'s second, counted among the 39 above.
 The classes suite was **killed at 30 minutes with no result** on the box that measured this PR (load
 180–220), so at that point the record-field delta was **unmeasured** and a green run of the owner-level
 suite below could not be read as covering it. It was then **run to completion at load ~15 on the same

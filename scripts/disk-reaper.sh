@@ -561,6 +561,20 @@ print_status() {
     # so it must be printable, or it does not exist (the rule two paragraphs down).
     log_line "delegate_verdict_worktree=$(status_field delegate_verdict_worktree)"
     log_line "verdict_runner_work=$(status_field verdict_runner_work)"
+    # ⛔ AND `verdict_duplicate_install=` ON THE SAME RULE — it was the ONE field of the five the rule
+    # above is written for that the reader still could not print (#3057 review, P1). `record_body` has
+    # written it every pass since the class landed, `cloud-cell-supervisor.sh` parses it out of THIS
+    # verb's output, and nothing emitted it — so `_dr_dup` was permanently empty and both operator-facing
+    # trouble arms (`⏸ DEFERRED` and `⛔ NOT HEALTHY`) rendered a literal `duplicate-install=?`. `?` is
+    # this record's own token for "could not measure", so the line asserted a state the record
+    # contradicts: the record holds `deferred` / `fail-closed` / `removal-failed` on every such pass.
+    # The healthy arm's `_dr_cls_note duplicate-install` could never fire either, for the same reason.
+    # ⛔ THE REASON IT SURVIVED REVIEW IS THE TEST, not the code: `cloud-cell-supervisor.test.sh`
+    # HAND-WRITES `verdict_runner_work=` into its status fixture (:3329, :3343), so the supervisor's
+    # parse was asserted only against an input the PRODUCER never emitted — a false PASS. The suite this
+    # line is guarded by now asserts the producer RENDERS it (that suite's `case_g`), so the fixture and
+    # the producer can no longer disagree in silence.
+    log_line "verdict_duplicate_install=$(status_field verdict_duplicate_install)"
     # ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST. `skipped_worktree=` is the whole point of
     # #2443 (WHICH repo was skipped and WHY); leaving it out of `--print-status` would repeat the
     # `classes=`/`repos=` defect this block already documents — written every pass, read by nobody.
