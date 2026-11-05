@@ -117,7 +117,7 @@ fi
 OUT_DRIVE=""
 drive_gate() {
   local o="$1" why="$2"
-  OUT_DRIVE="$(O="$o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "$why" 2>&1)"
+  OUT_DRIVE="$(O="$o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "$why" 2>&1)"
 }
 
 # run_env <dir> [KEY=VAL …] — ONE hermetic environment for every invocation (review P2: `--check` used
@@ -956,7 +956,7 @@ printf 'garbage-head\n300\n200\n' > "$D/o/candidates.txt"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$D/bin/wc"; chmod +x "$D/bin/wc"
 mkdir -p "$D/o/state"
 printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=0\nbacklog=UNKNOWN\nhanded=\n' "$(date +%s)" > "$D/o/state/refresh-last"
-OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
 case "$OUT_DRIVE" in
   *"the queue is EMPTY"*) bad "depth-unknown: the gate claimed the queue is EMPTY over a depth nobody measured — $OUT_DRIVE" ;;
   *) ok "depth-unknown: no 'the queue is EMPTY' claim when the depth could not be measured" ;;
@@ -971,7 +971,7 @@ sed -e 's/^      '"''"'|\*\[!0-9\]\*) _bl_state="UNKNOWN" ;;$/      '"''"'|*[!0-
     -e 's/^    UNKNOWN) _bl_state="UNKNOWN" ;;$/    UNKNOWN) : ;;/' "$FNS" > "$FNSM" 2>/dev/null
 if cmp -s "$FNS" "$FNSM" 2>/dev/null; then bad "depth-unknown: the coerce-to-zero mutation did not apply — the sed anchor drifted"
 else
-  OUT_M="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSM" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  OUT_M="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSM" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
   case "$OUT_M" in
     *"the queue is EMPTY"*) ok "depth-unknown: non-vacuity — coercing the failed read to 0 restores the EMPTY claim" ;;
     *) bad "depth-unknown: the REVERTED gate did not reproduce the defect — $OUT_M" ;;
@@ -987,7 +987,7 @@ mk_tool_clean "$D"
 printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
 mkdir -p "$D/o/state"
 printf 'result=running\nat=%s\nrepo=daniel-ospina/agent-infra\n' "$(date +%s)" > "$D/o/state/refresh-last"
-OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
 case "$OUT_DRIVE" in
   *"the queue is EMPTY"*) bad "running-depth-unknown: the in-flight arm claimed the queue is EMPTY over a depth nobody measured — $OUT_DRIVE" ;;
   *) ok "running-depth-unknown: no 'the queue is EMPTY' claim when the depth could not be measured" ;;
@@ -1003,17 +1003,17 @@ mk_tool_clean "$D"
 : > "$D/o/candidates.txt"
 mkdir -p "$D/o/state"
 printf 'result=running\nat=%s\nrepo=daniel-ospina/agent-infra\n' "$(date +%s)" > "$D/o/state/refresh-last"
-OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
 case "$OUT_DRIVE" in
   *"the queue is EMPTY"*) ok "running-empty: a MEASURED empty queue still reads as EMPTY in flight" ;;
   *) bad "running-empty: a measured empty queue stopped reading as EMPTY — $OUT_DRIVE" ;;
 esac
 # NON-VACUITY (4a3): drop the witness arm and the in-flight branch prints EMPTY again.
 FNS_R="$T/origination-fns-running-rev.sh"
-sed 's/^    elif \[ "\$_bl_state" = "UNKNOWN" \] && \[ "\$backlog" -le 0 \]; then$/    elif false; then/' "$FNS" > "$FNS_R" 2>/dev/null
+sed 's/^    elif \[ "\$_bl_state" = "UNKNOWN" \]; then$/    elif false; then/' "$FNS" > "$FNS_R" 2>/dev/null
 if cmp -s "$FNS" "$FNS_R" 2>/dev/null; then bad "running-depth-unknown: the witness-arm removal did not apply — the sed anchor drifted"
 else
-  OUT_R="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS_R" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  OUT_R="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS_R" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
   case "$OUT_R" in
     *"the queue is EMPTY"*) ok "running-depth-unknown: non-vacuity — without the witness arm the EMPTY claim returns" ;;
     *) bad "running-depth-unknown: the REVERTED gate did not reproduce the defect — $OUT_R" ;;
@@ -1029,7 +1029,7 @@ mk_tool_clean "$D"
 : > "$D/o/candidates.txt"
 mkdir -p "$D/o/state"
 printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=0\nqueued=0\nbacklog=UNKNOWN\nhanded=\n' "$(date +%s)" > "$D/o/state/refresh-last"
-OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
 case "$OUT_DRIVE" in
   *"DEPTH of the queue could not be measured"*) bad "record-unknown: a recorded UNKNOWN overrode a measurement the beat DID take — $OUT_DRIVE" ;;
   *"the queue is EMPTY"*) ok "record-unknown: the beat's own measurement wins, so a drained queue still reads as EMPTY" ;;
@@ -1040,7 +1040,7 @@ FNS_O="$T/origination-fns-override-rev.sh"
 sed 's/^    UNKNOWN) \[ "\$_bl_state" = "READ" \] || _bl_state="UNKNOWN" ;;$/    UNKNOWN) _bl_state="UNKNOWN" ;;/' "$FNS" > "$FNS_O" 2>/dev/null
 if cmp -s "$FNS" "$FNS_O" 2>/dev/null; then bad "record-unknown: the override revert did not apply — the sed anchor drifted"
 else
-  OUT_O="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS_O" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  OUT_O="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS_O" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
   case "$OUT_O" in
     *"DEPTH of the queue could not be measured"*) ok "record-unknown: non-vacuity — letting the record override restores the false 'both failed to read' sentence" ;;
     *) bad "record-unknown: the REVERTED precedence did not reproduce the defect — $OUT_O" ;;
@@ -1058,7 +1058,7 @@ printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
 FN_FNS="$T/funnel-fns.sh"
 awk '/^dispatch_funnel\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$LOOP" > "$FN_FNS"
 if grep -q '^dispatch_funnel() {' "$FN_FNS" 2>/dev/null; then :; else bad "funnel-depth: dispatch_funnel() could not be extracted from orch-loop.sh"; fi
-OUT_FN="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; . "$4"; dispatch_funnel 0 READ 2>&1' _ "$ISNUM" "$HELPFNS" "$FNS" "$FN_FNS" 2>&1)"
+OUT_FN="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; . "$4"; dispatch_funnel 0 READ 2>&1' _ "$ISNUM" "$HELPFNS" "$FNS" "$FN_FNS" 2>&1)"
 case "$OUT_FN" in
   *"Permission denied"*) bad "funnel-depth: the shell's own redirection error reached the operator line — $OUT_FN" ;;
   *) ok "funnel-depth: no 'Permission denied' leak" ;;
@@ -1075,7 +1075,7 @@ sed 's/^  \[ "\$_fl_state" = "READ" \] || backlog="UNKNOWN"$/  [ "$_fl_state" = 
 if cmp -s "$FN_FNS" "$FN_M" 2>/dev/null; then bad "funnel-depth: the coerce-to-zero mutation did not apply — the sed anchor drifted"
 else
   chmod 000 "$D/o/candidates.txt"
-  OUT_FN2="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; . "$4"; dispatch_funnel 0 READ 2>&1' _ "$ISNUM" "$HELPFNS" "$FNS" "$FN_M" 2>&1)"
+  OUT_FN2="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; . "$4"; dispatch_funnel 0 READ 2>&1' _ "$ISNUM" "$HELPFNS" "$FNS" "$FN_M" 2>&1)"
   chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
   case "$OUT_FN2" in
     *"0 queued of an UNRECORDED pool"*) ok "funnel-depth: non-vacuity — coercing the miss to 0 restores '0 queued'" ;;
@@ -1089,7 +1089,7 @@ printf 'garbage-head\n300\n200\n' > "$D/o/candidates.txt"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$D/bin/wc"; chmod +x "$D/bin/wc"
 mkdir -p "$D/o/state"
 printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=2\nbacklog=2\nhanded=300\nhanded_why=judged CLEAN\n' "$(date +%s)" > "$D/o/state/refresh-last"
-OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
 case "$OUT_DRIVE" in
   *"the queue is EMPTY"*|*"nothing to defer"*) bad "depth-recorded: the gate read a 2-row queue as empty/undrained-and-idle — $OUT_DRIVE" ;;
   *"skipped ("*) ok "depth-recorded: the pass's own backlog=2 is used, so a queued candidate still reads as deferred" ;;
@@ -1775,7 +1775,7 @@ printf '7\n' > "$SKEW/o/candidates.txt"
 # drive_gate_self <O> <why> <self-dir> — the same shipped block, with the copy beside the loop named.
 drive_gate_self() {
   local o="$1" why="$2" self="$3"
-  OUT_DRIVE="$(O="$o" LOG=/dev/null REFRESH_SELF_DIR="$self" bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "$why" 2>&1)"
+  OUT_DRIVE="$(O="$o" LOG=/dev/null REFRESH_SELF_DIR="$self" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "$why" 2>&1)"
 }
 
 # (a) THE PROBE ITSELF: a definition is capability, a mention in prose is not.
@@ -2095,5 +2095,34 @@ else
 fi
 
 echo
+# ── 12) THE DRIVERS RUN IN THE MODE orch-loop.sh RUNS IN (review P2, cycle 17) ──
+# `set -u` is NOT inherited by a child `bash -c`, so a driver without it reports an unbound reference in
+# the graded arms GREEN while production aborts (rc=1, KeepAlive loop — this file's own `dispatch_funnel`
+# note records exactly that crash). The sibling suites hold this invariant; this one did not.
+_drv_total=0; _drv_unpinned=""
+while IFS= read -r _line; do
+  case "$_line" in *"bash -c"*) : ;; *) continue ;; esac
+  case "$_line" in *"dispatch_gate_line"*|*"dispatch_funnel"*) : ;; *) continue ;; esac
+  # the unbound-probe driver below is deliberately run BOTH ways — it is the mutation, not a fixture
+  case "$_line" in *"FNS_P"*) continue ;; esac
+  _drv_total=$(( _drv_total + 1 ))
+  case "$_line" in *"bash -c 'set -u;"*) : ;; *) _drv_unpinned="$_drv_unpinned line${_drv_total}" ;; esac
+done < "$0"
+if [ "$_drv_total" -ge 10 ] && [ -z "$_drv_unpinned" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked)"
+else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}); checked $_drv_total — an unbound reference in a graded arm is fatal in production and invisible here"; fi
+# NON-VACUITY: an unbound reference in a graded arm must be VISIBLE to this suite. Inject one and drive it
+# both ways — with the prologue it aborts (what production would do), without it the arm reports green.
+FNS_P="$T/origination-fns-unbound.sh"
+awk 'NR==1{print; next} /^dispatch_gate_line\(\)/{print; inarm=1; next} inarm==1 && /^  local /{print; print "  : \"$SUITE_UNBOUND_PROBE\""; inarm=0; next} {print}' "$FNS" > "$FNS_P" 2>/dev/null
+if cmp -s "$FNS" "$FNS_P" 2>/dev/null; then bad "drivers: the unbound-probe mutation did not apply — the awk anchor drifted"
+else
+  bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 stub' _ "$ISNUM" "$HELPFNS" "$FNS_P" "merge-priority" >/dev/null 2>&1
+  _rc_u=$?
+  bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 stub' _ "$ISNUM" "$HELPFNS" "$FNS_P" "merge-priority" >/dev/null 2>&1
+  _rc_n=$?
+  if [ "$_rc_u" -ne 0 ] && [ "$_rc_n" -eq 0 ]; then ok "drivers: non-vacuity — the unbound probe aborts under \`set -u\` (rc=$_rc_u) and passes silently without it (rc=$_rc_n), which is what the pin above prevents"
+  else bad "drivers: the unbound probe behaved unexpectedly (set -u rc=$_rc_u, plain rc=$_rc_n) — the pin's premise is wrong"; fi
+fi
+
 echo "==> $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
