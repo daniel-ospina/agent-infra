@@ -91,7 +91,7 @@
 #   That marker is signed only when key and openssl both work (HMAC-SHA256 over
 #   the text, $AI_REVIEW_GATE_KEY, #2055; else UNSIGNED, :4827-4833). A **SIGNED** marker
 #   reaches CI in TWO copies (the body; the admitted comment this recorder also posts at
-#   :1305, from post_marker_comment), an UNSIGNED one in ONE (:1197). The per-box record
+#   :1305, from post_marker_comment), an UNSIGNED one in ONE (:4898). The per-box record
 #   does not travel, so a review minted on a cell leaves the rail at NO-RECORD while the proof travels.
 #   Measured 2026-10-26: of 45 open PRs, 12 had a marker whose `diff=` equals the
 #   PR's live diff and no record file here; the registry covered 2 of them.
@@ -1217,9 +1217,9 @@ post_marker_comment() { # <repo> <pr> <marker>
   # the genuine signature is appended after it. Any failure ⇒ no comment (fail closed).
   # ⛔ `${GATE_KEY:-}`, NOT `$GATE_KEY` (#3168 re-review): `--flush-pending`
   # dispatches at :1744, BEFORE the global assignment at :2870, so under `set -u`
-  # a bare `$GATE_KEY` here aborts the whole flush (measured: 11 assertions red,
-  # "line 1239: GATE_KEY: unbound variable"). An unset key must read as
-  # "unsigned" and fail CLOSED, never as a crash.
+  # a bare `$GATE_KEY` here aborts the whole flush (measured: "line 1239: GATE_KEY:
+  # unbound variable" — the red count is NOT restated: it rots as the suite grows). An
+  # unset key must read as "unsigned" and fail CLOSED, never as a crash.
   case "$marker" in
     *" sig="*) ;;
     *) return 0 ;;
@@ -1230,7 +1230,7 @@ post_marker_comment() { # <repo> <pr> <marker>
   # ⛔ RESOLVE THE KEY LOCALLY WHEN THE CALLER'S SCOPE PREDATES THE GLOBAL. The
   # global is assigned at :2870, but `--flush-pending` dispatches at :1744 — long
   # before it — so a bare `$GATE_KEY` here was an `unbound variable` abort under
-  # `set -u` in the flush (measured: 11 assertions red, line 1239), and taking the
+  # `set -u` in the flush (measured: "line 1239: GATE_KEY: unbound variable"), and taking the
   # global's EMPTY value instead would silently fail CLOSED on a good signed
   # marker, disabling the durable copy on the one path whose entire purpose is to
   # deliver it. Replicating the same resolution keeps this function authoritative

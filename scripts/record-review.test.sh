@@ -6048,7 +6048,8 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
 #   :1248  the HMAC did not MATCH   → pinned by 20.12.
 # ⛔ 20.10 IS NOT THE :1245 PIN, and saying so was FALSE (measured): 20.10's negative
 # drives `AI_REVIEW_GATE_KEY=""`, so its run is REFUSED at :1245 — but BEFORE 20.13 EXISTED
-# deleting that line left the suite at PASS=1045 FAIL=0 (20.13 is what reddens it now: 1049/1),
+# deleting that line left the suite GREEN (20.13 is what reddens it now — its count is not
+# restated here, because a comment that restates its own arithmetic rots as the suite grows),
 # because 20.10's unsigned marker then reaches :1248 and fails the MATCH instead (`openssl dgst -hmac ""` is legal and
 # yields a stable digest, so the empty-key comparison is a real comparison). A vector
 # that merely PASSES THROUGH an arm is not a pin on it. 20.13 signs under the EMPTY
@@ -6168,7 +6169,7 @@ assert_eq "$(dc_posts "$DC_PR5")" "1" \
 # (#3168 round-8, P1.) `[ -n "$_key" ] || return 0` (:1245) is the last unpinned
 # refusal, and the §20.11/§20.12 prose claimed 20.10 covered it. It does not:
 # 20.10 is merely REFUSED there. Before 20.13 existed, deleting the line left the suite at
-# PASS=1045 FAIL=0 (measured on a throw-away copy; at this head 20.13 doubles it to 1049/1),
+# PASS=1045 FAIL=0 (measured on a throw-away copy; at this head 20.13 is what reddens it),
 # because 20.10's unsigned marker then reaches :1248 and fails the MATCH — a refusal, so the
 # vector stays green. The shape where :1245's removal actually PUBLISHES is a marker
 # whose `sig=` is the HMAC under the EMPTY key, because `openssl dgst -hmac ""`
