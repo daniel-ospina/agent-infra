@@ -549,7 +549,12 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     unpushed count is > 0, so the majority of lanes cost no network call. It REFUSES, loudly and by name,
     to push from a hub checkout (`--git-dir` == `--git-common-dir`) or onto the landing branch, because
     either would publish a ref that only the merge rail may move. A DETACHED head is `push=detached`:
-    nothing is invented, and the marker tells a reclaim pass to refuse that worktree.
+    nothing is invented, and the marker tells a reclaim pass to refuse that worktree. ⛔ **AND AN
+    UNANSWERED VERIFY IS NOT AN ABSENT REF** — `push=verify-unanswered` means the push exited 0 and the
+    verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
+    (`next=MANUAL … did NOT establish`); it is a distinct verdict from `push=FAILED` (the remote ANSWERED
+    and the ref is absent) exactly as the symref read on the same path already refuses to read silence as
+    "no protected names".
   * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
     writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
@@ -557,7 +562,12 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     `rescue`, `wip_ref`, `dirty`, `ended`, `next` (mechanically derived) and a `porcelain:` section. A
     path that returned BEFORE the measurement writes `state=not-measured` and `next=MANUAL — …did NOT
     measure`, never a clean bill of health: the hatch is an escape, not a licence to claim a reading
-    that was never taken. ⛔ It is deliberately NOT written into the worktree — a file at the worktree
+    that was never taken. ⛔ `MANUAL` follows the RISK, not the tree verdict: a REFUSED push on a CLEAN
+    (unpushed-only) tree carries it too, because those commits are on that disk only just the same —
+    otherwise a consumer filtering on this file's own convention reclaims one and refuses the other for
+    the same fact. And the affirmative `nothing at risk … may be removed` sentence names its SCOPE (the
+    paths git does NOT ignore), so a lane whose only copy of its work is an ignored file cannot read more
+    safety out of the artifact than the enumeration covered. ⛔ It is deliberately NOT written into the worktree — a file at the worktree
     root would make every clean worktree dirty, which is the exact predicate the reaper keys on.
   * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
     (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
