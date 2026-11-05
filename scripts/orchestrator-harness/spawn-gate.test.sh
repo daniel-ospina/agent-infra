@@ -157,11 +157,20 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # rebasing this branch onto current `main`: `got_pi` carried `harness-refresh.sh`, i.e. a fourth
   # instance of the exact class this list exists for — a census that reddens on PROSE teaches the next
   # lane to ignore it. Excluded by name, with its own non-launcher assertion below.
+  # ⛔ `key-gate.sh` IS THE FIFTH OF THAT CLASS (#3443), and its prose is the one that CANNOT be reworded
+  # away: it is a CREDENTIAL assertion that launches nothing (it reads pi's own config files in
+  # python3), but #3443's remedy — the finding that actually worked on a cell — IS the model flag, so the
+  # file now PRINTS the working invocation (`pi -p --no-session --provider %s --model %s`) in its refusal
+  # prose and quotes it in its header. That string is the deliverable, not decoration, so declaring the
+  # file in EXPECTED_PI instead would assert the opposite of the truth (a census of launch paths does not
+  # contain a file with none). Found RED while landing #3443: `got_pi` carried `key-gate.sh`, so both
+  # EQUALITY arms below failed — a fix whose whole subject is one diagnostic line would have shipped a red
+  # bash shard. Excluded by name, with its own non-launcher assertions below.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh|*/key-gate.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -252,6 +261,24 @@ ck "the excluded orphaned-harness.sh is a NON-launcher (no spawn primitive; its 
 # a real `pi` launch added to it brings `exec pi`/`run_agent`/`nohup` with it and this arm goes RED.
 if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' "$HERE/harness-refresh.sh" 2>/dev/null; then rc=1; else rc=0; fi
 ck "the excluded harness-refresh.sh is a NON-launcher (no spawn primitive; its '-p' is 'ps -p'), so its census exclusion hides no launch path" $rc
+
+# …and the same proof for key-gate.sh, the fifth file of that class (#3443), in TWO arms because this
+# one's prose is CODE: the pair lives in `printf` FORMAT STRINGS, so stripping comments alone cannot
+# tell it from a launch (and stripping `#` first leaves an unmatched quote wherever the string contains
+# `#3443`, which truncates the line and makes a clean file read as a launcher — the order below is
+# deliberate). Arm 1 is the detector's own predicate over the file's CODE: comments AND single-quoted
+# strings stripped, pair absent. Arm 2 is the spawn-primitive form the two arms above use, over the
+# SAME stripped code because `run_agent`/`nohup` appear in this file's comments by design. Either arm
+# going RED means the file grew a launch path and must come back into the census. STATED LIMIT, the same
+# one the detector carries: a launch whose COMMAND NAME is assembled at runtime, and one written inside a
+# multi-line quoted string (which the line-oriented strip cannot close), are outside a grep's reach — the
+# runtime `run_agent` contract, not this census, is what covers those.
+_kg_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
+_kg_code="$(sed -e "s/'[^']*'//g" -e 's/#.*//' "$HERE/key-gate.sh" 2>/dev/null)"
+if grep -qE -e "$_kg_flag" <<<"$_kg_code" && grep -qF -- '--no-session' <<<"$_kg_code"; then rc=1; else rc=0; fi
+ck "the excluded key-gate.sh is a NON-launcher in CODE (the pi token pair lives in its printf remedy strings, so what matched is prose), so its census exclusion hides no launch path" $rc
+if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' <<<"$_kg_code"; then rc=1; else rc=0; fi
+ck "the excluded key-gate.sh carries no spawn primitive, so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
