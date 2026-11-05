@@ -516,7 +516,8 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
 # exercised. This one spends the budget ACROSS a page boundary, so a request is always issued
 # with less than a full timeout left.
 def test_a_request_near_the_deadline_gets_only_the_time_left(monkeypatch):
-    """The budget is shared by the open/merged PAIR, so a page that hangs must not eat the
+    """The budget is shared by ALL FOUR PR lists (the tracker's open/merged pair and every fix
+    repo's pair), so a page that hangs must not eat the
     remainder in a single 15 s request -- the timeout handed to the transport is the remaining
     budget, whichever is smaller."""
     budget = 0.5
@@ -1443,6 +1444,33 @@ def test_the_token_spawn_draws_on_the_phase_clock_too(monkeypatch, tmp_path):
         "the credential spawn got %r, not what was left of the phase clock" % (spawned[0],))
 
 
+def test_the_phase_clock_restores_the_deadline_it_found(monkeypatch):
+    """⛔ THE RESTORE IS A CONTRACT, AND IT WAS UNPINNED IN BOTH DIRECTIONS (#3457 review round 7).
+
+    `_phase_clock` claims it "restores what was there before" and the module comment says
+    `compute()` "restores the previous value when it returns". Neither was observable: `compute()`
+    is the only `with` caller, so `_prev` is always `None` in production, and BOTH mutations —
+    `__exit__` assigning `None` unconditionally, and deleting `_prev`/`__slots__` outright — left
+    the suite GREEN. A context manager whose restoration is indistinguishable from a hard reset is
+    a claim, not a mechanism; the next caller to nest it (a partial re-read, a test that opens a
+    short clock inside a long one) would silently have its outer bound destroyed.
+    """
+    outer = bp.time.monotonic() + 100
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", outer)
+
+    with bp._phase_clock() as inner:
+        assert inner is not outer, "the block did not open its own clock"
+        assert bp._PHASE_DEADLINE == inner
+        with bp._phase_clock() as innermost:
+            assert bp._PHASE_DEADLINE == innermost
+        assert bp._PHASE_DEADLINE == inner, (
+            "the nested block did not restore the clock it found — a partial re-read would lose "
+            "its parent's bound")
+
+    assert bp._PHASE_DEADLINE == outer, (
+        "the outermost block must restore the deadline that was there BEFORE it, not `None`")
+
+
 def test_a_spent_phase_clock_refuses_the_read_instead_of_spawning(monkeypatch):
     """⛔ THE PHASE CLOCK IS WHAT KEEPS THE WORST CASE CONSTANT AS REPOS ARE ADDED.
 
@@ -1485,6 +1513,22 @@ def test_the_phase_clock_bounds_the_rest_deadline_and_is_then_restored(monkeypat
     assert max(deadlines) <= started + 5 + 1, (
         "a REST read was given a budget that outlives the phase clock: %r" % (deadlines,))
     assert bp._PHASE_DEADLINE is None, "the phase clock must be RESTORED, never left spent"
+
+    # ⛔ AND THE CLAMP IS NOT THE ONLY HALF (#3457 review round 7). `rest_deadline` is a MIN of the
+    # REST budget and the phase clock, and every assertion above runs with a SHORT clock (5 s),
+    # which the min always wins -- so the REST arm's own half was untested. Measured: with the
+    # phase clock at 100 s, mutating `REST_BUDGET_S` -> `PHASE_BUDGET_S` there left 37 passed, i.e.
+    # a future edit could silently hand the REST arm the whole phase budget (60 s) and the
+    # "REST IS A CHILD OF THE PHASE CLOCK, not a peer" property would be gone with nothing red.
+    deadlines.clear()
+    monkeypatch.setattr(bp, "PHASE_BUDGET_S", 100)     # well ABOVE REST_BUDGET_S, so the min matters
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 100)
+    started = bp.time.monotonic()
+    assert bp._compute() is not None
+    assert deadlines and all(d is not None for d in deadlines)
+    assert max(deadlines) - started <= bp.REST_BUDGET_S + 1, (
+        "the REST arm was handed %r, i.e. NOT bounded by its own %ss budget -- the phase clock is "
+        "its PARENT, not its substitute" % (max(deadlines) - started, bp.REST_BUDGET_S))
 
 
 def test_the_phase_budget_fits_the_slack_band_and_holds_the_rest_budget():

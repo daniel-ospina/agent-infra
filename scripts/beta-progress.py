@@ -462,8 +462,9 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
     bucket this fallback exists because we are rationing; the disclosed row bound is the honest
     trade, and `merged_today` stays exact while a day's merges (plus the abandoned rows updated
     beside them) fit inside it. A page
-    that cannot be read -- or a read whose SHARED deadline (`deadline`, an epoch-seconds
-    instant the caller owns; None = no bound) has passed -- returns None for the WHOLE read; a
+    that cannot be read -- or a read whose SHARED deadline (`deadline`, an instant on the SAME
+    clock as `time.monotonic()`, which is what every caller here uses; None = no bound) has passed
+    -- returns None for the WHOLE read; a
     partial list is indistinguishable from a complete one at the call site. The deadline is a
     caller-supplied `deadline`, not a per-read budget: `compute()` gives the tracker PAIR **and
     every fix-repo read** the SAME one, because a per-read budget MULTIPLIES the phase's worst
@@ -733,8 +734,9 @@ def _compute():
     #   * ⛔ AND A "SELF-REFERENCE" FILTER WAS TRIED, MEASURED, AND REMOVED. The idea was to ignore a
     #     fix-repo row whose bare `#N` equals the ROW'S OWN number (agent-infra#2513's
     #     `fix/2513-pool-filter` citing agent-infra#2513, not tortoise#2513). Measured against the
-    #     live windows (2026-11-05, agent-infra open 47 + merged 400 = 447 rows; 31 open tracker
-    #     P0/P1): only 2 of 447 rows carry their own number at all, and **0 of the 7 rows that
+    #     live windows (2026-11-05, agent-infra open 47 + merged 400 = 447 rows; 34 open tracker
+    #     P0/P1 -- 17 + 17, re-measured, NOT the 31 of the stale 14/17 split this block first
+    #     carried): only 2 of 447 rows carry their own number at all, and **0 of the 7 rows that
     #     actually collide with an open tracker unit are self-references** — every one of them cites
     #     the tracker BARE (`fix/10114-pin-tree-is-a-holder`, `fix/10951-pool-filter`, `p0-10114`,
     #     `ai-10114`, `batch(#3309 #10114 …)`), which is the same fact that rules out the qualified
