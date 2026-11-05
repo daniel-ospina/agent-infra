@@ -6023,13 +6023,24 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
     "20.10 …but a SIGNED not-clean marker whose note contains ' sig=' IS still published (the fix must not over-block)"
 
 # ── 20.11 THE OTHER FAIL-CLOSED ARM: AN UNCOMPUTABLE HMAC IS NOT A MATCH ──────
-# (#3168 self-review, round 5.) `post_marker_comment` has THREE refusals past the
-# ` sig=` shape guard — no key configured (`[ -n "$_key" ] || return 0`, :1245),
-# the HMAC did not COMPUTE (`[ -n "$_mexp" ] || return 0`, :1247), and it did not
-# MATCH (`[ "$_mexp" != "$_msig" ]`, :1248). 20.10 pins the FIRST (:1245): its
-# negative drives `AI_REVIEW_GATE_KEY=""``, and its positive is a genuinely signed
-# marker that nothing refuses. The COMPUTE arm was pinned by NOTHING: the one-line
-# mutant
+# (#3168 self-review, round 5.) `post_marker_comment` has FOUR refusals past the
+# ` sig=` shape guard, and the inventory below is what a reader must be able to trust
+# (three rounds have now been spent on prose that claimed coverage it did not have):
+#   :1229  `_msig` is not 64 hex   → UNPINNED, and safely so: it only short-circuits a
+#           comparison that :1245/:1248 then refuse anyway, so a regression here changes
+#           WHICH loud line prints, never whether a comment is posted. Declared rather
+#           than faked with the source-text pin an earlier round removed (14.1d(g)).
+#   :1245  no key resolved         → pinned by 20.13.
+#   :1247  the HMAC did not COMPUTE → pinned by 20.11 (below).
+#   :1248  the HMAC did not MATCH   → pinned by 20.12.
+# ⛔ 20.10 IS NOT THE :1245 PIN, and saying so was FALSE (measured): 20.10's negative
+# drives `AI_REVIEW_GATE_KEY=""`, so its run is REFUSED at :1245 — but deleting that
+# line leaves the suite at PASS=1045 FAIL=0, because 20.10's unsigned marker then
+# reaches :1248 and fails the MATCH instead (`openssl dgst -hmac ""` is legal and
+# yields a stable digest, so the empty-key comparison is a real comparison). A vector
+# that merely PASSES THROUGH an arm is not a pin on it. 20.13 signs under the EMPTY
+# key, which is the only shape where :1245's removal publishes.
+# The COMPUTE arm was pinned by NOTHING: the one-line mutant
 # `[ -n "$_mexp" ] || return 0` → `[ -n "$_mexp" ] || _mexp="$_msig"` — i.e.
 # "if openssl produced nothing, treat that as a match" — left the suite at
 # PASS=1035 FAIL=0 (measured). That mutant is FAIL-OPEN on the guard whose whole
@@ -6090,8 +6101,10 @@ assert_eq "$(dc_posts "$DC_PR4")" "1" \
 # (#3168 re-review @ a3e78f942, P1.) `:1248` is the refusal that rejects a TAMPERED
 # marker or one signed under a ROTATED key — and it was pinned by NOTHING: replacing
 # `if [ "$_mexp" != "$_msig" ]; then` with `if false; then` left the whole suite at
-# PASS=1040 FAIL=0 (measured). 20.10 pins the no-key arm (:1245), 20.11 the
-# uncomputable arm (:1247); neither reaches :1248. No fixture in the suite signed
+# PASS=1040 FAIL=0 (measured). 20.11 pins the uncomputable arm (:1247), 20.13 the
+# no-key arm (:1245); 20.10 passes THROUGH :1245 without pinning it (deleting that
+# line leaves 20.10 green — measured; see its header). Neither reaches :1248. No
+# fixture in the suite signed
 # under one key and verified under another, so the arm was unreachable by the tests
 # at all — a fail-open with no signal, in the round that was opened to close one.
 # ⛔ THE DRIVER IS THE FLUSH, because it is the ONE path that delivers marker bytes
@@ -6137,6 +6150,45 @@ FL6_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
     bash "$RECORD" --flush-pending "$DC_PR5" daniel-ospina/agent-infra 2>&1)" || true
 assert_eq "$(dc_posts "$DC_PR5")" "1" \
     "20.12 …but the SAME marker under the key that SIGNED it IS published (the arm is not an over-block)"
+
+# ── 20.13 THE NO-KEY ARM: NO KEY MEANS NO COMMENT, NOT "MATCH THE EMPTY KEY" ──
+# (#3168 round-8, P1.) `[ -n "$_key" ] || return 0` (:1245) is the last unpinned
+# refusal, and the §20.11/§20.12 prose claimed 20.10 covered it. It does not:
+# 20.10 is merely REFUSED there. Deleting the line leaves the suite at
+# PASS=1045 FAIL=0 (measured on a throw-away copy), because 20.10's unsigned marker
+# then reaches :1248 and fails the MATCH — a refusal, so the count stays 0 and the
+# vector stays green. The shape where :1245's removal actually PUBLISHES is a marker
+# whose `sig=` is the HMAC under the EMPTY key, because `openssl dgst -hmac ""`
+# succeeds (measured) and so the empty-key comparison MATCHES.
+# ⛔ DRIVEN THROUGH `--flush-pending` for the same reason as 20.12: the flush delivers
+# bytes this box did not sign, so it can be handed a marker signed by a box that had
+# NO key — a state the mint path cannot build, since the mint both signs and verifies.
+FLE_PR=424356
+FLE_M="review recorded: reviews/$FLE_PR.json verdict=clean @ $SHA (daniel-ospina/agent-infra)"
+FLE_SIG_EMPTY="$(printf '%s' "$FLE_M" | openssl dgst -sha256 -hmac "" | awk '{print $NF}')"
+FLE_PEND="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$FLE_PR.marker"
+mkdir -p "$(dirname "$FLE_PEND")"
+# ⛔ "NO KEY" MUST BE A STATE, NOT A FIXTURE CLAIM: the recorder falls back to
+# $HOME/.pi/agent/.ai-review-gate-key when the env var is empty, so that file has to
+# be ABSENT or this vector would be testing a configured key under a keyless label.
+rm -f "$F_HOME/.pi/agent/.ai-review-gate-key"
+if [ ! -e "$F_HOME/.pi/agent/.ai-review-gate-key" ] \
+   && printf '%s\n' "$FLE_M sig=$FLE_SIG_EMPTY" > "$FLE_PEND" \
+   && command grep -qE ' sig=[0-9a-f]{64}$' "$FLE_PEND"; then
+    ok "20.13 fixture: no key in the env AND no key file, with an EMPTY-KEY-signed pending marker (shape and no-key arm both satisfied)"
+else
+    bad "20.13 fixture: a key file exists, or the pending marker was not written with a sig= — the vector would not reach :1245 (file: $(cat "$FLE_PEND" 2>/dev/null))"
+fi
+rb_clear
+: > "$LOG"
+FLE_RC=0
+FLE_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" AI_REVIEW_GATE_KEY="" \
+    STUB_BODY="PR body — no review evidence yet" \
+    bash "$RECORD" --flush-pending "$FLE_PR" daniel-ospina/agent-infra 2>&1)" || FLE_RC=$?
+assert_eq "$(dc_posts "$FLE_PR")" "0" \
+    "20.13 with NO key resolvable, a marker whose sig= only matches the EMPTY key is never published (:1245, fail CLOSED)"
+assert_eq "$FLE_RC" "0" \
+    "20.13 …and the keyless flush still delivers the BODY copy (rc 0) — the refusal is not fatal"
 
 DM_20_SENTINEL=1
 
