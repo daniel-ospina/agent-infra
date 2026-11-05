@@ -1204,11 +1204,62 @@ def test_a_malformed_fix_repo_payload_is_unavailable_not_a_traceback(monkeypatch
         return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[label])
 
     monkeypatch.setattr(bp, "gh", fake_gh)
-    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+    tried = []
+
+    def refusing_rest(state, limit=100, deadline=None, repo=None):
+        tried.append((repo, state))
+        return None
+
+    monkeypatch.setattr(bp, "_rest_prs", refusing_rest)
 
     assert bp.compute() is None, (
         "a malformed fix-repo payload must not raise out of compute(), and must not be read as "
         "a complete list")
+    # ⛔ "REST TRIED AND REFUSED" IS NOT "REST NEVER TRIED" (#3457 review round 11). The shape gate
+    # used to sit AFTER the fallback, so this payload returned None without ever asking the second
+    # source — and this test could not see the difference, because both outcomes are `compute() is
+    # None`. That is precisely the "one repo's odd answer costs the whole line" failure `_repo_prs`
+    # exists to prevent: a fix repo answering `{"message": "Not Found"}` took the DELIVERY line
+    # down while a REST read would have answered.
+    assert ("daniel-ospina/agent-infra", "open") in tried, (
+        "the second source was never asked for the malformed fix repo — the shape gate ran before "
+        "the fallback instead of as part of it")
+
+
+def test_a_non_list_tracker_list_of_non_dicts_is_unavailable_not_a_count(monkeypatch, no_cache):
+    """⛔ `len()` TURNS A BAD LIST INTO A NUMBER, AND ONLY `covered()` WOULD HAVE RAISED.
+
+    The tracker lists had a LIST-level gate for one round and no per-row one. With both tier lists
+    EMPTY, `covered()` never runs — so nothing raised, and an answered `["nope", None, 42]` printed
+    `... | 3 open PRs, 0 merged today` and CACHED it for the 1800 s TTL (measured on a copy before
+    the fix). That is the same class, and the same caching consequence, that makes the issue read's
+    `{}` the worst of the four.
+
+    The second member is silent: a falsy non-str `mergedAt` (`{}`, `0`) is swallowed by
+    `(p.get("mergedAt") or "")` and UNDER-counts `merged_today`, where the fix-repo path refuses
+    the identical row. Both are refused now, by the one shared predicate.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            return ["nope", None, 42] if args[args.index("--state") + 1] == "open" else []
+        return []                                    # both tiers EMPTY: `covered()` never runs
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+    assert bp.compute() is None, (
+        "a list of non-dict tracker rows must be `unavailable`, never `3 open PRs`")
+
+    # ...and the silent half: a `merged` row whose `mergedAt` is a dict, with an EMPTY open list.
+    def fake_gh_merged(*args):
+        if args[:2] == ("pr", "list"):
+            return [] if args[args.index("--state") + 1] == "open" \
+                else [{"number": 1, "title": "t", "headRefName": "r", "mergedAt": {}}]
+        return []
+
+    monkeypatch.setattr(bp, "gh", fake_gh_merged)
+    assert bp.compute() is None, (
+        "a non-str `mergedAt` must refuse the read, not UNDER-count `merged_today` through "
+        "`(p.get(\"mergedAt\") or \"\")`")
 
 
 def test_the_merged_fix_repo_window_alone_covers_a_landed_fix(monkeypatch, no_cache):

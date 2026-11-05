@@ -617,30 +617,24 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
     return None
 
 
-def _repo_prs(repo, state, limit, deadline):
-    """One repo's PR list: GraphQL first, REST second, then a SHAPE gate.
+def _shape_pr_rows(rows, state):
+    """THE ONE SHAPE GATE EVERY PR LIST GOES THROUGH: well-formed rows, or the read FAILED.
 
-    ⛔ EVERY FIX-REPO READ NEEDS THE SECOND SOURCE TOO (#2139). The measured refusal is a
-    SECONDARY-limit one, so every `gh pr list` on a box is refused at once; a fix-repo read with no
-    REST fallback would take down a DELIVERY line whose tracker read had already succeeded.
-    ⛔ AND A MALFORMED BUT ANSWERED READ IS NOT A LIST. `gh` can exit 0 with a JSON OBJECT
-    (`{"message": "Not Found"}`) or a list of non-dicts. `covered()` then calls `.get()` on a str
-    and RAISES, `main()` catches it, and the box prints a traceback and `unavailable` on EVERY
-    refresh for as long as that payload persists -- a whole metric lost to one repo's odd answer.
-    ⛔ AND PRESENCE IS NOT SHAPE — this is the SAME per-row rule `_rest_prs` applies, TYPES
-    INCLUDED (`number` an int that is not a bool, the two fields `covered()` REGEXES strings when
-    present, `mergedAt` a string when present). `isinstance(r, dict)` alone let a row with a dict
-    `title` through this gate and then raised inside `covered()`'s `pat.search()` — the exact
-    traceback this function's docstring claims to prevent.
+    ⛔ `gh` CAN EXIT 0 WITH A JSON OBJECT (`{"message": "Not Found"}`) OR A LIST OF NON-DICTS, and
+    a dict is TRUTHY and sized — so an `is None` test never fires on it, `covered()` calls `.get()`
+    on a str and RAISES, and `len()` turns the payload into a NUMBER. Three rounds of review each
+    found one more consumer that had only half this rule (#3457 rounds 9-11): the fix-repo list,
+    then the tracker's list-level check, then the fix-repo's non-list path. It lives in ONE place
+    now, and every read calls it, so a fourth consumer cannot re-open the class.
+
+    ⛔ PRESENCE IS NOT SHAPE — TYPES INCLUDED, and that is why this is not `isinstance(rows, list)`:
+    `number` must be an int that is not a bool (a bool IS an int, and `covered(True)` would search
+    for `1`), the two fields `covered()` REGEXES must be strings when present, and `mergedAt` must
+    be a string when present (a falsy non-str there silently under-counts `merged_today`).
+
+    Returns the rows, or None — never a partial list: a short window is indistinguishable from a
+    complete one at every call site, which is the error class this file exists to refuse.
     """
-    fields = ("number,title,headRefName" if state == "open"
-              else "number,title,headRefName,mergedAt")
-    rows = gh("pr", "list", "--repo", repo, "--state", state, "--limit", str(limit),
-              "--json", fields)
-    if rows is None:
-        rows = _rest_prs(state, limit=limit, deadline=deadline, repo=repo)
-    if rows is None:
-        return None
     if not isinstance(rows, list):
         return None
     for r in rows:
@@ -660,6 +654,33 @@ def _repo_prs(repo, state, limit, deadline):
     return rows
 
 
+def _repo_prs(repo, state, limit, deadline):
+    """One repo's PR list: GraphQL first, REST second, then THE shape gate.
+
+    ⛔ EVERY FIX-REPO READ NEEDS THE SECOND SOURCE TOO (#2139). The measured refusal is a
+    SECONDARY-limit one, so every `gh pr list` on a box is refused at once; a fix-repo read with no
+    REST fallback would take down a DELIVERY line whose tracker read had already succeeded.
+    ⛔ AND A MALFORMED BUT ANSWERED READ IS NOT A LIST. `gh` can exit 0 with a JSON OBJECT
+    (`{"message": "Not Found"}`) or a list of non-dicts. `covered()` then calls `.get()` on a str
+    and RAISES, `main()` catches it, and the box prints a traceback and `unavailable` on EVERY
+    refresh for as long as that payload persists -- a whole metric lost to one repo's odd answer.
+    ⛔ SO THE SHAPE IS NORMALISED BEFORE THE FALLBACK, not after it (#3457 review round 11). It
+    used to be checked only on the way OUT, so a non-list answer returned None without ever asking
+    the second source -- the exact "one repo's odd answer costs the whole line" failure this
+    function's own first paragraph says it exists to prevent. The tracker path already ordered it
+    this way; now all four lists do.
+    """
+    fields = ("number,title,headRefName" if state == "open"
+              else "number,title,headRefName,mergedAt")
+    rows = _shape_pr_rows(
+        gh("pr", "list", "--repo", repo, "--state", state, "--limit", str(limit),
+           "--json", fields), state)
+    if rows is None:
+        rows = _shape_pr_rows(
+            _rest_prs(state, limit=limit, deadline=deadline, repo=repo), state)
+    return rows
+
+
 def compute():
     """The metric, or None. Every read inside it shares ONE clock (see `PHASE_BUDGET_S`)."""
     with _phase_clock():
@@ -667,20 +688,24 @@ def compute():
 
 
 def _compute():
-    openpr = gh("pr", "list", "--repo", REPO, "--state", "open", "--limit", "500",
-                "--json", "number,title,headRefName")
-    merged = gh("pr", "list", "--repo", REPO, "--state", "merged", "--limit", "400",
-                "--json", "number,title,headRefName,mergedAt")
+    # ⛔ THE TRACKER LISTS GO THROUGH THE SAME GATE AS EVERY OTHER LIST (#3457 review round 11).
+    # This was only a LIST-level check for one round, which left two members of the class open: a
+    # list of non-dicts (`["nope", None, 42]`) became `3 open PRs` with both tier lists empty (so
+    # `covered()` never ran to raise), and a falsy non-str `mergedAt` silently under-counted
+    # `merged_today`. Both are refused now, by the predicate the fix-repo path already used.
+    openpr = _shape_pr_rows(
+        gh("pr", "list", "--repo", REPO, "--state", "open", "--limit", "500",
+           "--json", "number,title,headRefName"), "open")
+    merged = _shape_pr_rows(
+        gh("pr", "list", "--repo", REPO, "--state", "merged", "--limit", "400",
+           "--json", "number,title,headRefName,mergedAt"), "merged")
     # ⛔ AN ANSWERED READ THAT IS NOT A LIST IS A FAILED READ, FOR THE TRACKER TOO (#3457 review
-    # round 10). The fix-repo path got this gate in this PR and the tracker reads did not: `gh` can
-    # exit 0 with a JSON OBJECT (`{"message": "Not Found"}`), and a dict is TRUTHY and sized, so
-    # the `is None` tests below never fire. Measured on the shipped module: an open read answered
-    # `{"message": "Not Found"}` printed `... | 1 open PRs, 0 merged today` (`len(dict)` == 1),
-    # and the REST fallback never engaged. Normalising here means ONE rule for all four PR lists.
-    if not isinstance(openpr, list):
-        openpr = None
-    if not isinstance(merged, list):
-        merged = None
+    # round 10). `gh` can exit 0 with a JSON OBJECT (`{"message": "Not Found"}`), and a dict is
+    # TRUTHY and sized, so the `is None` tests below never fire. Measured on the shipped module: an
+    # open read answered `{"message": "Not Found"}` printed `... | 1 open PRs, 0 merged today`
+    # (`len(dict)` == 1), and the REST fallback never engaged. `_shape_pr_rows` normalises it (and
+    # the per-row types) BEFORE the fallback, so ONE rule covers all four PR lists.
+    # (The shape is applied above, at the read itself — this comment records why.)
     # GRAPHQL REFUSED -> TRY REST BEFORE DECLARING THE METRICS UNAVAILABLE. If EITHER read
     # failed, BOTH lists are re-read over REST: once one read has failed the survivor may
     # itself be a degraded read, so pairing a REST count with it would compare two
