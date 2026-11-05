@@ -4036,6 +4036,17 @@ queue_order_from_pool() {
   if [ -n "$_h" ]; then
     QUEUE_ORDER_STATE="severity"
     echo "[refresh] queue order: severity-first from the pool — head #$_h is the highest-ranked CLEAN entry still queued ($_r pool-ranked, $_u unranked at the tail)"
+  elif [ "$_r" -gt 0 ]; then
+    # ⛔ THE RANKED-NONE SENTENCE IS KEYED OFF WHAT WAS RANKED, NOT OFF THE HEAD (review P3, cycle 12).
+    # `_h` is SANITISED above (`*[!0-9]*` -> ""), so a queue whose ranked rows are not plain issue
+    # numbers fell out of the `[ -n "$_h" ]` branch WITH `_r > 0` and printed "the pool ranked NONE of the
+    # N queued candidate(s) … this pass established NO priority order — candidates.txt WAS rewritten in
+    # its existing order" — three false claims about a reorder this call HAD performed: it ranked rows,
+    # it did establish an order, and the file's sequence was re-derived (measured: queue `aaa,bbb`,
+    # pool `bbb` → rows `bbb aaa`, and the durable `why=` said the order "could NOT be re-derived").
+    # The rank COUNT is the witness of what happened; the head is only a witness of WHICH row leads.
+    QUEUE_ORDER_STATE="severity"
+    echo "[refresh] queue order: the reorder WAS derived from the pool — $_inst_said: $_r ranked, $_u unranked, so the rows in $o/candidates.txt now lead with the pool-ranked ones; the HEAD cannot be named here because the count read back a head that is not a plain issue number"
   else
     # Not a silent degradation: nothing in the queue is ranked by the pool, so the ORDER MEANS NOTHING.
     # ⛔ AND IT IS NOT "ARRIVAL ORDER" EITHER (review P2). This arm rewrites the file with the rows in
@@ -4048,13 +4059,16 @@ queue_order_from_pool() {
     # runs. The first version of this sentence said "byte-identical" unconditionally, which was false
     # in exactly that case — a typed claim about a write this call had just performed. `_wrote` is the
     # answer, from the `cmp`/`mv` that actually decided it.
+    # ⛔ AND THE POPULATION IS THE MEASURED DEPTH, NOT `_u` (review P3, cycle 12): `_u` is the count
+    # file's own unranked field, and with `_r` 0 the two agree — but the sentence is a claim about the
+    # QUEUE, so it says the queue's size, which `_rows_now` (and the totals cross-check above) verified.
     QUEUE_ORDER_STATE="priority-unreadable"
     if [ "${_wrote:-0}" -eq 1 ]; then
       _wrote_said="candidates.txt WAS rewritten in its existing order (duplicate rows collapsed; the SEQUENCE was not re-derived here, and is NOT this pass's arrival order either)"
     else
       _wrote_said="candidates.txt was left UNTOUCHED (byte-identical; the sequence was not re-derived here, and is NOT this pass's arrival order either)"
     fi
-    echo "[refresh] priority-unreadable: the pool ranked NONE of the $_u queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
+    echo "[refresh] priority-unreadable: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
     echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry"
@@ -5988,12 +6002,24 @@ if [ -n "$_head_issue" ]; then
     "pass completed; queue depth $_backlog_n; head #$_head_issue is what dispatch takes next" \
     "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=$_head_issue" \
     "handed_why=$_head_why" "unusable=$(unusable_summary)"
-elif [ -n "$_backlog_n" ]; then
+# ⛔ THE EMPTY WORD HANGS OFF THE MEASUREMENT ON **BOTH** ARMS (review P2, cycle 12). The SKIP arm's fix
+# was applied here only halfway: `elif [ -n "$_backlog_n" ]` is true for ANY measured depth, and
+# `_head_issue` is deliberately SANITISED above, so a readable queue holding rows whose head is not a
+# plain number (a CRLF row, a `#1234`-prefixed row) printed "the queue is empty and this pass queued
+# nothing usable" and recorded `backlog=0` over those rows — the #1931 polarity this PR exists to close.
+# `_backlog_n` is the MEASURED depth; the head is a different question and gets its own honest answer.
+elif [ "$_backlog_n" -eq 0 ]; then
   echo "[refresh] handed to dispatch: NONE — the queue is empty and this pass queued nothing usable (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed but handed NOTHING to dispatch: the queue is empty and no candidate this pass was usable" \
     "judged=$judged" "queued=$QUEUED" "backlog=0" "handed=" "unusable=$(unusable_summary)"
+elif [ -n "$_backlog_n" ]; then
+  echo "[refresh] handed to dispatch: NONE — this pass queued nothing usable, and the queue holds $_backlog_n row(s) but its HEAD could not be read as a candidate number, so this pass cannot say WHICH one dispatch takes next — the depth is MEASURED, the head is UNKNOWN, and this is NOT an empty queue (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
+  REFRESH_RECORDED=1
+  refresh_record_write ok handoff 0 \
+    "pass completed but handed NOTHING to dispatch: the queue holds $_backlog_n row(s) and its head could not be read, so the DEPTH is measured and the HEAD is unknown (this is not an empty queue)" \
+    "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=" "unusable=$(unusable_summary)"
 else
   # ⛔ THE THIRD ARM (review P2, cycle 11): the queue could not be READ, so its depth is UNKNOWN — never
   # the success word, and never a `backlog=0` the durable record would be asserting as a measurement.
