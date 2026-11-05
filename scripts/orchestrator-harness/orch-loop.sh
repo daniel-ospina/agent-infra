@@ -2047,9 +2047,29 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   # `candidates.txt: No such file or directory` for `<` before the command's stderr is redirected, so a
   # box with no queue file would pollute the very line this function exists to keep clean. The file is
   # tested FIRST instead.
-  backlog=0
-  [ -r "$O/candidates.txt" ] && backlog="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
-  case "$backlog" in ''|*[!0-9]*) backlog=0 ;; esac
+  # ⛔ A FAILED DEPTH READ IS UNKNOWN, NOT ZERO (review P2, cycle 15). The refresh pass records
+  # `backlog=UNKNOWN` for a queue it could not measure — and this reader ignored that field entirely and
+  # re-measured, coercing a failed read to `0`. So the beat printed "the queue is EMPTY now … drained
+  # work, not a stalled origin" over a queue holding rows while the record beside it said UNKNOWN: the
+  # same #1931 polarity the pass was just fixed to stop, one layer out. `_bl_state` is the witness; every
+  # EMPTY sentence below is gated on `READ`.
+  backlog=0; _bl_state="UNKNOWN"
+  if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+    _bl="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
+    case "$_bl" in
+      ''|*[!0-9]*) _bl_state="UNKNOWN" ;;
+      *)           backlog="$_bl"; _bl_state="READ" ;;
+    esac
+  fi
+  # ⛔ AND THE PASS'S OWN MEASUREMENT IS READ, not merely printed (review P2, cycle 15): when this beat
+  # cannot measure the depth itself, the attempt the pass recorded is the only evidence there is, and its
+  # `UNKNOWN` is what stops the EMPTY word below.
+  brec="$(refresh_record_field backlog "$rec")"
+  case "${brec:-}" in
+    UNKNOWN) _bl_state="UNKNOWN" ;;
+    ''|*[!0-9]*) : ;;
+    *) [ "$_bl_state" = "READ" ] || { backlog="$brec"; _bl_state="RECORDED"; } ;;
+  esac
   # ⛔ `-r`, NOT `-f` (review P2): a mode-000 or foreign-owned queue file passes `-f`, and `wc -l <`
   # then fails with a Permission-denied the `2>/dev/null` does NOT suppress (a failed redirection is
   # reported before the command's stderr is redirected) — so the beat would print "the queue is
@@ -2146,7 +2166,12 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       # NOW — but the ordinary drain state is “the pass queued 3 and dispatch took all 3”, where that
       # sentence is false and sends an operator after origination that worked. The record carries the
       # truth (`queued=`, `handed=`); it is printed as recorded, and `?` when it recorded nothing.
-      if [ -n "$hrec" ]; then
+      if [ "$_bl_state" = "UNKNOWN" ]; then
+        # ⛔ THE THIRD STATE (review P2, cycle 15): the queue's depth could not be measured HERE and the
+        # pass recorded no measurement either — so "EMPTY" is a claim about a file nobody read.
+        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured (this beat and the last refresh pass both failed to read it), so this is NOT known to be an empty queue: work may be queued and unread | PR path: %s\n' \
+          "$why" "$lanes" "$workers" "$prtail"
+      elif [ -n "$hrec" ]; then
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY now; the last refresh pass (%s) recorded queued=%s and handed #%s to dispatch, so this is drained work, not a stalled origin | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$age" "${qrec:-?}" "$hrec" "$prtail"
       else

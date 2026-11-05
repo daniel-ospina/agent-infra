@@ -5860,8 +5860,18 @@ fi
 # a directory printed `wc: 'standard input': Is a directory` to stderr AND `backlog now 0 issues` — a
 # MEASURED-zero claim over a queue the pass could not read, twenty-five lines above the arm that says
 # `the queue could NOT be READ … backlog=UNKNOWN`. One pass cannot say both; the read decides which.
+# ⛔ THE DEPTH IS ONE MEASUREMENT WITH ONE WORD, WHATEVER THE READ DID (review P3, cycle 15). The guarded
+# echo still interpolated `$(wc -l …)` directly, so a readable file whose depth read FAILED printed
+# `backlog now  issues` — an unmeasured field rendered with no word at all — 90 lines above the handoff
+# saying the depth was UNKNOWN. The measurement is taken once, named, and then stated.
 if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
-  echo "[refresh] checked $judged; backlog now $(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ') issues"
+  _depth_now="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+  case "$_depth_now" in ''|*[!0-9]*) _depth_now="" ;; esac
+  if [ -n "$_depth_now" ]; then
+    echo "[refresh] checked $judged; backlog now $_depth_now issues"
+  else
+    echo "[refresh] checked $judged; backlog depth UNKNOWN — $O/candidates.txt is readable but its depth could not be measured, so this pass cannot say how deep the queue is (this is NOT an empty queue)"
+  fi
 else
   echo "[refresh] checked $judged; backlog depth UNKNOWN — $O/candidates.txt is not a readable regular file, so this pass cannot say how deep the queue is (this is NOT an empty queue)"
 fi
@@ -5888,13 +5898,20 @@ refresh_stage handoff "state/refresh-last"
 #   · the same failed REDIRECTION leaks the shell's `…: Is a directory` / `…: No such file or directory`
 #     to stderr even with `2>/dev/null` (the redirection is set up before the command runs) — the exact P3
 #     fixed for `.queue-rank`. `orch-loop.sh` already reads this file `[ -r ]`-first for the same reason.
+# ⛔ THE GUARD'S OWN VERDICT IS THE WITNESS, NOT THE EMPTINESS OF ITS TWO OUTPUTS (review P2, cycle 15).
+# The unreadable word was derived from "both reads came back empty", and TWO DIFFERENT states produce
+# that — the file was never readable, and the file WAS readable but its DEPTH read failed while its head
+# was unparsable (a CRLF row, a `#1234` row). The second printed and recorded "is not a readable regular
+# file" ABOUT a readable regular file: the SKIP arm's defect, 1,800 lines down, unfixed. `_q_readable` is
+# set INSIDE the guard, so every arm below can name the state that actually happened.
+_q_readable=0
+_backlog_n=""; _head_issue=""
 if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+  _q_readable=1
   _backlog_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
   case "$_backlog_n" in ''|*[!0-9]*) _backlog_n="" ;; esac
   _head_issue="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
   case "$_head_issue" in ''|*[!0-9]*) _head_issue="" ;; esac
-else
-  _backlog_n=""; _head_issue=""
 fi
 # ⛔ A KNOWN HEAD DOES NOT IMPLY A MEASURED DEPTH (review P2, cycle 14). This arm was `if [ -n
 # "$_head_issue" ]` alone, and `_backlog_n` is EMPTY when only the DEPTH read failed (a `wc` shim, a file
@@ -5902,6 +5919,34 @@ fi
 # VALUE into `state/refresh-last`: an unmeasured field rendered silently, which is the polarity the rest
 # of this file forbids. Measured on the shipped lines: `RECORD: … queue depth ; head #300 … backlog=
 # handed=300`. The depth is now part of the arm's condition, and the mixed state says so.
+# ⛔ THE HEAD'S PROVENANCE IS COMPOSED BEFORE THE ARMS SPLIT (review P3, cycle 15). It used to be built
+# INSIDE the first arm, so the head-known/depth-unknown arm — added a cycle earlier — recorded
+# `handed=<head>` with NO `handed_why=` at all: the durable record named a row and said nothing about
+# where it came from, while the sibling arms treat that field as the one that outlives the log line.
+# One composition, used by every arm that hands a head.
+if [ -n "$_head_issue" ]; then
+case "${QUEUE_ORDER_STATE:-}" in
+  severity) _head_rank="the highest-ranked CLEAN entry in the pool-ordered queue" ;;
+  # ⛔ NO ARM MAY TYPE AN AGE CLAIM IT DID NOT READ (review P2). Both unreadable arms used to open with
+  # "the OLDEST CLEAN entry still queued" — an ARRIVAL-order assertion this string then writes to the
+  # DURABLE record as `handed_why=`, where it outlives the log line. It is false in both: a failed
+  # reorder leaves the PREVIOUS pass's order (possibly severity-ordered, so the head may be the
+  # top-ranked one, not the oldest), and the ranked-none arm keeps the queue's pre-existing order,
+  # whose head is not the arrival-oldest either. Say where the row is, not how old it is.
+  empty)    _head_rank="the entry at the head of the queue — the reorder ranked NOTHING (it read an empty queue) and yet a row is here, so writer and reader disagree: treat this row as UNRANKED with severity UNKNOWN, not as ranked by anything" ;;
+  # ⛔ THE THIRD STATE NEEDS ITS OWN WORDS (review P2, cycle 10). `severity-uncounted` fell into the `*` arm
+  # below, which says "this pass established NO priority order" — the OPPOSITE of the truth: the reorder
+  # was derived and is on disk, and this head IS the highest-ranked CLEAN entry. That sentence becomes
+  # `handed_why=` in `state/refresh-last`, so the durable record contradicted the log line printed two
+  # lines above it. The same conflation the writer fixed, one layer out.
+  severity-uncounted) _head_rank="the entry at the head of the queue this pass derived — whether the pool ranked ANY row is UNKNOWN (the count could not be read back), so read this row's RANK as unknown, not as ranked by anything" ;;
+  *)        _head_rank="the entry at the head of the queue — priority-unreadable: this pass established NO priority order for the queue, so neither its severity nor its age rank is known, and it is not a priority decision" ;;
+esac
+case " ${QUEUED_THIS_PASS:-}" in
+  *" $_head_issue "*) _head_why="judged CLEAN by THIS pass, and $_head_rank" ;;
+  *)                  _head_why="carried over from an earlier pass — $_head_rank" ;;
+esac
+fi
 if [ -n "$_head_issue" ] && [ -n "$_backlog_n" ]; then
   # ⛔ THE ORDER CLAIM IS READ, NEVER TYPED (review P1). This sentence used to say "highest-ranked …
   # severity order" unconditionally, so it was FALSE in exactly the two cases the writer had just
@@ -5924,27 +5969,6 @@ if [ -n "$_head_issue" ] && [ -n "$_backlog_n" ]; then
   #     (the previous pass's order). ⛔ `OLDEST` was the same defect one word over (review P2, cycle 3):
   #     age rank is a claim about arrival order, and neither arm verified one. The one fact true of both
   #     is that THIS PASS established no priority order — so that is all either arm may say.
-  case "${QUEUE_ORDER_STATE:-}" in
-    severity) _head_rank="the highest-ranked CLEAN entry in the pool-ordered queue" ;;
-    # ⛔ NO ARM MAY TYPE AN AGE CLAIM IT DID NOT READ (review P2). Both unreadable arms used to open with
-    # "the OLDEST CLEAN entry still queued" — an ARRIVAL-order assertion this string then writes to the
-    # DURABLE record as `handed_why=`, where it outlives the log line. It is false in both: a failed
-    # reorder leaves the PREVIOUS pass's order (possibly severity-ordered, so the head may be the
-    # top-ranked one, not the oldest), and the ranked-none arm keeps the queue's pre-existing order,
-    # whose head is not the arrival-oldest either. Say where the row is, not how old it is.
-    empty)    _head_rank="the entry at the head of the queue — the reorder ranked NOTHING (it read an empty queue) and yet a row is here, so writer and reader disagree: treat this row as UNRANKED with severity UNKNOWN, not as ranked by anything" ;;
-    # ⛔ THE THIRD STATE NEEDS ITS OWN WORDS (review P2, cycle 10). `severity-uncounted` fell into the `*` arm
-    # below, which says "this pass established NO priority order" — the OPPOSITE of the truth: the reorder
-    # was derived and is on disk, and this head IS the highest-ranked CLEAN entry. That sentence becomes
-    # `handed_why=` in `state/refresh-last`, so the durable record contradicted the log line printed two
-    # lines above it. The same conflation the writer fixed, one layer out.
-    severity-uncounted) _head_rank="the entry at the head of the queue this pass derived — whether the pool ranked ANY row is UNKNOWN (the count could not be read back), so read this row's RANK as unknown, not as ranked by anything" ;;
-    *)        _head_rank="the entry at the head of the queue — priority-unreadable: this pass established NO priority order for the queue, so neither its severity nor its age rank is known, and it is not a priority decision" ;;
-  esac
-  case " ${QUEUED_THIS_PASS:-}" in
-    *" $_head_issue "*) _head_why="judged CLEAN by THIS pass, and $_head_rank" ;;
-    *)                  _head_why="carried over from an earlier pass — $_head_rank" ;;
-  esac
   echo "[refresh] handed to dispatch: #$_head_issue — $_head_why (queue depth $_backlog_n; orch-loop.sh takes the head first)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
@@ -5953,12 +5977,13 @@ if [ -n "$_head_issue" ] && [ -n "$_backlog_n" ]; then
     "handed_why=$_head_why" "unusable=$(unusable_summary)"
 elif [ -n "$_head_issue" ]; then
   # The head was read, the depth was not. Both facts are recorded — the head as `handed=`, the depth as
-  # `UNKNOWN` — because a `backlog=` with no value asserts a measurement this pass did not make.
-  echo "[refresh] handed to dispatch: #$_head_issue — the queue's HEAD was read but its DEPTH could not be measured, so the depth is UNKNOWN (the head is still what dispatch takes first; judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
+  # `UNKNOWN` — because a `backlog=` with no value asserts a measurement this pass did not make. The head
+  # also carries the same provenance every other handing arm records (review P3, cycle 15).
+  echo "[refresh] handed to dispatch: #$_head_issue — $_head_why (the queue's DEPTH could not be measured, so it is UNKNOWN; judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed; head #$_head_issue is what dispatch takes next, but the queue's DEPTH could not be measured (UNKNOWN)" \
-    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=$_head_issue" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=$_head_issue" "handed_why=$_head_why" "unusable=$(unusable_summary)"
 # ⛔ THE EMPTY WORD HANGS OFF THE MEASUREMENT ON **BOTH** ARMS (review P2, cycle 12). The SKIP arm's fix
 # was applied here only halfway: `elif [ -n "$_backlog_n" ]` is true for ANY measured depth, and
 # `_head_issue` is deliberately SANITISED above, so a readable queue holding rows whose head is not a
@@ -5981,12 +6006,22 @@ elif [ -n "$_backlog_n" ]; then
   refresh_record_write ok handoff 0 \
     "pass completed but handed NOTHING to dispatch: the queue holds $_backlog_n row(s) and its head could not be read, so the DEPTH is measured and the HEAD is unknown (this is not an empty queue)" \
     "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=" "unusable=$(unusable_summary)"
-else
+elif [ "$_q_readable" -eq 0 ]; then
   # ⛔ THE THIRD ARM (review P2, cycle 11): the queue could not be READ, so its depth is UNKNOWN — never
   # the success word, and never a `backlog=0` the durable record would be asserting as a measurement.
   echo "[refresh] handed to dispatch: NONE — this pass queued nothing usable, and the queue could NOT be READ ($O/candidates.txt is not a readable regular file), so this pass cannot say what dispatch would take (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed; the queue could NOT be read, so the depth and the head are UNKNOWN and nothing was handed" \
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "unusable=$(unusable_summary)"
+else
+  # ⛔ READABLE, BUT NEITHER NUMBER CAME BACK (review P2, cycle 15): the file WAS read (the guard above
+  # proved it), the depth read failed, and the head is not a plain number. Saying "not a readable regular
+  # file" about it is false, so this state gets its own sentence — depth UNKNOWN, head UNKNOWN, queue
+  # readable, and the durable record says exactly that.
+  echo "[refresh] handed to dispatch: NONE — this pass queued nothing usable; the queue WAS read ($O/candidates.txt is a readable regular file) but its DEPTH could not be measured and its HEAD is not a candidate number, so this pass can say neither how many rows are queued nor which one dispatch would take — the depth and the head are UNKNOWN, and this is NOT an empty queue (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
+  REFRESH_RECORDED=1
+  refresh_record_write ok handoff 0 \
+    "pass completed; the queue WAS readable but neither its DEPTH nor its HEAD could be measured, so both are UNKNOWN and nothing was handed (this is not an empty queue)" \
     "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "unusable=$(unusable_summary)"
 fi

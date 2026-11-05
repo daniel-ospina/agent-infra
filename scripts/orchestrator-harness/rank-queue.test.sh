@@ -1255,6 +1255,8 @@ skip_drive() {  # <label> <queue-setup: absent|empty|rows|garbage|dir> -> sets S
     dir)     mkdir -p "$d/o/candidates.txt" ;;
     wcfail)  printf '300\n200\n' > "$d/o/candidates.txt"
              mkdir -p "$d/bin"; printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+    wcfail-garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
+                    mkdir -p "$d/bin"; printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
     mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
   esac
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\n'
@@ -1290,6 +1292,13 @@ if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue WAS read' \
    && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty'; then rc=0
 else rc=1; echo "      skip/wcfail: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a readable file whose depth read fails: 'the queue WAS read' + backlog=UNKNOWN, NOT 'could NOT be READ', NOT empty)"; fi
 ck "SKIP arm: a READABLE file whose DEPTH read fails says the queue WAS read, with backlog=UNKNOWN (driven)" $rc
+skip_drive unreadable-depth wcfail-garbage
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue WAS read' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
+   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
+   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty'; then rc=0
+else rc=1; echo "      skip/wcfail-garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (readable + depth failed + unparsable head: 'the queue WAS read', NOT 'could NOT be READ', NOT empty)"; fi
+ck "SKIP arm: readable + depth failed + unparsable head is still a READ queue, with backlog=UNKNOWN (driven)" $rc
 skip_drive unreadable mode000
 if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
    && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
@@ -1436,6 +1445,12 @@ main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
     wcfail) printf '300\n200\n' > "$d/o/candidates.txt"
             mkdir -p "$d/bin"
             printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+    # ⛔ READABLE, DEPTH UNMEASURABLE, HEAD UNPARSABLE (review P2, cycle 15): the state that `_q_readable`
+    # exists for. Both of the arm's OUTPUTS are empty here, exactly as they are for an unreadable file, so
+    # without the witness the pass calls this readable file "not a readable regular file".
+    wcfail-garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
+                    mkdir -p "$d/bin"
+                    printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
     # ⛔ AND A REGULAR FILE THAT IS NOT READABLE: the `-r` half of the guard, which a directory (`-f`
     # fails first) can never grade.
     mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
@@ -1532,6 +1547,46 @@ else
   else rc=1; echo "      the fail-open re-parse did not reproduce the defect: '$(tr '\n' '|' < "$d/out" | head -c 240)'"; fi
 fi
 ck "non-vacuity: the pre-fix \`_backlog_n=0\` re-parse turns a failed depth read into a MEASURED \`backlog=0\`" $rc
+# (b3b) READABLE + DEPTH FAILED + HEAD UNPARSABLE (review P2, cycle 15). Both reads came back empty, so
+# this state is indistinguishable from an unreadable file UNLESS the guard's verdict is carried — and the
+# unreadable sentence is FALSE here: the file was read.
+main_handoff wcfailg wcfail-garbage
+if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'the queue WAS read' \
+   && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
+   && printf '%s' "$MHOUT" | grep -q 'the depth and the head are UNKNOWN' \
+   && ! printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
+   && ! printf '%s' "$MHOUT" | grep -q 'backlog now  issues' \
+   && ! printf '%s' "$MHOUT" | grep -q 'backlog=0'; then rc=0
+else rc=1; echo "      readable/depth-fail/garbage-head: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (want 'the queue WAS read' + 'the depth and the head are UNKNOWN'; NOT 'could NOT be READ', NOT an empty 'backlog now', NOT backlog=0)"; fi
+ck "a READABLE queue whose depth read fails AND whose head is unparsable is not called unreadable, and the depth ECHO names it UNKNOWN" $rc
+# NON-VACUITY: drop the witness (key the last arm on the emptiness of its outputs again) — the state goes
+# back to being described as an unreadable file.
+# The defect is DERIVING THE STATE FROM THE OUTPUTS instead of from the guard's verdict: key the
+# unreadable word on "no head was read" and a readable file lands in it again (the readable/depth arm
+# below is then unreachable for this state, which is exactly how the pre-fix code behaved).
+QGREV="$TMP/main-handoff-witness-rev.sh"
+sed 's/^elif \[ "\$_q_readable" -eq 0 \]; then$/elif [ -z "$_head_issue" ]; then/' "$MAINDRV" > "$QGREV" 2>/dev/null
+if cmp -s "$MAINDRV" "$QGREV" 2>/dev/null; then rc=1; echo "      the witness revert did not apply — the sed anchor drifted"
+else
+  d="$TMP/mh-witrev"; rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
+  printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
+  { printf 'set -u\nQUEUE_ORDER_STATE="severity"\nQUEUED_THIS_PASS=""\n'
+    printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\nunusable_summary() { printf "none"; }\n'
+    for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
+    printf 'O="%s/o"\nSTARVED=0\n' "$d"; cat "$QGREV"; printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" PATH="$d/bin:$PATH" bash drive.sh ) > "$d/out" 2>&1
+  if grep -q 'could NOT be READ' "$d/out" 2>/dev/null; then rc=0
+  else rc=1; echo "      the output-keyed arm did not reproduce the defect: '$(tr '\n' '|' < "$d/out" | head -c 240)'"; fi
+fi
+ck "non-vacuity: keying the unreadable word on the OUTPUTS again makes a readable file be reported as unreadable" $rc
+# (b3c) THE HEAD-ONLY ARM RECORDS ITS PROVENANCE (review P3, cycle 15). It used to write `handed=<head>`
+# with no `handed_why=` at all — a durable row with no statement of where it came from.
+main_handoff wcfail2 wcfail
+if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'handed_why=' \
+   && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN'; then rc=0
+else rc=1; echo "      head-only arm: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (the arm that records handed=300 must also record handed_why=)"; fi
+ck "the HEAD-KNOWN/DEPTH-UNKNOWN arm records handed_why alongside handed (the field that outlives the log)" $rc
 # (b4) THE `-r` HALF OF THE GUARD (review P3, cycle 14). Every unreadable fixture so far was a DIRECTORY,
 # which `-f` alone rejects — so dropping `-r` re-leaked the shell's own `Permission denied` unpunished.
 main_handoff mode000 mode000
