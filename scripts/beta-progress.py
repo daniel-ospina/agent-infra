@@ -226,6 +226,12 @@ REST_TIMEOUT_S = 15   # per request
 # pages. 30 s is ~4x the measured latency (0.43 s/call, ~7.7 s for 18 pages) and sits inside the
 # tick's 40-90 s of residual slack. A PER-READ budget is what this rules out: four 30 s reads is
 # 120 s of REST alone, which spends the slack and then some.
+# ⛔ AND THE DISCLOSED COST OF THE WIDER READ IS IN THIS BUDGET, NOT IN A LARGER ONE. The fix-repo
+# pair adds ~9 more pages inside the SAME 30 s, so the per-page tolerance on a GraphQL-refusing box
+# halves: ~3.3 s/page before this change, ~1.67 s/page after, against a measured 0.43 s/call. It is
+# accepted rather than raised because a bigger REST budget pushes the phase past the slack the
+# paragraph above measures, which is the failure this budget exists to prevent — and because the
+# direction it fails in is `unavailable` (a line), never a SHORT WINDOW (a wrong number).
 REST_BUDGET_S = 30
 # ⛔ AND REST IS NOT THE WHOLE PHASE. `gh()` reads are NOT on `rest_deadline`; they were bounded
 # only by `gh()`'s own flat 120 s, so the phase's worst case was (PR lists + issue lists) x 120 s =
@@ -235,22 +241,27 @@ REST_BUDGET_S = 30
 # So ONE clock bounds the WHOLE phase: `compute()` opens it (`_phase_clock`), `gh()` derives every
 # child's timeout from what is LEFT of it, and the REST deadline is clamped to it. The bound is a
 # CONSTANT of the phase — adding a fix repo cannot EXTEND it, it only spends it.
-# ⛔ SIZED FROM THE MEASUREMENT, NOT FROM THE SLACK BAND -- and this is the whole reason the number
-# is not smaller. `objective.py` records the only latency measurement this repo has for a `gh`
-# read: `GH_SERIALISED_LATENCY_S = 63.0` (13 lanes on one box) against 0.676 s at 3 lanes, and its
-# rule is blunt -- "a budget under the measured latency does not bound the read, it manufactures a
-# false absence". A "safe-looking" phase budget of 40 s did exactly that on the busiest boxes: it
-# sat BELOW one measured read, so the phase refused on the boxes that most need the line.
-# 100 s = `objective.py`'s own QUEUE_READ_MAX_S (1.6x the measurement, "one more lane is ordinary
-# traffic"), which leaves 290 s of the tick's 390 s. A single slow-but-legitimate read (63 s) and
-# the ~15 s per-read cost of six reads on a loaded box therefore both still produce a NUMBER; what
-# reaches this bound is a box whose reads are all several times the measured worst case, and there
-# the honest answer is `unavailable` rather than being killed with no line at all.
+# ⛔ SIZED FROM THE PHASE'S OWN SLACK — AND THAT IS NOT THE SAME NUMBER AS A READ'S LATENCY. An
+# earlier draft sized this at 100 s by borrowing `objective.py`'s `QUEUE_READ_MAX_S`, and it was
+# wrong twice over: (a) 100 s sits ABOVE the 40-90 s this step actually has left inside the tick, so
+# the clock could never fire before `run_bounded` killed the tick — it was an INERT ENFORCER that
+# looked like protection; and (b) it borrowed a bound for ONE read to cover SIX (two tracker PR
+# lists + two fix-repo PR lists + two issue lists), giving each an effective 16.7 s.
+# 60 s is chosen from the slack band this step really has: it fires INSIDE the 40-90 s window, so a
+# slow phase prints `unavailable` instead of being killed with no line; and it is ~5-6x the MEASURED
+# phase on this box (the six reads took 0.7-3.3 s each, ~8-12 s end to end, against ~4 s for the
+# REST arm); and it is exactly 2x `REST_BUDGET_S`, so the REST arm fits inside it rather than being
+# clipped by it.
+# ⛔ THE RESIDUAL, STATED RATHER THAN BOUNDED AWAY: `objective.py` measures 63 s for ONE `gh` read at
+# 13 lanes, and SIX such reads (378 s) cannot fit this step's slack in ANY implementation — that is a
+# pre-existing property of the heartbeat, not something this constant can fix. What the clock buys is
+# that the phase's worst case no longer GROWS with `FIX_REPOS`, and that the slow case yields a line
+# instead of a killed tick.
 # ⛔ WHY THE WHOLE LINE AND NOT "DEGRADE TO THE TRACKER PAIR": the tracker pair IS already in hand
 # when the fix-repo reads run, so a partial answer is possible. It is refused on purpose. A
 # tracker-only count reports `without_pr` for every unit whose fix repo went unread -- a FALSE GAP,
 # the exact mis-charter this change exists to remove -- so an unread phase must say so, not guess.
-PHASE_BUDGET_S = 100
+PHASE_BUDGET_S = 60
 
 
 def _token():
@@ -472,6 +483,16 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
     tok = _token()
     if not tok:
         return None
+    # ⛔ A FALSY `repo` IS REFUSED, NOT SUBSTITUTED (#3457 review). `None` is the documented
+    # "the tracker" default; anything else that is not a well-formed `owner/name` — an empty
+    # string from a malformed config, say — used to fall through `repo or REPO` and hand back the
+    # TRACKER's `/pulls` under the caller's repo name: a wrong list that still looks complete, which
+    # is the one thing this path may not do. The caller validates `FIX_REPOS` too, but a callee that
+    # only holds the hazard when its caller remembers is not holding it at all.
+    if repo is None:
+        repo = REPO
+    elif not isinstance(repo, str) or repo.count("/") != 1 or not all(repo.split("/")):
+        return None
     path = "open" if state == "open" else "closed"
     if deadline is None:
         deadline = time.time() + REST_BUDGET_S
@@ -492,7 +513,7 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
             if remaining <= 0:
                 return None           # budget spent -- refuse, never return a short window
             url = ("https://api.github.com/repos/%s/pulls?state=%s&sort=updated&direction=desc"
-                   "&per_page=%d&page=%d" % (repo or REPO, path, REST_PER_PAGE, page))
+                   "&per_page=%d&page=%d" % (repo, path, REST_PER_PAGE, page))
             raw = _rest_get_json(url, tok, min(REST_TIMEOUT_S, remaining))
             if not isinstance(raw, list):
                 return None
@@ -676,25 +697,28 @@ def _compute():
     #     them and got the surface wrong in three ways (four were `P0-blocker` rather than
     #     `P1-severe`, ten open P1s above the range were missing, and the "newest PR" it pinned was
     #     already stale). The CHECK IS "ANY OPEN TORTOISE NUMBER", so a list can only rot.
-    #   * THE MITIGATION IS NOT A QUALIFIED MATCH. `tortoise#N` / issue-URL matching was the first
-    #     suggestion and it would UNDO this change: agent-infra#3368's title carries the bare
-    #     `(#10114)` that this PR exists to see, so requiring a qualifier restores the `without_pr`
-    #     that charters a lane to rebuild landed work. What is applied instead is narrower: a
-    #     fix-repo row whose bare `#N` EQUALS THE ROW'S OWN NUMBER is that row referring to itself,
-    #     so it is not a cover (`covered()` below). That closes the dominant class -- every fix-repo
-    #     branch named after its own numbered issue.
-    #   * ⛔ AND THAT RULE HAS A COST, IN THE OTHER DIRECTION, STATED RATHER THAN OVERSOLD. It is
-    #     not "safe in one direction"; it deliberately converts one error into another. A fix-repo
-    #     PR numbered `N` that genuinely fixes `tortoise#N` is now suppressed, so tortoise#N reads
-    #     `without_pr`. That is REACHABLE TODAY, in exactly the two numbers already in range
-    #     (#2281, #2513), and an earlier form of this comment claimed otherwise. The direction is
-    #     chosen on purpose: a false COVER silently drops a unit nobody then builds (silent loss of
-    #     work), while a false GAP costs at most a wasted dispatch and is VISIBLE in the line -- and
-    #     the bare-number prior is that agent-infra rows cite agent-infra issues, because a tracker
-    #     reference is written `tortoise#N`.
-    #   * LEFT OPEN, stated: an agent-infra row that cross-references a DIFFERENT agent-infra issue
-    #     whose number is also an open tortoise P0/P1 still reads as a cover. Narrowing that needs a
-    #     per-row repo identity, which neither endpoint returns.
+    #   * THE MITIGATION IS NOT A QUALIFIED MATCH, AND NONE IS APPLIED HERE. `tortoise#N` / issue-URL
+    #     matching was the first suggestion and it would UNDO this change: agent-infra#3368's title
+    #     carries the bare `(#10114)` that this PR exists to see, so requiring a qualifier restores
+    #     the `without_pr` that charters a lane to rebuild landed work.
+    #   * ⛔ AND A "SELF-REFERENCE" FILTER WAS TRIED, MEASURED, AND REMOVED. The idea was to ignore a
+    #     fix-repo row whose bare `#N` equals the ROW'S OWN number (agent-infra#2513's
+    #     `fix/2513-pool-filter` citing agent-infra#2513, not tortoise#2513). Measured against the
+    #     live windows (2026-11-05, agent-infra open 47 + merged 400 = 447 rows; 31 open tracker
+    #     P0/P1): only 2 of 447 rows carry their own number at all, and **0 of the 7 rows that
+    #     actually collide with an open tracker unit are self-references** — every one of them cites
+    #     the tracker BARE (`fix/10114-pin-tree-is-a-holder`, `fix/10951-pool-filter`, `p0-10114`,
+    #     `ai-10114`, `batch(#3309 #10114 …)`), which is the same fact that rules out the qualified
+    #     match. So the filter closed nothing measurable while SUPPRESSING a real cover whenever a
+    #     fix-repo PR numbered N genuinely fixes tortoise#N — a false gap, i.e. work rebuilt. Not
+    #     worth it, and it made this block argue both that a false gap is the worst error and that it
+    #     is the cheap one. Removed rather than documented; the measurement is kept so it is not
+    #     re-invented.
+    #   * SO THE FALSE-COVER RISK IS OPEN AND UNMITIGATED, deliberately. The correct successor is a
+    #     PER-ROW REPO IDENTITY (each row's own repo, so a bare `#N` from a fix repo can be matched
+    #     against that repo's issues or rejected); neither `gh pr list` nor `/pulls` returns it
+    #     today, so it is a follow-up, not a heuristic. Until then the optimistic error stands: a
+    #     fix-repo row citing an in-range number marks the same-numbered tortoise unit covered.
     # ⛔ A REFUSED READ IS NOT "NO PR": with no second source it returns None so the whole line
     # reads `unavailable`, exactly as a failed tracker read does. Inflating `without` from an
     # unreadable repo is the fail-open direction, and it is the one that misdirects a lane into
@@ -726,21 +750,10 @@ def _compute():
 
     def covered(n):
         pat = re.compile(r"(?<![\d])%d(?![\d])" % n)
-        for p in openpr + merged:
-            if pat.search(p.get("headRefName") or "") or pat.search(p.get("title") or ""):
-                return True
-        for p in fix_prs:
-            # ⛔ A ROW CITING ITS OWN NUMBER IS NOT COVERING A TRACKER ISSUE (see the false-cover
-            # block above). agent-infra numbers ITS OWN issues and PRs in the same sequence, so its
-            # branch `fix/2513-pool-filter` cites agent-infra#2513 -- never tortoise#2513. Skipping
-            # the self-reference closes the dominant class WITHOUT the qualified match that would
-            # stop covering the bare `(#10114)` this change exists to see.
-            # ⛔ THE COST IS A FALSE GAP when a fix-repo PR numbered N really does fix tortoise#N;
-            # that is accepted deliberately, because a false cover silently drops a unit while a
-            # false gap only costs a wasted dispatch. Both directions are stated at the block above,
-            # and neither is claimed away.
-            if p.get("number") == n:
-                continue
+        # ⛔ ONE RULE FOR EVERY ROW. A per-repo rule was tried and removed -- see the false-cover
+        # block above for the measurement (0 of 7 colliding rows are self-references) and why the
+        # only sound successor is a per-row repo identity rather than a heuristic here.
+        for p in openpr + merged + fix_prs:
             if pat.search(p.get("headRefName") or "") or pat.search(p.get("title") or ""):
                 return True
         return False

@@ -34,7 +34,6 @@ from __future__ import annotations
 import importlib.util
 import json
 import pathlib
-import re
 import time
 
 import pytest
@@ -1241,18 +1240,24 @@ def test_the_merged_fix_repo_window_alone_covers_a_landed_fix(monkeypatch, no_ca
     assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}
 
 
-def test_a_fix_repo_row_citing_its_own_number_is_not_a_cover(monkeypatch, no_cache):
-    """⛔ agent-infra NUMBERS ITS OWN ISSUES AND PRs IN THE SAME SEQUENCE AS THE TRACKER.
+def test_a_fix_repo_row_citing_its_own_number_still_covers_it_pins_the_disclosed_residual(monkeypatch, no_cache):
+    """⛔ THE KNOWN FALSE-COVER RESIDUAL, PINNED AS THE SHIPPED BEHAVIOUR — NOT AS CORRECT.
 
-    Its PR `fix/2513-pool-filter` cites agent-infra#2513 — NOT tortoise#2513, which is a different
-    issue with the same number. `covered()` cannot tell which repo a row came from, so a bare match
-    fails OPTIMISTICALLY: the tortoise issue reads covered and nobody builds it. The rule applied is
-    the narrowest one that cannot break the fix: a row whose match EQUALS THE ROW'S OWN NUMBER is
-    referring to itself, so it is not a cover.
+    agent-infra numbers its own issues and PRs in the SAME sequence as the tracker, so its branch
+    `fix/2513-pool-filter` cites agent-infra#2513 while tortoise#2513 is a different issue with the
+    same number. `covered()` cannot tell which repo a row came from, so that row marks tortoise#2513
+    covered and nobody builds it.
 
-    ⛔ THE QUALIFIED MATCH (`tortoise#N`) IS DELIBERATELY NOT USED: agent-infra#3368's title carries
-    the BARE `(#10114)` that this change exists to see, so requiring a qualifier would restore the
-    `without_pr` that charters a lane to rebuild landed work.
+    ⛔ A "SELF-REFERENCE" FILTER WAS SHIPPED FOR THIS AND THEN REMOVED, because the measurement did
+    not support it: of 447 agent-infra rows only 2 carry their own number at all, and 0 of the 7
+    rows that actually collide with an open tracker unit are self-references — they all cite the
+    tracker BARE (`fix/10114-pin-tree-is-a-holder`, `p0-10114`, `batch(#3309 #10114 …)`), which is
+    the same fact that rules out a qualified match. So the filter closed nothing measurable while
+    suppressing genuine covers (a fix-repo PR numbered N that really does fix tortoise#N).
+
+    This test therefore asserts the RESIDUAL IS OPEN. If it ever goes red because someone narrowed
+    `covered()`, that is a behaviour change to be justified against the comment in
+    `scripts/beta-progress.py` — not a test to "fix" by relaxing it.
     """
     other = "daniel-ospina/agent-infra"
 
@@ -1267,7 +1272,7 @@ def test_a_fix_repo_row_citing_its_own_number_is_not_a_cover(monkeypatch, no_cac
             return [
                 # agent-infra's OWN issue 2513 — a DIFFERENT issue from tortoise#2513.
                 pr(2513, ref="fix/2513-pool-filter", title="fix(2513): the pool filter, one def"),
-                # a cross-reference to a different number still covers, as it must (#10114).
+                # a cross-reference to a different number covers, as it must (#10114).
                 pr(4000, ref="fix/pin-tree", title="fix(reaper): the PIN TREE (#10114)"),
             ]
         label = args[args.index("--label") + 1]
@@ -1276,10 +1281,10 @@ def test_a_fix_repo_row_citing_its_own_number_is_not_a_cover(monkeypatch, no_cac
     monkeypatch.setattr(bp, "gh", fake_gh)
     out = bp.compute()
     assert out is not None
-    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}, (
-        "agent-infra#2513 cites ITS OWN issue; tortoise#2513 is not covered by it")
-    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
-        "the self-number rule must NOT stop a genuine cross-reference (3368 cites 10114)")
+    assert out["p1"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "the disclosed residual: a fix-repo row citing an in-range number IS read as a cover. If "
+        "this changed, the change needs its own justification against the measured collision data")
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}
 
 
 def test_a_malformed_fix_repo_entry_is_unavailable_not_a_typeerror(monkeypatch, no_cache):
@@ -1338,7 +1343,9 @@ def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_
                 state = args[args.index("--state") + 1]
                 if repo == bp.REPO:
                     return [pr(900)] if state == "open" else []
-                return [bad_row] if state == "open" else []
+                # ⛔ BOTH WINDOWS: `mergedAt` is only requested/checked for a NON-open window, so a
+                # bad row offered only as `open` never reaches that branch of the gate.
+                return [bad_row]
             return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[
                 args[args.index("--label") + 1]])
         return fake_gh
@@ -1349,6 +1356,10 @@ def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_
             {"number": 3368, "title": "t", "headRefName": ["fix/x"]},      # list ref
             {"number": {"n": 1}, "title": "t", "headRefName": "fix/x"},    # non-int number
             {"number": True, "title": "t", "headRefName": "fix/x"},        # bool is not a number
+            # ⛔ THE `mergedAt` GATE TOO. `_repo_prs` requests `mergedAt` for a non-open window, so a
+            # non-str there is the documented shape violation -- and it was the one branch of that
+            # gate with no test, so deleting it left the suite green.
+            {"number": 3368, "title": "t", "headRefName": "fix/x", "mergedAt": {"m": 1}},
     ):
         monkeypatch.setattr(bp, "gh", payload(bad_row))
         monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
@@ -1401,30 +1412,82 @@ def test_the_phase_clock_bounds_the_rest_deadline_and_is_then_restored(monkeypat
     assert bp._PHASE_DEADLINE is None, "the phase clock must be RESTORED, never left spent"
 
 
-def test_the_phase_budget_is_sized_from_the_measured_gh_latency():
-    """⛔ A PHASE BUDGET BELOW THE MEASURED READ LATENCY DOES NOT BOUND THE READ — IT REFUSES IT.
+def test_the_phase_budget_fits_the_slack_band_and_holds_the_rest_budget():
+    """⛔ A PHASE BUDGET IS NOT A READ BUDGET — TWO EARLIER DRAFTS GOT THIS WRONG IN OPPOSITE WAYS.
 
-    `objective.py` carries the only latency measurement this repo has for a `gh` read on a loaded
-    box — `GH_SERIALISED_LATENCY_S = 63.0` (13 lanes, one box) against 0.676 s at 3 lanes — and its
-    rule is blunt: a budget under it "manufactures a false absence". A draft of this change set
-    `PHASE_BUDGET_S = 40`, i.e. BELOW ONE measured read, so the busiest boxes would have lost the
-    whole line where `main` printed a number (measured: at 8 s/read the 40 s clock returned
-    `unavailable` at 40.0 s while the unbounded shape returned a NUMBER at 48.0 s).
+    * 40 s set it BELOW a single measured `gh` read.
+    * 100 s set it ABOVE the 40-90 s this step actually has left inside the tick
+      (`scripts/heartbeat-loop.sh`: `run_bounded $((TARGET - IN_PASS_RESERVE))` = 390 s for the
+      WHOLE `orchestrator-heartbeat.sh`, of which ~300-350 s is spent before `beta-progress.py`
+      runs at `scripts/orchestrator-heartbeat.sh:411`). A budget above the remaining slack can
+      never fire before `run_bounded` kills the tick, so it is an INERT ENFORCER: it looks like
+      protection and protects nothing.
 
-    This pins the budget to that measurement — so it cannot silently drift back under it — and pins
-    it below the tick's own kill, so it still bounds the phase.
+    So the pin is two-sided: the phase must FIT the slack band (else it is inert) and must HOLD the
+    REST arm it contains (else the REST reads are clipped by the clock instead of by their own
+    budget). It is deliberately NOT tied to a single-read latency measurement — a phase containing
+    six such reads cannot fit this step whatever the constants say, and that residual is stated in
+    the module rather than papered over with a number the step cannot honour.
     """
-    src = pathlib.Path(__file__).with_name("objective.py").read_text()
-    m = re.search(r"^GH_SERIALISED_LATENCY_S\s*=\s*([0-9.]+)", src, re.M)
-    assert m, "objective.py no longer declares GH_SERIALISED_LATENCY_S — re-derive the budget"
-    measured = float(m.group(1))
-    assert bp.PHASE_BUDGET_S >= measured * 1.5, (
-        "PHASE_BUDGET_S=%r is at or under the measured worst-case `gh` read (%.1fs): a budget under "
-        "the measurement refuses reads that would have completed, and the busiest boxes are exactly "
-        "the ones that need the line" % (bp.PHASE_BUDGET_S, measured))
-    # `TARGET` 540 - `IN_PASS_RESERVE` 150 = the 390 s `run_bounded` that wraps this module.
+    assert bp.PHASE_BUDGET_S >= 2 * bp.REST_BUDGET_S, (
+        "the REST arm (%ss) must fit INSIDE the phase budget (%ss) with room, or the phase clock "
+        "clips reads the REST budget meant to allow" % (bp.REST_BUDGET_S, bp.PHASE_BUDGET_S))
+    assert bp.PHASE_BUDGET_S <= 90, (
+        "a phase budget above this step's residual slack (40-90 s) cannot fire before "
+        "`run_bounded` kills the tick — it is an inert enforcer, not a bound")
     assert bp.PHASE_BUDGET_S < 390, (
         "a phase budget at or above the tick's own kill cannot bound anything")
+
+
+def test_gh_derives_its_child_timeout_from_the_phase_clock(monkeypatch):
+    """⛔ THE PHASE CLOCK'S CENTRAL CLAIM: `gh()` SHRINKS ITS CHILD'S TIMEOUT TO WHAT IS LEFT.
+
+    Deleting just `tmo = min(tmo, left)` (keeping the spent-clock refusal) left 33/33 green — so the
+    mechanism the whole bound rests on was untested. Without it a read starting with 1 s left still
+    gets a flat 120 s and can outlive the phase by 119 s, which is exactly the unbounded growth the
+    clock exists to remove.
+    """
+    seen = []
+
+    def fake_run(args, **kw):
+        seen.append(kw.get("timeout"))
+        raise RuntimeError("stop here — the timeout is the datum")
+
+    monkeypatch.setattr(bp.subprocess, "run", fake_run)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() + 3)
+    assert bp.gh("pr", "list", "--repo", bp.REPO) is None   # no output -> None
+    assert seen, "gh() never spawned the child"
+    assert seen[0] is not None and seen[0] <= 3.1, (
+        "the child timeout %r was not derived from the 3 s left on the phase clock" % (seen[0],))
+
+    # ...and with NO phase in flight, the pre-existing flat timeout is kept.
+    seen.clear()
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", None)
+    assert bp.gh("pr", "list", "--repo", bp.REPO) is None
+    assert seen[0] == 120.0, "a direct call must keep gh()'s own 120 s, got %r" % (seen[0],)
+
+
+def test_the_rest_read_refuses_a_falsy_repo_instead_of_substituting_the_tracker(monkeypatch):
+    """⛔ `repo or REPO` WAS THE HAZARD ITS OWN CALLER'S COMMENT NAMED.
+
+    The `FIX_REPOS` validation only protects the call sites that remember it; `_rest_prs` itself
+    still fell back to the tracker for any falsy `repo`, handing back the TRACKER's `/pulls` under
+    the caller's repo name — a wrong list that still looks complete. `None` is the documented
+    "the tracker" default; anything else must be well-formed or the read is refused.
+    """
+    urls = []
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    monkeypatch.setattr(bp, "_rest_get_json",
+                        lambda url, tok, timeout=None: (urls.append(url) or []))
+
+    for bad in ("", "agent-infra", "daniel-ospina/", "a/b/c", False, 0):
+        assert bp._rest_prs("open", limit=100, deadline=bp.time.time() + 5, repo=bad) is None, (
+            "repo=%r must be REFUSED, not answered with the tracker's list" % (bad,))
+    assert urls == [], "a refused repo still made a request: %r" % (urls,)
+
+    # `None` is the documented tracker default and still works.
+    assert bp._rest_prs("open", limit=100, deadline=bp.time.time() + 5, repo=None) == []
+    assert "/repos/%s/pulls" % bp.REPO in urls[0]
 
 
 # ── the PRODUCER'S contract: a failed read is UNKNOWN (None), never an empty list ──
