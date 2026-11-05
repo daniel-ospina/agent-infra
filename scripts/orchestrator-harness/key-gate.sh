@@ -393,8 +393,15 @@ if sys.argv[2] == "var":
         def _ok_input(v):        # {"type": "array", "items": {"enum": ["text", "image"]}}
             return isinstance(v, list) and all(x in ("text", "image") for x in v)
 
-        def _ok_level_map(v):    # each level is {"anyOf": [{"type": "string"}, {"type": "null"}]}
-            return isinstance(v, dict) and all(x is None or isinstance(x, str) for x in v.values())
+        LEVELS = ("off", "minimal", "low", "medium", "high", "xhigh", "max")
+
+        def _ok_level_map(v):
+            # `ThinkingLevelMap` types ONLY those seven keys ({"anyOf": [string, null]}) and has no
+            # `additionalProperties: false`, so an unknown key is legal at ANY type: iterating every value made
+            # the gate abstain on a file pi loads (round 19, P3, measured `{"turbo":{...}}` -> gate skipped,
+            # pi LOADED), which is the #3331 silence on a box whose credential is real.
+            return isinstance(v, dict) and all(
+                v[k] is None or isinstance(v[k], str) for k in LEVELS if k in v)
 
         def _ok_cost(v):         # ModelCost: FOUR required numbers, plus optional tiers with five each
             if not isinstance(v, dict):
@@ -415,19 +422,80 @@ if sys.argv[2] == "var":
                         return False
             return True
 
-        def _ok_input_limits(v):  # ModelInputLimits
+        def _ok_input_limits(v):
+            # ModelInputLimits types its CHILDREN, not just the container (round 19, P1, measured): pi DISCARDED
+            # `{"images":{"maxPerMessage":0}}` and `{"images":{"resize":{"maxWidth":"wide"}}}` while this helper
+            # answered "dict, fine" - the same false-ok class one level deeper than R18.
             if not isinstance(v, dict):
                 return False
             if "maxRequestBytes" in v and not _ok_int(v["maxRequestBytes"]):
                 return False
-            if "images" in v and not isinstance(v["images"], dict):
-                return False
+            if "images" in v:
+                im = v["images"]
+                if not isinstance(im, dict):
+                    return False
+                for _k in ("maxPerMessage", "maxPerRequest"):
+                    if _k in im and not _ok_int(im[_k]):
+                        return False
+                if "resize" in im:
+                    rs = im["resize"]
+                    if not isinstance(rs, dict):
+                        return False
+                    for _k in ("maxWidth", "maxHeight", "maxBytes"):
+                        if _k in rs and not _ok_int(rs[_k]):
+                            return False
+                    if "jpegQuality" in rs:
+                        q = rs["jpegQuality"]
+                        if not (_ok_int(q) and q <= 100):
+                            return False
             return True
 
-        def _ok_prompt_cache(v):  # ModelPromptCache: each retention tier is a number > 0
+        def _ok_prompt_cache(v):
+            # `ModelPromptCache` types `short` and `long` as number > 0 and, again, allows unknown keys at any
+            # type - so only those two are checked (round 19, P3, measured `{"weird":"x"}` -> pi LOADED).
             if not isinstance(v, dict):
                 return False
-            return all(_ok_num(x) for x in v.values())
+            return all(_ok_num(v[k]) for k in ("short", "long") if k in v)
+
+        def _ok_override(v):
+            # `modelOverrides` is `patternProperties {"^.*$": <ModelOverride>}` and ModelOverride types its own
+            # fields, so "is a dict" is one level too shallow (round 19, P1, measured: pi DISCARDED
+            # `{"m":{"cost":"cheap"}}` while this gate answered `check=ok`). NOTE `cost` here is PARTIAL - the four
+            # fields are optional - so `_ok_cost` (which requires them) must NOT be reused.
+            if not isinstance(v, dict):
+                return False
+            for ov in v.values():
+                if not isinstance(ov, dict):
+                    return False
+                for _k in ("name", "api", "baseUrl"):
+                    if _k in ov and not _nonempty_str(ov[_k]):
+                        return False
+                for _k in ("contextWindow", "maxTokens"):
+                    if _k in ov and not _ok_num(ov[_k]):
+                        return False
+                if "reasoning" in ov and not isinstance(ov["reasoning"], bool):
+                    return False
+                if "input" in ov and not _ok_input(ov["input"]):
+                    return False
+                if "thinkingLevelMap" in ov and not _ok_level_map(ov["thinkingLevelMap"]):
+                    return False
+                if "inputLimits" in ov and not _ok_input_limits(ov["inputLimits"]):
+                    return False
+                if "promptCache" in ov and not _ok_prompt_cache(ov["promptCache"]):
+                    return False
+                if "cost" in ov:
+                    co = ov["cost"]
+                    if not isinstance(co, dict):
+                        return False
+                    for _k in ("input", "output", "cacheRead", "cacheWrite"):
+                        if _k in co and not _number(co[_k]):
+                            return False
+            return True
+
+        def _ok_sptl(v):
+            # `samplingParamsByThinkingLevel` types each LEVEL as an object (round 19, P1, measured: pi DISCARDED
+            # `{"off":"x"}` while this gate said ok).
+            return isinstance(v, dict) and all(isinstance(v[k], dict) for k in LEVELS if k in v)
 
         MODEL_CHECKS = (
             ("name", _nonempty_str), ("api", _nonempty_str), ("baseUrl", _nonempty_str),
@@ -436,7 +504,7 @@ if sys.argv[2] == "var":
             ("cost", _ok_cost), ("promptCache", _ok_prompt_cache),
             ("contextWindow", _ok_num), ("maxTokens", _ok_num),
             ("samplingParams", lambda v: isinstance(v, dict)),
-            ("samplingParamsByThinkingLevel", lambda v: isinstance(v, dict)),
+            ("samplingParamsByThinkingLevel", _ok_sptl),
             ("headers", _str_map), ("compat", lambda v: isinstance(v, dict)),
         )
         PROVIDER_CHECKS = (
@@ -444,13 +512,15 @@ if sys.argv[2] == "var":
             ("apiKey", _nonempty_str), ("oauth", lambda v: v == "radius"),
             ("headers", _str_map), ("compat", lambda v: isinstance(v, dict)),
             ("authHeader", lambda v: isinstance(v, bool)),
-            ("modelOverrides", lambda v: isinstance(v, dict)),
+            ("modelOverrides", _ok_override),
         )
         if "$schema" in d and not isinstance(d["$schema"], str):
             return False
+        if "providers" not in d:
+            # `required: ["providers"]` - a document without it is DISCARDED by pi (round 19, P1 footnote, measured:
+            # `{"$schema":"x"}` -> pi DISCARDED, gate cannot-say). `providers: {}` IS valid and loads.
+            return False
         provs = d.get("providers")
-        if provs is None:
-            return True
         if not isinstance(provs, dict):
             return False
         for body in provs.values():
@@ -490,23 +560,58 @@ if sys.argv[2] == "var":
 if not isinstance(doc, dict):
     raise SystemExit(1)
 entry = doc.get(sys.argv[3])
-FIELDS = ("key", "api_key", "apikey", "access_token", "refresh_token", "token",
-          "access", "refresh")
-if isinstance(entry, str):
-    entry = {"key": entry}
-if not isinstance(entry, dict):
+# ⛔ rc 5 = THE STORE ENTRY IS INVALID, AND THAT IS ITS OWN ANSWER (round 19, P1, measured).
+# pi validates every entry on load (`auth-storage.js:188-209`): it must be an OBJECT, `type` must be one of
+# `api_key` (with `key` an optional string and `env` an optional string map) or `oauth` (string `access`,
+# string `refresh`, finite number `expires`), and anything else THROWS. A throw is NOT "the environment
+# decides": measured on the installed pi with `{"deepseek":{"key":"sk-..."}}` (no `type`), with
+# `{"deepseek":"sk-..."}`, and with an `oauth` entry missing `refresh`/`expires`, `pi -p` printed
+# `No API key found for deepseek.` with nothing exported, and `Provider is not configured: deepseek` with
+# DEEPSEEK_API_KEY exported AND a models.json template naming it. The old reader here scanned for any
+# `key`-ish field, so it answered `reason=stored-credential` for a store pi cannot take a key from and
+# suppressed the very refusal that would have named the missing variable. pi provably cannot run this
+# provider, so the honest answer is the stronger one: refuse, naming the STORE.
+if entry is None:
+    # NO ENTRY for this provider: the positive "no stored credential", so the environment decides (measured: an
+    # absent entry plus `DEEPSEEK_API_KEY` exported runs, and without it pi prints `No API key found`).
     raise SystemExit(1)
+if not isinstance(entry, dict):
+    raise SystemExit(5)
+_type = entry.get("type")
+if _type == "api_key":
+    _env = entry.get("env")
+    if _env is not None and not (isinstance(_env, dict)
+                                 and all(isinstance(x, str) for x in _env.values())):
+        raise SystemExit(5)
+    _key = entry.get("key")
+    if _key is None or (isinstance(_key, str) and not _key.strip()):
+        # `key` is OPTIONAL for pi, and a key-less entry does not hand the decision back to the ENVIRONMENT this
+        # gate reads: measured, an `{"type":"api_key"}` entry with DEEPSEEK_API_KEY exported RAN on that BUILT-IN
+        # variable - not on the models.json template the gate follows. Whether the entry redirects the effective
+        # source is pi\x27s answer, so this is cannot-say (4), never "absent" (which would refuse 82 naming a
+        # variable pi does not consult here).
+        raise SystemExit(4)
+    if not isinstance(_key, str):
+        raise SystemExit(5)
+elif _type == "oauth":
+    if not (isinstance(entry.get("access"), str) and isinstance(entry.get("refresh"), str)
+            and isinstance(entry.get("expires"), (int, float))
+            and not isinstance(entry.get("expires"), bool)):
+        raise SystemExit(5)
+    # A valid oauth entry is a credential pi can only USE where the provider has an oauth handler (measured:
+    # the built-ins do not), and which providers those are is pi\x27s answer, not this gate\x27s.
+    raise SystemExit(3)
+else:
+    raise SystemExit(5)
 envmap = entry.get("env") if isinstance(entry.get("env"), dict) else None
 cannot = False
-for f in FIELDS:
-    val = entry.get(f)
-    if not isinstance(val, str) or not val.strip():
-        continue
-    status, _ = resolve(val, envmap)
-    if status == "ok":
-        raise SystemExit(0)
-    if status == "cmd":
-        cannot = True
+# pi reads ONLY `key` on an `api_key` entry (`auth-storage.js:220-226`), so a legacy `access_token`/`token`
+# field is inert there: scanning those synonyms asserted a credential pi never looks at.
+status, _ = resolve(entry["key"], envmap)
+if status == "ok":
+    raise SystemExit(0)
+if status == "cmd":
+    cannot = True
 # ⛔ rc 4 IS ITS OWN ANSWER, AND IT IS NOT rc 1 (review cycle 2, P1, measured). An entry that EXISTS for
 # this provider but whose key resolves to nothing is NOT "no stored credential": pi hands the present
 # credential to `composeApiKeyAuth.resolve`, which delegates to the inherited provider handler
@@ -689,6 +794,10 @@ key_gate_stored_credential() {
   # exists to prevent. Pinned by key-gate.test.sh 2j11/2j12.
   case "$rc" in
     0|1) return "$rc" ;;
+    # 5 = the ENTRY ITSELF is invalid by pi\x27s loader (round 19, P1, measured) - neither "has a credential" nor
+    # "absent": pi throws on it and then cannot run that provider even with the key exported. It gets its own
+    # refusal at both call sites rather than being folded into the cannot-say bucket.
+    5) return 5 ;;
     *) return 3 ;;
   esac
 }
@@ -757,14 +866,18 @@ key_gate_selected_model() { # <model> <explicit-provider>
       # ⛔ AND A *NAMED* PREFIXED MODEL NO LONGER NAMES A PROVIDER EITHER (round 18, P1, measured — see the block
       # above the function): the empty provider propagates as `cannot-resolve-provider-credential`, which asserts
       # nothing, instead of a green line about whichever provider the slash happened to spell.
-      case "$m" in
-        */*)
-          case "${1:-}" in
-            "") p="deepseek" ;;   # inherited: the env half is what `run_agent` passes as --provider
-            *) p="" ;;            # named with a slash and no --provider: pi's answer needs the model registry
-          esac
-          ;;
-        *) p="deepseek" ;;
+      # ⛔ A *NAMED* MODEL WITH NO PROVIDER ASSERTS NOTHING, PREFIXED OR NOT (round 19, P2, measured): the
+      # `*/*` half of this rule landed in round 18, and the unprefixed half kept the LANE justification below —
+      # but this function cannot tell a lane from the documented `--probe` path, and the probe is exactly where an
+      # operator asks "would THIS model start". Measured: `--probe t <home> "" gpt-4o` printed
+      # `check=ok var=DEEPSEEK_API_KEY provider=deepseek model=gpt-4o` while `pi -p --model gpt-4o` answered
+      # `Model "gpt-4o" is ambiguous across providers: azure/gpt-4o, cloudflare-ai-gateway/gpt-4o, openai/gpt-4o.
+      # No matching provider is authenticated.` - a green gate over a model pi will not run. Resolving a bare id
+      # needs the model registry and the auth state, so both named shapes abstain and `--provider` is the way to a
+      # verdict. An INHERITED model keeps `deepseek`, because `run_agent` really does pass that as `--provider`.
+      case "${1:-}" in
+        "") p="deepseek" ;;
+        *) p="" ;;
       esac
     fi
   fi
@@ -1069,6 +1182,14 @@ key_gate_box_default_assert() {
   local store_rc=1
   key_gate_stored_credential "$home" "$prov" "$cwd"; store_rc=$?
   case "$store_rc" in
+    5)
+      # The pin cannot be asserted AND the lane about to be dispatched cannot start on this store either, so in
+      # `refused` mode (the standalone probe) this is a verdict about the FILE. A lane\x27s own `key_gate_assert`
+      # refuses through the arm above, and `warn` mode stays quiet so one lane log does not carry it twice.
+      [ "$quiet" = 1 ] && return 0
+      printf '[key-gate] %s check=fail result=REFUSED reason=store-invalid model=%s box_default=%s provider=%s home=%s agent_dir=%s - %s/auth.json holds an entry pi\x27s loader REJECTS (an object with `type` "api_key" and an optional string `key`/string-map `env`, or "oauth" with string `access`, string `refresh` and a finite number `expires`); measured: with such a store `pi -p` prints `No API key found` and `Provider is not configured` EVEN with the key exported, so this is a verdict about the FILE, not about a missing variable. Repair or delete `%s/auth.json` (agent-infra#3443)\n' \
+        "$label" "$dm" "$dm" "$prov" "${home:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}"
+      return "$KEY_GATE_REFUSED" ;;
     0)
       # ⛔ IT STILL SPEAKS IN `refused` MODE (round 7, P3, measured): returning silently printed ZERO bytes and
       # exited 0, so an operator or a provisioning script could not tell "usable via the stored credential" from
@@ -1169,6 +1290,19 @@ key_gate_assert_main() {
   KEY_GATE_VAR="$missing"
   local store_rc=1
   key_gate_stored_credential "$home" "$KEY_GATE_PROVIDER" "$cwd"; store_rc=$?
+  if [ "$store_rc" = "5" ]; then
+    # \u26d4 AN INVALID STORE IS A REFUSAL, AND THE REMEDY IS THE FILE - NOT A VARIABLE (round 19, P1, measured).
+    # pi validates `auth.json` on load and throws on an entry that is not an object carrying `type: "api_key"`
+    # (optional string `key`, optional string-map `env`) or `type: "oauth"` (string `access`, string `refresh`,
+    # finite number `expires`) (`auth-storage.js:188-209`). A throw does not fall back to the environment:
+    # measured with `{"deepseek":{"key":"sk-..."}}` (no `type`) pi printed `No API key found for deepseek.` with
+    # nothing exported, and `Provider is not configured: deepseek` with DEEPSEEK_API_KEY exported AND a
+    # models.json template naming it. So `export $VAR` is NOT the remedy, and the `credential-missing` refusal
+    # below would have named the wrong one.
+    printf '[key-gate] %s check=fail result=REFUSED reason=store-invalid model=%s provider=%s var=%s home=%s agent_dir=%s - the credential store is INVALID: %s/auth.json holds an entry for this provider that pi\x27s loader REJECTS (it must be an OBJECT whose `type` is "api_key" with an optional string `key` and string-map `env`, or "oauth" with string `access`, string `refresh` and a finite number `expires`), and a rejected store is NOT a fallback to the environment - measured: `pi -p` prints `No API key found for <provider>.` with nothing exported and `Provider is not configured: <provider>` even WITH the key exported and a models.json template naming it. So this is a verdict about the FILE, not about a missing variable: repair %s/auth.json (or delete it) and re-run (agent-infra#3443)\n' \
+      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ "$store_rc" = "0" ]; then
     # The store is what `pi` reads FIRST, so an absent variable is not an absent credential. Nothing is
     # asserted — and the line says WHICH source answered, so an operator reading a green gate is not
