@@ -796,8 +796,111 @@ mk25="$TMP/n25O/state/lane-exit-label.state"
 [ -s "$mk25" ] && [ "$(grep -c '^label=' "$mk25")" = 1 ] \
   && ! grep -qx 'INJECTED' "$mk25" && ! grep -qx 'bel' "$mk25"; rcn25=$?
 ck "N25 a NEWLINE in the label or in WIP_PATH is flattened — it cannot inject a line into the marker's key=value stream [$(grep -m1 '^label=' "$mk25" 2>/dev/null)]" $rcn25
-# ⛔ N16 — THE CLONE-REF LEG OF THE LANDING CHECK (review cycle 4, gap 2): with the remote's own answer
-# unavailable, a clone whose refs/remotes/origin/HEAD still names the renamed default must refuse THAT name.
+# ⛔ N26 — A STALE CACHE IS NOT AN ANSWER (review cycle 9, P0 — REPRODUCED END-TO-END before the fix).
+# The landing-branch guard used to let the clone's cached `refs/remotes/origin/HEAD` SUBSTITUTE for the
+# remote's own answer (`[ -z "$def" ] && [ -z "$c" ]`), so a cache that merely EXISTED satisfied "we know
+# the default". Measured on the pre-fix helper: a bare whose REAL default was `trunk`, a clone whose cache
+# still said `origin/main`, `ls-remote --symref` silent, and a lane on `trunk` -> the exit path PUSHED
+# `refs/heads/trunk` (the remote's own landing branch) and recorded `push=pushed`. That is a dying lane's
+# exit hook moving a landing branch, skipping the rail AND the attestation, reported as a clean delivery.
+# This arm is the fixture from that reproduction: the cache names a DIFFERENT branch from the real default.
+N26="$TMP/n26"
+git init -q --bare -b trunk "$N26-origin.git"
+git init -q -b n26base "$N26-hub"
+git -C "$N26-hub" config user.name t; git -C "$N26-hub" config user.email t@t
+git -C "$N26-hub" remote add origin "$GHURL"
+git -C "$N26-hub" config url."$N26-origin.git".insteadOf "$GHURL"
+printf 'n26 seed\n' > "$N26-hub/seed.txt"
+git -C "$N26-hub" add seed.txt && git -C "$N26-hub" commit -q -m 'n26 seed'
+git -C "$N26-hub" push -q origin n26base:trunk
+git -C "$N26-hub" fetch -q origin
+git -C "$N26-hub" worktree add -q "$N26-lane" -b trunk origin/trunk
+git -C "$N26-lane" config user.name t; git -C "$N26-lane" config user.email t@t
+printf 'n26 local\n' > "$N26-lane/local.txt"
+git -C "$N26-lane" add local.txt && git -C "$N26-lane" commit -q -m 'n26 local only'
+# the STALE cache: the clone still believes the default is `main`
+git -C "$N26-hub" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main
+n26_before="$(git -C "$N26-origin.git" rev-parse refs/heads/trunk)"
+: > "$O/logs/n26.log"
+# `ls-remote --symref` silent = the bound timing out; the cache is present, the remote's answer is not.
+PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" bash -c '
+  . "$1"
+  lane_end_push n26 "$2" "$3" trunk 1 1
+  printf "push=%s origin=%s\n" "$LANE_END_PUSH" "$LANE_END_ORIGIN"
+' _ "$GATE" "$O/logs/n26.log" "$N26-lane" 2>/dev/null > "$TMP/n26.out"
+n26_after="$(git -C "$N26-origin.git" rev-parse refs/heads/trunk)"
+[ "$n26_before" = "$n26_after" ] && grep -q 'push=refused-unknown-default' "$TMP/n26.out" \
+  && grep -q 'could NOT DETERMINE' "$O/logs/n26.log" \
+  && ! grep -q 'pushed trunk' "$O/logs/n26.log"; rcn26=$?
+ck "N26 a SILENT remote + a STALE clone cache does NOT license a push of the remote's real default (trunk did not move; the cache is a name to refuse on, never an answer) [$(grep -m1 'push=' "$TMP/n26.out" 2>/dev/null)]" $rcn26
+n26m="$( bash -c '
+  . "$1"
+  O="$2"; LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH=refused-unknown-default
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=trunk
+  lane_end_next' _ "$GATE" "$TMP/n26O" 2>/dev/null )"
+case "$n26m" in MANUAL*"do NOT reap"*) rcn26b=0 ;; *) rcn26b=1 ;; esac
+ck "N26b …and next= is MANUAL / do-not-reap, so the artifact does not read this refusal as a clean delivery" $rcn26b
+# ⛔ N27 — A REPORTER MAY NOT SILENCE A MANUAL ARM (review cycle 9, P1 — REPRODUCED, the cycle-8 fix's own
+# REGRESSION). Hoisting only the rescue `FAILED`/`archived-local` block put `archived-local` — a REPORTER —
+# above the MANUAL push set, so `dirty + archived-local + push=FAILED` printed "retrieve the archive …
+# (local pin only — the OFF-BOX push is unconfirmed)" and returned: the branch fact was dropped, and a
+# known-FAILED push was described as merely "unconfirmed". Measured on f842544e.
+for n27p in FAILED UNAVAILABLE detachdrunning; do
+  case "$n27p" in detachdrunning) n27p=detached ;; esac
+  n27="$( bash -c '
+    . "$1"
+    LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH="$2"
+    LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop; LANE_END_REF=refs/wip-local/develop
+    lane_end_next' _ "$GATE" "$n27p" 2>/dev/null )"
+  case "$n27" in MANUAL*"do NOT reap"*) rcn27=0 ;; *) rcn27=1 ;; esac
+  ck "N27 a known-$n27p push is NOT described as 'unconfirmed' and still says do-not-reap when the archive is local-only [${n27:0:64}]" $rcn27
+done
+n27b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=pushed
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop; LANE_END_REF=refs/wip-local/develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n27b" in *refs/wip-local/develop*) rcn27b=0 ;; *) rcn27b=1 ;; esac
+ck "N27b …while with a known-GOOD branch push the archive sentence still names the local pin (the reporter is not silenced by a MANUAL arm that never fired)" $rcn27b
+# ⛔ N28 — cannot-verify MAY NOT BE TOLD TO 'read the log before removing it' (review cycle 9, P1). The
+# lane LOG for this state says "Do not reap this worktree on the strength of this row"; the artifact, which
+# is what a reclaim pass keys on, said only "read the [wip] line before removing it". One run then refuses
+# in its log and licenses a reclaim in its marker. Reachable with push=nothing|pushed, so no MANUAL push
+# arm above has fired.
+for n28p in nothing pushed; do
+  n28="$( bash -c '
+    . "$1"
+    LANE_END_TREE=cannot-verify; LANE_END_RESCUE=nothing; LANE_END_PUSH="$2"
+    LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+    lane_end_next' _ "$GATE" "$n28p" 2>/dev/null )"
+  # ⛔ CASE-INSENSITIVE ON PURPOSE: the sentence reads "Do NOT reap", and a `case` pattern is
+  # case-sensitive — the first cut of this arm matched "do NOT reap" and went red on its own wording
+  # while the behaviour was correct.
+  { case "$n28" in MANUAL*) : ;; *) false ;; esac; } && printf '%s' "$n28" | grep -qi 'NOT reap'; rcn28=$?
+  ck "N28 cannot-verify with push=$n28p gets next=MANUAL / do-not-reap — the artifact and the lane log agree [${n28:0:60}]" $rcn28
+done
+# ⛔ N29 — THE OTHER UNMEASURED EARLY RETURN LEARNS THE SAME LESSON (review cycle 9, P2). N24/G10b cover
+# the WIP_RESCUE_DISABLE hatch; `not-a-worktree` reaches the writer through the other early return and was
+# still publishing `unpushed=0` AND `dirty=0` — a derived zero over a tree whose porcelain was never read.
+rm -rf "$TMP/n29O"
+( bash -c '
+  . "$1"
+  O="$2"; LANE_END_TREE=not-a-worktree; LANE_END_RESCUE=UNAVAILABLE
+  LANE_END_UNPUSHED=0; LANE_END_PORCELAIN=""
+  LANE_END_ROOT=/tmp/not-a-wt; LANE_END_LOG=/dev/null; LANE_END_MARKER_FRESH=1
+  lane_end_marker n29 0 10' _ "$GATE" "$TMP/n29O" 2>/dev/null )
+mk29="$TMP/n29O/state/lane-exit-n29.state"
+[ -s "$mk29" ] && grep -qx 'state=not-a-worktree' "$mk29" && grep -qx 'unpushed=?' "$mk29" \
+  && grep -qx 'dirty=?' "$mk29" && ! grep -qx 'dirty=0' "$mk29"; rcn29=$?
+ck "N29 a NOT-A-WORKTREE terminal records unpushed=? AND dirty=? — both zeros were derived over an enumeration that never ran [$(grep -m1 '^dirty=' "$mk29" 2>/dev/null)]" $rcn29
+# ⛔ N16 — THE CLONE-REF LEG OF THE LANDING CHECK (review cycle 4, gap 2), RE-BASED ON A STRONGER VERDICT
+# (review cycle 9, P0). This arm used to require `refused-protected` — i.e. it required the clone's cached
+# `origin/HEAD` to be TRUSTED as knowledge of the remote's default. That trust was the P0: a bare whose
+# REAL default is `trunk` + a cache still saying `origin/main` + a silent `ls-remote --symref` made the exit
+# path push `refs/heads/trunk` and record `push=pushed` (reproduced end-to-end). The cache is now honoured
+# only as one MORE name to refuse on, so a silent remote refuses the WHOLE push as
+# `refused-unknown-default` — strictly stronger than refusing one name, and this arm asserts the property
+# that matters (the renamed default did NOT move) under the new verdict. N26 below drives the bypass case.
 git -C "$WT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk 2>/dev/null
 pi_stub unpushed_landing
 : > "$O/logs/cloneref.log"
@@ -809,8 +912,8 @@ PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
   run_agent 300 "$4" "$5" "clone ref leg" >>"$4.agent" 2>&1
 ' _ "$GATE" "$TMP/wt5" "$O" "$O/logs/cloneref.log" "$PROMPT"
 arm "$O/logs/cloneref.log"
-ck "N16 …with the remote silent, the clone's refs/remotes/origin/HEAD still refuses the renamed default (trunk not moved) [$(tail -1 "$O/logs/cloneref.log" 2>/dev/null | cut -c1-90)]" \
-  $(grep -q 'refused-protected' "$O/logs/cloneref.log" && ! git -C "$BARE" rev-parse -q --verify refs/heads/trunk >/dev/null 2>&1 && echo 0 || echo 1)
+ck "N16 …with the remote silent, NOTHING is pushed and the renamed default does not move — the clone's stale cache is no longer trusted as an answer [$(tail -1 "$O/logs/cloneref.log" 2>/dev/null | cut -c1-90)]" \
+  $(grep -q 'refused-unknown-default\|refused-protected' "$O/logs/cloneref.log" && ! git -C "$BARE" rev-parse -q --verify refs/heads/trunk >/dev/null 2>&1 && echo 0 || echo 1)
 # ⛔ N17 — NO FORBIDDEN VERB ON ANY EXIT BRANCH (review cycle 4, gap 4; STRENGTHENED after cycle 5 proven
 # by mutation: `--force` was caught but `-f` and the `+HEAD:refs/heads/…` force-by-refspec spelling were
 # NOT, and `git +stash` required the verb adjacent to `git` while every call in this file is

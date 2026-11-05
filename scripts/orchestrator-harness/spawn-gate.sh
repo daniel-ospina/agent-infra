@@ -1338,16 +1338,24 @@ lane_end_push() {
   # never an authority over the remote's own answer, and never a REASON to skip the other names.
   c="$(git -C "$root" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')"
   [ -n "$c" ] && case "$_protected" in *" $c "*) ;; *) _protected="$_protected$c " ;; esac
-  # ⛔ AN UNKNOWN DEFAULT IS NOT "NO PROTECTED NAMES" (review cycle 2, finding 1 — REPRODUCED: with the
-  # remote's answer unavailable, `trunk` was pushed and `refs/heads/trunk` moved). The determining read is
-  # BOUNDED, so it returns empty on a transient failure *including its own timeout* — treating that empty
-  # as "nothing extra to protect" made the refusal hold only for a remote that answers, which is the
-  # fail-open this arm exists to close. The function one block up already states the doctrine for a
-  # different measurement ("`unmeasured` is NOT treated as zero"); it applies here verbatim. Both sources
-  # must fail before this refuses — a real clone always has one of them.
-  if [ -z "$def" ] && [ -z "$c" ]; then
+  # ⛔ A STALE CACHE IS NOT AN ANSWER, AND TREATING IT AS ONE IS A REPRODUCED MERGE-GATE BYPASS
+  # (review cycle 9, P0). This guard used to be `[ -z "$def" ] && [ -z "$c" ]`, i.e. the clone's
+  # `refs/remotes/origin/HEAD` was allowed to SUBSTITUTE for the remote's answer — so a `c` that merely
+  # EXISTED (however old) satisfied "we know the default". Reproduced end-to-end on `f842544e`: a bare
+  # whose real default was `trunk`, a clone whose cached `origin/HEAD` still said `origin/main` (a plain
+  # `git fetch` does not re-point it), the authoritative `ls-remote --symref` returning nothing (its own
+  # 15 s bound timing out — the words two lines up already say "an empty answer is also what a TIMEOUT
+  # looks like"), and a lane sitting on `trunk` → `LANE_END_PUSH=pushed`, remote `refs/heads/trunk` MOVED
+  # `829cec3..d15f940`, and the marker recorded a clean delivery. That is a dying lane's exit hook moving
+  # the remote's landing branch, which skips the rail AND the recorded attestation — the exact hole this
+  # block exists to close — reported as success.
+  # ⇒ THE AUTHORITATIVE READ IS THE ONLY THING THAT MAY SAY "I KNOW THE DEFAULT". The cache stays in
+  # `_protected` as one MORE name to refuse on (it is never a reason to push), and its absence is not the
+  # question: if `def` is empty this refuses, whatever `c` says. Over-block, never fail-open: a box that
+  # cannot reach the remote keeps its commits on disk and says so, and the remedy is printed.
+  if [ -z "$def" ]; then
     LANE_END_PUSH="refused-unknown-default"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but this run could NOT DETERMINE the remote's default branch — neither \`ls-remote --symref origin HEAD\` (bounded at 15 s; an empty answer is also what a TIMEOUT looks like) nor the clone's refs/remotes/origin/HEAD answered. Pushing anyway could move a landing branch, so NOTHING was pushed. Re-run once the remote answers, or push by hand if you know $sym is not the default" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but this run could NOT DETERMINE the remote's default branch — \`ls-remote --symref origin HEAD\` (bounded at 15 s; an empty answer is also what a TIMEOUT looks like) answered nothing. The clone's cached refs/remotes/origin/HEAD says '${c:-<none>}', and that is a CACHE, not an answer: a default that has been renamed leaves it stale (a plain \`git fetch\` does not re-point it), so it is honoured only as one MORE name to refuse on, never as proof of what the remote's default is. Pushing anyway could move a landing branch, so NOTHING was pushed. Re-run once the remote answers, or push by hand if you know $sym is not the default" >> "$log" 2>/dev/null || true
     return 0
   fi
   case "$_protected" in
@@ -1426,31 +1434,42 @@ lane_end_next() {
       printf 'MANUAL — this terminal did NOT measure the tree (%s); nothing here licenses a reclaim. Read the [wip] line in the lane log\n' \
         "${LANE_END_TREE:-<empty>}"; return 0 ;;
   esac
-  # ⛔ THE RESCUE DOMAIN IS CONSULTED **FIRST**, AND THIS ORDER IS THE FIX (review cycle 8, P1 —
-  # REPRODUCED). Both refusals above/below are `return 0`, so whichever case runs first SILENCES the
-  # others; the push case used to run first, and its `refused-protected|refused-main-checkout` arm is a
-  # NON-MANUAL sentence — so a DIRTY tree whose archive FAILED was told only about its branch, and the
-  # "uncommitted work is NOT archived; do NOT reap" fact was dropped from the one artifact a reclaim pass
-  # reads (measured on the shipped helper: `tree=dirty push=refused-protected rescue=FAILED` gave the
-  # branch sentence, while the same tree with `push=pushed` gave MANUAL). That is the identical
-  # weakest-wording-on-the-state-that-needs-refusing defect the `refused-unknown-default` arm below was
-  # added for, one domain over — so the rule is now stated instead of emerging from arm order: **any
-  # domain that says MANUAL outranks a domain that only reports.** The rescue half of the uncommitted
-  # work is what survives neither a removed worktree nor a discarded volume, so it is read before the
-  # branch half; `archived-local` follows it for the same reason (a local pin has no off-box copy).
+  # ⛔ THE RULE IS NOW STATED, NOT EMERGENT FROM ARM ORDER: **any domain that says MANUAL outranks a
+  # domain that only reports**, and among the MANUAL facts the uncommitted work is read before the branch
+  # because it is the half that survives neither a removed worktree nor a discarded volume.
+  # ⛔ THIS ORDER HAS NOW BEEN WRONG IN BOTH DIRECTIONS, TWICE, SO IT IS THE FIRST THING TO CHECK:
+  #
+  #   (review cycle 8, P1 — REPRODUCED) the PUSH case ran first, and its
+  #   `refused-protected|refused-main-checkout` arm is a NON-MANUAL sentence, so a DIRTY tree whose
+  #   archive FAILED was told only about its branch — `dirty + refused-protected + rescue=FAILED` gave
+  #   the branch sentence while the same tree with `push=pushed` gave MANUAL.
+  #   (review cycle 9, P1 — REPRODUCED, the fix's own REGRESSION) moving ONLY the rescue `FAILED`/`archived-local`
+  #   block up then put a REPORTER first: `dirty + rescue=archived-local + push=FAILED` printed "retrieve
+  #   the archive … (local pin only — the OFF-BOX push is unconfirmed)" and returned, DROPPING a MANUAL
+  #   branch fact that 12708a01 had printed — and calling a known-FAILED push "unconfirmed". A
+  #   reporter placed above a MANUAL arm silences it exactly as a MANUAL arm above a reporter does.
+  # So the MANUAL push set is hoisted to its own case ABOVE every reporter, and the two surviving
+  # reporters (`archived-local`, and the `refused-protected|refused-main-checkout` pair) each NAME the
+  # other domain instead of speaking alone. Arms N23-N23h cover the matrix.
+  case "${LANE_END_PUSH:-}" in
+    FAILED|UNAVAILABLE|unmeasured|detached|running|refused-unknown-default)
+      printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. They survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" \
+        "$(case "${LANE_END_RESCUE:-}" in FAILED|UNAVAILABLE) printf ' — AND the uncommitted work at %s is NOT archived either (rescue=%s)' "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE}" ;; archived-local) printf ' — the uncommitted work is archived to the LOCAL pin %s only (no off-box copy)' "${LANE_END_REF:-refs/wip-local/<slug>}" ;; esac)"; return 0 ;;
+  esac
   case "${LANE_END_RESCUE:-}" in
     FAILED|UNAVAILABLE)
       printf 'MANUAL — uncommitted work at %s is NOT archived; do NOT reap it. re-run bg-rescue-wip.sh and read its refusal\n' \
         "${LANE_END_ROOT:-<unknown>}"; return 0 ;;
   esac
+  # ⛔ A REPORTER, NOT A MANUAL ARM — so it may only run once NO push MANUAL verdict exists (the case
+  # above has already returned for every one of them), and it must still not lose the branch fact.
   if [ "${LANE_END_RESCUE:-}" = "archived-local" ]; then
-    printf 'retrieve the archive %s (local pin only — the OFF-BOX push is unconfirmed) before removing %s\n' \
-      "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}"; return 0
+    printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the branch push is push=%s, so the commits on %s are not on origin either\n' \
+      "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
+      "${LANE_END_PUSH:-not-attempted}" "${LANE_END_BRANCH:-<unknown>}"; return 0
   fi
   case "${LANE_END_PUSH:-}" in
-    FAILED|UNAVAILABLE|unmeasured|detached|running)
-      printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. See the [lane-exit] line in the lane log\n' \
-        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}"; return 0 ;;
     refused-protected|refused-main-checkout)
       # ⛔ AND THE TWO NON-MANUAL VERDICTS STILL MERGE THE OTHER DOMAIN IN (review cycle 8, P1). Moving
       # the rescue domain first fixed the FAILED archive; it does NOT fix the state where the uncommitted
@@ -1472,9 +1491,8 @@ lane_end_next() {
     # matters most here: they die with the volume. Same state class as the arm above, and the WEAKEST
     # wording was landing on the state a reclaim pass most needs to refuse. The domain is read from
     # `lane_end_push`'s assignments, never from prose (the same rule the rescue arms above record).
-    refused-unknown-default)
-      printf 'MANUAL — commit(s) on %s were NOT pushed because the remote default could not be read; do NOT reap %s until they are off-box. They survive the worktree being removed but NOT the volume — re-run once the remote answers, or push %s by hand\n' \
-        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
+    # ⛔ ITS MANUAL FORM IS NOW HOISTED ABOVE (review cycle 9): it is a MANUAL verdict, so it belongs in
+    # the MANUAL case and may not sit below a reporter.
   esac
   # ⛔ `unpushed-only` IS NOT A DIRTY TREE (review cycle 2, finding 3 — REPRODUCED). `at_risk=0` for a
   # clean tree, so `rescue=nothing` deterministically and NO `refs/wip/<slug>` is ever created — yet this
@@ -1510,6 +1528,21 @@ lane_end_next() {
           "then re-dispatch"
         return 0 ;;
     esac
+    # ⛔ `cannot-verify` MAY NOT BE TOLD TO "read the [wip] line before removing it" (review cycle 9, P1).
+    # The lane LOG for this identical state says the opposite, in as many words (:1915): "read
+    # 'rescue=nothing' here as 'the rescue did not certify this tree', NOT as 'the tree was clean'. Do not
+    # reap this worktree on the strength of this row" — while this arm, the artifact a reclaim pass
+    # actually keys on, published a sentence that only asked the reader to look first. Reachable with
+    # `push=nothing|pushed` (so every MANUAL push arm above has already passed): `git status --porcelain`
+    # warns about a directory it could not read, the rescue finds nothing to archive in the paths it CAN
+    # read and exits 0, and `rev-list` measures 0. One run then refuses in its log and licenses a reclaim
+    # in its artifact. The `MANUAL` keyword is the convention this PR establishes, so it is emitted here
+    # too, and the two readings agree.
+    if [ "${LANE_END_TREE}" = "cannot-verify" ]; then
+      printf 'MANUAL — the tree at %s measured cannot-verify (rescue=%s): the listing was not PROVEN complete, so rescue=nothing means the rescue did not certify this tree, NOT that it was clean. Do NOT reap %s on the strength of this row — read the [wip] line in the lane log\n' \
+        "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_ROOT:-<unknown>}"
+      return 0
+    fi
     printf 'the tree measured %s with rescue=%s — no archive ref is claimed here; the work is IN %s. Read the [wip] line before removing it, then re-dispatch\n' \
       "${LANE_END_TREE}" "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_ROOT:-<unknown>}"
     return 0
@@ -1526,7 +1559,7 @@ lane_end_next() {
 # terminal path already goes through (see its own note). Never changes the exit status.
 lane_end_marker() {
   local label="$1" rc="$2" cap="$3" o_root slug f tmp shown n
-  local unpushed_shown label_shown root_shown
+  local unpushed_shown label_shown root_shown dirty_shown
   o_root="${O:-${HOME:-$PWD}/orchestrator}"
   slug="$(printf '%s' "$label" | tr ' /' '__' | tr -cd 'A-Za-z0-9._-')"
   [ -n "$slug" ] || slug="agent"
@@ -1552,16 +1585,19 @@ lane_end_marker() {
     return 0
   }
   n="$(printf '%s\n' "${LANE_END_PORCELAIN:-}" | grep -c . 2>/dev/null)"; [ -n "$n" ] || n=0
-  # ⛔ A "zero" NOBODY READ IS NOT A MEASURED ZERO (review cycle 8, P2). `LANE_END_UNPUSHED` is reset to
-  # `0` at the top of `terminal_wip_rescue` (before the hatch can return), so the two early-return paths
-  # wrote `state=not-measured` **with `unpushed=0`** — a count printed as measured inside the artifact a
-  # reclaim pass reads FIELD BY FIELD. The sibling guards in this file already refuse exactly this on the
-  # TSV column (`?` for a failed `rev-list`) and in `lane_end_next`'s last arm ("the COUNT is read, never
-  # hard-coded": a row whose count was `?` was being published as a measured zero). Same rule here: a
-  # tree that was never measured did not measure its commits either.
+  # ⛔ A "zero" NOBODY READ IS NOT A MEASURED ZERO (review cycle 8, P2; COMPLETED in cycle 9, P2 — the
+  # first cut covered only `not-measured` and left `not-a-worktree` publishing `unpushed=0`, and `dirty`
+  # was a derived `0` for EVERY unmeasured tree, because `${LANE_END_PORCELAIN:-}` is EMPTY when nothing
+  # was read exactly as when a reading found nothing). `LANE_END_UNPUSHED` is reset to `0` at the top of
+  # `terminal_wip_rescue`, before either early return, and `dirty` counts whatever the porcelain variable
+  # holds. So the artifact a reclaim pass reads FIELD BY FIELD could not distinguish "measured zero" from
+  # "never measured" in either field — the exact lie this marker exists to prevent. The reading is only a
+  # measurement when the ENUMERATION was trusted, i.e. the three measured tree verdicts; everything else
+  # says `?`, which is what the TSV column already does for a failed `rev-list`.
   unpushed_shown="${LANE_END_UNPUSHED:-?}"
+  dirty_shown="$n"
   case "${LANE_END_TREE:-}" in
-    ""|not-measured) unpushed_shown="?" ;;
+    ""|not-measured|not-a-worktree|cannot-verify) unpushed_shown="?"; dirty_shown="?" ;;
   esac
   # ⛔ `label` AND `root` ARE THE TWO FIELDS THAT CAN CARRY A NEWLINE INTO THIS LINE-ORIENTED FILE (review
   # cycle 8, P2). The ledger's own writer already flattens exactly this hazard for its path column
@@ -1593,7 +1629,7 @@ lane_end_marker() {
     printf 'branch_on_origin=%s\n' "${LANE_END_ORIGIN:-}"
     printf 'rescue=%s\n' "${LANE_END_RESCUE:-}"
     printf 'wip_ref=%s\n' "${LANE_END_REF:-}"
-    printf 'dirty=%s\n' "$n"
+    printf 'dirty=%s\n' "$dirty_shown"
     printf 'ended=%s\n' "$(date +%s)"
     printf 'next=%s\n' "$(lane_end_next | tr '\n' ' ' | sed 's/  */ /g')"
     printf 'porcelain:\n'
