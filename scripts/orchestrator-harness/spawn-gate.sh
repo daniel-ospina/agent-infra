@@ -1924,7 +1924,16 @@ lane_end_push_caveat() {
       else
         printf ' — AND the commit(s) on %s are NOT on origin either (push=FAILED), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}"
       fi ;;
-    UNAVAILABLE|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
+    # ⛔ `unmeasured` IS NOT IN THE ABSENCE GROUP EITHER (review cycle 21, P2 — MEASURED). It means the
+    # `rev-list --count` that would have produced the number FAILED, and the arm that consumes it says the
+    # opposite in as many words ("does NOT know whether the branch exists anywhere but this disk"). The
+    # sentence below also PRESUPPOSES the commits exist, which the failed enumeration cannot establish.
+    # Latent today for the same reason `FAILED` was: every MANUAL push verdict returns above this helper's
+    # call sites. A group whose header claims "absence measured by the caller" may not hold a member whose
+    # count was never read.
+    unmeasured)
+      printf ' — AND the unpushed-commit count on %s could NOT be read (push=unmeasured), so whether those commits exist anywhere but this disk is NOT established either way — read it yourself (`git rev-list --count origin/%s..HEAD`)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" ;;
+    UNAVAILABLE|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
       printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
     verify-unanswered|push-unreported|push-killed)
       printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
