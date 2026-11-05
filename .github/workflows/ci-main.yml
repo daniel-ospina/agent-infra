@@ -596,9 +596,13 @@ jobs:
         # (`tests/atomic-land/run.sh`, 852 s), and well inside the 360 min platform step maximum.
         #
         # ⛔ `BASH_SHARDS_BUDGET_SECS` IS DELIBERATELY GONE, AND CANNOT COME BACK HERE. The runner
-        # REFUSES a positive budget combined with a slice (scripts/run-bash-shards.sh:402-405: "this
-        # process only accumulates the shards its own slice ran, so a whole-list budget would be ~N
-        # times too lenient", `shard_exit 2`). Setting it would red EVERY merge, and no fixture runs
+        # REFUSES a positive budget combined with a slice (scripts/run-bash-shards.sh, the
+        # "cannot be combined with BASH_SHARD_SLICE" refusal: "this process only accumulates the shards
+        # its own slice ran, so a whole-list budget would be ~N times too lenient", `shard_exit 2`).
+        # ⛔ CITED BY QUOTE, NOT BY LINE NUMBER: an earlier version of this comment said `:402-405`, and
+        # the forward-merge of #3235 onto main moved that block 5 lines with no error anywhere — a
+        # citation that rots is worse than none (`admin-merge.sh` states the same rule for its steps).
+        # Setting it would red EVERY merge, and no fixture runs
         # this workflow, so nothing here would catch it before main. What is lost is #3186's NAMED
         # `❌ SHARD BUDGET EXCEEDED` verdict; what is NOT lost is the RED — this is a STEP bound
         # (`failure`, never a job-level `cancelled`) and a single hang is still bounded per shard by
