@@ -104,12 +104,16 @@ REST call answered in 0.43 s — the fleet lost its own progress measurement whi
 existed. That reader therefore keeps a REST fallback of its own (`_rest_prs`), and the rules it
 follows are the reusable ones:
 
-* **Same source or no metric — for the TRACKER pair.** If EITHER of the tracker's GraphQL lists
-  fails, BOTH are re-read over REST. A REST open-count beside a GraphQL merged-count compares two
-  differently-wrong reads, and `merged_today` is a DIFFERENCE between those two windows, so the
-  hazard is the pairing. The fix-repo lists (#3457) are read per `(repo, state)` and mix sources
-  freely: `covered()` ORs over rows, so an open list from one source beside a merged list from
-  another cannot produce a wrong difference — each list is individually complete or refused.
+* **Same source or no metric — enforced for the TRACKER pair.** If EITHER tracker GraphQL list
+  fails, BOTH are re-read over REST. The reason is the SURVIVOR, not a difference: a refusal is
+  evidence the box is under limit pressure, so the list that answered may itself be degraded, and
+  `covered()` walks `openpr + merged` together — a degraded half makes `covered()` report a gap
+  (or a cover) that the other source would not. `open_prs` and `merged_today` each read ONE list,
+  so the pair is re-read together to keep one snapshot of a two-number metric. The fix-repo lists
+  (#3457) are read and fall back per `(repo, state)` (`_repo_prs`) and are deliberately NOT
+  re-read as a pair: they publish no per-list number, and each read is complete-or-refused — a
+  refusal returns the whole DELIVERY line `unavailable` rather than a short list, so no
+  half-read fix-repo pair can reach `covered()`.
 * **`limit` bounds ROWS READ, not rows returned.** The loop advances on the rows it FETCHED, so it
   spends the same row budget `gh pr list --limit` spent. In the closed window those rows are then
   filtered to merges, so the merged list holds the merges among the `limit` most-recently-updated
