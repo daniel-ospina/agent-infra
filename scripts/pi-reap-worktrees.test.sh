@@ -913,10 +913,18 @@ ANCHORS = {
     # (4b) delete the `//` COLLAPSE only — the trailing-slash strip still runs — but keep the derivation, so a
     # non-canonical spelling of the sha record derives the WRONG root — `<root>/.pi/agent/` — where the
     # production dir record does not live. That is a silent miss and therefore a removal, and it is why
-    # the normalisation is not cosmetic (`check-farm-drift.sh:194` needed the same one).
+    # the normalisation is not cosmetic (`check-farm-drift.sh:195` needed the same one).
     "no-pin-root-normalisation": (
         "        pin_root=\"$(printf \x27%s\x27 \"$pin_root\" | tr -s \x27/\x27)\"   # collapse `//` — POSIX, no bashism",
         "        :   # MUTANT: the `//` collapse is deleted (the trailing-slash strip below still runs)",
+    ),
+    # (4c) delete the ABSOLUTENESS guard on the record CONTENT ITSELF — the arm that keeps a relative
+    # `.harness-path` from being resolved against the CWD OF THE REAPER. With it gone the same record
+    # matches or does not depending on where the reaper was invoked: a verdict that is a function of
+    # the caller, on a veto whose miss is a removal.
+    "no-record-absoluteness": (
+        "        case \"$rec_t\" in /?*) : ;; *) continue ;; esac",
+        "        case \"$rec_t\" in __mutant_record_absoluteness_removed__) : ;; *) : ;; esac   # MUTANT: the absoluteness guard is deleted",
     ),
     # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
     # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
@@ -4648,6 +4656,35 @@ OUT="$(CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
 assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "pin-tree" \
     "G15n a \$CELL_HOME-rooted record is read with NO record at \$HOME and no 'harness' in the path (the mixed-root shape, other direction from G15k)"
 
+# G15o: THE RECORD'S OWN CONTENT — a RELATIVE path must be DISCARDED, never resolved against the
+# reaper's cwd. `$canon` is absolute (`pwd -P`), so a relative record can only ever match through
+# `rec_c`, and `rec_c` is `cd "$(dirname "$rec_t")"` — i.e. relative to WHEREVER THE REAPER WAS
+# INVOKED. One box, one record, two cwds, two verdicts, and the wrong one is rule 3, which REMOVES
+# the tree the box executes. The tree below carries NO `harness` component, so the shape backstop
+# cannot mask the miss, and the FIRST half asserts that the ABSOLUTE spelling of the same record
+# PRESERVES — without it the second half would be vacuous, because a fixture that cannot see a
+# record at all proves nothing about the record it discards.
+ENV=pin_tree_relrec
+REPO="$(mk_repo "$ENV")"
+RELWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$RELWT" HEAD
+RELREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$RELWT/scripts/orchestrator-harness" >"$RELREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "pin-tree" \
+    "G15o precondition: the ABSOLUTE spelling of this record PRESERVES, so the fixture can see it"
+# …and now the SAME record file with the SAME tree, the content rewritten RELATIVE, invoked from a
+# cwd where that relative spelling DOES resolve (`$T/$ENV` -> `opt/5b1b09aad2c1/scripts` exists). A
+# reaper that resolves it answers `pin-tree`; this one discards the record, so the verdict cannot
+# move with the caller. That the discarded arm lands on rule-3 residue is the DECLARED residual —
+# pinned here so the outcome is stated rather than discovered.
+printf '%s\n' "opt/5b1b09aad2c1/scripts/orchestrator-harness" >"$RELREC"
+OUT="$(cd "$T/$ENV" && REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "reclaimable" \
+    "G15o a RELATIVE record is DISCARDED, not resolved against the reaper's cwd (a cwd-dependent verdict on a veto whose miss is a removal)"
+
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
 # every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
@@ -4715,6 +4752,14 @@ OUT="$(REAPER_OVERRIDE="$MUTP6" CELL_HOME_OVERRIDE="$T/pin_tree_cellhome/cell-ho
     run_reaper pin_tree_cellhome --dry-run --repo "$T/pin_tree_cellhome/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "reclaimable" \
     "G15-M6 MUTATION: without the \$CELL_HOME record element that tree is WRONGLY rule-3 residue => G15n is discriminating (it was NOT, before this leg)"
+
+MUTP7="$T/mutant-no-record-absoluteness.sh"
+mutate_reaper_anchored "$MUTP7" no-record-absoluteness
+OUT="$(cd "$T/pin_tree_relrec" && REAPER_OVERRIDE="$MUTP7" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_relrec --dry-run --repo "$T/pin_tree_relrec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_relrec/opt/5b1b09aad2c1")")" "pin-tree" \
+    "G15-M7 MUTATION: without the record absoluteness guard the RELATIVE record resolves against the reaper's cwd and PRESERVES, so G15o's discard assertion is discriminating (and the verdict is a function of the caller)"
 
 echo ""
 echo "── results: ${PASS} passed, ${FAIL} failed ──"
