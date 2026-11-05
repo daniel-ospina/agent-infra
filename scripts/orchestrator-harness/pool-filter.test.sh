@@ -231,7 +231,9 @@ NONCOMMENT="$(printf '%s\n' "$JOINED" | grep -vE '^[[:space:]]*#')"
 # pin_site <label> <identifying fixed-string> <expected jq argument> <expected tail> <expected output>
 pin_site() {
   local label="$1" fixed="$2" want="$3" want_tail="$4" want_out="$5" line rest tail out
-  line="$(printf '%s\n' "$JOINED" | grep -m1 -F -- "$fixed")"
+  # ⛔ NONCOMMENT, not JOINED (review cycle 6, P2): a COMMENT quoting the shipped statement matched
+  # first and discharged the pin, so the real site could regrow a private rule with every check green.
+  line="$(printf '%s\n' "$NONCOMMENT" | grep -m1 -F -- "$fixed")"
   if [ -z "$line" ]; then bad=$((bad+1)); echo "FAIL [call site] $label - could not locate its statement in the shipped script"; return; fi
   rest="${line#*--jq }"
   case "$rest" in
@@ -283,7 +285,14 @@ else bad=$((bad+1)); echo "FAIL [drift] call sites splicing the definition: ${si
 floor_bind="$(printf '%s\n' "$NONCOMMENT" | sed -n 's/^[[:space:]]*local pool_jq=//p')"
 floor_eff=""
 if [ -n "$floor_bind" ] && [ "$(printf '%s\n' "$floor_bind" | grep -c .)" -eq 1 ]; then
-  floor_eff="$(POOL_JQ="$SEL" eval "pool_jq_eff=$floor_bind" 2>/dev/null; printf '%s' "${pool_jq_eff:-}")"
+  # ⛔ THE WHOLE STATEMENT IS EVALUATED, IN A FUNCTION, THE WAY BASH RUNS IT (review cycle 6, P1).
+  # `eval "pool_jq_eff=$floor_bind"` executed only the FIRST assignment on the line and silently
+  # dropped the rest: appending `; pool_jq+='|select(.number>9000)'` on the SAME line left this suite
+  # at `70 passed, 0 failed` with `floor_eff` IDENTICAL to the definition, while the real runtime value
+  # ended in the private arm and removed live P0 #4282 from the emergency class. Feeding the statement
+  # to a function also reproduces `local`, which the plain eval did not.
+  floor_eff="$(printf 'f() { local pool_jq=%s\n printf %%s "$pool_jq"\n}\nf\n' "$floor_bind" \
+    | POOL_JQ="$SEL" bash 2>/dev/null)"
 fi
 if [ "$floor_eff" = "$SEL" ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] the emergency floor's \`local pool_jq=\` does not resolve to the shared definition (got '${floor_eff:0:60}') - it must read \${POOL_JQ:?...} and never carry its own program"; fi
@@ -318,7 +327,11 @@ else bad=$((bad+1)); echo "FAIL [drift] \`POOL_JQ\` is mentioned on ${pj_lines:-
 # left this suite at `66 passed, 0 failed`. A private pool rule IS a jq `select(`/`test(`, so a `--jq`
 # argument that carries one and does not splice the shared definition is exactly the drift this file
 # removes — including at a site nobody has written yet.
-priv="$(printf '%s\n' "$NONCOMMENT" | grep -cE -- '--jq.*(select\(|test\()' 2>/dev/null || true)"
+# ⛔ SCOPED TO TITLE/LABEL FILTERING (review cycle 6, P3). Unscoped, this red a legitimate change to an
+# UNRELATED listing (`--jq '.[].number'` → `--jq '.[]|select(.number>0)|.number'` at :2534) and accused
+# it of a private pool rule. A container rule necessarily reads `.title` or `.labels`, so those are the
+# queries this census owns; a query that filters on neither is not in the pool path.
+priv="$(printf '%s\n' "$NONCOMMENT" | grep -E -- '--jq.*(select\(|test\()' | grep -cE -- '\.title|\.labels' 2>/dev/null || true)"
 if [ "${priv:-0}" -eq 0 ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] ${priv:-0} \`--jq\` program(s) carry a select(/test( WITHOUT splicing the shared definition - a private pool rule is the drift this file removes"; fi
 
