@@ -27,7 +27,17 @@ automatic nudges (it reads the turn, asks Jev what happened, then nudges). The
 manual dispatch path had no equivalent, which is how a human-driven send could be
 less informed than an automated one.
 
-Usage:  lane-wip.py <label-or-workspace> [--chars N] [--turns N]
+Usage:  lane-wip.py <label-or-workspace> [--chars N] [--turns N] [--json]
+
+EXIT CONTRACT (added for #3382 row 3 — the MCP `lane.artifact` words axis):
+  0  the question was ANSWERED — the lane matched and its turns were read. An empty tail is a
+     real answer (the lane wrote nothing in its last turn), not an error.
+  2  USAGE — no lane matched <label-or-workspace>, or no argument. Nothing was read.
+  3  UNMEASURED — the lane matched but its activity could NOT be read (no session file for its
+     sid, or `lane-status.py` produced no parseable rows). ⛔ This was exit 1 before: a FAILED
+     READ and a CALLER BUG were different codes but the read failure had no name of its own, so
+     a consumer reading `!= 0` as "nothing to say" got `idle` out of an unreadable lane — the
+     conflation #3382 invariant 1 exists to remove. A consumer must never read 3 as "idle".
 """
 from __future__ import annotations
 import glob, json, os, subprocess, sys, time
@@ -37,13 +47,21 @@ SESS = os.path.expanduser("~/.pi/agent/sessions")
 
 
 def lane_rows():
-    out = subprocess.run([sys.executable, os.path.join(SCRIPTS, "lane-status.py"),
-                          "--json", "--sample", "2"], capture_output=True, text=True,
-                         timeout=240).stdout
+    """The lane-status rows, or None when they could not be READ.
+
+    ⛔ `None`, NOT `[]`. The old body caught every exception and returned an empty list, so an
+    unreadable `lane-status.py` and a fleet with no lanes were the same value — and the caller then
+    said "no lane matches <x>", which is a statement about the LANE derived from a failed read.
+    (#3382 invariant 1: unknown is not zero.)
+    """
     try:
-        return json.loads(out)
+        proc = subprocess.run([sys.executable, os.path.join(SCRIPTS, "lane-status.py"),
+                               "--json", "--sample", "2"], capture_output=True, text=True,
+                              timeout=240)
+        rows = json.loads(proc.stdout)
     except Exception:
-        return []
+        return None
+    return rows if isinstance(rows, list) else None
 
 
 def session_file(sid):
@@ -77,6 +95,43 @@ def turns(path, want):
     return got[-want:]
 
 
+def collect(key, chars=400, want=1):
+    """The payload, built ONCE for both surfaces (text and `--json`).
+
+    Returns ``(rc, payload)``. `rc` is the exit contract in the module docstring; `payload` always
+    carries `measured_at` and, on a failure, a named `unmeasured` — so the JSON and the prose can never
+    disagree about which outcome happened (the defect #3382 exists to remove, in miniature).
+    """
+    rows = lane_rows()
+    now = int(time.time())
+    base = {"measured_at": now, "lane_key": key}
+    if rows is None:
+        return 3, dict(base, unmeasured=(
+            "UNMEASURED(lane-status.py --json --sample 2 + no parseable rows: the lane table could "
+            "not be read, so this lane's activity is unknown)"))
+    row = next((r for r in rows
+                if str(r.get("ws", "")).upper() == key
+                or str(r.get("lane", "")).upper() == key), None)
+    if not row:
+        return 2, dict(base, unmeasured=None,
+                       note="no lane matches %r — run lane-status.py for the list" % key)
+    sid, verdict = row.get("sid"), row.get("verdict")
+    path = session_file(sid)
+    if not path:
+        return 3, dict(base, lane=row.get("lane"), ws=row.get("ws"), sid=sid, verdict=verdict,
+                       unmeasured=("UNMEASURED(session file for sid %s + not found under %s: the "
+                                   "lane's activity cannot be read, so it is NOT known idle)"
+                                   % (str(sid)[:8] or "<none>", SESS)))
+    age_m = (time.time() - os.path.getmtime(path)) / 60.0
+    turns_read = turns(path, want)
+    return 0, dict(base, lane=row.get("lane"), ws=row.get("ws"), sid=sid, verdict=verdict,
+                   session_file=path, session_age_m=round(age_m, 1),
+                   turns=[t[:chars] for t in turns_read],
+                   turns_truncated=want, route=("unfinished -> nudge it to CONTINUE that work; "
+                                                "finished -> hand it the next unheld item; "
+                                                "a question -> route it (ask-owner.py)"))
+
+
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
     if not args:
@@ -84,31 +139,31 @@ def main():
     key = args[0].upper()
     chars = 400
     want = 1
+    as_json = "--json" in sys.argv[1:]
     for i, a in enumerate(sys.argv):
         if a == "--chars" and i + 1 < len(sys.argv):
             chars = int(sys.argv[i + 1])
         if a == "--turns" and i + 1 < len(sys.argv):
             want = int(sys.argv[i + 1])
 
-    row = next((r for r in lane_rows()
-                if str(r.get("ws", "")).upper() == key
-                or str(r.get("lane", "")).upper() == key), None)
-    if not row:
-        print(f"no lane matches {args[0]!r} — run lane-status.py for the list"); return 2
-
-    sid, verdict = row.get("sid"), row.get("verdict")
-    path = session_file(sid)
-    if not path:
-        print(f"{row.get('lane')}  [{verdict}]  NO SESSION FILE — activity UNKNOWN, do not assume idle")
-        return 1
-    age = (time.time() - os.path.getmtime(path)) / 60.0
-    print(f"LANE    {row.get('lane')}")
-    print(f"VERDICT {verdict}   session written {age:.0f}m ago   (id {str(sid)[:8]})")
-    print(f"WS      {row.get('ws')}")
+    rc, payload = collect(key, chars=chars, want=want)
+    if as_json:
+        print(json.dumps(payload, indent=2, sort_keys=True, default=str))
+        return rc
+    if rc == 3:
+        print(payload["unmeasured"])
+        return rc
+    if rc == 2:
+        print(payload["note"])
+        return rc
+    print(f"LANE    {payload.get('lane')}")
+    print(f"VERDICT {payload.get('verdict')}   session written {payload.get('session_age_m'):.0f}m ago"
+          f"   (id {str(payload.get('sid'))[:8]})")
+    print(f"WS      {payload.get('ws')}")
     print()
     print("LAST TURN" + ("S (oldest first)" if want > 1 else "") + ":")
-    for t in turns(path, want):
-        print("  " + t[:chars] + ("…”" if len(t) > chars else ""))
+    for t in payload["turns"]:
+        print("  " + t)
     print()
     print("ROUTE ON THE ABOVE — not on the verdict:")
     print("  unfinished  -> nudge it to CONTINUE that work, naming it")

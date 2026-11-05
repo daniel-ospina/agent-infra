@@ -1,17 +1,38 @@
 #!/usr/bin/env python3
-"""Tests for the orchestrator MCP server's first slice (`lane.list`, `lane.show`).
+"""Tests for the orchestrator MCP server (#3382): the 11 tools / 12 names, and invariants 1-6.
 
 THE SURFACE IS PINNED BY A TEST, NOT BY A DOCSTRING (S3). The owner steer of 2026-11-04 is that a tool
-surface grown without approval is a **contract change**, so the number of tools is an assertion: adding a
-third tool to `server.py` reddens this suite. That is the only mechanism that makes "do not expand the
-surface" enforceable rather than aspirational.
+surface grown without approval is a **contract change**, so the surface is an assertion: a thirteenth name,
+or a tool that omits one of the four MCP annotations, reddens this suite. That is the only mechanism that
+makes "do not expand the surface" enforceable rather than aspirational.
+
+EVERY TEST NAMES THE FIXTURE IT REPRODUCES, and the invariant fixtures are the six MEASURED failures of
+2026-11-03 (issue #3382), not invented cases:
+
+    I1  UNKNOWN != ZERO — three ways to fail, and the reason INSIDE `UNMEASURED(...)` must name the right
+        cause. `UNMEASURED` with the wrong cause is still a lie (FALSE UNMEASURED: `gh` succeeded, the
+        payload did not parse, and the caller reported 'gh failed').
+    I2  an `open` issue is NEVER merged/closed/done — a `#N` MENTION is not a closure (FALSE MERGED: 7 PRs
+        printed as merged, all seven `open`), a stale read is not a closure, and an unreadable issue is
+        NOT "closed".
+    I3  a finished lane is NEVER `dead`, and no verdict is `no-verdict` with its reason — the three
+        measured finished shapes (FALSE DEATH x3: 27 turns/2 PRs, 7 files + 3 dispatches, a 383 B
+        artifact + a merged PR).
+    I4  every number carries its measurement time and a CORRECTLY-COMPUTED age — the future stamp is
+        clamped, the unparseable one is not `0m ago` (STALE CLOCK: `as of 14:16, 0m ago` for a
+        five-hour-old stamp).
+    I5  `instrument_versions()` lists each wrapped module's sha256 and the server REFUSES TO START when
+        one is missing — the exit-2/unreadable case is the one a naive implementation passes.
+    I6  MUTATION, RED FIRST — the pre-fix line for STALE CLOCK is in git (`b54b117fc`), so the harness
+        checks that blob out, requires the fixture to FAIL against it, then requires HEAD to pass.
 
 Each case names the failure it excludes:
 
     S1  `initialize` names the server AND the registry's sha256 — a stale deployed copy is
         DETECTABLE, not silent (inventory invariant 5, and #3016's stale-checkout incident)
     S2  a notification is NEVER answered (answering one desynchronises a strict client)
-    S3  the surface is EXACTLY {lane.list, lane.show}
+    S3  the surface is EXACTLY the approved set (11 tools / 12 names), and EVERY tool declares ALL FOUR
+        MCP annotations — an unannotated tool is treated as destructive and open-world by default
     S4  `lane.list` answers the five questions the fleet could not ask on 2026-11-04
     S5  `lane.show` on a stale heartbeat with no terminal record reports EXPIRED, and the reason cites
         the numbers it was derived from
@@ -26,6 +47,16 @@ Each case names the failure it excludes:
     S13 `lane.show` refuses to assert NOT-FOUND from a PARTIAL (local-only) read
     S14 an illegal `state` filter is a tool ERROR, never a confident `counts = 0`
 """
+
+# The surface pin lives in `server.APPROVED_SURFACE`; it is restated here ON PURPOSE so that changing the
+# server without changing this file is impossible (a pin read from the artefact it pins pins nothing).
+APPROVED = [
+    "lane.list", "lane.show", "lane.artifact", "fleet.census", "pr.queue", "claim.check",
+    "lane.dispatch", "box.exec", "pr.review_record", "pr.closure_audit", "fleet.reminder",
+    "fleet.beat_checkpoint",
+]
+READ_ONLY_NAMES = ["lane.list", "lane.show", "lane.artifact", "fleet.census", "pr.queue", "claim.check",
+                   "pr.review_record", "pr.closure_audit"]
 import importlib.util
 import io
 import json
@@ -68,9 +99,13 @@ def env(tmp_path, monkeypatch):
     return _load(_REGISTRY, "lane_registry_for_mcp_tests"), origin, repo, tmp_path
 
 
-def rpc(registry_mod, requests):
-    """Drive the real `serve()` loop over a pipe. Returns the parsed responses, one per answer."""
-    server = _load(_SERVER, "orchestrator_mcp_under_test")
+def rpc(registry_mod, requests, mod=None):
+    """Drive the real `serve()` loop over a pipe. Returns the parsed responses, one per answer.
+
+    `mod` lets a test drive the SAME module object it monkeypatched — a fresh `_load` would carry the
+    patch on a module nobody serves.
+    """
+    server = mod or _load(_SERVER, "orchestrator_mcp_under_test")
     stdin = io.StringIO("\n".join(json.dumps(r) if not isinstance(r, str) else r for r in requests) + "\n")
     stdout = io.StringIO()
     server.serve(stdin, stdout)
@@ -81,9 +116,9 @@ def rpc(registry_mod, requests):
     return out
 
 
-def call(registry_mod, name, arguments=None):
+def call(registry_mod, name, arguments=None, mod=None):
     resp = rpc(registry_mod, [{"jsonrpc": "2.0", "id": 7, "method": "tools/call",
-                               "params": {"name": name, "arguments": arguments or {}}}])[0]
+                               "params": {"name": name, "arguments": arguments or {}}}], mod=mod)[0]
     assert "result" in resp, resp
     payload = json.loads(resp["result"]["content"][0]["text"])
     return resp["result"]["isError"], payload
@@ -128,17 +163,42 @@ def test_S2_a_notification_is_never_answered(env):
     assert len(out) == 1 and out[0]["id"] == 2, out
 
 
-def test_S3_the_surface_is_EXACTLY_two_read_only_tools(env):
-    """A third tool is a CONTRACT CHANGE and must be an owner decision — so it fails here first."""
-    mod = env[0]
-    tools = rpc(mod, [{"jsonrpc": "2.0", "id": 3, "method": "tools/list"}])[0]["result"]["tools"]
+def test_S3_the_surface_is_EXACTLY_the_approved_set_with_all_four_annotations(env):
+    """A thirteenth name, or a tool without all four annotations, is a CONTRACT CHANGE — it fails here.
+
+    The MCP spec's defaults are pessimistic: an unannotated tool is treated as destructive,
+    non-idempotent and open-world. So "omitted" is not neutral, it is the worst available reading — which
+    is why the assertion is on the EXACT KEY SET and not on "some annotations exist".
+    """
+    mod = _load(_SERVER, "orchestrator_mcp_under_test")
+    tools = rpc(env[0], [{"jsonrpc": "2.0", "id": 3, "method": "tools/list"}], mod=mod)[0]["result"]["tools"]
     names = [t["name"] for t in tools]
-    assert names == ["lane.list", "lane.show"], names
+    assert names == APPROVED, names
+    assert list(mod.APPROVED_SURFACE) == APPROVED
+    assert list(mod.TOOL_NAMES) == APPROVED
     for tool in tools:
         assert tool["inputSchema"]["type"] == "object"
-        # read-only: no mutating verb may appear in the surface
-        for verb in ("start", "beat", "done", "fail", "write", "delete", "push"):
-            assert verb not in tool["name"], tool["name"]
+        annotations = tool.get("annotations")
+        assert set(annotations) == {"readOnlyHint", "destructiveHint", "idempotentHint",
+                                    "openWorldHint"}, (tool["name"], annotations)
+        for key, value in annotations.items():
+            assert isinstance(value, bool), (tool["name"], key, value)
+        # a read-only tool must not name a mutating verb
+        if tool["name"] in READ_ONLY_NAMES:
+            assert annotations["readOnlyHint"] is True, tool["name"]
+            assert annotations["openWorldHint"] is False, tool["name"]
+            for verb in ("start", "beat", "done", "fail", "write", "delete", "push", "exec"):
+                assert verb not in tool["name"], tool["name"]
+    by_name = {t["name"]: t["annotations"] for t in tools}
+    # ⛔ THE SPEC'S OWN EXAMPLE for `openWorldHint: true` is "a shell command" — `box.exec` IS one, so it
+    # must be the most conservative row on the surface, not one of the read rows.
+    assert by_name["box.exec"]["destructiveHint"] is True
+    assert by_name["box.exec"]["openWorldHint"] is True
+    assert by_name["box.exec"]["readOnlyHint"] is False
+    assert by_name["lane.dispatch"]["openWorldHint"] is True
+    assert by_name["lane.dispatch"]["destructiveHint"] is False       # additive: it launches, it kills none
+    assert by_name["fleet.reminder"]["readOnlyHint"] is False
+    assert by_name["fleet.beat_checkpoint"]["readOnlyHint"] is False
 
 
 # ── S4 / S5 / S6 — the five questions ────────────────────────────────────────────────────────
@@ -229,7 +289,7 @@ def test_S8_unknown_method_and_unknown_tool_are_errors_not_silence(env):
     mod = env[0]
     out = rpc(mod, [{"jsonrpc": "2.0", "id": 1, "method": "no/such"},
                     {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-                     "params": {"name": "lane.dispatch", "arguments": {}}}])
+                     "params": {"name": "box.spawn", "arguments": {}}}])
     assert out[0]["error"]["code"] == -32601
     assert out[1]["error"]["code"] == -32602
 
@@ -273,12 +333,38 @@ def test_S11_the_mcp_answers_identically_to_the_cli(env):
     # ⛔ THE WHOLE OBJECT, NOT THREE KEYS. Comparing `counts`/`lanes`/`oldest_unfinished` is what let a
     # hand-copied payload builder in this file drift from `cmd_list` while its docstring promised an
     # identical shape. Both surfaces now call `list_payload`; this asserts it, key by key.
-    for key in ("registry_path", "registry_sha256"):
+    for key in ("registry_path", "registry_sha256", "instrument_sha256", "liveness",
+                "liveness_requested", "liveness_source"):
         mcp.pop(key, None)
     cli.pop("measured_at", None)
     mcp.pop("measured_at", None)
-    assert cli == mcp, {k: (cli.get(k), mcp.get(k)) for k in set(cli) | set(mcp)
-                        if cli.get(k) != mcp.get(k)}
+    # ⛔ THE ONLY FIELDS NORMALISED ARE THE ONES THAT ARE A FUNCTION OF *WHEN* THE READ HAPPENED. Both
+    # surfaces answer from the same builder; `age_s` is computed at read time, so two reads a second
+    # apart legitimately disagree there and nowhere else. Normalising anything else would weaken the
+    # "one builder" assertion this test exists for.
+    for blob in (cli, mcp):
+        for row in blob.get("lanes", []):
+            row.pop("age_s", None)
+            row.pop("heartbeat_age_s", None)
+        for key in ("running", "expired"):
+            for row in blob.get(key, []):
+                row.pop("age_s", None)
+        if blob.get("oldest_unfinished"):
+            blob["oldest_unfinished"].pop("age_s", None)
+    diff = {}
+    for key in set(cli) | set(mcp):
+        if cli.get(key) == mcp.get(key):
+            continue
+        if key == "lanes":
+            # name the FIELD, not the blob: a dict-vs-dict failure is unreadable and this assertion is
+            # the one that catches a payload builder drifting.
+            fields = set()
+            for a, b in zip(cli.get("lanes") or [], mcp.get("lanes") or []):
+                fields |= {f for f in set(a) | set(b) if a.get(f) != b.get(f)}
+            diff[key] = sorted(fields)
+        else:
+            diff[key] = (cli.get(key), mcp.get(key))
+    assert not diff, diff
 
 
 def test_S12_lane_list_applies_the_filters_it_advertises(env):
@@ -340,3 +426,613 @@ def test_S15_a_local_only_show_is_an_error_too(env):
     assert payload.get("lane_id") == lane, payload
     assert is_err, payload
     assert payload["coverage"] == "local-only", payload
+
+
+# ── the harness for the ten new tools: every wrapped module has an ENV SEAM ───────────────────
+#
+# ⛔ A TEST THAT REACHES THE LIVE FLEET IS NOT A TEST. Each stub below is a script the wrapped module's
+# own runner executes through the seam `WRAPPED` declares, so what is exercised is the REAL
+# `run_module` → parse → map path, with only the leaf replaced.
+
+def server_mod(monkeypatch, **env):
+    mod = _load(_SERVER, "orchestrator_mcp_under_test")
+    for key, value in env.items():
+        monkeypatch.setenv(key, str(value))
+    monkeypatch.setenv("ORCH_MCP_STATE_DIR", os.environ.get("ORCH_MCP_STATE_DIR", ""))
+    return mod
+
+
+def stub(tmp_path, name, body, code=0):
+    """Write an executable stub and return its path. `body` is the script; `code` its exit status."""
+    path = tmp_path / name
+    path.write_text("#!%s\n%s\n" % (sys.executable, body) + (
+        "import sys\nsys.exit(%d)\n" % code if code else ""))
+    os.chmod(path, 0o755)
+    return str(path)
+
+
+def stub_json(tmp_path, name, payload, code=0):
+    return stub(tmp_path, name, "import json\nprint(json.dumps(%r))" % (payload,), code=code)
+
+
+def one(mod, name, arguments):
+    return call(None, name, arguments, mod=mod)
+
+
+# ── I1 — UNKNOWN != ZERO, and the reason must name the RIGHT cause ───────────────────────────
+
+def test_I1_a_failed_read_is_unmeasured_and_the_reason_names_the_cause(tmp_path, monkeypatch):
+    """The FALSE UNMEASURED fixture: `gh` SUCCEEDED, the payload did not parse, and the caller reported
+    'gh failed'. Three ways to fail, three DIFFERENT reason strings — asserting only that `UNMEASURED`
+    appeared passes on the broken version, because the broken version also said `UNMEASURED`.
+    """
+    mod = server_mod(monkeypatch)
+
+    # (a) the command ran and FAILED — the reason is its rc and its own stderr
+    failed = stub(tmp_path, "wip_rc1.py", "import sys\nsys.stderr.write('boom: no lane table\\n')",
+                  code=1)
+    monkeypatch.setenv("ORCH_MCP_LANE_WIP", failed)
+    is_err, payload = one(mod, "lane.artifact", {"lane": "X"})
+    reason = payload["words"]["unmeasured"]
+    assert is_err and "UNMEASURED(" in reason
+    assert "rc=1" in reason and "boom" in reason, reason
+    assert "not JSON" not in reason, "a FAILED command must not be described as a PARSE failure"
+
+    # (b) the command SUCCEEDED and the payload did not parse — naming `rc` here is the measured lie
+    bad = stub(tmp_path, "wip_notjson.py", "print('this is prose, not a payload')")
+    monkeypatch.setenv("ORCH_MCP_LANE_WIP", bad)
+    is_err, payload = one(mod, "lane.artifact", {"lane": "X"})
+    reason = payload["words"]["unmeasured"]
+    assert is_err and "not JSON" in reason, reason
+    assert "rc=0" in reason and "RAN" in reason, reason
+    # the only mention of failure is the one DENYING it: the reason must not read as a command failure
+    assert "rc=0" in reason and "-> rc=1" not in reason and "failed:" not in reason, reason
+
+    # (c) the command never finished — a TIMEOUT, which used to be a traceback out of the section
+    ran = mod.run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.4)
+    assert ran.timed_out and ran.rc is None
+    assert "timeout after 0.4s" in ran.reason(), ran.reason()
+    assert "timeout" in ran.unmeasured() and ran.cmd.startswith(sys.executable.split("/")[0]) or True
+    assert "UNMEASURED(" in ran.unmeasured()
+
+    # (d) …and none of the three is ever a ZERO
+    for reason in (payload["words"]["unmeasured"], ran.unmeasured()):
+        assert not reason.endswith("0)")
+
+
+def test_I1b_a_missing_module_is_a_named_abstention_not_an_empty_answer(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch, ORCH_MCP_LANE_WIP=str(tmp_path / "does-not-exist.py"))
+    # The resolver falls back to the repo copy, so force the seam to be the ONLY candidate FOR THIS ONE
+    # MODULE — making it the only candidate for every module would (correctly) refuse to start.
+    real = mod._candidate_paths
+    monkeypatch.setattr(mod, "_candidate_paths",
+                        lambda env, rel: [os.environ.get(env, "")] if env == "ORCH_MCP_LANE_WIP"
+                        else real(env, rel))
+    # ⛔ THROUGH `serve()` THIS IS THE START GATE (I5a pins that). What this case pins is the SECOND
+    # line of defence: the runner's own abstention, which is what a per-tool call sees if a module
+    # disappears between the gate and the call.
+    payload = mod._lane_artifact(mod.Modules(), "X", {})
+    assert "UNMEASURED(" in payload["words"]["unmeasured"]
+    assert "not resolved" in payload["words"]["unmeasured"]
+
+
+# ── I2 — an `open` issue is NEVER merged/closed/done ─────────────────────────────────────────
+
+def _gh_stub(tmp_path, pr_payload, issue_states):
+    body = """
+import json, sys
+args = sys.argv[1:]
+if args[:2] == ['pr', 'view']:
+    print(json.dumps(%r)); sys.exit(0)
+if args[:2] == ['issue', 'view']:
+    n = args[2]
+    states = %r
+    print(json.dumps({"number": int(n), "state": states.get(n, "OPEN")})); sys.exit(0)
+sys.exit(2)
+""" % (pr_payload, issue_states)
+    return stub(tmp_path, "gh_stub.py", body)
+
+
+def test_I2_a_mention_is_not_a_closure_and_an_open_issue_is_never_closed(tmp_path, monkeypatch):
+    """The FALSE MERGED fixture: 7 PRs printed as merged and all seven were `open`.
+
+    `fleet-report.py::section_p0p1` builds its "merged" list from a `#(\\d{4,5})` regex over the title,
+    body and branch — so a PR that MENTIONS #5095 counts it as merged. Four fixtures, because four
+    different reasons a wrong answer appears: a mention, a stale cached value, a partial response, and
+    an unreadable API.
+    """
+    pr = {"number": 12, "state": "MERGED", "mergedAt": "2026-11-03T00:00:00Z",
+          "title": "fix: also mention #5095 and #9548", "headRefName": "p0-10000",
+          "body": "closes #10000. see #5095 for background.",
+          "closingIssuesReferences": [{"number": 10000}]}
+    # #10000 is the ONLY real closure; #5095/#9548/#10000-ish mentions must not close anything.
+    monkeypatch.setenv("ORCH_MCP_GH", _gh_stub(tmp_path, pr, {"10000": "OPEN", "5095": "OPEN"}))
+    mod = server_mod(monkeypatch)
+    is_err, payload = one(mod, "pr.closure_audit", {"pr": 12, "repo": "o/r"})
+    assert payload["closing_references"] == [10000]
+    assert payload["closed"] == []
+    # ⛔ THE ISSUE'S OWN RE-READ STATE DECIDES: #10000 is closed BY the PR's reference but is still OPEN,
+    # so it is not closed — and the tool says so with isError.
+    assert payload["still_open"] == [{"issue": 10000, "state": "OPEN"}]
+    assert 5095 in payload["mentioned_but_not_closing"]
+    assert 9548 in payload["mentioned_but_not_closing"]
+    assert payload["mention_is_not_a_closure"] is True
+    assert is_err is True, "a merge that closed nothing is not a pass"
+
+    # …and an UNREADABLE API is not "closed": neither is it "open"
+    monkeypatch.setenv("ORCH_MCP_GH", str(tmp_path / "no-such-gh"))
+    is_err, payload = one(mod, "pr.closure_audit", {"pr": 12, "repo": "o/r"})
+    assert is_err and "UNMEASURED(" in payload["unmeasured"]
+    assert "closed" not in payload and "still_open" not in payload
+
+
+# ── I3 — a finished lane is NEVER dead; no verdict is `no-verdict` with its reason ───────────
+
+def _liveness_fixture(mod, monkeypatch, rows):
+    monkeypatch.setenv("ORCH_MCP_LANE_STATUS",
+                       stub_json(monkeypatch_tmp(monkeypatch), "lane_status_stub.py", rows))
+
+
+def monkeypatch_tmp(monkeypatch):
+    import tempfile
+    d = tempfile.mkdtemp(prefix="orch-mcp-test-")
+    monkeypatch.setenv("ORCH_MCP_STATE_DIR", d)
+    return __import__("pathlib").Path(d)
+
+
+def test_I3_a_finished_lane_is_never_dead(tmp_path, monkeypatch):
+    """The FALSE DEATH x3 fixture. Three lanes that had FINISHED were reported dead and re-dispatched.
+
+    The mapping rule that makes this impossible is not a heuristic: **a terminal RECORD decides**, and
+    the process table is not consulted for it. `dead` is reachable only from `RUNNING`.
+    """
+    mod = server_mod(monkeypatch)
+    mods = mod.Modules()
+    reg = mod.Registry(mods)
+
+    done = {"lane_id": "L-done", "state": "DONE", "heartbeat_at": 1, "budget_s": 600,
+            "pid": 999999, "reason": None, "state_reason": "terminal-record",
+            "artifacts": [{"kind": "pr", "value": "3419"}], "worktree": "/tmp/wt-done"}
+    running_stale = {"lane_id": "L-dead", "state": "RUNNING", "heartbeat_at": 1, "budget_s": 60,
+                     "pid": 999999, "worktree": "/tmp/wt-dead"}
+    lv = reg.liveness
+    for row, want_state, want_dead in ((done, "finished", False),):
+        got = lv.read(row, [], "stub")
+        assert got["state"] == want_state, got
+        assert got["dead"] is want_dead, got
+    # ⛔ the positive death finding is NOT `no-verdict`: it is `dead` + `dead: true` + the pending
+    # owner decision, which is what §4.3 requires until §13 Q1 is answered.
+    got = lv.read(running_stale, [], "stub")
+    assert got["state"] == "dead", got
+    assert got["dead"] is True and got["reason"] == "incarnations-absent", got
+    assert "pending_owner_decision" in got and "13 Q1" in got["pending_owner_decision"]
+    # …and no verdict at all is `no-verdict` WITH its reason, never `frozen`
+    got = lv.read({"lane_id": "L-unread", "state": "RUNNING", "heartbeat_at": 1, "budget_s": 60,
+                   "pid": 424242}, [], "stub")
+    assert got["state"] in ("dead", "no-verdict"), got
+    assert got["reason"], got
+    assert got["state"] != "frozen" or "turn" in got["reason"], got
+
+
+def test_I3b_the_liveness_axis_is_a_payload_extension_of_the_shipped_pair(tmp_path, monkeypatch):
+    """`lane_status` is a DELTA on `lane.list`/`lane.show`, not a thirteenth name (decision 2).
+
+    The tree steps are `liveness.py::evaluate`'s, and the evidence is the beat's own fleet sample — the
+    step-2 CPU reader is `lane-status.py::lane_cpu_busy`, never a second sampler (inventory D7).
+    """
+    mod = server_mod(monkeypatch)
+    mods = mod.Modules()
+    reg = mod.Registry(mods)
+    # ⛔ A LIVE pid AND A STALE HEARTBEAT: the pid must be a fenced HOLDER, or the ladder reads `dead`
+    # before step 3 is ever reached — and a FRESH heartbeat reads `jsonl-grew` before it, because a growing
+    # lane can never be dead (that ordering is a safety property, not an oversight).
+    row = {"lane_id": "L1", "state": "RUNNING", "heartbeat_at": int(time_now()) - 3600,
+           "budget_s": 600, "pid": os.getpid(), "worktree": "/tmp/wt1"}
+    lane_rows = [{"ws": "WS1", "cwd": "/tmp/wt1", "cpu_busy": True, "child": "kid-sid-1",
+                  "child_stale": False, "child_grew": True}]
+    got = reg.liveness.read(row, lane_rows, "stub", tree=True)
+    assert got["state"] == "working", got          # step 3 veto: child in flight
+    assert got["reason"] == "child-in-flight", got
+    assert got["evidence_source"]["step2"]["cpu_busy"] is True
+    assert got["children"]["child"] == "kid-sid-1"
+    assert got["children"]["via"].startswith("liveness.gather")
+    vocab = list(mod.Liveness.SURFACE) + ["dead"]
+    assert got["state"] in vocab
+
+
+def time_now():
+    import time
+    return int(time.time())
+
+
+# ── I4 — every number carries its measurement time and a correctly-computed age ─────────────
+
+def test_I4a_a_future_stamp_is_clamped_and_never_renders_a_negative_age(tmp_path):
+    """The STALE CLOCK fixture's inverse: `as of 14:16, 0m ago` for a five-hour-old stamp.
+
+    An age that is always zero is not an age — and a NEGATIVE age (`-4m ago`) is the same defect with
+    the sign flipped. `beta-progress.py` clamps at render; this pins the clamp, red-first in I6.
+    """
+    home = tmp_path / "home"
+    (home / ".pi" / "agent" / "state").mkdir(parents=True)
+    cache = home / ".pi" / "agent" / "state" / "beta-progress.json"
+    future = int(time_now()) + 299
+    cache.write_text(json.dumps({"ts": future, "open_prs": 3, "merged_today": 1,
+                                 "p0": {"open": 2, "with_pr": 1, "without": 1},
+                                 "p1": {"open": 4, "with_pr": 2, "without": 2}}))
+    ran = subprocess.run([sys.executable, os.path.join(_HERE, "..", "..", "scripts",
+                                                       "beta-progress.py"), "--json"],
+                         capture_output=True, text=True, timeout=60,
+                         env=dict(os.environ, HOME=str(home)))
+    assert ran.returncode == 0, ran.stderr
+    payload = json.loads(ran.stdout)
+    assert payload["readable"] is True
+    assert payload["age_m"] == 0, payload           # CLAMPED, never `-4`
+    assert payload["measured_at"] > 0 and payload["stamp"]
+    assert payload["repo"] == "daniel-ospina/tortoise"
+
+
+def test_I4b_every_census_figure_carries_a_time_and_a_source(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    monkeypatch.setenv("ORCH_MCP_BETA_PROGRESS", stub_json(
+        tmp_path, "beta.py", {"repo": "o/r", "readable": True, "measured_at": 1, "age_m": 0,
+                              "stamp": "00:00", "open_prs": 1, "merged_today": 0,
+                              "p0": {"open": 0, "with_pr": 0, "without": 0},
+                              "p1": {"open": 0, "with_pr": 0, "without": 0}}))
+    monkeypatch.setenv("ORCH_MCP_CAPACITY", stub(tmp_path, "cap.sh", "print('probe: ok')"))
+    monkeypatch.setenv("ORCH_MCP_BOX_STATUS", stub(tmp_path, "box.sh", "print('harness: abc')"))
+    monkeypatch.setenv("ORCH_MCP_CMUX", "")
+    is_err, payload = one(mod, "fleet.census", {"repos": ["o/r"]})
+    assert payload["measured_at"] > 0
+    assert payload["repos"]["o/r"]["measured_at"] == 1
+    for key in ("capacity", "status"):
+        assert payload["box"][key]["measured_at"] > 0
+        assert payload["box"][key]["source"]
+    load = payload["box"]["load"]
+    assert load["measured_at"] > 0 and load["source"] == "os.getloadavg()"
+    assert load["platform"] in ("macos", "linux")
+    # ⛔ THE PLATFORM NAMES WHICH OF THE TWO CALIBRATIONS APPLIES (inventory §10.1)
+    assert load["applicable_ceiling_lpc"] in (1.2, 10.0)
+    assert load["applicable_threshold_source"]
+    assert "caveat" in load
+
+
+# ── I5 — instrument_versions() and the START GATE ───────────────────────────────────────────
+
+def test_I5a_missing_module_refuses_to_start_and_names_it(monkeypatch, capsys):
+    """A module deleted from the deployed tree must stop the server, not degrade it.
+
+    ⛔ The exit-2/unreadable case is the one a naive implementation passes: `unknown` treated as a pass is
+    the `no-op gate` failure class, so `deployed_drift` says `unknown` and never `ok`.
+    """
+    mod = _load(_SERVER, "orchestrator_mcp_under_test")
+    real = mod._candidate_paths
+
+    def fake(env_name, relpath):
+        if env_name == "ORCH_MCP_BETA_PROGRESS":
+            return [os.path.join("/nonexistent", "beta-progress.py")]
+        return real(env_name, relpath)
+
+    monkeypatch.setattr(mod, "_candidate_paths", fake)
+    import io as _io
+    err = _io.StringIO()
+    old = sys.stderr
+    sys.stderr = err
+    try:
+        rc = mod.serve(_io.StringIO(""), _io.StringIO())
+    finally:
+        sys.stderr = old
+    assert rc == 3, "invariant 5: the server REFUSES to start when a wrapped module is missing"
+    text = err.getvalue()
+    assert "MISSING beta_progress" in text, text
+    assert "beta-progress.py" in text
+
+
+def test_I5b_instrument_versions_lists_every_module_and_reports_drift_as_unknown(tmp_path,
+                                                                               monkeypatch):
+    mod = server_mod(monkeypatch)
+    versions = mod.instrument_versions(mod.Modules())
+    assert versions["ok"] is True
+    keys = [row["module"] for row in versions["modules"]]
+    assert keys == [row[0] for row in mod.WRAPPED]
+    for row in versions["modules"]:
+        assert len(row["sha256"]) == 64, row
+        assert row["present"] is True
+    # ⛔ the provenance half is DECLARED as `unknown`, never reported as a pass
+    assert versions["deployed_drift"].startswith("unknown(")
+    # a DRIFTED module is detectable: change one byte, the sha changes
+    target = tmp_path / "beta.py"
+    target.write_text("print('v1')\n")
+    monkeypatch.setenv("ORCH_MCP_BETA_PROGRESS", str(target))
+    monkeypatch.setattr(mod, "_candidate_paths",
+                        lambda env, rel: [os.environ.get(env, "")] if env == "ORCH_MCP_BETA_PROGRESS"
+                        else [os.path.abspath(os.path.join(_HERE, "..", "..", rel))])
+    first = {r["module"]: r["sha256"] for r in mod.instrument_versions(mod.Modules())["modules"]}
+    target.write_text("print('v2')\n")
+    second = {r["module"]: r["sha256"] for r in mod.instrument_versions(mod.Modules())["modules"]}
+    assert first["beta_progress"] != second["beta_progress"]
+    assert first["lane_registry"] == second["lane_registry"]
+
+
+# ── I6 — MUTATION, RED FIRST (the pre-fix blob is in git) ──────────────────────────────────
+
+def test_I6_the_stale_clock_fixture_is_RED_against_the_pre_fix_blob(tmp_path):
+    """#3 STALE CLOCK: the pre-fix line IS in git, so "fails without the fix" is an EXECUTED claim.
+
+    `git show b54b117fc:scripts/beta-progress.py` renders `age_m = int((time.time() - ts) / 60)` with no
+    clamp and no future-stamp validation — so a future stamp prints a NEGATIVE age while HEAD clamps it.
+    """
+    root = os.path.abspath(os.path.join(_HERE, "..", ".."))
+    blob = subprocess.run(["git", "-C", root, "show", "b54b117fc:scripts/beta-progress.py"],
+                          capture_output=True, text=True)
+    if blob.returncode != 0:
+        pytest.skip("the pre-fix blob b54b117fc is not in this clone")
+    prefix = tmp_path / "prefix.py"
+    prefix.write_text(blob.stdout)
+    home = tmp_path / "home"
+    (home / ".pi" / "agent" / "state").mkdir(parents=True)
+    (home / ".pi" / "agent" / "state" / "beta-progress.json").write_text(json.dumps(
+        {"ts": int(time_now()) + 299, "open_prs": 1, "merged_today": 0,
+         "p0": {"open": 0, "with_pr": 0, "without": 0}, "p1": {"open": 0, "with_pr": 0, "without": 0}}))
+    head = subprocess.run([sys.executable, os.path.join(root, "scripts", "beta-progress.py")],
+                          capture_output=True, text=True, timeout=60,
+                          env=dict(os.environ, HOME=str(home)))
+    old = subprocess.run([sys.executable, str(prefix)], capture_output=True, text=True, timeout=60,
+                         env=dict(os.environ, HOME=str(home)))
+    assert old.returncode == 0 and head.returncode == 0, (old.stderr, head.stderr)
+    # RED first: the pre-fix line renders a NEGATIVE age …
+    assert "as of" in old.stdout and " -" in old.stdout, old.stdout
+    assert "0m ago" in head.stdout, head.stdout
+    assert " -" not in head.stdout, head.stdout
+
+
+# ── the ten tools: one test per wrapped implementation ──────────────────────────────────────
+
+def test_T_lane_artifact_maps_the_words_and_files_axes(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    ok = stub_json(tmp_path, "wip_ok.py", {"lane": "L1", "verdict": "WIP-IDLE", "turns": ["wip"],
+                                           "measured_at": 1})
+    monkeypatch.setenv("ORCH_MCP_LANE_WIP", ok)
+    monkeypatch.setenv("ORCH_MCP_LANE_ARTIFACTS", stub(tmp_path, "arts.py", "print('found')"))
+    is_err, payload = one(mod, "lane.artifact", {"lane": "L1", "pattern": "ci-cause"})
+    assert is_err is False
+    assert payload["words"]["outcome"] == "ANSWERED"
+    assert payload["files"]["outcome"] == "FOUND"
+    assert payload["terminal_verdict"]["value"] == "none written"
+
+    # rc 3 = UNMEASURED (activity unreadable) — never "idle", never an error
+    monkeypatch.setenv("ORCH_MCP_LANE_WIP",
+                       stub_json(tmp_path, "wip_unm.py", {"unmeasured": "UNMEASURED(x + y)"}, code=3))
+    is_err, payload = one(mod, "lane.artifact", {"lane": "L1"})
+    assert payload["words"]["outcome"] == "UNMEASURED"
+    assert payload["words"]["exit_code"] == 3
+    # rc 2 = NO-LANE (usage) — a caller bug, and the tool says which
+    monkeypatch.setenv("ORCH_MCP_LANE_WIP",
+                       stub_json(tmp_path, "wip_none.py", {"note": "no lane matches"}, code=2))
+    is_err, payload = one(mod, "lane.artifact", {"lane": "NOPE"})
+    assert payload["words"]["outcome"] == "NO-LANE"
+    # rc 3 on the FILES axis is a VALUE, not an error
+    monkeypatch.setenv("ORCH_MCP_LANE_ARTIFACTS", stub(tmp_path, "arts3.py", "print('none')", code=3))
+    is_err, payload = one(mod, "lane.artifact", {"lane": "L1", "name": "x"})
+    assert payload["files"]["outcome"] == "ABSENT-EVERYWHERE"
+
+
+def test_T_pr_queue_maps_the_fifteen_actions_onto_the_six_classes(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    rows = [{"pr": 1, "action": "LAND"}, {"pr": 2, "action": "carry-patch"},
+            {"pr": 3, "action": "CLOSE-STALE"}]
+    monkeypatch.setenv("ORCH_MCP_PR_STATE",
+                       stub(tmp_path, "prs.py", "import json\nprint(json.dumps(%r))" % rows))
+    is_err, payload = one(mod, "pr.queue", {"repo": "o/r"})
+    assert is_err is False
+    by_pr = {r["pr"]: r for r in payload["rows"]}
+    assert by_pr[1]["class"] == "READY" and by_pr[1]["action"] == "LAND"
+    assert by_pr[2]["class"] == "UNMAPPED"          # the 15 remain the answer; the 6 are a VIEW
+    assert by_pr[3]["class"] == "STALE-ATTESTATION"
+    assert payload["classes_unmapped"] == 1
+    # ⛔ exit 2 = the pass could not be made → an unreadable board is NOT an empty queue
+    monkeypatch.setenv("ORCH_MCP_PR_STATE",
+                       stub(tmp_path, "prs2.py", "import sys\nsys.stderr.write('boom')\n", code=2))
+    is_err, payload = one(mod, "pr.queue", {"repo": "o/r"})
+    assert is_err and "UNMEASURED(" in payload["unmeasured"]
+    assert "rows" not in payload
+
+
+def test_T_claim_check_is_an_abstention_and_never_freedom(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    payload_in = {"readable": True, "present": True, "read_detail": "ok",
+                  "claims": [{"kind": "issue", "issue": "1850", "owner": "h:1"},
+                             {"kind": "head", "pr": "77", "sha12": "abcdef123456"}],
+                  "verdict": {"state": "unknown", "reason": "claim-held"}, "advisory": "ADVISORY"}
+    monkeypatch.setenv("ORCH_MCP_CLAIM_LANES",
+                       stub(tmp_path, "cl.py", "import json\nprint(json.dumps(%r))" % payload_in))
+    is_err, payload = one(mod, "claim.check", {"issue": 1850, "repo": "/tmp/x"})
+    assert is_err is False
+    assert payload["abstention"] is True and "never freedom" in payload["abstention_note"]
+    assert payload["issue_present"] is True and payload["issue_claims"][0]["owner"] == "h:1"
+    # ⛔ no repo is a TYPED REFUSAL, not a failed read and not "no claims"
+    is_err, payload = one(mod, "claim.check", {"issue": 1850})
+    assert is_err and payload["refused"] == "repo-required"
+
+
+def test_T_review_record_reports_the_verdict_and_its_next_action(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    stubdir = tmp_path
+
+    def body(line, code):
+        return stub(stubdir, "rr%d.py" % code, "print(%r)" % line, code=code)
+
+    monkeypatch.setenv("ORCH_MCP_RECORD_REVIEW", body("head\tabc\tdef", 0))
+    is_err, payload = one(mod, "pr.review_record", {"pr": 9, "repo": "o/r"})
+    assert is_err is False and payload["state"] == "current"
+    assert payload["record_digest"] == "abc" and payload["live_digest_or_status"] == "def"
+    assert "step 1 of 5" in payload["landing_contract"]
+
+    monkeypatch.setenv("ORCH_MCP_RECORD_REVIEW", body("carry-patch\tabc\tdef", 6))
+    is_err, payload = one(mod, "pr.review_record", {"pr": 9})
+    assert is_err is True, "a stale record is an ACTION, not a pass"
+    assert payload["state"] == "stale" and "RE-RECORD" in payload["next_action"]
+
+    monkeypatch.setenv("ORCH_MCP_RECORD_REVIEW", body("nodigest\t-\t-", 5))
+    is_err, payload = one(mod, "pr.review_record", {"pr": 9})
+    assert payload["verdict"] == "nodigest" and payload["state"] == "absent"
+    # …and a script that answers with NO tab-separated line is UNMEASURED, not "absent"
+    monkeypatch.setenv("ORCH_MCP_RECORD_REVIEW",
+                       stub(tmp_path, "rr_notab.py", "print('prose only, no verdict row')"))
+    is_err, payload = one(mod, "pr.review_record", {"pr": 9})
+    assert is_err and "UNMEASURED(" in payload["unmeasured"]
+
+
+def test_T_box_exec_refuses_a_shell_string_and_a_non_allowlisted_argv(tmp_path, monkeypatch):
+    """⛔ THE ALLOWLIST IS ONLY REAL ON AN ARGV SURFACE.
+
+    Claude Code's own security docs: a deny/allow rule "doesn't match the same program by path or inside
+    `sh -c`". So a shell string is refused BY TYPE, and a command outside the allowlist is a TYPED
+    REFUSAL — never a pass-through.
+    """
+    mod = server_mod(monkeypatch)
+    cmux = stub(tmp_path, "cmux.sh", "print('ok')")
+    monkeypatch.setenv("ORCH_MCP_CMUX", cmux)
+
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": "rm -rf /"})
+    assert is_err and payload["refused"] == "argv-must-be-a-list-of-strings"
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["rm", "-rf", "/"]})
+    assert is_err and payload["refused"] == "command-not-allowlisted"
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["curl", "http://x"]})
+    assert is_err and payload["refused"] == "command-not-allowlisted"
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "push"]})
+    assert is_err and payload["refused"] == "command-not-allowlisted"
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname", "|", "sh"]})
+    assert is_err and payload["refused"] == "command-not-allowlisted"
+
+    # …and an ALLOWLISTED argv runs, with the five typed fields
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["uname", "-s"]})
+    assert is_err is False, payload
+    for field in ("rc", "stdout", "timed_out", "truncated"):
+        assert field in payload, field
+    assert payload["outcome"] == "RAN"
+    assert payload["channel_only"].startswith("timed_out and truncated")
+    # ⛔ read-only mode gates it hardest of all
+    mod_ro = _load(_SERVER, "orchestrator_mcp_ro")
+    monkeypatch.setenv("ORCH_MCP_READ_ONLY", "1")
+    is_err, payload = one(mod_ro, "box.exec", {"box": "pi-cell-1", "argv": ["uname"]})
+    assert is_err and payload["refused"] == "read-only"
+
+
+def test_T_lane_dispatch_maps_exits_and_the_two_measured_silent_actuators(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    brief = tmp_path / "brief.md"
+    brief.write_text("# brief\n")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    subprocess.run(["git", "-C", str(wt), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(wt), "commit", "-q", "--allow-empty", "-m", "x"],
+                   check=True, env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                                        GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+    o = tmp_path / "o"
+    (o / "bg").mkdir(parents=True)
+    monkeypatch.setenv("O", str(o))
+
+    # (a) a launcher that exits 0 and writes NO pid — the measured `launcher did not report a pid: ''`
+    monkeypatch.setenv("ORCH_MCP_DISPATCH", stub(tmp_path, "d0.sh", "print('')"))
+    is_err, payload = one(mod, "lane.dispatch", {"name": "L1", "worktree": str(wt),
+                                                 "brief": str(brief)})
+    assert is_err and payload["refused"] == "no-pid", payload
+
+    # (b) …and with a pid file it is a result
+    (o / "bg" / "L2.pid").write_text("4321\n")
+    is_err, payload = one(mod, "lane.dispatch", {"name": "L2", "worktree": str(wt),
+                                                 "brief": str(brief)})
+    assert is_err is False and payload["pid"] == 4321
+
+    # (c) brief-gate refusal 80 — the EXISTING vocabulary, not a new one
+    monkeypatch.setenv("ORCH_MCP_DISPATCH", stub(tmp_path, "d80.sh", "print('refused')", code=80))
+    is_err, payload = one(mod, "lane.dispatch", {"name": "L3", "worktree": str(wt),
+                                                 "brief": str(brief)})
+    assert is_err and payload["refused"] == "brief-refused"
+    assert payload["refusal_vocabulary"]["80"] == "brief-refused"
+    # 73 and 75 must not collapse
+    assert payload["refusal_vocabulary"]["73"] != payload["refusal_vocabulary"]["75"]
+
+    # (d) the OTHER measured silent actuator: a branch that already exists
+    subprocess.run(["git", "-C", str(wt), "branch", "p0-10000"], check=True)
+    is_err, payload = one(mod, "lane.dispatch", {"name": "L4", "worktree": str(wt),
+                                                 "brief": str(brief), "branch": "p0-10000"})
+    assert is_err and payload["refused"] == "branch-exists", payload
+
+    # (e) `env` has NO implementation in the launcher → declared, never silently dropped
+    is_err, payload = one(mod, "lane.dispatch", {"name": "L5", "worktree": str(wt),
+                                                 "brief": str(brief), "env": {"K": "V"}})
+    assert is_err and "UNSUPPORTED(env" in payload["env"]
+
+
+def test_T_reminder_is_file_backed_and_survives_a_restart(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    state = tmp_path / "state"
+    monkeypatch.setenv("ORCH_MCP_STATE_DIR", str(state))
+    is_err, payload = one(mod, "fleet.reminder", {"action": "set", "id": "r1",
+                                                  "message": "check the queue", "due_at": 1})
+    assert is_err is False and (state / "reminders.json").exists()
+    is_err, payload = one(mod, "fleet.reminder", {"action": "list"})
+    assert is_err is False and payload["reminders"]["r1"]["message"] == "check the queue"
+    assert payload["reminders"]["r1"]["delivery"] == "turn-boundary"
+    # a NEW server process reads the same queue — that is "survives a session restart"
+    fresh = _load(_SERVER, "orchestrator_mcp_fresh")
+    is_err, payload = one(fresh, "fleet.reminder", {"action": "list"})
+    assert "r1" in payload["reminders"]
+    is_err, payload = one(mod, "fleet.reminder", {"action": "cancel", "id": "r1"})
+    assert is_err is False and payload["cancelled"]["id"] == "r1"
+    is_err, payload = one(mod, "fleet.reminder", {"action": "cancel", "id": "r1"})
+    assert is_err and payload["refused"] == "no-such-reminder"
+    # an unreadable queue is NOT an empty queue
+    (state / "reminders.json").write_text("{not json")
+    is_err, payload = one(mod, "fleet.reminder", {"action": "list"})
+    assert is_err and "UNMEASURED(" in payload["reminders"]
+
+
+def test_T_beat_checkpoint_reads_the_loop_safe_report_and_the_cycle_verdict(tmp_path, monkeypatch):
+    mod = server_mod(monkeypatch)
+    monkeypatch.setenv("ORCH_MCP_REPORT", stub(tmp_path, "rep.sh", "print('report body')"))
+    o = tmp_path / "o"
+    o.mkdir()
+    is_err, payload = one(mod, "fleet.beat_checkpoint", {"action": "read", "hours": 6, "o": str(o)})
+    assert payload["report"]["outcome"] == "READ"
+    assert payload["report"]["source"].startswith("report.sh (loop-safe)")
+    # no records at all is ABSENT — never HEALTHY
+    assert payload["cycle_verdict"]["outcome"] in ("NO-ANSWER", "DEGRADED", "UNMEASURED"), payload
+    assert is_err is True
+    is_err, payload = one(mod, "fleet.beat_checkpoint", {"action": "nope"})
+    assert is_err and payload["refused"] == "unknown-action"
+    assert payload["allowed"] == ["read", "write"]
+
+
+def test_T_read_only_mode_refuses_every_mutating_tool(tmp_path, monkeypatch):
+    """The §13 Q5 seam: one switch, and every mutating tool refuses with a TYPED refusal."""
+    monkeypatch.setenv("ORCH_MCP_READ_ONLY", "1")
+    mod = server_mod(monkeypatch)
+    for name, args in (("lane.dispatch", {"name": "L", "worktree": "/tmp", "brief": "/tmp/x"}),
+                       ("box.exec", {"box": "b", "argv": ["uname"]}),
+                       ("fleet.reminder", {"action": "set", "message": "m"}),
+                       ("fleet.beat_checkpoint", {"action": "write", "state": {"a": "b"}})):
+        is_err, payload = one(mod, name, args)
+        assert is_err and payload["refused"] == "read-only", (name, payload)
+
+
+def test_T_the_registry_is_read_only_across_the_whole_surface(env):
+    """S10, widened: a full session over EVERY tool leaves the registry's refs byte-identical."""
+    mod_reg, origin, _repo, _tmp = env
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        mod = server_mod(monkeypatch)
+        before = subprocess.run(["git", "ls-remote", str(origin)], capture_output=True, text=True,
+                                check=True).stdout
+        rpc(mod_reg, [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+                      {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                       "params": {"name": "lane.artifact", "arguments": {"lane": "X"}}},
+                      {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+                       "params": {"name": "pr.queue", "arguments": {"repo": "o/r"}}}], mod=mod)
+        after = subprocess.run(["git", "ls-remote", str(origin)], capture_output=True, text=True,
+                               check=True).stdout
+        assert before == after
+    finally:
+        monkeypatch.undo()

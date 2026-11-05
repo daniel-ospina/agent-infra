@@ -33,6 +33,10 @@ import urllib.parse
 import urllib.request
 
 REPO = "daniel-ospina/tortoise"
+# ⛔ `--repo` EXISTS BECAUSE `fleet_census(repos)` CANNOT BE A WRAPPER OF A MODULE THAT TAKES NO
+# ARGUMENTS (#3382 row 4, docs/ops/orchestrator-mcp-inventory.md §5.0 V4 / §7.7). It is a PARAMETER on
+# the existing derivation, never a second one: `compute()` still owns every P0/P1/coverage rule and
+# reads this global. Defaulted to the same repo, so the beat's call (which passes no argv) is unchanged.
 CACHE = os.path.expanduser("~/.pi/agent/state/beta-progress.json")
 TTL = 1800  # was 3600; halved so the worst-case lag is 30m, at ~2x the API cost (still cheap)
 # ⛔ A CACHE `ts` MAY NOT BE IN THE FUTURE. Clock skew between the writer and the reader is real,
@@ -519,7 +523,43 @@ def compute():
     return out
 
 
-def main():
+def main(argv=None):
+    """ONE line by default; `--json` emits the SAME object the render reads.
+
+    ⛔ TWO SURFACES, ONE DERIVATION (#3382 invariant-by-construction): `--json` does not compute
+    anything. It emits `payload`, which is the exact dict the prose branch renders from — so a caller
+    cannot get a figure from the JSON that the operator's line does not show, or the other way round.
+    `--json` also carries `age_m`/`stamp` **computed here, at render time, from `ts`** (#3382 invariant
+    4), so every figure in it has a measurement time and a correctly-computed age, and a future stamp
+    is clamped by the same rule the prose uses rather than by a second one.
+
+    Exit is 0 in every case except a USAGE error (2), because this runs on the beat and a metrics
+    failure must never take it down (module header). `--json` says `unavailable` in the payload.
+    """
+    global REPO
+    # ⛔ `None` MEANS "NO ARGUMENTS", and the CLI passes them explicitly at the trailer. Reading
+    # `sys.argv[1:]` here made every in-process caller — the tests, and anything that imports this
+    # module — inherit ITS OWN argv, so a pytest run turned pytest's arguments into a usage error.
+    argv = list(argv or [])
+    as_json = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            as_json = True
+        elif a == "--repo":
+            if i + 1 >= len(argv) or "/" not in argv[i + 1]:
+                sys.stderr.write("beta-progress: --repo needs owner/name\n")
+                return 2
+            REPO = argv[i + 1]
+            i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            sys.stderr.write("beta-progress: unknown argument %r\n" % a)
+            return 2
+        i += 1
     data = None
     try:
         with open(CACHE) as fh:
@@ -588,6 +628,13 @@ def main():
             sys.stderr.write("beta-progress: compute failed:\n%s" % traceback.format_exc())
             data = None
         if data is None:
+            if as_json:
+                print(json.dumps({"repo": REPO, "readable": False, "measured_at": int(time.time()),
+                                  "unmeasured": "UNMEASURED(gh issue/pr list --repo %s + metrics "
+                                                "read failed: no P0/P1 figure is known, and unknown "
+                                                "is not zero)" % REPO},
+                                 indent=2, sort_keys=True))
+                return 0
             print("DELIVERY: unavailable (metrics read failed)")
             return 0
         try:
@@ -616,11 +663,26 @@ def main():
                    p1["open"], p1["with_pr"], p1["without"],
                    data["open_prs"], data["merged_today"]))
     except Exception:
+        if as_json:
+            print(json.dumps({"repo": REPO, "readable": False, "measured_at": int(time.time()),
+                              "unmeasured": "UNMEASURED(render of the cached payload + unrenderable "
+                                            "shape: no figure is reported rather than a guess)"},
+                             indent=2, sort_keys=True))
+            return 0
         print("DELIVERY: unavailable (metrics read failed)")
+        return 0
+    if as_json:
+        payload = dict(data)
+        payload["repo"] = REPO
+        payload["readable"] = True
+        payload["measured_at"] = int(ts) if ts else None
+        payload["age_m"] = age_m
+        payload["stamp"] = stamp
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     print(line)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))
