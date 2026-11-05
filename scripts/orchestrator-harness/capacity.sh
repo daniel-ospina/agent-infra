@@ -1194,7 +1194,7 @@ cap_read_fleet() {
   # `GIT_TERMINAL_PROMPT=0` in the subshell: a credential prompt is a hang with the lock held, not a
   # question anyone is there to answer (the same reason `claims.sh` sets it).
   out="$(export GIT_TERMINAL_PROMPT=0; cap_bounded "$CAP_CHANNEL_TIMEOUT" git -C "$repo" ls-remote --refs origin "$CAP_NS/*" 2>/dev/null)"; rc=$?
-  [ "$rc" -ne 124 ] || { printf 'CAPACITY: git ls-remote %s/* timed out after %ss — the fleet channel is UNREADABLE\n' "$CAP_NS" "$CAP_CHANNEL_TIMEOUT" >&2; return 124; }
+  [ "$rc" -ne 124 ] || { printf 'CAPACITY: git ls-remote %s/* timed out after %ss — the fleet channel is UNREADABLE\n' "$CAP_NS" "$(cap_bound_secs "$CAP_CHANNEL_TIMEOUT")" >&2; return 124; }
   [ "$rc" -eq 0 ] || { printf 'CAPACITY: git ls-remote %s/* failed (rc=%s) — the fleet channel is UNREADABLE\n' "$CAP_NS" "$rc" >&2; return 2; }
   printf '%s\n' "$out" | cap_parse_lsremote
 }
@@ -1233,14 +1233,27 @@ cap_cmux_bin() {
 # Giving the child a file instead of our stdout means no descendant can hold the reader open; the bytes
 # are `cat`ed after the wait, and a lingering grandchild is then the provider's business, not a wedge in
 # the drainer tick that holds the lock.
+# cap_bound_secs <seam-value> -> the seconds a bound will REALLY use. Normalised NUMERICALLY, because
+# matching spellings is not enough: `0`, `00` and `000` are all "no timeout" to GNU `timeout` while the
+# watchdog arm treats them as an instant expiry, so a legal-looking seam both removed the bound on the
+# arm every Linux cell takes and made the two arms disagree (fresh review rounds 7-8). Whole seconds,
+# 1..999999999; anything else — empty, non-numeric, zero in any spelling, out of range — is the 10 s
+# fallback, and the ONE place that decides is the same one the diagnostics print.
+cap_bound_secs() {
+  local n
+  case "${1:-}" in ''|*[!0-9]*) printf '10'; return 0 ;; esac
+  n=$(( 10#$1 ))
+  if [ "$n" -ge 1 ] && [ "$n" -le 999999999 ]; then printf '%s' "$n"; else printf '10'; fi
+}
+
 cap_bounded() {
   local s="${1:-}" impl="${CAP_BOUND_IMPL:-auto}"; shift 2>/dev/null || true
   [ "$#" -gt 0 ] || return 2
-  # ⛔ `0` IS NOT A BOUND (fresh review round 7, P2). GNU `timeout 0` means NO timeout, so a legal
-  # `CAP_*_TIMEOUT=0` dropped the bound on the arm every Linux cell takes (measured: a 6 s provider
-  # call under `CAP_INVENTORY_TIMEOUT=0` ran unbounded) while the watchdog arm returned an instant 124 —
-  # the two arms disagreeing about what `0` means. It joins the malformed values.
-  case "$s" in ''|0|*[!0-9]*) s=10 ;; esac
+  # ⛔ `0` IS NOT A BOUND, AND NEITHER IS `00` (fresh review rounds 7-8, P2). GNU `timeout` reads
+  # `0`, `00`, `000` all as NO TIMEOUT, so a legal-looking seam dropped the bound on the arm every Linux
+  # cell takes (measured: a 6 s provider call under `CAP_INVENTORY_TIMEOUT=00` ran unbounded) while the
+  # watchdog arm returned an instant 124. Normalised NUMERICALLY, in the one helper the diagnostics use.
+  s="$(cap_bound_secs "$s")"
   # ⛔ THE CHILD NEVER INHERITS OUR STDOUT — ON EVERY ARM, NOT JUST THE WATCHDOG (fresh review round 6,
   # P1). `kill` reaches the direct pid only, so a descendant the provider left behind keeps the caller's
   # `$( )` open past the bound. Rounds 3-4 fixed that inside the WATCHDOG arm only, and the `timeout` /
@@ -1393,7 +1406,7 @@ cap_fleet_inventory() {
   # ⛔ A TIMEOUT IS ITS OWN READING (rc 124, both the `timeout`/`gtimeout` arms and the watchdog agree),
   # because "the provider did not answer in BOUNDED time" sends an operator somewhere different from
   # "the provider refused".
-  [ "$rc" -ne 124 ] || { printf 'UNKNOWN provider-inventory-unreadable(%s timed out after %ss — CAP_INVENTORY_TIMEOUT)\n' "$cmd" "$CAP_INVENTORY_TIMEOUT"; return 1; }
+  [ "$rc" -ne 124 ] || { printf 'UNKNOWN provider-inventory-unreadable(%s timed out after %ss — CAP_INVENTORY_TIMEOUT)\n' "$cmd" "$(cap_bound_secs "$CAP_INVENTORY_TIMEOUT")"; return 1; }
   [ "$rc" -eq 0 ] || { printf 'UNKNOWN provider-inventory-unreadable(%s exited %s)\n' "$cmd" "$rc"; return 1; }
   out="$(printf '%s' "$out" | cap_parse_inventory)"; prc=$?
   if [ "$prc" -ne 0 ]; then
@@ -1654,10 +1667,13 @@ EOF2
 cap_fleet_line() {
   local repo="${1:-.}" fleet rrc frc _o _chan
   _o="$(git -C "$repo" remote get-url origin 2>/dev/null)" || _o=""
-  _chan="${_o#*://}"; _chan="${_chan%.git}"
-  CAP_CHAN="${_chan:-$repo}"
+  # ⛔ NO CREDENTIAL ON THE LINE, AND NO CARRY-OVER (fresh review round 8, P2). `https://x-access-token:…@`
+  # origins are a CI convention this repo already guards against elsewhere; printing one would write the
+  # token into the drainer's log on every tick. And a module-global leaked the LAST call's channel onto
+  # an unrelated `cap_fleet_line_from`, so the value is passed on the one command that read a repo.
+  _chan="${_o#*://}"; _chan="${_chan#*@}"; _chan="${_chan%.git}"
   fleet="$(cap_read_fleet "$repo" 2>/dev/null)"; rrc=$?
-  cap_fleet_line_from "$fleet" "$rrc"; frc=$?
+  CAP_CHAN="${_chan:-$repo}" cap_fleet_line_from "$fleet" "$rrc"; frc=$?
   [ "$rrc" -eq 0 ] || return 2
   return "$frc"
 }

@@ -300,12 +300,20 @@ VM listing — the reconciliation is `published − extra = expected − INELIGI
   cut of this line: an **unreadable clock** used to make every age negative (so every record looked
   fresh — the line certified a fleet from a clock it never read), and a roster that **tokenized to
   nothing** used to read as `expected=0`, a clean bill of health built from no material.
-- **`chan=`** — the channel the PUBLISHED side was read from (the origin URL, scheme and `.git`
-  stripped). `src=` names the *expected* source only, so without `chan=` a `published=0` was
-  unattributable — which is how the drainer reported a healthy 3-of-5 fleet as `published=0
-  INELIGIBLE=5` while reading a **lane** checkout whose origin is not the queue repo. `ai-drainer.sh`
-  no longer defaults `FLEET_REPO` to its own checkout: unset means `why=channel-unverified` (a refusal),
-  never a count taken from whatever repository happened to be at hand.
+- **`chan=`** — the channel the PUBLISHED side was read from (the origin URL, scheme, `.git` and any
+  **userinfo** stripped — an `https://x-access-token:…@` origin is a CI convention, and echoing it would
+  write a credential into the drainer's log on every tick). `src=` names the *expected* source only, so
+  without `chan=` a `published=0` was unattributable — which is how the drainer reported a healthy 3-of-5
+  fleet as `published=0 INELIGIBLE=5` while reading a **lane** checkout whose origin is not the queue
+  repo. The field is set only by the call that actually read a repo, so it can never label a reading that
+  did not take one.
+
+  **WHICH CHANNEL A DRAINER READS, in order, and nothing else is assumed:** an explicit `FLEET_REPO` (or
+  the ambient `REPO`); otherwise this drainer's own `SEED_REPO` **only when its origin IS** the
+  `REPO_SLUG` the drainer already knows — the comparison the old default assumed instead of checking;
+  otherwise `why=channel-unverified`. The units render `FLEET_REPO` (`install-drainer-timer.sh` →
+  `DRAINER_FLEET_REPO`, default `DRAINER_SEED_REPO`), so a deployed cell takes the middle path on a
+  fleet whose seed checkout shares the queue origin and refuses on one where it does not.
 
 **The polarity is the point**, and it is the same rule the fleet already applies to check-runs (a
 missing check is not a green check):
@@ -343,10 +351,10 @@ And the FILE applies to **every** arm, not just the watchdog: `timeout` / `gtime
 cell (and macOS with coreutils) takes — used to hand the child the caller's stdout, so a descendant that
 escaped the child's process group held the caller's `$( )` past the bound (measured: 1 s bound, 12 s
 caller block). The bound exists so the reading can be taken inside the drainer's tick lock, so that leak
-was a wedge, not a slow read. A `CAP_*_TIMEOUT=0` is treated as MALFORMED, not as "no bound": GNU
-`timeout 0` means *no timeout*, so a legal-looking `0` silently removed the bound on the arm every
-Linux cell takes, while the watchdog arm returned an instant 124 — the two arms disagreeing about what
-`0` means.
+was a wedge, not a slow read. A `CAP_*_TIMEOUT` is normalised NUMERICALLY — `0`, `00` and `000` are all
+"no timeout" to GNU `timeout` while the watchdog arm treats them as an instant expiry, so every all-zero
+spelling, any non-number and anything outside 1…999999999 is the 10 s fallback, decided by ONE helper
+(`cap_bound_secs`) that the timeout DIAGNOSTICS also print (`timed out after 10s`, never `after 0s`).
 Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
 `wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
 `exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /

@@ -1858,13 +1858,20 @@ _c10_arg="$(cat "$TMP/fakebin/arg" 2>/dev/null)"
 ck "(c10) a 0 timeout is normalised to the fallback bound, never handed to timeout as 0 (got ${_c10_arg:-<none>})" \
    "$([ "${_c10_arg:-}" = "10" ] && echo 0 || echo 1)"
 # (c10-mutant) NON-VACUITY: without the `0` case the same seam hands timeout a `0` (unbounded).
-sed 's|  case "$s" in ..\|0\|\*\[!0-9\]\*) s=10 ;; esac|  case "$s" in ..\|*[!0-9]*) s=10 ;; esac   # MUTANT: 0 accepted|' "$CAP" > "$TMP/cap-zerotimeout.sh"
-ck "  …the mutant really lost the 0 guard" "$([ "$(grep -c 'MUTANT: 0 accepted' "$TMP/cap-zerotimeout.sh")" -eq 1 ] && echo 0 || echo 1)"
+sed 's|  if \[ "$n" -ge 1 \] && \[ "$n" -le 999999999 \]; then printf .%s. "$n"; else printf .10.; fi|  printf "%s" "${1:-}"   # MUTANT: no numeric normalisation|' "$CAP" > "$TMP/cap-zerotimeout.sh"
+ck "  …the mutant really lost the numeric normalisation" "$([ "$(grep -c 'MUTANT: no numeric normalisation' "$TMP/cap-zerotimeout.sh")" -eq 1 ] && echo 0 || echo 1)"
+# The seam value under test is `00` — GNU `timeout` reads it as 0 (NO timeout), which is exactly the
+# spelling a `0`-only guard let through (fresh review round 8).
 rm -f "$TMP/fakebin/arg"
-FAKE_ARG="$TMP/fakebin/arg" PATH="$TMP/fakebin:$PATH" CAP_BOUND_IMPL=auto bash -c '. "$1"; cap_bounded 0 true' _ "$TMP/cap-zerotimeout.sh" >/dev/null 2>&1
+FAKE_ARG="$TMP/fakebin/arg" PATH="$TMP/fakebin:$PATH" CAP_BOUND_IMPL=auto cap_bounded 00 true >/dev/null 2>&1
+_c10z="$(cat "$TMP/fakebin/arg" 2>/dev/null)"
+ck "  …and \`00\` normalises to the SAME bound (got ${_c10z:-<none>}, never 00)" \
+   "$([ "${_c10z:-}" = "10" ] && echo 0 || echo 1)"
+rm -f "$TMP/fakebin/arg"
+FAKE_ARG="$TMP/fakebin/arg" PATH="$TMP/fakebin:$PATH" CAP_BOUND_IMPL=auto bash -c '. "$1"; cap_bounded 00 true' _ "$TMP/cap-zerotimeout.sh" >/dev/null 2>&1
 _c10m="$(cat "$TMP/fakebin/arg" 2>/dev/null)"
-ck "  …mutation control: without the guard timeout is handed '${_c10m:-<none>}'" \
-   "$([ "${_c10m:-}" = "0" ] && echo 0 || echo 1)"
+ck "  …mutation control: without the normalisation timeout is handed '${_c10m:-<none>}'" \
+   "$([ "${_c10m:-}" = "00" ] && echo 0 || echo 1)"
 # (c7) ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
 # expected-side dedupe is right for a roster row and wrong for the provider inventory, where the key is
 # `network.ipv4`: 5 running machines with pi-cell-2 reusing the address of pi-cell-1 read

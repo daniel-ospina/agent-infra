@@ -37,6 +37,7 @@
 #   DRAINER_STATE      the drainer's state dir ($AI)                   default: $HOME/orchestrator-ai
 #   DRAINER_REPO_SLUG  owner/name the brief names                      default: daniel-ospina/agent-infra
 #   DRAINER_SEED_REPO  checkout the lane's worktree is branched from    default: $HOME/agent-infra-main
+#   DRAINER_FLEET_REPO checkout whose origin carries refs/boxes/*      default: $DRAINER_SEED_REPO
 #   MAX_LANES          CPU-side ceiling of the lane target. RENDERED BLANK by default, so the unit
 #                      carries no pin and the drainer DERIVES it from this box's cores on every tick
 #                      (floor(ncpu x 5/2), the fleet's 2026-10-17 ruling) — a value rendered here is a
@@ -71,6 +72,10 @@ DRAINER_O="${DRAINER_O:-$HOME_DIR/orchestrator}"
 DRAINER_STATE="${DRAINER_STATE:-$HOME_DIR/orchestrator-ai}"
 DRAINER_REPO_SLUG="${DRAINER_REPO_SLUG:-daniel-ospina/agent-infra}"
 DRAINER_SEED_REPO="${DRAINER_SEED_REPO:-$HOME_DIR/agent-infra-main}"
+# The queue repo whose origin carries `refs/boxes/*`. Rendered into the unit so the fleet line can say
+# WHICH channel it read (`chan=`); the seed checkout is the default here because it carries the same
+# origin on this fleet, and the drainer re-checks that before using it.
+DRAINER_FLEET_REPO="${DRAINER_FLEET_REPO:-$DRAINER_SEED_REPO}"
 SYSTEMCTL="${SYSTEMCTL:-}"
 SUDO="${SUDO:-sudo -n}"
 
@@ -142,6 +147,7 @@ render() { # <template> <dest>
         -e "s|{{AI}}|$DRAINER_STATE|g" \
         -e "s|{{REPO_SLUG}}|$DRAINER_REPO_SLUG|g" \
         -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
+        -e "s|{{FLEET_REPO}}|$DRAINER_FLEET_REPO|g" \
         -e "s|{{MAX_LANES}}|${MAX_LANES:-}|g" \
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
         -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}|g" \

@@ -113,6 +113,9 @@
 #   SEED_REPO         checkout to branch the lane's worktree from   default: $HOME/agent-infra-main
 #   SEED_REF          ref the worktree is created at                default: origin/main
 #   REPO_SLUG         owner/name the brief names                    default: daniel-ospina/agent-infra
+#   FLEET_REPO        checkout whose origin carries `refs/boxes/*` default: $REPO, else $SEED_REPO when
+#                     its origin IS $REPO_SLUG, else the line refuses with `why=channel-unverified`
+#                     (`REPO` is accepted too — it is the fleet's ambient work repo)
 #   MAX_LANES         CPU-side ceiling of the target        default: DERIVED — floor(ncpu × 5/2)
 #                     (0 is legal and means "never dispatch"; an explicit value is never recomputed)
 #   TARGET_LANES      pin the WHOLE target, overriding both derivations (operator's explicit call)
@@ -232,14 +235,24 @@ fi
 # `FLEET_REPO`/`REPO` and `SEED_REPO` on an agent-infra checkout, a tick read `published=0
 # INELIGIBLE=5 (cell-1 … cell-5)` rc 0 — all five named ineligible, three of them publishing on the real
 # channel — and nothing on the line said which repo it had read. That is the 2026-11-04 "no usable
-# remote capacity" conclusion, produced by the instrument built to prevent it. Unset means REFUSE, and
-# `cap_fleet_line` now stamps `chan=` so a `published=0` is always attributable.
+# remote capacity" conclusion, produced by the instrument built to prevent it. So: an explicit
+# `FLEET_REPO`/`REPO` is used; otherwise this drainer's own checkout is used ONLY IF ITS ORIGIN IS THE
+# FLEET'S (the `REPO_SLUG` this drainer already knows) — the comparison the old default assumed instead of
+# checking; otherwise REFUSE by name. `cap_fleet_line` stamps `chan=` so a `published=0` is attributable.
 FLEET_REPO="${FLEET_REPO:-${REPO:-}}"
+if [ -z "$FLEET_REPO" ] && [ -n "${SEED_REPO:-}" ] && [ -n "${REPO_SLUG:-}" ]; then
+  _seed_origin="$(git -C "$SEED_REPO" remote get-url origin 2>/dev/null)" || _seed_origin=""
+  _seed_slug="${_seed_origin%.git}"
+  case "$_seed_slug" in
+    "$REPO_SLUG"|*"/$REPO_SLUG"|"git@${REPO_SLUG%%/*}:${REPO_SLUG#*/}"|*":${REPO_SLUG}.git") FLEET_REPO="$SEED_REPO" ;;
+    git@*:*) _seed_slug="${_seed_slug#*:}"; [ "$_seed_slug" = "$REPO_SLUG" ] && FLEET_REPO="$SEED_REPO" ;;
+  esac
+fi
 [ -n "$CAPACITY_MOD" ] && [ -f "$CAPACITY_MOD" ] && . "$CAPACITY_MOD" 2>/dev/null
 fleet_line() { # log ONE `fleet:` line per tick — the reading, or a NAMED reason it could not be taken
   local line=""
   if [ -z "${FLEET_REPO:-}" ]; then
-    line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=channel-unverified(no FLEET_REPO/REPO: this drainer's own checkout is a LANE checkout and a lane origin is not necessarily the fleet channel — set FLEET_REPO to the queue repo)"
+    line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=channel-unverified(no FLEET_REPO/REPO, and $SEED_REPO is not a checkout of $REPO_SLUG — a lane origin is not necessarily the fleet channel: set FLEET_REPO to the queue repo)"
   elif command -v cap_fleet_line >/dev/null 2>&1; then
     line="$(cap_fleet_line "$FLEET_REPO" 2>/dev/null)" || true   # rc says completeness; the LINE is the answer
   fi
