@@ -474,8 +474,9 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
     trade, and `merged_today` stays exact while a day's merges (plus the abandoned rows updated
     beside them) fit inside it. A page
     that cannot be read -- or a read whose SHARED deadline (`deadline`, an instant on the SAME
-    clock as `time.monotonic()`, which is what every caller here uses; `None` opens a FRESH
-    `REST_BUDGET_S` budget — it is NOT "unbounded", and no caller in this file passes it) has
+    clock as `time.monotonic()`, which is what every caller here uses; `None` opens a budget
+    clamped to `min(now + REST_BUDGET_S, _PHASE_DEADLINE)` — it is NOT "unbounded", and a SPENT
+    phase clock refuses outright) has
     passed -- returns None for the WHOLE read; a
     partial list is indistinguishable from a complete one at the call site. The deadline is a
     caller-supplied `deadline`, not a per-read budget: `compute()` gives the tracker PAIR **and
@@ -536,7 +537,19 @@ def _rest_prs(state, limit=100, deadline=None, repo=None):
         return None
     path = "open" if state == "open" else "closed"
     if deadline is None:
+        # ⛔ AND `None` IS BOUNDED BY A LIVE PHASE CLOCK TOO (#3457 review round 21). The default
+        # used to be a bare `REST_BUDGET_S`, so a caller that omitted the deadline got 30 s
+        # REGARDLESS of a phase clock that had 2 s left -- and the module-level claim that
+        # "ONE clock bounds the WHOLE phase" then held only while every caller remembered to clamp
+        # (it is `_compute` that clamps: `min(rest_deadline, _PHASE_DEADLINE)`). A bound a callee
+        # only holds when its caller remembers is not a bound, which is the same rule this function
+        # already applies to `repo` above. Both shipped call sites pass the clamped deadline, so
+        # this changes no current read; it removes the trap for the NEXT one.
         deadline = time.monotonic() + REST_BUDGET_S
+        if _PHASE_DEADLINE is not None:
+            if _PHASE_DEADLINE - time.monotonic() <= 0:
+                return None           # a spent phase clock REFUSES rather than opening a budget
+            deadline = min(deadline, _PHASE_DEADLINE)
     # ⛔ ONE RETRY ON A REPEAT (#2142 review). A repeat proves the list moved DURING the read,
     # and on a box running ~17 concurrent gh clients most movers are churn that a SECOND attempt
     # reads cleanly -- so the read is attempted once more BEFORE it refuses. The cost is bounded
