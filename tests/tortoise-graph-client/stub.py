@@ -29,13 +29,15 @@ CTL, PORT = sys.argv[1], int(sys.argv[2])
 # serves the SUBSET the client touches, which is what the suite needs). The suite asserts every call
 # the client makes is a member — that is R5, stated as data instead of prose.
 #
-# ⛔ THIS IS THE **ONLY** COPY, AND IT IS SERVED — NOT EXPORTED TO A SIDE FILE (#3374 review P2).
-# The list used to exist three times: here, in `run.sh`'s R5 arm, and in a dead `advertised()` helper.
-# So the arm compared the client against a hand-written list rather than against the surface this
-# process actually SERVES, and the WRITE verbs were never driven at all: a client calling a retired
-# write handler kept R5 green. `run.sh` now POSTs `tools/list` to this server and compares the
-# recorded calls against THAT answer — so an entry dropped here is dropped from the surface the arm
-# reads, and the suite has no second copy to disagree with.
+# ⛔ THIS IS THE **ONLY** COPY OF THE FULL SET, AND IT IS SERVED — NOT EXPORTED TO A SIDE FILE
+# (#3374 review P2). The list used to exist three times: here, in `run.sh`'s R5 arm, and in a dead
+# `advertised()` helper. So the arm compared the client against a hand-written list rather than
+# against the surface this process actually SERVES, and the WRITE verbs were never driven at all: a
+# client calling a retired write handler kept R5 green. `run.sh` now POSTs `tools/list` to this server
+# and compares the recorded calls against THAT answer — so an entry dropped here is dropped from the
+# surface the arm reads, and the suite has no second copy to disagree with. (`run.sh`'s `WRITE_TOOLS`
+# is not such a copy: it is the suite's REQUIREMENT that two specific write handlers be advertised,
+# which is a different question from what the surface is.)
 #
 # `tortoise_create_operator` is here because the client's write path calls it (with the served
 # (op_type, source_id, target_ids, direction, semantics) signature). It was MISSING from this set,

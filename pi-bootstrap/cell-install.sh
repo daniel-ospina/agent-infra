@@ -287,6 +287,11 @@ _no_group_world_write() {
 #             existence of an entry that is not there.
 #   LITERAL — an `Authorization` that is NOT env-indirect: a credential written into the shared file,
 #             which `--verify` refuses (LITERAL_AUTH). It is not "no authorization" either.
+#   BADSHAPE — the entry EXISTS and the file reads fine, but its `Authorization` is not a string
+#             (`12345`), so there is no variable to resolve; `--verify` refuses it (BADAUTH:int).
+#             Reporting this as NOENTRY was the mirror of the bug above: it told an operator that a
+#             perfectly healthy `.mcp.json` could not be read, and pointed at recreating the file
+#             instead of at the line that is wrong (#3374 review, round 8).
 # Only a real entry with no `Authorization` key at all is the self-host shape.
 graph_mcp_var() {
   [ -f "$DEST/.mcp.json" ] || { printf 'NOENTRY'; return 0; }
@@ -299,13 +304,15 @@ try:
     if not isinstance(t, dict):
         raise ValueError("tortoise entry is not an object")
     auth = (t.get("headers") or {}).get("Authorization") or ""
-    # ⛔ THE TYPE CHECK BELONGS INSIDE THE `try` (#3374 review P3). `auth.strip()` sat OUTSIDE it, so
-    # `"Authorization": 12345` raised AttributeError, the `2>/dev/null` on this command swallowed the
-    # traceback and printed NOTHING — which the caller renders as GRAPH_NOAUTH, i.e. "this entry
-    # declares no Authorization" about an entry that declares one. `--verify` independently fails
-    # BADAUTH:int, so no LAYER VERIFIED follows; the mis-statement is confined to the note.
+    # ⛔ THE TYPE CHECK BELONGS INSIDE THE `try`, AND IT MUST NOT BORROW ANOTHER MARKER (#3374 review P3).
+    # `auth.strip()` sat OUTSIDE the try, so `"Authorization": 12345` raised AttributeError, the
+    # `2>/dev/null` on this command swallowed the traceback and printed NOTHING — which the caller
+    # renders as GRAPH_NOAUTH, i.e. "this entry declares no Authorization" about an entry that
+    # declares one. Raising here would trade that for a DIFFERENT false sentence (NOENTRY: "no
+    # readable entry") about a file that reads perfectly, so it gets its own marker.
     if not isinstance(auth, str):
-        raise ValueError("Authorization is not a string")
+        print("BADSHAPE")
+        sys.exit(0)
     if not auth.strip():
         sys.exit(0)                 # no Authorization AT ALL: the documented self-host shape
     if "${" not in auth:
@@ -329,11 +336,18 @@ graph_key_resolve() {
   GRAPH_NOAUTH=0
   GRAPH_NOENTRY=0
   GRAPH_LITERAL=0
+  GRAPH_BADSHAPE=0
   case "$GRAPH_VAR" in
     NOENTRY)
       # no readable tortoise entry at all — a DIFFERENT state from "an entry that needs no key",
       # and reporting it as the latter asserts an entry that is not there (see graph_mcp_var).
       GRAPH_NOENTRY=1
+      GRAPH_VAR=""
+      return 0 ;;
+    BADSHAPE)
+      # the entry reads, but its Authorization is not a string: there is no variable to resolve and
+      # --verify refuses the file (BADAUTH:int). NOT a missing entry, and NOT "needs no key".
+      GRAPH_BADSHAPE=1
       GRAPH_VAR=""
       return 0 ;;
     LITERAL)
@@ -396,6 +410,10 @@ graph_credential_state() {
     printf 'LITERAL — the tortoise entry carries a literal credential in the shared file; --verify refuses it (LITERAL_AUTH)'
     return 0
   fi
+  if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
+    printf 'UNKNOWN — the tortoise entry Authorization is not a string, so there is no variable to resolve; --verify refuses it (BADAUTH:int)'
+    return 0
+  fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
     printf 'none required — the tortoise entry declares no Authorization (self-hosted daemon)'
     return 0
@@ -416,6 +434,10 @@ graph_credential_note() {
   fi
   if [ "$GRAPH_LITERAL" -eq 1 ]; then
     log_line "⚠️  graph credential: the tortoise entry carries a LITERAL credential in .mcp.json — a shared config file must be env-indirect (\${TORTOISE_MCP_API_KEY}), and --verify REFUSES this file (LITERAL_AUTH); move the key to \$HOME/keys.env (mode 600) and leave the file env-indirect"
+    return 0
+  fi
+  if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
+    log_line "⚠️  graph credential: UNKNOWN — the tortoise entry's Authorization is not a string (it must be \"Bearer \${TORTOISE_MCP_API_KEY}\"), so there is no variable to resolve and --verify REFUSES this file (BADAUTH:int); --install replaces the entry"
     return 0
   fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then

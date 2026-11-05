@@ -2126,8 +2126,7 @@ grep -qE "${CRED_ON_CERT}UNRESOLVED" "$LOG" \
 # box that exports the key the fixed line is never executed: reverting `${HOME:-}` to `$HOME` left this
 # arm GREEN (measured: `rc=0`, `graph credential: resolves from the environment`) while the suite's only
 # red was the unrelated group-writable keys.env arm. Both names are cleared, for the same reason the
-# negative arm above clears them. With no key anywhere the credential must be UNRESOLVED — asserted
-# too, because reaching UNRESOLVED is what proves the `keys.env` probe RAN with HOME unset.
+# negative arm above clears them.
 : > "$TMP/nohome.log"
 env -u HOME -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
   CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
@@ -2138,6 +2137,37 @@ rc=$?
   && grep -qE "${CRED_ON_CERT}UNRESOLVED" "$TMP/nohome.log" \
   && ok "--verify completes with HOME UNSET and NO key in the environment (rc=0, LAYER VERIFIED reached, credential UNRESOLVED) — a systemd/\`env -i\` context certifies the layer instead of aborting mid-run" \
   || fail "--verify aborted or refused with HOME unset and the key cleared (rc=$rc) — the unbound-variable abort skips every guard after the graph check and reports a graph problem for a HOME problem; or the arm never reached the keys.env probe (no UNRESOLVED on the cert line)"
+# ⛔ AND UNRESOLVED ALONE PROVES NOTHING (#3374 review P3): it is ALSO what the resolver prints when the
+# candidate loop never ran at all (measured: delete the whole `for base … done` and this arm's previous
+# wording still printed its green — the three later keys.env arms were the only reds). So the SAME
+# HOME-less context is run again with a 0600 `$CELL_HOME/keys.env` holding a real key: the verdict must
+# name THAT FILE, which is a positive only the loop can produce.
+printf 'export TORTOISE_MCP_API_KEY="tt_%s"\n' "$(printf 'C%.0s' $(seq 24))" > "$CELL_HOME/keys.env"
+chmod 600 "$CELL_HOME/keys.env"
+env -u HOME -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
+  CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --verify > "$TMP/nohome-key.log" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && grep -qF "resolves from $CELL_HOME/keys.env (TORTOISE_MCP_API_KEY)" "$TMP/nohome-key.log" \
+  && ok "…and the SAME HOME-less run RESOLVES a 0600 \$CELL_HOME/keys.env by reading it (rc=0) — the candidate loop really ran; UNRESOLVED above would also be printed by a loop that never ran" \
+  || fail "a HOME-less run with a 0600 \$CELL_HOME/keys.env did not resolve from it (rc=$rc) — the credential source is the one thing the layer cannot lose to a HOME problem, and the arm above cannot tell 'the loop ran and found nothing' from 'the loop never ran'"
+rm -f "$CELL_HOME/keys.env"
+
+# ⛔ A NON-STRING `Authorization` IS ITS OWN STATE, NOT "no readable entry" (#3374 review P3). The first
+# fix moved the AttributeError inside the `try` but let it fall through to NOENTRY, so the note told an
+# operator that a perfectly healthy `.mcp.json` could not be read — the mirror image of the bug it
+# replaced, and it points at recreating the file instead of at the line that is wrong (BADAUTH:int).
+# The note only runs on the --verify SUCCESS path, which a BADAUTH file never reaches, so this arm
+# drives the resolver the note reads — extracted from the installer under test, never re-implemented.
+mcp_var_for() {   # mcp_var_for <dest-dir> — run the installer's OWN graph_mcp_var against that DEST
+  DEST="$1" bash -c 'eval "$(sed -n "/^graph_mcp_var()/,/^}/p" "$1")"; graph_mcp_var' _ "$INSTALLER" 2>/dev/null
+}
+BADSHAPE_DEST="$TMP/badshape"; mkdir -p "$BADSHAPE_DEST"
+printf '{"mcpServers":{"tortoise":{"url":"https://api.premiselabs.co/mcp/","headers":{"Authorization":12345}}}}' > "$BADSHAPE_DEST/.mcp.json"
+BADSHAPE_VAR="$(mcp_var_for "$BADSHAPE_DEST")"
+[ "$BADSHAPE_VAR" = "BADSHAPE" ] \
+  && ok "a non-string Authorization resolves to BADSHAPE — its own state, not \"no readable entry\" (a healthy .mcp.json must never be reported as missing or as keyless)" \
+  || fail "a non-string Authorization resolved to '${BADSHAPE_VAR:-<empty>}' — 'no readable entry' tells the operator to recreate a file that reads perfectly, and empty is the old 'declares no Authorization' lie; the real cause is BADAUTH:int"
 
 # ⛔ THE FILE PATH OF THE ALIAS RESOLVER IS THE WHOLE POINT OF THE RESOLVER, AND IT HAD NO COVERAGE.
 # Every arm above feeds the credential through the ENVIRONMENT, so `graph_key_from_env_file` could

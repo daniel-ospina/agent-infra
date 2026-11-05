@@ -95,8 +95,13 @@ PY
 # helper that nothing ever called — so the arm compared the client against a hand-written list that
 # agreed with another hand-written list, not against the surface. That is how `tortoise_create_operator`
 # (which the client's write path calls) stayed MISSING from the "advertised" set while R5 stayed green.
-# One list, owned by the stub, fetched here over the same loopback `tools/list` a client would use.
-served_list() {
+# One full list, owned by the stub, fetched here over the same loopback `tools/list` a client would use.
+#
+# `WRITE_TOOLS` is NOT a second copy of that list: it is this suite's REQUIREMENT of the surface (the
+# two handlers the write path must be able to call), declared once and passed to every arm that needs
+# it — the surface probe below and the non-vacuity check in the R5 python.
+WRITE_TOOLS="tortoise_create_point tortoise_create_operator"
+served_list() {   # served_list — POST tools/list, write the names to $TMP/served.json, print them
   python3 - "$PORT" "$TMP/served.json" <<'PY'
 import json, sys, urllib.request
 body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
@@ -120,7 +125,7 @@ SERVED_N="$(printf '%s\n' "$SERVED" | awk -F, '{print NF}')"
 # NON-VACUITY OF THE SURFACE ITSELF: the two handlers the WRITE path calls must be advertised by the
 # server, or R5's "every call is advertised" is a comparison against a set that omits the very tools
 # the defect lived on.
-for NEED in tortoise_create_point tortoise_create_operator; do
+for NEED in $WRITE_TOOLS; do
   printf '%s\n' "$SERVED" | tr ',' '\n' | grep -qx "$NEED" \
     && pass "…and the served surface advertises $NEED (the write handler R5 must be able to check)" \
     || fail "tools/list does not advertise $NEED — the surface R5 compares against is missing a handler the client calls, so the write path cannot be covered"
@@ -252,7 +257,7 @@ ok_op = op == {
 ok_pt = pt.get("kind") == "evidence" and bool((pt.get("content") or "").strip())
 sys.exit(0 if ok_op and ok_pt else 1)
 PY
-bad="$(python3 - "$TMP/calls.jsonl" "$TMP/served.json" <<'PY'
+bad="$(python3 - "$TMP/calls.jsonl" "$TMP/served.json" "$WRITE_TOOLS" <<'PY'
 import json, sys
 ADVERTISED = set(json.load(open(sys.argv[2])))
 seen, bad = set(), []
@@ -263,8 +268,10 @@ for line in open(sys.argv[1]):
         seen.add(n)
         if n not in ADVERTISED:
             bad.append(n)
-# NON-VACUITY: a set that never names the WRITE tools is the defect this arm was blind to.
-missing = sorted({"tortoise_create_point", "tortoise_create_operator"} - seen)
+# NON-VACUITY: a set that never names the WRITE tools is the defect this arm was blind to. The names
+# are THIS SUITE'S requirement (argv[3]), passed in rather than restated — the surface itself is
+# argv[2], read from the server.
+missing = sorted(set(sys.argv[3].split()) - seen)
 if missing:
     bad.append("(NOT EXERCISED: %s)" % ",".join(missing))
 print(",".join(sorted(set(bad))))
