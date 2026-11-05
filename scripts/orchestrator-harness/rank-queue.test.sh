@@ -460,6 +460,45 @@ else
   rc=1; echo "      unverifiable-count rc=$bad_rc (want !=0, with a written reorder); real-count rc=$good_rc (want 0, count written)"
 fi
 ck "a reorder whose COUNT cannot be verified FAILS instead of reporting a drained queue (positive pair: a real count succeeds)" $rc
+# ⛔ THE RANKER REFUSES A MALFORMED COUNT *IT* WROTE (review P3, cycle 14). `rank_queue_by_pool` ends with
+# `[ -s "$cnt" ]` and a `case` on the count's FORMAT; the suite only ever satisfied the first (an empty
+# file). Deleting the `case` left the suite green, so the strictness the CALLER's polarity leans on was
+# ungraded. Driven with a `cat` shim that serves a malformed count BODY for the count file only, so the
+# ranker's own write is untouched — the point is that the check reads it back, not what wrote it.
+RANKFMT="$TMP/rankfmt"; rm -rf "$RANKFMT"; mkdir -p "$RANKFMT/bin" "$RANKFMT/o"
+printf '300\n200\n' > "$RANKFMT/o/candidates.txt"
+printf '200\n300\n' > "$RANKFMT/o/.pool"
+cat > "$RANKFMT/bin/cat" <<'SHIM'
+#!/usr/bin/env bash
+case "${1:-}" in *.queue-rank) printf 'x 2 -\n'; exit 0 ;; esac
+exec /bin/cat "$@"
+SHIM
+chmod +x "$RANKFMT/bin/cat"
+{ drive_prologue; cat "$FNS"
+  printf 'rank_queue_by_pool "$1/.pool" "$1/candidates.txt" "$1/.order" "$1/.queue-rank"\nexit $?\n'; } > "$RANKFMT/drive.sh"
+( cd "$RANKFMT" && HOME="$RANKFMT" PATH="$RANKFMT/bin:$PATH" bash drive.sh "$RANKFMT/o" ) > "$RANKFMT/out" 2>&1
+RFMT_RC=$?
+# `rc != 0` is the whole contract: the reorder is a TEMP file until the caller's install, so a failed
+# ranker leaves candidates.txt untouched whatever it wrote to `.order` (the install arm is what the
+# adjacent-to-`mv` re-check pins).
+if [ "$RFMT_RC" -ne 0 ]; then rc=0
+else rc=1; echo "      malformed count accepted: rc=$RFMT_RC (the ranker must FAIL rather than report a count it cannot read)"; fi
+ck "the RANKER itself refuses a malformed count body (rc != 0, nothing installed) — not only the caller's re-parse" $rc
+# NON-VACUITY: delete the format `case` from the driven source and confirm the fixture goes GREEN on the
+# mutant — i.e. the fixture is grading that check and not something else.
+RANKFMTM="$TMP/fns-nofmt.sh"
+awk 'BEGIN{skip=0} /^  case "\$\(cat "\$cnt"/{skip=1} skip==1 && /^  esac$/{skip=0; next} skip==0{print}' "$FNS" > "$RANKFMTM" 2>/dev/null
+if ! cmp -s "$FNS" "$RANKFMTM" 2>/dev/null && ! grep -q "case \"\$(cat \"\$cnt\"" "$RANKFMTM" 2>/dev/null; then
+  rf2="$TMP/rankfmt2"; rm -rf "$rf2"; mkdir -p "$rf2/bin" "$rf2/o"
+  cp "$RANKFMT/o/candidates.txt" "$rf2/o/candidates.txt"; cp "$RANKFMT/o/.pool" "$rf2/o/.pool"
+  cp "$RANKFMT/bin/cat" "$rf2/bin/cat"
+  { drive_prologue; cat "$RANKFMTM"
+    printf 'rank_queue_by_pool "$1/.pool" "$1/candidates.txt" "$1/.order" "$1/.queue-rank"\nexit $?\n'; } > "$rf2/drive.sh"
+  ( cd "$rf2" && HOME="$rf2" PATH="$rf2/bin:$PATH" bash drive.sh "$rf2/o" ) > "$rf2/out" 2>&1
+  if [ "$?" -eq 0 ]; then rc=0
+  else rc=1; echo "      the format-check deletion did not change the outcome — the fixture is not grading it"; fi
+else rc=1; echo "      the format-check mutation did not apply (the awk anchor drifted) — the non-vacuity half is missing"; fi
+ck "non-vacuity: deleting the ranker's count-format \`case\` makes the malformed-count fixture go GREEN" $rc
 
 # ── 7) THE WIRING CANNOT GO INERT — the false-PASS this suite was written for ──
 # The first cut of this change (`70ea113c`) left both definitions OUTSIDE the region the sibling check
@@ -930,10 +969,14 @@ ck "a MALFORMED count field is refused by the strict re-parse, never laundered t
 # fixture would otherwise believe a queue-shape guard protects it, and editing the totals check would
 # then neither redden this test nor be caught by the thing it appears to rely on.
 count_race foreign-zero 'printf "0 0 -\n" > "$QRO/.queue-rank"'
+# ⛔ AND THE ASSERTION NAMES THE GUARD THAT FIRED (review P3, cycle 14). It used to grep "NOT this
+# queue's", a phrase carried by TWO messages — so the check could not tell the totals cross-check from
+# the `[ -s candidates.txt ]` re-check it thought it was grading (that re-check turned out to be
+# unreachable dead code and is gone). The distinct phrase is the cross-check's.
 if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' \
-   && printf '%s' "$CROUT" | grep -q "NOT this queue's"; then rc=0
-else rc=1; echo "      foreign zero: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a foreign '0 0 -' must NOT be read as EMPTY over rows this pass installed)"; fi
-ck "a FOREIGN zero count (another pass's drained arm, same shared path) is not read as EMPTY over rows this pass installed" $rc
+   && printf '%s' "$CROUT" | grep -q 'does not add up to the queue'; then rc=0
+else rc=1; echo "      foreign zero: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a foreign '0 0 -' over a 2-row queue must be refused by the TOTALS cross-check, not read as EMPTY)"; fi
+ck "a FOREIGN zero count (another pass's drained arm, same shared path) is refused by the TOTALS cross-check over rows this pass installed" $rc
 # a foreign count whose head does not name the queue's head is foreign too — the severity line's "head #N is
 # the highest-ranked CLEAN entry" is a claim about the row at the TOP OF THE FILE.
 count_race foreign-head 'printf "1 1 999999\n" > "$QRO/.queue-rank"'
@@ -1210,6 +1253,9 @@ skip_drive() {  # <label> <queue-setup: absent|empty|rows|garbage|dir> -> sets S
     rows)    printf '300\n200\n' > "$d/o/candidates.txt" ;;
     garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt" ;;
     dir)     mkdir -p "$d/o/candidates.txt" ;;
+    wcfail)  printf '300\n200\n' > "$d/o/candidates.txt"
+             mkdir -p "$d/bin"; printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+    mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
   esac
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\n'
     printf 'skip_order_why() { printf "WHY:%%s" "${1:-}"; }\n'
@@ -1218,7 +1264,7 @@ skip_drive() {  # <label> <queue-setup: absent|empty|rows|garbage|dir> -> sets S
     printf 'O="%s/o"\n' "$d"
     cat "$SKIPDRV"
     printf 'exit 0\n'; } > "$d/drive.sh"
-  ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
+  ( cd "$d" && HOME="$d" PATH="${d}/bin:$PATH" bash drive.sh ) > "$d/out" 2>&1
   SDRC=$?
   SDOUT="$(cat "$d/out" 2>/dev/null)"
 }
@@ -1234,6 +1280,41 @@ if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
    && ! printf '%s' "$SDOUT" | grep -q 'No such file or directory'; then rc=0
 else rc=1; echo "      skip/dir: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a DIRECTORY is unreadable: could NOT be READ + backlog=UNKNOWN, no stderr leak)"; fi
 ck "SKIP arm: a queue that is a DIRECTORY is unreadable, and its depth is UNKNOWN (driven)" $rc
+# ⛔ A READABLE FILE WHOSE DEPTH READ FAILS IS NOT AN UNREADABLE FILE (review P2, cycle 14). Both states
+# leave `_skip_n` empty; the arm reported both as "not a readable regular file" while the SAME record
+# carried `handed=300` — a row it had just read out of the file it had just called unreadable.
+skip_drive wcfail wcfail
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue WAS read' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
+   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
+   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty'; then rc=0
+else rc=1; echo "      skip/wcfail: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a readable file whose depth read fails: 'the queue WAS read' + backlog=UNKNOWN, NOT 'could NOT be READ', NOT empty)"; fi
+ck "SKIP arm: a READABLE file whose DEPTH read fails says the queue WAS read, with backlog=UNKNOWN (driven)" $rc
+skip_drive unreadable mode000
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
+   && ! printf '%s' "$SDOUT" | grep -q 'Permission denied'; then rc=0
+else rc=1; echo "      skip/mode000: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a regular file with no read bit: could NOT be READ + backlog=UNKNOWN, no 'Permission denied')"; fi
+ck "SKIP arm: a REGULAR file with NO READ BIT is unreadable, and leaks no 'Permission denied' (driven)" $rc
+# NON-VACUITY: the pre-fix fail-open re-parse (`_skip_n=0`) turns the depth-read failure into a MEASURED
+# zero — "the queue is empty (0 rows)" with `backlog=0` over two rows on disk.
+SDCO="$TMP/skip-arm-coerce.sh"
+sed 's/_skip_n="" ;; esac/_skip_n=0 ;; esac/' "$SKIPDRV" > "$SDCO" 2>/dev/null
+if cmp -s "$SKIPDRV" "$SDCO" 2>/dev/null; then rc=1; echo "      the coerce-to-zero mutation did not apply — the sed anchor drifted"
+else
+  d="$TMP/sa-coerce"; rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
+  printf '300\n200\n' > "$d/o/candidates.txt"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
+  { printf 'set -u\nQUEUE_ORDER_STATE="severity"\n'
+    printf 'skip_order_why() { printf "WHY:%%s" "${1:-}"; }\n'
+    printf 'unusable_summary() { printf "none"; }\n'
+    printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+    printf 'O="%s/o"\n' "$d"; cat "$SDCO"; printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" PATH="$d/bin:$PATH" bash drive.sh ) > "$d/out" 2>&1
+  if grep -q 'the queue is empty' "$d/out" 2>/dev/null && grep -q 'backlog=0' "$d/out" 2>/dev/null; then rc=0
+  else rc=1; echo "      the fail-open re-parse did not reproduce the defect: '$(tr '\n' '|' < "$d/out" | head -c 240)'"; fi
+fi
+ck "non-vacuity: the pre-fix \`_skip_n=0\` re-parse turns a failed depth read into 'the queue is empty (0 rows)' with \`backlog=0\`" $rc
 skip_drive drained empty
 if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue is empty (0 rows)' \
    && printf '%s' "$SDOUT" | grep -q 'backlog=0' \
@@ -1258,7 +1339,7 @@ ck "SKIP arm: rows with an UNPARSABLE head are MEASURED (backlog=3), not called 
 # — that is the finding — so the fixture that must red is the readable-garbage one, which flips to
 # "could NOT be READ" with `backlog=UNKNOWN` over a file that is perfectly readable.
 SDKEY="$TMP/skip-arm-headkey.sh"
-sed 's/^    if \[ -z "\$_skip_n" \]; then$/    if [ -z "$_skip_head" ]; then/' "$SKIPDRV" > "$SDKEY" 2>/dev/null
+sed 's/^    elif \[ -z "\$_skip_n" \]; then$/    elif [ -z "$_skip_head" ]; then/' "$SKIPDRV" > "$SDKEY" 2>/dev/null
 if cmp -s "$SKIPDRV" "$SDKEY" 2>/dev/null; then rc=1; echo "      the re-key mutation did not apply — the sed anchor drifted"
 else
   _sd_ok=0
@@ -1269,10 +1350,15 @@ else
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
     printf 'O="%s/o"\n' "$d"; cat "$SDKEY"; printf 'exit 0\n'; } > "$d/drive.sh"
   ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
-  if grep -q 'could NOT be READ' "$d/out" 2>/dev/null && grep -q 'backlog=UNKNOWN' "$d/out" 2>/dev/null; then
+  # The mutant misreports the state — a MEASURED depth (3 rows) becomes `UNKNOWN` and the arm that should
+  # name the unreadable head is never reached. Either symptom is the defect; both are asserted so the
+  # check cannot pass on a mutant that merely reworded itself.
+  if grep -q 'backlog=UNKNOWN' "$d/out" 2>/dev/null \
+     && ! grep -q 'backlog=3' "$d/out" 2>/dev/null \
+     && ! grep -q 'its HEAD could not be read' "$d/out" 2>/dev/null; then
     _sd_ok=1
   else
-    echo "      the HEAD-keyed arm did NOT reproduce the defect: '$(tr '\n' '|' < "$d/out" | head -c 240)'"
+    echo "      the HEAD-keyed arm did NOT reproduce the defect: '$(tr '\n' '|' < "$d/out" | head -c 260)'"
   fi
   [ "$_sd_ok" -eq 1 ] && rc=0 || rc=1
 fi
@@ -1336,8 +1422,8 @@ _mh_n="$(wc -l < "$MAINDRV" 2>/dev/null | tr -d ' ')"
 if [ -n "$_mh_n" ] && [ "$_mh_n" -gt 12 ] && grep -q 'handed to dispatch' "$MAINDRV" 2>/dev/null; then rc=0
 else rc=1; echo "      MAIN handoff extraction failed ($_mh_n line(s)) — the drive below would grade an empty file"; fi
 ck "the MAIN handoff's depth-read-and-arms region is extracted from the shipped file" $rc
-main_handoff() {  # <label> <queue-setup: 'dir'|'empty'|'rows'|'none'> -> sets MHRC/MHOUT
-  local d="$TMP/mh-$1" how="$2"
+main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
+  local d="$TMP/mh-$1" how="$2" st="${3:-severity}"
   rm -rf "$d"; mkdir -p "$d/o"
   case "$how" in
     dir)   mkdir -p "$d/o/candidates.txt" ;;          # unreadable AS A FILE: a directory
@@ -1345,9 +1431,17 @@ main_handoff() {  # <label> <queue-setup: 'dir'|'empty'|'rows'|'none'> -> sets M
     rows)  printf '300\n200\n' > "$d/o/candidates.txt" ;;
     none)  : ;;                                       # absent
     garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt" ;;  # rows, head not a number
+    # ⛔ A READABLE FILE WHOSE DEPTH READ FAILS (review P2, cycle 14). `_backlog_n` is EMPTY in two
+    # unrelated states and the arm must not confuse them; `wc` is the read that can fail alone.
+    wcfail) printf '300\n200\n' > "$d/o/candidates.txt"
+            mkdir -p "$d/bin"
+            printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+    # ⛔ AND A REGULAR FILE THAT IS NOT READABLE: the `-r` half of the guard, which a directory (`-f`
+    # fails first) can never grade.
+    mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
   esac
   {
-    printf 'set -u\nQUEUE_ORDER_STATE="severity"\nQUEUED_THIS_PASS=""\n'
+    printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS=""\n' "$st"
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
     printf 'unusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
@@ -1355,7 +1449,7 @@ main_handoff() {  # <label> <queue-setup: 'dir'|'empty'|'rows'|'none'> -> sets M
     cat "$MAINDRV"
     printf 'exit 0\n'
   } > "$d/drive.sh"
-  ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
+  ( cd "$d" && HOME="$d" PATH="${d}/bin:$PATH" bash drive.sh ) > "$d/out" 2>&1
   MHRC=$?
   MHOUT="$(cat "$d/out" 2>/dev/null)"
 }
@@ -1409,6 +1503,53 @@ else
   else rc=1; echo "      the REVERTED gate did not reproduce the defect — the fixture is not grading the depth gate: '$(tr '\n' '|' < "$d/out" | head -c 240)'"; fi
 fi
 ck "non-vacuity: the pre-fix \`elif [ -n \"\$_backlog_n\" ]\` restores 'the queue is empty' + \`backlog=0\` over three rows" $rc
+# (b3) DEPTH READ FAILS ON A READABLE FILE (review P2, cycle 14). The head is still readable, so the pass
+# knows WHICH row dispatch takes — and it must not also claim a depth it never measured. `backlog=` with
+# an empty value is the same defect as a wrong one: it renders an unmeasured field as if it were one.
+main_handoff wcfail wcfail
+if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
+   && printf '%s' "$MHOUT" | grep -q 'handed=300' \
+   && ! printf '%s' "$MHOUT" | grep -q 'queue depth ;' \
+   && ! printf '%s' "$MHOUT" | grep -q 'backlog= handed' \
+   && ! printf '%s' "$MHOUT" | grep -q 'could NOT be READ'; then rc=0
+else rc=1; echo "      depth-fail: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (want backlog=UNKNOWN + handed=300; NOT 'queue depth ;', NOT an empty backlog=, NOT 'could NOT be READ' — the file WAS read)"; fi
+ck "a READABLE queue whose DEPTH read fails records backlog=UNKNOWN with the head it DID read, and never an empty backlog=" $rc
+# NON-VACUITY: the pre-fix fail-OPEN re-parse (`_backlog_n=0` instead of "") turns that state into a
+# MEASURED zero. Nothing else in the suite can see it, because no fixture made the depth read fail.
+MHWCF="$TMP/main-handoff-coerce-rev.sh"
+sed 's/_backlog_n="" ;; esac/_backlog_n=0 ;; esac/' "$MAINDRV" > "$MHWCF" 2>/dev/null
+if cmp -s "$MAINDRV" "$MHWCF" 2>/dev/null; then rc=1; echo "      the coerce-to-zero mutation did not apply — the sed anchor drifted"
+else
+  d="$TMP/mh-coerce"; rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
+  printf '300\n200\n' > "$d/o/candidates.txt"
+  printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
+  { printf 'set -u\nQUEUE_ORDER_STATE="severity"\nQUEUED_THIS_PASS=""\n'
+    printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\nunusable_summary() { printf "none"; }\n'
+    for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
+    printf 'O="%s/o"\nSTARVED=0\n' "$d"; cat "$MHWCF"; printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" PATH="$d/bin:$PATH" bash drive.sh ) > "$d/out" 2>&1
+  if grep -q 'backlog=0' "$d/out" 2>/dev/null && ! grep -q 'backlog=UNKNOWN' "$d/out" 2>/dev/null; then rc=0
+  else rc=1; echo "      the fail-open re-parse did not reproduce the defect: '$(tr '\n' '|' < "$d/out" | head -c 240)'"; fi
+fi
+ck "non-vacuity: the pre-fix \`_backlog_n=0\` re-parse turns a failed depth read into a MEASURED \`backlog=0\`" $rc
+# (b4) THE `-r` HALF OF THE GUARD (review P3, cycle 14). Every unreadable fixture so far was a DIRECTORY,
+# which `-f` alone rejects — so dropping `-r` re-leaked the shell's own `Permission denied` unpunished.
+main_handoff mode000 mode000
+if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
+   && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
+   && ! printf '%s' "$MHOUT" | grep -q 'Permission denied' \
+   && ! printf '%s' "$MHOUT" | grep -q 'backlog=0'; then rc=0
+else rc=1; echo "      mode-000: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a regular file with no read bit is unreadable: could NOT be READ + backlog=UNKNOWN, and no 'Permission denied' leak)"; fi
+ck "a REGULAR file with NO READ BIT is unreadable, records backlog=UNKNOWN, and leaks no 'Permission denied'" $rc
+# (b5) THE ORDER CLAIM IS NOT TYPED IN THE STATE THAT HAS NO ORDER (review P3, cycle 14). The unranked
+# arm's `handed_why=` used to be able to carry "the highest-ranked CLEAN entry in the pool-ordered queue"
+# — a severity claim about a pass that established NO priority order. Nothing asserted its ABSENCE.
+main_handoff unranked rows priority-unreadable
+if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'established NO priority order' \
+   && ! printf '%s' "$MHOUT" | grep -q 'highest-ranked' \
+   && ! printf '%s' "$MHOUT" | grep -q 'pool-ordered'; then rc=0
+else rc=1; echo "      unranked handoff: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a priority-unreadable pass may NOT describe its head as 'the highest-ranked CLEAN entry' / 'pool-ordered')"; fi
+ck "an UNRANKED pass never describes its head as 'the highest-ranked CLEAN entry in the pool-ordered queue'" $rc
 main_handoff absent none
 if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
    && ! printf '%s' "$MHOUT" | grep -q 'No such file or directory' \
