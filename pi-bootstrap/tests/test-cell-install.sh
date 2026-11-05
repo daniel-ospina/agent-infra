@@ -400,6 +400,43 @@ python3 - "$DEST/.mcp.json" <<'PY' && ok "a cell-local MCP server survives a re-
 import json, sys
 sys.exit(0 if "cell-local" in ((json.load(open(sys.argv[1])).get("mcpServers")) or {}) else 1)
 PY
+# ⛔ HEADERS THIS MACHINE ADDED ARE KEPT **AND NAMED** (#3374 review P2). `entry = dict(want)`
+# discarded every non-Authorization header with no output at all, while the merge's own contract
+# (merge-mcp.py:54) is that every decision is a `NOTE:` line and "nothing here is silent". A cell
+# behind a gateway that requires `X-Tenant` lost it on EVERY install.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+t["headers"] = dict(t.get("headers") or {})
+t["headers"]["X-Tenant"] = "acme-prod"
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a header this machine added to the hosted tortoise entry SURVIVES a re-install" \
+  || fail "re-install discarded a machine-added header on the tortoise entry — a gateway/tenant header vanishes with no signal"
+import json, sys
+h = ((json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}).get("headers") or {}
+sys.exit(0 if h.get("X-Tenant") == "acme-prod" and "Authorization" in h else 1)
+PY
+grep -qF "kept this machine's own header(s) on the tortoise entry: X-Tenant" "$LOG" \
+  && ok "...and the merge NAMES the header it kept (nothing here is silent)" \
+  || fail "...a kept header was not named in a NOTE — the operator cannot see what the merge did to their config"
+grep -qF "hosted tortoise entry installed" "$LOG" \
+  && ok "...and the summary still says the HOSTED entry is installed, because this file carries it" \
+  || fail "...the summary did not report the hosted entry on a file that carries it (the opposite falsehood)"
+# Restore the fixture to the uninterpolated entry so the arms below mutate a known shape.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+t = dict(d["mcpServers"]["tortoise"])
+t["headers"] = {k: v for k, v in (t.get("headers") or {}).items() if k != "X-Tenant"}
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(p, "w"), indent=2)
+PY
 # ...and a SELF-HOSTED tortoise url is preserved (the template's own comment tells self-host users
 # to set it; a source-wins merge would silently repoint them at the hosted endpoint, where they
 # have no key, and the failure would read as an auth error rather than the repoint it is).
@@ -425,6 +462,17 @@ import json, sys
 t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
 sys.exit(0 if t.get("_selfHosted") is True else 1)
 PY
+# ⛔ THE INSTALL SUMMARY MUST DESCRIBE THE FILE, NOT THE INTENT (#3374 review P2). THIS run KEPT a
+# self-hosted url, so a summary that says "hosted tortoise entry installed" sends the operator to
+# inspect the wrong artifact. The positive polarity of this pair is asserted above, where the file
+# really does carry the hosted entry — a log line that is right in only one state is still a lie.
+if grep -qF "hosted tortoise entry installed" "$LOG"; then
+  fail "the install log claimed the HOSTED entry was installed while the merge KEPT a self-hosted url — the summary contradicts the artifact it just wrote"
+elif grep -qF "the tortoise entry is NOT the hosted default" "$LOG"; then
+  ok "a self-hosted install says the tortoise entry is NOT the hosted default (the summary describes the file)"
+else
+  fail "a self-hosted install neither reported the hosted entry nor named the kept url — the summary is silent about the decision"
+fi
 run_verify
 [ $? -eq 0 ] && grep -q "SELFHOSTED:http://localhost:8000/mcp" "$LOG" \
   && ok "--verify ACCEPTS a marked self-hosted url and says so by name" \
