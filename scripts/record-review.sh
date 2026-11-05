@@ -88,10 +88,10 @@
 #
 # record-review.sh --recover-body <pr> [owner/repo]
 #   REBUILD a MISSING record from the PR body's own SIGNED marker (#2872).
-#   The marker the recorder posts is signed (HMAC-SHA256 over the marker text,
-#   $AI_REVIEW_GATE_KEY, #2055), and it is the only copy of the verdict that
-#   TRAVELS with the PR — the record file is per-box. So a review minted on a
-#   cell, or on a box since recycled, leaves the rail saying NO-RECORD while the
+#   That marker is signed only when key and openssl both work (HMAC-SHA256 over
+#   the text, $AI_REVIEW_GATE_KEY, #2055; else UNSIGNED, :4827-4833). It is the
+#   only copy of the verdict that TRAVELS with the PR — records are per-box — so
+#   a review minted on a cell leaves the rail saying NO-RECORD while the
 #   proof sits in the body, verifiable with a key this box already holds.
 #   Measured 2026-10-26: of 45 open PRs, 12 had a marker whose `diff=` equals the
 #   PR's live diff and no record file here; the registry covered 2 of them.
