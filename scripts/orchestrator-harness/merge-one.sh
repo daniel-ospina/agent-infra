@@ -202,6 +202,11 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
     mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"
   else
     echo "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR: mandate-preflight.sh $_mt_why — this spawn cannot tell whether the files it orders a reviewer to read exist (#3377). Proceeding: a helper that cannot run is not a reading about the box." >> "$log"
+    # ⛔ THE LOG IS NOT THE REVIEWER (this change's review cycle 2, P1): the same reason `spawn-gate.sh`
+    # gives on the identical branch — a notice only an operator can read leaves the reviewer as blind as it
+    # was before the disclosure existed, and this is the branch an un-provisioned box takes.
+    grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null ||
+      printf '%s\n' "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"
   fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
