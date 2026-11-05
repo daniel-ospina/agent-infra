@@ -502,6 +502,24 @@ case "$CHECK_ERR" in *'[mandate-preflight] MISSING'*) ok "--check TAGS each miss
 bash "$HELPER" --bogus-verb >/dev/null 2>&1; BOGUS_RC=$?
 [ "$BOGUS_RC" = "78" ]; ck $? "an UNKNOWN argument answers 78, the repo's config-error convention (measured rc=$BOGUS_RC; \`return 1\` used to pass)"
 
+# ── E1s: THE OTHER TWO `--check` TAGS, AND THE NAME OF THE ROOT IT READ (#3379 review cycle 20, P2/P3) ─
+# Cycle 19 pinned the MISSING tag one `elif` away and left its two siblings — the tags on the state this whole
+# file exists to distinguish ("ABSENT is not UNREADABLE"). Measured: dropping the UNREADABLE tag (bare absolute
+# paths on stderr) and dropping the NOT-A-FILE tag both left 190/0, and reducing the success line to a bare
+# `ok` did too — so a healthy run no longer named WHICH state dir it read, which is the surface of the earlier
+# "a wrong root reported as fact" P1.
+mkstate; : > "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; : > "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+OK_ERR="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --check 2>&1' _ "$HELPER")"
+case "$OK_ERR" in *"[mandate-preflight] ok: every mandated file is present under $TMP/home/.pi/agent/state"*) ok "a HEALTHY --check names the state dir it read (a bare 'ok' would hide a wrong root)" ;; *) bad "a healthy --check did not name the state dir it read: $OK_ERR" ;; esac
+chmod 000 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+UR_ERR="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --check 2>&1 >/dev/null' _ "$HELPER")"
+chmod 644 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+case "$UR_ERR" in *'[mandate-preflight] CANNOT VERIFY (unreadable)'*) ok "--check TAGS the UNREADABLE path (its MISSING sibling was pinned one elif away and this was not)" ;; *) bad "--check wrote an UNTAGGED unreadable path to stderr: $UR_ERR" ;; esac
+rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; mkdir -p "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+NF_ERR="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --check 2>&1 >/dev/null' _ "$HELPER")"
+rm -rf "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+case "$NF_ERR" in *'[mandate-preflight] CANNOT VERIFY (not a regular file)'*) ok "--check TAGS the OCCUPIED path too (all three can't-verify tags now carry an identification)" ;; *) bad "--check wrote an UNTAGGED occupied-path line to stderr: $NF_ERR" ;; esac
+
 # ── E1i: A RENDER THAT PRODUCES NOTHING MUST NOT READ AS "EVERY FILE PRESENT" (review P1) ─────────
 # The disclosure is rendered into `line`; when that render fails the OLD code took the empty result as
 # "nothing to declare" and — if a second read also failed — appended "BOTH mandated files are now PRESENT"
