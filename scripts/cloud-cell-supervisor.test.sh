@@ -809,7 +809,7 @@ AUTH="$F/home/.pi/agent/auth.json"
 # absence (the idiom this suite already uses: never two absences).
 cellcheck 0
 case "$CC_OUT" in
-  *"provider credential for 'deepseek' is in the store"*) ok "check: reads the store and names the credential it found" ;;
+  *"the provider store holds a 'deepseek' credential"*) ok "check: reads the store and names the credential it found" ;;
   *) bad "check: never reported the provider store it is supposed to read — output: $CC_OUT" ;;
 esac
 # (b) Empty store, but `keys.env` carries the key: delivered, so the box CAN answer — a WARN, not a
@@ -864,15 +864,26 @@ case "$CC_OUT" in
   *"pi cannot READ"*) ok "…naming the entry, not the provider or the network" ;;
   *) bad "the malformed-entry refusal is not explained: $CC_OUT" ;;
 esac
-# (f) An OAUTH entry is a REAL credential pi can use, and this read-only verb cannot judge it. It must
-# pass and say nothing is asserted — neither "present" (it cannot know) nor a refusal (false block).
+# (f) An OAUTH entry WITH an access token is a real credential pi can use (`auth-storage` accepts
+# `{type:"oauth", access, refresh, expires}`), so it must PASS — and it must be reported as an entry
+# pi can use, not refused for having no `key` field.
 printf '{"deepseek":{"type":"oauth","access":"acc","refresh":"ref","expires":9999999999}}\n' > "$AUTH"
 cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "check PASSES a store holding an oauth credential for the provider (no false block)" \
                    || bad "check false-blocked a box whose stored credential is oauth (rc=$CC_RC): $CC_OUT"
 case "$CC_OUT" in
-  *"does not judge"*) ok "…and states that it did not judge it, rather than claiming the credential is usable" ;;
-  *) bad "the oauth entry was silently treated as judged/usable: $CC_OUT" ;;
+  *"credential"*) ok "…reporting it as a credential pi can use" ;;
+  *) bad "the oauth entry was not reported as a credential: $CC_OUT" ;;
+esac
+# (g) An entry of a type this file does NOT know is not a refusal either: whether it resolves is pi's
+# answer, so the only honest line says exactly that (a guess in either direction is a defect).
+printf '{"deepseek":{"type":"some_future_scheme","blob":"x"}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check PASSES a store entry of a type it does not know (no false block)" \
+                   || bad "check false-blocked an unrecognised credential type (rc=$CC_RC): $CC_OUT"
+case "$CC_OUT" in
+  *"does not judge"*) ok "…and states that it did not judge it, rather than asserting either way" ;;
+  *) bad "the unknown-type entry was silently treated as judged: $CC_OUT" ;;
 esac
 # restore the fixture for every arm after this block
 rm -f "$F/keys.env"; seed_provider_store "$F/home"
