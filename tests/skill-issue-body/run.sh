@@ -343,6 +343,19 @@ canon_reasons_missing() {
   [ -n "$(printf '%s\n' "$f" | inline_body_offenders)" ] && miss="$miss inline-body"
   grep -qF -e '#3445' -- "$f" 2>/dev/null || miss="$miss citation-3445"
   grep -qF -e '#729' -- "$f" 2>/dev/null || miss="$miss citation-729"
+  # ⛔ THE RECIPE HALVES, each of which a review round had to fix and which nothing else pinned:
+  #   call1-path   — a line that PRINTS the derived path, BEFORE the gh call, so the `write` tool has
+  #                  a target. Deleting it left the canonical example unrunnable and the shard green.
+  #   recipe-var   — the fresh-shell-broken `VAR=…` + `--body-file "$VAR"` recipe (see the scanner).
+  awk '
+    /^[ \t]*#/ { next }
+    {
+      if (!printed && /echo/ && /pi-issue-body-/) printed=1
+      if (!ghseen && /issue[ \t]+create/) { ghseen=1; gh_at_echo = printed }
+    }
+    END { exit(gh_at_echo ? 0 : 1) }
+  ' "$f" 2>/dev/null || miss="$miss call1-path"
+  [ -n "$(canon_recipe_absent "$f")" ] && miss="$miss recipe-var"
   printf '%s' "$miss"
 }
 
@@ -362,6 +375,48 @@ readme_route_absent() {
   local r="$1"
   [ -f "$r" ] || { printf '%s\n' "$r"; return 0; }
   grep -iF -e '--body-file' -- "$r" 2>/dev/null | grep -iqF -e 'not a bypass' || printf '%s\n' "$r"
+}
+
+# readme_worktree_claim <file> → the file, when it claims a WORKTREE LIFTS the title refusal ("").
+# ⛔ WHY THIS IS A SEPARATE ARM. A whole review round removed "or file from a worktree" from this row
+# because it is FALSE: a title that merely MENTIONS a destructive verb is refused regardless of cwd (a
+# mention resolves to no git invocation, so the arm cannot worktree-exempt it — measured live from a
+# linked worktree). Removing the sentence without pinning its absence left it one edit from returning:
+# restoring it was measured to keep the whole shard GREEN (36/0), because arm D reads only two tokens.
+readme_worktree_claim() {
+  local r="$1"
+  [ -f "$r" ] || { printf '%s\n' "$r"; return 0; }
+  # The escape/backdoor table's own text, so a legitimate mention elsewhere cannot false-red this.
+  awk '/^## Escape hatches/{f=1;next} /^Rule of thumb:/{f=0} f' "$r" 2>/dev/null \
+    | grep -iE 'or file (the report )?from a worktree|file (it|the report) from a worktree' \
+    && printf '%s\n' "$r"
+  return 0
+}
+
+# canon_recipe_absent <file> → the file, when it teaches the FRESH-SHELL-BROKEN recipe: a `VAR=…`
+# assignment (value carrying a $) followed by `--body-file "$VAR"` in the SAME fence. ⛔ Every bash
+# tool call is a fresh shell, so the variable is EMPTY at the consumer — the exact defect the skills
+# were fixed for, and the shape the literal-path arm cannot see because it skips `$` values.
+canon_recipe_absent() {
+  local f="$1"
+  [ -f "$f" ] || { printf '%s\n' "$f"; return 0; }
+  awk '
+    # non-comment code lines only: a comment WARNING about this pitfall is the correct text.
+    { line=$0 }
+    line ~ /^[ \t]*#/ { next }
+    # an assignment whose value carries a variable/substitution
+    match(line, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=.*\$/) {
+      name=line; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/=.*/, "", name); vars[name]=1; next
+    }
+    {
+      # a consumer of one of those variables
+      for (v in vars) {
+        if (index(line, "--body-file") && (index(line, "\"$" v "\"") || index(line, "\"${" v "}\""))) {
+          print FILENAME; found=1; exit
+        }
+      }
+    }
+  ' "$f"
 }
 
 # ── A: population floor ─────────────────────────────────────────────────────────────────────────
@@ -396,17 +451,41 @@ LITOFF="$(printf '%s\n' "$CENSUS" | literal_path_offenders)"
   && ok 'and every one of them names a DERIVED body path (`$BODY`), not a literal one — two concurrent lanes cannot overwrite each other'"'"'s body between the write and the gh call (#729)' \
   || bad "literal body path(s): $(printf '%s' "$LITOFF" | sed "s|$ROOT/||g" | tr '\n' ' ') — a body path that is not DERIVED is shared by every lane on the box, so concurrent lanes can publish each other text (#729)"
 
+# ── B3: NO skill anywhere teaches the fresh-shell-broken `VAR=` recipe ─────────────────────────
+# ⛔ WHY POPULATION-WIDE. A review round found that re-introducing this recipe into ANY of the five
+# skills left the suite green, because only the canonical file was checked. Every bash tool call is a
+# fresh shell, so `VAR="…"` in one call is EMPTY at the next — `--body-file "$VAR"` then passes an
+# empty path, which is exactly the defect this round fixed. The literal-path arm cannot see it: it
+# skips values containing `$`, on the reasonable assumption that `$` means derived.
+RECIPE_OFF=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  R="$(canon_recipe_absent "$f")"
+  [ -n "$R" ] && RECIPE_OFF="$RECIPE_OFF $R"
+done <<EOF
+$POPULATION
+EOF
+[ -z "$RECIPE_OFF" ] \
+  && ok 'and NO skill or template teaches the fresh-shell-broken recipe (a VAR= assignment consumed by --body-file VAR) — the derivation is repeated inline in the gh call, which is the only form that survives the fresh-shell rule' \
+  || bad "fresh-shell-broken recipe in:$(printf '%s' "$RECIPE_OFF" | sed "s|$ROOT/||g" | tr '\n' ' ') — a variable assigned in one tool call is EMPTY in the next, so passing it as the body-file path hands gh an empty path; repeat the derivation inline"
+
 # ── C: the canonical example carries the reasons, not just the shape ────────────────────────────
 C_MISS="$(canon_reasons_missing "$ROOT/$CANON")"
 [ -z "$C_MISS" ] \
-  && ok "$CANON teaches --body-file AND cites why on both counts (#3445 the gated shape, #729 the derived path) — the shape travels with the reason, so the next editor cannot revert it as style" \
-  || bad "$CANON is missing:$C_MISS — without the cited reasons the shape reads as formatting and gets tidied away by the next lane that thinks a literal temp path is simpler"
+  && ok "$CANON teaches --body-file, cites why on both counts (#3445 the gated shape, #729 the derived path), prints the derived path in an earlier call so the write tool has a target, and never uses the fresh-shell-broken `VAR=\u2026` recipe — the shape travels with the reason, so the next editor cannot revert it as style" \
+  || bad "$CANON is missing:$C_MISS — without the cited reasons the shape reads as formatting and gets tidied away; without the path-printing call the example is UNRUNNABLE (the write tool has no target); with `VAR=` + `--body-file \"\$VAR\"` the path is empty by the time gh runs (every bash call is a fresh shell)"
 
 # ── D: the guard README documents the route (and does not call it an escape) ────────────────────
 ABSENT="$(readme_route_absent "$README")"
 [ -z "$ABSENT" ] \
   && ok 'the guard README names `--body-file` as the sanctioned route and says it is NOT a bypass — the documented route sits next to the escapes it is deliberately not one of' \
   || bad "$(printf '%s' "$ABSENT" | sed "s|$ROOT/||") does not name --body-file as the sanctioned (not-a-bypass) route — then the one correct shape looks like an undocumented workaround, and the next lane routes around the guard instead (#3445 acceptance 3)"
+
+# ── D2: the row does not resurrect the FALSE worktree remedy ───────────────────────────────────
+WT_CLAIM="$(readme_worktree_claim "$README")"
+[ -z "$WT_CLAIM" ] \
+  && ok 'the guard README does NOT claim a worktree lifts the title refusal — the one sentence a review round had to remove is now pinned, so it cannot come back as a plausible-looking alternative' \
+  || bad "$(printf '%s' "$WT_CLAIM" | sed "s|$ROOT/||") offers \"file it from a worktree\" again — that remedy is FALSE (a title merely MENTIONING a destructive verb is refused from a worktree too, measured: a mention resolves to no git invocation, so the arm cannot worktree-exempt it), and an agent following it hits the identical refusal"
 
 # ── E: BOTH guard classifiers still separate the two shapes (the premise of the whole fix) ──────
 if [ -f "$CLASSIFIER" ]; then
