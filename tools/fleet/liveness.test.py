@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty tests with sixty-nine paired mutations: every mutation re-
+Fifty-one tests with seventy paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -17,8 +17,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 50 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (69)
+    python3 tools/fleet/liveness.test.py                # the 51 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (70)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2203,6 +2203,63 @@ def t50():
               % (label, v.state, v.reason))
 
 
+@test("T51 the /proc reader ABSTAINS on a malformed row instead of re-parenting it to 0")
+def t51():
+    """⛔ THE SAME RULE AS T39, ON THE PLATFORM WHERE THE FLEET'S LANES LIVE.
+
+    T39 pins the `ps` arm. The `/proc` arm had no test at all — `/proc` does not exist on
+    the Mac, so nothing ever drove it — and it shipped encoding an unparseable row as
+    `(0, None)`. `0` SEVERS the child's parent link: the walk from our root never reaches
+    the pid, `cpu.get(p) is None` never fires, and the CPU leaves the total. That is a
+    SMALLER total, which is exactly how a busy tree reads flat and then `frozen` — the
+    undercount T39's docstring forbids. Encoding it also orphans its own descendants.
+    """
+    d = tempfile.mkdtemp(prefix="liv-proc-")
+    try:
+        def row(pid, ppid, utime, stime=0, broken=None):
+            if broken == "noparen":
+                stat = "not a stat line"          # no `)` at all
+            elif broken == "badfield":
+                # HAS a `)` but a non-numeric ppid — the parse arm, not the `)` arm
+                stat = "%d (cmd) S xx 0 0 0 0 0 0 0 0 0 %d %d" % (pid, utime, stime)
+            else:
+                # pid (comm) state ppid … utime stime …  — field N is rest[N-3]
+                stat = "%d (cmd) S %d 0 0 0 0 0 0 0 0 0 %d %d" % (pid, ppid, utime, stime)
+            os.makedirs(os.path.join(d, str(pid)), exist_ok=True)
+            with open(os.path.join(d, str(pid), "stat"), "w", encoding="utf-8") as fh:
+                fh.write(stat)
+
+        # root 100 (1 s) + child 101 (2 s) = 3 s = 300 cs. A non-pid dir is ignored.
+        row(100, 1, 100)
+        row(101, 100, 200)
+        os.makedirs(os.path.join(d, "self"), exist_ok=True)
+        proc = liv._proc_cpu_cs(d)
+        check(proc == {100: (1, 100), 101: (100, 200)},
+              "the /proc reader parses (ppid, cpu_cs) and skips non-pid entries; got %r" % (proc,))
+        check(liv._sum_subtree(100, {p: v[0] for p, v in proc.items()},
+                               {p: v[1] for p, v in proc.items()}) == 300,
+              "the subtree sums root+descendants")
+
+        # THE DISCRIMINATING CASES. Both arms used to SILENTLY SKIP a malformed row: the
+        # parse arm encoded it as `(0, None)` (severed parent link — the walk never reached
+        # pid 102, so its CPU vanished) and the no-`)` arm `continue`d outright. Pre-fix,
+        # both left the total at 300: a clean-looking undercount of a subtree that holds an
+        # unreadable member.
+        for shape in ("badfield", "noparen"):
+            for stale in ("102",):
+                shutil.rmtree(os.path.join(d, stale), ignore_errors=True)
+            row(102, 100, 0, broken=shape)
+            check(liv._proc_cpu_cs(d) is None,
+                  "a malformed row (%s) ABSTAINS the whole /proc read — it is never "
+                  "re-parented to 0 and never skipped" % shape)
+
+        # …and a non-existent root is an abstention, never an empty map that reads as "no CPU".
+        check(liv._proc_cpu_cs(os.path.join(d, "absent")) is None,
+              "an unreadable /proc is an abstention")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -2707,6 +2764,15 @@ MUTATIONS = [
         '    if False:',
         "a caller that bypasses `parse_bound_pid` hands a non-numeric token to int(), so "
         "the drop becomes a ValueError out of `gather_log_lane`",
+    ),
+    Mutation(
+        "T51", "module",
+        '            # turns an unread member into a missing one.\n            return None',
+        '            # turns an unread member into a missing one.\n'
+        '            out[int(name)] = (0, None)\n            continue',
+        "an unparseable /proc row is encoded as `(0, None)`, so the walk never visits it "
+        "and the subtree total silently UNDERCOUNTS — the `/proc` twin of T39's defect, on "
+        "the platform where the fleet's lanes actually live",
     ),
 ]
 

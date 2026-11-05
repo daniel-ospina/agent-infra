@@ -1154,12 +1154,12 @@ def parse_bound_pid(text: str):
     line_end = text.find("\n", last.start())
     line = text[last.start(): line_end if line_end >= 0 else len(text)]
     pids = _bound_pid_re().findall(line.split(" log=")[0])
-    # A pid is <= 7 digits (PID_MAX_DEFAULT 4194304). A longer token is not a pid, and
-    # `int()` on it raises "Exceeds the limit (4300 digits)" — an exception, not a state.
     if not pids:
         return ""
-    # A pid is <= 7 digits (PID_MAX_DEFAULT 4194304). A longer token is NOT a pid, and
-    # `int()` on it raises "Exceeds the limit (4300 digits)" — an exception, not a state.
+    # A pid token is capped at 10 digits DEFENSIVELY, not because `PID_MAX_DEFAULT` (4194304)
+    # is 7 digits long. The cap exists so `int()` below never sees a 4300-digit token and
+    # raises "Exceeds the limit" — an exception is not a state. Any token longer than the cap
+    # is NOT a pid.
     # `"?"` marks "present but unusable", which the binding DROPS; `""` means "the line
     # names no incarnation", which is ADOPTED and declared.
     return pids[-1] if len(pids[-1]) <= 10 else "?"
@@ -2158,7 +2158,7 @@ def gather(
     )
 
 
-def _proc_cpu_cs() -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
+def _proc_cpu_cs(root: str = "/proc") -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
     """``{pid: (ppid, cpu_cs)}`` read from ``/proc`` at ``SC_CLK_TCK`` resolution.
 
     ⛔ WHY NOT JUST ``ps -o time=``: **GNU procps prints whole seconds only.**
@@ -2172,8 +2172,11 @@ def _proc_cpu_cs() -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
 
     Returns ``None`` when ``/proc`` is not readable (macOS) so the caller falls back
     to ``ps``; a pid that vanishes mid-walk is simply absent (it is gone).
+
+    ``root`` is injectable ONLY so the malformed-row arm below can be driven from a
+    synthetic tree: ``/proc`` does not exist on the Mac, so without a seam that arm had
+    no test at all and it shipped encoding an unreadable row as ``(0, None)``.
     """
-    root = "/proc"
     try:
         names = os.listdir(root)
     except (OSError, ValueError):
@@ -2189,7 +2192,13 @@ def _proc_cpu_cs() -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
         # `comm` may contain spaces and parentheses: split on the LAST ')'
         close = raw.rfind(")")
         if close < 0:
-            continue
+            # ⛔ A ROW WITH NO `)` IS MALFORMED, NOT VANISHED (review P2, same rule as the
+            # parse arm below). `open()` succeeded, so the pid still existed when it was
+            # read; the content simply is not a `stat` line. Skipping it drops its CPU from
+            # the total — a SMALLER total, which reads as flat and then `frozen`. A process
+            # that truly vanished is the `OSError` arm above, which is the only arm here
+            # that is allowed to `continue`.
+            return None
         rest = raw[close + 2:].split()
         # rest[0] = state (field 3), so field N is rest[N-3]
         try:
@@ -2197,8 +2206,16 @@ def _proc_cpu_cs() -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
             utime = int(rest[11])         # field 14
             stime = int(rest[12])         # field 15
         except (IndexError, ValueError):
-            out[int(name)] = (0, None)
-            continue
+            # ⛔ AN UNPARSEABLE ROW ABSTAINS THE WHOLE READ — IT IS NOT ENCODED AS `(0, None)`
+            # (review P2). `(0, …)` re-parents the pid to 0, so the walk from our root NEVER
+            # REACHES IT: `kids[root]` does not contain it, `cpu.get(p) is None` never fires, and
+            # its CPU silently leaves the total — a SMALLER total, which is exactly how a busy
+            # tree reads flat and then `frozen`, the failure `_sum_subtree`'s docstring forbids.
+            # Encoding it also orphans its own descendants, which hang off a pid nobody visits.
+            # The `ps` arm below already does the right thing for this same shape (`return None`
+            # on `len(parts) < 3`); this arm now matches it instead of being the one path that
+            # turns an unread member into a missing one.
+            return None
         out[int(name)] = (ppid, (utime + stime) * 100 // _CLK_TCK)
     return out or None
 

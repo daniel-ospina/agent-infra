@@ -812,8 +812,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 50 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (69)
+python3 tools/fleet/liveness.test.py               # 51 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (70)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
@@ -1818,11 +1818,17 @@ hand the token over and have a previous dispatch's outcome published on the surf
 fleet reader's home. A row whose `verdict_pid` does not resolve inside the queried tree is dropped to
 `no-verdict` exactly as in `gather_log_lane`.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (50 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (69 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (51 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (70 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
-`--log-census` decoder). Their paired mutations re-introduce the exact pre-fix behaviours — the
+`--log-census` decoder); T43–T44 are its BINDING (an appended log line left by an EARLIER dispatch is
+not this lane's, and a stale `--verdict-file` cannot outrank a fresh one); T45–T46 are the drop-reason
+and `--log-census` binding rules; T47–T49 are broken readings and fact-naming (a SHRINKING log is not
+`no-output`, the census survives the `?` it prints itself, and an abstention names the FACT rather than
+only its class); T50 is the abstention-masking refusal; and T51 is the `/proc` reader's own ABSTENTION
+— a malformed row abstains the whole read rather than being re-parented to `0` (its `ps` twin is T39).
+Their paired mutations re-introduce the exact pre-fix behaviours — the
 dropped progress veto, the exited process falling into the freeze ladder, the missing window, the
 absent log as a death witness, the log axis masking a session query, every bound verdict reading
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped
