@@ -1648,6 +1648,112 @@ Cross-references: plan `docs/plans/2026-08-27-issue-347-m4-worktree-freeze.md`
 §5a (the residual tier), issue #351 (this decision), #347 / PR #348 (the
 review rounds that surfaced the family).
 
+## Remote-context boundaries — a cell command is not a hub command (#3444)
+
+**A command whose execution target is another box is not gated against THIS
+hub.** `cmux vm exec <vm> -- <cmd>`, `ssh <host> -- <cmd>` and
+`docker exec <container> -- <cmd>` hand their trailing argv to a remote shell:
+the relative paths in it are THAT box's paths (resolved against THAT box's cwd)
+and the checkout they move is THAT box's checkout. Every local gate that
+resolves a path against this session's cwd, or reads this hub's state, was
+answering a question nobody asked.
+
+This is the guard's own principle one level up from the payload exemption it
+already states ("file / module / stdin payloads are NOT content-gated here"):
+a command whose TARGET is remote is not gated against the local hub, whatever
+its payload shape.
+
+**Measured 2026-11-04 (issue #3444).** ALL cell dispatch was refused from any
+hub-rooted session — ~87 idle lanes across four running cells, blocked for
+hours; the only thing that worked was spelling the ABSOLUTE remote path, found
+by trial. Four refusals:
+
+| # | Refusal | Why it was wrong |
+|---|---|---|
+| 1 | `#1919`: `cmux vm exec <vm> -- bash -c 'git worktree add .worktrees/x b'` | The RELATIVE path was resolved against the local cwd, and the message named the LOCAL path. It runs on a cell. |
+| 2 | `#1484`: `cmux vm exec <vm> -- git checkout -b x` | Gated as though it moved this hub's HEAD. It moves the cell's. |
+| 3 | `#1144`: `cd /x && cmux vm exec <vm> -- git pull` | A remote `pull` inside a compound was read as a local sync. |
+| 4 | payload → remote shell | A heredoc body fed to a REMOTE shell was gated against the local hub. |
+
+**The mechanism.** `classify-git.mjs:stripRemoteContexts` rewrites every
+remote-context segment to `true`; `index.ts` computes it ONCE per bash call and
+every command-text gate consumes the result (M4 hub-state, the script backdoor,
+#1919 nested worktree, #437/#618 tracked writes, M5 discards, the degradation
+classifier and the full invocation walk).
+
+**What is NOT exempt — the boundary is a SEGMENT, never the command:**
+
+| Shape | Behaviour | Why |
+|---|---|---|
+| `cmux vm exec c -- ls ; git reset --hard` | the `reset` is **still blocked** | the later segment runs HERE |
+| `git reset --hard \| cmux vm exec c -- cat` | the `reset` is **still blocked** | the upstream segment runs HERE |
+| `cmux vm exec c -- bash -c "$(git reset --hard)"` | **not exempt** — gated as today | `$( … )` is evaluated by the LOCAL shell BEFORE the dispatch |
+| ``cmux vm exec c -- bash -c "`git reset`"`` / `<( … )` / `>( … )` | **not exempt** | same reason |
+| `cmux vm exec c -- ls > <hub-tracked-file>` | **still blocked** | the redirection is performed HERE — the tracked-write gate reads it |
+| an UNQUOTED heredoc body (`<<EOS` with `$(…)`) | **not exempt** | the local shell expands it before delivery |
+| `cmux vm exec c -- bash <<'EOS' … EOS` | allowed | the quoted body is the REMOTE shell's stdin — blanked, while the operator and delimiter stay so the rewrite remains valid shell |
+| a heredoc delimiter whose VALUE cannot be computed (`<<$'EOS'`, `<<$"EOS"`) | **not exempt** | the delimiter is the word after quote removal; `$'…'`/`$"…"` add ANSI-C / locale translation, and a delimiter computed differently from bash's moves the "terminator" and blanks a LOCAL command that bash really runs (#3444 review cycle 2, measured) |
+| an unterminated heredoc | **not exempt** | its extent is unprovable, so what follows may or may not be body |
+| `ssh() { … }` / `function ssh` / `alias ssh=…` before a dispatch | **not exempt** | a name resolves LOCALLY once it is defined — the segment would run here while being called remote (#3444 review cycle 1) |
+| `eval '…'` / `source <file>` / `. <file>` before a dispatch | **not exempt** | a definition built from text no scan can read (#3444 review cycle 2: `eval 'ssh() { eval "${@:3}"; }'; ssh cell-a -- git reset --hard` ran the reset HERE) |
+| `./ssh`, `/usr/local/bin/cmux` (a path-qualified head) | **not exempt** | a local file that merely looks like the transport |
+| an ANSI-C word (`$'\''`) anywhere in the segment | **parsed, never mis-quoted** | `\` ESCAPES inside `$'…'`, so a plain single-quote scan closed the quote at `\'` and INVERTED the state — every later `;`/`>` read as "inside a string" and the whole command collapsed into ONE remote segment (#3444 review cycle 3, measured: a LOCAL reset and a LOCAL tracked-file write were both laundered) |
+| `PATH=…:$PATH ssh …` (a leading resolution variable) | **not exempt** | the bare word `ssh` no longer resolves to the transport — it runs a LOCAL shim that executes the same argv HERE (#3444 review cycle 3) |
+| `ssh -o ProxyCommand=…` / `-o LocalCommand=…` / `-o PermitLocalCommand=yes` | **not exempt** | the LOCAL ssh runs that command before/around the dispatch (#3444 review cycle 3, measured) |
+| `ssh -F <config>` / `-E <log>` | **not exempt** | a local file whose content (a `LocalCommand`/`ProxyCommand`) or write the scan cannot prove |
+| `ssh -o BatchMode=yes` / `FOO=1 cmux …` | allowed | the cycle-3 rejections are SCOPED: only the resolution variables and ssh's local-execution/local-file flags |
+
+**The separator is REQUIRED.** `ssh host git …` (no `--`) is NOT recognised:
+the boundary must be explicit to be provable. Likewise `ssh -- git …` (no host
+operand), `docker exec -- c …` / `cmux vm exec -- v …` (the `--` belongs to the
+transport's own flag parsing and proves no remote target), and a dynamic head
+(`$CM vm exec …`) all keep today's gating. Fail-closed by construction: what
+the stripper cannot prove stays in the text and is gated exactly as before.
+
+**Declared residuals** — every one is a FALSE BLOCK (fail-closed), never an
+exemption. (a) A LOCAL script FILE whose *content* dispatches to a cell (the
+guard reads that file as script content, a separate text the strip does not
+rewrite) stays gated. (b) The transports are exactly the three above; a fourth
+dispatcher is not recognised until it is added with a pin. (c) A WRAPPER in
+front of the transport (`sudo`/`env`/`time`/`nohup cmux …`) is not recognised:
+only leading shell assignments (`FOO=1 cmux …`) are skipped. (d) A transport
+inside a subshell/group (`( cmux … )`, `{ cmux …; }`) is not recognised — the
+segment's first word is `(`/`{`. (e) A PATH-QUALIFIED transport
+(`/usr/bin/ssh host -- …`) is not recognised: only the bare command word is
+provable. (f) A remote heredoc with a `$'…'`/`$"…"` delimiter stays gated. (g) A
+command that uses `eval`/`source`/`.` anywhere BEFORE a dispatch, or defines a
+transport-named function/alias, keeps the whole command gated — a name that can
+be redefined is a name that can resolve locally. (h) A leading command-RESOLUTION
+assignment (`PATH=… ssh …`) and ssh's own local-execution/local-file argv
+(`-o ProxyCommand|LocalCommand|PermitLocalCommand`, `-F`, `-E`) keep the segment
+gated: the transport word is no longer provable (#3444 review cycle 3).
+
+**A limitation of the premise, stated rather than implied.** The exemption
+assumes the transport really leaves this box. `ssh localhost -- …` and
+`docker exec <container> -- …` do NOT: a local sshd or a container with the hub
+bind-mounted runs the payload against THIS filesystem. The guard cannot decide
+that from the command text (it does not read the user's ssh config, the
+dangerous-looking but common case — `ssh localhost` in a test fixture — must not
+be blocked wholesale), so these stay ALLOWED by design: a `docker exec` is a
+namespace boundary and the issue names it as one. What protects the hub is that
+neither reaches it without a mount/sshd the operator created.
+
+**Tests:** `test-remote-context.mjs` — Part A pins the boundary itself, Part B
+drives the REAL `tool_call` handler against a hermetic MAIN hub and asserts
+ALLOW-for-remote / REFUSE-for-local for each measured case plus the
+anti-laundering controls above, and (its own CI step) `--mutations` reverts the
+fix in three independent ways and requires the paired pins to go RED:
+
+| mutant | what it reverts | which pins must fail |
+|---|---|---|
+| M1 | the RECOGNISER (`stripRemoteContexts` → identity) | A1–A6, and the classifier's verdict on the surviving text |
+| M2 | the CALL SITE (the handler's strip → identity, in a temp copy of `index.ts`) | the four measured field cases, at the real handler |
+| M3 | the strip's PROOF (delimiter value, `$'…'` bail, unprovable-heredoc bail, redefinition bail, bare-word head) | B15–B21, B24, B25 — the fail-open shapes both review cycles found |
+| M4 | the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the resolution-variable prefix refusal, ssh's local-execution argv refusal) | B27–B30 — a LOCAL reset/write read as remote, a PATH-shimmed transport, `ssh -o ProxyCommand` |
+
+M1/M2 cannot redden the fail-open pins (`identity` is *stricter*); M3 and M4
+exist so a guard that keeps local text gateable has mutation evidence too.
+
 ## Environment variables
 
 | Variable | Purpose | Required for |

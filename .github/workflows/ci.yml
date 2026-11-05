@@ -1034,6 +1034,36 @@ jobs:
         # before anything reads it.
         # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~5s.
         run: node extensions/main-worktree-guard/test-command-position.mjs
+      - name: main-worktree-guard REMOTE-CONTEXT boundaries (#3444)
+        # The path/hub guards resolved REMOTE cell commands against the LOCAL hub,
+        # so ALL cell dispatch was refused from any hub-rooted session: a remote
+        # `git worktree add` refused by #1919 with the LOCAL path in the message, a
+        # remote branch switch by #1484, a remote `pull` inside a compound by #1144,
+        # a payload fed to a remote shell by the same arm. ~87 idle lanes across
+        # four cells, blocked for hours (measured 2026-11-04).
+        # Part A pins the boundary predicate; Part B drives the REAL index.ts
+        # tool_call handler against a hermetic MAIN hub and asserts
+        # ALLOW-for-remote / REFUSE-for-local for each measured case, plus the
+        # anti-laundering controls that keep the fix from becoming a bypass (a
+        # later `;`/`&&`/`|` segment, a local redirection into a tracked hub file,
+        # and any remote portion carrying a shell substitution all stay gated).
+        # Zero-dep (`node:*` + the `git` binary), no `npm ci`, ~8s. Its OWN step,
+        # like #709/#744/#1484 above — the `extensions/*/test*.mjs` glob in
+        # ci-main.yml runs on the push lane only, never on a PR.
+        run: node extensions/main-worktree-guard/test-remote-context.mjs
+      - name: main-worktree-guard remote-context MUTATION evidence (#3444)
+        # A pin that cannot go RED is not a pin. `--mutations` reverts the fix in
+        # FOUR independent places — the RECOGNISER (`stripRemoteContexts` →
+        # identity), the CALL SITE (the handler's strip call → identity into a TEMP
+        # copy of index.ts), the strip's PROOF (heredoc-delimiter value, the
+        # unprovable/unterminated bail, the transport-redefinition bail, the
+        # bare-word head rule) and the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the
+        # command-resolution variable prefix, ssh's local-execution argv) — and
+        # requires every paired pin to FAIL: the pure ones go blind, and the REAL
+        # handler refuses the four remote field cases again while the fail-open
+        # shapes are ALLOWED again. Its own step so neither verdict can suppress
+        # the other.
+        run: node extensions/main-worktree-guard/test-remote-context.mjs --mutations
       - name: main-worktree-guard nested-worktree hub gate (#1919)
         # `git worktree add 8779-optA` (a RELATIVE path) puts a registered
         # worktree INSIDE the repo root; git reports it as an untracked

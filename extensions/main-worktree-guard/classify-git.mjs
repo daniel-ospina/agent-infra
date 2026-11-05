@@ -3284,6 +3284,482 @@ export function joinContinuations(command) {
 }
 
 /**
+ * Unquote ONE shell word for comparison (`"--"` → `--`, `'vm'` → `vm`).
+ * Deliberately minimal: this is a COMPARISON view for the remote-context
+ * recogniser below, never a word fed to a path resolver.
+ * @param {string} tok
+ * @returns {string}
+ */
+function _wtUnquoteWord(tok) {
+  let s = String(tok ?? "");
+  if (s.length >= 2) {
+    const a = s[0], b = s[s.length - 1];
+    if ((a === "'" && b === "'") || (a === '"' && b === '"')) s = s.slice(1, -1);
+  }
+  return s;
+}
+
+/** A word whose VALUE is not statically known (`$VAR`, backtick, `$(…)`). */
+function _wtWordIsDynamic(tok) {
+  const raw = String(tok ?? "");
+  return /[$`]/.test(raw);
+}
+
+/**
+ * Skip a paren-balanced span that starts AT the `(` of `$( … )` / `<( … )` /
+ * `>( … )`, returning the index just past its closing paren (or `text.length`
+ * when unbalanced). Quote-aware; nested parens are counted.
+ * @param {string} text
+ * @param {number} openIdx index of the `(`
+ * @returns {number}
+ */
+function _wtSkipBalanced(text, openIdx) {
+  let depth = 0;
+  let quote = null;
+  for (let i = openIdx; i < text.length; i++) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') { i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { i++; continue; }
+    // #3444 review P0: `$'…'` is ANSI-C quoting — `\` ESCAPES INSIDE it, so a plain
+    // single-quote scan closes the quote at `\'` and inverts the state for the
+    // rest of the span.
+    if (ch === "$" && text[i + 1] === "'") {
+      i += 2;
+      while (i < text.length) {
+        if (text[i] === "\\") { i += 2; continue; }
+        if (text[i] === "'") break;
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"' || ch === "`") { quote = ch; continue; }
+    if (ch === "(") { depth++; continue; }
+    if (ch === ")") { depth--; if (depth <= 0) return i + 1; continue; }
+  }
+  return text.length;
+}
+
+/**
+ * The VALUE bash derives a heredoc delimiter from: real quote REMOVAL, not just
+ * symmetric outer-quote stripping. `<<'EOS'`, `<<\EOS`, `<<E"O"S` and `<<EOS`
+ * are ALL the delimiter `EOS` in bash — a recogniser that keeps the spelling
+ * never matches the terminator, so its "body" runs to end of input and every
+ * LOCAL command after the real terminator disappears from the text the gates
+ * read (a #3444-review P0 fail-open: `cmux vm exec c -- bash <<\EOS … EOS`
+ * followed by a local `git reset --hard` was ALLOWED).
+ * `$'\u2026'` / `$"\u2026"` are NOT modelled (`$'E\\tOS'` would need bash's ANSI-C
+ * escape expansion and `$"\u2026"` its locale translation) — those return `null`, and the
+ * caller refuses to strip that segment (fail closed). Computing a delimiter that
+ * differs from bash's is the SAME fail-open one line up.
+ * @param {string} raw
+ * @returns {string|null} the delimiter bash will compare against, or null when unprovable
+ */
+function _wtDelimiterValue(raw) {
+  let out = "";
+  const s = String(raw ?? "");
+  if (/\$['"]/.test(s)) return null;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\\") { out += s[i + 1] ?? ""; i++; continue; }
+    if (ch === "'") {
+      // Single quotes: everything up to the closing quote is literal.
+      i++;
+      while (i < s.length && s[i] !== "'") { out += s[i]; i++; }
+      continue;
+    }
+    if (ch === '"') {
+      // Double quotes: `\` still escapes `"`, `\\`, `$` and a backtick.
+      i++;
+      while (i < s.length && s[i] !== '"') {
+        if (s[i] === "\\" && '"\\$`'.includes(s[i + 1] ?? "")) { out += s[i + 1]; i += 2; continue; }
+        out += s[i]; i++;
+      }
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+
+/**
+ * The heredoc body that starts at `from`: its text and the index after its
+ * terminator line. `dash` honours `<<-` (leading TABS are stripped before the
+ * delimiter comparison). `terminated` is FALSE when the terminator never
+ * appears — the caller must then treat the body as UNPROVABLE (fail closed)
+ * rather than assume it runs to end of input.
+ * @param {string} text
+ * @param {number} from
+ * @param {{delim: string, dash: boolean}} hd
+ * @returns {{bodyStart: number, bodyText: string, next: number, terminated: boolean}}
+ */
+function _wtHeredocBody(text, from, hd) {
+  const n = text.length;
+  let i = from;
+  while (i <= n) {
+    let lineEnd = text.indexOf("\n", i);
+    if (lineEnd === -1) lineEnd = n;
+    let line = text.slice(i, lineEnd);
+    if (hd.dash) line = line.replace(/^\t+/, "");
+    const isTerminator = line === hd.delim;
+    const next = lineEnd >= n ? n : lineEnd + 1;
+    if (isTerminator) return { bodyStart: from, bodyText: text.slice(from, i), next, terminated: true };
+    if (lineEnd >= n) return { bodyStart: from, bodyText: text.slice(from, n), next: n, terminated: false };
+    i = next;
+  }
+  return { bodyStart: from, bodyText: text.slice(from, n), next: n, terminated: false };
+}
+
+/**
+ * #3444: split a command string into TOP-LEVEL shell segments, recording for
+ * each one where its command portion ends (the first top-level redirection),
+ * where the segment ends (including heredoc bodies), and the heredoc body spans
+ * inside it.
+ *
+ * Quote-aware (`'`/`"`/backtick), escape-aware, and it does NOT split inside
+ * `$( … )` / `<( … )` / `>( … )` spans or inside heredoc bodies — a separator
+ * in any of those is data or a nested command, never a segment boundary of
+ * THIS shell.
+ *
+ * @param {string} text
+ * @returns {Array<{start:number,end:number,commandEnd:number,bodies:Array<{start:number,text:string}>}>}
+ */
+function _wtSegments(text) {
+  const n = String(text ?? "").length;
+  const segs = [];
+  let start = 0;
+  let redirectAt = -1;
+  let heredocs = [];
+  let quote = null;
+  let i = 0;
+
+  let pendingHeredocs = [];
+  const finish = (end, bodies) => {
+    segs.push({
+      start,
+      end,
+      commandEnd: redirectAt < 0 ? Math.min(end, n) : redirectAt,
+      bodies: bodies ?? [],
+      // A delimiter we cannot prove (a `$'\u2026'`/`$"\u2026"` form) or a terminator that
+      // never arrived makes the segment's EXTENT unprovable, so nothing in it may
+      // be exempted.
+      unprovable: pendingHeredocs.some((hd) => !hd.provable),
+    });
+    pendingHeredocs = [];
+    heredocs = [];
+    redirectAt = -1;
+  };
+
+  while (i < n) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\" && quote === '"') { i += 2; continue; }
+      if (ch === quote) quote = null;
+      i++;
+      continue;
+    }
+    if (ch === "\\") { i += 2; continue; }
+    // #3444 review P0: `$'…'` (ANSI-C quoting) — `\` ESCAPES inside it, so a plain
+    // single-quote scan closed the quote at `\'` and INVERTED the state for the
+    // rest of the line: every later `;`/`>` then read as "inside a string" and the
+    // whole command collapsed into ONE remote segment. Measured against the real
+    // handler: `cmux vm exec cell-a -- bash $'\'' ; git reset --hard` stripped to
+    // `true`, so a LOCAL reset was laundered as remote, and
+    // `… ls $'\'' > tracked.txt` hid a LOCAL tracked-file write from #437/#618.
+    if (ch === "$" && text[i + 1] === "'") {
+      i += 2;
+      while (i < n) {
+        if (text[i] === "\\") { i += 2; continue; }
+        if (text[i] === "'") { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') { quote = ch; i++; continue; }
+    if (ch === "`") {
+      i++;
+      while (i < n && text[i] !== "`") { if (text[i] === "\\") i++; i++; }
+      i++;
+      continue;
+    }
+    if (ch === "$" && text[i + 1] === "(") { i = _wtSkipBalanced(text, i + 1); continue; }
+    if ((ch === "<" || ch === ">") && text[i + 1] === "(") { i = _wtSkipBalanced(text, i + 1); continue; }
+    // Heredoc (`<<`, `<<-`) — NOT the here-string `<<<`, which is a plain word.
+    if (ch === "<" && text[i + 1] === "<" && text[i + 2] !== "<") {
+      const dash = text[i + 2] === "-";
+      if (redirectAt < 0) redirectAt = i;
+      let j = i + (dash ? 3 : 2);
+      while (j < n && (text[j] === " " || text[j] === "\t")) j++;
+      let raw = "";
+      while (j < n && !/[\s;|&<>()]/.test(text[j])) { raw += text[j]; j++; }
+      const delim = _wtDelimiterValue(raw);
+      heredocs.push({ delim, dash, provable: delim !== null });
+      i = j;
+      continue;
+    }
+    if (ch === "<") {
+      if (redirectAt < 0) redirectAt = i;
+      // `<<<` here-string, `<>`, `<&`: consume the operator only.
+      i++;
+      if (text[i] === "<") i++;
+      if (text[i] === "<") i++;
+      if (text[i] === ">" || text[i] === "&") i++;
+      continue;
+    }
+    if (ch === ">") {
+      if (redirectAt < 0) redirectAt = i;
+      i++;
+      if (text[i] === ">") i++;
+      if (text[i] === "&") i++;
+      if (text[i] === ">") i++;
+      continue;
+    }
+    if (ch === "&" && text[i + 1] === ">") {
+      if (redirectAt < 0) redirectAt = i;
+      i += 2;
+      if (text[i] === ">") i++;
+      continue;
+    }
+    if (ch === "\n") {
+      // The command line ends here; any pending heredoc BODIES follow it and
+      // belong to THIS segment (they are the command's stdin, never segments).
+      const bodies = [];
+      let cursor = i + 1;
+      const hadHeredocs = heredocs.length > 0;
+      pendingHeredocs = heredocs;
+      for (const hd of heredocs) {
+        const body = _wtHeredocBody(text, cursor, hd);
+        bodies.push({ start: body.bodyStart, text: body.bodyText, terminated: body.terminated });
+        cursor = body.next;
+      }
+      const end = hadHeredocs ? cursor : i;
+      finish(end, bodies);
+      start = hadHeredocs ? end : i + 1;
+      i = start;
+      continue;
+    }
+    if (ch === ";" || ch === "&" || ch === "|") {
+      const len = (text[i + 1] === ch && (ch === "&" || ch === "|")) || (ch === ";" && text[i + 1] === ";") ? 2 : 1;
+      finish(i, []);
+      start = i + len;
+      i = i + len;
+      continue;
+    }
+    i++;
+  }
+  finish(n, []);
+  return segs;
+}
+
+/**
+ * #3444: where the REMOTE payload begins in a segment's token list, or -1 when
+ * the segment does not dispatch to a remote box.
+ *
+ * Recognised (the `--` separator is REQUIRED — the boundary must be explicit to
+ * be provable):
+ *   `cmux vm exec [flags] <vm> -- <cmd…>`
+ *   `ssh [flags] <host> -- <cmd…>`
+ *   `docker exec [flags] <container> -- <cmd…>`
+ *
+ * Rejected (fail closed, today's gating stays): a dynamic head (`$CM`, backtick),
+ * and any `--` that arrives BEFORE an operand (`ssh -- git …`, which addresses no
+ * host, `docker exec -- …` / `cmux vm exec -- …`, where the `--` belongs to the
+ * transport's own flag parsing and does not prove a remote target).
+ * @param {string[]} toks
+ * @returns {number}
+ */
+function _wtRemotePayloadIndex(toks) {
+  let i = 0;
+  // Leading environment assignments do not change the command word — EXCEPT the
+  // ones that change how a BARE word is RESOLVED. `PATH=/tmp/shim:$PATH ssh …`
+  // runs a LOCAL `ssh` shim, which executes the same argv HERE, so the bare-word
+  // proof below no longer holds (#3444 review P1). Fail closed on the resolution
+  // variables; every other assignment stays skippable (`FOO=1 cmux …`).
+  while (i < toks.length) {
+    const w = _wtUnquoteWord(toks[i]);
+    if (!/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) break;
+    if (/^(?:PATH|CDPATH|BASH_ENV|ENV|IFS)$/.test(w.slice(0, w.indexOf("=")))) return -1;
+    i++;
+  }
+  if (i >= toks.length) return -1;
+  if (_wtWordIsDynamic(toks[i])) return -1;
+  const head = basename(_wtUnquoteWord(toks[i]));
+  // ⛔ The transport must be the BARE command word: `ssh`, never `./ssh`,
+  // `../x/ssh` or `/usr/bin/ssh`. A PATH-QUALIFIED token is a LOCAL file that
+  // merely looks like the transport — a hub-resident `./ssh` shim executed its
+  // own argv locally while this recogniser called the segment remote (#3444
+  // review P1). A quoted head (`"ssh"`) is refused for the same reason: the
+  // recogniser must prove the WORD, not a spelling that could resolve
+  // elsewhere. Cost: a path-qualified transport is gated as before (declared
+  // residual, fail-closed).
+  if (toks[i] !== head) return -1;
+  const word = (k) => _wtUnquoteWord(toks[k] ?? "");
+
+  const sepAfter = (from) => {
+    let sawOperand = false;
+    for (let j = from; j < toks.length; j++) {
+      const v = word(j);
+      if (v === "--") return sawOperand ? j : -1;
+      if (!/^-/.test(v) && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(v)) sawOperand = true;
+    }
+    return -1;
+  };
+
+  if (head === "cmux") {
+    if (word(i + 1) !== "vm" || word(i + 2) !== "exec") return -1;
+    return sepAfter(i + 3);
+  }
+  if (head === "docker") {
+    if (word(i + 1) !== "exec") return -1;
+    return sepAfter(i + 2);
+  }
+  if (head === "ssh") {
+    const sep = sepAfter(i + 1);
+    if (sep < 0) return -1;
+    // ⛔ ssh's OWN argv is executed by the LOCAL ssh before/around the dispatch:
+    // `-o ProxyCommand=…` / `-o LocalCommand=…` / `-o PermitLocalCommand=yes`
+    // run a command HERE, and `-F/--config` / `-E/--log-file` read or write
+    // local files whose content this scan cannot prove (#3444 review P1).
+    // Measured against the real handler: `ssh -o ProxyCommand='git reset
+    // --hard' cell-a -- ls` ran the reset in the SESSION cwd and the segment
+    // stripped to `true`. Those flags keep today's gating; a benign
+    // `-o BatchMode=yes` (and every other flag) stays provable.
+    for (let j = i + 1; j < sep; j++) {
+      const raw = word(j);
+      if (/^-F/.test(raw) || raw === "--config") return -1;
+      if (/^-E/.test(raw) || raw === "--log-file") return -1;
+      let opt = null;
+      if (raw === "-o" || raw === "--option") opt = word(j + 1);
+      else if (/^-o./.test(raw)) opt = raw.slice(2);
+      else if (raw.startsWith("--option=")) opt = raw.slice("--option=".length);
+      if (opt !== null &&
+          /^(?:proxycommand|localcommand|permitlocalcommand|match)$/.test(String(opt).toLowerCase().split("=")[0].trim())) return -1;
+    }
+    return sep;
+  }
+  return -1;
+}
+
+/**
+ * #3444 — strip every REMOTE-context segment from a command, leaving only what
+ * the LOCAL shell actually runs.
+ *
+ * WHY. `cmux vm exec <vm> -- <cmd>`, `ssh <host> -- <cmd>` and
+ * `docker exec <c> -- <cmd>` hand their trailing argv to ANOTHER box's shell:
+ * the paths in it are that box's paths and the checkout they move is that box's
+ * checkout. Every local gate that resolves a relative path against THIS
+ * session's cwd (#1919 named `/Users/…/hub/.worktrees/x` for a command that ran
+ * on a cell) or reads THIS hub's state (#1484, #1144) is answering a question
+ * nobody asked. Measured 2026-11-04 (issue #3444): all cell dispatch was
+ * refused from any hub-rooted session — ~87 idle lanes across four cells.
+ *
+ * This is the guard's OWN principle one level up from the payload exemption it
+ * already states (`index.ts`, "File / module / stdin payloads are NOT
+ * content-gated here"): a command whose TARGET is remote is not gated against
+ * the local hub, whatever its payload shape.
+ *
+ * ⛔ WHAT IS NOT EXEMPT — a boundary is a SEGMENT, never the whole command:
+ *   • a later segment (`;` `&&` `||` `|` `&` newline) runs LOCALLY and is kept,
+ *     so `cmux vm exec c -- ls ; git reset --hard` still gates the reset;
+ *   • a segment carrying a command/process SUBSTITUTION (`$(`, backtick, `<(`,
+ *     `>(`) anywhere in its remote portion is NOT stripped — those are
+ *     evaluated by the LOCAL shell before the dispatch, so today's gating
+ *     stays (fail closed);
+ *   • a REDIRECTION after the dispatch is performed by the LOCAL shell and is
+ *     kept verbatim, so `cmux vm exec c -- ls > <hub-tracked-file>` still
+ *     reaches the #437/#618 tracked-write gate. Only a heredoc BODY (that
+ *     command's stdin, delivered to the remote shell) is blanked.
+ *
+ * Best-effort by construction: anything it cannot prove stays in the text, and
+ * an unprovable shape is gated exactly as before.
+ * @param {string} command
+ * @returns {string}
+ */
+/**
+ * Could the command text REDEFINE a transport name — or CONSTRUCT a definition the
+ * text cannot show?
+ *
+ * `ssh() { … }`, `function ssh { … }` and `alias ssh=…` all make the NAME resolve
+ * locally, which turns a "remote" segment into a local execution of the same
+ * argv (#3444 review cycle 1). `eval '…'`, `source file` and the POSIX `.` are
+ * worse: the definition is built from text no scan can read — measured in cycle 2,
+ * `eval 'ssh() { … }'; ssh cell-a -- <verb>` ran the verb HERE while the
+ * recogniser called the segment remote.
+ *
+ * Quoting is not a hiding place: `'`, `"` and `$` are accepted as LEFT BOUNDARY
+ * characters, so a definition inside an `eval` argument matches on its own text.
+ * Over-matching only re-gates (fail closed).
+ * @param {string} text
+ * @returns {boolean}
+ */
+function _wtMayRedefineTransport(text) {
+  const s = String(text ?? "");
+  if (!s) return false;
+  return /(?:^|[;&|(){}\s'"$])(?:function\s+)?(?:cmux|ssh|docker)\s*\(\s*\)/.test(s) ||
+    /\bfunction\s+(?:cmux|ssh|docker)\b/.test(s) ||
+    /\balias\s+(?:-[A-Za-z]+\s+)*(?:cmux|ssh|docker)\s*=/.test(s) ||
+    /(?:^|[;&|(){}\s])(?:eval|source)\s/.test(s) ||
+    /(?:^|[;&|])\s*\.\s+\S/.test(s);
+}
+
+export function stripRemoteContexts(command) {
+  const text = String(command ?? "");
+  // Cheap, SOUND pre-filter: a boundary segment must name its transport, and
+  // that name can only appear in the text. Skipping the scan here can never
+  // hide a boundary; it only avoids the parse on the overwhelming majority of
+  // commands.
+  if (!/\b(?:cmux|ssh|docker)\b/.test(text)) return text;
+
+  let out = "";
+  let cursor = 0;
+  for (const seg of _wtSegments(text)) {
+    if (seg.end <= seg.start || seg.start < cursor) continue;
+    // ⛔ NOTHING may have been able to REDEFINE the transport name before this
+    // segment. The head is a NAME, and a name resolves locally when an earlier
+    // segment defines it — `ssh() { … }; ssh c -- …` (#3444 review cycle 1) — or when
+    // it is constructed through `eval`/`source`/`.`, which no text scan can prove
+    // (#3444 review cycle 2). Anything in the PRECEDING text that could do any of
+    // those makes the command unprovable: keep today's gating. (Only the text
+    // BEFORE this segment matters — bash executes in order, so a later definition
+    // cannot affect this dispatch.)
+    if (_wtMayRedefineTransport(text.slice(0, seg.start))) continue;
+    // An UNPROVABLE heredoc makes the segment's EXTENT unprovable: either the
+    // delimiter is a form we cannot compute, or the terminator never arrived, so
+    // what follows may or may not be body. Fail closed — leave the text alone
+    // (the #3444-review P0 shape was a delimiter spelling the recogniser did not
+    // match, which swallowed a LOCAL command that was NOT part of the body).
+    if (seg.unprovable || seg.bodies.some((b) => !b.terminated)) continue;
+    const payloadIdx = _wtRemotePayloadIndex(wtShellWords(text.slice(seg.start, seg.commandEnd)));
+    if (payloadIdx < 0) continue;
+    // The remote portion AND its heredoc bodies must be substitution-free: a
+    // `$( … )` there is executed by the LOCAL shell before the dispatch.
+    let region = text.slice(seg.start, seg.commandEnd);
+    for (const b of seg.bodies) region += "\n" + b.text;
+    if (/\$\(|`|<\s*\(|>\s*\(/.test(region)) continue;
+
+    out += text.slice(cursor, seg.start);
+    // Keep the segment's own surrounding whitespace so the rewrite stays a
+    // faithful, readable command (`a &&  b` → `a && true`, never `a &&true`).
+    const cmdRaw = text.slice(seg.start, seg.commandEnd);
+    out += (cmdRaw.match(/^\s*/) || [""])[0] + "true" + (cmdRaw.match(/\s*$/) || [""])[0];
+    let p = seg.commandEnd;
+    for (const b of seg.bodies) {
+      if (b.start < p) continue;
+      out += text.slice(p, b.start);
+      out += b.text.replace(/[^\n]/g, " ");          // remote stdin — blank it
+      p = b.start + b.text.length;
+    }
+    out += text.slice(p, seg.end);                   // local redirections stay
+    cursor = seg.end;
+  }
+  if (cursor === 0) return text;
+  return out + text.slice(cursor);
+}
+
+/**
  * True when the pipeline's LAST segment runs an interpreter, using the same
  * head analysis as the heredoc walker — spawners, flags and redirections are
  * accepted (`… | env bash`, `… | bash -x`, `… | sh -s`, `… | 2>/dev/null bash`),

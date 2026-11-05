@@ -87,6 +87,17 @@
 //     misread a main checkout under a `worktrees/` directory as a linked
 //     worktree). Env hatch + TTL marker bypass the clean-hub write gate; M4's
 //     disordered-hub freeze stays active under the marker.
+//  8. (#3444) REMOTE-CONTEXT BOUNDARIES: a command whose execution target is
+//     another box (`cmux vm exec <vm> -- …`, `ssh <host> -- …`,
+//     `docker exec <c> -- …`) is not a command against THIS hub — its relative
+//     paths belong to that box and its checkout is that box's. ONE
+//     `stripRemoteContexts` per bash call replaces every remote SEGMENT with
+//     `true`, and every command-text gate below consumes the result, so no
+//     local gate answers about another box's paths and refs. The boundary is a
+//     segment, never the command: a later `;`/`&&`/`|` segment, a local
+//     redirection, and any remote portion carrying a shell substitution (all
+//     evaluated HERE before the dispatch) keep today's gating
+//     (`classify-git.mjs:stripRemoteContexts` documents the full list).
 //
 // Worktrees are ISOLATED — none of this applies inside a worktree. The only
 // escape hatches are AGENT_ALLOW_MAIN_EDITS=1 (or ELDATO_ALLOW_MAIN_EDITS=1,
@@ -190,6 +201,16 @@ let nestedWorktreeTargetViolation: (command: string, sessionCwd?: string) => str
 // (an inert stripper means the gate inspects the raw text, i.e. today's
 // behaviour, never a blind spot).
 let stripHeredocData: (text: string, codeBodies?: unknown[] | null) => string = (t) => t;
+// #3444: REMOTE-CONTEXT BOUNDARIES. A command whose execution target is another
+// box (`cmux vm exec <vm> -- …`, `ssh <host> -- …`, `docker exec <c> -- …`) is
+// not a command against the LOCAL hub: its relative paths belong to that box and
+// its checkout is that box's. Every local gate below (path resolution, hub
+// state, the discard effect gate, the destructive classifier) therefore reads
+// the LOCAL portion of the command, computed once per bash call.
+// Fail-safe default: IDENTITY — a stale/short classify-git leaves today's
+// all-local gating, which is the fail-CLOSED direction (never a silent
+// relaxation of every gate at once).
+let stripRemoteContexts: (command: string) => string = (c) => c;
 // #618/#621: TARGET-aware checkout classification (the shared mechanism both
 // hub-write issues consume). Fail-safe defaults: inert (null/[]) so a failed
 // import NEVER false-blocks — the write gates degrade to today's behavior.
@@ -340,6 +361,11 @@ try {
   if (typeof _m5.stripHeredocData === "function") {
     stripHeredocData = _m5.stripHeredocData;
   }
+  // #3444: remote-context boundaries. Namespace read + typeof guard, same
+  // skew contract as #709/#1919 above — the destructuring target list is pinned
+  // by test-module-load.mjs Part A. A missing export leaves the identity, so a
+  // stale module keeps TODAY's gating rather than relaxing it.
+  if (typeof _m5.stripRemoteContexts === "function") stripRemoteContexts = _m5.stripRemoteContexts;
   hubNewFileVolumeVerdict = _hubNewFileVolumeVerdict;
   HUB_NEW_FILE_WARN_BUDGET = _HUB_NEW_FILE_WARN_BUDGET;
   HUB_NEW_FILE_BLOCK_CAP = _HUB_NEW_FILE_BLOCK_CAP;
@@ -4992,6 +5018,21 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
+    // ── #3444: the command the LOCAL shell actually runs ──
+    // ONE strip per bash call, resolved here and consumed by every command-text
+    // gate below (M4 hub-state, script backdoor, #1919 nested worktree, #437/#618
+    // tracked write, M5 discard, the degradation classifier and the full
+    // invocation walk). A remote-context segment (`cmux vm exec <vm> -- …`,
+    // `ssh <host> -- …`, `docker exec <c> -- …`) is replaced by `true`, so every
+    // LOCAL gate stops answering about another box's paths and refs — while the
+    // segments that DO run here are gated exactly as before (the boundary is a
+    // segment, never the whole command; `classify-git.mjs:stripRemoteContexts`
+    // documents what is deliberately NOT exempt: later segments, local
+    // redirections, and anything carrying a shell substitution).
+    const bashCommand = isBash
+      ? stripRemoteContexts((event.input as { command?: string }).command ?? "")
+      : "";
+
     // ── M4: hub-state gate + script-backdoor closure (#1484) ──
     // Runs BEFORE the marker/flag bypass: M4 stays ACTIVE under the TTL marker
     // (D3 — a stranded lane recovers with the marker but cannot resume feature
@@ -4999,7 +5040,7 @@ export default function (pi: ExtensionAPI) {
     // worktree sessions stay exempt — agent-infra is NOT exempt (#615).
     if (!_isAllowMainEdits()) {
       if (isBash) {
-        const command = (event.input as { command?: string }).command ?? "";
+        const command = bashCommand;
         // #347: execution-cwd-aware backdoor (script path + content gating
         // resolve against the command's cd-target, not the session cwd).
         const execCwd = commandExecutionCwd(command, process.cwd()) ?? undefined;
@@ -5187,7 +5228,7 @@ export default function (pi: ExtensionAPI) {
     // `touch … && git …` is not a marker command (single-command contract)
     // and stays git-classified first.
     if (isBash) {
-      const command = (event.input as { command?: string }).command ?? "";
+      const command = bashCommand;
       if (isAllowMarkerCommand(command, homedir())) {
         _stampMarker(_markerPath(), _currentSessionId(_ctx), extractMarkerReason(command));
         return undefined;
@@ -5218,7 +5259,7 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
     if (isBash) {
-      const command = (event.input as { command?: string }).command ?? "";
+      const command = bashCommand;
       // ── M5 (#709): effect-keyed working-tree-discard gate ──
       // Runs BEFORE the degradation/full classifier arms and BEFORE the
       // worktree exemptions below, so a discard is caught whether or not
