@@ -1081,6 +1081,12 @@ def test_a_fix_in_another_repo_is_a_landing_path_not_a_gap(monkeypatch, no_cache
         other_open=[pr(3368, ref="fix/10114-pin-tree-is-a-holder",
                         title="fix(reaper): the harness PIN TREE is a holder, not residue (#10114)"),
                     pr(3333, title="batch(#3309 #10114 #3243): one integration branch")])
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
 
     out = bp.compute()
     assert out is not None
@@ -1229,6 +1235,12 @@ def test_the_merged_fix_repo_window_alone_covers_a_landed_fix(monkeypatch, no_ca
         other_open=[],
         other_merged=[pr(3368, merged=MERGED_TODAY, ref="fix/10114-pin-tree-is-a-holder",
                           title="fix(reaper): the harness PIN TREE is a holder (#10114)")])
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
 
     out = bp.compute()
     assert out is not None
@@ -1278,6 +1290,12 @@ def test_a_fix_repo_row_citing_its_own_number_still_covers_it_pins_the_disclosed
         return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": (2513,)}[label])
 
     monkeypatch.setattr(bp, "gh", fake_gh)
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
     out = bp.compute()
     assert out is not None
     assert out["p1"] == {"open": 1, "with_pr": 1, "without": 0}, (
@@ -1318,6 +1336,12 @@ def test_a_fix_repo_listed_twice_is_read_once(monkeypatch, no_cache):
 
     monkeypatch.setattr(bp, "gh", fake_gh)
     monkeypatch.setattr(bp, "FIX_REPOS", (bp.REPO, other, other))
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
 
     assert bp.compute() is not None
     reads = [a for a in calls
@@ -1473,6 +1497,12 @@ def test_a_number_that_is_only_a_PREFIX_of_a_fix_repo_citation_is_not_covered(mo
 
     monkeypatch.setattr(bp, "gh", fake_gh)
     assert other in bp.FIX_REPOS
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
 
     out = bp.compute()
     assert out is not None
