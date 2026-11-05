@@ -1252,7 +1252,8 @@ REV_STARTED=1
 # were exact when written, and the round-8 review then found that round 7 had shipped four stale line
 # references by inserting two lines above them. A reference that has to be re-counted is a reference
 # that will rot, so the anchors here are the code text and the paragraph above.
-# ⛔ CORRECTION (review round 7, P2 — re-verified against claims.sh:1151 and merge-one.sh:364): this
+# ⛔ CORRECTION (review round 7, P2 — re-verified against the clamp test and the `CLAIM_LEASE`
+# assignment, both anchored by code text above): this
 # block used to read `CLAIM_TTL_MAX - 1200` = **6000** s, and to conclude that the 7200 s backstop
 # "would produce a 7200 s reviewer holding a claim that expires at 6000". That arithmetic is from when
 # `CLAIM_TTL_MAX` was 7200; #2999 raised it to 9600, so the threshold is 8400 at the default gate wait

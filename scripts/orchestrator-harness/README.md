@@ -3776,8 +3776,8 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(18000s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive,
-and to 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
+(18000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
+outlive, and 14400s -> 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
 #2999) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
 `CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
 `CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
@@ -3787,11 +3787,11 @@ for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLA
 never wrong.)*
 Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
-stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one, `_gw` the gate wait; 8400 s at
-the defaults) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one): raising either timeout past
-`CLAIM_TTL_MAX - (_gw + 300)` (the reviewer) or `CLAIM_TTL_MAX - 1200` (the fixer) requires raising
-`CLAIM_TTL_MAX` in the same change, or the claim is clamped below the term the worker asked for — and
-past `CLAIM_TTL_MAX` itself it expires before the review it was taken for. *(Corrected: this sentence
+stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one; `_gw` is the gate wait, 900 s at
+the defaults, so that lease is 3000 s and the clamp threshold — `CLAIM_TTL_MAX - (_gw + 300)` — is
+8400 s) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one): raising either timeout past its own threshold
+requires raising `CLAIM_TTL_MAX` in the same change, or the claim is clamped below the term the worker
+asked for — and past `CLAIM_TTL_MAX` itself it expires before the review it was taken for. *(Corrected: this sentence
 said `REVIEW_TIMEOUT + 1200` and a flat `CLAIM_TTL_MAX - 1200`, which was right only for the fixer and
 only at the default gate wait.)* The verification is `claim-orphan.test.sh`,
 which reads the stamped term back out of the **pushed claim commit**. Both tunables are

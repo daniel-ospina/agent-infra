@@ -263,7 +263,7 @@ eq "acquire with NO explicit ttl succeeds" "$?" "0"
 L1="$(lease_of refs/claims/branch-integration-lease-default)"
 if [ -n "$L1" ]; then lease_arm "the DEFAULT lease is the branch key's own 14400s, not the PR claim's 1800s" 14400 "$L1"; else bad "no lease_until on the default-acquire claim ref"; fi
 # ⛔ THE CEILING ARM. An explicit over-ceiling request must clamp to THIS KEY's ceiling (14400) and say
-# so — not to CLAIM_TTL_MAX (9600). A clamp to 9600 shreds 44 % of a batch's term silently.
+# so — not to CLAIM_TTL_MAX (9600). A clamp to 9600 shreds 33 % of a batch's term (14400 -> 9600).
 NOW=$(date +%s)
 acquire_from owner "$BR_LEASE_CEIL" 999999
 grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is clamped LOUDLY, not silently" \
@@ -299,6 +299,10 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # (c) AFTER it. A `CLAIM_` name is legal ONLY inside the candidate list, which is exactly what the
 # shipped message does. If the list sentence is ever reworded the arm reddens — fail-CLOSED, because a
 # contract the test does not recognise is not a pass.
+# ⛔ AND THERE IS EXACTLY ONE CLAUSE (round 9 self-check, P2). "First clause" is only the OPERATIVE
+# clause if no earlier decoy exists: measured on this head, "the branch ceiling (14400s) is documented
+# here. lease ttl %ss exceeds this keying ceiling (9600s) — clamped. …" ran 43 passed, 0 failed while a
+# fixer reads 9600. The contract is ONE clause, so any second `ceiling (` — before OR after it — is RED.
 CLAUSE_REPORT="$(awk '
   { msg = $0
     s = msg
@@ -330,6 +334,7 @@ CLAUSE_REPORT="$(awk '
     else if (named != "") print "NAMES " named
     else if (outside != "") print "BEFORE-LIST " outside
     else if (trail != "") print "AFTER-LIST " trail
+    else if (n != 1) print "MULTIPLE " n
     else print "OK " firstval
   }
 ' "$T/acq.out" 2>/dev/null)"
@@ -340,6 +345,7 @@ case "$CLAUSE_REPORT" in
   "NAMES "*) bad "the clamp warning names a keying knob AS this ceiling inside 'ceiling ( … )': ${CLAUSE_REPORT#NAMES }" ;;
   "BEFORE-LIST "*) bad "the clamp warning names a keying knob as the ceiling BEFORE the candidate list: ${CLAUSE_REPORT#BEFORE-LIST }" ;;
   "AFTER-LIST "*) bad "the clamp warning names a keying knob as the ceiling AFTER the candidate list: ${CLAUSE_REPORT#AFTER-LIST }" ;;
+  "MULTIPLE "*) bad "the clamp warning carries ${CLAUSE_REPORT#MULTIPLE } 'ceiling ( … )' clauses — with more than one, the number a fixer reads is not provably this keying's: $(cat "$T/acq.out")" ;;
   *) bad "the not-another-knob guard could not evaluate the property (awk said '${CLAUSE_REPORT}') — unreadable operand must not read as clean" ;;
 esac
 # ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2), AND ON THE OPERATIVE CLAUSE (round 9,
@@ -376,8 +382,8 @@ L3="$(lease_of refs/claims/branch-integration-lease-knob)"
 if [ -n "$L3" ]; then lease_arm "CLAIM_BRANCH_TTL=20000 raises the CEILING too — one knob, not a split term" 20000 "$L3"; else bad "no lease_until on the env-raised claim ref"; fi
 # ⛔ AND THE OTHER HALF OF THE SAME PROPERTY (review round 3, P2): the CEILING following the knob does
 # not prove the DEFAULT does. The default arm above runs with the knob UNSET, where a hardcoded
-# `${3:-14400}` is indistinguishable from `$CLAIM_BRANCH_TTL` — measured, that mutant left all 40
-# assertions green while `CLAIM_BRANCH_TTL=20000` produced a 14400 s DEFAULT against a 20000 s ceiling:
+# `${3:-14400}` is indistinguishable from `$CLAIM_BRANCH_TTL` — measured, that mutant left EVERY
+# assertion green (naming the count here would rot, as the `unset` comment above records) while `CLAIM_BRANCH_TTL=20000` produced a 14400 s DEFAULT against a 20000 s ceiling:
 # exactly the "longer than its own clamp" split these arms exist to forbid. So the knob is moved once
 # more, on the DEFAULT path.
 NOW=$(date +%s)

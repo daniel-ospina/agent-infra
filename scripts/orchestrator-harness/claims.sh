@@ -152,7 +152,8 @@ esac
 # ⛔ `CLAIM_TTL_MAX` IS A CEILING, NOT THE DEFAULT, and the difference is load-bearing. The shipped
 # merge/fix paths lease a PR claim for MORE than `CLAIM_TTL` on purpose, because the lease must cover
 # the review+merge the claim is taken for:
-#     merge-one.sh   CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))  -> 3000s
+#     merge-one.sh   CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))  -> 3000s at the defaults
+#                    (`_gw` is the gate wait, 900 s at the defaults — NOT a constant 1200)
 #     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 )) -> 8400s
 #                    (3600s before agent-infra#2888: the fixer ran 2400 s, now the 7200 s backstop)
 # So a clamp at 1800 would expire a claim MID-MERGE and hand the same head to a peer — the duplicate
@@ -161,7 +162,8 @@ esac
 # the silent extension the #2094 incident exposed, a term no reaper's reach outlives.
 # ⚠️ THE CEILING IS COUPLED TO THOSE TWO CALLERS, exactly as CLAIM_ISSUE_TTL is coupled to LANE_TIMEOUT.
 # A caller's lease is `timeout + 1200` (`FIX_LEASE`, fix-one) or `timeout + _gw + 300` (`CLAIM_LEASE`,
-# merge-one — `_gw` is the gate wait, 8400 s at the defaults), so raising either timeout past
+# merge-one — `_gw` is the gate wait, 900 s at the defaults, so that lease is 3000 s and the clamp
+# threshold is `CLAIM_TTL_MAX - (_gw + 300)` = 8400 s), so raising either timeout past
 # `CLAIM_TTL_MAX - 1200` (the fixer) or `CLAIM_TTL_MAX - (_gw + 300)` (the reviewer) makes
 # `_claim_acquire_at` CLAMP the lease below what the worker asked for, spending the post-review
 # headroom — and above `CLAIM_TTL_MAX` itself the claim expires under a worker that is still running,
@@ -1100,7 +1102,8 @@ claim_issue_acquire() {
 # caller that already handles rc=1 (another box owns it) and rc=2 (infra) needs no new vocabulary.
 # ⛔ The default lease is the PR claim's own CLAIM_TTL, not the issue claim's 3 h: this claim covers
 #    a review-plus-merge, exactly like the per-head claim it is taken alongside, and merge-one.sh
-#    passes its derived `REVIEW_TIMEOUT + 1200` explicitly rather than relying on either default.
+#    passes its own derived `REVIEW_TIMEOUT + _gw + 300` (`_gw` = the gate wait) explicitly rather
+#    than relying on either default.
 claim_pr_acquire() {
   _claim_acquire_at "$(claim_pr_ref "$2")" "${3:-$CLAIM_TTL}" "$CLAIM_TTL" "$CLAIM_TTL_MAX"
 }
