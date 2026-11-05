@@ -1577,14 +1577,22 @@ def evaluate(ev: Evidence) -> Verdict:
         # over a FAILED read — and a `frozen` log read then CONVICTED a lane on
         # evidence it had thrown away, which is strictly worse than the masking the
         # guard exists to stop.
+        # ⛔ AND THE TREE'S STEP 2/3 SLOTS ARE ON THIS LIST (rebased onto #3382's
+        # `CpuSample`/`ChildEvidence`). Neither side of the merge wrote this clause:
+        # on main the two slots did not exist, and on the #3382 branch this guard did
+        # not. A union that left them off would let the log axis silently DISCARD a
+        # supplied CPU delta or in-flight child — the `#1777 B7` shape reconstructed
+        # yet again, this time by the merge itself. A `None` slot is NOT evidence, so
+        # this only fires on a caller who actually supplied one.
         if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \
                 or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \
                 or ev.tool is not None or ev.jsonl_turn is not None \
+                or ev.cpu is not None or ev.child is not None \
                 or not ev.ps_ok or not ev.store_ok:
             return Verdict(
                 "unknown", "log-read-on-session-query",
-                detail="a log-lane query carries ONLY log_read; supplying session or claim "
-                       "evidence too would let this axis mask it (#1777 B7)")
+                detail="a log-lane query carries ONLY log_read; supplying session, claim, "
+                       "CPU or child evidence too would let this axis mask it (#1777 B7)")
         return log_lane_verdict(ev.log_read)
 
     # (1) Evidence availability. A failed read abstains with a NAMED reason —
