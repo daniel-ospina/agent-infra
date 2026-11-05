@@ -602,11 +602,13 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     (nothing was examined — the cause is the CALLER's pointer, so `next=` names `WIP_PATH=` as the remedy);
     and `rescue=UNAVAILABLE` means the rescuer was not FOUND, so `next=` says to install it rather than
     "re-run bg-rescue-wip.sh", a command that cannot be run. ⛔ **AND THE OTHER DOMAINS' MANUAL FACTS ARE
-    APPENDED BY SHARED HELPERS, NOT RE-TYPED PER ARM** (`lane_end_rescue_caveat`, `lane_end_tree_caveat`):
-    four consecutive review cycles each found a fresh arm that dropped one — a refused push silencing the
-    archive, the archive silencing the refused push, a reporter silencing `cannot-verify`, and finally
-    `cannot-verify` itself being dropped by every MANUAL push and rescue arm because its own arm sits below
-    them. A caveat expressed once cannot get a case list subtly different.
+    APPENDED BY SHARED HELPERS, NOT RE-TYPED PER ARM** (`lane_end_rescue_caveat`, `lane_end_tree_caveat`,
+    `lane_end_push_caveat`): four consecutive review cycles each found a fresh arm that dropped one — a
+    refused push silencing the archive, the archive silencing the refused push, a reporter silencing
+    `cannot-verify`, and finally `cannot-verify` itself being dropped by every MANUAL push and rescue arm
+    because its own arm sits below them. A caveat expressed once cannot get a case list subtly different —
+    and the two rescue arms that still re-typed the PUSH caveat by hand had already drifted (one listed
+    `UNAVAILABLE`, the other did not; neither listed `running`, which the `cannot-verify` list carries).
   * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
     writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,

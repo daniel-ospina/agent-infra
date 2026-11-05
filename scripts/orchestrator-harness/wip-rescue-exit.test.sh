@@ -2077,6 +2077,35 @@ ck "N44h2 …and the log names the read that failed as the cause, so the remedy 
 case "$(cat "$TMP/n44h.next" 2>/dev/null)" in MANUAL*"do NOT reap"*) rcn44h3=0 ;; *) rcn44h3=1 ;; esac
 ck "N44h3 …and next= still refuses the reclaim (fail-closed either way)" $rcn44h3
 git -C "$n44h/wk" worktree remove --force "$n44h/wt" 2>/dev/null
+# ⛔ N45 — NO `next=` SENTENCE MAY BE PRINTED TWICE, MANGLED, OR LEFT HALF-FILLED (review cycle 19, P1 —
+# REPRODUCED). Inserting one more `%s` into a format without its argument (or the reverse) makes bash
+# RE-RUN the whole format on the left-over arguments: the durable `next=` then carried the entire MANUAL
+# sentence twice, with the push URL dropped into the `refs/heads/%s` slot (`refs/heads//srv/repo.git`) and
+# the branch appended after "lane log". Two arms were in that state and NO arm asserted the shape of the
+# output — the suite printed the corrupt line and stayed green. This drives the full PUSH x RESCUE matrix
+# and reads the product, so it covers every arm and every future one.
+n45_bad=""
+for n45_push in pushed nothing running unmeasured detached verify-unanswered push-unreported push-killed \
+                FAILED UNAVAILABLE refused-unknown-default refused-protected refused-main-checkout \
+                refused-pushurl-divergent refused-pushurl-unresolved; do
+  for n45_rescue in nothing FAILED UNAVAILABLE archived-local refs/wip/develop; do
+    n45_out="$( bash -c '
+      . "$1"
+      LANE_END_TREE=dirty; LANE_END_RESCUE="$3"; LANE_END_PUSH="$2"
+      LANE_END_UNPUSHED=1; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+      LANE_END_PUSH_URL=/srv/repo.git; LANE_END_REF=refs/wip/develop; LANE_END_ORIGIN=deadbeef
+      lane_end_next' _ "$GATE" "$n45_push" "$n45_rescue" 2>/dev/null )"
+    n45_cell="$n45_push/$n45_rescue"
+    # 1. one sentence, not the same sentence twice
+    n45_n="$(printf '%s' "$n45_out" | grep -o 'MANUAL' | grep -c . )"
+    [ "${n45_n:-0}" -gt 1 ] && n45_bad="$n45_bad $n45_cell(x$n45_n)"
+    # 2. no specifier dropped a URL/path into a REF slot, and none was left unfilled
+    case "$n45_out" in *'refs/heads//'*|*'refs/heads/developdevelop'*|*'origin//'*|*'%s'*) n45_bad="$n45_bad $n45_cell(mangled-ref)" ;; esac
+    # 3. a push verdict's caveat may not print an EMPTY verdict (`push=` with nothing after it)
+    case "$n45_out" in *'push=)'*|*'push=,'*|*'push= '*) n45_bad="$n45_bad $n45_cell(empty-verdict)" ;; esac
+  done
+done
+ck "N45 every push x rescue cell produces ONE well-formed next= sentence — no duplicated sentence, no URL in a ref slot, no unfilled specifier [bad:${n45_bad:-none}]" "$([ -z "$n45_bad" ] && echo 0 || echo 1)"
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
