@@ -318,7 +318,8 @@ completeness, so a `$( )` caller still gets the reading.
 
 Seams (all opt-in; a box that sets none calls the provider): `CAP_EXPECTED_BOXES`, `CAP_EXPECTED`,
 `CAP_CMUX_BIN` (path to the provider CLI), `CAP_CMUX_LIST` (an operator's own inventory command line,
-e.g. a bounded wrapper), `CAP_INVENTORY_TIMEOUT` (seconds, default 10).
+e.g. a bounded wrapper), `CAP_INVENTORY_TIMEOUT` (seconds, default 10), `CAP_CHANNEL_TIMEOUT` (seconds,
+default 10 — the `git ls-remote` half is a network read too).
 
 ⛔ **THE INVENTORY CALL IS BOUNDED, AND A TIMEOUT IS A NAMED READING.** `cmux vm list --json` is a
 NETWORK call: unbounded, a wedged provider hangs the **drainer tick that holds the lock** — every later
@@ -330,6 +331,13 @@ watchdog (the macOS arm) writes the child's stdout to a FILE rather than to the 
 reaches the direct pid only, so a descendant the provider left behind would otherwise keep the caller's
 `$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. The sibling
 reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this line's path.
+
+⛔ **THE CHANNEL READ IS BOUNDED FOR THE SAME REASON.** `cap_read_fleet`'s `git ls-remote` is a network
+read on the same path (`GIT_TERMINAL_PROMPT=0`, so a credential prompt cannot become a lock-holding
+hang); a timeout reads `why=channel-timeout` and `published=UNREADABLE`. This matters most where the
+reading was added: `ai-drainer.sh` takes it BEFORE its guards while holding the tick's lock, so an
+unbounded read there stops every later tick (`SKIP: drainer already running`) and the box stops topping
+up — the same consequence the provider bound exists for, on the other half of the same reading.
 
 A provider that lists **zero** running machines reads as `provider-inventory-unparseable`, not
 `expected=0`: the reader cannot tell an empty listing from one it failed to parse, and guessing zero
@@ -351,6 +359,12 @@ produces a number where an expectation exists.** A cell that should reconcile mu
 `CAP_EXPECTED_BOXES` (`pi-cell-1:10.238.144.2,pi-cell-2:10.238.144.6,…`, the roster whose keys are the
 very `network.ipv4` values `cap_boxid` publishes under) or, if only the count is known,
 `CAP_EXPECTED=<n>` (which reports `INELIGIBLE=unknown`, because a count cannot name who is missing).
+
+⛔ **A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL.** A 19+-digit `CAP_EXPECTED` (or a leading zero like
+`08`, which `test` reads as bad octal) made the count arm's loop fail, return 0 with no output, and the
+line certified `expected=0 published=1 INELIGIBLE=0` — the `expected=0` false PASS the instrument
+forbids. A count must be a whole number of at most four digits with no leading zero beyond `0` itself
+(`expected-count-unusable`), and `CAP_EXPECTED=0` remains the one explicit, operator-made zero.
 
 owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
 `cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —

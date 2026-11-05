@@ -1625,6 +1625,61 @@ CAP_BOUND_IMPL=watchdog CAP_INVENTORY_TIMEOUT=1 CAP_CMUX_LIST="$HOLD" bash -c '.
 _w1m="$(date +%s)"; _dwm=$(( _w1m - _w0m ))
 ck "  …mutation control: the pre-fix watchdog inherits stdout and takes ${_dwm}s (so (w) is load-bearing)" \
    "$([ "$_dwm" -ge 7 ] && echo 0 || echo 1)"
+# (x) ⛔ THE CHANNEL READ IS A NETWORK READ TOO AND IS BOUNDED (fresh review round 3, P2). Only the
+# provider call was bounded, but `git ls-remote` on the same path was raw — and `ai-drainer.sh` takes
+# the reading BEFORE its guards WHILE HOLDING THE TICK LOCK, so a wedged origin blocks the tick forever
+# and every later tick logs `SKIP: drainer already running`. A timeout is `why=channel-timeout`.
+WORKSSH="$TMP/work-ssh"; git init -q "$WORKSSH" >/dev/null 2>&1
+HANGSSH="$TMP/hang-ssh.sh"; printf '%s\n' '#!/bin/sh' 'sleep 12' > "$HANGSSH"; chmod +x "$HANGSSH"
+git -C "$WORKSSH" remote add origin 'ssh://example.invalid/repo' >/dev/null 2>&1 || true
+_x0="$(date +%s)"
+L22="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" CAP_CHANNEL_TIMEOUT=1 GIT_SSH_COMMAND="$HANGSSH" cap_fleet_line "$WORKSSH" 2>/dev/null)"; RC=$?
+_x1="$(date +%s)"; _dx=$(( _x1 - _x0 ))
+ck "(x) a wedged origin is bounded in ${_dx}s and named (published=UNREADABLE, not a quiet fleet: $L22)" \
+   "$([ "$_dx" -lt 8 ] && [ "$RC" -eq 2 ] && qF 'published=UNREADABLE' "$L22" && qF 'why=channel-timeout' "$L22" && ! qF 'published=0' "$L22" && echo 0 || echo 1)"
+# (x-mutant) NON-VACUITY: the PRE-FIX unbounded `ls-remote` in a copy takes the origin's full 12s.
+{ cat "$CAP"; cat <<'CAPMUT'
+cap_read_fleet() {
+  local repo="${1:-.}" out rc
+  out="$(git -C "$repo" ls-remote --refs origin "$CAP_NS/*" 2>/dev/null)"; rc=$?
+  [ "$rc" -eq 0 ] || return 2
+  printf '%s\n' "$out" | cap_parse_lsremote
+}
+CAPMUT
+} > "$TMP/cap-unbounded-channel.sh"
+_x0m="$(date +%s)"
+CAP_EXPECTED_BOXES="cell-1:10.0.0.1" CAP_CHANNEL_TIMEOUT=1 GIT_SSH_COMMAND="$HANGSSH" bash -c '. "$1"; cap_fleet_line "$2"' _ "$TMP/cap-unbounded-channel.sh" "$WORKSSH" >/dev/null 2>&1
+_x1m="$(date +%s)"; _dxm=$(( _x1m - _x0m ))
+ck "  …mutation control: an unbounded channel read takes ${_dxm}s on the same wedged origin (so (x) is load-bearing)" \
+   "$([ "$_dxm" -ge 11 ] && echo 0 || echo 1)"
+# (y) ⛔ A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL, NOT A FLEET OF ZERO (fresh review round 3, P1).
+# `[ "$n" -lt "$CAP_EXPECTED" ]` fails on a 19+-digit value (and on a leading zero like `08`, which
+# `test` reads as bad octal), so the loop body never ran and the function returned 0 with NO output:
+# the line then certified `expected=0 published=1 INELIGIBLE=0 extra=1`, rc 0, with the cause on a
+# stderr that both emitters discard. `expected=0` is the exact value this function forbids.
+L23="$(CAP_EXPECTED=99999999999999999999 cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"; RC=$?
+ck "(y) an out-of-range COUNT is expected=UNKNOWN why=expected-count-unusable, never expected=0 ($L23)" \
+   "$([ "$RC" -eq 1 ] && qF 'expected=UNKNOWN' "$L23" && qF 'why=expected-count-unusable' "$L23" && ! qF 'expected=0' "$L23" && ! qF 'INELIGIBLE=0' "$L23" && echo 0 || echo 1)"
+L23B="$(CAP_EXPECTED=08 cap_fleet_line_from "" 0)"
+ck "  …and a leading-zero count (bare `test` reads it as octal) is the same refusal ($L23B)" \
+   "$(qF 'why=expected-count-unusable' "$L23B" && ! qF 'expected=0' "$L23B" && echo 0 || echo 1)"
+L23C="$(CAP_EXPECTED=0 cap_fleet_line_from "" 0)"; RC=$?
+ck "  …while an EXPLICIT zero is still a real answer (rc=$RC: $L23C)" \
+   "$([ "$RC" -eq 0 ] && qF 'expected=0' "$L23C" && echo 0 || echo 1)"
+# (y-mutant) NON-VACUITY: the PRE-FIX count arm (no range/leading-zero guard) certifies the fleet.
+{ cat "$CAP"; cat <<'CAPMUT'
+cap_expected_boxes() {
+  local n
+  [ "$(cap_expected_src)" = "count" ] || { cap_fleet_inventory; return $?; }
+  n=0
+  while [ "$n" -lt "$CAP_EXPECTED" ]; do printf -- '- -\n'; n=$((n + 1)); done
+  return 0
+}
+CAPMUT
+} > "$TMP/cap-precount.sh"
+L23M="$(CAP_EXPECTED=99999999999999999999 bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-precount.sh" 2>/dev/null)"
+ck "  …mutation control: drop the range guard and the SAME seam reads expected=0 ($L23M)" \
+   "$(qF 'expected=0' "$L23M" && echo 0 || echo 1)"
 
 
 echo

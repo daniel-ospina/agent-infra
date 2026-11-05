@@ -292,6 +292,12 @@ CAP_CMUX_LIST="${CAP_CMUX_LIST:-}"             # the inventory command LINE (def
 # `timeout` -> `gtimeout` -> a bash-native watchdog (the same contract as `repo-authority.sh`'s
 # `_gh_bounded` for the identical macOS constraint). A timeout is a NAMED reading, never a zero.
 CAP_INVENTORY_TIMEOUT="${CAP_INVENTORY_TIMEOUT:-10}"  # seconds
+# ⛔ AND THE CHANNEL SIDE IS A NETWORK READ TOO (fresh review round 3, P2). `git ls-remote` was raw and
+# unbounded, and `ai-drainer.sh` now takes the fleet reading BEFORE its guards while holding the tick
+# lock — a wedged/unreachable origin, or a credential prompt, would block that tick forever and every
+# later tick would log `SKIP: drainer already running`. Same consequence the provider bound exists for,
+# on the other half of the same reading. `CAP_CHANNEL_TIMEOUT` bounds it; a timeout is `channel-timeout`.
+CAP_CHANNEL_TIMEOUT="${CAP_CHANNEL_TIMEOUT:-10}"      # seconds
 # ⛔ WHICH ARM OF THE BOUND TO USE: `auto` (default) walks it, `watchdog` FORCES the third arm. The third
 # arm is the macOS case and CI is Linux, so without a seam the arm the fleet actually depends on could
 # never be graded — the same reason the drainer suite pins `DRAINER_OS` instead of inheriting `uname`.
@@ -1170,12 +1176,17 @@ cap_parse_lsremote() {
 }
 
 # cap_read_fleet <repo> -> every box's newest record, one per line. rc 2 when the channel cannot be
-# read (no repo, no origin, git failure) — the CALLER must then refuse to place, never place blind.
+# read (no repo, no origin, git failure) and rc 124 when the read TIMED OUT (both leave the channel
+# UNREADABLE to a caller; the distinct code is what lets the line name `why=channel-timeout` instead of
+# the generic token) — the CALLER must then refuse to place, never place blind.
 cap_read_fleet() {
   local repo="${1:-.}" out rc
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { printf 'CAPACITY: not a git checkout: %s\n' "$repo" >&2; return 2; }
   git -C "$repo" remote get-url origin >/dev/null 2>&1 || { printf 'CAPACITY: %s has no origin — the fleet channel is unreadable\n' "$repo" >&2; return 2; }
-  out="$(git -C "$repo" ls-remote --refs origin "$CAP_NS/*" 2>/dev/null)"; rc=$?
+  # `GIT_TERMINAL_PROMPT=0` in the subshell: a credential prompt is a hang with the lock held, not a
+  # question anyone is there to answer (the same reason `claims.sh` sets it).
+  out="$(export GIT_TERMINAL_PROMPT=0; cap_bounded "$CAP_CHANNEL_TIMEOUT" git -C "$repo" ls-remote --refs origin "$CAP_NS/*" 2>/dev/null)"; rc=$?
+  [ "$rc" -ne 124 ] || { printf 'CAPACITY: git ls-remote %s/* timed out after %ss — the fleet channel is UNREADABLE\n' "$CAP_NS" "$CAP_CHANNEL_TIMEOUT" >&2; return 124; }
   [ "$rc" -eq 0 ] || { printf 'CAPACITY: git ls-remote %s/* failed (rc=%s) — the fleet channel is UNREADABLE\n' "$CAP_NS" "$rc" >&2; return 2; }
   printf '%s\n' "$out" | cap_parse_lsremote
 }
@@ -1383,6 +1394,19 @@ cap_expected_boxes() {
       case "$CAP_EXPECTED" in
         *[!0-9]*) printf 'UNKNOWN expected-count-unparseable(CAP_EXPECTED="%s" is not a whole number)\n' "$CAP_EXPECTED"; return 1 ;;
       esac
+      # ⛔ A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL, NOT A FLEET OF ZERO (fresh review round 3,
+      # P1). `[ "$n" -lt "$CAP_EXPECTED" ]` fails on a 19+-digit value (and on a leading zero like
+      # `08`, which `test` reads as a bad octal), the loop body NEVER runs and the function returned
+      # 0 with no output — so the line certified `expected=0 published=1 INELIGIBLE=0 extra=1`, rc 0,
+      # with the cause on stderr that BOTH emitters discard. That is the `expected=0` false PASS the
+      # function's own contract forbids, reachable from one mangled seam. Bound the magnitude and
+      # reject the leading-zero (octal) shape BEFORE the loop.
+      case "$CAP_EXPECTED" in
+        0?*) printf 'UNKNOWN expected-count-unusable(CAP_EXPECTED="%s" has a leading zero — `test` reads it as octal, so it is a refusal rather than a guess)\n' "$CAP_EXPECTED"; return 1 ;;
+      esac
+      if [ "${#CAP_EXPECTED}" -gt 4 ]; then
+        printf 'UNKNOWN expected-count-unusable(CAP_EXPECTED="%s" is out of range — a fleet of more than 9999 boxes is not a count this instrument can compare)\n' "$CAP_EXPECTED"; return 1
+      fi
       n=0
       while [ "$n" -lt "$CAP_EXPECTED" ]; do printf -- '- -\n'; n=$((n + 1)); done
       return 0 ;;
@@ -1416,7 +1440,7 @@ cap_fleet_line_from() {
     why="${why%% *}"
     [ -n "$why" ] || why="expected-unreadable"
   fi
-  [ "$rrc" -eq 0 ] || unk_pub=1
+  [ "$rrc" -eq 0 ] || { unk_pub=1; [ "$rrc" -eq 124 ] && why="channel-timeout"; }
   # ⛔ AN UNREADABLE CLOCK IS *NOT* "EVERY RECORD IS FRESH" (review, P1). The old fallback set `now=0`,
   # which makes every age negative, the clamp below turn it into 0, and `age > CAP_PROBE_TTL` false for
   # EVERY record — including one dated 2001 — so the line certified a whole fleet from a clock it never
