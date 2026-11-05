@@ -21,10 +21,17 @@
 # artefacts, `.venv`/`node_modules` and any file a step creates under the checkout — so "nothing under
 # this entry has been written for N seconds" is a positive fact about a dead entry. ⛔ `_work/_temp`
 # (the step scripts and the command logs) is a SIBLING OF THE CHECKOUT **INSIDE THE ROOT THIS SWEEPS**,
-# not a child of it — the vendor resolves every runner-private directory as `Combine(Work, <name>)`
+# not a child of it — the vendor resolves the runner-private directories as `Combine(Work, <name>)`
 # (`actions/runner` `src/Runner.Common/HostContext.cs` `GetDirectory`: `case WellKnownDirectory.Temp`,
-# `.Actions` and `.Tools` each `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)`, over
-# `Constants.Path.{Temp,Actions,Tool}Directory` = `_temp`/`_actions`/`_tool`; the checkout is
+# `.Actions` and `.Update` are UNCONDITIONAL `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)`,
+# over `Constants.Path.{Temp,Actions,Update}Directory` = `_temp`/`_actions`/`_update`; ⛔ `Tools` is the
+# EXCEPTION and it is why the `_tool` row's premise is CONDITIONAL — `WellKnownDirectory.Tools` prefers
+# `$RUNNER_TOOL_CACHE` / `$RUNNER_TOOLSDIRECTORY` / `$AGENT_TOOLSDIRECTORY` and only falls back to
+# `Combine(Work, "_tool")` when all three are unset, so on a box that sets one (every github-hosted image,
+# many self-hosted ones) `_work/_tool` is not the tool cache and may not exist at all. The retain row is
+# still right — a directory by that name under `_work` is never a job checkout — but "the vendor puts the
+# tool cache here" is a fallback, not a rule, and stating it as one is the same wrong-origin class this
+# paragraph exists to correct; the checkout is
 # `Path.Combine(_workDirectory, trackingConfig.PipelineDirectory)` at `Runner.Worker/JobExtension.cs:215`,
 # with `_workDirectory = HostContext.GetDirectory(WellKnownDirectory.Work)`) — so a write there
 # does NOT refresh the checkout's floor and it is NOT an in-entry witness. ⛔ AND THAT IS EXACTLY WHY IT
@@ -89,9 +96,17 @@
 # Env seams:
 #   REAP_RW_GLOBS       space-separated globs of `_work` roots (same as --glob; `disk-reaper.sh` passes
 #                       its own DISK_REAPER_RUNNER_GLOBS down here). Default:
-#                           /opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work
-#                       ⚠️ Globs are expanded ONE level, as written. A layout that nests the install one
-#                       directory deeper (`/tmp/actions-runner/<name>/_work`) needs `*/*` in the pattern.
+#                           /opt/gh-runner*/_work $HOME/actions-runner*/_work $HOME/actions-runner/*/_work
+#                           /tmp/actions-runner*/_work /tmp/actions-runner/*/_work
+#                       ⛔ BOTH DEPTHS, AND THE NESTED PAIR IS NOT OPTIONAL. Globs are expanded ONE level,
+#                       as written, so a flat pattern cannot reach a layout that nests the install one
+#                       directory deeper — and that is the layout this repo's own `ci_runner_pool.sh`
+#                       CREATES: `RUNNER_ROOT` defaults to `/tmp/actions-runner`, `add` copies the template
+#                       into `$RUNNER_ROOT/<name>`, so `_work` lands at `/tmp/actions-runner/<name>/_work`.
+#                       A flat-only default matched nothing there, which this class correctly reads as a
+#                       MEASURED EMPTY POPULATION (`census=ok`) — so the sink filled while the class
+#                       reported healthy (#3057 review, measured). A custom `RUNNER_ROOT` still needs its
+#                       own glob: discovery is by glob, never a walk of the whole filesystem.
 #                       A SET-but-EMPTY value is a REFUSAL (an empty list would scan nothing for ever
 #                       while the class reported a measured zero).
 #   REAP_RW_MIN_AGE     the mtime floor in seconds (default 7200)
@@ -148,7 +163,10 @@ EXPLICIT="${REAP_RW_EXPLICIT-0}"
 # `/opt` first because that is where the measured cell's 19 G was; `$HOME` and `/tmp` because that is
 # where the farm puts runners elsewhere (cell 3 keeps installs under `/tmp/actions-runner`, cell 4's
 # are in `/opt`).
-GLOBS="${REAP_RW_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work}"
+# ⛔ BOTH DEPTHS — see the `REAP_RW_GLOBS` note above: the nested pair is the POOLED layout this repo's
+# own `ci_runner_pool.sh` creates (`$RUNNER_ROOT/<name>/_work`), and a flat-only default missed it and
+# read the miss as a measured empty population.
+GLOBS="${REAP_RW_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work $HOME/actions-runner/*/_work /tmp/actions-runner*/_work /tmp/actions-runner/*/_work}"
 RUNNER_WORK_MIN_AGE="${REAP_RW_MIN_AGE:-7200}"
 DU_TIMEOUT="${REAP_RW_DU_TIMEOUT:-120}"
 FIND_TIMEOUT="${REAP_RW_FIND_TIMEOUT:-120}"
@@ -160,9 +178,12 @@ GLOB_ARGS_GIVEN=0
 # ── THE RUNNER'S `_work` NAMESPACE — the ONE table deciding what is a job checkout and what is not ──
 # ⛔ THIS TABLE IS THE BUG FIX, NOT A TIDY-UP. `sweep_root` walks `"$root"/*/` — every directory under
 # `_work` — and it cannot tell a job checkout from the runner's own directories, because the vendor
-# keeps BOTH in `_work`: `HostContext.GetDirectory` resolves `Temp`, `Actions`, `Tools` and `Update` as
+# keeps BOTH in `_work`: `HostContext.GetDirectory` resolves `Temp`, `Actions` and `Update` as
 # `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)` (`actions/runner`
-# `src/Runner.Common/HostContext.cs`, over `Constants.Path.{Temp,Actions,Tool,Update}Directory`). So a
+# `src/Runner.Common/HostContext.cs`, over `Constants.Path.{Temp,Actions,Update}Directory`), and `Tools`
+# is the CONDITIONAL one — it prefers `RUNNER_TOOL_CACHE`/`RUNNER_TOOLSDIRECTORY`/`AGENT_TOOLSDIRECTORY`
+# and falls back to `Combine(Work, "_tool")`, which is why that row's premise is stated as a fallback and
+# not as a vendor rule. So a
 # name that appears in NO row here is a reap candidate SILENTLY — which is how `_temp`, a live job's
 # `$RUNNER_TEMP`, became one without a line in any file saying so.
 #
@@ -616,9 +637,21 @@ sweep_root() { # <_work root>
         # ⛔ NEVER FOLLOW A SYMLINK OUT OF THE ROOT. `*/` matches a link to a directory and `-d` follows
         # it, so a link planted in `_work` would make this sweep classify — and `rm -rf` — a tree OUTSIDE
         # the population it was told to sweep (the abandoned-worktree owner records the same hazard,
-        # measured). A link is not a job's checkout; it is skipped silently, because naming every link in
-        # every runner on every pass is noise.
-        [ -d "$e" ] && [ ! -L "$e" ] || continue
+        # measured). A link is not a job's checkout and it is never followed.
+        # ⛔ AND IT IS NOT SKIPPED *SILENTLY* — that was the shape of the measured defect (#3057 review):
+        # `continue` before any counter, so a `_work` whose entries are links published `roots=1
+        # candidates=0 unmeasurable=0 retained=0 census=ok` and the class read MEASURED-AND-HEALTHY over
+        # a population it never classified, one level below the ROOT arm that already abstains for the
+        # same input. The entry was also absent from `retained=`, so "why is this still here" had no
+        # answer. It is counted as a RETAIN (`retained=`, its own reason) rather than an abstention: the
+        # decision not to follow is a POLICY, so the census is honest — but the carve-out is now visible
+        # and named, the same rule the vendor namespace gets.
+        if [ -L "$e" ]; then
+            RETAINED=$((RETAINED + 1))
+            log_line "RETAINED $e reason=symlinked-entry (a symlink under _work is never followed and never a candidate: following one would classify — and could remove — a tree OUTSIDE the population this root was told to sweep. Counted so a `_work` of links is a VISIBLE carve-out and never a silently measured zero)"
+            continue
+        fi
+        [ -d "$e" ] || continue
         _seen=1
         prune_entry "$e" "$root"
     done

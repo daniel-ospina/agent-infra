@@ -4192,7 +4192,11 @@ cmd_status() {
       case "${2:-}" in ''|ok|'?'|not-run) printf '' ; return 0 ;; esac
       case "$1" in runner-work) _k=runner_work ;; duplicate-install) _k=duplicate_install ;; *) _k="$1" ;; esac
       printf ' ⚠️ %s=%s' "$1" "$2"
-      _dr_unm "$_k"
+      # ⛔ ONLY `runner_work` PUBLISHES `unmeasurable_=` (#3057 review, measured): `disk-reaper.sh`
+      # writes `unmeasurable_runner_work=` and NO `unmeasurable_duplicate_install=` — the
+      # duplicate-install owner has no such field — so the generic lookup below advertised a number
+      # that class can never show. The VERDICT above is written for both and stays printed.
+      case "$_k" in runner_work) _dr_unm "$_k" ;; esac
     }
     # The tally that makes the verdict honest: `partial` means the census could not read all of the class's
     # population, and the CANDIDATE COUNT beside it is a LOWER BOUND — a reader that prints `partial`

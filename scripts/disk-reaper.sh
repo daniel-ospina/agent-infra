@@ -112,9 +112,17 @@
 #   DISK_REAPER_VENV_MIN_AGE   venv floor in seconds     (default 1800)
 #   DISK_REAPER_RUNNER_GLOBS   space-separated globs naming the CI runners' `_work` roots, handed to
 #                              the runner-work owner (default: /opt/gh-runner*/_work,
-#                              $HOME/actions-runner*/_work, /tmp/actions-runner*/_work). A SET-but-EMPTY
-#                              value is a REFUSAL at startup, never "scan nothing": an emptied seam
-#                              would otherwise report a measured zero for a sink nothing looked at
+#                              $HOME/actions-runner*/_work, $HOME/actions-runner/*/_work,
+#                              /tmp/actions-runner*/_work, /tmp/actions-runner/*/_work). ⛔ BOTH
+#                              DEPTHS ARE SHIPPED and the nested pair is not optional: `ci_runner_pool.sh`
+#                              defaults `RUNNER_ROOT=/tmp/actions-runner` and copies the template into
+#                              `$RUNNER_ROOT/<name>`, so the pooled layout puts `_work` ONE LEVEL DEEPER
+#                              (`/tmp/actions-runner/<name>/_work`) than the flat `/opt/gh-runner*/_work`
+#                              installs — a flat-only default missed every pooled instance, published
+#                              `roots=0 census=ok`, and left the class INERT ON A CELL WHILE READING
+#                              HEALTHY (#3057 review, measured). A SET-but-EMPTY value is a REFUSAL at
+#                              startup, never "scan nothing": an emptied seam would otherwise report a
+#                              measured zero for a sink nothing looked at
 #   DISK_REAPER_RUNNER_MIN_AGE the runner-work mtime floor in seconds (default 7200 — the only
 #                              empirically validated floor, see the class note below): a `_work` entry
 #                              whose NEWEST content is older than this is reapable
@@ -193,7 +201,13 @@ VENV_MIN_AGE="${DISK_REAPER_VENV_MIN_AGE:-1800}"
 # substitute the DEFAULTS for an emptied seam, so an operator (or a rendered unit) that emptied the
 # glob list to "turn the class off" would instead get the WIDEST possible sweep — the delete direction.
 # This is the same rule BOUNDED_LIB gets: a set value is authoritative, and a wrong one is loud.
-RUNNER_GLOBS="${DISK_REAPER_RUNNER_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work}"
+# ⛔ BOTH DEPTHS: a flat install (`/opt/gh-runner-x64/_work`, cell c1) and the POOLED layout
+# `ci_runner_pool.sh` creates (`$RUNNER_ROOT/<name>/_work`, RUNNER_ROOT defaulting to
+# `/tmp/actions-runner`). Only the flat form shipped first, and on a pooled cell it matched nothing —
+# which the class is designed to read as a MEASURED EMPTY POPULATION (`census=ok`), so the sink filled
+# while the hourly pass read healthy. The owner's basename-is-`_work` gate makes the wider patterns safe
+# and `SEEN_ROOTS` dedupes the overlap, so widening costs one comparison and no deletion surface.
+RUNNER_GLOBS="${DISK_REAPER_RUNNER_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work $HOME/actions-runner/*/_work /tmp/actions-runner*/_work /tmp/actions-runner/*/_work}"
 RUNNER_GLOBS_EXPLICIT=0
 if [ -n "${DISK_REAPER_RUNNER_GLOBS+set}" ]; then RUNNER_GLOBS_EXPLICIT=1; fi
 # The floor: a `_work` entry whose NEWEST CONTENT is older than this is reapable. ⛔ THE SHIPPED VALUE IS
@@ -3062,11 +3076,20 @@ record_body() {
     else printf 'freed_mb_total=%s\n' "$_freed_total"; fi
     printf 'free_mb_root=%s\n' "$_first_root"
     printf 'free_mb=%s\n' "${_free_mb:-unmeasured}"
-    if [ "${_total_unmeasured:-0}" != 1 ] && ! is_dry && [ -n "$_free_mb" ] && [ "$_free_mb" -lt "$_low_free" ] && [ "$_freed_total" -lt "$_urb_min" ]; then
+    # ⛔ THE ALERT IS GATED ON THE **MEASURED SUBSET**, NOT ON THE WHOLE SUM (#3057 review, measured).
+    # It used to require `_total_unmeasured = 0`, so ONE unmeasured class (a missing delegate, a df that
+    # would not answer) silenced `alert=under-reclaim` on a box below the floor whose MEASURED classes
+    # demonstrably did not keep up — the near-full-disk alarm switched off by an unrelated measurement
+    # failure, and nothing else in the repo recomputes it. `_measured_total` is `none` only when NO class
+    # measured anything (a pass whose only class never ran must not say `did not keep up`), which is the
+    # recorded decision; any measured class is enough to assert about what it freed. Measured before the
+    # fix: `--only venv` alone alerted, `--only venv,runner-work` with the owner missing alerted NOTHING.
+    if [ "${_measured_total:-none}" != none ] && ! is_dry && [ -n "$_free_mb" ] && [ "$_free_mb" -lt "$_low_free" ] && [ "$_measured_total" -lt "$_urb_min" ]; then
         printf 'alert=under-reclaim\n'
-        printf 'alert_detail=freed_mb=%s (< %s) while free_mb=%s (< %s) — the pass RAN and did not keep up\n' \
-               "$_freed_total" "$_urb_min" "$_free_mb" "$_low_free"
-        log "disk-reaper: ⚠️ UNDER-RECLAIM freed_mb=${_freed_total} < ${_urb_min}MB while free_mb=${_free_mb} < ${_low_free}MB — this pass ran and did not keep up; the box can still reach zero"
+        printf 'alert_detail=freed_mb=%s (< %s) while free_mb=%s (< %s) — the pass RAN and did not keep up%s\n' \
+               "$_measured_total" "$_urb_min" "$_free_mb" "$_low_free" \
+               "$([ "${_total_unmeasured:-0}" = 1 ] && printf ' (measured classes only: another class went unmeasured, so the pass total is a lower bound)' || printf '')"
+        log "disk-reaper: ⚠️ UNDER-RECLAIM freed_mb=${_measured_total} < ${_urb_min}MB while free_mb=${_free_mb} < ${_low_free}MB — this pass ran and did not keep up; the box can still reach zero"
     fi
     printf 'detail=%s\n' "$DETAIL"
     return 0

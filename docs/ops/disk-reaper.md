@@ -396,13 +396,21 @@ headroom.
 `scripts/reap-runner-work.sh` owns the rule; the class only runs it and accounts per filesystem.
 
 * **Discovery** is a bounded, documented glob list — `/opt/gh-runner*/_work`,
-  `$HOME/actions-runner*/_work`, `/tmp/actions-runner*/_work` — as `DISK_REAPER_RUNNER_GLOBS`
+  `$HOME/actions-runner*/_work`, `$HOME/actions-runner/*/_work`, `/tmp/actions-runner*/_work`,
+  `/tmp/actions-runner/*/_work` — as `DISK_REAPER_RUNNER_GLOBS`
   (space-separated, handed down as `REAP_RW_GLOBS`). A SET-but-EMPTY value is a **refusal at startup**
   (exit 3), the rule `BOUNDED_LIB` already gets: `${X:-default}` would silently substitute the WIDEST
   sweep for an emptied seam, which is the delete direction. A glob that matches nothing is ordinary; a
   glob list set EXPLICITLY that matches NOTHING is `misconfigured` + `?` (see below).
-  ⚠️ Globs expand ONE level as written: a layout nesting the install one directory deeper
-  (`/tmp/actions-runner/<name>/_work`) needs `*/*` in the pattern.
+  ⛔ **BOTH DEPTHS SHIP, AND THE NESTED PAIR IS NOT OPTIONAL.** Globs expand ONE level as written, and
+  this repo's own `scripts/ci_runner_pool.sh` defaults `RUNNER_ROOT=/tmp/actions-runner` and copies the
+  template into `$RUNNER_ROOT/<name>` — so a POOLED runner's `_work` is `/tmp/actions-runner/<name>/_work`,
+  one level deeper than a flat `/opt/gh-runner-x64/_work` install. A flat-only default matched nothing on
+  a pooled cell, and this class reads a default-glob miss as a MEASURED EMPTY POPULATION (`roots=0
+  census=ok`, exit 0) by design — so the class was **INERT ON A CELL WHILE REPORTING HEALTHY**, which is
+  the exact defect `#2894` was filed to remove (measured in review; the suite's `(f)` reach arm and its
+  `MUT_F5` flat-only mutant now pin it). A custom `RUNNER_ROOT` still needs its own glob: discovery is by
+  glob, never a walk of the whole filesystem.
 * ⛔ **A matched root whose BASENAME is not `_work` is REFUSED, by name, and the pass exits 3.** This is
   the last gate before `rm -rf` and it was missing: a seam ONE COMPONENT SHORT — `/opt/gh-runner*/`
   instead of `/opt/gh-runner*/_work` — matched the runner INSTALL tree and swept `bin/`,
@@ -423,12 +431,19 @@ headroom.
   `_work` entry is a
   candidate only when **nothing under it has been written for longer than the floor**. The in-entry
   witness is the **checkout's own writes** (outputs, build artefacts, `.venv`/`node_modules`, any file a
-  step creates under the checkout) — NOT `_work/_temp`: the vendor resolves every runner-private
-  directory as `Combine(Work, <name>)` (`actions/runner` `src/Runner.Common/HostContext.cs`
-  `GetDirectory`, `case WellKnownDirectory.Temp`: `Path.Combine(GetDirectory(WellKnownDirectory.Work),
-  Constants.Path.TempDirectory)`), so `_temp` — like `_actions`, `_tool` and `_update` — is a **sibling
-  of `_work/<repo>` INSIDE `_work`**, not a directory at the runner root (older runner builds put them
-  at the install root; the checkout's `_work` is what this class sweeps). Writes there therefore do not
+  step creates under the checkout) — NOT `_work/_temp`: the vendor resolves the runner's private
+  directories as `Combine(Work, <name>)` (`actions/runner` `src/Runner.Common/HostContext.cs`
+  `GetDirectory`: `case WellKnownDirectory.Temp` → `Path.Combine(GetDirectory(WellKnownDirectory.Work),
+  Constants.Path.TempDirectory)`, and the same for `.Actions` and `.Update`), so `_temp` — like
+  `_actions` and `_update` — is a **sibling of `_work/<repo>` INSIDE `_work`**, not a directory at the
+  runner root (older runner builds put them at the install root; the checkout's `_work` is what this
+  class sweeps). ⛔ **`_tool` IS THE EXCEPTION AND ITS PREMISE IS CONDITIONAL:** `WellKnownDirectory.Tools`
+  prefers `$RUNNER_TOOL_CACHE` / `$RUNNER_TOOLSDIRECTORY` / `$AGENT_TOOLSDIRECTORY` and only falls back
+  to `Combine(Work, "_tool")` when all three are unset, so on a box that sets one (every github-hosted
+  image, many self-hosted) `_work/_tool` is not the tool cache and may not exist. The retain row is
+  still right — a directory by that name under `_work` is never a job checkout — but the reason is
+  "never a checkout", not "the vendor puts the tool cache here"; stating the fallback as a rule is the
+  same wrong-origin class this paragraph exists to correct. Writes there therefore do not
   refresh the checkout's floor, and mtime is a positive proof of death for the entry being reaped.
   ⛔ **But being none of the checkout's business is NOT the same as being invisible here**, and reading
   it as "at the runner root" was the whole of the shipped defect: `sweep_root` walks **every** entry of
@@ -1370,14 +1385,14 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **22 case functions driven
-23 times + 39 mutants, 62 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **23 case runs + 41 mutants,
+64 outcomes per box**, plus **3 top-level assertions on the owner's own source** (the
 pre-removal re-probe, which no existing case can drive behaviourally — see the comment at the assertion), so
-**65 outcomes** in total (case (s) is driven TWICE, at its two vanish sites), each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+**67 outcomes** in total (case (s) is driven TWICE, at its two vanish sites), each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
 against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **27 passed,
-38 failed, 2 skipped**, and against this tree **65 passed, 0 failed, 5 skipped**: the discrimination is
+38 failed, 2 skipped**, and against this tree **67 passed, 0 failed, 6 skipped**: the discrimination is
 measured both ways, not asserted. (The red on the pre-change tree is 20 of the 23 case runs — every case whose
 subject runs through the ENTRY POINT, which on that tree has no `class=runner-work` at all: (a), (b), (c),
 (d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r), (s) BOTH arms, (t), (v) and (w); the owner-only cases (i), (m) and
@@ -1385,7 +1400,7 @@ subject runs through the ENTRY POINT, which on that tree has no `class=runner-wo
 exist in that tree. The 21 mutants that DO still apply are reported "caught" only because their case is already
 red on that tree, so the green run above is the discriminating measurement, not that one. The two rows
 COMPOSE: 20 red case outcomes + 18 unappliable mutants = the 38 failures, and 21 applicable mutants (each
-"caught") + the 3 owner-only cases = the 24 passes.)
+"caught") + the 3 owner-only cases + the 3 top-level assertions = the 27 passes.)
 
 ⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement — BY THE SUITE THAT ACTUALLY ASSERTS IT.**
 The class's **record fields** at the ENTRY-POINT level (`freed_mb_runner_work=`,

@@ -380,7 +380,7 @@ case_b() { # <entry-point> <owner>
     # `--print-status` assertion at all.
     # ⛔ CORRECTED ATTRIBUTION — the previous version of this comment said `--print-status` renders "ONE
     # `|`-joined line", so a `^verdict_…$` grep "could never match". MEASURED FALSE: `print_status` emits
-    # **43 lines, one `key=value` per line, with ZERO `|`**, and `grep -c '^verdict_runner_work=ok$'`
+    # **46 lines, one `key=value` per line, with ZERO `|`**, and `grep -c '^verdict_runner_work=ok$'`
     # returns **1**. An anchored grep DOES match here, and the rest of the repo relies on exactly that
     # (`cloud-cell-supervisor.sh:4142` parses this very output with `sed -n 's/^status=//p'`). The
     # ⛔ CITATION CORRECTED AT THIS HEAD: this line used to say `:3973`, and a reviewer checked it —
@@ -465,6 +465,15 @@ case_j() { # <entry-point> <owner>
     fixture_age "$work/_vendor_added_later" 600 || return 1
     # the pairing: a genuinely dead checkout in the SAME pass, so this is not a blanket refusal
     fixture_entry dead "$work" job-abandoned 300 || return 1
+    # ⛔ AND AN ENTRY THAT IS A SYMLINK — the arm a review measured reading as a MEASURED ZERO (#3057
+    # review). `continue` fired before any counter, so a `_work` of links published `retained=0
+    # unmeasurable=0 census=ok` and named the entry NOWHERE. It is RETAINED (never followed, never a
+    # candidate) and it must be COUNTED and NAMED, so a `_work` of links is a visible carve-out.
+    _link_target="$T/j-target.$$.$RANDOM"
+    mkdir -p "$_link_target/payload" || return 1
+    printf 'outside\n' >"$_link_target/payload/file"
+    fixture_age "$_link_target" 600 || return 1
+    ln -s "$_link_target" "$work/job-linked" || return 1
     s1="$(uniqstate j1)"
     out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 run_pass "$pass" "$s1" "$base/gh-runner*/_work" --apply --only runner-work)"; rc=$?
     case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "the pass exits 0 (rc=$rc)"
@@ -476,13 +485,17 @@ case_j() { # <entry-point> <owner>
                "… it is NAMED with the vendor's own reason, so 'why is this still here' has an answer"
     case_check "$([ -d "$work/_vendor_added_later" ] && echo 0 || echo 1)" \
                "a vendor directory the layout table has NEVER SEEN is kept too — not a silent candidate"
+    case_check "$([ -e "$work/job-linked" ] && [ -f "$_link_target/payload/file" ] && echo 0 || echo 1)" \
+               "a SYMLINKED entry under _work is neither followed nor removed — its target is outside the population"
+    case_check "$(grep -qF 'reason=symlinked-entry' <<<"$out" && echo 0 || echo 1)" \
+               "… and it is NAMED (reason=symlinked-entry), not silently dropped from a population the class calls measured"
     case_check "$(grep -qF 'reason=vendor-namespace-unlisted' <<<"$out" && echo 0 || echo 1)" \
                "… and NAMED as an undecided directory, which is the point: the next one is a visible decision"
     case_check "$([ -d "$live" ] && echo 0 || echo 1)" "the live checkout itself was KEPT by the floor, same pass"
     case_check "$([ ! -e "$dead" ] && echo 0 || echo 1)" \
                "the dead checkout in the SAME pass WAS reaped — the retention is not a blanket refusal"
-    case_check "$(grep -qF 'retained=2' <<<"$out" && echo 0 || echo 1)" \
-               "both are counted on the class line (retained=2), so the carve-out is visible without the log"
+    case_check "$(grep -qF 'retained=3' <<<"$out" && echo 0 || echo 1)" \
+               "all three are counted on the class line (retained=3: _temp, the unlisted vendor dir AND the symlink), so the carve-out is visible without the log"
     return $((CASE_FAIL > 0))
 }
 
@@ -667,6 +680,33 @@ case_f() { # <entry-point> <owner>
                "… the pass-end LOG says NO class measured, never a 'measured classes: 0MB' about a pass that measured nothing"
     case_check "$(grep -q 'could not be set up: runner-work' <<<"$out" && echo 0 || echo 1)" \
                "… and the log NAMES the third cause, so the class it excluded has a reason on the surface a postmortem reads"
+    # ── (f4) THE ALARM IS GATED ON THE **MEASURED SUBSET**, not on the whole sum (#3057 review, P2) ────
+    # ⛔ MEASURED BEFORE THIS ARM: `alert=under-reclaim` required `_total_unmeasured = 0`, so ONE
+    # unmeasured class silenced the near-full-disk alarm on a pass whose MEASURED class demonstrably did
+    # not keep up (`--only venv` alone alerted; `--only venv,runner-work` with the owner missing alerted
+    # NOTHING). Nothing else in the repo recomputes that alarm, so it simply switched off. The fixture is
+    # a measured class that frees ~0 MB (`duplicate-install` over an empty temp root — nothing to reap)
+    # beside a class that could not be set up at all, with the free-space floor driven past any real box.
+    # Both numbers stay what they are (`freed_mb_total=unmeasured`), so the alarm and the total cannot
+    # contradict each other — and `alert_detail` says the figure is the measured subset.
+    s4="$(uniqstate f4)"; _di="$T/f4di.$$.$RANDOM"
+    mkdir -p "$_di/roots/installA/bin" "$_di/live" || return 1
+    : >"$_di/roots/installA/bin/Runner.Listener"
+    out="$(DISK_REAPER_STATE_DIR="$s4" REAP_DI_STATE_DIR="$s4" REAP_DI_ROOTS="$_di/roots" \
+           REAP_DI_LIVE_PATHS="$_di/live" DISK_REAPER_LOW_FREE_MB=999999999 \
+           DISK_REAPER_UNDER_RECLAIM_MB=1000000 RUNNER_WORK_REAPER=/nonexistent-owner \
+           bash "$pass" --apply --only duplicate-install,runner-work 2>&1)"; rc=$?
+    st="$(status_of "$s4")"
+    if grep -q '^freed_mb_duplicate_install=0$' <<<"$st"; then
+        case_check "$(grep -q '^alert=under-reclaim$' <<<"$st" && echo 0 || echo 1)" \
+                   "f4 … an unrelated UNMEASURED class does NOT silence the alarm: a MEASURED class that freed ~0 MB below the floor still alerts (the pre-fix predicate required the whole sum to be measured, so this pass alerted nothing)"
+        case_check "$(grep -q '^freed_mb_total=unmeasured$' <<<"$st" && echo 0 || echo 1)" \
+                   "f4 … and the pass TOTAL still abstains, so the alarm is not built on a sum containing an unconfirmed term"
+        case_check "$(grep -q '^alert_detail=.*measured classes only' <<<"$st" && echo 0 || echo 1)" \
+                   "f4 … and alert_detail NAMES that it is a lower bound, so the number an operator reads is labelled"
+    else
+        skip "f4 measured-subset alert — this host did not record a MEASURED duplicate-install figure (got '$(sed -n 's/^freed_mb_duplicate_install=//p' <<<"$st")'), so the two-class arm was NOT measured"
+    fi
     # ⛔ THE OTHER HALF: THE DEFAULT GLOBS MATCHING NOTHING IS **NOT** A FAILURE. A box with no runners
     # has an EMPTY POPULATION, which is a measurement (`roots=0`); painting it red every hour is the
     # alarm-fatigue shape this family forbids. Proven here so the refusal arm cannot swallow it.
@@ -674,13 +714,46 @@ case_f() { # <entry-point> <owner>
     # that HAS real runner roots (a cell: `/opt/gh-runner*/_work` holds ~19 G of live checkout) the arm
     # is SKIPPED by name and the documented defaults are asserted from the source instead. `--dry-run`
     # either way, so even the skipped-on-a-cell version could remove nothing.
+    # ⛔ THE REACHARM RUNS ON **EVERY** BOX, and that is deliberate (#3057 review). It is the one thing
+    # the glob seam cannot pin — its subject IS the default list — so its old form was a `grep -qF` for the
+    # literal strings, which stayed GREEN on a default that NAMED the roots and could not MATCH them. That
+    # is exactly what shipped: the flat `/tmp/actions-runner*/_work` never reaches the POOLED layout this
+    # repo's own `ci_runner_pool.sh` creates (`RUNNER_ROOT=/tmp/actions-runner`, instances one level down),
+    # so a pooled cell published `roots=0 candidates=0 census=ok` on an ARMED pass while the sink filled.
+    # The check EXTRACTS the shipped default string and expands it against a FIXTURE shaped like that
+    # layout, so it is falsifiable on a laptop, a cell, and under MUT_F5 alike — and it never reads,
+    # lists or touches a real root.
+    _dg="$(grep -o 'DISK_REAPER_RUNNER_GLOBS-[^}]*' "$pass" | head -1 | sed 's/^DISK_REAPER_RUNNER_GLOBS-//')"
+    case_check "$([ -n "$_dg" ] && echo 0 || echo 1)" \
+               "… the entry point's DEFAULT glob list could be read off the source (got '${_dg:-<nothing>}')"
+    # the POOLED layout, built under the suite's OWN `$HOME` fixture so the extracted default can be
+    # expanded exactly as the entry point would expand it. ⛔ It is one level DEEPER than the flat
+    # `$HOME/actions-runner*/_work`, so it cannot make `has_real_runner_root` answer true.
+    mkdir -p "$HOME/actions-runner/cell1-runner-1/_work" || return 1
+    # ⛔ THE EXTRACTED STRING CONTAINS A LITERAL `$HOME`, so it must be EVALUATED for the pattern to
+    # expand at all — `for _g in $_dg` word-splits but never re-expands a parameter, which is how the first
+    # version of this assertion "reached" nothing. The subshell keeps `set --` off the case's own `$@`.
+    # ⛔ AND THE PROBE IS SCOPED TO THE `actions-runner` GLOBS, not the whole list: on a cell
+    # `/opt/gh-runner*/_work` really exists, so an unscoped `-d` probe would satisfy this assertion from the
+    # BOX rather than from the default under test — and the flat-only mutant would survive on exactly the box
+    # class this arm exists for (measured: it did).
+    _reach=1
+    ( eval "set -- $_dg"
+      for _g in "$@"; do
+          case "$_g" in *actions-runner*) [ -d "$_g" ] && exit 0 ;; esac
+      done
+      exit 1 ) && _reach=0
+    case_check "$_reach" \
+               "… and it REACHES the pooled layout \`ci_runner_pool.sh\` creates (\$RUNNER_ROOT/<name>/_work) — a FLAT-only default is INERT ON A CELL WHILE READING HEALTHY (\`roots=0 census=ok\`)"
+    _flat=1
+    case " $_dg " in *' /opt/gh-runner*/_work '*) _flat=0 ;; esac
+    case_check "$_flat" \
+               "… and still names the FLAT /opt runner installs, so covering the pool must not narrow it (both depths ship)"
     if has_real_runner_root; then
         # ⛔ `skip`, NOT `case_check 0` — the arm did NOT run, so it must not be reported as one that did.
-        # The case's own status still comes from the assertions below, which DO run and are falsifiable on
-        # any box (they read the source), so a broken default list still reddens here.
-        skip "(f) default-glob half, entry point $pass — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead"
-        case_check "$(grep -qF '/opt/gh-runner*/_work' "$pass" && grep -qF 'actions-runner*/_work' "$pass" && echo 0 || echo 1)" \
-                   "… the entry point's DEFAULT glob list still names the documented /opt and actions-runner roots"
+        # The case's own status still comes from assertions that DID run (the reach arm above), so the tally
+        # stays honest in both directions.
+        skip "(f) default-glob half, entry point $pass — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted by REACH instead"
         return $((CASE_FAIL > 0))
     fi
     out="$(DISK_REAPER_STATE_DIR="$s2" REAP_RW_STATE_DIR="$s2" BOUNDED_LIB="$HERE/lib/bounded.sh" \
@@ -1525,6 +1598,16 @@ MUT_C='/|retain|/d; s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__n
 MUT_D='s/^want_class runner-work && { WANT_RW=1;/true \&\& { WANT_RW=1;/'
 MUT_E='s/valid: uv, venv, worktree, duplicate-install, runner-work/valid: uv, venv, worktree, duplicate-install/g'
 MUT_F2='s/^    if \[ "\$_rw_census" = "no-roots" \]; then/    if false; then/'
+# (f)'s THIRD arm, and it is the P1 a review measured: the shipped DEFAULT list named the actions-runner
+# roots in a FLAT form (`/tmp/actions-runner*/_work`) that cannot match the POOLED layout this repo's own
+# `ci_runner_pool.sh` creates, so a pooled cell published `roots=0 census=ok` on an ARMED pass. The edit
+# strips BOTH nested patterns and leaves the flat ones, so only the reach assertion can redden — which is
+# what makes it an assertion about REACH rather than about the presence of a string.
+MUT_F5='s| \$HOME/actions-runner/\*/_work||; s| /tmp/actions-runner/\*/_work||'
+# (f4)'s arm: restore the PRE-FIX gate — the alert suppressed whenever ANY class went unmeasured, rather
+# than gated on the measured subset. If this survives, one unrelated measurement failure can switch the
+# near-full-disk alarm off again on a pass that demonstrably did not keep up.
+MUT_F6='s/"\${_measured_total:-none}" != none/"${_total_unmeasured:-0}" != 1/'
 MUT_G='s/^    export REAP_RW_STATE_DIR=.*$/    : REAP_RW_STATE_DIR deliberately NOT relayed/'
 MUT_H1='s/^case "\$RUNNER_GLOBS" in \*\[!\[:space:\]\]\*) : ;; \*)/case "$RUNNER_GLOBS" in *[![:space:]]*) : ;; __never__)/'
 MUT_H2='s/^case "\$GLOBS" in \*\[!\[:space:\]\]\*) : ;; \*)/case "$GLOBS" in *[![:space:]]*) : ;; __never__)/'
@@ -1550,6 +1633,12 @@ MUT_U="s/^            misconfigured) printf '?' ;;$/            misconfigured) p
 # unlisted-vendor default, which is what makes the NEXT vendor directory safe.
 MUT_J1='/^_temp|retain|live-job-temp|/d'
 MUT_J2='s/^VENDOR_NAMESPACE_PREFIX="_"$/VENDOR_NAMESPACE_PREFIX="__never__"/'
+# (j)'s THIRD arm, on the SYMLINKED-ENTRY accounting a review measured: the entry was skipped before any
+# counter, so a `_work` of links read as a measured empty population and the carve-out was invisible. The
+# edit deletes the COUNT only (12 spaces of indent — `prune_entry`'s own increment is at 8, so this anchor
+# is unambiguous); the link is still not followed, so the target assertions stay green and only the
+# `retained=` / `reason=symlinked-entry` claims can redden. That is the discrimination this arm needs.
+MUT_J3='s/^            RETAINED=\$((RETAINED + 1))$//'
 # (l)'s arm: the whole "the root itself is a measurement" guard. Deleting it restores the measured-zero
 # reading a reviewer found at this head, so if this mutant ever survives the abstention has gone inert.
 MUT_L='s/^    if \[ "\$_seen" = 0 \] && ! root_is_listable "\$root"; then$/    if false; then/'
@@ -1718,6 +1807,16 @@ if apply_mutation "$REAPER" "$T/mut-f4/disk-reaper.sh" "$MUT_F4"; then
 else
     bad "f mutation could not be applied (the measured-classes exclusion moved) — the pass-end figure is not checked any more"
 fi
+if apply_mutation "$REAPER" "$T/mut-f5/disk-reaper.sh" "$MUT_F5"; then
+    expect_fail "f mutation: a FLAT-only default glob list turns the case RED — it cannot reach the pooled \$RUNNER_ROOT/<name>/_work layout, so the class is inert on a cell while reading healthy" case_f "$T/mut-f5/disk-reaper.sh" "$OWNER"
+else
+    bad "f mutation could not be applied (the default glob list moved) — the case is not checking REACH any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-f6/disk-reaper.sh" "$MUT_F6"; then
+    expect_fail "f mutation: restoring the whole-sum gate on the under-reclaim alert turns the case RED — one unmeasured class then silences the alarm on a pass that did not keep up" case_f "$T/mut-f6/disk-reaper.sh" "$OWNER"
+else
+    bad "f mutation could not be applied (the alert's gate moved) — the case is not checking it any more"
+fi
 
 expect_pass "g a FULL-DISK fallback pass still hands this owner a writable dir" case_g "$REAPER" "$OWNER"
 if apply_mutation "$REAPER" "$T/mut-g/disk-reaper.sh" "$MUT_G"; then
@@ -1755,6 +1854,11 @@ if apply_mutation "$OWNER" "$T/mut-j2/reap-runner-work.sh" "$MUT_J2"; then
     expect_fail "j mutation: dropping the vendor-namespace default turns the case RED (the NEXT vendor dir)" case_j "$REAPER" "$T/mut-j2/reap-runner-work.sh"
 else
     bad "j mutation could not be applied (the vendor-namespace default moved) — the case is not checking it any more"
+fi
+if apply_mutation "$OWNER" "$T/mut-j3/reap-runner-work.sh" "$MUT_J3"; then
+    expect_fail "j mutation: dropping the symlinked-entry COUNT turns the case RED (the entry reads as a measured zero)" case_j "$REAPER" "$T/mut-j3/reap-runner-work.sh"
+else
+    bad "j mutation could not be applied (the symlinked-entry counter moved) — the case is not checking it any more"
 fi
 
 expect_pass "k a \`reap\` row is HONOURED — the table's other disposition is not inert" case_k "$REAPER" "$OWNER"

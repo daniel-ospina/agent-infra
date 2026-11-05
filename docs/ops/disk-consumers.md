@@ -88,7 +88,10 @@ that GAINED five runners in a week silently lost its headroom and nothing measur
 `scripts/disk-reaper.sh` only runs and accounts for it):
 
 * discovery is a bounded, documented glob list: `/opt/gh-runner*/_work`, `$HOME/actions-runner*/_work`,
-  `/tmp/actions-runner*/_work` (`DISK_REAPER_RUNNER_GLOBS`);
+  `$HOME/actions-runner/*/_work`, `/tmp/actions-runner*/_work`, `/tmp/actions-runner/*/_work`
+  (`DISK_REAPER_RUNNER_GLOBS`) — **both depths**, because `scripts/ci_runner_pool.sh` puts a pooled
+  runner's `_work` at `$RUNNER_ROOT/<name>/_work` (one level deeper than a flat `/opt` install), and a
+  flat-only list missed it and read the miss as a measured empty population;
 * **the gate is mtime over the entry and its content**: an entry is a candidate only when **nothing in
   it has been written for longer than `DISK_REAPER_RUNNER_MIN_AGE`** (default 7200 s — the only
   empirically validated value; it was 3600 s, half of it), the entry's own

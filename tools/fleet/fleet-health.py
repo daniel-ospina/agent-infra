@@ -569,13 +569,23 @@ def _class_note(kv):
 
     Benign spellings stay silent (`ok`, `not-run`, `?`, absent) so a healthy cell gains no noise; every
     other spelling is printed — FAIL-LOUD on an unrecognised one, the same polarity as `_dclass`.
+
+    ⛔ ONLY `runner_work` PUBLISHES THE TALLY (#3057 review, measured). `disk-reaper.sh` writes
+    `unmeasurable_runner_work=` — its owner answers `unmeasurable=` — and writes NO
+    `unmeasurable_duplicate_install=`, because that owner has no such field. Looking the tally up for
+    every class made the `duplicate-install` clause unrenderable: a `⚠️ duplicate-install=partial`
+    could never be followed by a count, so the operator it was written for ("one unreadable root or
+    fifty?") got nothing, and the sentence above implied a guarantee the record does not carry. The
+    VERDICT loop stays over both classes — both verdict fields are written — and the tally is gated on
+    the classes that actually publish it.
     """
+    tally_classes = ("runner_work",)
     out = ""
     for cls in ("runner_work", "duplicate_install"):
         verdict = kv.get(f"verdict_{cls}", "")
         if verdict in ("", "ok", "not-run", "?"):
             continue
-        unm = kv.get(f"unmeasurable_{cls}", "")
+        unm = kv.get(f"unmeasurable_{cls}", "") if cls in tally_classes else ""
         out += f" ⚠️ {cls.replace('_', '-')}={verdict}" + (f" unmeasurable={unm}" if unm else "")
     return out
 
