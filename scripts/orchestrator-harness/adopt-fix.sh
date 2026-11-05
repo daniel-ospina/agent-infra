@@ -42,7 +42,18 @@ if [ "$_wt_rc" = 4 ]; then
   # name the DISK gate rather than a materialisation failure. `worktree add` was never ATTEMPTED —
   # that is the property that makes the refusal free, and the reason it must not read as an add error.
   echo "[adopt-fix $PR] $WT_RESULT" | tee -a "$O/logs/adopt-$PR.log"
-  echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — nothing created; reclaim space; this will NOT clear by waiting" | tee -a "$O/logs/adopt-$PR.log"
+  # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review round 5, P2 — MEASURED). BOTH
+  # pre-start arms reach rc 4 with `REFUSED-UNKNOWN`: an unreadable `df`, and a half-deployed `$O`
+  # missing `spawn-gate.sh` (`wt-lifecycle.sh`'s own arm pins that skew). This line used to tell the
+  # operator to "reclaim space; this will NOT clear by waiting" for both — a remedy that CANNOT ARRIVE
+  # for a broken probe or a version skew, which is the #2721 wrong-cause class this PR fixes one file
+  # over in `fix-one.sh`. `$WT_RESULT` already names which arm refused, so the remedy is read from it.
+  case "$WT_RESULT" in
+    *REFUSED-UNKNOWN*)
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-UNKNOWN: nothing was created, and this is NOT a full disk. The free-space probe could not answer, so check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033). Reclaiming space will NOT clear it." | tee -a "$O/logs/adopt-$PR.log" ;;
+    *)
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-DISK: nothing created; reclaim space; this will NOT clear by waiting" | tee -a "$O/logs/adopt-$PR.log" ;;
+  esac
   exit 77
 fi
 if [ "$_wt_rc" != 0 ]; then

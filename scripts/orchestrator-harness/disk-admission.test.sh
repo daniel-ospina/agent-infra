@@ -249,6 +249,18 @@ LIVE_NEED="$( env DISK_MIN_FREE_MB=500 bash -c '. "$1"; set -- $(disk_lane_costs
 [ "$NEED" = "$LIVE_NEED" ]; rc=$?
 ck "the seam's requirement equals the live arm's disk_lane_need on a python target (seam=$NEED, live=$LIVE_NEED)" $rc
 
+# ⛔ …AND THE ARM ABOVE CANNOT SEE A RAISED `tree` (review round 5, P2 — MEASURED). With the shipped
+# defaults `tree` (350) < `self` (6,144), so `max(tree, self)` IS `self` and a tree-BLIND seam agrees
+# with the live arm by accident. State the tree the cell actually pays and the two seams parted:
+# `disk_worktree_need` answered 2,064 while `disk_lane_need` answered 22,000 — so the worktree was
+# materialised and `run_agent` refused one step later, i.e. #3395's defect under a configured bound.
+# `DISK_LANE_TREE_MB` is precisely the remedy docs/ops/disk-reaper.md gives a repo whose python markers
+# do not match, so the arm that pins "one bound" has to drive it.
+SEAM_T="$( env DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=20000 DISK_LANE_SELF_MB=64 bash -c '. "$1"; disk_worktree_need' _ "$GATE" )"
+LIVE_T="$( env DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=20000 DISK_LANE_SELF_MB=64 bash -c '. "$1"; set -- $(disk_lane_costs "$2"); disk_lane_need "$1" "$2" "$3"' _ "$GATE" "$T/pytarget" )"
+{ [ "$SEAM_T" = "$LIVE_T" ] && [ "$SEAM_T" = 22000 ]; }; rc=$?
+ck "the seam equals the live arm under a RAISED DISK_LANE_TREE_MB (seam=$SEAM_T, live=$LIVE_T, want 22000) — a tree-blind seam answers 2064, which admits the lane run_agent then refuses" $rc
+
 # ⛔ AN ALL-DIGIT READING BEYOND THE COMPARISON'S RANGE MUST REFUSE (review round 2, P2). The first
 # version compared `free -lt need`, so an ERRORED comparison (rc 2) read as "not below" and ADMITTED.
 OVR="$( env DISK_MIN_FREE_MB=500 bash -c '
@@ -491,9 +503,20 @@ case "$_fixarm" in
   *) bad "H3) fix-one.sh's rc-4 arm is no longer extractable or no longer refunds the attempt"; _fixarm="" ;;
 esac
 H3D="$T/h3"; mkdir -p "$H3D"
-H3OUT="$( ( _wt_rc=4; PR=4242; L="$H3D"; WT_RESULT="REFUSED-DISK(free=100, need=200, box=rig)"
-             refund_gate_attempt() { : > "$H3D/refunded"; }
-             eval "$_fixarm" ) 2>&1 )"
+# ⛔ THE ARM IS DRIVEN THROUGH A HELPER FUNCTION, NOT AN INLINE `$( … )` BLOCK (review round 5, P1 —
+# MEASURED). The stub defines a FUNCTION, and a `$( … )` whose double-quoted string spanned three
+# physical lines left `check-false-pass-shapes.sh`'s brace walk believing a block opened there never
+# closed — the scan of THIS file then reported PARTIAL, and that suite FAILED on it ("1 of 310 file(s)
+# were only PARTIALLY scanned", #2096). The helper is also the honest shape: it NAMES what the subshell
+# is for. The subshell is still required — the arm's own `exit 77` must not end this suite.
+# ⛔ THE STUB READS `_h3dir`, NOT `$1`: a function called with no arguments has its OWN (empty)
+# positional parameters, so a `"$1"` body would be an unbound variable under this file's `set -u`.
+_h3drive() { # <dir> <issue> <verdict> — run the extracted rc-4 arm under that refusal verdict
+  _h3dir="$1"; _wt_rc=4; PR="$2"; L="$1"; WT_RESULT="$3"
+  refund_gate_attempt() { : > "$_h3dir/refunded"; }
+  eval "$_fixarm"
+}
+( _h3drive "$H3D" 4242 "REFUSED-DISK(free=100, need=200, box=rig)" ) >/dev/null 2>&1
 H3RC=$?
 if [ "$H3RC" -eq 77 ]; then ok "H3) the rc-4 arm exits 77, the disk gate's own code (never a generic 1)"; else bad "H3) the rc-4 arm exited $H3RC, not 77 — the operator is sent to a remedy that cannot clear it"; fi
 if [ -f "$H3D/refunded" ]; then ok "H3) …and the attempt is REFUNDED (a free refusal must not spend one)"; else bad "H3) the refusal consumed the attempt — refund_gate_attempt did not run"; fi
@@ -505,9 +528,7 @@ if [ -f "$H3D/refunded" ]; then ok "H3) …and the attempt is REFUNDED (a free r
 # remedy line, and `REFUSED-UNKNOWN` proves the interpolated verdict survives — so this drives BOTH
 # branches of the cause selector.
 H3U="$T/h3u"; mkdir -p "$H3U"
-( _wt_rc=4; PR=4243; L="$H3U"; WT_RESULT="REFUSED-UNKNOWN(free=?, need=8144, box=rig)"
-  refund_gate_attempt() { : > "$H3U/refunded"; }
-  eval "$_fixarm" ) >/dev/null 2>&1
+( _h3drive "$H3U" 4243 "REFUSED-UNKNOWN(free=?, need=8144, box=rig)" ) >/dev/null 2>&1
 H3ULOG="$(cat "$H3U.log" 2>/dev/null)"
 case "$H3ULOG" in
   *REFUSED-UNKNOWN*) ok "H3) …the operator log carries the verdict it was given (REFUSED-UNKNOWN survives the interpolation)" ;;
