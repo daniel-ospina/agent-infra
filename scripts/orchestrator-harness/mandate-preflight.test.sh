@@ -955,6 +955,45 @@ M1_RANK="$(_mp_rank "$MERGE" '^[[:space:]]*for _ms in .*mandate-preflight\.sh' '
 [ "$SP_RANK" = "OK" ]; ck $? "spawn-gate.sh ranks the box's \$O copy AHEAD of the legacy ~/.pi/agent/scripts one (measured $SP_RANK; a reordering that puts the stale farmed copy first used to pass)"
 [ "$M1_RANK" = "OK" ]; ck $? "…and merge-one.sh ranks them the same way (measured $M1_RANK — the two seams must agree on ORDER, not just membership)"
 
+# ── E5e: REASON SELECTION, AND THE LANE-FACING REMEDIES (#3379 review cycle 24, P2, MEASURED) ──────────
+# Cycle 21/22 pinned the two reason SENTENCES with source greps and left the branch that CHOOSES between them
+# free: inverting `[ -z "$_mp_sh" ]` → `[ -n "$_mp_sh" ]` left 209/0 on BOTH seams, and both sentences are
+# still in the file so both greps still pass. On the population #3377 measured the operator is then told
+# "at  is unusable" (replace a file that does not exist) while a present-but-unusable helper reports "not
+# found (looked in $O …)" (sync a file that is right there) — the sync-vs-replace defect those cycles closed.
+grep -qF '[ -z "$_mp_sh" ]' "$SPAWN"; ck $? "spawn-gate.sh CHOOSES the not-found reason when the helper was not found (the two sentences were pinned; the branch between them was not)"
+grep -qF '[ -z "${mandate_sh:-}" ]' "$MERGE"; ck $? "…and merge-one.sh makes the same choice the same way"
+# The LANE-FACING remedies, read from the rendered block rather than grepped in the source.
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+L24="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+case "$L24" in *'Say so plainly in your report; do NOT claim to have read it'*) ok "the MISSING block tells the LANE what to do with the absence (say it, do not claim to have read it) — identification pinned without its instruction was the c23 class" ;; *) bad "the MISSING block lost its instruction to the lane" ;; esac
+case "$L24" in *'Proceed with the BRIEF'*) ok "…and the block still ENDS with its closing instruction, so the last line the lane reads is present (a colon in place of the write used to pass a source grep)" ;; *) bad "the block lost its closing instruction — the last line the LANE reads" ;; esac
+UD24="$(mktemp -d)"; mkdir -p "$UD24/.pi/agent/state"; chmod 000 "$UD24/.pi/agent/state"
+L24UD="$(CELL_HOME="$UD24" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+chmod 755 "$UD24/.pi/agent/state"; rm -rf "$UD24"
+case "$L24UD" in *'remedy is a mode fix on that directory, NOT a missing deployment'*) ok "the undecidable renderer names the mode-fix remedy (a chmod on the dir, not a deployment) — read from the block an unsearchable state dir actually renders" ;; *) bad "the undecidable renderer dropped its remedy" ;; esac
+case "$L24UD" in *'so whether the lane can obey its'*) ok "…and still says what is UNKNOWN, not merely that something is" ;; *) bad "the undecidable renderer no longer states what is unknown" ;; esac
+NOBASE_L24="$(env -u HOME -u CELL_HOME bash "$HELPER" --line 2>/dev/null)"
+case "$NOBASE_L24" in *'remedy is an environment fix'*) ok "…and with no base to name it prescribes an ENVIRONMENT fix instead of a chmod on a path that does not exist" ;; *) bad "the no-base renderer lost its distinct remedy" ;; esac
+case "$NOBASE_L24" in *'neither CELL_HOME nor HOME is set'*) ok "…and still says WHY no base can be named" ;; *) bad "the no-base renderer no longer says why" ;; esac
+# ⛔ THE THIRD LEG OF `healthy` IS PINNED LIKE ITS SIBLINGS (#3379 review cycle 24, P2, MEASURED): the comment
+# claimed "the three collectors are each pinned" and only `mandate_missing` was. Stubbing each in turn is the
+# instrument that already reddens for the missing one.
+for _coll24 in mandate_unreadable mandate_irregular; do
+  # ⛔ THREE THINGS MUST BE TRUE FOR THIS ARM TO SEE ITS LEG AT ALL (#3379 review cycle 24, MEASURED — the arm
+  # passed green twice before the fixture was right): (1) the brief must ALREADY carry a SENTINEL block, or
+  # the emit returns early; (2) the box must be otherwise PERFECT, or `mandate_missing` blocks the `healthy`
+  # gate regardless and the leg under test is invisible; (3) the renderer must be stubbed empty, which is the
+  # failure the leg exists to catch. Then leg present → no PRESENT claim; leg deleted → a PRESENT claim.
+  _b24="$TMP/brief-hl-$_coll24.txt"; seam_brief "$_b24"
+  mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+  CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" stamp' _ "$HELPER" "$TMP/hl24.log" "$_b24" >/dev/null 2>&1
+  grep -qF 'MANDATE-UNSATISFIABLE' "$_b24"; ck $? "E5e fixture ($_coll24): a SENTINEL block is stamped first (an unstamped brief returns early and the arm cannot fail)"
+  : > "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; : > "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+  CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_line() { :; }; '"$_coll24"'() { printf "%s\n" /x/y; }; mandate_preflight_emit "$2" "$3" hl' _ "$HELPER" "$TMP/hl24.log" "$_b24" >/dev/null 2>&1
+  if grep -qF 'BOTH mandated files are now PRESENT' "$_b24"; then bad "an empty render on a $_coll24-non-empty box was answered with a PRESENT claim — that leg of the healthy gate is load-bearing and unpinned"; else ok "…and the healthy gate refuses on a non-empty $_coll24 ALONE, every other leg clean (leg pinned, as the comment claimed)"; fi
+done
+
 # ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
 # ⛔ CYCLE 1'S ARMS WERE VACUOUS (measured in cycle 2): they grepped for the STRING `MANDATE_PREFLIGHT_SH`,
 # which the explanatory COMMENT above the resolver also contains — so reverting the whole merge-one.sh fix
