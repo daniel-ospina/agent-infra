@@ -286,17 +286,26 @@ LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown")
 # the fleet's existing two-sample span.
 LOG_WINDOW_MS = 30_000
 # The freeze window: how long EVERY signal must have been flat before a LIVE tree
-# is called ``frozen``. `LANE_REAP_LIVE_MIN` default 45 min — already the reviewed
-# bound for "log advanced ⇒ live" — reused so ONE number answers one question
-# instead of a second, unreviewed one.
-# ⛔ IT IS **NOT** ABOVE THE WALL LIMIT ANY MORE, and the old rationale said it was.
-# `lane.sh` now runs `run_agent "${LANE_TIMEOUT:-3300}"` (``lane.sh:387``; its own
-# comment: "THE WALL LIMIT GREW BECAUSE THE JOB DID (3300s, was 2400s)") and
-# `lane-bound.sh`\'s `--wall` default is likewise 3300. So 2700 s is BELOW the wall
-# clock by 10 min, and the freeze window can fire on a lane still inside its allowance.
-# 45 min is still the right number — it is the REAPER\'s own kill threshold
-# (`lane-reap.sh` `LANE_REAP_LIVE_MIN`) and well above `lane-bound.sh`\'s 1200 s idle
-# bound — but for THAT reason, not for a wall-clock ordering that no longer holds.
+# is called ``frozen``. 45 min = 2700 s is the fleet's ALREADY DECLARED no-progress
+# allowance, copied rather than invented: it is ``lane-bound.sh``'s ``--idle``
+# default (``LANE_BOUND_IDLE_S``, scripts/orchestrator-harness/lane-bound.sh) and
+# ``DEFAULT_PROGRESS_AGE_MS`` = 2_700_000 ms
+# (extensions/shared/heartbeat-progress-edges.ts, the builtin-tools ``no-progress``
+# clause #5195). ``frozen`` asks the SAME question ``--idle`` answers — "no progress
+# on any signal" — so it takes that bound and no second, unreviewed one.
+# ⛔ IT IS **NOT** ``LANE_REAP_LIVE_MIN``, and an earlier revision of this comment
+# said it was. That constant is 125 min since agent-infra#2888, because it is an
+# MTIME-ONLY window and must sit ABOVE the wall backstop so a live lane inside one
+# silent tool call does not read as dead. This axis is decided on CPU as well, so
+# its analogue is the PROGRESS bound, not the mtime window; re-pointing this at
+# 125 min would make ``frozen`` unreachable on exactly the wedge class it names.
+# ⛔ AND IT SITS BELOW THE WALL ON PURPOSE. ``lane-bound.sh``'s ``--wall``
+# (``LANE_BACKSTOP_S`` = 7200 s) is a BACKSTOP; since #2888 the PROGRESS bound is
+# primary, so it must fire FIRST — otherwise the wall pre-empts it and a lane that
+# is still working is killed by elapsed time, which is the measured defect #2888
+# fixes. An earlier revision called this ordering a defect and cited stale
+# literals (``lane.sh``'s ``3300``; ``--wall`` default ``3300``; a 1200 s
+# ``--idle``): ``lane.sh`` now passes ``LANE_TIMEOUT:-$LANE_BACKSTOP_S``.
 LOG_FREEZE_MS = 45 * 60 * 1000
 # The CPU tolerance: a delta at or below this is NOT progress. `LANE_REAP_CPU_TOL_CS`
 # default 10 (0.10 s) — a sub-0.1 s twitch is indistinguishable from a parked fork

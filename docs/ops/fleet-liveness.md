@@ -1658,13 +1658,24 @@ So on Linux, `LOG_WINDOW_MS` = 30 s (`LANE_REAP_WINDOW`) with `LOG_CPU_TOL_CS` =
 (`LANE_REAP_CPU_TOL_CS`) resolves S2 to **0.10 CPU-seconds per 30 s (about 3.3 mCPU)**. Where only a
 whole-second `ps` is available the floor is **1.0 CPU-s per window (about 33 mCPU)** — a lane burning
 under ~3 % of a core reads flat there, which is why `/proc` is preferred and why the tolerance alone
-is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is `LANE_REAP_LIVE_MIN`'s existing value — already the reviewed
-bound for "log advanced ⇒ live" — reused so one number answers one question instead of a second,
-unreviewed one. **It is NOT above the wall clock** (an earlier revision said it was): `lane.sh` now runs
-`run_agent "${LANE_TIMEOUT:-3300}"` and `lane-bound.sh`'s `--wall` default is likewise 3300, so 2700 s
-sits 10 min *below* it. 45 min is still the right number because it is the **reaper's own kill
-threshold** (`lane-reap.sh` `LANE_REAP_LIVE_MIN`) and well above `lane-bound.sh`'s 1200 s idle bound —
-for that reason, not for a wall-clock ordering that no longer holds.
+is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is the fleet's **already declared
+no-progress allowance**, copied rather than invented: `lane-bound.sh`'s `--idle` default
+(`LANE_BOUND_IDLE_S` = 2700 s, `scripts/orchestrator-harness/lane-bound.sh`) and
+`DEFAULT_PROGRESS_AGE_MS` = 2_700_000 ms (`extensions/shared/heartbeat-progress-edges.ts`). `frozen`
+asks the same question `--idle` answers — *no progress on any signal* — so it takes that bound rather
+than a second, unreviewed one.
+
+**It is NOT `LANE_REAP_LIVE_MIN`** (125 min, `agent-infra#2888`), and an earlier revision of this
+paragraph said it was. That window is decided on log **mtime alone**, so it must sit *above* the 2 h
+wall backstop or a live lane inside one silent tool call reads as dead. This axis is decided on CPU as
+well, so its analogue is the **progress** bound; re-pointing it at 125 min would make `frozen`
+unreachable on exactly the wedge class it exists to name. **And it sits below the wall clock on
+purpose:** `--wall` (`LANE_BACKSTOP_S` = 7200 s) is a BACKSTOP, and since `agent-infra#2888` the
+progress bound is PRIMARY — it must fire first, otherwise the wall pre-empts it and a lane that is
+still working is killed by elapsed time, which is the measured defect #2888 fixes. (That earlier
+revision called this ordering a defect and cited stale literals — `lane.sh`'s `3300`, a `--wall`
+default of `3300`, and a 1200 s `--idle` bound. `lane.sh` now passes
+`run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}"`.)
 
 **A NEGATIVE DELTA IS A BROKEN READING, NOT A FLAT ONE.** A stable subtree cannot *lose* CPU, so a
 negative delta means one of the two reads was incomplete (a child exited between the samples, a
