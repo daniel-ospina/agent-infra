@@ -977,6 +977,111 @@ else
     *) bad "depth-unknown: the REVERTED gate did not reproduce the defect — $OUT_M" ;;
   esac
 fi
+# ── 4a3) THE `running` ARM'S EMPTY SENTENCE IS GATED TOO (review P2, cycle 16) ──
+# `backlog` is 0 by INITIALISATION when the depth could not be read, and the in-flight branch tested
+# `[ "$backlog" -gt 0 ]` alone — so a queue behind a mode-000 file, holding rows, printed "the queue is
+# EMPTY; … work in progress". The witness was wired into the `result=ok` arm only; this is the branch one
+# level down.
+mk_case running-depth-unknown
+mk_tool_clean "$D"
+printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+mkdir -p "$D/o/state"
+printf 'result=running\nat=%s\nrepo=daniel-ospina/agent-infra\n' "$(date +%s)" > "$D/o/state/refresh-last"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+case "$OUT_DRIVE" in
+  *"the queue is EMPTY"*) bad "running-depth-unknown: the in-flight arm claimed the queue is EMPTY over a depth nobody measured — $OUT_DRIVE" ;;
+  *) ok "running-depth-unknown: no 'the queue is EMPTY' claim when the depth could not be measured" ;;
+esac
+case "$OUT_DRIVE" in
+  *"DEPTH of the queue could not be measured"*) ok "running-depth-unknown: the in-flight line names the depth as unmeasured" ;;
+  *) bad "running-depth-unknown: the in-flight line does not say the depth is unknown — $OUT_DRIVE" ;;
+esac
+chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+# a READABLE, MEASURED-EMPTY queue in the same branch must still say EMPTY (the guard does not silence it)
+mk_case running-empty
+mk_tool_clean "$D"
+: > "$D/o/candidates.txt"
+mkdir -p "$D/o/state"
+printf 'result=running\nat=%s\nrepo=daniel-ospina/agent-infra\n' "$(date +%s)" > "$D/o/state/refresh-last"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+case "$OUT_DRIVE" in
+  *"the queue is EMPTY"*) ok "running-empty: a MEASURED empty queue still reads as EMPTY in flight" ;;
+  *) bad "running-empty: a measured empty queue stopped reading as EMPTY — $OUT_DRIVE" ;;
+esac
+# NON-VACUITY (4a3): drop the witness arm and the in-flight branch prints EMPTY again.
+FNS_R="$T/origination-fns-running-rev.sh"
+sed 's/^    elif \[ "\$_bl_state" = "UNKNOWN" \] && \[ "\$backlog" -le 0 \]; then$/    elif false; then/' "$FNS" > "$FNS_R" 2>/dev/null
+if cmp -s "$FNS" "$FNS_R" 2>/dev/null; then bad "running-depth-unknown: the witness-arm removal did not apply — the sed anchor drifted"
+else
+  OUT_R="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS_R" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  case "$OUT_R" in
+    *"the queue is EMPTY"*) ok "running-depth-unknown: non-vacuity — without the witness arm the EMPTY claim returns" ;;
+    *) bad "running-depth-unknown: the REVERTED gate did not reproduce the defect — $OUT_R" ;;
+  esac
+fi
+
+# ── 4a4) A RECORDED UNKNOWN IS A FALLBACK, NOT AN OVERRIDE (review P3, cycle 16) ──
+# The beat measured a genuinely empty queue; the record says UNKNOWN. The measurement outranks the
+# recorded absence of one — otherwise the line claims "this beat … failed to read it" about a read it
+# performed, and denies a drained queue that is right there.
+mk_case ok-record-unknown-measured-empty
+mk_tool_clean "$D"
+: > "$D/o/candidates.txt"
+mkdir -p "$D/o/state"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=0\nqueued=0\nbacklog=UNKNOWN\nhanded=\n' "$(date +%s)" > "$D/o/state/refresh-last"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+case "$OUT_DRIVE" in
+  *"DEPTH of the queue could not be measured"*) bad "record-unknown: a recorded UNKNOWN overrode a measurement the beat DID take — $OUT_DRIVE" ;;
+  *"the queue is EMPTY"*) ok "record-unknown: the beat's own measurement wins, so a drained queue still reads as EMPTY" ;;
+  *) bad "record-unknown: unexpected line — $OUT_DRIVE" ;;
+esac
+# NON-VACUITY (4a4): make a recorded UNKNOWN override the beat's own measurement again.
+FNS_O="$T/origination-fns-override-rev.sh"
+sed 's/^    UNKNOWN) \[ "\$_bl_state" = "READ" \] || _bl_state="UNKNOWN" ;;$/    UNKNOWN) _bl_state="UNKNOWN" ;;/' "$FNS" > "$FNS_O" 2>/dev/null
+if cmp -s "$FNS" "$FNS_O" 2>/dev/null; then bad "record-unknown: the override revert did not apply — the sed anchor drifted"
+else
+  OUT_O="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS_O" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  case "$OUT_O" in
+    *"DEPTH of the queue could not be measured"*) ok "record-unknown: non-vacuity — letting the record override restores the false 'both failed to read' sentence" ;;
+    *) bad "record-unknown: the REVERTED precedence did not reproduce the defect — $OUT_O" ;;
+  esac
+fi
+
+# ── 4a5) dispatch_funnel's OWN depth read (review P3, cycle 16) ──
+# Same class, same file, 250 lines down: `[ -f ]` passes a mode-000 file, `wc -l <` had no redirect (so the
+# shell's `Permission denied` reached the operator line) and `is_num || backlog=0` rendered the miss as a
+# measurement.
+mk_case funnel-depth-unknown
+mk_tool_clean "$D"
+printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+# `dispatch_funnel` ships AFTER the origination block's end marker, so it is extracted on its own.
+FN_FNS="$T/funnel-fns.sh"
+awk '/^dispatch_funnel\(\) \{/{f=1} f{print} f&&/^}/{exit}' "$LOOP" > "$FN_FNS"
+if grep -q '^dispatch_funnel() {' "$FN_FNS" 2>/dev/null; then :; else bad "funnel-depth: dispatch_funnel() could not be extracted from orch-loop.sh"; fi
+OUT_FN="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; . "$4"; dispatch_funnel 0 READ 2>&1' _ "$ISNUM" "$HELPFNS" "$FNS" "$FN_FNS" 2>&1)"
+case "$OUT_FN" in
+  *"Permission denied"*) bad "funnel-depth: the shell's own redirection error reached the operator line — $OUT_FN" ;;
+  *) ok "funnel-depth: no 'Permission denied' leak" ;;
+esac
+case "$OUT_FN" in
+  *"0 queued of an UNRECORDED pool"*) bad "funnel-depth: an unmeasured depth was rendered as 0 queued — $OUT_FN" ;;
+  *"UNKNOWN queued of an UNRECORDED pool"*|*"queued of an UNRECORDED pool"*) ok "funnel-depth: an unmeasured depth is named, never 0" ;;
+  *) bad "funnel-depth: unexpected line — $OUT_FN" ;;
+esac
+chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+# NON-VACUITY (4a5): coerce the unmeasured depth back to 0 and the operator line states a number again.
+FN_M="$T/funnel-fns-coerce.sh"
+sed 's/^  \[ "\$_fl_state" = "READ" \] || backlog="UNKNOWN"$/  [ "$_fl_state" = "READ" ] || backlog=0/' "$FN_FNS" > "$FN_M" 2>/dev/null
+if cmp -s "$FN_FNS" "$FN_M" 2>/dev/null; then bad "funnel-depth: the coerce-to-zero mutation did not apply — the sed anchor drifted"
+else
+  chmod 000 "$D/o/candidates.txt"
+  OUT_FN2="$(O="$D/o" LOG=/dev/null bash -c '. "$1"; . "$2"; . "$3"; . "$4"; dispatch_funnel 0 READ 2>&1' _ "$ISNUM" "$HELPFNS" "$FNS" "$FN_M" 2>&1)"
+  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+  case "$OUT_FN2" in
+    *"0 queued of an UNRECORDED pool"*) ok "funnel-depth: non-vacuity — coercing the miss to 0 restores '0 queued'" ;;
+    *) bad "funnel-depth: the REVERTED read did not reproduce the defect — $OUT_FN2" ;;
+  esac
+fi
 # and the record's own measurement is USED when the beat cannot take one
 mk_case ok-depth-recorded
 mk_tool_clean "$D"

@@ -2066,7 +2066,12 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   # `UNKNOWN` is what stops the EMPTY word below.
   brec="$(refresh_record_field backlog "$rec")"
   case "${brec:-}" in
-    UNKNOWN) _bl_state="UNKNOWN" ;;
+    # ⛔ THE RECORD IS THE FALLBACK, NEVER AN OVERRIDE (review P3, cycle 16). This arm used to set
+    # UNKNOWN unconditionally, so a beat that HAD measured the queue printed "this beat and the last
+    # refresh pass both failed to read it" — two false clauses on a queue it read perfectly well (and the
+    # sibling arm below already refuses to let a recorded NUMBER override `READ`, so the two disagreed
+    # about precedence). A measurement taken here outranks a recorded absence of one.
+    UNKNOWN) [ "$_bl_state" = "READ" ] || _bl_state="UNKNOWN" ;;
     ''|*[!0-9]*) : ;;
     *) [ "$_bl_state" = "READ" ] || { backlog="$brec"; _bl_state="RECORDED"; } ;;
   esac
@@ -2205,6 +2210,14 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     elif [ "${d:-0}" -ge "$RUNNING_STALE_MIN" ]; then
       printf '[dispatch] BLOCKED: a refresh pass wrote its start marker %s and has recorded no outcome since — %sm is past the %sm stale bound, so the pass DIED (SIGKILL, OOM, cycle timeout, or an uncaught error) and nothing will replace that marker but a pass that finishes;%s %s lanes=%s workers=%s | PR path: %s\n' \
         "$age" "${d:-?}" "$RUNNING_STALE_MIN" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
+    elif [ "$_bl_state" = "UNKNOWN" ] && [ "$backlog" -le 0 ]; then
+      # ⛔ THE SAME WITNESS AS THE `result=ok` ARM (review P2, cycle 16). `backlog` is 0 by
+      # INITIALISATION when the depth could not be read, so testing `[ "$backlog" -gt 0 ]` alone made this
+      # arm print "the queue is EMPTY" over rows nobody read — the #1931 polarity, in the branch one level
+      # down from where the witness was wired. Measured: two rows on disk behind a mode-000 file, and the
+      # beat said EMPTY.
+      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured, so this is NOT known to be an empty queue (work may be queued and unread); a refresh pass wrote its start marker %s and has recorded no outcome yet, so this is work in progress, not a drained queue | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$prtail"
     elif [ "$backlog" -gt 0 ]; then
       printf '[dispatch] deferred (%s) lanes=%s workers=%s — %s usable candidate(s) queued, head #%s; a refresh pass wrote its start marker %s and has recorded no outcome yet. A deferral whose origination is UNPROVEN: do not read this as a healthy pass | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
@@ -2298,8 +2311,19 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     esac
   done
   # The queue depth is measured HERE, not taken from the refresh's record: it is this cycle's file.
-  [ -f "$O/candidates.txt" ] && backlog="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
-  is_num "${backlog:-}" || backlog=0
+  # ⛔ AND A FAILED READ IS UNKNOWN, NOT ZERO (review P3, cycle 16 — the last of the #1931 family). This
+  # line tested `[ -f ]` (a mode-000 file passes it), ran `wc -l <` with NO redirect (so the shell printed
+  # `…: Permission denied` onto the operator line) and then coerced the miss with `is_num || backlog=0` —
+  # the depth rendered as a measurement. `_fl_state` carries the verdict; the two "queued of an
+  # UNRECORDED pool" sentences below print UNKNOWN rather than a number this beat did not take.
+  _fl_state="UNKNOWN"; backlog=""
+  if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+    _fl_b="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
+    if is_num "${_fl_b:-}"; then backlog="$_fl_b"; _fl_state="READ"; fi
+  fi
+  # `backlog` stays EMPTY when unmeasured: every sentence that needs a number tests `READ` first, and a
+  # bare `0` here is exactly the claim this guard exists to stop.
+  [ "$_fl_state" = "READ" ] || backlog="UNKNOWN"
   if [ -z "${listed:-}" ]; then
     # No usable record. Say so — do NOT print a decomposition that does not exist, and do NOT fall
     # back to "backlog empty", which is the claim this function exists to stop. ⛔ The two causes are
