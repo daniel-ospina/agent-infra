@@ -635,6 +635,18 @@ url = t.get("url") or ""
 if not isinstance(url, str):
     print("URLTYPE:%s" % type(url).__name__)
     sys.exit(1)
+# ⛔ NORMALIZE THE url EXACTLY AS THE MERGE'S `usable()` DOES, BEFORE ANY PREDICATE READS IT
+# (#3374 review, round 9 P2). `usable()` runs every floor on `url.strip()`, so the merge PRESERVES a
+# whitespace-padded self-host; this verifier read the RAW value, so a leading pad failed the
+# `^scheme://` match below and it refused `INSECURE_URL:` (or `BADURL:` with no key) — sentences that
+# are FALSE about the artifact, because the client's own parser builds a working transport from
+# exactly those bytes (`new URL(" https://localhost:8000/mcp")` → host `localhost:8000`, measured;
+# WHATWG strips leading/trailing C0 and space). `--install` ends in this same verify, so the repair
+# re-created the refusal for ever: verify → install → verify never converged. A FALSE BLOCK on a
+# working config, which is the one direction this file must never take. One rule, one call, both
+# sides — the same `.strip()` — so a shape one side preserves is a shape the other certifies.
+# The pad is stripped, NOT the entry rewritten: `--verify` classifies, it never writes.
+url = url.strip()
 if not url:
     print("NOURL")
     sys.exit(1)
