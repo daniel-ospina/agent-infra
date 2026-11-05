@@ -848,8 +848,20 @@ else
     else
       echo "[lane $N] WARN: could not write $capacity_record — the refusal still releases the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
     fi
-    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — \$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it. NOT a capacity refusal and nothing was consumed: put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file." >> "$O/logs/lane-$N.log"
-    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — the model credential \$${KEY_GATE_VAR:-?} is missing; see $O/logs/lane-$N.log" >&2
+    # ⛔ THESE TWO LINES FOLLOW THE REASON TOO (round 23, P2, measured): round 22 fixed only the capacity-transfer
+    # sentence above, so a `store-invalid`/`auth-store-unreadable` refusal still told the operator here that
+    # "$VAR holds no value in the environment this lane would run with ... put the credential where this lane's own
+    # env sources it" - the exact prescription the gate's own line in the SAME log refutes ("this is a verdict about
+    # the FILE, not about a missing variable ... `export %s` cannot help"), and with no template the variable renders
+    # as the non-existent `$<none>`. The suite missed it because the guard greps one fixed phrase.
+    case "${KEY_GATE_REASON:-credential-missing}" in
+      store-invalid|auth-store-unreadable)
+        KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and neither exporting \$${KEY_GATE_VAR:-<none>} nor a models.json template rescues that; repair or delete that file and re-dispatch" ;;
+      *)
+        KEY_GATE_WHY="\$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it; put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file" ;;
+    esac
+    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — ${KEY_GATE_WHY}. NOT a capacity refusal and nothing was consumed." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — ${KEY_GATE_REASON:-credential-missing}: ${KEY_GATE_WHY}; see $O/logs/lane-$N.log" >&2
     exit "$KEY_GATE_RC"
   fi
 fi
