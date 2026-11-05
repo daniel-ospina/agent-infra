@@ -10139,3 +10139,320 @@ function _expandMarkerToken(token, home) {
   t = t.replace(/\$\{HOME\}|\$HOME\b/g, home);
   return t;
 }
+
+// ─────────────────────────────────────────────────────────────────────────
+// #3444 — REMOTE-EXEC CONTEXT BOUNDARY
+//
+// The guards in index.ts resolve PATHS and HUB STATE against the LOCAL
+// checkout. That is right for a command that runs here, and wrong for one whose
+// execution target is another box: `cmux vm exec <vm> -- …`, `ssh <host> …` and
+// `docker exec <c> …` run the remainder of the command somewhere the guard
+// cannot see. Measured 2026-11-04 (#3444), from a hub-rooted session:
+//   • `cmux vm exec cell -- sh -c 'git worktree add rev-3168'` → #1919 resolved
+//     the RELATIVE target against the LOCAL hub and printed the local path;
+//   • `… -- sh -c 'cd /srv/repo && git checkout feat/x'` → #1484's hub-state
+//     gate (and, on a clean hub, M3) judged the LOCAL checkout;
+//   • `… -- sh -c 'cd /srv/repo && git pull --ff-only && make test'` → #1144's
+//     sync allowance read the LOCAL tree state;
+//   • an opaque payload fed to a REMOTE shell → the M4 unverifiable-content arm
+//     failed closed on content that never runs here.
+// ~87 idle lanes on four cells were unusable from the hub because of it.
+//
+// This does NOT weaken a local guard: it MASKS the remote payload so the
+// downstream gates see only the text that can actually run locally. The mask is
+// deliberately conservative in the fail-closed direction:
+//   • it ENDS at the first top-level separator (`;`, `&&`, `||`, `|`, `&`,
+//     newline) — a trailing LOCAL segment stays fully gated;
+//   • a REDIRECTION stays visible with its target, so `cmux vm exec … > <hub
+//     file>` is still gated as the local write it is;
+//   • a substitution that RUNS LOCALLY is never masked: an unquoted or
+//     double-quoted `$(…)`/backtick inside the payload executes in the LOCAL
+//     shell, so that token is kept verbatim (a single-quoted one does not run
+//     locally and is masked with the rest of the payload);
+//   • a heredoc BODY is masked with the payload it belongs to (`sh -s <<'EOF'`
+//     is how a lane ships a script to a cell);
+//   • the replacement is ONE inert word, so nothing downstream can mistake it
+//     for an invocation or a path.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** ssh(1) options whose VALUE is the next word (`-p 22`, `-o K=V`, `-i key`). */
+const _RB_SSH_VALUE_FLAGS = new Set([
+  "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l",
+  "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w",
+]);
+/** `docker exec` options whose VALUE is the next word. */
+const _RB_DOCKER_EXEC_VALUE_FLAGS = new Set([
+  "-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys",
+]);
+/** Tokens that START (or end) a shell command in the walk below. */
+const _RB_SEPARATORS = new Set([";", ";;", "&&", "||", "|", "&", "\n", "(", ")"]);
+/** A redirection operator token (`>`, `>>`, `2>`, `>&`, `<<`, `<<-`, `<<<`, …). */
+const _RB_REDIRECT_RE = /^(?:\d*(?:>>|>&|>\||<<<|<<-?|<&|<|>)|&>>|&>)/;
+/** The one inert word a masked remote payload is replaced with. */
+export const REMOTE_PAYLOAD_PLACEHOLDER = "_remote_payload_";
+
+/** #3444 — quote-aware word/operator tokens carrying their SOURCE offsets, so a
+ *  caller can mask ranges without re-spelling the text it keeps. */
+function _rbTokens(s) {
+  const out = [];
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const ch = s[i];
+    if (ch === " " || ch === "\t" || ch === "\r") { i++; continue; }
+    if (ch === "\\" && s[i + 1] === "\n") { i += 2; continue; }
+    if (ch === "\n") { out.push({ start: i, end: i + 1, text: "\n", op: true }); i++; continue; }
+    if (ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")") {
+      const two = s.slice(i, i + 2);
+      const text = two === "&&" || two === "||" || two === ";;" ? two : ch;
+      out.push({ start: i, end: i + text.length, text, op: true });
+      i += text.length;
+      continue;
+    }
+    if (ch === "<" || ch === ">") {
+      const m = _RB_REDIRECT_RE.exec(s.slice(i));
+      if (m) {
+        out.push({ start: i, end: i + m[0].length, text: m[0], op: true, redirect: true });
+        i += m[0].length;
+        continue;
+      }
+    }
+    const start = i;
+    let text = "";
+    let quote = null;
+    let localSubst = false;
+    while (i < n) {
+      const c = s[i];
+      if (quote === "'") { text += c; if (c === "'") quote = null; i++; continue; }
+      if (quote === '"') {
+        // A `$(…)` / backtick inside DOUBLE quotes still runs in the LOCAL shell.
+        if ((c === "$" && s[i + 1] === "(") || c === "`") localSubst = true;
+        if (c === "\\" && i + 1 < n) { text += c + s[i + 1]; i += 2; continue; }
+        text += c; if (c === '"') quote = null; i++;
+        continue;
+      }
+      if (c === "\\") { text += c + (s[i + 1] ?? ""); i += 2; continue; }
+      if (c === "'" || c === '"') { quote = c; text += c; i++; continue; }
+      if ((c === "$" && s[i + 1] === "(") || c === "`") localSubst = true;
+      if (c === " " || c === "\t" || c === "\r" || c === "\n" || c === "&" || c === "|" || c === ";"
+          || c === "(" || c === ")" || c === "<" || c === ">") break;
+      text += c;
+      i++;
+    }
+    out.push({ start, end: i, text, op: false, localSubst });
+  }
+  return out;
+}
+
+/** `'EOF'` / `"EOF"` / `\EOF` → `EOF` (the word the shell compares a heredoc
+ *  terminator against). */
+function _rbUnquoteDelim(word) {
+  let t = String(word ?? "").trim();
+  if (t.length >= 2 && (t[0] === "'" || t[0] === '"') && t[t.length - 1] === t[0]) t = t.slice(1, -1);
+  return t.replace(/\\/g, "");
+}
+
+/** The source range of a heredoc folded around `delim`: `bodyStart` is the first
+ *  character of the BODY, `termStart` the first character of the TERMINATOR line
+ *  and `afterTerm` the newline that ends it (or end-of-string when the terminator
+ *  never appears — the shell would swallow the rest of the input too). The
+ *  terminator line is NOT part of the body: masking it would leave a heredoc no
+ *  downstream parser can close, and the next local command would be swallowed as
+ *  body data (a fail-open). */
+function _rbHeredocBodyRange(s, from, delim) {
+  if (!delim) return { bodyStart: from, termStart: from, afterTerm: from };
+  const nl = s.indexOf("\n", from);
+  if (nl < 0) return { bodyStart: s.length, termStart: s.length, afterTerm: s.length };
+  const bodyStart = nl + 1;
+  let lineStart = bodyStart;
+  while (lineStart <= s.length) {
+    const end = s.indexOf("\n", lineStart);
+    const line = end < 0 ? s.slice(lineStart) : s.slice(lineStart, end);
+    if (line.trim() === delim) {
+      return { bodyStart, termStart: lineStart, afterTerm: end < 0 ? s.length : end };
+    }
+    if (end < 0) break;
+    lineStart = end + 1;
+  }
+  return { bodyStart, termStart: s.length, afterTerm: s.length };
+}
+
+/** Could `prefix` REDEFINE a transport name — or build a definition no text scan
+ *  can read? `ssh() { … }; ssh host cmd` resolves the NAME locally and runs `cmd`
+ *  HERE; `eval '…'` / `source file` / POSIX `.` construct the definition from text
+ *  this scan never sees. Either way the boundary proof is void, so the command is
+ *  left UNMASKED (today's gating). Over-matching only re-gates — fail closed. */
+function _rbMayRedefineTransport(prefix) {
+  const s = String(prefix ?? "");
+  if (!s) return false;
+  return /(?:^|[;&|(){}\s'"$])(?:function\s+)?(?:cmux|ssh|docker)\s*\(\s*\)/.test(s)
+    || /\bfunction\s+(?:cmux|ssh|docker)\b/.test(s)
+    || /\balias\s+(?:-[A-Za-z]+\s+)*(?:cmux|ssh|docker)\s*=/.test(s)
+    || /(?:^|[;&|(){}\s])(?:eval|source)\s/.test(s)
+    || /(?:^|[;&|])\s*\.\s+\S/.test(s);
+}
+
+/** The token index where the FIRST remote payload of this command starts, or
+ *  null when the command has no remote-exec invocation at all.
+ *
+ *  Recognised boundaries (the command word must stand at COMMAND POSITION and be
+ *  the BARE word — so `grep 'cmux vm exec'` is an operand, and `./ssh`/`/usr/bin/ssh`
+ *  is a LOCAL file that runs its own argv HERE, not a boundary):
+ *    • `cmux vm exec … <vm> -- <payload…>`  (the `--` is the marker)
+ *    • `ssh [options] <host> [payload…]`
+ *    • `docker exec [options] <container> [payload…]`
+ *  @param {{start:number,op:boolean,text:string}[]} tokens
+ *  @param {string} source the command text the tokens came from (for the
+ *    transport-redefinition proof; the tokens alone cannot see it) */
+function _rbRemotePayloadStart(tokens, source) {
+  const s = String(source ?? "");
+  const word = (t) => (t && !t.op ? String(t.text) : null);
+  for (let k = 0; k < tokens.length; k++) {
+    const tk = tokens[k];
+    if (!tk || tk.op) continue;
+    const prev = tokens[k - 1];
+    const atCommandPos = !prev || (prev.op && _RB_SEPARATORS.has(prev.text));
+    if (!atCommandPos) continue;
+    // ⛔ The transport must be the BARE word. A PATH-QUALIFIED token (`./ssh`,
+    // `/usr/bin/ssh`) or a quoted one (`"ssh"`) is a LOCAL file/shape that can
+    // run the same argv HERE — the boundary proof does not hold. Cost: such a
+    // spelling is gated as before (declared residual, fail closed).
+    const head = String(tk.text);
+    if (head !== "cmux" && head !== "ssh" && head !== "docker") continue;
+    // ⛔ And nothing BEFORE it may have been able to redefine the name
+    // (`ssh() { … }`, `alias ssh=…`, `eval`/`source`/`.`), or the "remote"
+    // segment executes locally.
+    if (_rbMayRedefineTransport(s.slice(0, tk.start))) continue;
+    if (head === "cmux") {
+      if (word(tokens[k + 1]) !== "vm" || word(tokens[k + 2]) !== "exec") continue;
+      let p = -1;
+      for (let j = k + 3; j < tokens.length; j++) {
+        const t = tokens[j];
+        if (t.op) { if (_RB_SEPARATORS.has(t.text)) break; continue; }
+        if (t.text === "--") { p = j + 1; break; }
+      }
+      if (p < 0) continue;                    // no `--` marker → no command was handed over
+      while (p < tokens.length && tokens[p].op && !_RB_SEPARATORS.has(tokens[p].text)) p++;
+      if (p < tokens.length && !tokens[p].op) return p;
+      continue;
+    }
+    const isDockerExec = head === "docker" && word(tokens[k + 1]) === "exec";
+    if (head !== "ssh" && !isDockerExec) continue;
+    const flags = head === "ssh" ? _RB_SSH_VALUE_FLAGS : _RB_DOCKER_EXEC_VALUE_FLAGS;
+    let j = k + (head === "ssh" ? 1 : 2);
+    let operand = -1;
+    while (j < tokens.length) {
+      const t = tokens[j];
+      if (t.op) { if (_RB_SEPARATORS.has(t.text)) break; j++; continue; }
+      if (t.text === "--") { j++; continue; }
+      if (/^-[^\s]/.test(t.text)) { j += (flags.has(t.text.slice(0, 2)) || flags.has(t.text)) ? 2 : 1; continue; }
+      operand = j;
+      break;
+    }
+    if (operand < 0) continue;                // no host/container operand → nothing runs remotely
+    let p = operand + 1;
+    while (p < tokens.length && tokens[p].op && !_RB_SEPARATORS.has(tokens[p].text)) p++;
+    if (p >= tokens.length || tokens[p].op) continue;  // `ssh <host>` alone: an interactive login
+    return p;
+  }
+  return null;
+}
+
+/**
+ * #3444 — replace every REMOTE-EXEC payload in `command` with one inert word, so
+ * the local gates downstream see only text that can run on THIS box.
+ *
+ * A command with no remote-exec boundary is returned UNCHANGED (identity), which
+ * is what makes this safe to run on every bash call: the local guards are not
+ * relaxed by a byte unless a boundary is actually present, and the tail after
+ * the boundary is left exactly as written.
+ * @param {string} command
+ * @returns {string}
+ */
+export function maskRemoteExecPayloads(command) {
+  const s = String(command ?? "");
+  if (!s) return s;
+  const tokens = _rbTokens(s);
+  const start = _rbRemotePayloadStart(tokens, s);
+  if (start === null) return s;
+  let out = "";
+  let last = 0;            // source offset already emitted
+  let masking = false;     // inside a masked payload run
+  let verbatimNextWord = null; // true | "heredoc" — the redirect operand is text, not payload
+  const verbatimTo = (end) => {
+    if (end > last) out += s.slice(last, end);
+    if (end > last) last = end;
+  };
+  const maskTo = (start, end) => {
+    if (!masking) {
+      // Emit everything BEFORE the run verbatim — a local command ahead of the
+      // remote call must never be dropped by the mask (`git x && cmux vm exec …`).
+      if (start > last) { out += s.slice(last, start); last = start; }
+      out += ` ${REMOTE_PAYLOAD_PLACEHOLDER}`;
+      masking = true;
+    }
+    if (end > last) last = end;
+  };
+  const endMask = () => { masking = false; };
+  let k = start;
+  while (k < tokens.length) {
+    const tk = tokens[k];
+    if (tk.end <= last) { k++; continue; }   // already consumed (heredoc body, redirect operand)
+    if (tk.op) {
+      if (tk.redirect) {
+        verbatimTo(tk.end);
+        endMask();
+        verbatimNextWord = /^<<-?$/.test(tk.text) ? "heredoc" : true;
+        k++;
+        continue;
+      }
+      if (_RB_SEPARATORS.has(tk.text)) {
+        // The remote command ENDS here: everything after it can run LOCALLY.
+        endMask();
+        verbatimTo(tk.end);
+        k++;
+        const nextStart = _rbRemotePayloadStart(tokens.slice(k), s.slice(tokens[k].start));
+        if (nextStart === null) break;
+        k += nextStart;
+        verbatimNextWord = null;
+        continue;
+      }
+      endMask();
+      verbatimTo(tk.end);
+      k++;
+      continue;
+    }
+    if (verbatimNextWord) {
+      endMask();
+      verbatimTo(tk.end);
+      if (verbatimNextWord === "heredoc") {
+        // The BODY is the payload's script (masked), but the TERMINATOR LINE is
+        // kept: it is structure, not payload, and without it the next local
+        // command reads as heredoc data to every downstream parser (fail-open).
+        const body = _rbHeredocBodyRange(s, tk.end, _rbUnquoteDelim(tk.text));
+        if (body.termStart > last) last = body.termStart;                       // body: masked
+        // The newline that separated the delimiter word from the body is gone with
+        // it. Keep ONE: without it the terminator line would fuse onto the
+        // delimiter word (`<<'EOS'EOS`), no downstream parser could close the
+        // heredoc, and the following LOCAL command would read as body text.
+        out += "\n";
+        if (body.afterTerm > last) { out += s.slice(body.termStart, body.afterTerm); last = body.afterTerm; }
+        // A heredoc operator ends its simple command; what follows is LOCAL text.
+        endMask();
+      }
+      verbatimNextWord = null;
+      k++;
+      continue;
+    }
+    if (tk.localSubst) {                     // runs in THIS shell — never masked
+      endMask();
+      verbatimTo(tk.end);
+      k++;
+      continue;
+    }
+    maskTo(tk.start, tk.end);
+    k++;
+  }
+  if (!masking && last < s.length) out += s.slice(last);
+  return out;
+}

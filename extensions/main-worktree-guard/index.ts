@@ -274,6 +274,12 @@ let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean; at?
   };
 let joinContinuations: (cmd: string) => string = (c: string) => String(c ?? "");
 let ansiTranslate: (s: string) => string = (s: string) => String(s ?? "");
+// #3444: the REMOTE-EXEC boundary (cmux vm exec <vm> -- … / ssh <host> … /
+// docker exec <c> …). Fail-safe default = IDENTITY: a stale/partial
+// classify-git.mjs must leave every local gate exactly as strict as it is today
+// rather than letting an undefined call throw inside the tool hook (which aborts
+// the bash call) — the same skew contract as the #709/#627 bindings above.
+let maskRemoteExecPayloads: (command: string) => string = (c: string) => String(c ?? "");
 // #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
 // intersect of bash-write candidates with index-tracked rels). Fail-safe
 // default: inert (null) — a failed import NEVER false-blocks (same contract
@@ -330,6 +336,10 @@ try {
   if (typeof _m5.wtIsPlaceholderPathspec === "function") wtIsPlaceholderPathspec = _m5.wtIsPlaceholderPathspec;
   if (typeof _m5.wtPipelineFeedsShell === "function") wtPipelineFeedsShell = _m5.wtPipelineFeedsShell;
   if (typeof _m5.wtShellInlinePayloads === "function") wtShellInlinePayloads = _m5.wtShellInlinePayloads;
+  // #3444: the remote-exec mask. Namespace read + typeof guard for the same
+  // skew reason as #709/#627 — a stale module leaves the IDENTITY default, which
+  // keeps today's (strict) behaviour instead of throwing in the hook.
+  if (typeof _m5.maskRemoteExecPayloads === "function") maskRemoteExecPayloads = _m5.maskRemoteExecPayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
   // #1919: read from the namespace for the same reason as #709/#627 above — the
@@ -5000,12 +5010,25 @@ export default function (pi: ExtensionAPI) {
     if (!_isAllowMainEdits()) {
       if (isBash) {
         const command = (event.input as { command?: string }).command ?? "";
+        // #3444 — REMOTE-EXEC BOUNDARY. `cmux vm exec <vm> -- …`, `ssh <host> …`
+        // and `docker exec <c> …` run the remainder of the command on ANOTHER
+        // box, which this guard cannot see and does not protect. Every gate in
+        // this block resolves PATHS and HUB STATE against the LOCAL checkout, so
+        // a remote payload must not be judged by them (measured 2026-11-04:
+        // `cmux vm exec cell -- sh -c 'git worktree add <rel>'` was refused by
+        // #1919 with the LOCAL path named, and a remote `git checkout`/`git pull`
+        // by #1484/#1144 — ~87 idle lanes on four cells, unusable from the hub).
+        // The mask removes ONLY the payload text; a trailing local segment, a
+        // local redirection target and a locally-executed substitution all stay
+        // visible, so the local guarantees are unchanged (see
+        // classify-git.mjs maskRemoteExecPayloads).
+        const localCommand = maskRemoteExecPayloads(command);
         // #347: execution-cwd-aware backdoor (script path + content gating
         // resolve against the command's cd-target, not the session cwd).
-        const execCwd = commandExecutionCwd(command, process.cwd()) ?? undefined;
-        const backdoor = _backdoorBlock(command, execCwd);
+        const execCwd = commandExecutionCwd(localCommand, process.cwd()) ?? undefined;
+        const backdoor = _backdoorBlock(localCommand, execCwd);
         if (backdoor) return { block: true, reason: backdoor };
-        const nestedWt = _nestedWorktreeBlock(command);
+        const nestedWt = _nestedWorktreeBlock(localCommand);
         if (nestedWt) return { block: true, reason: nestedWt };
         const st = _hubState();
         // #618/#621: the tracked bash-write gate runs for EVERY non-hatched bash
@@ -5027,7 +5050,7 @@ export default function (pi: ExtensionAPI) {
         // marker is an audited solo-session recovery hatch, not a license to
         // write other hubs).
         const markerOn = readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
-        const bashWrite = _hubBashTrackedWrite(command, st.disorder, markerOn);
+        const bashWrite = _hubBashTrackedWrite(localCommand, st.disorder, markerOn);
         if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
         if (st.disorder) {
           // #437 (C): bash writes to TRACKED hub files while the hub is
@@ -5060,8 +5083,8 @@ export default function (pi: ExtensionAPI) {
           // destroyed a foreign checkout's uncommitted work with M4 classifying
           // recovery and M5 never consulted. Wiring the hatch to the shape (not
           // just to the window) makes M4 refuse those forms exactly as main does.
-          const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(command);
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
+          const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(localCommand);
+          const gate = evaluateHubGateWithTargets(localCommand, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -5087,7 +5110,7 @@ export default function (pi: ExtensionAPI) {
             // this early-return swallow a push: fall through to the
             // ownership/M2 path below (which allows the session's OWN branch
             // and blocks foreign ones, incl. bare/`HEAD`/remote-only pushes).
-            const pushDet = classifyGitCommandDetailed(command);
+            const pushDet = classifyGitCommandDetailed(localCommand);
             const gateablePush = pushDet?.verdict === "block:push" ||
               pushDet?.verdict === "block:force-push" ||
               pushDet?.verdict === "block:push-delete";
@@ -5105,7 +5128,7 @@ export default function (pi: ExtensionAPI) {
               // Round 15: the MESSAGE needs the hatch itself, not the shape-gated
               // `escapeActive` — passing the latter told a hatched lane (refused for
               // being compound/wrapped) to stamp the marker it already holds.
-              const discardReason = _worktreeDiscardBlock(command, _currentHatchActive);
+              const discardReason = _worktreeDiscardBlock(localCommand, _currentHatchActive);
               if (discardReason) return { block: true, reason: discardReason };
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
@@ -5219,18 +5242,26 @@ export default function (pi: ExtensionAPI) {
     }
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
+      // #3444 — the SAME remote-exec mask the M4 block above uses. This block
+      // feeds M5 (the effect-keyed discard gate), the degradation classifier and
+      // the full M3/M2/ownership/#1144 decision from ONE string, so masking here
+      // is what stops a REMOTE `git pull`/`git checkout`/`git reset` being judged
+      // by the LOCAL tree state (measured: #1144 refused a remote pull inside a
+      // compound because the local hub had no baseline and the local tree was
+      // dirty). The tail AFTER the remote command stays verbatim and gated.
+      const localCommand = maskRemoteExecPayloads(command);
       // ── M5 (#709): effect-keyed working-tree-discard gate ──
       // Runs BEFORE the degradation/full classifier arms and BEFORE the
       // worktree exemptions below, so a discard is caught whether or not
       // branch-ownership loaded, and in a linked worktree as well as the hub.
       // It sits AFTER the env/marker hatch return above, so both hatches
       // bypass it unchanged.
-      const discardBlock = _worktreeDiscardBlock(command, false);
+      const discardBlock = _worktreeDiscardBlock(localCommand, false);
       if (discardBlock) return { block: true, reason: discardBlock };
       // #350: hub-WIP discipline prompts (never block) — bash-write detection
       // (heredoc/tee/python into the hub) + the throttled periodic hub-hygiene
       // scan (once per 5 min — never per-command).
-      _maybeWarnBashWrite(command);
+      _maybeWarnBashWrite(localCommand);
       _periodicHubHygieneCheck();
 
       // ── Degradation fallback (branch-ownership OR detailed classifier
@@ -5238,7 +5269,7 @@ export default function (pi: ExtensionAPI) {
       // bypass. No repo exemption — agent-infra degrades identically (#615). ──
       if (!branchOwnership || !classifierLoaded) {
         if (_isAllowMainEdits()) return undefined;
-        const verdict = classifyGitCommand(command);
+        const verdict = classifyGitCommand(localCommand);
         // #443 clean-hub parity: the FROZEN legacy classifier reports
         // `block:push-delete` for the exact `--delete`/`:branch` spellings
         // only, so the documented `-d` short form and `--del`-style
@@ -5256,7 +5287,7 @@ export default function (pi: ExtensionAPI) {
         // keep its existing generic block below — an unrelated legacy block
         // must never be swallowed by the coordinated-delete arm's
         // allow-when-no-sibling-checkout return.
-        const rawDeleteNames = extractPushDeleteBranch(command) ?? [];
+        const rawDeleteNames = extractPushDeleteBranch(localCommand) ?? [];
         // `allow-non-git` is intentionally absent: a non-empty extractor
         // requires a literal `git push` token, so the legacy verdict for any
         // such command is `allow` or a `block:*` — never `allow-non-git`.
@@ -5302,7 +5333,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Full branch-ownership path (#265) ──
-      const det = classifyGitCommandDetailed(command);
+      const det = classifyGitCommandDetailed(localCommand);
       // P2 (cycle 3): resolve the effective repo against the STATE-mutating
       // invocation — `git -C <wt> status && git checkout main` must gate on the
       // main checkout, not the worktree the first invocation pointed at.
@@ -5334,7 +5365,7 @@ export default function (pi: ExtensionAPI) {
         // boundary-aware → its hints are the reference truth.
         eff = branchOwnership.resolveRepoFromInv(det.stateHints, process.cwd());
       } else {
-        eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.verb, 0);
+        eff = branchOwnership.resolveEffectiveRepo(localCommand, process.cwd(), det.verb, 0);
       }
       const allowActive = _isAllowMainEdits();
 
@@ -5586,7 +5617,7 @@ export default function (pi: ExtensionAPI) {
           // base decision — a `git pull origin main && git push origin -d b`
           // compound is an origin/main parity gap (the pull allowance already
           // swallowed it before #443), out of this push-spelling scope.
-          const wcDeletes = wholeCommandDeleteTargets(det.verdict, command);
+          const wcDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);
           const baselineBranch = baseline?.branch ?? null;
           // Unknown baseline (no way to tell own from foreign) → keep the
           // allowance's base decision exactly as before.
@@ -5624,7 +5655,7 @@ export default function (pi: ExtensionAPI) {
         return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
       if (det.verdict === "block:push" || det.verdict === "block:force-push") {
-        const laterDeletes = wholeCommandDeleteTargets(det.verdict, command);
+        const laterDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);
         if (laterDeletes.length > 0) {
           const blocked = _coordinatedDeleteBlock(laterDeletes);
           if (blocked) return blocked;
