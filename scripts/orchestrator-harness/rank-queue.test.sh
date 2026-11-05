@@ -948,14 +948,14 @@ count_race gone 'rm -f "$QRO/.queue-rank" 2>/dev/null || true'
 # ⛔ AND THE FAILED REDIRECTION DOES NOT LEAK (review P3, cycle 10): `read … < missing` prints `…: No such
 # file or directory` on stderr even with read's own `2>/dev/null`, landing a spurious failure line in the
 # controller log directly above the honest message. The `[ -r ]` guard is what removes it.
-if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED' \
-   && ! printf '%s' "$CROUT" | grep -q 'No such file or directory' \
-   && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' && ! printf '%s' "$CROUT" | grep -q 'priority-unreadable'; then rc=0
+if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && grep -q 'DERIVED AND INSTALLED' <<<"$CROUT" \
+   && ! grep -q 'No such file or directory' <<<"$CROUT" \
+   && ! grep -q 'the queue is EMPTY' <<<"$CROUT" && ! grep -q 'priority-unreadable' <<<"$CROUT"; then rc=0
 else rc=1; echo "      count file GONE: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (want rows installed, 'DERIVED AND INSTALLED', NOT 'EMPTY', NOT 'priority-unreadable')"; fi
 ck "a count file that VANISHES between the reorder and the read-back is UNKNOWN COUNTS over an INSTALLED order, not a measured EMPTY queue" $rc
 count_race bad 'printf "x 2 -\n" > "$QRO/.queue-rank"'
-if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED' \
-   && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY'; then rc=0
+if [ "$CRR" -eq 0 ] && grep -q 'DERIVED AND INSTALLED' <<<"$CROUT" \
+   && ! grep -q 'the queue is EMPTY' <<<"$CROUT"; then rc=0
 else rc=1; echo "      malformed count: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (want DERIVED AND INSTALLED, NOT 'EMPTY')"; fi
 ck "a MALFORMED count field is refused by the strict re-parse, never laundered to zero and read as EMPTY" $rc
 # ⛔ THE WRITE SHAPE OF THE SAME RACE (review P2, cycle 10). Deleting the count file was only half of it: the
@@ -973,31 +973,31 @@ count_race foreign-zero 'printf "0 0 -\n" > "$QRO/.queue-rank"'
 # queue's", a phrase carried by TWO messages — so the check could not tell the totals cross-check from
 # the `[ -s candidates.txt ]` re-check it thought it was grading (that re-check turned out to be
 # unreachable dead code and is gone). The distinct phrase is the cross-check's.
-if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' \
-   && printf '%s' "$CROUT" | grep -q 'does not add up to the queue'; then rc=0
+if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && ! grep -q 'the queue is EMPTY' <<<"$CROUT" \
+   && grep -q 'does not add up to the queue' <<<"$CROUT"; then rc=0
 else rc=1; echo "      foreign zero: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a foreign '0 0 -' over a 2-row queue must be refused by the TOTALS cross-check, not read as EMPTY)"; fi
 ck "a FOREIGN zero count (another pass's drained arm, same shared path) is refused by the TOTALS cross-check over rows this pass installed" $rc
 # a foreign count whose head does not name the queue's head is foreign too — the severity line's "head #N is
 # the highest-ranked CLEAN entry" is a claim about the row at the TOP OF THE FILE.
 count_race foreign-head 'printf "1 1 999999\n" > "$QRO/.queue-rank"'
-if [ "$CRR" -eq 0 ] && ! printf '%s' "$CROUT" | grep -q 'head #999999 is the highest-ranked' \
-   && printf '%s' "$CROUT" | grep -q 'candidates.txt.s head is'; then rc=0
+if [ "$CRR" -eq 0 ] && ! grep -q 'head #999999 is the highest-ranked' <<<"$CROUT" \
+   && grep -q 'candidates.txt.s head is' <<<"$CROUT"; then rc=0
 else rc=1; echo "      foreign head: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a head that is not candidates.txt's head must not be reported AS the head)"; fi
 ck "a count whose HEAD is not candidates.txt's head is refused, never reported as the highest-ranked CLEAN entry" $rc
 # ⛔ THE IDENTICAL BRANCH SAYS IT WROTE NOTHING (review P3, cycle 10). `_wrote` is 0 when `cmp` found the
 # bytes equal, so "INSTALLED" would be a typed claim about a write that never happened. Queue already in the
 # pool's order, pool `300 200`; a `cmp` shim models the concurrent pass deleting the count.
 count_race identical 'rm -f "$QRO/.queue-rank" 2>/dev/null || true' "$(printf '300\n200')" "$(printf '300\n200')" cmp
-if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'already held exactly those bytes' \
-   && ! printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED'; then rc=0
+if [ "$CRR" -eq 0 ] && grep -q 'already held exactly those bytes' <<<"$CROUT" \
+   && ! grep -q 'DERIVED AND INSTALLED' <<<"$CROUT"; then rc=0
 else rc=1; echo "      identical branch: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (want 'already held exactly those bytes', NOT 'INSTALLED')"; fi
 ck "an UNCHANGED reorder is not reported as INSTALLED — the wording follows the write that happened" $rc
 # ⛔ AND A COUNT WHOSE TOTALS DO NOT ADD UP IS REFUSED (review P3, cycle 10). The head cross-check passes a
 # count that happens to share the head; the totals are a second, independent witness — and a foreign `_u`
 # of 0 would otherwise silence the unranked-tail WARN.
 count_race bad-totals 'printf "1 0 300\n" > "$QRO/.queue-rank"'
-if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'does not add up to the queue' \
-   && ! printf '%s' "$CROUT" | grep -q 'head #300 is the highest-ranked'; then rc=0
+if [ "$CRR" -eq 0 ] && grep -q 'does not add up to the queue' <<<"$CROUT" \
+   && ! grep -q 'head #300 is the highest-ranked' <<<"$CROUT"; then rc=0
 else rc=1; echo "      bad totals: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a count of 1 over a 2-row queue must not be published as this pass's totals)"; fi
 ck "a count whose TOTALS do not add up to the queue is refused, never published as this pass's counts" $rc
 # 12-y3) THE STATE WORD, ONE CASE PER READ-BACK OUTCOME (review P2, cycle 12). The fixtures above grade the
@@ -1045,15 +1045,15 @@ else
 fi
 ck "non-vacuity: relabelling \`severity-uncounted\` as \`priority-unreadable\` reds the state assertion" $rc
 count_race good 'true'
-if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'severity-first from the pool — head #300 is the highest-ranked' \
-   && printf '%s' "$CROUT" | grep -q '2 pool-ranked, 0 unranked'; then rc=0
+if [ "$CRR" -eq 0 ] && grep -q 'severity-first from the pool — head #300 is the highest-ranked' <<<"$CROUT" \
+   && grep -q '2 pool-ranked, 0 unranked' <<<"$CROUT"; then rc=0
 else rc=1; echo "      positive pair: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (the fixtures above must not pass because the drive is broken, and the grounding must not reject a REAL count)"; fi
 ck "positive pair: with the count file intact the same drive reports 'severity-first from the pool' with its counts" $rc
 # AND A GENUINELY DRAINED QUEUE STILL SAYS EMPTY — the grounding must not turn a real empty queue into
 # 'unknown counts' (the mirror failure this fix could easily have introduced).
 count_race drained 'true' '-' '-'
-if [ "$CRR" -eq 0 ] && [ -z "$CRROWS" ] && printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' \
-   && ! printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED'; then rc=0
+if [ "$CRR" -eq 0 ] && [ -z "$CRROWS" ] && grep -q 'the queue is EMPTY' <<<"$CROUT" \
+   && ! grep -q 'DERIVED AND INSTALLED' <<<"$CROUT"; then rc=0
 else rc=1; echo "      drained queue: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (an EMPTY queue must still say EMPTY)"; fi
 ck "a GENUINELY empty queue still reports 'the queue is EMPTY' — the artefact grounding does not turn a real empty into unknown counts" $rc
 # 12-y2) THE SKIP ARM'S PROVENANCE MAPPING, one case per state (#2201 shape). Inlined in the arm, nothing
@@ -1072,12 +1072,12 @@ w_pri="$( ( cd "$TMP" && bash skipwhy.sh priority-unreadable ) 2>/dev/null )"
 # does), where an unset `$1` is a fatal abort — and the state the arm can pass is "" (unrecorded), never
 # "no argument at all".
 w_unk="$( ( cd "$TMP" && bash skipwhy.sh "" ) 2>/dev/null )"
-if printf '%s' "$w_sev" | grep -q 'the ORDER was re-derived severity-first from the pool' \
-   && ! printf '%s' "$w_sev" | grep -q 'nothing was queued' \
-   && printf '%s' "$w_unc" | grep -q 'the COUNTS could not be read back' \
-   && printf '%s' "$w_emp" | grep -q 'nothing was queued, so there was no ORDER to derive' \
-   && printf '%s' "$w_pri" | grep -q 'the ORDER could NOT be re-derived' \
-   && printf '%s' "$w_unk" | grep -q "provenance was NOT recorded" \
+if grep -q 'the ORDER was re-derived severity-first from the pool' <<<"$w_sev" \
+   && ! grep -q 'nothing was queued' <<<"$w_sev" \
+   && grep -q 'the COUNTS could not be read back' <<<"$w_unc" \
+   && grep -q 'nothing was queued, so there was no ORDER to derive' <<<"$w_emp" \
+   && grep -q 'the ORDER could NOT be re-derived' <<<"$w_pri" \
+   && grep -q "provenance was NOT recorded" <<<"$w_unk" \
    && [ "$(printf '%s\n%s\n%s\n%s\n%s' "$w_sev" "$w_unc" "$w_emp" "$w_pri" "$w_unk" | sort -u | wc -l)" -eq 5 ]; then rc=0
 else rc=1; echo "      why clauses: severity='$w_sev' uncounted='$w_unc' empty='$w_emp' pri='$w_pri' unknown='$w_unk' (want five DISTINCT clauses, each matching its own state)"; fi
 ck "the skip record's provenance clause is chosen PER STATE — five distinct clauses, each matching its own" $rc
@@ -1271,38 +1271,38 @@ skip_drive() {  # <label> <queue-setup: absent|empty|rows|garbage|dir> -> sets S
   SDOUT="$(cat "$d/out" 2>/dev/null)"
 }
 skip_drive absent absent
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
-   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && ! grep -q 'the queue is empty' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/absent: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (want could NOT be READ + backlog=UNKNOWN)"; fi
 ck "SKIP arm: an ABSENT queue is unreadable, never empty (driven)" $rc
 skip_drive dir dir
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
-   && ! printf '%s' "$SDOUT" | grep -q 'No such file or directory'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && ! grep -q 'No such file or directory' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/dir: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a DIRECTORY is unreadable: could NOT be READ + backlog=UNKNOWN, no stderr leak)"; fi
 ck "SKIP arm: a queue that is a DIRECTORY is unreadable, and its depth is UNKNOWN (driven)" $rc
 # ⛔ A READABLE FILE WHOSE DEPTH READ FAILS IS NOT AN UNREADABLE FILE (review P2, cycle 14). Both states
 # leave `_skip_n` empty; the arm reported both as "not a readable regular file" while the SAME record
 # carried `handed=300` — a row it had just read out of the file it had just called unreadable.
 skip_drive wcfail wcfail
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue WAS read' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
-   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
-   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$SDOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$SDOUT" \
+   && ! grep -q 'the queue is empty' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/wcfail: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a readable file whose depth read fails: 'the queue WAS read' + backlog=UNKNOWN, NOT 'could NOT be READ', NOT empty)"; fi
 ck "SKIP arm: a READABLE file whose DEPTH read fails says the queue WAS read, with backlog=UNKNOWN (driven)" $rc
 skip_drive unreadable-depth wcfail-garbage
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue WAS read' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
-   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
-   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$SDOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$SDOUT" \
+   && ! grep -q 'the queue is empty' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/wcfail-garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (readable + depth failed + unparsable head: 'the queue WAS read', NOT 'could NOT be READ', NOT empty)"; fi
 ck "SKIP arm: readable + depth failed + unparsable head is still a READ queue, with backlog=UNKNOWN (driven)" $rc
 skip_drive unreadable mode000
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
-   && ! printf '%s' "$SDOUT" | grep -q 'Permission denied'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
+   && ! grep -q 'Permission denied' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/mode000: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a regular file with no read bit: could NOT be READ + backlog=UNKNOWN, no 'Permission denied')"; fi
 ck "SKIP arm: a REGULAR file with NO READ BIT is unreadable, and leaks no 'Permission denied' (driven)" $rc
 # NON-VACUITY: the pre-fix fail-open re-parse (`_skip_n=0`) turns the depth-read failure into a MEASURED
@@ -1325,23 +1325,23 @@ else
 fi
 ck "non-vacuity: the pre-fix \`_skip_n=0\` re-parse turns a failed depth read into 'the queue is empty (0 rows)' with \`backlog=0\`" $rc
 skip_drive drained empty
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue is empty (0 rows)' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=0' \
-   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'the queue is empty (0 rows)' <<<"$SDOUT" \
+   && grep -q 'backlog=0' <<<"$SDOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/empty: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a MEASURED empty queue: 'the queue is empty (0 rows)' + backlog=0)"; fi
 ck "SKIP arm: a MEASURED empty queue says so, with backlog=0 (driven)" $rc
 skip_drive withhead rows
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'head #300' \
-   && printf '%s' "$SDOUT" | grep -q 'handed=300' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=2'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'head #300' <<<"$SDOUT" \
+   && grep -q 'handed=300' <<<"$SDOUT" \
+   && grep -q 'backlog=2' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/rows: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (want head #300, handed=300, backlog=2)"; fi
 ck "SKIP arm: a READABLE queue with a parsable head names it, and records handed= (driven)" $rc
 skip_drive garbage garbage
-if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'its HEAD could not be read' \
-   && printf '%s' "$SDOUT" | grep -q 'backlog=3' \
-   && printf '%s' "$SDOUT" | grep -q 'handed= ' \
-   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty' \
-   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ'; then rc=0
+if [ "$SDRC" -eq 0 ] && grep -q 'its HEAD could not be read' <<<"$SDOUT" \
+   && grep -q 'backlog=3' <<<"$SDOUT" \
+   && grep -q 'handed= ' <<<"$SDOUT" \
+   && ! grep -q 'the queue is empty' <<<"$SDOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (want 'its HEAD could not be read' + backlog=3, NOT empty, NOT unreadable)"; fi
 ck "SKIP arm: rows with an UNPARSABLE head are MEASURED (backlog=3), not called empty and not called unreadable (driven)" $rc
 # NON-VACUITY: re-key the arm on the HEAD (the pre-fix shape). Every containment pin above survives this
@@ -1392,8 +1392,8 @@ NNOUT="$(cat "$NND/out" 2>/dev/null)"
 NNSTATE="$(printf '%s' "$NNOUT" | sed -n 's/^STATE=//p' | tail -1)"
 NNROWS="$(tr '\n' ' ' < "$NND/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
 if [ "$NNRC" -eq 0 ] && [ "$NNROWS" = "bbb aaa" ] && [ "$NNSTATE" = "severity" ] \
-   && printf '%s' "$NNOUT" | grep -q 'the reorder WAS derived from the pool' \
-   && ! printf '%s' "$NNOUT" | grep -q 'ranked NONE'; then rc=0
+   && grep -q 'the reorder WAS derived from the pool' <<<"$NNOUT" \
+   && ! grep -q 'ranked NONE' <<<"$NNOUT"; then rc=0
 else rc=1; echo "      non-numeric ranked rows: rc=$NNRC rows='$NNROWS' STATE='${NNSTATE:-<none>}' out '$(printf '%s' "$NNOUT" | tr '\n' '|' | head -c 260)' (want rows reordered, STATE=severity, 'the reorder WAS derived'; NOT 'ranked NONE')"; fi
 ck "a reorder that RANKED rows with a non-numeric head is reported as derived, never as 'ranked NONE'/'existing order'" $rc
 NNREV="$TMP/nonnum-rev.sh"
@@ -1471,36 +1471,36 @@ main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
 # (a) THE DEFECT ITSELF: a queue that cannot be READ must not be described as EMPTY, must not record
 # `backlog=0`, and must not leak the shell's own redirection error.
 main_handoff unreadable dir
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
-   && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
-   && ! printf '%s' "$MHOUT" | grep -q 'the queue is empty' \
-   && ! printf '%s' "$MHOUT" | grep -q 'backlog=0' \
-   && ! printf '%s' "$MHOUT" | grep -q 'Is a directory' \
-   && ! printf '%s' "$MHOUT" | grep -q 'integer expression expected' \
-   && ! printf '%s' "$MHOUT" | grep -q 'backlog now 0 issues'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
+   && ! grep -q 'the queue is empty' <<<"$MHOUT" \
+   && ! grep -q 'backlog=0' <<<"$MHOUT" \
+   && ! grep -q 'Is a directory' <<<"$MHOUT" \
+   && ! grep -q 'integer expression expected' <<<"$MHOUT" \
+   && ! grep -q 'backlog now 0 issues' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      unreadable queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (want 'could NOT be READ' + backlog=UNKNOWN; NOT 'the queue is empty', NOT backlog=0, NO 'Is a directory' leak, NO 'integer expression expected', NO 'backlog now 0 issues')"; fi
 ck "an UNREADABLE queue is reported as unmeasured on EVERY surface (backlog=UNKNOWN, no arithmetic error, no 'backlog now 0 issues'), never as 'the queue is empty'" $rc
 # (b) POSITIVE PAIR — a genuinely drained queue still says EMPTY, and a row-holding queue still names its
 # head, so (a) is not passing because the drive lost the other arms.
 main_handoff drained empty
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'the queue is empty' \
-   && printf '%s' "$MHOUT" | grep -q 'backlog=0' \
-   && ! printf '%s' "$MHOUT" | grep -q 'could NOT be READ'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'the queue is empty' <<<"$MHOUT" \
+   && grep -q 'backlog=0' <<<"$MHOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      drained queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (a MEASURED empty queue must still say EMPTY with backlog=0)"; fi
 ck "a GENUINELY empty queue still reports 'the queue is empty' with backlog=0 (the guard does not silence the real empty)" $rc
 main_handoff rows rows
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'handed to dispatch: #300' \
-   && ! printf '%s' "$MHOUT" | grep -q 'could NOT be READ'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'handed to dispatch: #300' <<<"$MHOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      row queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (a readable queue must still hand its head)"; fi
 ck "a READABLE queue still hands its head (the unreadable arm is not swallowing the normal path)" $rc
 # (b2) THE ROWS-BUT-NO-HEAD STATE (review P2, cycle 12). `_head_issue` is sanitised, so this state used to
 # take the MEASURED-EMPTY arm: "the queue is empty" + `backlog=0` over three rows that are on disk. The
 # depth is measured and the head is not, and those are two different sentences.
 main_handoff garbage garbage
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'its HEAD could not be read' \
-   && printf '%s' "$MHOUT" | grep -q 'backlog=3' \
-   && ! printf '%s' "$MHOUT" | grep -q 'the queue is empty' \
-   && ! printf '%s' "$MHOUT" | grep -q 'backlog=0'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'its HEAD could not be read' <<<"$MHOUT" \
+   && grep -q 'backlog=3' <<<"$MHOUT" \
+   && ! grep -q 'the queue is empty' <<<"$MHOUT" \
+   && ! grep -q 'backlog=0' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      rows/no-head: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (want 'its HEAD could not be read' + backlog=3; NOT 'the queue is empty', NOT backlog=0)"; fi
 ck "a row-holding queue with an UNPARSABLE head is measured (backlog=3) and NOT called empty" $rc
 MHGR="$TMP/main-handoff-garbage-rev.sh"
@@ -1522,11 +1522,11 @@ ck "non-vacuity: the pre-fix \`elif [ -n \"\$_backlog_n\" ]\` restores 'the queu
 # knows WHICH row dispatch takes — and it must not also claim a depth it never measured. `backlog=` with
 # an empty value is the same defect as a wrong one: it renders an unmeasured field as if it were one.
 main_handoff wcfail wcfail
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
-   && printf '%s' "$MHOUT" | grep -q 'handed=300' \
-   && ! printf '%s' "$MHOUT" | grep -q 'queue depth ;' \
-   && ! printf '%s' "$MHOUT" | grep -q 'backlog= handed' \
-   && ! printf '%s' "$MHOUT" | grep -q 'could NOT be READ'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
+   && grep -q 'handed=300' <<<"$MHOUT" \
+   && ! grep -q 'queue depth ;' <<<"$MHOUT" \
+   && ! grep -q 'backlog= handed' <<<"$MHOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      depth-fail: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (want backlog=UNKNOWN + handed=300; NOT 'queue depth ;', NOT an empty backlog=, NOT 'could NOT be READ' — the file WAS read)"; fi
 ck "a READABLE queue whose DEPTH read fails records backlog=UNKNOWN with the head it DID read, and never an empty backlog=" $rc
 # NON-VACUITY: the pre-fix fail-OPEN re-parse (`_backlog_n=0` instead of "") turns that state into a
@@ -1551,12 +1551,12 @@ ck "non-vacuity: the pre-fix \`_backlog_n=0\` re-parse turns a failed depth read
 # this state is indistinguishable from an unreadable file UNLESS the guard's verdict is carried — and the
 # unreadable sentence is FALSE here: the file was read.
 main_handoff wcfailg wcfail-garbage
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'the queue WAS read' \
-   && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
-   && printf '%s' "$MHOUT" | grep -q 'the depth and the head are UNKNOWN' \
-   && ! printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
-   && ! printf '%s' "$MHOUT" | grep -q 'backlog now  issues' \
-   && ! printf '%s' "$MHOUT" | grep -q 'backlog=0'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$MHOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
+   && grep -q 'the depth and the head are UNKNOWN' <<<"$MHOUT" \
+   && ! grep -q 'could NOT be READ' <<<"$MHOUT" \
+   && ! grep -q 'backlog now  issues' <<<"$MHOUT" \
+   && ! grep -q 'backlog=0' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      readable/depth-fail/garbage-head: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (want 'the queue WAS read' + 'the depth and the head are UNKNOWN'; NOT 'could NOT be READ', NOT an empty 'backlog now', NOT backlog=0)"; fi
 ck "a READABLE queue whose depth read fails AND whose head is unparsable is not called unreadable, and the depth ECHO names it UNKNOWN" $rc
 # NON-VACUITY: drop the witness (key the last arm on the emptiness of its outputs again) — the state goes
@@ -1583,32 +1583,32 @@ ck "non-vacuity: keying the unreadable word on the OUTPUTS again makes a readabl
 # (b3c) THE HEAD-ONLY ARM RECORDS ITS PROVENANCE (review P3, cycle 15). It used to write `handed=<head>`
 # with no `handed_why=` at all — a durable row with no statement of where it came from.
 main_handoff wcfail2 wcfail
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'handed_why=' \
-   && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'handed_why=' <<<"$MHOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      head-only arm: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (the arm that records handed=300 must also record handed_why=)"; fi
 ck "the HEAD-KNOWN/DEPTH-UNKNOWN arm records handed_why alongside handed (the field that outlives the log)" $rc
 # (b4) THE `-r` HALF OF THE GUARD (review P3, cycle 14). Every unreadable fixture so far was a DIRECTORY,
 # which `-f` alone rejects — so dropping `-r` re-leaked the shell's own `Permission denied` unpunished.
 main_handoff mode000 mode000
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
-   && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
-   && ! printf '%s' "$MHOUT" | grep -q 'Permission denied' \
-   && ! printf '%s' "$MHOUT" | grep -q 'backlog=0'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
+   && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
+   && ! grep -q 'Permission denied' <<<"$MHOUT" \
+   && ! grep -q 'backlog=0' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      mode-000: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a regular file with no read bit is unreadable: could NOT be READ + backlog=UNKNOWN, and no 'Permission denied' leak)"; fi
 ck "a REGULAR file with NO READ BIT is unreadable, records backlog=UNKNOWN, and leaks no 'Permission denied'" $rc
 # (b5) THE ORDER CLAIM IS NOT TYPED IN THE STATE THAT HAS NO ORDER (review P3, cycle 14). The unranked
 # arm's `handed_why=` used to be able to carry "the highest-ranked CLEAN entry in the pool-ordered queue"
 # — a severity claim about a pass that established NO priority order. Nothing asserted its ABSENCE.
 main_handoff unranked rows priority-unreadable
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'established NO priority order' \
-   && ! printf '%s' "$MHOUT" | grep -q 'highest-ranked' \
-   && ! printf '%s' "$MHOUT" | grep -q 'pool-ordered'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'established NO priority order' <<<"$MHOUT" \
+   && ! grep -q 'highest-ranked' <<<"$MHOUT" \
+   && ! grep -q 'pool-ordered' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      unranked handoff: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a priority-unreadable pass may NOT describe its head as 'the highest-ranked CLEAN entry' / 'pool-ordered')"; fi
 ck "an UNRANKED pass never describes its head as 'the highest-ranked CLEAN entry in the pool-ordered queue'" $rc
 main_handoff absent none
-if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
-   && ! printf '%s' "$MHOUT" | grep -q 'No such file or directory' \
-   && ! printf '%s' "$MHOUT" | grep -q 'integer expression expected'; then rc=0
+if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
+   && ! grep -q 'No such file or directory' <<<"$MHOUT" \
+   && ! grep -q 'integer expression expected' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      absent queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (an ABSENT queue is unreadable, and neither the redirection nor the depth gate may leak stderr)"; fi
 ck "an ABSENT queue is unmeasured too, and neither the failed redirection nor the depth gate leaks stderr" $rc
 # (c) NON-VACUITY — revert the guarded read to the pre-fix unguarded one (which coerces a failed `wc` to 0)
