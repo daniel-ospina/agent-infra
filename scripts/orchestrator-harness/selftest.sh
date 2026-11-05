@@ -3894,7 +3894,7 @@ ck "refresh-candidates.sh ranks the tiers P0=0 < P1=1 < P2=2 (a constant rank wo
 # `set -u` with `rc_dedupe: unbound variable`: no FAIL line, no summary, and every check after this one
 # never ran. The guard's failure path is the one thing that must never itself crash. Defaulting to 1
 # makes a skipped drive count a named FAIL and lets the suite continue, as it did before this change.
-rc_dedupe=1; rc_rank=1; rc_handoff=1; rc_uncounted=1
+rc_dedupe=1; rc_rank=1; rc_handoff=1; rc_uncounted=1; rc_tailu=1
 if [ -s "$REFRESH" ]; then
   awk '/^done < /{f=1;next} f' "$REFRESH" > "$TMP/tail.sh"
   # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
@@ -3937,8 +3937,25 @@ if [ -s "$REFRESH" ]; then
     esc_tmp="${TMP//\\/\\\\}"; esc_tmp="${esc_tmp//&/\\&}"
     awk -v tmp="$esc_tmp" '{gsub(/\$O/, tmp)} 1' "$TMP/tail.sh" > "$TMP/tail-drive.sh"
     awk -v tmp="$esc_tmp" '{gsub(/\$O/, tmp)} 1' "$TMP/qorder-fns.sh" > "$TMP/qorder-fns-drive.sh"
+    # ⛔ THE DRIVE RUNS UNDER `set -u`, LIKE THE SHIPPED FILE (review P3, cycle 11). `set -u` is NOT
+    # inherited by a child `bash <file>`, so a tail driven without it reports an unbound reference GREEN in
+    # the only check that grades this region — while in production it is a fatal abort BEFORE
+    # `REFRESH_RECORDED=1`, which the EXIT trap then reports as a failed pass. The state the tail reads is
+    # produced by the EARLIER half of the pass, which is not part of this drive, so it is seeded here —
+    # explicitly, one name per line (measured: without the seeds the drive aborts on `judged: unbound
+    # variable`; the list is the exact set the tail reads, found by driving it and adding each name).
+    tail_prologue() {
+      printf 'set -u\n'
+      printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+      printf 'unusable_summary() { printf "none"; }\n'
+      for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED SKIP_CHECKED SKIP_DISPATCHED \
+                SKIP_LANDED SKIP_COLLIDED LIMIT ICR_INCOMPLETE ICR_HELD ICR_RECLAIMED STARVED \
+                POOL_SWEPT QUEUED; do
+        printf ': "${%s:=}"\n' "$_n"
+      done
+    }
     # DEFINITIONS BEFORE THE TAIL — the order the shipped file has, and the order the tail needs.
-    cat "$TMP/qorder-fns-drive.sh" "$TMP/tail-drive.sh" > "$TMP/tail-with-qorder.sh"
+    { tail_prologue; cat "$TMP/qorder-fns-drive.sh" "$TMP/tail-drive.sh"; } > "$TMP/tail-with-qorder.sh"
     # ⛔ SANDBOX THE DRIVE. The substitution above only rewrites the literal `$O`; a path spelled any
     # other way escapes to the REAL location — and `$HOME/orchestrator/candidates.txt` is the shipped
     # script's own default O and is live on a running box. Binding O and HOME to $TMP closes it
@@ -3979,14 +3996,27 @@ if [ -s "$REFRESH" ]; then
     #     "this pass established NO priority order": the opposite, and it becomes `handed_why=` in
     #     `state/refresh-last`, where it outlives the log line that contradicted it. The STATE is stubbed
     #     (reaching it needs a concurrent pass racing the count file); the ARM is the shipped one.
-    { cat "$TMP/qorder-fns-drive.sh"
+    { tail_prologue
+      cat "$TMP/qorder-fns-drive.sh"
       printf 'queue_order_from_pool() { QUEUE_ORDER_STATE="severity-uncounted"; }\n'
       cat "$TMP/tail-drive.sh"; } > "$TMP/tail-uncounted.sh"
     printf '200\n300\n' > "$TMP/candidates.txt"
     ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-uncounted.sh ) > "$TMP/uncounted-drive.log" 2>&1
-    if grep -q 'the highest-ranked CLEAN entry in the pool-ordered queue this pass derived' "$TMP/uncounted-drive.log" 2>/dev/null \
+    if grep -q 'the entry at the head of the queue this pass derived' "$TMP/uncounted-drive.log" 2>/dev/null \
        && ! grep -q 'established NO priority order' "$TMP/uncounted-drive.log" 2>/dev/null; then rc_uncounted=0; else rc_uncounted=1; fi
     [ "$rc_uncounted" -eq 0 ] || echo "      severity-uncounted arm: own-words $(grep -c 'this pass derived' "$TMP/uncounted-drive.log" 2>/dev/null) / NO-priority-order $(grep -c 'established NO priority order' "$TMP/uncounted-drive.log" 2>/dev/null) (want 1 / 0)" 
+
+    # BOTH tail drives must carry `set -u`, or the mode this check exists for is absent from the very
+    # drivers it grades (a prologue is only worth what is pinned).
+    _pro_drives=""; _pro_n=0
+    for _d in "$TMP/tail-with-qorder.sh" "$TMP/tail-uncounted.sh"; do
+      [ -f "$_d" ] || continue
+      _pro_n=$(( _pro_n + 1 ))
+      grep -qx 'set -u' "$_d" || _pro_drives="$_pro_drives ${_d##*/}"
+    done
+    if [ "$_pro_n" -eq 2 ] && [ -z "$_pro_drives" ]; then rc_tailu=0; else rc_tailu=1; fi
+    [ "$rc_tailu" -eq 0 ] || echo "      tail drives: ${_pro_n} found; WITHOUT 'set -u':${_pro_drives:- none} (want 2, both under set -u)"
+    ck "both generated tail drives run under \`set -u\`, the mode the shipped file runs in" $rc_tailu
     [ "$rc_dedupe" -eq 0 ] || echo "      dedupe drive gave '$tail_got' (want '5000 100 9000')"
     rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
   fi
