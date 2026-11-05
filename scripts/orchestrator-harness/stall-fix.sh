@@ -49,9 +49,20 @@ AGEMIN="${2:-?}"                    # minutes since the last land (or the thresh
 # `synth|measured` and rewrote everything else to `measured`, so that one pass still put "no PR merged
 # in 360 minutes" in the worker's premise and `agesrc=measured` in the ledger an incident is read from
 # — the exact re-introduction, for the new third value, of the defect the paragraph above says this
-# flag exists to remove. Every value the caller can emit is accepted here.
+# flag exists to remove. Every value the caller can emit is accepted here, and a PRESENT-BUT-
+# UNRECOGNISED value is NOT claimed as `measured` (see the `*)` arm — unset is handled by the
+# `:-measured` default below, so that arm only ever sees a value the caller supplied).
 AGESRC="${_AGESRC:-measured}"
-case "$AGESRC" in synth|unmeasured|measured) : ;; *) AGESRC=measured ;; esac
+case "$AGESRC" in
+  synth|unmeasured|measured) : ;;
+  # ⛔ AN UNRECOGNISED PROVENANCE IS NOT `measured` (review cycle 2 of #3181, 2026-11-03, P2). Unset
+  # never reaches here (`:-measured` above handles a caller that passes no flag), so this arm only ever
+  # sees a value the caller DID supply and this script does not understand. Claiming it as `measured`
+  # asserts a reading no box took — verbatim the defect this whole flag exists to remove, reachable by
+  # a fourth provenance or a typo'd caller — so it degrades to `unmeasured`, the one value that says no
+  # reading was taken. `measured` is now asserted ONLY when the caller said `measured`.
+  *) AGESRC=unmeasured ;;
+esac
 
 # ⛔ NOT `say` (agent-infra#2910). On macOS `say` is /usr/bin/say — text-to-speech — so a shipped
 # script that defines a helper by that name SPEAKS through the owner's speakers whenever a fragment

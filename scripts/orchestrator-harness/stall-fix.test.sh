@@ -468,7 +468,7 @@ echo "── §F the age's PROVENANCE reaches both sinks this script owns ──
 # because a worker quotes the premise back in its report and the ledger is the durable record.
 # The pre-fix `case` accepted only `synth|measured` and silently rewrote `unmeasured` to `measured`,
 # which asserted a reading this box never took on BOTH surfaces. Two mutations, and the arms they
-# redden are the §F ones below (`f2`/`f3`), NOT the §B verdict arms at lines 131/141 — a maintainer
+# redden are the §F ones below (`f2`/`f3`), NOT the §B verdict arms at lines 134/144 — a maintainer
 # who follows a pointer to `b1`/`b2` sees them stay green and wrongly concludes §F is vacuous.
 #   · delete the `unmeasured` alternative from the `case` at stall-fix.sh:54 → all FOUR of `f3`'s
 #     asserts redden (measured: 77 passed, 4 failed);
@@ -495,6 +495,18 @@ case "$(brief_of "$D")" in *"no PR merged in an UNMEASURED number of minutes"*) 
 case "$(brief_of "$D")" in *"no PR merged in 90 minutes"*) ck 1 "…and it never presents the window that could not be searched as the stall age" ;; *) ck 0 "…and it never presents the window that could not be searched as the stall age" ;; esac
 case "$(ledger_of "$D")" in *"age_min=90	agesrc=unmeasured"*) ck 0 "…and the durable row keeps agesrc=unmeasured verbatim (the P1 fix)" ;; *) ck 1 "…and the durable row keeps agesrc=unmeasured verbatim (the P1 fix): $(ledger_of "$D")" ;; esac
 case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; *) ck 0 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; esac
+
+# ⛔ AN UNRECOGNISED PROVENANCE IS NOT `measured` (review cycle 2, 2026-11-03, P2). Unset is handled by
+# the `:-measured` default, so only a value the caller SUPPLIED can reach the `*)` arm. Before the fix
+# that arm wrote `measured`, so `_AGESRC=<anything unknown>` put "no PR merged in 90 minutes" in the
+# worker's premise and `agesrc=measured` in the ledger — the same false measurement, reachable by a
+# fourth provenance. Set the `*)` arm back to `measured` and both asserts below redden.
+D="$(new_o f4)"; stub "$D" "$STUB_OK_TOUCH"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       _AGESRC=banana bash "$SH" 3 90 2>&1)"
+case "$(brief_of "$D")" in *"no PR merged in an UNMEASURED number of minutes"*) ck 0 "unrecognised: the brief does NOT claim a measurement it was never given" ;; *) ck 1 "unrecognised: the brief does NOT claim a measurement it was never given: $(brief_of "$D" | head -20 | tail -6)" ;; esac
+case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and the durable row does not assert agesrc=measured for a value it did not understand: $(ledger_of "$D")" ;; *) ck 0 "…and the durable row does not assert agesrc=measured for a value it did not understand" ;; esac
+case "$(ledger_of "$D")" in *"agesrc=unmeasured"*) ck 0 "…it degrades to agesrc=unmeasured (the value that says no reading was taken)" ;; *) ck 1 "…it degrades to agesrc=unmeasured (the value that says no reading was taken): $(ledger_of "$D")" ;; esac
 
 
  echo
