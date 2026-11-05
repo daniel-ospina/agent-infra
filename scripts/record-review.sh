@@ -89,10 +89,10 @@
 # record-review.sh --recover-body <pr> [owner/repo]
 #   REBUILD a MISSING record from the PR body's own SIGNED marker (#2872).
 #   That marker is signed only when key and openssl both work (HMAC-SHA256 over
-#   the text, $AI_REVIEW_GATE_KEY, #2055; else UNSIGNED, :4827-4833). A **SIGNED** marker
-#   reaches CI in TWO copies (the body; the admitted comment this recorder also posts at
-#   :1305, from post_marker_comment), an UNSIGNED one in ONE (:4898). The per-box record
-#   does not travel, so a review minted on a cell leaves the rail at NO-RECORD while the proof travels.
+#   the text, $AI_REVIEW_GATE_KEY, #2055; else UNSIGNED, :4827-4833). A **SIGNED** marker CAN reach CI
+#   through TWO channels — the body, and (best-effort; skipped by design when the comment read or POST
+#   fails) the admitted comment this recorder posts at :1305 — an UNSIGNED one has the body alone (:4898).
+#   The per-box record does not travel, so a review minted on a cell leaves the rail at NO-RECORD while the proof travels.
 #   Measured 2026-10-26: of 45 open PRs, 12 had a marker whose `diff=` equals the
 #   PR's live diff and no record file here; the registry covered 2 of them.
 #   It verifies the HMAC before minting (a body is attacker-writable, so a
@@ -2678,8 +2678,8 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
   # that lacks the file may still have the verdict in the registry (minted on a
   # peer box), or in the PR body's SIGNED marker. An admitted PR COMMENT can carry a MARKER too, but
-  # ⛔ NO VERB RECOVERS A RECORD FROM ONE (only the dedup READ at :1276 reads marker text out of
-  # comments; --recover-body reads the body alone, :2988). A comment IS a working --evidence input (:835).
+  # ⛔ NO VERB RECOVERS A RECORD FROM ONE: :1276 is the only place marker text leaves comments, and a
+  # marker comment is REFUSED as evidence (:905) — that copy helps the GATE. A REVIEW comment is fine (:835).
   CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
   if [ -n "$REPO" ]; then
     if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
