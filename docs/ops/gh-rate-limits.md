@@ -119,8 +119,8 @@ follows are the reusable ones:
   merging; only rows with a non-null `merged_at` may count toward `merged_today`.
 * **The window is paged, `per_page` never shrinks, and a window that MOVED is refused.** REST
   caps `per_page` at 100, so the
-  500/400 windows are `ceil(limit/100)` requests. A page that cannot be read — or the pair
-  spending its shared 30 s budget — refuses the WHOLE read instead of returning a short list: a
+  500/400 windows are `ceil(limit/100)` requests. A page that cannot be read — or the four lists
+  spending their shared 30 s budget — refuses the WHOLE read instead of returning a short list: a
   silently short window under-counts `merged_today`, which is the one error a fallback must not
   add. `per_page` stays 100 on every page because GitHub derives a request's offset from THAT
   request's `per_page`, so a shrunk final page re-reads an earlier range and leaves a hole; the
