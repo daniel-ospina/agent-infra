@@ -1312,7 +1312,7 @@ against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's
 measured both ways, not asserted. (The red on the pre-change tree is 18 of the 21 cases — every case whose
 subject runs through the ENTRY POINT, which on that tree has no `class=runner-work` at all: (a), (b), (c),
 (d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r), (s), (t) and (v); the owner-only cases (i), (m) and
-(q) stay green — plus **15** mutants that cannot even be applied there, because the arms they edit do not
+(q) stay green — plus **16** mutants that cannot even be applied there, because the arms they edit do not
 exist in that tree. The 19 mutants that DO still apply are reported "caught" only because their case is already
 red on that tree, so the green run above is the discriminating measurement, not that one. The two rows
 COMPOSE: 18 red cases + 16 unappliable mutants = the 34 failures, and 19 applicable mutants (each
@@ -1429,6 +1429,18 @@ re-derived the number here to `24`. What is printed above is measured, not deriv
 Three skips, not two: `(f)` is driven from three places in the suite — the real entry point, the `mut-f`
 mutant, and `mut-u`'s mutant, which reaches `case_f` a THIRD time — so an arm that skips `(f)` skips it
 three times, and "the same two skips" was already stale when it was written.
+
+⛔ **AND THE SKIP COUNT IS NOT ALWAYS 3 — case (v) has a CONDITIONAL arm that names itself.** Its
+positive half ("having observed a nonzero `df` delta, the note offers it as a POSSIBLE own reclaim") can
+only be asserted when the pass actually observed a delta, and `df` is shared: a full fixture's worth of
+concurrent allocation on the same filesystem cancels it. **Measured**: across one run of the five
+case-(v) invocations the arm ran 4 times and vanished once, and the tally then read an unqualified
+`56 passed, 0 failed, 3 skipped` — an arm that did not run, travelling as one that did, which is the
+exact defect the skip channel exists to remove. It now calls `skip()` with its reason, and the fixture
+is 16 MB (large enough that cancellation is unlikely, small enough to stay cheap), so a healthy run
+reports **3** skips and a run whose delta was cancelled reports that many MORE, each with its reason on
+the `skipped:` lines. **A tally whose skip count exceeds 3 is therefore not a regression** — read the
+reasons before assuming one.
 
 | case | proves | mutant that must turn it red |
 |---|---|---|

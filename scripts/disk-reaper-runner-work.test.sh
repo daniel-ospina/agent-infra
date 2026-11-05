@@ -962,12 +962,14 @@ case_v() { # <entry-point> <owner>
     local pass="$1" owner="$2" base work dead stub out st s ps_out
     # ── (v1) cut short on an ARMED pass, having already removed an entry ─────────────────────────────
     base="$T/v1.$$.$RANDOM"; work="$(mk_work "$base" gh-runner-x64-v1)"
-    fixture_entry dead "$work" job-killed 180 4 || return 1   # 3 h old, and REAL bytes
+    fixture_entry dead "$work" job-killed 180 16 || return 1   # 3 h old, and REAL bytes (16 MB: large enough
+    # that a concurrent allocation on the same filesystem is unlikely to cancel the df delta below, which is
+    # what makes the "MAY BE ITS OWN" assertion below reachable on a busy box)
     # ⛔ THE FIXTURE'S SIZE IS ASSERTED, because every `df`-delta assertion below is vacuous without it.
     # This is what caught `bs=1m` (GNU dd rejects it, so this entry was 12 KB and `df_raw` was always 0):
     # a future regression in the fixture is now a red case, not a silently unreachable assertion.
-    case_check "$([ "$(du -sk "$dead" 2>/dev/null | cut -f1)" -ge 3000 ] && echo 0 || echo 1)" \
-               "v1 the fixture holds REAL bytes (>= 3 MB), so the df-delta assertions that follow are reachable"
+    case_check "$([ "$(du -sk "$dead" 2>/dev/null | cut -f1)" -ge 15000 ] && echo 0 || echo 1)" \
+               "v1 the fixture holds REAL bytes (>= 15 MB), so the df-delta assertions that follow are reachable"
     stub="$T/v-stub-cut.$$.$RANDOM.sh"
     {
         printf '#!/usr/bin/env bash\n'
@@ -987,11 +989,18 @@ case_v() { # <entry-point> <owner>
                "v1 … and the note NAMES the cut, so an operator is told the removal count is unknown"
     case_check "$(grep -qF 'belongs to another process' <<<"$st" && echo 1 || echo 0)" \
                "v1 … and it never asserts that the class removed nothing and another process caused the df change"
-    # … and the POSITIVE half of that fix, asserted only when there IS a delta to attribute (so the check is
-    # never vacuous on a box whose `df` moved, and never flaky on one where another process cancelled it).
+    # … and the POSITIVE half of that fix, asserted only when there IS a delta to attribute.
+    # ⛔ AND WHEN THERE IS NOT, THE ARM SAYS SO — it is not silently dropped from the outcome set.
+    # Measured: across one run of the five case-(v) invocations this arm ran 4 times and vanished once,
+    # because ~4 MB of concurrent allocation on the same filesystem cancels the delta; the tally then read
+    # an unqualified "56 passed, 0 failed, 3 skipped", which this suite's own doctrine ("an arm that did not
+    # run proves nothing and must not be read as one that passed") forbids. A 16 MB fixture makes the
+    # cancellation unlikely; `skip()` makes it IMPOSSIBLE TO HIDE when it still happens.
     if grep -qE 'df_raw=[1-9][0-9]*MB' <<<"$out"; then
         case_check "$(grep -qF 'MAY BE ITS OWN' <<<"$st" && echo 0 || echo 1)" \
                    "v1 … and having OBSERVED a nonzero df delta, the note offers it as a POSSIBLE own reclaim (not as proof of another process)"
+    else
+        skip "v1 positive half, entry point <entry>/disk-reaper.sh — this pass observed NO df delta (another process moved df inside the window), so the 'MAY BE ITS OWN' wording was NOT measured"
     fi
     ps_out="$(DISK_REAPER_STATE_DIR="$s" bash "$pass" --print-status 2>/dev/null)"
     case_check "$(grep -qE '(^|\|)reaped_runner_work=\?(\||$)' <<<"$ps_out" && echo 0 || echo 1)" \
