@@ -566,6 +566,72 @@ grep -q 'push=pushed' "$TMP/n4d.out" && ! grep -q 'push=FAILED' "$TMP/n4d.out" \
 ck "N4b …a fast-forward by a peer inside the verify window records DELIVERY (push=pushed), not FAILED — the lane's commits ARE on that ref [$(grep -m1 'push=' "$TMP/n4d.out" 2>/dev/null)]" $rcn4b
 ! grep -q "this lane's commits are not on that ref" "$O/logs/n4d.log"; rcn4c=$?
 ck "N4c …and it does NOT keep the pre-fix absence claim beside a passing ancestry read — the sentence the old arm printed unconditionally" $rcn4c
+# ⛔ N4e-N4i — AN ANCESTRY THAT COULD NOT BE MEASURED IS NOT A NON-DELIVERY (review round 2, P1 —
+# REPRODUCED). `merge-base --is-ancestor` has THREE outcomes: 0 (ancestor), 1 (measured, NOT an ancestor)
+# — and **128** when the object is not in THIS repository, which is the NORMAL shape for exactly the case
+# this block exists for: a peer advanced the ref and this lane never fetched, so the peer's commit is
+# unknown locally. Measured here: `--is-ancestor M D` → `fatal: Not a valid commit name` rc=128 before the
+# fetch, rc=0 after. Treating every non-zero as "not an ancestor" printed a false durable absence for a
+# genuine descendant. ⛔ N4d could NOT see it: the peer there was a WORKTREE OF THE SAME HUB, so `D` was
+# always already in the lane's object store and `rc` could only ever be 0 — hence the SEPARATE CLONE here.
+N4E="$TMP/n4e"
+rm -rf "$N4E-lane" "$N4E-hub" "$N4E-peer" "$N4E-origin.git"
+git init -q --bare -b main "$N4E-origin.git"
+git init -q -b main "$N4E-hub"
+git -C "$N4E-hub" config user.name t; git -C "$N4E-hub" config user.email t@t
+git -C "$N4E-hub" remote add origin "$GHURL"
+git -C "$N4E-hub" config url."$N4E-origin.git".insteadOf "$GHURL"
+printf 'n4e seed\n' > "$N4E-hub/seed.txt"
+git -C "$N4E-hub" add seed.txt && git -C "$N4E-hub" commit -q -m 'n4e seed'
+git -C "$N4E-hub" push -q origin HEAD:refs/heads/main
+git -C "$N4E-hub" fetch -q origin
+git -C "$N4E-hub" worktree add -q "$N4E-lane" -b advlane
+git -C "$N4E-lane" config user.name t; git -C "$N4E-lane" config user.email t@t
+printf 'the lane commit\n' > "$N4E-lane/lane.txt"
+git -C "$N4E-lane" add lane.txt && git -C "$N4E-lane" commit -q -m 'the lane commit'
+n4e_mine="$(git -C "$N4E-lane" rev-parse HEAD)"
+# ⛔ DELIBERATELY NO `-u` ON THE FIXTURE'S OWN PUSH: a `-u` here would pre-set the upstream and make N4i
+# vacuous (it asserts the TERMINAL writes none).
+git -C "$N4E-lane" push -q origin advlane:refs/heads/advlane
+# a SEPARATE CLONE — not a worktree of the same hub — so the descendant object is absent from the lane
+git clone -q "$N4E-origin.git" "$N4E-peer" 2>/dev/null
+git -C "$N4E-peer" config user.name t; git -C "$N4E-peer" config user.email t@t
+git -C "$N4E-peer" checkout -q -B advlane "$n4e_mine"
+printf 'peer advance\n' > "$N4E-peer/peer.txt"
+git -C "$N4E-peer" add peer.txt && git -C "$N4E-peer" commit -q -m 'a peer advanced the ref'
+git -C "$N4E-peer" push -q origin HEAD:refs/heads/advlane
+n4e_origin="$(git -C "$N4E-origin.git" rev-parse refs/heads/advlane)"
+# non-vacuity: in the LANE's own object store the remote sha is UNKNOWN (rc=128), and it IS a descendant
+git -C "$N4E-lane" merge-base --is-ancestor "$n4e_mine" "$n4e_origin" 2>/dev/null; rcn4e_pre=$?
+git -C "$N4E-origin.git" merge-base --is-ancestor "$n4e_mine" "$n4e_origin" 2>/dev/null; rcn4e_org=$?
+[ "$rcn4e_pre" = 128 ] && [ "$rcn4e_org" = 0 ]; rcn4e=$?
+ck "N4e the fixture makes the remote's sha UNKNOWN to the lane (rc=$rcn4e_pre, not 1) while it really IS a descendant (origin's own rc=$rcn4e_org) — so this arm measures the 128 branch, which N4d structurally could not" $rcn4e
+: > "$O/logs/n4e.log"
+bash -c '
+  . "$1"
+  lane_end_push n4e "$2" "$3" advlane 1 1
+  printf "push=%s origin=%s\n" "$LANE_END_PUSH" "$LANE_END_ORIGIN"
+' _ "$GATE" "$O/logs/n4e.log" "$N4E-lane" 2>/dev/null > "$TMP/n4e.out"
+grep -q 'push=verify-ancestry-unmeasured' "$TMP/n4e.out" && ! grep -q 'push=FAILED' "$TMP/n4e.out" \
+  && grep -q 'ANCESTRY COULD NOT BE MEASURED' "$O/logs/n4e.log"; rcn4f=$?
+ck "N4f …an ancestry the worktree cannot evaluate records verify-ancestry-unmeasured — NOT FAILED [$(grep -m1 'push=' "$TMP/n4e.out" 2>/dev/null)]" $rcn4f
+! grep -q "commits are not on that ref" "$O/logs/n4e.log" && grep -q 'asserts NEITHER delivery NOR loss' "$O/logs/n4e.log"; rcn4g=$?
+ck "N4g …and it makes no absence claim: neither 'not on that ref' nor 'NOT an ancestor', only that the relation was not measured" $rcn4g
+n4e_next="$( bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_PUSH=verify-ancestry-unmeasured; LANE_END_ORIGIN=deadbeefcafe
+  LANE_END_HEAD=feedface; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=advlane
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n4e_next" in MANUAL*'NEITHER delivery NOR loss'*) rcn4h=0 ;; *) rcn4h=1 ;; esac
+ck "N4h …and next= is MANUAL and says the artifact asserts NEITHER delivery NOR loss, so a reclaim pass cannot read it as safe OR as lost [${n4e_next:0:60}]" $rcn4h
+# ⛔ N4i — NO `-u` (review round 2, P2 — REPRODUCED). The terminal used to push with `-u`, writing
+# `branch.<br>.remote`/`.merge` into the repository's SHARED config — which in a linked worktree is what
+# every PEER worktree reads, so one dying lane silently gave another a `git pull`/`git push` default it
+# never configured. The function's own contract already said "no `-u` on a guess".
+[ -z "$(git -C "$N4E-lane" config --get branch.advlane.merge 2>/dev/null)" ] \
+  && [ -z "$(git -C "$N4E-lane" config --get branch.advlane.remote 2>/dev/null)" ]; rcn4i=$?
+ck "N4i …and the exit path writes NO upstream for the lane's branch — a dying terminal may not hand a peer worktree a pull/push default it never configured" $rcn4i
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
 # ⛔ N6 — AN UNREADABLE REMOTE ANSWER IS UNKNOWN, NOT "NO PROTECTED NAMES" (review cycle 2, finding 1,
@@ -727,6 +793,57 @@ n14b_e=$(( $(date +%s) - n14b_s ))
 # 2 s bound + 4 s slack; the pre-fix library needs 9 s, so the arm discriminates with room to spare.
 [ "$n14b_e" -le 6 ]; rcn14b=$?
 ck "N14b …and the bound bounds WALL CLOCK: a CAPTURED command whose grandchild outlives the kill still returns at the bound (${n14b_e}s for a 2 s bound — 9 s before the process-group fix)" $rcn14b
+# ⛔ N14c-N14e — THE BOUND MUST NOT BECOME A FLOOR (review round 2, P1 — REPRODUCED). N14b's fix gives the
+# bounded command its OWN process group so the TIMER can reach a transport helper. The first cut forked the
+# WATCHDOG under `set -m` too, so BOTH left the caller's group — and the fleet reaps a lane with
+# `kill -TERM -- -<pgid>` then `-KILL` precisely so nothing is left resident. Measured, pre-fix, under a
+# caller group-TERM: the bounded `sleep` SURVIVED at ppid 1 until its own bound expired. On a
+# `tb_timeout 1800 python3` that is half an hour of resident work the census has to account for.
+# ⛔ NO `setsid` HERE — macOS has none, and the fleet's orchestrator boxes are Macs. `set -m` in the
+# probe's PARENT makes the probe its own group leader on any bash, which is the same shape a reaper
+# creates; the arm asserts that shape (non-vacuity) before it signals anything.
+cat > "$TMP/n14c-probe.sh" <<'N14CPROBE'
+set -u
+export TB_TIMEOUT_FORCE_INTERNAL=1
+. "$1"
+tb_timeout 60 sleep 4242 &
+wait
+N14CPROBE
+n14c_pid="$(bash -c '
+  set -m 2>/dev/null
+  bash "$1" "$2" >/dev/null 2>&1 &
+  printf "%s" "$!"' _ "$TMP/n14c-probe.sh" "$HERE/../lib/bounded.sh")"
+sleep 2
+n14c_pgid="$(ps -o pgid= -p "${n14c_pid:-0}" 2>/dev/null | tr -d ' ')"
+n14c_before="$(pgrep -f '^sleep 4242$' 2>/dev/null | wc -l | tr -d ' ')"
+[ -n "$n14c_pid" ] && [ "$n14c_pgid" = "$n14c_pid" ] && [ "${n14c_before:-0}" -ge 1 ]; rcn14c=$?
+ck "N14c the probe is a real caller-group shape (pgid ${n14c_pgid:-?} = pid ${n14c_pid:-?}) and the bounded command is running (${n14c_before} tagged process(es)) — so the signal below is the fleet's own shape" $rcn14c
+kill -TERM -"${n14c_pid:-0}" 2>/dev/null
+sleep 2
+pgrep -f '^sleep 4242$' >/dev/null 2>&1; rcn14d=$?
+[ "$rcn14d" -ne 0 ]; rcn14d=$?
+ck "N14d …and a caller group-TERM reaches the bounded command: it is GONE (pre-fix it survived at ppid 1 for its whole bound — the watchdog was ungrouped with it and its trap forwarded nothing)" $rcn14d
+# ⛔ AND THE ESCALATION: a command that IGNORES the forwarded TERM must not outlive the reap either, or
+# ungrouping it would have hidden it from the reaper's second (KILL) stage.
+cat > "$TMP/n14e-probe.sh" <<'N14EPROBE'
+set -u
+export TB_TIMEOUT_FORCE_INTERNAL=1
+. "$1"
+trap '' TERM
+tb_timeout 60 sleep 4343 &
+wait
+N14EPROBE
+n14e_pid="$(bash -c '
+  set -m 2>/dev/null
+  bash "$1" "$2" >/dev/null 2>&1 &
+  printf "%s" "$!"' _ "$TMP/n14e-probe.sh" "$HERE/../lib/bounded.sh")"
+sleep 2
+kill -TERM -"${n14e_pid:-0}" 2>/dev/null
+sleep 3
+pgrep -f '^sleep 4343$' >/dev/null 2>&1; rcn14e=$?
+[ "$rcn14e" -ne 0 ]; rcn14e=$?
+ck "N14e …and a TERM-IGNORING command is ESCALATED to SIGKILL by the watchdog, so ungrouping it did not hide it from the reaper's second stage" $rcn14e
+pkill -9 -f '^sleep 4242$' 2>/dev/null; pkill -9 -f '^sleep 4343$' 2>/dev/null
 # ⛔ N15 — THE HUB REFUSAL IS READ, NOT INHERITED (review cycle 4, gap 3: F7 executes the shape but no arm
 # ever greps `refused-main-checkout`, so deleting the block left the suite green — the merge-gate bypass
 # the comment names, undetected).
