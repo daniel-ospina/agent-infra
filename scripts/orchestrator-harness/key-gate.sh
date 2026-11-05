@@ -209,8 +209,20 @@ def read_json(path, jsonc=False):
     settings-manager.js:266, trust-manager.js, model-config.js:116. Python json.load rejects a BOM, so the same file pi
     consumed came back UNPARSEABLE here: for store that was a POSITIVE no-credential and a false 82 on a box pi runs
     (measured), and for models.json it made the gate INERT (check=skipped, rc 0) on a file pi uses."""
-    with open(path, encoding="utf-8-sig") as f:
+    # ⛔ EMPTY IS AN EMPTY STORE, NOT AN UNREADABLE ONE (round 24, P1, measured): `parseStorageData` starts with
+    # `if (!content) { return {}; }` (`auth-storage.js:301-305`), and `settings-manager.js:262-267` does the same, so a
+    # 0-byte `auth.json` (an interrupted atomic write, `touch`, `: > auth.json`) leaves pi running on the environment
+    # while this reader raised - and the store arm mapped that to rc 6, REFUSING 82 a box pi runs. Measured: 0-byte
+    # store + `DEEPSEEK_API_KEY` exported -> `pi -p` made the call (401 ****BBBB), the gate said
+    # `reason=auth-store-unreadable`. For `models.json` the answer is the same by a different route: pi\x27s loader
+    # `JSON.parse`s "" and discards the file, and `{}` is discarded too (the document requires `providers`).
+    # ⛔ AND THE SAME FOR NON-UTF-8 BYTES (round 24, P1, measured): Node decodes with U+FFFD replacement and never
+    # throws (`readFileSync(path, "utf-8")`, `auth-storage.js:175`), so a latin-1 `key` is an ordinary string to pi
+    # while Python raised UnicodeDecodeError -> rc 6 -> a false 82. `errors="replace"` is exactly Node\x27s behaviour.
+    with open(path, encoding="utf-8-sig", errors="replace") as f:
         txt = f.read()
+    if not txt:
+        return {}
     if jsonc:
         txt = strip_jsonc(txt)
     # ⛔ JSON.parse REJECTS `Infinity`/`-Infinity`/`NaN`, PYTHON\x27S json.loads ACCEPTS THEM (round 23, P2, measured):
@@ -218,7 +230,10 @@ def read_json(path, jsonc=False):
     # a document carrying `"contextWindow": Infinity` is DISCARDED by pi while this reader returned a value
     # `_ok_num` graded admissible (`inf > 0`) - a `check=ok` naming a variable from a file pi never loaded, the exact
     # false-PASS class this file exists to prevent. `parse_constant` is the hook Python offers for precisely those
-    # three tokens; `1e999` (which JSON.parse also turns into Infinity) stays accepted on both sides, as measured.
+    # three tokens. ⛔ AND A NON-FINITE RESULT IS ITS OWN CASE (round 24, P2, measured): `1e999` parses on BOTH sides,
+    # but pi\x27s validator then rejects the non-finite number and discards the document - `_number` refuses it too (the
+    # earlier note here claimed both sides accepted it, which was wrong and would have talked the next reader out of
+    # checking).
     return json.loads(txt, parse_constant=_reject_constant)
 
 NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -391,7 +406,11 @@ if sys.argv[2] == "var":
             return isinstance(v, str) and v != ""
 
         def _number(v):
-            return not isinstance(v, bool) and isinstance(v, (int, float))
+            # ⛔ NON-FINITE IS NOT A NUMBER TO pi (round 24, P2, measured): `JSON.parse("1e999")` yields `Infinity`,
+            # and pi\x27s validator answers `Invalid models.json schema: ... must be number` and DISCARDS the file, while
+            # `inf > 0` made this gate answer "valid" and print `check=ok var=...` out of a document pi never loaded.
+            return (not isinstance(v, bool) and isinstance(v, (int, float))
+                    and v == v and v not in (float("inf"), float("-inf")))
 
         def _ok_num(v):          # {"type": "number", "exclusiveMinimum": 0}
             return _number(v) and v > 0
@@ -1378,28 +1397,24 @@ key_gate_box_default_assert() {
   # `<PWD>/rel/models.json`, printing `check=ok` for a variable the box's own store does not name — the
   # false-PASS polarity the header forbids.
   names="$(key_gate_var "$home" "$prov" "$cwd")"
-  if [ -z "$names" ]; then
-    [ "$quiet" = 1 ] && return 0
-    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s box_default=%s provider=%s settings_json=%s — the apiKey template for the STARTUP provider is not resolvable, so nothing is asserted here\n' \
-      "$label" "$dm" "$dm" "$prov" "$sj"
-    return 0
-  fi
-  for n in $names; do
-    key_gate_value_present "$n" || { missing="$n"; break; }
-  done
-  # ⛔ THE STORE IS PROBED BEFORE THE ENVIRONMENT, AS pi READS IT (round 20, P1, measured): with the key
-  # exported AND a store entry pi cannot use, the old order printed `check=ok box_default=…` for a pin pi
-  # then refuses (`Provider is not configured: <provider>`), while the same box with the variable unset was
-  # refused - one box, two opposite verdicts, and the exported one was the false pass.
+  # ⛔ THE STORE IS PROBED BEFORE THE TEMPLATE, AS pi READS IT (round 24, P2, measured) — THE SAME ORDERING THE LANE PATH
+  # HAS HAD SINCE ROUND 21, which this arm never got: a `models.json` need not declare a built-in provider at all (the
+  # NORMAL cell shape), and the early return below ran first, so on one box `--probe` refused `reason=store-invalid`
+  # while `--probe --box-default` answered `reason=cannot-resolve-provider-credential` — the README advertises the
+  # latter as refusing an unusable pin, and on the ordinary shape it structurally could not. The early return now sits
+  # BELOW the store probe (it still applies when the store has no entry: then nothing names a variable to check).
   local store_rc=1
   key_gate_stored_credential "$home" "$prov" "$cwd"; store_rc=$?
+  # ⛔ AND THAT PROBE RUNS BEFORE THE ENVIRONMENT TOO (round 20, P1, measured): with the key exported AND a store
+  # entry pi cannot use, the old order printed `check=ok box_default=…` for a pin pi then refuses, while the same box
+  # with the variable unset was refused - one box, two opposite verdicts, and the exported one was the false pass.
   case "$store_rc" in
     5)
       # The pin cannot be asserted AND the lane about to be dispatched cannot start on this store either, so in
       # `refused` mode (the standalone probe) this is a verdict about the FILE. A lane\x27s own `key_gate_assert`
       # refuses through the arm above, and `warn` mode stays quiet so one lane log does not carry it twice.
       [ "$quiet" = 1 ] && return 0
-      printf '[key-gate] %s check=fail result=REFUSED reason=store-invalid model=%s box_default=%s provider=%s home=%s agent_dir=%s - %s/auth.json holds an entry pi cannot resolve to a key (an object whose `type` is "api_key" with a non-null `key`, or "oauth" with a non-empty string `access` and an `expires` that is a number, a numeric string or absent); measured: with such a store `pi -p` prints `No API key found` and `Provider is not configured` EVEN with the key exported, so this is a verdict about the FILE, not about a missing variable. Repair or delete `%s/auth.json` (agent-infra#3443)\n' \
+      printf '[key-gate] %s check=fail result=REFUSED reason=store-invalid model=%s box_default=%s provider=%s home=%s agent_dir=%s - %s/auth.json holds an entry pi cannot resolve to a key (an object whose `type` is "api_key" with a non-null `key`, or "oauth" with a non-empty string `access` and an `expires` that is a number, a numeric string or absent); measured: with such a store `pi -p` never reaches the provider — it prints the no-credential guidance (`No API key found` / `Use /login to log into a provider via OAuth or API key.`, depending on how the CLI is invoked) EVEN with the key exported, so this is a verdict about the FILE, not about a missing variable. Repair or delete `%s/auth.json` (agent-infra#3443)\n' \
         "$label" "$dm" "$dm" "$prov" "${home:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}"
       return "$KEY_GATE_REFUSED" ;;
     6)
@@ -1417,15 +1432,27 @@ key_gate_box_default_assert() {
       # "the probe did nothing" — every other arm of this function prints exactly one `check=` line there.
       [ "$quiet" = 1 ] && return 0
       printf '[key-gate] %s check=skipped reason=stored-credential box_default=%s model=%s provider=%s settings_json=%s — the credential for this pin is a STORED one under %s/auth.json (what `pi /login` writes, and the FIRST source pi consults), so whether the environment has to supply $%s at all is pi\x27s answer; nothing is asserted here, and the pin is NOT refused\n' \
-        "$label" "$dm" "$dm" "$prov" "$sj" "${agent_dir:-<none>}" "$missing"
+        "$label" "$dm" "$dm" "$prov" "$sj" "${agent_dir:-<none>}" "$(printf '%s\n' "$names" | paste -sd ',' - 2>/dev/null)"
       return 0 ;;
     1) : ;;
     *)
       [ "$quiet" = 1 ] && return 0
       printf '[key-gate] %s check=skipped reason=stored-credential-unresolvable model=%s box_default=%s provider=%s settings_json=%s — %s/auth.json holds an entry for this provider whose value this gate cannot resolve (a `!command`, an `oauth` credential - only pi\x27s handler registry knows whether this provider takes one - or a template whose variables are absent from both the entry env map and this environment), and pi reads that store BEFORE the environment; whether $%s is consulted at all is pi\x27s answer, so nothing is asserted about this pin\n' \
-        "$label" "$dm" "$dm" "$prov" "$sj" "${agent_dir:-<none>}" "$missing"
+        "$label" "$dm" "$dm" "$prov" "$sj" "${agent_dir:-<none>}" "$(printf '%s\n' "$names" | paste -sd ',' - 2>/dev/null)"
       return 0 ;;
   esac
+  # ⛔ THE TEMPLATE GATE NOW SITS HERE, AFTER THE STORE (round 24, P2 — see the ordering note above). With no entry in
+  # the store there is nothing to assert FROM the template: an empty `names` would otherwise fall through to the
+  # `check=ok` arm below with a blank `var=`, which is a pass line about nothing.
+  if [ -z "$names" ]; then
+    [ "$quiet" = 1 ] && return 0
+    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s box_default=%s provider=%s settings_json=%s — the apiKey template for the STARTUP provider is not resolvable, so nothing is asserted here\n' \
+      "$label" "$dm" "$dm" "$prov" "$sj"
+    return 0
+  fi
+  for n in $names; do
+    key_gate_value_present "$n" || { missing="$n"; break; }
+  done
   if [ -z "$missing" ]; then
     [ "$quiet" = 1 ] && return 0
     # ⛔ WHAT THIS LINE ASSERTS AND WHAT IT DOES NOT (review round 2, P2): the CREDENTIAL for the pinned pair
@@ -1523,7 +1550,7 @@ key_gate_assert_main() {
     KEY_GATE_VAR="${names:-<none>}"
     KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
     KEY_GATE_REASON="auth-store-unreadable"
-    printf '[key-gate] %s check=fail result=REFUSED reason=auth-store-unreadable model=%s provider=%s var=%s home=%s agent_dir=%s - %s/auth.json does not PARSE, and pi reads that file before anything else: measured, `pi -p` answers `Credential store read failed for <provider>: ...` and exits, with AND without the provider key exported. No entry is resolvable from it, so `export %%s` cannot help: repair %s/auth.json (or delete it) and re-run (agent-infra#3443)\n' \
+    printf '[key-gate] %s check=fail result=REFUSED reason=auth-store-unreadable model=%s provider=%s var=%s home=%s agent_dir=%s - %s/auth.json does not PARSE, and pi reads that file before anything else: measured, `pi -p` answers `Credential store read failed for <provider>: ...` and exits, with AND without the provider key exported. No entry is resolvable from it, so `export $%s` cannot help: repair %s/auth.json (or delete it) and re-run (agent-infra#3443)\n' \
       "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "$KEY_GATE_VAR" "${KEY_GATE_AGENT_DIR:-<none>}"
     return "$KEY_GATE_REFUSED"
   fi
