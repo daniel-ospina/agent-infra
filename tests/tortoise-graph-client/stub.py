@@ -50,6 +50,45 @@ ADVERTISED = {
     "tortoise_create_operator",
 }
 
+# ⛔ THE ADVERTISED **ARGUMENTS**, NOT ONLY THE NAMES (#3374 review, round 10 P2). This stub used to
+# answer `tools/list` with `{"name": n}` and nothing else, and to dispatch `tools/call` on `mode`
+# while ignoring `arguments` entirely — so the suite could prove a verb calls an ADVERTISED HANDLER,
+# but never that it calls it with ARGUMENTS THE HANDLER DECLARES. That is precisely the `label` vs
+# `semantics` defect class the write arms exist for: the point lands, the predicate is dropped or
+# rejected AFTER the write, and the verb exits 0. `run.sh` now asserts every recorded `tools/call`'s
+# argument KEYS against these declared properties, and the write tools' `required` against the
+# declared essential set.
+#
+# MEASURED, not assumed: read from the hosted surface's own `tools/list` (69 tools) with
+# scripts/tortoise_graph_client.py on 2026-11-05. The COUNT moves as the surface moves, so it is
+# dated; the PROPERTIES below are what the assertions read, and re-measuring them is the way to
+# refresh this fixture when the surface changes. `semantics` is the current spelling on
+# `tortoise_create_operator` — `label` (the self-hosted SDK's name) is NOT declared, which is the
+# whole point of the arm.
+SERVED_SCHEMA = {
+    "tortoise_get_entity": {
+        "properties": ["graph", "id", "limit", "type"],
+        "required": [],
+    },
+    "tortoise_overview": {
+        "properties": ["days", "entity_id", "graph", "limit", "section"],
+        "required": [],
+    },
+    "tortoise_search": {
+        "properties": ["entity_type", "graph", "kind", "limit", "min_confidence", "order_by",
+                       "query", "relationship_filter", "threshold", "traversal_path"],
+        "required": [],
+    },
+    "tortoise_create_point": {
+        "properties": ["authoredBy", "content", "credibility", "dedup", "graph", "kind", "props"],
+        "required": ["content", "kind"],
+    },
+    "tortoise_create_operator": {
+        "properties": ["direction", "graph", "op_type", "semantics", "source_id", "target_ids"],
+        "required": ["op_type", "source_id", "target_ids"],
+    },
+}
+
 OK_POINT = '{"id":"pt_abc","content":"a point","pointKind":"statement"}'
 
 
@@ -64,7 +103,21 @@ def reply_for(body):
         mode = "ok"
     method, rid = body.get("method"), body.get("id")
     if method == "tools/list":
-        result = {"tools": [{"name": n} for n in sorted(ADVERTISED)]}
+        # A tool with no measured schema is advertised by NAME ONLY rather than invented: a fixture
+        # that guesses an `inputSchema` would make the argument arm assert against the guess, which
+        # is the defect (`pins the client against the author's belief`) one level down.
+        tools = []
+        for n in sorted(ADVERTISED):
+            entry = {"name": n}
+            sch = SERVED_SCHEMA.get(n)
+            if sch:
+                entry["inputSchema"] = {
+                    "type": "object",
+                    "properties": {p: {} for p in sch["properties"]},
+                    "required": list(sch["required"]),
+                }
+            tools.append(entry)
+        result = {"tools": tools}
     elif mode == "retired":
         result = {"content": [
             {"type": "text", "text": OK_POINT},

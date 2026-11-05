@@ -26,6 +26,11 @@ The graph-write operations in this skill are identical for every Tortoise deploy
 
 Your agent reaches the graph through the Tortoise **MCP server** at `https://api.premiselabs.co/mcp/`, authenticated with a Bearer API key (`TORTOISE_MCP_API_KEY`; the client falls back to `TORTOISE_API_KEY`, which USUALLY carries the same token — `skills/research/SKILL.md` records it measured identical, Bearer → `200` — but where that name carries the REST token instead the endpoint may REJECT it). If you installed the skills via the onboarding wizard, the MCP server is already wired — `claude mcp add tortoise` (or the `.mcp.json` snippet: `{"type": "http", "url": "https://api.premiselabs.co/mcp/", "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}}`). Every operation below maps to a `tortoise_*` MCP tool. No local database, SDK or `.env` — and outside a fleet box, no graph scripts either (on a fleet box, the farmed client below is the preferred route).
 
+⛔ **THE ENTRY SHIPS `lazy: true` — RUN `mcp_load tortoise` FIRST (#3374).** The hosted cold handshake
+exceeds pi's default connect budget and a core server blocks every session start on a
+memory-constrained cell, so the entry is on-demand: until you load it, no `mcp__tortoise__*` tool
+exists and a call fails as "unknown tool". The shell client below needs no load step.
+
 ⛔ **PREFER THE CLI ON A FLEET BOX.** The MCP entry's `Authorization` header is env-expanded by the pi process, so in a long-lived process started before the key existed it expands to EMPTY and every call fails `Unauthorized: invalid or missing Bearer token` — measured 2026-11-02 on a cell that CARRIES the key (agent-infra#3253). The same tools are reachable through `~/.pi/agent/scripts/tortoise-graph.sh` (farmed by `pi-bootstrap/setup.sh`; `scripts/tortoise-graph.sh` where that pointer resolves), which reads the key AT CALL TIME: `tortoise-graph.sh evidence 'MEASURED: …' --to <id>` / `decision` / `search` / `get` / `health`. Same MCP tools underneath, so the operation names below are unchanged.
 
 ### Self-hosted

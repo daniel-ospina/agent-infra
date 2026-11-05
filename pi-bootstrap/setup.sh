@@ -110,8 +110,21 @@ merge_mcp() {
   else
     # A plain copy CLOSES over a self-hosted tortoise url and drops every local server. It is kept
     # only because a machine with no python3 cannot merge at all, and it is loud.
+    #
+    # ⛔ IT ALSO KEEPS THE BYTES IT REPLACES (#3374 review, round 10 P2). Every other replace path in
+    # this change keeps operator content — `merge-mcp.py`'s `_keep_backup()` runs for an unparseable or
+    # wrong-shaped container — so this was the ONE path that told the operator their config had been
+    # destroyed at the moment it became unrecoverable, on the ONE box with no python3 to reconstruct
+    # it. A warning without a backup is a receipt, not a remedy.
     echo "    WARNING: python3 not found — copying .mcp.json wholesale (any local server and any" >&2
     echo "    self-hosted tortoise url is LOST). Install python3 and re-run to merge properly." >&2
+    if [ -f "$DEST/.mcp.json" ]; then
+      if cp -f "$DEST/.mcp.json" "$DEST/.mcp.json.bak"; then
+        echo "    the replaced file is kept at $DEST/.mcp.json.bak" >&2
+      else
+        echo "    ⚠️  could not write $DEST/.mcp.json.bak — the replaced config is about to be LOST" >&2
+      fi
+    fi
     cp "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json"
   fi
 }
