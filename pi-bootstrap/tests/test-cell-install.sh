@@ -2020,6 +2020,113 @@ rc=$?
 [ "$rc" -eq 3 ] && grep -qF 'declares no usable tortoise entry' "$TMP/nourl.out" \
   && ok "...and the MERGE refuses the same url-less template (exit 3) — install and verify agree about one file" \
   || fail "the merge answered rc=$rc for the url-less template ('$(head -1 "$TMP/nourl.out" | cut -c1-60)') while --verify answered BADTPL:no-url — the two sides disagree about the same template"
+# ⛔ THE TEMPLATE WAS THE ONE ENTRY THIS FILE INSTALLED **WITHOUT EVER RUNNING `usable()` ON IT**
+# (#3374 review, round 10 P1). `usable()` is total over every entry the merge REPLACES or PRESERVES,
+# but the template's own `want` went straight into `.mcp.json` on every branch — so a template no lane
+# could use was installed VERBATIM into a SHARED config file, and `--verify` then REFUSED the file the
+# installer had just written. That makes the repair loop (`cloud-cell-bringup.sh`: verify → install →
+# verify) non-convergent BY CONSTRUCTION: the next `--install` reads the literal, replaces it with
+# `want`, and writes the same literal back. Measured pre-fix, rc=0 both times: a template carrying
+# `Bearer tt_AAAABBBBCCCCDDDD` landed in `.mcp.json` verbatim (R2 of this change's own contract), and a
+# template carrying `http://api.premiselabs.co/mcp/` was installed as the hosted default.
+# Each arm below ALSO asserts the destination was never created: refusing to write is the contract, and
+# a refusal that still wrote would satisfy a message-only assertion.
+_mk_tpl() {   # _mk_tpl <out> <python-expr over `t` (the tortoise entry)> — fixture from the SHIPPED base
+  python3 - "$ROOT/templates/.mcp.base.json" "$1" "$2" <<'PY'
+import json, sys
+base, out, expr = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(base))
+t = d["mcpServers"]["tortoise"]
+exec(expr)
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(out, "w"), indent=2)
+PY
+}
+_mk_tpl "$TMP/tpl-literal.json" 't["headers"]["Authorization"] = "Bearer tt_AAAABBBBCCCCDDDD"'
+_mk_tpl "$TMP/tpl-http.json"    't["url"] = "http://api.premiselabs.co/mcp/"'
+_mk_tpl "$TMP/tpl-nokey.json"   't.pop("headers", None)'
+for _case in literal:literal@headers.Authorization http:insecure nokey:nokey; do
+  _name="${_case%%:*}"; _why="${_case#*:}"
+  _dst="$TMP/tpl-${_name}-dest.json"; rm -f "$_dst"
+  python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/tpl-${_name}.json" "$_dst" --cell > "$TMP/tpl-${_name}.out" 2>&1
+  rc=$?
+  [ "$rc" -eq 3 ] && grep -qF "UNUSABLE tortoise entry (${_why})" "$TMP/tpl-${_name}.out" \
+    && [ ! -e "$_dst" ] && ! grep -q 'Traceback' "$TMP/tpl-${_name}.out" \
+    && ok "a template declaring an UNUSABLE tortoise entry is refused by name (${_why}, exit 3) and NOTHING is written" \
+    || fail "the merge answered rc=$rc for a template whose tortoise entry is unusable (${_why}) and left \$([ -e "$_dst" ] && echo a destination || echo no destination) — a template is what this file INSTALLS, so installing one --verify refuses is a repair loop that can never converge"
+done
+# ...and the CONTROL, so the three arms above cannot pass by refusing EVERY template: the SHIPPED
+# template still installs. Without it, an over-eager `usable()` call on `want` (the false-block
+# direction, which would stop every fresh box from getting a graph at all) satisfies all three.
+rm -f "$TMP/tpl-real-dest.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/tpl-real-dest.json" --cell > "$TMP/tpl-real.out" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ -f "$TMP/tpl-real-dest.json" ] \
+  && ok "...and the SHIPPED template still installs (rc=0) — the new guard refuses unusable templates, not all of them" \
+  || fail "the shipped template was refused (rc=$rc, '$(head -1 "$TMP/tpl-real.out" | cut -c1-70)') — validating the template must not block the one template every box installs"
+# ⛔ THE DESTINATION READ WAS THE LAST BARE `open()` IN THIS FILE (#3374 review, round 10 P2).
+# `except ValueError` caught the JSONDecodeError and let every OSError through, so an unreadable
+# `.mcp.json` escaped as a TRACEBACK with the undocumented rc=1 while the docstring advertises 0/2/3 —
+# and `--verify` names exactly this shape (`UNREADABLE:`). Measured pre-fix:
+# `mkdir dst.json; merge-mcp.py tpl dst.json --cell` → IsADirectoryError traceback, rc=1. It is
+# reachable from the repair loop, which then dies on Python internals for a file the verifier had just
+# named correctly. A directory is the fixture because it raises in EVERY environment.
+mkdir -p "$TMP/unreadable-dest.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/unreadable-dest.json" --cell > "$TMP/unreadable-dest.out" 2>&1
+rc=$?
+[ "$rc" -eq 3 ] && grep -qF 'is not a readable config file' "$TMP/unreadable-dest.out" && ! grep -q 'Traceback' "$TMP/unreadable-dest.out" \
+  && ok "an unreadable DESTINATION is a named FATAL (exit 3), not a traceback with the undocumented rc=1" \
+  || fail "an unreadable destination produced rc=$rc / '$(head -1 "$TMP/unreadable-dest.out" | cut -c1-70)' — the documented contract is 0/2/3, and the repair path must not die on Python internals"
+# ...and the CONTROL, so the arm above cannot pass by refusing a destination that is merely ABSENT.
+# `os.path.exists` guards the read, so a missing dest must take the fresh-install path; if the OSError
+# branch ever swallowed it, every first install on every box would stop — the false-block direction.
+# ⛔ A DANGLING SYMLINK IS *NOT* THIS BRANCH'S SHAPE, AND THE CODE COMMENT CLAIMED IT WAS. `os.path.exists`
+# follows the link, so it is FALSE for a dangling one, the read is SKIPPED, and the write goes THROUGH the
+# link and creates the target. Measured, and pinned here as data so the comment cannot drift back: the
+# repair loop converges either way, but it converges by creating the link's target, not by refusing.
+rm -f "$TMP/absent-dest.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/absent-dest.json" --cell > "$TMP/absent-dest.out" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ -f "$TMP/absent-dest.json" ] \
+  && ok "...and an ABSENT destination is still a fresh install (rc=0) — the unreadable guard does not catch a first run" \
+  || fail "an absent destination produced rc=$rc — the unreadable-destination branch is swallowing the fresh-install path, which would stop the very first install on every box"
+rm -f "$TMP/dangling-target.json" "$TMP/dangling-dest.json"
+ln -s "$TMP/dangling-target.json" "$TMP/dangling-dest.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/dangling-dest.json" --cell > "$TMP/dangling.out" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && [ -f "$TMP/dangling-target.json" ] && [ -L "$TMP/dangling-dest.json" ] \
+  && ok "a DANGLING-SYMLINK destination is written THROUGH the link (rc=0, target created) — measured, not the FATAL branch" \
+  || fail "a dangling-symlink destination produced rc=$rc with \$([ -f "$TMP/dangling-target.json" ] && echo a target || echo NO target) — the OSError branch cannot see this shape (os.path.exists follows the link), so the code comment must not claim it"
+# ...and an unreadable-by-PERMISSION REGULAR file is REPLACED, not refused, and the bytes it
+# discards are BACKED UP. Two directions are asserted, because the first draft of this arm only
+# asserted "a `.bak` exists" and thereby certified a WARNING: `_keep_backup` needs READ on the source,
+# so for the one shape that reaches this fallback the copy FAILED and the content was LOST while the
+# NOTE printed "the previous file was saved as (backup FAILED …)" — a sentence asserting a save that
+# did not happen, against this file's own rule that operator content is never silently deleted
+# (measured pre-fix: mode-0000 dest → rc=0, no `.bak`, content GONE). The second direction is the
+# CONVERGENCE one: the replacement must be readable, or `--verify` refuses the file this installer
+# just wrote and verify → install → verify never converges. Skipped as root, which reads a 0000 file
+# regardless and would make both arms assert nothing.
+if [ "$(id -u)" -ne 0 ]; then
+  _orig='{"mcpServers":{"mine":{"command":"keep-me"}}}'
+  printf '%s' "$_orig" > "$TMP/eperm-dest.json"
+  chmod 000 "$TMP/eperm-dest.json"
+  python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/eperm-dest.json" --cell > "$TMP/eperm.out" 2>&1
+  rc=$?
+  # stat works without READ permission; the byte count is what proves the copy happened.
+  _want="$(printf '%s' "$_orig" | wc -c | tr -d ' ')"
+  _got="$(stat -c '%s' "$TMP/eperm-dest.json.bak" 2>/dev/null || stat -f '%z' "$TMP/eperm-dest.json.bak" 2>/dev/null || echo 0)"
+  [ "$rc" -eq 0 ] && grep -qF 'REPLACED an UNREADABLE .mcp.json' "$TMP/eperm.out" \
+    && ! grep -qF 'backup FAILED' "$TMP/eperm.out" && [ "$_got" = "$_want" ] \
+    && ok "an unreadable-by-PERMISSION regular file is REPLACED with its bytes KEPT in the backup (rc=0, ${_got}B)" \
+    || fail "a permission-unreadable regular destination produced rc=$rc with a ${_got}B backup (wanted ${_want}B) — a file that may hold hand-written work must be replaced AND backed up, never refused or dropped"
+  # the CONVERGENCE direction: the file the installer just wrote must be one the verifier can read.
+  [ -r "$TMP/eperm-dest.json" ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if "tortoise" in d["mcpServers"] else 1)' "$TMP/eperm-dest.json" \
+    && ok "...and the replacement is READABLE and parses (mode $(stat -c '%a' "$TMP/eperm-dest.json" 2>/dev/null || stat -f '%Lp' "$TMP/eperm-dest.json")) — the repair loop can converge" \
+    || fail "the replacement written over an unreadable dest is mode $(stat -c '%a' "$TMP/eperm-dest.json" 2>/dev/null) and cannot be read/parsed — --verify would refuse the file this installer just wrote, so verify -> install -> verify never converges (restoring the 0000 mode here is what causes it)"
+else
+  ok "an unreadable-by-PERMISSION destination is REPLACED and backed up (arm skipped: running as root, which reads a 0000 file)"
+fi
 # ⛔ AN UNREADABLE `.mcp.json` WAS THE LAST BARE `open()` ON THE VERIFY PATH (#3374 review P2): every
 # sibling shape error (BADROOT/BADSERVERS/BADDERS/NOTJSON) is a NAMED refusal, but the read itself
 # raised straight out, so stdout was EMPTY and `verify_graph_mcp` printed `FAIL … (marker: none)`
