@@ -606,31 +606,44 @@ physical_path() {
 #     commonly reached through a symlinked ancestor (`/tmp` → `/private/tmp` on macOS). Measured on
 #     this suite's own fixture: HOME=/tmp/… resolved to /private/tmp/…, the literal prefix never
 #     matched, and the guard PASSED the exact TCC-dead target it exists to refuse.
+# ⛔ AND THE COMPARISON IS CASE-INSENSITIVE, because APFS is case-insensitive by default: `~/documents/x`
+# IS `~/Documents/x` on the default volume, and a literal-prefix `case` let it through. Measured
+# (fresh review of #3413, on the extracted function): `$HOME/Documents/x` REFUSED while
+# `$HOME/documents/x` and `$HOME/DOCUMENTS/x` both PASSED. `nocasematch` is saved/restored so this
+# function does not change its caller's matching semantics, and the loop sets a flag instead of
+# returning early for the same reason.
 # The LITERAL target is tested first and always, so a path whose directory cannot be resolved falls
 # back to the literal `case` — an unresolvable path must never be the way past this guard.
 is_tcc_protected() {
-    local arg="$1" arg_phys root root_phys candidate
+    local arg="$1" arg_phys root root_phys candidate hit=1 ncm=0
     arg_phys="$(physical_path "$arg")"
+    if shopt -q nocasematch; then ncm=1; fi
+    shopt -s nocasematch
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         for candidate in "$arg" "$arg_phys"; do
             [ -n "$candidate" ] || continue
-            case "$candidate" in "$root" | "$root"/*) return 0 ;; esac
+            case "$candidate" in "$root" | "$root"/*) hit=0; break 2 ;; esac
         done
         root_phys="$(physical_path "$root")"
         if [ -n "$root_phys" ] && [ "$root_phys" != "$root" ]; then
             for candidate in "$arg" "$arg_phys"; do
                 [ -n "$candidate" ] || continue
-                case "$candidate" in "$root_phys" | "$root_phys"/*) return 0 ;; esac
+                case "$candidate" in "$root_phys" | "$root_phys"/*) hit=0; break 2 ;; esac
             done
         fi
     done < <(tcc_protected_roots)
-    return 1
+    [ "$ncm" -eq 1 ] || shopt -u nocasematch
+    return "$hit"
 }
 
 # Verify what launchd will EXEC: it must resolve AND be readable from the launchd context. Data
 # arguments that sit in the TCC tree are WARNED about, never refused (P1-A of the #3413 review).
-# $1 = rendered plist FILE. Prints offending/warned targets; returns 1 if any EXEC target is bad.
+# $1 = rendered plist FILE. Prints offending/warned targets.
+# RETURN CODES — the caller distinguishes them, because they are not the same failure:
+#   0  every EXEC target resolves and is readable
+#   1  a target is MISSING/unparseable — fatal to the run (actionable: sync.sh / setup.sh)
+#   3  an EXEC target is TCC-PROTECTED (#427) — refuse THIS unit, but not the whole run
 #
 # ⛔ EXEC vs DATA IS THE WHOLE CLASSIFICATION. Only what launchd must READ in order to start the job
 # can hard-refuse: argv[0], plus the script a resolved interpreter is handed. Everything else
@@ -643,12 +656,18 @@ is_tcc_protected() {
 # `sync.sh:4` is `set -euo pipefail` and `sync.sh:81` runs this installer UNGUARDED — so Level-1
 # auto-sync died there and never reached the #341 cost-config guard or the #498/#502 parity gate.
 # An over-block that takes down a working pipeline is not "fail-closed", it is a regression.
+#
+# ⛔ THE SAME PROPAGATION DEFEATS THE TCC ARM TOO, which is why rc 3 exists (fresh review of #3413).
+# `branch-reaper`/`worktree-reaper` exec `{{TORTOISE_REPO}}/.venv/bin/python`, and on the documented
+# default box that interpreter is INSIDE the protected tree — genuinely dead, so it must not be armed,
+# but escalating it to a fatal install failure stops `sync.sh` converging the rest of the box. The
+# unit is refused (and any stale copy disarmed); the RUN is not failed.
 verify_targets() {
-    local plist="$1" raw argv0 exec_idx="" line idx arg bad=0 abs=0 first_after
+    local plist="$1" raw argv0 exec_idx="" line idx arg bad=0 tcc=0 abs=0 first_after base
     if ! raw="$(plist_program_args "$plist")"; then
-        echo "    unreadable ProgramArguments: this plist could not be parsed, so what launchd will" >&2
-        echo "        execute is UNVERIFIED. Refusing to install on an empty scan (an unparseable" >&2
-        echo "        unit is how a job gets armed with NO arguments and reports as healthy)." >&2
+        echo "    unreadable ProgramArguments: this plist has none, or could not be parsed, so what" >&2
+        echo "        launchd will execute is UNVERIFIED. Refusing to install on an empty scan (an" >&2
+        echo "        unparseable unit is how a job gets armed with NO arguments and reports healthy)." >&2
         return 1
     fi
     argv0="$(printf '%s\n' "$raw" | sed -n '1p' | cut -f2)"
@@ -679,9 +698,19 @@ verify_targets() {
                 echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427);" >&2
                 echo "        it starts this job and bash exits 126 'Operation not permitted', which" >&2
                 echo "        reads as 'installed' to every instrument that only checks existence." >&2
-                echo "        Render the FARMED copy ({{HOME}}/.pi/agent/scripts/…) and declare it in" >&2
-                echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
-                bad=1
+                base="$(basename -- "$arg")"
+                case "$base" in
+                    bash|sh|zsh|dash|ksh|python|python2|python3|python3.*|perl|ruby|node|env)
+                        echo "        This is the job's INTERPRETER ('$base'), not its script: farming a" >&2
+                        echo "        script cannot help here. Point the interpreter at a path launchd" >&2
+                        echo "        can read, or move the checkout it lives in out of the tree (#427)." >&2
+                        ;;
+                    *)
+                        echo "        Render the FARMED copy ({{HOME}}/.pi/agent/scripts/…) and declare it in" >&2
+                        echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
+                        ;;
+                esac
+                tcc=1
                 ;;
             *)
                 echo "    WARN $arg is inside a TCC-protected tree (#427) but is a DATA argument:" >&2
@@ -696,7 +725,9 @@ verify_targets() {
         echo "        nothing to verify — refusing to install an unverified unit." >&2
         return 1
     fi
-    return "$bad"
+    [ "$bad" -eq 0 ] || return 1
+    [ "$tcc" -eq 0 ] || return 3
+    return 0
 }
 
 job_loaded() {
@@ -704,7 +735,7 @@ job_loaded() {
 }
 
 install_job() {
-    local template="$1" label installed rendered tmp left ph unset_ph=""
+    local template="$1" label installed rendered tmp left ph unset_ph="" vrc=0
     label="$(job_label "$template")"
     installed="$AGENTS_DIR/$label.plist"
 
@@ -733,11 +764,32 @@ install_job() {
     fi
 
     rendered="$(render "$template")"
-    # Broken script target → refuse to install a dead job (hard failure).
+    # A target launchd cannot reach → refuse to install a dead job. The TWO return codes are NOT the
+    # same failure and must not propagate alike:
+    #   rc 1 — a broken/missing target (a farm or checkout that is not there yet). FATAL: it is
+    #          actionable with `sync.sh` / `pi-bootstrap setup.sh`, and it is the pre-existing contract.
+    #   rc 3 — a TCC-protected EXEC target (#427). NOT fatal to the RUN: it is a structural property of
+    #          the box's layout and `sync.sh:4`/`:81` runs this installer unguarded under `set -e`, so
+    #          failing the run would stop the whole box converging in order to fix one job that cannot
+    #          run anyway. The unit is still NOT installed — arming it is the false PASS this guard
+    #          exists to prevent — and a stale copy is DISARMED, so the outcome is an ABSENCE plus a
+    #          named report, never an armed corpse respawning every 15 s.
     tmp="$(mktemp)" || return 1
     printf '%s' "$rendered" > "$tmp"
-    if ! verify_targets "$tmp"; then
+    verify_targets "$tmp" || vrc=$?
+    if [ "$vrc" -ne 0 ]; then
         rm -f "$tmp"
+        if [ "$vrc" -eq 3 ]; then
+            echo "  REFUSED $label: launchd cannot READ its target (#427) — NOT installing it." >&2
+            echo "        Arming a unit launchd cannot start is the false PASS (#3413) this guard exists" >&2
+            echo "        to prevent. See the remedy above." >&2
+            if [ -f "$installed" ]; then
+                launchctl bootout "$DOMAIN" "$installed" 2>/dev/null || true
+                rm -f "$installed"
+                echo "        An earlier copy was armed and could never run — DISARMED and removed." >&2
+            fi
+            return 3
+        fi
         echo "  FAIL $label: script target(s) above are missing or unreachable from launchd —" >&2
         echo "        fix the farm/checkout first (run sync.sh / pi-bootstrap setup.sh), then re-run." >&2
         echo "        Refusing to install: a unit launchd cannot start reads as 'armed' and does" >&2
@@ -977,6 +1029,7 @@ fi
 
 echo "=== Installing agent-infra launchd agents (idempotent) ==="
 fail=0
+tcc_refused=""
 # Retire first (#432): unload jobs whose work moved to session-checks.
 retire_pass || fail=1
 for template in "$TEMPLATES_DIR"/*.plist; do
@@ -986,8 +1039,26 @@ for template in "$TEMPLATES_DIR"/*.plist; do
         echo "  $(basename "$template" .plist): skipped (in RETIRED — remove the template)" >&2
         continue
     fi
-    install_job "$template" || fail=1
+    install_job "$template"
+    case "$?" in
+        0) ;;
+        # rc 3 = refused for TCC, not a failed run (see install_job). Collected and reported below so
+        # the absence is NAMED even though the exit code stays 0 for `sync.sh`.
+        3) tcc_refused="$tcc_refused $(basename "$template" .plist)" ;;
+        *) fail=1 ;;
+    esac
 done
+if [ -n "$tcc_refused" ]; then
+    echo "" >&2
+    echo "NOT INSTALLED — launchd cannot READ their target, so arming them would be a false PASS (#427):" >&2
+    for _l in $tcc_refused; do echo "  - $_l" >&2; done
+    echo "  Their executable (or the checkout it lives in) is under ~/Documents, ~/Desktop, ~/Downloads or" >&2
+    echo "  iCloud, which macOS TCC denies to every launchd-spawned process. Remedy: move that checkout" >&2
+    echo "  out of the protected tree, or point the unit at a FARMED copy (pi-bootstrap/setup.sh)." >&2
+    echo "  ⛔ This does NOT fail the run — sync.sh runs this installer unguarded under set -e, and a" >&2
+    echo "  structural TCC refusal must not stop the rest of the box converging. The units are ABSENT," >&2
+    echo "  not armed: 'install-launchd.sh --status' reports them NOT INSTALLED." >&2
+fi
 if [ "$fail" -ne 0 ]; then
     echo "ERROR: one or more jobs FAILED — see above. Nothing was half-installed; re-run after fixing." >&2
     exit 1
