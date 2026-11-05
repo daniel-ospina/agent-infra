@@ -76,6 +76,9 @@ mkstate
 run --check >/dev/null 2>&1; ck $? "both present → rc 0"
 LINE="$(run --line)"; [ -z "$LINE" ]; ck $? "both present → --line renders NOTHING (empty, not a banner)"
 MISS="$(run --missing)"; [ -z "$MISS" ]; ck $? "--missing is empty when both are present"
+# ⛔ THE POSITIVE CONTROL FOR EVERY `--missing` rc-2 ARM (#3379 review cycle 27): a verb that answered 2
+# unconditionally would satisfy all of them, so the healthy box is asserted at rc 0 here.
+run --missing >/dev/null 2>&1; ck $? "…and --missing is rc 0 on a healthy box (the control that stops a '2 to everything' helper passing the CANNOT-VERIFY arms)"
 
 echo "§B one missing → named BY PATH, the present one NOT named"
 rm -f "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
@@ -159,6 +162,22 @@ else
     run --line | grep -qF 'CANNOT VERIFY'; ck $? "--line says CANNOT VERIFY, and never MISSING, when an ancestor is unsearchable"
   fi
   chmod 755 "$TMP/home/.pi/agent"
+  # ⛔ READABLE IS NOT SEARCHABLE — THE ANCESTOR LEG TOO (#3379 review cycle 27, P2, MEASURED). The arm above
+  # exercises `chmod 000` on the ancestor, which clears BOTH bits, so it cannot tell `-x` from `-r`: replacing
+  # `[ -x "$p" ] || return 0` with `[ -r "$p" ] || return 0` leaves the suite GREEN while an ancestor at
+  # `chmod 640` (readable, not searchable — the mode the function's own comment names as realistic: "an
+  # ordinary 711 owned by another user", "a dir owned by another user without x") makes both PRESENT files
+  # MISSING again, with the `ship it` remedy: the cycle-7/cycle-9 false-absence claim, one bit away.
+  : > "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+  : > "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+  chmod 640 "$TMP/home/.pi/agent"
+  if [ -x "$TMP/home/.pi/agent" ]; then
+    ok "(skipped: this user keeps search permission on a 640 dir — running as root?)"
+  else
+    run --check >/dev/null 2>&1; [ $? -eq 2 ]; ck $? "a READABLE-but-UNSEARCHABLE ANCESTOR → rc 2, not 1 (only -x gates resolving a name; a -r-based ancestor leg calls both PRESENT files missing)"
+    MISS_ANR="$(run --missing 2>/dev/null)"; [ -z "$MISS_ANR" ]; ck $? "--missing prints NOTHING when an ancestor is readable but unsearchable (no false 'ship it' advice)"
+  fi
+  chmod 755 "$TMP/home/.pi/agent"
   rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
   # …and a state path that is a FILE where a dir belongs is a deployment fault, never an ABSENCE.
   rmdir "$TMP/home/.pi/agent/state" && : > "$TMP/home/.pi/agent/state"
@@ -178,6 +197,14 @@ else
   run --check >/dev/null 2>&1; [ $? -eq 2 ]; ck $? "a present-but-unreadable FILE → rc 2, not 0 (the false-PASS arm)"
   run --missing | grep -qF 'LANE-BRIEF-PREAMBLE.md' && bad "--missing reports an unreadable file as ABSENT (wrong remedy: ship vs chmod)" || ok "--missing does NOT call an unreadable file absent"
   run --line | grep -qF 'UNREADABLE'; ck $? "--line names the unreadable file as UNREADABLE"
+  # ⛔ AND `--missing` MUST ANSWER CANNOT-VERIFY, NOT 0-WITH-AN-EMPTY-LIST (#3379 review cycle 27, P2,
+  # MEASURED). The arm above only asserts it does not CALL the file absent — which an rc 0 with no output
+  # satisfies. Measured on this fixture: `--check` rc 2 naming the path, `--missing` rc 0 printing nothing,
+  # so a consumer reading the empty list as "nothing is missing" read a can't-verify box as clean — the
+  # same disagreement the occupied-path arm closes for a directory, one state over.
+  MISS_UF_ERR="$(run --missing 2>&1 >/dev/null)"; MISS_UF_RC="$(run --missing >/dev/null 2>&1; printf %s $?)"
+  [ "$MISS_UF_RC" = "2" ]; ck $? "--missing on a present-but-UNREADABLE file is 2, not 0 with an empty list (measured rc=$MISS_UF_RC; the empty list is a can't-verify claim wearing the healthy answer's clothes)"
+  case "$MISS_UF_ERR" in *'CANNOT VERIFY (unreadable)'*) ok "…and it NAMES the unreadable path on stderr, so the reader knows the remedy is a chmod" ;; *) bad "--missing returned 2 without naming the unreadable path (a verdict with no subject)" ;; esac
 fi
 chmod 644 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" 2>/dev/null
 # ⛔ …AND THE THIRD CELL OF THE SAME TABLE: a path OCCUPIED by something that is not a regular file
@@ -602,6 +629,16 @@ case "$NOBASE_LINE" in *'CANNOT VERIFY'*) ok "…and it says CANNOT VERIFY inste
 # --missing: an UNKNOWN state must not look like the empty list that means "nothing missing".
 MISS_UNDEC_RC="$(T=$(mktemp -d); mkdir -p "$T/.pi/agent/state"; chmod 000 "$T/.pi/agent/state"; CELL_HOME="$T" bash "$HELPER" --missing >/dev/null 2>&1; _r=$?; chmod 755 "$T/.pi/agent/state"; rm -rf "$T"; printf %s "$_r")"
 [ "$MISS_UNDEC_RC" = "2" ]; ck $? "--missing on an UNRESOLVABLE state dir is 2, not 0-with-empty-output (a consumer reading 0 as 'all present' was reading unknown as clean; measured rc=$MISS_UNDEC_RC)"
+# ── E1k-b: A SET-BUT-EMPTY `CELL_HOME` FALLS BACK TO `HOME` (#3379 review cycle 27, P2, MEASURED) ─────
+# The fixture above covers `CELL_HOME` UNSET, never SET-AND-EMPTY — the state the cycle-3 P1 was about
+# (`/.pi/agent/state`). `${CELL_HOME:-${HOME:-}}` falls back on an empty value; the one-character revert to
+# `${CELL_HOME-${HOME:-}}` leaves the suite green and emits a sentence that is FALSE on that box ("neither
+# CELL_HOME nor HOME is set") plus the wrong remedy (an environment fix, where the truth is "ship the file").
+mkstate
+SE_RC="$(CELL_HOME= HOME="$TMP/home" bash "$HELPER" --check >/dev/null 2>&1; printf %s $?)"
+[ "$SE_RC" = "1" ]; ck $? "a SET-BUT-EMPTY CELL_HOME falls back to HOME → rc 1 MISSING (measured rc=$SE_RC; \${CELL_HOME-…} makes it rc 2 with an untrue 'neither is set' sentence)"
+SE_LINE="$(CELL_HOME= HOME="$TMP/home" bash "$HELPER" --line 2>/dev/null)"
+case "$SE_LINE" in *'neither CELL_HOME nor HOME is set'*) bad "…and with HOME set it still claims NEITHER is set (a wrong diagnosis, and the remedy it prints is an environment fix for a box that needs a deployment)" ;; *) ok "…and it never claims both are unset when HOME is set" ;; esac
 # ── E1l: AN ANCESTOR THAT IS NOT A DIRECTORY IS UNDECIDABLE TOO (cycle 4, P2, MEASURED) ─────────══
 # The walk tested only the EXECUTE bit, never `-d`, so an ancestor that exists, is executable, and is a
 # FILE was graded decidable — and the answer was `MISSING … ship the file` for a path that can never exist.
@@ -990,6 +1027,11 @@ UD24="$(mktemp -d)"; mkdir -p "$UD24/.pi/agent/state"; chmod 000 "$UD24/.pi/agen
 L24UD="$(CELL_HOME="$UD24" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
 chmod 755 "$UD24/.pi/agent/state"; rm -rf "$UD24"
 case "$L24UD" in *'remedy is a mode fix on that directory, NOT a missing deployment'*) ok "the undecidable renderer names the mode-fix remedy (a chmod on the dir, not a deployment) — read from the block an unsearchable state dir actually renders" ;; *) bad "the undecidable renderer dropped its remedy" ;; esac
+# ⛔ AND THE FAULT LIST, IN THE RENDERER THE LANE ACTUALLY READS (#3379 review cycle 27, P2, MEASURED): the
+# same fault list was pinned only for `mandate_verdict` (the `--check` text), so deleting the parenthetical
+# from `cv_where` left 233/0 while `--check` kept it — the lane and its operator lost the only cue that
+# distinguishes a mode fault from "not provisioned yet", in the section written to stop exactly that split.
+case "$L24UD" in *'parent directory search (execute) bit is clear'*) ok "…and the LANE-facing renderer names the faults to look for, not only the remedy (the --check twin was pinned; this sentence was free)" ;; *) bad "the lane-facing undecidable renderer dropped its fault list while --check kept it (the lane is told the remedy but not what to look for)" ;; esac
 case "$L24UD" in *'so whether the lane can obey its'*) ok "…and still says what is UNKNOWN, not merely that something is" ;; *) bad "the undecidable renderer no longer states what is unknown" ;; esac
 NOBASE_L24="$(env -u HOME -u CELL_HOME bash "$HELPER" --line 2>/dev/null)"
 case "$NOBASE_L24" in *'remedy is an environment fix'*) ok "…and with no base to name it prescribes an ENVIRONMENT fix instead of a chmod on a path that does not exist" ;; *) bad "the no-base renderer lost its distinct remedy" ;; esac
@@ -1021,6 +1063,17 @@ done
 # highest-volume model call in the harness, with nothing red. The identical condition on spawn-gate reddens
 # (E3d's flip-back arms drive the real run_agent), so this pins the text on the seam that cannot be driven.
 grep -qF 'if [ -n "${mandate_sh:-}" ] && . "$mandate_sh" 2>>"$log" && declare -F mandate_preflight_emit' "$MERGE"; ck $? "merge-one.sh's emit is gated on the helper being PRESENT and USABLE — the whole condition, not its parts (inverting it sent every provisioned reviewer to the degraded branch with nothing red)"
+
+# ── E5h: THE EMIT MUST PRECEDE THE LAUNCH THAT READS THE BRIEF (#3379 review cycle 27, P2, MEASURED) ──
+# Every pin above is a STRING in the file, and none is POSITIONAL: cutting the whole mandate block out of
+# `run_agent` and re-inserting it AFTER `pid=$!` — i.e. after `pi -p … "$(cat "$prompt")"` has already
+# captured the brief into argv — left this suite at 233 passed, 0 failed. The reviewer is then never told
+# anything the emit wrote, which is the #3377 defect restored on the highest-volume model call in the
+# harness. The lane seam reddens for the same relocation because E3 drives its launched argv; this seam
+# cannot be driven (§E5's limit), so its ORDER is pinned instead of its text.
+_MOE="$(grep -nF 'mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"' "$MERGE" | head -1 | cut -d: -f1)"
+_MOL="$(grep -nF 'pi -p --provider "$lane_provider"' "$MERGE" | head -1 | cut -d: -f1)"
+{ [ -n "$_MOE" ] && [ -n "$_MOL" ] && [ "$_MOE" -lt "$_MOL" ]; }; ck $? "merge-one.sh's emit runs BEFORE the launch that captures the brief into argv (measured emit line=$_MOE, launch line=$_MOL; relocating the block below the launch left the reviewer untold at 233/0)"
 
 # ── E5g: THE REMAINING SENTENCES AND COLLECTOR RULES (#3379 review cycle 25, P3, MEASURED) ─────────────
 # Twelve more reverts stayed green. None changes a VERDICT, so they are pinned as the code text they are —
