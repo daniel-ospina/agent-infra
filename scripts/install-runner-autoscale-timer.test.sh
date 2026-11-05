@@ -1913,6 +1913,19 @@ assert_contains "$OUT" "repoints the capacity pass to 'other/pool'" "and the one
 assert_contains "$OUT" "RUNNER_AUTOSCALE_REPO='o/r'" "with the exact command that keeps the old pool"
 assert_contains "$(grep '^ExecStart=' "$D/$UNIT_NAME.service")" "other/pool" \
     "and the artifact really was repointed — the note is not advice the install ignores"
+# ⛔ THE PREVIEW ARM: `--dry-run` writes nothing, so the note must not claim it repointed anything.
+# Measured before this case existed: `--install --dry-run` printed "THIS install repoints …" and left
+# the unit byte-identical — the indicative about an act that did not happen, on the one mode whose whole
+# purpose is to report what WOULD happen. The suite's preview convention is `WOULD` (T15 asserts it).
+BEFORE_SUM="$(cksum < "$D/$UNIT_NAME.service")"
+ENVV=(RUNNER_AUTOSCALE_REPO="yet/another")
+OUT="$(run_install Linux "$D" --install --dry-run)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a --dry-run install exits 0"
+assert_contains "$OUT" "a real install WOULD repoint the capacity pass to 'yet/another'" \
+    "the PREVIEW says WOULD, not 'THIS install repoints' (it writes nothing)"
+assert_contains "$OUT" "This is a --dry-run: nothing was written" "and states that explicitly"
+assert_eq "$(cksum < "$D/$UNIT_NAME.service")" "$BEFORE_SUM" \
+    "the preview left the artifact byte-identical (the note was the only thing that happened)"
 # The launchd arm carries its own call site; pin it too, or only the systemd half is covered.
 D2="$T/c66d"; fresh "$D2"
 run_install Darwin "$D2" --install >/dev/null 2>&1

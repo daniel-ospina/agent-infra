@@ -501,7 +501,18 @@ note_repo_change() {
     declared="$(artifact_repo_value "$art")"
     [ -n "$declared" ] || return 0
     [ "$declared" = "$REPO" ] && return 0
-    err "note: the installed artifact converges repo '$declared' and this invocation resolves '$REPO', so THIS install repoints the capacity pass to '$REPO'."
+    # ⛔ A PREVIEW DOES NOT REPOINT ANYTHING, SO IT MUST NOT SAY IT DOES. `--dry-run` renders and prints,
+    # writing and enabling nothing (the file header says so, and the usage line offers `[--dry-run]` as a
+    # preview), yet this note stated the repoint in the INDICATIVE on that path — measured: `--install
+    # --dry-run` printed "THIS install repoints the capacity pass to …" and left the unit byte-identical
+    # (`cmp -s`). The suite's own preview convention is `WOULD` (T15 asserts `WOULD disarm`), so the
+    # dry-run arm says WOULD and names the fact that nothing is written.
+    if [ "${DRY_RUN:-0}" = "1" ]; then
+        err "note: the installed artifact converges repo '$declared' and this invocation resolves '$REPO', so a real install WOULD repoint the capacity pass to '$REPO'."
+        err "      This is a --dry-run: nothing was written, and the $MODE render was not installed."
+    else
+        err "note: the installed artifact converges repo '$declared' and this invocation resolves '$REPO', so THIS install repoints the capacity pass to '$REPO'."
+    fi
     err "      If that is not intended, re-run with:  RUNNER_AUTOSCALE_REPO='$declared' $0 $MODE"
     return 0
 }
