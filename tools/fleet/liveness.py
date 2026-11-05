@@ -1171,13 +1171,26 @@ def parse_bound_pid(text: str):
     pid_head = line.split(" log=")[0]
     pids = _bound_pid_re().findall(pid_head)
     if not pids:
-        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS NOT AN ABSENT ONE (cycle-6 review,
-        # P2). "Absent from the line" is the ADOPT row of the doc's binding table; "a pid that
-        # cannot be resolved" is the DROP row. This returned "" for both, so a line carrying
-        # `pid=abc` — reachable directly, `lane-bound.sh --pid` takes the value verbatim — took the
-        # ADOPT arm and published a verdict whose binding was never checked. The module's own
-        # `_bind_verdict` already has the drop for a non-pid token (`invalid-bound-verdict-pid`);
-        # it was unreachable from this parser, which is what marks the intent. `"?"` reaches it.
+        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS NOT AN ABSENT ONE (review P2).
+        # "Absent from the line" is the ADOPT row of the doc's binding table; "a pid that cannot
+        # be resolved" is the DROP row. This returned "" for both, so a line carrying `pid=abc`
+        # took the ADOPT arm and published a verdict whose binding was never checked.
+        #
+        # WHERE SUCH A LINE COMES FROM — stated narrowly, because the first version of this
+        # comment overclaimed it and a later reviewer falsified the claim. It is NOT the shipped
+        # writer: `lane-bound.sh --pid` takes the value verbatim (`:161`) but no emission path can
+        # carry a non-numeric one — `watch` mode refuses first (`:465` → `pid_alive`, whose
+        # `case "${1:-}" in *[!0-9]*) return 1` guard at `:234` has been on `main` since the bound
+        # was introduced) and `run` mode overwrites `PID=$!` (`:475`). Measured:
+        # `lane-bound.sh watch --log … --pid abc` → "refusing: --pid 'abc' is not a live
+        # process — nothing to bound", rc=2, nothing emitted. So the producers that reach this
+        # arm are a FOREIGN or hand-edited verdict file (`$log.lanebound`), a restored state dir,
+        # or a FUTURE producer — the same producer class this file names for every other hostile
+        # state value. That makes this defence in depth, not a live production bypass, and the
+        # guard is justified without the overclaim: the doc's binding table requires the DROP row
+        # for an unresolvable pid, and `_bind_verdict`'s `invalid-bound-verdict-pid` arm already
+        # existed for a non-pid token but was UNREACHABLE from this parser — which is what marks
+        # the intent. `"?"` reaches it.
         # `\bpid=` does not match `ppid=` / `cpu_delta_cs=` (a word boundary needs a non-word
         # char before `p`), so this only fires on a real `pid=` field.
         if _bound_pid_field_re().search(pid_head):

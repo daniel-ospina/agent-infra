@@ -1985,12 +1985,22 @@ def t43():
         check("bound-verdict-without-pid" in liv.evaluate(liv.Evidence(log_read=lr)).detail,
               "and the PUBLISHED verdict says it is unbound (a reader cannot otherwise "
               "tell a verified binding from an unbound one)")
-        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS *NOT* AN ABSENT ONE (cycle-6
-        # review, P2). \"absent from the line\" is the ADOPT row of the doc's binding table;
-        # \"a pid that cannot be resolved\" is the DROP row — and `lane-bound.sh --pid` takes
-        # the value VERBATIM, so `pid=abc` is reachable from the shipped writer, not only from
-        # a hand-edit. Collapsing the two into `\"\"` published a verdict whose binding was never
-        # checked: the same fail-open class, one surface over from the census's column 11.
+        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS *NOT* AN ABSENT ONE (review P2).
+        # "absent from the line" is the ADOPT row of the doc's binding table; "a pid that cannot
+        # be resolved" is the DROP row. Collapsing the two into "" published a verdict whose
+        # binding was never checked — the same fail-open class, one surface over from the
+        # census's column 11.
+        #
+        # ⛔ AND THE PRODUCER IS NAMED NARROWLY ON PURPOSE. An earlier version of this comment
+        # said `pid=abc` was "reachable from the shipped writer" via `lane-bound.sh --pid`. A
+        # later reviewer FALSIFIED that: `--pid` is verbatim at `:161`, but `watch` mode refuses
+        # a non-numeric pid first (`:465` -> `pid_alive`, `case "${1:-}" in *[!0-9]*) return 1`
+        # at `:234`) and `run` mode overwrites `PID=$!` (`:475`). Measured:
+        # `lane-bound.sh watch --pid abc` -> "refusing: ... not a live process", rc=2, nothing
+        # emitted. So this arm is defence in depth against a FOREIGN / hand-edited
+        # `$log.lanebound`, a restored state dir, or a future producer — not a live bypass. The
+        # guard is still required by the doc's binding table, and `_bind_verdict`'s
+        # `invalid-bound-verdict-pid` arm existed already but was unreachable from the parser.
         for tok in ("abc", "?", "0x10"):
             with open(log, "w", encoding="utf-8") as fh:
                 fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%s rc=0\n" % tok)
@@ -2731,8 +2741,9 @@ MUTATIONS = [
         "T43", "module",
         '        if _bound_pid_field_re().search(pid_head):\n            return "?"',
         '        if False:\n            return "?"',
-        "a `pid=` field that is PRESENT but unparseable (e.g. `--pid abc`, which "
-        "`lane-bound.sh` takes verbatim) is collapsed into \"no pid at all\", so the verdict "
+        "a `pid=` field that is PRESENT but unparseable (a FOREIGN / hand-edited verdict "
+        "file, a restored state dir, or a future producer — NOT the shipped writer, which "
+        "refuses a non-numeric `--pid`) is collapsed into \"no pid at all\", so the verdict "
         "is ADOPTED with the binding never checked — the binding table's DROP row published "
         "as its ADOPT row, one surface over from the census's column 11",
     ),
