@@ -1436,6 +1436,12 @@ ck "  …the second emission is INSIDE the probe-unreadable branch (a box whose 
 # keeps the count at 2 and keeps the elif-arm green while the normal cycle is silent.
 ck "  …the FIRST emission is inside the healthy (else) arm — not merely counted somewhere in the file" \
    "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{f=2; next} f==2 && /CAP_VERDICT=/{exit} f==2 && /cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
+# ⛔ AND EVERY EMISSION CARRIES THE CHANNEL (fresh review round 10, P2): without `CAP_CHAN=` the
+# controller's `published=0` was unattributable — the round-7 defect, which could return with every arm
+# above green because they grade the emission's COUNT and POSITION, not its attribution.
+ck "  …all THREE controller emissions stamp chan= (an unattributable published=0 is the round-7 defect)" \
+   "$([ "$(grep -cF 'CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}"' "$LOOP")" -eq 3 ] \
+      && qF 'cap_chan_of' "$(cat "$LOOP")" && echo 0 || echo 1)"
 ck "  …and the DISK-HELD cycle reports the fleet too (a skipping cycle is not a silent one)" \
    "$(awk '/^  if \[ "\${_df_rc:-0}" = "1" \]; then/{f=1; next} f && /^    continue$/{exit} f && /cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
 ck "  …and cap_place still receives that same read (the line cannot disagree with placement about who is visible)" \
@@ -1927,16 +1933,47 @@ ck "(c14) chan= carries the host, never the userinfo ($(printf '%s' "$L34" | gre
 L34B="$(cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
 ck "  …and an unrelated direct call carries NO chan (no carry-over: $(printf '%s' "$L34B" | grep -c 'chan=') occurrence(s))" \
    "$(! printf '%s' "$L34B" | grep -q 'chan=' && echo 0 || echo 1)"
-sed 's|##\*@|#*@   # MUTANT: shortest @|' "$CAP" > "$TMP/cap-chanweak.sh"
+sed 's|_chan="${_chan##\*@}"|_chan="${_chan#*@}"   # MUTANT: shortest @|' "$CAP" > "$TMP/cap-chanweak.sh"
 ck "  …the mutant really lost the longest-@ strip" "$([ "$(grep -c 'MUTANT: shortest @' "$TMP/cap-chanweak.sh")" -ge 1 ] && echo 0 || echo 1)"
 L34M="$(bash -c '. "$1"; cap_chan_of "$2"' _ "$TMP/cap-chanweak.sh" "$_C14R" 2>/dev/null)"
-ck "  …mutation control: with the shortest match the line would carry '${L34M}' (a secret fragment)" \
-   "$(printf '%s' "$L34M" | grep -qE 'ss@|p@ss' && echo 0 || echo 1)"
+ck "  …mutation control: with the shortest match the line carries the 'ss@…' FRAGMENT of the password (${L34M})" \
+   "$(printf '%s' "$L34M" | grep -qE 'ss@' && echo 0 || echo 1)"
 # (c15) ⛔ A REFUSAL NAMES THE BOUND IT HIT, NOT THE SEAM AS TYPED (fresh review round 9, P2): with
 # `CAP_INVENTORY_TIMEOUT=00` the message said `timed out after 00s` after waiting 10 s.
 L35="$(CAP_INVENTORY_TIMEOUT=00 CAP_CMUX_LIST="sleep 12" cap_fleet_inventory 2>&1 | head -1)"
 ck "(c15) the timeout diagnostic names the APPLIED bound ($L35)" \
    "$(qF 'timed out after 10s' "$L35" && ! printf '%s' "$L35" | grep -q 'after 00s' && echo 0 || echo 1)"
+# (c16) ⛔ A FIELD THE SHELL CANNOT REPRESENT IS A REFUSAL, NOT A PASS (fresh review round 10, P1). Every
+# gate is `[ "$x" -ge "$y" ]`, and an ERRORING test is FALSE: a record carrying a 20-digit `lpc` bypassed
+# the load ceiling (`[: …: integer expression expected` on a discarded stderr) and placement answered
+# `place=cell-9 eligible=1` for the saturated box. `at` has its own: `$(( 10#18446744075502150016 ))`
+# wraps MODULO 2^64, so a stamp 500 years ahead read as "just published" and never aged out.
+_HUGE="$(recf cmux 8 56 0 120000 14000 "$NOW" 400 15041 1 | sed 's/ lpc=[^ ]*/ lpc=18446744073709551615/')"
+L36P="$(printf '%s\n' "$_HUGE" | cap_place cmux 2>/dev/null)"
+ck "(c16) a 20-digit field refuses placement, never bypasses the ceiling ($(printf '%s' "$L36P" | head -1))" \
+   "$(qF 'refuse bound=probe_unreadable' "$L36P" && echo 0 || echo 1)"
+L36C="$(printf '%s\n' "$(recf cmux 8 8000 0 120000 14000 "$NOW" 400 15041 1)" | cap_place cmux 2>/dev/null)"
+ck "  …and the ceiling still refuses a REPRESENTABLE overload (control: $(printf '%s' "$L36C" | head -1))" \
+   "$(qF 'refuse bound=load_per_cpu' "$L36C" && echo 0 || echo 1)"
+# (c16-mutant) NON-VACUITY: without the width guard the same record is PLACED.
+sed 's|    \[ "${#v}" -le 12 \] \|\| return 1|    :   # MUTANT: no width guard|' "$CAP" > "$TMP/cap-nowidth.sh"
+ck "  …the mutant really lost the width guard" "$([ "$(grep -c 'MUTANT: no width guard' "$TMP/cap-nowidth.sh")" -ge 1 ] && echo 0 || echo 1)"
+L36M="$(printf '%s\n' "$_HUGE" | bash -c '. "$1"; cap_place cmux' _ "$TMP/cap-nowidth.sh" 2>/dev/null)"
+ck "  …mutation control: without it the same record is PLACED ($(printf '%s' "$L36M" | head -1))" \
+   "$(printf '%s' "$L36M" | grep -q '^place=' && echo 0 || echo 1)"
+# (c16b) the wrapped stamp: a ref whose `at` overflows 2^64 must not read as "just published".
+_WRAP="$(recf cmux 8 56 0 120000 14000 18446744075502150016 400 15041 1)"
+L37="$(CAP_EXPECTED_BOXES="cell-1:$(printf '%s' "$_WRAP" | sed -n 's/.*boxid=\([^ ]*\).*/\1/p')" cap_fleet_line_from "$_WRAP" 0)"
+ck "(c16b) an overflowing stamp is REFUSED, never read as fresh ($L37)" \
+   "$(! printf '%s' "$L37" | grep -q 'published=1' && echo 0 || echo 1)"
+# (c17) ⛔ 137 IS A TIMEOUT ONLY IF THE BOUND ELAPSED (fresh review round 10, P2): a child that kills
+# ITSELF returned in 0 s and was relabelled `timed out after 10s`, while the watchdog said `exited 137`.
+_c17_rc=$(CAP_BOUND_IMPL=auto cap_bounded 10 sh -c 'kill -9 $$' >/dev/null 2>&1; echo $?)
+ck "(c17) a self-killed child is NOT reported as a timeout (rc=$_c17_rc, not 124)" \
+   "$([ "$_c17_rc" -ne 124 ] && echo 0 || echo 1)"
+_c17b_rc=$(CAP_BOUND_IMPL=auto cap_bounded 1 "$TMP/term-ignorer.sh" >/dev/null 2>&1; echo $?)
+ck "  …while the TERM-ignoring child still reports the timeout (rc=$_c17b_rc, and (c13) bounds its wall)" \
+   "$([ "$_c17b_rc" -eq 124 ] && echo 0 || echo 1)"
 # (c7) ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
 # expected-side dedupe is right for a roster row and wrong for the provider inventory, where the key is
 # `network.ipv4`: 5 running machines with pi-cell-2 reusing the address of pi-cell-1 read

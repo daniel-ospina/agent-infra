@@ -243,9 +243,14 @@ FLEET_REPO="${FLEET_REPO:-${REPO:-}}"
 if [ -z "$FLEET_REPO" ] && [ -n "${SEED_REPO:-}" ] && [ -n "${REPO_SLUG:-}" ]; then
   _seed_origin="$(git -C "$SEED_REPO" remote get-url origin 2>/dev/null)" || _seed_origin=""
   _seed_slug="${_seed_origin%.git}"
+  # ⛔ ONLY THE ALTERNATIVES THAT CAN ACTUALLY MATCH (fresh review round 10, P2). Two of the original
+  # four were unreachable — `*":${REPO_SLUG}.git"` cannot match because `.git` is stripped above, and
+  # `git@${REPO_SLUG%%/*}:${REPO_SLUG#*/}` expands to `git@daniel-ospina:agent-infra`, not an scp URL —
+  # so a reader would believe the guard accepted spellings it never accepted. The scp form is handled by
+  # the second arm, which normalises it first.
   case "$_seed_slug" in
-    "$REPO_SLUG"|*"/$REPO_SLUG"|"git@${REPO_SLUG%%/*}:${REPO_SLUG#*/}"|*":${REPO_SLUG}.git") FLEET_REPO="$SEED_REPO" ;;
-    git@*:*) _seed_slug="${_seed_slug#*:}"; [ "$_seed_slug" = "$REPO_SLUG" ] && FLEET_REPO="$SEED_REPO" ;;
+    "$REPO_SLUG"|*"/$REPO_SLUG") FLEET_REPO="$SEED_REPO" ;;
+    git@*) _seed_slug="${_seed_slug#*:}"; [ "$_seed_slug" = "$REPO_SLUG" ] && FLEET_REPO="$SEED_REPO" ;;
   esac
 fi
 [ -n "$CAPACITY_MOD" ] && [ -f "$CAPACITY_MOD" ] && . "$CAPACITY_MOD" 2>/dev/null

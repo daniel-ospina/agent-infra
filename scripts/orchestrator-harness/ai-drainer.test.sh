@@ -111,7 +111,7 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
   [ "${RUN_NO_FLEET_REPO:-0}" = 1 ] && _fleet_v=""
   mkdir -p "$o/bg" "$ai"
   printf '%s\n' \
-    "O=$o" "AI=$ai" "DISPATCH=$DISPATCH" "SEED_REPO=$SEED" "SEED_REF=$SEED_REF" \
+    "O=$o" "AI=$ai" "DISPATCH=$DISPATCH" "SEED_REPO=${RUN_SEED_REPO:-$SEED}" "SEED_REF=$SEED_REF" \
     "TARGET_LANES=${RUN_TARGET:-}" "MAX_LANES=${RUN_MAX_LANES:-}" \
     "NCPU=${RUN_NCPU:-4}" "MEM_AVAIL_MB=${RUN_MEM:-8192}" "LOAD1_100=${RUN_LOAD:-100}" \
     "SWAP_TOTAL_MB=${RUN_SWAP_TOTAL:-9999}" "SWAP_FREE_MB=${RUN_SWAP:-9999}" \
@@ -165,7 +165,7 @@ reset_run() {
   RUN_TARGET=; RUN_MAX_LANES=; RUN_NCPU=; RUN_MEM=; RUN_LOAD=; RUN_SWAP=; RUN_SWAP_TOTAL=
   RUN_LANE_TIMEOUT=; RUN_SLICE_WIDTH=; RUN_SLICE_TOTAL=; RUN_RC_GRACE=; RUN_WT_MOD=; RUN_PS=
   RUN_DRAINER_OS=; RUN_PRESSURE=; RUN_MAX_PRESSURE=
-  RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_CAPACITY_MOD=; RUN_EXPECTED=
+  RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_SEED_REPO=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
 }
 # A lane-shaped live process in $O/bg, so the CENSUS sees it. A pidfile alone is not enough (the
@@ -940,6 +940,32 @@ FL3="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
 check "(f5) a STALE instrument is named as such (why=capacity.sh-incomplete, never 'unreachable': $(printf '%s' "$FL3" | head -1))" \
   'grep -q "why=capacity.sh-incomplete" <<<"$FL3" && ! grep -q "why=capacity.sh-unreachable" <<<"$FL3" && grep -q "published=UNREADABLE" <<<"$FL3"'
 reset_run
+# ⛔ …AND THE GUARDED SEED FALLBACK FIRES, IT IS NOT ONLY THE REFUSAL BRANCH (fresh review round 10, P2):
+# (f7) exercises "nothing configured" with an ORIGINLESS seed, so deleting the accepting arm of the
+# comparison left every drainer arm green while the path the docs rely on ("a hand-run tick, the macOS
+# arm, a box whose unit predates this") was gone.
+SEEDW="$ROOT/seed-with-origin"
+git init -q "$SEEDW" 2>/dev/null
+( cd "$SEEDW" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m s \
+  && git remote add origin "https://github.com/daniel-ospina/agent-infra.git" ) >/dev/null 2>&1
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NO_FLEET_REPO=1 RUN_SEED_REPO="$SEEDW"
+run_drainer_fg seedmatch
+FL8="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f8) an unset channel falls back to a seed whose ORIGIN IS the fleet repo, and says which ($(printf '%s' "$FL8" | head -1))" \
+  'grep -q "chan=github.com/daniel-ospina/agent-infra" <<<"$FL8" && ! grep -q "why=channel-unverified" <<<"$FL8"'
+SEEDF="$ROOT/seed-foreign"
+git init -q "$SEEDF" 2>/dev/null
+( cd "$SEEDF" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m s \
+  && git remote add origin "https://github.com/daniel-ospina/tortoise.git" ) >/dev/null 2>&1
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NO_FLEET_REPO=1 RUN_SEED_REPO="$SEEDF"
+run_drainer_fg seedforeign
+FL8F="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f8) …while a FOREIGN seed origin still REFUSES ($(printf '%s' "$FL8F" | head -1))" \
+  'grep -q "why=channel-unverified" <<<"$FL8F"'
 # ⛔ A SKIPPING TICK STILL REPORTS THE FLEET (fresh review round 7, P2). The line is taken BEFORE the
 # guards for the same reason the beat is: a swap-bound or load-bound box skips every tick in steady state,
 # and a reading taken only after a dispatch would make every skip look like a silent fleet. Moving the

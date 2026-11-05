@@ -317,6 +317,14 @@ VM listing — the reconciliation is `published − extra = expected − INELIGI
   every other caller (a hand-run tick, the macOS arm, a box whose unit predates this). A cell whose
   `DRAINER_SEED_REPO` points at a foreign repo still READS it (attributable via `chan=`), it does not
   refuse: bounded, and stated rather than implied.
+- **A field the shell cannot represent is a REFUSAL, not a PASS.** Every gate is `[ "$x" -ge "$y" ]`, and
+  an ERRORING test is FALSE: a channel record carrying a 20-digit `lpc` bypassed the load ceiling (the
+  diagnostic went to a stderr both readers discard) and `cap_place` answered `place=… eligible=1` for the
+  saturated box; the same held for `disk_free_mb` and `mem_free_mb`. `at` has its own variant —
+  `$(( 10#18446744075502150016 ))` wraps MODULO 2^64, so a stamp five centuries ahead read as *just
+  published* AND never aged out, with both readers agreeing on the wrong thing. Every numeric field is
+  bounded to 12 digits in the one helper both readers already call, which keeps `at` valid past 2286 and
+  every reading well inside int64.
 - **One TTL predicate, consulted by BOTH readers.** `cap_bound_hit` (placement) and the line validate the
   window through the same helper (`cap_ttl_secs`), and `cap_parse_lsremote` hands awk the VALIDATED
   number — unvalidated, a duration typo made the line refuse while placement PLACED on the same bytes
@@ -366,8 +374,10 @@ was a wedge, not a slow read. A `CAP_*_TIMEOUT` is normalised NUMERICALLY — `0
 spelling, any non-number and anything outside 1…999999999 is the 10 s fallback, decided by ONE helper
 (`cap_bound_secs`) that the timeout DIAGNOSTICS also print (`timed out after 10s`, never `after 0s`).
 The `timeout` arm also KILLS (`-k 1`), because a child that ignores SIGTERM otherwise ran its full
-lifetime under a 1 s bound (measured: 10 s) while the watchdog arm bounded it in 1 s; the kill-after
-status is normalised to 124 so a refusal keeps its name.
+lifetime under a 1 s bound (measured: 10 s) while the watchdog arm bounded it in 1 s. The kill-after
+status (137) is normalised to 124 ONLY when the clock says the bound really elapsed: a child that killed
+itself returned in 0 s and must not be reported as `timed out after 10s`, which is what a blanket
+normalisation did while the watchdog arm called the same child `exited 137`.
 Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
 `wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
 `exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /

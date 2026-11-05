@@ -871,6 +871,15 @@ cap_valid_base_record() {
   for k in ncpu load1 lpc lanes disk_free_mb mem_free_mb at; do
     v="$(cap_kv "$r" "$k")"
     case "$v" in ''|*[!0-9]*) return 1 ;; esac
+    # ⛔ A FIELD THE SHELL CANNOT REPRESENT IS A REFUSAL, NOT A PASS (fresh review round 10, P1). Every
+    # gate below is `[ "$x" -ge "$y" ]`, and an ERRORING test is FALSE — so a channel record carrying a
+    # 20-digit `lpc` bypassed the load ceiling (`[: …: integer expression expected` on a discarded stderr)
+    # and `cap_place` answered `place=cell-9 eligible=1` for the box that is saturated. The same shape
+    # held for `disk_free_mb` and `mem_free_mb`, and `at` has its own: `$(( 10#18446744075502150016 ))`
+    # wraps MODULO 2^64, so a stamp 500 years ahead read as "just published" AND NEVER AGED OUT — both
+    # readers agreeing on the wrong thing. 12 digits keeps `at` valid past 2286 and bounds every reading
+    # well inside int64; one predicate, consulted by placement, the line and the pruner alike.
+    [ "${#v}" -le 12 ] || return 1
   done
   case "$(cap_kv "$r" host)" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   return 0
@@ -1298,16 +1307,25 @@ cap_bounded() {
   # taken INSIDE the drainer's tick lock. `-k` sends SIGKILL one second after the TERM, and the
   # kill-after status (137) is normalised to the documented 124 so a refusal keeps its NAME.
   if [ "$impl" != "watchdog" ]; then
+    # ⛔ 137 IS A TIMEOUT ONLY IF THE BOUND ELAPSED (fresh review round 10, P2). `-k` made a
+    # TERM-ignoring child die by SIGKILL (137), but the blanket normalisation also relabelled a child that
+    # killed ITSELF: `cap_bounded 10 sh -c 'kill -9 $$'` returned in 0 s and reported `timed out after
+    # 10s`, while the watchdog arm said `exited 137` — the two arms disagreeing again. The verdict is
+    # normalised only when the clock says the bound really ran out.
     if command -v timeout >/dev/null 2>&1; then
+      _s0=$SECONDS
       timeout -k 1 "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      _el=$(( SECONDS - _s0 ))
       cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
-      case "$_rc" in 137) _rc=124 ;; esac
+      case "$_rc" in 137) [ "$_el" -ge "$s" ] && _rc=124 ;; esac
       return "$_rc"
     fi
     if command -v gtimeout >/dev/null 2>&1; then
+      _s0=$SECONDS
       gtimeout -k 1 "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      _el=$(( SECONDS - _s0 ))
       cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
-      case "$_rc" in 137) _rc=124 ;; esac
+      case "$_rc" in 137) [ "$_el" -ge "$s" ] && _rc=124 ;; esac
       return "$_rc"
     fi
   fi
@@ -1559,6 +1577,7 @@ cap_fleet_line_from() {
   case "${now:-}" in
     ''|*[!0-9]*) unk_pub=1; why="${why:-clock-unreadable}" ;;
   esac
+  [ "${#now}" -le 12 ] || { unk_pub=1; why="${why:-clock-unreadable}"; }
   # ⛔ AND A TTL THE SHELL CANNOT COMPARE IS NOT "EVERY RECORD IS FRESH" (fresh review rounds 4, 6 and
   # 9). `[ "$age" -gt "$CAP_PROBE_TTL" ]` with a non-numeric seam (`15m`), a numeric-but-out-of-range one
   # (20 digits) or a leading-zero one FAILS, the stale branch is skipped, and EVERY record is counted
@@ -1794,13 +1813,16 @@ cap_ledger_drop() {
 # authorship let the second publisher delete the first box's live ref (reproduced: ncpu 4 vs 8, same key,
 # same boot → one ref left, `foreign=0`, reader saw one box). Authorship is a fact, not a guess.
 cap_ref_deletable() {
-  local orec="${1:-}" oref="${2:-}" ledger="${3:-}" now="${4:-}" oat age
+  local orec="${1:-}" oref="${2:-}" ledger="${3:-}" now="${4:-}" oat age _pttl
   cap_valid_base_record "$orec" || return 1
   cap_ledger_has "$ledger" "$oref" && return 0                  # (a) proven ours
   oat="$(cap_kv "$orec" at)"; case "$oat" in ''|*[!0-9]*) oat=0 ;; esac
   case "$now" in ''|*[!0-9]*) return 1 ;; esac
   age=$(( 10#$now - 10#$oat )); [ "$age" -lt 0 ] && age=0
-  [ "$age" -gt "$CAP_PROBE_TTL" ] && return 0                   # (b) stale
+  # The ONE validated window (fresh review round 10): a duration typo used to make this comparison error,
+  # which stopped pruning entirely — safe polarity, but the docs claim one predicate for every reader.
+  _pttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"; [ -n "$_pttl" ] || return 1
+  [ "$age" -gt "$_pttl" ] && return 0                           # (b) stale
   return 1
 }
 
