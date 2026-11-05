@@ -314,7 +314,28 @@ for N in "$@"; do
        # first version released only `$N` and broke, which BOTH left the rest claimed for the lease and
        # was a regression against the old `*)` arm, where each issue released its own claim as it went.
        echo "#$N: $WT_RESULT"
-       echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take the remaining issues"
+       # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review round 8, P2 — MEASURED).
+       # THIS file was the THIRD rc-4 caller and the only one left printing a single remedy. THREE
+       # arms reach rc 4 carrying `REFUSED-UNKNOWN`, and only one of them is a disk fact:
+       # `wt-lifecycle.sh`'s missing-`spawn-gate.sh` arm (version skew, #2033), `spawn-gate.sh`'s
+       # unreadable-`df` arm, and `wt-lifecycle.sh`'s "refused without naming its numbers" fallback.
+       # Telling an operator whose box cannot answer `df` — or is half-deployed — to "reclaim space"
+       # is a remedy that CANNOT ARRIVE, and because this arm stops the WHOLE batch it stays dark
+       # every cycle until someone reasons past the log line. That is the #2721 wrong-cause class this
+       # PR fixes in the other two callers; `wt-lifecycle.sh`'s own comment said "Both callers", and
+       # that count is why this one was missed. `$WT_RESULT` already names the arm, so read it.
+       # ⛔ NO MULTI-ARM `case` BLOCK HERE ON PURPOSE: dispatch-merge's rc-4 arm is extracted by
+       # disk-admission.test.sh's `arm_of`, which terminates at the first line ENDING in a double
+       # semicolon, so a multi-line `case` placed ahead of this arm's own terminator would truncate
+       # the census's view of it. The one-line `case … esac` below ends in `esac`, so extraction still
+       # reaches the terminator intact.
+       _dm_unknown=0
+       case "$WT_RESULT" in *REFUSED-UNKNOWN*) _dm_unknown=1 ;; esac
+       if [ "$_dm_unknown" -eq 1 ]; then
+         echo "dispatch-merge: stopping the batch — REFUSED-UNKNOWN: the free-space probe could NOT answer, or this box's \$O is missing spawn-gate.sh, so this is NOT a full disk. Nothing was created. Check that \`df\` is on PATH and that the box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033) — reclaiming space will NOT clear it, so re-dispatch once the probe answers."
+       else
+         echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take the remaining issues"
+       fi
        # ⛔ NEVER RELEASE A CLAIM FOR AN ISSUE THIS BATCH ALREADY **SPAWNED A LANE OR A CHAIN** FOR
        # (review rounds 2 and 3). `SPAWNED_IDS` holds the lanes that ARE running; `CHAIN_IDS` holds the
        # ids whose chain was started even when the lane spawn failed — releasing either lets a peer
