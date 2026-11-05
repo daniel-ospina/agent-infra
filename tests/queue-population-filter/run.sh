@@ -34,7 +34,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 S="$ROOT/scripts/orchestrator-harness/refresh-candidates.sh"
 FIX="$ROOT/tests/fixtures/queue-population-filter/issues.json"
-MIN_ASSERTIONS=36
+MIN_ASSERTIONS=42
 MIN_FIXTURE_ROWS=19
 PASS=0
 FAIL=0
@@ -198,9 +198,9 @@ echo "── arm 3: behaviour on the REAL jq program (the one the script sends)"
 pickable() { jq -r ".[]|${QUEUE_UNIT_SELECT}|\"\(.number)\"" "$FIX" | sort -n | tr '\n' ' '; }
 has() { case " $(pickable) " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-eq "the fixture's pickable population" "8488 10175 10538 90001 90004 90005 90007 90009 90014 " "$(pickable)"
+eq "the fixture's pickable population" "8488 10175 10538 90001 90004 90005 90007 90009 90014 90019 90020 " "$(pickable)"
 
-for n in 5333 4917 9097 90006 90008 90010 90011 90012; do
+for n in 5333 4917 9097 90006 90008 90010 90011 90012 90015 90016 90017 90018; do
   has "$n" && bad "#$n ($(jq -r ".[]|select(.number==$n)|.title" "$FIX" | cut -c1-24)…) is a container and must NOT be pickable" \
            || ok "#$n is excluded as a container"
 done
@@ -225,6 +225,14 @@ has 90002 && bad "#90002 declares \`standing-constraint\` and must not be pickab
 # the failure this issue exists to prevent — in the opposite direction.
 has 90014 && ok "#90014 (a \`P0 <noun>:\` title — real work, and the shape three live P0-blockers carry) stays pickable" \
           || bad "#90014 was excluded: a severity prefix is not a container prefix, and this hides real P0 work"
+# ⛔ A KIND AS A BARE PREFIX IS THE SAME DEFECT, ONE RULE OVER (#10951 review cycle 1, measured). `epic`
+# is a PREFIX of `epidemic`, and `lane ` of `lane reaper:` — so a bare stem excludes a title that merely
+# STARTS with the letters. Both are real work shapes and both were pickable before this change, so
+# shipping the bare form would have been a REGRESSION that no container arm above could see.
+has 90019 && ok "#90019 (\`analysis-paralysis fix: …\` — real work) stays pickable: the analysis stem is form-anchored, never a bare prefix" \
+          || bad "#90019 was excluded by a bare \`analysis\` stem — \`analysis\` is a prefix of \`analysis-paralysis\`, so this hides real work"
+has 90020 && ok "#90020 (\`lane reaper: …\` — a real bug ticket) stays pickable: the lane form needs a lane ID" \
+          || bad "#90020 was excluded by a bare \`lane \` form — \`lane-<tool>:\` and \`lane reaper:\` are real tickets"
 has 90003 && bad "#90003 is assigned and must not be pickable" \
           || ok "#90003 is excluded because it is assigned"
 has 10175 && ok "#10175 is still title-pickable — the label, not the title, is how a constraint is declared" \

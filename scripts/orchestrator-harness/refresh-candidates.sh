@@ -181,19 +181,31 @@ O="${O:-$HOME/orchestrator}"
 # agent-infra#1220/#1221 ("Measure summarization latency…", "Measure long-context ANSWER QUALITY…")
 # and bare `lane` swallowed #2773/#1699 (real `lane-actions:` / `lane-watchdog.py:` BUGS). So, with
 # the instance that justifies each:
-#   epic                       bare — 15 instances, every one an epic (`epic:`, `epic-scope:`, `epic(`, `Epic:`)
-#   OWNER DECISION/decision    bare — every instance is a decision (`decision(fleet):`, `Decision needed:`)
+#   epic(-<q>)*[(:]           `epic:`, `Epic:`, `epic(`, `epic-scope:`, `epic(extractor-v4):` — 15 live
+#                              instances, every one an epic. ⛔ NOT bare: `epidemic: …` is a real unit and a
+#                              bare stem hides it (`epic` is a PREFIX of `epidemic`).
+#   OWNER DECISION/decision    `OWNER DECISION (OD-6):`, `Owner decision (small):`, `decision(fleet):`,
+#                              `Decision needed:` — every instance is a decision.
 #   decide:                    the colon form — agent-infra#1613 ("a POLICY question, not a defect")
 #   tracking:                  the colon form — tortoise#2820 ("… problem map … (organize before fixing)")
-#   lane[ ]                    the SPACE form (`lane L3:`) is the container; `lane-<tool>` is a real bug ticket
+#   lane[ ]+<id>[ ]*:          `lane L3:` is the container. ⛔ NOT the bare space form: `lane reaper: …`
+#                              is a real BUG ticket, and `lane-<tool>:` (`lane-actions:`, `lane-watchdog.py:`)
+#                              is real work too — so the form requires an actual lane ID (`L3`, `c7`).
 #   lane-liveness escalation   a scheduled AUTOMATED report (agent-infra#1559: "1 dead lane(s)" from
 #                              2026-10-02) — noise a coding lane cannot act on. Safe to name as a whole
 #                              phrase: the real tickets are `lane-actions:` / `lane-watchdog.py:`.
-#   design[(] measure[(] analysis[(]   the PAREN forms are containers; the bare words are not
+#   design[(] measure[(] analysis[(] investigation[(]   the PAREN forms are containers; the bare
+#                              words are not (`analysis-paralysis fix: …` is real work).
+#   map[(] arch[(] requirement[(] residual[(]   the same paren rule, for the kinds a first cut missed —
+#                              measured on the live queue: tortoise#5313 `map(pricing):`, #4333
+#                              `arch(storage):`, #4622 `requirement(objective-4):`, #7524
+#                              `residual(extractor):` were all still pickable. The list is a KIND list
+#                              on purpose (a structural `word(` rule would swallow `ops(quota):`); this
+#                              is the half a picker reads mechanically, and the label arm below is the
+#                              durable half for everything a kind list cannot know.
 #   coord:                     the colon form (`coord: memory quality + cost`)
-#   investigation              bare — 0 instances in the population, kept as the original filter had it
 #: Container-title prefixes that are not units of work. Keep this the ONLY copy of the pattern.
-QUEUE_CONTAINER_TITLE_RE='^(epic|lane[ ]|OWNER DECISION|decision|decide:|design[(]|coord:|measure[(]|analysis[(]|investigation|tracking:|lane-liveness escalation)'
+QUEUE_CONTAINER_TITLE_RE='^(epic(-[a-z0-9]+)*[(:]|OWNER DECISION|decision([(:]|[ ]+needed)|decide:|design[(]|coord:|measure[(]|analysis[(:]|investigation[(:]|tracking:|lane-liveness escalation|lane[ ][A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*[ ]*:|map[(]|arch[(]|requirement[(]|residual[(])'
 #: The declaration a standing constraint carries, so it is excluded by a property and not a word.
 #: ⛔ `owner-decision` IS DELIBERATELY **NOT** IN THIS ARM, AND THE MEASUREMENT IS WHY (#10951 review).
 #: A fresh-context reviewer raised the reuse this issue itself offered ("or reuse the existing

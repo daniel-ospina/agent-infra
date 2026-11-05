@@ -1,22 +1,263 @@
 [
-  {"number": 10175, "title": "ops(capture): the hosted capture cap is HELD deliberately — never override it; the switchover is a new graph on Pro, set as default and measured", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 5333, "title": "design(extractor): the destructive/relocation half of G5 — whether any pass may remove or archive an existing Object (owner ruling)", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 4917, "title": "coord: memory quality + cost — measurements, the 3-workstream plan, and the work order (2026-09-23)", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 9097, "title": "measure(ask): seal and publish the epic Q3 exit measurement — distilled + planted-supersession, pre-registered, no verbatim regression", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 2281, "title": "epic: ask/answer surface reads ingest-time-distilled knowledge with raw-turn fallback", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 8488, "title": "Add context-enriched embeddings + BM25 lexical retrieval (the two signals we lack)", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 10538, "title": "feat(2513): time-aware query expansion for spread-evidence questions", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 90001, "title": "fix(1234): a real work unit", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 90002, "title": "fix(1235): a real-looking unit that DECLARES itself a standing constraint", "assignees": [], "labels": [{"name": "P1-severe"}, {"name": "standing-constraint"}]},
-  {"number": 90003, "title": "feat(1236): a real unit already assigned to someone else", "assignees": [{"login": "someone"}], "labels": [{"name": "P1-severe"}]},
-  {"number": 90004, "title": "fix(1237): a real unit whose payload carries no labels key at all", "assignees": []},
-  {"number": 90005, "title": "Measure summarization latency + time-to-first-byte at the 700K window (timeout sizing)", "assignees": [], "labels": [{"name": "P2-moderate"}]},
-  {"number": 90006, "title": "measure(tiering): the premise is unmeasured — are our queries actually answered", "assignees": [], "labels": [{"name": "P2-moderate"}]},
-  {"number": 90007, "title": "lane-actions: _is_linked_worktree reads an ANCESTOR's .git, so a real bug", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 90008, "title": "lane L3: extractor — the pipeline body", "assignees": [], "labels": [{"name": "P1-severe"}]},
-  {"number": 90009, "title": "fix(1238): a real unit whose payload carries no assignees key", "labels": [{"name": "P1-severe"}]},
-  {"number": 90010, "title": "decide: every PR is unlandable through the rail — a policy question, not a defect", "assignees": [], "labels": [{"name": "P2-moderate"}]},
-  {"number": 90011, "title": "tracking: memory-substrate problem map (organize before fixing)", "assignees": [], "labels": [{"name": "P2-moderate"}]},
-  {"number": 90012, "title": "lane-liveness escalation: 1 dead lane(s) (land-lane-4)", "assignees": [], "labels": [{"name": "P2-moderate"}]},
-  {"number": 90014, "title": "P0 storage: nothing evicts the FalkorDB cache, so it grows without bound (the live tortoise#10976 shape)", "assignees": [], "labels": [{"name": "P0-blocker"}]}
+ {
+  "number": 10175,
+  "title": "ops(capture): the hosted capture cap is HELD deliberately — never override it; the switchover is a new graph on Pro, set as default and measured",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 5333,
+  "title": "design(extractor): the destructive/relocation half of G5 — whether any pass may remove or archive an existing Object (owner ruling)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 4917,
+  "title": "coord: memory quality + cost — measurements, the 3-workstream plan, and the work order (2026-09-23)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 9097,
+  "title": "measure(ask): seal and publish the epic Q3 exit measurement — distilled + planted-supersession, pre-registered, no verbatim regression",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 2281,
+  "title": "epic: ask/answer surface reads ingest-time-distilled knowledge with raw-turn fallback",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 8488,
+  "title": "Add context-enriched embeddings + BM25 lexical retrieval (the two signals we lack)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 10538,
+  "title": "feat(2513): time-aware query expansion for spread-evidence questions",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 90001,
+  "title": "fix(1234): a real work unit",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 90002,
+  "title": "fix(1235): a real-looking unit that DECLARES itself a standing constraint",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   },
+   {
+    "name": "standing-constraint"
+   }
+  ]
+ },
+ {
+  "number": 90003,
+  "title": "feat(1236): a real unit already assigned to someone else",
+  "assignees": [
+   {
+    "login": "someone"
+   }
+  ],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 90004,
+  "title": "fix(1237): a real unit whose payload carries no labels key at all",
+  "assignees": []
+ },
+ {
+  "number": 90005,
+  "title": "Measure summarization latency + time-to-first-byte at the 700K window (timeout sizing)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90006,
+  "title": "measure(tiering): the premise is unmeasured — are our queries actually answered",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90007,
+  "title": "lane-actions: _is_linked_worktree reads an ANCESTOR's .git, so a real bug",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 90008,
+  "title": "lane L3: extractor — the pipeline body",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 90009,
+  "title": "fix(1238): a real unit whose payload carries no assignees key",
+  "labels": [
+   {
+    "name": "P1-severe"
+   }
+  ]
+ },
+ {
+  "number": 90010,
+  "title": "decide: every PR is unlandable through the rail — a policy question, not a defect",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90011,
+  "title": "tracking: memory-substrate problem map (organize before fixing)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90012,
+  "title": "lane-liveness escalation: 1 dead lane(s) (land-lane-4)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90014,
+  "title": "P0 storage: nothing evicts the FalkorDB cache, so it grows without bound (the live tortoise#10976 shape)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P0-blocker"
+   }
+  ]
+ },
+ {
+  "number": 90015,
+  "title": "map(pricing): every place tied to the pricing model — the blast radius when the cost assumptions change (post-beta)",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90016,
+  "title": "arch(storage): own the storage architecture — node volume + the true per-node storage cost",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90017,
+  "title": "requirement(objective-4): the done-state has never been measured against the deployed product",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90018,
+  "title": "residual(extractor): the boundary's NER/POS/syntax residuals have no live tracker",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90019,
+  "title": "analysis-paralysis fix: the four review passes serialise, so nothing ships",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ },
+ {
+  "number": 90020,
+  "title": "lane reaper: the sweep never runs on a cell whose pin is stale",
+  "assignees": [],
+  "labels": [
+   {
+    "name": "P2-moderate"
+   }
+  ]
+ }
 ]
