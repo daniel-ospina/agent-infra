@@ -71,6 +71,7 @@ import os
 import shlex
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from typing import Any, Dict, List, Optional, Tuple
@@ -671,26 +672,102 @@ def _decode(raw: bytes, cap: int) -> Tuple[str, bool]:
     return (text[:cap], True) if len(raw) > cap else (text, False)
 
 
+# ⛔ `cap` BOUNDS WHAT IS RETURNED, NOT WHAT IS BUFFERED — AND THAT WAS AN OUTAGE. `run()` used
+# `subprocess.run(stdout=PIPE)`, which reads the WHOLE stream into memory and truncates afterwards, so
+# `box.exec {"argv": ["cat", "/dev/zero"]}` buffered without limit until the OOM killer took the MCP
+# server — i.e. the entire tool surface for that session — from a READ-ONLY, allowlisted command.
+# Measured with this module's own `run()`: one 128 MB stream took peak RSS from 71.6 MB to 282.9 MB
+# while returning 100 bytes. `timeout_s` was also unbounded (`int(args.get("timeout_s") or 60)`, no
+# maximum in the schema), so `timeout_s: 86400` made it unbounded in TIME as well. The realistic
+# trigger is not hostile: `cat` of a large log is the diagnostic use this tool exists for.
+MAX_TIMEOUT_S = 300          # a declared maximum for ANY child, box.exec included
+MAX_CAP = 2_000_000          # a declared maximum for the returned-bytes cap
+_DRAIN_CHUNK = 65536
+
+
+def _drain_into(sink: "bytearray", stream, cap: int, state: Dict[str, Any]) -> None:
+    """Read up to `cap` bytes into `sink`, then DRAIN AND DISCARD so the child never blocks.
+
+    ⛔ DISCARDING MATTERS MORE THAN THE CAP. If the reader stopped at `cap`, the child would block
+    forever on a full pipe and the call would hang to its timeout (or, with `subprocess.run`, the
+    WHOLE stream would be buffered). Draining keeps the memory at `cap` and the pipe moving, so an
+    endless producer is bounded by the TIMEOUT rather than by the machine's RAM.
+    """
+    try:
+        while True:
+            chunk = stream.read(_DRAIN_CHUNK)
+            if not chunk:
+                return
+            room = cap - len(sink)
+            if room > 0:
+                sink.extend(chunk[:room])
+                if len(chunk) > room:
+                    state["truncated"] = True
+            else:
+                state["truncated"] = True
+    except (OSError, ValueError):
+        return
+
+
 def run(argv: List[str], timeout: float = 60.0, cap: int = 200_000,
         env: Optional[Dict[str, str]] = None) -> Ran:
     if not argv:
         return Ran(argv, error="empty argv")
+    # ⛔ CLAMPED, NOT TRUSTED. `timeout` arrives from a tool argument on the `box.exec` path.
+    try:
+        timeout = float(timeout)
+    except (TypeError, ValueError):
+        timeout = 60.0
+    if not (0 < timeout <= MAX_TIMEOUT_S):
+        timeout = MAX_TIMEOUT_S
+    try:
+        cap = int(cap)
+    except (TypeError, ValueError):
+        cap = 200_000
+    if cap < 0 or cap > MAX_CAP:
+        cap = MAX_CAP
     started = time.time()
     environ = dict(os.environ)
     environ.update(env or {})
     try:
-        proc = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                              timeout=timeout, check=False, env=environ)
-    except subprocess.TimeoutExpired as exc:
-        out, trunc = _decode(exc.stdout or b"", cap)
-        return Ran(argv, rc=None, stdout=out, stderr="", timed_out=True, truncated=trunc,
-                   cap=cap, seconds=time.time() - started)
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                env=environ)
     except (OSError, ValueError) as exc:
         return Ran(argv, error="%s: %s" % (type(exc).__name__, exc), cap=cap,
                    seconds=time.time() - started)
-    out, trunc = _decode(proc.stdout or b"", cap)
-    err, etrunc = _decode(proc.stderr or b"", cap)
-    return Ran(argv, rc=proc.returncode, stdout=out, stderr=err, truncated=trunc or etrunc,
+    # Two independent pipes, so two drainers: reading one to EOF while the other fills would deadlock
+    # on a child that writes both.
+    out_buf, err_buf = bytearray(), bytearray()
+    state: Dict[str, Any] = {"truncated": False}
+    drainers = [threading.Thread(target=_drain_into, args=(out_buf, proc.stdout, cap, state),
+                                 daemon=True),
+                threading.Thread(target=_drain_into, args=(err_buf, proc.stderr, cap, state),
+                                 daemon=True)]
+    for t in drainers:
+        t.start()
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+    for t in drainers:
+        t.join(timeout=10)
+    out, trunc = _decode(bytes(out_buf), cap)
+    err, etrunc = _decode(bytes(err_buf), cap)
+    if timed_out:
+        return Ran(argv, rc=None, stdout=out, stderr=err, timed_out=True,
+                   truncated=trunc or etrunc or state["truncated"],
+                   cap=cap, seconds=time.time() - started)
+    return Ran(argv, rc=proc.returncode, stdout=out, stderr=err,
+               truncated=trunc or etrunc or state["truncated"],
                cap=cap, seconds=time.time() - started)
 
 
@@ -855,18 +932,18 @@ class Liveness:
                 # `cpu`; `cpu_any` is the deliberately WEAKER #1867 read ("a pi in this lane's own
                 # pane advanced") and is REPORTED, never promoted to step-2 evidence — promoting it
                 # would claim an exact attribution the producer did not make.
-                cpu_busy = joined.get("cpu")
-                if not isinstance(cpu_busy, bool):
-                    cpu_busy = None          # not-read is `None`, never a guessed False
-                sources["step2"] = {"row": joined.get("ws"), "cpu": cpu_busy,
+                cpu_reading = joined.get("cpu")
+                if not isinstance(cpu_reading, bool):
+                    cpu_reading = None       # not-read is `None`, never a guessed False
+                sources["step2"] = {"row": joined.get("ws"), "cpu": cpu_reading,
                                     "cpu_any": joined.get("cpu_any"), "source": note}
-                if cpu_busy is None:
+                if cpu_reading is None:
                     sources["step2"] = dict(
                         sources["step2"],
                         unmeasured="UNMEASURED(the row carries no `cpu` attribution: "
                                    "lane_cpu_busy declined, so step 2 abstains)")
-                cpu = lv.CpuSample(advanced=cpu_busy, delta_s=None, window_ms=None,
-                                   source=("lane-status.py::lane_cpu_busy" if cpu_busy is not None
+                cpu = lv.CpuSample(advanced=cpu_reading, delta_s=None, window_ms=None,
+                                   source=("lane-status.py::lane_cpu_busy" if cpu_reading is not None
                                            else ""))
                 kid = joined.get("child")
                 # ⛔ `child_stale` IS AN AGE IN SECONDS. The producer's own suppression rule is
@@ -1605,8 +1682,21 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         payload["allowlist"] = sorted(ALLOWLIST)
         # FAIL-CLOSED: never a pass-through.
         return True, payload
-    timeout_s = int(args.get("timeout_s") or 60)
-    cap = int(args.get("max_output") or 20_000)
+    # ⛔ BOTH ARE CLAMPED HERE, BECAUSE THE SCHEMA DOES NOT BOUND THEM AND `run()`'s OWN CLAMP WOULD
+    # OTHERWISE BE THE ONLY ONE — `timeout_s` also goes to `cmux --timeout`, which `run()` never sees.
+    # A caller-supplied `86400` made a hung remote command hold a slot for a day.
+    try:
+        timeout_s = int(args.get("timeout_s") or 60)
+    except (TypeError, ValueError):
+        timeout_s = 60
+    if not (0 < timeout_s <= MAX_TIMEOUT_S):
+        timeout_s = MAX_TIMEOUT_S
+    try:
+        cap = int(args.get("max_output") or 20_000)
+    except (TypeError, ValueError):
+        cap = 20_000
+    if cap < 0 or cap > MAX_CAP:
+        cap = MAX_CAP
     cmux = _cmux()
     if cmux is None:
         payload["unmeasured"] = "UNMEASURED(cmux vm exec + cmux not found on PATH)"
@@ -1640,7 +1730,17 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
 
 
 def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
-    prog = os.path.basename(argv[0])
+    # ⛔ THE ALLOWLIST PINS A **NAME**, SO THE NAME IS EXACTLY WHAT MAY BE PASSED. Matching
+    # `basename(argv[0])` let `["/tmp/evil/git", "status"]`, `["./git", "status"]` and
+    # `["../../bin/git", "log"]` all pass (verified) — i.e. any file named an allowlisted program, at
+    # a CALLER-CHOSEN path, executed under this surface's authority. `/tmp` on a cell is writable by
+    # anything else running there, so a planted `git`/`cat`/`ls` was reachable through a gate whose own
+    # contract says "a command that is not on the allowlist is a TYPED REFUSAL, never a pass-through"
+    # and whose cited rationale is that a rule "doesn't match the same program by path".
+    if os.sep in argv[0] or (os.altsep and os.altsep in argv[0]):
+        return False, ("refusing %r: the allowlist pins a PROGRAM NAME, and a path selects a"
+                       " different file than the one the name refers to" % argv[0])
+    prog = argv[0]
     if prog not in ALLOWLIST:
         return False, "%r is not on the allowlist" % prog
     prefix, max_args = ALLOWLIST[prog]
