@@ -204,7 +204,7 @@ else
   # same disagreement the occupied-path arm closes for a directory, one state over.
   MISS_UF_ERR="$(run --missing 2>&1 >/dev/null)"; MISS_UF_RC="$(run --missing >/dev/null 2>&1; printf %s $?)"
   [ "$MISS_UF_RC" = "2" ]; ck $? "--missing on a present-but-UNREADABLE file is 2, not 0 with an empty list (measured rc=$MISS_UF_RC; the empty list is a can't-verify claim wearing the healthy answer's clothes)"
-  case "$MISS_UF_ERR" in *'CANNOT VERIFY (unreadable)'*) ok "…and it NAMES the unreadable path on stderr, so the reader knows the remedy is a chmod" ;; *) bad "--missing returned 2 without naming the unreadable path (a verdict with no subject)" ;; esac
+  case "$MISS_UF_ERR" in *'CANNOT VERIFY (unreadable)'*'LANE-BRIEF-PREAMBLE.md'*) ok "…and it NAMES the unreadable path on stderr, so the reader knows the remedy is a chmod (the property is the SUBJECT, not the label: an honest 'unreadable' verdict that named nothing stayed green here, measured)" ;; *) bad "--missing did not report the unreadable file AS unreadable and BY PATH (measured rc=$MISS_UF_RC, stderr=[$MISS_UF_ERR]) — a verdict with no subject sends the operator looking for nothing" ;; esac
 fi
 chmod 644 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" 2>/dev/null
 # ⛔ …AND THE THIRD CELL OF THE SAME TABLE: a path OCCUPIED by something that is not a regular file
@@ -732,6 +732,12 @@ case "$HELP_OUT" in *'the names are static'*) ok "--help states WHY --files can 
 # help line left 158 passed, 0 failed. It now anchors on the real phrase from `git show 2a94471c` ("an unread
 # declaration or an unresolvable state dir renders no names"), which the current true sentence does not contain.
 case "$HELP_OUT" in *'unresolvable state dir renders no names'*) bad "--help still claims the withdrawn over-block (an unresolvable state dir does not block the names)" ;; *) ok "…and it does NOT claim the withdrawn over-block (anchored on the real withdrawn phrase, not a fabricated token)" ;; esac
+# ⛔ THE SAME SURFACE ON THE LINE THE `--missing` FIX EDITED (#3379 review cycle 28, P2, MEASURED): that
+# commit added a NEW rc-2 cause to the operator-facing contract (a declared file that exists but cannot be
+# read) and no arm covered the sentence — reverting the help line to its pre-fix wording left the suite at
+# 242 passed, 0 failed. Cycle 10's finding verbatim, one line over: an operator reading the reverted help goes
+# hunting for a directory fault when the real cause is a `chmod`.
+case "$HELP_OUT" in *'a declared file that exists but cannot be read'*) ok "--help documents the UNREADABLE cause of --missing's rc 2 (the contract this diff changed, pinned)" ;; *) bad "--help no longer documents that --missing answers 2 for a file that exists but cannot be read — the one cause this diff added to the contract" ;; esac
 # ⛔ THE THREE COLLECTORS ARE LISTS, NOT VERDICTS (review cycle 10, P2, MEASURED): each iterates the
 # declaration, so an unread declaration makes all three print nothing at rc 0 — the same false-clean the
 # guarded verbs answer 2 for. Driven directly, the way a future sourced consumer would call them.
