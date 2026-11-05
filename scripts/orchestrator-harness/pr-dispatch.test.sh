@@ -1353,11 +1353,19 @@ if [ -s "$TMP/dh.sh" ]; then
   # `"0"` instead of `"${_dpass:-0}"` made `stall-fix.sh` refuse every call in production (`SEEN=0` is
   # not a stalled pass — the escalation dispatches NOBODY, the exact inertness this PR removes) while
   # the whole suite stayed green. Asserting the counter is what makes the leg discriminating.
-  stallfix_dispatch() {   # <land-age-minutes> -> the pass counter the fixer was called with | "not-called"
+  # ⛔ THE STUB RECORDS THE AGE'S PROVENANCE BESIDE THE COUNTER, NOT JUST THE COUNTER (fresh-context
+  # review of #3380, 2026-11-05, P2). `orch-loop.sh` forwards `_AGESRC` on the SAME line it forwards
+  # the counter, and that forwarding was pinned by NOTHING: delete `_AGESRC="${_agesrc:-measured}"`
+  # from the call and `stall-fix.sh` falls back to its `:-measured` default, so an UNMEASURED or
+  # SYNTHESISED age is reported as a measurement on both sinks — the exact defect #3380 fixes — while
+  # every suite stayed green (measured: `pr-dispatch.test.sh` 144/0 and `stall-fix.test.sh` 84/0
+  # unchanged). §F in `stall-fix.test.sh` pins the CONSUMER of the value; these legs pin the PRODUCER,
+  # because an interface is only pinned when both ends are.
+  stallfix_dispatch() {   # <land-age-minutes> -> <pass counter>|<age provenance> | "not-called"
     rm -f "$TMP/called.txt"; mkdir -p "$TMP/D3/state"; : > "$TMP/D3/state/merged-1.done"
     cat > "$TMP/D3/stall-fix.sh" <<'STUBFIX'
 #!/bin/bash
-printf '%s' "$1" >> "$STUBMARK"
+printf '%s|%s' "${1:-}" "${_AGESRC:-<unset>}" >> "$STUBMARK"
 STUBFIX
     chmod +x "$TMP/D3/stall-fix.sh"
     (
@@ -1373,9 +1381,10 @@ STUBFIX
     ) >/dev/null 2>&1
     [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
   }
+  # A real stamp inside the window is a READING (`_lmsyn=0`) — the one case that may say `measured`.
   _o="$(stallfix_dispatch 400)"
-  [ "$_o" = "1" ] && ok "a STALLED pass invokes the stall fixer WITH the pass counter it measured (1) — the escalation dispatches" \
-    || bad "a stalled pass did not hand the stall fixer pass counter 1 — the escalation is inert, or hands it a counter stall-fix.sh refuses: got '$_o'"
+  [ "$_o" = "1|measured" ] && ok "a STALLED pass invokes the stall fixer WITH the pass counter it measured (1) — the escalation dispatches — and hands it the age's TRUE provenance (measured)" \
+    || bad "a stalled pass did not hand the stall fixer 'pass counter 1 + agesrc=measured' — the escalation is inert, hands it a counter stall-fix.sh refuses, or forwards no provenance at all (the fixer then defaults to 'measured'): got '$_o'"
   # ⛔ AND THE SAME EMPTY ANSWER MUST DISPATCH (verifier, cycle 3 + #2929): an empty `mp_recent_land`
   # is NOTHING landed inside the window — the ≥6h class this box actually reaches, and the state #2929
   # measured at 178 markers / 0 inside 360m. It printed a line and set no flag, so the escalation was
@@ -1385,7 +1394,7 @@ STUBFIX
     rm -f "$TMP/called.txt"; mkdir -p "$TMP/D4/state"; : > "$TMP/D4/state/merged-1.done"
     cat > "$TMP/D4/stall-fix.sh" <<'STUBFIX'
 #!/bin/bash
-printf '%s' "$1" >> "$STUBMARK"
+printf '%s|%s' "${1:-}" "${_AGESRC:-<unset>}" >> "$STUBMARK"
 STUBFIX
     chmod +x "$TMP/D4/stall-fix.sh"
     (
@@ -1397,9 +1406,47 @@ STUBFIX
     ) >/dev/null 2>&1
     [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
   }
+  # An EMPTY answer with a READABLE `state/` is a SYNTHESISED bound, never a measurement.
   _o="$(stallfix_dispatch_noland)"
-  [ "$_o" = "1" ] && ok "…and the EMPTY answer (nothing landed inside the window — the >=6h stall) dispatches too, with the measured counter" \
-    || bad "the empty-answer path printed the line but never invoked the fixer correctly — inert where the stall is worst: got '$_o'"
+  [ "$_o" = "1|synth" ] && ok "…and the EMPTY answer (nothing landed inside the window — the >=6h stall) dispatches too, with the measured counter — and says the age is a BOUND (synth), not a reading" \
+    || bad "the empty-answer path printed the line but never invoked the fixer correctly, or forwarded the wrong provenance ('measured' here is the #3380 defect — an invented reading): got '$_o'"
+  # ⛔ THE THIRD PROVENANCE, PINNED AT THE PRODUCER (#3380). `_lmread=0` — a `state/` that exists but
+  # cannot be READ — makes `_agesrc=unmeasured`, and the fixer must be TOLD so its brief says the age
+  # was not taken. This leg is `chmod`, not a directory trick, because the shape being built IS the
+  # permission state (`[ -r "$O/state" ]`), and it therefore cannot be built for root: on a root host
+  # `-r` is always true, so the leg is reported UNPROVEN rather than counted — a leg that silently
+  # passes for the wrong reason is the thing this suite exists to prevent.
+  stallfix_dispatch_unreadable_state() {
+    rm -f "$TMP/called.txt"; mkdir -p "$TMP/D7/state"; : > "$TMP/D7/state/merged-1.done"
+    chmod 0333 "$TMP/D7/state"
+    cat > "$TMP/D7/stall-fix.sh" <<'STUBFIX'
+#!/bin/bash
+printf '%s|%s' "${1:-}" "${_AGESRC:-<unset>}" >> "$STUBMARK"
+STUBFIX
+    chmod +x "$TMP/D7/stall-fix.sh"
+    (
+      O="$TMP/D7"; LOG="$TMP/dh7.log"; UPN_WORK=9; LO_CHOICE=pr; MERGE_STALL_MIN=360
+      STUBMARK="$TMP/called.txt"; export STUBMARK
+      mp_recent_land() { printf ''; }
+      is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0?*) return 1 ;; *) return 0 ;; esac; }
+      . "$TMP/dh.sh"
+    ) >/dev/null 2>&1
+    chmod 0755 "$TMP/D7/state" 2>/dev/null || true
+    [ -s "$TMP/called.txt" ] && cat "$TMP/called.txt" || echo not-called
+  }
+  if [ "$(id -u)" = "0" ]; then
+    # ⛔ THE BACKTICKS ARE ESCAPED, AND THAT IS NOT COSMETIC (review cycle 4 of #3380, 2026-11-05, P3):
+    # inside a DOUBLE-quoted string an unescaped `state/` is COMMAND SUBSTITUTION, so on the one host
+    # class this branch exists for the disclosure printed "/tmp/…: state/: No such file or directory"
+    # and "-r: command not found" and then garbled its own sentence, while `bash -n` stayed clean and
+    # no gate looked. Measured by running this exact line with an uid-0 stub
+    # (`bash /tmp/probe-root-line.sh`) — the escape is what makes it a sentence instead of a script.
+    echo "  ⏭  UNPROVEN-ON(root): the unsearchable-\`state/\` leg cannot be built for a privileged user (\`-r\` is always true), so the producer side of 'unmeasured' is UNMEASURED here — the consumer side is pinned by §F in stall-fix.test.sh"
+  else
+    _o="$(stallfix_dispatch_unreadable_state)"
+    [ "$_o" = "1|unmeasured" ] && ok "…and an UNSEARCHABLE state/ dispatches with agesrc=unmeasured — the third provenance reaches BOTH sinks, not a synthesised measurement" \
+      || bad "the unsearchable-state path handed the fixer the wrong provenance — 'measured' or 'synth' here asserts a reading this box never took (the #3181 P1): got '$_o'"
+  fi
   _o="$(stallfix_dispatch 5)"
   [ "$_o" = "not-called" ] && ok "…and a LANDED pass does not (no worker on a healthy box)" \
     || bad "a healthy pass invoked the stall fixer — the gate reads the counter, not the stall: got '$_o'"
