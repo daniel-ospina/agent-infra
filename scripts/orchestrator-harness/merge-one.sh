@@ -963,8 +963,9 @@ _cc_ask() {
   # ⛔ A READABLE ANSWER BREAKS THE UNREADABLE STREAK (fresh review of #3037, P3-1). The cap in the
   # `3:unreadable` arm is head-keyed, so without this a box that recovered on cycle 2 and then hit a
   # single contended read on cycle 4 at the SAME head would inherit a count nobody can explain. The
-  # streak means CONSECUTIVE failed reads, so every answer that is not `unreadable` clears it —
-  # INCLUDING the retry inside that arm, which is the whole point of retrying.
+  # streak means CONSECUTIVE failed reads, so every answer that is not one of the two failed-READ
+  # tokens (`3:unreadable`, `8:surface-unknown` — the second added by #3440) clears it — INCLUDING
+  # the retry inside that arm, which is the whole point of retrying.
   if [ "$CC_RC:$CC_TOKEN" != "3:unreadable" ] && [ "$CC_RC:$CC_TOKEN" != "8:surface-unknown" ]; then
     rm -f "$O/state/diffreadcount-$PR" 2>/dev/null || true
   fi
@@ -1086,10 +1087,16 @@ _cc_recover() {
       if review_clean_at_head; then CC_OWED=1; return 0; fi ;;
     0:red-base-owned)
       # (#3440) The record covers the head; the reds are the base's. Same action as `0:head`, and
-      # the red is NAMED — never a bare green.
+      # the red is NAMED — never a bare green. ⛔ THE LOG NAMES THE BRANCH IT TOOK (review round 3,
+      # P1): this arm is reached on a TOCTOU between the two asks, where the record may sit at THIS
+      # head, so it must not claim "an older head" unconditionally.
       if review_clean_at_head; then
         CC_OWED=1
-        echo "[merge $PR] RECOVERED AND CARRIED — the record restored from the body covers an older head and the reviewed artifact is UNCHANGED — but ⛔ the head's CHECK SURFACE IS RED and BASE-OWNED (groups named in the check-carry stderr above); no review ordered (a red build is not a review finding), the merge below is the rail's/this run's decision" >> "$L.log"
+        echo "[merge $PR] RECOVERED AND CARRIED — the restored record is clean at head=$HEAD and the head's CHECK SURFACE is RED but BASE-OWNED (groups named in the check-carry stderr above); no review ordered (a red build is not a review finding), the merge below is the rail's/this run's decision" >> "$L.log"
+        return 0
+      elif _cc_rerecord && review_clean_at_head; then
+        CC_OWED=1
+        echo "[merge $PR] RECOVERED AND CARRIED — the record restored from the body covers an older head and the reviewed artifact is UNCHANGED (re-recorded $CC_VERDICT at head=$HEAD) — but ⛔ the head's CHECK SURFACE IS RED and BASE-OWNED (groups named in the check-carry stderr above); no review ordered, the merge below is the rail's/this run's decision" >> "$L.log"
         return 0
       fi ;;
     7:red-surface|8:surface-unknown)
@@ -1248,8 +1255,19 @@ case "$CC_RC:$CC_TOKEN" in
     if review_clean_at_head; then
       CC_OWED=1
       echo "[merge $PR] CARRY — a CLEAN record is bound to head=$HEAD (check-carry rc=0 token=red-base-owned). ⛔ THE HEAD'S CHECK SURFACE IS RED, and every red group also reproduces on the base — this is NOT a green head and NOT a green attestation: the groups are named in the check-carry stderr above. No review is ordered (a red build is not a review finding), and the merge below is the RAIL's decision, which exempts base-owned reds only against its own reproduction" >> "$L.log"
+    elif _cc_rerecord && review_clean_at_head; then
+      # ⛔ THE CARRY POPULATION LANDS HERE, AND IT USED TO FALL INTO A PAID REVIEW (#3440 review
+      # round 3, P1). `red-base-owned` is emitted by the producer's CARRY arm as well as its
+      # head-bound arm, so the ordinary shape — a record at an OLDER head whose reviewed diff is
+      # unchanged, with reds that reproduce on the base — arrives with `review_clean_at_head` FALSE.
+      # Pre-fix that state ran the `else` below: a 20-40 minute review the recorder had just proved
+      # unnecessary (its own answer says the diff is unchanged), and a log line asserting a
+      # HEAD-BOUND record that did not exist. This branch is the `0:carry` remedy, with the red
+      # still NAMED — which is the whole difference #3440 asks for.
+      CC_OWED=1
+      echo "[merge $PR] CARRY — the reviewed diff is unchanged across the head move and every red group reproduces on the base; re-recorded $CC_VERDICT at head=$HEAD, no review ordered. ⛔ THE HEAD'S CHECK SURFACE IS RED and BASE-OWNED (groups named in the check-carry stderr above) — never a green attestation, and base ownership here is the recorder's same-name comparison, a NAMED RESIDUAL in gate mode" >> "$L.log"
     else
-      echo "[merge $PR] a record is bound to head=$HEAD with base-owned red surface, but its verdict is [$(review_verdict_of "$(review_record_file_at_head)")], not full 'clean' — a HEAD-BOUND answer is not a CLEAN one, so a review is owed" >> "$L.log"
+      echo "[merge $PR] check-carry=red-base-owned (rc=$CC_RC): the head's CHECK SURFACE IS RED but base-owned, yet the carry re-mint did not produce a clean head-bound record (re-mint rc=${CC_RE_RC:-not attempted}) — a review is owed. Base ownership does NOT make this head green" >> "$L.log"
     fi ;;
   7:red-surface)
     # (#3440) THE HEAD IS RED AND THE PR CAUSED IT — NOT mergeable, and NOT a review's job.
@@ -1287,8 +1305,9 @@ case "$CC_RC:$CC_TOKEN" in
   4:*)
     # No record anywhere on this box: the #2872 case. The verdict may still travel in the body.
     # ⛔ `_cc_recover` CAN EXIT 3 (it parks a RECOVERED record whose surface is red or unreadable) —
-    # it never falls through on a refusal, and the `if !` form keeps `set -e` from turning a
-    # non-zero return into an abort.
+    # it never falls through on a refusal: the non-zero return IS the branch test, so a refusal is a
+    # DECISION here rather than a silent fall-through. (This script runs `set -u` and NO `set -e`;
+    # an earlier version of this comment credited errexit, which is not active in this file.)
     if ! _cc_recover; then
       echo "[merge $PR] no record and no verified body marker for head=$HEAD on this box — a fresh review is owed" >> "$L.log"
     fi ;;
@@ -1298,8 +1317,9 @@ case "$CC_RC:$CC_TOKEN" in
     # wrapper that ignores unknown flags) exits 0 with its own output, and keying on rc alone read
     # that as "the record already covers this head". It is NO ANSWER, not an authorisation.
     echo "[merge $PR] --check-carry answered rc=0 with [${CC_TOKEN:-<empty>}], which is not 'head'|'carry' — a recorder that does not implement the verb answers 0 too, so rc alone is NOT an authorization; treating it as NO answer" >> "$L.log"
-    # ⛔ `_cc_recover` CAN EXIT 3 (it parks) — it never falls through on a refusal, and its
-    # `||` form keeps `set -e` from turning a NON-zero return into an abort.
+    # ⛔ `_cc_recover` CAN EXIT 3 (it parks) — it never falls through on a refusal: the `if !` form
+    # makes the non-zero return the branch test (this script runs `set -u`, NOT `set -e`, so nothing
+    # here depends on errexit).
     if ! _cc_recover; then
       echo "[merge $PR] …and no verified body marker covers head=$HEAD — a fresh review is owed" >> "$L.log"
     fi ;;

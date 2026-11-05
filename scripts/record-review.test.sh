@@ -6308,7 +6308,7 @@ fi
 # 21.17 A SURFACE WHOSE ROWS ARE ALL EXCLUDED IS `empty`, NOT `green` — review of `554d272`, P2.
 # The early guard caught only an EMPTY RESPONSE, so a head whose only run is the excluded
 # `ai-review-gate` fell through to `green`: the record asserted `check_surface:green` about a
-# surface whose only observed check is RED (contradicting the scan's own contract, line 2467, and
+# surface whose only observed check is RED (contradicting the scan's own contract, line 2470, and
 # the mint-path comment), and `--check-carry` printed NO not-green line where the design promises
 # one. "Nothing observable" must never be worded as "everything observed passed".
 s21_rows "$S21_HEAD" 'ai-review-gate|ai-review-gate|99|completed|failure'

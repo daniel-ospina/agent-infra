@@ -348,6 +348,21 @@ out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_REC
 rc=0; merge_ran || { rc=1; note "the same fixture/authority merged NOTHING on a LICENSING answer (spies: $(merge_ran_whence)), so the 'merges NOTHING' claim cannot fire: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
 ck "NON-VACUITY: …on 'head' the SAME fixture DOES merge, so that claim can fire" $rc
 
+# ══ 3c) #3440 (review round 4): the ORDINARY recovery arm's surface refusal is PINNED ═══════════
+# `_cc_recover`'s FIRST block asks the surface where the recovered record is already clean at this
+# head (pinned by 3b). Its SECOND `case` — reached when the recovered record does NOT cover this
+# head — has its OWN `7:red-surface|8:surface-unknown` park, and nothing pinned it: deleting that arm
+# leaves the suite green while a PR-caused red buys a review and the PR MERGES (`pi_calls=1`,
+# `merged=y`) — #3440's false PASS on the recovery population. Hence its own vector.
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_RECOVER_HEAD="$OLDH" FAKE_CC_TOKEN_AFTER=red-surface FAKE_CC_RC_AFTER=7)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — the ORDINARY recovery arm bought a review over a red head"; }
+ck "RED→GREEN: a recovered record that does NOT cover the head, over a RED surface, buys NO review" $rc
+rc=0; merge_ran && { rc=1; note "a MERGE ran over a red surface (via: $(merge_ran_whence))"; }
+ck "…and merges NOTHING (a PR-caused red is the gate's refusal, not a review order)" $rc
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "it neither merged nor parked — an unbounded loop"; }
+ck "…and PARKS, so the red surfaces instead of re-looping" $rc
+
 # ══ 4) `nodigest` / `carry-patch` say RE-RECORD, never RE-REVIEW ═════════════════════════════════
 # Both are NON-ZERO rcs. Keying on `rc == 0` treated them as "a fresh review is owed" and bought a
 # full paid review (REVIEW_TIMEOUT = 1800 s) on a rebase — the exact #1377 case.
@@ -433,6 +448,24 @@ ck "…and STATES that the surface is red and base-owned (never a silent green)"
 # this, "merges nothing" on the red answer could be passing because that fixture never merges.
 rc=0; merge_ran || { rc=1; note "gate authority merged NOTHING on the LICENSING token either (spies: $(merge_ran_whence)) — the red-surface claim above could not fire: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
 ck "NON-VACUITY: …and 'red-base-owned' DOES reach the raw merge in this same fixture" $rc
+# ── #3440 REVIEW ROUND 4, P1: `red-base-owned` ARRIVING ON THE CARRY POPULATION ──
+# The producer emits `red-base-owned` from its CARRY arm as well as its head-bound arm, so the
+# ordinary shape — a record at an OLDER head, reviewed diff unchanged, reds that reproduce on the
+# base — arrives with `review_clean_at_head` FALSE. Pre-fix that took the "a review is owed" else
+# branch: a 20-40 minute review the recorder had just proved unnecessary (its own answer says the
+# diff is unchanged), plus a log line asserting a HEAD-BOUND record that did not exist. The fix is
+# the `0:carry` remedy with the red still printed. MUTANT: delete the `elif _cc_rerecord` branch and
+# both assertions below go red (pi_calls=1).
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-base-owned FAKE_CC_RC=0)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a base-owned red on the CARRY population bought a review the recorder had just proved unnecessary"; }
+ck "RED→GREEN: 'red-base-owned' with the record at an OLDER head buys NO review (the 0:carry remedy)" $rc
+rc=0; [ "$(remints)" -ge 1 ] || { rc=1; note "no re-mint ran: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
+ck "…and re-mints the reviewed verdict at the LIVE head, which is what makes the merge legal" $rc
+rc=0; log_has "CARRY — the reviewed diff is unchanged across the head move and every red group reproduces" || { rc=1; note "log: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and NAMES the base-owned red in that log (the red is never a silent green)" $rc
+rc=0; merge_ran || { rc=1; note "the carried record never reached the merge (spies: $(merge_ran_whence))"; }
+ck "…and the carried red-base-owned record DOES reach the merge (licence, not a refusal)" $rc
 
 # ── #3440 REVIEW ROUND 1: the red-surface BOUND, and the streak that has to clear it ──
 # The cap is not decoration: without it a durable PR-caused red re-loops `exit 0` for ever and

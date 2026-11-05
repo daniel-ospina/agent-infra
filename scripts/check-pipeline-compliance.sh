@@ -1427,7 +1427,16 @@ c_carry_ask() {
   # the gate's own output, instead of being invisible. A red the PR CAUSED
   # (`red-surface`) and a surface that could not be READ (`surface-unknown`) refuse
   # below: those are the false PASSes #3440 measured.
-  if [[ "$rc" -eq 0 && "$tok" == "red-base-owned" ]]; then
+  if [[ "$rc" -eq 0 && "$tok" == "red-base-owned" && -n "$recd" && "$recd" != "-" && "$recd" == "$live" ]]; then
+    # ⛔ THE PASS NEEDS CONTENT IDENTITY, NOT JUST THE TOKEN (#3440 review round 3, P2).
+    # `red-base-owned` is emitted by BOTH producer arms. On the CARRY arm the equality printed below
+    # is proven; on the HEAD-bound arm it is an identity by construction (`recd == live ==` the one
+    # head's digest), and for a head-bound record with NO `diff_sha256` the producer emits
+    # `red-base-owned<TAB>-<TAB><hash>` — so this gate would print "diff unchanged (- = bbbb…)", an
+    # equality it never checked. That state is ALSO the TOCTOU the `0:head` arm refuses (the head
+    # moved between the gate's read and the producer's), so it must reach that arm instead of
+    # passing here. A token with no proven identity falls through to the `case` and is classified
+    # there: `0:red-base-owned` is not an arm, so it lands on the catch-all refusal, which names it.
     # A SUCCESS terminal: c_carry_resolve stops here, so relaying now is relaying once.
     c_carry_relay_red "$cerr"
     C_CARRY_WHY="diff unchanged (${recd:0:12}… = ${live:0:12}…); the head's check surface is RED but BASE-OWNED — the producer named the groups in its own output above. On a rail repo the rail re-measures base reds against its own reproduction before it merges anything (#3322/#3715); in gate mode this same-name comparison is the only evidence and is a named residual. This gate passing is not a claim that the head is green"
@@ -1469,6 +1478,14 @@ c_carry_ask() {
       C_CARRY_WHY="the JUDGED head's CHECK SURFACE IS RED (the JUDGED head is the LIVE head the producer would merge — this gate asks about an EARLIER head, so the recorded head is NOT the one judged; an unread live head answers 'surface-unknown' below, never a substitution) and the red is NOT shown base-owned (the producer named the red group(s) in its own output above) — the record may cover the artifact, but it does not cover a tree whose checks are failing, and passing here would be the false PASS of #3440 (#3355 was attested clean over 7 red checks). Fix or re-run the failing checks — a re-review is not the remedy for a broken build" ;;
     8:surface-unknown)
       C_CARRY_WHY="the JUDGED head's check surface could NOT BE READ (the producer answered 'surface-unknown': a refused gh/API read, an unreadable PR HEAD identity — in which case no sha was judged at all and the RECORDED head was NOT substituted — or no repo resolvable for the check-runs query). A read that FAILED is not a green surface, so nothing is certified here — this is a transport/budget fault, not a fault of the PR, and the remedy is to RE-RUN this gate, not to change the code" ;;
+    0:red-base-owned)
+      # ⛔ THE TOKEN WITHOUT ITS PROOF (#3440 review round 3, P2). The pre-`case` arm passes
+      # `red-base-owned` only when it carries a record digest that EQUALS the live one; this arm is
+      # the rest — the producer's HEAD-bound shape (`recd` is `-` for a record with no
+      # `diff_sha256`), and the TOCTOU the `0:head` arm above refuses. Refuse, and say what is
+      # missing rather than "cannot classify a carry", which would send the operator at the wrong
+      # tool.
+      C_CARRY_WHY="the producer answered 'red-base-owned' (the head's check surface is RED but base-owned) WITHOUT a usable record digest it could compare to the live one, so whether the reviewed artifact is the one that would merge is UNPROVEN — base ownership of the red does not establish that the record covers this head. Re-record naming the head the record carries (record-review.sh $pr $rh <same verdict> $repo — a CARRY, not a review), or re-run this gate if the head moved between its reads" ;;
     0:head)
       # Unreachable in the normal path (the caller only asks about a head that is
       # NOT the current one), but reachable on a TOCTOU: the producer read the
@@ -3511,6 +3528,10 @@ case "${PCC3315_MODE:-carry}" in
   # stderr away with `2>/dev/null` (review of `554d272`, P2). Passes 33/34 pin the relay.
   red-base-owned) printf 'record-review.sh --check-carry: RED, and every red group ALSO reproduces on the base — You are accepting: CI|verify\n' >&2
                   printf 'red-base-owned\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
+  # The HEAD-bound shape: the producer answers `red-base-owned` with NO record digest on the left, so
+  # the consumer cannot prove the reviewed artifact is the one that would merge (pass 33b).
+  red-base-owned-nodigest) printf 'record-review.sh --check-carry: RED and base-owned, but this record carries no diff digest\n' >&2
+                  printf 'red-base-owned\t-\t%s\n' "${PCC3315_DIGEST:-}"; exit 0 ;;
   red-surface)  printf 'record-review.sh --check-carry: RED and NOT shown base-owned — Red group(s): CI|bash-suites (3)\n' >&2
                 printf 'red-surface\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 7 ;;
   surface-unknown) printf 'surface-unknown\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 8 ;;
@@ -3759,6 +3780,14 @@ C3315_STUB_EOF
   # MUTANT: restore `2>/dev/null` on the producer call and both vectors go red.
   c3315_case "pass 36: the producer's BASE-OWNED group line is RELAYED into the gate's log (#3440)" \
     red-base-owned "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" pass 'You are accepting: CI|verify'
+  # 35b — A `red-base-owned` TOKEN WITH NO PROVEN CONTENT IDENTITY DOES NOT PASS (#3440 review round 3,
+  # P2). The producer emits that token from its HEAD-bound arm too, where `recd` is `-` for a record
+  # with no `diff_sha256`; the first version of the arm printed "diff unchanged (- = cccc…)" and
+  # PASSED — an equality it never checked, and the TOCTOU the `0:head` arm refuses. The stub's
+  # `red-base-owned-nodigest` mode models exactly that argv pair. It sits in the SURFACE run (33–35)
+  # because that is what it pins, not in the relay run (36–38) that follows it.
+  c3315_case "pass 35b: 'red-base-owned' with NO proven diff digest ⇒ FAILS CLOSED, never a licence" \
+    red-base-owned-nodigest "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'WITHOUT a usable record digest'
   c3315_case "pass 37: the producer's RED group line is RELAYED into the gate's log (#3440)" \
     red-surface "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'Red group(s): CI|bash-suites (3)'
   # 38 — THE RELAY FIRES ONCE, ABOVE THE REFUSAL IT SUPPORTS (review of this change, nit 4). With TWO
@@ -3766,7 +3795,9 @@ C3315_STUB_EOF
   # refusal; relaying inside c_carry_ask printed the identical group block once per ASK, and an
   # older candidate's groups could appear above a message describing a different cause. The relay
   # is now stashed per ask and printed once, immediately above the reported refusal.
-  # MUTANT: move the relay back into c_carry_ask's `7:red-surface` arm → the count below becomes 2.
+  # MUTANT: move the relay back into c_carry_ask's `7:red-surface` arm → the count below becomes 3
+  # (one per ASK, for the two candidates, plus the one the resolve path prints for the reported
+  # refusal). Measured: "appeared 3 time(s), wanted 1".
   {
     PR_BODY="Fixes #1
 $(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")"
@@ -3798,7 +3829,7 @@ $(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")"
   unset C3315_KEY_SAVE C3315_HOME_SAVE
   rm -rf "$C3315_ISO" "$C3315_DIR"
   if [[ "$C3315_FAILS" -ne 0 ]]; then
-    echo "  ❌ passes 15–35: $C3315_FAILS carry-arm assertion(s) failed (#3315 / #3440)" >&2
+    echo "  ❌ passes 15–38: $C3315_FAILS carry-arm assertion(s) failed (#3315 / #3440)" >&2
     exit 2
   fi
   summarize || true
@@ -5739,7 +5770,7 @@ $big_filler"
   unset reval_sh pipeline_repo_root pipeline_wf pipeline_is_self 2>/dev/null || true
 
   # ── #3315 — CHECK (c) CONSULTS THE CARRY: run the FAIL_ALL arms for real ───
-  # The vectors themselves live in the FAIL_ALL block (passes 15–35), the same
+  # The vectors themselves live in the FAIL_ALL block (passes 15–38), the same
   # way #1356's clean-low vectors do — and for the same reason (#991): CI runs
   # SELF_TEST and never FAIL_ALL, so a vector that only lives there is executed by
   # nothing and pins nothing. This subprocess run is what puts them in front of
@@ -5783,6 +5814,7 @@ $big_filler"
     "pass 33: 'red-base-owned'" \
     "pass 34: 'red-surface'" \
     "pass 35: 'surface-unknown'" \
+    "pass 35b: 'red-base-owned' with NO proven diff digest" \
     'pass 36: the producer'\''s BASE-OWNED group line is RELAYED' \
     'pass 37: the producer'\''s RED group line is RELAYED' \
     'pass 38: the producer'\''s red-group lines are RELAYED exactly ONCE' ; do

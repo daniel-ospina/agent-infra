@@ -2651,9 +2651,11 @@ fi
 # GREEN and answers `head`/`carry` (exit 0 = a merge licence), and check (c) passes on it: a gate
 # defeated by ambient env, which this repo classes category A (a bypass), and the only defeat
 # mechanism the surface read has. The exclusion itself is a recorded decision (#1590) and stays —
-# only its ambient override goes. A consumer that genuinely needs a different set edits this line
-# (the script is copied into consumer repos and is pinned/sanctioned there), so nothing is lost but
-# the silent, per-invocation override.
+# only its ambient override goes. A consumer that genuinely needs a different set must VENDOR the
+# script (wiring option 1: keep a copy in the repo and edit this line there) — the default wiring
+# option 2 auto-fetches the script into no tracked file, so there is no line to edit, and that is
+# stated here rather than implied (#3440 review round 3). The exclusion set being stale for one
+# consumer is tracked by #2367.
 RECORD_REVIEW_RED_EXCLUDE="ai-review-gate ai-review-gate-tests"
 # ── check_surface_scan — THE ONE POLARITY IMPLEMENTATION (#3440) ───────────
 # Everything above applies; this function is the SAME read, generalised so that the
@@ -2700,7 +2702,7 @@ check_surface_scan() { # <sha>
   # `554d272`, P2). The guard above only catches an EMPTY RESPONSE; a head whose only run is the
   # excluded `ai-review-gate` returned rows, so the awk fell through to `green` — a record asserting
   # `check_surface:green` about a surface whose only observed check is RED, and no NOT-GREEN line
-  # from `--check-carry`, both contradicting this function's own contract (line 2467: `empty` is
+  # from `--check-carry`, both contradicting this function's own contract (line 2470: `empty` is
   # "no non-excluded group exists on this commit") and the
   # mint-path comment. See the `nseen` counter in the awk END block: nothing OBSERVABLE is `empty`,
   # never `green`.
