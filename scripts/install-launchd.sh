@@ -457,27 +457,91 @@ job_label() {
     basename "$1" .plist
 }
 
-# Print absolute-path ProgramArguments entries, one per line (python3
-# plistlib; PlistBuddy fallback — macOS guaranteed to have one of them).
+# The plist READER, resolved independently of the CALLER'S PATH. The installer deliberately PINS a
+# PATH for the jobs it renders and a caller may hand it a filtered one (§ the all-shim fixture), so a
+# reader that only answers `command -v` disappears exactly when the install is being verified. That
+# is not a hypothetical: it turned every job into a FAIL in that fixture once "could not read" became
+# a refusal. python3 lives in a standard location on every supported box; PlistBuddy is the fallback.
+plist_python() {
+    local c
+    for c in "$(command -v python3 2>/dev/null)" /usr/bin/python3 /usr/local/bin/python3 \
+             /opt/homebrew/bin/python3; do
+        [ -n "$c" ] && [ -x "$c" ] && { printf '%s\n' "$c"; return 0; }
+    done
+    return 1
+}
+
+# Print absolute-path ProgramArguments entries as `<kind>\t<path>`, one per line
+# (python3 plistlib; PlistBuddy fallback — macOS guarantees one of them).
+#
+# `kind` is `exec` for the COMMAND PREFIX — everything before the first option — and `data` for
+# every absolute value from the first `-`-prefixed argument onward. That split is the difference
+# between "launchd cannot EXECUTE this job" and "this job's work cannot READ its input": only the
+# former is a reason to refuse the install (see verify_targets). It is derived from argv ORDER, not
+# from a fixed index, because `/usr/bin/env bash <script>` puts the script at argv[2] while
+# `/bin/bash <script>` puts it at argv[1].
+#
+# ⛔ A RETURN OF NON-ZERO MEANS "COULD NOT READ", NEVER "NO TARGETS" (#1743). Both consumers of
+# this function are verdicts about whether a job may be armed, so an unparseable plist and a plist
+# with no absolute argument must not arrive at the caller as the same empty string — that was an
+# empty-as-PASS, where a rendered plist launchd could not parse installed UNVERIFIED.
 plist_program_args() {
-    local plist="$1" out
-    if command -v python3 >/dev/null 2>&1; then
-        out="$(python3 - "$plist" 2>/dev/null <<'PY' || true
+    local plist="$1" out rc=0 py
+    if py="$(plist_python)"; then
+        out="$("$py" - "$plist" 2>/dev/null <<'PY'
 import plistlib, sys
 try:
     with open(sys.argv[1], "rb") as f:
         d = plistlib.load(f)
-    for a in d.get("ProgramArguments", []):
-        if isinstance(a, str) and a.startswith("/"):
-            print(a)
 except Exception:
-    pass
+    sys.exit(3)                      # UNREADABLE — not "no targets"
+args = d.get("ProgramArguments")
+if not isinstance(args, list) or not args:
+    sys.exit(4)                      # no ProgramArguments array to verify
+target = True
+for a in args:
+    if not isinstance(a, str):
+        continue
+    if a.startswith("-"):
+        target = False
+        continue
+    if a.startswith("/"):
+        print("%s\t%s" % ("exec" if target else "data", a))
 PY
-)"
-        if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+)" || rc=$?
+        if [ "$rc" -eq 0 ]; then
+            # Parsed, but the array named no absolute path → NOTHING was verified. A pass here
+            # would be the same empty-as-PASS in a quieter costume.
+            [ -n "$out" ] || return 1
+            printf '%s\n' "$out"
+            return 0
+        fi
+        # rc=3/4 (unparseable / no array) → try the other guaranteed reader before giving up.
     fi
-    /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" 2>/dev/null \
-        | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*=[[:space:]]*//p' | grep '^/' || true
+    local buddy=/usr/libexec/PlistBuddy raw
+    [ -x "$buddy" ] || return 1
+    raw="$("$buddy" -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 1
+    [ -n "$raw" ] || return 1
+    out="$(printf '%s\n' "$raw" | awk '
+        BEGIN { target = 1; seen = 0 }
+        # PlistBuddy wraps an array in `Array {` / `}` on their own lines.
+        /^[[:space:]]*(Array)?[[:space:]]*\{[[:space:]]*$/ { next }
+        /^[[:space:]]*\}[[:space:]]*$/ { next }
+        {
+            line = $0
+            sub(/^[[:space:]]*/, "", line)
+            sub(/[[:space:]]*$/, "", line)
+            sub(/^(Arg)?[0-9]+[[:space:]]*=[[:space:]]*/, "", line)
+            if (line == "") next
+            seen = 1
+            if (line ~ /^-/) { target = 0; next }
+            if (line ~ /^\//) printf "%s\t%s\n", (target ? "exec" : "data"), line
+        }
+        END { if (!seen) exit 1 }
+    ')" || return 1
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
+    return 0
 }
 
 # ── the TCC-protected tree (#427) ─────────────────────────────────────────
@@ -487,7 +551,7 @@ PY
 #
 #   com.eldato.worker-supply        runs=1766  last exit code=126
 #   com.eldato.objective-reminder   runs=44    last exit code=126
-#   com.eldato.controller-watchdog  runs=0     last exit code=126
+#   com.eldato.controller-watchdog  runs=1     last exit code=126
 #   com.tortoise.queue-reconcile    runs=n/a   last exit code=2
 #
 # and every one of them logged the same sentence, 27,322 times for the first:
@@ -528,11 +592,38 @@ tcc_protected_roots() {
         "$HOME/Library/Mobile Documents"
 }
 
+# physical_path <path> → the path with every symlink component resolved, or non-zero.
+#
+# `pwd -P` alone resolves only the DIRECTORY, which was the first draft's hole: a farm entry that is
+# itself a symlink into the protected tree (`~/.pi/agent/scripts/x.sh -> ~/Documents/…/x.sh`, the
+# shape `pi-bootstrap/setup.sh` deliberately replaces with real copies) has an unresolvable-by-pwd
+# basename and passed the guard. `readlink` is POSIX (macOS ships it without `-f`), so the loop is
+# explicit rather than a `realpath -f` dependency; the hop bound stops a symlink cycle from hanging
+# the installer.
+physical_path() {
+    local p="$1" n=0 t d b
+    while [ -L "$p" ]; do
+        [ "$n" -lt 40 ] || return 1
+        t="$(readlink "$p" 2>/dev/null)" || return 1
+        [ -n "$t" ] || return 1
+        case "$t" in
+            /*) p="$t" ;;
+            *)  d="$(CDPATH= cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)" || return 1
+                p="$d/$t" ;;
+        esac
+        n=$((n + 1))
+    done
+    d="$(CDPATH= cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)" || return 1
+    b="$(basename -- "$p")"
+    printf '%s/%s\n' "$d" "$b"
+}
+
 # is_tcc_protected <absolute path> → 0 when launchd cannot read it.
 #
 # TWO resolutions are compared, and BOTH are required:
-#   * the PHYSICAL path of the target, for the reason `launchd_path` does — it is the TARGET that TCC
-#     gates, so a symlink pointing INTO the protected tree is dead while one pointing OUT of it is fine;
+#   * the PHYSICAL path of the target (symlinks included), for the reason `launchd_path` does — it is
+#     the TARGET that TCC gates, so a symlink pointing INTO the protected tree is dead while one
+#     pointing OUT of it is fine;
 #   * the PHYSICAL path of each ROOT, because the roots are built from `$HOME` and `$HOME` itself is
 #     commonly reached through a symlinked ancestor (`/tmp` → `/private/tmp` on macOS). Measured on
 #     this suite's own fixture: HOME=/tmp/… resolved to /private/tmp/…, the literal prefix never
@@ -540,11 +631,8 @@ tcc_protected_roots() {
 # A path whose directory cannot be resolved falls back to the literal, and the literal `case` still
 # matches — an unresolvable path must never be the way past this guard.
 is_tcc_protected() {
-    local arg="$1" arg_phys="" dir phys root root_phys candidate
-    dir="$(dirname -- "$arg")"
-    if phys="$(CDPATH= cd -- "$dir" 2>/dev/null && pwd -P)"; then
-        arg_phys="$phys/$(basename -- "$arg")"
-    fi
+    local arg="$1" arg_phys="" root root_phys candidate
+    arg_phys="$(physical_path "$arg" 2>/dev/null)" || arg_phys=""
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         for candidate in "$arg" "$arg_phys"; do
@@ -552,7 +640,7 @@ is_tcc_protected() {
             case "$candidate" in "$root" | "$root"/*) return 0 ;; esac
         done
         root_phys=""
-        if root_phys="$(CDPATH= cd -- "$root" 2>/dev/null && pwd -P)" && [ "$root_phys" != "$root" ]; then
+        if root_phys="$(physical_path "$root" 2>/dev/null)" && [ "$root_phys" != "$root" ]; then
             for candidate in "$arg" "$arg_phys"; do
                 [ -n "$candidate" ] || continue
                 case "$candidate" in "$root_phys" | "$root_phys"/*) return 0 ;; esac
@@ -565,17 +653,48 @@ is_tcc_protected() {
 # Verify every absolute path in ProgramArguments resolves AND is readable from the launchd context
 # (catches broken symlinks — e.g. provider-latency-tripwire.sh pointing at a not-yet-pulled checkout,
 # fixed by re-running setup.sh — and TCC-protected targets, fixed by farming).
-# $1 = rendered plist FILE. Prints offending targets; exits 1 if any.
+#
+# ⛔ ONLY THE EXECUTED COMMAND MAY REFUSE; A TCC-PROTECTED DATA ARGUMENT WARNS. The guard exists so
+# that a job launchd cannot START is never armed — not so that a job whose INPUT is unreachable is
+# refused as if its script were missing. Four shipped templates pass `--repo {{TORTOISE_REPO}}`, and
+# TORTOISE_REPO defaults to `~/Documents/GitHub/tortoise` on the documented box, so refusing data
+# arguments reddened the whole installer there: `install_job … || fail=1` → exit 1, and `sync.sh`
+# (`set -euo pipefail`, installer run unguarded) died before its cost-config and parity gates. A
+# unit that installs but cannot read its `--repo` is DEAD WORK, which is #427's recorded class — the
+# honest answer is a named WARN on a passing install, not a refusal that blocks every other job.
+# The existence check stays unconditional (pre-existing behaviour, and a missing target is a broken
+# install whoever reads it).
+# $1 = rendered plist FILE. Prints offending targets; exits 1 if any EXEC target is unverifiable.
 verify_targets() {
-    local arg bad=0
-    while IFS= read -r arg; do
+    # ⛔ THE ITERATION COUNT IS PART OF THE CHECK, not decoration: "the feeder emitted nothing" and
+    # "every target verified" were the same observable before #1743, and the repo's own detector
+    # reported this function as an empty-as-PASS for exactly that reason. Zero verified entries is a
+    # REFUSAL now — a second, independent gate beside the feeder's own return code, because the two
+    # can fail separately (a reader that succeeds on a plist with no absolute argument is rc=0).
+    local kind arg args_out bad=0 n=0
+    if ! args_out="$(plist_program_args "$1")"; then
+        echo "    cannot read ProgramArguments: $1" >&2
+        echo "        a plist that does not parse (or names no absolute target) is NOT an empty" >&2
+        echo "        target list — nothing was verified, so the job cannot be armed." >&2
+        return 1
+    fi
+    while IFS=$'\t' read -r kind arg; do
         [ -n "$arg" ] || continue
+        n=$((n + 1))
         if [ ! -e "$arg" ]; then
             echo "    broken target: $arg" >&2
             bad=1
             continue
         fi
         if is_tcc_protected "$arg"; then
+            if [ "$kind" = "data" ]; then
+                echo "    WARN TCC-protected data argument: $arg" >&2
+                echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427), so" >&2
+                echo "        the part of this job's work that reads this value is dead. The unit still" >&2
+                echo "        installs: this is not the executable, and refusing here blocked every" >&2
+                echo "        other job on the documented default box (#427, --repo under ~/Documents)." >&2
+                continue
+            fi
             echo "    TCC-protected target: $arg" >&2
             echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427);" >&2
             echo "        it starts this job and bash exits 126 'Operation not permitted', which" >&2
@@ -584,7 +703,11 @@ verify_targets() {
             echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
             bad=1
         fi
-    done < <(plist_program_args "$1")
+    done <<< "$args_out"
+    if [ "$n" -eq 0 ]; then
+        echo "    no absolute ProgramArguments entry was verified: $1" >&2
+        return 1
+    fi
     return "$bad"
 }
 
