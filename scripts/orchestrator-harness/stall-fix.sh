@@ -316,11 +316,17 @@ fi
 
 # KIND=prfix — A MEASUREMENT, NOT AN EXEMPTION (review P2, 2026-11-01: this comment used to say the
 # creation gate "exempts" a stall repair, which spawn-gate.sh denies). `prfix` is exempt ONLY on proof
-# that this worktree IS an open PR at this HEAD (`spawn-gate.sh:1989-1993`, via
+# that this worktree IS an open PR at this HEAD (`spawn-gate.sh`'s `KIND=prfix` arm, via
 # `land_backlog_open_pr_evidence`), and a DETACHED worktree at `origin/main` can never produce that
-# proof (`:1970-1978`: the branch rule is skipped because `rev-parse --abbrev-ref HEAD` is `HEAD`, and
-# no open PR's head is main's tip). So this KIND falls through to the ordinary landing-ratio
-# measurement (`:1994-2005`) — and a drain stall IS the state where that ratio is over the ceiling.
+# proof (that arm's branch rule is skipped because `rev-parse --abbrev-ref HEAD` is `HEAD`, and no open
+# PR's head is main's tip). So this KIND falls through to the ordinary landing-ratio measurement — and
+# a drain stall IS the state where that ratio is over the ceiling.
+#
+# ⛔ THESE WERE LINE NUMBERS AND THEY WENT STALE (review cycle 5 of #3380, 2026-11-05, P3). The three
+# pointers that used to sit here (`:1989-1993`, `:1970-1978`, `:1994-2005`) had all drifted into
+# spawn-gate.sh's DISK-gate block, so a maintainer following them read a comment about headroom and
+# concluded this one was talking about the disk. Cited by NAME now, which cannot drift — the rule the
+# §F note in stall-fix.test.sh states, applied where it was being broken.
 # ⇒ The creation back-pressure gate CAN legitimately HOLD this dispatch, and it is most likely to fire
 # on exactly the box this escalation exists for. That is stated rather than denied, and it is not
 # hidden from the operator: the hold writes `[land-backlog] REFUSED …` to the worker's own log, which
