@@ -801,6 +801,27 @@ def _now() -> int:
     return int(time.time())
 
 
+def _iso(epoch: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(epoch))
+
+
+def _age(epoch: float) -> str:
+    """Computed age of a measurement, in the shape the rest of the fleet prints it.
+
+    Invariant 4: a number travels with its measurement time AND a computed age. A bare epoch is a
+    number nobody can reason about without doing arithmetic, and arithmetic done twice is how two
+    lanes end up disagreeing about how old the same snapshot is.
+    """
+    delta = max(0, int(_now() - epoch))
+    if delta < 60:
+        return "%ds" % delta
+    if delta < 3600:
+        return "%dm" % (delta // 60)
+    if delta < 86400:
+        return "%dh%02dm" % (delta // 3600, (delta % 3600) // 60)
+    return "%dd%02dh" % (delta // 86400, (delta % 86400) // 3600)
+
+
 def parse_payload(ran: Ran, what: str) -> Tuple[Optional[Any], Optional[str]]:
     """Parse stdout as JSON **regardless of exit status**.
 
@@ -1476,6 +1497,100 @@ def _numbers(text: str) -> List[str]:
     return re.findall(r"#(\d{3,6})", text or "")
 
 
+_SAVED_MAX_MATCHES = 10
+
+
+def _saved_for_issue(repo: str, issue: int) -> Dict[str, Any]:
+    """Saved work for one issue, read from the EXISTING `refs/wip/*` population.
+
+    ⛔ THIS READS; IT NEVER SAVES. `scripts/bg-rescue-wip.sh` is the actuator that archives
+    uncommitted work to `refs/wip/<branch-slug>` on origin. This is the lookup that makes those
+    snapshots findable, so an agent asking "is this claimed?" is not told `free` while a snapshot
+    of the same work sits unreferenced. No write path exists here, by design (#3489's sibling).
+
+    The slug is derived from the BRANCH, not from the issue, so a match is a slug TOKEN equal to
+    the issue number (`ai-3194` matches 3194; `ai-31940` does not). That is a heuristic, and the
+    payload says so in `match_rule` — it is evidence of a candidate, never membership.
+
+    ⛔ An unreadable registry is `UNMEASURED(<cmd> + <error>)`, NEVER `none`. An empty set is not
+    evidence of absence (invariant 1) — and this is exactly the shape of the 222-snapshot problem:
+    the snapshots existed the whole time; nothing was looking.
+    """
+    base: Dict[str, Any] = {
+        "measured_at": _now(),
+        "match_rule": "refs/wip/<slug> where <slug> contains the issue number as a hyphen-delimited token",
+        # The save only happens when an agent exits through the normal path. A box that is killed
+        # (OOM) or a cell that is reclaimed loses its work with no snapshot at all, so `none` must
+        # never be read as "no work was in progress".
+        "save_coverage": "normal-exit-only",
+        "coverage_note": ("a snapshot exists only when the agent exited normally; an OOM kill or a "
+                          "reclaimed server saves nothing, so `none` does NOT mean no work was in progress"),
+    }
+    if not os.path.isdir(repo):
+        return dict(base, count=None,
+                    unmeasured="UNMEASURED(git -C %s ls-remote origin refs/wip/*): not a directory — "
+                               "the saved-work read needs a checkout, not a remote URL" % repo)
+    ran = run(["git", "-C", repo, "ls-remote", "--refs", "origin", "refs/wip/*"], timeout=60.0)
+    if ran.rc != 0:
+        return dict(base, count=None,
+                    unmeasured="UNMEASURED(git -C %s ls-remote origin refs/wip/* + %s)"
+                               % (repo, (ran.stderr or "rc=%d" % ran.rc).strip()[:200]))
+    total = 0
+    matches: List[Tuple[str, str]] = []
+    for line in (ran.stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not parts[1].startswith("refs/wip/"):
+            continue
+        total += 1
+        slug = parts[1][len("refs/wip/"):]
+        if str(issue) in slug.split("-"):
+            matches.append((parts[0], slug))
+    found: List[Dict[str, Any]] = []
+    for sha, slug in matches[:_SAVED_MAX_MATCHES]:
+        local = "refs/wip-remote/%s" % slug
+        got = run(["git", "-C", repo, "fetch", "-q", "--no-tags", "origin",
+                   "+refs/wip/%s:%s" % (slug, local)], timeout=60.0)
+        entry: Dict[str, Any] = {"ref": "refs/wip/%s" % slug, "slug": slug, "sha": sha}
+        if got.rc != 0:
+            entry["age"] = ("UNMEASURED(git fetch +refs/wip/%s + %s)"
+                            % (slug, (got.stderr or "rc=%d" % got.rc).strip()[:120]))
+            entry["files"] = None
+            found.append(entry)
+            continue
+        ts = run(["git", "-C", repo, "log", "-1", "--format=%ct", local], timeout=30.0)
+        if ts.rc == 0 and (ts.stdout or "").strip().isdigit():
+            entry["age"] = _age(float((ts.stdout or "").strip()))
+            entry["committed_at"] = _iso(float((ts.stdout or "").strip()))
+        else:
+            entry["age"] = ("UNMEASURED(git log -1 --format=%%ct %s + %s)"
+                            % (local, (ts.stderr or "rc=%d" % ts.rc).strip()[:120]))
+        # ⛔ `--root`, NOT `<ref>^..<ref>`. A rescue snapshot is frequently a ROOT commit (the
+        # actuator commits a bare tree onto `refs/wip/<slug>`), so a parent-relative diff fails with
+        # "unknown revision" and the file count would silently become UNMEASURED on exactly the
+        # snapshots that matter most. `diff-tree --root` lists the whole tree for a root commit and
+        # the change set otherwise, which is the same question answered for both shapes.
+        files = run(["git", "-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r",
+                     "--root", local], timeout=30.0)
+        if files.rc == 0:
+            entry["files"] = [f for f in (files.stdout or "").splitlines() if f.strip()]
+            entry["file_count"] = len(entry["files"])
+        else:
+            entry["files"] = None
+            entry["file_count"] = None
+            entry["file_count_detail"] = ("UNMEASURED(git diff-tree --root %s + %s)"
+                                          % (local, (files.stderr or "").strip()[:120]))
+        found.append(entry)
+    return dict(base,
+                count=len(matches),
+                population=total,
+                matches=found,
+                truncated=len(matches) > _SAVED_MAX_MATCHES,
+                note=("none" if not matches else "saved work exists for this item — read it before "
+                      "redoing it") if matches else "none",
+                none_means="no snapshot was found for this issue — NOT 'no work was in progress'; "
+                           "see save_coverage")
+
+
 def _claim_check(mods: Modules, args: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
     repo = args.get("repo") or os.environ.get("CLAIM_REPO")
     if not repo:
@@ -1514,6 +1629,11 @@ def _claim_check(mods: Modules, args: Dict[str, Any]) -> Tuple[bool, Dict[str, A
         out["issue"] = int(args["issue"])
         out["issue_claims"] = mine
         out["issue_present"] = bool(mine)
+        # ⛔ CLAIMED-OR-NOT IS HALF THE ANSWER. 222 snapshots of half-finished work sat on origin
+        # with nothing pointing at them, so "free" was returned while the same work had already been
+        # done once. The saved-work axis is READ here and never written (the actuator is
+        # bg-rescue-wip.sh); an unreadable registry is UNMEASURED, never `none`.
+        out["saved"] = _saved_for_issue(str(repo), int(args["issue"]))
     if args.get("pr") is not None or args.get("sha"):
         heads = [c for c in claims if c.get("kind") == "head"]
         if args.get("pr") is not None:

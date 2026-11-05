@@ -1246,3 +1246,71 @@ def test_T_the_registry_is_read_only_across_the_whole_surface(env):
         assert before == after
     finally:
         monkeypatch.undo()
+
+
+# ── the saved-work axis of `claim.check` (owner comment 6662755371 on #3382) ──────────────────
+# Two tests, each named for the failure it prevents. 222 snapshots of half-finished work sat on
+# origin under `refs/wip/*` with nothing pointing at them, so an agent asked "is this claimed?",
+# was told `free`, and redid work somebody had already done. The lookup is the fix; the second
+# test is that the lookup can never lie by omission.
+
+
+def _saved_mod():
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("orch_srv_saved", os.path.join(here, "server.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_T_saved_work_is_found_by_slug_token(tmp_path):
+    """A snapshot named after the issue is REPORTED — this is the lookup that did not exist.
+
+    Without it `claim.check` answered "unclaimed" while the work sat in `refs/wip/<slug>`, which is
+    how the same task got done twice in six worktrees.
+    """
+    import subprocess
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+    git = lambda *a: subprocess.run(["git", "-C", str(work), *a], check=True,
+                                    capture_output=True, text=True)
+    subprocess.run(["git", "-C", str(work), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(work), "config", "user.name", "t"], check=True)
+    (work / "half.sh").write_text("echo half\n")
+    git("add", "half.sh")
+    git("-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "half-finished work")
+    git("push", "-q", "origin", "HEAD:refs/wip/ai-9001")
+
+    mod = _saved_mod()
+    got = mod._saved_for_issue(str(work), 9001)
+    assert got["count"] == 1, got
+    assert not got.get("unmeasured"), got
+    entry = got["matches"][0]
+    assert entry["ref"] == "refs/wip/ai-9001", entry
+    assert entry["age"] and "UNMEASURED" not in str(entry["age"]), entry
+    assert entry["file_count"] == 1, entry
+    # the coverage caveat travels with the answer: `none` must never read as "no work was in progress"
+    assert got["save_coverage"] == "normal-exit-only", got
+
+    # a slug that is NOT the token must not match: `ai-90010` is a different item
+    other = mod._saved_for_issue(str(work), 90010)
+    assert other["count"] == 0, other
+    assert other["none_means"].startswith("no snapshot was found"), other
+
+
+def test_T_saved_work_unreadable_is_unmeasured_never_none(tmp_path):
+    """An unreadable registry is `UNMEASURED`, never `none` — invariant 1 on the saved axis.
+
+    The empty-set-is-not-absence rule is the whole reason this axis exists: reporting `none` when
+    the read failed is the same lie as reporting `unclaimed` when nothing was consulted.
+    """
+    mod = _saved_mod()
+    got = mod._saved_for_issue(str(tmp_path / "not-a-checkout"), 3382)
+    assert got["count"] is None, got
+    assert str(got["unmeasured"]).startswith("UNMEASURED("), got
+    assert "not a directory" in got["unmeasured"], got
+    # and it still carries the caveat, so a caller cannot read the absence as evidence
+    assert got["save_coverage"] == "normal-exit-only", got

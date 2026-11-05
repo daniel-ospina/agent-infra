@@ -697,6 +697,35 @@ must add · what it does NOT answer.
 | 5 | `pr_queue(repo)` | `tools/fleet/pr_state.py` — `action_for`, `row_action`, `fidelity`, `inherited_reds`, `verdict`; rows `CLOSE-STALE`/`WAIT:draft`/`REPAIR-CONFLICT`/`FIX-RED`/`RERUN-FLAKE`/`WAIT:inherited-red`/`REVIEW`/`WAIT:attested-elsewhere`/`WAIT:owes-review`/`WAIT:diff-unreadable`/`WAIT:in-flight`/`WAIT:no-check-surface`/`WAIT:mergeable-unknown`/`WAIT:authority-unreadable`/`LAND`; exit **2 = the pass could not be made** | the issue's vocabulary is coarser (`CONFLICT`/`STALE-ATTESTATION`/`NO-ATTESTATION`/`READY`/`INHERITED-RED`/`DRAFT`); **closing issues** are not attached to a row; `--json` exists but there is no MCP-typed shape with a `measured_at` | wrap `pr_state.py --json` (never `fleet-report.py::classify` — D1); map its 15 actions onto the issue's 6 classes **lossily in one direction only** (the 6 are a view; the 15 remain the answer); join closing issues per row | **WRAPPER** |
 | 6 | `claim_check(issue, repo)` | **registry axis:** `tools/fleet/claim_lanes.py` (`read_registry`, `read_pull`, `read_snapshot`, `parse_key`, `parse_owner`, `parse_lease`, `to_evidence`) + `tools/fleet/liveness.py::claim_verdict` + `CLAIM_REASONS` (6 named abstentions) + `scripts/orchestrator-harness/claims.sh`. **local-checkout axis:** `tortoise/tools/who-is-on.sh` (tracked, 1954 B — `0` complete answer, `2` a surface could not be read) — a **3-line body** (35 lines with its header) that `exec`s `who_is_on.py` (953 lines), which imports `collision_preflight` (9132 lines) for its git enumeration | one answer across both axes; the registry axis answers "does a claim exist for this issue/head", the local axis answers "is work in flight on this disk". Today they are two tools in two repos and neither names the gap | wrap `claim_lanes.py` for the registry axis (`--json` + exit 3 = nothing established, never freedom) and **port the local axis** — which is **three files, not one**: `who-is-on.sh` + `who_is_on.py` + a declared decision on its `collision_preflight` import (port the gate, or keep the local axis `UNMEASURED(<why>)` rather than a second enumerator). Carry `ClaimRead.readable` and `siblings` into the payload so an absent key can never read as "free" | **WRAPPER** (two axes, both existing) |
 
+### 5.2b `claim.check` answers TWO questions, not one (owner delta, #3382 comment 6662755371)
+
+| field | source | contract |
+|---|---|---|
+| `claimed` | `refs/claims/issue-N` via `claim_lanes.py` | abstention vocabulary only — a declared OWNERSHIP window, never evidence a process is alive |
+| `saved` | **`refs/wip/<slug>`**, read live via `git ls-remote` + `git fetch` | `ref`, `age`, `file_count` per match · **`UNMEASURED(<cmd> + <error>)` when the read fails**, never `none` |
+
+**Why it exists.** 226 snapshots of half-finished work sat on origin under `refs/wip/*` with nothing
+pointing at them (measured 2026-11-05; the figure was 222 when the owner raised it). An agent asking
+"is this claimed?" was told `free` while a snapshot of the same work existed — which is how one task got
+done twice across six worktrees. `claim.check` now reports both axes in one answer.
+
+**Boundaries, both deliberate:**
+- **It reads; it never saves.** `scripts/bg-rescue-wip.sh` is the actuator. No tool in this surface writes
+  `refs/wip/*` — this is a lookup over work that already exists (#3489's sibling, kept separate).
+- **It does not enforce.** A lookup an agent can skip is not a check; the requirement-to-check belongs to
+  the brief gate, not here.
+
+**Matching is a heuristic and the payload says so.** The slug is derived from the *branch*
+(`refs/wip/mcp-3382-phase2`), not the issue, so a match is a hyphen-delimited slug token equal to the issue
+number — `ai-3194` matches 3194, `ai-31940` does not. `match_rule` travels with every payload.
+
+**`none` is never "no work was in progress".** A snapshot exists only when the agent exited normally; an OOM
+kill or a reclaimed cell saves nothing (`cloud-cell-quiesce.sh` has no save step). Every payload carries
+`save_coverage: normal-exit-only` and a `none_means` sentence, so the absence cannot be read as evidence.
+
+Two tests, each named for the failure it prevents: a snapshot named for the issue is found (and a
+near-miss slug is not), and an unreadable registry answers `UNMEASURED` rather than `none`.
+
 ### 5.3 Actuation (tools 7–9)
 
 | # | Tool | Existing implementation (file + function) | What it does NOT answer today | Wrapper plan | Class |
