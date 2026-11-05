@@ -554,7 +554,9 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
     (`next=MANUAL … did NOT establish`); it is a distinct verdict from `push=FAILED` (the remote ANSWERED
     and the ref is absent) exactly as the symref read on the same path already refuses to read silence as
-    "no protected names".
+    "no protected names". `push=push-timed-out` is the same honesty for `rc=124` on the push itself: the
+    timer killed the CLIENT, so the ref may already have been applied server-side and the terminal asserts
+    neither delivery nor loss — `FAILED` is reserved for a refusal the remote actually answered.
   * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
     writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,

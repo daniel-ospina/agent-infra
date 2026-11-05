@@ -1566,6 +1566,100 @@ case "$sc" in *'does NOT ignore'*) rcn32a=0 ;; *) rcn32a=1 ;; esac
 ck "N32a the clean \"may be removed\" verdict names what it measured (the paths git does NOT ignore), so the artifact cannot state more safety than the enumeration covered" $rcn32a
 case "$sc" in *"may be removed once its PR is terminal"*) rcn32b=0 ;; *) rcn32b=1 ;; esac
 ck "N32b …and it is still an affirmative verdict where that is warranted — the scope was added, not the removal replaced by an abstention" $rcn32b
+# ⛔ N27c — A REPORTER MAY NOT SIT ABOVE A MANUAL ARM, AND THE ARCHIVE IS NO EXCEPTION (review cycle 12,
+# P1 — REPRODUCED). `refused-protected|refused-main-checkout` used to live BELOW the `archived-local`
+# reporter, so a DIRTY tree with a refused push and a LOCAL-ONLY archive — the fleet's worst reachable state
+# (the documented `fix-one.sh` no-`WIP_PATH` case on the hub's landing branch, plus a full disk where only
+# the local pin could be written: nothing off-box at all) — got the reporter's generic sentence, with no
+# `MANUAL` and no `do NOT reap`. Measured before the fix:
+#   next=retrieve the archive refs/wip-local/develop … the branch push is push=refused-main-checkout, so the
+#         commits on develop are not on origin either
+# i.e. the reclaim pass this artifact exists for took the worktree and lost both halves.
+nx27c="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=refused-main-checkout
+  LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx27c" in MANUAL*) rcn27c=0 ;; *) rcn27c=1 ;; esac
+case "$nx27c" in *"do NOT reap"*) : ;; *) rcn27c=1 ;; esac
+case "$nx27c" in *"refs/wip-local/develop"*) : ;; *) rcn27c=1 ;; esac
+ck "N27c a REFUSED push over a LOCAL-ONLY archive is MANUAL / do-not-reap and still names the pin — the reporter no longer runs above the MANUAL arm [${nx27c:0:72}]" $rcn27c
+nx27d="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=refused-protected
+  LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx27d" in MANUAL*"do NOT reap"*) rcn27d=0 ;; *) rcn27d=1 ;; esac
+ck "N27d …the same holds for refused-protected (the pair is one arm, so it is asserted as one)" $rcn27d
+# ⛔ N33 — A TIMED-OUT PUSH IS NOT A MEASURED ABSENCE EITHER (review cycle 12, P2). `rc=124` means the
+# TIMER KILLED THE CLIENT — the ref may already have been applied server-side — yet the log said "STILL only
+# on this disk", contradicting itself in one breath ("the remote never answered") and breaking this file's
+# own definition of `FAILED` (the remote ANSWERED and the ref is absent), while next= printed "exist only on
+# this disk" as measured fact. A shim that exits 124 is a faithful driver: the code branches on the NUMBER,
+# and the number is the contract the timer has with every caller.
+mkdir -p "$TMP/bin-124"
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 124 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-124/git"
+chmod +x "$TMP/bin-124/git"
+git -C "$WT" worktree add -q "$TMP/wt10" -b timedout 2>/dev/null
+git -C "$TMP/wt10" commit -q --allow-empty -m "unpushed for the push-timeout arm" 2>/dev/null
+: > "$O/logs/timedout.log"; rm -f "$O/state/lane-exit-timedout.state"
+PATH="$TMP/bin-124:$PATH" O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=timedout
+  lane_end_push "timedout" "$3" "$2" timedout 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+  lane_end_next > "$4"
+  LANE_END_LOG="$3"; LANE_END_MARKER_FRESH=1
+  lane_end_marker "timedout" 0 300
+' _ "$GATE" "$TMP/wt10" "$O/logs/timedout.log" "$TMP/n33.next" > "$TMP/n33.out" 2>&1
+grep -qx 'push=push-timed-out' "$TMP/n33.out"; rcn33a=$?
+ck "N33a a push whose TIMER fired (rc=124) records push=push-timed-out — a distinct verdict from push=FAILED (the remote ANSWERED and the ref is absent)" $rcn33a
+! grep -q 'STILL only on this disk' "$O/logs/timedout.log" && grep -q 'TIMED OUT' "$O/logs/timedout.log" \
+  && grep -q 'did NOT establish' "$O/logs/timedout.log"; rcn33b=$?
+ck "N33b …and the log says the delivery was NOT established, never the self-contradicting 'never answered … STILL only on this disk'" $rcn33b
+case "$(cat "$TMP/n33.next" 2>/dev/null)" in MANUAL*"did NOT establish"*) rcn33c=0 ;; *) rcn33c=1 ;; esac
+ck "N33c …and next= is MANUAL / 'did NOT establish' — not reaped, and not told to stop reaping for a loss nobody measured [$(cut -c1-58 "$TMP/n33.next" 2>/dev/null)]" $rcn33c
+grep -qx 'push=push-timed-out' "$O/state/lane-exit-timedout.state" 2>/dev/null; rcn33d=$?
+ck "N33d …and the MARKER carries the same verdict, so artifact and log agree" $rcn33d
+# ⛔ N34 — THE LEDGER COLUMN AND THE MARKER ARE ONE DERIVATION (review cycle 12, P2 — REPRODUCED). The TSV
+# wrote the raw `${LANE_END_UNPUSHED:-0}`, and `terminal_wip_rescue` resets that global to 0 BEFORE both
+# early returns, so `WIP_RESCUE_DISABLE=1` and `not-a-worktree` published a MEASURED ZERO in the aggregate
+# row while the marker beside them said `unpushed=?` — the exact lie the marker's own comment claims to
+# prevent, still live in the ledger the README describes as the table consumers read.
+rm -rf "$TMP/n34O"
+( bash -c '
+  . "$1"
+  O="$2"; WIP_RESCUE_DISABLE=1; LANE_END_LOG=/dev/null
+  terminal_wip_rescue n34 0 10 /dev/null' _ "$GATE" "$TMP/n34O" 2>/dev/null )
+tsv34="$TMP/n34O/state/lane-end.tsv"
+mk34="$TMP/n34O/state/lane-exit-n34.state"
+[ -s "$tsv34" ] && [ "$(awk -F'\t' 'NR==1{print $5}' "$tsv34")" = "not-measured" ] \
+  && [ "$(awk -F'\t' 'NR==1{print $8}' "$tsv34")" = "?" ]; rcn34a=$?
+ck "N34a the HATCH row's ledger column 8 is '?' — the same '?' the marker publishes, not the reset's 0 [$(awk -F'\t' 'NR==1{print "state="$5" unpushed="$8}' "$tsv34" 2>/dev/null)]" $rcn34a
+[ -s "$mk34" ] && grep -qx 'unpushed=?' "$mk34"; rcn34b=$?
+ck "N34b …and the marker on the SAME terminal says the same thing — one derivation, two writers" $rcn34b
+rm -rf "$TMP/n34bO"
+mkdir -p "$TMP/definitely-not-a-repo"
+( bash -c '
+  . "$1"
+  O="$2"; WIP_PATH="$3"; LANE_END_LOG=/dev/null
+  terminal_wip_rescue n34b 0 10 /dev/null' _ "$GATE" "$TMP/n34bO" "$TMP/definitely-not-a-repo" 2>/dev/null )
+tsv34b="$TMP/n34bO/state/lane-end.tsv"
+[ -s "$tsv34b" ] && [ "$(awk -F'\t' 'NR==1{print $5}' "$tsv34b")" = "not-a-worktree" ] \
+  && [ "$(awk -F'\t' 'NR==1{print $8}' "$tsv34b")" = "?" ]; rcn34c=$?
+ck "N34c …and the same holds on the OTHER unmeasured early return (not-a-worktree), so the fix is the derivation and not one arm [$(awk -F'\t' 'NR==1{print "state="$5" unpushed="$8}' "$tsv34b" 2>/dev/null)]" $rcn34c
+rm -rf "$TMP/definitely-not-a-repo"
+# ⛔ N34d NON-VACUITY: a MEASURED zero still publishes `0` — the derivation must not turn every row into `?`.
+rm -rf "$TMP/n34cO"
+( bash -c '
+  . "$1"
+  O="$2"; LANE_END_TREE=clean; LANE_END_RESCUE=nothing; LANE_END_UNPUSHED=0
+  LANE_END_LOG=/dev/null; LANE_END_MARKER_FRESH=1
+  lane_end_record n34c 0 10' _ "$GATE" "$TMP/n34cO" 2>/dev/null )
+tsv34c="$TMP/n34cO/state/lane-end.tsv"
+[ -s "$tsv34c" ] && [ "$(awk -F'\t' 'NR==1{print $8}' "$tsv34c")" = "0" ]; rcn34d=$?
+ck "N34d …while a MEASURED zero still publishes 0 — the column gained a distinction, not a blanket '?'" $rcn34d
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
