@@ -1183,6 +1183,34 @@ copy_repo_path() {
   fi
 }
 
+# merge_tortoise_is_hosted <merged .mcp.json> <template .mcp.base.json>
+#   True only when the file that was JUST WRITTEN points its `tortoise` entry at the template's
+#   (hosted) url and does not carry the `_selfHosted` marker. The merge may legitimately keep a
+#   machine's own url, so this is what the install summary line reports — the ARTIFACT, never the
+#   intent of having run a merge. A file that cannot be read is NOT the hosted default: the
+#   caller's other line is the honest one, and the verifier refuses such a cell by name.
+merge_tortoise_is_hosted() {
+  python3 - "$1" "$2" <<'MCPHOSTED' >/dev/null 2>&1
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        have = (json.load(fh).get("mcpServers") or {}).get("tortoise") or {}
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        want = (json.load(fh).get("mcpServers") or {}).get("tortoise") or {}
+except Exception:
+    sys.exit(1)
+if not isinstance(have, dict) or not isinstance(want, dict):
+    sys.exit(1)
+sys.exit(
+    0
+    if (have.get("url") or "").strip() == (want.get("url") or "").strip()
+    and (want.get("url") or "").strip()
+    and not have.get("_selfHosted")
+    else 1
+)
+MCPHOSTED
+}
+
 install_config() {
   local rel cfg_fail=0
   # settings.json is the SIXTH config source, and it is checked FIRST so that the step's
@@ -1276,7 +1304,16 @@ PY
     if [ "$mcp_rc" -ne 0 ]; then
       fail ".mcp.json merge failed (merge-mcp.py rc=$mcp_rc) — the cell would keep whatever config it already had"
     else
-      log_line ".mcp.json: hosted tortoise entry installed (cell-local servers preserved)"
+      # ⛔ THE SUMMARY LINE DESCRIBES THE FILE, NOT THE INTENT (#3374 review P2). The merge may
+      # legitimately KEEP this machine's own tortoise url — it prints a NOTE saying so — and on
+      # rc=0 alone this line then told the operator the HOSTED entry was installed, the opposite of
+      # what the artifact says. Reading the merged file back is the same discipline the layer
+      # verification below uses: a claim about an artifact is checked against the artifact.
+      if merge_tortoise_is_hosted "$DEST/.mcp.json" "$mcp_src"; then
+        log_line ".mcp.json: hosted tortoise entry installed (cell-local servers preserved)"
+      else
+        log_line ".mcp.json: merged, but the tortoise entry is NOT the hosted default (see the NOTE above) — cell-local servers preserved"
+      fi
     fi
   fi
   graph_credential_note

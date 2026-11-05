@@ -383,14 +383,48 @@ def main(argv):
                 # is the repoint class this file exists to stop.
                 entry = dict(want)
                 cur_headers = cur.get("headers") if isinstance(cur.get("headers"), dict) else {}
+                want_headers = dict(want.get("headers") or {})
                 cur_auth = (cur_headers.get("Authorization") or "").strip()
-                want_auth = ((want.get("headers") or {}).get("Authorization") or "").strip()
+                want_auth = (want_headers.get("Authorization") or "").strip()
+                # ⛔ `entry = dict(want)` USED TO DISCARD EVERY OTHER HEADER THIS MACHINE DECLARED,
+                # with no output at all — the file's own contract (line 54) is that every decision
+                # is a `NOTE:` line and "nothing here is silent". A cell behind a gateway that
+                # requires `X-Tenant`, or a proxy that needs `Accept` pinned, lost it on EVERY
+                # install and could only notice by diffing the file by hand (#3374 review P2).
+                # A header the template does not declare is the OPERATOR's, so it is KEPT; a header
+                # both declare is the TEMPLATE's, and overriding one is a decision that is NAMED.
+                extra = {
+                    k: v
+                    for k, v in cur_headers.items()
+                    if k not in want_headers and k != "Authorization"
+                }
+                overridden = sorted(
+                    k
+                    for k, v in cur_headers.items()
+                    if k in want_headers and k != "Authorization" and v != want_headers[k]
+                )
+                headers = dict(want_headers)
+                headers.update(extra)
                 if cur_auth and cur_auth != want_auth:
-                    entry["headers"] = dict(want.get("headers") or {}, Authorization=cur_auth)
+                    headers["Authorization"] = cur_auth
+                if extra:
+                    print(
+                        "NOTE: kept this machine's own header(s) on the tortoise entry: %s"
+                        % ", ".join(sorted(extra))
+                    )
+                if overridden:
+                    print(
+                        "NOTE: replaced this machine's own %s on the tortoise entry with the "
+                        "template's — the hosted endpoint's shape is fixed, so a local override "
+                        "there does not survive an install" % ", ".join(overridden)
+                    )
+                if cur_auth and cur_auth != want_auth:
                     print(
                         "NOTE: kept this entry's credential variable (%s) instead of the template's (%s)"
                         % (cur_auth, want_auth)
                     )
+                if extra or overridden or (cur_auth and cur_auth != want_auth):
+                    entry["headers"] = headers
                 have["tortoise"] = entry
         else:
             print(
