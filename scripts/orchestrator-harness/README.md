@@ -548,7 +548,18 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     by the push's exit status — transport success is not delivery. It fires only when the measured
     unpushed count is > 0, so the majority of lanes cost no network call. It REFUSES, loudly and by name,
     to push from a hub checkout (`--git-dir` == `--git-common-dir`) or onto the landing branch, because
-    either would publish a ref that only the merge rail may move. A DETACHED head is `push=detached`:
+    either would publish a ref that only the merge rail may move. ⛔ **AND THE READ AND THE WRITE MUST
+    ADDRESS THE SAME REPOSITORY** — `git push origin` honours `remote.origin.pushurl` and
+    `url.<base>.pushInsteadOf`, while a read of `origin` (`ls-remote origin`) honours `remote.origin.url`,
+    so an exit path that read one and wrote the other derived the landing-branch set from repository A
+    and then moved repository B's landing branch (reproduced: B's `refs/heads/trunk` moved
+    `613382f..b4e6ab9` while the same terminal recorded `push=FAILED` "does NOT hold
+    refs/heads/trunk"). `lane_end_push` therefore resolves origin's push url ONCE
+    (`git remote get-url --push --all origin`) and BOTH network READS address it; the push still goes
+    through `git push origin` so git's own rewrite is applied exactly once, as `cleanup-stale-branches.sh`
+    does for the same reason. A push url set that is not exactly one is `push=refused-pushurl-divergent`:
+    guessing which repository receives the ref is the fail-open this refusal exists to close. A DETACHED
+    head is `push=detached`:
     nothing is invented, and the marker tells a reclaim pass to refuse that worktree. ⛔ **AND AN
     UNANSWERED VERIFY IS NOT AN ABSENT REF** — `push=verify-unanswered` means the push exited 0 and the
     verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
@@ -577,9 +588,12 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     ⛔ **AND NO MANUAL ARM MAY ASSERT AN ABSENCE IT DID NOT MEASURE.** Four verdicts had that shape and
     now say only what was established: `push=unmeasured` means the `rev-list --count` FAILED, so it says the
     count could not be read rather than that the commits "exist only on this disk" (the enumeration that
-    failed is not evidence of existence); `push=running` is what the PRE-NETWORK marker holds when the lane
-    is killed mid-push, so it says the push had not returned — never that the commits exist only here, which
-    the same row's own `unpushed=0` would contradict; `not-a-worktree` is not a verdict about any worktree
+    failed is not evidence of existence); `push=running` is what the PRE-NETWORK marker holds, so it says
+    this MARKER did not establish a push verdict — and it names its possible causes WITHOUT asserting one,
+    because the same on-disk state is left by a kill during the push, by a successful push whose later
+    marker write did not land (a full disk — the very state this feature exists for), and by a kill in the
+    rescue that follows the push; it never says "killed mid-push", and never that the commits exist only
+    here, which the same row's own `unpushed=0` would contradict; `not-a-worktree` is not a verdict about any worktree
     (nothing was examined — the cause is the CALLER's pointer, so `next=` names `WIP_PATH=` as the remedy);
     and `rescue=UNAVAILABLE` means the rescuer was not FOUND, so `next=` says to install it rather than
     "re-run bg-rescue-wip.sh", a command that cannot be run. ⛔ **AND THE OTHER DOMAINS' MANUAL FACTS ARE
