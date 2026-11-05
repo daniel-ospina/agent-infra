@@ -612,15 +612,20 @@ grep -qF '[ -n "$_ms" ] && [ -f "$_ms" ]' "$MERGE"; ck $? "…and merge-one.sh t
 # log-only on every lane, fixer and worker with a green suite. So BOTH files are pinned, EACH candidate by
 # its own token, and their candidate COUNTS are required to agree — a removal reddens a token pin, an
 # addition (a one-sided divergence) reddens the count.
-_mp_cand_count() { # _mp_cand_count <file> <start-marker> <end-marker> → `mandate-preflight.sh` tokens in the resolver's CODE
+_mp_cand_count() { # _mp_cand_count <file> <for-line regex> → `mandate-preflight.sh` tokens in the resolver's for-STATEMENT
   # ⛔ PROSE IS NOT A CANDIDATE (measured): the resolver's explanatory comment names `$O/mandate-preflight.sh`, so
   # a whole-region count read 5 for spawn-gate against 4 for merge-one and the arm reddened on a healthy tree.
-  # Comment lines are skipped; only executed lines are counted.
-  awk -v s="$2" -v e="$3" 'index($0,s)==1{f=1} f && $0 ~ /^[[:space:]]*#/ {next} f{n+=gsub(/mandate-preflight\.sh/,"&")} f&&index($0,e)==1{print n; exit}' "$1"
+  # ⛔ AND A COUNT THAT CAN SILENTLY BE EMPTY IS 0==0 (this change's review cycle 3, P1, MEASURED): the previous
+  # version printed only from its END-marker branch, so a renamed start marker yielded `""` for BOTH files and
+  # `[ "" = "" ]` PASSED — the arm said "the resolvers agree" having counted nothing. It also made the two end
+  # markers behave differently: an INDENTED `done` (a purely cosmetic reindent) returned `""` and reddened the
+  # suite on healthy code, while an indented `}` was simply dead. Counting the `for` STATEMENT removes the end
+  # markers altogether: it terminates on its own `do`, and `print n+0` can never emit an empty string.
+  awk -v r="$2" '$0 ~ r {buf=$0; while (buf !~ /do[[:space:]]*$/ && (getline nx) > 0) buf=buf" "nx; n=gsub(/mandate-preflight\.sh/,"&",buf); print n+0; exit}' "$1"
 }
-SP_NCA="$(_mp_cand_count "$SPAWN" 'mandate_preflight_lib() {' '}')"
-M1_NCA="$(_mp_cand_count "$MERGE" 'mandate_sh=""' 'done')"
-[ "$SP_NCA" = "$M1_NCA" ]; ck $? "the two resolvers carry the SAME number of candidates (spawn-gate=$SP_NCA, merge-one=$M1_NCA) — a one-sided addition is a disagreement"
+SP_NCA="$(_mp_cand_count "$SPAWN" '^[[:space:]]*for c in .*mandate-preflight\.sh')"
+M1_NCA="$(_mp_cand_count "$MERGE" '^[[:space:]]*for _ms in .*mandate-preflight\.sh')"
+{ [ -n "$SP_NCA" ] && [ -n "$M1_NCA" ] && [ "$SP_NCA" = "$M1_NCA" ]; }; ck $? "the two resolvers carry the SAME number of candidates (spawn-gate=${SP_NCA:-NOT-FOUND}, merge-one=${M1_NCA:-NOT-FOUND}) — a one-sided addition is a disagreement, and an unmatched list is not agreement"
 for _mf_cand in '${MANDATE_PREFLIGHT_SH:-}' '$O/mandate-preflight.sh' '$_M1_HERE/mandate-preflight.sh' \
                 '${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh' \
                 '${HOME:-}/.pi/agent/scripts/mandate-preflight.sh'; do
@@ -635,13 +640,21 @@ done
 # MEASURED): replacing EITHER `else` body below with `:` left the suite at 110 passed, 0 failed, while
 # nothing at all was written — the silence #3377 exists to end. These are SOURCE pins, the same stated
 # limit §E5 carries for the delegate, because the branch is only reachable with the helper absent.
-grep -qF '[mandate-preflight] CANNOT VERIFY' "$SPAWN"; ck $? "spawn-gate.sh still says CANNOT VERIFY when the helper is absent or unusable (deleting that notice restores the silence)"
-grep -qF '[mandate-preflight] CANNOT VERIFY' "$MERGE"; ck $? "…and merge-one.sh says it too (the reviewer seam has no other notice on that path)"
-# merge-one's BRIEF append is a SOURCE pin for §E5's stated reason (its `run_agent` needs a PR, a chain
-# context and a merge queue, so its behaviour cannot be driven here) — but it is pinned to text ONLY the
-# append carries: deleting the append leaves the echo (and any grep for the notice) green, measured at
-# 120 passed, 0 failed before this arm existed. `is not available to this spawn` appears nowhere else.
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$SPAWN"; ck $? "spawn-gate.sh still says CANNOT VERIFY at all on the degraded branch"
+grep -qF 'Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh' "$SPAWN"; ck $? "…and the OPERATOR-LOG line survives with its remedy (a bare grep for the notice was satisfied by the BRIEF append 16 lines below, measured 121/0 with this line deleted)"
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$MERGE"; ck $? "merge-one.sh still says CANNOT VERIFY at all on the degraded branch"
+grep -qF 'orders a reviewer to read exist (#3377). Proceeding: a helper that cannot run is not a reading about the box' "$MERGE"; ck $? "…and the reviewer seam's OPERATOR-LOG line survives too (its parenthetical claim that 'no other notice' exists on that path was inverted — the brief append satisfied the bare grep)"
+# merge-one's BRIEF APPEND and its IDEMPOTENCE GUARD are both SOURCE pins for §E5's stated reason (its
+# `run_agent` needs a PR, a chain context and a merge queue, so its behaviour cannot be driven here). Each
+# is pinned to text ONLY that line carries, because a bare grep for the notice was satisfied by the OTHER
+# line in the same branch — measured green with the line deleted either way.
+# ⛔ THE GUARD IS THE WHOLE POINT (this change's review cycle 3, P1, MEASURED): without it the seam appends
+# one notice PER DISPATCH (measured 2 on two dispatches against 1 on the real tree), i.e. the unbounded
+# brief growth the emit's own guard exists to prevent, re-opened on the branch every un-provisioned box
+# takes. Deleting it left 121 passed, 0 failed.
 grep -qF 'is not available to this spawn' "$MERGE"; ck $? "merge-one.sh APPENDS the notice to the brief, not only to the log (source pin, §E5's limit)"
+grep -qF 'grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null ||' "$MERGE"; ck $? "…and that append is IDEMPOTENT (its guard is pinned; without it a degraded box grows the brief per dispatch)"
+grep -qF 'grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null ||' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too (same guard; deleting it left the suite green)"
 # ⛔ THE LOG IS NOT THE LANE, AND THAT WAS THE ACTUAL HOLE (this change's review cycle 2, P1, MEASURED):
 # the notice above went to `$log` ONLY, so on a box that has not received the helper the LANE was told
 # nothing — #3377 exactly, on the population #3377 measured — and replacing BOTH notices with `:` left the
@@ -658,6 +671,19 @@ PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran5.log" O="$TMP/O" CELL_HOME="$TMP/home2
   _ "$SPAWN" "$FIXREPO" "$TMP/seam5.log" "$BRIEF5" >/dev/null 2>&1
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$BRIEF5"; ck $? "an UNRESOLVABLE helper still tells the LANE it cannot verify (#3377's own population: a box without the helper)"
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$TMP/pi-ran5.log" 2>/dev/null; ck $? "…and the line is in the ARGV the agent was launched with, not only in a log the lane never reads"
+# ⛔ ONE NOTICE PER DISPATCH, NOT ONE PER ATTEMPT (this change's review cycle 3, P1, MEASURED): the suite
+# drove this branch ONCE, so no arm could see a second append — deleting the idempotence guard left 121
+# passed, 0 failed while a degraded box grew its brief by a line per dispatch (measured 2 notices after two
+# dispatches, against 1 on the real tree). A re-dispatch is the normal case (the stale-worker reaper retries),
+# so this is measured, not hypothetical: drive it a SECOND time and require exactly one notice.
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran5.log" O="$TMP/O" CELL_HOME="$TMP/home2" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; mandate_preflight_lib() { return 1; }; cd "$2" || exit 2; run_agent 5 "$3" "$4" nohelper' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam5.log" "$BRIEF5" >/dev/null 2>&1
+NONCE_COUNT="$(grep -cF '[mandate-preflight] CANNOT VERIFY' "$BRIEF5")"
+[ "$NONCE_COUNT" = "1" ]; ck $? "a SECOND dispatch does NOT append a second notice (measured $NONCE_COUNT; without the guard the brief grows per dispatch)"
 # The emit itself must be non-fatal on every branch.
 if awk '/^mandate_preflight_emit\(\)/,/^}/' "$HELPER" | grep -qE '\breturn [1-9]'; then
   bad "mandate_preflight_emit returns non-zero on some branch — callers would treat a disclosure as a refusal"
@@ -685,7 +711,15 @@ DEF_COUNT="$(grep -c '^mandate_files() {' "$HELPER")"
 # `grep -qF 'mandate-preflight.sh'` matched install.sh's own COMMENTS, so deleting it from the `for f in …`
 # drift list still left the arm green — a `$O` losing the helper would go unreported. Pin the LIST line.
 grep -qE '^for f in .*mandate-preflight\.sh' "$HERE/install.sh" 2>/dev/null; ck $? "install.sh names it in the DRIFT LIST ITSELF, not merely in its comments (a \$O missing it is reported)"
-grep -qF 'mandate-preflight.sh' "$HERE/check-single-source.sh" 2>/dev/null; ck $? "check-single-source.sh names it in EXECUTED (presence-required)"
+# ⛔ MEMBERSHIP IN THE LIST, NOT PRESENCE IN THE FILE (this change's review cycle 3, P1, MEASURED): a bare
+# `grep -qF 'mandate-preflight.sh'` was satisfied by a COMMENT, so moving the name out of EXECUTED into prose
+# left 121 passed, 0 failed — the same defect this commit fixed for `install.sh` on the line above. The value
+# is extracted and tested as a WORD, so neither a comment nor a substring (`my-mandate-preflight.sh`) passes.
+_CSS_EXECUTED="$(sed -nE 's/^EXECUTED="([^"]*)".*/\1/p' "$HERE/check-single-source.sh" 2>/dev/null)"
+case " $_CSS_EXECUTED " in
+  *' mandate-preflight.sh '*) ok "check-single-source.sh names it in the EXECUTED list itself, not merely in its comments (a \$O missing it is reported)" ;;
+  *) bad "check-single-source.sh does NOT name mandate-preflight.sh in EXECUTED — a \$O that lost the helper would go unreported" ;;
+esac
 
 echo
 printf 'mandate-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
