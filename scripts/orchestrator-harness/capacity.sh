@@ -1564,7 +1564,18 @@ cap_expected_boxes() {
           *:*) label="${tok%%:*}"; bid="${tok#*:}" ;;
           *)   label="$tok";        bid="$tok" ;;
         esac
+        # ⛔ THE LABEL IS DISPLAY-ONLY AND IS EMITTED AS ONE TOKEN TOO (fresh review round 14, P2).
+        # The line prints the missing boxes as `(label, label)` and the stale ones as `stale=(label)`,
+        # so a label carrying the LIST (comma) or PAREN characters corrupts the field it is printed
+        # into. `cap_ref_token` is the same sanitiser the KEY has been through since this function was
+        # written; applying it here makes "one token per field" true of the whole line.
+        # ⛔ AND A ROSTER ROW CANNOT CARRY A SPACE AT ALL: `$CAP_EXPECTED_BOXES` is split on commas AND
+        # whitespace (it is a plist seam), so `pi cell 1:10.0.0.1` IS three rows and reads as
+        # `expected=3 … (pi, cell)` — a malformed seam, not a lost label. That is why the
+        # one-token guarantee is enforced on the PROVIDER listing (whose names arrive as JSON fields,
+        # where a space is representable) and stated as a seam rule here.
         [ -n "$label" ] || label="$bid"
+        label="$(cap_ref_token "$label")"; [ -n "$label" ] || label="$bid"
         bid="$(cap_ref_token "$bid")"
         printf '%s %s\n' "$label" "${bid:--}"
         seen=$((seen + 1))
@@ -1660,21 +1671,24 @@ cap_fleet_line_from() {
     while IFS= read -r rec; do
       [ -n "${rec:-}" ] || continue
       # ⛔ A RECORD THE LINE CANNOT VALIDATE IS NOT "THIS BOX IS NOT PUBLISHING" (fresh review round
-      # 12, P2). Every field is checked by `cap_valid_base_record`, and `cap_place` REFUSES the same
-      # bytes (`bound=probe_unreadable`) — but this loop DROPPED the record and then reported the box as
-      # INELIGIBLE: MEASURED `fleet: expected=1 published=0 INELIGIBLE=1 (cell-1)` rc 0 ("both sides
-      # known and attributable") from a record `cap_place` refuses, sending the operator to restart a
-      # controller whose record is merely malformed. Same shape, same answer as the `collide=1` arm
-      # below: the line and placement must not disagree about who is visible.
+      # 12, P2). Every field is checked by `cap_valid_base_record`, and `cap_place` REFUSES a record it
+      # cannot place — but this loop DROPPED such a record and then reported the box as INELIGIBLE:
+      # MEASURED `fleet: expected=1 published=0 INELIGIBLE=1 (cell-1)` rc 0 ("both sides known and
+      # attributable") from a record `cap_place` answers `bound=probe_unreadable` on, sending the
+      # operator to restart a controller whose record is merely malformed. The line must not CERTIFY A
+      # MEMBERSHIP placement refuses; it refuses the published reading and names the reason instead.
+      # (Conservative in one direction: placement still evaluates the records it CAN read, so a single
+      # malformed peer blanks the line while placement keeps placing on the others — the safe direction,
+      # and the line says why.)
       if ! cap_valid_base_record "$rec"; then unk_pub=1; why="${why:-record-unreadable}"; break; fi
       bid="$(cap_kv "$rec" boxid)"
       # ⛔ A RECORD WITH NO ATTRIBUTABLE KEY IS NOT "THIS BOX IS NOT PUBLISHING" EITHER (fresh review
       # round 13, P2 — the same class one `continue` further in). An older peer's record carries no
-      # `boxid` (a pre-#2707 writer; `cap_parse_lsremote` passes it through) and `cap_place` REFUSES
-      # those bytes (`bound=box_unknown`) — while this loop dropped the record and the line asserted
+      # `boxid` (a pre-#2707 writer; `cap_parse_lsremote` passes it through) and `cap_place` REFUSES it
+      # (`bound=box_unknown`) — while this loop dropped the record and the line asserted
       # `published=0 INELIGIBLE=1 (cell-1)` rc 0, i.e. a membership claim and "both sides attributable"
-      # about a record whose owner cannot be named. The line must not disagree with placement about who
-      # is visible, so an unattributable record refuses the reading and says why.
+      # about a record whose owner cannot be named. The line must not certify a membership placement
+      # refuses, so an unattributable record refuses the reading and says why.
       if ! cap_boxid_ok "$bid"; then unk_pub=1; why="${why:-box-unreadable}"; break; fi
       # ⛔ A COLLIDED KEY IS NOT A PUBLISHED BOX (fresh review round 5, P1). `cap_parse_lsremote` marks
       # such a record (`collide=1`, `capacity.sh:cap_parse_lsremote`) and `cap_place` refuses the WHOLE
@@ -1685,10 +1699,12 @@ cap_fleet_line_from() {
       # bytes. The line and placement must not disagree about who is visible.
       if [ "$(cap_kv "$rec" collide)" = "1" ]; then unk_pub=1; why="${why:-identity-collision}"; break; fi
       at="$(cap_kv "$rec" at)"
-      # …and the same for a stamp the age cannot be computed from: `cap_bound_hit` answers
-      # `probe_unreadable` for it (see its own `at` guard), so a silent drop here is the same
-      # disagreement, one field further in.
-      case "$at" in ''|*[!0-9]*) unk_pub=1; why="${why:-record-unreadable}"; break ;; esac
+      # ⛔ NO GUARD HERE, DELIBERATELY: `cap_valid_base_record` above already requires every numeric
+      # field (including `at`) to be digits and at most 12 long, so the age below cannot abort on a
+      # non-digit or wrap on an oversized stamp. (Fresh review round 14 found the arm that used to sit
+      # here INERT — reverting it changed no reading, because that predicate had already closed the
+      # hole; an arm that can never fire is the "inert enforcer" this file keeps erasing.) Keep the
+      # guarantee where it is MADE, not a second copy of it that can drift.
       # ⛔ `10#`: a leading-zero `at` (`08`) is CHANNEL-LEGAL and makes plain arithmetic ABORT the whole
       # function — no line printed, against a documented contract that says one is printed in every case
       # (fresh review round 6, P1; measured end-to-end: `capacity.sh: line 1500: 08: value too great for

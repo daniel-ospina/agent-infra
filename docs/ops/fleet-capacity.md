@@ -492,9 +492,12 @@ and still clamps to "just published".
   (`pi cell 1`) was read as `label=pi`, `bid=cell 1 10.0.0.1` — measured `expected=1 published=1
   INELIGIBLE=1 (pi)` rc 0: a phantom box named as missing, the real box published beside it, and the
   line's own `published − extra = expected − INELIGIBLE` invariant broken by a display-only label. The
-  label is normalised to the token charset (the one `cap_ref_token` applies to a roster row); an
-  ADDRESS carrying whitespace is refused with the listing, because it is the join key and a key that
-  cannot be one token can never match a published record. The **collision compare keeps the raw name**:
+  label is normalised to the token charset (`cap_ref_token`, the same sanitiser a roster row's key and
+  label go through); an ADDRESS carrying whitespace is refused with the listing, because it is the
+  join key and a key that cannot be one token can never match a published record. A roster row cannot
+  carry a space at all — `CAP_EXPECTED_BOXES` is split on commas AND whitespace, so `pi cell
+  1:10.0.0.1` is three rows and reads `expected=3 … (pi, cell)`; that is a malformed seam, not a lost
+  label. The **collision compare keeps the raw name**:
   normalising it first made `pi cell 2` and `pi_cell_2` compare equal, so two distinct machines behind
   one address collapsed into one expected entry — the exact false PASS the duplicate-address gate
   (`DUPLICATEKEY`) exists to stop, and one this change briefly re-opened.

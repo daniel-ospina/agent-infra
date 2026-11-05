@@ -2153,6 +2153,21 @@ ck "  …the mutant really lost the label normalisation" "$([ "$(grep -c 'MUTANT
 L47M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $_INVSP" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-rawlabel.sh" "$(recb 10.8.0.1 "$NOW")" 2>/dev/null)"
 ck "  …mutation control: without it the same listing reads INELIGIBLE=1 naming 'pi' ($L47M)" \
    "$(qF 'INELIGIBLE=1' "$L47M" && qF '(pi)' "$L47M" && echo 0 || echo 1)"
+# (c28) ⛔ A LABEL IS DISPLAY-ONLY, AND IT IS PRINTED INTO A LIST (fresh review round 14, P2). The line
+# prints the missing boxes as `(label, label)`, so a label carrying the LIST or PAREN characters corrupts
+# the field it lands in. `cap_ref_token` sanitised the KEY already; the LABEL now goes through the same
+# one, so "one token per field" is true of the whole line. (The inventory side of the same contract is
+# (c24). A roster ROW still cannot carry a space — the seam is split on commas AND whitespace — so this
+# arm grades the punctuation class, which IS reachable from a roster.)
+L51="$(CAP_EXPECTED_BOXES="c(1):10.8.0.5,c[2]:10.8.0.6" cap_fleet_line_from "$(recb 10.8.0.7 "$NOW")" 0)"; RC=$?
+ck "(c28) a roster label carrying punctuation is emitted as ONE token, never splitting the (names) list ($L51)" \
+   "$([ "$RC" -eq 0 ] && qF 'INELIGIBLE=2' "$L51" && qF '(c1, c2)' "$L51" && echo 0 || echo 1)"
+# (c28-mutant) NON-VACUITY: drop the label sanitiser and the list is corrupted by the label itself.
+sed 's@label="$(cap_ref_token "$label")"@:   # MUTANT: no label token@' "$CAP" > "$TMP/cap-rawlab2.sh"
+ck "  …the mutant really lost the roster label sanitiser" "$([ "$(grep -c 'MUTANT: no label token' "$TMP/cap-rawlab2.sh")" -eq 1 ] && echo 0 || echo 1)"
+L51M="$(CAP_EXPECTED_BOXES="c(1):10.8.0.5,c[2]:10.8.0.6" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-rawlab2.sh" "$(recb 10.8.0.7 "$NOW")" 2>/dev/null)"
+ck "  …mutation control: without it the (names) list carries the raw label ($L51M)" \
+   "$(qF '(c(1), c[2])' "$L51M" && echo 0 || echo 1)"
 # (c25) ⛔ AN ADDRESS IS THE JOIN KEY AND MAY NOT CARRY WHITESPACE (fresh review round 12, P2). A value
 # that cannot be one token cannot match any published record, so the OBJECT is unclassifiable and the
 # whole listing refuses — never a key that silently never joins.
