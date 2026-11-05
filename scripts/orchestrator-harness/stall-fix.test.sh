@@ -471,12 +471,13 @@ echo "── §F the age's PROVENANCE reaches both sinks this script owns ──
 #
 # ⛔ THIS BLOCK PINS THE CONSUMER ONLY — THE PRODUCER IS PINNED IN `pr-dispatch.test.sh` (fresh-context
 # review of #3380, 2026-11-05, P2). `_AGESRC` is supplied by these legs and `f1` relies on the
-# `:-measured` default, so on its own this block cannot see the OTHER half of the interface: delete
+# `-measured` default, so on its own this block cannot see the OTHER half of the interface: delete
 # `_AGESRC="${_agesrc:-measured}"` from `orch-loop.sh`'s call and this suite stays green while every
 # real dispatch falls back to `measured` — the #3181 P1, restored, with nothing red. The legs there
 # record the provenance the fixer was actually HANDED (`1|measured`, `1|synth`, `1|unmeasured`), so an
-# interface is now pinned at both ends; this note says which end lives where so neither reads as
-# covering the whole handoff.
+# interface is now pinned at both ends. One caveat a maintainer must not have to discover: the
+# `unmeasured` producer leg needs an unreadable-but-writable `state/`, so it is reported
+# UNPROVEN-ON(root) rather than counted there — on a root host only two of the three are pinned.
 #
 # ⛔ THIS NOTE CITES CODE BY NAME, NEVER BY LINE NUMBER (review cycles 2 and 3 of #3181, 2026-11-03).
 # Two cycles in a row found a pointer here that had silently gone stale: every edit ABOVE a cited line
@@ -530,6 +531,19 @@ OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIF
 case "$(brief_of "$D")" in *"no PR merged in an UNMEASURED number of minutes"*) ck 0 "unrecognised: the brief does NOT claim a measurement it was never given" ;; *) ck 1 "unrecognised: the brief does NOT claim a measurement it was never given: $(brief_of "$D" | head -20 | tail -6)" ;; esac
 case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and the durable row does not assert agesrc=measured for a value it did not understand: $(ledger_of "$D")" ;; *) ck 0 "…and the durable row does not assert agesrc=measured for a value it did not understand" ;; esac
 case "$(ledger_of "$D")" in *"agesrc=unmeasured"*) ck 0 "…it degrades to agesrc=unmeasured (the value that says no reading was taken)" ;; *) ck 1 "…it degrades to agesrc=unmeasured (the value that says no reading was taken): $(ledger_of "$D")" ;; esac
+
+# ⛔ A PRESENT-BUT-**EMPTY** VALUE IS NOT AN ABSENT ONE (review cycle 3 of #3380, 2026-11-05, P3).
+# `:-measured` substitutes on empty as well as unset, so `_AGESRC=` — the "typo'd caller" shape the
+# `*)` arm exists for — was read as `measured` and put "no PR merged in 90 minutes" in the premise and
+# `agesrc=measured` in the ledger, byte-identical to an unset variable. The default is `-measured`, so
+# only an ABSENT variable keeps its old shape; a caller that supplied an empty value is a caller this
+# script did not understand, and that degrades like any other unrecognised value. Set the default back
+# to `:-measured` and this leg reddens.
+D="$(new_o f5)"; stub "$D" "$STUB_OK_TOUCH"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       _AGESRC= bash "$SH" 3 90 2>&1)"
+case "$(brief_of "$D")" in *"no PR merged in an UNMEASURED number of minutes"*) ck 0 "empty: a PRESENT-BUT-EMPTY provenance is NOT read as the default measurement" ;; *) ck 1 "empty: a PRESENT-BUT-EMPTY provenance is NOT read as the default measurement: $(brief_of "$D" | head -20 | tail -6)" ;; esac
+case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and the ledger row does not claim a measurement for an empty value: $(ledger_of "$D")" ;; *) ck 0 "…and the ledger row does not claim a measurement for an empty value" ;; esac
 
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
