@@ -3958,8 +3958,13 @@ queue_order_from_pool() {
   # polarity is closed at both ends; with zero seeds it was closed only for a field that ARRIVES malformed,
   # not for a count that never arrives at all. Reachable because a CONCURRENT pass deletes this file at
   # its own entry (`rm -f "$o/.queue-rank"`), and two passes can overlap.
+  # ⛔ A FAILED REDIRECTION IS REPORTED BY THE SHELL, NOT BY THE COMMAND (review P3, cycle 10): `read … <
+  # "$o/.queue-rank" 2>/dev/null` still prints `…: No such file or directory` on STDERR, because the
+  # redirection is set up before `read` runs and read's own `2>/dev/null` never applies. That line lands in
+  # the controller log directly above a message trying to explain the state honestly, and it reads like a
+  # failure. The `[ -r ]` test is the guard, not a cosmetic — this file's own siblings do the same.
   _r=""; _u=""; _h=""
-  read -r _r _u _h < "$o/.queue-rank" 2>/dev/null || true
+  [ -r "$o/.queue-rank" ] && read -r _r _u _h < "$o/.queue-rank" 2>/dev/null
   # ⛔ AN UNREADABLE COUNT IS UNKNOWN, NOT ZERO — even here (review P2, cycle 4). Coercing a bad field
   # to 0 landed the state in the EMPTY arm below, which is the very "a drained queue" claim that
   # `rank_queue_by_pool` now refuses a reorder to make (it validates the count's FORMAT before
@@ -3969,6 +3974,15 @@ queue_order_from_pool() {
   case "${_r:-}" in ''|*[!0-9]*) _r="" ;; esac
   case "${_u:-}" in ''|*[!0-9]*) _u="" ;; esac
   case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
+  # ⛔ WHETHER THE BYTES MOVED IS REPORTED, NOT TYPED (review P3, cycle 10). Every arm below runs after EITHER
+  # the `mv` OR the byte-identical `cmp` branch, so "INSTALLED" is false half the time — and the ranked-none
+  # arm forty lines up already uses `_wrote` for exactly this reason ("whether the bytes moved is reported,
+  # not assumed"). One sentence, decided by the write that actually happened.
+  if [ "${_wrote:-0}" -eq 1 ]; then
+    _inst_said="the reorder was DERIVED AND INSTALLED"
+  else
+    _inst_said="the reorder was DERIVED and the queue already held exactly those bytes (nothing was written)"
+  fi
   if [ -z "$_r" ] || [ -z "$_u" ]; then
     # ⛔ THE ORDER WAS DERIVED AND INSTALLED — ONLY THE COUNTS ARE UNKNOWN (review P2, cycle 10). This arm
     # said `priority-unreadable`, whose word for the ORDER is "UNVERIFIED (whatever the PREVIOUS pass
@@ -3977,11 +3991,23 @@ queue_order_from_pool() {
     # "did not re-derive the ORDER", and the skip arm quoted the latter into `why=` — the field that
     # outlives the log. Two states, two words.
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: severity-first from the pool — the reorder was DERIVED AND INSTALLED, but its COUNT could not be read back from $o/.queue-rank, so how many rows the pool ranked is UNKNOWN (this is NOT a drained queue, and the order is THIS pass's, not the previous pass's)"
+    echo "[refresh] queue order: severity-first from the pool — $_inst_said, but its COUNT could not be read back from $o/.queue-rank, so how many rows the pool ranked is UNKNOWN (this is NOT a drained queue, and the order is THIS pass's, not the previous pass's)"
     rm -f "$o/.queue-rank" 2>/dev/null
     return 0
   fi
   rm -f "$o/.queue-rank" 2>/dev/null
+  # ⛔ THE TOTALS MUST ADD UP TO THE QUEUE (review P3, cycle 10). The head cross-check below catches a count
+  # naming another queue's head, but a foreign count that happens to SHARE the head (the prune case this
+  # file models 40 lines up) passed its TOTALS through — publishing another queue's `N pool-ranked` and,
+  # worse, silencing the unranked-tail WARN when the foreign `_u` was 0. The ranker's count covers exactly
+  # the rows it emitted, so `_r + _u` IS this file's depth; a mismatch means the count is not this queue's.
+  _rows_now="$(awk 'END{print NR+0}' "$o/candidates.txt" 2>/dev/null)"
+  case "${_rows_now:-}" in ''|*[!0-9]*) _rows_now="" ;; esac
+  if [ -z "$_rows_now" ] || [ $(( _r + _u )) -ne "$_rows_now" ]; then
+    QUEUE_ORDER_STATE="severity-uncounted"
+    echo "[refresh] queue order: severity-first from the pool — $_inst_said, but the count read back from $o/.queue-rank ($_r ranked + $_u unranked) does not add up to the queue's ${_rows_now:-UNREADABLE} row(s), so it is NOT this queue's count and the totals are UNKNOWN (this is NOT a drained queue)"
+    return 0
+  fi
   if [ "$_r" -eq 0 ] && [ "$_u" -eq 0 ]; then
     # Nothing queued at all: a drained queue, not a blind one. ⛔ AND THE CLAIM IS GROUNDED IN THE ARTEFACT,
     # NOT IN THE COUNT ALONE (review P2, cycle 10). The count path is SHARED: a concurrent pass reaching
@@ -3991,7 +4017,7 @@ queue_order_from_pool() {
     # installed stands, and the counts are UNKNOWN.
     if [ -s "$o/candidates.txt" ]; then
       QUEUE_ORDER_STATE="severity-uncounted"
-      echo "[refresh] queue order: severity-first from the pool — the reorder was DERIVED AND INSTALLED, but the count read back from $o/.queue-rank says 0 queued while candidates.txt holds $(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ') row(s), so that count is NOT this queue's (a concurrent pass wrote its own) and how many rows the pool ranked is UNKNOWN (this is NOT a drained queue)"
+      echo "[refresh] queue order: severity-first from the pool — $_inst_said, but the count read back from $o/.queue-rank says 0 queued while candidates.txt holds $(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ') row(s), so that count is NOT this queue's (a concurrent pass wrote its own) and how many rows the pool ranked is UNKNOWN (this is NOT a drained queue)"
       return 0
     fi
     QUEUE_ORDER_STATE="empty"
@@ -4004,7 +4030,7 @@ queue_order_from_pool() {
   _head_now="$(head -1 "$o/candidates.txt" 2>/dev/null || true)"
   if [ -n "$_h" ] && [ "$_h" != "$_head_now" ]; then
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: severity-first from the pool — the reorder was DERIVED AND INSTALLED, but the count read back from $o/.queue-rank names head #$_h while candidates.txt's head is #${_head_now:-none}, so that count is NOT this queue's and how many rows the pool ranked is UNKNOWN"
+    echo "[refresh] queue order: severity-first from the pool — $_inst_said, but the count read back from $o/.queue-rank names head #$_h while candidates.txt's head is #${_head_now:-none}, so that count is NOT this queue's and how many rows the pool ranked is UNKNOWN"
     return 0
   fi
   if [ -n "$_h" ]; then
@@ -5931,6 +5957,12 @@ if [ -n "$_head_issue" ]; then
     # top-ranked one, not the oldest), and the ranked-none arm keeps the queue's pre-existing order,
     # whose head is not the arrival-oldest either. Say where the row is, not how old it is.
     empty)    _head_rank="the entry at the head of the queue — the reorder ranked NOTHING (it read an empty queue) and yet a row is here, so writer and reader disagree: treat this row as UNRANKED with severity UNKNOWN, not as ranked by anything" ;;
+    # ⛔ THE THIRD STATE NEEDS ITS OWN WORDS (review P2, cycle 10). `severity-uncounted` fell into the `*` arm
+    # below, which says "this pass established NO priority order" — the OPPOSITE of the truth: the reorder
+    # was derived and is on disk, and this head IS the highest-ranked CLEAN entry. That sentence becomes
+    # `handed_why=` in `state/refresh-last`, so the durable record contradicted the log line printed two
+    # lines above it. The same conflation the writer fixed, one layer out.
+    severity-uncounted) _head_rank="the highest-ranked CLEAN entry in the pool-ordered queue this pass derived — how many rows it ranked is UNKNOWN (the count could not be read back), so read the ROW as ranked and the TOTALS as unknown" ;;
     *)        _head_rank="the entry at the head of the queue — priority-unreadable: this pass established NO priority order for the queue, so neither its severity nor its age rank is known, and it is not a priority decision" ;;
   esac
   case " ${QUEUED_THIS_PASS:-}" in
