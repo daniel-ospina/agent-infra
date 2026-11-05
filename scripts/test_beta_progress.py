@@ -1935,6 +1935,35 @@ def test_the_rest_read_refuses_a_falsy_repo_instead_of_substituting_the_tracker(
     assert "/repos/%s/pulls" % bp.REPO in urls[0]
 
 
+# ── a cover that lives ONLY in a branch name, which nothing else exercised ────
+def test_a_number_that_appears_ONLY_in_the_fix_repo_branch_is_a_cover(monkeypatch, no_cache):
+    """⛔ THE `headRefName` HALF OF `covered()` WAS PINNED BY NO TEST (#3457 review round 19).
+
+    Mutating `covered()` to search `title` only left the whole suite GREEN, because every fixture
+    that cites a tracker unit in a fix-repo row carried the number in BOTH fields — so no
+    assertion could say which one produced the cover, and the branch half could be deleted in
+    silence. That is the wrong half to be blind to: this section's own measured collision list is
+    BRANCH citations (`fix/10114-pin-tree-is-a-holder`, `fix/10951-pool-filter`), i.e. exactly the
+    shape nothing exercised on its own.
+
+    Here the TITLE carries no number at all, so `with_pr` can only come from `headRefName`.
+    """
+    _gh_by_repo(
+        monkeypatch,
+        tracker_open=[pr(900)],
+        tracker_merged=[],
+        other_open=[pr(3368, ref="fix/10114-pin-tree-is-a-holder",
+                        title="fix(reaper): the harness PIN TREE is a holder, not residue")])
+    # Same reason as the test above: a forced-REST mutant must not reach api.github.com.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "the branch carries `10114` and the title does NOT — a cover visible only through "
+        "`headRefName` must still count, or every `fix/<n>-…` PR is invisible to the gap count")
+
+
 # ── the `merged_today` day boundary: `>=`, and the suite was blind to it ──────
 def test_merged_today_counts_a_pr_merged_at_exactly_midnight_utc(monkeypatch):
     """⛔ THE DAY BOUNDARY IS `>=`, AND THE WHOLE SUITE WAS BLIND TO IT (#3457 review round 16).
