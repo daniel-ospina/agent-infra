@@ -834,8 +834,17 @@ else
     # nothing to read, so it waits out its 90 minutes holding the cross-box claim while every peer's
     # pre-flight sees COLLISION (the R8 defect the record exists to remove). `capability` writes one for
     # exactly this reason; the words below say what the stand-down buys, the way `land`/`skew` do.
+    # ⛔ THE SENTENCE FOLLOWS THE REASON (round 22, P2, measured): a `store-invalid`/`auth-store-unreadable` refusal is a
+    # verdict about `auth.json`, and telling the operator to "put the credential in the environment" sends them to the
+    # one thing the refusal already measured as NOT the problem (`export $VAR` does not rescue either shape).
+    case "${KEY_GATE_REASON:-credential-missing}" in
+      store-invalid|auth-store-unreadable)
+        KEY_GATE_REMEDY="a property of THIS box's credential STORE — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-<agent dir>}/auth.json, which pi reads before anything else, and neither exporting the variable nor a models.json template rescues it; repair or delete that file" ;;
+      *)
+        KEY_GATE_REMEDY="a property of THIS box — the [key-gate] lines above name the variable and every candidate file. The remedy HERE is to put the credential in the environment lanes run with" ;;
+    esac
     if lane_standdown_write key "$CAPACITY_YIELD_SECS"; then
-      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=key) — the credential is a property of THIS box, so chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min and a peer that has the key can claim it; this box will not re-win it while the yield is live. The remedy HERE is to put the credential in the environment lanes run with (the [key-gate] lines above name the variable and every candidate file)." >> "$O/logs/lane-$N.log"
+      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=key) — the credential is ${KEY_GATE_REMEDY}." >> "$O/logs/lane-$N.log"
     else
       echo "[lane $N] WARN: could not write $capacity_record — the refusal still releases the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
     fi
