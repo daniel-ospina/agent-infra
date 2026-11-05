@@ -538,7 +538,14 @@ headroom.
     the class blaming someone else for the deletion it had just performed. The sentence is now gated on
     the owner ANSWERING (`HAVE_RW_REAPED`), and an unanswered ledger reports the delta as
     **MAY BE ITS OWN (unattributed)**, never as proof that another process caused it, while
-    `reaped_runner_work=?` tells a reader the removal count is not a measurement.
+    `reaped_runner_work=?` tells a reader the removal count is not a measurement. ⛔ **AND THE BYTES ARE
+    `unmeasured` TOO, not a measured `0 MB`** (#3057 review): `freed_mb_runner_work=unmeasured`, with
+    `freed_mb_unmeasured` naming `runner-work`, because the under-reclaim sum and the pass total read that
+    field and a stub that deleted 40 MB reported a *confident* zero there while the note admitted the
+    figure was unknown — the note being the only surface that said so is the same "measured zero that is
+    not a measurement" this class's `?` polarity exists to remove. The class line names the MISSING
+    LEDGER as the cause (`df ANSWERED, but the owner never did`), not "df could not answer", which would
+    point an operator at the wrong component.
   * **Without `gone=`, an EMPTY sink and a VANISHED one were the same record.** The owner counts a
     disappeared entry/root into `gone=` and feeds it into its census decision, and cases **(s)**/**(t)**
     exist to keep that out of `unmeasurable=` — a gone root is a fact about the box, not a doubt about

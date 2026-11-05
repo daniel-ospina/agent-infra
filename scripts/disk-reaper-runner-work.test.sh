@@ -1033,6 +1033,17 @@ case_v() { # <entry-point> <owner>
                "v1 … the record answers reaped_runner_work=? — a DELETE the owner never answered is not a measured 0"
     case_check "$(grep -qF 'CUT SHORT' <<<"$st" && echo 0 || echo 1)" \
                "v1 … and the note NAMES the cut, so an operator is told the removal count is unknown"
+    # ⛔ THE BYTES ARE UNATTRIBUTABLE TOO — `reaped_runner_work=?` ALONE WAS NOT ENOUGH (#3057 review, P2).
+    # The arm published `freed=0` under `DF_RW_OK=$MEASURED`, so the record read `freed_mb_runner_work=0` —
+    # a MEASURED zero — for a sweep that really did delete an entry whose `df` delta may well be its own,
+    # and `freed_mb_unmeasured` (which the pass total and the under-reclaim sum read) stayed EMPTY. The
+    # note was the only surface admitting the figure was unknown, and a reader of `freed_mb*` never sees it.
+    case_check "$(grep -q '^freed_mb_runner_work=unmeasured$' <<<"$st" && echo 0 || echo 1)" \
+               "v1 … and the BYTES are unmeasured, not a measured 0MB, for a deletion the owner never answered (freed_mb_runner_work=$(sed -n 's/^freed_mb_runner_work=//p' <<<"$st"))"
+    case_check "$(grep -qE '^freed_mb_unmeasured=.*runner-work' <<<"$st" && echo 0 || echo 1)" \
+               "v1 … and the pass total NAMES it, so no reader and no under-reclaim sum inherits a fabricated zero"
+    case_check "$(grep -qF 'NOT ATTRIBUTABLE' <<<"$out" && echo 0 || echo 1)" \
+               "v1 … and the class line blames the MISSING LEDGER, not 'df could not answer' — a false cause with a wasted remedy"
     case_check "$(grep -qF 'belongs to another process' <<<"$st" && echo 1 || echo 0)" \
                "v1 … and it never asserts that the class removed nothing and another process caused the df change"
     # … and the POSITIVE half of that fix, asserted only when there IS a delta to attribute.
