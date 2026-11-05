@@ -2108,6 +2108,28 @@ assert_eq "$(cksum < "$D6/$UNIT_NAME.service")" "$BEFORE_SUM2" "and the artifact
 box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$PCTDIR/inst.sh|" "$D6/$UNIT_NAME.service"
 OUT="$(run_install Linux "$D6" --install --report-only)"; RC=$?
 assert_eq "$RC" 1 "--install --report-only also refuses a '%' adopted pin"
+# ⛔ AND THE LAUNCHD ARM NEEDS ITS OWN TWIN: reverting the launchd call site alone left the suite fully
+# green, while the behaviour it guards is real on an armed plist (measured: `--install --report-only` over
+# a plist carrying a transient pin exited 0, `changed=1`, writing `--dry-run` over it).
+D8="$T/c67h"; fresh "$D8"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Darwin "$D8" --install >/dev/null 2>&1; ENVV=()
+assert_eq "$(plist_env "$D8/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$PROV3" \
+    "precondition: the launchd fixture carries a pin"
+python3 - "$D8/$LABEL.plist" "$SCRATCH/inst.sh" <<'PYEOF'
+import sys, plistlib
+path, val = sys.argv[1], sys.argv[2]
+d = plistlib.load(open(path, "rb"))
+env = d.get("EnvironmentVariables", {})
+env["RUNNER_AUTOSCALE_PROVISIONER"] = val
+d["EnvironmentVariables"] = env
+plistlib.dump(d, open(path, "wb"))
+PYEOF
+assert_eq "$(plist_env "$D8/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$SCRATCH/inst.sh" \
+    "precondition: the transient pin landed in the PLIST"
+OUT="$(run_install Darwin "$D8" --install --report-only)"; RC=$?
+assert_eq "$RC" 1 "a launchd --install --report-only REFUSES a transient adopted pin (its own call site)"
+assert_contains "$OUT" "TRANSIENT SCRATCH" "with the same message class as the systemd arm"
 
 
 # The launchd arm adopts too, and deleting that call left the suite green — so pin it here.
