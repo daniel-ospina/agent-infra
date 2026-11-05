@@ -711,13 +711,21 @@ ck "N4k the [wip] NOTE abstains for EVERY abstaining push verdict, not just the 
 # Static for the same reason N4k is: driving this NOTE needs a non-fast-forward fixture AND a peer move
 # inside the verify window, and what went stale is the SHAPE of the arm, not the sentence.
 n4m_ok=""
-grep -qE '^        FAILED\)$' <<< "$n4k_body" && n4m_ok="$n4m_ok FAILED-arm"
-grep -q 'branch_on_origin=\$LANE_END_ORIGIN' <<< "$n4k_body" && n4m_ok="$n4m_ok splits-on-origin"
-grep -q 'some OTHER ref was NOT measured' <<< "$n4k_body" && n4m_ok="$n4m_ok abstains"
+# ⛔ AND THE POLARITY, NOT JUST THE SENTENCES (review round 6, P2 — REPRODUCED). Asserting that four
+# STRINGS exist in the function body cannot see the condition they hang off: inverting the guard to
+# `[ -z "${LANE_END_ORIGIN:-}" ]` makes the NOTE print "exist ONLY locally and were NOT pushed" for the
+# different-sha case and "holds that ref at a DIFFERENT sha (branch_on_origin=)" for the empty one —
+# i.e. EXACTLY the defect this arm claims to prevent — and the suite stayed at 222 passed, 0 failed.
+# So the arm is extracted and its test is pinned as a TEST.
+n4m_arm="$(printf '%s\n' "$n4k_body" | awk '/^[[:space:]]*FAILED\)$/{f=1} f{print} f&&/^[[:space:]]*\*\)$/{exit}')"
+[ -n "$n4m_arm" ] && n4m_ok="$n4m_ok FAILED-arm"
+grep -qF 'if [ -n "${LANE_END_ORIGIN:-}" ]; then' <<< "$n4m_arm" && n4m_ok="$n4m_ok polarity"
+grep -q 'branch_on_origin=\$LANE_END_ORIGIN' <<< "$n4m_arm" && n4m_ok="$n4m_ok splits-on-origin"
+grep -q 'some OTHER ref was NOT measured' <<< "$n4m_arm" && n4m_ok="$n4m_ok abstains"
 # control: the honest sentence must still exist for the ref-ABSENT half — deleting the split by deleting
 # the sentence would pass the three greps above.
-grep -q 'branch_on_origin empty' <<< "$n4k_body" && n4m_ok="$n4m_ok keeps-the-absence-half"
-case "$n4m_ok" in *FAILED-arm*splits-on-origin*abstains*keeps-the-absence-half*) rcn4m=0 ;; *) rcn4m=1 ;; esac
+grep -q 'branch_on_origin empty' <<< "$n4m_arm" && n4m_ok="$n4m_ok keeps-the-absence-half"
+case "$n4m_ok" in *FAILED-arm*polarity*splits-on-origin*abstains*keeps-the-absence-half*) rcn4m=0 ;; *) rcn4m=1 ;; esac
 ck "N4m …and the NOTE splits FAILED on what the remote actually holds, rather than re-asserting the absence the [lane-exit] line above declines [$n4m_ok]" $rcn4m
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
@@ -883,23 +891,41 @@ n14_scan() { # n14_scan <gate-file> -> "<network> <local-config> <at-bound-posit
       print line; line = ""
     }' "$1" 2>/dev/null)
   segs=$(printf '%s\n' "$j" | sed 's/&&/\n/g; s/||/\n/g; s/;/\n/g; s/|/\n/g')
-  n=$(printf '%s\n' "$segs" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | wc -l | tr -d ' ')
+  # ⛔ THE VERB IS MATCHED AT COMMAND POSITION, NOT AS ANY SUBSTRING (review round 6, P1 — REPRODUCED).
+  # The old test was `…\b(push|fetch|ls-remote)\b` MINUS `grep -v 'remote get-url'`, and that exclusion was
+  # a whole-SEGMENT substring drop: any segment merely MENTIONING `remote get-url` vanished from both the
+  # network count and the unbounded count. Measured by injecting
+  #   out7="$(git -C "$root" ls-remote --heads "$pushurl" 2>/dev/null)"  # this IS a network read, and
+  #                                                                       # no remote get-url happened here
+  # above the bounded push: `n14_scan` returned `4 1 4 0` for the real gate AND for the mutant — the
+  # unbounded read was not counted at all, and N14 stayed green at 222/0. Exactly the class round 5 closed
+  # one line up; the comment on this arm claimed the direction was "never fail-open" while it stood.
+  # ⇒ THE EXCLUSION WAS NEVER NEEDED. It existed because the generic verb regex matched the `--push` FLAG in
+  # `git -C "$root" remote get-url --push --all origin`. Requiring the verb to be a COMMAND WORD — the
+  # character before it is not `-`/alnum/underscore — separates the flag from the call without dropping the
+  # segment: the flag match disappears, the real call stays, and a trailing comment can no longer exempt
+  # anything because nothing is excluded by prose any more. `n_local` is still counted and still asserted
+  # (=1), so the push-url read has to keep existing.
+  n=$(printf '%s\n' "$segs" | grep -E 'git -C "\$root".*([^-[:alnum:]_]|^)(push|fetch|ls-remote)([[:space:]]|$)' | wc -l | tr -d ' ')
   l=$(printf '%s\n' "$segs" | grep -c 'git -C "\$root" remote get-url' | tr -d ' ')
-  b=$(printf '%s\n' "$segs" | grep -E 'git -C "\$root".*\b(push|fetch|ls-remote)\b' | grep -v 'remote get-url' | grep -cE 'tb_timeout[[:space:]]+[0-9]+[[:space:]]+git -C "\$root"' | tr -d ' ')
+  # ⛔ AND `tb_timeout 0` IS NOT A BOUND (review round 6, P2 — REPRODUCED). `bounded.sh:30` defines
+  # `<secs>` 0 as "no bound", and `tb_timeout 0 sleep 3` measures 3 s with rc=0 — so `[0-9]+` certified an
+  # explicitly UNBOUNDED exit-path call as bounded. Measured: a mutant with
+  # `out8="$(tb_timeout 0 git -C "$root" ls-remote --heads "$pushurl")"` injected above the push gave
+  # `5 1 5 0` and 222/0. A leading non-zero digit is the whole fix.
+  b=$(printf '%s\n' "$segs" | grep -E 'git -C "\$root".*([^-[:alnum:]_]|^)(push|fetch|ls-remote)([[:space:]]|$)' | grep -cE 'tb_timeout[[:space:]]+[1-9][0-9]*[[:space:]]+git -C "\$root"' | tr -d ' ')
   printf '%s %s %s %s\n' "$n" "$l" "$b" "$((n - b))"
 }
 # ⛔ COUNTED PER COMMAND SEGMENT, NOT PER LINE (review cycle 7: joining continuations made a bounded and an
 # unbounded call share one line, so `tb_timeout … ls-remote … \` + `&& git -C "$root" fetch origin` read as
 # bounded — a fail-open the join CREATED). Every segment that contains a network verb must carry its own
 # `tb_timeout`.
-# ⛔ AND `remote get-url` IS NOT A NETWORK CALL, SO COUNTING IT HERE WAS A FALSE RED (review cycle 17, P2 —
-# REPRODUCED). The verb regex matches the `--push` FLAG in `remote get-url --push --all origin`, which reads
-# config and touches no socket. The exit path resolves origin's push url with it precisely so the
-# landing-branch read and the verifying read address the repository the push actually reaches (see
-# lane_end_push's push-url block), and the false positive failed this arm on a correctly-bounded path.
-# The exclusion is SEGMENT-precise and COUNTED: exactly one such segment is expected, so a future real verb
-# cannot be smuggled in under the same shape — dropping the `--push` flag turns n_local to 0 and reds this
-# arm, and an unbounded fetch/push/ls-remote is still counted because it never matches `remote get-url`.
+# ⛔ AND `remote get-url` USED TO BE EXCLUDED HERE AS A FALSE RED (review cycle 17, P2) — AND THAT
+# EXCLUSION WAS ITSELF A FAIL-OPEN (review round 6, P1). The flag `--push` in `remote get-url --push --all
+# origin` tripped the generic verb regex, so the segment was dropped; but `grep -v 'remote get-url'` drops a
+# segment for MENTIONING the string, so a real unbounded read sharing a segment with that prose was dropped
+# with it. `n14_scan` now matches the verb as a COMMAND WORD instead, which separates the flag from the call
+# without excluding any segment — the false red and the fail-open were the same defect from two sides.
 n14_res="$(n14_scan "$GATE")"
 n_net=$(printf '%s\n' "$n14_res" | awk '{print $1}')
 n_local=$(printf '%s\n' "$n14_res" | awk '{print $2}')
