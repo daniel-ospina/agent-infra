@@ -931,6 +931,26 @@ case "$OUT_DRIVE" in
   *) bad "skip: the skipped pass read as '$(printf '%s' "$OUT_DRIVE" | cut -c1-40)…' — $OUT_DRIVE" ;;
 esac
 
+# ── 4a1) THE HANDOFF ARM'S WITNESS VALUE, WHEN THE QUEUE CANNOT BE READ (review P3, cycle 19) ──
+# The handoff arm publishes `backlog=UNKNOWN` from TWO causes, and the caller's sentence depends entirely
+# on `queue_readable=` distinguishing them — so the VALUE on the unreadable side must be pinned, not just
+# the field's presence. A regression that published `queue_readable=1` here would leave every suite green
+# while the beat printed "the pass READ the queue but measured neither its DEPTH nor a head" over a pass
+# whose own log line says it could NOT be read.
+mk_case ok-unreadable-queue
+mk_tool_clean "$D"
+mkdir -p "$D/o/candidates.txt"          # a DIRECTORY: present, and unreadable
+rf "$D"
+[ "$RC" -eq 0 ] && ok "unreadable-queue: the pass survives an unreadable queue (rc=0)" \
+  || bad "unreadable-queue: rc=$RC (want 0 — an unreadable queue is a recorded state, not a crash) — $OUT"
+[ "$(rec "$D" stage)" = "handoff" ] && ok "unreadable-queue: it still reaches the handoff stage" \
+  || bad "unreadable-queue: record stage='$(rec "$D" stage)' (want handoff)"
+[ "$(rec "$D" backlog)" = "UNKNOWN" ] && ok "unreadable-queue: the depth is recorded as UNKNOWN, never 0" \
+  || bad "unreadable-queue: record backlog='$(rec "$D" backlog)' (want UNKNOWN — an unread queue is not an empty one)"
+[ "$(rec "$D" queue_readable)" = "0" ] && ok "unreadable-queue: the witness says the queue could NOT be read (0) — the value the caller's clause depends on" \
+  || bad "unreadable-queue: record queue_readable='$(rec "$D" queue_readable)' (want 0 — a 1 here makes the caller claim a read the pass did not perform)"
+
+
 # ── 4) AN EMPTY-POOL PASS IS 'nothing to defer', NEVER 'skipped' ───────────────
 mk_case ok-empty
 mk_tool_clean "$D"
@@ -2207,16 +2227,48 @@ _drv_expect=14
 _drv_scan "$0"
 if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked, count pinned)"
 else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}) or a population of $_drv_total where $_drv_expect are declared — a driver that skips the prologue, or leaves the population, is invisible here"; fi
-# NON-VACUITY: delete the prologue from ONE driver and break its command over two lines — the shape that
-# defeated the line-based scan must now be caught, by this same scan.
+# NON-VACUITY: delete the prologue from ONE driver AND put a real NEWLINE inside its quoted payload, so
+# the driver's `dispatch_gate_line` call sits on a different physical line from its `bash -c`. That is the
+# shape that defeated the pre-fix line-based scan; the payload-accurate scan must still find it, and must
+# flag THAT driver — a mutation that only removes `set -u` reddens under the old scan too, so it would
+# grade nothing about the change (review P3, cycle 19).
 _drv_m="$T/suite-driver-mutant.sh"
-awk 'BEGIN{done=0} !done && /bash -c .set -u; .*dispatch_gate_line/ {sub(/set -u; /, ""); print; print ""; done=1; next} {print}' "$0" > "$_drv_m" 2>/dev/null
+awk 'BEGIN{done=0}
+     !done && /bash -c .set -u;/ {
+       sub(/set -u; /, "\n")
+       print
+       done=1; next
+     }
+     {print}' "$0" > "$_drv_m" 2>/dev/null
 if cmp -s "$0" "$_drv_m" 2>/dev/null; then bad "drivers: the stripped-prologue mutation did not apply — the awk anchor drifted"
 else
+  if awk 'BEGIN{n=0} /bash -c/ {inb=1; n=0; next} inb==1 {n++; if ($0 ~ /dispatch_gate_line/) {if (n>1) {found=1}; inb=0}} END{exit !found}' "$_drv_m"; then
+    ok "drivers: the mutant really is SPLIT (its dispatch call is on a later physical line than its \`bash -c\`)"
+  else bad "drivers: the mutant is still one physical line — it would not discriminate against the line-based scan"; fi
   _drv_saved_total="$_drv_total"; _drv_saved_unpin="$_drv_unpinned"
   _drv_scan "$_drv_m"
-  if [ -n "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "drivers: non-vacuity — a prologue-stripped driver is caught by the joined scan ($_drv_unpinned)"
-  else bad "drivers: a driver stripped of \`set -u\` still passed the pin (total=$_drv_total unpinned='${_drv_unpinned:-none}')"; fi
+  _mut_hits="$_drv_unpinned"
+  # ⛔ the SPLIT driver is the one flagged — the first `bash -c` in the file, i.e. #1 here — not "some" driver
+  if [ -n "$_mut_hits" ] && [ "$_drv_total" -eq "$_drv_expect" ] && grep -q '#1' <<< "$_mut_hits"; then
+    ok "drivers: non-vacuity — the SPLIT, prologue-stripped driver is caught and named ($_mut_hits)"
+  else bad "drivers: the split driver was not flagged as expected (total=$_drv_total pin='${_mut_hits:-none}')"; fi
+  # CONTROL: split the SAME driver's payload but KEEP the prologue — the pin must stay GREEN, so it is
+  # firing on the missing prologue and not merely on the multi-line shape.
+  _drv_r="$T/suite-driver-split-with-prologue.sh"
+  awk 'BEGIN{done=0}
+       !done && /bash -c .set -u;/ {
+         sub(/; \. "\$1"/, ";\n. \"$1\"")
+         print
+         done=1; next
+       }
+       {print}' "$0" > "$_drv_r" 2>/dev/null
+  if cmp -s "$0" "$_drv_r" 2>/dev/null; then bad "drivers: the control mutation did not apply — the awk anchor drifted"
+  else
+    _drv_scan "$_drv_r"
+    if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then
+      ok "drivers: control — a driver split the SAME way but KEEPING \`set -u\` stays GREEN (the pin fires on the prologue, not the shape)"
+    else bad "drivers: control failed — the pin reds on the SHAPE rather than the missing prologue (${_drv_unpinned:-none}, total=$_drv_total)"; fi
+  fi
   _drv_total="$_drv_saved_total"; _drv_unpinned="$_drv_saved_unpin"
 fi
 # NON-VACUITY: an unbound reference in a graded arm must be VISIBLE to this suite. Inject one and drive it
