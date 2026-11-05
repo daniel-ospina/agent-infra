@@ -2506,8 +2506,9 @@ reap_runner_work() {
     # instead of the structural 0 the worktree arm had to fix (#4529).
     # ⛔ A CENSUS THE OWNER COULD NOT TAKE IS `abstained`, AND IT MUST NOT LAND AS A MEASURED ZERO. The
     # owner's `unmeasurable=` says how many entries/roots it could not MEASURE (an unreadable entry, an
-    # unlistable root, a bounded walk that ran out of time, or a root REPLACED under the pass — the tally has
-    # one field and four causes, which is why the notes below name the tally and never pick one); when NOTHING
+    # unlistable root, a bounded walk that ran out of time, a root REPLACED under the pass, a SYMLINKED root
+    # this class will not follow, or a default seam the list format cannot EXPRESS — the tally has one field
+    # and six causes, which is why the notes below name the tally and never pick one); when NOTHING
     # was reached the
     # owner publishes `census=abstained`, and NOTHING here may turn that into
     # `candidates_runner_work=0 verdict_runner_work=ok` — the false PASS a review measured at this head
@@ -2522,8 +2523,8 @@ reap_runner_work() {
     # problem that did not exist and pointed the operator at the wrong remedy. The remedy differs per
     # path, so the note does not guess: it states the tally and says the count is unknown.
     if [ "$_rw_census" = "abstained" ]; then
-        log_line "disk-reaper: ⚠️  class=runner-work ABSTAINED — nothing under a matched _work root could be CLASSIFIED (${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be MEASURED — read failure, watchdog, or a root that changed under the pass), so the owner's candidates=0 is an ABSTENTION, not a measurement (the entries were KEPT)"
-        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be measured (read failure, watchdog, or a root that changed under the pass) and nothing was classified, so the candidate count is UNKNOWN, not 0"
+        log_line "disk-reaper: ⚠️  class=runner-work ABSTAINED — nothing under a matched _work root could be CLASSIFIED (${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be MEASURED — a read failure, a watchdog, a root that changed under the pass, a symlinked root this class will not follow, or an inexpressible default seam), so the owner's candidates=0 is an ABSTENTION, not a measurement (the entries were KEPT)"
+        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be measured (a read failure, a watchdog, a root that changed under the pass, a symlinked root, or an inexpressible default seam) and nothing was classified, so the candidate count is UNKNOWN, not 0"
         RW_ABSTAINED=1
     fi
     # ⛔ A PARTLY-UNREADABLE POPULATION IS STILL AN ABSTENTION, ONE STATE OVER. `census=abstained` only
@@ -2536,14 +2537,15 @@ reap_runner_work() {
     # verdict is the distinct token, so nothing keying on `ok` inherits the lie. rc stays 0.
     if [ "$_rw_census" = "partial" ]; then
         # ⛔ THE SAME "NAME WHAT YOU KNOW" RULE AS THE ABSTAINED ARM (#3057 review cycle 3, P2): the owner's
-        # `unmeasurable=` has THREE causes (an unreadable entry, an unlistable root, a root REPLACED under the
-        # pass), and this note said "could not be read" for all of them — MEASURED on a partly-swapped
+        # `unmeasurable=` has SIX causes now (an unreadable entry, an unlistable root, a root REPLACED under the
+        # pass, a bounded walk out of time, a SYMLINKED root this class will not follow, and an inexpressible
+        # default seam — #3057 added the last two), and this note said "could not be read" for all of them — MEASURED on a partly-swapped
         # population: `kept=1 unmeasurable=1 census=partial` rendered as "1 entry/root could not be read",
         # sending an operator to a permissions fault that did not exist while the real state (a `_work` moved
         # aside, so that half of the class is INERT) appeared nowhere. It states the tally and the possible
         # causes, and never picks one.
-        log_line "disk-reaper: ⚠️  class=runner-work census PARTIAL — ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be MEASURED (read failure, watchdog, or a root that changed under the pass), so candidates=$_rw_cand is a LOWER BOUND, not the population (the unmeasured ones were KEPT)"
-        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census is PARTIAL: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be measured (read failure, watchdog, or a root that changed under the pass), so the candidate count is a LOWER BOUND"
+        log_line "disk-reaper: ⚠️  class=runner-work census PARTIAL — ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be MEASURED (a read failure, a watchdog, a root that changed under the pass, a symlinked root this class will not follow, or an inexpressible default seam), so candidates=$_rw_cand is a LOWER BOUND, not the population (the unmeasured ones were KEPT)"
+        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census is PARTIAL: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be measured (a read failure, a watchdog, a root that changed under the pass, a symlinked root, or an inexpressible default seam), so the candidate count is a LOWER BOUND"
         RW_PARTIAL=1
     fi
     if [ "$_rw_census" = "ok" ] || [ "$_rw_census" = "partial" ]; then

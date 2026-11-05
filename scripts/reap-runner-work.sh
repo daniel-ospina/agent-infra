@@ -706,10 +706,24 @@ while IFS= read -r _g; do
         # declining to measure is not the same as having measured nothing (the same distinction an
         # UNLISTABLE root makes, and the census rule below already turns `unmeasurable>0` into
         # `abstained`/`partial` — never `ok`). rc stays 0: the record is the alarm channel.
-        if [ -d "$_r" ] && [ -L "$_r" ]; then
+        # ⛔ `-L` IS TESTED BEFORE `-d`, AND THE ROOT IS DEDUPED — two defects a review found in the
+        # first cut of this arm (#3057 review, P2s). (i) A DANGLING symlink is not `-d`, so
+        # `[ -d ] && [ -L ]` was FALSE for exactly the state the workaround produces when its big-disk
+        # volume is not mounted: the root fell through to `continue` with `_matched=0` and the pass again
+        # published "matched no runner _work root" over a glob that matched. `-L` alone covers both the
+        # live and the dangling case. (ii) The arm used to `continue` BEFORE the `SEEN_ROOTS` dedupe, so
+        # one symlinked root matched by two overlapping globs was counted twice, overstating
+        # `unmeasurable=` in a file whose whole discipline is "a zero that nothing measured is not a
+        # zero". It is registered in `SEEN_ROOTS` like every other root, for the same reason.
+        if [ -L "$_r" ]; then
             _matched=1
+            case " $SEEN_ROOTS " in
+                *" $_r "*) log_line "reap-runner-work: symlinked root $_r was already counted from an earlier glob — not counted twice"
+                    continue ;;
+            esac
+            SEEN_ROOTS="$SEEN_ROOTS $_r"
             UNMEASURABLE=$((UNMEASURABLE + 1))
-            log_line "UNMEASURED $_r reason=symlinked-root (the glob matched a _work namespace that is a SYMLINK; this class never follows one in a delete path, so its population was NOT measured — the sink may be filling behind it, and a symlinked _work is the documented full-disk workaround)"
+            log_line "UNMEASURED $_r reason=symlinked-root (the glob matched a _work namespace that is a SYMLINK, live or DANGLING; this class never follows one in a delete path, so its population was NOT measured — the sink may be filling behind it, and a symlinked _work is the documented full-disk workaround, whose target being gone is the unmounted-big-disk state)"
             continue
         fi
         [ -d "$_r" ] || continue
@@ -805,7 +819,16 @@ if [ "$EXPLICIT" = 0 ]; then
     esac
 fi
 
-if [ -z "${PENDING_ROOTS# }" ] && [ "$EXPLICIT" = 1 ]; then
+# ⛔ AND `unmeasurable=0` IS PART OF THE CONDITION (#3057 review, P2). This refusal's sentence is "the
+# glob list was set EXPLICITLY and matched no directory" — and with a root that DID match but that this
+# class will not follow (a SYMLINKED `_work` is the documented full-disk workaround), that sentence is a
+# FALSEHOOD and its remedy ("fix your seam") aims an operator at a seam that is correct. Worse, the
+# refusal `exit 3`s BEFORE the census block below, so the abstention the symlink arm had just recorded was
+# discarded on exactly the path an operator most likely configured by hand. With an abstention on the
+# books, the pass falls through to the census instead, which publishes `abstained` and the `UNMEASURED`
+# line naming `reason=symlinked-root` — the same "name the cause you can actually know" rule the
+# `census=refused` token was created for.
+if [ -z "${PENDING_ROOTS# }" ] && [ "$EXPLICIT" = 1 ] && [ "$UNMEASURABLE" -eq 0 ]; then
     # ⛔ AN EXPLICIT LAYOUT THAT MATCHES NOTHING IS A REFUSAL, NOT A ZERO. When the operator (or the
     # rendered unit) SET the glob list, they asserted where this box's runners live; a sweep over a
     # population that is not there must not report `candidates=0` as if it had measured the sink. It is

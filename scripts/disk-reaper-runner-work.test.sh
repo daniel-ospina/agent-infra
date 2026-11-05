@@ -847,8 +847,8 @@ case_l() { # <entry-point> <owner>
     # GREEN — MEASURED: reverting only that sentence gave `62 passed, 0 failed, 5 skipped`. The gap was
     # exactly one arm, on the token this case exists to drive (`census=abstained`), so it is ratified here:
     # the note may state the tally and the possible causes, never pick a cause it cannot know.
-    case_check "$(grep -q 'could not be measured (read failure, watchdog, or a root that changed under the pass)' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
-               "… and the ABSTAINED note names the possible causes rather than asserting a read failure"
+    case_check "$(grep -q 'could not be measured (a read failure, a watchdog, a root that changed under the pass, a symlinked root, or an inexpressible default seam)' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the ABSTAINED note names the possible causes rather than asserting a read failure (the list GREW in #3057 — a symlinked root and an inexpressible default seam — so this pins the sentence's SHAPE, not a frozen cause set)"
     case_check "$(grep -q 'could not be read' <<<"$(status_of "$s1")" && echo 1 || echo 0)" \
                "… and it never claims the walk 'could not be read', which a replaced root would make a falsehood"
     case_check "$(grep -q 'note_runner_work=1 entry/root KEPT as UNMEASURED' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
@@ -1275,7 +1275,7 @@ case_r() { # <entry-point> <owner>
     # "1 entry/root could not be read", i.e. a permissions fault that did not exist, while the real state —
     # that half of the class is INERT and the disk stays full — appeared nowhere. The note states the tally
     # and the possible causes instead; case (w) pins the third cause at the owner, this pins the wording.
-    case_check "$(grep -qF 'could not be measured (read failure, watchdog, or a root that changed under the pass)' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+    case_check "$(grep -qF 'could not be measured (a read failure, a watchdog, a root that changed under the pass, a symlinked root, or an inexpressible default seam)' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
                "… and names the possible causes rather than asserting a read failure"
     case_check "$(grep -qF 'could not be read' <<<"$(status_of "$s1")" && echo 1 || echo 0)" \
                "… and never claims the walk 'could not be read', which a replaced root would make a falsehood"
@@ -1872,18 +1872,32 @@ if grep -qF 'KEPT   $entry reason=toctou (a writer appeared during the pass' "$O
 else
     bad "… but the re-probe's KEPT arm is gone: a written-during-the-pass answer now falls through to rm -rf"
 fi
-# ⛔ A SYMLINKED `_work` ROOT MUST NOT READ AS "MATCHED NOTHING" (#3057 review, P1). A symlinked `_work`
-# is the file's own cited full-disk workaround, so this is a live shape, not a hypothetical: the old
-# `[ -d ] && [ ! -L ] || continue` dropped it BEFORE `_matched`, so `roots=0 candidates=0 census=ok` was
-# published with a note saying the glob "matched no runner _work root" — over a sink that was filling.
-# ⛔ STRUCTURAL, WITH THE LIMIT STATED: it proves the branch still sets `_matched` and counts the root as
-# UNMEASURED (which is what turns the census off `ok`), not that a fixture reaches it. Verified by hand
-# when this was written: a symlinked `_work` now gives `unmeasurable=1 … census=abstained`, rc 0, and the
-# entry point records `verdict_runner_work` non-ok. Recorded on PR #3057.
-if grep -qF 'reason=symlinked-root' "$OWNER"; then
-    ok "a SYMLINKED _work root is counted as UNMEASURED, so it cannot read as 'matched nothing' with census=ok"
+# ⛔ A SYMLINKED `_work` ROOT MUST NOT READ AS "MATCHED NOTHING" (#3057 review, P1), AND THIS ARM IS
+# DRIVEN, NOT GREPPED — the FIRST cut of it was a bare `grep -qF 'reason=symlinked-root'` against the
+# owner's source, and a reviewer proved it VACUOUS: deleting the `UNMEASURABLE=$((UNMEASURABLE + 1))` line
+# left the suite at `65 passed, 0 failed, 5 skipped` while `census` went back to `ok` — the exact false
+# pass the arm exists for, restored under a green suite. A `_work` that is a SYMLINK is the file's own
+# cited full-disk workaround, so the state is built and the owner is run against it.
+# ⛔ EACH ASSERTION BELOW IS THE ONE ITS MUTANT KILLS: the census token dies with the UNMEASURABLE
+# increment, `unmeasurable=1` dies with it too, and the "matched no root" assertion dies with `_matched=1`.
+sym_base="$T/sym.$$.$RANDOM"; sym_real="$sym_base/real/_work"; sym_link="$sym_base/g1/_work"
+mkdir -p "$sym_base/g1" "$sym_real" 2>/dev/null || true
+fixture_entry dead "$sym_real" job-dead 120 4 >/dev/null 2>&1 || true
+ln -s "$sym_real" "$sym_link" 2>/dev/null || true
+if [ -L "$sym_link" ]; then
+    sym_out="$(DISK_REAPER_RUNNER_MIN_AGE=3600 REAP_RW_GLOBS="$sym_link" REAP_RW_EXPLICIT=0 \
+               BOUNDED_LIB="$HERE/lib/bounded.sh" bash "$OWNER" --dry-run 2>&1)"
+    ok "a symlinked _work root is driven (fixture built: $sym_link -> $sym_real)"
+    case_check "$(grep -q 'census=abstained' <<<"$sym_out" && echo 0 || echo 1)" \
+               "a SYMLINKED _work root publishes census=abstained, never a measured empty population (census=ok)"
+    case_check "$(grep -q 'unmeasurable=1 ' <<<"$sym_out" && echo 0 || echo 1)" \
+               "… and it is COUNTED as unmeasurable=1, so the entry point cannot lift verdict=ok from it"
+    case_check "$(grep -qF 'matched no runner _work root' <<<"$sym_out" && echo 1 || echo 0)" \
+               "… and the 'matched no root' note is NOT printed over a glob that DID match"
+    case_check "$(grep -q 'reason=symlinked-root' <<<"$sym_out" && echo 0 || echo 1)" \
+               "… and the cause is NAMED symlinked-root, so the operator is not sent to a permissions fault"
 else
-    bad "the symlinked-root abstention is GONE: a symlinked _work (the documented full-disk workaround) reads as a measured empty population"
+    skip "a symlinked _work root could not be created under \$T, so the symlink arm was NOT measured"
 fi
 
 if apply_mutation "$OWNER" "$T/mut-s-instrumented/reap-runner-work.sh" "$MUT_S_INSTRUMENT"; then
