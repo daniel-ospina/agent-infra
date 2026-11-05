@@ -402,7 +402,6 @@ for N in "$@"; do
   # releasing the claim" ordering. Same rule as `${_lan-}` below: every variable this branch reads
   # must be safe when unset.
   if wt_spawn "chain-$N" "${REPO_ABS:-$REPO}" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '${REPO_ABS:-$REPO}' '$OR' $N '$BR'"; then
-    CHAIN_IDS="$CHAIN_IDS $N"   # the disk arm must not release a claim a live chain holds (round 3, P3)
     echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
     # The same disclosure on the refusal path (see the lane spawn above): a chain that never started
