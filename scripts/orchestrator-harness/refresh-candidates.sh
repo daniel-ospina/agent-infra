@@ -27,8 +27,12 @@ set -u
 #      with the ONE qualifier this repo uses (`epic-scope:`), or the `lane <id>:` umbrella form. The
 #      structural requirement is what makes the rule safe: the bare prefix this replaced also dropped
 #      WORK — `analysis-paralysis fix: …` (as `analysis`) and `lane reaper: …` (as `lane`). `analysis`
-#      and `investigation` are legacy members of the old rule that no live row currently uses; they
-#      stay because the old rule carried them and dropping them would be an unreviewed widening.
+#      and `investigation` are members the old rule CARRIED, kept rather than re-justified: they stay
+#      because dropping one would be an unreviewed widening. ⛔ DO NOT READ THE MEASUREMENT AS "UNUSED":
+#      the measured tortoise queue had no live row using them, but `analysis(` IS live in
+#      agent-infra — #1425 `analysis(review-enforcer): …` carries `P2-moderate`, and it is exactly the
+#      container shape this arm must keep excluding. A cleanup that deletes the kind makes that
+#      container pickable (review cycle 4, P3).
 #      ⛔ THE QUALIFIER IS ENUMERATED, NOT `-[A-Za-z0-9]+` (review cycle 3, P1). An unbounded
 #      qualifier silently DROPPED real work: `tracking-id: …`, `design-tokens: …`, `arch-lint: …`,
 #      `map-cache: …`, `measure-latency: …`, `coord-lock: …`, `residual-risk: …`,
@@ -39,7 +43,12 @@ set -u
 #      ⛔ AND A BARE `epic` WITH NO SEPARATOR IS DELIBERATELY **PICKABLE** (review cycle 3, P2): the
 #      pre-fix P0 rule excluded `epic of the v4 selection workstream` and `epic — end-to-end proof …`
 #      by prefix; the structural requirement now INCLUDES both, because excluding by bare prefix is
-#      what dropped `epidemic:` and `analysis-paralysis fix:` — hiding work is the worse direction.
+#      what dropped `analysis-paralysis fix:` (as `analysis`) and `lane reaper:` (as `lane`) — hiding
+#      work is the worse direction. ⛔ `epidemic:` IS **NOT** A CASUALTY AND MUST NOT BE CITED AS ONE
+#      (review cycle 4, P2, measured): `^epic` cannot match `epidemic`, so the old rule never dropped
+#      it. It is pinned as a FORWARD-GUARD (§4) so a re-added bare prefix cannot pass — a forward-guard
+#      and a casualty are different claims, and inflating the casualty list is what makes a DELIBERATE
+#      widening (a bare `epic` container is now pickable) look better justified than it is.
 #      Pinned as an inclusion in the suite so the trade-off is a decision, not an omission.
 #   2. THE DECLARED LABEL — `standing-constraint`, and that label only. A standing constraint
 #      CANNOT be told from work by its title, and must not be inferred from its prose, so the
@@ -5383,7 +5392,7 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   # so the dependency is declared HERE, where the extractor can see it: product-floor.test.sh prepends
   # the shipped `POOL_JQ=` line to the extracted text. An extractor that forgets fails with a NAMED
   # message instead of bash's bare "unbound variable", and the definition is never duplicated.
-  local pool_jq="${POOL_JQ:?POOL_JQ is not in scope — a consumer that extracts this function must also extract the POOL_JQ= line from the shipped refresh (agent-infra#10951)}"
+  local pool_jq="${POOL_JQ:?POOL_JQ is not in scope — a consumer that extracts this function must also extract the POOL_JQ= line from the shipped refresh (tortoise#10951)}"
   if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
     case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
       eq_need=$(( CORE_RESERVE + EQ_PAGES ))

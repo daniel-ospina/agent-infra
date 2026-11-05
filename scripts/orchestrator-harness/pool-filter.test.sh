@@ -23,8 +23,9 @@
 #   • CONTAINER spellings (section 1) and the WORK titles in section 3 that carry a real issue
 #     number are QUOTED FROM LIVE ROWS — an open daniel-ospina/tortoise P0/P1/P2 issue read on
 #     2026-11-05 (219 rows). `analysis:` / `investigation:` are the exception and say so: they are
-#     members of the OLD rule that no live row currently uses, kept because the old rule carried
-#     them.
+#     members of the OLD rule, kept because the old rule carried them — the measured tortoise queue
+#     had no live row using them, but `analysis(` IS live in agent-infra (#1425, `P2-moderate`), so
+#     the kind stays and their fixtures below are SYNTHETIC.
 #   • SYNTHETIC cases are numbered from 900001 so they cannot be mistaken for a real issue: the
 #     over-block guards (section 4), the unknown-kind case (5), and the robustness rows (6).
 #   • Section 4's `epidemic:` and `map the …` cases are FORWARD-GUARDS, not casualties of the old
@@ -100,7 +101,9 @@ check_excluded 'residual(...)'      "$(iss 7524 'residual(extractor): the bounda
 check_excluded 'map(...)'           "$(iss 5313 'map(pricing): every place tied to the pricing model — the blast radius')"
 check_excluded 'arch(...)'          "$(iss 4333 'arch(storage): own the storage architecture — node volume + the true per-node cost')"
 check_excluded 'leading whitespace' "$(iss 900002 '   epic: indented by a human, still a container')"
-# Legacy members of the OLD rule that no live row uses — kept, so dropping one is a reviewed change.
+# Legacy members of the OLD rule — kept, so dropping one is a reviewed change. (No live row in the
+# measured tortoise queue used them; agent-infra#1425 DOES use `analysis(`, which is why the kind
+# must stay.)
 check_excluded 'analysis: (legacy kind)'      "$(iss 900003 'analysis: where the recall loss actually is')"
 check_excluded 'investigation: (legacy kind)'  "$(iss 900004 'investigation: why the container reaper double-fired')"
 
@@ -122,7 +125,7 @@ check_included 'epic label on a work title (not an exclusion)' \
 
 # ── 3. WORK TITLES — each must be INCLUDED (a filter that hides work is the worse defect) ────
 check_included 'feat(...)'    "$(iss 900010 'feat(4282): retire the five run_onboarding MCP tools (81 -> 76 live)')"
-check_included 'fix(...)'     "$(iss 10951 'fix(10951): the container-title filter misses no spelling')"
+check_included 'fix(...)'     "$(iss 900018 'fix(queue): a fix row is work, whatever its number')"
 check_included 'bug(...)'     "$(iss 900011 'bug(queue): the container-title filter misses the spellings the repo uses')"
 check_included 'test(...)'    "$(iss 9567 'test(record): capstone — prove the record works end to end')"
 check_included 'chore(...)'   "$(iss 900012 'chore(deps): bump uv to 0.6.0')"
@@ -169,8 +172,10 @@ check_included 'map-cache: (hyphenated work)' \
   "$(iss 900028 'map-cache: the LRU is unbounded')"
 # ⛔ A BARE `epic` WITH NO SEPARATOR IS DELIBERATELY PICKABLE (review cycle 3, P2). The pre-fix P0
 # rule excluded these two by prefix; the structural requirement includes them, because excluding by
-# bare prefix is what dropped `epidemic:` and `analysis-paralysis fix:` — hiding work is the worse
-# direction. Pinned so the trade-off reads as a decision rather than as an omission.
+# bare prefix is what dropped `analysis-paralysis fix:` and `lane reaper:` — hiding work is the worse
+# direction. ⛔ `epidemic:` is NOT one of them (review cycle 4, P2, measured: `^epic` cannot match
+# `epidemic`); it is pinned above as a FORWARD-GUARD, and citing it as a casualty would overstate the
+# case for this deliberate widening. Pinned so the trade-off reads as a decision, not an omission.
 check_included 'epic of ... (bare epic, no separator)' \
   "$(iss 900029 'epic of the v4 selection workstream')"
 check_included 'epic — ... (bare epic, no separator)' \
@@ -224,6 +229,20 @@ sites="$(grep -cF -- "'\"\$POOL_JQ\"'" "$RC" 2>/dev/null || true)"
 local_sites="$(grep -cF -- "'\"\$pool_jq\"'" "$RC" 2>/dev/null || true)"
 if [ "${sites:-0}" -eq 3 ] && [ "${local_sites:-0}" -eq 1 ]; then ok=$((ok+1))
 else bad=$((bad+1)); echo "FAIL [drift] call sites splicing the definition: ${sites:-0} file-global + ${local_sites:-0} local - expected 3 + 1 (P0, P1, P2 and the emergency floor)"; fi
+
+# (a2) THE FOURTH SITE'S BINDING IS DRIVEN, NOT COUNTED (review cycle 4, P2). (a) pins the SPLICE text
+# and `drive_site` supplies `pool_jq` from the ENVIRONMENT, so the emergency floor's
+# `local pool_jq=…` was evaluated by NOTHING: replacing it with a NARROWER literal program left this
+# suite at 60/0 and product-floor at 214/0 (measured), i.e. the fourth copy could regrow the exact
+# drift this PR removed (T3) with every check green. So resolve the shipped expression the way bash
+# does — with POOL_JQ set — and require the RESULT to be the shared definition itself.
+floor_bind="$(sed -n 's/^[[:space:]]*local pool_jq=//p' "$RC")"
+floor_eff=""
+if [ -n "$floor_bind" ] && [ "$(printf '%s\n' "$floor_bind" | grep -c .)" -eq 1 ]; then
+  floor_eff="$(POOL_JQ="$SEL" eval "pool_jq_eff=$floor_bind" 2>/dev/null; printf '%s' "${pool_jq_eff:-}")"
+fi
+if [ "$floor_eff" = "$SEL" ]; then ok=$((ok+1))
+else bad=$((bad+1)); echo "FAIL [drift] the emergency floor's \`local pool_jq=\` does not resolve to the shared definition (got '${floor_eff:0:60}') - it must read \${POOL_JQ:?...} and never carry its own program"; fi
 
 # (b) THE WHOLE PROGRAM IS PINNED, ONCE, BY WHOLE-TEXT EQUALITY (review cycle 4, P2). The three
 # per-arm pins that used to live here could each be defeated by an ARM APPENDED to the shared program:

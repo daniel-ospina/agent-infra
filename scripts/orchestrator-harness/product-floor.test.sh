@@ -1405,7 +1405,7 @@ ck "P13(iii) [RED→GREEN] with no product candidate the floor had nothing to ap
 # refresh and driven here (the same `rest_list` seam P7 uses), so the class the floor consults is proven
 # to come from a LISTING and not from an assumption.
 WEF="$T/weqfns.sh"
-# ⛔ THE EXTRACTED BODY DEPENDS ON THE SHIPPED POOL DEFINITION (agent-infra#10951). `write_emergency_queue`
+# ⛔ THE EXTRACTED BODY DEPENDS ON THE SHIPPED POOL DEFINITION (tortoise#10951). `write_emergency_queue`
 # consults the pool predicate, which is the ONE `POOL_JQ=` line at the top of the shipped refresh — a
 # file-global that a bare function-body extraction does not carry. So the extraction carries it: without
 # this line the body dies on `POOL_JQ: unbound variable` under `set -u` and the P0 emergency class is
