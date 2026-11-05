@@ -276,10 +276,14 @@ STATES = ("dead", "running-quiet", "wedged", "idle", "unknown")
 #              while the supervisor still calls the lane progressing).
 #   finished   the process tree is GONE and the lane WROTE A VERDICT that says
 #              its turn completed (``lane-bound.sh``'s own line).
-#   no-verdict the process tree is GONE and the lane wrote NO verdict at all —
-#              the process ended and told us nothing. A NEW, honest state: it
-#              is what the 200–400 B artefacts of 2026-11-03 were, and reading
-#              that shape as ``dead`` is the false negative this axis removes.
+#   no-verdict the process tree is GONE and the lane wrote NO recognisable BOUND
+#              verdict — the bound never reported a completion, so completion is
+#              unassertable. ⛔ IT IS NOT "told us nothing": the LAUNCHER's own
+#              `rc=<n>` may be perfectly readable and is reported in ``detail``
+#              (``merge-one.sh`` has no bound at all — see ``gather_log_lane``).
+#              A NEW, honest state: it is what the 200–400 B artefacts of
+#              2026-11-03 were, and reading that shape as ``dead`` is the false
+#              negative this axis removes.
 #
 # ⛔ A PROCESS THAT HAS EXITED IS TERMINAL, NEVER ``frozen``/``working``.
 # ``frozen`` is a statement about a LIVE tree that stopped progressing; a tree
@@ -331,7 +335,7 @@ BOUND_VERDICTS = ("finished", "stalled", "exceeded-wallclock")
 # completion; `0` is `run` mode's success.
 #
 # ⛔ `na` IS **NOT** COMPLETION EVIDENCE — it is the ABSENCE of exit-status evidence.
-# `lane-bound.sh` sets `V_RC=na` UNCONDITIONALLY in `watch` mode (`:397`), and `watch`
+# `lane-bound.sh` sets `V_RC=na` UNCONDITIONALLY in `watch` mode (its own `V_RC=na`), and `watch`
 # is the mode the fleet's ONLY launcher uses for EVERY lane/fixer/worker
 # (`spawn-gate.sh`'s `run_agent` -> `lane-bound.sh watch`). `run` mode (which does)
 # put the child's real status on the line) is never used by the fleet. So `rc=na`
@@ -1595,8 +1599,8 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                 if rc == "na":
                     # ⛔ `na` IS NOT COMPLETION — IT IS THE ABSENCE OF EXIT-STATUS
                     # EVIDENCE. `lane-bound.sh watch` writes it UNCONDITIONALLY
-                    # (`:397`) and `watch` is what `spawn-gate.sh`'s `run_agent` uses
-                    # for EVERY lane/fixer/worker (`:1532`), so in the fleet's actual
+                    # (`lane-bound.sh`'s `V_RC=na`) and `watch` is what `spawn-gate.sh`'s
+                    # `run_agent` uses for EVERY lane/fixer/worker, so in the fleet's actual
                     # population `finished` + `rc=na` is written by a lane that
                     # COMPLETED and by a lane that CRASHED, was OOM-killed, or was
                     # killed by the completion watchdog's 15 s TERM->KILL —
@@ -1646,7 +1650,7 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # "told us nothing". The state stays `no-verdict`: without a bound verdict we
         # cannot assert the bound fired nothing, so a launcher `rc=0` is EVIDENCE, not a
         # completion — promoting it to `finished` is a separate claim this axis does not
-        # make (docs §13.5, and the `finished` rule that a bound verdict is required).
+        # make (docs §13.4, and the `finished` rule that a bound verdict is required).
         if runner_rc is not None:
             return Verdict("no-verdict", "process-gone-no-verdict",
                            detail=("bytes=%s age_ms=%s (the process ended and wrote NO bound "
@@ -2793,7 +2797,16 @@ def gather_log_lane(
             lr.detail = " | ".join(x for x in (lr.detail, note) if x)
         if why:
             lr.detail = " | ".join(x for x in (lr.detail, why) if x)
-            lr.verdict, lr.rc = "", None
+            # ⛔ CLEAR THE INCARNATION WITH THE VERDICT. Dropping a stale/unbound bound
+            # verdict but KEEPING its `verdict_line_pid` leaves the launcher block below
+            # binding to the incarnation we just refused: measured, a log holding
+            # dispatch 1's `pid=<A> rc=na` + its own `[timeout] agent pid=<A> … rc=0`
+            # and then dispatch 2's header — queried as `<B>` — dropped the verdict and
+            # still adopted `runner_rc=0` from `<A>`, publishing "the launcher reported
+            # rc=0" for a lane that had said nothing. With the pid cleared, an unadopted
+            # incarnation can only fall through to `runner_pid == str(pid)`, which is the
+            # queried lane — over-refusal is the safe direction here.
+            lr.verdict, lr.rc, lr.verdict_line_pid = "", None, ""
 
     # ⛔ READ THE LAUNCHER'S OWN LINE FOR **EVERY READABLE LOG** — NOT ONLY FOR `rc=na`.
     # `na` is `watch` mode's unconditional shape (`lane-bound.sh`'s `V_RC=na`) and the

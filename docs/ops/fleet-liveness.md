@@ -1619,7 +1619,7 @@ reader can mistake `finished` for a transcript state.
 | `working` **(`within-window`)** | the tree is alive and nothing is happening **yet** | every signal flat, but for less than `LOG_FREEZE_MS`. This is NOT positive liveness evidence — it is the fleet's normal resting state — so a consumer must not read `working` as "something happened" without looking at `reason` |
 | `frozen` | the tree is alive **and nothing is happening** | **ZERO progress on EVERY signal** — the log's silence for the full `LOG_FREEZE_MS` window, CPU over the `LOG_WINDOW_MS` sample — with the freeze window echoed in `detail` as `freeze_ms=` and named SEPARATELY from `window_ms=`, the sample span the deltas were taken over, so a machine reader can always tell which window it received |
 | `finished` | the tree is **gone** and the lane **completed** | positive identity evidence of absence + `verdict=finished` **with `rc=0`**, **or** `rc=na` corroborated by the launcher's own `[timeout] agent pid=<pid> … rc=0` line |
-| `no-verdict` | the tree is **gone** and the lane **told us nothing** | positive identity evidence of absence + no recognisable verdict |
+| `no-verdict` | the tree is **gone** and no recognisable **bound** verdict was written — the launcher's own `rc=` may still be readable and is then reported in `detail` | positive identity evidence of absence + no recognisable bound verdict |
 | `dead` | the tree is gone **because the bound killed it** | `verdict=stalled` / `verdict=exceeded-wallclock` |
 | `unknown` | abstention, reason named | an unreadable log, an unreadable signal, or an unfenceable process |
 

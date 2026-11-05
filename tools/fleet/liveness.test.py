@@ -2668,6 +2668,50 @@ def t52():
         check(lr.runner_rc is None,
               "an unreadable launcher token is NO witness on this path either; got %r"
               % (lr.runner_rc,))
+
+        # ⛔ AND THE BINDING STILL HOLDS WHEN THERE IS NO BOUND LINE. Widening the gate to
+        # `if lr.readable:` must not turn the launcher line into a witness for a lane it
+        # does not describe — the appended-log premise this axis states everywhere.
+        # (a) a launcher line naming a pid that is NEITHER the queried pid NOR any bound
+        #     pid is not this lane's witness.
+        other = subprocess.Popen([sys.executable, "-c", "pass"])
+        other_pid = other.pid
+        other.wait()
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=900s rc=0\n" % other_pid)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.runner_rc is None,
+              "a launcher line naming ANOTHER incarnation is not adopted; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check("reported rc=" not in (v.detail or ""),
+              "…and the detail does not claim it heard an rc; got %r" % (v.detail,))
+
+        # (b) ⛔ THE STALE PAIR — the regression the widened gate introduced and this arm
+        #     exists to prevent. Dispatch 1 left BOTH a bound verdict and its own launcher
+        #     line naming the SAME pid; the verdict is DROPPED as stale for the queried
+        #     lane, so its incarnation must be dropped with it. Keeping
+        #     `verdict_line_pid` let the launcher block bind dispatch 1's `rc=0` to
+        #     dispatch 2 and publish "the launcher reported rc=0" for a lane that said
+        #     nothing — a self-contradicting detail (`reported rc=0` next to
+        #     `unbound-bound-verdict`).
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                     "elapsed=61s log=%s\n" % (other_pid, log))
+            fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=0\n"
+                     % other_pid)
+            fh.write("=== next dispatch ===\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.verdict == "", "the stale bound verdict is dropped; got %r" % (lr.verdict,))
+        check(lr.verdict_line_pid == "",
+              "the DROPPED verdict's incarnation is cleared with it; got %r"
+              % (lr.verdict_line_pid,))
+        check(lr.runner_rc is None,
+              "a launcher line belonging to the DROPPED verdict is not adopted; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check("reported rc=" not in (v.detail or ""),
+              "…and the detail never says it heard an rc from another dispatch; got %r"
+              % (v.detail,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3349,6 +3393,22 @@ MUTATIONS = [
         "the bound-line PID LOCATOR carries the allow-list again, so an unusable `pid=` "
         "reads as ABSENT and is ADOPTED — a previous dispatch's `finished` published as "
         "this lane's terminal state",
+    ),
+    Mutation(
+        "T52", "module",
+        '            # queried lane — over-refusal is the safe direction here.\n            lr.verdict, lr.rc, lr.verdict_line_pid = "", None, ""',
+        '            # queried lane — over-refusal is the safe direction here.\n            lr.verdict, lr.rc = "", None',
+        "a DROPPED bound verdict keeps its incarnation, so the launcher block binds the "
+        "refused dispatch's own `rc=0` to the queried lane and publishes 'the launcher "
+        "reported rc=0' for a lane that said nothing (the stale-pair regression the "
+        "widened gate introduced)",
+    ),
+    Mutation(
+        "T52", "module",
+        '                                if lr.verdict_line_pid else (runner_pid == str(pid)))',
+        '                                if lr.verdict_line_pid else True)',
+        "with NO bound line the launcher witness is adopted unconditionally, so ANY "
+        "appended `[timeout] agent … rc=0` from an earlier dispatch corroborates this lane",
     ),
     Mutation(
         "T51", "module",
