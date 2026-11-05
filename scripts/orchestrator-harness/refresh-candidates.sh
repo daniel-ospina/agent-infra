@@ -14,6 +14,41 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
+# ── THE POOL-ELIGIBILITY DEFINITION — THE ONLY COPY (issue #10951) ───────────────────────────
+# This line decides WHAT COUNTS AS A WORK UNIT. It used to exist four times, inline, and the
+# copies had drifted: the P0 query and the emergency-P0 floor excluded six container spellings,
+# while the P1-severe and P2-moderate queries excluded two (`epic|OWNER DECISION`) — so the P1
+# tier was the NARROWEST filter here and ranked a standing constraint (#10175, whose title says
+# "the cap is HELD deliberately — never override it") as a work unit. One definition, four call
+# sites, and `pool-filter.test.sh` drives THESE EXACT BYTES through real jq.
+#
+# TWO ARMS, because two different facts need expressing:
+#   1. THE TITLE KIND, marked STRUCTURALLY — the kind token followed by `(` or `:`, optionally
+#      with a `-qualifier` (`epic-scope:`), or the `lane <id>:` umbrella form. The structural
+#      requirement is what makes the rule safe: a bare prefix (the form this replaced) also
+#      dropped `epidemic: …` as `epic` and `analysis-paralysis fix: …` as `analysis` — both work.
+#   2. THE DECLARED LABEL — `standing-constraint` and `epic`. A standing constraint CANNOT be
+#      told from work by its title, and must not be inferred from its prose, so the declaration
+#      is the only honest marker (the same lesson #10902 records for folds: declare the property,
+#      do not infer it).
+#
+# ⛔ IT IS A DENYLIST AND AN UNKNOWN SPELLING STAYS PICKABLE — measured, not stylistic: 40 of the
+# 219 open P0/P1/P2 issues carry NO kind prefix at all (`P0 storage: …`, `MCP read surface: …`,
+# `Run the LongMemEval-S …`), so an allowlist would silently drop every one of them, P0-blockers
+# included, and the queue would report a healthy-but-empty backlog. This surface's documented
+# failure is SILENT DISAPPEARANCE (#8465), so adding a container kind is a TEST change, never a
+# runtime guess. Measured effect of the whole change on the live queue: 192 → 179 pickable, and
+# NOT ONE issue newly included — it can withhold a container, never hide work.
+#
+# ⛔ `owner-decision` IS DELIBERATELY NOT IN THE LABEL ARM. Its description says "not for the
+# lane or orchestrator", but it is applied to real work rows — `fix(mcp): tortoise_create_source
+# cannot record the absent-raw state` (#5212), `defect(quota): …` (#4051) — so excluding it would
+# hide work. Narrowing that label's usage is a queue policy decision, not a filter edit.
+#
+# ⛔ THIS LINE IS EXTRACTED VERBATIM BY `pool-filter.test.sh`, so it stays ONE single-quoted
+# assignment on ONE line. `\\s` is doubled because a jq string literal needs it doubled; `$L`
+# and `$n` are jq variables and stay unexpanded inside the single quotes.
+POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["epic","standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:(?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|owner decision)(?:-[A-Za-z0-9]+)*\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
 OR_FROM_ENV="${OR:-}"
 # ⛔ "DECLARED" MEANS THE OPERATOR NAMED IT — NOT THAT THE VARIABLE IS PRESENT (#1977 review, P1).
 # `orch-loop.sh` EXPORTS `OR` on EVERY cycle, including the one where it fell back to its own default
@@ -3472,7 +3507,9 @@ fi
 
 touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 
-# pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus epics/owner-decisions
+# pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus container issues
+# ⛔ THE CONTAINER DEFINITION IS NOT IN THIS BLOCK — it is the single `POOL_JQ=` line near the top,
+# so the three tiers here and the emergency floor below cannot drift apart again (#10951).
 #
 # ⛔ SEVERITY FIRST, AGE SECOND. Each tier emits "<tier> <number>" and the sort keys on the tier
 # before the number. A bare `sort -n` over the numbers ALONE ordered by ISSUE NUMBER — i.e. oldest
@@ -3497,13 +3534,13 @@ touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 rm -f "$O/.pool-err" "$O/.pool-read"
 {
   if rest_list issues --repo "$OR" --state open --limit 300 --label P0-blocker \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
+    --jq ".[]|$POOL_JQ|\"0 \(.number)\"" 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
   else echo "P0-blocker" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P1-severe \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
+    --jq ".[]|$POOL_JQ|\"1 \(.number)\"" 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
   else echo "P1-severe" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+    --jq ".[]|$POOL_JQ|\"2 \(.number)\"" 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 # ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
 # number is what is emitted, so the pool is priority-ordered, oldest-first inside a tier. (The fork's
@@ -5338,7 +5375,7 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
   # does — so it must not stand the floor down either.
   if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
-      --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|.number' \
+      --jq ".[]|$POOL_JQ|.number" \
       > "$o/.emergency-issues" 2>/dev/null; then
     if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then
       weq_degrade "$o" \
