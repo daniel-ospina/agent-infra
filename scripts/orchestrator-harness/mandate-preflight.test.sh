@@ -739,6 +739,42 @@ case "$(tail -1 "$BRIEF3C")" in
   *'never claim to have read one'*) bad "…but the brief's LAST line is still the stale degraded notice — the lane is still ordered to report a falsehood" ;;
   *) ok "…and the stale claim is no longer the brief's last word" ;;
 esac
+# ── E3d: THE FLIP-BACK (heal → helper gone again) must not leave a stale PRESENT claim last (#3379 P2) ──
+# The seam's guard used to be a whole-FILE grep for `[mandate-preflight] CANNOT VERIFY`. After a heal the brief
+# ENDS with the emit's "BOTH mandated files are now PRESENT … do not claim a mandated file is missing" while an
+# OLD degraded notice survives earlier in the brief — so the grep matched that old copy, appended NOTHING, and
+# the lane's last word was a stale PRESENT claim while the log said CANNOT VERIFY. End-anchored now: the branch
+# appends whenever the brief does not END with the degraded notice.
+mkdir -p "$TMP/home6/.pi/agent/state"
+BRIEF3D="$TMP/brief-flipback.txt"; seam_brief "$BRIEF3D"
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran3d1.log" O="$TMP/O" CELL_HOME="$TMP/home6" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; cd "$2" || exit 2; mandate_preflight_lib() { return 1; }; run_agent 5 "$3" "$4" degraded' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam3d1.log" "$BRIEF3D" >/dev/null 2>&1
+: > "$TMP/home6/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; : > "$TMP/home6/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran3d2.log" O="$TMP/O" CELL_HOME="$TMP/home6" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; cd "$2" || exit 2; run_agent 5 "$3" "$4" healed' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam3d2.log" "$BRIEF3D" >/dev/null 2>&1
+case "$(tail -1 "$BRIEF3D")" in
+  *'BOTH mandated files are now PRESENT'*) ok "…setup: after the heal the brief ENDS with the emit's PRESENT notice (the state the flip-back starts from)" ;;
+  *) bad "…setup failed: the healed dispatch did not end the brief with the PRESENT notice (got: $(tail -1 "$BRIEF3D"))" ;;
+esac
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran3d3.log" O="$TMP/O" CELL_HOME="$TMP/home6" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; cd "$2" || exit 2; mandate_preflight_lib() { return 1; }; run_agent 5 "$3" "$4" degraded2' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam3d3.log" "$BRIEF3D" >/dev/null 2>&1
+case "$(tail -1 "$BRIEF3D")" in
+  *'BOTH mandated files are now PRESENT'*) bad "FLIP-BACK: the brief still ENDS with the stale PRESENT claim — the helper is gone again and the lane is told nothing (the whole-file guard matched an old notice earlier in the brief)" ;;
+  *'CANNOT VERIFY degraded2'*) ok "FLIP-BACK: the degraded notice is appended again, so the lane's last claim is CURRENT" ;;
+  *) bad "FLIP-BACK: the brief's last line is neither the degraded notice nor the stale claim (got: $(tail -1 "$BRIEF3D"))" ;;
+esac
 # ── E4: THE POSITIVE CONTROL FOR THE SEAM — present files leave the brief untouched ───────────────
 mkdir -p "$TMP/home3/.pi/agent/state"
 : > "$TMP/home3/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
@@ -881,10 +917,12 @@ grep -qF 'is not available to this spawn' "$MERGE"; ck $? "merge-one.sh APPENDS 
 # writes — rather than a shape that changed under it: the cycle-14 lesson that a pin must track the line
 # it guards, applied to a sibling commit that legitimately respelled that line.)
 grep -qF "if { printf '%s\\n%s\\n' '<!-- mandate-preflight #3377 -->' \"[mandate-preflight] CANNOT VERIFY reviewer PR #\$PR:" "$MERGE"; ck $? "…and the printf that PERFORMS that write is pinned (a colon keeps the prose and the redirect and writes nothing)"
-# ⛔ THE GUARD'S SHAPE CHANGED IN THIS CHANGE'S OWN FOURTH REVIEW (P2): the append is now an `if` branch so its
-# redirect failure can be REPORTED, so the pin follows the CODE it guards — `if ! grep … ; then` — rather
-# than the comment above it (the cycle-2 lesson: a pin satisfied by prose guards nothing).
-grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$MERGE"; ck $? "…and that append is IDEMPOTENT (its guard is pinned; without it a degraded box grows the brief per dispatch)"
+# ⛔ AND THE GUARD IS END-ANCHORED NOW (#3379 review, P2): a whole-file grep matched an OLD copy of the notice
+# earlier in the brief, so on a flip-back the seam appended nothing and left a stale "BOTH mandated files are
+# now PRESENT" as the last claim. Pin the CODE, not the prose (the cycle-2 lesson).
+grep -qF '_md_prefix="[mandate-preflight] CANNOT VERIFY reviewer PR #$PR:"' "$MERGE"; ck $? "…and that append is IDEMPOTENT, end-anchored on the notice the brief actually ENDS with (a whole-file grep matched a stale copy earlier in the brief)"
+grep -qF 'if [ "${_md_last#"$_md_prefix"}" = "$_md_last" ]; then' "$MERGE"; ck $? "…and merge-one.sh tests the brief's LAST LINE, not 'the phrase occurs somewhere' (the flip-back hole)"
+grep -qF '<!-- mandate-preflight #3377 -->' "$MERGE"; ck $? "…and merge-one.sh's degraded notice CARRIES the sentinel (without it a provisioned box can never retire it)"
 # ⛔ THE OUTER GUARD LINE SURVIVES EVERY REVERT OF THE FIX'S SUBSTANCE (#3379 review cycle 5, P2, MEASURED):
 # restoring merge-one's ungrouped `printf … >> "$prompt"` INSIDE the kept `if ! grep …; then`, or deleting
 # its WARN `else`, both left this suite at 133 passed / 0 failed. merge-one cannot be driven behaviourally
@@ -894,14 +932,10 @@ grep -qF '>> "$prompt"; } 2>/dev/null; then' "$MERGE"; ck $? "…and merge-one.s
 # ⛔ SAME DESTINATION HOLE ON THE WARN (#3379 review cycle 12, P2, MEASURED): the arm said "RECORDS a failed
 # append in the operator log" while pinning only the sentence — `>> "$log"` → `>> /dev/null` stayed 162/0. The
 # WARN exists to tell an operator the LANE went untold; a WARN written nowhere tells nobody.
-# ⛔ TWO ANCHORS ON ONE LINE IS ONE ASSERTION PLUS A VACUOUS ONE (#3379 review cycle 14, P1, MEASURED — and
-# this was MY bug, introduced one commit earlier): `ck` CONSUMES `$?`, so a second `ck $?` after it tests the
-# FIRST grep's status again — always 0 — and can never fail. The arm therefore printed ✅ on the very mutant
-# its text named ("a WARN written to /dev/null used to pass"), while `>> "$log"` → `>> /dev/null` on this line
-# left the suite at 169/0. One `ck` per capture, and the destination is a capture of its own.
 grep -qF 'echo "[mandate-preflight] WARN reviewer PR #$PR: could not append' "$MERGE"; ck $? "…and the failed-append WARN is WRITTEN (the echo: a colon keeps the prose and writes nothing)"
-grep -qF 'Proceeding (a disclosure, not a gate)." >> "$log"' "$MERGE"; ck $? "…AND RECORDS it IN THE OPERATOR LOG (destination pinned separately; a second ck on one line is vacuous)" 
-grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too (same guard; deleting it left the suite green)"
+grep -qF 'Proceeding (a disclosure, not a gate)." >> "$log"' "$MERGE"; ck $? "…AND RECORDS it IN THE OPERATOR LOG (destination pinned separately; a second ck on one line is vacuous)"
+grep -qF '_md_prefix="[mandate-preflight] CANNOT VERIFY $label:"' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too, end-anchored on the notice the brief ENDS with"
+grep -qF 'if [ "${_md_last#"$_md_prefix"}" = "$_md_last" ]; then' "$SPAWN"; ck $? "…and it tests the LAST LINE, not 'the phrase occurs somewhere' (the whole-file grep was the flip-back hole)"
 # ⛔ THE LOG IS NOT THE LANE, AND THAT WAS THE ACTUAL HOLE (this change's review cycle 2, P1, MEASURED):
 # the notice above went to `$log` ONLY, so on a box that has not received the helper the LANE was told
 # nothing — #3377 exactly, on the population #3377 measured — and replacing BOTH notices with `:` left the

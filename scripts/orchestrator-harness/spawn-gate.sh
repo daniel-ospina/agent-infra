@@ -2407,7 +2407,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ⛔ It is a DISCLOSURE, never a gate: every branch PROCEEDS. The absence is box state that no brief
   # author can fix from the brief (the fix is a provisioning path — #1193 owns the content), so refusing
   # here would be an over-block that halts the fleet instead of a warning that reaches it.
-  local _mp_sh _mp_why
+  local _mp_sh _mp_why _md_last _md_prefix
   _mp_sh="$(mandate_preflight_lib)" || _mp_sh=""
   # ⛔ SOURCING SUCCESS IS NOT HELPER USABILITY (this change's review, P2). A bare
   # `. "$_mp_sh" && mandate_preflight_emit …` turns "the helper was found but is unusable" (a stale or
@@ -2441,7 +2441,16 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     # landed or not. That is #3377's silence restored, in the one branch an un-provisioned box takes. The
     # helper's own emit already refuses this shape (`mandate-preflight.sh`'s `if { printf … } 2>/dev/null`
     # with a WARN on the else); this is the same `if`/`else` in the seam.
-    if ! grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null; then
+    # ⛔ END-ANCHORED, NOT "THE PHRASE OCCURS SOMEWHERE" (#3379 review, P2, MEASURED). The guard used to be
+    # `grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt"` — a whole-FILE substring test. Now that a
+    # healed box ends its brief with "BOTH mandated files are now PRESENT … do not claim a mandated file is
+    # missing", a LATER dispatch whose helper is unavailable again matched the OLD notice earlier in the
+    # brief, appended NOTHING, and left that stale PRESENT claim as the lane's last word while the log said
+    # CANNOT VERIFY — the flip-back hole the emit's own guard records as fixed, left one layer out. The rule
+    # is the emit's (`mandate_ends_with`): the claim that matters is the one the brief ENDS with.
+    _md_prefix="[mandate-preflight] CANNOT VERIFY $label:"
+    _md_last="$(tail -n 1 "$prompt" 2>/dev/null)" || :
+    if [ "${_md_last#"$_md_prefix"}" = "$_md_last" ]; then
       # ⛔ AND IT CARRIES THE SENTINEL, LIKE EVERY OTHER SHAPE (#3379 review, P1, MEASURED). Without the
       # marker the emit's content-aware guard (`stamped`) can NEVER retire this block: on a box that is later
       # provisioned, the lane keeps reading "treat every mandated file as unread … never claim to have read

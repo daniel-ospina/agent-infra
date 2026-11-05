@@ -153,7 +153,7 @@ REVIEW_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section reviewer)" || {
 # agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
 # reaper in orch-loop.sh is the second line of defence.
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc start elapsed bgrc _mt_why
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed bgrc _mt_why _md_last _md_prefix
   AGENT_STARTED=0
   # ── THE BRIEF GATE (#2258), first and fail-closed, for the reason spawn-gate.sh gives: a brief
   # refusal is DETERMINISTIC (it will not clear by waiting, and it follows the item to any box), so
@@ -210,7 +210,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
     # emits its own `line N: <path>: Permission denied` to the CALLER's stderr (a trailing `2>/dev/null`
     # cannot retract it — redirections apply left to right) and NOTHING records that the reviewer was never
     # told, so the `CANNOT VERIFY` line above reads identically either way.
-    if ! grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null; then
+    # ⛔ END-ANCHORED — the sibling seam's fix, for the same measured reason (#3379 review, P2): a
+    # whole-file `grep` for the notice matched an OLD copy earlier in the brief, so on a flip-back the
+    # reviewer kept a stale "BOTH mandated files are now PRESENT" as its last mandate claim and nothing was
+    # appended. The claim that matters is the one the brief ENDS with.
+    _md_prefix="[mandate-preflight] CANNOT VERIFY reviewer PR #$PR:"
+    _md_last="$(tail -n 1 "$prompt" 2>/dev/null)" || :
+    if [ "${_md_last#"$_md_prefix"}" = "$_md_last" ]; then
       # ⛔ AND IT CARRIES THE SENTINEL — the sibling seam's fix, for the same measured reason (#3379
       # review, P1): without the marker the emit's `stamped` guard can never retire this block, so a
       # provisioned box keeps a false "treat every mandated file as unread" as the reviewer's last claim.
