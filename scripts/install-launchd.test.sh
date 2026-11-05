@@ -406,6 +406,39 @@ assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "$HOME1/.pi/agent/scripts
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "<integer>300</integer>" "runner-gate every 5 min (StartInterval 300)"
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "RunAtLoad" "runner-gate runs once at load (a freshness kick)"
 assert_contains "$(cat "$GATE_INSTALLED" 2>/dev/null)" "agent-infra-plist-version: 0.1.0" "runner-gate template carries version marker"
+# #2413 audit — the three units that were ARMED AND DEAD now point at the FARMED copy, and NOTHING
+# pinned those three TEMPLATES (P2-C of the #3413 review): `mkfakehome` carries both candidate paths
+# and neither is under the fixture's `~/Documents`, so `verify_targets` passed either way and
+# reverting `com.eldato.worker-supply.plist` or `com.eldato.controller-watchdog.plist` to
+# `{{AGENT_INFRA_PATH}}` left the whole suite green — on the two units with `runs=1766` and the 126
+# deaths this change is about. Both directions are asserted: the farmed path is PRESENT and the
+# checkout path is ABSENT, so neither half of a revert can hide.
+WS_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.worker-supply.plist"
+CW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.controller-watchdog.plist"
+OR_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist"
+# ⛔ READ THE RENDERED ProgramArguments VALUE, never the whole file (the same E2-3 lesson
+# `installed_path` below records): these plists legitimately carry `AGENT_INFRA_PATH` in
+# `EnvironmentVariables`, so a whole-file `assert_not_contains` reds on a CORRECT unit — a false RED
+# that invites weakening the assertion instead of the template.
+installed_program_args() { # $1 = installed plist → its ProgramArguments <string> values, one per line
+    awk '
+        /<key>ProgramArguments<\/key>/ { inargs = 1; next }
+        inargs && /<\/array>/          { inargs = 0; next }
+        inargs && /<string>/           { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print }
+    ' "$1" 2>/dev/null || true
+}
+assert_contains "$(installed_program_args "$WS_INSTALLED")" "$HOME1/.pi/agent/scripts/orchestrator-harness/worker-supply.sh" \
+    "worker-supply plist execs the FARMED copy, still NESTED (#427/#2413)"
+assert_not_contains "$(installed_program_args "$WS_INSTALLED")" "$AGENT_INFRA_PATH/scripts/" \
+    "…and does NOT exec the checkout path (the ~/Documents form that exits 126, #427/#2413)"
+assert_contains "$(installed_program_args "$CW_INSTALLED")" "$HOME1/.pi/agent/scripts/orchestrator-harness/watchdog-loop.sh" \
+    "controller-watchdog plist execs the FARMED copy, still NESTED (#427/#2413)"
+assert_not_contains "$(installed_program_args "$CW_INSTALLED")" "$AGENT_INFRA_PATH/scripts/" \
+    "…and does NOT exec the checkout path (#427/#2413)"
+assert_contains "$(installed_program_args "$OR_INSTALLED")" "$HOME1/.pi/agent/scripts/objective-reminder.sh" \
+    "objective-reminder plist execs the FARMED copy (#427/#2413)"
+assert_not_contains "$(installed_program_args "$OR_INSTALLED")" "$AGENT_INFRA_PATH/scripts/" \
+    "…and does NOT exec the checkout path (#427/#2413)"
 # #1719 — these assertions read the RENDERED PATH VALUE, not the whole plist (review E2-3). The
 # rendered plist keeps the template's comments, and a purely documentary edit that NAMES the shim
 # path (e.g. `~/.pi/agent/shims`, which the installer's own comment uses) would red a whole-file
@@ -681,7 +714,6 @@ touch "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
 chmod +x "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
 sed -i.bak \
     -e 's#<string>{{HOME}}/.pi/agent/scripts/objective-reminder.sh</string>#<string>{{HOME}}/Documents/checkout/scripts/tcc-dead.sh</string>#' \
-    -e 's/agent-infra-plist-version: 0.2.0/agent-infra-plist-version: 0.2.0-tccprobe/' \
     "$TEMPLATES/com.eldato.objective-reminder.plist" \
     && rm -f "$TEMPLATES/com.eldato.objective-reminder.plist".bak || true
 rm -f "$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist"
@@ -692,20 +724,91 @@ set -e
 assert_eq "$RC" "1" "TCC-protected target → exit 1"
 assert_contains "$OUT" "TCC-protected target" "TCC-protected target named"
 assert_contains "$OUT" "Operation not permitted" "the 126 symptom is named in the refusal"
-assert_contains "$OUT" "FAIL" "TCC-protected target refuses install"
+assert_contains "$OUT" "FAIL com.eldato.objective-reminder" "the refusal names the unit it would not arm"
 # The whole point: the guard must not merely WARN — the unit is absent, not half-installed.
 if [ -e "$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist" ]; then
     echo "✗ TCC-protected unit was installed anyway" >&2; exit 1
 fi
-# Restore the template + fixture so later sections install cleanly.
+# Restore the template so later sections install cleanly. The `agent-infra-plist-version` bump this
+# used to make (and undo) was already unnecessary — the `rm -f` above forces the reinstall — and it
+# hardcoded a version string that silently became a no-op at the next template bump (review P3-J).
 sed -i.bak \
     -e 's#<string>{{HOME}}/Documents/checkout/scripts/tcc-dead.sh</string>#<string>{{HOME}}/.pi/agent/scripts/objective-reminder.sh</string>#' \
-    -e 's/agent-infra-plist-version: 0.2.0-tccprobe/agent-infra-plist-version: 0.2.0/' \
     "$TEMPLATES/com.eldato.objective-reminder.plist" \
     && rm -f "$TEMPLATES/com.eldato.objective-reminder.plist".bak || true
-mkfakehome "$HOME1"
 
-# Restore the farmed script so later tests install cleanly
+echo "── 7c. the TCC guard's OWN resolution paths (#3413 review P2-D) ──"
+# §7b drives the whole installer, and that run can only ever reach the FIRST `case` arm: its target
+# and its root share the literal prefix, so `is_tcc_protected` returns before `physical_path`, before
+# the ROOT's physical comparison, and before the final-component symlink follow — deleting any of them
+# left §7b green, including the two resolutions the change's own comment credits with catching a
+# defect. So the function is probed DIRECTLY here, on the four shapes the fix is about, with a
+# symlinked alias so each path is distinguishable on Linux AND macOS.
+GUARD_LIB="$T/tcc-guard.sh"
+sed -n '/^tcc_protected_roots()/,/^}/p;/^physical_path()/,/^}/p;/^is_tcc_protected()/,/^}/p;/^plist_program_args()/,/^}/p;/^verify_targets()/,/^}/p' "$INSTALLER" > "$GUARD_LIB"
+if grep -q '^is_tcc_protected()' "$GUARD_LIB" && grep -q '^physical_path()' "$GUARD_LIB" \
+   && grep -q '^tcc_protected_roots()' "$GUARD_LIB" && grep -q '^verify_targets()' "$GUARD_LIB"; then
+    ok "the TCC guard's functions are extractable, so the probes below are not vacuous"
+else
+    bad "could not extract is_tcc_protected/physical_path/tcc_protected_roots/verify_targets — every probe below would be vacuous"
+fi
+tcc_probe() { # <home> <path> → "protected" | "ok"
+    ( HOME="$1"; . "$GUARD_LIB"; if is_tcc_protected "$2"; then echo protected; else echo ok; fi )
+}
+PROBE_HOME="$T/probe-home"
+mkdir -p "$PROBE_HOME/Documents/checkout/scripts" "$PROBE_HOME/.pi/agent/scripts" "$PROBE_HOME/safe"
+touch "$PROBE_HOME/Documents/checkout/scripts/dead.sh" "$PROBE_HOME/safe/live.sh"
+ln -s "$PROBE_HOME/Documents/checkout/scripts/dead.sh" "$PROBE_HOME/.pi/agent/scripts/farm-link.sh"
+ln -s "$PROBE_HOME/safe/live.sh" "$PROBE_HOME/.pi/agent/scripts/farm-out.sh"
+ln -sfn "$PROBE_HOME" "$T/probe-alias"
+assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/Documents/checkout/scripts/dead.sh")" "protected" \
+    "a literal path under Documents is refused"
+assert_eq "$(tcc_probe "$PROBE_HOME" "$T/probe-alias/Documents/checkout/scripts/dead.sh")" "protected" \
+    "…and the same file reached through a SYMLINKED ANCESTOR is refused (the physical-TARGET resolution)"
+assert_eq "$(tcc_probe "$T/probe-alias" "$PROBE_HOME/Documents/checkout/scripts/dead.sh")" "protected" \
+    "…and the ROOT's physical form is compared too (HOME itself reached through a symlink — /tmp on macOS)"
+assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/farm-link.sh")" "protected" \
+    "…and a FARM entry that IS a symlink INTO Documents is refused (P0: resolving only the directory passed it)"
+assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/farm-out.sh")" "ok" \
+    "…while a symlink pointing OUT of the tree passes (the documented contract is not over-blocked)"
+assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/safe/live.sh")" "ok" \
+    "a path outside every protected root passes"
+
+# ── EXEC vs DATA: the over-block, pinned in both directions (P1-A) ─────────
+# `verify_targets` used to run `is_tcc_protected` over EVERY absolute ProgramArguments element, so a
+# pure `--repo <~/Documents/…>` refused the whole unit on the box default and `sync.sh:81`'s unguarded
+# `set -e` run died before its own later gates. Nothing pinned that, so a revert reddens nothing. The
+# rule is now: only what launchd must READ to start the job may hard-refuse; DATA warns.
+write_job_plist() { # <file> <ProgramArguments element>...
+    local out="$1"; shift
+    {
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n<key>ProgramArguments</key><array>\n'
+        local a
+        for a in "$@"; do printf '<string>%s</string>\n' "$a"; done
+        printf '</array></dict></plist>\n'
+    } > "$out"
+}
+vt_probe() { # <plist> → "<rc>" and leaves the output in $T/vt.out
+    ( HOME="$PROBE_HOME"; . "$GUARD_LIB"; verify_targets "$1" 2>&1; exit $? ) > "$T/vt.out" 2>&1
+}
+write_job_plist "$T/job-data.plist" /bin/bash "$PROBE_HOME/safe/live.sh" --repo "$PROBE_HOME/Documents/checkout"
+set +e; VRC="$(vt_probe "$T/job-data.plist"; echo "rc=$?")"; set -e
+assert_eq "${VRC##*rc=}" "0" "a DATA argument under Documents does NOT refuse the unit (the over-block that killed sync.sh)"
+assert_contains "$(cat "$T/vt.out")" "WARN" "…it WARNS instead, so the TCC-dead WORK is still named"
+assert_contains "$(cat "$T/vt.out")" "Documents/checkout" "…and names the argument whose work launchd cannot do"
+write_job_plist "$T/job-exec.plist" "$PROBE_HOME/Documents/checkout/scripts/dead.sh"
+set +e; VRC="$(vt_probe "$T/job-exec.plist"; echo "rc=$?")"; set -e
+assert_eq "${VRC##*rc=}" "1" "an EXEC target (argv[0]) under Documents still HARD-REFUSES — the 126 is real"
+assert_contains "$(cat "$T/vt.out")" "TCC-protected target" "…and the refusal says so by name"
+write_job_plist "$T/job-interp.plist" /bin/bash "$PROBE_HOME/Documents/checkout/scripts/dead.sh" --repo /tmp
+set +e; VRC="$(vt_probe "$T/job-interp.plist"; echo "rc=$?")"; set -e
+assert_eq "${VRC##*rc=}" "1" "…and so is the SCRIPT a resolved interpreter is handed (argv[1]), not just argv[0]"
+write_job_plist "$T/job-noabs.plist" relative-only
+set +e; VRC="$(vt_probe "$T/job-noabs.plist"; echo "rc=$?")"; set -e
+assert_eq "${VRC##*rc=}" "1" "a ProgramArguments with no absolute entry REFUSES rather than verifying nothing (P2-E: an empty scan is not a pass)"
+
+# Restore the fixture so later sections install cleanly (one call — the second was a duplicate,
+# review P3-J).
 mkfakehome "$HOME1"
 
 echo "── 8. Placeholder skip (no swarm root) ───────────────────────────"
