@@ -950,7 +950,7 @@ ANCHORS = {
         "        */state/HARNESS-PIN) pin_root=\"${pin_root%/state/HARNESS-PIN}\" ;;",
         "        */__mutant_no_pin_root_derivation__) pin_root=\"\" ;;   # MUTANT: the derivation is deleted",
     ),
-    # (4b) delete the NORMALISATION (trailing-slash strip + `//` collapse) but keep the derivation, so a
+    # (4b) delete the `//` COLLAPSE only — the trailing-slash strip still runs — but keep the derivation, so a
     # non-canonical spelling of the sha record derives the WRONG root — `<root>/.pi/agent/` — where the
     # production dir record does not live. That is a silent miss and therefore a removal, and it is why
     # the normalisation is not cosmetic (`check-farm-drift.sh:194` needed the same one).

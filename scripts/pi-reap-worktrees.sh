@@ -367,9 +367,11 @@
 #   worktree-locked (an `initializing` lock older than REAP_WT_STALE_INIT_SECONDS is DETECTED here
 #   and the interrupted-add class stays pending) > unreadable-path | prunable > live-process >
 #   live-cwd > pin-tree | pin-tree-shape (#10114 — a HARNESS PIN TREE is a holder /proc cannot
-#   show, so it outranks every removal rule that can fire on a tree that still EXISTS — rules
-#   3/4/5 and the residue gates below it; the `unreadable-path | prunable` arm ABOVE it only fires
-#   when the directory is already gone, so it cannot destroy a pin tree) > live-claim > claim-unverified >
+#   show, so it outranks every removal rule that can fire on a tree that still EXISTS — rules 3/4,
+#   which are the only REMOVE rules, and the residue gates below it; the only `remove` ABOVE it is the
+#   `prunable` arm, which fires only when the directory is already absent, and `unreadable-path` is a
+#   PRESERVE — so neither can destroy a pin tree. Rule 5 is a KEEP and removes nothing) >
+#   live-claim > claim-unverified >
 #   interrupted-add[-unreachable] >
 #   dirty | ignored-artifact | status-timeout | status-error > abandoned-wip >
 #   detached-unreachable > open-pr > too-recent | ghost-zero-ahead > too-young >
