@@ -632,6 +632,37 @@ ck "N4h …and next= is MANUAL and says the artifact asserts NEITHER delivery NO
 [ -z "$(git -C "$N4E-lane" config --get branch.advlane.merge 2>/dev/null)" ] \
   && [ -z "$(git -C "$N4E-lane" config --get branch.advlane.remote 2>/dev/null)" ]; rcn4i=$?
 ck "N4i …and the exit path writes NO upstream for the lane's branch — a dying terminal may not hand a peer worktree a pull/push default it never configured" $rcn4i
+# ⛔ N4j — THE BOUNDED SCRATCH DIR IS RELEASED, AND THE PRIME MUST COME BEFORE THE FIRST BOUNDED CALL
+# (review round 3, P2 — REPRODUCED). Every bounded call in `lane_end_push` is CAPTURED, so `tb_bound_tmp`'s
+# `mktemp -d` runs in the command-substitution SUBSHELL unless the parent already holds the handle. With the
+# prime sitting after the proof and symref reads, those two still minted their own directory and the parent
+# cleaned up nothing — measured: two orphaned `bounded.*` dirs per lane exit, which is the accumulation this
+# feature exists to stop. `TB_TIMEOUT_FORCE_INTERNAL=1` is part of the arm: without it this host's GNU
+# `timeout` runs and the arm would measure a path that never touches the scratch dir at all.
+rm -rf "$N4E-tmp"; mkdir -p "$N4E-tmp"
+: > "$O/logs/n4j.log"
+TMPDIR="$N4E-tmp" TB_TIMEOUT_FORCE_INTERNAL=1 bash -c '
+  . "$1"
+  lane_end_push n4j "$2" "$3" advlane 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$O/logs/n4j.log" "$N4E-lane" 2>/dev/null > "$TMP/n4j.out"
+n4j_dirs="$(ls -d "$N4E-tmp"/bounded.* 2>/dev/null | wc -l | tr -d ' ')"
+# non-vacuity: the internal path really ran and really made the dir (else the count proves nothing)
+grep -q 'bounded\.' "$O/logs/n4j.log" 2>/dev/null || :
+[ "${n4j_dirs:-1}" -eq 0 ] && grep -q 'push=' "$TMP/n4j.out"; rcn4j=$?
+ck "N4j …and the bounded scratch dir is RELEASED rather than orphaned (${n4j_dirs:-?} \`bounded.*\` dirs left after a real exit-path push — the prime covers the proof and symref reads, not just the last two)" $rcn4j
+# ⛔ N4k — EVERY CONSUMER OF THE `push=` DOMAIN, NOT JUST THE TWO THAT WERE REMEMBERED (review round 3,
+# P1 — REPRODUCED). `verify-ancestry-unmeasured` was added to `lane_end_next` and to
+# `lane_end_push_caveat`, but NOT to the `[wip] NOTE` case in `terminal_wip_rescue` — the THIRD consumer —
+# so it fell to that case's `*)` arm and printed "N commit(s) … exist ONLY locally and were NOT pushed" in
+# the same terminal whose marker `next=` says "asserts NEITHER delivery NOR loss". A false measured
+# absence, which is the one class this whole feature exists to remove. STATIC on purpose: driving the NOTE
+# needs a full cap/clean-tree fixture, and what went stale is not the sentence but the DOMAIN LIST — the
+# list is what this pins.
+n4k_body="$(awk '/^terminal_wip_rescue\(\)/,/^}/' "$GATE" 2>/dev/null)"
+[ "$(grep -c 'verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured' <<< "$n4k_body")" = 1 ] \
+  && grep -q 'MIGHT exist only locally' <<< "$n4k_body"; rcn4k=$?
+ck "N4k the [wip] NOTE abstains for EVERY abstaining push verdict, not just the three it was written for — a verdict added to the domain must be found in all THREE consumers, not the two that were remembered" $rcn4k
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
 # ⛔ N6 — AN UNREADABLE REMOTE ANSWER IS UNKNOWN, NOT "NO PROTECTED NAMES" (review cycle 2, finding 1,
@@ -802,27 +833,34 @@ ck "N14b …and the bound bounds WALL CLOCK: a CAPTURED command whose grandchild
 # ⛔ NO `setsid` HERE — macOS has none, and the fleet's orchestrator boxes are Macs. `set -m` in the
 # probe's PARENT makes the probe its own group leader on any bash, which is the same shape a reaper
 # creates; the arm asserts that shape (non-vacuity) before it signals anything.
+# ⛔ AND THE ARM SCORES THE PID IT STARTED, NEVER AN ARGV MATCH (review round 3, P1 — REPRODUCED). Matching
+# the process table for `sleep 4242` and then `pkill -9 -f` on it made two lanes running this suite on one
+# box interfere: a leftover from an interrupted run read as "the bounded command SURVIVED" (a false red),
+# and the cleanup then SIGKILLed a process this run did not own. The bounded command now publishes its own
+# pid, which is the only handle that is true of THIS run — the measurement-artifact rule, applied to the
+# instrument rather than to the product.
 cat > "$TMP/n14c-probe.sh" <<'N14CPROBE'
 set -u
 export TB_TIMEOUT_FORCE_INTERNAL=1
 . "$1"
-tb_timeout 60 sleep 4242 &
+tb_timeout 60 bash -c 'echo $$ > "$1"; exec sleep 4242' _ "$2" &
 wait
 N14CPROBE
 n14c_pid="$(bash -c '
   set -m 2>/dev/null
-  bash "$1" "$2" >/dev/null 2>&1 &
-  printf "%s" "$!"' _ "$TMP/n14c-probe.sh" "$HERE/../lib/bounded.sh")"
+  bash "$1" "$2" "$3" >/dev/null 2>&1 &
+  printf "%s" "$!"' _ "$TMP/n14c-probe.sh" "$HERE/../lib/bounded.sh" "$TMP/n14c-child.pid")"
 sleep 2
 n14c_pgid="$(ps -o pgid= -p "${n14c_pid:-0}" 2>/dev/null | tr -d ' ')"
-n14c_before="$(pgrep -f '^sleep 4242$' 2>/dev/null | wc -l | tr -d ' ')"
-[ -n "$n14c_pid" ] && [ "$n14c_pgid" = "$n14c_pid" ] && [ "${n14c_before:-0}" -ge 1 ]; rcn14c=$?
-ck "N14c the probe is a real caller-group shape (pgid ${n14c_pgid:-?} = pid ${n14c_pid:-?}) and the bounded command is running (${n14c_before} tagged process(es)) — so the signal below is the fleet's own shape" $rcn14c
+n14c_child="$(cat "$TMP/n14c-child.pid" 2>/dev/null)"
+[ -n "$n14c_pid" ] && [ "$n14c_pgid" = "$n14c_pid" ] && [ -n "$n14c_child" ] && kill -0 "$n14c_child" 2>/dev/null; rcn14c=$?
+ck "N14c the probe is a real caller-group shape (pgid ${n14c_pgid:-?} = pid ${n14c_pid:-?}) and ITS OWN bounded command is running (pid ${n14c_child:-?}) — so the signal below is the fleet's own shape" $rcn14c
 kill -TERM -"${n14c_pid:-0}" 2>/dev/null
 sleep 2
-pgrep -f '^sleep 4242$' >/dev/null 2>&1; rcn14d=$?
+kill -0 "${n14c_child:-0}" 2>/dev/null; rcn14d=$?
 [ "$rcn14d" -ne 0 ]; rcn14d=$?
-ck "N14d …and a caller group-TERM reaches the bounded command: it is GONE (pre-fix it survived at ppid 1 for its whole bound — the watchdog was ungrouped with it and its trap forwarded nothing)" $rcn14d
+ck "N14d …and a caller group-TERM reaches the bounded command: the pid THIS arm started is GONE (pre-fix it survived at ppid 1 for its whole bound — the watchdog was ungrouped with it and its trap forwarded nothing)" $rcn14d
+kill -9 "${n14c_child:-0}" 2>/dev/null
 # ⛔ AND THE ESCALATION: a command that IGNORES the forwarded TERM must not outlive the reap either, or
 # ungrouping it would have hidden it from the reaper's second (KILL) stage.
 cat > "$TMP/n14e-probe.sh" <<'N14EPROBE'
@@ -830,20 +868,21 @@ set -u
 export TB_TIMEOUT_FORCE_INTERNAL=1
 . "$1"
 trap '' TERM
-tb_timeout 60 sleep 4343 &
+tb_timeout 60 bash -c 'echo $$ > "$1"; exec sleep 4343' _ "$2" &
 wait
 N14EPROBE
 n14e_pid="$(bash -c '
   set -m 2>/dev/null
-  bash "$1" "$2" >/dev/null 2>&1 &
-  printf "%s" "$!"' _ "$TMP/n14e-probe.sh" "$HERE/../lib/bounded.sh")"
+  bash "$1" "$2" "$3" >/dev/null 2>&1 &
+  printf "%s" "$!"' _ "$TMP/n14e-probe.sh" "$HERE/../lib/bounded.sh" "$TMP/n14e-child.pid")"
 sleep 2
+n14e_child="$(cat "$TMP/n14e-child.pid" 2>/dev/null)"
 kill -TERM -"${n14e_pid:-0}" 2>/dev/null
 sleep 3
-pgrep -f '^sleep 4343$' >/dev/null 2>&1; rcn14e=$?
+kill -0 "${n14e_child:-0}" 2>/dev/null; rcn14e=$?
 [ "$rcn14e" -ne 0 ]; rcn14e=$?
-ck "N14e …and a TERM-IGNORING command is ESCALATED to SIGKILL by the watchdog, so ungrouping it did not hide it from the reaper's second stage" $rcn14e
-pkill -9 -f '^sleep 4242$' 2>/dev/null; pkill -9 -f '^sleep 4343$' 2>/dev/null
+ck "N14e …and a TERM-IGNORING command is ESCALATED to SIGKILL by the watchdog, so ungrouping it did not hide it from the reaper's second stage (pid ${n14e_child:-?})" $rcn14e
+kill -9 "${n14e_child:-0}" "${n14c_child:-0}" 2>/dev/null
 # ⛔ N15 — THE HUB REFUSAL IS READ, NOT INHERITED (review cycle 4, gap 3: F7 executes the shape but no arm
 # ever greps `refused-main-checkout`, so deleting the block left the suite green — the merge-gate bypass
 # the comment names, undetected).
@@ -2301,9 +2340,11 @@ git -C "$n44h/wk" worktree remove --force "$n44h/wt" 2>/dev/null
 n45_sha=deadbeef
 n45_bad=""; n45_all=""
 for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured clean; do
-  for n45_push in pushed nothing running unmeasured detached verify-unanswered push-unreported push-killed \
-                  FAILED UNAVAILABLE refused-unknown-default refused-protected refused-main-checkout \
-                  refused-pushurl-divergent refused-pushurl-unresolved; do
+# ⛔ ONE DEFINITION OF THE MATRIX'S PUSH DOMAIN, SO THE COMPLETENESS ARM BELOW CAN COMPARE AGAINST IT
+# (review round 3, P1). It used to be inline in the `for`, which is why a 16th verdict could be added to
+# `lane_end_push` and silently never exercised.
+n45_push_domain="pushed nothing running unmeasured detached verify-unanswered push-unreported push-killed verify-ancestry-unmeasured FAILED UNAVAILABLE refused-unknown-default refused-protected refused-main-checkout refused-pushurl-divergent refused-pushurl-unresolved"
+  for n45_push in $n45_push_domain; do
     for n45_rescue in nothing FAILED UNAVAILABLE archived-local refs/wip/develop; do
       n45_out="$( bash -c '
         . "$1"
@@ -2433,6 +2474,20 @@ n45_bad2=0
 n45_distinct="$(printf '%s\n' "$n45_all" 2>/dev/null | sed '/^$/d' | sort -u | wc -l | tr -d ' ')"
 [ "${n45_distinct:-0}" -ge 20 ] || n45_bad2=1
 ck "N45b …and the matrix really reaches distinct arms (${n45_distinct:-0} distinct next= sentences, floor 20) — a floor below 1 would make N45 vacuous" $n45_bad2
+# ⛔ N45c — THE MATRIX'S OWN DOMAIN LIST MUST TRACK THE CODE (review round 3, P1 — REPRODUCED). The push
+# list above is a HARDCODED 15-value enumeration, and `verify-ancestry-unmeasured` was added to
+# `lane_end_push` without being added to it — so the new arm's `%s` slots, format re-runs and specifier
+# counts were asserted by NOTHING: deleting an argument from the new arm's printf left the matrix green
+# while the sentence rendered the root into the sha slot and an empty sha into the `git -C` slot. That is
+# precisely the class this matrix exists to catch, defeated by a list nobody re-derived. So the domain is
+# now DERIVED from the source and every assigned value must appear in the list.
+n45_derived="$(grep -o 'LANE_END_PUSH="[a-z][a-z-]*"' "$GATE" 2>/dev/null | sed 's/.*="//; s/"$//' | sort -u)"
+n45_missing=""
+for n45_v in $n45_derived; do
+  grep -q "\\b${n45_v}\\b" <<< "$n45_push_domain" 2>/dev/null || n45_missing="$n45_missing $n45_v"
+done
+[ -z "$n45_missing" ] && [ -n "$n45_derived" ]; n45_bad3=$?
+ck "N45c …and every push verdict the CODE can assign is in the matrix's list, derived from source (${n45_derived_count:-$(printf '%s\n' $n45_derived | wc -l | tr -d ' ')} values${n45_missing:+, MISSING:$n45_missing}) — so a new verdict cannot be forgotten the way this one was" $n45_bad3
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
