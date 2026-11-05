@@ -897,7 +897,7 @@ for n28p in nothing pushed; do
   # ⛔ CASE-INSENSITIVE ON PURPOSE: the sentence reads "Do NOT reap", and a `case` pattern is
   # case-sensitive — the first cut of this arm matched "do NOT reap" and went red on its own wording
   # while the behaviour was correct.
-  { case "$n28" in MANUAL*) : ;; *) false ;; esac; } && printf '%s' "$n28" | grep -qi 'NOT reap'; rcn28=$?
+  { case "$n28" in MANUAL*) : ;; *) false ;; esac; } && grep -qi 'NOT reap' <<<"$n28"; rcn28=$?
   ck "N28 cannot-verify with push=$n28p gets next=MANUAL / do-not-reap — the artifact and the lane log agree [${n28:0:60}]" $rcn28
 done
 # ⛔ N29 — THE OTHER UNMEASURED EARLY RETURN LEARNS THE SAME LESSON (review cycle 9, P2). N24/G10b cover
