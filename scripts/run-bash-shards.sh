@@ -875,11 +875,41 @@ shard_kill_group() {
 # rc 124, which a suite is free to exit with itself). `shard_bound` 0 short-circuits to the plain
 # invocation, so disabling the bound is not a second code path — it is the ABSENCE of the watchdog,
 # which is what `SHARD_BOUND=0` promises.
+# ⛔ A SHARD DOES NOT INHERIT THIS PROCESS'S OWN DISPATCH DECISION (agent-infra#3415/#2741, measured).
+# The three variables in this runner's env contract describe the CALLER's dispatch — which slice THIS
+# process runs, what bound THIS process applies to each shard — and none of them is a fact about a
+# shard's own children. Handing them over unmodified made every RE-ENTRANT suite (one whose fixture
+# runs the real runner on its own staged list) read the parent's slice as its own:
+#
+#   ❌ BASH_SHARD_SLICE asks for 8 slice(s) of 3 listed shard(s) — a slice would run nothing   (exit 2)
+#
+# Measured 2026-11-05 on head c012d438: EIGHTEEN suites red across all 8 `bash-suites` slices — every
+# one of them green on a laptop, where nothing exports these — while `bash-suites-gate` (unsliced) and
+# main's `script-validate` (a single unsliced job) both stayed GREEN. So the red was in no suite and in
+# no diff: it was this handover. `tests/run-bash-shards-bound/run.sh:76-92` had already written the
+# defect down and worked around it for ITSELF; `tests/ci-lane-parity/run.sh` spells the same workaround
+# at 18 call sites. That is the tell that the root was here — every re-entrant suite was being made
+# responsible for a fact about its caller that it has no way to see, and the ones written since simply
+# did not know to. Fixed once, here.
+#
+# ⛔ CLEARING A BOUND CANNOT REMOVE A BOUND. The shard process is ALREADY bounded from outside by
+# `shard_run_bounded`'s own watchdog, so an inherited `SHARD_BOUND` is not what protects this run — it
+# would only re-apply the PARENT's per-shard figure to an unrelated nested list. And `BASH_SHARDS_BUDGET_SECS`
+# is a whole-list deadline that `slice_skip` has already refuted composing with a slice
+# (this file, `shard_budget` vs `BASH_SHARD_SLICE`): inheriting it into a nested runner is the same
+# ~N-times-too-lenient deadline the refusal above exists to prevent.
+#
+# `env -u` (not a subshell `unset`): it is one exec, so the child's pid and its `set -m` process group
+# are unchanged — `$!`, `shard_bg_pid` and every group TERM→KILL below address the shard itself, exactly
+# as they did before. It is also the idiom this repo's own suites already use for the same reason
+# (`env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS`, tests/ci-lane-parity/run.sh).
+shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"; }
+
 shard_run_bounded() {
-  if [ "$shard_bound" -lt 1 ]; then bash "$1" </dev/null; return $?; fi
+  if [ "$shard_bound" -lt 1 ]; then shard_exec "$1" </dev/null; return $?; fi
   : >"$shard_timeout_marker" 2>/dev/null || true
   set -m                                  # job control ⇒ each background job LEADS its own group
-  bash "$1" </dev/null &
+  shard_exec "$1" </dev/null &
   shard_bg_pid=$!
   # ⛔ THE WATCHDOG'S OUTPUT GOES TO /dev/null, and that is load-bearing rather than tidy: the timer
   # must never be able to hold the driver's stdout open. A caller that runs this driver inside
