@@ -358,6 +358,115 @@ case "$_marm" in
     bad "H) the mutation harness could not extract a mutated arm — fix the harness, do not trust the pass above" ;;
 esac
 
+# ⛔ THE CENSUS POPULATION IS ASSERTED AS AN EQUALITY, NOT AS A HARDCODED LIST (review round 6, P1 —
+# MEASURED). `for pair in "fix-one.sh:…" …` names THREE files, so a FOURTH `wt_provision` caller can
+# drift in ungated and the census still reads green — the corpus-drift failure this repo already
+# guards by asserting populations as equalities (`spawn-gate.test.sh`'s pi-invoker equality,
+# `wt-lifecycle.test.sh` L9). The population is DERIVED from the source, so a new caller reds HERE.
+_census_pop="$(grep -rlE '^[[:space:]]*(if[[:space:]]+)?wt_provision[[:space:]]' --include='*.sh' "$HERE" \
+  | grep -v '\.test\.sh$' | xargs -r -n1 basename | sort | tr '\n' ' ')"
+_census_want='adopt-fix.sh dispatch-merge.sh fix-one.sh '
+if [ "$_census_pop" = "$_census_want" ]; then
+  ok "H) the wt_provision caller population is EXACTLY the censused set (${_census_want% })"
+else
+  bad "H) the wt_provision caller population DRIFTED — a caller is ungated (found: '${_census_pop% }', censused: '${_census_want% }'). Add it to arm H's list and to the rc-4 mapping."
+fi
+
+# ⛔ READ THE `echo` LINES ONLY, NEVER THE COMMENTS (review round 6, self-caught — MEASURED). The
+# first version of this pin extracted from the `elif` line onwards, so the COMMENT above the echo — which
+# names REFUSED-DISK to explain the finding — satisfied the match by itself and the pin passed against
+# the OLD, WRONG message. A comment-fabricated declaration is not a declaration; the registry's own
+# forward scan refuses one for exactly this reason. Only lines whose first token is `echo` count.
+_c77="$(awk '/elif \[ "\$rc" = "77" \]/{f=1} f&&/^[[:space:]]*echo /{print} f&&/^[[:space:]]*echo /&&/adopt-\$PR\.log/{exit}' "$HERE/adopt-fix.sh")"
+case "$_c77" in
+  *REFUSED-DISK*REFUSED-UNKNOWN*|*REFUSED-UNKNOWN*REFUSED-DISK*)
+    ok "H) adopt-fix.sh's exit-77 remedy names the PRE-START refusal and its own token, not only the live arm" ;;
+  *) bad "H) adopt-fix.sh's exit-77 remedy does not name the #3395 pre-start refusal (REFUSED-DISK / REFUSED-UNKNOWN) — the operator is sent to a '[disk-gate] REFUSED' line that does not exist on that path" ;;
+esac
+
+# ═══ H2. THE BATCH-STOP ARM, DRIVEN ═════════════════════════════════════════════════════════════
+# ⛔ ARM H ABOVE IS A SOURCE CENSUS: it proves the token `break` sits inside the rc-4 arm. MEASURED
+# (review round 6): it stayed 42 passed / 0 failed while BOTH regressions its own comments call P1/P2
+# were re-introduced — `for _dm in "$N" "$@"` (round 5) and deleting the
+# `case " $SPAWNED_IDS $CHAIN_IDS " in *" $_dm "*) continue ;; esac` guard (round 3, which releases a
+# LIVE lane's or chain's claim and lets a peer duplicate in-flight work). A census cannot see a loop
+# that releases the wrong set; this executes it.
+#
+# The release loop is EXTRACTED FROM THE SHIPPED SCRIPT and run with injected state, so the assertion
+# is on BEHAVIOUR and survives a refactor of the surrounding case arm. Same idiom, and the same
+# anti-pipeline rule, as the `dmrecount` arms in repo-target.test.sh.
+echo
+echo "── H2) the batch-stop arm releases EXACTLY the unspawned remainder, and stops ──"
+_relblock="$(awk '/^[[:space:]]*_dm_unspawned=""/{f=1} f{print} f&&/drop_dispatched_rows/{exit}' "$HERE/dispatch-merge.sh")"
+case "$_relblock" in
+  *release_issue_claim_unspawned*)
+    case "$_relblock" in
+      *SPAWNED_IDS*|*CHAIN_IDS*) ok "H2) the release loop is extractable from dispatch-merge.sh (so H2 cannot be vacuous)" ;;
+      *) bad "H2) the extracted block has no SPAWNED_IDS/CHAIN_IDS guard — a live lane's claim is releasable"; _relblock="" ;;
+    esac ;;
+  *) bad "H2) the batch-stop release loop is no longer extractable — fix this harness, do not trust the arms below"; _relblock="" ;;
+esac
+drive_rel() { # <N> <spawned> <chain> <all-ids...> -> "REL=[…] DROP=[…]"
+  local n="$1" sp="$2" ch="$3"; shift 3
+  ( N="$n"; SPAWNED_IDS="$sp"; CHAIN_IDS="$ch"; _rel=""; _drop=""
+    release_issue_claim_unspawned() { _rel="$_rel $1"; }
+    drop_dispatched_rows() { _drop="$_drop $*"; }
+    eval "$_relblock"
+    printf 'REL=[%s] DROP=[%s]\n' "${_rel# }" "${_drop# }" ) 2>&1
+}
+# (1) mid-batch: 10 already HAS a live lane. Releasing it is the round-3 P3 defect.
+H2OUT="$(drive_rel 11 "10" "" 10 11 12)"
+case "$H2OUT" in
+  *'REL=[11 12]'*) ok "H2) a mid-batch refusal releases ONLY the unspawned remainder (11 12) — never the live lane's 10" ;;
+  *) bad "H2) the batch-stop arm released the WRONG set — a live lane's claim can be released and a peer can duplicate in-flight work (got: $H2OUT)" ;;
+esac
+case "$H2OUT" in
+  *'DROP=[11 12]'*) ok "H2) …and drops exactly those dispatched.txt rows, so no phantom dispatched work" ;;
+  *) bad "H2) the batch-stop arm dropped the wrong dispatched.txt rows (got: $H2OUT)" ;;
+esac
+# (2) the CHAIN_IDS half of the same guard — a chain was started even though the lane spawn failed.
+H2OUT2="$(drive_rel 11 "" "10" 10 11 12)"
+case "$H2OUT2" in
+  *'REL=[11 12]'*) ok "H2) a live CHAIN's claim is protected too (CHAIN_IDS half of the guard)" ;;
+  *) bad "H2) the CHAIN_IDS half of the guard is gone — an id whose chain STARTED can have its claim released (got: $H2OUT2)" ;;
+esac
+# (3) everything BEFORE $N is never touched, even with nothing spawned (the `_dm_seen` window).
+#     This is what the round-5 `for _dm in "$N" "$@"` regression breaks: `$N` first sets _dm_seen on
+#     iteration 1, so the at-or-after guard opens for ids EARLIER than $N too.
+H2OUT3="$(drive_rel 11 "" "" 10 11 12)"
+case "$H2OUT3" in
+  *'REL=[11 12]'*) ok "H2) ids BEFORE the refusing issue are never released (the at-or-after window holds)" ;;
+  *) bad "H2) the at-or-after window is broken — an EARLIER issue's claim is released (got: $H2OUT3). This is the round-5 'for _dm in \"\$N\" \"\$@\"' defect." ;;
+esac
+
+# ═══ H3. fix-one.sh's rc-4 arm, DRIVEN: the attempt is REFUNDED and the exit is 77 ═══════════════
+# Arm H's census only proves the TOKEN `AGENT_DISK_REFUSED` sits in the arm. It cannot see the two
+# things the arm exists for: that the attempt is refunded (a refusal that spends an attempt is the
+# misattribution #2721 fixed) and that the exit is the disk gate's own 77 (folded into a generic 1,
+# the operator is sent to wait for a load remedy that cannot arrive). Both are behavioural, so drive.
+echo
+echo "── H3) fix-one.sh's rc-4 arm refunds the attempt and exits 77, not a generic 1 ──"
+_fixarm="$(awk '/if \[ "\$_wt_rc" = 4 \]/{f=1} f{print} f&&/^[[:space:]]*fi[[:space:]]*$/{c++; exit}' "$HERE/fix-one.sh")"
+case "$_fixarm" in
+  *refund_gate_attempt*)
+    case "$_fixarm" in
+      *exit*) ok "H3) fix-one.sh's rc-4 arm is extractable and contains its refund + exit (so H3 cannot be vacuous)" ;;
+      *) bad "H3) fix-one.sh's rc-4 arm no longer exits — the refusal would fall through to the generic arm"; _fixarm="" ;;
+    esac ;;
+  *) bad "H3) fix-one.sh's rc-4 arm is no longer extractable or no longer refunds the attempt"; _fixarm="" ;;
+esac
+H3D="$T/h3"; mkdir -p "$H3D"
+H3OUT="$( ( _wt_rc=4; PR=4242; L="$H3D"; WT_RESULT="REFUSED-DISK(free=100, need=200, box=rig)"
+             refund_gate_attempt() { : > "$H3D/refunded"; }
+             eval "$_fixarm" ) 2>&1 )"
+H3RC=$?
+if [ "$H3RC" -eq 77 ]; then ok "H3) the rc-4 arm exits 77, the disk gate's own code (never a generic 1)"; else bad "H3) the rc-4 arm exited $H3RC, not 77 — the operator is sent to a remedy that cannot clear it"; fi
+if [ -f "$H3D/refunded" ]; then ok "H3) …and the attempt is REFUNDED (a free refusal must not spend one)"; else bad "H3) the refusal consumed the attempt — refund_gate_attempt did not run"; fi
+case "$(cat "$H3D.log" 2>/dev/null)" in
+  *REFUSED-DISK*) ok "H3) …and the log the operator reads names REFUSED-DISK (not a generic abort)" ;;
+  *) bad "H3) the refusal did not name REFUSED-DISK in \$L.log (got: $(head -1 "$H3D.log" 2>/dev/null))" ;;
+esac
+
 echo
 echo "── results: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
