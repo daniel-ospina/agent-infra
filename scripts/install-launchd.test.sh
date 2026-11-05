@@ -119,6 +119,10 @@ SHIM
 chmod +x "$T/bin/dscl"
 
 # Fake HOME with a farmed scripts dir + a swarm checkout.
+# mkstub <path> — a NON-EMPTY executable stub. `touch` is not enough: the guard refuses a 0-byte
+# executed target (execve gives ENOEXEC, the 126/127 class this change exists for), so a fixture that
+# models a farmed script must carry a byte.
+mkstub() { printf '#!/bin/bash\nexit 0\n' > "$1"; chmod +x "$1"; }
 mkfakehome() { # $1 = home dir
     # #2413-audit — the three jobs whose templates name the FARMED copy. On a real box they pointed
     # at `{{AGENT_INFRA_PATH}}/scripts/…` (inside ~/Documents) and launchd exited 126 on every tick
@@ -126,16 +130,12 @@ mkfakehome() { # $1 = home dir
     # or the broken-target guard refuses the whole §1 install and every section after it.
     mkdir -p "$1/.pi/agent/scripts/orchestrator-harness"
     for f in objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh; do
-        touch "$1/.pi/agent/scripts/$f"
-        chmod +x "$1/.pi/agent/scripts/$f"
+        mkstub "$1/.pi/agent/scripts/$f"
     done
     mkdir -p "$1/.pi/agent/scripts/checkout-hygiene"
-    touch "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
-    touch "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
-    touch "$1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh"  # #476 poller
-    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
-    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
-    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh"
+    mkstub "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
+    mkstub "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
+    mkstub "$1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh"  # #476 poller
     # #373 fleet-cadence farm + #469 pi-session-reaper + #476 balance-watch
     # (setup.sh copies these to the scripts root): the weekly plist's driver +
     # its sibling report/watch/parser AND the reaper/balance-watch drivers must
@@ -143,8 +143,7 @@ mkfakehome() { # $1 = home dir
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
     for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py worktree-hygiene-sweep.sh cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
-        touch "$1/.pi/agent/scripts/$f"
-        chmod +x "$1/.pi/agent/scripts/$f"
+        mkstub "$1/.pi/agent/scripts/$f"
     done
     # #1719 — the gate job's plist target. Its farm entry is `fleet_srcs` (setup.sh copies it to
     # scripts/), so it must resolve here or the broken-target guard refuses the install.
@@ -160,8 +159,7 @@ mkfakehome() { # $1 = home dir
     # outside the TCC-protected tree, so it must SURVIVE the filter. Mirrors install.sh:add_dir(),
     # whose blanket `*/.pi/*` exclusion would wrongly drop it here.
     mkdir -p "$1/.pi/agent/bin"
-    touch "$1/.pi/agent/bin/rg"
-    chmod +x "$1/.pi/agent/bin/rg"
+    mkstub "$1/.pi/agent/bin/rg"
     # #1719 (review D2-3) — a PATH entry containing `&`, the sed replacement's "whole match" token.
     # Without escaping, `render` turns it into a corrupted entry with a literal {{PATH}} left in the
     # middle of it, and nothing downstream notices (verify_targets inspects ProgramArguments only).
@@ -179,20 +177,16 @@ mkfakehome() { # $1 = home dir
     # not resolve), so its presence in a rendered plist means the fix was reverted.
     mkdir -p "$1/.pi/agent/cdpath/cdpathphantom"
     mkdir -p "$1/.pi/agent/scripts/lib"
-    touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
-    chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    mkstub "$1/.pi/agent/scripts/lib/pid-identity.sh"
     # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
     # the driver + its sibling classifier under scripts/fleet/ (the broken-target
     # guard refuses the install when they are absent). NOT tools/fleet/: pi's
     # startup scan blocks interactive boot on any non-fd/rg entry there (#1277).
     mkdir -p "$1/.pi/agent/scripts/fleet"
-    touch "$1/.pi/agent/scripts/fleet/lane_liveness.py"
-    touch "$1/.pi/agent/scripts/fleet/liveness.py"
-    chmod +x "$1/.pi/agent/scripts/fleet/lane_liveness.py"
-    chmod +x "$1/.pi/agent/scripts/fleet/liveness.py"
+    mkstub "$1/.pi/agent/scripts/fleet/lane_liveness.py"
+    mkstub "$1/.pi/agent/scripts/fleet/liveness.py"
     mkdir -p "$1/swarm/.venv/bin"
-    touch "$1/swarm/.venv/bin/python"
-    chmod +x "$1/swarm/.venv/bin/python"
+    mkstub "$1/swarm/.venv/bin/python"
     mkdir -p "$1/Library/LaunchAgents"
 }
 
@@ -824,7 +818,7 @@ mkfakehome "$PROBE_HOME"
 mkdir -p "$PROBE_HOME/Documents/checkout/scripts"
 PROBE_DEAD="$PROBE_HOME/Documents/checkout/scripts/tcc-dead.sh"
 touch "$PROBE_DEAD"; chmod +x "$PROBE_DEAD"
-touch "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"; chmod +x "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
+mkstub "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
 # the two `com.tortoise.*` reapers exec the CHECKOUT's own interpreter; §7c (c3) reproduces that shape
 mkdir -p "$PROBE_HOME/Documents/checkout/.venv/bin"
 # a BINARY (magic bytes that are not `#!`): a zero-byte placeholder would be "unreadable/empty", which
@@ -1161,8 +1155,11 @@ chmod 000 "$PROBE_UNREADABLE"
 set +e
 OUT="$(probe_install "$PROBE_HOME" "$PROBE_UNREADABLE" 2>&1)"; RC=$?
 set -e
-assert_eq "$RC" "1" "§7c an UNREADABLE launcher is refused — cannot-read is never a binary"
-assert_contains "$OUT" "unreadable or not a regular file" "§7c …and the refusal NAMES unreadability (not a TCC guess)"
+# the launcher is INSIDE the tree, so the TCC verdict wins (skip, disarm) — what matters is that
+# "cannot read" is NOT read as "is a binary that holds the grant" (fresh review of #3413, P2).
+assert_eq "$RC" "0" "§7c an UNREADABLE launcher inside a TCC root is skipped, not failed (a FAIL would kill sync.sh)"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …verdict 2, never excused as a grant-holding binary"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …cannot-read is NOT treated as a binary grant"
 if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
     bad "§7c …and the unit is not installed"
 else
@@ -1207,6 +1204,11 @@ for _probe_s in -S --split-string; do
         set -e
     fi
     assert_line "$OUT" '^    TCC-protected target: ' "§7c env $_probe_s '<cmd with a TCC script>' is classified (the string is a command line, not an option value)"
+    # ⛔ AND THE RUN MUST NOT FAIL: the verdict is a SKIP, and a mis-read of the string shows up as a
+    # "broken target" FAIL (rc=1) that would take `sync.sh` with it. Without this the "nothing is
+    # installed" arm below is satisfied by the BUG (fresh review of #3413, P3).
+    assert_eq "$RC" "0" "§7c …and the install does not FAIL (the verdict is a SKIP, not a broken target)"
+    assert_not_contains "$OUT" "broken target" "§7c …with no bogus path emitted from the command string"
     if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
         bad "§7c …so nothing is installed for it ($_probe_s)"
     else
@@ -1236,8 +1238,7 @@ chmod 755 "$PROBE_NOREAD"
 # (c21) a symlink that lives under a TCC root but RESOLVES OUTSIDE it is READABLE, so it must install —
 # matching the literal spelling as well as the physical one skipped AND DISARMED a unit that starts
 # (fresh review of #3413, P2).
-: > "$PROBE_HOME/.pi/agent/scripts/live-outside.sh"
-chmod +x "$PROBE_HOME/.pi/agent/scripts/live-outside.sh"
+mkstub "$PROBE_HOME/.pi/agent/scripts/live-outside.sh"
 ln -sfn "$PROBE_HOME/.pi/agent/scripts/live-outside.sh" "$PROBE_HOME/Documents/checkout/alias-out.sh"
 set +e
 OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/Documents/checkout/alias-out.sh" 2>&1)"; RC=$?
@@ -1250,6 +1251,64 @@ else
     bad "§7c …and it really is installed"
 fi
 
+# (c22) the PlistBuddy FALLBACK cannot know roles, so it must not claim `exec` for everything: a
+# DIRECTORY-valued `--repo` is legitimate, and calling it an unreadable executed target aborted the
+# whole install on a host whose python3 cannot parse the plist (fresh review of #3413, P2).
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+        <string>--repo</string>
+        <string>$PROBE_HOME/.pi/agent/scripts</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the fallback reader does not FAIL on a DIRECTORY-valued --repo (role is unknown, not exec)"
+assert_not_contains "$OUT" "unreadable or not a regular file" "§7c …so no false 'unreadable executed target'"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit installs"
+else
+    bad "§7c …and the unit installs"
+fi
+
+# (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
+# together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
+mkdir -p "$PROBE_HOME/Documents/checkout/with space"
+printf 'exit 0\n' > "$PROBE_HOME/Documents/checkout/with space/tcc-dead.sh"
+chmod +x "$PROBE_HOME/Documents/checkout/with space/tcc-dead.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "bash $PROBE_HOME/Documents/checkout/with\\ space/tcc-dead.sh" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c env -S keeps an ESCAPED space inside the path (env's own grammar) and still classifies the script"
+
+# (c24) a 0-BYTE executed target outside any TCC root: existence is not readability, and execve gives
+# ENOEXEC (126/127) — the class this change exists for, on the direction that is NOT about TCC.
+PROBE_EMPTY="$PROBE_HOME/.pi/agent/scripts/empty-target.sh"
+: > "$PROBE_EMPTY"; chmod +x "$PROBE_EMPTY"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_EMPTY" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c a 0-BYTE executed target fails the install (execve gives ENOEXEC)"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why"
+
 # (c4) `env -i bash <script>`: an option AND env's program hop both sit before the script.
 set +e
 OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -i bash "$PROBE_DEAD" 2>&1)"; RC=$?
@@ -1261,7 +1320,7 @@ assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is no
 # it as executed, so the unit is SKIPPED rather than armed. This is a deliberate cost, stated: the
 # guard cannot tell a positional value from an inline program's script, and arming a unit launchd
 # cannot start is the defect this exists for, so the doubt resolves to "do not install".
-: > "$PROBE_HOME/Documents/checkout/positional-data.txt"
+printf 'data\n' > "$PROBE_HOME/Documents/checkout/positional-data.txt"
 set +e
 OUT="$(probe_install "$PROBE_HOME" /bin/bash -c 'echo hi' "$PROBE_HOME/Documents/checkout/positional-data.txt" 2>&1)"; RC=$?
 set -e
@@ -1508,7 +1567,7 @@ echo "── 13. worktree-reaper installs under the TCC-holding interpreter (#13
 # that lets the template resolve and install.
 HOME3="$T/home3"; mkfakehome "$HOME3"
 mkdir -p "$HOME3/tortoise/.venv/bin" "$HOME3/tortoise/.git"
-touch "$HOME3/tortoise/.venv/bin/python"; chmod +x "$HOME3/tortoise/.venv/bin/python"
+mkstub "$HOME3/tortoise/.venv/bin/python"
 WT_INSTALLED="$HOME3/Library/LaunchAgents/com.tortoise.worktree-reaper.plist"
 (
     export HOME="$HOME3"
