@@ -313,7 +313,8 @@ import json, sys
 # other about the SAME file — the exact class this marker set exists to close, one line over. So a
 # shape error now prints `BADSHAPE:<the marker verify will print>`, and the note quotes it.
 try:
-    entry = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]
+    with open(sys.argv[1], encoding="utf-8") as _f:
+        entry = json.load(_f)["mcpServers"]["tortoise"]
 except Exception:
     print("NOENTRY")           # the FILE or the entry cannot be READ at all — never "needs no key"
     sys.exit(0)
@@ -524,7 +525,9 @@ p = sys.argv[1]
 tpl = {}
 if len(sys.argv) > 2:
     try:
-        with open(sys.argv[2]) as _tf:
+        # ⛔ EXPLICIT utf-8 (see the config read below): the template carries `—`, and a
+        # locale-encoding read turns a healthy template into a BADTPL on a box that pins UTF-8 off.
+        with open(sys.argv[2], encoding="utf-8") as _tf:
             tpl = json.load(_tf)
     except (OSError, ValueError) as exc:
         print("BADTPL:%s: %s" % (type(exc).__name__, exc))
@@ -546,7 +549,38 @@ want_url = (_want or {}).get("url") or ""
 if not isinstance(want_url, str):
     print("BADTPL:shape: mcpServers.tortoise.url is %s, not a string" % type(want_url).__name__)
     sys.exit(1)
-raw = open(p).read()
+# ⛔ AN EMPTY TEMPLATE url IS NOT "NO OPINION" — IT IS "NOTHING TO COMPARE AGAINST", and that
+# comparison is the ONLY arm that refuses a wrong endpoint. With `want_url` empty, `if want_url and
+# url != want_url` is False, so URL_NOT_DEFAULT/BADURL/NOHOST/USERINFO are ALL skipped and the entry
+# falls through to the hosted-default `else`, which certifies ANY url as `OK:<url>:<auth>` rc=0 — the
+# tenant key attached to whatever host the file happens to name. Measured against a template whose
+# `tortoise` entry carries no `url` (the pre-#3374 stdio shape, and any hand-edited/forked template):
+#   cell url `https://api.premiselab.co/mcp/` (one-letter typo) -> `OK:https://api.premiselab.co/mcp/:…` rc=0
+#   cell url `https://evil.example/mcp/`                        -> `OK:https://evil.example/mcp/:…` rc=0
+# `merge-mcp.py:555` already REFUSES this same template (`FATAL: … declares no usable tortoise
+# entry`, exit 3), so install and verify DISAGREED about one file; this converges them in the safe
+# direction — a template that cannot establish the default certifies NOTHING, it never certifies
+# everything. Named, so the operator is told which file is the broken one.
+if not want_url.strip():
+    print("BADTPL:no-url: mcpServers.tortoise declares no url in %s" % (sys.argv[2] if len(sys.argv) > 2 else "(no template given)"))
+    sys.exit(1)
+# ⛔ THIS READ WAS THE ONE CONFIG READ ON THE VERIFY SIDE WITH NO GUARD (#3374 review, round 10 P2).
+# `graph_mcp_var`/this marker's own template read are both wrapped; this one was bare, so an
+# unreadable `.mcp.json` (an EACCES, a directory, a non-UTF-8 byte) raised straight out and left
+# stdout EMPTY — `FAIL … (marker: none)` over Python internals, the exact "marker: none beside a
+# traceback" shape BADROOT/BADDERS/NOTJSON exist to prevent. Fails closed either way; the point is
+# that a checker which cannot say WHY is the instrument defect, not the audit.
+# The explicit `encoding` is the second half: `templates/.mcp.base.json` carries non-ASCII (`—`) in
+# `_comment`/`purpose`, and `open()` in text mode uses the LOCALE encoding — `PYTHONUTF8=0` with a C
+# locale is `ascii`, and the read then dies on its own byte 503. Modern CPython coerces a C locale,
+# so this does not bite a default host; it bites an environment that pins UTF-8 off, which is the
+# one a service unit can hand you. The fix costs one keyword and removes the class.
+try:
+    with open(p, encoding="utf-8") as _cf:
+        raw = _cf.read()
+except (OSError, UnicodeDecodeError) as exc:
+    print("UNREADABLE:%s: %s" % (type(exc).__name__, exc))
+    sys.exit(1)
 try:
     cfg = json.loads(raw)
 except ValueError as exc:
@@ -912,6 +946,8 @@ PY
         fail ".mcp.json's tortoise url (${out#NOHOST:}) is marked _selfHosted but its authority names no usable host — the client cannot build a request from it (an empty host, a space, a non-numeric or out-of-range port, a percent-encoded host, or a host DNS cannot resolve). Write the real endpoint, e.g. http://localhost:8000/mcp" ;;
       BADTPL:*)
         fail "the template (\$INFRA_ROOT/templates/.mcp.base.json) could not be read, so nothing can be certified — ${out#BADTPL:}. A cell without a usable template is a broken checkout; re-run install from a complete one" ;;
+      UNREADABLE:*)
+        fail ".mcp.json could not be READ at all (${out#UNREADABLE:}) — nothing can be certified from a file the verifier cannot open, and this is NOT the same fault as a wrong shape. Check the file's permissions/owner (it must be readable by the installing user) or re-install, which writes it through temp+rename" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)
