@@ -123,6 +123,15 @@ def pi_process_count():
     table is not 'no such process' ... an empty table is an UNREADABLE read, never absence"
     (#1178 C3). The probing process itself must appear in any real table, so zero parsed rows is
     reported as None here rather than as a second, contradicting ps contract.
+
+    ⛔ "PARSED" MEANS A ROW WITH A NUMERIC PID, NOT MERELY TWO FIELDS (review cycle 10, finding 2).
+    The guard counted any line with two whitespace-separated fields, so a `ps` that printed a
+    HEADER (`PID COMMAND` -- which is what a `ps` that does not honour the trailing `=` on
+    `pid=,command=` emits) counted as a row while contributing no pid: `rows=1, n=0`, which returns
+    a MEASURED ZERO and takes the census's silent arm. Measured: a header-only table yielded
+    `pi_process_count()==0` and `lane_census(0,0,0,7)==None`, i.e. `✅ no suspects` and exit 0 --
+    the exact fail-open this guard was added to close, reached through a read the format did not
+    match. Requiring `parts[0].isdigit()` makes the guard test what the comment claims it tests.
     """
     try:
         cp = subprocess.run(PI_PS_ARGV, capture_output=True, text=True, timeout=20)
@@ -134,7 +143,7 @@ def pi_process_count():
     rows = 0
     for line in cp.stdout.splitlines():
         parts = line.strip().split(None, 1)
-        if len(parts) < 2 or not parts[1].strip():
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].strip():
             continue
         rows += 1
         argv0 = parts[1].split()[0]
