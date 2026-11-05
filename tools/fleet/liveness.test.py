@@ -17,8 +17,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (88)
+    python3 tools/fleet/liveness.test.py                # the 52 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (92)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3189,7 +3189,8 @@ MUTATIONS = [
         '            or not all(f.isdigit() and len(f) <= 6 for f in fields)):',
         "a non-ASCII digit passes .isdigit() and raises in int(), where _cpu_time_cs' "
         "contract is None on an unreadable read (the Mac `ps` path)",
-    ),    Mutation(
+    ),
+    Mutation(
         "T46", "module",
         '            if lr.verdict:',
         '            if False:',
