@@ -4851,6 +4851,37 @@ assert_not_contains "$RECORD_ERR" "attempted on the line above" \
     "14.1d …nor claim a comment post it cannot know happened (the unsigned and read-failure arms post none)"
 assert_not_contains "$RECORD_ERR" "already admits the evidence" \
     "14.1d …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
+# 14.1d(h) ⛔ THE EXIT-5 NOUN (#3168 re-review, latest comment, P2). Both exit-5
+#      messages said "the signed marker" — but BOTH arms are reachable with
+#      `MARKER_SIGNED=0` (:4809-4821: no gate key warns and CONTINUES), so the
+#      adjective named a property those bytes need not have. These
+#      two vectors drive that exact conjunction (key unset + a refused body GET / a
+#      refused body PATCH) and are placed HERE, inside §14, because a fresh CLEAN
+#      mint needs a verifiable --evidence artifact: at the end of the file §20 has
+#      left `EV_REF` on a NOT-CLEAN comment, so the mint is refused at rc 3 and never
+#      reaches the body channel at all — green for the wrong reason (measured on the
+#      first draft of these vectors).
+#      The positive assertion comes FIRST in each pair so the negative cannot pass on
+#      an empty capture. RED pre-fix: "so the signed marker was NOT written into the
+#      PR body" / "the signed marker for … could NOT be PATCHed".
+UNC_PR=424360
+AI_REVIEW_GATE_KEY="" STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' \
+    run_record_633 "$UNC_PR" "$SHA" '[]'
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(h) an UNKEYED run whose body READ fails is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "the marker was NOT written into the PR body" \
+    "14.1d(h) …its exit-5 message still names the marker it could not write (capture is live)"
+assert_not_contains "$RECORD_ERR" "the signed marker" \
+    "14.1d(h) …and does NOT call it 'the signed marker' — this arm is reached with MARKER_SIGNED=0"
+UNC_PR2=424361
+AI_REVIEW_GATE_KEY="" STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
+    run_record_633 "$UNC_PR2" "$SHA" '[]'
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(h) an UNKEYED run whose body PATCH fails is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "the marker for daniel-ospina/agent-infra#$UNC_PR2 could NOT be PATCHed" \
+    "14.1d(h) …its exit-5 message still names the marker (capture is live)"
+assert_not_contains "$RECORD_ERR" "the signed marker" \
+    "14.1d(h) …and does NOT call it 'the signed marker' on the PATCH-failure arm either"
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body is the only copy of the verdict that
@@ -5077,6 +5108,15 @@ if declare -F run_record_no_gh >/dev/null 2>&1; then
     run_record_no_gh clean-micro "daniel-ospina/agent-infra" 424332 || true
     assert_eq "$RECORD_RC" "5" "14.10e with gh missing the record is written but the exit is a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
     assert_contains "$RECORD_ERR" "gh CLI is missing" "14.10e …and the message names the cause"
+    # ⛔ AND IT MUST NOT CALL IT SIGNED (#3168 re-review, cycle 2): no gate key means
+    #   nothing was signed, and MARKER is built inside the gh-available block, so on
+    #   THIS arm no marker exists at all — "the signed marker" was false twice over.
+    #   Pinned on the vector that already drives the arm, so the third instance of
+    #   the class cannot come back unnoticed.
+    assert_not_contains "$RECORD_ERR" "the signed marker" \
+        "14.10e …and does not call a marker it never built 'the signed marker'"
+    assert_contains "$RECORD_ERR" "so no marker for daniel-ospina/agent-infra#424332 was posted" \
+        "14.10e …saying instead that no marker was posted (the honest state on this arm)"
     if [ -e "$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424332.marker" ]; then
         bad "14.10e the gh-missing arm persisted a pending marker (it cannot have built one — MARKER is set inside the gh block)"
     else
@@ -5133,14 +5173,22 @@ fi
 #       the invisible-record state defect A reported.
 FL_MUT="$T/record-review-a-mutant.sh"
 cp "$RECORD" "$FL_MUT"
-if grep -qF 'body-marker-unposted: the signed marker for $REPO#$PR could NOT be PATCHed' "$FL_MUT"; then
+# ⛔ THE ANCHOR NAMES THE BRANCH, NOT THE ADJECTIVE (#3168 re-review, latest comment,
+#   P2). It used to require the literal `the signed marker for … could NOT be
+#   PATCHed`, so dropping the word "signed" from that message — correct, because this
+#   arm is reachable with MARKER_SIGNED=0 — broke a MUTATION PIN that has nothing to do
+#   with the adjective: a wording change must not be able to silently disarm a
+#   behavioural pin, and re-anchoring it by hand every time is exactly the treadmill
+#   this comment exists to avoid. `.*` spans the noun phrase; "could NOT be PATCHed
+#   into the PR body" is unique to THIS arm (the body-READ arm says "was NOT written").
+if grep -qE 'body-marker-unposted: .*could NOT be PATCHed into the PR body' "$FL_MUT"; then
     # The mutant restores the pre-fix behaviour on THAT branch only: warn and exit 0.
     # ⛔ ANCHORED TO THE BRANCH, AND THE SCOPE IS ASSERTED (fresh-review P2): two
     # lines in the script carry exactly six spaces before `exit 5` (this one and
     # --recover-body's refusal), so an address-free `s/^      exit 5$/…/` mutates
     # BOTH — a mutant wider than its declaration, whose extra change could mask a
     # fail-closed regression in later assertions.
-    sed -i.bak '/body-marker-unposted: the signed marker for \$REPO#\$PR could NOT be PATCHed/,/^      exit 5$/ s/^      exit 5$/      exit 0/' "$FL_MUT"
+    sed -i.bak '/body-marker-unposted: .*could NOT be PATCHed into the PR body/,/^      exit 5$/ s/^      exit 5$/      exit 0/' "$FL_MUT"
     rm -f "$FL_MUT.bak"
     if cmp -s "$RECORD" "$FL_MUT"; then
         bad "14.10c the mutant is byte-identical to the script — the exit-5 sed did not apply (re-anchor it)"
@@ -5888,6 +5936,35 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
     "20.10 …but a SIGNED not-clean marker whose note contains ' sig=' IS still published (the fix must not over-block)"
 
 DM_20_SENTINEL=1
+
+# ══ §21 #3168 re-review (latest comment): the doc-block drift ══════════════
+#
+# 21.1 [P2] The `post_marker_comment` doc block: ONE copy, at the doc comment's own
+#      indentation, with its body-mirror referent pointing where that mirror
+#      actually is. The defect was a 21-line duplicate left indented two spaces
+#      between the doc comment and the function — it read as function body,
+#      repeated the PRODUCER-HALF rationale verbatim, and said "The BODY mirror
+#      **above** stays" about a mirror ~3 600 lines BELOW. Documentation drift,
+#      pinned structurally because prose is what drifted: each assertion reddens
+#      when the duplicate is restored, and the positive pair proves the fix MERGED
+#      the rationale instead of deleting it (a delete-only fix would satisfy every
+#      negative here and lose the why).
+RRS="$RECORD"
+_rr_docblock="$(awk '/^# post_marker_comment <repo> <pr> <marker> -> ALWAYS 0/{f=1;next} /^post_marker_comment\(\) \{/{f=0} f' "$RRS")"
+assert_ne "" "$_rr_docblock" \
+    "21.1 the post_marker_comment doc block is findable (prerequisite for the vectors below)"
+assert_eq "$(printf '%s\n' "$_rr_docblock" | grep -cE '^[[:space:]]+(#|[^[:space:]])' || true)" "0" \
+    "21.1 every line between the doc comment and the function is a COLUMN-0 comment (the stale 2-space indented duplicate is gone)"
+assert_eq "$(grep -cF 'docs/ai-review-gate.md carried' "$RRS" || true)" "1" \
+    "21.1 the PRODUCER-HALF rationale appears ONCE in the recorder (the duplicate block was merged, not duplicated)"
+assert_contains "$_rr_docblock" "BODY MIRROR STAYS" \
+    "21.1 …and the doc block still documents the body mirror (the duplicate was MERGED, not deleted)"
+assert_contains "$_rr_docblock" "post_marker()" \
+    "21.1 …naming the site ABOVE it as well — post_marker() IS a body mirror (the --flush-pending half), so 'the mirror above' was ambiguous, not absent"
+assert_contains "$_rr_docblock" "MINT path" \
+    "21.1 …and the MINT path below, so both body-posting sites are named and neither reader is misled"
+
+DM_21_SENTINEL=1
 
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"

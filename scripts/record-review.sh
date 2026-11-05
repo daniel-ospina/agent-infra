@@ -1158,28 +1158,34 @@ ${marker}"; else newbody="$marker"; fi
 # at the FUNCTION because every caller (the mint path, both failure arms,
 # --flush-pending and --recover-body) must publish the same channel with the same
 # guarantees:
-  # ── Durable channel: the SAME signed marker as an append-only PR COMMENT ──
-  # (agent-infra#1224, producer half — the gate has shipped the consumer half
-  # since 2026-09 and docs/ai-review-gate.md carried "Producer status: the
-  # producer half is NOT deployed" for a month.) Why it is not optional: the PR
-  # body is a MUTABLE field that lanes rewrite routinely, so a body-only marker
-  # is one edit away from being no marker at all, and the edit that removed it
-  # is invisible — the next read reports "No AI review evidence found" for a
-  # review that genuinely happened. Measured 2026-10-31: tortoise#10410 carries a
-  # signed clean marker at its exact head d96ffe8c, its only gate attempt was
-  # created BEFORE that marker landed and concluded `failure` with
-  # "No AI review evidence found in PR #10410 body or comments", and the head
-  # then held that red with the verdict present. tortoise#10424's own review
-  # comment reports the same shape (a `reviews/10424.json ... clean @ 3805f492`
-  # attestation that no longer covers the head it sits on, after a body edit).
-  # The gate already unions body ∪ comments and HMAC-verifies both, admitting
-  # only OWNER/MEMBER/COLLABORATOR comments, so this ADDS AVAILABILITY and
-  # changes no security property: a forged or stale comment still fails the
-  # HMAC or the binding rules. Idempotent — post only when no admitted comment
-  # already carries this exact marker text. Best-effort: NEVER fails the record.
-  # The BODY mirror above stays: it is what fires `edited` and re-runs the gate
-  # (a comment alone fires `issue_comment`, which this gate deliberately does
-  # not trigger on — see the skip-footgun rule in the workflow header).
+#
+# ── Durable channel: the SAME signed marker as an append-only PR COMMENT ──
+# The PR body is a MUTABLE field that lanes rewrite routinely, so a body-only
+# marker is one edit away from being no marker at all, and the edit that removed
+# it is invisible — the next read reports "No AI review evidence found" for a
+# review that genuinely happened. Measured 2026-10-31: tortoise#10410 carries a
+# signed clean marker at its exact head d96ffe8c, its only gate attempt was
+# created BEFORE that marker landed and concluded `failure` with "No AI review
+# evidence found in PR #10410 body or comments", and the head then held that red
+# with the verdict present. tortoise#10424's own review comment reports the same
+# shape (a `reviews/10424.json ... clean @ 3805f492` attestation that no longer
+# covers the head it sits on, after a body edit).
+# The gate already unions body ∪ comments and HMAC-verifies both, admitting only
+# OWNER/MEMBER/COLLABORATOR comments, so this ADDS AVAILABILITY and changes no
+# security property: a forged or stale comment still fails the HMAC or the
+# binding rules. Idempotent — post only when no admitted comment already carries
+# this exact marker text. Best-effort: NEVER fails the record.
+# ⛔ THE BODY MIRROR STAYS, AT *BOTH* SITES — this function only ADDS a copy.
+# (1) `post_marker()`, immediately ABOVE this comment: the recovery half
+# (--flush-pending, and any later minting run) PATCHes the marker into the PR body
+# there. (2) The MINT path further DOWN this file, which is the run that actually
+# mints the record. EITHER site's PATCH is what fires `edited` and re-runs the
+# gate; a comment alone fires `issue_comment`, which this gate deliberately does
+# not trigger on (see the skip-footgun rule in the workflow header). An earlier
+# draft of this block had been moved here from the old inline site but stayed
+# indented two spaces, so it read as function body and named only "the body mirror
+# above" — which is true of ONE of the two sites. Same information, one copy, at
+# the indentation this doc comment actually uses.
 post_marker_comment() { # <repo> <pr> <marker>
   local repo="$1" pr="$2" marker="$3"
   local PR_EVIDENCE_COMMENTS_JQ="" HAVE_COMMENT=0 EXISTING_COMMENT_BODIES=""
@@ -4839,7 +4845,12 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # WITHOUT it, so the arm this channel exists for still exited 5 having
     # published nothing — suite vector 14.1d(e) is the discriminator).
     post_marker_comment "$REPO" "$PR" "$MARKER" || true
-    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (gh refused the GET — ⛔ this line does NOT assert WHICH cause: the error text is discarded, so a transient API failure, a throttled token, and a permanent 404 for a wrong PR number or a repo this token cannot see all land here), so the signed marker was NOT written into the PR body — the record is saved. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers the BODY copy WITHOUT a new review IF the cause was transient; a PERMANENT cause fails that retry the same way." >&2
+    # ⛔ THE NOUN CARRIES NO SIGNEDNESS CLAIM (#3168 re-review P2): this arm is
+    # reached with MARKER_SIGNED=0 too (:4809-4821 — with no gate key the `else`
+    # branch warns and sets MARKER_SIGNED=0, then execution CONTINUES to the body
+    # read below), so "the signed marker" named a property these bytes need not
+    # have. It says "the marker".
+    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (gh refused the GET — ⛔ this line does NOT assert WHICH cause: the error text is discarded, so a transient API failure, a throttled token, and a permanent 404 for a wrong PR number or a repo this token cannot see all land here), so the marker was NOT written into the PR body — the record is saved. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers the BODY copy WITHOUT a new review IF the cause was transient; a PERMANENT cause fails that retry the same way." >&2
     exit 5
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
@@ -4892,7 +4903,13 @@ ${MISSING}"
       # signed bytes. Attempted BEFORE the exit, and "$MISSING" not "$MARKER" — it
       # is the exact line this run tried to deliver.
       post_marker_comment "$REPO" "$PR" "$MISSING" || true
-      echo "⛔ body-marker-unposted: the signed marker for $REPO#$PR could NOT be PATCHed into the PR body (gh/API refused — ⛔ this line does NOT assert WHICH cause: the PATCH's error text is discarded, so a spent token budget, a 403, a 5xx and a permanent 404/422 all land here). The record IS saved at $FILE. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). The BODY PATCH is what fires the 'edited' event that RE-RUNS the gate, so this retry is still owed." >&2
+      # ⛔ NO SIGNEDNESS CLAIM IN THE MESSAGE BELOW (#3168 re-review P2): like the
+      # read-failure arm, this one is reached with MARKER_SIGNED=0 as well
+      # (:4809-4821 — no gate key warns and CONTINUES), so "the signed marker" named
+      # a property the bytes on this path need not have. The marker is called "the
+      # marker" — the caller's own warning line already said loudly whether it was
+      # signed.
+      echo "⛔ body-marker-unposted: the marker for $REPO#$PR could NOT be PATCHed into the PR body (gh/API refused — ⛔ this line does NOT assert WHICH cause: the PATCH's error text is discarded, so a spent token budget, a 403, a 5xx and a permanent 404/422 all land here). The record IS saved at $FILE. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). The BODY PATCH is what fires the 'edited' event that RE-RUNS the gate, so this retry is still owed." >&2
       echo "   The marker is kept verbatim in $(marker_pending_file "$REPO" "$PR") — deliver it with: record-review.sh --flush-pending $PR ${REPO}   (no new review, no new record, no re-record)" >&2
       exit 5
     fi
@@ -5047,7 +5064,12 @@ else
     # persists an EMPTY file (a fresh review measured exactly that, and the flush
     # then "delivered" nothing and deleted it). The next run WITH gh rebuilds the
     # marker from the record and posts it, so nothing is lost.
-    echo "⛔ body-marker-unposted: the gh CLI is missing, so the signed marker for $REPO#$PR was NOT posted — the record is saved at $FILE but the ai-review-gate required check cannot see it. Install gh and re-run the recorder at this head: it rebuilds the marker from the record and posts it (no new review, no re-record)." >&2
+    # ⛔ THE SAME FALSE NOUN ON THE THIRD EXIT-5 ARM (#3168 re-review, cycle 2): this
+    # message used to say "the signed marker", and here it is false TWICE — no gate
+    # key means nothing was signed, and the whole marker is built INSIDE the
+    # gh-available block above, so on THIS arm no marker was even constructed (the
+    # paragraph above says exactly that about the pending file). It now says that.
+    echo "⛔ body-marker-unposted: the gh CLI is missing, so no marker for $REPO#$PR was posted — the record is saved at $FILE but the ai-review-gate required check cannot see it. Install gh and re-run the recorder at this head: it rebuilds the marker from the record and posts it (no new review, no re-record)." >&2
     exit 5
   fi
   echo "⚠️ record-review: evidence post skipped (gh CLI missing or REPO undetectable) — the record is saved, but the ai-review-gate required check will fail until evidence is posted manually." >&2
