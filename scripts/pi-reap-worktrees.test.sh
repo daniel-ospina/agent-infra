@@ -1010,6 +1010,22 @@ ANCHORS = {
         "            if [ -e \"$rec\" ] || [ -L \"$rec\" ] || { [ -d \"$_rdir\" ] && [ ! -x \"$_rdir\" ]; }; then",
         "            if false; then   # MUTANT: the unreadable-record fail-closed arm is deleted",
     ),
+    # (8b) and (8c): the (8) anchor replaces the WHOLE condition, so it cannot distinguish its three
+    # disjuncts — and only `[ -e ]` had a fixture. Each disjunct is now pinned ALONE, because each one
+    # is a shape a tidy-up can talk itself into deleting: `-L` looks redundant next to `-e` (it is not —
+    # `-e` is FALSE for a DANGLING symlink, which is exactly the record a rotated pin leaves behind),
+    # and the unsearchable-parent arm looks like a broken box (it is the TCC / mixed-root case).
+    # ⛔ NO TRAILING COMMENT IN EITHER MUTANT: these replace a MID-LINE substring, so a `#` would
+    # comment out the `; then` that follows and the mutant would die of a SYNTAX ERROR instead of
+    # answering — which reads as an empty row, not as a red assertion (measured on the first draft).
+    "no-record-unreadable-symlink": (
+        " || [ -L \"$rec\" ] ||",
+        " || false ||",
+    ),
+    "no-record-unreadable-parent": (
+        "{ [ -d \"$_rdir\" ] && [ ! -x \"$_rdir\" ]; }",
+        "{ false; }",
+    ),
 }
 s = open(src).read()
 old, new = ANCHORS[name]
@@ -5200,6 +5216,48 @@ OUT="$(cd / && HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
 assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
     "G15r …and from the cwd where it does not, so the verdict is not a function of the caller"
 
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
+    "G15r …and from the cwd where it does not, so the verdict is not a function of the caller"
+
+# G15s: the record is a DANGLING SYMLINK — and `[ -e ]` is FALSE for one, so this is the ONE shape
+# where the `-L` disjunct is the entire guard. It is not hypothetical: a rotated pin leaves exactly a
+# link to a path that no longer exists. G15q exercises only `[ -e ]` (chmod 000 on a regular file), so
+# without this fixture the `-L` arm could be deleted with the suite green.
+ENV=pin_tree_symrec
+REPO="$(mk_repo "$ENV")"
+SYMWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$SYMWT" HEAD
+ln -s "/nonexistent/pin-audit-rotated" "$T/$ENV/home/.harness-path"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$SYMWT")")" "pin-tree" \
+    "G15s a DANGLING SYMLINK record PRESERVES (-e is false for it; -L is the whole guard)"
+assert_contains "$(row_for "$OUT" "$SYMWT")" "UNREADABLE" \
+    "G15s …and the row says WHY, so an operator can see the rotated-pin link rather than lose the tree"
+
+# G15t: the record's PARENT exists but cannot be SEARCHED, so `[ -r ]`, `[ -e ]` and `[ -L ]` are ALL
+# false for a path that is really there. Only the parent disjunct can see it, and that disjunct is the
+# one a tidy-up is most likely to call "a broken box". The tree path carries no `harness` component.
+ENV=pin_tree_nox
+REPO="$(mk_repo "$ENV")"
+NOXWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$NOXWT" HEAD
+NOXDIR="$T/$ENV/nox"
+mkdir -p "$NOXDIR"
+printf '%s\n' "$NOXWT/scripts/orchestrator-harness" >"$NOXDIR/.harness-path"
+if chmod 600 "$NOXDIR" 2>/dev/null && [ -z "$(cat "$NOXDIR/.harness-path" 2>/dev/null)" ]; then
+    OUT="$(HARNESS_PIN_FILE_OVERRIDE="$NOXDIR/.harness-path" \
+        REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper "$ENV" --dry-run --repo "$REPO")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$NOXWT")")" "pin-tree" \
+        "G15t a record under an UNSEARCHABLE directory PRESERVES (-r, -e and -L are all false for it)"
+    assert_contains "$(row_for "$OUT" "$NOXWT")" "UNREADABLE" \
+        "G15t …and the row says WHY, so the operator fixes permissions instead of losing the tree"
+else
+    echo "  → G15t unsearchable-parent leg skipped (chmod 600 did not block traversal here)"
+fi
+chmod 755 "$NOXDIR" 2>/dev/null || true
+
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
 # every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
@@ -5309,6 +5367,29 @@ OUT="$(cd "$T/pin_tree_relpinroot" && REAPER_OVERRIDE="$MUTP9" \
     run_reaper pin_tree_relpinroot --dry-run --repo "$T/pin_tree_relpinroot/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT_M")")" "pin-tree" \
     "G15-M9 MUTATION: without the \$pin_root guard a RELATIVE spelling PRESERVES from the resolving cwd => G15r is discriminating"
+
+# G15-M10 / G15-M11: the (8) anchor replaces the WHOLE fail-closed condition, so it cannot show WHICH
+# disjunct carries the fix. Each disjunct is deleted ALONE here; both mutants must fall back to the
+# pre-fix answer (`reclaimable`, i.e. the tree removed), which is what makes G15s and G15t assertions.
+MUTP10="$T/mutant-no-record-unreadable-symlink.sh"
+mutate_reaper_anchored "$MUTP10" no-record-unreadable-symlink
+OUT="$(REAPER_OVERRIDE="$MUTP10" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_symrec --dry-run --repo "$T/pin_tree_symrec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_symrec/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M10 MUTATION: without the -L disjunct a DANGLING SYMLINK record removes the tree => G15s is discriminating"
+
+MUTP11="$T/mutant-no-record-unreadable-parent.sh"
+mutate_reaper_anchored "$MUTP11" no-record-unreadable-parent
+if chmod 600 "$T/pin_tree_nox/nox" 2>/dev/null && [ -z "$(cat "$T/pin_tree_nox/nox/.harness-path" 2>/dev/null)" ]; then
+    OUT="$(REAPER_OVERRIDE="$MUTP11" HARNESS_PIN_FILE_OVERRIDE="$T/pin_tree_nox/nox/.harness-path" \
+        REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper pin_tree_nox --dry-run --repo "$T/pin_tree_nox/repo")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_nox/opt/5b1b09aad2c1")")" "reclaimable" \
+        "G15-M11 MUTATION: without the unsearchable-parent disjunct that record removes the tree => G15t is discriminating"
+else
+    echo "  → G15-M11 skipped (chmod 600 did not block traversal here, so the mutant is unobservable)"
+fi
+chmod 755 "$T/pin_tree_nox/nox" 2>/dev/null || true
 
 
 echo ""

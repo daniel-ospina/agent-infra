@@ -3190,7 +3190,10 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         # `[ -r "$rec" ] || continue` made the two indistinguishable, so the ONE thing that says the
         # box needs these bytes read as "no evidence" the moment it could not be read — and rule 3 then
         # removed the tree the box EXECUTES. That is the fail-open this PR exists to close, one step
-        # further out: `unreadable-path` is a PRESERVE everywhere else in this file (`:3346`, `:3351`),
+        # further out: `unreadable-path` is a PRESERVE in BOTH arms of `classify_one`'s empty-`$canon`
+        # block — NAMED, NOT CITED BY LINE, for the reason stated 23 lines below: the first draft of this
+        # comment cited `:3346`/`:3351`, which were correct when it was written and were already wrong at
+        # the head that shipped it, because the 20 lines ABOVE them in this very edit pushed them down.
         # and `holders_live` was fixed to the same polarity when a TRUNCATED scan read as "no holder".
         # A probe that cannot answer is not a NEGATIVE answer.
         # ⛔ THE ASYMMETRY IS DELIBERATE: a record that is genuinely ABSENT still falls through. Its
