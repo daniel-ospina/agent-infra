@@ -878,7 +878,17 @@ class Liveness:
                 child = lv.ChildEvidence(sid=str(kid or ""), in_flight=bool(kid),
                                          stale=(cs is not None and cs > CHILD_ABANDON_S),
                                          grew=joined.get("child_grew"),
-                                         source="lane-status.py::child_suppresses")
+                                         # ⛔ NAMES THE ARM, NOT THE FUNCTION. `child_suppresses` is
+                                         # `(declared or pane_kids or live_child) and verdict in
+                                         # ACTION_VERDICTS`, and the row carries `declared` and
+                                         # `pane_children` too — which this join does NOT read. No
+                                         # divergence today (that function's own measured notes say
+                                         # both are always empty, so `live_child` is the only live
+                                         # arm), but the label must not claim the whole rule: the
+                                         # moment `declared_children` works, this surface could say
+                                         # `frozen` where the producer says `WAITING-CHILD`, and
+                                         # nothing in the payload would show which arm was used.
+                                         source="lane-status.py::child_suppresses(live_child arm)")
                 sources["step3"] = {"child": kid, "child_stale_s": cs,
                                     "abandon_s": CHILD_ABANDON_S, "stale": child.stale,
                                     "grew": joined.get("child_grew"), "source": note}
@@ -1525,9 +1535,18 @@ ALLOWLIST = {
     "hostname": ([], 1),
     "whoami": ([], 1),
     "id": ([], 1),
-    "df": (["-h"], 3),
-    "free": (["-m"], 3),
-    "ps": (["-eo", "pid,etime,pcpu,comm"], 2),
+    # ⛔ THE PREFIX IS ENFORCED (see `_allowlisted`), SO IT MUST MEAN SAFETY, NOT FORMATTING. `df`,
+    # `free` and `ps` were the entries where the prefix was a PRETTY-PRINTING default rather than a
+    # safety property: enforcing them refused `df /`, `free -h` and `ps -ef` — read-only calls, refused
+    # with a reason naming neither. `max_args` is the real limit for all three, and none of them mutates
+    # state from an operand (`df /` QUERIES that filesystem; `ps -ef` is the standard listing).
+    # ⛔ THE PREFIX MECHANISM IS KEPT AND IS NOT DEAD CODE: it is the INVARIANT that a declared fixed
+    # prefix is honoured rather than unpacked and ignored (the defect that made `hostname NAME` pass),
+    # and it is pinned by an arm that installs a prefixed entry and asserts the prefix is enforced — so
+    # a future entry can rely on it and a future deletion of the check reds.
+    "df": (None, 3),
+    "free": (None, 3),
+    "ps": (None, 2),
     "git": (None, 8),
     "ls": (None, 6),
     "cat": (None, 4),
@@ -1545,7 +1564,21 @@ DISK_OK_VERBS = ("-l", "-la", "-lh", "-lah", "-t", "-lt")
 # cell — through a gate whose own refusal text says "FAIL-CLOSED: never a pass-through" — and every
 # read-only verb above accepts it. `cat` is the same escape in reverse: plant content, read it back.
 # The check is a REFUSAL BY SHAPE, before the verb check, so it also covers a future verb added above.
+# ⛔ AND IT IS SCOPED TO `git`, WHICH IS THE ONLY ALLOWLISTED PROGRAM IN THIS SET WITH A CALLER-NAMED
+# OUTPUT FILE. A blanket ban false-blocked a READ-ONLY call and stated a falsehood doing it: GNU
+# `df --output=FIELD_LIST` only selects COLUMNS (`df --output=source` writes nothing), so a legitimate
+# diagnostic was refused with "writes a file the caller names" — wrong about the command and wrong
+# about the reason. Scope the ban to the program whose option actually behaves that way.
 WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
+# ⛔ A BARE ARGUMENT TO `hostname` IS THE SETTER FORM, NOT A QUERY. `hostname NAME` and
+# `hostname -F <file>` RENAME the box (`hostname --help`: `{hostname|-F file}  set host name`), and
+# `ALLOWLIST["hostname"] = ([], 1)` bounds only the COUNT — so `["hostname", "pwned-cell"]` passed this
+# gate, whose refusal text says the surface is "allowlisted for READING". A rename is not cosmetic on
+# this fleet: `lane_registry.short_host()` is baked into every record's `host` and every minted
+# `lane_id`, so that box's new records stop matching its existing ones and host-scoped claim/
+# ownership reads degrade to abstentions. Queries only, by explicit flag.
+HOSTNAME_OK_FLAGS = ("-a", "-A", "-d", "-f", "-i", "-I", "-s", "-y", "-V", "--version",
+                     "-h", "--help")
 
 
 def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[bool, Dict[str, Any]]:
@@ -1614,20 +1647,33 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
     rest = argv[1:]
     if len(rest) > max_args:
         return False, "at most %d argument(s) for %r, got %d" % (max_args, prog, len(rest))
+    # ⛔ THE DECLARED PREFIX IS ENFORCED, NOT DECORATION. It was unpacked and NEVER USED (only
+    # reference in this function), so the `(program, fixed-prefix args)` contract the ALLOWLIST
+    # comment states was unobserved: `free` required no `-m` and `ps` required no `-eo …`, so an
+    # arbitrary argv of the right LENGTH passed. That is the same class as `hostname NAME` — a gate
+    # that checks a count and calls it a shape.
+    if prefix is not None and list(rest[:len(prefix)]) != list(prefix):
+        return False, ("%r requires the fixed arguments %r first (got %r)"
+                       % (prog, list(prefix), list(rest[:len(prefix)])))
     for token in argv:
         if any(ch in token for ch in "|&;><`$\n\r\\"):
             return False, "refusing %r: shell metacharacters have no meaning in an argv surface" % token
-    # ⛔ A WRITE-ESCAPE IS NOT A SHELL METACHARACTER, SO THE FILTER ABOVE MISSES IT. `git`'s
-    # `--output=<path>` (and `--outfile=`) writes a file the caller chose, on a command the allowlist
-    # only ever meant to READ; `cat` reads back whatever was planted. Refused by SHAPE, on every verb,
-    # so a verb added to GIT_OK_VERBS later cannot reintroduce it. Both the `=` and the bare-flag form
-    # are covered because `--output <path>` is equally a write.
-    for token in argv:
-        low = token.lower()
-        for bad in WRITE_ESCAPE_TOKENS:
-            if low == bad or low.startswith(bad + "="):
-                return False, ("refusing %r: %s writes a file the caller names — an argv surface "
-                               "allowlisted for READING is not a write channel" % (token, bad))
+    # ⛔ A WRITE-ESCAPE IS NOT A SHELL METACHARACTER, SO THE FILTER ABOVE MISSES IT. Scoped to `git`,
+    # the one allowlisted program here whose option names a caller-chosen file.
+    if prog == "git":
+        for token in argv:
+            low = token.lower()
+            for bad in WRITE_ESCAPE_TOKENS:
+                if low == bad or low.startswith(bad + "="):
+                    return False, ("refusing %r: %s writes a file the caller names — an argv surface "
+                                   "allowlisted for READING is not a write channel" % (token, bad))
+    # ⛔ `hostname` WITH A BARE ARGUMENT RENAMES THE BOX (see HOSTNAME_OK_FLAGS). Flags only.
+    if prog == "hostname":
+        for token in rest:
+            if token not in HOSTNAME_OK_FLAGS:
+                return False, ("refusing %r: `hostname` takes QUERY flags only on this surface — a "
+                               "bare argument (or `-F`) SETS the host name, which rewrites the "
+                               "identity every lane record and lane_id is minted from" % token)
     if prog == "git" and (not rest or rest[0] not in GIT_OK_VERBS):
         return False, "git verb %r is not read-only" % (rest[0] if rest else "")
     if prog in ("cat", "wc", "sha256sum", "pgrep") and not rest:

@@ -976,7 +976,7 @@ not answer the tool's own signature, the missing half was written **into that mo
 
 | tool (MCP name) | wraps | what Phase 2 WROTE (the `PARTIAL` half) |
 |---|---|---|
-| `lane.list` / `lane.show` (**rows 1 + 2**) | `lane_registry.py` (the four states, `list_payload`), `tools/fleet/liveness.py::evaluate` (**the ONE classifier**), `scripts/lib/pid-identity.sh` (`probe-argv`), `lane-status.py` as the **sampler** (`cpu_busy`, `child*`) | **tree steps 2 and 3 into `liveness.py`** — `Evidence.cpu` / `Evidence.child` + two vetoes (§4.2, D8's first half); the `finished`/`dead` **mapping** onto the registry's terminal record; the **step-6 recursion** = `evaluate` applied to the child via the same `gather`; the liveness axis as a **payload extension** (no thirteenth name) |
+| `lane.list` / `lane.show` (**rows 1 + 2**) | `lane_registry.py` (the four states, `list_payload`), `tools/fleet/liveness.py::evaluate` (**the ONE classifier**), `scripts/lib/pid-identity.sh` (`probe-argv`), `lane-status.py` as the **sampler** (`cpu`, `cpu_any`, `child*`) | **tree steps 2 and 3 into `liveness.py`** — `Evidence.cpu` / `Evidence.child` + two vetoes (§4.2, D8's first half); the `finished`/`dead` **mapping** onto the registry's terminal record; the **step-6 recursion** = `evaluate` applied to the child via the same `gather`; the liveness axis as a **payload extension** (no thirteenth name) |
 | `lane.artifact` (**row 3**) | `scripts/lane-wip.py` (words), `lane-artifacts.sh` (files, already typed), the board's `LANE-DONE` line | **`lane-wip.py --json` + a stated exit contract** (`0` answered · `2` usage/no-lane · `3` UNMEASURED) — §5.0 V3 |
 | `fleet.census` (**row 4**) | `beta-progress.py::compute`, `capacity.sh` (`probe`), `box-status.sh`, `os.getloadavg()` | **`--repo` and `--json` on `beta-progress.py`** (it parsed no argv at all) — the repo parameter and the typed payload, and nothing else (§7.7) |
 | `pr.queue` (**row 5**) | `tools/fleet/pr_state.py --json` (the 15 actions + `fidelity`) | the **6-class VIEW** over the 15, in one direction only (§13 Q4); the `UNMAPPED` count makes a silent loss impossible |
@@ -1004,6 +1004,11 @@ not answer the tool's own signature, the missing half was written **into that mo
    this PR, not larger: the MCP surface reads only that module's **sampler fields** (`cpu_busy`, `child`,
    `child_stale`, `child_grew`, `cwd`) and **never its verdict**, so the ladder's only remaining caller is the
    heartbeat's own `lane-status.last.json`. That is §13 Q6's “quarantined, one caller, one release”.
+   ⛔ THE ROW'S KEY IS `cpu` / `cpu_any`, NOT `cpu_busy`: `cpu_busy` exists only as a `classify()` keyword
+   (`lane-status.py:1852,2335`), while the emitted row carries `cpu=_cpu, cpu_any=_cpu_any`
+   (`:2416-2421`). An earlier revision of this list said `cpu_busy`, an implementation was written from it,
+   and step 2 was therefore silently UNMEASURED on the MCP surface — recorded here so the next lane
+   implementing against §4.1 does not reproduce it.
 5. **Tree step 5's classification is still `lane-actions.py`'s** (one batched JEV call for the fleet, D7). The
    MCP attaches its **input** (`lane.artifact`'s words axis) and never makes a second JEV call.
 
