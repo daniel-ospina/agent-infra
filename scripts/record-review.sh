@@ -2677,8 +2677,8 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   if [ "$CC_SUPPLIED" -eq 0 ]; then
   # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
   # that lacks the file may still have the verdict in the registry (minted on a
-  # peer box) or in the PR body's SIGNED marker (minted anywhere, and the only
-  # copy that travels). Naming only the re-review made every cross-box review
+  # peer box), in the PR body's SIGNED marker, or in an admitted PR comment
+  # (minted anywhere; both travel). Naming only the re-review made every cross-box review
   # cost twice — a lane paying again for evidence the fleet already holds.
   CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
   if [ -n "$REPO" ]; then
@@ -2876,8 +2876,8 @@ fi
 GATE_KEY="$(printf '%s' "$GATE_KEY" | tr -d '[:space:]')"
 
 # ── --recover-body (#2872): rebuild a MISSING record from the SIGNED marker ──
-# The record file is per-box; the signed marker in the PR body is the only copy
-# of the verdict that travels. So an absence on THIS box is not evidence that no
+# The record file is per-box; a signed marker in the PR body OR in an admitted PR
+# comment travels. So an absence on THIS box is not evidence that no
 # review happened — and the rail's only named remedy ("run the review") makes a
 # lane pay a second time for a verdict the fleet already holds (#2872: 12 of 45
 # open PRs, of which the registry covered 2).
