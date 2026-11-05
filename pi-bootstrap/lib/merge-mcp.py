@@ -150,6 +150,63 @@ def authority_of(url):
     return (m.group(1) + (":" + port if port is not None else "")).lower()
 
 
+def authority_names_a_host(authority):
+    """True when `authority` (`host[:port]`, userinfo already stripped) names an endpoint at all.
+
+    ⛔ `_selfHosted` IS AN EXEMPTION, AND AN EXEMPTION MAY ONLY CERTIFY SOMETHING REACHABLE (#3374
+    review P3). The exemption's floor was `^scheme://[^/?#]+` — ONE character after `//` was enough —
+    so `https://:8443/mcp/` (no host), `https://my daemon:8000/mcp` (a space in the host) and
+    `https://api.premiselabs.co:8443x/mcp/` (a non-numeric port) were all printed `SELFHOSTED:` and
+    exited 0, i.e. LAYER VERIFIED over an entry that points at nothing. That is the same false green
+    the scheme-less `BADURL:` arm exists to close; this arm is the rest of it.
+
+    THE RULE IS THE CLIENT'S PARSER, NOT A GUESS. Each refusal below is a shape `new URL(u)` in the
+    mcp-client THROWS on (measured: `ERR_INVALID_URL` for the empty host, the space, the non-numeric
+    port, `:65536`, `:-1` and a percent-encoded host) — so refusing it cannot over-block a config
+    that works, because no request can be constructed from it either. The shapes the client ACCEPTS
+    are accepted here: a bare trailing `host:` (URL reads it as no port), a trailing root dot
+    (`api.example.`), an underscore (`my_host`), an IDN (punycoded by URL), and `[<ipv6>]:port`.
+    The empty-labeled and alnum-free forms the client parses but DNS cannot resolve (`.`, `-`,
+    `a..b`) are refused too: they are typos, never an endpoint someone configured.
+
+    ⛔ `cell-install.sh`'s marker carries the SAME predicate under the same name. Two predicates
+    disagreeing about "a usable endpoint" is the defect class this whole change exists to close
+    (#3374 P1), so a shape refused here must be refused there and vice versa.
+    """
+    a = (authority or "").strip()
+    if not a or any(c.isspace() for c in a):
+        return False
+    if "@" in a:                                 # userinfo is NOT the host (refused elsewhere)
+        a = a.rsplit("@", 1)[1]
+    if a.startswith("["):                         # `[<ipv6>]`, optionally `:port`
+        m = re.match(r"^\[([0-9A-Fa-f:.]+)\](?::(.*))?$", a)
+        if not m or not _port_ok(m.group(2)):
+            return False
+        try:
+            ipaddress.IPv6Address(m.group(1))
+        except ValueError:
+            return False
+        return True
+    if a.count(":") > 1:                          # an unbracketed IPv6 is not a legal authority
+        return False
+    host, sep, port = a.partition(":")
+    if sep and port and not _port_ok(port):
+        return False
+    if not host or "%" in host:                    # empty, or pct-encoded (the client throws)
+        return False
+    labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
+    return all(lab and any(ch.isalnum() for ch in lab) for lab in labels)
+
+
+def _port_ok(port):
+    """True when `port` is absent, or a decimal 1..65535 (`""` is the bare-`host:` spelling)."""
+    if port is None or port == "":
+        return True
+    if not port.isdigit():
+        return False
+    return 1 <= int(port) <= 65535
+
+
 def near_miss(url, want_url):
     """True when `url` is the DEFAULT endpoint spelled differently (SAME AUTHORITY).
 
@@ -350,6 +407,11 @@ def usable(entry, want_url):
     # authority, so this shape is REPLACED with the hosted default rather than certified.
     if re.match(r"^[a-z][a-z0-9+.\-]*://[^/?#]*@", url, re.I):
         return False, "userinfo"
+    # ⛔ THE SAME ARM AS THE VERIFIER'S `NOHOST:` — an authority that names no endpoint is not a
+    # self-host to preserve, and preserving it hands back a file the next verify refuses, forever.
+    _a = re.match(r"^[a-z][a-z0-9+.\-]*://([^/?#]*)", url, re.I)
+    if not authority_names_a_host(_a.group(1) if _a else ""):
+        return False, "nohost"
     # `type` is only disqualifying for the HOSTED default. The client's McpServerConfig has no
     # `type` field at all (it selects StreamableHTTP from `url` alone), so a self-hosted entry that
     # spells `type: "sse"` for its own daemon WORKS — replacing it would destroy the operator's
@@ -589,9 +651,11 @@ def main(argv):
                 "NOTE: REPLACED an unusable tortoise entry (reason: %s — the hosted endpoint needs an "
                 "env-indirect Authorization, no entry may carry a literal key, a credential may not "
                 "be sent to a non-loopback url over a non-https scheme, EVERY preserved url must "
-                "be an absolute http(s) url, and no url may carry USERINFO in its authority (that is "
-                "what a host-spoof looks like, and it is the minimum `--verify` will certify) with the "
-                "hosted default; a preserved one could never be repaired" % why
+                "be an absolute http(s) url, no url may carry USERINFO in its authority (that is "
+                "what a host-spoof looks like), and no authority may name a host the client cannot "
+                "build a request from (an empty host, a space, a bad port, a percent-encoded host, "
+                "or a name DNS cannot resolve) — all of that is the minimum `--verify` will certify) "
+                "with the hosted default; a preserved one could never be repaired" % why
             )
             have["tortoise"] = want
     else:
