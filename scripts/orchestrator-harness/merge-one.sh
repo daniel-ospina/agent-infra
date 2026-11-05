@@ -1021,9 +1021,38 @@ _cc_recover() {
   local rec_head
   "$RECORDER" --recover-body "$PR" "$OR" >> "$L.log" 2>&1 || return 1
   if review_clean_at_head; then
-    echo "[merge $PR] RECOVERED — the PR body's SIGNED marker verified and the record was rebuilt at head=$HEAD; no review ordered (the MERGE still runs below)" >> "$L.log"
-    CC_OWED=1
-    return 0
+    # ⛔ A RECORD-FILE VERDICT IS NOT A SURFACE READING (#3440, review round 3, BLOCKING).
+    # `review_clean_at_head` is a STORE check: it answers "is there a clean record at this head",
+    # and it never looks at CI. This arm used to set CC_OWED=1 and return on that alone, so on the
+    # #2872 population — the record absent on THIS box and a signed marker in the body at the
+    # CURRENT head, i.e. the whole reason the verb exists — a PR-caused red (or an unreadable
+    # surface) was read as mergeable with no check-runs read anywhere in the run. That is the
+    # false PASS #3440 exists to close, and in GATE mode step 4 is not rail-gated, so nothing else
+    # would have caught it. So the surface is ASKED about before the merge, and only the two
+    # licence tokens cover the head.
+    _cc_ask
+    case "$CC_RC:$CC_TOKEN" in
+      0:head)
+        echo "[merge $PR] RECOVERED — the PR body's SIGNED marker verified, the record was rebuilt at head=$HEAD, and the head's CHECK SURFACE carries no red group that is not base-owned; no review ordered (the MERGE still runs below)" >> "$L.log"
+        CC_OWED=1
+        return 0 ;;
+      0:red-base-owned)
+        echo "[merge $PR] RECOVERED — the marker verified and the record covers head=$HEAD, but ⛔ THE HEAD'S CHECK SURFACE IS RED and every red group also reproduces on the base (the groups are named in the check-carry stderr above). ⛔ Base ownership here is the RECORDER's same-name comparison — in gate mode nothing else re-measures it, so this is a named residual, not a guarantee. No review ordered (a red build is not a review finding); the merge below is what this run decided to risk" >> "$L.log"
+        CC_OWED=1
+        return 0 ;;
+      7:red-surface|8:surface-unknown)
+        # ⛔ A BROKEN TREE OR A FAILED READ IS NOT A REASON TO BUY A REVIEW, and this arm has no
+        # bounded retry of its own — so it PARKs rather than looping `exit 0` for ever (the
+        # inert-enforcer shape this file refuses). Stated asymmetry: the main path retries a red
+        # surface SURFACE_TRIES times before parking; on this cross-box recovery population the
+        # first refusal parks, because a durable red/gh fault on a head that was already recovered
+        # once needs a human look, and a flaky shard re-arms on the next push (the park is
+        # head-keyed).
+        park "the record for head=$HEAD was RECOVERED from the PR body's signed marker and its verdict is clean, but --check-carry REFUSED it: token='${CC_TOKEN}' (rc=$CC_RC). $([ "$CC_TOKEN" = "red-surface" ] && printf 'The head'"'"'s CHECK SURFACE IS RED and the red is the PR'"'"'s own — the groups are named in the check-carry stderr in this log.' || printf 'The head'"'"'s CHECK SURFACE COULD NOT BE READ — a failed read is not a green one.') NOTHING WAS MERGED and NO review was ordered (a red build is not a review finding). Fix or re-run the failing check(s) / the gh layer, then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+        echo "[merge $PR] ABORT: check-carry refused the RECOVERED record at head=$HEAD (token=${CC_TOKEN}) — parked with the surface named, because nothing may merge over it and a review would not fix it" >> "$L.log"
+        exit 3 ;;
+    esac
+    echo "[merge $PR] RECOVERED — the marker verified and the record was rebuilt at head=$HEAD, but --check-carry answered rc=$CC_RC token=[${CC_TOKEN:-<none>}] (not one this caller may act on), so the ordinary recovery path below decides" >> "$L.log"
   fi
   rec_head="$(review_head_of "$(review_record_file_for_pr)")"
   # ⛔ THE RECOVERED HEAD IS NOT ALWAYS A DIFFERENT ONE (fresh review of #3037, P2-1). This line used
@@ -1040,6 +1069,21 @@ _cc_recover() {
   case "$CC_RC:$CC_TOKEN" in
     0:head)
       if review_clean_at_head; then CC_OWED=1; return 0; fi ;;
+    0:red-base-owned)
+      # (#3440) The record covers the head; the reds are the base's. Same action as `0:head`, and
+      # the red is NAMED — never a bare green.
+      if review_clean_at_head; then
+        CC_OWED=1
+        echo "[merge $PR] RECOVERED AND CARRIED — the record restored from the body covers an older head and the reviewed artifact is UNCHANGED — but ⛔ the head's CHECK SURFACE IS RED and BASE-OWNED (groups named in the check-carry stderr above); no review ordered (a red build is not a review finding), the merge below is the rail's/this run's decision" >> "$L.log"
+        return 0
+      fi ;;
+    7:red-surface|8:surface-unknown)
+      # (#3440) Reached when the recovered record is NOT clean at this head: a red build or a failed
+      # read must not become a 20-40 minute review. PARK — the caller's `4:*`/`0:*` arms would
+      # otherwise report "a review is owed" for a token that says no such thing.
+      park "check-carry answered '${CC_TOKEN}' for head=$HEAD while recovering this PR's record from the body (rc=$CC_RC). The recovered verdict does not cover this head either, and a red surface / a failed READ is not a reason to buy a review. Nothing was merged and no review was ordered. Fix or re-run the failing check(s), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+      echo "[merge $PR] ABORT: check-carry answered ${CC_TOKEN} during recovery at head=$HEAD — parked rather than buying a review for a broken tree or a failed read" >> "$L.log"
+      exit 3 ;;
     0:carry|5:*|6:*)
       if _cc_rerecord && review_clean_at_head; then
         echo "[merge $PR] RECOVERED AND CARRIED — the record restored from the body covers an older head and the reviewed artifact is UNCHANGED across the head move: re-recorded $CC_VERDICT at head=$HEAD, no review ordered (the MERGE still runs below)" >> "$L.log"
@@ -1227,9 +1271,10 @@ case "$CC_RC:$CC_TOKEN" in
     exit 0 ;;
   4:*)
     # No record anywhere on this box: the #2872 case. The verdict may still travel in the body.
-    if _cc_recover; then
-      :
-    else
+    # ⛔ `_cc_recover` CAN EXIT 3 (it parks a RECOVERED record whose surface is red or unreadable) —
+    # it never falls through on a refusal, and the `if !` form keeps `set -e` from turning a
+    # non-zero return into an abort.
+    if ! _cc_recover; then
       echo "[merge $PR] no record and no verified body marker for head=$HEAD on this box — a fresh review is owed" >> "$L.log"
     fi ;;
   0:*)
@@ -1238,7 +1283,9 @@ case "$CC_RC:$CC_TOKEN" in
     # wrapper that ignores unknown flags) exits 0 with its own output, and keying on rc alone read
     # that as "the record already covers this head". It is NO ANSWER, not an authorisation.
     echo "[merge $PR] --check-carry answered rc=0 with [${CC_TOKEN:-<empty>}], which is not 'head'|'carry' — a recorder that does not implement the verb answers 0 too, so rc alone is NOT an authorization; treating it as NO answer" >> "$L.log"
-    if _cc_recover; then :; else
+    # ⛔ `_cc_recover` CAN EXIT 3 (it parks) — it never falls through on a refusal, and its
+    # `||` form keeps `set -e` from turning a NON-zero return into an abort.
+    if ! _cc_recover; then
       echo "[merge $PR] …and no verified body marker covers head=$HEAD — a fresh review is owed" >> "$L.log"
     fi ;;
   *)

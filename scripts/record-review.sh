@@ -51,8 +51,10 @@
 #                    from exit 0 because no merge may be assumed.
 #     fresh       1  the DIFF changed; a fresh review is genuinely owed
 #     unreadable  3  the live diff could not be READ — RETRY, do NOT re-review
-#     red-surface 7  (#3440) the RECORDED sha's check surface is RED and the red is
-#                    NOT shown base-owned — NOT mergeable. The record may still cover
+#     red-surface 7  (#3440) the JUDGED sha's check surface is RED and the red is NOT shown
+#                    base-owned — NOT mergeable. The JUDGED sha is the head that would
+#                    MERGE: the recorded head on the head-bound arm, and the LIVE head on
+#                    the `carry` arm (where the two differ by construction). The record may still cover
 #                    the artifact; it does not cover a tree whose checks are failing,
 #                    and answering `head`/`carry` there is the false PASS #3440
 #                    measured (#3355: a clean attestation over 7 red checks). The
@@ -2647,13 +2649,15 @@ RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE-ai-review-gate ai-review-
 #
 # The distinction that matters and is easy to lose: `empty` (the API ANSWERED, and no
 # non-excluded group exists on this commit) and `unreadable` (the READ FAILED) are
-# different facts. The clause-E carry veto folds them into the same "not shown red"
-# because #2342 measured that folding is what keeps a spent budget from refusing every
-# carry (clause E applies that mapping itself, in its own two branches); the attestation surface
-# keeps them apart because #3440 asked for it — an
-# unreadable surface must never be recorded as anything resembling green, and neither
-# must an empty one, but only the former is a REFUSAL at `--check-carry` (see
-# `cc_surface_gate`, which names both policies where it applies them).
+# different facts, and the two consumers map them DIFFERENTLY — deliberately, and the
+# mapping is stated here because a future editor who guesses it wrong weakens a veto:
+#   · clause E (the carry veto) CONTINUES on `green`/`empty`/`in_flight`, REFUSES on `red`,
+#     and REFUSES on `unreadable` (its `rc` check). #2342 records why an EMPTY surface must
+#     not refuse there;
+#   · `--check-carry` keeps the normal answer for `green`/`empty`/`in_flight` (loudly, for
+#     the latter two), and REFUSES `red` (as `red-surface`/`red-base-owned`) and `unreadable`
+#     (as `surface-unknown`). An unreadable surface must never be recorded as anything
+#     resembling green, and neither must an empty one — the record says `unknown` for both.
 check_surface_scan() { # <sha>
   local raw
   if ! raw="$(command gh api "repos/$REPO/commits/$1/check-runs?per_page=100&filter=all" \

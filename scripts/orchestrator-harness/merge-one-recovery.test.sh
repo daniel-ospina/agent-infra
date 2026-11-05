@@ -296,6 +296,35 @@ ck "RED→GREEN: …with no paid review" $rc
 rc=0; recorder_saw "--recover-body $PR $OR" || { rc=1; note "calls: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
 ck "…asked --recover-body for THIS PR and repo" $rc
 
+# ══ 3b) #3440 (review round 3): THE RECOVERY ARM ASKS ABOUT THE SURFACE BEFORE IT MERGES ══════════
+# `review_clean_at_head` is a STORE check — "is there a clean record at this head" — and it never
+# looks at CI. The arm used to set CC_OWED=1 and return on that alone, so on the #2872 population
+# (record absent on this box, signed marker in the body at the CURRENT head) a PR-caused red, or an
+# unreadable surface, was read as mergeable with NO check-runs read anywhere in the run — in gate
+# mode nothing else gates step 4. It now asks `--check-carry` and only the two licence tokens cover
+# the head.
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=red-surface FAKE_CC_RC_AFTER=7)"
+rc=0; rail_ran && { rc=1; note "the rail/merge ran over a RED surface on the RECOVERY path"; }
+ck "RED→GREEN: a RECOVERED record over a RED surface merges NOTHING" $rc
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a red build bought a review on the recovery path"; }
+ck "…and buys NO review (a red build is not a review finding, on this path either)" $rc
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "it neither merged nor parked — an unbounded loop"; }
+ck "RED→GREEN(exit-3): …it PARKS, naming the surface, instead of re-looping for ever" $rc
+# ⛔ THE BRANCH ITSELF IS PINNED BY ITS OWN LOG LINE, not only by the outcome: a park is also
+# reachable from the ORDINARY recovery path (which asks --check-carry again and parks), so a mutant
+# that deletes only the new ask can still land on a park. This line is emitted ONLY where the
+# recovered record is already clean at this head — i.e. only by the arm this vector is about.
+rc=0; log_has "check-carry refused the RECOVERED record" || { rc=1; note "the recovery arm did not report its OWN refusal: $(tail -5 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the log shows the RECOVERY arm itself made that decision (its own line, not a downstream one)" $rc
+
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=surface-unknown FAKE_CC_RC_AFTER=8)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a FAILED READ bought a review"; }
+ck "RED→GREEN: a RECOVERED record over an UNREADABLE surface does not buy a review either" $rc
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "it neither merged nor parked"; }
+ck "…and parks (a failed read is its own answer, not a review order)" $rc
+
 # ══ 4) `nodigest` / `carry-patch` say RE-RECORD, never RE-REVIEW ═════════════════════════════════
 # Both are NON-ZERO rcs. Keying on `rc == 0` treated them as "a fresh review is owed" and bought a
 # full paid review (REVIEW_TIMEOUT = 1800 s) on a rebase — the exact #1377 case.

@@ -5779,6 +5779,7 @@ EV_REF="comment:42495501"
 #   21.12 the `carry` arm judges the LIVE head, not the recorded one — + MUTATION PIN
 #   21.13 an IN-FLIGHT surface keeps the normal answer and says so (deliberate policy)
 #   21.14 with NO repo resolvable the answer is surface-unknown (8), never a green
+#   21.15 the surface fields are VOLATILE in the #1709 rec 7 identity — + MUTATION PIN
 # ⛔ THE EVIDENCE BODY IS A §20 FIXTURE (a deliberately NOT-CLEAN artifact, used to pin the
 # falsified-evidence refusal) and the shared runner does not clear it, so every mint below
 # would be refused with "the named review evidence could not be verified" — a decision about
@@ -6034,6 +6035,62 @@ if grep -qF -- 'cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HA
     fi
 else
     bad "21.12 the carry arm's gate call is gone — re-anchor the pin"
+fi
+
+# 21.15 THE SURFACE FIELDS ARE VOLATILE IN THE #1709 rec 7 IDENTITY — review round 3, coverage.
+# A record re-minted at the SAME head that observes a DIFFERENT surface (red → green after a re-run)
+# must be a NO-OP: `reviewed_at` is the audit trail's only join to the authorising dispatch, and a
+# refresh must not move it. If either strip in `record_identity` is dropped, the second mint is
+# treated as a NEW record, rewrites the file and re-stamps `reviewed_at` — and nothing else in this
+# suite notices, because every other mint is one per PR.
+s21_rows "$S21_HEAD" "$S21_RED"
+rm -f "$S21_FILE-425015.json"
+export STUB_CHECKS_ROWS_DIR="$S21_ROWS"
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425015
+S21_REC15A="$(cat "$S21_FILE-425015.json" 2>/dev/null || echo)"
+assert_contains "$S21_REC15A" '"check_surface":"red"' "21.15 fixture: the first mint records the RED surface"
+S21_AT15="$(printf '%s' "$S21_REC15A" | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p')"
+sleep 1
+s21_rows "$S21_HEAD" "$S21_GREEN" "$S21_GREEN2"
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425015
+S21_REC15B="$(cat "$S21_FILE-425015.json" 2>/dev/null || echo)"
+assert_contains "$(printf '%s' "$S21_REC15B" | sed -n 's/.*"check_surface":"\([^"]*\)".*/\1/p')" "red" \
+  "21.15 a re-mint at the same head with a CHANGED surface is a #1709 rec 7 NO-OP (the first observation stands)"
+assert_contains "$(printf '%s' "$S21_REC15B" | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p')" "$S21_AT15" \
+  "21.15 …and reviewed_at did NOT move (the audit join is preserved)"
+assert_contains "$(printf '%s' "$RECORD_ERR" | command tr '\n' '|')" "idempotent" \
+  "21.15 …and the recorder SAYS it was a no-op, so the state is diagnosable"
+# (e) MUTATION PIN — drop the strip and the second mint rewrites the record.
+# ⛔ THE MUTANT IS BUILT WITH `grep -vF` ON A FIXED STRING, not a sed script: the line being
+# removed is itself full of shell/regex metacharacters (`'`, `"`, `[^"]*`), and a sed address
+# written to match it is a parsing puzzle rather than a test. Fixed-string deletion is exact.
+S21_MUT15="$S21_MUTDIR/record-review-s21-nostrip.sh"
+S21_STRIP_PAT='-e '"'"'s/"check_surface":"[^"]*",//'"'"''
+if grep -qF -- "$S21_STRIP_PAT" "$RECORD"; then
+    grep -vF -- "$S21_STRIP_PAT" "$RECORD" > "$S21_MUT15"
+    if cmp -s "$RECORD" "$S21_MUT15"; then
+        bad "21.15 mutation: the fixed-string deletion did not apply — re-anchor the pin"
+    else
+        s21_rows "$S21_HEAD" "$S21_RED"
+        rm -f "$S21_FILE-425016.json"
+        EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425016
+        s21_rows "$S21_HEAD" "$S21_GREEN" "$S21_GREEN2"
+        S21_REC16A="$(cat "$S21_FILE-425016.json" 2>/dev/null || echo)"
+        S21_AT16="$(printf '%s' "$S21_REC16A" | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p')"
+        sleep 1
+        S21_SAVE="$RECORD"
+        RECORD="$S21_MUT15"
+        EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425016
+        RECORD="$S21_SAVE"
+        S21_REC16B="$(cat "$S21_FILE-425016.json" 2>/dev/null || echo)"
+        if [ "$(printf '%s' "$S21_REC16B" | sed -n 's/.*"check_surface":"\([^"]*\)".*/\1/p')" = "green" ]; then
+            ok "21.15 MUTATION PIN: with the strip removed the same head is RE-MINTED (surface rewritten to green) — the volatility rule is load-bearing"
+        else
+            bad "21.15 mutation NOT caught (record still: $(printf '%s' "$S21_REC16B" | command head -c 160))"
+        fi
+    fi
+else
+    bad "21.15 the record_identity strip is gone — re-anchor the pin"
 fi
 
 # 21.13 IN FLIGHT is a deliberate POLICY (it keeps the normal answer and says so). Pinned because
