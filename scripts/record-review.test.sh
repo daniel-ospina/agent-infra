@@ -6039,7 +6039,10 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
 #           loud line prints"; that was false, measured, and corrected here.)
 #   :1245  no key resolved         → pinned by 20.13 (its count assertion pins the refusal;
 #           its assertion on the ABSENCE of the loud line names which arm fired).
-#   :1247  the HMAC did not COMPUTE → pinned by 20.11 (below).
+#   :1247  the HMAC did not COMPUTE → its FAIL-OPEN REWRITE (`|| _mexp="$_msig"`) is PINNED
+#           by 20.11; ⛔ its own DELETION is undetected (the empty `_mexp` then reaches
+#           :1248 and fails the MATCH, so the suite stays green) — same "passes through"
+#           shape as :1229, and the block's own rule says that is not a pin.
 #   :1248  the HMAC did not MATCH   → pinned by 20.12.
 # ⛔ 20.10 IS NOT THE :1245 PIN, and saying so was FALSE (measured): 20.10's negative
 # drives `AI_REVIEW_GATE_KEY=""`, so its run is REFUSED at :1245 — but deleting that
@@ -6208,6 +6211,70 @@ assert_not_contains "$FLE_OUT" "REFUSING to publish a marker" \
     "20.13 …and the refusal came from the KEY-UNSET arm (:1245, silent), not from the match arm (:1248, loud) [out: $(printf '%s' "$FLE_OUT" | tr '\n' ' ')]"
 assert_eq "$FLE_RC" "0" \
     "20.13 …and the keyless flush still delivers the BODY copy (rc 0) — the refusal is not fatal"
+
+# ── 20.14 A FAILED PENDING WRITE MUST NOT BE SWALLOWED ────────────────────────
+# (#3168 round-9 review, P2.) Both body-channel failure arms persist the marker to the
+# pending file so a later `--flush-pending` can deliver it WITHOUT a second review —
+# and the minted RECORD does not carry the marker text or its `sig=`, so that file is
+# the ONLY copy. Both arms used to discard `marker_pending_write`'s status (`|| true`)
+# and then print "the marker is kept in <path>". When the write fails, that sentence is
+# false, and the remedy it names is a no-op: `--flush-pending` answers "nothing pending
+# … Nothing was written" and exits 0. Silent loss of the only copy, reported as success
+# — the same defect class as `|| true` on the post itself, one layer down. Pre-existing
+# on main, but BOTH lines were rewritten by this PR with the claim retained.
+# The mint path already had the correct pattern (:4887-4889: warn, and reproduce the
+# marker text so the bytes survive). Both arms now use it, LINE-NEUTRALLY (the file
+# stays 5087 lines so every `:NNNN` citation holds).
+# ⛔ THE FIXTURE BLOCKS THE DIRECTORY, not the write: `marker_pending_write` starts with
+# `mkdir -p "$(marker_pending_dir)"`, so a regular FILE at that path makes it return 1
+# deterministically — no chmod, no root, no dependence on the runner's uid.
+PWF_PR=424357
+PWF_PENDDIR="$F_HOME/.pi/agent/reviews/pending"
+rm -rf "$PWF_PENDDIR" && printf 'not a directory\n' > "$PWF_PENDDIR"
+if [ -f "$PWF_PENDDIR" ] && [ ! -d "$PWF_PENDDIR" ]; then
+    ok "20.14 fixture: a regular FILE sits at the pending-dir path, so mkdir -p fails (the write CANNOT succeed)"
+else
+    bad "20.14 fixture: the pending dir could not be replaced by a file — the vector would judge a successful write"
+fi
+: > "$LOG"
+# ⛔ RUN INLINE, NOT VIA run_record_633. The evidence fixture must be re-pointed for this
+# PR (the stub answers the evidence fetch only for the PR it is told about) and swapped
+# to a CLEAN body — §20 left the shared fixture on a "NOT CLEAN" artifact, so a clean
+# mint carrying it is refused at rc 3 and the vector would judge the EVIDENCE arm instead
+# of the pending-write arm. A prefix assignment does not reach the recorder through the
+# harness (it `export`s a fixed list), so the env is spelled out here.
+PWF_CAP="$T/pwfcap"; PWF_ERRF="$T/pwferr"
+: > "$PWF_CAP"; : > "$PWF_ERRF"
+PWF_RC=0
+PWF_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
+    STUB_EVIDENCE_PR="$PWF_PR" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra" \
+    STUB_EVIDENCE_BODY='**Outcome: CLEAN — no blocking issues found.**' \
+    STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' \
+    STUB_CAPTURE="$PWF_CAP" \
+    bash "$RECORD" "$PWF_PR" "$SHA" clean daniel-ospina/agent-infra \
+        --evidence "comment:7391001" 2>"$PWF_ERRF")" || PWF_RC=$?
+PWF_ERR="$(cat "$PWF_ERRF" 2>/dev/null || true)"
+rm -f "$PWF_PENDDIR"; mkdir -p "$PWF_PENDDIR"
+if [ ! -f "$PWF_PENDDIR" ] && [ -d "$PWF_PENDDIR" ]; then
+    ok "20.14 restore: the pending dir is usable again for later vectors"
+else
+    bad "20.14 restore FAILED — the pending dir is still a file, later flush vectors will misbehave"
+fi
+assert_eq "$PWF_RC" "5" \
+    "20.14 a failed pending write does not change the exit code — the arm is still a NAMED failure (rc 5) [err: $(printf '%s' "$PWF_ERR" | tr '\n' '|')]"
+assert_contains "$PWF_ERR" "could NOT persist the pending marker" \
+    "20.14 …and the lost write is REPORTED, instead of discarded by `|| true`"
+assert_contains "$PWF_ERR" ">>> review recorded: reviews/$PWF_PR.json" \
+    "20.14 …and the marker text is reproduced in that message, so the only copy is not lost"
+# ⛔ AND THE EXIT-5 MESSAGE NO LONGER ASSERTS THE OPPOSITE (the second half of the same
+# P2). It used to end "The marker is kept in <path> and a later --flush-pending …
+# delivers it" — unconditionally, including on this run, where nothing was written and
+# that flush answers "nothing pending … Nothing was written" exit 0. Two contradictory
+# sentences on one stderr stream, and the reassuring one was the false one.
+assert_contains "$PWF_ERR" "WHETHER THESE BYTES ARE ON DISK DEPENDS ON THE PERSIST WARNING ABOVE" \
+    "20.14 …and the exit-5 message makes its 'kept in <path>' claim CONDITIONAL on that warning, instead of asserting it"
+assert_contains "$PWF_ERR" "If it DID appear, NOTHING was written" \
+    "20.14 …naming the failed-write case and where the bytes then live (only in the warning)"
 
 DM_20_SENTINEL=1
 

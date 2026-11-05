@@ -4842,7 +4842,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # file first: a later `--flush-pending` (or any later run of this PR) delivers
     # them without a second review. Exit 5 names the state instead of reporting
     # success over an invisible record.
-    marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || true
+    marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy this arm prints below WILL FIND NOTHING and will report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
     # ⛔ THE DURABLE CHANNEL IS ATTEMPTED HERE, BEFORE THE exit 5 (agent-infra#3168
     # review P2). This arm and the PATCH-failure arm below are the ONLY scenarios
     # the durable channel exists for, and both used to `exit 5` before reaching it —
@@ -4860,7 +4860,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # branch warns and sets MARKER_SIGNED=0, then execution CONTINUES to the body
     # read below), so "the signed marker" named a property these bytes need not
     # have. It says "the marker".
-    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (gh refused the GET — ⛔ this line does NOT assert WHICH cause: the error text is discarded, so a transient API failure, a throttled token, and a permanent 404 for a wrong PR number or a repo this token cannot see all land here), so the marker was NOT written into the PR body — the record is saved. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers the BODY copy WITHOUT a new review IF the cause was transient; a PERMANENT cause fails that retry the same way." >&2
+    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (gh refused the GET — ⛔ this line does NOT assert WHICH cause: the error text is discarded, so a transient API failure, a throttled token, and a permanent 404 for a wrong PR number or a repo this token cannot see all land here), so the marker was NOT written into the PR body — the record is saved. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). ⛔ WHETHER THESE BYTES ARE ON DISK DEPENDS ON THE PERSIST WARNING ABOVE: if that warning did NOT appear, the marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers the BODY copy WITHOUT a new review IF the cause was transient (a PERMANENT cause fails that retry the same way). If it DID appear, NOTHING was written, --flush-pending will answer 'nothing pending', and the marker text exists ONLY inside that warning line — copy it from there." >&2
     exit 5
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
@@ -4907,7 +4907,7 @@ ${MISSING}"
       # with the ONLY local record of the failure on stderr. It is now a NAMED
       # non-zero state, and the marker survives on disk so delivery can be retried
       # without re-recording (which would dilute the evidence).
-      marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MISSING" || true
+      marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MISSING" || echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy printed below WILL FIND NOTHING and will report success. The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand. >>> $MISSING <<<" >&2
       # Same reasoning as the read-failure arm above (#3168 review P2): the PATCH
       # was refused, so the durable channel is the one that can still carry the
       # marker's bytes. Attempted BEFORE the exit, and "$MISSING" not "$MARKER" — it
@@ -4920,7 +4920,7 @@ ${MISSING}"
       # marker" — the caller's own warning line already said loudly whether it was
       # signed.
       echo "⛔ body-marker-unposted: the marker for $REPO#$PR could NOT be PATCHed into the PR body (gh/API refused — ⛔ this line does NOT assert WHICH cause: the PATCH's error text is discarded, so a spent token budget, a 403, a 5xx and a permanent 404/422 all land here). The record IS saved at $FILE. ⛔ THIS MESSAGE COVERS THE PR BODY ONLY. It is deliberately not a claim about whether ai-review-gate can read the evidence from a PR COMMENT: the comment channel is a separate call that reports on its OWN line when it has something to report, and is SILENT when it withheld the post by design (an UNSIGNED marker is never published as a comment) or when an admitted comment already carries the marker. Admission there is decided by the gate (OWNER/MEMBER/COLLABORATOR authors only). The BODY PATCH is what fires the 'edited' event that RE-RUNS the gate, so this retry is still owed." >&2
-      echo "   The marker is kept verbatim in $(marker_pending_file "$REPO" "$PR") — deliver it with: record-review.sh --flush-pending $PR ${REPO}   (no new review, no new record, no re-record)" >&2
+      echo "   ⛔ THE PERSIST WARNING ABOVE DECIDES THIS LINE'S TRUTH: if it did NOT appear, the marker is kept verbatim in $(marker_pending_file "$REPO" "$PR") — deliver it with: record-review.sh --flush-pending $PR ${REPO}   (no new review, no new record, no re-record). If it DID appear, nothing is on disk, that flush will find nothing, and the marker text exists ONLY inside that warning line." >&2
       exit 5
     fi
   fi
