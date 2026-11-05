@@ -1045,22 +1045,55 @@ esac
 # assertion, not the regex; so the SHAPE is banned outright and this arm reddens if it ever returns.
 # (comment lines are excluded: the explanation of this very bug contains the banned shape as prose — measured,
 # it was the only hit, which is also a reminder that a prose match is not a code match.)
-# ⛔ AND THE FIRST VERSION OF THIS ARM BANNED ONE SPELLING, NOT THE CLASS (#3379 review cycle 16, P1,
-# MEASURED): its regex required the first `ck` after a line start or `;` AND the second after `;`, so three
-# other live vacuous shapes walked straight through it — `grep … && ck $? "a"; ck $? "b"`, `ck $? "a" && ck
-# $? "b"`, and `ok "…"; ck $? "…"` — each leaving the suite at 179/0 green. A ban that anchors on a SEPARATOR
-# bans the separator. This one COUNTS STATUS CONSUMERS per line, whatever sits between them: two or more
-# `ck $?`, or any `ck $?` sharing a line with a preceding `ok`/`bad`/`ck`, is a line whose later assertion
-# reads 0 unconditionally.
-# (comment lines are excluded: the explanation of this bug contains the banned shape as prose.)
-DOUBLE_CK="$(grep -vE '^[[:space:]]*#' "$0" | awk '{
-  line = $0
-  ck = gsub(/ck[[:space:]]+\$\?/, "", line); line = $0
-  oth = gsub(/(ok|bad|ck)[[:space:]]+"/, "", line)
-  if (ck >= 2 || (ck >= 1 && oth >= 1)) { n++; if (n <= 3) print "  " NR": "$0 }
-} END { print n+0 }' | tail -1)"
-DOUBLE_CK="${DOUBLE_CK##*$'\n'}"
-[ "${DOUBLE_CK:-0}" = "0" ]; ck $? "no line reuses the shell status after a consumer (a second ck/ok/bad on one line reads 0 unconditionally - measured ${DOUBLE_CK:-0} such line(s))"
+# ⛔ THE HAZARD IS A STATUS CONSUMER IN A NON-INITIAL POSITION, NOT A SPELLING OF `$?` (this arm's third
+# revision, #3379 review cycles 14-17, each MEASURED). `ck`/`ok`/`bad` return 0 unconditionally, so an
+# assertion whose argument reads `$?` AFTER another statement has already consumed it ALWAYS passes — the
+# arm printed ✅ over a `[ 1 -eq 2 ]` exactly that way. Two earlier versions were wrong in opposite
+# directions: a literal `; ck $? …; ck $?` (bans a separator, evaded by `&&`, `ok`, quoted `"$?"`, `${?}`,
+# `_s=$?; ck $_s`), then a per-line CONSUMER COUNT (reddened on the file's own `then ok "$2"; else bad "$2"`
+# and on messages whose prose contains the word, i.e. a false block). What is actually banned is the
+# combination: an assertion at a non-initial position whose argument reads a status.
+# Comments are stripped FIRST — whole-line and trailing — because this file documents its own defects inline,
+# and a trailing comment quoting the shape must not fail a correct line.
+# The diagnostic reports FILE line numbers (FNR on the file itself), not the index of a filtered stream.
+# ⛔ AND IT MUST NOT FAIL OPEN WHEN IT CANNOT RUN (this arm's fourth revision; #3379 review cycle 17). The
+# third revision used `seg` as BOTH the split array and the per-segment scalar, so awk aborted with
+# "illegal reference to array seg", the capture came back EMPTY, and `${DOUBLE_CK:-0}` read empty as 0 —
+# the guard reported "measured 0 line(s)" and passed while testing NOTHING. A gate that exits 0 when it
+# could not run is the no-op shape this whole branch is about, and it was mine. Distinct names now, and an
+# unparseable report is a FAILURE rather than a zero.
+DOUBLE_CK_REPORT="$(awk '
+  {
+    line = $0
+    sub(/^[[:space:]]*#.*$/, "", line)      # a whole-line comment
+    sub(/[[:space:]]+#.*$/, "", line)       # a trailing comment
+    gsub(/\|\|/, ";", line)                 # one separator kind, so the walk need not know which
+    gsub(/&&/, ";", line)
+    n = split(line, segs, ";")
+    seen = 0                                # has a consumer already run on this line?
+    for (i = 1; i <= n; i++) {
+      sg = segs[i]
+      sub(/^[[:space:]]*/, "", sg)
+      sub(/^\([[:space:]]*/, "", sg)
+      sub(/^\{[[:space:]]*/, "", sg)
+      sub(/^then[[:space:]]+/, "", sg)
+      sub(/^else[[:space:]]+/, "", sg)
+      if (sg !~ /^(ck|ok|bad)[[:space:]]+/) continue
+      arg = sg
+      sub(/^(ck|ok|bad)[[:space:]]+/, "", arg)
+      reads = (arg ~ /\$\?/ || arg ~ /\$\{[[:space:]]*\?/ || arg ~ /^"?\$_[A-Za-z_]/)
+      if (seen && reads) { cnt++; hits = hits (cnt == 1 ? "" : ",") FNR; break }
+      seen = 1
+    }
+  }
+  END { printf "%d|%s", cnt + 0, hits }
+' "$0" 2>/dev/null)"
+DOUBLE_CK="${DOUBLE_CK_REPORT%%|*}"
+DOUBLE_CK_AT="${DOUBLE_CK_REPORT#*|}"
+case "${DOUBLE_CK:-}" in
+  ''|*[!0-9]*) bad "the double-status guard COULD NOT RUN (report='${DOUBLE_CK_REPORT:-<empty>}') — an unparseable report is not a pass" ;;
+  *) [ "$DOUBLE_CK" = "0" ]; ck $? "no non-initial assertion reads a status (it would read a consumer's 0 and could never fail - measured $DOUBLE_CK line(s)${DOUBLE_CK_AT:+, at $DOUBLE_CK_AT})" ;;
+esac
 
 echo
 printf 'mandate-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
