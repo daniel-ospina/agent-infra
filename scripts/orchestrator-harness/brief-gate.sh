@@ -242,7 +242,9 @@ END {
 #      END block is how a change to one silently re-opens the other.
 #
 # Globals: `sec` (the heading exists), `none` (a NO NEW ASSERTIONS claim with a reason), `hdr` (a
-# table header naming assertion + mutant + reddened) and `row` (a data row with >=3 non-empty cells).
+# table header naming assertion + mutant + reddened), `hl` (the header's LINE index, so a header can
+# never count as its own data row), `row` (a data row BELOW the header with >=3 non-empty cells) and
+# `fence` (inside a ``` block — quoted material, never a claim).
 # Tokens are printed only when the contract is unmet, one per line, so the caller can teach each.
 # shellcheck disable=SC2016
 BRIEF_GATE_MUTATION_AWK='
@@ -255,7 +257,7 @@ function _cells(s, arr,   n, i, x, k, tmp) {
   }
   return k
 }
-BEGIN { buf = ""; ins = 0; depth = 0; sec = 0; none = 0; hdr = 0; row = 0 }
+BEGIN { buf = ""; ins = 0; depth = 0; sec = 0; none = 0; hdr = 0; row = 0; fence = 0; hl = 0 }
 { buf = buf $0 "\n" }
 END {
   if (length(buf) == 0) { print "EMPTY"; exit }
@@ -264,7 +266,20 @@ END {
   gsub(/\\n/, "\n", buf)
   nl = split(buf, L, "\n")
   for (i = 1; i <= nl; i++) {
-    line = L[i]; lc = tolower(line); nh = 0
+    # ⛔ CR BEFORE ANYTHING ELSE: a body that travelled through a CRLF carrier has a trailing \r on
+    # every line, and `|---|\r` is not an all-separator row to the regex below — so the rule would
+    # become the DATA row and a header-plus-rule table would be admitted (fresh-context review, P1).
+    line = L[i]; sub(/\r$/, "", line)
+    # ⛔ A FENCED BLOCK IS QUOTED MATERIAL, NEVER THE CLAIM ITSELF (#3442 review, P2). The reviewer is
+    # HANDED a filled worked row (`--mutation-section`) and both SKILL.md templates carry one, so
+    # "paste the shape I was given" inside a fence is exactly the fabricated-but-shaped block this
+    # contract exists to refuse. Fence state is tracked before any section logic, so a fenced heading
+    # cannot open the section either. An UNBALANCED fence swallows the rest of the artifact, which
+    # fails CLOSED (no heading/rows ⇒ refused) — the safe direction, stated so it is not a surprise.
+    # (No apostrophes in this program: it is a single-quoted bash string.)
+    if (line ~ /^[ \t]*```/) { fence = !fence; continue }
+    if (fence) continue
+    lc = tolower(line); nh = 0
     if (lc ~ /^#+/) { match(lc, /^#+/); nh = RLENGTH }
     # A heading at or above the section closes it (subsections stay inside it).
     if (ins && nh > 0 && nh <= depth) ins = 0
@@ -283,12 +298,15 @@ END {
       k = _cells(l, C)
       if (k >= 2) {
         t = tolower(l)
-        if (t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) hdr = 1
+        if (t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) { hdr = 1; hl = i }
         allsep = 1
         for (j = 1; j <= k; j++) { if (C[j] !~ /^:?-+:?$/) allsep = 0 }
         # The header row is not a data row, and a `|---|` rule is not either. Both would otherwise
-        # satisfy "has a row" on a table whose every data row was deleted.
-        if (!allsep && k >= 3 && tolower(C[1]) != "assertion") row = 1
+        # satisfy "has a row" on a table whose every data row was deleted. ⛔ BY POSITION, NOT BY
+        # TEXT (review of #3442, P1): matching the first cell against the literal `assertion` admits
+        # every DECORATED header — `| assertion (file:line) | mutant | … |` — as a data row, which is
+        # the same vacuous table the index was added to refuse. Rows count only AFTER the header.
+        if (!allsep && k >= 3 && i > hl) row = 1
       }
     }
   }

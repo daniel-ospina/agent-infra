@@ -190,6 +190,18 @@ printf '%s' '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the dif
 miss="$(bash "$GATE" --mutation-missing "$TMP/mut-tsv.txt" 2>/dev/null)"
 [ -z "$miss" ]; ck $? "(ix) a ONE-LINE @tsv-escaped body is parsed (the review-artifact carrier; got '$miss')"
 bash "$GATE" --mutation-missing "$TMP/does-not-exist-mut.txt" 2>/dev/null | grep -qx 'NO-FILE'; ck $? "(x) an UNREADABLE artifact is refused as NO-FILE, never admitted (fail-closed)"
+# ── THE SHAPED-BUT-VACUOUS CARRIERS (fresh-context review of #3442, P1/P2). Each of these carries the
+#    SHAPE of an attribution and NONE of its content — which is the exact vacuity the contract exists to
+#    refuse, so each is a separate arm rather than a variant of (v)–(vii).
+printf '## MUTATION ATTRIBUTION\n\n| assertion (file:line) | mutant | reddened row | observed |\n|---|---|---|---|\n' > "$TMP/mut-hdr-decorated.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-hdr-decorated.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xi) a header whose FIRST CELL is DECORATED ('assertion (file:line)') with no data rows is REFUSED — the header is excluded by POSITION, not by matching its text"
+printf '## MUTATION ATTRIBUTION\r\n\r\n| assertion | mutant | reddened row | observed |\r\n|---|---|---|---|\r\n' > "$TMP/mut-crlf.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-crlf.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xii) …and that header-plus-rule table delivered over CRLF is REFUSED too (the trailing \\r made the RULE the data row)"
+printf '## Review\n\nQuoting the shape:\n\n```\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| example | example | example | ok |\n```\n' > "$TMP/mut-fenced.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-fenced.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xiii) a block inside a TRIPLE-BACKTICK fence is QUOTED, not claimed — the artifact still carries no attribution"
+printf '## MUTATION ATTRIBUTION\n\n| assertion (file:line) | mutant | reddened row | observed |\n|---|---|---|---|\n| a:1 | sed s/x/y/ | §A | ❌ rc=1 |\n' > "$TMP/mut-hdr-decorated-full.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xiv) POSITIVE CONTROL: a decorated header WITH a real data row is ADMITTED — the position rule excludes the header, never the table (got '$miss')"
 
 # ── §G THE MUTATION PROOF: each §F assertion above must be able to FAIL. Same discipline as §C — the
 # mutant is derived FROM THE SHIPPED FILE so it tracks it, and the transformation is itself asserted.
@@ -218,6 +230,39 @@ cmp -s "$GATE" "$TMP/mutant-no-column.sh"; rc=$?
 bash -n "$TMP/mutant-no-column.sh"; ck $? "§G …and the column mutant still parses"
 miss="$(bash "$TMP/mutant-no-column.sh" --mutation-missing "$TMP/mut-nocol.txt" 2>/dev/null)"
 [ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(vi) 'a table whose header never names the mutant is REFUSED' now FAILS — the mutant admits it (got '$miss')"
+
+# §F(xi)/(xii) — the header is excluded from `row` BY POSITION. The mutant drops that index, so the
+# header counts as its own data row and a header-only table is admitted (measured: the decorated-header
+# and CRLF fixtures both return EMPTY under it, which is §F(xi) and §F(xii) failing).
+sed 's/i > hl) row = 1/1) row = 1  # MUTANT: a header may count as its own row/' "$GATE" > "$TMP/mutant-hdr-row.sh"
+cmp -s "$GATE" "$TMP/mutant-hdr-row.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the header-position mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-hdr-row.sh"; ck $? "§G …and the header-position mutant still parses"
+for _f in mut-hdr-decorated mut-crlf; do
+  miss="$(bash "$TMP/mutant-hdr-row.sh" --mutation-missing "$TMP/$_f.txt" 2>/dev/null)"
+  [ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xi)/(xii) on '$_f' now FAILS — the mutant lets the HEADER be the row (got '$miss')"
+done
+
+# §F(xii)'s SECOND half — the trailing CR is what made the RULE the data row. The mutant keeps the
+# position rule and drops the CR strip, so only the CRLF fixture is admitted: the arm is load-bearing
+# for the strip, not merely a restatement of the position rule.
+sed 's/; sub(\/\\r\$\/, "", line)//' "$GATE" > "$TMP/mutant-cr.sh"
+cmp -s "$GATE" "$TMP/mutant-cr.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the CR-strip mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-cr.sh"; ck $? "§G …and the CR-strip mutant still parses"
+miss="$(bash "$TMP/mutant-cr.sh" --mutation-missing "$TMP/mut-crlf.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xii) now FAILS — without the strip the all-separator RULE is the data row (got '$miss')"
+miss="$(bash "$TMP/mutant-cr.sh" --mutation-missing "$TMP/mut-hdr-decorated.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G …and the \\r-less fixture is STILL refused, so the strip is what the arm tests (got '$miss')"
+
+# §F(xiii) — fenced material is quoted, never claimed. The mutant keeps the `if` and empties its body,
+# so fences stop toggling and the quoted block is parsed as the artifact's own claim.
+sed 's/{ fence = !fence; continue }/{ }  # MUTANT: fences are not skipped/' "$GATE" > "$TMP/mutant-fence.sh"
+cmp -s "$GATE" "$TMP/mutant-fence.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the fence mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-fence.sh"; ck $? "§G …and the fence mutant still parses"
+miss="$(bash "$TMP/mutant-fence.sh" --mutation-missing "$TMP/mut-fenced.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xiii) now FAILS — the mutant admits a paste-back of the worked example (got '$miss')"
 
 echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
