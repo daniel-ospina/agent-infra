@@ -756,8 +756,11 @@ def leg_lane_census(mod):
 
         That is the exact state the original defect rendered as a clean scan, and it keeps the
         "unreadable store" fail-closed path from masking this one. Returns (exit_code, stdout).
-        `corrupt_store=True` writes a store that cannot be parsed, which is the ONLY way to model
-        `hook_ok is False` -- the shape the census's store-read guard depends on. Every patched
+        `corrupt_store=True` writes a store that cannot be parsed, which models the PARSE-failure
+        route to `hook_ok is False` -- the shape the census's store-read guard depends on. It is NOT
+        the only route: `load_hook` also reports `hook_ok is False` on SHAPE DRIFT (a store holding
+        records, none of which carries a `sessionId`), which `records=[...]` can model and which this
+        arm therefore does not exercise (review cycle 8, finding 1). Every patched
         global is restored, and a name the pre-fix module never had is deleted rather than left
         behind, so later legs see the module they expect.
         """
