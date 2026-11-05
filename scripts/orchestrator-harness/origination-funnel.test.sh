@@ -1123,10 +1123,23 @@ _arm_shape_check() {   # $1=handed, $2=label, $3=backlog, $4=result → OUT_DRIV
 }
 _arm_shape_check 4242 ok-recorded-count 2 ok
 case "$OUT_DRIVE" in
+  # ⛔ THE PREFIX, not a shared phrase (review P3, cycle 24): "the PASS's count" is printed by the
+  # recorded-ZERO fallback arm TOO, so asserting it left the recorded-COUNT arm's deletion fully green —
+  # the line flipped to `nothing to defer` over a record that says 2 are queued and nothing noticed.
+  *"[dispatch] deferred ("*) ok "ok-recorded-count: the recorded count takes the \`deferred (\` prefix (a candidate is queued per the record)" ;;
+  *"[dispatch] nothing to defer ("*) bad "ok-recorded-count: a record saying 2 are queued read as 'nothing to defer' — the recorded-COUNT arm is gone — $OUT_DRIVE" ;;
+  *) bad "ok-recorded-count: unexpected prefix — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
   *"recorded backlog=2"*) ok "ok-recorded-count: the recorded count is stated" ;;
   *) bad "ok-recorded-count: the recorded count is not stated — $OUT_DRIVE" ;;
 esac
 _arm_shape_check "" running-recorded-count 5 running
+case "$OUT_DRIVE" in
+  *"[dispatch] deferred ("*) ok "running-recorded-count: the recorded count takes the \`deferred (\` prefix" ;;
+  *"[dispatch] nothing to defer ("*) bad "running-recorded-count: a record saying 5 are queued read as 'nothing to defer' — the recorded-COUNT arm is gone — $OUT_DRIVE" ;;
+  *) bad "running-recorded-count: unexpected prefix — $OUT_DRIVE" ;;
+esac
 case "$OUT_DRIVE" in
   *"the PASS's count"*) ok "running-recorded-count: the count is attributed to the pass" ;;
   *) bad "running-recorded-count: the count is not attributed to the pass — $OUT_DRIVE" ;;
@@ -1163,6 +1176,37 @@ _count_gate_mut() {   # $1 = result (ok|running), $2 = sed pattern kind, $3 = mu
     *) bad "count-gate/$_res: the un-gated arm did not reproduce the claim — $(printf '%s' "$_mut_out" | head -c 200)" ;;
   esac
 }
+# ⛔ AND EACH ARM'S DELETION, not just its `READ` gate: the differential above proves the gate matters,
+# not that the arm exists. `elif [ "$backlog" -gt 0 ]; then` appears once per branch (ok = 1st, running =
+# 2nd), so the deletion is scoped by occurrence and the fixture must red because the line falls through to
+# the recorded-ZERO arm under the `nothing to defer` prefix.
+_arm_del_mut() {   # $1 = 1|2 (occurrence), $2 = destination
+  awk -v want="$1" 'BEGIN{n=0} $0=="    elif [ \"$backlog\" -gt 0 ]; then" {n++; if (n==want) {print "    elif false; then"; next}} {print}' "$FNS" > "$2" 2>/dev/null
+}
+_arm_del_drive() {   # $1 = result, $2 = mutant file → prefixes
+  _recorded_line_check "" "armdel-${1}-$3" 5 "$1"; chmod 000 "$D/o/candidates.txt" 2>/dev/null
+  _out="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$2" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+  printf '%s' "$_out"
+}
+FNSDELOK="$T/origination-fns-armdel-ok.sh"
+_arm_del_mut 1 "$FNSDELOK"
+if cmp -s "$FNS" "$FNSDELOK" 2>/dev/null; then bad "arm-deletion/ok: the mutation did not apply — the awk anchor drifted"
+else
+  case "$(_arm_del_drive ok "$FNSDELOK" ok)" in
+    *"[dispatch] nothing to defer ("*) ok "arm-deletion/ok: non-vacuity — deleting the recorded-COUNT arm flips the line to 'nothing to defer', which the fixture now REDS on" ;;
+    *) bad "arm-deletion/ok: deleting the arm did not change the prefix — the fixture would not catch it" ;;
+  esac
+fi
+FNSDELRUN="$T/origination-fns-armdel-running.sh"
+_arm_del_mut 2 "$FNSDELRUN"
+if cmp -s "$FNS" "$FNSDELRUN" 2>/dev/null; then bad "arm-deletion/running: the mutation did not apply — the awk anchor drifted (is the arm present?)"
+else
+  case "$(_arm_del_drive running "$FNSDELRUN" running)" in
+    *"[dispatch] nothing to defer ("*) ok "arm-deletion/running: non-vacuity — deleting the recorded-COUNT arm flips the line to 'nothing to defer'" ;;
+    *) bad "arm-deletion/running: deleting the arm did not change the prefix" ;;
+  esac
+fi
 FNSOKM="$T/origination-fns-count-ok.sh"
 sed 's/^    if \[ "\$backlog" -gt 0 \] \&\& \[ "\$_bl_state" = "READ" \]; then$/    if [ "$backlog" -gt 0 ]; then/' "$FNS" > "$FNSOKM" 2>/dev/null
 if cmp -s "$FNS" "$FNSOKM" 2>/dev/null; then bad "ok-count-gate: the un-gate mutation did not apply — the sed anchor drifted"
@@ -1474,6 +1518,45 @@ case "$OUT_DRIVE" in
   *"2 usable candidate(s) still queued from an earlier pass"*) ok "mask+queue: the line says the deferred work exists AND that origination is what is broken" ;;
   *) bad "mask+queue: the line does not carry the deferred-backlog note — $OUT_DRIVE" ;;
 esac
+
+# ── 5b2) THE TAILNOTE IS A PRESENT-TENSE CLAIM TOO (review P3, cycle 24) ──────
+# The bracket appended to the BLOCKED / died / SEED-SKEW arms said "N usable candidate(s) still queued"
+# whenever `backlog > 0` — including when the number is the RECORD's and this cycle read nothing. Same
+# defect as the caller's own arms, which refuse it one line up.
+mkdir -p "$T/mask-rec/state"
+printf 'result=fail\nstage=preflight\nrc=1\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=none of the 3 judged candidate(s) produced a usable verdict — failing surface(s): issue-assignee-holder:3\nbacklog=5\n' "$(date +%s)" > "$T/mask-rec/state/refresh-last"
+printf '7\n8\n' > "$T/mask-rec/candidates.txt"; chmod 000 "$T/mask-rec/candidates.txt"
+drive_gate "$T/mask-rec" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+chmod 644 "$T/mask-rec/candidates.txt" 2>/dev/null || true
+case "$OUT_DRIVE" in
+  *"5 usable candidate(s) still queued from an earlier pass"*) bad "tailnote: a RECORDED count (this cycle read nothing) printed 'still queued' in the present tense — $OUT_DRIVE" ;;
+  *"the last pass recorded 5 queued; THIS cycle could not measure the queue"*) ok "tailnote: a recorded count is attributed, and its deferral called UNPROVEN" ;;
+  *) bad "tailnote: the recorded count got no gate at all — $OUT_DRIVE" ;;
+esac
+# the MEASURED case still says "still queued" (the guard does not silence the real one)
+mkdir -p "$T/mask-meas/state"
+printf 'result=fail\nstage=preflight\nrc=1\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=none of the 3 judged candidate(s) produced a usable verdict — failing surface(s): issue-assignee-holder:3\n' "$(date +%s)" > "$T/mask-meas/state/refresh-last"
+printf '7\n8\n' > "$T/mask-meas/candidates.txt"
+drive_gate "$T/mask-meas" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
+case "$OUT_DRIVE" in
+  *"2 usable candidate(s) still queued from an earlier pass"*) ok "tailnote: a MEASURED count still reads 'still queued'" ;;
+  *) bad "tailnote: the measured count lost its note — $OUT_DRIVE" ;;
+esac
+# NON-VACUITY: restore the un-gated bracket and the present-tense claim comes back.
+FNS_TN="$T/origination-fns-tailnote-rev.sh"
+sed 's/^  if \[ "\$backlog" -gt 0 \] \&\& \[ "\$_bl_state" = "READ" \]; then$/  if [ "$backlog" -gt 0 ]; then/' "$FNS" > "$FNS_TN" 2>/dev/null
+if cmp -s "$FNS" "$FNS_TN" 2>/dev/null; then bad "tailnote: the un-gate mutation did not apply — the sed anchor drifted"
+else
+  # the fixture's read bit was restored above; put it back or the drive MEASURES the queue and the mutant
+  # would "reproduce" a claim that is true
+  chmod 000 "$T/mask-rec/candidates.txt" 2>/dev/null
+  _tn_out="$(O="$T/mask-rec" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS_TN" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)" 2>&1)"
+  chmod 644 "$T/mask-rec/candidates.txt" 2>/dev/null || true
+  case "$_tn_out" in
+    *"usable candidate(s) still queued from an earlier pass"*) ok "tailnote: non-vacuity — un-gating the bracket restores the present-tense claim" ;;
+    *) bad "tailnote: the un-gated bracket did not reproduce the claim — $_tn_out" ;;
+  esac
+fi
 
 # ── 5c) THE TOMBSTONE AND THE OTHER NON-'skipped' STATES ───────────────────────
 # (For the same reason as `mk_case`: these fixtures model a box that HAS a refresh script. The
@@ -2383,7 +2466,7 @@ _drv_scan() {   # $1 = file to scan → sets _drv_total, _drv_unpinned
 # The population is pinned to a COUNT rather than floored: a line-based scan with a floor let a driver
 # evaded it simply by being REFORMATTED across two lines, which is the defect this section exists to
 # catch (review P3, cycle 18).
-_drv_expect=20
+_drv_expect=22
 _drv_scan "$0"
 if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked, count pinned)"
 else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}) or a population of $_drv_total where $_drv_expect are declared — a driver that skips the prologue, or leaves the population, is invisible here"; fi

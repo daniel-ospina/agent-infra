@@ -2105,7 +2105,16 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     else age="$(( d / 60 ))h ago"; fi
   fi
   tailnote=""
-  [ "$backlog" -gt 0 ] && tailnote=" [$backlog usable candidate(s) still queued from an earlier pass — deferred work exists, but origination is what is broken]"
+  # ⛔ A NUMBER WRITTEN EARLIER IS NOT A COUNT NOW (review P3, cycle 24). `backlog` is the RECORD's when
+  # `_bl_state=RECORDED` — this cycle read nothing — and this bracket asserted "N usable candidate(s)
+  # still queued" in the present tense, appended to the BLOCKED/died/SEED-SKEW arms (the same defect the
+  # caller's own arms refuse one line up). Only a measurement taken here may say "still queued"; a
+  # recorded number is attributed, and a recorded absence claims nothing.
+  if [ "$backlog" -gt 0 ] && [ "$_bl_state" = "READ" ]; then
+    tailnote=" [$backlog usable candidate(s) still queued from an earlier pass — deferred work exists, but origination is what is broken]"
+  elif [ "$backlog" -gt 0 ]; then
+    tailnote=" [the last pass recorded $backlog queued; THIS cycle could not measure the queue, so deferred work is UNPROVEN rather than counted]"
+  fi
   # ⛔ THE UNRECORDED-FAILURE MARKER COMES BEFORE EVERYTHING (review P1, two reviewers). When a pass
   # FAILS and cannot write its record (`$O/state` unwritable while `$O` is writable), the record still
   # holds the PREVIOUS pass's `result=ok` — so a reader that trusts it prints `skipped (refresh ok)`
