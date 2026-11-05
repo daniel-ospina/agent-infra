@@ -477,6 +477,24 @@ case "$WHY_NF" in
   *) bad "the NOT-A-FILE render never produced a block at all (an arm that can vanish is not an arm)" ;;
 esac
 
+# ── E1t: THE SENTINEL IN THE THIRD SHAPE (#3379 review cycle 25, P2, MEASURED) ──────────────────────
+# §E1b pins the sentinel for the UNDECIDABLE shape; the unread-declaration shape added later carried it too and
+# nothing checked: deleting that one `printf` left 221/0, and the block became UNRETIRABLE — the emit's
+# `stamped` guard can never fire without the marker, so a healed box keeps a false "treat every mandated file
+# as unread" as its last mandate claim, silently. ARCHITECTURE.md states the invariant as "ONE sentinel line …
+# that every shape carries", so every shape is now checked through the same predicate.
+SENT_P="$(bash -c '. "$1"; mandate_sentinel' _ "$HELPER")"
+for _shape in unread-decl undecidable; do
+  if [ "$_shape" = "unread-decl" ]; then
+    _out="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+  else
+    _ud="$(mktemp -d)"; mkdir -p "$_ud/.pi/agent/state"; chmod 000 "$_ud/.pi/agent/state"
+    _out="$(CELL_HOME="$_ud" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+    chmod 755 "$_ud/.pi/agent/state"; rm -rf "$_ud"
+  fi
+  [ "$(printf '%s\n' "$_out" | head -1)" = "$SENT_P" ]; ck $? "$_shape: the block's FIRST line is the sentinel (without it the block is unretirable — the stale-positive hole, reopened)"
+done
+
 # ── E1q: `--files` EMITS NAMES, NOT `name|reason` (#3379 review cycle 19, P2, MEASURED) ─────────
 # The projection `mandate_files | cut -d'|' -f1` was unpinned: reverting it to bare `mandate_files` left
 # 186/0 while the verb's output became `LANE-BRIEF-PREAMBLE.md|a dispatch brief may open with …` — a
@@ -994,7 +1012,39 @@ for _coll24 in mandate_unreadable mandate_irregular; do
   if grep -qF 'BOTH mandated files are now PRESENT' "$_b24"; then bad "an empty render on a $_coll24-non-empty box was answered with a PRESENT claim — that leg of the healthy gate is load-bearing and unpinned"; else ok "…and the healthy gate refuses on a non-empty $_coll24 ALONE, every other leg clean (leg pinned, as the comment claimed)"; fi
 done
 
-# ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
+# ── E5f: THE GATE THAT REACHES THE REVIEWER SEAM'S EMIT (#3379 review cycle 25, P1, MEASURED) ───────────
+# §E5 pinned the PARTS of merge-one's seam — the resolver assignment, the sourcing redirect, the `declare -F`
+# probe, the emit call text, and the reason-selection branch — and left the CONDITION that gates them free.
+# Inverting `[ -n "${mandate_sh:-}" ]` → `[ -z … ]` (or replacing it with `false`) left 221/0 GREEN: on every
+# provisioned box the reviewer session's real disclosure never ran, and the DEGRADED branch instead told the
+# reviewer to "treat every mandated file as unread" and logged CANNOT VERIFY — a false box-state claim on the
+# highest-volume model call in the harness, with nothing red. The identical condition on spawn-gate reddens
+# (E3d's flip-back arms drive the real run_agent), so this pins the text on the seam that cannot be driven.
+grep -qF 'if [ -n "${mandate_sh:-}" ] && . "$mandate_sh" 2>>"$log" && declare -F mandate_preflight_emit' "$MERGE"; ck $? "merge-one.sh's emit is gated on the helper being PRESENT and USABLE — the whole condition, not its parts (inverting it sent every provisioned reviewer to the degraded branch with nothing red)"
+
+# ── E5g: THE REMAINING SENTENCES AND COLLECTOR RULES (#3379 review cycle 25, P3, MEASURED) ─────────────
+# Twelve more reverts stayed green. None changes a VERDICT, so they are pinned as the code text they are —
+# but each one is a sentence an operator or a sourced consumer reads, and this branch spent four cycles
+# arguing that a diagnosis without its reason or its remedy is half a diagnosis.
+grep -qF 'the brief ALREADY ends with this mandate block' "$HELPER";        ck $? "the emit's no-op log line still names WHY it appended nothing (a bare 'skipping append' leaves the operator guessing)"
+grep -qF 'SUPERSEDES the mandate block earlier in this brief' "$HELPER";    ck $? "the supersession log line still names WHAT it superseded"
+grep -qF '(a permission problem)' "$HELPER" && bad "the undecidable renderer collapsed its fault list to '(a permission problem)'" || ok "the undecidable renderer still names the faults to look for, not a vague class"
+grep -qF 'see --help' "$HELPER";                                            ck $? "an unknown argument still points the reader at --help"
+grep -qF '"nothing to disclose" cannot be concluded' "$HELPER";             ck $? "the unread-declaration block still says what CANNOT be concluded, not merely that something cannot"
+# ⛔ THE COLLECTORS' OWN RULES, WHICH THEIR SHIPPED CALLERS MASK (#3379 review cycle 25, P3, MEASURED): every
+# shipped verb consults `mandate_irregular` first, so `mandate_missing`'s `[ -e ] && continue` — the rule
+# that stops a DIRECTORY being reported as MISSING — is unobservable through them and free to revert. The
+# header advertises these collectors as a consumer-facing contract, so the rule is pinned where it lives.
+grep -qF '[ -e "$root/$name" ] && continue' "$HELPER";                      ck $? "mandate_missing SKIPS an occupied path (a directory where a file belongs is not 'missing' — the comment's own fixed defect)"
+grep -qF 'if [ -f "$root/$name" ] && [ ! -r "$root/$name" ]; then' "$HELPER"; ck $? "mandate_unreadable tests REGULAR-AND-UNREADABLE (an occupied path is mandate_irregular's fact, not this one's)"
+# ⛔ AND TWO DEFENSIVE LITERALS THAT ARE NOT DEAD (#3379 review cycle 25, P3, MEASURED): removing
+# `mandate_why`'s `return 0` makes EVERY rendered reason gain a trailing generic phrase (measured), so the
+# "unreachable" fallback is reachable exactly that way; and the brief read's `2>/dev/null` is what keeps an
+# unreadable brief's `cat: … Permission denied` off the caller's stderr.
+grep -qF 'printf '\''%s'\'' "${spec#*|}"; return 0 ;; esac' "$HELPER";      ck $? "mandate_why RETURNS after the matched spec (without it every reason gains a trailing generic phrase)"
+grep -qF 'brief_text="$(cat "$prompt" 2>/dev/null)"' "$HELPER";              ck $? "the brief read SUPPRESSES its own stderr (an unreadable brief must not print cat's error at the caller)"
+
+# ── E6: THE TWO RESOLVERS MUST AGREE# ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
 # ⛔ CYCLE 1'S ARMS WERE VACUOUS (measured in cycle 2): they grepped for the STRING `MANDATE_PREFLIGHT_SH`,
 # which the explanatory COMMENT above the resolver also contains — so reverting the whole merge-one.sh fix
 # left the suite at 86 passed, 0 failed. An arm satisfied by prose guards nothing. The spawn-gate arms are
