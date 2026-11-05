@@ -260,6 +260,37 @@ console.log("\n── Part A: `stripRemoteContexts` — what is remote, what is 
     strip(`ssh -t -o BatchMode=yes cell-a -- ${PULL}`), "true");
   expectEq("A52 control: a plain env prefix (`FOO=1 cmux …`) stays provable",
     strip(`FOO=1 cmux vm exec --timeout 60 cell-a -- ${PULL}`), "true");
+
+  // ── A53–A59: the CYCLE-3b fail-open class (fresh-context review, cycle 2) ──
+  // The heredoc DELIMITER is a shell WORD: `<<EOS\ ` (escaped space) is the
+  // delimiter `EOS `, and `<<EOS\` + newline continues the word. A whitespace-only
+  // scan computes a strict PREFIX of bash's delimiter and blanks the line after
+  // the REAL terminator — where bash runs a LOCAL command. The tail must survive.
+  for (const [label, cmd] of [
+    ["A53 `<<EOS\\ ` (escaped space) then a LOCAL tail", `cmux vm exec cell-a -- bash <<EOS\\ \nEOS \n${RESET}\nEOS`],
+    ["A54 `<<E\\ OS` (escaped space, mid-word)", `cmux vm exec cell-a -- bash <<E\\ OS\nE OS\n${RESET}\nE OS`],
+    ["A55 `<<EOS\\` line-continued delimiter", `cmux vm exec cell-a -- bash <<EOS\\\nX\nEOSX\n${RESET}\nEOS`],
+  ]) {
+    const out = strip(cmd);
+    expectTrue(`${label}: the LOCAL tail SURVIVES`, out.includes(RESET), `got ${JSON.stringify(out)}`);
+    expectTrue(`${label}: …and the dispatch is still replaced`, out.startsWith("true"), `got ${JSON.stringify(out)}`);
+  }
+  // The `.` (source) ban must hold in EVERY command position — after a newline,
+  // behind `builtin`/`command`/`exec`, escaped (`\.`) — and through the
+  // assignment-indirection channel (`x=eval; $x 'ss''h()…'`). Each builds the
+  // definition from text no literal scan reads, so the name may resolve locally.
+  for (const [label, cmd] of [
+    ["A56 `. <file>` after a NEWLINE", `printf 'x\\n' > /tmp/defs-3444.sh\ntrue\n. /tmp/defs-3444.sh\nssh cell-a -- ${RESET}`],
+    ["A57 `builtin . <file>`", `builtin . /tmp/defs-3444.sh; ssh cell-a -- ${RESET}`],
+    ["A58 `\\. <file>` (escaped dot)", `\\. /tmp/defs-3444.sh; ssh cell-a -- ${RESET}`],
+    ["A59 `x=eval; $x '…'` (assignment indirection)", `x=eval; $x 'ss''h() { :; }'; ssh cell-a -- ${RESET}`],
+  ]) {
+    expectEq(`${label} → not provable, unchanged`, strip(cmd), cmd);
+  }
+  // ssh's local-execution option family is not only ProxyCommand/LocalCommand.
+  expectEq("A60 `ssh -o KnownHostsCommand=…` (a LOCAL command) → not exempt",
+    strip(`ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`),
+    `ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`);
 }
 
 // ── Part B: the REAL handler, in a hermetic MAIN checkout ─────────────────
@@ -399,6 +430,9 @@ async function partB() {
       ["B28 ANSI-C `$'…'` hiding a LOCAL tracked write", `cmux vm exec cell-a -- ls $'\\'' > tracked.txt`],
       ["B29 a PATH-shimmed transport", `PATH=/tmp/shim:$PATH ssh cell-a -- ${RESET}`],
       ["B30 ssh -o ProxyCommand running HERE", `ssh -o ProxyCommand='${RESET}' cell-a -- ls`],
+      ["B33 escaped-space heredoc delimiter then a LOCAL reset", `cmux vm exec cell-a -- bash <<EOS\\ \nEOS \n${RESET}\nEOS`],
+      ["B34 `. <file>` after a NEWLINE, then a dispatch", `printf 'x\\n' > /tmp/defs-3444.sh\ntrue\n. /tmp/defs-3444.sh\nssh cell-a -- ${RESET}`],
+      ["B35 ssh -o KnownHostsCommand running HERE", `ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`],
     ]) {
       const r = await bash(cmd);
       expectTrue(`${label} → STILL REFUSED`, !allowed(r), "was ALLOWED — the remote boundary laundered a LOCAL operation");
@@ -451,7 +485,7 @@ try {
 }
 
 // ── Part M (#3444): MUTATION EVIDENCE — the pins must be able to go RED ────
-// A pin that cannot fail is not a pin. This reverts the fix in three independent
+// A pin that cannot fail is not a pin. This reverts the fix in FOUR independent
 // places and requires the paired assertions to FAIL:
 //   M1 the RECOGNISER (`stripRemoteContexts` → identity) — the pure pins and the
 //      decision they feed both go blind;
@@ -462,6 +496,9 @@ try {
 //      fail-open shapes the review found are ALLOWED again. M1/M2 cannot redden
 //      these: `identity` is STRICTER, so a fail-open pin needs a mutant that
 //      reintroduces the fail-open.
+//   M4 the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the command-resolution
+//      variable prefix, ssh's local-execution argv, the heredoc delimiter's WORD
+//      scan, the `.`-command ban and `KnownHostsCommand`) — same reason as M3.
 // Opt-in, its own CI step (the same construction as the discard-gate suite).
 if (process.argv.includes("--mutations")) {
   console.log("\n── Part M: mutation evidence — reverting the fix reddens the pins ──");
@@ -569,7 +606,7 @@ if (process.argv.includes("--mutations")) {
         // (b) the `$'…'`-form unprovability bail → removed (the cycle-2 defect),
         // (c) the unprovable/unterminated-heredoc refusal → removed.
         ["heredocs.push({ delim, dash, provable: delim !== null });",
-         "heredocs.push({ delim: _wtUnquoteWord(raw), dash, provable: true });"],
+         "heredocs.push({ delim: _wtUnquoteWord(hw.raw), dash, provable: true });"],
         ["if (/\\$['\"]/.test(s)) return null;", "if (false) return null;"],
         ["if (seg.unprovable || seg.bodies.some((b) => !b.terminated)) continue;",
          "if (false) continue;"],
@@ -649,6 +686,18 @@ if (process.argv.includes("--mutations")) {
         // (c) ssh's own local-execution / local-file argv.
         ["for (let j = i + 1; j < sep; j++) {\n      const raw = word(j);\n      if (/^-F/.test(raw) || raw === \"--config\") return -1;",
          "for (let j = i + 1; false && j < sep; j++) {\n      const raw = word(j);\n      if (/^-F/.test(raw) || raw === \"--config\") return -1;"],
+        // (d) the heredoc delimiter's WORD scan (cycle 3b): back to "stop at the
+        // first whitespace, no escapes" — the strict-PREFIX delimiter.
+        ["if (/\\s|;|\\||&|\\(|\\)|<|>/.test(ch)) break;   // unquoted metacharacter ends the word",
+         "if (/\\s/.test(ch)) break;   // MUTANT (cycle 3b): whitespace-only scan"],
+        ["if (ch === \"\\\\\") {\n      if (text[i + 1] === \"\\n\") { i += 2; continue; }          // line continuation",
+         "if (false) {\n      if (text[i + 1] === \"\\n\") { i += 2; continue; }          // line continuation"],
+        // (e) the `.`-command ban in EVERY position (cycle 3b).
+        ["    /(?:^|[;&|(){}\\s!])\\s*(?:builtin\\s+|command\\s+|exec\\s+)?\\\\?\\.\\s+\\S/.test(s) ||\n",
+         "    false ||\n"],
+        // (f) ssh's remaining local-execution option (cycle 3b).
+        ["/^(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match)$/",
+         "/^(?:proxycommand|localcommand|permitlocalcommand|match)$/"],
       ];
       let mutated = SRC;
       let applied = 0;
@@ -680,6 +729,9 @@ if (process.argv.includes("--mutations")) {
             ["M4  B28 ANSI-C quoting hiding a LOCAL tracked write", `cmux vm exec cell-a -- ls $'\\'' > tracked.txt`],
             ["M4  B29 PATH-shimmed transport", `PATH=/tmp/shim:$PATH ssh cell-a -- ${RESET}`],
             ["M4  B30 ssh -o ProxyCommand", `ssh -o ProxyCommand='${RESET}' cell-a -- ls`],
+            ["M4  B33 escaped-space heredoc delimiter + LOCAL reset", `cmux vm exec cell-a -- bash <<EOS\\ \nEOS \n${RESET}\nEOS`],
+            ["M4  B34 `.` after a NEWLINE then a dispatch", `printf 'x\\n' > /tmp/defs-3444.sh\ntrue\n. /tmp/defs-3444.sh\nssh cell-a -- ${RESET}`],
+            ["M4  B35 ssh -o KnownHostsCommand", `ssh -o KnownHostsCommand='${RESET}' cell-a -- ls`],
           ]) {
             process.chdir(hub);
             const r = await toolCall({ toolName: "bash", input: { command: cmd } }, undefined);

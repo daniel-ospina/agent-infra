@@ -3414,6 +3414,61 @@ function _wtHeredocBody(text, from, hd) {
 }
 
 /**
+ * #3444 review cycle 3 — the heredoc DELIMITER is a shell WORD, so its scan must
+ * be quote/escape-aware: `<<EOS\ ` (an ESCAPED space) is the delimiter `EOS `, and
+ * `<<EOS\` + newline continues the word onto the next line (`<<EOS\`+`X` ⇒ `EOSX`).
+ * A scan that stops at the first whitespace computes a strict PREFIX of bash's
+ * delimiter, matches a line the real shell treats as a COMMAND, and blanks a
+ * LOCAL command as "remote stdin" — measured: `cmux vm exec c -- bash <<EOS\ ` /
+ * `EOS ` / `git reset --hard` / `EOS` was ALLOWED while the bare verb is blocked.
+ * @param {string} text
+ * @param {number} from
+ * @returns {{raw: string, end: number}}
+ */
+function _wtHeredocDelimiterWord(text, from) {
+  const n = text.length;
+  let raw = "";
+  let i = from;
+  while (i < n) {
+    const ch = text[i];
+    if (/\s|;|\||&|\(|\)|<|>/.test(ch)) break;   // unquoted metacharacter ends the word
+    if (ch === "\\") {
+      if (text[i + 1] === "\n") { i += 2; continue; }          // line continuation
+      if (text[i + 1] === "\r" && text[i + 2] === "\n") { i += 3; continue; }
+      raw += ch + (text[i + 1] ?? "");
+      i += 2;
+      continue;
+    }
+    if (ch === "$" && text[i + 1] === "'") {
+      raw += "$'";
+      i += 2;
+      while (i < n) {
+        if (text[i] === "\\") { raw += text[i] + (text[i + 1] ?? ""); i += 2; continue; }
+        raw += text[i];
+        if (text[i] === "'") { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      const close = ch;
+      raw += ch;
+      i++;
+      while (i < n) {
+        if (close === '"' && text[i] === "\\") { raw += text[i] + (text[i + 1] ?? ""); i += 2; continue; }
+        raw += text[i];
+        if (text[i] === close) { i++; break; }
+        i++;
+      }
+      continue;
+    }
+    raw += ch;
+    i++;
+  }
+  return { raw, end: i };
+}
+
+/**
  * #3444: split a command string into TOP-LEVEL shell segments, recording for
  * each one where its command portion ends (the first top-level redirection),
  * where the segment ends (including heredoc bodies), and the heredoc body spans
@@ -3493,11 +3548,10 @@ function _wtSegments(text) {
       if (redirectAt < 0) redirectAt = i;
       let j = i + (dash ? 3 : 2);
       while (j < n && (text[j] === " " || text[j] === "\t")) j++;
-      let raw = "";
-      while (j < n && !/[\s;|&<>()]/.test(text[j])) { raw += text[j]; j++; }
-      const delim = _wtDelimiterValue(raw);
+      const hw = _wtHeredocDelimiterWord(text, j);
+      const delim = _wtDelimiterValue(hw.raw);
       heredocs.push({ delim, dash, provable: delim !== null });
-      i = j;
+      i = hw.end;
       continue;
     }
     if (ch === "<") {
@@ -3636,7 +3690,7 @@ function _wtRemotePayloadIndex(toks) {
       else if (/^-o./.test(raw)) opt = raw.slice(2);
       else if (raw.startsWith("--option=")) opt = raw.slice("--option=".length);
       if (opt !== null &&
-          /^(?:proxycommand|localcommand|permitlocalcommand|match)$/.test(String(opt).toLowerCase().split("=")[0].trim())) return -1;
+          /^(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match)$/.test(String(opt).toLowerCase().split("=")[0].trim())) return -1;
     }
     return sep;
   }
@@ -3701,8 +3755,13 @@ function _wtMayRedefineTransport(text) {
   return /(?:^|[;&|(){}\s'"$])(?:function\s+)?(?:cmux|ssh|docker)\s*\(\s*\)/.test(s) ||
     /\bfunction\s+(?:cmux|ssh|docker)\b/.test(s) ||
     /\balias\s+(?:-[A-Za-z]+\s+)*(?:cmux|ssh|docker)\s*=/.test(s) ||
+    /(?:^|[;&|(){}\s!])\s*(?:builtin\s+|command\s+|exec\s+)?\\?\.\s+\S/.test(s) ||
     /(?:^|[;&|(){}\s])(?:eval|source)\s/.test(s) ||
-    /(?:^|[;&|])\s*\.\s+\S/.test(s);
+    // A variable ASSIGNED the resolution builtin (`x=eval` / `x=source` / `x=.`)
+    // is the same constructed-definition channel, one indirection further out:
+    // `x=eval; $x 'ss''h() { "${@:3}"; }'; ssh cell-a -- <verb>` built the shadow
+    // from a spelling no literal scan reads (#3444 review cycle 3, measured).
+    /(?:^|[\s;&|(){])(?:export\s+)?[A-Za-z_][A-Za-z0-9_]*=(?:eval|source|\.)\s*(?:$|[;&|)\s])/.test(s);
 }
 
 export function stripRemoteContexts(command) {

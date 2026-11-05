@@ -1702,6 +1702,10 @@ classifier and the full invocation walk).
 | `ssh -o ProxyCommand=…` / `-o LocalCommand=…` / `-o PermitLocalCommand=yes` | **not exempt** | the LOCAL ssh runs that command before/around the dispatch (#3444 review cycle 3, measured) |
 | `ssh -F <config>` / `-E <log>` | **not exempt** | a local file whose content (a `LocalCommand`/`ProxyCommand`) or write the scan cannot prove |
 | `ssh -o BatchMode=yes` / `FOO=1 cmux …` | allowed | the cycle-3 rejections are SCOPED: only the resolution variables and ssh's local-execution/local-file flags |
+| a heredoc delimiter with an ESCAPED space (`<<EOS\ `) or a LINE-CONTINUED word (`<<EOS\` + newline ⇒ `EOSX`) | **the tail after bash's REAL terminator stays gated** | the delimiter is a shell WORD, so a scan that stops at the first whitespace computes a strict PREFIX of bash's: it terminates EARLY (or late) and blanks a line bash runs as a COMMAND (`<<EOS\ ` / `EOS ` / `git reset --hard` / `EOS` was laundered — review cycle 3b, measured) |
+| `. <file>` in ANY command position (after a newline, `builtin . …`, `command . …`, `\. …`, `{ . …; }`, `! . …`) | **not exempt** | the ban must hold wherever a command word can sit — the previous rule only read string start and `;&\|`, so a sourced `ssh()` built the shadow one line down (review cycle 3b, measured: the reset ran HERE) |
+| `x=eval; $x 'ss''h() { … }'; ssh …` (assignment indirection) | **not exempt** | a variable ASSIGNED the resolution builtin is the same constructed-definition channel one hop further out (review cycle 3b, measured) |
+| `ssh -o KnownHostsCommand=…` | **not exempt** | it runs a LOCAL command during host-key verification, like `ProxyCommand` (measured on OpenSSH 9.6p1) |
 
 **The separator is REQUIRED.** `ssh host git …` (no `--`) is NOT recognised:
 the boundary must be explicit to be provable. Likewise `ssh -- git …` (no host
@@ -1726,7 +1730,12 @@ transport-named function/alias, keeps the whole command gated — a name that ca
 be redefined is a name that can resolve locally. (h) A leading command-RESOLUTION
 assignment (`PATH=… ssh …`) and ssh's own local-execution/local-file argv
 (`-o ProxyCommand|LocalCommand|PermitLocalCommand`, `-F`, `-E`) keep the segment
-gated: the transport word is no longer provable (#3444 review cycle 3).
+gated: the transport word is no longer provable (#3444 review cycle 3). (i) The
+heredoc delimiter is scanned as a shell WORD (escapes, quotes, line continuation),
+but a delimiter the SHELL would EXPAND (`<<$X`, `` <<`cmd` ``) stays unprovable and
+gated. (j) `.`/`eval`/`source` are banned in every command position, but a
+resolution builtin reached through an UNASSIGNED expansion (`$X` where `X` only
+becomes `eval` inside a function body) is still out of surface.
 
 **A limitation of the premise, stated rather than implied.** The exemption
 assumes the transport really leaves this box. `ssh localhost -- …` and
@@ -1742,14 +1751,14 @@ neither reaches it without a mount/sshd the operator created.
 drives the REAL `tool_call` handler against a hermetic MAIN hub and asserts
 ALLOW-for-remote / REFUSE-for-local for each measured case plus the
 anti-laundering controls above, and (its own CI step) `--mutations` reverts the
-fix in three independent ways and requires the paired pins to go RED:
+fix in four independent ways and requires the paired pins to go RED:
 
 | mutant | what it reverts | which pins must fail |
 |---|---|---|
 | M1 | the RECOGNISER (`stripRemoteContexts` → identity) | A1–A6, and the classifier's verdict on the surviving text |
 | M2 | the CALL SITE (the handler's strip → identity, in a temp copy of `index.ts`) | the four measured field cases, at the real handler |
 | M3 | the strip's PROOF (delimiter value, `$'…'` bail, unprovable-heredoc bail, redefinition bail, bare-word head) | B15–B21, B24, B25 — the fail-open shapes both review cycles found |
-| M4 | the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the resolution-variable prefix refusal, ssh's local-execution argv refusal) | B27–B30 — a LOCAL reset/write read as remote, a PATH-shimmed transport, `ssh -o ProxyCommand` |
+| M4 | the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the resolution-variable prefix refusal, ssh's local-execution argv refusal, the heredoc delimiter's WORD scan, the `.`-command ban, `KnownHostsCommand`) | B27–B30, B33–B35 — a LOCAL reset/write read as remote, a PATH-shimmed transport, `ssh -o ProxyCommand`, an escaped-space delimiter, a sourced definition, `-o KnownHostsCommand` |
 
 M1/M2 cannot redden the fail-open pins (`identity` is *stricter*); M3 and M4
 exist so a guard that keeps local text gateable has mutation evidence too.

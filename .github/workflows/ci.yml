@@ -1058,7 +1058,9 @@ jobs:
         # copy of index.ts), the strip's PROOF (heredoc-delimiter value, the
         # unprovable/unterminated bail, the transport-redefinition bail, the
         # bare-word head rule) and the CYCLE-3 proofs (ANSI-C `$'…'` parsing, the
-        # command-resolution variable prefix, ssh's local-execution argv) — and
+        # command-resolution variable prefix, ssh's local-execution argv, the
+        # heredoc delimiter's WORD scan, the `.`-command ban in every position and the
+        # assignment-indirection channel, `KnownHostsCommand`) — and
         # requires every paired pin to FAIL: the pure ones go blind, and the REAL
         # handler refuses the four remote field cases again while the fail-open
         # shapes are ALLOWED again. Its own step so neither verdict can suppress
