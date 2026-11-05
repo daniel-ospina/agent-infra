@@ -1657,8 +1657,8 @@ lane_end_next() {
     # $br exists anywhere but this disk"). `terminal_wip_rescue`'s NOTE is already guarded on the count for
     # exactly this reason; `next=` was the one surface that fabricated it.
     unmeasured)
-      printf 'MANUAL — the unpushed-commit count on %s could NOT be read (push=unmeasured), so this terminal does NOT know whether the branch exists anywhere but this disk — it does not assert that it does, and it does not assert that it does not. Do NOT reap %s until you have read it yourself (`git rev-list --count origin/%s..HEAD`), and read the [lane-exit] line in the lane log%s\n' \
-        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" \
+      printf 'MANUAL — the unpushed-commit count on %s could NOT be read (push=unmeasured), so this terminal does NOT know whether the branch exists anywhere but this disk — it does not assert that it does, and it does not assert that it does not. Do NOT reap %s until you have read it yourself (`git -C %s rev-list --count HEAD --not --remotes`, the same endpoint-free enumeration that failed — `origin/%s..HEAD` answers a NARROWER question, about one remote, and fails outright when that remote does not carry the branch), and read the [lane-exit] line in the lane log%s\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" \
         "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
     # ⛔ `FAILED` NO LONGER ASSERTS THE STRONGEST ABSENCE (review cycle 16, P2 — REPRODUCED). It used to
     # share this arm's "exist only on this disk", but `FAILED` is assigned from measurements that do NOT all
@@ -1907,8 +1907,11 @@ lane_end_rescue_caveat() {
 # above those arms), which is why it is P2 and not a lost sentence — but it is exactly the per-arm
 # re-typing that four earlier cycles each found a fresh instance of, and a future verdict or a reorder
 # would land on a list that silently drops it. A caveat expressed once cannot have a case list that
-# differs. Three verdict GROUPS, each with its own claim: nothing was pushed (absence measured by the
-# caller), delivery unestablished, or the marker predates the push.
+# differs. FOUR claims live in this case, each its own: nothing was pushed (absence measured by the
+# caller), the unpushed COUNT could not be read (so neither presence nor absence was established), the
+# delivery was not established, or the marker predates the push. `FAILED` adds a fifth variant — the
+# remote answered holding a DIFFERENT sha — which is a delivery claim with a named counter-observation,
+# not an absence.
 lane_end_push_caveat() {
   case "${LANE_END_PUSH:-}" in
     # ⛔ `FAILED` MAY NOT SIT IN THE ABSENCE GROUP (review cycle 20, P2). It is assigned from TWO
@@ -1932,7 +1935,7 @@ lane_end_push_caveat() {
     # call sites. A group whose header claims "absence measured by the caller" may not hold a member whose
     # count was never read.
     unmeasured)
-      printf ' — AND the unpushed-commit count on %s could NOT be read (push=unmeasured), so whether those commits exist anywhere but this disk is NOT established either way — read it yourself (`git rev-list --count origin/%s..HEAD`)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" ;;
+      printf ' — AND the unpushed-commit count on %s could NOT be read (push=unmeasured), so whether those commits exist anywhere but this disk is NOT established either way — read it yourself (`git -C %s rev-list --count HEAD --not --remotes`, the SAME endpoint-free enumeration this terminal used, so it answers the same question instead of a narrower one about a single remote that may not even carry the branch)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" ;;
     UNAVAILABLE|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
       printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
     verify-unanswered|push-unreported|push-killed)
