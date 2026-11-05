@@ -709,6 +709,11 @@ echo "── 7b. TCC-protected target refusal (#427 / #2413 audit) ────�
 #
 # The guard reads $HOME at install time, so the case is built under the fixture HOME — never the
 # operator's real ~/Documents.
+#
+# ⛔ THE FIXTURE IS RESTORED FIRST, so the ONLY refused unit in this run is the TCC one. Without
+# this the run also carries §7's still-missing tripwire script, the installer would exit 1 for THAT
+# (the pre-existing fatal contract) and the assertion below would pass for the wrong reason.
+mkfakehome "$HOME1"
 mkdir -p "$HOME1/Documents/checkout/scripts"
 touch "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
 chmod +x "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
@@ -721,10 +726,17 @@ set +e
 OUT="$(run_installer "$HOME1" 2>&1)"
 RC=$?
 set -e
-assert_eq "$RC" "1" "TCC-protected target → exit 1"
-assert_contains "$OUT" "TCC-protected target" "TCC-protected target named"
+# ⛔ A TCC REFUSAL DOES NOT FAIL THE RUN (fresh review of #3413), and this assertion is the contract:
+# `sync.sh:81` runs this installer UNGUARDED under `set -e`, and `branch-reaper`/`worktree-reaper`
+# exec `{{TORTOISE_REPO}}/.venv/bin/python` — which on the DOCUMENTED default box is inside
+# `~/Documents`. Escalating that to exit 1 stops Level-1 auto-sync converging the whole box in order
+# to report one job that cannot run anyway. §7 above still pins the FATAL arm (a missing target →
+# exit 1), so the two contracts are distinguished here rather than conflated.
+assert_eq "$RC" "0" "a TCC-protected target does NOT fail the run (sync.sh must keep converging)"
+assert_contains "$OUT" "REFUSED com.eldato.objective-reminder" "the refused unit is named"
 assert_contains "$OUT" "Operation not permitted" "the 126 symptom is named in the refusal"
-assert_contains "$OUT" "FAIL com.eldato.objective-reminder" "the refusal names the unit it would not arm"
+assert_contains "$OUT" "NOT INSTALLED — launchd cannot READ their target" "…and the run ends with a summary of what was NOT installed"
+assert_contains "$OUT" "  - com.eldato.objective-reminder" "…naming the unit in that summary too"
 # The whole point: the guard must not merely WARN — the unit is absent, not half-installed.
 if [ -e "$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist" ]; then
     echo "✗ TCC-protected unit was installed anyway" >&2; exit 1
@@ -773,6 +785,12 @@ assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/farm-out.sh"
     "…while a symlink pointing OUT of the tree passes (the documented contract is not over-blocked)"
 assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/safe/live.sh")" "ok" \
     "a path outside every protected root passes"
+# APFS IS CASE-INSENSITIVE BY DEFAULT, so `~/documents/x` IS `~/Documents/x`. A literal-prefix `case`
+# let the variant through (measured: `$HOME/Documents/x` REFUSED, `$HOME/documents/x` PASSED).
+assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/documents/checkout/scripts/dead.sh")" "protected" \
+    "…and a CASE-VARIANT of the root is refused too (APFS is case-insensitive; a literal case-pattern passed it)"
+assert_eq "$(tcc_probe "$PROBE_HOME" "$PROBE_HOME/DOCUMENTS/checkout/scripts/dead.sh")" "protected" \
+    "…in upper case as well"
 
 # ── EXEC vs DATA: the over-block, pinned in both directions (P1-A) ─────────
 # `verify_targets` used to run `is_tcc_protected` over EVERY absolute ProgramArguments element, so a
@@ -798,14 +816,35 @@ assert_contains "$(cat "$T/vt.out")" "WARN" "…it WARNS instead, so the TCC-dea
 assert_contains "$(cat "$T/vt.out")" "Documents/checkout" "…and names the argument whose work launchd cannot do"
 write_job_plist "$T/job-exec.plist" "$PROBE_HOME/Documents/checkout/scripts/dead.sh"
 set +e; VRC="$(vt_probe "$T/job-exec.plist"; echo "rc=$?")"; set -e
-assert_eq "${VRC##*rc=}" "1" "an EXEC target (argv[0]) under Documents still HARD-REFUSES — the 126 is real"
+assert_eq "${VRC##*rc=}" "3" "an EXEC target (argv[0]) under Documents is REFUSED for the unit — the 126 is real"
 assert_contains "$(cat "$T/vt.out")" "TCC-protected target" "…and the refusal says so by name"
 write_job_plist "$T/job-interp.plist" /bin/bash "$PROBE_HOME/Documents/checkout/scripts/dead.sh" --repo /tmp
 set +e; VRC="$(vt_probe "$T/job-interp.plist"; echo "rc=$?")"; set -e
-assert_eq "${VRC##*rc=}" "1" "…and so is the SCRIPT a resolved interpreter is handed (argv[1]), not just argv[0]"
+assert_eq "${VRC##*rc=}" "3" "…and so is the SCRIPT a resolved interpreter is handed (argv[1]), not just argv[0]"
 write_job_plist "$T/job-noabs.plist" relative-only
 set +e; VRC="$(vt_probe "$T/job-noabs.plist"; echo "rc=$?")"; set -e
 assert_eq "${VRC##*rc=}" "1" "a ProgramArguments with no absolute entry REFUSES rather than verifying nothing (P2-E: an empty scan is not a pass)"
+# ⛔ THE `/usr/bin/env` ARM IS THE ONE NINE TEMPLATES DEPEND ON (fresh review of #3413):
+# `deepseek-balance-watch`, `fleet-cost-weekly`, `lane-liveness`, `pi-cache-reap`, `pi-reap-orphans`,
+# `pi-session-reaper`, `pi-task-session-prune`, `provider-latency-tripwire` and `pr-doctor` all exec
+# `/usr/bin/env <interp> <script>`. Deleting `env` from the interpreter list flipped this case from
+# REFUSE to WARN-and-install (rc 1 -> 0) with the whole suite still green, so a future edit that
+# reintroduces `{{AGENT_INFRA_PATH}}` in any of those nine would re-arm a 126-dead unit silently.
+write_job_plist "$T/job-env.plist" /usr/bin/env bash "$PROBE_HOME/Documents/checkout/scripts/dead.sh"
+set +e; VRC="$(vt_probe "$T/job-env.plist"; echo "rc=$?")"; set -e
+assert_eq "${VRC##*rc=}" "3" "…and through /usr/bin/env <interp> <script>, the script is still EXEC (the arm 9 templates depend on)"
+# And the rc is 3, not 1, for a TCC-protected EXEC target: the unit is refused without failing the run.
+# The INTERPRETER arm is exercised with an argv[0] that IS an interpreter inside the tree — the
+# `branch-reaper`/`worktree-reaper` shape (`{{TORTOISE_REPO}}/.venv/bin/python`) — because for that
+# shape the "render the FARMED copy of the script" remedy cannot apply, and the message must say so.
+mkdir -p "$PROBE_HOME/Documents/checkout/.venv/bin"
+touch "$PROBE_HOME/Documents/checkout/.venv/bin/python"
+chmod +x "$PROBE_HOME/Documents/checkout/.venv/bin/python"
+write_job_plist "$T/job-interp0.plist" "$PROBE_HOME/Documents/checkout/.venv/bin/python" "$PROBE_HOME/safe/live.sh" --repo /tmp
+set +e; VRC="$(vt_probe "$T/job-interp0.plist"; echo "rc=$?")"; set -e
+assert_eq "${VRC##*rc=}" "3" "a TCC-protected INTERPRETER (argv[0]) is refused for the unit, not for the run"
+assert_contains "$(cat "$T/vt.out")" "INTERPRETER" "…and gets the remedy that can actually apply to it (farming a script cannot help)"
+assert_contains "$(cat "$T/vt.out")" "TCC-protected target" "…while still naming the target it refused"
 
 # Restore the fixture so later sections install cleanly (one call — the second was a duplicate,
 # review P3-J).
