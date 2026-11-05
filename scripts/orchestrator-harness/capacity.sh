@@ -1411,6 +1411,15 @@ cap_parse_inventory() {
       if (q == 0) return ""
       return substr(rest, 1, q - 1)
     }
+    # ⛔ ONE TOKEN PER FIELD IS THE OUTPUT CONTRACT OF THIS FUNCTION (fresh review round 12, P2). The
+    # consumer splits each line on whitespace, so a provider NAME carrying a space — `pi cell 1` — was
+    # read as `label=pi`, `bid=cell 1 10.0.0.1`: a PHANTOM box named `pi`, the real box reported
+    # INELIGIBLE beside a published one, and rc 0.
+    # MEASURED `expected=1 published=1 INELIGIBLE=1 (pi)` — the line DID break its own
+    # `published − extra = expected − INELIGIBLE` invariant, and named a live box as missing, from a
+    # DISPLAY-ONLY label. The label is normalised to the token charset (the same one `cap_ref_token`
+    # applies on the roster path); the JOIN key is the address, so nothing a reader compares is lost.
+    function labeltok(s) { gsub(/[^A-Za-z0-9._-]+/, "_", s); return s }
     { buf = buf $0 }
     END {
       if (buf == "") exit 1
@@ -1451,6 +1460,12 @@ cap_parse_inventory() {
         if (st == "stopped") continue
         if (st != "running") { bad++; continue }
         ip = jget(m[i], "ipv4")
+        # ⛔ AN ADDRESS IS THE KEY AND MAY NOT CARRY WHITESPACE (fresh review round 12, P2). Unlike the
+        # label this is not a display nicety: `network.ipv4` IS the identity `cap_boxid` publishes
+        # under, so a value that cannot be one token cannot match any published record — the object is
+        # UNCLASSIFIABLE (which refuses the listing) rather than a key that silently never joins.
+        if (ip != "" && ip ~ /[ \t]/) { bad++; continue }
+        nm = labeltok(nm)
         # ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
         # expected-side dedupe ("the same box named twice is one box") is right for a roster row and
         # WRONG for the provider inventory, where the key is `network.ipv4`: it silently dropped the
@@ -1502,7 +1517,7 @@ cap_fleet_inventory() {
     # The parser names HOW MANY objects it could not classify; carry that onto the line rather than
     # reporting the strictly weaker "nothing could be read" (which is also what a parked fleet says).
     case "${out:-}" in
-      'UNCLASSIFIED '*) detail="${out#UNCLASSIFIED } machine object(s) could not be classified (an unreadable status or name) — a parse failure is not a parked fleet" ;;
+      'UNCLASSIFIED '*) detail="${out#UNCLASSIFIED } machine object(s) could not be classified (an unreadable status, name or address — a value a single output field cannot carry) — a parse failure is not a parked fleet" ;;
       'DUPLICATEKEY '*) detail="two machines report the same address (${out#DUPLICATEKEY }) — a key that names two boxes cannot say which one publishes" ;;
       *)                detail="no running machine could be read from it" ;;
     esac
@@ -1627,7 +1642,14 @@ cap_fleet_line_from() {
   if [ "$unk_pub" -eq 0 ]; then
     while IFS= read -r rec; do
       [ -n "${rec:-}" ] || continue
-      cap_valid_base_record "$rec" || continue
+      # ⛔ A RECORD THE LINE CANNOT VALIDATE IS NOT "THIS BOX IS NOT PUBLISHING" (fresh review round
+      # 12, P2). Every field is checked by `cap_valid_base_record`, and `cap_place` REFUSES the same
+      # bytes (`bound=probe_unreadable`) — but this loop DROPPED the record and then reported the box as
+      # INELIGIBLE: MEASURED `fleet: expected=1 published=0 INELIGIBLE=1 (cell-1)` rc 0 ("both sides
+      # known and attributable") from a record `cap_place` refuses, sending the operator to restart a
+      # controller whose record is merely malformed. Same shape, same answer as the `collide=1` arm
+      # below: the line and placement must not disagree about who is visible.
+      if ! cap_valid_base_record "$rec"; then unk_pub=1; why="${why:-record-unreadable}"; break; fi
       bid="$(cap_kv "$rec" boxid)"
       cap_boxid_ok "$bid" || continue
       # ⛔ A COLLIDED KEY IS NOT A PUBLISHED BOX (fresh review round 5, P1). `cap_parse_lsremote` marks
@@ -1639,7 +1661,10 @@ cap_fleet_line_from() {
       # bytes. The line and placement must not disagree about who is visible.
       if [ "$(cap_kv "$rec" collide)" = "1" ]; then unk_pub=1; why="${why:-identity-collision}"; break; fi
       at="$(cap_kv "$rec" at)"
-      case "$at" in ''|*[!0-9]*) continue ;; esac
+      # …and the same for a stamp the age cannot be computed from: `cap_bound_hit` answers
+      # `probe_unreadable` for it (see its own `at` guard), so a silent drop here is the same
+      # disagreement, one field further in.
+      case "$at" in ''|*[!0-9]*) unk_pub=1; why="${why:-record-unreadable}"; break ;; esac
       # ⛔ `10#`: a leading-zero `at` (`08`) is CHANNEL-LEGAL and makes plain arithmetic ABORT the whole
       # function — no line printed, against a documented contract that says one is printed in every case
       # (fresh review round 6, P1; measured end-to-end: `capacity.sh: line 1500: 08: value too great for

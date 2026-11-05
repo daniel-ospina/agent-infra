@@ -444,7 +444,16 @@ disagreement — a box with a broken RTC would otherwise read `published=1` for 
 after it died — so it refuses as `why=clock-skew`; a second or two of skew between two boxes is normal
 and still clamps to "just published".
 
-⛔ **TWO MORE WAYS THE PUBLISHED SIDE USED TO COUNT SOMETHING IT HAD NOT ESTABLISHED.**
+⛔ **MORE WAYS A SIDE USED TO COUNT SOMETHING IT HAD NOT ESTABLISHED.**
+
+- **A record the line cannot validate is not "this box is not publishing".** `cap_place` refuses such a
+  record (`bound=probe_unreadable`), but the published loop used to DROP it and then report the box as
+  INELIGIBLE with rc 0 — measured `expected=1 published=0 INELIGIBLE=1 (cell-1)` on a record placement
+  refuses (`lpc=18446744073709551615`: every field is bounded, `cap_valid_base_record` returns 1). rc 0
+  claims "both sides known and attributable", and the named cause sends the operator to restart a
+  controller whose record is merely malformed. An unreadable record (or one whose `at` cannot be
+  parsed) now refuses as `why=record-unreadable`, the same answer the collision arm gives: the line and
+  placement must not disagree about who is visible.
 
 - **A collided key is not a published box.** `cap_parse_lsremote` already marks such a record
   (`collide=1`) and `cap_place` refuses the whole evaluation on it (`bound=identity_collision`),
@@ -468,6 +477,14 @@ and still clamps to "just published".
   check — measured on a 5-machine listing cut after object 2: `expected=2 published=2 INELIGIBLE=0`, rc
   0, naming two of five machines. Completeness is now structural: every `{` needs its `}`, every `[`
   its `]` (the live provider emits `{"machines":[…]}` — `]}` — so only BALANCE is assumed, not shape).
+- **One token per field, or the line names a box that does not exist.** Each inventory line is
+  `<name> <ipv4|->` and the reader splits on whitespace, so a machine NAME carrying a space
+  (`pi cell 1`) was read as `label=pi`, `bid=cell 1 10.0.0.1` — measured `expected=1 published=1
+  INELIGIBLE=1 (pi)` rc 0: a phantom box named as missing, the real box published beside it, and the
+  line's own `published − extra = expected − INELIGIBLE` invariant broken by a display-only label. The
+  label is normalised to the token charset (the one `cap_ref_token` applies to a roster row); an
+  ADDRESS carrying whitespace is refused with the listing, because it is the join key and a key that
+  cannot be one token can never match a published record.
 
 owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
 `cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —

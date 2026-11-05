@@ -2061,6 +2061,58 @@ ck "  …the mutant really lost the duplicate gate" "$([ "$(grep -c 'MUTANT: no 
 L29M="$(printf '%s' "$_DUP" | bash -c '. "$1"; cap_parse_inventory' _ "$TMP/cap-nodup.sh" 2>&1)"
 ck "  …mutation control: without the gate the same listing reads 2 machines under one key ($L29M)" \
    "$([ "$(printf '%s' "$L29M" | grep -cE '^pi-c[0-9] ')" -eq 2 ] && echo 0 || echo 1)"
+# (c23) ⛔ A RECORD THE LINE CANNOT VALIDATE IS NOT "THIS BOX IS NOT PUBLISHING" (fresh review round 12,
+# P2). `cap_place` REFUSES such a record (`bound=probe_unreadable`) while the line dropped it and then
+# asserted the box was INELIGIBLE — MEASURED `expected=1 published=0 INELIGIBLE=1 (cell-1)` rc 0, i.e.
+# "both sides known and attributable" about a record placement refuses, which sends the operator to
+# restart a controller whose record is merely malformed. Same answer as (c4)'s collision arm: an
+# unreadable datum is UNREADABLE, never a membership claim.
+_UNREC="host=cell-1 ncpu=8 load1=1 lpc=18446744073709551615 lanes=0 disk_free_mb=99999 mem_free_mb=99999 at=$NOW procs=10 procs_max=100000 fork=1 boxid=10.0.0.1 boot=123"
+ck "  …fixture: the unreadable record really makes placement refuse (control)" \
+   "$([ "$(printf '%s\n' "$_UNREC" | cap_place cell-1 | head -1 | cut -d' ' -f1-2)" = "refuse bound=probe_unreadable" ] && echo 0 || echo 1)"
+L45="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$_UNREC" 0)"; RC=$?
+ck "(c23) a record the READER cannot validate refuses the reading, never 'this box is not publishing' ($L45)" \
+   "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L45" && qF 'why=record-unreadable' "$L45" && echo 0 || echo 1)"
+L45C="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
+ck "  …while a valid record under the same key is published (so (c23) is not a blanket refusal: $L45C)" \
+   "$(qF 'published=1' "$L45C" && echo 0 || echo 1)"
+# (c23-mutant) NON-VACUITY: the pre-fix `|| continue` drops the record and reports the box as missing.
+sed 's|then unk_pub=1; why="${why:-record-unreadable}"; break; fi|then continue; fi|' "$CAP" > "$TMP/cap-norecvalid.sh"
+ck "  …the mutant really restored the pre-fix DROP" \
+   "$([ "$(grep -c 'then continue; fi' "$TMP/cap-norecvalid.sh")" -eq 1 ] && echo 0 || echo 1)"
+L45M="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-norecvalid.sh" "$_UNREC" 2>/dev/null)"; RCM=$?
+ck "  …mutation control: dropping the record instead asserts 'not publishing' rc 0 ($L45M rc=$RCM)" \
+   "$([ "$RCM" -eq 0 ] && qF 'published=0' "$L45M" && qF 'INELIGIBLE=1' "$L45M" && echo 0 || echo 1)"
+# (c24) ⛔ ONE TOKEN PER FIELD, OR THE LINE NAMES A BOX THAT DOES NOT EXIST (fresh review round 12, P2).
+# The consumer splits each `<name> <ipv4>` line on whitespace, so a provider NAME carrying a space read
+# as `label=pi`, `bid=cell 1 10.0.0.1` — MEASURED `expected=1 published=1 INELIGIBLE=1 (pi)` rc 0: a
+# PHANTOM box named as missing, the real one published, and the line's own
+# `published − extra = expected − INELIGIBLE` invariant broken by a display-only label. The label is
+# normalised to the token charset; an ADDRESS carrying whitespace is refused (it is the join key).
+_INVSP="$TMP/inventory-3446-space.json"
+printf '%s\n' '{"machines":[{"name":"pi cell 1","status":"running","network":{"ipv4":"10.8.0.1"}}]}' > "$_INVSP"
+L46="$(cap_parse_inventory < "$_INVSP" 2>&1)"; RC=$?
+ck "(c24) a whitespace-bearing machine NAME keeps ONE token per field ($L46)" \
+   "$([ "$RC" -eq 0 ] && [ "$(printf '%s\n' "$L46" | grep -cE '^pi_cell_1 10\.8\.0\.1$')" -eq 1 ] && echo 0 || echo 1)"
+L47="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $_INVSP" cap_fleet_line_from "$(recb 10.8.0.1 "$NOW")" 0)"; RC=$?
+ck "  …and the line reconciles: expected=1 published=1 INELIGIBLE=0 with no phantom name ($L47)" \
+   "$([ "$RC" -eq 0 ] && qF 'expected=1' "$L47" && qF 'published=1' "$L47" && qF 'INELIGIBLE=0' "$L47" \
+      && ! qF '(' "$L47" && echo 0 || echo 1)"
+# (c24-mutant) NON-VACUITY: without the label normalisation the same listing names a phantom box.
+# The replacement is a VALID awk no-op (`nm = nm`), not `:` — awk has no empty statement, and an
+# earlier draft of this arm mutated the program into a syntax error, which reddened the control for
+# the wrong reason (the listing refused as unparseable instead of mis-splitting).
+sed 's|        nm = labeltok(nm)|        nm = nm   # MUTANT: no label normalise|' "$CAP" > "$TMP/cap-rawlabel.sh"
+ck "  …the mutant really lost the label normalisation" "$([ "$(grep -c 'MUTANT: no label normalise' "$TMP/cap-rawlabel.sh")" -eq 1 ] && echo 0 || echo 1)"
+L47M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $_INVSP" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-rawlabel.sh" "$(recb 10.8.0.1 "$NOW")" 2>/dev/null)"
+ck "  …mutation control: without it the same listing reads INELIGIBLE=1 naming 'pi' ($L47M)" \
+   "$(qF 'INELIGIBLE=1' "$L47M" && qF '(pi)' "$L47M" && echo 0 || echo 1)"
+# (c25) ⛔ AN ADDRESS IS THE JOIN KEY AND MAY NOT CARRY WHITESPACE (fresh review round 12, P2). A value
+# that cannot be one token cannot match any published record, so the OBJECT is unclassifiable and the
+# whole listing refuses — never a key that silently never joins.
+L48="$(printf '%s' '{"machines":[{"name":"pi-1","status":"running","network":{"ipv4":"10.8.0.1 10.8.0.2"}}]}' | cap_parse_inventory 2>&1)"; RC=$?
+ck "(c25) a whitespace-bearing ADDRESS refuses the listing, never a key that cannot join ($L48)" \
+   "$([ "$RC" -ne 0 ] && qF 'UNCLASSIFIED' "$L48" && ! grep -qE '^pi-1 ' <<<"$L48" && echo 0 || echo 1)"
 # (c8) ⛔ A NUMERIC TTL THE SHELL CANNOT COMPARE IS THE SAME HOLE AS THE COUNT (fresh review round 6,
 # P2): 20 digits makes `[ "$age" -gt "$CAP_PROBE_TTL" ]` error, the stale branch never runs and every
 # record counts fresh — measured `expected=3 published=1 INELIGIBLE=2` rc 0 where the truth (TTL=900) is
