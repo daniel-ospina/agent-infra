@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-four tests with one hundred paired mutations: every mutation re-
+Fifty-five tests with one hundred and five paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven of them pin the #1254 TURN-BOUNDARY rule:
+evidence mechanical. (These two numbers are the measured ones; the runner also
+prints them, and ``check_header_counts()`` reddens the suite if they drift apart
+— a hardcoded count in a verification artifact is a claim like any other.)
+Seven of them pin the #1254 TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -17,8 +20,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 54 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (100)
+    python3 tools/fleet/liveness.test.py                # the 55 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (105)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2052,6 +2055,16 @@ def t41():
         check(by_pid["30"][0] == "unknown",
               "a NEGATIVE cpu delta is a broken reading, not a flat one; got %r"
               % (by_pid["30"],))
+        # ⛔ AND THE DETAIL MUST AGREE WITH THE STATE (review P2). The state abstains BECAUSE
+        # the reading is broken, so `cpu_unreadable` must say so — the census used to derive
+        # the flag from `?` alone and print `cpu_delta_cs=-200 cpu_unreadable=0`, one detail
+        # line reporting the channel as fine beside the number it refuses to trust. The
+        # acquisition path normalises the identical fact to `cpu_unreadable=True` +
+        # `cpu_delta_cs=None` (`A NEGATIVE DELTA IS NOT 'FLAT'`), so the two surfaces now agree.
+        d30 = full["30"][3] if len(full["30"]) > 3 else ""
+        check("cpu_unreadable=1" in d30,
+              "a NEGATIVE cpu delta must report cpu_unreadable=1 beside the value it "
+              "refuses to trust; got %r" % (d30,))
         check(by_pid["31"][0] == "unknown",
               "an unreadable `rc` at the seam must ABSTAIN, never claim a crash; got %r"
               % (by_pid["31"],))
@@ -3649,6 +3662,14 @@ MUTATIONS = [
     ),
     # ── round 5: the launcher status at the door, and a negative log age ───────────
     Mutation(
+        "T41", "module",
+        '                         cpu_unreadable=(cpu_delta is None or cpu_delta < 0),',
+        '                         cpu_unreadable=(cpu_delta is None),',
+        "a NEGATIVE cpu delta is reported as a FINE channel (`cpu_unreadable=0`) beside the "
+        "value the verdict refuses to trust, so the detail and the abstention contradict "
+        "each other on one line",
+    ),
+    Mutation(
         "T37", "module",
         '                if runner_rc is not None and runner_rc != "0":',
         '                if False and runner_rc is not None and runner_rc != "0":',
@@ -3914,11 +3935,45 @@ def run_mutations():
     return bad == 0
 
 
+def check_header_counts() -> int:
+    """Hold this file's own stated counts to the measurement.
+
+    ⛔ A COUNT IN A VERIFICATION ARTIFACT IS A CLAIM, and this header has been stale
+    before: it said 54 tests / 100 mutations while the suite held 55 / 104, because
+    nothing read it and so nothing could go red. `dceeb68e8` had bumped 51/72 -> 54/100,
+    and the tests added afterwards were never reflected. The runner already PRINTS the
+    authoritative numbers; this makes the prose agree with them or the suite fail.
+    """
+    import re as _re
+    with open(__file__, encoding="utf-8") as fh:
+        src = fh.read()
+    m_t = _re.search(r"# the (\d+) tests, green", src)
+    m_m = _re.search(r"each mutation, RED \((\d+)\)", src)
+    want = (("tests", len(TESTS)), ("mutations", len(MUTATIONS)))
+    got = (("tests", int(m_t.group(1)) if m_t else None),
+           ("mutations", int(m_m.group(1)) if m_m else None))
+    bad = 0
+    for (what, g), (_, w) in zip(got, want):
+        if g != w:
+            print("   ❌ HEADER STALE — the docstring says %r %s, the suite holds %d"
+                  % (g, what, w))
+            bad += 1
+    if not bad:
+        print("   ok   the docstring's counts match the suite (%d tests, %d mutations)"
+              % (len(TESTS), len(MUTATIONS)))
+    return bad
+
+
 def main(argv):
     if "--mutations" in argv:
         return 0 if run_mutations() else 1
     print("── #1178 liveness acceptance suite (%d tests) ──" % len(TESTS))
-    return 0 if run_tests(os.environ.get("LIVENESS_ONLY")) else 1
+    ok = run_tests(os.environ.get("LIVENESS_ONLY"))
+    # ⛔ run LAST so the counts above are the real ones, and only in the full-suite path:
+    # the mutation harness runs one test in a subprocess and must not pay for this.
+    if os.environ.get("LIVENESS_ONLY") is None:
+        ok = (check_header_counts() == 0) and ok
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":

@@ -3219,10 +3219,13 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # ⛔ AND AN UNREAD CPU IS `cpu_unreadable=1`, NOT `0` (review P2). Column 4
             # is `?` for NOT READ, which IS the unread case; leaving the flag at its
             # `False` default made one detail line assert both "the CPU channel was not
-            # read" and "the CPU channel was not unread".
+            # read" and "the CPU channel was not unread". A NEGATIVE delta is the same
+            # fact one branch over — the acquisition path normalises it to
+            # `cpu_unreadable=True` + `cpu_delta_cs=None` for exactly this reason — so the
+            # census marks it too rather than abstaining on a reading it reports as fine.
             cpu_delta = _opt(3)
             lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=cpu_delta,
-                         cpu_unreadable=(cpu_delta is None),
+                         cpu_unreadable=(cpu_delta is None or cpu_delta < 0),
                          window_ms=None, verdict=verdict,
                          # ⛔ THE `rc` ALLOW-LIST IS NOT RE-IMPLEMENTED HERE. It lives
                          # at ONE door — `log_lane_verdict`, which normalises an
