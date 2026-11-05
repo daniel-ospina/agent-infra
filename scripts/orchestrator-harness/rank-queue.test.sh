@@ -33,6 +33,10 @@
 #      file UNTOUCHED (`rm -f`, no `mv`), so it holds whatever the PREVIOUS pass left; "is in ARRIVAL
 #      order" was a typed claim about an unread file, and is asserted ABSENT here while assertion 3 (the
 #      arm that really does rewrite in arrival order) asserts it PRESENT, so the pair discriminates.
+#   7. The PRODUCT FLOOR'S FILE FOLLOWS the order a pass installs: `candidates.product.txt` is read by
+#      `orch-loop.sh`'s `floor_order` in ITS OWN order, and the skip arm returns before the split that
+#      would otherwise derive it — so without check 12 the floor's head could be chosen by a sequence the
+#      pass no longer maintains (order only; the row set is compared, never changed).
 #   6. The WIRING: both call sites exist and both follow the definitions, so the reorder cannot go inert
 #      the way the first cut of this change did (defined after the skip arm's call site, line ~1337
 #      apart — `command not found`, absorbed).
@@ -292,13 +296,23 @@ ck "an unranked population is ANNOUNCED — 'WARN queue order: 2 queued candidat
 #     output no longer carries them. Without this, 3b could be satisfied by the fixture rather than by
 #     the shipped print. This is the same removal that was measured GREEN before this check existed.
 MUT_NOCOUNT="$TMP/fns-nocount.sh"
+# ⛔ THE WARN LINE IS NEUTERED, NOT DELETED (review P2, cycle 8). `sed /…/d` removes the echo from inside
+# its `if … then … fi`, leaving an EMPTY then-body: `bash -n` rejects the mutant, the drive below dies at
+# rc=2 with EMPTY output, and the `*) rc=0` arm reads that CRASH as "the prints are gone" — the mutation
+# would prove nothing while reporting green. `:` keeps the block valid, so the mutant parses and runs and
+# the only difference is the absent lines.
 sed -e 's/ (\$_r pool-ranked, \$_u unranked at the tail)//' \
-    -e '/WARN queue order: \$_u queued candidate(s)/d' "$FNS" > "$MUT_NOCOUNT"
+    -e '/WARN queue order: \$_u queued candidate(s)/{s/.*/    : MUTANT_NO_WARN/}' "$FNS" > "$MUT_NOCOUNT"
+bash -n "$MUT_NOCOUNT" 2>/dev/null || { rc=1; echo "      the count/WARN mutation left an UNPARSABLE source"; ck "the count/WARN mutation keeps the extracted source parsable" $rc; }
 case "$(cat "$MUT_NOCOUNT" 2>/dev/null)" in
   *'pool-ranked, $_u unranked'*|*'WARN queue order: $_u queued'*) mutated=1 ;;
   *) mutated=0 ;;
 esac
-[ "$mutated" -eq 0 ] && rc=0 || { rc=1; echo "      the count/WARN mutation did not apply — a sed anchor drifted"; }
+case "$(cat "$MUT_NOCOUNT" 2>/dev/null)" in
+  *'MUTANT_NO_WARN'*) mutated_neutered=1 ;;
+  *) mutated_neutered=0 ;;
+esac
+[ "$mutated" -eq 0 ] && [ "$mutated_neutered" -eq 1 ] && rc=0 || { rc=1; echo "      the count/WARN mutation did not apply cleanly — a sed anchor drifted, or the WARN line was DELETED (leaving an empty then-body) rather than neutered"; }
 ck "the count-stripping mutation applied to the extracted source (both anchors still match it)" $rc
 drive mut-nocount "$MUT_NOCOUNT" '9
 300
@@ -308,9 +322,10 @@ drive mut-nocount "$MUT_NOCOUNT" '9
 300
 '
 nc_out="$(cat "$TMP/mut-nocount/out" 2>/dev/null)"
+nc_order="$(cat "$TMP/mut-nocount/order" 2>/dev/null)"
 case "$nc_out" in
   *'pool-ranked'*|*'WARN queue order'*) rc=1; echo "      the mutant still prints a count/WARN — 3b cannot discriminate"; out_tail="$(printf '%s' "$nc_out" | grep -o 'pool-ranked\|WARN queue order' | head -2 | tr '\n' ' ')"; echo "      still present: $out_tail" ;;
-  *) rc=0 ;;
+  *) [ "$nc_order" = "200 300 9 7" ] && rc=0 || { rc=1; echo "      the mutant's drive did not RUN (order '$nc_order', want '200 300 9 7') — an absent print on a CRASHED drive proves nothing"; } ;;
 esac
 ck "non-vacuity: with both prints removed the 3b assertions go RED (the removal is visible, not absorbed)" $rc
 
@@ -436,7 +451,7 @@ ck "a reorder whose COUNT cannot be verified FAILS instead of reporting a draine
 # passes because they supply their own call.
 # ⛔ THE DIRECTION AND THE ANCHOR IN THIS COMMENT WERE CORRECTED (review P2, cycle 6). It used to say
 # "DEFINED both functions ~1,337 lines BELOW the skip arm" — measured false on `70ea113c`: the
-# definition was at 3742 and the skip-arm call at 3803, so it was 61 lines ABOVE that call. The ~1,337
+# definition was at 3742 and the skip-arm call at 3810, so it was 68 lines ABOVE that call. The ~1,337
 # magnitude is the definition → MAIN-call distance (1,467 at HEAD, `:3813` → `:5280`), not the defect.
 # The assertion below is sound either way; only the story it told was wrong.
 #
@@ -613,6 +628,192 @@ if [ "$race_rc" -ne 0 ] && [ "$race_rows" = "111 222" ] \
    && [ ! -e "$SH/o/.cand.ranked" ]; then rc=0
 else rc=1; echo "      rc=$race_rc rows='$race_rows' (want '111 222'); out: $(tr '\n' '|' < "$SH/out" 2>/dev/null | head -c 300)"; fi
 ck "a prune that refills the queue between the read and the install is REFUSED — the rows survive, no 'EMPTY' is reported" $rc
+
+# ── 12) THE PRODUCT FLOOR'S FILE FOLLOWS THE ORDER THIS PASS INSTALLED ───────────────────────
+# `orch-loop.sh`'s `floor_order` walks `candidates.product.txt` in ITS OWN order and takes up to
+# `PRODUCT_FLOOR` (default 1) rows that ALSO live in candidates.txt. On a MAIN pass `write_product_queues`
+# derives it from candidates.txt, so the two agree; the SKIP arm returns before that split, so without
+# `product_queue_follow` the product file keeps the PREVIOUS pass's sequence while the queue it is
+# intersected with moves — and the floor slot is then chosen by an order the pass no longer maintains
+# (membership is unaffected, which is why the exposure is the floor slot alone).
+# ⛔ THE WIRING FIRST (the same lesson as check 7): the function being right is worthless if the skip arm
+# never calls it — or calls it BEFORE the queue is re-ordered, in which case it copies the OLD order
+# forward. So the call is pinned by CONTAINMENT inside the arm and by ORDER after the queue's call.
+skip_arm_call() {  # <marker-text> <file> -> line of that CALL inside the skip arm, or empty
+  awk -v want="$1" '
+    /^[[:space:]]*refresh_stage skip "digest compare/{ arm = 1; next }
+    arm && /^[[:space:]]*exit 0[[:space:]]*$/{ exit }
+    arm && /^[[:space:]]*#/ { next }
+    arm { line = $0; sub(/#.*/, "", line); if (index(line, want)) { print NR; exit } }
+  ' "$2"
+}
+# 12-w0) THE ORDER PREDICATE, in ONE place: the shipped check and the reversed fixture below must drive the
+#        SAME function, or the reversed fixture pins only its own comparison and a predicate degenerated to
+#        "both calls present" passes green (measured at VGATE pass 4).
+arm_order_ok() {  # <queue-line> <product-line> -> true when BOTH were found AND the product call FOLLOWS
+  [ -n "$1" ] && [ -n "$2" ] && [ "$2" -gt "$1" ]
+}
+q_in_arm="$(skip_arm_call 'queue_order_from_pool "$O"' "$REFRESH")"
+pf_in_arm="$(skip_arm_call 'product_queue_follow "$O"' "$REFRESH")"
+if arm_order_ok "$q_in_arm" "$pf_in_arm"; then rc=0
+else rc=1; echo "      skip-arm calls: queue_order_from_pool='${q_in_arm:-MISSING}' product_queue_follow='${pf_in_arm:-MISSING}' (want both present, the product call AFTER the queue's)"; fi
+ck "the SKIP arm calls product_queue_follow, and AFTER the queue reorder it must follow (queue line ${q_in_arm:-?}, product line ${pf_in_arm:-?})" $rc
+# 12-w) NON-VACUITY of the wiring pin, BOTH directions:
+#       (a) the product call moved BELOW the arm's `exit 0` must produce NO line — otherwise an inert
+#           call satisfies a position-only pin; and
+#       (b) a COMMENTED-OUT call inside the arm must produce NO line either (review P2, cycle 8): a raw
+#           substring match counted `# product_queue_follow "$O"` as the call, so an arm whose only
+#           "call" was a comment would satisfy a checkmark claiming the arm CALLS it.
+#       Both fixtures carry a REAL queue call, so a scanner that found nothing at all cannot pass either.
+INERTPF="$TMP/pf-inert.sh"
+printf '%s\n' \
+  '  refresh_stage skip "digest compare (fixture)"' \
+  '  queue_order_from_pool "$O" || true' \
+  '  exit 0' \
+  '  product_queue_follow "$O" || true' > "$INERTPF"
+COMMENTPF="$TMP/pf-comment.sh"
+printf '%s\n' \
+  '  refresh_stage skip "digest compare (fixture)"' \
+  '  queue_order_from_pool "$O" || true' \
+  '  # product_queue_follow "$O" || true' \
+  '  exit 0' > "$COMMENTPF"
+REVERSEDPF="$TMP/pf-reversed.sh"
+printf '%s\n' \
+  '  refresh_stage skip "digest compare (fixture)"' \
+  '  product_queue_follow "$O" || true' \
+  '  queue_order_from_pool "$O" || true' \
+  '  exit 0' > "$REVERSEDPF"
+INLINEPF="$TMP/pf-inline-comment.sh"
+printf '%s\n' \
+  '  refresh_stage skip "digest compare (fixture)"' \
+  '  queue_order_from_pool "$O" || true' \
+  '  : # product_queue_follow "$O" || true' \
+  '  exit 0' > "$INLINEPF"
+below_exit0="$(skip_arm_call 'product_queue_follow "$O"' "$INERTPF")"
+commented="$(skip_arm_call 'product_queue_follow "$O"' "$COMMENTPF")"
+inline_commented="$(skip_arm_call 'product_queue_follow "$O"' "$INLINEPF")"
+q_live_a="$(skip_arm_call 'queue_order_from_pool "$O"' "$INERTPF")"
+q_live_b="$(skip_arm_call 'queue_order_from_pool "$O"' "$COMMENTPF")"
+q_live_c="$(skip_arm_call 'queue_order_from_pool "$O"' "$INLINEPF")"
+if [ -z "$below_exit0" ] && [ -z "$commented" ] && [ -z "$inline_commented" ] \
+   && [ -n "$q_live_a" ] && [ -n "$q_live_b" ] && [ -n "$q_live_c" ]; then rc=0
+else
+  rc=1; echo "      below-exit0='${below_exit0:-none}' commented='${commented:-none}' inline='${inline_commented:-none}' (want none/none/none) with queue call found in every fixture ('${q_live_a:-MISSING}'/'${q_live_b:-MISSING}'/'${q_live_c:-MISSING}')"
+fi
+ck "non-vacuity: the reachability pin reddens on a product call BELOW the arm's exit 0, on a full-line COMMENT, and on an INLINE-commented one" $rc
+# 12-w2) NON-VACUITY of the ORDER half, which the three fixtures above do NOT exercise (VGATE, cycle 9 —
+#        it verified the predicate reds on the shipped tree, but the suite never re-proved that red itself,
+#        so a rewrite of the comparison could go inert unnoticed). A REVERSED arm — product call BEFORE the
+#        queue's — must not satisfy `pf -gt q`.
+pf_rev="$(skip_arm_call 'product_queue_follow "$O"' "$REVERSEDPF")"
+q_rev="$(skip_arm_call 'queue_order_from_pool "$O"' "$REVERSEDPF")"
+if ! arm_order_ok "$q_rev" "$pf_rev"; then rc=0
+  # (the predicate must REJECT a reversed arm: both calls ARE present there, so a presence-only
+  #  comparison would accept it — which is the vacuity this fixture exists to redden)
+else rc=1; echo "      reversed fixture: product line '${pf_rev:-none}' queue line '${q_rev:-none}' — arm_order_ok ACCEPTED a REVERSED arm, so the ORDER half cannot distinguish 'after' from 'merely present'"; fi
+ck "non-vacuity: the ORDER half reddens on a REVERSED skip arm (product line ${pf_rev:-?} < queue line ${q_rev:-?}), so 'after' is not assumed from presence" $rc
+# The assertion below is on the FLOOR'S OWN DECISION, driven from the shipped `floor_order`.
+FLOORFNS="$TMP/floor-fns.sh"
+awk '/^floor_order\(\) \{/{f=1} f && /^\}[[:space:]]*$/{print; exit} f' "$HERE/orch-loop.sh" > "$FLOORFNS"
+if [ -s "$FLOORFNS" ] && grep -q '^floor_order() {' "$FLOORFNS"; then rc=0
+else rc=1; echo "      could not extract floor_order from orch-loop.sh — check 12 cannot grade the floor"; fi
+ck "the shipped floor_order is extracted WHOLE (the consumer this check drives)" $rc
+# Driven as a SCRIPT, like every other drive in this suite, so the shipped function is executed rather
+# than re-implemented here (a restatement of `head -1 of the product file` would pass on a broken floor).
+{ cat "$FLOORFNS"; printf 'floor_order "$1" "$2" "$3"\n'; } > "$TMP/floor-drive.sh"
+floor_head() {  # <product-file> <all-file> -> the row the floor's ONE slot takes
+  ( cd "$TMP" && bash floor-drive.sh 1 "$1" "$2" ) 2>/dev/null | head -1
+}
+PQ="$TMP/productfollow"; mkdir -p "$PQ/o"
+{
+  echo 'QUEUE_ORDER_STATE=""'
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\nproduct_queue_follow "$1"\n'
+} > "$PQ/drive.sh"
+inode_pf() { ls -i "$1" 2>/dev/null | awk '{print $1}'; }
+# A) THE STALE CASE: the product file still leads with 200 while the queue has moved to 300 first.
+#    ⛔ THE FIXTURE'S ORDER MUST NOT BE ASCENDING (VGATE, cycle 9). Seed `200 300` and "onto the queue's
+#    order" is indistinguishable from `sort -n`: a `sort`-instead-of-follow implementation never opens
+#    candidates.txt and still produced the expected bytes. The pool now ranks 300 BEFORE 200, so the
+#    queue's order and the numeric sort disagree — the same reasoning section 1 applies to the queue
+#    itself (a fixture whose two explanations coincide proves neither).
+printf '200\n300\n' > "$PQ/o/candidates.txt"
+printf '300\n200\n' > "$PQ/o/.pool"
+printf '200\n300\n' > "$PQ/o/candidates.product.txt"
+( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log" 2>&1
+prod_a="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" 2>/dev/null | sed 's/ *$//')"
+head_a="$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt")"
+if [ "$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')" = "300 200" ] && [ "$prod_a" = "300 200" ] && [ "$head_a" = "300" ]; then rc=0
+else rc=1; echo "      queue '$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')' product '$prod_a' floor-head '$head_a' (want 300 200 / 300 200 / 300 — the queue ARRIVED '200 300', so the reorder must really run; a numeric sort would leave the product at '200 300' and the head at 200)"; fi
+ck "a SKIPPED pass re-sequences candidates.product.txt onto the queue's order, so the floor slot takes the queue's head (200 -> 300)" $rc
+# B) NO NEEDLESS REWRITE: an already-aligned product file keeps its INODE (same reasoning as check 8 —
+#    a swap races a reader for no gain). Positive pair: A above really did move bytes.
+printf '300\n200\n9\n' > "$PQ/o/candidates.txt"
+printf '300\n200\n' > "$PQ/o/.pool"
+printf '300\n200\n' > "$PQ/o/candidates.product.txt"
+ino1="$(inode_pf "$PQ/o/candidates.product.txt")"
+( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log2" 2>&1
+ino2="$(inode_pf "$PQ/o/candidates.product.txt")"
+prod_b="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" | sed 's/ *$//')"
+if [ -n "$ino1" ] && [ "$ino1" = "$ino2" ] && [ "$prod_b" = "300 200" ]; then rc=0
+else rc=1; echo "      inode $ino1 -> $ino2 (want equal); product '$prod_b'"; fi
+ck "an already-aligned product queue is not rewritten (inode unchanged), so the follow is not a needless swap" $rc
+# C) MEMBERSHIP IS PRESERVED: a product row the queue does not hold is KEPT (in its own order), never
+#    dropped — dropping it here would be a silent membership change in the file the floor reads.
+printf '200\n300\n' > "$PQ/o/candidates.txt"
+printf '300\n200\n' > "$PQ/o/.pool"
+printf '777\n300\n555\n' > "$PQ/o/candidates.product.txt"
+( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log3" 2>&1
+prod_c="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" 2>/dev/null | sed 's/ *$//')"
+if [ "$prod_c" = "300 777 555" ]; then rc=0
+else rc=1; echo "      product '$prod_c' (want '300 777 555': the queue's order first, the unknown rows KEPT after it in THEIR order — a sort would emit '300 555 777')"; fi
+ck "re-sequencing never changes the product file's ROW SET — a row candidates.txt does not hold is kept, not dropped" $rc
+# D) AN ABSENT product file is the documented unmet-floor case: nothing is CREATED (that would
+#    manufacture product work from a classification this pass did not make).
+printf '200\n300\n' > "$PQ/o/candidates.txt"
+printf '200\n300\n' > "$PQ/o/.pool"
+rm -f "$PQ/o/candidates.product.txt"
+( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log4" 2>&1
+if [ ! -e "$PQ/o/candidates.product.txt" ] && [ ! -e "$PQ/o/.product.follow" ]; then rc=0
+else rc=1; echo "      an absent product file was CREATED (or left a temp behind): $(ls -a "$PQ/o" | tr '\n' ' ')"; fi
+ck "an ABSENT product queue is left absent — the follow invents no product work and leaves no temp file" $rc
+# D2) AN UNREADABLE PRODUCT PATH IS NAMED, NOT SILENT (review P3, cycle 8). Absent means "no split ever
+#     ran here"; a DIRECTORY on that path means the floor really is reading something this pass could not
+#     — and saying nothing about it is how a stale floor head becomes invisible. The pair discriminates:
+#     D above (absent) must be SILENT, D2 (unreadable) must say it could not be re-sequenced.
+printf '200\n300\n' > "$PQ/o/candidates.txt"
+printf '200\n300\n' > "$PQ/o/.pool"
+rm -f "$PQ/o/candidates.product.txt"
+mkdir -p "$PQ/o/candidates.product.txt"
+( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log5" 2>&1
+if [ -d "$PQ/o/candidates.product.txt" ] && grep -q 'not a readable regular file' "$PQ/log5" 2>/dev/null \
+   && ! grep -q 'not a readable regular file' "$PQ/log4" 2>/dev/null; then rc=0
+else rc=1; echo "      unreadable product path: log '$(tr '\n' '|' < "$PQ/log5" 2>/dev/null | head -c 240)'; absent case said it too: $(grep -c 'not a readable regular file' "$PQ/log4" 2>/dev/null)"; fi
+ck "an UNREADABLE product queue is NAMED (and an ABSENT one stays silent) — the floor head is never left stale in silence" $rc
+rmdir "$PQ/o/candidates.product.txt" 2>/dev/null || true
+# 12a) NON-VACUITY by MUTATION: make `product_queue_follow` a no-op (`return 0` as its first statement)
+#      and the stale-case assertion must RED — the product file stays a pass behind.
+MUT_NOFOLLOW="$TMP/fns-nofollow.sh"
+sed '/^product_queue_follow() {$/a\  return 0' "$FNS" > "$MUT_NOFOLLOW"
+if awk '/^product_queue_follow\(\) \{/{getline; if ($0 ~ /return 0/) found=1} END{exit !found}' "$MUT_NOFOLLOW"; then rc=0
+else rc=1; echo "      the no-op mutation did not apply — sed anchor drifted"; fi
+ck "the no-op mutation applied to the extracted product_queue_follow (a \`return 0\` as its first statement)" $rc
+{
+  echo 'QUEUE_ORDER_STATE=""'
+  cat "$MUT_NOFOLLOW"
+  printf 'queue_order_from_pool "$1"\nproduct_queue_follow "$1"\n'
+} > "$PQ/drive-mut.sh"
+printf '200\n300\n' > "$PQ/o/candidates.txt"
+printf '300\n200\n' > "$PQ/o/.pool"
+printf '200\n300\n' > "$PQ/o/candidates.product.txt"
+( cd "$PQ" && HOME="$PQ" bash drive-mut.sh "$PQ/o" ) > "$PQ/mutlog" 2>&1
+if [ "$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" | sed 's/ *$//')" = "200 300" ] \
+   && [ "$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt")" = "200" ]; then rc=0
+else
+  mut_prod="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" | sed 's/ *$//')"
+  rc=1; echo "      the NO-OP mutant still moved the product file to '$mut_prod' — check 12 proves nothing"
+fi
+ck "non-vacuity: with product_queue_follow disabled the floor's head stays on the stale row ('200'), which is what check 12 reds on" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

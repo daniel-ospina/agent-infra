@@ -4006,6 +4006,75 @@ queue_order_from_pool() {
   fi
   return 0
 }
+# product_queue_follow <O> -> re-sequences candidates.product.txt onto candidates.txt's order
+# ⛔ THE FLOOR'S HEAD COMES FROM A DIFFERENT FILE (review P2, cycle 7). `orch-loop.sh`'s `floor_order`
+# walks `candidates.product.txt` in ITS OWN order and takes up to `PRODUCT_FLOOR` (default 1) entries
+# that ALSO live in `candidates.txt` — so the product file's SEQUENCE, not merely its membership, picks
+# the row that fills the floor slot. On a MAIN pass `write_product_queues` derives both class files from
+# candidates.txt and the two agree by construction; on a SKIPPED pass this pass re-orders
+# candidates.txt and returns BEFORE that split, so the product file keeps the PREVIOUS pass's sequence
+# while the queue it is intersected with moves — leaving the floor's head chosen by an order this pass
+# no longer maintains. Reproduced: queue `300 200`, pool `200 300`, product `300`; after the skip the
+# queue is `200 300` and `floor_order` still took `300` out of the product file
+# ⛔ ORDER, NEVER MEMBERSHIP, again: the product file is re-sequenced INTO the queue's order; a product
+# row candidates.txt does not hold is KEPT (in its own order) instead of dropped, because dropping it
+# here would be a silent membership change in the one file the floor reads. The row SET is compared,
+# not assumed, before the write — and an unchanged sequence writes nothing, the same
+# no-needless-rewrite reasoning as the queue install (a swap here would race the same sort of reader).
+# ⛔ AN ABSENT product file is the documented unmet-floor case (a repo that is not a PRODUCT_REPOS, or
+# a listing that could not answer): nothing is CREATED here, because inventing one would manufacture
+# product work out of a classification this pass never made. An existing-but-UNREADABLE one is named
+# (see the two cases separated below), because there the floor really is reading something this pass
+# could not.
+product_queue_follow() {
+  local o="${1:-}" pf tmp _before _after
+  [ -n "$o" ] || return 1
+  pf="$o/candidates.product.txt"
+  # ⛔ AN ABSENT FILE AND AN UNREADABLE ONE ARE NOT THE SAME STATE (review P3, cycle 8). ABSENT is the
+  # documented unmet-floor case (a repo that is not a PRODUCT_REPOS, or a listing that could not answer)
+  # and is silent on purpose: there is nothing to follow, and creating a file here would manufacture
+  # product work out of a classification this pass never made. An existing-but-unreadable/non-regular
+  # file is the OTHER state — the floor's head IS being taken from a path this pass could not read — and
+  # silence about it is how a stale floor head becomes invisible.
+  [ -e "$pf" ] || return 0
+  if [ ! -f "$pf" ] || [ ! -r "$pf" ]; then
+    echo "[refresh] WARN queue order: $pf EXISTS but is not a readable regular file — it was NOT re-sequenced this pass, so the product floor's head is whatever that path now holds, not this pass's order"
+    return 0
+  fi
+  tmp="$o/.product.follow"
+  # The QUEUE's order first, then any product row the queue does not hold, in the order the product
+  # file has it. `FILENAME == ARGV[1]` for the same reason the rank uses it: it is the file's
+  # IDENTITY, so an empty or unreadable queue cannot make the product file's own records pass for the
+  # queue's (with `NR == FNR` a zero-record first file would re-emit the product rows THROUGH the
+  # queue branch, i.e. a re-sequence derived from the wrong file).
+  if ! awk -v pf="$pf" '
+        BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
+        FILENAME == ARGV[1] { if (($0 in prod) && !($0 in out)) { out[$0] = 1; print } next }
+        { if (!($0 in out)) { out[$0] = 1; print } }
+      ' "$o/candidates.txt" "$pf" > "$tmp" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    echo "[refresh] WARN queue order: candidates.product.txt could NOT be re-sequenced this pass — it keeps the PREVIOUS pass's order, so the product floor's head may be chosen by a sequence the queue no longer has"
+    return 0
+  fi
+  _before="$(LC_ALL=C sort -u "$pf" 2>/dev/null)"
+  _after="$(LC_ALL=C sort -u "$tmp" 2>/dev/null)"
+  if [ "$_before" != "$_after" ]; then
+    rm -f "$tmp" 2>/dev/null
+    echo "[refresh] WARN queue order: re-sequencing candidates.product.txt would have CHANGED its row set — NOTHING was written, so it keeps the PREVIOUS pass's order (and its membership, which the floor relies on)"
+    return 0
+  fi
+  if cmp -s "$tmp" "$pf" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    return 0
+  fi
+  if ! mv -f "$tmp" "$pf" 2>/dev/null; then
+    rm -f "$tmp" 2>/dev/null
+    echo "[refresh] WARN queue order: candidates.product.txt could not be re-sequenced (the move failed) — it keeps the PREVIOUS pass's order, so read the floor's head as possibly stale"
+    return 0
+  fi
+  echo "[refresh] queue order: candidates.product.txt re-sequenced onto the queue's order ($(wc -l < "$pf" 2>/dev/null | tr -d ' ') row(s)) — the product floor's head now comes from the same order dispatch walks"
+  return 0
+}
 # The previous pass's record, parsed strictly. Four fields, all required, none guessed.
 PREV_DIGEST=""; PREV_EPOCH=""; PREV_STATE=""; PREV_EXHAUSTED=""
 if [ -r "$POOL_TOKEN" ]; then
@@ -4032,6 +4101,12 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     # here is how the head could stay a `P2-moderate` through an unchanged-input window (measured
     # 2026-11-01: head #2944 for 23 minutes of skipped passes).
     queue_order_from_pool "$O" || true
+    # ⛔ AND THE PRODUCT QUEUE FOLLOWS IT, because this arm returns BEFORE the split that would
+    # otherwise derive it (review P2, cycle 7). `candidates.product.txt` is what the product floor picks
+    # its head from, and the floor INTERSECTS it with candidates.txt — so leaving it a pass behind does
+    # not change membership, it changes WHICH product row takes the floor slot. On the skip-heavy steady
+    # state this PR itself describes, that was the one order this pass did not maintain.
+    product_queue_follow "$O" || true
     # ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY ONE — and this arm used to type exactly that (review P2,
     # cycle 5). `head`/`wc -l` on a candidates.txt that is a DIRECTORY (or unreadable) return nothing,
     # which coerced to `_skip_n=0` and printed "the queue is empty, so dispatch has nothing to take" — a
