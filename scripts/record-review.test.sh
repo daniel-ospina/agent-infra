@@ -5143,12 +5143,14 @@ assert_eq "$(dc_posts "$FL2_PR")" "1" \
 assert_contains "$FL2_OUT" "as a durable comment" \
     "14.10b3 …and says so, so the operator can tell the two channels apart [out: $(printf '%s' "$FL2_OUT" | tr '\n' ' ')]"
 # 14.10b4 NO SIGNEDNESS CLAIM ON THE FLUSH SUCCESS LINE (#3168 re-review P3). The
-#        pending file is written BEFORE the marker is signed, so an unsigned marker is
-#        exactly what a flush can be holding — this line said "the pending signed
-#        marker", the same false noun the two exit-5 arms were corrected for. Same
-#        class, third site, and it was the one the PR's own prose quotes. Driven
-#        through the CLI on an UNSIGNED pending marker (produced by a key-less run
-#        whose body PATCH failed, i.e. the production shape), and asserted as a PAIR:
+#        marker is signed BEFORE it is persisted, so a KEYED run's pending file does
+#        carry a `sig=` — but both body-channel arms are reachable with MARKER_SIGNED=0
+#        (no gate key, or openssl producing nothing: a warning then CONTINUES), so an
+#        unsigned marker is exactly what a flush can be holding. This line said "the
+#        pending signed marker", the same false noun the two exit-5 arms were corrected
+#        for. Same class, third site, and it was the one the PR's own prose quotes.
+#        Driven through the CLI on an UNSIGNED pending marker (produced by a key-less
+#        run whose body PATCH failed, i.e. the production shape), and asserted as a PAIR:
 #        the honest noun is present, the false one is absent — so a revert reddens the
 #        negative instead of passing on an empty capture.
 FL3_PR=424351

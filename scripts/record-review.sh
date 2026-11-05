@@ -1757,11 +1757,14 @@ if [ "$FLUSH_PENDING" -eq 1 ]; then
   fi
   if flush_pending_markers "$REPO" "$PR"; then
     # ⛔ NO SIGNEDNESS CLAIM (#3168 re-review P3): this arm is reached with MARKER_SIGNED=0
-    # too. Every `marker_pending_write` call in the body-channel arms persists the bytes
-    # BEFORE the marker is signed, so an unsigned marker is exactly what a flush can be
-    # holding — and this line used to call it "signed", the same false noun the two exit-5
-    # arms were corrected for in 673edf9f. `--flush-pending` cannot know either way: it
-    # delivers whatever bytes the pending file holds. So the noun says only what is observed.
+    # too. The marker IS signed before it is persisted (the signing block runs above, and
+    # a keyed run's pending file does carry a `sig=` — measured), so the reason is NOT an
+    # ordering: it is that BOTH body-channel arms are reachable with MARKER_SIGNED=0 — no
+    # gate key, or openssl producing nothing, prints a warning and CONTINUES. The bytes a
+    # flush holds therefore need not carry a `sig=` at all, and `--flush-pending` cannot
+    # know which case it is: it delivers whatever the pending file holds. This line used
+    # to call them "the pending signed marker" — the same false noun the two exit-5 arms
+    # were corrected for in 673edf9f. So the noun says only what is observed.
     echo "record-review.sh --flush-pending: delivered the pending marker for ${REPO}#$PR to the PR body — no new review was owed and none was recorded"
     exit 0
   fi
