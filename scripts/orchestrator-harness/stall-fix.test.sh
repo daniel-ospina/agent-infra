@@ -469,6 +469,15 @@ echo "── §F the age's PROVENANCE reaches both sinks this script owns ──
 # The pre-fix `case` accepted only `synth|measured` and silently rewrote `unmeasured` to `measured`,
 # which asserted a reading this box never took on BOTH surfaces.
 #
+# ⛔ THIS BLOCK PINS THE CONSUMER ONLY — THE PRODUCER IS PINNED IN `pr-dispatch.test.sh` (fresh-context
+# review of #3380, 2026-11-05, P2). `_AGESRC` is supplied by these legs and `f1` relies on the
+# `:-measured` default, so on its own this block cannot see the OTHER half of the interface: delete
+# `_AGESRC="${_agesrc:-measured}"` from `orch-loop.sh`'s call and this suite stays green while every
+# real dispatch falls back to `measured` — the #3181 P1, restored, with nothing red. The legs there
+# record the provenance the fixer was actually HANDED (`1|measured`, `1|synth`, `1|unmeasured`), so an
+# interface is now pinned at both ends; this note says which end lives where so neither reads as
+# covering the whole handoff.
+#
 # ⛔ THIS NOTE CITES CODE BY NAME, NEVER BY LINE NUMBER (review cycles 2 and 3 of #3181, 2026-11-03).
 # Two cycles in a row found a pointer here that had silently gone stale: every edit ABOVE a cited line
 # shifts it, so a maintainer who follows the number lands on a comment or a blank line, mutates
