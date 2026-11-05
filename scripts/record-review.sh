@@ -1131,7 +1131,8 @@ post_marker() { # <repo> <pr> <marker> -> 0 present/posted, 1 post failed, 2 bod
   # and by every later minting run — and it is the one that can DESTROY the marker:
   # unanchored `-qF` read a body that merely CITES the marker mid-line as "already
   # present", so it PATCHed nothing, flush_pending_markers() `rm -f`'d the pending
-  # file, and the caller printed "delivered the pending signed marker". Silent loss
+  # file, and the caller printed "delivered the pending signed marker" (the wording
+  # before #3168 — see the success line below, which now claims no signedness). Silent loss
   # of the only copy of the signed bytes, reported as success (a false PASS).
   # ⛔ The here-string is also what makes the SIGPIPE class impossible here (#841/#864,
   # the idiom scripts/check-no-sigpipe-grep.sh guards): `grep -q` exits at the first
@@ -1755,7 +1756,13 @@ if [ "$FLUSH_PENDING" -eq 1 ]; then
     exit 0
   fi
   if flush_pending_markers "$REPO" "$PR"; then
-    echo "record-review.sh --flush-pending: delivered the pending signed marker for ${REPO}#$PR to the PR body — no new review was owed and none was recorded"
+    # ⛔ NO SIGNEDNESS CLAIM (#3168 re-review P3): this arm is reached with MARKER_SIGNED=0
+    # too. Every `marker_pending_write` call in the body-channel arms persists the bytes
+    # BEFORE the marker is signed, so an unsigned marker is exactly what a flush can be
+    # holding — and this line used to call it "signed", the same false noun the two exit-5
+    # arms were corrected for in 673edf9f. `--flush-pending` cannot know either way: it
+    # delivers whatever bytes the pending file holds. So the noun says only what is observed.
+    echo "record-review.sh --flush-pending: delivered the pending marker for ${REPO}#$PR to the PR body — no new review was owed and none was recorded"
     exit 0
   fi
   echo "⛔ body-marker-unposted: the pending marker for ${REPO}#$PR is STILL not in the body (gh refused, the API is throttled, the body could not be read, or the pending file is EMPTY — see the reason above). It is KEPT at ${FP_FILE/#$HOME/~} for a later --flush-pending; this is not a re-review and not a new record. If the file is empty, re-run the recorder at the same head with gh available so the marker is rebuilt from the record." >&2

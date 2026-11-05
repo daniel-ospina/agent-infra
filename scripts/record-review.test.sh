@@ -96,7 +96,12 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 #   rerun (-X POST … /rerun)      → 201; exit 1 when STUB_RERUN_FAIL=1
 #   comments (… /issues/<n>/comments) → the DURABLE comment channel (#3168):
 #                                   READ (--paginate … --jq) prints
-#                                   ${STUB_COMMENT_BODIES:-} verbatim, or a
+#                                   ${STUB_COMMENT_BODIES:-} verbatim, or — when
+#                                   the ENVELOPE fixture ${STUB_COMMENT_JSON:-} is
+#                                   set — applies the caller's OWN --jq
+#                                   expression to it with the real `jq` (so the
+#                                   admission predicate is tested where it is
+#                                   USED, not where it is defined), or a
 #                                   NON-EMPTY error body on STDOUT with exit 1
 #                                   when STUB_COMMENT_FAIL=1 (the `gh api`
 #                                   shape that must never be read as "no
@@ -186,6 +191,26 @@ if [ "$1" = "api" ]; then
         if [ "${STUB_COMMENT_FAIL:-0}" = "1" ]; then
             printf '%s\n' '{"message":"API rate limit exceeded","status":"403"}'
             exit 1
+        fi
+        # ⛔ MODEL --jq, DO NOT IGNORE IT (#3168 re-review P3). The dedup read passes
+        # the admission constant as `--jq`, and a stub that printed its fixture
+        # verbatim made every assertion about that constant a pin on SOURCE TEXT:
+        # measured, swapping the read's `--jq "$PR_EVIDENCE_COMMENTS_JQ"` for
+        # `--jq '.[] | .body'` left the suite GREEN with the constant defined-but-dead.
+        # When a JSON ENVELOPE fixture is supplied, apply the CALLER'S OWN expression
+        # to it with the real jq — the same shape real gh has — so the admission set
+        # is exercised where it is USED. STUB_COMMENT_BODIES stays verbatim, so every
+        # vector written before this arm keeps its exact behaviour.
+        if [ -n "${STUB_COMMENT_JSON:-}" ]; then
+            _cjq="" _cprev=""
+            for _carg in "$@"; do
+                if [ "$_cprev" = "--jq" ]; then _cjq="$_carg"; break; fi
+                _cprev="$_carg"
+            done
+            if [ -n "$_cjq" ]; then
+                jq -r "$_cjq" <<<"$STUB_COMMENT_JSON" || exit 1
+                exit 0
+            fi
         fi
         [ -n "${STUB_COMMENT_BODIES:-}" ] && printf '%s\n' "${STUB_COMMENT_BODIES}"
         exit 0
@@ -4563,6 +4588,10 @@ run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
         # (a NON-EMPTY error body on STDOUT plus a non-zero exit), and capture the
         # posted comment body for the idempotency vector.
         export STUB_COMMENT_BODIES="${STUB_COMMENT_BODIES:-}"
+        # #3168 re-review P3: the ENVELOPE fixture the stub applies the caller's own
+        # `--jq` to. Without it the admission constant could only be pinned as SOURCE
+        # TEXT (measured: the drop-the-filter mutant stayed GREEN).
+        export STUB_COMMENT_JSON="${STUB_COMMENT_JSON:-}"
         export STUB_COMMENT_FAIL="${STUB_COMMENT_FAIL:-0}"
         export STUB_COMMENT_POST_FAIL="${STUB_COMMENT_POST_FAIL:-0}"
         export STUB_COMMENT_CAPTURE="${STUB_COMMENT_CAPTURE:-}"
@@ -4796,21 +4825,47 @@ assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the r
 #     permanent, so it must never be published to that channel.
 AI_REVIEW_GATE_KEY="" STUB_COMMENT_CAPTURE="$T/ccap_d" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d an UNSIGNED marker is never published as a comment"
-# (d-g) THE ADMISSION CONSTANT IS PINNED (#3168 re-review finding 3). It is the
-#       ONLY author filter on a permanent public channel AND the predicate the dedup
-#       matches against, yet it appeared nowhere in this suite: replacing it with
-#       `.[] | .body` left the suite GREEN because the stub ignores `--jq`. Once
-#       merged nothing re-checks the producer's copy against the gate's, so a
-#       dropped filter (any drive-by comment quoting the marker suppresses the
-#       durable post) or a typo'd field (dedup never matches ⇒ one duplicate
-#       permanent comment per run, forever) was invisible. Pins all three admitted
-#       associations, which is what the gate's byte-identical copy lists.
-assert_contains "$(cat "$RECORD")" 'author_association == "OWNER"' \
-    "14.1d(g) the comment admission constant filters by author_association (a drive-by comment must not suppress the durable post)"
-assert_contains "$(cat "$RECORD")" 'author_association == "MEMBER"' \
-    "14.1d(g) …and admits MEMBER"
-assert_contains "$(cat "$RECORD")" 'author_association == "COLLABORATOR"' \
-    "14.1d(g) …and admits COLLABORATOR (all three the gate admits)"
+# (d-g) THE ADMISSION CONSTANT IS PINNED **BEHAVIOURALLY** (#3168 re-review finding 3,
+#       cycle 2). It is the ONLY author filter on a permanent public channel AND the
+#       predicate the dedup matches against. The first version of this pin asserted the
+#       constant's TEXT in the recorder's source — "pins all three admitted associations"
+#       — which is not the behaviour: measured, swapping the dedup read's
+#       `--jq "$PR_EVIDENCE_COMMENTS_JQ"` for `--jq '.[] | .body'` left all three
+#       assertions GREEN, because the stub ignored `--jq` and printed its fixture
+#       verbatim. The constant was therefore pinned where it is DEFINED and nowhere
+#       where it is USED, and the consequence of the mutant is real: a drive-by comment
+#       quoting the marker would suppress the durable post forever.
+#       So the stub now applies the CALLER'S OWN `--jq` to a JSON ENVELOPE fixture
+#       (STUB_COMMENT_JSON), and the pin is a pair that discriminates: the SAME marker,
+#       ALONE ON A LINE, from authors on either side of the filter, must produce
+#       OPPOSITE POST counts. Per-association runs, so dropping any ONE association from
+#       the filter reddens exactly that run instead of hiding behind the others.
+# ⛔ EVERY run below reuses $DC_PR, ON PURPOSE. The marker embeds `reviews/<pr>.json`,
+#    so a fixture built from PR N's marker can never match a run on PR M — the first
+#    draft of this block used four fresh PR numbers and posted 1 for every admitted
+#    vector (measured), i.e. it would have "passed" the drive-by half and reddened the
+#    admitted half for a reason that has nothing to do with the filter.
+if [ -n "$DC_MARKER" ]; then
+    for ADM_ASSOC in OWNER MEMBER COLLABORATOR; do
+        STUB_COMMENT_JSON="$(jq -nc --arg m "$DC_MARKER" --arg a "$ADM_ASSOC" \
+            '[{author_association: $a, body: $m}]')" \
+            STUB_COMMENT_CAPTURE="$T/ccap_g_$ADM_ASSOC" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+        assert_eq "$(dc_posts "$DC_PR")" "0" \
+            "14.1d(g) an ADMITTED $ADM_ASSOC comment already carrying the marker suppresses the duplicate"
+    done
+    STUB_COMMENT_JSON="$(jq -nc --arg m "$DC_MARKER" \
+        '[{author_association: "NONE", body: $m}, {author_association: "FIRST_TIMER", body: $m}]')" \
+        STUB_COMMENT_CAPTURE="$T/ccap_g_driveby" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+    assert_eq "$(dc_posts "$DC_PR")" "1" \
+        "14.1d(g) …while an UNADMITTED author's comment carrying the SAME marker does NOT suppress it (drop-the-filter mutant: 0)"
+    if [ -s "$T/ccap_g_driveby" ]; then
+        ok "14.1d(g) …and the post it makes carries a body (the vector is not judging an empty capture)"
+    else
+        bad "14.1d(g) the drive-by vector captured no POST body — it would pass on a post that never happened"
+    fi
+else
+    bad "14.1d(g) vector SKIPPED — the marker fixture is empty (14.1d's first vector captured nothing)"
+fi
 # (d-f) THE POST-FAILURE ARM (#3168 re-review finding 4). Nothing exercised it:
 #       `STUB_COMMENT_POST_FAIL` was defined by the stub and exported by the harness
 #       but NO vector ever set it, so swapping the failure line for the SUCCESS line
@@ -5087,6 +5142,36 @@ assert_eq "$(dc_posts "$FL2_PR")" "1" \
     "14.10b3 the flush publishes the durable comment even when its body PATCH FAILS (ordering, not luck)"
 assert_contains "$FL2_OUT" "as a durable comment" \
     "14.10b3 …and says so, so the operator can tell the two channels apart [out: $(printf '%s' "$FL2_OUT" | tr '\n' ' ')]"
+# 14.10b4 NO SIGNEDNESS CLAIM ON THE FLUSH SUCCESS LINE (#3168 re-review P3). The
+#        pending file is written BEFORE the marker is signed, so an unsigned marker is
+#        exactly what a flush can be holding — this line said "the pending signed
+#        marker", the same false noun the two exit-5 arms were corrected for. Same
+#        class, third site, and it was the one the PR's own prose quotes. Driven
+#        through the CLI on an UNSIGNED pending marker (produced by a key-less run
+#        whose body PATCH failed, i.e. the production shape), and asserted as a PAIR:
+#        the honest noun is present, the false one is absent — so a revert reddens the
+#        negative instead of passing on an empty capture.
+FL3_PR=424351
+AI_REVIEW_GATE_KEY="" STUB_PATCH_FAIL=1 run_record_633 "$FL3_PR" "$SHA" '[]'
+PEND14C="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$FL3_PR.marker"
+if [ -f "$PEND14C" ]; then
+    if grep -qF -- " sig=" "$PEND14C"; then
+        bad "14.10b4 fixture is SIGNED — this vector would not test the noun (pending file carries a sig=)"
+    else
+        ok "14.10b4 fixture: a key-less body-PATCH failure left an UNSIGNED pending marker"
+    fi
+    : > "$LOG"; FL3_RC=0
+    FL3_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
+        STUB_BODY="PR body — no review evidence yet" \
+        bash "$RECORD" --flush-pending "$FL3_PR" daniel-ospina/agent-infra 2>&1)" || FL3_RC=$?
+    assert_contains "$FL3_OUT" "delivered the pending marker" \
+        "14.10b4 the flush success line names the pending marker it delivered [out: $(printf '%s' "$FL3_OUT" | tr '\n' ' ')]"
+    assert_not_contains "$FL3_OUT" "pending signed marker" \
+        "14.10b4 …and does NOT call an unsigned marker 'signed' (the noun the exit-5 arms were corrected for)"
+    assert_eq "$FL3_RC" "0" "14.10b4 …and the flush still succeeds (the wording change is not a behaviour change)"
+else
+    bad "14.10b4 vector SKIPPED — no pending marker was written; the noun pin did NOT run"
+fi
 assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
 # 14.10d an EMPTY pending file is NOT a delivered marker (cycle-2 P1: the helper
 #       used to `rm -f` it and return 0, so the flush claimed delivery and then
