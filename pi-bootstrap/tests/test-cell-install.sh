@@ -1593,7 +1593,7 @@ json.dump(d, open(p, "w"), indent=2)
 PY
 run_install
 python3 - "$DEST/.mcp.json" <<'PY' && ok "a self-hosted entry declaring its own transport is PRESERVED (the client ignores type)" \
-  || fail "install replaced a working self-hosted entry because of its `type` — the operator's daemon is destroyed and they are pointed at a hosted endpoint they have no key for"
+  || fail "install replaced a working self-hosted entry because of its \`type\` — the operator's daemon is destroyed and they are pointed at a hosted endpoint they have no key for"
 import json, sys
 t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
 sys.exit(0 if t.get("url") == "http://localhost:8000/mcp" else 1)
@@ -2153,21 +2153,48 @@ rc=$?
   || fail "a HOME-less run with a 0600 \$CELL_HOME/keys.env did not resolve from it (rc=$rc) — the credential source is the one thing the layer cannot lose to a HOME problem, and the arm above cannot tell 'the loop ran and found nothing' from 'the loop never ran'"
 rm -f "$CELL_HOME/keys.env"
 
-# ⛔ A NON-STRING `Authorization` IS ITS OWN STATE, NOT "no readable entry" (#3374 review P3). The first
-# fix moved the AttributeError inside the `try` but let it fall through to NOENTRY, so the note told an
-# operator that a perfectly healthy `.mcp.json` could not be read — the mirror image of the bug it
-# replaced, and it points at recreating the file instead of at the line that is wrong (BADAUTH:int).
-# The note only runs on the --verify SUCCESS path, which a BADAUTH file never reaches, so this arm
-# drives the resolver the note reads — extracted from the installer under test, never re-implemented.
+# ⛔ NO UNESCAPED BACKTICK IN A MESSAGE THAT IS PART OF AN ASSERTION (#3374 review, round 9). Two
+# `fail` messages carried one, and a backtick inside a double-quoted string is COMMAND SUBSTITUTION:
+# the suite ran `--verify` from inside a `fail` argument (measured: `line 2053: --verify: command not
+# found` above a message with a hole where the word belongs) and ran `type` at :1428. The arm still
+# reddened, so nothing was hidden — but the sentence an operator reads on a red was broken, and a
+# SUITE must never execute a word it is only trying to print. Escaped at both sites; this guard is
+# what keeps the next one from being written, and it is a plain line scan, not a parse.
+bad_bt="$(awk -v bt="$(printf '\140')" '
+  /^[[:space:]]*(\|\|[[:space:]]*)?(ok|fail) "/ {
+    s = $0; gsub("\\\\" bt, "", s)
+    if (index(s, bt) > 0) printf "%d:%s\n", NR, $0
+  }' "${BASH_SOURCE[0]}")"
+[ -z "$bad_bt" ] \
+  && ok "no unescaped backtick inside any ok/fail message (one there would EXECUTE from inside the assertion)" \
+  || fail "an ok/fail message carries an unescaped backtick, so the suite executes it: $bad_bt"
+
+# ⛔ A MALFORMED ENTRY IS ITS OWN STATE, NOT "no readable entry" AND NOT "needs no key" (#3374 review
+# P3, then round 9). The note only runs on the --verify SUCCESS path, which a refused file never
+# reaches, so this arm drives the resolver the note reads — extracted from the installer under test,
+# never re-implemented. EVERY sibling shape is pinned here, because fixing only the non-string auth
+# left the other two borrowing the wrong sentence (measured: headers-as-string rendered "there is no
+# readable tortoise entry" about a file that reads perfectly, whitespace-only rendered "declares no
+# Authorization" about an entry that declares one) while --verify said BADDERS:str / LITERAL_AUTH.
 mcp_var_for() {   # mcp_var_for <dest-dir> — run the installer's OWN graph_mcp_var against that DEST
   DEST="$1" bash -c 'eval "$(sed -n "/^graph_mcp_var()/,/^}/p" "$1")"; graph_mcp_var' _ "$INSTALLER" 2>/dev/null
 }
 BADSHAPE_DEST="$TMP/badshape"; mkdir -p "$BADSHAPE_DEST"
-printf '{"mcpServers":{"tortoise":{"url":"https://api.premiselabs.co/mcp/","headers":{"Authorization":12345}}}}' > "$BADSHAPE_DEST/.mcp.json"
-BADSHAPE_VAR="$(mcp_var_for "$BADSHAPE_DEST")"
-[ "$BADSHAPE_VAR" = "BADSHAPE" ] \
-  && ok "a non-string Authorization resolves to BADSHAPE — its own state, not \"no readable entry\" (a healthy .mcp.json must never be reported as missing or as keyless)" \
-  || fail "a non-string Authorization resolved to '${BADSHAPE_VAR:-<empty>}' — 'no readable entry' tells the operator to recreate a file that reads perfectly, and empty is the old 'declares no Authorization' lie; the real cause is BADAUTH:int"
+for SHAPE in 'non-string auth|"headers":{"Authorization":12345}|BADSHAPE:BADAUTH:int' \
+             'string headers|"headers":"Bearer ${TORTOISE_MCP_API_KEY}"|BADSHAPE:BADDERS:str' \
+             'blank auth|"headers":{"Authorization":"   "}|LITERAL' \
+             'non-object entry|__NOE__|NOENTRY'; do
+  KIND="${SHAPE%%|*}"; REST="${SHAPE#*|}"; EXPFOR="${REST##*|}"; BODY="${REST%|*}"
+  if [ "$BODY" = "__NOE__" ]; then
+    printf '{"mcpServers":{"tortoise":"nope"}}' > "$BADSHAPE_DEST/.mcp.json"
+  else
+    printf '{"mcpServers":{"tortoise":{"url":"https://api.premiselabs.co/mcp/",%s}}}' "$BODY" > "$BADSHAPE_DEST/.mcp.json"
+  fi
+  GOT="$(mcp_var_for "$BADSHAPE_DEST")"
+  [ "$GOT" = "$EXPFOR" ] \
+    && ok "resolver: $KIND → $EXPFOR (its own state — a healthy .mcp.json is never reported as unreadable or keyless)" \
+    || fail "resolver: $KIND → '${GOT:-<empty>}' (expected $EXPFOR) — the note then contradicts --verify about the same file, and the empty case is the old 'declares no Authorization' lie; the real cause is a shape --verify names"
+done
 
 # ⛔ THE FILE PATH OF THE ALIAS RESOLVER IS THE WHOLE POINT OF THE RESOLVER, AND IT HAD NO COVERAGE.
 # Every arm above feeds the credential through the ENVIRONMENT, so `graph_key_from_env_file` could
@@ -2218,7 +2245,7 @@ if [ "$rc" -eq 0 ] \
    && grep -q 'graph credential: UNRESOLVED' <<<"$cert_line"; then
   ok "a GROUP-WRITABLE keys.env is refused as a credential source (not sourced, not hidden), and the cell still certifies with UNRESOLVED"
 else
-  fail "a group-writable keys.env was SOURCED (rc=$rc) — `--verify` would execute a file any local user can rewrite, as the provisioning user (log: $LOG)"
+  fail "a group-writable keys.env was SOURCED (rc=$rc) — \`--verify\` would execute a file any local user can rewrite, as the provisioning user (log: $LOG)"
 fi
 chmod 600 "$CELL_HOME/keys.env"
 HOME="$MODHOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \

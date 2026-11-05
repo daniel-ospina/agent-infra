@@ -299,30 +299,39 @@ graph_mcp_var() {
   command -v python3 >/dev/null 2>&1 || { printf 'NOENTRY'; return 0; }
   python3 -c '
 import json, sys
+# ⛔ READ vs SHAPE ARE TWO QUESTIONS, AND EACH SHAPE ERROR MUST CARRY THE MARKER `--verify` USES
+# (#3374 review, round 9). The previous pass gave a non-string Authorization its own state but left
+# its SIBLINGS borrowing one: `"headers": "Bearer …"` fell through to NOENTRY ("there is no readable
+# tortoise entry" about a file that reads perfectly, while --verify said BADDERS:str), and a
+# whitespace-only Authorization fell through to NOAUTH ("this entry declares no Authorization" about
+# an entry that declares one, while --verify said LITERAL_AUTH). The two renderers contradicted each
+# other about the SAME file — the exact class this marker set exists to close, one line over. So a
+# shape error now prints `BADSHAPE:<the marker verify will print>`, and the note quotes it.
 try:
-    t = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]
-    if not isinstance(t, dict):
-        raise ValueError("tortoise entry is not an object")
-    auth = (t.get("headers") or {}).get("Authorization") or ""
-    # ⛔ THE TYPE CHECK BELONGS INSIDE THE `try`, AND IT MUST NOT BORROW ANOTHER MARKER (#3374 review P3).
-    # `auth.strip()` sat OUTSIDE the try, so `"Authorization": 12345` raised AttributeError, the
-    # `2>/dev/null` on this command swallowed the traceback and printed NOTHING — which the caller
-    # renders as GRAPH_NOAUTH, i.e. "this entry declares no Authorization" about an entry that
-    # declares one. Raising here would trade that for a DIFFERENT false sentence (NOENTRY: "no
-    # readable entry") about a file that reads perfectly, so it gets its own marker.
-    if not isinstance(auth, str):
-        print("BADSHAPE")
-        sys.exit(0)
-    if not auth.strip():
-        sys.exit(0)                 # no Authorization AT ALL: the documented self-host shape
-    if "${" not in auth:
-        print("LITERAL")            # a literal credential --verify refuses (LITERAL_AUTH)
-        sys.exit(0)
-    name = auth.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
-    print(name)
+    entry = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]
 except Exception:
-    print("NOENTRY")                # unreadable / no such entry — NOT "declares no Authorization"
+    print("NOENTRY")           # the FILE or the entry cannot be READ at all — never "needs no key"
     sys.exit(0)
+if not isinstance(entry, dict):
+    print("NOENTRY")           # same marker the verifier prints for this shape: the two agree
+    sys.exit(0)
+headers = entry.get("headers")
+if headers is not None and not isinstance(headers, dict):
+    print("BADSHAPE:BADDERS:%s" % type(headers).__name__)
+    sys.exit(0)
+auth = ((headers or {}).get("Authorization") or "")
+if not isinstance(auth, str):
+    print("BADSHAPE:BADAUTH:%s" % type(auth).__name__)
+    sys.exit(0)
+if not auth:
+    sys.exit(0)                 # no Authorization AT ALL: the documented self-host shape
+if "${" not in auth:
+    # present but not env-indirect — INCLUDING whitespace-only, which is truthy: --verify refuses
+    # it (LITERAL_AUTH), so it must not be reported as "needs no key".
+    print("LITERAL")
+    sys.exit(0)
+name = auth.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
+print(name)
 ' "$DEST/.mcp.json" 2>/dev/null
 }
 
@@ -337,6 +346,7 @@ graph_key_resolve() {
   GRAPH_NOENTRY=0
   GRAPH_LITERAL=0
   GRAPH_BADSHAPE=0
+  GRAPH_BADSHAPE_WHY=""
   case "$GRAPH_VAR" in
     NOENTRY)
       # no readable tortoise entry at all — a DIFFERENT state from "an entry that needs no key",
@@ -344,10 +354,11 @@ graph_key_resolve() {
       GRAPH_NOENTRY=1
       GRAPH_VAR=""
       return 0 ;;
-    BADSHAPE)
-      # the entry reads, but its Authorization is not a string: there is no variable to resolve and
-      # --verify refuses the file (BADAUTH:int). NOT a missing entry, and NOT "needs no key".
+    BADSHAPE*)
+      # the entry READS, but its shape is one --verify refuses; the marker it will print travels with
+      # the state so the note quotes the same name. NOT a missing entry, and NOT "needs no key".
       GRAPH_BADSHAPE=1
+      GRAPH_BADSHAPE_WHY="${GRAPH_VAR#BADSHAPE:}"
       GRAPH_VAR=""
       return 0 ;;
     LITERAL)
@@ -411,7 +422,7 @@ graph_credential_state() {
     return 0
   fi
   if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
-    printf 'UNKNOWN — the tortoise entry Authorization is not a string, so there is no variable to resolve; --verify refuses it (BADAUTH:int)'
+    printf 'UNKNOWN — the tortoise entry is malformed (%s), so there is no variable to resolve; --verify refuses it by that name' "${GRAPH_BADSHAPE_WHY:-shape}"
     return 0
   fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
@@ -433,11 +444,11 @@ graph_credential_note() {
     return 0
   fi
   if [ "$GRAPH_LITERAL" -eq 1 ]; then
-    log_line "⚠️  graph credential: the tortoise entry carries a LITERAL credential in .mcp.json — a shared config file must be env-indirect (\${TORTOISE_MCP_API_KEY}), and --verify REFUSES this file (LITERAL_AUTH); move the key to \$HOME/keys.env (mode 600) and leave the file env-indirect"
+    log_line "⚠️  graph credential: the tortoise entry's Authorization is not env-indirect (no \${…} to expand) — nothing can be resolved from it, and --verify REFUSES this file (LITERAL_AUTH); write it as \"Bearer \${TORTOISE_MCP_API_KEY}\" and put the key in \$HOME/keys.env (mode 600)"
     return 0
   fi
   if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
-    log_line "⚠️  graph credential: UNKNOWN — the tortoise entry's Authorization is not a string (it must be \"Bearer \${TORTOISE_MCP_API_KEY}\"), so there is no variable to resolve and --verify REFUSES this file (BADAUTH:int); --install replaces the entry"
+    log_line "⚠️  graph credential: UNKNOWN — the tortoise entry is malformed (${GRAPH_BADSHAPE_WHY:-shape}), so there is no variable to resolve; --verify REFUSES this file by that name and --install replaces the entry"
     return 0
   fi
   if [ "$GRAPH_NOAUTH" -eq 1 ]; then
