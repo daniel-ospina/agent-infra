@@ -105,6 +105,10 @@ chmod +x "$DISPATCH"
 #   RUN_WT_MOD      worker-terminal.sh for the launcher census     default: a path that does not exist
 _drainer_env() { # <tag> → echoes the env assignments, one per line (callers use `env`)
   local o="$ROOT/o-$1" ai="$ROOT/ai-$1"
+  # The channel: the fixture seed by default, `RUN_FLEET_REPO` to name one, and `RUN_NO_FLEET_REPO=1` for
+  # "nothing configured" — a state the drainer must REFUSE by name rather than resolve to a lane checkout.
+  local _fleet_v="${RUN_FLEET_REPO:-$SEED}"
+  [ "${RUN_NO_FLEET_REPO:-0}" = 1 ] && _fleet_v=""
   mkdir -p "$o/bg" "$ai"
   printf '%s\n' \
     "O=$o" "AI=$ai" "DISPATCH=$DISPATCH" "SEED_REPO=$SEED" "SEED_REF=$SEED_REF" \
@@ -117,7 +121,7 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
     "LANE_TIMEOUT=${RUN_LANE_TIMEOUT:-60}" "PS=${RUN_PS:-ps}" \
     "SLICE_WIDTH=${RUN_SLICE_WIDTH:-10}" "SLICE_TOTAL=${RUN_SLICE_TOTAL:-70}" \
     "FAKE_LANE_SECS=${FAKE_LANE_SECS:-0}" "FAKE_RC=${FAKE_RC:-0}" "FAKE_NO_PIDFILE=${FAKE_NO_PIDFILE:-0}" \
-    "FLEET_REPO=${RUN_FLEET_REPO:-$SEED}" "CAPACITY_MOD=${RUN_CAPACITY_MOD:-}" "CAP_EXPECTED_BOXES=${RUN_EXPECTED:-}" \
+    "FLEET_REPO=${_fleet_v}" "CAPACITY_MOD=${RUN_CAPACITY_MOD:-}" "CAP_EXPECTED_BOXES=${RUN_EXPECTED:-}" \
     "FAKE_DISPATCH_SLEEP=${FAKE_DISPATCH_SLEEP:-0}" \
     "RC_GRACE_S=${RUN_RC_GRACE:-2}"
   return 0
@@ -136,7 +140,10 @@ run_drainer_fg() { # <tag> [drainer-path] → sets LAST_RC
   local -a envs
   envs=()
   while IFS= read -r line; do envs+=("$line"); done < <(_drainer_env "$tag")
-  env -u SWAP_FREE_MB -u SWAP_TOTAL_MB "${envs[@]}" bash "$script" >/dev/null 2>&1
+  # ⛔ THE OPERATOR'S `REPO` MUST NOT DECIDE THIS SUITE'S CHANNEL (fresh review round 7). The drainer's own
+  # default chain is `FLEET_REPO -> REPO -> (refuse)`, and a lane shell routinely exports `REPO` for its
+  # own work; inheriting it made (f3) read a REAL fleet channel instead of the fixture's originless seed.
+  env -u REPO -u SWAP_FREE_MB -u SWAP_TOTAL_MB "${envs[@]}" bash "$script" >/dev/null 2>&1
   LAST_RC=$?
   LAST_O="$ROOT/o-$tag"; LAST_AI="$ROOT/ai-$tag"
   return 0
@@ -158,7 +165,7 @@ reset_run() {
   RUN_TARGET=; RUN_MAX_LANES=; RUN_NCPU=; RUN_MEM=; RUN_LOAD=; RUN_SWAP=; RUN_SWAP_TOTAL=
   RUN_LANE_TIMEOUT=; RUN_SLICE_WIDTH=; RUN_SLICE_TOTAL=; RUN_RC_GRACE=; RUN_WT_MOD=; RUN_PS=
   RUN_DRAINER_OS=; RUN_PRESSURE=; RUN_MAX_PRESSURE=
-  RUN_FLEET_REPO=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
+  RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_CAPACITY_MOD=; RUN_EXPECTED=
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
 }
 # A lane-shaped live process in $O/bg, so the CENSUS sees it. A pidfile alone is not enough (the
@@ -932,6 +939,33 @@ run_drainer_fg fleet3
 FL3="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
 check "(f5) a STALE instrument is named as such (why=capacity.sh-incomplete, never 'unreachable': $(printf '%s' "$FL3" | head -1))" \
   'grep -q "why=capacity.sh-incomplete" <<<"$FL3" && ! grep -q "why=capacity.sh-unreachable" <<<"$FL3" && grep -q "published=UNREADABLE" <<<"$FL3"'
+reset_run
+# ⛔ A SKIPPING TICK STILL REPORTS THE FLEET (fresh review round 7, P2). The line is taken BEFORE the
+# guards for the same reason the beat is: a swap-bound or load-bound box skips every tick in steady state,
+# and a reading taken only after a dispatch would make every skip look like a silent fleet. Moving the
+# call below the guards (the plausible "fix" for a slow tick) left all five arms above green while every
+# skipping tick went blind — so the position itself is graded here. The skip is forced with LOAD (the
+# swap seam is deliberately unset by the harness so the real box cannot mask it).
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NCPU=4 RUN_LOAD=3300 RUN_MEM=8192 RUN_TARGET=
+run_drainer_fg skip
+FL6="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+SK6="$(grep 'SKIP' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | head -1)"
+check "(f6) a SKIPPING tick still logs its ONE fleet line ($(printf '%s' "$FL6" | head -1))" \
+  '[ "$(grep -c "fleet:" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)" -eq 1 ] && grep -q "fleet: expected=1 " <<<"$FL6" && grep -q "SKIP: load" "$LAST_AI/logs/ai-drainer.log"' \
+  "SKIP line: ${SK6:-<none>}"
+# ⛔ …AND A LANE CHECKOUT IS NOT THE FLEET CHANNEL (fresh review round 7, P1). Unset `FLEET_REPO`/`REPO`
+# used to fall back to `SEED_REPO` — this drainer's own lane checkout — so a tick read an agent-infra
+# origin and reported `published=0 INELIGIBLE=5` rc 0 for a healthy 3-of-5 fleet, naming every box
+# ineligible. Unset now REFUSES, by name, and never publishes a count it did not measure.
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NO_FLEET_REPO=1
+run_drainer_fg norepo
+FL7="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f7) no channel configured REFUSES by name, never a published=0 reading ($(printf '%s' "$FL7" | head -1))" \
+  'grep -q "why=channel-unverified" <<<"$FL7" && grep -q "published=UNREADABLE" <<<"$FL7" && grep -q "expected=UNKNOWN" <<<"$FL7"'
 reset_run
 
 echo

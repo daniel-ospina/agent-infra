@@ -294,12 +294,18 @@ VM listing — the reconciliation is `published − extra = expected − INELIGI
   unavailable`, `provider-inventory-unreadable`, `provider-inventory-unparseable`,
   `expected-count-unparseable`, `expected-count-unusable`, `expected-has-no-boxid`, `roster-empty`,
   `clock-unreadable`, `clock-skew`, `ttl-unreadable`, `identity-collision`, `channel-unreadable`,
-  `channel-timeout`). `expected-has-no-boxid` means the expectation was READ but cannot be matched
+  `channel-timeout`, `channel-unverified`). `expected-has-no-boxid` means the expectation was READ but cannot be matched
   record-for-record, so the line names what it can prove and says `INELIGIBLE=unknown` rather than a
   subtraction. Two of those are worth calling out because each was a fail-OPEN in the first
   cut of this line: an **unreadable clock** used to make every age negative (so every record looked
   fresh — the line certified a fleet from a clock it never read), and a roster that **tokenized to
   nothing** used to read as `expected=0`, a clean bill of health built from no material.
+- **`chan=`** — the channel the PUBLISHED side was read from (the origin URL, scheme and `.git`
+  stripped). `src=` names the *expected* source only, so without `chan=` a `published=0` was
+  unattributable — which is how the drainer reported a healthy 3-of-5 fleet as `published=0
+  INELIGIBLE=5` while reading a **lane** checkout whose origin is not the queue repo. `ai-drainer.sh`
+  no longer defaults `FLEET_REPO` to its own checkout: unset means `why=channel-unverified` (a refusal),
+  never a count taken from whatever repository happened to be at hand.
 
 **The polarity is the point**, and it is the same rule the fleet already applies to check-runs (a
 missing check is not a green check):
@@ -337,7 +343,10 @@ And the FILE applies to **every** arm, not just the watchdog: `timeout` / `gtime
 cell (and macOS with coreutils) takes — used to hand the child the caller's stdout, so a descendant that
 escaped the child's process group held the caller's `$( )` past the bound (measured: 1 s bound, 12 s
 caller block). The bound exists so the reading can be taken inside the drainer's tick lock, so that leak
-was a wedge, not a slow read.
+was a wedge, not a slow read. A `CAP_*_TIMEOUT=0` is treated as MALFORMED, not as "no bound": GNU
+`timeout 0` means *no timeout*, so a legal-looking `0` silently removed the bound on the arm every
+Linux cell takes, while the watchdog arm returned an instant 124 — the two arms disagreeing about what
+`0` means.
 Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
 `wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
 `exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /

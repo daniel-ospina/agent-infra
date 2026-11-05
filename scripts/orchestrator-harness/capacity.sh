@@ -1236,7 +1236,11 @@ cap_cmux_bin() {
 cap_bounded() {
   local s="${1:-}" impl="${CAP_BOUND_IMPL:-auto}"; shift 2>/dev/null || true
   [ "$#" -gt 0 ] || return 2
-  case "$s" in ''|*[!0-9]*) s=10 ;; esac
+  # ⛔ `0` IS NOT A BOUND (fresh review round 7, P2). GNU `timeout 0` means NO timeout, so a legal
+  # `CAP_*_TIMEOUT=0` dropped the bound on the arm every Linux cell takes (measured: a 6 s provider
+  # call under `CAP_INVENTORY_TIMEOUT=0` ran unbounded) while the watchdog arm returned an instant 124 —
+  # the two arms disagreeing about what `0` means. It joins the malformed values.
+  case "$s" in ''|0|*[!0-9]*) s=10 ;; esac
   # ⛔ THE CHILD NEVER INHERITS OUR STDOUT — ON EVERY ARM, NOT JUST THE WATCHDOG (fresh review round 6,
   # P1). `kill` reaches the direct pid only, so a descendant the provider left behind keeps the caller's
   # `$( )` open past the bound. Rounds 3-4 fixed that inside the WATCHDOG arm only, and the `timeout` /
@@ -1634,14 +1638,24 @@ EOF2
   [ -z "$names" ]  || printf ' (%s)' "$names"
   [ -z "$stalen" ] || printf ' stale=(%s)' "$stalen"
   [ -z "$why" ]    || printf ' why=%s' "$why"
-  printf ' src=%s\n' "$src"
+  printf ' src=%s' "$src"
+  # ⛔ WHICH CHANNEL THIS READING CAME FROM (fresh review round 7, P1). `src=` names the EXPECTED side
+  # only, so a `published=0` line was unattributable: the drainer defaulted `FLEET_REPO` to a LANE
+  # checkout whose origin is not the queue repo, and reported a healthy 3-of-5 fleet as
+  # `published=0 INELIGIBLE=5` rc 0 with nothing on the line to say where it had looked. Set only when
+  # the caller read a real channel (`cap_fleet_line`); a direct `cap_fleet_line_from` has no repo.
+  [ -z "${CAP_CHAN:-}" ] || printf ' chan=%s' "$CAP_CHAN"
+  printf '\n' 
   return "$rc"
 }
 
 # cap_fleet_line <repo> -> read the channel, then the ONE line. rc: 2 when `cap_read_fleet` could not
 # read it (the line still prints `published=UNREADABLE`), otherwise cap_fleet_line_from's rc.
 cap_fleet_line() {
-  local repo="${1:-.}" fleet rrc frc
+  local repo="${1:-.}" fleet rrc frc _o _chan
+  _o="$(git -C "$repo" remote get-url origin 2>/dev/null)" || _o=""
+  _chan="${_o#*://}"; _chan="${_chan%.git}"
+  CAP_CHAN="${_chan:-$repo}"
   fleet="$(cap_read_fleet "$repo" 2>/dev/null)"; rrc=$?
   cap_fleet_line_from "$fleet" "$rrc"; frc=$?
   [ "$rrc" -eq 0 ] || return 2

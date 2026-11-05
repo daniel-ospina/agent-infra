@@ -1823,14 +1823,48 @@ fi
 # against a documented contract that a line is printed in every case; the drainer then named a false cause
 # (`why=capacity.sh-incomplete — a STALE copy: re-seed $O`). `10#` fixes the arithmetic.
 L28="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" cap_fleet_line_from "$(recb 10.0.0.1 08)" 0 2>/dev/null)"; RC=$?
-ck "(c6) a leading-zero `at` still prints a line (rc=$RC: ${L28:-<NOTHING>})" \
+ck '(c6) a leading-zero at still prints a line (rc='"$RC"': '"${L28:-<NOTHING>}"')' \
    "$([ "$RC" -eq 0 ] && qF 'fleet: expected=1' "$L28" && qF 'INELIGIBLE=1' "$L28" && echo 0 || echo 1)"
 # (c6-mutant) NON-VACUITY: plain arithmetic aborts the assignment and the line disappears.
 sed 's|age=$(( 10#$now - 10#$at ))|age=$(( now - at ))|' "$CAP" > "$TMP/cap-octal.sh"
-ck "  …the mutant really lost the `10#` arithmetic" "$([ "$(grep -c 'age=$(( now - at ))' "$TMP/cap-octal.sh")" -ge 1 ] && echo 0 || echo 1)"
+ck '  …the mutant really lost the 10# arithmetic' "$([ "$(grep -c 'age=$(( now - at ))' "$TMP/cap-octal.sh")" -ge 1 ] && echo 0 || echo 1)"
 L28M="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-octal.sh" "$(recb 10.0.0.1 08)" 2>/dev/null)"
 ck "  …mutation control: with plain arithmetic the same input prints NOTHING (${L28M:-<nothing>})" \
    "$([ -z "$L28M" ] && echo 0 || echo 1)"
+# (c9) ⛔ THE SAME `at=08` HOLE IN THE PLACEMENT PATH (fresh review round 7, P2). `cap_bound_hit`'s
+# arithmetic is the hunk that decides whether a record can be AGED at all; reverting only that hunk left
+# the suite 298/298 green while `cap_place` PLACED work on a record whose age it could not compute —
+# `place=h1 eligible=1` on the same bytes that must refuse (`probe_stale`).
+L31="$(printf '%s\n' "$(recb 10.0.0.1 08)" | cap_place cell-1 2>&1)"; RC=$?
+ck "(c9) cap_place refuses a record it cannot age, rather than placing on it ($L31)" \
+   "$([ "$RC" -ne 0 ] && qF 'refuse bound=probe_stale' "$L31" && ! printf '%s' "$L31" | grep -q '^place=' && echo 0 || echo 1)"
+L31C="$(printf '%s\n' "$(recb 10.0.0.1 "$NOW")" | cap_place cell-1 2>&1)"
+ck "  …while the same box with a readable stamp PLACES (so (c9) is not a blanket refusal: $(printf '%s' "$L31C" | head -1))" \
+   "$(printf '%s' "$L31C" | grep -q '^place=' && echo 0 || echo 1)"
+# (c9-mutant) NON-VACUITY: plain arithmetic in `cap_bound_hit` makes the same bytes PLACEABLE.
+sed 's|  age=$(( 10#$now - 10#$at ))|  age=$(( now - at ))|' "$CAP" > "$TMP/cap-octal-place.sh"
+L31M="$(printf '%s\n' "$(recb 10.0.0.1 08)" | bash -c '. "$1"; cap_place cell-1' _ "$TMP/cap-octal-place.sh" 2>/dev/null)"
+ck "  …mutation control: with plain arithmetic the same record is PLACED ($(printf '%s' "$L31M" | head -1))" \
+   "$(printf '%s' "$L31M" | grep -q '^place=' && echo 0 || echo 1)"
+# (c10) ⛔ `0` IS NOT A BOUND (fresh review round 7, P2): GNU `timeout 0` means NO timeout, so a legal
+# `CAP_INVENTORY_TIMEOUT=0` dropped the bound on the arm every Linux cell takes. Deterministic: a
+# stand-in `timeout` records the SECONDS it was handed, so the arm asserts what the bound would be
+# GIVEN rather than how long a fixture happened to sleep.
+mkdir -p "$TMP/fakebin"
+printf '%s\n' '#!/bin/sh' 'printf "%s" "$1" > "$FAKE_ARG"' 'shift' 'exec "$@"' > "$TMP/fakebin/timeout"
+chmod +x "$TMP/fakebin/timeout"
+FAKE_ARG="$TMP/fakebin/arg" PATH="$TMP/fakebin:$PATH" CAP_BOUND_IMPL=auto cap_bounded 0 true >/dev/null 2>&1
+_c10_arg="$(cat "$TMP/fakebin/arg" 2>/dev/null)"
+ck "(c10) a 0 timeout is normalised to the fallback bound, never handed to timeout as 0 (got ${_c10_arg:-<none>})" \
+   "$([ "${_c10_arg:-}" = "10" ] && echo 0 || echo 1)"
+# (c10-mutant) NON-VACUITY: without the `0` case the same seam hands timeout a `0` (unbounded).
+sed 's|  case "$s" in ..\|0\|\*\[!0-9\]\*) s=10 ;; esac|  case "$s" in ..\|*[!0-9]*) s=10 ;; esac   # MUTANT: 0 accepted|' "$CAP" > "$TMP/cap-zerotimeout.sh"
+ck "  …the mutant really lost the 0 guard" "$([ "$(grep -c 'MUTANT: 0 accepted' "$TMP/cap-zerotimeout.sh")" -eq 1 ] && echo 0 || echo 1)"
+rm -f "$TMP/fakebin/arg"
+FAKE_ARG="$TMP/fakebin/arg" PATH="$TMP/fakebin:$PATH" CAP_BOUND_IMPL=auto bash -c '. "$1"; cap_bounded 0 true' _ "$TMP/cap-zerotimeout.sh" >/dev/null 2>&1
+_c10m="$(cat "$TMP/fakebin/arg" 2>/dev/null)"
+ck "  …mutation control: without the guard timeout is handed '${_c10m:-<none>}'" \
+   "$([ "${_c10m:-}" = "0" ] && echo 0 || echo 1)"
 # (c7) ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
 # expected-side dedupe is right for a roster row and wrong for the provider inventory, where the key is
 # `network.ipv4`: 5 running machines with pi-cell-2 reusing the address of pi-cell-1 read

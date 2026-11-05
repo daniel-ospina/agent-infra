@@ -226,11 +226,21 @@ fi
 # The queue repo whose origin carries `refs/boxes/*` — the SAME channel the controller reads. `REPO`
 # is the fleet's ambient work repo; `SEED_REPO` is this drainer's own checkout, used as the last resort
 # because a checkout of ANY repo that shares that origin answers the identical question.
-FLEET_REPO="${FLEET_REPO:-${REPO:-$SEED_REPO}}"
+# ⛔ AND A LANE CHECKOUT IS NOT THE FLEET CHANNEL (fresh review round 7, P1). This defaulted to
+# `SEED_REPO` — this drainer's own lane checkout — on the reasoning that "a checkout of ANY repo that
+# shares that origin answers the identical question". The origin is never compared: measured, with no
+# `FLEET_REPO`/`REPO` and `SEED_REPO` on an agent-infra checkout, a tick read `published=0
+# INELIGIBLE=5 (cell-1 … cell-5)` rc 0 — all five named ineligible, three of them publishing on the real
+# channel — and nothing on the line said which repo it had read. That is the 2026-11-04 "no usable
+# remote capacity" conclusion, produced by the instrument built to prevent it. Unset means REFUSE, and
+# `cap_fleet_line` now stamps `chan=` so a `published=0` is always attributable.
+FLEET_REPO="${FLEET_REPO:-${REPO:-}}"
 [ -n "$CAPACITY_MOD" ] && [ -f "$CAPACITY_MOD" ] && . "$CAPACITY_MOD" 2>/dev/null
 fleet_line() { # log ONE `fleet:` line per tick — the reading, or a NAMED reason it could not be taken
   local line=""
-  if command -v cap_fleet_line >/dev/null 2>&1; then
+  if [ -z "${FLEET_REPO:-}" ]; then
+    line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=channel-unverified(no FLEET_REPO/REPO: this drainer's own checkout is a LANE checkout and a lane origin is not necessarily the fleet channel — set FLEET_REPO to the queue repo)"
+  elif command -v cap_fleet_line >/dev/null 2>&1; then
     line="$(cap_fleet_line "$FLEET_REPO" 2>/dev/null)" || true   # rc says completeness; the LINE is the answer
   fi
   case "${line:-}" in
