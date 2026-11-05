@@ -31,9 +31,11 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
                                                  (census-only; the same run prints 31 `❌`
                                                  lines because the ambient HARNESS failure is
                                                  included and is red on the UNMUTATED module too)
-  * drop `attributed` from main()                -> 3 paired CENSUS reds (the healthy-box arms)
-                                                 — the OPPOSITE polarity to the mutation above:
-                                                 it makes the census cry wolf on every live box
+  * drop `attributed` from main()                -> 4 CENSUS reds (the healthy-box arms: the
+                                                 3 must_red pairs plus the unreadable-table arm,
+                                                 which reds as collateral) — the OPPOSITE
+                                                 polarity to the mutation above: it makes the
+                                                 census cry wolf on every live box
   * split the UNVERIFIED tails on `attributed`   -> 2 paired EXITLINE reds (the tail must follow
                                                  the note's words, not a count)
   * let the census speak about an unread roster   -> 1 paired CENSUS red (the store-read guard:
@@ -558,9 +560,12 @@ def leg_lane_census(mod):
     # ⛔ A MISSING FUNCTION IS A RED IN THE PREDICATE BLOCK, AND THE LIMIT OF THAT IS STATED HERE
     # (review cycle 14, finding 2). The pre-fix module has no `lane_census`, and this block reports
     # that as failed checks (❌ on stdout) so the red control can key on the markers rather than on a
-    # silent exit. ⛔ IT DOES NOT MAKE THE WHOLE LEG CRASHPROOF: the `_drive` arms below call
-    # `main()`, which cannot run without the symbol, so a module missing `lane_census` would abort
-    # there — AFTER these ❌ markers have been printed. That is bounded, not read as "no red": every
+    # silent exit. ⛔ IT DOES NOT MAKE THE WHOLE LEG CRASHPROOF — but NOT for the reason an earlier
+    # draft gave, which was false (measured 2026-11-05): the real pre-fix module has neither the
+    # `lane_census` SYMBOL nor a `lane_census` CALL, so the `_drive` arms run `main()` to completion
+    # and report ordinary ❌s (measured against `origin/main`'s module: 0 tracebacks, `71 passed, 44
+    # failed`). Only a mutant that removes the SYMBOL while leaving `main()`'s call in place would
+    # abort there, and no mutation does that. Either way it is bounded, not read as "no red": every
     # mutation in `MUTATIONS` KEEPS the symbol (the neuter mutant makes it return None), so no
     # control run is affected. The PAIR and PRODUCER blocks are guarded so they survive a `None`
     # function; the `_drive` arms deliberately are not, because there is nothing honest to fabricate
