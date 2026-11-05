@@ -335,6 +335,156 @@ inline_body_offenders() { scan inline; }
 literal_path_offenders() { scan literal; }
 odd_parity_files()      { scan parity; }
 
+# carries_deriv <string> → 0 when the string carries a derivation that resolves PER CHECKOUT or PER
+# CALL. One definition, used by the awk recipe model and by the README arm, so the two cannot drift.
+# ⛔ `--git-dir` IS NOT ONE OF THEM (round 9). The property is "resolves per checkout or per call",
+# and in a MAIN worktree `git rev-parse --git-dir` prints the literal `.git`, whose cksum is ONE
+# CONSTANT for every repo on the box — a WORSE collision than the #729 residual the derivation exists
+# to avoid (measured: `--git-dir` → `.git` → cksum 2660610672, identical in every checkout).
+# `--git-common-dir` is excluded for the opposite reason: every worktree of a repo shares it.
+# Accepted: `--absolute-git-dir` (per checkout) and `mktemp` (per call — but see recipe()).
+DERIV_RE='(git rev-parse --absolute-git-dir|mktemp)'
+carries_deriv() { printf '%s' "$1" | grep -qE -- 'git rev-parse --absolute-git-dir|mktemp'; }
+
+# shipped_cmd <file> → the `issue create` command the file ACTUALLY prints, with its `\`-continuations
+# joined. A function (not an inline awk) so a fixture can exercise the collector itself: E4 once
+# matched a `#` COMMENT that showed the anti-pattern and reported the untouched EXAMPLE as refused.
+# ⛔ COMMENTS ARE NOT COMMANDS — arm C's scanner already skips them, and a skill legitimately SHOWS
+# the wrong shape inside its own fence (measured, round 9: 43/1 naming the wrong line).
+shipped_cmd() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  awk '
+    /^[ \t]*(`{3,}|~{3,})/ { fence = !fence; next }
+    !fence { next }
+    /^[ \t]*#/ { next }
+    !collect && /issue[ \t]+create/ { collect = 1 }
+    collect {
+      line = $0
+      cont = (line ~ /\\[ \t\r]*$/)
+      sub(/\\[ \t\r]*$/, "", line)
+      printf "%s ", line
+      if (!cont) exit
+    }
+  ' "$f"
+}
+
+# ── THE RECIPE MODEL — ONE place that answers "what path does this file PRINT, and what path does it
+# FILE". Round 9 found the four arms below were four INDEPENDENT token tests on different physical
+# lines, so nothing tied the printed path (the `write` tool's target) to the filed path. MEASURED:
+# keep the canonical's correct printed path and change ONLY the `--body-file` value to a fresh
+# `$(mktemp …)` — a brand-new EMPTY file — and the suite stayed 44/0. A skill that tells the reader to
+# write the body to one file and then files a different, empty one read as CLEAN.
+#
+# Emits `key=value` lines; the arms ask properties of them instead of grepping spellings:
+#   printed=<resolved expression the echo/printf PRINTS, before the gh call>
+#   filed=<resolved expression passed to -F/--body-file>
+#   via=<assign|direct>   did the filed value resolve through a `VAR=` assignment?
+#   order=<pre|none>      was a path printed BEFORE the gh call?
+#   write=<yes|no>        is there a write instruction AFTER the print?
+#   quoted=<yes|no>       is the filed value QUOTED in the source?
+#
+# ⛔ `-F` IS the body-file flag — `gh` documents `-F, --body-file`, and the literal arm at (ii) below
+# already treats the two as one flag. Refusing `-F` here made two arms of the same predicate disagree
+# about the same flag (measured, round 9: `-F <derived path>` reddened body-quoted + derivation-unique).
+# ⛔ `mktemp` is accepted only VIA AN ASSIGNMENT: two direct `$(mktemp …)` expansions are two DIFFERENT
+# files, so the print and the file disagree — the same empty-body defect in a new shape.
+# ⛔ The gh call is read with its `\`-continuations JOINED: the canonical puts `--body-file` on the
+# line AFTER `gh issue create … \`, so a per-line flag scan cannot see it at all.
+recipe() {
+  local f="$1"
+  [ -f "$f" ] || return 1
+  awk '
+    function trim(s) { sub(/^[ \t\r]+/, "", s); sub(/[ \t\r]+$/, "", s); return s }
+    # resolve $NAME / ${NAME} through the assignments seen so far. `${TMPDIR:-/tmp}` is NOT a bare
+    # name (the `:` blocks the match), so ordinary shell parameter expansion survives untouched.
+    function resolve(s,   i, name) {
+      for (i = 0; i < 8; i++) {
+        if (match(s, /\$\{[A-Za-z_][A-Za-z0-9_]*\}/)) {
+          name = substr(s, RSTART + 2, RLENGTH - 3)
+          if (!(name in ASG)) break
+          s = substr(s, 1, RSTART - 1) ASG[name] substr(s, RSTART + RLENGTH)
+          continue
+        }
+        if (match(s, /\$[A-Za-z_][A-Za-z0-9_]*/)) {
+          name = substr(s, RSTART + 1, RLENGTH - 1)
+          if (!(name in ASG)) break
+          s = substr(s, 1, RSTART - 1) ASG[name] substr(s, RSTART + RLENGTH)
+          continue
+        }
+        break
+      }
+      return s
+    }
+    function norm(s) { gsub(/[ \t\r]+/, " ", s); return trim(s) }
+    function emit(s) { gsub(/[\001-\037]/, " ", s); return s }
+    BEGIN { ghseen = 0; ingh = 0; ghbuf = ""; wrote = 0; printed = ""; order = "none"
+            filed = ""; via = "direct"; quoted = "no" }
+    {
+      line = $0
+      # JOIN the gh call across `\`-continuations before looking for the flag.
+      if (ingh) {
+        ghbuf = ghbuf " " line
+        if (line !~ /\\[ \t\r]*$/) ingh = 0
+        next
+      }
+      # THE WRITE INSTRUCTION — only a mention AFTER the path has been printed is the instruction;
+      # CALL 1 own comment mentions the write tool before printing (a comment is a legit place).
+      if (line ~ /^[ \t]*#/) {
+        if (printed != "" && !wrote && line ~ /[Ww]rite/ && line ~ /write.*tool|tool.*write/) wrote = 1
+        next
+      }
+      # an assignment: remembered, and it is the ONLY way a per-CALL derivation is legitimate.
+      if (match(line, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/)) {
+        name = line; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/=.*/, "", name)
+        val = line;  sub(/^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/, "", val)
+        ASG[name] = val
+        next
+      }
+      if (!ghseen && line ~ /issue[ \t]+create/) {
+        ghseen = 1; ghbuf = line; if (line ~ /\\[ \t\r]*$/) ingh = 1
+        next
+      }
+      # THE PRINTED PATH — the LAST double-quoted span (a printf format is the FIRST arg, so "last"
+      # reads the value in both the echo and the printf shape), else the trailing word.
+      if (!ghseen && line ~ /(^|[ \t])(echo|printf)([ \t]|$)/) {
+        p = line; n = 0; span = ""
+        while (match(p, /"[^"]*"/)) { span = substr(p, RSTART + 1, RLENGTH - 2); p = substr(p, RSTART + RLENGTH); n++ }
+        if (n == 0) { span = line; sub(/.*[ \t]/, "", span) }
+        printed = norm(resolve(span)); order = "pre"
+        next
+      }
+    }
+    END {
+      if (ghbuf != "") {
+        rest = ghbuf
+        if (match(rest, /(^|[ \t])(--body-file|-F)([= \t]|$)/)) {
+          rest = substr(rest, RSTART + RLENGTH)
+          sub(/^[ \t]*=*[ \t]*/, "", rest)
+          if (substr(rest, 1, 1) == "\"") {
+            q = index(substr(rest, 2), "\"")
+            if (q > 0) { filed = substr(rest, 2, q - 1); quoted = "yes" }
+            else { filed = substr(rest, 2) }
+          } else {
+            filed = rest; sub(/[ \t].*/, "", filed)
+          }
+        }
+        if (filed ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) via = "assign"
+        filed = norm(resolve(filed))
+        # the assignments themselves must be resolved before the print is compared to the file, which
+        # is why `printed` was resolved at capture time — a variable assigned LATER than it is printed
+        # is not a shape this repo teaches, and would be a fresh-shell bug anyway.
+      }
+      printf "printed=%s\n", emit(printed)
+      printf "filed=%s\n",   emit(filed)
+      printf "via=%s\n",     via
+      printf "order=%s\n",   order
+      printf "write=%s\n",   (wrote ? "yes" : "no")
+      printf "quoted=%s\n",  quoted
+    }
+  ' "$f"
+}
+
 # canon_reasons_missing <file> → the tokens the canonical example is missing ("" when complete), so
 # the arm can be driven RED against a fixture instead of by editing the tracked tree. The SHAPE half
 # is scanned (a fenced command, no inline body) rather than grepped: the canonical file's own prose
@@ -352,7 +502,7 @@ canon_reasons_missing() {
   # the pin exists so a reword keeps the FACT, and a vocabulary that omits the repo's own words
   # refuses correct text. Requiring the adverb "still" once false-reddened "is refused too"
   # (round 7); omitting "gated" false-reddened "is gated as well" (round 8). Widen, never narrow.
-  awk 'BEGIN{n=0} /--title/ && /(classif|refus|scan|block|reject|forbid|gate|denied|deny|prohibit|unsafe|not (exempt|permitted|allowed)|fail)/ {n=1} END{exit(n?0:1)}' "$f" 2>/dev/null \
+  awk 'BEGIN{n=0} /--title/ && /(classif|refus|scan|block|reject|forbid|gate|denied|deny|prohibit|unsafe|not (exempt|permitted|allowed)|fail|inspect|cover|govern|subjec|appl|affect|treat)/ {n=1} END{exit(n?0:1)}' "$f" 2>/dev/null \
     || miss="$miss title-residual"
   # ⛔ THE RECIPE HALVES, each of which a review round had to fix and which nothing else pinned:
   #   call1-path   — a line that PRINTS the derived path, BEFORE the gh call, so the `write` tool has
@@ -362,77 +512,41 @@ canon_reasons_missing() {
 #   body-quoted  — the derived path is QUOTED, so a TMPDIR with a space cannot split the argument.
 #   derivation-unique — the lane-uniqueness token is in the --body-file VALUE, not only in the echo
 #                  (a `$`-carrying SHARED path passes arm B2 by construction — round 6).
-  # ⛔ call1-path checks the DERIVATION, not just the word: an `echo "/tmp/pi-issue-body-shared.md"`
-  # satisfies "prints a path" while reintroducing the #729 shared-name collision the derivation exists
-  # to prevent (round 3 measured exactly that staying green).
-  awk '
-    /^[ \t]*#/ { next }
-    {
-      if (!printed && /(echo|printf)/ && /pi-issue-body-/ && /git rev-parse/) printed=1
-      if (!ghseen && /issue[ \t]+create/) { ghseen=1; gh_at_echo = printed }
-    }
-    END { exit(gh_at_echo ? 0 : 1) }
-  ' "$f" 2>/dev/null || miss="$miss call1-path"
-  # ⛔ CALL 2 — the `write`-tool instruction ITSELF. Round 6 measured that deleting it stayed green
-  # (41/0) while this arm's own message promises the write tool "has a target": call 1 prints one,
-  # but nothing then told the reader to WRITE the body. CALL 1's comment mentions the `write` tool
-  # too ("so the `write` tool has something to write to"), so the match is gated on `printed` — only
-  # a mention AFTER the path has been printed can be the instruction.
-  awk '
-    {
-      if (!printed && /(echo|printf)/ && /pi-issue-body-/ && /git rev-parse/) printed = 1
-      if (!wrote && printed && /^[ \t]*#/ && /[Ww]rite/ && /write.*tool|tool.*write/) wrote = 1
-      # ⛔ The verdict is a FLAG, not `exit` inside the rule: `exit` jumps to END, and an END that
-      # itself exits would overwrite this status (measured while writing this arm — it reported a
-      # real instruction as missing).
-      if (!ghseen && /issue[ \t]+create/) { ghseen = 1; res = (printed && wrote) ? 0 : 1 }
-    }
-    END { exit(ghseen && res == 0 ? 0 : 1) }
-  ' "$f" 2>/dev/null || miss="$miss call2-write"
-  # ⛔ QUOTING — an UNQUOTED derived path breaks on any TMPDIR containing a space, a case this shard
-  # measures elsewhere (TMPDIR="/tmp/tmp with space"). Round 6 measured that removing the quotes
-  # from all five skills left the suite GREEN, and no other arm sees it: the literal arm skips values
-  # containing `$`, and the recipe arm only looks for a `VAR=` assignment.
-  # ⛔ The PROPERTY is "quoted, and the value carries an expansion" — NOT the `${` spelling. Pinning
-  # the spelling false-reds a strictly better derivation such as
-  # `--body-file "$(mktemp "${TMPDIR:-/tmp}/pi-issue-body.XXXXXX")"` (measured, round 7).
-  awk '
-    { if ($0 ~ /^[ \t]*#/) next }
-    { if ($0 ~ /--body-file[= ]+"[^"]*\$/) ok = 1 }
-    END { exit(ok ? 0 : 1) }
-  ' "$f" 2>/dev/null || miss="$miss body-quoted"
-  # ⛔ THE CHECKOUT-UNIQUENESS TOKEN must be in the --body-file VALUE, not only in the printed path.
-  # Replacing the derivation with a derived-looking SHARED path -- `--body-file "$(pwd)/pi-issue-body.md"`,
-  # `--body-file "$(git rev-parse --show-toplevel)/pi-issue-body.md"`,
-  # `--body-file "$(git rev-parse --git-common-dir)/pi-issue-body.md"` -- keeps the `$` that arm B2's
-  # literal check deliberately skips, so the #729 collision returns with the suite GREEN (measured,
-  # round 6: two spellings passed 41/0; round 7 added the common-dir one).
-  # ⛔ The PROPERTY is "the expansion resolves per checkout or per call", NOT one spelling: a
-  # `mktemp` derivation is strictly better (unique per CALL) and must stay green, which a token match
-  # on `--absolute-git-dir` alone refused (measured, round 7).
-  awk '
-    { if ($0 ~ /^[ \t]*#/) next }
-    # an ASSIGNMENT may carry the derivation, and the call site may then name the variable: a
-    # single-fence recipe is a valid shape (assignment + consumer = one shell), so it must not be
-    # refused for spelling — the resolution, not the spelling, is the rule.
-    match($0, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) {
-      name = $0; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/=.*/, "", name)
-      if ($0 ~ /\$\((git rev-parse --(absolute-)?git-dir|mktemp)/ && $0 !~ /--git-common-dir/) uniq[name] = 1
-      next
-    }
-    {
-      if ($0 !~ /--body-file/) next
-      if ($0 ~ /\$\((git rev-parse --(absolute-)?git-dir|mktemp)/ && $0 !~ /--git-common-dir/) ok = 1
-      rest = $0
-      while (match(rest, /\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
-        v = substr(rest, RSTART, RLENGTH); sub(/^\$\{?/, "", v)
-        if (v in uniq) ok = 1
-        rest = substr(rest, RSTART + RLENGTH)
-      }
-    }
-    END { exit(ok ? 0 : 1) }
-  ' "$f" 2>/dev/null || miss="$miss derivation-unique"
-  [ -n "$(canon_recipe_absent "$f")" ] && miss="$miss recipe-var"
+  # ── the recipe arms, read from the ONE model above instead of four line-scoped token tests ──
+  # Every one of these was a spelling test before round 9; each is now a property of `printed` /
+  # `filed` / their EQUALITY, which is what the reader actually needs to be true.
+  REC="$(recipe "$f" 2>/dev/null)"
+  rec_get() { printf '%s\n' "$REC" | sed -n "s/^$1=//p" | head -1; }
+  P_PRINT="$(rec_get printed)"; P_FILE="$(rec_get filed)"; P_VIA="$(rec_get via)"
+  P_ORDER="$(rec_get order)";    P_WRITE="$(rec_get write)"; P_QUOTE="$(rec_get quoted)"
+  # call1-path — a path is PRINTED BEFORE the gh call and it carries a derivation. Checking only the
+  # word `pi-issue-body-` let `echo "/tmp/pi-issue-body-shared.md"` satisfy it while reintroducing the
+  # #729 collision (round 3), so the derivation is part of the property, not a separate token.
+  # ⛔ A variable-mediated print (`echo "$BODY"`) IS this property when `BODY` is assigned the
+  # derivation in the same fence: the model resolves it, and refusing it for spelling contradicted
+  # derivation-unique own comment, which blesses exactly that shape (round 9).
+  { [ "$P_ORDER" = pre ] && [ -n "$P_PRINT" ] && carries_deriv "$P_PRINT"; } \
+    || miss="$miss call1-path"
+  # call2-write — the instruction to WRITE the body, AFTER the path is printed. Deleting it left the
+  # canonical example unrunnable and the shard green (round 6): call 1 prints a path, but nothing then
+  # told the reader to write the body there.
+  [ "$P_WRITE" = yes ] || miss="$miss call2-write"
+  # body-quoted — the filed value is QUOTED and carries an expansion, so a TMPDIR containing a space
+  # cannot split the argument. The PROPERTY, not the `${` spelling (round 7).
+  { [ "$P_QUOTE" = yes ] && printf '%s' "$P_FILE" | grep -q '\$'; } \
+    || miss="$miss body-quoted"
+  # derivation-unique — the derivation is in the FILED value, not only in the printed one. A
+  # `$(pwd)`, `$(git rev-parse --show-toplevel)` or `$(git rev-parse --git-common-dir)` path keeps the
+  # `$` arm B2 skips by construction, so the #729 collision returns with the suite GREEN (rounds 6-7).
+  # `mktemp` qualifies ONLY through an assignment — see the model note.
+  { carries_deriv "$P_FILE" && { [ "$P_VIA" = direct ] || printf '%s' "$P_FILE" | grep -qE -- 'git rev-parse --absolute-git-dir'; } \
+    || { printf '%s' "$P_FILE" | grep -q 'mktemp' && [ "$P_VIA" = assign ]; }; } \
+    || miss="$miss derivation-unique"
+  # recipe-match (#3483 round 9) — THE PRINTED PATH **IS** THE FILED PATH. Nothing tied the two, so a
+  # skill could print the correct path for the `write` tool and file a DIFFERENT, freshly-`mktemp`ed
+  # EMPTY file while every arm above stayed green (measured: 44/0 with an empty body). That is the
+  # one property the whole three-call recipe exists to guarantee.
+  [ -n "$P_PRINT" ] && [ "$P_PRINT" = "$P_FILE" ] || miss="$miss recipe-match"
   printf '%s' "$miss"
 }
 
@@ -471,8 +585,10 @@ readme_route_absent() {
     # ⛔ The value must be DERIVED (per checkout or per call) — not any `$`: a bare `"$BODY"` is the
     # fresh-shell-broken shape the row's OWN sentence warns about, and `--git-common-dir` is shared by
     # every worktree of the repo. Both passed the weaker `\$\{?` test (measured, round 7).
-    if printf '%s' "$ROUTE_CMD" | grep -qE -- '--body-file[= ]+"?[^|]*\$\((git rev-parse --(absolute-)?git-dir|mktemp)' \
-       && ! printf '%s' "$ROUTE_CMD" | grep -q -- '--git-common-dir'; then :; else
+    # `-F` is the documented short form of `--body-file`; `--git-dir` is NOT a per-checkout
+    # derivation (it prints the literal `.git` in a main worktree — one constant for every repo).
+    if printf '%s' "$ROUTE_CMD" | grep -qE -- '(-F|--body-file)[= ]+"?[^|]*\$' \
+       && carries_deriv "$ROUTE_CMD"; then :; else
       printf '%s\n' "$r(route-path)"
     fi
     # and never the inline body this whole change removes
@@ -499,7 +615,7 @@ readme_route_absent() {
       gsub(/[|;]/, "\n", buf)
       gsub(/\. +/, "\n", buf)
       n = split(buf, seg, "\n")
-      for (i = 1; i <= n; i++) if (seg[i] ~ /--title/ && seg[i] ~ /(classif|refus|scan|block|reject|forbid|gate|denied|deny|prohibit|unsafe|not (exempt|permitted|allowed)|fail)/) ok = 1
+      for (i = 1; i <= n; i++) if (seg[i] ~ /--title/ && seg[i] ~ /(classif|refus|scan|block|reject|forbid|gate|denied|deny|prohibit|unsafe|not (exempt|permitted|allowed)|fail|inspect|cover|govern|subjec|appl|affect|treat)/) ok = 1
       exit(ok ? 0 : 1)
     }' || printf '%s\n' "$r(title-residual)"
   printf '%s\n' "$RT" | grep -qi -- 'label' || printf '%s\n' "$r(label-residual)"
@@ -551,10 +667,11 @@ canon_recipe_absent() {
       # a consumer of one of those variables — QUOTED or BARE. Round 3 showed the quoted-only form let
       # `--body-file $VAR` (the identical empty-path defect) pass both this arm and the literal arm.
       for (v in vars) {
-        if (index(line, "--body-file")) {
-          rest = substr(line, index(line, "--body-file"))
-          if ((index(rest, "$" v) || index(rest, "${" v "}")) && vars[v] != fence) { print FILENAME; found=1; exit }
-        }
+        # `-F` is `--body-file`; a consumer written with the short form is the identical defect.
+        if (index(line, "--body-file")) rest = substr(line, index(line, "--body-file"))
+        else if (match(line, /(^|[ \t])-F([= \t]|$)/)) rest = substr(line, RSTART)
+        else continue
+        if ((index(rest, "$" v) || index(rest, "${" v "}")) && vars[v] != fence) { print FILENAME; found=1; exit }
       }
     }
   ' "$f"
@@ -588,12 +705,16 @@ fi
 NO_PREP=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
-  grep -qF -e '--body-file' -- "$f" 2>/dev/null || continue
-  awk '
-    /^[[:space:]]*(echo|printf)[[:space:]]/ && /\$\(/ { seen = 1 }
-    /gh[[:space:]]+issue[[:space:]]+create/ { if (!seen) { rc = 1 }; exit }
-    END { if (!seen) { rc = 1 }; exit rc + 0 }
-  ' "$f" 2>/dev/null || NO_PREP="$NO_PREP ${f#$ROOT/}"
+  grep -qE -- '(-F|--body-file)' -- "$f" 2>/dev/null || continue
+  # ⛔ READ IT FROM THE MODEL, not from a fourth line-scoped grep. The old form required a `$(` on
+  # the SAME `echo` line, so (a) a legitimate single-fence `BODY=…` recipe — which assignment-aware
+  # arms elsewhere explicitly bless — was refused, and (b) ANY `$(` satisfied it, so an `echo` of an
+  # unrelated substitution stood in for the body path (measured, round 9, both directions).
+  R3="$(recipe "$f" 2>/dev/null)"
+  P3P="$(printf '%s\n' "$R3" | sed -n 's/^printed=//p' | head -1)"
+  P3O="$(printf '%s\n' "$R3" | sed -n 's/^order=//p' | head -1)"
+  { [ "$P3O" = pre ] && [ -n "$P3P" ] && carries_deriv "$P3P"; } \
+    || NO_PREP="$NO_PREP ${f#$ROOT/}"
 done <<EOF
 $(printf '%s\n' "$CENSUS")
 EOF
@@ -718,18 +839,7 @@ fi
 # command out of the file (the `issue create` line plus its `\`-continuations) and probe THAT: a
 # replica proves the shape CAN be filed, only the shipped text proves it IS.
 if [ -f "$CLASSIFIER" ]; then
-  SHIPPED_CMD="$(awk '
-    /^[ \t]*(`{3,}|~{3,})/ { fence = !fence; next }
-    !fence { next }
-    !collect && /issue[ \t]+create/ { collect = 1 }
-    collect {
-      line = $0
-      cont = (line ~ /\\[ \t\r]*$/)
-      sub(/\\[ \t\r]*$/, "", line)
-      printf "%s ", line
-      if (!cont) exit
-    }
-  ' "$ROOT/$CANON")"
+  SHIPPED_CMD="$(shipped_cmd "$ROOT/$CANON")"
   if [ -z "$SHIPPED_CMD" ]; then
     bad "could not read the taught \`issue create\` command out of $CANON — a shipped-example arm that measures nothing is a vacuous green"
   else
@@ -806,12 +916,15 @@ while IFS= read -r f; do
   # mutator turns a CORRECT `=`-spelled example into an unchanged "mutant", the arms then find
   # nothing, and the suite reports them INERT — a false red on a correct tree, blaming the
   # predicate for the mutator's blind spot (measured, round 8).
-  sed -E 's#--body-file([[:blank:]]+|=)[^[:blank:]]*#--body "<quoted command>"#g' "$f" > "$T/mut/inline$IDX.md"
+  # ⛔ BOTH FLAGS AND BOTH SPELLINGS: `gh` accepts `-F` as `--body-file`, and the arms now accept it
+  # too, so a mutator that only rewrites the long form leaves a correct `-F` example UNCHANGED and the
+  # arms are then blamed as INERT (round 8's defect, recurring for `-F` in round 9).
+  sed -E 's#(-F|--body-file)([[:blank:]]+|=)[^[:blank:]]*#--body "<quoted command>"#g' "$f" > "$T/mut/inline$IDX.md"
   MUT_INLINE="$MUT_INLINE$T/mut/inline$IDX.md
 "
   # (ii) keep the shape, break the PATH: the derived path becomes a literal temp path. Both
   # spellings again (see (i)); the replacement normalises to the separated form.
-  sed -E 's#--body-file([[:blank:]]+|=)[^[:blank:]]*#--body-file /tmp/issue-body.md#g' "$f" > "$T/mut/literal$IDX.md"
+  sed -E 's#(-F|--body-file)([[:blank:]]+|=)[^[:blank:]]*#--body-file /tmp/issue-body.md#g' "$f" > "$T/mut/literal$IDX.md"
   MUT_LITERAL="$MUT_LITERAL$T/mut/literal$IDX.md
 "
   # ⛔ A MUTANT THAT STILL CARRIES THE SHAPE IT WAS SUPPOSED TO REVERT PROVES NOTHING, and
@@ -820,9 +933,9 @@ while IFS= read -r f; do
   # `cmp -s` against the source, and not "does the word appear at all": these files name the flag in
   # PROSE too, so the count of the ARGUMENT SHAPE is the only honest invariant — the inline mutant
   # must hold none of it, and the literal mutant must hold exactly as many as its source.
-  n_src="$(grep -oE -e '--body-file([[:blank:]]+|=)' "$f" 2>/dev/null | wc -l | tr -d ' ')"
-  n_inl="$(grep -oE -e '--body-file([[:blank:]]+|=)' "$T/mut/inline$IDX.md" 2>/dev/null | wc -l | tr -d ' ')"
-  n_lit="$(grep -oE -e '--body-file[[:blank:]]+/tmp/issue-body\.md' "$T/mut/literal$IDX.md" 2>/dev/null | wc -l | tr -d ' ')"
+  n_src="$(grep -oE -e '(-F|--body-file)([[:blank:]]+|=)' "$f" 2>/dev/null | wc -l | tr -d ' ')"
+  n_inl="$(grep -oE -e '(-F|--body-file)([[:blank:]]+|=)' "$T/mut/inline$IDX.md" 2>/dev/null | wc -l | tr -d ' ')"
+  n_lit="$(grep -oE -e '(-F|--body-file)[[:blank:]]+/tmp/issue-body\.md' "$T/mut/literal$IDX.md" 2>/dev/null | wc -l | tr -d ' ')"
   if [ "$n_inl" -ne 0 ] || [ "$n_lit" -ne "$n_src" ]; then
     MUT_NOOP="$MUT_NOOP $(basename "$f")"
   fi
@@ -894,7 +1007,7 @@ if [ -n "$(canon_reasons_missing "$T/mut/canon-no-citations.md")" ]; then
 else
   bad 'MUTATION: arm C stayed green on a copy with #3445 and #729 removed — the citation check is INERT'
 fi
-sed -E 's#--body-file([[:blank:]]+|=)[^[:blank:]]*#--body "<quoted command>"#g' "$ROOT/$CANON" > "$T/mut/canon-inline.md"
+sed -E 's#(-F|--body-file)([[:blank:]]+|=)[^[:blank:]]*#--body "<quoted command>"#g' "$ROOT/$CANON" > "$T/mut/canon-inline.md"
 case "$(canon_reasons_missing "$T/mut/canon-inline.md")" in
   *inline-body*) ok 'MUTATION: reverting the canonical copy to the inline shape reddens arm C through the SCANNER (not a token grep), so a prose mention of --body-file can never stand in for a real example' ;;
   *) bad 'MUTATION: arm C stayed green on a copy whose command reverted to the inline shape — its shape half is reading text, not code' ;;
@@ -1201,6 +1314,109 @@ if [ -z "$(printf '%s\n' "$T/stdin-body.md" | literal_path_offenders)" ]; then
 else
   bad 'a stdin body sentinel is reported as a literal temp path — the #729 arm over-blocks the documented stdin form'
 fi
+
+# ══ ROUND 9: the recipe model and the derivations it accepts ═══════════════════════════════════════
+# Each arm below is derived from the REAL canonical file, so it tracks future edits instead of
+# drifting into a hand-written replica of it.
+
+# (xxvii) THE PRINTED PATH IS THE FILED PATH. Keeping the correct printed path and changing only the
+# `--body-file` value to a fresh `$(mktemp …)` — a brand-new EMPTY file — left the suite at 44/0
+# before this round: a skill that tells the reader to write the body to one file and files a
+# different, empty one read as CLEAN. This is the property the whole three-call recipe exists for.
+# ⛔ COMMENTS ARE NOT COMMANDS HERE EITHER: the canonical warns about this very shape in a `#` line
+# inside its own fence ("a `BODY=…` set in an earlier call is empty here and `--body-file \"$BODY\"`"),
+# so a comment-blind mutator rewrote the WARNING and left the real command untouched — the arm then
+# reported the predicate blind while the fixture was unchanged (measured while writing this arm).
+awk '
+  /^[ \t]*#/ { print; next }
+  !done && /(--body-file|-F)[ \t]"/ {
+    sub(/(--body-file|-F)[ \t]+"[^"]*"/, "--body-file \"$(mktemp \"${TMPDIR:-/tmp}/pi-issue-body.XXXXXX\")\"")
+    done = 1
+  }
+  { print }
+' "$ROOT/$CANON" > "$T/mut/canon-emptybody.md"
+case "$(canon_reasons_missing "$T/mut/canon-emptybody.md")" in
+  *recipe-match*) ok 'MUTATION: printing the correct path but FILING a fresh `$(mktemp …)` (an EMPTY file) is named — the printed path and the filed path must be the SAME path, which nothing tied together before round 9 (measured: 44/0 with a blank body)' ;;
+  *) bad 'arm C stayed green when the filed path stopped being the printed path — the recipe can tell the reader to write the body to one file and file a different, empty one, which is #3445 unfixed in its most consequential shape' ;;
+esac
+
+# (xxviii) `--git-dir` is NOT per checkout. In a MAIN worktree git prints the literal `.git`, so its
+# cksum is ONE CONSTANT for every repo on the box — a worse collision than the #729 residual the
+# derivation exists to avoid (measured: cksum 2660610672). `--absolute-git-dir` must stay green.
+# ⛔ THE SUBSTITUTION IS DERIVATION-AGNOSTIC, and it has a PRECONDITION. A canonical that legitimately
+# switched to `mktemp` carries no `--absolute-git-dir` to rewrite, so a spelling-bound sed produced a
+# byte-identical fixture and this arm reported the PREDICATE as accepting `--git-dir` — round 8's
+# mutator disease, reproduced in this very arm while writing it (measured: 51/0 canonical, 50/1 on a
+# correct `mktemp` variant). Both derivations are normalised away, and a fixture that still carries
+# one is reported as a MUTATOR fault instead of blaming the predicate.
+sed -E 's#git rev-parse --absolute-git-dir#git rev-parse --git-dir#g; s#mktemp([[:blank:]]+)"[^"]*"#git rev-parse --git-dir#g' \
+  "$ROOT/$CANON" > "$T/mut/canon-dashgit.md"
+if ! grep -q -- '--git-dir' "$T/mut/canon-dashgit.md" \
+   || grep -qE -- '--absolute-git-dir|mktemp' "$T/mut/canon-dashgit.md"; then
+  bad 'the MUTATOR could not rewrite the shipped derivation to `--git-dir` (the canonical uses a derivation this sed does not know) — the arm below is not measured, so a green would be vacuous'
+else
+  case "$(canon_reasons_missing "$T/mut/canon-dashgit.md")" in
+    *derivation-unique*) ok 'MUTATION: `--git-dir` is REFUSED — it resolves to the literal `.git` in a main worktree, one cksum for every repo, so it is not the per-checkout derivation the #729 arm claims to require' ;;
+    *) bad 'arm C accepted `--git-dir` as a per-checkout derivation — in a main worktree that is the constant string `.git`, so every repo on the box derives the SAME body-path name and the #729 collision is WORSE than the one the fix removes' ;;
+  esac
+fi
+# the CONTROL that makes the red above attributable to the spelling rather than to an always-on arm
+if [ -z "$(canon_reasons_missing "$ROOT/$CANON")" ]; then
+  ok 'MUTATION control: the shipped derivation still passes every recipe arm — the `--git-dir` red above is attributable to the spelling, not to an arm that refuses everything'
+else
+  bad "the SHIPPED canonical no longer passes its own recipe arms (missing:$(canon_reasons_missing "$ROOT/$CANON")) — the arm is always-on and pins nothing"
+fi
+
+# (xxix) `-F` IS `--body-file`. `gh` documents the short form, and the literal arm already treats the
+# two as one flag, so refusing `-F` here made two arms of the same predicate disagree (measured,
+# round 9: `-F <derived path>` reddened body-quoted + derivation-unique).
+sed -E 's/(--body-file)([[:blank:]]+)/-F\2/' "$ROOT/$CANON" > "$T/mut/canon-short-F.md"
+if [ -z "$(canon_reasons_missing "$T/mut/canon-short-F.md")" ]; then
+  ok 'MUTATION: the `-F` short form of `--body-file` is ACCEPTED by every recipe arm — the documented alias cannot be refused as if it were a different flag'
+else
+  bad "the `-F` short form reddened the recipe arms (\`$(canon_reasons_missing "$T/mut/canon-short-F.md")\`) — \`gh\` documents \`-F\` as \`--body-file\`, and the literal arm already accepts it, so the predicate contradicts itself"
+fi
+
+# (xxx) A SINGLE-FENCE `BODY=…` RECIPE IS CORRECT: assignment and consumer are ONE shell, so the
+# worker gets one path. It was refused for spelling while derivation-unique's own comment blessed it
+# (measured, round 9) — the false RED that blocks the next improvement.
+awk '
+  /^echo "\$\{TMPDIR/ { v = $0; sub(/^echo /, "", v); print "BODY=" v; print "echo \"$BODY\""; next }
+  /(--body-file|-F)[ \t]"/ { sub(/(--body-file|-F)[[:blank:]]+"[^"]*"/, "--body-file \"$BODY\""); print; next }
+  { print }
+' "$ROOT/$CANON" > "$T/mut/canon-singlefence.md"
+if [ -z "$(canon_reasons_missing "$T/mut/canon-singlefence.md")" ]; then
+  ok 'MUTATION: a single-fence `BODY=` recipe (assignment, printed, then consumed in the SAME fence) is CLEAN — one shell means one path, so this shape must not be refused for spelling'
+else
+  bad "a CORRECT single-fence \`BODY=\` recipe reddened (\`$(canon_reasons_missing "$T/mut/canon-singlefence.md")\`) — refusing it blocks the next improvement to the very text this shard exists to protect"
+fi
+
+# (xxxi) E4 reads COMMANDS, not warning comments. Skills legitimately SHOW the anti-pattern inside
+# their own fence; a comment above an untouched correct example reddened E4 and named the wrong line.
+{
+  printf '%s\n' '```bash'
+  printf '%s\n' '# WRONG — never do this: gh issue create --title "fix: guard blocked git pull --ff-only" --body "x"'
+  shipped_cmd "$ROOT/$CANON"
+  printf '%s\n' '```'
+} > "$T/mut/canon-warning-comment.md"
+WARN_CMD="$(shipped_cmd "$T/mut/canon-warning-comment.md")"
+case "$WARN_CMD" in
+  *"WRONG"*) bad 'arm E4 collector picked up a `#` WARNING COMMENT instead of the example — a skill that documents the anti-pattern it forbids would be reported as teaching it, naming the wrong line' ;;
+  *issue*create*) ok 'MUTATION: the E4 collector skips `#` comments and reads the EXAMPLE — a skill can show the wrong shape in a warning without being accused of teaching it' ;;
+  *) bad "the E4 collector found no command at all in a fixture carrying one ('$WARN_CMD') — the comment-skip is over-broad" ;;
+esac
+
+# (xxxii) the title-residual pin must not refuse ordinary rewordings of the SAME true fact. It is a
+# vocabulary, and a vocabulary that omits the repo own words blocks the next editor (round 7 refusals
+# of "is refused too"; round 8 of "is gated as well"; round 9 of "inspected"/"covered").
+for v in 'is still inspected by that same check' 'is equally covered by the same check'; do
+  sed "s/is still scanned, and is still refused/$v/" "$ROOT/$CANON" > "$T/mut/canon-title.md"
+  case "$(canon_reasons_missing "$T/mut/canon-title.md")" in
+    *title-residual*) bad "the title-residual pin refused a correct rewording ('$v') — the fact is unchanged, so this is a false RED that blocks the next improvement" ;;
+    *) : ;;
+  esac
+done
+ok 'MUTATION: the title-residual pin accepts ordinary rewordings of the same fact ("inspected by", "covered by") while arm E3 MEASURES that the fact still holds — the sentence pin no longer blocks the next editor'
 
 # ── NOTE (not an assertion): odd fence parity blinds arms B/B2 for the rest of that file ────────
 PARITY="$(printf '%s\n' "$CENSUS" | odd_parity_files | sed "s|$ROOT/||g" | tr '\n' ' ')"
