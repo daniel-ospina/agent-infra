@@ -2204,6 +2204,16 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
         fi
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured by THIS cycle, and %s, so this is NOT known to be an empty queue: work may be queued and unread | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$_pass_said" "$prtail"
+      elif [ "$_bl_state" != "READ" ]; then
+        # ⛔ A RECORDED ZERO IS NOT A MEASUREMENT OF NOW (review P3, cycle 21). `RECORDED` means this beat
+        # could NOT read the queue and `backlog` is the PASS's number, but it passed the
+        # `_bl_state != UNKNOWN` test above — so a beat that had just failed to open the queue printed
+        # "the queue is EMPTY now": a present-tense fact about a file nobody read, licensed by a field
+        # written at some earlier time. The EMPTY word below is now reachable only from `READ`. (No
+        # shipped path can yet produce "record ok/backlog=0" with rows on disk — the pass writes both —
+        # but that invariant is enforced by nothing, which is exactly why the sentence must not rely on it.)
+        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s and %s, so that is the PASS'"'"'s count, not a measurement of the queue now — it is NOT evidence the queue is empty | PR path: %s\n' \
+          "$why" "$lanes" "$workers" "$age" "$backlog" "${hrec:+handed #$hrec}" "${hrec:-handed nothing}" "$prtail"
       elif [ -n "$hrec" ]; then
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY now; the last refresh pass (%s) recorded queued=%s and handed #%s to dispatch, so this is drained work, not a stalled origin | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$age" "${qrec:-?}" "$hrec" "$prtail"

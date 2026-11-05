@@ -1074,6 +1074,38 @@ else
     *) bad "depth-unknown: the REVERTED gate did not reproduce the defect — $OUT_M" ;;
   esac
 fi
+# ── 4a2c) A RECORDED ZERO IS NOT A MEASUREMENT OF NOW (review P3, cycle 21) ──
+# `_bl_state=RECORDED` means this beat could not read the queue and `backlog` is the PASS's number — yet it
+# satisfied the "not UNKNOWN" test, so the beat printed "the queue is EMPTY now" over a file it had just
+# failed to open. The record's number is not evidence about the queue NOW, however old or new it is.
+mk_case ok-recorded-zero
+mk_tool_clean "$D"
+printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"     # unreadable HERE
+mkdir -p "$D/o/state"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=0\nqueued=0\nbacklog=0\nhanded=\nqueue_readable=1\n' "$(date +%s)" > "$D/o/state/refresh-last"
+OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+case "$OUT_DRIVE" in
+  *"the queue is EMPTY"*) bad "recorded-zero: the beat claimed the queue is EMPTY over a file THIS cycle could not read — $OUT_DRIVE" ;;
+  *) ok "recorded-zero: no 'the queue is EMPTY' claim when only the RECORD holds a zero" ;;
+esac
+case "$OUT_DRIVE" in
+  *"THIS cycle could not measure the queue"*"recorded backlog=0"*) ok "recorded-zero: the line attributes the zero to the PASS, not to a measurement now" ;;
+  *) bad "recorded-zero: the line does not attribute the recorded zero — $OUT_DRIVE" ;;
+esac
+# NON-VACUITY: without the RECORDED arm the beat falls through to the measured-EMPTY sentence (driven
+# while the queue is STILL unreadable — restoring the read bit first would send the drive down the
+# `skipped` arm and grade nothing).
+FNSRZ="$T/origination-fns-recorded-rev.sh"
+sed 's/^      elif \[ "\$_bl_state" != "READ" \]; then$/      elif false; then/' "$FNS" > "$FNSRZ" 2>/dev/null
+if cmp -s "$FNS" "$FNSRZ" 2>/dev/null; then bad "recorded-zero: the arm-removal mutation did not apply — the sed anchor drifted"
+else
+  OUT_M="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSRZ" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  case "$OUT_M" in
+    *"the queue is EMPTY"*) ok "recorded-zero: non-vacuity — removing the RECORDED arm restores the false EMPTY claim" ;;
+    *) bad "recorded-zero: the REVERTED gate did not reproduce the defect — $OUT_M" ;;
+  esac
+fi
+chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
 # ── 4a3) THE `running` ARM'S EMPTY SENTENCE IS GATED TOO (review P2, cycle 16) ──
 # `backlog` is 0 by INITIALISATION when the depth could not be read, and the in-flight branch tested
 # `[ "$backlog" -gt 0 ]` alone — so a queue behind a mode-000 file, holding rows, printed "the queue is
@@ -2223,7 +2255,7 @@ _drv_scan() {   # $1 = file to scan → sets _drv_total, _drv_unpinned
 # The population is pinned to a COUNT rather than floored: a line-based scan with a floor let a driver
 # evaded it simply by being REFORMATTED across two lines, which is the defect this section exists to
 # catch (review P3, cycle 18).
-_drv_expect=14
+_drv_expect=16
 _drv_scan "$0"
 if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked, count pinned)"
 else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}) or a population of $_drv_total where $_drv_expect are declared — a driver that skips the prologue, or leaves the population, is invisible here"; fi

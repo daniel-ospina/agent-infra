@@ -1511,6 +1511,7 @@ main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
 main_handoff unreadable dir
 if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
+   && grep -q 'queue_readable=0' <<<"$MHOUT" \
    && ! grep -q 'the queue is empty' <<<"$MHOUT" \
    && ! grep -q 'backlog=0' <<<"$MHOUT" \
    && ! grep -q 'Is a directory' <<<"$MHOUT" \
@@ -1523,6 +1524,7 @@ ck "an UNREADABLE queue is reported as unmeasured on EVERY surface (backlog=UNKN
 main_handoff drained empty
 if [ "$MHRC" -eq 0 ] && grep -q 'the queue is empty' <<<"$MHOUT" \
    && grep -q 'backlog=0' <<<"$MHOUT" \
+   && grep -q 'queue_readable=1' <<<"$MHOUT" \
    && ! grep -q 'could NOT be READ' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      drained queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (a MEASURED empty queue must still say EMPTY with backlog=0)"; fi
 ck "a GENUINELY empty queue still reports 'the queue is empty' with backlog=0 (the guard does not silence the real empty)" $rc
@@ -1537,6 +1539,7 @@ ck "a READABLE queue still hands its head (the unreadable arm is not swallowing 
 main_handoff garbage garbage
 if [ "$MHRC" -eq 0 ] && grep -q 'its HEAD could not be read' <<<"$MHOUT" \
    && grep -q 'backlog=3' <<<"$MHOUT" \
+   && grep -q 'queue_readable=1' <<<"$MHOUT" \
    && ! grep -q 'the queue is empty' <<<"$MHOUT" \
    && ! grep -q 'backlog=0' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      rows/no-head: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (want 'its HEAD could not be read' + backlog=3; NOT 'the queue is empty', NOT backlog=0)"; fi
@@ -1562,6 +1565,7 @@ ck "non-vacuity: the pre-fix \`elif [ -n \"\$_backlog_n\" ]\` restores 'the queu
 main_handoff wcfail wcfail
 if [ "$MHRC" -eq 0 ] && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
    && grep -q 'handed=300' <<<"$MHOUT" \
+   && grep -q 'queue_readable=1' <<<"$MHOUT" \
    && ! grep -q 'queue depth ;' <<<"$MHOUT" \
    && ! grep -q 'backlog= handed' <<<"$MHOUT" \
    && ! grep -q 'could NOT be READ' <<<"$MHOUT"; then rc=0
@@ -1631,6 +1635,7 @@ ck "the HEAD-KNOWN/DEPTH-UNKNOWN arm records handed_why alongside handed (the fi
 main_handoff mode000 mode000
 if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
+   && grep -q 'queue_readable=0' <<<"$MHOUT" \
    && ! grep -q 'Permission denied' <<<"$MHOUT" \
    && ! grep -q 'backlog=0' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      mode-000: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a regular file with no read bit is unreadable: could NOT be READ + backlog=UNKNOWN, and no 'Permission denied' leak)"; fi
