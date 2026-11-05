@@ -829,6 +829,16 @@ case_l() { # <entry-point> <owner>
     # so it may not say the walk "could not be read" (that would name a cause it cannot know, the exact
     # defect the entry point's own comment records). It says the entry/root was kept UNMEASURED and lists
     # the possible causes; case (w) pins the third one.
+    # ⛔ THE RATCHET FOR THE ABSTAINED NOTE (#3057 review cycle 4, P2). The `KEPT as UNMEASURED` assertion
+    # below pins the `unmeasurable=` note; the `census=abstained` note is a SECOND site in the entry point
+    # (`disk-reaper.sh`), and restoring its pre-fix "could not be read" wording there left the whole suite
+    # GREEN — MEASURED: reverting only that sentence gave `62 passed, 0 failed, 5 skipped`. The gap was
+    # exactly one arm, on the token this case exists to drive (`census=abstained`), so it is ratified here:
+    # the note may state the tally and the possible causes, never pick a cause it cannot know.
+    case_check "$(grep -q 'could not be measured (read failure, watchdog, or a root that changed under the pass)' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+               "… and the ABSTAINED note names the possible causes rather than asserting a read failure"
+    case_check "$(grep -q 'could not be read' <<<"$(status_of "$s1")" && echo 1 || echo 0)" \
+               "… and it never claims the walk 'could not be read', which a replaced root would make a falsehood"
     case_check "$(grep -q 'note_runner_work=1 entry/root KEPT as UNMEASURED' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
                "… and the NOTE names it, so an operator finds it without knowing the field exists"
     # ⛔ THE ABSTENTION MUST NOT LAND AS A MEASURED ZERO — the FALSE PASS a review found at this head.

@@ -2480,7 +2480,10 @@ reap_runner_work() {
     # initialised 0. The owner prints the SUMMARY in BOTH modes, so an ARMED pass answers a real count
     # instead of the structural 0 the worktree arm had to fix (#4529).
     # ⛔ A CENSUS THE OWNER COULD NOT TAKE IS `abstained`, AND IT MUST NOT LAND AS A MEASURED ZERO. The
-    # owner's `unmeasurable=` says how many entries/roots it could not read; when NOTHING was reached the
+    # owner's `unmeasurable=` says how many entries/roots it could not MEASURE (an unreadable entry, an
+    # unlistable root, a bounded walk that ran out of time, or a root REPLACED under the pass — the tally has
+    # one field and four causes, which is why the notes below name the tally and never pick one); when NOTHING
+    # was reached the
     # owner publishes `census=abstained`, and NOTHING here may turn that into
     # `candidates_runner_work=0 verdict_runner_work=ok` — the false PASS a review measured at this head
     # (a mode-0111 `_work`: {ok=1, candidates=0, unmeasurable=1, verdict=ok}, dead entry survived).
@@ -2633,7 +2636,8 @@ reap_runner_work() {
         [ -n "$cands" ] && log_line "$cands"
         # ⛔ `kept=` IS NOT A DECISION AND `unmeasurable=` IS AN ABSTENTION — both are on the line, so an
         # operator reading the class line alone can tell "ten entries were written within the floor" from
-        # "ten entries could not be read at all" (the second is a broken probe, not a healthy box).
+        # "ten entries could not be measured at all" (the second is a broken probe or a root that moved, not a
+        # healthy box — so the SERVER of that pair names the causes rather than guessing which).
         log_line "disk-reaper: class=runner-work rc=$RC_RW verdict=$VERDICT_RW mode=dry-run candidates=$(_tally_num "$HAVE_RW_CAND" "$CAND_RW") would_free_du=${WOULD_RW}MB (du estimate) freed_df=0MB min_age=${RUNNER_MIN_AGE}s retained=${_rw_retained:-?} kept=$(_tally_num "$HAVE_RW_CAND" "${_rw_kept:-?}") unmeasurable=$RW_UNMEAS roots=${_rw_roots:-?} gone=$(_tally_num "$HAVE_RW_GONE" "$GONE_RW")"
     else
         if [ "${DF_RW_OK:-0}" = 1 ]; then
