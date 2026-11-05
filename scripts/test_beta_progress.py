@@ -1366,6 +1366,71 @@ def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_
             % (bad_row,))
 
 
+def test_an_empty_object_fix_repo_payload_is_unavailable_not_a_gap(monkeypatch, no_cache):
+    """⛔ THE ONE PAYLOAD THE PER-ROW GATE CANNOT SEE: `{}`.
+
+    `_repo_prs` refuses a non-list, then refuses any row that is not a well-shaped dict. An EMPTY
+    JSON OBJECT (`{}`, rc 0) satisfies BOTH: iterating it yields no row to reject, and
+    `fix_prs.extend({})` is a silent no-op — so the fix repo contributes nothing and the metric
+    reports a GAP for every unit whose fix lives there, which is the exact fail-open direction this
+    change exists to remove (an unreadable repo must read `unavailable`, never `without_pr`).
+
+    ⛔ THIS TEST PINNED A GAP IN THE GATE, measured: deleting `if not isinstance(rows, list):
+    return None` left the suite GREEN at 35 passed, because `{"message": "Not Found"}` happens to
+    be caught one line later (iterating a dict yields its KEYS, which are not dicts) and
+    `{}` was never offered. With the gate removed this test's `compute()` returns a clean-looking
+    `p0 {open: 1, with_pr: 0, without: 1}` instead of `None`.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+            return {}                                # rc 0, an empty JSON OBJECT
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    assert bp.compute() is None, (
+        "an empty-object fix-repo payload must read `unavailable`, never a gap — an unread repo "
+        "that contributes no rows is indistinguishable from a repo with no PRs")
+
+
+def test_the_token_spawn_draws_on_the_phase_clock_too(monkeypatch, tmp_path):
+    """⛔ "ONE CLOCK BOUNDS THE WHOLE PHASE" WAS FALSE BY 5 s — THE CREDENTIAL SPAWN.
+
+    `gh auth token` is a `gh` CHILD on a flat 5 s and `_rest_prs` resolves it BEFORE checking its own
+    deadline, so on a gh-refusing box (keyring config, no env token) the phase's worst case was
+    `PHASE_BUDGET_S + 5 s`. Measured before the fix: with `PHASE_BUDGET_S = 0.0001` `compute()`
+    still spawned `['…/gh', 'auth', 'token', '--hostname', 'github.com']` with `timeout=5`, i.e. the
+    phase can outlive its own clock inside exactly the case the clock was added for.
+    """
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))        # no hosts.yml -> the subprocess path
+    spawned = []
+
+    def fake_run(args, **kw):
+        spawned.append(kw.get("timeout"))
+        raise RuntimeError("stop here — the timeout is the datum")
+
+    monkeypatch.setattr(bp.subprocess, "run", fake_run)
+
+    # A spent clock: refuse, do NOT spend the last seconds of the pass on a credential lookup.
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() - 1)
+    assert bp._token() == ""
+    assert spawned == [], "a spent phase clock must refuse the credential spawn, not run it"
+
+    # A live clock: the child's timeout is what is LEFT of the phase, not the flat 5 s.
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() + 2)
+    assert bp._token() == ""                       # the fake_run raises -> caught -> ""
+    assert spawned and spawned[0] is not None and spawned[0] <= 2.1, (
+        "the credential spawn got %r, not what was left of the phase clock" % (spawned[0],))
+
+
 def test_a_spent_phase_clock_refuses_the_read_instead_of_spawning(monkeypatch):
     """⛔ THE PHASE CLOCK IS WHAT KEEPS THE WORST CASE CONSTANT AS REPOS ARE ADDED.
 
@@ -1421,18 +1486,26 @@ def test_the_phase_budget_fits_the_slack_band_and_holds_the_rest_budget():
       never fire before `run_bounded` kills the tick, so it is an INERT ENFORCER: it looks like
       protection and protects nothing.
 
-    So the pin is two-sided: the phase must FIT the slack band (else it is inert) and must HOLD the
-    REST arm it contains (else the REST reads are clipped by the clock instead of by their own
-    budget). It is deliberately NOT tied to a single-read latency measurement — a phase containing
-    six such reads cannot fit this step whatever the constants say, and that residual is stated in
-    the module rather than papered over with a number the step cannot honour.
+    ⛔ AND THE BAND HAS A FLOOR THE CEILING TEST CANNOT SEE. 60 s fires whenever at least 60 s of
+    the pass remain — the band's middle and up — but it CANNOT fire in the band's bottom (40-59 s),
+    where the tick is killed first; below 40 it is worse, and the harness's own accounting floors a
+    tick residual at 20 s (`heartbeat-loop.sh:414`). The module states that residual instead of
+    claiming the clock covers the whole band. What this test must catch is the OPPOSITE error (a
+    constant so large it can never fire), which is why the ceiling is asserted against the band's
+    TOP — not a figure of speech about "inside the window".
+
+    So the pin is two-sided: the phase must FIT under the band's top (else it is inert) and must
+    HOLD the REST arm it contains (else the REST reads are clipped by the clock instead of by their
+    own budget). It is deliberately NOT tied to a single-read latency measurement — a phase
+    containing six such reads cannot fit this step whatever the constants say, and that residual is
+    stated in the module rather than papered over with a number the step cannot honour.
     """
     assert bp.PHASE_BUDGET_S >= 2 * bp.REST_BUDGET_S, (
         "the REST arm (%ss) must fit INSIDE the phase budget (%ss) with room, or the phase clock "
         "clips reads the REST budget meant to allow" % (bp.REST_BUDGET_S, bp.PHASE_BUDGET_S))
     assert bp.PHASE_BUDGET_S <= 90, (
-        "a phase budget above this step's residual slack (40-90 s) cannot fire before "
-        "`run_bounded` kills the tick — it is an inert enforcer, not a bound")
+        "a phase budget above the TOP of this step's residual slack (40-90 s) cannot fire before "
+        "`run_bounded` kills the tick even in the best case — it is an inert enforcer, not a bound")
     assert bp.PHASE_BUDGET_S < 390, (
         "a phase budget at or above the tick's own kill cannot bound anything")
 
