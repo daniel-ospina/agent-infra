@@ -2427,6 +2427,14 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     mandate_preflight_emit "$log" "$prompt" "$label"
   else
     echo "[mandate-preflight] CANNOT VERIFY $label: mandate-preflight.sh $_mp_why — this spawn cannot tell whether the files it orders a lane to read exist (#3377). Proceeding: a helper that cannot run is not a reading about the box. Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh \$O/" >> "$log"
+    # ⛔ THE LOG IS NOT THE LANE (this change's review cycle 2, P1, MEASURED). #3377 is about the LANE being
+    # ordered to read files that do not exist, and a notice only an operator can read leaves the lane
+    # exactly as blind as before it existed. This branch is the one EVERY box that has not yet received the
+    # helper takes — the population #3377 measured — so the notice goes into the brief as well, where every
+    # other mandate disclosure lands. Idempotent on the same marker the emit uses, or a degraded box would
+    # grow the brief by a line per dispatch.
+    grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null ||
+      printf '%s\n' "[mandate-preflight] CANNOT VERIFY $label: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"
   fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
