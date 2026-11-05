@@ -169,8 +169,11 @@ Dedup by checking for existing open issues with title prefix `clickthrough-failu
 
 ```bash
 # Write the failure report to a file with the `write` tool first, to a path unique to this checkout
-# (never a fixed /tmp name — #729); an inline --body is part of the shell command string and is scanned
-# for destructive git verbs, so a report quoting one is unfilable that way (#3445). Then:
+# (never a fixed /tmp name — #729). The tool takes a LITERAL path, not a shell expansion, so print
+# it — hand THIS output to the tool (#3445); an inline --body is part of the shell command string
+# and is scanned for destructive git verbs, so a report quoting one is unfilable that way (#3445):
+echo "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
+# Then:
 # Repeat the derivation INLINE in the gh call — every bash tool call is a fresh shell, so a
 # `BODY=…` set on an earlier line would be EMPTY here:
 gh issue create \

@@ -348,10 +348,11 @@ canon_reasons_missing() {
   grep -qF -e '#729' -- "$f" 2>/dev/null || miss="$miss citation-729"
   # The TITLE residual must be STATED, not just true: arm E3 measures that a title/label naming a
   # destructive verb is still refused, and this pins the sentence to that fact so the two cannot drift.
-  # ⛔ The PROPERTY is "the sentence names --title AND a refusal", not one of a few fixed wordings:
-  # requiring the adverb "still" false-reds a correct reword ("a `--title` that names a destructive
-  # verb is refused too"), which is the kind of edit the pin exists to ALLOW (measured, round 7).
-  awk 'BEGIN{n=0} /--title/ && /(classif|refus|scan|block|reject|forbid)/ {n=1} END{exit(n?0:1)}' "$f" 2>/dev/null \
+  # ⛔ The sentence must name --title AND state the refusal. That IS a vocabulary, deliberately:
+  # the pin exists so a reword keeps the FACT, and a vocabulary that omits the repo's own words
+  # refuses correct text. Requiring the adverb "still" once false-reddened "is refused too"
+  # (round 7); omitting "gated" false-reddened "is gated as well" (round 8). Widen, never narrow.
+  awk 'BEGIN{n=0} /--title/ && /(classif|refus|scan|block|reject|forbid|gate|denied|deny|prohibit|unsafe|not (exempt|permitted|allowed)|fail)/ {n=1} END{exit(n?0:1)}' "$f" 2>/dev/null \
     || miss="$miss title-residual"
   # ⛔ THE RECIPE HALVES, each of which a review round had to fix and which nothing else pinned:
   #   call1-path   — a line that PRINTS the derived path, BEFORE the gh call, so the `write` tool has
@@ -498,7 +499,7 @@ readme_route_absent() {
       gsub(/[|;]/, "\n", buf)
       gsub(/\. +/, "\n", buf)
       n = split(buf, seg, "\n")
-      for (i = 1; i <= n; i++) if (seg[i] ~ /--title/ && seg[i] ~ /(classif|refus|scan|block|reject|forbid)/) ok = 1
+      for (i = 1; i <= n; i++) if (seg[i] ~ /--title/ && seg[i] ~ /(classif|refus|scan|block|reject|forbid|gate|denied|deny|prohibit|unsafe|not (exempt|permitted|allowed)|fail)/) ok = 1
       exit(ok ? 0 : 1)
     }' || printf '%s\n' "$r(title-residual)"
   printf '%s\n' "$RT" | grep -qi -- 'label' || printf '%s\n' "$r(label-residual)"
@@ -577,6 +578,29 @@ if [ "$(printf '%s\n' "$CENSUS" | canon_in_census "$ROOT/$CANON")" = yes ]; then
   ok "the canonical example ($CANON) is IN the population — the file #3445 is about is measured, not assumed"
 else
   bad "$CANON has no fenced \`issue create\` command — #3445's canonical example has been moved or deleted, so this shard is not measuring it"
+fi
+
+# ── A3: EVERY census file that teaches `--body-file` must PRINT the path FIRST ──
+# The `write` tool takes a LITERAL path, so an example that shows only a shell expansion tells the
+# reader to write to a path it never told it how to obtain — and the reader then invents a fixed
+# `/tmp` name, re-entering the #729 class this change exists to close (measured, round 8: five of the
+# six teach-sites had the instruction and no way to obtain the path).
+NO_PREP=""
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  grep -qF -e '--body-file' -- "$f" 2>/dev/null || continue
+  awk '
+    /^[[:space:]]*(echo|printf)[[:space:]]/ && /\$\(/ { seen = 1 }
+    /gh[[:space:]]+issue[[:space:]]+create/ { if (!seen) { rc = 1 }; exit }
+    END { if (!seen) { rc = 1 }; exit rc + 0 }
+  ' "$f" 2>/dev/null || NO_PREP="$NO_PREP ${f#$ROOT/}"
+done <<EOF
+$(printf '%s\n' "$CENSUS")
+EOF
+if [ -z "$NO_PREP" ]; then
+  ok "A3: every census file that teaches \`--body-file\` prints the derived path (with \`echo\` or \`printf\`) BEFORE the gh call, so the \`write\` tool has a literal target and the reader is not left to invent a fixed \`/tmp\` name (#729)"
+else
+  bad "these files teach \`--body-file\` but never PRINT the derived path before the gh call:$NO_PREP — an example the reader cannot run is an example it will improvise around, and the improvisation is a shared \`/tmp\` name"
 fi
 
 # ── A2: EVERY skill the README claims is "taught by" is actually pinned ─────────────────────────
@@ -771,22 +795,47 @@ fi
 # A predicate that only ever reports "no offenders" is indistinguishable from one that cannot match.
 # Each mutation is DERIVED from the real, current file (not hand-written), so it tracks future edits.
 mkdir -p "$T/mut"
-N_BODY_FILES=0; IDX=0; MUT_INLINE=""; MUT_LITERAL=""
+N_BODY_FILES=0; IDX=0; MUT_INLINE=""; MUT_LITERAL=""; MUT_NOOP=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   grep -qF -e '--body-file' -- "$f" 2>/dev/null || continue
   N_BODY_FILES=$((N_BODY_FILES + 1)); IDX=$((IDX + 1))
   # (i) revert the shape: every `--body-file <path>` becomes the pre-fix inline `--body "<…>"`.
-  sed 's#--body-file [^ ]*#--body "<quoted command>"#g' "$f" > "$T/mut/inline$IDX.md"
+  # ⛔ BOTH SPELLINGS. `gh` accepts `--body-file=<path>` as well as the separated form, and this
+  # shard's OWN literal arm names the `=` form as a spelling a regression may use. A space-only
+  # mutator turns a CORRECT `=`-spelled example into an unchanged "mutant", the arms then find
+  # nothing, and the suite reports them INERT — a false red on a correct tree, blaming the
+  # predicate for the mutator's blind spot (measured, round 8).
+  sed -E 's#--body-file([[:blank:]]+|=)[^[:blank:]]*#--body "<quoted command>"#g' "$f" > "$T/mut/inline$IDX.md"
   MUT_INLINE="$MUT_INLINE$T/mut/inline$IDX.md
 "
-  # (ii) keep the shape, break the PATH: the derived path becomes a literal temp path.
-  sed 's#--body-file [^ ]*#--body-file /tmp/issue-body.md#g' "$f" > "$T/mut/literal$IDX.md"
+  # (ii) keep the shape, break the PATH: the derived path becomes a literal temp path. Both
+  # spellings again (see (i)); the replacement normalises to the separated form.
+  sed -E 's#--body-file([[:blank:]]+|=)[^[:blank:]]*#--body-file /tmp/issue-body.md#g' "$f" > "$T/mut/literal$IDX.md"
   MUT_LITERAL="$MUT_LITERAL$T/mut/literal$IDX.md
 "
+  # ⛔ A MUTANT THAT STILL CARRIES THE SHAPE IT WAS SUPPOSED TO REVERT PROVES NOTHING, and
+  # reporting it as "arm B is INERT" blames the PREDICATE for the MUTATOR's blind spot (measured,
+  # round 8: a correct `--body-file=<path>` example produced exactly those three failures). NOT
+  # `cmp -s` against the source, and not "does the word appear at all": these files name the flag in
+  # PROSE too, so the count of the ARGUMENT SHAPE is the only honest invariant — the inline mutant
+  # must hold none of it, and the literal mutant must hold exactly as many as its source.
+  n_src="$(grep -oE -e '--body-file([[:blank:]]+|=)' "$f" 2>/dev/null | wc -l | tr -d ' ')"
+  n_inl="$(grep -oE -e '--body-file([[:blank:]]+|=)' "$T/mut/inline$IDX.md" 2>/dev/null | wc -l | tr -d ' ')"
+  n_lit="$(grep -oE -e '--body-file[[:blank:]]+/tmp/issue-body\.md' "$T/mut/literal$IDX.md" 2>/dev/null | wc -l | tr -d ' ')"
+  if [ "$n_inl" -ne 0 ] || [ "$n_lit" -ne "$n_src" ]; then
+    MUT_NOOP="$MUT_NOOP $(basename "$f")"
+  fi
 done <<EOF
 $(printf '%s\n' "$CENSUS")
 EOF
+
+# the mutator's own precondition — checked before any arm below is allowed to report INERT
+if [ -z "$MUT_NOOP" ]; then
+  ok "MUTATION precondition: every generated revert mutant is really REWRITTEN (none still carries the shape it was meant to revert), so a green arm below is the PREDICATE being blind — not a mutant that never changed"
+else
+  bad "the MUTATOR left the shape it was told to revert intact in:$MUT_NOOP — it cannot rewrite every spelling this tree may use (separated vs attached); fix the MUTATOR, the arms below are not inert"
+fi
 
 named_all() { # <mode> <newline-separated files> → the names that were NOT reported
   # `while read`, not `for m in $list`: the list is newline-separated PATHS, and a word-split turns a
@@ -804,14 +853,18 @@ EOF
 
 if [ "$N_BODY_FILES" -ge 1 ]; then
   MISSED="$(named_all inline "$MUT_INLINE")"
-  if [ -n "$MISSED" ]; then
+  if [ -n "$MUT_NOOP" ]; then
+    : # the mutator's precondition already failed; an INERT verdict here would misdiagnose it
+  elif [ -n "$MISSED" ]; then
     bad "MUTATION: reverting the fix did NOT redden arm B for:$MISSED — the predicate cannot see the #3445 shape, so arm B is INERT"
   else
     ok "MUTATION: reverting all $N_BODY_FILES fixed file(s) back to the inline \`--body \"…\"\` shape reddens arm B for every one — the revert direction is what this shard exists to refuse"
   fi
 
   MISSED_LIT="$(named_all literal "$MUT_LITERAL")"
-  if [ -n "$MISSED_LIT" ]; then
+  if [ -n "$MUT_NOOP" ]; then
+    : # ditto: the mutator is the fault, the predicate has been shown nothing
+  elif [ -n "$MISSED_LIT" ]; then
     bad "MUTATION: replacing the derived body path with a literal temp path did NOT redden arm B2 for:$MISSED_LIT — the #729 check is INERT"
   else
     ok "MUTATION: replacing the derived body path with a literal temp path reddens arm B2 for all $N_BODY_FILES of them — the #729 collision class is pinned, not just described"
@@ -841,7 +894,7 @@ if [ -n "$(canon_reasons_missing "$T/mut/canon-no-citations.md")" ]; then
 else
   bad 'MUTATION: arm C stayed green on a copy with #3445 and #729 removed — the citation check is INERT'
 fi
-sed 's#--body-file [^ ]*#--body "<quoted command>"#g' "$ROOT/$CANON" > "$T/mut/canon-inline.md"
+sed -E 's#--body-file([[:blank:]]+|=)[^[:blank:]]*#--body "<quoted command>"#g' "$ROOT/$CANON" > "$T/mut/canon-inline.md"
 case "$(canon_reasons_missing "$T/mut/canon-inline.md")" in
   *inline-body*) ok 'MUTATION: reverting the canonical copy to the inline shape reddens arm C through the SCANNER (not a token grep), so a prose mention of --body-file can never stand in for a real example' ;;
   *) bad 'MUTATION: arm C stayed green on a copy whose command reverted to the inline shape — its shape half is reading text, not code' ;;
