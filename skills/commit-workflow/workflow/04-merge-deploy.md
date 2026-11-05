@@ -683,9 +683,10 @@ The deploy is live — this issue tracks the broken journey.
 
 Then:
 ```bash
-BODY="${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
+# Repeat the derivation INLINE in the gh call — every bash tool call is a fresh shell, so a
+# `BODY=…` set on an earlier line would be EMPTY here:
 gh issue create --title "Post-deploy smoke test failure: <journey> on <date>" \
-  --body-file "$BODY" --label "bug,ci-failure,smoke-test" 2>&1
+  --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md" --label "bug,ci-failure,smoke-test" 2>&1
 ```
 
 **Always proceed** to Step 3.8 after smoke test (pass or fail). The smoke test is a detection mechanism, not a gate.

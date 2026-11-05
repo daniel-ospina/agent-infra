@@ -65,8 +65,10 @@ Classify bug complexity and route through `issue-workflow`:
 ```bash
 # Create a bug issue — write the body with the `write` tool first, to a lane-unique path
 # (never a fixed /tmp name — #729), then pass the PATH:
-BODY="${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
-gh issue create --title "Bug: <symptom>" --label "bug,complexity:<tier>" --body-file "$BODY"
+# Repeat the derivation INLINE in the gh call — every bash tool call is a fresh shell, so a
+# `BODY=…` set on an earlier line would be EMPTY here:
+gh issue create --title "Bug: <symptom>" --label "bug,complexity:<tier>" \
+  --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
 # (An inline --body is part of the shell command string and is scanned for destructive git
 #  verbs, so a body quoting one is unfilable that way — #3445.)
 

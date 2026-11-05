@@ -422,7 +422,18 @@ PROBE
   # is structural (heredoc/substitution + interpreter content), not caused by this text. See the (xi) note.
   V="git pu"; V="$V""ll --ff-only"
   INLINE="gh issue create --title \"fix: guard false-block\" --body \"the guard refused $V in a compound command\""
-  BYFILE="gh issue create --title \"fix: guard false-block\" --label \"complexity:micro\" --body-file \"\${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md\""
+  # ⛔ The derivation must appear LITERAL in the probed string, because that is what the skills TEACH.
+  # The earlier form escaped only `${TMPDIR…}` and left the `$( … )` unescaped, so the shard ran the
+  # command substitution at ASSIGNMENT time and classified a pre-expanded path — a command the skills
+  # never teach, whose `git rev-parse` token was already gone. The taught shape DOES carry that
+  # read-only token (string verdict `allow`), so the message below says so instead of claiming no token.
+  BODY_DERIV='$(git rev-parse --absolute-git-dir | cksum | cut -d" " -f1)'
+  BYFILE="gh issue create --title \"fix: guard false-block\" --label \"complexity:micro\" --body-file \"\${TMPDIR:-/tmp}/pi-issue-body-${BODY_DERIV}.md\""
+  # Anti-vacuity: the taught shape must still carry its derivation, or this arm is measuring nothing.
+  case "$BYFILE" in
+    *'$(git rev-parse'*) : ;;
+    *) bad "the probed --body-file command lost its INLINE derivation ('$BYFILE') — the arm would then pin a shape no skill teaches" ;;
+  esac
   INLINE_VERDICTS="$(node "$T/probe.mjs" "$CLASSIFIER" "$INLINE" 2>/dev/null || echo probe-failed)"
   FILE_VERDICTS="$(node "$T/probe.mjs" "$CLASSIFIER" "$BYFILE" 2>/dev/null || echo probe-failed)"
   case "$INLINE_VERDICTS" in
@@ -430,8 +441,8 @@ PROBE
     *) bad "an inline body quoting a destructive verb classified '$INLINE_VERDICTS', not block:* on both classifiers — either the guard's shell scan lost this verb (the fix's premise is now false, so re-derive it) or the probe did not run" ;;
   esac
   case "$FILE_VERDICTS" in
-    allow*allow*) ok "and the --body-file shape classifies '$FILE_VERDICTS' on both — the body never enters the command string, so there is no git token to scan" ;;
-    *) bad "the --body-file shape classified '$FILE_VERDICTS', not allow* on both — if a file payload is now gated, the sanctioned route this shard teaches is blocked and #3445's fix is wrong" ;;
+    allow*allow*) ok "and the TAUGHT --body-file command (derivation inline, as the skills print it) classifies '$FILE_VERDICTS' on both — its only git token is the read-only \`rev-parse\` derivation; no destructive verb is in the body, so nothing refuses it" ;;
+    *) bad "the taught --body-file command classified '$FILE_VERDICTS', not allow* on both — if a file payload (or its read-only derivation) is now gated, the sanctioned route these skills teach is blocked and #3445's fix is wrong" ;;
   esac
 else
   bad "$CLASSIFIER is missing — the premise arm cannot run, so the exemption this shard teaches is unverified"
