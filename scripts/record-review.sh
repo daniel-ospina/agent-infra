@@ -1206,9 +1206,9 @@ post_marker_comment() { # <repo> <pr> <marker>
   # stub `gh` for an unsigned marker, while the same probe on a CLEAN unsigned
   # marker correctly made 0. Trailer-anchoring (` sig=[0-9a-f]{64}$`) does NOT close
   # it either, for the same reason (`note=x sig=<64hex>` ends the marker that way).
-  # `MARKER_SIGNED` is not the fix either: this function has five call sites and
-  # flush_pending_markers / --recover-body do not have it in scope — which is
-  # plausibly why the text match was written in the first place.
+  # `MARKER_SIGNED` is not the fix either: it is assigned only in the MINT path (below
+  # :4826), so a call site that asks for a marker first — flush_pending_markers (:1744)
+  # and --recover-body (:2898) — cannot see it, whatever the GATE_KEY's scope is.
   # So apply the file's OWN doctrine (:2886): "a marker is EVIDENCE only when
   # its `sig=` verifies over its own text". The key is resolved GLOBALLY at :2870,
   # but ⛔ that is NOT above every call site — so this function must never assume
@@ -1254,22 +1254,22 @@ post_marker_comment() { # <repo> <pr> <marker>
   fi
   # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
   # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
-  # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract says a producer
-  # must declare its admission residuals AT THE CONSTANT (ai-review-gate.yml
-  # :86-87, :421-424), so they live here rather than in a PR body nobody re-reads:
+  # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract asks a producer to
+  # declare them AT THE CONSTANT (ai-review-gate.yml :86-87, :421-424), so they live here:
   #   1. AUTHOR SET. A recording identity whose comment reports
   #      `author_association` outside {OWNER, MEMBER, COLLABORATOR} (a GitHub-App
   #      or bot token) is INVISIBLE to its own dedup read and to the gate → one
   #      duplicate comment per run, and no comment-borne evidence admitted. It
   #      degrades to the pre-change behaviour (the body mirror still carries the
-  #      verdict), so the record is never lost. Unarmed on this fleet: `gh`
-  #      authenticates as the repo owner (OWNER ⇒ admitted).
+  #      verdict), so the record is never lost. Unarmed here: `gh` is repo-OWNER.
   #   2. READ-FAILURE ARM. When the comment read FAILS (HAVE_COMMENT=-1) the
   #      durable post is SKIPPED for that call BY DESIGN — an error body printed
   #      to STDOUT must never be read as comment text. Whether a BODY copy exists
   #      is reported by the CALLER, never here: FOUR of the five call sites reach
-  #      this function with no body copy saved (see the success line below for the
-  #      inventory).
+  #      this function with no body copy saved (see the success line below).
+  #   3. VERDICT TIERS. `marker_re` admits only `verdict=clean(-micro|-low)?` (tortoise
+  #      ai-review-gate.yml:612), so a published `not-clean` marker is a durable copy of a
+  #      NEGATIVE verdict the GATE does not admit — it adds no gate availability at all.
   PR_EVIDENCE_COMMENTS_JQ='.[] | select(.author_association == "OWNER" or .author_association == "MEMBER" or .author_association == "COLLABORATOR") | .body'
   HAVE_COMMENT=0
   if EXISTING_COMMENT_BODIES="$(command gh api --paginate \
