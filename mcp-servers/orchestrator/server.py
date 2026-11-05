@@ -680,8 +680,15 @@ def _decode(raw: bytes, cap: int) -> Tuple[str, bool]:
 # while returning 100 bytes. `timeout_s` was also unbounded (`int(args.get("timeout_s") or 60)`, no
 # maximum in the schema), so `timeout_s: 86400` made it unbounded in TIME as well. The realistic
 # trigger is not hostile: `cat` of a large log is the diagnostic use this tool exists for.
-MAX_TIMEOUT_S = 300          # a declared maximum for ANY child, box.exec included
+# ⛔ THE MAXIMA MUST COVER THE LARGEST DECLARED CALL SITE, OR THE CLAMP SILENTLY REWRITES IT. `pr_state`
+# asks for `timeout=400.0` (the whole-board `gh` read); a `MAX_TIMEOUT_S` of 300 turned a slow-but-
+# legitimate read into a FALSE `UNMEASURED(... timeout after 300s)` — the exact failure class (#3382
+# invariant 1: unknown is not zero) this PR exists to remove, introduced by its own bound. A guard arm
+# parses this file and reds if any call site declares more than the constant.
+MAX_TIMEOUT_S = 420          # > the largest declared call site (400.0, `pr_state`)
 MAX_CAP = 2_000_000          # a declared maximum for the returned-bytes cap
+_DEFAULT_TIMEOUT_S = 60.0    # what a degenerate/absent request falls back to
+_DEFAULT_CAP = 200_000
 _DRAIN_CHUNK = 65536
 
 
@@ -714,17 +721,24 @@ def run(argv: List[str], timeout: float = 60.0, cap: int = 200_000,
     if not argv:
         return Ran(argv, error="empty argv")
     # ⛔ CLAMPED, NOT TRUSTED. `timeout` arrives from a tool argument on the `box.exec` path.
+    # ⛔ AND A DEGENERATE VALUE FALLS BACK TO THE DEFAULT, NEVER TO THE MAXIMUM: `cap < 0` used to be
+    # mapped to `MAX_CAP`, i.e. a nonsense-low request produced the LARGEST buffer — the wrong
+    # direction for the very bound this fix exists to impose.
     try:
         timeout = float(timeout)
     except (TypeError, ValueError):
-        timeout = 60.0
-    if not (0 < timeout <= MAX_TIMEOUT_S):
+        timeout = _DEFAULT_TIMEOUT_S
+    if not (timeout > 0):
+        timeout = _DEFAULT_TIMEOUT_S
+    elif timeout > MAX_TIMEOUT_S:
         timeout = MAX_TIMEOUT_S
     try:
         cap = int(cap)
     except (TypeError, ValueError):
-        cap = 200_000
-    if cap < 0 or cap > MAX_CAP:
+        cap = _DEFAULT_CAP
+    if cap < 0:
+        cap = _DEFAULT_CAP
+    elif cap > MAX_CAP:
         cap = MAX_CAP
     started = time.time()
     environ = dict(os.environ)
@@ -1684,18 +1698,23 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         return True, payload
     # ⛔ BOTH ARE CLAMPED HERE, BECAUSE THE SCHEMA DOES NOT BOUND THEM AND `run()`'s OWN CLAMP WOULD
     # OTHERWISE BE THE ONLY ONE — `timeout_s` also goes to `cmux --timeout`, which `run()` never sees.
-    # A caller-supplied `86400` made a hung remote command hold a slot for a day.
+    # A caller-supplied `86400` made a hung remote command hold a slot for a day. A degenerate value
+    # falls back to the DEFAULT, never to the maximum (see `run()`).
     try:
         timeout_s = int(args.get("timeout_s") or 60)
     except (TypeError, ValueError):
         timeout_s = 60
-    if not (0 < timeout_s <= MAX_TIMEOUT_S):
+    if not (timeout_s > 0):
+        timeout_s = 60
+    elif timeout_s > MAX_TIMEOUT_S:
         timeout_s = MAX_TIMEOUT_S
     try:
         cap = int(args.get("max_output") or 20_000)
     except (TypeError, ValueError):
         cap = 20_000
-    if cap < 0 or cap > MAX_CAP:
+    if cap < 0:
+        cap = 20_000
+    elif cap > MAX_CAP:
         cap = MAX_CAP
     cmux = _cmux()
     if cmux is None:
