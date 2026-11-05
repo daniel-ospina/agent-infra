@@ -546,7 +546,21 @@ prune_entry() { # <entry> <root>
                    log_line "KEPT   $entry reason=toctou-unreadable (the re-probe could not answer; NOT removed)"
                    return 0 ;;
             esac
-            if rm -rf "$entry" 2>/dev/null && [ ! -e "$entry" ]; then
+            # ⛔ `rm -rf` IS NOT EVIDENCE THAT THIS PROCESS REMOVED ANYTHING (#3057 review, P2). It exits 0
+            # for a path that no longer exists (measured: `rm -rf /tmp/does-not-exist` → rc 0), so a
+            # checkout the runner cleaned up in the window between the re-probe above and this line was
+            # counted and logged as THIS class's own removal — inflating `reaped=`, which is the gate the
+            # entry point uses to unlock df attribution (`disk-reaper.sh`: a pass with `reaped=0` is not
+            # credited with the delta), and emitting "no content written for >= N s" about an entry that
+            # simply vanished. That is the same GONE-vs-REAPED distinction the classification site above
+            # and the re-probe immediately above already make; this window was the one left unguarded.
+            # ⛔ `-L` IS CHECKED TOO: a DANGLING symlink is not `-e`, so `!-e` alone would report a symlink
+            # this class can legitimately remove as vanished.
+            if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
+                GONE=$((GONE + 1))
+                log_line "GONE   $entry reason=vanished-at-removal (the runner cleaned its own checkout between the re-probe and the removal — nothing removed by this class, and not an abstention)"
+                return 0
+            elif rm -rf "$entry" 2>/dev/null && [ ! -e "$entry" ]; then
                 REAPED=$((REAPED + 1))
                 log_line "REAPED $entry how=rm (no content written for >= ${RUNNER_WORK_MIN_AGE}s)"
                 log "reaped $entry root=$root"
