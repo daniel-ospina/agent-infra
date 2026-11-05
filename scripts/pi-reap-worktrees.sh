@@ -3099,8 +3099,22 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # is worse than a false PASS: a pin tree this box EXECUTES that no record source names falls
     # through to rule 3 and is REMOVED. So the sha record is read when the caller names it, and its
     # root contributes a fourth candidate.
-    # `$HARNESS_PIN` is install.sh:838's and harness-apply-pass.sh:206's own name for the sha record, and
-    # neither exports it, so this arm is INERT unless a box points its pin record somewhere else — which
+    # `$HARNESS_PIN` is `install.sh:838`'s and `harness-apply-pass.sh:206`'s own name for the sha
+    # record. ⛔ THIS ARM IS **LIVE**, NOT INERT — an earlier draft of this paragraph claimed otherwise
+    # and that claim was FALSE (2026-11-05 review; the reader it endangered is the one who deletes
+    # "dead" code, which reopens exactly this PR's failure mode). The measured reach: the installer
+    # RENDERS `HARNESS_PIN` into the launchd job (`scripts/orchestrator-harness/launchd.plist.template:117-118`,
+    # filled from the `install.sh:838` default at `install.sh:1373`) and `launchd-controller.sh:148` lists
+    # it in `CONTROLLER_ENV`, forwarding it ON PRESENCE at `:175-182` — so every process the controller
+    # spawns sees it, including `pr-repair-loop.sh:422`'s `"$SCRIPTS/pi-reap-worktrees.sh" --apply`.
+    # What is true of the two scripts named above is only that neither EXPORTS it; the plist is the
+    # exporter, so "neither exports it" is not evidence about the reaper's environment. It IS inert in
+    # exactly two measured contexts: the plist-launched scheduled disk reaper, whose
+    # `EnvironmentVariables` carry `HOME`/`PATH` and not this key
+    # (`templates/launchd/reaper/com.eldato.disk-reaper.plist:57-60`), and a cell, which names the same
+    # sha record `HARNESS_PIN_RECORD` (`cloud-cell-bringup.sh:90`). Where it IS set but keeps the
+    # installer's default it derives `$HOME`, contributing the same candidate as the third source — so
+    # the arm earns its place on the box that points the sha record somewhere ELSE, which
     # is exactly the box the shape backstop cannot save, because `HARNESS_PIN_DIR` is operator-settable
     # and a custom pin root need not be named `harness`.
     # ⛔ ITS BOUNDARY, DECLARED RATHER THAN IMPLIED — and MEASURED, because the first two drafts of this
@@ -3176,7 +3190,7 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"
         [ -n "$rec_t" ] || continue
         # ⛔ THE RECORD'S OWN CONTENT IS HELD TO THE SAME ABSOLUTENESS RULE (#10114 review P1), and the
-        # asymmetry was the tell: the ARM that names the record is guarded above (`:2702`) with the
+        # asymmetry was the tell: the ARM that names the record is guarded above (`:3127`) with the
         # stated reason "a CWD-relative candidate that IS read", while the CONTENT it reads was not.
         # `$canon` is absolute (`pwd -P`), so a RELATIVE record can only ever match through `rec_c` —
         # and `rec_c` resolves it with `cd "$(dirname …)"`, i.e. against the REAPER'S WORKING
