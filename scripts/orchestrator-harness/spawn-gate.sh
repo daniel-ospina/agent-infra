@@ -1182,8 +1182,9 @@ LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 # that stages broadly. It lives in $O/state, keyed by the lane label.
 LANE_END_BRANCH=""      # the branch the tree is on (or `detached-<sha>`), never invented
 LANE_END_HEAD=""        # HEAD as measured at exit
-LANE_END_PUSH=""        # running | pushed | nothing | unmeasured | detached | verify-unanswered | push-killed |
-                         # refused-main-checkout | refused-protected | refused-unknown-default | FAILED | UNAVAILABLE
+LANE_END_PUSH=""        # running | pushed | nothing | unmeasured | detached | verify-unanswered | push-unreported
+                        #   | push-killed |
+                        #   refused-main-checkout | refused-protected | refused-unknown-default | FAILED | UNAVAILABLE
                         #   (see lane_end_push — `lane_end_next` reads THIS domain, so a value added
                         #    there without an arm there silently loses its `next=` sentence)
 LANE_END_ORIGIN=""      # the sha origin/<branch> held AFTER the push: a read, not a claim
@@ -1382,6 +1383,7 @@ lane_end_push() {
   # worktree rather than a lost branch.
   out="$(tb_timeout 15 git -C "$root" push -u origin "HEAD:refs/heads/$sym" 2>&1)"; rc=$?
   [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/[lane-exit]   /' >> "$log" 2>/dev/null
+  PUSH_RC="$rc"
   if [ "$rc" -ne 0 ]; then
     # ⛔ A TIMED-OUT PUSH IS NOT A MEASURED ABSENCE EITHER (review cycle 12, P2). `rc=124` means the TIMER
     # KILLED THE CLIENT — the ref may already have been applied server-side before the kill, so "STILL only
@@ -1413,9 +1415,14 @@ lane_end_push() {
       echo "[lane-exit] ⛔ label=$label: PUSH CLIENT KILLED (rc=$rc) — $(case "$rc" in 124) printf 'the timer fired at its bound';; 137) printf 'the client was SIGKILLed, and WHICH signal sent it is not measurable from here (an OOM kill on a full disk looks identical), so the 15s bound is NOT proven to have fired';; esac), so this terminal did NOT establish whether origin received the $unpushed commit(s) on $br. The push may have been applied server-side before the kill, and it may not: this is NOT a rejection and NOT a measured absence. Re-run \`git -C $root ls-remote --heads origin refs/heads/$sym\` before re-pushing, and do NOT reap this worktree until that read answers" >> "$log" 2>/dev/null || true
       return 0 ;;
     esac
-    LANE_END_PUSH="FAILED"
-    echo "[lane-exit] ⛔ label=$label: PUSH FAILED (exit $rc) — $unpushed commit(s) on $br are STILL only on this disk. The remote's own words are replayed above; a non-fast-forward means someone else moved the branch and this exit path will NOT force it" >> "$log" 2>/dev/null || true
-    return 0
+    # ⛔ AND A NON-ZERO EXIT IS NOT A MEASURED ABSENCE EITHER (review cycle 16, P2 — REPRODUCED, and an
+    # R2 violation). This arm assigned `FAILED` and said "$unpushed commit(s) are STILL only on this disk"
+    # WITHOUT READING THE REMOTE — the one thing R2 forbids ("a push is verified against the remote, never
+    # trusted from its exit status"). A non-zero exit covers a rejected ref, a transport failure, a
+    # pre-receive hook, and a server that APPLIED the ref and then failed to report — only the first of
+    # which establishes absence. So the rc≠0 path now falls through to the SAME bounded verify read the
+    # rc=0 path uses, and every verdict below is derived from what the REMOTE said.
+    PUSH_RC="$rc"
   fi
   # ⛔ VERIFIED BY READING THE REMOTE, NOT BY THE PUSH'S EXIT STATUS. “Success is not delivery” is this
   # fleet's most-repeated finding, and a push is exactly a transport success that can still leave the
@@ -1442,11 +1449,24 @@ lane_end_push() {
   vraw="$(tb_timeout 5 git -C "$root" ls-remote --heads origin "refs/heads/$sym" 2>/dev/null)"; vrc=$?
   LANE_END_ORIGIN="$(printf '%s\n' "$vraw" | sed -n '1s/[[:space:]].*//p')"
   if [ -z "$LANE_END_ORIGIN" ] && [ "$vrc" -ne 0 ]; then
-    LANE_END_PUSH="verify-unanswered"
-    echo "[lane-exit] ⛔ label=$label: the push exited 0, but the VERIFYING READ of the remote did not answer (ls-remote rc=$vrc at its 5 s bound) — so this terminal can neither confirm nor deny that origin holds refs/heads/$sym. This is NOT a measured absence and NOT a measured delivery: re-run \`git -C $root ls-remote --heads origin refs/heads/$sym\` before reaping. $unpushed commit(s) are UNVERIFIED off-box" >> "$log" 2>/dev/null || true
+    # ⛔ TWO CAUSES, TWO VERDICTS, ONE OF THEM NEW (review cycle 16, P2 — REPRODUCED). When the PUSH ALSO
+    # FAILED, "the push exited 0" is not merely wrong wording — it would be a claim about a fact this
+    # path never measured, which is the class this whole block exists to remove. `push-unreported` is the
+    # honest verdict for "the client reported a failure and the remote would not tell us what it holds":
+    # it asserts neither delivery nor loss, and it does NOT inherit the rc≠0 absence claim this cycle
+    # deleted.
+    if [ "${PUSH_RC:-0}" -eq 0 ]; then
+      LANE_END_PUSH="verify-unanswered"
+      echo "[lane-exit] ⛔ label=$label: the push exited 0, but the VERIFYING READ of the remote did not answer (ls-remote rc=$vrc at its 5 s bound) — so this terminal can neither confirm nor deny that origin holds refs/heads/$sym. This is NOT a measured absence and NOT a measured delivery: re-run \`git -C $root ls-remote --heads origin refs/heads/$sym\` before reaping. $unpushed commit(s) are UNVERIFIED off-box" >> "$log" 2>/dev/null || true
+    else
+      LANE_END_PUSH="push-unreported"
+      echo "[lane-exit] ⛔ label=$label: the push exited $PUSH_RC AND the VERIFYING READ of the remote did not answer (ls-remote rc=$vrc at its 5 s bound) — so this terminal knows the client did not report success and does NOT know what origin holds. That is NOT a measured absence: a server can apply a ref and then fail to report, and a transport failure says nothing about the server. Re-run \`git -C $root ls-remote --heads origin refs/heads/$sym\` before reaping. $unpushed commit(s) are UNVERIFIED off-box" >> "$log" 2>/dev/null || true
+    fi
   elif [ -z "$LANE_END_ORIGIN" ]; then
+    # The REMOTE ANSWERED and the ref is absent — the one thing that does establish this lane's commits are
+    # not on THAT ref. The sentence says only that.
     LANE_END_PUSH="FAILED"
-    echo "[lane-exit] ⛔ label=$label: the push reported success but origin does NOT hold refs/heads/$sym — do not trust the push's exit status here, the remote is the only verdict. $unpushed commit(s) are STILL only on this disk" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: the remote ANSWERED and does NOT hold refs/heads/$sym (push exit ${PUSH_RC:-0}) — the remote is the only verdict, never the push's exit status. $unpushed commit(s) are not on that ref; read the replayed push output above" >> "$log" 2>/dev/null || true
   elif [ -z "$mine" ]; then
     # ⛔ NO HEAD, NO VERDICT (review cycle 2, finding 2 — REPRODUCED: an unreadable HEAD made this arm
     # claim `= this worktree's HEAD` over a matching-by-accident sha, recording push=pushed). `local mine`
@@ -1456,7 +1476,7 @@ lane_end_push() {
     echo "[lane-exit] ⛔ label=$label: the push exited 0 and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read — so nothing proves the remote holds THIS lane's commit. Recorded as FAILED rather than as a delivery; $unpushed commit(s) must be assumed still only on this disk" >> "$log" 2>/dev/null || true
   elif [ "$LANE_END_ORIGIN" != "$mine" ]; then
     LANE_END_PUSH="FAILED"
-    echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine — the push did NOT deliver this lane's commits (a pre-receive hook, a shim that exited 0, or a concurrent move). $unpushed commit(s) are STILL not on that ref; read the replayed push output above" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine — this lane's commits are NOT on that ref (a pre-receive hook, a shim that exited 0, or a concurrent move). Whether they are on some OTHER ref is not measured here; read the replayed push output above" >> "$log" 2>/dev/null || true
   else
     LANE_END_PUSH="pushed"
     echo "[lane-exit] pushed $br → origin refs/heads/$br ($LANE_END_ORIGIN = this worktree's HEAD) — $unpushed commit(s) that existed only on this disk are now off-box" >> "$log" 2>/dev/null || true
@@ -1514,6 +1534,15 @@ lane_end_next() {
       printf 'MANUAL — a push was attempted and exited 0, but the VERIFYING READ of the remote did not answer, so this terminal did NOT establish whether origin holds the commit(s) on %s. Nothing here proves they are off-box and nothing here proves they are lost — do NOT reap %s until `git ls-remote --heads origin refs/heads/%s` answers%s\n' \
         "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" \
         "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
+    # ⛔ `push-unreported` IS A SECOND UNANSWERED-READ VERDICT, NOT A SYNONYM (review cycle 16, P2). Its
+    # cause differs from `verify-unanswered` — the client REPORTED FAILURE and the remote then refused to
+    # say what it holds — so it may not inherit that arm's "a push was attempted and exited 0", which would
+    # be a claim about an exit status this path never measured as 0. Both assert the same absence of
+    # knowledge, which is why both refuse a reclaim.
+    push-unreported)
+      printf 'MANUAL — the push CLIENT REPORTED FAILURE and the VERIFYING READ of the remote did not answer either, so this terminal does NOT know what origin holds for %s: a server can apply a ref and then fail to report, and a transport failure says nothing about the server. Nothing here proves the commit(s) are off-box and nothing here proves they are lost — do NOT reap %s until `git ls-remote --heads origin refs/heads/%s` answers%s%s\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" \
+        "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
     push-killed)
       # ⛔ CAUSE-NEUTRAL, AND THAT IS THE POINT (review cycle 15, P2 — REPRODUCED). The LOG was made
       # rc-specific in cycle 14 but this DURABLE sentence kept saying "TIMED OUT" — which `137` does not
@@ -1549,10 +1578,29 @@ lane_end_next() {
       printf 'MANUAL — the unpushed-commit count on %s could NOT be read (push=unmeasured), so this terminal does NOT know whether the branch exists anywhere but this disk — it does not assert that it does, and it does not assert that it does not. Do NOT reap %s until you have read it yourself (`git rev-list --count origin/%s..HEAD`), and read the [lane-exit] line in the lane log%s\n' \
         "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" \
         "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
-    FAILED|UNAVAILABLE|detached|refused-unknown-default)
-      printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. They survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s\n' \
+    # ⛔ `FAILED` NO LONGER ASSERTS THE STRONGEST ABSENCE (review cycle 16, P2 — REPRODUCED). It used to
+    # share this arm's "exist only on this disk", but `FAILED` is assigned from measurements that do NOT all
+    # establish it: the remote ANSWERED and the ref is ABSENT (the only one that does), and the remote
+    # answered holding a DIFFERENT sha — where the same artifact prints `branch_on_origin=<sha>`, so the
+    # two lines contradicted each other and, when that sha was a DESCENDANT (a peer push or a rail merge of
+    # our commits), the absence was simply false. Its sentence now derives from which of the two was
+    # measured. `UNAVAILABLE|detached|refused-unknown-default` keep the absence claim: each of them means
+    # NOTHING WAS PUSHED while `unpushed>0` WAS measured by rev-list, which is exactly that fact.
+    FAILED)
+      if [ -n "${LANE_END_ORIGIN:-}" ]; then
+        printf 'MANUAL — the remote ANSWERED and holds refs/heads/%s at %s, which is not the HEAD this terminal measured (%s): the commit(s) from this lane were NOT delivered to that ref. Whether they are on some OTHER ref is not measured here, so do NOT reap %s until that is settled — read the replayed push output in the lane log%s%s\n' \
+          "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ORIGIN}" "${LANE_END_HEAD:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" \
+          "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"
+      else
+        printf 'MANUAL — the remote ANSWERED and does NOT hold refs/heads/%s, so the commit(s) on %s are not on that ref; do NOT reap %s. They survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s%s\n' \
+          "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" \
+          "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"
+      fi
+      return 0 ;;
+    UNAVAILABLE|detached|refused-unknown-default)
+      printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. They survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s%s\n' \
         "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" \
-        "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
+        "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
   esac
   # ⛔ AND THE ONE MANUAL ARM THAT DID NOT UNION THE OTHER DOMAIN NOW DOES (review cycle 13, P2 — REPRODUCED).
   # This case used to print its sentence and return, so `push=refused-main-checkout` + `rescue=FAILED` — the
@@ -1564,7 +1612,7 @@ lane_end_next() {
     FAILED)
       printf 'MANUAL — uncommitted work at %s is NOT archived; do NOT reap it. re-run bg-rescue-wip.sh and read its refusal%s\n' \
         "${LANE_END_ROOT:-<unknown>}" \
-        "$(case "${LANE_END_PUSH:-}" in FAILED|UNAVAILABLE|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout) printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; verify-unanswered|push-killed) printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; esac)$(lane_end_tree_caveat)"; return 0 ;;
+        "$(case "${LANE_END_PUSH:-}" in FAILED|UNAVAILABLE|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout) printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; verify-unanswered|push-unreported|push-killed) printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; esac)$(lane_end_tree_caveat)"; return 0 ;;
     UNAVAILABLE)
       # ⛔ `UNAVAILABLE` IS A DIFFERENT CAUSE WITH A DIFFERENT REMEDY (review cycle 14, P2). The rescuer was
       # not FOUND, so "re-run bg-rescue-wip.sh" is a command the operator cannot run — and the log for this
@@ -1572,7 +1620,7 @@ lane_end_next() {
       # the artifact told them identically.
       printf 'MANUAL — the rescue TOOL itself was not found (rescue=UNAVAILABLE), so the uncommitted work at %s was never archived and this row names no copy of it: do NOT reap it. Install `bg-rescue-wip.sh` (the [wip] line in the lane log names the homes that were searched), then re-run it%s\n' \
         "${LANE_END_ROOT:-<unknown>}" \
-        "$(case "${LANE_END_PUSH:-}" in FAILED|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout) printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; verify-unanswered|push-killed) printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; esac)$(lane_end_tree_caveat)"; return 0 ;;
+        "$(case "${LANE_END_PUSH:-}" in FAILED|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout) printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; verify-unanswered|push-unreported|push-killed) printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; esac)$(lane_end_tree_caveat)"; return 0 ;;
   esac
   # ⛔ `cannot-verify` IS A MANUAL VERDICT, SO IT MAY NOT SIT BELOW A REPORTER (review cycle 13, P1 —
   # REPRODUCED). It used to live INSIDE the `dirty|cannot-verify` block far below, so the `archived-local`
@@ -1591,7 +1639,7 @@ lane_end_next() {
       printf 'MANUAL — the tree at %s measured cannot-verify (rescue=%s): the listing was not PROVEN complete, so this terminal did NOT certify the tree and the rescue did not certify it either — which is NOT the same as the tree being clean. Do NOT reap %s on the strength of this row — read the [wip] line in the lane log%s%s\n' \
         "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_ROOT:-<unknown>}" \
         "$(case "${LANE_END_RESCUE:-}" in refs/wip/*) printf ' — the archive is %s (its tree is the worktree as it was left, but the paths the INCOMPLETE listing never saw are in NEITHER)' "${LANE_END_RESCUE}" ;; archived-local) printf ' — AND the archive is the LOCAL pin %s only (no off-box copy), and it cannot cover the paths the incomplete listing never saw' "${LANE_END_REF:-refs/wip-local/<slug>}" ;; esac)" \
-        "$(case "${LANE_END_PUSH:-}" in FAILED|UNAVAILABLE|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout) printf ' — AND the commit(s) on %s were NOT pushed (push=%s)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; verify-unanswered|push-killed) printf ' — AND the branch push at %s did NOT establish delivery (push=%s)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; running) printf ' — AND the push had not returned when this marker was written (push=running), so its delivery was NOT established' ;; esac)"; return 0 ;;
+        "$(case "${LANE_END_PUSH:-}" in FAILED|UNAVAILABLE|unmeasured|detached|refused-unknown-default|refused-protected|refused-main-checkout) printf ' — AND the commit(s) on %s were NOT pushed (push=%s)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; verify-unanswered|push-unreported|push-killed) printf ' — AND the branch push at %s did NOT establish delivery (push=%s)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;; running) printf ' — AND the push had not returned when this marker was written (push=running), so its delivery was NOT established' ;; esac)"; return 0 ;;
   esac
   # ⛔ THE REFUSED-PUSH ARMS SIT **ABOVE** THE `archived-local` REPORTER (review cycle 12, P1 — REPRODUCED).
   # They used to live BELOW it, so a `dirty` tree with `rescue=archived-local` + `push=refused-main-checkout`
@@ -1613,9 +1661,17 @@ lane_end_next() {
       # a LOCAL-ONLY archive, so the hoist above the reporter loses the reader nothing.
       case "${LANE_END_TREE:-}" in
         dirty)
-          printf 'MANUAL — commit(s) on %s were NOT pushed (see the lane log) AND this terminal left uncommitted work at %s (tree=%s, rescue=%s, wip_ref=%s): do NOT reap it. Re-dispatch and push from a lane branch, and recover the uncommitted state from the rescue ref if one is named here\n' \
+          # ⛔ THIS ARM APPS THE SHARED RESCUE CAVEAT TOO (review cycle 16, P2 — REPRODUCED). It was the
+          # ONE manual arm that appended neither helper, and it is the arm written FOR the fleet's worst
+          # reachable state — so with `rescue=archived-local` (a full disk: the archive could only be
+          # written to the LOCAL pin) it printed `rescue=archived-local, wip_ref=refs/wip-local/…` and told
+          # the reader to "recover the uncommitted state from the rescue ref", while omitting the one fact
+          # that makes the state the worst: that pin has NO off-box copy and dies with the cell volume.
+          # Naming the raw `rescue=` value is not naming the fact; that loophole is what kept the helper
+          # from being structural.
+          printf 'MANUAL — commit(s) on %s were NOT pushed (see the lane log) AND this terminal left uncommitted work at %s (tree=%s, rescue=%s, wip_ref=%s): do NOT reap it. Re-dispatch and push from a lane branch, and recover the uncommitted state from the rescue ref if one is named here%s\n' \
             "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_TREE}" \
-            "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_REF:-<none>}"; return 0 ;;
+            "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_REF:-<none>}" "$(lane_end_rescue_caveat)"; return 0 ;;
       esac
       # ⛔ A CLEAN TREE IS NOT A LESSER RISK (review cycle 11, P2). This arm returned WITHOUT `MANUAL`,
       # while `refused-unknown-default` — a refusal that leaves the commits in exactly the same place, on
@@ -2083,7 +2139,7 @@ terminal_wip_rescue() {
       case "${LANE_END_PUSH:-}" in
         pushed)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br existed ONLY locally and the exit path PUSHED them to origin refs/heads/$br (see the [lane-exit] line above) — bg-rescue-wip.sh archives UNCOMMITTED work only, so the branch push is what covers this case" >> "$log" ;;
-        verify-unanswered|push-killed)
+        verify-unanswered|push-unreported|push-killed)
           # ⛔ SAME RULE AS THE ARTIFACT (review cycles 11 and 12): neither verdict measured delivery OR
           # loss, so the log may not say "were NOT pushed" any more than `next=` may say "exist only on
           # this disk". The reader is told exactly what was and was not established.
