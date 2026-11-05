@@ -24,6 +24,14 @@
 #   as reached; (d) the exit status is 1 — an interrupted run must never read green.
 # ARM 2 — HAPPY PATH. A COMPLETE run prints the recap WITHOUT the marker. Without this arm the trap
 #   could fire on every run and arm 1 would still pass, making the marker noise.
+# ARM 3 — THE OUTER JOB'S SLICE MUST NOT REACH THE FIXTURE (#3452). `ci.yml`'s `bash-suites` matrix
+#   exports `BASH_SHARD_SLICE=<i>/<n>` for the WHOLE step, so every shard it runs inherits it — and
+#   this suite's subject is the runner's WHOLE-LIST recap over a THREE-shard fixture list. Inherited,
+#   a slice of 8 over 3 entries has nothing to run and the runner refuses (rc 2), so this shard
+#   reddens on EVERY PR in the sharded lane while it is green on uns harded `main` — a red no diff
+#   can cause. The suite therefore runs its fixtures unsliced (stated, never silent) and this arm
+#   is the MUTATION control: the same fixture WITH the slice must still refuse, so the arm proves
+#   the hazard is real and that the mitigation — not a weakened runner — is what makes arm 2 green.
 #
 # THE CONSUMERS of the marker are pinned next door, in `scripts/ci-failure-set.truncated.test.sh`:
 # `ci_exemption.py` must answer such a capture with UNPROVEN (no ids), and `ci-failure-set.sh` must
@@ -52,6 +60,16 @@ FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
 bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 
+# ⛔ THE FIXTURE'S LIST IS NOT THE JOB'S LIST (#3452). A slice is a MATRIX concern of the job that
+# owns the REAL list — `run-bash-shards.sh`'s own words — and it has no meaning inside a fixture
+# whose list is three entries long. Dropped here, PRINTED so a lane reading the job log can see the
+# value was dropped on purpose instead of wondering why a slice did nothing. ARM 3 pins the reason
+# the drop is needed, so this cannot decay into an unexplained `unset`.
+if [ -n "${BASH_SHARD_SLICE:-}" ]; then
+  echo "  · inherited BASH_SHARD_SLICE='$BASH_SHARD_SLICE' is the OUTER job's slice of the REAL list — the fixture's 3-shard list is not that list, so the fixtures run unsliced (#3452; ARM 3 proves it)"
+fi
+unset BASH_SHARD_SLICE
+
 # ⛔ THE FIXTURE MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING (#3011): a copy of the runner calls
 # `fixture_guard_placement` with the DEFAULT root set, so on a box with a live cell controller the
 # copy would exit 78 and this suite's verdict would depend on the machine. An explicit EMPTY value
@@ -66,6 +84,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/shard-recap.XXXXXX")" || {
 trap 'rm -rf "$TMP"' EXIT
 
 # narrow_runner <out> — the SHIPPED runner with its ONE data list narrowed to the fixture's shards.
+# SLICE_CONTROL — the value ARM 3 hands the fixture: index 5 of 8 over a 3-shard list, i.e. a slice
+# with nothing to run. That is exactly what a real `bash-suites (<n>)` job exports.
+SLICE_CONTROL="5/8"
+
 narrow_runner() {
   awk '
     /^SUITE_GLOBS=\($/ { print "SUITE_GLOBS=( \"shards/*.test.sh\" )"; skip = 1; next }
@@ -219,6 +241,22 @@ if grep -q 'RECAP INCOMPLETE' <<<"$COUT"; then
   bad "the incomplete marker FIRED ON THE HAPPY PATH — a marker that is always present is not a signal"
 else
   ok "the incomplete marker does NOT fire on the happy path (so its presence MEANS something)"
+fi
+
+# ARM 3 — THE MUTATION CONTROL (#3452). Hand the SAME fixture the outer job's slice and the runner
+# must refuse: that is the red this suite shipped in the sharded lane, and this arm is what keeps
+# the mitigation above from being deleted as unexplained noise. The value is written for THIS CHILD
+# only, so the suite's own environment stays unsliced.
+BASH_SHARD_SLICE="$SLICE_CONTROL" bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/sliced.out" 2>&1
+SRC=$?
+SOUT="$(cat "$TMP/sliced.out" 2>/dev/null)"
+# The refusal's count is DERIVED from SLICE_CONTROL, never re-typed: a literal here would let the
+# control drift away from the value it claims to describe and still pass.
+SLICE_COUNT="${SLICE_CONTROL##*/}"
+if [ "$SRC" -eq 2 ] && grep -q "asks for $SLICE_COUNT slice(s) of 3 listed shard(s)" <<<"$SOUT"; then
+  ok "(mutation) the SAME fixture WITH BASH_SHARD_SLICE=$SLICE_CONTROL REFUSES (rc 2) — the hazard ARM 2 is protected from is real"
+else
+  bad "(mutation) a sliced fixture run exited $SRC and did not name the slice refusal — ARM 2's isolation would then be described by nothing: $(tr '\n' '|' <<<"$SOUT" | cut -c1-300)"
 fi
 
 echo ""
