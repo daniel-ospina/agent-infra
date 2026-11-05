@@ -2636,11 +2636,11 @@ abstain_gate() {
 #
 # A pin record is a HOLDER that /proc cannot show: between passes nothing has the tree as its cwd,
 # and the record is the ONLY thing that says the box needs the bytes. So this veto outranks every
-# REMOVE rule exactly like `live-claim` — and, like it, it is a preserve that can never remove.
-# ⛔ NOT "rules 3/4/5": rule 5 is a KEEP (`preserve pr-closed-unmerged`, decision table above), and
-# the removal set is wider than 3/4 — the residue gates and the rule=P aged floor also REMOVE. The
-# authority is the code, so the list is `grep "printf 'remove" scripts/pi-reap-worktrees.sh`, not a
-# sentence here that a new rule can falsify.
+# REMOVE rule THAT CAN FIRE ON A TREE THAT STILL EXISTS, exactly like `live-claim` — and, like it,
+# it is a preserve that can never remove. The one `remove` ABOVE it (`prunable`) fires only on a
+# directory already gone, and `unreadable-path` is a PRESERVE. ⛔ NOT an enumeration to keep: rule 5
+# is a KEEP (`preserve pr-closed-unmerged`), the removal set is wider than any list written here,
+# and the authority is the code — `grep "printf 'remove" scripts/pi-reap-worktrees.sh`.
 #
 # TWO PROBES, and the second exists because the first can be silent:
 #   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
@@ -2682,9 +2682,10 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # paragraph were both wrong in opposite directions. The arm is NORMALISED first — the same
     # trailing-slash strip and `//` collapse `check-farm-drift.sh` needed and does above its `:201` —
     # and then, UNLIKE it, REQUIRES an absolute path. `check-farm-drift.sh` keeps a RELATIVE spelling by
-    # rooting it at `.` (`.pi/agent) _pin_root="."`) because `--pin-file` is "documented with no
-    # absoluteness requirement" (`:182-183`); here the same spelling would derive a CWD-RELATIVE
-    # candidate that is actually READ, so the departure is deliberate and belongs in the record. Without the collapse a `//`-spelled record strips to `<root>/.pi/agent/`, the `/.pi/agent`
+    # rooting it at `.` (`./.pi/agent|.pi/agent) _pin_root="."` at `:201`) because `--pin-file` is
+    # "documented with no absoluteness requirement" (`:182-183`); here the same spelling would derive a
+    # CWD-RELATIVE candidate that is actually READ, so the departure is deliberate.
+    # Without the collapse a `//`-spelled record strips to `<root>/.pi/agent/`, the `/.pi/agent`
     # strip below then does not fire, and the derived candidate becomes `<root>/.pi/agent//.harness-path`
     # — a path the PRODUCTION layout never writes (the dir record lives at `<root>/.harness-path`), so the
     # box is a SILENT MISS and rule 3 removes the tree it executes. Without the trailing-slash strip the
