@@ -559,6 +559,22 @@ esac
 DECL_DEF_OUT="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli "" 2>/dev/null' _ "$HELPER")"
 case "$DECL_DEF_OUT" in *'CANNOT VERIFY'*) ok "…and the NO-ARG default action agrees (same renderer, so the two cannot drift)" ;; *) bad "…but the no-arg default action still rendered empty on an unread declaration" ;; esac
 case "$DECL_LINE_OUT" in *'MISSING'*) bad "…and it must NOT tell the operator to ship files on a box whose declaration could not be read" ;; *) ok "…and it never calls the files MISSING (the remedy is a complete helper, not a deployment)" ;; esac
+# ── E1o: THE FOURTH SURFACE — `--files` (#3379 review cycle 8, P2, MEASURED) ─────────────────────
+# Cycles 2, 5 and 7 each closed this state on ONE verb and left the next one open: `--check`, then
+# `--missing`, then `--line`. `--files` was the last, and it was unguarded and untested — `grep -c -- '--files'
+# mandate-preflight.test.sh` was 0 — so it rendered ZERO BYTES at rc 0 for a declaration that names nothing,
+# which is byte-for-byte the healthy answer. A consumer that PROVISIONS from this list provisions nothing,
+# silently: #3377's silence reached through the helper written to end it. Each arm below is paired with a
+# POSITIVE control, or a helper that always answers 2 would pass it.
+DECL_FILES_RC="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --files >/dev/null 2>&1; printf %s $?' _ "$HELPER")"
+[ "$DECL_FILES_RC" = "2" ]; ck $? "an unread declaration → --files is 2, not 0 with an empty list (measured rc=$DECL_FILES_RC)"
+DECL_FILES_MSG="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --files 2>&1 >/dev/null' _ "$HELPER")"
+case "$DECL_FILES_MSG" in *'CANNOT VERIFY'*) ok "…and --files SAYS cannot-verify on stderr (silence was the defect)" ;; *) bad "…but --files said nothing while answering 0 on an unread declaration" ;; esac
+DECL_FILES_OUT="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --files 2>/dev/null' _ "$HELPER")"
+[ -z "$DECL_FILES_OUT" ]; ck $? "…and it emits NOTHING on stdout, so a consumer cannot mistake the failure for a short list either"
+mkstate
+FILES_OK="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --files 2>/dev/null' _ "$HELPER")"
+[ "$(printf '%s\n' "$FILES_OK" | grep -c .)" = "2" ]; ck $? "POSITIVE CONTROL: a readable declaration still lists both names at rc 0 ($(printf '%s\n' "$FILES_OK" | grep -c .) names) — the guard is not always-2"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
