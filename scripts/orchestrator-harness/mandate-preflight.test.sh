@@ -595,7 +595,12 @@ esac
 # rc 2 means. Both halves are pinned: the true sentence must be there, and the false one must not.
 HELP_OUT="$(bash "$HELPER" --help 2>&1)"
 case "$HELP_OUT" in *'the names are static'*) ok "--help states WHY --files can answer 2 (the declaration renders no names) — the true contract, not the withdrawn over-block" ;; *) bad "--help no longer explains when --files answers 2 — revertible prose with no red" ;; esac
-case "$HELP_OUT" in *'error_state_dir'*|*'unresolvable state dir … renders no names'*) bad "--help still claims the withdrawn over-block" ;; *) ok "…and it does NOT claim the withdrawn over-block (an unresolvable state dir does not block the names)" ;; esac
+# ⛔ THE NEGATIVE HALF WAS ITSELF UNFALSIFIABLE (review cycle 11, P1, MEASURED): its alternatives were a token
+# that appears NOWHERE (`error_state_dir`) and a pattern with a LITERAL `…` where a wildcard was meant, which
+# matched neither the withdrawn sentence nor anything else — so restoring that sentence as an extra `--files`
+# help line left 158 passed, 0 failed. It now anchors on the real phrase from `git show 2a94471c` ("an unread
+# declaration or an unresolvable state dir renders no names"), which the current true sentence does not contain.
+case "$HELP_OUT" in *'unresolvable state dir renders no names'*) bad "--help still claims the withdrawn over-block (an unresolvable state dir does not block the names)" ;; *) ok "…and it does NOT claim the withdrawn over-block (anchored on the real withdrawn phrase, not a fabricated token)" ;; esac
 # ⛔ THE THREE COLLECTORS ARE LISTS, NOT VERDICTS (review cycle 10, P2, MEASURED): each iterates the
 # declaration, so an unread declaration makes all three print nothing at rc 0 — the same false-clean the
 # guarded verbs answer 2 for. Driven directly, the way a future sourced consumer would call them.
@@ -794,12 +799,20 @@ for _mf_cand in '${MANDATE_PREFLIGHT_SH:-}' '${O:-}/mandate-preflight.sh' '$here
 done
 # ⛔ THE DEGRADED BRANCH IS THE ONE EVERY ALREADY-DEPLOYED BOX TAKES (this change's review cycle 2, P1,
 # MEASURED): replacing EITHER `else` body below with `:` left the suite at 110 passed, 0 failed, while
-# nothing at all was written — the silence #3377 exists to end. These are SOURCE pins, the same stated
-# limit §E5 carries for the delegate, because the branch is only reachable with the helper absent.
-grep -qF '[mandate-preflight] CANNOT VERIFY' "$SPAWN"; ck $? "spawn-gate.sh still says CANNOT VERIFY at all on the degraded branch"
-grep -qF 'Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh' "$SPAWN"; ck $? "…and the OPERATOR-LOG line survives with its remedy (a bare grep for the notice was satisfied by the BRIEF append 16 lines below, measured 121/0 with this line deleted)"
-grep -qF '[mandate-preflight] CANNOT VERIFY' "$MERGE"; ck $? "merge-one.sh still says CANNOT VERIFY at all on the degraded branch"
-grep -qF 'orders a reviewer to read exist (#3377). Proceeding: a helper that cannot run is not a reading about the box' "$MERGE"; ck $? "…and the reviewer seam's OPERATOR-LOG line survives too (its parenthetical claim that 'no other notice' exists on that path was inverted — the brief append satisfied the bare grep)"
+# nothing at all was written — the silence #3377 exists to end.
+# ⛔ A GREP FOR THE SENTENCE IS NOT A TEST THAT ANYTHING WAS WRITTEN (review cycle 11, P1, MEASURED, and
+# this is the arm's own history repeating): `: "[mandate-preflight] CANNOT VERIFY …" >> "$log"` keeps every
+# word of the notice and writes NOTHING — 158 passed, 0 failed. The arms below therefore assert the WRITE,
+# not the prose: spawn-gate's is DRIVEN (the real `run_agent` with the resolver forced to fail, so the
+# operator log is read back), and merge-one's is pinned to the `echo` that performs the write (§E5's limit
+# means it cannot be driven). A cycle-8 finding said exactly this and was wrongly recorded as falsified: the
+# counter-mutant had deleted the sentence as well, which reddens a text grep for the wrong reason.
+grep -qF 'echo "[mandate-preflight] CANNOT VERIFY $label:' "$SPAWN"; ck $? "spawn-gate.sh performs the degraded-branch LOG WRITE with its notice (a bare grep for the sentence passed on a mutant that wrote nothing)"
+grep -qF 'echo "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR:' "$MERGE"; ck $? "merge-one.sh performs the degraded-branch LOG WRITE with its notice (same: the sentence without the write is silence)"
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$SPAWN"; ck $? "spawn-gate.sh still carries the notice text on the degraded branch"
+grep -qF 'Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh' "$SPAWN"; ck $? "…with its remedy (a bare grep for the notice was satisfied by the BRIEF append 16 lines below)"
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$MERGE"; ck $? "merge-one.sh still carries the notice text on the degraded branch"
+grep -qF 'orders a reviewer to read exist (#3377). Proceeding: a helper that cannot run is not a reading about the box' "$MERGE"; ck $? "…with the reason (its parenthetical claim that 'no other notice' exists on that path was inverted — the brief append satisfied the bare grep)"
 # merge-one's BRIEF APPEND and its IDEMPOTENCE GUARD are both SOURCE pins for §E5's stated reason (its
 # `run_agent` needs a PR, a chain context and a merge queue, so its behaviour cannot be driven here). Each
 # is pinned to text ONLY that line carries, because a bare grep for the notice was satisfied by the OTHER
@@ -837,6 +850,13 @@ PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran5.log" O="$TMP/O" CELL_HOME="$TMP/home2
   _ "$SPAWN" "$FIXREPO" "$TMP/seam5.log" "$BRIEF5" >/dev/null 2>&1
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$BRIEF5"; ck $? "an UNRESOLVABLE helper still tells the LANE it cannot verify (#3377's own population: a box without the helper)"
 grep -qF '[mandate-preflight] CANNOT VERIFY' "$TMP/pi-ran5.log" 2>/dev/null; ck $? "…and the line is in the ARGV the agent was launched with, not only in a log the lane never reads"
+# ⛔ THE OPERATOR LOG MUST ACTUALLY RECEIVE IT (review cycle 11, P1, MEASURED). The two source greps above
+# assert the SENTENCE is in the file; `: "[mandate-preflight] CANNOT VERIFY …" >> "$log"` keeps every word,
+# writes nothing, and passed at 158/0 — the operator's only record on the branch every un-provisioned box
+# takes, gone with a green suite. This arm reads the log back from the SAME drive, so it fails on a mutant
+# that keeps the prose.
+grep -qF '[mandate-preflight] CANNOT VERIFY' "$TMP/seam5.log" 2>/dev/null; ck $? "the OPERATOR LOG actually receives the degraded notice (a mutant that keeps the sentence but writes nothing used to pass here)"
+grep -qF 'Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh' "$TMP/seam5.log" 2>/dev/null; ck $? "…with its remedy in the log, so an operator is told how to fix the box and not merely that it is broken"
 # ⛔ ONE NOTICE PER DISPATCH, NOT ONE PER ATTEMPT (this change's review cycle 3, P1, MEASURED): the suite
 # drove this branch ONCE, so no arm could see a second append — deleting the idempotence guard left 121
 # passed, 0 failed while a degraded box grew its brief by a line per dispatch (measured 2 notices after two
