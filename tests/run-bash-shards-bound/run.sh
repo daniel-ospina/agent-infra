@@ -201,6 +201,85 @@ else
   fail "the hermeticity control did not see the injected values (rc $MUT_RC) — this arm cannot detect an inherited runner variable: $(tr '\n' '|' <"$MUT_PROBE" | head -c 300)"
 fi
 
+# ── 0b. A SHARD DOES NOT INHERIT THIS PROCESS'S DISPATCH ENV (agent-infra#3415/#2741) ──────────
+# §0 above makes THIS SUITE hermetic by hand: it re-execs and unsets all three runner variables. That
+# is a workaround for ONE suite, and by 2026-11-05 eighteen suites needed the same workaround and only
+# some had it — so eight `bash-suites` slices were red on a tree where no suite and no diff was wrong,
+# while the UNSLICED jobs (`bash-suites-gate`, main's single-job `script-validate`) stayed green. The
+# root was never the suites: `shard_run_bounded` handed each shard `bash "$1"` and therefore its OWN
+# dispatch env, so a RE-ENTRANT suite (one whose fixture runs the real runner on its own list) read the
+# parent's slice as its own and refused or ran 1/n of its staged shards.
+#
+# So the pin belongs at the ROOT, with the pollution injected by the RUNNER'S OWN MATRIX SHAPE: run the
+# real runner WITH a slice and a bound in its env, and require a shard to see neither. This arm is the
+# only place in the repo that can fail if someone restores the plain `bash "$1"` — the 18 affected
+# suites pass on a laptop, where nothing exports these, which is exactly why the leak survived.
+echo "0b. A SHARD CANNOT SEE THIS PROCESS'S SLICE, BUDGET OR BOUND (#3415/#2741)"
+ENVFIX="$TMP/envfix"
+probe_shard() { # <root> — add a shard that reports the runner env it was handed
+  mkdir -p "$1/tests/nnn-envprobe"
+  {
+    printf '#!/bin/bash\n'
+    printf 'printf "PROBE SHARD_BOUND=%%s\\n" "${SHARD_BOUND-<unset>}"\n'
+    printf 'printf "PROBE BUDGET=%%s\\n" "${BASH_SHARDS_BUDGET_SECS-<unset>}"\n'
+    printf 'printf "PROBE SLICE=%%s\\n" "${BASH_SHARD_SLICE-<unset>}"\n'
+    printf 'exit 0\n'
+  } >"$1/tests/nnn-envprobe/run.sh"
+}
+if stage_fixture "$ENVFIX" 0; then
+  probe_shard "$ENVFIX"
+  # A whole-list slice (`1/1`) is a REAL slice this runner accepts, and it is the harshest input: the
+  # value reaches every shard unchanged today, so the probe reports it verbatim when the handover is
+  # restored. `SHARD_BOUND=0` rides along because it is the third member of the same env contract and
+  # `0` is legitimate runner config, so a set-but-meaningful value is what a shard would have inherited.
+  # ⛔ AND `BASH_SHARDS_BUDGET_SECS=0` IS SET FOR THE SAME REASON (review of this arm, P3): with it
+  # merely `unset` in the parent, the probe reports `<unset>` whether or not `shard_exec` clears it, so
+  # the budget clause was pinned by nothing — measured: dropping `-u BASH_SHARDS_BUDGET_SECS` from
+  # `shard_exec` still passed the arm. `0` is an accepted companion to a slice (only a POSITIVE budget
+  # conflicts, run-bash-shards.sh:407-411 — tests/ci-lane-parity/run.sh:1162 pins that pair), so a set
+  # value is what makes this arm able to see the leak.
+  SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids" bash "$ENVFIX/scripts/runner.sh" >"$TMP/envprobe.out" 2>&1
+  ENV_RC=$?
+  if [ "$ENV_RC" -eq 0 ] \
+    && grep -qx 'PROBE SHARD_BOUND=<unset>' "$TMP/envprobe.out" \
+    && grep -qx 'PROBE BUDGET=<unset>' "$TMP/envprobe.out" \
+    && grep -qx 'PROBE SLICE=<unset>' "$TMP/envprobe.out"; then
+    pass "a shard run under BASH_SHARD_SLICE=1/1 SHARD_BOUND=0 sees NONE of them — a re-entrant suite cannot inherit its caller's dispatch"
+  elif ! grep -q 'PROBE ' "$TMP/envprobe.out"; then
+    fail "the probe shard did not run at all (rc $ENV_RC) — this arm cannot see an inherited value: $(printf '%s' "$(cat "$TMP/envprobe.out")" | tail -3 | tr '\n' '|')"
+  else
+    fail "a shard INHERITED this process's dispatch env (rc $ENV_RC): $(grep 'PROBE ' "$TMP/envprobe.out" | tr '\n' '|')"
+  fi
+  # ⛔ THE CONTROL RESTORES THE DEFECT (the same mutate-a-copy idiom as §0's control): with the `env -u`
+  # handover replaced by a plain `bash "$1"`, the SAME probe MUST come back carrying the values. Without
+  # this, an arm that could not observe the leak would pass forever and certify the very handover it
+  # exists to forbid.
+  MUTENV="$TMP/envfix-mutant"
+  if stage_fixture "$MUTENV" 0; then
+    probe_shard "$MUTENV"
+    sed 's|env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash|bash|' \
+      "$RUNNER" >"$MUTENV/scripts/runner-mutant.sh"
+    if cmp -s "$RUNNER" "$MUTENV/scripts/runner-mutant.sh"; then
+      fail "the dispatch-env mutation did not change the runner — the handover is not one \`env -u\` line, so this control has no control"
+    else
+      SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids-mutant" bash "$MUTENV/scripts/runner-mutant.sh" >"$TMP/envprobe-mutant.out" 2>&1
+      MUTENV_RC=$?
+      if [ "$MUTENV_RC" -eq 0 ] \
+        && grep -qx 'PROBE SHARD_BOUND=0' "$TMP/envprobe-mutant.out" \
+        && grep -qx 'PROBE BUDGET=0' "$TMP/envprobe-mutant.out" \
+        && grep -qx 'PROBE SLICE=1/1' "$TMP/envprobe-mutant.out"; then
+        pass "control: with the handover restored the same probe DOES see SLICE=1/1, BUDGET=0 and SHARD_BOUND=0 — this arm can see the leak it guards"
+      else
+        fail "the dispatch-env control did not observe the injected values (rc $MUTENV_RC): $(grep 'PROBE ' "$TMP/envprobe-mutant.out" | tr '\n' '|')"
+      fi
+    fi
+  else
+    fail "could not stage the dispatch-env control fixture"
+  fi
+else
+  fail "could not stage the dispatch-env fixture"
+fi
+
 echo "1. A SHARD THAT OUTLIVES THE BOUND IS KILLED, NAMED, AND DOES NOT SWALLOW THE LIST (#3187)"
 FIX="$TMP/fixture"
 stage_fixture "$FIX" 30
