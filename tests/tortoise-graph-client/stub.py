@@ -7,14 +7,17 @@ call so the suite can assert WHAT was called, not merely that something was:
   - `retired`  the real #3883 shape: the answer arrives as TWO text blocks, the second being a
                `RETIRED TOOL: …` notice. Folding both is what made `get`/`health`/`stats` print
                their JSON *plus* a paragraph while every exit code stayed 0.
-  - `empty`    the server's not-found convention: `{}` with `isError: false`.
+  - `empty`    the server's not-found convention: `{}` with `isError: false`; `empty_list` the
+               legitimate `[]` a LIST verb may answer.
   - `poison`   a healthy result whose CONTENT mentions "RETIRED TOOL:" mid-line — the false-block
                direction: a read of such a point must still succeed.
+  - `budget`   the server's tool-error shape: `isError: true` with a text block. Nothing set this
+               mode, so the client's `isError` branch was never driven — a timed-out call could
+               print the error text as the answer at exit 0 and no arm noticed.
 
 usage: stub.py <control-dir> <port>
   reads   <control-dir>/mode   before each reply
-  appends <control-dir>/calls.jsonl  (one JSON body per line)
-"""
+  appends <control-dir>/calls.jsonl  (one JSON body per line)"""
 import json
 import os
 import sys
@@ -26,11 +29,13 @@ CTL, PORT = sys.argv[1], int(sys.argv[2])
 # serves the SUBSET the client touches, which is what the suite needs). The suite asserts every call
 # the client makes is a member — that is R5, stated as data instead of prose.
 #
-# ⛔ IT IS WRITTEN TO `<ctl>/advertised.json` AT STARTUP AND THE TEST READS *THAT* (#3374 review P2).
-# The list used to be copied THREE times — here, in `run.sh`'s R5 arm, and in a dead `advertised()`
-# helper — so the arm compared the client against a hand-written list rather than against the surface
-# the stub actually serves, and the WRITE verbs were never driven at all: a client calling a retired
-# write handler kept R5 green. One list, emitted by the process that serves `tools/list`.
+# ⛔ THIS IS THE **ONLY** COPY, AND IT IS SERVED — NOT EXPORTED TO A SIDE FILE (#3374 review P2).
+# The list used to exist three times: here, in `run.sh`'s R5 arm, and in a dead `advertised()` helper.
+# So the arm compared the client against a hand-written list rather than against the surface this
+# process actually SERVES, and the WRITE verbs were never driven at all: a client calling a retired
+# write handler kept R5 green. `run.sh` now POSTs `tools/list` to this server and compares the
+# recorded calls against THAT answer — so an entry dropped here is dropped from the surface the arm
+# reads, and the suite has no second copy to disagree with.
 #
 # `tortoise_create_operator` is here because the client's write path calls it (with the served
 # (op_type, source_id, target_ids, direction, semantics) signature). It was MISSING from this set,
@@ -43,14 +48,18 @@ ADVERTISED = {
     "tortoise_create_operator",
 }
 
-with open(os.path.join(CTL, "advertised.json"), "w") as _fh:
-    json.dump(sorted(ADVERTISED), _fh)
-
 OK_POINT = '{"id":"pt_abc","content":"a point","pointKind":"statement"}'
 
 
 def reply_for(body):
-    mode = open(os.path.join(CTL, "mode")).read().strip()
+    # ⛔ A MISSING MODE FILE IS "ok", NOT A CRASH. The served surface is fetched with `tools/list`
+    # BEFORE the first arm calls `mode()`, so `open(mode)` raised FileNotFoundError, the handler died
+    # and the client saw `RemoteDisconnected` — a stub that answers `tools/call` but not the one
+    # request that tells the client what the surface IS.
+    try:
+        mode = open(os.path.join(CTL, "mode")).read().strip()
+    except FileNotFoundError:
+        mode = "ok"
     method, rid = body.get("method"), body.get("id")
     if method == "tools/list":
         result = {"tools": [{"name": n} for n in sorted(ADVERTISED)]}

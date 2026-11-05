@@ -90,16 +90,41 @@ except FileNotFoundError:
 print("%s\t%s" % (name, args))
 PY
 }
-advertised() {   # is $1 a tool the served `tools/list` advertises?
-  python3 - "$1" "$TMP/advertised.json" <<'PY'
-import json, sys
-# ⛔ THE SET COMES FROM THE PROCESS THAT SERVES `tools/list`, NOT FROM A SECOND COPY IN THIS FILE
-# (#3374 review P2). The old body hardcoded four names beside the stub's own four names, so this
-# helper agreed with the client's assumptions rather than with the surface — and it was never
-# called, which is how the drift stayed invisible.
-print("yes" if sys.argv[1] in set(json.load(open(sys.argv[2]))) else "no")
+# ⛔ THE SERVED SURFACE IS READ FROM THE SERVER THAT SERVES IT, NEVER RESTATED HERE (#3374 review P2).
+# The set used to exist THREE times — in the stub, in the R5 arm below, and in an `advertised()`
+# helper that nothing ever called — so the arm compared the client against a hand-written list that
+# agreed with another hand-written list, not against the surface. That is how `tortoise_create_operator`
+# (which the client's write path calls) stayed MISSING from the "advertised" set while R5 stayed green.
+# One list, owned by the stub, fetched here over the same loopback `tools/list` a client would use.
+served_list() {
+  python3 - "$PORT" "$TMP/served.json" <<'PY'
+import json, sys, urllib.request
+body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}).encode()
+req = urllib.request.Request("http://127.0.0.1:%s/" % sys.argv[1], data=body,
+                             headers={"Content-Type": "application/json"})
+tools = json.load(urllib.request.urlopen(req, timeout=5))["result"]["tools"]
+names = sorted(t["name"] for t in tools if isinstance(t, dict) and t.get("name"))
+json.dump(names, open(sys.argv[2], "w"))
+print(",".join(names))
 PY
 }
+
+# The surface is fetched ONCE, before any arm, and asserted NON-EMPTY: an empty set makes every
+# membership test below pass vacuously.
+echo "== the SERVED surface: read from the server's own tools/list, which is what R5 asserts against"
+SERVED="$(served_list)"
+SERVED_N="$(printf '%s\n' "$SERVED" | awk -F, '{print NF}')"
+[ -n "$SERVED" ] && [ "$SERVED_N" -gt 0 ] \
+  && pass "tools/list answers with a non-empty surface (${SERVED_N} tools) — R5 has something to compare against" \
+  || fail "tools/list returned NOTHING — an EMPTY served set makes every membership test pass, so R5 would certify a client that calls anything"
+# NON-VACUITY OF THE SURFACE ITSELF: the two handlers the WRITE path calls must be advertised by the
+# server, or R5's "every call is advertised" is a comparison against a set that omits the very tools
+# the defect lived on.
+for NEED in tortoise_create_point tortoise_create_operator; do
+  printf '%s\n' "$SERVED" | tr ',' '\n' | grep -qx "$NEED" \
+    && pass "…and the served surface advertises $NEED (the write handler R5 must be able to check)" \
+    || fail "tools/list does not advertise $NEED — the surface R5 compares against is missing a handler the client calls, so the write path cannot be covered"
+done
 
 echo "== get: the ADVERTISED handler, the right arguments, and nothing else on stdout"
 mode ok
@@ -148,6 +173,21 @@ call search 'nothing matches this'
 [ "$RC" -eq 0 ] && pass "search '\[]' → exit 0 (an empty LIST is a legitimate answer, not an error)" \
   || fail "search exited $RC on a legitimate empty list — the empty-result rule leaked into a list verb"
 
+echo "== a server-side tool ERROR is a REFUSAL, not a result"
+# The stub's `budget` mode is the real shape of a server-side tool error (`isError: true` + a text
+# block). Before this arm NOTHING set that mode, so the client's `isError` branch was never driven by
+# the suite: a timed-out write that answered `isError` could print its error text on stdout at exit 0
+# and every arm stayed green.
+mode budget
+call get pt_abc
+[ "$RC" -eq 4 ] && pass "an isError answer (the server's wait-budget shape) exits 4 — an error is not a result" \
+  || fail "an isError answer exited $RC (must be 4): the tool's error text is then read as an answer, and a lane reports a value the server refused to produce"
+printf '%s' "$ERR" | grep -q 'GRAPH-TOOL-ERROR' \
+  && pass "…and NAMES it: GRAPH-TOOL-ERROR on stderr" \
+  || fail "…but never named the tool error (stderr: $ERR)"
+[ -z "$OUT" ] && pass "…and prints NOTHING on stdout (no error text dressed as data)" \
+  || fail "…but still printed a payload on stdout: $(printf '%s' "$OUT" | head -c 120)"
+
 echo "== health and stats call the ADVERTISED handlers"
 mode ok
 call health
@@ -174,6 +214,14 @@ for verb in "health" "stats" "search attestation" "get pt_abc" \
   call $verb
   [ "$RC" -le 4 ] || fail "verb '$verb' exited $RC — not a documented exit (0/2/4)"
 done
+# ⛔ NON-VACUITY ON THE LOG ITSELF (#3374 review P2). There was no `[ -s … ]` guard, so a loop that
+# made ZERO calls stayed green: `call get` with no id is a USAGE error (exit 2, which the `-le 4`
+# above accepts) and never reaches the server, so the membership arm below compared an EMPTY log
+# against the surface and printed `✅ every recorded tools/call is an ADVERTISED handler` for a client
+# that called nothing. An empty log and a perfect log must not be indistinguishable.
+[ -s "$TMP/calls.jsonl" ] \
+  && pass "the R5 loop really drove the client ($(grep -c '"tools/call"' "$TMP/calls.jsonl") tools/call record(s) in the log) — the membership arm below is not vacuous" \
+  || fail "the R5 loop recorded NO tools/call at all — every verb stopped before the server (a usage error still exits 2), so the membership arm below would pass against an empty log"
 call evidence 'measured 42 things' --to pt_target
 [ "$RC" -eq 0 ] || fail "evidence --to exited $RC (the write+edge path)"
 # ⛔ THE WRITE CALLS ARE PINNED BY THEIR ARGUMENTS, NOT BY THEIR NAMES (#3374 review P1). Asserting
@@ -204,7 +252,7 @@ ok_op = op == {
 ok_pt = pt.get("kind") == "evidence" and bool((pt.get("content") or "").strip())
 sys.exit(0 if ok_op and ok_pt else 1)
 PY
-bad="$(python3 - "$TMP/calls.jsonl" "$TMP/advertised.json" <<'PY'
+bad="$(python3 - "$TMP/calls.jsonl" "$TMP/served.json" <<'PY'
 import json, sys
 ADVERTISED = set(json.load(open(sys.argv[2])))
 seen, bad = set(), []
@@ -222,8 +270,16 @@ if missing:
 print(",".join(sorted(set(bad))))
 PY
 )"
-[ -z "$bad" ] && pass "every recorded tools/call is an ADVERTISED handler — and both WRITE tools were exercised" \
-  || fail "the client calls UNadvertised handler(s), or the write path was never driven: $bad — the surface will append a retirement notice to each answer and the JSON contract breaks"
+if [ $? -ne 0 ]; then
+  # ⛔ AN UNREADABLE SURFACE IS A RED, NOT AN EMPTY `bad` (#3374 review P2 class). Before this, a
+  # failed python wrote nothing to stdout, `bad` came back EMPTY, and the arm below printed
+  # `✅ every recorded tools/call is an ADVERTISED handler` — the same vacuity the `[ -s … ]` guard
+  # closes for the log, one file over.
+  fail "could not evaluate R5: $TMP/served.json or $TMP/calls.jsonl is unreadable, so 'every call is advertised' was never actually checked"
+else
+  [ -z "$bad" ] && pass "every recorded tools/call is an ADVERTISED handler — and both WRITE tools were exercised" \
+    || fail "the client calls UNadvertised handler(s), or the write path was never driven: $bad — the surface will append a retirement notice to each answer and the JSON contract breaks"
+fi
 
 echo
 if [ "$failures" -eq 0 ]; then
