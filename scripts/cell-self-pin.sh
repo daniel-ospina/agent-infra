@@ -1393,26 +1393,27 @@ verify_timer() { # <rendered timer> [expected Unit= target]
 # installed rc=0 and NOTHING in the run mentioned the file — the same false PASS one directory over, on the
 # very defect class (#3194's drop-in) this section exists for. The dirs are enumerated from systemd's own
 # rule rather than a list of the paths somebody happened to think of.
-# ⛔ THE ROOT LIST MUST BE systemd's OWN LOAD PATH, AND IT WAS THREE PATHS SOMEBODY THOUGHT OF. On systemd
-# 255 `systemd-analyze unit-paths` lists TWELVE entries; the ones that merge a `<unit>.d/*.conf` over a unit
-# are the seven below (MEASURED with a probe drop-in planted under each root and `systemd-analyze verify
-# --root`: `etc/systemd/system.control`, `run/systemd/system.control`, `etc/systemd/system.attached`,
-# `run/systemd/system.attached`, `/etc/systemd/system`, `/usr/local/lib/systemd/system` and
-# `/usr/lib/systemd/system` all merged; `run/systemd/transient` and the three `generator` entries did not).
+# ⛔ THE ROOT LIST MUST BE systemd's OWN LOAD PATH, AND IT WAS THREE PATHS SOMEBODY THOUGHT OF. MEASURED on
+# systemd 255, with a probe drop-in planted under each candidate and `systemd-analyze verify --root`:
+# `systemd-analyze unit-paths` prints TWELVE entries, and EIGHT of them merge a `<unit>.d/*.conf` over the
+# unit — the four `.control`/`.attached` roots, `/etc/systemd/system`, `/run/systemd/system`,
+# `/usr/local/lib/systemd/system` and `/usr/lib/systemd/system`. `run/systemd/transient` and the three
+# `generator` entries did NOT merge in that measurement, so they are deliberately not listed (listing a
+# directory that cannot hold an effective drop-in would only add a refusal surface). The ninth entry,
+# `/lib/systemd/system`, is the same directory as `/usr/lib/systemd/system` on a non-usrmerge host.
 # `systemd.unit(5)` Table 1 puts `/usr/local/lib/systemd/system` — "System units installed by the
 # administrator" — ABOVE `/usr/lib/systemd/system`, and lists the `.control`/`.attached` entries as
 # "Persistent and transient configuration created using the dbus API", which is ABOVE `/etc/systemd/system`.
-# ⛔ AND THIS LIST WAS ALREADY WRONG TWICE: it once omitted `/usr/local/lib/systemd/system`, and then it
-# omitted all four `.control`/`.attached` roots — each time leaving a directory systemd DOES merge read by
-# nothing, i.e. #3194's false PASS in the one function whose job is to close it (rounds 5 and 4 of review).
-# The static paths stay (an installer must work with no `systemd-analyze` on the box); what changed is that
-# the set is now the MEASURED merge set rather than the four somebody happened to write down. The list below omitted it, so a legacy
-# `cell-self-pin.service.d/*.conf` carrying the very `WorkingDirectory=/tmp/cell-ai` this change exists to
-# remove was merged OVER the rendered unit by systemd and read by NOTHING, while `--install` printed
-# "installed — ONE actuator on this pin" and exited 0: the exact false PASS this section exists to close,
-# in the directory an administrator building a cell by hand is most likely to use. `/lib/systemd/system` is
-# the same directory on a non-usrmerge host, and `/etc/systemd/system` is scanned even when the caller
-# redirects the unit dir (`SYSTEMD_UNIT_DIR`, which the suite uses), because systemd loads it regardless.
+# ⛔ AND THIS LIST HAS BEEN WRONG TWICE, BOTH TIMES AS A SUBSET: it once omitted
+# `/usr/local/lib/systemd/system`, and then it omitted all four `.control`/`.attached` roots — each time
+# leaving a directory systemd MERGES read by NOTHING, so a legacy `cell-self-pin.service.d/*.conf` carrying
+# the very `WorkingDirectory=/tmp/cell-ai` this change removes was merged OVER the rendered unit while
+# `--install` printed "installed — ONE actuator on this pin" and exited 0: #3194's false PASS inside the
+# function whose only job is to close it (review rounds 5 and 4). The static paths stay, because an
+# installer must work on a box with no `systemd-analyze`; what changed is that the set is the MEASURED
+# merge set rather than the four somebody happened to write down.
+# `/etc/systemd/system` is scanned even when the caller redirects the unit dir (`SYSTEMD_UNIT_DIR`, which
+# the suite uses), because systemd loads it regardless of what any install targets.
 # `CELL_SELF_PIN_DROPIN_ROOTS` is the SEAM the suite plants a drop-in under: the real roots are root-owned,
 # so a leg that cannot write them proves nothing about the enumeration — and MEASURED, deleting `/run` and
 # `/usr/lib` from this list left the suite at 240 ok / 0 failed, i.e. nothing pinned it at all.
