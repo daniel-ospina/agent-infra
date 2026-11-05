@@ -2325,8 +2325,8 @@ if [ -d "$DELTA_REPO" ]; then
   # feature silently INERT — while this suite stayed green: (33a)/(33a2) never look at
   # `carry_arm`, and (33f2) only proves the reader agrees about a record nothing should produce.
   # It is the PAIR that is asserted, not the word: `--check-carry` requires `carry_arm` AND
-  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:2407-2418) BEFORE it
-  # head-binds at :2443, so a delta record missing either is a no-record for the gate.
+  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:2761-2770) BEFORE it
+  # head-binds at :2796-2800, so a delta record missing either is a no-record for the gate.
   D_REC_A6="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
   CC_RC_A6=0
   CC_OUT_A6="$( cd "$DELTA_REPO" || exit 9
@@ -2527,11 +2527,11 @@ INNERPY
   # at all), so deleting `|| [ "$DELTA" -eq 1 ]` from the one-verb guard — or dropping the
   # `[ "$DELTA" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]` arity guard, or the delta arm of the
   # `--evidence/--force-stale/--expect-head` refusal — reddened NOTHING while restoring exactly
-  # the false PASS the guard comment at `:1268-1274` says was MEASURED (`--delta
+  # the false PASS the guard comment at `:1531-1548` says was MEASURED (`--delta
   # --print-diff-hash` exited 0 with the record untouched; `--delta --check-carry` answered
   # `fresh … run the code-review skill`, i.e. the paid re-review the verb exists to remove).
   # The in-repo standard for this guard class already existed — `--recover-body`'s combinations
-  # are pinned assertion-per-combo in `scripts/record-review.test.sh:2947-2971` — so this section
+  # are pinned assertion-per-combo in `scripts/record-review.test.sh:3009-3023` — so this section
   # meets that standard instead of describing it.
   #
   # THE FIXTURE IS THE ACCEPTANCE TOPOLOGY ON PURPOSE: record at `$D_REVIEWED`, live head

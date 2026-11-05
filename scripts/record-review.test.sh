@@ -4941,12 +4941,17 @@ assert_not_contains "$RECORD_ERR" "the signed marker" \
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body was the only copy of the verdict that
-#      travelLED — until #1224, when this recorder began posting a durable comment copy too.
+#      travelled — until #1224, when this recorder began posting a durable comment copy too.
 #      Handing the recovered marker back into that same MUTABLE field, with the comment
 #      channel as the only durable twin, would still leave a later body edit able to erase the
 #      copy of what the run had just restored. This vector reddens when the call is
-#      removed (measured: PASS=925 FAIL=1 with only that call deleted), which is the
-#      same discriminator shape as 14.1d(e).
+#      removed, and it reddens through BOTH of its durable-channel assertions —
+#      the `assert_eq` label `14.1e …and publishes the recovered marker to the durable
+#      comment channel` (got: 0, want: 1) and the `bad` label `14.1e the durable comment
+#      did not carry the recovered marker line` — which is the same discriminator shape
+#      as 14.1d(e). ⛔ The counts are named as ASSERTIONS, not quoted as `PASS=n FAIL=m`
+#      (#3168 review P3): the numbers that used to sit here had already rotted, and
+#      §20.11 of this file states the same rule for its own count.
 DC_RB_PR=424951
 rb_clear
 RB_M_E="$(rb_marker "$DC_RB_PR" "review recorded: reviews/${DC_RB_PR}.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
