@@ -593,8 +593,13 @@ def leg_lane_census(mod):
         # silent, and the only `alive > 0` call above is `fn(2, 7, 9, 7)` — which is silent through
         # the LOWER `established >= roster_size` arm, not this one. Measured: deleting the top arm
         # (`if alive >= roster_size:` -> `if False:`) left `101 passed` — the whole suite green.
-        # Its one behavioural effect is the first case below: a fully-live roster over an
-        # UNREADABLE table is silent (the roster IS the box) where a partly-live one is UNVERIFIED.
+        # Its one behavioural effect is the SECOND case below, `PREDICATE[9]`: a fully-live roster
+        # over an UNREADABLE table is silent (the roster IS the box) where a partly-live one is
+        # UNVERIFIED. ⛔ NOT THE FIRST (review cycle 24): `fn(7, 0, 18, 7)` is a READABLE table, so it
+        # is silent through the LOWER `established >= roster_size` arm too and stays green when the
+        # top arm is deleted — measured, the `if False:` mutant reds `PREDICATE[9]` and the
+        # `_drive` `rc_liveu` arm, never this one. Citing the insensitive check as the pin is how a
+        # reader concludes a live pin is bogus.
         check(fn(7, 0, 18, 7) is None, PREDICATE[8])
         check(fn(7, 0, None, 7) is None, PREDICATE[9])
         # ⛔ THESE TWO SHAPES WERE SILENT AND PINNED BY NOTHING (review cycle 16, finding 1), and their
