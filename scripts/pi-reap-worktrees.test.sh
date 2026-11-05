@@ -5055,9 +5055,10 @@ assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "pin-tree" \
     "G15n a \$CELL_HOME-rooted record is read with NO record at \$HOME and no 'harness' in the path (the mixed-root shape, other direction from G15k)"
 
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
-# ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg while
-# every neighbouring gate in this file has one, and that is how two vacuous assertions survived three
-# recorded clean reviews. Each leg below asserts the MUTANT's behaviour — so each one shows the
+# ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
+# every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
+# `set -f` · stash x2 · the per-repo offset key) has one — and that is how two vacuous assertions
+# survived three recorded clean reviews. Each leg below asserts the MUTANT's behaviour — so each one shows the
 # corresponding G15 assertion can go red, which is the only thing that makes it an assertion.
 G15_REPO="$T/pin_tree/repo"
 G15_PINWT="$T/pin_tree/harness/5b1b09aad2c1"
