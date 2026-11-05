@@ -1001,8 +1001,9 @@ not answer the tool's own signature, the missing half was written **into that mo
    are **not** in this PR. The tools do not depend on them (§5.0.3, D3), and landing untracked bytes is its own
    review.
 4. **D8's second half — retiring `lane-status.py`'s 12-verdict ladder — is a follow-up.** It is *smaller* after
-   this PR, not larger: the MCP surface reads only that module's **sampler fields** (`cpu_busy`, `child`,
-   `child_stale`, `child_grew`, `cwd`) and **never its verdict**, so the ladder's only remaining caller is the
+   this PR, not larger: the MCP surface reads only that module's **sampler fields** (`cpu`, `cpu_any`,
+   `child`, `child_stale`, `child_grew`, `cwd`) and **never its verdict**, so the ladder's only remaining
+   caller is the
    heartbeat's own `lane-status.last.json`. That is §13 Q6's “quarantined, one caller, one release”.
    ⛔ THE ROW'S KEY IS `cpu` / `cpu_any`, NOT `cpu_busy`: `cpu_busy` exists only as a `classify()` keyword
    (`lane-status.py:1852,2335`), while the emitted row carries `cpu=_cpu, cpu_any=_cpu_any`

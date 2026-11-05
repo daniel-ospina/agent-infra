@@ -75,14 +75,35 @@ def test_turns_truncated_is_a_flag_not_the_requested_count(monkeypatch):
 def test_the_exit_contract_separates_a_failed_read_from_no_match(monkeypatch):
     """#3382 invariant 1: a lane table that could not be READ is not "no lane matches".
 
-    Kept here because the payload and the exit code are the same contract, and the code is what a
-    consumer dispatches on.
+    ⛔ THIS ARM MUST DRIVE `lane_rows()`'s REAL BODY, NOT ONLY ITS OUTPUT. Stubbing `lane_rows` to
+    return `None` exercises `collect()` and proves nothing about the function that PRODUCES the
+    distinction — and `lane_rows()` is where the defect lived: its old body caught every exception
+    and returned `[]`, so an unreadable `lane-status.py` and a fleet with no lanes were the same
+    value (the module docstring says exactly this). Reverting `return None` to `return []` left the
+    stubbed version of this arm green, so it could not have caught its own defect. Driving
+    `subprocess.run` is what makes the production side falsifiable.
     """
     lw = _load()
-    monkeypatch.setattr(lw, "lane_rows", lambda: None)
+
+    # (a) THE PRODUCER: a `lane-status.py` that cannot be read yields `None`, NEVER `[]`.
+    def boom(*a, **kw):
+        raise OSError("lane-status.py is not there")
+    monkeypatch.setattr(lw.subprocess, "run", boom)
+    assert lw.lane_rows() is None, "an unreadable lane table is `None`, never `[]`"
     rc, p = lw.collect("WS1")
     assert rc == 3 and "UNMEASURED" in (p.get("unmeasured") or ""), (rc, p)
 
-    monkeypatch.setattr(lw, "lane_rows", lambda: [])
+    # (b) …and a table that is NOT a list (a JSON object, an error blob, empty output) is also
+    #     `None` — "could not be read" is not "zero lanes".
+    class _Proc:
+        def __init__(self, out):
+            self.stdout = out
+    for out in ('{"not": "a list"}', "", "Traceback (most recent call last):"):
+        monkeypatch.setattr(lw.subprocess, "run", lambda *a, **kw: _Proc(out))
+        assert lw.lane_rows() is None, "a non-list payload is not a lane table: %r" % (out,)
+
+    # (c) AND A REAL EMPTY FLEET IS `[]`, which IS a readable answer — the two must not collapse.
+    monkeypatch.setattr(lw.subprocess, "run", lambda *a, **kw: _Proc("[]"))
+    assert lw.lane_rows() == [], "an empty fleet is a READ answer, not an abstention"
     rc, p = lw.collect("NOPE")
     assert rc == 2 and p.get("note"), (rc, p)
