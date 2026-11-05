@@ -1443,6 +1443,43 @@ ck "8L12 a NON-UTF-8 auth.json is not a refusal — pi decodes it with replaceme
    "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
 hasnt "$OUT" "auth-store-unreadable" \
     "8L13 …so a latin-1 credential file does not block a lane pi would run"
+# ⛔ A `null` DOCUMENT IS A FATAL STORE, NOT "NO STORED CREDENTIAL" (round 25, P1, measured): a whole-document `null`
+# parses fine, and pi then evaluates `readState.data[provider]` on it — `Credential store read failed for <provider>:
+# Cannot read properties of null (reading '<provider>')`, exit 1, WITH the key exported. rc 1 is the POSITIVE "there is
+# no credential in that store", so folding `null` into it printed `check=ok` — and "auth.json has NO entry for this
+# provider" — over a lane that dies. `[]` stays rc 1, measured: indexing an array yields `undefined`, pi reaches the
+# provider and 401s, so refusing it would be the false 82.
+HNUL="$(mkset storenull "$TWO_JSON" ABSENT)"
+printf 'null\n' > "$HNUL/.pi/agent/auth.json"
+OUT="$(run_gate "$HNUL" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8L17 a null auth.json REFUSES — pi throws on it before any provider is reached (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=auth-store-unreadable" \
+    "8L18 …under the unreadable-store reason, which is the shape of the failure"
+hasnt "$OUT" "check=ok" \
+    "8L19 …and never the pass line over a document pi cannot index"
+HARR="$(mkset storearray "$TWO_JSON" ABSENT)"
+printf '[]\n' > "$HARR/.pi/agent/auth.json"
+OUT="$(run_gate "$HARR" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8L20 …while an ARRAY store is NOT refused — pi reaches the provider from it (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+    "8L21 …so the null rule is not a blanket refusal of every non-object"
+# ⛔ AND A FILE CONTAINING ONLY A BOM IS NOT AN EMPTY STORE (round 25, P1, measured): pi tests the RAW string
+# (`if (!content) return {};`) and strips the BOM only inside `JSON.parse`, so `"\ufeff"` is NON-EMPTY and unparseable
+# (`Unexpected end of JSON input`, fatal). Decoding as `utf-8-sig` first made it "" and the round-24 empty rule called
+# it an empty store — `check=ok` over a dead lane, on a file that is truncated BOM-only text.
+HBOM="$(mkset storebomonly "$TWO_JSON" ABSENT)"
+printf '\xEF\xBB\xBF' > "$HBOM/.pi/agent/auth.json"
+OUT="$(run_gate "$HBOM" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8L22 a BOM-ONLY auth.json is unreadable, not empty (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=auth-store-unreadable" \
+    "8L23 …because pi sees a non-empty file that does not parse"
+# ...and the 0-byte arm above still holds, so the rule keys on BYTES and not on the decoded text.
+OUT="$(run_gate "$HEM2" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8L24 a 0-byte store is still the one EMPTY shape (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
 # pi parses models.json as JSONC (`stripJsonComments(stripBom(...))`, `model-config.js:116`); a comment must not make
 # the gate blind on a file pi uses — that is a fail-open on the exact defect #3331 exists to remove.
 HJC="$(mkset jsoncmodels "$TWO_JSON" ABSENT)"
@@ -1583,6 +1620,10 @@ overridectx|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides"
 authHeader|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","authHeader":"yes"}}}
 nonfinite|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","contextWindow":1e999}]}}}
 nonfinitecost|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","maxTokens":1e999}]}}}
+nonfiniteprice|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"max_price":{"prompt":1e999}}}}}}
+nonfinitepercentile|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"preferred_min_throughput":1e999}}}}}
+nonfinitepercentileleaf|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"preferred_max_latency":{"p50":1e999}}}}}}
+nonfinitetemplate|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"chatTemplateKwargs":{"k":1e999}}}}}
 infinity|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","contextWindow":Infinity}]}}}
 infinitycost|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","cost":{"input":Infinity,"output":2,"cacheRead":0,"cacheWrite":0}}]}}}
 nan|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","maxTokens":NaN}]}}}
