@@ -11,7 +11,8 @@
 # EMPTY in a long-lived pi process started before the key existed, so the connection fails
 # "Unauthorized: invalid or missing Bearer token" — measured 2026-11-02 on a fleet cell that
 # CARRIES the key, while that same key authenticated a direct POST with HTTP 200 (the endpoint
-# answers 401 without it, and advertises 74 tools).
+# answers 401 without it, and advertises 69 tools — measured 2026-11-04, and the count moves with the
+# surface, so date it rather than trusting it).
 # The endpoint, the key and the tools are all healthy; only the client-side plumbing is stale.
 # Not reproducible on a cell without the key — there this script exits 3 GRAPH-UNREACHABLE(NO-KEY).
 # This script therefore reads the key at CALL time, from the live environment.

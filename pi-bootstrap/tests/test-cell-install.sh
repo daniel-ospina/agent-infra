@@ -1884,21 +1884,9 @@ rc=$?
   && ok "the merge NAMES a literal credential it PRESERVED in another server (cell-local.env.K), so its rc and its log agree with the layer's verdict" \
   || fail "the merge preserved a credential in another server and said nothing (rc=$rc) — the install log reports success over a file --verify refuses, and the operator is never told which entry holds it"
 
-# ⛔ A HOME-LESS CONTEXT MUST NOT ABORT THE VERIFIER. This script runs under `set -uo pipefail`, so an
-# unguarded `$HOME/keys.env` aborted `--verify` with `HOME: unbound variable` — and it aborted LATE,
-# after `.mcp.json verify: OK`, so the log looked like a graph problem while `guard_tools_dir`,
-# `guard_spawn_gate`, `guard_gh_shim` and the `LAYER VERIFIED` verdict were all SKIPPED. systemd units,
-# `sudo -u`, `env -i` and CI steps all run without HOME, and a correctly-installed cell could not be
-# certified from any of them. Two sites had it; this arm reaches one of them (the credential note's
-# legacy-alias probe is the other, and it is only reached on a box with no resolvable key).
-: > "$TMP/nohome.log"
-env -u HOME CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
-  bash "$INSTALLER" --verify >> "$TMP/nohome.log" 2>&1
-rc=$?
-[ "$rc" -eq 0 ] && ! grep -q 'unbound variable' "$TMP/nohome.log" \
-  && grep -q 'LAYER VERIFIED' "$TMP/nohome.log" \
-  && ok "--verify completes with HOME UNSET (rc=0, LAYER VERIFIED reached) — a systemd/\`env -i\` context certifies the layer instead of aborting mid-run" \
-  || fail "--verify aborted or refused with HOME unset (rc=$rc) — the unbound-variable abort skips every guard after the graph check and reports a graph problem for a HOME problem"
+# (The HOME-LESS arm lives further down, with the other credential-state arms: it needs
+# `CRED_ON_CERT`, and the property it asserts — the credential state ON the certification line — is a
+# property of the same LAYER VERIFIED line those arms pin.)
 
 # ⛔ THE INSTALL SIDE MUST ENFORCE THE HOSTED HEADER TOO. The verifier has three arms for it; the
 # merge carries its own copy of the predicate, so an install that PRESERVED a foreign variable would
@@ -2124,6 +2112,31 @@ rc=$?
 grep -qE "${CRED_ON_CERT}UNRESOLVED" "$LOG" \
   && ok "…and the UNRESOLVED state is ON the certification line, not on a line the bring-up drops" \
   || fail "the UNRESOLVED state was not on the LAYER VERIFIED line (rc=$rc) — cloud-cell-bringup.sh filters for that line, so a separate one is silently invisible"
+
+# ⛔ A HOME-LESS CONTEXT MUST NOT ABORT THE VERIFIER. This script runs under `set -uo pipefail`, so an
+# unguarded `$HOME/keys.env` aborted `--verify` with `HOME: unbound variable` — and it aborted LATE,
+# after `.mcp.json verify: OK`, so the log looked like a graph problem while `guard_tools_dir`,
+# `guard_spawn_gate`, `guard_gh_shim` and the `LAYER VERIFIED` verdict were all SKIPPED. systemd units,
+# `sudo -u`, `env -i` and CI steps all run without HOME, and a correctly-installed cell could not be
+# certified from any of them. Two sites had it; this arm reaches one of them (the credential note's
+# legacy-alias probe is the other, and it is only reached on a box with no resolvable key).
+# ⛔ AND THE ARM MUST CLEAR THE KEY NAMES, OR IT NEVER REACHES THE LINE IT GUARDS (#3374 review P1).
+# `graph_key_resolve` probes `"${HOME:-}/keys.env"` only when `printenv "$GRAPH_VAR"` is EMPTY, so on a
+# box that exports the key the fixed line is never executed: reverting `${HOME:-}` to `$HOME` left this
+# arm GREEN (measured: `rc=0`, `graph credential: resolves from the environment`) while the suite's only
+# red was the unrelated group-writable keys.env arm. Both names are cleared, for the same reason the
+# negative arm above clears them. With no key anywhere the credential must be UNRESOLVED — asserted
+# too, because reaching UNRESOLVED is what proves the `keys.env` probe RAN with HOME unset.
+: > "$TMP/nohome.log"
+env -u HOME -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
+  CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --verify >> "$TMP/nohome.log" 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && ! grep -q 'unbound variable' "$TMP/nohome.log" \
+  && grep -q 'LAYER VERIFIED' "$TMP/nohome.log" \
+  && grep -qE "${CRED_ON_CERT}UNRESOLVED" "$TMP/nohome.log" \
+  && ok "--verify completes with HOME UNSET and NO key in the environment (rc=0, LAYER VERIFIED reached, credential UNRESOLVED) — a systemd/\`env -i\` context certifies the layer instead of aborting mid-run" \
+  || fail "--verify aborted or refused with HOME unset and the key cleared (rc=$rc) — the unbound-variable abort skips every guard after the graph check and reports a graph problem for a HOME problem; or the arm never reached the keys.env probe (no UNRESOLVED on the cert line)"
 
 # ⛔ THE FILE PATH OF THE ALIAS RESOLVER IS THE WHOLE POINT OF THE RESOLVER, AND IT HAD NO COVERAGE.
 # Every arm above feeds the credential through the ENVIRONMENT, so `graph_key_from_env_file` could
