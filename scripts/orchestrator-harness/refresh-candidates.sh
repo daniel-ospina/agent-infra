@@ -4130,11 +4130,23 @@ if [ -n "$POOL_DIGEST" ] && [ "${PREV_DIGEST:-}" = "$POOL_DIGEST" ] \
     if [ -z "$_skip_n" ]; then
       echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged), and the queue could NOT be READ ($O/candidates.txt is not a readable regular file), so this pass cannot say what dispatch would take"
       _skip_backlog="UNKNOWN"
+    # ⛔ THE EMPTY WORD IS DECIDED BY THE MEASUREMENT, NOT BY THE HEAD (fresh-context review, P2).
+    # This arm used to be `elif [ -n "$_skip_head" ]` with a bare `else` that said "the queue is EMPTY",
+    # and `_skip_head` is deliberately SANITISED above (a first row that is not a plain number becomes
+    # ""). So a queue this pass READ, holding rows, whose head is unparsable, fell into that `else` and
+    # printed "the queue is empty, so dispatch has nothing to take" while writing `backlog=$_skip_n` —
+    # e.g. `backlog=3` — into the SAME durable record. An operator reading that record would be told
+    # dispatch is idle with three rows queued, which is the typed-claim-instead-of-a-read defect this
+    # PR exists to close, one layer out. `_skip_n` is the MEASURED depth and is already numeric-checked;
+    # the head is a different question and gets its own honest answer.
+    elif [ "$_skip_n" -eq 0 ]; then
+      echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged) and the queue is empty (0 rows), so dispatch has nothing to take"
+      _skip_backlog="$_skip_n"
     elif [ -n "$_skip_head" ]; then
       echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged); the queue still holds $_skip_n candidate(s), head #$_skip_head, which dispatch takes next"
       _skip_backlog="$_skip_n"
     else
-      echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged) and the queue is empty, so dispatch has nothing to take"
+      echo "[refresh] handed to dispatch: NONE from THIS pass — it judged nothing (inputs unchanged); the queue holds $_skip_n row(s) but its HEAD could not be read as a candidate number, so this pass cannot say WHICH one dispatch takes next — the depth is MEASURED, the head is UNKNOWN, and this is NOT an empty queue"
       _skip_backlog="$_skip_n"
     fi
     REFRESH_RECORDED=1
