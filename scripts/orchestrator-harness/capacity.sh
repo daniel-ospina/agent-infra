@@ -1573,14 +1573,23 @@ cap_expected_boxes() {
         *[!0-9]*) printf 'UNKNOWN expected-count-unparseable(CAP_EXPECTED="%s" is not a whole number)\n' "$CAP_EXPECTED"; return 1 ;;
       esac
       # ⛔ A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL, NOT A FLEET OF ZERO (fresh review round 3,
-      # P1). `[ "$n" -lt "$CAP_EXPECTED" ]` fails on a 19+-digit value (and on a leading zero like
-      # `08`, which `test` reads as a bad octal), the loop body NEVER runs and the function returned
-      # 0 with no output — so the line certified `expected=0 published=1 INELIGIBLE=0 extra=1`, rc 0,
-      # with the cause on stderr that BOTH emitters discard. That is the `expected=0` false PASS the
-      # function's own contract forbids, reachable from one mangled seam. Bound the magnitude and
-      # reject the leading-zero (octal) shape BEFORE the loop.
+      # P1). `[ "$n" -lt "$CAP_EXPECTED" ]` fails on a 19+-digit value (`integer expression
+      # expected`, rc 2), the loop body NEVER runs and the function returned 0 with no output — so the
+      # line certified `expected=0 published=1 INELIGIBLE=0 extra=1`, rc 0, with the cause on stderr
+      # that BOTH emitters discard. That is the `expected=0` false PASS the function's own contract
+      # forbids, reachable from one mangled seam. Bound the magnitude BEFORE the loop.
+      #
+      # ⛔ AND THE LEADING-ZERO REFUSAL IS A CONVENTION, NOT A SHELL LIMITATION (fresh review round
+      # 12, P2). The comment that stood here claimed `test` reads `08` as a bad octal — MEASURED
+      # FALSE on bash 5.2.21 and on bash 3.2.57: `[ 0 -lt 08 ]` → rc 0 and `[ 8 -lt 010 ]` → rc 0, so
+      # `test` compares these DECIMALLY, and the pre-guard arm on `CAP_EXPECTED=08` emitted 8 expected
+      # lines rather than none. `08` is therefore not the fail-open this guard was written for; it is
+      # refused because a zero-padded count is not a count anyone writes on purpose, and silently
+      # re-reading an operator's value as a different number is its own surprise. Same refusal, true
+      # reason — a rationale that names a shell behaviour that does not exist teaches the next reader
+      # to trust a hazard that is not there.
       case "$CAP_EXPECTED" in
-        0?*) printf 'UNKNOWN expected-count-unusable(CAP_EXPECTED="%s" has a leading zero — `test` reads it as octal, so it is a refusal rather than a guess)\n' "$CAP_EXPECTED"; return 1 ;;
+        0?*) printf 'UNKNOWN expected-count-unusable(CAP_EXPECTED="%s" has a leading zero — refused BY CONVENTION (the value would compare fine; a zero-padded count is not re-read as a different number))\n' "$CAP_EXPECTED"; return 1 ;;
       esac
       if [ "${#CAP_EXPECTED}" -gt 4 ]; then
         printf 'UNKNOWN expected-count-unusable(CAP_EXPECTED="%s" is out of range — a fleet of more than 9999 boxes is not a count this instrument can compare)\n' "$CAP_EXPECTED"; return 1

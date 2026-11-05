@@ -424,11 +424,18 @@ produces a number where an expectation exists.** A cell that should reconcile mu
 very `network.ipv4` values `cap_boxid` publishes under) or, if only the count is known,
 `CAP_EXPECTED=<n>` (which reports `INELIGIBLE=unknown`, because a count cannot name who is missing).
 
-⛔ **A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL.** A 19+-digit `CAP_EXPECTED` (or a leading zero like
-`08`, which `test` reads as bad octal) made the count arm's loop fail, return 0 with no output, and the
-line certified `expected=0 published=1 INELIGIBLE=0` — the `expected=0` false PASS the instrument
-forbids. A count must be a whole number of at most four digits with no leading zero beyond `0` itself
+⛔ **A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL.** A 19+-digit `CAP_EXPECTED` made the count arm's
+loop fail (`integer expression expected`), return 0 with no output, and the line certified
+`expected=0 published=1 INELIGIBLE=0` — the `expected=0` false PASS the instrument forbids. A count must
+be a whole number of at most four digits with no leading zero beyond `0` itself
 (`expected-count-unusable`), and `CAP_EXPECTED=0` remains the one explicit, operator-made zero.
+
+The **leading-zero** refusal is a convention, not a shell limitation, and this document says so because
+it used to say the opposite. MEASURED on bash 5.2.21 and on bash 3.2.57: `[ 0 -lt 08 ]` → rc 0 and
+`[ 8 -lt 010 ]` → rc 0, i.e. `test` compares these **decimally**, and the pre-guard arm on
+`CAP_EXPECTED=08` emitted 8 expected lines rather than zero. `08` is refused because a zero-padded count
+is not a count anyone writes on purpose, and quietly re-reading an operator's value as a different
+number is its own surprise — not because the comparison would fail.
 
 ⛔ **A NUMERIC TTL OUT OF RANGE IS THE SAME HOLE AS AN UNCOMPARABLE ONE.** Twenty digits make
 `[ "$age" -gt "$CAP_PROBE_TTL" ]` error, so the stale branch never runs and every record counts fresh —

@@ -1664,15 +1664,20 @@ _x1m="$(date +%s)"; _dxm=$(( _x1m - _x0m ))
 ck "  …mutation control: an unbounded channel read takes ${_dxm}s on the same wedged origin (so (x) is load-bearing)" \
    "$([ "$_dxm" -ge 11 ] && echo 0 || echo 1)"
 # (y) ⛔ A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL, NOT A FLEET OF ZERO (fresh review round 3, P1).
-# `[ "$n" -lt "$CAP_EXPECTED" ]` fails on a 19+-digit value (and on a leading zero like `08`, which
-# `test` reads as bad octal), so the loop body never ran and the function returned 0 with NO output:
-# the line then certified `expected=0 published=1 INELIGIBLE=0 extra=1`, rc 0, with the cause on a
-# stderr that both emitters discard. `expected=0` is the exact value this function forbids.
+# `[ "$n" -lt "$CAP_EXPECTED" ]` fails on a 19+-digit value (`integer expression expected`), so the
+# loop body never ran and the function returned 0 with NO output: the line then certified
+# `expected=0 published=1 INELIGIBLE=0 extra=1`, rc 0, with the cause on a stderr that both emitters
+# discard. `expected=0` is the exact value this function forbids.
+# ⛔ THE LEADING-ZERO ARM GRADES A CONVENTION, NOT A SHELL LIMIT (fresh review round 12, P2 — the arm
+# label that stood here claimed `test` reads `08` as octal, which is FALSE). MEASURED: `[ 0 -lt 08 ]`
+# and `[ 8 -lt 010 ]` both compare DECIMALLY on bash 5.2.21 and bash 3.2.57, and the pre-guard arm emits
+# 8 expected lines for `08`. The refusal is deliberate (a zero-padded count is not re-read as a
+# different number); the arm asserts the convention, and its label says so.
 L23="$(CAP_EXPECTED=99999999999999999999 cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"; RC=$?
 ck "(y) an out-of-range COUNT is expected=UNKNOWN why=expected-count-unusable, never expected=0 ($L23)" \
    "$([ "$RC" -eq 1 ] && qF 'expected=UNKNOWN' "$L23" && qF 'why=expected-count-unusable' "$L23" && ! qF 'expected=0' "$L23" && ! qF 'INELIGIBLE=0' "$L23" && echo 0 || echo 1)"
 L23B="$(CAP_EXPECTED=08 cap_fleet_line_from "" 0)"
-ck "  …and a leading-zero count (bare `test` reads it as octal) is the same refusal ($L23B)" \
+ck "  …and a leading-zero count is refused BY CONVENTION (measured: test compares 08 DECIMALLY, so this arm grades the convention and not a shell limit) ($L23B)" \
    "$(qF 'why=expected-count-unusable' "$L23B" && ! qF 'expected=0' "$L23B" && echo 0 || echo 1)"
 L23C="$(CAP_EXPECTED=0 cap_fleet_line_from "" 0)"; RC=$?
 ck "  …while an EXPLICIT zero is still a real answer (rc=$RC: $L23C)" \
@@ -1932,10 +1937,10 @@ ck "  …mutation control: without it the child runs ${_c13b_d}s (so (c13) is lo
 # leaked the LAST call's channel onto an unrelated `cap_fleet_line_from`.
 _C14R="$TMP/chanrepo"; git init -q "$_C14R" 2>/dev/null
 git -C "$_C14R" remote add origin 'https://user:p@ss@github.com/daniel-ospina/agent-infra.git' 2>/dev/null
-L34="$(cap_fleet_line "$_C14R" 2>/dev/null)"
+L34="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="false" cap_fleet_line "$_C14R" 2>/dev/null)"
 ck "(c14) chan= carries the host, never the userinfo ($(printf '%s' "$L34" | grep -o 'chan=[^ ]*'))" \
    "$(qF 'chan=github.com/daniel-ospina/agent-infra' "$L34" && ! grep -qE 'chan=[^ ]*(@|token|p@ss)' <<<"$L34" && echo 0 || echo 1)"
-L34B="$(cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
+L34B="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="false" cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
 ck "  …and an unrelated direct call carries NO chan (no carry-over: $(printf '%s' "$L34B" | grep -c 'chan=') occurrence(s))" \
    "$(! q 'chan=' "$L34B" && echo 0 || echo 1)"
 sed 's|_chan="${_chan##\*@}"|_chan="${_chan#*@}"   # MUTANT: shortest @|' "$CAP" > "$TMP/cap-chanweak.sh"
@@ -1943,6 +1948,28 @@ ck "  …the mutant really lost the longest-@ strip" "$([ "$(grep -c 'MUTANT: sh
 L34M="$(bash -c '. "$1"; cap_chan_of "$2"' _ "$TMP/cap-chanweak.sh" "$_C14R" 2>/dev/null)"
 ck "  …mutation control: with the shortest match the line carries the 'ss@…' FRAGMENT of the password (${L34M})" \
    "$(grep -qE 'ss@' <<<"$L34M" && echo 0 || echo 1)"
+# ⛔ AND (c14) PINS THE INVENTORY SEAM (fresh review round 12, P2). Unpinned, `cap_expected_src` falls
+# through to the provider, so these two calls made TWO LIVE `cmux vm list` invocations on any host that
+# has the CLI — measured on a cell: `/usr/local/bin/cmux` present, the real five-box inventory returned —
+# which contradicted this suite's own "hermetic: no network" header and made the arm host-dependent.
+# `CAP_CMUX_LIST=false` is a provider that refuses, so `chan=` and the no-carry-over property are graded
+# on the same bytes everywhere.
+# (c14b) ⛔ THE RESOLVER'S PIN IS ITSELF GRADED (fresh review round 12, P2). `cap_cmux_bin` has three
+# arms — the pin, PATH, and the macOS app bundle — and NOTHING asserted the pin, so a typo in
+# `CAP_CMUX_BIN` produced `why=provider-inventory-unavailable` on every cycle of the one box whose
+# inventory is authoritative, invisibly. A pinned stub answering an EMPTY machine list makes the pin's
+# USE observable: only a binary the resolver actually ran can reach (r)'s `provider-inventory-unparseable`
+# verdict; a resolver that fell through to PATH would say something else (the live fleet here, `no cmux`
+# on a CI runner) and this arm goes RED either way.
+_C14C="$TMP/fake-cmux"
+printf '%s\n' '#!/bin/sh' 'printf "%s\n" "{\"machines\":[]}"' > "$_C14C"; chmod +x "$_C14C"
+L38="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_BIN="$_C14C" cap_fleet_inventory 2>&1)"; R38=$?
+ck "  …(c14b) the resolver RUNS the pinned binary (its empty list reads as 'no running machine', not as 'no binary'): $L38" \
+   "$([ "$R38" -ne 0 ] && qF 'provider-inventory-unparseable' "$L38" && echo 0 || echo 1)"
+_C14CN="$TMP/not-executable-cmux"; : > "$_C14CN"
+L38B="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_BIN="$_C14CN" cap_fleet_inventory 2>&1)"; R38B=$?
+ck "  …and a non-executable pin is a NAMED refusal, never a silent fall-through to PATH ($L38B)" \
+   "$([ "$R38B" -ne 0 ] && qF 'provider-inventory-unavailable' "$L38B" && echo 0 || echo 1)"
 # (c15) ⛔ A REFUSAL NAMES THE BOUND IT HIT, NOT THE SEAM AS TYPED (fresh review round 9, P2): with
 # `CAP_INVENTORY_TIMEOUT=00` the message said `timed out after 00s` after waiting 10 s.
 L35="$(CAP_INVENTORY_TIMEOUT=00 CAP_CMUX_LIST="sleep 12" cap_fleet_inventory 2>&1 | head -1)"
@@ -1971,6 +1998,23 @@ _WRAP="$(recf cmux 8 56 0 120000 14000 18446744075502150016 400 15041 1)"
 L37="$(CAP_EXPECTED_BOXES="cell-1:$(printf '%s' "$_WRAP" | sed -n 's/.*boxid=\([^ ]*\).*/\1/p')" cap_fleet_line_from "$_WRAP" 0)"
 ck "(c16b) an overflowing stamp is REFUSED, never read as fresh ($L37)" \
    "$(! q 'published=1' "$L37" && echo 0 || echo 1)"
+# (c16c) ⛔ THE FORK PAIR GETS THE SAME WIDTH BOUND, AND NOTHING GRADED IT (fresh review round 12, P1).
+# `cap_h_for` COMPARES `procs` against `procs_max`, and an ERRORING comparison answers `unbounded` — the
+# fail-OPEN direction for the box that cannot spawn. Every sibling width guard has an arm AND a mutant
+# ((c16) `lpc`, (c19) `CAP_NOW`, (c8) the TTL, (y) `CAP_EXPECTED`, (c18) the seams); these two lines had
+# NEITHER, so deleting them shipped the wrap GREEN — measured on the mutated tree, the same 20-digit
+# record came back `place=cmux … eligible=1` with `cap_fork_headroom` = 15042 (a wrapped int64): the box
+# that cannot spawn, certified eligible.
+_HUGEP="$(recf cmux 8 56 0 120000 14000 "$NOW" 18446744073709551615 15041 1)"
+L36P2="$(printf '%s\n' "$_HUGEP" | cap_place cmux 2>/dev/null)"
+ck "(c16c) a 20-digit procs/procs_max refuses the fork pair, never wraps to headroom ($(printf '%s' "$L36P2" | head -1))" \
+   "$(qF 'refuse bound=fork_unknown' "$L36P2" && echo 0 || echo 1)"
+sed 's|\[ "${#p}" -le 12 \]|true|; s|\[ "${#m}" -le 12 \]|true|' "$CAP" > "$TMP/cap-noforkwidth.sh"
+ck "  …the mutant really lost BOTH fork-pair width bounds (and the shipped file carries exactly two)" \
+   "$([ "$(grep -c 'true || { printf .fork_unknown.' "$TMP/cap-noforkwidth.sh")" -eq 2 ] && [ "$(grep -c -- '-le 12 ] || { printf .fork_unknown.' "$CAP")" -eq 2 ] && echo 0 || echo 1)"
+L36P2M="$(printf '%s\n' "$_HUGEP" | bash -c '. "$1"; cap_place cmux' _ "$TMP/cap-noforkwidth.sh" 2>/dev/null)"
+ck "  …mutation control: without them the same record is PLACED ($(printf '%s' "$L36P2M" | head -1))" \
+   "$(qF 'place=' "$L36P2M" && echo 0 || echo 1)"
 # (c17) ⛔ 137 IS A TIMEOUT ONLY IF THE BOUND ELAPSED (fresh review round 10, P2): a child that kills
 # ITSELF returned in 0 s and was relabelled `timed out after 10s`, while the watchdog said `exited 137`.
 _c17_rc=$(CAP_BOUND_IMPL=auto cap_bounded 10 sh -c 'kill -9 $$' >/dev/null 2>&1; echo $?)
