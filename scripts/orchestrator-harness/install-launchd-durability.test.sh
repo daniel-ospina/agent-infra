@@ -405,13 +405,18 @@ else bad "install.sh does not source launchd-cycle.sh"; fi
 
 # ── A2. the $O DRIFT LIST names every script the daemon or the loop RUNS ─────────────────────────
 # install.sh warns when `$O/<script>` differs from the shipped copy, and the NAMES it walks are a
-# hand-kept list. The plist executes `$O/launchd-controller.sh` and nothing else — so a list without
-# that name is a drift check that can never report the one file whose drift turns every cycle into
-# exit 127 while the controller looks healthy. This is not hypothetical: it happened in the merge
-# that introduced it (our side added launchd-controller.sh, main's side added live-ownership.sh, and
-# a resolution keeping one side leaves a real file unchecked — for live-ownership.sh silently
-# reverting selection to registry-only). So the list is pinned against the PLIST and the loop's own
-# sourced modules, not against a copy of itself.
+# hand-kept list. The plist executes a $O script and nothing else — so a list without that name is a
+# drift check that can never report the one file whose drift turns every cycle into exit 127 while the
+# controller looks healthy. This is not hypothetical: it happened in the merge that introduced it (our
+# side added launchd-controller.sh, main's side added live-ownership.sh, and a resolution keeping one
+# side leaves a real file unchecked — for live-ownership.sh silently reverting selection to
+# registry-only). So the list is pinned against the PLIST and the loop's own sourced modules, not
+# against a copy of itself.
+# ⛔ #3309 CHANGED WHAT THE PLIST EXECUTES. It is no longer `$O/<controller>` rendered literally into
+# the template: the program is the STABLE resolver `__PROGRAM__`, which install.sh substitutes with
+# `$O/orch-pin-exec.sh`. The derivation below therefore resolves the token to the NAME install.sh
+# renders — deriving from the installer's own STABLE_PROG assignment, not from a second copy of the
+# name — so the drift-coverage guarantee still has a real subject on either shape.
 echo "-- A2. the \$O drift list covers what the plist and the loop execute"
 DRIFT_LIST="$(grep -E '^for f in .*gh-rest/gh' "$INSTALL" | head -1 | sed -e 's/^for f in //' -e 's/; do$//')"
 drift_names() { printf '%s\n' "$1" | tr ' ' '\n' | grep -v '^$' || true; }
@@ -419,8 +424,13 @@ if [ -n "$DRIFT_LIST" ]; then ok "install.sh's \$O drift list was found ($(drift
 else bad "install.sh's \$O drift list is gone — nothing compares \$O against the shipped copies"; fi
 # The plist's ProgramArguments target IS the file launchd executes; derive it, never assume it.
 PLIST_ENTRY="$(grep -oE '__O__/[A-Za-z0-9._-]+\.sh' "$HARNESS/launchd.plist.template" | head -1 | sed 's|__O__/||')"
+if [ -z "$PLIST_ENTRY" ] && grep -qF '<string>__PROGRAM__</string>' "$HARNESS/launchd.plist.template"; then
+  # #3309: stable-resolver shape. The name is whatever install.sh assigns to STABLE_PROG.
+  PLIST_ENTRY="$(grep -oE 'STABLE_PROG="\$O/[A-Za-z0-9._-]+\.sh"' "$INSTALL" | head -1 | sed -e 's|^STABLE_PROG="\$O/||' -e 's|"$||')"
+  [ -n "$PLIST_ENTRY" ] && ok "the plist template renders the stable resolver __PROGRAM__, which install.sh sets to \$O/$PLIST_ENTRY"
+fi
 if [ -n "$PLIST_ENTRY" ]; then ok "the plist template names its entrypoint ($PLIST_ENTRY)"
-else bad "no __O__/<script> entrypoint found in launchd.plist.template — this pin cannot be derived"; fi
+else bad "no __O__/<script> or __PROGRAM__ entrypoint could be derived from launchd.plist.template — this pin cannot be derived"; fi
 if [ -n "$PLIST_ENTRY" ] && drift_names "$DRIFT_LIST" | grep -qxF "$PLIST_ENTRY"; then
   ok "the drift list checks the entrypoint the plist actually executes ($PLIST_ENTRY)"
 else bad "the drift list does NOT include $PLIST_ENTRY — a drift in the one file launchd runs could never be reported"; fi
@@ -1601,6 +1611,164 @@ unset FAKE_PRINT_FAIL
 if [ "$rc" -ne 0 ]; then ok "an unreadable domain after a start refuses (non-zero)"; else bad "an unreadable domain was scored as a start"; fi
 assert_contains "$out" "could not be read" "…and the message names the failed read, not 'no pid'"
 assert_not_contains "$out" "NO pid" "…it does not claim the label has no pid"
+echo
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# J. THE RENDERED LAUNCHD PROGRAM MUST BE STABLE AND RESOLVABLE (agent-infra#3309)
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# THE INCIDENT (measured 2026-11-02 on this box): the installed plist ran
+#   /Users/home/harness/5712e52776c8/scripts/orchestrator-harness/launchd-controller.sh
+# `~/harness/` holds HASH-NAMED pin snapshots and the GC deletes old ones as the pin advances. When the
+# pin moved to 9ae71c4e118e, 5712e52776c8 was gone, so EVERY tick died `No such file or directory`,
+# exit 127 — and `launchctl list` still printed the job as LOADED, launchd.err repeated one stale-looking
+# line, and a 15-hour-old candidates.txt (194 entries) read as a full queue. The loop was dead ~15h.
+# launchd reads ProgramArguments ONCE at bootstrap and cannot follow a moving pin, so the ONLY stable
+# shapes are (a) a path that never moves, or (b) a stub that resolves the pin per tick. install.sh ships
+# (b): a stable `$O/orch-pin-exec.sh` seeded from the pinned tree. These checks fail if the rendered
+# program can be a path that MOVES or does not RESOLVE.
+printf '== §J the launchd program is STABLE and RESOLVABLE (#3309) ==\n'
+
+# J1. the TEMPLATE must not render the pin path as the program any more.
+if grep -qE '^[[:space:]]*<string>__HARNESS__/__ENTRY__</string>' "$HARNESS/launchd.plist.template"; then
+  bad "the plist template still renders the PIN PATH (__HARNESS__/__ENTRY__) as ProgramArguments — a hash dir the pin GC deletes (#3309)"
+else
+  ok "the plist template does not render the pin path as the program"
+fi
+assert_contains "$(cat "$HARNESS/launchd.plist.template")" "__PROGRAM__" "…it renders the STABLE __PROGRAM__ token instead"
+
+# J2. THE STATIC HALF. ⛔ THIS IS NOT THE WITNESS FOR BEHAVIOUR (agent-infra#3309 review, P2 finding 6):
+# these greps passed on code that silently aborted at rc=127 under a resolver that could not resolve,
+# refused a re-run with a factually false diagnosis, and disabled its own pin-root guard whenever the
+# operator's `HARNESS_PIN_DIR` ended in a slash. A grep cannot see any of those, so they are labelled for
+# what they are — a cheap STRUCTURAL claim (a token with no substitution rule renders a plist naming
+# nothing) — and the BEHAVIOURAL arms are J8 below and `scripts/mac-pin-parity.test.sh` §B8, which run the
+# shipped installer and read the outcome.
+assert_contains "$INSTALL_CODE" 's|__PROGRAM__|' "install.sh substitutes __PROGRAM__ (a token with no rule is a rendered plist naming nothing)"
+assert_contains "$INSTALL_CODE" 'REFUSED (#3309): the stable program' "…and it carries a refusal that NAMES the stable program (structure only — §J8 proves it can PRINT)"
+
+# J3. the invariant itself, on a real seeded copy: the program must be OUTSIDE the pin root.
+rm -rf "$T/j"; mkdir -p "$T/j/o" "$T/j/pin/aaaaaaaaaaaa" "$T/j/pin/bbbbbbbbbbbb"
+STABLE_PROG="$T/j/o/orch-pin-exec.sh"
+cp "$HARNESS/orch-pin-exec.sh" "$STABLE_PROG" && chmod +x "$STABLE_PROG"
+for p in aaaaaaaaaaaa bbbbbbbbbbbb; do
+  printf '#!/bin/bash\necho RAN-FROM-%s\n' "$p" > "$T/j/pin/$p/launchd-controller.sh"
+  chmod +x "$T/j/pin/$p/launchd-controller.sh"
+done
+case "$STABLE_PROG" in
+  "$T/j/pin"/*) bad "the stable program is INSIDE the pin root — a hash-named tree that GC deletes (#3309)" ;;
+  *)             ok "the stable program is outside the pin root (a path that never moves)" ;;
+esac
+
+# J4. THE SCENARIO, REPRODUCED: pin advances, the old hash dir is GC'd, the plist cannot move.
+export HARNESS_PIN_FILE="$T/j/harness-path"
+printf '%s\n' "$T/j/pin/aaaaaaaaaaaa" > "$HARNESS_PIN_FILE"
+assert_eq "$(/bin/bash "$STABLE_PROG" --resolve-only 2>&1)" "$T/j/pin/aaaaaaaaaaaa/launchd-controller.sh" "the stub resolves the CURRENT pin (--resolve-only)"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"
+assert_contains "$out" "RAN-FROM-aaaaaaaaaaaa" "…and execs it"
+# the pin advances + the old snapshot is garbage-collected
+rm -rf "$T/j/pin/aaaaaaaaaaaa"
+printf '%s\n' "$T/j/pin/bbbbbbbbbbbb" > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"
+assert_contains "$out" "RAN-FROM-bbbbbbbbbbbb" "after a pin advance + GC of the old hash dir, the SAME unchanged program execs the NEW controller (the plist never has to move)"
+if [ -f "$STABLE_PROG" ]; then ok "the plist's program path still exists after the pin moved (nothing to re-render)"
+else bad "the plist's program path vanished on a pin move — that is the #3309 defect"; fi
+
+# J5. FAIL-BEFORE, stated as an assertion: the OLD shape is exactly what is now gone.
+LEGACY="$T/j/pin/aaaaaaaaaaaa/launchd-controller.sh"
+if [ -e "$LEGACY" ]; then
+  bad "the legacy pin path still resolves — this fixture does not reproduce the GC that killed the loop"
+else
+  ok "the legacy pin path is GONE after the pin advance — the old plist shape would exit 127 here (the 15h outage, reproduced)"
+fi
+if [ -x "$LEGACY" ]; then bad "the old program still exists"; else ok "…so a program pointing at it is NOT resolvable, which §J4 shows the stub survives"; fi
+
+# J6. LOUD, NOT SILENT. The real defect was that a dead supervisor read as "between ticks".
+printf '%s\n' "$T/j/pin/deadbeef0000" > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "an unresolvable pin exits 127 (the code launchctl already shows beside the label)"
+assert_contains "$out" "PIN-EXEC: DEAD-SUPERVISOR" "…with a greppable DEAD-SUPERVISOR marker, so a dead supervisor cannot read as 'between ticks'"
+assert_contains "$out" "DOES NOT EXIST" "…and names the missing pin dir as the cause"
+# an EMPTY record must not resolve to anything either (a blank record is a dead supervisor, not an unset option)
+: > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "an EMPTY pin record exits 127 (not 0 with no controller)"
+assert_contains "$out" "EMPTY" "…and says the record is empty"
+# a GARBAGE record (a diagnostic line instead of a path) must fail loudly, never exec a fragment
+printf 'harness-refresh: advanced pin\n/tmp/nope-xyz\n' > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "a record whose first line is not the pin dir is refused (127)"
+# a HALF-MATERIALISED pin (dir exists, no entrypoint) must not exec nothing
+mkdir -p "$T/j/pin/cccccccccccc"; printf '%s\n' "$T/j/pin/cccccccccccc" > "$HARNESS_PIN_FILE"
+out="$(/bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "a pin dir carrying NEITHER entrypoint is refused (127)"
+assert_contains "$out" "NEITHER launchd-controller.sh NOR orch-loop.sh" "…and names what is absent"
+unset HARNESS_PIN_FILE
+
+# J7. the stub must never resolve to ITSELF — a pin record naming the stub's own dir, with the stub as the
+# entry, would re-exec itself every tick: a launchd fork bomb on a 10 s KeepAlive, not an error.
+printf '%s\n' "$T/j/o" > "$T/j/harness-path"
+out="$(HARNESS_PIN_FILE="$T/j/harness-path" ORCH_ENTRY=orch-pin-exec.sh /bin/bash "$STABLE_PROG" 2>&1)"; rc=$?
+assert_eq "$rc" "127" "a pin that resolves back to the stub itself is refused (not an exec loop)"
+assert_contains "$out" "refusing to exec ourselves" "…and says so by name"
+
+# J7b. THE SAME GUARD MUST NOT FAIL OPEN ON A SYMLINK (agent-infra#3309 review, P1 finding 4). J7 names the
+# stub's own dir LITERALLY, so it passes on a guard that compares STRINGS — which is what the stub did:
+# both sides were built with `cd … && pwd` (LOGICAL paths). A pin record naming a SYMLINK to the stub's own
+# directory — the shape `~/orchestrator` takes on a box whose worker dir is a link — then made
+# `--resolve-only` PRINT THE ALIAS PATH OF THE STUB and exit 0, so the exec path would be
+# `exec /bin/bash <alias>/orch-pin-exec.sh` under KeepAlive/ThrottleInterval: the launchd spin the guard
+# exists to prevent, in its own named shape.
+ln -s "$T/j/o" "$T/j/o-alias" 2>/dev/null
+printf '%s\n' "$T/j/o-alias" > "$T/j/harness-alias"
+out="$(HARNESS_PIN_FILE="$T/j/harness-alias" ORCH_ENTRY=orch-pin-exec.sh /bin/bash "$STABLE_PROG" --resolve-only 2>&1)"; rc=$?
+if [ "$rc" -eq 127 ]; then ok "a pin record naming a SYMLINK to the stub's own dir is REFUSED (rc=127, not 0 with the alias printed)"
+else bad "a symlinked pin record still resolved to the stub through the alias (rc=$rc, out=$out) — the guard compares logical paths and FAILS OPEN into a launchd exec loop"; fi
+assert_contains "$out" "refusing to exec ourselves" "…and says so by name"
+# ⛔ AND THE ALIAS IS NOT HANDED ON AS THE PROGRAM. This is the datum that made the finding: the guard's
+# failure was not `rc=0 with silence`, it was `rc=0 having printed a program to exec`.
+assert_not_contains "$out" "$T/j/o-alias/orch-pin-exec.sh" "…and does NOT print the alias as the program to exec"
+
+# J7c. THE OTHER HALF OF THE SAME RESOLUTION: a pin dir holding a SYMLINKED FILE named for the entry (the
+# dir itself is not a link). `pwd -P` on the dirs alone still compares a link to its target as two paths.
+mkdir -p "$T/j/o-filelink"
+ln -s "$T/j/o/orch-pin-exec.sh" "$T/j/o-filelink/orch-pin-exec.sh" 2>/dev/null
+printf '%s\n' "$T/j/o-filelink" > "$T/j/harness-filelink"
+ffl="$(HARNESS_PIN_FILE="$T/j/harness-filelink" ORCH_ENTRY=orch-pin-exec.sh /bin/bash "$STABLE_PROG" --resolve-only 2>&1)"; rc=$?
+if [ "$rc" -eq 127 ]; then ok "a pin whose ENTRY FILE is a symlink to the stub is REFUSED too (rc=127)"
+else bad "a symlinked FILE resolved to the stub (rc=$rc, out=$ffl) — file symlinks need resolving, not just directories"; fi
+
+# J8. ⛔ BEHAVIOUR, NOT SOURCE TEXT (agent-infra#3309 review, P2 finding 6): RUN the shipped installer and
+# observe a REFUSAL. The invariant under test is the pin-root guard, and the condition is the one that
+# silently disabled it: `HARNESS_PIN_DIR` written with a TRAILING SLASH (operator-supplied, `:836`) made the
+# pattern `/x/harness//*` match NOTHING — while `$O` here is INSIDE that root, so a skip is a false PASS on
+# exactly the refusal that has to fire. §F's stage + launchd/tool stubs are reused; when §F could not run
+# (no usable git checkout) this arm SKIPS LOUDLY rather than passing.
+if [ -n "${STAGE:-}" ] && [ -f "$STAGE/install.sh" ] && type -t ORUN >/dev/null 2>&1; then
+  j8out="$(HARNESS_PIN_DIR="$T/" ORUN 2>&1)"; j8rc=$?
+  # ⛔ THE MESSAGE IS THE ASSERTION AND rc IS CORROBORATION (review finding). `rc -ne 0` alone PASSES on any
+  # refusal — and this installer has an earlier gate that can abort before the render stage at all
+  # (`merge-reminder.py does not parse` needs python3 >= 3.12; a 3.9 host reds §F/§G/§H and aborts here),
+  # so an rc-only arm reported PASS for a refusal that has nothing to do with `$HARNESS_PIN_DIR`: the exact
+  # false-PASS shape this hunk exists to argue against. A host that cannot reach the render stage is
+  # DECLARED as a skip, never counted as a pass.
+  # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#841, the rule stated at :83): under `pipefail` the quiet
+  # grep exits on its first match, the writer takes SIGPIPE, and the PIPELINE reads 141 — so on a large
+  # installer log the parse-gate abort would go UNDETECTED and this arm would report a false FAILURE for
+  # the very host the skip exists for (`scripts/check-no-sigpipe-grep.sh` gates the shape in CI).
+  # ⛔ AND THE NEEDLE IS THE FULL ERROR, not `does not parse`: install.sh emits that phrasing at several
+  # gates (`bash -n` on the seeded entrypoint included), so the short form would attribute a different
+  # abort to python3 3.12. The skip still stays loud either way — it can never be a pass.
+  if grep -qF 'merge-reminder.py is missing or does not parse' <<<"$j8out"; then
+    skipd "§J8 — SKIPPED, NOT A PASS: the installer aborted at its python3 parse gate ($(command -v python3) — merge-reminder.py needs 3.12+) before reaching the render stage, so the pin-root refusal was NOT exercised here. Re-run with a 3.12+ python3 first on PATH (CI has one)."
+  else
+    assert_contains "$j8out" "INSIDE the harness pin root" "install.sh REFUSES a program INSIDE \$HARNESS_PIN_DIR — with the operator's path written as '$T/' (trailing slash; the guard used to be skipped silently)"
+    assert_contains "$j8out" "Nothing was installed" "…and says nothing was installed"
+    if [ "$j8rc" -ne 0 ]; then ok "…and the run exits NON-ZERO (rc=$j8rc), corroborating the refusal above"
+    else bad "…but the run exited 0 (rc=$j8rc) despite the refusal text"; fi
+  fi
+else
+  skipd "§J8 the installer is RUN against a sandbox HOME — SKIPPED: §F could not stage the installer here (no usable git checkout), so the pin-root refusal is witnessed only by scripts/mac-pin-parity.test.sh §B8 in this run"
+fi
+
 echo
 if [ "$FAIL" -eq 0 ]; then
   printf '==> all %d checks passed (%d skipped)\n' "$PASS" "$SKIP"
