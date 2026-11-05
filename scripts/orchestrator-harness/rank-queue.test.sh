@@ -1332,7 +1332,7 @@ if [ "$SDRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$SDOUT" \
    && grep -q 'queue_readable=1' <<<"$SDOUT" \
    && ! grep -q 'could NOT be READ' <<<"$SDOUT" \
    && ! grep -q 'the queue is empty' <<<"$SDOUT"; then rc=0
-else rc=1; echo "      skip/wcfail-garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (readable + depth failed + unparsable head: 'the queue WAS read', NOT 'could NOT be READ', NOT empty)"; fi
+else rc=1; echo "      skip/wcfail-garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (readable + depth failed + unparsable head: 'the queue WAS read' + queue_readable=1, NOT 'could NOT be READ', NOT empty)"; fi
 ck "SKIP arm: readable + depth failed + unparsable head is still a READ queue, with backlog=UNKNOWN (driven)" $rc
 skip_drive unreadable mode000
 if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
@@ -1363,12 +1363,14 @@ ck "non-vacuity: the pre-fix \`_skip_n=0\` re-parse turns a failed depth read in
 skip_drive drained empty
 if [ "$SDRC" -eq 0 ] && grep -q 'the queue is empty (0 rows)' <<<"$SDOUT" \
    && grep -q 'backlog=0' <<<"$SDOUT" \
+   && grep -q 'queue_readable=1' <<<"$SDOUT" \
    && ! grep -q 'could NOT be READ' <<<"$SDOUT"; then rc=0
-else rc=1; echo "      skip/empty: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a MEASURED empty queue: 'the queue is empty (0 rows)' + backlog=0)"; fi
+else rc=1; echo "      skip/empty: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a MEASURED empty queue: 'the queue is empty (0 rows)' + backlog=0 + queue_readable=1)"; fi
 ck "SKIP arm: a MEASURED empty queue says so, with backlog=0 (driven)" $rc
 skip_drive withhead rows
 if [ "$SDRC" -eq 0 ] && grep -q 'head #300' <<<"$SDOUT" \
    && grep -q 'handed=300' <<<"$SDOUT" \
+   && grep -q 'queue_readable=1' <<<"$SDOUT" \
    && grep -q 'backlog=2' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/rows: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (want head #300, handed=300, backlog=2)"; fi
 ck "SKIP arm: a READABLE queue with a parsable head names it, and records handed= (driven)" $rc
