@@ -978,6 +978,27 @@ ck "8W a pin in the ENV but an unusable STORE is refused, not called ok (rc=${rc
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=store-invalid" \
     "8W2 …naming the store, which is what pi resolves first"
+# ⛔ AND THE STORE IS PROBED BEFORE THE TEMPLATE, NOT ONLY BEFORE THE ENVIRONMENT (round 21, P1, measured). A
+# `models.json` need not declare a built-in provider - that is the NORMAL cell shape - and pi reads `auth.json`
+# FIRST, so gating this refusal behind "the template is resolvable" reported an unusable store entry as
+# `check=skipped reason=cannot-resolve-provider-credential` ("a provisioning detail") on a box where `pi -p` printed
+# `No API key found for deepseek.` and exited. Measured: `models.json` = `{}`, `auth.json` =
+# `{"deepseek":{"key":"sk-legacy-no-type"}}`, DEEPSEEK_API_KEY exported -> gate skipped, pi died.
+HPT="$(mkset notemplate '{}' ABSENT)"
+printf '{"deepseek":{"key":"sk_legacy_no_type"}}\n' > "$HPT/.pi/agent/auth.json"
+OUT="$(run_gate "$HPT" KG_CANARY_KEY=v)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "8X no models.json template + an unusable store still REFUSES (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=store-invalid" \
+    "8X2 …because pi reads the STORE, not the template, first"
+hasnt "$OUT" "reason=cannot-resolve-provider-credential" \
+    "8X3 …and never files a provable pi death under the provisioning-detail reason"
+# ...and a USABLE store entry on the same templateless box is the store\x27s answer, not a cannot-say.
+HPT2="$(mkset notemplateok '{}' ABSENT)"
+printf '{"deepseek":{"type":"api_key","key":"sk_stored_ok"}}\n' > "$HPT2/.pi/agent/auth.json"
+OUT="$(run_gate "$HPT2")"
+has "$OUT" "check=skipped reason=stored-credential provider=deepseek" \
+    "8X4 a usable store entry needs no template: the store answers, so the gate says so"
 # ⛔ AN UNUSABLE STORE ENTRY IS A REFUSAL, AND ITS REMEDY IS THE FILE (rounds 19-20, P1, measured; the mechanism
 # was corrected in round 20): on the LANE path pi does not validate the store - `AuthStorage.create` ->
 # `parseStorageData` is a bare `JSON.parse` (`auth-storage.js:306-312`); the throwing `load()` is
@@ -1001,8 +1022,8 @@ while IFS='|' read -r _n _store; do
 done <<'STORES'
 untyped|{"deepseek":{"key":"sk_legacy_no_type"}}
 barestring|{"deepseek":"sk_bare_string_entry"}
-oauthmissing|{"deepseek":{"type":"oauth","access":"a"}}
-oauthwipe|{"deepseek":{"type":"oauth","access":"a","refresh":"r"}}
+oauthnoaccess|{"deepseek":{"type":"oauth","access":123,"refresh":"r"}}
+oauthnull|{"deepseek":{"type":"oauth","access":"a","refresh":"r","expires":null}}
 apikeynonstring|{"deepseek":{"type":"api_key","key":42}}
 badtype|{"deepseek":{"type":"kerberos","key":"sk_x"}}
 STORES
@@ -1046,6 +1067,23 @@ has "$OUT" "check=skipped reason=stored-credential provider=deepseek" \
     "8U4 env SET + a usable stored credential is the STORE\x27s answer, so the gate does not claim the environment"
 hasnt "$OUT" "check=ok" \
     "8U5 …and still no green line: the store, not the exported variable, is what pi resolves there"
+# ⛔ AND A USABLE OAUTH ENTRY IS NOT A STORE DEFECT (round 21, P2, measured): pi hands it to
+# `resolveStoredOAuth` → `oauth.toAuth` and only refreshes when the token is near expiry, so a MISSING `expires`
+# ("never expires"), a STRING `expires` (compared numerically) and a missing `refresh` are all shapes pi USES -
+# measured against `anthropic`, a built-in WITH an oauth handler: each reached the provider (401 "OAuth access
+# token is invalid") while the first version of this gate refused them 82 and told the operator to delete a
+# credential pi was using.
+for _ok_oauth in '{"deepseek":{"type":"oauth","access":"a","refresh":"r","expires":"9999999999999"}}' \
+                 '{"deepseek":{"type":"oauth","access":"a","refresh":"r"}}' \
+                 '{"deepseek":{"type":"oauth","access":"a","expires":9999999999999}}'; do
+  HOO="$(mkset oauthok "$TWO_JSON" ABSENT)"
+  printf '%s\n' "$_ok_oauth" > "$HOO/.pi/agent/auth.json"
+  OUT="$(run_gate "$HOO")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+  ck "8S4 an oauth entry pi can use is not refused (rc=${RC:-<none>})" \
+     "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+  hasnt "$OUT" "reason=store-invalid" \
+      "8S5 …and is graded as cannot-say, because only pi\x27s handler registry knows if the provider takes oauth"
+done
 # `key: null` is PRESENT, and pi dies on it before any lookup (measured: `Credential store read failed for
 # <provider>: Cannot read properties of null (reading \x27startsWith\x27)`), so it is store-invalid rather than the
 # key-absent cannot-say.
@@ -1411,6 +1449,12 @@ compatconst|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"maxTo
 compatformat|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"thinkingFormat":"bogus"}}}}
 compatpriority|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"vllmPriority":"high"}}}}
 compatfallback|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"allowedFallbackModels":[{"provider":"p","model":"m"}]}}}}
+overridecompat|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"compat":{"supportsStore":"yes"}}}}}}
+overrideheaders|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"headers":{"X-A":1}}}}}}
+overridesampling|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"samplingParams":[]}}}}}
+overridesptl|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"samplingParamsByThinkingLevel":{"off":"x"}}}}}}
+templatevar|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"chatTemplateKwargs":{"k":{"$var":"bogus"}}}}}}
+datacollection|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"openRouterRouting":{"data_collection":"bogus"}}}}}
 compattemplate|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"chatTemplateKwargs":{"x":{"noVar":1}}}}}}
 tiersnull|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"tiers":null}}]}}}
 overridetiersnull|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"cost":{"tiers":null}}}}}}
@@ -1444,6 +1488,18 @@ printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m
 OUT="$(run_gate "$HOX" KG_CANARY_KEY=v)"
 has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
     "8M26 an unknown key inside modelOverrides does not blind the gate — pi loads that file and ignores it"
+# ⛔ AND THE TWO SHAPES pi LOADS MUST NOT BLIND THE GATE (round 21, P3, measured): `openRouterRouting`'s
+# `preferred_min_throughput`/`preferred_max_latency` are `anyOf number|object` (a NUMBER made the first cut abstain),
+# and `modelOverrides` accepts unknown keys. Blindness on a loadable file is the #3331 silence.
+for _pair in 'minthroughput|{"openRouterRouting":{"preferred_min_throughput":100}}' \
+             'maxlatency|{"openRouterRouting":{"preferred_max_latency":2}}'; do
+  _field="${_pair%%|*}"; _body="${_pair#*|}"
+  HOR="$(mkset "routing-$_field" "$TWO_JSON" ABSENT)"
+  printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":%s,"models":[{"id":"m"}]}}}\n' "$_body" > "$HOR/.pi/agent/models.json"
+  OUT="$(run_gate "$HOR" KG_CANARY_KEY=v)"
+  has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+      "8M27.$_field a NUMERIC openRouterRouting leaf is legal — pi loads it, so the credential is still asserted"
+done
 printf '%s\n' '{"$schema":"https://pi.dev/schemas/models.json","providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","name":"DeepSeek","baseUrl":"https://api.deepseek.com","api":"openai-completions","authHeader":false,"headers":{"x-tag":"1"},"compat":{"supportsStore":true},"modelOverrides":{"m":{"contextWindow":1024}},"models":[{"id":"m","name":"M","api":"openai-completions","baseUrl":"https://api.deepseek.com","reasoning":true,"thinkingLevelMap":{"high":"high"},"input":["text","image"],"inputLimits":{"maxRequestBytes":1024,"images":{"maxPerMessage":2}},"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"tiers":[{"inputTokensAbove":1000,"input":1,"output":2,"cacheRead":0,"cacheWrite":0}]},"promptCache":{"short":60,"long":300},"contextWindow":128000,"maxTokens":8192,"samplingParams":{"temperature":0.2},"samplingParamsByThinkingLevel":{"high":{"temperature":0.9}},"headers":{"y":"2"},"compat":{"supportsStore":true}}]}}}' > "$HVA/.pi/agent/models.json"
 OUT="$(run_gate "$HVA" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
 ck "8M23 a models.json using every optional field VALIDLY still answers (rc=${rc:-<none>})" \
