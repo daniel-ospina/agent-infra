@@ -150,6 +150,45 @@ def authority_of(url):
     return (m.group(1) + (":" + port if port is not None else "")).lower()
 
 
+# WHATWG URL's forbidden HOST code points. A host containing one is not "a spelling of a host" —
+# the client's parser refuses it outright (`new URL(...)` -> ERR_INVALID_URL), so a predicate that
+# calls it usable certifies an endpoint no request can be built from.
+# ⛔ THIS LIST IS THE POINT, NOT A DETAIL: `all(lab and any(ch.isalnum() for ch in lab))` alone
+# passes `api.premiselabs.co|evil.example` (every label has an alnum), and the marker printed
+# `SELFHOSTED:` rc=0 for it — a false PASS on the certification gate, resurrecting the exact class
+# the host predicate was added to close (#3374 review, round 2 P3).
+_HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
+
+try:                                          # IDNA2008/UTS46 — the standard the client applies
+    import idna as _idna
+except ImportError:                           # pragma: no cover — stdlib-only box
+    _idna = None
+
+
+def _label_ok(lab):
+    """True when one DNS label is a name the client would accept.
+
+    ASCII labels get the structural rule only (non-empty, at least one alnum) — deliberately NOT
+    `idna.encode`, which is IDNA2008 and stricter than the client on ASCII (it refuses `-abc`, which
+    `new URL` accepts; refusing a spelling that WORKS is the false block this gate exists to avoid).
+    A non-ASCII label is the opposite case: the client applies UTS46, and only IDNA2008 agrees with
+    it — `١.example` passes an "alnum" test and `new URL` throws (`IDNABidiError`), while
+    `münchen.example` is accepted by both. So ask the library, and keep the residual visible: on a
+    box with no `idna` the label is accepted on the forbidden-code-point check alone.
+    """
+    if not lab or not any(ch.isalnum() for ch in lab):
+        return False
+    if any(ch in _HOST_FORBIDDEN for ch in lab):
+        return False
+    if lab.isascii() or _idna is None:
+        return True
+    try:
+        _idna.encode(lab, uts46=True)
+    except Exception:
+        return False
+    return True
+
+
 def authority_names_a_host(authority):
     """True when `authority` (`host[:port]`, userinfo already stripped) names an endpoint at all.
 
@@ -195,7 +234,7 @@ def authority_names_a_host(authority):
     if not host or "%" in host:                    # empty, or pct-encoded (the client throws)
         return False
     labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
-    return all(lab and any(ch.isalnum() for ch in lab) for lab in labels)
+    return all(_label_ok(lab) for lab in labels)
 
 
 def _port_ok(port):
@@ -515,6 +554,21 @@ def main(argv):
     want = base.get("tortoise")
     if not isinstance(want, dict) or not want.get("url"):
         sys.stderr.write("FATAL: %s declares no usable tortoise entry\n" % tpl_path)
+        return 3
+    # ⛔ A TEMPLATE url THAT IS NOT A STRING WAS A TRACEBACK TOO, one predicate further in. The
+    # guard above checks only that `url` is TRUTHY, so `"url": 123` (or an object) passed it and
+    # died at `(want.get("url") or "").strip()` — `AttributeError: 'int' object has no attribute
+    # 'strip'`, rc=1, the file unchanged, i.e. the repair path could not repair it AND the operator
+    # got Python internals, which is the contract `main()`'s own template guard declares closed.
+    # The verifier had the mirror of it: a non-string template url made `want_url` an int, so
+    # `--verify` printed `URL_NOT_DEFAULT:` against the cell's CORRECT hosted entry — a sentence
+    # asserting the right config was wrong (#3374 review, round 2 P3).
+    if not isinstance(want.get("url"), str) or not want.get("url").strip():
+        sys.stderr.write(
+            "FATAL: %s declares a tortoise url of type %s, not a non-empty string — the merge and "
+            "`--verify` both read it as the hosted endpoint, so nothing can be compared against it\n"
+            % (tpl_path, type(want.get("url")).__name__)
+        )
         return 3
 
     # ⛔ TOTAL OVER THE DESTINATION'S *STRUCTURE*, not only over its entries. `usable()` was made

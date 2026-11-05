@@ -539,6 +539,13 @@ if _want is not None and not isinstance(_want, dict):
     print("BADTPL:shape: mcpServers.tortoise is %s, not an object" % type(_want).__name__)
     sys.exit(1)
 want_url = (_want or {}).get("url") or ""
+# ⛔ THE MIRROR OF THE MERGE'S TEMPLATE-url TYPE GUARD (#3374 review, round 2 P3). A non-string
+# template `url` made `want_url` an int, so the `url != want_url` branch fired and this verifier
+# printed `URL_NOT_DEFAULT:` against the cell's CORRECT hosted entry — a refusal sentence asserting
+# the right config is wrong. Unreadable template = nothing can be certified, named as such.
+if not isinstance(want_url, str):
+    print("BADTPL:shape: mcpServers.tortoise.url is %s, not a string" % type(want_url).__name__)
+    sys.exit(1)
 raw = open(p).read()
 try:
     cfg = json.loads(raw)
@@ -601,6 +608,21 @@ if tok.search(raw):
 def redact(value):
     """Mask anything shaped like a credential — a marker is ECHOED into operator-facing logs."""
     return tok.sub("<redacted>", value if isinstance(value, str) else str(value))
+
+
+# ⛔ A USERINFO IS A CREDENTIAL, AND `redact()` DOES NOT CATCH IT (#3374 review, round 2 P3).
+# `tok` matches `tt_`/`tk_` shapes only, so `INSECURE_URL:http://user:hunter2@evil.example/mcp/`
+# put a PASSWORD in the bring-up log — a log that gets pasted into issues and PRs fleet-wide. Every
+# url-echoing marker goes through this: the userinfo is replaced wholesale, because its whole content
+# is secret-or-irrelevant, and nothing after it is touched (the host is the actionable part).
+def shown_url(u):
+    u = u if isinstance(u, str) else str(u)
+    head, sep, tail = u.partition("://")
+    if sep and "@" in tail.split("/", 1)[0]:
+        rest = tail.split("/", 1)
+        authority = rest[0].rsplit("@", 1)[1]
+        u = "%s://<redacted>@%s%s" % (head, authority, ("/" + rest[1]) if len(rest) > 1 else "")
+    return redact(u)
 
 
 if not isinstance(t, dict):
@@ -703,7 +725,7 @@ def _loopback(authority):
 _m = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/]+)", url, re.I)
 if auth and (_m.group(1).lower() if _m else "") != "https" \
    and not _loopback(_m.group(2) if _m else ""):
-    print("INSECURE_URL:%s" % url)
+    print("INSECURE_URL:%s" % shown_url(url))
     sys.exit(1)
 
 
@@ -725,6 +747,32 @@ def _port_ok(port):
     if not port.isdigit():
         return False
     return 1 <= int(port) <= 65535
+
+
+# ⛔ WHATWG URL's forbidden HOST code points, and the IDNA rule for non-ASCII labels. A host
+# containing one is refused by the client's parser outright, so certifying it is a false PASS —
+# `api.premiselabs.co|evil.example` passed an "every label has an alnum" test and printed
+# `SELFHOSTED:` rc=0 (#3374 review, round 2 P3). `merge-mcp.py` carries the SAME helpers.
+_HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
+
+try:                                          # IDNA2008/UTS46 — the standard the client applies
+    import idna as _idna
+except ImportError:                           # pragma: no cover — stdlib-only box
+    _idna = None
+
+
+def _label_ok(lab):
+    if not lab or not any(ch.isalnum() for ch in lab):
+        return False
+    if any(ch in _HOST_FORBIDDEN for ch in lab):
+        return False
+    if lab.isascii() or _idna is None:
+        return True
+    try:
+        _idna.encode(lab, uts46=True)
+    except Exception:
+        return False
+    return True
 
 
 def authority_names_a_host(authority):
@@ -750,7 +798,7 @@ def authority_names_a_host(authority):
     if not host or "%" in host:                    # empty, or pct-encoded (the client throws)
         return False
     labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
-    return all(lab and any(ch.isalnum() for ch in lab) for lab in labels)
+    return all(_label_ok(lab) for lab in labels)
 # ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client sends headers VERBATIM
 # (extensions/mcp-client/index.ts:819-821), so `Authorization: ${TORTOISE_MCP_API_KEY}` (no scheme) is
 # delivered as `Authorization: tt_…` and the server answers 401 — yet it contains "${" and used to
@@ -778,14 +826,14 @@ if want_url and url != want_url:
     # An absolute http(s) url is the minimum this exemption can honestly certify.
     _su = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/?#]+)", url or "", re.I)
     if not _su or _su.group(1).lower() not in ("http", "https"):
-        print("BADURL:%s" % url)
+        print("BADURL:%s" % shown_url(url))
         sys.exit(1)
     # ⛔ AND "ABSOLUTE" IS NOT "REACHABLE" (#3374 review P3): `https://:8443/mcp/` is absolute-
     # looking with NO host, and it was certified SELFHOSTED rc=0. The predicate is shared by name
     # with `merge-mcp.py`, which REFUSES the shape, so the repair replaces it and this verifies the
     # result — converge, in both directions.
     if not authority_names_a_host(_su.group(2)):
-        print("NOHOST:%s" % url)
+        print("NOHOST:%s" % shown_url(url))
         sys.exit(1)
     # ⛔ USERINFO IN THE AUTHORITY IS NOT A SELF-HOST, IT IS A SPOOF SPELLING (#3374 review P1). The
     # real host is the part AFTER the `@` — `https://api.premiselabs.co@evil.example/mcp/` is
@@ -796,12 +844,12 @@ if want_url and url != want_url:
     # from a URL that includes credentials"). `merge-mcp.py`'s `usable()` refuses the same shape, so
     # the repair REPLACES it — verify and install must not disagree in either direction.
     if re.match(r"^[a-z][a-z0-9+.\-]*://[^/?#]*@", url or "", re.I):
-        print("USERINFO:%s" % url)
+        print("USERINFO:%s" % shown_url(url))
         sys.exit(1)
     # A self-hosted entry is certified BY NAME, and its own transport spelling is part of what the
     # operator chose: the client selects StreamableHTTP from `url` alone and never reads `type`, so
     # refusing `sse` here would refuse a config that WORKS (and that install preserves on purpose).
-    print("SELFHOSTED:%s" % url)
+    print("SELFHOSTED:%s" % shown_url(url))
 else:
     if t.get("type") not in (None, "http"):
         print("NOTHTTP:%s" % t.get("type"))
@@ -812,7 +860,7 @@ else:
     if not HOSTED_AUTH.match(auth.strip()):
         print("WRONG_AUTH:%s" % auth)
         sys.exit(1)
-    print("OK:%s:%s" % (url, auth))
+    print("OK:%s:%s" % (shown_url(url), auth))
 PY
 }
 
