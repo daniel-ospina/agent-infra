@@ -2335,6 +2335,43 @@ def t51():
         shutil.rmtree(d, ignore_errors=True)
 
 
+@test("T52 `cpu-advanced` renders an UNREAD delta as `?`, never a fabricated `0.00s`")
+def t52():
+    """⛔ THE STEP-2 VETO'S DETAIL MUST NOT INVENT A MEASUREMENT.
+
+    `(ev.cpu.delta_s or 0.0)` / `(ev.cpu.window_ms or 0)` turned `None` into `0`, and the MCP surface
+    ALWAYS constructs `CpuSample(advanced=…, delta_s=None, window_ms=None)` (`server.py`), so every
+    such verdict in the fleet rendered `cpu +0.00s over 0s (tolerance 0.10s)` beside a
+    `running-quiet` state — the module's own contradicting-evidence class (the `bytes_delta=-990`
+    fix) — and violated the rule `_n()` states a few lines below: an unread value is `?`, never `0`.
+
+    This arm exists because the FIX for that defect had no test at all: reverting it left the whole
+    suite green, so it could (and did) ship unpinned.
+    """
+    holder = liv.Candidate(pid=os.getpid(), observed=liv.HOLDER, kind="argv", start_seconds=None)
+    base = dict(sid="sid-1", now_ms=NOW_MS, jsonl_grew=False, jsonl_age_ms=5 * M,
+                candidates=[holder])
+    # (1) THE UNREAD SHAPE — an advancing sample with no numbers, exactly what the MCP path builds.
+    v = liv.evaluate(liv.Evidence(**base, cpu=liv.CpuSample(advanced=True)))
+    check(v.state == "running-quiet" and v.reason == "cpu-advanced",
+          "an advancing CPU sample is the step-2 veto; got %s/%s" % (v.state, v.reason))
+    check("0.00s" not in v.detail and "over 0s" not in v.detail,
+          "an UNREAD delta must not render as 0; got %r" % v.detail)
+    check(v.detail == "cpu +? over ?",
+          "both unread numbers render `?`, with no tolerance claim; got %r" % v.detail)
+    # (2) THE READ SHAPE — real numbers still render, and the tolerance is stated with them.
+    v = liv.evaluate(liv.Evidence(**base,
+                                 cpu=liv.CpuSample(advanced=True, delta_s=0.5, window_ms=20000)))
+    check(v.detail == "cpu +0.50s over 20s (tolerance 0.10s)",
+          "a measured delta renders with its window and tolerance; got %r" % v.detail)
+    # (3) AND THE VETO IS `is True`: an unattributable (`None`) or flat (`False`) sample is NOT
+    #     progress — it must fall through the ladder rather than claim `cpu-advanced`.
+    for adv in (None, False):
+        v = liv.evaluate(liv.Evidence(**base, cpu=liv.CpuSample(advanced=adv)))
+        check(v.reason != "cpu-advanced",
+              "advanced=%r must not be read as progress; got %s/%s" % (adv, v.state, v.reason))
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -2345,6 +2382,14 @@ class Mutation:
 
 
 MUTATIONS = [
+    Mutation(
+        "T52", "module",
+        '                               % (_n(None if ev.cpu.delta_s is None else "%.2fs" % ev.cpu.delta_s),',
+        '                               % ("%.2fs" % (ev.cpu.delta_s or 0.0),',
+        "an unread delta renders as a MEASURED `+0.00s`, printing its own contradicting "
+        "evidence beside a `running-quiet` state (the `bytes_delta=-990` class, and a "
+        "violation of `_n()`'s \"unread is `?`, never `0`\" rule)",
+    ),
     Mutation(
         "T32", "module",
         '    if kinds:\n        numbers = []',
