@@ -478,6 +478,21 @@ ANC_RC="$(CELL_HOME="$ANC" bash "$HELPER" --check >/dev/null 2>&1; printf %s $?)
 [ "$ANC_RC" = "2" ]; ck $? "an ANCESTOR that is a non-directory → CANNOT VERIFY (2), not 1 'MISSING' with the ship-the-file remedy (measured rc=$ANC_RC)"
 case "$(CELL_HOME="$ANC" bash "$HELPER" --line 2>/dev/null)" in *'MISSING'*) bad "…and --line calls the files MISSING through a non-directory ancestor (wrong remedy)" ;; *) ok "…and --line never calls them MISSING through it" ;; esac
 rm -rf "$ANC"
+# ── E1m: AN OCCUPIED PATH IS CANNOT-VERIFY FOR `--missing` TOO (#3379 review, P2, MEASURED) ──────
+# `mandate_missing` deliberately SKIPS a path that exists (a directory where a declared file belongs is a
+# deployment fault whose remedy is `mv`, not `ship the file`), so on that box `--missing` answered 0 with a
+# list that silently OMITTED the occupied path while `--check` said CANNOT VERIFY about the SAME box: a
+# consumer reading the list as "what to ship" never saw the one path needing another remedy, and rc 0 read
+# as "nothing absent". Same doctrine as the undecidable arm above — a cannot-verify is never an empty or
+# quietly short list — applied one arm over.
+OCC=$(mktemp -d); mkdir -p "$OCC/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+OCC_MISS_RC="$(CELL_HOME="$OCC" bash "$HELPER" --missing >/dev/null 2>&1; printf %s $?)"
+[ "$OCC_MISS_RC" = "2" ]; ck $? "a path OCCUPIED by a directory → --missing is 2, not 0 with a silently short list (measured rc=$OCC_MISS_RC)"
+OCC_MSG="$(CELL_HOME="$OCC" bash "$HELPER" --missing 2>&1 >/dev/null)"
+case "$OCC_MSG" in *'CANNOT VERIFY'*) ok "…and it SAYS cannot-verify on stderr instead of leaving the occupied path out of the list" ;; *) bad "…but --missing said nothing about the occupied path (it is absent from the list AND from stderr)" ;; esac
+OCC_CHECK_RC="$(CELL_HOME="$OCC" bash "$HELPER" --check >/dev/null 2>&1; printf %s $?)"
+[ "$OCC_CHECK_RC" = "2" ]; ck $? "…and --check agrees on the same box, so the two verbs cannot disagree about it"
+rm -rf "$OCC"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
@@ -539,6 +554,30 @@ if [ "$FAIL" -gt "$E3_MARK" ]; then
   printf '%s\n' "--- stdout ---"; tail -10 "$TMP/seam.out" 2>/dev/null
   printf '%s\n' "--- stderr ---"; tail -10 "$TMP/seam.err" 2>/dev/null
 fi
+# ── E3b: THE DEGRADED BRANCH'S BRIEF APPEND IS BRANCHED ON, NOT LEAKED (#3379 review, P2, MEASURED) ──
+# The un-provisioned box takes the `CANNOT VERIFY` branch, whose whole point is that the LANE is told. An
+# ungrouped `printf … >> "$prompt"` on an UNWRITABLE brief emits its own `line N: <path>: Permission denied`
+# to the CALLER's stderr (a trailing `2>/dev/null` cannot retract it) and nothing recorded that the append
+# failed — the log line above read identically either way. Driven through the REAL `run_agent` with the
+# resolver forced to fail (`mandate_preflight_lib() { return 1; }`, the reviewer's own instrument) and a
+# mode-444 brief, so the branch under test is the one an un-provisioned box takes.
+BRIEF3B="$TMP/brief-degraded.txt"; seam_brief "$BRIEF3B"; chmod 444 "$BRIEF3B"
+BEFORE3B="$(cksum < "$BRIEF3B")"; : > "$TMP/seam3b.log"; rm -f "$TMP/pi-ran3b.log"
+PATH="$TMP/bin:$PATH" PI_LOG="$TMP/pi-ran3b.log" O="$TMP/O" CELL_HOME="$TMP/home2" KIND=reviewer \
+  WIP_RESCUE_DISABLE=1 LANE_PREFLIGHT=0 \
+  DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MAX_LOAD=99999 \
+  PI_LANE_PROVIDER=deepseek PI_LANE_MODEL=deepseek-flash \
+  bash -c '. "$1"; cd "$2" || exit 2; mandate_preflight_lib() { return 1; }; run_agent 5 "$3" "$4" degraded; echo "run_agent_rc=$?"' \
+  _ "$SPAWN" "$FIXREPO" "$TMP/seam3b.log" "$BRIEF3B" >"$TMP/seam3b.out" 2>"$TMP/seam3b.err"
+[ "$(cksum < "$BRIEF3B")" = "$BEFORE3B" ]; ck $? "a READ-ONLY brief on the degraded branch is left untouched (the append cannot land — so the arm is measuring the FAILURE path)"
+grep -qF 'WARN degraded: could not append the degraded notice' "$TMP/seam3b.log"; ck $? "…and the LOG records that the LANE was NOT told (without it the CANNOT VERIFY line reads identically on success and failure)"
+if grep -q 'Permission denied' "$TMP/seam3b.err"; then
+  bad "…but a raw bash error escaped to the caller's stderr — the untagged redirect leak, which is what the grouped form prevents"
+else
+  ok "…and no raw bash error escaped to the caller's stderr (the redirect is GROUPED, so its failure is suppressible)"
+fi
+grep -qF 'STUB-PI-RAN' "$TMP/pi-ran3b.log" 2>/dev/null; ck $? "…and the agent STILL STARTED (a failed disclosure is never a gate)"
+chmod 644 "$BRIEF3B"
 # ── E4: THE POSITIVE CONTROL FOR THE SEAM — present files leave the brief untouched ───────────────
 mkdir -p "$TMP/home3/.pi/agent/state"
 : > "$TMP/home3/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
@@ -653,8 +692,11 @@ grep -qF 'orders a reviewer to read exist (#3377). Proceeding: a helper that can
 # brief growth the emit's own guard exists to prevent, re-opened on the branch every un-provisioned box
 # takes. Deleting it left 121 passed, 0 failed.
 grep -qF 'is not available to this spawn' "$MERGE"; ck $? "merge-one.sh APPENDS the notice to the brief, not only to the log (source pin, §E5's limit)"
-grep -qF 'grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null ||' "$MERGE"; ck $? "…and that append is IDEMPOTENT (its guard is pinned; without it a degraded box grows the brief per dispatch)"
-grep -qF 'grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null ||' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too (same guard; deleting it left the suite green)"
+# ⛔ THE GUARD'S SHAPE CHANGED IN THIS CHANGE'S OWN FOURTH REVIEW (P2): the append is now an `if` branch so its
+# redirect failure can be REPORTED, so the pin follows the CODE it guards — `if ! grep … ; then` — rather
+# than the comment above it (the cycle-2 lesson: a pin satisfied by prose guards nothing).
+grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$MERGE"; ck $? "…and that append is IDEMPOTENT (its guard is pinned; without it a degraded box grows the brief per dispatch)"
+grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too (same guard; deleting it left the suite green)"
 # ⛔ THE LOG IS NOT THE LANE, AND THAT WAS THE ACTUAL HOLE (this change's review cycle 2, P1, MEASURED):
 # the notice above went to `$log` ONLY, so on a box that has not received the helper the LANE was told
 # nothing — #3377 exactly, on the population #3377 measured — and replacing BOTH notices with `:` left the

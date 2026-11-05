@@ -2433,8 +2433,21 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     # helper takes — the population #3377 measured — so the notice goes into the brief as well, where every
     # other mandate disclosure lands. Idempotent on the same marker the emit uses, or a degraded box would
     # grow the brief by a line per dispatch.
-    grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null ||
-      printf '%s\n' "[mandate-preflight] CANNOT VERIFY $label: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"
+    # ⛔ GROUP THE REDIRECT WITH THE COMMAND AND BRANCH ON ITS STATUS (#3379 review, P2, MEASURED). An
+    # ungrouped `printf … >> "$prompt"` on an unwritable brief emits its own `line N: <path>: Permission
+    # denied` to the CALLER's stderr — an untagged bash error escaping `run_agent`'s log contract, which a
+    # trailing `2>/dev/null` cannot retract because redirections apply left to right — and NOTHING recorded
+    # that the lane was never told, so the `CANNOT VERIFY` line above read identically whether the append
+    # landed or not. That is #3377's silence restored, in the one branch an un-provisioned box takes. The
+    # helper's own emit already refuses this shape (`mandate-preflight.sh`'s `if { printf … } 2>/dev/null`
+    # with a WARN on the else); this is the same `if`/`else` in the seam.
+    if ! grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt" 2>/dev/null; then
+      if { printf '%s\n' "[mandate-preflight] CANNOT VERIFY $label: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"; } 2>/dev/null; then
+        :
+      else
+        { echo "[mandate-preflight] WARN $label: could not append the degraded notice to $prompt, so only THIS LOG names it and the LANE will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null || :
+      fi
+    fi
   fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!

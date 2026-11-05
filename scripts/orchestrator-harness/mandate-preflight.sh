@@ -535,13 +535,24 @@ _mandate_cli() {
         printf '[mandate-preflight] CANNOT VERIFY: the state dir cannot be resolved on this box, so no path may be called missing (a cannot-verify is never an empty list). Use --check for the verdict.\n' >&2
         return 2
       fi
+      # ⛔ AN OCCUPIED PATH IS CANNOT-VERIFY HERE TOO (#3379 review, P2, MEASURED). `mandate_missing`
+      # deliberately SKIPS a path that exists — a directory sitting where a declared file belongs is a
+      # deployment fault whose remedy is `mv`, not `ship the file` — so on that box this verb answered 0
+      # with a list that silently OMITTED the occupied path, while `--check` said CANNOT VERIFY about the
+      # SAME box. A consumer reading the list as "what to ship" never saw the one path that needs the other
+      # remedy, and one reading rc 0 as "nothing absent" read an unknown state as clean: the exact shape
+      # the undecidable arm above closed, one arm over. Same doctrine, same answer: 2.
+      if [ -n "$(mandate_irregular)" ]; then
+        mandate_irregular | sed 's/^/[mandate-preflight] CANNOT VERIFY (not a regular file) /' >&2
+        return 2
+      fi
       mandate_missing ;;
     --files)   mandate_files | cut -d'|' -f1 ;;
     -h|--help)
       printf 'usage: %s [--check|--line|--missing|--files]\n' "$0"
       printf '  --check    0 every mandated file present · 1 any missing (each named on stderr) · 2 CANNOT VERIFY\n'
       printf '  --line     the disclosure block appended to a brief (EMPTY when all are present)\n'
-      printf '  --missing  the missing paths, one per line · 2 CANNOT VERIFY (never an empty list for an unknown state)\n'
+      printf '  --missing  the missing paths, one per line · 2 CANNOT VERIFY (a path occupied by a non-file, or a state dir that cannot be resolved — never an empty or silently short list for an unknown state)\n'
       printf '  --files    the declared names, one per line\n' ;;
     "")
       mandate_preflight_line ;;
