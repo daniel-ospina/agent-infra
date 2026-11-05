@@ -3881,28 +3881,73 @@ ck "refresh-candidates.sh ranks the tiers P0=0 < P1=1 < P2=2 (a constant rank wo
 # Widening further means stubbing `gh` and driving the pool build too; this is the boundary drawn.
 # ⛔ AND THE FUNCTIONS THE TAIL CALLS MUST BE IN THE DRIVEN REGION (#2019, PR #3234). The queue's order
 # is now RE-DERIVED from the pool at the dedupe site, so the tail CALLS `queue_order_from_pool`. Both
-# definitions sit ~1,100 lines ABOVE this anchor, so the first version of that change left the drive
-# calling an UNDEFINED command — `command not found`, absorbed by `|| true`, output discarded — and this
-# check stayed GREEN while its own name asserted "nothing running it re-sorts it" about a file the
-# shipped code now re-sorts on every pass. The shipped behaviour and the guard's claim had inverted and
-# nothing reddened: a false-PASS guard. The definitions are therefore PREPENDED here, and a SECOND
-# fixture gives the pool a rank so the drive must actually move the head — a POSITIVE assertion, so an
-# inert call reads RED instead of green.
+# definitions sit far ABOVE this anchor — OUTSIDE the driven region, which is the property that matters,
+# and no line number is quoted here because every one this comment has ever carried has drifted (three
+# figures in three review rounds, and the third was stale by the very edit that added it). The delta
+# cannot be checked from a comment; the PREDICATE below checks the thing it is actually about. That
+# distance is why the first version of that change left the drive calling an UNDEFINED command —
+# `command not found`, absorbed by `|| true`, output discarded — and this check stayed GREEN while its
+# own name asserted "nothing running it re-sorts it" about a file the shipped code now re-sorts on every
+# pass. The shipped behaviour and the guard's claim had inverted and nothing reddened: a false-PASS
+# guard. The definitions are therefore PREPENDED here, and a SECOND fixture gives the pool a rank so the
+# drive must actually move the head — a POSITIVE assertion, so an inert call reads RED instead of green.
 # ⛔ BOTH RESULTS START AT 1, BEFORE ANY BRANCH (review P2). They used to be assigned only INSIDE the
 # success branch, while the two `ck` calls below read them unconditionally — so on the very path this
 # check exists for (missing/empty $REFRESH, or either extraction anchor drifting) the run died under
 # `set -u` with `rc_dedupe: unbound variable`: no FAIL line, no summary, and every check after this one
 # never ran. The guard's failure path is the one thing that must never itself crash. Defaulting to 1
 # makes a skipped drive count a named FAIL and lets the suite continue, as it did before this change.
-rc_dedupe=1; rc_rank=1; rc_handoff=1
+rc_dedupe=1; rc_rank=1; rc_handoff=1; rc_qfns=1; rc_drift=1; rc_consume=1
+# ⛔ THE EXTRACTION MUST BE PROVEN WHOLE, NOT MERELY NON-EMPTY (review P2, cycle 7). The gate used to test
+# `-s` plus "contains `^queue_order_from_pool() {`", which an OVER-CAPTURE satisfies: drift the
+# terminator comment and awk runs to EOF, swallowing the rest of the script — and this check still
+# reported 3 passed while rank-queue.test.sh reddened on the same drift. Two suites disagreeing about
+# what a broken anchor looks like, with this half saying green, is a false PASS in the one guard that
+# exists to catch a false PASS. WHOLE now means: exactly ONE definition of each function the tail calls,
+# the fragment ENDS at a closing brace (so an EOF-run that stops mid-block cannot pass), and the block
+# that FOLLOWS the functions is NOT inside it (the first assignment after the terminator).
+qorder_fns_extract() { # <script> -> the two queue-order functions (+ product_queue_follow) as a fragment
+  awk '/^rank_queue_by_pool\(\) \{/{f=1} f && /^# The previous pass.s record/{exit} f' "${1:-}"
+}
+qorder_fns_whole() { # <fragment-file> -> 0 iff the extraction stopped where it was meant to
+  [ -s "${1:-}" ] || return 1
+  [ "$(grep -c '^rank_queue_by_pool() {' "$1")" = "1" ] || return 1
+  [ "$(grep -c '^queue_order_from_pool() {' "$1")" = "1" ] || return 1
+  [ "$(tail -1 "$1" | tr -d '[:space:]')" = "}" ] || return 1
+  ! grep -q '^PREV_DIGEST=' "$1" || return 1
+  return 0
+}
+# ⛔ THE GATE THE DRIVE DEPENDS ON IS THIS FUNCTION — there is no second spelling of the condition that
+# could drift from it (review P2, cycle 8). It used to be `-s "$TMP/tail.sh" && grep … && [ "$rc_qfns" = 0 ]`,
+# and reverting THAT line to the old `-s` + `grep '^queue_order_from_pool() {'` accepted an over-capture
+# again while every check in this file stayed green: the drift fixture exercised the predicate DIRECTLY, so
+# nothing pinned that the gate consumed it. One function, called by the gate and driven by the fixture,
+# plus the textual pin below so a revert is a NAMED FAIL rather than a silent loss.
+qorder_gate_ok() { # <refresh> <tail> <out-fragment> -> 0 iff the drive region is COMPLETE
+  local r="${1:-}" t="${2:-}" out="${3:-}"
+  { [ -n "$r" ] && [ -n "$t" ] && [ -n "$out" ]; } || return 1
+  [ -s "$r" ] && [ -s "$t" ] || return 1
+  grep -q 'candidates\.txt' "$t" || return 1
+  qorder_fns_extract "$r" > "$out" || return 1
+  qorder_fns_whole "$out" || return 1
+  return 0
+}
 if [ -s "$REFRESH" ]; then
   awk '/^done < /{f=1;next} f' "$REFRESH" > "$TMP/tail.sh"
+  # Its own RED PATH is exercised on every run: the SAME gate over a copy whose terminator comment has
+  # drifted runs to EOF, and must be REFUSED. Without this fixture the gate is only ever observed
+  # passing, which is exactly how it stayed green through the drift that reddened the sibling suite.
+  sed 's/The previous pass.s record/DRIFTED terminator — the anchor this extraction relies on/' "$REFRESH" > "$TMP/refresh-drift.sh"
+  if [ -s "$TMP/refresh-drift.sh" ] && [ -s "$TMP/tail.sh" ] \
+     && ! qorder_gate_ok "$TMP/refresh-drift.sh" "$TMP/tail.sh" "$TMP/qorder-fns-drift.sh"; then rc_drift=0
+  else
+    rc_drift=1; echo "      the drifted-terminator fixture was NOT refused ($(wc -l < "$TMP/qorder-fns-drift.sh" 2>/dev/null | tr -d ' ') line(s) captured)"
+  fi
   # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
-  # both functions are contiguous there, and a terminator anchor cannot silently capture half the file.
-  awk '/^rank_queue_by_pool\(\) \{/{f=1} f && /^# The previous pass.s record/{exit} f' "$REFRESH" > "$TMP/qorder-fns.sh"
-  # Fail closed if an extraction found nothing, or lost the file it is supposed to exercise.
-  if [ -s "$TMP/tail.sh" ] && grep -q 'candidates\.txt' "$TMP/tail.sh" \
-     && grep -q '^queue_order_from_pool() {' "$TMP/qorder-fns.sh"; then
+  # both functions are contiguous there; `qorder_gate_ok` proves the stop actually happened there and
+  # leaves the fragment it validated in $TMP/qorder-fns.sh — the drive below uses THOSE bytes.
+  if qorder_gate_ok "$REFRESH" "$TMP/tail.sh" "$TMP/qorder-fns.sh"; then
+    rc_qfns=0
     # Redirect $O at the SOURCE rather than editing paths: `awk -v` passes the fixture dir without any
     # shell quoting of `$O` on the command line. Escape it first — in awk's gsub REPLACEMENT `&` means
     # the matched text and `\x` is an escape, so a `&` or `\\` in $TMP would corrupt the generated
@@ -3952,6 +3997,26 @@ if [ -s "$REFRESH" ]; then
     rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
   fi
 fi
+# ⛔ AND THE GATE IS THE PREDICATE, PINNED IN THE FILE'S OWN TEXT (review P2, cycle 8). The drift fixture
+# above proves `qorder_gate_ok` refuses an over-capture; it does NOT prove this file's drive depends on
+# it. Measured: reverting the drive's condition to the old `-s` + `grep '^queue_order_from_pool() {'`
+# accepted a 2,067-line over-capture and every check here stayed green. A predicate and its caller are
+# two wires, and a suite that pins only one can be unplugged from the other without a red line.
+# ⛔ AND IT IS MATCHED AS A WHOLE LINE (`grep -qxF`), because the pattern is written IN THIS FILE: a
+# plain `grep -qF` matches the assignment line below, so the pin would satisfy itself and be green on
+# every revert (measured: with the old condition restored, a substring pin still passed).
+gate_line='  if qorder_gate_ok "$REFRESH" "$TMP/tail.sh" "$TMP/qorder-fns.sh"; then'
+if grep -qxF "$gate_line" "$HERE/selftest.sh" 2>/dev/null; then
+  rc_consume=0
+else
+  rc_consume=1; echo "      the drive no longer gates on qorder_gate_ok — an over-capture would be driven again"
+fi
+# BOTH results are read HERE, OUTSIDE every branch (review P3, cycle 8): they used to be assigned inside
+# the `if [ -s "$REFRESH" ]` block, so with an unreadable $REFRESH the new gate checks VANISHED from the
+# run — fewer checks, no red line attributable to them — which is the shape the `rc_dedupe` comment above
+# says must never happen. They start at 1 (fail-closed) and are only cleared by a measured pass.
+ck "the extraction gate FAILS CLOSED on an over-capture: a drifted terminator (awk runs to EOF) is REFUSED, not reported green" $rc_drift
+ck "the drive's gate IS qorder_gate_ok — a revert to the old '-s + grep the function name' condition is a NAMED FAIL here" $rc_consume
 ck "refresh-candidates.sh dedupes the backlog in place (and leaves the order alone when the pool ranks nothing)" $rc_dedupe
 ck "refresh-candidates.sh re-derives the queue's head from the pool — the ranked row leads, unranked rows keep their tail order" $rc_rank
 ck "the handoff line names the order it actually has — 'priority-unreadable' without inventing 'ARRIVAL order', and the severity arm when the pool ranked" $rc_handoff
