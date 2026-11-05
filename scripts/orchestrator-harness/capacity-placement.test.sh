@@ -1337,6 +1337,198 @@ MACBID="$(macbid 2>/dev/null)"; RC=$?
 ck "(7) a box with a hardware uuid keeps THAT identity and never consults the net derivation (mac unchanged: $MACBID)" \
    "$([ "$RC" -eq 0 ] && [ "$MACBID" = '8e93de39-C0FFEE-11EE-9E93-8E93DE39AAAA' ] && echo 0 || echo 1)"
 
+# ── §15 EXPECTED vs PUBLISHED (#3446) ──────────────────────────────────────────────────────────
+echo
+echo "── §15 the fleet line: expected vs published, and an EMPTY read is never health ──"
+# MEASURED 2026-11-04, the defect these arms are about: `cmux vm ls` reported 5 of 5 machines running
+# while `git ls-remote --refs origin 'refs/boxes/*'` held ONE ref. Five live boxes were invisible and
+# nothing said so, because every reader in this file treats an absent record as "ineligible" — the
+# fail-closed direction, which cannot distinguish a DEAD box from a FULL one. The line joins the two
+# readings; the polarity that matters (an empty set is an ALARM, not a quiet fleet of one) is graded
+# here, including by mutation.
+# recb <boxid> <at> — a full record under an EXPLICIT identity, which is how a provider lists a box.
+recb() {
+  recf cmux 8 56 0 120000 14000 "$2" 400 15041 1 \
+    | sed "s/ boxid=[^ ]*/ boxid=$1/"
+}
+INV="$TMP/inventory-3446.json"
+printf '%s\n' '{"machines":[{"id":"vm-1","name":"pi-cell-1","status":"running","self":false,"network":{"ipv4":"10.0.0.1","ipv6":"fdbc::1"},"reachable":true},{"id":"vm-2","name":"pi-cell-2","status":"running","self":true,"network":{"ipv4":"10.0.0.2","ipv6":"fdbc::2"},"reachable":false},{"id":"vm-4","name":"pi-cell-4","status":"stopped","network":{"ipv4":"10.0.0.4"}}]}' > "$INV"
+INVP="$TMP/inventory-3446-pretty.json"
+printf '%s\n' '{' '  "machines": [' '    {' '      "id": "vm-1",' '      "name": "pi-cell-1",' '      "status": "running",' '      "network": { "ipv4": "10.0.0.1", "ipv6": "fdbc::1" }' '    },' '    {' '      "id": "vm-2",' '      "name": "pi-cell-2",' '      "status": "running",' '      "network": { "ipv4": "10.0.0.2" }' '    }' '  ]' '}' > "$INVP"
+ROSTER3="cell-1:10.0.0.1 cell-2:10.0.0.2 cell-3:10.0.0.3"
+# (a) THE LINE ITSELF: three expected, one publishing.
+L1="$(CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"; RC=$?
+ck "(a) expected/published/INELIGIBLE in ONE line, with the missing boxes NAMED ($L1)" \
+   "$([ "$RC" -eq 0 ] && qF 'expected=3' "$L1" && qF 'published=1' "$L1" && qF 'INELIGIBLE=2' "$L1" \
+      && qF '(cell-2, cell-3)' "$L1" && qF 'src=roster' "$L1" && echo 0 || echo 1)"
+# (b) ALL PUBLISHED: no alarm, and no names invented for a fleet that is whole.
+L2="$(CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line_from "$(printf '%s\n' "$(recb 10.0.0.1 "$NOW")" "$(recb 10.0.0.2 "$NOW")" "$(recb 10.0.0.3 "$NOW")")" 0)"; RC=$?
+ck "(b) a whole fleet reads INELIGIBLE=0 with NO name list and no extra= ($L2)" \
+   "$([ "$RC" -eq 0 ] && qF 'published=3' "$L2" && qF 'INELIGIBLE=0' "$L2" && ! qF '(' "$L2" \
+      && ! qF 'extra=' "$L2" && echo 0 || echo 1)"
+# (c) STALE IS NOT PUBLISHED, AND IT IS SAID DIFFERENTLY FROM GONE. A record that stopped refreshing is
+# a box whose CONTROLLER died (the box is still up); a box with no record at all may be gone. The old
+# fleet view collapsed both into "not visible".
+STALE_AT=$(( NOW - CAP_PROBE_TTL - 60 ))
+L3="$(CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line_from "$(printf '%s\n' "$(recb 10.0.0.1 "$NOW")" "$(recb 10.0.0.2 "$STALE_AT")")" 0)"; RC=$?
+ck "(c) a record older than the TTL is INELIGIBLE and named under stale=, not counted as published ($L3)" \
+   "$([ "$RC" -eq 0 ] && qF 'published=1' "$L3" && qF 'INELIGIBLE=2' "$L3" && qF '(cell-3)' "$L3" \
+      && qF 'stale=(cell-2)' "$L3" && echo 0 || echo 1)"
+# (c-mutant) NON-VACUITY: the SAME assertion must FAIL when the freshness test is disarmed. If (c)
+# passed on a box that counts stale records as published, it was asserting nothing.
+L3M="$(CAP_PROBE_TTL=99999999 CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line_from "$(printf '%s\n' "$(recb 10.0.0.1 "$NOW")" "$(recb 10.0.0.2 "$STALE_AT")")" 0)"
+ck "  …non-vacuity: disarm the TTL and the stale box counts as published (published=2: $(printf '%s' "$L3M" | grep -o 'published=[0-9]*'))" \
+   "$(case "$L3M" in *'published=2'*) echo 0 ;; *) echo 1 ;; esac)"
+# (d) ⛔ THE ARM THIS ISSUE EXISTS FOR: an EMPTY read is an ALARM, never a healthy fleet of nobody.
+L4="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1 cell-2:10.0.0.2" cap_fleet_line_from "" 0)"; RC=$?
+ck "(d) an EMPTY fleet against 2 expected boxes reads published=0 INELIGIBLE=2 with both named ($L4)" \
+   "$([ "$RC" -eq 0 ] && qF 'published=0' "$L4" && qF 'INELIGIBLE=2' "$L4" && qF '(cell-1, cell-2)' "$L4" && echo 0 || echo 1)"
+# (e) NO EXPECTATION IS 'UNKNOWN', NEVER '0'. `expected=0` would be a claim that the provider runs no
+# machines — a claim nothing measured — and it would render the fleet whole.
+L5="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="false" cap_fleet_line_from "" 0)"; RC=$?
+ck "(e) an unreadable provider inventory is expected=UNKNOWN WITH its reason, never expected=0 ($L5)" \
+   "$([ "$RC" -eq 1 ] && qF 'expected=UNKNOWN' "$L5" && ! qF 'expected=0' "$L5" \
+      && qF 'why=provider-inventory-unreadable' "$L5" && qF 'INELIGIBLE=unknown' "$L5" && echo 0 || echo 1)"
+# (e-mutant) NON-VACUITY: a tree whose UNKNOWN arm is replaced by "no expectation" must fail (e).
+{ cat "$CAP"; printf '\ncap_expected_boxes() { return 0; }\n'; } > "$TMP/cap-no-unknown.sh"
+L5M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="false" bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-no-unknown.sh" 2>&1)"
+ck "  …mutation control: remove the UNKNOWN arm and (e)'s assertion no longer holds ($(printf '%s' "$L5M" | grep -o 'expected=[A-Za-z0-9]*' | head -1))" \
+   "$(case "$L5M" in *'expected=UNKNOWN'*) echo 1 ;; *) echo 0 ;; esac)"
+# (f) THE PROVIDER'S OWN INVENTORY answer — and the NAME->KEY mapping that lets the line name boxes:
+# `network.ipv4` is the identity `cap_boxid` publishes under, and a STOPPED machine is not expected.
+L6="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INV" cap_fleet_line_from "$(recb 10.0.0.2 "$NOW")" 0)"; RC=$?
+ck "(f) the provider listing is the expectation (2 running machines, the stopped one excluded) and the missing cell is NAMED ($L6)" \
+   "$([ "$RC" -eq 0 ] && qF 'expected=2' "$L6" && qF 'published=1' "$L6" && qF 'INELIGIBLE=1' "$L6" \
+      && qF '(pi-cell-1)' "$L6" && qF 'src=cmux' "$L6" && ! qF 'pi-cell-4' "$L6" && echo 0 || echo 1)"
+L6P="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INVP" cap_fleet_line_from "$(recb 10.0.0.2 "$NOW")" 0)"
+ck "  …and a PRETTY-PRINTED listing parses identically (spaces/newlines around the fields are not a syntax the reader misses: $L6P)" \
+   "$(case "$L6P" in *'expected=2'*'INELIGIBLE=1'*'(pi-cell-1)'*) echo 0 ;; *) echo 1 ;; esac)"
+# (g) AN UNREADABLE CHANNEL IS 'UNREADABLE', NEVER '0 PUBLISHED' — the same rule one level down.
+WORK15="$TMP/work15"; git init -q "$WORK15" >/dev/null 2>&1
+L7="$(CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line "$WORK15" 2>/dev/null)"; RC=$?
+ck "(g) a channel that cannot be read reports published=UNREADABLE (never published=0) with rc=2 ($L7)" \
+   "$([ "$RC" -eq 2 ] && qF 'published=UNREADABLE' "$L7" && ! qF 'published=0' "$L7" && echo 0 || echo 1)"
+# (h) THE OPERATOR'S VERB: the same line, from the shipped CLI, over a REAL read of the channel.
+git -C "$WORK15" remote add origin "$TMP/origin2707.git" >/dev/null 2>&1 || true
+L8="$(CAP_EXPECTED_BOXES="$ROSTER3" bash "$CAP" fleet-line "$WORK15" 2>/dev/null)"; RC=$?
+ck "(h) 'bash capacity.sh fleet-line <repo>' prints the line (the CLI is wired, not just the library: $L8)" \
+   "$(case "$L8" in 'fleet: expected='*'published='*'INELIGIBLE='*) echo 0 ;; *) echo 1 ;; esac)"
+# (i) COUNT-ONLY IS A REAL MODE AND SAYS WHAT IT CANNOT DO: the count is reported, the names are not
+# invented, and the rc marks the line's INCOMPLETENESS.
+# ⛔ AND A COUNT-ONLY EXPECTATION CANNOT COUNT INELIGIBLE EITHER (review round 2). `expected - published`
+# is a LOWER BOUND, not a count: a publisher the expectation does not name (a Mac is in no provider VM
+# listing) inflates `published` and silently under-reports the gap. The count and the reason are reported;
+# the ineligible figure is `unknown`, because nothing measured it.
+L9="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="4" cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"; RC=$?
+ck "(i) an explicit COUNT reports expected=4 and INELIGIBLE=unknown — never a subtraction posing as a count (rc=$RC: $L9)" \
+   "$([ "$RC" -eq 1 ] && qF 'expected=4' "$L9" && qF 'INELIGIBLE=unknown' "$L9" && qF 'why=expected-has-no-boxid' "$L9" && echo 0 || echo 1)"
+# (j) WIRING — THE CONTROLLER AND THE DRAINER BOTH EMIT IT. A defined-but-unused instrument is inert.
+# ⛔ AND BOTH BRANCHES THAT HAVE A READING MUST EMIT IT (review round 3): a `grep -q` can only see that
+# SOME site exists, so deleting the probe-unreadable emission — the whole point of the round-2 addition —
+# left this arm green. The count is asserted, and then the branch membership structurally.
+ck "(j) orch-loop.sh emits the line on BOTH branches that have a reading (normal cycle AND probe-unreadable)" \
+   "$([ "$(grep -cF 'cap_fleet_line_from "${CAP_FLEET:-}"' "$LOOP")" -eq 2 ] && qF 'CAP_FLEET_RC=$?' "$(cat "$LOOP")" && echo 0 || echo 1)"
+ck "  …the second emission is INSIDE the probe-unreadable branch (a box whose own probe failed still reports the fleet)" \
+   "$(awk '/^    elif \[ -z "\${CAP_REC:-}" \]; then/{f=1; next} f && /^    else$/{exit} f && /\$\(cap_fleet_line_from "\$\{CAP_FLEET:-\}"/{print "hit"; exit}' "$LOOP" | grep -q hit && echo 0 || echo 1)"
+ck "  …and cap_place still receives that same read (the line cannot disagree with placement about who is visible)" \
+   "$(qF 'printf '"'"'%s\n'"'"' "${CAP_FLEET:-}" "$CAP_REC" | cap_place' "$(cat "$LOOP")" && echo 0 || echo 1)"
+DRAINER="$HERE/ai-drainer.sh"
+ck "  …and ai-drainer.sh takes the reading ONCE PER TICK it owns the lock for (a skipped tick still reports the fleet)" \
+   "$(qF 'fleet_line' "$(cat "$DRAINER")" && qF 'cap_fleet_line "$FLEET_REPO"' "$(cat "$DRAINER")" && echo 0 || echo 1)"
+# ⛔ NO "MUTATION CONTROL" THAT NEVER RUNS THE MUTANT (review round 3). A control here used to `sed` the
+# per-tick CALL out of a copy and assert the COPY no longer contained it — a statement about the copy,
+# true on any tree, which cannot go red before or after the change. That behaviour is graded where it
+# can actually be EXECUTED: `ai-drainer.test.sh` (f1) counts the `fleet:` lines a real tick writes.
+{ cat "$CAP"; printf '\ncap_fleet_line_from() { printf "fleet: expected=2 published=2 INELIGIBLE=0\\n"; }\n'; } > "$TMP/cap-always-healthy.sh"
+L10="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1 cell-2:10.0.0.2" bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-always-healthy.sh" 2>&1)"
+# ⛔ AND THE CONTROL APPLIES ARM (d)'s OWN PREDICATE (review round 3), not a weaker one: matching
+# `INELIGIBLE=0` against a formatter hard-wired to print it is true by construction. This asserts the
+# mutant FAILS (d), i.e. that (d)'s assertion is load-bearing.
+ck "  …mutation control: a formatter that answers 'healthy' unconditionally FAILS arm (d)'s assertion ($L10)" \
+   "$(qF 'published=0' "$L10" && qF 'INELIGIBLE=2' "$L10" && qF '(cell-1, cell-2)' "$L10" && echo 1 || echo 0)"
+
+# ── review round 2: three fail-OPEN holes the first cut still had ────────────────────────────────
+# (k) ⛔ AN UNREADABLE CLOCK IS NOT "EVERY RECORD IS FRESH". The first cut substituted `now=0` on a
+# non-numeric clock; every age then went negative, the clamp turned it into 0, and `age > TTL` was false
+# for EVERY record — including one dated 2001 — so the line certified a whole fleet from a clock it never
+# read. `cap_place` refuses on the same datum (`bound=usage detail=clock-unreadable`); the line must
+# report it in the same vocabulary rather than guess.
+L11="$(CAP_NOW=garbage CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line_from "$(recb 10.0.0.1 1000000000)" 0)"; RC=$?
+ck "(k) an unreadable clock reports published=UNREADABLE why=clock-unreadable, never a certified fleet ($L11)" \
+   "$([ "$RC" -eq 1 ] && qF 'published=UNREADABLE' "$L11" && qF 'why=clock-unreadable' "$L11" && ! qF 'published=1' "$L11" && echo 0 || echo 1)"
+# (k-mutant) NON-VACUITY, ON THE REAL CODE PATH (review round 2): a COPY of the module whose clock arm
+# is the pre-fix one — `now=0` — must certify the fleet on the same input. The previous control replayed
+# the pre-fix snippet by hand, which asserted something about the TEST's own text and passed even on an
+# empty module.
+sed 's/unk_pub=1; why="${why:-clock-unreadable}"/now=0/' "$CAP" > "$TMP/cap-badclock.sh"
+L11M="$(CAP_NOW=garbage CAP_EXPECTED_BOXES="cell-1:10.0.0.1" bash -c '. "$1"; cap_fleet_line_from "$2" 0' _ "$TMP/cap-badclock.sh" "$(recb 10.0.0.1 1000000000)" 2>&1)"
+ck "  …mutation control: put the pre-fix clock arm back and the SAME input certifies the fleet ($L11M)" \
+   "$(case "$L11M" in *'published=1'*'INELIGIBLE=0'*) echo 0 ;; *) echo 1 ;; esac)"
+# (l) ⛔ A ROSTER THAT TOKENIZES TO NOTHING IS A REFUSAL, NOT A FLEET OF ZERO. `CAP_EXPECTED_BOXES=","`
+# (an empty list joined into a plist, a stray space) used to emit no box lines and return 0, so the caller
+# read `expected=0 … INELIGIBLE=0`: a clean bill of health built from no material — the exact case the
+# function's own contract, one screen above the roster arm, forbids.
+L12="$(CAP_EXPECTED_BOXES="," cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"; RC=$?
+ck "(l) a roster with no box token is expected=UNKNOWN why=roster-empty, never expected=0 ($L12)" \
+   "$([ "$RC" -eq 1 ] && qF 'expected=UNKNOWN' "$L12" && qF 'why=roster-empty' "$L12" && ! qF 'expected=0' "$L12" && echo 0 || echo 1)"
+L12S="$(CAP_EXPECTED_BOXES=" " cap_fleet_line_from "" 0)"; RC=$?
+ck "  …and a roster of only whitespace is the same refusal, not an empty fleet ($L12S)" \
+   "$([ "$RC" -eq 1 ] && qF 'why=roster-empty' "$L12S" && ! qF 'expected=0' "$L12S" && echo 0 || echo 1)"
+# (m) ⛔ THE THREE FIELDS MUST RECONCILE. `published` counts EVERY publishing box — a Mac publishes but
+# appears in no provider VM listing — so `expected` and `published` can be equal while every expected box
+# is silent: that is the same false-PASS shape, one field over. `extra=` names the surplus, so
+# `published − extra = expected − INELIGIBLE` is checkable ON THE LINE (arm (b) asserts its absence when
+# the fleet is whole).
+L13="$(CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line_from "$(recb 10.9.9.9 "$NOW")" 0)"; RC=$?
+ck "(m) a stranger that publishes is named as extra=, so 'expected == published' can never read whole ($L13)" \
+   "$([ "$RC" -eq 0 ] && qF 'published=1' "$L13" && qF 'extra=1' "$L13" && qF 'INELIGIBLE=3' "$L13" && echo 0 || echo 1)"
+# (n) ⛔ AN UNREADABLE CHANNEL CANNOT SUPPORT A MEMBERSHIP CLAIM. With `fresh` never computed, every
+# expected box used to fall into `missing` and be NAMED as ineligible — asserting "these are not
+# publishing" when the truth is "nobody read the channel" — and no `why=` was set at all, so the line both
+# omitted its promised reason and invented a finding. That is the mirror of the defect being fixed.
+WORK15B="$TMP/work15-b"; git init -q "$WORK15B" >/dev/null 2>&1   # no origin at all: the channel cannot be read
+L14="$(CAP_EXPECTED_BOXES="$ROSTER3" cap_fleet_line "$WORK15B" 2>/dev/null)"; RC=$?
+ck "(n) an unreadable channel withholds the membership claim (no '(...)') and names why=channel-unreadable ($L14)" \
+   "$([ "$RC" -eq 2 ] && qF 'published=UNREADABLE' "$L14" && qF 'why=channel-unreadable' "$L14" && ! qF '(' "$L14" && echo 0 || echo 1)"
+# (o) ⛔ AN UNATTRIBUTABLE ROSTER CANNOT *COUNT* INELIGIBLE (review round 2). This arm used to SUBTRACT
+# (`expected - published`), which cannot know which expected box a published record belongs to: with one
+# keyed and one unkeyed entry it printed `INELIGIBLE=0 (cell-1)` — a count contradicting the name beside
+# it on the same line — and with strangers publishing it read `expected=2 published=2`, the equality this
+# change exists to stop. The keyed box that IS provably missing stays named; the count is `unknown`.
+L15="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1 cell-2:" cap_fleet_line_from "$(recb 10.9.9.9 "$NOW")" 0)"; RC=$?
+ck "(o) a mixed roster reads INELIGIBLE=unknown — never a subtraction that contradicts the names beside it ($L15)" \
+   "$([ "$RC" -eq 1 ] && qF 'INELIGIBLE=unknown' "$L15" && qF '(cell-1)' "$L15" && qF 'why=expected-has-no-boxid' "$L15" && echo 0 || echo 1)"
+# (p) ⛔ NO SURPLUS CAN BE ASSERTED ABOUT A LIST NOBODY READ (the sibling of (n)): with the expectation
+# unknown `expids` is empty, so every publisher would look like a box the expectation does not name.
+L16="$(CAP_EXPECTED_BOXES="," cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
+ck "(p) expected=UNKNOWN never claims a surplus (no extra=) — nothing was compared ($L16)" \
+   "$(qF 'expected=UNKNOWN' "$L16" && ! qF 'extra=' "$L16" && echo 0 || echo 1)"
+# (q) ⛔ THE SAME BOX NAMED TWICE IS ONE BOX (review round 2). `expected` counts ENTRIES while `published`
+# counts DISTINCT keys, so a duplicated row broke the advertised `published − extra = expected − INELIGIBLE`
+# — reachable without a typo, because `cap_ref_token` DELETES rather than escapes.
+L17="$(CAP_EXPECTED_BOXES="cell-1:10.0.0.1 cell-1again:10.0.0.1 cell-2:10.0.0.2" cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"
+ck "(q) a roster row repeated for one box counts ONCE, so the fields reconcile ($L17)" \
+   "$(case "$L17" in *'expected=2 published=1 INELIGIBLE=1 '*) echo 0 ;; *) echo 1 ;; esac)"
+# (r) ⛔ A PROVIDER THAT LISTS **NO RUNNING MACHINE** IS UNKNOWN, NEVER `expected=0` — the same rule
+# as (e) one level down, and the one place the empty set gets closest to reading as health. An inventory
+# of STOPPED machines is indistinguishable from a parse that read nothing, so a zero would certify a
+# fleet of nobody: every expected box vanishes from the denominator and the line prints
+# `expected=0 published=1 INELIGIBLE=0`, which is the whole-fleet-healthy shape this issue exists to
+# kill. `cmux vm list` DOES return parked cells (that is why the `status` filter is there), so this is
+# reachable by an operator parking the fleet, not only by a broken parse.
+INV0="$TMP/inventory-3446-stopped.json"
+printf '%s\n' '{"machines":[{"id":"vm-4","name":"pi-cell-4","status":"stopped","network":{"ipv4":"10.0.0.4"}},{"id":"vm-5","name":"pi-cell-5","status":"stopped","network":{"ipv4":"10.0.0.5"}}]}' > "$INV0"
+L18="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" CAP_CMUX_LIST="cat $INV0" cap_fleet_line_from "$(recb 10.0.0.1 "$NOW")" 0)"; RC=$?
+ck "(r) an inventory with NO running machine is expected=UNKNOWN why=provider-inventory-unparseable, never expected=0 ($L18)" \
+   "$([ "$RC" -eq 1 ] && qF 'expected=UNKNOWN' "$L18" && qF 'why=provider-inventory-unparseable' "$L18" && ! qF 'expected=0' "$L18" && echo 0 || echo 1)"
+# (r-mutant) NON-VACUITY, ON THE REAL CODE PATH: revert the guard so an inventory that yields no box
+# reads as 'the provider answered, with zero machines' — the pre-fix shape — and (r)'s OWN predicate
+# must fail. Without this, (r) could be passing on a module that never consults the inventory at all.
+{ cat "$CAP"; printf '\ncap_fleet_inventory() { return 0; }\n'; } > "$TMP/cap-empty-inventory-ok.sh"
+L18M="$(CAP_EXPECTED_BOXES="" CAP_EXPECTED="" bash -c '. "$1"; cap_fleet_line_from "" 0' _ "$TMP/cap-empty-inventory-ok.sh" 2>&1)"
+ck "  …mutation control: let an empty inventory answer 'zero boxes' and the SAME assertion no longer holds ($L18M)" \
+   "$(qF 'expected=UNKNOWN' "$L18M" && qF 'why=provider-inventory-unparseable' "$L18M" && echo 1 || echo 0)"
+
 
 echo
 echo "───────────────────────────────────────────────────────────────────────────────"

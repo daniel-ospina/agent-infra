@@ -757,9 +757,17 @@ done
 # failed copy — passed the gate as WIRED, then `cap_publish_logged … || true` swallowed `command not
 # found` (rc 127) and the box published NOTHING, silently: the exact defect this change fixes. The list
 # is what makes a stale module read as unwired, and the message names what is missing.
-if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars >/dev/null 2>&1; then CAPACITY=1; else
+# ⛔ SAY WHAT IT CHECKS, NOT MORE (review round 3): this is the DIRECT interface — the names the cycle
+# calls, plus the first hop of the #3446 line (`cap_fleet_line_from` → `cap_expected_boxes` /
+# `cap_fleet_inventory` / `cap_cmux_bin` / `cap_parse_inventory`), because a missing CONSUMER of the
+# cycle is what reads as wired-and-silent. It is NOT the transitive closure (that is 50 names, and a
+# list that long rots); a deeper helper that is absent still fails CLOSED and loudly — `command not
+# found` on the controller's stderr, and a line that over-reports ineligibility rather than certifying
+# a fleet. What this gate exists to stop is the SILENT false pass, and that is what the names below
+# cover.
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars cap_fleet_line_from cap_expected_src cap_expected_boxes cap_fleet_inventory cap_cmux_bin cap_parse_inventory >/dev/null 2>&1; then CAPACITY=1; else
   CAPACITY=0
-  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, and this box publishes NOTHING to peers\n' >> "$LOG" 2>/dev/null || true
+  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars/cap_fleet_line_from/cap_expected_src/cap_expected_boxes/cap_fleet_inventory/cap_cmux_bin/cap_parse_inventory) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, this box publishes NOTHING to peers, and nothing reconciles EXPECTED against PUBLISHED (the #3446 fleet line is not emitted, so a dead box reads the same as a full one)\n' >> "$LOG" 2>/dev/null || true
 fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
@@ -5709,6 +5717,17 @@ PY
     elif [ -z "${CAP_REC:-}" ]; then
       CAP_STATE=unreadable
       echo "[capacity] this box's probe is UNREADABLE (no load/ncpu/disk/mem reading) — it is INELIGIBLE, and it will not place work on itself blind either" >> "$LOG"
+      # ⛔ EXPECTED vs PUBLISHED IS *NOT* SKIPPED HERE (agent-infra#3446, review). A box whose own probe
+      # failed is exactly the box an operator is asking about, and the fleet reading is independent of
+      # this box's probe — so the reconciliation is taken from the channel alone (`"" 0` on the record
+      # side only if the channel itself is unreadable, which `cap_fleet_line_from "" 2` would say). Here
+      # the channel is READ, and this box's own missing record simply does not count as published.
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
+      echo "[capacity] $(cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
+      # ⛔ THE ONE PATH THAT DOES NOT TAKE IT IS THE FORK-EXHAUSTED ONE ABOVE, deliberately: every step
+      # of `cap_fleet_line_from` forks (`date`, `cmux`, `git`), and that arm is built from BUILTINS ONLY
+      # because a failed fork terminates the shell (see FORK HEADROOM). A fork-starved box therefore
+      # reports `[fork]`/`[capacity]` and is seen by its PEERS' lines instead — stated, not hidden.
     else
       # THE LOCAL FORK BOUND, from the SAME record placement reads — one implementation, two consumers.
       CAP_FORK_BOUND_SELF="$(cap_fork_bound "$CAP_REC" 2>/dev/null)" || CAP_FORK_BOUND_SELF=""
@@ -5720,8 +5739,19 @@ PY
       # line AND is driven by the suite (§14 (16)-(18)), so its polarity, its reason parsing and its
       # CAP_BOXID gate are graded behaviour rather than a grep of this file's text.
       cap_publish_logged "$REPO" "$CAP_REC" "$LOG" "$CAP_NS" || true
-      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
       [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"
+      # ⛔ EXPECTED vs PUBLISHED, EVERY CYCLE THAT HAS A READABLE PROBE (agent-infra#3446). Everything
+      # above is fail-closed in ONE direction — a box that cannot publish is INELIGIBLE — which is right
+      # for SAFETY and cannot tell a DEAD box from a FULL one, because both publish nothing. MEASURED
+      # 2026-11-04: `cmux vm ls` said 5 of 5 machines running while `refs/boxes/*` held ONE ref, and a
+      # controller concluded "there is no usable remote capacity" while ~87 lanes sat idle across four
+      # running cells. This line joins the two readings so the absence is a READING:
+      # `expected=5 published=1 INELIGIBLE=4 (…)`, or `expected=UNKNOWN` WITH its reason — never
+      # `expected=0`, and never `published=0` for a read that failed. `CAP_FLEET_RC` is passed in so an
+      # unreadable channel says `published=UNREADABLE`; a `published=0` here would be a false claim of a
+      # quiet fleet of one. (The fork-exhausted cycle above does not take it — builtins only, see there.)
+      echo "[capacity] $(cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
       # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.
       CAP_VERDICT="$(printf '%s\n' "${CAP_FLEET:-}" "$CAP_REC" | cap_place "$(cap_host)")" || true
       case "${CAP_VERDICT:-}" in

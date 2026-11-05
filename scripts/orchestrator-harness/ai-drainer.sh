@@ -204,6 +204,51 @@ mkdir -p "$AI/state" "$AI/logs" "$LANES_DIR" 2>/dev/null || {
 }
 log_line() { printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG" 2>/dev/null; }
 
+# ── THE FLEET LINE — EXPECTED vs PUBLISHED, ONE LINE PER TICK (agent-infra#3446) ────────────────
+# WHY A *DISPATCHER* OWES THIS READING. Everything in this file measures THIS box: the target is this
+# box's memory and cores, the census counts this box's lanes, the guards are this box's floors. A tick
+# that tops up one box while four of five cells have gone silent is INERT for the fleet and looks
+# perfectly healthy from inside, and MEASURED 2026-11-04 that is exactly what happened: `cmux vm ls`
+# reported 5 of 5 machines running while `refs/boxes/*` held ONE ref, and the conclusion drawn was
+# "there is no usable remote capacity" while ~87 lanes sat idle. The drainer is the component that ACTS
+# on that reading, so it must also REPORT when the fleet it is filling is not the fleet that exists.
+#
+# The instrument is `capacity.sh`'s (`cap_fleet_line`), never a second derivation here — the same rule
+# the census already applies to `worker-terminal.sh`: one implementation, two adapters. A missing or
+# stale module is NAMED on the line (`why=capacity.sh-unreachable`), never silence: a tick that cannot
+# see the fleet is not a tick on a healthy fleet.
+CAPACITY_MOD="${CAPACITY_MOD:-}"
+if [ -z "$CAPACITY_MOD" ]; then
+  for _cap_cand in "$O/capacity.sh" "$SELF_DIR/capacity.sh"; do
+    [ -f "$_cap_cand" ] && { CAPACITY_MOD="$_cap_cand"; break; }
+  done
+fi
+# The queue repo whose origin carries `refs/boxes/*` — the SAME channel the controller reads. `REPO`
+# is the fleet's ambient work repo; `SEED_REPO` is this drainer's own checkout, used as the last resort
+# because a checkout of ANY repo that shares that origin answers the identical question.
+FLEET_REPO="${FLEET_REPO:-${REPO:-$SEED_REPO}}"
+[ -n "$CAPACITY_MOD" ] && [ -f "$CAPACITY_MOD" ] && . "$CAPACITY_MOD" 2>/dev/null
+fleet_line() { # log ONE `fleet:` line per tick — the reading, or a NAMED reason it could not be taken
+  local line=""
+  if command -v cap_fleet_line >/dev/null 2>&1; then
+    line="$(cap_fleet_line "$FLEET_REPO" 2>/dev/null)" || true   # rc says completeness; the LINE is the answer
+  fi
+  case "${line:-}" in
+    'fleet: '*) : ;;
+    *)
+      # ⛔ THE REASON IS DERIVED, NOT ASSUMED (review, P2). "absent" and "present but stale" are
+      # different states with different remedies (`re-seed $O`, vs install the instrument), and the
+      # stale case is the one the `declare -f` interface gate exists for in the controller. Naming a
+      # file "unreachable" while it sits there sourced sends the operator to the wrong remedy.
+      if [ -n "${CAPACITY_MOD:-}" ] && [ -f "$CAPACITY_MOD" ]; then
+        line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=capacity.sh-incomplete($CAPACITY_MOD is present and was sourced, but defines no cap_fleet_line — a STALE copy: re-seed \$O)"
+      else
+        line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=capacity.sh-unreachable(the expected-vs-published instrument is neither beside this drainer nor in \$O: ${CAPACITY_MOD:-<none>})"
+      fi ;;
+  esac
+  log_line "$line"
+}
+
 # Every numeric seam is validated: an unvalidated value turns a fence into an abort (`[ '' -lt 700 ]`
 # is a bash error) or a silent skip. A bad value falls back to the shipped default and says so.
 _num() { # <name> <value> <default>
@@ -366,6 +411,10 @@ trap cleanup EXIT
 # a full or swap-bound box — written only after a dispatch, every legitimate skip would read LATE.
 beat() { printf '%s\n' "$(date +%s)" >"$AI/state/ai-drainer.beat" 2>/dev/null; }
 beat
+# ⛔ AND THE FLEET LINE IS TAKEN HERE TOO, for the SAME reason the beat is: a skipped tick (swap floor,
+# load ceiling, pressure) is a normal steady state, and a fleet reading taken only after a dispatch
+# would make every skip look like a silent fleet. One line per tick that owns the lock.
+fleet_line
 
 # ── THE PROBES (each one fail-closed: an unreadable probe is a FAILURE, never "0", never a skip) ──
 # `0` is a real answer for every one of these numbers, so an empty read folded into 0 is the defect the
