@@ -582,6 +582,26 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     and an OOM killer on these boxes produces it with no timer at all — so the value says `push-killed`
     and the LOG carries the code and says which cause is *not* established. Claiming "TIMED OUT after 15s"
     for an OOM kill would be a cause the exit path cannot know, written into the durable artifact.
+  * ⛔ **THE WHOLE `push=` VOCABULARY, IN ONE PLACE** — the marker's `push=` column is a closed set, and a
+    reader keying on it must be able to tell every value apart: `running` (the pre-network marker),
+    `pushed` (verified by reading the remote back, and it now also covers a remote that a PEER
+    fast-forwarded inside the verify window — ancestry is measured with `git merge-base --is-ancestor`,
+    because a descendant sha means our commits ARE on the ref and recording `FAILED` there would be a
+    durable false absence), `nothing` (the unpushed count read 0 — a statement about the LOCAL
+    `refs/remotes/*` CACHE, not about the remote, which is why the sentence says so), `unmeasured`,
+    `detached`, `verify-unanswered`, `push-unreported`, `push-killed`, `FAILED` (the remote ANSWERED and
+    the ref is absent or holds an unrelated sha), and the refusals: `refused-main-checkout` (a hub's
+    branch is not a dying lane's to publish), `refused-protected` (the landing branch moves only through
+    the rail), `refused-unknown-default` (the protected set could not be established — an unknown default
+    is not "no protected names"), `refused-pushurl-divergent` / `refused-pushurl-unresolved` (the read
+    and the write would address different repositories), and `UNAVAILABLE`, which has THREE causes the
+    `[lane-exit]` line distinguishes: an unreadable `--git-common-dir` (the hub-vs-worktree shape is
+    unknown), `scripts/lib/bounded.sh` not found, and the library not sourceable. Each refusal refuses
+    because an UNBOUNDED or MISADDRESSED network call on the exit path is worse than no push at all.
+    ⛔ **AND AN EMPTY `push=` IS A DECLARED STATE, NOT A GAP:** it means the terminal never ran the push
+    step at all (`state=not-measured` / `not-a-worktree` — the tree was never measured, so there was
+    nothing to push), and `lane_end_next` abstains for it rather than falling through to a removal
+    licence. Any value that is neither `pushed` nor `nothing` abstains.
   * ⛔ **THE ARM ORDER IN `lane_end_next` IS A SAFETY PROPERTY, NOT A STYLE CHOICE** — any domain that says
     `MANUAL` outranks a domain that only reports, and a reporter placed above a MANUAL arm silences it.
     Three separate review cycles have now found the same defect in a neighbouring arm, so it is stated

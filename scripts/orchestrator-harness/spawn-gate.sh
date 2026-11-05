@@ -1317,12 +1317,22 @@ lane_end_push() {
     echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $br exist ONLY on this disk and the push could NOT be attempted — scripts/lib/bounded.sh was not found (looked in \$O/lib, the repo's scripts/lib, \$AGENT_INFRA_PATH/scripts/lib and ~/.pi/agent/scripts/lib), and an UNBOUNDED push on the exit path can hang this lane instead of ending it. Install the library (or fix the pin) and re-run; until then do NOT reap $root" >> "$log" 2>/dev/null || true
     return 0
   fi
-  # shellcheck source=../lib/bounded.sh
-  . "$lib" 2>/dev/null || {
+  # ⛔ SOURCED AT MOST ONCE PER SHELL, AND ITS SCRATCH DIR IS RELEASED (review of PR #3399, P2 — REPRODUCED).
+  # `bounded.sh` RESETS `TB_BOUND_TMP` at source time, and `tb_bound_tmp` hands out ONE lazily-created
+  # `mktemp -d` whose handle the library's contract says the caller removes via `tb_bound_cleanup`.
+  # Re-sourcing per terminal (this function runs once per lane terminal, and `fix-one.sh` runs `run_agent`
+  # more than once in one shell) therefore RESET the handle and ORPHANED the previous directory —
+  # unfixable afterwards, because the only reference to it is the variable that was just cleared. Guarding
+  # the source keeps the handle; the two `tb_bound_cleanup` calls below release it. This bites exactly on
+  # the hosts this file exists for: macOS has no GNU `timeout`, so `tb_timeout` always takes the
+  # `tb_watchdog` path and always makes the dir.
+  if declare -F tb_timeout >/dev/null 2>&1; then
+    : # already sourced in this shell — re-sourcing would reset TB_BOUND_TMP and orphan the live scratch dir
+  elif ! . "$lib" 2>/dev/null; then
     LANE_END_PUSH="UNAVAILABLE"
     echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $br exist ONLY on this disk and $lib could not be sourced, so no bounded push was possible. Do NOT reap $root" >> "$log" 2>/dev/null || true
     return 0
-  }
+  fi
   # (2) NEVER THE LANDING BRANCH. A push of the default branch from an exit hook is a merge-gate
   # BYPASS: every landing on this fleet goes through the rail + a recorded attestation, and a branch ref
   # moved by a dying lane's cleanup is exactly the hole those gates exist to close.
@@ -1389,6 +1399,7 @@ lane_end_push() {
     # The PUSH target is what the refusal is about (the read would reach `$proof`); the log names both.
     LANE_END_PUSH_URL="$pushurl"
     echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but the repository a READ of this push target would reach is NOT the repository the push writes: push target = $pushurl, fetch-side expansion = ${proof:-<unresolvable>}. \`git ls-remote\` is a FETCH, so it re-applies \`url.<base>.insteadOf\` on top of origin's resolved push url; \`git push origin\` does not — so the landing-branch set below and the verifying read after it would describe ONE repository while the ref was written to ANOTHER. Nothing was pushed. Remove the rewrite that separates them (or push the branch by hand from a lane branch) and re-run; the commits stay in the local object store" >> "$log" 2>/dev/null || true
+    declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
   LANE_END_PUSH_URL="$pushurl"
@@ -1450,7 +1461,14 @@ lane_end_push() {
   # worktree rather than a lost branch.
   # The one line that makes a divergent fetch/push config READABLE after the fact — written above, before
   # the landing-set read, so it is present on the refusal paths too.
-  out="$(tb_timeout 15 git -C "$root" push -u origin "HEAD:refs/heads/$sym" 2>&1)"; rc=$?
+  # ⛔ NO `-u` (review of PR #3399, P2 — REPRODUCED). The function's own contract above already said "no
+  # `-u` on a guess"; the invocation had one anyway. `-u` writes `branch.<br>.remote` and
+  # `branch.<br>.merge` into the repository's SHARED config — and in a linked worktree that file is the one
+  # every other worktree of the same repo reads, so one dying lane silently gives a PEER worktree (two lanes
+  # on a reused branch name are a documented case here) a `git pull`/`git push` default it never
+  # configured. Nothing below reads an upstream — the verify read names its refspec explicitly — so the exit
+  # path has no use for one, and a lane about to be reaped has no business setting it.
+  out="$(tb_timeout 15 git -C "$root" push origin "HEAD:refs/heads/$sym" 2>&1)"; rc=$?
   [ -n "$out" ] && printf '%s\n' "$out" | sed 's/^/[lane-exit]   /' >> "$log" 2>/dev/null
   PUSH_RC="$rc"
   if [ "$rc" -ne 0 ]; then
@@ -1544,12 +1562,28 @@ lane_end_push() {
     LANE_END_PUSH="FAILED"
     echo "[lane-exit] ⛔ label=$label: the push exited 0 and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read — so nothing proves the remote holds THIS lane's commit. Recorded as FAILED rather than as a delivery; $unpushed commit(s) must be assumed still only on this disk" >> "$log" 2>/dev/null || true
   elif [ "$LANE_END_ORIGIN" != "$mine" ]; then
-    LANE_END_PUSH="FAILED"
-    echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine — this lane's commits are NOT on that ref (a pre-receive hook, a shim that exited 0, or a concurrent move). Whether they are on some OTHER ref is not measured here; read the replayed push output above" >> "$log" 2>/dev/null || true
+    # ⛔ A DIFFERENT SHA IS TWO FACTS, AND ONLY ONE OF THEM IS A NON-DELIVERY (review of PR #3399, P2 —
+    # REPRODUCED). This arm used to record `FAILED` on inequality ALONE and say "this lane's commits are NOT
+    # on that ref", listing "a concurrent move" as one of its own causes — while asserting the opposite of
+    # what a concurrent move means. The verify read happens ~1 RTT after the push, on an account 22
+    # concurrent landers share and a rail that fast-forwards branches: if a peer or the rail advanced the
+    # ref INSIDE that window, origin's sha is our commit's DESCENDANT and every one of this lane's commits
+    # IS on that ref. Ancestry is decidable and LOCAL (no network), so it is measured instead of assumed;
+    # only rc=0 establishes it, so an inconclusive `merge-base` stays conservative (`FAILED`).
+    local anc_rc=0
+    git -C "$root" merge-base --is-ancestor "$mine" "$LANE_END_ORIGIN" 2>/dev/null || anc_rc=$?
+    if [ "$anc_rc" -eq 0 ]; then
+      LANE_END_PUSH="pushed"
+      echo "[lane-exit] pushed $br → origin refs/heads/$br — $unpushed commit(s) that existed only on this disk are now off-box. Origin holds $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine): a peer push or the rail advanced the ref inside the verify window, and the commits it advanced over are this lane's" >> "$log" 2>/dev/null || true
+    else
+      LANE_END_PUSH="FAILED"
+      echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine, and $mine is NOT an ancestor of what origin holds (merge-base --is-ancestor rc=$anc_rc) — so this lane's commits are not on that ref (a pre-receive hook, a shim that exited 0, or a concurrent move to an unrelated sha). Whether they are on some OTHER ref is not measured here; read the replayed push output above" >> "$log" 2>/dev/null || true
+    fi
   else
     LANE_END_PUSH="pushed"
     echo "[lane-exit] pushed $br → origin refs/heads/$br ($LANE_END_ORIGIN = this worktree's HEAD) — $unpushed commit(s) that existed only on this disk are now off-box" >> "$log" 2>/dev/null || true
   fi
+  declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
   return 0
 }
 
@@ -1799,7 +1833,18 @@ lane_end_next() {
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
           "${LANE_END_ORIGIN:-<sha>}"; return 0 ;;
       nothing)
-        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; unpushed=0, so every commit on %s is already on a remote ref and only the uncommitted work is local-only\n' \
+        # ⛔ `unpushed=0` IS A MEASUREMENT ABOUT THE **LOCAL TRACKING REFS**, NOT ABOUT THE REMOTE (review of
+        # PR #3399, P1 — REPRODUCED). It used to read "every commit on %s is already on a remote ref", which
+        # is an OFF-BOX fact this path never measured: the count comes from
+        # `git rev-list --count HEAD --not --remotes`, i.e. `refs/remotes/*` — a CACHE that `git fetch
+        # --prune` revokes and that a deleted remote branch leaves stale forever. Measured on a clone whose
+        # remote branch had been deleted: the tracking ref still held the commit, `unpushed` = 0, and the
+        # sentence claimed delivery. `scripts/pi-reap-worktrees.sh` (#3041) already refuses exactly this
+        # inference — its `remote-only-ref` reason exists because a tracking ref can be revoked, and only a
+        # bounded `ls-remote --heads` upgrades a row to `remote-holds:`. The sentence is now scoped to what
+        # was read, so it cannot state more safety than the enumeration covered. The `unpushed=0` token is
+        # kept literally (arms N31b pin it).
+        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and only the uncommitted work is local-only\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
           "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
     esac
@@ -1864,8 +1909,22 @@ lane_end_next() {
   # an ignored file (`.env`, generated output) reads `state=clean dirty=0` and was handed an affirmative
   # "may be removed" with no scope attached. The artifact now states what it measured, so it can never
   # state more safety than the enumeration covered.
-  printf 'nothing at risk (tree=%s, unpushed=%s, measured over the paths git does NOT ignore — a file git IGNORES is not covered here and a lane whose only copy of its work is ignored reads clean): %s may be removed once its PR is terminal\n' \
-    "${LANE_END_TREE:-clean}" "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}"
+  # ⛔ THE LAST ARM MAY NOT BE A FALL-THROUGH EITHER (review of PR #3399, P2 — REPRODUCED). This is the
+  # function's tail, so it is where EVERY value nobody classified lands — and it handed them an affirmative
+  # "nothing at risk … may be removed once its PR is terminal" without ever consulting `LANE_END_PUSH`, the
+  # exact shape both arms above it abstain for. Driving the shipped function with an empty push value and
+  # with two values outside the declared domain all printed the affirmative sentence. Every reachable value
+  # has an arm today, so this is latent — but a latent arm is precisely the one a FUTURE verdict lands on,
+  # and the value it would land on is a removal licence. Only `pushed` and `nothing` are verdicts that
+  # measured the branch safe; anything else (including empty) abstains and names the verdict.
+  case "${LANE_END_PUSH:-}" in
+    pushed|nothing)
+      printf 'nothing at risk (tree=%s, unpushed=%s, measured over the paths git does NOT ignore — a file git IGNORES is not covered here and a lane whose only copy of its work is ignored reads clean; the branch column came from LOCAL refs/remotes/*, a cache): %s may be removed once its PR is terminal\n' \
+        "${LANE_END_TREE:-clean}" "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}"
+      return 0 ;;
+  esac
+  printf 'MANUAL — tree=%s and unpushed=%s, but this artifact does NOT classify the branch push (push=%s), so it asserts neither delivery nor absence for the commit(s); read the [lane-exit] line in the lane log before removing %s\n' \
+    "${LANE_END_TREE:-clean}" "${LANE_END_UNPUSHED:-?}" "${LANE_END_PUSH:-<unset>}" "${LANE_END_ROOT:-<unknown>}"
 }
 
 # lane_end_unpushed_col — the ONE derivation of the `unpushed` column, shared by the TSV row and the
