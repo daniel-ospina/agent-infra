@@ -141,6 +141,41 @@ resolve_home --create \
 
 O="${O:-$HOME/orchestrator}"
 
+# ── WHAT COUNTS AS A UNIT OF WORK — ONE DEFINITION, EVERY QUERY (#10951) ──────────────────────
+# ⛔ THE PREDICATE HAD FOUR COPIES AND TWO DIFFERENT MEANINGS. The P0 pool and the emergency
+# listing excluded `^(epic|lane|OWNER DECISION|decision|analysis|investigation)`; the P1-severe
+# and P2-moderate pools excluded only `^(epic|OWNER DECISION)`. So two tiers disagreed about what
+# a unit IS, and the tier where it bit hardest was P1-severe: measured 2026-11-04 18:52Z, 6 of 8
+# `NO-PR` P1 units were containers the narrow filter let through — including #10175, whose own
+# TITLE reads "the hosted capture cap is HELD deliberately — never override it". A picker that
+# lands there dispatches a lane AT a standing constraint. That is a bypass, not a bad sort.
+# ⛔ THE SPELLINGS DO NOT FIX #10175, AND THIS FILE DOES NOT CLAIM TO. `ops(capture):` is not a
+# container prefix and must not become one (`ops(quota):`/`ops(ci):` are real units). #10175 is
+# excluded by the LABEL below, which is applied on the ISSUE — so the declaration is a separate act
+# from this predicate, and a constraint nobody labelled is still dispatchable. Both halves are
+# needed; this file is only the half a picker can read mechanically.
+#
+# ⛔ THE SPELLINGS ARE ONLY THE SYMPTOM. `design(` / `coord(` / `measure(` are prefixes the repo
+# actually writes and the old filter never named; they are listed below so the population stops
+# counting them. But a standing constraint is a DECLARATION, not a prefix — so the second half of
+# the predicate excludes by LABEL (`standing-constraint`), which a new prefix spelling cannot
+# dodge. That is #10902's rule: declare the property, do not infer it from prose.
+#
+# ⛔ NO `\b` IN THE PATTERN, AND THAT IS DELIBERATE. This regex is interpolated into a **jq string
+# literal** (`test("$QUEUE_CONTAINER_TITLE_RE")`), and jq parses `\b` in a string as the BACKSPACE
+# escape (U+0008) before the regex engine ever sees it. A `\b` here would therefore require a
+# literal backspace after the prefix, match NOTHING, and fail OPEN — the whole filter would become
+# a no-op while looking stricter. The `^` anchor is what makes the prefix test sufficient; the
+# escaping trap is pinned by `tests/queue-population-filter/run.sh` running the REAL jq program.
+#: Container-title prefixes that are not units of work. Keep this the ONLY copy of the pattern.
+QUEUE_CONTAINER_TITLE_RE='^(epic|lane|OWNER DECISION|decision|design|coord|measure|analysis|investigation)'
+#: The declaration a standing constraint carries, so it is excluded by a property and not a word.
+QUEUE_CONTAINER_LABEL='standing-constraint'
+#: The `select` fragment every pool/emergency query applies before it projects a row.
+QUEUE_UNIT_SELECT="select((.assignees|length)==0)"\
+"|select(.title|test(\"$QUEUE_CONTAINER_TITLE_RE\";\"i\")|not)"\
+"|select(([.labels[]?.name]|index(\"$QUEUE_CONTAINER_LABEL\"))==null)"
+
 # ⛔ ONE BOARD REBUILD PER PASS, NOT ONE PER CANDIDATE (#2022). A pass runs the pre-flight once per
 # candidate, and the fleet-board rebuild inside it measured 15.9 s of a 19 s run — identical every
 # time. Six rebuilds per pass contend with the controller's own sweep; a contended GitHub read returns
@@ -3497,13 +3532,13 @@ touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 rm -f "$O/.pool-err" "$O/.pool-read"
 {
   if rest_list issues --repo "$OR" --state open --limit 300 --label P0-blocker \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
+    --jq ".[]|${QUEUE_UNIT_SELECT}|\"0 \\(.number)\"" 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
   else echo "P0-blocker" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P1-severe \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
+    --jq ".[]|${QUEUE_UNIT_SELECT}|\"1 \\(.number)\"" 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
   else echo "P1-severe" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+    --jq ".[]|${QUEUE_UNIT_SELECT}|\"2 \\(.number)\"" 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 # ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
 # number is what is emitted, so the pool is priority-ordered, oldest-first inside a tier. (The fork's
@@ -5338,7 +5373,7 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
   # does — so it must not stand the floor down either.
   if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
-      --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|.number' \
+      --jq ".[]|${QUEUE_UNIT_SELECT}|.number" \
       > "$o/.emergency-issues" 2>/dev/null; then
     if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then
       weq_degrade "$o" \
