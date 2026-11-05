@@ -3,8 +3,8 @@
 #
 # THE DEFECT. `skills/issue-creation/SKILL.md` taught `gh issue create … --body "…"`. An inline body
 # is part of the SHELL COMMAND STRING, and the hub-state guard classifies that string for
-# version-control verbs — so an issue whose body QUOTES a DESTRUCTIVE verb (`git pull`, `git rebase`,
-# `git reset`, a branch `-D`, a force-push) is unfilable in exactly that shape. MEASURED 2026-11-04:
+# version-control verbs — so an issue whose body QUOTES a DESTRUCTIVE verb (a fetch-and-ff sync, a
+# rebase, a hard reset, a branch `-D`, a force-push) is unfilable in exactly that shape. MEASURED 2026-11-04:
 # four P0s were refused four times before one landed. The perverse consequence is the reason this
 # shard exists: the report of a destructive-git false-block could not be filed, because it described
 # the false-block. Re-measured here on every run, the two shapes differ by classifier verdict and
@@ -415,9 +415,11 @@ const { classifyGitCommand, classifyGitCommandDetailed } = await import(process.
 const cmd = process.argv[3];
 console.log(classifyGitCommand(cmd) + " " + classifyGitCommandDetailed(cmd).verdict);
 PROBE
-  # The verb is assembled from pieces so this suite's OWN text carries no literal destructive-git
-  # command: a guarded session running this shard would otherwise be refused by the very gate it
-  # measures (measured twice — an inline probe quoting the verb was blocked before it ran).
+  # The verb is assembled from pieces for the INLINE/copy-paste route: an inline probe that quotes the
+  # verb IS blocked before it runs (measured twice), and a lane debugging a red arm pastes the failing
+  # snippet into its own bash call. ⛔ It does NOT make this FILE hub-runnable: `scriptGitVerdict(<abs
+  # path>)` is `block` for this shard and stays `block` with every `git` word stripped, so the refusal
+  # is structural (heredoc/substitution + interpreter content), not caused by this text. See the (xi) note.
   V="git pu"; V="$V""ll --ff-only"
   INLINE="gh issue create --title \"fix: guard false-block\" --body \"the guard refused $V in a compound command\""
   BYFILE="gh issue create --title \"fix: guard false-block\" --label \"complexity:micro\" --body-file \"\${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md\""
@@ -433,6 +435,36 @@ PROBE
   esac
 else
   bad "$CLASSIFIER is missing — the premise arm cannot run, so the exemption this shard teaches is unverified"
+fi
+
+# ── E2: WHICH layer carries the refusal — M4 must NOT be mistaken for it ────────────────────────
+# WHY THIS ARM EXISTS (it was paid for). A lane verifying #3445 drove
+# `evaluateHubGateWithTargets` — the M4 hub-disorder gate — got `non-git` for the exact command arm
+# E asserts blocks, and concluded the issue's premise was false and the shape safe. It is not: the
+# refusal comes from the BRANCH-OWNERSHIP path (`classifyGitCommandDetailed`, index.ts), which runs
+# for every bash command in a healthy session. M4 is gated on `st.disorder` and never sees it.
+# That divergence is a FALSE-SAFE hazard, not a curiosity: a verifier that probes the wrong entry
+# point reports the fix unnecessary, and the next lane reverts it. So the routing is pinned here —
+# if either side moves, this reds and the next lane re-derives WHICH layer holds the invariant
+# instead of trusting the one that answered first.
+if [ -f "$CLASSIFIER" ]; then
+  cat > "$T/gate.mjs" <<'GATE'
+const { evaluateHubGateWithTargets, classifyGitCommandDetailed } = await import(process.argv[2]);
+// A clean, ordered hub context is the COMMON case; the point is that M4 is content-indifferent here.
+const ctx = { disorder: null, branch: "main", path: "/tmp/issue-body-shape-hub", dirtyPaths: 0 };
+const verdict = evaluateHubGateWithTargets(process.argv[3], "main", "/tmp/issue-body-shape-hub", null, ctx).verdict;
+console.log(verdict + " " + classifyGitCommandDetailed(process.argv[3]).verdict);
+GATE
+  ROUTING="$(node "$T/gate.mjs" "$CLASSIFIER" "$INLINE" 2>/dev/null || echo probe-failed)"
+  ROUTING_M4="${ROUTING%% *}"
+  ROUTING_DET="${ROUTING##* }"
+  case "$ROUTING_DET" in
+    block:*) case "$ROUTING_M4" in
+      non-git) ok "the refusal is routed: the branch-ownership classifier blocks the inline body ('$ROUTING_DET') while the M4 disorder gate reports '$ROUTING_M4' for the SAME command — so a probe of M4 alone reads this shape as safe, which is the false-safe this arm exists to stop" ;;
+      *) bad "M4 now reports '$ROUTING_M4' (not non-git) for the inline body — the routing changed: re-derive WHICH layer refuses this shape before trusting either, then update this arm and the skill's cited reason" ;;
+    esac ;;
+    *) bad "the branch-ownership classifier no longer blocks the inline body ('$ROUTING_DET') — the live path lost the refusal this whole fix is premised on; re-measure before teaching anything" ;;
+  esac
 fi
 
 # ── M: MUTATIONS — revert the fix and require the predicates to name the reverted file ──────────
@@ -535,16 +567,19 @@ fi
 
 # (vii) FENCE-LENGTH/TILDE awareness: an inline body inside a FOUR-backtick fence, and inside a `~~~`
 # fence, must be NAMED. Toggling on any three-backtick line read the first as "outside a fence".
+# The fixture's verb is assembled (see the (xi) note) so a lane that copies the failing snippet into
+# its own bash call does not paste a gated inline payload. That is what the assembly buys — only that.
+FPULL="git pu"; FPULL="$FPULL""ll --ff-only"
 {
   printf '%s\n' '````markdown'
   printf '%s\n' '```bash'
-  printf '%s\n' 'gh issue create --title x --body "inline body quoting git pull"'
+  printf '%s\n' "gh issue create --title x --body \"inline body quoting $FPULL\""
   printf '%s\n' '```'
   printf '%s\n' '````'
 } > "$T/four-fence.md"
 {
   printf '%s\n' '~~~bash'
-  printf '%s\n' 'gh issue create --title x --body "inline body quoting git pull"'
+  printf '%s\n' "gh issue create --title x --body \"inline body quoting $FPULL\""
   printf '%s\n' '~~~'
 } > "$T/tilde-fence.md"
 if [ -n "$(printf '%s\n' "$T/four-fence.md" "$T/tilde-fence.md" | inline_body_offenders)" ] \
@@ -583,9 +618,20 @@ fi
 # (xi) FAIL-CLOSED vs FALSE-OPEN: a COMMENT may SHOW the anti-pattern inside a fence. The fixed
 # skills themselves warn this way, so a comment that reddened the file could only be silenced by
 # deleting the warning — but the direction matters: comments are skipped, commands are not.
+# ⛔ WHY THE FIXTURE VERB IS ASSEMBLED — and what that does NOT buy. The gated surface is an INLINE
+# payload (`bash -c '<text>'`, `node -e '<text>'`, a snippet pasted into a bash call): there the payload
+# text IS the command string, and a quoted operand is read as a verb. Assembly keeps every fixture
+# safe to copy-paste into that route, which is exactly what a lane does when an arm reds.
+# ⛔ It does NOT make this FILE runnable from a hub, and nothing here should be read as claiming it:
+# measured, `scriptGitVerdict(<abs path>, "main", repo, repo)` is `block` for this shard — and STILL
+# `block` with every `git` word stripped out, so the verdict is structural (heredoc / command-
+# substitution + interpreter content across the file), not caused by these fixtures. That is why suites
+# are run in a worktree or through a task child whose cwd is one; it is not something fixture wording
+# can fix, and it must not be mistaken for a bug in the assembly above.
+CPULL="git pu"; CPULL="$CPULL""ll --ff-only"
 {
   printf '%s\n' '```bash'
-  printf '%s\n' '# WRONG: gh issue create --title x --body "… git pull --ff-only …"'
+  printf '%s\n' "# WRONG: gh issue create --title x --body \"… $CPULL …\""
   printf '%s\n' 'BODY="${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d" " -f1).md"'
   printf '%s\n' 'gh issue create --title x --body-file "$BODY"'
   printf '%s\n' '```'
