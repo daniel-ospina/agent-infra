@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with seventy paired mutations: every mutation re-
+Fifty-one tests with seventy-one paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (70)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (71)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2781,6 +2781,15 @@ MUTATIONS = [
         "an unparseable /proc row is encoded as `(0, None)`, so the walk never visits it "
         "and the subtree total silently UNDERCOUNTS — the `/proc` twin of T39's defect, on "
         "the platform where the fleet's lanes actually live",
+    ),
+    Mutation(
+        "T38", "module",
+        'BOUND_FINISHED = frozenset({"finished"})',
+        'BOUND_FINISHED = frozenset()',
+        "an exited lane's `verdict=finished` reads `dead`, so the before/after table's "
+        "FINISHED row convicts a lane that completed — the 2026-11-03 false negative "
+        "(land-10762) that the whole §13.1 measurement exists to pin. T38 was the ONE test "
+        "in the axis with no paired mutation, so nothing proved it could fail",
     ),
 ]
 
