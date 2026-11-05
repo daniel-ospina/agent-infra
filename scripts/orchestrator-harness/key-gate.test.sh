@@ -150,6 +150,11 @@ printf '{"zai":{"type":"api_key","key":"sk_other"}}\n' > "$HA/.pi/agent/auth.jso
 OUT="$(run_gate "$HA")"
 RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "2i a store for a DIFFERENT provider still refuses (rc=${RC:-<none>})" "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+# ⛔ AND AN ABSENT ENTRY IS THE ENVIRONMENT'S QUESTION, NOT A STORE DEFECT (round 19, P1): folding "no entry for
+# this provider" into the invalid-store arm would refuse with `reason=store-invalid` and send an operator to repair
+# a file whose only fault is not mentioning the provider - a false 82 carrying a false remedy.
+hasnt "$OUT" "reason=store-invalid" \
+    "2i2 …and never calls the store invalid: an entry for another provider is not a defect in this one"
 
 # ── 2j: AN `env` MAP WITH NO `key` IS **NOT** A CREDENTIAL (review, P1, measured) ─────────────────
 # ⛔ THE FALSE PASS THIS ARM CLOSES. pi uses a stored `env` map only to RESOLVE a `key` template —
@@ -520,6 +525,17 @@ hasnt "$OUT" "var=" \
 OUT="$(run_gate "$HV" KG_MODEL=venice/whatever KG_VENICE_KEY=v)"
 hasnt "$OUT" "check=ok" \
     "7d setting the prefixed provider's key does not make the gate assert it — the abstention is not a refusal"
+# ⛔ AND THE SAME FOR A BARE ID (round 19, P2, measured): `--probe t <home> "" gpt-4o` used to answer
+# `check=ok var=DEEPSEEK_API_KEY provider=deepseek model=gpt-4o` while `pi -p --model gpt-4o` answered
+# `Model "gpt-4o" is ambiguous across providers: azure/gpt-4o, cloudflare-ai-gateway/gpt-4o, openai/gpt-4o. No
+# matching provider is authenticated.` Resolving a bare id needs the model registry, so a NAMED model with no
+# provider abstains; an INHERITED one keeps `deepseek`, because that is the `--provider` `run_agent` really passes
+# (arm 8E pins that side).
+OUT="$(run_gate "$HV" KG_MODEL=gpt-4o KG_CANARY_KEY=v)"
+has "$OUT" "check=skipped reason=cannot-resolve-provider-credential model=gpt-4o provider=<none>" \
+    "7f a NAMED model with no --provider abstains even without a slash — pi may refuse it as ambiguous"
+hasnt "$OUT" "check=ok" \
+    "7f2 …so the probe cannot report a green credential for a model pi will not run"
 # ⛔ `$PI_LANE_PROVIDER` OUTRANKS THE PREFIX, BECAUSE `run_agent` PASSES IT AS `--provider` (round 3, F5/P3,
 # measured). With `PI_LANE_PROVIDER=deepseek` and a `venice/whatever` model, the old order asserted venice and
 # went green while `spawn-gate.sh:2110` would have handed pi `--provider deepseek --model venice/whatever` — a
@@ -633,7 +649,8 @@ has "$OUT" "check=skipped reason=default-model-provider-unknown model=some-model
 # say" (rc 3 — a `!command` value) into the refusal, so a box pi WOULD run was refused 82. The mutant —
 # restoring `key_gate_stored_credential … && return 0` — reddens 8g3/8g4.
 HS="$(mkset boxstore "$TWO_JSON" "$SET_UNPROV")"
-printf '{"venice":{"key":"!printf sk-from-a-command"}}\n' > "$HS/.pi/agent/auth.json"
+# (typed, because an untyped entry is INVALID to pi\x27s loader and now refuses as `store-invalid` — round 19, P1)
+printf '{"venice":{"type":"api_key","key":"!printf sk-from-a-command"}}\n' > "$HS/.pi/agent/auth.json"
 OUT="$(run_box_at "$HS" "$T/nocwd" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
 ck "8g3 a store entry this gate cannot resolve refuses NOTHING (rc=${rc:-<none>}) — pi reads the store first" \
    "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
@@ -942,12 +959,59 @@ has "$OUT" "agent_dir=<none>" \
 # ⛔ THE STORED-CREDENTIAL ARM STILL PRINTS IN `refused` MODE (round 7, P3, measured): it returned silently —
 # zero bytes, rc 0 — so a provisioning script could not tell "usable via the store" from "the probe did nothing".
 HSK="$(mkset boxstoreok "$TWO_JSON" "$SET_UNPROV")"
-printf '{"venice":{"key":"sk_stored_fixture"}}\n' > "$HSK/.pi/agent/auth.json"
+# \u26d4 A TYPED ENTRY, because an untyped `{"venice":{"key":...}}` is INVALID to pi\x27s loader (round 19, P1,
+# measured) and the gate now refuses it as `store-invalid` - the fixture has to be a store pi can read for this
+# arm to be about the stored-credential reading at all.
+printf '{"venice":{"type":"api_key","key":"sk_stored_fixture"}}\n' > "$HSK/.pi/agent/auth.json"
 OUT="$(run_box_at "$HSK" "$T/nocwd")"; rc="$(rc_of "$OUT")"
 ck "8y a pin whose credential is already in the STORE is not refused (rc=${rc:-<none>})" \
    "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
 has "$OUT" "check=skipped reason=stored-credential box_default=venice-uncensored" \
     "8y2 …and the probe still prints a reading, so 'usable via the store' is distinguishable from 'did nothing'"
+# ⛔ AN INVALID STORE IS A REFUSAL, AND ITS REMEDY IS THE FILE (round 19, P1, measured). pi validates every entry
+# on load (`auth-storage.js:188-209`) and THROWS on one that is not an object carrying `type: "api_key"` (optional
+# string `key`, optional string-map `env`) or `type: "oauth"` (string `access`, string `refresh`, finite number
+# `expires`). A throw does not fall back to the environment: measured on each shape below, `pi -p --provider
+# deepseek` printed `No API key found for deepseek.` with nothing exported, and `Provider is not configured:
+# deepseek` with DEEPSEEK_API_KEY exported AND a models.json template naming it. The reader here used to scan for
+# any `key`-ish field, so it answered `reason=stored-credential` (a false pass on a store pi cannot take a key
+# from) and suppressed the very refusal that would have named the missing variable.
+while IFS='|' read -r _n _store; do
+  [ -n "$_n" ] || continue
+  HI="$(mkset "store-$_n" "$TWO_JSON" ABSENT)"
+  printf '%s\n' "$_store" > "$HI/.pi/agent/auth.json"
+  OUT="$(run_gate "$HI")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+  ck "8S.$_n an INVALID store entry ($_n) REFUSES with the gate'\''s own status (rc=${RC:-<none>})" \
+     "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+  has "$OUT" "check=fail result=REFUSED reason=store-invalid" \
+      "8S2.$_n …naming the STORE as the defect, which is what pi reports"
+  hasnt "$OUT" "reason=stored-credential " \
+      "8S3.$_n …and never claims the store answered (that claim was the false pass)"
+done <<'STORES'
+untyped|{"deepseek":{"key":"sk_legacy_no_type"}}
+barestring|{"deepseek":"sk_bare_string_entry"}
+oauthmissing|{"deepseek":{"type":"oauth","access":"a"}}
+oauthwipe|{"deepseek":{"type":"oauth","access":"a","refresh":"r"}}
+apikeynonstring|{"deepseek":{"type":"api_key","key":42}}
+badtype|{"deepseek":{"type":"kerberos","key":"sk_x"}}
+STORES
+# ⛔ AND A TYPED ENTRY WITH NO `key` IS CANNOT-SAY, NOT "ABSENT" (measured): pi RAN there on the provider's own
+# built-in variable, which is NOT the models.json template this gate follows, so a skip is the only answer that
+# cannot be wrong in either direction (refusing would be a false 82 on a box pi runs).
+HJ="$(mkset storekeyless "$TWO_JSON" ABSENT)"
+printf '{"deepseek":{"type":"api_key"}}\n' > "$HJ/.pi/agent/auth.json"
+OUT="$(run_gate "$HJ")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "8T a typed entry with NO key refuses nothing (rc=${RC:-<none>})" \
+   "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "reason=stored-credential-unresolvable" \
+    "8T2 …and says the credential it can see is not ours to resolve"
+# ...and an invalid entry for ANOTHER provider is not this provider's defect (measured: pi skipped it and ran on
+# the valid deepseek entry), so the store still answers for this one.
+HK="$(mkset storeotherbad "$TWO_JSON" ABSENT)"
+printf '{"deepseek":{"type":"api_key","key":"sk_good"},"zzz":{"bogus":true}}\n' > "$HK/.pi/agent/auth.json"
+OUT="$(run_gate "$HK")"
+has "$OUT" "check=skipped reason=stored-credential provider=deepseek" \
+    "8T3 an invalid entry for ANOTHER provider does not poison this one — pi skips it and reads this key"
 # ⛔ A SCOPED STARTUP IS A CANNOT-SAY, NOT A VERDICT ON THE PIN (round 8, P2, verified against the vendor
 # source): `main.js:660` scopes the startup model from `enabledModels` and `main.js:389-403` installs
 # `scopedModels[0]` — with no auth check — BEFORE `findInitialModel` consults the pin. So on a box that sets
@@ -1281,6 +1345,14 @@ inputLimits|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":
 input|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","input":["audio"]}]}}}
 reasoning|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","reasoning":"yes"}]}}}
 samplingParams|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","samplingParams":[]}]}}}
+sptllevel|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","samplingParamsByThinkingLevel":{"off":"x"}}]}}}
+levelmapvalue|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","thinkingLevelMap":{"high":5}}]}}}
+promptcachevalue|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","promptCache":{"short":-5}}]}}}
+imagesmax|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","inputLimits":{"images":{"maxPerMessage":0}}}]}}}
+imagesresize|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","inputLimits":{"images":{"resize":{"maxWidth":"wide"}}}}]}}}
+overridecost|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"cost":"cheap"}}}}}
+overridecostvalue|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"cost":{"input":"1"}}}}}}
+overridectx|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"contextWindow":"big"}}}}}
 authHeader|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","authHeader":"yes"}}}
 providercompat|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":"no"}}}
 modelOverrides|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":[]}}}
@@ -1289,6 +1361,18 @@ modelapi|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m"
 CASES
 # ⛔ AND THE POSITIVE CONTROL: the SAME fields, VALID, must still pass — a mirror that rejects a legal template is
 # the false-82 polarity this whole file is written against, and it is the easier mistake to make when adding checks.
+# ⛔ AND THE MIRROR MUST NOT INVENT RULES pi DOES NOT HAVE (round 19, P3, measured): `ThinkingLevelMap` and
+# `ModelPromptCache` type only their named keys and carry no `additionalProperties: false`, so an UNKNOWN key there
+# is legal at ANY type. Iterating every value made the gate abstain on a file pi LOADS — the #3331 silence, on a
+# box whose credential is real.
+for _pair in 'promptCache|{"weird":"x"}' 'thinkingLevelMap|{"turbo":{"x":1}}'; do
+  _field="${_pair%%|*}"; _body="${_pair#*|}"
+  HU="$(mkset "unknown-$_field" "$TWO_JSON" ABSENT)"
+  printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","%s":%s}]}}}\n' "$_field" "$_body" > "$HU/.pi/agent/models.json"
+  OUT="$(run_gate "$HU" KG_CANARY_KEY=v)"
+  has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+      "8M25.$_field an UNKNOWN $_field key is legal (pi loads the file), so the gate still asserts the credential"
+done
 HVA="$(mkset schema-valid "$TWO_JSON" ABSENT)"
 printf '%s\n' '{"$schema":"https://pi.dev/schemas/models.json","providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","name":"DeepSeek","baseUrl":"https://api.deepseek.com","api":"openai-completions","authHeader":false,"headers":{"x-tag":"1"},"compat":{"supportsStore":true},"modelOverrides":{"m":{"contextWindow":1024}},"models":[{"id":"m","name":"M","api":"openai-completions","baseUrl":"https://api.deepseek.com","reasoning":true,"thinkingLevelMap":{"high":"high"},"input":["text","image"],"inputLimits":{"maxRequestBytes":1024,"images":{"maxPerMessage":2}},"cost":{"input":1,"output":2,"cacheRead":0,"cacheWrite":0,"tiers":[{"inputTokensAbove":1000,"input":1,"output":2,"cacheRead":0,"cacheWrite":0}]},"promptCache":{"short":60,"long":300},"contextWindow":128000,"maxTokens":8192,"samplingParams":{"temperature":0.2},"samplingParamsByThinkingLevel":{"high":{"temperature":0.9}},"headers":{"y":"2"},"compat":{"supportsStore":true}}]}}}' > "$HVA/.pi/agent/models.json"
 OUT="$(run_gate "$HVA" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
