@@ -758,9 +758,10 @@ def leg_lane_census(mod):
         "unreadable store" fail-closed path from masking this one. Returns (exit_code, stdout).
         `corrupt_store=True` writes a store that cannot be parsed, which models the PARSE-failure
         route to `hook_ok is False` -- the shape the census's store-read guard depends on. It is NOT
-        the only route: `load_hook` also reports `hook_ok is False` on SHAPE DRIFT (a store holding
-        records, none of which carries a `sessionId`), which `records=[...]` can model and which this
-        arm therefore does not exercise (review cycle 8, finding 1). Every patched
+        the only route: `load_hook` also reports `hook_ok is False` on SHAPE DRIFT, which is a store
+        holding at least one record while no record carries a NON-EMPTY `sessionId`/`session_id` (the
+        test is truthiness, and either key satisfies it). `records=[...]` models that shape, and this
+        arm does not exercise it (review cycles 8-9). Every patched
         global is restored, and a name the pre-fix module never had is deleted rather than left
         behind, so later legs see the module they expect.
         """
@@ -1030,8 +1031,10 @@ MUTATIONS = [
      ["REGISTERED: %s is in REAPERS" % LABEL]),
     # ⛔ THE STORE-READ GUARD (review cycle 18, finding 2). Without it the census blames the ROSTER
     # for a failed STORE READ — the wrong diagnosis, sending an operator to edit the roster when the
-    # store was the fault. Pinned by the `corrupt_store` `_drive` arm, which supplies the only shape
-    # that can reach `hook_ok is False`.
+    # store was the fault. Pinned by the `corrupt_store` `_drive` arm -- the only ARM in this leg that
+    # reaches the `hook_ok is False` path. It is not the only SHAPE that does: a shape-drifted store
+    # (at least one record, none carrying a non-empty `sessionId`/`session_id`) reaches it too, and is
+    # deliberately not exercised here (see `_drive`'s docstring).
     ("let the census speak about a roster it could not read",
      _sub("    census_note = (lane_census(attributed, dead, pi_process_count(), len(LANES))\n"
           "                   if hook_ok else None)",
