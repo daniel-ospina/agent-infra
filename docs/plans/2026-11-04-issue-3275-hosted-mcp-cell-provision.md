@@ -95,17 +95,17 @@ credential into a 0644 file). It is: **make the entry installable**, then instal
 5. **DONE — the fallback client's two broken calls.** `tortoise_create_operator` now sends `op_type/source_id/target_ids/direction/semantics` (was `label`); `get` sends `id` (was `point_id`). Both were rejected by the server's argument validation; the second failed **after** the point was written.
    **DONE — the third defect, found by review after #3883.** `get`/`health`/`stats` called tools the surface **retired**: they still answer, so nothing failed, but each answer carries a second content block (a `RETIRED TOOL: …` notice) which the client folded into the payload with `"\n".join` — so those verbs printed their JSON *plus* a paragraph, exit 0, breaking the file's own documented contract. They now call `tortoise_get_entity(id, type="point")` and `tortoise_overview(section="health"|"pointkinds")` (the advertised handlers, verified to return the same payloads), a retirement notice is a fail-closed `GRAPH-RETIRED-TOOL` (exit 4) rather than a comment appended to the answer, and `{}` from the server — its not-found convention — is a failed read (exit 4), never a green.
 6. **DONE — canonical credential name.** `scripts/tortoise-graph.sh` reads `TORTOISE_MCP_API_KEY` first, legacy `TORTOISE_API_KEY` second, and its abstention message names both plus the remedy.
-7. **DONE — regression tests.** `pi-bootstrap/tests/test-cell-install.sh` → **200 assertions, `FAILURES=0`** on Linux (measured; the count moves whenever a concurrent commit on this branch adds an arm, so it is a MEASUREMENT with its date, not a constant); `tests/tortoise-graph-client/run.sh` → 15 arms against a hermetic stub of the served surface. On macOS the same cell-install suite reports 3 `FAIL` in the gh-shim arms — an unresolved `/var/folders/…/T//` `$TMP` compared against the verifier's physical `/private/var/folders/…`, identical at base `1f69ab544`, so it is **declared and not chased**. The graph arms are named in the PR body.
+7. **DONE — regression tests.** `pi-bootstrap/tests/test-cell-install.sh` → **211 assertions, `FAILURES=0`** on Linux (measured 2026-11-05; the count moves whenever a concurrent commit on this branch adds an arm, so it is a MEASUREMENT with its date, not a constant — it has gone 183 → 191 → 195 → 197 → 200 → 209 → 211 during this PR); `tests/tortoise-graph-client/run.sh` → 23 arms against a hermetic stub of the served surface. On macOS the same cell-install suite reports 3 `FAIL` in the gh-shim arms — an unresolved `/var/folders/…/T//` `$TMP` compared against the verifier's physical `/private/var/folders/…`, identical at base `1f69ab544`, so it is **declared and not chased**. The graph arms are named in the PR body.
 8. **DONE — measured end-to-end.** `HOME=<scratch> bash pi-bootstrap/setup.sh` and `CELL_HOME=<scratch> bash pi-bootstrap/cell-install.sh --install` both print the expected farm + merge + `LAYER VERIFIED` lines (transcript excerpt in the PR body).
 
 ## Verification
 
 ```
-bash pi-bootstrap/tests/test-cell-install.sh        → 200 assertions, FAILURES=0 (Linux)
+bash pi-bootstrap/tests/test-cell-install.sh        → 211 assertions, FAILURES=0 (Linux, 2026-11-05)
                                                       on macOS: 3 FAIL in the gh-shim arms (the `/var` →
                                                       `/private/var` comparison — a symlink artifact,
                                                       identical at base, declared not chased)
-bash tests/tortoise-graph-client/run.sh             → 15 arms, green (hermetic stub of the served surface)
+bash tests/tortoise-graph-client/run.sh             → 23 arms, green (hermetic stub of the served surface)
 bash pi-bootstrap/tests/test-farm-unfarm.sh         → green (graph_srcs declared, unfarm clean)
 bash -n over every shipped script                   → clean (bash 3.2 parse gate is CI-enforced)
 ```
