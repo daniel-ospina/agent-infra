@@ -33,6 +33,17 @@ import urllib.parse
 import urllib.request
 
 REPO = "daniel-ospina/tortoise"
+# ⛔ THE TRACKER IS NOT THE ONLY REPO A FIX LANDS IN (tortoise#10951). `REPO` is where the ISSUES
+# live; it is not where every fix is written. This backlog is worked by the harness, whose PRs are
+# under `agent-infra`, so a single-repo PR read counts "landed elsewhere" as "nobody is on it".
+# MEASURED 2026-11-05: #10114 was reported `without_pr` — the number a lane charter reads — while
+# agent-infra#3368 (`fix(reaper): the harness PIN TREE is a holder, not residue (#10114)`) was OPEN
+# and agent-infra#3333 folded it. A lane was one step from rebuilding it. This metric decides what
+# the fleet builds next and is the number the owner reads for "beta ships when p0/p1 are merged",
+# so an absent PR may only ever come from a repo that ANSWERED.
+# ⛔ `open_prs` keeps its old meaning (the TRACKER's open PRs) — the extra repos feed `covered()`
+# ONLY, so widening the gap count cannot silently move the headline number.
+FIX_REPOS = (REPO, "daniel-ospina/agent-infra")
 CACHE = os.path.expanduser("~/.pi/agent/state/beta-progress.json")
 TTL = 1800  # was 3600; halved so the worst-case lag is 30m, at ~2x the API cost (still cheap)
 # ⛔ A CACHE `ts` MAY NOT BE IN THE FUTURE. Clock skew between the writer and the reader is real,
@@ -294,8 +305,17 @@ def _rest_get_json(url, tok, timeout=REST_TIMEOUT_S):
         return None
 
 
-def _rest_prs(state, limit=100, deadline=None):
+def _rest_prs(state, limit=100, deadline=None, repo=None):
     """The PR list over REST -- the fallback when `gh pr list` (GraphQL) is refused.
+
+    `repo` defaults to the TRACKER. It is a parameter because the gap count also reads the
+    repos a fix lands in (FIX_REPOS), and those reads need the SAME second source: the
+    measured #2139 refusal is a SECONDARY-limit one, so every `gh pr list` on the box is
+    refused at once and a fix repo with no REST fallback would take the whole DELIVERY line
+    down -- the exact line this fallback exists to keep printing.
+    ⛔ AND THE URL MUST BE REBUILT FROM IT. This path used `REPO` directly, so a caller that
+    passed a repo without changing that line would be handed the TRACKER's `/pulls` under
+    the fix repo's name -- a wrong list that still looks complete.
 
     Returned in the `gh pr list --json` shape this file consumes: `number`, `title`,
     `headRefName` (<- head.ref), `mergedAt` (<- merged_at). REST `closed` ALSO carries
@@ -394,7 +414,7 @@ def _rest_prs(state, limit=100, deadline=None):
             if remaining <= 0:
                 return None           # budget spent -- refuse, never return a short window
             url = ("https://api.github.com/repos/%s/pulls?state=%s&sort=updated&direction=desc"
-                   "&per_page=%d&page=%d" % (REPO, path, REST_PER_PAGE, page))
+                   "&per_page=%d&page=%d" % (repo or REPO, path, REST_PER_PAGE, page))
             raw = _rest_get_json(url, tok, min(REST_TIMEOUT_S, remaining))
             if not isinstance(raw, list):
                 return None
@@ -469,6 +489,31 @@ def _rest_prs(state, limit=100, deadline=None):
     return None
 
 
+def _repo_prs(repo, state, limit, deadline):
+    """One repo's PR list: GraphQL first, REST second, then a SHAPE gate.
+
+    ⛔ EVERY FIX-REPO READ NEEDS THE SECOND SOURCE TOO (#2139). The measured refusal is a
+    SECONDARY-limit one, so every `gh pr list` on a box is refused at once; a fix-repo read with no
+    REST fallback would take down a DELIVERY line whose tracker read had already succeeded.
+    ⛔ AND A MALFORMED BUT ANSWERED READ IS NOT A LIST. `gh` can exit 0 with a JSON OBJECT
+    (`{"message": "Not Found"}`) or a list of non-dicts. `covered()` then calls `.get()` on a str
+    and RAISES, `main()` catches it, and the box prints a traceback and `unavailable` on EVERY
+    refresh for as long as that payload persists -- a whole metric lost to one repo's odd answer.
+    Same rule `_rest_prs` already applies per row: the documented shape, or it is not a row.
+    """
+    fields = ("number,title,headRefName" if state == "open"
+              else "number,title,headRefName,mergedAt")
+    rows = gh("pr", "list", "--repo", repo, "--state", state, "--limit", str(limit),
+              "--json", fields)
+    if rows is None:
+        rows = _rest_prs(state, limit=limit, deadline=deadline, repo=repo)
+    if rows is None:
+        return None
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        return None
+    return rows
+
+
 def compute():
     openpr = gh("pr", "list", "--repo", REPO, "--state", "open", "--limit", "500",
                 "--json", "number,title,headRefName")
@@ -482,8 +527,13 @@ def compute():
     # Same source or no metric -- scoped to THIS re-read: where the workspace has the gh layer's
     # REST adapter the OPEN read is already REST while MERGED is GraphQL (see the block above),
     # so this arm claims no more than that a FAILURE never leaves a half-re-read pair.
+    # ⛔ ONE BUDGET FOR THE WHOLE REST PHASE, not one per read (see the invariant above). The
+    # tracker pair and every fix-repo read draw on the SAME deadline: a per-read budget would let a
+    # refusing box double the phase's worst case and outlive the tick's own `run_bounded` kill --
+    # which prints NOTHING, the failure that budget exists to prevent.
+    rest_deadline = time.time() + REST_BUDGET_S
     if openpr is None or merged is None:
-        deadline = time.time() + REST_BUDGET_S      # ONE budget for the pair (see above)
+        deadline = rest_deadline                    # the pair shares it
         ro = _rest_prs("open", limit=500, deadline=deadline)
         # Short-circuit: if the open read already failed, the merged one cannot be used by the
         # guard below, so spending the shared budget on it only starves the tick.
@@ -493,12 +543,49 @@ def compute():
     if openpr is None or merged is None:
         return None
 
+    # ── the other repos a fix may land in (see FIX_REPOS) ─────────────────────────────
+    # ⛔ THE WINDOW IS OPEN **AND** MERGED, and the merged half is not symmetry for its own sake.
+    # A PR in a fix repo does not close a TRACKER issue (cross-repo `Closes` does not close it), so
+    # the issue stays open AFTER the fix merges. Reading only OPEN rows would report #10114 as
+    # `without_pr` the moment agent-infra#3368 merged -- "no PR, you are the path" about work that
+    # had LANDED. That is strictly worse than the open case this change exists to fix: rebuilding an
+    # open PR wastes a lane, rebuilding a landed fix ships nothing, and the error would grow
+    # monotonically as fixes complete. The tracker's own list counts merged rows for exactly this
+    # reason, so the two lists now agree on what coverage means.
+    # ⛔ AND `covered()` CANNOT TELL WHICH REPO A ROW CAME FROM, so a fix repo's bare `#N` is read
+    # as the TRACKER's issue N. Measured 2026-11-05 against the live lists: ZERO false covers --
+    # the only match is #10114. It is latent, not live, and it is named here because it fails
+    # OPTIMISTICALLY: an agent-infra PR closing its OWN issue would silently mark the same-numbered
+    # tortoise unit covered, and nobody would build it. The bare numbers that matter are tortoise P1
+    # #2281/#2513/#4917/#4051/#4282/#5064/#5087/#5090/#5095/#5333, all below agent-infra's current
+    # range and rising into it. If that ever fires, the fix is a qualified match (`tortoise#N` /
+    # issue URL), not a wider one.
+    # ⛔ A REFUSED READ IS NOT "NO PR": with no second source it returns None so the whole line
+    # reads `unavailable`, exactly as a failed tracker read does. Inflating `without` from an
+    # unreadable repo is the fail-open direction, and it is the one that misdirects a lane into
+    # duplicate work.
+    fix_prs = []
+    for _repo in dict.fromkeys(FIX_REPOS):          # dedupe: a repo listed twice is one read
+        if _repo == REPO:
+            continue
+        # ⛔ A FIX_REPOS ENTRY IS A CONTRACT, NOT A HINT. A falsy or malformed one must be
+        # UNREADABLE, never silently substituted: `--repo None` raises, and the REST path's
+        # `repo or REPO` would then hand back the TRACKER's `/pulls` under the fix repo's name --
+        # a wrong list that still looks complete, which is the one thing this path may not do.
+        if not isinstance(_repo, str) or _repo.count("/") != 1 or not all(_repo.split("/")):
+            return None
+        for _state, _limit in (("open", 500), ("merged", 400)):
+            rows = _repo_prs(_repo, _state, _limit, rest_deadline)
+            if rows is None:
+                return None
+            fix_prs.extend(rows)
+
     today = time.strftime("%Y-%m-%dT00:00:00Z", time.gmtime())
     merged_today = sum(1 for p in merged if (p.get("mergedAt") or "") >= today)
 
     def covered(n):
         pat = re.compile(r"(?<![\d])%d(?![\d])" % n)
-        for p in openpr + merged:
+        for p in openpr + merged + fix_prs:
             if pat.search(p.get("headRefName") or "") or pat.search(p.get("title") or ""):
                 return True
         return False

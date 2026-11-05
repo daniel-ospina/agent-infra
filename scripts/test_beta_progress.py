@@ -99,13 +99,16 @@ def test_graphql_failure_uses_rest_and_still_counts_merged_today(monkeypatch, no
 
     deadlines = []
 
-    def fake_rest(state, limit=100, deadline=None):
+    def fake_rest(state, limit=100, deadline=None, repo=None):
         rest_calls.append((state, limit))
         deadlines.append(deadline)
         if state == "open":
             return [pr(1), pr(2)]
         return [pr(3, merged=MERGED_TODAY), pr(4, merged=LONG_AGO)]
 
+    # These two tests pin the TRACKER's GraphQL-refusal/REST-fallback contract, and their `gh` stub
+    # answers every `pr list` alike — so the cross-repo gap read is pinned to the tracker here,
+    # and graded on its own by the FIX_REPOS tests at the end of this file.
     monkeypatch.setattr(bp, "gh", fake_gh)
     monkeypatch.setattr(bp, "_rest_prs", fake_rest)
 
@@ -346,7 +349,7 @@ def test_a_failed_graphql_read_never_produces_a_mixed_source_read(monkeypatch):
             return [pr(n) for n in range(1, 8)]
         return None
 
-    def fake_rest(state, limit=100, deadline=None):
+    def fake_rest(state, limit=100, deadline=None, repo=None):
         if state == "open":
             return [pr(100), pr(101)]          # REST's open window: 2, not 7
         return [pr(200, merged=LONG_AGO)]      # no PR merged today
@@ -370,7 +373,7 @@ def test_a_failed_graphql_read_never_produces_a_mixed_source_read(monkeypatch):
             return [pr(300, merged=LONG_AGO)]  # GraphQL says: 0 merged today
         return None
 
-    def fake_rest_mirror(state, limit=100, deadline=None):
+    def fake_rest_mirror(state, limit=100, deadline=None, repo=None):
         if state == "open":
             return [pr(400), pr(401), pr(402), pr(403)]
         return [pr(500, merged=MERGED_TODAY), pr(501, merged=LONG_AGO)]   # REST says: 1
@@ -1080,3 +1083,176 @@ def test_a_cache_25_minutes_old_prints_25m_ago_not_zero(no_cache, capsys):
     assert "25m ago" in out, (
         "a 25-minute-old cache must print `25m ago` — an always-0m age makes a stale figure "
         "indistinguishable from a live one. got: %r" % out)
+
+
+# ══ THE GAP COUNT MUST SEE THE REPO THE FIX LANDS IN (tortoise#10951) ═══════════════
+# `REPO` is the TRACKER. It is not the repo every fix lands in: tortoise's P0/P1 backlog is
+# worked by the harness (agent-infra), whose PRs live under a different repo. Measured
+# 2026-11-05: #10114 was reported `without_pr`, and the lane chartered off that number was
+# about to rebuild it — while agent-infra #3368 (`fix(reaper): the harness PIN TREE is a
+# holder, not residue (#10114)`) was OPEN and #3333 folded it. A metric that reads a single
+# repo's PR list turns "landed elsewhere" into "nobody is on it", and this is the number the
+# owner reads to decide whether beta ships.
+def _issue_rows(*numbers):
+    return [{"number": n} for n in numbers]
+
+
+def _gh_by_repo(monkeypatch, tracker_open, tracker_merged, other_open):
+    """A `gh` whose answer depends on `--repo`, which is what the defect is about."""
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        repo = args[args.index("--repo") + 1] if "--repo" in args else bp.REPO
+        if args[:2] == ("pr", "list"):
+            state = args[args.index("--state") + 1]
+            if repo == bp.REPO:
+                return tracker_open if state == "open" else tracker_merged
+            return other_open
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": (10951,)}[label])
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    return calls
+
+
+def test_a_fix_in_another_repo_is_a_landing_path_not_a_gap(monkeypatch, no_cache):
+    """#10114: no tortoise PR, an OPEN agent-infra PR whose TITLE carries `(#10114)`.
+
+    The pre-fix count called that a gap. The assertion is not "the number changed" — it is
+    that an OPEN PR referencing the issue, in the repo the fix is actually written in, makes
+    `without` ZERO, because that is the fact a lane charter reads.
+
+    ⛔ NO `FIX_REPOS` PIN HERE, ON PURPOSE. The shipped default already names agent-infra, and
+    pinning it made the red-first run die on `AttributeError: no attribute 'FIX_REPOS'` against
+    the pre-change module — an error that PROVES A NEW CONSTANT EXISTS, not that the defect does.
+    Unpinned, the same tests are red on the old code with the real defect in the assertion
+    (`p0 == {'open': 1, 'with_pr': 0, 'without': 1}`).
+    """
+    other = "daniel-ospina/agent-infra"
+    calls = _gh_by_repo(
+        monkeypatch,
+        tracker_open=[pr(900)],
+        tracker_merged=[],
+        other_open=[pr(3368, ref="fix/10114-pin-tree-is-a-holder",
+                        title="fix(reaper): the harness PIN TREE is a holder, not residue (#10114)"),
+                    pr(3333, title="batch(#3309 #10114 #3243): one integration branch")])
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "an OPEN PR in the fix repo IS a landing path; counting it as a gap is what chartered "
+        "a lane to rebuild landed-elsewhere work")
+    # #10951 has NO PR in EITHER repo — the metric must not become optimistic either.
+    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}
+    # The headline count keeps its meaning: the TRACKER's open PRs, not the fleet's.
+    assert out["open_prs"] == 1
+    # ⛔ THE WINDOW IS PART OF THE CONTRACT, so it is asserted and not just commented: a fix-repo
+    # read that asked only for `--state open` would drop #10114 the moment #3368 merged — "no PR,
+    # you are the path" about work that had LANDED, which is worse than the open case this fixes.
+    for want in ("open", "merged"):
+        assert any(a[:2] == ("pr", "list")
+                   and a[a.index("--repo") + 1] == other
+                   and a[a.index("--state") + 1] == want for a in calls), \
+            "the fix repo was never read as an %r window — a merged fix would read as a gap" % want
+
+
+def test_a_refused_fix_repo_read_falls_back_to_rest_not_to_unavailable(monkeypatch, no_cache):
+    """⛔ THE #2139 REFUSAL IS A SECONDARY-LIMIT ONE, SO IT HITS EVERY `gh pr list` AT ONCE.
+
+    `compute()`'s REST fallback covered only the tracker pair; a fix repo read through the same
+    GraphQL call would return None on those boxes and take the whole DELIVERY line down — while
+    the tracker's own successful read had already been paid for. The fix repo gets the same
+    second source, and the REST URL is built from the repo it was asked for (it used to hardcode
+    the TRACKER, which would hand back the tracker's `/pulls` under the fix repo's name).
+    """
+    other = "daniel-ospina/agent-infra"
+    rest_calls = []
+
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            return None                      # refused for EVERY repo, as it is on a cell
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[label])
+
+    def fake_rest(state, limit=100, deadline=None, repo=None):
+        rest_calls.append(repo)
+        if repo == other:
+            return [pr(3368, title="fix(reaper): the harness PIN TREE is a holder (#10114)")]
+        return [pr(900)] if state == "open" else []
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", fake_rest)
+
+    out = bp.compute()
+    assert out is not None, "a refused GraphQL read must not cost the line its REST fallback"
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}
+    assert other in rest_calls, "the fix repo was never read over REST — it has no second source"
+
+
+def test_an_unreadable_fix_repo_is_not_a_gap(monkeypatch, no_cache):
+    """⛔ COULD NOT READ IS NOT 'NO PR'. A refused read of the fix repo must make the metric
+    UNAVAILABLE, never inflate `without` — that is the fail-open direction, and it is the one
+    that sends a lane to rebuild work somebody else already has open.
+
+    ⛔ BOTH SOURCES MUST BE REFUSED, NOT JUST GRAPHQL. The first draft stubbed only `gh`, so the
+    fix-repo REST fallback went to the REAL api.github.com; on a box with a token it answered 38
+    real rows and the metric came back non-None — the test passed only where the network was
+    absent (caught by the [VGATE] verifier, which reproduced it live). A test about "unreadable"
+    has to make both sources unreadable.
+    """
+    _gh_by_repo(monkeypatch, tracker_open=[pr(900)], tracker_merged=[], other_open=None)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)   # no second source either
+
+    assert bp.compute() is None, (
+        "a refused read of a fix repo must not be reported as a real gap — it must not be "
+        "reported at all")
+
+
+def test_the_rest_fallback_asks_the_repo_it_was_given(monkeypatch):
+    """⛔ THE URL IS PART OF THE FIX, AND THIS IS THE ONLY TEST THAT CAN SEE IT.
+
+    `_rest_prs` built its URL from the module constant `REPO`, so a fix-repo call would have been
+    answered with the TRACKER's `/pulls` and the fix repo's name attached to it — a wrong list that
+    still looks complete. Every other test stubs `_rest_prs` wholesale and can only observe the
+    `repo` ARGUMENT, so reverting the URL to `% (REPO, ...)` used to leave the whole suite green
+    (measured: 23 passed). This pins the bytes actually requested.
+    """
+    other = "daniel-ospina/agent-infra"
+    seen = []
+
+    def fake_get(url, tok, timeout=None):
+        seen.append(url)
+        return []
+
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    monkeypatch.setattr(bp, "_rest_get_json", fake_get)
+
+    assert bp._rest_prs("open", limit=100, deadline=bp.time.time() + 30, repo=other) == []
+    assert seen, "_rest_prs made no request at all"
+    assert "/repos/%s/pulls" % other in seen[0], (
+        "the REST read asked for %r, not the repo it was given" % seen[0])
+
+
+def test_a_malformed_fix_repo_payload_is_unavailable_not_a_traceback(monkeypatch, no_cache):
+    """⛔ `gh` CAN EXIT 0 WITH A JSON OBJECT (`{"message": "Not Found"}`) OR A LIST OF NON-DICTS.
+
+    `covered()` calls `.get()` on every row, so a str row RAISES; `main()` catches it and the box
+    then prints a traceback and `unavailable` on EVERY refresh for as long as that payload persists
+    — a whole metric lost to one repo's odd answer, and nothing cached to self-heal. The shape gate
+    in `_repo_prs` turns that into the honest `unavailable`-by-return-None path instead.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+            return {"message": "Not Found"}          # rc 0, wrong shape
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    assert bp.compute() is None, (
+        "a malformed fix-repo payload must not raise out of compute(), and must not be read as "
+        "a complete list")
