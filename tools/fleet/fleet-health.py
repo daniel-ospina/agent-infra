@@ -263,13 +263,14 @@ def lane_census(alive, dead, pi_count, roster_size):
         # and that a pin "stops the exemption being split from its arm". Both claims were FALSE: BOTH
         # arms `return None`, so the ORDER IS UNOBSERVABLE through the verdict, and a verdict-level
         # pin cannot see it. Measured against the pre-fix MODULE on a box whose identity probe
-        # resolves (the shipped base — a DIFFERENT thing from this ordering): `71 passed, 42 failed`
-        # = 36 `CENSUS` + 5 `EXITLINE` + 1 ambient `HARNESS`, i.e. 41 census checks red (the 42nd
-        # `❌` is the ambient HARNESS failure, red on the UNMUTATED module too — quoting 42 as a
+        # resolves (the shipped base — a DIFFERENT thing from this ordering): `71 passed, 44 failed`
+        # = 38 `CENSUS` + 5 `EXITLINE` + 1 ambient `HARNESS`, i.e. 43 census checks red (the 44th
+        # `❌` is the ambient HARNESS failure, red on the UNMUTATED module too — quoting 44 as a
         # CENSUS count is the same two-populations conflation this file exists to keep apart). So
         # the pins are sensitive to the FIX and blind to the ORDER. ⛔ THESE INTEGERS TRACK THE
-        # SUITE'S SIZE (this round's five new checks moved them from 37/36 to 42/41), so they are a
-        # measurement to RE-RUN, never a constant to quote. This is stated for what it is —
+        # SUITE'S SIZE — every check added to this leg moves them — so they are a measurement to
+        # RE-RUN (`--_mutant <pre-fix module>`), never a constant to quote. This is stated for what
+        # it is —
         # the comment now matches the code it sits on, and the exemption sits adjacent to the arm it
         # governs so the two cannot drift apart unnoticed. The value is the HONEST REASON and the
         # PINS below, not an ordering guarantee.

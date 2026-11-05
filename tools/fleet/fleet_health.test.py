@@ -27,8 +27,8 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
   * neuter the lane-census reconciliation      -> 5 paired CENSUS reds (the fifth is the
                                                  exit-code check), plus collateral reds in the
-                                                 other census checks — **28 CENSUS reds**
-                                                 (census-only; the same run prints 29 `❌`
+                                                 other census checks — **30 CENSUS reds**
+                                                 (census-only; the same run prints 31 `❌`
                                                  lines because the ambient HARNESS failure is
                                                  included and is red on the UNMUTATED module too)
   * drop `attributed` from main()                -> 3 paired CENSUS reds (the healthy-box arms)
@@ -951,12 +951,27 @@ def leg_lane_census(mod):
     check("no suspects" not in out_stale,
           "CENSUS: an all-dead roster never prints a clean scan while pi runs")
     check(rc_stale == 1, "CENSUS: the stale-roster scan exits non-zero")
+    # ⛔ THE EXIT LINE ITSELF WAS PINNED ONLY AT THE PURE-FUNCTION LEVEL (review cycle 25). PAIR[0..4]
+    # pin `census_exit_verdict` in isolation, and the arms around this one pin the NOTE plus the exit
+    # CODE — so a `main()` that ignored the note and printed a constant `("INCOMPLETE", "rows without
+    # a verdict are not a verdict")`, or computed `established = 0`, kept the whole suite green while
+    # reproducing BOTH defects this lane claims to fix: "INCOMPLETE" under a 7-of-7 roster (cycle 7
+    # finding 1) and "0 … conclusive" for every note (cycle 3 finding 2). The line below asserts all
+    # three derived values at once — the WORD the note selects, the CONCLUSIVE COUNT it was told, and
+    # the TAIL — so neither can be re-introduced silently.
+    check("lane census STALE ROSTER (7 of 7 rostered lanes conclusive, 0 attributed alive"
+          in out_stale,
+          "CENSUS: the exit line carries the note's OWN word, count and tail — a complete roster "
+          "is not INCOMPLETE, and the count is not a constant")
     rc_unv, out_unv = _drive(lambda: None, records=dead_recs)
     check("LANE CENSUS UNVERIFIED" in out_unv,
           "CENSUS: …and an UNREADABLE table makes the same roster UNVERIFIED, never clean")
     check("no suspects" not in out_unv,
           "CENSUS: an unreadable table never turns an all-dead roster into a clean scan")
     check(rc_unv == 1, "CENSUS: the unverified scan exits non-zero")
+    check("lane census UNVERIFIED (7 of 7 rostered lanes conclusive, 0 attributed alive"
+          in out_unv,
+          "CENSUS: …and the UNVERIFIED exit line carries its own word, count and tail")
 
     # ⛔ THE CYCLE-2 DEFECT ITSELF (review cycle 3, finding 1): a rostered lane whose record is
     # PRESENT but whose identity read ABSTAINS (a live pid and no `pidStartSeconds` -> the row
