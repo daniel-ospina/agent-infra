@@ -111,6 +111,133 @@ export function resolveGhShimDir(): string | null {
 }
 
 /**
+ * The sentinel every entry point of the quota layer carries, in its FIRST 8 KiB (#1988).
+ * `gh-limit.py`'s `is_harness_shim` and the shim's own `_is_harness_layer` both identify a layer
+ * this way, and NOT by the sibling helper — see `isGhLimitLayer`.
+ */
+const GH_LIMIT_MARKER = "harness-gh-shim-marker";
+
+/**
+ * How the QUOTA wrapper names its own delegation to the helper: `exec python3 "$HELPER" --self …`.
+ * Its header states the contract — "`--self` makes the helper skip THIS file while walking PATH`. It
+ * is what separates `gh-limit/gh` from the `gh-rest/gh` adapter, which carries the same marker and
+ * the same sibling helper but never passes `--self` (see `isGhLimitLayer`).
+ */
+const GH_LIMIT_SELF_TOKEN = "--self";
+
+/**
+ * Is `<dir>/gh` THE QUOTA WRAPPER — present, executable, and carrying the layer's own sentinel?
+ *
+ * ⛔ IDENTITY BY SENTINEL, NEVER BY THE SIBLING HELPER. The first draft of this function accepted
+ * "a regular+executable `gh` beside a `../gh-limit.py`", and `gh-limit.py:3296` records that exact
+ * predicate as a MEASURED bypass: "a sibling `../gh-limit.py` was accepted too, which SILENTLY
+ * SKIPPED any other `gh` sitting in such a directory — measured with the tree's own admin-merge
+ * guard (`scripts/gh-shim/gh`) placed beside the helper: `gh pr merge --admin` then reached the
+ * real gh UNGUARDED, i.e. the layer defeated #984's gate." A wrong directory here is worse than a
+ * missing one: it is prepended AHEAD of the guard, so an unrecognised `gh` would run the command
+ * while `ghShimWillEnforce` still reports the guard armed.
+ *
+ * The window is 8 KiB because that is what BOTH existing consumers read. It is also what makes the
+ * chain work: `scripts/gh-shim/gh` keeps its marker at byte 26405 deliberately (outside the
+ * window), so the quota layer resolves the argv guard as its CHILD instead of skipping it — which
+ * is why `gh-limit → gh-shim → real gh` is the correct order rather than a hopeful one.
+ *
+ * ⛔ THE MARKER ALONE IS NOT THE LAYER'S IDENTITY — IT IS THE HARNESS' (#3477 review round 2).
+ * `harness-gh-shim-marker` is carried by EVERY entry point of this family, `gh-rest/gh` included
+ * (bytes 2602 and 5988 — inside the same window), and `gh-rest/gh` also sits beside a
+ * `../gh-limit.py` (`LIMIT_HELPER=…`). A predicate keyed on those two facts alone accepts the REST
+ * adapter as the quota layer — and that is a GUARD BYPASS, because `gh-rest/gh:77` skips harness
+ * layers by a WHOLE-FILE marker grep, so it skips `~/.pi/agent/shims/gh` and execs the real `gh`:
+ * `gh pr merge --admin` would then run unguarded while the extension still reported the #984 layer
+ * armed. The layer's own delegating contract is the discriminator — `gh-limit/gh` execs
+ * `python3 "$HELPER" --self "$SELF_REAL"` (byte 6156, inside the window) and says so in its header
+ * ("`--self` makes the helper skip THIS file while walking PATH"); `gh-rest/gh` contains no
+ * `--self` at all. Require it.
+ *
+ * The sibling helper is still required, as a THIRD condition: the wrapper resolves it as
+ * `$SELF_DIR/../gh-limit.py` and, without it, takes a fail-open arm that runs the plain `gh` while
+ * the box believes the cache is in force. Present-and-genuine is the only state worth prepending.
+ */
+function isGhLimitLayer(dir: string): boolean {
+  try {
+    const p = resolvePath(dir, "gh");
+    // A regular file, because the shell only runs a regular file (same rule as `isExecutableShim`).
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    if (!fs.existsSync(resolvePath(dir, "..", "gh-limit.py"))) return false;
+    const fd = fs.openSync(p, "r");
+    try {
+      const buf = Buffer.alloc(8192);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      const head = buf.subarray(0, n);
+      // BOTH tokens, not either: the marker proves it is a harness entry point (as `gh-rest/gh` is),
+      // and `--self` proves it is the quota wrapper that delegates to the helper (which `gh-rest/gh`
+      // never does). See the doc-comment for the measured bypass this closes.
+      return head.includes(GH_LIMIT_MARKER) && head.includes(GH_LIMIT_SELF_TOKEN);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false; // absent, unreadable, unexecutable or not a regular file: not a layer
+  }
+}
+
+/**
+ * The QUOTA layer's directory — `$O/gh-limit`, the cell's `gh` serialiser/cache (#1988,
+ * #2243, #2342).
+ *
+ * WHY IT IS RESOLVED HERE (#3477). The layer exists and is good: TTL read cache per class,
+ * single-flight coalescing of identical concurrent reads, an ETag conditional-REST cache, the
+ * account budget partition, and a `--stats` instrument. MEASURED 2026-11-05 on cell `cmux`:
+ * 11 of 12 live lane `pi` processes did NOT have it on PATH, so they resolved
+ * `~/.pi/agent/shims/gh` and then the real `gh`, bypassing all of it — while the same box's
+ * `gh-limit` events log recorded 839 `gh-core-floor … read refused` events and ZERO
+ * `read-cache hit`, ZERO `single-flight: shared`, ZERO `conditional: 304`. `--stats` said
+ * `--stats` said `averted=0`. The bucket was exhausted (`core 0/5000`) with `graphql 4159/5000`.
+ * The log line is `read-cache: <class> hit — within its <n>s TTL`, so `rg -c 'read-cache: .* hit'`
+ * is the re-verification — the literal string `read-cache hit` is never emitted.
+ *
+ * The cause is compositional, not logical: `lane.sh:83-84` puts `$O/gh-limit` (then `$O/gh-rest`)
+ * first on PATH for the lanes IT spawns, and this extension put only the argv shim on the PATH of
+ * every bash call. Lanes spawned from a cmux pane get the login PATH, so they got the guard and not
+ * the cache. Prepending the same directory here makes the layer reach EVERY lane that already has
+ * the guard, without a second mechanism and without touching the layer itself.
+ *
+ * ⛔ ORDER IS THE WHOLE CORRECTNESS ARGUMENT — AND THE GUARD IS THE HALF THAT SURVIVES. The
+ * documented chain is `gh-limit → gh-shim → real gh`: `gh-limit` walks PATH and skips files carrying
+ * the `harness-gh-shim-marker` sentinel **in the first 8 KiB**, and `scripts/gh-shim/gh` keeps its
+ * own marker at byte 26405 — deliberately outside that window — so `gh-limit` resolves the argv
+ * guard as its child and the #984 admin-merge gate stays in the chain.
+ *
+ * ⛔ AND WITH THE ORDER REVERSED IT IS THE QUOTA LAYER THAT IS LOST, NOT THE GUARD (measured, review
+ * round 5). `scripts/gh-shim/gh`'s `_is_harness_layer` also reads the first 8 KiB, and `gh-limit`'s
+ * marker sits at byte 1100 — INSIDE it — so the guard `continue`s past `gh-limit` and resolves the
+ * real `gh`. The result is the guard running with the cache bypassed, i.e. exactly the `averted=0` /
+ * `839 gh-core-floor` state this change exists to end, not a lost merge gate. Say it that way: the
+ * failure an operator will actually meet is "gh-limit is still unused", not "merges are unguarded".
+ *
+ * ⛔ BOTH CONDITIONS, OR NOTHING — see `isGhLimitLayer` for the attested reason the sibling
+ * helper alone is not an identity.
+ */
+export function resolveGhLimitDir(): string | null {
+  const explicit = process.env.AGENT_GH_LIMIT_DIR;
+  const candidates: string[] = [];
+  if (explicit) candidates.push(explicit);
+  // `$O` is the harness's own root (lane.sh: `O="${O:-$HOME/orchestrator}"`), so it resolves the
+  // same directory the controller already trusts rather than guessing a second location.
+  const o = process.env.O || resolvePath(os.homedir(), "orchestrator");
+  candidates.push(resolvePath(o, "gh-limit"));
+  for (const dir of candidates) {
+    try {
+      if (isGhLimitLayer(dir)) return dir;
+    } catch {
+      /* an unreadable candidate is not a match */
+    }
+  }
+  return null;
+}
+
+/**
  * Is `<dir>/gh` present AND EXECUTABLE — i.e. is this directory a shim at all?
  *
  * A PATH entry whose `gh` lacks the execute bit is SKIPPED by the shell, so the real
@@ -221,19 +348,82 @@ function activeGhShimDir(): string | null {
 }
 
 /**
+ * Resolved ONCE per session, with the SAME per-call revalidation `activeGhShimDir` gets and for
+ * the same reason: a session outlives a deployment, and `check-deployed-drift.sh` / a re-bootstrap
+ * can remove or replace `$O/gh-limit`.
+ *
+ * ⛔ STATE, STATED ACCURATELY (a first draft of this comment claimed the opposite): the cache holds
+ * `null` for "checked, absent", and the `!== null` guard below means that state falls THROUGH to
+ * the resolver on every call. That is deliberate, not an oversight — it costs two stats on a box
+ * with no layer, and it is what lets a layer deployed MID-SESSION be picked up instead of staying
+ * invisible until the session restarts (the controller deploys `gh-limit` beside running lanes).
+ * A non-null entry takes the cheap path and is re-validated, so a layer that is REMOVED stops
+ * being injected on the next call rather than for the rest of the session.
+ */
+let ghLimitDirCache: string | null | undefined;
+function activeGhLimitDir(): string | null {
+  if (ghLimitDirCache !== undefined && ghLimitDirCache !== null && isGhLimitLayer(ghLimitDirCache)) {
+    return ghLimitDirCache;
+  }
+  ghLimitDirCache = resolveGhLimitDir();
+  return ghLimitDirCache;
+}
+
+/**
  * Prefix a bash command with the shim directory on PATH.
  *
  * Returns null when there is nothing to do — no shim resolved, or the operator's
  * kill switch is set. The kill switch exists because this touches EVERY bash call:
  * `AGENT_GH_SHIM=0` turns the layer off without editing code.
  *
+ * `limitDir` is the QUOTA layer (`resolveGhLimitDir`). When present it is prepended AHEAD of the
+ * argv shim, so the chain is `gh-limit → gh-shim → real gh` — the order `lane.sh:83-84` already
+ * establishes for controller-spawned lanes and the order `gh-limit`'s own PATH walk expects (it
+ * skips `harness-gh-shim-marker` files, so it resolves the guard as its child). `AGENT_GH_LIMIT=0`
+ * drops ONLY that entry and leaves the argv guard in place: the two switches are independent on
+ * purpose, because a caller may want the admin-merge guard without the quota layer's +155 ms hop.
+ *
  * `export PATH=…` on its OWN LINE, so the command's text is otherwise untouched
  * and its exit status is still the command's (`&&` would change both).
  */
-export function withGhShim(command: string, shimDir: string | null): string | null {
+export function withGhShim(
+  command: string,
+  shimDir: string | null,
+  limitDir: string | null = null,
+): string | null {
   if (process.env.AGENT_GH_SHIM === "0") return null;
   if (!shimDir) return null;
-  return `export PATH=${JSON.stringify(shimDir)}:"$PATH"\n${command}`;
+  const quota = process.env.AGENT_GH_LIMIT === "0" ? null : limitDir;
+  const entries = quota ? [quota, shimDir] : [shimDir];
+  return `export PATH=${entries.map((d) => JSON.stringify(d)).join(":")}:"$PATH"\n${command}`;
+}
+
+/**
+ * The WIRING — resolve the quota layer and compose the prefix, in one place.
+ *
+ * ⛔ THIS EXISTS SO THE WIRING IS TESTABLE (#3477 review rounds 2-3). `activeGhLimitDir` is private
+ * and every other assertion calls `withGhShim` with an EXPLICIT `limitDir`, so `activeGhLimitDir`
+ * returning `null` — or this call site losing its third argument — left the suite at 405 green while
+ * the change was dead: the exact silent re-opening of the defect the change exists to close.
+ *
+ * ⛔ A DEGRADED GUARD MUST NOT COST THE QUOTA LAYER TOO (#3477 review round 3). `withGhShim`
+ * returns `null` when `shimDir` is `null`, and the handler calls it on EVERY box — including the
+ * degraded ones it detects and warns about twelve lines earlier (`ghArgvLayerState`). Coupling the
+ * two entries that way meant a box with a valid `$O/gh-limit` but no resolvable argv guard kept the
+ * measured budget collapse (`839` `gh-core-floor … read refused` in 21 h, `averted=0`) even though
+ * injecting the quota entry ALONE is safe there: `gh-limit` resolves whatever `gh` PATH yields,
+ * i.e. exactly today's status quo, with the cache in front of it. So the quota entry stands on its
+ * own; only the shared kill switches turn it off.
+ */
+export function withGhLayers(command: string, shimDir: string | null): string | null {
+  const limitDir = activeGhLimitDir();
+  if (shimDir) return withGhShim(command, shimDir, limitDir);
+  // The argv guard did not resolve. `AGENT_GH_SHIM=0` is the documented "turn the injection off"
+  // switch and must keep meaning that; `AGENT_GH_LIMIT=0` drops the quota entry by itself.
+  if (process.env.AGENT_GH_SHIM === "0") return null;
+  if (process.env.AGENT_GH_LIMIT === "0") return null;
+  if (!limitDir) return null;
+  return `export PATH=${JSON.stringify(limitDir)}:"$PATH"\n${command}`;
 }
 
 /**
@@ -8925,7 +9115,11 @@ export default function (pi: ExtensionAPI) {
         );
         logGateEvent("gh_shim_degraded", { reason: "argv_layer_absent", command: auditCommand(rawCommand) });
       }
-      const shimmed = withGhShim(rawCommand, shimDir);
+      // The QUOTA layer goes ahead of the argv guard (see `withGhShim`): the guard is what every
+      // lane already got, so resolving the quota dir here is what makes the cache/budget/single-flight
+      // reach the lanes that were bypassing it (#3477). Delegated to `withGhLayers` so the wiring
+      // itself is covered by a test.
+      const shimmed = withGhLayers(rawCommand, shimDir);
       if (shimmed !== null) event.input.command = shimmed;
 
       // #1382: THE GATE READS A DATA MODEL, NOT THE BYTES THE USER TYPED. A heredoc body is stdin
