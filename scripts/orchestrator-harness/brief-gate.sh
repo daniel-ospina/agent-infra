@@ -332,11 +332,21 @@ END {
       r = l; sub(/^[^:]*:/, "", r); gsub(/^[ \t]+/, "", r); gsub(/[ \t]+$/, "", r)
       if (length(r) > 0) none = 1
     }
-    if (l ~ /^\|/) {
+    # ⛔ A TABLE NEED NOT HAVE OUTER PIPES (#3442 review cycle 3, P2). GFM renders
+    # `assertion | mutant | reddened row | observed` as a table, and refusing it told the reviewer its
+    # header "must name assertion, mutant and reddened" — a column it already had. So any line carrying
+    # a pipe is a table candidate; `_cells` still requires >=3 non-empty cells for a row, and the
+    # header still has to name all three columns. Stated limit, unchanged in kind: this is a SHAPE
+    # test, so a prose line with three pipe-separated segments can satisfy a row.
+    if (l ~ /\|/) {
       k = _cells(l, C)
       if (k >= 2) {
         t = tolower(l)
-        if (t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) { hdr = 1; hl = i }
+        # ⛔ THE HEADER RESETS `row` (#3442 review cycle 3, P1). A table ABOVE the header (a "what I
+        # ran" summary is the normal shape) sets `row` while `hl` is still 0, and a later header-only
+        # attribution table then inherited that row — the vacuous table, admitted. Finding the header
+        # starts the attribution over: from here only a row BELOW it counts.
+        if (t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) { hdr = 1; hl = i; row = 0 }
         allsep = 1
         for (j = 1; j <= k; j++) { if (C[j] !~ /^:?-+:?$/) allsep = 0 }
         # The header row is not a data row, and a `|---|` rule is not either. Both would otherwise

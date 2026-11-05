@@ -208,7 +208,7 @@ miss="$(bash "$GATE" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev
 printf '## MUTATION ATTRIBUTION\\r\\n\\r\\n| assertion | mutant | reddened row | observed |\\r\\n|---|---|---|---|\\r\\n' > "$TMP/mut-tsv-crlf.txt"
 [ "$(grep -c '' "$TMP/mut-tsv-crlf.txt")" = "1" ]; ck $? "fixture: the CRLF+@tsv carrier is ONE line of literal \\r\\n escapes (the shape jq @tsv emits)"
 bash "$GATE" --mutation-missing "$TMP/mut-tsv-crlf.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xv) the SAME header-plus-rule table through the @tsv carrier is REFUSED (an escaped \\r left unreversed made the RULE the data row)"
-printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a:1 | sed s/a\\nb// | t §A | rc=1 |\n' > "$TMP/mut-literal-escape.txt"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row |\n|---|---|---|\n| a:1 | sed s/a\\nb// | §A |\n' > "$TMP/mut-literal-escape.txt"
 grep -q 's/a\\nb//' "$TMP/mut-literal-escape.txt"; ck $? "fixture: a real multi-line artifact whose CELL contains a literal backslash-n (a newline-editing mutant)"
 miss="$(bash "$GATE" --mutation-missing "$TMP/mut-literal-escape.txt" 2>/dev/null)"
 [ -z "$miss" ]; ck $? "(xvi) …is ADMITTED — un-escaping a REAL multi-line body splits that cell and REFUSES an honest row (got '$miss')"
@@ -219,6 +219,14 @@ bash "$GATE" --mutation-missing "$TMP/mut-indented.txt" 2>/dev/null | grep -qE '
 printf '  ## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a | b | c | d |\n' > "$TMP/mut-indented-heading.txt"
 miss="$(bash "$GATE" --mutation-missing "$TMP/mut-indented-heading.txt" 2>/dev/null)"
 [ -z "$miss" ]; ck $? "(xix) a heading indented by 1–3 spaces is a HEADING (Markdown) and its table is ADMITTED — requiring column 0 would deadlock an honest verdict until it is reflowed (got '$miss')"
+# ── CYCLE 3: THE SUMMARY TABLE ABOVE THE ATTRIBUTION, AND GFM'S OPTIONAL OUTER PIPES.
+#    A "what I ran" table is the NORMAL shape of a review comment, and it sits ABOVE the attribution
+#    table — so a row seen before the header must not survive into it.
+printf '## MUTATION ATTRIBUTION\n\nWhat I ran:\n\n| suite | result | notes |\n|---|---|---|\n| brief-gate.test.sh | 183 pass, 1 known-fail | pre-existing |\n\nNow the attribution:\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n' > "$TMP/mut-table-before-header.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-table-before-header.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xx) a SUMMARY table above the attribution does not donate a row to it — the attribution header with no rows of its own is REFUSED"
+printf '## MUTATION ATTRIBUTION\n\nassertion | mutant | reddened row | observed\n---|---|---|---\n| x.sh:1 | sed s/a/b/ | §A | rc=1 |\n' > "$TMP/mut-no-outer-pipes.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-no-outer-pipes.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xxi) a GFM table WITHOUT outer pipes is a table — the attribution is complete, and telling the reviewer its header lacks a column it has is a false block (got '$miss')"
 
 # ── §G THE MUTATION PROOF: each §F assertion above must be able to FAIL. Same discipline as §C — the
 # mutant is derived FROM THE SHIPPED FILE so it tracks it, and the transformation is itself asserted.
@@ -337,6 +345,59 @@ miss="$(bash "$TMP/mutant-hindent.sh" --mutation-missing "$TMP/mut-hdr-decorated
 [ -z "$miss" ]; ck $? "§G …and the heading-indent mutant still ANSWERS (control admitted; got '$miss')"
 miss="$(bash "$TMP/mutant-hindent.sh" --mutation-missing "$TMP/mut-indented-heading.txt" 2>/dev/null)"
 [ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xix) now FAILS — a 2-space-indented heading is refused as if there were no block (got '$miss')"
+
+# §F(xx) — the header RESETS the row. Without the reset a row from a summary table ABOVE the header
+# survives into it, and a header-only attribution table is admitted.
+sed 's/hdr = 1; hl = i; row = 0/hdr = 1; hl = i/' "$GATE" > "$TMP/mutant-noreset.sh"
+cmp -s "$GATE" "$TMP/mutant-noreset.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the row-reset mutation REALLY changed the file (the header anchor still matches)"
+bash -n "$TMP/mutant-noreset.sh"; ck $? "§G …and the row-reset mutant still parses"
+miss="$(bash "$TMP/mutant-noreset.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the row-reset mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-noreset.sh" --mutation-missing "$TMP/mut-table-before-header.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xx) now FAILS — the summary row above the header is inherited, so the vacuous table is admitted (got '$miss')"
+
+# §F(xxi) — outer pipes are OPTIONAL in GFM. Restoring the column-0 requirement refuses an honest
+# table, which is the false block the widening removes.
+sed 's@if (l ~ /.|/) {@if (l ~ /^\\|/) {@' "$GATE" > "$TMP/mutant-outerpipe.sh"
+cmp -s "$GATE" "$TMP/mutant-outerpipe.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the outer-pipe mutation REALLY changed the file (the table-line anchor still matches)"
+bash -n "$TMP/mutant-outerpipe.sh"; ck $? "§G …and the outer-pipe mutant still parses"
+miss="$(bash "$TMP/mutant-outerpipe.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the outer-pipe mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-outerpipe.sh" --mutation-missing "$TMP/mut-no-outer-pipes.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxi) now FAILS — an honest pipe-less table is refused again (got '$miss')"
+
+# ── THE ARMS THAT ONLY FALSIFY THE **OVER-BLOCK** DIRECTION, WHICH HAD NO MUTANT AT ALL (cycle-3
+#    review, P2). §F(ii)/(iv-b) are the scoping half: making the reviewer requirement GLOBAL is the
+#    plausible well-meaning defect, and it would deadlock every lane dispatch. §F(iii)/(viii)/(ix)/(x)
+#    are the reachability half — a parser that refuses EVERYTHING passes every refusal arm in §F.
+sed 's/if \[ "$role" = "reviewer" \]/if true/' "$GATE" > "$TMP/mutant-role-true.sh"
+cmp -s "$GATE" "$TMP/mutant-role-true.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the over-block role mutation REALLY changed the file (both role tests still match the anchor)"
+bash -n "$TMP/mutant-role-true.sh"; ck $? "§G …and the over-block mutant still parses"
+bash "$TMP/mutant-role-true.sh" --check "$TMP/reviewer-no-mutation.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "§G ⛔ MUTATION: §F(ii) 'the SAME brief is still admitted for role lane' now FAILS — a global requirement refuses a lane brief (rc=$rc)"
+bash "$TMP/mutant-role-true.sh" --line lane 2>/dev/null | grep -q '3442'; ck $? "§G ⛔ MUTATION: §F(iv-b) 'the LANE line does not name the block' now FAILS — the mutant's lane line demands it"
+
+sed 's/if (none) exit/if (0) exit/' "$GATE" > "$TMP/mutant-none.sh"
+cmp -s "$GATE" "$TMP/mutant-none.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the exemption mutation REALLY changed the file (the NO NEW ASSERTIONS anchor still matches)"
+bash -n "$TMP/mutant-none.sh"; ck $? "§G …and the exemption mutant still parses"
+bash "$TMP/mutant-none.sh" --mutation-missing "$TMP/mut-none.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "§G ⛔ MUTATION: §F(viii) 'NO NEW ASSERTIONS is REACHABLE' now FAILS — the mutant refuses the exemption"
+
+sed 's/if (nx == "n")  { out = out ".n"; i++; continue }/if (nx == "n")  { }/' "$GATE" > "$TMP/mutant-nl.sh"
+cmp -s "$GATE" "$TMP/mutant-nl.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the escaped-LF mutation REALLY changed the file (the un-escape anchor still matches)"
+bash -n "$TMP/mutant-nl.sh"; ck $? "§G …and the escaped-LF mutant still parses"
+bash "$TMP/mutant-nl.sh" --mutation-missing "$TMP/mut-tsv.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "§G ⛔ MUTATION: §F(ix) 'a ONE-LINE @tsv body is parsed' now FAILS — without the LF reversal the escaped carrier has no heading"
+
+sed 's/printf .NO-FILE.n./:/' "$GATE" > "$TMP/mutant-nofile.sh"
+cmp -s "$GATE" "$TMP/mutant-nofile.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the NO-FILE mutation REALLY changed the file (the refusal anchors still match)"
+bash -n "$TMP/mutant-nofile.sh"; ck $? "§G …and the NO-FILE mutant still parses"
+miss="$(bash "$TMP/mutant-nofile.sh" --mutation-missing "$TMP/does-not-exist-mut.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(x) 'an UNREADABLE artifact is refused as NO-FILE' now FAILS — a missing file reads as clean (got '$miss')"
 
 echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
