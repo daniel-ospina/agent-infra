@@ -348,7 +348,10 @@ canon_reasons_missing() {
   grep -qF -e '#729' -- "$f" 2>/dev/null || miss="$miss citation-729"
   # The TITLE residual must be STATED, not just true: arm E3 measures that a title/label naming a
   # destructive verb is still refused, and this pins the sentence to that fact so the two cannot drift.
-  awk 'BEGIN{n=0} /--title/ && /(still scanned|still refused|is still)/ {n=1} END{exit(n?0:1)}' "$f" 2>/dev/null \
+  # ⛔ The PROPERTY is "the sentence names --title AND a refusal", not one of a few fixed wordings:
+  # requiring the adverb "still" false-reds a correct reword ("a `--title` that names a destructive
+  # verb is refused too"), which is the kind of edit the pin exists to ALLOW (measured, round 7).
+  awk 'BEGIN{n=0} /--title/ && /(classif|refus|scan|block|reject|forbid)/ {n=1} END{exit(n?0:1)}' "$f" 2>/dev/null \
     || miss="$miss title-residual"
   # ⛔ THE RECIPE HALVES, each of which a review round had to fix and which nothing else pinned:
   #   call1-path   — a line that PRINTS the derived path, BEFORE the gh call, so the `write` tool has
@@ -364,7 +367,7 @@ canon_reasons_missing() {
   awk '
     /^[ \t]*#/ { next }
     {
-      if (!printed && /echo/ && /pi-issue-body-/ && /git rev-parse/) printed=1
+      if (!printed && /(echo|printf)/ && /pi-issue-body-/ && /git rev-parse/) printed=1
       if (!ghseen && /issue[ \t]+create/) { ghseen=1; gh_at_echo = printed }
     }
     END { exit(gh_at_echo ? 0 : 1) }
@@ -376,7 +379,7 @@ canon_reasons_missing() {
   # a mention AFTER the path has been printed can be the instruction.
   awk '
     {
-      if (!printed && /echo/ && /pi-issue-body-/ && /git rev-parse/) printed = 1
+      if (!printed && /(echo|printf)/ && /pi-issue-body-/ && /git rev-parse/) printed = 1
       if (!wrote && printed && /^[ \t]*#/ && /[Ww]rite/ && /write.*tool|tool.*write/) wrote = 1
       # ⛔ The verdict is a FLAG, not `exit` inside the rule: `exit` jumps to END, and an END that
       # itself exits would overwrite this status (measured while writing this arm — it reported a
@@ -389,19 +392,43 @@ canon_reasons_missing() {
   # measures elsewhere (TMPDIR="/tmp/tmp with space"). Round 6 measured that removing the quotes
   # from all five skills left the suite GREEN, and no other arm sees it: the literal arm skips values
   # containing `$`, and the recipe arm only looks for a `VAR=` assignment.
+  # ⛔ The PROPERTY is "quoted, and the value carries an expansion" — NOT the `${` spelling. Pinning
+  # the spelling false-reds a strictly better derivation such as
+  # `--body-file "$(mktemp "${TMPDIR:-/tmp}/pi-issue-body.XXXXXX")"` (measured, round 7).
   awk '
     { if ($0 ~ /^[ \t]*#/) next }
-    { if (index($0, "--body-file \"${")) ok = 1 }
+    { if ($0 ~ /--body-file[= ]+"[^"]*\$/) ok = 1 }
     END { exit(ok ? 0 : 1) }
   ' "$f" 2>/dev/null || miss="$miss body-quoted"
-  # ⛔ THE LANE-UNIQUENESS TOKEN must be in the --body-file VALUE, not only in the printed path.
+  # ⛔ THE CHECKOUT-UNIQUENESS TOKEN must be in the --body-file VALUE, not only in the printed path.
   # Replacing the derivation with a derived-looking SHARED path -- `--body-file "$(pwd)/pi-issue-body.md"`,
-  # `--body-file "$(git rev-parse --show-toplevel)/pi-issue-body.md"` -- keeps the `$` that arm B2's
+  # `--body-file "$(git rev-parse --show-toplevel)/pi-issue-body.md"`,
+  # `--body-file "$(git rev-parse --git-common-dir)/pi-issue-body.md"` -- keeps the `$` that arm B2's
   # literal check deliberately skips, so the #729 collision returns with the suite GREEN (measured,
-  # round 6: both spellings passed 41/0). The derivation IS the rule, so the token is what is pinned.
+  # round 6: two spellings passed 41/0; round 7 added the common-dir one).
+  # ⛔ The PROPERTY is "the expansion resolves per checkout or per call", NOT one spelling: a
+  # `mktemp` derivation is strictly better (unique per CALL) and must stay green, which a token match
+  # on `--absolute-git-dir` alone refused (measured, round 7).
   awk '
     { if ($0 ~ /^[ \t]*#/) next }
-    { if (index($0, "--body-file") && index($0, "--absolute-git-dir")) ok = 1 }
+    # an ASSIGNMENT may carry the derivation, and the call site may then name the variable: a
+    # single-fence recipe is a valid shape (assignment + consumer = one shell), so it must not be
+    # refused for spelling — the resolution, not the spelling, is the rule.
+    match($0, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=/) {
+      name = $0; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/=.*/, "", name)
+      if ($0 ~ /\$\((git rev-parse --(absolute-)?git-dir|mktemp)/ && $0 !~ /--git-common-dir/) uniq[name] = 1
+      next
+    }
+    {
+      if ($0 !~ /--body-file/) next
+      if ($0 ~ /\$\((git rev-parse --(absolute-)?git-dir|mktemp)/ && $0 !~ /--git-common-dir/) ok = 1
+      rest = $0
+      while (match(rest, /\$\{?[A-Za-z_][A-Za-z0-9_]*/)) {
+        v = substr(rest, RSTART, RLENGTH); sub(/^\$\{?/, "", v)
+        if (v in uniq) ok = 1
+        rest = substr(rest, RSTART + RLENGTH)
+      }
+    }
     END { exit(ok ? 0 : 1) }
   ' "$f" 2>/dev/null || miss="$miss derivation-unique"
   [ -n "$(canon_recipe_absent "$f")" ] && miss="$miss recipe-var"
@@ -435,21 +462,45 @@ readme_route_absent() {
   # be reverted to the inline `--body "…"` or to a fixed `/tmp` path while every arm stayed GREEN
   # (measured, round 6: both reverts passed 41/0). The example is a table CELL, i.e. prose, so the
   # fenced scanner cannot see it — these checks on the cell are its only pin.
+  ROUTE_LINE="$(printf '%s\n' "$RT" | grep -F 'gh issue create' | head -1)"
   ROUTE_CMD="$(printf '%s\n' "$RT" | tr '`' '\n' | grep -F 'gh issue create' | head -1)"
   if [ -z "$ROUTE_CMD" ]; then
     printf '%s\n' "$r(route-example)"
   else
-    # the value must be DERIVED and QUOTED (`"${…`), the shape the skills teach
-    printf '%s' "$ROUTE_CMD" | grep -qE -- '--body-file[= ]+"?\$\{?' || printf '%s\n' "$r(route-path)"
+    # ⛔ The value must be DERIVED (per checkout or per call) — not any `$`: a bare `"$BODY"` is the
+    # fresh-shell-broken shape the row's OWN sentence warns about, and `--git-common-dir` is shared by
+    # every worktree of the repo. Both passed the weaker `\$\{?` test (measured, round 7).
+    if printf '%s' "$ROUTE_CMD" | grep -qE -- '--body-file[= ]+"?[^|]*\$\((git rev-parse --(absolute-)?git-dir|mktemp)' \
+       && ! printf '%s' "$ROUTE_CMD" | grep -q -- '--git-common-dir'; then :; else
+      printf '%s\n' "$r(route-path)"
+    fi
     # and never the inline body this whole change removes
     printf '%s' "$ROUTE_CMD" | grep -qE -- '(^|[ ])--body[ =]' && printf '%s\n' "$r(route-inline)"
   fi
+  # ⛔ THE ROW MUST STILL PARSE AS A TABLE ROW. GFM splits cells on UNESCAPED pipes BEFORE inline
+  # parsing, so a `|` inside the example's code span silently turns one 3-column row into five cells
+  # and orphans the Consequence column — the row rendered broken while the shard read it as text and
+  # stayed green (measured, round 7). The row must carry the same unescaped-pipe count as the header.
+  HDR_PIPES="$(printf '%s\n' "$RT" | grep -m1 '^|' | sed 's/\\|//g' | tr -cd '|' | wc -c | tr -d ' ')"
+  ROW_PIPES="$(printf '%s' "$ROUTE_LINE" | sed 's/\\|//g' | tr -cd '|' | wc -c | tr -d ' ')"
+  [ "${HDR_PIPES:-0}" = "${ROW_PIPES:-0}" ] || printf '%s\n' "$r(row-cells)"
   # ⛔ The TITLE residual is read from the RESIDUAL, not from the example: a bare `--title` grep is
   # satisfied by the example command in the neighbouring cell, so deleting the title half of the
   # sentence stayed green (measured, round 6: M20, label-only residual, 41/0). The `[^|]*` keeps a
   # flag in one cell from borrowing a refusal word from another.
-  printf '%s\n' "$RT" | grep -qE -- '--title[^|]*(classifies|refused|scanned|blocked|forbidden)' \
-    || printf '%s\n' "$r(title-residual)"
+  # ⛔ Per CELL and per SENTENCE, not per physical line: `[^|]*` on a LINE conflates "one cell" with
+  # "one source line", so moving the residual into a normal wrapped paragraph — the shape this repo's
+  # prose uses — reds a correct document (measured, round 7). Escaped pipes are protected first.
+  printf '%s\n' "$RT" | awk '
+    { buf = buf " " $0 }
+    END {
+      gsub(/\\\|/, "\001", buf)
+      gsub(/[|;]/, "\n", buf)
+      gsub(/\. +/, "\n", buf)
+      n = split(buf, seg, "\n")
+      for (i = 1; i <= n; i++) if (seg[i] ~ /--title/ && seg[i] ~ /(classif|refus|scan|block|reject|forbid)/) ok = 1
+      exit(ok ? 0 : 1)
+    }' || printf '%s\n' "$r(title-residual)"
   printf '%s\n' "$RT" | grep -qi -- 'label' || printf '%s\n' "$r(label-residual)"
 }
 
@@ -476,19 +527,24 @@ readme_worktree_claim() {
 }
 
 # canon_recipe_absent <file> → the file, when it teaches the FRESH-SHELL-BROKEN recipe: a `VAR=…`
-# assignment (value carrying a $) followed by `--body-file "$VAR"` in the SAME fence. ⛔ Every bash
-# tool call is a fresh shell, so the variable is EMPTY at the consumer — the exact defect the skills
-# were fixed for, and the shape the literal-path arm cannot see because it skips `$` values.
+# assignment whose value carries a `$`, consumed by `--body-file "$VAR"` in a DIFFERENT fence. ⛔ Every
+# bash tool call is a fresh shell, so a variable assigned in one code block is EMPTY in the next — the
+# exact defect the skills were fixed for, and the shape the literal-path arm cannot see because it
+# skips `$` values. ⛔ A DIFFERENT fence is the whole test: assignment and consumer in ONE block are one
+# call and one shell, so that recipe WORKS and flagging it would be a false red (measured, round 7 —
+# the old code never tracked fences at all).
 canon_recipe_absent() {
   local f="$1"
   [ -f "$f" ] || { printf '%s\n' "$f"; return 0; }
   awk '
     # non-comment code lines only: a comment WARNING about this pitfall is the correct text.
     { line=$0 }
+    # FENCE tracking: a ``` / ~~~ run (any length) toggles blocks; the marker line is not content.
+    line ~ /^[ \t]*(`{3,}|~{3,})/ { fence++; next }
     line ~ /^[ \t]*#/ { next }
-    # an assignment whose value carries a variable/substitution
+    # an assignment whose value carries a variable/substitution, TAGGED with its fence
     match(line, /^[ \t]*(export[ \t]+)?[A-Za-z_][A-Za-z0-9_]*=.*\$/) {
-      name=line; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/=.*/, "", name); vars[name]=1; next
+      name=line; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/=.*/, "", name); vars[name]=fence; next
     }
     {
       # a consumer of one of those variables — QUOTED or BARE. Round 3 showed the quoted-only form let
@@ -496,7 +552,7 @@ canon_recipe_absent() {
       for (v in vars) {
         if (index(line, "--body-file")) {
           rest = substr(line, index(line, "--body-file"))
-          if (index(rest, "$" v) || index(rest, "${" v "}")) { print FILENAME; found=1; exit }
+          if ((index(rest, "$" v) || index(rest, "${" v "}")) && vars[v] != fence) { print FILENAME; found=1; exit }
         }
       }
     }
