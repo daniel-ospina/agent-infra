@@ -3183,8 +3183,10 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     #                          `cloud-cell-supervisor.sh:2316`;
     #   `$CELL_HOME/…`         `harness-apply-pass.sh:207` CONSUMES the DIR record and roots its own
     #                          default at `$CELL_HOME/.harness-path` — the co-rooting that makes this
-    #                          source real on a box whose `CELL_HOME` is not `$HOME` (its uses are reads:
-    #                          `:555`, `:1159`).
+    #                          source real on a box whose `CELL_HOME` is not `$HOME` (its two CONTENT
+    #                          reads are `:555` and `:1159`; it never writes it — it also assigns,
+    #                          `-f`/`-s`-tests and re-exports it, so "its uses are reads" would be the
+    #                          over-broad form of a claim that only needs to be about writing).
     #                          ⛔ G15n is the ONLY fixture where this element is the sole candidate:
     #                          in G15a `cell` IS `$HOME` (so the third element names the same file and
     #                          masks it), and G15k/G15l point `CELL_HOME` at a record-less home. Measured
@@ -3223,6 +3225,20 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         # absence is EVIDENCE this probe is allowed to act on (it is what lets G15f reclaim a plain
         # merged worktree, and preserving on absence would make the reaper inert). An UNREADABLE record
         # is not evidence of anything, so it PRESERVES — a false positive here costs disk, never work.
+        # ⛔ AND ITS BLAST RADIUS IS EVERY CANDIDATE, NOT THE TREE THE RECORD NAMES — stated here
+        # because it is a real operating consequence and nothing else says it. Both this arm and the
+        # placement arm below return before any per-record comparison, so ONE unreadable / empty /
+        # relative / trailing-junk record answers PRESERVE for EVERY worktree the pass examines, all
+        # labelled `reason=pin-tree`, and the pass reclaims nothing box-wide. Measured: with an empty
+        # `$HOME/.harness-path`, an unrelated plain worktree moves from `remove … rule=3` (on main and
+        # on this branch with the record ABSENT) to `preserve … reason=pin-tree … names NOTHING`. That
+        # is the deliberate trade — the alternative is deleting the tree the box EXECUTES — and it is
+        # RECOVERABLE (a re-pin) and VISIBLE (the proof text says which arm fired, and
+        # `reap-ineffective` reds once free space drops under the floor). What it is NOT is
+        # self-describing: `reasons=pin-tree:N` attributes a box-wide stall to a class that is false for
+        # most of those N trees. A distinct token for these arms (e.g. `pin-record-unplaceable`) would
+        # make one cause read as one cause instead of N; it is left as a follow-up rather than widened
+        # into this change, because it moves an operator-facing vocabulary with no consumer to update.
         # The fourth test covers the shape `-e` cannot see: a record under a directory that exists but
         # cannot be searched (the TCC-protected / mixed-root case), where `[ -e ]` answers false for a
         # path that is really there.
@@ -3283,6 +3299,26 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         # the guard at `:3141`. A line number in a file this edit amends is a citation that cannot
         # survive its own repair.
         case "$rec_t" in
+            /?*[[:space:]]|/?*[[:cntrl:]])
+                # ⛔ AN ABSOLUTE PATH WITH TRAILING JUNK IS UNPLACEABLE TOO (#10114 cycle 5, P1 — IN
+                # SURFACE). The arms below test only the PREFIX (`/?*`), so content that STARTS `/` and
+                # ends in a space, tab or CR sails past them and is then compared VERBATIM, where it
+                # cannot match `$canon` — and `rec_c` cannot rescue it either, because `dirname` and
+                # `basename` of a path with trailing space give a DIFFERENT path. Reproduced: the
+                # ROOT form `<tree>` + one trailing space is `remove … rule=3`, while the DESCENDANT
+                # form is safe only by accident (the `"$canon"/*` arm absorbs trailing junk). The root
+                # form is PRODUCTION-WRITTEN: `install.sh` accepts an explicit `HARNESS=<pin root>`
+                # ("an operator may pin a deliberate checkout") and `pin_write_record`s it as the dir
+                # record — and that same box is the one the shape backstop cannot save, since a custom
+                # pin root need not be named `harness`.
+                # ⛔ NOT TRIMMED. A path may legitimately END in a space (G15l's spaced home is why this
+                # file never word-splits a record), so trimming would trade one wrong verdict for
+                # another. "Cannot place it as written" is a cannot-answer — and a probe that cannot
+                # answer is not a NEGATIVE answer. G15x drives it, `no-record-trailing-junk` deletes
+                # this arm and G15-M14 asserts the mutant reclaims.
+                PIN_VERDICT="pin-tree"
+                PIN_PROOF="pin record $rec names '$rec_t', which ends in whitespace or a control character — this probe will not TRIM a path and will not place it as written; 'cannot place it' is not 'names something else'; failed CLOSED"
+                return 0 ;;
             /?*) : ;;
             *)
                 PIN_VERDICT="pin-tree"

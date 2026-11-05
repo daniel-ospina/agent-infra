@@ -973,6 +973,16 @@ ANCHORS = {
         "            /?*) : ;;\n            *)\n                PIN_VERDICT=\"pin-tree\"",
         "            /?*) : ;;\n            *) continue\n                PIN_VERDICT=\"pin-tree\"",
     ),
+    # (4d) delete the TRAILING-JUNK arm alone. The arms below it test only the PREFIX, so an absolute
+    # path ENDING in a space sails past them and is compared verbatim, where it cannot match and `rec_c`
+    # cannot rescue it (dirname/basename of that spelling give a different path). The ROOT form is
+    # production-written (an operator `HARNESS=<pin root>` is what install.sh records), and the
+    # descendant form is safe only by the accident of the `"$canon"/*` arm absorbing trailing junk.
+    # Deleting the arm restores the removal; G15x and G15-M14 must red.
+    "no-record-trailing-junk": (
+        "            /?*[[:space:]]|/?*[[:cntrl:]])\n",
+        "            __mutant_record_trailing_junk_removed__)\n",
+    ),
     # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
     # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
     # inside the alternate word); `${home:+$home/.harness-path}` is TWO, so a HOME containing a space
@@ -5394,6 +5404,32 @@ assert_eq "$FIFO_RC" "0" \
 assert_eq "$(reason_token "$(row_for "$OUT" "$FIFOWT")")" "pin-tree" \
     "G15w a FIFO record PRESERVES — -r is true for it and -f is the disjunct that catches it"
 
+# G15x: an ABSOLUTE record that ENDS in whitespace — the ROOT FORM of the record, which is the only
+# form the `"$canon"/*` arm cannot rescue. `/?*` passes it, the verbatim comparison misses (the path has
+# a trailing space), and `rec_c` misses too (dirname/basename of `<tree> ` are a DIFFERENT path), so the
+# pre-fix answer is NEGATIVE and rule 3 removes the tree the box EXECUTES. The root form is
+# PRODUCTION-WRITTEN: install.sh accepts an explicit `HARNESS=<pin root>` ("an operator may pin a
+# deliberate checkout") and records it with `pin_write_record`. ⛔ NOT TRIMMED on the way in — a path may
+# legitimately END in a space (that is why G15l exists), so the record is refused, not corrected.
+# The tree path carries no `harness` component, so the shape backstop cannot mask it.
+ENV=pin_tree_wsprec
+REPO="$(mk_repo "$ENV")"
+WSWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WSWT" HEAD
+WSREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$WSWT" >"$WSREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSWT")")" "pin-tree" \
+    "G15x precondition: the ROOT form with no trailing junk PRESERVES, so the fixture can see the record"
+printf '%s\n' "$WSWT " >"$WSREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSWT")")" "pin-tree" \
+    "G15x a ROOT-form record with a TRAILING SPACE PRESERVES (unplaceable, not 'names something else')"
+assert_contains "$(row_for "$OUT" "$WSWT")" "will not TRIM" \
+    "G15x …and the row says the path was refused rather than trimmed, so a real trailing space is not silently lost"
+
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
 # every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
@@ -5484,6 +5520,17 @@ OUT="$(REAPER_OVERRIDE="$MUTP13" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES
     run_reaper pin_tree_emptyrec --dry-run --repo "$T/pin_tree_emptyrec/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_emptyrec/pins/5b1b09aad2c1")")" "reclaimable" \
     "G15-M13 MUTATION: without the placement arm an EMPTY record is skipped and the tree is WRONGLY rule-3 residue => G15v is discriminating"
+# G15-M14: delete the TRAILING-JUNK arm. The mutant answers like the pre-fix prefix-only test did — a
+# root-form record ending in a space is "absolute", so it is compared verbatim, misses, and the tree
+# falls to rule 3. That is the one IN-SURFACE shape cycle 5 reproduced, and this leg is what keeps it
+# from coming back.
+MUTP14="$T/mutant-no-record-trailing-junk.sh"
+mutate_reaper_anchored "$MUTP14" no-record-trailing-junk
+printf '%s\n' "$T/pin_tree_wsprec/pins/5b1b09aad2c1 " >"$T/pin_tree_wsprec/home/.harness-path"
+OUT="$(REAPER_OVERRIDE="$MUTP14" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wsprec --dry-run --repo "$T/pin_tree_wsprec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wsprec/pins/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M14 MUTATION: without the trailing-junk arm a ROOT-form record with a trailing space is compared verbatim, misses, and the tree is WRONGLY rule-3 residue => G15x is discriminating"
 
 # G15-M8: delete the FAIL-CLOSED arm for an unreadable record. The mutant answers like the pre-fix
 # `[ -r "$rec" ] || continue` did — an unreadable record reads as "no record" — so the tree the box
