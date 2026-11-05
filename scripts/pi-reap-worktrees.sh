@@ -3104,12 +3104,14 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # is exactly the box the shape backstop cannot save, because `HARNESS_PIN_DIR` is operator-settable
     # and a custom pin root need not be named `harness`.
     # ⛔ ITS BOUNDARY, DECLARED RATHER THAN IMPLIED — and MEASURED, because the first two drafts of this
-    # paragraph were both wrong in opposite directions. The arm is NORMALISED first — the same
-    # trailing-slash strip and `//` collapse `check-farm-drift.sh` needed and does above its `:201` —
-    # and then, UNLIKE it, REQUIRES an absolute path. `check-farm-drift.sh` keeps a RELATIVE spelling by
-    # rooting it at `.` (`./.pi/agent|.pi/agent) _pin_root="."` at `:201`) because `--pin-file` is
-    # "documented with no absoluteness requirement" (`:182-183`); here the same spelling would derive a
-    # CWD-RELATIVE candidate that is actually READ, so the departure is deliberate.
+    # paragraph were both wrong in opposite directions. The arm REQUIRES an absolute path BEFORE it
+    # normalises — a relative spelling is discarded before anything reads it, so it never reaches the
+    # strips below — and the normalisation is the same trailing-slash strip and `//` collapse
+    # `check-farm-drift.sh` needed and does above its `:201`. THAT requirement is the departure:
+    # `check-farm-drift.sh` keeps a RELATIVE spelling by rooting it at `.` (`./.pi/agent|.pi/agent)
+    # _pin_root="."` at `:201`) because `--pin-file` is "documented with no absoluteness requirement"
+    # (`:182-183`); but for this requirement the same spelling HERE would derive a CWD-RELATIVE
+    # candidate that is actually READ, so requiring absoluteness is the deliberate departure.
     # Without the collapse a `//`-spelled record strips to `<root>/.pi/agent/`, the `/.pi/agent`
     # strip below then does not fire, and the derived candidate becomes `<root>/.pi/agent//.harness-path`
     # — a path the PRODUCTION layout never writes (the dir record lives at `<root>/.harness-path`), so the
