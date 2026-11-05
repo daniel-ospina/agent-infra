@@ -1848,6 +1848,31 @@ else
     bad "r2 mutation could not be applied (the partial-verdict override moved) — that verdict is not checked any more"
 fi
 
+# ⛔ THE PRE-REMOVAL RE-PROBE HAD NO COVERAGE AT ALL (#3057 review, P2). It is the arm the owner's own
+# header calls the guard for "the one outcome this class must never produce" — a job that started in the
+# classification window killed with its checkout — and deleting it left the suite at exactly
+# 62 passed / 0 failed / 5 skipped: nothing reddened, so a future edit could remove it and ship green.
+# ⛔ THIS IS A STRUCTURAL GUARD, NOT A BEHAVIOURAL ONE, AND THE LIMIT IS STATED RATHER THAN IMPLIED: it
+# proves the re-probe call and its `written-during-the-pass` KEPT arm are still in the owner; it cannot
+# prove that arm is REACHABLE. A behavioural fixture is the real answer and it needs its own case — the
+# existing ones cannot carry it, because (b) asserts a reap and the re-probe's whole job is to REFUSE
+# one (an instrumented owner would redden (b) with CORRECT code, which is the wrong discrimination).
+# The behaviour was verified by hand when this was written: an entry touched between classification and
+# removal gives `KEPT … reason=toctou`, `reaped=0`, and the entry survives; with the re-probe deleted the
+# same fixture gives `REAPED … how=rm`, `reaped=1`. Recorded on PR #3057.
+# The count is 2 because the line appears at the CLASSIFICATION site (4 spaces, `:498`) and the RE-PROBE
+# (12 spaces); no mutation in this file touches either, so every owner variant this suite drives reports 2.
+if [ "$(grep -cF 'entry_written_since "$entry" "$FLOOR_REF"; verdict=$?' "$OWNER")" = 2 ]; then
+    ok "the PRE-REMOVAL re-probe is still present beside the classification call (a job that starts mid-pass is not killed with its checkout)"
+else
+    bad "the PRE-REMOVAL re-probe is GONE from the owner — an entry can now be deleted after a job started writing to it"
+fi
+if grep -qF 'KEPT   $entry reason=toctou (a writer appeared during the pass' "$OWNER"; then
+    ok "… and its written-during-the-pass arm still KEEPS the entry rather than falling through to the removal"
+else
+    bad "… but the re-probe's KEPT arm is gone: a written-during-the-pass answer now falls through to rm -rf"
+fi
+
 if apply_mutation "$OWNER" "$T/mut-s-instrumented/reap-runner-work.sh" "$MUT_S_INSTRUMENT"; then
     expect_pass "s an entry that VANISHES during the pass is gone=, never unmeasurable= (not an abstention)" \
         case_s "$REAPER" "$T/mut-s-instrumented/reap-runner-work.sh"

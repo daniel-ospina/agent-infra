@@ -2439,7 +2439,13 @@ reap_runner_work() {
     _rw_kept="$(kv_field "$_rw_line" kept)"
     _rw_failed="$(kv_field "$_rw_line" failed)"
     # The eighth field — the one the lift used to drop. Carried, never re-derived: the owner is the only
-    # component that can say which entries its walk could not read.
+    # component that can say which entries its walk could not MEASURE.
+    # ⛔ "COULD NOT READ" WAS THE OLD WORDING AND IT IS NOT WHAT THE TALLY COUNTS (#3057 review, P2). The
+    # previous revision of this sentence, and of the two note arms above, said `unmeasurable=` was
+    # "entries/roots it could not read" — but the tally has FOUR causes and only one of them is a read
+    # failure: an unreadable entry, an UNLISTABLE root, a watchdog timeout (124), and a root REPLACED under
+    # the pass. This is the third and last site; it is corrected with the other two rather than left to
+    # re-teach the cause the fix removed.
     _rw_unmeasurable="$(kv_field "$_rw_line" unmeasurable)"
     # ⛔ THE COERCION STAYS (the arithmetic below needs a number) BUT IT IS NO LONGER A MEASUREMENT.
     # `HAVE_RW_REAPED` records whether the owner ANSWERED, and every surface that STATES what was removed

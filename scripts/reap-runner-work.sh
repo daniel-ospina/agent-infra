@@ -761,6 +761,30 @@ if [ "$REFUSED_ROOTS" -gt 0 ]; then
     exit 3
 fi
 
+# ⛔ THE DEFAULT LIST IS INTERPOLATED FROM `$HOME`, AND WHITESPACE IN `$HOME` SILENTLY DESTROYS IT
+# (#3057 review, P2). This seam's glob list is SPACE-SEPARATED by contract — that is what makes `--glob`
+# repeatable and `REAP_RW_GLOBS` a single variable — so with a spaced `$HOME` the documented default
+# `$HOME/actions-runner*/_work` is split by line 687's `printf '%s\n' $GLOBS` into two fragments that
+# match nothing: `globs=2 roots=0 candidates=0 census=ok`, rc 0, while a dead checkout sits in place. That
+# is a MEASURED-LOOKING EMPTY POPULATION over a box the pass never looked at — the class is inert and
+# reads HEALTHY, which is the exact false-PASS shape `census=no-roots` exists to refuse, reached through
+# the file's own DEFAULT rather than through a hand-written seam (`--glob` with a no-match correctly
+# refuses at the block below, because that path sets EXPLICIT=1).
+# ⛔ THE FIX IS NOT TO START PARSING SPACED PATHS — a path containing a space is GENUINELY inexpressible
+# in this format, and the header says so. The duty is to stop CLAIMING a measurement: count the
+# unexpressible default as UNMEASURED, and the census rule at the bottom of this file does the rest —
+# `abstained` when nothing else was reached, `partial` when other roots were reached and this one was not
+# — never `ok`. rc stays 0, because an abstention is the pass saying it could not look and the ALARM is
+# the caller's judgement (the same decision `unmeasurable=` already carries).
+if [ "$EXPLICIT" = 0 ]; then
+    case "${HOME:-}" in
+        *[[:space:]]*)
+            UNMEASURABLE=$((UNMEASURABLE + 1))
+            log_line "UNMEASURED default reason=unexpressible (HOME='$HOME' contains whitespace, and this seam's glob list is SPACE-SEPARATED, so the documented default '$HOME/actions-runner*/_work' was split into fragments that match nothing — the HOME layout was NOT measured on this box; set REAP_RW_GLOBS to a path this format can express)"
+            ;;
+    esac
+fi
+
 if [ -z "${PENDING_ROOTS# }" ] && [ "$EXPLICIT" = 1 ]; then
     # ⛔ AN EXPLICIT LAYOUT THAT MATCHES NOTHING IS A REFUSAL, NOT A ZERO. When the operator (or the
     # rendered unit) SET the glob list, they asserted where this box's runners live; a sweep over a

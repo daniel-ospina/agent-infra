@@ -283,7 +283,7 @@ abstention rather than a measured zero (a PARTLY-unreadable population as `censu
 `verdict=ok`; an entry that vanishes mid-pass as `gone=`, never as doubt), and a cut-short dry sweep
 publishing no partial candidate
 count; its suite fails against the
-pre-change tree (24 passed / 38 failed, 2 skipped, measured at this head) and kills all 39 of its mutants
+pre-change tree (26 passed / 38 failed, 2 skipped, measured at this head) and kills all 39 of its mutants
 (`scripts/disk-reaper-runner-work.test.sh`).
 
 ### G9 — the stale `/tmp` sink (filed as **#3043**, deliberately NOT fixed with G8)
