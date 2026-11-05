@@ -527,30 +527,61 @@ skip_call_line() {  # <file> -> the line number of a call INSIDE the skip arm, o
     arm && /queue_order_from_pool "\$O"/{ print NR; exit }
   ' "$1"
 }
+wiring_pin_ok() {  # <file> -> rc 0 when the wiring holds on THAT file: a definition, exactly two call
+  # sites, every call AFTER the definition, and the skip arm's call REACHABLE inside its arm. ONE
+  # predicate, driven by both the shipped tree (7) and a reversed fixture (7b) — the lesson of 12-w0
+  # below: a fixture that compares the numbers ITSELF pins nothing but itself.
+  local f="$1" wdef wcalls wcall_n wskip wbad wc
+  wdef="$(grep -n '^queue_order_from_pool() {' "$f" | head -1 | cut -d: -f1)"
+  wcalls="$(grep -n 'queue_order_from_pool "\$O"' "$f" | cut -d: -f1 | tr '\n' ' ' | sed 's/ *$//')"
+  wcall_n="$(grep -c 'queue_order_from_pool "\$O"' "$f")"
+  wskip="$(skip_call_line "$f")"
+  wbad=""
+  for wc in $wcalls; do
+    [ -n "$wdef" ] && [ "$wc" -gt "$wdef" ] || wbad="$wbad $wc"
+  done
+  [ -n "$wdef" ] && [ "$wcall_n" -eq 2 ] && [ -z "$wbad" ] && [ -n "$wskip" ]
+}
 def_line="$(grep -n '^queue_order_from_pool() {' "$REFRESH" | head -1 | cut -d: -f1)"
 call_lines="$(grep -n 'queue_order_from_pool "\$O"' "$REFRESH" | cut -d: -f1 | tr '\n' ' ' | sed 's/ *$//')"
 call_n="$(grep -c 'queue_order_from_pool "\$O"' "$REFRESH")"
 skip_in_arm="$(skip_call_line "$REFRESH")"
-bad_calls=""
-for c in $call_lines; do
-  [ -n "$def_line" ] && [ "$c" -gt "$def_line" ] || bad_calls="$bad_calls $c"
-done
-if [ -n "$def_line" ] && [ "$call_n" -eq 2 ] && [ -z "$bad_calls" ] && [ -n "$skip_in_arm" ]; then rc=0
+if wiring_pin_ok "$REFRESH"; then rc=0
 else
   rc=1
-  echo "      def_line='$def_line' call_n='$call_n' calls='$call_lines' BEFORE-def:${bad_calls:-none} skip-arm-call='${skip_in_arm:-MISSING}'"
+  echo "      def_line='$def_line' call_n='$call_n' calls='$call_lines' skip-arm-call='${skip_in_arm:-MISSING}'"
   echo "      (want: a definition, exactly 2 call sites — the skip arm and the main pass — both AFTER it, and the skip arm's INSIDE the arm, before its exit 0)"
 fi
 ck "both call sites FOLLOW the definitions AND the skip arm's call is REACHABLE — inside the arm, before its exit 0 (def at line ${def_line:-?})" $rc
 
-# 7b) NON-VACUITY: a definition placed AFTER a call site must redden it — the defect this check was
-#     born for. Built here rather than read from git history so it does not depend on a commit.
+# 7b) NON-VACUITY: a definition placed AFTER the call sites must redden the SAME predicate check 7
+#     uses — the defect this check was born for. Built here rather than read from git history so it does
+#     not depend on a commit: the SHIPPED file with its one `queue_order_from_pool` definition block
+#     MOVED to the end. The move is the only change, so the pin can redden for no other reason (the
+#     call count is still 2 and the skip arm's call is still inside its arm) — that is what makes this a
+#     non-vacuity proof instead of a second copy of the numbers. An earlier version of this block built
+#     a tiny fixture and asserted `mcall -lt mdef` ON IT, which restated the fixture and could never
+#     redden check 7's loop (review P2, cycle 10).
 MOVED="$TMP/moved.sh"
-{ printf 'queue_order_from_pool "$O"\n'; cat "$FNS"; } > "$MOVED"
-mdef="$(grep -n '^queue_order_from_pool() {' "$MOVED" | head -1 | cut -d: -f1)"
-mcall="$(grep -n 'queue_order_from_pool "\$O"' "$MOVED" | head -1 | cut -d: -f1)"
-[ -n "$mdef" ] && [ -n "$mcall" ] && [ "$mcall" -lt "$mdef" ] && rc=0 || { rc=1; echo "      moved fixture: call=$mcall def=$mdef"; }
-ck "non-vacuity: the wiring pin reddens on a definition placed AFTER its call site" $rc
+mv_def_first="$(grep -n '^queue_order_from_pool() {' "$REFRESH" | head -1 | cut -d: -f1)"
+mv_def_last=""
+[ -n "$mv_def_first" ] && mv_def_last="$(awk -v s="$mv_def_first" 'NR >= s && /^}[[:space:]]*$/{ print NR; exit }' "$REFRESH")"
+if [ -n "$mv_def_first" ] && [ -n "$mv_def_last" ]; then
+  awk -v s="$mv_def_first" -v e="$mv_def_last" 'NR < s || NR > e' "$REFRESH" > "$MOVED"
+  awk -v s="$mv_def_first" -v e="$mv_def_last" 'NR >= s && NR <= e' "$REFRESH" >> "$MOVED"
+else
+  : > "$MOVED"
+fi
+moved_intact=0
+if [ "$(grep -c '^queue_order_from_pool() {' "$MOVED" 2>/dev/null)" -eq 1 ] \
+   && [ "$(grep -c 'queue_order_from_pool "\$O"' "$MOVED" 2>/dev/null)" -eq 2 ] \
+   && [ -n "$(skip_call_line "$MOVED")" ]; then moved_intact=1; fi
+if [ "$moved_intact" -eq 1 ] && ! wiring_pin_ok "$MOVED"; then rc=0
+else
+  rc=1
+  echo "      moved fixture did not discriminate: intact=$moved_intact (want 1) pin_says_ok=$(wiring_pin_ok "$MOVED" && echo yes || echo no) (want no) def moved to line ${mv_def_last:-?} of $(wc -l < "$MOVED" 2>/dev/null || echo '?')"
+fi
+ck "non-vacuity: the SHIPPED wiring pin reddens when the definition is MOVED to the end of the file, behind both call sites" $rc
 
 # 7c) NON-VACUITY of the REACHABILITY half: the same arm shape with the call moved below its `exit 0`
 #     must produce NO line from skip_call_line — otherwise the containment pin is a phrase, and this is
