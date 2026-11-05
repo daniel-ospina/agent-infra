@@ -531,7 +531,12 @@ def leg_lane_census(mod):
         "CENSUS: pi running vs a roster with no records raises the mismatch",
         "CENSUS: the mismatch names BOTH populations — a bare 0 is the defect",
         "CENSUS: an UNREADABLE process table is NAMED, never rendered as agreement",
-        "CENSUS: a genuinely empty process table raises nothing",
+        # ⛔ "EMPTY TABLE" MEANS `None` IN THIS FILE, AND THIS LABEL SAID IT MEANT `0` (review
+        # cycle 15, finding 1). `pi_count == 0` is a MEASURED population — a read table with no pi
+        # row — while an EMPTY table is `None` (see `pi_process_count` and the PRODUCER label 100
+        # lines below, which uses "empty table" for `None`). The two labels cannot both be right, and
+        # this one was: silence here is the `pi_count <= 0` arm, never the empty-table case.
+        "CENSUS: a MEASURED-EMPTY pi population (a read table with no pi row) raises nothing; an EMPTY table is None, rejected at the producer",
         "CENSUS: a live, attributed lane reconciles the populations",
         "CENSUS: an all-dead roster on a box with NO pi running is an idle fleet, not a stale roster",
         "CENSUS: an all-dead roster while pi RUNS is a STALE ROSTER — the roster names none of the population",
@@ -791,7 +796,12 @@ def leg_lane_census(mod):
     check("LANE CENSUS MISMATCH" in out,
           "CENSUS: main() prints the mismatch over a readable store holding none of the roster")
     check("no suspects" not in out,
-          "CENSUS: main() never prints a clean scan over 0 measured lanes")
+          # ⛔ SCOPED TO THE POPULATION (review cycle 15, finding 1). Unscoped, this label claimed a
+          # global invariant that `main()` deliberately does NOT hold: over an INCONCLUSIVE roster
+          # with a MEASURED-EMPTY pi population it prints `✅ no suspects` and exits 0 on purpose —
+          # nothing is running, so a roster that names nobody cannot mislead. That arm is pinned
+          # end-to-end just below; the claim that holds in THIS arm is the one with a population.
+          "CENSUS: main() never prints a clean scan over 0 measured lanes while pi processes run")
     # ⛔ BOTH ARE CHECKED, AND BOTH DISCRIMINATE (review cycle 5, finding 1). An earlier comment
     # here claimed the exit code could not fail because this box carries a scheduled-maintainer
     # alarm — false INSIDE these arms: `_drive` stubs `reaper_section` and `harness_apply_section`
@@ -815,6 +825,17 @@ def leg_lane_census(mod):
           "CENSUS: an unreadable process table is never rendered as a clean scan")
     check(rc_abs == 1,
           "CENSUS: an unreconcilable census exits non-zero, so a scheduler can see it")
+
+    # ⛔ THE DELIBERATE `pi_count <= 0` ARM, PINNED END-TO-END (review cycle 15, finding 1). An
+    # INCONCLUSIVE roster over a MEASURED-EMPTY population is silent on purpose: nothing is running,
+    # so a roster that names nobody cannot mislead anybody. Stating that only in a PREDICATE label
+    # left it as an un-pinned claim about `main()`; this drives the real entry point over the same
+    # readable store and asserts the CLEAN result is the intended one rather than an accident.
+    rc0, out0 = _drive(lambda: 0)
+    check("LANE CENSUS" not in out0 and not rc0,
+          "CENSUS: a MEASURED-EMPTY pi population is silent, whatever the roster")
+    check("no suspects" in out0,
+          "CENSUS: …and a clean scan there is the DELIBERATE arm, not a missed alarm")
 
     # ── end-to-end: an ALL-DEAD roster must not read as a clean scan ────────────────
     # ⛔ THE PREDICATE ARMS ABOVE WERE ALL GREEN THROUGH BOTH OF CYCLES 7 AND 8's P1s, because the
