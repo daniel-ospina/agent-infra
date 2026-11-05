@@ -248,6 +248,28 @@ eqv "${KG_GATE:-<none>}" "key" "1d3 …and field 3 names the KEY gate (an unname
 hasnt "$(lastline)" "[venv-reap]" "1e the REFUSAL log does NOT end on a cleanup/reap line (the shape mistaken for a working lane)"
 hasnt "$(lastline)" "[wip]" "1f …nor on the wip-rescue line"
 
+# ═══ 1f. A STORE VERDICT IS NOT A MISSING VARIABLE, AND THE TOKEN SAYS SO (round 22, P2, measured) ═══
+# `lane.sh` writes `key-gate:${KEY_GATE_REASON:-credential-missing}:…`, so a `store-invalid` refusal that never
+# sets the reason published `reason=key-gate:credential-missing:<VAR>:<MODEL>` — the exact misattribution this
+# file's own header forbids — and its stand-down sentence told the operator to export the variable the refusal
+# had just measured as NOT the problem (`export` does not rescue an entry pi cannot use: measured, pi answers
+# `Provider is not configured` with the key exported).
+mk_arm storeinvalid; WT="$ARMWT"
+printf '{"deepseek":{"key":"sk_legacy_no_type"}}\n' > "$ARMDIR/home/.pi/agent/auth.json"
+PI_MARK="$ARMDIR/pi-ran"; export PI_MARK
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi 2>/dev/null || true
+drive "$WT"
+check_terminal "1f" refused "key-gate:store-invalid" 82
+eqv "$(printf '%s' "$(lastline | sed -n 's/.*reason=\(key-gate:[^ ]*\).*/\1/p')" | awk -F: '{print $2}')" \
+    "store-invalid" \
+    "1f2 the token's REASON is store-invalid, not the credential-missing default — a scan counts the real cause"
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "put the credential in the environment lanes run with" \
+    "1f3 …and the stand-down sentence does NOT prescribe exporting a variable the refusal already ruled out"
+has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
+    "1f4 …it names the FILE the operator must repair or delete"
+[ ! -s "$PI_MARK" ]; ck "1f5 pi was never spawned for a store verdict" $?
+
 # ── 1y: THE ESCAPE IS ARGV, AND THE ENVIRONMENT ROUTE IS RETIRED (review, P1, measured) ─────────
 # ⛔ THE HEAD COMMIT'S WHOLE CLAIM, WHICH HAD NO ASSERTION (review, P1: deleting the guard left all three
 # suites green). The escape used to be `LANE_KEY_GATE=0` read from the environment. Fencing it against the
