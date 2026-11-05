@@ -448,9 +448,11 @@ killed 37 processes *and the tmux server*, losing every lane. The gate would hav
 
 - Model form is split: a launch with no `--provider` may use `provider/model` (`deepseek/deepseek-v4-flash`), while the
   harness passes `--provider` and a bare `--model` (`deepseek-flash`) as two separate halves — pass BOTH, because the
-  gate now asserts nothing about a prefixed id when nothing names a provider: pi infers such a prefix only when it names a
-  provider that HAS models and otherwise matches the whole string as a model id across every provider
-  (`model-resolver.js:322-345,388-420`), so `--model deepseek/x` can run under a DIFFERENT provider than the slash spells.
+  gate asserts nothing about a model NAMED on the invocation when nothing names a provider (prefixed or not): pi infers a
+  prefix only when it names a provider that HAS models, otherwise it matches the whole string as a model id across every
+  provider (`model-resolver.js:322-345,388-420`), so `--model deepseek/x` can run under a DIFFERENT provider than the slash
+  spells, and a bare id can be ambiguous. A model INHERITED from `$PI_LANE_MODEL` is the exception the lane path relies on:
+  that is asserted under `deepseek`, because `run_agent` passes exactly that as `--provider`.
 - ⛔ **`keys.env` IS NOT GUARANTEED TO CONTAIN AN API KEY — AND ON A CELL IT USUALLY DOES NOT.** Measured
   2026-10-19: cell-1's file exported only `REPO CYC MAX_FIX MIN_SWAP_FREE PATH …` and **no provider key at all**; measured
   again 2026-11-04 on cell-5 (agent-infra#3443): `/home/cmux/keys.env` held **`GH_TOKEN` and nothing else**. The lanes that
