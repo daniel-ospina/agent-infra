@@ -1223,18 +1223,27 @@ def parse_runner_line(text: str):
     if not text:
         return "", None
     _bound_verdict_re()  # ensures the compiled globals exist
+    # ⛔ A `[timeout] agent` LINE WITH NO `pid=` TOKEN IS NOT A LAUNCHER REPORT. The
+    # watchdog writes PROSE with the same prefix — the mechanism-3 line this axis's own
+    # doc quotes: `[timeout] agent completed but did not exit within 15s — killing`. Taking
+    # the LAST marker unconditionally made that prose the witness: it has no `pid=`, so it
+    # became `"?"` (asserting a pid token existed) and it SHADOWED an earlier readable
+    # launcher line, downgrading a corroborated `finished` to `unknown`. Only a marker
+    # line that carries a `pid=` is a launcher report; `"?"` stays reserved for a `pid=`
+    # that is PRESENT and unusable (`0x1f`, empty value, non-ASCII, over-long).
     last = None
     for m in _RUNNER_MARKER_RE.finditer(text):
-        last = m
+        line_end = text.find("\n", m.start())
+        cand = text[m.start(): line_end if line_end >= 0 else len(text)]
+        if _RUNNER_PID_TOKEN_RE.search(cand) is None:
+            continue                      # prose, not a launcher report line
+        last = cand
     if last is None:
         return "", None
-    line_end = text.find("\n", last.start())
-    line = text[last.start(): line_end if line_end >= 0 else len(text)]
-    pm = _RUNNER_PID_TOKEN_RE.search(line)
-    pid_tok = pm.group(1) if pm else ""
+    pid_tok = _RUNNER_PID_TOKEN_RE.search(last).group(1)
     pid = (pid_tok if (pid_tok.isascii() and pid_tok.isdigit()
                        and len(pid_tok) <= 10) else "?")
-    tok = _RUNNER_RC_TOKEN_RE.search(line)
+    tok = _RUNNER_RC_TOKEN_RE.search(last)
     return pid, (tok.group(1) if tok else None)
 
 def parse_bound_line(text: str):

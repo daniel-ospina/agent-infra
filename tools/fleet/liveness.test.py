@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with eighty-six paired mutations: every mutation re-
+Fifty-one tests with eighty-seven paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (86)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (87)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1817,6 +1817,29 @@ def t39():
         check(liv.subtree_cpu_cs(4242, ps_bin=shim) is None, "an absent pid is not 0 CPU")
         check(liv.subtree_cpu_cs(100, ps_bin=os.path.join(d, "nope")) is None,
               "an unreadable ps is an abstention")
+        # ⛔ `_parent_of` MUST NOT RAISE EITHER. It reaches its `ps` fallback when `/proc`
+        # has no row (an exited pid), and it is called from the BINDING path — i.e. exactly
+        # when a terminal state is being decided. `.isdigit()` admits a 5000-digit run and
+        # `int()` then raises, where this helper's contract is `None`.
+        dead_pid = 2 ** 31 - 1          # never live, so /proc always misses
+        for junk in ("9" * 5000, "\u00b2", "abc"):
+            with open(table, "w", encoding="utf-8") as fh:
+                fh.write(junk + "\n")
+            with open(shim, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\ncat %s\n" % table)
+            os.chmod(shim, 0o755)
+            old_ps = os.environ.get("PS_BIN")
+            os.environ["PS_BIN"] = shim
+            try:
+                got_parent = liv._parent_of(dead_pid)
+            finally:
+                if old_ps is None:
+                    os.environ.pop("PS_BIN", None)
+                else:
+                    os.environ["PS_BIN"] = old_ps
+            check(got_parent is None,
+                  "an unreadable ppid row abstains, never raises: %r -> %r"
+                  % (junk[:12], got_parent))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2529,6 +2552,27 @@ def t51():
         check("runner-pid-unreadable" in (v.detail or ""),
               "…and the detail says a line EXISTS with an unusable pid; got %r"
               % (v.detail,))
+        # ⛔ THE WATCHDOG'S PROSE CARRIES THE SAME PREFIX. Mechanism 3 in this axis's own
+        # doc is `[timeout] agent completed but did not exit within 15s — killing`. It has
+        # NO `pid=`, so it is not a launcher report: treating it as one made it the LAST
+        # marker, asserting a pid token existed AND shadowing the earlier readable line —
+        # downgrading a corroborated `finished` to `unknown`.
+        prose = "[timeout] agent completed but did not exit within 15s \u2014 killing"
+        check(liv.parse_runner_line(prose) == ("", None),
+              "the watchdog PROSE is not a launcher report; got %r"
+              % (liv.parse_runner_line(prose),))
+        check(liv.parse_runner_line("[timeout] agent wall_limit=1s rc=0") == ("", None),
+              "a pid-less line is ABSENT, not present-but-unusable")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                     "elapsed=61s log=%s\n" % (dead, log))
+            fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=0\n" % dead)
+            fh.write(prose + "\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "finished",
+              "trailing PROSE must not shadow the readable witness; got %s/%s"
+              % (v.state, v.reason))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3022,22 +3066,6 @@ MUTATIONS = [
     ),
     Mutation(
         "T48", "module",
-        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
-        '                return tok if (tok.isascii() and tok.isdigit()) else "?"',
-        "the digit cap is gone, so an out-of-range row pid reaches int() BEFORE `_bind_verdict` "
-        "decides and raises ValueError (the 4300-digit conversion limit), taking the whole "
-        "census run down after printing only the rows before it",
-    ),
-    Mutation(
-        "T48", "module",
-        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
-        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else ""',
-        "a col-11 pid that is PRESENT but unusable is collapsed into \"absent\", so the census "
-        "takes the ADOPT arm and publishes a verdict whose binding was never checked — the "
-        "fail-open the col-11 rule exists to close",
-    ),
-    Mutation(
-        "T48", "module",
         '                    note = "bound-verdict-without-pid source=census"',
         '                    note = ""',
         "the census adopts an unbound 10-column row SILENTLY, so the fifth rule of the "
@@ -3196,6 +3224,21 @@ MUTATIONS = [
         '        if not (d.isascii() and d.isdigit()):',
         "the DAYS field is unbounded again, so a long digit run raises where the contract "
         "is `None`",
+    ),
+    Mutation(
+        "T39", "module",
+        '    return (int(out) if (out.isascii() and out.isdigit() and len(out) <= 10) else None)',
+        '    return (int(out) if (out.isascii() and out.isdigit()) else None)',
+        "`_parent_of`'s digit bound is dropped again, so an unreadable ppid row raises "
+        "ValueError on the BINDING path, where the contract is `None`",
+    ),
+    Mutation(
+        "T51", "module",
+        '        if _RUNNER_PID_TOKEN_RE.search(cand) is None:',
+        '        if False:',
+        "a marker line with NO `pid=` (the mechanism-3 watchdog PROSE) is taken as the "
+        "launcher report again: it asserts a pid token existed AND shadows an earlier "
+        "readable witness, downgrading a corroborated `finished` to `unknown`",
     ),
 ]
 
