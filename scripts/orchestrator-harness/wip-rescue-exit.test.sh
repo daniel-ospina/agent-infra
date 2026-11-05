@@ -2004,6 +2004,79 @@ ck "N44e …nothing was pushed anywhere by that refusal (canon's trunk still ${n
 case "$(cat "$TMP/n44.next" 2>/dev/null)" in MANUAL*"do NOT reap"*) rcn44f=0 ;; *) rcn44f=1 ;; esac
 ck "N44f …and next= is MANUAL / do-not-reap, so a reclaimer is told to refuse that worktree [$(cut -c1-60 "$TMP/n44.next" 2>/dev/null)]" $rcn44f
 git -C "$n44/wk" worktree remove --force "$n44/wt" 2>/dev/null
+# ⛔ N44g — RESOLVING THE PUSH URL IS NOT ENOUGH, BECAUSE THE READ IS A FETCH (review cycle 18, P0 —
+# REPRODUCED). `git ls-remote <url>` re-applies `url.<base>.insteadOf` ON TOP of the resolved push url; the
+# push does not. So with `url.B.pushInsteadOf = A` and `url.C.insteadOf = B`, get-url answers B, the push
+# writes B, and the READ answers C — the fix above went green on N44a/N44b and was still one rewrite hop
+# short. THIS ARM FAILS IF THE PROOF GUARD IS REMOVED: without it B's landing branch moves.
+n44g="$TMP/n44g"; mkdir -p "$n44g"
+git init -q --bare "$n44g/A.git" && git init -q --bare "$n44g/B.git" && git init -q --bare "$n44g/C.git"
+git -C "$n44g/A.git" symbolic-ref HEAD refs/heads/main
+git -C "$n44g/B.git" symbolic-ref HEAD refs/heads/trunk
+git -C "$n44g/C.git" symbolic-ref HEAD refs/heads/main
+git init -q "$n44g/seed" && git -C "$n44g/seed" commit -q --allow-empty -m base && git -C "$n44g/seed" branch -M main
+for r in A B C; do git -C "$n44g/seed" push -q "$n44g/$r.git" main:main; done
+git -C "$n44g/seed" checkout -q -b trunk && git -C "$n44g/seed" commit -q --allow-empty -m t2
+# trunk must be reachable through A too, so the WORKTREE can be created the ordinary way; A is not a
+# rewrite target, so this fetch reaches the repository it names.
+git -C "$n44g/seed" push -q "$n44g/A.git" trunk:trunk
+git -C "$n44g/seed" push -q "$n44g/B.git" trunk:trunk && git -C "$n44g/seed" push -q "$n44g/C.git" trunk:trunk
+rm -rf "$n44g/seed"
+git clone -q "$n44g/A.git" "$n44g/wk" 2>/dev/null
+git -C "$n44g/wk" config "url.$n44g/B.git.pushInsteadOf" "$n44g/A.git"
+git -C "$n44g/wk" config "url.$n44g/C.git.insteadOf" "$n44g/B.git"
+git -C "$n44g/wk" fetch -q origin trunk:trunk
+git -C "$n44g/wk" worktree add -q "$n44g/wt" trunk
+git -C "$n44g/wt" commit -q --allow-empty -m "a lane's unpushed work"
+n44g_target="$(git -C "$n44g/wt" remote get-url --push origin)"
+n44g_proof="$(git -C "$n44g/wt" ls-remote --get-url "$n44g_target")"
+n44g_before="$(git -C "$n44g/B.git" rev-parse refs/heads/trunk 2>/dev/null)"
+ck "N44g0 …the fixture really is chained (push target ${n44g_target##*/}, fetch expansion ${n44g_proof##*/} — they must DIFFER, or this arm cannot see the class)" "$([ "$n44g_target" != "$n44g_proof" ] && echo 0 || echo 1)"
+: > "$O/logs/chain.log"
+O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=trunk
+  lane_end_push "chain" "$3" "$2" trunk 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+  lane_end_next > "$4"
+' _ "$GATE" "$n44g/wt" "$O/logs/chain.log" "$TMP/n44g.next" > "$TMP/n44g.out" 2>&1
+grep -qx 'push=refused-pushurl-divergent' "$TMP/n44g.out"; rcn44g=$?
+ck "N44g an insteadOf rewrite that separates the READ from the WRITE is refused, not read anyway ($(cat "$TMP/n44g.out" 2>/dev/null | tr -d '\n'))" $rcn44g
+grep -q 'fetch-side expansion' "$O/logs/chain.log"; rcn44g2=$?
+ck "N44g2 …and the log names BOTH endpoints, so the operator can see what separates them" $rcn44g2
+[ "$n44g_before" = "$(git -C "$n44g/B.git" rev-parse refs/heads/trunk 2>/dev/null)" ]; rcn44g3=$?
+ck "N44g3 …and the push target's LANDING BRANCH did not move (${n44g_before:0:8}) — the assertion that goes RED when the proof guard is removed" $rcn44g3
+case "$(cat "$TMP/n44g.next" 2>/dev/null)" in MANUAL*"do NOT reap"*) rcn44g4=0 ;; *) rcn44g4=1 ;; esac
+ck "N44g4 …and next= refuses the reclaim" $rcn44g4
+git -C "$n44g/wk" worktree remove --force "$n44g/wt" 2>/dev/null
+# ⛔ N44h — A MISSING `origin` IS NOT A DIVERGENCE (review cycle 18, P2 — REPRODUCED). It recorded
+# `refused-pushurl-divergent (0 found: )` — an empty list in a durable artifact — and blamed a pushurl/
+# pushInsteadOf divergence the repo does not have. A resolution that FAILED is its own cause with its own
+# remedy.
+n44h="$TMP/n44h"; mkdir -p "$n44h"
+git init -q --bare "$n44h/only.git" && git -C "$n44h/only.git" symbolic-ref HEAD refs/heads/main
+git init -q "$n44h/seed" && git -C "$n44h/seed" commit -q --allow-empty -m base && git -C "$n44h/seed" push -q "$n44h/only.git" HEAD:main && rm -rf "$n44h/seed"
+git clone -q "$n44h/only.git" "$n44h/wk" 2>/dev/null
+git -C "$n44h/wk" worktree add -q "$n44h/wt" -b lone 2>/dev/null
+git -C "$n44h/wt" commit -q --allow-empty -m "a lane's unpushed work"
+git -C "$n44h/wt" remote remove origin 2>/dev/null
+: > "$O/logs/noorigin.log"
+O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=lone
+  lane_end_push "noorigin" "$3" "$2" lone 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+  lane_end_next > "$4"
+' _ "$GATE" "$n44h/wt" "$O/logs/noorigin.log" "$TMP/n44h.next" > "$TMP/n44h.out" 2>&1
+grep -qx 'push=refused-pushurl-unresolved' "$TMP/n44h.out"; rcn44h=$?
+ck "N44h a checkout with NO origin records refused-pushurl-unresolved, not 'divergent' over an empty list ($(cat "$TMP/n44h.out" 2>/dev/null | tr -d '\n'))" $rcn44h
+grep -q 'could NOT BE RESOLVED' "$O/logs/noorigin.log"; rcn44h2=$?
+ck "N44h2 …and the log names the read that failed as the cause, so the remedy is not a config change that does not apply" $rcn44h2
+case "$(cat "$TMP/n44h.next" 2>/dev/null)" in MANUAL*"do NOT reap"*) rcn44h3=0 ;; *) rcn44h3=1 ;; esac
+ck "N44h3 …and next= still refuses the reclaim (fail-closed either way)" $rcn44h3
+git -C "$n44h/wk" worktree remove --force "$n44h/wt" 2>/dev/null
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
