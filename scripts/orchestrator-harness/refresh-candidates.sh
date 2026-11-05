@@ -195,6 +195,24 @@ O="${O:-$HOME/orchestrator}"
 #: Container-title prefixes that are not units of work. Keep this the ONLY copy of the pattern.
 QUEUE_CONTAINER_TITLE_RE='^(epic|lane[ ]|OWNER DECISION|decision|decide:|design[(]|coord:|measure[(]|analysis[(]|investigation|tracking:|lane-liveness escalation)'
 #: The declaration a standing constraint carries, so it is excluded by a property and not a word.
+#: ⛔ `owner-decision` IS DELIBERATELY **NOT** IN THIS ARM, AND THE MEASUREMENT IS WHY (#10951 review).
+#: A fresh-context reviewer raised the reuse this issue itself offered ("or reuse the existing
+#: `owner-answered`/`held` label"), and it looked like a pure win: `standing-constraint` did not exist
+#: in `daniel-ospina/agent-infra` when this ships (HTTP 404 — the label has since been created, so the
+#: mechanism is no longer a rollout gap), while `owner-decision` exists in BOTH repos and its own
+#: description reads "not for the lane or orchestrator". Measured against the live queue, though, the
+#: alternation `^(standing-constraint|owner-decision)$` excludes EIGHT further rows — and THREE of them
+#: are `P0-blocker` with ordinary work titles: `tortoise#4282` (Implement the canonical MCP and SDK
+#: surface), `tortoise#9548` (ops(record): arm the record in the hosted deployment), `tortoise#9567`
+#: (test(record): capstone) — plus P1 `tortoise#8488`/`#4051`/`#8861`/`#5212` and `agent-infra#1173`.
+#: This fragment is applied to the EMERGENCY listing too, so those rows would leave the class
+#: `floor_emergency` consults — i.e. a real P0 would be neither dispatched NOR able to outrank the
+#: product floor. That is the fail-open direction the floor exists to prevent, and it hides work: the
+#: exact failure mode #10951 was filed against, inverted. `standing-constraint` alone excludes exactly
+#: the row the issue measured (`tortoise#10175`) and costs no P0, so only that one is honoured here.
+#: Whether "a P0 the owner has reserved for a decision" may be dropped from the dispatchable set — and,
+#: if so, whether it must still outrank the floor — is a DECISION, not a filter tweak. Filed as a
+#: follow-up with the measurement above rather than taken unilaterally in a queue patch.
 QUEUE_CONTAINER_LABEL='standing-constraint'
 #: The `select` fragment every pool/emergency query applies before it projects a row.
 QUEUE_UNIT_SELECT="select((.assignees|length)==0)"\
@@ -2455,7 +2473,9 @@ rest_list() {
     page=$((page + 1))
   done
   # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a labelled PR becomes a DISPATCH CANDIDATE: the tier
-  # programs below only require "no assignee and a non-epic title", so it would be queued as
+  # programs below require exactly `$QUEUE_UNIT_SELECT` (unassigned, not a container title, not
+  # excluded by a declaration label — see its definition at the top of this file), so it would be
+  # queued as
   # `0 <PR#>`, land in `dispatched.txt`, and get a lane spawned for a PR number the pass never
   # adjudicated as an issue. The REAPER is exposed to the same rows for an unrelated reason —
   # `has_pr` (below) keys on PR head-BRANCH names, not on numbers, so a PR row whose branch does not
@@ -3532,7 +3552,12 @@ fi
 
 touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 
-# pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus epics/owner-decisions
+# pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus whatever `$QUEUE_UNIT_SELECT`
+# excludes — container TITLE prefixes (`^QUEUE_CONTAINER_TITLE_RE`), issues carrying a DECLARATION
+# label (`^QUEUE_CONTAINER_LABEL`), and anything already assigned. That fragment is the ONE
+# definition; all three tiers below and the emergency listing interpolate it rather than restating
+# the rule in their own words (this header used to say "minus epics/owner-decisions", which stopped
+# being the rule when the filter was unified — #10951).
 #
 # ⛔ SEVERITY FIRST, AGE SECOND. Each tier emits "<tier> <number>" and the sort keys on the tier
 # before the number. A bare `sort -n` over the numbers ALONE ordered by ISSUE NUMBER — i.e. oldest
@@ -5383,6 +5408,25 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   fi
   # LOCAL, not a top-level constant: product-floor.test.sh extracts THIS FUNCTION BODY alone and drives it.
   local EQ_LIMIT=100 EQ_PAGES=1 eq_need=0 eq_ok=0 eq_n=""
+  # ⛔ THE PREDICATE IS READ HERE, LOCALLY, AND ITS ABSENCE IS A NAMED DEGRADE — NOT A CRASH AND NOT A
+  # FALSE DIAGNOSIS. This is the SAME trap the `EQ_LIMIT` line above documents, and it bit for real:
+  # `QUEUE_UNIT_SELECT` is defined at top level and interpolated HERE, but `product-floor.test.sh`
+  # extracts `weq_degrade` + this function ALONE and drives them. Under the script's own `set -u` the
+  # extracted copy had it UNSET, so every P13(iii-b)/(iii-c) expectation came back `('')` — measured
+  # at `bc9a9227`: `208 passed, 5 failed` against `origin/main`'s `213 passed, 0 failed`. With `-u`
+  # off it is wrong DIFFERENTLY: the program degrades to `.[]||.number`, a jq COMPILE error (rc 3), so
+  # `rest_list` returns non-zero and the writer records `UNKNOWN-LISTING-FAILED` — a false diagnosis
+  # that blames the LISTING for a missing predicate. Both are fail-open-in-a-costume: the first
+  # stands the floor down silently, the second misnames the cause. An absent predicate is its own
+  # named UNKNOWN, which `floor_emergency` reads as `p0-unknown(...)` and the floor STANDS DOWN for —
+  # the same direction every other degraded arm takes.
+  local unit_select="${QUEUE_UNIT_SELECT:-}"
+  if [ -z "$unit_select" ]; then
+    weq_degrade "$o" \
+      "$(printf 'UNKNOWN-PREDICATE-MISSING the population predicate (QUEUE_UNIT_SELECT) is not defined in this copy of the refresh, so the P0-blocker listing could not be filtered into units of work')" \
+      "$(printf '[refresh] WARN: QUEUE_UNIT_SELECT is undefined here, so the emergency class is UNKNOWN and the product floor STANDS DOWN this pass. An UNFILTERED listing would rank a container — an epic, a decision, a standing constraint — as a P0 and stand the floor down for work that is not work.')"
+    return 0
+  fi
   if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
     case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
       eq_need=$(( CORE_RESERVE + EQ_PAGES ))
@@ -5398,7 +5442,7 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
   # does — so it must not stand the floor down either.
   if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
-      --jq ".[]|${QUEUE_UNIT_SELECT}|.number" \
+      --jq ".[]|${unit_select}|.number" \
       > "$o/.emergency-issues" 2>/dev/null; then
     if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then
       weq_degrade "$o" \

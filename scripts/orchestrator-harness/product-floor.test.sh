@@ -1405,7 +1405,42 @@ ck "P13(iii) [RED→GREEN] with no product candidate the floor had nothing to ap
 # refresh and driven here (the same `rest_list` seam P7 uses), so the class the floor consults is proven
 # to come from a LISTING and not from an assumption.
 WEF="$T/weqfns.sh"
-{ sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$WEF"
+# ⛔ THE PREDICATE TRAVELS WITH THE WRITER (#10951, delivery-lane review P1). The two `sed` ranges above
+# extract the FUNCTIONS; the writer INTERPOLATES `$QUEUE_UNIT_SELECT`, which used to be a TOP-LEVEL
+# constant and therefore an UNSET VARIABLE inside the extracted copy — under the shipped `set -u` every
+# expectation came back `('')` (measured at `bc9a9227`: 208 passed, 5 failed against the base's
+# 213/0), and with `-u` off the jq program degrades to a COMPILE error that the writer reports as
+# `UNKNOWN-LISTING-FAILED`, blaming the listing for a missing predicate. So the definition block, not
+# just the function bodies, is extracted — from the SAME live script, so the graded predicate is the
+# shipped one for ever after.
+# ⛔ AND THE EXTRACTION IS REFUSED, NOT MERELY "BOUNDED" — `awk exit` STOPS READING, IT DOES NOT
+# UNPRINT (second fresh-context review, measured). With the terminator renamed (a legitimate refactor)
+# the awk below emits `QUEUE_CONTAINER_TITLE_RE=` → EOF: 5,363 lines, carrying a SECOND `rest_list()`
+# definition that would overwrite the seam stub this writer must be graded through, and — once
+# `cat`'d into `$WEF` and sourced — running the whole refresh pass in-process (real `gh` reads; it
+# left `.open_iss`, `.pr_brs` and `state/refresh-last` in the fixture home). The first cut checked
+# only "three `QUEUE_` assignments found", which a whole-script dump satisfies. So the STATUS is
+# captured and the block is used only when every bound holds; otherwise `$WEF` carries no predicate
+# and the arms below RED (the writer then reports `UNKNOWN-PREDICATE-MISSING`).
+PRED="$T/weqpred.sh"
+awk '\
+  /^QUEUE_CONTAINER_TITLE_RE=/ { p = 1 }\
+  p { print }\
+  p && index($0, "[.labels[]?.name]") { found = 1; exit }\
+  END { exit (found ? 0 : 3) }\
+' "$REFRESH" > "$PRED" 2>/dev/null
+PRED_RC=$?
+PRED_LINES="$(wc -l < "$PRED" 2>/dev/null | tr -d ' ' || :)"
+case "${PRED_LINES:-}" in ''|*[!0-9]*) PRED_LINES=0 ;; esac
+PRED_OK=0
+[ "$PRED_RC" = "0" ] \
+  && [ "$PRED_LINES" -ge 4 ] && [ "$PRED_LINES" -le 60 ] \
+  && [ "$(grep -c '^QUEUE_[A-Z_]*=' "$PRED")" = "3" ] \
+  && ! grep -q '^rest_list() {' "$PRED" \
+  && PRED_OK=1
+ck "P13(iii-b) (setup) the population predicate extracts from the shipped refresh, BOUNDED (rc=$PRED_RC lines=$PRED_LINES)" $(( 1 - PRED_OK ))
+[ "$PRED_OK" = "1" ] || echo "   (refusing to source an unbounded predicate extraction — \$WEF carries none, so the arms below must red)"
+{ sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; [ "$PRED_OK" = "1" ] && cat "$PRED"; } > "$WEF"
 [ -s "$WEF" ] && grep -q 'write_emergency_queue()' "$WEF"
 ck "P13(iii-b) (setup) the emergency writer extracts from the shipped refresh" $?
 weq() { # <O> <repo> <PRODUCT_REPOS> <rest_list-rc> [rows] [window-filled] [core-now] [core-reserve]
@@ -1443,6 +1478,28 @@ for arm in LISTING-FAILED LISTING-TRUNCATED BUDGET-SKIPPED; do
   [ -z "$EQN" ] || WA=1
   ck "P13(iii-b) [RED→GREEN] $arm leaves NO emergency in the class and records UNKNOWN-$arm (file='$EQN')" $WA
 done
+# ⛔ …AND THE FOURTH UNREADABLE ARM IS THE PREDICATE ITSELF (#10951, delivery-lane review P1). This is
+# the arm that would have caught the regression: `write_emergency_queue` interpolates a predicate it
+# does not define, so a copy that lacks it must DEGRADE BY NAME — never crash on `set -u` (the
+# measured shape: five assertions returning `('')`), and never fall through to jq's
+# `.[]|.number` compile error, which the writer reports as `UNKNOWN-LISTING-FAILED` and thereby
+# blames the listing. Driven here with the predicate explicitly emptied AFTER the (real) definition
+# block is sourced, which is exactly the state a stripped extraction produces.
+mkdir -p "$T/we4"
+printf '10\n34\n' > "$T/we4/candidates.txt"; printf '34\n' > "$T/we4/candidates.product.txt"
+OUTW4="$(
+  CORE_NOW=""; CORE_RESERVE=""; REST_WINDOW_FILLED=0
+  rest_list() { printf '10\n'; }
+  # shellcheck source=/dev/null
+  . "$WEF" || exit 1
+  QUEUE_UNIT_SELECT=""
+  write_emergency_queue "$T/we4" daniel-ospina/tortoise daniel-ospina/tortoise
+) 2>&1"
+EQN4="$(tr '\n' ' ' < "$T/we4/candidates.emergency.txt" 2>/dev/null | sed 's/ $//')"
+case "$(eqrec "$T/we4")" in UNKNOWN-PREDICATE-MISSING*) W4=0 ;; *) W4=1 ;; esac
+[ -z "$EQN4" ] || W4=1
+case "$OUTW4" in *"QUEUE_UNIT_SELECT"*) ;; *) W4=1 ;; esac
+ck "P13(iii-b) [RED→GREEN] an UNDEFINED predicate degrades BY NAME (no unbound-variable crash, no false LISTING-FAILED) and leaves NO emergency (file='$EQN4', record='$(eqrec "$T/we4")')" $W4
 # …and a repo that is not a product repo records N/A without spending the read at all.
 mkdir -p "$T/we2"; printf '10\n' > "$T/we2/candidates.txt"
 weq "$T/we2" vendor/harness daniel-ospina/tortoise 1 '' >/dev/null

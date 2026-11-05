@@ -34,7 +34,8 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 S="$ROOT/scripts/orchestrator-harness/refresh-candidates.sh"
 FIX="$ROOT/tests/fixtures/queue-population-filter/issues.json"
-MIN_ASSERTIONS=34
+MIN_ASSERTIONS=36
+MIN_FIXTURE_ROWS=19
 PASS=0
 FAIL=0
 
@@ -109,6 +110,33 @@ eval "$BLOCK"
 for v in QUEUE_CONTAINER_TITLE_RE QUEUE_CONTAINER_LABEL QUEUE_UNIT_SELECT; do
   if [ -z "${!v:-}" ]; then echo "❌ $v resolved empty after extracting the block"; exit 1; fi
 done
+# ⛔ AND THE BLOCK'S CONTENT, NOT ONLY ITS VARIABLE NAMES (#10951 second review, measured). The loop
+# above proves the three variables are NON-EMPTY — not that they still carry the two parts of the rule.
+# A truncated extraction (one that ends after the title select) leaves three non-empty variables, and
+# then arm 4 strips a fragment that was never there, so "removing the label select changed the answer"
+# is asserted about a program that never had a label select.
+# ⚠️ MATCH THE EXPANDED VALUE. The first cut of this pin looked for the literal token
+# `QUEUE_CONTAINER_LABEL` inside `$QUEUE_UNIT_SELECT` — but `eval "$BLOCK"` has already expanded it, so
+# the token can never appear and the `case` fell through an empty `esac`: a pin that could not fire,
+# reported green. It also had no `*)` arm, so a non-match was silent. Both are fixed here.
+case "$QUEUE_UNIT_SELECT" in
+  *'.labels[]?.name'*'index('*) : ;;
+  *) { echo "❌ the extracted predicate carries no DECLARATION-label arm — the block is truncated (got: $QUEUE_UNIT_SELECT)"; exit 1; } ;;
+esac
+case "$QUEUE_CONTAINER_LABEL" in
+  standing-constraint) : ;;
+  *) { echo "❌ QUEUE_CONTAINER_LABEL is no longer \`standing-constraint\` (got: $QUEUE_CONTAINER_LABEL)"; exit 1; } ;;
+esac
+# ⛔ A FIXTURE ROW THAT IS DELETED MUST RED, NOT PASS. `has N && bad … || ok …` takes the `ok` branch
+# when the row is ABSENT, so every behavioural arm above is vacuous against a fixture that lost its
+# row (measured: deleting a row left ALL PASSED). The count is pinned as a FLOOR, so a legitimate
+# addition does not red it either.
+FIX_ROWS="$(jq 'length' "$FIX" 2>/dev/null)"
+case "${FIX_ROWS:-}" in ''|*[!0-9]*) FIX_ROWS=0 ;; esac
+if [ "$FIX_ROWS" -lt "$MIN_FIXTURE_ROWS" ]; then
+  echo "❌ the fixture carries $FIX_ROWS row(s) but this suite needs at least $MIN_FIXTURE_ROWS — a row the arms name was deleted, so those arms are vacuous"
+  exit 1
+fi
 
 echo "── arm 1: one definition, every call site"
 eq "the container-title pattern is built in exactly one place (comments excluded)" \
@@ -121,8 +149,17 @@ eq "the narrow ^(epic|OWNER DECISION) filter survives nowhere" \
 # 5, ALL PASSED; add one `#:` doc line to the block → count 6, FAILED. So the sites are counted by
 # their literal `--jq` prefix, and an INLINE predicate at any listing is counted separately — a
 # second filter cannot ride alongside the shared one unseen.
-eq "four call sites interpolate \$QUEUE_UNIT_SELECT (comments excluded)" \
-  "4" "$(grep -v '^[[:space:]]*#' "$S" | grep -cF -- '--jq ".[]|${QUEUE_UNIT_SELECT}|')"
+# ⛔ THREE DIRECT CALL SITES PLUS ONE ALIAS (#10951, delivery-lane review P1). The emergency listing
+# reads the definition through a LOCAL alias (`local unit_select="${QUEUE_UNIT_SELECT:-}"`) because a
+# TOP-LEVEL constant is an UNSET VARIABLE inside `product-floor.test.sh`'s extracted copy — which
+# crashed under `set -u` and cost five assertions at `bc9a9227`. The alias is therefore pinned as a
+# literal of its own: "one definition" would otherwise be a claim about a copy.
+eq "the three tier call sites interpolate \$QUEUE_UNIT_SELECT (comments excluded)" \
+  "3" "$(grep -v '^[[:space:]]*#' "$S" | grep -cF -- '--jq ".[]|${QUEUE_UNIT_SELECT}|')"
+eq "the emergency listing reads the predicate through a local alias of the SAME variable" \
+  "1" "$(grep -v '^[[:space:]]*#' "$S" | grep -cF -- 'local unit_select="${QUEUE_UNIT_SELECT:-}"')"
+eq "...and interpolates that alias, so it cannot carry a predicate of its own" \
+  "1" "$(grep -v '^[[:space:]]*#' "$S" | grep -cF -- '--jq ".[]|${unit_select}|.number"')"
 # ⛔ EVERY `--jq` THAT MENTIONS `select` MUST USE THE SHARED ONE (#10951 second review, finding 4).
 # The first version matched only `select((` — so a fifth copy shaped `select(.title|test("^wip|"))`
 # (single paren) rode in green. Measured: inserting such a tier query left the suite at ALL PASSED.
@@ -130,7 +167,7 @@ eq "four call sites interpolate \$QUEUE_UNIT_SELECT (comments excluded)" \
 # POSITIVE: a `--jq` line that mentions `select` but not the shared fragment is a failure, whatever
 # its spelling.
 eq "no tier query carries a predicate of its own" \
-  "0" "$(grep -v '^[[:space:]]*#' "$S" | grep -E -- '--jq ' | grep -F select | grep -vcF -- '${QUEUE_UNIT_SELECT}')"
+  "0" "$(grep -v '^[[:space:]]*#' "$S" | grep -E -- '--jq ' | grep -F select | grep -vcE -- '\$\{QUEUE_UNIT_SELECT\}|\$\{unit_select\}')"
 
 # ⛔ THE CALL SITES' OWN PROGRAMS, NOT JUST THE SHARED SELECT (#10951 review finding 3). The arms
 # above extract only the DEFINITION and then build their own `--jq` program by hand — so the four
@@ -147,7 +184,7 @@ eq "the P1 call site emits the '1 ' rank prefix with correct jq escaping" \
 eq "the P2 call site emits the '2 ' rank prefix with correct jq escaping" \
   "1" "$(grep -v '^[[:space:]]*#' "$S" | grep -cF -- '|${QUEUE_UNIT_SELECT}|\"2 \\(.number)\"')"
 eq "the emergency listing emits a bare .number (no rank prefix)" \
-  "1" "$(grep -v '^[[:space:]]*#' "$S" | grep -cF -- '|${QUEUE_UNIT_SELECT}|.number')"
+  "1" "$(grep -v '^[[:space:]]*#' "$S" | grep -cF -- '|${unit_select}|.number')"
 
 echo "── arm 2: the jq escaping trap (a backslash here fails OPEN)"
 case "$QUEUE_CONTAINER_TITLE_RE" in
@@ -161,18 +198,33 @@ echo "── arm 3: behaviour on the REAL jq program (the one the script sends)"
 pickable() { jq -r ".[]|${QUEUE_UNIT_SELECT}|\"\(.number)\"" "$FIX" | sort -n | tr '\n' ' '; }
 has() { case " $(pickable) " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 
-eq "the fixture's pickable population" "8488 10175 10538 90001 90004 90005 90007 90009 " "$(pickable)"
+eq "the fixture's pickable population" "8488 10175 10538 90001 90004 90005 90007 90009 90014 " "$(pickable)"
 
 for n in 5333 4917 9097 90006 90008 90010 90011 90012; do
   has "$n" && bad "#$n ($(jq -r ".[]|select(.number==$n)|.title" "$FIX" | cut -c1-24)…) is a container and must NOT be pickable" \
            || ok "#$n is excluded as a container"
 done
 has 2281 && bad "#2281 (epic: …) must not be pickable" || ok "#2281 is excluded as an epic"
+# ⚠️ WHAT #8488 IS MODELLED AS, NOT WHAT IT IS (second review, P2). Live `tortoise#8488` carries
+# `owner-decision,provenance-stale,P1-severe`; this fixture row carries `P1-severe` only. That is
+# DELIBERATE: the rule under test is the one where `owner-decision` is NOT an exclusion (see the
+# comment on `QUEUE_CONTAINER_LABEL` — it would drop three live P0-blockers), so the row isolates the
+# title/label rule from a label this predicate does not read. The live label set and the decision it
+# needs are recorded on the follow-up issue, not asserted here.
 for n in 8488 10538 90001 90005 90007 90009; do
   has "$n" && ok "#$n is real work and stays pickable" || bad "#$n is real work but was excluded"
 done
 has 90002 && bad "#90002 declares \`standing-constraint\` and must not be pickable" \
           || ok "#90002 is excluded BY ITS LABEL, though its title looks like ordinary work"
+# ⛔ THE OVER-EXCLUSION DIRECTION, WHICH NOTHING ELSE GUARDS (#10951 second review, measured). Every arm
+# above asserts "container → excluded"; none asserted "REAL WORK → kept" for the shapes the live queue
+# actually carries. Measured: adding `P0 |P0:|P1:|P1 ` to the title regex left the suite at ALL PASSED,
+# and that entry hides eight live tier rows including three `P0-blocker`s (tortoise#10976 "P0 storage:
+# nothing evicts the FalkorDB cache…", tortoise#10000, agent-infra#2833 "P0: lanes die constantly…").
+# Row 90014 is that shape: a severIty prefix is not a container prefix, and a filter that hides a P0 is
+# the failure this issue exists to prevent — in the opposite direction.
+has 90014 && ok "#90014 (a \`P0 <noun>:\` title — real work, and the shape three live P0-blockers carry) stays pickable" \
+          || bad "#90014 was excluded: a severity prefix is not a container prefix, and this hides real P0 work"
 has 90003 && bad "#90003 is assigned and must not be pickable" \
           || ok "#90003 is excluded because it is assigned"
 has 10175 && ok "#10175 is still title-pickable — the label, not the title, is how a constraint is declared" \
@@ -191,7 +243,15 @@ eq "the fixture's #90009 really carries NO assignees key" \
   "false" "$(jq -r '.[]|select(.number==90009)|has("assignees")' "$FIX")"
 
 echo "── arm 4: MUTATION — strip the label select and the label arm must go GREEN"
+# ⛔ A MUTATION THAT CHANGES NOTHING PROVES NOTHING. If the strip below no longer matches (the label
+# select is renamed, respelled, or absent), `$MUT` is identical to `$QUEUE_UNIT_SELECT` and the
+# "it discriminates" assertion below becomes a tautology — a green arm that cannot go red, which is
+# the class of defect this suite exists to refuse. So the mutation's EFFECT is asserted first.
 MUT="$(printf '%s' "$QUEUE_UNIT_SELECT" | sed 's/|select((\[.*$//')"
+[ "$MUT" != "$QUEUE_UNIT_SELECT" ]
+if [ "$MUT" = "$QUEUE_UNIT_SELECT" ]; then
+  bad "the mutation did not change the predicate — the label select is gone or respelled, so arm 4 asserts nothing"
+fi
 mut_pickable() { jq -r ".[]|${MUT}|\"\(.number)\"" "$FIX" | tr '\n' ' '; }
 case " $(mut_pickable) " in
   *" 90002 "*) ok "removing the label select makes #90002 pickable again — the arm discriminates" ;;
@@ -204,12 +264,17 @@ case "$MIN_ASSERTIONS" in
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
     FAIL=$((FAIL + 1)) ;;
   *)
-    if [ "$FAIL" -eq 0 ] && [ "$PASS" -ne "$MIN_ASSERTIONS" ]; then
-      echo "❌ $PASS assertion(s) ran but this suite declares $MIN_ASSERTIONS — a section was deleted or skipped, or an assertion was added without updating the pin"
+    # ⛔ `<` NOT `!=` (#10951 review). The pin exists to catch a suite that was EMPTIED or skipped; `-ne`
+    # also reds on a legitimate ADDITION, which is the "gate refuses honest work" class this file has
+    # otherwise been careful about — this very series tripped it (18 → 34) while adding arms. `-lt` keeps
+    # every anti-emptying property (delete a section and PASS still falls below the floor) and drops the
+    # false failure. The count is still REPORTED either way.
+    if [ "$FAIL" -eq 0 ] && [ "$PASS" -lt "$MIN_ASSERTIONS" ]; then
+      echo "❌ only $PASS assertion(s) ran but this suite declares a floor of $MIN_ASSERTIONS — a section was deleted or skipped"
       FAIL=$((FAIL + 1))
     fi ;;
 esac
 
-if [ "$FAIL" -eq 0 ]; then echo "ALL PASSED ($PASS assertion(s))"; exit 0; fi
+if [ "$FAIL" -eq 0 ]; then echo "ALL PASSED ($PASS assertion(s), floor $MIN_ASSERTIONS)"; exit 0; fi
 echo "FAILED: $FAIL of $((PASS + FAIL)) assertion(s)"
 exit 1
