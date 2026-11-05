@@ -1781,9 +1781,17 @@ assert_nofile "$ARM" "so the dated record is DROPPED (the substring test KEPT it
 
 # ── T62: a RELATIVE script path is refused, not read as present ─────────────────────────
 say_case "T62 an artifact naming the script RELATIVELY is refused"
+# ⛔ THE RELATIVE TOKEN MUST RESOLVE IN THE READER'S CWD, OR THIS CASE PROVES NOTHING. It used to be
+# `"converger.py"`, which resolves in no directory `run_install` ever cds to — so `[ -f "$installed_script" ]`
+# from the READER's cwd failed as well, and the case stayed GREEN with the absoluteness guard REMOVED
+# (measured: reverted to the `[ -f ]`-only guard, the suite still reported PASS=436 FAIL=0). That is the
+# class round 3 found in T47 — an assertion that is a property of the MACHINE, not of the fix. `run_install`
+# cds to $HERE and this suite lives in it, so the name below IS resolvable from the reader's cwd: pre-fix
+# the guard reads it as `script_present=yes` and exits 0, which is the very defect the case is for.
 D="$T/c62"; fresh "$D"; rm -f "$ARM"
 run_install Linux "$D" --install >/dev/null 2>&1
-box_sed_i 's|"[^"]*converger\.py"|"converger.py"|' "$D/$UNIT_NAME.service"
+box_sed_i 's|"[^"]*converger\.py"|"install-runner-autoscale-timer.sh"|' "$D/$UNIT_NAME.service"
+assert_file "$HERE/install-runner-autoscale-timer.sh" "precondition: the relative token resolves in the reader's cwd (so 'present' and 'refused' are distinguishable)"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "a relative script is red: a scheduler resolves it against ITS cwd (203/EXEC every tick)"
 assert_contains "$OUT" "NOT AN ABSOLUTE PATH" "saying which rule it breaks"

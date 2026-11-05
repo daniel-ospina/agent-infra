@@ -1155,18 +1155,6 @@ args_first() { # args_first <newline-separated values>
     printf '%s' "${1%%$'\n'*}"
 }
 
-args_first_matching() { # args_first_matching <newline-separated values> <GLOB pattern>
-    local pat="$2" rest="$1" l
-    while [ -n "$rest" ]; do
-        l="${rest%%$'\n'*}"
-        case "$l" in $pat) printf '%s' "$l"; return 0 ;; esac
-        case "$rest" in
-            *$'\n'*) rest="${rest#*$'\n'}" ;;
-            *) rest="" ;;
-        esac
-    done
-    return 0
-}
 
 # want_value_ok <v> — is <v> a value `--want` can take AT ALL?
 # ⛔ THE PASS DECLARES `--want` AS `type=int` (`runner_autoscale.py:3775-3780`), so the set of values it
