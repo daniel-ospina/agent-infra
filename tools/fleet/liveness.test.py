@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with eighty-one paired mutations: every mutation re-
+Fifty-one tests with eighty-three paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (81)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (83)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1617,9 +1617,26 @@ def t37():
           "the real rc= wins over an earlier rc=-shaped field")
     # ⛔ AND THE rc TOKEN IS BOUNDED: an exit status is a small number, so a runaway
     # token is UNREADABLE and abstains rather than being interpolated into the reason.
+    # ⛔ AND THE UNREADABLE CASE IS ITS OWN FACT (`"?"`), NOT "absent" (`None`). Collapsing
+    # them made the verdict publish "no rc= on the line" over a line that carried one.
     check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=%s\n"
-                               % ("9" * 40)) == ("finished", None),
-          "a runaway rc token is unreadable, not a status")
+                               % ("9" * 40)) == ("finished", "?"),
+          "a runaway rc token is PRESENT-BUT-UNREADABLE, not absent")
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=0x0\n")
+          == ("finished", "?"), "a non-numeric rc token is present-but-unreadable")
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1\n")
+          == ("finished", None), "a line with NO rc= is the ABSENT fact")
+    # …and the verdict's DETAIL must say which of the two it actually saw.
+    _v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="?"))
+    check(_v.state == "unknown" and _v.reason == "finished-rc-unreadable",
+          "a present-but-unreadable rc abstains; got %s/%s" % (_v.state, _v.reason))
+    check("PRESENT and UNREADABLE" in (_v.detail or ""),
+          "…and says it was PRESENT; got %r" % (_v.detail,))
+    _v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=None))
+    check("no readable `rc=` was supplied" in (_v.detail or ""),
+          "…while an absent rc says it was not supplied; got %r" % (_v.detail,))
+    check("on the line" not in (_v.detail or ""),
+          "…and neither wording claims a LINE (the census has none); got %r" % (_v.detail,))
     check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=255\n")
           == ("finished", "255"), "a real 3-digit status is still read")
 
@@ -1905,6 +1922,12 @@ def t41():
             "29\t%s\t0\t0\t\t1\t3000000\t9\t0" % as_dir,
             # a NEGATIVE cpu delta is a broken reading, not a flat one
             "30\t%s\t0\t-200\t\t1\t3000000\t9\t0" % log,
+            # ⛔ AN IMPLAUSIBLE NUMBER IS NOT A READING. `int()` accepts a 40-digit cell, so
+            # a runaway `size_delta`/`age_ms` became a STATE and was interpolated whole.
+            # Each of these three must abstain exactly as an unread cell does.
+            "34\t%s\t%s\t0\t\t1\t1000\t100\t?\t\t34" % (log, "9" * 40),
+            "35\t%s\t0\t%s\t\t1\t1000\t100\t?\t\t35" % (log, "9" * 40),
+            "36\t%s\t0\t0\t\t1\t%s\t100\t?\t\t36" % (log, "9" * 40),
             # ⛔ AN UNREADABLE EXIT STATUS IS NOT A NEGATIVE FACT — the same rule the
             # bound line and the launcher line apply. This column used to accept any
             # non-empty, non-`?` token, so `0x0` published `no-verdict/bound-finished-rc:0x0`
@@ -1957,6 +1980,10 @@ def t41():
               % len(by_pid["32"][1]))
         check(by_pid["33"] == ("no-verdict", "bound-finished-rc:7"),
               "a REAL non-zero rc is still named; got %r" % (by_pid["33"],))
+        for row in ("34", "35", "36"):
+            check(by_pid[row][0] == "unknown",
+                  "an IMPLAUSIBLE number must ABSTAIN, never become a state (row %s); got %r"
+                  % (row, by_pid[row]))
         # ⛔ A PER-LANE FLAG MUST BE REFUSED, NOT SILENTLY DROPPED. `--verdict-file`,
         # `--transcript`, `--start-seconds` and `--json` were ACCEPTED AND IGNORED: measured
         # with a valid `$log.lanebound`, the single-lane arm published `finished` for a file
@@ -3073,8 +3100,8 @@ MUTATIONS = [
     # ── round 4: the verdict door, and the silently-dropped census flags ─────────────
     Mutation(
         "T37", "module",
-        '        if (rc is not None and rc != "na"',
-        '        if False and (rc is not None and rc != "na"',
+        '        elif (rc is not None and rc != "na"',
+        '        elif False and (rc is not None and rc != "na"',
         "the verdict function stops normalising `rc`, so a DIRECT caller publishes "
         "`bound-finished-rc:0x0` — a negative fact from an unreadable status — that both "
         "shipped producers abstain on",
@@ -3102,6 +3129,21 @@ MUTATIONS = [
         '    if lr.age_ms is None:',
         "a NEGATIVE log age reads as \"less than the freeze window\" again, so a broken "
         "reading publishes `working/within-window` and the freeze check can never fire",
+    ),
+    # ── round 7: present-but-unreadable vs absent, and an implausible number ─────────
+    Mutation(
+        "T37", "module",
+        '    return (verdict, "?" if _bound_rc_present_re().search(head) else None)',
+        '    return (verdict, None)',
+        "a PRESENT-but-unreadable `rc=` collapses into ABSENT again, so the detail claims "
+        "\"no rc= on the line\" over a line that carried one — a fact the log contradicts",
+    ),
+    Mutation(
+        "T41", "module",
+        '                if not (body.isascii() and body.isdigit() and len(body) <= maxdigits):',
+        '                if not (body.isascii() and body.isdigit()):',
+        "an IMPLAUSIBLE census number (40 digits) is accepted as a reading again, so a "
+        "runaway `size_delta`/`age_ms` becomes a state and is interpolated whole",
     ),
 ]
 

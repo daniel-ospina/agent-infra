@@ -331,6 +331,7 @@ _BOUND_VERDICT_RE = None  # compiled lazily, so importing the module stays cheap
 _BOUND_RC_RE = None
 _BOUND_PID_RE = None
 _BOUND_LINE_RE = None    # the `[lane-bound] VERDICT` MARKER alone (the line, not its token)
+_BOUND_RC_PRESENT_RE = None  # `rc=` presence only — "absent" vs "present but unreadable"
 _RUNNER_MARKER_RE = None  # the LAUNCHER's `[timeout] agent pid=` line (location only)
 _RUNNER_RC_TOKEN_RE = None  # the status token read off that line
 # `rc=` is captured on the SAME line, because a verdict without its exit status is
@@ -1082,6 +1083,15 @@ def _bound_rc_re():
     return _BOUND_RC_RE
 
 
+def _bound_rc_present_re():
+    """``rc=`` PRESENCE only (no allow-list) — "absent" vs "present but unreadable"."""
+    global _BOUND_RC_PRESENT_RE
+    if _BOUND_RC_PRESENT_RE is None:
+        _bound_verdict_re()
+        assert _BOUND_RC_PRESENT_RE is not None
+    return _BOUND_RC_PRESENT_RE
+
+
 def _bound_verdict_re():
     # ⛔ ALL THREE, DECLARED `global`, ASSIGNED DIRECTLY (review P2). This block lazy-inits the
     # sibling patterns that `_bound_rc_re` / `_bound_pid_re` consume, so it must bind them in the
@@ -1116,6 +1126,9 @@ def _bound_verdict_re():
         # doctrine the runner line and the census column follow. `na` is kept verbatim.
         globals()["_BOUND_RC_RE"] = _re.compile(r"\brc=([0-9]{1,10}|na)\b")
         _BOUND_RC_RE = _re.compile(r"\brc=([0-9]{1,10}|na)\b")
+        # Presence only (no allow-list) — tells "absent" from "present but unreadable".
+        globals()["_BOUND_RC_PRESENT_RE"] = _re.compile(r"\brc=")
+        _BOUND_RC_PRESENT_RE = globals()["_BOUND_RC_PRESENT_RE"]
         globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=([0-9]+)\b")
         # ⛔ THE MARKER ALONE, with NO token requirement. `_BOUND_VERDICT_RE` demands
         # `verdict=` followed by `[a-z][a-z-]*`, so a FINAL line whose token is
@@ -1135,7 +1148,7 @@ def _bound_verdict_re():
         # The MARKER (pid only) locates the line; the STATUS is read off that line
         # separately, so "no line" and "line present, status unreadable" stay distinct.
         globals()["_RUNNER_MARKER_RE"] = _re.compile(
-            r"\[timeout\]\s+agent\s+pid=(\d+)\b")
+            r"\[timeout\]\s+agent\s+pid=(\d{1,10})\b")
         _RUNNER_MARKER_RE = globals()["_RUNNER_MARKER_RE"]
         globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\brc=(\d{1,3})\b")
         _RUNNER_RC_TOKEN_RE = globals()["_RUNNER_RC_TOKEN_RE"]
@@ -1258,7 +1271,14 @@ def parse_bound_line(text: str):
     # None, which the verdict function turns into `finished-rc-unreadable`.
     head = line.split(" log=")[0]
     rcs = _bound_rc_re().findall(head)
-    return (verdict, rcs[-1] if rcs else None)
+    if rcs:
+        return (verdict, rcs[-1])
+    # ⛔ "NO `rc=`" AND "`rc=` PRESENT BUT UNREADABLE" ARE DIFFERENT FACTS. Collapsing
+    # them made the verdict publish "no rc= on the line" over a line that carried one
+    # (`rc=0x0`, a runaway token), and over a `--log-census` row that has no line at all.
+    # `"?"` is this module's existing "present but unusable" token (see `parse_bound_pid`);
+    # the verdict function words the two cases separately and never claims a line.
+    return (verdict, "?" if _bound_rc_present_re().search(head) else None)
 
 
 def parse_bound_pid(text: str):
@@ -1500,9 +1520,15 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # because either copy alone produced the identical observable state). One rule, one
         # place. An unreadable status ABSTAINS.
         rc = lr.rc
-        if (rc is not None and rc != "na"
+        # `"?"` = the field was PRESENT and could not be read; `None` = it was ABSENT.
+        # Both ABSTAIN, but they are different diagnoses and the detail says which.
+        rc_unreadable = rc == "?"
+        if rc == "?":
+            rc = None
+        elif (rc is not None and rc != "na"
                 and not (rc.isascii() and rc.isdigit() and len(rc) <= 10)):
             rc = None
+            rc_unreadable = True
         # ⛔ THE SAME RULE FOR THE LAUNCHER'S STATUS, which is the *other* half of the same
         # decision. `runner_rc` was consumed RAW: any non-None value that is not "0" was
         # decoded as "the child did NOT complete" — so `0x0`, `exit:0`, a non-ASCII digit,
@@ -1526,8 +1552,12 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                 # re-dispatches it, and the lane's turn never completed.
                 if rc is None:
                     return Verdict("unknown", "finished-rc-unreadable",
-                                   detail="verdict=finished but no rc= on the line; "
-                                          "completion is undecidable")
+                                   detail=("verdict=finished, but the `rc=` was PRESENT and "
+                                           "UNREADABLE, so completion is undecidable"
+                                           if rc_unreadable else
+                                           "verdict=finished and no readable `rc=` was "
+                                           "supplied, so completion is undecidable")
+                                          + _also(lr.detail))
                 if rc == "na":
                     # ⛔ `na` IS NOT COMPLETION — IT IS THE ABSENCE OF EXIT-STATUS
                     # EVIDENCE. `lane-bound.sh watch` writes it UNCONDITIONALLY
@@ -1573,7 +1603,7 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
             # REAL DEATH (mechanism 3), reported by the producer that caused it.
             return Verdict("dead", "bound-verdict:%s" % verdict,
                            detail=("verdict_source=%s rc=%s"
-                                   % (lr.verdict_source or "log", _n(lr.rc)))
+                                   % (lr.verdict_source or "log", _n(rc)))
                                   + _also(lr.detail))
         return Verdict("no-verdict", "process-gone-no-verdict",
                        detail=("bytes=%s age_ms=%s (the process ended and told us nothing)"
@@ -2941,11 +2971,21 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # manufacture "the process is gone" and publish `no-verdict` over a live
             # lane. Anything outside the allow-lists is `None` = NOT READ = abstain,
             # which is the whole doctrine. `?` (and an absent field) is NOT 0 either.
-            def _opt(idx):
+            def _opt(idx, maxdigits=10):
+                # ⛔ A TOKEN LONGER THAN `maxdigits` IS NOT A READING. `int()` accepts a
+                # 40-digit value happily, so an out-of-range cell became a STATE and was
+                # interpolated whole: `size_delta=9…` published `working/progress:bytes`,
+                # and a 40-digit `age_ms` published `frozen/no-progress`. Every other token
+                # on this axis is bounded exactly this way; a byte delta, a CPU delta and
+                # an mtime age all fit in 10 digits by many orders of magnitude.
                 if idx >= len(f) or f[idx] in ("", "?"):
                     return None
+                tok = f[idx].strip()
+                body = tok[1:] if tok.startswith("-") else tok
+                if not (body.isascii() and body.isdigit() and len(body) <= maxdigits):
+                    return None
                 try:
-                    return int(f[idx])
+                    return int(tok)
                 except ValueError:
                     return None
 
