@@ -550,10 +550,16 @@ disk_worktree_terms() { # -> "<tree> <self> <reserve>", all validated integers
   # raise one and the other goes on admitting on the old number, which is #3395's defect wearing a
   # constant instead of an ordering. (The grep at review round 3 found the literals still here; the
   # round-2 edit had not landed. It has now, and the seam==live arm asserts it.)
-  # `tree` has NO default here on purpose: this seam does not classify the checkout (no `--repo`, see
-  # `disk_admit`), so an UNSTATED tree term cannot be inferred and contributes nothing on top of
-  # `self`. A stated one is honoured — it is the cell-level number an operator measures.
-  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; fi
+  # `tree` takes the CLASSIFIER'S PYTHON DEFAULT when the operator has not stated one (review round 6,
+  # P2 — MEASURED). It used to default to 0, which is only harmless while `self` (6,144) exceeds it: an
+  # operator who lowers `DISK_LANE_SELF_MB` — the very remedy `disk_admit`'s own refusal text
+  # recommends — went BELOW the live arm's tree term, so with `DISK_LANE_SELF_MB=64` on a python
+  # target the seam answered 2,064 MB (`terms="0 64 2000"`) while `disk_lane_need` answered 2,350 MB
+  # (`350 64 2000`) — seam < live, i.e. this seam admits the lane `run_agent` then refuses, which is
+  # #3395's defect a third time. 350 is the worst case of the two classifier defaults (350 python, 64
+  # harness), so taking it cannot lower the seam and keeps the shipped default at 8,144 MB (350 <
+  # 6,144). This is why the seam needs no `--repo`: it charges the LARGER class unconditionally.
+  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; else tree="$DISK_LANE_TREE_PY_DEFAULT"; fi
   if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; else self="$DISK_LANE_SELF_PY_DEFAULT"; fi
   if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve="$(disk_lane_reserve_default)"; fi
   # ⛔ AN EXPLICIT `0` IS HONOURED, exactly as `disk_lane_costs` honours it (the file's own word: the
@@ -590,6 +596,11 @@ disk_worktree_need() { # -> the MB a worktree creation must find free
 # read a CORRECT refusal as a false positive more than once (#3395's own record), and the numbers are
 # what make that impossible.
 #
+# ⛔ THE ARITHMETIC THE LINE PRINTS MUST BE THE ARITHMETIC IT COMPUTED (review round 6, P2 —
+# MEASURED). The sentence used to read `one lane's worst case ${worst}MB = max(tree, self) + reserve`
+# where `worst` was only `max(tree, self)` — an equation false by the reserve on every refusal, printed
+# on a line whose whole purpose is that an operator can re-derive the number from it alone. It now
+# states `need = max(tree, self) + reserve`, which is exactly what `disk_worktree_need` returns.
 # ⛔ THE TOKEN CARRIES THE EXACT MEBIBYTES AS WELL AS THE ROUNDED GiB (review round 1, P2 — MEASURED).
 # One decimal on GiB is not enough to be unambiguous AT THE BOUNDARY: 8,143 MB and 8,144 MB both render
 # `8.0GB`, so the arm that refuses `free = need - 1` printed `free=8.0GB, need=8.0GB` — a correct
@@ -614,13 +625,12 @@ disk_admit() { # <target> [<label>]
   # command macOS lacks: `spawn-gate.sh free-macos-absent: baseline=0 live=1`, which REDS
   # check-portability-traps.test.sh's own-tree arm on a false finding. The name was also a shadow of
   # the command in a file that probes memory elsewhere; `avail` says what it is.
-  local target="${1:-.}" label="${2:-disk-admit}" avail need box terms worst tree self reserve
+  local target="${1:-.}" label="${2:-disk-admit}" avail need box terms tree self reserve
   DISK_ADMIT_LINE=""
   need="$(disk_worktree_need)"
   terms="$(disk_worktree_terms)"
   tree="${terms%% *}"; terms="${terms#* }"
   self="${terms%% *}"; reserve="${terms#* }"
-  worst="$self"; if [ "$tree" -gt "$worst" ]; then worst="$tree"; fi
   box="$(disk_box_id)"
   avail="$(disk_free_mb_target "$target")"
   if ! disk_readable "$avail"; then
@@ -635,7 +645,7 @@ disk_admit() { # <target> [<label>]
   # created — where every other predicate in this file refuses an uncomparable reading. Written as
   # `need <= avail`, an errored comparison is FALSE, i.e. a refusal.
   if ! [ "$need" -le "$avail" ]; then
-    DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$avail"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$avail, need_mb=$need) $label: $avail MB free on $target < ${need}MB required (one lane's worst case ${worst}MB = max(tree ${tree}MB, self ${self}MB) + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
+    DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$avail"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$avail, need_mb=$need) $label: $avail MB free on $target < ${need}MB required (need ${need}MB = max(tree ${tree}MB, self ${self}MB) + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
   fi
