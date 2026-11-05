@@ -183,8 +183,51 @@ drive "$WT"
 eqv "$LANE_RC" "82" "1a a lane whose \$HOME models.json names a variable the environment does not hold exits 82 — the key gate's OWN code, not 72/75/80"
 has "$(cat "$(LOG)" 2>/dev/null)" "[key-gate] lane 3331 check=fail result=REFUSED reason=credential-missing var=$KEYVAR" \
     "1b the log names the missing variable and where the name came from"
+# ⛔ AND THE LANE'S REMEDY PRINTS THE WORKING INVOCATION (round 10, P2, measured): #3443's item 1 is that the
+# remedy is the MODEL FLAG, and only the BOX-DEFAULT refusal had an arm for it — deleting the clause from the
+# `credential-missing` line left both suites green. This is the line a lane log carries, so it is the one an
+# operator actually reads at 3am.
+has "$(cat "$(LOG)" 2>/dev/null)" 'pi -p --no-session --provider deepseek --model deepseek-flash' \
+    "1b2 …and the remedy gives the exact working invocation, not \"source keys.env\""
 [ ! -s "$PI_MARK" ]; ck "1c pi was NEVER spawned — the refusal is BEFORE the agent, so no model call was spent" $?
 check_terminal "1d" refused "key-gate:credential-missing:$KEYVAR" 82
+# ⛔ AND THE TERMINAL TOKEN NAMES THE MODEL, NOT ONLY THE VARIABLE (agent-infra#3443). The failure this
+# gate front-runs is named after the MODEL (`No API key found for the selected model.`), so a token
+# carrying only `$VAR` sends an operator to a credential that may never have been the question — and this
+# is the line a fleet scan greps, not the prose above it. The mutant (reverting the token to
+# `key-gate:<reason>:<VAR>`) reddens 1d4/1d5 and nothing else (1d2/1d3 are the epoch/yield arms).
+_kginfo="$(lastline | sed -n 's/.*reason=\(key-gate:[^ ]*\).*/\1/p')"
+eqv "$(printf '%s' "$_kginfo" | awk -F: '{print NF}')" "4" \
+    "1d4 the key-gate reason token carries FOUR fields — reason, variable AND the MODEL"
+# ⛔ A LITERAL, NOT THE AMBIENT `$PI_LANE_MODEL` (review round 2, P3, measured): the lane subprocess is launched
+# with `env -u PI_LANE_PROVIDER -u PI_LANE_MODEL`, so the token ALWAYS carries the built-in default — while an
+# ambient `PI_LANE_MODEL` (which `README.md` tells operators to put in `keys.env`, and a controller session
+# re-sources) made this arm fail on a correctly-behaving gate.
+eqv "$(printf '%s' "$_kginfo" | awk -F: '{print $4}')" "deepseek-flash" \
+    "1d5 …and the fourth is the model the gate asserted (the built-in default, since the lane runs env-scrubbed)"
+# ⛔ lane.sh PASSES BOTH HALVES, AND THE CLAIM IS THE ONE THE ARM CAN ACTUALLY MAKE (round 11, P3, measured).
+# The round-8 version said the pre-change 2-arg call "answers about venice here". After round 10's rule — the
+# `provider/` prefix decides only for a model that was NAMED, never one inherited from `$PI_LANE_MODEL` — that
+# became FALSE: both shapes resolve `deepseek`, the log text is byte-identical, and the arm could not distinguish
+# any implementation (a surviving mutant dressed as a guard). So:
+#   • the BEHAVIOURAL arm stays and keeps what it really proves — a prefixed ambient model is asserted against
+#     the provider the lane will hand pi (`deepseek`), not the prefix;
+#   • the CALL SHAPE is asserted statically, because no fixture can observe it: `lane.sh` sources the gate from
+#     its own directory, so a stub cannot be injected, and the four-argument call is the fact that would regress.
+#     This is a source check on purpose and says so — it reddens if lane.sh stops passing the resolved pair.
+mk_arm pair; PI_MARK="$ARMDIR/pi-ran"; export PI_MARK
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi 2>/dev/null || true
+drive "$ARMWT" PI_LANE_MODEL=venice/whatever
+eqv "$LANE_RC" "82" "1e a prefixed PI_LANE_MODEL still refuses on the LANE's own provider, as pi would run it"
+has "$(cat "$(LOG)" 2>/dev/null)" "[key-gate] lane 3331 check=fail result=REFUSED reason=credential-missing var=$KEYVAR provider=deepseek model=venice/whatever" \
+    "1e2 …naming deepseek, the provider run_agent will hand pi, rather than the id's venice/ prefix"
+[ ! -s "$PI_MARK" ]; ck "1e3 pi was never spawned" $?
+# ⛔ SOURCE CHECK, DECLARED AS ONE. `lane.sh` must call the gate with the RESOLVED pair (four arguments); the
+# pre-change 2-arg call is the regression this line exists to catch, and it is invisible at runtime.
+_gkcall="$(grep -c 'key_gate_assert "lane \$N" "${HOME:-}" "${PI_LANE_PROVIDER:-deepseek}" "${PI_LANE_MODEL:-deepseek-flash}"' "$LANE" 2>/dev/null || true)"
+eqv "${_gkcall:-0}" "1" \
+    "1e4 lane.sh calls the gate with FOUR arguments — label, home, resolved provider, model — so the gate and the spawn cannot disagree"
 # ⛔ THE REFUSAL YIELDS THE ITEM (review round 3, P2). `chain-merge.sh`'s ONLY early bail-out reads
 # `state/capacity-refused-<N>`, and the key gate refuses 270 lines BEFORE the arm that writes it — so
 # without this record the chain waits its full 90 minutes holding `refs/claims/issue-<N>` for a PR that
@@ -204,6 +247,36 @@ eqv "${KG_GATE:-<none>}" "key" "1d3 …and field 3 names the KEY gate (an unname
 # terminal `outcome=done` line made them unfalsifiable: a `done` log can never end on a cleanup line).
 hasnt "$(lastline)" "[venv-reap]" "1e the REFUSAL log does NOT end on a cleanup/reap line (the shape mistaken for a working lane)"
 hasnt "$(lastline)" "[wip]" "1f …nor on the wip-rescue line"
+
+# ═══ 1f. A STORE VERDICT IS NOT A MISSING VARIABLE, AND THE TOKEN SAYS SO (round 22, P2, measured) ═══
+# `lane.sh` writes `key-gate:${KEY_GATE_REASON:-credential-missing}:…`, so a `store-invalid` refusal that never
+# sets the reason published `reason=key-gate:credential-missing:<VAR>:<MODEL>` — the exact misattribution this
+# file's own header forbids — and its stand-down sentence told the operator to export the variable the refusal
+# had just measured as NOT the problem (`export` does not rescue an entry pi cannot use: measured, pi answers
+# `Provider is not configured` with the key exported).
+mk_arm storeinvalid; WT="$ARMWT"
+printf '{"deepseek":{"key":"sk_legacy_no_type"}}\n' > "$ARMDIR/home/.pi/agent/auth.json"
+PI_MARK="$ARMDIR/pi-ran"; export PI_MARK
+pi() { printf 'ran\n' >> "$PI_MARK"; return 0; }
+export -f pi 2>/dev/null || true
+drive "$WT"
+check_terminal "1f" refused "key-gate:store-invalid" 82
+eqv "$(printf '%s' "$(lastline | sed -n 's/.*reason=\(key-gate:[^ ]*\).*/\1/p')" | awk -F: '{print $2}')" \
+    "store-invalid" \
+    "1f2 the token's REASON is store-invalid, not the credential-missing default — a scan counts the real cause"
+# ⛔ WIDENED IN ROUND 23, AFTER THE NARROW GREP WAS MEASURED AS A HOLE: 1f3 pinned the ONE phrase only the fixed
+# capacity-transfer sentence contained, while the TWO lines that carry the refusal into the lane log and onto stderr
+# still said "$VAR holds no value in the environment this lane would run with" — the prescription the gate refutes
+# in the same log. A phrase-specific grep is an arm written to miss its own subject, so every prescription is named.
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "put the credential in the environment lanes run with" \
+    "1f3 …and the stand-down sentence does NOT prescribe exporting a variable the refusal already ruled out"
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment this lane would run with" \
+    "1f3b …nor do the NOT-started lines, which are the ones an operator reads in the lane log"
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "credential \$" \
+    "1f3c …nor does any line call the credential MISSING for a verdict about the FILE"
+has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
+    "1f4 …it names the FILE the operator must repair or delete"
+[ ! -s "$PI_MARK" ]; ck "1f5 pi was never spawned for a store verdict" $?
 
 # ── 1y: THE ESCAPE IS ARGV, AND THE ENVIRONMENT ROUTE IS RETIRED (review, P1, measured) ─────────
 # ⛔ THE HEAD COMMIT'S WHOLE CLAIM, WHICH HAD NO ASSERTION (review, P1: deleting the guard left all three
