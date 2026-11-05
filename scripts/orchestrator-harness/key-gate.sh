@@ -280,7 +280,7 @@ except Exception:
     # ⛔ rc 4 = CANNOT SAY, FOR `store` TOO (round 14, P1, measured): rc 1 is the POSITIVE "no credential", and a
     # store that failed to PARSE is not that — with a BOM the gate refused 82 a box pi runs, on a file pi read fine.
     # `var` stays 0 (it prints nothing either way); `default` and `store` say "cannot say".
-    raise SystemExit(4 if sys.argv[2] in ("default", "store") else 0)
+    raise SystemExit(6 if sys.argv[2] == "store" else (4 if sys.argv[2] == "default" else 0))
 
 if sys.argv[2] == "default":
     # MODE=default — the startup pair a BARE `pi` would use, per pi\x27s OWN settings.json (`docs/settings.md`:
@@ -501,28 +501,71 @@ if sys.argv[2] == "var":
                 return False
             return True
 
-        def _ok_routing(v):
-            # openRouterRouting/vercelGatewayRouting type their leaves (booleans, string arrays, objects); this
-            # checks the leaf KINDS rather than every key, so a bogus value is caught without inventing rules.
+        # `openRouterRouting`/`vercelGatewayRouting` type their leaves PER KEY (round 22, P1, measured with a
+        # differential over the whole schema: the leaf-kind test accepted `allow_fallbacks: "yes"`, `order: "x"`,
+        # `max_price: {"prompt": null}` and `vercelGatewayRouting.only: "x"` - 30 mismatches, all here - while pi
+        # DISCARDS the document and the provider disappears from `--list-models`, so the gate certified a variable
+        # from a file pi never loaded).
+        def _num_or_str(x):
+            return isinstance(x, str) or (not isinstance(x, bool) and isinstance(x, (int, float)))
+
+        def _ok_price_map(v):
+            # `max_price` types its NAMED leaves `number|string` and carries NO `additionalProperties: false`, so an
+            # unknown key there is legal at any type (measured on the compiled schema: 0 occurrences). Iterating every
+            # value instead made a legal `{"weird": true}` go cannot-say - the round-19 blindness class, on the very
+            # file pi loads.
             if not isinstance(v, dict):
                 return False
+            return all(_num_or_str(v[k]) for k in ("prompt", "completion", "image", "audio", "request") if k in v)
+
+        def _ok_percentiles(v):
+            # throughput/latency -> `anyOf number | {p50,p75,p90,p99: number}`, same no-additionalProperties rule
+            if not isinstance(v, bool) and isinstance(v, (int, float)):
+                return True
+            if not isinstance(v, dict):
+                return False
+            return all(
+                not isinstance(v[k], bool) and isinstance(v[k], (int, float))
+                for k in ("p50", "p75", "p90", "p99") if k in v)
+
+        def _ok_sort(v):
+            # `anyOf string | {by: string, partition: string|null}`, neither key required
+            if isinstance(v, str):
+                return True
+            if not isinstance(v, dict):
+                return False
+            if "by" in v and not isinstance(v["by"], str):
+                return False
+            return "partition" not in v or v["partition"] is None or isinstance(v["partition"], str)
+
+        def _ok_str_list(v):
+            return isinstance(v, list) and all(isinstance(x, str) for x in v)
+
+        def _ok_or_routing(v):
+            if not isinstance(v, dict):
+                return False
+            for _k in ("allow_fallbacks", "require_parameters", "zdr", "enforce_distillable_text"):
+                if _k in v and not isinstance(v[_k], bool):
+                    return False
+            for _k in ("order", "only", "ignore", "quantizations"):
+                if _k in v and not _ok_str_list(v[_k]):
+                    return False
             if "data_collection" in v and v["data_collection"] not in ("deny", "allow"):
-                # `data_collection` is `anyOf` of two consts (round 21, P3, measured: `"bogus"` -> pi DISCARDS,
-                # the leaf-kind test above accepted any string).
                 return False
-            for x in v.values():
-                if isinstance(x, (bool, str)):
-                    continue
-                # `preferred_min_throughput`/`preferred_max_latency` are `anyOf number|object` (round 21, P3,
-                # measured: a NUMBER made this gate abstain on a file pi LOADS - the over-strict direction).
-                if not isinstance(x, bool) and isinstance(x, (int, float)):
-                    continue
-                if isinstance(x, list) and all(isinstance(y, str) for y in x):
-                    continue
-                if isinstance(x, dict):
-                    continue
+            if "sort" in v and not _ok_sort(v["sort"]):
                 return False
+            if "max_price" in v and not _ok_price_map(v["max_price"]):
+                return False
+            for _k in ("preferred_min_throughput", "preferred_max_latency"):
+                if _k in v and not _ok_percentiles(v[_k]):
+                    return False
             return True
+
+        def _ok_vercel_routing(v):
+            # only `only`/`order`, both `array of string`
+            if not isinstance(v, dict):
+                return False
+            return all(_ok_str_list(v[k]) for k in ("only", "order") if k in v)
 
         def _ok_compat(v):
             if not isinstance(v, dict):
@@ -538,9 +581,10 @@ if sys.argv[2] == "var":
             for _k in ("chatTemplateKwargs", "chatTemplateArgs"):
                 if _k in v and not _ok_template_map(v[_k]):
                     return False
-            for _k in ("openRouterRouting", "vercelGatewayRouting"):
-                if _k in v and not _ok_routing(v[_k]):
-                    return False
+            if "openRouterRouting" in v and not _ok_or_routing(v["openRouterRouting"]):
+                return False
+            if "vercelGatewayRouting" in v and not _ok_vercel_routing(v["vercelGatewayRouting"]):
+                return False
             if "allowedFallbackModels" in v:
                 af = v["allowedFallbackModels"]
                 if not isinstance(af, list) or len(af) > 3:
@@ -949,6 +993,12 @@ key_gate_stored_credential() {
     # "absent": pi throws on it and then cannot run that provider even with the key exported. It gets its own
     # refusal at both call sites rather than being folded into the cannot-say bucket.
     5) return 5 ;;
+    # 6 = THE FILE DOES NOT PARSE (round 22, P2, measured): `parseStorageData` is a bare `JSON.parse`, so pi
+    # answers `Credential store read failed for <provider>: Expected property name ...` and exits - with AND
+    # without the provider key exported, for every provider. Reporting that as the cannot-say bucket printed
+    # "holds an entry for this provider whose value this gate cannot resolve (a `!command`, an `oauth`
+    # credential ...)" about a file that holds no entry at all, and let a certain death through as a skip.
+    6) return 6 ;;
     *) return 3 ;;
   esac
 }
@@ -1327,8 +1377,17 @@ key_gate_box_default_assert() {
       # `refused` mode (the standalone probe) this is a verdict about the FILE. A lane\x27s own `key_gate_assert`
       # refuses through the arm above, and `warn` mode stays quiet so one lane log does not carry it twice.
       [ "$quiet" = 1 ] && return 0
-      printf '[key-gate] %s check=fail result=REFUSED reason=store-invalid model=%s box_default=%s provider=%s home=%s agent_dir=%s - %s/auth.json holds an entry pi cannot resolve to a key (an object with `type` "api_key" and a non-null `key`, or "oauth" with string `access`, string `refresh` and a finite number `expires`); measured: with such a store `pi -p` prints `No API key found` and `Provider is not configured` EVEN with the key exported, so this is a verdict about the FILE, not about a missing variable. Repair or delete `%s/auth.json` (agent-infra#3443)\n' \
+      printf '[key-gate] %s check=fail result=REFUSED reason=store-invalid model=%s box_default=%s provider=%s home=%s agent_dir=%s - %s/auth.json holds an entry pi cannot resolve to a key (an object whose `type` is "api_key" with a non-null `key`, or "oauth" with a non-empty string `access` and an `expires` that is a number, a numeric string or absent); measured: with such a store `pi -p` prints `No API key found` and `Provider is not configured` EVEN with the key exported, so this is a verdict about the FILE, not about a missing variable. Repair or delete `%s/auth.json` (agent-infra#3443)\n' \
         "$label" "$dm" "$dm" "$prov" "${home:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}"
+      return "$KEY_GATE_REFUSED" ;;
+    6)
+      # ⛔ THE FILE DOES NOT PARSE, SO NO PIN CAN BE ASSERTED FROM THIS BOX (round 22, P2, measured): pi answers
+      # `Credential store read failed for <provider>: ...` and exits, with AND without the provider key exported.
+      # The cannot-say bucket said "holds an entry for this provider whose value this gate cannot resolve" about a
+      # file that holds no entry at all, and let a certain death through as a skip.
+      [ "$quiet" = 1 ] && return 0
+      printf '[key-gate] %s check=fail result=REFUSED reason=auth-store-unreadable model=%s box_default=%s provider=%s settings_json=%s home=%s agent_dir=%s - %s/auth.json does not PARSE, and pi reads that file before anything else: measured, `pi -p` answers `Credential store read failed for <provider>: ...` and exits, with AND without the provider key exported, so this is a verdict about the FILE and the pin cannot be asserted from it. Repair %s/auth.json (or delete it) and re-run (agent-infra#3443)\n' \
+        "$label" "$dm" "$dm" "$prov" "$sj" "${home:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}" "${agent_dir:-<none>}"
       return "$KEY_GATE_REFUSED" ;;
     0)
       # ⛔ IT STILL SPEAKS IN `refused` MODE (round 7, P3, measured): returning silently printed ZERO bytes and
@@ -1424,8 +1483,26 @@ key_gate_assert_main() {
     # The variable is unknown when the template is absent, so the line names the provider instead of pretending.
     KEY_GATE_VAR="${names:-<none>}"
     KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
+    # ⛔ THE LANE TOKEN READS THIS (round 22, P2, measured): `lane.sh` writes
+    # `key-gate:${KEY_GATE_REASON:-credential-missing}:${KEY_GATE_VAR}:${KEY_GATE_MODEL}`, so leaving it unset for
+    # this arm made a store-invalid refusal publish `reason=key-gate:credential-missing:...` - the exact
+    # misattribution this file's header forbids, and the value was already being set for the env-missing arm.
+    KEY_GATE_REASON="store-invalid"
     printf '[key-gate] %s check=fail result=REFUSED reason=store-invalid model=%s provider=%s var=%s home=%s agent_dir=%s - the credential store is INVALID: %s/auth.json holds an entry for this provider that pi cannot resolve to a key (it must be an OBJECT whose `type` is "api_key" with a non-null `key`, or "oauth" with a non-empty string `access` and an `expires` that is a number, a numeric string or absent), and that entry SHADOWS the environment instead of falling back to it - measured: `pi -p` prints `No API key found for <provider>.` with nothing exported and `Provider is not configured: <provider>` even WITH the key exported and a models.json template naming it. So this is a verdict about the FILE, not about a missing variable: repair %s/auth.json (or delete it) and re-run (agent-infra#3443)\n' \
       "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}"
+    return "$KEY_GATE_REFUSED"
+  fi
+  if [ "$store_rc" = "6" ]; then
+    # ⛔ A STORE THAT DOES NOT PARSE IS A REFUSAL, NOT A CANNOT-SAY (round 22, P2, measured): pi's
+    # `parseStorageData` is a bare `JSON.parse`, so it answers `Credential store read failed for <provider>:
+    # Expected property name ...` and exits - with AND without the provider key exported, for every provider.
+    # The old rc-4 answer printed "holds an entry for this provider whose value this gate cannot resolve (a
+    # `!command`, an `oauth` credential ...)" about a file that holds no entry at all, and let that death through.
+    KEY_GATE_VAR="${names:-<none>}"
+    KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
+    KEY_GATE_REASON="auth-store-unreadable"
+    printf '[key-gate] %s check=fail result=REFUSED reason=auth-store-unreadable model=%s provider=%s var=%s home=%s agent_dir=%s - %s/auth.json does not PARSE, and pi reads that file before anything else: measured, `pi -p` answers `Credential store read failed for <provider>: ...` and exits, with AND without the provider key exported. No entry is resolvable from it, so `export %%s` cannot help: repair %s/auth.json (or delete it) and re-run (agent-infra#3443)\n' \
+      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "$KEY_GATE_VAR" "${KEY_GATE_AGENT_DIR:-<none>}"
     return "$KEY_GATE_REFUSED"
   fi
   if [ -z "$KEY_GATE_PROVIDER" ]; then
@@ -1440,8 +1517,12 @@ key_gate_assert_main() {
     # The store is what `pi` reads FIRST, so an absent variable is not an absent credential. Nothing is
     # asserted — and the line says WHICH source answered, so an operator reading a green gate is not
     # misled into thinking the environment carries the key.
+    # ⛔ THE TEMPLATE VARIABLE IS THE ONE `key_gate_var` ACTUALLY RETURNED (round 22, P3, measured: the round-21 cut
+    # printed `$<none>` twice, asserting a false fact about a models.json that names a real variable).
+    local tmpl_names
+    tmpl_names="$(printf '%s\n' "${names:-<none>}" | paste -sd ',' - 2>/dev/null)"
     printf '[key-gate] %s check=skipped reason=stored-credential provider=%s model=%s home=%s agent_dir=%s — %s/auth.json holds a credential for this provider, and pi consults that store BEFORE the environment (and before the models.json template that names $%s), so whether $%s is exported here is not the question pi asks first; nothing is asserted here\n' \
-      "$label" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_VAR:-<none>}" "${KEY_GATE_VAR:-<none>}"
+      "$label" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${tmpl_names:-<none>}" "${tmpl_names:-<none>}"
     return 0
   fi
   if [ "$store_rc" = "3" ] || [ "$store_rc" = "4" ]; then
