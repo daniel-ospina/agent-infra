@@ -1802,7 +1802,7 @@ def evaluate(ev: Evidence) -> Verdict:
         # evidence in the same query means the caller has a second axis's answer in
         # hand, and resolving silently to the log axis would DISCARD it — the
         # #1777 B7 shape. Naming the refusal beats picking a winner.
-        # ⛔ AN ABSTENTION IS EVIDENCE TOO (T50). `ps_ok`/`store_ok` are the session
+        # ⛔ AN ABSTENTION IS EVIDENCE TOO (T55). `ps_ok`/`store_ok` are the session
         # axis answering `unknown/ps-unreadable` / `unknown/store-unreadable`. This
         # guard once listed only the POSITIVE session fields, so a log read resolved
         # over a FAILED read — and a `frozen` log read then CONVICTED a lane on
@@ -3044,6 +3044,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
     log = pid = vfile = transcript = None
     start_seconds = None
     window_ms = LOG_WINDOW_MS
+    window_ms_set = False
     sample = True
     as_json = False
     census = False
@@ -3076,6 +3077,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             except ValueError:
                 print("liveness.py: --window-ms must be an integer", file=sys.stderr)
                 return 2
+            window_ms_set = True
             # ⛔ A ZERO-LENGTH WINDOW CANNOT PRODUCE A DELTA. It collapses both readings
             # into one instant, so both progress signals are trivially flat and a LIVE,
             # working lane reads `frozen` — measured end to end with a CPU burner.
@@ -3103,11 +3105,18 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
         # and `--json` silently changed nothing about the TSV output. Both exited 0, so no
         # caller could tell it had been ignored. A refusal is consistent with the surface's
         # own contract (it reads lanes AND their evidence from stdin).
+        # ⛔ `--window-ms` IS REFUSED FOR A STRONGER REASON THAN THE OTHERS (review P1). It is
+        # not merely inert: the census takes its DELTAS from the caller (`?` = unread), so it
+        # never measures over a window at all, yet it interpolated this value into every row's
+        # `detail` as `window_ms=`. Measured: `--log-census --window-ms 5` on a caller row with
+        # `age_ms=3000000` published `window_ms=5`, telling a reader the flat deltas were
+        # measured over 5 ms when the caller measured them over its own window. A lying
+        # diagnostic is worse than a dropped flag, so this one is refused too.
         if (log or pid is not None or vfile or transcript or start_seconds is not None
-                or as_json or not sample):
+                or as_json or not sample or window_ms_set):
             print("liveness.py: --log-census reads its lanes and their evidence from stdin; "
                   "do not also pass --log/--pid/--verdict-file/--transcript/"
-                  "--start-seconds/--json/--no-sample", file=sys.stderr)
+                  "--start-seconds/--json/--no-sample/--window-ms", file=sys.stderr)
             return 2
         rc = 0
         for line in sys.stdin:

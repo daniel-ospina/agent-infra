@@ -2020,11 +2020,18 @@ def t41():
         # the census then published as `no-verdict / process-gone-no-verdict` — "the lane told
         # us nothing" for a lane that finished — and `--json` changed nothing about the TSV.
         # Both exited 0, so no caller could tell. A refusal is the surface's own contract.
+        # ⛔ `--window-ms` IS THE WORSE CASE AND IS LISTED HERE FOR THAT REASON (review P1).
+        # It was not merely ignored — the census INTERPOLATED it into every row's `detail` as
+        # `window_ms=`, while the deltas came from the caller over the caller's own window.
+        # Measured before the refusal: `--log-census --window-ms 5` on a row with
+        # `age_ms=3000000` published `window_ms=5`, i.e. it told a reader that flat deltas were
+        # measured over 5 ms. A lying diagnostic is worse than a dropped flag.
         for argv in (["--log-census", "--json"],
                      ["--log-census", "--verdict-file", os.path.join(d, "V")],
                      ["--log-census", "--transcript", os.path.join(d, "T")],
                      ["--log-census", "--start-seconds", "5"],
-                     ["--log-census", "--no-sample"]):
+                     ["--log-census", "--no-sample"],
+                     ["--log-census", "--window-ms", "5"]):
             refuse_rc, refuse_rows = census([], argv)
             check(refuse_rc == 2,
                   "%r must be REFUSED, not ignored; got rc=%r" % (argv[1:], refuse_rc))
@@ -2901,6 +2908,28 @@ def t54():
             check(True, "a paren-less stat line abstains the read")
         check(liv.subtree_cpu_cs(500, proc_root=d) is None,
               "…and the caller abstains; got %r" % (liv.subtree_cpu_cs(500, proc_root=d),))
+
+        # (i) ⛔ A FULL-LENGTH ROW WHOSE **ppid TOKEN IS NON-NUMERIC** MUST ABSTAIN TOO.
+        # This is the PARSE arm, not the `)` arm: the row has a valid `)` and every field
+        # present, so `rest[1]` exists — it is `int("abc")` that raises `ValueError`. The
+        # `except` must therefore catch `ValueError` as well as `IndexError`, and only this
+        # shape distinguishes them. Measured before this case existed (the #3404 train had
+        # a pin for it that the rebase dropped): narrowing `except (IndexError, ValueError):`
+        # to `except IndexError:` left PASS=55 FAIL=0, and `ValueError` would then escape
+        # `_proc_cpu_cs` straight out of `subtree_cpu_cs`, whose contract is `None` or
+        # `_ProcUnreadable` — an exception is not a state.
+        write(600, "600 (pi) S abc 0 0 0 0 0 0 0 0 3 4\n")
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "a non-numeric ppid must RAISE _ProcUnreadable, not skip the row")
+        except liv._ProcUnreadable:
+            check(True, "a non-numeric ppid abstains the read")
+        except ValueError as exc:
+            check(False, "a non-numeric ppid must not raise ValueError out of the reader: %s"
+                  % exc)
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller abstains rather than returning a short total; got %r"
+              % (liv.subtree_cpu_cs(500, proc_root=d),))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -3551,11 +3580,19 @@ MUTATIONS = [
     Mutation(
         "T41", "module",
         '        if (log or pid is not None or vfile or transcript or start_seconds is not None\n'
-        '                or as_json or not sample):',
+        '                or as_json or not sample or window_ms_set):',
         '        if log or pid is not None:',
         "`--log-census` silently DROPS the per-lane flags again, so a `--verdict-file` that "
         "makes the single-lane arm say `finished` is ignored and the census publishes "
         "`no-verdict` for that lane with exit 0",
+    ),
+    Mutation(
+        "T41", "module",
+        '                or as_json or not sample or window_ms_set):',
+        '                or as_json or not sample):',
+        "`--log-census` accepts `--window-ms` again and interpolates it into every row's "
+        "`detail`, so the census reports a window the caller's deltas were never measured "
+        "over — a lying diagnostic, which is worse than a dropped flag",
     ),
     # ── round 5: the launcher status at the door, and a negative log age ───────────
     Mutation(
@@ -3699,6 +3736,15 @@ MUTATIONS = [
         '        if not (name.isascii() and len(name) <= 10):',
         "the `isdigit()` conjunct is dropped, so `net`/`self`/`dma` reach `open(root/net/stat)` "
         "-> ENOTDIR -> the WHOLE reading abstains on every real `/proc`",
+    ),
+    Mutation(
+        "T54", "module",
+        '        except (IndexError, ValueError):\n            # ⛔ THE SAME RULE ONE BRANCH DOWN',
+        '        except IndexError:\n            # ⛔ THE SAME RULE ONE BRANCH DOWN',
+        "a FULL-LENGTH row whose `ppid` token is non-numeric raises ValueError straight out "
+        "of `_proc_cpu_cs` (the parse arm), escaping `subtree_cpu_cs`, whose contract is "
+        "`None` or `_ProcUnreadable` — the `)` arm is caught either way, so only that shape "
+        "distinguishes the two",
     ),
     Mutation(
         "T51", "module",
