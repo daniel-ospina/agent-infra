@@ -1535,7 +1535,8 @@ drive_gate "$T/mask-rec" "merge-priority (2 un-owned of 5 open PR(s) — PRs bef
 chmod 644 "$T/mask-rec/candidates.txt" 2>/dev/null || true
 case "$OUT_DRIVE" in
   *"5 usable candidate(s) still queued from an earlier pass"*) bad "tailnote: a RECORDED count (this cycle read nothing) printed 'still queued' in the present tense — $OUT_DRIVE" ;;
-  *"the record on disk says 5 queued; THIS cycle could not measure the queue"*) ok "tailnote: the recorded count is attributed to the ARTEFACT, and its deferral called UNPROVEN" ;;
+  *"the record on disk carries backlog=5; THIS cycle could not measure the queue"*) ok "tailnote: the recorded count is attributed to the ARTEFACT by its OWN FIELD name, and its deferral called UNPROVEN" ;;
+  *"record on disk says"*) bad "tailnote: the bracket calls the record's backlog= a 'queued' count — that is a different key on the same record — $OUT_DRIVE" ;;
   *) bad "tailnote: the recorded count got no gate at all — $OUT_DRIVE" ;;
 esac
 # and it must not name a pass, on an arm whose own sentence says the record was NOT written by the last one
@@ -2443,6 +2444,58 @@ if [ -s "$SPAWNBLOCK" ] && grep -q 'refresh-candidates.sh' "$SPAWNBLOCK" && grep
 else
   bad "spawn+skew: could not extract the refresh spawn block — the disclosure is ungraded"
 fi
+
+# ⛔ THE BRACKET IS ON FIVE ARMS, AND THREE OF THEM HAD NO FIXTURE (review P3, cycle 26). Deleting
+# `$tailnote` from the SEED-SKEW arm and the two `running` death arms left the suite fully green, so the
+# note could vanish from 3 of the 5 lines that carry it. The SEED-SKEW arm is REACHABLE with a counted
+# record (an `ok` handoff frozen past the bound, on a box where nothing can write it), so it gets a
+# positive assertion of its own — including that it does not credit a pass.
+_skewdir="$T/tail-skew"
+mkdir -p "$_skewdir/o/state" "$_skewdir/none"
+printf '%s\n' '#!/usr/bin/env bash' ': nothing here can record' > "$_skewdir/none/refresh-candidates.sh"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=judged CLEAN\n' \
+  "$(( $(date +%s) - 3 * 3600 ))" > "$_skewdir/o/state/refresh-last"
+printf '7\n8\n' > "$_skewdir/o/candidates.txt"; chmod 000 "$_skewdir/o/candidates.txt"
+drive_gate_self "$_skewdir/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$_skewdir/none"
+chmod 644 "$_skewdir/o/candidates.txt" 2>/dev/null || true
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED (SEED-SKEW):"*) ok "tailnote/seed-skew: the SEED-SKEW verdict still wins over a counted record" ;;
+  *) bad "tailnote/seed-skew: not SEED-SKEW — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"the record on disk carries backlog=5"*) ok "tailnote/seed-skew: the counted record is reported, by its own field name" ;;
+  *) bad "tailnote/seed-skew: the counted record got no bracket on the SEED-SKEW arm — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"the last pass recorded"*|*"still queued from an earlier pass"*) bad "tailnote/seed-skew: the bracket claims a present-tense/credited count on an arm that says nothing here can write the record — $OUT_DRIVE" ;;
+  *) ok "tailnote/seed-skew: and the bracket credits neither a pass nor a present-tense count" ;;
+esac
+# and the DIED arm's bracket: a measured queue must still say "still queued" (the note the SEED-SKEW arm
+# above must NOT print) — so the two arms are distinguished by where the count came from.
+_dieddir="$T/tail-died"
+mkdir -p "$_dieddir/o/state" "$_dieddir/self"
+printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$_dieddir/self/refresh-candidates.sh"
+cp "$_dieddir/self/refresh-candidates.sh" "$_dieddir/o/refresh-candidates.sh"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' \
+  "$(( $(date +%s) - 60 * 60 ))" > "$_dieddir/o/state/refresh-last"
+printf '7\n8\n' > "$_dieddir/o/candidates.txt"
+drive_gate_self "$_dieddir/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$_dieddir/self"
+case "$OUT_DRIVE" in
+  "[dispatch] BLOCKED: a refresh pass wrote its start marker"*) ok "tailnote/died: a stale tombstone still reads as a DIED pass" ;;
+  *) bad "tailnote/died: not the died reading — $OUT_DRIVE" ;;
+esac
+case "$OUT_DRIVE" in
+  *"2 usable candidate(s) still queued from an earlier pass"*) ok "tailnote/died: a MEASURED count still carries the present-tense note" ;;
+  *) bad "tailnote/died: the died arm lost its measured-count note — $OUT_DRIVE" ;;
+esac
+# and the UNAGEABLE-tombstone arm (a third site passing `$tailnote`): its own sentence names the
+# unreadable stamp, and the measured-count note must survive there too.
+printf 'result=running\nstage=provision\nrc=0\nat=not-a-number\nrepo=daniel-ospina/agent-infra\nwhy=started\n' > "$_dieddir/o/state/refresh-last"
+drive_gate_self "$_dieddir/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$_dieddir/self"
+case "$OUT_DRIVE" in
+  *"2 usable candidate(s) still queued from an earlier pass"*) ok "tailnote/unageable: the unreadable-stamp arm carries the measured-count note" ;;
+  *) bad "tailnote/unageable: that arm lost the note — $OUT_DRIVE" ;;
+esac
 
 echo
 # ── 12) THE DRIVERS RUN IN THE MODE orch-loop.sh RUNS IN (review P2, cycle 17) ──
