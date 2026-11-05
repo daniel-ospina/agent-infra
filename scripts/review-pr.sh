@@ -810,7 +810,7 @@ run_reviewer() { # <secs> <log> <prompt-file>
   # markers. `merge-one.sh` fixes this at the box level, but the seam should not depend on a
   # redaction extension being installed. `gh` reads are unaffected — the child still gets
   # GH_TOKEN/GH_REPO, which is all the verification it does.
-  ( cd "$RUN_DIR" && exec env -u AI_REVIEW_GATE_KEY "$PI_BIN" -p --provider "$LANE_PROVIDER" --model "$LANE_MODEL" --no-session "$(cat "$pf")" ) >> "$log" 2>&1 &
+  ( cd "$RUN_DIR" && exec env -u AI_REVIEW_GATE_KEY "$PI_BIN" -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$pf")" ) >> "$log" 2>&1 &
   pid=$!
   # ⛔ A KILLED SEAM MUST NOT LEAK A PAID REVIEWER (P3, fresh review of #2288 — measured): only an
   # EXIT trap was installed, so SIGTERM to this script left the `pi -p` child ALIVE (child ppid =
