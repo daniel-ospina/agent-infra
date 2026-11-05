@@ -1171,7 +1171,7 @@ def test_the_rest_fallback_asks_the_repo_it_was_given(monkeypatch):
     monkeypatch.setattr(bp, "_token", lambda: "test-token")
     monkeypatch.setattr(bp, "_rest_get_json", fake_get)
 
-    assert bp._rest_prs("open", limit=100, deadline=bp.time.time() + 30, repo=other) == []
+    assert bp._rest_prs("open", limit=100, deadline=bp.time.monotonic() + 30, repo=other) == []
     assert seen, "_rest_prs made no request at all"
     assert "/repos/%s/pulls" % other in seen[0], (
         "the REST read asked for %r, not the repo it was given" % seen[0])
@@ -1322,6 +1322,16 @@ def test_a_fix_repo_listed_twice_is_read_once(monkeypatch, no_cache):
     reads = [a for a in calls
              if a[:2] == ("pr", "list") and a[a.index("--repo") + 1] == other]
     assert len(reads) == 2, "one repo, two windows — got %d reads: %r" % (len(reads), reads)
+    # ⛔ AND THE WINDOW SIZES ARE PART OF THE CONTRACT, NOT A DETAIL (#3457 review round 6). They
+    # were unpinned: on a /tmp copy, `(500, 400)` -> `(100, 100)` left the whole suite GREEN. A
+    # 100-row merged window scrolls `agent-infra#3368`'s cover of #10114 out within DAYS (the
+    # 400-row window already spans #2035..#3418), silently re-creating the decay this change exists
+    # to remove -- and nothing would red. The tracker pair's windows are already asserted; this is
+    # the same assertion for the pair that feeds the gap count.
+    windows = {a[a.index("--state") + 1]: a[a.index("--limit") + 1] for a in reads}
+    assert windows == {"open": "500", "merged": "400"}, (
+        "the fix-repo windows must be the tracker's windows (open 500 / merged 400), got %r"
+        % (windows,))
 
 
 def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_cache):
@@ -1420,12 +1430,12 @@ def test_the_token_spawn_draws_on_the_phase_clock_too(monkeypatch, tmp_path):
     monkeypatch.setattr(bp.subprocess, "run", fake_run)
 
     # A spent clock: refuse, do NOT spend the last seconds of the pass on a credential lookup.
-    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() - 1)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() - 1)
     assert bp._token() == ""
     assert spawned == [], "a spent phase clock must refuse the credential spawn, not run it"
 
     # A live clock: the child's timeout is what is LEFT of the phase, not the flat 5 s.
-    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() + 2)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 2)
     assert bp._token() == ""                       # the fake_run raises -> caught -> ""
     assert spawned and spawned[0] is not None and spawned[0] <= 2.1, (
         "the credential spawn got %r, not what was left of the phase clock" % (spawned[0],))
@@ -1442,7 +1452,7 @@ def test_a_spent_phase_clock_refuses_the_read_instead_of_spawning(monkeypatch):
     """
     spawned = []
     monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: spawned.append(a))
-    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() - 1)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() - 1)
 
     assert bp.gh("pr", "list", "--repo", bp.REPO) is None
     assert spawned == [], "a spent clock must refuse, not spawn a read it cannot bound"
@@ -1466,7 +1476,7 @@ def test_the_phase_clock_bounds_the_rest_deadline_and_is_then_restored(monkeypat
     monkeypatch.setattr(bp, "PHASE_BUDGET_S", 5)
     monkeypatch.setattr(bp, "_PHASE_DEADLINE", None)
 
-    started = bp.time.time()
+    started = bp.time.monotonic()
     assert bp.compute() is not None
     assert deadlines, "the REST arm never ran"
     assert all(d is not None for d in deadlines)
@@ -1482,14 +1492,16 @@ def test_the_phase_budget_fits_the_slack_band_and_holds_the_rest_budget():
     * 100 s set it ABOVE the 40-90 s this step actually has left inside the tick
       (`scripts/heartbeat-loop.sh`: `run_bounded $((TARGET - IN_PASS_RESERVE))` = 390 s for the
       WHOLE `orchestrator-heartbeat.sh`, of which ~300-350 s is spent before `beta-progress.py`
-      runs at `scripts/orchestrator-heartbeat.sh:411`). A budget above the remaining slack can
+      runs (the `DELIV=` step in `scripts/orchestrator-heartbeat.sh`)). A budget above the remaining
+      slack can
       never fire before `run_bounded` kills the tick, so it is an INERT ENFORCER: it looks like
       protection and protects nothing.
 
     ⛔ AND THE BAND HAS A FLOOR THE CEILING TEST CANNOT SEE. 60 s fires whenever at least 60 s of
     the pass remain — the band's middle and up — but it CANNOT fire in the band's bottom (40-59 s),
     where the tick is killed first; below 40 it is worse, and the harness's own accounting floors a
-    tick residual at 20 s (`heartbeat-loop.sh:414`). The module states that residual instead of
+    tick residual at 20 s (the `remaining()` helper in `heartbeat-loop.sh`). The module states that
+    residual instead of
     claiming the clock covers the whole band. What this test must catch is the OPPOSITE error (a
     constant so large it can never fire), which is why the ceiling is asserted against the band's
     TOP — not a figure of speech about "inside the window".
@@ -1525,7 +1537,7 @@ def test_gh_derives_its_child_timeout_from_the_phase_clock(monkeypatch):
         raise RuntimeError("stop here — the timeout is the datum")
 
     monkeypatch.setattr(bp.subprocess, "run", fake_run)
-    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.time() + 3)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 3)
     assert bp.gh("pr", "list", "--repo", bp.REPO) is None   # no output -> None
     assert seen, "gh() never spawned the child"
     assert seen[0] is not None and seen[0] <= 3.1, (
@@ -1552,10 +1564,10 @@ def test_the_rest_read_refuses_a_falsy_repo_instead_of_substituting_the_tracker(
                         lambda url, tok, timeout=None: (urls.append(url) or []))
 
     for bad in ("", "agent-infra", "daniel-ospina/", "a/b/c", False, 0):
-        assert bp._rest_prs("open", limit=100, deadline=bp.time.time() + 5, repo=bad) is None, (
+        assert bp._rest_prs("open", limit=100, deadline=bp.time.monotonic() + 5, repo=bad) is None, (
             "repo=%r must be REFUSED, not answered with the tracker's list" % (bad,))
     assert urls == [], "a refused repo still made a request: %r" % (urls,)
 
     # `None` is the documented tracker default and still works.
-    assert bp._rest_prs("open", limit=100, deadline=bp.time.time() + 5, repo=None) == []
+    assert bp._rest_prs("open", limit=100, deadline=bp.time.monotonic() + 5, repo=None) == []
     assert "/repos/%s/pulls" % bp.REPO in urls[0]

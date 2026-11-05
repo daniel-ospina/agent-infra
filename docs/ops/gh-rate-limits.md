@@ -89,14 +89,16 @@ documented policy, so this file does not restate the numbers — it names where 
 | **≥ 1 s between mutative calls** (POST/PATCH/PUT/DELETE) | `pace_mutation` |
 | Conditional REST for polling: ETag stored per URL (host + path + credential digest), `if-none-match` sent, a **304 replayed from cache** and charged nothing. The cached body is base64 (a 304 replay is byte-exact, binary included) and the cache is bounded in ENTRIES and BYTES (`GH_LIMIT_CACHE_MAX_ENTRIES` 500, `GH_LIMIT_CACHE_MAX_BYTES` 64 MiB) | `conditional_fetch` / `cache_put` / `prune_cache` |
 | The shim stays FIRST on PATH even though every gh-calling harness script prepends `/opt/homebrew/bin:/usr/local/bin` | the `$O/gh-limit` / `$O/gh-rest` re-assert in the harness scripts that prepend and invoke `gh` |
-| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary — **except `beta-progress.py`'s two PR-list REST reads, which go direct (see "A reader with its OWN REST second source" below and the matching residual)** | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the five that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned). Was nine/six until agent-infra#1874 retired `retired/queue-dispatch.py` — a retired tool is not in the beat, so it is not counted here |
+| The heartbeat's tooling (`objective.py`, `merge-queue.py`, `beta-progress.py`, `ask-owner.py`, `turn-classify.py`, `turn-end.py`, `undelivered-answers.py`, `pr-doctor.py`) reaches the layer instead of a pinned real binary — **except `beta-progress.py`'s four PR-list REST reads, which go direct (see "A reader with its OWN REST second source" below and the matching residual)** | each resolver prefers `$O/gh-rest/gh` then `$O/gh-limit/gh` (`$O`-derived, never PATH); the five that HAVE a pinned candidate also hand it through as `GH_REST_REAL_GH`/`GH_LIMIT_REAL_GH` (see the residual below for the three that never pinned). Was nine/six until agent-infra#1874 retired `retired/queue-dispatch.py` — a retired tool is not in the beat, so it is not counted here |
 ### A reader with its OWN REST second source (#2139)
 
-`beta-progress.py` (the heartbeat's DELIVERY line) reads both PR lists with `gh pr list --json`.
+`beta-progress.py` (the heartbeat's DELIVERY line) reads all four PR lists with `gh pr list --json`
+— the TRACKER's open/merged pair, and the same pair for each repo a fix lands in (`FIX_REPOS`,
+agent-infra#3457; the fix-repo rows feed the P0/P1 gap count only and never the headline number).
 Where a box has the REST adapter (`$O/gh-rest`, #1959) the OPEN read is already served over REST —
 `number,title,headRefName` are all in its `PR_FIELDS` — but **`mergedAt` is not**, so the MERGED
 read delegates to the real `gh`, i.e. GraphQL. On the cells there is no `$O/gh-rest` (#1978), so
-both reads are GraphQL. Under fleet concurrency a SECONDARY-limit refusal then took the line out
+all four reads are GraphQL. Under fleet concurrency a SECONDARY-limit refusal then took the line out
 entirely (`DELIVERY: unavailable (metrics read failed)`) while `core` read 1599/5000 and a single
 REST call answered in 0.43 s — the fleet lost its own progress measurement while a readable source
 existed. That reader therefore keeps a REST fallback of its own (`_rest_prs`), and the rules it
@@ -311,12 +313,14 @@ Two properties worth knowing before you debug it:
   of the beat — retired in agent-infra#1874, so it is no longer a resolver here.) The shell call sites
   keep the waits: they have no
   subprocess bound of their own.
-- **`beta-progress.py`'s REST fallback is OUTSIDE the layer (#2139).** Its two `/pulls`
+- **`beta-progress.py`'s REST fallback is OUTSIDE the layer (#2139).** Its four `/pulls`
   reads use urllib + the token directly, so they are not serialised by the box's single-flight
   lock, get no ETag/304 replay, and are invisible to `$GH_LIMIT_DIR/last-limit`. Deliberate: the
   adapter cannot serve `mergedAt` (`PR_FIELDS` omits it, so the merged read delegates to
-  GraphQL), and the cells have no adapter at all. The read is bounded (shared 30 s budget, paged,
-  refusing rather than truncating) and it runs only after a GraphQL read already failed.
+  GraphQL), and the cells have no adapter at all. The read is bounded (ONE shared 30 s budget for
+  all four lists — up to 18 pages — paged, refusing rather than truncating, and clamped to the
+  read phase's own 60 s clock, `PHASE_BUDGET_S`, which is what keeps the phase's worst case from
+  GROWING with `FIX_REPOS`) and it runs only after a GraphQL read already failed.
   Follow-up (#2143): model `mergedAt` in `PR_FIELDS` **and map `--state merged` to `state=closed`
   plus a non-null-`merged_at` filter** — the adapter forwards the state verbatim and REST has no
   `merged` state, so sending it as-is is a 4xx, not a list. That fixes `merge-queue.py`'s
