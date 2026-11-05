@@ -505,11 +505,30 @@ def leak_path(node, trail=""):
         return trail
     return ""
 
+# ⛔ THE LEAK SCAN RUNS FIRST — BEFORE EVERY SHAPE EXIT (#3374 review P2). It used to sit AFTER
+# the STDIO/URLTYPE/NOURL/BADDERS/… early exits, so a legacy stdio entry carrying a literal key in
+# its `command` (or in `args`/`env`, the plausible place — the old template shipped the variable
+# there) returned `STDIO:<the whole command, key included>`: the secret was ECHOED into the run log
+# by the marker, and `verify_graph_mcp` prints that marker into the bring-up log, while the leak was
+# never NAMED as a leak and the operator was told "not the hosted shape" instead. A literal must be
+# reported as `SECRET_IN_FILE:<path>` whatever shape the entry has, and no marker may carry it.
+if tok.search(raw):
+    # report the path UNDER `mcpServers` — `mcpServers.tortoise._comment` is noise when the whole
+    # file is already known to be that object, and `tortoise._comment` is what an operator greps.
+    print("SECRET_IN_FILE:%s" % (leak_path(servers) or "(unlocatable)"))
+    sys.exit(1)
+
+
+def redact(value):
+    """Mask anything shaped like a credential — a marker is ECHOED into operator-facing logs."""
+    return tok.sub("<redacted>", value if isinstance(value, str) else str(value))
+
+
 if not isinstance(t, dict):
     print("NOENTRY")
     sys.exit(1)
 if t.get("command"):
-    print("STDIO:%s" % t.get("command"))
+    print("STDIO:%s" % redact(t.get("command")))
     sys.exit(1)
 url = t.get("url") or ""
 if not isinstance(url, str):
@@ -615,12 +634,6 @@ if auth and (_m.group(1).lower() if _m else "") != "https" \
 # while `LAYER VERIFIED` printed a green credential line beside it. Both names are allowed, nothing
 # else is, and the scheme is required.
 HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$")
-# a literal credential in a SHARED file is the leak, not the config
-if tok.search(raw):
-    # report the path UNDER `mcpServers` — `mcpServers.tortoise._comment` is noise when the whole
-    # file is already known to be that object, and `tortoise._comment` is what an operator greps.
-    print("SECRET_IN_FILE:%s" % (leak_path(servers) or "(unlocatable)"))
-    sys.exit(1)
 # ⛔ A DIFFERING url is not automatically fine, and a MISSING Authorization is not automatically
 # broken: the two questions are linked. Accepting any non-empty http url let a cell whose endpoint
 # was a typo (or copied from another box) be certified LAYER VERIFIED while pointing at nothing — a
@@ -632,6 +645,15 @@ if tok.search(raw):
 if want_url and url != want_url:
     if not t.get("_selfHosted"):
         print("URL_NOT_DEFAULT:%s" % url)
+        sys.exit(1)
+    # ⛔ `_selfHosted` IS AN EXEMPTION, NOT A LICENCE TO CERTIFY ANY STRING (#3374 review P2). The
+    # branch used to print SELFHOSTED and exit 0 for ANY marked url — including a SCHEME-LESS one
+    # (`localhost:8000/mcp`), which `new URL()` in the client reads with protocol `localhost:` and no
+    # host, so a cell pointing at nothing was certified LAYER VERIFIED with a green credential line.
+    # An absolute http(s) url is the minimum this exemption can honestly certify.
+    _su = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/?#]+)", url or "", re.I)
+    if not _su or _su.group(1).lower() not in ("http", "https"):
+        print("BADURL:%s" % url)
         sys.exit(1)
     # A self-hosted entry is certified BY NAME, and its own transport spelling is part of what the
     # operator chose: the client selects StreamableHTTP from `url` alone and never reads `type`, so
@@ -679,6 +701,8 @@ PY
         fail ".mcp.json's tortoise Authorization is a ${out#BADAUTH:}, not a string — a config the client cannot expand, and a shape no merge can repair. Make it \"Bearer \${TORTOISE_MCP_API_KEY}\" (a re-install replaces it)" ;;
       URLTYPE:*)
         fail ".mcp.json's tortoise url is a ${out#URLTYPE:}, not a string — nothing can be resolved from it, so nothing can be certified (a re-install replaces the entry)" ;;
+      BADURL:*)
+        fail ".mcp.json's tortoise entry is marked _selfHosted but its url (${out#BADURL:}) is not an absolute http(s) url — the client builds a transport from it, so this cell points at nothing. Write the full url (e.g. http://localhost:8000/mcp)" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)
