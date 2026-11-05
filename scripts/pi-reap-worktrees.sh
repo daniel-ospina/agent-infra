@@ -369,7 +369,10 @@
 #   live-cwd > pin-tree | pin-tree-shape (#10114 — a HARNESS PIN TREE is a holder /proc cannot
 #   show, so it outranks EVERY removal rule that can fire on a tree that still EXISTS — rule 3, rule 4,
 #   the lane-residue gates and the rule=P aged floor, all of which sit BELOW it. This is not an
-#   enumeration to maintain: the list is `grep "printf 'remove"` on this file. The only `remove` ABOVE
+#   enumeration to maintain: the removal gates are `grep -n -F "printf 'remove\t"` on this file with
+#   comments filtered out (`| grep -v ':#'`, which also drops the line quoting this pattern) — the
+#   plain `grep "printf 'remove"` additionally lists the summary COUNTERS `printf 'remove=%s` and
+#   `printf 'removed=%s`. The only `remove` ABOVE
 #   it is the `prunable` arm, which fires only when the directory is already absent, and
 #   `unreadable-path` is a PRESERVE — so neither can destroy a pin tree. Rule 5 is a KEEP) >
 #   live-claim > claim-unverified >
@@ -3055,7 +3058,9 @@ abstain_gate() {
 # it is a preserve that can never remove. The one `remove` ABOVE it (`prunable`) fires only on a
 # directory already gone, and `unreadable-path` is a PRESERVE. ⛔ NOT an enumeration to keep: rule 5
 # is a KEEP (`preserve pr-closed-unmerged`), the removal set is wider than any list written here,
-# and the authority is the code — `grep "printf 'remove" scripts/pi-reap-worktrees.sh`.
+# and the authority is the code — `grep -n -F "printf 'remove\t" scripts/pi-reap-worktrees.sh` (the
+# escape is LITERAL in the format string) `| grep -v ':#'`. The unfiltered form also lists the summary
+# counters `printf 'remove=%s`/`printf 'removed=%s` and the lines quoting the pattern.
 #
 # TWO PROBES, and the second exists because the first can be silent:
 #   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
@@ -3117,12 +3122,15 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # unit nor `pr-repair-loop.sh` names `HARNESS_PIN` at all. Its separateness is a recorded DECISION,
     # not an accident (`templates/systemd/eldato-pr-repair.service`, "they stay separate units with
     # separate names and separate installers"). So the two production invokers of the reaper do NOT
-    # carry `HARNESS_PIN`: the repair unit, and the doctor's hygiene role, which reads `$HARNESS_PIN_FILE`.
+    # carry `HARNESS_PIN`: the repair unit, and the doctor's hygiene role, which resolves the pin tree
+    # from `$HARNESS_PIN_DIR` and never names `$HARNESS_PIN_FILE` (the only readers of that one are
+    # `install.sh` and `harness-apply-pass.sh`).
     # What is true of the two scripts named above is only that neither EXPORTS it; the plist is the
     # exporter, so "neither exports it" is not evidence about the reaper's environment. It IS inert in
-    # exactly two measured contexts: the plist-launched scheduled disk reaper, whose
-    # `EnvironmentVariables` carry `HOME`/`PATH` and not this key
-    # (`templates/launchd/reaper/com.eldato.disk-reaper.plist:57-62`), and a cell, which names the same
+    # exactly two measured contexts: the plist-launched scheduled disk reaper, whose WHOLE
+    # `EnvironmentVariables` dict (`templates/launchd/reaper/com.eldato.disk-reaper.plist:57-98`)
+    # carries NO `HARNESS_PIN` — it sets `HOME`, `PATH` and the reaper's own state/delegate keys —
+    # and a cell, which names the same
     # sha record `HARNESS_PIN_RECORD` (`cloud-cell-bringup.sh:90`). Where it IS set but keeps the
     # installer's default it derives `$HOME`, contributing the same candidate as the third source — so
     # the arm earns its place on the box that points the sha record somewhere ELSE, which
