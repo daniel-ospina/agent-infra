@@ -343,14 +343,21 @@ canon_reasons_missing() {
   [ -n "$(printf '%s\n' "$f" | inline_body_offenders)" ] && miss="$miss inline-body"
   grep -qF -e '#3445' -- "$f" 2>/dev/null || miss="$miss citation-3445"
   grep -qF -e '#729' -- "$f" 2>/dev/null || miss="$miss citation-729"
+  # The TITLE residual must be STATED, not just true: arm E3 measures that a title/label naming a
+  # destructive verb is still refused, and this pins the sentence to that fact so the two cannot drift.
+  awk 'BEGIN{n=0} /--title/ && /(still scanned|still refused|is still)/ {n=1} END{exit(n?0:1)}' "$f" 2>/dev/null \
+    || miss="$miss title-residual"
   # ⛔ THE RECIPE HALVES, each of which a review round had to fix and which nothing else pinned:
   #   call1-path   — a line that PRINTS the derived path, BEFORE the gh call, so the `write` tool has
   #                  a target. Deleting it left the canonical example unrunnable and the shard green.
   #   recipe-var   — the fresh-shell-broken `VAR=…` + `--body-file "$VAR"` recipe (see the scanner).
+  # ⛔ call1-path checks the DERIVATION, not just the word: an `echo "/tmp/pi-issue-body-shared.md"`
+  # satisfies "prints a path" while reintroducing the #729 shared-name collision the derivation exists
+  # to prevent (round 3 measured exactly that staying green).
   awk '
     /^[ \t]*#/ { next }
     {
-      if (!printed && /echo/ && /pi-issue-body-/) printed=1
+      if (!printed && /echo/ && /pi-issue-body-/ && /git rev-parse/) printed=1
       if (!ghseen && /issue[ \t]+create/) { ghseen=1; gh_at_echo = printed }
     }
     END { exit(gh_at_echo ? 0 : 1) }
@@ -375,20 +382,34 @@ readme_route_absent() {
   local r="$1"
   [ -f "$r" ] || { printf '%s\n' "$r"; return 0; }
   grep -iF -e '--body-file' -- "$r" 2>/dev/null | grep -iqF -e 'not a bypass' || printf '%s\n' "$r"
+  # The row also asserts the TITLE/LABEL residual (the fourth unpinned claim in round 3): without this,
+  # rewriting that sentence to "a title may name any verb" stayed green. E3 measures the FACT; this pins
+  # the SENTENCE. Both names are required — the example command carries `--title` on its own, so a
+  # `--title`-only check was satisfied by the EXAMPLE and let the deletion of the residual sentence pass
+  # (measured: M13). `--label` appears nowhere else in that table, so it is the discriminator.
+  RT="$(awk '/^## Escape hatches/{f=1;next} /^Rule of thumb:/{f=0} f' "$r" 2>/dev/null)"
+  printf '%s\n' "$RT" | grep -q -- '--title' || printf '%s\n' "$r(title-residual)"
+  printf '%s\n' "$RT" | grep -qi -- 'label' || printf '%s\n' "$r(label-residual)"
 }
 
-# readme_worktree_claim <file> → the file, when it claims a WORKTREE LIFTS the title refusal ("").
-# ⛔ WHY THIS IS A SEPARATE ARM. A whole review round removed "or file from a worktree" from this row
-# because it is FALSE: a title that merely MENTIONS a destructive verb is refused regardless of cwd (a
-# mention resolves to no git invocation, so the arm cannot worktree-exempt it — measured live from a
-# linked worktree). Removing the sentence without pinning its absence left it one edit from returning:
-# restoring it was measured to keep the whole shard GREEN (36/0), because arm D reads only two tokens.
+# readme_worktree_claim <file> → the file, when the escape table asserts a WORKTREE LIFTS the refusal.
+# ⛔ Matching the ASSERTION, not one sentence. Round 3 showed a predicate that matched only the two
+# phrasings a previous round deleted: the opposite claim ("A worktree lifts the title refusal, so file
+# the report from one") passed the arm green. So: strip the NEGATED forms the row is supposed to carry,
+# then look for an affirmative worktree-lifts/exempts claim.
 readme_worktree_claim() {
-  local r="$1"
+  local r="$1" txt
   [ -f "$r" ] || { printf '%s\n' "$r"; return 0; }
-  # The escape/backdoor table's own text, so a legitimate mention elsewhere cannot false-red this.
-  awk '/^## Escape hatches/{f=1;next} /^Rule of thumb:/{f=0} f' "$r" 2>/dev/null \
-    | grep -iE 'or file (the report )?from a worktree|file (it|the report) from a worktree' \
+  # ⛔ NO APOSTROPHE anywhere in this function — not even in prose. A contraction in a double-quoted
+  # sed expression desynced the guard's quote-aware walker and surfaced ~200 lines later as an
+  # `unverifiable-verb` on an unrelated `case` glob, refusing the whole suite (measured). That is why
+  # the variants below are spelled out instead of using a contraction.
+  txt="$(awk '/^## Escape hatches/{f=1;next} /^Rule of thumb:/{f=0} f' "$r" 2>/dev/null \
+    | sed -e 's/[Dd]oes NOT lift//g' -e 's/[Nn]ot lift//g' -e 's/[Nn]ever lifts//g')"
+  # Affirmative constructions ONLY. A bare "worktree"/"exempt" grep false-reds on this row's own
+  # corrective text ("the arm cannot worktree-exempt it"), so the verb must follow the noun directly:
+  # "a worktree lifts/works/is fine", or the old "file it from a worktree" remedy.
+  printf '%s\n' "$txt" | grep -iE '(worktree|from one)( +|[- ])(lifts|lift|works|is fine|exempts|bypasses|accepts)|or file (the report |it )?from a worktree' \
     && printf '%s\n' "$r"
   return 0
 }
@@ -409,10 +430,12 @@ canon_recipe_absent() {
       name=line; sub(/^[ \t]*(export[ \t]+)?/, "", name); sub(/=.*/, "", name); vars[name]=1; next
     }
     {
-      # a consumer of one of those variables
+      # a consumer of one of those variables — QUOTED or BARE. Round 3 showed the quoted-only form let
+      # `--body-file $VAR` (the identical empty-path defect) pass both this arm and the literal arm.
       for (v in vars) {
-        if (index(line, "--body-file") && (index(line, "\"$" v "\"") || index(line, "\"${" v "}\""))) {
-          print FILENAME; found=1; exit
+        if (index(line, "--body-file")) {
+          rest = substr(line, index(line, "--body-file"))
+          if (index(rest, "$" v) || index(rest, "${" v "}")) { print FILENAME; found=1; exit }
         }
       }
     }
@@ -438,6 +461,25 @@ if [ "$(printf '%s\n' "$CENSUS" | canon_in_census "$ROOT/$CANON")" = yes ]; then
 else
   bad "$CANON has no fenced \`issue create\` command — #3445's canonical example has been moved or deleted, so this shard is not measuring it"
 fi
+
+# ── A2: EVERY skill the README claims is "taught by" is actually pinned ─────────────────────────
+# ⛔ Round 3 found the floor above (>=2) was read as coverage for FIVE named files: the README row
+# says "Taught by issue-creation, debug-workflow, post-deploy-verify, carousel-b2b-strategy and
+# commit-…", and removing the example from any three of them left the shard at 38/0. A "pinned by"
+# claim is only true for the files it names, so the names are asserted, not inferred from a floor.
+NAMED_UNPINNED=""
+for n in "$CANON" \
+         skills/debug-workflow/SKILL.md \
+         skills/post-deploy-verify/SKILL.md \
+         skills/carousel-b2b-strategy/SKILL.md \
+         skills/commit-workflow/workflow/04-merge-deploy.md; do
+  if [ "$(printf '%s\n' "$CENSUS" | canon_in_census "$ROOT/$n")" != yes ]; then
+    NAMED_UNPINNED="$NAMED_UNPINNED $n"
+  fi
+done
+[ -z "$NAMED_UNPINNED" ] \
+  && ok 'and every skill the guard README names as teaching the route really carries a fenced `issue create` example — the "pinned by this shard" claim holds for the files it names, one by one' \
+  || bad "the README claims these are taught (and pinned) but they carry NO fenced \`issue create\` example:$NAMED_UNPINNED — deleting the example stops the skill teaching the route while the shard stays green"
 
 # ── B: no inline body in any fenced `issue create` command ─────────────────────────────────────
 OFFENDERS="$(printf '%s\n' "$CENSUS" | inline_body_offenders)"
@@ -525,6 +567,26 @@ PROBE
   esac
 else
   bad "$CLASSIFIER is missing — the premise arm cannot run, so the exemption this shard teaches is unverified"
+fi
+
+# ── E3: the TITLE/LABEL residual is MEASURED, not merely asserted ───────────────────────────────
+# ⛔ Round 3 found the fourth unpinned claim: both the README row and the skill state that a title or
+# label naming a destructive verb is STILL scanned and refused (— `--body-file` moves only the body) —
+# and NO arm measured it. Rewriting that sentence to its opposite survived the suite. Arm E's probe
+# carries a CLEAN title and label, so it proves only that a clean command is allowed.
+if [ -f "$CLASSIFIER" ]; then
+  TITLE_VERB="gh issue create --title \"fix: guard blocked $V\" --label \"complexity:micro\" --body-file \"\${TMPDIR:-/tmp}/pi-issue-body-${BODY_DERIV}.md\""
+  LABEL_VERB="gh issue create --title \"fix: guard false-block\" --label \"bug,$V\" --body-file \"\${TMPDIR:-/tmp}/pi-issue-body-${BODY_DERIV}.md\""
+  TITLE_VERDICTS="$(node "$T/probe.mjs" "$CLASSIFIER" "$TITLE_VERB" 2>/dev/null || echo probe-failed)"
+  LABEL_VERDICTS="$(node "$T/probe.mjs" "$CLASSIFIER" "$LABEL_VERB" 2>/dev/null || echo probe-failed)"
+  case "$TITLE_VERDICTS" in
+    "block:"*" block:"*) ok "a destructive verb in the --TITLE is STILL refused ('$TITLE_VERDICTS') even with the body passed by file — the residual both files document is measured, not asserted" ;;
+    *) bad "a destructive verb in the --title classified '$TITLE_VERDICTS', no longer block:* on both classifiers — if that refusal is gone, BOTH the README row and the skill's residual paragraph are now WRONG about the title (and a title-only workaround may be unnecessary); re-derive and update them" ;;
+  esac
+  case "$LABEL_VERDICTS" in
+    "block:"*" block:"*) ok "and the same verb in --LABEL is refused too ('$LABEL_VERDICTS') — the residual covers the label, as both files say" ;;
+    *) bad "a destructive verb in the --label classified '$LABEL_VERDICTS', no longer block:* — the README/skill claim about labels is stale; re-derive" ;;
+  esac
 fi
 
 # ── E2: WHICH layer carries the refusal — M4 must NOT be mistaken for it ────────────────────────
