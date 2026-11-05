@@ -106,8 +106,9 @@ It was a local stdio server (`${TORTOISE_HOME}/.venv/bin/python3 -m tortoise.mcp
 local FalkorDB) until `graph-mcp-provision`: that shape needs a tortoise checkout, a venv and a
 local database, none of which exists on a cell — so cells shipped no MCP config at all and every
 cell lane wrote `GRAPH-UNREACHABLE`. The database target is resolved SERVER-SIDE; a client needs
-only the endpoint and the key (`TORTOISE_MCP_API_KEY`, the standard name per `skills/research/SKILL.md` and #5153/#5343; the legacy `TORTOISE_API_KEY` is the alias). Every other base
-server is lazy (`mcp_load` on demand). **There is no `exa`** — it was uninstalled by
+only the endpoint and the key (`TORTOISE_MCP_API_KEY`, the standard name per `skills/research/SKILL.md` and #5153/#5343; the legacy `TORTOISE_API_KEY` is the alias). `tortoise` is lazy, and
+so is every other base server (`mcp_load` on demand) — the word "other" used to be here, which read
+as "tortoise is the one eager exception" in the paragraph that says it is lazy. **There is no `exa`** — it was uninstalled by
 owner ruling (2026-10-31: *"exa should be uninstalled because I never wanted it.
 external research should be perplexity"*), which reverses #419's "demote to lazy"
 arrangement. External search is Perplexity: the `seo-intelligence` MCP server

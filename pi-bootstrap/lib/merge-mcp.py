@@ -329,6 +329,29 @@ def host_typo(url, want_url, floor=3):
     return _edit_distance(uh, wh, floor) < floor
 
 
+def lookalike_of_hosted(cur_url):
+    """True when `cur_url`'s host is a LOOKALIKE of the HOSTED endpoint's — a 1- or 2-char typo.
+
+    ⛔ THE COMPARAND IS `HOSTED_DEFAULT_URL`, NEVER THE TEMPLATE'S URL (#3374 review, round 11 P2).
+    `host_typo`'s own docstring is about "the hosted endpoint", and its whole job is to stop an
+    entry being PRESERVED and marked `_selfHosted` while it carries
+    `Bearer ${TORTOISE_MCP_API_KEY}` — so the thing it must compare against is the endpoint that
+    key belongs to. The caller passed the TEMPLATE's url, which is the same value for the shipped
+    template and a DIFFERENT endpoint for a self-hosting one (the documented shape: point `url` at
+    your own daemon). Two failures followed, both measured:
+      * a two-daemon LAN fleet — `192.168.1.5` in the template, `192.168.1.6` on one cell — is ONE
+        character apart, so the merge REPOINTED that cell at its neighbour's daemon and printed a
+        reason calling the neighbour "the hosted host". A genuine self-host is a different host and
+        is PRESERVED (rule 3 of this file's docstring); this arm was overriding that rule.
+      * the sentence was false about the artifact — no "hosted host", no tenant key, on a keyless
+        self-host — the docstring-vs-code defect this PR keeps correcting.
+    For the SHIPPED template `want.url` IS `HOSTED_DEFAULT_URL`, so the guarded case behaves exactly
+    as before; what changes is only the self-hosting template, where the old comparand was a second
+    endpoint nobody's key belongs to.
+    """
+    return host_typo(cur_url, HOSTED_DEFAULT_URL)
+
+
 def _loopback(authority):
     """⛔ MUST MATCH `cell-install.sh`'s `_loopback` — the verifier applies the same rule, and a
     disagreement here is the "install preserves what verify refuses" loop this file's docstring
@@ -755,19 +778,22 @@ def main(argv):
                 % (cur.get("url"), want.get("url"))
             )
             have["tortoise"] = want
-        elif ok_entry and host_typo((cur.get("url") or "").strip(), (want.get("url") or "").strip()):
+        elif ok_entry and lookalike_of_hosted((cur.get("url") or "").strip()):
             # A LOOKALIKE HOST IS A TYPO TOO. `near_miss` only compares the authority, so one wrong
             # letter in the HOST read as "a genuine self-host" and was preserved AND marked — which
             # is how a repair install turned `--verify`'s refusal into a certification, with the live
             # key attached (#3374 review P1). A genuine self-host is never 1–2 characters from the
             # hosted endpoint, so the default wins here for the same reason it wins on a same-host
             # typo: the box must not be left pointing at an endpoint nobody meant to configure.
+            # ⛔ THE HOST NAMED BELOW IS THE HOSTED ENDPOINT — the one actually compared against —
+            # never the template's url by reflex: a sentence calling a LAN address "the hosted host"
+            # is false about the artifact (#3374 review, round 11 P2).
             print(
                 "NOTE: replaced a LOOKALIKE of the hosted host (%s) with the default (%s) — a host "
                 "one or two characters from %s is a typo, not a self-host, and marking such an entry "
                 "_selfHosted would certify it with the tenant key attached. A genuine self-host is a "
                 "different host; re-point it deliberately if this was one"
-                % (cur.get("url"), want.get("url"), (want.get("url") or "").strip())
+                % (cur.get("url"), want.get("url"), HOSTED_DEFAULT_URL)
             )
             have["tortoise"] = want
         elif ok_entry:
@@ -907,6 +933,27 @@ def main(argv):
         if name == "tortoise":
             continue                    # refused by `usable()`, and named by `--verify` already
         at = token_path(entry, name)
+        if at:
+            print(
+                "NOTE: .mcp.json STILL carries a literal credential at %s — this merge preserved it, "
+                "and `--verify` will refuse this file until it is removed. Make it env-indirect "
+                '(e.g. "${YOUR_VAR}") or delete the entry' % at
+            )
+
+    # ⛔ AND THE SAME SENTENCE ONE LEVEL UP (#3374 review, round 11 P1). The loop above covers the
+    # SERVERS; `--verify` scans the WHOLE file, so a literal pasted into a TOP-LEVEL key (a
+    # `_noteboard`, a hand-added `"token"`) was found by the verifier and named NOWHERE: the install
+    # log read `hosted tortoise entry installed`, rc=0, and the layer then refused the file it had
+    # just written — the un-converging repair path round 6 fixed for servers, still open for the
+    # container. Exactly `dst`'s non-server keys, because they are the only top-level keys this
+    # merge can carry through (`merged` below is `{**dst, "mcpServers": have}`; the template's other
+    # root keys are never copied), and the same NAMING decision applies for the same reason: the
+    # bytes are already in the destination and a merge never clobbers, so the sentence is the
+    # missing half — refusing here would add a block without removing the secret.
+    for key, value in sorted(dst.items()):
+        if key == "mcpServers":
+            continue
+        at = token_path(value, key)
         if at:
             print(
                 "NOTE: .mcp.json STILL carries a literal credential at %s — this merge preserved it, "

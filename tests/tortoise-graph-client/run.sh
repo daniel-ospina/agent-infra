@@ -137,7 +137,15 @@ SERVED_N="$(printf '%s\n' "$SERVED" | awk -F, '{print NF}')"
 # server, or R5's "every call is advertised" is a comparison against a set that omits the very tools
 # the defect lived on.
 for NEED in $WRITE_TOOLS; do
-  printf '%s\n' "$SERVED" | tr ',' '\n' | grep -qx "$NEED" \
+  # ⛔ A HERE-STRING, NEVER `printf … | grep -q` (#3374 review, round 11 P2). Under `set -uo pipefail`
+  # a producer that feeds an early-exiting consumer takes SIGPIPE, the PIPELINE reports 141, and the
+  # `&& pass || fail` chain takes the FAIL branch on a payload that visibly contains the pattern — a
+  # false RED in the very suite this PR cites as its R5 evidence, now that `scripts/run-bash-shards.sh`
+  # discovers `tests/*/run.sh` as a shard. Measured on a 40-run concurrency probe: 5 failed, and an
+  # instrumented copy caught `grc=141` from `printf` (the mechanism is written down in this repo at
+  # `scripts/cloud-cell-bringup.sh:954`, and `scripts/check-no-sigpipe-grep.sh`'
+  # blessed form is the here-string). `${SERVED//,/$'\n'}` splits with no process at all.
+  grep -qx "$NEED" <<<"${SERVED//,/$'\n'}" \
     && pass "…and the served surface advertises $NEED (the write handler R5 must be able to check)" \
     || fail "tools/list does not advertise $NEED — the surface R5 compares against is missing a handler the client calls, so the write path cannot be covered"
 done
@@ -162,7 +170,7 @@ mode retired
 call get pt_abc
 [ "$RC" -eq 4 ] && pass "a RETIRED TOOL notice exits 4 — the answer is not the tool's result" \
   || fail "a retired-tool answer exited $RC (must be 4): the payload is contaminated, so exit 0 reports 'a point' where the server said 'this tool is retired'"
-printf '%s' "$ERR" | grep -q 'GRAPH-RETIRED-TOOL' \
+grep -q 'GRAPH-RETIRED-TOOL' <<<"$ERR" \
   && pass "…and NAMES it: GRAPH-RETIRED-TOOL on stderr, with the server's own notice" \
   || fail "…but never named the retirement (stderr: $ERR)"
 [ -z "$OUT" ] && pass "…and prints NOTHING on stdout, so a piped consumer sees no half-answer" \
@@ -179,7 +187,7 @@ mode empty
 call get pt_nope
 [ "$RC" -eq 4 ] && pass "get '\{\}' → exit 4 (nothing matched is never OK)" \
   || fail "get on a nonexistent point exited $RC — a mistyped id reads as a landed write"
-printf '%s' "$ERR" | grep -q 'GRAPH-EMPTY-RESULT' \
+grep -q 'GRAPH-EMPTY-RESULT' <<<"$ERR" \
   && pass "…and says GRAPH-EMPTY-RESULT, not a silent success" \
   || fail "…without naming the empty result (stderr: $ERR)"
 # …but a LIST verb may legally answer `[]`. The rule is scoped to the read-one-entity verb, so this
@@ -198,7 +206,7 @@ mode budget
 call get pt_abc
 [ "$RC" -eq 4 ] && pass "an isError answer (the server's wait-budget shape) exits 4 — an error is not a result" \
   || fail "an isError answer exited $RC (must be 4): the tool's error text is then read as an answer, and a lane reports a value the server refused to produce"
-printf '%s' "$ERR" | grep -q 'GRAPH-TOOL-ERROR' \
+grep -q 'GRAPH-TOOL-ERROR' <<<"$ERR" \
   && pass "…and NAMES it: GRAPH-TOOL-ERROR on stderr" \
   || fail "…but never named the tool error (stderr: $ERR)"
 [ -z "$OUT" ] && pass "…and prints NOTHING on stdout (no error text dressed as data)" \
@@ -313,7 +321,7 @@ bad_args="$(_arg_schema "$TMP/calls.jsonl" "$TMP/served-schema.json")"
 # the lookup) — a green that measures the checker's silence rather than the client's correctness.
 printf '%s\n' '{"method":"tools/call","params":{"name":"tortoise_create_operator","arguments":{"op_type":"IMPL","source_id":"a","target_ids":["b"],"label":"supports"}}}' > "$TMP/calls-badlabel.jsonl"
 bad_args="$(_arg_schema "$TMP/calls-badlabel.jsonl" "$TMP/served-schema.json")"
-printf '%s' "$bad_args" | grep -q 'undeclared label' \
+grep -q 'undeclared label' <<<"$bad_args" \
   && pass "…and the checker CATCHES the 'label' spelling the defect shipped (it is not declared — the served property is 'semantics')" \
   || fail "the argument checker did NOT catch a call sending 'label' instead of 'semantics' (got: '${bad_args}') — the arm above is then measuring its own silence, which is the very 'pins against belief' defect it was added to close"
 # ⛔ THE HERE-DOC LIVES IN A FUNCTION BODY, NEVER INSIDE THE `$( )` (#2248, #2930). bash 3.2's
