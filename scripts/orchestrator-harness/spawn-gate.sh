@@ -1183,7 +1183,7 @@ LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 LANE_END_BRANCH=""      # the branch the tree is on (or `detached-<sha>`), never invented
 LANE_END_HEAD=""        # HEAD as measured at exit
 LANE_END_PUSH=""        # running | pushed | nothing | unmeasured | detached | verify-unanswered | push-unreported
-                        #   | push-killed | verify-ancestry-unmeasured
+                        #   | push-killed | verify-ancestry-unmeasured | verify-head-unreadable
                         #   refused-main-checkout | refused-protected | refused-unknown-default |
                         #   refused-pushurl-divergent | refused-pushurl-unresolved | FAILED | UNAVAILABLE
 LANE_END_PUSH_URL=""    # the repository the push would have reached (origin's PROVEN push target), so every
@@ -1586,8 +1586,16 @@ lane_end_push() {
     # claim `= this worktree's HEAD` over a matching-by-accident sha, recording push=pushed). `local mine`
     # is already declared, so the old `-n "$mine"` guard bought no `set -u` safety — it only turned "could
     # not read HEAD" into a PASS, which is the one direction this check must never take.
-    LANE_END_PUSH="FAILED"
-    echo "[lane-exit] ⛔ label=$label: the push exited 0 and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read — so nothing proves the remote holds THIS lane's commit. Recorded as FAILED rather than as a delivery; $unpushed commit(s) must be assumed still only on this disk" >> "$log" 2>/dev/null || true
+    # ⛔ AND `FAILED` WAS STILL TWO FACTS UNDER ONE NAME (review round 4, P1 — REPRODUCED). This arm means
+    # "I could not read MY OWN head, so NO COMPARISON WAS MADE" — but both artifact consumers split only on
+    # `LANE_END_ORIGIN`, so it printed "…which is not the HEAD this terminal measured (<unknown>): the
+    # commit(s) from this lane were NOT delivered to that ref" (and the caveat: "did NOT reach that ref").
+    # A comparison that could not be made was published as a MEASURED ABSENCE — the class this whole
+    # feature exists to remove — and the log line beside it already said the opposite ("nothing proves the
+    # remote holds THIS lane's commit"). So the unmeasurable half gets its own verdict, which asserts
+    # neither delivery nor loss and names the read that would settle it.
+    LANE_END_PUSH="verify-head-unreadable"
+    echo "[lane-exit] ⛔ label=$label: the push exited 0 and origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD could NOT be read ($unpushed commit(s) were counted, so the repository reads — a partial/promisor clone, a corrupt odb, or a permission problem on the ref). NO COMPARISON WAS MADE, so this terminal asserts NEITHER delivery NOR loss. Read it yourself before reaping: git -C $root rev-parse HEAD, then git -C $root merge-base --is-ancestor <that sha> $LANE_END_ORIGIN" >> "$log" 2>/dev/null || true
   elif [ "$LANE_END_ORIGIN" != "$mine" ]; then
     # ⛔ A DIFFERENT SHA IS THREE FACTS, AND ONLY ONE OF THEM IS A NON-DELIVERY (review of PR #3399, P2 —
     # REPRODUCED). This arm used to record `FAILED` on inequality ALONE and say "this lane's commits are NOT
@@ -1753,6 +1761,16 @@ lane_end_next() {
     UNAVAILABLE|detached|refused-unknown-default|refused-pushurl-divergent|refused-pushurl-unresolved)
       printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. They survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s%s\n' \
         "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" \
+        "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
+    # ⛔ NO COMPARISON WAS MADE, SO NO DELIVERY VERDICT (review round 4, P1 — REPRODUCED). The push exited 0
+    # and the remote answered with a sha, but this worktree's own HEAD could not be read, so the two were
+    # never compared. `FAILED` used to carry it and both consumers read `branch_on_origin` non-empty and
+    # printed "which is not the HEAD this terminal measured (<unknown>) … were NOT delivered to that ref" —
+    # a measured absence fabricated from a missing measurement.
+    verify-head-unreadable)
+      printf 'MANUAL — the remote ANSWERED and holds refs/heads/%s at %s, but the HEAD of this worktree could NOT be read, so NO COMPARISON WAS MADE: this artifact asserts NEITHER delivery NOR loss for the commit(s) on %s. Read it yourself before reaping %s — git -C %s rev-parse HEAD, then compare it with %s%s%s\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ORIGIN:-<sha>}" "${LANE_END_BRANCH:-<unknown>}" \
+        "${LANE_END_ROOT:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_ORIGIN:-<sha>}" \
         "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
     # ⛔ AN ANCESTRY THAT COULD NOT BE MEASURED IS NOT A NON-DELIVERY (review round 2, P1 — REPRODUCED). The
     # remote ANSWERED with a sha this worktree does not even have (`--is-ancestor` exited 128), so no relation
@@ -2052,7 +2070,7 @@ lane_end_push_caveat() {
       printf ' — AND the unpushed-commit count on %s could NOT be read (push=unmeasured), so whether those commits exist anywhere but this disk is NOT established either way — read it yourself (`git -C %s rev-list --count HEAD --not --remotes`, the SAME endpoint-free enumeration this terminal used, so it answers the same question instead of a narrower one about a single remote that may not even carry the branch)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" ;;
     UNAVAILABLE|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
       printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
-    verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured)
+    verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured|verify-head-unreadable)
       printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
     running)
       printf ' — AND this marker was written BEFORE the push step returned (push=running), so the branch push at %s established NOTHING either way, which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" ;;
@@ -2382,7 +2400,7 @@ terminal_wip_rescue() {
       case "${LANE_END_PUSH:-}" in
         pushed)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br existed ONLY locally and the exit path PUSHED them to origin refs/heads/$br (see the [lane-exit] line above) — bg-rescue-wip.sh archives UNCOMMITTED work only, so the branch push is what covers this case" >> "$log" ;;
-        verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured)
+        verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured|verify-head-unreadable)
           # ⛔ SAME RULE AS THE ARTIFACT (review cycles 11 and 12): none of these verdicts measured delivery
           # OR loss, so the log may not say "were NOT pushed" any more than `next=` may say "exist only on
           # this disk". The reader is told exactly what was and was not established.
