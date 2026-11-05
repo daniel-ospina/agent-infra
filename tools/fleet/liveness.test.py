@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-five tests with one hundred and five paired mutations: every mutation re-
+55 tests with 105 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. (These two numbers are the measured ones; the runner also
-prints them, and ``check_header_counts()`` reddens the suite if they drift apart
-— a hardcoded count in a verification artifact is a claim like any other.)
+evidence mechanical. (These numbers are the measured ones, and they are DIGITS so
+that `check_header_counts()` can hold every occurrence to the suite: the opening
+sentence above, and the two command examples below. A count in a verification
+artifact is a claim like any other.)
 Seven of them pin the #1254 TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
@@ -3936,30 +3937,43 @@ def run_mutations():
 
 
 def check_header_counts() -> int:
-    """Hold this file's own stated counts to the measurement.
+    """Hold EVERY count this file states to the measurement.
 
     ⛔ A COUNT IN A VERIFICATION ARTIFACT IS A CLAIM, and this header has been stale
-    before: it said 54 tests / 100 mutations while the suite held 55 / 104, because
-    nothing read it and so nothing could go red. `dceeb68e8` had bumped 51/72 -> 54/100,
-    and the tests added afterwards were never reflected. The runner already PRINTS the
-    authoritative numbers; this makes the prose agree with them or the suite fail.
+    before: the first version of this gate read only the two command examples below,
+    while its own docstring claimed it checked "these two numbers" in the opening
+    sentence — so editing the sentence alone left the suite GREEN and the gate
+    announcing a match it had never tested (measured: exit 0 with a wrong first
+    sentence). Every occurrence is checked now, and the prose uses digits so the
+    words-form cannot drift out of reach.
+
+    Provenance, verified per commit rather than asserted (the first version of this
+    docstring got it wrong and a reviewer falsified it): `main`'s baseline was 51/72
+    (`origin/main:tools/fleet/liveness.test.py:20-21`), `dceeb68e8` moved the header
+    53/93 -> 54/96, `aa424dafc` reached 99 -> 100, and the rescue commits after the
+    #3404 rebase brought it here.
     """
     import re as _re
     with open(__file__, encoding="utf-8") as fh:
         src = fh.read()
+    m_p = _re.search(r"^(\d+) tests with (\d+) paired mutations", src, _re.M)
     m_t = _re.search(r"# the (\d+) tests, green", src)
     m_m = _re.search(r"each mutation, RED \((\d+)\)", src)
-    want = (("tests", len(TESTS)), ("mutations", len(MUTATIONS)))
-    got = (("tests", int(m_t.group(1)) if m_t else None),
-           ("mutations", int(m_m.group(1)) if m_m else None))
+    # (label, stated, measured) — one row per OCCURRENCE, so no copy can be skipped.
+    rows = [
+        ("opening sentence, tests", int(m_p.group(1)) if m_p else None, len(TESTS)),
+        ("opening sentence, mutations", int(m_p.group(2)) if m_p else None, len(MUTATIONS)),
+        (":run example, tests", int(m_t.group(1)) if m_t else None, len(TESTS)),
+        (":run example, mutations", int(m_m.group(1)) if m_m else None, len(MUTATIONS)),
+    ]
     bad = 0
-    for (what, g), (_, w) in zip(got, want):
-        if g != w:
-            print("   ❌ HEADER STALE — the docstring says %r %s, the suite holds %d"
-                  % (g, what, w))
+    for label, stated, measured in rows:
+        if stated != measured:
+            print("   ❌ HEADER STALE — %s says %r, the suite holds %d"
+                  % (label, stated, measured))
             bad += 1
     if not bad:
-        print("   ok   the docstring's counts match the suite (%d tests, %d mutations)"
+        print("   ok   every stated count matches the suite (%d tests, %d mutations)"
               % (len(TESTS), len(MUTATIONS)))
     return bad
 
