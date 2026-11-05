@@ -1092,6 +1092,85 @@ case "$OUT_DRIVE" in
   *"THIS cycle could not measure the queue"*"recorded backlog=0"*) ok "recorded-zero: the line attributes the zero to the PASS, not to a measurement now" ;;
   *) bad "recorded-zero: the line does not attribute the recorded zero — $OUT_DRIVE" ;;
 esac
+# ⛔ THE ARMS ADDED BESIDE THAT ONE ARE GRADED TOO (review P3, cycle 23). The arity fixtures above write
+# `backlog=0`, so they pin the RECORDED-ZERO sentence only; the `deferred (` arms (a recorded COUNT, in
+# BOTH branches) and the `running` gate had no assertion at all — measured: a surplus `printf` argument
+# added to the recorded-COUNT arm and the `running` gate both deleted left the suite 252/0 GREEN.
+_recorded_line_check() {   # $1=handed, $2=label, $3=backlog (default 0), $4=result (default ok)
+  mk_case "ok-arity-$2"
+  mk_tool_clean "$D"
+  printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+  mkdir -p "$D/o/state"
+  if [ "${4:-ok}" = "running" ]; then
+    printf 'result=running\nat=%s\nrepo=daniel-ospina/agent-infra\nbacklog=%s\nhanded=%s\n' "$(date +%s)" "${3:-0}" "$1" > "$D/o/state/refresh-last"
+  else
+    printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=0\nqueued=0\nbacklog=%s\nhanded=%s\nqueue_readable=1\n' "$(date +%s)" "${3:-0}" "$1" > "$D/o/state/refresh-last"
+  fi
+  OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+}
+
+# the arms added beside the RECORDED-ZERO one need the same shape checks (see the note below)
+_arm_shape_check() {   # $1=handed, $2=label, $3=backlog, $4=result → OUT_DRIVE + two shape checks
+  _recorded_line_check "$1" "$2" "$3" "$4"
+  _n="$(printf '%s\n' "$OUT_DRIVE" | grep -c '^\[dispatch\]' || true)"
+  if [ "$_n" = "1" ]; then ok "$2: exactly ONE [dispatch] line"
+  else bad "$2: $_n [dispatch] lines — printf recycled the format over a surplus argument: $OUT_DRIVE"; fi
+  case "$OUT_DRIVE" in
+    *"| PR path: stub PR path"*) ok "$2: the sentence keeps its \`| PR path:\`" ;;
+    *) bad "$2: the prtail was displaced — $OUT_DRIVE" ;;
+  esac
+}
+_arm_shape_check 4242 ok-recorded-count 2 ok
+case "$OUT_DRIVE" in
+  *"recorded backlog=2"*) ok "ok-recorded-count: the recorded count is stated" ;;
+  *) bad "ok-recorded-count: the recorded count is not stated — $OUT_DRIVE" ;;
+esac
+_arm_shape_check "" running-recorded-count 5 running
+case "$OUT_DRIVE" in
+  *"the PASS's count"*) ok "running-recorded-count: the count is attributed to the pass" ;;
+  *) bad "running-recorded-count: the count is not attributed to the pass — $OUT_DRIVE" ;;
+esac
+_arm_shape_check "" running-recorded-zero 0 running
+case "$OUT_DRIVE" in
+  *"the queue is EMPTY"*) bad "running-recorded-zero: a RECORDED zero printed 'the queue is EMPTY' over a queue this cycle could not read — $OUT_DRIVE" ;;
+  *"the PASS's count"*) ok "running-recorded-zero: the zero is attributed to the pass, and EMPTY is not claimed" ;;
+  *) bad "running-recorded-zero: no attributing sentence — $OUT_DRIVE" ;;
+esac
+# NON-VACUITY, per arm: delete each count gate and the present-tense claim comes back.
+# ⛔ THE FIXTURE MUST STAY UNREADABLE FOR THE MUTANT DRIVE: `_recorded_line_check` restores the read bit on
+# its way out (so later cases are not poisoned), and a readable queue turns the record's count into a
+# MEASUREMENT — which would make the mutant "reproduce" a claim that is true. Re-applied here, and both
+# arms are driven on the SAME fixture so the differential is the gate itself.
+_count_gate_mut() {   # $1 = result (ok|running), $2 = sed pattern kind, $3 = mutant file
+  local _res="$1" _fan="$3"
+  # ⛔ CAPTURE BEFORE THE NEXT `mk_case`: `$D` is global, so reading `$D/base.out` after the second fixture
+  # is built reads a path in the NEW case directory — the file is not there, and the assertion grades an
+  # empty string (measured: the shipped-arm check failed with an empty message while the mutant check, read
+  # before the switch, passed).
+  _recorded_line_check "" "countmut-${_res}-base" 2 "$_res"; chmod 000 "$D/o/candidates.txt" 2>/dev/null
+  _base_out="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+  _recorded_line_check "" "countmut-${_res}-mut" 2 "$_res"; chmod 000 "$D/o/candidates.txt" 2>/dev/null
+  _mut_out="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$_fan" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
+  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
+  case "$_base_out" in
+    *"recorded backlog=2"*) ok "count-gate/$_res: SHIPPED — the recorded count is attributed to the pass" ;;
+    *) bad "count-gate/$_res: the shipped arm did not attribute the count — $(printf '%s' "$_base_out" | head -c 200)" ;;
+  esac
+  case "$_mut_out" in
+    *"usable candidate(s) queued, head #"*) ok "count-gate/$_res: non-vacuity — un-gating the arm restores the present-tense claim" ;;
+    *) bad "count-gate/$_res: the un-gated arm did not reproduce the claim — $(printf '%s' "$_mut_out" | head -c 200)" ;;
+  esac
+}
+FNSOKM="$T/origination-fns-count-ok.sh"
+sed 's/^    if \[ "\$backlog" -gt 0 \] \&\& \[ "\$_bl_state" = "READ" \]; then$/    if [ "$backlog" -gt 0 ]; then/' "$FNS" > "$FNSOKM" 2>/dev/null
+if cmp -s "$FNS" "$FNSOKM" 2>/dev/null; then bad "ok-count-gate: the un-gate mutation did not apply — the sed anchor drifted"
+else _count_gate_mut ok ok "$FNSOKM"; fi
+FNSRUNM="$T/origination-fns-count-running.sh"
+sed 's/^    elif \[ "\$backlog" -gt 0 \] \&\& \[ "\$_bl_state" = "READ" \]; then$/    elif [ "$backlog" -gt 0 ]; then/' "$FNS" > "$FNSRUNM" 2>/dev/null
+if cmp -s "$FNS" "$FNSRUNM" 2>/dev/null; then bad "running-count-gate: the un-gate mutation did not apply — the sed anchor drifted"
+else _count_gate_mut running running "$FNSRUNM"; fi
 # NON-VACUITY: without the RECORDED arm the beat falls through to the measured-EMPTY sentence (driven
 # while the queue is STILL unreadable — restoring the read bit first would send the drive down the
 # `skipped` arm and grade nothing).
@@ -1099,6 +1178,11 @@ FNSRZ="$T/origination-fns-recorded-rev.sh"
 sed 's/^      elif \[ "\$_bl_state" = "RECORDED" \]; then$/      elif false; then/' "$FNS" > "$FNSRZ" 2>/dev/null
 if cmp -s "$FNS" "$FNSRZ" 2>/dev/null; then bad "recorded-zero: the arm-removal mutation did not apply — the sed anchor drifted"
 else
+  mk_case ok-recorded-zero-rev
+  mk_tool_clean "$D"
+  printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
+  mkdir -p "$D/o/state"
+  printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=0\nqueued=0\nbacklog=0\nhanded=\nqueue_readable=1\n' "$(date +%s)" > "$D/o/state/refresh-last"
   OUT_M="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNSRZ" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
   case "$OUT_M" in
     *"the queue is EMPTY"*) ok "recorded-zero: non-vacuity — removing the RECORDED arm restores the false EMPTY claim" ;;
@@ -1111,15 +1195,6 @@ chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
 # asserting `recorded backlog=` with nothing after it — and the first lost its `| PR path:` to a bare issue
 # number. Every other assertion here is a substring match on one line, which is exactly why nothing caught
 # it; this one counts LINES and requires the prtail to survive, for BOTH values of `handed=`.
-_recorded_line_check() {   # $1 = handed value → sets OUT_DRIVE
-  mk_case "ok-arity-$2"
-  mk_tool_clean "$D"
-  printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
-  mkdir -p "$D/o/state"
-  printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=0\nqueued=0\nbacklog=0\nhanded=%s\nqueue_readable=1\n' "$(date +%s)" "$1" > "$D/o/state/refresh-last"
-  OUT_DRIVE="$(O="$D/o" LOG=/dev/null bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
-  chmod 644 "$D/o/candidates.txt" 2>/dev/null || true
-}
 _recorded_line_check 4242 withhead
 _n_dispatch="$(printf '%s\n' "$OUT_DRIVE" | grep -c '^\[dispatch\]' || true)"
 [ "$_n_dispatch" = "1" ] && ok "arity/handed=4242: the beat printed exactly ONE [dispatch] line (a surplus printf argument would recycle the format into a second)" \
@@ -2308,7 +2383,7 @@ _drv_scan() {   # $1 = file to scan → sets _drv_total, _drv_unpinned
 # The population is pinned to a COUNT rather than floored: a line-based scan with a floor let a driver
 # evaded it simply by being REFORMATTED across two lines, which is the defect this section exists to
 # catch (review P3, cycle 18).
-_drv_expect=18
+_drv_expect=20
 _drv_scan "$0"
 if [ -z "$_drv_unpinned" ] && [ "$_drv_total" -eq "$_drv_expect" ]; then ok "every driver of the shipped block runs under \`set -u\` ($_drv_total checked, count pinned)"
 else bad "drivers WITHOUT \`set -u\` (${_drv_unpinned:-none}) or a population of $_drv_total where $_drv_expect are declared — a driver that skips the prologue, or leaves the population, is invisible here"; fi

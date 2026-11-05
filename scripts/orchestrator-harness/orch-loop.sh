@@ -2279,9 +2279,19 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     elif [ "$backlog" -gt 0 ]; then
       printf '[dispatch] deferred (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s, which is the PASS'"'"'s count and not a measurement now; a refresh pass wrote its start marker and has recorded no outcome yet, so origination is UNPROVEN | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$age" "$backlog" "$prtail"
+    elif [ "$_bl_state" = "RECORDED" ]; then
+      # ⛔ THE SAME ARM AS THE `result=ok` BRANCH (review P3, cycle 23). A record carrying `backlog=0` is a
+      # number written earlier, and it DOWNGRADED the correct UNKNOWN sentence below into a present-tense
+      # "the queue is EMPTY" over a file this cycle never read: `_bl_state` was `RECORDED`, not `UNKNOWN`,
+      # so the UNKNOWN arm did not take it. Only `READ` may say EMPTY.
+      _handed_word="handed nothing"
+      [ -n "$hrec" ] && _handed_word="handed #$hrec"
+      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s and %s, which is the PASS'"'"'s count and not a measurement now; a refresh pass wrote its start marker and has recorded no outcome yet, so origination is UNPROVEN and this is NOT evidence the queue is empty | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$backlog" "$_handed_word" "$prtail"
     else
       # The empty-queue-yet-fresh case: the pass is in flight and has not queued anything YET. That is
-      # the ordinary state for a healthy pass on a short backlog, so it must not be BLOCKED.
+      # the ordinary state for a healthy pass on a short backlog, so it must not be BLOCKED — and it is
+      # reachable only from `READ`, so "the queue is EMPTY" is a measurement this cycle took.
       printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY; a refresh pass wrote its start marker %s and has recorded no outcome yet, so this is work in progress, not a drained queue and not a death | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$age" "$prtail"
     fi
