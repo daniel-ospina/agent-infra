@@ -1549,6 +1549,18 @@ Found N issues:
 
 2. ...
 
+### Mutation attribution
+
+```
+MUTATION ATTRIBUTION:
+- assertion: <the behaviour each new assertion protects> | mutant: <the revert> | red: <the row that goes red>
+```
+
+⛔ **Not a table, and not the template above left unfilled.** `record-review.sh`'s row grammar requires
+one **bullet** carrying `assertion:` + `mutant:` + `red:` (`row:` also accepted) with **no
+angle-bracketed placeholder left in a slot** — an unfilled copy, or the help text the refusal prints, is
+REFUSED (that paste was a measured bypass). One bullet per assertion.
+
 🤖 Generated with [Pi](https://pi.dev)
 
 <sub>- If this code review was useful, please react with 👍. Otherwise, react with 👎.</sub>
@@ -1561,8 +1573,26 @@ Or if no issues:
 
 No issues found. Checked for bugs, guidance compliance, historical context, and prior PR comments.
 
+MUTATION ATTRIBUTION:
+- assertion: <the behaviour the new assertion protects> | mutant: <the revert> | red: <the row that goes red>
+
 🤖 Generated with [Pi](https://pi.dev)
 ```
+
+⛔ **The `MUTATION ATTRIBUTION` block is REQUIRED, not decoration (agent-infra#3442).** For each
+assertion the diff ADDS that claims to protect a behaviour, name the mutant that reverts that
+behaviour and the row that goes RED. One row per assertion; a mutant that reddens the suite through
+an UNRELATED row is NOT a proof. A diff that adds no assertion says
+`MUTATION ATTRIBUTION: none — <why>` instead (that is a claim too, and a false one is a finding).
+`record-review.sh` REFUSES a `clean` record whose artifact carries no such block (exit 3), so a clean
+review without it cannot be recorded and the PR cannot land. Why: five PRs in one night passed clean
+on assertions that could not fail (#3355, #3368 ×2, #3374); the missing mutation leg is exactly how
+they survived three recorded clean reviews.
+
+**Second half of the same contract — the mutant must EXIST and be runnable.** The block is a claim;
+`test-writing`/`test-review` own the proof (a `mutate_*` leg, or the observed red on revert). A
+comment explaining why an assertion cannot fail is **not** a fix: an assertion that cannot fail is a
+finding, and it must be made reachable or deleted.
 
 **Link format:** `https://github.com/<owner>/<repo>/blob/<full sha>/<file>#L<start>-L<end>`. Require full SHA, provide 1 line of context before and after the issue.
 

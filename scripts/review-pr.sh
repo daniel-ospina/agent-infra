@@ -704,6 +704,21 @@ notes are welcome under CLEAN and are listed above the verdict line.
 
 Print nothing after the verdict line. Do not write, commit, push, merge, or
 comment on GitHub: the caller posts your findings.
+
+## REQUIRED BEFORE THE VERDICT: attribute every NEW assertion to a mutant (agent-infra#3442)
+Review had no contract requiring that a new assertion can FAIL, so five PRs in one night passed clean on
+guards whose tests stay GREEN with the bug restored. Print this block BEFORE your verdict line — one
+bullet PER assertion the diff ADDS that claims to protect a behaviour:
+
+MUTATION ATTRIBUTION:
+- assertion: <the behaviour it protects> | mutant: <the revert of that behaviour> | red: <the row/test that goes red>
+
+FILL every slot: a copy of this template with the angle-bracketed slots still in it is REFUSED, and so
+is the reviewer brief pasted verbatim. A mutant that reddens the suite through an UNRELATED row is NOT a
+proof — name the row that names the behaviour. If the diff adds no assertion at all, print
+`MUTATION ATTRIBUTION: none — <why, concretely>` instead; that is a claim too, and a false one is a
+finding. The caller transcribes this block into the review comment, and \`record-review.sh\` REFUSES a
+clean record whose artifact carries none — so a clean verdict that omits it is INCOMPLETE, not clean.
 $(if [ -n "$t" ]; then cat <<TAIL
 
 ## TRUNCATED DIFF — PROOF OF THE FETCH (required, the caller PARSES it)
@@ -2177,6 +2192,100 @@ fi
 # its own): the caller must own the comment id, because a verdict whose artifact it
 # cannot name cannot be recorded.
 # post_comment <body-file> -> the comment id on stdout (empty on failure).
+# attribution_block <transcript-file> — print the reviewer's `MUTATION ATTRIBUTION` block, or nothing.
+# ⛔ IT SKIPS BLANK LINES BEFORE THE FIRST ROW AND STOPS AT THE FIRST BLANK AFTER ONE (fresh review of
+# this change, P2). Stopping at the FIRST blank line transcribed only the heading when the reviewer put a
+# blank line between the label and its list — the exact form `record-review.sh`'s own parser documents as
+# compliant — so the block was non-empty, no warning fired, and the posted CLEAN comment was refused
+# `NO-ROWS` at record time, after the review was paid for. A field that only looks present is worse than
+# a missing one.
+attribution_block() {
+  awk '
+    function trim(s) { sub(/^[ \t]+/, "", s); sub(/[ \t]+$/, "", s); return s }
+    { line = $0; low = tolower(line) }
+    # ⛔ A BLOCK ENDS ON CONTENT, NOT ON A BULLET (fresh review, cycle 4, P1). `rows` used to be set ONLY by
+    # a following bullet line, so the two forms the recorder accepts ON THE LABEL LINE ITSELF — a
+    # `MUTATION ATTRIBUTION: none — <why>` declaration, and an inline `- assertion: … | mutant: … | red: …` —
+    # never satisfied it: the blank-line skip kept running, and the "block" swallowed every later line of the
+    # reviewer output (notes, verdict prose) until a blank line that followed some later bullet. That
+    # pasted that PROSE into the evidence artifact and let `attr_block_veto` scan it, killing
+    # genuinely clean reviews whose notes merely mentioned the gate vocabulary. So: a label line that carries
+    # its OWN value counts as content, exactly like a bullet does.
+    !inblk && (low ~ /mutation[ \t]+attribution[ \t]*:/ || low ~ /^#+[^a-z0-9]*mutation[ \t]+attribution/) {
+      inblk = 1
+      print trim(line)
+      rest = line; sub(/^[^:]*:/, "", rest); rest = trim(rest)
+      if (rest != "") got = 1
+      next
+    }
+    inblk && !got && line ~ /^[ \t]*$/ { next }
+    inblk && got && line ~ /^[ \t]*$/ { exit }
+    inblk { if (line ~ /^[ \t]*[-*+][ \t]+/) got = 1; print trim(line) }
+  ' "${1:-/dev/null}" 2>/dev/null
+}
+
+# attr_block_row_ok <block> — 0 when the block carries at least one FILLED row, judged by THE RECORDER'S
+# OWN PARSER — the one that will actually judge the evidence artifact (fresh review of this change,
+# cycle 3, P2). The previous version was a grep approximation, and a THIRD grammar: it rejected a
+# recordable row whose slot merely BEGAN with a bracketed token (`- assertion: <slug> is interpolated |
+# …`), discarding a legitimate clean review; and it accepted `- assertion: …` with no `mutant:`/`red:`,
+# posting an incomplete block with no warning. Two grammars for one contract drift by construction, so
+# this borrows the shipped one from the SAME recorder the evidence will be handed to.
+# ma_slice_parser <recorder-file> — print ONLY the mutation-attribution parser slice, or fail closed.
+# ⛔ THE END ANCHOR IS VERIFIED, AND THAT IS NOT PEDANTRY (fresh review, cycle 4, P1). A `sed -n '/A/,/B/p'`
+# whose END anchor stops matching (a rename, a reordering) runs to EOF, and `sed '$d'` then deletes only the
+# final line: the "slice" becomes the WHOLE recorder, and `eval`-ing it EXECUTES the recorder's main body —
+# whose `[[ "${BASH_SOURCE[0]}" == "$0" ]]` guard is TRUE under eval in another script — with THIS script's
+# argv. Measured: 4,175 lines and the recorder's own argv parse and `exit` running inside review-pr.sh.
+# awk exits on the anchor and reports whether it saw it, so an over-wide slice is impossible by construction.
+ma_slice_parser() {
+  awk '
+    /^MUTATION_ATTRIBUTION_AWK=/ { p = 1 }
+    p && /^MUTATION_ATTRIBUTION_HELP=/ { seen = 1; exit }
+    p { print }
+    END { exit (seen ? 0 : 1) }
+  ' "${1:-/dev/null}" 2>/dev/null
+}
+ma_parser_eval() { # define mutation_attribution_missing from $RECORDER; 1 = no such parser there
+  local slice
+  [ -r "$RECORDER" ] || return 1
+  if ! slice="$(ma_slice_parser "$RECORDER")"; then return 1; fi
+  [ -n "$slice" ] || return 1
+  # The slice is a copy of the file this process is about to execute, and it is now bounded by BOTH
+  # anchors, so `eval` adds no trust boundary that running the recorder would not already cross.
+  eval "$slice"
+  declare -F mutation_attribution_missing >/dev/null 2>&1
+}
+attr_block_row_ok() {
+  local b="${1:-}"
+  # (1) STRUCTURAL FLOOR — something must actually FOLLOW the label: a bullet row, or a `none — <why>`
+  # declaration. This is not a second grammar, it is the check that the block is not just its heading
+  # (fresh review, cycle 3, P2: a heading-only block transcribed as "present", produced no warning, and
+  # was refused at record time). It runs FIRST so it still fires when the recorder cannot be read.
+  grep -qiE 'none([^a-z0-9]|$)|^[ 	]*[-*+][ 	]+' <<<"$b" || return 1
+  # (2) THE EXACT GRAMMAR, borrowed from the recorder that will judge the artifact (see ma_parser_eval).
+  if ma_parser_eval; then
+    [ -z "$(mutation_attribution_missing "$b")" ]
+    return
+  fi
+  # FAIL-SAFE FALLBACK, only reachable when the recorder cannot be read or carries no parser — in which
+  # case nothing downstream enforces the shape either. Accept rather than block a clean verdict on a copy
+  # we could not read.
+  return 0
+}
+
+# attr_block_veto <block> — 0 when the rows would trip record-review.sh's UNCONDITIONAL outcome arms.
+# ⛔ THIS IS THE RECORDER'S OWN ALTERNATION, COPIED WHOLE (fresh review of this change, cycle 3, P2). The
+# first version named five of the nine groups and called itself "narrow on purpose" — but a row about THIS
+# repo's gate plausibly quotes an unresolved-issues marker or [ADVERSARIAL-BOUND], and those were exactly
+# the groups it omitted, so the comment was posted and the recorder THEN refused the clean verdict: the
+# after-posting loss this check exists to prevent. An incomplete mirror is not narrow, it is a second
+# vocabulary. Kept in lockstep with `record-review.sh` arm (1); `tests/review-pr/run.sh` §A1b arm (4)
+# drives one row from EACH group the first version missed, so the widening cannot silently regress.
+attr_block_veto() {
+  grep -qiE 'auto-fix[[:space:]]+(stalled|failed|reached|aborted|converged|stuck)|require[s]?[[:space:]]+human[[:space:]]+(attention|input|review)|unresolved[[:space:]]+issues?|[0-9]+[[:space:]]+issues?[[:space:]]+remain|test[[:space:]]+review[[:space:]]+capped|\[ADVERSARIAL-BOUND\]|\[NO-LOOP-BUDGET\]|(^|[*[:space:]])outcome:[[:space:]]*[*[:space:]]*(not|non|no)[[:space:]_-]*clean|(^|[[:space:]>*-])review[[:space:]]*[—–-][[:space:]]*not[[:space:]_-]*clean' <<<"${1:-}"
+}
+
 # ONE posting path, so the notes comment and the verdict comment cannot disagree about
 # how an id is resolved, and the documented Step 10 fallback (the newest comment) exists
 # in exactly one place.
@@ -2260,6 +2369,40 @@ if [ "$VERDICT" = clean ] && [ -n "$FINDINGS" ]; then
 fi
 
 if [ "$VERDICT" = clean ]; then
+  # ⛔ THE ARTIFACT MUST CARRY THE REVIEWER'S OWN ATTRIBUTION (agent-infra#3442). This producer
+  # composes its comment ITSELF — the reviewer's prose is posted in a separate notes comment — so
+  # before this, every clean verdict minted through `review-pr.sh` posted a body with no
+  # `MUTATION ATTRIBUTION` block and `record-review.sh` refused it (exit 3) AFTER the review was paid
+  # for: the live seam was unrecordable (found in fresh review of this change, P1).
+  #
+  # ⛔ AND WHEN THE REVIEWER PRINTED NONE, THIS DOES NOT FABRICATE ONE. An earlier design wrote
+  # `none — no new assertion`, which would have been a claim NOBODY made and exactly the kind of
+  # invented compliance this issue exists to stop. The notice below says what actually happened, does
+  # NOT satisfy the recorder's grammar (no bullet, no `none` declaration), and therefore leaves the
+  # refusal where it belongs — with the gate that teaches the remedy.
+  ATTR_BLOCK="$(attribution_block "$LOG")"
+  # A block that is present but INCOMPLETE (a heading with no filled row) is the same failure as none:
+  # the comment would look compliant to a human and be refused by the recorder. Downgrade it to the
+  # MISSING notice so the gap is stated rather than implied.
+  if [ -n "$ATTR_BLOCK" ] && ! attr_block_row_ok "$ATTR_BLOCK"; then
+    err "review-pr: the reviewer's 'MUTATION ATTRIBUTION' block carries no FILLED row (an unfilled template, or a heading with no rows) — treating it as MISSING (agent-infra#3442)."
+    ATTR_BLOCK=""
+  fi
+  # ⛔ THE COMPOSED CLEAN BODY MUST NOT VETO ITSELF (fresh review of this change, P2). The rows are the
+  # reviewer's own words, and this repo's most-reviewed code IS the review gate — so an attribution row
+  # about that gate legitimately reads "mutant: delete arm 1b | red: 20.3b, where the comment says
+  # Outcome: not-clean", and the recorder's UNCONDITIONAL arm would then refuse a genuinely clean verdict
+  # AFTER the comment was posted. Refused EARLY instead, naming the row, so nothing is wasted after it.
+  if [ -n "$ATTR_BLOCK" ] && attr_block_veto "$ATTR_BLOCK"; then
+    err "review-pr: ⛔ the reviewer's mutation-attribution rows carry the recorder's own NOT-CLEAN vocabulary (a row about the veto that QUOTES it), which would make record-review.sh refuse this clean verdict as 'DECLARES a non-clean outcome'."
+    err "  offending block:"
+    printf '%s\n' "$ATTR_BLOCK" | sed 's/^/    /' >&2
+    die "$E_NOVERDICT" "the attribution rows would veto their own clean record — re-run the review, or record against a comment that states the attribution without quoting the veto vocabulary (#3442)"
+  fi
+  if [ -z "$ATTR_BLOCK" ]; then
+    ATTR_BLOCK='MUTATION ATTRIBUTION: MISSING — the reviewer printed no attribution block. This clean verdict CANNOT be recorded until one is supplied (agent-infra#3442): re-run the review with a reviewer that prints the block, or post a comment carrying it and record against that comment instead.'
+    err "review-pr: ⛔ the reviewer printed NO 'MUTATION ATTRIBUTION' block. The clean verdict will NOT be recordable (record-review.sh refuses it, agent-infra#3442) — the comment is posted with this stated, so the failure is visible rather than silent."
+  fi
   # ⛔ The clean body must not trip record-review.sh's evidence veto: no "issues
   # remain", no "NOT CLEAN", no "requires human attention", no "auto-fix …".
   # `Outcome: clean` is stated EXPLICITLY so the loose `not…clean` prose arm (which
@@ -2304,7 +2447,8 @@ if [ "$VERDICT" = clean ]; then
       fi
     fi
     printf 'The reviewer reported no HIGH-confidence blocking findings at this revision. '
-    printf 'Its findings are its own output, posted verbatim (in this comment, or in the non-blocking notes comment named below).\n'
+    printf 'Its findings are its own output, posted verbatim (in this comment, or in the non-blocking notes comment named below).\n\n'
+    printf '%s\n\n' "$ATTR_BLOCK"
     # ⛔ THE NOTES ARE QUOTED BY REFERENCE, NOT BY CONTENT (P3, fresh review of PR #2288).
     # The evidence body is what record-review.sh's veto scans, and its arm-(1) markers
     # ("auto-fix stalled", "N issues remain", "requires human attention", …) are

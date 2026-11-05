@@ -632,6 +632,16 @@ with open('operations/logs/cycle-status.yaml', 'w') as f:
   never ran a scan): `[NO-LOOP-BUDGET] RISK_CLASS=low — the single Step 4 pass is the whole budget; its findings are in the review comment and were never re-reviewed (#1537)\n\n`. ⛔ This is **not** a landing: with no scan there is nothing to land on, and any blocking finding the single pass reported must be fixed or escalated to a human.
 - `EXIT_REASON == "clean"`: no prefix (zero findings of any severity, and zero follow-ups)
 
+> **A CLEAN Step 8 comment must carry `MUTATION ATTRIBUTION:` (agent-infra#3442).** One row per
+> assertion the diff ADDS that claims to protect a behaviour —
+> `assertion: … | mutant: … | red: …` — naming the mutant that reverts the behaviour and the row that
+> goes RED; or `none — <why>` when the diff adds no assertion. This is not this file's vocabulary to
+> invent: `scripts/record-review.sh` REFUSES a `clean` record whose artifact carries no such block
+> (exit 3), so a clean review without it cannot be recorded and the PR cannot land. Why it is a gate
+> rather than advice: five PRs in one night passed clean on assertions that could not fail (#3355,
+> #3368 ×2, #3374), and #3368's own review named the mechanism — *"No mutation leg for the new gate —
+> which is exactly how findings 1 and 2 survived three recorded clean reviews."*
+
 > **No ceiling is ever a landing permission.** `proportional-capped` lands only on `blocking=0`;
 > with a blocking finding it escalates at every cycle number, `AGENTS.md` §Hard Cap's "a capped exit
 > is never reported as clean" unchanged.

@@ -42,6 +42,13 @@ assert_contains() {
 assert_not_contains() {
     if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpectedly present: $2)"; else ok "$3"; fi
 }
+# ⛔ THE rc-FIRST FORM, added for §21 (#3442). Every other helper here is value-first, but the mutation
+# and fixture guards in §21 read naturally as "did this command succeed" — the same `ck <rc> <msg>` shape
+# `brief-gate.test.sh` uses. Without it those calls fail as `ck: command not found` under `set -e`, which
+# is what a first run of §21 measured: an ABORT at the first guard, never a silent pass.
+ck() {
+    if [ "$1" -eq 0 ]; then ok "$2"; else bad "$2"; fi
+}
 
 T="$(mktemp -d /tmp/record-review-test.XXXXXX)"
 # tortoise#7391 (friction, found while adding §13): `trap 'rm -rf "$T"' EXIT` LAUNDERED the
@@ -368,10 +375,19 @@ if [ "$1" = "api" ]; then
         # `evidence_fetch` review arm always emits it.
         _state=""
         case "$*" in *"/pulls/"*"reviews/"*|*"/reviews/"*) _state="$(printf '\t')${STUB_REVIEW_STATE:-APPROVED}" ;; esac
+        # ⛔ agent-infra#3442 — THE DEFAULT ARTIFACT MUST SATISFY THE MUTATION-ATTRIBUTION CONTRACT.
+        # Every vector in this suite that is NOT about that contract hands the gate a ref the stub must
+        # answer with an ACCEPTED row, so the requirement cannot be defaulted away and each vector keeps
+        # testing its OWN subject. This literal is the fixture that says "a complete artifact"; a vector
+        # that wants the incomplete shape sets STUB_EVIDENCE_BODY itself (§21 does, both directions).
+        _ev_default='Reviewed the diff; no issues found.
+
+MUTATION ATTRIBUTION:
+- assertion: the new gate refuses an empty artifact | mutant: revert to the unconditional accept | red: section 21'
         printf '%s\t%s\t%s%s\n' \
             "${STUB_EVIDENCE_AT:-2026-01-02T03:04:05Z}" \
             "$_parent" \
-            "$(printf '%s' "${STUB_EVIDENCE_BODY-Reviewed the diff; no issues found.}" | awk '{ gsub(/\\/,"\\\\"); gsub(/\t/,"\\t"); printf "%s\\n", $0 }')" \
+            "$(printf '%s' "${STUB_EVIDENCE_BODY-$_ev_default}" | awk '{ gsub(/\\/,"\\\\"); gsub(/\t/,"\\t"); printf "%s\\n", $0 }')" \
             "$_state"
         exit 0
     fi
@@ -3745,6 +3761,17 @@ run_record_ev() { # <pr> [VAR=VAL…]; ref via $EV_REF (empty ⇒ omit --evidenc
     RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
 }
 
+# ⛔ agent-infra#3442 — EVERY CLEAN VECTOR BELOW MUST SATISFY THE MUTATION-ATTRIBUTION CONTRACT.
+# The gate now refuses a `clean` artifact that names no mutant, and that refusal is the SUBJECT of §21.
+# The vectors between here and there are about OTHER properties (a foreign parent, an unresolved-exit
+# template, a NOT-CLEAN declaration, the state field), so each one's fixture appends this tail — a
+# `none` DECLARATION with a reason is a satisfied contract, exactly as a docs-only review is on a real
+# PR. Without it those vectors would go red for a reason that is not their subject, which is how a new
+# gate silently narrows an existing suite instead of being pinned by it.
+ATTR_TAIL='
+
+MUTATION ATTRIBUTION: none — this fixture reviews no new assertion (see §21 for the vectors that do)'
+
 # ─────────────────────────────────────────────────────────────────────────
 # 12g #1377 — THE PATCH CARRY: a REBASE whose reviewed change is untouched is
 # re-recorded, NOT re-reviewed; a changed patch is still refused.
@@ -4214,7 +4241,7 @@ assert_eq "$RECORD_RC" "3" "13k the #784 fail-open arm with NO evidence is refus
 # current head with no argument at all — 13a): naming a non-review artifact is
 # a deliberate act, which is the bar.
 rm -f "$(Q2 424744)"
-EV_REF="comment:42474401" run_record_ev 424744 STUB_EVIDENCE_BODY="🤖 Mergify: your pull request has been merged automatically."
+EV_REF="comment:42474401" run_record_ev 424744 STUB_EVIDENCE_BODY="🤖 Mergify: your pull request has been merged automatically.${ATTR_TAIL}"
 assert_eq "$RECORD_RC" "0" "13l (DECLARED OUT OF SCOPE) a non-review artifact is ACCEPTED — the gate checks artifact, not review"
 R13L="$(cat "$(Q2 424744)" 2>/dev/null || true)"
 assert_contains "$R13L" '"evidence":"comment:42474401"' "13l the record names the non-review artifact it accepted"
@@ -4254,7 +4281,7 @@ Found 3 issues:
 2. missing repo guard (guidance)
 3. stale comment (quality)
 
-All three fixed in 9f1a2b3."
+All three fixed in 9f1a2b3.${ATTR_TAIL}"
 assert_eq "$RECORD_RC" "0" "13m2 the clean template (issues FOUND then FIXED) still records (rc 0)"
 R13M2="$(cat "$(Q2 424746)" 2>/dev/null || true)"
 assert_contains "$R13M2" '"evidence":"comment:42474601"' "13m2 the clean review artifact is what the record names"
@@ -4277,7 +4304,7 @@ assert_contains "$R13M2" '"evidence":"comment:42474601"' "13m2 the clean review 
 and an unresolved entity name is raised only from the recorder — this is not clean-up code, it is
 the guard itself.
 
-One test failed on origin/main and passes here."
+One test failed on origin/main and passes here.${ATTR_TAIL}"
   assert_eq "$RECORD_RC" "0" "13n an explicit Outcome: CLEAN outranks prose mentioning not-clean/failed (rc 0)"
   R13N="$(cat "$(Q2 424747)" 2>/dev/null || true)"
   assert_contains "$R13N" '"evidence":"comment:42474701"' "13n the clean artifact is what the record names"
@@ -4340,7 +4367,7 @@ assert_eq "$RECORD_RC" "3" "13m3 'Requires Human Input' is refused (rc 3)"
 rm -f "$(Q2 424748)"
 EV_REF="comment:42474801" run_record_ev 424748 STUB_EVIDENCE_BODY="### Code review
 
-No issues remain after the fixes in 9f1a2b3."
+No issues remain after the fixes in 9f1a2b3.${ATTR_TAIL}"
 assert_eq "$RECORD_RC" "0" "13m4 a clean review saying 'No issues remain' still records (rc 0)"
 
 # 13m5 — the OTHER FOUR unresolved prefixes from the file that OWNS the
@@ -4428,7 +4455,7 @@ EV_REF="review:42475901" run_record_ev 424759 STUB_EVIDENCE_BODY="Reviewed the d
 assert_eq "$RECORD_RC" "3" "13q a CHANGES_REQUESTED review is refused (rc 3)"
 [ ! -f "$(Q2 424759)" ] && ok "13q no record written for a CHANGES_REQUESTED review" || bad "13q wrote a record for a CHANGES_REQUESTED review"
 rm -f "$(Q2 424760)"
-EV_REF="review:42476001" run_record_ev 424760 STUB_EVIDENCE_BODY="Reviewed the diff." STUB_REVIEW_STATE="COMMENTED"
+EV_REF="review:42476001" run_record_ev 424760 STUB_EVIDENCE_BODY="Reviewed the diff.${ATTR_TAIL}" STUB_REVIEW_STATE="COMMENTED"
 assert_eq "$RECORD_RC" "0" "13q control: the same body under COMMENTED still records (rc 0)"
 
 # 13q2 — the EMPTY-BODY parse is its own adversarial case, and it defeated the
@@ -4448,10 +4475,24 @@ for _q2_state in CHANGES_REQUESTED DISMISSED PENDING; do
 done
 rm -f "$(Q2 424764)"
 EV_REF="review:42476401" run_record_ev 424764 STUB_EVIDENCE_BODY="" STUB_REVIEW_STATE="APPROVED"
-assert_eq "$RECORD_RC" "0" "13q2 control: an empty-body APPROVED review still records (rc 0)"
+# ⛔ THE CONTROL'S SUBJECT IS THE EMPTY-FIELD PARSE, NOT THE VERDICT. Since agent-infra#3442 an empty
+# artifact cannot be clean evidence at all, so the observable moves from "records" to WHICH arm
+# refused: the attribution arm. That is strictly better coverage — it proves the empty body parsed as
+# an EMPTY BODY (an empty field collapsed into `state` would have been refused as a state mismatch,
+# with a different message), and it pins the new contract on the same vector. A compliant-body control
+# follows immediately, so "review refs are broken" cannot explain this pair.
+assert_eq "$RECORD_RC" "3" "13q2 an EMPTY-BODY APPROVED review is refused — by the #3442 arm, not by a state misread"
+[ ! -f "$(Q2 424764)" ] && ok "13q2 no record written for an empty-body APPROVED review" || bad "13q2 wrote a record for an empty-body APPROVED review"
+assert_contains "$RECORD_ERR" "MUTATION ATTRIBUTION" "13q2 …and the EMPTY body parsed as an empty body (the refusal is the attribution arm, so the state field was not misread)"
 rm -f "$(Q2 424765)"
 EV_REF="review:42476501" run_record_ev 424765 STUB_EVIDENCE_BODY="" STUB_REVIEW_STATE="COMMENTED"
-assert_eq "$RECORD_RC" "0" "13q2 control: an empty-body COMMENTED review still records (rc 0)"
+assert_eq "$RECORD_RC" "3" "13q2 an EMPTY-BODY COMMENTED review is refused by the same arm"
+assert_contains "$RECORD_ERR" "MUTATION ATTRIBUTION" "13q2 …same reason, so the two states behave identically on an empty body"
+# …and the POSITIVE control for the same review-kind path: a body that satisfies the contract mints,
+# so the refusals above are about the artifact, not about `review:` refs having stopped working.
+rm -f "$(Q2 424766)"
+EV_REF="review:42476601" run_record_ev 424766 STUB_EVIDENCE_BODY="Reviewed the diff.${ATTR_TAIL}" STUB_REVIEW_STATE="COMMENTED"
+assert_eq "$RECORD_RC" "0" "13q2 control: a COMPLIANT-body COMMENTED review records (rc 0) — review:-kind refs still work"
 
 # 13n — T15: the evidence value must NOT be smuggled in through the ENVIRONMENT.
 # The gate reads it from argv only; a caller that exports EVIDENCE and passes no
@@ -5469,8 +5510,289 @@ assert_contains "$RECORD_ERR" "DECLARES a non-clean outcome" "20.3b …and names
 NEG_F=1
 EV_REF="comment:42495501"
 
+# ═════════════════════════════════════════════════════════════════════════════════════════════
+# 21. agent-infra#3442 — A CLEAN ARTIFACT THAT NAMES NO MUTANT IS INCOMPLETE, NOT CLEAN
+#
+# THE DEFECT THIS PINS. Review had no contract requiring that a NEW ASSERTION can FAIL, so a PR could
+# be reviewed clean — three times — on the strength of a guard whose test stays GREEN with the bug
+# restored. Measured: five instances in five PRs in one night (#3355, #3368 ×2, #3374, #3355 round 4).
+# The clearest statement is #3368's own review: "No mutation leg for the new gate — which is exactly
+# how findings 1 and 2 survived three recorded clean reviews."
+#
+# WHY THE PIN IS HERE AND NOT IN A REVIEW SKILL. A skill is prose an agent may or may not follow; the
+# mint is the one place a `clean` verdict becomes an artifact the merge gate reads. So the contract is
+# enforced where the claim is made, and the producer surfaces (the reviewer brief, `merge-one.sh`'s
+# reviewer prompt, `skills/code-review`) are taught the identical grammar in the same change — a gate
+# that refuses an artifact its own producer never asked for is a false block, not a guard.
+#
+# EVERY ARM BELOW IS DRIVEN THROUGH THE SHIPPED SCRIPT with the stub `gh`, exactly as §13 does; none
+# of them greps record-review.sh's source. The MUTATION at the end is the non-vacuity half: it proves
+# 21b/21c/21d go RED when the new refusal is deleted, rather than passing because the gate refuses
+# everything.
+echo "── 21. agent-infra#3442: a clean artifact must attribute its mutants ──"
+
+# run_record_ev_body <pr> <body>  — a fresh `clean` mint whose evidence artifact is <body>.
+# Deliberately its OWN runner rather than a knob on run_record_ev: the arms below vary the BODY of a
+# vector that is otherwise identical, so any difference between them is attributable to the body.
+run_record_ev_body() { # <pr> <body>
+    local pr="$1" body="$2" rcfile="$T/marc" errfile="$T/maerr"
+    rm -f "$errfile"
+    : > "$LOG"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        export STUB_EVIDENCE_BODY="$body"
+        rc=0
+        bash "$RECORD" "$pr" "$SHA" clean "daniel-ospina/agent-infra" \
+            --evidence "comment:${pr}01" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+
+MA_ROWS='**Outcome: CLEAN — verified, no issues.**
+
+MUTATION ATTRIBUTION:
+- assertion: the gate refuses an artifact that names no mutant | mutant: delete the attribution call | red: 21b
+- assertion: a bare `none` is not a declaration | mutant: drop the reason requirement | red: 21e'
+MA_NONE='**Outcome: CLEAN — verified, no issues.**
+
+MUTATION ATTRIBUTION: none — docs-only diff; the change adds no assertion'
+MA_NOBLOCK='**Outcome: CLEAN — verified, no issues.**
+
+Reviewed the diff; it looks right.'
+MA_BARE_NONE='**Outcome: CLEAN — verified, no issues.**
+
+MUTATION ATTRIBUTION: none'
+# The shape an agent produces when it copies the BRIEF's instruction instead of doing the work: the
+# label is present, the value is prose, and no row attributes anything.
+MA_INSTRUCTION='**Outcome: CLEAN — verified, no issues.**
+
+MUTATION ATTRIBUTION: for each new assertion, state which mutant reddens it.'
+
+# 21a — THE POSITIVE CONTROL, first, so no refusal below can be read as "this gate refuses clean".
+rm -f "$(Q2 424980)"
+run_record_ev_body 424980 "$MA_ROWS"
+assert_eq "$RECORD_RC" "0" "21a a clean artifact WITH attributed rows still mints (rc 0)"
+if [ -f "$(Q2 424980)" ]; then ok "21a …and the record is written"; else bad "21a no record written for a compliant artifact"; fi
+
+# 21b — THE REFUSAL. No block at all: the artifact never says which mutant reddens anything.
+rm -f "$(Q2 424981)"
+run_record_ev_body 424981 "$MA_NOBLOCK"
+assert_eq "$RECORD_RC" "3" "21b a clean artifact with NO mutation attribution is REFUSED (rc 3) — an incomplete review is not a clean one"
+if [ -f "$(Q2 424981)" ]; then bad "21b a refused clean mint wrote a record anyway"; else ok "21b …and mints NO record (the merge gate reads absence, so a written record would defeat the refusal)"; fi
+assert_contains "$RECORD_ERR" "3442" "21b …the refusal cites the record (agent-infra#3442) so the author can read why"
+assert_contains "$RECORD_ERR" "MUTATION ATTRIBUTION:" "21b …and PRINTS the label it wants"
+assert_contains "$RECORD_ERR" "assertion:" "21b …and the row grammar (assertion:)"
+assert_contains "$RECORD_ERR" "mutant:" "21b …(mutant:)"
+assert_contains "$RECORD_ERR" "red:" "21b …(red:) — the three slots, so the remedy is copyable rather than guessed"
+assert_contains "$RECORD_ERR" "INCOMPLETE review, not a clean one" "21b …and names the verdict as INCOMPLETE, which is the issue's own wording"
+
+# 21c — the DECLARATION form. A diff that adds no assertion must be able to say so with a reason,
+# or this gate would refuse every docs-only and refactor-only review (a false block).
+rm -f "$(Q2 424982)"
+run_record_ev_body 424982 "$MA_NONE"
+assert_eq "$RECORD_RC" "0" "21c 'none — <reason>' is a DECLARATION and mints (rc 0) — a diff with no new assertion is not refused"
+if [ -f "$(Q2 424982)" ]; then ok "21c …and the record is written"; else bad "21c no record written for a declared-none artifact"; fi
+
+# 21d — the PROSE-AS-VALUE shape (an agent that copied the brief's instruction). The label exists, so
+# a presence-only check would admit it; what is missing is any attributable row.
+rm -f "$(Q2 424983)"
+run_record_ev_body 424983 "$MA_INSTRUCTION"
+assert_eq "$RECORD_RC" "3" "21d a label with PROSE and no row is REFUSED (rc 3) — the check is not presence-only"
+assert_contains "$RECORD_ERR" "no attributable row" "21d …and the reason is the ROW, not the label (the two failure modes are told apart)"
+
+# 21e — a bare `none` with no reason is not a declaration: "I did not look" and "there was nothing to
+# look at" must not read the same. This is the arm that makes `none` cost a sentence.
+rm -f "$(Q2 424984)"
+run_record_ev_body 424984 "$MA_BARE_NONE"
+assert_eq "$RECORD_RC" "3" "21e a bare 'none' with NO reason is REFUSED (rc 3)"
+if grep -qF "NO 'MUTATION ATTRIBUTION' block" <<<"$RECORD_ERR"; then
+    bad "21e the bare-none refusal claims the label is MISSING (it is present — the message must name the row)"
+else ok "21e …and the message does NOT claim the label is missing (it is present, so only the row/reason is absent)"; fi
+
+# 21e2 — THE BYPASS A FRESH REVIEW OF THIS CHANGE FOUND (P2): you could satisfy the gate by pasting
+# the REMEDY. The refusal prints a `MUTATION ATTRIBUTION:` block with angle-bracketed slots, and the
+# first row grammar matched `assertion` + `mutant` + `red:` anywhere on a line — so the printed help
+# text, or the reviewer BRIEF, was accepted as a filled attribution. A lane that got refused could
+# therefore paste the refusal's own advice into a comment and mint `clean` without attributing anything.
+# The body below is the SHIPPED help text, SLICED FROM THE SCRIPT (never a copy that could drift), so
+# this arm tests exactly what a lane is told to paste.
+# The extraction ends on the line that CLOSES the literal (a trailing quote), not on the next line that
+# starts with one: the shell's next `'`-starting line is the awk program's terminator far ABOVE this
+# assignment, so an open-ended range ran to EOF (measured: 4078 lines, and the arm came back rc=126).
+sed -n "/^MUTATION_ATTRIBUTION_HELP='/,/'\$/p" "$RECORD" | sed "1s/^MUTATION_ATTRIBUTION_HELP='//" | sed "\$ s/'\$//" > "$T/ma-help.txt"
+[ -s "$T/ma-help.txt" ]; ck $? "fixture: the help text the refusal prints was sliced out of the shipped recorder"
+grep -qF 'MUTATION ATTRIBUTION:' "$T/ma-help.txt"; ck $? "fixture: …and it really is the block a refused lane is told to paste"
+rm -f "$(Q2 424988)"
+run_record_ev_body 424988 "$(cat "$T/ma-help.txt")"
+assert_eq "$RECORD_RC" "3" "21e2 ⛔ PASTING THE HELP TEXT IS REFUSED (rc 3) — an unfilled template is not an attribution"
+[ ! -f "$(Q2 424988)" ] && ok "21e2 …and mints NO record, so 'paste the remedy' is not a route to clean" || bad "21e2 pasting the help text minted a record"
+# …and the SAME for the reviewer brief: the instruction is not a filled attribution either.
+# ⛔ THE FIXTURE IS ASSERTED NON-EMPTY FIRST. Without that guard an unavailable renderer yields an empty
+# body, which is refused for the WRONG reason and the arm still reports success — the false pass this
+# whole issue is about (measured on the first run of this arm: `ROOT` was unbound, the substitution came
+# back empty, and the assertion went green).
+BRIEF_TEXT="$(bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" --section reviewer 2>/dev/null)"
+[ -n "$BRIEF_TEXT" ]; ck $? "fixture: the reviewer brief RENDERED (an empty fixture would make the arm pass for the wrong reason)"
+if grep -qF 'MUTATION ATTRIBUTION:' <<<"$BRIEF_TEXT"; then rc=0; else rc=1; fi
+ck "$rc" "fixture: …and the rendered brief carries the attribution order"
+rm -f "$(Q2 424989)"
+run_record_ev_body 424989 "$BRIEF_TEXT"
+assert_eq "$RECORD_RC" "3" "21e2 ⛔ pasting the REVIEWER BRIEF is refused too (rc 3)"
+
+# 21k — THE MUTATION for that arm: delete the unfilled-slot condition and the help text is ADMITTED,
+# so 21e2 is load-bearing rather than green for some other reason. The mutant is built by removing the
+# labelled anchor block (an awk copy, not an in-place pattern rewrite) and its liveness is asserted
+# BEFORE any behavioural claim, because a truncated mutant satisfies every assertion for the wrong
+# reason — the P1 a fresh review of this change found in §C2 of `brief-gate.test.sh`.
+MUT_UNFILLED="$T/mutant-unfilled-slots-accepted.sh"
+# ⛔ THE REMOVAL RUNS TO THE CONDITION, NOT A FIXED LINE COUNT. The anchor is followed by its own
+# explanation (three comment lines) and THEN the `if (… ) return 0` it names, so `skip = 2` left the
+# condition in place and the "mutant" refused exactly like the shipped gate — a mutation that changes
+# nothing reads as a passing proof, which is the §C2 defect one file over. The flag therefore drops
+# lines until the first `return 0` after the anchor (the condition's own body), inclusive.
+awk '/MUTATION-ANCHOR: unfilled slot/{ print "  # MUTANT: unfilled slots accepted"; drop = 1; next }
+     drop == 1 { if ($0 ~ /return 0/) drop = 0; next }
+     { print }' "$RECORD" > "$MUT_UNFILLED"
+# ⛔ `if …; then` AND NOT `cmd; rc=$?`: this suite runs under `set -e`, so a command whose non-zero
+# status IS the observation (a `cmp` reporting "they differ", a `grep` reporting "not found") aborts the
+# harness before the assertion it was feeding — the ABORT-on-the-obvious-guard failure measured on the
+# first run of this block.
+if cmp -s "$MUT_UNFILLED" "$RECORD"; then rc=0; else rc=1; fi
+[ "$rc" -ne 0 ]; ck $? "mutation(21k): the anchor block was removed (the mutant differs from the shipped file)"
+[ -s "$MUT_UNFILLED" ]; ck $? "mutation(21k): ⛔ the mutant is NON-EMPTY ($(wc -c < "$MUT_UNFILLED" | tr -d ' ') bytes)"
+bash -n "$MUT_UNFILLED"; ck $? "mutation(21k): the mutant still parses"
+if grep -qF 'MUTATION-ANCHOR: unfilled slot' "$MUT_UNFILLED"; then rc=0; else rc=1; fi
+[ "$rc" -ne 0 ]; ck $? "mutation(21k): the anchor is GONE from the mutant (the removal applied, not a no-op)"
+rm -f "$(Q2 424990)"
+( 
+    export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
+    export STUB_EVIDENCE_PR="424990" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+    # ⛔ A PLAIN ASSIGNMENT, NOT `export X="$(...)"`: the declaration builtin masks the command
+    # substitution's status (the `discarded-status` shape `check-false-pass-shapes.sh` refuses, which
+    # caught this line on its first run) — a failed read would read as an empty body, and this arm would
+    # then be testing an empty fixture rather than the pasted-remedy one.
+    HELP_BODY="$(cat "$T/ma-help.txt")" || { printf '9' > "$T/mutk.rc"; exit 0; }
+    export STUB_EVIDENCE_BODY="$HELP_BODY"
+    rc=0
+    bash "$MUT_UNFILLED" 424990 "$SHA" clean "daniel-ospina/agent-infra" --evidence comment:42499001 \
+        >/dev/null 2>"$T/mutk.err" || rc=$?
+    printf '%s' "$rc" > "$T/mutk.rc"
+) 2>/dev/null
+MUT_K_RC="$(cat "$T/mutk.rc" 2>/dev/null || echo 99)"
+assert_eq "$MUT_K_RC" "0" "MUTATION(21k): without the unfilled-slot condition the help text is ADMITTED (rc 0) — 21e2 is load-bearing"
+[ -f "$(Q2 424990)" ] && ok "MUTATION(21k): …and the mutant really minted clean from the pasted remedy (the bypass 21e2 closes)" || bad "MUTATION(21k): the mutant wrote no record, so its rc 0 means something else"
+rm -f "$(Q2 424990)"
+
+# 21e3 — THE GRAMMAR MATRIX. One arm per shape, driven through the SHIPPED parser sliced out of the
+# script (so this table cannot drift from the implementation). The two directions are pinned together on
+# purpose: a grammar that refuses everything passes every refusal arm, and a grammar that admits
+# everything passes every acceptance arm — only the pair is a test. Three of these rows are defects a
+# FRESH REVIEW of this change found in the previous grammar (marked), and each one is a real PR decision,
+# not a formality:
+#   · `none — <why, concretely>` was ADMITTED (the second line of the help text: paste-the-remedy open).
+#   · a FILLED row whose prose legitimately mentions `<slug>` was REFUSED (a false block).
+#   · a row the author WRAPPED onto a second line was REFUSED (a false block with a misleading message).
+# ⛔ AN OVER-WIDE SLICE WOULD BE EVALUATED, NOT IGNORED (fresh review, cycle 4, P1/P2). A `sed` range whose
+# END anchor stops matching runs to EOF, deletes only the last line, and the "slice" becomes the whole
+# recorder — whose `BASH_SOURCE == $0` guard is TRUE under `eval` in another script, so its main body would
+# run inside this suite. awk exits on the anchor and reports whether it saw it.
+if awk '/^MUTATION_ATTRIBUTION_AWK=/{p=1} p&&/^MUTATION_ATTRIBUTION_HELP=/{s=1;exit} p{print} END{exit (s?0:1)}' \
+     "$RECORD" > "$T/ma-parser.sh"; then
+    ck 0 "fixture: the artifact parser was sliced out of the shipped recorder (BOTH anchors matched)"
+else
+    ck 1 "fixture: the parser slice FAILED — an anchor is missing, so nothing below may be attributed to the parser"
+fi
+[ -s "$T/ma-parser.sh" ]; ck $? "fixture: …and the slice is non-empty"
+. "$T/ma-parser.sh"
+ma_verdict() { # ma_verdict <body> — the parser's token, empty = accepted
+    local b="$1"
+    mutation_attribution_missing "$b"
+}
+for _spec in \
+    "ACCEPT|MUTATION ATTRIBUTION:\n- assertion: the gate refuses X | mutant: delete the call | red: T1" \
+    "ACCEPT|MUTATION ATTRIBUTION:\n- assertion: the template renders <slug> into the brief | mutant: drop the interpolation | red: A1" \
+    "ACCEPT|MUTATION ATTRIBUTION:\n- assertion: x | mutant: drop the\n  arm (1b) | red: 20.3b" \
+    "ACCEPT|MUTATION ATTRIBUTION:\n- assertion: a | mutant: b | row: T1" \
+    "ACCEPT|### Mutation attribution\n- assertion: a | mutant: b | red: T1" \
+    "ACCEPT|MUTATION ATTRIBUTION:\n\n- assertion: a | mutant: b | red: T1" \
+    "ACCEPT|MUTATION ATTRIBUTION: none — docs-only diff; no new assertion" \
+    "ACCEPT|MUTATION ATTRIBUTION: none — no new assertion; the only change is the <slug> template prose" \
+    "ACCEPT|MUTATION ATTRIBUTION: none — <slug> is interpolated into the template; adds no assertion" \
+    "ACCEPT|MUTATION ATTRIBUTION: none — docs only (see docs/x<y>.md)" \
+    "REFUSE|MUTATION ATTRIBUTION: none — <why, concretely>" \
+    "REFUSE|MUTATION ATTRIBUTION: none" \
+    "REFUSE|MUTATION ATTRIBUTION: none — " \
+    "REFUSE|MUTATION ATTRIBUTION: none." \
+    "REFUSE|MUTATION ATTRIBUTION:\n- assertion: <the behaviour> | mutant: <the revert> | red: <the row>" \
+    "REFUSE|MUTATION ATTRIBUTION:\n- assertion:  | mutant: b | red: T1" \
+    "REFUSE|MUTATION ATTRIBUTION: for each new assertion, name the mutant that reddens it" \
+    "REFUSE|- assertion: a | mutant: b | red: T1" \
+    "REFUSE|Reviewed the diff; it looks right."; do
+    _want="${_spec%%|*}"; _body="${_spec#*|}"; _body="$(printf '%b' "$_body")"
+    _got="$(ma_verdict "$_body")"
+    if [ "$_want" = "ACCEPT" ]; then
+        [ -z "$_got" ]; ck $? "matrix: ACCEPT — $(printf '%s' "$_body" | head -2 | tr '\n' ' ' | cut -c1-70)"
+    else
+        [ -n "$_got" ]; ck $? "matrix: REFUSE ($_got) — $(printf '%s' "$_body" | head -2 | tr '\n' ' ' | cut -c1-70)"
+    fi
+done
+
+# 21f — SCOPE. A `not-clean` verdict is a findings report, not a claim of clean, so it must keep
+# minting without a block. Without this arm, widening the requirement to every polarity would pass
+# every assertion above and refuse the honest negative review — the over-block direction.
+STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+1 open P2: the retry loop re-reads the claim after the lock is released.'
+export STUB_EVIDENCE_BODY
+EV_REF="comment:42498501"
+rm -f "$(Q2 424985)"
+run_record_neg 424985
+assert_eq "$RECORD_RC" "0" "21f a NOT-CLEAN artifact with no attribution still mints (rc 0) — the contract is scoped to clean"
+unset STUB_EVIDENCE_BODY
+
+# 21g — THE MUTATION. Delete the new refusal's DECISION (the call site, not the function header — the
+# shape §10.9 uses) from a COPY of the shipped file: 21b's refusal must then FAIL, which is the only
+# thing that shows 21b is testing the new arm rather than something else in the recorder.
+MUT_MA="$T/mutant-no-mutation-attribution.sh"
+sed 's|mz_missing="$(mutation_attribution_missing "$body")"|mz_missing=""  # MUTANT: attribution never checked|' "$RECORD" > "$MUT_MA"
+if cmp -s "$MUT_MA" "$RECORD"; then
+    bad "mutation(21g): the sed anchor no longer matches, so the mutation could not be applied — 21g is inconclusive"
+else ok "mutation(21g): the mutation REALLY changed the shipped file (the call-site anchor still matches)"; fi
+bash -n "$MUT_MA" && ok "mutation(21g): the mutant still parses (it is a program, not a syntax error)" || bad "mutation(21g): the mutant does not parse — it would fail for the wrong reason"
+if grep -qF 'MUTATION ATTRIBUTION:' "$MUT_MA"; then ok "mutation(21g): the mutant is ALIVE — it still carries the teaching text, only the decision is gone"; else bad "mutation(21g): the mutant lost the teaching text too (the mutation is too wide)"; fi
+# Drive the mutant through the SAME body 21b refused.
+rm -f "$(Q2 424986)"
+(
+    export HOME="$F_HOME"
+    export PATH="$T/bin:$PATH"
+    export GH_STUB_LOG="$LOG"
+    export STUB_EVIDENCE_PR="424986" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+    export STUB_EVIDENCE_BODY="$MA_NOBLOCK"
+    rc=0
+    bash "$MUT_MA" 424986 "$SHA" clean "daniel-ospina/agent-infra" --evidence "comment:42498601" \
+        >/dev/null 2>"$T/mutma.err" || rc=$?
+    printf '%s' "$rc" > "$T/mutma.rc"
+) 2>/dev/null
+MUT_MA_RC="$(cat "$T/mutma.rc" 2>/dev/null || echo 99)"
+assert_eq "$MUT_MA_RC" "0" "MUTATION(21g): without the new refusal the SAME artifact is ADMITTED (rc 0) — so 21b is load-bearing, and a tree with the fix reverted goes RED at 21b"
+if [ -f "$(Q2 424986)" ]; then ok "MUTATION(21g): …and the mutant really minted a clean record from the incomplete artifact (that is the defect #3442 measured)"; else bad "MUTATION(21g): the mutant did not write a record, so its rc 0 means something else"; fi
+rm -f "$(Q2 424986)"
+
+# 21h — THE OTHER DIRECTION. A gate that refuses EVERYTHING is equally useless, so pin that the
+# shipped gate ADMITS the same compliant artifact the mutant also admitted: the difference between the
+# two is the requirement, not a blanket refusal. (21a already does this; this arm re-states it at the
+# mutant's own PR number so a future edit cannot make 21a and 21g fail for unrelated fixture drift.)
+rm -f "$(Q2 424987)"
+run_record_ev_body 424987 "$MA_ROWS"
+assert_eq "$RECORD_RC" "0" "21h the SHIPPED gate admits the compliant artifact at the same shape the mutant was driven with (rc 0)"
+
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"
+
 SUMMARY_PRINTED=1   # the sentinel: only from here may the EXIT trap pass an exit status through
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
 echo "  ✅ all checks passed"

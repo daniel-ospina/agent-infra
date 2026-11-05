@@ -26,6 +26,24 @@
 #        RUNG: <1|2|3> — <tool>  which rung of the research ladder, and the tool it names
 #   2. ANYWHERE in the brief:
 #        CONTRADICTION TEST: <non-empty>   whether a RECORDED DECISION covers the work
+#   3. ANYWHERE in the brief, and REQUIRED ONLY FOR ROLE `reviewer` (agent-infra#3442):
+#        MUTATION ATTRIBUTION: <non-empty>  what the review must attribute, per new assertion
+#
+# ⛔ #3442 — WHY THE REVIEWER ROLE GETS A THIRD FIELD, AND WHY IT IS NOT A GLOBAL ONE. Review had no
+# contract requiring that a NEW ASSERTION can FAIL, so five PRs in one night passed clean on guards
+# whose tests stay GREEN with the bug restored (#3355, #3368 ×2, #3374, #3355 round 4) — and #3368's
+# own review named the mechanism: "No mutation leg for the new gate — which is exactly how findings 1
+# and 2 survived three recorded clean reviews." The reviewer's brief is where that contract can be put
+# in front of the reviewer before it reads a diff, and `merge-one.sh` splices THIS section into the
+# reviewer's prompt, so the requirement reaches the reviewer by construction.
+#
+# It is scoped to `reviewer` DELIBERATELY, and the scope is pinned by a test in both directions: a
+# lane/fixer/worker brief without the field is still ADMITTED (widening this would refuse every
+# authored brief and every generated brief that predates the change — a false block, which is the
+# failure mode this tree's gates are most often wrong about), while a REVIEWER brief without it is
+# REFUSED. The artifact half of the contract (the reviewer must FILL the rows) is enforced where the
+# claim is minted: `record-review.sh`'s evidence gate, not here — a brief carries the instruction and
+# an artifact carries the filled attribution, and neither can stand in for the other.
 #
 # Two labelled fields are not decoration: they are the two halves of the pass that the two measured
 # incidents each skipped, and the rung line is what stops "research" from degrading into "I thought
@@ -76,23 +94,27 @@ BRIEF_GATE_UNAVAILABLE=78
 # DO" above; the prohibition itself lives in the research skill and the owner's ruling.
 BRIEF_GATE_TOOLS='perplexity, web_search, web_fetch, context7'
 
-# brief_gate_missing <brief-file|-> — print ONE token per missing element, nothing when complete.
-# `-` reads stdin (pane orders are passed inline, not as files). An unreadable or empty brief prints
-# NO-FILE / EMPTY rather than pretending the parse failed for some subtler reason.
+# brief_gate_missing <brief-file|-> [role] — print ONE token per missing element, nothing when
+# complete. `-` reads stdin (pane orders are passed inline, not as files). An unreadable or empty brief
+# prints NO-FILE / EMPTY rather than pretending the parse failed for some subtler reason.
+#
+# ⛔ THE ROLE DECIDES WHETHER `MUTATION-ATTRIBUTION` IS REQUIRED (#3442). Only `reviewer` owes it, so
+# the role is a REQUIRED input of the parse rather than a post-filter: a filter that ran after the
+# parse could be reordered away, and the caller that would notice is the one that is refused.
 #
 # ⛔ THE PARSE IS ONE awk PASS ON PURPOSE. It is the same shape #2148's suite drives and it needs no
 # python at dispatch time — a gate that adds an interpreter to every spawn is a gate that will
 # eventually be "temporarily" worked around on the box that lacks one.
-brief_gate_missing() { # brief_gate_missing <brief-file|->
-  local f="${1:--}"
+brief_gate_missing() { # brief_gate_missing <brief-file|-> [role]
+  local f="${1:--}" role="${2:-lane}"
   if [ "$f" != "-" ] && { [ ! -e "$f" ] || [ ! -r "$f" ]; }; then
     printf 'NO-FILE\n'
     return 0
   fi
   if [ "$f" = "-" ]; then
-    awk "$BRIEF_GATE_AWK"
+    awk -v brief_role="$role" "$BRIEF_GATE_AWK"
   else
-    awk "$BRIEF_GATE_AWK" "$f"
+    awk -v brief_role="$role" "$BRIEF_GATE_AWK" "$f"
   fi
 }
 
@@ -119,7 +141,7 @@ function _label(s,   t) {
   _lab = ""; _rest = ""
   return ""
 }
-BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 0 }
+BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 0; mat = 0 }
 {
   line = $0
   lc = tolower(line)
@@ -143,6 +165,11 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
         tolower(_rest) ~ /perplexity|web_search|web[ _-]?fetch|context7/) rung = 1
   }
   if (_lab == "contradiction test" && length(_rest) > 0) ct = 1
+  # agent-infra#3442 — the mutation-attribution field. PRESENCE and non-emptiness only: a brief states
+  # the INSTRUCTION (what the reviewer must attribute), so its value is prose by design. The FILLED
+  # rows are read from the review ARTIFACT by `record-review.sh`, which is a different check on a
+  # different object — see the header.
+  if (_lab == "mutation attribution" && length(_rest) > 0) mat = 1
 }
 END {
   if (NR == 0) { print "EMPTY"; exit }
@@ -153,6 +180,8 @@ END {
     if (!rung)     print "RUNG"
   }
   if (!ct) print "CONTRADICTION-TEST"
+  # ⛔ THE ROLE GATES THIS TOKEN, NOT A LATER FILTER (#3442).
+  if (tolower(brief_role) == "reviewer" && !mat) print "MUTATION-ATTRIBUTION"
 }
 '
 
@@ -169,7 +198,7 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
       return "$BRIEF_GATE_UNAVAILABLE" ;;
   esac
   # stdin is INHERITED through the command substitution, so `-` reads the caller's pipe.
-  miss="$(brief_gate_missing "$f")"
+  miss="$(brief_gate_missing "$f" "$role")"
   [ -n "$miss" ] || return 0
 
   # ── THE REFUSAL MUST TEACH (delivery D) ───────────────────────────────────────────────────────
@@ -188,6 +217,8 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
       RUNG)      lines="${lines}  • \`RUNG: <1|2|3> — <tool>\` — which rung of the research ladder, naming the tool (one of: ${BRIEF_GATE_TOOLS})${nl}" ;;
       CONTRADICTION-TEST)
                  lines="${lines}  • \`CONTRADICTION TEST:\` — which RECORDED DECISION covers this work, quoted; or that none does${nl}" ;;
+      MUTATION-ATTRIBUTION)
+                 lines="${lines}  • \`MUTATION ATTRIBUTION:\` — a REVIEWER brief must order the reviewer to state, per new assertion, which mutant reddens it (or to declare \`none — <why>\`). A clean review that lists no mutants is an INCOMPLETE review, not a clean one (agent-infra#3442)${nl}" ;;
     esac
   done <<< "$miss"
 
@@ -200,6 +231,9 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
     body="$(brief_gate_section "$role")"
     printf '%s\n' "$body" | sed 's/^/[brief-gate]   /'
     printf '[brief-gate] why: two lanes in one day acted on a false premise because their brief never forced the pass — one re-derived a root the tracker already held, one opened a duplicate PR. Both were brief defects, not lane defects (agent-infra#2258).\n'
+    if [ "$role" = "reviewer" ]; then
+      printf '[brief-gate] why (reviewer): review had no contract requiring that a NEW ASSERTION can fail, so five PRs in one night passed clean on guards whose tests stay GREEN with the bug restored (#3355, #3368 x2, #3374). A reviewer brief that does not order the attribution lets that happen again silently (agent-infra#3442).\n'
+    fi
     printf '[brief-gate] the pass is checked for PRESENCE and SHAPE only — a green run is not evidence the research was good; you still review the substance.\n'
   } >&2
   return "$BRIEF_GATE_REFUSED"
@@ -243,6 +277,14 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
     \`no recorded decision reaches this work\` if none does. If a finding contradicts a recorded
     decision, it is NOT a candidate for adoption: reopen the decision and argue it in its own home;
     never adopt over it.
+MUTATION ATTRIBUTION: for EACH assertion the diff ADDS that claims to protect a behaviour, name the
+    mutant that reverts that behaviour and the row/test that goes RED — \`assertion: … | mutant: … |
+    red: …\`, one row per assertion. A mutant that reddens the suite through an UNRELATED row is not
+    a proof: the failing row must be the one that names the behaviour. If the diff adds no assertion
+    at all, declare \`none — <why>\` instead; that is a claim too, and a false one is a finding. A
+    clean verdict that lists no mutants is treated as INCOMPLETE rather than clean, and
+    \`record-review.sh\` refuses a \`clean\` record whose evidence artifact names none
+    (agent-infra#3442: five PRs in one night passed clean on assertions that could not fail).
 BRIEF
 }
 
@@ -251,6 +293,11 @@ BRIEF
 brief_gate_line() { # brief_gate_line [role]
   local role="${1:-lane}"
   printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80).'
+  # #3442 — the reviewer role owes the third field, so the line says so ONCE where an operator greps.
+  if [ "$role" = "reviewer" ]; then
+    printf ' [gate] #3442 non-vacuity: a REVIEWER brief must also carry MUTATION ATTRIBUTION (assertion -> mutant -> reddened row, or `none - <why>`), and a clean verdict that names no mutant is INCOMPLETE. REFUSED without it (brief-gate.sh, exit 80).'
+  fi
+  printf '\n'
 }
 
 # ── CLI: for callers, for tests, and for a human who wants the exact text ────────────────────────
@@ -261,7 +308,7 @@ brief_gate_line() { # brief_gate_line [role]
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --check)   shift; brief_gate_verify "${1:--}" "${2:-lane}" ;;
-    --missing) shift; brief_gate_missing "${1:--}" ;;
+    --missing) shift; brief_gate_missing "${1:--}" "${2:-lane}" ;;
     --section) shift; brief_gate_section "${1:-lane}" ;;
     --line)    shift; brief_gate_line "${1:-lane}" ;;
     *)

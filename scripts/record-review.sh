@@ -842,6 +842,164 @@ evidence_fetch() { # <kind> <id> -> tsv row; non-zero = unreadable
   esac
 }
 
+# ── agent-infra#3442 — THE MUTATION-ATTRIBUTION CONTRACT ────────────────────────────────────────
+# WHY THIS EXISTS. Until this, review had no contract requiring that a NEW ASSERTION can FAIL. A PR
+# could be reviewed clean, repeatedly, on the strength of a guard whose test would stay GREEN with
+# the bug restored — and nothing in the review contract noticed. Measured: FIVE instances in five
+# PRs in one night (#3355, #3368 ×2, #3374, #3355 round 4). The clearest statement of the root is
+# #3368's own review: "No mutation leg for the new gate — which is exactly how findings 1 and 2
+# survived three recorded clean reviews." So the absence of a mutant is not a missing test; it is
+# WHY the vacuous assertions went undetected.
+#
+# THE CONTRACT (one grammar, taught identically in `brief-gate.sh --section reviewer`, in
+# `merge-one.sh`'s reviewer prompt, and in `skills/code-review`): a `clean` artifact must carry a
+# block that attributes EACH new assertion to a mutant that reddens it:
+#
+#     MUTATION ATTRIBUTION:
+#     - assertion: <the behaviour the new assertion protects> | mutant: <the revert> | red: <the row that goes red>
+#
+# …or declare, with a reason, that the diff adds no assertion at all:
+#
+#     MUTATION ATTRIBUTION: none — docs-only diff; no new assertion
+#
+# WHAT THIS BUYS, PRECISELY (do not over-read a green run): it is PRESENCE and SHAPE, never content.
+# It cannot tell a real mutant from a fabricated one — exactly as `Outcome: clean` is a claim the
+# gate reads rather than verifies. What it does is convert "I read the diff and it looks right" into
+# a NAMED, checkable claim, and make "I did not think about it" impossible to omit. The second half
+# of the contract (the mutant actually reddening the named row) is the reviewer's and CI's job.
+#
+# ⛔ ONE GRAMMAR, TWO ARTIFACTS, AND THEY ARE NOT THE SAME CHECK. A review BRIEF carries the
+# INSTRUCTION (`brief-gate.sh --check <brief> reviewer` requires the labelled field, non-empty); a
+# review ARTIFACT carries the FILLED rows, and this function is what reads it. Both use the label
+# `MUTATION ATTRIBUTION` so a reviewer connects them; neither can stand in for the other.
+#
+# ⛔ SCOPE: `clean` only, deliberately. A `not-clean` artifact is a findings report — the remedy it
+# names is a fixer, not a proof of discriminating power — and `clean-micro` / `clean-low` take no
+# `--evidence` at all, so this gate cannot reach them (and must not: a micro record dispatches no
+# reviewer). Requiring it of a negative artifact would refuse the honest negative.
+#
+# The body arrives @tsv-escaped from `evidence_fetch` (newlines are the two characters `\n`), so the
+# parse unescapes first — otherwise the whole comment is ONE line and a block on line 2 is invisible.
+# ⛔ THE ROW GRAMMAR IS A BULLET WITH THREE LABELS AND NO UNFILLED SLOT (fresh review of this change,
+# P2). The first version matched `assertion` + `mutant` + `red:` ANYWHERE on one line, and that is a
+# keyword soup: pasting the reviewer BRIEF — or the help text this refusal prints — as a fresh comment
+# satisfied it (`… red: …`, one row per assertion. A mutant that reddens …` carries all three words),
+# so a refused lane could mint `clean` by pasting the remedy. Three conditions now, and each one has a
+# test: a BULLET (`- `), the three labels, and NO angle-bracketed placeholder left in a slot — the
+# difference between a filled attribution and a template that was copied instead of filled.
+# shellcheck disable=SC2016
+MUTATION_ATTRIBUTION_AWK='
+function _trim(s,   t) { t = s; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t); return t }
+# The value of one slot: the text after `<label>:`, up to the next `|` or the end of the line.
+function _slot(s, lab,   i, rest) {
+  i = index(s, lab ":")
+  if (!i) return ""
+  rest = substr(s, i + length(lab))
+  sub(/^[ \t]*:[ \t]*/, "", rest)
+  if (match(rest, /\|/)) rest = substr(rest, 1, RSTART - 1)
+  return _trim(rest)
+}
+# ⛔ THE ROW IS A BULLET WITH THREE FILLED SLOTS (fresh reviews of this change, P1 then P2). The first
+# version matched `assertion` + `mutant` + `red:` ANYWHERE on a line — keyword soup, so pasting the
+# reviewer BRIEF or the help text this refusal prints satisfied it. The second version rejected any line
+# carrying `<…>` ANYWHERE — which false-blocked FILLED rows whose prose legitimately mentions `<slug>`,
+# and refused a row an author wrapped onto a second line. Both directions are answered here:
+#   · the BULLET is what makes it a row rather than prose;
+#   · each SLOT must be non-empty;
+#   · a slot whose value is ENTIRELY a `<…>` placeholder is an unfilled template, not an attribution
+#     (an embedded `<slug>` inside real prose is fine, because then the slot is not placeholder-only).
+function _ph(v) { return (v ~ /^<[^<>]*>$/) }
+function _row(l,   a, mu, r) {
+  if (l !~ /^[ \t]*[-*+][ \t]+/) return 0
+  if (l !~ /assertion/ || l !~ /mutant/) return 0
+  a = _slot(l, "assertion"); mu = _slot(l, "mutant")
+  if (match(l, /(red|row)[ \t]*:/)) r = _trim(substr(l, RSTART + RLENGTH)); else return 0
+  if (a == "" || mu == "" || r == "") return 0
+  # MUTATION-ANCHOR: unfilled slot
+  # The two lines below are one condition, and deleting them is the mutation that proves it is
+  # load-bearing (`record-review.test.sh` §21k). The marker line exists so that mutant can be built by
+  # removing a labelled block instead of rewriting a bracket-heavy pattern in place — a mitigation, not
+  # a preference: the bracket form tripped the checkout guard that decides whether a suite may run.
+  if (_ph(a) || _ph(mu) || _ph(r)) return 0
+  return 1
+}
+BEGIN { found = 0; none = 0; rows = 0; buf = "" }
+{
+  line = $0
+  # The artifact arrives @tsv-escaped, so its newlines are the two characters `\` `n`.
+  gsub(/\\n/, "\n", line)
+  n = split(line, L, "\n")
+  for (i = 1; i <= n; i++) {
+    cur = L[i]
+    low = tolower(cur)
+    # A WRAPPED ROW: a bullet naming the first two slots but not the third is continued by the next
+    # non-blank, non-bullet line. Without this a long row is refused with a message about a missing row,
+    # which sends the author looking for a defect in a row that is there (measured false block).
+    if (buf != "") {
+      if (low ~ /^[ \t]*$/ || low ~ /^[ \t]*[-*+][ \t]+/) { buf = "" }
+      else {
+        if (_row(tolower(buf " " _trim(cur)))) rows = 1
+        buf = ""
+        continue
+      }
+    }
+    if (!found && (low ~ /mutation[ \t]+attribution[ \t]*:/ || low ~ /^#+[^a-z0-9]*mutation[ \t]+attribution/)) {
+      found = 1
+      val = cur
+      sub(/^[^:]*:/, "", val); val = _trim(val)
+      lv = tolower(val)
+      if (lv ~ /^none([^a-z0-9]|$)/) {
+        # ⛔ THE DECLARATION COSTS A REASON, AND THE PLACEHOLDER TEST IS ON THE FIRST TOKEN OF THAT REASON —
+        # not on the whole value (fresh review, cycle 3, P2). Two earlier versions were wrong in opposite
+        # directions: `length > 4` admitted `none — <why, concretely>` (the second line of the help text
+        # this refusal prints, so "paste the remedy" stayed open), and testing the WHOLE value rejected
+        # `none — no new assertion; the only change is the <slug> template prose`, which is ordinary prose
+        # in this repo. A reason that merely MENTIONS an angle-bracketed token mid-sentence is fine; a
+        # reason that IS one is an unfilled template.
+        raw = val
+        sub(/^none/, "", raw); raw = _trim(raw)
+        sub(/^[—:.–-]+[ \t]*/, "", raw); raw = _trim(raw)
+        # ⛔ JUDGE THE RESIDUAL, NOT THE FIRST BYTE (fresh review, cycle 4, P2). Testing `substr(raw,1,1)`
+        # refused a reason that merely BEGINS with a legitimate token — `none — <slug> is interpolated into
+        # the template; adds no assertion` — which is ordinary prose in this repo, and the refusal message
+        # then blamed the author for a declaration they had written. Removing the placeholders and asking
+        # whether real prose REMAINS refuses exactly the unfilled templates (`<why, concretely>`, `<a> <b>`)
+        # and admits a token used inside a sentence.
+        g = raw; gsub(/<[^<>]*>/, "", g); g = _trim(g)
+        if (length(g) >= 3) none = 1
+      }
+      else if (_row(lv)) rows = 1
+      continue
+    }
+    if (found) {
+      if (_row(low)) { rows = 1; continue }
+      if (low ~ /^[ \t]*[-*+][ \t]+/ && low ~ /assertion/ && low ~ /mutant/ && low !~ /(red|row)[ \t]*:/) buf = low
+    }
+  }
+}
+END {
+  if (!found)   { print "NO-BLOCK"; exit }
+  if (none || rows) exit
+  print "NO-ROWS"
+}
+'
+
+# mutation_attribution_missing <escaped-body> — print ONE token when the contract is unmet, nothing
+# when it is met. Tokens: NO-BLOCK (the labelled field is absent) · NO-ROWS (the field is present but
+# carries neither a row nor a `none — reason` declaration).
+mutation_attribution_missing() { # mutation_attribution_missing <escaped-body>
+  printf '%s' "${1:-}" | awk "$MUTATION_ATTRIBUTION_AWK"
+}
+
+# The teaching text, ONE source, printed by this file's refusal and asserted by the suite.
+# ⛔ ITS ROW IS INTENTIONALLY UNSATISFYING: the slots are angle-bracketed placeholders, which the row
+# grammar above REFUSES. Pasting this help text as a review artifact was how the first version could be
+# satisfied without doing the work (fresh review, P2); the placeholder check closes that, and the suite
+# pins it both ways (the help text is refused, a filled row is accepted).
+MUTATION_ATTRIBUTION_HELP='MUTATION ATTRIBUTION:
+- assertion: <the behaviour the new assertion protects> | mutant: <the revert of that behaviour> | red: <the row that goes red>
+(or, when the diff adds no assertion at all: MUTATION ATTRIBUTION: none — <why, concretely>)'
+
 # Verify that <ref> is a review artifact attesting THIS PR at <head>.
 # Prints one confirmation line on success; prints WHY on stderr and returns 1.
 verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
@@ -853,7 +1011,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   # not itself a record marker) is shared, so a negative record cannot be minted
   # over an artifact that is missing, foreign or older than the revision it
   # claims to describe.
-  local ref="$1" head="$2" polarity="${3:-clean}" split kind id row created parent body state head_date _rest
+  local ref="$1" head="$2" polarity="${3:-clean}" split kind id row created parent body state head_date _rest mz_missing
   if [ -z "$REPO" ] || ! command -v gh >/dev/null 2>&1; then
     echo "   cannot verify review evidence without a repo and the gh CLI (repo='${REPO:-<none>}') — pass <owner/repo> explicitly so the artifact can be read." >&2
     return 1
@@ -1027,6 +1185,28 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
   if ! grep -qiE '(^|[*[:space:]])outcome:[[:space:]]*(clean|\*\*clean)' <<<"$body"; then
     if grep -qiE 'not[[:space:]_-]*clean' <<<"$body"; then
       echo "   $kind $id asserts an UNRESOLVED outcome (NOT-CLEAN, and states no explicit Outcome:) — it is evidence the review did not conclude clean." >&2
+      return 1
+    fi
+  fi
+  # ── agent-infra#3442 — A CLEAN ARTIFACT THAT NAMES NO MUTANT IS INCOMPLETE, NOT CLEAN ─────────
+  # Placed LAST, deliberately: every arm above names a MORE SPECIFIC reason to refuse (an unreadable
+  # artifact, a foreign parent, a NOT-CLEAN declaration), and a reviewer who wrote one of those must
+  # be told that, not told to add a block to a comment that was already disqualified. So this arm
+  # only ever fires on an artifact that would otherwise have MINTED a clean verdict — which is
+  # precisely the failure #3442 measures: five vacuous assertions that passed clean.
+  if [ "$polarity" = "clean" ]; then
+    mz_missing="$(mutation_attribution_missing "$body")"
+    if [ -n "$mz_missing" ]; then
+      case "$mz_missing" in
+        NO-BLOCK)
+          echo "   $kind $id carries NO 'MUTATION ATTRIBUTION' block, so it does not say which mutant reddens the assertions this diff adds — that is an INCOMPLETE review, not a clean one (agent-infra#3442)." >&2 ;;
+        *)
+          echo "   $kind $id carries a 'MUTATION ATTRIBUTION' field but no attributable row and no 'none — <why>' declaration, so it claims nothing a reader can check (agent-infra#3442)." >&2 ;;
+      esac
+      echo "   why this is a refusal and not a nit: five PRs in one night passed clean on assertions that could not fail — a gate whose test stays GREEN with the bug restored is worse than no test, because the pipeline counts it (#3355, #3368 ×2, #3374). The absence of a mutation leg is why those survived three recorded clean reviews." >&2
+      echo "   → add this to the review artifact and re-record (the same block the reviewer brief, brief-gate.sh --section reviewer, orders):" >&2
+      printf '%s\n' "$MUTATION_ATTRIBUTION_HELP" | sed 's/^/     /' >&2
+      echo "   → one row PER new assertion that encodes a fix. If the diff adds no assertion at all, say 'none — <why>' instead; that is a claim too, and a false one is a review finding." >&2
       return 1
     fi
   fi

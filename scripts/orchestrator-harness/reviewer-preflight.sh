@@ -152,6 +152,12 @@ reviewer_brief_section() {
    \`${REVIEWER_PREFLIGHT_DISPATCH_CMD}\`
 2. Act on its findings. Re-dispatch after fixes; converge before you record. The review must leave
    an ARTIFACT — the PR comment you post — because step 3 names it.
+   ⛔ That artifact MUST carry a \`MUTATION ATTRIBUTION:\` block (agent-infra#3442): one row per
+   assertion the diff ADDS — \`assertion: … | mutant: … | red: …\` — naming the mutant that reverts
+   the behaviour the assertion protects and the row that goes RED; or \`none — <why>\` when the diff
+   adds no assertion. \`record-review.sh\` REFUSES a \`clean\` record whose artifact names no mutant
+   (exit 3), so a clean review without it cannot be recorded. Five PRs in one night passed clean on
+   assertions that could not fail (#3355, #3368 ×2, #3374) — that is what this closes.
 3. Record the attestation at the PR's CURRENT head — after your LAST push:
    \`${REVIEWER_PREFLIGHT_RECORD_CMD}\`
    ⛔ \`--evidence\` is REQUIRED for a fresh \`clean\` record (tortoise#7391): without it

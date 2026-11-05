@@ -515,6 +515,139 @@ case "$P" in *"the linked issue body"*) rc=0;; *) rc=1;; esac; ck $rc "…and th
 case "$P" in *'web_search(model="sonar")'*) rc=0;; *) rc=1;; esac; ck $rc "…and names research rung 2 explicitly (web_search model=\"sonar\")"
 case "$(cat "$TMP/pi-argv.txt")" in *"--no-session"*) rc=0;; *) rc=1;; esac; ck $rc "…spawned with --no-session (a genuinely fresh context)"
 
+# ── §A1b agent-infra#3442 — the ARTIFACT carries the reviewer's mutation attribution ─────────────
+# ⛔ WHY THIS SECTION EXISTS. `review-pr.sh` composes the evidence comment ITSELF (the reviewer's prose
+# goes to a separate notes comment), so before this change EVERY clean verdict minted through this seam
+# posted a body with no `MUTATION ATTRIBUTION` block and `record-review.sh` refused it (exit 3) AFTER the
+# review was paid for — an unrecordable live seam (fresh review of this change, P1). The transcription is
+# what fixes it, so it is pinned by DRIVING it, not by grepping this script's source.
+echo; echo "§A1b #3442 — the attribution reaches the evidence comment"
+ATTR_ROW='- assertion: the door refuses an empty artifact | mutant: revert to the unconditional accept | red: T1'
+reset; printf 'MUTATION ATTRIBUTION:\n%s\n\nCLEAN\n' "$ATTR_ROW" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a CLEAN verdict that DID print an attribution still records (rc=$(rc_of))"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *"MUTATION ATTRIBUTION:"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "⛔ the evidence comment carries the block — without this the recorder refuses the paid review"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *"$ATTR_ROW"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "…VERBATIM (the reviewer's own row, never a paraphrase or a re-derivation)"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *MISSING*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "…and no MISSING notice on a review that supplied one"
+# …and when the reviewer prints NONE, the producer must not invent compliance: the comment states the
+# gap in words the recorder REFUSES (no bullet, no `none` declaration), so the refusal stays with the
+# gate that teaches the remedy — never a fabricated `none` claiming the diff added no assertion.
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "a CLEAN verdict with NO attribution still completes the producer's own steps (rc=$(rc_of)) — the recorder is the judge of recordability, not this script's guess"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *'MUTATION ATTRIBUTION: MISSING'*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "⛔ …and the comment SAYS SO ('MUTATION ATTRIBUTION: MISSING …'), so the gap is visible in the artifact instead of silent"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *'MUTATION ATTRIBUTION: none'*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "…and it does NOT fabricate a 'none — no new assertion' claim nobody made"
+err_has 'printed NO' ; ck $? "…and the operator is told on stderr before the review is recorded as clean"
+
+# (2) A HEADING-ONLY BLOCK IS THE SAME FAILURE AS NONE, and must not masquerade as present (fresh review
+# of this change, P2: the transcription stopped at the first blank line, so the block came back as the
+# heading alone, `-z` did not fire, no warning was printed, and the posted comment was refused NO-ROWS at
+# record time — a field that only LOOKS present is worse than a missing one).
+reset; printf 'MUTATION ATTRIBUTION:\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *'MUTATION ATTRIBUTION: MISSING'*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "⛔ (2) a heading with NO rows is treated as MISSING, not transcribed as if it were an attribution"
+err_has 'no FILLED row'; ck $? "…and stderr says the block carried no filled row (the operator is not left guessing)"
+
+# (3) A BLANK LINE BETWEEN THE LABEL AND ITS ROWS IS COMPLIANT (the recorder's own parser documents it),
+# so the transcription must span it rather than truncate at it.
+reset; printf 'MUTATION ATTRIBUTION:\n\n%s\n\nCLEAN\n' "$ATTR_ROW" > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "(3) a label/rows pair separated by a blank line still records (rc=$(rc_of))"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *"$ATTR_ROW"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "⛔ (3) …and the ROW reached the comment across that blank line (truncating at the blank left the comment unrecordable)"
+
+# (4) THE COMPOSED BODY MUST NOT VETO ITSELF. A row about the review gate legitimately QUOTES the gate's
+# own NOT-CLEAN vocabulary, and the recorder's arm (1)/(1b) arms are UNCONDITIONAL — so pasting such a row
+# into the evidence body would make a genuinely clean verdict unrecordable AFTER the comment was posted.
+# The producer refuses EARLY instead, names the rows, and posts nothing.
+reset; printf 'MUTATION ATTRIBUTION:\n- assertion: the veto fires on a row about it | mutant: delete arm 1b, where the comment says Outcome: not-clean | red: 20.3b\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "6" ]; ck $? "⛔ (4) rows that quote the recorder's NOT-CLEAN vocabulary are refused with 6, BEFORE any comment is posted (rc=$(rc_of))"
+no_comment; ck $? "(4) …and NOTHING was posted, so no unrecordable artifact exists on the PR"
+err_has 'NOT-CLEAN vocabulary'; ck $? "(4) …and the message names the cause"
+no_record; ck $? "(4) …and no record was attempted"
+# (4b) THE MIRROR MUST BE THE WHOLE VOCABULARY, not five of its nine groups (fresh review, cycle 3, P2).
+# The first version omitted `unresolved issues?`, `test review capped`, `[ADVERSARIAL-BOUND]` and
+# `[NO-LOOP-BUDGET]` — and a row about THIS repo's own gate quotes them. Each omitted group is driven
+# here, because the arm that closes a class must cover the members the class was missed on.
+for _vgroup in 'unresolved issues' '[ADVERSARIAL-BOUND] cycles=1 threats=2 covered=2 residuals=none' '[NO-LOOP-BUDGET] RISK_CLASS=low' 'test review capped at 10 cycles'; do
+  reset; printf 'MUTATION ATTRIBUTION:\n- assertion: the recorder refuses an artifact that says %s | mutant: delete arm 1 | red: 20.3a\n\nCLEAN\n' "$_vgroup" > "$TMP/reviewer-out"
+  run "$SRC" 2284
+  [ "$(rc_of)" = "6" ] && no_comment; ck $? "⛔ (4b) a row quoting '${_vgroup:0:24}' is refused EARLY with 6 and nothing is posted (rc=$(rc_of))"
+done
+
+# (5) THE TWO LABEL-LINE FORMS MUST NOT SWALLOW THE REST OF THE TRANSCRIPT (fresh review, cycle 4, P1).
+# The block terminator fired only after a BULLET, so a `none — <why>` declaration or an inline row — both
+# of which the recorder accepts ON THE LABEL LINE — left `rows` unset, the blank-line skip kept running,
+# and the "block" swallowed the reviewer's notes and verdict prose. Two failures followed: the notes were
+# pasted into the EVIDENCE body (the cargo `#2288` P3 keeps out of the recorder's veto scan), and
+# `attr_block_veto` then scanned THAT PROSE and killed genuinely clean reviews whose notes merely
+# mentioned the gate vocabulary. Both forms are driven here, and the second one asserts the notes did NOT
+# travel.
+reset; printf 'MUTATION ATTRIBUTION: none — docs-only change; adds no assertion\n\n## Notes\n- the retry loop leaves unresolved issues in the queue path, filed as #99\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "⛔ (5) a 'none — <why>' declaration on the LABEL LINE records (rc=$(rc_of)) — its own not-blocked-ness is the point: the notes below quote 'unresolved issues'"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *'unresolved issues'*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "⛔ (5) …and the reviewer's NOTES did NOT travel into the evidence body (the block ended at the declaration)"
+reset; printf 'MUTATION ATTRIBUTION: - assertion: the door refuses an empty artifact | mutant: revert the accept | red: T1\n\n## Notes\n- a later bullet that must not be captured\n\nCLEAN\n' > "$TMP/reviewer-out"
+run "$SRC" 2284
+[ "$(rc_of)" = "0" ]; ck $? "⛔ (5) an INLINE row on the label line records (rc=$(rc_of))"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *'a later bullet'*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "⛔ (5) …and the later prose bullet was not captured into the block"
+
+# (6) THE PARSER SLICE MUST FAIL CLOSED WHEN AN ANCHOR DRIFTS (fresh review, cycle 4, P2). The slice is
+# `eval`-ed from the recorder, and the recorder main body is guarded by `BASH_SOURCE == $0` — TRUE under
+# eval in another script — so an over-wide slice would EXECUTE the recorder with review-pr's argv. The
+# earlier `sed -n '/A/,/B/p'` ran to EOF when the end anchor stopped matching; `ma_slice_parser` exits on
+# the anchor and reports whether it saw it. Driven here on a RENAMED-anchor copy of the real recorder.
+# The function is EXTRACTED FROM THE SHIPPED SCRIPT, so this arm cannot drift from what runs.
+eval "$(sed -n '/^ma_slice_parser() {/,/^}/p' "$SRC")"
+declare -F ma_slice_parser >/dev/null 2>&1; ck $? "(6) fixture: ma_slice_parser was extracted from the shipped review-pr.sh"
+sed 's/^MUTATION_ATTRIBUTION_HELP=/MUTATION_ATTRIBUTION_HELP_RENAMED=/' "$ROOT/scripts/record-review.sh" > "$TMP/drifted-recorder.sh"
+[ -s "$TMP/drifted-recorder.sh" ]; ck $? "(6) fixture: a drifted copy of the shipped recorder was built"
+if ma_slice_parser "$TMP/drifted-recorder.sh" >/dev/null 2>&1; then rc=1; else rc=0; fi
+ck $rc "⛔ (6) a recorder whose END anchor does not match is REFUSED by the slicer — nothing over-wide is ever eval-ed"
+if out="$(ma_slice_parser "$ROOT/scripts/record-review.sh")"; then rc=0; else rc=1; fi
+ck $rc "(6) …and the SHIPPED recorder still slices (the guard is not a blanket refusal)"
+case "$out" in
+  *MUTATION_ATTRIBUTION_AWK=*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "(6) …and the slice really carries the parser (so a green 6 cannot come from an empty slice)"
+
 # ── §A2 the RECORD step's own failure arms, and the --repo mode ───────────────
 # ⛔ (P2, fresh review of #2288) THREE GUARDS HAD NO ASSERTION BEHIND THEM and each could be
 # deleted with the suite fully green: the recorder's non-zero exit check, the recorder preflight

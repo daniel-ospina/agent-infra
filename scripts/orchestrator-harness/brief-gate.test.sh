@@ -143,6 +143,90 @@ bash "$TMP/mutant-refuse.sh" --check "$CANON" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "MUTATION (other direction): 'a complete brief passes' FAILS when the gate refuses everything (rc=$rc)"
 
 echo
+echo "§A2 agent-infra#3442 — the REVIEWER brief must order a mutation attribution (and only the reviewer one)"
+# ⛔ WHY THIS EXISTS. Review had no contract requiring that a NEW ASSERTION can FAIL, so five PRs in one
+# night passed clean on guards whose tests stay GREEN with the bug restored (#3355, #3368 ×2, #3374,
+# #3355 round 4) — #3368's own review named the mechanism: "No mutation leg for the new gate — which is
+# exactly how findings 1 and 2 survived three recorded clean reviews." The reviewer's brief is where
+# that contract reaches the reviewer, because `merge-one.sh` splices `--section reviewer` into the
+# reviewer's prompt.
+#
+# ⛔ AND THE SCOPE IS THE HALF THAT MATTERS. A requirement that fired on every role would refuse every
+# authored brief and every GENERATED brief that predates this change — the false block this tree's gates
+# are most often wrong about. Both directions are pinned below, so a later "tighten it everywhere" edit
+# reddens here instead of stalling the fleet.
+CANON_REV="$TMP/canon-reviewer.txt"; bash "$GATE" --section reviewer > "$CANON_REV"
+NO_MAT="$TMP/reviewer-no-mat.txt"; sed '/^MUTATION ATTRIBUTION:/d' "$CANON_REV" > "$NO_MAT"
+[ -s "$NO_MAT" ]; ck $? "fixture: the reviewer section still renders after the attribution block is stripped"
+# The strip must REALLY strip: a fixture that silently matched nothing would make every arm below pass
+# for the wrong reason (the #3355 shape — a mutation that never applied).
+grep -q '^MUTATION ATTRIBUTION:' "$CANON_REV"; ck $? "fixture: the shipped reviewer section CARRIES the attribution order (the gate cannot refuse its own advice)"
+grep -q '^MUTATION ATTRIBUTION:' "$NO_MAT"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "fixture: the stripped copy really has no attribution order (the sed anchor is live)"
+bash "$GATE" --check "$CANON_REV" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(i) the canonical REVIEWER brief PASSES (got $rc)"
+bash "$GATE" --check "$NO_MAT" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(ii) a reviewer brief with NO mutation attribution is REFUSED with 80 (got $rc) — no reviewer is dispatched to 'look at it' without being ordered to name what reddens a new assertion"
+bash "$GATE" --check "$NO_MAT" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(iii) the SAME brief under role 'lane' is ADMITTED (got $rc) — the requirement is scoped to the role that owes it, not a blanket false block"
+for _r in fixer worker; do
+  bash "$GATE" --check "$NO_MAT" "$_r" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(iii-b) role '$_r' without the field is ADMITTED too (got $rc)"
+done
+sed 's/^MUTATION ATTRIBUTION:.*/MUTATION ATTRIBUTION:/' "$CANON_REV" > "$TMP/reviewer-empty-mat.txt"
+bash "$GATE" --check "$TMP/reviewer-empty-mat.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(iv) an EMPTY attribution value is REFUSED (got $rc) — a label with nothing after it orders nothing (the check is not presence-only)"
+# The token is what a caller can branch on, so pin it directly rather than inferring it from the rc.
+# Captured to a variable rather than piped: `cmd | grep -q` is the SIGPIPE shape this repo guards
+# against, and the capture has no subprocess to strand.
+MISS_REV="$(bash "$GATE" --missing "$NO_MAT" reviewer)"
+grep -qx 'MUTATION-ATTRIBUTION' <<<"$MISS_REV"; ck $? "(v) --missing names the token MUTATION-ATTRIBUTION for the reviewer role"
+MISS_LANE="$(bash "$GATE" --missing "$NO_MAT" lane)"
+grep -qx 'MUTATION-ATTRIBUTION' <<<"$MISS_LANE"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(v-b) …and NOT for the lane role (the token is role-derived, so a caller cannot see a phantom requirement)"
+
+# §B2 — THE REFUSAL TEACHES: it names the field, cites the record, and says the verdict is INCOMPLETE.
+OUTMAT="$(bash "$GATE" --check "$NO_MAT" reviewer 2>&1)"
+grep -q 'MUTATION ATTRIBUTION' <<<"$OUTMAT"; ck $? "§B2 the refusal names the missing MUTATION ATTRIBUTION field"
+grep -q '3442' <<<"$OUTMAT"; ck $? "§B2 …cites agent-infra#3442 so the author can read why"
+grep -qi 'INCOMPLETE' <<<"$OUTMAT"; ck $? "§B2 …and says an unattributed clean review is INCOMPLETE (the consequence, not just the omission)"
+grep -q 'assertion' <<<"$OUTMAT"; ck $? "§B2 …and names the row vocabulary (assertion/mutant/red) the reviewer must produce"
+# ⛔ AND ONE PHRASE THAT ONLY THE *NEW CASE ARM* CAN PRODUCE (fresh review of this change, P2). The four
+# assertions above are ALL satisfied by the canonical block that every refusal prints — measured by
+# deleting the new `MUTATION-ATTRIBUTION)` teaching line and watching all four stay green. So the line
+# that exists to teach the remedy for THIS field was unpinned, which is this issue's own defect class.
+# This phrase appears only in that case arm (the canonical section says "for EACH assertion the diff
+# ADDS…", never "a REVIEWER brief must order").
+grep -qF 'a REVIEWER brief must order the reviewer to state' <<<"$OUTMAT"; ck $? "§B2 ⛔ …and the teaching line SPECIFIC to this field is present (the four greps above are satisfied by the canonical block alone, so this is what pins it)"
+
+# §C2 — NON-VACUITY. Delete the role gate from the awk, derive the mutant FROM THE SHIPPED FILE (so it
+# tracks it), and prove §A2(ii) goes RED: the mutant admits the brief it just refused.
+MATMUT="$TMP/mutant-no-attribution-gate.sh"
+# ⛔ THE DELIMITER IS `|`, NOT `#`, AND THAT IS LOAD-BEARING (fresh review of this change, P1). With
+# `#` the replacement's own `# MUTANT:` terminated the expression, sed exited 1, the redirect left a
+# 0-BYTE mutant, and EVERY arm below passed on an empty file — `diff` differed, `bash -n` succeeded,
+# `--section` exited 0 and `--check` exited 0. Four green assertions over a mutation that was never
+# applied, on the issue whose whole subject is assertions that cannot fail. The guards are the fix, and
+# they are ordered so the empty-mutant state cannot reach a behavioural assertion: sed's own status,
+# then a non-empty size, then the retained requirement text.
+if sed 's|^  if (tolower(brief_role) == "reviewer" \&\& !mat) print "MUTATION-ATTRIBUTION"$|  # MUTANT: the reviewer requirement is deleted|' "$GATE" > "$MATMUT"; then
+  ck 0 "§C2 the mutation applied (sed exited 0 — a non-zero sed leaves a truncated mutant, not a mutation)"
+else
+  ck 1 "§C2 sed FAILED to apply the mutation — every arm below would pass on a truncated file, so this is a hard stop"
+fi
+diff -q "$GATE" "$MATMUT" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§C2 the mutation REALLY changed the validator (the sed anchor still matches)"
+[ -s "$MATMUT" ]; ck $? "§C2 ⛔ the mutant is NON-EMPTY ($(wc -c < "$MATMUT" | tr -d ' ') bytes) — an empty 'mutant' would satisfy every assertion below for the wrong reason"
+bash -n "$MATMUT"; ck $? "§C2 the mutant still parses — it is a program, not a syntax error failing for the wrong reason"
+bash "$MATMUT" --section reviewer >/dev/null 2>&1; ck $? "§C2 the mutant is ALIVE (it still renders the section) — only the decision was removed"
+grep -qF 'MUTATION ATTRIBUTION:' "$MATMUT"; ck $? "§C2 the mutant still CARRIES the requirement text — only its gate was removed"
+bash "$MATMUT" --check "$NO_MAT" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "MUTATION §C2: '(ii) a reviewer brief with no attribution is REFUSED' now FAILS — the mutant admits it (rc=$rc, §A2 would report rc=$rc as ❌)"
+bash "$MATMUT" --check "$TMP/reviewer-empty-mat.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "MUTATION §C2: '(iv) an EMPTY value is refused' now FAILS too (rc=$rc) — so the arm is pinning the value check, not the label"
+
+
+echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
 # ── the stub `pi` records every invocation, so "refused" is proven by ABSENCE, and the admitted
 #    control proves the machinery under it actually works (a negative assert alone passes on a tree
@@ -576,13 +660,31 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # so it is a deliberate NAMER of the gate rather than a new dispatch path — but it is a REFERENCER,
 # and an undeclared one reddens this equality. Measured: unregistered, this arm fails with
 # `ADDED: scripts/test_cmux_payload.py`, which is exactly the attributable red the census exists for.
+# ⛔ AND `scripts/record-review.test.sh` NOW IS ONE TOO (agent-infra#3442). §21e2 renders the canonical
+# reviewer section and feeds it to the artifact parser, to prove the two halves of the mutation-
+# attribution contract cannot stand in for each other — the same "build the fixture from the shipped
+# validator so it cannot drift" construction as the entry above, not a dispatch path.
 # ⛔ AND THE LIST IS AN EQUALITY, SO IT MUST BE KEPT CURRENT BY WHOEVER MOVES THE SCAN (#1881 LANE,
 # measured). The five `orchestrator-harness` entries without a comment above arrived on `main` after
 # the last time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the
 # four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
 # superset), independently of any branch. Declared here because an equality that is red on its own
 # base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# ⛔ agent-infra#3442 added `scripts/record-review.sh`, AND IT IS A REFERENCER BY DESIGN, not a
+# dispatch path: the mutation-attribution contract has two halves, and that file owns the ARTIFACT
+# half — its refusal teaches the same `MUTATION ATTRIBUTION:` block this validator requires in a
+# REVIEWER brief, by citing `brief-gate.sh --section reviewer` as the canonical source of the wording.
+# Two files holding one grammar must name each other, or the next editor changes one and the reviewer
+# is taught a shape the mint refuses. Measured on this change: undeclared, the arm failed with
+# `ADDED: scripts/record-review.sh`, which is the attributable red this census exists for.
+# ⛔ THE FOUR PRE-EXISTING UNDECLARED ENTRIES (`check-farm-drift.sh`, `cloud-cell-supervisor.sh`,
+# `key-gate.sh`, `nonblocking-dispatch.test.sh`) were ALREADY in `found` on the base this change was
+# written against, so this arm was red before it — the exact "red on its own base" case the paragraph
+# above names. They are DECLARED here rather than filtered out by a pattern (a filter would silently
+# absorb the next referencer too) and rather than left red (an equality nobody can get green protects
+# nothing). Each is a REFERENCER — a farm/doctor/harness script that resolves or drives the gate — and
+# none is a dispatch path the gate is missing.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

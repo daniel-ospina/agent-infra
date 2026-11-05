@@ -3573,11 +3573,16 @@ _RESEARCH_SECTION = None
 # The role this file's brief is judged with. `nonblocking-dispatch.sh:175` -- the dispatcher every
 # `prfix` worker goes through -- regrades the brief it is about to send with `worker`, and `--section`
 # above is rendered for `worker`, so `worker` is the judge's role. The choice is NOT load-bearing for
-# the verdict: `brief-gate.sh --check` is role-independent across the four declared roles (measured --
-# a shipped section exits 0, a section with no `CONTRADICTION TEST:` exits 80, for both `lane` and
-# `worker`; only an UNKNOWN role yields 78, and 78 is now ungradable rather than a refusal). Grading
-# with `lane` would therefore not admit anything `worker` refuses -- but stating that `lane` is "the
-# role that will judge the brief" was simply wrong, so it says `worker`.
+# the verdict: `lane`, `fixer` and `worker` are interchangeable judges (measured — a shipped section
+# exits 0, a section with no `CONTRADICTION TEST:` exits 80, for both `lane` and `worker`; only an
+# UNKNOWN role yields 78, and 78 is now ungradable rather than a refusal). ⛔ `reviewer` is the ONE
+# exception since agent-infra#3442: it additionally owes a `MUTATION ATTRIBUTION:` field (the brief half
+# of the non-vacuity contract), so a brief lacking it exits 80 under `reviewer` and 0 under the other
+# three. That does not touch this file — it grades `worker` and renders `worker` — but the sentence
+# above used to claim all four roles agreed, and it no longer does; stated here so the next reader does
+# not rediscover it as a bug. Grading with `lane` would therefore still not admit anything `worker`
+# refuses -- but stating that `lane` is "the role that will judge the brief" was simply wrong, so it
+# says `worker`.
 _BRIEF_GATE_ROLE = "worker"
 # What `--check` is handed: the section PLUS a minimal order. The gate's contract is about a BRIEF, and
 # a bare section is what it calls EMPTY/NO-FILE -- grading a fragment would test the wrong shape.

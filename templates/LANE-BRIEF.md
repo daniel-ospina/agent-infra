@@ -188,6 +188,14 @@ flag does either.
 
 2. Act on its findings. Re-dispatch after fixes; converge before you record. The review must leave
    an ARTIFACT (the PR comment you post) — step 3 names it.
+   ⛔ **The artifact MUST carry a `MUTATION ATTRIBUTION:` block (agent-infra#3442).** For EACH
+   assertion the diff ADDS that claims to protect a behaviour, the reviewer states the mutant that
+   reverts that behaviour and the row that goes RED —
+   `assertion: … | mutant: … | red: …`, one row per assertion (a mutant that reddens the suite via an
+   UNRELATED row is not a proof). If the diff adds no assertion, the block says
+   `none — <why>`; that is a claim too, and a false one is a finding. This is ENFORCED: step 3's
+   `record-review.sh` REFUSES a `clean` record whose artifact names no mutant (exit 3), because five
+   PRs in one night passed clean on assertions that could not fail (#3355, #3368 ×2, #3374).
 3. Record the attestation at the PR's CURRENT head — after your LAST push:
 
    ```

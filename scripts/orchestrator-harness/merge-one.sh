@@ -1201,6 +1201,18 @@ Write your review to a file, then:
     gh pr comment $PR --repo $OR --body-file <your-review-file>
 Your comment MUST state the outcome plainly and MUST NOT contain an unresolved assertion. Forbidden phrases in a CLEAN comment: "issues remain", "NOT CLEAN", "requires human attention", "auto-fix stalled/failed/reached cap".
 
+## REQUIRED: attribute every NEW ASSERTION to a mutant that reddens it (agent-infra#3442)
+Review had no contract requiring that a new assertion can FAIL, so five PRs in one night passed clean on guards whose tests stay GREEN with the bug restored (#3355, #3368 x2, #3374). Your comment MUST carry a mutation-attribution block:
+
+    MUTATION ATTRIBUTION:
+    - assertion: <the behaviour the new assertion protects> | mutant: <the revert of that behaviour> | red: <the row/test that goes red>
+
+…one row PER assertion the diff ADDS that claims to protect a behaviour. A mutant that reddens the suite through an UNRELATED row is NOT a proof: the failing row must be the one that names the behaviour. If the diff adds no assertion at all, write
+
+    MUTATION ATTRIBUTION: none — <why, concretely>
+
+instead — that is a claim too, and a false one is a finding. THIS IS ENFORCED, NOT ADVISORY: record-review.sh REFUSES a `clean` record whose artifact carries no such block (exit 3, message naming this issue), so a CLEAN verdict without it cannot be recorded and the PR cannot land.
+
 ## FINAL MESSAGE — exactly one line:
     CLEAN <the comment URL that gh pr comment printed>
   or, if you found real issues:
