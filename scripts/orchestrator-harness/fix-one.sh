@@ -238,7 +238,17 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # misattribution #2721 fixed for the live arm. Measured cost of NOT distinguishing it: the
     # operator is sent to wait for a load remedy that cannot arrive.
     echo "[fix $PR] REFUSED before creating a worktree: $WT_RESULT" >> "$L.log"
-    echo "[fix $PR] REFUSED-DISK (nothing created, attempt refunded) — reclaim space; this will NOT clear by waiting" >> "$L.log"
+    # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review cycle 4, P2 — MEASURED). BOTH
+    # pre-start arms reach rc 4 with `REFUSED-UNKNOWN`: an unreadable `df`, and a half-deployed `$O`
+    # missing `spawn-gate.sh` (the file's own arm G pins that skew). Telling the operator to "reclaim
+    # space" for a version skew or a broken probe is a remedy that CANNOT ARRIVE — the exact
+    # misattribution #2721 fixed for the live arm, re-introduced one step earlier.
+    case "$WT_RESULT" in
+      *REFUSED-UNKNOWN*)
+        echo "[fix $PR] REFUSED-UNKNOWN (nothing created, attempt refunded) — the free-space probe could NOT answer, so this is NOT a full disk: check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033). Reclaiming space will NOT clear it." >> "$L.log" ;;
+      *)
+        echo "[fix $PR] REFUSED-DISK (nothing created, attempt refunded) — reclaim space; this will NOT clear by waiting" >> "$L.log" ;;
+    esac
     refund_gate_attempt
     exit "${AGENT_DISK_REFUSED:-77}"
   fi
