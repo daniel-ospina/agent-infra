@@ -899,10 +899,27 @@ shard_kill_group() {
 # (this file, `shard_budget` vs `BASH_SHARD_SLICE`): inheriting it into a nested runner is the same
 # ~N-times-too-lenient deadline the refusal above exists to prevent.
 #
-# `env -u` (not a subshell `unset`): it is one exec, so the child's pid and its `set -m` process group
-# are unchanged — `$!`, `shard_bg_pid` and every group TERM→KILL below address the shard itself, exactly
-# as they did before. It is also the idiom this repo's own suites already use for the same reason
-# (`env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS`, tests/ci-lane-parity/run.sh).
+# `env -u` (not a subshell `unset`), because a subshell would have to *know* which variables to drop
+# and the list already drifts between call sites. It is also the idiom this repo's own suites use for
+# the same reason (`env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS`, tests/ci-lane-parity/run.sh).
+#
+# ⛔ `$!` HERE IS THE PROCESS-GROUP LEADER, NOT THE SHARD'S OWN PID — measured, and the first draft of
+# this comment claimed the opposite. `shard_exec "$1" &` backgrounds a FUNCTION, so bash forks a WRAPPER
+# subshell for its body; the wrapper then forks `env`, which execs `bash "$1"` in place. Measured on the
+# shipped shape: `$!`=wrapper, shard=wrapper+2 (a direct `env … bash … &`, or a function whose body ends
+# in `exec`, preserves the pid — the function form does NOT). What makes that safe is the GROUP, not the
+# pid: under `set -m` the backgrounded wrapper IS the leader of a new group and the shard INHERITS that
+# group (measured: wrapper pgid == `$!`, shard pgid == wrapper pgid), so `shard_shard_escalate`'s
+# `kill -TERM -"$1"` / `kill -KILL -"$1"` reach the shard exactly as before. The bare-pid fallback is
+# therefore unreachable while the shard lives — `-<pgid>` fails only when NO member of the group is
+# alive, which means the shard is already gone — so it can never orphan a live shard here.
+# ⚠️ STATED RESIDUAL: the `kill -0` / `ps -o stat=` reads in `shard_watchdog` also name the WRAPPER. It
+# proxies the shard faithfully (it exits when its foreground child does, and is then this driver's zombie
+# until `wait` reaps it, which is the `Z*` case the bound already handles), but between the shard's exit
+# and the wrapper's own is a short window where the read is `S` — so a shard finishing at the very
+# instant of the bound can be named a TIMEOUT. It is cosmetic (the rc is still the shard's and the group
+# is already gone); restoring exact pid identity would mean inlining the `env -u` at the `&` site, which
+# moves the string the three ci-lane-parity mutants pin — the P0 this branch already had to repair once.
 shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"; }
 
 shard_run_bounded() {

@@ -3921,25 +3921,20 @@ remove_one() {
             rm -f "$out"; return 1
         fi
         log "PRESERVE-OK $path $presv"
-        # ⛔ RE-CHECK #2 AGAIN, AFTER THE ARCHIVE (review of #3405 round 5, P3). Re-check #2 exists to
-        # catch a gitignored NON-EPHEMERAL file that appeared in the window ("would be deleted with the
-        # checkout — silently"). Gate (b) then spends FOUR bounded forks (up to ~4.7 min at the
-        # defaults) between that verdict and the fork, so a lane's build writing `.env`/`data/`/
-        # `.coverage` during the archive was admitted by a `clean` read taken BEFORE it existed — and
-        # the archive's own `git status` does not list ignored entries, so it would not even be
-        # recorded as evidence. A `clean` captured in the archive proves the checkout was clean at
-        # capture time; it does not prove it is clean now. One more bounded gate closes the half of
-        # the window the archive opened, and `holder_recheck` STAYS LAST.
-        crumb="$(clean_gate "$path")"
-        cverdict="${crumb%%$'\t'*}"
-        cpay="${crumb#*$'\t'}"
-        if [ "$cverdict" != clean ]; then
-            REMOVE_SKIP_VERDICT="$cverdict"
-            log "REMOVE-SKIP $path post-archive re-check not clean ($cverdict: $cpay) — nothing removed, the archive is kept"
-            rm -f "$out"; return 2
-        fi
-        # ⛔ BUT `clean` HERE STILL TOLERATES THE LANE EVIDENCE, AND THE TOLERANCE IS SPENT (review of
-        # #3422, P2). `clean_gate` admits IGNORED_LANE_EVIDENCE because `preserve_before_removal` is
+        # ⛔ THE ORDER OF THIS BLOCK IS THE GATE, NOT A STYLE CHOICE (review of #3422, P2 — ORDERING).
+        # The post-archive cleanliness re-check exists to catch a gitignored NON-EPHEMERAL file that
+        # appeared in the window ("would be deleted with the checkout — silently"). Capturing a
+        # verdict in the `clean` position below is only worth anything if it is the LAST cleanliness
+        # read before the fork — and the evidence ladder that follows it is up to NINE bounded probes
+        # (the manifest read, `lane_evidence_present` once per tolerated root, and per root a link
+        # probe + a directory probe + the walk in `evidence_signature`), EACH at
+        # `REAP_WT_REMOVE_TIMEOUT` = 120 s, i.e. up to ~18 min at the defaults. A gate placed BEFORE
+        # that ladder is a `clean` verdict a lane's build has ~18 min to falsify by writing a
+        # `.env`/`data/`/`.coverage` — the A21e exposure relocated, not closed. So the ladder runs
+        # FIRST and `clean_gate` is the last cleanliness read, immediately before `holder_recheck`
+        # (which is a LIVENESS probe and cannot see such a file at all) and the fork.
+        # ⛔ `clean` ALSO TOLERATES THE LANE EVIDENCE, AND THE TOLERANCE IS SPENT (review of #3422,
+        # P2). `clean_gate` admits IGNORED_LANE_EVIDENCE because `preserve_before_removal` is
         # ABOUT TO archive it — a precondition that no longer holds once the archive has run. A
         # `WORKTREE-REPORT.md` that appears during the archive therefore read as `clean`, the removal
         # proceeded, and the lane's mandatory report (the very class gate (b) exists for) was destroyed
@@ -3982,12 +3977,33 @@ remove_one() {
                 log "REMOVE-SKIP $path lane evidence CHANGED during the archive (signature $ev_sig_before -> $ev_sig_now) — nothing removed, the archive is kept"
                 rm -f "$out"; return 2
             fi
-        elif [ "$ev_before" != "<none>" ] && [ "$ev_before" != "$ev_archived" ]; then
-            # NOT silent (review of #3422 round 11, P3): tolerated evidence that was there before the
-            # archive and GONE after it means the comparison's own precondition was waived. Nothing is
-            # lost (the archive holds what was captured), so this is not a preserve — but a waived gate
-            # that says nothing is how a gate stops being one, so it is named.
+        elif [ "$ev_before" != "<none>" ]; then
+            # NOT silent (review of #3422 round 11, P3; condition corrected in review of #3422, P3):
+            # tolerated evidence that was there BEFORE the archive and GONE after it means the
+            # comparison's own precondition was waived. ⛔ THE OLD CONDITION ALSO REQUIRED
+            # `ev_before != ev_archived`, which made the note UNREACHABLE in exactly the ordering its
+            # own message describes: evidence present before the signature and still present at
+            # capture gives `ev_before == ev_archived`, and if the lane then removes it mid-archive
+            # the note was skipped silently — a waived gate that says nothing, which is the class this
+            # note exists to prevent. Nothing is lost (the archive holds what was captured), so this
+            # is not a preserve — but it is named.
             log "REMOVE-NOTE $path tolerated lane evidence vanished during the archive (was '$ev_before') — the before-signature is waived; what existed at capture time is in the archive"
+        fi
+        # ⛔ RE-CHECK #2 AGAIN, AFTER THE ARCHIVE (review of #3405 round 5, P3) — and DELIBERATELY THE
+        # LAST CLEANLINESS READ, which is why it sits here and not above the evidence ladder (see the
+        # ordering note at the top of this block). Gate (b) spends its bounded forks between re-check
+        # #2 and this point, so a lane's build writing `.env`/`data`/`.coverage` during the archive was
+        # admitted by a `clean` read taken BEFORE it existed — and the archive's own `git status` does
+        # not list ignored entries, so it would not even be recorded as evidence. A `clean` captured in
+        # the archive proves the checkout was clean at CAPTURE time; it does not prove it is clean now.
+        # Placed last, this is the one gate that closes the whole window the archive opened.
+        crumb="$(clean_gate "$path")"
+        cverdict="${crumb%%$'\t'*}"
+        cpay="${crumb#*$'\t'}"
+        if [ "$cverdict" != clean ]; then
+            REMOVE_SKIP_VERDICT="$cverdict"
+            log "REMOVE-SKIP $path post-archive re-check not clean ($cverdict: $cpay) — nothing removed, the archive is kept"
+            rm -f "$out"; return 2
         fi
     fi
 

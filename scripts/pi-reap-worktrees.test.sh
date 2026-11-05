@@ -2522,7 +2522,9 @@ assert_dir "$WT_LATEF" "A21f the worktree is still on disk"
 # MUTANT: drop the archived-vs-current comparison and the same fixture loses the report.
 MUT6="$T/$ENV/pi-reap-worktrees.mutant-evidence.sh"
 awk '
-    /BUT `clean` HERE STILL TOLERATES THE LANE EVIDENCE/ { skip = 1 }
+    # ⛔ THE ANCHOR IS THE COMMENT THAT INTRODUCES THE BLOCK, so it must track the wording (this
+    # exact arm went vacuous once when a reorder reworded it — `cmp -s` below is what caught it).
+    /TOLERATES THE LANE EVIDENCE/ { skip = 1 }
     skip && /ev_sig_now/ { seen = 1 }
     skip && seen && /^        fi$/ { skip = 0; seen = 0; next }
     !skip { print }
@@ -2811,6 +2813,18 @@ else
             bad "A21o the probe arms whitelist 124|125 again — 137/126/127 would read as 'absent' and drop the root" ;;
         *)
             ok "A21o …and no arm whitelists just 124|125" ;;
+    esac
+    # ⛔ THE INNER-LINK GUARD NEEDS ITS OWN ARM (review of #3422, P3 — MEASURED). It is a `||` on a
+    # command substitution inside the `find -exec sh -c` string, NOT a `*) exit 3 ;;` arm, so the count
+    # above does not move when it is deleted (verified: deleting it still counts 3). The doc row used to
+    # credit A21o's catch-all count with pinning it, which was false — this arm is what makes the claim
+    # true. The needle goes in a VARIABLE so its `)` cannot terminate the `case` pattern.
+    READLINK_GUARD='readlink "$l")" || exit 3'
+    case "$SIGFN" in
+        *"$READLINK_GUARD"*)
+            ok "A21o an inner link's readlink that FAILS is a walk failure (RED), not a 'link -> ' line that compares equal to itself" ;;
+        *)
+            bad "A21o the inner link's `readlink` fallback is GONE — a failing readlink would emit 'link X -> ' forever, equal to itself" ;;
     esac
 fi
 LANEFN="$(awk '/^lane_evidence_present\(\) \{/{f=1} f{print} f&&/^}$/{exit}' "$REAPER")"
