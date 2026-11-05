@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-55 tests with 106 paired mutations: every mutation re-
+55 tests with 107 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 55 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (106)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (107)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3550,6 +3550,23 @@ MUTATIONS = [
         '                    note = ""',
         "the census adopts an unbound 10-column row SILENTLY, so the fifth rule of the "
         "binding table is false on the fleet-wide surface",
+    ),
+    # ⛔ RESTORED FROM `main` (#3404), the sibling of round 5's T38. `main` proved BOTH census
+    # pid-seam defects RED from one anchor; this branch's refactor moved `_pidtok` from
+    # `… else "?"` to a wrapped `… else ""`, and only the PRESENT-BUT-UNUSABLE half was
+    # re-homed (as T46's `_pidcol(10)` -> `_num(10)`). The DIGIT-CAP half was simply dropped,
+    # so `--mutations` printed a clean 106/106 while nothing re-introduced it. Verified before
+    # restoring: the anchor occurs exactly once (`liveness.py:3194`) and applying it reddens
+    # T48 with the ValueError main's `why` describes.
+    Mutation(
+        "T48", "module",
+        '                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10\n'
+        '                        else "")',
+        '                return (tok if tok.isascii() and tok.isdigit()\n'
+        '                        else "")',
+        "the digit cap is gone, so an out-of-range row pid reaches int() BEFORE `_bind_verdict` "
+        "decides and raises ValueError (the 4300-digit conversion limit), taking the whole "
+        "census run down after printing only the rows before it",
     ),
     Mutation(
         "T43", "module",
