@@ -3251,22 +3251,45 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
             continue
         fi
         rec_t="$(head -n 1 "$rec" 2>/dev/null)"
-        [ -n "$rec_t" ] || continue
-        # ⛔ THE RECORD'S OWN CONTENT IS HELD TO THE SAME ABSOLUTENESS RULE (#10114 review P1), and the
-        # asymmetry was the tell: the ARM that names the record is guarded above — the
-        # `case "$pin_root" in /?*)` line in `pin_tree_match` — with the stated reason "a CWD-relative
-        # candidate that IS read", while the CONTENT it reads was not.
+        # ⛔ THE RECORD'S OWN CONTENT IS HELD TO THE SAME FAIL-CLOSED RULE AS EVERY OTHER WAY THIS
+        # PROBE CAN FAIL TO PLACE IT (#10114 review P1, then cycle 3 P2/P3). `$canon` is absolute
+        # (`pwd -P`), so content this probe cannot place in space ABSOLUTELY cannot be answered
+        # negative: a RELATIVE spelling can only ever match through `rec_c`, and `rec_c` resolves it
+        # with `cd "$(dirname …)"`, i.e. against the REAPER'S WORKING DIRECTORY — one box, one record,
+        # two cwds, two verdicts. Resolving it by guesswork is therefore out; and NEGATIVE is not the
+        # other option, because "cannot place it" is not "names something else" — the same rule the
+        # empty arm is here for.
+        # ⛔ AND AN EMPTY RECORD IS A MEASURED PRODUCTION STATE, NOT A HYPOTHETICAL. The dir record is
+        # written NON-ATOMICALLY by `cloud-cell-supervisor.sh` (`printf … > "$HARNESS_PIN_FILE"`), which
+        # is why `cloud-cell-bringup.sh` states the consequence in its own comment: "a concurrent
+        # `status`/`start` can `head -1` an EMPTY pin, and a write that fails after the redirect leaves
+        # a previously valid pin EMPTY … (the measured `pinned=none`-with-a-pin-file state)". Reading
+        # that as "no record" makes the reaper remove the tree the box EXECUTES in exactly the state
+        # the bringup was hardened against. The sibling reader refuses on the same input — install.sh's
+        # "Empty means 'no usable record', never 'current'" — and preserving is this probe's analogue
+        # of that refusal, so it costs disk, never work.
+        # ⛔ ONE ARM, TWO SHAPES, DELIBERATELY: a `*`-arm that preserved for the EMPTY case alone would
+        # leave whitespace-only and relative content answered NEGATIVE one line later — a triad of
+        # cannot-answer inputs, split across two polarities, which is what the review objected to. The
+        # empty/relative distinction is carried by the PROOF, not by the verdict. `no-record-absoluteness`
+        # deletes this arm and G15-M7/G15-M13 prove both are discriminating; the fixture path carries no
+        # `harness` component, so the shape backstop cannot mask it.
         # NAMED, NOT CITED BY LINE: this reference has now been wrong TWICE, both times because the
         # reference itself had moved — `:2702` was the guard on the pre-rebase commit, and the fix for
         # that (`:3127`) was falsified by the 14 comment lines that same fix ADDED above it, which put
         # the guard at `:3141`. A line number in a file this edit amends is a citation that cannot
         # survive its own repair.
-        # `$canon` is absolute (`pwd -P`), so a RELATIVE record can only ever match through `rec_c` —
-        # and `rec_c` resolves it with `cd "$(dirname …)"`, i.e. against the REAPER'S WORKING
-        # DIRECTORY. One box, one record, two cwds, two verdicts; the wrong one is rule 3, which
-        # REMOVES the tree the box executes. Discarded rather than resolved by guesswork, so the
-        # verdict cannot move with the caller (G15o asserts the discard, G15-M7 the discrimination).
-        case "$rec_t" in /?*) : ;; *) continue ;; esac
+        case "$rec_t" in
+            /?*) : ;;
+            *)
+                PIN_VERDICT="pin-tree"
+                if [ -z "$rec_t" ]; then
+                    PIN_PROOF="pin record $rec is READABLE but names NOTHING — empty, or a write that failed after the redirect; 'no content' is not 'names something else'; failed CLOSED"
+                else
+                    PIN_PROOF="pin record $rec names '$rec_t', which this probe will not resolve against its own cwd — 'cannot place it' is not 'names something else'; failed CLOSED"
+                fi
+                return 0 ;;
+        esac
         # ⛔ THE RECORD IS NORMALISED BEFORE IT IS COMPARED (#10114 review P1). `$canon` comes from
         # `pwd -P`, but a record is taken VERBATIM — so a record spelled through a symlink never
         # matched, and only the shape backstop masked it. That is the shipped Darwin spelling

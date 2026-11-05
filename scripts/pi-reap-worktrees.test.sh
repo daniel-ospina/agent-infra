@@ -960,13 +960,18 @@ ANCHORS = {
         "        pin_root=\"$(printf \x27%s\x27 \"$pin_root\" | tr -s \x27/\x27)\"   # collapse `//` — POSIX, no bashism",
         "        :   # MUTANT: the `//` collapse is deleted (the trailing-slash strip below still runs)",
     ),
-    # (4c) delete the ABSOLUTENESS guard on the record CONTENT ITSELF — the arm that keeps a relative
-    # `.harness-path` from being resolved against the CWD OF THE REAPER. With it gone the same record
-    # matches or does not depending on where the reaper was invoked: a verdict that is a function of
-    # the caller, on a veto whose miss is a removal.
+    # (4c) delete the PLACEMENT guard on the record CONTENT — the arm that refuses to answer NEGATIVE
+    # on content it cannot place (empty, whitespace-only, or a relative `.harness-path` that would only
+    # resolve against the reaper CWD itself). Replacing it with `continue` reproduces the PRE-FIX
+    # one-liner EXACTLY (`case "$rec_t" in /?*) : ;; *) continue ;; esac`), so the mutant is the code
+    # this arm replaced, not a stand-in for it: the record is skipped in silence and the tree the box
+    # EXECUTES falls to rule 3. G15o (relative) and G15v (empty) must both red, which is how the ONE
+    # arm is shown to carry BOTH shapes.
+    # ⛔ NO APOSTROPHES IN THIS BLOCK: it is a single-quoted `python3 -c` argument, so one would end
+    # the shell string (see the same warning on the ANCHORS header).
     "no-record-absoluteness": (
-        "        case \"$rec_t\" in /?*) : ;; *) continue ;; esac",
-        "        case \"$rec_t\" in __mutant_record_absoluteness_removed__) : ;; *) : ;; esac   # MUTANT: the absoluteness guard is deleted",
+        "            /?*) : ;;\n            *)\n                PIN_VERDICT=\"pin-tree\"",
+        "            /?*) : ;;\n            *) continue\n                PIN_VERDICT=\"pin-tree\"",
     ),
     # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
     # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
@@ -5132,14 +5137,16 @@ OUT="$(CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
 assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "pin-tree" \
     "G15n a \$CELL_HOME-rooted record is read with NO record at \$HOME and no 'harness' in the path (the mixed-root shape, other direction from G15k)"
 
-# G15o: THE RECORD'S OWN CONTENT — a RELATIVE path must be DISCARDED, never resolved against the
-# reaper's cwd. `$canon` is absolute (`pwd -P`), so a relative record can only ever match through
-# `rec_c`, and `rec_c` is `cd "$(dirname "$rec_t")"` — i.e. relative to WHEREVER THE REAPER WAS
-# INVOKED. One box, one record, two cwds, two verdicts, and the wrong one is rule 3, which REMOVES
-# the tree the box executes. The worktree PATH carries NO `harness` component, so the shape
+# G15o: THE RECORD'S OWN CONTENT — content this probe cannot PLACE IN SPACE must PRESERVE, and the
+# verdict must not move with the caller. `$canon` is absolute (`pwd -P`), so a relative record can only
+# ever match through `rec_c`, and `rec_c` is `cd "$(dirname "$rec_t")"` — i.e. relative to WHEREVER THE
+# REAPER WAS INVOKED. Resolving it by guesswork is one box, one record, two cwds, two verdicts. But
+# NEGATIVE is not the alternative: "cannot place it" is not "names something else", so the arm
+# PRESERVES — the same rule the EMPTY record gets in G15v, deliberately ONE arm for both shapes (see
+# the comment in `pin_tree_match`). The worktree PATH carries NO `harness` component, so the shape
 # backstop cannot mask the miss, and the FIRST half asserts that the ABSOLUTE spelling of the same
 # record PRESERVES — without it the second half would be vacuous, because a fixture that cannot see
-# a record at all proves nothing about the record it discards.
+# a record at all proves nothing about the record it declines to place.
 #
 # ⛔ THE PATH THE RECORD NAMES MUST EXIST IN THE WORKTREE, AND THAT IS LOAD-BEARING (#10114). `rec_c`
 # is `cd "$(dirname "$rec_t")" && pwd -P`, so a relative record only resolves when the directory it
@@ -5167,16 +5174,56 @@ OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 
     run_reaper "$ENV" --dry-run --repo "$REPO")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "pin-tree" \
     "G15o precondition: the ABSOLUTE spelling of this record PRESERVES, so the fixture can see it"
-# …and now the SAME record file with the SAME tree, the content rewritten RELATIVE, invoked from a
-# cwd where that relative spelling DOES resolve (`$T/$ENV` -> `opt/5b1b09aad2c1/scripts` exists in
-# the worktree, because the line above commits it). A reaper that resolves it answers `pin-tree`;
-# this one discards the record, so the verdict cannot move with the caller. That the discarded arm lands on rule-3 residue is the DECLARED residual —
-# pinned here so the outcome is stated rather than discovered.
+# …and now the SAME record file with the SAME tree, the content rewritten RELATIVE. Invoked from a
+# cwd where that relative spelling DOES resolve (`$T/$ENV` -> `opt/5b1b09aad2c1/scripts` exists in the
+# worktree, because the line above commits it) AND from `/` where it does not: BOTH must PRESERVE,
+# which is the whole property — the verdict is not a function of the caller. `G15-M7` shows the
+# discriminating mutant (the pre-fix `continue`) reclaiming it from BOTH cwds.
 printf '%s\n' "opt/5b1b09aad2c1/scripts/orchestrator-harness" >"$RELREC"
 OUT="$(cd "$T/$ENV" && REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "reclaimable" \
-    "G15o a RELATIVE record is DISCARDED, not resolved against the reaper's cwd (a cwd-dependent verdict on a veto whose miss is a removal)"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "pin-tree" \
+    "G15o a RELATIVE record PRESERVES from the cwd where its spelling resolves (it is not resolved, it is refused)"
+OUT="$(cd / && REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "pin-tree" \
+    "G15o …and from the cwd where it does not, so the verdict is not a function of the caller"
+assert_contains "$(row_for "$OUT" "$RELWT")" "cannot place it" \
+    "G15o …and the row says WHY it declined to place the record, rather than reading it as no record"
+
+# G15v: an EMPTY — and a whitespace-only — record. This is a MEASURED production state, not a
+# hypothetical: `cloud-cell-supervisor.sh` writes the dir record NON-ATOMICALLY (`printf … >
+# "$HARNESS_PIN_FILE"`), and `cloud-cell-bringup.sh` states the consequence in its own comment —
+# "a concurrent `status`/`start` can `head -1` an EMPTY pin, and a write that fails after the
+# redirect leaves a previously valid pin EMPTY … (the measured `pinned=none`-with-a-pin-file
+# state)". The pre-fix `[ -n "$rec_t" ] || continue` read that as "no record" and rule 3 removed the
+# tree the box EXECUTES, in exactly the state the bringup was hardened against. The sibling reader
+# refuses the same input (`install.sh`: "Empty means 'no usable record', never 'current'"), and
+# PRESERVE is this probe's analogue of that refusal. The tree path carries no `harness` component, so
+# the shape backstop cannot mask it, and the first half asserts the READABLE record preserves — the
+# vacuity guard G15o was caught without.
+ENV=pin_tree_emptyrec
+REPO="$(mk_repo "$ENV")"
+EMWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$EMWT" HEAD
+EMREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$EMWT/scripts/orchestrator-harness" >"$EMREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$EMWT")")" "pin-tree" \
+    "G15v precondition: the POPULATED record preserves, so the fixture can see the record it empties"
+: >"$EMREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$EMWT")")" "pin-tree" \
+    "G15v an EMPTY record PRESERVES (a truncated write is not 'names something else')"
+assert_contains "$(row_for "$OUT" "$EMWT")" "names NOTHING" \
+    "G15v …and the row says the record is empty, so the operator sees a failed write instead of losing the tree"
+printf '   \n' >"$EMREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$EMWT")")" "pin-tree" \
+    "G15v …and a WHITESPACE-ONLY record also PRESERVES (same cannot-answer input, same arm)"
 
 # G15q: the UNREADABLE RECORD (review cycle 5, P2). `[ -r "$rec" ] || continue` made "cannot read
 # it" and "it is not there" the SAME answer, so the one record that says the box needs these bytes
@@ -5284,8 +5331,9 @@ chmod 755 "$NOXDIR" 2>/dev/null || true
 # box executes — with the record sitting right there and `[ -e ]` inside ALREADY true for it. This is
 # the same predicate the sibling record reader settles by REFUSING (`orchestrator-harness/install.sh`,
 # "A RECORD THAT IS NOT A FILE IS CANNOT-VERIFY, NOT AN EMPTY PIN"). A FIFO would be worse than a
-# removal here: `[ -r ]` passes and `head` BLOCKS, hanging the classifier — so this fixture uses a
-# directory (a FIFO fixture would hang the suite if the disjunct were ever deleted).
+# removal here: `[ -r ]` passes and `head` BLOCKS on `open()`, hanging the whole classifier — so the
+# DIRECTORY is driven here and the FIFO gets its own bounded fixture below (a plain FIFO fixture would
+# hang the suite rather than red it if either arm were ever deleted).
 # The tree path carries NO `harness` component, so the shape backstop cannot mask the miss.
 ENV=pin_tree_dirrec
 REPO="$(mk_repo "$ENV")"
@@ -5299,6 +5347,40 @@ assert_eq "$(reason_token "$(row_for "$OUT" "$DIRWT")")" "pin-tree" \
     "G15u a record that is a DIRECTORY (readable, but not a regular file) PRESERVES — -r is not 'readable as a record'"
 assert_contains "$(row_for "$OUT" "$DIRWT")" "UNREADABLE" \
     "G15u …and the row says WHY, so the operator sees the mis-created record instead of losing the tree"
+
+# G15w: the FIFO — the ONE shape where deleting `[ ! -f "$rec" ]` does not merely mis-classify but
+# HANGS. `[ -r ]` is true for a FIFO and `[ -f ]` is false, so production never reaches `head`; without
+# the disjunct, `head -n 1 <fifo>` blocks in `open()` waiting for a writer that never comes, and the
+# whole reap pass stops. A directory can no longer distinguish the disjunct (the PLACEMENT arm catches
+# the empty `head` result, which is the right end state and is exactly what G15-M12 asserts), so the
+# FIFO is the disjunct's remaining reason to exist and it is driven here.
+# ⛔ BOUNDED, DELIBERATELY, AND NOT WITH `timeout` (not in BSD userland): a bare run would hang the
+# SUITE rather than fail a leg, so the pair is driven by a background `sleep` + `kill`, and a bound
+# that fires is an assertion failure, never a silent pass. ⛔ THE OUTPUT GOES TO A FILE, NOT THROUGH
+# `$( )`: a command substitution is a SUBSHELL, so a status the helper set would be lost and the
+# caller would read an unbound variable (measured — the first draft of this helper did exactly that).
+_bounded_reap() { # <secs> <shell-command> <outfile> -> exit status IS the reaper's (137 = killed)
+    local secs="$1" cmd="$2" out="$3" pid killer rc
+    eval "$cmd" >"$out" 2>&1 &
+    pid=$!
+    ( sleep "$secs"; kill -9 "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    killer=$!
+    wait "$pid" 2>/dev/null; rc=$?
+    kill -9 "$killer" 2>/dev/null; wait "$killer" 2>/dev/null
+    return "$rc"
+}
+ENV=pin_tree_fiforec
+REPO="$(mk_repo "$ENV")"
+FIFOWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$FIFOWT" HEAD
+mkfifo "$T/$ENV/home/.harness-path"
+_bounded_reap 20 "REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 run_reaper $ENV --dry-run --repo $REPO" "$T/.bounded-fifo.out"
+FIFO_RC=$?
+OUT="$(cat "$T/.bounded-fifo.out")"
+assert_eq "$FIFO_RC" "0" \
+    "G15w a FIFO record returns at once (it never reaches head, so it cannot block)"
+assert_eq "$(reason_token "$(row_for "$OUT" "$FIFOWT")")" "pin-tree" \
+    "G15w a FIFO record PRESERVES — -r is true for it and -f is the disjunct that catches it"
 
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
@@ -5370,11 +5452,26 @@ assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "reclaimable" \
 
 MUTP7="$T/mutant-no-record-absoluteness.sh"
 mutate_reaper_anchored "$MUTP7" no-record-absoluteness
-OUT="$(cd "$T/pin_tree_relrec" && REAPER_OVERRIDE="$MUTP7" \
-    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
-    run_reaper pin_tree_relrec --dry-run --repo "$T/pin_tree_relrec/repo")"
-assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_relrec/opt/5b1b09aad2c1")")" "pin-tree" \
-    "G15-M7 MUTATION: without the record absoluteness guard the RELATIVE record resolves against the reaper's cwd and PRESERVES, so G15o's discard assertion is discriminating (and the verdict is a function of the caller)"
+# ⛔ BOTH cwds, because the mutant reproduces the PRE-FIX `continue` and the fix's property is
+# cwd-INDEPENDENCE — asserting from one cwd could not tell a discard from a discard that happens to
+# land the same way here. Production answers `pin-tree` from both (G15o).
+for _cwd in "$T/pin_tree_relrec" /; do
+    OUT="$(cd "$_cwd" && REAPER_OVERRIDE="$MUTP7" \
+        REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper pin_tree_relrec --dry-run --repo "$T/pin_tree_relrec/repo")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_relrec/opt/5b1b09aad2c1")")" "reclaimable" \
+        "G15-M7 MUTATION (cwd=$_cwd): without the placement arm a RELATIVE record is skipped and the tree is WRONGLY rule-3 residue => G15o is discriminating"
+done
+# G15-M13: the SAME anchor, asserted against the EMPTY fixture — which is how ONE arm is shown to
+# carry BOTH cannot-answer shapes. Without it the empty record reads as "no record" and the tree the
+# box EXECUTES is removed in the state `cloud-cell-bringup.sh` says it was hardened against.
+MUTP13="$T/mutant-no-record-empty.sh"
+mutate_reaper_anchored "$MUTP13" no-record-absoluteness
+: >"$T/pin_tree_emptyrec/home/.harness-path"
+OUT="$(REAPER_OVERRIDE="$MUTP13" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_emptyrec --dry-run --repo "$T/pin_tree_emptyrec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_emptyrec/pins/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M13 MUTATION: without the placement arm an EMPTY record is skipped and the tree is WRONGLY rule-3 residue => G15v is discriminating"
 
 # G15-M8: delete the FAIL-CLOSED arm for an unreadable record. The mutant answers like the pre-fix
 # `[ -r "$rec" ] || continue` did — an unreadable record reads as "no record" — so the tree the box
@@ -5433,15 +5530,22 @@ else
 fi
 chmod 755 "$T/pin_tree_nox/nox" 2>/dev/null || true
 
-# G15-M12: delete the `[ ! -f "$rec" ]` disjunct alone. The mutant is back to `-r`-only, so a DIRECTORY
-# record is "readable", the arm is not entered, and the tree falls to rule 3 and is RECLAIMED. This is
-# the leg that makes G15u discriminating rather than an assertion that happens to pass.
+# G15-M12: delete the `[ ! -f "$rec" ]` disjunct alone, and drive BOTH non-regular shapes.
+#  (a) the DIRECTORY: the mutant falls through to `head -n 1 <dir>`, which FAILS, so the PLACEMENT arm
+#      answers — the tree is STILL PRESERVED, which is the end state that matters. This leg therefore
+#      asserts the redundancy rather than a removal: two independent arms now cover a directory.
+#  (b) the FIFO: `head` does not fail, it BLOCKS. The mutant must be KILLED by the bound, because a
+#      hang is the defect this disjunct exists to prevent and no assertion on the row can express it.
 MUTP12="$T/mutant-no-record-unreadable-notfile.sh"
 mutate_reaper_anchored "$MUTP12" no-record-unreadable-notfile
 OUT="$(REAPER_OVERRIDE="$MUTP12" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper pin_tree_dirrec --dry-run --repo "$T/pin_tree_dirrec/repo")"
-assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_dirrec/opt/5b1b09aad2c1")")" "reclaimable" \
-    "G15-M12 MUTATION: without the [ ! -f ] disjunct a DIRECTORY record silences the arm and rule 3 removes the tree => G15u is discriminating"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_dirrec/opt/5b1b09aad2c1")")" "pin-tree" \
+    "G15-M12a MUTATION: without [ ! -f ] a DIRECTORY record reaches the PLACEMENT arm and is STILL preserved — the two arms are independent, so G15u's outcome does not depend on either alone"
+_bounded_reap 6 "REAPER_OVERRIDE=$MUTP12 REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 run_reaper pin_tree_fiforec --dry-run --repo $T/pin_tree_fiforec/repo" "$T/.bounded-fifo-mut.out"
+M12B_RC=$?
+assert_eq "$M12B_RC" "137" \
+    "G15-M12b MUTATION: without [ ! -f ] a FIFO record BLOCKS the pass until killed => the disjunct's remaining job is the HANG, and G15w is the fixture that proves production does not take it"
 
 
 echo ""
