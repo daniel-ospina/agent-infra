@@ -486,14 +486,21 @@ esac
 
 # ⛔ THE VERDICT→REMEDY SELECTOR IS DRIVEN, NOT CENSUSED (review round 7, P2 — MEASURED). The `_c77`
 # arm above pins the exit-77 echo; the `case "$WT_RESULT" in …` selector that CHOOSES the remedy was
-# pinned by NOTHING. It is the #2721 wrong-cause class: both pre-start arms reach rc 4 carrying
-# REFUSED-UNKNOWN (an unreadable `df`, AND a half-deployed `$O` with no spawn-gate.sh), so a selector
-# that collapsed to the disk remedy would tell an operator to reclaim space for a broken probe — a
-# remedy that cannot arrive. Measured: deleting the selector from a scratch copy left the suite at
-# 65 passed / 0 failed, while the same class in `fix-one.sh` IS driven (H3). The fix exists twice and
-# was pinned once.
+# pinned by NOTHING. It is the #2721 wrong-cause class: several pre-start arms reach rc 4 carrying
+# REFUSED-UNKNOWN (an unreadable `df`, AND a half-deployed `$O` with no spawn-gate.sh, AND
+# wt_disk_admit's "refused without naming its numbers" fallback), so a selector that collapsed to the
+# disk remedy would tell an operator to reclaim space for a broken probe — a remedy that cannot arrive.
+# Measured: deleting the selector from a scratch copy left the suite at 65 passed / 0 failed, while the
+# same class in `fix-one.sh` IS driven (H3).
 #
-# The block is EXTRACTED FROM THE SHIPPED SCRIPT and EXECUTED with `$WT_RESULT` injected (the `arm_of`
+# ⛔ AND IT WAS PINNED FOR **ONE OF THREE** CALLERS (review round 8, P2 — MEASURED). This block named
+# the count "twice" and pinned only `adopt-fix.sh`; `dispatch-merge.sh` — a real `wt_provision` caller,
+# listed as one in this PR's own description — kept a SINGLE hardcoded "reclaim space" remedy for all
+# three REFUSED-UNKNOWN causes, and this suite stayed fully green. A count in a comment is not a
+# population: the loop below DERIVES the driven set from arm H's own caller census, so a fourth caller
+# cannot arrive unpinned the way the third did.
+#
+# Each block is EXTRACTED FROM THE SHIPPED SCRIPT and EXECUTED with `$WT_RESULT` injected (the `arm_of`
 # idiom), so the assertion is on BEHAVIOUR and a regression breaks this arm rather than a copy of it.
 _af_sel="$(awk '/^[[:space:]]*case "\$WT_RESULT" in/{f=1} f{print} f&&/^[[:space:]]*esac[[:space:]]*$/{exit}' "$HERE/adopt-fix.sh")"
 if [ -z "$_af_sel" ]; then
@@ -519,6 +526,53 @@ else
       ok "H) a genuine DISK refusal still gets the reclaim-space remedy (so the selector is not inert the other way)" ;;
     *) bad "H) adopt-fix.sh's REFUSED-DISK remedy is missing or no longer says to reclaim space — a real full disk would be sent down the wrong arm" ;;
   esac
+fi
+
+# ⛔ THE SAME SELECTOR IN `dispatch-merge.sh`, DRIVEN (review round 8, P2 — MEASURED). This caller was
+# the one left hardcoding a single remedy, and because its rc-4 arm STOPS THE WHOLE BATCH, a box whose
+# probe cannot answer went dark every cycle with the operator sent to prune a filesystem that was not
+# full. Nothing above could see it: arm H only censuses the token `break` inside that arm. Driven, not
+# censused, for the same reason as adopt-fix's block above.
+_dm_sel="$(awk '/^[[:space:]]*_dm_unknown=0[[:space:]]*$/{f=1} f{print} f&&/^[[:space:]]*fi[[:space:]]*$/{exit}' "$HERE/dispatch-merge.sh")"
+if [ -z "$_dm_sel" ]; then
+  bad "H) dispatch-merge.sh's verdict-to-remedy selector is GONE or unextractable — its rc-4 arm would report one cause for three different ones (#2721)"
+else
+  _dm_remedy() { # <verdict> -> the lines the shipped selector produces for it
+    ( N=7 WT_RESULT="$1"; eval "$_dm_sel" ) 2>&1
+  }
+  _dm_unk="$(_dm_remedy REFUSED-UNKNOWN)"
+  _dm_dsk="$(_dm_remedy REFUSED-DISK)"
+  case "$_dm_unk" in
+    *spawn-gate.sh*)
+      ok "H) dispatch-merge.sh's REFUSED-UNKNOWN remedy names the PROBE and the version skew, selected from the verdict" ;;
+    *) bad "H) dispatch-merge.sh's REFUSED-UNKNOWN remedy does not name the probe/skew — an unreadable df or a half-deployed box is reported as a full disk (the #2721 wrong-cause class)" ;;
+  esac
+  case "$_dm_unk" in
+    *"reclaim space"*)
+      bad "H) dispatch-merge.sh's REFUSED-UNKNOWN remedy tells the operator to RECLAIM SPACE — that remedy cannot arrive for a broken probe, and this arm stops the whole batch" ;;
+    *) ok "H) …and it does NOT tell an unreadable probe to reclaim space" ;;
+  esac
+  case "$_dm_dsk" in
+    *"reclaim space"*)
+      ok "H) a genuine DISK refusal in dispatch-merge.sh still gets reclaim-space (the selector is not inert the other way)" ;;
+    *) bad "H) dispatch-merge.sh's DISK remedy is missing or no longer says to reclaim space — a real full disk would not name its own remedy" ;;
+  esac
+  # NON-VACUITY: the arms above must be able to FAIL. Neutralising the glob on a COPY (the real tree
+  # untouched) reverts the selector to the single hardcoded remedy it replaced — exactly the shape
+  # dispatch-merge.sh shipped with — and must be flagged here.
+  _dm_mut="$T/mut-dispatch-merge-remedy.sh"
+  sed 's/\*REFUSED-UNKNOWN\*/*NEVER-MATCHES*/' "$HERE/dispatch-merge.sh" > "$_dm_mut" 2>/dev/null
+  _dm_sel_mut="$(awk '/^[[:space:]]*_dm_unknown=0[[:space:]]*$/{f=1} f{print} f&&/^[[:space:]]*fi[[:space:]]*$/{exit}' "$_dm_mut")"
+  if [ -z "$_dm_sel_mut" ]; then
+    bad "H) the mutation harness could not extract the mutated selector — fix the harness, do not trust the passes above"
+  else
+    _dm_mut_unk="$( ( N=7 WT_RESULT=REFUSED-UNKNOWN; eval "$_dm_sel_mut" ) 2>&1 )"
+    case "$_dm_mut_unk" in
+      *"reclaim space"*)
+        ok "H) the arm is non-vacuous: with the selector neutralised the mutation IS caught (it falls back to 'reclaim space')" ;;
+      *) bad "H) the mutation harness did not reproduce the regression — the arms above may be passing for the wrong reason" ;;
+    esac
+  fi
 fi
 
 # ═══ H2. THE BATCH-STOP ARM, DRIVEN ═════════════════════════════════════════════════════════════
