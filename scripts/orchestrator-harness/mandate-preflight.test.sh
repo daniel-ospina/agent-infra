@@ -444,6 +444,34 @@ if bash -c '. "$1"; mandate_ends_with "[block] then something else" "[block]"' _
 else
   ok "a needle that is NOT at the end does not match (the block must be the brief's LAST statement)"
 fi
+# ── E1p: THE REASON HALF OF THE DECLARATION (#3379 review cycle 18, P2, MEASURED) ────────────────
+# `§F` pins the NAMES half (`mandate_files` is defined exactly once) and nothing looked at the `why` half, so
+# replacing `mandate_why`'s lookup with `:` left the suite at 182 passed, 0 failed while all three renderers
+# fell back to the generic phrase — silently dropping the actionable part of the disclosure, the part that
+# tells an operator WHY the file is mandated. The reasons are prose in the declaration, so they are asserted
+# as prose: a distinctive fragment of each spec must reach the rendered block.
+mkstate; rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md" "$TMP/home/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md"
+WHY_LINE="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+case "$WHY_LINE" in *"READ §0 and §0b of this file FIRST"*) ok "the MISSING block carries the PREAMBLE's own declared REASON, not a generic phrase (mandate_why is live)" ;; *) bad "the rendered block lost the declared reason for LANE-BRIEF-PREAMBLE.md — mandate_why returned nothing and the disclosure became generic" ;; esac
+case "$WHY_LINE" in *"orders a lane to read this BEFORE it derives"*) ok "…and the GRAPH brief's reason too (both specs reach the renderer, so no spec row is dropped)" ;; *) bad "…but the TOURTOISE-GRAPH-BRIEF.md reason never reached the renderer" ;; esac
+# The UNREADABLE and NOT-A-FILE renderers take the same argument, so one arm each keeps them honest too.
+: > "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; chmod 000 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+WHY_UR="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+chmod 644 "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+case "$WHY_UR" in
+  *"READ §0 and §0b of this file FIRST"*) ok "…and the UNREADABLE renderer carries the reason as well" ;;
+  *UNREADABLE*) bad "the UNREADABLE renderer dropped the reason (mandate_why is not reaching it)" ;;
+  *) : ;;
+esac
+rm -f "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"; mkdir -p "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+WHY_NF="$(CELL_HOME="$TMP/home" bash -c '. "$1"; _mandate_cli --line 2>/dev/null' _ "$HELPER")"
+rm -rf "$TMP/home/.pi/agent/state/LANE-BRIEF-PREAMBLE.md"
+case "$WHY_NF" in
+  *"READ §0 and §0b of this file FIRST"*) ok "…and the NOT-A-FILE renderer carries it" ;;
+  *NOT-A-FILE*) bad "the NOT-A-FILE renderer dropped the reason (mandate_why is not reaching it)" ;;
+  *) : ;;
+esac
+
 # ── E1i: A RENDER THAT PRODUCES NOTHING MUST NOT READ AS "EVERY FILE PRESENT" (review P1) ─────────
 # The disclosure is rendered into `line`; when that render fails the OLD code took the empty result as
 # "nothing to declare" and — if a second read also failed — appended "BOTH mandated files are now PRESENT"
