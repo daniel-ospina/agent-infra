@@ -45,12 +45,19 @@ REPO = "daniel-ospina/tortoise"
 # 2026-11-05) -- so when #10250 scrolls out, #10114 becomes `without_pr` WHILE agent-infra#3368
 # (`fix(reaper): the harness PIN TREE is a holder, not residue (#10114)`) is still OPEN, and a lane
 # reads "no PR, you are the path" about live work. Measured flips from this change on the day of
-# authoring: ZERO. This is therefore a DECAY fix: it removes the accident that was hiding the
-# defect, and prevents the future mis-charter; it is not correcting a wrong number today.
-# ⛔ AND THE DECAY HAS ALREADY BITTEN ONCE. Re-measured the same day with this change applied:
-# agent-infra#3467 (`fix(10951): the pool filter was four copies that had drifted`) appeared in the
-# OPEN window, and tortoise P1 #10951 flipped from `without_pr` to `with_pr` — 1 live flip, not 0.
-# `#10114` is still covered only by the #10250 accident, so it is the NEXT one due.
+# authoring: ZERO, and RE-MEASURED as zero later the same day by running the shipped module twice
+# with `FIX_REPOS` widened and narrowed -- the tier numbers are byte-identical, because every
+# tracker unit that currently has a fix-repo PR also has a tracker PR. This is therefore a DECAY
+# fix: it removes the accident that is hiding the defect, and prevents the future mis-charter; it
+# is not correcting a wrong number today.
+# ⛔ A CLAIM THAT WAS CHECKED AND RETRACTED, kept because it reads true: an earlier version of this
+# comment said #10951 had flipped today (it appears covered by agent-infra#3467). It has not --
+# tortoise#11027, OPEN since 04:44, already covered it before #3467 was created at 08:05, so the
+# flip belonged to a TRACKER PR and this change made no difference to that number.
+# ⛔ AND #10114 IS NOT COVERED ONLY BY THE ACCIDENT -- WITH THIS CHANGE APPLIED. The #10250 accident
+# is what covers it on `main`; here the fix-repo rows (#3368's bare `(#10114)`, #3333, #3313) cover
+# it directly, which is the whole point. Delete #10250 from the merged window and it still reads
+# `with_pr` under this change, and stops reading so on `main`.
 # ⛔ `open_prs` keeps its old meaning (the TRACKER's open PRs) — the extra repos feed `covered()`
 # ONLY, so widening the gap count cannot silently move the headline number.
 FIX_REPOS = (REPO, "daniel-ospina/agent-infra")
@@ -228,9 +235,22 @@ REST_BUDGET_S = 30
 # So ONE clock bounds the WHOLE phase: `compute()` opens it (`_phase_clock`), `gh()` derives every
 # child's timeout from what is LEFT of it, and the REST deadline is clamped to it. The bound is a
 # CONSTANT of the phase — adding a fix repo cannot EXTEND it, it only spends it.
-# 40 s is the FLOOR of that 40-90 s slack band, chosen so the phase provably fits even when the step
-# has no slack left; the measured cost is ~4 s for the REST arm and ~1 s per `gh` read.
-PHASE_BUDGET_S = 40
+# ⛔ SIZED FROM THE MEASUREMENT, NOT FROM THE SLACK BAND -- and this is the whole reason the number
+# is not smaller. `objective.py` records the only latency measurement this repo has for a `gh`
+# read: `GH_SERIALISED_LATENCY_S = 63.0` (13 lanes on one box) against 0.676 s at 3 lanes, and its
+# rule is blunt -- "a budget under the measured latency does not bound the read, it manufactures a
+# false absence". A "safe-looking" phase budget of 40 s did exactly that on the busiest boxes: it
+# sat BELOW one measured read, so the phase refused on the boxes that most need the line.
+# 100 s = `objective.py`'s own QUEUE_READ_MAX_S (1.6x the measurement, "one more lane is ordinary
+# traffic"), which leaves 290 s of the tick's 390 s. A single slow-but-legitimate read (63 s) and
+# the ~15 s per-read cost of six reads on a loaded box therefore both still produce a NUMBER; what
+# reaches this bound is a box whose reads are all several times the measured worst case, and there
+# the honest answer is `unavailable` rather than being killed with no line at all.
+# ⛔ WHY THE WHOLE LINE AND NOT "DEGRADE TO THE TRACKER PAIR": the tracker pair IS already in hand
+# when the fix-repo reads run, so a partial answer is possible. It is refused on purpose. A
+# tracker-only count reports `without_pr` for every unit whose fix repo went unread -- a FALSE GAP,
+# the exact mis-charter this change exists to remove -- so an unread phase must say so, not guess.
+PHASE_BUDGET_S = 100
 
 
 def _token():
@@ -642,25 +662,36 @@ def _compute():
     # ⛔ AND `covered()` CANNOT TELL WHICH REPO A ROW CAME FROM, so a fix repo's bare `#N` is read
     # as the TRACKER's issue N. That fails OPTIMISTICALLY -- the issue reads covered and nobody
     # builds it -- so the risk is stated as MEASURED rather than as it first read:
-    #   * 2026-11-05 against the live lists (agent-infra open 46 + merged 400, window #1986..#3481):
+    #   * 2026-11-05 against the live lists (agent-infra open ~46 + merged 400, window #1986..#3483):
     #     TWO colliding tracker units, #10114 and #10951, and BOTH are TRUE covers. Zero false
     #     covers that day -- but that is a fact about WHICH ROWS THE WINDOW RETURNED, not a property
     #     of this change, so it is not a guarantee to lean on.
     #   * The risk is STRUCTURAL and already IN RANGE, not "below the current numbering". agent-infra
-    #     is numbered in the SAME sequence as tortoise and its newest PR is #3481, so tortoise P1s
-    #     #2281 and #2513 are ALREADY inside its range -- an agent-infra PR on its own issue #2513
-    #     collides TODAY. The other eight (#4051/#4282/#4917/#5064/#5087/#5090/#5095/#5333) are
-    #     ABOVE that range: each becomes a scheduled collision as agent-infra's counter passes it.
-    #     (The earlier form of this comment had that direction inverted; it is corrected here rather
-    #     than silently reworded, because it is the record of what was believed.)
+    #     is numbered in the SAME sequence as tortoise and its newest PR is in the #34xx range, so
+    #     the LOW end of the open tortoise backlog (#2281, #2513) is ALREADY inside it -- an
+    #     agent-infra PR on its own issue #2513 collides TODAY. Every tracker unit numbered ABOVE
+    #     agent-infra's counter becomes a scheduled collision as that counter passes it, and the
+    #     open backlog is ~31 units (14 P0 + 17 P1 on 2026-11-05), almost all of them above it.
+    #     ⛔ NO EXPLICIT LIST OF NUMBERS HERE, DELIBERATELY: an earlier draft enumerated eight of
+    #     them and got the surface wrong in three ways (four were `P0-blocker` rather than
+    #     `P1-severe`, ten open P1s above the range were missing, and the "newest PR" it pinned was
+    #     already stale). The CHECK IS "ANY OPEN TORTOISE NUMBER", so a list can only rot.
     #   * THE MITIGATION IS NOT A QUALIFIED MATCH. `tortoise#N` / issue-URL matching was the first
     #     suggestion and it would UNDO this change: agent-infra#3368's title carries the bare
     #     `(#10114)` that this PR exists to see, so requiring a qualifier restores the `without_pr`
-    #     that charters a lane to rebuild landed work. What is applied instead is narrower and
-    #     safe in exactly one direction: a fix-repo row whose bare `#N` EQUALS THE ROW'S OWN NUMBER
-    #     is that row referring to itself, so it is not a cover (`covered()` below). That closes the
-    #     dominant class -- every fix-repo branch named after its own numbered issue -- and it cannot
-    #     stop covering a genuine cross-reference, which is never to the row's own number.
+    #     that charters a lane to rebuild landed work. What is applied instead is narrower: a
+    #     fix-repo row whose bare `#N` EQUALS THE ROW'S OWN NUMBER is that row referring to itself,
+    #     so it is not a cover (`covered()` below). That closes the dominant class -- every fix-repo
+    #     branch named after its own numbered issue.
+    #   * ⛔ AND THAT RULE HAS A COST, IN THE OTHER DIRECTION, STATED RATHER THAN OVERSOLD. It is
+    #     not "safe in one direction"; it deliberately converts one error into another. A fix-repo
+    #     PR numbered `N` that genuinely fixes `tortoise#N` is now suppressed, so tortoise#N reads
+    #     `without_pr`. That is REACHABLE TODAY, in exactly the two numbers already in range
+    #     (#2281, #2513), and an earlier form of this comment claimed otherwise. The direction is
+    #     chosen on purpose: a false COVER silently drops a unit nobody then builds (silent loss of
+    #     work), while a false GAP costs at most a wasted dispatch and is VISIBLE in the line -- and
+    #     the bare-number prior is that agent-infra rows cite agent-infra issues, because a tracker
+    #     reference is written `tortoise#N`.
     #   * LEFT OPEN, stated: an agent-infra row that cross-references a DIFFERENT agent-infra issue
     #     whose number is also an open tortoise P0/P1 still reads as a cover. Narrowing that needs a
     #     per-row repo identity, which neither endpoint returns.
@@ -704,6 +735,10 @@ def _compute():
             # branch `fix/2513-pool-filter` cites agent-infra#2513 -- never tortoise#2513. Skipping
             # the self-reference closes the dominant class WITHOUT the qualified match that would
             # stop covering the bare `(#10114)` this change exists to see.
+            # ⛔ THE COST IS A FALSE GAP when a fix-repo PR numbered N really does fix tortoise#N;
+            # that is accepted deliberately, because a false cover silently drops a unit while a
+            # false gap only costs a wasted dispatch. Both directions are stated at the block above,
+            # and neither is claimed away.
             if p.get("number") == n:
                 continue
             if pat.search(p.get("headRefName") or "") or pat.search(p.get("title") or ""):

@@ -32,6 +32,7 @@ Run:  python3 -m pytest scripts/test_beta_progress.py -q
 from __future__ import annotations
 
 import importlib.util
+import re
 import pathlib
 
 import pytest
@@ -1396,3 +1397,29 @@ def test_the_phase_clock_bounds_the_rest_deadline_and_is_then_restored(monkeypat
     assert max(deadlines) <= started + 5 + 1, (
         "a REST read was given a budget that outlives the phase clock: %r" % (deadlines,))
     assert bp._PHASE_DEADLINE is None, "the phase clock must be RESTORED, never left spent"
+
+
+def test_the_phase_budget_is_sized_from_the_measured_gh_latency():
+    """⛔ A PHASE BUDGET BELOW THE MEASURED READ LATENCY DOES NOT BOUND THE READ — IT REFUSES IT.
+
+    `objective.py` carries the only latency measurement this repo has for a `gh` read on a loaded
+    box — `GH_SERIALISED_LATENCY_S = 63.0` (13 lanes, one box) against 0.676 s at 3 lanes — and its
+    rule is blunt: a budget under it "manufactures a false absence". A draft of this change set
+    `PHASE_BUDGET_S = 40`, i.e. BELOW ONE measured read, so the busiest boxes would have lost the
+    whole line where `main` printed a number (measured: at 8 s/read the 40 s clock returned
+    `unavailable` at 40.0 s while the unbounded shape returned a NUMBER at 48.0 s).
+
+    This pins the budget to that measurement — so it cannot silently drift back under it — and pins
+    it below the tick's own kill, so it still bounds the phase.
+    """
+    src = pathlib.Path(__file__).with_name("objective.py").read_text()
+    m = re.search(r"^GH_SERIALISED_LATENCY_S\s*=\s*([0-9.]+)", src, re.M)
+    assert m, "objective.py no longer declares GH_SERIALISED_LATENCY_S — re-derive the budget"
+    measured = float(m.group(1))
+    assert bp.PHASE_BUDGET_S >= measured * 1.5, (
+        "PHASE_BUDGET_S=%r is at or under the measured worst-case `gh` read (%.1fs): a budget under "
+        "the measurement refuses reads that would have completed, and the busiest boxes are exactly "
+        "the ones that need the line" % (bp.PHASE_BUDGET_S, measured))
+    # `TARGET` 540 - `IN_PASS_RESERVE` 150 = the 390 s `run_bounded` that wraps this module.
+    assert bp.PHASE_BUDGET_S < 390, (
+        "a phase budget at or above the tick's own kill cannot bound anything")
