@@ -1073,7 +1073,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
     [ -n "$_ma_d" ] && [ -f "$_ma_d/brief-gate.sh" ] && { ma_gate="$_ma_d/brief-gate.sh"; break; }
   done
   if [ -z "$ma_gate" ]; then
-    echo "   cannot check the NON-VACUITY contract without brief-gate.sh (looked in \$O, ${ma_dir}, its orchestrator-harness subdirectory, \$AGENT_INFRA_PATH/scripts/orchestrator-harness and ~/.pi/agent/scripts) — a cannot-verify is never a pass." >&2
+    echo "   cannot check the NON-VACUITY contract without brief-gate.sh (looked in ${ma_dir}, ${ma_dir}/orchestrator-harness, \$AGENT_INFRA_PATH/scripts/orchestrator-harness and ~/.pi/agent/scripts) — a cannot-verify is never a pass." >&2
     return 1
   fi
   # ⛔ `|| ma_rc=$?`, NEVER `ma_miss="$(…)"; ma_rc=$?` — this file runs under `set -euo pipefail` (see
