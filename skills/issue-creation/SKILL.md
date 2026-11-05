@@ -43,8 +43,29 @@ For trivial fixes with zero ambiguity, skip sections 2–4 and create directly:
 - The file being changed has at least one existing test. If the file has zero test coverage and the change touches logic (not pure strings/constants), upgrade to `complexity:standard` — the file needs test infrastructure before adding more code.
 
 ```bash
-gh issue create --title "fix: <one-liner>" --label "complexity:micro" --body "..."
+# Write the body with the `write` tool FIRST, to a lane-unique path — a fixed /tmp
+# name lets two concurrent lanes publish EACH OTHER's body (#729):
+BODY="${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
+gh issue create --title "fix: <one-liner>" --label "complexity:micro" --body-file "$BODY"
 ```
+
+**Why `--body-file` and never an inline `--body "…"`** (#3445): an inline body goes *into
+the shell command string*, which the hub-state guard scans for version-control verbs — so an
+issue whose body quotes a **destructive** verb (`git pull`, `git rebase`, `git reset`, a branch
+`-D`, a force-push) is unfilable that way, and infrastructure and guard-bug reports are made of
+exactly those. Passed by file, the body never enters the command string, so nothing scans it (the
+property the guard states for its own payloads: *"File / module / stdin payloads are NOT
+content-gated here"*). Write the body in one call and `gh issue create` in the next; the same rule
+covers any issue/PR body (see `commit-workflow/workflow/02-commit-pr.md`, including the `#729`
+path derivation). Run it **inside the repo**: the name is lane-unique because of
+`git rev-parse --absolute-git-dir`, so from outside a git repo that substitution yields one shared
+name for every lane on the box.
+
+⚠️ **The title and label are ALSO part of the command string.** `--body-file` moves the *body* out of
+it; a `--title "… git pull --ff-only …"` is still scanned, and is still refused. So a report whose
+TITLE names a destructive verb keeps the verb in the body and words the title around it ("false
+block on a read-only sync command"), or is filed from a worktree. Body and file are solved; the
+title is not (#3445 Residual 5).
 
 ---
 

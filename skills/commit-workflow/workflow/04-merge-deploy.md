@@ -662,19 +662,30 @@ agent-browser errors 2>&1
    Auto-filing follow-up issue...
 ```
 
-Auto-file a follow-up issue:
+Auto-file a follow-up issue. **Write the body with the `write` tool first**, to a lane-unique
+path (never a fixed /tmp name — #729). An inline `--body "…"` is part of the shell command
+string and is scanned for destructive git verbs, so a body that quotes one is unfilable that way
+(#3445). The body must carry:
+
+```markdown
+## Smoke Test Failure
+
+**Deploy:** PR #<PR_NUMBER>
+**Journey:** <journey walked>
+**Error:** <error details>
+**Time:** <UTC timestamp — fill from `date -u +%Y-%m-%dT%H:%M:%SZ`>
+
+The post-deploy journey smoke test failed after merging this PR.
+The deploy is live — this issue tracks the broken journey.
+
+**Action:** Investigate and fix the journey. The PR that introduced this is #<PR_NUMBER>.
+```
+
+Then:
 ```bash
-gh issue create   --title "Post-deploy smoke test failure: <journey> on <date>"   --body "## Smoke Test Failure
-  
-  **Deploy:** PR #<PR_NUMBER>
-  **Journey:** <journey walked>
-  **Error:** <error details>
-  **Time:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
-  
-  The post-deploy journey smoke test failed after merging this PR.
-  The deploy is live — this issue tracks the broken journey.
-  
-  **Action:** Investigate and fix the journey. The PR that introduced this is #<PR_NUMBER>."   --label "bug,ci-failure,smoke-test" 2>&1
+BODY="${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
+gh issue create --title "Post-deploy smoke test failure: <journey> on <date>" \
+  --body-file "$BODY" --label "bug,ci-failure,smoke-test" 2>&1
 ```
 
 **Always proceed** to Step 3.8 after smoke test (pass or fail). The smoke test is a detection mechanism, not a gate.

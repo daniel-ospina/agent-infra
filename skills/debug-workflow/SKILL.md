@@ -63,8 +63,12 @@ Pipeline-gated debugging — classifies bug complexity and routes through issue-
 Classify bug complexity and route through `issue-workflow`:
 
 ```bash
-# Create a bug issue
-gh issue create --title "Bug: <symptom>" --label "bug,complexity:<tier>" --body "..."
+# Create a bug issue — write the body with the `write` tool first, to a lane-unique path
+# (never a fixed /tmp name — #729), then pass the PATH:
+BODY="${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
+gh issue create --title "Bug: <symptom>" --label "bug,complexity:<tier>" --body-file "$BODY"
+# (An inline --body is part of the shell command string and is scanned for destructive git
+#  verbs, so a body quoting one is unfilable that way — #3445.)
 
 # Route through issue-workflow — it detects Level + complexity and dispatches
 # issue-workflow → task-workflow (micro) or task-workflow-standard (Level:task, standard/complex)

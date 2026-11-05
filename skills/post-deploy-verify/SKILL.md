@@ -168,9 +168,13 @@ reserved for issue numbers), so a skipped surface is never reported without sayi
 Dedup by checking for existing open issues with title prefix `clickthrough-failure:`.
 
 ```bash
+# Write the failure report to a file with the `write` tool first, to a lane-unique path (never a
+# fixed /tmp name — #729); an inline --body is part of the shell command string and is scanned
+# for destructive git verbs, so a report quoting one is unfilable that way (#3445). Then:
+BODY="${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
 gh issue create \
   --title "clickthrough-failure: <check name> — $(date -u +%Y-%m-%d)" \
-  --body "...PR #$PR_NUMBER, error details, screenshot path..." \
+  --body-file "$BODY" \
   --label "bug"
 ```
 
