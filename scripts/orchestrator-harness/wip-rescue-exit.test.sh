@@ -518,8 +518,54 @@ PATH="$TMP/bin-shim:$TMP/bin:$PATH" PI_LOG="$O/pi7.log" bash -c '
 arm "$O/logs/shim.log"
 ck "N3 the push shim really lies (origin/durable did NOT move to the lane's head: $(git -C "$BARE" rev-parse --short refs/heads/durable 2>/dev/null) vs $(git -C "$WT2" rev-parse --short HEAD))" \
   $([ "$(git -C "$BARE" rev-parse refs/heads/durable 2>/dev/null)" != "$(git -C "$WT2" rev-parse HEAD)" ] && echo 0 || echo 1)
-grep -q "this lane's commits are NOT on that ref" "$O/logs/shim.log" && grep -q 'push=FAILED' "$O/state/lane-exit-shim.state"; rcn3=$?
+grep -q "this lane's commits are not on that ref" "$O/logs/shim.log" && grep -q 'push=FAILED' "$O/state/lane-exit-shim.state"; rcn3=$?
 ck "N4 …and the exit path does NOT record push=pushed for it: a 0 exit from the push is not a delivery" $rcn3
+# ⛔ N4a-N4c — A DIFFERENT SHA IS TWO FACTS, AND ONLY ONE IS A NON-DELIVERY (review of PR #3399, P2 —
+# REPRODUCED). The `!=` arm used to record `FAILED` and say "this lane's commits are NOT on that ref" on
+# INEQUALITY ALONE — while listing "a concurrent move" as one of its causes, which is the opposite of what
+# a concurrent move means. The verify read lands ~1 RTT after the push, on an account 22 concurrent landers
+# share and a rail that fast-forwards: if a peer advanced the ref inside that window, origin's sha is our
+# commit's DESCENDANT and every one of this lane's commits IS on it. Ancestry is local and decidable, so
+# this fixture makes the remote's ref a descendant and asserts the delivery is recognised — AND asserts the
+# absence claim is gone, so a fix that merely softened the wording without measuring would fail here.
+N4D="$TMP/n4d"
+rm -rf "$N4D"* "$N4D-origin.git"
+git init -q --bare -b main "$N4D-origin.git"
+git init -q -b main "$N4D-hub"
+git -C "$N4D-hub" config user.name t; git -C "$N4D-hub" config user.email t@t
+git -C "$N4D-hub" remote add origin "$GHURL"
+git -C "$N4D-hub" config url."$N4D-origin.git".insteadOf "$GHURL"
+printf 'n4d seed\n' > "$N4D-hub/seed.txt"
+git -C "$N4D-hub" add seed.txt && git -C "$N4D-hub" commit -q -m 'n4d seed'
+git -C "$N4D-hub" push -q origin HEAD:refs/heads/main
+git -C "$N4D-hub" fetch -q origin
+git -C "$N4D-hub" worktree add -q "$N4D-lane" -b desclane
+git -C "$N4D-lane" config user.name t; git -C "$N4D-lane" config user.email t@t
+printf 'n4d lane work\n' > "$N4D-lane/local.txt"
+git -C "$N4D-lane" add local.txt && git -C "$N4D-lane" commit -q -m 'the lane commit'
+n4d_mine="$(git -C "$N4D-lane" rev-parse HEAD)"
+# the PEER ADVANCE: one commit ON TOP of the lane's head, pushed outside the lane, inside the verify window
+git -C "$N4D-hub" worktree add -q "$N4D-peer" -b peerdesclane "$n4d_mine"
+git -C "$N4D-peer" config user.name t; git -C "$N4D-peer" config user.email t@t
+printf 'peer advance\n' > "$N4D-peer/peer.txt"
+git -C "$N4D-peer" add peer.txt && git -C "$N4D-peer" commit -q -m 'a peer advanced the ref'
+git -C "$N4D-peer" push -q origin HEAD:refs/heads/desclane
+n4d_origin="$(git -C "$N4D-origin.git" rev-parse refs/heads/desclane)"
+: > "$O/logs/n4d.log"
+PATH="$TMP/bin-shim:$TMP/bin:$PATH" bash -c '
+  . "$1"
+  lane_end_push n4d "$2" "$3" desclane 1 1
+  printf "push=%s origin=%s\n" "$LANE_END_PUSH" "$LANE_END_ORIGIN"
+' _ "$GATE" "$O/logs/n4d.log" "$N4D-lane" 2>/dev/null > "$TMP/n4d.out"
+# non-vacuity: the fixture really did put origin AHEAD of the lane's HEAD (not equal, not behind)
+git -C "$N4D-origin.git" merge-base --is-ancestor "$n4d_mine" "$n4d_origin" 2>/dev/null \
+  && [ "$n4d_mine" != "$n4d_origin" ]; rcn4a=$?
+ck "N4a the fixture really made origin's ref a DESCENDANT of the lane's HEAD ($(printf '%s' "$n4d_mine" | cut -c1-8) → $(printf '%s' "$n4d_origin" | cut -c1-8)) — so the verdict below is about ancestry, not equality" $rcn4a
+grep -q 'push=pushed' "$TMP/n4d.out" && ! grep -q 'push=FAILED' "$TMP/n4d.out" \
+  && grep -q 'DESCENDANT' "$O/logs/n4d.log"; rcn4b=$?
+ck "N4b …a fast-forward by a peer inside the verify window records DELIVERY (push=pushed), not FAILED — the lane's commits ARE on that ref [$(grep -m1 'push=' "$TMP/n4d.out" 2>/dev/null)]" $rcn4b
+! grep -q "this lane's commits are not on that ref" "$O/logs/n4d.log"; rcn4c=$?
+ck "N4c …and it does NOT keep the pre-fix absence claim beside a passing ancestry read — the sentence the old arm printed unconditionally" $rcn4c
 grep -qx 'push=FAILED' "$O/state/lane-exit-shim.state" 2>/dev/null; rcn4=$?
 ck "N5 …the marker says push=FAILED, so the artifact a reclaim pass trusts never became 'safe'" $rcn4
 # ⛔ N6 — AN UNREADABLE REMOTE ANSWER IS UNKNOWN, NOT "NO PROTECTED NAMES" (review cycle 2, finding 1,
@@ -1583,6 +1629,35 @@ case "$sc" in *'does NOT ignore'*) rcn32a=0 ;; *) rcn32a=1 ;; esac
 ck "N32a the clean \"may be removed\" verdict names what it measured (the paths git does NOT ignore), so the artifact cannot state more safety than the enumeration covered" $rcn32a
 case "$sc" in *"may be removed once its PR is terminal"*) rcn32b=0 ;; *) rcn32b=1 ;; esac
 ck "N32b …and it is still an affirmative verdict where that is warranted — the scope was added, not the removal replaced by an abstention" $rcn32b
+# ⛔ N32c — THE LAST ARM MAY NOT BE A FALL-THROUGH EITHER (review of PR #3399, P2 — REPRODUCED). `lane_end_next`
+# ENDS on this arm, so it is where every value nobody classified lands — and it handed them "nothing at risk …
+# may be removed" without consulting `LANE_END_PUSH` at all, the exact shape both arms above it abstain for.
+# Driving the shipped function with an EMPTY push value printed the affirmative sentence. Every reachable
+# value has an arm today, so this is latent — but a latent arm is precisely the one a FUTURE verdict lands
+# on, and what it would land on here is a removal licence.
+sc_u="$( bash -c '
+  . "$1"
+  LANE_END_TREE=clean; LANE_END_RESCUE=nothing; LANE_END_PUSH=
+  LANE_END_UNPUSHED=0; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$sc_u" in MANUAL*'does NOT classify'*) rcn32c=0 ;; *) rcn32c=1 ;; esac
+ck "N32c …but an UNCLASSIFIED push value (here: the pre-push EMPTY one) makes the SAME clean tree ABSTAIN — a removal licence is never a fall-through [${sc_u:0:60}]" $rcn32c
+# ⛔ N32d — `unpushed=0` IS A MEASUREMENT ABOUT THE LOCAL TRACKING REFS, NOT ABOUT THE REMOTE (review of
+# PR #3399, P1 — REPRODUCED). The sentence claimed "every commit on <b> is already on a remote ref", an
+# OFF-BOX fact this path never measured: the count is `git rev-list --count HEAD --not --remotes`, i.e.
+# `refs/remotes/*` — a CACHE that `git fetch --prune` revokes and that a deleted remote branch leaves stale
+# forever. `scripts/pi-reap-worktrees.sh` (#3041) already refuses exactly this inference (`remote-only-ref`
+# exists for it; only a bounded `ls-remote --heads` upgrades a row to `remote-holds:`). Pinned from both
+# sides: the claim must be scoped to the cache, and the unscoped wording must not come back.
+n32d="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=nothing
+  LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n32d" in *'a CACHE'*) rcn32d=0 ;; *) rcn32d=1 ;; esac
+ck "N32d push=nothing names the LOCAL tracking refs it read and calls them a CACHE — it does not claim the remote holds the commits [${n32d:0:90}]" $rcn32d
+case "$n32d" in *'already on a remote ref'*) rcn32d2=1 ;; *) rcn32d2=0 ;; esac
+ck "N32d2 …and the unscoped off-box claim ('already on a remote ref') is gone, so the sentence cannot state more safety than the enumeration covered" $rcn32d2
 # ⛔ N27c — A REPORTER MAY NOT SIT ABOVE A MANUAL ARM, AND THE ARCHIVE IS NO EXCEPTION (review cycle 12,
 # P1 — REPRODUCED). `refused-protected|refused-main-checkout` used to live BELOW the `archived-local`
 # reporter, so a DIRTY tree with a refused push and a LOCAL-ONLY archive — the fleet's worst reachable state
