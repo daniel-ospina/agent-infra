@@ -15892,6 +15892,62 @@ else
   fail "(p) rail-exit.test.sh FAILED — see its output above"
 fi
 
+# ── (q) EVERY `--jq` LITERAL IN THE RAIL MUST COMPILE ─────────────────────────
+# #2598's sibling, and the reason #2598's own repro could not find it: `wait_for_run`'s
+# RE-RUN read carried an UNTERMINATED jq string — one closing `"` short:
+#
+#     --jq '"\(.status)\t\(.attempt // "")'
+#
+# gh exited non-zero on EVERY poll (`failed to parse jq expression … unexpected EOF`),
+# so `status` was always empty, `observed` never became 1, and the wait's SUCCESS PATH
+# WAS UNREACHABLE — the only reachable verdict was `return 3` UNOBSERVABLE after the
+# full bound. Every rail needing a re-run burned its whole budget and then blocked,
+# prescribing "check gh auth/network" while gh was perfectly healthy.
+#
+# #2598 diagnosed the PATH shim and quoted the expression WITH its closing quote, so
+# its repro never exercised the script's actual text. The shim is a real but SEPARATE
+# fault; repairing it alone still blocks every re-run.
+#
+# THE SUITE COULD NOT SEE IT: the fake `gh` IGNORES `--jq` and prints its own projection,
+# so a malformed filter is invisible to every scenario. This guard is therefore STATIC —
+# each literal is COMPILED with the real jq, which is exactly what gh does with `--jq`
+# before it evaluates anything. The wrapper puts the expression in a `def` that is never
+# invoked, so this is a COMPILE check and not an evaluation: an expression like
+# `.[] | …` must not be run against `null` and reported as broken when it is merely
+# inapplicable to an empty input.
+#
+# ⛔ FAIL-CLOSED: a missing `jq`, or an EMPTY population, is a FAILURE. An empty scan is
+# never a clean scan, and a guard that silently skips is the inert-enforcer class this
+# repo keeps re-learning.
+JQ_LITERALS_TMP="$TMP/jq-literals.txt"
+{ grep -o -- "--jq '[^']*'" "$ROOT/scripts/admin-merge.sh" \
+    | sed "s/^--jq '//; s/'\$//" ; } > "$JQ_LITERALS_TMP" 2>/dev/null || true
+# `LANE_RUN_JQ` is the one expression the rail passes as a VARIABLE, so the literal
+# scan cannot see it. It is held to the same contract.
+{ grep -E "^LANE_RUN_JQ='" "$ROOT/scripts/admin-merge.sh" \
+    | sed "s/^LANE_RUN_JQ='//; s/'\$//" ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
+JQ_LITERAL_COUNT="$(grep -c . "$JQ_LITERALS_TMP" 2>/dev/null || echo 0)"
+if ! command -v jq >/dev/null 2>&1; then
+  fail "(q) the rail's --jq compile guard needs jq and jq is NOT on PATH — refusing to skip"
+elif [ "${JQ_LITERAL_COUNT:-0}" -eq 0 ]; then
+  fail "(q) the --jq scan found NOTHING in scripts/admin-merge.sh — an empty scan is never a clean scan"
+else
+  JQ_BAD=0
+  while IFS= read -r jq_expr; do
+    [ -n "$jq_expr" ] || continue
+    # `def … ; empty` — compiled in full, never invoked (see the header note).
+    if ! jq -n "def _probe: ($jq_expr); empty" >/dev/null 2>&1; then
+      JQ_BAD=$((JQ_BAD + 1))
+      echo "   ❌ unparseable --jq literal: $jq_expr"
+    fi
+  done < "$JQ_LITERALS_TMP"
+  if [ "$JQ_BAD" -eq 0 ]; then
+    pass "(q) every --jq literal in the rail COMPILES ($JQ_LITERAL_COUNT checked)"
+  else
+    fail "(q) $JQ_BAD rail --jq literal(s) do not compile — gh fails EVERY read that uses one"
+  fi
+fi
+
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
   exit 1

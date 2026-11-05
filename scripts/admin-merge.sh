@@ -6352,7 +6352,7 @@ wait_for_run() {
     # OBSERVABLE identity of the re-run we requested.
     # shellcheck disable=SC2086
     line="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
-      --json status,attempt --jq '"\(.status)\t\(.attempt // "")' 2>/dev/null || true)"
+      --json status,attempt --jq '"\(.status)\t\(.attempt // "")"' 2>/dev/null || true)"
     IFS=$'\t' read -r status attempt <<< "$line"
     RERUN_WAIT_LAST="status=${status:-<unreadable>} attempt=${attempt:-<unreadable>}"
     # "Could not read the run" is NOT "the run exceeded its bound". A gh failure
