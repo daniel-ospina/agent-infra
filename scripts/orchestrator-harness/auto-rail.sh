@@ -695,7 +695,11 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # leave the read empty, which reads as ABSENT and posts a DUPLICATE marker on every pass — the exact
   # thrash the idempotence requirement forbids, produced by the check that implements it. Read first,
   # decide second, and refuse to post on an unreadable list.
-  seen=$(gh pr view "$pr" --repo "$repo" --json comments --jq '.comments[].body' 2>/dev/null) \
+  # ⛔ THE PAGINATED ENDPOINT, NOT `pr view --json comments`: a PR body's comment list is truncated by
+  # the single-page query, so on exactly the busiest PRs — the ones with dozens of review findings — the
+  # marker can fall off the page that was read, and the duplicate this check exists to prevent gets
+  # posted. `--paginate` reads every page.
+  seen=$(gh api "repos/$repo/issues/$pr/comments?per_page=100" --paginate --jq '.[].body' 2>/dev/null) \
     || { log_line "$repo #$pr MARKER-UNREADABLE: could not read the PR's comments to check for an existing review marker — NOT posting (a blind post is a duplicate on every pass)"; return 1; }
   case "$seen" in *"$tag"*) return 0;; esac
   gh pr comment "$pr" --repo "$repo" --body "$(printf '%s\n\n%s' "$text" "$tag")" >/dev/null 2>>"$LOG" \

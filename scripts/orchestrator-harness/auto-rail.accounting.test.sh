@@ -591,11 +591,20 @@ COMMENTS="$_ghdir/comments.txt"; POSTED="$_ghdir/posted.txt"; : > "$COMMENTS"; :
 export COMMENTS POSTED
 cat > "$_ghdir/bin/gh" <<'GH'
 #!/bin/bash
-case "$1 $2" in
-  "pr view")   if [ "${GH_READ_FAILS:-0}" = 1 ]; then exit 1; fi; cat "$COMMENTS" ;;
-  "pr comment") shift 3; _b=""
-                while [ "$#" -gt 0 ]; do case "$1" in --body) _b=$2; shift 2;; *) shift;; esac; done
-                printf '%s\n' "$_b" >> "$COMMENTS"; printf '%s\n' "$_b" >> "$POSTED" ;;
+# ⛔ THE READ IS `gh api …/comments --paginate` (a single `pr view --json comments` page truncates a long
+# comment list, and the marker can fall off it), so the stub answers that shape and nothing else: an
+# invocation the SUT does not make fails loudly (exit 2) instead of passing silently.
+case "$1" in
+  api)  case "$2" in
+          */issues/*/comments*) if [ "${GH_READ_FAILS:-0}" = 1 ]; then exit 1; fi; cat "$COMMENTS" ;;
+          *) exit 2 ;;
+        esac ;;
+  pr)   case "$2" in
+          comment) shift 3; _b=""
+                   while [ "$#" -gt 0 ]; do case "$1" in --body) _b=$2; shift 2;; *) shift;; esac; done
+                   printf '%s\n' "$_b" >> "$COMMENTS"; printf '%s\n' "$_b" >> "$POSTED" ;;
+          *) exit 2 ;;
+        esac ;;
   *) exit 2 ;;
 esac
 GH
