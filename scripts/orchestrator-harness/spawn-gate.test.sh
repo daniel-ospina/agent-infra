@@ -3145,7 +3145,11 @@ ck "R1 LANE_REGISTRY=0 leaves the spawn working and writes NO record [$(printf '
    $([ "${lanerc:-x}" = "0" ] && [ "${started:-x}" = "1" ] && ! grep -q 'lane_id' <<<"$lanes" && echo 0 || echo 1)
 
 # R2 — a completed lane is DONE, with artifacts (this is the question the fleet could not ask).
-res="$(rdrive "registry-on" 1)"; rc=$?
+# ⛔ NOT `rc=$?` (R1's comment one arm up records why): `rdrive`'s last command is `printf`, so the
+# assignment always succeeds and the captured value is the DRIVER's status. The lane's own rc is parsed
+# out of the driver's output, and asserted — an arm that cannot fail is decoration.
+res="$(rdrive "registry-on" 1)"
+lanerc="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
 lanes="$(rlist)"
 state="$(python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
@@ -3155,20 +3159,21 @@ print(rows[0]["state"] if rows else "NONE")' <<<"$lanes" 2>/dev/null)"
 arts="$(python3 -c 'import json,sys
 d=json.load(sys.stdin); rows=[r for r in d.get("lanes",[]) if r["state"]!="RUNNING"]
 print(len(rows[0].get("artifacts") or []) if rows else 0)' <<<"$lanes" 2>/dev/null)"
-ck "R2 a completed lane leaves a DONE record naming its artifacts ($state artifacts=$arts)" \
-   $([ "$state" = "DONE" ] && [ "${arts:-0}" -ge 1 ] && echo 0 || echo 1)
+ck "R2 a completed lane leaves a DONE record naming its artifacts ($state artifacts=$arts lane rc=${lanerc:-?})" \
+   $([ "${lanerc:-x}" = "0" ] && [ "$state" = "DONE" ] && [ "${arts:-0}" -ge 1 ] && echo 0 || echo 1)
 
 # R5 — the record names the REPO it was about (cross-repo visibility, §3.2).
 # ⛔ THIS ARM EXISTS BECAUSE THE FIELD WAS DEAD: `lane_registry_begin` computed `repo` twice and threw
 # both away, so every record shipped with no `repo` at all and `lane.list --repo owner/name` could never
 # match anything — a filter against a field nothing wrote. The fixture's origin is
 # `https://github.com/owner/repo.git`, so the record must say `owner/repo` or this reds.
-res="$(rdrive "registry-repo" 1)"; rc=$?
+res="$(rdrive "registry-repo" 1)"
+lanerc="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
 repo_field="$(rlist | python3 -c 'import json,sys
 rows=[r for r in json.load(sys.stdin).get("lanes",[]) if r["state"]!="RUNNING"]
 print(rows[-1].get("repo") or "EMPTY")' 2>/dev/null)"
-ck "R5 the terminal record names its repo ($repo_field, want owner/repo)" \
-   $([ "$repo_field" = "owner/repo" ] && echo 0 || echo 1)
+ck "R5 the terminal record names its repo ($repo_field, want owner/repo, lane rc=${lanerc:-?})" \
+   $([ "${lanerc:-x}" = "0" ] && [ "$repo_field" = "owner/repo" ] && echo 0 || echo 1)
 
 # R3 — THE TERMINAL DECISION TABLE, driven at `lane_registry_end` directly.
 # ⛔ WHY NOT THROUGH A WHOLE SPAWN: the two inputs it reads (`AGENT_BOUND_VERDICT`, `AGENT_CAP_HIT`) are
