@@ -1001,3 +1001,66 @@ def test_a_limit_that_is_not_a_multiple_of_100_keeps_the_page_offsets_sound(monk
     assert numbers == list(range(1, 251)), "hole or duplicate: the window is not the window"
     assert [u.split("per_page=")[1].split("&")[0] for u in seen_urls] == ["100", "100", "100"]
     assert len(seen_urls) == 3
+
+
+# ── `--repo` must never relabel another repo's cached figures ──
+def test_a_repo_call_never_returns_another_repos_cached_figures(monkeypatch, no_cache, capsys):
+    """⛔ THE CACHE WAS REPO-BLIND, AND `--repo` CHANGED THE LABEL ON IT.
+
+    `--repo X` mutates the global `REPO`, but the cache was one file whose payload carried no repo
+    identity and the cache-HIT path is taken ABOVE `compute()` — so for the whole TTL (~15 beats of
+    16) a `--repo owner/other` call returned the cached TORTOISE counts printed as `owner/other`'s,
+    and in the other direction a miss wrote other-repo numbers into the file the no-arg beat renders
+    as tortoise's `DELIVERY:` line. `mcp-servers/orchestrator/server.py::_census` is exactly that
+    caller: it fans out with `["--repo", repo, "--json"]`.
+
+    Three arms, one per mechanism: a cache LABELLED with another repo is a miss; an UNLABELLED cache
+    away from the base path is a miss; and a `--repo` run writes its own labelled file while leaving
+    the base file byte-identical.
+    """
+    import json as _json
+    import time as _time
+
+    now = int(_time.time())
+    tortoise_cached = {"ts": now, "repo": "daniel-ospina/tortoise", "open_prs": 7, "merged_today": 3,
+                       "p0": {"open": 2, "with_pr": 1, "without": 1},
+                       "p1": {"open": 4, "with_pr": 2, "without": 2}}
+    other_cached = dict(tortoise_cached, repo="owner/other", open_prs=99, merged_today=99)
+
+    def fresh():
+        return {"ts": int(_time.time()), "repo": bp.REPO, "open_prs": 1, "merged_today": 0,
+                "p0": {"open": 9, "with_pr": 9, "without": 0},
+                "p1": {"open": 9, "with_pr": 9, "without": 0}}
+
+    # (1) A LABELLED cache for a DIFFERENT repo is never served under this repo's name.
+    monkeypatch.setattr(bp, "REPO", "owner/other")
+    pe = bp._cache_path()
+    monkeypatch.setattr(bp, "CACHE", str(no_cache))
+    assert bp._cache_path() != str(no_cache), "a non-default repo must not share the base file"
+    import pathlib
+    pathlib.Path(bp._cache_path()).write_text(_json.dumps(tortoise_cached))
+    monkeypatch.setattr(bp, "compute", fresh)
+    assert bp.main() == 0
+    out = capsys.readouterr().out
+    assert "7 open PRs" not in out, "TORTOISE'S CACHED COUNT was served as owner/other's: %s" % out
+    assert "99 open PRs" not in out
+    assert "1 open PRs" in out, "a mislabelled cache must be a MISS, so the fresh read is used: %s" % out
+
+    # (2) AN UNLABELLED cache away from the base path is a MISS (we cannot know what it measured).
+    pathlib.Path(bp._cache_path()).write_text(_json.dumps(
+        {k: v for k, v in other_cached.items() if k != "repo"}))
+    monkeypatch.setattr(bp, "compute", fresh)
+    assert bp.main() == 0
+    out = capsys.readouterr().out
+    assert "99 open PRs" not in out, "an unlabelled per-repo cache was adopted: %s" % out
+
+    # (3) AND A `--repo` RUN DOES NOT TOUCH THE BASE FILE (the beat's state).
+    monkeypatch.setattr(bp, "DEFAULT_REPO", "daniel-ospina/tortoise")
+    base_before = no_cache.read_bytes() if no_cache.exists() else b"<absent>"
+    monkeypatch.setattr(bp, "compute", fresh)
+    assert bp.main() == 0
+    capsys.readouterr()
+    after = no_cache.read_bytes() if no_cache.exists() else b"<absent>"
+    assert after == base_before, "a --repo run overwrote the base cache the beat renders"
+    written = _json.loads(pathlib.Path(bp._cache_path()).read_text())
+    assert written["repo"] == "owner/other", written
