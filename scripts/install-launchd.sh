@@ -585,9 +585,25 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                     i += 1
                     cmd = argv[i] if i < len(argv) and isinstance(argv[i], str) else ""
                     skipped.add(i)
-                for tok in env_split(cmd):
-                    if tok.startswith("/"):
-                        print("exec\t" + tok)
+                # ⛔ THE SAME TWO RULES THE argv LOOP APPLIES, because `-S` IS a command line and a
+                # separate `startswith("/")` test made it disagree with the space form in BOTH
+                # directions (measured on the previous head, review of #3413 round 8):
+                #   `-S '/bin/bash --script=<TCC>'`  → no verdict at all, unit INSTALLED (fail-open)
+                #   `-S '/bin/bash <ok> --repo <TCC>'` → filed as EXEC, unit SKIPPED and DISARMED,
+                #                                       while the space form WARNs and installs.
+                toks = env_split(cmd)
+                for j, tok in enumerate(toks):
+                    if not isinstance(tok, str) or not tok:
+                        continue
+                    if tok.startswith("--") and "=" in tok:
+                        name, val = tok.split("=", 1)
+                        if val.startswith("/"):
+                            print("%s\t%s" % ("data" if name in DATA_OPTIONS else "exec", val))
+                        continue
+                    if not tok.startswith("/"):
+                        continue
+                    prev = toks[j - 1] if j and isinstance(toks[j - 1], str) else ""
+                    print("%s\t%s" % ("data" if prev in DATA_OPTIONS else "exec", tok))
                 break
             if a.startswith("-") or ("=" in a and not a.startswith("/")):
                 i += 1
@@ -930,7 +946,27 @@ verify_targets() {
         fi
         case "$kind" in
             launcher)
-                if ! is_tcc_protected "$arg"; then continue; fi
+                if ! is_tcc_protected "$arg"; then
+                    # ⛔ A LAUNCHER IS `execve`d BY launchd, so it must be an EXECUTABLE REGULAR FILE.
+                    # The grant model below is about READABILITY from a TCC context and says nothing
+                    # about this. Without this arm a `Program` — or a `ProgramArguments[0]` with no
+                    # `Program` — that is a DIRECTORY, a 0-byte file, or a file with no `x` bit
+                    # installed as `installed + loaded` and then died 126/127 on every tick: the same
+                    # category-A false PASS as `[ -e ]` in the exec arm. Measured on the previous head
+                    # for all four shapes, rc=0 `installed + loaded` each (review of #3413, round 8).
+                    # ⛔ `-x` IS NOT duplicated onto the `exec` arm: `bash <script>` only READS its
+                    # argument, so a readable non-executable script is legitimately runnable there,
+                    # while launchd READS this one and hands it to the kernel instead.
+                    if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ] || [ ! -x "$arg" ]; then
+                        echo "    unreadable or not an executable regular file: $arg" >&2
+                        echo "        launchd execs this path directly (Program / argv[0]); a" >&2
+                        echo "        directory, an empty file or a non-executable one exits 126/127" >&2
+                        echo "        on every tick, which reads as 'installed' to every instrument" >&2
+                        echo "        that only checks existence." >&2
+                        bad=1
+                    fi
+                    continue
+                fi
                 if grant="$(launcher_grant_root "$arg")"; then
                     case "$grants" in *" $grant "*) ;; *) grants="$grants$grant " ;; esac
                     echo "    WARN TCC-root launcher: $arg" >&2
