@@ -41,8 +41,13 @@ This is the control flow, in order. For the ASCII diagram and the worker-type ta
 issue (open, labelled P0/P1/P2, unassigned)
   │
   ├─ refresh-candidates.sh   pool = unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus
-  │                           title-prefixed epics/owner-decisions (P0 also excludes
-  │                           lane/decision/analysis/investigation) — ORDERED BY SEVERITY FIRST,
+  │                           CONTAINER issues, by ONE definition (`POOL_JQ=`, top of the script,
+  │                           shared by all three tiers and the emergency floor — tortoise#10951):
+  │                           a title-kind arm (epic/lane/decision/design/coord/measure/analysis/
+  │                           investigation/requirement/tracking/residual/map/arch/OWNER DECISION,
+  │                           each only when marked structurally as `kind:` or `kind(...)`, or
+  │                           `lane <id>:`) and a declared `standing-constraint` label. Unknown
+  │                           spellings stay pickable on purpose — ORDERED BY SEVERITY FIRST,
   │                           then issue number (tortoise#8465/#8467).
   │                           A bare `sort -n` on the numbers alone ordered by AGE, which put
   │                           hundreds of P2s ahead of the eligible P0s.
