@@ -449,7 +449,13 @@ assert_not_contains "$GATE_PATH_VAL" "cdpathphantom" \
 # with the false claim that the guard could never be reached.
 HOME_GUARD="$T/home-guard"; mkfakehome "$HOME_GUARD"
 SHIMONLY="$T/shimonly/shims"; mkdir -p "$SHIMONLY"
-for tool in bash sh sed grep mktemp cmp cat dirname basename mkdir rm mv chmod awk tr cut head sort stat id; do
+# ⛔ `python3` BELONGS IN THIS LIST EVEN THOUGH IT IS NOT PART OF THE RENDERED PATH (#3413 review
+# P2-E). This fixture's subject is `launchd_path` — the installer's toolchain must still resolve here,
+# which is why `sed`/`grep`/`mktemp` are shimmed. `plist_program_args` parses the rendered unit with
+# python3 (PlistBuddy is the macOS fallback and does not exist on Linux), so leaving it out made the
+# parser unavailable, and "cannot parse" is now a refusal instead of an empty pass: the run exited 1
+# and the canary never installed. Shim it, exactly like the other toolchain members.
+for tool in bash sh sed grep mktemp cmp cat dirname basename mkdir rm mv chmod awk tr cut head sort stat id readlink python3; do
     src="$(command -v "$tool" 2>/dev/null)" || continue
     ln -sfn "$src" "$SHIMONLY/$tool"
 done

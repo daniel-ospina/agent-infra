@@ -457,27 +457,61 @@ job_label() {
     basename "$1" .plist
 }
 
-# Print absolute-path ProgramArguments entries, one per line (python3
-# plistlib; PlistBuddy fallback — macOS guaranteed to have one of them).
+# Print `INDEX<TAB>VALUE` for EVERY ProgramArguments element, in plist order (python3 plistlib;
+# PlistBuddy fallback — macOS is guaranteed to have one of them).
+#
+# ⛔ THE INDEX IS LOAD-BEARING, so relative elements are emitted too: `verify_targets` classifies
+# element 0 (and the script an interpreter is handed) as the EXEC target and everything else as DATA,
+# and dropping the relative elements would renumber the survivors into the wrong class.
+#
+# ⛔ IT RETURNS NON-ZERO WHEN IT COULD NOT READ THE PLIST, and that is a fix, not a tidy-up (P2-E of
+# the #3413 review). This function used to end in `|| true` / `except Exception: pass` on both
+# branches: a rendered plist that did not parse printed NOTHING, the caller's loop iterated ZERO
+# times, and `verify_targets` returned its success-initialised flag — the job installed UNVERIFIED.
+# That is exactly the `empty-as-pass` shape `check-false-pass-shapes.sh` baselines for this file
+# (`false-pass-baseline.tsv`, #1743), and it is no longer tolerable now that the TCC guarantee rides
+# on the same loop: "could not parse" and "no absolute arguments" must never be the same observable
+# as "everything checks out".
 plist_program_args() {
-    local plist="$1" out
+    local plist="$1" out raw
     if command -v python3 >/dev/null 2>&1; then
-        out="$(python3 - "$plist" 2>/dev/null <<'PY' || true
+        if out="$(python3 - "$plist" 2>/dev/null <<'PY'
 import plistlib, sys
 try:
     with open(sys.argv[1], "rb") as f:
         d = plistlib.load(f)
-    for a in d.get("ProgramArguments", []):
-        if isinstance(a, str) and a.startswith("/"):
-            print(a)
 except Exception:
-    pass
+    sys.exit(2)
+args = d.get("ProgramArguments")
+if not isinstance(args, list) or not args:
+    sys.exit(3)
+for i, a in enumerate(args):
+    if isinstance(a, str):
+        print("%d\t%s" % (i, a))
 PY
-)"
-        if [ -n "$out" ]; then printf '%s\n' "$out"; return 0; fi
+)"; then
+            printf '%s\n' "$out"
+            return 0
+        fi
     fi
-    /usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" 2>/dev/null \
-        | sed -n 's/^[[:space:]]*[0-9][0-9]*[[:space:]]*=[[:space:]]*//p' | grep '^/' || true
+    # PlistBuddy's array print is either `0 = value` per line or bare values between `Array {` /
+    # `}`; both shapes are handled, and the index is re-numbered in plist order when it is absent.
+    raw="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || raw=""
+    [ -n "$raw" ] || return 1
+    if out="$(printf '%s\n' "$raw" | sed -n 's/^[[:space:]]*\([0-9][0-9]*\)[[:space:]]*=[[:space:]]*/\1\t/p')" \
+       && [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    out="$(printf '%s\n' "$raw" | awk '
+        /^[[:space:]]*(Array|Dict)[[:space:]]*\{/ { next }
+        /^[[:space:]]*\}/ { next }
+        /^[[:space:]]*$/ { next }
+        { v = $0; sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v);
+          printf "%d\t%s\n", n, v; n++ }
+    ')"
+    [ -n "$out" ] || return 1
+    printf '%s\n' "$out"
 }
 
 # ── the TCC-protected tree (#427) ─────────────────────────────────────────
@@ -487,7 +521,7 @@ PY
 #
 #   com.eldato.worker-supply        runs=1766  last exit code=126
 #   com.eldato.objective-reminder   runs=44    last exit code=126
-#   com.eldato.controller-watchdog  runs=0     last exit code=126
+#   com.eldato.controller-watchdog  runs=1     last exit code=126
 #   com.tortoise.queue-reconcile    runs=n/a   last exit code=2
 #
 # and every one of them logged the same sentence, 27,322 times for the first:
@@ -528,31 +562,63 @@ tcc_protected_roots() {
         "$HOME/Library/Mobile Documents"
 }
 
+# physical_path <absolute path> → the same path with symlinks resolved, as far as it exists.
+#
+# `cd <dir> && pwd -P` resolves the DIRECTORY; the FINAL component is followed here explicitly, and
+# that is not a detail (P0 of the #3413 review). The first form computed `arg_phys="$(dirname)…"/
+# append` and so resolved only the directory. A program target that is ITSELF a symlink into the
+# protected tree — `~/.pi/agent/scripts/foo.sh -> ~/Documents/GitHub/agent-infra/scripts/foo.sh`,
+# which is exactly the shape `scripts/install-launchd.sh:171-173` and `check-farm-drift.sh:68-71`
+# warn about — never entered a protected prefix, the guard PASSED it, and the installer armed the
+# unit that exits 126. MEASURED against the extracted function before the fix:
+#
+#   REFUSED(protected)     …/Downloads/dead.sh
+#   PASSED(not protected)  …/safe/link.sh   ← real target …/Downloads/dead.sh
+#
+# The hop bound keeps a symlink CYCLE from spinning; on exhaustion the last resolved path is used,
+# and the literal `$arg` is still tested by the caller — an unresolvable path must never be the way
+# past this guard.
+physical_path() {
+    local p="$1" link target dirphys hops=0
+    while [ -L "$p" ] && [ "$hops" -lt 40 ]; do
+        link="$(readlink -- "$p" 2>/dev/null)" || break
+        [ -n "$link" ] || break
+        case "$link" in
+            /*) p="$link" ;;
+            *)  p="$(dirname -- "$p")/$link" ;;
+        esac
+        hops=$((hops + 1))
+    done
+    if dirphys="$(CDPATH= cd -- "$(dirname -- "$p")" 2>/dev/null && pwd -P)"; then
+        printf '%s/%s\n' "$dirphys" "$(basename -- "$p")"
+    else
+        printf '%s\n' "$p"
+    fi
+}
+
 # is_tcc_protected <absolute path> → 0 when launchd cannot read it.
 #
 # TWO resolutions are compared, and BOTH are required:
-#   * the PHYSICAL path of the target, for the reason `launchd_path` does — it is the TARGET that TCC
-#     gates, so a symlink pointing INTO the protected tree is dead while one pointing OUT of it is fine;
+#   * the PHYSICAL path of the target (FILE included, `physical_path`), for the reason `launchd_path`
+#     does — it is the TARGET that TCC gates, so a symlink pointing INTO the protected tree is dead
+#     while one pointing OUT of it is fine;
 #   * the PHYSICAL path of each ROOT, because the roots are built from `$HOME` and `$HOME` itself is
 #     commonly reached through a symlinked ancestor (`/tmp` → `/private/tmp` on macOS). Measured on
 #     this suite's own fixture: HOME=/tmp/… resolved to /private/tmp/…, the literal prefix never
 #     matched, and the guard PASSED the exact TCC-dead target it exists to refuse.
-# A path whose directory cannot be resolved falls back to the literal, and the literal `case` still
-# matches — an unresolvable path must never be the way past this guard.
+# The LITERAL target is tested first and always, so a path whose directory cannot be resolved falls
+# back to the literal `case` — an unresolvable path must never be the way past this guard.
 is_tcc_protected() {
-    local arg="$1" arg_phys="" dir phys root root_phys candidate
-    dir="$(dirname -- "$arg")"
-    if phys="$(CDPATH= cd -- "$dir" 2>/dev/null && pwd -P)"; then
-        arg_phys="$phys/$(basename -- "$arg")"
-    fi
+    local arg="$1" arg_phys root root_phys candidate
+    arg_phys="$(physical_path "$arg")"
     while IFS= read -r root; do
         [ -n "$root" ] || continue
         for candidate in "$arg" "$arg_phys"; do
             [ -n "$candidate" ] || continue
             case "$candidate" in "$root" | "$root"/*) return 0 ;; esac
         done
-        root_phys=""
-        if root_phys="$(CDPATH= cd -- "$root" 2>/dev/null && pwd -P)" && [ "$root_phys" != "$root" ]; then
+        root_phys="$(physical_path "$root")"
+        if [ -n "$root_phys" ] && [ "$root_phys" != "$root" ]; then
             for candidate in "$arg" "$arg_phys"; do
                 [ -n "$candidate" ] || continue
                 case "$candidate" in "$root_phys" | "$root_phys"/*) return 0 ;; esac
@@ -562,29 +628,74 @@ is_tcc_protected() {
     return 1
 }
 
-# Verify every absolute path in ProgramArguments resolves AND is readable from the launchd context
-# (catches broken symlinks — e.g. provider-latency-tripwire.sh pointing at a not-yet-pulled checkout,
-# fixed by re-running setup.sh — and TCC-protected targets, fixed by farming).
-# $1 = rendered plist FILE. Prints offending targets; exits 1 if any.
+# Verify what launchd will EXEC: it must resolve AND be readable from the launchd context. Data
+# arguments that sit in the TCC tree are WARNED about, never refused (P1-A of the #3413 review).
+# $1 = rendered plist FILE. Prints offending/warned targets; returns 1 if any EXEC target is bad.
+#
+# ⛔ EXEC vs DATA IS THE WHOLE CLASSIFICATION. Only what launchd must READ in order to start the job
+# can hard-refuse: argv[0], plus the script a resolved interpreter is handed. Everything else
+# (`--repo ~/Documents/GitHub/tortoise`, a `--script` value) is DATA: the unit still starts, its WORK
+# is what dies under TCC — which this file's own header already records on #427.
+#
+# Refusing the UNIT for a DATA argument was the first form, and it made the installer exit 1 on the
+# documented default box (`TORTOISE_REPO` defaults to `~/Documents/GitHub/tortoise`,
+# `templates/launchd/com.tortoise.worktree-hygiene.plist:91` passes it as `--repo`), while
+# `sync.sh:4` is `set -euo pipefail` and `sync.sh:81` runs this installer UNGUARDED — so Level-1
+# auto-sync died there and never reached the #341 cost-config guard or the #498/#502 parity gate.
+# An over-block that takes down a working pipeline is not "fail-closed", it is a regression.
 verify_targets() {
-    local arg bad=0
-    while IFS= read -r arg; do
-        [ -n "$arg" ] || continue
+    local plist="$1" raw argv0 exec_idx="" line idx arg bad=0 abs=0 first_after
+    if ! raw="$(plist_program_args "$plist")"; then
+        echo "    unreadable ProgramArguments: this plist could not be parsed, so what launchd will" >&2
+        echo "        execute is UNVERIFIED. Refusing to install on an empty scan (an unparseable" >&2
+        echo "        unit is how a job gets armed with NO arguments and reports as healthy)." >&2
+        return 1
+    fi
+    argv0="$(printf '%s\n' "$raw" | sed -n '1p' | cut -f2)"
+    # EXEC targets: element 0, plus (when element 0 is an interpreter, directly or via env) the first
+    # absolute element after it — that is the script/launcher the job actually runs.
+    exec_idx=" 0 "
+    case "$(basename -- "${argv0:-}")" in
+        bash|sh|zsh|dash|ksh|python|python2|python3|python3.*|perl|ruby|node|env)
+            first_after="$(printf '%s\n' "$raw" | awk -F'\t' '$2 ~ /^\// && $1 != "0" { print $1; exit }')"
+            [ -n "$first_after" ] && exec_idx="$exec_idx$first_after "
+            ;;
+    esac
+    while IFS=$'\t' read -r idx arg; do
+        [ -n "${arg:-}" ] || continue
+        # Relative elements are not paths launchd resolves here (`daniel-ospina/tortoise` is a repo
+        # NAME); only absolute ones are this function's business, exactly as before.
+        case "$arg" in /*) ;; *) continue ;; esac
+        abs=$((abs + 1))
         if [ ! -e "$arg" ]; then
             echo "    broken target: $arg" >&2
             bad=1
             continue
         fi
-        if is_tcc_protected "$arg"; then
-            echo "    TCC-protected target: $arg" >&2
-            echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427);" >&2
-            echo "        it starts this job and bash exits 126 'Operation not permitted', which" >&2
-            echo "        reads as 'installed' to every instrument that only checks existence." >&2
-            echo "        Render the FARMED copy ({{HOME}}/.pi/agent/scripts/…) and declare it in" >&2
-            echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
-            bad=1
-        fi
-    done < <(plist_program_args "$1")
+        is_tcc_protected "$arg" || continue
+        case "$exec_idx" in
+            *" $idx "*)
+                echo "    TCC-protected target: $arg" >&2
+                echo "        launchd cannot read ~/Documents, ~/Desktop, ~/Downloads or iCloud (#427);" >&2
+                echo "        it starts this job and bash exits 126 'Operation not permitted', which" >&2
+                echo "        reads as 'installed' to every instrument that only checks existence." >&2
+                echo "        Render the FARMED copy ({{HOME}}/.pi/agent/scripts/…) and declare it in" >&2
+                echo "        pi-bootstrap/setup.sh's farm array, so the copy is what actually executes." >&2
+                bad=1
+                ;;
+            *)
+                echo "    WARN $arg is inside a TCC-protected tree (#427) but is a DATA argument:" >&2
+                echo "        the unit still starts; this job's WORK will fail reading it. Installing" >&2
+                echo "        anyway — moving that checkout out of ~/Documents (or farming what it" >&2
+                echo "        needs) is the fix, and it belongs to the job's owner." >&2
+                ;;
+        esac
+    done <<< "$raw"
+    if [ "$abs" -eq 0 ]; then
+        echo "    no absolute ProgramArguments entry: launchd has no program to exec, so there is" >&2
+        echo "        nothing to verify — refusing to install an unverified unit." >&2
+        return 1
+    fi
     return "$bad"
 }
 
