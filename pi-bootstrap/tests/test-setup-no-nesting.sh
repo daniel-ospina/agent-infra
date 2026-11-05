@@ -459,7 +459,17 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # held back only because `lane-status.py` is. #1553 declares both in `lane_root_srcs`; when it lands
 # both take the membership branch and this list becomes STALE, which the stale check below FAILS —
 # delete the entries then, so the exemption cannot outlive its reason.
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 repo-target.sh:#3174"
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 repo-target.sh:#3174 ai_pr_status.py:#3450"
+# `ai_pr_status.py` joined on 2026-11-03 (#3450) — and it is the ONE entry here whose producer has no
+# repo file at all, so "withheld from the farm" understates it: `scripts/objective-reminder.sh` (:100)
+# defaults `TRIAGE_CMD` to `$HOME/.pi/agent/scripts/ai_pr_status.py`, no array CAN carry it, and the
+# read at :152 is guarded by `[ -f … ]`, so its absence is silent ("no triage line" reads exactly like
+# "nothing to triage"). It entered the population when #3413 made `objective-reminder.sh` a FARMED
+# consumer: the derivation closes over the exec sites of farmed files, so the same landing that
+# delivered the consumer delivered this undelivered-producer gap with it — #1552's shape, one level
+# down. It stays a DECLARED-GAP with an owner because the honest options (ship a repo-owned helper, or
+# make the absence loud) are #3450's decision, not this gate's; the stale check below drops the entry
+# the moment a farm array carries the file.
 # `repo-target.sh` joined on 2026-11-01 (#3174) — a DISCLOSED GAP, not a delivery, and the reason is a
 # DERIVATION defect rather than a farm one. A farmed consumer names it through the ORCHESTRATOR payload
 # (`install-repair-service.sh`: `"$HERE/orchestrator-harness/repo-target.sh"` then `"$O/repo-target.sh"`),
@@ -527,7 +537,7 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
+script:ai_pr_status.py script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
 script:disk-reaper.sh script:fleet-cost-report.sh script:goal-state.py script:harness-apply-pass.sh
 script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
 script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
@@ -541,6 +551,11 @@ lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py
 other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
+# `script:ai_pr_status.py` joined on 2026-11-03 (#3413/#3450): `objective-reminder.sh` — farmed by
+# `fleet_srcs` in the same landing — execs it, so the derivation sees a producer it never saw before.
+# It is NOT delivered (there is no repo file to deliver; see its `LANE_PRODUCERS_EXEMPT` entry), so
+# this is a re-pin of the derived population WITH a named gap, not a delivery claim.
+#
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
 # producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
