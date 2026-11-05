@@ -6022,6 +6022,62 @@ STUB_COMMENT_BODIES="" \
 assert_eq "$(dc_posts "$DC_PR3")" "1" \
     "20.10 …but a SIGNED not-clean marker whose note contains ' sig=' IS still published (the fix must not over-block)"
 
+# ── 20.11 THE OTHER FAIL-CLOSED ARM: AN UNCOMPUTABLE HMAC IS NOT A MATCH ──────
+# (#3168 self-review, round 5.) `post_marker_comment` has TWO refusals past the
+# ` sig=` shape guard: the HMAC must COMPUTE (`[ -n "$_mexp" ] || return 0`, :1247)
+# and it must MATCH (`[ "$_mexp" != "$_msig" ]`, :1248). 20.10 pins the second.
+# The FIRST was pinned by NOTHING: the one-line mutant
+# `[ -n "$_mexp" ] || return 0` → `[ -n "$_mexp" ] || _mexp="$_msig"` — i.e.
+# "if openssl produced nothing, treat that as a match" — left the suite at
+# PASS=1035 FAIL=0 (measured). That mutant is FAIL-OPEN on the guard whose whole
+# documented contract is "any failure ⇒ no comment": with a broken or absent
+# openssl it would publish an UNVERIFIED marker permanently, which is exactly the
+# hole finding 1 closed by a different route. So this vector drives the
+# conjunction the recorder's own messages name — a key IS configured, but openssl
+# produced nothing (:4827-4829) — and asserts the channel stays SILENT.
+# ⛔ THE STUB BREAKS ONLY `-hmac`, NOT openssl: every other invocation delegates
+# to the real binary, so the diff digests these vectors rest on are untouched and
+# the ONLY broken thing is the one under test. A wholesale-broken openssl would
+# also send the run down the legacy-sha path and the vector would be judging
+# that instead.
+NOHMAC_BIN="$T/bin-hmac-broken"
+mkdir -p "$NOHMAC_BIN"
+REAL_OPENSSL_BIN="$(command -v openssl)"
+cat > "$NOHMAC_BIN/openssl" <<STUB_OPENSSL
+#!/usr/bin/env bash
+for _a in "\$@"; do [ "\$_a" = "-hmac" ] && exit 0; done
+exec "$REAL_OPENSSL_BIN" "\$@"
+STUB_OPENSSL
+chmod +x "$NOHMAC_BIN/openssl"
+DC_PR4=424347
+rb_clear
+: > "$LOG"
+STUB_CAPTURE="$T/negcap_2011" STUB_COMMENT_BODIES="" PATH="$NOHMAC_BIN:$PATH" \
+    run_record_neg "$DC_PR4" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
+# POSITIVE FIXTURE ASSERTIONS FIRST — a 0-post count proves nothing on a run that
+# was refused before it ever reached the channel.
+assert_eq "$RECORD_RC" "0" \
+    "20.11 fixture: the keyed, openssl-producing-nothing mint still succeeds (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "could not compute marker signature" \
+    "20.11 fixture: the run really is in the 'keyed but openssl produced nothing' state"
+NEG_CAP_2011="$(jq -r '.body // empty' "$T/negcap_2011" 2>/dev/null || true)"
+if [ -n "$NEG_CAP_2011" ] && command grep -qF -- "note=quoted sig=$FAKE_SIG" <<<"$NEG_CAP_2011"; then
+    ok "20.11 fixture: the UNSIGNED marker ends in a ' sig=<64hex>' shape, so the shape guard is satisfied and ONLY the HMAC can refuse it"
+else
+    bad "20.11 fixture: the posted marker carries no ' sig=' trailer — the vector would judge the shape guard, not the uncomputable-HMAC arm (capture: $NEG_CAP_2011)"
+fi
+assert_eq "$(dc_posts "$DC_PR4")" "0" \
+    "20.11 an UNCOMPUTABLE HMAC is never treated as a match — nothing is published when openssl produces nothing"
+# THE PAIR: same PR, same note, same fixtures — only openssl differs. Without
+# this half the vector above could be passing because that PR's run never reached
+# the channel at all (the shape 20.10's first draft had).
+rb_clear
+: > "$LOG"
+STUB_COMMENT_BODIES="" \
+    run_record_neg "$DC_PR4" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
+assert_eq "$(dc_posts "$DC_PR4")" "1" \
+    "20.11 …while the SAME conjunction with a WORKING openssl DOES publish (the arm is reached, not skipped)"
+
 DM_20_SENTINEL=1
 
 # ══ §21 #3168 re-review (latest comment): the doc-block drift ══════════════

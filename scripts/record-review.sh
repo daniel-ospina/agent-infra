@@ -2526,7 +2526,7 @@ if [ "$PRINT_TIER" -eq 1 ]; then
   # a tier chosen from a list that may be incomplete.
   #
   # The count is over the NEW path only, exactly as clean_low_shape_ok counts it
-  # (`:385`) — GitHub counts a rename as ONE changed file while the compare row
+  # (its DISTINCT `$2` count, :548) — GitHub counts a rename as ONE changed file while the compare row
   # carries the old path too, so counting both ends would report truncation for
   # any diff containing a rename. The CLASSIFICATION below still reads BOTH ends
   # (a rename out of a rail must not slip through); only the parity arithmetic is
@@ -4229,7 +4229,7 @@ fi
 #           "review evidence posted to … as a durable comment"
 #
 # Three claims that run never made, on a SUCCESSFUL exit: `mint:"fresh"` (no
-# reviewer ran — delta mode REFUSES --evidence, :1319), the prior record's
+# reviewer ran — delta mode REFUSES --evidence, :1590), the prior record's
 # `evidence` (the one pointer tortoise#7391/#10177 exist to preserve) is DELETED,
 # and a signed marker is PATCHed. The tortoise#7391 gate below cannot catch it
 # because that gate is keyed on `VERDICT = clean`, and `clean-micro`/`clean-low`
