@@ -159,10 +159,15 @@ esac
 # work this registry exists to prevent. But before this bound there was no ceiling at ALL: the only
 # check was "at most 9 digits", so a caller could mint `lease_until = now + 999999999` (31 years) —
 # the silent extension the #2094 incident exposed, a term no reaper's reach outlives.
-# ⚠️ THE CEILING IS COUPLED TO THOSE TWO CALLERS, exactly as CLAIM_ISSUE_TTL is coupled to LANE_TIMEOUT:
-# raising REVIEW_TIMEOUT or FIX_TIMEOUT above (CLAIM_TTL_MAX - 1200) makes `_claim_acquire_at` CLAMP the
-# lease below the review window, which is the mid-review expiry this block exists to prevent — so raise
-# CLAIM_TTL_MAX at the same time. The clamp is not silent: it reports itself on stderr.
+# ⚠️ THE CEILING IS COUPLED TO THOSE TWO CALLERS, exactly as CLAIM_ISSUE_TTL is coupled to LANE_TIMEOUT.
+# A caller's lease is `timeout + 1200` (`FIX_LEASE`, fix-one) or `timeout + _gw + 300` (`CLAIM_LEASE`,
+# merge-one — `_gw` is the gate wait, 8400 s at the defaults), so raising either timeout past
+# `CLAIM_TTL_MAX - 1200` (the fixer) or `CLAIM_TTL_MAX - (_gw + 300)` (the reviewer) makes
+# `_claim_acquire_at` CLAMP the lease below what the worker asked for, spending the post-review
+# headroom — and above `CLAIM_TTL_MAX` itself the claim expires under a worker that is still running,
+# which is the mid-review expiry this block exists to prevent. So raise CLAIM_TTL_MAX at the same
+# time. The clamp is not silent: it reports itself on stderr. ⛔ The single `- 1200` form that used to
+# stand here was right only for the fixer and only at the default gate wait.
 # Same digit clamp as the two TTLs above: an unparseable ceiling is worse than the default.
 CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-9600}"   # 2 h 40 m — above fix-one's 8400s lease, the longest shipped one
 case "${CLAIM_TTL_MAX:-}" in

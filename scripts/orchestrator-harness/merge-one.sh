@@ -344,8 +344,8 @@ if [ -f "$O/claims.sh" ]; then
   # is < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site, so a future caller
   # that skips this guard still cannot mint a lease the reader is unable to parse.
   # ⛔ SIZED FROM THE EFFECTIVE WAIT, NOT THE DEFAULT (review round 7 P2-3). The wait is a first-class
-  # tunable (`GATE_POLL_TRIES` x `GATE_POLL_SECS`), so a box running `GATE_POLL_SECS=60` has a 3600 s
-  # worst case — longer than the old fixed 3000 s lease, which would then expire mid-wait and let
+  # tunable (`GATE_POLL_TRIES` x `GATE_POLL_SECS`), so a box running `GATE_POLL_SECS=60` has an 1800 s
+  # gate wait (30 x 60) and an 1800 + 1800 + 300 = 3900 s lease — longer than the old fixed 3000 s lease, which would then expire mid-wait and let
   # another box acquire the PR and run a DUPLICATE paid review (#1908, the duplicate this lease exists
   # to prevent). Defaults are unchanged: 1800 + (30 x 30) + 300 = 3000.
   # ⛔ `is_limit`, NOT A `case ''|*[!0-9]*` GUARD: that idiom (this file's own header names it) ACCEPTS
@@ -1238,16 +1238,20 @@ REV_STARTED=1
 # claim about a warning nobody emits.
 #
 # It is not fixed here because the bound is not free to raise ALONE. `CLAIM_LEASE` is
-# `$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))` at :364 ABOVE this block — `_gw` is the gate wait,
-# default 900 s (30 × 30) but a box may set it up to 86400 — and `claims.sh` CLAMPS any lease ABOVE
-# that keying's ceiling `CLAIM_TTL_MAX` (9600); `_claim_acquire_at`'s test at claims.sh:1151 is a
-# STRICT `-gt`. So the reviewer bound stays un-clamped only while
-# `REVIEW_TIMEOUT + _gw + 300 <= 9600` — 8400 s at the default 900 s gate wait, but only 5700 s on a
-# box running `GATE_POLL_SECS=60`, which is the point of sizing from the EFFECTIVE wait (see:60 above).
-# Past that threshold the lease is pinned at 9600 and the clamp erodes the post-review headroom,
-# reaching ZERO at `REVIEW_TIMEOUT` = 9600; only ABOVE 9600 does the claim actually expire under a
-# reviewer that is still running — a second lane free to take the claim mid-review, which is the
-# exact silent-park `claims.sh` guards against.
+# `${REVIEW_TIMEOUT:-1800} + _gw + 300` — assigned ABOVE this block, from the EFFECTIVE wait — and
+# `_gw` is `GATE_POLL_TRIES x GATE_POLL_SECS` clamped to [900, 86400]: 900 s at the defaults, but
+# 1800 s on a box running `GATE_POLL_SECS=60`, and up to 86400 s. `claims.sh` CLAMPS any lease ABOVE
+# that keying's ceiling `CLAIM_TTL_MAX` (9600), and its test is a STRICT `-gt`, so a lease of exactly
+# the ceiling is never clamped. The reviewer bound therefore stays un-clamped only while
+# `REVIEW_TIMEOUT + _gw + 300 <= 9600` — 8400 s at the default 900 s gate wait, but only 7500 s on a
+# box running `GATE_POLL_SECS=60`. Past that threshold the lease is pinned at 9600 and the clamp
+# erodes the post-review headroom, reaching ZERO at `REVIEW_TIMEOUT` = 9600; only ABOVE 9600 does the
+# claim actually expire under a reviewer that is still running — a second lane free to take the claim
+# mid-review, which is the exact silent-park `claims.sh` guards against.
+# ⛔ NO LINE NUMBERS IN THIS PARAGRAPH, ON PURPOSE. Round 8 cited `:364` and `claims.sh:1151`; they
+# were exact when written, and the round-8 review then found that round 7 had shipped four stale line
+# references by inserting two lines above them. A reference that has to be re-counted is a reference
+# that will rot, so the anchors here are the code text and the paragraph above.
 # ⛔ CORRECTION (review round 7, P2 — re-verified against claims.sh:1151 and merge-one.sh:364): this
 # block used to read `CLAIM_TTL_MAX - 1200` = **6000** s, and to conclude that the 7200 s backstop
 # "would produce a 7200 s reviewer holding a claim that expires at 6000". That arithmetic is from when

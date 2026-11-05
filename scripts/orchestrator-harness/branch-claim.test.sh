@@ -290,14 +290,15 @@ grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is
 # ⛔ AND IT IS NON-VACUOUS (round 7, P2): `grep` returns 1 both for "found nothing" and "read
 # nothing", so an EMPTY message used to satisfy "does not name another knob". Here an absent clause
 # is its own outcome and it is RED, not green.
-# ⛔ AND THE CLAUSE IS NOT THE WHOLE MESSAGE (round 8, P2 — the round-7 review MEASURED this hole
-# rather than assuming it). Guarding only the parenthetical still passed a message that put the wrong
-# ceiling OUTSIDE it: "… ceiling (14400s) — clamped. The ceiling is CLAIM_ISSUE_TTL. Raise the ceiling
-# for that keying (CLAIM_TTL_MAX / CLAIM_ISSUE_TTL / CLAIM_BRANCH_TTL) …" ran 43 passed, 0 failed. The
-# misdirection is what the arm exists to catch, and the parentheses are not where a fixer's eye lands.
-# So the property covers the message: a `CLAIM_` name may appear ONLY in the candidate list — nothing
-# before the literal "Raise the ceiling for that keying (" may name a knob at all. If that sentence is
-# ever reworded the arm reddens (fail-CLOSED: a contract the test does not recognise is not a pass).
+# ⛔ AND THE PROPERTY COVERS THE WHOLE MESSAGE (round 8 then round 9 — two reviews MEASURED this arm
+# instead of trusting its comment, and each found a region left unread). Round 7 guarded only the
+# parenthetical and passed a message naming the wrong ceiling OUTSIDE it; round 8 guarded "before the
+# candidate list" and passed one naming it AFTER the list — "… (CLAIM_TTL_MAX / CLAIM_ISSUE_TTL /
+# CLAIM_BRANCH_TTL) …; the ceiling is CLAIM_ISSUE_TTL." ran 43 passed, 0 failed. There are three
+# regions, so all three are asserted: (a) inside `ceiling ( … )`, (b) before the candidate list,
+# (c) AFTER it. A `CLAIM_` name is legal ONLY inside the candidate list, which is exactly what the
+# shipped message does. If the list sentence is ever reworded the arm reddens — fail-CLOSED, because a
+# contract the test does not recognise is not a pass.
 CLAUSE_REPORT="$(awk '
   { msg = $0
     s = msg
@@ -307,40 +308,53 @@ CLAUSE_REPORT="$(awk '
       if (j == 0) { unterminated = 1; break }
       n++
       c = substr(s, 1, j - 1)
+      if (n == 1) firstval = c
       if (c ~ /CLAIM_/) named = c
       s = substr(s, j + 1)
     }
     p = index(msg, "Raise the ceiling for that keying (")
-    head = (p > 0) ? substr(msg, 1, p - 1) : msg
-    if (head ~ /CLAIM_/) outside = head }
+    if (p > 0) {
+      head = substr(msg, 1, p - 1)
+      rest = substr(msg, p)
+      q = index(rest, ")")
+      after = (q > 0) ? substr(rest, q + 1) : rest
+    } else {
+      head = msg
+      after = ""
+    }
+    if (head ~ /CLAIM_/) outside = head
+    if (after ~ /CLAIM_/) trail = after }
   END {
     if (unterminated) print "UNTERMINATED"
     else if (n == 0) print "ABSENT"
     else if (named != "") print "NAMES " named
     else if (outside != "") print "BEFORE-LIST " outside
-    else print "OK " n
+    else if (trail != "") print "AFTER-LIST " trail
+    else print "OK " firstval
   }
 ' "$T/acq.out" 2>/dev/null)"
 case "$CLAUSE_REPORT" in
-  "OK "*) ok "the clamp warning states this keying's value and names a keying knob only in the candidate list" ;;
+  "OK "*) ok "the clamp warning names a keying knob ONLY in the candidate list" ;;
   ABSENT) bad "the clamp warning carries no 'ceiling ( … )' clause to evaluate — an empty or absent clause must not read as clean: $(cat "$T/acq.out")" ;;
   UNTERMINATED) bad "the clamp warning's 'ceiling (' clause is unterminated — the property cannot be evaluated: $(cat "$T/acq.out")" ;;
   "NAMES "*) bad "the clamp warning names a keying knob AS this ceiling inside 'ceiling ( … )': ${CLAUSE_REPORT#NAMES }" ;;
-  "BEFORE-LIST "*) bad "the clamp warning names a keying knob as the ceiling OUTSIDE the candidate list: ${CLAUSE_REPORT#BEFORE-LIST }" ;;
+  "BEFORE-LIST "*) bad "the clamp warning names a keying knob as the ceiling BEFORE the candidate list: ${CLAUSE_REPORT#BEFORE-LIST }" ;;
+  "AFTER-LIST "*) bad "the clamp warning names a keying knob as the ceiling AFTER the candidate list: ${CLAUSE_REPORT#AFTER-LIST }" ;;
   *) bad "the not-another-knob guard could not evaluate the property (awk said '${CLAUSE_REPORT}') — unreadable operand must not read as clean" ;;
 esac
-# ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2). The arm above measures the STAMPED
-# LEASE, never the printed ceiling — so a warning that stamps 14400 correctly while PRINTING 9600
-# misdirects the fixer exactly as before and stayed green. The number in the message is the `%ss`
-# argument, and it must equal this keying's ceiling.
+# ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2), AND ON THE OPERATIVE CLAUSE (round 9,
+# P2). The arm above checks WHICH KNOBS are named; this one checks the NUMBER. Round 5's form was
+# `grep -q 'ceiling (14400s)'` — presence ANYWHERE in the message, so a message whose operative clause
+# printed 9600 while a decoy clause carried `ceiling (14400s)` ran 43 passed, 0 failed, and a fixer
+# reads `ceiling (9600s)`. The number must be the FIRST clause's — the shipped message has exactly one
+# and it is the operative one — so awk reports it and this asserts on the value, not on presence.
 # Each arm below carries an `ok` as well as its `bad` (review round 6, P2): an assertion with only
 # the failure arm prints nothing on success and increments neither PASSES nor FAILS, so a green run
 # under-reports what executed and the arm can be deleted without moving any number.
-if grep -q 'ceiling (14400s)' "$T/acq.out"; then
-  ok "the clamp warning prints this keying's own ceiling (14400s)"
-else
-  bad "the clamp warning does not print this keying's ceiling (14400s): $(cat "$T/acq.out")"
-fi
+case "$CLAUSE_REPORT" in
+  "OK 14400s") ok "the clamp warning prints this keying's own ceiling (14400s) as its operative ceiling" ;;
+  *) bad "the clamp warning's operative ceiling clause does not print this keying's ceiling (14400s) — report '${CLAUSE_REPORT}': $(cat "$T/acq.out")" ;;
+esac
 # ⛔ AND THE GUARD IS NOT A SINGLE LITERAL (review round 3, P2): the message must also name THIS
 # keying's variable among the candidates it suggests raising.
 if grep -q 'CLAIM_BRANCH_TTL' "$T/acq.out"; then

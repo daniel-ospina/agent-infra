@@ -3787,9 +3787,13 @@ for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLA
 never wrong.)*
 Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
-stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
-either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or
-the claim expires before the review it was taken for. The verification is `claim-orphan.test.sh`,
+stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one, `_gw` the gate wait; 8400 s at
+the defaults) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one): raising either timeout past
+`CLAIM_TTL_MAX - (_gw + 300)` (the reviewer) or `CLAIM_TTL_MAX - 1200` (the fixer) requires raising
+`CLAIM_TTL_MAX` in the same change, or the claim is clamped below the term the worker asked for — and
+past `CLAIM_TTL_MAX` itself it expires before the review it was taken for. *(Corrected: this sentence
+said `REVIEW_TIMEOUT + 1200` and a flat `CLAIM_TTL_MAX - 1200`, which was right only for the fixer and
+only at the default gate wait.)* The verification is `claim-orphan.test.sh`,
 which reads the stamped term back out of the **pushed claim commit**. Both tunables are
 validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
 `claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
