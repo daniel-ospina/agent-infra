@@ -1110,11 +1110,15 @@ ck "non-vacuity: with product_queue_follow disabled the floor's head stays on th
 # nothing to take", while the SAME durable record carries `backlog=3`. An operator reading that record
 # would be told dispatch is idle with three rows queued: the typed-claim-instead-of-a-read defect this
 # PR exists to close, one layer out. The empty word therefore hangs off `_skip_n`, the MEASURED depth.
-# ⛔ PINNED BY CONTAINMENT AND ORDER, not driven (the reason check 12 pins its call the same way): the
-# skip arm needs the unchanged-input state, and reaching it here depends on an ambient claim registry
-# this sandbox does not have. A source pin that reddens on the revert is the honest instrument; a drive
-# whose skip does not happen would assert the full-pass path and report green over the wrong arm —
-# measured on exactly that fixture before it was abandoned, which is why it is not a drive.
+# ⛔ THESE PINS ARE SUPPLEMENTARY, NOT THE EVIDENCE (review P2, cycle 13). They grade the arm chain's
+# TEXT and its order — and text is not behaviour: keying the arm on `_skip_head` instead of `_skip_n`
+# (the pre-fix shape) left every one of them GREEN while a READABLE queue was reported as unreadable and
+# its measured depth was replaced by `backlog=UNKNOWN`. The behavioural evidence is the `skip_drive`
+# fixtures below, which execute this region; the pins stay because they catch a reordering that a
+# single-state drive would miss.
+# ⛔ AND THE EARLIER JUSTIFICATION FOR PINNING-ONLY WAS FALSE, corrected here at the source: it claimed
+# the arm is unreachable here without an ambient claim registry. It is not — `ledger_all_live` returns 0
+# on an absent ledger, and the drive below reaches the arm with no registry at all.
 skip_handoff() {  # <file> -> the skip arm's handoff chain, COMMENT LINES STRIPPED
   awk '/_skip_head=""; _skip_n=""; _skip_backlog=""/{f=1} f && /^[[:space:]]*REFRESH_RECORDED=1/{exit} f' "$1" \
     | grep -v '^[[:space:]]*#'
@@ -1176,6 +1180,94 @@ else
   else rc=0; fi
 fi
 ck "non-vacuity: reverting \`_skip_backlog=\"UNKNOWN\"\` to \`0\` makes the pin go RED" $rc
+# ⛔ THE SKIP ARM IS DRIVEN (review P2, cycle 13). One fixture per state it can be handed, each compared
+# with the arm that belongs to it — and the durable `backlog=`/`handed=` asserted alongside the sentence,
+# because that pair is what outlives the log line.
+SKIPDRV="$TMP/skip-arm.sh"
+awk '/^    _skip_head=""; _skip_n=""; _skip_backlog=""/{f=1}
+     f { print }
+     f && /backlog=\$_skip_backlog/{exit}' "$REFRESH" > "$SKIPDRV" 2>/dev/null
+_sa_n="$(wc -l < "$SKIPDRV" 2>/dev/null | tr -d ' ')"
+if [ -n "$_sa_n" ] && [ "$_sa_n" -gt 20 ] && grep -q 'handed to dispatch' "$SKIPDRV" 2>/dev/null \
+   && grep -q 'backlog=\$_skip_backlog' "$SKIPDRV" 2>/dev/null; then rc=0
+else rc=1; echo "      the skip arm's handoff chain + record call could not be extracted ($_sa_n line(s))"; fi
+ck "the skip arm's arm chain AND its record call are extracted from the shipped file" $rc
+skip_drive() {  # <label> <queue-setup: absent|empty|rows|garbage|dir> -> sets SDRC/SDOUT
+  local d="$TMP/sa-$1" how="$2"
+  rm -rf "$d"; mkdir -p "$d/o"
+  case "$how" in
+    absent)  : ;;
+    empty)   : > "$d/o/candidates.txt" ;;
+    rows)    printf '300\n200\n' > "$d/o/candidates.txt" ;;
+    garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt" ;;
+    dir)     mkdir -p "$d/o/candidates.txt" ;;
+  esac
+  { printf 'set -u\nQUEUE_ORDER_STATE="severity"\n'
+    printf 'skip_order_why() { printf "WHY:%%s" "${1:-}"; }\n'
+    printf 'unusable_summary() { printf "none"; }\n'
+    printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+    printf 'O="%s/o"\n' "$d"
+    cat "$SKIPDRV"
+    printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
+  SDRC=$?
+  SDOUT="$(cat "$d/out" 2>/dev/null)"
+}
+skip_drive absent absent
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
+   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty'; then rc=0
+else rc=1; echo "      skip/absent: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (want could NOT be READ + backlog=UNKNOWN)"; fi
+ck "SKIP arm: an ABSENT queue is unreadable, never empty (driven)" $rc
+skip_drive dir dir
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'could NOT be READ' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=UNKNOWN' \
+   && ! printf '%s' "$SDOUT" | grep -q 'No such file or directory'; then rc=0
+else rc=1; echo "      skip/dir: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a DIRECTORY is unreadable: could NOT be READ + backlog=UNKNOWN, no stderr leak)"; fi
+ck "SKIP arm: a queue that is a DIRECTORY is unreadable, and its depth is UNKNOWN (driven)" $rc
+skip_drive drained empty
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'the queue is empty (0 rows)' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=0' \
+   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ'; then rc=0
+else rc=1; echo "      skip/empty: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a MEASURED empty queue: 'the queue is empty (0 rows)' + backlog=0)"; fi
+ck "SKIP arm: a MEASURED empty queue says so, with backlog=0 (driven)" $rc
+skip_drive withhead rows
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'head #300' \
+   && printf '%s' "$SDOUT" | grep -q 'handed=300' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=2'; then rc=0
+else rc=1; echo "      skip/rows: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (want head #300, handed=300, backlog=2)"; fi
+ck "SKIP arm: a READABLE queue with a parsable head names it, and records handed= (driven)" $rc
+skip_drive garbage garbage
+if [ "$SDRC" -eq 0 ] && printf '%s' "$SDOUT" | grep -q 'its HEAD could not be read' \
+   && printf '%s' "$SDOUT" | grep -q 'backlog=3' \
+   && printf '%s' "$SDOUT" | grep -q 'handed= ' \
+   && ! printf '%s' "$SDOUT" | grep -q 'the queue is empty' \
+   && ! printf '%s' "$SDOUT" | grep -q 'could NOT be READ'; then rc=0
+else rc=1; echo "      skip/garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (want 'its HEAD could not be read' + backlog=3, NOT empty, NOT unreadable)"; fi
+ck "SKIP arm: rows with an UNPARSABLE head are MEASURED (backlog=3), not called empty and not called unreadable (driven)" $rc
+# NON-VACUITY: re-key the arm on the HEAD (the pre-fix shape). Every containment pin above survives this
+# — that is the finding — so the fixture that must red is the readable-garbage one, which flips to
+# "could NOT be READ" with `backlog=UNKNOWN` over a file that is perfectly readable.
+SDKEY="$TMP/skip-arm-headkey.sh"
+sed 's/^    if \[ -z "\$_skip_n" \]; then$/    if [ -z "$_skip_head" ]; then/' "$SKIPDRV" > "$SDKEY" 2>/dev/null
+if cmp -s "$SKIPDRV" "$SDKEY" 2>/dev/null; then rc=1; echo "      the re-key mutation did not apply — the sed anchor drifted"
+else
+  _sd_ok=0
+  d="$TMP/sa-headkey"; rm -rf "$d"; mkdir -p "$d/o"; printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
+  { printf 'set -u\nQUEUE_ORDER_STATE="severity"\n'
+    printf 'skip_order_why() { printf "WHY:%%s" "${1:-}"; }\n'
+    printf 'unusable_summary() { printf "none"; }\n'
+    printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+    printf 'O="%s/o"\n' "$d"; cat "$SDKEY"; printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
+  if grep -q 'could NOT be READ' "$d/out" 2>/dev/null && grep -q 'backlog=UNKNOWN' "$d/out" 2>/dev/null; then
+    _sd_ok=1
+  else
+    echo "      the HEAD-keyed arm did NOT reproduce the defect: '$(tr '\n' '|' < "$d/out" | head -c 240)'"
+  fi
+  [ "$_sd_ok" -eq 1 ] && rc=0 || rc=1
+fi
+ck "non-vacuity: re-keying the skip arm on \`\$_skip_head\` (the pre-fix shape) reds the driven fixture" $rc
 
 # 12-y4) A REORDER THAT RANKED ROWS IS NOT "RANKED NONE" (review P3, cycle 12). The ranked-none arm was
 # keyed off `_h` — the count file's head, SANITISED to "" when it is not a plain issue number — so a
@@ -1222,8 +1314,13 @@ ck "non-vacuity: keying the arm off the head again (\`elif false\`) restores 'ra
 # arm, 1,700 lines down, had not. DRIVEN, not pinned by containment: the region is self-contained, so the
 # shipped lines are extracted and executed, and each arm is compared with the state that belongs to it.
 MAINDRV="$TMP/main-handoff.sh"
-awk '/^if \[ -f "\$O\/candidates\.txt" \] && \[ -r "\$O\/candidates\.txt" \]; then$/{f=1}
-     f && /backlog=UNKNOWN/{seen=1}
+# ⛔ THE START ANCHOR IS A MARKER, NOT A POSITIONAL GUARD (review P3, cycle 13). The old start matched
+# `if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then` at its FIRST occurrence — which is
+# the SKIP arm's identical guard 1,700 lines up — so the drive began in the skip arm and executed both
+# arms before reaching the handoff (measured: it then needed `refresh_stage` and `STARVED`, i.e. it was
+# grading a region nobody meant to drive). The shipped marker below names the region.
+awk '/BOTH DEPTH STATEMENTS OF A MAIN PASS ARE GUARDED/{f=1}
+     f && !/^[[:space:]]*#/ && /backlog=UNKNOWN/{seen=1}
      f { print }
      f && seen && /^fi$/{exit}' "$REFRESH" > "$MAINDRV" 2>/dev/null
 _mh_n="$(wc -l < "$MAINDRV" 2>/dev/null | tr -d ' ')"
@@ -1245,7 +1342,7 @@ main_handoff() {  # <label> <queue-setup: 'dir'|'empty'|'rows'|'none'> -> sets M
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
     printf 'unusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
-    printf 'O="%s/o"\n' "$d"
+    printf 'O="%s/o"\nSTARVED=0\n' "$d"
     cat "$MAINDRV"
     printf 'exit 0\n'
   } > "$d/drive.sh"
@@ -1260,9 +1357,11 @@ if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
    && printf '%s' "$MHOUT" | grep -q 'backlog=UNKNOWN' \
    && ! printf '%s' "$MHOUT" | grep -q 'the queue is empty' \
    && ! printf '%s' "$MHOUT" | grep -q 'backlog=0' \
-   && ! printf '%s' "$MHOUT" | grep -q 'Is a directory'; then rc=0
-else rc=1; echo "      unreadable queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (want 'could NOT be READ' + backlog=UNKNOWN; NOT 'the queue is empty', NOT backlog=0, NO 'Is a directory' leak)"; fi
-ck "an UNREADABLE queue is reported as unmeasured (backlog=UNKNOWN), never as 'the queue is empty' with backlog=0" $rc
+   && ! printf '%s' "$MHOUT" | grep -q 'Is a directory' \
+   && ! printf '%s' "$MHOUT" | grep -q 'integer expression expected' \
+   && ! printf '%s' "$MHOUT" | grep -q 'backlog now 0 issues'; then rc=0
+else rc=1; echo "      unreadable queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (want 'could NOT be READ' + backlog=UNKNOWN; NOT 'the queue is empty', NOT backlog=0, NO 'Is a directory' leak, NO 'integer expression expected', NO 'backlog now 0 issues')"; fi
+ck "an UNREADABLE queue is reported as unmeasured on EVERY surface (backlog=UNKNOWN, no arithmetic error, no 'backlog now 0 issues'), never as 'the queue is empty'" $rc
 # (b) POSITIVE PAIR — a genuinely drained queue still says EMPTY, and a row-holding queue still names its
 # head, so (a) is not passing because the drive lost the other arms.
 main_handoff drained empty
@@ -1287,7 +1386,7 @@ if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'its HEAD could not be re
 else rc=1; echo "      rows/no-head: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (want 'its HEAD could not be read' + backlog=3; NOT 'the queue is empty', NOT backlog=0)"; fi
 ck "a row-holding queue with an UNPARSABLE head is measured (backlog=3) and NOT called empty" $rc
 MHGR="$TMP/main-handoff-garbage-rev.sh"
-sed 's/^elif \[ "\$_backlog_n" -eq 0 \]; then$/elif [ -n "$_backlog_n" ]; then/' "$MAINDRV" > "$MHGR" 2>/dev/null
+sed 's/^elif \[ -n "\$_backlog_n" \] \&\& \[ "\$_backlog_n" -eq 0 \]; then$/elif [ -n "$_backlog_n" ]; then/' "$MAINDRV" > "$MHGR" 2>/dev/null
 if cmp -s "$MAINDRV" "$MHGR" 2>/dev/null; then rc=1; echo "      the depth-gate revert did not apply — the sed anchor drifted"
 else
   d="$TMP/mh-garbage-rev"; rm -rf "$d"; mkdir -p "$d/o"
@@ -1295,7 +1394,7 @@ else
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\nQUEUED_THIS_PASS=""\n'
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\nunusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
-    printf 'O="%s/o"\n' "$d"; cat "$MHGR"; printf 'exit 0\n'; } > "$d/drive.sh"
+    printf 'O="%s/o"\nSTARVED=0\n' "$d"; cat "$MHGR"; printf 'exit 0\n'; } > "$d/drive.sh"
   ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
   if grep -q 'the queue is empty' "$d/out" 2>/dev/null && grep -q 'backlog=0' "$d/out" 2>/dev/null; then rc=0
   else rc=1; echo "      the REVERTED gate did not reproduce the defect — the fixture is not grading the depth gate: '$(tr '\n' '|' < "$d/out" | head -c 240)'"; fi
@@ -1303,19 +1402,20 @@ fi
 ck "non-vacuity: the pre-fix \`elif [ -n \"\$_backlog_n\" ]\` restores 'the queue is empty' + \`backlog=0\` over three rows" $rc
 main_handoff absent none
 if [ "$MHRC" -eq 0 ] && printf '%s' "$MHOUT" | grep -q 'could NOT be READ' \
-   && ! printf '%s' "$MHOUT" | grep -q 'No such file or directory'; then rc=0
-else rc=1; echo "      absent queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 300)' (an ABSENT queue is unreadable, and the redirection must not leak stderr)"; fi
-ck "an ABSENT queue is unmeasured too, and the failed redirection leaks no stderr line" $rc
+   && ! printf '%s' "$MHOUT" | grep -q 'No such file or directory' \
+   && ! printf '%s' "$MHOUT" | grep -q 'integer expression expected'; then rc=0
+else rc=1; echo "      absent queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (an ABSENT queue is unreadable, and neither the redirection nor the depth gate may leak stderr)"; fi
+ck "an ABSENT queue is unmeasured too, and neither the failed redirection nor the depth gate leaks stderr" $rc
 # (c) NON-VACUITY — revert the guarded read to the pre-fix unguarded one (which coerces a failed `wc` to 0)
 # and show fixture (a) goes RED. A guard that survives its own revert is not the thing being graded.
 MHREV="$TMP/main-handoff-rev.sh"
-sed 's/^if \[ -f "\$O\/candidates.txt" \] && \[ -r "\$O\/candidates.txt" \]; then$/if true; then/' "$MAINDRV" > "$MHREV" 2>/dev/null
+sed 's/^if \[ -f "\$O\/candidates.txt" \] && \[ -r "\$O\/candidates.txt" \]; then$/if true; then/g' "$MAINDRV" > "$MHREV" 2>/dev/null
 if cmp -s "$MAINDRV" "$MHREV" 2>/dev/null; then rc=1; echo "      the revert mutation did not apply — the sed anchor drifted"; else
   d="$TMP/mh-revert"; rm -rf "$d"; mkdir -p "$d/o/candidates.txt"
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\nQUEUED_THIS_PASS=""\n'
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\nunusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
-    printf 'O="%s/o"\n' "$d"; cat "$MHREV"; printf 'exit 0\n'; } > "$d/drive.sh"
+    printf 'O="%s/o"\nSTARVED=0\n' "$d"; cat "$MHREV"; printf 'exit 0\n'; } > "$d/drive.sh"
   ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
   if grep -q 'the queue is empty' "$d/out" 2>/dev/null || grep -q 'backlog=0' "$d/out" 2>/dev/null; then rc=0
   else rc=1; echo "      the REVERTED read did not reproduce the defect — fixture (a) is not grading the guard: '$(tr '\n' '|' < "$d/out" | head -c 240)'"; fi
