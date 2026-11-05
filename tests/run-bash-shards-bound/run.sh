@@ -232,7 +232,13 @@ if stage_fixture "$ENVFIX" 0; then
   # value reaches every shard unchanged today, so the probe reports it verbatim when the handover is
   # restored. `SHARD_BOUND=0` rides along because it is the third member of the same env contract and
   # `0` is legitimate runner config, so a set-but-meaningful value is what a shard would have inherited.
-  SHARD_BOUND=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids" bash "$ENVFIX/scripts/runner.sh" >"$TMP/envprobe.out" 2>&1
+  # ⛔ AND `BASH_SHARDS_BUDGET_SECS=0` IS SET FOR THE SAME REASON (review of this arm, P3): with it
+  # merely `unset` in the parent, the probe reports `<unset>` whether or not `shard_exec` clears it, so
+  # the budget clause was pinned by nothing — measured: dropping `-u BASH_SHARDS_BUDGET_SECS` from
+  # `shard_exec` still passed the arm. `0` is an accepted companion to a slice (only a POSITIVE budget
+  # conflicts, run-bash-shards.sh:407-411 — tests/ci-lane-parity/run.sh:1162 pins that pair), so a set
+  # value is what makes this arm able to see the leak.
+  SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids" bash "$ENVFIX/scripts/runner.sh" >"$TMP/envprobe.out" 2>&1
   ENV_RC=$?
   if [ "$ENV_RC" -eq 0 ] \
     && grep -qx 'PROBE SHARD_BOUND=<unset>' "$TMP/envprobe.out" \
@@ -256,12 +262,13 @@ if stage_fixture "$ENVFIX" 0; then
     if cmp -s "$RUNNER" "$MUTENV/scripts/runner-mutant.sh"; then
       fail "the dispatch-env mutation did not change the runner — the handover is not one \`env -u\` line, so this control has no control"
     else
-      SHARD_BOUND=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids-mutant" bash "$MUTENV/scripts/runner-mutant.sh" >"$TMP/envprobe-mutant.out" 2>&1
+      SHARD_BOUND=0 BASH_SHARDS_BUDGET_SECS=0 BASH_SHARD_SLICE=1/1 HANG_PID_DIR="$TMP/envpids-mutant" bash "$MUTENV/scripts/runner-mutant.sh" >"$TMP/envprobe-mutant.out" 2>&1
       MUTENV_RC=$?
       if [ "$MUTENV_RC" -eq 0 ] \
         && grep -qx 'PROBE SHARD_BOUND=0' "$TMP/envprobe-mutant.out" \
+        && grep -qx 'PROBE BUDGET=0' "$TMP/envprobe-mutant.out" \
         && grep -qx 'PROBE SLICE=1/1' "$TMP/envprobe-mutant.out"; then
-        pass "control: with the handover restored the same probe DOES see SLICE=1/1 and SHARD_BOUND=0 — this arm can see the leak it guards"
+        pass "control: with the handover restored the same probe DOES see SLICE=1/1, BUDGET=0 and SHARD_BOUND=0 — this arm can see the leak it guards"
       else
         fail "the dispatch-env control did not observe the injected values (rc $MUTENV_RC): $(grep 'PROBE ' "$TMP/envprobe-mutant.out" | tr '\n' '|')"
       fi
