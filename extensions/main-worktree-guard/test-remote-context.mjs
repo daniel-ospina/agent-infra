@@ -32,7 +32,7 @@
 //   Part B — BEHAVIORAL: the REAL index.ts handler, driven against a hermetic
 //            hub. Each pinned case asserts BOTH directions: the remote form is
 //            ALLOWED and the SAME command run locally is still REFUSED.
-//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): TWENTY mutants are
+//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): TWENTY-ONE mutants are
 //            built in a TEMP copy of this extension and each must redden the
 //            specific assertion it reverts — the pre-fix identity mask, an
 //            over-reaching mask that ignores separators, a swallowed heredoc
@@ -46,7 +46,8 @@
 //            escape taken literally, a CRLF delimiter word trimmed, a paren depth
 //            ignored for the heredoc newline, a process substitution not bailed, a
 //            substitution feeding a local command, a delimiter continuation kept
-//            as a newline, and a local substitution masked anyway. The leg FAILS (never skips green) when the real-module
+//            as a newline, a local substitution masked anyway (the spawner-wrapper loss), and a
+//            redirection `&` treated as a job separator. The leg FAILS (never skips green) when the real-module
 //            loader is unavailable, because it is evidence.
 //
 // Run: node extensions/main-worktree-guard/test-remote-context.mjs
@@ -599,6 +600,22 @@ for (const c of [
 expectTrue("A34c: a substitution fed to grep is still masked",
   mask(`grep $(cmux vm exec cell-a -- printf x) file`).includes(REMOTE_PAYLOAD_PLACEHOLDER),
   JSON.stringify(mask(`grep $(cmux vm exec cell-a -- printf x) file`)));
+
+// A37 (#3478 review cycle 8 P1): `&` is a job separator ONLY when it is not part
+// of a REDIRECTION. Splitting on a redirection `&` cut the segment between the
+// payload and its pipe, so `… 2>&1 | bash -s` was masked again — the #709 class
+// the bail exists to prevent.
+for (const redir of ["2>&1", ">&2", "&>/dev/null", "&>>/tmp/log", "2>/dev/null"]) {
+  for (const shell of ["bash -s", "sh", "bash -s -- -x"]) {
+    const c = `cmux vm exec cell-a -- printf 'git reset --hard' ${redir} | ${shell}`;
+    expect(`A37: a REDIRECTION \`&\` is not a stage boundary — ${JSON.stringify(c)}`, mask(c), c);
+  }
+}
+// …while a backgrounding `&` IS a boundary: `grep x & bash -c $(…)` must bail.
+expect("A37b: a backgrounded consumer does not hide a later executor",
+  mask(`grep x & bash -c $(cmux vm exec cell-a -- printf 'y')`),
+  `grep x & bash -c $(cmux vm exec cell-a -- printf 'y')`);
+
 
 // A36 (#3478 review cycle 7 P1): a local substitution INSIDE the masked run loses
 // the `sh -c` SPAWNER wrapper that #1919 walks, so keeping the token verbatim was
@@ -1195,6 +1212,20 @@ if (typeof stripTypeScriptTypes !== "function" ||
           maskProbe: `cmux vm exec cell-a -- sh -c "echo $(git worktree add loc)"`,
           // RED means: the mask HID the `sh -c` spawner wrapper that #1919 walks.
           check: (out) => !String(out).includes("sh -c"),
+        },
+        {
+          // #3478 review cycle 8 P1: `&` must split only as a JOB separator, never
+          // as part of a redirection (`2>&1`). Splitting on the redirection `&` cut
+          // the segment between the payload and its pipe, so `… 2>&1 | bash -s` was
+          // masked again — A37 goes RED.
+          label: "redirection & treated as a job separator",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "  for (const cmd of cmdText.split(/;|&&|\\|\\||\\n|(?<![<>])&(?!>)/)) {",
+            "  for (const cmd of cmdText.split(/;|&&|\\|\\||\\n|&/)) {",
+          ),
+          maskProbe: `cmux vm exec cell-a -- printf 'git reset --hard' 2>&1 | bash -s`,
+          check: (out) => !String(out).includes("git reset --hard"),
         },
       ];
 

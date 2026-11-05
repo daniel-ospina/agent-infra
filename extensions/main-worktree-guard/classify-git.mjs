@@ -10845,7 +10845,12 @@ function _rbFeedsLocalShell(text) {
   // `|&` is a PIPE, not a background job — normalise it before splitting on `&`,
   // or `… |& bash -s` splits into `… |` and `bash` and the stage head vanishes.
   const cmdText = joined.replace(/\|&/g, "|");
-  for (const cmd of cmdText.split(/;|&&|\|\||\n|&/)) {
+  // ⛔ `&` is a job separator ONLY when it is not part of a REDIRECTION
+  // (`2>&1`, `>&2`, `&>`, `&>>`). Splitting on a redirection `&` cut the segment
+  // between the payload and its pipe, so `… printf '…' 2>&1 | bash -s` was masked
+  // again — the exact #709-class fail-open this bail exists to prevent (review
+  // #3478 cycle 8 P1). The lookaround keeps the redirection forms whole.
+  for (const cmd of cmdText.split(/;|&&|\|\||\n|(?<![<>])&(?!>)/)) {
     if (!cmd.includes(ph)) continue;
     const stages = cmd.split(/\|&?/);
     for (let idx = 1; idx < stages.length; idx++) {
