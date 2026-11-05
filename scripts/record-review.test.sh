@@ -5780,6 +5780,7 @@ EV_REF="comment:42495501"
 #   21.13 an IN-FLIGHT surface keeps the normal answer and says so (deliberate policy)
 #   21.14 with NO repo resolvable the answer is surface-unknown (8), never a green
 #   21.15 the surface fields are VOLATILE in the #1709 rec 7 identity — + MUTATION PIN
+#   21.16 an UNREAD live head never answers from the RECORDED one — + 2 MUTATION PINS
 # ⛔ THE EVIDENCE BODY IS A §20 FIXTURE (a deliberately NOT-CLEAN artifact, used to pin the
 # falsified-evidence refusal) and the shared runner does not clear it, so every mint below
 # would be refused with "the named review evidence could not be verified" — a decision about
@@ -6016,8 +6017,8 @@ assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "${S21_HEAD:0:12}" "21.12 …a
 # (d) MUTATION PIN — judging the recorded head instead puts the licence back.
 S21_MUT12="$S21_MUTDIR/record-review-s21-recordedsha.sh"
 cp "$RECORD" "$S21_MUT12"
-if grep -qF -- 'cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"' "$S21_MUT12"; then
-    sed -i.bak 's#^    cc_surface_gate "\${CC_LIVE_HEAD:-\$CC_HEAD}" "\$CC_DIFF" "\$DIFF_HASH"$#    cc_surface_gate "$CC_HEAD" "$CC_DIFF" "$DIFF_HASH"#' "$S21_MUT12"
+if grep -qF -- 'cc_surface_gate "$CC_LIVE_HEAD" "$CC_DIFF" "$DIFF_HASH"' "$S21_MUT12"; then
+    sed -i.bak 's#^    cc_surface_gate "\$CC_LIVE_HEAD" "\$CC_DIFF" "\$DIFF_HASH"$#    cc_surface_gate "$CC_HEAD" "$CC_DIFF" "$DIFF_HASH"#' "$S21_MUT12"
     rm -f "$S21_MUT12.bak"
     if cmp -s "$RECORD" "$S21_MUT12"; then
         bad "21.12 mutation: the sed did not apply — re-anchor the pin"
@@ -6035,6 +6036,76 @@ if grep -qF -- 'cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HA
     fi
 else
     bad "21.12 the carry arm's gate call is gone — re-anchor the pin"
+fi
+
+# 21.16 AN UNREAD LIVE HEAD IS NEVER ANSWERED FROM THE RECORDED ONE — review of `988d0968`,
+# BLOCKING. The `carry` arm is the second answer that reads as a LICENCE ("Do NOT re-review …
+# land it"), and the population it exists for is exactly "the head moved, the reviewed diff did
+# not". The head IDENTITY read is a SINGLE un-retried `gh` call while the diff read retries
+# `DIFF_FETCH_ATTEMPTS` times, so "diff readable / head unreadable" is the ordinary degradation,
+# not the exotic one — and the arm used to substitute the RECORDED head for the unread one. That
+# is round 2's BLOCKING shape reached again through the identity read: a GREEN recorded head over
+# a head whose surface was never read answered `carry`/0, which check (c) reads as a PASSING
+# required check and `merge-one.sh`'s RECORD-RECOVERY arm reads as "no review owed".
+# HERE the recorded head IS green and the LIVE head is NOT READABLE (`gh` answers `null`, the
+# API's own shape for an unresolvable ref), so the only correct answer is `surface-unknown`/8.
+s21_rows "$S21_STALE" "$S21_GREEN" "$S21_GREEN2"   # the recorded head's surface: GREEN
+s21_rows "$S21_BASE"  "$S21_GREEN" "$S21_GREEN2"
+printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+    "425020" "$S21_STALE" "$S21_SHA" "$S21_REPO" > "$S21_FILE-425020.json"
+# The ABSENCE assertion below must not see a prior vector's check-runs calls (the §13a idiom).
+s21_unread() { # <script> -> CC_RC/CC_OUT, with the LIVE head UNREADABLE
+    CC_RC=0
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="null" STUB_BASE_SHA="$S21_BASE" \
+        STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+        bash "$1" --check-carry 425020 "$S21_REPO" 2>"$T/s21-err")" || CC_RC=$?
+}
+: > "$LOG"
+s21_unread "$RECORD"
+assert_eq "$CC_RC" "8" "21.16 an UNREAD live head answers exit 8 (a failed read is not a carry)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "surface-unknown" "21.16 …never 'carry', which reads as 'land it'"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "LIVE head could not be READ" "21.16 …and the diagnosis names the unread LIVE head, so an operator is not sent at the record"
+if grep -qF -- "commits/$S21_STALE/check-runs" "$LOG" 2>/dev/null; then
+    bad "21.16 the RECORDED head's check surface was READ — it is not the head that merges, so its green certifies nothing about the merge"
+else
+    ok "21.16 …and the RECORDED head's surface is never read (its green would be a licence for a sha nobody read)"
+fi
+# (f) MUTATION PIN — THE PRE-FIX CODE, EXACTLY: the guard removed AND the recorded head
+# substituted for the unread one. This is the fail-open the finding names ("silently falls back to
+# the record"), so the pin asserts the OLD answer rather than merely "something else happened".
+S21_MUT16A="$S21_MUTDIR/record-review-s21-unreadfallback.sh"
+cp "$RECORD" "$S21_MUT16A"
+sed -i.bak 's#^  if \[ -z "\$CC_LIVE_HEAD" \]; then$#  if false; then#' "$S21_MUT16A"
+sed -i.bak 's#^    cc_surface_gate "\$CC_LIVE_HEAD" "\$CC_DIFF" "\$DIFF_HASH"$#    cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"#' "$S21_MUT16A"
+rm -f "$S21_MUT16A.bak"
+if cmp -s "$RECORD" "$S21_MUT16A"; then
+    bad "21.16(a) mutation: neither sed applied — re-anchor the pin"
+else
+    s21_unread "$S21_MUT16A"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ]; then
+        ok "21.16(a) MUTATION PIN: restoring the fallback over an UNREAD live head answers 'carry'/0 on the GREEN recorded head — the recorded-head substitution IS the fail-open"
+    else
+        bad "21.16(a) mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — the answer is not produced by the fallback"
+    fi
+fi
+# (g) AND THE GUARD ALONE IS LOAD-BEARING — not merely "we happen to pass the right variable".
+# With only the guard deleted, `cc_surface_gate ""` is what runs; the scan's `empty` arm is a PASS
+# (#2342), so the same stub answers `carry`/0. Correctness must not rest on the real API turning a
+# blank sha into a 422 — measured here so the guard cannot be tidied away as redundant.
+S21_MUT16B="$S21_MUTDIR/record-review-s21-noguard.sh"
+cp "$RECORD" "$S21_MUT16B"
+sed -i.bak 's#^  if \[ -z "\$CC_LIVE_HEAD" \]; then$#  if false; then#' "$S21_MUT16B"
+rm -f "$S21_MUT16B.bak"
+if cmp -s "$RECORD" "$S21_MUT16B"; then
+    bad "21.16(b) mutation: the sed did not apply — re-anchor the pin"
+else
+    s21_unread "$S21_MUT16B"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ]; then
+        ok "21.16(b) MUTATION PIN: without the guard the blank sha reaches cc_surface_gate and the same unread head answers 'carry'/0 — the refusal is OURS, not the transport's"
+    else
+        bad "21.16(b) mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — the guard is not what produces 21.16"
+    fi
 fi
 
 # 21.15 THE SURFACE FIELDS ARE VOLATILE IN THE #1709 rec 7 IDENTITY — review round 3, coverage.
@@ -6152,7 +6223,8 @@ if grep -q 'SURFACE_CELL="$(check_surface_scan "$SHA" 2>/dev/null)" || SURFACE_C
         EV_REF="comment:7391001" run_record "$S21_REPO" 425017
         RECORD="$S21_RECORD_SAVE"
         S21_REC17="$(cat "$S21_FILE-425017.json" 2>/dev/null || echo)"
-        if printf '%s' "$S21_REC17" | grep -q '"check_surface":"green"'; then
+        # ⛔ NO PIPE (#841/#864) — here-string, the transform the exceptions file records.
+        if grep -q '"check_surface":"green"' <<<"$S21_REC17"; then
             ok "21.7 MUTATION PIN: with the check-runs read dropped the record says check_surface=green over the SAME red head — the read is load-bearing"
         else
             bad "21.7 mutation NOT caught (record: $S21_REC17) — 21.7 would pass on a mutant that never reads CI"
@@ -6206,7 +6278,7 @@ EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425010
 unset STUB_CHECKS_FAIL
 S21_REC10="$(cat "$S21_FILE-425010.json" 2>/dev/null || echo)"
 assert_contains "$S21_REC10" '"check_surface":"unknown"' "21.10 an UNREADABLE surface records 'unknown' (never 'green' — absence is not evidence)"
-if printf '%s' "$S21_REC10" | grep -q '"check_surface":"green"'; then
+if grep -q '"check_surface":"green"' <<<"$S21_REC10"; then
     bad "21.10 a failed read was recorded as GREEN"
 else
     ok "21.10 …and NOT 'green'"

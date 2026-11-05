@@ -62,7 +62,11 @@
 #     surface-unknown 8 (#3440) the head's check surface COULD NOT BE READ (a refused
 #                    gh/API read, or no repo resolvable). A failed read is its own
 #                    answer and never a green one (#2342's rule, applied to this
-#                    question) — RETRY once the budget/transport recovers.
+#                    question) — RETRY once the budget/transport recovers. On the
+#                    `carry` arm this also covers an unread PR HEAD IDENTITY: with no
+#                    live head there is no sha to judge, and the RECORDED head is not
+#                    substituted for it (a green recorded head is no evidence about
+#                    the head that lands).
 #     red-base-owned 0 (#3440) the fourth surface outcome: the head IS red, but every red
 #                    group also reproduces on the PR's base, so it is the BASE's red. Exit
 #                    0 because the RECORD still covers what would merge and no re-review
@@ -73,9 +77,11 @@
 #                    does, which is a NAMED RESIDUAL, not a guarantee.
 #   The SHA judged is the one that would MERGE: on the head-bound arm that is the recorded
 #   sha, on the `carry` arm it is the LIVE head (review round 2 — a green recorded head
-#   with a red live head must not answer `carry`). An EMPTY surface and an IN-FLIGHT one
-#   keep the normal token and are named loudly on stderr — neither is green, and #2342
-#   records why an absent surface must not become a refusal here.
+#   with a red live head must not answer `carry`). ⛔ NO SHA IS EVER SUBSTITUTED FOR IT: if
+#   the live head cannot be READ on the `carry` arm, the answer is `surface-unknown`/8, never
+#   a licence on the recorded head (review of 988d0968, BLOCKING). An EMPTY surface and an
+#   IN-FLIGHT one keep the normal token and are named loudly on stderr — neither is green,
+#   and #2342 records why an absent surface must not become a refusal here.
 #
 #     norecord    4  no record for this PR/repo — there is no verdict to carry
 #                    (with no repo resolved: no unique `<owner>-<repo>-<pr>.json`
@@ -2969,7 +2975,12 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
         notowned="${notowned}${notowned:+, }${k} (unattributable)"
         continue
       fi
-      if [ -n "$bred" ] && printf '%s\n' "$bred" | command grep -qxF -- "$k"; then
+      # ⛔ NO PIPE (#841/#864): a producer into a quiet reader can take SIGPIPE, `pipefail` makes
+      # the pipeline non-zero, `owned` is never incremented and a genuinely BASE-OWNED red is
+      # answered `red-surface`/7 — a false refusal in exactly the class this guard exists to stop.
+      # The here-string form is the transform `scripts/sigpipe-grep-exceptions.txt` records for this
+      # file's previous four sites (declared: NO EXCEPTIONS).
+      if [ -n "$bred" ] && command grep -qxF -- "$k" <<<"$bred"; then
         owned=$((owned + 1))
       else
         notowned="${notowned}${notowned:+, }${k}"
@@ -3090,11 +3101,36 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
     echo "record-review.sh --check-carry: the PR's live diff could not be READ (status ${DIFF_FETCH:-unavailable}) — this is NOT a changed diff and NOT a carry. RETRY (a shared gh-gate queue, a rate-limit window or a transient API failure is far cheaper than a re-review)." >&2
     exit 3
   fi
+  # ⛔ AN UNREAD LIVE HEAD IS ITS OWN ANSWER — NEVER A SUBSTITUTED ONE (#3440, review of
+  # 988d0968, BLOCKING). `CC_LIVE_HEAD` is emptied by the non-hex / length rule just above when
+  # the PR's `.head.sha` read fails or answers a non-hex/null value, and NO arm between there and
+  # here refuses on that state — so the `carry` arm below was reached with it EMPTY and substituted
+  # the RECORDED head (`${CC_LIVE_HEAD:-$CC_HEAD}`). A green recorded head over a head whose
+  # identity was never read then answered `carry`/exit 0 — "the reviewed DIFF is UNCHANGED …
+  # land it" — for a sha this mode's own contract says is NOT the one that merges. That is
+  # round 2's BLOCKING shape re-reached through the IDENTITY read instead of the digest, and it
+  # is the false PASS #3440 exists to close: on a gate-mode repo check (c) turns that token into
+  # a PASSING required check, and `merge-one.sh`'s recovery arm turns it into "no review owed".
+  # The head read is also the CHEAPER one to lose: it is a single un-retried call, while the
+  # diff read above retries (DIFF_FETCH_ATTEMPTS), so "diff read ok / head read failed" is the
+  # common degradation and not the rare one.
+  # ⛔ AND PASSING THE EMPTY STRING IS NOT THE FIX (measured, not assumed). `cc_surface_gate ""`
+  # does not have to refuse: on the real API `commits//check-runs` is a 422 → `unreadable`/8, but
+  # the scan's `empty` arm is a PASS (#2342: an API that ANSWERS with nothing must not become a
+  # refusal), so any stub, proxy or endpoint answering an empty surface instead of an error turns
+  # a blank sha into a licence. The refusal must be OURS, not the transport's.
+  if [ -z "$CC_LIVE_HEAD" ]; then
+    printf 'surface-unknown\t%s\t%s\n' "$CC_DIFF" "${DIFF_HASH:--}"
+    echo "record-review.sh --check-carry: ⛔ (#3440) the PR's LIVE head could not be READ, so WHICH sha would merge is UNKNOWN — and a green RECORDED head (${CC_HEAD:0:12}…) is no evidence about the head that lands. A failed read is its own answer and never a green one (#2342), so nothing is carried and nothing is certified here. RETRY once the budget window or the transport recovers: this is NOT a changed artifact and NOT a re-review." >&2
+    exit 8
+  fi
   if [ "$CC_DIFF" = "$DIFF_HASH" ]; then
     # (#3440) The SECOND licence-reading answer — same gate, same four outcomes, but the sha
     # judged is the LIVE head: this arm only runs when the recorded head is NOT the live one, and
-    # the live head is what would merge (review round 2, BLOCKING).
-    cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"
+    # the live head is what would merge (review round 2, BLOCKING). The guard above is what makes
+    # "the LIVE head" TRUE rather than nominal: it cannot be empty when this line runs, and no
+    # fallback to the recorded head exists anywhere on this path.
+    cc_surface_gate "$CC_LIVE_HEAD" "$CC_DIFF" "$DIFF_HASH"
     printf 'carry\t%s\t%s\n' "$CC_DIFF" "$DIFF_HASH"
     echo "record-review.sh --check-carry: the reviewed DIFF is UNCHANGED (diff_sha256 ${CC_DIFF:0:12}… matches the PR's live diff) — the merge gate CARRIES this record across the head move (${CC_HEAD:-the earlier head}${CC_HEAD:+ }…). Do NOT re-review and do NOT mint a fresh record: land it. [source: $CC_ORIGIN]" >&2
     exit 0
