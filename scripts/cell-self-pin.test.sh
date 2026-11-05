@@ -898,6 +898,16 @@ refuses_dropin 'declares a DynamicUser= (an allocated identity cannot pin the tr
 # `Unit=/bin/true.service` (activates nothing) each installed green and silently — a pin that never runs.
 refuses_dropin 're-schedules the timer, in the TIMER drop-in dir (cell-self-pin.timer.d)' "$(dropin_doctor timerondir 'OnCalendar=*-*-* 00:00:00' 'cell-self-pin.timer.d')" 're-schedules'
 refuses_dropin 're-targets the timer, in the TIMER drop-in dir (Unit=)' "$(dropin_doctor timerunit 'Unit=/bin/true.service' 'cell-self-pin.timer.d')" 're-targets'
+# ⛔ AND THE REASON MUST BE TRUE FOR THE UNIT TYPE IT IS READING (round-3 review, P2). This reader serves
+# BOTH unit names, and a service's cause is false for a timer: a timer executes nothing, so `WorkingDirectory=`
+# cannot fail it at CHDIR. Measured on this box: `systemd-analyze verify` answers "Unknown section 'Service'.
+# Ignoring." / "Unknown key name 'WorkingDirectory' in section 'Timer', ignoring." — the key is INERT there.
+# The refusal is right either way; the CAUSE is what these two legs pin, because an operator who is refused
+# for a failure mode that cannot occur deletes the wrong line for the wrong reason.
+refuses_dropin 'declares WorkingDirectory= in a TIMER drop-in (the key is inert there)' \
+  "$(dropin_doctor timerwd 'WorkingDirectory=/srv/harness-current' 'cell-self-pin.timer.d')" 'Unknown key name'
+refuses_dropin 'declares a RootDirectory= in a TIMER drop-in (the key is inert there)' \
+  "$(dropin_doctor timerroot 'RootDirectory=/srv/harness-current' 'cell-self-pin.timer.d')" 'Unknown key name'
 # ⛔ THE IDENTITY ALLOWANCE WAS ADVERTISED AND NEVER READ (round-13 review, P1). This section's own header
 # says a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)" — and `verify_unit` refuses any `User=`
 # that is not the owner of `$CELL_HOME` because that is the identity whose git can answer for the tree the
@@ -1051,6 +1061,21 @@ if [ "$rc" -eq 0 ]; then
 elif [[ $out == *'WorkingDirectory='* ]]; then
   ok "…and a unit dir containing a SPACE is enumerated as ONE path, so its drop-in is refused by name"
 else bad "refused a spaced unit dir for the WRONG reason: $out"; fi
+# ⛔ AND THE SEAM'S OWN VALUE IS THE SAME CLASS ONE LEVEL UP (round-3 review, P2). The unit dir was fixed
+# and `CELL_SELF_PIN_DROPIN_ROOTS`/`SYSTEMD_UNIT_ROOTS` were still word-split, so a ROOT whose path contains
+# a space became two roots that do not exist: measured at this head, `--install` printed "installed" and
+# exited rc=0 while the hostile drop-in inside that very root — merged by systemd — was never read. The list
+# is now newline-separated end to end (one root per line), which is the only separator a path cannot carry.
+space_root="$T/root with space"; mkdir -p "$space_root/cell-self-pin.service.d"
+printf '[Service]\nWorkingDirectory=/srv/harness-current\n' >"$space_root/cell-self-pin.service.d/legacy.conf"
+u_spaceroot="$T/units-spaceroot"; mkdir -p "$u_spaceroot"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$u_spaceroot" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
+         CELL_SELF_PIN_DROPIN_ROOTS="$space_root" PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "ACCEPTED a drop-in ROOT whose path contains a SPACE — the seam was word-split, so the root was never enumerated and a systemd-merged WorkingDirectory= went unread: $out"
+elif [[ $out == *'WorkingDirectory='* ]]; then
+  ok "…and a drop-in ROOT containing a SPACE is enumerated as ONE path, so its drop-in is refused by name"
+else bad "refused a spaced drop-in root for the WRONG reason: $out"; fi
 # ⛔ THE NON-VACUITY CONTROL FOR *THESE* LEGS TOO: a readable, benign drop-in must still INSTALL, or the
 # three legs above could "pass" by refusing every drop-in the file cannot read for any reason.
 u_nul_ok="$T/dropin-nul-ok"; mkdir -p "$u_nul_ok/cell-self-pin.service.d"

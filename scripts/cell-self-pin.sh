@@ -1407,18 +1407,29 @@ verify_timer() { # <rendered timer> [expected Unit= target]
 # `CELL_SELF_PIN_DROPIN_ROOTS` is the SEAM the suite plants a drop-in under: the real roots are root-owned,
 # so a leg that cannot write them proves nothing about the enumeration — and MEASURED, deleting `/run` and
 # `/usr/lib` from this list left the suite at 240 ok / 0 failed, i.e. nothing pinned it at all.
-SYSTEMD_UNIT_ROOTS="/etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system /lib/systemd/system"
+# ⛔ ONE ROOT PER LINE, NOT ONE SPACE-SEPARATED STRING. The consumer reads this line-by-line, and a root
+# path containing a space was silently SPLIT by the shell into two paths that do not exist — so `--install`
+# reported PASS over a root it never enumerated while the hostile drop-in inside it was merged by systemd
+# (measured at this head, round-3 review P2: rc=0 with `CELL_SELF_PIN_DROPIN_ROOTS="$T/root with space"`,
+# while the same drop-in in a space-free root is refused). The seam is a LIST OF EQUALITY-KNOWN PATHS, so
+# its separator has to be one that cannot be a path character.
+SYSTEMD_UNIT_ROOTS="/etc/systemd/system
+/run/systemd/system
+/usr/local/lib/systemd/system
+/usr/lib/systemd/system
+/lib/systemd/system"
 # ⛔ THE ROOT LIST AND THE ENUMERATION UNDER ONE ROOT ARE TWO DIFFERENT QUESTIONS, and collapsing them into
 # one function made the FIRST one unaskable — which is how an unsearchable root became a PASS (see
 # `verify_dropins`). `dropin_roots` answers "where does systemd look"; `dropin_dirs` answers "which drop-in
 # directories exist under THIS root". The root list is the input to a SEARCHABILITY check, so it has to be
 # reachable even when nothing under the root can be listed.
-dropin_roots() { # <unit-dir> — systemd's own search order, the unit dir first
-  local unit_dir="$1" root
-  printf '%s\n' "$unit_dir"
-  for root in ${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS}; do
-    printf '%s\n' "$root"
-  done
+dropin_roots() { # <unit-dir> — systemd's own search order, the unit dir first, ONE PATH PER LINE
+  printf '%s\n' "$1"
+  # ⛔ NO `for … in ${…}` HERE. A word-splitting loop is what turned a root containing a space into two
+  # roots that do not exist — the fail-open the caller's `while IFS= read -r` exists to prevent, one level
+  # above it. The seam and the default are both newline-separated lists, and this function passes them
+  # through verbatim.
+  printf '%s\n' "${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS}"
 }
 
 dropin_dirs() { # <root> <unit-name> — every drop-in directory systemd merges FROM THIS ROOT
@@ -1515,15 +1526,23 @@ verify_dropins() { # <unit-dir> <unit-name>
       fi
       for f in "$_dir"/*.conf; do
         [ -f "$f" ] || continue
-        verify_dropin_file "$f" || return 1
+        verify_dropin_file "$f" "$2" || return 1
       done
     done < <(dropin_dirs "$_root" "$2")
   done < <(dropin_roots "$1")
   return 0
 }
 
-verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the search-path loop stays a loop
-  local f="$1" body _c _kv grep_rc _expect_user _n_user _u
+# ⛔ THIS READER SERVES TWO UNIT NAMES AND MUST SAY SO. `do_install` verifies the SERVICE's drop-ins and the
+# TIMER's (`verify_dropins "$unit_dir" cell-self-pin.timer`), and a reason written for a service is FALSE for
+# a timer: a timer executes nothing, so `WorkingDirectory=` cannot fail it at CHDIR and `RootDirectory=`
+# cannot chroot a payload that does not exist — measured, `systemd-analyze verify` answers "Unknown section
+# 'Service'. Ignoring." / "Unknown key name 'WorkingDirectory' in section 'Timer', ignoring." (round-3
+# review, P2). The unit name is therefore a PARAMETER, and the inert-key reason is used for a `.timer`.
+verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split out so the search-path loop stays a loop
+  local f="$1" unm="${2:-}" body _c _kv grep_rc _expect_user _n_user _u
+  local is_timer=0
+  case "${unm##*.}" in timer) is_timer=1 ;; esac
     # ⛔ A READ THAT FAILED IS NOT A FILE WITH NOTHING IN IT, and that is the whole false PASS: `grep`'s
     # exit status used to be DISCARDED, so a drop-in this run could not read (0600 and root-owned, an I/O
     # error) produced an EMPTY body, every rule below passed on nothing, and `--install` went on to print
@@ -1565,6 +1584,12 @@ verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the 
     for _c in $(directive_names "$body"); do
       case "$_c" in
         WorkingDirectory)
+          if [ "$is_timer" -eq 1 ]; then
+            # A TIMER executes nothing, so this key is INERT here: systemd drops it in silence and the line
+            # only survives review looking like a constraint on the clock. Refused for what it is, with a
+            # cause that is true for THIS unit type.
+            bad "the installed drop-in ${f} declares WorkingDirectory= in a TIMER drop-in — systemd answers \"Unknown key name 'WorkingDirectory' in section 'Timer', ignoring.\", so the line has NO effect and reads as configuration the manager discards; a timer fires the unit and needs no working directory — remove ${f}"; return 1
+          fi
           bad "the installed drop-in ${f} declares WorkingDirectory= — it refuses to start the unit when the directory is gone (EXIT_CHDIR 200), which is the defect this change replaces; remove ${f}"; return 1 ;;
         Condition*)
           bad "the installed drop-in ${f} declares ${_c}= — a failed condition SKIPS the unit and leaves it green; remove ${f}"; return 1 ;;
@@ -1572,6 +1597,9 @@ verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the 
           # The same "never began" class as `WorkingDirectory=`, one syscall over: systemd enters that root
           # before the payload runs. Refused in the drop-in path too, because a drop-in is merged OVER the
           # unit and an operator reading the unit will never see it.
+          if [ "$is_timer" -eq 1 ]; then
+            bad "the installed drop-in ${f} declares ${_c}= in a TIMER drop-in — that key is [Service]-only, so systemd ignores it here (measured: \"Unknown key name … in section 'Timer', ignoring.\"); the line has NO effect and reads as configuration the manager discards — remove ${f}"; return 1
+          fi
           bad "the installed drop-in ${f} declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant is a unit that never began; remove ${f}"; return 1 ;;
         Exec*)
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
@@ -2077,7 +2105,7 @@ case "${1:---pass}" in
   --print-unit)   print_unit ;;
   # read-only: the SYSTEM unit directories `dropin_dirs` scans, so the enumeration is an assertion a test
   # can make instead of a list nothing reads (see SYSTEMD_UNIT_ROOTS).
-  --print-dropin-roots) printf '%s\n' ${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS} ;;
+  --print-dropin-roots) printf '%s\n' "${CELL_SELF_PIN_DROPIN_ROOTS:-$SYSTEMD_UNIT_ROOTS}" ;;
   --install)      shift; do_install "${1:-}" ;;
   --takeover)     err "--takeover is an argument to --install: '$0 --install --takeover'"; exit 64 ;;
   # ⛔ THE RANGE IS DERIVED, NOT TYPED. `sed -n '2,68p'` cut mid-sentence and printed `set -u` plus the
