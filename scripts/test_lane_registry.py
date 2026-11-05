@@ -350,10 +350,24 @@ def test_T7_a_second_terminal_transition_is_REFUSED(box):
 
 
 def test_T7b_a_lane_whose_lease_lapsed_may_still_write_its_terminal_record(box):
-    """EXPIRED is derived, so it is not a tombstone: a late writer still gets to say what happened."""
+    """EXPIRED is derived, so it is not a tombstone: a late writer still gets to say what happened.
+
+    ⛔ THE RAW RECORD, NOT THE `show --json` ROW. `collect()` REPLACES a row's `state` with the DERIVED
+    one (`_derived(rec, now)`), so feeding that payload back into `_derived` hands it `"EXPIRED"` — a value
+    `_derived` refuses by design (`unvalidated state 'EXPIRED' reached _derived`), because only a raw
+    record is a legal input. That made this test depend on elapsed wall clock: with `budget=1`, a `show`
+    subprocess that finished inside the same second returned `"RUNNING"` and the assertion passed, while
+    the same test under load (or in the full CI list) read `"EXPIRED"` and ERRORED with `ValueError` —
+    reproduced deterministically with a 1.5 s gap. Reading the raw registry removes the clock from the
+    assertion and keeps its discriminating power: this still fails if `_derived` stops deriving EXPIRED.
+    """
     mod, origin, _ = box
     lane = start(mod, origin, budget=1)
-    rec = json.loads(run(mod, ["show", "--lane-id", lane] + _remote(origin) + ["--json"])[1])
+    ok, _detail, records, _src = mod.read_registry(str(origin), 20.0, allow_local_fallback=False)
+    assert ok
+    rec = dict(records[lane])
+    rec.pop("_ref", None)
+    rec.pop("_sha", None)
     assert mod._derived(rec, int(rec["lease_until"]) + 1)[0] == "EXPIRED"
     assert run(mod, ["done", "--lane-id", lane, "--pr", "9"] + _remote(origin))[0] == 0
     assert json.loads(run(mod, ["show", "--lane-id", lane] + _remote(origin) + ["--json"])[1])[
