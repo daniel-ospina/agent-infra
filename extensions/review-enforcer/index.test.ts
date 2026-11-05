@@ -7146,6 +7146,14 @@ test("withGhLayers (#3477): the WIRING — resolve then compose — is exercised
   // → a FALSE RED on the order assertion, i.e. a red over a correct change, in the newly added test.
   // Same class round 2 fixed one variable over; clear it too.
   const prevDir = process.env.AGENT_GH_LIMIT_DIR;
+  // ⛔ AND `AGENT_GH_SHIM` IS THE FOURTH, on exactly the same footing as the three above and for the
+  // file's own stated reason (the SAVE/RESTORE rule in the `withGhShim` kill-switch test): the
+  // suite's DECLARED posture is `AGENT_GH_SHIM=0` at the top of this file, and the degraded-path arm
+  // below sets it and then DELETES it. Un-restored, that leaves the variable ABSENT — the OPPOSITE
+  // posture — for every later test in a 12k-line file, which silently makes the declared posture
+  // inert and turns the suite order-dependent (and leaks the value when an assertion throws).
+  // A bare assignment here is the bug that rule exists to prevent; this test had it.
+  const prevShim = process.env.AGENT_GH_SHIM;
   try {
     const layer = resolvePath(root, "gh-limit");
     fs.mkdirSync(layer, { recursive: true });
@@ -7204,6 +7212,8 @@ test("withGhLayers (#3477): the WIRING — resolve then compose — is exercised
     else process.env.AGENT_GH_LIMIT = prevLimit;
     if (prevDir === undefined) delete process.env.AGENT_GH_LIMIT_DIR;
     else process.env.AGENT_GH_LIMIT_DIR = prevDir;
+    if (prevShim === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prevShim;
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
