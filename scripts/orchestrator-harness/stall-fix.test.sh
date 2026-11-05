@@ -19,6 +19,9 @@
 # §D  the worker's worktree is REFRESHED on every dispatch, not frozen at the first stall
 # §E  the two sinks this script opens are BOUNDED — a brief older than the retention bound is pruned,
 #     the escalation ledger rotates at its cap, and a file this script does not own is left alone.
+# §F  the age's PROVENANCE (`measured` | `synth` | `unmeasured`) reaches BOTH sinks verbatim — the
+#     brief's premise line renders it rather than printing an attempted window as a stall age, and the
+#     durable `age_min=/agesrc=` row keeps it un-rewritten (the #3181 P1 regression).
 #
 # Hermetic: every case builds its own `$O`, its own `$HOME` (the spawn-gate ledger lives under it),
 # its own fake worktree and its own stub dispatcher. No network, no real runtime, no `pi`.
@@ -464,8 +467,14 @@ echo "── §F the age's PROVENANCE reaches both sinks this script owns ──
 # `age_min=/agesrc=` ledger row an operator reads after an incident — must say which one they got,
 # because a worker quotes the premise back in its report and the ledger is the durable record.
 # The pre-fix `case` accepted only `synth|measured` and silently rewrote `unmeasured` to `measured`,
-# which asserted a reading this box never took on BOTH surfaces. Delete that alternative and b1
-# reddens; drop the `unmeasured` render and b2 reddens on its own premise line.
+# which asserted a reading this box never took on BOTH surfaces. Two mutations, and the arms they
+# redden are the §F ones below (`f2`/`f3`), NOT the §B verdict arms at lines 131/141 — a maintainer
+# who follows a pointer to `b1`/`b2` sees them stay green and wrongly concludes §F is vacuous.
+#   · delete the `unmeasured` alternative from the `case` at stall-fix.sh:54 → all FOUR of `f3`'s
+#     asserts redden (measured: 77 passed, 4 failed);
+#   · drop only the `unmeasured)` render at stall-fix.sh:82 → `f3`'s premise-line pair reddens
+#     (measured: 79 passed, 2 failed).
+# No §B verdict arm changes in either mutation.
 brief_of() { cat "$1"/state/briefs/stall-fix-*.md 2>/dev/null || true; }
 
 D="$(new_o f1)"; stub "$D" "$STUB_OK_TOUCH"
