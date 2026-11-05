@@ -111,9 +111,12 @@ follows are the reusable ones:
   (or a cover) that the other source would not. `open_prs` and `merged_today` each read ONE list,
   so the pair is re-read together to keep one snapshot of a two-number metric. The fix-repo lists
   (#3457) are read and fall back per `(repo, state)` (`_repo_prs`) and are deliberately NOT
-  re-read as a pair: they publish no per-list number, and each read is complete-or-refused — a
-  refusal returns the whole DELIVERY line `unavailable` rather than a short list, so no
-  half-read fix-repo pair can reach `covered()`.
+  re-read as a pair: they publish no per-list number, and a REFUSED read returns `None` so the
+  whole DELIVERY line reads `unavailable` — never a short list — except the one `_rest_prs`
+  mid-read-removal path described below, which applies to fix-repo reads too and is stated there
+  as the fallback's only under-counting path. The GraphQL arm is accepted as answered: `_repo_prs`
+  shape-gates it (list, per-row types) but cannot certify it complete — the same trust the tracker
+  pair extends to a list that answers.
 * **`limit` bounds ROWS READ, not rows returned.** The loop advances on the rows it FETCHED, so it
   spends the same row budget `gh pr list --limit` spent. In the closed window those rows are then
   filtered to merges, so the merged list holds the merges among the `limit` most-recently-updated

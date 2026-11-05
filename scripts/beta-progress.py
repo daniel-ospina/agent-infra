@@ -671,6 +671,16 @@ def _compute():
                 "--json", "number,title,headRefName")
     merged = gh("pr", "list", "--repo", REPO, "--state", "merged", "--limit", "400",
                 "--json", "number,title,headRefName,mergedAt")
+    # ⛔ AN ANSWERED READ THAT IS NOT A LIST IS A FAILED READ, FOR THE TRACKER TOO (#3457 review
+    # round 10). The fix-repo path got this gate in this PR and the tracker reads did not: `gh` can
+    # exit 0 with a JSON OBJECT (`{"message": "Not Found"}`), and a dict is TRUTHY and sized, so
+    # the `is None` tests below never fire. Measured on the shipped module: an open read answered
+    # `{"message": "Not Found"}` printed `... | 1 open PRs, 0 merged today` (`len(dict)` == 1),
+    # and the REST fallback never engaged. Normalising here means ONE rule for all four PR lists.
+    if not isinstance(openpr, list):
+        openpr = None
+    if not isinstance(merged, list):
+        merged = None
     # GRAPHQL REFUSED -> TRY REST BEFORE DECLARING THE METRICS UNAVAILABLE. If EITHER read
     # failed, BOTH lists are re-read over REST: once one read has failed the survivor may
     # itself be a degraded read, so pairing a REST count with it would compare two
@@ -821,6 +831,15 @@ def _compute():
                   "--limit", "300", "--json", "number")
         if rows is None:
             return None
+        # ⛔ AND THE SAME SHAPE GATE HERE (#3457 review round 10), where it is the worst of the
+        # four: `{}` iterates to NOTHING, so `len(rows)` is 0 and the tier reads `0 open, 0 none`
+        # -- a wrong number, not `unavailable`, and `main()` CACHES it for the whole 1800 s TTL.
+        # Measured: an issue read answered `{}` printed `P0 0 open (0 with PR, 0 NONE) | P1 0 open
+        # (0 with PR, 0 NONE)`. The `for r in rows` below cannot catch it: there is no row to
+        # reject. Non-empty wrong payloads escaped only by accident (iterating a dict yields str
+        # keys, and `r["number"]` raises into `main()`'s handler), which is not a guard.
+        if not isinstance(rows, list):
+            return None
         have = sum(1 for r in rows if covered(r["number"]))
         out[tier] = {"open": len(rows), "with_pr": have, "without": len(rows) - have}
     return out
@@ -883,8 +902,10 @@ def main():
         # `orchestrator-heartbeat.sh` sends stderr to /dev/null -- the exact "reports nothing
         # instead of the line it can prove" failure this file exists to avoid. Cited by NAME for
         # the reason stated at `REST_TIMEOUT_S` above (#2142 review): the number this used to name
-        # is a line that moves. The row guards above make that payload unreachable; this keeps a
-        # FUTURE one from taking the beat's measurement down silently.
+        # is a line that moves. The row guards above COVER THE LIST-LEVEL SHAPE for all four PR
+        # lists and the issue reads (a non-list is `unavailable`, never a number), and this keeps a
+        # FUTURE shape from taking the beat's measurement down silently. It is not redundant with
+        # them: a list of well-typed-but-absent fields still reaches here.
         try:
             data = compute()
         except Exception:
