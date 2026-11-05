@@ -6023,14 +6023,21 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
     "20.10 …but a SIGNED not-clean marker whose note contains ' sig=' IS still published (the fix must not over-block)"
 
 # ── 20.11 THE OTHER FAIL-CLOSED ARM: AN UNCOMPUTABLE HMAC IS NOT A MATCH ──────
-# (#3168 self-review, round 5.) `post_marker_comment` has FOUR refusals past the
-# ` sig=` shape guard, and the inventory below is what a reader must be able to trust
-# (three rounds have now been spent on prose that claimed coverage it did not have):
+# (#3168 self-review.) `post_marker_comment` refuses at FIVE points, and the inventory
+# below is what a reader must be able to trust (four rounds have now been spent on prose
+# that claimed coverage it did not have, so every line here was measured):
+#   :1224-1227  the ` sig=` SUBSTRING guard → UNPINNED and genuinely redundant: deleting
+#           it leaves posting IDENTICAL in every probe, because `_msig` then falls back to
+#           the whole marker and fails the shape guard at :1229. Declared rather than
+#           faked with the source-text pin an earlier round removed (14.1d(g)).
 #   :1229  `_msig` is not 64 hex   → UNPINNED, and safely so: it only short-circuits a
-#           comparison that :1245/:1248 then refuse anyway, so a regression here changes
-#           WHICH loud line prints, never whether a comment is posted. Declared rather
-#           than faked with the source-text pin an earlier round removed (14.1d(g)).
-#   :1245  no key resolved         → pinned by 20.13.
+#           comparison that :1245/:1248 then refuse anyway, so a comment is posted with it
+#           or without it. ⛔ AND IT IS SILENT: deleting it moves the refusal DOWN to
+#           :1248, which prints the loud REFUSING line — the change is SILENT→LOUD, not one
+#           loud line becoming another. (An earlier draft of this entry said "changes WHICH
+#           loud line prints"; that was false, measured, and corrected here.)
+#   :1245  no key resolved         → pinned by 20.13 (its count assertion pins the refusal;
+#           its assertion on the ABSENCE of the loud line names which arm fired).
 #   :1247  the HMAC did not COMPUTE → pinned by 20.11 (below).
 #   :1248  the HMAC did not MATCH   → pinned by 20.12.
 # ⛔ 20.10 IS NOT THE :1245 PIN, and saying so was FALSE (measured): 20.10's negative
