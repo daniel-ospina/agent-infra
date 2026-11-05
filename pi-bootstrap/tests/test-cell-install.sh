@@ -167,6 +167,25 @@ run_verify() {
     bash "$INSTALLER" --verify >> "$LOG" 2>&1
 }
 
+# The same two drivers against a DIFFERENT checkout root. Needed because a template is read from
+# `$INFRA_ROOT/templates/.mcp.base.json`, so every shape that only exists in a NON-SHIPPED template
+# (a self-host url, a padded url) is invisible to an arm that installs from this repo's own file.
+run_install_root() { # <infra-root> [path]
+  local rc=0
+  : > "$LOG"
+  echo "---- cell-install --install (INFRA_ROOT=$1) ----" >> "$LOG"
+  CELL_HOME="$CELL_HOME" INFRA_ROOT="$1" PATH="${2:-$FAKEBIN:$PATH}" \
+    bash "$INSTALLER" --install >> "$LOG" 2>&1 || rc=$?
+  printf '.' >> "$INSTALLS"
+  return $rc
+}
+run_verify_root() { # <infra-root>
+  : > "$LOG"
+  echo "---- cell-install --verify (INFRA_ROOT=$1) ----" >> "$LOG"
+  CELL_HOME="$CELL_HOME" INFRA_ROOT="$1" PATH="$FAKEBIN:$PATH" \
+    bash "$INSTALLER" --verify >> "$LOG" 2>&1
+}
+
 # --- the INDEPENDENT expected farm set (never the installer's own reader) ---
 # setup.sh declares each farm as a single-line array; this reader is deliberately the
 # simplest thing that can be right, so agreeing with the installer's python parser means
@@ -1450,6 +1469,159 @@ PY
 run_verify
 [ $? -eq 0 ] && ok "...and --verify CERTIFIES the padded url: both sides normalize it the way the client's parser does" \
   || fail "--verify refused a padded url the merge preserves and the client parses — verify -> install -> verify never converges (a FALSE BLOCK, not a certification gap)"
+# ⛔ THREE SHAPES THAT ONLY EXIST WHEN THE TEMPLATE IS NOT THE SHIPPED ONE (#3374 review, round 11).
+# Every arm above installs from `$ROOT/templates/.mcp.base.json`, which is why two rules could be
+# right for the shipped file and wrong for the documented self-host one, and one leak shape could be
+# named for `mcpServers` and nowhere else. Each arm below therefore builds its own checkout root.
+PADTPL="$TMP/padtpl-checkout"; SELFTPL="$TMP/selftpl-checkout"
+for _fx in "$PADTPL" "$SELFTPL"; do
+  mkdir -p "$_fx"
+  for e in "$ROOT"/*; do
+    b="$(basename "$e")"
+    [ "$b" = templates ] && continue
+    ln -s "$e" "$_fx/$b"
+  done
+  # The WHOLE templates dir, not just its `*.json`: `templates/AGENTS.base.md` is part of what the
+  # installer certifies (`a cell would get no global rules`), so a fixture without it fails for a
+  # reason that has nothing to do with the arm.
+  cp -R "$ROOT/templates" "$_fx/templates"
+done
+python3 - "$ROOT/templates/.mcp.base.json" "$PADTPL/templates/.mcp.base.json" "$SELFTPL/templates/.mcp.base.json" <<'PY'
+import json, sys
+src, pad, selfhost = sys.argv[1:4]
+d = json.load(open(src))
+d["mcpServers"]["tortoise"]["url"] = " https://api.premiselabs.co/mcp/ "   # the same endpoint, padded
+d = json.load(open(src))
+d["mcpServers"]["tortoise"]["url"] = "https://192.168.1.5/mcp"              # a self-hosting operator's own daemon
+d = json.load(open(src))
+d["mcpServers"]["tortoise"]["url"] = " https://api.premiselabs.co/mcp/ "
+json.dump(d, open(pad, "w"), indent=2, ensure_ascii=False)
+d = json.load(open(src))
+d["mcpServers"]["tortoise"]["url"] = "https://192.168.1.5/mcp"
+json.dump(d, open(selfhost, "w"), indent=2, ensure_ascii=False)
+PY
+python3 - "$PADTPL/templates/.mcp.base.json" "$SELFTPL/templates/.mcp.base.json" <<'PY' \
+  && ok "the template fixtures really differ from the shipped url (non-vacuity: the arms below cannot pass by reading the shipped file)" \
+  || fail "the template fixtures were not written — every arm below would then be measuring the shipped template again"
+import json, sys
+pad = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]["url"]
+selfhost = json.load(open(sys.argv[2]))["mcpServers"]["tortoise"]["url"]
+sys.exit(0 if pad == " https://api.premiselabs.co/mcp/ " and selfhost == "https://192.168.1.5/mcp" else 1)
+PY
+# ⛔ THE TEMPLATE SIDE OF THE PAD RULE WAS NOT NORMALIZED (#3374 review, round 11 P2). `url` is
+# stripped in the verifier and `want_url` was not, so with a padded TEMPLATE url the `url !=
+# want_url` arm fired against a cell pointing at exactly the same endpoint: `URL_NOT_DEFAULT:` on a
+# correct config, and because `--install` ends in this same verify, a repair loop that never
+# converged. Measured pre-fix by deleting the strip: `URL_NOT_DEFAULT:https://api.premiselabs.co/mcp/`.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselabs.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install_root "$PADTPL"
+[ $? -eq 0 ] && ok "install accepts a template whose url carries a pad (it is the same endpoint, per the client's own parser)" \
+  || fail "install refused a template whose url is the hosted endpoint with surrounding space — a hand-edited template then blocks every cell (log: $(grep -m2 -E 'FATAL|UNUSABLE|FAIL' "$LOG" | tr '\n' ' '))"
+run_verify_root "$PADTPL"
+[ $? -eq 0 ] && ok "…and --verify CERTIFIES it: the template side is normalized too, so verify -> install -> verify converges" \
+  || fail "--verify refused URL_NOT_DEFAULT against a padded TEMPLATE url while the cell points at the same endpoint — the repair loop is a FALSE BLOCK that never converges (pre-fix: URL_NOT_DEFAULT:https://api.premiselabs.co/mcp/)"
+# ⛔ THE LOOKALIKE RULE'S COMPARAND IS THE HOSTED ENDPOINT, NOT THE TEMPLATE'S URL (#3374 review,
+# round 11 P2). With a self-hosting template, `host_typo(cur.url, want.url)` made a two-daemon LAN
+# fleet (`192.168.1.5` in the template, `.6` on one cell) one character apart, so the merge REPOINTED
+# that cell at its neighbour's daemon — overriding rule 3's "a usable differing entry is PRESERVED"
+# — and the NOTE it printed called the neighbour "the hosted host", with a tenant-key reason that is
+# false on a keyless self-host.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://192.168.1.6/mcp",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+    "_selfHosted": True,
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install_root "$SELFTPL"
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a self-host template does NOT repoint a cell whose own daemon is one character away (192.168.1.6 vs the template's .5)" \
+  || fail "install repointed a self-hosted cell at the template's NEIGHBOURING daemon — the lookalike rule was comparing against the template's url instead of the hosted endpoint, so rule 3's preserve-a-self-host was overridden"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://192.168.1.6/mcp" and t.get("_selfHosted") else 1)
+PY
+# …and the CONTROL: on that SAME self-host template, a lookalike of the HOSTED host is still replaced,
+# so the arm above cannot pass by disabling the lookalike rule outright.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselab.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install_root "$SELFTPL"
+python3 - "$DEST/.mcp.json" <<'PY' && ok "…while a LOOKALIKE of the hosted host is still REPLACED on a self-host template (the rule was narrowed, not disabled)" \
+  || fail "a host-level typo of the hosted endpoint survived on a self-host template — the tenant key would go to a host nobody vetted"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://192.168.1.5/mcp" and not t.get("_selfHosted") else 1)
+PY
+# ⛔ A LITERAL CREDENTIAL OUTSIDE `mcpServers` WAS NAMED NOWHERE (#3374 review, round 11 P1). The
+# verifier scans the WHOLE file but searched for the PATH under `mcpServers` only, so a literal in a
+# TOP-LEVEL key — a `_noteboard`, a hand-added "token", the shape a curl-style paste produces —
+# printed `SECRET_IN_FILE:(unlocatable)`: the operator was told a secret exists and given nowhere to
+# look. The install side did not name it at all, so the repair loop never converged either.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["_noteboard"] = "tt_AAAABBBBCCCCDDDDEEEE"
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify_root "$ROOT"
+grep -q 'SECRET_IN_FILE:_noteboard' "$LOG" \
+  && ok "a literal in a TOP-LEVEL key is NAMED by --verify (not '(unlocatable)'), so the operator knows where to look" \
+  || fail "--verify reported a top-level literal as unlocatable — the operator is told a secret exists and given no location (pre-fix: SECRET_IN_FILE:(unlocatable))"
+run_install_root "$ROOT"
+grep -q 'literal credential at _noteboard' "$LOG" \
+  && ok "…and --install NAMES it too, so the install log cannot read as success over a file the verify refuses" \
+  || fail "--install said nothing about the top-level literal it preserved — the log reads as a clean install over a file the next --verify refuses"
+# CONTROL: the under-`mcpServers` spelling every earlier arm greps is UNCHANGED by the fix.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.pop("_noteboard", None)
+d["mcpServers"]["acme"] = {"type": "http", "url": "https://acme.example/mcp",
+                            "headers": {"Authorization": "Bearer tt_AAAABBBBCCCCDDDD"}}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify_root "$ROOT"
+grep -q 'SECRET_IN_FILE:acme.headers.Authorization' "$LOG" \
+  && ok "…and a literal inside a server still reports the UNDER-mcpServers path (the fix widened the search, it did not change the spelling)" \
+  || fail "the secret marker's spelling changed for an under-mcpServers literal — every arm and every operator grep that relied on it is now wrong"
+run_install_root "$ROOT" >/dev/null 2>&1   # restore the shipped-template state for the arms below
+# AND DROP THE FIXTURE KEYS: a merge never clobbers, so without this the `acme` literal above is still
+# in the file and every later `--verify` arm would find `SECRET_IN_FILE:` before reaching the shape it
+# is about (measured: the two USERINFO arms below failed on exactly that contamination).
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.pop("_noteboard", None)
+(d.get("mcpServers") or {}).pop("acme", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install >/dev/null 2>&1
 # ⛔ USERINFO IN THE AUTHORITY IS A HOST-SPOOF SHAPE (#3374 review P1).
 # `https://api.premiselabs.co@evil.example/mcp/` resolves to **evil.example** while its authority
 # BEGINS with the hosted host. `near_miss`/`host_typo` read the authority verbatim, so this was "a

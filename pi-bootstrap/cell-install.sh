@@ -553,6 +553,18 @@ want_url = (_want or {}).get("url") or ""
 if not isinstance(want_url, str):
     print("BADTPL:shape: mcpServers.tortoise.url is %s, not a string" % type(want_url).__name__)
     sys.exit(1)
+# ⛔ NORMALIZE THE TEMPLATE SIDE TOO — `url` is stripped below and `want_url` was NOT (#3374 review,
+# round 11 P2). The two comparisons in the entry arm therefore disagreed about whitespace: with a
+# template url carrying any surrounding space (`…/mcp/ ` — a hand-edit, or a copy that kept the
+# pad), `url != want_url` was TRUE against a cell pointing at exactly the same endpoint, so this
+# verifier refused `URL_NOT_DEFAULT:` and asserted the cell points somewhere the operator did not
+# ask for — while the merge's `usable()` strips, so install PRESERVED the value it could not
+# certify. `--install` ends in this same verify, so verify → install → verify never converged and
+# `cloud-cell-bringup.sh` died on every attempt: the same FALSE BLOCK class round 9 fixed on the
+# destination side. WHATWG strips leading/trailing space in `new URL()`, so the padded spelling IS
+# the endpoint; one normalization, both sides, applied here so every branch below reads the same
+# value (and `want_url.strip()` just below is then non-empty exactly when the url is).
+want_url = want_url.strip()
 # ⛔ AN EMPTY TEMPLATE url IS NOT "NO OPINION" — IT IS "NOTHING TO COMPARE AGAINST", and that
 # comparison is the ONLY arm that refuses a wrong endpoint. With `want_url` empty, `if want_url and
 # url != want_url` is False, so URL_NOT_DEFAULT/BADURL/NOHOST/USERINFO are ALL skipped and the entry
@@ -639,7 +651,17 @@ def leak_path(node, trail=""):
 if tok.search(raw):
     # report the path UNDER `mcpServers` — `mcpServers.tortoise._comment` is noise when the whole
     # file is already known to be that object, and `tortoise._comment` is what an operator greps.
-    print("SECRET_IN_FILE:%s" % (leak_path(servers) or "(unlocatable)"))
+    # ⛔ BUT THE SCAN IS THE WHOLE FILE (`raw`), so the PATH must be looked for there too (#3374
+    # review, round 11 P1). It was searched under `servers` alone, so a literal pasted into a
+    # TOP-LEVEL key — a `_noteboard`, a hand-added `"token"`, the shape a curl-style paste actually
+    # produces — was found by the scan and then reported as `(unlocatable)`: the operator was told a
+    # secret exists and given nowhere to look, and NOTHING on the install side named it either, so
+    # the repair loop never converged. The under-`mcpServers` spelling is preserved exactly (the
+    # prefix is stripped, not the path), so every existing marker a suite greps keeps its shape.
+    _leak = leak_path(cfg)
+    if _leak.startswith("mcpServers."):
+        _leak = _leak[len("mcpServers."):]
+    print("SECRET_IN_FILE:%s" % (_leak or "(unlocatable)"))
     sys.exit(1)
 
 
