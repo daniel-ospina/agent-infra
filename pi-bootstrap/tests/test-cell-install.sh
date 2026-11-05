@@ -1423,6 +1423,34 @@ PY
 run_verify
 [ $? -eq 0 ] && ok "...and the repair CONVERGES: the file install wrote is one --verify certifies" \
   || fail "verify still refuses the entry install just wrote — the repair path is a loop, not a repair"
+# ⛔ A WHITESPACE-PADDED url IS THE SAME url, AND THE VERIFIER WAS THE ONLY SIDE THAT DISAGREED
+# (#3374 review, round 9 P2). `usable()` normalizes with `.strip()` before every predicate, so the
+# merge preserves a padded self-host on its STRIPPED form; `graph_mcp_marker` read the RAW value, so
+# a leading pad failed its `^scheme://` match and it refused `INSECURE_URL:` / `BADURL:` — while the
+# client's own parser builds a working transport from exactly those bytes (`node -e 'new URL(" \
+# https://localhost:8000/mcp")'` → host `localhost:8000`, measured). A FALSE BLOCK on a config that
+# works, and because `--install` ends in this same verify, the repair re-created the refusal for ever.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": " https://localhost:8000/mcp",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "install PRESERVES a whitespace-padded loopback self-host and marks it (the same url, padded)" \
+  || fail "install did not preserve+mark the padded loopback self-host — the convergence arm below would then be vacuous"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if str(t.get("url") or "").strip() == "https://localhost:8000/mcp" and t.get("_selfHosted") else 1)
+PY
+run_verify
+[ $? -eq 0 ] && ok "...and --verify CERTIFIES the padded url: both sides normalize it the way the client's parser does" \
+  || fail "--verify refused a padded url the merge preserves and the client parses — verify -> install -> verify never converges (a FALSE BLOCK, not a certification gap)"
 # ⛔ USERINFO IN THE AUTHORITY IS A HOST-SPOOF SHAPE (#3374 review P1).
 # `https://api.premiselabs.co@evil.example/mcp/` resolves to **evil.example** while its authority
 # BEGINS with the hosted host. `near_miss`/`host_typo` read the authority verbatim, so this was "a
