@@ -3878,7 +3878,14 @@ queue_order_from_pool() {
     fi
     _wrote=1
   fi
-  _r=0; _u=0; _h=""
+  # ⛔ THE SEEDS ARE EMPTY, NOT ZERO (review P2, cycle 9). They used to be `0 0`, and a `read` from a
+  # MISSING/unreadable file assigns NOTHING — so the seeded `0 0` survived the strict parse below (zero
+  # IS a well-formed count) and the state fell into the drained-queue arm: a 3-row queue, reordered and
+  # installed, reported to the durable record as "nothing was queued". The comment underneath claims the
+  # polarity is closed at both ends; with zero seeds it was closed only for a field that ARRIVES malformed,
+  # not for a count that never arrives at all. Reachable because a CONCURRENT pass deletes this file at
+  # its own entry (`rm -f "$o/.queue-rank"`), and two passes can overlap.
+  _r=""; _u=""; _h=""
   read -r _r _u _h < "$o/.queue-rank" 2>/dev/null || true
   # ⛔ AN UNREADABLE COUNT IS UNKNOWN, NOT ZERO — even here (review P2, cycle 4). Coercing a bad field
   # to 0 landed the state in the EMPTY arm below, which is the very "a drained queue" claim that

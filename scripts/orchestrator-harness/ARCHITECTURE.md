@@ -49,7 +49,11 @@ issue (open, labelled P0/P1/P2, unassigned)
   │                           each candidate is pre-flighted (collision pre-flight) → append CLEAN
   │                           ones → candidates.txt (SEVERITY-FIRST: its ORDER IS the dispatch
   │                           priority, re-derived from `.pool` on every pass — including a skipped
-  │                           one — so the head is the highest-ranked CLEAN entry, never the oldest;
+  │                           one — so the head is the highest-ranked CLEAN entry, never the oldest
+  │                           WHEN THE POOL RANKED IT — a pass that could not rank (unreadable pool, or
+  │                           a pool ranking none of the queue) says `priority-unreadable` and installs
+  │                           nothing, so in THAT state the order is unverified and its head may well be
+  │                           the oldest (the code's own words: "NOT this pass's arrival order either");
   │                           membership stays FIFO-with-dedupe and an unranked row is kept at the
   │                           tail and COUNTED, agent-infra#2019; the product queue the floor reads is
   │                           re-sequenced onto the same order even on a skipped pass. EXCEPT
