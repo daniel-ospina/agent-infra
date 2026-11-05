@@ -1101,6 +1101,12 @@ _recorded_line_check() {   # $1=handed, $2=label, $3=backlog (default 0), $4=res
   mk_tool_clean "$D"
   printf '300\n200\n' > "$D/o/candidates.txt"; chmod 000 "$D/o/candidates.txt"
   mkdir -p "$D/o/state"
+  # ⛔ A `result=running` RECORD CARRYING A COUNT IS NOT A SHAPE THE WRITER EMITS (review P3, cycle 28): the
+  # only running write is the tombstone, which has `why=`+`cmd=?` and NO `backlog=`/`handed=`
+  # (`refresh-candidates.sh:1991-1993`) — and `_bl_state=RECORDED` needs a numeric `backlog=`. This branch
+  # exists to pin `printf` ARITY on the `running` gate (a surplus argument recycles the format and
+  # fabricates a line), which it does; the record is a HAND-EDITED / partly-written one, so it grades the
+  # arity and NOT a state production can enter. Do not read it as coverage of a tombstone.
   if [ "${4:-ok}" = "running" ]; then
     printf 'result=running\nat=%s\nrepo=daniel-ospina/agent-infra\nbacklog=%s\nhanded=%s\n' "$(date +%s)" "${3:-0}" "$1" > "$D/o/state/refresh-last"
   else
@@ -1558,7 +1564,7 @@ esac
 # with rows is the ORDINARY shape of that arm, and it prints the MEASURED note. Nothing graded it: a
 # regression that emitted the note only for `_bl_state != READ` left the suite green.
 mkdir -p "$T/mask-rec-read/state"
-printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=2\nhanded=7\nhanded_why=judged CLEAN by THIS pass\nqueue_readable=1\nunusable=\n' "$(date +%s)" > "$T/mask-rec-read/state/refresh-last"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed; queue depth 2; head #7 is what dispatch takes next\njudged=3\nqueued=3\nbacklog=2\nhanded=7\nhanded_why=judged CLEAN by THIS pass, and the highest-ranked CLEAN entry in the pool-ordered queue\nqueue_readable=1\nunusable=\n' "$(date +%s)" > "$T/mask-rec-read/state/refresh-last"
 printf 'stage=handoff\nrc=1\nat=%s\nwhy=record write failed\n' "$(date +%s)" > "$T/mask-rec-read/.refresh-unrecorded"
 printf '7\n8\n' > "$T/mask-rec-read/candidates.txt"
 drive_gate "$T/mask-rec-read" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
@@ -2467,10 +2473,13 @@ fi
 _skewdir="$T/tail-skew"
 mkdir -p "$_skewdir/o/state" "$_skewdir/none"
 printf '%s\n' '#!/usr/bin/env bash' ': nothing here can record' > "$_skewdir/none/refresh-candidates.sh"
-# ⛔ THE RECORD SHAPE IS THE WRITER'S (review P3, cycle 27): an `ok handoff` record always carries
-# `queue_readable=` and `unusable=` (and `handed_why=` in the writer's own wording) — a fixture that omits
-# them certifies a pre-witness record while claiming to model production.
-printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed; queue depth 5\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=judged CLEAN by THIS pass\nqueue_readable=1\nunusable=\n' \
+# ⛔ THE RECORD'S BYTES ARE THE WRITER'S (review P3, cycles 27 and 28). A fixture claiming to model
+# production while omitting fields the writer always emits (`queue_readable=`, `unusable=`) certifies a
+# pre-witness record; and one whose VALUES the writer cannot produce (`handed_why=` with no rank clause, a
+# truncated `why=`) certifies nothing either. Every `_head_rank` arm and BOTH `_head_why` arms end in
+# `, and $_head_rank` / `— $_head_rank` (`refresh-candidates.sh:5930-5949`), and `why=` is the writer's
+# whole template (`:5974`) — so what follows are its literal strings, not abbreviations of them.
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed; queue depth 5; head #7 is what dispatch takes next\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=judged CLEAN by THIS pass, and the highest-ranked CLEAN entry in the pool-ordered queue\nqueue_readable=1\nunusable=\n' \
   "$(( $(date +%s) - 3 * 3600 ))" > "$_skewdir/o/state/refresh-last"
 printf '7\n8\n' > "$_skewdir/o/candidates.txt"; chmod 000 "$_skewdir/o/candidates.txt"
 drive_gate_self "$_skewdir/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$_skewdir/none"
@@ -2498,8 +2507,9 @@ _dieddir="$T/tail-died"
 mkdir -p "$_dieddir/o/state" "$_dieddir/self"
 printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$_dieddir/self/refresh-candidates.sh"
 cp "$_dieddir/self/refresh-candidates.sh" "$_dieddir/o/refresh-candidates.sh"
-# the tombstone's own bytes: the writer emits `why=` then `cmd=?` (`refresh_record_write running provision 0`)
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet\ncmd=?\n' \
+# the tombstone's own bytes — the writer's WHOLE `why=` (it continues PAST "outcome yet") and `cmd=?`
+# (`refresh_record_write running provision 0`, `refresh-candidates.sh:1991-1993`)
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\ncmd=?\n' \
   "$(( $(date +%s) - 60 * 60 ))" > "$_dieddir/o/state/refresh-last"
 printf '7\n8\n' > "$_dieddir/o/candidates.txt"
 drive_gate_self "$_dieddir/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$_dieddir/self"
@@ -2513,7 +2523,7 @@ case "$OUT_DRIVE" in
 esac
 # and the UNAGEABLE-tombstone arm (a third site passing `$tailnote`): its own sentence names the
 # unreadable stamp, and the measured-count note must survive there too.
-printf 'result=running\nstage=provision\nrc=0\nat=not-a-number\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet\ncmd=?\n' > "$_dieddir/o/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=not-a-number\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\ncmd=?\n' > "$_dieddir/o/state/refresh-last"
 drive_gate_self "$_dieddir/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$_dieddir/self"
 case "$OUT_DRIVE" in
   *"2 usable candidate(s) still queued from an earlier pass"*) ok "tailnote/unageable: the unreadable-stamp arm carries the measured-count note" ;;
