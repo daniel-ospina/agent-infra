@@ -22,6 +22,17 @@
 #                          a dead end.
 #   8 MUTANT               with the hook removed the same stray push SUCCEEDS and the head MOVES,
 #                          so 3 measured the hook and not the fixture.
+#   9 CHAINED HOOK         a FOREIGN pre-push hook already in place still receives the ref lines on
+#                          STDIN and its ARGV, so a chain written `while read …; do validate; done`
+#                          validates the real lines instead of silently validating nothing.
+#  10 THE TERM             the DEFAULT branch lease is `CLAIM_BRANCH_TTL` (14400s), that same value is
+#                          the CEILING (a caller cannot mint a longer one), `CLAIM_TTL_MAX` (9600)
+#                          does NOT clamp it, an over-ceiling clamp is LOUD on stderr, and raising the
+#                          env var raises default AND ceiling together (one knob, not two). Before
+#                          this case NOTHING in the suite named `CLAIM_BRANCH_TTL`: measured,
+#                          reverting the default to the PR claim's 1800s left every suite green, so
+#                          the single-owner guarantee's entire term — the thing whose expiry lets a
+#                          peer take a LIVE batch branch — was unpinned.
 #
 # ⛔ NO `git checkout` ANYWHERE: every push names its destination ref (`HEAD:refs/heads/...`).
 #
@@ -47,7 +58,12 @@ export O="$T/orch" CLAIM_STATE_DIR="$T/orch/state"
 # ⛔ AND THE AMBIENT REPO SEAM IS CLEARED. The guard resolves the CHECKOUT it runs in; an inherited
 # `CLAIM_REPO` (which the harness exports for the controller) made this suite's first run read the
 # real registry and report "unclaimed" over a live claim — the bug the guard now refuses to have.
-unset CLAIM_REPO CLAIM_OWNER_HOST
+# ⛔ AND SO ARE THE LEASE SEAMS, for the same reason one class further along (review round 1): case 10
+# pins the DEFAULT term, so a cell that legitimately raised the knob — the operation `claims.sh`
+# advertises — would get a FALSE RED on correct code. Measured before this `unset`: `CLAIM_BRANCH_TTL=18000`
+# turned case 10 into 2 failures over a lease that was doing exactly what it was told. Empty is safe:
+# `claims.sh` falls back to 14400 / 9600 on an empty or unparseable value.
+unset CLAIM_REPO CLAIM_OWNER_HOST CLAIM_BRANCH_TTL CLAIM_TTL_MAX
 
 BR=integration/land-batch-2
 REMOTE_BR="refs/heads/$BR"
@@ -210,6 +226,88 @@ if [ -s "$T/chain-stdin.txt" ]; then
 else
   bad "the chained hook got an EMPTY stdin — a peer gate would validate nothing and PASS"
 fi
+
+echo "== 10. the DEFAULT branch lease is CLAIM_BRANCH_TTL (14400s), and it is its OWN ceiling"
+# ⛔ WHY THIS CASE EXISTS. `claim_branch_acquire` passes `CLAIM_BRANCH_TTL` as the default AND the
+# ceiling, and the lease is the single-owner guarantee in arithmetic form: a term shorter than the
+# batch hands the branch to a peer MID-BATCH (the exact loss #3328 exists to prevent), and a term
+# longer than the key's own ceiling is one no reaper can reach. Nothing pinned either number.
+lease_of() { # <ref> -> the claim commit's lease_until epoch
+  git --git-dir="$T/origin.git" log -1 --format=%s "$1" 2>/dev/null | sed -n 's/.*lease_until=\([0-9]*\).*/\1/p'
+}
+lease_arm() { # <label> <expected-seconds> <lease_until-epoch>
+  # ⛔ THE TOLERANCE IS WIDE ENOUGH TO SURVIVE A LOADED BOX, NOT A TIGHT CLOCK. `NOW` is taken
+  # immediately before EVERY acquire (see each arm), so the delta can only exceed the term by that one
+  # acquire's own duration — a bare-repo CAS under a loaded fleet is not sub-second, and a tighter
+  # bound would be a flake rather than a gate. ±15 s still discriminates every value that matters here:
+  # 1800 and 9600 are 1000 s+ away.
+  local want="$2" d
+  d=$(( $3 - NOW ))
+  if [ "$d" -ge "$(( want - 15 ))" ] && [ "$d" -le "$(( want + 15 ))" ]; then
+    ok "$1 (lease ${d}s from now, want ~${want}s)"
+  else
+    bad "$1 (lease ${d}s from now, want ~${want}s; lease_until=$3 now=$NOW)"
+  fi
+}
+BR_LEASE=integration/lease-default
+BR_LEASE_CEIL=integration/lease-ceiling
+BR_LEASE_KNOB=integration/lease-knob
+BR_LEASE_KNOB_DEF=integration/lease-knob-default
+NOW=$(date +%s)
+acquire_from owner "$BR_LEASE"
+eq "acquire with NO explicit ttl succeeds" "$?" "0"
+L1="$(lease_of refs/claims/branch-integration-lease-default)"
+if [ -n "$L1" ]; then lease_arm "the DEFAULT lease is the branch key's own 14400s, not the PR claim's 1800s" 14400 "$L1"; else bad "no lease_until on the default-acquire claim ref"; fi
+# ⛔ THE CEILING ARM. An explicit over-ceiling request must clamp to THIS KEY's ceiling (14400) and say
+# so — not to CLAIM_TTL_MAX (9600). A clamp to 9600 shreds 44 % of a batch's term silently.
+NOW=$(date +%s)
+acquire_from owner "$BR_LEASE_CEIL" 999999
+grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is clamped LOUDLY, not silently" \
+  || bad "no clamp warning for an over-ceiling branch ttl: $(cat "$T/acq.out")"
+# ⛔ AND IT MUST NOT NAME ANOTHER KEYING'S KNOB AS THE CEILING (review round 2, P2; round 5 widened
+# it). The warning used to read "(CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s)" — for a branch key BOTH
+# names are wrong (9600 / 18000), so a fixer was sent to raise a knob that is not the ceiling. Two
+# literal greps (the exact former string, then a positive mention of this keying's name) were each
+# defeated by a respelling — "ceiling (CLAIM_ISSUE_TTL = 14400s) — clamped. Candidates: … CLAIM_BRANCH_TTL"
+# mentions this keying AND avoids the old spelling while still naming the wrong ceiling. So the
+# assertion is on the PROPERTY: the clause inside `ceiling ( … )` must not be another keying's knob.
+if grep -qE 'ceiling \(CLAIM_(TTL_MAX|ISSUE_TTL|TTL)\b' "$T/acq.out"; then
+  bad "the clamp warning names another keying's knob AS this ceiling: $(cat "$T/acq.out")"
+else
+  ok "the clamp warning does not name another keying's knob as this ceiling"
+fi
+# ⛔ AND THE PRINTED NUMBER IS PINNED SEPARATELY (round 5, P2). The arm above measures the STAMPED
+# LEASE, never the printed ceiling — so a warning that stamps 14400 correctly while PRINTING 9600
+# misdirects the fixer exactly as before and stayed green. The number in the message is the `%ss`
+# argument, and it must equal this keying's ceiling.
+grep -q 'ceiling (14400s)' "$T/acq.out" \
+  || bad "the clamp warning does not print this keying's ceiling (14400s): $(cat "$T/acq.out")"
+# ⛔ AND THE GUARD IS NOT A SINGLE LITERAL (review round 3, P2): the message must also name THIS
+# keying's variable among the candidates it suggests raising.
+grep -q 'CLAIM_BRANCH_TTL' "$T/acq.out" \
+  || bad "the clamp warning does not name CLAIM_BRANCH_TTL as a ceiling candidate: $(cat "$T/acq.out")"
+L2="$(lease_of refs/claims/branch-integration-lease-ceiling)"
+if [ -n "$L2" ]; then lease_arm "an over-ceiling request clamps to CLAIM_BRANCH_TTL (14400), NOT to CLAIM_TTL_MAX (9600)" 14400 "$L2"; else bad "no lease_until on the over-ceiling claim ref"; fi
+# ⛔ THE KNOB ARM — ONE KNOB, NOT TWO (review round 2, P2). The comment in `claims.sh` claims that
+# raising the env var raises the DEFAULT and the CEILING together. Two literals cannot prove that: a
+# mutant that hardcodes the ceiling (`_claim_acquire_at … "14400"`) leaves every arm above green,
+# because it only differs once the knob MOVES. Here it moves: with CLAIM_BRANCH_TTL=20000 an
+# over-ceiling request must clamp to 20000, not to 14400. Measured with the split-knob mutant: this
+# arm is the ONLY one that reddens.
+NOW=$(date +%s)
+CLAIM_BRANCH_TTL=20000 acquire_from owner "$BR_LEASE_KNOB" 999999
+L3="$(lease_of refs/claims/branch-integration-lease-knob)"
+if [ -n "$L3" ]; then lease_arm "CLAIM_BRANCH_TTL=20000 raises the CEILING too — one knob, not a split term" 20000 "$L3"; else bad "no lease_until on the env-raised claim ref"; fi
+# ⛔ AND THE OTHER HALF OF THE SAME PROPERTY (review round 3, P2): the CEILING following the knob does
+# not prove the DEFAULT does. The default arm above runs with the knob UNSET, where a hardcoded
+# `${3:-14400}` is indistinguishable from `$CLAIM_BRANCH_TTL` — measured, that mutant left all 40
+# assertions green while `CLAIM_BRANCH_TTL=20000` produced a 14400 s DEFAULT against a 20000 s ceiling:
+# exactly the "longer than its own clamp" split these arms exist to forbid. So the knob is moved once
+# more, on the DEFAULT path.
+NOW=$(date +%s)
+CLAIM_BRANCH_TTL=20000 acquire_from owner "$BR_LEASE_KNOB_DEF"
+L4="$(lease_of refs/claims/branch-integration-lease-knob-default)"
+if [ -n "$L4" ]; then lease_arm "CLAIM_BRANCH_TTL=20000 raises the DEFAULT too — one knob, not two" 20000 "$L4"; else bad "no lease_until on the env-raised DEFAULT claim ref"; fi
 
 echo
 printf 'branch-claim.test.sh: %d passed, %d failed\n' "$PASSES" "$FAILS"

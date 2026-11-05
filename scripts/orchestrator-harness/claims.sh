@@ -128,16 +128,19 @@ case "${CLAIM_ISSUE_TTL:-}" in
 esac
 
 # ── THE BRANCH CLAIM'S LEASE (agent-infra#3328) ─────────────────────────────────────────────
-# ⛔ THE CEILING IS THIS KEY'S OWN TERM (14400), NOT CLAIM_TTL_MAX (7200): `claim_branch_acquire`
-# passes CLAIM_BRANCH_TTL as BOTH the default and the ceiling, because a batch legitimately outlives the
-# 2 h PR/merge ceiling and clamping to it would expire a live batch mid-flight. Stated because the
-# comment below used to claim the opposite.
+# ⛔ THE CEILING IS THIS KEY'S OWN TERM (14400), AND `CLAIM_TTL_MAX` DOES NOT APPLY TO IT.
+# `claim_branch_acquire` passes `CLAIM_BRANCH_TTL` as BOTH the default and the ceiling (its 3rd and 4th
+# args to `_claim_acquire_at`), so a caller cannot mint a longer term while a batch legitimately
+# outlives the PR/merge ceiling: 14400 is ABOVE `CLAIM_TTL_MAX`'s 9600 default, deliberately, and a
+# clamp to `CLAIM_TTL_MAX` would expire a live batch mid-flight.
 # A BATCH BRANCH is held for the whole batch, which is longer than any single lane: the owner takes
-# it before the first lane pushes and releases it after the last one lands. Its term is therefore the
-# issue claim's ceiling, not the PR claim's 1800s — a batch claim that expires MID-BATCH lets a peer
-# reclaim it and push, which is the exact loss this key exists to prevent. It is capped by
-# CLAIM_TTL_MAX for the same reason every other key is (claim_branch_acquire passes it as its own
-# ceiling), so a caller cannot mint a term no reaper can reach.
+# it before the first lane pushes and releases it after the last one lands. Its term is therefore its
+# own, not the PR claim's 1800s — a batch claim that expires MID-BATCH lets a peer reclaim it and
+# push, which is the exact loss this key exists to prevent. Raising the env var raises the default and
+# the ceiling together, so the term stays a single knob and never splits into "longer than its own
+# clamp". *(This block is the one #3328 comment that contradicted ITSELF: it said "not CLAIM_TTL_MAX"
+# and then "capped by CLAIM_TTL_MAX", and it cited CLAIM_TTL_MAX as 7200 when the value is 9600. The
+# assertions that pin the real behaviour are `branch-claim.test.sh` case 10.)*
 # ⛔ THE HOLDER RELEASES ON COMPLETION, so the full term is only ever spent by a box that died.
 CLAIM_BRANCH_TTL="${CLAIM_BRANCH_TTL:-14400}"
 case "${CLAIM_BRANCH_TTL:-}" in
@@ -1147,7 +1150,18 @@ _claim_acquire_at() {
     # ⛔ LOUD, NOT SILENT. A clamp shortens a lease below what the caller asked for, and for
     # merge-one/fix-one that means expiring before the review window closes — a peer takes the same
     # head and the merge runs twice. That is the one consequence this bound must never hide.
-    printf '[claims] lease ttl %ss exceeds this keying ceiling (CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = %ss) — clamped. If REVIEW_TIMEOUT/FIX_TIMEOUT were raised, raise the ceiling at the same time (agent-infra#2094).\n' \
+    # ⛔ THE MESSAGE NAMES NO SINGLE KNOB AS THE CEILING, BECAUSE `max` IS NOT ALWAYS ONE (review
+    # round 2, P2; the headline was over-stated until round 5). It used to read
+    # "(CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = %ss)" — and for a BRANCH key `max` is CLAIM_BRANCH_TTL
+    # (14400), which is neither of those two variables (9600 / 18000). Measured on the real code, a
+    # branch-key clamp printed "CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s", sending a fixer to raise a
+    # knob that is not the ceiling. The number was right and the two names were wrong — the same
+    # misdirection this block's own prose correction exists to remove. What the message now does: it
+    # states the CEILING VALUE inside `ceiling ( … )` and nothing else, then lists the three ceiling
+    # variables as CANDIDATES for "raise the ceiling for that keying". No caller names its variable —
+    # `_claim_acquire_at` receives only `ref/ttl/dflt/max` (claims.sh:836, 1079, 1088, 1098) — so the
+    # list is a literal here, and the assertions that pin it live in `branch-claim.test.sh` case 10.
+    printf '[claims] lease ttl %ss exceeds this keying ceiling (%ss) — clamped. Raise the ceiling for that keying (CLAIM_TTL_MAX / CLAIM_ISSUE_TTL / CLAIM_BRANCH_TTL) if its timeout was raised (agent-infra#2094).\n' \
       "$ttl" "$max" >&2
     ttl="$max"
   fi

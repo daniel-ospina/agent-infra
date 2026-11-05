@@ -3775,9 +3775,14 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(14400s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive)
-are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
-caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
+(18000s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive,
+and to 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
+#2999) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
+`CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
+`CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
+expire a live batch mid-flight (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
+case 10). *(These four numbers were stale here until review round 2: this paragraph still said 14400s
+for `CLAIM_ISSUE_TTL` and 7200s for `CLAIM_TTL_MAX`, and did not mention the branch keying at all.)* Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
 stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
 either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or
