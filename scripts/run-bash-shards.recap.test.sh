@@ -82,24 +82,22 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 # DIFFERENT knobs for the SAME runner: `ci.yml`'s `bash-suites` exports `BASH_SHARD_SLICE`, and
 # `ci-main.yml`'s `script-validate` exports `BASH_SHARDS_BUDGET_SECS: '7800'` for the whole step, so
 # every shard inherits it on main's lane too (`shard_run_bounded` hands a shard its environment
-# unchanged). Two independent reasons the fixture must own none of them:
-#   * the P1 — a positive budget and a slice do not compose, and `run-bash-shards.sh` refuses the
-#     pair BY NAME. Before ARM 3's child was isolated with `env -u`, the inherited budget made the
-#     arm meet THAT refusal instead of the slice one it pins, and it reddened on main's lane:
-#     measured pre-fix (`9b7ed763`) with only `BASH_SHARDS_BUDGET_SECS=7800` inherited,
-#     `PASS 12 · FAIL 1` — ARM 3. That specific arm red is now fixed by the `env -u` on the child
-#     (which isolates exactly one variable); it is NOT fixed by this `unset`, and this `unset` is
-#     not what the arm red measured.
-#   * the contract hygiene — no FIXTURE should run under the outer job's budget or bound at all.
-#     The fixture is ~3 s against a 1800 s default; inheriting `BASH_SHARDS_BUDGET_SECS=7800` or
-#     `SHARD_BOUND=5` makes its verdict depend on the outer job's timing, which is the same "a red
-#     no diff can cause" shape one layer down. `tests/run-bash-shards-bound/run.sh` §0 clears the
-#     identical set for exactly this reason.
-# Stated this way round because a reader who tries to reproduce the arm red on the SHIPPED tree
-# cannot — the `env -u` now prevents it — and a rationale that cannot be reproduced reads as an
-# unfounded claim in a file whose evidence is measurements.
-if [ -n "${BASH_SHARD_SLICE:-}" ] || [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ] || [ -n "${SHARD_BOUND:-}" ]; then
-  echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE:-}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS:-}' SHARD_BOUND='${SHARD_BOUND:-}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header)"
+# unchanged). Three reasons, each readable in `run-bash-shards.sh`:
+#   * a POSITIVE budget and a slice do not compose — the runner refuses the pair BY NAME, so an
+#     inherited budget makes a sliced ARM 3 meet THAT refusal instead of the slice one it pins. On
+#     the pre-fix head (`9b7ed763`, no `env -u` on the child) that reddened ARM 3 on main's lane:
+#     `PASS 12 · FAIL 1` with only `BASH_SHARDS_BUDGET_SECS=7800` inherited.
+#   * a SET-but-EMPTY budget is REFUSED as a missing value, not read as "no deadline". That is why
+#     the test below is PRESENCE (`+set`), never non-emptiness: `:-` would drop an empty inherited
+#     value silently and swallow a refusal the runner is entitled to make.
+#   * an inherited `SHARD_BOUND` puts the fixture's verdict on the outer job's clock.
+# TWO CLEARANCES, ON PURPOSE, and both remove the leaked budget before ARM 3's child starts: this
+# `unset`, and the `env -u` on that child. The `env -u` is what makes the arm answer ONE variable;
+# it is not the only thing standing between the budget and the arm, and this comment must not be
+# read as claiming it is. `tests/run-bash-shards-bound/run.sh` §0 clears the identical set and uses
+# the same `env -u` spelling per invocation.
+if [ "${BASH_SHARD_SLICE+set}" = set ] || [ "${BASH_SHARDS_BUDGET_SECS+set}" = set ] || [ "${SHARD_BOUND+set}" = set ]; then
+  echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE-<unset>}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS-<unset>}' SHARD_BOUND='${SHARD_BOUND-<unset>}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header). A bare dash (not colon-dash) is used in this echo for the same reason the test above is +set: a SET-but-EMPTY value must print as '' and an ABSENT one as <unset>, or the two are indistinguishable in the log this notice exists for."
 fi
 unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
 
@@ -291,7 +289,7 @@ SLICE_COUNT="${SLICE_CONTROL##*/}"
 if [ "$SRC" -eq 2 ] && grep -q "asks for $SLICE_COUNT slice(s) of 3 listed shard(s)" <<<"$SOUT"; then
   ok "(mutation) the SAME fixture WITH BASH_SHARD_SLICE=$SLICE_CONTROL REFUSES (rc 2) — the hazard the fixtures are protected from is real"
 else
-  bad "(mutation) a sliced fixture run exited $SRC and did not name the slice refusal — ARM 2's isolation would then be described by nothing: $(tr '\n' '|' <<<"$SOUT" | cut -c1-300)"
+  bad "(mutation) a sliced fixture run exited $SRC and did not name the slice refusal — the fixtures' isolation would then be described by nothing: $(tr '\n' '|' <<<"$SOUT" | cut -c1-300)"
 fi
 
 echo ""
