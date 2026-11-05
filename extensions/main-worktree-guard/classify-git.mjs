@@ -10177,9 +10177,12 @@ function _expandMarkerToken(token, home) {
 //     separator for this scanner, so it ENDS the mask and the remainder is gated
 //     exactly as before the fix (fail-closed, documented rather than modelled);
 //   • a heredoc BODY is masked with the payload it belongs to (`sh -s <<'EOF'`
-//     is how a lane ships a script to a cell) while its TERMINATOR line is kept —
-//     it is structure, and masking it makes the next local command read as body
-//     data. Plain `<<` requires the terminator at column 0; `<<-` strips tabs;
+//     is how a lane ships a script to a cell) while its TERMINATOR line and the
+//     REST OF THE DELIMITER LINE are kept — they are structure and LOCAL text
+//     (`… <<'EOF'; cmd`, `… <<'EOF' > f`), and masking them made the next local
+//     command read as body data. Plain `<<` requires the terminator at column 0;
+//     `<<-` strips tabs. A heredoc with no payload word (`ssh cell <<'EOF'`) is
+//     itself the payload;
 //   • the replacement is ONE inert word, so nothing downstream can mistake it
 //     for an invocation or a path;
 //   • a shape this scan cannot PROVE is left unmasked (today's gating): a
@@ -10189,7 +10192,10 @@ function _expandMarkerToken(token, home) {
 //     line;
 //   • a payload piped INTO a local shell (`cmux vm exec … | bash -s`) is left
 //     unmasked: the pipe is built here and the remote stdout runs as a local
-//     script, which is exactly the case the #709 arm refuses.
+//     script, which is exactly the case the #709 arm refuses. The stage head is
+//     read through decorations (`|&`, `| (bash)`, `| { bash; }`) and an
+//     unreadable head (a quote, a `$`, an empty stage) also counts as a shell —
+//     fail closed, so an unmodelled spelling re-gates rather than slips past.
 // ─────────────────────────────────────────────────────────────────────────
 
 /** ssh(1) options whose VALUE is the next word (`-p 22`, `-o K=V`, `-i key`). */
@@ -10419,7 +10425,17 @@ function _rbRemotePayloadStart(tokens, source) {
       const t = tokens[j];
       if (t.op) { if (_RB_SEPARATORS.has(t.text)) break; j++; continue; }
       if (t.text === "--") { j++; continue; }
-      if (/^-[^\s]/.test(t.text)) { j += (flags.has(t.text.slice(0, 2)) || flags.has(t.text)) ? 2 : 1; continue; }
+      if (/^-[^\s]/.test(t.text)) {
+        // A value flag consumes the NEXT word only when it has no attached value:
+        // `-o ProxyCommand=x` takes one, but `-p22` / `-L8080:host:80` / `-oK=V`
+        // carry it, and consuming the next word there swallowed the HOST — the
+        // boundary was then lost entirely and a remote command stayed gated
+        // (review #3478 cycle 3 P2, fail-closed but a real gap).
+        const flag = t.text.startsWith("--") ? t.text.split("=")[0] : t.text.slice(0, 2);
+        const attached = t.text.startsWith("--") ? t.text.includes("=") : t.text.length > 2;
+        j += flags.has(flag) && !attached ? 2 : 1;
+        continue;
+      }
       operand = j;
       break;
     }
@@ -10427,9 +10443,16 @@ function _rbRemotePayloadStart(tokens, source) {
     // The payload must BEGIN at a word, immediately after the operand. A
     // REDIRECT there (`ssh cell-a > a.txt`) is a LOCAL truncating write — its
     // target is not remote payload (review #3478 P0), and `2>/dev/null` before
-    // the command is an unmodelled shape (gated as before).
+    // the command is an unmodelled shape (gated as before). The ONE exception is
+    // a HEREDOC (`ssh cell <<'EOS'`): that is how a lane ships a script to a
+    // cell, and there is no payload WORD to find — the body is the payload
+    // (review #3478 cycle 3 P2).
     const p = operand + 1;
-    if (p >= tokens.length || tokens[p].op) continue;  // `ssh <host>` alone, or a redirect-only form
+    if (p >= tokens.length) continue;                    // `ssh <host>` alone
+    if (tokens[p].op) {
+      if (tokens[p].redirect && /^<<-?$/.test(tokens[p].text)) return p;
+      continue;                                          // redirect-only form
+    }
     return p;
   }
   return null;
@@ -10523,13 +10546,33 @@ export function maskRemoteExecPayloads(command) {
         // The BODY is the payload's script (masked), but the TERMINATOR LINE is
         // kept: it is structure, not payload, and without it the next local
         // command reads as heredoc data to every downstream parser (fail-open).
+        // ⛔ The REST OF THE DELIMITER LINE is LOCAL text, not payload: bash
+        // discards everything from `#` and otherwise runs `cmd <<'EOS'; foo` /
+        // `… && foo` / `… | tee f` / `… > f` HERE after the body is consumed. That
+        // tail used to be DROPPED (not masked — dropped), so `cmux vm exec c --
+        // sh -s <<'EOS'; git worktree add loc` and `… <<'EOS' > a.txt` went from
+        // BLOCKED to ALLOWED (review #3478 cycle 3 P0).
+        const nl = s.indexOf("\n", tk.end);
         const body = _rbHeredocBodyRange(s, tk.end, _rbUnquoteDelim(tk.text), verbatimNextWord === "heredoc");
+        if (nl < 0) {                    // no newline ⇒ no body: nothing here is payload
+          verbatimTo(s.length);
+          endMask();
+          verbatimNextWord = null;
+          k++;
+          continue;
+        }
+        if (nl > last) { out += s.slice(last, nl); last = nl; }   // delimiter-line tail: LOCAL
+        // The heredoc can be the payload ITSELF (`ssh cell <<'EOS'` — no payload
+        // word), in which case the placeholder has not been emitted yet. It goes
+        // where the BODY was, on its own line, so the heredoc stays parseable.
+        const needPlaceholder = !masking;
         if (body.termStart > last) last = body.termStart;                       // body: masked
         // The newline that separated the delimiter word from the body is gone with
         // it. Keep ONE: without it the terminator line would fuse onto the
         // delimiter word (`<<'EOS'EOS`), no downstream parser could close the
         // heredoc, and the following LOCAL command would read as body text.
-        out += "\n";
+        out += needPlaceholder ? `\n ${REMOTE_PAYLOAD_PLACEHOLDER}\n` : "\n";
+        masking = true;
         if (body.afterTerm > last) { out += s.slice(body.termStart, body.afterTerm); last = body.afterTerm; }
         // A heredoc operator ends its simple command; what follows is LOCAL text.
         endMask();
@@ -10557,23 +10600,38 @@ export function maskRemoteExecPayloads(command) {
   return out;
 }
 
-/** Does `text` pipe a masked placeholder INTO an interpreter (or hand it to one
- *  as a script operand)? Those are the shapes where the payload would be executed
- *  by THIS shell, so the mask must not hide it.
+/** Does `text` pipe a masked placeholder INTO a command that may run it — a shell
+ *  or an interpreter wrapper? Those are the shapes where the payload would be
+ *  executed by THIS shell, so the mask must not hide it.
  *  Scoped to ONE simple command (`;`/`&&`/`||`/newline split), so an unrelated
- *  local `… | bash` in another command does not disable the mask. */
+ *  local `… | bash` in another command does not disable the mask.
+ *
+ *  ⛔ An allow-list of shells alone is NOT enough (review #3478 cycle 3 P0): the
+ *  head can be decorated (`|& bash`, `| (bash -s)`, `| { bash; }`, `| ! bash`),
+ *  carry a variable or a quote (`| "$SHELL"`), or be a multi-word launcher
+ *  (`| busybox sh`). A stage head this scan cannot READ is treated as a shell —
+ *  the command is then left unmasked, which only re-gates it (fail closed). */
 function _rbFeedsLocalShell(text) {
   const ph = REMOTE_PAYLOAD_PLACEHOLDER;
-  const WRAPPERS = new Set(["env", "exec", "sudo", "command", "nice", "nohup", "time", "stdbuf", "xargs"]);
-  const isShell = (w) => /^(?:\S*\/)?(?:ba|z|k|da|a)?sh$/.test(w);
+  const WRAPPERS = new Set(["env", "exec", "sudo", "command", "nice", "nohup", "time", "stdbuf", "xargs", "busybox", "setsid", "doas", "chroot"]);
+  const isShell = (w) => /^(?:\S*\/)?(?:ba|z|k|da|a|c|mk)?sh$/.test(w) || /^(?:python[0-9.]*|perl|ruby|node|awk|tclsh|lua)$/.test(w);
   for (const cmd of text.split(/;|&&|\|\||\n/)) {
     if (!cmd.includes(ph)) continue;
-    const stages = cmd.split("|");
+    // `|&` splits like `|` — otherwise the stage head is `& bash`, which no
+    // allow-list matches and the bail silently did not fire.
+    const stages = cmd.split(/\|&?/);
     for (let idx = 1; idx < stages.length; idx++) {
       if (!stages.slice(0, idx).some((st) => st.includes(ph))) continue;
-      const words = stages[idx].trim().split(/\s+/).filter(Boolean);
+      const raw = stages[idx].trim();
+      if (!raw) continue;                            // dangling `|` — nothing runs there
+      const stripped = raw.replace(/^[!({]+/, "").replace(/[)}];*&*$/, "").trim();
+      if (!stripped) return true;                    // `| ( … )`-shaped: unreadable
+      // A head carrying a quote, a variable or a substitution is a command this
+      // scan cannot see (`"$SHELL"`, `$(which bash)`) — treat it as a shell.
+      if (/["'`$]/.test(stripped.split(/\s+/)[0])) return true;
+      const words = stripped.split(/\s+/).filter(Boolean);
       let j = 0;
-      // Skip redirections / leading assignments / `!` before the command word.
+      // Skip redirections / leading assignments before the command word.
       while (j < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[j]) || /^\d*[<>]/.test(words[j]) || words[j] === "!")) j++;
       if (j >= words.length) continue;
       if (WRAPPERS.has(words[j]) || isShell(words[j])) return true;

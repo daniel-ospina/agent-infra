@@ -32,9 +32,15 @@
 //   Part B — BEHAVIORAL: the REAL index.ts handler, driven against a hermetic
 //            hub. Each pinned case asserts BOTH directions: the remote form is
 //            ALLOWED and the SAME command run locally is still REFUSED.
-//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): three mutants are
+//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): NINE mutants are
 //            built in a TEMP copy of this extension and each must redden the
-//            specific assertion it reverts.
+//            specific assertion it reverts — the pre-fix identity mask, an
+//            over-reaching mask that ignores separators, a swallowed heredoc
+//            terminator, a split unquoted-backtick region, a quote-scanned
+//            comment, an ANSI-C quote read as a plain quote, a piped payload
+//            that blinds the local-shell arm, a dropped heredoc delimiter-line
+//            tail, and a `|&` stage not split. The leg FAILS (never skips green)
+//            when the real-module loader is unavailable, because it is evidence.
 //
 // Run: node extensions/main-worktree-guard/test-remote-context.mjs
 //      node extensions/main-worktree-guard/test-remote-context.mjs --mutations
@@ -380,6 +386,66 @@ expectTrue("A18c: an unrelated local `… | bash` in another command does not di
   expect("A20: an unterminated quote leaves the command UNMASKED", mask(c), c);
 }
 
+// A21 (#3478 review cycle 3 P0): the REST OF THE DELIMITER LINE is LOCAL text.
+// bash runs `cmd <<'EOS'; foo` / `… && foo` / `… | tee f` / `… > f` HERE after the
+// body is consumed; that tail used to be DROPPED (not masked — dropped), so
+// `… <<'EOS'; git worktree add loc` and `… <<'EOS' > a.txt` went BLOCKED →
+// ALLOWED. The tail must survive VERBATIM.
+for (const [c, must] of [
+  [`cmux vm exec cell-a -- sh -s <<'EOS'; git worktree add rev-9999\nbody\nEOS`, "git worktree add rev-9999"],
+  [`cmux vm exec cell-a -- sh -s <<'EOS' && git worktree add rev-9999\nbody\nEOS`, "git worktree add rev-9999"],
+  [`cmux vm exec cell-a -- sh -s <<'EOS' | tee a.txt\nbody\nEOS`, "tee a.txt"],
+  [`cmux vm exec cell-a -- sh -s <<'EOS' > a.txt\nbody\nEOS`, "> a.txt"],
+  [`cmux vm exec cell-a -- sh -s <<-'EOS'; git worktree add loc\nbody\nEOS`, "git worktree add loc"],
+]) {
+  expectTrue(`A21: the heredoc DELIMITER-LINE tail is kept verbatim — ${JSON.stringify(c)}`,
+    mask(c).includes(must), JSON.stringify(mask(c)));
+  expectTrue(`A21: …and the body is still masked — ${JSON.stringify(c)}`,
+    mask(c).includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(mask(c)));
+  expectTrue(`A21: …and the terminator still closes the heredoc — ${JSON.stringify(c)}`,
+    /\nEOS\s*$/.test(mask(c)), JSON.stringify(mask(c)));
+}
+
+// A22 (#3478 review cycle 3 P0): the local-shell pipe bail must not be a
+// spelling allow-list — `|&`, subshell/brace decorations, a `$SHELL`/quoted head
+// and a multi-word launcher all execute the remote stdout HERE.
+for (const c of [
+  `cmux vm exec cell-a -- printf 'git checkout -- a.txt' |& bash -s`,
+  `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | (bash -s)`,
+  `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | { bash -s; }`,
+  `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | "$SHELL"`,
+  `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | busybox sh`,
+  `X=$(cmux vm exec cell-a -- printf 'git checkout -- a.txt' | bash -s); echo "$X"`,
+]) {
+  expectTrue(`A22: a piped payload into a LOCAL shell is unmasked — ${JSON.stringify(c)}`,
+    mask(c).includes("git checkout -- a.txt"), JSON.stringify(mask(c)));
+}
+
+// A23 (#3478 review cycle 3 P2, fail-closed gaps the issue's goal needs closed):
+// a heredoc payload with no payload WORD (`ssh cell <<'EOS'`), and value flags
+// carrying their value (`-p22`, `-L8080:host:80`, `-oK=V`) which used to swallow
+// the HOST and lose the boundary entirely.
+for (const c of [
+  `ssh cell <<'EOS'\ngit worktree add rev\nEOS`,
+  `ssh -p22 cell 'git worktree add x'`,
+  `ssh -L8080:localhost:80 cell 'git worktree add x'`,
+  `ssh -oProxyCommand=x cell 'git worktree add x'`,
+  `ssh -o ProxyCommand=x cell 'git worktree add x'`,
+]) {
+  expectTrue(`A23: a remote payload is recognised — ${JSON.stringify(c)}`,
+    hasGitWord(mask(c)) === false, JSON.stringify(mask(c)));
+}
+// …while a redirect-only ssh form is STILL not a boundary (its write is local).
+expect("A23b: `ssh cell > a.txt` stays unmasked", mask(`ssh cell > a.txt`), `ssh cell > a.txt`);
+
+// A24: a heredoc used as the payload must still present a closeable heredoc — the
+// placeholder is its own body line, never fused onto the terminator.
+{
+  const out = mask(`ssh cell <<'EOS'\ngit worktree add rev\nEOS`);
+  expectTrue("A24: the placeholder replaces the BODY, on its own line",
+    /<<'EOS'\n _remote_payload_\nEOS/.test(out), JSON.stringify(out));
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // Part B — BEHAVIORAL: the real index.ts handler against a hermetic hub
@@ -581,6 +647,33 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("B17: a COMMENT with a quote does not hide the next local line", blocked(b17),
       "allowed — the comment swallowed the newline and the local line with it");
 
+    // B18 (#3478 review cycle 3 P0): the heredoc DELIMITER-LINE tail is LOCAL.
+    // It used to be dropped from the gated string, so these went ALLOWED.
+    const b18a = await real.bash("cmux vm exec cell-a -- sh -s <<'EOS'; git worktree add rev-9999\nbody\nEOS");
+    expectTrue("B18: `… <<'EOS'; git worktree add loc` is REFUSED", blocked(b18a),
+      "allowed — the delimiter-line tail was dropped from the gated string");
+    expectTrue("B18: …by the #1919 arm", reasonOf(b18a).includes("#1919"), reasonOf(b18a).split("\n")[0]);
+    const b18b = await real.bash("cmux vm exec cell-a -- sh -s <<'EOS' > a.txt\nbody\nEOS");
+    expectTrue("B18: `… <<'EOS' > <tracked file>` is REFUSED (a local write)", blocked(b18b),
+      "allowed — the local redirect target was dropped");
+    const b18c = await real.bash("cmux vm exec cell-a -- sh -s <<'EOS'\nbody\nEOS");
+    expectTrue("B18 control: a plain heredoc payload is ALLOWED", !blocked(b18c), `blocked: ${reasonOf(b18c).split("\n")[0]}`);
+
+    // B19 (#3478 review cycle 3 P0): `|&` is a pipe — its target runs LOCALLY.
+    const b19 = await real.bash(`cmux vm exec cell-a -- printf 'git checkout -- a.txt' |& bash -s`);
+    expectTrue("B19: a `|&` payload into a local shell is REFUSED", blocked(b19),
+      "allowed — the `|&` stage head was not recognised");
+
+    // B20 (#3478 review cycle 3 P2): a value flag with an ATTACHED value
+    // (`-p22`, `-L8080:host:80`, `-oK=V`) must not swallow the host — the boundary
+    // was lost entirely and a legitimate remote dispatch stayed refused.
+    const b20 = await real.bash("ssh -p22 cell-a 'git worktree add rev-9999'");
+    expectTrue("B20: `ssh -p22 <host> '<payload>'` is ALLOWED (boundary recognised)", !blocked(b20),
+      `blocked: ${reasonOf(b20).split("\n")[0]}`);
+    const b20h = await real.bash("ssh -p22 cell-a <<'EOS'\ngit worktree add rev-9999\nEOS");
+    expectTrue("B20b: a heredoc payload after an attached-value flag is ALLOWED", !blocked(b20h),
+      `blocked: ${reasonOf(b20h).split("\n")[0]}`);
+
     // ── Part C — mutation evidence ──────────────────────────────────────
     if (process.argv.includes("--mutations")) {
       console.log("\n── Part M: mutation evidence (#3444) ──");
@@ -639,7 +732,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
           // B9 must go RED.
           label: "heredoc terminator swallowed",
           revert: (src) => src.replace(
-            "        out += \"\\n\";\n        if (body.afterTerm > last) { out += s.slice(body.termStart, body.afterTerm); last = body.afterTerm; }",
+            "        if (body.afterTerm > last) { out += s.slice(body.termStart, body.afterTerm); last = body.afterTerm; }",
             "        // MUTANT: terminator swallowed with the body",
           ),
           expectRed: ["B9"],
@@ -708,6 +801,32 @@ if (typeof stripTypeScriptTypes !== "function" ||
             "  // MUTANT: no local-shell pipe bail",
           ),
           maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | bash -s`,
+          check: (out) => !String(out).includes("git checkout"),
+        },
+        {
+          // #3478 review cycle 3 P0: the rest of the heredoc DELIMITER LINE is
+          // LOCAL text and used to be dropped from the gated string. Reverting the
+          // tail emit makes A21 and B18 go RED.
+          label: "heredoc delimiter-line tail dropped",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "        if (nl > last) { out += s.slice(last, nl); last = nl; }   // delimiter-line tail: LOCAL",
+            "        // MUTANT: delimiter-line tail dropped",
+          ),
+          maskProbe: "cmux vm exec cell-a -- sh -s <<'EOS'; git worktree add rev-9999\nbody\nEOS",
+          check: (out) => !String(out).includes("git worktree add rev-9999"),
+        },
+        {
+          // #3478 review cycle 3 P0: a `|&` stage head is `& bash`, which the
+          // allow-list missed. Reverting the `|&` split (back to split on `|`)
+          // makes A22 and B19 go RED.
+          label: "pipe-amp not split",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "    const stages = cmd.split(/\\|&?/);",
+            "    const stages = cmd.split(\"|\");",
+          ),
+          maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' |& bash -s`,
           check: (out) => !String(out).includes("git checkout"),
         },
       ];
