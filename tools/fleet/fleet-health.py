@@ -195,9 +195,10 @@ def lane_census(alive, dead, pi_count, roster_size):
     `pi_count == 0`, NOT `pi_count <= 0` (review cycle 18, finding 4): `None` is not a small number,
     it is a population that WAS NOT READ, and it returns UNRECONCILED immediately above — the same
     `None`/`0` collapse this file exists to keep apart, which the old wording reproduced in prose
-    while the code got it right. Nothing else is silent — in particular a
-    conclusive-with-a-live-lane roster over an UNREADABLE table is UNVERIFIED, not silent (see the
-    arm below).
+    while the code got it right. Nothing else is silent — in particular a conclusive roster that is
+    PARTLY live (`0 < alive < roster_size`) over an UNREADABLE table is UNVERIFIED, not silent (see
+    the arm below); a FULLY-live one is the first arm's exemption, which is why that arm is stated
+    as `>=` and not `==` (review cycle 21).
 
     ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
     table cannot be read, returning None would render that state identically to `pi_count == 0`
