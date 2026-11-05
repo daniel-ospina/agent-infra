@@ -526,37 +526,54 @@ disk_mb_gb() { # <mb>
 
 # disk_worktree_need -> the MB a worktree CREATION must find free. See the derivation block above:
 # the lane's worst case, plus the cell's reserve (4x the dispatch floor).
-# ⛔ THE TWO TERMS ARE DERIVED ONCE, IN `disk_worktree_terms`, AND EVERY CONSUMER READS THEM FROM
+# ⛔ THE THREE TERMS ARE DERIVED ONCE, IN `disk_worktree_terms`, AND EVERY CONSUMER READS THEM FROM
 # THERE (review round 1, P2, MEASURED). The refusal message used to re-derive the reserve as
 # `$(( need - ${DISK_LANE_SELF_MB:-6144} ))` — i.e. it fed the RAW, UNVALIDATED env value into
 # arithmetic. `DISK_LANE_SELF_MB=12x` (or `6G`, or `6144MB`: all plausible operator spellings) then made
 # the REFUSAL ITSELF die with `need - 12x: value too great for base`: rc 1 (not the documented 77), an
 # EMPTY DISK_ADMIT_LINE, and a `--disk-admit` verb exiting 1 outside its own 0/77/64 contract. That is
 # the input class this file says it tolerates, so the validated terms are emitted in ONE place.
-disk_worktree_terms() { # -> "<self> <reserve>", both validated integers
-  local self reserve
+# ⛔ THE SEAM CHARGES max(tree, self), THROUGH THE LIVE ARM'S OWN `disk_lane_need` (review round 5, P2
+# — MEASURED). It used to derive `self + reserve` and ignore `DISK_LANE_TREE_MB` altogether, so a cell
+# that had RAISED the stated tree cost (docs/ops/disk-reaper.md's own remedy for a repo whose python
+# markers do not match) was admitted by this seam at 2,064 MB while `run_agent` refused the same
+# dispatch at 22,000 MB — measured with `DISK_LANE_TREE_MB=20000 DISK_LANE_SELF_MB=64
+# DISK_MIN_FREE_MB=500`. The worktree was therefore materialised and the refusal arrived one step
+# LATE, which is #3395's defect itself, and it made this block's "raise one and the other goes on
+# admitting on the old number" claim false for the tree term. `max(self, tree) >= self`, so routing
+# through `disk_lane_need` can only strengthen the stated worst-case intent, never weaken it, and one
+# function now decides both bounds.
+disk_worktree_terms() { # -> "<tree> <self> <reserve>", all validated integers
+  local tree=0 self reserve
   # ⛔ THE DEFAULTS ARE THE NAMED CONSTANTS / THE ONE RESERVE PROBE, NEVER A COPY (review rounds 2
   # and 3, P2/P3): `disk_lane_costs` (the live arm) and this seam must not carry separate literals —
   # raise one and the other goes on admitting on the old number, which is #3395's defect wearing a
   # constant instead of an ordering. (The grep at review round 3 found the literals still here; the
   # round-2 edit had not landed. It has now, and the seam==live arm asserts it.)
+  # `tree` has NO default here on purpose: this seam does not classify the checkout (no `--repo`, see
+  # `disk_admit`), so an UNSTATED tree term cannot be inferred and contributes nothing on top of
+  # `self`. A stated one is honoured — it is the cell-level number an operator measures.
+  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; fi
   if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; else self="$DISK_LANE_SELF_PY_DEFAULT"; fi
   if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve="$(disk_lane_reserve_default)"; fi
-  printf '%s %s\n' "$self" "$reserve"
-}
-
-disk_worktree_need() { # -> the MB a worktree creation must find free
-  local self reserve
-  self="$(disk_worktree_terms | awk '{print $1}')"
-  reserve="$(disk_worktree_terms | awk '{print $2}')"
-  case "${self:-}" in ''|*[!0-9]*) self="$DISK_LANE_SELF_PY_DEFAULT" ;; esac
-  case "${reserve:-}" in ''|*[!0-9]*) reserve=0 ;; esac
   # ⛔ AN EXPLICIT `0` IS HONOURED, exactly as `disk_lane_costs` honours it (the file's own word: the
   # test seam neutralises the terms in one place, and 0 is a STATED choice). Only an ABSENT/garbled
   # value derives the default, so a typo'd env cannot silently collapse the bound to nothing — while a
   # suite that deliberately zeroes both terms gets a gate that admits, which is what lets it test the
   # worktree lifecycle without depending on this host's free space.
-  printf '%s\n' "$(( self + reserve ))"
+  case "$tree" in ''|*[!0-9]*) tree=0 ;; esac
+  case "$self" in ''|*[!0-9]*) self="$DISK_LANE_SELF_PY_DEFAULT" ;; esac
+  case "$reserve" in ''|*[!0-9]*) reserve=0 ;; esac
+  printf '%s %s %s\n' "$tree" "$self" "$reserve"
+}
+
+disk_worktree_need() { # -> the MB a worktree creation must find free
+  local terms tree self reserve
+  terms="$(disk_worktree_terms)"
+  tree="${terms%% *}"; terms="${terms#* }"
+  self="${terms%% *}"; reserve="${terms#* }"
+  # The live arm's own predicate, so the two seams cannot disagree about the bound (#3395).
+  disk_lane_need "$tree" "$self" "$reserve"
 }
 
 # disk_admit <target-path> [<label>] — THE PRE-START DISK ADMISSION.
@@ -581,40 +598,49 @@ disk_worktree_need() { # -> the MB a worktree creation must find free
 # verbatim by disk-admission.test.sh) and appends the raw figures inside the same parentheses.
 #
 # ⛔ NO `repo` PARAMETER, DELIBERATELY (review round 1, P2 — it was plumbed and unread, which made the
-# "ONE predicate" claim false by ~4x without saying so). This seam charges the lane's WORST CASE
-# (`self`) for ANY checkout, where the live arm classifies the checkout (`python_target`) and charges
-# the marginal `tree` when it can. That divergence is a DECISION, not an oversight: `tree` is true only
-# while a warm shared uv cache holds, and the cache is what gets pruned under pressure — so a seam that
-# admitted on the marginal figure would admit the lane that materialises the whole venv, and at this
-# step nothing has been spent yet (a refusal costs one re-dispatch). It is stated in README §7.2i, and
-# the cost of choosing it is named there too: a box at ~5 GB free refuses a harness lane the live gate
-# would have admitted, until an operator states a smaller worst case with DISK_LANE_SELF_MB.
+# "ONE predicate" claim false by ~4x without saying so). This seam does not CLASSIFY the checkout
+# (`python_target`) to derive a marginal `tree`: at this step the brief's install step is unknown, and
+# `tree` is true only while a warm shared uv cache holds — the cache is exactly what gets pruned under
+# pressure, so a seam that admitted on the marginal figure would admit the lane that materialises the
+# whole venv, and nothing has been spent yet here (a refusal costs one re-dispatch). What it does honour
+# is a `tree` the OPERATOR stated for the cell — through the live arm's own `disk_lane_need`, so the
+# bound is `max(tree, self) + reserve`, the same function `run_agent` decides on (review round 5, P2).
+# It is stated in README §7.2i, and the cost of choosing the worst case is named there too: a box at
+# ~5 GB free refuses a harness lane the live gate would have admitted, until an operator states a
+# smaller worst case with DISK_LANE_SELF_MB.
 disk_admit() { # <target> [<label>]
-  local target="${1:-.}" label="${2:-disk-admit}" free need box self reserve
+  # ⛔ THE READING IS NOT CALLED `free` (review round 5, P1 — MEASURED). `check-portability-traps.sh`
+  # reads a bare word in `local` as a CALL, so `local … free …` was counted as a use of the `free`
+  # command macOS lacks: `spawn-gate.sh free-macos-absent: baseline=0 live=1`, which REDS
+  # check-portability-traps.test.sh's own-tree arm on a false finding. The name was also a shadow of
+  # the command in a file that probes memory elsewhere; `avail` says what it is.
+  local target="${1:-.}" label="${2:-disk-admit}" avail need box terms worst tree self reserve
   DISK_ADMIT_LINE=""
   need="$(disk_worktree_need)"
-  self="$(disk_worktree_terms | awk '{print $1}')"
-  reserve="$(disk_worktree_terms | awk '{print $2}')"
+  terms="$(disk_worktree_terms)"
+  tree="${terms%% *}"; terms="${terms#* }"
+  self="${terms%% *}"; reserve="${terms#* }"
+  worst="$self"; if [ "$tree" -gt "$worst" ]; then worst="$tree"; fi
   box="$(disk_box_id)"
-  free="$(disk_free_mb_target "$target")"
-  if ! disk_readable "$free"; then
+  avail="$(disk_free_mb_target "$target")"
+  if ! disk_readable "$avail"; then
     DISK_ADMIT_LINE="[disk-admit] REFUSED-UNKNOWN $label: free=? need=$(disk_mb_gb "$need") box=$box target=$target — the free-space probe could not answer (no readable \`df\` for that path or its nearest EXISTING ancestor), so the lane's headroom CANNOT be verified. Nothing was created, no worktree, no branch; a PRE-START admission fails CLOSED (an unmeasurable box is not an empty one). Check PATH/'df' on this box, or pass the volume explicitly (agent-infra#3395/#3231)"
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
   fi
   # ⛔ ADMIT ONLY ON A COMPARISON THAT SUCCEEDED (review round 2, P2 — this was the ONE place in this
-  # file that failed OPEN on a reading it could not compare). `[ "$free" -lt "$need" ]` returns 2 when
+  # file that failed OPEN on a reading it could not compare). `[ "$avail" -lt "$need" ]` returns 2 when
   # an all-digit reading exceeds bash's integer range, and the `if` then took the ADMITTED branch:
-  # measured, `free=99999999999999999999` printed `integer expression expected` and let the worktree be
+  # measured, `avail=99999999999999999999` printed `integer expression expected` and let the worktree be
   # created — where every other predicate in this file refuses an uncomparable reading. Written as
-  # `need <= free`, an errored comparison is FALSE, i.e. a refusal.
-  if ! [ "$need" -le "$free" ]; then
-    DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$free"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$free, need_mb=$need) $label: $free MB free on $target < ${need}MB required (one lane's measured worst case ${self}MB + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
+  # `need <= avail`, an errored comparison is FALSE, i.e. a refusal.
+  if ! [ "$need" -le "$avail" ]; then
+    DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$avail"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$avail, need_mb=$need) $label: $avail MB free on $target < ${need}MB required (one lane's worst case ${worst}MB = max(tree ${tree}MB, self ${self}MB) + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
     printf '%s\n' "$DISK_ADMIT_LINE"
     return "$AGENT_DISK_REFUSED"
   fi
   [ "${DISK_ADMIT_VERBOSE:-0}" = 1 ] && printf '[disk-admit] ADMITTED %s: free=%sMB need=%sMB box=%s target=%s\n' \
-    "$label" "$free" "$need" "$box" "$target"
+    "$label" "$avail" "$need" "$box" "$target"
   return 0
 }
 

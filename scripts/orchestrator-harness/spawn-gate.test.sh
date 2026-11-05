@@ -2065,7 +2065,7 @@ done
 ck "the §9 rig carries every module fix-one.sh hard-requires (a rig missing one asserts a HALF-DEPLOYED refusal, not the claim refusal)" $rc
 printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arccb=$?
 [ "$arccb" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports a CROSS-BOX claim refusal as 79 (got $arccb) — not SUCCESS for a run that pushed nothing" $rc

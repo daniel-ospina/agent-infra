@@ -304,10 +304,12 @@ wt_rollback() {
 # ⛔ NOT A SECOND PREDICATE. `disk_admit` is spawn-gate.sh's, and it reads through the same
 # `disk_free_mb` / `disk_readable` / `disk_worktree_terms` / `disk_worktree_need` the live arm's
 # `disk_lane_costs` / `disk_lane_need` are built on; this file only decides WHEN to ask it (before the
-# write) and how to surface the answer (WT_RESULT + rc 4). ⚠️ The two seams do NOT make the same choice
-# of term: the live arm decides on `max(tree, self)` (the marginal cost while the shared cache holds),
-# and this one takes `self` + the cell reserve (the worst case, because at this point the install step
-# the brief will ask for is not known yet). Same functions, different — stated — policy.
+# write) and how to surface the answer (WT_RESULT + rc 4). ⚠️ The two seams feed the same `disk_lane_need`
+# with different TERMS: the live arm CLASSIFIES the checkout and charges the marginal `tree` while the
+# shared cache holds, and this one charges `self` — the stated worst case — plus the cell reserve,
+# because at this point the install step the brief will ask for is not known yet (a `tree` the operator
+# states for the cell is honoured on both sides, which is what keeps the bounds identical, review
+# round 5 P2). Same functions, same bound, different — stated — term.
 #
 # ⛔ THE SOURCE IS LAZY, AND THAT IS MEASURED, NOT STYLISTIC (#1702). spawn-gate.sh derives
 # `_NCPU`/`MAX_LOAD` at SOURCE time from `sysctl`/`nproc`/`getconf`. This file is sourced EARLY by
