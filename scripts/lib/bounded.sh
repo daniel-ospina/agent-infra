@@ -173,10 +173,6 @@ tb_watchdog() {
     local secs="$1"; shift
     local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 jobctl=0 g=0
     TB_BOUND_N=$((TB_BOUND_N + 1))
-    if tb_bound_tmp; then
-        sentinel="$TB_BOUND_TMP/s.$TB_BOUND_N"
-        done_flag="$TB_BOUND_TMP/d.$TB_BOUND_N"
-    fi
     was_m=0; case $- in *m*) was_m=1 ;; esac
     jobctl=0
     set -m 2>/dev/null && jobctl=1
@@ -186,6 +182,19 @@ tb_watchdog() {
     # The redirection restores exactly the behaviour every existing caller had before `set -m` existed.
     "$@" </dev/null &
     pid=$!
+    # ⛔ THE SENTINEL IS NAMED FROM THE COMMAND'S OWN PID, NOT FROM A SHELL COUNTER (review round 4, P2 —
+    # MEASURED). `TB_BOUND_N` lives in the shell, but a CAPTURED bounded call runs this whole function in a
+    # command-substitution SUBSHELL whose increment is discarded — so two concurrent calls in one shell both
+    # minted `s.1`/`d.1`: one call's `done_flag` was visible to the other's timer (which then exited 0 and
+    # SKIPPED ITS SIGKILL, i.e. the bound was defeated) and its `rm -f` could clear the other's flag. Latent
+    # today — no in-tree caller runs two at once — but it is a fail-OPEN shape in the one mechanism every
+    # caller trusts. `$pid` is unique per call in this shell AND across subshells, and costs no fork, which
+    # a `mktemp` per sentinel would (fork economy is credited as a correctness property above). The counter
+    # stays as a record only. It is named here, after the fork, because before it the command has no pid.
+    if tb_bound_tmp; then
+        sentinel="$TB_BOUND_TMP/s.$pid"
+        done_flag="$TB_BOUND_TMP/d.$pid"
+    fi
     # ⛔ JOB CONTROL OFF FOR THIS FORK, ON PURPOSE (see the paragraph above the function): the watchdog must
     # stay in the caller's group to receive the caller's group signal.
     set +m 2>/dev/null
