@@ -122,6 +122,15 @@ case "${LAUNCH_VERIFY_S}" in ''|*[!0-9]*)
 # main carries at a path TCC permits — not a hand-copied mirror, which would be the stale-code trap.
 RAIL_SCRIPT=${RAIL_SCRIPT:-$HOME/rail-hub/scripts/admin-merge.sh}
 RAIL_HUB=$(dirname "$(dirname "$RAIL_SCRIPT")")
+# ── THE REVIEWER STEP'S SEAM (#3489) ───────────────────────────────────────────────────────────────
+# `scripts/review-pr.sh` is the step that PRODUCES an attestation: it spawns a fresh-context reviewer
+# (`KIND=reviewer`), posts the reviewer's findings as a COMMENT, and — only when the reviewer came back
+# clean — records the verdict with `record-review.sh --evidence comment:<id>` bound to the reviewed
+# head. It is taken from the SAME refreshed clone as the rail, for the same measured reason: a path
+# under `~/Documents` is TCC-denied for a launchd job (`Operation not permitted`), and `$RAIL_HUB` is
+# fast-forwarded to origin/main at the top of every pass, so it is what main carries at a permissible
+# path rather than a hand-copied mirror.
+REVIEW_SCRIPT=${REVIEW_SCRIPT:-$RAIL_HUB/scripts/review-pr.sh}
 # ⛔ THE `gh` THIS JOB FINDS MUST BE THE SHIM **AND** EXECUTABLE HERE. `~/.pi/agent/shims/gh` is a symlink into
 # ~/Documents (TCC-denied for launchd), and using the real gh directly would DROP the argv-level admin-merge
 # guard (#984) from the one actor that merges automatically. The rail-hub clone carries scripts/gh-shim/gh at a
@@ -154,6 +163,20 @@ COOLDOWN_S=${COOLDOWN_S:-21600}
 # attestation being re-recorded and for main going green. So: a verdict that can only be changed by a
 # NEW HEAD (CONFLICTED, DRAFT) keeps the long cooldown; every other verdict gets the short one.
 COOLDOWN_TRANSIENT_S=${COOLDOWN_TRANSIENT_S:-900}
+case "${COOLDOWN_TRANSIENT_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: COOLDOWN_TRANSIENT_S='${COOLDOWN_TRANSIENT_S}' is not a positive integer" >> "$LOG"; exit 3;; esac
+# ⛔ A DISPATCHED REVIEW IS NOT A RAILED VERDICT, so it does not take the 15-minute transient retry.
+# `review-pr.sh` is a PAID, multi-minute reviewer process that caps ITSELF at 1800 s and then
+# SIGTERMs (SIGKILL after `REVIEW_PR_KILL_GRACE`, default 15 s). A dispatch that has shown no exit
+# line for 2700 s is therefore certainly not running any more — re-dispatching before that would pay
+# for a SECOND review of the same head while the first is still working. 2700 = 1800 + 900 of margin.
+# This is the SAME head-keyed cooldown the rail path uses (the key is the head, in the state file's
+# name and in its dispatch line); it is a separate window only because a review is a different unit
+# of work from a rail.
+REVIEW_COOLDOWN_S=${REVIEW_COOLDOWN_S:-2700}
+case "${REVIEW_COOLDOWN_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a positive integer — a non-numeric window makes every review-dispatch comparison a syntax error, i.e. no cooldown at all" >> "$LOG"; exit 3;; esac
+[ "$REVIEW_COOLDOWN_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a POSITIVE integer — 0 re-dispatches a paid reviewer every pass over a head that is already being reviewed" >> "$LOG"; exit 3; }
 # ⛔ THE RAIL DIRECTORIES ARE PRECONDITIONS, NOT DECORATION. Every launch writes its verdict into
 # `$RAIL_DIR`, and the cooldown logic READS it; a `mkdir` whose status nobody checks, and a redirect that
 # cannot be opened, both leave the ledger recording "railed" for a rail that never ran — measured cycle 4
@@ -175,6 +198,16 @@ fi
 if [ ! -f "$RAIL_SCRIPT" ]; then
   echo "$(date -u +%FT%TZ) REFUSED: rail not found at $RAIL_SCRIPT — this actuator cannot land anything" >> "$LOG"
   exit 3
+fi
+# ⛔ THE REVIEW SEAM'S ABSENCE IS LOUD BUT NOT FATAL, AND THE DIFFERENCE IS DELIBERATE. A missing RAIL
+# is fatal because nothing can land; a missing REVIEWER is not, because the rail still lands every
+# PR that already carries an attestation. Exiting here would turn a missing capability into a total
+# merge stall — the larger failure. So it is said ONCE at start, in the log an operator reads the pass
+# line in, and the pass then names each PR it could not serve.
+REVIEW_AVAILABLE=1
+if [ ! -f "$REVIEW_SCRIPT" ]; then
+  REVIEW_AVAILABLE=0
+  echo "$(date -u +%FT%TZ) REVIEW-UNAVAILABLE: no reviewer at $REVIEW_SCRIPT — unattested green PRs will stay unattested (the rail path is unaffected)" >> "$LOG"
 fi
 # ⛔ PRs the consolidation pass (aiconsol2, 2026-10-24) flagged as one of a DUPLICATE PAIR whose
 # survivor is not yet decided. Green checks do not make a duplicate safe to merge: the pair exists
@@ -233,7 +266,18 @@ lock_holder_is_live() {  # $1 = lock dir; rc 0 = a LIVE auto-rail holds it (do n
   if [ -n "$pid" ] && ps -p "$pid" -o args= 2>/dev/null | grep -q 'auto-rail[.]sh'; then
     return 0   # a real holder: right pid AND the process is this script
   fi
-  mtime=$(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null)
+  # ⛔ THE DATE MUST BE READ WITH THE FORM THAT WORKS ON THIS PLATFORM, AND THE FALLBACK WAS IN THE
+  # WRONG ORDER (measured 2026-11-05 on a Linux cell, on the base commit — this suite's two "recycled
+  # pid" arms were red there and green on macOS). GNU `stat -f %m` is *"filesystem info, format %m"*: it
+  # prints a whole multi-line filesystem block to STDOUT and exits 1, so the BSD form came FIRST and
+  # SUCCEEDED-ENOUGH to poison the `||` fallback — `mtime` held a block of text plus the real epoch.
+  # The numeric guard below then returned 0 ("cannot date it → assume held") on EVERY Linux box, i.e. the
+  # stale-lock reclaim this function was rewritten for could never fire on a cell: a lock left behind by
+  # a killed pass makes the actuator exit 0 with "another auto-rail holds the lock" for ever — the exact
+  # permanently-dead-with-a-clean-log state the three answers above exist to rule out.
+  # GNU (`-c %Y`) first, BSD (`-f %m`) second: on macOS `stat -c` fails outright, on Linux `stat -c %Y`
+  # is the only form that prints just the epoch. The numeric guard stays as the fail-closed backstop.
+  mtime=$(stat -c %Y "$d" 2>/dev/null || stat -f %m "$d" 2>/dev/null)
   case "${mtime:-}" in ''|*[!0-9]*) return 0;; esac   # cannot date the lock -> assume held
   now=$(date +%s); age=$(( now - mtime ))
   [ "$age" -lt "$LOCK_AGE_GRACE" ]
@@ -517,6 +561,144 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
   forget_tried "$row"
   return 1
 }
+# ── THE REVIEW STEP: THE PRODUCER OF ATTESTATIONS (#3489) ─────────────────────────────────────────
+# ⛔ MEASURED 2026-11-05 on PR #3486 while it sat in exactly this state:
+#     auto-rail.sh  admin-merge refs   = 4
+#     auto-rail.sh  record-review refs = 0
+#     chain-merge for #3486 running    = none
+#     ~/.pi/agent/reviews/3486         = absent
+# — a MERGEABLE PR reading `mergeable=MERGEABLE state=BLOCKED reviewDecision=empty`. `admin-merge` reads
+# a head-bound attestation out of the PR BODY and NOTHING in the unattended loop ever wrote one: the
+# candidate search DROPPED every PR without the marker (`if "review recorded:" not in body: continue`),
+# so "mergeable, no owner" was not merely invisible — it was not a candidate at all. That filter is the
+# root; these are the pieces that replace it.
+#
+# ⛔ THIS ACTUATOR NEVER WRITES A VERDICT. It dispatches `review-pr.sh`, which spawns a fresh-context
+# reviewer and — only on a clean verdict — calls `record-review.sh --evidence comment:<id>` itself. A
+# review record is minted only from a fresh-context reviewer's verified evidence; an actuator that
+# composed verdict text (or that called the recorder on its own reading) would BE the attestation
+# author, which reverses that recorded decision. The reviewer is dispatched by KIND (review-pr.sh sets
+# KIND=reviewer), never by a self-declared exemption flag.
+# ⛔ AND NOT VIA `chain-merge.sh`: its interface is lane-scoped (`<repo-path> <owner/repo> <issue>
+# <branch>`) and it "waits for the lane to open its PR". An orphaned PR has no lane to wait on, which is
+# the entire case here, so the step lives in this loop, keyed to the PR and its head like everything
+# else in this file.
+#
+# ── WHAT A DISPATCHED REVIEW IS DOING, AS ONE DRIVEN FUNCTION ─────────────────────────────────────
+# One file per (repo, pr, HEAD) carries the review's whole life, so a later pass needs no memory:
+#     line 1   REVIEW-DISPATCHED at=<epoch> head=<head> …   written by the PARENT, before the launch
+#     …        the reviewer's own output (review-pr.sh: findings, evidence, refusals)
+#     last     REVIEW-EXIT rc=<n>                          written by the wrapper, ALWAYS
+# The exit line is what makes the outcome durable — an earlier pass cannot learn a background child's
+# status, and `review-pr.sh`'s rc IS the outcome:
+#     0  clean: record written and verified at the reviewed head
+#     5  a clean record already exists at this head (a lost race in the good direction: nothing owed)
+#     7  the reviewer FOUND ISSUES — not recorded, findings posted as the comment
+#     8  the head moved during the review        9  the record/artifact arm failed
+#     75 a spawn-point load refusal (nothing was consumed)
+# ⛔ 7 IS TERMINAL AT THIS HEAD, AND THAT IS THE POINT: re-dispatching a head the reviewer already
+# rejected pays for the SAME verdict again for ever. The fix is a new head, and a new head is a
+# different key (the file is named for the head), so a new head gets a review by construction.
+review_state() {  # $1 = the review's output file; prints none|pending|clean|issues|retry
+  [ -f "$1" ] || { printf 'none\n'; return 0; }
+  local rc
+  rc=$(sed -n 's/^REVIEW-EXIT rc=\([0-9][0-9]*\)$/\1/p' "$1" 2>/dev/null | tail -1)
+  # ⛔ NO EXIT LINE IS *PENDING*, NOT *FAILED*: the child may be mid-review, or may not have reached the
+  # line yet. Reading it as failed is exactly how a live 20-minute review gets a duplicate next pass.
+  [ -n "$rc" ] || { printf 'pending\n'; return 0; }
+  case "$rc" in
+    0|5) printf 'clean\n';;
+    7)   printf 'issues\n';;
+    *)   printf 'retry\n';;
+  esac
+}
+# The dispatch epoch, from the record the PARENT wrote — never the file's mtime, which a reviewer that
+# keeps writing output would keep refreshing and which would therefore never age out.
+review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or nothing
+  sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p' "$1" 2>/dev/null | tail -1
+}
+# ── THE ACTION, IN ONE PLACE ───────────────────────────────────────────────────────────────────────
+# rc 0 = WAIT (a review is already owed at this head), 1 = DISPATCH now, 2 = TERMINAL at this head (a
+# fix or the recorder is owed — never another review). A function, so a test pins the SHIPPED predicate
+# instead of a copy of it: the whole anti-thrash arm IS these ten lines.
+review_action() {  # $1 = state (from review_state), $2 = seconds since dispatch
+  local age=${2:-0}
+  case "${1:-}" in
+    issues|clean) return 2;;
+    # A dispatched review is a WAIT, and it is longer than a rail's: only the reviewer's own exit (or
+    # its own 1800 s cap) can end it, and neither is observable from here while it runs.
+    pending) [ "$age" -lt "$REVIEW_COOLDOWN_S" ] && return 0; return 1;;
+    # It RAN AND LEFT NO VERDICT (or was refused before it started): short retry — a rate-limit window
+    # or a moved head is cheap to retry, and a head that can only change with a fix cools down by KEY
+    # instead (this file is named for the head, so a new head is a different file).
+    retry)   [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0; return 1;;
+    *)       return 1;;
+  esac
+}
+# ── PUBLISHING THE STATE ON THE PR, IDEMPOTENTLY ───────────────────────────────────────────────────
+# ⛔ THIS IS THE PART THAT ACTUALLY KILLS THE DEFECT: `mergeable=MERGEABLE state=BLOCKED
+# reviewDecision=empty` with nothing written on the PR is indistinguishable from "a lane is working on
+# this". The state has to be ON THE PR. Mergify expresses a required review as a queue CONDITION it
+# reports, and the label-based queues keep their state on the PR and resume from it after a crash; the
+# convergent answer is a first-class visible state reconciled by a loop — which this already is.
+# ⛔ A COMMENT, NEVER A BODY EDIT: the body is where the attestation marker lives, and an edit after a
+# record wipes the proof the gate reads (agent-infra#1224). `review-pr.sh` refuses to PATCH a body for
+# the same reason.
+# ⛔ IDEMPOTENCE IS BY KEY, NOT BY HOPE. The hidden tag names the state AND the head, so re-running the
+# loop in the same state adds NOTHING (a second `review-in-flight` marker for one head is a duplicate
+# this cannot emit), while a real transition — in-flight → found-issues — adds exactly one new marker
+# instead of rewriting history. `awaiting-review` carries NO head: it is published where the head is
+# not yet read (a cap deferral), and it says "no owner yet" about the PR, not about a revision.
+publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 = present (or just posted)
+  local repo=$1 pr=$2 state=$3 head=${4:-} tag seen text
+  tag="<!-- auto-rail-review:${state}${head:+:$head} -->"
+  case "$state" in
+    awaiting-review)
+      text="🔎 **auto-rail: review needed.** This PR is mergeable and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot. **It is not waiting on a lane.**";;
+    review-in-flight)
+      text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ). auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
+    review-found-issues)
+      text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
+    *) text="auto-rail: review state \`${state}\`.";;
+  esac
+  # ⛔ A FAILED READ IS NOT "NO MARKER": this script has no `pipefail`, so a `gh` that cannot run would
+  # leave the read empty, which reads as ABSENT and posts a DUPLICATE marker on every pass — the exact
+  # thrash the idempotence requirement forbids, produced by the check that implements it. Read first,
+  # decide second, and refuse to post on an unreadable list.
+  seen=$(gh pr view "$pr" --repo "$repo" --json comments --jq '.comments[].body' 2>/dev/null) \
+    || { log_line "$repo #$pr MARKER-UNREADABLE: could not read the PR's comments to check for an existing review marker — NOT posting (a blind post is a duplicate on every pass)"; return 1; }
+  case "$seen" in *"$tag"*) return 0;; esac
+  gh pr comment "$pr" --repo "$repo" --body "$(printf '%s\n\n%s' "$text" "$tag")" >/dev/null 2>>"$LOG" \
+    || { log_line "$repo #$pr MARKER-FAILED: could not post the review-state marker ($state) — this loop knows the state and GitHub does not"; return 1; }
+  log_line "$repo #$pr review state published on the PR: $state"
+  return 0
+}
+# ── THE WRAPPER THAT MAKES THE OUTCOME DURABLE ────────────────────────────────────────────────────
+# Runs in a background subshell and writes the exit line UNCONDITIONALLY, so a reviewer that dies at
+# once still leaves an outcome rather than a permanent `pending`. Exported (rather than inlined into
+# `nohup bash -c`) so the suite can drive it against a stub reviewer without spawning the loop.
+run_review() {  # $1 = reviewer script, $2 = PR, $3 = repo, $4 = output file
+  bash "$1" "$2" --repo "$3" >> "$4" 2>&1
+  printf 'REVIEW-EXIT rc=%s\n' "$?" >> "$4"
+}
+export -f run_review
+# ── THE DISPATCH, VERIFIED THE SAME WAY `launch_rail` IS ────────────────────────────────────────────
+# `( … ) &` returns 0 whether or not anything ran (measured cycle 4 on this very file for the rail), and
+# a dispatch that never started must be RETRIED next pass, not remembered as in flight for
+# REVIEW_COOLDOWN_S. So the record is removed on proof that nothing started.
+launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file; rc 0 = an attempt started
+  local repo=$1 pr=$2 head=$3 out=$4 pid
+  printf 'REVIEW-DISPATCHED at=%s head=%s repo=%s pr=%s\n' "$(date +%s)" "$head" "$repo" "$pr" > "$out" \
+    || { log_line "$repo #$pr REVIEW-LAUNCH-FAILED: cannot write the review record at $out — nothing was dispatched and no cooldown was consumed"; return 1; }
+  nohup bash -c 'run_review "$@"' _ "$REVIEW_SCRIPT" "$pr" "$repo" "$out" >> "$LOG" 2>&1 &
+  pid=$!
+  log_line "$repo #$pr no attestation at head $head -> dispatching reviewer (KIND=reviewer, $REVIEW_SCRIPT)"
+  sleep "$LAUNCH_VERIFY_S"
+  if kill -0 "$pid" 2>/dev/null || [ "$(wc -l < "$out")" -gt 1 ]; then return 0; fi
+  log_line "$repo #$pr REVIEW-LAUNCH-FAILED — nothing started within ${LAUNCH_VERIFY_S}s (no live child, nothing beyond the dispatch line in $out); the record is removed so this head is retried next pass instead of being reported as in flight for ${REVIEW_COOLDOWN_S}s"
+  rm -f "$out"
+  return 1
+}
 # ⛔ THE FAIL-VISIBLE PATH, AS A FUNCTION (review round 5, measured P1). The candidate search's stdout IS
 # the candidate file, so its diagnostics go to stderr — and unredirected stderr is launchd's
 # StandardErrorPath, the channel this file's own header records as the grave of the original defect
@@ -551,11 +733,11 @@ while :; do
   for repo in $REPOS; do
     _cand=/tmp/auto-rail-cand.$$
     python3 - "$repo" "$RED_CAP" <<'PY' 2>> "$LOG" > "$_cand"
-import json,subprocess,sys
+import json,re,subprocess,sys
 repo=sys.argv[1]
 try:
     r=subprocess.run(["gh","pr","list","--repo",repo,"--state","open","--limit","100",
-        "--json","number,mergeable,isDraft,statusCheckRollup,body"],capture_output=True,text=True)
+        "--json","number,mergeable,isDraft,statusCheckRollup,body,headRefOid"],capture_output=True,text=True)
 except Exception as e:
     # ⛔ THIS IS HOW THE ACTUATOR WAS DEAD FOR DAYS WITHOUT A SYMPTOM (measured 2026-10-30): `gh` exists
     # ONLY at ~/.pi/agent/shims/gh, that directory was missing from this job's PATH, so subprocess raised
@@ -572,14 +754,37 @@ except Exception:
     print("SEARCH-FAILED rc=%s stderr=%s" % (r.returncode, (r.stderr or "").strip().splitlines()[:1]), file=sys.stderr)
     sys.exit(2)
 green=[]; red=[]
+
+# ⛔ THE ONE DEFINITION OF "IS THIS ATTESTED AT THE HEAD THAT WOULD MERGE" (#3489). The old rule was a
+# SUBSTRING (`"review recorded:" in body`), and it was wrong in both directions:
+#   * it dropped a PR with NO marker entirely, which is the defect this change exists for — such a PR
+#     was not "waiting on a lane", it was not a candidate at all, so nothing ever moved; and
+#   * it PASSED a PR whose body merely QUOTES the marker shape (our own PR bodies do), or carries one
+#     for a DIFFERENT PR number, or for an OLDER head — the rail then refuses for "no head-bound
+#     record" and the actuator never learns why.
+# So the marker is parsed the way the GATE names it: `review recorded: reviews/<PR>.json verdict=<v> @
+# <40-hex>` with the repo suffix on the same line. ⛔ WHICH VERDICTS MAY LAND IS THE GATE'S DECISION, NOT
+# THIS ACTUATOR'S: any recorded verdict at this head is `at-head`, because the question asked here is
+# only "does an attestation exist for the head that would merge?" (a non-clean record still names a
+# review that happened, and re-buying a review of the same head is not the remedy for it).
+MARKER_RE = re.compile(r"review recorded: reviews/(\d+)\.json verdict=[a-z][a-z-]* @ ([0-9a-f]{40})")
+
+def attestation(body, head, pr, repo):
+    "at-head | stale | absent | nohead — never an inference from a partial match."
+    if not head:
+        return "nohead"          # no head means nothing can be at it; the reviewer re-reads the head
+    seen = []
+    for line in (body or "").splitlines():
+        if ("(%s)" % repo) not in line:
+            continue                 # the gate binds the repo; a marker naming another repo is not ours
+        for m in MARKER_RE.finditer(line):
+            if m.group(1) == str(pr):
+                seen.append(m.group(2).lower())
+    if head in seen:
+        return "at-head"
+    return "stale" if seen else "absent"
+
 for p in prs:
-    # ⛔ A PR WITHOUT A REVIEW RECORD CANNOT MERGE, so railing it is noise that occupies a MAX slot.
-    # Measured 2026-10-24: three PRs sat at reds=0 with a record and NOBODY railed them (that is what
-    # this script exists for) while many more were red only on `pipeline-compliance (c)` -- no head-bound
-    # record -- and a rail on those refuses in seconds. Requiring the marker makes the candidate set
-    # equal the set of PRs that can actually land, which is the whole point of an actuator.
-    if "review recorded:" not in (p.get("body") or ""):
-        continue
     # A DRAFT CAN NEVER MERGE: the rail refuses it in one line ("PR is a DRAFT").
     if p.get("isDraft"):
         continue
@@ -602,9 +807,18 @@ for p in prs:
     # was strictly stricter than the gate it feeds, which is why 32 PRs sat. Green goes first and
     # red-handed-over rails are CAPPED (RED_CAP) so a burst cannot burn the API budget; the rail still
     # refuses anything whose red is unique to the PR.
-    (green if redn==0 else red).append((redn, p["number"]))
-for _r,n in sorted(green): print(n)
-for _r,n in sorted(red)[:int(sys.argv[2])]: print(n)
+    att = attestation(p.get("body") or "", (p.get("headRefOid") or "").lower(), p["number"], repo)
+    (green if redn==0 else red).append((redn, p["number"], att))
+# ⛔ THE CANDIDATE LINE CARRIES THREE FIELDS — <green|red>\t<PR>\t<att> — and each one has a consumer:
+#   * the KIND is what tells the loop whether a review may be bought at all (a RED head has to change
+#     before an attestation can land it, so buying a review for it is money spent on a dying revision);
+#   * the ATTESTATION is the classification #3489 is about, computed HERE because this is where the
+#     body is already fetched — no second read, and one definition of the predicate (the suite drives
+#     this heredoc directly, so the rule is pinned where it is written).
+for _r,n,a in sorted(green): print("green\t%d\t%s" % (n,a))
+# Attested reds are emitted FIRST so RED_CAP cannot be spent on a red that a review could not help.
+for _r,n,a in sorted(red, key=lambda t: (t[2] != "at-head", t[0], t[1]))[:int(sys.argv[2])]:
+    print("red\t%d\t%s" % (n,a))
 PY
     # ⛔ A FAILED SEARCH IS NOT AN EMPTY QUEUE, AND IT IS SAID OUT LOUD (review round 5, measured P1).
     # `2>> "$LOG"` above is what makes SEARCH-FAILED visible at all — unredirected it went to launchd's
@@ -622,7 +836,7 @@ PY
     # rail nobody can attribute is unknown load, and a report that omits it reads as "none".
     read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
     log_line "$repo pass: candidates=$(wc -l < "$_cand") cand_bytes=$(wc -c < "$_cand" 2>/dev/null || echo MISSING) rails_on_repo=$_own rails_live=$_total unattributed=$_unk max=$MAX max_total=$MAX_TOTAL"
-    while read -r pr; do
+    while IFS=$'\t' read -r _kind pr _att; do
       [ -z "${pr:-}" ] && continue
       if denied "$repo" "$pr"; then log_line "$repo #$pr DENIED — duplicate-pair member or contradictory PR pending a decision"; continue; fi
       # ⛔ THE SAME FAIL-OPEN THIS FILE FORBIDS AT THE COUNTER, one line below it. No `pipefail` here,
@@ -644,7 +858,15 @@ PY
       # another repo's rails can only decide this repo's candidates once the AGGREGATE is reached.
       if candidate_deferred "$repo" $REPOS; then
         read -r _own _total _unk <<< "$(rails_for_repo "$repo" $REPOS)"
-        log_line "$repo #$pr deferred ($_own rails on this repo + $_unk unattributed, $_total live in total, max=$MAX max_total=$MAX_TOTAL)"; continue
+        log_line "$repo #$pr deferred ($_own rails on this repo + $_unk unattributed, $_total live in total, max=$MAX max_total=$MAX_TOTAL)"
+        # ⛔ A CAP DEFERRAL IS EXACTLY WHERE AN UNATTESTED PR GOES INVISIBLE AGAIN, so the state is
+        # published HERE as well: a PR that is mergeable, has no review owner and is waiting on a slot
+        # must not look like a PR waiting on a lane. Keyed on the STATE (no head — the head is read
+        # further down), so this is a no-op on every pass after the first. A RED head is left out: it
+        # cannot be landed by an attestation, its owner is the red arm, and its state is already
+        # visible as a red check.
+        [ "$_kind" = green ] && [ "$_att" != at-head ] && publish_review_state "$repo" "$pr" awaiting-review
+        continue
       fi
       # ⛔ A FAILED HEAD READ IS NOT AN EMPTY HEAD. `gh` failing here used to write the cooldown key
       # with an EMPTY head, which no later pass's real head can ever match — so the same PR was railed
@@ -653,6 +875,44 @@ PY
       head=$(gh pr view "$pr" --repo "$repo" --json headRefOid --jq .headRefOid 2>/dev/null) \
         || { log_line "$repo #$pr HEAD-READ-FAILED: gh rc=$? — skipping this candidate (a cooldown keyed to an empty head would re-rail it every pass)"; continue; }
       [ -n "$head" ] || { log_line "$repo #$pr HEAD-READ-FAILED: gh returned an empty head — skipping this candidate"; continue; }
+      # ⛔ THE ONE DECISION THIS CHANGE ADDS, AND IT IS MADE FROM THE ATTESTATION AT THE HEAD THAT WOULD
+      # MERGE (#3489). `at-head` is today's behaviour, untouched, below. Anything else means no review
+      # owns this PR — so the rail is NOT launched (it would refuse for "no head-bound record" in one
+      # line and consume a slot) and the reviewer step is dispatched instead.
+      if [ "$_att" != at-head ]; then
+        if [ "$_kind" != green ]; then
+          log_line "$repo #$pr AWAITING-REVIEW ($_att) but its checks are RED — no review is bought for a head that has to change; the red arm owns this PR"
+          continue
+        fi
+        if [ "$REVIEW_AVAILABLE" != 1 ]; then
+          log_line "$repo #$pr AWAITING-REVIEW ($_att) and this box has no reviewer at $REVIEW_SCRIPT — the PR stays unattested until one is reachable (said once at start, named here per candidate)"
+          continue
+        fi
+        # One state file per (repo, PR, HEAD): that file IS the head-keyed cooldown for this step, for
+        # the same reason `$TRIED` is for the rail — a verdict that only a new head can change must not
+        # be re-bought every 180 s, and a new head is a different key by construction.
+        _rout="$RAIL_DIR/review-$(printf '%s' "$repo" | tr '/' '-')-$pr-$head.out"
+        _rstate=$(review_state "$_rout")
+        _rdat=$(review_dispatched_at "$_rout")
+        case "${_rdat:-}" in ''|*[!0-9]*) _rage=0;; *) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;; esac
+        review_action "$_rstate" "$_rage"; _ract=$?
+        if [ "$_ract" -eq 0 ]; then
+          log_line "$repo #$pr review $_rstate $(( _rage / 60 ))m ago at $head — waiting, not re-dispatching (a slow review is not a stuck one)"
+          continue
+        fi
+        if [ "$_ract" -eq 2 ]; then
+          if [ "$_rstate" = issues ]; then
+            publish_review_state "$repo" "$pr" review-found-issues "$head"
+            log_line "$repo #$pr REVIEW-FOUND-ISSUES at $head ($_rout) — no attestation was recorded and this head is NOT re-reviewed; it needs a fix, and a new head gets a new review"
+          else
+            log_line "$repo #$pr REVIEW-RECORDED cleanly at $head but the PR body carries no marker this actuator can bind ($_rout) — re-running the recorder is the remedy here, and re-reviewing would not be"
+          fi
+          continue
+        fi
+        publish_review_state "$repo" "$pr" review-in-flight "$head"
+        launch_review "$repo" "$pr" "$head" "$_rout" || continue
+        continue
+      fi
       # The rail writes its verdict into rails/auto-<owner>-<repo>-<pr>.out. Computed ONCE, before the
       # cooldown read AND before the launch, so the file the cooldown judges and the file the launch
       # writes are the same file by construction (they were two separate expressions).

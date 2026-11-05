@@ -494,15 +494,61 @@ grep -q 'SEARCH-FAILED' "$_pydir/err" || bad "the failed search must say SEARCH-
 # candidates=0). Two branches, two exit codes: only the parse branch was pinned by the arm above.
 _pybin=$(command -v python3)
 _nogh=$(mktemp -d)
-PATH="$_nogh:/usr/bin:/bin" "$_pybin" "$_pysrc" daniel-ospina/tortoise 2 2>"$_pydir/err3"; _pyrc3=$?
+# ⛔ A gh-FREE PATH, NOT "a temp dir FIRST". This arm shipped `PATH="$_nogh:/usr/bin:/bin"`, which is
+# a gh-free path on a Mac and NOT one on any box with a system `gh` (every Linux cell here has
+# `/usr/bin/gh`) — there the arm silently exercises the HEALTHY path and then fails its own assertion,
+# i.e. it never tested the branch it is named for (measured on this box, on the base commit). The
+# interpreter is invoked by ABSOLUTE path, so PATH only has to be gh-free to mean what this says.
+PATH="$_nogh" "$_pybin" "$_pysrc" daniel-ospina/tortoise 2 2>"$_pydir/err3"; _pyrc3=$?
 [ "$_pyrc3" -ne 0 ] || bad "a MISSING gh must also exit non-zero (got $_pyrc3) — that is the branch that left the actuator dead for days with a placid log"
 grep -q 'SEARCH-FAILED' "$_pydir/err3" || bad "a missing gh must say SEARCH-FAILED (got: $(cat "$_pydir/err3"))"
 rm -rf "$_nogh"
 # …and the healthy path still produces candidates, so the arm above is not satisfied by "always fails".
-printf '#!/bin/bash\ncat <<JSON\n[{"number": 7, "mergeable": "MERGEABLE", "isDraft": false, "body": "review recorded: r", "statusCheckRollup": [{"name": "ci", "status": "COMPLETED", "conclusion": "SUCCESS"}]}]\nJSON\n' > "$_badbin/gh"; chmod +x "$_badbin/gh"
-PATH="$_badbin:$PATH" python3 "$_pysrc" daniel-ospina/tortoise 2 2>"$_pydir/err2" > "$_pydir/out2"; _pyrc2=$?
-[ "$_pyrc2" -eq 0 ] || bad "a healthy search must exit 0 (got $_pyrc2: $(cat "$_pydir/err2"))"
-grep -qx '7' "$_pydir/out2" || bad "a healthy search must emit the candidate PR number (got: $(cat "$_pydir/out2"))"
+# ⛔ THE FIXTURE NOW CARRIES THE ATTESTATION, BECAUSE THE CANDIDATE LINE DOES (#3489). The line is
+# `<green|red>\t<PR>\t<at-head|stale|absent|nohead>`: the KIND decides whether a review may be bought
+# (a red head has to change first) and the ATTESTATION is the classification this change exists for.
+# The old fixture's body ("review recorded: r") is a substring with no head and no PR number — it was
+# enough for the substring filter, and it is deliberately NOT enough for the parse below.
+H7=1111111111111111111111111111111111111111
+_ghbody() {  # $1 = JSON array; installs it as the stub gh
+  printf '#!/bin/bash\ncat <<JSON\n%s\nJSON\n' "$1" > "$_badbin/gh"; chmod +x "$_badbin/gh"
+}
+_ckline() {  # $1 = the PR's JSON body text; $2 = headRefOid (or '' for absent); $3 = expected line; $4 = why
+  local body=$1 head=$2 want=$3 why=$4 got
+  _ghbody "[{\"number\": 7, \"mergeable\": \"MERGEABLE\", \"isDraft\": false, \"headRefOid\": \"$head\", \"body\": $(printf '%s' "$body" | python3 -c 'import json,sys;print(json.dumps(sys.stdin.read()))'), \"statusCheckRollup\": [{\"name\": \"ci\", \"status\": \"COMPLETED\", \"conclusion\": \"SUCCESS\"}]}]"
+  # ⛔ NO `$( _run_search )` HELPER: a command substitution is a SUBSHELL, so an rc captured inside it
+  # never reaches this arm (measured — `_pyrc2: unbound variable`) and the rc-0 assertion below would be
+  # reading a variable that does not exist, i.e. pinning nothing. Capture in THIS shell.
+  got=$(PATH="$_badbin:$PATH" python3 "$_pysrc" daniel-ospina/tortoise 2 2>"$_pydir/err2"); _pyrc2=$?
+  # The rc-0 arm, kept from the original block: it is what stops the arms below being satisfied by a
+  # search that simply always fails.
+  [ "$_pyrc2" -eq 0 ] || bad "a healthy search must exit 0 (got $_pyrc2: $(cat "$_pydir/err2"))"
+  [ "$got" = "$(printf '%b' "$want")" ] || bad "$why (got: '$got', wanted: '$(printf '%b' "$want")')"
+}
+# STATE 1 — ATTESTED AT HEAD: the rail path, and nothing else, is what this PR is for.
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 diff=$(printf 'a%.0s' $(seq 1 64)) (daniel-ospina/tortoise)" "$H7" 'green\t7\tat-head' \
+  "a clean record AT the current head must classify as at-head (the rail's own precondition)"
+# STATE 2 — STALE: a record for an OLDER head is not an attestation for the head that would merge.
+_ckline "review recorded: reviews/7.json verdict=clean @ 2222222222222222222222222222222222222222 (daniel-ospina/tortoise)" "$H7" 'green\t7\tstale' \
+  "a record bound to an OLDER head must classify as stale, not at-head — 'there is a marker somewhere' is the substring rule this replaces"
+# STATE 3 — ABSENT: ⛔ THE #3489 DEFECT ITSELF. This PR used to be dropped by the search entirely, so it
+# was not 'waiting on a lane' — it was not a candidate, and nothing would ever move it.
+_ckline "no attestation in this body" "$H7" 'green\t7\tabsent' \
+  "a mergeable green PR with NO record must still be a CANDIDATE (this is the PR #3486 shape: it was dropped, and sat for ever)"
+# ⛔ AND THE FALSE PASS THE SUBSTRING RULE PRODUCED: a body that mere QUOTES the marker shape, or carries
+# one for another PR, or names another repo, passed `"review recorded:" in body` and was never reviewed.
+_ckline "Example: review recorded: reviews/99.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "$H7" 'green\t7\tabsent' \
+  "a marker for a DIFFERENT PR number must not read as this PR's attestation (quoting the shape is not a record)"
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 (some-other-org/tortoise)" "$H7" 'green\t7\tabsent' \
+  "a marker naming another REPO must not read as this PR's attestation — the gate binds the repo too"
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "" 'green\t7\tnohead' \
+  "a PR whose head could not be read must not be called at-head (nothing can be at an unknown head)"
+# STATE 3b — RED AND UNATTESTED: emitted (so the loop can SAY why it is not reviewed), and ordered AFTER
+# an attested red so RED_CAP is never spent on a head that a review could not land.
+_ghbody "[{\"number\": 8, \"mergeable\": \"MERGEABLE\", \"isDraft\": false, \"headRefOid\": \"$H7\", \"body\": \"none\", \"statusCheckRollup\": [{\"name\": \"ci\", \"status\": \"COMPLETED\", \"conclusion\": \"FAILURE\"}]}, {\"number\": 9, \"mergeable\": \"MERGEABLE\", \"isDraft\": false, \"headRefOid\": \"$H7\", \"body\": \"review recorded: reviews/9.json verdict=clean @ $H7 (daniel-ospina/tortoise)\", \"statusCheckRollup\": [{\"name\": \"ci\", \"status\": \"COMPLETED\", \"conclusion\": \"FAILURE\"}]}]"
+_redout=$(PATH="$_badbin:$PATH" python3 "$_pysrc" daniel-ospina/tortoise 1 2>"$_pydir/err2")
+[ "$_redout" = "$(printf 'red\t9\tat-head')" ] \
+  || bad "RED_CAP=1 must be spent on the ATTESTED red (#9 \u2014 the rail can land it) and NOT on the unattested #8, which no review could help until its head changes (got: '$_redout')"
 rm -rf "$_pydir" "$_badbin" "$_sutlog"
 
 [ "$fail" = 0 ] && echo "PASS: per-repo accounting launches a starved repo's candidate, identifies repos by owner/name, still bounds one repo, counts unknown load against everyone, and verifies its launches"
