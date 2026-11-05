@@ -106,7 +106,6 @@ const CMUX_CASES = [
   ["A2b", `cmux vm exec --timeout 60 cell-a -- sh -c 'cd /srv/repo && git checkout feat/x'`],
   ["A2c", `cmux vm exec cell-a -- sh -c 'cd /srv/repo && git pull --ff-only && make test'`],
   ["A2d", `cmux vm exec cell-a -- sh -c '\ngit worktree add rev-3168\n'`],
-  ["A2e", `cmux vm exec cell-a -- sh -c 'echo Z2l0IGNv | base64 -d | sh'`],
   ["A2f", `cmux vm exec cell-a -- git worktree add rev-3168`],
   ["A2g", `cmux vm exec cell-a -- sh -s <<'EOS'\ngit worktree add rev-3168\nEOS`],
 ];
@@ -115,6 +114,17 @@ for (const [id, c] of CMUX_CASES) {
   expectTrue(`${id}: the remote payload is masked — ${JSON.stringify(c)}`,
     !hasGitWord(out), JSON.stringify(out));
   expectTrue(`${id}: …and the placeholder marks where it was`, out.includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(out));
+}
+// A2e: an ENCODED payload carries no git word of its own, so only the
+// placeholder/identity-difference half can discriminate here (the non-vacuity is
+// the "the text CHANGED and the git-bearing words after it are gone" pair).
+{
+  const c = `cmux vm exec cell-a -- sh -c 'echo Z2l0IGNv | base64 -d | sh'`;
+  const out = mask(c);
+  expectTrue("A2e: a base64 payload is masked (placeholder inserted)", out.includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(out));
+  expectTrue("A2e: …the transformed text is not the input", out !== c, JSON.stringify(out));
+  const c2 = `cmux vm exec cell-a -- sh -c 'echo Z2l0IGNv | base64 -d | sh' && git worktree add loc`;
+  expectTrue("A2e: …and a LOCAL command after it survives", mask(c2).includes("git worktree add loc"), JSON.stringify(mask(c2)));
 }
 expect("A2h: the placeholder is an inert word (no git verb in it)", hasGitWord(REMOTE_PAYLOAD_PLACEHOLDER), false);
 
@@ -234,13 +244,94 @@ expectTrue("A10c: a path-qualified head in a compound is not masked",
   mask(`git status && /usr/bin/ssh cell-a git worktree add x`).includes("git worktree add x"),
   JSON.stringify(mask(`git status && /usr/bin/ssh cell-a git worktree add x`)));
 
+// A11 (#3478 review P0): an UNQUOTED backtick region runs in THIS shell. The
+// opening token used to be kept while the rest of the region was masked, so
+// `` `git reset --hard` `` inside a remote command lost its verb and the LOCAL
+// reset was allowed. The WHOLE region must survive.
+for (const c of [
+  `cmux vm exec cell-a -- \`git reset --hard\``,
+  `cmux vm exec cell-a -- echo \`git reset --hard\``,
+  `ssh cell-a \`git reset --hard\``,
+  // A DOUBLE-quoted backtick region is a local execution too (double quotes do
+  // not stop substitution) — it must survive with the token that holds it.
+  `cmux vm exec cell-a -- sh -c "echo \`git reset --hard\`"`,
+]) {
+  const out = mask(c);
+  expectTrue(`A11: a LOCAL backtick region survives — ${JSON.stringify(c)}`,
+    out.includes("git reset --hard"), JSON.stringify(out));
+}
+// …while a backtick region in the REMOTE script (single quotes) is masked with it.
+for (const c of [
+  `cmux vm exec cell-a -- sh -c 'echo \`git reset --hard\`'`,
+  `cmux vm exec cell-a -- sh -s <<'EOS'\necho \`git reset --hard\`\nEOS`,
+]) {
+  expectTrue(`A11b: a remote backtick region is masked — ${JSON.stringify(c)}`,
+    !hasGitWord(mask(c)), JSON.stringify(mask(c)));
+}
+
+// A12 (#3478 review P0): a REDIRECT in the operand position is the LOCAL shell's
+// write — `ssh cell-a > a.txt` truncates a LOCAL file and hands ssh no command at
+// all. The operand walk used to read the redirect's TARGET as the payload and
+// mask it, hiding a tracked-hub write.
+for (const c of [`ssh cell-a > a.txt`, `docker exec b > a.txt`, `cmux vm exec cell-a -- > a.txt`]) {
+  expect(`A12: a redirect-only remote form is NOT masked (its target is local) — ${JSON.stringify(c)}`, mask(c), c);
+}
+
+// A13 (#3478 review P1): a TRAILING separator is the last token, and the walk
+// dereferenced the token after it — a TypeError that escaped the hook and aborted
+// the whole bash call (no guard message at all). Every shape must return a string.
+const TRAILING = [
+  `cmux vm exec cell-a -- ls\n`,
+  `cmux vm exec cell-a -- sh -s <<'EOS'\nls\nEOS\n`,
+  `ssh cell-a 'ls' &`,
+  `cmux vm exec cell-a -- ls ;`,
+  `cmux vm exec cell-a -- ls |`,
+  `docker exec b ls &&`,
+];
+for (const c of TRAILING) {
+  let threw = null;
+  let out = null;
+  try { out = mask(c); } catch (e) { threw = String(e && e.message); }
+  expectTrue(`A13: a trailing separator does not throw — ${JSON.stringify(c)}`, threw === null, threw ?? "");
+  expectTrue(`A13: …and the payload is still masked — ${JSON.stringify(c)}`,
+    typeof out === "string" && out.includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(out));
+}
+
+// A14 (#3478 review P2): an INDENTED terminator does NOT close a plain `<<`
+// heredoc, so everything after it is still BODY (the shell would warn and read the
+// rest as the body) — masking it all is correct, and stopping at the indented line
+// would expose remote script text as local commands. `<<-` DOES strip leading tabs.
+{
+  const c = `cmux vm exec cell-a -- sh -s <<'EOS'\nls\n  EOS\ngit worktree add after`;
+  expectTrue("A14: an indented terminator does not end a plain `<<` heredoc",
+    !hasGitWord(mask(c)), JSON.stringify(mask(c)));
+  const c2 = `cmux vm exec cell-a -- sh -s <<-'EOS'\nls\n\tEOS\ngit worktree add after`;
+  expectTrue("A14b: an indented terminator DOES end a `<<-` heredoc",
+    mask(c2).includes("git worktree add after"), JSON.stringify(mask(c2)));
+}
+
+// A15 (#3478 review P2): two heredocs on ONE line make the body order depend on
+// source position, not token order — unprovable, so the command is left gated.
+{
+  const c = `cmux vm exec cell-a -- sh -s <<'A' <<'B'\nx\nA\ny\nB`;
+  expect("A15: two heredocs on one line → NOT masked (fail-closed)", mask(c), c);
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part B — BEHAVIORAL: the real index.ts handler against a hermetic hub
 // ─────────────────────────────────────────────────────────────────────────
 if (typeof stripTypeScriptTypes !== "function" ||
     (typeof register !== "function" && typeof registerHooks !== "function")) {
-  skipped("Part B/C/M: real index.ts load",
-    `node ${process.versions.node} lacks module.stripTypeScriptTypes (needs Node >= 22.13)`);
+  // The mutation leg is EVIDENCE: if the loader is unavailable it cannot run, and
+  // a green exit would claim proof it never produced. Fail closed there; the
+  // plain leg keeps the suite's Part-A coverage and reports the skip.
+  if (process.argv.includes("--mutations")) {
+    expectTrue("M: the mutation leg REQUIRES the real index.ts loader", false,
+      `node ${process.versions.node} lacks module.stripTypeScriptTypes (needs Node >= 22.13)`);
+  } else {
+    skipped("Part B/C/M: real index.ts load",
+      `node ${process.versions.node} lacks module.stripTypeScriptTypes (needs Node >= 22.13)`);
+  }
 } else {
   const hooks = await import(new URL("./module-load-hooks.mjs", import.meta.url).href);
   if (typeof registerHooks === "function") registerHooks({ resolve: hooks.resolve, load: hooks.load });
@@ -387,6 +478,31 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("B12: a WRAPPED remote head (`sudo cmux …`) is not exempted (fail-closed residual)",
       blocked(residual), "allowed — the residual must not silently widen");
 
+    // B13 (#3478 review P0): a LOCAL backtick substitution inside a remote
+    // command RUNS HERE. It must still be refused — the pre-fix guard refused it
+    // (measured), and a mask that keeps only the opening token turns it into an
+    // allow.
+    const b13 = await real.bash("cmux vm exec cell-a -- `git reset --hard`");
+    expectTrue("B13: a local BACKTICK region inside a remote command is still REFUSED",
+      blocked(b13), "allowed — a local substitution was masked away");
+
+    // B14 (#3478 review P0): `ssh <host> > <file>` truncates a LOCAL file and
+    // hands ssh no command. The redirect target must stay visible to the
+    // tracked-write gate.
+    const b14 = await real.bash("ssh cell-a > a.txt");
+    expectTrue("B14: `ssh <host> > <tracked hub file>` is still REFUSED (a local write)",
+      blocked(b14), "allowed — the redirect target was masked as remote payload");
+    expectTrue("B14: …by the tracked-write gate", reasonOf(b14).includes("tracked file"), reasonOf(b14).split("\n")[0]);
+
+    // B15 (#3478 review P1): a TRAILING separator must not throw. A thrown guard
+    // aborts the whole bash call with an internal error instead of a message, so
+    // assert the handler RESOLVES and the remote form is allowed.
+    let b15threw = null;
+    let b15 = null;
+    try { b15 = await real.bash("cmux vm exec cell-a -- ls\n"); } catch (e) { b15threw = String(e && e.message); }
+    expectTrue("B15: a trailing newline does not throw in the handler", b15threw === null, b15threw ?? "");
+    expectTrue("B15: …and the remote command is ALLOWED", !blocked(b15), `blocked: ${reasonOf(b15).split("\n")[0]}`);
+
     // ── Part C — mutation evidence ──────────────────────────────────────
     if (process.argv.includes("--mutations")) {
       console.log("\n── Part M: mutation evidence (#3444) ──");
@@ -452,6 +568,24 @@ if (typeof stripTypeScriptTypes !== "function" ||
           check: (r) => !blocked(r),
           probe: (p) => p.remote,
         },
+        {
+          // #3478 review P0: the unquoted-backtick region is one LOCAL token. The
+          // revert keeps only the opening token (the shipped defect), so the pin
+          // that requires the region to survive must go RED. Asserted at the MASK
+          // level, because that is the unit the revert changes.
+          label: "unquoted backtick region split",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "      // #3444 review (#3478 P0): an UNQUOTED backtick region is ONE word. Taking\n" +
+            "      // only the opening token let the region's remaining words fall into the\n" +
+            "      // mask, and `` `git reset --hard` `` is executed by THIS shell.\n" +
+            "      if (c === \"`\") { localSubst = true; i = _rbBacktickRegionEnd(s, i); text = s.slice(start, i); continue; }",
+            "      // MUTANT: only the opening backtick token is kept\n" +
+            "      if (c === \"`\") { localSubst = true; text += c; i++; continue; }",
+          ),
+          maskProbe: "cmux vm exec cell-a -- `git reset --hard`",
+          check: (out) => !String(out).includes("git reset --hard"),
+        },
       ];
 
       // The pins must be LIVE on the unmutated module first — a mutation whose
@@ -469,6 +603,17 @@ if (typeof stripTypeScriptTypes !== "function" ||
         expectTrue(`M: the ${mut.label} defect was actually reintroduced (anchor applied)`, built.applied,
           "textual revert did not apply — a stale anchor proves nothing");
         try {
+          if (mut.kind === "mask") {
+            // MASK-level mutant: import the MUTATED classifier directly and show
+            // the pin's own predicate flips.
+            const mutated = await import(pathToFileURL(join(built.root, "extensions", "main-worktree-guard", "classify-git.mjs")).href);
+            const out = mutated.maskRemoteExecPayloads(mut.maskProbe);
+            expectTrue(`M: under ${mut.label}, the pin goes RED (so the pin CAN fail)`, mut.check(out), `masked to ${JSON.stringify(out)}`);
+            // …and the UNMUTATED module must satisfy it, or the pin asserts nothing.
+            const realOut = mask(mut.maskProbe);
+            expectTrue(`M0: the mask pin is GREEN on the unmutated module (${mut.label})`, !mut.check(realOut), JSON.stringify(realOut));
+            continue;
+          }
           const g = await loadGuard(built.index, hub);
           expect("M: the mutant copy loads without a degradation warning", g.degradation.length, 0);
           for (const id of mut.expectRed) {

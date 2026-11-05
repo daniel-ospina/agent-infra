@@ -1393,18 +1393,26 @@ guard is relaxed by a byte unless a boundary is really present.
   the mask ends at the first top-level separator;
 - a LOCAL segment **before** it (`git worktree add lead && cmux vm exec …`);
 - a REDIRECTION and its target (`cmux vm exec … > a.txt`), because redirecting a
-  remote command's stdout is a LOCAL file write;
-- a substitution that RUNS LOCALLY — an unquoted or double-quoted `$(…)` /
-  backtick inside a remote command executes in THIS shell, so that token is never
-  masked (a single-quoted one runs remotely and is);
+  remote command's stdout is a LOCAL file write — and the same holds for a
+  redirect in the OPERAND position (`ssh cell-a > a.txt` truncates a local file
+  and hands ssh no command at all), so such a form is not a boundary;
+- a substitution that RUNS LOCALLY: an unquoted or double-quoted backtick region
+  is ONE local token (the whole region is kept, not just the opening one), an
+  unquoted or double-quoted `$(…)` is kept with its token, and a single-quoted
+  spelling is masked with the rest of the payload because it runs remotely;
 - a heredoc's TERMINATOR line, which is structure rather than payload: masking it
   fused the delimiter onto the terminator (`<<'EOS'EOS`), no downstream parser
   could close the heredoc, and the next LOCAL command read as body data — a
-  fail-open found by this suite while the fix was being written;
+  fail-open found by this suite while the fix was being written. Plain `<<`
+  requires the terminator at column 0 (an INDENTED terminator does not close it,
+  so the rest stays body and stays masked); `<<-` ignores leading tabs;
 - wrapper heads we do not model (`sudo cmux …`, `env K=V cmux …`, a
   `bash -c '…'` payload that hides the head): these stay GATED (fail-closed
   residual), because a boundary recogniser that guessed would relax a local guard
-  for a command it had not actually resolved.
+  for a command it had not actually resolved. Two further unprovable shapes bail
+  out to today's gating rather than guess: TWO heredocs on one command line (the
+  body order is source-positional, not token-order) and a redirect-only remote
+  form (`ssh <host> 2>/dev/null cmd`).
 
 **Scope note, measured rather than assumed.** The issue also reports a BASE64
 payload piped to a remote shell. At this head that spelling alone is not refused
@@ -1415,8 +1423,14 @@ to a shell whose text is visible. Encoded payloads are covered on the mask side:
 opaque content is masked with the rest of the payload either way.
 
 **Tests.** `test-remote-context.mjs` (below) pins both directions for each case
-and carries three mutants that MUST redden it: the pre-fix identity mask, an
-over-reaching mask that ignores separators, and the swallowed heredoc terminator.
+and carries four mutants that MUST redden it: the pre-fix identity mask, an
+over-reaching mask that ignores separators, the swallowed heredoc terminator, and
+a mask that keeps only the opening token of an unquoted backtick region.
+
+**Known cosmetic residual.** The placeholder `_remote_payload_` is an ordinary
+word, so the tracked-write probe may `git ls-files` it (one stderr line, benign).
+A repo that really tracked a file with that name would have that path probed
+instead — no gate decision depends on it.
 
 ## Hub-WIP hygiene warnings — put WIP in a worktree (#350) + #437 tracked-write gate
 
@@ -2075,7 +2089,7 @@ marker fixes **guard-blocked** sessions only.
 | `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
 | `test-command-position.mjs` | `node extensions/main-worktree-guard/test-command-position.mjs` | **command POSITION for the `git` token (#1158)** — the highest-leverage false positive in the stack: an OPERAND `git` (`command -v git >/dev/null 2>&1 || exit 1`) started a phantom invocation whose "verb" was the next shell operator, so the canonical defensive idiom refused the whole script (`check-deployed-drift.sh`, `harness-refresh.sh`). Part A pins the predicate (operand shapes ALLOW; command-position, newline/`then`/pipe/`!`/subshell/case separators, path-qualified invocations, process substitution, and **every wrapper word in `SPAWNER_WORDS` — one fixture each** — still REFUSE); Part B the script-content verdict; Part C the REAL `tool_call` handler against a hermetic MAIN checkout (the idiom ALLOWED, the idiom beside a real destructive invocation STILL BLOCKED, `git status --porcelain` ALLOWED); Part D **measured pins of five KNOWN-FALSE shapes deliberately left unfixed** (`bash -n` noexec, a leading `~`, `<<<` whole-file co-occurrence, `join(" ")` prose rejoin, quoted `\|` alternation) each with a control, so the next lane inherits a map rather than a surprise |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
-| `test-remote-context.mjs` | `node extensions/main-worktree-guard/test-remote-context.mjs` (mutation leg: `… --mutations`) | **the REMOTE-EXEC boundary (#3444)** — Part A pins `maskRemoteExecPayloads` (identity for every non-remote command; `cmux vm exec`/`ssh`/`docker exec` payloads masked including multi-line, heredoc, base64 and direct-argv spellings; LOCAL text after/before the boundary, redirect targets and locally-executed substitutions preserved; heredoc terminator kept on its own line; wrapper heads NOT masked). Part B drives the REAL `index.ts` handler against a hermetic hub and pins BOTH directions of every measured refusal — the remote form ALLOWED and the SAME command run locally still REFUSED by the guard that owns it (#1919 for `git worktree add`, #1484/M3 for `git checkout`, #1144 for a compound `git pull`, #709 for a piped payload, plus the `ssh` bare-argv and `docker exec` spellings) — on a clean AND a dirty hub, with the local-redirect / trailing-local / heredoc-then-local safety pins. Part M (`--mutations`, its own CI step) rebuilds a TEMP copy of the extension and requires three mutants — the pre-fix identity mask, an over-reaching mask that ignores top-level separators, and the swallowed heredoc terminator — to redden exactly the pins they revert |
+| `test-remote-context.mjs` | `node extensions/main-worktree-guard/test-remote-context.mjs` (mutation leg: `… --mutations`) | **the REMOTE-EXEC boundary (#3444)** — Part A pins `maskRemoteExecPayloads` (identity for every non-remote command; `cmux vm exec`/`ssh`/`docker exec` payloads masked including multi-line, heredoc, base64 and direct-argv spellings; LOCAL text after/before the boundary, redirect targets — including a redirect in the OPERAND position — locally-executed substitutions and whole backtick regions preserved; heredoc terminator kept on its own line with `<<`/`<<-` semantics; wrapper heads, path-qualified/quoted heads, redefined transports and two-heredoc lines NOT masked; a trailing separator does not throw). Part B drives the REAL `index.ts` handler against a hermetic hub and pins BOTH directions of every measured refusal — the remote form ALLOWED and the SAME command run locally still REFUSED by the guard that owns it (#1919 for `git worktree add`, #1484/M3 for `git checkout`, #1144 for a compound `git pull`, #709 for a piped payload, plus the `ssh` bare-argv and `docker exec` spellings) — on a clean AND a dirty hub, with the local-redirect / local-backtick / trailing-local / heredoc-then-local safety pins. Part M (`--mutations`, its own CI step, which FAILS rather than skips if the real-module loader is unavailable) rebuilds a TEMP copy of the extension and requires four mutants — the pre-fix identity mask, an over-reaching mask that ignores top-level separators, the swallowed heredoc terminator, and a split backtick region — to redden exactly the pins they revert |
 | `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout NOT exempt — allowed on a pristine fixture and BLOCKED while a candidate checkout carries tracked dirt; a linked-worktree copy still gated; set-scoped so a direct discard in the same command is still blocked; a wrapper that SOURCES the helper still blocked; a `-c` payload naming the helper still blocked; a **quoted** path piped into a shell walked like the unquoted spelling, the two NEGATIVE pipe cases — an unquoted word pair must not invent a joined seed, a quoted word with a space must not be over-split — and an eight-row pipeline-seed **shell-fidelity** table over single quotes, escaped spaces, a backslash inside single quotes, an apostrophe inside double quotes and an escaped quote inside double quotes; the unclean-vs-unresolvable message split, a cause-neutral fail-closed headline, the absolute-path remedy being itself allowed, a discard aimed at a non-checkout target allowed, and a null-anchor/guard-without-`scripts/` case where the inert exemption leaves the discard GATED — a BLOCK with the `#709` reason, driven from a hermetic DIRTY cwd so the assertion cannot depend on the runner's own checkout), the #1060 state predicate for `git show <rev>:<path> > <target>` (Part D: the X4 self-overwrite BLOCKED from both hub-rooted and worktree-rooted sessions and ALLOWED on a pristine hub; the redirect target named rather than the source; bare reads — including a `$var` source — and `/dev/null` allowed; untracked-only dirt allowed; the declared outside-checkout fail-closed cost on a dirty tree; the #940 four-shape matrix on a pristine vs a tracked-dirty hub; M4 no longer shadowing M5 on a disordered hub; and the negative controls), #1125 (the read-only `scripts/stale-main-triage.sh` RUNS on the dirty hub it diagnoses; a `for`-loop `git cat-file -e` existence probe with no write surface is allowed; and the negative controls — a `$f`-to-`$f` redirect hint, a resolvable hint landing on its own path, and the M4 block naming the disordered checkout + `dirty: N path(s)` on BOTH the bash and write/edit routes), and both escape hatches |
 
 `test-discard-gate.mjs` also takes `--mutations` (#2161): it reintroduces the
