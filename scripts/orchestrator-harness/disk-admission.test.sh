@@ -261,6 +261,19 @@ LIVE_T="$( env DISK_MIN_FREE_MB=500 DISK_LANE_TREE_MB=20000 DISK_LANE_SELF_MB=64
 { [ "$SEAM_T" = "$LIVE_T" ] && [ "$SEAM_T" = 22000 ]; }; rc=$?
 ck "the seam equals the live arm under a RAISED DISK_LANE_TREE_MB (seam=$SEAM_T, live=$LIVE_T, want 22000) — a tree-blind seam answers 2064, which admits the lane run_agent then refuses" $rc
 
+# ⛔ …AND IT MUST NOT GO BELOW THE LIVE ARM WHEN THE OPERATOR LOWERS `self` INSTEAD (review round 6,
+# P2 — MEASURED). The arms above and below both survive a seam whose `tree` defaults to 0, because
+# `self` (6,144) dominates 0 AND dominates the classifier's 350. Lower `self` — which is exactly what
+# `disk_admit`'s own refusal text recommends for a box whose lanes are measured cheaper — and a
+# 0-defaulted seam falls BELOW the live arm: measured `DISK_LANE_SELF_MB=64`, tree unstated, python
+# target -> seam 2,064 (`terms="0 64 2000"`) vs live 2,350 (`350 64 2000`). 2,064–2,349 MB free then
+# ADMITS a worktree `run_agent` refuses, i.e. #3395 once more. So `tree` defaults to the classifier's
+# PYTHON constant (350, the larger of 350/64), which cannot lower the seam and keeps 8,144 shipped.
+SEAM_LOW="$( env DISK_MIN_FREE_MB=500 DISK_LANE_SELF_MB=64 bash -c '. "$1"; disk_worktree_need' _ "$GATE" )"
+LIVE_LOW="$( env DISK_MIN_FREE_MB=500 DISK_LANE_SELF_MB=64 bash -c '. "$1"; set -- $(disk_lane_costs "$2"); disk_lane_need "$1" "$2" "$3"' _ "$GATE" "$T/pytarget" )"
+{ [ "$SEAM_LOW" -ge "$LIVE_LOW" ] && [ "$LIVE_LOW" = 2350 ]; }; rc=$?
+ck "the seam is never BELOW the live arm when DISK_LANE_SELF_MB is lowered (seam=$SEAM_LOW, live=$LIVE_LOW, want live 2350) — a seam defaulting tree to 0 answers 2064 here and admits what run_agent refuses" $rc
+
 # ⛔ AN ALL-DIGIT READING BEYOND THE COMPARISON'S RANGE MUST REFUSE (review round 2, P2). The first
 # version compared `free -lt need`, so an ERRORED comparison (rc 2) read as "not below" and ADMITTED.
 OVR="$( env DISK_MIN_FREE_MB=500 bash -c '
@@ -284,6 +297,12 @@ GVOUT="$( env PATH="$T/bin-ok:$PATH" FAKE_DF_AVAIL_MB=3584 DISK_BOX=cell-3 DISK_
           DISK_LANE_SELF_MB=6G bash "$GATE" --disk-admit "$REPO" )"; gvrc=$?
 { [ "$gvrc" = 77 ] && case "$GVOUT" in *'need_mb=8144'*) true ;; *) false ;; esac; }; rc=$?
 ck "…and the verb still honours its own contract (77, need_mb=8144 for a garbled '6G'), not 1 (rc=$gvrc)" $rc
+# ⛔ THE LINE'S ARITHMETIC MUST BE THE ARITHMETIC IT COMPUTED (review round 6, P2 — MEASURED). It used
+# to read `worst case ${worst}MB = max(tree, self) + reserve` with `worst` = max(tree, self) alone, an
+# equation false by the reserve on every refusal — on the line an operator is meant to re-derive the
+# number from. Pinned VERBATIM at the shipped defaults (350/6,144/2,000 -> 8,144).
+case "$GVOUT" in *'need 8144MB = max(tree 350MB, self 6144MB) + reserve 2000MB'*) rc=0 ;; *) rc=1 ;; esac
+ck "…and the refusal states the arithmetic it actually computed (need = max(tree, self) + reserve) — $(printf '%s' "$GVOUT" | grep -o 'need [0-9]*MB = max(tree [0-9]*MB, self [0-9]*MB) + reserve [0-9]*MB' | head -1)" $rc
 
 # ── G) A MISSING GATE IS A REFUSAL, NOT A SKIP (version skew, the #2033 rule applied to disk) ───
 echo
@@ -376,8 +395,14 @@ esac
 # drift in ungated and the census still reads green — the corpus-drift failure this repo already
 # guards by asserting populations as equalities (`spawn-gate.test.sh`'s pi-invoker equality,
 # `wt-lifecycle.test.sh` L9). The population is DERIVED from the source, so a new caller reds HERE.
+  # ⛔ NO `xargs -r`: it is a GNU EXTENSION with no macOS spelling, so this arm — the census of the
+  # `wt_provision` callers — died on the fleet's Darwin boxes with `illegal option -- r`, captured an
+  # EMPTY population and reported "population DRIFTED (found: '')" against an unmodified tree (review
+  # round 6, P2). That is the test-of-the-HOST class this PR fixes for `df` in three other suites,
+  # reintroduced as a test of the PLATFORM. The `grep -v` guarantees a non-empty stream on a real tree,
+  # and on an empty one `xargs` runs nothing either way — the `-r` bought nothing.
 _census_pop="$(grep -rlE '^[[:space:]]*(if[[:space:]]+)?wt_provision[[:space:]]' --include='*.sh' "$HERE" \
-  | grep -v '\.test\.sh$' | xargs -r -n1 basename | sort | tr '\n' ' ')"
+  | grep -v '\.test\.sh$' | xargs -n1 basename | sort | tr '\n' ' ')"
 _census_want='adopt-fix.sh dispatch-merge.sh fix-one.sh '
 if [ "$_census_pop" = "$_census_want" ]; then
   ok "H) the wt_provision caller population is EXACTLY the censused set (${_census_want% })"
