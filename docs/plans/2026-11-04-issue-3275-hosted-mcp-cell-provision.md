@@ -105,7 +105,7 @@ bash pi-bootstrap/tests/test-cell-install.sh        → 297 ok arms, FAIL: 0 (Li
                                                       on macOS: 3 FAIL in the gh-shim arms (the `/var` →
                                                       `/private/var` comparison — a symlink artifact,
                                                       identical at base, declared not chased)
-bash tests/tortoise-graph-client/run.sh             → 23 arms, green (hermetic stub of the served surface)
+bash tests/tortoise-graph-client/run.sh             → `OK: 25 arms — …` (green; hermetic stub of the served surface)
 bash pi-bootstrap/tests/test-farm-unfarm.sh         → green (graph_srcs declared, unfarm clean)
 bash -n over every shipped script                   → clean (bash 3.2 parse gate is CI-enforced)
 ```
