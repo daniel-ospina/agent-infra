@@ -6023,10 +6023,27 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
     "20.10 …but a SIGNED not-clean marker whose note contains ' sig=' IS still published (the fix must not over-block)"
 
 # ── 20.11 THE OTHER FAIL-CLOSED ARM: AN UNCOMPUTABLE HMAC IS NOT A MATCH ──────
-# (#3168 self-review, round 5.) `post_marker_comment` has TWO refusals past the
-# ` sig=` shape guard: the HMAC must COMPUTE (`[ -n "$_mexp" ] || return 0`, :1247)
-# and it must MATCH (`[ "$_mexp" != "$_msig" ]`, :1248). 20.10 pins the second.
-# The FIRST was pinned by NOTHING: the one-line mutant
+# (#3168 self-review, round 5.) `post_marker_comment` has FOUR refusals past the
+# ` sig=` shape guard, and the honest inventory of what pins each one is the point
+# of this block. An earlier draft of it said "20.10 pins the second" — the MATCH
+# arm. It does NOT; see 20.12:
+#   :1229  `_msig` is not 64 hex                 → UNPINNED, and safely so: it only
+#           short-circuits a comparison that `:1245`/`:1248` then refuse anyway, so
+#           a regression here changes WHICH loud line prints, never whether a
+#           comment is posted. Declared rather than faked with a source-text pin.
+#   :1245  no key resolved                        → pinned by 20.13 (mutant: deleting
+#           the line published an empty-key-signed marker permanently).
+#   :1247  the HMAC could not be COMPUTED         → pinned by 20.11 (below).
+#   :1248  the HMAC did not MATCH                 → pinned by 20.12 (below).
+# 20.10 is NOT the match-arm pin: its 0-post vector runs with NO KEY, so it is
+# refused at `:1245` before the comparison ever executes. MEASURED at the head this
+# block was written on (throw-away worktree, shared checkout untouched): with
+# `if [ "$_mexp" != "$_msig" ]; then` → `if false; then`, the whole suite stayed at
+# PASS=1040 FAIL=0 while the channel PERMANENTLY published a foreign-key-signed
+# marker. Nothing else in the suite observes that arm either: 11.14k REACHES it (a
+# forged `sig=` on the `--recover-body` path) but asserts only the record mint, never
+# the comment channel.
+# The `:1247` arm: the one-line mutant
 # `[ -n "$_mexp" ] || return 0` → `[ -n "$_mexp" ] || _mexp="$_msig"` — i.e.
 # "if openssl produced nothing, treat that as a match" — left the suite at
 # PASS=1035 FAIL=0 (measured). That mutant is FAIL-OPEN on the guard whose whole
@@ -6082,6 +6099,117 @@ STUB_COMMENT_BODIES="" \
     run_record_neg "$DC_PR4" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
 assert_eq "$(dc_posts "$DC_PR4")" "1" \
     "20.11 …while the SAME conjunction with a WORKING openssl DOES publish (the arm is reached, not skipped)"
+
+# ── 20.12 THE MATCH ARM: A MARKER WHOSE sig= DOES NOT MATCH IS NEVER PUBLISHED ─
+# (#3168 round-8 review, P1.) `if [ "$_mexp" != "$_msig" ]; then` (:1248) is the
+# refusal whose own comment says an unverifiable marker "must never become a
+# permanent PR comment (the gate could never accept it, and unlike the PR body it
+# cannot be retracted)". At the previous head it was pinned by NOTHING while the
+# header above asserted it was covered — a suite claiming a coverage it did not
+# have, which is the defect class this whole PR exists to remove.
+# ⛔ MEASURED, before this block existed, on a throw-away worktree of this head:
+# `:1248` → `if false; then` left the suite at PASS=1040 FAIL=0 — a fail-OPEN
+# mutation that publishes a wrongly-signed attestation PERMANENTLY, and the whole
+# suite green. So the vector is not decorative; it is the only thing that sees the
+# arm. ⛔ DRIVEN THROUGH `--flush-pending`, the object this matters for: the flush
+# holds bytes a PREVIOUS box signed, so "the key here no longer matches the one that
+# signed it" is its NORMAL failure mode, not a contrived one.
+MR_PR=424353
+MR_PEND="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$MR_PR.marker"
+MR_TEXT="review recorded: reviews/$MR_PR.json verdict=clean @ $SHA diff=$(printf 'c%.0s' $(seq 1 64)) (daniel-ospina/agent-infra)"
+# The FOREIGN key lives ONLY in the marker bytes — never as a key FILE under
+# $F_HOME, which the :1242 fallback would then read and silently arm every later
+# "keyless" vector in this suite (20.10's zero-post half among them).
+MR_BOX_KEY="the-key-configured-on-THIS-box"
+MR_FOREIGN_KEY="a-foreign-key-this-box-does-not-hold"
+MR_SIG_FOREIGN="$(printf '%s' "$MR_TEXT" | openssl dgst -sha256 -hmac "$MR_FOREIGN_KEY" | awk '{print $NF}')"
+mkdir -p "$(dirname "$MR_PEND")"
+printf '%s sig=%s\n' "$MR_TEXT" "$MR_SIG_FOREIGN" > "$MR_PEND"
+# FIXTURE ASSERTIONS FIRST — a 0-post count proves nothing on a run that never
+# reached the channel. The sig must be WELL-FORMED (or the :1229 shape guard is what
+# refuses, not :1248) and must genuinely NOT verify under the box key (or :1248 would
+# take the MATCH branch and the vector would be asserting the opposite of its name).
+if [ -s "$MR_PEND" ] && command grep -qE -- " sig=[0-9a-f]{64}$" "$MR_PEND"; then
+    ok "20.12 fixture: the pending marker ends in a well-formed ' sig=<64hex>', so the shape guard is satisfied"
+else
+    bad "20.12 fixture: the pending marker is missing or its sig= is not 64 hex — the shape guard (:1229) would refuse it, not the match arm"
+fi
+if [ "$(printf '%s' "$MR_TEXT" | openssl dgst -sha256 -hmac "$MR_BOX_KEY" | awk '{print $NF}')" = "$MR_SIG_FOREIGN" ]; then
+    bad "20.12 fixture: the marker's sig= ALSO verifies under this box's key — it is not foreign, so :1248 would MATCH and the vector would judge nothing"
+else
+    ok "20.12 fixture: the marker's sig= does NOT verify under the key this box holds (the mismatch is measured, not assumed)"
+fi
+: > "$LOG"
+MR_RC=0
+MR_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" AI_REVIEW_GATE_KEY="$MR_BOX_KEY" \
+    STUB_COMMENT_BODIES="" STUB_BODY="PR body" \
+    bash "$RECORD" --flush-pending "$MR_PR" daniel-ospina/agent-infra 2>&1)" || MR_RC=$?
+assert_eq "$(dc_posts "$MR_PR")" "0" \
+    "20.12 a marker whose sig= does NOT match its content is never published to the durable channel (the :1248 MATCH arm)"
+# THE REFUSAL MUST BE LOUD **AND** MUST BE `:1248`'s. "REFUSING to publish a marker"
+# exists at ONE site (:1252, inside the :1248 arm); :1245 and :1247 return silently,
+# so this assertion cannot be satisfied by either of them.
+assert_contains "$MR_OUT" "REFUSING to publish a marker" \
+    "20.12 …and the refusal is LOUD and names why — the text only :1248's arm prints [out: $(printf '%s' "$MR_OUT" | tr '\n' ' ')]"
+# ANTI-VACUITY: the flush must have REACHED delivery. "0 posts" is also what an
+# early "nothing pending" return produces (exit 0, empty output), so the body
+# delivery is what proves this run actually processed the marker.
+assert_contains "$MR_OUT" "delivered the pending marker" \
+    "20.12 …and the run really processed the marker (a 'nothing pending' exit 0 would also give 0 posts) [out: $(printf '%s' "$MR_OUT" | tr '\n' ' ')]"
+assert_eq "$MR_RC" "0" \
+    "20.12 …and the comment refusal is NOT fatal — the body copy is still delivered (rc 0)"
+# THE POSITIVE PAIR — same PR, same marker TEXT, same fixtures; the ONLY differing
+# input is which key signed the bytes. Without it the negative above could be passing
+# because this PR's flush never reached the channel at all. The pending file must be
+# RE-CREATED because a successful body delivery deletes it (`rm -f` in
+# flush_pending_markers), so reusing the first one would judge an absent file.
+MR_SIG_BOX="$(printf '%s' "$MR_TEXT" | openssl dgst -sha256 -hmac "$MR_BOX_KEY" | awk '{print $NF}')"
+printf '%s sig=%s\n' "$MR_TEXT" "$MR_SIG_BOX" > "$MR_PEND"
+if [ -s "$MR_PEND" ] && command grep -qF -- " sig=$MR_SIG_BOX" "$MR_PEND"; then
+    ok "20.12 pair fixture: the pending marker was re-created, signed with THIS box's key (a successful flush deletes it)"
+else
+    bad "20.12 pair fixture: the pending marker is gone or unsigned — the positive half would judge an absent file"
+fi
+: > "$LOG"
+MR_OK_RC=0
+MR_OK_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" AI_REVIEW_GATE_KEY="$MR_BOX_KEY" \
+    STUB_COMMENT_BODIES="" STUB_BODY="PR body" \
+    bash "$RECORD" --flush-pending "$MR_PR" daniel-ospina/agent-infra 2>&1)" || MR_OK_RC=$?
+assert_eq "$(dc_posts "$MR_PR")" "1" \
+    "20.12 …while the SAME marker signed with THIS box's key IS published (the arm is reached, and the guard does not over-block)"
+assert_eq "$MR_OK_RC" "0" "20.12 …and that keyed flush also exits 0"
+
+# ── 20.13 THE KEY-UNSET ARM: NO KEY MEANS NO COMMENT, NOT "MATCH THE EMPTY KEY" ─
+# (Same round, same class.) `[ -n "$_key" ] || return 0` (:1245) is the sibling
+# unpinned refusal, and it is not cosmetic: deleting it falls through to the
+# comparison, where `openssl dgst -hmac ""` SUCCEEDS (an empty HMAC key is legal
+# and yields a stable digest). A marker whose `sig=` was computed under the EMPTY
+# key then MATCHES and is published permanently — computable by anyone. MEASURED:
+# the same mutant left the suite at PASS=1040 FAIL=0.
+FLE_PR=424354
+FLE_PEND="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$FLE_PR.marker"
+FLE_TEXT="review recorded: reviews/$FLE_PR.json verdict=clean @ $SHA diff=$(printf 'e%.0s' $(seq 1 64)) (daniel-ospina/agent-infra)"
+FLE_SIG_EMPTY="$(printf '%s' "$FLE_TEXT" | openssl dgst -sha256 -hmac "" | awk '{print $NF}')"
+printf '%s sig=%s\n' "$FLE_TEXT" "$FLE_SIG_EMPTY" > "$FLE_PEND"
+# "NO KEY" MUST BE A STATE, NOT A FIXTURE CLAIM: the recorder falls back to
+# $HOME/.pi/agent/.ai-review-gate-key when the env is empty, so that file's absence
+# is asserted too. (This suite never creates it; this vector must not be the first.)
+rm -f "$F_HOME/.pi/agent/.ai-review-gate-key"
+if [ ! -e "$F_HOME/.pi/agent/.ai-review-gate-key" ] && [ -s "$FLE_PEND" ]; then
+    ok "20.13 fixture: no key in the environment AND no key file on disk, with an empty-key-signed pending marker"
+else
+    bad "20.13 fixture: a key file exists at \$HOME/.pi/agent/.ai-review-gate-key, or the marker is absent — the vector would not be keyless"
+fi
+: > "$LOG"
+FLE_RC=0
+FLE_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" AI_REVIEW_GATE_KEY="" \
+    STUB_COMMENT_BODIES="" STUB_BODY="PR body" \
+    bash "$RECORD" --flush-pending "$FLE_PR" daniel-ospina/agent-infra 2>&1)" || FLE_RC=$?
+assert_eq "$(dc_posts "$FLE_PR")" "0" \
+    "20.13 with NO key resolvable, a marker whose sig= only matches the EMPTY key is never published (fail CLOSED)"
+assert_contains "$FLE_OUT" "delivered the pending marker" \
+    "20.13 …and that keyless run really processed the marker (not an early 'nothing pending' return)"
+assert_eq "$FLE_RC" "0" "20.13 …and the keyless flush still delivers the body copy (rc 0)"
 
 DM_20_SENTINEL=1
 
