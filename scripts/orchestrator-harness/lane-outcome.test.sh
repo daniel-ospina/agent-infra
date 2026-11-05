@@ -264,8 +264,16 @@ check_terminal "1f" refused "key-gate:store-invalid" 82
 eqv "$(printf '%s' "$(lastline | sed -n 's/.*reason=\(key-gate:[^ ]*\).*/\1/p')" | awk -F: '{print $2}')" \
     "store-invalid" \
     "1f2 the token's REASON is store-invalid, not the credential-missing default — a scan counts the real cause"
+# ⛔ WIDENED IN ROUND 23, AFTER THE NARROW GREP WAS MEASURED AS A HOLE: 1f3 pinned the ONE phrase only the fixed
+# capacity-transfer sentence contained, while the TWO lines that carry the refusal into the lane log and onto stderr
+# still said "$VAR holds no value in the environment this lane would run with" — the prescription the gate refutes
+# in the same log. A phrase-specific grep is an arm written to miss its own subject, so every prescription is named.
 hasnt "$(cat "$(LOG)" 2>/dev/null)" "put the credential in the environment lanes run with" \
     "1f3 …and the stand-down sentence does NOT prescribe exporting a variable the refusal already ruled out"
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment this lane would run with" \
+    "1f3b …nor do the NOT-started lines, which are the ones an operator reads in the lane log"
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "credential \$" \
+    "1f3c …nor does any line call the credential MISSING for a verdict about the FILE"
 has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
     "1f4 …it names the FILE the operator must repair or delete"
 [ ! -s "$PI_MARK" ]; ck "1f5 pi was never spawned for a store verdict" $?
