@@ -35,13 +35,17 @@
 #
 # 1. FARMED SCRIPTS — copied from the DECLARED farm set, never from a glob.
 #    `pi-bootstrap/setup.sh` is the single declaration of what the farm carries; this
-#    script PARSES its array declarations — the four it declares today (`fleet_srcs`,
-#    `lib_srcs`, `fleet_tools`, `merge_gate_srcs`) PLUS the two #1552/#1553 adds
-#    (`lane_root_srcs`, `lane_srcs`), so the mapping is already complete when that lands —
-#    plus its `scripts_dir` checkout-hygiene farm, and copies exactly those, preserving the
+#    script PARSES its array declarations and lays each one out per `FARM_LAYOUT` below —
+#    today `fleet_srcs`, `merge_gate_srcs`, `graph_srcs` (#3374: the hosted-graph fallback
+#    has its OWN array; it is NOT also in `fleet_srcs`, because a file declared twice is
+#    copied twice and appears twice in the farm's declared set), `lane_root_srcs`,
+#    `lane_srcs`, `lib_srcs` and `fleet_tools` — plus its `scripts_dir` checkout-hygiene
+#    farm, and copies exactly those, preserving the
 #    relative layout setup.sh documents (`scripts/lib/`, `scripts/fleet/`). A farm array
 #    this script does not know how to lay out is a LOUD failure, never a silent skip: an
 #    unparsed farm would leave a cell with a partial layer that still reports success.
+#    ⛔ `FARM_LAYOUT` IS THE AUTHORITY FOR THAT LIST — this sentence is the prose reading of
+#    it, and it went stale the moment #3374 added a 7th row (#3374 review, round 10 P2).
 #    The parse is the same shape as `scripts/run-bash-shards.sh --list`, which reads its
 #    own shard lines rather than keeping a second copy of them.
 #    NOTE the dest is `scripts/fleet/`, never `tools/fleet/`: pi's startup migration treats

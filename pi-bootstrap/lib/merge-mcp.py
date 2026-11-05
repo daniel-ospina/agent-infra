@@ -363,9 +363,42 @@ def _keep_backup(path):
         return ""
     dst = real + ".bak"
     try:
+        orig_mode = stat.S_IMODE(os.stat(real).st_mode)
+    except OSError:
+        orig_mode = None
+
+    def _copy():
         shutil.copy2(real, dst)
-        if os.path.exists(real):
-            os.chmod(dst, stat.S_IMODE(os.stat(real).st_mode))
+        if orig_mode is not None:
+            os.chmod(dst, orig_mode)
+
+    try:
+        try:
+            _copy()
+        except PermissionError:
+            # ⛔ A FILE THAT CANNOT BE READ CANNOT BE BACKED UP, SO "THE BYTES ARE KEPT" WAS FALSE
+            # FOR EXACTLY THE SHAPE THE CALLER'S COMMENT NAMES (#3374 review, round 10). The OSError
+            # branch below replaces an unreadable-by-PERMISSION `.mcp.json` and its docstring says
+            # the replaced bytes are kept — but `shutil.copy2` needs READ on the source, so the one
+            # shape that reaches this fallback lost the operator's hand-written content with only a
+            # WARNING, while the NOTE above it printed "the previous file was saved as (backup
+            # FAILED …)": a sentence asserting a save that did not happen. Measured before the fix:
+            # mode-0000 `.mcp.json` → rc=0, no `.bak`, content GONE. We are about to REPLACE this
+            # file, so making it owner-accessible for the length of the copy changes nothing the
+            # operator could still read, and the backup carries the original mode (`_copy` chmods
+            # `dst` to `orig_mode`).
+            # ⛔ THE ORIGINAL MODE IS **NOT** RESTORED, DELIBERATELY. The write path carries the
+            # destination's mode onto the replacement (`os.chmod(tmp, …os.stat(dst_real)…)`), so
+            # restoring `0000` here would hand a `0000` config to the very verifier that runs next:
+            # `--verify` could not read it, the repair loop verify → install → verify would refuse
+            # the file the installer had just written, and this branch would have REPLACED one
+            # non-convergent shape with another. The widening is owner-only (`|S_IRUSR|S_IWUSR`):
+            # it adds no group/other bit, so a credential-adjacent file does not get WIDER in the
+            # direction the write path's own rule exists to prevent, and `0000` was never a usable
+            # mode for a config the client must read. The discarded BYTES keep the operator's own
+            # mode, via `_copy`'s `chmod(dst, orig_mode)`.
+            os.chmod(real, (orig_mode or 0) | stat.S_IRUSR | stat.S_IWUSR)
+            _copy()
     except OSError as exc:                        # pragma: no cover — environment-dependent
         sys.stderr.write("WARNING: could not back up %s (%s) — continuing the repair\n" % (path, exc))
         return ""
@@ -544,6 +577,42 @@ def main(argv):
                 % (type(exc).__name__, exc, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
             )
             dst = {}
+        except OSError as exc:
+            # ⛔ A DESTINATION THAT CANNOT BE READ IS NOT AN UNPARSEABLE ONE, AND IT WAS THE LAST
+            # BARE READ IN THIS FILE (#3374 review, round 10 P2). `except ValueError` caught the
+            # `JSONDecodeError` and let every `OSError` through, so an unreadable `.mcp.json` — a
+            # DIRECTORY at the path, or an EACCES on a regular file — escaped as a traceback with the
+            # UNDOCUMENTED rc=1, while the docstring advertises 0/2/3 and `--verify` names exactly
+            # this shape (`UNREADABLE:`). Measured: `mkdir dst.json; merge-mcp.py tpl dst.json` →
+            # `IsADirectoryError` traceback, rc=1. Reachable from the repair loop
+            # (`cloud-cell-bringup.sh`: verify → install → verify), which then dies on Python
+            # internals for a file the verifier had just named correctly.
+            # A path that is not a regular file cannot be `os.replace`d into either, so it is not a
+            # REPLACE to attempt: it is a FATAL, named, exit 3 — the same "cannot read this config"
+            # answer the template guard gives. An unreadable-by-PERMISSION regular file keeps its
+            # bytes (there may be hand-written work in them) and IS replaced, exactly like the
+            # unparseable shape above.
+            # ⛔ A DANGLING SYMLINK IS NOT THIS BRANCH'S SHAPE, and an earlier draft of this comment
+            # claimed it was. `os.path.exists` FOLLOWS the link, so it is False for a dangling one:
+            # the read is SKIPPED, `dst` stays `{}`, and the write goes THROUGH the link, creating
+            # its target (measured: rc=0, target created, link intact). The repair loop therefore
+            # converges either way — but for this shape it converges by creating the target, not by
+            # refusing, and `pi-bootstrap/tests/test-cell-install.sh` pins that measurement so this
+            # comment cannot drift back into the claim. Only a DIRECTORY (or an EACCES on a regular
+            # file, handled just below) reaches here.
+            if not os.path.isfile(dst_path):
+                sys.stderr.write(
+                    "FATAL: %s is not a readable config file (%s: %s) — a directory or an "
+                    "unreadable path cannot be replaced, so nothing was written. "
+                    "Move it aside and re-run.\n"
+                    % (dst_path, type(exc).__name__, exc)
+                )
+                return 3
+            print(
+                "NOTE: REPLACED an UNREADABLE .mcp.json (%s: %s); the previous file was saved as %s"
+                % (type(exc).__name__, exc, _keep_backup(dst_path) or "(backup FAILED — see the WARNING above)")
+            )
+            dst = {}
     # ⛔ A TEMPLATE THAT PARSES BUT IS THE WRONG **SHAPE** WAS STILL A TRACEBACK. Guarding `json.load`
     # alone left `tpl.get` on a list (or `base.get` on a non-object `mcpServers`) raising straight out
     # of `main` — rc=1 and Python internals, the very contract the guard above declares closed. A
@@ -576,6 +645,31 @@ def main(argv):
             "FATAL: %s declares a tortoise url of type %s, not a non-empty string — the merge and "
             "`--verify` both read it as the hosted endpoint, so nothing can be compared against it\n"
             % (tpl_path, type(want.get("url")).__name__)
+        )
+        return 3
+    # ⛔ THE TEMPLATE'S OWN ENTRY WAS NEVER RUN THROUGH `usable()` (#3374 review, round 10 P1).
+    # `usable()` is total over every entry this file REPLACES or PRESERVES, but `want` went straight
+    # into `.mcp.json` on every branch — so a template that is not a config a lane could use was
+    # INSTALLED VERBATIM, and the shared config file is exactly where the one unforgivable thing can
+    # land. Measured (merge rc=0 in both cases):
+    #   template Authorization "Bearer tt_AAAABBBBCCCCDDDD"  -> written into .mcp.json verbatim
+    #   template url http://api.premiselabs.co/mcp/           -> installed as the hosted default
+    # `--verify` then REFUSES the file the installer just wrote (SECRET_IN_FILE / INSECURE_URL /
+    # NOTHTTP), and the repair path cannot converge: the next `--install` sees that literal, replaces
+    # it with `want`, and writes the same literal back — a repair loop that prints "REPLACED an
+    # unusable tortoise entry with the hosted default" while producing the unusable entry. It also
+    # contradicts R2 of this change's own contract: no credential is ever written into a shared
+    # config file. The verifier already refuses these shapes, so validating here is what makes the
+    # two sides agree — one predicate, both directions, on the template as well as the cell's copy.
+    _want_ok, _want_why = usable(want, want["url"].strip())
+    if not _want_ok:
+        sys.stderr.write(
+            "FATAL: %s declares an UNUSABLE tortoise entry (%s) — a template is the thing this file "
+            "INSTALLS, so an entry no lane could use must be refused here rather than written into "
+            "a shared config: a literal credential, a non-https endpoint carrying one, a missing "
+            "Authorization on the hosted default, a foreign credential variable, or a non-http "
+            "transport. Fix the template; nothing was written.\n"
+            % (tpl_path, _want_why)
         )
         return 3
 
