@@ -1426,23 +1426,18 @@ lane_end_next() {
       printf 'MANUAL — this terminal did NOT measure the tree (%s); nothing here licenses a reclaim. Read the [wip] line in the lane log\n' \
         "${LANE_END_TREE:-<empty>}"; return 0 ;;
   esac
-  case "${LANE_END_PUSH:-}" in
-    FAILED|UNAVAILABLE|unmeasured|detached|running)
-      printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. See the [lane-exit] line in the lane log\n' \
-        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}"; return 0 ;;
-    refused-protected|refused-main-checkout)
-      printf 'commit(s) on %s were NOT pushed by the exit path (see why in the lane log); they survive the worktree being removed but not the volume — re-dispatch and push from a lane branch\n' \
-        "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
-    # ⛔ ITS OWN ARM, NOT A FALL-THROUGH (review, PR #3399 P2). `refused-unknown-default` is assigned by
-    # `lane_end_push` and was in NEITHER case list, so it landed on the generic `unpushed-only` sentence
-    # below — "the commits are in the local object store, not on origin" — which drops the one fact that
-    # matters most here: they die with the volume. Same state class as the arm above, and the WEAKEST
-    # wording was landing on the state a reclaim pass most needs to refuse. The domain is read from
-    # `lane_end_push`'s assignments, never from prose (the same rule the rescue arms below record).
-    refused-unknown-default)
-      printf 'MANUAL — commit(s) on %s were NOT pushed because the remote default could not be read; do NOT reap %s until they are off-box. They survive the worktree being removed but NOT the volume — re-run once the remote answers, or push %s by hand\n' \
-        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
-  esac
+  # ⛔ THE RESCUE DOMAIN IS CONSULTED **FIRST**, AND THIS ORDER IS THE FIX (review cycle 8, P1 —
+  # REPRODUCED). Both refusals above/below are `return 0`, so whichever case runs first SILENCES the
+  # others; the push case used to run first, and its `refused-protected|refused-main-checkout` arm is a
+  # NON-MANUAL sentence — so a DIRTY tree whose archive FAILED was told only about its branch, and the
+  # "uncommitted work is NOT archived; do NOT reap" fact was dropped from the one artifact a reclaim pass
+  # reads (measured on the shipped helper: `tree=dirty push=refused-protected rescue=FAILED` gave the
+  # branch sentence, while the same tree with `push=pushed` gave MANUAL). That is the identical
+  # weakest-wording-on-the-state-that-needs-refusing defect the `refused-unknown-default` arm below was
+  # added for, one domain over — so the rule is now stated instead of emerging from arm order: **any
+  # domain that says MANUAL outranks a domain that only reports.** The rescue half of the uncommitted
+  # work is what survives neither a removed worktree nor a discarded volume, so it is read before the
+  # branch half; `archived-local` follows it for the same reason (a local pin has no off-box copy).
   case "${LANE_END_RESCUE:-}" in
     FAILED|UNAVAILABLE)
       printf 'MANUAL — uncommitted work at %s is NOT archived; do NOT reap it. re-run bg-rescue-wip.sh and read its refusal\n' \
@@ -1452,6 +1447,35 @@ lane_end_next() {
     printf 'retrieve the archive %s (local pin only — the OFF-BOX push is unconfirmed) before removing %s\n' \
       "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}"; return 0
   fi
+  case "${LANE_END_PUSH:-}" in
+    FAILED|UNAVAILABLE|unmeasured|detached|running)
+      printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. See the [lane-exit] line in the lane log\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}"; return 0 ;;
+    refused-protected|refused-main-checkout)
+      # ⛔ AND THE TWO NON-MANUAL VERDICTS STILL MERGE THE OTHER DOMAIN IN (review cycle 8, P1). Moving
+      # the rescue domain first fixed the FAILED archive; it does NOT fix the state where the uncommitted
+      # work IS archived (`rescue=refs/wip/<slug>`) or was never needed, because those arms live BELOW
+      # this one and would still be silenced. So a refused push on a DIRTY tree names BOTH facts rather
+      # than the branch alone — the branch commits have no copy off this disk AND the tree it left behind
+      # is not something a reaper may take on this row's word.
+      case "${LANE_END_TREE:-}" in
+        dirty|cannot-verify)
+          printf 'MANUAL — commit(s) on %s were NOT pushed (see the lane log) AND this terminal left uncommitted work at %s (tree=%s, rescue=%s, wip_ref=%s): do NOT reap it. Re-dispatch and push from a lane branch, and recover the uncommitted state from the rescue ref if one is named here\n' \
+            "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_TREE}" \
+            "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_REF:-<none>}"; return 0 ;;
+      esac
+      printf 'commit(s) on %s were NOT pushed by the exit path (see why in the lane log); they survive the worktree being removed but not the volume — re-dispatch and push from a lane branch\n' \
+        "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
+    # ⛔ ITS OWN ARM, NOT A FALL-THROUGH (review, PR #3399 P2). `refused-unknown-default` is assigned by
+    # `lane_end_push` and was in NEITHER case list, so it landed on the generic `unpushed-only` sentence
+    # below — "the commits are in the local object store, not on origin" — which drops the one fact that
+    # matters most here: they die with the volume. Same state class as the arm above, and the WEAKEST
+    # wording was landing on the state a reclaim pass most needs to refuse. The domain is read from
+    # `lane_end_push`'s assignments, never from prose (the same rule the rescue arms above record).
+    refused-unknown-default)
+      printf 'MANUAL — commit(s) on %s were NOT pushed because the remote default could not be read; do NOT reap %s until they are off-box. They survive the worktree being removed but NOT the volume — re-run once the remote answers, or push %s by hand\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
+  esac
   # ⛔ `unpushed-only` IS NOT A DIRTY TREE (review cycle 2, finding 3 — REPRODUCED). `at_risk=0` for a
   # clean tree, so `rescue=nothing` deterministically and NO `refs/wip/<slug>` is ever created — yet this
   # arm told the reader to fetch one, which fails. A tree whose branch is on origin has nothing to
@@ -1502,6 +1526,7 @@ lane_end_next() {
 # terminal path already goes through (see its own note). Never changes the exit status.
 lane_end_marker() {
   local label="$1" rc="$2" cap="$3" o_root slug f tmp shown n
+  local unpushed_shown label_shown root_shown
   o_root="${O:-${HOME:-$PWD}/orchestrator}"
   slug="$(printf '%s' "$label" | tr ' /' '__' | tr -cd 'A-Za-z0-9._-')"
   [ -n "$slug" ] || slug="agent"
@@ -1527,6 +1552,25 @@ lane_end_marker() {
     return 0
   }
   n="$(printf '%s\n' "${LANE_END_PORCELAIN:-}" | grep -c . 2>/dev/null)"; [ -n "$n" ] || n=0
+  # ⛔ A "zero" NOBODY READ IS NOT A MEASURED ZERO (review cycle 8, P2). `LANE_END_UNPUSHED` is reset to
+  # `0` at the top of `terminal_wip_rescue` (before the hatch can return), so the two early-return paths
+  # wrote `state=not-measured` **with `unpushed=0`** — a count printed as measured inside the artifact a
+  # reclaim pass reads FIELD BY FIELD. The sibling guards in this file already refuse exactly this on the
+  # TSV column (`?` for a failed `rev-list`) and in `lane_end_next`'s last arm ("the COUNT is read, never
+  # hard-coded": a row whose count was `?` was being published as a measured zero). Same rule here: a
+  # tree that was never measured did not measure its commits either.
+  unpushed_shown="${LANE_END_UNPUSHED:-?}"
+  case "${LANE_END_TREE:-}" in
+    ""|not-measured) unpushed_shown="?" ;;
+  esac
+  # ⛔ `label` AND `root` ARE THE TWO FIELDS THAT CAN CARRY A NEWLINE INTO THIS LINE-ORIENTED FILE (review
+  # cycle 8, P2). The ledger's own writer already flattens exactly this hazard for its path column
+  # (`root_col="$(… tr '\t\n' '  ')"`, with the comment "a tab or newline in the path would shift every
+  # later column"); `root` is a caller-supplied `WIP_PATH`, so a newline there injected a bogus
+  # `key=value` line and every `while read k=v` consumer mis-parsed the rest of the marker. Flattened the
+  # same way, for the same reason, in the same artifact family.
+  label_shown="$(printf '%s' "$label" | tr '\t\n' '  ')"
+  root_shown="$(printf '%s' "${LANE_END_ROOT:-}" | tr '\t\n' '  ')"
   # ⛔ `tr`, NOT `sed 's/\t/  /g'` (review cycle 7, finding 1). `git status --porcelain -uall` emits NO
   # tabs (v1 separates with a SPACE and C-quotes odd paths — measured: `?? a.txt`, `?? "b c.txt"`), so
   # the sed was a no-op on GNU sed and ACTIVELY CORRUPTING on BSD/macOS sed, where `\t` is not an
@@ -1537,14 +1581,14 @@ lane_end_marker() {
   shown="$(printf '%s\n' "${LANE_END_PORCELAIN:-}" | tr '\t' '  ' | head -40)"
   {
     printf 'LANE-EXIT\n'
-    printf 'label=%s\n' "$label"
+    printf 'label=%s\n' "$label_shown"
     printf 'state=%s\n' "${LANE_END_TREE:-not-measured}"
     printf 'rc=%s\n' "$rc"
     printf 'cap=%s\n' "$cap"
     printf 'branch=%s\n' "${LANE_END_BRANCH:-}"
     printf 'head=%s\n' "${LANE_END_HEAD:-}"
-    printf 'root=%s\n' "${LANE_END_ROOT:-}"
-    printf 'unpushed=%s\n' "${LANE_END_UNPUSHED:-0}"
+    printf 'root=%s\n' "$root_shown"
+    printf 'unpushed=%s\n' "$unpushed_shown"
     printf 'push=%s\n' "${LANE_END_PUSH:-}"
     printf 'branch_on_origin=%s\n' "${LANE_END_ORIGIN:-}"
     printf 'rescue=%s\n' "${LANE_END_RESCUE:-}"

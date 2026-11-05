@@ -552,7 +552,7 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     nothing is invented, and the marker tells a reclaim pass to refuse that worktree.
   * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
-    writer as the ledger, so no path can forget it: `LABEL`, `state` (the tree verdict), `rc`, `cap`,
+    writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
     `branch`, `head`, `root`, `unpushed`, `push`, `branch_on_origin` (the sha the REMOTE reported),
     `rescue`, `wip_ref`, `dirty`, `ended`, `next` (mechanically derived) and a `porcelain:` section. A
     path that returned BEFORE the measurement writes `state=not-measured` and `next=MANUAL — …did NOT

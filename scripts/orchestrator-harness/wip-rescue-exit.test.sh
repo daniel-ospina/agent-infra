@@ -682,6 +682,120 @@ ck "N15b …and an UNREADABLE git-common-dir is REFUSED before any push (nothing
 mk15b="$O/state/lane-exit-shape_unknown.state"
 [ -s "$mk15b" ] && grep -qx 'push=UNAVAILABLE' "$mk15b" && grep -q '^next=MANUAL' "$mk15b"; rcn15c=$?
 ck "N15c …and the artifact says push=UNAVAILABLE with next=MANUAL, so a reclaim pass cannot read an unknown shape as safe" $rcn15c
+# ⛔ N15d — THE HUB REFUSAL IS DRIVEN, NOT MERELY READ (review cycle 8, P1 — REPRODUCED). N15 greps the
+# block's existence and N15b/N15c break a READ; NEITHER drives a hub checkout that HAS a working origin,
+# so the equality could be neutered (`[ "$gd" = "$cd" ]` -> `[ "$gd" = "NEVER-EQUAL" ]`) and this suite
+# stayed green while the lane PUSHED its branch to origin — the merge-gate bypass the block exists to
+# close, undetected by every arm in this file. N19 already states the rule for R6: "a scan proves a verb
+# is absent; it cannot prove a DIVERGENT branch is refused". Same rule, same missing arm.
+HUB="$TMP/hub"
+git init -q -b hubfeature "$HUB"
+git -C "$HUB" config user.name t; git -C "$HUB" config user.email t@t
+git -C "$HUB" remote add origin "$GHURL"
+git -C "$HUB" config url."$BARE".insteadOf "$GHURL"
+printf 'hub seed\n' > "$HUB/seed.txt"
+git -C "$HUB" add seed.txt && git -C "$HUB" commit -q -m 'hub seed'
+# ⛔ AN UNPUSHED COMMIT IS PART OF THE FIXTURE, NOT SET DRESSING: `lane_end_push` short-circuits on
+# `unpushed <= 0`, so a hub whose branch is already on origin would measure `push=nothing` and this arm
+# would pass on the ungated tree too.
+printf 'hub local\n' > "$HUB/local.txt"
+git -C "$HUB" add local.txt && git -C "$HUB" commit -q -m 'hub local only'
+# ⛔ AND THE DISCRIMINATOR IS ASSERTED, NOT ASSUMED: `git-dir` must EQUAL `git-common-dir` in the hub (that
+# is what makes it a MAIN checkout) — else the arm has no subject. ⛔ NOT `$WT`: `$WT` is itself a MAIN
+# checkout (`git init`), so asserting it DIFFERS was a false assertion about the fixture, not a defect in
+# the gate (measured: this arm went red on its own wrong premise while N15d below it passed).
+[ "$(git -C "$HUB" rev-parse --git-dir)" = "$(git -C "$HUB" rev-parse --git-common-dir)" ] \
+  && [ "$(git -C "$HUB" rev-list --count HEAD --not --remotes)" -gt 0 ]; rcn15d0=$?
+ck "N15d0 FIXTURE: the hub's git-dir EQUALS its git-common-dir (a main checkout) and its branch holds an unpushed commit — else this arm has no subject" $rcn15d0
+pi_stub clean
+: > "$O/logs/hub.log"; rm -f "$O/state/lane-exit-hub.state"
+PATH="$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "hub" >>"$4.agent" 2>&1
+' _ "$GATE" "$HUB" "$O" "$O/logs/hub.log" "$PROMPT"
+arm "$O/logs/hub.log"
+grep -q 'is the repo.s MAIN CHECKOUT' "$O/logs/hub.log" \
+  && ! git -C "$BARE" rev-parse -q --verify refs/heads/hubfeature >/dev/null 2>&1; rcn15d=$?
+ck "N15d …a MAIN CHECKOUT holding an unpushed branch is REFUSED by name and NOTHING reaches origin (refs/heads/hubfeature absent) — driven, not grepped" $rcn15d
+mk15d="$O/state/lane-exit-hub.state"
+[ -s "$mk15d" ] && grep -qx 'push=refused-main-checkout' "$mk15d" && grep -q '^next=' "$mk15d"; rcn15e=$?
+ck "N15e …and the artifact records push=refused-main-checkout with a next=, so the refusal is visible to a reclaim pass [$(grep -m1 '^push=' "$mk15d" 2>/dev/null)]" $rcn15e
+# ⛔ N23 — ANY DOMAIN THAT SAYS MANUAL OUTRANKS A DOMAIN THAT ONLY REPORTS (review cycle 8, P1).
+# `lane_end_next`'s arms are `return 0`, so arm ORDER decided the verdict: the push case ran first, and its
+# `refused-protected|refused-main-checkout` arm is a NON-MANUAL sentence, so a DIRTY tree whose archive
+# FAILED was told only about its branch — losing "uncommitted work is NOT archived; do NOT reap it" from
+# the one artifact a reclaim pass reads. Measured on the pre-fix helper: `dirty + refused-protected +
+# rescue=FAILED` -> "commit(s) on develop were NOT pushed … re-dispatch", while the same tree with
+# `push=pushed` -> MANUAL. A DIRECT call is honest here and not a stub of the subject: `lane_end_next` is
+# a PURE function of the LANE_END_* globals `terminal_wip_rescue` assigns, so setting them is exactly what
+# a drive would do — and it is the only way to reach this matrix (a real `refused-protected` push needs a
+# lane branch named after the remote's default, which a fixture cannot do without also testing git).
+nx="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=refused-protected
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx" in MANUAL*"do NOT reap"*) rcn23=0 ;; *) rcn23=1 ;; esac
+ck "N23 a DIRTY tree whose archive FAILED still gets next=MANUAL / do-not-reap when the push was refused-protected — the rescue fact is not silenced by the push arm [${nx:0:72}]" $rcn23
+nx2="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=pushed
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx2" in MANUAL*"NOT archived"*) rcn23b=0 ;; *) rcn23b=1 ;; esac
+ck "N23b …and the SAME tree with push=pushed still reaches the NOT-archived / do-not-reap sentence (the union does not depend on the push verdict)" $rcn23b
+nx3="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=refused-main-checkout
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx3" in MANUAL*"do NOT reap"*) rcn23c=0 ;; *) rcn23c=1 ;; esac
+ck "N23c …the same union holds for refused-main-checkout (both non-MANUAL push verdicts merge the rescue domain in)" $rcn23c
+nx4="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=refused-protected
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx4" in MANUAL*"uncommitted work"*) rcn23d=0 ;; *) rcn23d=1 ;; esac
+ck "N23d …and a DIRTY tree with a refused push names the uncommitted work even when no rescue value is set (the weak branch-only sentence is no longer reachable over an un-archived tree)" $rcn23d
+nx5="$( bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH=refused-protected
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx5" in MANUAL*) rcn23e=1 ;; *"NOT pushed"*) rcn23e=0 ;; *) rcn23e=1 ;; esac
+ck "N23e …while a CLEAN (unpushed-only) tree keeps the short branch sentence — the union adds MANUAL only where a reclaim could destroy work" $rcn23e
+# ⛔ N24 — A "ZERO" NOBODY READ IS NOT A MEASURED ZERO, IN THE MARKER TOO (review cycle 8, P2).
+# `LANE_END_UNPUSHED` is reset to `0` before the hatch can return, so a not-measured terminal wrote
+# `unpushed=0` — a count published as measured, one line above `state=not-measured`, in the artifact a
+# reclaim pass reads FIELD BY FIELD. The file already refuses this shape on the TSV column (`?`).
+nl="$( bash -c '
+  . "$1"
+  O="$2"; LANE_END_TREE=not-measured; LANE_END_RESCUE=DISABLED; LANE_END_UNPUSHED=0
+  LANE_END_LOG=/dev/null; LANE_END_MARKER_FRESH=1
+  lane_end_marker n24 0 10' _ "$GATE" "$TMP/n24O" 2>/dev/null )"
+mk24="$TMP/n24O/state/lane-exit-n24.state"
+[ -s "$mk24" ] && grep -qx 'state=not-measured' "$mk24" && grep -qx 'unpushed=?' "$mk24" \
+  && ! grep -qx 'unpushed=0' "$mk24"; rcn24=$?
+ck "N24 a NOT-MEASURED terminal records unpushed=? — never a 0 nobody read, in the marker as on the TSV column" $rcn24
+# ⛔ N25 — THE MARKER IS LINE-ORIENTED, SO ITS VALUES ARE FLATTENED (review cycle 8, P2). The ledger's own
+# writer already does this for its path column (`tr '\t\n' '  '`); `root` is a caller-supplied `WIP_PATH`,
+# so an embedded newline injected a bogus `key=value` line and every `while read k=v` consumer mis-parsed
+# the rest of the file. Only the label and root are flattened (the `porcelain:` section is raw BY DESIGN).
+rm -rf "$TMP/n25O"
+( bash -c '
+  . "$1"
+  O="$2"; LANE_END_TREE=clean; LANE_END_RESCUE=nothing; LANE_END_UNPUSHED=0
+  LANE_END_ROOT="$(printf "/tmp/ro\nINJECTED")"; LANE_END_LOG=/dev/null; LANE_END_MARKER_FRESH=1
+  lane_end_marker "$(printf "la\nbel")" 0 10' _ "$GATE" "$TMP/n25O" 2>/dev/null )
+mk25="$TMP/n25O/state/lane-exit-label.state"
+[ -s "$mk25" ] && [ "$(grep -c '^label=' "$mk25")" = 1 ] \
+  && ! grep -qx 'INJECTED' "$mk25" && ! grep -qx 'bel' "$mk25"; rcn25=$?
+ck "N25 a NEWLINE in the label or in WIP_PATH is flattened — it cannot inject a line into the marker's key=value stream [$(grep -m1 '^label=' "$mk25" 2>/dev/null)]" $rcn25
 # ⛔ N16 — THE CLONE-REF LEG OF THE LANDING CHECK (review cycle 4, gap 2): with the remote's own answer
 # unavailable, a clone whose refs/remotes/origin/HEAD still names the renamed default must refuse THAT name.
 git -C "$WT" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/trunk 2>/dev/null
@@ -969,6 +1083,11 @@ MK_OFF="$O/state/lane-exit-cap_disabled.state"
 ck "G9 …the marker says state=not-measured and carries NO push verdict (nothing was pushed, nothing measured)" $rcmk1
 grep -q '^next=MANUAL — this terminal did NOT measure' "$MK_OFF" 2>/dev/null && ! grep -q '^next=nothing at risk' "$MK_OFF" 2>/dev/null; rcmk2=$?
 ck "G10 …and next= says MANUAL / NOT MEASURED — never 'nothing at risk … may be removed' over an unmeasured tree" $rcmk2
+# ⛔ AND THE COUNT IS NOT INVENTED EITHER (review cycle 8, P2): `LANE_END_UNPUSHED` is reset to `0` before
+# the hatch can return, so this real-drive marker used to publish `unpushed=0` one line under
+# `state=not-measured`. N24 proves the rule at the writer; this asserts it on the LIVE path a drive takes.
+grep -qx 'unpushed=?' "$MK_OFF" 2>/dev/null && ! grep -qx 'unpushed=0' "$MK_OFF" 2>/dev/null; rcmk3=$?
+ck "G10b …and it records unpushed=? rather than the reset-to-0 value nobody read [$(grep -m1 '^unpushed=' "$MK_OFF" 2>/dev/null)]" $rcmk3
 git -C "$WT" config --unset-all url."$TMP/not-a-repo.git".insteadOf
 git -C "$WT" config url."$BARE".insteadOf "$GHURL"
 
