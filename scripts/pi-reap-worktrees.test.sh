@@ -1026,6 +1026,18 @@ ANCHORS = {
         "{ [ -d \"$_rdir\" ] && [ ! -x \"$_rdir\" ]; }",
         "{ false; }",
     ),
+    # (8d) and the disjunct that FAILS OPEN on a shape none of the three above can see: `-r` tests READ
+    # PERMISSION, and it is TRUE for a DIRECTORY, a symlink to one, and a FIFO. Before this leg the arm
+    # above was never even entered for those, `head -n 1 <dir>` yielded nothing and the
+    # `[ -n "$rec_t" ] || continue` re-created "cannot read it" ⇒ "no record" — so rule 3 removed the
+    # tree the box EXECUTES, with the record sitting right there. A FIFO is worse again: `[ -r ]`
+    # passes and `head` BLOCKS, hanging the classifier. `[ -e ]` inside was ALREADY true for a
+    # directory, i.e. the code knew and convicted anyway. Deleting this disjunct restores the
+    # fail-open, and G15u must red.
+    "no-record-unreadable-notfile": (
+        " || [ ! -f \"$rec\" ]",
+        " || false",
+    ),
 }
 s = open(src).read()
 old, new = ANCHORS[name]
@@ -5031,11 +5043,21 @@ assert_eq "$(reason_token "$(row_for "$OUT" "$MXWT")")" "pin-tree" \
 #       that element with a live `$HOME` too (its record is `$T/pin_tree_mixed/home/.harness-path`), and
 #       so does G15l. Both are discriminating for that element only because their tree paths
 #       (`pins/5b1b09aad2c1`) carry no `harness` component, so nothing else can carry the verdict.
+#   (c) ⛔ THE SPACE IS NOT ENOUGH — THE SPLIT WORDS MUST NOT BE EXISTING DIRECTORIES (measured after
+#       the `[ ! -f "$rec" ]` fail-closed disjunct landed). `mk_repo` creates `$T/<env>/home`, so a home
+#       spelled `$T/<env>/home with space` splits into `$T/<env>/home` — a REAL DIRECTORY — plus two
+#       more words. The mutant then entered the fail-closed arm on that first word and PRESERVED, so
+#       G15-M5 stopped discriminating: it still showed "the record was not read", but no longer showed
+#       "the tree is REMOVED". That preserve is the right POLARITY (a non-regular path fails closed,
+#       which is the whole point of that disjunct), so the mutant is what had to move, not the arm. The
+#       home is therefore spelled so that NO split word exists: `$T/<env>/spaced` and a relative
+#       `home/.harness-path`, neither of which is there. That is also the real shape the leg exists
+#       for — a `HOME=/Users/first last` whose `/Users/first` does not exist removes the tree.
 ENV=pin_tree_space
 REPO="$(mk_repo "$ENV")"
 SPWT="$T/$ENV/pins/5b1b09aad2c1"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$SPWT" HEAD
-SPHOME="$T/$ENV/home with space"
+SPHOME="$T/$ENV/spaced home"
 mkdir -p "$SPHOME" "$T/$ENV/cell-home"
 printf '%s\n' "$SPWT/scripts/orchestrator-harness" >"$SPHOME/.harness-path"
 OUT="$(HOME_OVERRIDE="$SPHOME" CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
@@ -5255,6 +5277,29 @@ else
 fi
 chmod 755 "$NOXDIR" 2>/dev/null || true
 
+# G15u: the record EXISTS and is READABLE, but is NOT A REGULAR FILE — a DIRECTORY on the record path.
+# ⛔ `-r` tests READ PERMISSION, not "readable as a record", and it is TRUE for a directory, a symlink
+# to one, and a FIFO. So the fail-closed arm above was not even ENTERED: `head -n 1 <dir>` yielded
+# nothing, the `[ -n "$rec_t" ] || continue` read that as "no record", and rule 3 REMOVED the tree the
+# box executes — with the record sitting right there and `[ -e ]` inside ALREADY true for it. This is
+# the same predicate the sibling record reader settles by REFUSING (`orchestrator-harness/install.sh`,
+# "A RECORD THAT IS NOT A FILE IS CANNOT-VERIFY, NOT AN EMPTY PIN"). A FIFO would be worse than a
+# removal here: `[ -r ]` passes and `head` BLOCKS, hanging the classifier — so this fixture uses a
+# directory (a FIFO fixture would hang the suite if the disjunct were ever deleted).
+# The tree path carries NO `harness` component, so the shape backstop cannot mask the miss.
+ENV=pin_tree_dirrec
+REPO="$(mk_repo "$ENV")"
+DIRWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$DIRWT" HEAD
+DIRREC="$T/$ENV/home/.harness-path"
+mkdir -p "$DIRREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DIRWT")")" "pin-tree" \
+    "G15u a record that is a DIRECTORY (readable, but not a regular file) PRESERVES — -r is not 'readable as a record'"
+assert_contains "$(row_for "$OUT" "$DIRWT")" "UNREADABLE" \
+    "G15u …and the row says WHY, so the operator sees the mis-created record instead of losing the tree"
+
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
 # every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
@@ -5387,6 +5432,16 @@ else
     echo "  → G15-M11 skipped (chmod 600 did not block traversal here, so the mutant is unobservable)"
 fi
 chmod 755 "$T/pin_tree_nox/nox" 2>/dev/null || true
+
+# G15-M12: delete the `[ ! -f "$rec" ]` disjunct alone. The mutant is back to `-r`-only, so a DIRECTORY
+# record is "readable", the arm is not entered, and the tree falls to rule 3 and is RECLAIMED. This is
+# the leg that makes G15u discriminating rather than an assertion that happens to pass.
+MUTP12="$T/mutant-no-record-unreadable-notfile.sh"
+mutate_reaper_anchored "$MUTP12" no-record-unreadable-notfile
+OUT="$(REAPER_OVERRIDE="$MUTP12" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_dirrec --dry-run --repo "$T/pin_tree_dirrec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_dirrec/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M12 MUTATION: without the [ ! -f ] disjunct a DIRECTORY record silences the arm and rule 3 removes the tree => G15u is discriminating"
 
 
 echo ""

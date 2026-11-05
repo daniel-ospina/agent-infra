@@ -3106,7 +3106,18 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # RENDERS `HARNESS_PIN` into the launchd job (`scripts/orchestrator-harness/launchd.plist.template:117-118`,
     # filled from the `install.sh:838` default at `install.sh:1373`) and `launchd-controller.sh:148` lists
     # it in `CONTROLLER_ENV`, forwarding it ON PRESENCE at `:175-182` — so every process the controller
-    # spawns sees it, including `pr-repair-loop.sh:422`'s `"$SCRIPTS/pi-reap-worktrees.sh" --apply`.
+    # spawns sees it, and `dispatch-merge.sh` literally hands such a lane the reaper command in its own
+    # report line — `(bash scripts/pi-reap-worktrees.sh --repo '$REPO' reports it)` — NAMED, not cited,
+    # because this edit moves the lines under it.
+    # ⛔ AND THE FIRST DRAFT OF THIS SENTENCE NAMED THE WRONG PROCESS, which is the same failure again
+    # and is why the boundary below is measured rather than argued. It claimed `pr-repair-loop.sh:422`'s
+    # `"$SCRIPTS/pi-reap-worktrees.sh" --apply`. It DOES invoke the reaper (that much was right), but it
+    # is NOT a child of the controller: `eldato-pr-repair.service` is a SEPARATE systemd unit whose
+    # `Environment=` carries `HOME`/`CELL_HOME`/`ENV_FILE`/`PATH`/`O` and NOT this key, and neither that
+    # unit nor `pr-repair-loop.sh` names `HARNESS_PIN` at all. Its separateness is a recorded DECISION,
+    # not an accident (`templates/systemd/eldato-pr-repair.service`, "they stay separate units with
+    # separate names and separate installers"). So the two production invokers of the reaper do NOT
+    # carry `HARNESS_PIN`: the repair unit, and the doctor's hygiene role, which reads `$HARNESS_PIN_FILE`.
     # What is true of the two scripts named above is only that neither EXPORTS it; the plist is the
     # exporter, so "neither exports it" is not evidence about the reaper's environment. It IS inert in
     # exactly two measured contexts: the plist-launched scheduled disk reaper, whose
@@ -3204,11 +3215,29 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         # The fourth test covers the shape `-e` cannot see: a record under a directory that exists but
         # cannot be searched (the TCC-protected / mixed-root case), where `[ -e ]` answers false for a
         # path that is really there.
-        if [ ! -r "$rec" ]; then
+        # ⛔ AND `-r` IS NOT "READABLE AS A RECORD" (#10114 review, P1). It tests READ PERMISSION, so it
+        # is TRUE for a DIRECTORY, a symlink to one, and a FIFO — the arm above is then never entered,
+        # `head -n 1 <dir>` yields nothing, and the `[ -n "$rec_t" ] || continue` below re-creates the
+        # very reading the arm was added to forbid ("cannot read it" ⇒ "no record"), so rule 3 removes
+        # the tree the box EXECUTES. Measured: a `.harness-path` that is a DIRECTORY reclaims the pin
+        # tree, while the identical path holding a regular file preserves it. A FIFO is worse again —
+        # `[ -r ]` passes and `head` BLOCKS, hanging the classifier. The `[ -e ]` disjunct inside is
+        # already TRUE for a directory, so the code knew the record was there and convicted anyway.
+        # ⛔ THE SIBLING RECORD READER ALREADY SETTLED THIS PREDICATE and refuses by name —
+        # `orchestrator-harness/install.sh`, "A RECORD THAT IS NOT A FILE IS CANNOT-VERIFY, NOT AN EMPTY
+        # PIN" (its two `[ ! -f … ]` refusals). NAMED, NOT CITED BY LINE, per THE RECORD'S OWN CONTENT
+        # below: this edit moves every line under it. Preserving is the reaper's analogue of that
+        # refusal — "an unreadable record is never an absent one" — so this costs disk, never work.
+        # ⛔ AND AN ABSENT RECORD STILL FALLS THROUGH, exactly as before: `-e`, `-L` and the parent test
+        # are all false for a path that is not there, so the `[ -f ]` disjunct adds a shape, not a
+        # blanket preserve. `G15f` (a plain merged worktree with neither record nor shape) still
+        # reclaims; `G15u` drives the directory record, `no-record-unreadable-notfile` deletes this
+        # disjunct and reds it.
+        if [ ! -r "$rec" ] || [ ! -f "$rec" ]; then
             _rdir="$(dirname "$rec")"
             if [ -e "$rec" ] || [ -L "$rec" ] || { [ -d "$_rdir" ] && [ ! -x "$_rdir" ]; }; then
                 PIN_VERDICT="pin-tree"
-                PIN_PROOF="pin record $rec exists but is UNREADABLE (permissions?) — it may name this tree, and 'cannot read' is not 'names something else'; failed CLOSED"
+                PIN_PROOF="pin record $rec exists but is UNREADABLE — not a regular file, or not readable (permissions?); it may name this tree, and 'cannot read' is not 'names something else'; failed CLOSED"
                 return 0
             fi
             continue
