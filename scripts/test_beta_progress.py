@@ -50,8 +50,15 @@ MERGED_TODAY = "2999-01-01T00:00:00Z"
 LONG_AGO = "2020-01-01T00:00:00Z"
 
 
-def pr(number, merged="", ref=None, title=None):
-    """One row in the `gh pr list --json` shape this file consumes."""
+def pr(number, merged=None, ref=None, title=None):
+    """One row in the `gh pr list --json` shape this file consumes.
+
+    ⛔ `merged` DEFAULTS TO `None`, NOT `""` (#3457 review round 14). `mergedAt` is MANDATORY in a
+    merged window (`_shape_pr_rows`), and every row of a `gh pr list --state merged` read carries a
+    non-empty stamp, so `""` was a payload NEITHER production arm can emit — and it was the easy
+    default, so three fixtures put an impossible row into a merged window and pinned the leniency.
+    With `None` the mistake is refused: a merged-window fixture must pass `merged=` explicitly.
+    """
     return {
         "number": number,
         "title": "PR %d" % number if title is None else title,
@@ -1128,7 +1135,9 @@ def test_a_refused_fix_repo_read_falls_back_to_rest_not_to_unavailable(monkeypat
     def fake_rest(state, limit=100, deadline=None, repo=None):
         rest_calls.append(repo)
         if repo == other:
-            return [pr(3368, title="fix(reaper): the harness PIN TREE is a holder (#10114)")]
+            # a stamp on the merged arm: `mergedAt` is mandatory in a merged window (#3457 round 14)
+            return [pr(3368, merged=LONG_AGO,
+                       title="fix(reaper): the harness PIN TREE is a holder (#10114)")]
         return [pr(900)] if state == "open" else []
 
     monkeypatch.setattr(bp, "gh", fake_gh)
@@ -1244,7 +1253,8 @@ def test_a_malformed_fix_repo_payload_is_unavailable_not_a_traceback(monkeypatch
     def answering_rest(state, limit=100, deadline=None, repo=None):
         tried.append((repo, state))
         answered["n"] += 1
-        return [pr(3368, ref="fix/10114-x", title="fix(reaper): the thing (#10114)")]
+        return [pr(3368, merged=LONG_AGO, ref="fix/10114-x",
+                   title="fix(reaper): the thing (#10114)")]
 
     monkeypatch.setattr(bp, "_rest_prs", answering_rest)
     assert bp.compute() is not None, (
@@ -1303,7 +1313,11 @@ def test_a_non_list_tracker_list_of_non_dicts_is_unavailable_not_a_count(monkeyp
     # --state merged` read is merged BY CONSTRUCTION — so an absent key is a PARTIAL payload, and
     # `merged_today` reported 0 for it and cached that for the TTL (measured). `_rest_prs` filters
     # unmerged rows out and always emits a string, so nothing legitimate reaches this shape.
-    for absent in ({}, {"mergedAt": None}):
+    # ⛔ AND `""` BELONGS IN THAT SET (#3457 review round 14): a type check alone accepted it, and
+    # `(p.get("mergedAt") or "")` then reports 0 for it exactly as it does for `null` — the
+    # rationale this block gives for refusing `None` applies to the empty string verbatim. Only
+    # `--state merged` reads are affected: an OPEN list legitimately carries no `mergedAt`.
+    for absent in ({}, {"mergedAt": None}, {"mergedAt": ""}):
         def fake_gh_partial(*args, _absent=absent):
             if args[:2] == ("pr", "list"):
                 if args[args.index("--repo") + 1] != bp.REPO:
@@ -1519,7 +1533,11 @@ def test_a_fix_repo_listed_twice_is_read_once(monkeypatch, no_cache):
     def fake_gh(*args):
         calls.append(args)
         if args[:2] == ("pr", "list"):
-            return [pr(900)] if args[args.index("--repo") + 1] == bp.REPO else []
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []
+            # the merged window needs its stamp: `mergedAt` is mandatory there (#3457 round 14)
+            return [pr(900)] if args[args.index("--state") + 1] == "open" \
+                else [pr(900, merged=LONG_AGO)]
         return []
 
     monkeypatch.setattr(bp, "gh", fake_gh)

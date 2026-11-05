@@ -667,7 +667,7 @@ def _shape_pr_rows(rows, state):
         # merged by construction and `_rest_prs` filters unmerged rows out, so an absent key is a
         # PARTIAL payload, not a shape we can render. (The `open` state is the exception that
         # justifies the split: an OPEN list carries no `mergedAt` at all.)
-        if state != "open" and not isinstance(r.get("mergedAt"), str):
+        if state != "open" and not (isinstance(r.get("mergedAt"), str) and r.get("mergedAt")):
             return None
     return rows
 
@@ -828,6 +828,15 @@ def _compute():
     # reads `unavailable`, exactly as a failed tracker read does. Inflating `without` from an
     # unreadable repo is the fail-open direction, and it is the one that misdirects a lane into
     # duplicate work.
+    # ⛔ AND THE MERGED COVER IS WINDOW-BOUNDED TOO, WHICH IS THE ONE RESIDUAL THIS BLOCK HAS NOT
+    # STATED (#3457 review round 14). The merged half reads the newest 400 rows -- the SAME bound
+    # the block above spends six paragraphs on for the tracker -- so a long-lived P0/P1 whose fix
+    # landed in another repo goes back to `without_pr` once 400 newer closed PRs exist in that
+    # repo (the 2026-11-05 measurement already put 400 agent-infra rows across ~1380 PR numbers).
+    # So "prevents the future mis-charter" is true of the OPEN window and TIME-BOUNDED for the
+    # merged one; the successor that removes both is the per-row referent resolution named above.
+    # It is accepted rather than widened because a deeper merged window costs a page per 100 rows
+    # on every tick inside the same 30 s REST budget and the same 60 s phase clock.
     fix_prs = []
     seen = []
     for _repo in FIX_REPOS:
