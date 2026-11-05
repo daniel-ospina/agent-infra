@@ -2096,12 +2096,13 @@ git -C "$n44h/wk" worktree remove --force "$n44h/wt" 2>/dev/null
 # Asserting PRESENCE catches a shifted or empty slot; it cannot see a TRANSPOSITION, because both values
 # are still somewhere in the string. Measured by swapping the root and origin arguments at the `pushed`
 # reporter: `… before removing deadbeef; … origin holds /tmp/wt`, and pin-slot + sha-slot BOTH passed.
-# The `sha-transposed` assertion below closes that, anchored on `origin holds ` — the one slot whose
-# introducer is unambiguous. ⛔ `before removing ` is NOT such an anchor: `the tree measured dirty with
-# rescue=nothing … the work is IN /tmp/wt. Read the [wip] line before removing it` names the root
-# EARLIER in the same sentence and then pronominalises it, so an anchor on that phrase reds two correct
-# arms. What catches a root in the sha slot is that the SHA is then missing from `origin holds `, which
-# is what `sha-transposed` tests; a root in the PIN slot is caught by `pin-slot` above.
+# Each sha-reporting shape therefore gets its OWN adjacency anchor, because a presence test cannot tell
+# which slot a value landed in. ⛔ `before removing ` is NOT an anchor on that list: 8 of the 450 cells
+# contain it and 6 of those already name the root there, but the `tree measured dirty with
+# rescue=nothing` arm names the root EARLIER in the sentence and then pronominalises it ("before removing
+# it") — so pinning root-adjacency to that phrase would red 2 cells of that one correct arm while
+# constraining 3 sentences. What catches a root in the sha slot is that the SHA is then missing from the
+# slot's own introducer, which is what the adjacency anchors below test.
 n45_sha=deadbeef
 n45_bad=""; n45_all=""
 for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured clean; do
@@ -2120,13 +2121,14 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
       # 1. one sentence, not the same sentence twice (a SURPLUS argument re-runs the whole format).
       # ⛔ COUNTING THE WORD `MANUAL` IS NOT COUNTING THE SENTENCES (review cycle 22, P2 — REPRODUCED).
       # Seven of the ninety distinct sentences carry no `MANUAL` at all — the `retrieve the archive`
-      # reporter arms and the `nothing at risk` / `nothing to recover` arms — so for those cells this
-      # check could not fire, and they are exactly the arms the tree dimension just added. Measured: with
-      # one surplus argument added to the `archived-local`/`pushed` reporter, and separately to the final
-      # `nothing at risk` arm, the format re-ran and printed the sentence TWICE while the `MANUAL` count,
-      # the `%s` search and both slot assertions stayed green. Every arm ends its format in a single `\n`,
-      # so a re-run is always a SECOND LINE — the line count covers all of them. The `MANUAL` count is
-      # kept because it names the specific defect when it fires.
+      # reporter arms, `recover the uncommitted state`, `nothing at risk`, `nothing to recover`, the
+      # `tree measured dirty with rescue=nothing` arm and the clean-branch-push abstention — so for those
+      # cells this check could not fire at all, and they are exactly the arms the tree dimension just
+      # added. Measured: with one surplus argument added to the `archived-local`/`pushed` reporter, and
+      # separately to the final `nothing at risk` arm, the format re-ran and printed the sentence TWICE
+      # while the `MANUAL` count, the `%s` search and both slot assertions stayed green. Every arm ends
+      # its format in a single `\n`, so a re-run is always a SECOND LINE — the line count covers all of
+      # them. The `MANUAL` count is kept because it names the specific defect when it fires.
       n45_lines="$(printf '%s' "$n45_out" | grep -c . )"
       [ "${n45_lines:-0}" -gt 1 ] && n45_bad="$n45_bad $n45_cell(x${n45_lines}-lines)"
       n45_n="$(printf '%s' "$n45_out" | grep -o 'MANUAL' | grep -c . )"
@@ -2160,6 +2162,11 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
           case "$n45_out" in *"$n45_sha"*) : ;; *) n45_bad="$n45_bad $n45_cell(sha-slot)" ;; esac ;;
       esac
       # ADJACENCY — the only thing that separates a correct slot from a TRANSPOSED one (see the header).
+      # Each sha-reporting SHAPE gets its own anchor; a presence test cannot tell which slot took the value.
+      # ⛔ `origin at ` IS THE THIRD SHAPE AND NEEDED ITS OWN (review cycle 23, P3 — REPRODUCED). `sha-slot`
+      # passes a transposition here because the sha is still PRESENT: swapping the two arguments at the
+      # unpushed-only sentence renders `origin at develop (deadbeef)` and measured `bad:[none]` over all
+      # 450 cells. `origin at ` occurs only in that one arm, so the anchor cannot red another.
       case "$n45_out" in
         *'origin holds '*)
           case "$n45_out" in
@@ -2168,6 +2175,18 @@ for n45_tree in dirty cannot-verify unpushed-only not-a-worktree not-measured cl
             *) n45_bad="$n45_bad $n45_cell(sha-transposed)" ;;
           esac ;;
       esac
+      case "$n45_out" in
+        *'origin at '*) case "$n45_out" in *'origin at '"$n45_sha"' '*) : ;; *) n45_bad="$n45_bad $n45_cell(origin-at-transposed)" ;; esac ;;
+      esac
+      # ⛔ THE `git -C` SLOT THIS BRANCH NAMES IS A SLOT TOO (review cycle 23, P3 — REPRODUCED). The
+      # `unmeasured` remedy names the root and then the enumeration's tail, and NEITHER was asserted:
+      # dropping the root argument renders `git -C  rev-list …` and transposing the two renders
+      # `git -C develop … origin//tmp/wt..HEAD`, both measured `bad:[none]` with the rescue and tree
+      # caveats swallowed. `git -C ` occurs exactly once in the product, so it is a safe anchor. The
+      # enumeration is asserted by its distinctive tail rather than by `rev-list --count ` alone, because
+      # the same sentence also quotes the NARROWER `origin/<b>..HEAD` form it is contrasted against.
+      case "$n45_out" in *'git -C '*) case "$n45_out" in *'git -C /tmp/wt '*) : ;; *) n45_bad="$n45_bad $n45_cell(gitroot-slot)" ;; esac ;; esac
+      case "$n45_out" in *'read it yourself'*) case "$n45_out" in *'rev-list --count HEAD --not --remotes'*) : ;; *) n45_bad="$n45_bad $n45_cell(enum-trap)" ;; esac ;; esac
       # ⛔ THE TWO NEGATIVE SHAPES ARE KEPT, NOT DROPPED (review cycle 22, P3). Neither fires on today's
       # product (0 of the 90 sentences match), so nothing measurable was lost when they fell out of the
       # rewrite — but an EMPTY root in a `reap`/`before removing` arm and an EMPTY push verdict are
