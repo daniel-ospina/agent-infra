@@ -620,6 +620,7 @@ _marker_count() { grep -cF -- "<!-- auto-rail-review:$1" "$POSTED" 2>/dev/null |
 # is the other half — that the review branch is NOT entered, and cannot launch a rail of its own.
 _branch=$(sed -n '/if \[ "\$_att" != at-head \]; then/,/^      # The rail writes its verdict/p' "$SUT")
 [ -n "$_branch" ] || bad "could not locate the review branch in $SUT — the arms below would then pin nothing"
+printf 'state 1 (attested at head): the rail path runs and the review branch can reach neither launch_rail nor a rail launch of its own\n'
 case "$_branch" in
   *launch_rail*) bad "the REVIEW branch must not launch a rail: the rail refuses a PR with no head-bound record in one line and burns a MAX slot, which is exactly what this change stops. (The rail IS launched on the at-head path, further down.)" ;;
 esac
@@ -647,6 +648,7 @@ case "$_rout_line" in
 esac
 
 # ── STATE 2 — ABSENT OR STALE AT HEAD: a reviewer IS dispatched, and the marker appears ONCE ─────
+printf 'state 2 (absent/stale at head): review classified from the shipped search arms above -> DISPATCH, marker once, second cycle silent\n'
 _rout="$_rdir/review-acme-widget-42-$H.out"
 [ "$(review_state "$_rout")" = none ] \
   || bad "a head with NO dispatch record must read 'none', not 'pending' — 'pending' makes the loop WAIT ${REVIEW_COOLDOWN_S}s on a review nobody ever dispatched (this is the PR #3486 state, and it would be indistinguishable from progress)"
@@ -704,6 +706,7 @@ _ep=$(review_dispatched_at "$_rout")
 case "${_ep:-}" in ''|*[!0-9]*) bad "the dispatch epoch must be readable from the record (got '${_ep:-}')" ;; esac
 # ⛔ mtime IS NOT THE DISPATCH TIME: a reviewer that keeps writing output keeps refreshing mtime, so an
 # mtime-keyed cooldown would never age out on exactly the reviews that are slowest.
+printf 'state 3 (review in flight): pending at age 0 and at %ss -> WAIT, no second dispatch, no second marker; at %ss -> RETRY\n' "$(( REVIEW_COOLDOWN_S - 1 ))" "$(( REVIEW_COOLDOWN_S + 1 ))"
 touch -t 200001010000 "$_rout"
 _ep2=$(review_dispatched_at "$_rout")
 [ "$_ep2" = "$_ep" ] && [ "$_ep2" -gt 946684800 ] \
