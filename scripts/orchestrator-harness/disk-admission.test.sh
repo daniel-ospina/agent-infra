@@ -497,9 +497,54 @@ H3OUT="$( ( _wt_rc=4; PR=4242; L="$H3D"; WT_RESULT="REFUSED-DISK(free=100, need=
 H3RC=$?
 if [ "$H3RC" -eq 77 ]; then ok "H3) the rc-4 arm exits 77, the disk gate's own code (never a generic 1)"; else bad "H3) the rc-4 arm exited $H3RC, not 77 — the operator is sent to a remedy that cannot clear it"; fi
 if [ -f "$H3D/refunded" ]; then ok "H3) …and the attempt is REFUNDED (a free refusal must not spend one)"; else bad "H3) the refusal consumed the attempt — refund_gate_attempt did not run"; fi
+# ⛔ DRIVEN WITH `REFUSED-UNKNOWN`, NOT `REFUSED-DISK` (review cycle 4, P1 — MEASURED). The first
+# version drove with a `WT_RESULT` that ALREADY carried `REFUSED-DISK`, so the arm's own
+# `REFUSED before creating a worktree: $WT_RESULT` line satisfied the match by itself: DELETING the
+# dedicated remedy line, and renaming its token to `REFUSED-DISKX`, both left the suite at 55/0. The
+# arm pinned nothing. With an UNKNOWN verdict the only way `REFUSED-DISK` can appear is the DISK
+# remedy line, and `REFUSED-UNKNOWN` proves the interpolated verdict survives — so this drives BOTH
+# branches of the cause selector.
+H3U="$T/h3u"; mkdir -p "$H3U"
+( _wt_rc=4; PR=4243; L="$H3U"; WT_RESULT="REFUSED-UNKNOWN(free=?, need=8144, box=rig)"
+  refund_gate_attempt() { : > "$H3U/refunded"; }
+  eval "$_fixarm" ) >/dev/null 2>&1
+H3ULOG="$(cat "$H3U.log" 2>/dev/null)"
+case "$H3ULOG" in
+  *REFUSED-UNKNOWN*) ok "H3) …the operator log carries the verdict it was given (REFUSED-UNKNOWN survives the interpolation)" ;;
+  *) bad "H3) the refusal swallowed the verdict — the operator cannot tell a skew from a full disk (got: $(printf '%s' "$H3ULOG" | head -1))" ;;
+esac
+# ⛔ THE MISATTRIBUTION ITSELF, ASSERTED DIRECTLY: an UNKNOWN verdict must NEVER be reported as a DISK
+# refusal. The verdict-echo line carries `REFUSED-UNKNOWN(…)`, so any `REFUSED-DISK` in this log could
+# ONLY come from a remedy that guessed "full disk" — which is the #2721 wrong-cause class.
+case "$H3ULOG" in
+  *REFUSED-DISK*) bad "H3) an UNREADABLE probe was reported as a DISK refusal — a version skew or a broken df cannot be cleared by reclaiming space (#2721 class)" ;;
+  *) ok "H3) …and an UNREADABLE probe is NOT reported as a DISK refusal (the remedy names the probe/skew)" ;;
+esac
+# The DISK verdict must reach the operator with a DISK REMEDY, not merely echo its own token: the
+# verdict-echo line ALWAYS contains `REFUSED-DISK(…)`, so a `*REFUSED-DISK*` match here would be
+# satisfied by that line alone — the original vacuity (deleting the remedy line left 55/0). The
+# assertion names text that ONLY the remedy line can supply.
 case "$(cat "$H3D.log" 2>/dev/null)" in
-  *REFUSED-DISK*) ok "H3) …and the log the operator reads names REFUSED-DISK (not a generic abort)" ;;
-  *) bad "H3) the refusal did not name REFUSED-DISK in \$L.log (got: $(head -1 "$H3D.log" 2>/dev/null))" ;;
+  *'reclaim space'*'will NOT clear'*) ok "H3) …and a DISK verdict reaches the operator with a DISK remedy, not just its own echoed token" ;;
+  *) bad "H3) a DISK refusal did not carry its remedy (reclaim-space guidance) — the token echo alone is not a remedy (got: $(head -1 "$H3D.log" 2>/dev/null))" ;;
+esac
+
+# ═══ H4. THE ONLY LINE THAT EVER POPULATES CHAIN_IDS MUST EXIST ═══════════════════════════════════
+# ⛔ MEASURED (review cycle 4, P1): `drive_rel` INJECTS `CHAIN_IDS`, so every H2 arm stayed green
+# (55/0) when the production assignment `CHAIN_IDS="$CHAIN_IDS $N"` was DELETED from the chain-start
+# branch — i.e. the suite could not detect the round-3 P3 defect (a peer duplicating in-flight chain
+# work) if it were re-introduced by deleting one line. Nothing else in the repo covers it:
+# refresh-scout.test.sh slices only the chain-FAILURE branch. This pins the SUCCESS branch.
+echo
+echo "── H4) the chain-start branch is the only producer of CHAIN_IDS, and it still produces it ──"
+_chainok="$(sed -n '/if wt_spawn "chain-/,/^  fi$/p' "$HERE/dispatch-merge.sh")"
+case "$_chainok" in
+  *'release_issue_claim_unspawned'*|*'chain-'*)
+    case "$_chainok" in
+      *'CHAIN_IDS="$CHAIN_IDS $N"'*) ok "H4) the chain-START branch records the id in CHAIN_IDS (so arm H2's guard has a producer)" ;;
+      *) bad "H4) the chain-start branch no longer assigns CHAIN_IDS — a live chain's claim becomes releasable and a peer duplicates in-flight work (round 3, P3)" ;;
+    esac ;;
+  *) bad "H4) the chain-start branch is no longer extractable — fix this harness, do not trust H4" ;;
 esac
 
 echo
