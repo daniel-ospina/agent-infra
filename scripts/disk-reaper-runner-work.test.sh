@@ -489,6 +489,13 @@ case_j() { # <entry-point> <owner>
                "a SYMLINKED entry under _work is neither followed nor removed — its target is outside the population"
     case_check "$(grep -qF 'reason=symlinked-entry' <<<"$out" && echo 0 || echo 1)" \
                "… and it is NAMED (reason=symlinked-entry), not silently dropped from a population the class calls measured"
+    # ⛔ AND NOTHING WAS EXECUTED WHILE SAYING IT (#3057 review cycle 2). The note was first written with
+    # BACKTICKS inside a double-quoted string, so the shell ran a command named `_work`, printed
+    # `_work: command not found` to stderr and lost the subject of the sentence — and this case stayed GREEN,
+    # because the `reason=` prefix it greps survived the damage. `run_pass` merges stderr into `$out`, so the
+    # assertion below catches the shape: a log line is DATA, never a command.
+    case_check "$(grep -q 'command not found' <<<"$out" && echo 1 || echo 0)" \
+               "… and no part of that note was EXECUTED as a command (an unquoted backtick in a double-quoted string runs a command named _work)"
     case_check "$(grep -qF 'reason=vendor-namespace-unlisted' <<<"$out" && echo 0 || echo 1)" \
                "… and NAMED as an undecided directory, which is the point: the next one is a visible decision"
     case_check "$([ -d "$live" ] && echo 0 || echo 1)" "the live checkout itself was KEPT by the floor, same pass"
@@ -754,13 +761,29 @@ case_f() { # <entry-point> <owner>
         # The case's own status still comes from assertions that DID run (the reach arm above), so the tally
         # stays honest in both directions.
         skip "(f) default-glob half, entry point $pass — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted by REACH instead"
-        return $((CASE_FAIL > 0))
+    else
+        out="$(DISK_REAPER_STATE_DIR="$s2" REAP_RW_STATE_DIR="$s2" BOUNDED_LIB="$HERE/lib/bounded.sh" \
+               RUNNER_WORK_REAPER="${PASS_OWNER:-}" bash "$pass" --dry-run --only runner-work 2>&1)"; rc=$?
+        case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "with the DEFAULT globs, no runner root on the box is rc 0 (got $rc)"
+        case_check "$(grep -q '^verdict_runner_work=ok$' <<<"$(status_of "$s2")" && echo 0 || echo 1)" \
+                   "… and verdict_runner_work=ok with candidates_runner_work=0 (a measured empty population)"
     fi
-    out="$(DISK_REAPER_STATE_DIR="$s2" REAP_RW_STATE_DIR="$s2" BOUNDED_LIB="$HERE/lib/bounded.sh" \
-           RUNNER_WORK_REAPER="${PASS_OWNER:-}" bash "$pass" --dry-run --only runner-work 2>&1)"; rc=$?
-    case_check "$([ "$rc" = 0 ] && echo 0 || echo 1)" "with the DEFAULT globs, no runner root on the box is rc 0 (got $rc)"
-    case_check "$(grep -q '^verdict_runner_work=ok$' <<<"$(status_of "$s2")" && echo 0 || echo 1)" \
-               "… and verdict_runner_work=ok with candidates_runner_work=0 (a measured empty population)"
+    # ⛔ THE **OWNER'S** OWN DEFAULT LIST, driven directly (#3057 review cycle 2). `MUT_F5` strips only the
+    # ENTRY POINT's list, so the owner's default could be reverted to the flat-only form — the whole P1 —
+    # and the suite still reported `68 passed, 0 failed`: the reach arm above reads `$pass`, never the
+    # owner. The owner is run with NO glob seam at all against a POOLED fixture under the suite's `$HOME`,
+    # so its shipped default must FIND that root; `--dry-run`, so even on a cell with real roots nothing
+    # can be removed. `MUT_F5B` reverts exactly this list and must redden it.
+    _ow="$T/fnow.$$.$RANDOM"
+    mkdir -p "$HOME/actions-runner/cell1-runner-2/_work/job-dead" || return 1
+    printf 'dead\n' >"$HOME/actions-runner/cell1-runner-2/_work/job-dead/f"
+    fixture_age "$HOME/actions-runner/cell1-runner-2/_work/job-dead" 600 >/dev/null 2>&1 || :
+    _os="$(uniqstate fnow)"
+    out="$(REAP_RW_STATE_DIR="$_os" REAP_RW_MIN_AGE=3600 BOUNDED_LIB="$HERE/lib/bounded.sh" \
+           bash "${PASS_OWNER:-$owner}" --dry-run 2>&1)"; rc=$?
+    case_check "$(grep -qF "$HOME/actions-runner/cell1-runner-2/_work" <<<"$out" && echo 0 || echo 1)" \
+               "(f) … the OWNER's OWN default glob list also REACHES a pooled \$RUNNER_ROOT/<name>/_work root (a flat-only owner default is the same inert-on-a-cell defect, one layer down)"
+    _ow=""
     return $((CASE_FAIL > 0))
 }
 
@@ -1604,6 +1627,11 @@ MUT_F2='s/^    if \[ "\$_rw_census" = "no-roots" \]; then/    if false; then/'
 # strips BOTH nested patterns and leaves the flat ones, so only the reach assertion can redden — which is
 # what makes it an assertion about REACH rather than about the presence of a string.
 MUT_F5='s| \$HOME/actions-runner/\*/_work||; s| /tmp/actions-runner/\*/_work||'
+# (f)'s FOURTH arm, on the OWNER rather than the entry point: `MUT_F5` strips only the entry point's nested
+# patterns, so the OWNER's documented default could be reverted to flat-only — the same P1, one layer down —
+# and the suite still reported a clean run (measured in review). This edit reverts exactly that list, and the
+# owner-driven reach assertion above must redden.
+MUT_F5B='s|^GLOBS="\${REAP_RW_GLOBS-/opt/gh-runner\*/_work \$HOME/actions-runner\*/_work \$HOME/actions-runner/\*/_work /tmp/actions-runner\*/_work /tmp/actions-runner/\*/_work}"$|GLOBS="${REAP_RW_GLOBS-/opt/gh-runner*/_work $HOME/actions-runner*/_work /tmp/actions-runner*/_work}"|'
 # (f4)'s arm: restore the PRE-FIX gate — the alert suppressed whenever ANY class went unmeasured, rather
 # than gated on the measured subset. If this survives, one unrelated measurement failure can switch the
 # near-full-disk alarm off again on a pass that demonstrably did not keep up.
@@ -1811,6 +1839,11 @@ if apply_mutation "$REAPER" "$T/mut-f5/disk-reaper.sh" "$MUT_F5"; then
     expect_fail "f mutation: a FLAT-only default glob list turns the case RED — it cannot reach the pooled \$RUNNER_ROOT/<name>/_work layout, so the class is inert on a cell while reading healthy" case_f "$T/mut-f5/disk-reaper.sh" "$OWNER"
 else
     bad "f mutation could not be applied (the default glob list moved) — the case is not checking REACH any more"
+fi
+if apply_mutation "$OWNER" "$T/mut-f5b/reap-runner-work.sh" "$MUT_F5B"; then
+    expect_fail "f mutation: the OWNER's own default list reverted to FLAT-only turns the case RED — the owner-driven reach arm, not just the entry point's" case_f "$REAPER" "$T/mut-f5b/reap-runner-work.sh"
+else
+    bad "f mutation could not be applied (the OWNER's default glob list moved) — the owner's reach is not checked any more"
 fi
 if apply_mutation "$REAPER" "$T/mut-f6/disk-reaper.sh" "$MUT_F6"; then
     expect_fail "f mutation: restoring the whole-sum gate on the under-reclaim alert turns the case RED — one unmeasured class then silences the alarm on a pass that did not keep up" case_f "$T/mut-f6/disk-reaper.sh" "$OWNER"

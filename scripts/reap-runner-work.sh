@@ -26,9 +26,10 @@
 # `.Actions` and `.Update` are UNCONDITIONAL `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)`,
 # over `Constants.Path.{Temp,Actions,Update}Directory` = `_temp`/`_actions`/`_update`; ⛔ `Tools` is the
 # EXCEPTION and it is why the `_tool` row's premise is CONDITIONAL — `WellKnownDirectory.Tools` prefers
-# `$RUNNER_TOOL_CACHE` / `$RUNNER_TOOLSDIRECTORY` / `$AGENT_TOOLSDIRECTORY` and only falls back to
-# `Combine(Work, "_tool")` when all three are unset, so on a box that sets one (every github-hosted image,
-# many self-hosted ones) `_work/_tool` is not the tool cache and may not exist at all. The retain row is
+# `$RUNNER_TOOL_CACHE` / `$RUNNER_TOOLSDIRECTORY` / `$AGENT_TOOLSDIRECTORY` / the `agent.ToolsDirectory`
+# runner variable, and only falls back to `Combine(Work, "_tool")` when ALL FOUR are empty, so on a box
+# that sets any one of them (every github-hosted image, many self-hosted ones) `_work/_tool` is not the
+# tool cache and may not exist at all. The retain row is
 # still right — a directory by that name under `_work` is never a job checkout — but "the vendor puts the
 # tool cache here" is a fallback, not a rule, and stating it as one is the same wrong-origin class this
 # paragraph exists to correct; the checkout is
@@ -181,8 +182,9 @@ GLOB_ARGS_GIVEN=0
 # keeps BOTH in `_work`: `HostContext.GetDirectory` resolves `Temp`, `Actions` and `Update` as
 # `Path.Combine(GetDirectory(WellKnownDirectory.Work), …)` (`actions/runner`
 # `src/Runner.Common/HostContext.cs`, over `Constants.Path.{Temp,Actions,Update}Directory`), and `Tools`
-# is the CONDITIONAL one — it prefers `RUNNER_TOOL_CACHE`/`RUNNER_TOOLSDIRECTORY`/`AGENT_TOOLSDIRECTORY`
-# and falls back to `Combine(Work, "_tool")`, which is why that row's premise is stated as a fallback and
+# is the CONDITIONAL one — it prefers `RUNNER_TOOL_CACHE`/`RUNNER_TOOLSDIRECTORY`/`AGENT_TOOLSDIRECTORY` /
+# the `agent.ToolsDirectory` variable and only then falls back to `Combine(Work, "_tool")`, which is why
+# that row's premise is stated as a fallback and
 # not as a vendor rule. So a
 # name that appears in NO row here is a reap candidate SILENTLY — which is how `_temp`, a live job's
 # `$RUNNER_TEMP`, became one without a line in any file saying so.
@@ -648,7 +650,7 @@ sweep_root() { # <_work root>
         # and named, the same rule the vendor namespace gets.
         if [ -L "$e" ]; then
             RETAINED=$((RETAINED + 1))
-            log_line "RETAINED $e reason=symlinked-entry (a symlink under _work is never followed and never a candidate: following one would classify — and could remove — a tree OUTSIDE the population this root was told to sweep. Counted so a `_work` of links is a VISIBLE carve-out and never a silently measured zero)"
+            log_line "RETAINED $e reason=symlinked-entry (a symlink under _work is never followed and never a candidate: following one would classify — and could remove — a tree OUTSIDE the population this root was told to sweep. Counted so a '_work' of links is a VISIBLE carve-out and never a silently measured zero)"
             continue
         fi
         [ -d "$e" ] || continue
