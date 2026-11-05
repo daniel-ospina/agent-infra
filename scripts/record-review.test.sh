@@ -4653,7 +4653,14 @@ fi
 #     → :4214 and :4352), so claiming all three "moved from `grep -qF` to `grep -qxF`"
 #     is FALSE — and a false "we changed this" is how a later reader concludes the
 #     older sites need anchoring too, or that this diff is bigger than it is. What
-#     the vector below pins is the PREDICATE, on the site this PR touched. It matches
+#     WHAT THE VECTOR BELOW ACTUALLY PINS (corrected — #3168 re-review finding 6):
+#     the BODY-APPEND site (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`), which is
+#     ALREADY `-qxF` on main (`git show origin/main:scripts/record-review.sh`
+#     → :4643) and is therefore NOT a site this PR changed. Reverting this PR's fix
+#     leaves 14.1c GREEN; the site this PR really anchors is `post_marker()`'s
+#     presence test, which 14.10f pins. This vector is kept — main's anchoring
+#     should not silently regress — but it is a regression pin for MAIN, and the
+#     earlier wording claimed it was evidence about this diff. It matches
 #     the gate's own `^…$` admission of a body marker. A body that merely
 #     CITES the marker mid-line is the discriminating case: unanchored `-qF` read
 #     it as PRESENT, so the recorder PATCHed nothing and set MARKER_PRESENT=1 on
@@ -4789,6 +4796,35 @@ assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the r
 #     permanent, so it must never be published to that channel.
 AI_REVIEW_GATE_KEY="" STUB_COMMENT_CAPTURE="$T/ccap_d" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d an UNSIGNED marker is never published as a comment"
+# (d-g) THE ADMISSION CONSTANT IS PINNED (#3168 re-review finding 3). It is the
+#       ONLY author filter on a permanent public channel AND the predicate the dedup
+#       matches against, yet it appeared nowhere in this suite: replacing it with
+#       `.[] | .body` left the suite GREEN because the stub ignores `--jq`. Once
+#       merged nothing re-checks the producer's copy against the gate's, so a
+#       dropped filter (any drive-by comment quoting the marker suppresses the
+#       durable post) or a typo'd field (dedup never matches ⇒ one duplicate
+#       permanent comment per run, forever) was invisible. Pins all three admitted
+#       associations, which is what the gate's byte-identical copy lists.
+assert_contains "$(cat "$RECORD")" 'author_association == "OWNER"' \
+    "14.1d(g) the comment admission constant filters by author_association (a drive-by comment must not suppress the durable post)"
+assert_contains "$(cat "$RECORD")" 'author_association == "MEMBER"' \
+    "14.1d(g) …and admits MEMBER"
+assert_contains "$(cat "$RECORD")" 'author_association == "COLLABORATOR"' \
+    "14.1d(g) …and admits COLLABORATOR (all three the gate admits)"
+# (d-f) THE POST-FAILURE ARM (#3168 re-review finding 4). Nothing exercised it:
+#       `STUB_COMMENT_POST_FAIL` was defined by the stub and exported by the harness
+#       but NO vector ever set it, so swapping the failure line for the SUCCESS line
+#       left the suite GREEN — a false-PASS-shaped mutant that tells an operator the
+#       durable copy exists during exactly the 403 / spent-token window this arm
+#       exists to report. Both halves are asserted: the failure is NAMED on stderr,
+#       and the success line is NOT printed on stdout.
+CPF_PR=424345
+: > "$LOG"
+STUB_COMMENT_POST_FAIL=1 STUB_COMMENT_CAPTURE="$T/ccap_f" run_record_633 "$CPF_PR" "$SHA" "$DC_CRUNS"
+assert_contains "$RECORD_ERR" "could not post the durable comment copy" \
+    "14.1d(f) a FAILED comment POST is reported on stderr"
+assert_not_contains "$RECORD_OUT633" "as a durable comment" \
+    "14.1d(f) …and the run does NOT claim a durable copy it failed to create (the false-PASS message)"
 # (e) THE P2 PIN: when the BODY channel fails, the run that most needs the durable
 #     copy must still attempt it. Both failure arms used to `exit 5` before reaching
 #     the durable block, so the channel never fired in the only scenario it exists
@@ -4999,6 +5035,27 @@ if grep -qF -- "-X PATCH" "$LOG"; then ok "14.10b the flush actually PATCHed the
 #       `run_record_633`/this arm truncate first, so the count is this run's alone.
 assert_eq "$(dc_posts 424329)" "1" \
     "14.10b2 --flush-pending also publishes the durable comment (not just the body PATCH)"
+# 14.10b3 THE FLUSH ORDERING IS LOAD-BEARING, SO PIN IT (#3168 re-review finding 5).
+#       The code says the durable call is "Placed before post_marker() so a body-side
+#       failure cannot short-circuit it", but 14.10b2 above only exercises a
+#       SUCCESSFUL PATCH — so MOVING the call inside that branch left the suite at
+#       PASS=1005 FAIL=0 (measured with the ordering inverted). The flush exists for
+#       the run whose BODY channel already failed once, so the discriminating case is
+#       a flush whose PATCH fails AGAIN: the durable copy must still be attempted.
+#       That is the whole reason the call sits above the `if post_marker`.
+FL2_PR=424344
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' run_record_633 "$FL2_PR" "$SHA" '[]'
+PEND14B="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$FL2_PR.marker"
+if [ -f "$PEND14B" ]; then ok "14.10b3 fixture: the failed body read left a pending marker to flush"; else bad "14.10b3 fixture missing — nothing pending, so the vector would judge nothing"; fi
+: > "$LOG"
+FL2_RC=0
+FL2_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_PATCH_FAIL=1 \
+    STUB_BODY="PR body — no review evidence yet" \
+    bash "$RECORD" --flush-pending "$FL2_PR" daniel-ospina/agent-infra 2>&1)" || FL2_RC=$?
+assert_eq "$(dc_posts "$FL2_PR")" "1" \
+    "14.10b3 the flush publishes the durable comment even when its body PATCH FAILS (ordering, not luck)"
+assert_contains "$FL2_OUT" "as a durable comment" \
+    "14.10b3 …and says so, so the operator can tell the two channels apart [out: $(printf '%s' "$FL2_OUT" | tr '\n' ' ')]"
 assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
 # 14.10d an EMPTY pending file is NOT a delivered marker (cycle-2 P1: the helper
 #       used to `rm -f` it and return 0, so the flush claimed delivery and then
@@ -5793,6 +5850,44 @@ if [ -f "$(Q2 424969)" ]; then bad "20.3b the refused clean mint wrote a record"
 assert_contains "$RECORD_ERR" "DECLARES a non-clean outcome" "20.3b …and names the declaration it refused on, which only (1b) can see"
 NEG_F=1
 EV_REF="comment:42495501"
+
+# ── 20.10 THE DURABLE-COMMENT GUARD MUST VERIFY THE HMAC, NOT MATCH A SUBSTRING ──
+# (#3168 re-review finding 1 — EXPLOITED at runtime, which is why this is a
+# discriminator and not a smoke test.) `--findings-note` is FREE-FORM (rejected only
+# for `"`, `\` and control characters, :1606) and is spliced into the marker text
+# verbatim (:4749). So on the pre-fix tree a KEY-LESS not-clean mint whose note
+# contained the token ` sig=` produced a marker with a FAKE 64-hex trailer that the
+# old `case "$marker" in *" sig="*)` guard ACCEPTED and published as a PERMANENT PR
+# comment — measured against a stub `gh`: 1 POST for that unsigned marker, versus 0
+# for the clean unsigned case in 14.1d(d). Trailer-anchoring
+# (` sig=[0-9a-f]{64}$`) does NOT close it either, because `note=x sig=<64hex>` ends
+# the marker that way — only recomputing the HMAC over the marker's own text does.
+# These two vectors live HERE (not beside 14.1d) on purpose: a not-clean mint must
+# carry a non-empty --evidence artifact, so `STUB_EVIDENCE_BODY` has to exist first,
+# and a vector placed before it would silently never reach the comment channel —
+# green for the wrong reason, which is the exact defect class this pair pins.
+DC_PR2=424342
+DC_PR3=424343
+FAKE_SIG="$(printf '%064d' 0)"
+rb_clear
+: > "$LOG"
+AI_REVIEW_GATE_KEY="" STUB_COMMENT_BODIES="" \
+    run_record_neg "$DC_PR2" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
+assert_eq "$(dc_posts "$DC_PR2")" "0" \
+    "20.10 an UNSIGNED marker whose NOTE merely contains ' sig=' is never published as a comment (HMAC-verified, not text-matched)"
+# THE NEGATIVE CONTROL. Without this, the vector above would also pass on a guard
+# that simply refuses EVERY not-clean marker — an over-block that silently disables
+# the durable channel for every negative review, which is the one verdict that most
+# needs a retractable copy. The genuine signature is appended AFTER the note, so
+# splitting on the LAST ' sig=' picks up the real one and the HMAC still verifies.
+rb_clear
+: > "$LOG"
+STUB_COMMENT_BODIES="" \
+    run_record_neg "$DC_PR3" --findings-note "quoted sig=$FAKE_SIG" >/dev/null 2>&1 || true
+assert_eq "$(dc_posts "$DC_PR3")" "1" \
+    "20.10 …but a SIGNED not-clean marker whose note contains ' sig=' IS still published (the fix must not over-block)"
+
+DM_20_SENTINEL=1
 
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"

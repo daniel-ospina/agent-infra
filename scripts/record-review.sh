@@ -1183,14 +1183,68 @@ ${marker}"; else newbody="$marker"; fi
 post_marker_comment() { # <repo> <pr> <marker>
   local repo="$1" pr="$2" marker="$3"
   local PR_EVIDENCE_COMMENTS_JQ="" HAVE_COMMENT=0 EXISTING_COMMENT_BODIES=""
+  local _mtext="" _msig="" _mexp=""
   # ⛔ AN UNSIGNED MARKER IS NEVER PUBLISHED AS A COMMENT. The gate can never accept
   # one (it HMAC-verifies), and unlike the body a comment is PERMANENT. Enforced HERE,
   # at the single chokepoint, so no caller can forget it and no new call site can
   # reopen the hole. The unsigned path stays body-only, where its warning is loud.
+  # ⛔ THIS GUARD MUST VERIFY THE HMAC — A TEXT MATCH IS NOT ENOUGH (#3168 re-review
+  # finding 1, exploited at runtime). The first version of this guard tested
+  # `case "$marker" in *" sig="*)`, i.e. it decided "signed" from a SUBSTRING of the
+  # marker. That is forgeable from an ordinary CLI flag: `--findings-note` is
+  # free-form (rejected only for `"`, `\` and control chars, :1606) and is spliced
+  # into the marker verbatim (:4749), so a key-less not-clean mint with
+  # `--findings-note 'quoted sig=<64hex>'` produced a marker containing ' sig=',
+  # passed the guard, and POSTED itself permanently — measured: 1 POST against a
+  # stub `gh` for an unsigned marker, while the same probe on a CLEAN unsigned
+  # marker correctly made 0. Trailer-anchoring (` sig=[0-9a-f]{64}$`) does NOT close
+  # it either, for the same reason (`note=x sig=<64hex>` ends the marker that way).
+  # `MARKER_SIGNED` is not the fix either: this function has five call sites and
+  # flush_pending_markers / --recover-body do not have it in scope — which is
+  # plausibly why the text match was written in the first place.
+  # So apply the file's OWN doctrine (:2816-2818): "a marker is EVIDENCE only when
+  # its `sig=` verifies over its own text". GATE_KEY is resolved GLOBALLY at :2800,
+  # above every call site, so this is authoritative everywhere and needs no new
+  # parameter. Split on the LAST ' sig=' — that is the real trailer, and it also
+  # keeps a note that legitimately contains ' sig=' working, because the genuine
+  # signature is appended after it. Any failure ⇒ no comment (fail closed).
+  # ⛔ `${GATE_KEY:-}`, NOT `$GATE_KEY` (#3168 re-review): `--flush-pending` and
+  # `--recover-body` dispatch BEFORE the global assignment at :2800, so under
+  # `set -u` a bare `$GATE_KEY` here aborts the whole flush (measured: 10 vectors
+  # red, "line 1218: GATE_KEY: unbound variable"). An unset key must read as
+  # "unsigned" and fail CLOSED, never as a crash.
   case "$marker" in
-    *" sig="*) : ;;
+    *" sig="*) ;;
     *) return 0 ;;
   esac
+  _mtext="${marker% sig=*}"
+  _msig="${marker##* sig=}"
+  [[ "$_msig" =~ ^[0-9a-f]{64}$ ]] || return 0
+  # ⛔ RESOLVE THE KEY LOCALLY WHEN THE CALLER'S SCOPE PREDATES THE GLOBAL. The
+  # global is assigned at :2800, but `--flush-pending` dispatches at :1722 — long
+  # before it — so a bare `$GATE_KEY` here was an `unbound variable` abort under
+  # `set -u` in the flush (measured: 10 vectors red), and taking the global's
+  # EMPTY value instead would silently fail CLOSED on a perfectly good signed
+  # marker, disabling the durable copy on the one path whose entire purpose is to
+  # deliver it. Replicating the same resolution keeps this function authoritative
+  # at every call site without moving a global the mint path deliberately
+  # resolves once, above the stale-sha guard.
+  local _key="${GATE_KEY:-}"
+  if [ -z "$_key" ]; then
+    _key="${AI_REVIEW_GATE_KEY:-}"
+    [ -n "$_key" ] || _key="$(cat "$HOME/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+    _key="$(printf '%s' "$_key" | tr -d '[:space:]')"
+  fi
+  [ -n "$_key" ] || return 0
+  _mexp="$(printf '%s' "$_mtext" | command openssl dgst -sha256 -hmac "$_key" 2>/dev/null | awk '{print $NF}' || true)"
+  [ -n "$_mexp" ] || return 0
+  if [ "$_mexp" != "$_msig" ]; then
+    # LOUD, because this arm means the caller believed it had a signed marker and
+    # did not — either a tampered/corrupt marker or a key that no longer matches
+    # the one that signed it. Either way the durable copy is REFUSED, not degraded.
+    echo "⚠️ record-review: REFUSING to publish a marker to the durable comment channel — its \`sig=\` does not verify against the configured AI_REVIEW_GATE_KEY. An unverifiable marker must never become a permanent PR comment (the gate could never accept it, and unlike the PR body it cannot be retracted). No comment was posted." >&2
+    return 0
+  fi
   # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
   # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
   # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract says a producer
