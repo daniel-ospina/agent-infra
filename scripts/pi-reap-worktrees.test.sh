@@ -5216,9 +5216,6 @@ OUT="$(cd / && HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
 assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
     "G15r …and from the cwd where it does not, so the verdict is not a function of the caller"
 
-assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
-    "G15r …and from the cwd where it does not, so the verdict is not a function of the caller"
-
 # G15s: the record is a DANGLING SYMLINK — and `[ -e ]` is FALSE for one, so this is the ONE shape
 # where the `-L` disjunct is the entire guard. It is not hypothetical: a rotated pin leaves exactly a
 # link to a path that no longer exists. G15q exercises only `[ -e ]` (chmod 000 on a regular file), so
