@@ -856,7 +856,15 @@ else
     # as the non-existent `$<none>`. The suite missed it because the guard greps one fixed phrase.
     case "${KEY_GATE_REASON:-credential-missing}" in
       store-invalid|auth-store-unreadable)
-        KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and neither exporting \$${KEY_GATE_VAR:-<none>} nor a models.json template rescues that; repair or delete that file and re-dispatch" ;;
+        # ⛔ NO `$<none>` IN AN INSTRUCTION (round 25, P3, measured): with no models.json template the gate sets
+        # `KEY_GATE_VAR` to the literal `<none>`, so the `${VAR:-<none>}` form below rendered "exporting $<none>" — a
+        # shell token that does not exist — inside a remedy the operator is meant to follow. The clause is dropped
+        # entirely when there is no variable to name (the gate…s own line does the same, printing `var=<none>`).
+        case "${KEY_GATE_VAR:-}" in
+          ""|"<none>"|"unknown") _kg_export="" ;;
+          *) _kg_export=" nor exporting \$${KEY_GATE_VAR}" ;;
+        esac
+        KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and neither a models.json template${_kg_export} rescues that; repair or delete that file and re-dispatch" ;;
       *)
         KEY_GATE_WHY="\$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it; put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file" ;;
     esac
