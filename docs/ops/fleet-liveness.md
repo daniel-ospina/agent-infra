@@ -429,7 +429,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**51 tests with 87 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**51 tests with 88 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
 > suite is **T32–T51**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
@@ -812,7 +812,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 51 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (87)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (88)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
@@ -1884,7 +1884,7 @@ so it never is.
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
 Regression contract: `python3 tools/fleet/liveness.test.py` (51 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (87 mutations, each of which must make its paired
+`python3 tools/fleet/liveness.test.py --mutations` (88 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder); T43–T51 are the 2026-11-04 binding / corroboration / abstention rounds. Their paired mutations re-introduce the exact pre-fix behaviours — the

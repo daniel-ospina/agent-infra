@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with eighty-seven paired mutations: every mutation re-
+Fifty-one tests with eighty-eight paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -18,7 +18,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (87)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (88)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2109,6 +2109,30 @@ def t43():
         check("unbound-bound-verdict" in lr.detail, "and named; got %r" % lr.detail)
         check(liv.evaluate(liv.Evidence(log_read=lr)).state == "no-verdict",
               "still terminal, still honest")
+
+        # ⛔ A `pid=` PRESENT BUT UNUSABLE IS "PRESENT" (`"?"`), NOT "ABSENT" (`""`). The
+        # LOCATOR used to be `pid=([0-9]+)`, so every non-all-digit form produced NO match
+        # -> `""` -> ADOPTED -> a previous dispatch's `verdict=finished` published as this
+        # lane's terminal state (the stale-verdict FALSE PASS this axis exists to remove),
+        # while the census dropped the identical token. Executed on the REAL path.
+        for bad in ("?", "0x1f", "", "abc", "-1", "1e5"):
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%s rc=0 "
+                         "log=%s\n" % (bad, log))
+            lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+            v = liv.evaluate(liv.Evidence(log_read=lr))
+            check(v.state == "no-verdict",
+                  "an unusable `pid=` (%r) must be DROPPED, never adopted as finished; got %s"
+                  % (bad, v.state))
+            check("unbound-bound-verdict" in (lr.detail or ""),
+                  "…and named as unbound; got %r" % (lr.detail,))
+        # …while a line that names NO pid at all is still the adopted-and-declared shape.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane rc=0 log=%s\n" % log)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check("bound-verdict-without-pid" in (lr.detail or ""),
+              "a genuinely pid-less line is adopted AND declared; got %r" % (lr.detail,))
+
         # ⛔ RE-GATHER: the previous sub-case already dropped its verdict, so evaluating
         # that stale `LogRead` asserted a conclusion about an object the appended log
         # never reached — "asserted evidence it does not have", the class this suite's
@@ -3038,8 +3062,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T43", "module",
-        '    return pids[-1] if len(pids[-1]) <= 10 else "?"',
-        '    return pids[-1]',
+        '    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
+        '    return tok',
         "the cap is gone, so an unusable pid token falls through to the FALLBACK guard: "
         "the drop reason becomes invalid-bound-verdict-pid instead of unbound-bound-verdict "
         "(and but for that guard, int() would raise out of gather_log_lane)",
@@ -3231,6 +3255,14 @@ MUTATIONS = [
         '    return (int(out) if (out.isascii() and out.isdigit()) else None)',
         "`_parent_of`'s digit bound is dropped again, so an unreadable ppid row raises "
         "ValueError on the BINDING path, where the contract is `None`",
+    ),
+    Mutation(
+        "T43", "module",
+        'globals()["_BOUND_PID_RE"] = _re.compile(r"\\bpid=(\\S*)")',
+        'globals()["_BOUND_PID_RE"] = _re.compile(r"\\bpid=([0-9]+)\\b")',
+        "the bound-line PID LOCATOR carries the allow-list again, so an unusable `pid=` "
+        "reads as ABSENT and is ADOPTED — a previous dispatch's `finished` published as "
+        "this lane's terminal state",
     ),
     Mutation(
         "T51", "module",

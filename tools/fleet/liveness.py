@@ -1130,7 +1130,15 @@ def _bound_verdict_re():
         # Presence only (no allow-list) — tells "absent" from "present but unreadable".
         globals()["_BOUND_RC_PRESENT_RE"] = _re.compile(r"\brc=")
         _BOUND_RC_PRESENT_RE = globals()["_BOUND_RC_PRESENT_RE"]
-        globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=([0-9]+)\b")
+        # ⛔ THE LOCATOR CARRIES NO ALLOW-LIST. `pid=([0-9]+)` meant a bound line whose
+        # `pid=` was PRESENT but unusable in a non-all-digit form (`?`, `0x1f`, empty,
+        # `abc`, `-1`, `1e5`) produced NO match — i.e. `""`, the value reserved for "the
+        # line names no incarnation", which `_bind_verdict` ADOPTS. So a previous
+        # dispatch's `verdict=finished` was published as this lane's terminal state (the
+        # stale-verdict FALSE PASS this axis exists to remove), while the census dropped
+        # the identical token. The allow-list now applies to the TOKEN, as in
+        # `parse_runner_line`; `""` means the line genuinely carries no `pid=`.
+        globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=(\S*)")
         # ⛔ THE MARKER ALONE, with NO token requirement. `_BOUND_VERDICT_RE` demands
         # `verdict=` followed by `[a-z][a-z-]*`, so a FINAL line whose token is
         # uppercase, empty, or spaced (`verdict = stalled`) produced NO match and the
@@ -1322,41 +1330,18 @@ def parse_bound_pid(text: str):
     if line is None:
         return ""
     pids = _bound_pid_re().findall(line.split(" log=")[0])
-    # A pid is <= 7 digits (PID_MAX_DEFAULT 4194304). A longer token is not a pid, and
-    # `int()` on it raises "Exceeds the limit (4300 digits)" — an exception, not a state.
     if not pids:
-        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS NOT AN ABSENT ONE (review P2).
-        # "Absent from the line" is the ADOPT row of the doc's binding table; "a pid that cannot
-        # be resolved" is the DROP row. This returned "" for both, so a line carrying `pid=abc`
-        # took the ADOPT arm and published a verdict whose binding was never checked.
-        #
-        # WHERE SUCH A LINE COMES FROM — stated narrowly, because the first version of this
-        # comment overclaimed it and a later reviewer falsified the claim. It is NOT the shipped
-        # writer: `lane-bound.sh --pid` takes the value verbatim (`:161`) but no emission path can
-        # carry a non-numeric one — `watch` mode refuses first (`:465` → `pid_alive`, whose
-        # `case "${1:-}" in *[!0-9]*) return 1` guard at `:234` has been on `main` since the bound
-        # was introduced) and `run` mode overwrites `PID=$!` (`:475`). Measured:
-        # `lane-bound.sh watch --log … --pid abc` → "refusing: --pid 'abc' is not a live
-        # process — nothing to bound", rc=2, nothing emitted. So the producers that reach this
-        # arm are a FOREIGN or hand-edited verdict file (`$log.lanebound`), a restored state dir,
-        # or a FUTURE producer — the same producer class this file names for every other hostile
-        # state value. That makes this defence in depth, not a live production bypass, and the
-        # guard is justified without the overclaim: the doc's binding table requires the DROP row
-        # for an unresolvable pid, and `_bind_verdict`'s `invalid-bound-verdict-pid` arm already
-        # existed for a non-pid token but was UNREACHABLE from this parser — which is what marks
-        # the intent. `"?"` reaches it.
-        # `\bpid=` does not match `ppid=` / `cpu_delta_cs=` (a word boundary needs a non-word
-        # char before `p`), so this only fires on a real `pid=` field.
-        if _bound_pid_field_re().search(pid_head):
-            return "?"
+        # The line names NO pid at all — the one shape that is adopted-and-declared.
         return ""
     # A pid token is capped at 10 digits DEFENSIVELY, not because `PID_MAX_DEFAULT` (4194304)
     # is 7 digits long. The cap exists so `int()` below never sees a 4300-digit token and
     # raises "Exceeds the limit" — an exception is not a state. Any token longer than the cap
     # is NOT a pid.
     # `"?"` marks "present but unusable", which the binding DROPS; `""` means "the line
-    # names no incarnation", which is ADOPTED and declared.
-    return pids[-1] if len(pids[-1]) <= 10 else "?"
+    # names no incarnation", which is ADOPTED and declared. The allow-list applies to the
+    # TOKEN, never to the locator, or every unusable form above would read as "absent".
+    tok = pids[-1]
+    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"
 
 
 def _pid_within(root: int, child: int, *, hops: int = 64):
