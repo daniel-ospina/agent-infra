@@ -122,14 +122,34 @@ tb_watchdogs_reap() {
 }
 
 # tb_watchdog <secs> <cmd...> — run <cmd> with a SIGKILL timer; 124 when the timer fired.
+#
+# ⛔ THE TIMER KILLS THE PROCESS **GROUP**, NOT JUST THE DIRECT CHILD (review of PR #3399, P2 —
+# REPRODUCED). `kill -9 "$pid"` reaps the command itself, but a command that FORKS a transport helper
+# leaves the grandchild alive — and because every caller captures this function's output
+# (`out="$(tb_timeout … 2>&1)"`, the shape this file's own tb_timeout note documents), the orphan keeps
+# the capture PIPE open and the command substitution blocks on it for as long as the orphan lives. The
+# bound then holds in SPELLING only: measured `tb_timeout 3` over a command that backgrounds a
+# `sleep 8` → **8 s** when captured, 3 s when redirected. In the fleet that is `git push` against a
+# black-holed transport hanging a dying lane for the full TCP connect timeout (measured 131 s against a
+# declared 15 s) on exactly the hosts this file exists for — macOS, which has no GNU `timeout` to signal
+# the group. Linux runners masked it, which is why only the internal path could see it.
+# ⛔ SO THE JOB GETS ITS OWN PROCESS GROUP (`set -m`) AND THE TIMER SIGNALS `-pgid`, which is what GNU
+# `timeout` does and why it never had this defect. The group is assigned at FORK, so job control is
+# restored immediately after both launches — the caller's `set -m` state is left exactly as it was found
+# (the same discipline `run_agent` records for its own `set -m`), and the negative-pid kill still reaches
+# the group afterwards. A shell that refuses `set -m` falls back to the direct-child kill, so this is a
+# strict improvement on every host rather than a new dependency.
 tb_watchdog() {
     local secs="$1"; shift
-    local pid wd="" s rc=0 sentinel="" done_flag=""
+    local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 jobctl=0
     TB_BOUND_N=$((TB_BOUND_N + 1))
     if tb_bound_tmp; then
         sentinel="$TB_BOUND_TMP/s.$TB_BOUND_N"
         done_flag="$TB_BOUND_TMP/d.$TB_BOUND_N"
     fi
+    was_m=0; case $- in *m*) was_m=1 ;; esac
+    jobctl=0
+    set -m 2>/dev/null && jobctl=1
     "$@" &
     pid=$!
     (
@@ -142,10 +162,16 @@ tb_watchdog() {
         [ -n "$done_flag" ] && [ -e "$done_flag" ] && exit 0
         if kill -0 "$pid" 2>/dev/null; then
             [ -n "$sentinel" ] && : >"$sentinel"
-            kill -9 "$pid" 2>/dev/null
+            # ⛔ THE GROUP FIRST, THE CHILD AS THE FALLBACK. A grandchild (git's transport helper) is what
+            # holds a caller's capture pipe open; killing only `$pid` leaves it writing into that pipe.
+            kill -9 "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
         fi
     ) >/dev/null 2>&1 &
     wd=$!
+    # The groups exist as of the fork, so the caller's job-control state is restored HERE and not after
+    # the wait: leaving it on for the duration would change how every async command the CALLER runs while
+    # this probe is in flight is grouped.
+    [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
     TB_WATCHDOGS="$TB_WATCHDOGS $wd"
     wait "$pid" 2>/dev/null || rc=$?
     if [ -n "$wd" ]; then
