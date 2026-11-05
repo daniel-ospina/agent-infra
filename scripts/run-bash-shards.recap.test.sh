@@ -32,7 +32,9 @@
 #   can cause. The suite therefore runs its fixtures unsliced (stated, never silent), and this arm
 #   is the MUTATION control pinning the HAZARD and the runner's refusal contract: the same fixture
 #   WITH the slice must still refuse with the runner's own message, so a changed refusal wording, a
-#   changed rc, or a weakened runner reds it.
+#   changed rc, or a weakened runner reds it. The drop above clears the runner's WHOLE env contract
+#   (`BASH_SHARD_SLICE`, `BASH_SHARDS_BUDGET_SECS`, `SHARD_BOUND`) because the two lanes export
+#   DIFFERENT knobs for the same runner and would otherwise each leak — see the block at the `unset`.
 #   ⛔ WHAT THIS ARM DOES NOT PIN, stated so nobody reads it as more than it is: it sets its own
 #   slice, so it is independent of the `unset` above and CANNOT see the mitigation disappear. That
 #   is measured, not assumed — delete the `unset` and an UNSLICED run is still green, while the
@@ -73,12 +75,22 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 # ⛔ THE FIXTURE'S LIST IS NOT THE JOB'S LIST (#3452). A slice is a MATRIX concern of the job that
 # owns the REAL list — `run-bash-shards.sh`'s own words — and it has no meaning inside a fixture
 # whose list is three entries long. Dropped here, PRINTED so a lane reading the job log can see the
-# value was dropped on purpose instead of wondering why a slice did nothing. ARM 3 pins the reason
-# the drop is needed, so this cannot decay into an unexplained `unset`.
-if [ -n "${BASH_SHARD_SLICE:-}" ]; then
-  echo "  · inherited BASH_SHARD_SLICE='$BASH_SHARD_SLICE' is the OUTER job's slice of the REAL list — the fixture's 3-shard list is not that list, so the fixtures run unsliced (#3452; ARM 3 proves it)"
+# value was dropped on purpose instead of wondering why a slice did nothing.
+#
+# ⛔ AND IT IS NOT THE ONLY NAME THAT LEAKS — this line must clear the runner's WHOLE env contract,
+# not just the one that reddened first (review of this change, cycle 2, P1). The two lanes export
+# DIFFERENT knobs for the SAME runner: `ci.yml`'s `bash-suites` exports `BASH_SHARD_SLICE`, and
+# `ci-main.yml`'s `script-validate` exports `BASH_SHARDS_BUDGET_SECS: '7800'` for the whole step, so
+# every shard inherits it on main's lane too (`shard_run_bounded` hands a shard its environment
+# unchanged). A positive budget and a slice do not compose — `run-bash-shards.sh` refuses the pair
+# by name — so ARM 3's slice would then hit THAT refusal instead of the one it pins, and the arm
+# reddened on main's lane. Measured with only `BASH_SHARDS_BUDGET_SECS=7800` (the `script-validate`
+# shape): `PASS 12 · FAIL 1` — ARM 3, on a diff whose subject is a red no diff can cause.
+# It is the line `tests/run-bash-shards-bound/run.sh` §0 already spells, for exactly this reason.
+if [ -n "${BASH_SHARD_SLICE:-}" ] || [ -n "${BASH_SHARDS_BUDGET_SECS:-}" ] || [ -n "${SHARD_BOUND:-}" ]; then
+  echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE:-}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS:-}' SHARD_BOUND='${SHARD_BOUND:-}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header)"
 fi
-unset BASH_SHARD_SLICE
+unset SHARD_BOUND BASH_SHARDS_BUDGET_SECS BASH_SHARD_SLICE
 
 # ⛔ THE FIXTURE MUST NOT ASK THE HOST'S PROCESS TABLE ANYTHING (#3011): a copy of the runner calls
 # `fixture_guard_placement` with the DEFAULT root set, so on a box with a live cell controller the
@@ -255,9 +267,11 @@ fi
 
 # ARM 3 — THE MUTATION CONTROL (#3452). Hand the SAME fixture the outer job's slice and the runner
 # must refuse: that is the red this suite shipped in the sharded lane, and this arm is what keeps
-# the mitigation above from being deleted as unexplained noise. The value is written for THIS CHILD
-# only, so the suite's own environment stays unsliced.
-BASH_SHARD_SLICE="$SLICE_CONTROL" bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/sliced.out" 2>&1
+# the mitigation above from being deleted as unexplained noise. ⛔ ONE VARIABLE IS ISOLATED ON
+# PURPOSE: the other two runner knobs are `env -u`n out of the child, because `BASH_SHARDS_BUDGET_SECS`
+# plus a slice is a DIFFERENT refusal (a positive budget and a slice do not compose) and would satisfy
+# this arm's `rc 2` for the wrong reason, or fail it for a reason that is not the one asserted.
+BASH_SHARD_SLICE="$SLICE_CONTROL" env -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/sliced.out" 2>&1
 SRC=$?
 SOUT="$(cat "$TMP/sliced.out" 2>/dev/null)"
 # The refusal's count is DERIVED from SLICE_CONTROL, never re-typed: a literal here would let the
