@@ -15892,7 +15892,7 @@ else
   fail "(p) rail-exit.test.sh FAILED — see its output above"
 fi
 
-# ── (q) EVERY `--jq` PROGRAM IN THE RAIL MUST COMPILE ──────────────────────────
+# ── (q) EVERY `--jq` PROGRAM THE RAIL SPELLS INLINE MUST COMPILE ───────────────
 # #2598's sibling, and the reason #2598's own repro could not find it: `wait_for_run`'s
 # RE-RUN read carried an UNTERMINATED jq string — one closing `"` short:
 #
@@ -15908,9 +15908,14 @@ fi
 # its repro never exercised the script's actual text. The shim is a real but SEPARATE
 # fault; repairing it alone still blocks every re-run.
 #
-# THE SUITE COULD NOT SEE IT: the fake `gh` IGNORES `--jq` and prints its own projection,
-# so a malformed filter is invisible to every scenario. This guard is therefore STATIC —
-# each expression is COMPILED ahead of time. The wrapper puts the expression in a `def`
+# THE SUITE COULD NOT SEE IT: the `run view` arm of the fake `gh` — the status/attempt
+# projection this bug lives in (`:556-660`) — keys only on `--json` and prints its OWN
+# output, never parsing `--jq`. A malformed filter is therefore invisible to every
+# scenario that drives that arm. (Do not overstate this as "the fake ignores --jq":
+# eight OTHER arms DO dispatch on the program via `flag_val --jq` (`:761`, `:882`,
+# `:955`, `:988`, `:997`, `:1000`, `:1018`, `:1025`) and one hard-fails an unmodelled
+# projection — a review cycle falsified the absolute form of this sentence.)
+# This guard is therefore STATIC — each expression is COMPILED ahead of time. The wrapper puts the expression in a `def`
 # that is never invoked, so this is a COMPILE check and not an evaluation: an expression
 # like `.[] | …` must not be run against `null` and reported as broken when it is merely
 # inapplicable to an empty input.
@@ -15932,6 +15937,18 @@ fi
 # ⛔ FAIL-CLOSED, THREE WAYS: a missing `jq` is a FAILURE; an EMPTY population is a
 # FAILURE; and a population BELOW `JQ_LITERAL_FLOOR` is a FAILURE. An empty scan is never
 # a clean scan, and a guard over a shrunken population reports a pass it did not earn.
+#
+# ⚠️ WHAT THIS IS, PRECISELY — a CENSUS OF THREE DECLARED FORMS, NOT A PROOF. It compiles
+# (1) single-quoted literals, (2) unquoted bare-token programs, (3) `*_JQ` assignments at
+# line start, optionally behind `export`/`readonly`/`local`/`declare`. Its known gaps are
+# stated rather than denied: a program held in a variable NOT named `*_JQ`, a program built
+# at runtime (`--jq "$(…)"`), and the `--jq=PROG` spelling (zero sites in the rail today)
+# are all outside it. Prose can also INFLATE the census — only WHOLE-LINE comments are
+# stripped, so a `say_err "… --jq .isDraft …"` string or a trailing `# … --jq .field`
+# comment contributes an entry that is not a call site. That is why the floor is a SHRINK
+# DETECTOR and not a completeness proof: it cannot tell 20 real programs + 4 prose from
+# 24 real ones. No static scan of a shell script can close that gap; the ceiling on this
+# guard is honest coverage of the forms the rail actually uses, which is what it has.
 JQ_LITERALS_TMP="$TMP/jq-literals.txt"
 # FORM 1 — the single-quoted literal, which is where the original bug was.
 { grep -o -- "--jq '[^']*'" "$ROOT/scripts/admin-merge.sh" \
@@ -15939,24 +15956,33 @@ JQ_LITERALS_TMP="$TMP/jq-literals.txt"
 # FORM 2 — the UNQUOTED bare-token program (`--jq .nameWithOwner`). A review cycle caught
 # the first draft declaring "every --jq program" while covering only FORM 1 and the
 # variables: SIX call sites (`.nameWithOwner`, `.headRefOid`, `.isDraft`, `.baseRefName`,
-# `.url`, `.sha`) were never compiled. Comment lines are stripped first, so a prose mention
-# of `--jq .isDraft` cannot enter the population; a quoted form is excluded by the first
-# character class so it is not counted twice.
+# `.url`, `.sha`) were never compiled. A quoted form is excluded by the first character
+# class so it is not counted twice. Whole-line comments are stripped, but a TRAILING comment
+# or a string literal mentioning `--jq .field` is NOT — see the census caveat above.
 { grep -v '^[[:space:]]*#' "$ROOT/scripts/admin-merge.sh" \
     | grep -oE -- "--jq [^'\"[:space:]][^[:space:]]*" \
     | sed 's/^--jq //' ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
 # FORM 3 — THE VARIABLE-HELD PROGRAMS. A `--jq "$VAR"` is invisible to both scans above, and
 # there are THREE such programs — `LANE_RUN_JQ`, `FIRST_CHECKS_JQ`, `LANE_RUN_GUARD_JQ`.
 # They are the SAME SHAPE as the expression this section exists for (`.[] | "\(…)\t…”`),
-# so a typo in any of them produces the identical silent-unobservable failure. The first
-# draft covered only `LANE_RUN_JQ` and called it "the one expression the rail passes as a
-# VARIABLE"; a review cycle falsified that against the script. The scan is generic WITHIN
-# THE `_JQ` NAMING CONVENTION — ⛔ that is the limit of the claim, and it is stated rather
-# than overclaimed: a fourth program named `JQ_FILTER=`, `*_PROG=` or `*_EXPR=` would be
-# added and silently unguarded. The floor below is what catches a SHRINK; it cannot catch
-# a wholly new naming convention, and no static scan of a shell script can.
-{ grep -oE "^[A-Z_]+_JQ='[^']*'" "$ROOT/scripts/admin-merge.sh" \
-    | sed "s/^[A-Z_]*_JQ='//; s/'\$//" ; } >> "$JQ_LITERALS_TMP" 2>/dev/null || true
+# so a typo in any of them produces the identical silent-unobservable failure. Two review
+# cycles tightened this scan: the first draft covered only `LANE_RUN_JQ` and called it "the
+# only variable"; the second matched `^[A-Z_]+_JQ=` only, which missed a FOURTH such
+# program the moment it was INDENTED, declared `local`/`export`, or double-quoted. The
+# pattern now tolerates all of those, so only a name outside the `*_JQ` convention escapes
+# — the gap the census caveat states.
+# ⛔ TWO PASSES, ONE PER QUOTE STYLE. A single `[^'"]*` value class is WRONG: a
+# single-quoted program routinely CONTAINS `"` (every jq interpolation does), so the class
+# stops at the first `"` and the capture truncates to something like `.[] | `. Each pass
+# therefore closes on the SAME quote it opened with.
+{ grep -oE "^[[:space:]]*(export |readonly |local |declare )?[A-Z_]+_JQ='[^']*'" \
+        "$ROOT/scripts/admin-merge.sh" \
+    | sed -E "s/^[[:space:]]*(export |readonly |local |declare )?[A-Z_]+_JQ='//; s/'$//" ; } \
+    >> "$JQ_LITERALS_TMP" 2>/dev/null || true
+{ grep -oE '^[[:space:]]*(export |readonly |local |declare )?[A-Z_]+_JQ="[^"]*"' \
+        "$ROOT/scripts/admin-merge.sh" \
+    | sed -E 's/^[[:space:]]*(export |readonly |local |declare )?[A-Z_]+_JQ="//; s/"$//' ; } \
+    >> "$JQ_LITERALS_TMP" 2>/dev/null || true
 # `grep -c . <empty file>` prints `0` AND exits 1, so the old `|| echo 0` appended a
 # SECOND `0` and `JQ_LITERAL_COUNT` became the two-line string `0\n0`. The `-eq 0` test
 # then raised "integer expression expected" (condition FALSE), fell through to the else
@@ -15989,7 +16015,7 @@ else
     fi
   done < "$JQ_LITERALS_TMP"
   if [ "$JQ_BAD" -eq 0 ]; then
-    pass "(q) every --jq program in the rail COMPILES ($JQ_LITERAL_COUNT checked = quoted literals + unquoted tokens + \`*_JQ\` variables)"
+    pass "(q) every inline --jq program in the rail COMPILES ($JQ_LITERAL_COUNT checked = quoted literals + unquoted tokens + `*_JQ` variables)"
   else
     fail "(q) $JQ_BAD rail --jq program(s) do not compile — gh fails EVERY read that uses one"
   fi
