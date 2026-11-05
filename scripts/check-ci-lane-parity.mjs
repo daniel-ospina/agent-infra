@@ -133,38 +133,71 @@ function logicalLines(runValue) {
 }
 
 /**
- * The scripts a job's steps actually INVOKE — as executed commands, never as text mentions.
+ * Does this job invoke `canonical` AS THE STEP'S OWN COMMAND?
  *
- * ⛔ NOT A SUBSTRING TEST (#3235 review, P1, measured). The guard-coverage walk below used
- * `s.run.includes("check-ci-lane-parity")`, which matches PROSE: rewriting the guard step to
- * `run: |` + `# bash scripts/check-ci-lane-parity.sh` left this guard exiting 0 and still printing
- * "runs the guard and is unconditional and blocking" — the gate switched off while every gate
- * reported green. `logicalLines` drops comment lines, so a comment is not an invocation, and
- * `CALL_RE` then requires the line to BE `bash <path>` — the same anchor the runner call site uses
- * (see the CALL SITE block in checkLane), so an `echo`, a `|| true` tail, a pipe, a heredoc body
- * or a trailing flag is a mention too.
+ * ⛔ NOT A SUBSTRING TEST, AND NOT A LINE SCAN EITHER (#3235 review, P1, measured twice).
+ * `s.run.includes("check-ci-lane-parity")` matched PROSE, so a commented-out guard step read green.
+ * A "one logical line shaped `bash <path>`" scan then matched UNEXECUTED text: `run: |` +
+ * `cat >/dev/null <<'EOF'` + the call + `EOF` was ACCEPTED, and so was `if false; then \<call\>; fi`
+ * — both measured rc 0 with the gate reporting it runs. A mini shell parser is exactly the
+ * semantics-modelling #666 retired ("two review rounds found six working bypasses and the second
+ * round's were created by the first round's fixes").
+ *
+ * So this uses the ONE technique the file already records for the runner call site (#666 item 6a):
+ * a TRIMMED-LINE EQUALITY. The step's `run` value must BE the bare call — exactly one logical line,
+ * and that line must be `bash <canonical path>`. Only a bare call's exit code is the step's, so
+ * heredocs, `if`/`for` bodies, tails, pipes, `env bash …` and variable indirection all fall out at
+ * once instead of being enumerated.
+ *
+ * ⚠️ DECLARED OVER-BLOCK (category B, accepted): a guard step that runs the call inside a multi-line
+ * script (`set -e` on line 1, the call on line 2) is now REFUSED, although it would execute. The
+ * remedy is a second step, and the refusal says so. That direction is a loud false block; the other
+ * direction was a silent false PASS, which is the class this whole file exists to refuse.
  */
-function invokedPaths(job) {
-  const out = [];
-  for (const v of stepRuns(job)) {
-    for (const line of logicalLines(v)) {
-      const m = CALL_RE.exec(line);
-      if (m) out.push(m[1]);
-    }
+function exactlyInvokes(job, canonical) {
+  return (job.steps || []).some((s) => {
+    if (!s || typeof s !== "object" || Array.isArray(s) || typeof s.run !== "string") return false;
+    const lines = logicalLines(s.run);
+    if (lines.length !== 1) return false;
+    const m = CALL_RE.exec(lines[0]);
+    if (!m) return false;
+    // A CANONICAL REPO PATH, not a basename (#3235 review, P3): `bash scripts/nested/check-ci-lane-parity.sh`
+    // names a DIFFERENT file and must not satisfy the walk. An absolute path and a `./` prefix are the
+    // intended allowances; CALL_RE already strips `./`.
+    return m[1] === canonical || m[1].endsWith("/" + canonical);
+  });
+}
+
+const GUARD_CANON = "scripts/check-ci-lane-parity.sh";
+const SELFTEST_CANON = "tests/ci-lane-parity/run.sh";
+const runsGuardScript = (job) => exactlyInvokes(job, GUARD_CANON);
+const runsSelfTestScript = (job) => exactlyInvokes(job, SELFTEST_CANON);
+
+/**
+ * Validate ONE `BASH_SHARD_SLICE` declaration. Both halves are load-bearing:
+ *
+ * - the DENOMINATOR must be `strategy.job-total` (GitHub's own count) or the width goes stale;
+ * - the NUMERATOR must be `matrix.shard`, or EVERY arm runs the SAME slice. `1/${{ strategy.job-total }}`
+ *   measured rc 0 and leaves 142 of 163 suites unrun while each arm still passes its own set
+ *   assertion, because every process derives its expected set from its OWN index — the identical
+ *   hole the denominator rule closes, on the other side of the slash (#3235 review, P1).
+ */
+function checkSliceValue(label, file, id, where, v) {
+  if (!v.includes("strategy.job-total")) {
+    refuse(
+      `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
+        v
+      )} — the denominator must be strategy.job-total, GitHub's own count of this matrix, or a widened/narrowed matrix leaves slices NO arm runs while every arm still passes its own set assertion; exiting 2`
+    );
   }
-  return out;
+  if (!v.includes("matrix.shard")) {
+    refuse(
+      `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
+        v
+      )} — the NUMERATOR must be matrix.shard, the one per-arm index the axis assertion pins to 1..N: any other numerator sends EVERY arm to the same slice, so that slice runs N times, the other N-1 run by nobody, and each arm still passes its own set assertion; exiting 2`
+    );
+  }
 }
-
-/** Does this job EXECUTE `script`? A path match, so `scripts/x.sh`, `./scripts/x.sh` and an
- *  absolute path all count — but text that merely names it does not. */
-function invokes(job, script) {
-  return invokedPaths(job).some((p) => p === script || p.endsWith("/" + script));
-}
-
-const GUARD_SCRIPT = "check-ci-lane-parity.sh";
-const SELFTEST_SCRIPT = "tests/ci-lane-parity/run.sh";
-const runsGuardScript = (job) => invokes(job, GUARD_SCRIPT);
-const runsSelfTestScript = (job) => invokes(job, SELFTEST_SCRIPT);
 
 /**
  * A step's failure must be able to fail the RUN: reject the keys that make a step or job not run,
@@ -313,7 +346,7 @@ function checkLane(label, workflowFile, jobName) {
       );
       process.exit(2);
     }
-    note(`   ✅ ${label}: job '${id}' runs the guard and is unconditional and blocking`);
+    note(`   ✅ ${label}: job '${id}' ${runsGuardScript(j) ? "runs the guard" : "runs the guard's MUTATION SELF-TEST"} and is unconditional and blocking`);
   }
 
   // ⛔ AND THE GUARD **AND ITS SELF-TEST** MUST STILL BE THERE (#3174 review, measured). The walk
@@ -500,6 +533,17 @@ function checkBounds(label, workflowFile) {
   const wf = parse(workflowFile);
   const file = base(workflowFile);
   const jobs = (wf && wf.jobs) || {};
+
+  // ⛔ THE WORKFLOW'S OWN `env:` REACHES EVERY JOB, so it is a third place a slice can be declared
+  // (#3235 review, P2, measured: a workflow-level `/12` left 52 of 163 suites unrun at rc 0). It is
+  // validated ONCE here rather than per job, because a workflow-level slice does NOT make every job
+  // in the file a slice-feeding job — only the runner's arm is, and demanding a `shard:` axis from
+  // every unrelated job would be a false block.
+  const wfEnv = wf && wf.env && typeof wf.env === "object" && !Array.isArray(wf.env) ? wf.env : undefined;
+  if (wfEnv && Object.prototype.hasOwnProperty.call(wfEnv, "BASH_SHARD_SLICE")) {
+    checkSliceValue(label, file, "(every job)", "the WORKFLOW's env", String(wfEnv.BASH_SHARD_SLICE));
+  }
+
   for (const [id, j] of Object.entries(jobs)) {
     if (!j || typeof j !== "object" || Array.isArray(j)) continue;
     const steps = Array.isArray(j.steps) ? j.steps : [];
@@ -510,8 +554,14 @@ function checkBounds(label, workflowFile) {
     // JOB-level `env:` reaches every one of the job's steps, so the same slice key placed there
     // bypassed the denominator rule below entirely — a slice with a hard-coded denominator of 12 on
     // an 8-wide matrix left 4/12 of the list run by nobody while this guard stayed green, because
-    // the rule only ever looked at step `env`. Collected from BOTH levels, and the result also
-    // decides whether this job is audited as a slice-feeding job at all.
+    // the rule only ever looked at step `env`. Collected from the JOB and from every STEP, and the
+    // result also decides whether this job is audited as a slice-feeding job at all.
+    // ⚠️ DECLARED RESIDUAL, not silently dropped: an `env:`-shaped declaration is the complete
+    // mechanism this guard can READ (workflow, job, step — all three are validated). A slice
+    // COMPUTED IN SHELL and written to `$GITHUB_ENV` by an earlier step is not a declaration, and
+    // catching it would mean modelling what a `run:` script does — the section-#666 line this file
+    // does not cross. It is a visible code change in the diff, and the runner's own runtime
+    // contract (count <= listed, exact-set reconciliation) is the backstop for the ones it can see.
     const sliceDecls = [];
     const collectSlice = (node, where) => {
       if (!node || typeof node !== "object" || Array.isArray(node)) return;
@@ -568,15 +618,7 @@ function checkBounds(label, workflowFile) {
     // leaves 4/12 of the list run by nobody while every arm still passes its own reconciliation
     // (measured, review cycle 2 mutation D → the guard stayed green). The denominator must be
     // GitHub's own count, which is the only spelling that cannot go stale.
-    sliceDecls.forEach(([where, v]) => {
-      if (!v.includes("strategy.job-total")) {
-        refuse(
-          `${label}: job '${id}' in ${file} sets BASH_SHARD_SLICE in ${where} to ${JSON.stringify(
-            v
-          )} — the denominator must be strategy.job-total, GitHub's own count of this matrix, or a widened/narrowed matrix leaves slices NO arm runs while every arm still passes its own set assertion; exiting 2`
-        );
-      }
-    });
+    sliceDecls.forEach(([where, v]) => checkSliceValue(label, file, id, where, v));
 
     // ── THE MATRIX IS THE COVERAGE CLAIM, AND IT MUST AGREE WITH THE DENOMINATOR ─────────
     // A matrix is not automatically a SLICE: only a job that feeds the runner is audited here, so an
@@ -611,6 +653,11 @@ function checkBounds(label, workflowFile) {
           `${label}: job '${id}' in ${file} feeds the shard runner but its matrix declares no 'shard: [...]' LIST (keys: [${Object.keys(
             matrix
           ).join(" ")}]) — BASH_SHARD_SLICE's denominator is strategy.job-total, so the shard axis must be written as a plain list this guard can count; a matrix spelled with 'include:'/'exclude:' (or with no shard axis at all) cannot be certified, and a slice that NO arm runs is a green hole; exiting 2`
+        );
+      }
+      if (axis.length === 0) {
+        refuse(
+          `${label}: job '${id}' in ${file} declares 'shard: []' — a ZERO-ARM matrix creates no jobs at all, so the entire sweep is ungated while this check reports parity, and every axis assertion below is vacuously true at N=0; exiting 2`
         );
       }
       const total = matrixJobTotal(matrix);
