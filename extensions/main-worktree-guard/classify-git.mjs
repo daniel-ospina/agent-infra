@@ -10332,6 +10332,12 @@ function _rbBacktickRegionEnd(s, from) {
  *    cannot resolve — the caller then leaves the command UNMASKED (fail-closed). */
 function _rbUnquoteDelim(word) {
   const t = String(word ?? "").trim();
+  // ⛔ A `\r` (CRLF line ending) is part of a bash WORD — it is not IFS whitespace
+  // and not a metacharacter — so `<<'EOS'\r` has the delimiter `EOS\r`. The
+  // tokenizer trims it, which would compute `EOS`, find no terminator and mask to
+  // end-of-string, dropping every LOCAL command after the real terminator (review
+  // #3478 cycle 5 P0). A word carrying a CR is therefore UNRESOLVED.
+  if (t.includes("\r")) return null;
   const ANSI = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\v", e: "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?" };
   let out = "";
   let i = 0;
@@ -10361,8 +10367,15 @@ function _rbUnquoteDelim(word) {
       while (i < t.length) {
         if (t[i] === "\\" && i + 1 < t.length) {
           const nx = t[i + 1];
-          // `\c` in ANSI-C: a known escape maps, anything else is taken literally.
-          out += Object.prototype.hasOwnProperty.call(ANSI, nx) ? ANSI[nx] : nx;
+          // ⛔ bash DECODES a character-code escape here (`\101`, `\x41`, `\u00e9`,
+          // `\cA`, `\E`). This remover does not, and a WRONG delimiter is worse than
+          // no mask at all: it never matches the real terminator, so the mask runs to
+          // end-of-string and hides every LOCAL command after it (review #3478 cycle 5
+          // P0). Unresolved ⇒ the whole command is left unmasked.
+          if (/[0-7xuUcE]/.test(nx)) return null;
+          // A KNOWN simple escape maps; an unknown one KEEPS its backslash, exactly
+          // as bash does (`$'\d'` is `\d`).
+          out += Object.prototype.hasOwnProperty.call(ANSI, nx) ? ANSI[nx] : "\\" + nx;
           i += 2;
           continue;
         }
@@ -10456,6 +10469,12 @@ function _rbRemotePayloadStart(tokens, source) {
     // spelling is gated as before (declared residual, fail closed).
     const head = String(tk.text);
     if (head !== "cmux" && head !== "ssh" && head !== "docker") continue;
+    // ⛔ An ARRAY LITERAL is not command position: `arr=(ssh cell 'x')` stores the
+    // words, it runs nothing (review #3478 cycle 5 P2). `(` follows a `name=` word.
+    if (prev && prev.op && prev.text === "(") {
+      const before = tokens[k - 2];
+      if (before && !before.op && /=$|\+=$/.test(String(before.text))) continue;
+    }
     // ⛔ And nothing BEFORE it may have been able to redefine the name
     // (`ssh() { … }`, `alias ssh=…`, `eval`/`source`/`.`), or the "remote"
     // segment executes locally.
@@ -10620,12 +10639,33 @@ export function maskRemoteExecPayloads(command) {
         // stream already absorbs both, so the first `\n` OP token is the boundary.
         const delim = _rbUnquoteDelim(tk.text);
         if (delim === null) return s;    // unreadable delimiter word ⇒ gate as before
+        // ⛔ A `\r` right after the word means the WORD ITSELF carries the CR (bash
+        // does not treat CR as IFS whitespace: `<<'EOS'` + CRLF has the delimiter
+        // `EOS\r`). The tokenizer trims it, so the computed word would never match
+        // the real terminator and the mask would run past every LOCAL command after
+        // it (review #3478 cycle 5 P0). Leave the command unmasked.
+        if (s[tk.end] === "\r") return s;
         let nlAt = -1;
+        let depth = 0;
         for (let j = k + 1; j < tokens.length; j++) {
+          const t = tokens[j];
+          if (t.op && (t.text === "(" || t.text === "(" || t.text === ")")) {
+            // ⛔ `(` and `)` are separator tokens, so a NEWLINE INSIDE an unquoted
+            // `$( … )` / `$(( … ))` on the delimiter line is not the body start:
+            // bash starts the body after the LOGICAL line, and taking the inner
+            // newline dropped the substitution's remainder — a local command
+            // (review #3478 cycle 5 P0). Only a depth-0 newline ends the line.
+            depth += t.text === ")" ? -1 : 1;
+            if (depth < 0) break;
+            continue;
+          }
           // A heredoc's body ALWAYS begins after the next newline — separators on
           // the delimiter line (`;`, `&&`, `|`, `>`) do not move it, they are that
           // line's LOCAL tail. Do not stop at them.
-          if (tokens[j].op && tokens[j].text === "\n") { nlAt = tokens[j].start; break; }
+          if (t.op && t.text === "\n") {
+            if (depth === 0) { nlAt = t.start; break; }
+            continue;
+          }
         }
         if (nlAt < 0) {                  // no logical newline ⇒ no body: not payload
           verbatimTo(s.length);
@@ -10671,6 +10711,12 @@ export function maskRemoteExecPayloads(command) {
   // inspect, so a piped payload that was refused became allowed (review #3478
   // cycle 2, P1). Return the command UNMASKED — the pre-fix refusal stands.
   if (out !== s && _rbFeedsLocalShell(out)) return s;
+  // ⛔ A PROCESS SUBSTITUTION (`<(…)`, `>(…)`, `< <(…)`) hands the masked payload
+  // to a command THIS shell runs — `bash <(cmux vm exec c -- printf '…')` executes
+  // the remote stdout locally, and #709 refused it before this mask existed (review
+  // #3478 cycle 5 P0). `_rbFeedsLocalShell` only inspects `|` stages, so bail here:
+  // a false bail only re-gates, a false allow EXECUTES.
+  if (out !== s && /[<>]\(/.test(out)) return s;
   return out;
 }
 

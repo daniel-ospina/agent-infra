@@ -32,7 +32,7 @@
 //   Part B — BEHAVIORAL: the REAL index.ts handler, driven against a hermetic
 //            hub. Each pinned case asserts BOTH directions: the remote form is
 //            ALLOWED and the SAME command run locally is still REFUSED.
-//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): TWELVE mutants are
+//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): SEVENTEEN mutants are
 //            built in a TEMP copy of this extension and each must redden the
 //            specific assertion it reverts — the pre-fix identity mask, an
 //            over-reaching mask that ignores separators, a swallowed heredoc
@@ -41,9 +41,12 @@
 //            that blinds the local-shell arm, a dropped heredoc delimiter-line
 //            tail, a pipe-head SHELL ALLOW-LIST (the pre-inversion polarity), a
 //            heredoc body cut at the physical newline, a delimiter word without
-//            quote removal, and a pipe bail that skips no redirection target. The
-//            leg FAILS (never skips green) when the real-module loader is
-//            unavailable, because it is evidence.
+//            quote removal, a pipe bail that skips no redirection target, an
+//            array literal treated as command position, an undecodable ANSI-C
+//            escape taken literally, a CRLF delimiter word trimmed, a paren depth
+//            ignored for the heredoc newline, and a process substitution not
+//            bailed. The leg FAILS (never skips green) when the real-module
+//            loader is unavailable, because it is evidence.
 //
 // Run: node extensions/main-worktree-guard/test-remote-context.mjs
 //      node extensions/main-worktree-guard/test-remote-context.mjs --mutations
@@ -511,6 +514,65 @@ for (const c of [
     out.split(REMOTE_PAYLOAD_PLACEHOLDER).length - 1, 1);
 }
 
+// A29 (#3478 review cycle 5 P0): a heredoc delimiter must be resolved EXACTLY or
+// the command is left alone — a WRONG delimiter never matches the real terminator,
+// so the mask runs to end-of-string and hides every LOCAL command after it.
+for (const c of [
+  // bash decodes character-code escapes in `$'…'`; this remover does not ⇒ bail.
+  `cmux vm exec c -- sh -s <<$'E\\101OS'\nbody\nEAOS\ngit worktree add octal`,
+  `cmux vm exec c -- sh -s <<$'\\x45OS'\nbody\nEOS\ngit worktree add hex`,
+  `cmux vm exec c -- sh -s <<$'\\u0045OS'\nbody\nEOS\ngit worktree add uni`,
+  // …and an unknown escape KEEPS its backslash (bash: `$'\d'` is `\d`), so this
+  // one must still resolve and mask.
+]) {
+  expect("A29: an undecodable ANSI-C delimiter leaves the command UNMASKED", mask(c), c);
+}
+expectTrue("A29b: an unknown ANSI-C escape keeps its backslash (still resolvable)",
+  mask(`cmux vm exec c -- sh -s <<$'\\dS'\nbody\n\\dS\ngit worktree add d`).includes("git worktree add d"),
+  JSON.stringify(mask(`cmux vm exec c -- sh -s <<$'\\dS'\nbody\n\\dS\ngit worktree add d`)));
+
+// A30 (#3478 review cycle 5 P0): CR is NOT IFS whitespace — `<<'EOS'` + CRLF has the
+// delimiter `EOS\r`. The tokenizer trims the CR, so the computed word never matches
+// and the mask would run past every LOCAL command after the terminator.
+for (const c of [
+  `cmux vm exec c -- sh -s <<'EOS'\r\nbody\r\nEOS\r\ngit worktree add crlf`,
+  `ssh cell <<'EOS'\r\nbody\r\nEOS\r\ngit worktree add crlf`,
+  `cmux vm exec c -- sh -s <<EOS\r\nbody\r\nEOS\r\ngit worktree add crlf`,
+]) {
+  expect("A30: a CRLF delimiter word leaves the command UNMASKED", mask(c), c);
+}
+
+// A31 (#3478 review cycle 5 P0): `(` is a separator token, so a newline inside an
+// unquoted `$(…)` / `$((…))` on the delimiter line is NOT the body start — bash ends
+// the line at depth 0, and taking the inner newline dropped the substitution's
+// local remainder.
+for (const c of [
+  `cmux vm exec c -- sh -s <<'EOS' $(true\n) ; git worktree add NL1\nbody\nEOS`,
+  `cmux vm exec c -- sh -s <<'EOS' $((1 +\n1)) ; git worktree add NL2\nbody\nEOS`,
+  `ssh cell <<'EOS' $(true\n) ; git worktree add NL3\nbody\nEOS`,
+]) {
+  expectTrue(`A31: a newline inside a substitution does not end the delimiter line — ${JSON.stringify(c)}`,
+    /git worktree add NL[123]/.test(mask(c)), JSON.stringify(mask(c)));
+}
+
+// A32 (#3478 review cycle 5 P0): a PROCESS SUBSTITUTION hands the payload to a
+// command THIS shell runs (`bash <(cmux vm exec …)`), which #709 refused before the
+// mask existed — so the command is left unmasked.
+for (const c of [
+  `bash <(cmux vm exec c -- printf 'git checkout -- a.txt')`,
+  `sh <(cmux vm exec c -- printf 'git checkout -- a.txt')`,
+  `bash < <(cmux vm exec c -- printf 'git checkout -- a.txt')`,
+]) {
+  expect("A32: process substitution is NOT masked", mask(c), c);
+}
+
+// A33 (#3478 review cycle 5 P2): an ARRAY LITERAL is not command position —
+// `arr=(ssh cell 'x')` stores words, it runs nothing, so the identity invariant holds.
+{
+  const c = `arr=(ssh cell 'x')`;
+  expect("A33: an array literal is not masked", mask(c), c);
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────
 // Part B — BEHAVIORAL: the real index.ts handler against a hermetic hub
@@ -747,13 +809,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
     // mask level, A27), so this PR neither creates nor fixes that gap; asserting a
     // refusal here would be asserting behaviour the guard never had.
     //
-    // The same honesty applies to two DOWNSTREAM parser limits found while writing
-    // these pins (also pre-existing, also fail-closed in the guard's favour, so out
-    // of this diff's scope and recorded in the README): a `\`+newline continuation
-    // on a heredoc's DELIMITER line, and a quoted heredoc delimiter (`<<$'EOS'`).
-    // The MASK keeps the local tail visible for both (A25/A26) — but the guard's
-    // own heredoc parsing then reads that tail as body, so neither form was ever
-    // refused, before or after this PR.
+    // The same honesty applies to a `\`+newline CONTINUATION on a heredoc's
+    // DELIMITER line: the guard's own heredoc parser reads that tail as body, so the
+    // form was never refused at origin/main either (measured on both heads). The
+    // MASK keeps the local tail visible (A25) and, for a QUOTED delimiter, resolves
+    // the terminator correctly (A26) — which is what keeps the latter's #1919
+    // refusal intact, as it already was at origin/main.
 
     // B24 (#3478 review cycle 4): a data-consumer stage still allows the mask, so a
     // legitimate piped remote command stays ALLOWED.
@@ -927,12 +988,12 @@ if (typeof stripTypeScriptTypes !== "function" ||
         {
           // #3478 review cycle 4 P0: the body starts after the LOGICAL line; a
           // `\`+newline continuation joins it. Reverting to the first PHYSICAL
-          // newline drops the joined remainder — A25 and B22 go RED.
+          // newline drops the joined remainder — A25 goes RED.
           label: "heredoc body cut at physical newline",
           kind: "mask",
           revert: (src) => src.replace(
-            "          if (tokens[j].op && tokens[j].text === \"\\n\") { nlAt = tokens[j].start; break; }",
-            "          if (tokens[j].op && tokens[j].text === \"\\n\") { nlAt = s.indexOf(\"\\n\", tk.end); break; }",
+            "            if (depth === 0) { nlAt = t.start; break; }",
+            "            if (depth >= 0) { nlAt = s.indexOf(\"\\n\", tk.end); break; }",
           ),
           maskProbe: "cmux vm exec c -- sh -s <<'EOS'; \\\ngit worktree add loc\nbody\nEOS",
           check: (out) => !String(out).includes("git worktree add loc"),
@@ -940,7 +1001,7 @@ if (typeof stripTypeScriptTypes !== "function" ||
         {
           // #3478 review cycle 4 P0: the delimiter word needs SHELL QUOTE REMOVAL.
           // Reverting to `slice(1, -1)` keeps the quotes of `$'EOS'`, no terminator
-          // matches, and the mask runs past the real one — A26 and B23 go RED.
+          // matches, and the mask runs past the real one — A26 goes RED.
           label: "delimiter word not unquoted",
           kind: "mask",
           revert: (src) => src.replace(
@@ -964,6 +1025,71 @@ if (typeof stripTypeScriptTypes !== "function" ||
           // data consumer (`/tmp/grep`): with the target skipped the real head is
           // `bash` (bail); without the skip the head IS `/tmp/grep` (masked).
           maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | > /tmp/grep bash -s`,
+          check: (out) => !String(out).includes("git checkout"),
+        },
+        {
+          // #3478 review cycle 5 P0: an ARRAY-LITERAL element is not command
+          // position. Reverting the `(`-after-`name=` check masks `arr=(ssh cell 'x')`
+          // — A33 goes RED.
+          label: "array literal treated as command position",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "    if (prev && prev.op && prev.text === \"(\") {",
+            "    if (false) {",
+          ),
+          maskProbe: `arr=(ssh cell 'x')`,
+          check: (out) => String(out) !== `arr=(ssh cell 'x')`,
+        },
+        {
+          // #3478 review cycle 5 P0: an undecodable ANSI-C escape must BAIL, not
+          // produce a wrong word. Reverting to "take the escape char literally"
+          // makes the delimiter wrong and the mask run past the real terminator —
+          // A29 goes RED.
+          label: "undecodable ANSI-C escape taken literally",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "          if (/[0-7xuUcE]/.test(nx)) return null;",
+            "          // MUTANT: undecodable escape taken literally",
+          ),
+          maskProbe: `cmux vm exec c -- sh -s <<$'E\\101OS'\nbody\nEAOS\ngit worktree add octal`,
+          check: (out) => !String(out).includes("git worktree add octal"),
+        },
+        {
+          // #3478 review cycle 5 P0: a CR after the delimiter word means the WORD
+          // carries the CR. Without the bail the computed word never matches and the
+          // mask eats every local command after the terminator — A30 goes RED.
+          label: "CRLF delimiter word trimmed",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "        if (s[tk.end] === \"\\r\") return s;",
+            "        // MUTANT: CR-trimmed delimiter word accepted",
+          ),
+          maskProbe: "cmux vm exec c -- sh -s <<'EOS'\r\nbody\r\nEOS\r\ngit worktree add crlf",
+          check: (out) => !String(out).includes("git worktree add crlf"),
+        },
+        {
+          // #3478 review cycle 5 P0: only a DEPTH-0 newline ends the delimiter line.
+          // Reverting the paren depth takes the newline inside `$( … )` as the body
+          // start and drops the substitution's local remainder — A31 goes RED.
+          label: "paren depth ignored for heredoc newline",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "            if (depth === 0) { nlAt = t.start; break; }",
+            "            { nlAt = t.start; break; }",
+          ),
+          maskProbe: "cmux vm exec c -- sh -s <<'EOS' $(true\n) ; git worktree add NL1\nbody\nEOS",
+          check: (out) => !String(out).includes("git worktree add NL1"),
+        },
+        {
+          // #3478 review cycle 5 P0: a process substitution runs the payload HERE.
+          // Without the bail `bash <(cmux vm exec …)` masks it — A32 goes RED.
+          label: "process substitution not bailed",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "  if (out !== s && /[<>]\\(/.test(out)) return s;",
+            "  // MUTANT: no process-substitution bail",
+          ),
+          maskProbe: `bash <(cmux vm exec c -- printf 'git checkout -- a.txt')`,
           check: (out) => !String(out).includes("git checkout"),
         },
       ];
