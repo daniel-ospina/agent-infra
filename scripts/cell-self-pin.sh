@@ -389,7 +389,7 @@ do_pass() {
   # lands this very fetch in the run-private ref — see `PIN_FETCH_REF_BASE` for why `FETCH_HEAD` is not ours
   # and why the destination is keyed by source.
   # ⛔ AND GIT'S OWN REASON IS THE ONE THING THIS LINE MUST NOT THROW AWAY. It was `2>/dev/null`, so the
-  # RED said only "git fetch … failed" — the exact pattern this file's own comment at `:142-147` names as
+  # RED said only "git fetch … failed" — the exact pattern this file's own comment at `:137-138` names as
   # why "the journal could not even say why" an earlier pin tick failed: the operator got a boolean where
   # git had already written `fatal: could not read Username for 'https://github.com'` / `Could not resolve
   # host`. `-q` suppresses progress on stdout, so stdout stays discarded and stderr is CAPTURED into the
@@ -467,7 +467,7 @@ do_pass() {
   now="$(pinned_head)"
   if [ -z "$now" ]; then
     # ⛔ A LOST RECORD MUST NOT BE A PERMANENT, UNHEALABLE RED. `cloud-cell-supervisor.sh`'s
-    # `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch (`:2137`/`:2160`), so a
+    # `harness_apply` writes $HARNESS_PIN_FILE only inside its CHANGED branch (`:2293`/`:2316`), so a
     # pin that is ALREADY at the tip takes `HARNESS_APPLIED=unchanged` and the record is never written.
     # A cell whose record was lost therefore reads an empty record every tick and REDs for ever on a
     # box that is in fact correct — the #3133 defect (merged), reproduced one layer up. The recorded
@@ -1058,6 +1058,15 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
     case "$_c" in
       Condition*)
         bad "the rendered unit declares ${_c}= — a failed condition SKIPS the unit and leaves it green; the missing-layer case must be a RED payload exit, not a skip"; return 1 ;;
+      DynamicUser)
+        # ⛔ THE IDENTITY CLASS IS MORE THAN ONE NAME, WHICH IS THE DEFECT THIS FILE HAS ALREADY FIXED
+        # THREE TIMES (`Exec*`, `Condition*`, `EnvironmentFile|UnsetEnvironment|PassEnvironment`). The
+        # `User=` rule closed the NAMED identity and left the ALLOCATED one open: measured,
+        # `DynamicUser=yes` installs rc=0 (rendered unit and drop-in alike), and `systemd.exec(5)` says the
+        # user/group "is dynamically allocated at the time the service is started" — i.e. the payload runs
+        # as nobody in particular, NOT as the owner of `$CELL_HOME`, so its git cannot answer for the tree
+        # and every tick REDs with the unit reporting installed. A pin unit must run as one KNOWN identity.
+        bad "the rendered unit declares ${_c}= — the pass must run as the OWNER of CELL_HOME (the identity whose git can answer for the tree it pins), and this directive either allocates or overrides that identity at start-up; the pin would then fail on every tick while this install reported success. Remove it"; return 1 ;;
       RootDirectory|RootImage)
         # ⛔ THE HEADER NAMES THIS DIRECTIVE AND NOTHING CHECKED IT. `RootDirectory=`/`RootImage=` make
         # systemd chroot()/pivot_root() the payload into that path (`systemd.exec(5)`) BEFORE any line of it
@@ -1435,6 +1444,12 @@ root_decidable() { # <path>
   while :; do
     d="$(dirname "$d")"
     if [ -e "$d" ]; then
+      # ⛔ A NON-DIRECTORY ANCESTOR IS A DECIDED ANSWER, NOT AN UNDECIDABLE ONE: nothing can live under a
+      # regular file, so the root provably does not exist. Treating it as undecidable refused a healthy
+      # box and asserted a FALSE cause ("a parent is not searchable") about a searchable directory whose
+      # child happens to be a file (measured, round-14 review P2). `-x` is the right test only for a
+      # DIRECTORY, where it answers "can I look inside".
+      [ -d "$d" ] || return 0
       [ -x "$d" ] && return 0
       return 1
     fi
@@ -1469,7 +1484,13 @@ verify_dropins() { # <unit-dir> <unit-name>
         bad "the systemd unit root ${_root} (mode $(ls -ld "$_root" 2>/dev/null | cut -c1-10)) cannot be READ/SEARCHED by this run, so it was never enumerated — systemd can still merge a ${2}.d/*.conf from it, and 'nothing found here' is not 'nothing installed'; fix its permissions (or remove it) and re-run"; return 1
       fi
     fi
-    for _dir in $(dropin_dirs "$_root" "$2"); do
+    # ⛔ AND THE ENUMERATION'S OUTPUT IS READ THE SAME WAY THE ROOT LIST IS. Fixing only the root list left
+    # the fail-open one level down: `for _dir in $(dropin_dirs …)` splits on IFS, so a unit dir containing a
+    # space produced a bogus path that either REFUSED with a false reason (mode blank, a directory that
+    # never existed) or — with a same-named relative directory in the CWD — silently inspected the WRONG
+    # directory while the real one, whose `.conf` systemd merges, was never read (measured, round-14
+    # review P2). One path per line, so the enumeration cannot be re-interpreted by the shell.
+    while IFS= read -r _dir; do
       # ⛔ AND THE SAME RULE ONE LEVEL DOWN: a drop-in DIRECTORY this run cannot read/enter expands
       # `"$_dir"/*.conf` to nothing, the loop body never ran, and this function reported PASS over a
       # directory whose contents systemd still merges. A guard on the feeder, not a count of an expansion
@@ -1483,7 +1504,7 @@ verify_dropins() { # <unit-dir> <unit-name>
         [ -f "$f" ] || continue
         verify_dropin_file "$f" || return 1
       done
-    done
+    done < <(dropin_dirs "$_root" "$2")
   done < <(dropin_roots "$1")
   return 0
 }
@@ -1543,6 +1564,8 @@ verify_dropin_file() { # <drop-in .conf> — one file's rules; split out so the 
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
         SuccessExitStatus)
           bad "the installed drop-in ${f} declares SuccessExitStatus= — it would widen the unit's green vocabulary past 0/11, which is a false PASS; remove ${f}"; return 1 ;;
+        DynamicUser)
+          bad "the installed drop-in ${f} declares DynamicUser= — it ALLOCATES the identity at start-up, so the pass would not run as the owner of CELL_HOME and its git could not answer for the tree it pins; this is the same defect as a drop-in User=root, one spelling over (measured rc=0 before this arm). Remove ${f}"; return 1 ;;
         User)
           # ⛔ THE ONE DIRECTIVE THIS FUNCTION'S OWN COMMENT ADVERTISED AS ALLOWED AND NEVER READ. The
           # header above says a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)", while the rule it

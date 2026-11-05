@@ -553,8 +553,15 @@ case "$out_pct" in
   *'%-specifiers'*) ok "…and says why (%-specifiers: %h is the manager user's home)" ;;
   *) bad "…but the refusal does not name the specifier expansion: $out_pct" ;;
 esac
-if cmp -s "$T/placed.before" "$PLACED"; then ok "…and that refusal did not replace the already-placed pass"
-else bad "a refused install (%-specifier) REPLACED the placed pass"; cp "$T/placed.before" "$PLACED"; fi
+# ⛔ THE `cmp -s "$T/placed.before" "$PLACED"` THAT STOOD HERE WAS VACUOUS, which is the same defect this
+# round fixed in the three refusal helpers (round-14 review, P2): the line above re-seeded `$PLACED` from
+# the expected bytes and then compared them with themselves, so it could never red — proved by hoisting
+# `place_pass` above verification, which reds 59 other legs and left this one green. And `$PLACED` is not
+# even this leg's destination: its CELL_HOME is `$pcthome`, so the path a leak would write is that home's
+# own `.pi/agent/scripts/cell-self-pin.sh`. Asserted on the real path instead.
+if [ -f "$pcthome/.pi/agent/scripts/cell-self-pin.sh" ]; then
+  bad "a refused install (%-specifier) PLACED the pass at $pcthome/.pi/agent/scripts/cell-self-pin.sh — deployed code that was never verified"
+else ok "…and that refusal placed no pass into this home (the artifact it would have leaked)"; fi
 [ -f "$T/units-pct/cell-self-pin.service" ] && bad "a refused install (%-specifier) still wrote the unit" \
   || ok "…and it wrote no unit"
 # ⛔ THE SUCCESS VOCABULARY IS GATED IN THE ONE DIRECTION THAT CAN BE A FALSE PASS, AND IN THE ONE THAT CAN
@@ -882,6 +889,7 @@ elif [[ $out == *'provisioning clone'* ]]; then
 else bad "refused an out-of-unit-dir drop-in for the WRONG reason: $out"; fi
 refuses_dropin 'lives in the TYPE-LEVEL drop-in dir (service.d)' "$(dropin_doctor typedir 'ConditionPathExists=/srv/nope' 'service.d')" 'ConditionPathExists='
 refuses_dropin 'declares a RootDirectory= (systemd enters it before the payload)' "$(dropin_doctor rootdir 'RootDirectory=/srv/harness-current')" 'never began'
+refuses_dropin 'declares a DynamicUser= (an allocated identity cannot pin the tree)' "$(dropin_doctor dynamicuser 'DynamicUser=yes')" 'DynamicUser='
 # ⛔ AND THE TIMER'S DROP-INS ARE A SEPARATE SET, WHICH NOTHING READ. `dropin_dirs` enumerates what systemd
 # merges FOR THE NAME IT IS GIVEN, and `--install` verified only `cell-self-pin.service` — so
 # `cell-self-pin.timer.d/`, `cell-self-.timer.d/`, `timer.d/` and the `/run` + `/usr/lib` copies went unread,
@@ -1013,6 +1021,36 @@ else
     || ok "a refused install (undecidable root) wrote nothing"
 fi
 chmod 755 "$parhidden"
+# ⛔ AND A NON-DIRECTORY ANCESTOR IS A DECIDED ANSWER, NOT AN UNDECIDABLE ONE (round-14 review, P2). `stat`
+# fails because nothing can live under a regular file — the root PROVABLY does not exist — but the first
+# version of `root_decidable` used `[ -x ]` for that component, which is false for a plain file, so it
+# reported UNDECIDABLE and refused a healthy box while asserting a false cause ("a parent is not
+# searchable") about a searchable directory whose child happens to be a file. This leg is the
+# non-vacuity direction of the same rule: the install must SUCCEED.
+regular_file_anc="$T/regular-file-ancestor"
+: >"$regular_file_anc"
+u_filed_anc="$T/units-file-ancestor"; mkdir -p "$u_filed_anc"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$u_filed_anc" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
+         CELL_SELF_PIN_DROPIN_ROOTS="$regular_file_anc/root" PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  ok "ACCEPTS a drop-in root under a regular FILE (that path provably cannot exist, so there is nothing to refuse)"
+else
+  bad "REFUSED a drop-in root whose ancestor is a regular file — an absent path is not an undecidable one, and the refusal asserts a cause that is false: $out"
+fi
+# ⛔ AND THE ENUMERATION'S OUTPUT MUST NOT BE WORD-SPLIT EITHER (round-14 review, P2). The root list was
+# fixed and its OUTPUT was not, so a unit dir containing a space was re-interpreted by the shell as two
+# paths: measured, this exact fixture either refused naming a directory that never existed (with a blank
+# mode) or — when a same-named relative directory existed in the CWD — installed rc=0 while never reading
+# the hostile drop-in the real directory holds. A path with a space in it is the whole point of the leg.
+u_space="$T/units-with space"; mkdir -p "$u_space/cell-self-pin.service.d"
+printf '[Service]\nWorkingDirectory=/srv/harness-current\n' >"$u_space/cell-self-pin.service.d/legacy.conf"
+out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$u_space" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
+         PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1)"; rc=$?
+if [ "$rc" -eq 0 ]; then
+  bad "ACCEPTED a unit dir containing a SPACE — the enumeration's output was word-split, so the hostile drop-in in it was never read: $out"
+elif [[ $out == *'WorkingDirectory='* ]]; then
+  ok "…and a unit dir containing a SPACE is enumerated as ONE path, so its drop-in is refused by name"
+else bad "refused a spaced unit dir for the WRONG reason: $out"; fi
 # ⛔ THE NON-VACUITY CONTROL FOR *THESE* LEGS TOO: a readable, benign drop-in must still INSTALL, or the
 # three legs above could "pass" by refusing every drop-in the file cannot read for any reason.
 u_nul_ok="$T/dropin-nul-ok"; mkdir -p "$u_nul_ok/cell-self-pin.service.d"
@@ -1067,6 +1105,12 @@ refuses 'an ExecStart that is not /bin/bash' "$(doctor_rw interp "s|^ExecStart=/
 refuses 'a MISSING Environment=CELL_HOME=' "$(doctor_rw nocellhome '/^Environment=CELL_HOME=/d')" "$T/u14" 'Environment=CELL_HOME='
 refuses 'a MISSING SuccessExitStatus=' "$(doctor_rw noexit '/^SuccessExitStatus=/d')" "$T/u15" 'must declare SuccessExitStatus'
 refuses 'a WIDENED SuccessExitStatus=' "$(doctor_rw wideexit 's|^SuccessExitStatus=.*$|SuccessExitStatus=0 11 1|')" "$T/u16" 'neither 0'
+# ⛔ AND THE IDENTITY IS NOT ONE DIRECTIVE. `User=` was refused and `DynamicUser=yes` installed rc=0
+# (measured, round-14 review P2): `systemd.exec(5)` allocates that identity AT START-UP, so the payload
+# does not run as the owner of `$CELL_HOME` and its git cannot answer for the tree — the same dead pin the
+# `User=` rule exists to prevent, one name over. The doctor APPENDS (keeping the legitimate `User=` line),
+# so no other rule can answer for it.
+refuses 'a DynamicUser= (systemd ALLOCATES the identity — it cannot pin the tree)' "$(doctor dynamicuser 'DynamicUser=yes')" "$T/u35" 'DynamicUser='
 # ⛔ AND THE macOS SPELLING OF THE CLONE. `/tmp` IS `/private/tmp` there, and the token rule required the
 # literal `/tmp/` — so this installed GREEN. It is reachable as an `Environment=` value, which NOTHING else
 # inspects (the `declares`/`$CELL_HOME` rules read only `WorkingDirectory=` and `ExecStart=`), and the pass
@@ -2124,6 +2168,17 @@ out="$(pinrun "$TICKBAD" 2>&1)"; rc=$?
 case "$out" in
   *"git's own reason"*) ok "…and the TICK's refusal carries git's own reason too (both fetches capture stderr, not one)" ;;
   *) bad "the tick's fetch refusal still discarded git's own reason: $out" ;;
+esac
+# ⛔ AND THE PHRASE ABOVE IS NOT ENOUGH ON ITS OWN (round-14 review, P2). It is literal text in the refusal
+# TEMPLATE, printed whether or not stderr was captured — so reverting ONLY the tick's `2>&1 >/dev/null`
+# left the suite at 390 ok / 0 failed, i.e. the tick half of this fix was ungated while the `--status` half
+# was. The discriminating assertion is that what git ACTUALLY SAID reaches the refusal: the fixture's
+# remote URL, which only appears in git's own stderr. The placeholder prints instead when nothing was
+# captured, and then this leg reds.
+case "$out" in
+  *'<git wrote nothing to stderr>'*) bad "the tick captured NOTHING from git — 2>/dev/null is back and the refusal only has the template's placeholder: $out" ;;
+  *'no-such-origin'*) ok "…and what GIT actually said reaches the refusal (the fixture's remote path), so stderr is captured and not merely described" ;;
+  *) bad "the tick's refusal does not carry git's own words: $out" ;;
 esac
 # ⛔ (b) A RENDER REFUSES WHEN `CELL_HOME` IS UNSET. The installer's default is `$HOME`; the READER of the
 # record it derives from defaults to `/tmp/cell-home` (cloud-cell-supervisor.sh:134). Rendering bakes
