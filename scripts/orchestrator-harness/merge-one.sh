@@ -950,8 +950,15 @@ _cc_ask() {
   # single contended read on cycle 4 at the SAME head would inherit a count nobody can explain. The
   # streak means CONSECUTIVE failed reads, so every answer that is not `unreadable` clears it —
   # INCLUDING the retry inside that arm, which is the whole point of retrying.
-  if [ "$CC_RC:$CC_TOKEN" != "3:unreadable" ]; then
+  if [ "$CC_RC:$CC_TOKEN" != "3:unreadable" ] && [ "$CC_RC:$CC_TOKEN" != "8:surface-unknown" ]; then
     rm -f "$O/state/diffreadcount-$PR" 2>/dev/null || true
+  fi
+  # (#3440, review round 1) THE SAME STREAK RULE FOR THE RED-SURFACE BOUND. Without this the
+  # counter accumulated over the head's whole lifetime, so "on N consecutive cycles" was a claim
+  # the counter did not measure — a shard alternating red/green would burn strikes with no
+  # consecutive run at all and park a head that was healthy half the time.
+  if [ "$CC_RC:$CC_TOKEN" != "7:red-surface" ]; then
+    rm -f "$O/state/redsurfacecount-$PR" 2>/dev/null || true
   fi
 }
 
@@ -1045,7 +1052,12 @@ _cc_recover() {
 }
 
 _cc_ask
-if [ "$CC_RC:$CC_TOKEN" = "3:unreadable" ]; then
+# (#3440) `8:surface-unknown` joins this arm: it is the SAME shape of fact — a read that
+# failed, on the same gh layer, with the same remedy (retry) and the same reason not to buy
+# a review (a failed read is not a changed artifact). It shares the bound below because the
+# counter is a count of CONSECUTIVE FAILED READS for this head, and both verbs are reads of
+# it; giving the surface its own counter would let a box alternate the two faults for ever.
+if [ "$CC_RC:$CC_TOKEN" = "3:unreadable" ] || [ "$CC_RC:$CC_TOKEN" = "8:surface-unknown" ]; then
   # ⛔ THE RETRY AND THE ARM BELOW ARE KEYED ON THE **TOKEN**, NOT ON rc (fresh review of #3037,
   # P1-5). `3` is the recorder's GENERAL refusal code: a pin refusal (`--expect-head: the PR head is
   # … NOT the … you named`), an uncheckable pin, usage, and any recorder that does not implement the
@@ -1058,7 +1070,7 @@ if [ "$CC_RC:$CC_TOKEN" = "3:unreadable" ]; then
   # ⛔ AN UNREADABLE DIFF IS NOT A CHANGED ONE, and the verb's own text asks for a RETRY. One inline
   # retry, because the alternative — reading a contended gh queue as "a review is owed" — is the
   # 20-40 minute purchase this whole block exists to prevent.
-  echo "[merge $PR] check-carry=unreadable — RETRYING once in ${CC_RETRY_SECS}s (a failed read is not a changed artifact)" >> "$L.log"
+  echo "[merge $PR] check-carry=${CC_TOKEN} — RETRYING once in ${CC_RETRY_SECS}s (a failed read is not a changed artifact)" >> "$L.log"
   sleep "$CC_RETRY_SECS"
   _cc_ask
 fi
@@ -1092,8 +1104,11 @@ case "$CC_RC:$CC_TOKEN" in
     else
       echo "[merge $PR] check-carry rc=$CC_RC (${CC_TOKEN}) says re-record rather than re-review, but the re-record did not produce a clean head-bound record (re-mint rc=${CC_RE_RC:-not attempted}) — falling through to a review, which is then the only remaining way to cover this head (fail-closed, and still cheaper than the unconditional review this block replaces)" >> "$L.log"
     fi ;;
-  3:unreadable)
-    # Still unreadable after the retry. ⛔ DO NOT PAY AND DO NOT MERGE ON A GUESS.
+  3:unreadable|8:surface-unknown)
+    # Still unreadable after the retry — the PR's DIFF, or (from #3440) the head's CHECK
+    # SURFACE. ⛔ DO NOT PAY AND DO NOT MERGE ON A GUESS, and note this arm is the one that
+    # makes `8:surface-unknown` behave: without it the token fell to `*` and bought a
+    # 20-40 minute review over a gh read that simply FAILED.
     # ⛔ AND DO NOT TRY RECOVERY HERE — IT CANNOT SUCCEED BY CONSTRUCTION (fresh review of #3037,
     # P3-2). `unreadable` is reachable ONLY after the recorder found a record for this PR and repo
     # whose digest proved a valid identity: `record-review.sh:1926` answers `norecord`/4 when there is
@@ -1139,12 +1154,76 @@ case "$CC_RC:$CC_TOKEN" in
       echo "[merge $PR] ABORT: state/diffreadcount-$PR is unwritable — the diff-read bound cannot be kept, so this head is parked instead of re-looped" >> "$L.log"
       exit 3
     fi
+    # (#3440) NAME WHICH READ FAILED. The two tokens reaching this arm are different
+    # questions on the same transport (the PR's diff, and the head's check surface), and a
+    # park message that named only the diff would send the operator to the wrong place.
+    if [ "$CC_TOKEN" = "surface-unknown" ]; then READ_WHAT="the head's CHECK SURFACE"; else READ_WHAT="the PR's DIFF"; fi
     if [ "$DR_N" -ge "$DR_TRIES" ]; then
-      park "the PR's DIFF could not be READ at head=$HEAD for $DR_N consecutive cycle(s) — check-carry answered 'unreadable' and no verified body marker covers this head. A failed READ is not a changed artifact, so nothing was paid for and nothing was merged; a durable unreadable diff is a gh-layer fault on THIS box (a wrapper chain resolving to itself, an expired/unreadable token, a hard 5xx), not a fault of the PR. Fix the gh layer (bin/harness status reports gh=CANNOT-REACH-REAL-GH for exactly this), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$DR_F'"
-      echo "[merge $PR] ABORT: the diff was UNREADABLE $DR_N time(s) at head=$HEAD (cap $DR_TRIES) — parked with the gh layer named, because an unbounded exit-0 loop never surfaces itself" >> "$L.log"
+      park "${READ_WHAT} could not be READ at head=$HEAD for $DR_N consecutive cycle(s) — check-carry answered '${CC_TOKEN}' and no verified body marker covers this head. A failed READ is not a changed artifact, so nothing was paid for and nothing was merged; a durable failed READ is a gh-layer fault on THIS box (a wrapper chain resolving to itself, an expired/unreadable token, a hard 5xx), not a fault of the PR. Fix the gh layer (bin/harness status reports gh=CANNOT-REACH-REAL-GH for exactly this), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$DR_F'"
+      echo "[merge $PR] ABORT: ${READ_WHAT} was UNREADABLE $DR_N time(s) at head=$HEAD (cap $DR_TRIES) — parked with the gh layer named, because an unbounded exit-0 loop never surfaces itself" >> "$L.log"
       exit 3
     fi
-    echo "[merge $PR] check-carry=unreadable after a retry and no verified body marker covers head=$HEAD — NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle ($DR_N/$DR_TRIES — a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
+    echo "[merge $PR] check-carry=${CC_TOKEN} after a retry and no verified body marker covers head=$HEAD — ${READ_WHAT} UNREAD, NOTHING PAID, NOTHING MERGED. A failed read is not a changed artifact; RETRY next cycle ($DR_N/$DR_TRIES — a re-review is 20-40 min and would not be evidence of anything)" >> "$L.log"
+    exit 0 ;;
+  0:red-base-owned)
+    # (#3440) THE RECORD COVERS THE HEAD; THE SURFACE IS RED BUT BASE-OWNED. This is the
+    # shape #3355 measured: a clean diff, a fully red surface, and every red reproducing
+    # on main. Two wrong answers are available here and both are worse than this one:
+    #   · `*` → "a fresh review is owed" — 20-40 minutes to be told the build is red for a
+    #     reason the PR did not cause;
+    #   · treating it as `0:head` SILENTLY — which is exactly the bare green #3440 exists
+    #     to end.
+    # So: the same ACTION as `0:head` (the record is bound; carry on) and the red NAMED in the
+    # log — never the bare green #3440 exists to end.
+    # ⛔ WHAT ACTUALLY VERIFIES IT DEPENDS ON THE POPULATION, AND THE FIRST VERSION OF THIS
+    # COMMENT CLAIMED THE WRONG ONE (review of #3440, round 1). On a RAIL repo this arm is
+    # unreachable by construction (a record at this head short-circuits into `rail_attempt`
+    # before `--check-carry` is asked), so the population that DOES reach it is gate mode —
+    # where step 4 is a raw client merge gated only on `$REVIEW_GATE`, and the rail never
+    # measures anything. There, the ONLY evidence that the red is base-owned is the recorder's
+    # own `(app, name)` comparison in `cc_surface_gate`, which cannot tell "fails on main for
+    # reason A" from "fails here for reason B". That is a NAMED RESIDUAL, not a guarantee: the
+    # groups are logged so a reader can see what was accepted, and a wrong classification lands
+    # a red tree. It is NOT a regression — pre-#3440 this head carried (and merged) with no
+    # surface read at all — but no future reader should inherit the stronger claim.
+    if review_clean_at_head; then
+      CC_OWED=1
+      echo "[merge $PR] CARRY — a CLEAN record is bound to head=$HEAD (check-carry rc=0 token=red-base-owned). ⛔ THE HEAD'S CHECK SURFACE IS RED, and every red group also reproduces on the base — this is NOT a green head and NOT a green attestation: the groups are named in the check-carry stderr above. No review is ordered (a red build is not a review finding), and the merge below is the RAIL's decision, which exempts base-owned reds only against its own reproduction" >> "$L.log"
+    else
+      echo "[merge $PR] a record is bound to head=$HEAD with base-owned red surface, but its verdict is [$(review_verdict_of "$(review_record_file_at_head)")], not full 'clean' — a HEAD-BOUND answer is not a CLEAN one, so a review is owed" >> "$L.log"
+    fi ;;
+  7:red-surface)
+    # (#3440) THE HEAD IS RED AND THE PR CAUSED IT — NOT mergeable, and NOT a review's job.
+    # Two wrong answers are available and both are worse than this one:
+    #   · the `*` arm → a 20-40 minute review to be told a build is broken. A red check is not
+    #     a review finding, and paying does not turn it green;
+    #   · continuing to the merge (what `0:head` does) → in GATE mode step 4 is a raw client
+    #     merge gated only on `REQ`, so the PR's OTHER red checks are not in its path at all.
+    #     Proceeding there would land a tree the producer just called NOT mergeable.
+    # So: pay nothing, merge nothing, and RETRY — a flaky shard re-runs green and the next
+    # cycle answers `head`. BOUNDED like every other repeated state in this file (a durable
+    # PR-caused red needs a fix; an unbounded `exit 0` loop would never surface itself).
+    SURF_TRIES="${SURFACE_TRIES:-3}"
+    if ! is_limit "$SURF_TRIES"; then
+      echo "[merge $PR] SURFACE_TRIES='$SURF_TRIES' is not an integer in range — using 3" >> "$L.log"
+      SURF_TRIES=3
+    fi
+    SF_F="$O/state/redsurfacecount-$PR"; SF_H=""; SF_N=0
+    if [ -f "$SF_F" ]; then read -r SF_H SF_N < "$SF_F" 2>/dev/null || true; fi
+    is_limit "${SF_N:-}" || SF_N=0
+    [ "${SF_H:-}" = "${HEAD:-}" ] || SF_N=0
+    SF_N=$((SF_N + 1))
+    if ! printf '%s %s\n' "${HEAD:-}" "$SF_N" > "$SF_F" 2>/dev/null; then
+      park "the red-surface counter for head=$HEAD CANNOT BE WRITTEN ($SF_F), so SURFACE_TRIES cannot bound this head and the worker would retry a red surface for ever while claiming to be bounded. Make $O/state writable (rm -rf a stray DIRECTORY named redsurfacecount-$PR), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$SF_F'"
+      echo "[merge $PR] ABORT: state/redsurfacecount-$PR is unwritable — the red-surface bound cannot be kept, so this head is parked instead of re-looped" >> "$L.log"
+      exit 3
+    fi
+    if [ "$SF_N" -ge "$SURF_TRIES" ]; then
+      park "check-carry answered 'red-surface' for head=$HEAD on $SF_N consecutive cycle(s) (cap $SURF_TRIES): the head's CHECK SURFACE IS RED and every red group is this PR's own (the producer named them in the check-carry stderr in this log; a base-owned red answers 'red-base-owned' instead). Nothing was paid for and nothing was merged — a red build is not a review finding. Fix or re-run the failing check(s), then: rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$SF_F'"
+      echo "[merge $PR] ABORT: the check surface is RED at head=$HEAD ($SF_N/$SURF_TRIES) — parked so the failure surfaces instead of re-looping" >> "$L.log"
+      exit 3
+    fi
+    echo "[merge $PR] ⛔ check-carry=red-surface: head=$HEAD carries a RED check surface that is NOT shown base-owned (the groups are named in the check-carry stderr above). NOT MERGEABLE and NOT a review's job — NO review ordered, NOTHING merged. RETRY next cycle ($SF_N/$SURF_TRIES — a re-run that goes green answers 'head' next time)" >> "$L.log"
     exit 0 ;;
   4:*)
     # No record anywhere on this box: the #2872 case. The verdict may still travel in the body.

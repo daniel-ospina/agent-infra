@@ -1343,6 +1343,11 @@ c_carry_resolve() { # <pr-body> <commit-messages> <pr> <repo> <current-head> [<a
 #   code is a REFUSAL. That is deliberate: `--check-carry` documents seven
 #   verdicts today, and a producer that grows an eighth must not be able to make
 #   this gate green by having produced a token nobody here classified.
+#   (#3440) The allow-list is now TWO tokens, both named explicitly: `carry` and
+#   `red-base-owned` (the record covers the artifact and the only reds reproduce on
+#   the base — which this gate already passed over, silently, before it read the
+#   surface at all). `red-surface` (exit 7) and `surface-unknown` (exit 8) REFUSE,
+#   each with its own diagnosis.
 #   ⛔ THE ANSWER MUST ALSO BE THE PRODUCER'S, NOT A LOOKALIKE. `--recorded-diff`
 #   is a verb this gate can only get from a producer at this revision; a recorder
 #   too old to understand it exits 2 with no verdict line, which lands on the
@@ -1366,6 +1371,16 @@ c_carry_ask() {
   C_CARRY_TOKEN="$tok"
   if [[ "$rc" -eq 0 && "$tok" == "carry" ]]; then
     C_CARRY_WHY="diff unchanged"
+    return 0
+  fi
+  # (#3440) `red-base-owned` PASSES, and this is NOT a weakening: before #3440 this
+  # gate never read the check surface at all, so every PR sitting on a base-owned red
+  # already passed it — silently. What changes is that the red is now NAMED here, in
+  # the gate's own output, instead of being invisible. A red the PR CAUSED
+  # (`red-surface`) and a surface that could not be READ (`surface-unknown`) refuse
+  # below: those are the false PASSes #3440 measured.
+  if [[ "$rc" -eq 0 && "$tok" == "red-base-owned" ]]; then
+    C_CARRY_WHY="diff unchanged (${recd:0:12}… = ${live:0:12}…); the head's check surface is RED but BASE-OWNED — the producer named the groups in its own output above, and the merge rail re-measures base reds against its own reproduction before it merges anything (#3322/#3715). This gate passing is not a claim that the head is green"
     return 0
   fi
   case "$rc:$tok" in
@@ -1394,6 +1409,14 @@ c_carry_ask() {
       C_CARRY_WHY="the producer answered 'norecord' — it could not identify a record to carry, so the carry predicate did not run (a tooling fault, not a policy verdict on this PR)" ;;
     5:nodigest)
       C_CARRY_WHY="the record carries no usable diff digest, so content identity cannot be established and nothing may be carried" ;;
+    7:red-surface)
+      # (#3440) THE FALSE PASS THIS ISSUE MEASURED. The diff may be identical and the
+      # record may be perfectly valid — the TREE is broken, and this gate must not be
+      # greener than the truth. Refusing here reddens the PR's own CI on a red the PR
+      # caused, which is exactly what a red check should do.
+      C_CARRY_WHY="the recorded head's CHECK SURFACE IS RED and the red is NOT shown base-owned (the producer named the red group(s) in its own output above) — the record may cover the artifact, but it does not cover a tree whose checks are failing, and passing here would be the false PASS of #3440 (#3355 was attested clean over 7 red checks). Fix or re-run the failing checks — a re-review is not the remedy for a broken build" ;;
+    8:surface-unknown)
+      C_CARRY_WHY="the recorded head's check surface could NOT BE READ (the producer answered 'surface-unknown': a refused gh/API read, or no repo resolvable for the check-runs query). A read that FAILED is not a green surface, so nothing is certified here — this is a transport/budget fault, not a fault of the PR, and the remedy is to RE-RUN this gate, not to change the code" ;;
     0:head)
       # Unreachable in the normal path (the caller only asks about a head that is
       # NOT the current one), but reachable on a TOCTOU: the producer read the
@@ -2356,7 +2379,19 @@ run_checks() {
       c_carry_resolve "$PR_BODY" "$COMMIT_MSGS" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD" \
         "$(admitted_comment_marker_text "${PR_COMMENTS:-}" "$PR_NUMBER" "$GH_REPO")" || C_CARRY_RC=$?
       if [[ "$C_CARRY_RC" -eq 0 ]]; then
-        grade_c_record "$C_CARRIED_VERDICT" "code-review record CARRIED from ${C_CARRIED_HEAD:0:12}… — diff unchanged (diff_sha256 ${C_CARRIED_DIFF:0:12}…)"
+        # (#3440) NAME THE SURFACE ON THE PASS LINE ITSELF. A `red-base-owned` carry passes
+        # (the record covers the artifact and the only reds reproduce on the base — which
+        # this gate already passed over, silently, before it read the surface at all), but
+        # the reader who greps the gate's output must not be left with "CARRIED … diff
+        # unchanged" and no hint that the tree is red. A reason only in C_CARRY_WHY would
+        # be invisible here: the PASS line is what the log carries.
+        # ⛔ THE VERDICT GRADED IS STILL `C_CARRIED_VERDICT` (#3315): the carried LINE's
+        # own verdict, not a whole-text rescan — see the ONE-WRITER note above.
+        C_CARRIED_PASS="code-review record CARRIED from ${C_CARRIED_HEAD:0:12}… — diff unchanged (diff_sha256 ${C_CARRIED_DIFF:0:12}…)"
+        if [[ "$C_CARRY_TOKEN" == "red-base-owned" ]]; then
+          C_CARRIED_PASS="$C_CARRIED_PASS; ⛔ the head's CHECK SURFACE IS RED but BASE-OWNED (#3440) — every red group also reproduces on the base (the producer named them in its own output above, relayed from its stderr by check (c)). This gate passing is NOT a claim that the head is green: base ownership here is the PRODUCER's same-name comparison, and on a rail repo the rail re-measures it against its own reproduction (#3322/#3715) before it exempts anything — in gate mode nothing else does, which is a named residual, not a guarantee"
+        fi
+        grade_c_record "$C_CARRIED_VERDICT" "$C_CARRIED_PASS"
       elif [[ "$C_CARRY_RC" -eq 1 ]]; then
         fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh artifact for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): the head-bound record FILE, the same marker line as a PR COMMENT posted by an OWNER/MEMBER/COLLABORATOR, or that marker line in the PR body/commit messages. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825). [$REV_NONE]"
         echo "      Missing: the code-review record marker for this PR at this head."
@@ -3417,6 +3452,10 @@ case "${PCC3315_MODE:-carry}" in
   nodigest)    printf 'nodigest\t-\t-\n'; exit 5 ;;
   unreadable)  printf 'unreadable\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 3 ;;
   carry-patch) printf 'carry-patch\t%s\t%s\n' "${PCC3315_DIGEST:-}" cccccccccccc; exit 6 ;;
+  # (#3440) the three CHECK-SURFACE verdicts, modelled exactly as the producer emits them.
+  red-base-owned) printf 'red-base-owned\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
+  red-surface)  printf 'red-surface\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 7 ;;
+  surface-unknown) printf 'surface-unknown\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 8 ;;
   # THE PREDICATE'S REAL PREDICATE, MODELLED: `carry` only for the digest it was
   # minted over, `fresh` for anything else. Without this mode a stub that answers
   # `carry` unconditionally cannot tell a gate that tried the NEWEST marker from
@@ -3637,13 +3676,30 @@ C3315_STUB_EOF
     carry "" fail 'no head-bound code-review record' \
     "$C3315_STUB" "" "$C3315_DIGEST" \
     "$(c3315_comment OWNER "$(printf 'review recorded: reviews/1.json verdict=clean @ %s diff=%s (premise-labs/tortoise)' "$C3315_PRIOR" "$C3315_DIGEST")")"
+  # ── #3440: THE CHECK SURFACE (renumbered 33–35 — #1224 × #3315 took 30–32) ──
+  # 33 — `red-base-owned` PASSES, and this pins WHY: the record covers the artifact
+  # and every red reproduces on the base. Before #3440 this gate never read the
+  # surface at all, so this PR would have passed SILENTLY; what changed is that the
+  # gate now says which red it is accepting. The assertion demands BOTH halves —
+  # a pass AND the naming — because a bare pass is exactly the shape #3440 removes.
+  c3315_case "pass 33: 'red-base-owned' ⇒ check (c) PASSES and NAMES the base-owned red (#3440)" \
+    red-base-owned "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" pass 'BASE-OWNED'
+  # 34 — THE FALSE PASS OF #3440: the head is red and the PR caused it. The record may
+  # be perfectly stale-free; the TREE is broken. Passing here would certify a merge the
+  # rail will refuse, which is the two-readers disagreement this gate exists to end.
+  c3315_case "pass 34: 'red-surface' ⇒ check (c) FAILS CLOSED, naming a broken build (#3440)" \
+    red-surface "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'CHECK SURFACE IS RED'
+  # 35 — a REFUSED read is not a green surface. The remedy is a re-run of the gate,
+  # not a code change and not a re-review.
+  c3315_case "pass 35: 'surface-unknown' ⇒ check (c) FAILS CLOSED, naming a RETRY (#3440)" \
+    surface-unknown "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'could NOT BE READ'
   unset PCC3315_CARRY_ONLY
   HOME="$C3315_HOME_SAVE"
   if [ "$C3315_KEY_SAVE" = "__unset__" ]; then unset AI_REVIEW_GATE_KEY; else AI_REVIEW_GATE_KEY="$C3315_KEY_SAVE"; fi
   unset C3315_KEY_SAVE C3315_HOME_SAVE
   rm -rf "$C3315_ISO" "$C3315_DIR"
   if [[ "$C3315_FAILS" -ne 0 ]]; then
-    echo "  ❌ passes 15–31: $C3315_FAILS carry-arm assertion(s) failed (#3315)" >&2
+    echo "  ❌ passes 15–35: $C3315_FAILS carry-arm assertion(s) failed (#3315 / #3440)" >&2
     exit 2
   fi
   summarize || true
@@ -5623,13 +5679,21 @@ $big_filler"
     'pass 30: an earlier-head marker surviving ONLY as an ADMITTED PR COMMENT' \
     'pass 31: an earlier-head marker in an UNATTESTED comment is NOT a candidate' \
     'pass 31b: the predicate was never asked about the unattested comment marker' \
-    'pass 32: an earlier-head comment marker for ANOTHER REPO is NOT a carry candidate' ; do
+    'pass 32: an earlier-head comment marker for ANOTHER REPO is NOT a carry candidate' \
+    "pass 33: 'red-base-owned'" \
+    "pass 34: 'red-surface'" \
+    "pass 35: 'surface-unknown'" ; do
     grep -qF -- "  ✅ $C3315_WANT" "$C3315_LOG" || { C3315_MISS=$((C3315_MISS + 1)); printf '   missing: ✅ %s\n' "$C3315_WANT" >&2; }
   done
-  if [[ "$C3315_MISS" -eq 0 ]]; then
-    printf '✅ #3315: all 21 carry-arm vectors ran green — the carry PASSES (newest evidence first, body before commit messages), and a changed diff / unreadable diff / no record / no digest / rebase / crashing or prose-printing predicate / absent recorder / foreign-repo marker / carried clean-micro marker / carry-with-a-non-zero-exit / head-answer each FAIL CLOSED\n'
+  # ⛔ THE CHILD'S STATUS IS ASSERTED TOO (review of #3440, BLOCKING). The label list above can
+  # only see a vector that FAILED to appear as green; it cannot see a vector that was DELETED
+  # from the FAIL_ALL block along with its line, and it cannot see a NEW failing vector that the
+  # list does not name yet. FAIL_ALL exits 1 by design (it ends BLOCKED), 2 when any of its own
+  # assertion groups fails — so `> 1` is the suite reporting a failure, and it must redden here.
+  if [[ "$C3315_MISS" -eq 0 && "${C3315_RC:-0}" -le 1 ]]; then
+    printf '✅ #3315/#3440: all 24 carry-arm vectors ran green — the carry PASSES (newest evidence first, body before commit messages), an admitted PR COMMENT carries while an unattested or foreign-repo one does not, and a base-owned red is NAMED; a changed diff / unreadable diff / no record / no digest / rebase / crashing or prose-printing predicate / absent recorder / foreign-repo marker / carried clean-micro marker / carry-with-a-non-zero-exit / head-answer / PR-CAUSED red surface / UNREADABLE check surface each FAIL CLOSED\n'
   else
-    printf '❌ #3315: %s carry-arm vector(s) missing or red (FAIL_ALL rc=%s) — check (c)'"'"'s carry contract is unpinned\n' "$C3315_MISS" "$C3315_RC" >&2
+    printf '❌ #3315/#3440: %s carry-arm vector(s) missing or red (FAIL_ALL rc=%s — anything above 1 is the suite reporting its own failure) — check (c)'"'"'s carry contract is unpinned\n' "$C3315_MISS" "$C3315_RC" >&2
     grep -E 'pass 1[5-9]|pass 2[0-9]|❌ \[c\]' "$C3315_LOG" >&2 || true
     selffail=$((selffail + 1))
   fi
