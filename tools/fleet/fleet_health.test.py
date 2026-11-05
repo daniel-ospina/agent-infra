@@ -27,8 +27,8 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
   * neuter the lane-census reconciliation      -> 5 paired CENSUS reds (the fifth is the
                                                  exit-code check), plus collateral reds in the
-                                                 other census checks — **25 CENSUS reds**
-                                                 (census-only; the same run prints 26 `❌`
+                                                 other census checks — **28 CENSUS reds**
+                                                 (census-only; the same run prints 29 `❌`
                                                  lines because the ambient HARNESS failure is
                                                  included and is red on the UNMUTATED module too)
   * drop `attributed` from main()                -> 3 paired CENSUS reds (the healthy-box arms)
@@ -656,6 +656,7 @@ def leg_lane_census(mod):
         "CENSUS: an empty `ps` table is UNREADABLE (None), never a measured 0",
         "CENSUS: argv0 basename matches exactly `pi` — a `pi-*` helper is not a lane",
         "CENSUS: a header-only `ps` table is UNREADABLE (None), never a measured 0",
+        "CENSUS: a `ps` that could not be SPAWNED abstains — the spawn arm never renders as 0",
     )
     counter = getattr(mod, "pi_process_count", None)
     saved_run = mod.subprocess.run
@@ -667,6 +668,18 @@ def leg_lane_census(mod):
             for rc in (1, 2):                       # unreadable table
                 mod.subprocess.run = lambda *a, **k: _R(rc, "1 pi\n")
                 check(counter() is None, PRODUCER[0])
+            # ⛔ THE SPAWN ARM WAS UNPINNED (review cycle 18, finding 1). Every case above hands a
+            # COMPLETED command back, so nothing reached `except Exception: return None` -- the arm
+            # that fires when `ps` is missing, unelevatable, or killed by the `timeout=20`. Measured:
+            # mutating that arm to the fail-open `return 0` left the suite green apart from the
+            # ambient HARNESS failure, while a box with no `ps` then read `pi_count == 0` ->
+            # `lane_census(0,0,0,7) is None` -> `✅ no suspects`, exit 0: the original defect, reached
+            # through the producer. (Same convention this lane pins one file over for `gh()`: a
+            # binary that could not be spawned is UNKNOWN, never an empty list.)
+            def _cannot_spawn(*a, **k):
+                raise OSError("ps is not on PATH")
+            mod.subprocess.run = _cannot_spawn
+            check(counter() is None, PRODUCER[4])
             # ⛔ AN EMPTY rc-0 TABLE IS UNREADABLE, NOT 0 (review cycle 3, finding 3, and the
             # contract scripts/lib/pid-identity.sh pins as `pid_table_nonempty`: "a read that
             # 'succeeds' but prints no table is not 'no such process' ... an empty table is an
@@ -703,6 +716,7 @@ def leg_lane_census(mod):
         "EXITLINE: an UNVERIFIED note over a PARTLY-live roster says the population cannot be reconciled",
         "EXITLINE: …and an UNVERIFIED note over an all-dead roster keeps the idle-fleet wording",
         "EXITLINE: a partial MISMATCH reads INCOMPLETE — rows without a verdict are not a verdict",
+        "EXITLINE: an UNRECONCILED note also reads INCOMPLETE, never the UNVERIFIED tails",
     )
     if pair is None:
         for msg in PAIR:
@@ -710,6 +724,15 @@ def leg_lane_census(mod):
     else:
         w, t = pair("LANE CENSUS STALE ROSTER: x", 0, 7, 7)
         check(w == "STALE ROSTER" and "running pi process" in t, PAIR[0])
+        # ⛔ THE FOURTH PAIRING WAS PINNED BY NOTHING (review cycle 18, finding 3), though the
+        # function's docstring says the pure-function split exists so "the pairing is PINNED
+        # directly". UNRECONCILED reached INCOMPLETE only through the function's DEFAULT return, and
+        # the one end-to-end arm that sees it greps the NOTE, not the exit word — so widening the
+        # UNVERIFIED branch to swallow UNRECONCILED left 0 non-ambient reds. That mutant is not
+        # cosmetic: an unreadable table over a 0-6 lane roster would print "an idle fleet and a
+        # stale roster are indistinguishable", a claim the UNRECONCILED note itself excludes.
+        w, t = pair("LANE CENSUS UNRECONCILED: x", 0, 0, 7)
+        check(w == "INCOMPLETE" and "rows without a verdict" in t, PAIR[4])
         # ⛔ THESE TWO USE REAL NOTES, NOT THE SYNTHETIC `"LANE CENSUS UNVERIFIED: x"` (review cycle
         # 13, finding 2). The synthetic placeholder carries NO shape, so the only thing that used to
         # separate the two tails was the `attributed` count — the very correlation the function's
@@ -753,7 +776,7 @@ def leg_lane_census(mod):
         check(w == "INCOMPLETE" and "rows without a verdict" in t, PAIR[3])
 
     # ── main() end-to-end over a read-only store holding none of the roster ──
-    def _drive(pi_stub, records=None, holder=False, corrupt_store=False):
+    def _drive(pi_stub, records=None, holder=False, corrupt_store=False, observed=None):
         """Run `main()` over a hook store.
 
         `records` defaults to two NON-rostered sessions (the stale-roster shape). Pass a list to
@@ -817,6 +840,11 @@ def leg_lane_census(mod):
             # without pretending the census made a second liveness decision.
             if holder:
                 mod._observed = lambda pid, start: mod.HOLDER_OBSERVED
+            elif observed is not None:
+                # Stub the ONE identity function (never the census), exactly as the holder arm
+                # does — a roster that ABSTAINS on every lane cannot be produced on a test box
+                # from real pids either.
+                mod._observed = lambda pid, start: observed
             sys.stdout = buf
             rc = mod.main()
         finally:
@@ -935,6 +963,27 @@ def leg_lane_census(mod):
           "CENSUS: an abstaining roster record is never rendered as a clean scan")
     check(rc_abs2 == 1,
           "CENSUS: the abstaining-record arm exits non-zero")
+
+    # ⛔ A FULLY-ABSTAINING ROSTER WAS UNPINNED (review cycle 18, finding 2). The only abstaining
+    # fixture above carries ONE record out of seven, so `established` could never reach
+    # `roster_size` from abstentions and the census's silence arms were unreachable from this
+    # direction. Two mutants on `main()`'s counters survived the whole suite:
+    #   A) `observed == HOLDER_OBSERVED` -> also true for `unreadable`/`off-fence`: an
+    #      all-abstaining roster under 18 live pi processes returns None -> `✅ no suspects`,
+    #      exit 0 — the ORIGINAL defect, through the counter the census reads.
+    #   B) `observed in DEAD_OBSERVED` -> also true for the abstentions: the same roster reports
+    #      "all 7 rostered lanes are DEAD/absent", counting a read that DID NOT HAPPEN as an
+    #      established death — the collapse `_observed`'s own docstring forbids.
+    # Both must turn THIS arm red, so it asserts the population mismatch, not merely "not clean".
+    abst_all = [{"sessionId": sid, "pid": os.getpid(), "agentLifecycle": "running"}
+                for _, sid in mod.LANES]
+    rc_abs3, out_abs3 = _drive(lambda: 18, records=abst_all, observed="unreadable")
+    check("LANE CENSUS MISMATCH" in out_abs3 and "STALE ROSTER" not in out_abs3,
+          "CENSUS: a FULLY-abstaining roster alarms as a MISMATCH — never STALE, never silent")
+    check("no suspects" not in out_abs3,
+          "CENSUS: seven abstaining roster rows over a live population are not a clean scan")
+    check(rc_abs3 == 1,
+          "CENSUS: the fully-abstaining roster exits non-zero")
 
     # ── end-to-end: a FULLY-LIVE roster must stay SILENT ───────────────────────────────
     # ⛔ THE HEALTHY-BOX ARM WAS PINNED BY NOTHING (review cycle 10, finding 1). Every `_drive` arm

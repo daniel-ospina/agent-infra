@@ -189,9 +189,13 @@ def lane_census(alive, dead, pi_count, roster_size):
     whatever the process table says); or every lane conclusive with at least one attributed alive
     AND a MEASURED population (the roster accounts for at least one running process, so it is not
     contradicted); or every lane conclusive over a MEASURED-EMPTY population (the population can
-    CONTRADICT nothing, and no lane is live — see the argv0 note in that arm); or `pi_count <= 0` on
-    an inconclusive roster (a MISMATCH needs at least one pi process the roster does not account
-    for, so an empty population has nothing to object to). Nothing else is silent — in particular a
+    CONTRADICT nothing, and no lane is live — see the argv0 note in that arm); or a MEASURED-EMPTY
+    population on an inconclusive roster (a MISMATCH needs at least one pi process the roster does
+    not account for, so an empty population has nothing to object to). ⛔ THAT SILENT ARM IS
+    `pi_count == 0`, NOT `pi_count <= 0` (review cycle 18, finding 4): `None` is not a small number,
+    it is a population that WAS NOT READ, and it returns UNRECONCILED immediately above — the same
+    `None`/`0` collapse this file exists to keep apart, which the old wording reproduced in prose
+    while the code got it right. Nothing else is silent — in particular a
     conclusive-with-a-live-lane roster over an UNREADABLE table is UNVERIFIED, not silent (see the
     arm below).
 
