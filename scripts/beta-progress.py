@@ -198,7 +198,9 @@ def gh(*args):
 
 
 # ── REST SECOND SOURCE FOR THE PR LISTS (fixed 2026-10-19) ─────────────────
-# WHY. Both lists come from `gh pr list --json`. Where the workspace has the gh layer's REST
+# WHY. BOTH LISTS OF A PAIR come from `gh pr list --json` — the TRACKER pair here, and (since
+# #3457) each fix repo's pair identically, which is why the fallback sits in `_repo_prs` rather
+# than at one call site. Where the workspace has the gh layer's REST
 # adapter (`$O/gh-rest`, #1959) the OPEN read is already served over REST — `number,title,headRefName`
 # are all in its PR_FIELDS — but `mergedAt` is NOT, so the MERGED read delegates to the real gh,
 # which is GRAPHQL. On the cells there is no `$O/gh-rest` (#1978), so BOTH reads are GraphQL.
@@ -232,7 +234,9 @@ REST_PER_PAGE = 100   # GitHub's ceiling for /pulls -- the honest bound on ONE r
 REST_TIMEOUT_S = 15   # per request
 # ⛔ ONE BUDGET FOR THE REST PHASE, not per read: `compute()` creates the deadline and hands it to
 # the tracker PAIR *and* to every fix-repo read (`FIX_REPOS`) — FOUR reads at 500/400 rows, up to 18
-# pages. 30 s is ~4x the measured latency (0.43 s/call, ~7.7 s for 18 pages) and sits inside the
+# pages (36 REQUESTS if every read takes its one repeat-triggered retry, which the SAME 30 s
+# deadline still holds: 36 x the measured 0.43 s/call = 15.5 s). 30 s is ~4x the measured latency
+# (0.43 s/call, ~7.7 s for 18 pages) and sits inside the
 # tick's 40-90 s of residual slack. A PER-READ budget is what this rules out: four 30 s reads is
 # 120 s of REST alone, which spends the slack and then some.
 # ⛔ AND THE DISCLOSED COST OF THE WIDER READ IS IN THIS BUDGET, NOT IN A LARGER ONE. The fix-repo
