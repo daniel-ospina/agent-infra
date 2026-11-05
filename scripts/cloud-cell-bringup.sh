@@ -801,7 +801,11 @@ check_provider_store() {
   fi
 }
 
-check_provider() {
+# ── (2·env) source the cell's environment, under the cell's home ────────────────────────────────
+# Split out of `check_provider` because the steps that follow it are ORDERED requirements, not
+# implementation detail: the ONE-home predicate must judge the env this run will hand the cell, and
+# the store repair must not run before that predicate has accepted the box (agent-infra#2024 review).
+check_provider_env() {
   if [ -f "$ENV_FILE" ]; then
     source_env_file
     # $ENV_FILE is arbitrary shell: re-assert the secret-lifetime handlers now that it has run, so a
@@ -816,15 +820,15 @@ check_provider() {
   else
     warn "no $ENV_FILE — push one with: cmux vm push --secret <m> <local> $ENV_FILE --mode 600"
   fi
-  # ⛔ THE ENV VAR IS NOT THE ONLY SOURCE, AND NOT EVEN THE FIRST ONE (agent-infra#3331's lesson in
-  # `key-gate.sh`'s header): pi consults the STORE first and only then the environment. Now that the
-  # store is repaired above, a box with a populated store and no key in its shell is a WORKING box —
-  # refusing it here would be a false block on exactly the cell this change provisions. The refusal
-  # stays for the box with neither, which is the shape that cannot answer at all.
-  if [ -z "${DEEPSEEK_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] \
-     && ! store_has_credential "$(auth_store_path "$CELL_HOME")"; then
-    die "no provider key set; a lane would run and return nothing"
-  fi
+}
+
+# ── (2·probe) the provider, verified by a REAL call ──────────────────────────────────────────────
+# ⛔ THERE IS NO "no provider key set" REFUSAL HERE ANY MORE. `check_provider_store` runs BEFORE this
+# and owns that verdict, with a message that names the STORE (the thing a lane actually reads) instead
+# of only the environment — and pi consults the store FIRST, so "no variable in this shell" is not
+# "no credential" (agent-infra#3331's lesson in `key-gate.sh`'s header). By the time this runs, the
+# box has either a usable stored credential or a delivered key; if neither, that gate already died.
+check_provider() {
   # Probe by EXECUTION. The image's ANTHROPIC key is present-but-invalid, so the
   # presence of the variable proves nothing.
   #
@@ -2307,21 +2311,21 @@ main() {
   check_network
   case "$MODE" in
     --check)
-      check_provider
-      # IMMEDIATELY after the env is sourced and HOME is forced: the ONE-home predicate reads the
-      # paths this run will hand the cell, so it must run while they are still the run's own values
-      # (later steps rewrite WORKDIR/HARNESS_PIN_DIR, and a check that reads them afterwards grades
-      # its own repair).
+      # Three steps, in this order, and the order is the requirement:
+      #  1. source the env (and force the cell's HOME) — everything below reads what it set;
+      #  2. judge the HOME layout IMMEDIATELY, while the paths are still the run's own values
+      #     (later steps rewrite WORKDIR/HARNESS_PIN_DIR, and a check that reads them afterwards
+      #     grades its own repair);
+      #  3. repair/judge the provider CREDENTIAL STORE — AFTER (2), deliberately: it WRITES a
+      #     credential, and a run that is about to be refused for its home layout must not first mint
+      #     a key into the operator's own `~/.pi/agent/auth.json` (agent-infra#2024 review);
+      #  4. only then PROBE. The probe answers from the ENVIRONMENT this bring-up sourced, so it
+      #     passes on a box whose LANES still die (they source nothing); the store is what a lane
+      #     actually reads, so the store is what is checked — and the provider is the one lanes use.
+      check_provider_env
       check_one_home env
-      # AFTER the one-home gate, DELIBERATELY (agent-infra#2024 review): the store repair WRITES a
-      # credential, so running it before the home predicate would mint a key into the operator's own
-      # `~/.pi/agent/auth.json` on a run that is then refused for its home layout. Before this line,
-      # nothing may write; after it, the box has been accepted as a cell.
-      # It is also the gate the provider PROBE cannot be: the probe answers from the ENVIRONMENT this
-      # bring-up sourced, so it passes on a box whose LANES still die (they source nothing). The
-      # store is what a lane actually reads, so the store is what is checked — and the provider is
-      # the one the lanes use.
       check_provider_store "${PI_LANE_PROVIDER:-deepseek}"
+      check_provider
       check_gh
       check_repo
       check_dispatch
