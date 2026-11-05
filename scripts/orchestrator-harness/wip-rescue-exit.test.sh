@@ -884,50 +884,77 @@ n_ver=$(grep -c 'tb_timeout 5 git -C "$root" ls-remote --heads' "$GATE" 2>/dev/n
 n14_scan() { # n14_scan <gate-file> -> "<network> <local-config> <at-bound-position> <unbounded>"
   local j cmds n l b
   j=$(awk '
-    function pushseg(s, sp, kind,   t) {
+    # QUOTE-AWARE: strip only the quoted literals that read as PROSE, i.e. those containing a space. A
+    # quoted single token ("fetch", "git") is a WORD in a real command and is kept, so quoting a verb is not
+    # a way to escape this scan.
+    function strip_prose(s,   out, i, c, q, buf) {
+      out = ""; buf = ""; q = 0
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\"") {
+          if (q == 0) { q = 1; buf = "" } else {
+            q = 0
+            if (buf ~ / /) out = out " "; else out = out "\"" buf "\""
+          }
+          continue
+        }
+        if (q == 0) out = out c; else buf = buf c
+      }
+      if (q == 1) out = out "\"" buf
+      return out
+    }
+    # ⛔ PROSE IS DECIDED BY QUOTE STATE AT THE SEPARATOR, NOT BY THE STATEMENT FIRST WORD (review round 9,
+    # P1 — REPRODUCED). Every per-statement rule tried in rounds 7 and 8 failed the same way, because a
+    # statement can carry BOTH prose and a real command: an `echo` message joined by `;`/`&&` to a genuine
+    # `git -C "$root" ls-remote …` was dropped with the message (round 8 measured `4 1 4 0` over that
+    # mutant, byte-identical to the clean gate, with the suite green — while the round-6 expression caught
+    # it). The property that actually separates the two is a QUOTE: a separator seen while inside a
+    # double-quoted literal is prose, and the same separator outside one is code. `$(` opens a COMMAND
+    # SUBSTITUTION even inside a literal, so its contents are code and track their own (unquoted) state.
+    # Matching rules: a quoted single token is a word, so only literals containing a SPACE are stripped.
+    function pushseg(s, sp, prose,   t) {
       if (s !~ /[^[:space:]]/) return
-      if (kind == "M" && sp != "$(" && s !~ /^[[:space:]]*[A-Za-z_][A-Za-z0-9_]*=/) return
-      # ⛔ THE FIRST SEGMENT OF A STATEMENT HAS ITS QUOTED LITERALS REMOVED BEFORE SCANNING (review round 8, P2 —
-      # REPRODUCED). A prose-only assignment (`local msg="do NOT git push…"`) is kind C because the
-      # statement is not an echo, so its quoted message read as a call and scanned `5 1 4 1` — a red suite
-      # over a line with no network call. A real command keeps its verb OUTSIDE the quotes
-      # (`git -C "$root" push origin "HEAD:…"` -> `git -C  push origin `), and a real call whose verb is
-      # inside a substitution lives in a LATER segment (sp == "$("), which is not stripped — so stripping
-      # only this one segment closes the false red without touching a call.
-      if (kind == "C" && sp == "") { t = s; gsub(/"[^"]*"/, "", t); print t; return }
+      if (prose == 1) return
+      # Only the opening segment can still hold a literal; later ones begin outside quotes. `bash -c`
+      # style wrappers are NOT stripped, so a call hidden in their argument stays visible (it then reads
+      # UNBOUNDED, the fail-closed direction).
+      if (sp == "" && s !~ /^[[:space:]]*(bash|sh|eval|command|env)([[:space:]]|$)/) {
+        t = strip_prose(s); print t; return
+      }
       print s
     }
     /^lane_end_push\(\)/,/^}/ {
       if ($0 ~ /^[[:space:]]*#/) next
       line = line $0
       if ($0 ~ /\\$/) { sub(/\\$/, "", line); next }
-      # ⛔ A MESSAGE IS PROSE **PER SEGMENT**, AND THE SEPARATOR SAYS WHICH SEGMENT IS CODE (review round 8,
-      # P1 — REPRODUCED). Round 7 tagged the whole STATEMENT, so a real command joined to a message by
-      # `;`/`&&` — the joining style used throughout, `out="$(…)"; rc=$?` — was dropped with it: injecting
-      #   echo "x" >> "$log" … || true; out9="$(tb_timeout 0 git -C "$root" ls-remote …)"
-      # made this function return `4 1 4 0` and the full suite stay at 222/0, while the round-6 expression
-      # caught it (`5 1 4 1`) — round 7 had REMOVED coverage round 6 had. Two facts separate a message from
-      # a call INSIDE one, and `split()` cannot supply either because it consumes the separator:
-      #   (a) text opened by `$(` is a COMMAND SUBSTITUTION — code, even inside a message;
-      #   (b) a segment that is an ASSIGNMENT (` out9="$(…)"`) is code, whether or not its `$(` survived.
-      # So the scan is manual and each segment knows the separator that created it. Prose that merely
-      # mentions an imperative (`git branch <name> && git push origin <name>`) is created by `&&`/`;` and
-      # matches neither (a) nor (b), so it stays excluded — which is what the message kind is for.
-      # Measured after: the prose case still scans `4 1 4 0`, and the joined-command case scans `5 1 4 1`.
-      # ⛔ THE OVER-BLOCK THIS LEAVES, NAMED RATHER THAN DENIED: prose that STARTS a statement which is
-      # neither an echo nor an assignment (`local msg=…` was closed by the quoted-literal strip above) would
-      # still read as a call. No such line exists in `lane_end_push` today, and the direction is fail-CLOSED
-      # — the cost is a red suite on a legitimate edit, never a shipped hole.
-      kind = (line ~ /^[[:space:]]*(echo|printf)([[:space:]]|$)/) ? "M" : "C"
-      cur = ""; sp = ""
+      cur = ""; sp = ""; q = 0; depth = 0; incase = 0; cprose = 0
       for (i = 1; i <= length(line); i++) {
         c = substr(line, i, 1); two = substr(line, i, 2)
-        if (two == "&&" || two == "||") { pushseg(cur, sp, kind); cur = ""; sp = two; i++; continue }
-        if (c == ";" || c == "|" || c == "&") { pushseg(cur, sp, kind); cur = ""; sp = c; continue }
-        if (two == "$(") { pushseg(cur, sp, kind); cur = ""; sp = "$("; i++; continue }
+        if (two == "$(") {
+          pushseg(cur, sp, cprose); cur = ""; sp = "$("
+          qs[depth] = q; depth++; q = 0; cprose = 0; i++; continue
+        }
+        # `case … in 124)` closes nothing: a `)` while a `case` is open inside the substitution is a
+        # PATTERN terminator, and popping there would hand the rest of a MESSAGE to the scan as code.
+        if (depth > 0 && substr(line, i, 5) == "case ") incase = 1
+        if (depth > 0 && substr(line, i, 4) == "esac") incase = 0
+        if (c == ")" && depth > 0 && q == 0 && incase == 0) {
+          # The substitution BODY is code, so emit it, then resume the enclosing literal for whatever
+          # follows. The `cprose` of the resumed segment is the RESTORED quote state, which is what keeps
+          # the prose trailing a `$(…)` inside a message out of the scan.
+          pushseg(cur, sp, cprose); cur = ""; sp = ")"
+          depth--; q = qs[depth]; cprose = (q == 1 && depth == 0); continue
+        }
+        if (depth == 0 && q == 0 && (two == "&&" || two == "||")) {
+          pushseg(cur, sp, cprose); cur = ""; sp = two; cprose = 0; i++; continue
+        }
+        if (depth == 0 && q == 0 && (c == ";" || c == "|" || c == "&")) {
+          pushseg(cur, sp, cprose); cur = ""; sp = c; cprose = 0; continue
+        }
+        if (c == "\"") { if (depth == 0) q = 1 - q; cur = cur c; continue }
         cur = cur c
       }
-      pushseg(cur, sp, kind)
+      pushseg(cur, sp, cprose)
       line = ""
     }' "$1" 2>/dev/null)
   # ⛔ `$(`, `&&`, `||`, `;`, `|` AND `&` ALL SPLIT (review round 7, P1 — REPRODUCED). `$(` was missing, so
@@ -1015,28 +1042,31 @@ ck "N14 …every NETWORK call on the exit path is BOUNDED (15/15/5) — no unbou
 # function it scans: inject that exact call into a copy of the gate and require the same scan to count an
 # unbounded network call. Without this, a future narrowing of the regex would go green on silence.
 n14_mut="$TMP/n14mut"; mkdir -p "$n14_mut"
-# ⛔ THREE MUTANTS, ONE PER CLASS THIS EXPRESSION NOW COVERS (rounds 5, 7 and 8 — each REPRODUCED). 1: the
+# ⛔ FOUR MUTANTS, ONE PER CLASS THIS EXPRESSION NOW COVERS (rounds 5, 7, 8 and 9 — each REPRODUCED). 1: the
 # round-5 class (an unbounded `fetch` whose trailing comment SAYS `tb_timeout`). 2: the round-7 class — a
 # spelling the old literal matcher could not see at all (`"${root}"`, verb `pull`). 3: the `&` class — an
 # unbounded call BACKGROUNDED onto a line whose bounded sibling would otherwise certify it. A control that
 # shares only the first goes green when the matcher narrows back to one spelling, and one that omits the
 # third goes green when the `&` splitter is reverted; both were measured green at 222/0 before they were
-# pinned here.
+# pinned here. 4: the round-9 class — a REAL command `;`-joined to a message — which every per-statement
+# rule (rounds 7 and 8) dropped: measured, reverting the quote-state rule leaves this mutant at 3 of 4.
 awk '{ print }
   !done && /tb_timeout 15 git -C "\$root" push/ {
     print "  out2=\"$(git -C \"$root\" fetch origin 2>/dev/null)\"  # tb_timeout"
     print "  out3=\"$(git -C \"${root}\" pull origin 2>/dev/null)\""
     print "  out4=\"$(tb_timeout 15 git -C \"$root\" rev-parse HEAD 2>/dev/null)\" & git -C \"$root\" fetch origin 2>/dev/null"
+    print "  echo \"noop\" >> \"$log\" 2>/dev/null || true; git -C \"$root\" fetch origin 2>/dev/null"
     done=1
   }' "$GATE" > "$n14_mut/gate.sh" 2>/dev/null
 grep -q 'fetch origin 2>/dev/null)"  # tb_timeout' "$n14_mut/gate.sh" 2>/dev/null \
   && grep -q 'git -C "${root}" pull origin' "$n14_mut/gate.sh" 2>/dev/null \
-  && grep -q 'rev-parse HEAD 2>/dev/null)" & git -C "$root" fetch origin' "$n14_mut/gate.sh" 2>/dev/null; n14_inj=$?
+  && grep -q 'rev-parse HEAD 2>/dev/null)" & git -C "$root" fetch origin' "$n14_mut/gate.sh" 2>/dev/null \
+  && grep -q 'noop" >> "$log" 2>/dev/null || true; git -C "$root" fetch origin' "$n14_mut/gate.sh" 2>/dev/null; n14_inj=$?
 # ⛔ THE SAME `n14_scan`, ON THE MUTANT — this is what makes the control real. If the exemption ever goes
 # back to a substring test, field 4 here reads 0 over an unbounded `fetch` and N14scan reds.
 n14_mut_unb=$(n14_scan "$n14_mut/gate.sh" | awk '{print $4}')
-[ "$n14_inj" -eq 0 ] && [ "$n14_mut_unb" -ge 3 ]; rcn14scan=$?
-ck "N14scan …and the arm can SEE an unbounded call a trailing comment pretends to bound, one in a spelling it used not to match at all, AND one BACKGROUNDED beside a bounded sibling (injected: 3, counted unbounded: $n14_mut_unb of 3) — a substring exemption, a single-spelling matcher, or a dropped ampersand split cannot pass this" $rcn14scan
+[ "$n14_inj" -eq 0 ] && [ "$n14_mut_unb" -ge 4 ]; rcn14scan=$?
+ck "N14scan …and the arm can SEE four classes it has had to learn: a trailing comment that pretends to bound, a spelling it used not to match, a call BACKGROUNDED beside a bounded sibling, and a real command joined to a message by a semicolon (injected: 4, counted unbounded: $n14_mut_unb of 4) — an exemption, a narrow matcher, a dropped ampersand split, or a per-statement prose rule cannot pass this" $rcn14scan
 # ⛔ N14b — THE BOUND MUST BOUND **WALL CLOCK**, NOT ONLY SPELLING (review cycle 10, P2 — REPRODUCED).
 # N14 is a TEXT SCAN by construction, so it cannot see this class at all, and on a Linux host GNU
 # `timeout` hides it: `tb_watchdog` used to `kill -9 "$pid"` — the DIRECT child only — so a command that
