@@ -147,6 +147,16 @@ tb_watchdogs_reap() {
 # stays in its group — it does NOT bound a nested `tb_timeout`. No in-tree caller nests today (the
 # reaper's delegates and `conflict-rebase-timer.sh`'s python do not re-enter it), so no caller currently
 # reads a guarantee it does not hold; the residue is tracked rather than glossed.
+# ⛔ AND THE GROUP IS A HANDLE THE **CALLER** KEEPS, NOT A PRISON (review of PR #3399, P1 — REPRODUCED).
+# The first cut forked the command AND its watchdog under `set -m`, so BOTH became group leaders and the
+# fleet's termination discipline could no longer reach either one: a lane is reaped with
+# `kill -TERM -- "-$pgid"` (spawn-gate.sh, cell-lane-preflight.sh) precisely so nothing is left resident
+# for the census to account for, and measured under `setsid` a caller group-TERM left the bounded command
+# alive at ppid 1 until its own bound expired — the bound had become a floor. Only the COMMAND is
+# ungrouped (it must be: that is what lets the timer reach a transport helper the command forked). The
+# WATCHDOG is forked with job control OFF so it stays in the CALLER's group, where the caller's group
+# signal reaches it, and its trap FORWARDS that TERM to the command's group — GNU `timeout`'s behaviour,
+# which is what the header above says this replicates.
 tb_watchdog() {
     local secs="$1"; shift
     local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 jobctl=0
@@ -158,12 +168,25 @@ tb_watchdog() {
     was_m=0; case $- in *m*) was_m=1 ;; esac
     jobctl=0
     set -m 2>/dev/null && jobctl=1
-    "$@" &
+    # ⛔ STDIN IS REDIRECTED, SO THE BOUND DOES NOT GAIN AN INPUT. bash gives a background job `/dev/null`
+    # as stdin only when job control is OFF; with `set -m` in effect (one line up) it INHERITS the caller's
+    # stdin, so a bounded `cat` or an interactive `gh` would silently consume a pipe meant for the caller.
+    # The redirection restores exactly the behaviour every existing caller had before `set -m` existed.
+    "$@" </dev/null &
     pid=$!
+    # ⛔ JOB CONTROL OFF FOR THIS FORK, ON PURPOSE (see the paragraph above the function): the watchdog must
+    # stay in the caller's group to receive the caller's group signal.
+    set +m 2>/dev/null
     (
-        # TERM means the parent finished with this probe: kill the timer and leave without signalling
-        # anything. No orphaned `sleep`, so no `pkill -P` sweep is needed.
-        trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
+        # TERM means the caller is finished with this probe — either the parent reaped the command, or the
+        # CALLER's own group-TERM arrived (the lane reaper's shape). Kill the timer; and when the command is
+        # still running, FORWARD the TERM to its group, or a group-killed lane leaves the bounded command
+        # resident for up to its whole bound — the very resident this function exists to not create.
+        # ⛔ `done_flag` IS THE DISCRIMINATOR, NOT `kill -0` (which is the narrow fallback for the degraded
+        # full-disk shape where no scratch dir could be made): the parent writes it BEFORE it signals this
+        # watchdog, so its presence means "the command already finished — forward nothing", which also
+        # closes the reap window in which `$pid` could have been reused by an unrelated process.
+        trap 'kill "$s" 2>/dev/null; if { [ -z "$done_flag" ] || [ ! -e "$done_flag" ]; } && kill -0 "$pid" 2>/dev/null; then kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null; fi; exit 0' TERM INT
         sleep "$secs" &
         s=$!
         wait "$s" 2>/dev/null
@@ -176,10 +199,9 @@ tb_watchdog() {
         fi
     ) >/dev/null 2>&1 &
     wd=$!
-    # The groups exist as of the fork, so the caller's job-control state is restored HERE and not after
-    # the wait: leaving it on for the duration would change how every async command the CALLER runs while
-    # this probe is in flight is grouped.
-    [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
+    # The caller's job-control state is restored EXACTLY as it was found, after BOTH forks — so a caller
+    # that runs with `set -m` gets it back for everything it runs while this probe is in flight.
+    [ "$was_m" = "1" ] && set -m 2>/dev/null
     TB_WATCHDOGS="$TB_WATCHDOGS $wd"
     wait "$pid" 2>/dev/null || rc=$?
     if [ -n "$wd" ]; then
