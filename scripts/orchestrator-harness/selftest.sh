@@ -3894,7 +3894,7 @@ ck "refresh-candidates.sh ranks the tiers P0=0 < P1=1 < P2=2 (a constant rank wo
 # `set -u` with `rc_dedupe: unbound variable`: no FAIL line, no summary, and every check after this one
 # never ran. The guard's failure path is the one thing that must never itself crash. Defaulting to 1
 # makes a skipped drive count a named FAIL and lets the suite continue, as it did before this change.
-rc_dedupe=1; rc_rank=1; rc_handoff=1
+rc_dedupe=1; rc_rank=1; rc_handoff=1; rc_uncounted=1
 if [ -s "$REFRESH" ]; then
   awk '/^done < /{f=1;next} f' "$REFRESH" > "$TMP/tail.sh"
   # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
@@ -3974,6 +3974,19 @@ if [ -s "$REFRESH" ]; then
        && ! grep -q 'ARRIVAL order' "$TMP/dedupe-drive.log" 2>/dev/null \
        && grep -q 'highest-ranked CLEAN entry in the pool-ordered queue' "$TMP/qorder-drive.log" 2>/dev/null; then rc_handoff=0; fi
     [ "$rc_handoff" -eq 0 ] || { echo "      handoff arm (no pool): $(grep -c 'established NO priority order' "$TMP/dedupe-drive.log" 2>/dev/null) / ARRIVAL-named: $(grep -c 'ARRIVAL order' "$TMP/dedupe-drive.log" 2>/dev/null) / severity arm: $(grep -c 'highest-ranked CLEAN entry in the pool-ordered queue' "$TMP/qorder-drive.log" 2>/dev/null)"; }
+    # C2) THE THIRD STATE HAS ITS OWN WORDS (review P2, cycle 10). `severity-uncounted` — the reorder was
+    #     DERIVED AND IS ON DISK, only its count could not be read back — fell into the `*` arm, which says
+    #     "this pass established NO priority order": the opposite, and it becomes `handed_why=` in
+    #     `state/refresh-last`, where it outlives the log line that contradicted it. The STATE is stubbed
+    #     (reaching it needs a concurrent pass racing the count file); the ARM is the shipped one.
+    { cat "$TMP/qorder-fns-drive.sh"
+      printf 'queue_order_from_pool() { QUEUE_ORDER_STATE="severity-uncounted"; }\n'
+      cat "$TMP/tail-drive.sh"; } > "$TMP/tail-uncounted.sh"
+    printf '200\n300\n' > "$TMP/candidates.txt"
+    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-uncounted.sh ) > "$TMP/uncounted-drive.log" 2>&1
+    if grep -q 'the highest-ranked CLEAN entry in the pool-ordered queue this pass derived' "$TMP/uncounted-drive.log" 2>/dev/null \
+       && ! grep -q 'established NO priority order' "$TMP/uncounted-drive.log" 2>/dev/null; then rc_uncounted=0; else rc_uncounted=1; fi
+    [ "$rc_uncounted" -eq 0 ] || echo "      severity-uncounted arm: own-words $(grep -c 'this pass derived' "$TMP/uncounted-drive.log" 2>/dev/null) / NO-priority-order $(grep -c 'established NO priority order' "$TMP/uncounted-drive.log" 2>/dev/null) (want 1 / 0)" 
     [ "$rc_dedupe" -eq 0 ] || echo "      dedupe drive gave '$tail_got' (want '5000 100 9000')"
     rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
   fi
@@ -3981,6 +3994,7 @@ fi
 ck "refresh-candidates.sh dedupes the backlog in place (and leaves the order alone when the pool ranks nothing)" $rc_dedupe
 ck "refresh-candidates.sh re-derives the queue's head from the pool — the ranked row leads, unranked rows keep their tail order" $rc_rank
 ck "the handoff line names the order it actually has — 'priority-unreadable' without inventing 'ARRIVAL order', and the severity arm when the pool ranked" $rc_handoff
+ck "a severity-uncounted handoff names the row as the highest-ranked CLEAN entry it DERIVED, not 'no priority order' (the third state has its own words)" $rc_uncounted
 
 # ── 19) the harness runs on Linux as well as macOS (#1702) ──────────────────────
 # The shipped cell controller (cloud-cell-supervisor.sh) starts THIS loop on a Linux cell, and every

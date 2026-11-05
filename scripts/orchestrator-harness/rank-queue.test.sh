@@ -442,6 +442,7 @@ QC="$TMP/countguard"; mkdir -p "$QC"
 printf '300\n9\n' > "$QC/q"
 printf '300\n' > "$QC/pool"
 {
+  drive_prologue
   cat "$FNS"
   printf 'rank_queue_by_pool "$1" "$2" "$3" "$4"\nexit $?\n'
 } > "$QC/one.sh"
@@ -826,7 +827,7 @@ cat > "$RS/bin/sort" <<'SHIM'
 if [ "${!#}" = "$RS_PF" ]; then { /usr/bin/sort "$@"; printf '999999\n'; }; else exec /usr/bin/sort "$@"; fi
 SHIM
 chmod +x "$RS/bin/sort"
-{ echo 'QUEUE_ORDER_STATE=""'; cat "$FNS"; printf 'product_queue_follow "$1"\nexit $?\n'; } > "$RS/drive.sh"
+{ drive_prologue; cat "$FNS"; printf 'product_queue_follow "$1"\nexit $?\n'; } > "$RS/drive.sh"
 ( cd "$RS" && HOME="$RS" RS_PF="$RS/o/candidates.product.txt" PATH="$RS/bin:$PATH" bash drive.sh "$RS/o" ) > "$RS/out" 2>&1
 rs_rows="$(tr '\n' ' ' < "$RS/o/candidates.product.txt" 2>/dev/null | sed 's/ *$//')"
 rs_tmp="$(ls -a "$RS/o" 2>/dev/null | grep -c '^\.product\.follow$')"
@@ -864,16 +865,24 @@ rmdir "$PQ/o/candidates.product.txt" 2>/dev/null || true
 count_race() {  # <name> <shim-body> [queue-content] -> sets CROUT / CRR / CRROWS for a real reorder
   local d="$TMP/count-$1"
   rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
-  # '$3'/'-' = an EMPTY queue; '$4'/'-' = an EMPTY pool; omitted = the 2-row / ranked-pool default
-  if [ "${4:-}" = "-" ]; then : > "$d/o/.pool"; else printf '300\n200\n' > "$d/o/.pool"; fi
-  if [ "${3:-}" = "-" ]; then : > "$d/o/candidates.txt"; else printf '200\n300\n' > "$d/o/candidates.txt"; fi
-  cat > "$d/bin/mv" <<SHIM
+  # '$3' = queue content ('-' = an EMPTY queue, omitted = the 2-row default); '$4' = pool content ('-' = an
+  # EMPTY pool, omitted = `300 200`); '$5' = which binary to shim (default `mv`). Each is honoured — an
+  # argument that were silently ignored would make a fixture assert the DEFAULT's behaviour while claiming
+  # to set up a different state (measured: the identical-branch fixture ran on the default order and
+  # reported INSTALLED, the very thing it exists to exclude).
+  if [ "${4:-}" = "-" ]; then : > "$d/o/.pool"
+  elif [ -n "${4:-}" ]; then printf '%s\n' "$4" > "$d/o/.pool"
+  else printf '300\n200\n' > "$d/o/.pool"; fi
+  if [ "${3:-}" = "-" ]; then : > "$d/o/candidates.txt"
+  elif [ -n "${3:-}" ]; then printf '%s\n' "$3" > "$d/o/candidates.txt"
+  else printf '200\n300\n' > "$d/o/candidates.txt"; fi
+  cat > "$d/bin/${5:-mv}" <<SHIM
 #!/usr/bin/env bash
 $2
-exec /usr/bin/mv "\$@"
+exec /usr/bin/${5:-mv} "\$@"
 SHIM
-  chmod +x "$d/bin/mv"
-  { echo 'QUEUE_ORDER_STATE=""'; cat "$FNS"; printf 'queue_order_from_pool "$1"\nexit $?\n'; } > "$d/drive.sh"
+  chmod +x "$d/bin/${5:-mv}"
+  { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\nexit $?\n'; } > "$d/drive.sh"
   ( cd "$d" && HOME="$d" PATH="$d/bin:$PATH" QRO="$d/o" bash drive.sh "$d/o" ) > "$d/out" 2>&1
   CRR=$?
   CROUT="$(cat "$d/out" 2>/dev/null)"
@@ -884,7 +893,11 @@ count_race gone 'rm -f "$QRO/.queue-rank" 2>/dev/null || true'
 # install (or the byte-identical `cmp`) has already decided the ORDER, so "the order is UNVERIFIED (whatever
 # the PREVIOUS pass left)" would be a false statement about this pass's own write — and the skip arm copies
 # that clause into `why=`, the field that outlives the log.
+# ⛔ AND THE FAILED REDIRECTION DOES NOT LEAK (review P3, cycle 10): `read … < missing` prints `…: No such
+# file or directory` on stderr even with read's own `2>/dev/null`, landing a spurious failure line in the
+# controller log directly above the honest message. The `[ -r ]` guard is what removes it.
 if [ "$CRR" -eq 0 ] && [ "$CRROWS" = "300 200" ] && printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED' \
+   && ! printf '%s' "$CROUT" | grep -q 'No such file or directory' \
    && ! printf '%s' "$CROUT" | grep -q 'the queue is EMPTY' && ! printf '%s' "$CROUT" | grep -q 'priority-unreadable'; then rc=0
 else rc=1; echo "      count file GONE: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (want rows installed, 'DERIVED AND INSTALLED', NOT 'EMPTY', NOT 'priority-unreadable')"; fi
 ck "a count file that VANISHES between the reorder and the read-back is UNKNOWN COUNTS over an INSTALLED order, not a measured EMPTY queue" $rc
@@ -910,6 +923,22 @@ if [ "$CRR" -eq 0 ] && ! printf '%s' "$CROUT" | grep -q 'head #999999 is the hig
    && printf '%s' "$CROUT" | grep -q 'candidates.txt.s head is'; then rc=0
 else rc=1; echo "      foreign head: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a head that is not candidates.txt's head must not be reported AS the head)"; fi
 ck "a count whose HEAD is not candidates.txt's head is refused, never reported as the highest-ranked CLEAN entry" $rc
+# ⛔ THE IDENTICAL BRANCH SAYS IT WROTE NOTHING (review P3, cycle 10). `_wrote` is 0 when `cmp` found the
+# bytes equal, so "INSTALLED" would be a typed claim about a write that never happened. Queue already in the
+# pool's order, pool `300 200`; a `cmp` shim models the concurrent pass deleting the count.
+count_race identical 'rm -f "$QRO/.queue-rank" 2>/dev/null || true' "$(printf '300\n200')" "$(printf '300\n200')" cmp
+if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'already held exactly those bytes' \
+   && ! printf '%s' "$CROUT" | grep -q 'DERIVED AND INSTALLED'; then rc=0
+else rc=1; echo "      identical branch: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (want 'already held exactly those bytes', NOT 'INSTALLED')"; fi
+ck "an UNCHANGED reorder is not reported as INSTALLED — the wording follows the write that happened" $rc
+# ⛔ AND A COUNT WHOSE TOTALS DO NOT ADD UP IS REFUSED (review P3, cycle 10). The head cross-check passes a
+# count that happens to share the head; the totals are a second, independent witness — and a foreign `_u`
+# of 0 would otherwise silence the unranked-tail WARN.
+count_race bad-totals 'printf "1 0 300\n" > "$QRO/.queue-rank"'
+if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'does not add up to the queue' \
+   && ! printf '%s' "$CROUT" | grep -q 'head #300 is the highest-ranked'; then rc=0
+else rc=1; echo "      bad totals: rc=$CRR out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (a count of 1 over a 2-row queue must not be published as this pass's totals)"; fi
+ck "a count whose TOTALS do not add up to the queue is refused, never published as this pass's counts" $rc
 count_race good 'true'
 if [ "$CRR" -eq 0 ] && printf '%s' "$CROUT" | grep -q 'severity-first from the pool — head #300 is the highest-ranked' \
    && printf '%s' "$CROUT" | grep -q '2 pool-ranked, 0 unranked'; then rc=0
@@ -928,13 +957,16 @@ ck "a GENUINELY empty queue still reports 'the queue is EMPTY' — the artefact 
 #        each state's clause is compared with the ONE that belongs to it — a swap reds, and every clause is
 #        asserted to be distinct from the others.
 SKIPWHY="$TMP/skipwhy.sh"
-{ cat "$FNS"; printf 'skip_order_why "$1"
+{ drive_prologue; cat "$FNS"; printf 'skip_order_why "$1"
 '; } > "$SKIPWHY"
 w_sev="$( ( cd "$TMP" && bash skipwhy.sh severity ) 2>/dev/null )"
 w_unc="$( ( cd "$TMP" && bash skipwhy.sh severity-uncounted ) 2>/dev/null )"
 w_emp="$( ( cd "$TMP" && bash skipwhy.sh empty ) 2>/dev/null )"
 w_pri="$( ( cd "$TMP" && bash skipwhy.sh priority-unreadable ) 2>/dev/null )"
-w_unk="$( ( cd "$TMP" && bash skipwhy.sh ) 2>/dev/null )"
+# an explicit EMPTY argument, not an absent one: the drive now runs under `set -u` (as the shipped code
+# does), where an unset `$1` is a fatal abort — and the state the arm can pass is "" (unrecorded), never
+# "no argument at all".
+w_unk="$( ( cd "$TMP" && bash skipwhy.sh "" ) 2>/dev/null )"
 if printf '%s' "$w_sev" | grep -q 'the ORDER was re-derived severity-first from the pool' \
    && ! printf '%s' "$w_sev" | grep -q 'nothing was queued' \
    && printf '%s' "$w_unc" | grep -q 'the COUNTS could not be read back' \
@@ -957,7 +989,7 @@ mapply=""
 [ "$MAPLINE" = "1" ] && mapply="$(grep '^    _skip_order_why="$(skip_order_why' "$REFRESH" | head -1)"
 if [ "$MAPLINE" = "1" ] && [ -n "$mapply" ]; then
   MAPD="$TMP/mapdrive"; rm -rf "$MAPD"; mkdir -p "$MAPD"
-  { cat "$FNS"
+  { cat "$FNS"; drive_prologue
     printf 'skip_order_why() { printf "%%s" "$1"; }\n'
     printf 'map_state() { QUEUE_ORDER_STATE="$1"; _skip_order_why="";\n%s\nprintf "%%s" "$_skip_order_why"; }\n' "$mapply"
     printf 'map_state "$1"\n'
@@ -974,6 +1006,23 @@ else
   rc=1; echo "      could not extract exactly ONE \`_skip_order_why=\$(skip_order_why …)\` assignment from the skip arm (found $MAPLINE) — this check cannot grade the dispatch"
 fi
 ck "the SKIP arm hands skip_order_why the STATE it recorded (no second re-mapping table that can drift from it)" $rc
+# 12-z) NO GENERATED DRIVER MAY OPT OUT OF `set -u` (review P2, cycle 10). Both scripts this suite EXTRACTS
+#       from run under `set -u` (refresh-candidates.sh:16, orch-loop.sh:4), so an unbound reference inside
+#       any function under test is a FATAL abort in production while a driver without the flag reports it
+#       GREEN. Measured by the reviewer: `echo "$UNBOUND_PROBE"` planted in the count-unreadable arm left
+#       the suite at 60/0, because the only driver reaching those arms (count_race) ran without the flag.
+#       The glob is deliberate: a driver added later is covered without being listed here.
+drivers_total=0; drivers_bare=""
+while IFS= read -r drv; do
+  [ -n "$drv" ] || continue
+  drivers_total=$(( drivers_total + 1 ))
+  grep -qx 'set -u' "$drv" 2>/dev/null || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
+done <<EOF
+$(find "$TMP" -type f \( -name 'drive*.sh' -o -name 'one.sh' -o -name 'skipwhy.sh' -o -name 'floor-drive.sh' -o -name 'tail-with-qorder.sh' \) 2>/dev/null | sort)
+EOF
+if [ "$drivers_total" -ge 4 ] && [ -z "$drivers_bare" ]; then rc=0
+else rc=1; echo "      generated drivers: $drivers_total found; WITHOUT 'set -u':${drivers_bare:- none} (want >=4 drivers, every one under set -u — without it a driver cannot see an unbound-reference abort)"; fi
+ck "every generated driver runs under \`set -u\`, like the shipped code it extracts ($drivers_total checked)" $rc
 # 12a) NON-VACUITY by MUTATION: make `product_queue_follow` a no-op (`return 0` as its first statement)
 #      and the stale-case assertion must RED — the product file stays a pass behind.
 MUT_NOFOLLOW="$TMP/fns-nofollow.sh"
@@ -982,7 +1031,7 @@ if awk '/^product_queue_follow\(\) \{/{getline; if ($0 ~ /return 0/) found=1} EN
 else rc=1; echo "      the no-op mutation did not apply — sed anchor drifted"; fi
 ck "the no-op mutation applied to the extracted product_queue_follow (a \`return 0\` as its first statement)" $rc
 {
-  echo 'QUEUE_ORDER_STATE=""'
+  drive_prologue
   cat "$MUT_NOFOLLOW"
   printf 'queue_order_from_pool "$1"\nproduct_queue_follow "$1"\n'
 } > "$PQ/drive-mut.sh"
