@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""scripts/test_lane_wip.py — the payload contract `lane-wip.py` states but never pinned.
+
+`lane-wip.py` builds ONE payload for two surfaces (prose and `--json`), and its own comment says
+the point is that "the JSON and the prose can never disagree". Nothing tested that, so the rewrite
+that introduced `collect()` silently dropped the `…` truncation marker the prose had carried
+before it, and set `turns_truncated` to the REQUESTED turn count rather than a truncation flag —
+a field whose name and value disagreed on every call.
+
+Both are the "arm that cannot fail" class: a payload asserted only by prose in its comments.
+
+`lane_rows` / `session_file` / `turns` are stubbed, so nothing shells out and no session directory
+is read.
+"""
+import importlib.util
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _load():
+    spec = importlib.util.spec_from_file_location(
+        "lane_wip_under_test", os.path.join(_HERE, "lane-wip.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _collect(monkeypatch, chars, want, turns_read):
+    """Drive `collect()` with its three I/O seams stubbed."""
+    lw = _load()
+    monkeypatch.setattr(lw, "lane_rows",
+                        lambda: [{"ws": "WS1", "lane": "L1", "sid": "sid-abc12345",
+                                  "verdict": "WORKING"}])
+    monkeypatch.setattr(lw, "session_file", lambda sid: __file__)
+    monkeypatch.setattr(lw, "turns", lambda path, n: list(turns_read))
+    return lw.collect("WS1", chars=chars, want=want)
+
+
+def test_an_over_long_turn_is_cut_and_marked(monkeypatch):
+    """⛔ THE MARKER WAS DROPPED. The pre-#3382 prose appended `("…" if len(t) > chars else "")`;
+    the rewrite that introduced `collect()` cut with a bare `t[:chars]`, so an operator could no
+    longer tell a truncated turn from a complete one — the ONE thing `--chars` exists to make
+    unambiguous."""
+    rc, p = _collect(monkeypatch, chars=10, want=1, turns_read=["x" * 50])
+    assert rc == 0, rc
+    assert p["turns"] == ["x" * 10 + "\u2026"], p["turns"]
+    assert p["turns"][0].count("\u2026") == 1, "exactly ONE ellipsis (a marker, not a pad)"
+
+
+def test_a_turn_that_fits_is_not_marked(monkeypatch):
+    rc, p = _collect(monkeypatch, chars=10, want=1, turns_read=["yyy"])
+    assert rc == 0, rc
+    assert p["turns"] == ["yyy"], p["turns"]
+    assert "\u2026" not in p["turns"][0], "no ellipsis is invented on a turn that fits"
+
+
+def test_turns_truncated_is_a_flag_not_the_requested_count(monkeypatch):
+    """⛔ IT HELD `want`. A consumer reading it as a truncation flag was wrong on EVERY call.
+
+    The requested count is still reported — as `turns_requested`, a name that is true.
+    """
+    _, p = _collect(monkeypatch, chars=10, want=1, turns_read=["yyy"])
+    assert p["turns_truncated"] is False, p["turns_truncated"]
+    assert p["turns_requested"] == 1, p["turns_requested"]
+
+    _, p = _collect(monkeypatch, chars=10, want=3,
+                    turns_read=["yyy", "x" * 50, "yyy"])
+    assert p["turns_truncated"] is True, "one long turn among three still sets the flag"
+    assert p["turns_requested"] == 3, p["turns_requested"]
+    assert len(p["turns"]) == 3, p["turns"]
+
+
+def test_the_exit_contract_separates_a_failed_read_from_no_match(monkeypatch):
+    """#3382 invariant 1: a lane table that could not be READ is not "no lane matches".
+
+    Kept here because the payload and the exit code are the same contract, and the code is what a
+    consumer dispatches on.
+    """
+    lw = _load()
+    monkeypatch.setattr(lw, "lane_rows", lambda: None)
+    rc, p = lw.collect("WS1")
+    assert rc == 3 and "UNMEASURED" in (p.get("unmeasured") or ""), (rc, p)
+
+    monkeypatch.setattr(lw, "lane_rows", lambda: [])
+    rc, p = lw.collect("NOPE")
+    assert rc == 2 and p.get("note"), (rc, p)
