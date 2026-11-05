@@ -1785,6 +1785,82 @@ rc=$?
 [ "$rc" -eq 0 ] && grep -qF 'SELFHOSTED:http://[0:0:0:0:0:0:0:1]:8000/mcp' "$LOG" \
   && ok "a fully-expanded IPv6 loopback self-host is PRESERVED and certified (loopback is an IP test in both files)" \
   || fail "a legal loopback spelling (http://[0:0:0:0:0:0:0:1]:8000/mcp) was refused (rc=$rc) — a false block on the documented local self-host, and the repair cannot converge"
+# ⛔ AN IPv6 LITERAL IS ONE HOST TOKEN — AND THIS ARM IS THE ONLY THING THAT SAYS SO (#3374 review P3).
+# The host class used to stop at the first colon INSIDE the brackets, so `[::1]` and `[::2]` both read
+# as `[` and ANY comparison built on it called two DISTINCT hosts equal. The commit that fixed it
+# shipped with no arm: reverting just the bracketed alternative left this suite byte-identically
+# green (223 ok / 0 FAIL, measured), i.e. a correct hardening nobody could regress. Driven at the
+# PREDICATE, on purpose — `near_miss` is called with the template's `want_url`, which is never a
+# bracketed literal, so the bracket branch is reachable on ONE side only and no install/verify arm
+# could ever see a difference.
+python3 - "$ROOT/pi-bootstrap/lib/merge-mcp.py" <<'PY' \
+  && ok "an IPv6 literal stays ONE host token — [::1] and [::2] do not collapse to the same host" \
+  || fail "the IPv6 host parse collapsed distinct literals to one token — every comparison built on host_of/authority_of would call two different hosts equal"
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("mm", sys.argv[1])
+mm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mm)
+# the literal must survive WHOLE, port outside it
+assert mm.host_of("http://[::1]:8000/mcp") == "[::1]", mm.host_of("http://[::1]:8000/mcp")
+assert mm.host_of("http://[::2]:8000/mcp") == "[::2]", mm.host_of("http://[::2]:8000/mcp")
+assert mm.authority_of("http://[::1]:8000/mcp") == "[::1]:8000", mm.authority_of("http://[::1]:8000/mcp")
+assert mm.host_of("http://[::1]:8000/mcp") != mm.host_of("http://[::2]:8000/mcp")
+sys.exit(0)
+PY
+# ⛔ `_selfHosted` IS AN EXEMPTION, AND AN EXEMPTION MAY ONLY CERTIFY SOMETHING REACHABLE (#3374
+# review P3). The floor was "one character after //", so an entry with NO host was printed
+# `SELFHOSTED:` and exited 0 — LAYER VERIFIED over an endpoint that points at nothing, the same false
+# green the scheme-less `BADURL:` arm closes. Every shape below is one `new URL(u)` THROWS on in the
+# client (measured `ERR_INVALID_URL`), so refusing it cannot over-block a config that works: no
+# request can be built from it either. And because `merge-mcp.py`'s `authority_names_a_host` is the
+# SAME predicate, install REPLACES each one — asserted, because a refusal with no repair is a cell
+# that can never converge.
+for _bad in 'https://:8443/mcp/' 'https://my daemon:8000/mcp' 'https://./mcp/' 'https://-/mcp/' \
+            'https://api.premiselabs.co:8443x/mcp/' 'https://api.premiselabs.co%40evil.example/mcp/'; do
+  python3 - "$DEST/.mcp.json" "$_bad" <<'PY'
+import json, sys
+p, u = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "url": u, "_selfHosted": True,
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+  run_verify
+  rc=$?
+  [ "$rc" -eq 1 ] && grep -qF 'names no usable host' "$LOG" \
+    && ok "--verify REFUSES a _selfHosted url that names no usable host ($_bad)" \
+    || fail "--verify CERTIFIED a url naming no usable host ($_bad, rc=$rc) — LAYER VERIFIED over an entry the client cannot build a request from"
+  run_install
+  run_verify
+  rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "...and install REPAIRS it into the hosted default, so verify converges ($_bad)" \
+    || fail "install did not converge from a no-host _selfHosted entry ($_bad): verify still fails (rc=$rc) — a cell that can never come up"
+done
+# ⛔ THE TEMPLATE READ WAS THE ONE REMAINING RAW TRACEBACK ON THE **VERIFY** SIDE (#3374 review P3).
+# `merge-mcp.py` got a named FATAL for a template that is missing, unparseable, or the wrong SHAPE;
+# the marker kept `json.load(open(...))` then `tpl.get(...)`, so all of them raised straight out and
+# left stdout EMPTY — `verify_graph_mcp` then printed `verify failed (marker: none)` above Python
+# internals instead of naming the cause, the exact "marker: none beside a traceback" shape this
+# file's own BADDERS/URLTYPE arms exist to prevent. It fails closed, but a checker that cannot say
+# WHY is the instrument defect, not the audit. Reachable: `is_infra_checkout` does not require
+# `templates/.mcp.base.json` to exist.
+MARKER_FN="$TMP/graph_mcp_marker.sh"
+sed -n '/^graph_mcp_marker()/,/^}/p' "$ROOT/pi-bootstrap/cell-install.sh" > "$MARKER_FN"
+printf '[1,2]'        > "$TMP/tpl-list.json"
+printf '{"mcpServers": 5}' > "$TMP/tpl-srv.json"
+printf '{not json'    > "$TMP/tpl-corrupt.json"
+for _tpl in "$TMP/tpl-corrupt.json" "$TMP/tpl-list.json" "$TMP/tpl-srv.json" "$TMP/tpl-absent.json"; do
+  out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$DEST/.mcp.json" "$_tpl" 2>&1)"
+  rc=$?
+  [ "$rc" -eq 1 ] && case "$out" in BADTPL:*) true ;; *) false ;; esac \
+    && ! grep -q 'Traceback' <<<"$out" \
+    && ok "the verifier names an unusable TEMPLATE (BADTPL:) instead of raising — $(basename "$_tpl")" \
+    || fail "an unusable template ($(basename "$_tpl")) produced rc=$rc / '${out:0:60}' instead of a named BADTPL refusal (a traceback in the marker leaves the operator with 'marker: none' and no cause)"
+done
+rm -f "$TMP/tpl-list.json" "$TMP/tpl-srv.json" "$TMP/tpl-corrupt.json" "$MARKER_FN"
 # ⛔ A `headers` THAT IS NOT AN OBJECT IS REFUSED BY NAME **AND** REPAIRABLE BY INSTALL. `.get` on a
 # str/list raised before the write on the install side and left an EMPTY marker on the verify side,
 # so `--install` — the repair path — could not fix the entry either: the "config nothing can repair"

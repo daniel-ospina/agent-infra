@@ -513,8 +513,32 @@ import re
 import sys
 
 p = sys.argv[1]
-tpl = json.load(open(sys.argv[2])) if len(sys.argv) > 2 else {}
-want_url = ((tpl.get("mcpServers") or {}).get("tortoise") or {}).get("url") or ""
+# ⛔ THE TEMPLATE READ WAS THE ONE REMAINING RAW TRACEBACK ON THE VERIFY SIDE (#3374 review P3).
+# `merge-mcp.py` was hardened to a named FATAL for a template that is missing, unparseable, or the
+# wrong SHAPE — but the marker kept `json.load(open(...))` then `tpl.get(...)`, so all three raised
+# straight out and left stdout EMPTY. `verify_graph_mcp` then printed `verify failed (marker: none)`
+# above Python internals instead of naming the cause, which is the exact "marker: none beside a
+# traceback" shape this file's own BADDERS/URLTYPE arms exist to prevent. It fails closed (rc is
+# still non-zero), but a checker that cannot say WHY is the instrument defect, not the audit.
+# Reachable: `is_infra_checkout` does not require `templates/.mcp.base.json` to exist.
+tpl = {}
+if len(sys.argv) > 2:
+    try:
+        with open(sys.argv[2]) as _tf:
+            tpl = json.load(_tf)
+    except (OSError, ValueError) as exc:
+        print("BADTPL:%s: %s" % (type(exc).__name__, exc))
+        sys.exit(1)
+if not isinstance(tpl, dict) or not isinstance(tpl.get("mcpServers"), (dict, type(None))):
+    print("BADTPL:shape: root is %s, mcpServers is %s" % (
+        type(tpl).__name__,
+        type(tpl.get("mcpServers") if isinstance(tpl, dict) else None).__name__))
+    sys.exit(1)
+_want = (tpl.get("mcpServers") or {}).get("tortoise")
+if _want is not None and not isinstance(_want, dict):
+    print("BADTPL:shape: mcpServers.tortoise is %s, not an object" % type(_want).__name__)
+    sys.exit(1)
+want_url = (_want or {}).get("url") or ""
 raw = open(p).read()
 try:
     cfg = json.loads(raw)
@@ -681,6 +705,52 @@ if auth and (_m.group(1).lower() if _m else "") != "https" \
    and not _loopback(_m.group(2) if _m else ""):
     print("INSECURE_URL:%s" % url)
     sys.exit(1)
+
+
+# ⛔ `_selfHosted` IS AN EXEMPTION, AND AN EXEMPTION MAY ONLY CERTIFY SOMETHING REACHABLE (#3374 P3).
+# The floor below was "one character after //", so `https://:8443/mcp/` (NO host), `https://my
+# daemon:8000/mcp` (a space in the host) and `https://api.premiselabs.co:8443x/mcp/` (a non-numeric
+# port) all printed SELFHOSTED and exited 0 — LAYER VERIFIED over an entry pointing at nothing, the
+# same false green the scheme-less BADURL arm closes. The rule is the CLIENT's parser, not a guess:
+# every shape refused here is one `new URL(u)` THROWS on (measured ERR_INVALID_URL), so refusing it
+# cannot over-block a config that works — no request could be built from it either. The shapes URL
+# ACCEPTS stay accepted: a bare trailing `host:`, a trailing root dot, an underscore, an IDN, and
+# `[<ipv6>]:port`. Empty-labeled and alnum-free forms the client parses but DNS cannot resolve
+# (`.`, `-`, `a..b`) are refused too: typos, never a configured endpoint.
+# ⛔ `merge-mcp.py`'s `authority_names_a_host` is the SAME predicate under the SAME name — a shape
+# refused here must be refused there and vice versa, so the repair always converges.
+def _port_ok(port):
+    if port is None or port == "":              # absent, or the bare-`host:` spelling URL accepts
+        return True
+    if not port.isdigit():
+        return False
+    return 1 <= int(port) <= 65535
+
+
+def authority_names_a_host(authority):
+    a = (authority or "").strip()
+    if not a or any(c.isspace() for c in a):
+        return False
+    if "@" in a:                                  # userinfo is NOT the host (refused elsewhere)
+        a = a.rsplit("@", 1)[1]
+    if a.startswith("["):                          # `[<ipv6>]`, optionally `:port`
+        m = re.match(r"^\[([0-9A-Fa-f:.]+)\](?::(.*))?$", a)
+        if not m or not _port_ok(m.group(2)):
+            return False
+        try:
+            ipaddress.IPv6Address(m.group(1))
+        except ValueError:
+            return False
+        return True
+    if a.count(":") > 1:                          # an unbracketed IPv6 is not a legal authority
+        return False
+    host, sep, port = a.partition(":")
+    if sep and port and not _port_ok(port):
+        return False
+    if not host or "%" in host:                    # empty, or pct-encoded (the client throws)
+        return False
+    labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
+    return all(lab and any(ch.isalnum() for ch in lab) for lab in labels)
 # ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client sends headers VERBATIM
 # (extensions/mcp-client/index.ts:819-821), so `Authorization: ${TORTOISE_MCP_API_KEY}` (no scheme) is
 # delivered as `Authorization: tt_…` and the server answers 401 — yet it contains "${" and used to
@@ -709,6 +779,13 @@ if want_url and url != want_url:
     _su = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/?#]+)", url or "", re.I)
     if not _su or _su.group(1).lower() not in ("http", "https"):
         print("BADURL:%s" % url)
+        sys.exit(1)
+    # ⛔ AND "ABSOLUTE" IS NOT "REACHABLE" (#3374 review P3): `https://:8443/mcp/` is absolute-
+    # looking with NO host, and it was certified SELFHOSTED rc=0. The predicate is shared by name
+    # with `merge-mcp.py`, which REFUSES the shape, so the repair replaces it and this verifies the
+    # result — converge, in both directions.
+    if not authority_names_a_host(_su.group(2)):
+        print("NOHOST:%s" % url)
         sys.exit(1)
     # ⛔ USERINFO IN THE AUTHORITY IS NOT A SELF-HOST, IT IS A SPOOF SPELLING (#3374 review P1). The
     # real host is the part AFTER the `@` — `https://api.premiselabs.co@evil.example/mcp/` is
@@ -771,6 +848,10 @@ PY
         fail ".mcp.json's tortoise entry is marked _selfHosted but its url (${out#BADURL:}) is not an absolute http(s) url — the client builds a transport from it, so this cell points at nothing. Write the full url (e.g. http://localhost:8000/mcp)" ;;
       USERINFO:*)
         fail ".mcp.json's tortoise url (${out#USERINFO:}) carries USERINFO in its authority — the host that answers is the part AFTER '@', so an entry spelled like the hosted endpoint with '@evil.example' after it sends \${TORTOISE_MCP_API_KEY} to evil.example. The client cannot even build a request from a url with credentials. Write a plain url and keep the key in \$HOME/keys.env" ;;
+      NOHOST:*)
+        fail ".mcp.json's tortoise url (${out#NOHOST:}) is marked _selfHosted but its authority names no usable host — the client cannot build a request from it (an empty host, a space, a non-numeric or out-of-range port, a percent-encoded host, or a host DNS cannot resolve). Write the real endpoint, e.g. http://localhost:8000/mcp" ;;
+      BADTPL:*)
+        fail "the template (\$INFRA_ROOT/templates/.mcp.base.json) could not be read, so nothing can be certified — ${out#BADTPL:}. A cell without a usable template is a broken checkout; re-run install from a complete one" ;;
       NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
         fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
       *)
