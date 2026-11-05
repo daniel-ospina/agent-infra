@@ -1044,7 +1044,7 @@ grep -qF 'if [ -f "$root/$name" ] && [ ! -r "$root/$name" ]; then' "$HELPER"; ck
 grep -qF 'printf '\''%s'\'' "${spec#*|}"; return 0 ;; esac' "$HELPER";      ck $? "mandate_why RETURNS after the matched spec (without it every reason gains a trailing generic phrase)"
 grep -qF 'brief_text="$(cat "$prompt" 2>/dev/null)"' "$HELPER";              ck $? "the brief read SUPPRESSES its own stderr (an unreadable brief must not print cat's error at the caller)"
 
-# ── E6: THE TWO RESOLVERS MUST AGREE# ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
+# ── E6: THE TWO RESOLVERS MUST AGREE (review cycle 1 P2; the arms were RE-DRIVEN in cycle 2) ─────
 # ⛔ CYCLE 1'S ARMS WERE VACUOUS (measured in cycle 2): they grepped for the STRING `MANDATE_PREFLIGHT_SH`,
 # which the explanatory COMMENT above the resolver also contains — so reverting the whole merge-one.sh fix
 # left the suite at 86 passed, 0 failed. An arm satisfied by prose guards nothing. The spawn-gate arms are
