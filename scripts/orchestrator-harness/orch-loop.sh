@@ -2180,10 +2180,22 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       # sentence is false and sends an operator after origination that worked. The record carries the
       # truth (`queued=`, `handed=`); it is printed as recorded, and `?` when it recorded nothing.
       if [ "$_bl_state" = "UNKNOWN" ]; then
-        # ⛔ THE THIRD STATE (review P2, cycle 15): the queue's depth could not be measured HERE and the
-        # pass recorded no measurement either — so "EMPTY" is a claim about a file nobody read.
-        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured (this beat and the last refresh pass both failed to read it), so this is NOT known to be an empty queue: work may be queued and unread | PR path: %s\n' \
-          "$why" "$lanes" "$workers" "$prtail"
+        # ⛔ THE THIRD STATE (review P2, cycle 15): the queue's depth could not be measured HERE, so
+        # "EMPTY" is a claim about a file nobody read. ⛔ AND THE CLAUSE ABOUT THE PASS IS READ FROM THE
+        # RECORD, NOT TYPED (review P3, cycle 17): the writer distinguishes THREE states — the queue was
+        # unreadable, it was readable but its DEPTH read failed (it records `backlog=UNKNOWN` WITH
+        # `handed=<head>`), and it recorded no depth at all — and one sentence asserted "the last refresh
+        # pass … failed to read it" for all three. A non-empty `handed=` is positive proof the pass READ
+        # the queue, so that clause was falsifiable from the record beside it.
+        if [ -n "$hrec" ]; then
+          _pass_said="the last refresh pass READ the queue (it recorded head #$hrec) but could not measure its DEPTH"
+        elif [ "${brec:-}" = "UNKNOWN" ]; then
+          _pass_said="the last refresh pass also could not read the queue"
+        else
+          _pass_said="the last refresh record states no depth at all"
+        fi
+        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured by THIS cycle, and %s, so this is NOT known to be an empty queue: work may be queued and unread | PR path: %s\n' \
+          "$why" "$lanes" "$workers" "$_pass_said" "$prtail"
       elif [ -n "$hrec" ]; then
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY now; the last refresh pass (%s) recorded queued=%s and handed #%s to dispatch, so this is drained work, not a stalled origin | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$age" "${qrec:-?}" "$hrec" "$prtail"
@@ -2218,7 +2230,7 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     elif [ "${d:-0}" -ge "$RUNNING_STALE_MIN" ]; then
       printf '[dispatch] BLOCKED: a refresh pass wrote its start marker %s and has recorded no outcome since — %sm is past the %sm stale bound, so the pass DIED (SIGKILL, OOM, cycle timeout, or an uncaught error) and nothing will replace that marker but a pass that finishes;%s %s lanes=%s workers=%s | PR path: %s\n' \
         "$age" "${d:-?}" "$RUNNING_STALE_MIN" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
-    elif [ "$_bl_state" = "UNKNOWN" ] && [ "$backlog" -le 0 ]; then
+    elif [ "$_bl_state" = "UNKNOWN" ]; then
       # ⛔ THE SAME WITNESS AS THE `result=ok` ARM (review P2, cycle 16). `backlog` is 0 by
       # INITIALISATION when the depth could not be read, so testing `[ "$backlog" -gt 0 ]` alone made this
       # arm print "the queue is EMPTY" over rows nobody read — the #1931 polarity, in the branch one level
@@ -2329,8 +2341,8 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     _fl_b="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
     if is_num "${_fl_b:-}"; then backlog="$_fl_b"; _fl_state="READ"; fi
   fi
-  # `backlog` stays EMPTY when unmeasured: every sentence that needs a number tests `READ` first, and a
-  # bare `0` here is exactly the claim this guard exists to stop.
+  # `backlog` becomes the WORD `UNKNOWN` when unmeasured — never the empty string and never a bare `0`,
+  # which are the two shapes that render an unmeasured depth as a measurement.
   [ "$_fl_state" = "READ" ] || backlog="UNKNOWN"
   if [ -z "${listed:-}" ]; then
     # No usable record. Say so — do NOT print a decomposition that does not exist, and do NOT fall
