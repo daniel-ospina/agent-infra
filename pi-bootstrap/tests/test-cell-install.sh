@@ -1863,9 +1863,13 @@ HOME="$MODHOME" CELL_HOME="$CELL_HOME" INFRA_ROOT="$ROOT" \
   env -u TORTOISE_API_KEY -u TORTOISE_MCP_API_KEY \
   bash "$INSTALLER" --verify > "$LOG" 2>&1
 rc=$?
+# ⛔ NO PIPE INTO `grep -q` (#841/#864): a quiet consumer exits on first match, the producer
+# takes SIGPIPE, and `pipefail` turns a MATCH into a FAILURE — the arm would go green on the
+# defect it exists to catch. Capture the produced lines, then test them from a here-string.
+cert_line="$(grep -E 'LAYER VERIFIED' "$LOG" || true)"
 if [ "$rc" -eq 0 ] \
    && grep -qF "$CELL_HOME/keys.env is NOT a credential source" "$LOG" \
-   && grep -E 'LAYER VERIFIED' "$LOG" | grep -q 'graph credential: UNRESOLVED'; then
+   && grep -q 'graph credential: UNRESOLVED' <<<"$cert_line"; then
   ok "a GROUP-WRITABLE keys.env is refused as a credential source (not sourced, not hidden), and the cell still certifies with UNRESOLVED"
 else
   fail "a group-writable keys.env was SOURCED (rc=$rc) — `--verify` would execute a file any local user can rewrite, as the provisioning user (log: $LOG)"
