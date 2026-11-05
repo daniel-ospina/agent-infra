@@ -721,7 +721,12 @@ jobs:
       # repo file, so nothing in CI exercised the fallback it now ships.
       # #1187 — test_cmux_payload.py rides it too, for the same reason (the sender's
       # payload-integrity checker was about to ship with no suite running it).
-      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py scripts/test_lane_registry.py mcp-servers/orchestrator/test_server.py -x --timeout=60 -q'
+      # ⛔ THE TWO LISTS MUST STAY IDENTICAL (agent-infra#3382). This is the POST-MERGE mirror — the job
+      # that catches "PR A + PR B together break main" — so a suite added to `ci.yml` and not here runs
+      # on the PR and never on the merged tree, which is exactly backward. They had drifted by one
+      # (`scripts/test_lane_wip.py`, added to `ci.yml` only) in the commit whose own thesis was that a
+      # suite the repo does not RUN is a suite it does not have.
+      test-command: 'python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py scripts/test_lane_registry.py scripts/test_lane_wip.py mcp-servers/orchestrator/test_server.py -x --timeout=60 -q'
       lint-command: ''
       typecheck-command: ''
       install-extras: ''
