@@ -118,6 +118,19 @@ fi
 #     $D/rc   — the run's exit status
 #   `nocall` runs the functions WITHOUT the call: the PRE-FIX baseline (arrival order), which is how a
 #   mutation check proves the assertion can fail at all.
+# ⛔ `set -u` IS PART OF THE SHAPE UNDER TEST, AND IT WAS MISSING FROM EVERY DRIVE (fresh-context
+# review, P2). Both scripts these functions are extracted from run it (`refresh-candidates.sh:16`,
+# `orch-loop.sh:4`), but not one generated driver did — so an unbound reference added inside
+# `rank_queue_by_pool`, `queue_order_from_pool`, `product_queue_follow` or `floor_order` is a FATAL
+# ABORT in production and stayed GREEN here, in the only suite that grades this code. Measured before
+# this prologue: `echo "$UNBOUND_PROBE" >/dev/null 2>&1` as the first statement of
+# `queue_order_from_pool` left the suite at 42 passed / 0 failed, while the same body under the shipped
+# `set -u` dies with `UNBOUND_PROBE: unbound variable`. Measured after: seven checks redden.
+# ONE definition, emitted into every drive, so a driver added later cannot quietly opt out of the mode
+# the shipped code runs in (`QUEUE_ORDER_STATE` is initialised here for the same reason the shipped
+# script initialises it above the definitions: the functions read it before any pass has decided).
+drive_prologue() { printf 'set -u\nQUEUE_ORDER_STATE=""\n'; }
+
 drive() {
   local label="$1" src="$2" q="$3" pool="$4" how="${5:-call}"
   local d="$TMP/$label"
@@ -125,7 +138,7 @@ drive() {
   printf '%s' "$q" > "$d/o/candidates.txt" || return 1
   [ "$pool" = "-" ] || printf '%s' "$pool" > "$d/o/.pool" || return 1
   {
-    echo 'QUEUE_ORDER_STATE=""'
+    drive_prologue
     cat "$src"
     [ "$how" = "call" ] && printf 'queue_order_from_pool "$1"\n'
     printf 'exit 0\n'
@@ -213,6 +226,7 @@ DR="$TMP/mut-member"; mkdir -p "$DR"
 printf '5000\n100\n9000\n5000\n' > "$DR/q"
 printf '100\n' > "$DR/pool"
 {
+  drive_prologue
   cat "$MUT_DROP_TAIL"
   printf 'rank_queue_by_pool "$1" "$2" "$3" "$4"\nexit $?\n'
 } > "$DR/drive.sh"
@@ -514,7 +528,7 @@ ck "non-vacuity: the reachability pin reddens on a skip call moved BELOW the arm
 ID="$TMP/inode"; mkdir -p "$ID/o"
 inode_of() { ls -i "$1" 2>/dev/null | awk '{print $1}'; }
 {
-  echo 'QUEUE_ORDER_STATE=""'
+  drive_prologue
   cat "$FNS"
   printf 'queue_order_from_pool "$1"\nexit 0\n'
 } > "$ID/drive.sh"
@@ -560,7 +574,7 @@ mkdir -p "$GQ/absent-o" "$GQ/dir-o/candidates.txt"
 cp "$GQ/pool" "$GQ/absent-o/.pool"
 cp "$GQ/pool" "$GQ/dir-o/.pool"
 {
-  echo 'QUEUE_ORDER_STATE=""'
+  drive_prologue
   cat "$FNS"
   printf 'queue_order_from_pool "$1"\nexit $?\n'
 } > "$GQ/drive.sh"
@@ -615,7 +629,7 @@ exec /usr/bin/cmp "$@"
 SHIM
 chmod +x "$SH/bin/cmp"
 {
-  echo 'QUEUE_ORDER_STATE=""'
+  drive_prologue
   cat "$FNS"
   printf 'queue_order_from_pool "$1"\nexit $?\n'
 } > "$SH/drive.sh"
@@ -749,13 +763,13 @@ else rc=1; echo "      could not extract floor_order from orch-loop.sh — check
 ck "the shipped floor_order is extracted WHOLE (the consumer this check drives)" $rc
 # Driven as a SCRIPT, like every other drive in this suite, so the shipped function is executed rather
 # than re-implemented here (a restatement of `head -1 of the product file` would pass on a broken floor).
-{ cat "$FLOORFNS"; printf 'floor_order "$1" "$2" "$3"\n'; } > "$TMP/floor-drive.sh"
+{ drive_prologue; cat "$FLOORFNS"; printf 'floor_order "$1" "$2" "$3"\n'; } > "$TMP/floor-drive.sh"
 floor_head() {  # <product-file> <all-file> -> the row the floor's ONE slot takes
   ( cd "$TMP" && bash floor-drive.sh 1 "$1" "$2" ) 2>/dev/null | head -1
 }
 PQ="$TMP/productfollow"; mkdir -p "$PQ/o"
 {
-  echo 'QUEUE_ORDER_STATE=""'
+  drive_prologue
   cat "$FNS"
   printf 'queue_order_from_pool "$1"\nproduct_queue_follow "$1"\n'
 } > "$PQ/drive.sh"
@@ -901,6 +915,53 @@ else
   rc=1; echo "      the NO-OP mutant still moved the product file to '$mut_prod' — check 12 proves nothing"
 fi
 ck "non-vacuity: with product_queue_follow disabled the floor's head stays on the stale row ('200'), which is what check 12 reds on" $rc
+
+# ── 13) THE SKIP ARM'S "EMPTY" WORD HANGS OFF THE MEASURED DEPTH, NOT OFF THE HEAD ─────────────
+# `_skip_head` is deliberately SANITISED in the skip arm (a first row that is not a plain number becomes
+# ""), so gating the EMPTY word on `[ -n "$_skip_head" ]` makes a queue this pass READ — holding rows,
+# with an unparsable head — fall into the bare `else` that says "the queue is empty, so dispatch has
+# nothing to take", while the SAME durable record carries `backlog=3`. An operator reading that record
+# would be told dispatch is idle with three rows queued: the typed-claim-instead-of-a-read defect this
+# PR exists to close, one layer out. The empty word therefore hangs off `_skip_n`, the MEASURED depth.
+# ⛔ PINNED BY CONTAINMENT AND ORDER, not driven (the reason check 12 pins its call the same way): the
+# skip arm needs the unchanged-input state, and reaching it here depends on an ambient claim registry
+# this sandbox does not have. A source pin that reddens on the revert is the honest instrument; a drive
+# whose skip does not happen would assert the full-pass path and report green over the wrong arm —
+# measured on exactly that fixture before it was abandoned, which is why it is not a drive.
+skip_handoff() {  # <file> -> the skip arm's handoff chain, COMMENT LINES STRIPPED
+  awk '/_skip_head=""; _skip_n=""; _skip_backlog=""/{f=1} f && /^[[:space:]]*REFRESH_RECORDED=1/{exit} f' "$1" \
+    | grep -v '^[[:space:]]*#'
+}
+HAND="$TMP/skip-handoff.txt"
+skip_handoff "$REFRESH" > "$HAND"
+hand_n="$(wc -l < "$HAND" 2>/dev/null | tr -d ' ')"
+[ -n "$hand_n" ] && [ "$hand_n" -gt 4 ] && rc=0 || rc=1
+ck "the skip arm's handoff chain is extracted (so the pins below grade the shipped branch, not an empty file)" $rc
+# Comments must not satisfy a pin: `_skip_head` is NAME that must be greppable without matching prose, so
+# the extraction above strips them and `_gate`/`_head`/`_empty` are read from the CODE only.
+_gate="$(grep -n 'elif \[ "\$_skip_n" -eq 0 \]; then' "$HAND" 2>/dev/null | head -1 | cut -d: -f1)"
+_head="$(grep -n 'elif \[ -n "\$_skip_head" \]; then' "$HAND" 2>/dev/null | head -1 | cut -d: -f1)"
+_empty="$(grep -n 'and the queue is empty (0 rows)' "$HAND" 2>/dev/null | head -1 | cut -d: -f1)"
+_unknown="$(grep -n 'the head is UNKNOWN' "$HAND" 2>/dev/null | head -1 | cut -d: -f1)"
+[ -n "$_gate" ] && rc=0 || { rc=1; echo "      the empty word is NOT gated on the measured depth (_skip_n) — the pre-fix head gate is back"; }
+ck "the skip arm's EMPTY word is gated on the MEASURED depth (\`elif [ \"\$_skip_n\" -eq 0 ]\`), not on the sanitised head" $rc
+[ -n "$_unknown" ] && rc=0 || { rc=1; echo "      no arm names the unreadable head — a row-holding queue with an unparsable head has nowhere honest to go"; }
+ck "a row-holding queue whose head is unparsable is NAMED ('the head is UNKNOWN'), never read as an empty queue" $rc
+if [ -n "$_gate" ] && [ -n "$_head" ] && [ -n "$_empty" ] && [ "$_gate" -lt "$_head" ] && [ "$_empty" -lt "$_head" ]; then rc=0
+else rc=1; echo "      arm ORDER is wrong (empty-word gate at line '${_gate:-?}', empty sentence at '${_empty:-?}', head arm at '${_head:-?}') — the empty sentence must be reached BEFORE the head is consulted"; fi
+ck "the empty sentence is decided BEFORE the head arm is consulted (an unparsable head cannot reach it)" $rc
+# NON-VACUITY: revert the gate to the pre-fix head condition and show the first pin reddens. A pin that
+# survives its own revert would be grading the comment, not the code.
+REVERTED="$TMP/skip-revert.sh"
+sed 's/elif \[ "\$_skip_n" -eq 0 \]; then/elif [ -n "$_skip_head" ]; then/' "$REFRESH" > "$REVERTED" 2>/dev/null
+if grep -q 'elif \[ "\$_skip_n" -eq 0 \]; then' "$REVERTED" 2>/dev/null; then rc=1; echo "      the revert mutation did not apply — the sed anchor drifted"
+else
+  skip_handoff "$REVERTED" > "$TMP/skip-handoff-rev.txt"
+  if grep -q 'elif \[ "\$_skip_n" -eq 0 \]; then' "$TMP/skip-handoff-rev.txt" 2>/dev/null; then
+    rc=1; echo "      the pin still passes on the REVERTED gate — it is grading something other than the fix"
+  else rc=0; fi
+fi
+ck "non-vacuity: reverting the measured gate to the pre-fix head gate makes the pin go RED" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
