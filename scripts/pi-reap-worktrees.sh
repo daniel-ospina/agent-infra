@@ -3059,7 +3059,7 @@ abstain_gate() {
 #
 # TWO PROBES, and the second exists because the first can be silent:
 #   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
-#       DISCRIMINATING fixture drives: `$HARNESS_PIN_FILE` G15j · `$CELL_HOME` G15n · `$HOME`
+#       DISCRIMINATING fixture drives: `$HARNESS_PIN_FILE` G15p · `$CELL_HOME` G15n · `$HOME`
 #       G15k/G15l · derived-from-the-sha-record G15m. Accepted in EITHER direction, because the record
 #       names a DESCENDANT of the worktree (`<tree>/scripts/orchestrator-harness`). ⛔ THESE FOUR
 #       ARE NOT AN EXHAUSTIVE SET OF ROOTS and the code does not claim they are: a `.harness-path`
@@ -3136,7 +3136,7 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     case "$pin_root" in
         */.pi/agent) pin_root="${pin_root%/.pi/agent}" ;;
     esac
-    # THE FOUR SOURCES, and each one is DISCRIMINATINGLY exercised by a fixture (G15j, G15n, G15k,
+    # THE FOUR SOURCES, and each one is DISCRIMINATINGLY exercised by a fixture (G15p, G15n, G15k,
     # G15m — plus G15a/G15l for the co-rooted and whitespace-HOME spellings of the `$HOME` element):
     #   `${HARNESS_PIN_FILE}`  the production variable — `cloud-cell-bringup.sh:89` and
     #                          `cloud-cell-supervisor.sh:1775` ROOT it at `$CELL_HOME/.harness-path`

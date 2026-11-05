@@ -931,7 +931,7 @@ ANCHORS = {
     # `reason=pin-tree-shape`, which a prefix match on `reason=pin-tree` ACCEPTS — so before the
     # exact-token assertion this mutant left G15a green.
     "no-pin-tree-record-probe": (
-        "    for rec in \"${HARNESS_PIN_FILE:-}\" \"$cellpin\" ${home:+\"$home/.harness-path\"} \"${pin_root:+\"$pin_root/.harness-path\"}\"; do",
+        "    for rec in \"${HARNESS_PIN_FILE:-}\" \"$cellpin\" \"${home:+\"$home/.harness-path\"}\" \"${pin_root:+\"$pin_root/.harness-path\"}\"; do",
         "    for rec in \"${__MUTANT_PIN_RECORD_PROBE_REMOVED:-}\"; do   # MUTANT: the record-based probe is deleted",
     ),
     # (2) delete the SHAPE backstop. A pin tree with no readable record falls to rule 3.
@@ -986,8 +986,8 @@ ANCHORS = {
     # assertions. G15n gives `CELL_HOME` the record and leaves `$HOME` without one, so this mutant is the
     # only thing that can turn it red, and it does.
     "no-cell-home-record": (
-        "\"$cellpin\" ${home:+\"$home/.harness-path\"}",
-        "${home:+\"$home/.harness-path\"}",
+        "\"$cellpin\" \"${home:+\"$home/.harness-path\"}\"",
+        "\"${home:+\"$home/.harness-path\"}\"",
     ),
 }
 s = open(src).read()
@@ -4914,7 +4914,7 @@ cat >"$T/seq-g15j/2.hook" <<HOOK
 printf '%s\n' "$(cd "$WT_RELATE" && pwd -P)/scripts/orchestrator-harness" >"$T/$ENV/pinfile"
 HOOK
 mkdir -p "$WT_RELATE/scripts/orchestrator-harness"
-OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j" HARNESS_PIN_FILE="$T/$ENV/pinfile" \
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j" HARNESS_PIN_FILE_OVERRIDE="$T/$ENV/pinfile" \
     REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
 assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (pin-tree)" \
     "G15j a pin record written AFTER classification STOPS the delete"
@@ -4928,7 +4928,7 @@ mkdir -p "$WT_CONTROL/.venv"; printf 'x\n' >"$WT_CONTROL/.venv/marker"
 mkdir -p "$T/seq-g15j-ctl"
 printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g15j-ctl/1"
 cp "$T/seq-g15j-ctl/1" "$T/seq-g15j-ctl/2"
-OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j-ctl" HARNESS_PIN_FILE="$T/$ENV/pinfile-none" \
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j-ctl" HARNESS_PIN_FILE_OVERRIDE="$T/$ENV/pinfile-none" \
     REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
 assert_nodir "$WT_CONTROL" "G15j …and a checkout with no pin record at either reading is still removed"
 # G15p: the record named by `$HARNESS_PIN_FILE` ITSELF — the production variable. Those three sites
