@@ -3991,7 +3991,7 @@ queue_order_from_pool() {
     # "did not re-derive the ORDER", and the skip arm quoted the latter into `why=` — the field that
     # outlives the log. Two states, two words.
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: severity-first from the pool — $_inst_said, but its COUNT could not be read back from $o/.queue-rank, so how many rows the pool ranked is UNKNOWN (this is NOT a drained queue, and the order is THIS pass's, not the previous pass's)"
+    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but its COUNT could not be read back from $o/.queue-rank, so how many rows the pool ranked is UNKNOWN and so is whether it ranked ANY (this is NOT a drained queue, and the order is THIS pass's, not the previous pass's)"
     rm -f "$o/.queue-rank" 2>/dev/null
     return 0
   fi
@@ -4005,7 +4005,7 @@ queue_order_from_pool() {
   case "${_rows_now:-}" in ''|*[!0-9]*) _rows_now="" ;; esac
   if [ -z "$_rows_now" ] || [ $(( _r + _u )) -ne "$_rows_now" ]; then
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: severity-first from the pool — $_inst_said, but the count read back from $o/.queue-rank ($_r ranked + $_u unranked) does not add up to the queue's ${_rows_now:-UNREADABLE} row(s), so it is NOT this queue's count and the totals are UNKNOWN (this is NOT a drained queue)"
+    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank ($_r ranked + $_u unranked) does not add up to the queue's ${_rows_now:-UNREADABLE} row(s), so it is NOT this queue's count and both the totals and whether the pool ranked ANY are UNKNOWN (this is NOT a drained queue)"
     return 0
   fi
   if [ "$_r" -eq 0 ] && [ "$_u" -eq 0 ]; then
@@ -4017,7 +4017,7 @@ queue_order_from_pool() {
     # installed stands, and the counts are UNKNOWN.
     if [ -s "$o/candidates.txt" ]; then
       QUEUE_ORDER_STATE="severity-uncounted"
-      echo "[refresh] queue order: severity-first from the pool — $_inst_said, but the count read back from $o/.queue-rank says 0 queued while candidates.txt holds $(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ') row(s), so that count is NOT this queue's (a concurrent pass wrote its own) and how many rows the pool ranked is UNKNOWN (this is NOT a drained queue)"
+      echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank says 0 queued while candidates.txt holds $(wc -l < "$o/candidates.txt" 2>/dev/null | tr -d ' ') row(s), so that count is NOT this queue's (a concurrent pass wrote its own) and both the totals and whether the pool ranked ANY are UNKNOWN (this is NOT a drained queue)"
       return 0
     fi
     QUEUE_ORDER_STATE="empty"
@@ -4030,7 +4030,7 @@ queue_order_from_pool() {
   _head_now="$(head -1 "$o/candidates.txt" 2>/dev/null || true)"
   if [ -n "$_h" ] && [ "$_h" != "$_head_now" ]; then
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: severity-first from the pool — $_inst_said, but the count read back from $o/.queue-rank names head #$_h while candidates.txt's head is #${_head_now:-none}, so that count is NOT this queue's and how many rows the pool ranked is UNKNOWN"
+    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank names head #$_h while candidates.txt's head is #${_head_now:-none}, so that count is NOT this queue's and both the totals and whether the pool ranked ANY are UNKNOWN"
     return 0
   fi
   if [ -n "$_h" ]; then
@@ -4139,7 +4139,7 @@ product_queue_follow() {
 skip_order_why() {
   case "${1:-}" in
     severity)            printf '%s' "the ORDER was re-derived severity-first from the pool" ;;
-    severity-uncounted)  printf '%s' "the ORDER was re-derived severity-first from the pool; the COUNTS could not be read back by this pass, so how many rows it ranked is UNKNOWN (the order itself is THIS pass's)" ;;
+    severity-uncounted)  printf '%s' "the ORDER was derived from the pool by this pass; the COUNTS could not be read back, so both how many rows it ranked and WHETHER it ranked ANY are UNKNOWN (the order itself is THIS pass's)" ;;
     empty)               printf '%s' "nothing was queued, so there was no ORDER to derive" ;;
     priority-unreadable) printf '%s' "the ORDER could NOT be re-derived this pass — it is UNVERIFIED (whatever the PREVIOUS pass left, or unranked)" ;;
     *)                   printf '%s' "the ORDER's provenance was NOT recorded by this pass — treat it as UNVERIFIED" ;;
@@ -5922,10 +5922,23 @@ fi
 # so instead of implying this pass found it. This is the pass's LAST line on purpose: "a successful
 # run must end by naming the candidate it handed to dispatch (or the exact reason it could not)".
 refresh_stage handoff "state/refresh-last"
-_backlog_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
-case "$_backlog_n" in ''|*[!0-9]*) _backlog_n=0 ;; esac
-_head_issue="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
-case "$_head_issue" in ''|*[!0-9]*) _head_issue="" ;; esac
+# ⛔ AN UNREADABLE QUEUE IS NOT AN EMPTY ONE, AND THE READ IS GUARDED (review P2, cycle 11). Two defects
+# lived here, both of them already fixed 1,700 lines up in the SKIP arm and neither mirrored:
+#   · `wc -l < "$O/candidates.txt" 2>/dev/null` COERCED a failed read to `0` — so an unreadable queue (a
+#     directory, a permission wall) printed "the queue is empty and this pass queued nothing usable" and
+#     wrote `backlog=0` into `state/refresh-last`, over a queue that may hold rows. The skip arm answers
+#     the same state with `backlog=UNKNOWN`; this is the same sentence, one layer out.
+#   · the same failed REDIRECTION leaks the shell's `…: Is a directory` / `…: No such file or directory`
+#     to stderr even with `2>/dev/null` (the redirection is set up before the command runs) — the exact P3
+#     fixed for `.queue-rank`. `orch-loop.sh` already reads this file `[ -r ]`-first for the same reason.
+if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+  _backlog_n="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+  case "$_backlog_n" in ''|*[!0-9]*) _backlog_n="" ;; esac
+  _head_issue="$(head -1 "$O/candidates.txt" 2>/dev/null || true)"
+  case "$_head_issue" in ''|*[!0-9]*) _head_issue="" ;; esac
+else
+  _backlog_n=""; _head_issue=""
+fi
 if [ -n "$_head_issue" ]; then
   # ⛔ THE ORDER CLAIM IS READ, NEVER TYPED (review P1). This sentence used to say "highest-ranked …
   # severity order" unconditionally, so it was FALSE in exactly the two cases the writer had just
@@ -5962,7 +5975,7 @@ if [ -n "$_head_issue" ]; then
     # was derived and is on disk, and this head IS the highest-ranked CLEAN entry. That sentence becomes
     # `handed_why=` in `state/refresh-last`, so the durable record contradicted the log line printed two
     # lines above it. The same conflation the writer fixed, one layer out.
-    severity-uncounted) _head_rank="the highest-ranked CLEAN entry in the pool-ordered queue this pass derived — how many rows it ranked is UNKNOWN (the count could not be read back), so read the ROW as ranked and the TOTALS as unknown" ;;
+    severity-uncounted) _head_rank="the entry at the head of the queue this pass derived — whether the pool ranked ANY row is UNKNOWN (the count could not be read back), so read this row's RANK as unknown, not as ranked by anything" ;;
     *)        _head_rank="the entry at the head of the queue — priority-unreadable: this pass established NO priority order for the queue, so neither its severity nor its age rank is known, and it is not a priority decision" ;;
   esac
   case " ${QUEUED_THIS_PASS:-}" in
@@ -5975,10 +5988,18 @@ if [ -n "$_head_issue" ]; then
     "pass completed; queue depth $_backlog_n; head #$_head_issue is what dispatch takes next" \
     "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=$_head_issue" \
     "handed_why=$_head_why" "unusable=$(unusable_summary)"
-else
+elif [ -n "$_backlog_n" ]; then
   echo "[refresh] handed to dispatch: NONE — the queue is empty and this pass queued nothing usable (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed but handed NOTHING to dispatch: the queue is empty and no candidate this pass was usable" \
     "judged=$judged" "queued=$QUEUED" "backlog=0" "handed=" "unusable=$(unusable_summary)"
+else
+  # ⛔ THE THIRD ARM (review P2, cycle 11): the queue could not be READ, so its depth is UNKNOWN — never
+  # the success word, and never a `backlog=0` the durable record would be asserting as a measurement.
+  echo "[refresh] handed to dispatch: NONE — this pass queued nothing usable, and the queue could NOT be READ ($O/candidates.txt is not a readable regular file), so this pass cannot say what dispatch would take (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
+  REFRESH_RECORDED=1
+  refresh_record_write ok handoff 0 \
+    "pass completed; the queue could NOT be read, so the depth and the head are UNKNOWN and nothing was handed" \
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "unusable=$(unusable_summary)"
 fi
