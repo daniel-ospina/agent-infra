@@ -554,9 +554,22 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
     (`next=MANUAL … did NOT establish`); it is a distinct verdict from `push=FAILED` (the remote ANSWERED
     and the ref is absent) exactly as the symref read on the same path already refuses to read silence as
-    "no protected names". `push=push-timed-out` is the same honesty for `rc=124` on the push itself: the
-    timer killed the CLIENT, so the ref may already have been applied server-side and the terminal asserts
-    neither delivery nor loss — `FAILED` is reserved for a refusal the remote actually answered.
+    "no protected names". `push=push-timed-out` is the same honesty for a push whose CLIENT WAS KILLED:
+    the timer signalled it (`rc=124`) or, on the fleet's internal watchdog with no sentinel, it was
+    SIGKILLed (`rc=137`), so the ref may already have been applied server-side and the terminal asserts
+    neither delivery nor loss — `FAILED` is reserved for an answer the remote actually gave. ⛔ **THE
+    CLASS, NOT ONE INTEGER:** `tb_bound_tmp` degrades to "no sentinel" when its scratch dir cannot be
+    made — the full-disk state this feature exists for — and `bounded.sh` then returns the killed child's
+    status, so keying on `124` alone left the most likely shape recording `FAILED` over an absence nobody
+    measured.
+  * ⛔ **THE ARM ORDER IN `lane_end_next` IS A SAFETY PROPERTY, NOT A STYLE CHOICE** — any domain that says
+    `MANUAL` outranks a domain that only reports, and a reporter placed above a MANUAL arm silences it.
+    Three separate review cycles have now found the same defect in a neighbouring arm, so it is stated
+    rather than left emergent: `cannot-verify` is a MANUAL verdict (an incomplete listing cannot certify a
+    tree, and the paths it never saw are in neither the porcelain section nor the archive), so it sits in
+    the MANUAL block above the `archived-local` and `refs/wip/*` reporters while still NAMING the archive
+    it found. Every MANUAL arm NAMES the other domain's MANUAL fact instead of returning alone — a refused
+    push beside a failed archive says both, and says that re-running the rescue cannot fix the branch.
   * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
     aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
     writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
@@ -564,7 +577,13 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     `rescue`, `wip_ref`, `dirty`, `ended`, `next` (mechanically derived) and a `porcelain:` section. A
     path that returned BEFORE the measurement writes `state=not-measured` and `next=MANUAL — …did NOT
     measure`, never a clean bill of health: the hatch is an escape, not a licence to claim a reading
-    that was never taken. ⛔ `MANUAL` follows the RISK, not the tree verdict: a REFUSED push on a CLEAN
+    that was never taken. ⛔ **THE COUNT AND THE LISTING HAVE DIFFERENT ENUMERATIONS**, so `unpushed` and
+    `dirty` are blanked independently: `dirty` rides on `git status --porcelain` and is `?` whenever that
+    listing is untrusted (`cannot-verify` included), while `unpushed` comes from `git rev-list` and is `?`
+    only when THAT command failed — publishing `?` over a count that WAS measured is the inverse error,
+    and it made the ledger say "never measured" about a number the lane log beside it printed. Both the
+    ledger column and the marker read ONE derivation (`lane_end_unpushed_col`), so the two artifacts can
+    no longer drift. ⛔ `MANUAL` follows the RISK, not the tree verdict: a REFUSED push on a CLEAN
     (unpushed-only) tree carries it too, because those commits are on that disk only just the same —
     otherwise a consumer filtering on this file's own convention reclaims one and refuses the other for
     the same fact. And the affirmative `nothing at risk … may be removed` sentence names its SCOPE (the
