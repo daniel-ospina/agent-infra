@@ -28,10 +28,20 @@
 #   exports `BASH_SHARD_SLICE=<i>/<n>` for the WHOLE step, so every shard it runs inherits it — and
 #   this suite's subject is the runner's WHOLE-LIST recap over a THREE-shard fixture list. Inherited,
 #   a slice of 8 over 3 entries has nothing to run and the runner refuses (rc 2), so this shard
-#   reddens on EVERY PR in the sharded lane while it is green on uns harded `main` — a red no diff
-#   can cause. The suite therefore runs its fixtures unsliced (stated, never silent) and this arm
-#   is the MUTATION control: the same fixture WITH the slice must still refuse, so the arm proves
-#   the hazard is real and that the mitigation — not a weakened runner — is what makes arm 2 green.
+#   reddens on EVERY PR in the sharded lane while it is green on unsharded `main` — a red no diff
+#   can cause. The suite therefore runs its fixtures unsliced (stated, never silent), and this arm
+#   is the MUTATION control pinning the HAZARD and the runner's refusal contract: the same fixture
+#   WITH the slice must still refuse with the runner's own message, so a changed refusal wording, a
+#   changed rc, or a weakened runner reds it.
+#   ⛔ WHAT THIS ARM DOES NOT PIN, stated so nobody reads it as more than it is: it sets its own
+#   slice, so it is independent of the `unset` above and CANNOT see the mitigation disappear. That
+#   is measured, not assumed — delete the `unset` and an UNSLICED run is still green, while the
+#   SLICED run (the CI shape) reds 9 arms. So the discrimination is the sliced lane's, and a box
+#   that only ever runs unsliced cannot see it. Pinning the `unset` itself needs a hermetic-probe
+#   mutant — the pattern `tests/run-bash-shards-bound/run.sh` §0 already uses (it strips its own
+#   `unset` into a copy and requires the probe to then see the leaked value). That is not built
+#   here because it needs a probe mode this suite does not have, and a self-copying mutant without
+#   one recurses; it is the follow-up, not a claim of coverage.
 #
 # THE CONSUMERS of the marker are pinned next door, in `scripts/ci-failure-set.truncated.test.sh`:
 # `ci_exemption.py` must answer such a capture with UNPROVEN (no ids), and `ci-failure-set.sh` must
