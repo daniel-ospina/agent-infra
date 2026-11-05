@@ -1132,8 +1132,8 @@ post_marker() { # <repo> <pr> <marker> -> 0 present/posted, 1 post failed, 2 bod
   # unanchored `-qF` read a body that merely CITES the marker mid-line as "already
   # present", so it PATCHed nothing, flush_pending_markers() `rm -f`'d the pending
   # file, and the caller printed "delivered the pending signed marker" (the wording
-  # before #3168 — see the success line below, which now claims no signedness). Silent loss
-  # of the only copy of those bytes, reported as success (a false PASS).
+  # before #3168). Silent loss of the only BODY copy of those bytes — ⛔ NOT the only copy
+  # since #3168: post_marker_comment runs BEFORE post_marker, so a keyed marker survives `rm -f`.
   # ⛔ The here-string is also what makes the SIGPIPE class impossible here (#841/#864,
   # the idiom scripts/check-no-sigpipe-grep.sh guards): `grep -q` exits at the first
   # match, so a `producer | grep -q` pipeline over a body larger than the pipe buffer

@@ -5224,7 +5224,9 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       merely CITES the marker mid-line read as "already present": the flush
 #       PATCHed NOTHING, `rm -f`'d the pending file, and the caller printed
 #       "delivered the pending signed marker". That is silent destruction of the
-#       only copy of the signed bytes, reported as success — reached not just by
+#       only BODY copy of the signed bytes (since #3168 the flush also posts a durable
+#       comment BEFORE the body PATCH, so a keyed marker survives), reported as success —
+#       reached not just by
 #       --flush-pending but by EVERY later minting run. The predicate must match
 #       the gate's line-anchored `^…$` admission, exactly like the three sites the
 #       main change already anchored. ⛔ ASSERTS THE TRANSPORT (a PATCH was issued),
@@ -6032,8 +6034,8 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
 #           the whole marker and fails the shape guard at :1229. Declared rather than
 #           faked with the source-text pin an earlier round removed (14.1d(g)).
 #   :1229  `_msig` is not 64 hex   → UNPINNED, and safely so: it only short-circuits a
-#           comparison that :1245/:1248 then refuse anyway, so a comment is posted with it
-#           or without it. ⛔ AND IT IS SILENT: deleting it moves the refusal DOWN to
+#           comparison that :1245/:1248 then refuse anyway, so whether a comment is posted is
+#           identical with it or without it. ⛔ AND IT IS SILENT: deleting it moves the refusal DOWN to
 #           :1248, which prints the loud REFUSING line — the change is SILENT→LOUD, not one
 #           loud line becoming another. (An earlier draft of this entry said "changes WHICH
 #           loud line prints"; that was false, measured, and corrected here.)
@@ -6045,9 +6047,9 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
 #           shape as :1229, and the block's own rule says that is not a pin.
 #   :1248  the HMAC did not MATCH   → pinned by 20.12.
 # ⛔ 20.10 IS NOT THE :1245 PIN, and saying so was FALSE (measured): 20.10's negative
-# drives `AI_REVIEW_GATE_KEY=""`, so its run is REFUSED at :1245 — but deleting that
-# line leaves the suite at PASS=1045 FAIL=0, because 20.10's unsigned marker then
-# reaches :1248 and fails the MATCH instead (`openssl dgst -hmac ""` is legal and
+# drives `AI_REVIEW_GATE_KEY=""`, so its run is REFUSED at :1245 — but BEFORE 20.13 EXISTED
+# deleting that line left the suite at PASS=1045 FAIL=0 (20.13 is what reddens it now: 1049/1),
+# because 20.10's unsigned marker then reaches :1248 and fails the MATCH instead (`openssl dgst -hmac ""` is legal and
 # yields a stable digest, so the empty-key comparison is a real comparison). A vector
 # that merely PASSES THROUGH an arm is not a pin on it. 20.13 signs under the EMPTY
 # key, which is the only shape where :1245's removal publishes.
@@ -6165,9 +6167,9 @@ assert_eq "$(dc_posts "$DC_PR5")" "1" \
 # ── 20.13 THE NO-KEY ARM: NO KEY MEANS NO COMMENT, NOT "MATCH THE EMPTY KEY" ──
 # (#3168 round-8, P1.) `[ -n "$_key" ] || return 0` (:1245) is the last unpinned
 # refusal, and the §20.11/§20.12 prose claimed 20.10 covered it. It does not:
-# 20.10 is merely REFUSED there. Deleting the line leaves the suite at
-# PASS=1045 FAIL=0 (measured on a throw-away copy), because 20.10's unsigned marker
-# then reaches :1248 and fails the MATCH — a refusal, so the count stays 0 and the
+# 20.10 is merely REFUSED there. Before 20.13 existed, deleting the line left the suite at
+# PASS=1045 FAIL=0 (measured on a throw-away copy; at this head 20.13 doubles it to 1049/1),
+# because 20.10's unsigned marker then reaches :1248 and fails the MATCH — a refusal, so the
 # vector stays green. The shape where :1245's removal actually PUBLISHES is a marker
 # whose `sig=` is the HMAC under the EMPTY key, because `openssl dgst -hmac ""`
 # succeeds (measured) and so the empty-key comparison MATCHES.
