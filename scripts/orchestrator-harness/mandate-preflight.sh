@@ -602,6 +602,18 @@ _mandate_cli() {
       # SAME box. A consumer reading the list as "what to ship" never saw the one path that needs the other
       # remedy, and one reading rc 0 as "nothing absent" read an unknown state as clean: the exact shape
       # the undecidable arm above closed, one arm over. Same doctrine, same answer: 2.
+      # ⛔ AND AN UNREADABLE FILE IS CANNOT-VERIFY HERE TOO (#3379 review cycle 27, P2, MEASURED).
+      # `mandate_missing` SKIPS a path that exists, so a file present with mode `000` was skipped and this
+      # verb answered **rc 0 with EMPTY output** while `--check` answered CANNOT VERIFY about the SAME box
+      # (measured: `--check` rc 2 naming the unreadable path, `--missing` rc 0 printing nothing). That is
+      # the disagreement the occupied-path arm below closes for a DIRECTORY, one state over — and the arm
+      # that existed here (`--missing` must not CALL it absent) was satisfied by the empty list, so the
+      # verb could say nothing about a box it could not read. `mandate_verdict` has tested this since
+      # cycle 1; this is the same doctrine applied to the list: a cannot-verify is never an empty list.
+      if [ -n "$(mandate_unreadable)" ]; then
+        mandate_unreadable | sed 's/^/[mandate-preflight] CANNOT VERIFY (unreadable) /' >&2
+        return 2
+      fi
       if [ -n "$(mandate_irregular)" ]; then
         mandate_irregular | sed 's/^/[mandate-preflight] CANNOT VERIFY (not a regular file) /' >&2
         return 2
@@ -630,7 +642,7 @@ _mandate_cli() {
       printf 'usage: %s [--check|--line|--missing|--files]\n' "$0"
       printf '  --check    0 every mandated file present · 1 any missing (each named on stderr) · 2 CANNOT VERIFY\n'
       printf '  --line     the disclosure block appended to a brief (EMPTY when all are present)\n'
-      printf '  --missing  the missing paths, one per line · 2 CANNOT VERIFY (a path occupied by a non-file, or a state dir that cannot be resolved — never an empty or silently short list for an unknown state)\n'
+      printf '  --missing  the missing paths, one per line · 2 CANNOT VERIFY (a declared file that exists but cannot be read, a path occupied by a non-file, or a state dir that cannot be resolved — never an empty or silently short list for an unknown state)\n'
       printf '  --files    the declared names, one per line · 2 CANNOT VERIFY (only when the declaration itself renders no names — the names are static, so an unresolvable state dir does NOT block them)\n' ;;
     "")
       mandate_preflight_line ;;
