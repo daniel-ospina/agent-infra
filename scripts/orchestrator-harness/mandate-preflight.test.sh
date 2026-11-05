@@ -1011,8 +1011,22 @@ esac
 # assertion, not the regex; so the SHAPE is banned outright and this arm reddens if it ever returns.
 # (comment lines are excluded: the explanation of this very bug contains the banned shape as prose — measured,
 # it was the only hit, which is also a reminder that a prose match is not a code match.)
-DOUBLE_CK="$(grep -vE '^[[:space:]]*#' "$0" | grep -cE '(^|;)[[:space:]]*ck[[:space:]]+\$\?.*;[[:space:]]*ck[[:space:]]+\$\?' || true)"
-[ "${DOUBLE_CK:-0}" = "0" ]; ck $? "no line calls ck twice on one line (the second is vacuous: ck consumes the status - measured ${DOUBLE_CK:-0} such line(s))"
+# ⛔ AND THE FIRST VERSION OF THIS ARM BANNED ONE SPELLING, NOT THE CLASS (#3379 review cycle 16, P1,
+# MEASURED): its regex required the first `ck` after a line start or `;` AND the second after `;`, so three
+# other live vacuous shapes walked straight through it — `grep … && ck $? "a"; ck $? "b"`, `ck $? "a" && ck
+# $? "b"`, and `ok "…"; ck $? "…"` — each leaving the suite at 179/0 green. A ban that anchors on a SEPARATOR
+# bans the separator. This one COUNTS STATUS CONSUMERS per line, whatever sits between them: two or more
+# `ck $?`, or any `ck $?` sharing a line with a preceding `ok`/`bad`/`ck`, is a line whose later assertion
+# reads 0 unconditionally.
+# (comment lines are excluded: the explanation of this bug contains the banned shape as prose.)
+DOUBLE_CK="$(grep -vE '^[[:space:]]*#' "$0" | awk '{
+  line = $0
+  ck = gsub(/ck[[:space:]]+\$\?/, "", line); line = $0
+  oth = gsub(/(ok|bad|ck)[[:space:]]+"/, "", line)
+  if (ck >= 2 || (ck >= 1 && oth >= 1)) { n++; if (n <= 3) print "  " NR": "$0 }
+} END { print n+0 }' | tail -1)"
+DOUBLE_CK="${DOUBLE_CK##*$'\n'}"
+[ "${DOUBLE_CK:-0}" = "0" ]; ck $? "no line reuses the shell status after a consumer (a second ck/ok/bad on one line reads 0 unconditionally - measured ${DOUBLE_CK:-0} such line(s))"
 
 echo
 printf 'mandate-preflight: %d passed, %d failed\n' "$PASS" "$FAIL"
