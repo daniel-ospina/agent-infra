@@ -429,9 +429,9 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**54 tests with 100 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**55 tests with 101 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
-> suite is **T32–T54**. The ids are
+> suite is **T32–T55**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
 > #1777 block, so definition order is not label order) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
@@ -811,8 +811,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 54 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (100)
+python3 tools/fleet/liveness.test.py               # 55 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (101)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -1841,11 +1841,13 @@ by T36 and by the mutation that degenerates its `if ev.log_read is not None:` gu
 is checked first — that would be the #1777 B7 defect (an added axis masking other evidence) rebuilt on
 a new axis.
 
-⛔ **AN ABSTENTION IS EVIDENCE TOO** (T50). `ps_ok=False` / `store_ok=False` are the session axis
+⛔ **AN ABSTENTION IS EVIDENCE TOO** (T55). `ps_ok=False` / `store_ok=False` are the session axis
 answering `unknown/ps-unreadable` / `unknown/store-unreadable`, so a log read resolving over them
 discards that answer — and when the log read is `frozen` it does worse than mask: it **convicts** a
 lane on evidence it threw away. The guard listed only *positive* session fields once; the two
-failed-read flags are in it for that reason.
+failed-read flags are in it for that reason. **T55, not T50**: the #3404 train re-landed this guard
+into the code without its test, and the log axis's own T50 is the `LOG_STATES` vocabulary pin — so
+the guard was unpinned and deleting it left the suite at `PASS/FAIL=0`. T55 is the re-landed test.
 
 Considered and rejected: a new `tools/fleet/log_liveness.py` (that **is** the second verdict function
 the rule forbids), and widening `lane_liveness.py`'s population (§8/§11) to log lanes (its population
@@ -1922,11 +1924,12 @@ so it never is.
 ⛔ **A CENSUS `rc=na` ROW IS `unknown`, NOT `finished`.** The census carries no launcher line, so it has
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (54 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (100 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (55 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (101 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
-`--log-census` decoder); T43–T54 are the 2026-11-04 binding / corroboration / abstention rounds. Their paired mutations re-introduce the exact pre-fix behaviours — the
+`--log-census` decoder); T43–T54 are the 2026-11-04 binding / corroboration / abstention rounds;
+T55 is the masking-abstention guard re-landed after the #3404 train merge dropped its test. Their paired mutations re-introduce the exact pre-fix behaviours — the
 dropped progress veto, the exited process falling into the freeze ladder, the missing window, the
 absent log as a death witness, the log axis masking a session query, every bound verdict reading
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped
