@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-55 tests with 105 paired mutations: every mutation re-
+55 tests with 106 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 55 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (105)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (106)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3058,6 +3058,20 @@ MUTATIONS = [
         '    if False and kinds:\n        numbers = []',
         "the progress VETO is dropped, so a lane working through a long silent tool call "
         "reads `frozen` — the log-mtime-keyed behaviour the 2026-11-03 table measured",
+    ),
+    # ⛔ RESTORED FROM `main` (#3404). `08772f153` added this entry because "T38 was the ONE
+    # test in the axis with no paired mutation, so nothing proved it could fail" — and the
+    # branch's own `891f071f1` then dropped those three lines, replacing the slot with its
+    # own T50 (`LOG_STATES`) mutation. At the pre-restore head `grep '"T38"'` was 0, so the
+    # axis's own before/after table — the §13.1 measurement, the land-10762 false negative —
+    # had no RED control while `--mutations` still printed a clean 105/105.
+    Mutation(
+        "T38", "module",
+        'BOUND_FINISHED = frozenset({"finished"})',
+        'BOUND_FINISHED = frozenset()',
+        "an exited lane's `verdict=finished` reads `dead`, so the before/after table's "
+        "FINISHED row convicts a lane that completed — the 2026-11-03 false negative "
+        "(land-10762) that the whole §13.1 measurement exists to pin",
     ),
     Mutation(
         "T33", "module",
