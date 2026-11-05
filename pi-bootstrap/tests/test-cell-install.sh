@@ -1134,14 +1134,21 @@ else
   # only way a corrupt bound can arrive today, and it is exactly what the next arm drives.
   printf '%s\n' 'source "$1"' '[ -z "${3:-}" ] || GH_SHIM_MAX_LINK_HOPS="$3"' 'gh_shim_realpath "$2"' 'exit $?' > "$RP_DRIVER"
   # realpath_bounded <link> [bound] — print the resolver's answer; rc is the resolver's, or 124 when
-  # it did not return within 10s (which IS the pre-fix behaviour: a cycle spins). No `timeout(1)`:
-  # macOS does not ship it, and this suite runs on both.
+  # it did not return within 30s (which for a CYCLE is the pre-fix behaviour: it spins). No
+  # `timeout(1)`: macOS does not ship it, and this suite runs on both.
+  # ⛔ THE CAP IS A LOAD GUARD, NOT A MEASUREMENT (#3374 review P2). It was 10 s, and the arms that
+  # USE it as a positive control (a 3-hop chain must resolve) fork a bash that sources a library —
+  # on a cell hosting lanes at load 100+ that fork can take longer than the cap, and the arm then
+  # reported rc=124 as "the hop bound broke the normal case": a FALSE RED on a correct resolver,
+  # which is the failure mode that teaches an operator to ignore this suite. Measured: 1 run in 6.
+  # The two arms that WANT the timeout (a real cycle must not spin) are unaffected — a correct
+  # resolver refuses those by link shape / hop bound immediately, never by reaching this cap.
   realpath_bounded() {
     local out="$TMP/realpath.out" pid i=0 rc
     : > "$out"
     ( bash "$RP_DRIVER" "$REALPATH_FNS" "$1" "${2:-}" >"$out" 2>/dev/null ) &
     pid=$!
-    while [ "$i" -lt 100 ]; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; i=$((i + 1)); done
+    while [ "$i" -lt 300 ]; do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; i=$((i + 1)); done
     if kill -0 "$pid" 2>/dev/null; then
       kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; cat "$out"; return 124
     fi
@@ -1166,7 +1173,7 @@ else
   out="$(realpath_bounded "$CY/hop2")"; rc=$?
   { [ "$rc" -eq 0 ] && [ "$out" = "$CY/target" ]; } \
     && ok "POSITIVE CONTROL: a legitimate multi-hop chain still resolves to its target (the bound is a cycle guard, not a link limit)" \
-    || fail "a 3-hop symlink chain no longer resolves (rc=$rc out='$out') — the hop bound broke the normal case"
+    || fail "a 3-hop symlink chain no longer resolves (rc=$rc out='$out') — $([ "$rc" -eq 124 ] && echo 'the HARNESS hit its own 30s wait (a loaded box), which is not a resolver verdict: re-run serially' || echo 'the hop bound broke the normal case')"
   # … AND THE BOUND ITSELF MUST BE A PLAIN NON-NEGATIVE INTEGER. `[ N -gt abc ]` is an ERROR (rc 2),
   # not a false, so `&& return 1` never fires and the walk continues — with a self-referential link
   # that is the SAME infinite hang, reached THROUGH the guard. MEASURED pre-fix: rc=124 (still

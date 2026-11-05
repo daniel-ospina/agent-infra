@@ -176,6 +176,34 @@ for verb in "health" "stats" "search attestation" "get pt_abc" \
 done
 call evidence 'measured 42 things' --to pt_target
 [ "$RC" -eq 0 ] || fail "evidence --to exited $RC (the write+edge path)"
+# ⛔ THE WRITE CALLS ARE PINNED BY THEIR ARGUMENTS, NOT BY THEIR NAMES (#3374 review P1). Asserting
+# names + exit codes let the defect this suite EXISTS FOR ship green: re-`label` for `semantics` on
+# `tortoise_create_operator` and every arm still passed — the point lands, the predicate is dropped
+# or rejected AFTER the write, the verb exits 0, and a lane reports "the finding is linked with
+# supports" when it is not. The stub ignores `arguments` by design (it dispatches on mode), so the
+# record in calls.jsonl is the only evidence — which is why it is asserted HERE, exactly as the read
+# verbs do at their own arms.
+python3 - "$TMP/calls.jsonl" <<'PY' && pass "the WRITE calls carry the SERVED arguments (semantics, not label; op_type/ids as served)" \
+  || fail "a write call's arguments are not the served signature — on tortoise_create_operator that means the predicate is dropped AFTER the point was written and the verb still exits 0"
+import json, sys
+seen = {}
+for line in open(sys.argv[1]):
+    b = json.loads(line)
+    if b.get("method") == "tools/call":
+        p = b.get("params") or {}
+        seen[p.get("name", "-")] = p.get("arguments") or {}
+op = seen.get("tortoise_create_operator") or {}
+pt = seen.get("tortoise_create_point") or {}
+ok_op = op == {
+    "op_type": "IMPL",
+    "source_id": "pt_abc",
+    "target_ids": ["pt_target"],
+    "direction": "unidirectional",
+    "semantics": "supports",
+}
+ok_pt = pt.get("kind") == "evidence" and bool((pt.get("content") or "").strip())
+sys.exit(0 if ok_op and ok_pt else 1)
+PY
 bad="$(python3 - "$TMP/calls.jsonl" "$TMP/advertised.json" <<'PY'
 import json, sys
 ADVERTISED = set(json.load(open(sys.argv[2])))
