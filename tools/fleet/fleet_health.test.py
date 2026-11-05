@@ -21,7 +21,7 @@ Restored by #1862 and pinned by this suite:
     python3 tools/fleet/fleet_health.test.py
     python3 tools/fleet/fleet_health.test.py --red-control
 
-RED CONTROL — seven mutations of the shipped module, each written to a TEMP copy and re-imported
+RED CONTROL — eight mutations of the shipped module, each written to a TEMP copy and re-imported
 (a mutation the suite does not catch is reported as a suite FAILURE). The first one is the
 pre-fix state of the lane census, so that leg is proved non-vacuous against it:
 
@@ -36,6 +36,9 @@ pre-fix state of the lane census, so that leg is proved non-vacuous against it:
                                                  it makes the census cry wolf on every live box
   * split the UNVERIFIED tails on `attributed`   -> 2 paired EXITLINE reds (the tail must follow
                                                  the note's words, not a count)
+  * let the census speak about an unread roster   -> 1 paired CENSUS red (the store-read guard:
+                                                 a failed STORE read must not be reported as a
+                                                 stale ROSTER)
   * drop the orphan row from REAPERS            -> REGISTERED red  (the pre-#1862 module)
   * re-file "orphan" as "worktree"              -> REGISTERED red + DRIFT red + MEANING-IV red
   * drop the label from REQUIRED_LABELS         -> REQUIRED red + ABSENT red
@@ -58,7 +61,7 @@ patched for the duration of a leg and restored in a `finally`, so nothing touche
 or the real launchd.
 
 ⛔ ONE EXCEPTION, STATED RATHER THAN HIDDEN: `leg_lane_census` is the first leg to call `main()`
-(**eight** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
+(**nine** `_drive` arms), and `main()` reaches the REAL process table — read-only, never written —
 once PER RECORDED LANE for three distinct reads: a lane-row `cputime_secs`, one `_observed` ->
 `scripts/lib/pid-identity.sh probe`, and a `cputime_secs` from the STATE snapshot write the
 enumeration runs for every recorded pid. Per recorded lane that is 3; what each arm actually
@@ -69,8 +72,9 @@ reaches:
   * the TWO HOLDER arms (`rc_live`, `rc_liveu`) — seven records: 2 × 7 = **14 each**, because
     `_observed` is stubbed to `holder`, so only the two `cputime_secs` reads per record remain;
   * the abstaining-record arm — one record reading `os.getpid()`, bound 3;
-  * the THREE default-store arms (`pi=9`, `pi=None`, `pi=0`) — no ROSTERED record (`_drive`'s
-    default store holds two non-rostered sessions), so they reach the table **zero** times.
+  * the THREE default-store arms (`pi=9`, `pi=None`, `pi=0`) and the CORRUPT-STORE arm
+    (`corrupt_store=True`) — no ROSTERED record (`_drive`'s default store holds two non-rostered
+    sessions, and the corrupt store holds none at all), so they reach the table **zero** times.
 
 Every one of the fixture-based reads targets the FIXTURE's pid (`99999999`), so they are not "about
 THIS process". The abstaining-record arm is the one that reads `os.getpid()`
@@ -744,16 +748,18 @@ def leg_lane_census(mod):
         check(w == "INCOMPLETE" and "rows without a verdict" in t, PAIR[3])
 
     # ── main() end-to-end over a read-only store holding none of the roster ──
-    def _drive(pi_stub, records=None, holder=False):
-        """Run `main()` over a READABLE hook store.
+    def _drive(pi_stub, records=None, holder=False, corrupt_store=False):
+        """Run `main()` over a hook store.
 
         `records` defaults to two NON-rostered sessions (the stale-roster shape). Pass a list to
         model other store shapes -- notably a roster record whose identity read ABSTAINS.
 
         That is the exact state the original defect rendered as a clean scan, and it keeps the
         "unreadable store" fail-closed path from masking this one. Returns (exit_code, stdout).
-        Every patched global is restored, and a name the pre-fix module never had is deleted
-        rather than left behind, so later legs see the module they expect.
+        `corrupt_store=True` writes a store that cannot be parsed, which is the ONLY way to model
+        `hook_ok is False` -- the shape the census's store-read guard depends on. Every patched
+        global is restored, and a name the pre-fix module never had is deleted rather than left
+        behind, so later legs see the module they expect.
         """
         _MISSING = object()
         keys = ("HOOK", "STATE", "TASK", "SESS", "pi_process_count",
@@ -765,15 +771,25 @@ def leg_lane_census(mod):
         rc = None
         try:
             hook = os.path.join(tmp, "hook.json")
-            if records is None:
+            if corrupt_store:
+                # ⛔ A STORE THE LEG CANNOT READ, so `hook_ok` is False (review cycle 18, finding 2).
+                # Without this shape the "NO CENSUS VERDICT WITHOUT A STORE READ" guard was pinned
+                # by NOTHING: removing it stayed at `114 passed` while `main()` printed the exact
+                # wrong diagnosis the guard exists to prevent — a census MISMATCH blaming the ROSTER
+                # beside "hook store unreadable" — sending an operator to edit the roster when the
+                # STORE READ was the fault.
+                with open(hook, "w", encoding="utf-8") as fh:
+                    fh.write('{"sessions":{')
+            if records is None and not corrupt_store:
                 records = [
                     {"sessionId": "aaaaaaaa-0000-0000-0000-00000000beef",
                      "agentLifecycle": "idle"},
                     {"sessionId": "bbbbbbbb-0000-0000-0000-00000000beef",
                      "agentLifecycle": "idle"},
                 ]
-            with open(hook, "w", encoding="utf-8") as fh:
-                json.dump({"sessions": records}, fh)
+            if not corrupt_store:
+                with open(hook, "w", encoding="utf-8") as fh:
+                    json.dump({"sessions": records}, fh)
             mod.HOOK = hook
             mod.STATE = os.path.join(tmp, "prev.json")
             mod.TASK = os.path.join(tmp, "task-sessions")
@@ -812,8 +828,9 @@ def leg_lane_census(mod):
           # ⛔ SCOPED TO THE POPULATION (review cycle 15, finding 1). Unscoped, this label claimed a
           # global invariant that `main()` deliberately does NOT hold: over an INCONCLUSIVE roster
           # with a MEASURED-EMPTY pi population it prints `✅ no suspects` and exits 0 on purpose —
-          # nothing is running, so a roster that names nobody cannot mislead. That arm is pinned
-          # end-to-end just below; the claim that holds in THIS arm is the one with a population.
+          # a measured-empty population contradicts nothing, so a roster that names nobody cannot
+          # mislead. That arm is pinned end-to-end just below; the claim that holds in THIS arm is
+          # the one with a population.
           "CENSUS: main() never prints a clean scan over 0 measured lanes while pi processes run")
     # ⛔ BOTH ARE CHECKED, AND BOTH DISCRIMINATE (review cycle 5, finding 1). An earlier comment
     # here claimed the exit code could not fail because this box carries a scheduled-maintainer
@@ -840,15 +857,33 @@ def leg_lane_census(mod):
           "CENSUS: an unreconcilable census exits non-zero, so a scheduler can see it")
 
     # ⛔ THE DELIBERATE `pi_count <= 0` ARM, PINNED END-TO-END (review cycle 15, finding 1). An
-    # INCONCLUSIVE roster over a MEASURED-EMPTY population is silent on purpose: nothing is running,
-    # so a roster that names nobody cannot mislead anybody. Stating that only in a PREDICATE label
-    # left it as an un-pinned claim about `main()`; this drives the real entry point over the same
-    # readable store and asserts the CLEAN result is the intended one rather than an accident.
+    # INCONCLUSIVE roster over a MEASURED-EMPTY population is silent on purpose: the population
+    # CONTRADICTS nothing, so a roster that names nobody cannot mislead anybody. ⛔ NOT "nothing is
+    # running" (review cycle 18, finding 1): `alive` may be non-zero here — `lane_census(2, 1, 0, 7)`
+    # is silent too — because `alive` fences the RECORDED pid+start and does not require that
+    # process to be the `pi` binary, while `pi_count` counts only argv0 basename exactly `pi`.
+    # Stating that only in a PREDICATE label left it as an un-pinned claim about `main()`; this
+    # drives the real entry point over the same readable store and asserts the CLEAN result is the
+    # intended one rather than an accident.
     rc0, out0 = _drive(lambda: 0)
     check("LANE CENSUS" not in out0 and not rc0,
           "CENSUS: a MEASURED-EMPTY pi population is silent, whatever the roster")
     check("no suspects" in out0,
           "CENSUS: …and a clean scan there is the DELIBERATE arm, not a missed alarm")
+
+    # ⛔ "NO CENSUS VERDICT WITHOUT A STORE READ" WAS PINNED BY NOTHING (review cycle 18,
+    # finding 2). `main()` guards the census with `if hook_ok else None` so a FAILED STORE READ is
+    # never reported as a roster problem; removing that guard stayed at `114 passed`, while `main()`
+    # printed the exact wrong diagnosis it exists to prevent:
+    #   "LANE CENSUS MISMATCH: 19 pi process(es) running but only 0 of the 7 … the roster is stale on
+    #    this box …" beside "hook store unreadable or shape-drifted — scan INCOMPLETE"
+    # — i.e. pointing an operator at editing the ROSTER when the STORE READ was the fault. This arm
+    # supplies the shape: a store the leg cannot parse, with a population that WOULD alarm.
+    rc_ns, out_ns = _drive(lambda: 19, corrupt_store=True)
+    check("LANE CENSUS" not in out_ns,
+          "CENSUS: an UNREADABLE store silences the census — it may not blame the roster for a failed store read")
+    check("INCOMPLETE" in out_ns and rc_ns == 1,
+          "CENSUS: …the store failure is still reported, by its OWN path and with its own exit")
 
     # ── end-to-end: an ALL-DEAD roster must not read as a clean scan ────────────────
     # ⛔ THE PREDICATE ARMS ABOVE WERE ALL GREEN THROUGH BOTH OF CYCLES 7 AND 8's P1s, because the
@@ -990,6 +1025,15 @@ MUTATIONS = [
     ("drop the orphan row from REAPERS (the pre-#1862 module)",
      _sub('    ("com.eldato.pi-reap-orphans",     "orphan"),\n', ""),
      ["REGISTERED: %s is in REAPERS" % LABEL]),
+    # ⛔ THE STORE-READ GUARD (review cycle 18, finding 2). Without it the census blames the ROSTER
+    # for a failed STORE READ — the wrong diagnosis, sending an operator to edit the roster when the
+    # store was the fault. Pinned by the `corrupt_store` `_drive` arm, which supplies the only shape
+    # that can reach `hook_ok is False`.
+    ("let the census speak about a roster it could not read",
+     _sub("    census_note = (lane_census(attributed, dead, pi_process_count(), len(LANES))\n"
+          "                   if hook_ok else None)",
+          "    census_note = lane_census(attributed, dead, pi_process_count(), len(LANES))"),
+     ["CENSUS: an UNREADABLE store silences the census — it may not blame the roster for a failed store read"]),
     # exit 3 CANNOT be a paired red here: worktree's exit-3 text contains "fail-closed" too, so the
     # MEANING-III leg stays green under this mutation. The family discriminator that does fire is the
     # exit-3 DISTINCTNESS check (two families must not read the same sentence).
