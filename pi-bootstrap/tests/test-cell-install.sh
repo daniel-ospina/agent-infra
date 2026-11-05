@@ -93,10 +93,16 @@ DEST="$CELL_HOME/.pi/agent"
 FAKEBIN="$TMP/bin"
 LOG="$TMP/runs.log"
 FAILURES=0
+CHECKED=0
 trap 'rm -rf "$TMP"' EXIT
 
-fail() { echo "FAIL: $*" >&2; FAILURES=$((FAILURES + 1)); }
-ok()   { echo "ok: $*"; }
+# ⛔ THE TOTALS ARE PRINTED, NOT COUNTED BY HAND (#3374 review, round 12 P3). This suite kept no
+# counter, so every "N ok arms" in the plan doc and the PR body was a `grep -c '^ok:'` somebody ran
+# once at one head — and by round 12 the SAME document carried 297, 291 and 305 for the same suite,
+# with a stale "23 arms" beside a corrected "25". A number the suite prints cannot be quoted stale,
+# because the only way to get it is to run the suite.
+fail() { CHECKED=$((CHECKED + 1)); FAILURES=$((FAILURES + 1)); echo "FAIL: $*" >&2; }
+ok()   { CHECKED=$((CHECKED + 1)); echo "ok: $*"; }
 hdr()  { echo "== $*"; }
 
 # --- hermetic environment -------------------------------------------------
@@ -1578,11 +1584,11 @@ PY
 # TOP-LEVEL key — a `_noteboard`, a hand-added "token", the shape a curl-style paste produces —
 # printed `SECRET_IN_FILE:(unlocatable)`: the operator was told a secret exists and given nowhere to
 # look. The install side did not name it at all, so the repair loop never converged either.
-python3 - "$DEST/.mcp.json" <<'PY'
+python3 - "$DEST/.mcp.json" "$LEAKKEY" <<'PY'
 import json, sys
-p = sys.argv[1]
+p, key = sys.argv[1], sys.argv[2]
 d = json.load(open(p))
-d["_noteboard"] = "tt_AAAABBBBCCCCDDDDEEEE"
+d["_noteboard"] = key
 json.dump(d, open(p, "w"), indent=2)
 PY
 run_verify_root "$ROOT"
@@ -1594,13 +1600,13 @@ grep -q 'literal credential at _noteboard' "$LOG" \
   && ok "…and --install NAMES it too, so the install log cannot read as success over a file the verify refuses" \
   || fail "--install said nothing about the top-level literal it preserved — the log reads as a clean install over a file the next --verify refuses"
 # CONTROL: the under-`mcpServers` spelling every earlier arm greps is UNCHANGED by the fix.
-python3 - "$DEST/.mcp.json" <<'PY'
+python3 - "$DEST/.mcp.json" "$LEAKKEY" <<'PY'
 import json, sys
-p = sys.argv[1]
+p, key = sys.argv[1], sys.argv[2]
 d = json.load(open(p))
 d.pop("_noteboard", None)
 d["mcpServers"]["acme"] = {"type": "http", "url": "https://acme.example/mcp",
-                            "headers": {"Authorization": "Bearer tt_AAAABBBBCCCCDDDD"}}
+                           "headers": {"Authorization": "Bearer " + key}}
 json.dump(d, open(p, "w"), indent=2)
 PY
 run_verify_root "$ROOT"
@@ -1669,6 +1675,127 @@ run_install                                             # the repair must conver
 run_verify
 [ $? -eq 0 ] && ok "...and the repair CONVERGES out of it" \
   || fail "verify still refuses what install produced from a userinfo entry"
+# ⛔ A DEFAULT PORT IS THE SAME ENDPOINT, AND IT WAS THE SELF-HOST EXEMPTION'S WAY IN (#3374 review,
+# round 12 P2). The "does this entry need the hosted credential" question compared BYTES against
+# `HOSTED_DEFAULT_URL`, so every non-canonical spelling of the SAME endpoint — `:443` under https,
+# `:80` under http, the bare `host:` — fell to the self-host branch, was PRESERVED, marked
+# `_selfHosted`, and certified with NO credential check. Measured pre-fix, on the shipped template:
+# the canonical spelling of an entry declaring `Bearer ${SOME_OTHER_VAR}` (which expands to an EMPTY
+# Bearer — the #3275/#3289 401 this whole change exists to close) was REPLACED, while its `:443`
+# spelling was kept, marked, and printed `SELFHOSTED:` rc=0 beside a note saying "a self-hosted
+# daemon needs none" about the HOSTED host. WHATWG drops a default port (`new URL(':443')` href is the
+# canonical form), so the two spellings ARE one endpoint; `endpoint_key()` is that identity.
+for _SPELL in "https://api.premiselabs.co:443/mcp/" "https://api.premiselabs.co:/mcp/"; do
+  python3 - "$DEST/.mcp.json" "$_SPELL" <<'PY'
+import json, sys
+p, spell = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": spell,
+    "headers": {"Authorization": "Bearer ${SOME_OTHER_VAR}"},
+}
+d["mcpServers"].pop("acme", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+  run_install
+  python3 - "$DEST/.mcp.json" "$_SPELL" <<'PY' && ok "a DEFAULT-PORT spelling of the hosted endpoint ($_SPELL) is REPLACED, not exempted — the entry is the hosted host and needs the hosted credential" \
+    || fail "install preserved $_SPELL as a self-host while it is the SAME endpoint as the hosted default (a default port is not part of an endpoint's identity) — the entry keeps a wrong credential variable, expands to an empty Bearer, and --verify then certifies it"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/"
+         and not t.get("_selfHosted")
+         and t.get("headers", {}).get("Authorization") == "Bearer ${TORTOISE_MCP_API_KEY}" else 1)
+PY
+  run_verify
+  [ $? -eq 0 ] && ok "...and --verify CERTIFIES what install wrote — the repair loop converges on the hosted credential" \
+    || fail "--verify refuses the entry install just produced from a default-port spelling — verify -> install -> verify never converges"
+done
+# …and the CONTROL: a NON-default port is a genuinely different endpoint. It must stay a preserved,
+# named self-host — so the arm above cannot pass by deleting the self-host exemption outright (that
+# would repoint every operator's own daemon, the silent-repoint defect this file's rule 3 forbids).
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselabs.co:8443/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install
+python3 - "$DEST/.mcp.json" <<'PY' && ok "…while a NON-DEFAULT port (8443) is still PRESERVED and marked a self-host (the rule was narrowed to DEFAULT ports, not disabled)" \
+  || fail "install repointed an operator's own daemon on a non-default port — a non-default port IS part of the endpoint, and repointing it is the silent-repoint defect this merge exists to prevent"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co:8443/mcp/" and t.get("_selfHosted") else 1)
+PY
+run_verify
+[ $? -eq 0 ] && ok "...and --verify certifies it BY NAME (SELFHOSTED:)" \
+  || fail "--verify refused a preserved non-default-port self-host — install and verify disagree about one file"
+run_install >/dev/null 2>&1
+# ⛔ THE MARKER THAT FIRES FOR THE COMMON CASE ECHOED THE RAW URL (#3374 review, round 12 P2), and a
+# url may carry a userinfo PASSWORD. `URL_NOT_DEFAULT` is the arm an operator sees whenever an entry
+# differs from the template — and it printed the url verbatim, so
+# `URL_NOT_DEFAULT:https://alice:hunter2@evil.example/mcp/` put the password into a bring-up log that
+# gets pasted into issues, while `USERINFO:` and `INSECURE_URL:` on the SAME url printed `<redacted>`.
+# `WRONG_AUTH` echoed the whole header for the same reason (it is not a `tt_`/`tk_` shape, so
+# `redact()` was never applied). Both are pinned here by SECRET, not by marker text: a marker that is
+# present with the secret beside it is exactly the failure.
+# ⛔ THE FIXTURE BELOW IS THE *REACHABLE* WRONG_AUTH SHAPE, AND THAT IS NOT A DETAIL (#3374 round 12).
+# The first draft of this arm used a bare literal (`Bearer hunter2NOTATOKEN`) — which never reaches
+# `WRONG_AUTH` at all: the marker refuses a `${`-less header as `LITERAL_AUTH` one branch earlier and
+# prints no value, so the arm failed on a marker the shape cannot produce (measured: LATEST/OLD both
+# `LITERAL_AUTH`). WRONG_AUTH is reached only by a header that DOES carry `${` but is not the exact
+# env-indirect form, and the leak needs a trailing literal: measured on the PRE-FIX marker,
+# `Bearer ${TORTOISE_MCP_API_KEY} hunter2NOTATOKEN` printed the whole header including the token,
+# and post-fix prints `${TORTOISE_MCP_API_KEY}`. That makes this arm RED against the old code.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://alice:hunter2@evil.example/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -qE 'URL_NOT_DEFAULT:' "$LOG" && ! grep -qF 'hunter2' "$LOG" \
+  && ok "URL_NOT_DEFAULT reports the url WITHOUT the userinfo password (the common-case marker was the one that leaked)" \
+  || fail "URL_NOT_DEFAULT is missing, or it echoed the userinfo password into the bring-up log (rc=$rc) — a log that gets pasted into issues and PRs fleet-wide"
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselabs.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY} hunter2NOTATOKEN"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 1 ] && grep -qE 'WRONG_AUTH:' "$LOG" && ! grep -qF 'hunter2NOTATOKEN' "$LOG" \
+  && ok "WRONG_AUTH names the VARIABLE and withholds everything after it (a trailing literal, which redact() never sees, stayed in the log)" \
+  || fail "WRONG_AUTH echoed the header verbatim into the log (rc=$rc) — a credential that is not tt_/tk_-shaped still lands in a pasted log"
+run_install >/dev/null 2>&1
+# ⛔ THE INSTALL SUMMARY CLAIMED "hosted" OVER A SELF-HOST TEMPLATE (#3374 review, round 12 P3).
+# `merge_tortoise_is_hosted` compared the written file against the TEMPLATE's url, so a cell correctly
+# matching its own `localhost` daemon satisfied it and the log said "hosted tortoise entry installed"
+# about an entry pointing at localhost — the same false-sentence class round 11 fixed one file over.
+run_install_root "$SELFTPL" >/dev/null 2>&1
+! grep -q 'hosted tortoise entry installed' "$LOG" \
+  && grep -q 'NOT the hosted default' "$LOG" \
+  && ok "a self-host template's install does NOT claim a HOSTED entry was installed (the summary compares against the hosted endpoint, not the template)" \
+  || fail "the install summary printed 'hosted tortoise entry installed' over an entry pointing at the template's own daemon — a sentence that is false about the artifact"
+run_install_root "$ROOT" >/dev/null 2>&1   # back to the shipped template
+run_install >/dev/null 2>&1
 # ⛔ A NON-OBJECT `tortoise` IS OPERATOR CONTENT, AND IT VANISHED SILENTLY (#3374 review P2). Every
 # sibling container shape names its replacement and keeps the bytes; this one was replaced with no
 # `NOTE:` and no `.bak` — against the merge's own "nothing here is silent" contract.
@@ -2197,7 +2324,7 @@ rc=$?
 # installer had just written. That makes the repair loop (`cloud-cell-bringup.sh`: verify → install →
 # verify) non-convergent BY CONSTRUCTION: the next `--install` reads the literal, replaces it with
 # `want`, and writes the same literal back. Measured pre-fix, rc=0 both times: a template carrying
-# `Bearer tt_AAAABBBBCCCCDDDD` landed in `.mcp.json` verbatim (R2 of this change's own contract), and a
+# `Bearer <a literal token>` landed in `.mcp.json` verbatim (R2 of this change's own contract), and a
 # template carrying `http://api.premiselabs.co/mcp/` was installed as the hosted default.
 # Each arm below ALSO asserts the destination was never created: refusing to write is the contract, and
 # a refusal that still wrote would satisfy a message-only assertion.
@@ -2212,7 +2339,7 @@ d["mcpServers"]["tortoise"] = t
 json.dump(d, open(out, "w"), indent=2)
 PY
 }
-_mk_tpl "$TMP/tpl-literal.json" 't["headers"]["Authorization"] = "Bearer tt_AAAABBBBCCCCDDDD"'
+_mk_tpl "$TMP/tpl-literal.json" "t[\"headers\"][\"Authorization\"] = \"Bearer $LEAKKEY\""
 _mk_tpl "$TMP/tpl-http.json"    't["url"] = "http://api.premiselabs.co/mcp/"'
 _mk_tpl "$TMP/tpl-nokey.json"   't.pop("headers", None)'
 for _case in literal:literal@headers.Authorization http:insecure nokey:nokey; do
@@ -2274,26 +2401,35 @@ PY
     fail "a self-host template installed but \`--verify\` answered '${_mk}' (rc=$_mrc) — install wrote a file verify refuses, so verify → install → verify can never converge"
   fi
 done
-# ⛔ THE HOSTED DEFAULT IS NOW A DEFINED FACT IN TWO LANGUAGES, SO PIN IT TO THE ARTIFACT IT NAMES.
-# `HOSTED_DEFAULT_URL` in merge-mcp.py and in cell-install.sh must both equal the endpoint the SHIPPED
-# template declares — otherwise the constant silently diverges from the template every box installs,
-# and "is this the hosted endpoint?" starts answering about an endpoint nobody uses.
+# ⛔ THE HOSTED DEFAULT IS NOW A DEFINED FACT IN TWO LANGUAGES (and in THREE assignments), SO PIN
+# EVERY ONE OF THEM TO THE ARTIFACT IT NAMES. `HOSTED_DEFAULT_URL` in merge-mcp.py and in
+# cell-install.sh's verifier, plus `GRAPH_HOSTED_DEFAULT_URL` in cell-install.sh's BASH, must all equal
+# the endpoint the SHIPPED template declares — otherwise the constant silently diverges from the
+# template every box installs, and "is this the hosted endpoint?" starts answering about an endpoint
+# nobody uses. ⛔ EVERY ASSIGNMENT IS CHECKED, not just the first per file (round 12): a file with two
+# spellings is exactly how the bash one would have drifted unseen, and the count per file is asserted
+# so a rename cannot turn this arm into a check of zero things.
 _pin_out="$(python3 - "$ROOT" <<'PY'
 import json, re, sys
 root = sys.argv[1]
 tpl = json.load(open(root + "/templates/.mcp.base.json"))["mcpServers"]["tortoise"]["url"]
 bad = []
+seen = {}
 for rel in ("pi-bootstrap/lib/merge-mcp.py", "pi-bootstrap/cell-install.sh"):
-    m = re.search(r'^HOSTED_DEFAULT_URL = "([^"]+)"', open(root + "/" + rel).read(), re.M)
-    if not m:
+    src = open(root + "/" + rel).read()
+    hits = re.findall(r'^\s*(?:GRAPH_)?HOSTED_DEFAULT_URL\s*=\s*"([^"]+)"', src, re.M)
+    seen[rel] = len(hits)
+    if not hits:
         bad.append(rel + ": no HOSTED_DEFAULT_URL")
-    elif m.group(1) != tpl:
-        bad.append("%s: %r != template %r" % (rel, m.group(1), tpl))
+    bad += ["%s: %r != template %r" % (rel, h, tpl) for h in hits if h != tpl]
+if seen.get("pi-bootstrap/cell-install.sh") != 2:
+    bad.append("cell-install.sh: expected 2 assignments (verifier python + bash), found %s"
+               % seen.get("pi-bootstrap/cell-install.sh"))
 print("; ".join(bad))
 PY
 )"
 [ -z "$_pin_out" ] \
-  && ok "HOSTED_DEFAULT_URL is the SHIPPED template's endpoint in BOTH languages (merge-mcp.py and cell-install.sh) — 'the hosted default' cannot drift away from the endpoint every box installs" \
+  && ok "HOSTED_DEFAULT_URL is the SHIPPED template's endpoint in EVERY assignment (merge-mcp.py, and both the verifier's python and the bash in cell-install.sh) — 'the hosted default' cannot drift away from the endpoint every box installs" \
   || fail "HOSTED_DEFAULT_URL has drifted from templates/.mcp.base.json: $_pin_out — the constant that decides whether an entry needs the hosted credential no longer names the hosted endpoint"
 # ⛔ THE DESTINATION READ WAS THE LAST BARE `open()` IN THIS FILE (#3374 review, round 10 P2).
 # `except ValueError` caught the JSONDecodeError and let every OSError through, so an unreadable
@@ -2816,11 +2952,31 @@ rm -f "$CELL_HOME/keys.env"
 # sites — it missed the suite's DOMINANT `[ … ] && ok "…"` form entirely, i.e. it would have stayed
 # silent on the shape an author is most likely to write. The pattern is now position-independent; the
 # message says "any line", which is what it now means.
-bad_bt="$(awk -v bt="$(printf '\140')" '
-  $0 !~ /^[[:space:]]*#/ && (index($0, "ok \"") > 0 || index($0, "fail \"") > 0) {
-    s = $0; gsub("\\\\" bt, "", s)
-    if (index(s, bt) > 0) printf "%d:%s\n", NR, $0
-  }' "${BASH_SOURCE[0]}")"
+# ⛔ THE SCAN MUST BE ABLE TO CATCH SOMETHING (#3374 review, round 12 P2). The arm ran one awk and
+# asserted the RESULT WAS EMPTY — and an absence-of-violations scan is green under ANY narrowing of
+# its own pattern. Measured: restoring the pre-round-10 line-start anchor still printed 0 hits over
+# this whole file, so reverting that fix (the one whose own comment says the anchor "missed the
+# suite's DOMINANT form entirely") reddened NOTHING, and a backtick inside an assertion would silently
+# execute a word again. The scan is a named function now, and a MUTANT fixture proves it fires on the
+# shape an author actually writes — the same control the R5 suite and the 'label' argument checker
+# carry, for the same reason: a guard nothing can fail is not a guard.
+_bt_scan() {   # _bt_scan <file> — lines carrying an unescaped backtick inside an ok/fail message
+  awk -v bt="$(printf '\140')" '
+    $0 !~ /^[[:space:]]*#/ && (index($0, "ok \"") > 0 || index($0, "fail \"") > 0) {
+      s = $0; gsub("\\\\" bt, "", s)
+      if (index(s, bt) > 0) printf "%d:%s\n", NR, $0
+    }' "$1"
+}
+BT_FIX="$TMP/bt-mutant.sh"
+# ⛔ THE MUTANT IS BUILT AT RUNTIME, AND THAT IS NOT PEDANTRY: a literal backtick here would make THIS
+# LINE the violation the scan below reports (measured — the first draft of this arm did exactly that,
+# and the suite reddened on its own fixture). `$(printf '\140')` emits one into the FILE while the
+# suite's own text carries none, so the scanner is tested without being tripped.
+printf '%s\n' "[ -n \"\$x\" ] && ok \"an edge case: run $(printf '\140')type x$(printf '\140')\"" > "$BT_FIX"
+[ -n "$(_bt_scan "$BT_FIX")" ] \
+  && ok "the backtick scanner CATCHES a planted one in the suite's dominant conditional-ok form (so the arm below is not measuring its own silence)" \
+  || fail "the backtick scanner did not flag a planted unescaped backtick — it is an absence check that can no longer redden, which is the defect class this PR keeps closing"
+bad_bt="$(_bt_scan "${BASH_SOURCE[0]}")"
 [ -z "$bad_bt" ] \
   && ok "no unescaped backtick inside ANY ok/fail message on any line (one there would EXECUTE from inside the assertion)" \
   || fail "an ok/fail message carries an unescaped backtick, so the suite executes it: $bad_bt"
@@ -3432,8 +3588,8 @@ bash -n "$INSTALLER" && ok "cell-install.sh parses (bash -n)" || fail "cell-inst
 
 echo ""
 if [ "$FAILURES" -gt 0 ]; then
-  echo "FAILURES: $FAILURES — full run log: $LOG" >&2
+  echo "FAILURES: $FAILURES of $CHECKED arms — full run log: $LOG" >&2
   tail -30 "$LOG" >&2 || true
   exit 1
 fi
-echo "OK: the operational layer installs to a cell, is verified by reading it back, and refuses a partial one."
+echo "OK: $CHECKED arms — the operational layer installs to a cell, is verified by reading it back, and refuses a partial one."

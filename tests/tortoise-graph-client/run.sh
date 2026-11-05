@@ -364,7 +364,10 @@ fi
 
 echo
 if [ "$failures" -eq 0 ]; then
-  echo "OK: the fallback client calls the SERVED surface, prints parseable JSON, and never reads nothing as a result."
+  # ⛔ THE COUNT IS PRINTED, NOT RECOUNTED BY HAND (#3374 review, round 12 P3). It was printed only on
+  # the FAILURE path, so every "N arms" in the plan doc and the PR body was a hand-run grep — and the
+  # same document ended up carrying "23 arms" in one section beside a corrected "25" in another.
+  echo "OK: $checks arms — the fallback client calls the SERVED surface, prints parseable JSON, and never reads nothing as a result."
 else
   echo "FAILURES=$failures of $checks"
 fi
