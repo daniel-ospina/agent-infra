@@ -523,6 +523,5 @@ case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and the durable row do
 case "$(ledger_of "$D")" in *"agesrc=unmeasured"*) ck 0 "…it degrades to agesrc=unmeasured (the value that says no reading was taken)" ;; *) ck 1 "…it degrades to agesrc=unmeasured (the value that says no reading was taken): $(ledger_of "$D")" ;; esac
 
 
- echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
