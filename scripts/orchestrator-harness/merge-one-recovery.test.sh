@@ -244,6 +244,20 @@ remints() { local n; n="$(grep -c '^7 ' "$MRG/recorder-calls" 2>/dev/null)"; pri
 log_has() { grep -qF -- "$1" "$MRG/o/logs/merge-$PR.log" 2>/dev/null; }
 no_park() { [ ! -s "$MRG/o/state/parked-$PR" ]; }
 merged() { [ -s "$MRG/merged" ]; }
+# ⛔ A MERGE IS RECORDED IN ONE OF TWO SPIES, AND `run_merge`'s AUTHORITY DECIDES WHICH: RAIL
+# authority executes the `admin-merge.sh` spy above (`rail-ran`), GATE authority merges with a raw
+# `gh pr merge` (`MERGE_SPY`, `merged`). So a "merges nothing" claim that reads only ONE of them is
+# not SATISFIED under the authority the other one records in — it cannot fire at all. Measured: a
+# `red-surface` arm mutated to fall through to the merge left the suite 96/96 green while the log
+# printed "NOTHING merged" and then `[merge 7] MERGED`. The claim therefore watches BOTH spies, and
+# `merge_ran_whence` names the one that fired so a real failure is diagnosable.
+merge_ran() { rail_ran || merged; }
+merge_ran_whence() {
+  local w=""
+  rail_ran && w="rail"
+  merged && w="${w:+$w+}raw-gh-merge"
+  printf '%s' "${w:-none}"
+}
 
 # ══ 1) THE CENTRAL PROPERTY: `carry` RE-BINDS THE RECORD AND THE MERGE IS REACHED ════════════════
 # The measured shape (#10255): a clean record at a STALE head, the live diff unchanged. The exit-0
@@ -305,7 +319,7 @@ ck "…asked --recover-body for THIS PR and repo" $rc
 # the head.
 mkmrg; mkrecorder
 out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=red-surface FAKE_CC_RC_AFTER=7)"
-rc=0; rail_ran && { rc=1; note "the rail/merge ran over a RED surface on the RECOVERY path"; }
+rc=0; merge_ran && { rc=1; note "a MERGE ran over a RED surface on the RECOVERY path (via: $(merge_ran_whence))"; }
 ck "RED→GREEN: a RECOVERED record over a RED surface merges NOTHING" $rc
 rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a red build bought a review on the recovery path"; }
 ck "…and buys NO review (a red build is not a review finding, on this path either)" $rc
@@ -320,10 +334,19 @@ ck "…and the log shows the RECOVERY arm itself made that decision (its own lin
 
 mkmrg; mkrecorder
 out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=surface-unknown FAKE_CC_RC_AFTER=8)"
+rc=0; merge_ran && { rc=1; note "a MERGE ran over an UNREADABLE surface on the RECOVERY path (via: $(merge_ran_whence)) — a failed read is not a green one"; }
+ck "RED→GREEN: …and a RECOVERED record over an UNREADABLE surface merges NOTHING" $rc
 rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a FAILED READ bought a review"; }
 ck "RED→GREEN: a RECOVERED record over an UNREADABLE surface does not buy a review either" $rc
 rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "it neither merged nor parked"; }
 ck "…and parks (a failed read is its own answer, not a review order)" $rc
+# ⛔ NON-VACUITY, IN THIS FIXTURE: the SAME authority and the SAME recovery answer must be able to
+# MERGE, or the refusal above could be passing because gate authority never reaches a merge at all.
+# Only the surface answer differs — `head` licenses the recovered record.
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=head FAKE_CC_RC_AFTER=0)"
+rc=0; merge_ran || { rc=1; note "the same fixture/authority merged NOTHING on a LICENSING answer (spies: $(merge_ran_whence)), so the 'merges NOTHING' claim cannot fire: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "NON-VACUITY: …on 'head' the SAME fixture DOES merge, so that claim can fire" $rc
 
 # ══ 4) `nodigest` / `carry-patch` say RE-RECORD, never RE-REVIEW ═════════════════════════════════
 # Both are NON-ZERO rcs. Keying on `rc == 0` treated them as "a fresh review is owed" and bought a
@@ -375,7 +398,7 @@ rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a RED BU
 ck "RED→GREEN: 'red-surface' (rc=7) does NOT buy a paid review — a broken build is not a finding" $rc
 rc=0; log_has "check-carry=red-surface" || { rc=1; note "the log does not name the red: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
 ck "…and NAMES the red surface, so the operator is never told a review is the remedy" $rc
-rc=0; rail_ran && { rc=1; note "the rail ran on a PR-caused red — the producer had just said NOT mergeable"; }
+rc=0; merge_ran && { rc=1; note "a MERGE ran on a PR-caused red (via: $(merge_ran_whence)) — the producer had just said NOT mergeable"; }
 ck "RED→GREEN: …and merges nothing (a red the PR caused is not mergeable, whatever the gate says)" $rc
 rc=0; no_park || { rc=1; note "a single red cycle parked the head (the bound is 3): $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
 ck "RED→GREEN(exit-0): …and does NOT park on cycle 1/3 (a flaky shard re-runs green)" $rc
@@ -386,6 +409,11 @@ rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a base-o
 ck "RED→GREEN: 'red-base-owned' (rc=0) is a CARRY, not a review — the record covers the artifact" $rc
 rc=0; log_has "red-base-owned" || { rc=1; note "the log does not name the base-owned red: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
 ck "…and STATES that the surface is red and base-owned (never a silent green)" $rc
+# ⛔ NON-VACUITY FOR THE `red-surface` CLAIM ABOVE: this licence token drives the SAME fixture on the
+# SAME authority — a clean record AT this head, gate mode — and it MUST reach the raw merge. Without
+# this, "merges nothing" on the red answer could be passing because that fixture never merges.
+rc=0; merge_ran || { rc=1; note "gate authority merged NOTHING on the LICENSING token either (spies: $(merge_ran_whence)) — the red-surface claim above could not fire: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "NON-VACUITY: …and 'red-base-owned' DOES reach the raw merge in this same fixture" $rc
 
 # ── #3440 REVIEW ROUND 1: the red-surface BOUND, and the streak that has to clear it ──
 # The cap is not decoration: without it a durable PR-caused red re-loops `exit 0` for ever and
@@ -432,6 +460,8 @@ rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
 ck "RED→GREEN: 'surface-unknown' (rc=8) pays for NO review — a failed read is not a changed artifact" $rc
 rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
 ck "RED→GREEN(exit-0): …and parks nothing (a transport fault is not the PR's fault)" $rc
+rc=0; merge_ran && { rc=1; note "gate authority MERGED a head whose read FAILED (via: $(merge_ran_whence)) — a failed read is not a green surface"; }
+ck "RED→GREEN: …and an UNREADABLE surface merges NOTHING on the main path either" $rc
 rc=0; log_has "CHECK SURFACE" || { rc=1; note "the log does not name WHICH read failed: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
 ck "…and names the CHECK SURFACE as the failed read, not the diff" $rc
 
