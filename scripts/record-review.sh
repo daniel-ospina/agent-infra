@@ -90,9 +90,9 @@
 #   REBUILD a MISSING record from the PR body's own SIGNED marker (#2872).
 #   That marker is signed only when key and openssl both work (HMAC-SHA256 over
 #   the text, $AI_REVIEW_GATE_KEY, #2055; else UNSIGNED, :4827-4833). A **SIGNED** marker
-#   reaches CI in TWO copies (the body; the admitted comment this recorder also posts,
-#   :1224), an UNSIGNED one in ONE (:1197). The per-box record does not travel, so a review
-#   minted on a cell leaves the rail at NO-RECORD while the proof travels.
+#   reaches CI in TWO copies (the body; the admitted comment this recorder also posts at
+#   :1305, from post_marker_comment), an UNSIGNED one in ONE (:1197). The per-box record
+#   does not travel, so a review minted on a cell leaves the rail at NO-RECORD while the proof travels.
 #   Measured 2026-10-26: of 45 open PRs, 12 had a marker whose `diff=` equals the
 #   PR's live diff and no record file here; the registry covered 2 of them.
 #   It verifies the HMAC before minting (a body is attacker-writable, so a

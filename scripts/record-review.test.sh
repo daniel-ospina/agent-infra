@@ -2677,8 +2677,8 @@ unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_
 # 11.14 #2872 — `--recover-body`: rebuild a MISSING record from the PR body's
 #       SIGNED marker.
 # ─────────────────────────────────────────────────────────────────────────
-# WHY THIS EXISTS. The record file is PER BOX; the signed marker in the PR body
-# is the only copy of the verdict that TRAVELS with the PR. Measured 2026-10-26:
+# WHY THIS EXISTS. The record file is PER BOX; the signed marker in the PR body was
+# the only copy of the verdict that TRAVELLED until #1224 added the comment copy. Measured 2026-10-26:
 # of 45 open PRs, 12 carried a marker whose `diff=` equalled the PR's live diff
 # with no record file on the merging box, and the registry covered 2 of them —
 # so 10 lanes were being told to run a second 20-40 minute review for a verdict
@@ -4939,9 +4939,10 @@ assert_not_contains "$RECORD_ERR" "the signed marker" \
     "14.1d(h) …and does NOT call it 'the signed marker' on the PATCH-failure arm either"
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
-#      The recovery verb exists BECAUSE the body is the only copy of the verdict that
-#      travels — so handing the recovered marker back into that same MUTABLE field,
-#      with no durable twin, left a later body edit able to erase the only admitted
+#      The recovery verb exists BECAUSE the body was the only copy of the verdict that
+#      travelLED — until #1224, when this recorder began posting a durable comment copy too.
+#      Handing the recovered marker back into that same MUTABLE field, with the comment
+#      channel as the only durable twin, would still leave a later body edit able to erase the
 #      copy of what the run had just restored. This vector reddens when the call is
 #      removed (measured: PASS=925 FAIL=1 with only that call deleted), which is the
 #      same discriminator shape as 14.1d(e).
@@ -6026,7 +6027,7 @@ assert_eq "$(dc_posts "$DC_PR3")" "1" \
 # (#3168 self-review.) `post_marker_comment` refuses at FIVE points, and the inventory
 # below is what a reader must be able to trust (four rounds have now been spent on prose
 # that claimed coverage it did not have, so every line here was measured):
-#   :1224-1227  the ` sig=` SUBSTRING guard → UNPINNED and genuinely redundant: deleting
+#   :1223-1226  the ` sig=` SUBSTRING guard → UNPINNED and genuinely redundant: deleting
 #           it leaves posting IDENTICAL in every probe, because `_msig` then falls back to
 #           the whole marker and fails the shape guard at :1229. Declared rather than
 #           faked with the source-text pin an earlier round removed (14.1d(g)).
@@ -6201,6 +6202,8 @@ assert_eq "$(dc_posts "$FLE_PR")" "0" \
 # the count assertion above is what fails if a regression makes either arm stop
 # refusing. (Positive-first discipline: the count must already be 0 for this to mean
 # anything, and `assert_eq` above runs first.)
+assert_contains "$FLE_OUT" "delivered the pending marker" \
+    "20.13 …the flush reported the body delivery, so the capture below is live (not empty)"
 assert_not_contains "$FLE_OUT" "REFUSING to publish a marker" \
     "20.13 …and the refusal came from the KEY-UNSET arm (:1245, silent), not from the match arm (:1248, loud) [out: $(printf '%s' "$FLE_OUT" | tr '\n' ' ')]"
 assert_eq "$FLE_RC" "0" \
