@@ -531,6 +531,16 @@ _mandate_cli() {
     # CLEAN. That is this file's own doctrine ("a cannot-verify is NEVER a pass") applied to `--check`
     # and forgotten here. The verb now answers 2 for the same state, and names why on stderr.
     --missing)
+      # ⛔ THE DECLARATION IS TESTED FIRST, EXACTLY AS `mandate_verdict` DOES IT (#3379 review cycle 5, P2,
+      # MEASURED). Every collector iterates the declaration, so a declaration that renders NOTHING makes
+      # all three lists empty and this verb answered rc 0 with an EMPTY list — "nothing is missing" about a
+      # population nobody looked for — on the same box where `--check` and the emit both answered CANNOT
+      # VERIFY. Cycle 2 closed that false PASS on those two surfaces and left it on this one, while the
+      # help text below promises it is "never an empty or silently short list for an unknown state".
+      if ! mandate_declaration_readable; then
+        printf '[mandate-preflight] CANNOT VERIFY: the mandate declaration renders no names, so no file was looked for and "nothing is missing" cannot be concluded (a cannot-verify is never an empty list). Use --check for the verdict.\n' >&2
+        return 2
+      fi
       if mandate_state_root_undecidable; then
         printf '[mandate-preflight] CANNOT VERIFY: the state dir cannot be resolved on this box, so no path may be called missing (a cannot-verify is never an empty list). Use --check for the verdict.\n' >&2
         return 2

@@ -493,6 +493,17 @@ case "$OCC_MSG" in *'CANNOT VERIFY'*) ok "…and it SAYS cannot-verify on stderr
 OCC_CHECK_RC="$(CELL_HOME="$OCC" bash "$HELPER" --check >/dev/null 2>&1; printf %s $?)"
 [ "$OCC_CHECK_RC" = "2" ]; ck $? "…and --check agrees on the same box, so the two verbs cannot disagree about it"
 rm -rf "$OCC"
+# ── E1m-b: …AND THE *DECLARATION* ARM OF THE SAME VERB (#3379 review cycle 5, P2, MEASURED) ──────
+# Every collector iterates the declaration, so a declaration that renders NOTHING empties the whole
+# POPULATION: `--check` and the emit answered CANNOT VERIFY (cycle 2's P1) while `--missing` answered rc 0
+# with an EMPTY list — "nothing is missing" about a set nobody looked for — on the same box. Driven with
+# the same function override §E1j uses, so the state needs no fixture and cannot drift from it.
+DECL_MISS_RC="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --missing >/dev/null 2>&1; printf %s $?' _ "$HELPER")"
+[ "$DECL_MISS_RC" = "2" ]; ck $? "a declaration that renders NOTHING → --missing is 2, not 0 with an empty list (measured rc=$DECL_MISS_RC)"
+DECL_CHECK_RC="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; mandate_verdict >/dev/null 2>&1; printf %s $?' _ "$HELPER")"
+[ "$DECL_CHECK_RC" = "2" ]; ck $? "…and --check agrees about that box, so no consumer can read one verb as clean while the other says cannot-verify"
+DECL_MISS_MSG="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_files() { :; }; _mandate_cli --missing 2>&1 >/dev/null' _ "$HELPER")"
+case "$DECL_MISS_MSG" in *'CANNOT VERIFY'*) ok "…and --missing SAYS cannot-verify on stderr (silence was the defect)" ;; *) bad "…but --missing said nothing while answering 0 on an unread declaration" ;; esac
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
@@ -696,6 +707,13 @@ grep -qF 'is not available to this spawn' "$MERGE"; ck $? "merge-one.sh APPENDS 
 # redirect failure can be REPORTED, so the pin follows the CODE it guards — `if ! grep … ; then` — rather
 # than the comment above it (the cycle-2 lesson: a pin satisfied by prose guards nothing).
 grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$MERGE"; ck $? "…and that append is IDEMPOTENT (its guard is pinned; without it a degraded box grows the brief per dispatch)"
+# ⛔ THE OUTER GUARD LINE SURVIVES EVERY REVERT OF THE FIX'S SUBSTANCE (#3379 review cycle 5, P2, MEASURED):
+# restoring merge-one's ungrouped `printf … >> "$prompt"` INSIDE the kept `if ! grep …; then`, or deleting
+# its WARN `else`, both left this suite at 133 passed / 0 failed. merge-one cannot be driven behaviourally
+# (§E5's stated limit), so its two halves are pinned as the code text they are — the grouped redirect, and
+# the WARN that records a failed append — because a pin on the surrounding guard alone guards the guard.
+grep -qF '>> "$prompt"; } 2>/dev/null; then' "$MERGE"; ck $? "…and merge-one.sh GROUPS the redirect with the command (an ungrouped >> leaks its failure to the caller and no trailing 2>/dev/null can retract it)"
+grep -qF 'WARN reviewer PR #$PR: could not append the degraded notice' "$MERGE"; ck $? "…and RECORDS a failed append in the operator log (deleting the else left the suite green — the LANE would go untold in silence)"
 grep -qF 'if ! grep -qF '\''[mandate-preflight] CANNOT VERIFY'\'' "$prompt" 2>/dev/null; then' "$SPAWN"; ck $? "spawn-gate.sh's brief append is IDEMPOTENT too (same guard; deleting it left the suite green)"
 # ⛔ THE LOG IS NOT THE LANE, AND THAT WAS THE ACTUAL HOLE (this change's review cycle 2, P1, MEASURED):
 # the notice above went to `$log` ONLY, so on a box that has not received the helper the LANE was told
