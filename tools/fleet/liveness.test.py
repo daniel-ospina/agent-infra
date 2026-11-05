@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-two tests with ninety-two paired mutations: every mutation re-
+Fifty-three tests with ninety-three paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -17,8 +17,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 52 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (92)
+    python3 tools/fleet/liveness.test.py                # the 53 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (93)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -2716,6 +2716,35 @@ def t52():
         shutil.rmtree(d, ignore_errors=True)
 
 
+@test("T53 `_sum_subtree` ABSTAINS when a member's CPU is unread, never shrinking")
+def t53():
+    # ⛔ THE INVARIANT THE `/proc` READER USED TO BREAK, and it had NO test at all —
+    # which is why an asserted invariant and an implementation could diverge unnoticed.
+    # Dropping an unread member makes the total SMALLER, and a smaller total is how a
+    # busy tree reads FLAT → `frozen` — the false negative this axis exists to remove.
+    # The `ps` path always abstained (a malformed row -> `None`); `_proc_cpu_cs` silently
+    # `continue`d, so a row it could not open or parse left the population entirely. It
+    # now abstains too (a VANISHED pid is still `continue` — that one is genuinely gone).
+    ppid = {100: 1, 101: 100, 102: 100, 103: 101}
+    cpu = {100: 10, 101: 20, 102: 30, 103: 40, 999: 90}
+    check(liv._sum_subtree(100, ppid, cpu) == 100,
+          "a fully-read tree sums the root and every descendant; got %r"
+          % (liv._sum_subtree(100, ppid, cpu),))
+    check(liv._sum_subtree(100, ppid, cpu) is not None
+          and liv._sum_subtree(100, ppid, cpu) < 190,
+          "a process OUTSIDE the tree (999) is not counted")
+    for unread in (100, 101, 102, 103):
+        bad = dict(cpu)
+        bad[unread] = None
+        check(liv._sum_subtree(100, ppid, bad) is None,
+              "an UNREAD member (%d) abstains the whole total; got %r"
+              % (unread, liv._sum_subtree(100, ppid, bad)))
+    check(liv._sum_subtree(100, ppid, {101: 20}) is None,
+          "the root absent from the map is an abstention, never 0")
+    check(liv._sum_subtree(100, ppid, {100: 10, 101: 20}) is None,
+          "a descendant present in ppid but missing from cpu abstains too, never shrinks")
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -3410,6 +3439,14 @@ MUTATIONS = [
         '                                if lr.verdict_line_pid else True)',
         "with NO bound line the launcher witness is adopted unconditionally, so ANY "
         "appended `[timeout] agent … rc=0` from an earlier dispatch corroborates this lane",
+    ),
+    Mutation(
+        "T53", "module",
+        '        if cpu.get(p) is None:\n            return None',
+        '        if cpu.get(p) is None:\n            continue',
+        "an unread member is SKIPPED instead of abstaining, so the subtree total shrinks "
+        "and a busy tree reads flat -> `frozen` (the invariant `_sum_subtree` states and "
+        "the `ps` path honours; `_proc_cpu_cs` used to violate it)",
     ),
     Mutation(
         "T51", "module",

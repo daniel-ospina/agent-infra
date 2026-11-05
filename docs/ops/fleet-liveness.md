@@ -429,9 +429,9 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**52 tests with 92 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**53 tests with 93 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
-> suite is **T32–T52**. The ids are
+> suite is **T32–T53**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
 > #1777 block, so definition order is not label order) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
@@ -811,8 +811,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 52 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (92)
+python3 tools/fleet/liveness.test.py               # 53 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (93)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -1867,7 +1867,11 @@ liveness.py --log-census  < pid\tlog\tsize_delta\tcpu_delta_cs\tverdict\talive\t
 `--start-seconds` is the process's start **epoch** (the same field the store's `pidStartSeconds`
 carries), and it is not optional in practice: the identity probe is the FENCED `probe` subcommand, so
 without a start time every live lane reads `unknown/process-identity-unreadable` (rc 3) rather than a
-presence-only guess. `--no-sample` skips the 30 s second reading (deltas then stay `None`, so a fresh
+presence-only guess. **Pass the pid `lane-bound.sh` ITSELF supervised when you have it** (§13.4): in
+`run` mode that is the child it supervised, in `watch` mode the `--pid` you gave it — not necessarily
+the tree root a caller asks about. Passing anything else does not produce a false answer, it makes the
+binding over-refuse (`no-verdict`), which is the only acceptable direction for this state.
+`--no-sample` skips the 30 s second reading (deltas then stay `None`, so a fresh
 call abstains instead of claiming a state), and `--window-ms` below 1 is REFUSED: a zero-length window
 collapses both readings into one instant, making both signals trivially flat, so a live working lane
 would read `frozen`.
@@ -1917,11 +1921,11 @@ so it never is.
 ⛔ **A CENSUS `rc=na` ROW IS `unknown`, NOT `finished`.** The census carries no launcher line, so it has
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (52 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (92 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (53 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (93 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
-`--log-census` decoder); T43–T52 are the 2026-11-04 binding / corroboration / abstention rounds. Their paired mutations re-introduce the exact pre-fix behaviours — the
+`--log-census` decoder); T43–T53 are the 2026-11-04 binding / corroboration / abstention rounds. Their paired mutations re-introduce the exact pre-fix behaviours — the
 dropped progress veto, the exited process falling into the freeze ladder, the missing window, the
 absent log as a death witness, the log axis masking a session query, every bound verdict reading
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped

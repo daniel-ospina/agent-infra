@@ -30,7 +30,9 @@ log-lane axis publishes, from the same ``evaluate``:
 
 Its progress contract is COPIED from ``scripts/orchestrator-harness/lane-bound.sh``
 (two independent signals — subtree CPU delta and output growth — and only BOTH
-flat for the full window is a freeze), and its terminal states come from the
+flat is a freeze: the log silent for the freeze window and the CPU delta flat over
+the sample window, durations that differ on purpose — §13.3), and its terminal
+states come from the
 verdict line that supervisor ALREADY writes. It is an evidence field of
 ``evaluate``, never a second classifier: inert when ``log_read is None``, and a
 ``log_read`` supplied on a session query is refused by name.
@@ -302,14 +304,21 @@ LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown")
 # over. `LANE_REAP_WINDOW` default 30 s (scripts/orchestrator-harness/lane-reap.sh),
 # the fleet's existing two-sample span.
 LOG_WINDOW_MS = 30_000
-# The freeze window: how long EVERY signal must have been flat before a LIVE tree
-# is called ``frozen``. 45 min = 2700 s is the fleet's ALREADY DECLARED no-progress
-# allowance, copied rather than invented: it is ``lane-bound.sh``'s ``--idle``
-# default (``LANE_BOUND_IDLE_S``, scripts/orchestrator-harness/lane-bound.sh) and
+# The freeze window: how long the LOG's bytes must have been flat before a LIVE
+# tree is called ``frozen``. ⛔ IT IS THE LOG'S WINDOW ONLY — the CPU and transcript
+# signals are sampled over ``LOG_WINDOW_MS``, so ``frozen`` means "no OUTPUT for the
+# freeze window AND no CPU in the sample window", never "no CPU for the freeze
+# window". The ``LOG_STATES`` entry above and §13.3 state that asymmetry and its
+# consequence, which is why ``frozen`` is not a licence to kill.
+# 45 min = 2700 s is the fleet's ALREADY DECLARED no-progress allowance, copied
+# rather than invented: it is ``lane-bound.sh``'s ``--idle`` default
+# (``LANE_BOUND_IDLE_S``, scripts/orchestrator-harness/lane-bound.sh) and
 # ``DEFAULT_PROGRESS_AGE_MS`` = 2_700_000 ms
 # (extensions/shared/heartbeat-progress-edges.ts, the builtin-tools ``no-progress``
-# clause #5195). ``frozen`` asks the SAME question ``--idle`` answers — "no progress
-# on any signal" — so it takes that bound and no second, unreviewed one.
+# clause #5195). ⛔ ``frozen`` BORROWS `--idle`'s DURATION, NOT ITS MEASUREMENT:
+# `--idle` resets its clock on EITHER signal, so the two instruments CAN disagree
+# and this is NOT "the same question" (§13.3). The duration is taken because the
+# fleet already declared that allowance — not because the two agree.
 # ⛔ IT IS **NOT** ``LANE_REAP_LIVE_MIN``, and an earlier revision of this comment
 # said it was. That constant is 125 min since agent-infra#2888, because it is an
 # MTIME-ONLY window and must sit ABOVE the wall backstop so a live lane inside one
@@ -1375,10 +1384,12 @@ def parse_bound_pid(text: str):
     if not pids:
         # The line names NO pid at all — the one shape that is adopted-and-declared.
         return ""
-    # A pid token is capped at 10 digits DEFENSIVELY, not because `PID_MAX_DEFAULT` (4194304)
-    # is 7 digits long. The cap exists so `int()` below never sees a 4300-digit token and
-    # raises "Exceeds the limit" — an exception is not a state. Any token longer than the cap
-    # is NOT a pid.
+    # A real pid is <= 7 digits (PID_MAX_DEFAULT 4194304), but the allow-list here is
+    # SLACK at 10 so that an over-long token can never reach `int()` — `int()` on a huge
+    # token raises "Exceeds the limit (4300 digits)", which is an exception and not a
+    # state. The same 10-digit bound is used by `parse_runner_line`, `_bind_verdict` and
+    # the census's `_pidtok`; a token that passes here but is not a live pid is dropped by
+    # `_pid_within`, so the slack is never adopted.
     # `"?"` marks "present but unusable", which the binding DROPS; `""` means "the line
     # names no incarnation", which is ADOPTED and declared. The allow-list applies to the
     # TOKEN, never to the locator, or every unusable form above would read as "absent".
@@ -2524,17 +2535,24 @@ def _proc_cpu_cs(root: str = "/proc") -> Optional[Dict[int, Tuple[int, Optional[
             continue
         try:
             raw = open(os.path.join(root, name, "stat"), "rb").read().decode("utf-8", "replace")
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            # The pid VANISHED between `listdir` and the read: it is genuinely GONE, so it
+            # is absent from the tree — the same fact the `ps` path gets when a row is
+            # simply not there. (A child that exits mid-window loses its accumulated CPU
+            # on both paths; that race is inherent to sampling, not a shrink we created.)
             continue
+        except (OSError, ValueError):
+            # ⛔ PRESENT BUT UNREADABLE IS NOT ABSENT. `_sum_subtree` promises ``None`` when
+            # ANY member is unread, and the `ps` path returns ``None`` for a malformed row
+            # for exactly this reason: dropping the row makes the total SMALLER, and a
+            # smaller total is how a busy tree reads FLAT → ``frozen`` — the false
+            # negative this axis exists to remove. Abstain for the whole read instead.
+            return None
         # `comm` may contain spaces and parentheses: split on the LAST ')'
         close = raw.rfind(")")
         if close < 0:
-            # ⛔ A ROW WITH NO `)` IS MALFORMED, NOT VANISHED (review P2, same rule as the
-            # parse arm below). `open()` succeeded, so the pid still existed when it was
-            # read; the content simply is not a `stat` line. Skipping it drops its CPU from
-            # the total — a SMALLER total, which reads as flat and then `frozen`. A process
-            # that truly vanished is the `OSError` arm above, which is the only arm here
-            # that is allowed to `continue`.
+            # A stat line with no `)` cannot be parsed and cannot be attributed to a
+            # subtree — the same abstention as an unreadable row, never a silent skip.
             return None
         rest = raw[close + 2:].split()
         # rest[0] = state (field 3), so field N is rest[N-3]
