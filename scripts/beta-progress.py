@@ -265,9 +265,16 @@ REST_BUDGET_S = 30
 # honest claim is: **the clock FIRES whenever at least 60 s remain**, which is the band's middle and
 # up — and below that the tick can still be killed with no line, because a bound cannot fire before
 # the kill that precedes it. What the constant must NOT do is exceed the band's TOP, where it would
-# be inert in every case (that was the 100 s draft). It is ~5-6x the MEASURED phase on this box (the
-# six reads took 0.7-3.3 s each, ~8-12 s end to end, against ~4 s for the REST arm); and it is
-# exactly 2x `REST_BUDGET_S`, so the REST arm fits inside it rather than being clipped by it.
+# be inert in every case (that was the 100 s draft).
+# ⛔ AND ITS MARGIN OVER THE MEASURED PHASE IS ~3.5x, NOT THE 5-6x THIS SAID FIRST (#3457 review
+# round 16). The retracted figures ("0.7-3.3 s each, ~8-12 s end to end") came from ONE quiet run.
+# RE-MEASURED at this head on the box this ships from, the same six reads took **17.4 s end to end
+# with per-read 1.2-7.0 s** -- two of the six ABOVE the 3.3 s ceiling the old sentence stated -- so
+# 60 s is a real bound on a quiet box and a LOAD-BOUNDED one on a busy box. It is still the right
+# size (under the band's 90 s top, exactly 2x `REST_BUDGET_S` so the REST arm fits inside it, and a
+# late fire degrades to `unavailable` -- a line -- rather than to a killed tick, which prints
+# nothing), but a margin argued from a single quiet measurement is how an INERT constant gets
+# defended, so the spread is stated as measured instead of as its best case.
 # ⛔ THE RESIDUAL, STATED RATHER THAN BOUNDED AWAY: `objective.py` measures 63 s for ONE `gh` read at
 # 13 lanes, and SIX such reads (378 s) cannot fit this step's slack in ANY implementation — that is a
 # pre-existing property of the heartbeat, not something this constant can fix. What the clock buys is
@@ -774,9 +781,19 @@ def _compute():
     #     is numbered in the SAME sequence as tortoise and its newest PR is in the #34xx range, so
     #     the LOW end of the open tortoise backlog (#2281, #2513) is ALREADY inside it -- an
     #     agent-infra PR on its own issue #2513 collides TODAY. Every tracker unit numbered ABOVE
-    #     agent-infra's counter becomes a scheduled collision as that counter passes it, and the
-    #     open backlog is ~34 units (17 P0 + 17 P1, re-measured 2026-11-05 after this block was
-    #     first written with a stale 14/17 split), almost all of them above it.
+    #     agent-infra's counter becomes a scheduled collision as that counter passes it, and ALL BUT
+    #     TWO open units are above it (the count that stood here is retracted below).
+    #     ⛔ THE COUNT THIS BLOCK CARRIED WAS WRONG WHEN IT WAS WRITTEN, and how it was wrong is the
+    #     reason it is retracted rather than corrected in place: it read "~34 units (17 P0 + 17 P1,
+    #     re-measured 2026-11-05 after this block was first written with a stale 14/17 split)".
+    #     Re-measured with `gh issue list --label … --state open`: the P0 half was right and the P1
+    #     half was not -- **17 P0 + 26 P1 = 43 open units**, and all 26 open P1s were created before
+    #     16:06Z that day, i.e. BEFORE this line was authored at 20:31Z. So the "re-measurement"
+    #     that replaced a stale split was itself stale, and 41 of the 43 sit above agent-infra's
+    #     #3493; the two that do not are #2281 and #2513, which is the point of the sentence.
+    #     ⛔ AND IT IS NOT CHECKABLE WITH `--state all`: that read truncates at `--limit` (a
+    #     300-row read of this label reported 24 where the OPEN read reports 26), which is the
+    #     "a measurement artifact is not a state" failure -- count from `--state open` only.
     #     ⛔ NO EXPLICIT LIST OF NUMBERS HERE, DELIBERATELY: an earlier draft enumerated eight of
     #     them and got the surface wrong in three ways (four were `P0-blocker` rather than
     #     `P1-severe`, ten open P1s above the range were missing, and the "newest PR" it pinned was
@@ -788,10 +805,10 @@ def _compute():
     #   * ⛔ AND A "SELF-REFERENCE" FILTER WAS TRIED, MEASURED, AND REMOVED. The idea was to ignore a
     #     fix-repo row whose bare `#N` equals the ROW'S OWN number (agent-infra#2513's
     #     `fix/2513-pool-filter` citing agent-infra#2513, not tortoise#2513). Measured against the
-    #     live windows (2026-11-05, agent-infra open 47 + merged 400 = 447 rows; 34 open tracker
-    #     P0/P1 -- 17 + 17, re-measured, NOT the 31 of the stale 14/17 split this block first
-    #     carried): only 2 of 447 rows carry their own number at all, and **0 of the 7 rows that
-    #     actually collide with an open tracker unit are self-references** — every one of them cites
+    #     live windows (2026-11-05, agent-infra open 47 + merged 400 = 447 rows; **43** open tracker
+    #     P0/P1 -- 17 P0 + 26 P1, see the count retraction above, NOT the 31 or the 34 this block
+    #     carried earlier): only 2 of 447 rows carry their own number at all, and **0 of the 7 rows
+    #     that actually collide with an open tracker unit are self-references** — each of them cites
     #     the tracker BARE (`fix/10114-pin-tree-is-a-holder`, `fix/10951-pool-filter`, `p0-10114`,
     #     `ai-10114`, `batch(#3309 #10114 …)`), which is the same fact that rules out the qualified
     #     match. So the filter closed nothing measurable while SUPPRESSING a real cover whenever a

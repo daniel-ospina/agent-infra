@@ -1931,3 +1931,69 @@ def test_the_rest_read_refuses_a_falsy_repo_instead_of_substituting_the_tracker(
     # `None` is the documented tracker default and still works.
     assert bp._rest_prs("open", limit=100, deadline=bp.time.monotonic() + 5, repo=None) == []
     assert "/repos/%s/pulls" % bp.REPO in urls[0]
+
+
+# ── the `merged_today` day boundary: `>=`, and the suite was blind to it ──────
+def test_merged_today_counts_a_pr_merged_at_exactly_midnight_utc(monkeypatch):
+    """⛔ THE DAY BOUNDARY IS `>=`, AND THE WHOLE SUITE WAS BLIND TO IT (#3457 review round 16).
+
+    MEASURED defect this pins: flipping `>=` to `>` in `_compute()`'s
+    `merged_today = sum(1 for p in merged if (p.get("mergedAt") or "") >= today)` left **42/42
+    GREEN**, because every "merged today" fixture is either `MERGED_TODAY =
+    "2999-01-01T00:00:00Z"` or `LONG_AGO = 2020…` — both far from the boundary — so not one
+    assertion in this file could tell the two operators apart. `>` drops a PR merged AT midnight
+    UTC out of the headline count with no refusal: a silently SHORT `merged_today`, the direction
+    this file says it must never fail in.
+
+    Both directions are pinned (the midnight row must COUNT, the row one second earlier must
+    NOT), and the calendar is FROZEN rather than read: `MERGED_TODAY`'s own comment exists so a
+    midnight-straddling run cannot flake, and a boundary test that read the live clock would red
+    for the clock instead of for the code.
+    """
+    import datetime
+    import time as _time
+
+    class _Frozen:                      # a closure over `_time`, NOT a module-level class
+        """`bp.time` with a PINNED calendar, delegating the stopwatch to the real module.
+
+        Only `gmtime`/`strftime` are frozen — the day boundary is the only thing under test.
+        `monotonic()` must stay REAL, or the phase clock becomes unreachable and the test would
+        be pinning a different program from the one that ships.
+        """
+
+        def __init__(self, instant):
+            self._instant = instant
+
+        def gmtime(self, *_a):
+            return self._instant
+
+        def strftime(self, fmt, tm):
+            return _time.strftime(fmt, tm)
+
+        def __getattr__(self, name):
+            return getattr(_time, name)
+
+    instant = _time.gmtime(1_790_000_000)
+    day = datetime.datetime(instant.tm_year, instant.tm_mon, instant.tm_mday,
+                            tzinfo=datetime.timezone.utc)
+    at_midnight = day.strftime("%Y-%m-%dT00:00:00Z")        # == the module's own `today`
+    one_second_before = (day - datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def fake_gh(*args):
+        if args[:2] != ("pr", "list"):
+            return []
+        if "--state" in args and args[args.index("--state") + 1] == "merged":
+            return [pr(1, merged=at_midnight), pr(2, merged=one_second_before)]
+        return []
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(bp, "time", _Frozen(instant))
+
+    out = bp.compute()
+    assert out is not None
+    assert out["merged_today"] == 1, (
+        "a PR merged at exactly today's 00:00:00Z must COUNT (`>=`) and one merged one second "
+        "earlier must NOT — got %r, so the boundary is wrong in one direction: `>` drops the "
+        "midnight row (a silently SHORT count) and anything looser counts yesterday"
+        % (out["merged_today"],))
