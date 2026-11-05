@@ -10173,7 +10173,9 @@ function _expandMarkerToken(token, home) {
 //     kept only the token that OPENED the backtick, which left `` `git `` visible
 //     and masked `reset --hard` — a local invocation hidden by the mask; #3478
 //     review P0.) A single-quoted spelling does not run locally and is masked
-//     with the rest of the payload;
+//     with the rest of the payload. An UNQUOTED `$(`/`((` is a top-level
+//     separator for this scanner, so it ENDS the mask and the remainder is gated
+//     exactly as before the fix (fail-closed, documented rather than modelled);
 //   • a heredoc BODY is masked with the payload it belongs to (`sh -s <<'EOF'`
 //     is how a lane ships a script to a cell) while its TERMINATOR line is kept —
 //     it is structure, and masking it makes the next local command read as body
@@ -10183,7 +10185,11 @@ function _expandMarkerToken(token, home) {
 //   • a shape this scan cannot PROVE is left unmasked (today's gating): a
 //     non-bare or quoted transport word, a transport name redefined earlier
 //     (`ssh() { … }`, `alias`, `eval`/`source`/`.`), a wrapper head (`sudo`,
-//     `env`), and two heredocs on one command line.
+//     `env`), a scan that ends INSIDE a quote, and two heredocs on one command
+//     line;
+//   • a payload piped INTO a local shell (`cmux vm exec … | bash -s`) is left
+//     unmasked: the pipe is built here and the remote stdout runs as a local
+//     script, which is exactly the case the #709 arm refuses.
 // ─────────────────────────────────────────────────────────────────────────
 
 /** ssh(1) options whose VALUE is the next word (`-p 22`, `-o K=V`, `-i key`). */
@@ -10203,10 +10209,25 @@ const _RB_REDIRECT_RE = /^(?:\d*(?:>>|>&|>\||<<<|<<-?|<&|<|>)|&>>|&>)/;
 export const REMOTE_PAYLOAD_PLACEHOLDER = "_remote_payload_";
 
 /** #3444 — quote-aware word/operator tokens carrying their SOURCE offsets, so a
- *  caller can mask ranges without re-spelling the text it keeps. */
+ *  caller can mask ranges without re-spelling the text it keeps.
+ *
+ *  Two shapes here are not cosmetic, because the mask must never disagree with
+ *  what the SHELL will run (review #3478 cycle 2, both measured fail-opens):
+ *   • a `#` at the START of a word begins a comment, and the shell discards the
+ *     rest of that LINE — including any quote character in it. Quote-scanning a
+ *     comment let `# don't` open a quote region that swallowed the newline, so
+ *     the NEXT (genuinely local) line was masked away;
+ *   • `$'…'` is ANSI-C quoting, where `\'` is an ESCAPE and does not close the
+ *     string. Reading it as a plain `'…'` closed the region early, re-opened
+ *     another, and again swallowed the newline.
+ *  `unterminated` reports a word scan that ended INSIDE a quote. A valid command
+ *  cannot do that except inside a comment, so the caller leaves the command
+ *  unmasked (fail-closed) rather than trust its own reading of it.
+ *  @returns {{tokens: Array<{start:number,end:number,text:string,op:boolean,redirect?:boolean,localSubst?:boolean}>, unterminated: boolean}} */
 function _rbTokens(s) {
   const out = [];
   let i = 0;
+  let unterminated = false;
   const n = s.length;
   while (i < n) {
     const ch = s[i];
@@ -10228,12 +10249,30 @@ function _rbTokens(s) {
         continue;
       }
     }
+    // A `#` that STARTS a word is a comment to end-of-line. It is one opaque
+    // token and is NOT quote-scanned: its text is discarded by the shell, so a
+    // quote inside it must not change how the next line is read.
+    if (ch === "#") {
+      const nl = s.indexOf("\n", i);
+      const end = nl < 0 ? n : nl;
+      out.push({ start: i, end, text: s.slice(i, end), op: false, comment: true });
+      i = end;
+      continue;
+    }
     const start = i;
     let text = "";
-    let quote = null;
+    let quote = null;   // null | "'" | '"' | "$'"
     let localSubst = false;
     while (i < n) {
       const c = s[i];
+      // ANSI-C: `\x` is an escape, so `$'don\'t'` is ONE region.
+      if (quote === "$'") {
+        text += c;
+        if (c === "\\" && i + 1 < n) { text += s[i + 1]; i += 2; continue; }
+        if (c === "'") quote = null;
+        i++;
+        continue;
+      }
       if (quote === "'") { text += c; if (c === "'") quote = null; i++; continue; }
       if (quote === '"') {
         // An unescaped backtick inside DOUBLE quotes still runs in the LOCAL
@@ -10248,6 +10287,7 @@ function _rbTokens(s) {
         continue;
       }
       if (c === "\\") { text += c + (s[i + 1] ?? ""); i += 2; continue; }
+      if (c === "$" && s[i + 1] === "'") { quote = "$'"; text += "$'"; i += 2; continue; }
       if (c === "'" || c === '"') { quote = c; text += c; i++; continue; }
       // #3444 review (#3478 P0): an UNQUOTED backtick region is ONE word. Taking
       // only the opening token let the region's remaining words fall into the
@@ -10259,9 +10299,10 @@ function _rbTokens(s) {
       text += c;
       i++;
     }
+    if (quote !== null) unterminated = true;
     out.push({ start, end: i, text, op: false, localSubst });
   }
-  return out;
+  return { tokens: out, unterminated };
 }
 
 /** The first index AFTER the backtick region opening at `from` (a lone opening
@@ -10408,7 +10449,11 @@ function _rbRemotePayloadStart(tokens, source) {
 export function maskRemoteExecPayloads(command) {
   const s = String(command ?? "");
   if (!s) return s;
-  const tokens = _rbTokens(s);
+  const { tokens, unterminated } = _rbTokens(s);
+  // A word scan that ended INSIDE a quote means this masker did not understand
+  // the command (in valid bash that only happens inside a comment). Leave it
+  // alone: today's gating is the safe reading.
+  if (unterminated) return s;
   const start = _rbRemotePayloadStart(tokens, s);
   if (start === null) return s;
   // ⛔ TWO heredocs on one command line make the body ORDER depend on source
@@ -10503,5 +10548,36 @@ export function maskRemoteExecPayloads(command) {
     k++;
   }
   if (!masking && last < s.length) out += s.slice(last);
+  // ⛔ A pipe that FEEDS A LOCAL SHELL is the #709 arm's case: `cmux vm exec … --
+  // printf '…' | bash -s` builds the pipe in THIS shell and runs the remote
+  // stdout as a local script. Masking the seed left the arm with nothing to
+  // inspect, so a piped payload that was refused became allowed (review #3478
+  // cycle 2, P1). Return the command UNMASKED — the pre-fix refusal stands.
+  if (out !== s && _rbFeedsLocalShell(out)) return s;
   return out;
+}
+
+/** Does `text` pipe a masked placeholder INTO an interpreter (or hand it to one
+ *  as a script operand)? Those are the shapes where the payload would be executed
+ *  by THIS shell, so the mask must not hide it.
+ *  Scoped to ONE simple command (`;`/`&&`/`||`/newline split), so an unrelated
+ *  local `… | bash` in another command does not disable the mask. */
+function _rbFeedsLocalShell(text) {
+  const ph = REMOTE_PAYLOAD_PLACEHOLDER;
+  const WRAPPERS = new Set(["env", "exec", "sudo", "command", "nice", "nohup", "time", "stdbuf", "xargs"]);
+  const isShell = (w) => /^(?:\S*\/)?(?:ba|z|k|da|a)?sh$/.test(w);
+  for (const cmd of text.split(/;|&&|\|\||\n/)) {
+    if (!cmd.includes(ph)) continue;
+    const stages = cmd.split("|");
+    for (let idx = 1; idx < stages.length; idx++) {
+      if (!stages.slice(0, idx).some((st) => st.includes(ph))) continue;
+      const words = stages[idx].trim().split(/\s+/).filter(Boolean);
+      let j = 0;
+      // Skip redirections / leading assignments / `!` before the command word.
+      while (j < words.length && (/^[A-Za-z_][A-Za-z0-9_]*=/.test(words[j]) || /^\d*[<>]/.test(words[j]) || words[j] === "!")) j++;
+      if (j >= words.length) continue;
+      if (WRAPPERS.has(words[j]) || isShell(words[j])) return true;
+    }
+  }
+  return false;
 }

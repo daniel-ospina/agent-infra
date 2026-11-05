@@ -317,6 +317,70 @@ for (const c of TRAILING) {
   expect("A15: two heredocs on one line → NOT masked (fail-closed)", mask(c), c);
 }
 
+// A16 (#3478 review cycle 2 P0): a `#` at the START of a word begins a COMMENT,
+// and the shell discards the rest of the LINE — quote characters included. The
+// tokenizer quote-scanned comments, so `# don't` opened a region that swallowed
+// the newline and the NEXT, genuinely LOCAL, line was masked away.
+for (const c of [
+  `cmux vm exec cell-a -- ls # it's fine\ngit reset --hard`,
+  `cmux vm exec cell-a -- ls # don't\n echo x >> a.txt`,
+  `ssh cell-a ls # it's\ngit worktree add rev-9`,
+  `cmux vm exec cell-a -- ls # say "hi\ngit reset --hard`,
+]) {
+  expectTrue(`A16: a quote inside a COMMENT does not swallow the next local line — ${JSON.stringify(c)}`,
+    mask(c).includes(c.slice(c.indexOf("\n") + 1)), JSON.stringify(mask(c)));
+}
+// …and a `#` that does NOT start a word is still an ordinary character.
+expect("A16b: `ls#x` is not a comment (the word stays payload)", hasGitWord(mask(`cmux vm exec cell-a -- ls#git`)), false);
+
+// A17 (#3478 review cycle 2 P0): `$'…'` is ANSI-C quoting, where `\'` ESCAPES and
+// does not close the region. Read as plain quoting it closed early, re-opened, and
+// again ate the newline — masking a local line.
+{
+  const c = `cmux vm exec cell-a -- echo $'don\\'t'\ngit reset --hard`;
+  expectTrue("A17: `$'don\\'t'` does not swallow the next local line",
+    mask(c).includes("git reset --hard"), JSON.stringify(mask(c)));
+}
+
+// A18 (#3478 review cycle 2 P1): a pipe that FEEDS A LOCAL SHELL runs the remote
+// stdout as a local script (#709's case). Masking the seed left that arm with
+// nothing to inspect, so a refused piped payload became allowed — leave the
+// command UNMASKED and let the pre-fix refusal stand.
+for (const c of [
+  `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | bash -s`,
+  `cmux vm exec cell-a -- printf 'x' | sh`,
+  `cmux vm exec cell-a -- printf 'x' | /bin/bash -s`,
+  `cmux vm exec cell-a -- printf 'x' | cat | bash -s`,
+  `cmux vm exec cell-a -- printf 'x' | env FOO=1 bash`,
+]) {
+  expectTrue(`A18: a payload piped into a LOCAL shell is NOT masked — ${JSON.stringify(c)}`,
+    hasGitWord(mask(c)) || mask(c).includes("printf"), JSON.stringify(mask(c)));
+}
+// …while a pipe whose target is NOT an interpreter is still masked (the pipe
+// itself is local, so its target stays visible and gated).
+expectTrue("A18b: a payload piped into a non-shell is still masked",
+  mask(`cmux vm exec cell-a -- x | grep y`).includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(mask(`cmux vm exec cell-a -- x | grep y`)));
+expectTrue("A18c: an unrelated local `… | bash` in another command does not disable the mask",
+  mask(`cmux vm exec cell-a -- x ; git log | bash`).includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(mask(`cmux vm exec cell-a -- x ; git log | bash`)));
+
+// A19 (#3478 review cycle 2 P2): `$(` is a top-level separator for this scanner,
+// so an UNQUOTED substitution ENDS the mask (fail-closed: the remainder is gated
+// exactly as today). Pinned so the documented behaviour and the code agree.
+{
+  const c = `cmux vm exec cell-a -- echo $((1+2)) git reset --hard`;
+  expectTrue("A19: an unquoted `$(` ends the mask (the remainder stays GATED)",
+    mask(c).includes("git reset --hard"), JSON.stringify(mask(c)));
+}
+
+// A20: an UNTERMINATED quote is a command this scanner does not understand — in
+// valid bash that only happens inside a comment — so the command is left
+// unmasked (fail-closed) rather than masked on a misreading.
+{
+  const c = "cmux vm exec cell-a -- sh -c 'unterminated";
+  expect("A20: an unterminated quote leaves the command UNMASKED", mask(c), c);
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────
 // Part B — BEHAVIORAL: the real index.ts handler against a hermetic hub
 // ─────────────────────────────────────────────────────────────────────────
@@ -503,6 +567,20 @@ if (typeof stripTypeScriptTypes !== "function" ||
     expectTrue("B15: a trailing newline does not throw in the handler", b15threw === null, b15threw ?? "");
     expectTrue("B15: …and the remote command is ALLOWED", !blocked(b15), `blocked: ${reasonOf(b15).split("\n")[0]}`);
 
+    // B16 (#3478 review cycle 2 P1): a payload piped into a LOCAL shell is
+    // executed HERE (#709). The mask must not hide the seed from that arm.
+    const b16 = await real.bash(`printf 'git checkout -- a.txt' | bash -s`);
+    expectTrue("B16 control: a local `… | bash -s` payload is REFUSED", blocked(b16), "allowed — the control itself is broken");
+    const b16r = await real.bash(`cmux vm exec cell-a -- printf 'git checkout -- a.txt' | bash -s`);
+    expectTrue("B16: …and the SAME payload behind a remote exec is still REFUSED", blocked(b16r),
+      "allowed — the local pipe into a shell was masked away");
+
+    // B17 (#3478 review cycle 2 P0): a quote inside a `#` comment must not mask
+    // the next LOCAL line.
+    const b17 = await real.bash("cmux vm exec cell-a -- ls # it's fine\ngit reset --hard");
+    expectTrue("B17: a COMMENT with a quote does not hide the next local line", blocked(b17),
+      "allowed — the comment swallowed the newline and the local line with it");
+
     // ── Part C — mutation evidence ──────────────────────────────────────
     if (process.argv.includes("--mutations")) {
       console.log("\n── Part M: mutation evidence (#3444) ──");
@@ -585,6 +663,52 @@ if (typeof stripTypeScriptTypes !== "function" ||
           ),
           maskProbe: "cmux vm exec cell-a -- `git reset --hard`",
           check: (out) => !String(out).includes("git reset --hard"),
+        },
+        {
+          // #3478 review cycle 2 P0: a `#` comment is discarded by the shell, so
+          // its text must not be quote-scanned. TWO protections implement that (the
+          // comment branch, and the unterminated-quote bail that catches a stray
+          // quote), so the mutant removes BOTH — the reverted world is the one that
+          // shipped in cycle 1, where the quote inside the comment swallowed the
+          // newline. A16 (mask) and B17 (handler) must go RED.
+          label: "comment text quote-scanned",
+          kind: "mask",
+          revert: (src) => src
+            .replace("    if (ch === \"#\") {", "    if (false) {")
+            .replace("  if (unterminated) return s;", "  // MUTANT: no unterminated bail"),
+          maskProbe: "cmux vm exec cell-a -- ls # it's fine\ngit reset --hard",
+          check: (out) => !String(out).includes("git reset --hard"),
+        },
+        {
+          // #3478 review cycle 2 P0: `$'…'` is ANSI-C quoting, where `\'` is an
+          // ESCAPE. Without that mode the region closes early and re-opens, eating
+          // the newline. TWO protections cover it (the mode, and the
+          // unterminated-quote bail that catches the odd-quote fall-out), so the
+          // mutant removes both — the reverted world is what shipped in cycle 1.
+          // A17 must go RED.
+          label: "ANSI-C quote read as plain quote",
+          kind: "mask",
+          revert: (src) => src
+            .replace(
+              "      if (c === \"$\" && s[i + 1] === \"'\") { quote = \"$'\"; text += \"$'\"; i += 2; continue; }",
+              "      // MUTANT: no ANSI-C mode",
+            )
+            .replace("  if (unterminated) return s;", "  // MUTANT: no unterminated bail"),
+          maskProbe: "cmux vm exec cell-a -- echo $'don\\'t'\ngit reset --hard",
+          check: (out) => !String(out).includes("git reset --hard"),
+        },
+        {
+          // #3478 review cycle 2 P1: a payload piped INTO a local shell is executed
+          // here (#709). Without the bail the seed is masked and the arm is blind —
+          // A18 and B16 must go RED.
+          label: "piped payload masked (local shell blinded)",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "  if (out !== s && _rbFeedsLocalShell(out)) return s;",
+            "  // MUTANT: no local-shell pipe bail",
+          ),
+          maskProbe: `cmux vm exec cell-a -- printf 'git checkout -- a.txt' | bash -s`,
+          check: (out) => !String(out).includes("git checkout"),
         },
       ];
 

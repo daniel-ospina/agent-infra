@@ -1381,10 +1381,11 @@ cannot be mistaken for a local one.
 recognises three boundaries — `cmux vm exec … <vm> -- <payload>`, `ssh [opts]
 <host> [payload]`, `docker exec [opts] <container> [payload]` — and replaces the
 payload with one inert word (`_remote_payload_`) before ANY local gate sees the
-command. `index.ts` applies it once per bash call and threads the masked string
-through M4/M5, the #1919 worktree gate, the #1484/#627 backdoor, the tracked
-write gate, the degradation classifier and the full M3/M2/#1144 decision. A
-command with no boundary is returned **byte-for-byte unchanged**, so no local
+command. `index.ts` applies it at BOTH bash gate call sites (the main gate and the
+M5 path) and threads the masked string through M4/M5, the #1919 worktree gate, the
+#1484/#627 backdoor, the tracked write gate, the degradation classifier and the
+full M3/M2/#1144 decision; the audit RECORD deliberately keeps the raw command.
+A command with no boundary is returned **byte-for-byte unchanged**, so no local
 guard is relaxed by a byte unless a boundary is really present.
 
 **What stays exactly as strict (the safety half — each has a pinned case):**
@@ -1397,9 +1398,20 @@ guard is relaxed by a byte unless a boundary is really present.
   redirect in the OPERAND position (`ssh cell-a > a.txt` truncates a local file
   and hands ssh no command at all), so such a form is not a boundary;
 - a substitution that RUNS LOCALLY: an unquoted or double-quoted backtick region
-  is ONE local token (the whole region is kept, not just the opening one), an
-  unquoted or double-quoted `$(…)` is kept with its token, and a single-quoted
+  is ONE local token (the whole region is kept, not just the opening one), a
+  DOUBLE-quoted `$(…)` is kept with the token that holds it, and a single-quoted
   spelling is masked with the rest of the payload because it runs remotely;
+- a COMMENT's text, which the shell discards: a `#` at the start of a word is
+  scanned to end-of-line WITHOUT quote handling, because a quote inside a comment
+  used to open a region that swallowed the newline and masked the next, genuinely
+  local, line. The same class covers ANSI-C quoting (`$'…'`, where `\'` escapes),
+  and a scan that ends inside a quote leaves the whole command UNMASKED;
+- a payload piped INTO a local shell (`cmux vm exec … | bash -s`), because the
+  pipe is built here and the remote stdout is executed as a local script: the
+  command is left unmasked so the #709 arm still refuses it;
+- an UNQUOTED `$(` or `((`, which ends the mask like any other top-level
+  separator — the remainder is then gated exactly as before the fix (fail-closed;
+  a remote command with an unquoted substitution still sees today's refusals);
 - a heredoc's TERMINATOR line, which is structure rather than payload: masking it
   fused the delimiter onto the terminator (`<<'EOS'EOS`), no downstream parser
   could close the heredoc, and the next LOCAL command read as body data — a
@@ -1423,9 +1435,11 @@ to a shell whose text is visible. Encoded payloads are covered on the mask side:
 opaque content is masked with the rest of the payload either way.
 
 **Tests.** `test-remote-context.mjs` (below) pins both directions for each case
-and carries four mutants that MUST redden it: the pre-fix identity mask, an
-over-reaching mask that ignores separators, the swallowed heredoc terminator, and
-a mask that keeps only the opening token of an unquoted backtick region.
+and carries SEVEN mutants that MUST redden it: the pre-fix identity mask, an
+over-reaching mask that ignores separators, the swallowed heredoc terminator, a
+mask that keeps only the opening token of an unquoted backtick region, a
+quote-scanned comment, an ANSI-C quote read as a plain quote, and a piped payload
+that blinds the local-shell arm.
 
 **Known cosmetic residual.** The placeholder `_remote_payload_` is an ordinary
 word, so the tracked-write probe may `git ls-files` it (one stderr line, benign).
