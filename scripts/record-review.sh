@@ -89,10 +89,10 @@
 # record-review.sh --recover-body <pr> [owner/repo]
 #   REBUILD a MISSING record from the PR body's own SIGNED marker (#2872).
 #   That marker is signed only when key and openssl both work (HMAC-SHA256 over
-#   the text, $AI_REVIEW_GATE_KEY, #2055; else UNSIGNED, :4827-4833). It is the
-#   only copy of the verdict that TRAVELS with the PR — records are per-box — so
-#   a review minted on a cell leaves the rail saying NO-RECORD while the
-#   proof sits in the body, verifiable with a key this box already holds.
+#   the text, $AI_REVIEW_GATE_KEY, #2055; else UNSIGNED, :4827-4833). It reaches
+#   CI in TWO copies that travel with the PR — the body, and the admitted comment
+#   this recorder also posts (:1224) — while the per-box record does not, so a
+#   review minted on a cell leaves the rail at NO-RECORD while the proof travels.
 #   Measured 2026-10-26: of 45 open PRs, 12 had a marker whose `diff=` equals the
 #   PR's live diff and no record file here; the registry covered 2 of them.
 #   It verifies the HMAC before minting (a body is attacker-writable, so a
@@ -1079,8 +1079,8 @@ record_identity() { # <record-file> -> the record with its volatile fields remov
 }
 
 # ── BODY-MARKER DURABILITY (defect A) ─────────────────────────────────────
-# The signed body marker is the ONLY evidence channel CI can read (the per-box
-# record file is local). So a record whose marker could not be POSTed is a
+# A signed marker is what CI can read — in the PR body, or in an admitted PR
+# COMMENT (records are per-box), so a record whose marker reached NEITHER is a
 # record nobody can see — and the old behaviour (warn + exit 0) made that state
 # indistinguishable from success, which is how a reviewed PR sat blocked with
 # "No AI review evidence found" while the script reported it was fine.
@@ -3213,10 +3213,10 @@ if [ "$RECOVER_BODY" -eq 1 ]; then
   fi
   rm -f "$RB_TMP"
   # ⛔ THE DURABLE CHANNEL, ALSO HERE (#3168 fresh-review finding 1). `--recover-body`
-  # exists BECAUSE the PR body is the only copy of the verdict that travels — so the
-  # one verb whose entire purpose is durability must not hand the recovered evidence
-  # back into the same MUTABLE field it was read from, leaving a later body edit able
-  # to erase the only admitted copy of what this run restored. `$RB_LINE` is the
+  # exists BECAUSE the PR body is the only copy this verb can READ — until #1224, the
+  # only one that travelled — so the one verb whose entire purpose is durability must
+  # not hand the recovered evidence back into the same MUTABLE field it was read from,
+  # leaving a later body edit able to erase the only admitted copy. `$RB_LINE` is the
   # HMAC-VERIFIED marker line the scan above required, so post_marker_comment()'s own
   # unsigned guard and line-anchored dedup apply here unchanged, exactly as at the
   # mint and failure arms. ⛔ ITS STDOUT GOES TO STDERR: this verb's stdout is a
