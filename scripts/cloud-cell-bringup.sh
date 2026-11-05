@@ -643,20 +643,13 @@ store_provider_state() {
   printf 'mergeable\n'
 }
 
-# store_has_credential <auth.json> [provider] — 0 iff pi can authenticate from the store: for the
-# named provider when one is given, otherwise for ANY provider.
-# "A file exists" is not the question (`{}` is the measured defect), and neither is "some provider
-# has a key" when the consumer uses one provider — the caller decides which question it is asking.
+# store_has_credential <auth.json> <provider> — 0 iff pi can authenticate as THAT provider from the
+# store. The provider is REQUIRED: "a file exists" is not the question (`{}` is the measured defect),
+# and neither is "some provider has a key" when a lane uses one provider — an any-provider variant
+# used to live here and had no caller, so it is gone rather than left to drift from this one.
 store_has_credential() {
-  local auth="$1" prov="${2:-}"
-  [ -s "$auth" ] || return 1
-  if [ -n "$prov" ]; then
-    [ "$(store_provider_state "$auth" "$prov")" = present ] && return 0
-    return 1
-  fi
-  jq -e "type == \"object\" and ([to_entries[] | .value | ${STORE_ENTRY_VALID_JQ}] | all)" "$auth" >/dev/null 2>&1 \
-    && jq -e 'type == "object" and ([to_entries[] | .value | ((.type == "api_key" and ((.key // "") | (type == "string") and ((gsub("^\\s+|\\s+$"; "")) | length) > 0)) or .type == "oauth")] | any)' \
-         "$auth" >/dev/null 2>&1
+  [ -s "${1:-}" ] || return 1
+  [ "$(store_provider_state "$1" "${2:-}")" = present ]
 }
 
 # store_has_body <auth.json> — 0 iff the file is something jq can read AS A DOCUMENT. A whitespace
