@@ -833,7 +833,25 @@ def busy_jobs(now):
                 entry = json.load(fh)
             deadline = float(entry["deadline"])
             started = float(entry.get("started") or 0)
-        except (OSError, ValueError, KeyError, TypeError):
+        # ⛔ `OverflowError` IS NOT A `ValueError` (cycle-5 review, P1). It is an `ArithmeticError`,
+        # so the tuple above did not cover it and `float()` on an integer literal like `10**400`
+        # RAISED OUT of `--verify`, aborting the check for every job after the broken marker —
+        # verbatim the defect `_finite` was added for on the stamp arm, left open on this one.
+        except (OSError, ValueError, KeyError, TypeError, OverflowError):
+            continue
+        # ⛔ A NON-FINITE MARKER IS NOT A BUSY MARKER (cycle-5 review, P1 — FALSE PASS).
+        # EVERY comparison against NaN is False, so `started=NaN` walked through BOTH guards below:
+        # `nan <= 0` did not drop it, `nan > now + slack` did not drop it, and
+        # `min(deadline, nan + …)` returns `deadline` because `nan < deadline` is False — so the
+        # clamp was a NO-OP and the marker's own self-declared deadline survived. The marker then
+        # counted as LIVE, `cmd_verify`'s tick and OVERDUE arms both excused themselves, and a
+        # WEDGED LOOP was certified `SCHEDULE VERIFIED` rc=0. `json.load` parses `NaN`/`Infinity`,
+        # and this file's own comment names the reachable inputs (hand-edit, foreign writer,
+        # restored state dir), so this is reachable without any exotic cause.
+        # Dropping it fails CLOSED: the tick then reads stale, which is the truth. This is the same
+        # `_finite` gate `cmd_verify` already applies to its own `started` (and `human_secs` to its
+        # age) — the printer was hardened while the gate it feeds was not.
+        if not (_finite(started) and _finite(deadline)):
             continue
         # ⛔ THE DEADLINE IS SELF-DECLARED, so it is CLAMPED by the budget THIS verifier enforces.
         # Otherwise a marker written once under a large FLEET_SCHEDULE_JOB_TIMEOUT (or left behind
