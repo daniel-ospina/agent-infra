@@ -1042,6 +1042,12 @@ case_v() { # <entry-point> <owner>
                "v1 … and the BYTES are unmeasured, not a measured 0MB, for a deletion the owner never answered (freed_mb_runner_work=$(sed -n 's/^freed_mb_runner_work=//p' <<<"$st"))"
     case_check "$(grep -qE '^freed_mb_unmeasured=.*runner-work' <<<"$st" && echo 0 || echo 1)" \
                "v1 … and the pass total NAMES it, so no reader and no under-reclaim sum inherits a fabricated zero"
+    # ⛔ AND THE TOTAL ITSELF IS NOT A SUM THAT ADDED AN UNKNOWN AS 0. `FREED_RW` here is a 0 the owner
+    # never confirmed, so `freed_mb_total` would under-count a class that may have freed gigabytes — and
+    # that total is precisely the figure `alert=under-reclaim` asserts on ("the pass RAN and did not keep
+    # up"). The alert is suppressed on this pass for the same reason.
+    case_check "$(grep -q '^freed_mb_total=unmeasured$' <<<"$st" && echo 0 || echo 1)" \
+               "v1 … and freed_mb_total is unmeasured too, never a sum with an unknown silently added as 0 (freed_mb_total=$(sed -n 's/^freed_mb_total=//p' <<<"$st"))"
     case_check "$(grep -qF 'NOT ATTRIBUTABLE' <<<"$out" && echo 0 || echo 1)" \
                "v1 … and the class line blames the MISSING LEDGER, not 'df could not answer' — a false cause with a wasted remedy"
     case_check "$(grep -qF 'belongs to another process' <<<"$st" && echo 1 || echo 0)" \

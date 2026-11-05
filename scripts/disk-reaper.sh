@@ -272,6 +272,10 @@ WANT_DUP=0
 # `duplicate_install` does: a `sed` key with a hyphen is a footgun for every `s/^freed_mb_//p` reader.
 FREED_RW=0; RAW_RW=0
 DF_RW_OK=1
+# ⛔ FILE-SCOPE, not a local: the under-reclaim sum and the alert live in `record_body()`, a DIFFERENT
+# function from the one that learns this. 1 = the owner never answered its ledger, so the class's freed
+# figure is not attributable to this class and must not be consumed as a 0 by either surface.
+RW_FREED_UNATTRIB=0
 WOULD_RW=0; CAND_RW=0
 WANT_RW=0
 # 1 = this pass MEASURED the candidate count (a lifted, fully-answered SUMMARY). 0 = it did not, and the
@@ -2365,7 +2369,7 @@ rw_df_targets() {
 }
 
 reap_runner_work() {
-    local out rc line path size why cands="" rows="" all_c=0 freed=0 raw=0 MEASURED=1 rec="" RW_FREED_UNATTRIB=0 _rw_dfdesc=""
+    local out rc line path size why cands="" rows="" all_c=0 freed=0 raw=0 MEASURED=1 rec="" _rw_dfdesc=""
     local tgt before after d _rw_line="" _rw_cand="" _rw_roots="" _rw_census="" _rw_reaped=""
     local _rw_retained="" _rw_failed="" _rw_kept="" _rw_why="" _rw_unmeasurable="" _rw_retained_names=""
     if [ -z "$RUNNER_WORK_REAPER_PATH" ]; then
@@ -2916,10 +2920,16 @@ record_body() {
     case "${_kb:-}" in ''|*[!0-9]*) : ;; *) _free_mb=$(( _kb / 1024 )) ;; esac
     # ⛔ A DRY RUN HAS NOT FREED ANYTHING: printing `freed_mb_total=0` there is a measured-looking
     # zero for a pass that never intended to reclaim (review of #3278).
-    if is_dry; then printf 'freed_mb_total=not-applicable\n'; else printf 'freed_mb_total=%s\n' "$_freed_total"; fi
+    # ⛔ AND AN UNATTRIBUTABLE CLASS MAKES THE SUM UNKNOWABLE — `FREED_RW` is a 0 the owner never
+    # confirmed, so the sum would under-count a class that may have freed gigabytes, which is exactly
+    # the premise `alert=under-reclaim` asserts ("the pass RAN and did not keep up"). The class's own
+    # field is already `unmeasured`; the total and the alert must not contradict it.
+    if [ "${RW_FREED_UNATTRIB:-0}" = 1 ]; then printf 'freed_mb_total=unmeasured\n'
+    elif is_dry; then printf 'freed_mb_total=not-applicable\n'
+    else printf 'freed_mb_total=%s\n' "$_freed_total"; fi
     printf 'free_mb_root=%s\n' "$_first_root"
     printf 'free_mb=%s\n' "${_free_mb:-unmeasured}"
-    if ! is_dry && [ -n "$_free_mb" ] && [ "$_free_mb" -lt "$_low_free" ] && [ "$_freed_total" -lt "$_urb_min" ]; then
+    if [ "${RW_FREED_UNATTRIB:-0}" != 1 ] && ! is_dry && [ -n "$_free_mb" ] && [ "$_free_mb" -lt "$_low_free" ] && [ "$_freed_total" -lt "$_urb_min" ]; then
         printf 'alert=under-reclaim\n'
         printf 'alert_detail=freed_mb=%s (< %s) while free_mb=%s (< %s) — the pass RAN and did not keep up\n' \
                "$_freed_total" "$_urb_min" "$_free_mb" "$_low_free"
