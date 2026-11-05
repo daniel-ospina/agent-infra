@@ -19,6 +19,9 @@
 # §D  the worker's worktree is REFRESHED on every dispatch, not frozen at the first stall
 # §E  the two sinks this script opens are BOUNDED — a brief older than the retention bound is pruned,
 #     the escalation ledger rotates at its cap, and a file this script does not own is left alone.
+# §F  the age's PROVENANCE (`measured` | `synth` | `unmeasured`) reaches BOTH sinks verbatim — the
+#     brief's premise line renders it rather than printing an attempted window as a stall age, and the
+#     durable `age_min=/agesrc=` row keeps it un-rewritten (the #3181 P1 regression).
 #
 # Hermetic: every case builds its own `$O`, its own `$HOME` (the spawn-gate ledger lives under it),
 # its own fake worktree and its own stub dispatcher. No network, no real runtime, no `pi`.
@@ -464,8 +467,40 @@ echo "── §F the age's PROVENANCE reaches both sinks this script owns ──
 # `age_min=/agesrc=` ledger row an operator reads after an incident — must say which one they got,
 # because a worker quotes the premise back in its report and the ledger is the durable record.
 # The pre-fix `case` accepted only `synth|measured` and silently rewrote `unmeasured` to `measured`,
-# which asserted a reading this box never took on BOTH surfaces. Delete that alternative and b1
-# reddens; drop the `unmeasured` render and b2 reddens on its own premise line.
+# which asserted a reading this box never took on BOTH surfaces.
+#
+# ⛔ THIS BLOCK PINS THE CONSUMER ONLY — THE PRODUCER IS PINNED IN `pr-dispatch.test.sh` (fresh-context
+# review of #3380, 2026-11-05, P2). `_AGESRC` is supplied by these legs and `f1` relies on the
+# `-measured` default, so on its own this block cannot see the OTHER half of the interface: delete
+# `_AGESRC="${_agesrc:-measured}"` from `orch-loop.sh`'s call and this suite stays green while every
+# real dispatch falls back to `measured` — the #3181 P1, restored, with nothing red. The legs there
+# record the provenance the fixer was actually HANDED (`1|measured`, `1|synth`, `1|unmeasured`), so an
+# interface is now pinned at both ends. One caveat a maintainer must not have to discover: the
+# `unmeasured` producer leg needs an unreadable-but-writable `state/`, so it is reported
+# UNPROVEN-ON(root) rather than counted there — on a root host only two of the three are pinned.
+#
+# ⛔ THIS NOTE CITES CODE BY NAME, NEVER BY LINE NUMBER (review cycles 2 and 3 of #3181, 2026-11-03).
+# Two cycles in a row found a pointer here that had silently gone stale: every edit ABOVE a cited line
+# shifts it, so a maintainer who follows the number lands on a comment or a blank line, mutates
+# nothing, sees every arm stay green, and concludes §F is vacuous when it is not. The §B verdict arms
+# (`b1`/`b2`) are NOT involved in any mutation below — a pointer there is what produced that earlier
+# false conclusion.
+#
+# MUTATIONS, MEASURED AT THIS HEAD — each named by the rule it breaks, not by a line to edit. The
+# counts are re-measured whenever a leg is ADDED, because they go stale the moment the suite grows: an
+# earlier revision of this note still said "81 passed, 3 failed" after `f5` existed (measured at that
+# head: 5 failed, not 3), and the pass count happened to stay 81 because it is `86 - failures`.
+#   · the `*)` arm of the age-provenance `case` back to `AGESRC=measured`
+#       → 81 passed, 5 failed: all three of `f4`'s asserts AND both of `f5`'s;
+#   · the `unmeasured)` arm of the brief-text `case` replaced by the bare `$AGEMIN`
+#       → 82 passed, 4 failed: `f3`'s premise pair, `f4`'s premise assert AND `f5`'s;
+#   · the `synth)` arm of the brief-text `case` replaced by the bare `$AGEMIN`
+#       → 85 passed, 1 failed: `f2`'s premise assert.
+#
+# AND ONE DELIBERATE NO-OP, stated so it is not mistaken for vacuity: deleting the `unmeasured`
+# alternative from the ACCEPT LIST alone changes NOTHING (86 passed, 0 failed), because the `*)` arm
+# already maps every non-accepted value to `unmeasured`. The accept list NAMES the vocabulary; the
+# `*)` arm is the GUARANTEE. Use one of the three mutations above to prove §F discriminates.
 brief_of() { cat "$1"/state/briefs/stall-fix-*.md 2>/dev/null || true; }
 
 D="$(new_o f1)"; stub "$D" "$STUB_OK_TOUCH"
@@ -487,7 +522,32 @@ case "$(brief_of "$D")" in *"no PR merged in 90 minutes"*) ck 1 "…and it never
 case "$(ledger_of "$D")" in *"age_min=90	agesrc=unmeasured"*) ck 0 "…and the durable row keeps agesrc=unmeasured verbatim (the P1 fix)" ;; *) ck 1 "…and the durable row keeps agesrc=unmeasured verbatim (the P1 fix): $(ledger_of "$D")" ;; esac
 case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; *) ck 0 "…and it is NOT rewritten to agesrc=measured (the pre-fix shape)" ;; esac
 
+# ⛔ AN UNRECOGNISED PROVENANCE IS NOT `measured` (review cycle 2, 2026-11-03, P2). Unset is handled by
+# the `-measured` default, so only a value the caller SUPPLIED can reach the `*)` arm. Before the fix
+# that arm wrote `measured`, so `_AGESRC=<anything unknown>` put "no PR merged in 90 minutes" in the
+# worker's premise and `agesrc=measured` in the ledger — the same false measurement, reachable by a
+# fourth provenance. Set the `*)` arm back to `measured` and all FIVE asserts below redden
+# (measured: 81 passed, 5 failed — these three AND `f5`'s two).
+D="$(new_o f4)"; stub "$D" "$STUB_OK_TOUCH"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       _AGESRC=banana bash "$SH" 3 90 2>&1)"
+case "$(brief_of "$D")" in *"no PR merged in an UNMEASURED number of minutes"*) ck 0 "unrecognised: the brief does NOT claim a measurement it was never given" ;; *) ck 1 "unrecognised: the brief does NOT claim a measurement it was never given: $(brief_of "$D" | head -20 | tail -6)" ;; esac
+case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and the durable row does not assert agesrc=measured for a value it did not understand: $(ledger_of "$D")" ;; *) ck 0 "…and the durable row does not assert agesrc=measured for a value it did not understand" ;; esac
+case "$(ledger_of "$D")" in *"agesrc=unmeasured"*) ck 0 "…it degrades to agesrc=unmeasured (the value that says no reading was taken)" ;; *) ck 1 "…it degrades to agesrc=unmeasured (the value that says no reading was taken): $(ledger_of "$D")" ;; esac
 
- echo
+# ⛔ A PRESENT-BUT-**EMPTY** VALUE IS NOT AN ABSENT ONE (review cycle 3 of #3380, 2026-11-05, P3).
+# `:-measured` substitutes on empty as well as unset, so `_AGESRC=` — the "typo'd caller" shape the
+# `*)` arm exists for — was read as `measured` and put "no PR merged in 90 minutes" in the premise and
+# `agesrc=measured` in the ledger, byte-identical to an unset variable. The default is `-measured`, so
+# only an ABSENT variable keeps its old shape; a caller that supplied an empty value is a caller this
+# script did not understand, and that degrades like any other unrecognised value. Set the default back
+# to `:-measured` and this leg reddens.
+D="$(new_o f5)"; stub "$D" "$STUB_OK_TOUCH"
+OUT="$(O="$D" STALL_FIX_WORKTREE="$D/wt" DRAIN_STALL_FIX_EVERY=3 STALL_FIX_VERIFY_SECS=1 \
+       _AGESRC= bash "$SH" 3 90 2>&1)"
+case "$(brief_of "$D")" in *"no PR merged in an UNMEASURED number of minutes"*) ck 0 "empty: a PRESENT-BUT-EMPTY provenance is NOT read as the default measurement" ;; *) ck 1 "empty: a PRESENT-BUT-EMPTY provenance is NOT read as the default measurement: $(brief_of "$D" | head -20 | tail -6)" ;; esac
+case "$(ledger_of "$D")" in *"agesrc=measured"*) ck 1 "…and the ledger row does not claim a measurement for an empty value: $(ledger_of "$D")" ;; *) ck 0 "…and the ledger row does not claim a measurement for an empty value" ;; esac
+
+
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

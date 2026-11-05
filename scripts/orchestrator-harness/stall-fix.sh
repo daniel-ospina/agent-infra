@@ -49,9 +49,27 @@ AGEMIN="${2:-?}"                    # minutes since the last land (or the thresh
 # `synth|measured` and rewrote everything else to `measured`, so that one pass still put "no PR merged
 # in 360 minutes" in the worker's premise and `agesrc=measured` in the ledger an incident is read from
 # — the exact re-introduction, for the new third value, of the defect the paragraph above says this
-# flag exists to remove. Every value the caller can emit is accepted here.
-AGESRC="${_AGESRC:-measured}"
-case "$AGESRC" in synth|unmeasured|measured) : ;; *) AGESRC=measured ;; esac
+# flag exists to remove. Every value the caller can emit is accepted here, and a PRESENT-BUT-
+# UNRECOGNISED value is NOT claimed as `measured` (see the `*)` arm).
+#
+# ⛔ ONLY AN ABSENT VARIABLE TAKES THE DEFAULT — `-`, NOT `:-` (review cycle 3 of #3380, 2026-11-05,
+# P3). `:-` also substitutes on a PRESENT-BUT-EMPTY value, so `_AGESRC=` — the exact "typo'd caller"
+# shape the `*)` arm was added for — was read as `measured` and put "no PR merged in 90 minutes" in the
+# worker's premise and `agesrc=measured` in the ledger, byte-identical to the `banana` case that arm
+# refuses. Measured: with `:-`, `_AGESRC= ` renders `no PR merged in 90 minutes` / `agesrc=measured`,
+# the same as an unset variable. `-` distinguishes the two: unset → `measured` (the caller passed no
+# flag), empty → the `*)` arm → `unmeasured` (a caller that said nothing is not a reading).
+AGESRC="${_AGESRC-measured}"
+case "$AGESRC" in
+  synth|unmeasured|measured) : ;;
+  # ⛔ AN UNRECOGNISED PROVENANCE IS NOT `measured` (review cycle 2 of #3181, 2026-11-03, P2). Unset
+  # never reaches here (`-measured` above handles a caller that passes no flag), so this arm only ever
+  # sees a value the caller DID supply and this script does not understand. Claiming it as `measured`
+  # asserts a reading no box took — verbatim the defect this whole flag exists to remove, reachable by
+  # a fourth provenance or a typo'd caller — so it degrades to `unmeasured`, the one value that says no
+  # reading was taken. `measured` is asserted ONLY when the caller's value IS `measured`.
+  *) AGESRC=unmeasured ;;
+esac
 
 # ⛔ NOT `say` (agent-infra#2910). On macOS `say` is /usr/bin/say — text-to-speech — so a shipped
 # script that defines a helper by that name SPEAKS through the owner's speakers whenever a fragment
@@ -75,8 +93,8 @@ is_num "$TIMEOUT" && [ "$TIMEOUT" -ge 1 ] || TIMEOUT=1800
 # own words. And an UNSEARCHABLE `state/` has NO number to render — see the provenance note above: the
 # value beside it is the window that could not be searched, so the brief must say the age is
 # unmeasured rather than print that window as a stall age (the same shape `drain_stall_token` uses,
-# which renders `?` for this provenance, and the same rule the `PRDISP_SPAWNS` arm above applies to an
-# unmeasured count).
+# which renders `?` for this provenance, and the same rule the `PRDISP_SPAWNS` arm BELOW — not the one
+# above — applies to an unmeasured count).
 case "$AGESRC" in
   synth)      AGEMIN_TXT=">=${AGEMIN}" ;;
   unmeasured) AGEMIN_TXT="an UNMEASURED number of" ;;
@@ -298,11 +316,17 @@ fi
 
 # KIND=prfix — A MEASUREMENT, NOT AN EXEMPTION (review P2, 2026-11-01: this comment used to say the
 # creation gate "exempts" a stall repair, which spawn-gate.sh denies). `prfix` is exempt ONLY on proof
-# that this worktree IS an open PR at this HEAD (`spawn-gate.sh:1989-1993`, via
+# that this worktree IS an open PR at this HEAD (`spawn-gate.sh`'s `KIND=prfix` arm, via
 # `land_backlog_open_pr_evidence`), and a DETACHED worktree at `origin/main` can never produce that
-# proof (`:1970-1978`: the branch rule is skipped because `rev-parse --abbrev-ref HEAD` is `HEAD`, and
-# no open PR's head is main's tip). So this KIND falls through to the ordinary landing-ratio
-# measurement (`:1994-2005`) — and a drain stall IS the state where that ratio is over the ceiling.
+# proof (that arm's branch rule is skipped because `rev-parse --abbrev-ref HEAD` is `HEAD`, and no open
+# PR's head is main's tip). So this KIND falls through to the ordinary landing-ratio measurement — and
+# a drain stall IS the state where that ratio is over the ceiling.
+#
+# ⛔ THESE WERE LINE NUMBERS AND THEY WENT STALE (review cycle 5 of #3380, 2026-11-05, P3). The three
+# pointers that used to sit here (`:1989-1993`, `:1970-1978`, `:1994-2005`) had all drifted into
+# spawn-gate.sh's DISK-gate block, so a maintainer following them read a comment about headroom and
+# concluded this one was talking about the disk. Cited by NAME now, which cannot drift — the rule the
+# §F note in stall-fix.test.sh states, applied where it was being broken.
 # ⇒ The creation back-pressure gate CAN legitimately HOLD this dispatch, and it is most likely to fire
 # on exactly the box this escalation exists for. That is stated rather than denied, and it is not
 # hidden from the operator: the hold writes `[land-backlog] REFUSED …` to the worker's own log, which
