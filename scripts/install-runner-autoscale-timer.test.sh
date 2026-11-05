@@ -1858,6 +1858,37 @@ assert_eq "$RC" 0 "--status certifies the box afterwards: armed artifact plus it
 assert_contains "$OUT" "arm_record=present" "…reading the record at the declared path"
 rm -f "$ALT"
 
+# ── T65: the launchd arm carries the SAME record guard, and NOTHING pinned it ──────────────
+# `do_install_launchd` calls `refuse_report_only_over_record` exactly as the systemd arm does
+# (`:1443` vs `:1344`), and T11/T22/T64 all exercise the systemd path — the suite's Darwin
+# invocations contained no `--report-only` run at all, so DELETING the launchd call measured
+# `PASS=437 FAIL=0`, identical to head: on a Mac that guard could vanish and CI would stay green while
+# `--report-only` shipped the forced-DISARMED plist over a live dated record. Same arrangement as T64
+# (the seam difference IS the case), one platform over.
+say_case "T65 the launchd --report-only guard refuses the record the ARTIFACT declares"
+D="$T/c65"; fresh "$D"; rm -f "$ARM"
+ALT="$T/c65state/runner-autoscale.armed"
+mkdir -p "$T/c65state"
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$T/c65state" RUNNER_AUTOSCALE_ARM_FILE="$ALT")
+run_install Darwin "$D" --install >/dev/null 2>&1
+run_install Darwin "$D" --arm --reason fixture >/dev/null 2>&1; ENVV=()
+assert_file "$ALT" "precondition: the record was minted at the DECLARED path"
+assert_nofile "$ARM" "precondition: nothing was written at the reader's default path"
+assert_contains "$(plist_env "$D/$LABEL.plist" RUNNER_AUTOSCALE_STATE_DIR)" "c65state" \
+    "precondition: the plist declares its own state dir, so the two paths really differ"
+OUT="$(run_install_noseam Darwin "$D" --report-only)"; RC=$?
+assert_eq "$RC" 1 "--report-only on the launchd arm refuses a live record at the DECLARED path"
+assert_contains "$OUT" "REFUSING --report-only" "and the refusal is the RECORD guard's, not a target failure"
+assert_contains "$OUT" "$ALT" "naming the record it actually read"
+assert_absent "$(plist_args "$D/$LABEL.plist")" "--dry-run" \
+    "and the forced-DISARMED plist never lands — the record and the artifact still agree"
+assert_file "$ALT" "the record is left alone"
+# Control: the SAME refusal when the seam IS exported, so the verdict is about the box and not the shell.
+ENVV=(RUNNER_AUTOSCALE_STATE_DIR="$T/c65state" RUNNER_AUTOSCALE_ARM_FILE="$ALT")
+OUT="$(run_install Darwin "$D" --report-only)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "control: the same refusal on the launchd arm when the seam IS exported"
+rm -f "$ALT"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
