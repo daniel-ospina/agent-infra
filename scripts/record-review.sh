@@ -1207,8 +1207,8 @@ post_marker_comment() { # <repo> <pr> <marker>
   # marker correctly made 0. Trailer-anchoring (` sig=[0-9a-f]{64}$`) does NOT close
   # it either, for the same reason (`note=x sig=<64hex>` ends the marker that way).
   # `MARKER_SIGNED` is not the fix either: it is assigned only in the MINT path (below
-  # :4826), so a call site that asks for a marker first — flush_pending_markers (:1744)
-  # and --recover-body (:2898) — cannot see it, whatever the GATE_KEY's scope is.
+  # :4826), so a call site that asks for a marker first — flush_pending_markers (:1348, dispatched at :1744)
+  # and --recover-body (:3226, dispatched at :2898) — cannot see it, whatever the GATE_KEY's scope is.
   # So apply the file's OWN doctrine (:2886): "a marker is EVIDENCE only when
   # its `sig=` verifies over its own text". The key is resolved GLOBALLY at :2870,
   # but ⛔ that is NOT above every call site — so this function must never assume
@@ -2677,9 +2677,9 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   if [ "$CC_SUPPLIED" -eq 0 ]; then
   # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
   # that lacks the file may still have the verdict in the registry (minted on a
-  # peer box), in the PR body's SIGNED marker, or in an admitted PR comment
-  # (minted anywhere; both travel). Naming only the re-review made every cross-box review
-  # cost twice — a lane paying again for evidence the fleet already holds.
+  # peer box), or in the PR body's SIGNED marker. An admitted PR COMMENT can carry it too, but
+  # ⛔ THIS RECORDER CANNOT RECOVER FROM ONE (only the dedup reads comments, :1277; --recover-body
+  # reads the body alone, :3001/:3041) — the gate reads it, so the re-review is still not the only remedy.
   CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
   if [ -n "$REPO" ]; then
     if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then

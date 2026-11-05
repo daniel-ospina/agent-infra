@@ -6269,7 +6269,7 @@ fi
 assert_eq "$PWF_RC" "5" \
     "20.14 a failed pending write does not change the exit code — the arm is still a NAMED failure (rc 5) [err: $(printf '%s' "$PWF_ERR" | tr '\n' '|')]"
 assert_contains "$PWF_ERR" "could NOT persist the pending marker" \
-    "20.14 …and the lost write is REPORTED, instead of discarded by `|| true`"
+    '20.14 …and the lost write is REPORTED, instead of discarded by || true'
 assert_contains "$PWF_ERR" ">>> review recorded: reviews/$PWF_PR.json" \
     "20.14 …and the marker text is reproduced in that message, so the only copy is not lost"
 # ⛔ AND THE EXIT-5 MESSAGE NO LONGER ASSERTS THE OPPOSITE (the second half of the same
