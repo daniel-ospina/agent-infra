@@ -1321,6 +1321,28 @@ refuse_root_invocation() {
     return 1
 }
 
+# warn_provisioner_reach — the FILL-half warning, emitted where the FACT is known.
+# ⛔ IT USED TO RUN IN `do_install` BEFORE TARGET SELECTION, i.e. BEFORE `adopt_installed_provisioner`
+# had had any chance to supply the pin from the artifact. Measured consequence on a re-install that
+# cannot resolve a provisioner from this shell but whose artifact already carries a working one: the
+# installer printed "no install-ci-runner-x64.sh resolved … it can never ADD capacity … Install from a
+# checkout that carries tools/…" and then, two lines later, "the pin the installed artifact already
+# carries is kept", rendering an artifact that still carries it (`changed=0`). A false consequence
+# stated in the same breath as the fact that contradicts it. The warning now runs AFTER adoption, so it
+# is emitted only when there really is no pin.
+warn_provisioner_reach() {
+    if [ -z "$PROVISIONER" ]; then
+        err "WARNING: no install-ci-runner-x64.sh resolved ($PROVISIONER_WHY) — the timer can RESTART a dead"
+        err "  runner and RE-REGISTER an orphaned one, but it can never ADD capacity (every pass with"
+        err "  live < ceiling records 'no provisioner' and exits 3). Install from a checkout that carries"
+        err "  tools/install-ci-runner-x64.sh, or set RUNNER_AUTOSCALE_PROVISIONER, to schedule a box that GROWS."
+    elif is_transient_scratch "$PROVISIONER"; then
+        err "WARNING: the pinned provisioner $PROVISIONER is inside a mktemp tree — after that directory goes,"
+        err "  the pass will report 'no provisioner' on every tick (repair-only). Install from a durable checkout."
+    fi
+    return 0
+}
+
 do_install() {
     # ⛔ THE GUARD STAYS ON EVERY WRITER, THIS ONE INCLUDED. It was briefly dropped here while the
     # cross-scope note was added, which would have made `--install` the ONE writer that skipped it:
@@ -1331,15 +1353,8 @@ do_install() {
     resolve_script || return 1
     resolve_python || return 1
     resolve_provisioner
-    if [ -z "$PROVISIONER" ]; then
-        err "WARNING: no install-ci-runner-x64.sh resolved ($PROVISIONER_WHY) — the timer can RESTART a dead"
-        err "  runner and RE-REGISTER an orphaned one, but it can never ADD capacity (every pass with"
-        err "  live < ceiling records 'no provisioner' and exits 3). Install from a checkout that carries"
-        err "  tools/install-ci-runner-x64.sh, or set RUNNER_AUTOSCALE_PROVISIONER, to schedule a box that GROWS."
-    elif is_transient_scratch "$PROVISIONER"; then
-        err "WARNING: the pinned provisioner $PROVISIONER is inside a mktemp tree — after that directory goes,"
-        err "  the pass will report 'no provisioner' on every tick (repair-only). Install from a durable checkout."
-    fi
+    # ⛔ THE FILL-HALF WARNING AND THE SCRATCH GATE ARE BOTH RE-RUN AFTER ADOPTION, INSIDE EACH VERB —
+    # nothing about the FILL half is knowable here (see `warn_provisioner_reach`).
     # ⛔ THE SCRATCH GUARD RUNS BEFORE TARGET SELECTION: a box whose HOME is transient scratch must be
     # told THAT, not "no scheduler available", and selection can refuse for an unrelated reason.
     refuse_unusable_target scheduled || return 1
@@ -1355,6 +1370,14 @@ do_install_systemd() {
     refuse_report_only_over_record || return 1
     refuse_systemd_unsafe_values || return 1
     adopt_installed_provisioner
+    # ⛔ THE GUARD RUNS AGAIN AFTER ADOPTION, BECAUSE ADOPTION CAN INTRODUCE THE VERY STATE IT REFUSES.
+    # Only `PROVISIONER` is adopted, and it is adopted HERE — so the pre-selection pass judged an EMPTY
+    # value on exactly the re-install the adoption exists for. Measured before this second pass: an
+    # artifact declaring a mktemp-tree provisioner was ADOPTED, re-rendered and installed with `exit 0`,
+    # and `--status` on that same artifact then exited 1 ("points into TRANSIENT SCRATCH SPACE") — the
+    # writer certifying what its own reader reds. One predicate, both readers, after the value exists.
+    refuse_transient_installed_artifact "$(artifact_path_for_target)" || return 1
+    warn_provisioner_reach
     note_repo_change
 
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-unit.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
@@ -1453,6 +1476,8 @@ do_install_launchd() {
     adopt_installed_state_dir
     refuse_report_only_over_record || return 1
     adopt_installed_provisioner
+    refuse_transient_installed_artifact "$(artifact_path_for_target)" || return 1
+    warn_provisioner_reach
     note_repo_change
     tmpd="$(mktemp -d "${TMPDIR:-/tmp}/runner-autoscale-plist.XXXXXX")" || { err "cannot create a temp dir"; return 1; }
     render "$src_plist" "$tmpd/$LABEL.plist" launchd || { rm -rf "$tmpd"; return 1; }

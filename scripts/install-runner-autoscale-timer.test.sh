@@ -1938,6 +1938,51 @@ assert_contains "$OUT" "note: the installed artifact converges repo 'o/r'" \
     "the launchd arm prints the same note (the second call site)"
 assert_contains "$(plist_args "$D2/$LABEL.plist")" "other/pool" "and its plist is repointed too"
 
+# ── T67: the pin ADOPTED from the artifact is judged before it is rendered, on both arms ────
+# `adopt_installed_provisioner` runs INSIDE the verbs, after the pre-selection `refuse_unusable_target`,
+# so on exactly the re-install the adoption exists for the scratch gate judged an EMPTY value. Measured
+# before this case: an artifact declaring a mktemp-tree provisioner was adopted, re-rendered and
+# installed with exit 0, and `--status` on that same artifact then exited 1 — the writer certifying what
+# its own reader reds. The same ordering also made the installer print "it can never ADD capacity" two
+# lines before "the pin the installed artifact already carries is kept", over an artifact still carrying
+# it. And the launchd half of the adoption was pinned by nothing: deleting it left `PASS=460 FAIL=0`.
+say_case "T67 an adopted provisioner pin is judged before rendering, on both arms"
+D="$T/c67"; fresh "$D"; rm -f "$ARM"
+PROV3="$T/home/prov3.sh"; printf '#!/bin/sh\n' >"$PROV3"; chmod +x "$PROV3"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Linux "$D" --install >/dev/null 2>&1; ENVV=()
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV3" \
+    "precondition: the artifact carries the pin"
+# Control: the same re-install with the pin resolvable only THROUGH the artifact keeps it, and does not
+# claim the box can never add capacity while doing so.
+OUT="$(run_install Linux "$D" --install)"; RC=$?
+assert_eq "$RC" 0 "control: a re-install that cannot resolve a pin from this shell still succeeds"
+assert_contains "$OUT" "the pin the installed artifact already carries is kept" "adopting the artifact's pin"
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV3" "and keeping it in the artifact"
+assert_absent "$OUT" "it can never ADD capacity" \
+    "and NOT claiming the box can never add capacity while adopting a working pin"
+# Now the ARTIFACT itself declares a transient pin. It is adopted, then judged — before any render.
+SCRATCH="/tmp/tmp.ra-prov.$$"; mkdir -p "$SCRATCH"; TPROV="$SCRATCH/inst.sh"
+printf '#!/bin/sh\n' >"$TPROV"; chmod +x "$TPROV"
+box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$TPROV|" "$D/$UNIT_NAME.service"
+OUT="$(run_install Linux "$D" --install)"; RC=$?
+assert_eq "$RC" 1 "a provisioner ADOPTED from transient scratch is REFUSED (this exited 0 before)"
+assert_contains "$OUT" "TRANSIENT SCRATCH" "naming the class it would create"
+assert_contains "$OUT" "PROVISIONER=$TPROV" "and the value it adopted"
+assert_absent "$OUT" "changed=1" "with nothing rendered or installed"
+OUT="$(run_install Linux "$D" --status)"; RC=$?
+assert_eq "$RC" 1 "and --status already refused it, so writer and reader now AGREE"
+# The launchd arm adopts too, and deleting that call left the suite green — so pin it here.
+D2="$T/c67d"; fresh "$D2"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Darwin "$D2" --install >/dev/null 2>&1; ENVV=()
+assert_eq "$(plist_env "$D2/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$PROV3" \
+    "precondition: the plist carries the pin"
+OUT="$(run_install Darwin "$D2" --install)"; RC=$?
+assert_eq "$RC" 0 "a launchd re-install that cannot resolve a pin succeeds"
+assert_eq "$(plist_env "$D2/$LABEL.plist" RUNNER_AUTOSCALE_PROVISIONER)" "$PROV3" \
+    "and KEEPS the pin (deleting the launchd adoption left this green before)"
+
 echo
 echo "PASS=$PASS FAIL=$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
