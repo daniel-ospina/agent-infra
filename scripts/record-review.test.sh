@@ -4812,12 +4812,13 @@ STUB_COMMENT_FAIL=1 STUB_COMMENT_CAPTURE="$T/ccap_c" run_record_633 "$DC_PR" "$S
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a FAILED comment read does not post (an error body is not 'no comment exists')"
 assert_contains "$RECORD_ERR" "could not read the PR's comments" "14.1d …and the failure is reported loudly, not swallowed"
 # ⛔ AND IT PROMISES NO RETRY IT CANNOT HONOUR (#3168 review cycle 4). "The verb that
-#    produced this message has to be re-run to retry" was FALSE at two of the five
-#    call sites: flush_pending_markers deletes its pending marker once its body post
-#    succeeds, and --recover-body refuses outright once a record exists — so re-running
-#    the verb that printed it delivers nothing. The line now says so instead.
+#    produced this message has to be re-run to retry" is FALSE outright at ONE call site:
+#    --recover-body refuses once a record exists. ⛔ THE FLUSH IS NOT THE SAME SHAPE and the
+#    line must not flatten them (#3168 round-15): flush_pending_markers removes its pending
+#    marker only when its body post SUCCEEDS, so a FAILED post IS retried by a second
+#    --flush-pending — the message now states the conditional, not a flat denial.
 assert_not_contains "$RECORD_ERR" "has to be re-run to retry" \
-    "14.1d …and does not promise a verb-agnostic retry (false at the flush/recover call sites)"
+    "14.1d …and does not promise a verb-agnostic retry (false outright only at the recover-body site)"
 assert_not_contains "$RECORD_ERR" "the body copy above is unaffected" \
     "14.1d …nor resurrect the old false claim that the body copy is unaffected"
 assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the record [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
@@ -6221,8 +6222,11 @@ assert_eq "$FLE_RC" "0" \
 # ── 20.14 A FAILED PENDING WRITE MUST NOT BE SWALLOWED ────────────────────────
 # (#3168 round-9 review, P2.) Both body-channel failure arms persist the marker to the
 # pending file so a later `--flush-pending` can deliver it WITHOUT a second review —
-# and the minted RECORD does not carry the marker text or its `sig=`, so that file is
-# the ONLY copy. Both arms used to discard `marker_pending_write`'s status (`|| true`)
+# and the minted RECORD does not carry the marker text or its `sig=`, so that file is the only
+# copy THIS RECORDER CONTROLS — the durable COMMENT at :4857 is attempted after the persist but
+# BEFORE the exit 5, and even when the persist FAILED, so it may also carry the bytes
+# (best-effort: skipped when that read fails, refused when the POST fails). Both arms
+# used to discard `marker_pending_write`'s status (`|| true`)
 # and then print "the marker is kept in <path>". When the write fails, that sentence is
 # false, and the remedy it names is a no-op: `--flush-pending` answers "nothing pending
 # … Nothing was written" and exits 0. Silent loss of the only copy, reported as success

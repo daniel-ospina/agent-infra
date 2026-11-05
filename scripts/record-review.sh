@@ -1292,12 +1292,12 @@ post_marker_comment() { # <repo> <pr> <marker>
     # Both were false here. The read's error text is discarded (2>/dev/null on the
     # capture — deliberately, so an HTTP error body can never be read as comment
     # text), so "transient API failure" was a guess that also covered a permanent
-    # 404. And "re-run this to retry" is FALSE at two of the five call sites:
-    # flush_pending_markers deletes its pending marker once its body post succeeds,
-    # and --recover-body refuses outright once a record exists — at both, the verb
-    # that printed this line cannot retry the durable copy at all. The remedy is
+    # 404. And "re-run this to retry" is FALSE outright at ONE of the five call sites:
+    # --recover-body cannot (it refuses once a record exists). The FLUSH is CONDITIONAL: it
+    # removes its pending marker only when its OWN body post SUCCEEDS (:1349-1352), so a
+    # FAILED post is retried by a second --flush-pending and a SUCCESSFUL one leaves nothing. The remedy is
     # the CALLER's to state; this function reports only what it observed.
-    echo "⚠️ record-review: could not read the PR's comments on $repo#$pr — this call created no durable comment copy, and this line makes no claim about the body channel. It does not name a CAUSE either (the read's error text is discarded by design), and ⛔ it deliberately promises NO retry: whether re-running helps is the CALLER's business, and at flush_pending_markers and --recover-body it does not, because those two verbs cannot reach this call a second time. Read the calling verb's own message for the remedy it can honour." >&2
+    echo "⚠️ record-review: could not read the PR's comments on $repo#$pr — this call created no durable comment copy, and this line makes no claim about the body channel. It does not name a CAUSE either (the read's error text is discarded by design), and ⛔ it deliberately promises NO retry: whether re-running helps is the CALLER's business, and at --recover-body it does not (that verb refuses outright once a record exists). ⛔ --flush-pending IS the exception and this line must not deny it: the flush removes its pending file ONLY when its body post SUCCEEDS (:1349-1352), so after a FAILED body post the bytes are KEPT and a second --flush-pending DOES reach this call and DOES publish the durable copy — which is exactly the retry this line used to talk an operator out of. Read the calling verb's own message for the remedy it can honour." >&2
     HAVE_COMMENT=-1
   fi
   if [ "$HAVE_COMMENT" = "0" ]; then
