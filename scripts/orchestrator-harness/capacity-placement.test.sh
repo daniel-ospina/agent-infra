@@ -1757,11 +1757,15 @@ L27M="$(printf '%s' "$_CUT" | bash -c '. "$1"; cap_parse_inventory' _ "$TMP/cap-
 ck "  …mutation control: without the balance check the same cut reads 2 of 5 machines ($L27M)" \
    "$([ "$(printf '%s' "$L27M" | grep -cE '^pi-c[0-9] ')" -eq 2 ] && echo 0 || echo 1)"
 # (t2) ⛔ THE TIMEOUT VERDICT IS A SENTINEL, NOT A `kill -0` RACE (fresh review round 5, P2). Liveness
-# was read AFTER `wait`, when the watchdog subshell had not necessarily exited: 40 timed runs of
-# `cap_bounded 1 sleep 5` gave rc 124 26 times and rc 137 14 times, and the emitter then loses the
-# NAME (`why=channel-unreadable` / `exited 137` instead of `channel-timeout`). The watchdog now marks
-# a file BEFORE it kills, so the verdict is never lost. (The pre-fix tally is measured, not asserted
-# in-suite: a flaky mutant is worse than none.)
+# was read AFTER `wait`, when the watchdog subshell had not necessarily exited, so the verdict could be
+# lost (reported as `exited 137` / `why=channel-unreadable` instead of `timed out after Ns` /
+# `channel-timeout`). The watchdog now marks a file BEFORE it kills, so the verdict never depends on when
+# the scheduler reaped a subshell.
+# ⚠️ THIS IS AN INVARIANT ARM, NOT A MUTATION-PROVEN ONE, AND THAT IS SAID PLAINLY: the reviewer measured
+# the pre-fix race as 26 rc 124 / 14 rc 137, but it did NOT reproduce on the lane host that fixed it — the
+# pre-fix body scored 60/60 rc 124 here (bare, `$( )`, and env-prefix invocations). So reverting the fix
+# would keep THIS arm green on this host; the arm exists to catch the hosts where the window really opens,
+# and the change stands on removing a scheduler dependence rather than on a reproduced failure.
 _t2_bad=0; _t2_i=0
 while [ "$_t2_i" -lt 12 ]; do
   CAP_BOUND_IMPL=watchdog cap_bounded 1 sleep 5 >/dev/null 2>&1
