@@ -50,10 +50,14 @@ issue (open, labelled P0/P1/P2, unassigned)
   │                           ones → candidates.txt (SEVERITY-FIRST: its ORDER IS the dispatch
   │                           priority, re-derived from `.pool` on every pass — including a skipped
   │                           one — so the head is the highest-ranked CLEAN entry, never the oldest
-  │                           WHEN THE POOL RANKED IT — a pass that could not rank (unreadable pool, or
-  │                           a pool ranking none of the queue) says `priority-unreadable` and installs
-  │                           nothing, so in THAT state the order is unverified and its head may well be
-  │                           the oldest (the code's own words: "NOT this pass's arrival order either");
+  │                           WHEN THE POOL RANKED IT. A pass that could not rank says `priority-unreadable`
+  │                           and does NOT re-derive the order: an UNREADABLE pool installs nothing (the
+  │                           previous pass's order stands, unverified), while a pool that ranked NONE of
+  │                           the queue MAY still rewrite the file in its existing order — collapsing a
+  │                           duplicate row — so in that state the head may well be the oldest, and it is
+  │                           "neither severity nor this pass's arrival order" (the code's own words).
+  │                           A count that cannot be read back after the install is its own state,
+  │                           `severity-uncounted`: the ORDER is this pass's, the COUNTS are unknown;
   │                           membership stays FIFO-with-dedupe and an unranked row is kept at the
   │                           tail and COUNTED, agent-infra#2019; the product queue the floor reads is
   │                           re-sequenced onto the same order even on a skipped pass. EXCEPT
