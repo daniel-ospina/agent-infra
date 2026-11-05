@@ -615,6 +615,16 @@ MISS_OK="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_missing' _ "$HELPER")"
 [ "$(printf '%s\n' "$MISS_OK" | grep -c .)" = "1" ]; ck $? "POSITIVE CONTROL: with a readable declaration and the preamble present, mandate_missing names exactly the ONE absent file (measured $(printf '%s\n' "$MISS_OK" | grep -c .)) — the collector is not disabled"
 MISS_ONE="$(CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_missing' _ "$HELPER" | grep -c 'TORTOISE-GRAPH-BRIEF')"
 [ "$MISS_ONE" = "1" ]; ck $? "…and it names the file that IS missing (so the collector was not disabled)"
+# ── E1p: the `--log`-ONLY path SAYS the lane will not see it (the un-pinned WARN) ───────────────────
+# Both in-tree seams always pass an existing brief, so this branch is defensive-only — but under a
+# `--log`-only invocation a silent success and "the lane was never told" read identically, which is the
+# class its two sibling WARNs (`could not append`, `still carries a STALE block`) are each pinned for.
+# Measured: deleting this WARN left the suite green.
+mkstate; rm -f "$TMP/home/.pi/agent/state/"*.md
+: > "$TMP/nobrief.log"
+CELL_HOME="$TMP/home" bash -c '. "$1"; mandate_preflight_emit "$2" "$3" nobrief' _ "$HELPER" "$TMP/nobrief.log" "$TMP/no-such-brief.txt" >/dev/null 2>&1
+grep -qF 'WARN nobrief: no brief file to append to' "$TMP/nobrief.log"; ck $? "a MISSING brief is recorded, not silently skipped (under --log-only the two read identically)"
+grep -qF 'the LANE will not see it' "$TMP/nobrief.log"; ck $? "…and the record says the LANE will not see it, not merely that a path was absent"
 # ── E2: THE POSITIVE CONTROL — with every file present the brief is NOT touched ───────────────────
 # Without this arm E1 passes vacuously on a helper that always appends.
 mkstate
