@@ -1444,6 +1444,48 @@ def test_the_token_spawn_draws_on_the_phase_clock_too(monkeypatch, tmp_path):
         "the credential spawn got %r, not what was left of the phase clock" % (spawned[0],))
 
 
+def test_a_number_that_is_only_a_PREFIX_of_a_fix_repo_citation_is_not_covered(monkeypatch, no_cache):
+    """⛔ THE BOUNDARY GUARD IN `covered()` IS NOW LOAD-BEARING ON 448x MORE ROWS.
+
+    `covered()` matches `(?<![\\d])N(?![\\d])`, and that guard was unpinned: replacing the
+    pattern with a bare `%d` left the whole suite GREEN (measured, 38 passed). The consequence is a
+    FALSE COVER — demonstrated end-to-end on that copy with a P0 unit `#1011` and a fix-repo PR
+    titled `fix(reaper): the thing (#10114)`: shipped code reports
+    `p0 {open: 1, with_pr: 0, without: 1}`, the mutant reports `{open: 1, with_pr: 1, without: 0}`
+    — a P0 silently dropped from the gap count a lane is chartered off. The guard predates this
+    change, but the change runs that regex over every row of every repo a fix lands in, so a
+    boundary defect that used to see one repo's PRs now sees ~448 more.
+
+    `#101` is included because the prefix relation goes both ways: a PR citing `#10114` must not
+    cover `#101` either, and a naive `startswith`-style match would take both.
+    """
+    other = "daniel-ospina/agent-infra"
+
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            state = args[args.index("--state") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if state == "open" else []
+            # The ONLY citation in either repo is `#10114` — a fix for 10114, not for 1011/101.
+            return ([pr(3368, ref="fix/10114-pin-tree-is-a-holder",
+                         title="fix(reaper): the thing (#10114)")] if state == "open" else [])
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (1011,), "P1-severe": (101,)}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    assert other in bp.FIX_REPOS
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 0, "without": 1}, (
+        "#1011 must NOT be covered by a citation of #10114 — a prefix match silently drops a P0 "
+        "from the gap count, which is the miss this instrument exists to report")
+    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}, (
+        "#101 must NOT be covered by a citation of #10114 either — the boundary holds in both "
+        "directions")
+
+
 def test_the_phase_clock_restores_the_deadline_it_found(monkeypatch):
     """⛔ THE RESTORE IS A CONTRACT, AND IT WAS UNPINNED IN BOTH DIRECTIONS (#3457 review round 7).
 
@@ -1469,6 +1511,18 @@ def test_the_phase_clock_restores_the_deadline_it_found(monkeypatch):
 
     assert bp._PHASE_DEADLINE == outer, (
         "the outermost block must restore the deadline that was there BEFORE it, not `None`")
+
+    # ⛔ AND IT MUST NOT SWALLOW WHAT HAPPENS INSIDE IT (#3457 review round 8). `__exit__` returns
+    # `False`, and that was unpinned: mutating it to `return True` left 38 passed, because the
+    # restore is asserted and the exception's fate is not. A swallowed exception means `main()`'s
+    # handler — the one whose recorded detail the module calls invaluable in a hand run — never
+    # runs, the tick prints a bare `unavailable`, and NOTHING is red. The clock is restored on the
+    # way out either way, so both halves are asserted here.
+    with pytest.raises(RuntimeError, match="boom"):
+        with bp._phase_clock():
+            raise RuntimeError("boom")
+    assert bp._PHASE_DEADLINE == outer, (
+        "an exception must not leave the phase clock spent either")
 
 
 def test_a_spent_phase_clock_refuses_the_read_instead_of_spawning(monkeypatch):

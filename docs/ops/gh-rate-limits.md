@@ -104,8 +104,12 @@ REST call answered in 0.43 s — the fleet lost its own progress measurement whi
 existed. That reader therefore keeps a REST fallback of its own (`_rest_prs`), and the rules it
 follows are the reusable ones:
 
-* **Same source or no metric.** If EITHER GraphQL list fails, BOTH are re-read over REST. A REST
-  open-count beside a GraphQL merged-count compares two differently-wrong reads.
+* **Same source or no metric — for the TRACKER pair.** If EITHER of the tracker's GraphQL lists
+  fails, BOTH are re-read over REST. A REST open-count beside a GraphQL merged-count compares two
+  differently-wrong reads, and `merged_today` is a DIFFERENCE between those two windows, so the
+  hazard is the pairing. The fix-repo lists (#3457) are read per `(repo, state)` and mix sources
+  freely: `covered()` ORs over rows, so an open list from one source beside a merged list from
+  another cannot produce a wrong difference — each list is individually complete or refused.
 * **`limit` bounds ROWS READ, not rows returned.** The loop advances on the rows it FETCHED, so it
   spends the same row budget `gh pr list --limit` spent. In the closed window those rows are then
   filtered to merges, so the merged list holds the merges among the `limit` most-recently-updated
