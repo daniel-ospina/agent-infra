@@ -743,6 +743,17 @@ def parse_json(ran: Ran, what: str) -> Tuple[Optional[Any], Optional[str]]:
 
 # ── the liveness axis: ONE verdict function, applied ─────────────────────────────────────────
 
+# ⛔ MIRRORS `scripts/lane-status.py`'s `ABANDON_S` (= 30 * 60), THE PRODUCER'S OWN BOUND FOR
+# "may this child record still SUPPRESS an action verdict". `lane-status.py` runs as a SUBPROCESS here
+# (see `fleet_rows`), so the value cannot be imported — it is named once, here, with a parity arm in
+# `test_server.py` that reads the producer's definition and reds if the two drift.
+# ⛔ WHY IT IS NEEDED AT ALL: `child_stale` is an AGE IN SECONDS, not a flag (`lane-status.py`:
+# `int(time.time() - os.path.getmtime(child_file))`). `bool()` collapses "any age >= 1 s" to "stale",
+# which silently drops the step-3 veto for every child older than one second — i.e. exactly the
+# `FINDING-lane-classifier-ignores-task-children` defect the step exists to fix.
+CHILD_ABANDON_S = 30 * 60
+
+
 class Liveness:
     """The decision tree, applied to a registry record.
 
@@ -835,16 +846,41 @@ class Liveness:
         if lane_rows is not None:
             joined = self._join(row, lane_rows)
             if isinstance(joined, dict):
-                sources["step2"] = {"row": joined.get("ws"), "cpu_busy": joined.get("cpu_busy"),
-                                    "source": note}
-                cpu = lv.CpuSample(advanced=joined.get("cpu_busy"), delta_s=None,
-                                   window_ms=None, source="lane-status.py::lane_cpu_busy")
+                # ⛔ THE ROW'S KEY IS `cpu`, NOT `cpu_busy` (verified against the producer:
+                # `lane-status.py`'s `out.append(dict(..., cpu=_cpu, cpu_any=_cpu_any, ...))`).
+                # `cpu_busy` exists ONLY as a `classify()` keyword there, so reading it here returned
+                # `None` on every row — step 2 could never fire on this surface, while the payload
+                # published `source="lane-status.py::lane_cpu_busy"` and a `step2` block naming a
+                # measurement nobody took. `lane_cpu_busy()`'s exactly-one-attribution answer is
+                # `cpu`; `cpu_any` is the deliberately WEAKER #1867 read ("a pi in this lane's own
+                # pane advanced") and is REPORTED, never promoted to step-2 evidence — promoting it
+                # would claim an exact attribution the producer did not make.
+                cpu_busy = joined.get("cpu")
+                if not isinstance(cpu_busy, bool):
+                    cpu_busy = None          # not-read is `None`, never a guessed False
+                sources["step2"] = {"row": joined.get("ws"), "cpu": cpu_busy,
+                                    "cpu_any": joined.get("cpu_any"), "source": note}
+                if cpu_busy is None:
+                    sources["step2"] = dict(
+                        sources["step2"],
+                        unmeasured="UNMEASURED(the row carries no `cpu` attribution: "
+                                   "lane_cpu_busy declined, so step 2 abstains)")
+                cpu = lv.CpuSample(advanced=cpu_busy, delta_s=None, window_ms=None,
+                                   source=("lane-status.py::lane_cpu_busy" if cpu_busy is not None
+                                           else ""))
                 kid = joined.get("child")
+                # ⛔ `child_stale` IS AN AGE IN SECONDS. The producer's own suppression rule is
+                # `child_stale > ABANDON_S` (`child_suppresses`), and `None` (no child file, or an
+                # unreadable stat) is "absence never counts against a child" -> NOT stale.
+                cs = joined.get("child_stale")
+                if isinstance(cs, bool) or not isinstance(cs, (int, float)):
+                    cs = None
                 child = lv.ChildEvidence(sid=str(kid or ""), in_flight=bool(kid),
-                                         stale=bool(joined.get("child_stale")),
+                                         stale=(cs is not None and cs > CHILD_ABANDON_S),
                                          grew=joined.get("child_grew"),
                                          source="lane-status.py::child_suppresses")
-                sources["step3"] = {"child": kid, "stale": joined.get("child_stale"),
+                sources["step3"] = {"child": kid, "child_stale_s": cs,
+                                    "abandon_s": CHILD_ABANDON_S, "stale": child.stale,
                                     "grew": joined.get("child_grew"), "source": note}
             else:
                 sources["step2"] = "UNMEASURED(%s + %s)" % (note, joined)
@@ -1502,6 +1538,14 @@ ALLOWLIST = {
 
 GIT_OK_VERBS = ("status", "log", "rev-parse", "ls-files", "show", "diff")
 DISK_OK_VERBS = ("-l", "-la", "-lh", "-lah", "-t", "-lt")
+# ⛔ `--output` IS A FILE WRITE, AND THE ALLOWLIST ABOVE GATES THE VERB ONLY. Measured on this tree:
+# `git show --output=/tmp/x HEAD` → rc=0, 7762 B written; `git log --output=/tmp/x -1` → 2038 B;
+# `git diff --output=/tmp/x` likewise. The metacharacter filter does not catch it (there is no `>`), so a
+# `box.exec` call whose argv is `["git", "show", "--output=<path>"]` WRITES an arbitrary file on a
+# cell — through a gate whose own refusal text says "FAIL-CLOSED: never a pass-through" — and every
+# read-only verb above accepts it. `cat` is the same escape in reverse: plant content, read it back.
+# The check is a REFUSAL BY SHAPE, before the verb check, so it also covers a future verb added above.
+WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
 
 
 def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[bool, Dict[str, Any]]:
@@ -1573,6 +1617,17 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
     for token in argv:
         if any(ch in token for ch in "|&;><`$\n\r\\"):
             return False, "refusing %r: shell metacharacters have no meaning in an argv surface" % token
+    # ⛔ A WRITE-ESCAPE IS NOT A SHELL METACHARACTER, SO THE FILTER ABOVE MISSES IT. `git`'s
+    # `--output=<path>` (and `--outfile=`) writes a file the caller chose, on a command the allowlist
+    # only ever meant to READ; `cat` reads back whatever was planted. Refused by SHAPE, on every verb,
+    # so a verb added to GIT_OK_VERBS later cannot reintroduce it. Both the `=` and the bare-flag form
+    # are covered because `--output <path>` is equally a write.
+    for token in argv:
+        low = token.lower()
+        for bad in WRITE_ESCAPE_TOKENS:
+            if low == bad or low.startswith(bad + "="):
+                return False, ("refusing %r: %s writes a file the caller names — an argv surface "
+                               "allowlisted for READING is not a write channel" % (token, bad))
     if prog == "git" and (not rest or rest[0] not in GIT_OK_VERBS):
         return False, "git verb %r is not read-only" % (rest[0] if rest else "")
     if prog in ("cat", "wc", "sha256sum", "pgrep") and not rest:
