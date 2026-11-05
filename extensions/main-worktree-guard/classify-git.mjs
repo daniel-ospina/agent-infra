@@ -10571,6 +10571,7 @@ export function maskRemoteExecPayloads(command) {
   let last = 0;            // source offset already emitted
   let masking = false;     // inside a masked payload run
   let payloadEmitted = false; // the placeholder has been written at least once
+  let localSubstMasked = false; // a local substitution was found INSIDE a masked run
   let verbatimNextWord = null; // true | "heredoc" — the redirect operand is text, not payload
   const verbatimTo = (end) => {
     if (end > last) out += s.slice(last, end);
@@ -10701,6 +10702,13 @@ export function maskRemoteExecPayloads(command) {
       continue;
     }
     if (tk.localSubst) {                     // runs in THIS shell — never masked
+      // ⛔ Keeping the token verbatim is necessary but NOT sufficient: a local
+      // substitution that sits INSIDE the run being masked (`sh -c "echo $(git
+      // worktree add loc)"` — double quotes do not stop substitution) loses the
+      // `sh -c` SPAWNER wrapper that #1919 walks, so the surviving text reads as
+      // inert. origin/main refused that command; the mask turned it into an allow
+      // (review #3478 cycle 7 P1). Record it and leave the whole command unmasked.
+      if (masking) localSubstMasked = true;
       endMask();
       verbatimTo(tk.end);
       k++;
@@ -10722,6 +10730,9 @@ export function maskRemoteExecPayloads(command) {
   // #3478 cycle 5 P0). `_rbFeedsLocalShell` only inspects `|` stages, so bail here:
   // a false bail only re-gates, a false allow EXECUTES.
   if (out !== s && /[<>]\(/.test(out)) return s;
+  // ⛔ A local substitution INSIDE the masked run: the spawner wrapper that made
+  // it detectable is gone, so the command is left unmasked (review #3478 cycle 7 P1).
+  if (localSubstMasked) return s;
   // \u26d4 A substitution whose body is the payload runs the remote stdout HERE.
   if (out !== s && _rbSubstFeedsShell(out)) return s;
   return out;
@@ -10783,7 +10794,11 @@ function _rbSubstFeedsShell(text) {
     // The enclosing simple command: back to the previous top-level separator.
     const prefix = s.slice(0, i);
     const cut = Math.max(prefix.lastIndexOf(";"), prefix.lastIndexOf("&&"), prefix.lastIndexOf("||"),
-      prefix.lastIndexOf("|"), prefix.lastIndexOf("\n"), prefix.lastIndexOf("("));
+      prefix.lastIndexOf("|"), prefix.lastIndexOf("\n"), prefix.lastIndexOf("("),
+      // `&` backgrounds the consumer, so the NEXT word is a command again
+      // (`grep x & bash -c $(…)`) — not cutting there let a data consumer hide a
+      // real executor (review #3478 cycle 7 P2).
+      prefix.lastIndexOf("&"));
     const seg = prefix.slice(cut + 1).trim();
     if (!seg) return true;                            // command position ⇒ EXECUTES
     const words = seg.split(/\s+/).filter(Boolean);
@@ -10827,7 +10842,10 @@ function _rbFeedsLocalShell(text) {
   const ph = REMOTE_PAYLOAD_PLACEHOLDER;
   // A pipeline continued on the next line is ONE pipeline — do not split there.
   const joined = text.replace(/\|&?\s*\n/g, "|");
-  for (const cmd of joined.split(/;|&&|\|\||\n/)) {
+  // `|&` is a PIPE, not a background job — normalise it before splitting on `&`,
+  // or `… |& bash -s` splits into `… |` and `bash` and the stage head vanishes.
+  const cmdText = joined.replace(/\|&/g, "|");
+  for (const cmd of cmdText.split(/;|&&|\|\||\n|&/)) {
     if (!cmd.includes(ph)) continue;
     const stages = cmd.split(/\|&?/);
     for (let idx = 1; idx < stages.length; idx++) {

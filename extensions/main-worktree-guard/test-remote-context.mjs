@@ -32,7 +32,7 @@
 //   Part B — BEHAVIORAL: the REAL index.ts handler, driven against a hermetic
 //            hub. Each pinned case asserts BOTH directions: the remote form is
 //            ALLOWED and the SAME command run locally is still REFUSED.
-//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): NINETEEN mutants are
+//   Part M — MUTATION EVIDENCE (--mutations, its own CI step): TWENTY mutants are
 //            built in a TEMP copy of this extension and each must redden the
 //            specific assertion it reverts — the pre-fix identity mask, an
 //            over-reaching mask that ignores separators, a swallowed heredoc
@@ -44,8 +44,9 @@
 //            quote removal, a pipe bail that skips no redirection target, an
 //            array literal treated as command position, an undecodable ANSI-C
 //            escape taken literally, a CRLF delimiter word trimmed, a paren depth
-//            ignored for the heredoc newline, and a process substitution not
-//            bailed. The leg FAILS (never skips green) when the real-module
+//            ignored for the heredoc newline, a process substitution not bailed, a
+//            substitution feeding a local command, a delimiter continuation kept
+//            as a newline, and a local substitution masked anyway. The leg FAILS (never skips green) when the real-module
 //            loader is unavailable, because it is evidence.
 //
 // Run: node extensions/main-worktree-guard/test-remote-context.mjs
@@ -599,6 +600,33 @@ expectTrue("A34c: a substitution fed to grep is still masked",
   mask(`grep $(cmux vm exec cell-a -- printf x) file`).includes(REMOTE_PAYLOAD_PLACEHOLDER),
   JSON.stringify(mask(`grep $(cmux vm exec cell-a -- printf x) file`)));
 
+// A36 (#3478 review cycle 7 P1): a local substitution INSIDE the masked run loses
+// the `sh -c` SPAWNER wrapper that #1919 walks, so keeping the token verbatim was
+// not enough — origin/main refused `sh -c "echo $(git worktree add loc)"` and the
+// mask turned it into an allow. A local substitution found inside a masked run
+// leaves the WHOLE command unmasked.
+for (const c of [
+  `cmux vm exec cell-a -- sh -c "echo $(git worktree add loc)"`,
+  `cmux vm exec cell-a -- sh -c "$(git worktree add loc)"`,
+  `cmux vm exec cell-a -- sh -c "echo x $(git worktree add loc) y"`,
+  `cmux vm exec cell-a -- sh -c "x=$(git worktree add loc); echo $x"`,
+  "cmux vm exec cell-a -- sh -c \"echo ${x:-$(git worktree add loc)}\"",
+  `cmux vm exec cell-a -- sh -c "echo \`echo $(git worktree add loc)\`"`,
+  `ssh cell-a sh -c "echo $(git worktree add loc)"`,
+  `docker exec c sh -c "echo $(git worktree add loc)"`,
+]) {
+  expect("A36: a local substitution INSIDE the payload leaves the command UNMASKED", mask(c), c);
+}
+// …while the SINGLE-quoted spelling (remote text, no local execution) is still masked.
+for (const c of [
+  `cmux vm exec cell-a -- sh -c 'echo $(git worktree add loc)'`,
+  `cmux vm exec cell-a -- sh -c 'git worktree add rev'`,
+]) {
+  expectTrue(`A36b: remote script text is still masked — ${JSON.stringify(c)}`,
+    mask(c).includes(REMOTE_PAYLOAD_PLACEHOLDER), JSON.stringify(mask(c)));
+}
+
+
 // A35 (#3478 review cycle 6 P2): a `\`+newline INSIDE a delimiter word is DELETED by
 // bash (not a newline). Emitting the newline computed a delimiter the shell never
 // uses, so no terminator matched and the mask ran to end-of-string.
@@ -937,11 +965,16 @@ if (typeof stripTypeScriptTypes !== "function" ||
           // revert keeps only the opening token (the shipped defect), so the pin
           // that requires the region to survive must go RED. Asserted at the MASK
           // level, because that is the unit the revert changes.
+          // ⚠️ This is the AGGREGATE "cycle-1 world" revert: the region is defended
+          // twice now (region-keeping AND the local-substitution bail), so both are
+          // removed here. The bail's OWN discriminator is the dedicated
+          // `local substitution masked with its spawner` mutant below.
           label: "unquoted backtick region split",
           kind: "mask",
           revert: (src) => src
             .split("i = _rbBacktickRegionEnd(s, i)").join("i = i + 1")
-            .replace("  if (out !== s && _rbSubstFeedsShell(out)) return s;", "  // MUTANT: no substitution bail"),
+            .replace("  if (out !== s && _rbSubstFeedsShell(out)) return s;", "  // MUTANT: no substitution bail")
+            .replace("  if (localSubstMasked) return s;", "  // MUTANT: no local-substitution bail"),
           maskProbe: "cmux vm exec cell-a -- `git reset --hard`",
           check: (out) => !String(out).includes("git reset --hard"),
         },
@@ -1147,6 +1180,21 @@ if (typeof stripTypeScriptTypes !== "function" ||
             .join("/* MUTANT: continuation kept as newline */"),
           maskProbe: "cmux vm exec cell-a -- sh -s <<EO\\\nS\n:\nEOS\ngit worktree add cont1\n",
           check: (out) => !String(out).includes("git worktree add cont1"),
+        },
+        {
+          // #3478 review cycle 7 P1: a local substitution INSIDE the masked run loses
+          // the `sh -c` SPAWNER wrapper #1919 walks, so the whole command must be left
+          // unmasked. This is the DEDICATED discriminator for that bail (pins A36/A36b):
+          // with it removed the spawner wrapper is masked away again.
+          label: "local substitution masked with its spawner",
+          kind: "mask",
+          revert: (src) => src.replace(
+            "  if (localSubstMasked) return s;",
+            "  // MUTANT: no local-substitution bail",
+          ),
+          maskProbe: `cmux vm exec cell-a -- sh -c "echo $(git worktree add loc)"`,
+          // RED means: the mask HID the `sh -c` spawner wrapper that #1919 walks.
+          check: (out) => !String(out).includes("sh -c"),
         },
       ];
 
