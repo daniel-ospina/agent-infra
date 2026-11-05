@@ -921,9 +921,10 @@ ANCHORS = {
     ),
     # ── G15 (the harness pin-tree veto, #10114) ── ONE ANCHOR PER INPUT of the veto: the record probe,
     # the shape backstop, the `$HOME` guard, the sha-record derivation, the NORMALISATION of that derivation,
-    # the QUOTING of the `$HOME` element, and the `$CELL_HOME` element. ⛔ NO COUNT IN THIS SENTENCE ON
-    # PURPOSE: it read "four" over five entries and then "six" over seven, and a numeral that has to be
-    # maintained by hand is a claim this file cannot keep true. The dict is the count.
+    # the QUOTING of the `$HOME` element, the `$CELL_HOME` element, and the ABSOLUTENESS of the record
+    # content. ⛔ NO COUNT IN THIS SENTENCE ON PURPOSE: it read "four" over five entries and then "six"
+    # over seven, and a numeral that has to be maintained by hand is a claim this file cannot keep true.
+    # The dict is the count.
     # The veto shipped with no mutation leg at all, and that is precisely how two of its assertions
     # passed vacuously through three recorded clean reviews.
     # (1) delete the RECORD-BASED probe entirely, leaving the shape backstop. The row then reads
