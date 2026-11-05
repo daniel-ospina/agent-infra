@@ -2450,7 +2450,7 @@ reap_runner_work() {
            # ⛔ "entries" ALONE IS INCOMPLETE AT THIS HEAD: the owner also counts a ROOT whose listing
            # could not be read (`reason=unlistable`) into the same field, because that is the same
            # abstention one level up — a root it could not look into was never measured either.
-           [ "$RW_UNMEAS" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${RW_UNMEAS} entr$( [ "$RW_UNMEAS" = 1 ] && printf 'y' || printf 'ies')/root$( [ "$RW_UNMEAS" = 1 ] && printf '' || printf 's') KEPT as unreadable (the bounded walk could not answer, which is never proof of death); see unmeasurable_runner_work" ;;
+           [ "$RW_UNMEAS" -gt 0 ] && NOTE_RW="${NOTE_RW}${NOTE_RW:+; }${RW_UNMEAS} entr$( [ "$RW_UNMEAS" = 1 ] && printf 'y' || printf 'ies')/root$( [ "$RW_UNMEAS" = 1 ] && printf '' || printf 's') KEPT as UNMEASURED (the owner got no answer — an unreadable entry/root, a bounded walk that ran out of time, OR a root that CHANGED under the pass and was not followed; none of those is proof of death); see unmeasurable_runner_work" ;;
     esac
     # ⛔ AN EXPLICIT GLOB LIST THAT MATCHED NOTHING IS `misconfigured`, NEVER A MEASURED ZERO — the same
     # rule (and the same shape) as `venv-no-repo`: a class that scanned NOTHING is not a pass, and the
@@ -2494,8 +2494,8 @@ reap_runner_work() {
     # problem that did not exist and pointed the operator at the wrong remedy. The remedy differs per
     # path, so the note does not guess: it states the tally and says the count is unknown.
     if [ "$_rw_census" = "abstained" ]; then
-        log_line "disk-reaper: ⚠️  class=runner-work ABSTAINED — nothing under a matched _work root could be CLASSIFIED (${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read), so the owner's candidates=0 is an ABSTENTION, not a measurement (the entries were KEPT)"
-        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be read and nothing was classified, so the candidate count is UNKNOWN, not 0"
+        log_line "disk-reaper: ⚠️  class=runner-work ABSTAINED — nothing under a matched _work root could be CLASSIFIED (${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be MEASURED — read failure, watchdog, or a root that changed under the pass), so the owner's candidates=0 is an ABSTENTION, not a measurement (the entries were KEPT)"
+        NOTE_RW="${NOTE_RW}${NOTE_RW:+; }the runner-work census ABSTAINED: ${RW_UNMEAS:-?} entr$( [ "${RW_UNMEAS:-0}" = 1 ] && printf 'y' || printf 'ies')/root$( [ "${RW_UNMEAS:-0}" = 1 ] && printf '' || printf 's') could not be measured (read failure, watchdog, or a root that changed under the pass) and nothing was classified, so the candidate count is UNKNOWN, not 0"
         RW_ABSTAINED=1
     fi
     # ⛔ A PARTLY-UNREADABLE POPULATION IS STILL AN ABSTENTION, ONE STATE OVER. `census=abstained` only
@@ -2712,13 +2712,15 @@ else
 fi
 
 TOTAL=$(( FREED_UV + FREED_VENV + FREED_WT + FREED_DUP + FREED_RW ))
-UNMEASURED=""; DF_UNM=""; LEDGER_UNM=""
+UNMEASURED=""; DF_UNM=""; LEDGER_UNM=""; SETUP_UNM=""
 _um() { UNMEASURED="${UNMEASURED}${UNMEASURED:+, }$1"; }
 _um_df() { _um "$1"; DF_UNM="${DF_UNM}${DF_UNM:+, }$1"; }
 # Adds to the PUBLISHED list only when the class is not already named there. One class can be unmeasured
 # for two reasons at once (a setup failure whose `df` ALSO could not answer), and a list that names it
 # twice is a list an operator reads as two classes.
 _um_uniq() { case ",$UNMEASURED," in *",$1,"*) : ;; *) _um "$1" ;; esac; }
+# Membership, for the surfaces that must EXCLUDE a class this list names (the "measured" sum below).
+_is_unm() { case ",$UNMEASURED," in *",$1,"*) return 0 ;; esac; return 1; }
 [ "${DF_UV_OK:-0}"  = 1 ] || _um_df uv
 [ "${DF_VENV_OK:-0}" = 1 ] || _um_df venv
 [ "${DF_WT_OK:-0}" = 1 ] || _um_df worktree
@@ -2756,7 +2758,12 @@ for _cv in uv venv worktree duplicate-install runner-work; do
         duplicate-install) _ck=DUP ;; runner-work) _ck=RW ;;
     esac
     eval "_cver=\${VERDICT_$_ck:-not-run}; _cw=\${WANT_$_ck:-0}"
-    if [ "$_cver" = misconfigured ] && [ "$_cw" = 0 ]; then _um_uniq "$_cv"; fi
+    # ⛔ AND ITS OWN REASON CHANNEL. `DF_UNM`/`LEDGER_UNM` are the two causes the pass-end line already
+    # explains; the third arrived here, so without this list the line said `freed_df=unmeasured` and named
+    # NO cause for the class it had just excluded — measured on the arm this fix exists for.
+    if [ "$_cver" = misconfigured ] && [ "$_cw" = 0 ]; then
+        _um_uniq "$_cv"; SETUP_UNM="${SETUP_UNM}${SETUP_UNM:+, }$_cv"
+    fi
 done
 # ⛔ AN UNANSWERABLE TOTAL IS `?`, NOT THE INITIALISED ZERO. `CAND_*` are initialised to 0 and are
 # only lifted to a sentinel on the CLASS line, so a fail-closed class printed `candidates=?` on its own
@@ -2802,11 +2809,27 @@ done
 _total_unmeasured=0
 if ! is_dry && [ -n "$UNMEASURED" ]; then _total_unmeasured=1; fi
 # The sum of the classes that WERE measured — a coerced 0 is not a measurement, so it is not a term.
-_measured_total=0
+# ⛔ AND A CLASS THE LIST NAMES IS NOT A TERM, WHATEVER ITS `DF_*_OK` SAYS (#3057 review cycle 2, P2). Every
+# setup-failure arm pins `DF_<C>_OK=1`, so keying this sum on that flag alone readded the initialised 0 this
+# whole block exists to keep out — and printed it as `measured classes: 0MB` on a pass where NOTHING was
+# measured, which an operator reads as "we measured, and it was zero". MEASURED before this fix
+# (`--apply --only runner-work`, explicit seam matching nothing): `freed_df=unmeasured (measured classes:
+# 0MB)` with no cause named. The sum now asks the SAME list as the total AND requires the class to have been
+# SELECTED (a `--only`-deselected class leaves `DF_*_OK=1` with an initialised `0`, which is "contributes
+# nothing", not "measured 0" — counting those printed `0MB` for a pass in which no class ran at all), and it
+# says `none` when that set is empty.
+_measured_total=0; _measured_n=0
 for _mc in UV VENV WT DUP RW; do
-    eval "_mok=\${DF_${_mc}_OK:-0}; _mfreed=\${FREED_${_mc}:-0}"
-    if [ "$_mok" = 1 ]; then _measured_total=$(( _measured_total + _mfreed )); fi
+    eval "_mok=\${DF_${_mc}_OK:-0}; _mfreed=\${FREED_${_mc}:-0}; _mw=\${WANT_${_mc}:-0}"
+    case "$_mc" in
+        UV) _mname=uv ;; VENV) _mname=venv ;; WT) _mname=worktree ;;
+        DUP) _mname=duplicate-install ;; RW) _mname=runner-work ;;
+    esac
+    if [ "$_mok" = 1 ] && [ "$_mw" = 1 ] && ! _is_unm "$_mname"; then
+        _measured_total=$(( _measured_total + _mfreed )); _measured_n=$(( _measured_n + 1 ))
+    fi
 done
+[ "$_measured_n" -gt 0 ] || _measured_total=none
 # ⛔ `_pc` IS DEFINED BEFORE THE BRANCH, NOT INSIDE IT: the pass-end `log` line below renders every class
 # field with it, and that line runs on a DRY RUN too — defined in the `else`, it made the dry-run log line
 # "command not found", i.e. the surface that is supposed to say what happened said nothing.
@@ -2820,7 +2843,8 @@ else
     _unmwhy=""
     [ -n "$DF_UNM" ] && _unmwhy="df could not measure: $DF_UNM"
     [ -n "$LEDGER_UNM" ] && _unmwhy="${_unmwhy}${_unmwhy:+ — }owner never answered its ledger: $LEDGER_UNM"
-    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %sMB)' "$_measured_total" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner-work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW"))${_unmwhy:+ — $_unmwhy (not a measured zero)}"
+    [ -n "$SETUP_UNM" ] && _unmwhy="${_unmwhy}${_unmwhy:+ — }could not be set up: $SETUP_UNM"
+    log_line "disk-reaper: pass end mode=apply verdict=$verdict $([ -n "$UNMEASURED" ] && printf 'freed_df=unmeasured (measured classes: %s)' "$( [ "$_measured_total" = none ] && printf 'none' || printf '%sMB' "$_measured_total" )" || printf 'freed_df=%sMB' "$TOTAL") (uv=$(_pc "${DF_UV_OK:-0}" "$FREED_UV" "$WANT_UV") venv=$(_pc "${DF_VENV_OK:-0}" "$FREED_VENV" "$WANT_VENV") worktree=$(_pc "${DF_WT_OK:-0}" "$FREED_WT" "$WANT_WT") duplicate-install=$(_pc "${DF_DUP_OK:-0}" "$FREED_DUP" "$WANT_DUP") runner-work=$(_pc "${DF_RW_OK:-0}" "$FREED_RW" "$WANT_RW"))${_unmwhy:+ — $_unmwhy (not a measured zero)}"
 fi
 
 # ── record it ───────────────────────────────────────────────────────────────────────────────────

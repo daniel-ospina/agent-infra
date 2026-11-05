@@ -1066,7 +1066,12 @@ is `unmeasured` — `df` silent, the owner silent, **a class that could not be s
 measurement and `alert=under-reclaim` asserts on that sum ("the pass RAN and did not keep up", which a
 total that silently counted an unknown as 0 would raise against a class that DID keep up). The measured
 part is not lost: the pass-end line prints it as `freed_df=unmeasured (measured classes: NMB)`, the sum of
-the classes that WERE measured. **A DRY RUN IS THE EXCEPTION**: it removed nothing, so `freed_mb=0` there
+the classes that were **SELECTED** and measured — `none` when that set is empty, because a deselected or
+never-set-up class contributes nothing and printing `0MB` for a pass in which no class actually ran is the
+same invented zero one surface over (#3057 review cycle 2, P2: keyed on `DF_*_OK` alone it read
+`measured classes: 0MB` for a pass whose only class never ran). That line now also names the third cause
+(`could not be set up: <class>`) beside the two it already carried, so the figure and its reason travel
+together. **A DRY RUN IS THE EXCEPTION**: it removed nothing, so `freed_mb=0` there
 is a real measurement and is recorded as one.
 ⛔ **THE THIRD CAUSE WAS DOCUMENTED AND NOT IMPLEMENTED, AND THAT IS THE WORST OF THE TWO** (#3057 review,
 P2). Every setup-failure arm pins `DF_<class>_OK=1` — deliberately, so `detail=` does not blame `df` for a
@@ -1361,19 +1366,19 @@ with that case's arm neutered (must fail), so a case that has stopped checking a
 | M | an **EMPTY census** on the `lsof`/`ps` arm is a refusal, never "nothing is live" (the `ps` block's early `return` used to skip the empty-table gate) | `if command -v "$_lp_ps_probe" …; then` → `… || return 0; if true; then` |
 | N | **re-probe before removal**: a lane that enters an old, clean worktree DURING the pass preserves it (`reason=toctou`) | `if ! toctou_preserve "$canon"; then` → `if false; then` |
 
-The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **21 case functions driven
-23 times + 38 mutants, 61 outcomes per box** (case (s) is driven TWICE, at its two vanish sites), each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
+The newest class has its own suite, `scripts/disk-reaper-runner-work.test.sh` — **22 case functions driven
+23 times + 39 mutants, 62 outcomes per box** (case (s) is driven TWICE, at its two vanish sites), each outcome passed or failed — also mutation-checked. A run ADDITIONALLY states how
 many arms it **skipped** — ⛔ not "a third outcome": `skipped` is counted on its own line, orthogonal to
 the outcome tally, because an arm that did not run proves nothing and must not be read as one that passed. Run
 against the PRE-CHANGE tree (`origin/main`'s `disk-reaper.sh` beside this tree's owner) it reports **24 passed,
-37 failed, 2 skipped**, and against this tree **61 passed, 0 failed, 4 skipped**: the discrimination is
+38 failed, 2 skipped**, and against this tree **62 passed, 0 failed, 5 skipped**: the discrimination is
 measured both ways, not asserted. (The red on the pre-change tree is 20 of the 23 case runs — every case whose
 subject runs through the ENTRY POINT, which on that tree has no `class=runner-work` at all: (a), (b), (c),
 (d), (e), (f), (g), (h), (j), (k), (l), (n), (o), (p), (r), (s) BOTH arms, (t), (v) and (w); the owner-only cases (i), (m) and
-(q) stay green — plus **17** mutants that cannot even be applied there, because the arms they edit do not
+(q) stay green — plus **18** mutants that cannot even be applied there, because the arms they edit do not
 exist in that tree. The 21 mutants that DO still apply are reported "caught" only because their case is already
 red on that tree, so the green run above is the discriminating measurement, not that one. The two rows
-COMPOSE: 20 red case outcomes + 17 unappliable mutants = the 37 failures, and 21 applicable mutants (each
+COMPOSE: 20 red case outcomes + 18 unappliable mutants = the 38 failures, and 21 applicable mutants (each
 "caught") + the 3 owner-only cases = the 24 passes.)
 
 ⚠️ **A gap that WAS disclosed, and is now CLOSED by measurement — BY THE SUITE THAT ACTUALLY ASSERTS IT.**
@@ -1420,24 +1425,24 @@ suite below could not be read as covering it. It was then **run to completion at
 pass is preserved, `reason=toctou`) — the same case and the same count as the pre-change baseline, i.e.
 pre-existing and not this class's. That tally is recorded here as what it is — the classes suite's own
 result, on the fields it actually asserts — and **not** as this class's evidence, which it never was. The
-record fields are MEASURED at this head by case (b) (`61 passed, 0 failed, 4 skipped` at this head on this
+record fields are MEASURED at this head by case (b) (`62 passed, 0 failed, 5 skipped` at this head on this
 box — it has real runner roots, so the (f) default-glob arm is skipped by name; the earlier
 `0 skipped` row was taken on a laptop and is not restated as this head's); the caveat that
 stood here for one revision is recorded rather than dropped silently, because "we could not measure it"
 and "it is fine" are different claims and only the first one was ever true.
 
 The measured transcript, `./scripts/disk-reaper-runner-work.test.sh`, at this head on a box that HAS
-real runner roots (so the (f) default-glob arm is skipped by name, FOUR times):
+real runner roots (so the (f) default-glob arm is skipped by name, FIVE times):
 
 ```
-  61 passed, 0 failed, 4 skipped
+  62 passed, 0 failed, 5 skipped
 ```
 
 and the same suite with `DR_REAPER=` `origin/main`'s `disk-reaper.sh` (the pre-change tree, beside this
 tree's owner):
 
 ```
-  24 passed, 37 failed, 2 skipped
+  24 passed, 38 failed, 2 skipped
 ```
 
 ⛔ **THESE TALLIES WERE RE-MEASURED BECAUSE THE SUITE CHANGED, NOT BECAUSE THE ARITHMETIC LOOKED WRONG.**
@@ -1448,10 +1453,10 @@ case **(v)** (the two tallies the record used to drop, four arms) and mutants `o
 numbers above were taken by running the suite at this head,
 and the pre-change row is the same command with `DR_REAPER` pointed at the base commit — **19 case outcomes and
 16 unappliable mutants** are red there simply because the base entry point has no `class=runner-work` at
-all, and it reports **2 skips, not 4**, for two DIFFERENT reasons: only one of the four `(f)` invocation
+all, and it reports **2 skips, not 5**, for two DIFFERENT reasons: only one of the five `(f)` invocation
 sites gets that far on a tree whose entry point refuses them earlier, and case (v)'s conditional positive
 half fires DETERMINISTICALLY there — the base entry point emits no `df_raw` at all, so the arm that needs a
-nonzero delta can never run and now says so instead of vanishing (measured: `24 passed, 37 failed,
+nonzero delta can never run and now says so instead of vanishing (measured: `24 passed, 38 failed,
 2 skipped`, one of the skips being `v1 positive half`). That pre-change run is a discrimination check, not
 evidence: every mutant it reports "caught" is caught only because its case is already red.
 
@@ -1461,11 +1466,11 @@ now calls `skip()` and returns `CASE_SKIPPED`, which `expect_pass`/`expect_fail`
 of ✅ — so the arm is on the `skipped:` channel and NOT in the outcome tally, and its SIX mutants are
 reported as "NOT measured" rather than as `MUTANT SURVIVED` (five of them did report `MUTANT SURVIVED`
 before the sentinel; `(g)`'s read "caught" only because `(g)` itself was red there). Measured on this box under
-`unshare -r --map-root-user`: **52 passed, 0 failed, 13 skipped, exit 0**, with zero `MUTANT SURVIVED`
+`unshare -r --map-root-user`: **53 passed, 0 failed, 14 skipped, exit 0**, with zero `MUTANT SURVIVED`
 lines. Before the sentinel the same run printed `50 passed, 6 failed, 10 skipped, exit 1` — five of those
 reds being "MUTANT SURVIVED: the arm is not covered by this case" about arms that WERE covered and merely
 could not be built, i.e. a suite blaming its own coverage for a host limitation, on a box that reports
-healthy. `passed + the skipped CASE lines` still totals 61; the 13 skips are 4 `(f)` sites + 9 case
+healthy. `passed + the skipped CASE lines` still totals 62; the 14 skips are 5 `(f)` sites + 9 case
 invocations — `(l)` four times (real + `l`/`l2`/`l3`), `(r)` three times (real + `r1`/`r2`), and `(g)`
 twice (real + its single mutant). The per-case split is STRUCTURAL — it is the number of times each case is
 reached from the registration block — so it is derived from that block, not taken from a lucky run.
@@ -1476,25 +1481,26 @@ pin the seam to — and recording it as a passing check meant a CELL (which skip
 tally as a laptop on which every arm really ran. The skipped arms are now counted on
 their own line with their reason, so the two runs cannot be mistaken for each other. Measured AT THIS HEAD,
 on a box told to have real runner roots so the skip path is taken (`<entry>` is the entry point under test;
-`mut-f`, `mut-f3` and `mut-u` are the mutant copies the suite makes in its own `$T`):
+`mut-f`, `mut-f3`, `mut-f4` and `mut-u` are the mutant copies the suite makes in its own `$T`):
 
 ```
-  61 passed, 0 failed, 4 skipped
+  62 passed, 0 failed, 5 skipped
     skipped: (f) default-glob half, entry point <entry>/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-f3/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
+    skipped: (f) default-glob half, entry point <suite $T>/mut-f4/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
     skipped: (f) default-glob half, entry point <suite $T>/mut-u/disk-reaper.sh — this box HAS real runner roots (/opt or /tmp), so the empty-population arm was NOT measured; the documented defaults are asserted from the SOURCE instead
 ```
 
 **How those two numbers compose — `skipped` is ORTHOGONAL, so the arithmetic must not be "balanced".**
-`passed + failed` is the OUTCOME count (61 here: one line per case run and per mutant — 21 case functions
-driven 23 times, and 38
+`passed + failed` is the OUTCOME count (62 here: one line per case run and per mutant — 22 case functions
+driven 23 times, and 39
 mutants). `skipped` is an
 independent count of arms that did not run: `skip()` neither increments nor decrements `PASS` — it records
 a reason in a file the outer runner reads at the end — and the arm's own pass line still lands, because the
 assertions beside the skip (the source check of the documented default list) still run. So
-`61 passed … 4 skipped` reads as **61 outcomes, 0 of them failed, PLUS 4 arms that were not measured**, and
-`passed + skipped` legitimately EXCEEDS 61. ⛔ **A transcript is therefore never "corrected" on the grounds
+`62 passed … 5 skipped` reads as **62 outcomes, 0 of them failed, PLUS 5 arms that were not measured**, and
+`passed + skipped` legitimately EXCEEDS 62. ⛔ **A transcript is therefore never "corrected" on the grounds
 that `passed + skipped` exceeds the outcome count.** An earlier revision of this section did exactly that,
 on the false premise that a skip must displace a pass, and replaced a correct transcript with
 `20 passed, 0 failed, 2 skipped` — a line no head of this suite can print; the same false premise then
@@ -1504,12 +1510,12 @@ re-derived the number here to `24`. What is printed above is measured, not deriv
 ⚠️ **AND A CENSUS TOKEN NEVER OUTRANKS A REAL FAILURE.** `census=partial` co-occurs with `rc=4` (one unreadable entry, one removal that failed), and the override used to replace `removal-failed` with `partial` — the surviving word was the BENIGN one, printed under the ⚠️ symbol. `abstained`/`partial` are now applied only when the class verdict is `ok`, so `removal-failed`, `fail-closed` and `deferred` win.
 ⚠️ **AND `globs=` COUNTS PATTERNS, not expanded words.** The discovery split used to glob-expand before counting, so a two-pattern list whose wildcard matched two roots reported `globs=3`, and every `root … (glob …)` line printed the expansion instead of the pattern — the one thing that line exists to answer. The pattern list is now split with globbing off and expanded per pattern.
 
-Four skips, not two: `(f)` is driven from FOUR places in the suite — the real entry point, the `mut-f`
-mutant, `mut-f3` (the setup-failure-cause mutant, added in this revision), and `mut-u`'s mutant, which
-reaches `case_f` a FOURTH time — so an arm that skips `(f)` skips it four times, and "the same two skips"
-was already stale when it was written.
+Five skips, not two: `(f)` is driven from FIVE places in the suite — the real entry point, the `mut-f`
+mutant, and `mut-f3`/`mut-f4`/`mut-u`, the three mutants added in this revision that reach `case_f` again —
+so an arm that skips `(f)` skips it five times, and "the same two skips" was already stale when it was
+written.
 
-⛔ **AND THE SKIP COUNT IS NOT ALWAYS 4 — case (v) has a CONDITIONAL arm that names itself.** Its
+⛔ **AND THE SKIP COUNT IS NOT ALWAYS 5 — case (v) has a CONDITIONAL arm that names itself.** Its
 positive half ("having observed a nonzero `df` delta, the note offers it as a POSSIBLE own reclaim") can
 only be asserted when the pass actually observed a delta, and `df` is shared: a full fixture's worth of
 concurrent allocation on the same filesystem cancels it. **Measured**: across one run of the five
@@ -1517,10 +1523,10 @@ case-(v) invocations the arm ran 4 times and vanished once, and the tally then r
 whose skip count had quietly DROPPED by one — an arm that did not run, travelling as one that did, which is the
 exact defect the skip channel exists to remove. It now calls `skip()` with its reason, and the fixture
 is 16 MB (large enough that cancellation is unlikely, small enough to stay cheap), so a healthy run
-reports **4** skips and a run whose delta was cancelled reports that many MORE, each with its reason on
-the `skipped:` lines. **A tally whose skip count exceeds 4 is therefore not a regression** — read the
+reports **5** skips and a run whose delta was cancelled reports that many MORE, each with its reason on
+the `skipped:` lines. **A tally whose skip count exceeds 5 is therefore not a regression** — read the
 reasons before assuming one. The count is a function of the HOST and the TREE, not of the suite's health:
-**4** on a normal box with runner roots, **2** on the pre-change tree (one `(f)` site, plus case (v)'s arm
+**5** on a normal box with runner roots, **2** on the pre-change tree (one `(f)` site, plus case (v)'s arm
 firing deterministically there), **up to 9 more** on a box that runs as root (the `(g)/(l)/(r)` case skips
 above), and one more per case-(v) invocation whose pass observed no delta.
 
@@ -1531,7 +1537,7 @@ above), and one more per case-(v) invocation whose pass observed no delta.
 | (c) | `_work/_tool` and `_work/_actions` survive when they are the OLDEST thing in the tree, in the same pass that reaps a dead sibling | the `retain` ROWS are deleted from `WORK_LAYOUT` **and** the vendor-namespace default disabled (they are one arm, because the prefix default alone would still keep them) |
 | (d) | `--only runner-work` runs no other class, and a pass selecting another class does not run this one — whose record then answers `unmeasurable_runner_work=not-run`, the documented polarity for an unselected class, never a number | `want_class runner-work` → `true` |
 | (e) | an unknown `--only` value is refused, the valid list names `runner-work`, and a near-miss (`runner`) is refused too | the valid list is shortened in the refusal |
-| (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) — and the RECORD answers `?` for both `candidates_runner_work=` and `unmeasurable_runner_work=`, a class that measured nothing claiming no number at all. On a box with REAL runner roots (a cell) the default-glob half is **SKIPPED by name and counted on the `skipped` line — not as an outcome, and never as a pass** (the case itself still passes or fails on the source assertions beside the skip) — the documented default list is then asserted from the source — and `(b)` pins that the record carries the owner's `unmeasurable=` tally. ⛔ **AND THE ARMED HALF, which the dry arm structurally cannot see** (a dry run records `freed_mb_total=not-applicable` by design, so the defect only exists on the `--apply` pass the installed unit runs): a class that could not be set up publishes `not-run`, and the pass TOTAL follows it to `unmeasured` — never a measured `0`, and with **no** `alert=under-reclaim`, because "the pass ran and did not keep up" cannot be asserted about a pass whose only class never ran | the `census=no-roots` arm is deleted; and, separately, the `unmeasurable_runner_work=` `?` polarity answers `not-run`; and, separately, the setup-failure cause removed from the unmeasured list (a class that never ran is added back as a measured 0 and the alert fires again) |
+| (f) | an EXPLICIT glob list matching nothing is `misconfigured` + `?` (rc 3), while the DEFAULT globs matching nothing is a measured empty population (rc 0) — and the RECORD answers `?` for both `candidates_runner_work=` and `unmeasurable_runner_work=`, a class that measured nothing claiming no number at all. On a box with REAL runner roots (a cell) the default-glob half is **SKIPPED by name and counted on the `skipped` line — not as an outcome, and never as a pass** (the case itself still passes or fails on the source assertions beside the skip) — the documented default list is then asserted from the source — and `(b)` pins that the record carries the owner's `unmeasurable=` tally. ⛔ **AND THE ARMED HALF, which the dry arm structurally cannot see** (a dry run records `freed_mb_total=not-applicable` by design, so the defect only exists on the `--apply` pass the installed unit runs): a class that could not be set up publishes `not-run`, and the pass TOTAL follows it to `unmeasured` — never a measured `0`, and with **no** `alert=under-reclaim`, because "the pass ran and did not keep up" cannot be asserted about a pass whose only class never ran | the `census=no-roots` arm is deleted; and, separately, the `unmeasurable_runner_work=` `?` polarity answers `not-run`; and, separately, the setup-failure cause removed from the unmeasured list (a class that never ran is added back as a measured 0 and the alert fires again); and, separately, the same rule dropped from the pass-end "measured classes" figure (a pass that measured nothing prints a measured `0MB` and names no cause) |
 | (g) | a FULL-DISK FALLBACK pass (configured state dir **and** `$HOME` unwritable) still hands this owner a writable dir, so the class REAPS on the pass it most needs to. ⚠️ **Skipped by name (not passed) when the suite runs as root** — `chmod` cannot deny root, so the unwritable state dir cannot be created and there would be nothing to measure | the `REAP_RW_STATE_DIR` relay line is dropped from the fallback block |
 | (h) | a SET-but-EMPTY glob list is a refusal at **both** layers (the entry point's seam and the owner's), never "scan nothing for ever" — `${X:-default}` would substitute the *widest* sweep for an emptied value, and this class's output is deletions | the entry point's empty-glob arm never matches; and, separately, the owner's |
 | (i) | the owner's OWN `--glob` flag is an explicit assertion too: an unmatched `--glob` is a REFUSAL (rc 3, `census=no-roots`), never a measured empty population — the same verdict the `REAP_RW_GLOBS` + `REAP_RW_EXPLICIT=1` env spelling gives. This is the case a fail-open `--glob` arm slipped past: the flag named roots the census never read, so an operator's explicit layout matched nothing and the pass reported a measured zero | the `--glob` arm's own `EXPLICIT=1` line becomes `:` |

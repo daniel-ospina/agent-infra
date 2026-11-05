@@ -645,6 +645,16 @@ case_f() { # <entry-point> <owner>
                "… and NO under-reclaim alert, so 'the pass ran and did not keep up' is not asserted about a pass that never ran the class"
     case_check "$(grep -q '^detail=.*cannot run: runner-work-no-root' <<<"$st" && echo 0 || echo 1)" \
                "… while detail= still names the cause, so the operator knows what to fix"
+    # ⛔ AND THE PASS-END LOG — the surface a postmortem reads (#3057 review cycle 2, P2). Its
+    # `freed_df=unmeasured (measured classes: NMB)` figure keyed on `DF_<C>_OK`, which every setup-failure
+    # arm PINS, so the excluded class was readded to the "measured" sum as its initialised 0 and printed as
+    # a confident 0MB. MEASURED before the fix: `freed_df=unmeasured (measured classes: 0MB)` with no cause
+    # named. It now asks the SAME list as the total, says `none` when nothing was measured, and names the
+    # third cause — so no surface of this pass publishes a measurement it does not have.
+    case_check "$(grep -q 'measured classes: none' <<<"$out" && echo 0 || echo 1)" \
+               "… the pass-end LOG says NO class measured, never a 'measured classes: 0MB' about a pass that measured nothing"
+    case_check "$(grep -q 'could not be set up: runner-work' <<<"$out" && echo 0 || echo 1)" \
+               "… and the log NAMES the third cause, so the class it excluded has a reason on the surface a postmortem reads"
     # ⛔ THE OTHER HALF: THE DEFAULT GLOBS MATCHING NOTHING IS **NOT** A FAILURE. A box with no runners
     # has an EMPTY POPULATION, which is a measurement (`roots=0`); painting it red every hour is the
     # alarm-fatigue shape this family forbids. Proven here so the refusal arm cannot swallow it.
@@ -814,7 +824,12 @@ case_l() { # <entry-point> <owner>
                "… and NAMED, so 'why is this still here' has an answer instead of a number an operator must guess at"
     case_check "$(grep -qF 'unmeasurable_runner_work=1' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
                "… and the entry point's RECORD carries it, so the abstention reaches the status channel (not just the log)"
-    case_check "$(grep -q 'note_runner_work=1 entry/root KEPT as unreadable' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
+    # ⛔ THE WORDING IS PART OF THE ASSERTION (#3057 review cycle 2, P2). This note now serves THREE paths
+    # into `unmeasurable=` — an unreadable ENTRY, an unlistable ROOT, and a root REPLACED under the pass —
+    # so it may not say the walk "could not be read" (that would name a cause it cannot know, the exact
+    # defect the entry point's own comment records). It says the entry/root was kept UNMEASURED and lists
+    # the possible causes; case (w) pins the third one.
+    case_check "$(grep -q 'note_runner_work=1 entry/root KEPT as UNMEASURED' <<<"$(status_of "$s1")" && echo 0 || echo 1)" \
                "… and the NOTE names it, so an operator finds it without knowing the field exists"
     # ⛔ THE ABSTENTION MUST NOT LAND AS A MEASURED ZERO — the FALSE PASS a review found at this head.
     # `unmeasurable=1` was carried correctly and changed NOTHING ELSE: `candidates=0` still came from a
@@ -1583,7 +1598,10 @@ MUT_W_INSTRUMENT='s|^for _r in \$PENDING_ROOTS; do sweep_root "\$_r"; done$|for 
 MUT_W='s/^    if \[ -e "\$root" \] && { \[ -L "\$root" \] || \[ ! -d "\$root" \]; }; then$/    if false; then/'
 # (f)'s second mutant, on the ENTRY POINT: the THIRD cause removed from the unmeasured list, restoring the
 # shape that added a class which never ran as a measured 0 and then asserted an under-reclaim on that sum.
-MUT_F3='s/^    if \[ "\$_cver" = misconfigured \] && \[ "\$_cw" = 0 \]; then _um_uniq "\$_cv"; fi$/    :/'
+MUT_F3='s/^    if \[ "\$_cver" = misconfigured \] && \[ "\$_cw" = 0 \]; then$/    if false; then/'
+# …and one for the SUM's half of the same rule: the "measured classes" figure must ask the same list, or the
+# excluded class is readded as its initialised 0 and printed as a measurement.
+MUT_F4='s/^    if \[ "\$_mok" = 1 \] && \[ "\$_mw" = 1 \] && ! _is_unm "\$_mname"; then$/    if [ "$_mok" = 1 ]; then/'
 
 apply_mutation() { # <src> <dest> <sed-expression>
     local src="$1" dest="$2" expr="$3"
@@ -1661,6 +1679,11 @@ if apply_mutation "$REAPER" "$T/mut-f3/disk-reaper.sh" "$MUT_F3"; then
     expect_fail "f mutation: dropping the setup-failure cause from the unmeasured list turns the case RED (a class that never ran is added as a measured 0)" case_f "$T/mut-f3/disk-reaper.sh" "$OWNER"
 else
     bad "f mutation could not be applied (the setup-failure cause arm moved) — the pass TOTAL is not checked any more"
+fi
+if apply_mutation "$REAPER" "$T/mut-f4/disk-reaper.sh" "$MUT_F4"; then
+    expect_fail "f mutation: dropping the same rule from the 'measured classes' figure turns the case RED (a pass that measured nothing prints a measured 0MB)" case_f "$T/mut-f4/disk-reaper.sh" "$OWNER"
+else
+    bad "f mutation could not be applied (the measured-classes exclusion moved) — the pass-end figure is not checked any more"
 fi
 
 expect_pass "g a FULL-DISK fallback pass still hands this owner a writable dir" case_g "$REAPER" "$OWNER"
