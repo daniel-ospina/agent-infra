@@ -167,6 +167,25 @@ run_verify() {
     bash "$INSTALLER" --verify >> "$LOG" 2>&1
 }
 
+# The same two drivers against a DIFFERENT checkout root. Needed because a template is read from
+# `$INFRA_ROOT/templates/.mcp.base.json`, so every shape that only exists in a NON-SHIPPED template
+# (a self-host url, a padded url) is invisible to an arm that installs from this repo's own file.
+run_install_root() { # <infra-root> [path]
+  local rc=0
+  : > "$LOG"
+  echo "---- cell-install --install (INFRA_ROOT=$1) ----" >> "$LOG"
+  CELL_HOME="$CELL_HOME" INFRA_ROOT="$1" PATH="${2:-$FAKEBIN:$PATH}" \
+    bash "$INSTALLER" --install >> "$LOG" 2>&1 || rc=$?
+  printf '.' >> "$INSTALLS"
+  return $rc
+}
+run_verify_root() { # <infra-root>
+  : > "$LOG"
+  echo "---- cell-install --verify (INFRA_ROOT=$1) ----" >> "$LOG"
+  CELL_HOME="$CELL_HOME" INFRA_ROOT="$1" PATH="$FAKEBIN:$PATH" \
+    bash "$INSTALLER" --verify >> "$LOG" 2>&1
+}
+
 # --- the INDEPENDENT expected farm set (never the installer's own reader) ---
 # setup.sh declares each farm as a single-line array; this reader is deliberately the
 # simplest thing that can be right, so agreeing with the installer's python parser means
@@ -1451,6 +1470,157 @@ PY
 run_verify
 [ $? -eq 0 ] && ok "...and --verify CERTIFIES the padded url: both sides normalize it the way the client's parser does" \
   || fail "--verify refused a padded url the merge preserves and the client parses — verify -> install -> verify never converges (a FALSE BLOCK, not a certification gap)"
+# ⛔ THREE SHAPES THAT ONLY EXIST WHEN THE TEMPLATE IS NOT THE SHIPPED ONE (#3374 review, round 11).
+# Every arm above installs from `$ROOT/templates/.mcp.base.json`, which is why two rules could be
+# right for the shipped file and wrong for the documented self-host one, and one leak shape could be
+# named for `mcpServers` and nowhere else. Each arm below therefore builds its own checkout root.
+PADTPL="$TMP/padtpl-checkout"; SELFTPL="$TMP/selftpl-checkout"
+for _fx in "$PADTPL" "$SELFTPL"; do
+  mkdir -p "$_fx"
+  for e in "$ROOT"/*; do
+    b="$(basename "$e")"
+    [ "$b" = templates ] && continue
+    ln -s "$e" "$_fx/$b"
+  done
+  # The WHOLE templates dir, not just its `*.json`: `templates/AGENTS.base.md` is part of what the
+  # installer certifies (`a cell would get no global rules`), so a fixture without it fails for a
+  # reason that has nothing to do with the arm.
+  cp -R "$ROOT/templates" "$_fx/templates"
+done
+python3 - "$ROOT/templates/.mcp.base.json" "$PADTPL/templates/.mcp.base.json" "$SELFTPL/templates/.mcp.base.json" <<'PY'
+import json, sys
+src, pad, selfhost = sys.argv[1:4]
+# Two SEPARATE fixtures, each from its own fresh read of the shipped template. (The first draft of
+# this block re-read and re-assigned in sequence, so only the last write to `d` survived and the
+# reader had to trace five assignments to learn that. Same bytes, stated once.)
+for out, url in ((pad, " https://api.premiselabs.co/mcp/ "),   # the same endpoint, padded
+                 (selfhost, "https://192.168.1.5/mcp")):       # a self-hosting operator's own daemon
+    d = json.load(open(src))
+    d["mcpServers"]["tortoise"]["url"] = url
+    json.dump(d, open(out, "w"), indent=2, ensure_ascii=False)
+PY
+python3 - "$PADTPL/templates/.mcp.base.json" "$SELFTPL/templates/.mcp.base.json" <<'PY' \
+  && ok "the template fixtures really differ from the shipped url (non-vacuity: the arms below cannot pass by reading the shipped file)" \
+  || fail "the template fixtures were not written — every arm below would then be measuring the shipped template again"
+import json, sys
+pad = json.load(open(sys.argv[1]))["mcpServers"]["tortoise"]["url"]
+selfhost = json.load(open(sys.argv[2]))["mcpServers"]["tortoise"]["url"]
+sys.exit(0 if pad == " https://api.premiselabs.co/mcp/ " and selfhost == "https://192.168.1.5/mcp" else 1)
+PY
+# ⛔ THE TEMPLATE SIDE OF THE PAD RULE WAS NOT NORMALIZED (#3374 review, round 11 P2). `url` is
+# stripped in the verifier and `want_url` was not, so with a padded TEMPLATE url the `url !=
+# want_url` arm fired against a cell pointing at exactly the same endpoint: `URL_NOT_DEFAULT:` on a
+# correct config, and because `--install` ends in this same verify, a repair loop that never
+# converged. Measured pre-fix by deleting the strip: `URL_NOT_DEFAULT:https://api.premiselabs.co/mcp/`.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselabs.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install_root "$PADTPL"
+[ $? -eq 0 ] && ok "install accepts a template whose url carries a pad (it is the same endpoint, per the client's own parser)" \
+  || fail "install refused a template whose url is the hosted endpoint with surrounding space — a hand-edited template then blocks every cell (log: $(grep -m2 -E 'FATAL|UNUSABLE|FAIL' "$LOG" | tr '\n' ' '))"
+run_verify_root "$PADTPL"
+[ $? -eq 0 ] && ok "…and --verify CERTIFIES it: the template side is normalized too, so verify -> install -> verify converges" \
+  || fail "--verify refused URL_NOT_DEFAULT against a padded TEMPLATE url while the cell points at the same endpoint — the repair loop is a FALSE BLOCK that never converges (pre-fix: URL_NOT_DEFAULT:https://api.premiselabs.co/mcp/)"
+# ⛔ THE LOOKALIKE RULE'S COMPARAND IS THE HOSTED ENDPOINT, NOT THE TEMPLATE'S URL (#3374 review,
+# round 11 P2). With a self-hosting template, `host_typo(cur.url, want.url)` made a two-daemon LAN
+# fleet (`192.168.1.5` in the template, `.6` on one cell) one character apart, so the merge REPOINTED
+# that cell at its neighbour's daemon — overriding rule 3's "a usable differing entry is PRESERVED"
+# — and the NOTE it printed called the neighbour "the hosted host", with a tenant-key reason that is
+# false on a keyless self-host.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://192.168.1.6/mcp",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+    "_selfHosted": True,
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install_root "$SELFTPL"
+python3 - "$DEST/.mcp.json" <<'PY' && ok "a self-host template does NOT repoint a cell whose own daemon is one character away (192.168.1.6 vs the template's .5)" \
+  || fail "install repointed a self-hosted cell at the template's NEIGHBOURING daemon — the lookalike rule was comparing against the template's url instead of the hosted endpoint, so rule 3's preserve-a-self-host was overridden"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://192.168.1.6/mcp" and t.get("_selfHosted") else 1)
+PY
+# …and the CONTROL: on that SAME self-host template, a lookalike of the HOSTED host is still replaced,
+# so the arm above cannot pass by disabling the lookalike rule outright.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselab.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install_root "$SELFTPL"
+python3 - "$DEST/.mcp.json" <<'PY' && ok "…while a LOOKALIKE of the hosted host is still REPLACED on a self-host template (the rule was narrowed, not disabled)" \
+  || fail "a host-level typo of the hosted endpoint survived on a self-host template — the tenant key would go to a host nobody vetted"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://192.168.1.5/mcp" and not t.get("_selfHosted") else 1)
+PY
+# ⛔ A LITERAL CREDENTIAL OUTSIDE `mcpServers` WAS NAMED NOWHERE (#3374 review, round 11 P1). The
+# verifier scans the WHOLE file but searched for the PATH under `mcpServers` only, so a literal in a
+# TOP-LEVEL key — a `_noteboard`, a hand-added "token", the shape a curl-style paste produces —
+# printed `SECRET_IN_FILE:(unlocatable)`: the operator was told a secret exists and given nowhere to
+# look. The install side did not name it at all, so the repair loop never converged either.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["_noteboard"] = "tt_AAAABBBBCCCCDDDDEEEE"
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify_root "$ROOT"
+grep -q 'SECRET_IN_FILE:_noteboard' "$LOG" \
+  && ok "a literal in a TOP-LEVEL key is NAMED by --verify (not '(unlocatable)'), so the operator knows where to look" \
+  || fail "--verify reported a top-level literal as unlocatable — the operator is told a secret exists and given no location (pre-fix: SECRET_IN_FILE:(unlocatable))"
+run_install_root "$ROOT"
+grep -q 'literal credential at _noteboard' "$LOG" \
+  && ok "…and --install NAMES it too, so the install log cannot read as success over a file the verify refuses" \
+  || fail "--install said nothing about the top-level literal it preserved — the log reads as a clean install over a file the next --verify refuses"
+# CONTROL: the under-`mcpServers` spelling every earlier arm greps is UNCHANGED by the fix.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.pop("_noteboard", None)
+d["mcpServers"]["acme"] = {"type": "http", "url": "https://acme.example/mcp",
+                            "headers": {"Authorization": "Bearer tt_AAAABBBBCCCCDDDD"}}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify_root "$ROOT"
+grep -q 'SECRET_IN_FILE:acme.headers.Authorization' "$LOG" \
+  && ok "…and a literal inside a server still reports the UNDER-mcpServers path (the fix widened the search, it did not change the spelling)" \
+  || fail "the secret marker's spelling changed for an under-mcpServers literal — every arm and every operator grep that relied on it is now wrong"
+run_install_root "$ROOT" >/dev/null 2>&1   # restore the shipped-template state for the arms below
+# AND DROP THE FIXTURE KEYS: a merge never clobbers, so without this the `acme` literal above is still
+# in the file and every later `--verify` arm would find `SECRET_IN_FILE:` before reaching the shape it
+# is about (measured: the two USERINFO arms below failed on exactly that contamination).
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d.pop("_noteboard", None)
+(d.get("mcpServers") or {}).pop("acme", None)
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_install >/dev/null 2>&1
 # ⛔ USERINFO IN THE AUTHORITY IS A HOST-SPOOF SHAPE (#3374 review P1).
 # `https://api.premiselabs.co@evil.example/mcp/` resolves to **evil.example** while its authority
 # BEGINS with the hosted host. `near_miss`/`host_typo` read the authority verbatim, so this was "a
@@ -2183,6 +2353,19 @@ chmod 700 "$RODEST"
 # CONVERGENCE one: the replacement must be readable, or `--verify` refuses the file this installer
 # just wrote and verify → install → verify never converges. Skipped as root, which reads a 0000 file
 # regardless and would make both arms assert nothing.
+# ⛔ ONE PORTABLE DEFINITION, USED BY EVERY ARM BELOW (#3374 review, round 11 P2). `stat -c` is
+# GNU-only: on macOS it fails outright, the substitution is EMPTY, and the sentence this file prints
+# then reads "is mode  and cannot be read/parsed" — a failure message with the fact missing. The two
+# siblings already carried the BSD counterpart; the third — the `fail` branch, i.e. the one that only
+# runs when something is ALREADY wrong — did not, and `scripts/check-portability-traps.sh` reported it
+# as `stat-c-gnu: baseline=0 live=1`: a NEW trap in a baselined file, which the gate refuses (and it
+# was red in the `bash-suites (8)` shard). The guarded chain is the detector's blessed idiom —
+# `stat -c … || stat -f …` inside ONE command unit, which `gnu_only_unit()` reads as portable — and
+# naming it ONCE is what stops the three call sites drifting apart again. The BSD field for mtime is
+# `%m`, but these arms need SIZE (`%z`) and MODE (`%Lp`), which is why `box_mtime` is not the helper
+# here: it answers a different question.
+_stat_mode() { stat -c '%a' "$1" 2>/dev/null || stat -f '%Lp' "$1" 2>/dev/null; }
+_stat_size() { stat -c '%s' "$1" 2>/dev/null || stat -f '%z' "$1" 2>/dev/null; }
 if [ "$(id -u)" -ne 0 ]; then
   _orig='{"mcpServers":{"mine":{"command":"keep-me"}}}'
   printf '%s' "$_orig" > "$TMP/eperm-dest.json"
@@ -2191,15 +2374,15 @@ if [ "$(id -u)" -ne 0 ]; then
   rc=$?
   # stat works without READ permission; the byte count is what proves the copy happened.
   _want="$(printf '%s' "$_orig" | wc -c | tr -d ' ')"
-  _got="$(stat -c '%s' "$TMP/eperm-dest.json.bak" 2>/dev/null || stat -f '%z' "$TMP/eperm-dest.json.bak" 2>/dev/null || echo 0)"
+  _got="$(_stat_size "$TMP/eperm-dest.json.bak" || echo 0)"
   [ "$rc" -eq 0 ] && grep -qF 'REPLACED an UNREADABLE .mcp.json' "$TMP/eperm.out" \
     && ! grep -qF 'backup FAILED' "$TMP/eperm.out" && [ "$_got" = "$_want" ] \
     && ok "an unreadable-by-PERMISSION regular file is REPLACED with its bytes KEPT in the backup (rc=0, ${_got}B)" \
     || fail "a permission-unreadable regular destination produced rc=$rc with a ${_got}B backup (wanted ${_want}B) — a file that may hold hand-written work must be replaced AND backed up, never refused or dropped"
   # the CONVERGENCE direction: the file the installer just wrote must be one the verifier can read.
   [ -r "$TMP/eperm-dest.json" ] && python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if "tortoise" in d["mcpServers"] else 1)' "$TMP/eperm-dest.json" \
-    && ok "...and the replacement is READABLE and parses (mode $(stat -c '%a' "$TMP/eperm-dest.json" 2>/dev/null || stat -f '%Lp' "$TMP/eperm-dest.json")) — the repair loop can converge" \
-    || fail "the replacement written over an unreadable dest is mode $(stat -c '%a' "$TMP/eperm-dest.json" 2>/dev/null) and cannot be read/parsed — --verify would refuse the file this installer just wrote, so verify -> install -> verify never converges (restoring the 0000 mode here is what causes it)"
+    && ok "...and the replacement is READABLE and parses (mode $(_stat_mode "$TMP/eperm-dest.json")) — the repair loop can converge" \
+    || fail "the replacement written over an unreadable dest is mode $(_stat_mode "$TMP/eperm-dest.json") and cannot be read/parsed — --verify would refuse the file this installer just wrote, so verify -> install -> verify never converges (restoring the 0000 mode here is what causes it)"
 else
   ok "an unreadable-by-PERMISSION destination is REPLACED and backed up (arm skipped: running as root, which reads a 0000 file)"
 fi
