@@ -1252,10 +1252,10 @@ post_marker_comment() { # <repo> <pr> <marker>
     echo "⚠️ record-review: REFUSING to publish a marker to the durable comment channel — its \`sig=\` does not verify against the configured AI_REVIEW_GATE_KEY. An unverifiable marker must never become a permanent PR comment (the gate could never accept it, and unlike the PR body it cannot be retracted). No comment was posted." >&2
     return 0
   fi
-  # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ
-  # (.github/workflows/ai-review-gate.yml, the #1224 cross-repo contract).
+  # BYTE-IDENTICAL to the gate's PR_EVIDENCE_COMMENTS_JQ (daniel-ospina/tortoise:
+  # .github/workflows/ai-review-gate.yml — NOT a path in this repo, hence the `daniel-ospina/tortoise:` prefix).
   # ⛔ DECLARED RESIDUALS OF THIS CONSTANT — the gate's contract asks a producer to
-  # declare them AT THE CONSTANT (ai-review-gate.yml :86-87, :421-424), so they live here:
+  # declare them AT THE CONSTANT (ai-review-gate.yml :86-87, :415-424), so they live here:
   #   1. AUTHOR SET. A recording identity whose comment reports
   #      `author_association` outside {OWNER, MEMBER, COLLABORATOR} (a GitHub-App
   #      or bot token) is INVISIBLE to its own dedup read and to the gate → one
@@ -2677,9 +2677,9 @@ if [ "$CHECK_CARRY" -eq 1 ]; then
   if [ "$CC_SUPPLIED" -eq 0 ]; then
   # #2872: the remedy for an ABSENCE is no longer only "review it again". A box
   # that lacks the file may still have the verdict in the registry (minted on a
-  # peer box), or in the PR body's SIGNED marker. An admitted PR COMMENT can carry a MARKER too, but
-  # ⛔ NO VERB RECOVERS A RECORD FROM ONE: :1276 is the only place marker text leaves comments, and a
-  # marker comment is REFUSED as evidence (:905) — that copy helps the GATE. A REVIEW comment is fine (:835).
+  # peer box), or in the PR body's SIGNED marker. An admitted PR COMMENT can carry a MARKER too — but
+  # ⛔ NO VERB RECOVERS A RECORD FROM ONE: marker text arrives from :835, :846 or :1276, and BOTH
+  # --evidence arms REFUSE it at :905, so that copy helps the GATE. A REVIEW comment is fine at :835/:846.
   CC_LOOKUP_HINT="Run the review, then record it. Before paying for that: if it ran on ANOTHER box, scripts/registry-sync.sh pull may already hold it; and if the PR body carries a SIGNED marker, record-review.sh --recover-body $PR ${REPO:-owner/repo} rebuilds this box's record from it (it verifies the HMAC first, so a body edit cannot mint one)."
   if [ -n "$REPO" ]; then
     if [ -n "$CC_FILE" ] && [ -f "$CC_FILE" ]; then
