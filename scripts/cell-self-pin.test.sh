@@ -13,7 +13,10 @@
 # ⛔ THE NEGATIVE CASE IS THE WHOLE TEST. A suite that only renders on THIS dev box proves nothing,
 # because this box happens to carry a bootstrap clone at `/tmp/cell-ai` — the exact coincidence that let
 # the defect ship. So every leg below runs through `runat`, which scrubs the ambient `HARNESS*` variables
-# a cell lane exports (cloud-cell-supervisor.sh::3092/3137 exports them into every controller) and points
+# a cell lane exports (cloud-cell-supervisor.sh::3562/3607 exports them into every controller) and points
+# ⛔ `::3092/3137` WAS THE STALE SPELLING OF THIS CITATION (round-13 review, P2): it was correct at
+# `eb7e4e81` and the exports moved with later merges from main. A pointer into the wrong line is a reader
+# checking code that does not do what the sentence claims, which is worse than no pointer at all.
 # `CELL_HOME` at a hermetic temp dir. The assertions are that (a) the resolved layer lives under THAT
 # home, never the clone, and (b) the rendered unit carries no bootstrap path and no `WorkingDirectory=`
 # even though this box could have supplied one.
@@ -284,6 +287,19 @@ esac
 # run exits 2 the `&&` short-circuited, so its `bad` could never fire. Assert on the reading, once.
 [ -n "$(printf '%s' "$out" | tr -d '[:space:]')" ] && ok "an unresolvable layer produced output (a unit that exits quietly is the defect)" \
   || bad "an unresolvable layer produced NO output at all — a unit that exits quietly is the defect"
+# ⛔ `record_outcome` IS THE ONLY THING BEHIND `--status`'s "last outcome" LINE, AND NOTHING GATED IT
+# (round-13 review, P2). Replacing its one write with `true` left the suite at 370 ok / 0 failed: the
+# `--status` verb advertises a last outcome, the header calls the record the answer to "what did this timer
+# do last tick", and a read-back with nothing behind it is the kind of claim this file refuses elsewhere
+# (`--print-unit`'s "a verb that advertises a last outcome and prints none"). The record is asserted on the
+# LOUD path, which is the path an operator actually reads it on: a RED must leave its reason behind.
+[ -s "$T/empty/orchestrator/self-pin.last" ] \
+  && ok "a RED tick RECORDS its outcome ($(tail -1 "$T/empty/orchestrator/self-pin.last")) — the line --status advertises exists" \
+  || bad "a RED tick wrote NO outcome record — --status' 'last outcome' line has nothing behind it"
+case "$(tail -1 "$T/empty/orchestrator/self-pin.last" 2>/dev/null)" in
+  *'unresolved(no-layer)'*) ok "…and the record names the REASON, not merely that something failed" ;;
+  *) bad "the outcome record does not name the reason: $(tail -1 "$T/empty/orchestrator/self-pin.last" 2>/dev/null)" ;;
+esac
 # ⛔ A pin worktree whose gitdir was reclaimed (cell-1's shape) is a DIRECTORY full of files no git
 # command can answer from. Accepting it on `-d` alone is the same class of lie as the unit this replaces.
 mkdir -p "$T/orphan/harness/deadbeeff00d/scripts"
@@ -361,11 +377,21 @@ install_doctored() { # <dir> <unit-dir>
   runat "$T/home" TEMPLATES_DIR="$1" SYSTEMD_UNIT_DIR="$2" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
     PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1
 }
+# ⛔ AN UNEXPECTED SUCCESS RE-SEEDS THE PLACED-PASS SENTINEL, AND ONLY AN UNEXPECTED SUCCESS MAY.
+# Under a MUTANT that reverts a rule the install SUCCEEDS and legitimately (re)places the pass, so
+# without a re-seed every LATER refusal leg reports "REPLACED the placed pass" for a replacement
+# that was correct, and one reverted rule reds a cascade instead of its own legs.
+# ⛔ BUT THE RE-SEED CANNOT BE UNCONDITIONAL, AND THAT IS NOT A STYLE POINT: `refuses` asserts the
+# refusal left the pass UNTOUCHED by comparing `$T/placed.before` with `$PLACED`. A `cp` that runs
+# on the refusal path too overwrites `$PLACED` FROM the expected bytes and then compares them with
+# themselves — every one of those assertions becomes a tautology that can never red, i.e. the
+# placed-pass gate is DELETED while still printing "ok". So the re-seed goes in the rc=0 branch,
+# before its `return`, and nowhere else (round-14 review, P1).
 # refuses <name> <doctored-dir> <unit-dir> <must-appear-in-the-reason>
 refuses() {
   local name="$1" d="$2" u="$3" why="$4" out rc
   out="$(install_doctored "$d" "$u")"; rc=$?
-  if [ "$rc" -eq 0 ]; then bad "ACCEPTED $name — the gate does not exist: $out"; return; fi
+  if [ "$rc" -eq 0 ]; then bad "ACCEPTED $name — the gate does not exist: $out"; cp "$T/placed.before" "$PLACED"; return; fi   # re-seed ONLY on an unexpected success
   if [[ $out == *"$why"* ]]; then ok "REFUSES $name, and says why (\"$why\")";
   else bad "refused $name for the WRONG reason (wanted \"$why\") — an environment failure is not a refusal: $out"; fi
   [ -f "$u/cell-self-pin.service" ] && bad "a refused install ($name) still wrote the unit" \
@@ -519,6 +545,7 @@ out_pct="$(env -u HARNESS -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR -u HARNESS_REPO
   -u TEMPLATES_DIR -u SYSTEMD_UNIT_DIR -u CELL_SELF_PIN_INTERVAL_MIN \
   -u CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR -u CELL_SELF_PIN_SRC -u HARNESS_REF \
   PATH="$T/fakebin-none:$PATH" CELL_HOME="$pcthome" HOME="$pcthome" \
+  CELL_SELF_PIN_DROPIN_ROOTS="$T/dropins-hermetic" \
   TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$T/units-pct" bash "$PIN" --install 2>&1)"; rc_pct=$?
 [ "$rc_pct" -ne 0 ] && ok "REFUSES a %-specifier in a rendered value (systemd would EXPAND it; rc=$rc_pct)" \
   || bad "a CELL_HOME carrying '%' installed green — systemd expands %-specifiers, so the verified base is not the executed base: $out_pct"
@@ -599,7 +626,7 @@ doctor_timer_append() { # <name> <sed-expr or ''> <text appended verbatim at EOF
 refuses_timer() { # <name> <doctored-dir> <unit-dir> <must-appear-in-the-reason>
   local name="$1" d="$2" u="$3" why="$4" out rc
   out="$(install_doctored "$d" "$u")"; rc=$?
-  if [ "$rc" -eq 0 ]; then bad "ACCEPTED $name — the timer gate does not exist: $out"; return; fi
+  if [ "$rc" -eq 0 ]; then bad "ACCEPTED $name — the timer gate does not exist: $out"; cp "$T/placed.before" "$PLACED"; return; fi   # re-seed ONLY on an unexpected success
   if [[ $out == *"$why"* ]]; then ok "REFUSES $name, and says why (\"$why\")"
   else bad "refused $name for the WRONG reason (wanted \"$why\"): $out"; fi
   [ -f "$u/cell-self-pin.timer" ] && bad "a refused install ($name) still wrote the TIMER" \
@@ -616,6 +643,15 @@ refuses_timer 'a timer Unit= re-targeted away from the pass' \
 # single time and then stops for ever, with every surface green.
 refuses_timer 'a timer with only the ONE-SHOT OnBootSec=' \
   "$(doctor_timer no-clock '/^OnUnitActiveSec=/d')" "$T/tu2" 'no REPEATING trigger'
+# ⛔ A `[Service]`-ONLY DIRECTIVE IN `[Timer]` IS INERT, AND THE GATE FOR IT HAD NO DOCTOR AT ALL
+# (round-13 review, P2 — the arm's RATIONALE was false, citing `EXIT_CHDIR / 203`, a failure mode a timer
+# cannot have). Measured: `systemd-analyze verify` answers `Unknown key name 'WorkingDirectory' in section
+# 'Timer', ignoring.` The refusal stays — a line the render believes constrains the clock and the manager
+# drops in silence is the green no-op class this file exists for — and this leg is what makes the arm
+# LOAD-BEARING rather than an unexplained refusal. `doctor_timer`'s extra line is inserted directly after
+# `Unit=`, which the template places inside `[Timer]`, so the doctor reproduces the measured state.
+refuses_timer 'a [Service]-only directive inside [Timer] (systemd IGNORES it — a green no-op)' \
+  "$(doctor_timer timerinert 's|^Unit=.*$|Unit=cell-self-pin.service|' 'WorkingDirectory=/srv/harness-current')" "$T/tu20" 'Unknown key name'
 # ⛔ AND AN EMPTY VALUE IS THE SAME DEFECT ONE SPELLING OVER: systemd ignores `OnUnitActiveSec=` with no
 # value, so the timer silently degrades to the one-shot case while the directive is present.
 refuses_timer 'an EMPTY OnUnitActiveSec=' \
@@ -669,6 +705,18 @@ refuses_timer 'an OnCalendar= that is NOT a calendar expression (10min)' \
   "$(doctor_timer unit-badcal 's|^OnUnitActiveSec=.*$|OnCalendar=10min|')" "$T/tu11" 'cannot parse'
 refuses_timer 'a repeating trigger of exactly infinity (a VALID timespan that means NEVER)' \
   "$(doctor_timer unit-inf 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=infinity|')" "$T/tu12" 'cannot parse'
+# ⛔ AND THE REFUSAL ABOVE WAS LOAD-BEARING AND UNGATED (round-13 review, P1). It ran under the suite's
+# default tier — `CELL_SELF_PIN_ANALYZE=none`, where `timer_timespan_ok`'s narrow grammar rejects `infinity`
+# BY SHAPE — so the explicit arm in `timer_value_ok` could be DELETED and the suite stayed at 370 ok / 0
+# failed. It is the only refusal on a box that HAS a parser: measured, `systemd-analyze timespan --
+# infinity` answers `μs: 18446744073709551615`, **rc=0** — the parser accepts a clock that means NEVER.
+# This leg puts the arm in the tier where it is the sole line of defence: an analyzer that ACCEPTS
+# everything (`mk_analyzer accept`), i.e. exactly the verdict the real manager gives this value.
+an_inf="$(mk_analyzer "$T/an-infinity" accept)"
+AN="$an_inf/systemd-analyze"
+refuses_timer 'a repeating trigger of exactly infinity WITH A PARSER PRESENT (the parser ACCEPTS it — rc=0)' \
+  "$(doctor_timer unit-inf-analyzer 's|^OnUnitActiveSec=.*$|OnUnitActiveSec=infinity|')" "$T/tu19" 'cannot parse'
+AN=none
 # ⛔ AND A VALUE'S SHAPE IS NOT ITS RANGE (round-13 review, P1 — the last spelling this rule could hide
 # behind). The reply above certified `number+unit SHAPED` and `contains h:mm`, which is not what the manager
 # grades: systemd RANGE-CHECKS every field and DISCARDS the value otherwise. MEASURED at the head these
@@ -756,7 +804,7 @@ refuses_dropin() { # <name> <unit-dir> <must-appear-in-the-reason>
   # The UNDOCTORED template, so the ONLY reason to refuse is the drop-in: an artifact rule that also fired
   # here would make the leg pass on a reason it did not name.
   out="$(install_doctored "$TPL" "$u")"; rc=$?
-  if [ "$rc" -eq 0 ]; then bad "ACCEPTED a drop-in that $name — the effective-unit gate does not exist: $out"; return; fi
+  if [ "$rc" -eq 0 ]; then bad "ACCEPTED a drop-in that $name — the effective-unit gate does not exist: $out"; cp "$T/placed.before" "$PLACED"; return; fi   # re-seed ONLY on an unexpected success
   if [[ $out == *"$why"* ]]; then ok "REFUSES a drop-in that $name, and names the file (\"$why\")"
   else bad "refused a drop-in that $name for the WRONG reason (wanted \"$why\"): $out"; fi
   [ -f "$u/cell-self-pin.service" ] && bad "a refused install (drop-in: $name) still wrote the unit" \
@@ -842,6 +890,27 @@ refuses_dropin 'declares a RootDirectory= (systemd enters it before the payload)
 # `Unit=/bin/true.service` (activates nothing) each installed green and silently — a pin that never runs.
 refuses_dropin 're-schedules the timer, in the TIMER drop-in dir (cell-self-pin.timer.d)' "$(dropin_doctor timerondir 'OnCalendar=*-*-* 00:00:00' 'cell-self-pin.timer.d')" 're-schedules'
 refuses_dropin 're-targets the timer, in the TIMER drop-in dir (Unit=)' "$(dropin_doctor timerunit 'Unit=/bin/true.service' 'cell-self-pin.timer.d')" 're-targets'
+# ⛔ THE IDENTITY ALLOWANCE WAS ADVERTISED AND NEVER READ (round-13 review, P1). This section's own header
+# says a drop-in "MAY adjust IDENTITY (User=, Environment=HOME=)" — and `verify_unit` refuses any `User=`
+# that is not the owner of `$CELL_HOME` because that is the identity whose git can answer for the tree the
+# pass pins. The drop-in path had NO `User)` arm at all, so the two rules disagreed and the LENIENT one
+# won: a drop-in is merged OVER the rendered unit, so `User=root` there reinstates the exact #3194 outcome
+# (`UNRESOLVED(no-layer)` every tick, root's git refusing the cell user's checkout as dubious ownership)
+# while `--install` prints "installed — ONE actuator on this pin". MEASURED rc=0 before this arm.
+# The cell home here is `$T/home`, owned by the INVOKING user, so `User=root` is hostile only when that user
+# is not root — where it is not, the leg says so honestly instead of asserting nothing (the suite's
+# established pattern for every identity-discriminating fixture, see the `owner_of /` leg below).
+if [ "$(id -u)" -eq 0 ]; then
+  ok "SKIPS the User=root drop-in leg honestly: this suite is running AS root, so root IS the owner of the cell home here and the value is not the defect"
+else
+  refuses_dropin 'sets User=root — an identity whose git cannot answer for the tree' "$(dropin_doctor userroot 'User=root')" 'cannot answer for the tree'
+fi
+# ⛔ AND AN EMPTY `User=` IS THE SAME DEFECT, NOT A HARMLESS RESET. `systemd.exec(5)`: an empty assignment
+# restores the manager's DEFAULT identity, which for a SYSTEM unit is root — so the file that was supposed
+# to correct the identity silently re-installs the one that cannot pin. `$(directive …)` cannot express
+# this (an empty value and an absent one both yield ""), which is why the arm reads RAW LINES and this leg
+# is unconditional: it is hostile under every identity this suite can run as.
+refuses_dropin 'declares an EMPTY User= (a reset to the manager default, i.e. root for a system unit)' "$(dropin_doctor userempty 'User=')" 'resets to the manager'
 # ⛔ THE NON-VACUITY CONTROL, and it is load-bearing: a drop-in that only sets IDENTITY is the operator's
 # DOCUMENTED remedy for the `User=root` render. Without this leg the gate above could "pass" by refusing
 # every drop-in, which would block the one migration this file recommends.
@@ -892,6 +961,58 @@ else
   refuses_dropin 'lives in a drop-in directory this run cannot SEARCH (the glob never expanded)' "$u_nosearch" 'cannot be READ/SEARCHED'
 fi
 chmod 755 "$u_nosearch/cell-self-pin.service.d"
+# ⛔ AND THE ROOT ITSELF: AN UNSEARCHABLE ROOT IS NOT A ROOT WITH NO DROP-INS (round-13 review, P1). The
+# guard above fires on a `.d` it FOUND; this one is the case where nothing can be found at all. The old
+# enumeration opened with `[ -d "$root" ] || continue` — and a 000-mode directory STATS TRUE, so the root
+# was PROCEEDED PAST, not skipped: every candidate under it failed `[ -d "$root/<name>.d" ]` for want of
+# search permission, the loop body never ran, and `--install` printed "installed — ONE actuator on this
+# pin". MEASURED rc=0 with a `cell-self-pin.service.d/legacy.conf` carrying `WorkingDirectory=/tmp/cell-ai`
+# under that root — systemd (root, not bound by this run's permissions) merges it anyway. So the verdict is
+# taken ON THE ROOT, before anything under it is enumerated.
+u_root000="$T/units-nosearch-root"; mkdir -p "$u_root000"
+roothidden="$T/roothidden"
+mkdir -p "$roothidden/cell-self-pin.service.d"
+printf '[Service]\nWorkingDirectory=/tmp/cell-ai\n' >"$roothidden/cell-self-pin.service.d/legacy.conf"
+chmod 000 "$roothidden"
+if [ "$(id -u)" -eq 0 ]; then
+  ok "SKIPS the unsearchable-drop-in-ROOT leg honestly: running as root, where mode 000 does not hide a directory (the route can not be reproduced, so it is not claimed)"
+else
+  out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$u_root000" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
+           CELL_SELF_PIN_DROPIN_ROOTS="$roothidden" PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    bad "ACCEPTED an unsearchable drop-in ROOT — a 000-mode root carrying a WorkingDirectory= drop-in installed rc=0, so 'nothing found here' was reported about a directory this run could not open: $out"
+  elif [[ $out == *'cannot be READ/SEARCHED'* ]]; then
+    ok "…and an unsearchable drop-in ROOT is REFUSED by name (the root, not a file it could not list)"
+  else bad "refused an unsearchable drop-in root for the WRONG reason: $out"; fi
+  [ -f "$u_root000/cell-self-pin.service" ] && bad "a refused install (unsearchable root) still wrote the unit" \
+    || ok "a refused install (unsearchable root) wrote nothing"
+fi
+chmod 755 "$roothidden"
+# ⛔ AND ONE LEVEL UP, WHERE `[ -e "$root" ]` STOPS BEING A READING AND BECOMES A GUESS (round-14 review,
+# P2). `stat` needs every component of the path SEARCHABLE, so a root whose PARENT is 000 answers `-e`
+# FALSE — "absent" — when the truth is "this run cannot see". Measured: `$T/parhidden` at 000 with
+# `root/cell-self-pin.service.d/legacy.conf` carrying `WorkingDirectory=/tmp/cell-ai` installed rc=0 and
+# nothing in the run mentioned the file. `root_decidable` walks the ancestors first, and undecidable is a
+# refusal: "nothing found here" may not be reported about a directory this run cannot look into.
+u_par000="$T/units-nosearch-parent"; mkdir -p "$u_par000"
+parhidden="$T/parhidden"
+mkdir -p "$parhidden/root/cell-self-pin.service.d"
+printf '[Service]\nWorkingDirectory=/tmp/cell-ai\n' >"$parhidden/root/cell-self-pin.service.d/legacy.conf"
+chmod 000 "$parhidden"
+if [ "$(id -u)" -eq 0 ]; then
+  ok "SKIPS the unsearchable-PARENT leg honestly: running as root, where mode 000 does not hide a directory (the route can not be reproduced, so it is not claimed)"
+else
+  out="$(runat "$T/home" TEMPLATES_DIR="$TPL" SYSTEMD_UNIT_DIR="$u_par000" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 \
+           CELL_SELF_PIN_DROPIN_ROOTS="$parhidden/root" PATH="$T/fakebin:$PATH" bash "$PIN" --install 2>&1)"; rc=$?
+  if [ "$rc" -eq 0 ]; then
+    bad "ACCEPTED a drop-in root whose PARENT cannot be searched — the run reported 'no drop-ins' about a directory it could not stat, so a box carrying that legacy drop-in installs rc=0 and keeps the defect: $out"
+  elif [[ $out == *'cannot be DECIDED'* ]]; then
+    ok "…and a drop-in root whose PARENT is unsearchable is REFUSED as UNDECIDABLE, not silently treated as absent"
+  else bad "refused an undecidable drop-in root for the WRONG reason: $out"; fi
+  [ -f "$u_par000/cell-self-pin.service" ] && bad "a refused install (undecidable root) still wrote the unit" \
+    || ok "a refused install (undecidable root) wrote nothing"
+fi
+chmod 755 "$parhidden"
 # ⛔ THE NON-VACUITY CONTROL FOR *THESE* LEGS TOO: a readable, benign drop-in must still INSTALL, or the
 # three legs above could "pass" by refusing every drop-in the file cannot read for any reason.
 u_nul_ok="$T/dropin-nul-ok"; mkdir -p "$u_nul_ok/cell-self-pin.service.d"
@@ -951,7 +1072,12 @@ refuses 'a WIDENED SuccessExitStatus=' "$(doctor_rw wideexit 's|^SuccessExitStat
 # inspects (the `declares`/`$CELL_HOME` rules read only `WorkingDirectory=` and `ExecStart=`), and the pass
 # that read it would derive a different pin record than the controller. This suite already resolves `/tmp`
 # for its own git paths (`pwd -P`); the guard has to see the same spelling.
-refuses 'an Environment= naming /private/tmp/cell-ai' "$(doctor privtmp 'Environment=HARNESS_PIN_FILE=/private/tmp/cell-ai/.harness-path')" "$T/u17" 'provisioning clone'
+# ⛔ EVERY LEG GETS ITS OWN UNIT DIR. These three were reusing `$T/u17`/`$T/u18`/`$T/u19`, which an
+# earlier leg in this file also installed into — so under a MUTANT that reverts one of those rules the
+# install succeeds, the shared dir keeps the written unit, and the NEXT leg's "wrote nothing" assertion
+# measures the PREVIOUS leg's install: one reverted rule reds a cascade of unrelated legs and the mutation
+# count stops measuring the rule it names (round-13 review, P2). `u32`–`u34` are unused anywhere else.
+refuses 'an Environment= naming /private/tmp/cell-ai' "$(doctor privtmp 'Environment=HARNESS_PIN_FILE=/private/tmp/cell-ai/.harness-path')" "$T/u32" 'provisioning clone'
 # ⛔ AND THE ENVIRONMENT ALLOWANCE IS ONE VARIABLE WIDE *IN THE RENDERED UNIT TOO* (round-8 review, P1).
 # The unit arm used to COUNT `Environment=CELL_HOME=` and ignore every other assignment, while the drop-in arm
 # already refused everything but `HOME=` — so a template carrying `Environment=HARNESS_PIN_FILE=/srv/elsewhere`
@@ -959,9 +1085,9 @@ refuses 'an Environment= naming /private/tmp/cell-ai' "$(doctor privtmp 'Environ
 # Each leg REPLACES `HOME=` (rather than appending a line) so the plain count/value rule cannot answer for it:
 # the verdict can only come from the allow-list, which is what these legs exist to pin.
 refuses 'an Environment= re-pointing the pin RECORD (HARNESS_PIN_FILE) in the rendered unit' \
-  "$(doctor_rw envrec 's|^Environment=HOME=.*$|Environment=HARNESS_PIN_FILE=/srv/elsewhere/.harness-path|')" "$T/u18" 'Environment=HARNESS_PIN_FILE='
+  "$(doctor_rw envrec 's|^Environment=HOME=.*$|Environment=HARNESS_PIN_FILE=/srv/elsewhere/.harness-path|')" "$T/u33" 'Environment=HARNESS_PIN_FILE='
 refuses 'an Environment= re-pointing the pin ROOT (HARNESS_PIN_DIR) in the rendered unit' \
-  "$(doctor_rw envroot 's|^Environment=HOME=.*$|Environment=HARNESS_PIN_DIR=/srv/elsewhere/pins|')" "$T/u19" 'Environment=HARNESS_PIN_DIR='
+  "$(doctor_rw envroot 's|^Environment=HOME=.*$|Environment=HARNESS_PIN_DIR=/srv/elsewhere/pins|')" "$T/u34" 'Environment=HARNESS_PIN_DIR='
 
 # ── 4b. ONE ACTUATOR PER PIN — the guard asks BOTH systemd managers, and retires BOTH ────────────
 # ⛔ BARE `systemctl` IS THE SYSTEM MANAGER ONLY, and the shipped sibling installer this guard names as
@@ -1968,6 +2094,36 @@ case "$out" in
   *'verdict        current'*) bad "a FAILED fetch still printed 'verdict current' — a reading the pass itself called unverified, reported GREEN" ;;
   *'UNKNOWN'*) ok "…and the verdict line says UNKNOWN, so the self-contradiction is gone" ;;
   *) bad "…but the verdict line does not name UNKNOWN: $out" ;;
+esac
+# ⛔ AND THE FAILURE MUST CARRY GIT'S OWN REASON (round-13 review, P2). Both fetches redirected stderr to
+# `/dev/null`, so the RED said only "git fetch … failed" — the exact pattern this file's own comment names
+# as why "the journal could not even say why" an earlier pin tick failed. Git had already written the answer
+# (`fatal: '…' does not appear to be a git repository`); it was deleted. A boolean is not a diagnosis, and
+# the comment that calls that pattern out is BELOW the line that committed it.
+case "$out" in
+  *"git's own reason"*) ok "…and the reading names GIT'S OWN REASON for the failed fetch (stderr is captured, not discarded)" ;;
+  *) bad "the failed fetch discarded git's own reason — an operator gets a boolean where git wrote the diagnosis: $out" ;;
+esac
+case "$out" in
+  *'no-such-origin'*|*'does not appear to be a git repository'*|*'fatal'*) ok "…and the reason is git's actual message, not a placeholder" ;;
+  *) bad "the captured reason is a placeholder, not what git said: $out" ;;
+esac
+# The TICK is the path that runs every ten minutes and writes the journal, so its refusal has to carry the
+# same diagnosis — it was a SEPARATE `2>/dev/null`, i.e. fixing one would have left the other blind. The
+# fixture above carries no supervisor, so the tick would stop at `no-supervisor` BEFORE the fetch; this one
+# carries one, so the failure the leg measures is the FETCH and nothing else.
+TICKBAD="$T/home-badfetch-tick"
+mkdir -p "$TICKBAD/harness" "$TICKBAD/orchestrator"
+git clone -q "$T/origin.git" "$TICKBAD/harness/tree" 2>/dev/null
+git -C "$TICKBAD/harness/tree" remote set-url origin "$T/no-such-origin.git"
+mkdir -p "$TICKBAD/harness/tree/scripts"
+mk_sup "$TICKBAD/harness/tree/scripts/cloud-cell-supervisor.sh"
+printf '%s\n' "$TICKBAD/harness/tree" >"$TICKBAD/.harness-path"
+out="$(pinrun "$TICKBAD" 2>&1)"; rc=$?
+[ "$rc" -eq 2 ] && ok "the TICK also exits 2 on a failed fetch" || bad "the tick exited $rc on a failed fetch, expected 2: $out"
+case "$out" in
+  *"git's own reason"*) ok "…and the TICK's refusal carries git's own reason too (both fetches capture stderr, not one)" ;;
+  *) bad "the tick's fetch refusal still discarded git's own reason: $out" ;;
 esac
 # ⛔ (b) A RENDER REFUSES WHEN `CELL_HOME` IS UNSET. The installer's default is `$HOME`; the READER of the
 # record it derives from defaults to `/tmp/cell-home` (cloud-cell-supervisor.sh:134). Rendering bakes
