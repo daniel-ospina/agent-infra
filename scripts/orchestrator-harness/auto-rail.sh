@@ -916,6 +916,13 @@ PY
       # MERGE (#3489). `at-head` is today's behaviour, untouched, below. Anything else means no review
       # owns this PR — so the rail is NOT launched (it would refuse for "no head-bound record" in one
       # line and consume a slot) and the reviewer step is dispatched instead.
+      # The classification was computed by the candidate search from ITS `gh pr list` read (body +
+      # headRefOid) while the head used for the state key below is this candidate's own read, a second
+      # apart. ⛔ THAT RACE IS NAMED RATHER THAN CLOSED, because closing it costs a second `gh` call per
+      # candidate per pass and it cannot produce a wrong ACTION: a push in between means the reviewer
+      # re-reads the head itself and reviews what is really there (`review-pr.sh` binds its record to the
+      # head it reviewed), and a record that landed in between means `review-pr.sh` exits 5 — "a clean
+      # record already exists at this head" — having spent nothing.
       if [ "$_att" != at-head ]; then
         if [ "$_kind" != green ]; then
           log_line "$repo #$pr AWAITING-REVIEW ($_att) but its checks are RED — no review is bought for a head that has to change; the red arm owns this PR"
