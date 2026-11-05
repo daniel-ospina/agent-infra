@@ -91,14 +91,13 @@ print("%s\t%s" % (name, args))
 PY
 }
 advertised() {   # is $1 a tool the served `tools/list` advertises?
-  python3 - "$1" <<'PY'
+  python3 - "$1" "$TMP/advertised.json" <<'PY'
 import json, sys
-# The stub's `tools/list` is the single source for "advertised" in this suite: the client is not
-# allowed to call anything it does not serve. Kept in step with stub.ADVERTISED by construction —
-# the STUB answers tools/list, so this arm reads the same list the client would.
-print("yes" if sys.argv[1] in {
-    "tortoise_get_entity", "tortoise_overview", "tortoise_search", "tortoise_create_point",
-} else "no")
+# ⛔ THE SET COMES FROM THE PROCESS THAT SERVES `tools/list`, NOT FROM A SECOND COPY IN THIS FILE
+# (#3374 review P2). The old body hardcoded four names beside the stub's own four names, so this
+# helper agreed with the client's assumptions rather than with the surface — and it was never
+# called, which is how the drift stayed invisible.
+print("yes" if sys.argv[1] in set(json.load(open(sys.argv[2]))) else "no")
 PY
 }
 
@@ -165,25 +164,38 @@ name="$(last_call | cut -f1)"; args="$(last_call | cut -f2)"
 
 echo "== R5 as data: no verb calls a tool the surface does not advertise"
 mode ok
-for verb in "health" "stats" "search attestation" "get pt_abc"; do
+# ⛔ THE WRITE PATH IS DRIVEN TOO (#3374 review P2). It used to cover only health/stats/search/get,
+# i.e. exactly the READS — while the defect this suite exists for (`label` vs `semantics` on
+# `tortoise_create_operator`) lived on the write path and stayed uncovered. A toolkit that calls an
+# unadvertised WRITE handler is the worse half of R5: the read fails loudly, the write can half-land.
+for verb in "health" "stats" "search attestation" "get pt_abc" \
+            "evidence measured-42-things" "decision DECIDED-measured-42-things"; do
   # shellcheck disable=SC2086
   call $verb
+  [ "$RC" -le 4 ] || fail "verb '$verb' exited $RC — not a documented exit (0/2/4)"
 done
-bad="$(python3 - "$TMP/calls.jsonl" <<'PY'
+call evidence 'measured 42 things' --to pt_target
+[ "$RC" -eq 0 ] || fail "evidence --to exited $RC (the write+edge path)"
+bad="$(python3 - "$TMP/calls.jsonl" "$TMP/advertised.json" <<'PY'
 import json, sys
-ADVERTISED = {"tortoise_get_entity", "tortoise_overview", "tortoise_search", "tortoise_create_point"}
-bad = []
+ADVERTISED = set(json.load(open(sys.argv[2])))
+seen, bad = set(), []
 for line in open(sys.argv[1]):
     b = json.loads(line)
     if b.get("method") == "tools/call":
         n = (b.get("params") or {}).get("name", "-")
+        seen.add(n)
         if n not in ADVERTISED:
             bad.append(n)
+# NON-VACUITY: a set that never names the WRITE tools is the defect this arm was blind to.
+missing = sorted({"tortoise_create_point", "tortoise_create_operator"} - seen)
+if missing:
+    bad.append("(NOT EXERCISED: %s)" % ",".join(missing))
 print(",".join(sorted(set(bad))))
 PY
 )"
-[ -z "$bad" ] && pass "every recorded tools/call is an ADVERTISED handler" \
-  || fail "the client calls UNadvertised handler(s): $bad — the surface will append a retirement notice to each answer and the JSON contract breaks"
+[ -z "$bad" ] && pass "every recorded tools/call is an ADVERTISED handler — and both WRITE tools were exercised" \
+  || fail "the client calls UNadvertised handler(s), or the write path was never driven: $bad — the surface will append a retirement notice to each answer and the JSON contract breaks"
 
 echo
 if [ "$failures" -eq 0 ]; then

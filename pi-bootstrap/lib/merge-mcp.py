@@ -121,6 +121,49 @@ def near_miss(url, want_url):
     return bool(wh) and uh == wh
 
 
+def _edit_distance(a, b, floor=3):
+    """Levenshtein distance, cut off once it is provably >= `floor`.
+
+    Hosts are short, so the table is tiny; the cut-off keeps a long, obviously-different host from
+    costing O(len(a)*len(b)) when the answer is already "not a near-miss".
+    """
+    if abs(len(a) - len(b)) >= floor:
+        return floor
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb)))
+        if min(cur) >= floor:
+            return floor
+        prev = cur
+    return min(prev[-1], floor)
+
+
+def host_typo(url, want_url, floor=3):
+    """True when `url`'s HOST is a lookalike of the default's — a one- or two-character typo.
+
+    ⛔ THE HOLE THIS CLOSES IS NOT THE SAME-SPELLING ONE `near_miss` ALREADY CATCHES. `near_miss`
+    matches on the AUTHORITY, so `api.premiselabs.co` vs `api.premiselab.co` (one letter) is a
+    DIFFERENT host to it — i.e. "a genuine self-host", which the merge then preserved AND MARKED
+    `_selfHosted`, the exemption `--verify` honours. So a repair install (cloud-cell-bringup.sh
+    runs verify → install → verify) minted the exemption for the exact config the verifier had just
+    refused, and the entry still carried `Bearer ${TORTOISE_MCP_API_KEY}` — the live tenant key was
+    sent to a host nobody vetted (#3374 review P1).
+
+    A DELIBERATE self-host is not one character away from the hosted endpoint (localhost, a LAN
+    address, a company domain), so this does NOT override the recorded rule that "a genuine
+    self-host is a different host and is preserved" — it only stops a LOOKALIKE from inheriting it.
+    """
+    def host(u):
+        m = re.match(r"^[a-z][a-z0-9+.\-]*://([^/:]+)", u or "", re.I)
+        return m.group(1).lower() if m else ""
+    uh, wh = host(url), host(want_url)
+    if not uh or not wh or uh == wh:
+        return False
+    return _edit_distance(uh, wh, floor) < floor
+
+
 def _loopback(authority):
     """⛔ MUST MATCH `cell-install.sh`'s `_loopback` — the verifier applies the same rule, and a
     disagreement here is the "install preserves what verify refuses" loop this file's docstring
@@ -359,6 +402,21 @@ def main(argv):
                 "different spelling of the SAME host is a typo, not a self-host; a genuine self-host "
                 "is a different host and is preserved"
                 % (cur.get("url"), want.get("url"))
+            )
+            have["tortoise"] = want
+        elif ok_entry and host_typo((cur.get("url") or "").strip(), (want.get("url") or "").strip()):
+            # A LOOKALIKE HOST IS A TYPO TOO. `near_miss` only compares the authority, so one wrong
+            # letter in the HOST read as "a genuine self-host" and was preserved AND marked — which
+            # is how a repair install turned `--verify`'s refusal into a certification, with the live
+            # key attached (#3374 review P1). A genuine self-host is never 1–2 characters from the
+            # hosted endpoint, so the default wins here for the same reason it wins on a same-host
+            # typo: the box must not be left pointing at an endpoint nobody meant to configure.
+            print(
+                "NOTE: replaced a LOOKALIKE of the hosted host (%s) with the default (%s) — a host "
+                "one or two characters from %s is a typo, not a self-host, and marking such an entry "
+                "_selfHosted would certify it with the tenant key attached. A genuine self-host is a "
+                "different host; re-point it deliberately if this was one"
+                % (cur.get("url"), want.get("url"), (want.get("url") or "").strip())
             )
             have["tortoise"] = want
         elif ok_entry:
