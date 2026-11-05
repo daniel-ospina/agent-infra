@@ -1660,6 +1660,89 @@ rm -rf "$TMP/n34cO"
 tsv34c="$TMP/n34cO/state/lane-end.tsv"
 [ -s "$tsv34c" ] && [ "$(awk -F'\t' 'NR==1{print $8}' "$tsv34c")" = "0" ]; rcn34d=$?
 ck "N34d …while a MEASURED zero still publishes 0 — the column gained a distinction, not a blanket '?'" $rcn34d
+# ⛔ N33e — THE RC CLASS, NOT ONE INTEGER (review cycle 13, P2 — REPRODUCED). Keying the timed-out push on
+# `124` alone missed the fleet's INTERNAL watchdog: `tb_bound_tmp` degrades to "no sentinel" when its scratch
+# dir cannot be made (the full-disk state this PR exists for) and `tb_timeout` then returns the SIGKILLed
+# child's status. Measured on the shipped lib: `TMPDIR=/nonexistent TB_TIMEOUT_FORCE_INTERNAL=1 tb_timeout 1
+# sleep 5` → **137**, not 124. A SIGKILLed client is a fortiori "did NOT establish", so the verdict must be
+# the same class. The shim branches on the NUMBER because the number is the timer's contract with the caller.
+mkdir -p "$TMP/bin-137"
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 137 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-137/git"
+chmod +x "$TMP/bin-137/git"
+git -C "$WT" worktree add -q "$TMP/wt11" -b killed 2>/dev/null
+git -C "$TMP/wt11" commit -q --allow-empty -m "unpushed for the push-SIGKILL arm" 2>/dev/null
+: > "$O/logs/killed.log"; rm -f "$O/state/lane-exit-killed.state"
+PATH="$TMP/bin-137:$PATH" O="$O" bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=killed
+  lane_end_push "killed" "$3" "$2" killed 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$TMP/wt11" "$O/logs/killed.log" > "$TMP/n33e.out" 2>&1
+grep -qx 'push=push-timed-out' "$TMP/n33e.out"; rcn33e=$?
+ck "N33e a push the INTERNAL watchdog SIGKILLed (rc=137, no sentinel — the full-disk shape) also records push=push-timed-out, not FAILED" $rcn33e
+! grep -q 'STILL only on this disk' "$O/logs/killed.log" && grep -q 'did NOT establish' "$O/logs/killed.log"; rcn33f=$?
+ck "N33f …and its log asserts neither delivery nor loss, so the 137 shape cannot claim the absence the 124 fix removed" $rcn33f
+# ⛔ N27e — THE ONE MANUAL ARM THAT DID NOT UNION THE OTHER DOMAIN (review cycle 13, P2 — REPRODUCED).
+# `rescue=FAILED` printed "uncommitted work is NOT archived … re-run bg-rescue-wip.sh" and returned BEFORE the
+# refused-push arms, so `push=refused-main-checkout` — the documented `fix-one.sh` no-`WIP_PATH` hub case —
+# was silently dropped, and the offered remedy cannot push a branch. The same rescue fact beside `push=FAILED`
+# does name both, so the arm order alone violated the file's own rule.
+nx27e="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=refused-main-checkout
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx27e" in MANUAL*"NOT archived"*) rcn27e=0 ;; *) rcn27e=1 ;; esac
+case "$nx27e" in *"NOT on origin"*) : ;; *) rcn27e=1 ;; esac
+case "$nx27e" in *"re-running the rescue does NOT fix"*) : ;; *) rcn27e=1 ;; esac
+ck "N27e a FAILED archive beside a REFUSED push names BOTH facts and says the rescue cannot fix the branch [${nx27e:0:64}]" $rcn27e
+# ⛔ N28c/N28d — A MANUAL VERDICT MAY NOT SIT BELOW A REPORTER, AND `cannot-verify` IS ONE (review cycle 13,
+# P1 — REPRODUCED). `cannot-verify` lived inside the `dirty|cannot-verify` block, so `rescue=archived-local`
+# and `rescue=refs/wip/*` both returned first: the lane LOG said the listing was INCOMPLETE and "do not reap
+# this worktree on the strength of this row" while the ARTIFACT said "retrieve the archive … before removing
+# it" — the same run refusing and licensing a reclaim. N28 could not see it: N28 drives `rescue=nothing`,
+# the one value where that arm was reachable.
+nx28c="$( bash -c '
+  . "$1"
+  LANE_END_TREE=cannot-verify; LANE_END_RESCUE=archived-local
+  LANE_END_REF=refs/wip-local/cvdemo; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx28c" in MANUAL*) rcn28c=0 ;; *) rcn28c=1 ;; esac
+case "$nx28c" in *"NOT reap"*) : ;; *) rcn28c=1 ;; esac
+case "$nx28c" in *"refs/wip-local/cvdemo"*) : ;; *) rcn28c=1 ;; esac
+ck "N28c cannot-verify over a LOCAL-ONLY archive is MANUAL / do-not-reap and still names the pin — the reporter no longer runs above it [${nx28c:0:60}]" $rcn28c
+nx28d="$( bash -c '
+  . "$1"
+  LANE_END_TREE=cannot-verify; LANE_END_RESCUE=refs/wip/cvdemo; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$nx28d" in MANUAL*"NOT reap"*"refs/wip/cvdemo"*) rcn28d=0 ;; *) rcn28d=1 ;; esac
+ck "N28d …nor is the OFF-BOX archive exempt — the incomplete listing means even that cannot certify the tree, and the ref is still named [${nx28d:0:60}]" $rcn28d
+# ⛔ N35 — `unpushed` HAS ITS OWN ENUMERATION AND MUST SURVIVE `cannot-verify` (review cycle 13, P2 —
+# REPRODUCED). `dirty` rides on the porcelain listing (untrusted here), but `unpushed` comes from `rev-list`
+# and is only `?` when THAT failed (:1893). Publishing `?` over a measured count is the inverse of the defect
+# cycle 12 fixed — "never measured" claimed about a number that was measured — and it left the ledger less
+# informative than the same terminal's own lane log.
+rm -rf "$TMP/n35O"
+( bash -c '
+  . "$1"
+  O="$2"; LANE_END_TREE=cannot-verify; LANE_END_RESCUE=nothing; LANE_END_UNPUSHED=1
+  LANE_END_PORCELAIN=""; LANE_END_LOG=/dev/null; LANE_END_MARKER_FRESH=1
+  lane_end_record n35 0 10' _ "$GATE" "$TMP/n35O" 2>/dev/null )
+tsv35="$TMP/n35O/state/lane-end.tsv"; mk35="$TMP/n35O/state/lane-exit-n35.state"
+[ -s "$tsv35" ] && [ "$(awk -F'\t' 'NR==1{print $8}' "$tsv35")" = "1" ] \
+  && grep -qx 'unpushed=1' "$mk35"; rcn35a=$?
+ck "N35a a cannot-verify row keeps the unpushed count it DID measure — and the marker agrees, one derivation [$(awk -F'\t' 'NR==1{print "col8="$8}' "$tsv35" 2>/dev/null)]" $rcn35a
+grep -qx 'dirty=?' "$mk35"; rcn35b=$?
+ck "N35b …while dirty on that same row IS '?', because that field does ride the untrusted listing" $rcn35b
+rm -rf "$TMP/n35bO"
+( bash -c '
+  . "$1"
+  O="$2"; LANE_END_TREE=cannot-verify; LANE_END_RESCUE=nothing; LANE_END_UNPUSHED="?"
+  LANE_END_PORCELAIN=""; LANE_END_LOG=/dev/null; LANE_END_MARKER_FRESH=1
+  lane_end_record n35b 0 10' _ "$GATE" "$TMP/n35bO" 2>/dev/null )
+awk -F'\t' 'NR==1{exit !($8=="?")}' "$TMP/n35bO/state/lane-end.tsv"; rcn35c=$?
+ck "N35c …and a genuinely UNMEASURED count on a cannot-verify row still publishes '?' — the fix keys on the count, not the tree" $rcn35c
 echo
 
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
