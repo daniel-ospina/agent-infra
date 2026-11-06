@@ -1268,7 +1268,7 @@ _r5="$_rdir/r5.out"; run_review /nonexistent/reviewer.sh 42 acme/widget "$_r5"
   || bad "a reviewer that never ran must leave a RETRYABLE outcome (got '$(review_state "$_r5")') — a permanent 'pending' is a head nobody will ever look at again"
 # ── AND A DISPATCH THAT CANNOT EVEN RECORD ITSELF CONSUMES NOTHING (mirrors `launch_rail`) ──────
 : > "$_sutlog"
-launch_review acme/widget 42 "$H" /proc/no/such/dir/r6.out 2>/dev/null && bad "a dispatch that cannot write its record must not read as started"
+launch_review acme/widget 42 "$H" /proc/no/such/dir/r6.out 2>/dev/null && bad "a dispatch that cannot write its record must not read as started"  # portability-ok: the SAME inexpressible shape as the `launch_rail` arm above (this whole case is annotated "mirrors `launch_rail`") — a deliberately NON-EXISTENT fixture path handed to the launcher as an argument, not a procfs READ. Where /proc is absent (macOS) the path is still nonexistent, so the fixture behaves identically and the arm still discriminates.
 # ⛔ AND A FAILED WRITE MUST REMOVE THE RECORD IT TRUNCATED (P2). `>` truncates the target BEFORE the write
 # runs, so a write that fails on a nearly-full volume (`disk-floor.sh` exists because that happens) leaves
 # a ZERO-BYTE record: no exit line (-> `pending`) and no dispatch epoch (-> `_rage=0`, the value a real
