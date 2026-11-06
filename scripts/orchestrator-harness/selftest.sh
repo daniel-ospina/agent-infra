@@ -2316,7 +2316,15 @@ ck "MIN_MEM_FREE_MB resolves to the documented 512MB default in the shipped file
 # arm in its own guard, and several of those guards close on a bare `  fi` — the first one truncated
 # the block to the merge-priority arm, ELEVEN assertions still passed and the three below went red.
 # A marker is the range the code itself declares, so adding an arm cannot silently shorten the test.
-GATE_BLOCK="$(sed -n '/^  GATE_WHY="\$(mp_reason/,/# \[gatevec:end\]/p' "$LOOP")"
+# ⛔ THE ENTRY LINE MOVED, AND THE PIN FOLLOWS IT BY NAME (owner ruling 2026-11-04). `merge-priority`
+# no longer assigns `GATE_WHY` — that assignment WAS the barrier — so it is computed into
+# `MP_PRIORITY` from the same count and the same four arguments. Two pins, because they answer two
+# different questions: this one proves the rule is still CALLED (a rename or a deletion reddens), and
+# `GATE_BLOCK` below is the capacity arms this section actually drives.
+GATE_ENTRY="$(grep -cE '^  MP_PRIORITY="\$\(mp_reason' "$LOOP" 2>/dev/null || true)"
+[ "${GATE_ENTRY:-0}" -ge 1 ] && rce=0 || { rce=1; echo "      the cascade's priority entry (MP_PRIORITY=\$(mp_reason …)) is GONE from $LOOP"; }
+ck "the cascade's priority is still fed by the shipped mp_reason call" $rce
+GATE_BLOCK="$(sed -n '/# \[gatevec:begin\]/,/# \[gatevec:end\]/p' "$LOOP")"
 [ -n "$GATE_BLOCK" ] && rcg=0 || { rcg=1; echo "      the gate chain could not be extracted from $LOOP"; }
 ck "the dispatch gate chain is extractable from the shipped loop" $rcg
 mrw() { # L LANES SWTOTAL SWFREE MEM_UNKNOWN MEMAVAIL_MB MAX_LOAD MAX_LANES MIN_SWAP MIN_MEM [WORKERS]

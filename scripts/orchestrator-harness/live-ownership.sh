@@ -329,7 +329,13 @@ lo_select_rows() {
 
 # ── the choice ────────────────────────────────────────────────────────────────
 # lo_select <total> <owned> <unowned> <parked-excluded> <first-pr|-> <capacity-reason|-> <backlog> \
-#          [<acted> <named-waits> <record|unknown> [<spawned>]]
+#          [<acted> <named-waits> <record|unknown> [<spawned> [<pr-waiting>]]]
+#
+# ⛔ `<pr-waiting>` IS THE CASCADE (owner ruling 2026-11-04), and its absence is NOT zero: an older
+# caller that does not pass it keeps the pre-change behaviour (`1` ⇒ PR work holds the issue path).
+# `0` means the PR sweep ran FIRST this pass, took the room it needed, and left room — so the issue
+# path opens and the line SAYS the order was respected. This is the only place the funnel learns that
+# "un-owned PRs exist" and "the issue path is closed" are two different statements.
 #
 # Prints the ONE-LINE FUNNEL that makes the cycle's choice auditable, and sets LO_CHOICE to
 # pr|issue|none. The ordering IS the rule: un-owned PRs → new issues → nothing.
@@ -358,11 +364,16 @@ lo_select_rows() {
 # module still agree, and a module must never invent a spawn count it was not given.
 lo_select() {
   local total="${1:--}" owned="${2:--}" unowned="${3:--}" parked="${4:-0}" first="${5:--}" cap="${6:-}" backlog="${7:-0}"
-  local acted="${8:-}" waits="${9:-}" rec="${10:-}" spawned="${11:-}"
-  local prs_why issues_why
+  local acted="${8:-}" waits="${9:-}" rec="${10:-}" spawned="${11:-}" prw="${12:-}"
+  local prs_why issues_why pr_waiting
   LO_CHOICE=none
   lo_num "$unowned" || unowned=""
   lo_num "$parked"  || parked=0
+  # ⛔ THE TWELFTH INPUT IS THE CASCADE (owner ruling 2026-11-04), and its ABSENCE is not "0". An older
+  # caller that does not report it keeps the pre-change behaviour exactly (`pr_waiting=1` ⇒ PR work
+  # holds the issue path), so a stale module and a new caller cannot silently disagree about whether
+  # issues may open — the module must never invent a capacity it was not told about.
+  pr_waiting="${prw:-1}"
   # An ABSENT acted count is not zero: it means the caller does not report it (an older caller), and
   # the old wording must stand. `0` is a MEASURED zero and takes the honest branch below.
   lo_num "$acted" || acted=""
@@ -376,7 +387,7 @@ lo_select() {
     LO_CHOICE=pr
     prs_why="dispatching PR-takeover (un-owned count UNREADABLE — draining rather than opening)"
     issues_why="SKIPPED (un-owned PR fetch unreadable)"
-  elif [ "$unowned" -gt 0 ]; then
+  elif [ "$unowned" -gt 0 ] && [ "$pr_waiting" != "0" ]; then
     LO_CHOICE=pr
     if [ "$spawned" = "0" ] && [ "$rec" = "unknown" ]; then
       # BOTH readings, kept apart: the spawn count WAS measured (0 worker records) while the per-PR
@@ -407,11 +418,25 @@ lo_select() {
     else
       prs_why="dispatching PR-takeover (target not resolved this cycle${spawned:+; $spawned worker(s) spawned})"
     fi
-    issues_why="SKIPPED (un-owned PRs exist)"
+    # ⛔ THE WORD "PRIORITY" IS LOAD-BEARING (owner ruling 2026-11-04). This is the branch a reader
+    # meets on almost every cycle, and it must not say the issue path is CLOSED — it is DEFERRED,
+    # because PR work has the first call on the room the box has. The two readings are different
+    # states with different remedies (wait vs. drain), so they get different words.
+    issues_why="DEFERRED (PR work holds the priority: ${unowned} un-owned PR(s) and no room left after it)"
   elif [ -n "$cap" ]; then
     LO_CHOICE=none
     prs_why="no un-owned PR left"
+    [ "$unowned" -gt 0 ] && prs_why="PR work dispatched first (${unowned} un-owned PR(s) remain, in flight)"
     issues_why="SKIPPED (no capacity: $cap)"
+  elif [ "$unowned" -gt 0 ]; then
+    # ── THE CASCADE OPENS HERE (owner ruling 2026-11-04) ─────────────────────────────────────
+    # Un-owned PR work EXISTS and the box still has room the PR sweep did not take. The recorded
+    # order is intact (PR work ran first and took the first slots); what is dropped is the barrier
+    # that held the rest of the capacity idle. Measured cost of the barrier: 0.66% of cycles
+    # dispatched ANYTHING over 1,219 cycles.
+    LO_CHOICE=issue
+    prs_why="PR-takeover ran first and took the room it needed (${unowned} un-owned PR(s) remain in flight)"
+    issues_why="DISPATCH — CASCADE ($backlog in backlog; the PR path had the first call on capacity and left room)"
   else
     LO_CHOICE=issue
     prs_why="no un-owned PR left"
