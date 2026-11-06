@@ -720,6 +720,11 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
   # `publish_review_state` → MARKER-UNREADABLE); this is the one that must too.
   if ! n=$(awk -v cut="$cut" '$1 ~ /^[0-9]+$/ && $1 > cut {c++} END {printf "%d", c+0}' "$f" 2>/dev/null); then
     log_line "$f REVIEW-LEDGER-UNREADABLE: the per-head attempt ledger exists but could not be read — treating this head as EXHAUSTED (fail-closed: an unreadable counter is not a free slot, and the append would otherwise grow a ledger nothing can count)"
+    # ⛔ THE VALUE RETURNED HERE IS THE CAP, NOT A COUNT — so whoever PUBLISHES it must not present it as a
+    # measurement. That cannot be signalled from here: the loop calls this function in `$( … )`, which is a
+    # SUBSHELL, so no variable set in this body reaches the caller (measured — a flag here left the
+    # published text claiming "3 dispatch(es)" as fact, with the suite green because its arms set the flag
+    # by hand). `review_ledger_unreadable` exists for the caller to ask the question DIRECTLY instead.
     printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"
     return 0
   fi
@@ -730,6 +735,15 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
     *[!0-9]*) log_line "$f REVIEW-LEDGER-UNPARSEABLE ('$n'): treating this head as EXHAUSTED (fail-closed)"; printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0;;
   esac
   printf '%s\n' "$n"
+}
+# Can this ledger be READ? Asked DIRECTLY by the caller, never through `$( )` — see the note inside
+# `review_attempts`: a subshell cannot hand a variable back, so a flag set there is silently inert and the
+# published comment keeps asserting the CAP as a measured count. rc 0 = exists and cannot be read.
+review_ledger_unreadable() {  # $1 = attempt ledger
+  local f=$1
+  [ -f "$f" ] || return 1
+  awk '$1 ~ /^[0-9]+$/ {c++} END {printf "%d", c+0}' "$f" >/dev/null 2>&1 || return 0
+  return 1
 }
 # ── FORGIVING A REFUSAL, PRECISELY ───────────────────────────────────────────────────────────────
 # ⛔ THE WINDOW DOES NOT MAKE THIS UNNECESSARY, AND DELETING IT WAS WRONG (review round 3, verifier).
@@ -879,8 +893,17 @@ review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; p
 # head is the cap-deferral publish: it says "no owner yet" about the PR rather than a revision, and it
 # stays plain presence.
 publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 = present (or just posted)
-  local repo=$1 pr=$2 state=$3 head=${4:-} tag seen text
+  local repo=$1 pr=$2 state=$3 head=${4:-} basis=${5:-} tag seen text _ratt_basis
   tag="<!-- auto-rail-review:${state}${head:+:$head} -->"
+  # ⛔ WHAT MAY BE SAID ABOUT THE COUNT (review round 6, P3): when the attempt ledger could not be READ, the
+  # count the loop acted on is the CAP, not a measurement — so the comment says that instead of asserting
+  # "3 dispatch(es)" as a fact. The caller passes `cap` for that case (a global flag cannot work: the count
+  # is fetched in `$( … )`, and a subshell cannot write back).
+  if [ "$basis" = cap ]; then
+    _ratt_basis="its ATTEMPT LEDGER could not be read, so it is held fail-closed as if ${REVIEW_MAX_ATTEMPTS} dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count)"
+  else
+    _ratt_basis="${REVIEW_MAX_ATTEMPTS} dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s"
+  fi
   case "$state" in
     awaiting-review)
       text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot and the environment allows it. **It is not waiting on a lane.**";;
@@ -889,7 +912,7 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     review-found-issues)
       text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
     review-retries-exhausted)
-      text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${REVIEW_MAX_ATTEMPTS} dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s. No attestation exists, and auto-rail is not dispatching another review at this revision until that window rolls — which it does BY ITSELF, so an environmental cause (a rate-limit or auth window, a loaded box) needs no action at all. If this head genuinely cannot be reviewed, push a new head: a new head is a new review.";;
+      text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${_ratt_basis}. No attestation exists, and auto-rail is not dispatching another review at this revision until that window rolls — which it does BY ITSELF, so an environmental cause (a rate-limit or auth window, a loaded box) needs no action at all. If this head genuinely cannot be reviewed, push a new head: a new head is a new review.";;
     review-record-unbound)
       text="⚠️ **auto-rail: a review record exists at \`${head:0:12}\` but the PR body carries no marker this loop can bind.** Re-running \`record-review.sh\` for this PR re-posts the signed marker at the same head (that write is idempotent). auto-rail never writes records, so it cannot do this itself — and it is deliberately NOT buying a second review, which would not help. **It is not waiting on a lane.**";;
     review-dispatch-failed)
@@ -1351,8 +1374,15 @@ PY
           # has no verdict, so dispatching again buys the same failure at review prices. Publishing it
           # is what keeps the PR from reading as "a lane is working on it" — the rest of this step only
           # exists to keep that from happening.
-          publish_review_state "$repo" "$pr" review-retries-exhausted "$head"
-          log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s (cap $REVIEW_MAX_ATTEMPTS, last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
+          # ⛔ THE COUNT AND THE COMMENT MUST AGREE, AND NEITHER MAY OVERSTATE WHAT WAS MEASURED: when the
+          # ledger cannot be read, `_rattn` is the CAP, so the published comment AND the log say that.
+          if review_ledger_unreadable "$_ratt"; then _rbasis=cap; else _rbasis=; fi
+          publish_review_state "$repo" "$pr" review-retries-exhausted "$head" "$_rbasis"
+          if [ "$_rbasis" = cap ]; then
+            log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read, so this head is held fail-closed as if $REVIEW_MAX_ATTEMPTS dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count; last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
+          else
+            log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s (cap $REVIEW_MAX_ATTEMPTS, last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
+          fi
           continue
         fi
         if [ "$_ract" -eq 2 ]; then

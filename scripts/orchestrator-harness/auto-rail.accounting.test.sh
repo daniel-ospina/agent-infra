@@ -712,6 +712,9 @@ rm -rf "$_pydir" "$_badbin" "$_sutlog"
 eval "$(sed -n '/^review_state() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_dispatched_at() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_attempts() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^review_ledger_unreadable() {/,/^}$/p' "$SUT")"
+command -v review_ledger_unreadable >/dev/null \
+  || { echo "FATAL: review_ledger_unreadable not found in $SUT"; exit 2; }
 eval "$(sed -n '/^review_forgive_refusal() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_action() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_should_defer() {/,/^}$/p' "$SUT")"
@@ -1595,6 +1598,56 @@ grep -qF 'bash "$1" "$2" --repo "$3" >> "$4" 2>&1 < /dev/null' "$SUT" \
   || bad "run_review must run the reviewer with '< /dev/null' — the loop's stdin is the CANDIDATE FILE and pi drains piped stdin, so an inherited fd 0 makes the reviewer eat the remainder of this repo's candidate list (silently: the pass line already counted them)"
 grep -qF '"$out" >> "$LOG" 2>&1 < /dev/null &' "$SUT" \
   || bad "the nohup dispatch must redirect stdin from /dev/null too — otherwise the background wrapper inherits the candidate file even if run_review's own redirection were dropped"
+# ⛔ AND THE FAIL-CLOSED NUMBER MUST NOT BE PUBLISHED AS A MEASUREMENT (review round 6, P3, measured): the
+# value returned for an unreadable ledger is the CAP, and the EXHAUSTED comment used to print it as
+# "N dispatch(es)" — a past-tense fact the loop never measured (on a mode-0200 root-owned ledger the append
+# fails too, so the TRUE recorded count is 0).
+# ⛔ AND IT MUST BE PINNED THROUGH THE REAL CALL PATTERN, not by hand-setting a variable: the loop fetches the
+# count with `_rattn=$(review_attempts …)`, a SUBSHELL, so a flag set inside `review_attempts` never reaches
+# the publisher — the first version of this fix was INERT exactly that way, with this suite green because
+# its arms set the flag themselves. So the arms below ask the shipped predicate and drive the shipped
+# publisher with the argument the loop passes.
+_UL2="$_rdir/unreadable2.attempts"
+printf '%s\n' "$(date +%s)" > "$_UL2"
+if chmod 000 "$_UL2" 2>/dev/null && [ ! -r "$_UL2" ]; then
+  review_ledger_unreadable "$_UL2" \
+    || bad "an existing-but-unreadable ledger must be reported by review_ledger_unreadable (rc $?) — the publisher's wording depends on this answer, and it is the only thing that can carry it out of the subshell"
+  _HU=7777777777777777777777777777777777777777
+  _b0=$(wc -l < "$POSTED")
+  _hn=$(review_attempts "$_UL2")          # the loop's own shape
+  if review_ledger_unreadable "$_UL2"; then _rb=cap; else _rb=; fi
+  publish_review_state acme/widget 42 review-retries-exhausted "$_HU" "$_rb"
+  case "$(sed -n "$(( _b0 + 1 )),\$p" "$POSTED")" in
+    *'that is the CAP, not a count'*) ;;
+    *) bad "an unreadable ledger must be published as the CAP, not as '$ _hn dispatch(es)' — the number is fail-closed, not measured (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
+  esac
+else
+  echo "SKIP: cannot make a ledger unreadable as $(id -un) — the CAP-wording arm is INERT on this host"
+fi
+chmod 600 "$_UL2" 2>/dev/null; rm -f "$_UL2"
+# ⛔ AND A READABLE LEDGER MUST BE REPORTED READABLE: if the predicate answers "unreadable" for everything,
+# every EXHAUSTED comment in the fleet claims its ledger could not be read — a false claim of a different
+# kind, and the measured-count branch would become dead code.
+_RL="$_rdir/readable.attempts"; printf '%s\n' "$(date +%s)" > "$_RL"
+review_ledger_unreadable "$_RL" \
+  && bad "a plainly READABLE ledger must not be reported unreadable — every exhaustion would then be published as 'the ledger could not be read'"
+rm -f "$_RL"
+review_ledger_unreadable "$_rdir/absent.attempts" \
+  && bad "a MISSING ledger must NOT be reported unreadable — the first dispatch of a head would be blocked"
+_HM=8888888888888888888888888888888888888888
+_b1=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-retries-exhausted "$_HM"
+case "$(sed -n "$(( _b1 + 1 )),\$p" "$POSTED")" in
+  *'dispatch(es) inside'*) ;;
+  *) bad "a MEASURED exhaustion must still publish the count — the CAP wording must not leak into the readable case (got: $(sed -n "$(( _b1 + 1 )),\$p" "$POSTED" | head -1))" ;;
+esac
+# …and the LOOP must pass the basis it computed: a bare publish (no 5th argument) would silently fall back
+# to the measured wording, which is the inert shape this fix replaced.
+grep -qF 'publish_review_state "$repo" "$pr" review-retries-exhausted "$head" "$_rbasis"' "$SUT" \
+  || bad "the loop must PASS its basis to the EXHAUSTED publish ('… review-retries-exhausted \"\$head\" \"\$_rbasis\"') — without the argument the comment falls back to asserting the CAP as a measured count, which is the defect this change closes"
+grep -qF 'if review_ledger_unreadable "$_ratt"; then _rbasis=cap; else _rbasis=; fi' "$SUT" \
+  || bad "the loop must ASK, directly, whether the ledger is unreadable ('if review_ledger_unreadable \"\$_ratt\"; then _rbasis=cap; else _rbasis=; fi') — a flag set inside \`\$(review_attempts …)\` never reaches the publisher (subshell)"
+
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"
 
