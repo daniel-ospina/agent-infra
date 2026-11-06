@@ -567,15 +567,15 @@ done
 # its name in the contract reddens here rather than in an operator's misread.
 _gates="$(sed -n '/^cap_refusal_gate()/,/^}/p' "$(dirname "$LANE")/chain-merge.sh" \
           | sed -n 's/^[[:space:]]*\([a-z][a-z-]*\))[[:space:]]*printf.*/\1/p' | sort -u | paste -sd ',' -)"
-eqv "$_gates" "capability,disk,fork,key,land,skew" \
-    "4e the normaliser's own vocabulary is the expected seven-to-six named arms (load is the FOLD, not an arm)"
+eqv "$_gates" "capability,disk,fork,key,land,mem,skew" \
+    "4e the normaliser's own vocabulary is the expected named arms — eight of them, load being the FOLD and not an arm"
 _fmt="$(sed -n '/^# FORMAT — one line/,/^# (`land` is the CREATION/p' "$LANE")"
-for _g in load disk land fork capability skew key; do
+for _g in load disk land fork capability skew key mem; do
   has "$_fmt" "\`$_g\`" "4e …and the FORMAT contract names the \`$_g\` gate (a consumer built from it cannot fold it)"
 done
-has "$_fmt" "SEVEN refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names)"
+has "$_fmt" "EIGHT refusal gates" "4e …and the COUNT agrees with the list (it said SIX beside seven names, then SEVEN beside eight)"
 _ret="$(head -n 80 "$(dirname "$LANE")/chain-merge.sh" | grep -n '^cap_refusal_gate()')"
-for _g in key skew; do
+for _g in key skew mem; do
   has "$_ret" "$_g" "4e …and chain-merge's return contract names \`$_g\`, which its case arm dispatches on"
 done
 

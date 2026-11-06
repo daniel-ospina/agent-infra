@@ -72,7 +72,7 @@ esac
 # same issue must never end a LIVE lane's chain: that would release the claim while the lane is
 # still working, and a peer would then open a second lane for the same issue. `refused_epoch >=
 # CHAIN_START` (same clock, same box) admits only a refusal from this very dispatch.
-cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew|key` and returns 0 iff THIS dispatch was refused by a gate
+cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` and returns 0 iff THIS dispatch was refused by a gate
   local f="$O/state/capacity-refused-${N:-}" ep until gate grace win
   [ -n "${N:-}" ] || return 1
   case "${N:-}" in *[!0-9]*) return 1 ;; esac
@@ -106,7 +106,7 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew|key` and r
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk / 82 key / 83 harness-skew), not a gate: an
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 memory / 82 key / 83 harness-skew), not a gate: an
   # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
@@ -130,10 +130,18 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew|key` and r
   # measured on the merged tree with a `gate=capability` record, `exit=75`, log `refused at the load
   # gate`. The arm below and this line are ONE unit; a suite arm now drives each gate through this
   # file and pins the exit code, so the pair cannot drift apart again.
+  # ⛔ `mem` is named here for the same reason (#2387): its arm exists below, so folding the word into
+  # `*` would route a MEMORY refusal through the load remedy — the very defect the paragraph above
+  # records, one gate later.
   case "${gate:-}" in
     disk) printf 'disk' ;;
     fork) printf 'fork' ;;
     land) printf 'land' ;;
+    # ⛔ `mem` IS THE SPAWN GATE'S MEMORY REFUSAL (#2387), and it MUST be mapped, not left to the
+    # default: `lane.sh` writes it, and falling through to `load` would name the load gate in the
+    # chain's log and exit 75 — sending the operator to watch a 1-min average that will never move
+    # while the OOM killer takes lanes, i.e. the exact wrong-cause class this field exists to remove.
+    mem) printf 'mem' ;;
     capability) printf 'capability' ;;
     skew) printf 'skew' ;;
     # ⛔ `key` IS THE MODEL-CREDENTIAL REFUSAL (agent-infra#3331), and it belongs HERE for the same reason
@@ -270,6 +278,11 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # anything. The exit code must differ for the same reason 75 and 77 differ from each other —
       # the remedy is different — and it must be a STOP here for the same reason: no PR can appear.
       land) _cap_rc=74 ;;
+      # 81 is spawn-gate.sh's AGENT_MEM_REFUSED (#2387): available memory is below the spawn gate's
+      # floor. A capacity refusal like load — a peer with free RAM can take the issue — but a
+      # DIFFERENT reading whose remedy is a DIFFERENT event (resident lanes finishing, not the load)
+      # so it exits with its own code rather than reporting 75.
+      mem)  _cap_rc="${AGENT_MEM_REFUSED:-81}" ;;
       # 71 is spawn-gate.sh's AGENT_CAPABILITY_REFUSED (#2935): the box could not complete one model
       # call and RETURN. Distinct from 75 for the usual reason — the remedy differs — and it lands in
       # the SAME yield path as load, deliberately: a capability refusal is a property of THIS box, so
@@ -496,13 +509,19 @@ fi
 
 bash "$O/merge-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$LOG" 2>&1
 rc=$?
-# A load refusal (75) is not a failure of the work: nothing ran and nothing was consumed. Name it
+# A capacity refusal is not a failure of the work: nothing ran and nothing was consumed. Name it
 # HERE, in the log the operator reads for this chain — the reviewer's own line is inside
 # merge-$PR.log, and on a box with no controller running nothing else would ever re-dispatch it.
+# ⛔ ONE CAUSE PER CODE (#2387 review P3): this block used to test `rc = 75` only, so a memory
+# refusal — merge-one.sh's own PI_GATE_MEM_REFUSED arm now exits 81 — propagated the right code and
+# said NOTHING, on the very path (chain-<N>, no controller running) the line exists to cover. The
+# remedies differ, so they are separate arms rather than a shared "capacity" sentence: a load floor
+# clears when the box quietens, a memory floor only when resident lanes finish or are stopped.
 echo "[chain $N] merge-one rc=$rc $(date)" >> "$LOG"
-if [ "$rc" = "75" ]; then
-  echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG"
-fi
+case "$rc" in
+  75) echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG" ;;
+  81) echo "[chain $N] reviewer NOT started (MEMORY gate) — nothing was consumed. Re-run this chain when resident lanes have finished and released their working set (this will NOT clear by waiting for load); the reading, the floor and its derivation are on the [mem-gate] REFUSED line in merge-$PR.log" >> "$LOG" ;;
+esac
 echo "[chain $N] done $(date)" >> "$LOG"
 # ⛔ EXIT WITH merge-one.sh's STATUS (#1720 review). This script used to end on the `echo …done…`
 # above, so `$?` was the STATUS OF `echo` — always 0 — and a caller doing `chain-merge.sh … && next`
