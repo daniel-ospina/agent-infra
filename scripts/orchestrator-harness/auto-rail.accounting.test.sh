@@ -781,6 +781,15 @@ _arm() { review_candidate_arm "$1" "$2"; }
 [ "$(_arm red at-head)"   = rail ]   || bad "an ATTESTED RED candidate takes the RAIL path — the rail's exemption engine is what lands a red head whose reds are not its own (got '$(_arm red at-head)')"
 [ "$(_arm red absent)"    = skip ]   || bad "a RED candidate with NO marker at any head must buy NOTHING: there is no record for check (c) to carry and no review is bought for a red head, which must not be attested clean (#3440) (got '$(_arm red absent)')"
 [ "$(_arm red stale)"     = rail ]   || bad "a RED candidate carrying a marker at an OLDER head must go to the RAIL, not be dropped — check (c) accepts a stale marker whose diff= matches the live diff (#3315) and the rail's exemption engine lands it; the 'continue' that skipped this is the P1 finding (got '$(_arm red stale)')"
+# ⛔ AND THE RED-ABSENT BRANCH MUST STILL `continue` (measured on the merged head: deleting that one
+# word left this whole suite GREEN). The `_arm` helper evals the decision BLOCK, so it cannot see the
+# fall-through — and the fall-through is the defect: with `_rarm=skip` the next gate is false, so control
+# reaches the RAIL path and a red head with no marker at ANY head is handed to the rail, which is exactly
+# the "a red head must not be attested clean" case (#3440) this branch exists to stop.
+grep -qF 'the red arm owns this PR"' "$SUT" \
+  || bad "the red-unattested log line is gone — this arm pins the continue that must follow it"
+awk '/the red arm owns this PR"$/{f=1;next} f&&/^[[:space:]]*continue$/{found=1;exit} f&&NF{exit} END{exit !found}' "$SUT" \
+  || bad "the red-unattested branch must CONTINUE — without it control falls through to the rail path and a red head with no marker at any head is railed ('a red head must not be attested clean', #3440); the block-extracting arms cannot see this, so it is pinned by the line after the log"
 # ⛔ A NON-CLEAN RECORD AT THE HEAD IS NOT `at-head` (P1, measured 2026-11-06). check (c) accepts ONLY
 # clean|clean-micro|clean-low, while `record-review.sh` mints `verdict=not-clean` for every review that
 # found blocking issues (#3400) — so `at-head` on a not-clean marker launched a rail the gate refuses
@@ -858,13 +867,19 @@ grep -qF '[ -s "$REVIEW_SCRIPT" ]' "$SUT" \
 # attempt budget is spent, and the loop publishes a 'paid dispatch(es)' claim about money never spent.
 grep -qF 'bash -n "$REVIEW_SCRIPT"' "$SUT" \
   || bad "the reviewer capability bar must PARSECHECK the reviewer ('bash -n \"\$REVIEW_SCRIPT\"') — without it an executable, non-empty, unparsable review-pr.sh latches REVIEW_AVAILABLE=1, burns the attempt budget on a reviewer that cannot run, and publishes a 'paid dispatch(es)' claim about money never spent"
-# …and a dispatch may never be invisible: the IN-FLIGHT marker is published BEFORE the launch. The two
-# call shapes are named exactly, because a looser match is satisfied by the found-issues publish further
-# up the branch — measured: deleting the in-flight publish entirely left a loose order assertion GREEN.
+# …and a dispatch that really STARTED must be announced at once — but ONLY once it started. The order
+# was the reverse until review round 5 (announce, then launch): announcing first means the marker claims a
+# dispatch that may be rolled back, and then every later pass must choose between leaving that claim as the
+# last word and re-posting one of the pair on every pass — measured at two comments per pass on a
+# persistently broken reviewer path. `launch_review` returns success only after it has PROVEN the child
+# started (`kill -0`/record lines), so publishing immediately after it announces a running review within
+# the verification window. Pinned by line order, both directions, because position IS the fix.
+# The two call shapes are named exactly, because a looser match is satisfied by the found-issues publish
+# further up the branch — measured: deleting the in-flight publish entirely left a loose order assertion GREEN.
 _pub_ln=$(printf '%s\n' "$_branch" | grep -nF 'publish_review_state "$repo" "$pr" review-in-flight "$head"' | head -1 | cut -d: -f1)
 _lau_ln=$(printf '%s\n' "$_branch" | grep -nF 'launch_review "$repo" "$pr" "$head" "$_rout"' | head -1 | cut -d: -f1)
-[ -n "$_pub_ln" ] && [ -n "$_lau_ln" ] && [ "$_pub_ln" -lt "$_lau_ln" ] \
-  || bad "the in-flight marker must be published BEFORE the reviewer is dispatched (in-flight publish at line ${_pub_ln:-MISSING}, launch at line ${_lau_ln:-MISSING}) — a launch that is never announced leaves a dispatched, paid review invisible on the PR"
+[ -n "$_pub_ln" ] && [ -n "$_lau_ln" ] && [ "$_pub_ln" -gt "$_lau_ln" ] \
+  || bad "the in-flight marker must be published AFTER the launch is PROVEN started (launch at line ${_lau_ln:-MISSING}, in-flight publish at line ${_pub_ln:-MISSING}) — announced before it, a rolled-back dispatch has already claimed a reviewer was dispatched, and keeping the PR truthful then costs a comment on every pass"
 # The review cooldown key is the HEAD, not the PR: keyed on the PR alone, a new head would inherit the
 # old head's record and the loop would hold a fixable PR for REVIEW_COOLDOWN_S for no reason.
 _rout_line=$(sed -n 's/^[[:space:]]*_rout="\(.*\)"$/\1/p' "$SUT")
@@ -934,15 +949,18 @@ _lau_ln=$(grep -nF 'launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt"' "$SUT
 # ⛔ AND "AFTER a successful dispatch" IS THE GUARD, NOT THE LINE ORDER (review round 3, P1, measured):
 # swapping the guard for `|| true` kept the increment after the launch and left the suite GREEN, so a
 # rolled-back launch still burned the repo's only slot. A bare `|| continue` is no longer enough either:
-# the rollback must CORRECT the in-flight marker it already posted, so the literal is the whole statement.
+# the rollback must PUBLISH a corrective state, so the literal is the whole statement.
 grep -qF 'launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" \' "$SUT" \
   || bad "the dispatch must GUARD the counter increment ('launch_review … \\') — without it a REVIEW-LAUNCH-FAILED (rolled back, nothing consumed) still increments the per-pass counter and starves every remaining candidate of that repo"
-# ⛔ AND THE GUARD MUST PUBLISH THE CORRECTION, NOT JUST `continue` (review round 3, measured): the
-# in-flight marker is posted BEFORE the launch by design, so a bare `|| continue` leaves the PR asserting
-# "review in flight" with nothing running — for ever, because the record was removed and every later pass
-# republishes the same tag as a no-op. The literal is pinned whole for that reason.
+# ⛔ AND THE GUARD MUST PUBLISH A CORRECTION, NOT JUST `continue` (review round 3, measured): when an
+# earlier dispatch DID start, the PR's last word is "review in flight"; a bare `|| continue` then leaves
+# that claim standing with nothing running — for ever, because the record was removed and every later
+# pass republishes the same tag as a no-op. The literal is pinned whole for that reason.
 grep -qF '|| { publish_review_state "$repo" "$pr" review-dispatch-failed "$head"; continue; }' "$SUT" \
   || bad "the rolled-back dispatch must PUBLISH 'review-dispatch-failed' AND continue ('|| { publish_review_state … review-dispatch-failed \"\$head\"; continue; }') — a bare '|| continue' leaves the PR asserting 'review in flight' with nothing running"
+# ⛔ THE IN-FLIGHT ORDER IS PINNED IN THE BRANCH ARMS ABOVE, VIA THE `_branch` EXTRACTION — not
+# repeated here. Two copies of one assertion is not a second pin: the copy that stays is the scoped
+# one, which names the exact call shapes inside the review branch.
 # ⛔ THE WAIT LOG MUST NAME THE WINDOW THE PREDICATE USED (review round 3, P3): `_ract` is 0 for
 # retry/refused on COOLDOWN_TRANSIENT_S, so a hardcoded REVIEW_COOLDOWN_S told the operator "within its
 # 2700s window" about a 900 s comparison — on the file's primary instrument. The `_rwin` selection is
@@ -956,7 +974,39 @@ printf '%s\n' "$_branch" | grep -qF 'within its ${_rwin}s window' \
 publish_review_state acme/widget 42 review-in-flight "$H"
 publish_review_state acme/widget 42 review-dispatch-failed "$H"
 [ "$(_marker_count 'review-dispatch-failed')" = 1 ] \
-  || bad "the rolled-back dispatch must be able to CORRECT itself on the PR (got $(_marker_count 'review-dispatch-failed')) — the in-flight marker is posted BEFORE the launch by design, so without a corrective state a failed dispatch leaves the PR asserting 'review in flight' with nothing running, for ever"
+  || bad "the rolled-back dispatch must be able to CORRECT itself on the PR (got $(_marker_count 'review-dispatch-failed')) — without a corrective state a failed dispatch leaves the PR asserting 'review in flight' with nothing running, for ever"
+# ⛔ AND THE CORRECTION MUST NOT OUTLIVE ITS OWN RETRY (review round 4, P3, reproduced): the failure
+# notice is now the NEWEST comment and says "Nothing is reviewing this PR right now" — while the retry's
+# `review-in-flight` tag already exists, so a plain presence check posts NOTHING and the failure stays the
+# PR's last word while a review actually runs. Re-posting in-flight restores the truth; and ONE re-post is
+# enough, so the second call must add nothing (ordering, not presence — a "does a failure tag exist" test
+# would re-post on every pass for the rest of the PR's life).
+_b4=$(_marker_count 'review-in-flight')
+publish_review_state acme/widget 42 review-in-flight "$H"
+[ "$(_marker_count 'review-in-flight')" = "$(( _b4 + 1 ))" ] \
+  || bad "a re-dispatch after a rolled-back one must RE-POST 'review-in-flight' (got $(_marker_count 'review-in-flight'), want $(( _b4 + 1 ))) — otherwise the failure notice stays the PR's last word while a review runs"
+publish_review_state acme/widget 42 review-in-flight "$H"
+[ "$(_marker_count 'review-in-flight')" = "$(( _b4 + 1 ))" ] \
+  || bad "the re-post must not become a per-pass duplicate (got $(_marker_count 'review-in-flight'), want $(( _b4 + 1 ))) — ONE re-post is enough, and a second adds nothing"
+# ⛔ AND A RETRY THAT ALSO ROLLS BACK MUST RE-POST THE FAILURE (review round 5, measured on the real
+# functions): after a STARTED dispatch has re-posted in-flight, its last word is "a reviewer was
+# dispatched" — if the next retry rolls back and its notice is suppressed by its OWN older tag, that claim
+# stays last for ever while nothing runs, which is precisely the disguise this actuator exists to remove.
+# Both states therefore compare POSITIONS, and because in-flight is only published for a launch proven
+# STARTED, exactly one of the pair is published per real transition — the alternation that two-way
+# positional repair caused on a broken path (2 comments per pass, measured) cannot occur.
+_b6=$(_marker_count 'review-dispatch-failed')
+publish_review_state acme/widget 42 review-dispatch-failed "$H"
+[ "$(_marker_count 'review-dispatch-failed')" = "$(( _b6 + 1 ))" ] \
+  || bad "a rolled-back retry after a STARTED dispatch must RE-POST 'review-dispatch-failed' (got $(_marker_count 'review-dispatch-failed'), want $(( _b6 + 1 ))) — otherwise the re-posted 'review in flight' stays the PR's last word while nothing runs"
+publish_review_state acme/widget 42 review-dispatch-failed "$H"
+[ "$(_marker_count 'review-dispatch-failed')" = "$(( _b6 + 1 ))" ] \
+  || bad "a repeated rolled-back dispatch must NOT post a second notice (got $(_marker_count 'review-dispatch-failed'), want $(( _b6 + 1 ))) — a broken reviewer path would then post a comment on every pass, for ever"
+# …and the cycle still turns: a dispatch that finally STARTS must be able to correct the notice again.
+_b7=$(_marker_count 'review-in-flight')
+publish_review_state acme/widget 42 review-in-flight "$H"
+[ "$(_marker_count 'review-in-flight')" = "$(( _b7 + 1 ))" ] \
+  || bad "a started dispatch must re-post in-flight after any newer failure notice (got $(_marker_count 'review-in-flight'), want $(( _b7 + 1 ))) — otherwise the retry that finally works leaves 'nothing is reviewing' as the PR's last word"
 # ⛔ NO UNESCAPED BACKTICK MAY APPEAR IN A MARKER'S TEXT (review round 3, measured the hard way): the
 # texts are double-quoted, so a bare backtick is COMMAND SUBSTITUTION — the published comment then has a
 # hole where the word was, and the shell runs the word as a command (observed: "REVIEW-LAUNCH-FAILED:
@@ -1129,8 +1179,11 @@ review_action retry 119;    [ $? -eq 0 ] || bad "COOLDOWN_TRANSIENT_S must be RE
 review_action retry 121;    [ $? -eq 1 ] || bad "COOLDOWN_TRANSIENT_S must be READ, not hardcoded — at COOLDOWN_TRANSIENT_S=120 a retry 121 s old must RETRY"
 REVIEW_COOLDOWN_S=$_cooldown_saved; COOLDOWN_TRANSIENT_S=$_transient_saved
 # the second cycle publishes nothing (same state+head), and the age comes from the RECORD
+# ⛔ RELATIVE, NOT ABSOLUTE (review round 4): an absolute count makes this arm fail on any earlier arm
+# that publishes the same marker, i.e. on an unrelated edit rather than on the behaviour it names.
+_b5=$(_marker_count 'review-in-flight')
 publish_review_state acme/widget 42 review-in-flight "$H"
-[ "$(_marker_count 'review-in-flight')" = 2 ] || bad "the waiting cycle added a marker (got $(_marker_count 'review-in-flight'))"
+[ "$(_marker_count 'review-in-flight')" = "$_b5" ] || bad "the waiting cycle added a marker (got $(_marker_count 'review-in-flight'), want $_b5)"
 _ep=$(review_dispatched_at "$_rout")
 case "${_ep:-}" in ''|*[!0-9]*) bad "the dispatch epoch must be readable from the record (got '${_ep:-}')" ;; esac
 # ⛔ mtime IS NOT THE DISPATCH TIME: a reviewer that keeps writing output keeps refreshing mtime, so an
@@ -1320,6 +1373,33 @@ launch_review acme/widget 42 "$H" "$_r8" "$_r8led" \
 [ "$(review_attempts "$_r8led")" = 1 ] \
   || bad "a FINISHED dispatch must consume exactly one attempt (got '$(review_attempts "$_r8led")') — uncounted, the per-head bound is weaker than it says"
 rm -f "$_rfast"
+
+# ⛔ A DISPATCH MUST NOT EAT THE LOOP'S CANDIDATE LIST (review round 4, P2, reproduced): the loop body
+# runs from `done < "$_cand"`, so a backgrounded child INHERITS the candidate file as fd 0 — and `pi -p`
+# reads piped stdin and appends it to the prompt. One dispatch would then drain every remaining row of
+# that repo: later candidates are silently abandoned for the pass (including attested greens whose rail
+# never launched), and the reviewer is fed the other PRs' rows as extra prompt text. Driven, not grepped:
+# the shipped `launch_review` runs inside a reading loop against a reviewer that CONSUMES stdin.
+_stdinrev=$(mktemp); printf '#!/bin/bash\ncat >/dev/null\nexit 6\n' > "$_stdinrev"; chmod +x "$_stdinrev"
+_candstub="$_rdir/cand.stdin"
+printf 'green\t101\tabsent\ngreen\t102\tat-head\ngreen\t103\tabsent\n' > "$_candstub"
+_seenf="$_rdir/seen.txt"
+_revsave=${REVIEW_SCRIPT:-}
+REVIEW_SCRIPT="$_stdinrev"
+( _seen=""
+  while IFS= read -r _l; do
+    _seen="$_seen|$_l"
+    launch_review acme/widget 101 "$H" "$_rdir/rstdin.out" >/dev/null 2>&1 || true
+  done < "$_candstub"
+  printf '%s' "$_seen" > "$_seenf" )
+REVIEW_SCRIPT=$_revsave
+[ "$(grep -o '|' "$_seenf" 2>/dev/null | wc -l | tr -d ' ')" = 3 ] \
+  || bad "a dispatch whose reviewer READS STDIN must not consume the loop's candidate list — the loop saw '$(cat "$_seenf" 2>/dev/null)', want 3 rows: with an inherited fd 0 one review drains every remaining candidate of the repo (abandoned silently) and feeds their rows into the reviewer's prompt"
+grep -qF '2>&1 < /dev/null &' "$SUT" \
+  || bad "the review launch must DETACH stdin (`< /dev/null`) — the loop body's fd 0 is the candidate list, and a reviewer that reads it silently drops every later candidate of the repo for that pass"
+grep -qF '$extra < /dev/null > "$out" 2>&1 &' "$SUT" \
+  || bad "the rail launch must DETACH stdin too — same inherited fd 0, same abandoned candidates, and it is the same file's shape"
+rm -f "$_stdinrev"
 rm -f "$_rev_issues" "$_rev_clean" "$_rev_load"
 # ⛔ THE EXIT LINE MUST START ITS OWN LINE (P2, measured). `run_review` appends `REVIEW-EXIT rc=N` to the
 # same file the reviewer writes to, and `review_state` matches it `^`-anchored per line. A child whose last
