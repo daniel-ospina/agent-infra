@@ -16584,8 +16584,9 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
 # surface when the BASE's own check surface (read from GitHub, not from a caller flag)
 # fails the same suite under the equivalent name declared by `declared_base_equivalent`,
 # on a workflow that declares no PR trigger.
-# (b)/(c)/(d) are the guards that stop this becoming a blanket exemption, and (e) is the
-# mutant: the fix's own arm must go RED when the exclusion is deleted.
+# (b)/(c)/(d) are the guards that stop this becoming a blanket exemption, (f) is the arm
+# that keeps a NON-CODE tree red out of it, and (e) is the mutant: the fix's own arm must
+# go RED when the exclusion is deleted.
 echo "== 80. #3322: a check MAIN ITSELF FAILS is excluded from the required surface =="
 
 # (a) THE FIX — the observed block. main fails `script-validate` (push-only ci-main.yml,
@@ -16791,6 +16792,52 @@ grep -q "NOT pull-request-evaluable" "$SCEN/err" \
   && pass "(e) …reaching §4.5 with the SAME base evidence (the base red is still classified not-PR-evaluable)" \
   || fail "(e) the mutant diverged BEFORE the exclusion — the arm does not isolate the fix: $(sed -n '1,8p' "$SCEN/err" 2>/dev/null)"
 grep -q "pr merge" "$SCEN/calls" && fail "(e) the mutant merged — no defect reproduced" || pass "(e) …and no merge, exactly as before the fix"
+
+# (f) THE THIRD GUARD — NEVER A NON-CODE RED, EVEN WHEN THE NAME MATCHES. The exclusion is
+# applied per-red inside the probe, and `[ "$noncode" -eq 0 ]` (admin-merge.sh:~6338) is the
+# only thing keeping a `schedule`/`issues` red out of it. Nothing else in §80 exercises that
+# conjunct: (a)-(e) all fail a `pull_request`-evented check, so DELETING the conjunct left
+# every other assertion green — the vacuous-guard class #3442 exists to end (a test that
+# cannot fail is not a test). This arm makes the conjunct load-bearing: the tree's red is
+# `bash-suites (3)` (so `declared_base_equivalent` WOULD match it) but its run map says
+# `schedule`, and the base is red on `script-validate` under a push-only workflow. Without
+# the conjunct the red is excluded as base-owned and the merge proceeds; with it the red is
+# the ANOMALY the header calls it and the rail must still refuse.
+new_scen baseowned-noncode
+HEAD_BO6="b0b6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO6" > "$SCEN/head"
+lane_pass "$HEAD_BO6" 7151 > "$SCEN/runs-$HEAD_BO6"
+lane_pass mainbo6 7152 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5151 'ci / lint' completed success 7251)" \
+  "$(check_run 5152 'bash-suites (3)' completed failure 7252)"
+pr_run_map 7251 pull_request 'CI'
+# ⛔ THE TREE RED'S EVENT IS `schedule` — the same impossible-but-observed shape §52(a)
+# models: a run a PR cannot attach re-routed to a check on the head sha.
+pr_run_map 7252 schedule 'CI'
+write_main_checks \
+  "$(check_run 6151 'script-validate' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6152 'extension-tests / lint' completed success 8251)"
+main_run_map 8251 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8251"
+wf_declares .github/workflows/ci-main.yml push
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(f) a NON-CODE tree red whose name matches a base-owned red still BLOCKS (exit $rc)" \
+  || fail "(f) a schedule-evented tree red was EXCLUDED as base-owned and merged — the non-code conjunct is gone"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(f) …as the §4.5 tree-red refusal" || fail "(f) the refusal is not the tree-red one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+# ⛔ THE DISCRIMINATOR. The exit code alone would also pass if the exclusion had fired and
+# something ELSE refused, so the arm must also see that NOTHING was excluded — that is the
+# conjunct's own effect, and the only assertion a deleted conjunct turns red here.
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(f) a NON-CODE red was excluded as base-owned — the tree anomaly was treated as an inherited defect" \
+  || pass "(f) …and nothing was excluded as base-owned"
+grep -q "NOT EXEMPT ON THIS SURFACE" "$SCEN/err" \
+  && pass "(f) …saying the non-code exemption does not apply on the evaluated tree" \
+  || fail "(f) the refusal does not state that the non-code exemption is base-only"
+grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted over an excluded non-code tree red" || pass "(f) …and no merge attempted"
 
 # #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
 # file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is

@@ -179,8 +179,11 @@
 #       `bash-suites (<n>)` == `script-validate`).
 # So the evidence is MAIN'S OWN MEASURED SURFACE, and the exclusion fires only where
 # main is red on that suite at read time. Every fail-closed path holds:
-#   * the base surface UNREADABLE / PARTIAL / UNMEASURED -> no set at all -> nothing is
-#     excluded -> §4.5 refuses as before (a base read that failed can never excuse a red);
+#   * the base surface UNREADABLE / UNMEASURED -> no `exempt:` row is ever written, so the
+#     set is EMPTY -> nothing is excluded -> §4.5 refuses as before (a base read that failed
+#     can never excuse a red); a PARTIAL base is the same empty-vs-seeded question but never
+#     reaches the tree at all — step 2c `exit 1`s on it (a half-read base is the #1261
+#     disarm), so the seeded set is not consulted. Either way nothing is excused;
 #   * the base read is CLEAN -> no set -> the PR's red is its own and blocks, which is
 #     the #1261 incident (a lint red main does NOT carry) and every real regression;
 #   * the base red is on a workflow that DOES declare a PR trigger -> it is a BLOCKING
@@ -197,6 +200,27 @@
 # nowhere in ci-main.yml), so `verify` is NOT covered by this rule — it is #3415's
 # "base-owned but unmeasurable from the base" family, not this one. That is a refusal
 # with a reason, never a silent pass.
+# ⛔ THE SECOND RESIDUAL, NAMED: THE EXCLUSION IS LANE-GRANULAR, NOT SHARD-GRANULAR.
+# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base
+# check `script-validate`, so while main is red on it, EVERY shard is excluded — including
+# a shard failure THIS PR introduced, whose cause is on no base. Per-shard attribution is
+# not available from base-side evidence (main publishes the sweep as ONE job-level red),
+# and inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
+# the guard for an ATTRIBUTABLE failure is deliberately NOT this rule and is untouched by
+# it: `named_unattributable_runs` (step 1c) still names it, and #3415's `bash-shard::`
+# reproduction still runs the residual on a pristine base worktree and refuses anything
+# the base does NOT reproduce. A PR-caused failure inside a shared shard is therefore
+# refused for its OWN reason, after this exclusion. The exclusion is a statement about a
+# NAME the base already fails; it is never a licence for a NEW failure inside that name.
+# ⛔ WHAT THE SUITE DOES AND DOES NOT PROVE. §80's fixtures carry no failing run, so the
+# "blocked by the decision -> re-run" leg is not entered and §4.5 is the SOLE blocker in
+# every scenario. §80 therefore pins the intended property — an inherited red no longer
+# refuses at §4.5, and the exclusion is named in BOTH stderr and the durable evidence —
+# and NOT an end-to-end merge in the shape #3322 measured (a tree red on both an inherited
+# shard and its own id-level residual). That second shape is decided by the attribution
+# legs above, which this change does not touch. §80(f) closes the last untested arm of
+# the rule itself: a NON-CODE tree red must stay excluded from the exclusion even when its
+# name matches a base-owned red.
 #
 # ── THE PR'S EVALUATED TREE (#1261) ───────────────────────────────────────
 # The incident, exactly. PR #4589 (commit ebe4e7e8f) landed three ruff
