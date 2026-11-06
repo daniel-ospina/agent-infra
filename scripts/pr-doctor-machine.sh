@@ -26,17 +26,21 @@
 #                                            ⛔ That refusal is the truthful half: wiring the
 #                                            per-repo rubric is #2518's, and inventing one here
 #                                            would grade every PR by a declaration nobody read.
-#   set ABSENT                            -> DEGRADED, and loudly. The pass runs the single-repo form
-#                                            and resolves its repo from the box's OWN evidence
-#                                            (`REPO`'s git `origin`, then `OR` — pr-doctor's ranks
-#                                            4 and 3), which is what this unit did before. This is
-#                                            deliberately NOT a refusal: an absent set is the state a
-#                                            box is in *before* an operator names its repos, and a
-#                                            doctor that stops grading every existing box on upgrade
-#                                            would trade a silent gap for an outage. What makes it
-#                                            honest is that it is LOGGED EVERY PASS with the exact
-#                                            file to create — a degraded mode nobody can see is the
-#                                            "installed but inert" state this repo keeps paying for.
+#   set ABSENT, and the box can still name a repo -> the single-repo form, and loudly. It resolves
+#                                            from the box's OWN evidence (`OR`, then `REPO`'s git
+#                                            `origin` — pr-doctor's ranks 3 and 4) and is LOGGED
+#                                            EVERY PASS with the exact file to create. This is the state
+#                                            a box is in *before* an operator names its repos, and a
+#                                            doctor that stopped grading on upgrade would trade a
+#                                            silent gap for an outage.
+#   set ABSENT and NOTHING names a repo      -> REFUSE (exit 2), naming both fixes. ⛔ THE WRAPPER
+#                                            CHECKED THIS RATHER THAN ASSUMING IT: the doctor's
+#                                            REPO-only arm raises when the checkout's `origin` proves
+#                                            nothing, so on a box whose checkout launchd cannot READ
+#                                            (~/Documents under TCC — the default macOS install)
+#                                            the "degraded" pass would have exited 2 before its first
+#                                            read while this file claimed it was grading. It was
+#                                            measured, not reasoned: review round 2, P1.
 #   set exists and is NOT usable          -> REFUSE (exit 2). Never half-honour a broken file: dropping
 #                                            a line it cannot parse would grade a shorter set and read
 #                                            exactly like a smaller machine.
@@ -130,13 +134,49 @@ case "$_rc" in
     exec "$PY" "$DOCTOR" --all-repos
     ;;
   3)
-    # NO-REPO-SET — the documented degraded mode. The reader's own text says which file to create and
-    # in what shape, so the whole fix is copy-paste from the capture; this line says what the wrapper
-    # DID about it.
+    # NO-REPO-SET — the single-repo mode, and ONLY when this box can still name a repo.
+    #
+    # ⛔ A DEGRADED PASS THAT CANNOT NAME A REPO IS NOT A DEGRADED PASS (review round 2, P1). Removing
+    # `--repo` from the plist removed the one datum the doctor cannot derive on a box whose checkout it
+    # cannot READ: `resolve_repo`'s REPO-only arm (rank 4) RAISES when the checkout's `origin` proves
+    # nothing, so the pass exits 2 before its first read — where the pre-#2281 unit passed `--repo`
+    # (rank 1) and then graded the queue READ-ONLY. That is not exotic: `install-launchd.sh` prefers
+    # `~/Documents/GitHub/tortoise`, which launchd has no Full Disk Access to (the TCC limitation
+    # `pr-doctor.py` and `repo-set.sh` both document). So this branch establishes, BEFORE exec'ing, that
+    # a slug is actually available, using the reader's own proof rather than a guess:
+    #
+    #   * `OR` set and a slug          -> rank 3: the doctor names it (and grades read-only if `REPO`
+    #                                     cannot be proven — exactly the old behaviour).
+    #   * `REPO` proves its slug       -> rank 4: the doctor names it.
+    #   * neither                      -> REFUSE here, by name, instead of printing "grading ..." and
+    #                                     letting the doctor die with a resolver message that does not
+    #                                     mention the file that fixes it.
     repo_set_parse 1>&2
-    _say "DEGRADED — NO-REPO-SET: $(repo_set_file) does not exist, so this box has named no repo."
-    _say "  Grading the ONE repo this box's own config declares (REPO's origin, then OR)."
-    _say "  Create the file above and this same unit grades every repo it names, with no reinstall."
+    _say "DEGRADED — NO-REPO-SET: $(repo_set_file) does not exist, so this box has named no repo set."
+    _degraded=""
+    if [ -n "${OR:-}" ]; then
+      _degraded="$OR"
+      _say "  Grading the ONE repo this box declares in OR=$OR."
+    elif [ -n "${REPO:-}" ]; then
+      # The reader's own proof function — the same one `check` uses, so the two cannot disagree.
+      _proof="$(_rs_origin_slug "$REPO")"; _why="${_proof#*$'	'}"; _proof="${_proof%%$'	'*}"
+      if [ -n "$_proof" ]; then
+        _degraded="$_proof"
+        _say "  Grading the ONE repo REPO proves: $_proof (from $REPO)."
+      else
+        _say "  REPO=$REPO proves no repo ($_why), and OR is not set — so this pass has NO repo to name."
+      fi
+    else
+      _say "  Neither OR nor REPO is set — so this pass has NO repo to name."
+    fi
+    if [ -z "$_degraded" ]; then
+      _say "REFUSING — a pass with no repo would exit 2 on its first line, having graded nothing."
+      _say "  Fix, either way:"
+      _say "    (1) create the repo set above — one line per repo this box serves; or"
+      _say "    (2) set OR=OWNER/NAME (or point REPO at a checkout whose git origin proves it) for this unit."
+      exit 2
+    fi
+    _say "  Create the repo set above and this same unit grades every repo it names, with no reinstall."
     exec "$PY" "$DOCTOR"
     ;;
   *)

@@ -87,7 +87,11 @@
 # already there sends them at the wrong defect, and degrading on it silently un-serves the second
 # repo — the exact failure #2281 exists to close.
 
-set -uo pipefail
+# ⛔ NO TOP-LEVEL `set -u`. THIS FILE IS SOURCED — that is its advertised contract (above) — and a
+# library that turns on `-u` in its caller's shell changes the caller's semantics: measured in review
+# round 2, a consumer that sourced this file died on the ordinary idiom `[ "$UNSET" = "1" ]`. The
+# strict flags belong to the EXECUTED path only, and are set at the bottom, immediately before a verb
+# runs. Nothing in this file needs `-u`: every expansion is `${x:-}`-guarded.
 
 repo_set_file() {
   printf '%s\n' "${REPO_SET_FILE:-$HOME/.config/orchestrator/repos.conf}"
@@ -311,8 +315,15 @@ repo_set_check() {
     fi
 
     if [ -n "$state" ]; then
+      # ⛔ CASE-FOLDED LIKE THE SLUG ABOVE (review round 2, P2). On APFS/HFS+ — the macOS default,
+      # and the platform this file's bash-3.2 note exists for — `/Users/x/Orchestrator` and
+      # `/Users/x/orchestrator` are ONE DIRECTORY, so a byte-exact comparison returned OK on exactly
+      # the silent-sharing failure this arm exists to refuse: two controllers on one `.orch.lock`,
+      # one candidates list, one worker registry. A case-SENSITIVE filesystem with two state dirs
+      # differing only by case now gets a refusal it did not need — loud, renameable, and strictly
+      # cheaper than the collision it prevents.
       local norm_state
-      norm_state="$(printf '%s' "$state" | sed 's:/*$::')"
+      norm_state="$(_rs_lower "$(printf '%s' "$state" | sed 's:/*$::')")"
       case "$seen_states" in
         *$'\n'"$norm_state"$'\n'*)
           problems="$problems; state=$state is shared with another repo in this set — the same silent-sharing failure two controllers would hit" ;;
@@ -380,6 +391,7 @@ _rs_main() {
 
 # Sourced ⇒ functions only; executed ⇒ one verb. `BASH_SOURCE[0]` != `$0` when sourced.
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+  set -uo pipefail
   _rs_main "$@"
   exit $?
 fi
