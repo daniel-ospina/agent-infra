@@ -3210,6 +3210,11 @@ ISSUES 2')"
   # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
   # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
   RPT="$TMP/rpt"; mkdir -p "$RPT/state" "$RPT/repo" "$TMP/ghstub"
+  # ⛔ A `mkdir` DIRECTORY IS NOT A CHECKOUT ANY MORE (agent-infra#3054). report.sh resolves `REPO`
+  # through repo-slug.sh's `resolve_repo`, which REFUSES BY NAME (exit 78, nothing on stdout) unless
+  # the value is a real git checkout — so every arm below that drives report.sh with `REPO="$RPT/repo"`
+  # produced NO output and its `grep` read as `[]`, reddening six assertions for a fixture reason.
+  git init -q "$RPT/repo"
   # ⛔ TWO markers for the SAME open PR and one for a PR that is not open (review round 2, P2): a
   # file count would print 3, an open-PR-only count prints 2, and the correct per-PR count prints 1.
   # The controller used to be able to leave two markers for one PR; report.sh must not report that as
@@ -3286,7 +3291,25 @@ GHOPEN3
   # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
   # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
   # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
-  _rpt_norepo="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep -E 'open PRs|stale evidence' )"
+  # ⛔ THE `norepo` BRANCH IS NOW REACHED BY A MISSING `gh`, NOT BY A MISSING CHECKOUT (#3054). An
+  # absent or non-checkout `REPO` no longer reaches this section at all: `resolve_repo` refuses first,
+  # naming the value and both supported ways to set it, and prints nothing — a STRONGER form of the
+  # same guarantee (an unresolvable REPO can never be read as a clean queue). So the reachable half is
+  # driven: a PATH carrying the whole toolchain and NO `gh`.
+  NOGH="$TMP/nogh"; mkdir -p "$NOGH"
+  for _b in bash sh git python3 ls cat wc tr date uname uptime awk sed grep stat head tail cut sort \
+            dirname basename env pgrep launchctl systemctl sleep readlink find mkdir rm; do
+    _p="$(command -v "$_b" 2>/dev/null)" || continue
+    case "$_p" in /*) ln -sf "$_p" "$NOGH/$_b" ;; esac
+  done
+  # A non-vacuity guard: if `gh` still resolved on that PATH, the two arms below would pass for the
+  # wrong reason (they would be driving the READABLE path and matching its text by accident).
+  if PATH="$NOGH" bash -c 'command -v gh >/dev/null 2>&1'; then
+    echo "  ❌ the no-gh PATH still resolves gh — the norepo arms below would be vacuous"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ the no-gh PATH resolves the toolchain but NOT gh (so the norepo arms drive the real branch)"; PASS=$((PASS+1))
+  fi
+  _rpt_norepo="$( O="$RPT" REPO="$RPT/repo" PATH="$NOGH" bash "$REPORT" 2 2>/dev/null | grep -E 'open PRs|stale evidence' )"
   case "$_rpt_norepo" in
     *"open PRs: 0"*|*"stale evidence (needs re-review): 0"*) echo "  ❌ with no repo checkout report.sh printed a confident 0: [$_rpt_norepo]"; FAIL=$((FAIL+1)) ;;
     *"needs a repo checkout and gh"*) echo "  ✅ with no repo checkout both lines name the missing dependency instead of printing 0"; PASS=$((PASS+1)) ;;
@@ -3301,7 +3324,7 @@ GHOPEN3
   # of which can be attributed on these paths (that is the whole reason the count is raw).
   printf '%s\n' livehead > "$RPT/state/parked-6001"
   printf '%s\n' oldhead > "$RPT/state/parked-6999"
-  _rpt_norepo_parked="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
+  _rpt_norepo_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$NOGH" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
   case "$_rpt_norepo_parked" in
     *" 2  (raw marker count"*) echo "  ✅ with no repo checkout the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ with no repo checkout the parked line printed [$_rpt_norepo_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;

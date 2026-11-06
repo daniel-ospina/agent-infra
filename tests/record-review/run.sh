@@ -2659,7 +2659,14 @@ echo; echo "── (32) post_marker: a marker already present is NOT re-patched 
 awk '/^post_marker\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$SRC" > "$TMP/pm-live.sh"
 if [ -s "$TMP/pm-live.sh" ] && grep -q 'post_marker()' "$TMP/pm-live.sh"; then
   # The MUTANT is the pre-#3347 line, written the way the script spelled it.
-  sed 's#if command grep -qF -- "[$]marker" <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep -qF -- "$marker"; then return 0; fi#' \
+  # ⛔ THE FLAG GROUP IS CARRIED THROUGH UNCHANGED (`\(-q[A-Za-z]*\)` -> `\1`), so the mutant differs
+  # from the shipped line in EXACTLY ONE dimension — pipe-into-`grep -q` instead of a here-string —
+  # which is the variable this section exists to test. Pinning the historical `-qF` spelling made the
+  # arm VACUOUS the moment the shipped line grew `-qxF` (whole-line match, #3327): the substitution
+  # matched nothing, `pm-old.sh` was a copy of the live form, (32a) reded "could not rebuild" and
+  # (32c) drove an unchanged function. Measured on 0b1d1ec65: shipped `if command grep -qxF -- "$marker"
+  # <<<"$body"; then return 0; fi`, and the `-qF`-only pattern matched no line in the function.
+  sed 's#if command grep \(-q[A-Za-z]*\) -- "[$]marker" <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep \1 -- "$marker"; then return 0; fi#' \
     "$TMP/pm-live.sh" > "$TMP/pm-old.sh"
   grep -q 'printf "%s' "$TMP/pm-old.sh" \
     && pass "(32a) the pre-fix pipe form was rebuilt for the mutation arm (the mutant is real, not a no-op)" \
