@@ -4299,13 +4299,19 @@ if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted";
   # opens with `MAX_LOAD="${MAX_LOAD:-…}"`, so an ambient EXPORTED MAX_LOAD — a harness/agent shell
   # sets one — short-circuits every arm below and all five red for a fact about the operator's shell,
   # not the guard. `unset` inside each drive script makes it self-contained whichever way it is called.
+  # ⛔ AND `unset` ALONE IS NOT A MUTATION LEG (review of this change, P2): the drives below are invoked
+  # with NO ambient value, so removing any `unset` produced byte-identical output and a future edit
+  # could drop one with every arm still green. So one arm CONTAMINATES itself — `MAX_LOAD=999` on the
+  # command line of the GOOD-`_NCPU` drive, the idiom `ncpu-drive6.sh` already uses one arm below. It
+  # must still read 120: with the `unset` the ambient value never reaches the guard, without it the
+  # value IS 999 and that row reds. Measured both directions.
   { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
   _nout="$(bash "$TMP/ncpu-drive.sh" 2>&1)"; _nrc=$?
   [ "$_nrc" -eq 0 ] && [ "$_nout" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU guard -> rc=$_nrc out='$_nout'"; }
   ck "install.sh falls back to 4 cores when sysctl succeeds but prints garbage (no arithmetic abort)" $rc
   # Non-vacuity: the stub really is the value being consulted, and a good one is still honoured.
   { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
-  _nout2="$(bash "$TMP/ncpu-drive2.sh" 2>&1)"
+  _nout2="$(MAX_LOAD=999 bash "$TMP/ncpu-drive2.sh" 2>&1)"
   [ "$_nout2" = "120" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 120"; }
   ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 120)" $rc
   # ⛔ THE PRODUCTION PATH'S OWN WRAP (P3, fifth review round, 2026-10-14). install.sh substitutes
