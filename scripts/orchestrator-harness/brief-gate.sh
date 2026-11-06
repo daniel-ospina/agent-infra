@@ -295,7 +295,7 @@ function _fence(s,   fc, fl, q, rest) {
 }
 function _strip(s) { sub(/^[ \t]+/, "", s); sub(/^[-*+][ \t]+/, "", s); sub(/^[0-9]+[.)][ \t]+/, "", s);
   sub(/^(\*\*|__)/, "", s); sub(/^[ \t]+/, "", s); return s }
-BEGIN { ins = 0; depth = 0; val = ""; fence = 0; fencec = ""; fencelen = 0 }
+BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen = 0 }
 {
   line = _qskip($0)
   if (line == "\001") next
@@ -314,10 +314,16 @@ BEGIN { ins = 0; depth = 0; val = ""; fence = 0; fencec = ""; fencelen = 0 }
     # decorated label must not turn an honest `issue-<N> -> none` into an unkeyed value.
     gsub(/^[*_`]+/, "", t); gsub(/[*_`]+$/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
-    val = t
+    _v[++_n] = t
   }
 }
-END { if (length(val) > 0) print val }
+# ⛔ EVERY `WIP:` VALUE, one per line, prefixed `V<TAB>` — the earlier "last one wins" shape made the
+# cross-check trivially bypassable: append a second `WIP:` line (unfenced, and the canonical block IS
+# such a line) and the checker abstained on it while the shape check was satisfied by the first.
+END {}
+{
+  for (_i = 1; _i <= _n; _i++) printf "V\t%s\n", _v[_i]
+}
 '
 
 # brief_gate_wip_value <file|-> — the `WIP:` value of the PREVIOUS WORK section, or nothing.
@@ -381,7 +387,10 @@ brief_gate_bounded() { # brief_gate_bounded <secs> <cmd...>
     BRIEF_GATE_BOUNDED_TRIED=1
     local c here
     here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
-    for c in "${O:-}/lib/bounded.sh" "$here/lib/bounded.sh" \
+    # ⛔ NO `${O:-}` ROOT (review cycle 2, nit): `O` is the orchestrator STATE root (`$O/state/...`),
+    # not a scripts root — a candidate that can only ever hit the wrong tree, tried first, so a state
+    # dir that happened to contain `lib/bounded.sh` would shadow the repo's own copy.
+    for c in "$here/lib/bounded.sh" \
              "${AGENT_INFRA_PATH:-}/scripts/lib/bounded.sh" \
              "${HOME:-}/.pi/agent/scripts/lib/bounded.sh"; do
       [ -n "$c" ] && [ -f "$c" ] || continue
@@ -441,29 +450,59 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
 # `issue-<N> -> <claim>`, and the claim is what decides: it begins `refs/wip/` ⇒ a ref is named;
 # anything else (`none`, `unclaimed`, `nothing`, `-`, a half-finished sentence) ⇒ a claim of absence,
 # which is then CHECKED. No word list to defeat, and no measurement note that can switch it off.
-brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo]
-  local f="${1:--}" repo="${2:-}" val claim issue refs rc hits
-  val="$(brief_gate_wip_value "$f")"
-  [ -n "$val" ] || return 0
-  case "$val" in
-    issue-[0-9]*) issue="${val#issue-}"; issue="${issue%%[!0-9]*}" ;;
-    *) return 0 ;;                                   # a pr-<N> key: no issue to look up
-  esac
-  [ -n "$issue" ] || return 0
-  claim="$(printf '%s' "$val" | sed -e 's/^issue-[0-9][0-9]*//' -e 's/^[[:space:]]*\(->\|→\|:\)[[:space:]]*//')"
-  case "$claim" in refs/wip/*) return 0 ;; esac     # a NAMED ref: not a claim of absence
+brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
+  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val tag key claim rest issue
+  local unkeyed=0 issues="" evidence="" seen=""
+  values="$(awk "$BRIEF_GATE_WIP_AWK" "$f" 2>/dev/null)"
+  [ -n "$values" ] || return 0            # no WIP line at all: the SHAPE token already refuses
+  # ── EVERY VALUE IS CHECKED, NOT THE LAST ONE (fresh-context review of #3484, P1) ──────────────
+  # The shapes that defeated the "last one wins" reader, all measured: a pasted canonical block (a live,
+  # unfenced `WIP: issue-<N> -> refs/wip/<ref>` line — i.e. THE TEXT THIS GATE HANDS THE AUTHOR), a
+  # trailing `WIP: none`, a bare `WIP:` label, and a second keyed line for a different issue. Each one
+  # made the checker abstain on the wrong line while the shape check stayed satisfied.
+  while IFS=$'\t' read -r tag val; do
+    [ "${tag:-}" = "V" ] || continue
+    if [ -z "${val:-}" ]; then unkeyed=1; continue; fi
+    case "$val" in
+      # ⛔ THE SLOT IS A KEY TOO (`issue-<N>`, `pr-<N>`). The canonical block ships the slot, and the
+      # gate cannot refuse its own advice — the same reason the research contract admits `<…>`. A slot
+      # has no number to look up, so it is keyed-but-unchecked; that is the stated coverage limit.
+      issue-"<"*|pr-"<"*) : ;;   # `<` is a REDIRECTION metacharacter in a bare case pattern
+      issue-[0-9]*)
+        issue="${val#issue-}"; issue="${issue%%[!0-9]*}"
+        # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
+        # claim of absence (an earlier draft read the whole value and switched itself off)
+        rest="${val#issue-}"; rest="${rest#"$issue"}"
+        claim="$(printf '%s' "$rest" | sed -e 's/^[[:space:]]*\(->\|→\|:\)[[:space:]]*//')"
+        case "$claim" in refs/wip/*) : ;; *) issues="$issues $issue" ;; esac ;;
+      pr-[0-9]*)
+        # A PR key is the FIXER's and the REVIEWER's key (they hold `refs/claims/<pr>-<sha>`); for a
+        # lane/worker dispatch the key is the issue, so `pr-<N> -> none` there is an unkeyed claim, not
+        # an exemption (fresh-context review of #3484, P1: it was accepted for every role).
+        case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      keyless*)
+        rest="${val#keyless}"
+        case "$rest" in ' '?*) : ;; *) unkeyed=1 ;; esac ;;
+      *) unkeyed=1 ;;
+    esac
+  done <<< "$values"
+  [ "$unkeyed" -eq 0 ] || printf 'PREVIOUS-WORK-WIP\n'
+  [ -n "${issues// /}" ] || return 0
   repo="$(brief_gate_repo "$repo")"
   if [ -z "$repo" ] || [ ! -d "$repo" ]; then
-    printf '[brief-gate] PREVIOUS WORK: refs/wip was NOT measured (no repository resolvable from here) — admitting the brief; the claim that #%s has no rescued WIP is UNVERIFIED.\n' "$issue" >&2
+    printf '[brief-gate] PREVIOUS WORK: refs/wip was NOT measured (no repository resolvable from here) — admitting the brief; the claim that #%s has no rescued WIP is UNVERIFIED.\n' "$(printf '%s' "$issues" | tr ' ' ',')" >&2
     return 0
   fi
-  refs="$(brief_gate_wip_refs "$issue" "$repo" 2>/dev/null)"; rc=$?
-  if [ "$rc" -ne 0 ]; then
-    printf '[brief-gate] PREVIOUS WORK: refs/wip could not be read for #%s — the claim that none exists is UNVERIFIED (admitted; see --wip-refs).\n' "$issue" >&2
-    return 0
-  fi
-  hits="$(printf '%s\n' "$refs" | awk 'NF >= 1')"
-  [ -z "$hits" ] || printf 'PREVIOUS-WORK-WIP-CONTRADICTED\t%s\n' "$(printf '%s' "$hits" | tr '\n' ',' | sed 's/,$//')"
+  for issue in $(printf '%s\n' $issues | sort -u); do
+    refs="$(brief_gate_wip_refs "$issue" "$repo" 2>/dev/null)"; local rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf '[brief-gate] PREVIOUS WORK: refs/wip could not be read for #%s — the claim that none exists is UNVERIFIED (admitted; see --wip-refs).\n' "$issue" >&2
+      continue
+    fi
+    rest="$(printf '%s\n' "$refs" | awk 'NF >= 1 { printf "%s%s", (n++ ? "," : ""), $1 }')"
+    [ -n "$rest" ] && evidence="${evidence}${evidence:+, }${rest}"
+  done
+  [ -n "$evidence" ] && printf 'PREVIOUS-WORK-WIP-CONTRADICTED\t%s\n' "$evidence"
   return 0
 }
 
@@ -601,7 +640,11 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
     # one — the choice is between an honest `keyless — <why>` and an invented issue number. An author
     # who means to evade can invent a number more easily than they can justify `keyless`, so nothing is
     # gained by withholding the honest form.
-    if (_lab == "wip" && (_rest ~ /^(issue|pr)-/ || _rest ~ /^keyless[ \t]+[^ \t]/)) pwwip = 1
+    # ⛔ PRESENCE ONLY, HERE. Whether the key is valid is decided in ONE place — `brief_gate_previous_work`,
+    # which reads EVERY `WIP:` value (fresh-context review of #3484, P1: two readers that disagreed about
+    # WHICH line is the claim let a trailing `WIP: none` / a pasted canonical block / a bare label satisfy
+    # the shape while the cross-check abstained on the last line it saw).
+    if (_lab == "wip" && length(_rest) > 0) pwwip = 1
     if (_lab == "branch" && length(_rest) > 0) pwbr = 1
     if (_lab == "worktree" && length(_rest) > 0) pwwt = 1
     if (_lab == "prior" && length(_rest) > 0) pwpri = 1
@@ -870,12 +913,16 @@ brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [rep
   rnd="$(brief_gate_round_norm "${3:-0}")"
   if [ "$f" = "-" ]; then
     tmpf="$(mktemp "${TMPDIR:-/tmp}/brief-gate.XXXXXX" 2>/dev/null)" || {
-      printf 'NO-FILE\n'; return 0; }
+      # ⛔ NOT `NO-FILE` (review cycle 2, nit): the brief is right there — the TEMP FILE could not be
+      # made (a full disk, an unusable TMPDIR). `NO-FILE` sends the author to look for a brief that
+      # exists; this token says what actually failed, and it refuses rather than answering "complete".
+      printf '[brief-gate] CANNOT VERIFY: no temp file for the stdin brief (mktemp failed) — the brief was NOT read.\n' >&2
+      printf 'GATE-UNAVAILABLE\n'; return 0; }
     cat > "$tmpf"
     f="$tmpf"
   fi
   brief_gate_missing "$f" "$role" "$rnd"
-  brief_gate_previous_work "$f" "$repo"
+  brief_gate_previous_work "$f" "$repo" "$role"
   [ -n "$tmpf" ] && rm -f "$tmpf"
   return 0
 }
@@ -906,7 +953,7 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
     f="$tmpf"
   fi
   miss="$(brief_gate_missing "$f" "$role" "$rnd")"
-  pw="$(brief_gate_previous_work "$f" "$repo")"
+  pw="$(brief_gate_previous_work "$f" "$repo" "$role")"
   [ -n "$pw" ] && miss="${miss:+$miss$'\n'}${pw}"
   if [ -z "$miss" ]; then
     [ -n "$tmpf" ] && rm -f "$tmpf"
@@ -1038,7 +1085,7 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
 ## PREVIOUS WORK — did someone already start this? (agent-infra#3484)
 
 A released claim reads as "nothing happened here" unless someone looks, and 222 rescued \`refs/wip/*\`
-snapshots existed on this repo that nothing told the next actor about. Measure the four facts below
+snapshots existed on this repo that nothing told the next actor about. Measure the five facts below
 and paste the MEASUREMENT — this is the handover the reaper cannot write for you, because only you
 know what the previous attempt concluded.
 
