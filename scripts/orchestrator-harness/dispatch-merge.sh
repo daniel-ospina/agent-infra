@@ -387,9 +387,11 @@ for N in "$@"; do
       # per-issue cleanup site in this loop, and the release above makes the issue FREE — while a row
       # left in `$O/dispatched.txt` is exactly what makes this box skip a FREE issue until the reaper
       # prunes it (`orch-loop.sh` reads the file and `continue`s on a hit). Same pairing as the two
-      # refusal arms above (`:299`, `:319`): every arm that RELEASES the claim drops the row with it,
+      # refusal arms above — the `wt_provision` refusal and the post-build repo/branch assertion — and
+      # named rather than line-numbered on purpose: this file's own rule is SYMBOLS, NOT LINE NUMBERS
+      # (see the note on the CI-queue release). Every arm that RELEASES the claim drops the row with it,
       # so the two can never disagree about whether the issue is free. The reap outcome below is
-      # deliberately irrelevant to this: a kept worktree is residue, the issue is still free.
+      # deliberately irrelevant to THIS question: a kept worktree is residue, the issue is still free.
       drop_dispatched_rows "$N"
       # ── and take its EMPTY worktree back (#2033) ─────────────────────────────────────────────
       # The lane is confirmed gone and no chain will ever look at this checkout, so an empty one is

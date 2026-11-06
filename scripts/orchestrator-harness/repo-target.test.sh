@@ -351,8 +351,15 @@ d4=$?
 # cannot cross-match today; the anchor is what keeps that true if the fixture ever grows.
 DMO5="$T/o-dm5"; mkdir -p "$DMO5/logs" "$DMO5/state"; printf '6001\n' > "$DMO5/dispatched.txt"
 # a STUB claims.sh, or `release_issue_claim_unspawned` returns at its `[ -f "$csh" ] || return 0`
-# guard and the claim-release conjunct below would be vacuously true (it would pass on a script that
-# never released anything). The stub only has to exist and answer the release call.
+# guard and never reaches its `released refs/claims/issue-…` echo — so the positive conjunct below
+# could never pass and the FIXTURE (not the code) would be what reds. Measured: 0 matches without the
+# stub, 1 with it. (Corrected: the first draft of this note said the conjunct would be "vacuously
+# true", which is backwards — a positive grep cannot pass on an absent line.)
+# `claim_issue_record_commit` is stubbed because the same file is sourced for it, and it masks nothing
+# TODAY: D5 `continue`s at the provision arm before the `chain_gen` read is reached. It returns 0 where
+# the real function returns 1 on "no record", so any future case driving the CHAIN arm through this
+# `$O` would get an empty generation and silently hit chain-merge.sh's "no captured claim generation →
+# NOT releasing" arm. Not a defect here; a trap for that case.
 printf '%s\n' 'claim_issue_release_record() { return 0; }' 'claim_issue_record_commit() { return 0; }' \
   > "$DMO5/claims.sh"
 # the CI-queue gate must ALLOW this batch, or the deferral (rc 3) exits before the per-issue arm.

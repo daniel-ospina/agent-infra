@@ -303,6 +303,7 @@ wt_rollback() {
 wt_provision() {
     local repo="$1" path="$2" br="$3" base="${4:-${WT_BASE:-origin/main}}"
     local created=0 oid existing_oid ahead rc wt_registered cur_canon want_canon
+    local holder="" holder_rc=0
     WT_RESULT=""
 
     [ -d "$repo" ] || { WT_RESULT="repo does not exist: $repo"; return 1; }
@@ -358,6 +359,29 @@ wt_provision() {
             cur_canon="$(wt_canon_any "$wt_registered" 2>/dev/null)" || cur_canon=""
             want_canon="$(wt_canon_any "$path" 2>/dev/null)" || want_canon=""
             if [ -n "$want_canon" ] && [ "$cur_canon" = "$want_canon" ]; then
+                # ⛔ A CHECKOUT A LIVE PROCESS STILL HOLDS IS NOT "A USABLE WORKTREE" (#3511 review, P1).
+                # This reuse arm had no holder probe, so a dispatch could be handed a checkout that an
+                # ORPHANED GRANDCHILD is still writing in: `wt_close` signals the pane pid only, so a
+                # grandchild legitimately survives the session census going `dead` — which is exactly
+                # the state `wt_reap_if_empty` names and refuses to reap (`wt_lifecycle.sh`'s live-holder
+                # gate, "a live process still holds the checkout … kept"). Before this, the only thing
+                # stopping a re-dispatch into that checkout was this box's `dispatched.txt` row — a row
+                # that is dropped the moment the claim is released, and is otherwise pruned only by
+                # refresh-candidates.sh's bounded re-check, so leaning on it is what let #3511's third
+                # arm trade one skip for two writers on one branch and one checkout (index.lock
+                # contention, attestations bound to a head the other lane moves).
+                # The probe answers in the caller's own name so the refusal is actionable, and rc 2 is
+                # the documented "refuses to touch, nothing changed": every caller turns it into
+                # skip + release-claim, and the issue is retried next cycle — by which time the orphan
+                # is normally gone and `wt_reap_if_empty` can take the tree back.
+                # rc 2 from the probe itself ("the argv witness could not be evaluated") is FAIL-CLOSED,
+                # matching `wt_reap_if_empty`: handing out a checkout on an unevaluable probe is how a
+                # second writer gets in, and the cost of refusing is one cycle.
+                holder="$(wt_live_holders "$cur_canon" 2>/dev/null)"; holder_rc=$?
+                if [ "$holder_rc" != 1 ]; then
+                    WT_RESULT="a live process still holds $wt_registered (${holder:-the live-holder probe could not be evaluated — fail-closed}) — refusing to hand this checkout to a NEW lane while something is running in it; nothing was changed — retry next cycle (bash scripts/pi-reap-worktrees.sh reports it)"
+                    return 2
+                fi
                 WT_RESULT="reused existing worktree $wt_registered"
                 return 0
             fi

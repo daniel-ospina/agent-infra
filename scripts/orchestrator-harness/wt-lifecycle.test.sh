@@ -333,6 +333,34 @@ OUT="$(in_wt "wt_provision '$REPO' .worktrees/fix-9 feat/9-tm origin/main; echo 
 assert_contains "$OUT" "rc=0" "W8 asking for the path the branch IS at still succeeds"
 assert_contains "$OUT" "WT_RESULT=reused" "W8 …and reports a reuse"
 
+# ── W9: a checkout a LIVE PROCESS still holds is not "reusable" ───────
+# #3511 review, P1. The reuse arm had NO holder probe, so a dispatch could be handed a checkout an
+# ORPHANED GRANDCHILD is still writing in: `wt_close` signals the pane pid only, so a grandchild
+# legitimately survives the session census going `dead` — which is exactly the state
+# `wt_reap_if_empty` names and refuses to reap ("a live process still holds the checkout … kept").
+# The only thing suppressing a re-dispatch into that checkout was this box's `dispatched.txt` row, and
+# #3511's third per-issue arm drops that row the moment the claim is released — so the guard has to
+# live HERE, in the one place every caller passes through: rc=2 = "refuses to touch, nothing changed",
+# which every caller already turns into skip + release-claim + retry next cycle.
+# The holder is a process whose ARGV names the checkout (the argv witness, so the arm does not depend
+# on `lsof` being installed); the same checkout reuses once it exits, which is what proves the refusal
+# is about the HOLDER and not about the path.
+ENV=W9; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-13 feat/13-tm origin/main" "$REPO" >/dev/null
+bash -c "cd '$REPO/.worktrees/tm-13' && sleep 30" &
+HOLDER_PID=$!
+sleep 1
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-13 feat/13-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+kill "$HOLDER_PID" 2>/dev/null
+wait "$HOLDER_PID" 2>/dev/null
+assert_contains "$OUT" "rc=2" "W9 a worktree a live process holds is REFUSED (rc=2, nothing changed)"
+assert_contains "$OUT" "still holds" "W9 the refusal names the holder"
+case "$OUT" in *"WT_RESULT=reused"*) bad "W9 a HELD checkout was reported as reusable — a second lane would commit into it" ;;
+                 *) ok "W9 …and it is never spelled 'reused'" ;; esac
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-13 feat/13-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=0" "W9 with the holder gone the SAME checkout reuses (the refusal is the holder, not the path)"
+assert_contains "$OUT" "WT_RESULT=reused" "W9 …and reports a reuse"
+
 # ── L-series: the lane's own exit path (wt_reap_if_empty) ──────────────
 echo "the lane exit path (a lane that produced nothing takes its checkout back)"
 
