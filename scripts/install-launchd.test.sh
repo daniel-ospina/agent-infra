@@ -1395,6 +1395,81 @@ else
     bad "§7c …and it really is installed"
 fi
 
+# (c27) the executable-file requirement must hold INSIDE a TCC root too. It was enforced only in the
+# non-TCC arm, so a readable file with no x bit named by `Program` installed with a WARN whenever its
+# path happened to land in the tree — the same category-A false PASS, on the half of the branch the
+# round-8 fix did not reach. The x bit is a verdict-1 FAILURE in both arms, because the remedy (a
+# chmod, or a re-farm) is an install step (review of #3413, round 9).
+PROBE_TCC_NOEXEC="$PROBE_HOME/Documents/checkout/notes.txt"
+printf 'not a program\n' > "$PROBE_TCC_NOEXEC"; chmod 644 "$PROBE_TCC_NOEXEC"
+set +e
+OUT="$(probe_install_program "$PROBE_HOME" "$PROBE_TCC_NOEXEC" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c a non-executable launcher INSIDE a TCC root fails the install (not a WARN+install)"
+assert_contains "$OUT" "unreadable or not an executable regular file" "§7c …and names the x bit, not the TCC tree"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …and is not excused as a grant-holding binary"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …so it is NOT installed (arming it is the false PASS)"
+else
+    ok "§7c …so it is NOT installed (arming it is the false PASS)"
+fi
+# …and the same rule at the INTERPRETER hop: a `#!` launcher that IS executable still cannot run if
+# the interpreter the kernel hands it to is not. `launcher_grant_root` requires the x bit per hop, so
+# this resolves to no grant → verdict 2 (skip + disarm), never a WARN+install.
+PROBE_TCC_INTERP_NX="$PROBE_HOME/Documents/checkout/.venv/bin/python-noexec"
+printf '\177ELF\002\001\001\000' > "$PROBE_TCC_INTERP_NX"; chmod 644 "$PROBE_TCC_INTERP_NX"
+PROBE_VIA_NX="$PROBE_HOME/Documents/checkout/via-noexec-interp.sh"
+printf '#!%s\n' "$PROBE_TCC_INTERP_NX" > "$PROBE_VIA_NX"; chmod +x "$PROBE_VIA_NX"
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_VIA_NX" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a launcher whose TCC INTERPRETER has no x bit does not fail the install (skip)"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …a non-executable interpreter is NOT treated as a granting binary"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …so the unit is NOT installed (launchd would exit 126)"
+else
+    ok "§7c …so the unit is NOT installed (launchd would exit 126)"
+fi
+
+# (c28) `env -S` must promote env's FIRST POSITIONAL token to LAUNCHER, exactly as the space form
+# promotes argv[1]. Without it the two forms disagreed on a TCC binary launcher (SKIP+disarm vs
+# WARN+install) and on a non-executable program (installed vs refused) — the third rule the split
+# loop was missing (review of #3413, round 9).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "$PROBE_HOME/Documents/checkout/.venv/bin/python $PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -S '<TCC binary> <script>' does not fail the install"
+assert_contains "$OUT" "WARN TCC-root launcher" "§7c …because the split string's program is the LAUNCHER, as in the space form"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so a runnable unit is not skipped and disarmed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
+PROBE_NOEXEC_PROG="$PROBE_HOME/.pi/agent/scripts/probe-noexec.sh"
+mkstub "$PROBE_NOEXEC_PROG"; chmod 644 "$PROBE_NOEXEC_PROG"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "$PROBE_NOEXEC_PROG --loop" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c env -S '<readable non-executable program>' fails the install (as the space form does)"
+assert_contains "$OUT" "unreadable or not an executable regular file" "§7c …because the promoted launcher is file-type checked"
+chmod 755 "$PROBE_NOEXEC_PROG"
+
+# (c29) getopt's JOINED spelling `-S'<cmd>'` is the same option as `-S '<cmd>'`. Unmatched, the string
+# fell into the generic option branch, was dropped, and the unit installed with NO verdict (review of
+# #3413, round 9).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env "-S/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env '-S<cmd>' (joined) does not fail the install"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …and its command line IS classified, as in the two-token spelling"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is SKIPPED, not installed with no verdict"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and nothing is installed for it (the joined-spelling fail-open)"
+else
+    ok "§7c …and nothing is installed for it (the joined-spelling fail-open)"
+fi
+
 # (c4) `env -i bash <script>`: an option AND env's program hop both sit before the script.
 set +e
 OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -i bash "$PROBE_DEAD" 2>&1)"; RC=$?
