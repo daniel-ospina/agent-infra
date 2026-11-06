@@ -2000,7 +2000,9 @@ EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature", "--remerge
 # the boundary is the verb list, not a flag); `completion.commands`,
 # `rebase.abbreviateCommands`, `color.pager` (not executables a read verb runs); `gc.recentObjectsHook`,
 # `uploadpack.packObjectsHook`, `browser.<tool>.cmd`, `man.<tool>.cmd`, `difftool.<tool>.cmd`,
-# `sendemail.*Cmd`, `interactive.diffFilter` (verbs/flows `GIT_OK_VERBS` never admits).
+# `sendemail.*Cmd`, `interactive.diffFilter` (verbs/flows `GIT_OK_VERBS` never admits — EXCEPT the
+# help flow, which `--help` used to open on EVERY admitted verb and which is now refused by shape;
+# `man.*` was listed here as out of reach on that reasoning and the reasoning was wrong).
 # ⛔ AND TWO CLASSES ARE NOT PINNABLE AT ALL — see GIT_UNPINNABLE_KEY_RE below; they are refused rather
 # than pinned. A NEW read-only verb must be re-checked against `git help --config` beside this list.
 GIT_PIN_CONFIG = (
@@ -2193,9 +2195,14 @@ def _repo_config_fault(cmux: str, target: str, timeout_s: int) -> Tuple[str, boo
                 "listing), so it could not be checked for a program-naming key" % got.cap), True
     # ⛔ AND `rc 0` DOES NOT BY ITSELF PROVE A REPOSITORY WAS READ. Without `--local`, `git config
     # --list` SUCCEEDS OUTSIDE a repository (global+system scope only), so "not a checkout" would
-    # report `clean` — the conflation the tri-state exists to end. Evidence is EITHER the format key a
-    # `git init` always writes, OR a config file under `.git/` in the listing's origins — the second
-    # so a real checkout whose key was unset is NOT mislabelled `unmeasured` forever.
+    # report `clean` — the conflation the tri-state exists to end.
+    # ⛔ THE EVIDENCE IS THE ORIGIN SHAPE, AND ONLY THAT (review cycle 5, P2). An earlier revision also
+    # accepted `core.repositoryformatversion` as positive evidence; round 10 (`6b1d31e98`) deleted that
+    # arm and left this sentence claiming it, so a reader could trust or delete the wrong branch with
+    # identical behaviour. Consequence of the origin-only rule, stated so it is not a surprise: a
+    # `--separate-git-dir` checkout keeps its config outside `/.git/`, so it reads `measured=False` and
+    # is labelled `repo_config: "unmeasured"`. That is a LABEL, not an admission — the hostile-key scan
+    # is origin-independent and still refuses such a checkout.
     if not saw_repo:
         return "", False
     return "", True
@@ -2383,6 +2390,24 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
                     return False, ("refusing %r: %s reads a file the caller names back into the "
                                    "response — an argv surface allowlisted for READING is not a "
                                    "file-dump channel" % (token, bad))
+            # ⛔ `--help` IS AN EXECUTION CHANNEL, AND IT TURNS EVERY ADMITTED VERB INTO ONE (review
+            # cycle 5, P1 — measured on three verbs, from cwd `/` as well as inside a repo).
+            # `git status --help` does not print text: it renders the manual through `man.<tool>.cmd` /
+            # `man.viewer`, BOTH OF WHICH NAME A PROGRAM, and both are read from the repo's config (or
+            # the box's global config). Measured with the module's own hardened argv — all 14 pins plus
+            # `--no-pager` — in a repo declaring `man.viewer=evil` + `man.evil.cmd`: rc=0, empty stdout,
+            # and the program ran. `git rev-parse --help` and `git ls-files --help` are the same.
+            # ⛔ IT CANNOT BE PINNED, ONLY REFUSED: measured, `man.viewer=`, `man.viewer=man`,
+            # `help.format=man`, `web.browser=` and leaving the keys unpinned ALL still ran the repo's
+            # `man.evil.cmd`, so no `-c` value closes it. And `_repo_config_fault` reads that repo as
+            # CLEAN, because `man.*` is not an unpinnable key class — so the fail-closed control cannot
+            # see this and the refusal has to live here, by shape.
+            # `-h` stays allowed: measured `rc=129`, usage text only, no program execution.
+            if low == "--help" or low.startswith("--help="):
+                return False, ("refusing %r: --help renders the manual through a CONFIG-NAMED program "
+                               "(`man.<tool>.cmd` / `man.viewer`), so it is an execution channel, not a "
+                               "read — an argv surface allowlisted for READING is not an execution "
+                               "surface" % token)
             # ⛔ AND AN EXEC-ESCAPE IS NEITHER A METACHARACTER NOR A WRITE (see EXEC_ESCAPE_TOKENS).
             for bad in EXEC_ESCAPE_TOKENS:
                 if low == bad or low.startswith(bad + "="):

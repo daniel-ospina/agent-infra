@@ -1557,8 +1557,9 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
                                         "does read: %r" % (precheck,))
 
     # a config that names NO program is fine, and the exec runs — with the pre-check REPORTED, so the
-    # caller can tell a clean pre-check from one that never ran. `core.repositoryformatversion` is the
-    # POSITIVE evidence of a checkout: `git init` always writes it.
+    # caller can tell a clean pre-check from one that never ran. `core.repositoryformatversion` is NOT
+    # evidence any more (the arm was deleted in round 10): these fixtures are `clean` because their
+    # origin is `file:.git/config`, which is the origin-shape rule — the key is decorative here.
     for config in (z(("core.repositoryformatversion", "0"), ("user.email", "a@b")),
                    z(("core.repositoryformatversion", "0"), ("core.pager", "less")),
                    z(("core.repositoryformatversion", "0"), ("remote.origin.promisor", "false")),
@@ -1614,8 +1615,10 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
 
     # ⛔ AND `rc 0` OUTSIDE A REPO IS NOT `clean`. Without `--local`, `git config --list` SUCCEEDS
     # outside a checkout (global+system scope only), so "no checkout" would report `clean` — the
-    # conflation the tri-state exists to end. `git init` always writes `core.repositoryformatversion`,
-    # so its ABSENCE is the signal.
+    # conflation the tri-state exists to end. The signal is the ORIGIN SHAPE — the listing's origin is
+    # the global config, not a `.git/config` — and NOT the absence of `core.repositoryformatversion`
+    # (that arm was deleted in round 10; the arm immediately below proves a version-key-less checkout
+    # reads `clean` from its origin).
     cfg.write_text(z(("user.email", "a@b"), ("core.pager", "less"), origin=GLOBAL_ORIGIN))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
     assert payload.get("refused") is None, payload
@@ -1623,8 +1626,9 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
 
     # ⛔ BUT A CHECKOUT WHOSE `core.repositoryformatversion` WAS UNSET IS STILL A CHECKOUT. Deciding
     # repo presence from that ONE optional key mislabelled a real repo `unmeasured` forever — a false
-    # "the check did not run" for a config that was read and clean. An origin under `/.git/` is the
-    # second, and stronger, piece of evidence.
+    # "the check did not run" for a config that was read and clean. An origin under `/` `.git/` is now
+    # the ONLY piece of evidence — the format-key arm was deleted in round 10, so there is no first
+    # piece for this to be "second" to.
     for origin in (REPO_ORIGIN, WORKTREE_ORIGIN):
         cfg.write_text(z(("user.email", "a@b"), origin=origin))   # a checkout, no version key
         is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
@@ -1904,3 +1908,42 @@ def test_T_lane_dispatch_local_field_and_unreadable_local_probe(tmp_path, monkey
         assert payload["remote"] is False, payload
     finally:
         monkeypatch.undo()
+
+
+def test_T_box_exec_refuses_the_git_help_execution_channel():
+    """[P1, review cycle 5] `git <admitted-verb> --help` executes a CONFIG-NAMED program.
+
+    Measured on three verbs, from cwd `/` as well as inside a repo: `--help` does not print text, it
+    renders the manual through `man.<tool>.cmd` / `man.viewer`, both of which name a program and both of
+    which come from the repo's (or the box's global) config. It cannot be pinned — every `-c man.*` value
+    tried still ran the repo's driver — and `_repo_config_fault` reads such a repo as CLEAN, so this
+    refusal is the only closure. `-h` stays allowed: rc=129, usage text, no execution.
+    """
+    mod = _saved_mod()
+    for argv in (["git", "status", "--help"], ["git", "rev-parse", "--help"],
+                 ["git", "ls-files", "--help"], ["git", "status", "--help=web"]):
+        ok, why = mod._allowlisted(argv)
+        assert not ok, argv
+        assert "--help" in why, (argv, why)
+    # the short form is not an execution channel and stays admitted
+    assert mod._allowlisted(["git", "status", "-h"])[0]
+    assert mod._allowlisted(["git", "status"])[0]
+
+
+def test_T_pin_the_help_boundary_shapes():
+    """[P3, review cycle 5] The refusal must be 'THESE SHAPES', not 'anything containing help'.
+
+    An over-broad rule (`if "help" in low:`) would false-block `-help`, which git treats as an unknown
+    option (measured: rc=129, usage text, no execution). This arm pins both directions so the widening is
+    a red, not a silent regression: refused forms stay refused, and the harmless spellings stay admitted.
+    """
+    mod = _saved_mod()
+    for argv in (["git", "status", "--help"], ["git", "status", "--HELP"],
+                 ["git", "status", "--Help=web"], ["git", "status", "--help="],
+                 ["git", "rev-parse", "--help"], ["git", "ls-files", "--help"]):
+        ok, why = mod._allowlisted(argv)
+        assert not ok and "--help" in why, (argv, ok, why)
+    # these are NOT execution channels (measured: usage text / unknown option / literal echo)
+    for argv in (["git", "status", "-h"], ["git", "status", "-help"],
+                 ["git", "status", "--hel"], ["git", "status", "--help-all"]):
+        assert mod._allowlisted(argv)[0], argv
