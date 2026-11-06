@@ -765,6 +765,41 @@ if apply_mutation "$PC" "$PC_DUP_JOB" \
   run_check 2 "a DUPLICATE \`pipeline-compliance:\` job id is CANNOT-VERIFY, never green" PC_FILE="$PC_DUP_JOB"
 fi
 
+# (c1b2) ⛔ AND THE DUPLICATE MUST BE FOUND FOR EVERY HEADER SPELLING, not just the bare one. The
+#        guard that refuses a duplicate job id located the header with a list of spellings, so
+#        `  pipeline-compliance :` (space before the colon), `  pipeline-compliance: &anchor` and
+#        `  pipeline-compliance: {name: x}` matched the block TERMINATOR but not the start rule —
+#        `starts` saw one header, the duplicate guard was skipped, and the reader answered about the
+#        FIRST (guarded) block while YAML's effective job was the LAST, with `if: true` or no `if:` at
+#        all. Measured: rc=0 over an effective `if` of `True`, one character from the spelling the arm
+#        above already covers. Both ends now derive from the indent SHAPE and the key NAME.
+PC_DUP_JOB_SPACE="$TMP/pc-dup-job-space.yml"
+if apply_mutation "$PC" "$PC_DUP_JOB_SPACE" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  pipeline-compliance :
+    if: true' \
+  "a duplicate job id with a space before the colon must be constructible"; then
+  run_check 2 "a duplicate job id spelled \`pipeline-compliance :\` is CANNOT-VERIFY too" PC_FILE="$PC_DUP_JOB_SPACE"
+fi
+
+# (c1d) ⛔ AND A DUPLICATE TOP-LEVEL `on:` IS THE SAME ROOT, one level up: YAML keeps the LAST, so a
+#       second `on:` carrying `push:` left the trigger pin inspecting the FIRST and reporting green
+#       (measured rc=0 with the effective key set `['push', 'pull_request']`). A `push:` arm attaches
+#       its verdict to main, not to a PR head, so this is the surface the whole 7f pin exists for.
+PC_DUP_ON="$TMP/pc-dup-on.yml"
+if apply_mutation "$PC" "$PC_DUP_ON" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+on:
+  push:
+    branches: [main]' \
+  "a duplicate top-level \`on:\` must be constructible"; then
+  run_check 2 "a DUPLICATE top-level \`on:\` is CANNOT-VERIFY, never green" PC_FILE="$PC_DUP_ON"
+fi
+
 # (c1c) …and a WHOLE-SCALAR QUOTED `if:` is the SAME value: quoting the whole expression is how a
 #       `!`-leading one is made legal YAML, so refusing it was a false block on a guarded tree
 #       (measured rc=1 against PyYAML's identical string).

@@ -74,7 +74,21 @@ const unquote = (s) => {
 // (YAML 1.1 parses a bare `on` as the boolean true, and some formatters quote it).
 function onRegion(text, file) {
   const lines = text.split("\n");
-  const start = lines.findIndex((raw) => /^(?:"on"|'on'|on):[ \t]*(?:#.*)?$/.test(raw));
+  const onRe = /^(?:"on"|'on'|on):/;
+  const onStarts = lines.map((raw, i) => (onRe.test(raw) ? i : -1)).filter((i) => i >= 0);
+  // ⛔ A DUPLICATE TOP-LEVEL `on:` IS LAST-WINS IN YAML, and a first-match reader reads the WRONG
+  // block: appending a second `on:` carrying `push:` leaves this pin inspecting the first one and
+  // reporting green (measured: rc=0 while the effective key set was ['push', 'pull_request']). Same
+  // duplicate-key/last-wins root as the duplicate JOB id below, and the same answer — refuse, because
+  // which block is in force is not something this reader can answer (rc 2).
+  if (onStarts.length > 1) {
+    refuse(
+      `${file}: \`on:\` appears ${onStarts.length} times (lines ${onStarts
+        .map((i) => i + 1)
+        .join(", ")}). YAML keeps only the LAST, so which trigger set is in force is not something this reader can answer — the trigger scope is UNVERIFIED.`
+    );
+  }
+  const start = onStarts.length === 1 ? onStarts[0] : -1;
   if (start < 0) refuse(`${file}: no top-level \`on:\` key — nothing to read`);
   const region = [];
   for (let i = start + 1; i < lines.length; i += 1) {
@@ -215,16 +229,25 @@ function extraSet(names, allowed) {
 // guard was gone. Scoping by job is what makes the guard assertion non-vacuous.
 function jobBlock(text, name) {
   const lines = String(text ?? "").split("\n");
-  // The START is matched by the same indent SHAPE as the terminator, never by exact string equality:
-  // a one-character edit to the required job's OWN header — a trailing comment
-  // (`  pipeline-compliance:  # the required context`) or a quoted name — made an exact matcher return
-  // "" and the caller report "the JOB does not carry the guard" while the guard was plainly present.
-  // That is a false block AND a misdiagnosis, and the natural repair for a wrong diagnosis is to
-  // loosen the guard regex, which is how a fail-open is born.
-  const headerRe = new RegExp(
-    `^ {2}(?:"${name}"|'${name}'|${name}):(?:\\s+#.*)?\\s*$`
-  );
-  const starts = lines.map((l, i) => (headerRe.test(l) ? i : -1)).filter((i) => i >= 0);
+  // ⛔ THE START IS FOUND BY THE SAME RULE AS THE TERMINATOR: the indent SHAPE, then the key NAME read
+  // out of the line — never an enumerated list of header spellings. A spellings regex
+  // (`  name:`, `  "name":`) is the exact anti-pattern the terminator comment below calls out, and it
+  // reopened the duplicate-job-id fail-open ONE CHARACTER away: `  pipeline-compliance :` (space before
+  // the colon), `  pipeline-compliance: &anchor` and `  pipeline-compliance: {name: x}` all matched the
+  // TERMINATOR but not the start rule, so `starts` saw a single header, the duplicate guard was
+  // skipped, and the reader answered about the FIRST (guarded) block while YAML's effective job was
+  // the LAST one — with `if: true`, or with no `if:` at all. Measured: rc=0 over an effective `if` of
+  // `True`. KEY_RE is the one key reader this file already uses; it tolerates quotes, whitespace
+  // before the colon, and any value shape.
+  const nameOfJobHeader = (line) => {
+    const m = KEY_RE.exec(line);
+    if (!m || m[1].length !== 2) return null; // job headers sit at 2 spaces, one level under `jobs:`
+    return (m[2] ?? m[3] ?? m[4] ?? "").trim();
+  };
+  const starts = lines
+    .map((l, i) => ({ l, i }))
+    .filter(({ l }) => nameOfJobHeader(l) === name)
+    .map(({ i }) => i);
   // ⛔ A DUPLICATE JOB ID IS LAST-WINS in YAML, and a first-match reader answers about the WRONG job.
   // Measured: a second `  pipeline-compliance:` appended with no `if:` at all leaves the effective
   // `if` ABSENT — i.e. the job RUNS on the comment event — while this reader inspected the FIRST
