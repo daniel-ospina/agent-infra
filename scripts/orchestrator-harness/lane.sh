@@ -675,8 +675,8 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the SEVEN refusal gates
-# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`.
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the EIGHT refusal gates
+# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`.
 # ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
 # emitted SIX since the fork/capability/skew/key gates were added — and it says SEVEN here because that
 # stale count is exactly how this comment drifted the first time (review cycle 1, P2: it read "SIX"
@@ -804,7 +804,14 @@ else
     echo "[lane $N] NOT started: the KEY gate could not be RUN ($O/state not writable) — see $O/logs/lane-$N.log" >&2
     exit 78
   fi
-  key_gate_assert "lane $N" "${HOME:-}" > "$KEY_GATE_OUT" 2>&1; KEY_GATE_RC=$?
+  # ⛔ THE MODEL PAIR IS PASSED EXPLICITLY, SO THE GATE AND THE SPAWN CANNOT DISAGREE (agent-infra#3443).
+  # `run_agent` builds `pi -p --provider "${PI_LANE_PROVIDER:-deepseek}" --model "${PI_LANE_MODEL:-deepseek-flash}"`
+  # — the provider is ALWAYS explicit there, even when the model id carries its own `provider/` prefix. A
+  # gate that resolved the provider from the prefix would therefore assert one provider's credential while
+  # `pi` was handed another: green gate, dead lane (the false-PASS polarity). Passing both halves here makes
+  # the agreement structural instead of a coincidence of two defaults, and it is why the gate's own
+  # prefix rule is reserved for a probe that names no provider.
+  key_gate_assert "lane $N" "${HOME:-}" "${PI_LANE_PROVIDER:-deepseek}" "${PI_LANE_MODEL:-deepseek-flash}" > "$KEY_GATE_OUT" 2>&1; KEY_GATE_RC=$?
   tee -a "$O/logs/lane-$N.log" < "$KEY_GATE_OUT"
   rm -f "$KEY_GATE_OUT" 2>/dev/null || true
   if [ "$KEY_GATE_RC" -ne 0 ] && [ "$KEY_GATE_RC" != "$KEY_GATE_REFUSED" ]; then
@@ -816,21 +823,59 @@ else
     exit 78
   fi
   if [ "$KEY_GATE_RC" -ne 0 ]; then
-    # The reason token names the VARIABLE, so a fleet scan can count the missing names without reading
-    # prose: `grep -h '^outcome=refused reason=key-gate' $O/logs/lane-*.log`.
-    lane_outcome refused "key-gate:${KEY_GATE_REASON:-credential-missing}:${KEY_GATE_VAR:-unknown}"
+    # The reason token names the VARIABLE and the MODEL, so a fleet scan can count the missing names and
+    # the model they were for without reading prose: `grep -h '^outcome=refused reason=key-gate'
+    # $O/logs/lane-*.log`. ⛔ THE MODEL IS IN THE TOKEN BECAUSE THE FAILURE IS NAMED AFTER IT (agent-infra#3443:
+    # `No API key found for the selected model.`) — a token carrying only the variable answers a question the
+    # operator did not ask when the variable was the wrong one to look at.
+    lane_outcome refused "key-gate:${KEY_GATE_REASON:-credential-missing}:${KEY_GATE_VAR:-unknown}:${KEY_GATE_MODEL:-unknown}"
     # ⛔ THE REFUSAL YIELDS THE ITEM (review round 3, P2). A key refusal is a property of THIS box, so a
     # peer that HAS the credential can take the work — and without this record `chain-merge.sh` has
     # nothing to read, so it waits out its 90 minutes holding the cross-box claim while every peer's
     # pre-flight sees COLLISION (the R8 defect the record exists to remove). `capability` writes one for
     # exactly this reason; the words below say what the stand-down buys, the way `land`/`skew` do.
+    # ⛔ THE SENTENCE FOLLOWS THE REASON (round 22, P2, measured): a `store-invalid`/`auth-store-unreadable` refusal is a
+    # verdict about `auth.json` — INCLUDING a JSON `null` document, which parses and still kills pi at read time
+    # (round 29, P3, measured: without this arm the lane prescribed exporting a variable for a file pi cannot index) —
+    # and telling the operator to "put the credential in the environment" sends them to the
+    # one thing the refusal already measured as NOT the problem (`export $VAR` does not rescue either shape).
+    case "${KEY_GATE_REASON:-credential-missing}" in
+      store-invalid|auth-store-unreadable|auth-store-null)
+        KEY_GATE_REMEDY="a property of THIS box's credential STORE — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-<agent dir>}/auth.json, which pi reads before anything else, and neither exporting the variable nor a models.json template rescues it; repair or delete that file" ;;
+      *)
+        KEY_GATE_REMEDY="a property of THIS box — the [key-gate] lines above name the variable and every candidate file. The remedy HERE is to put the credential in the environment lanes run with" ;;
+    esac
     if lane_standdown_write key "$CAPACITY_YIELD_SECS"; then
-      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=key) — the credential is a property of THIS box, so chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min and a peer that has the key can claim it; this box will not re-win it while the yield is live. The remedy HERE is to put the credential in the environment lanes run with (the [key-gate] lines above name the variable and every candidate file)." >> "$O/logs/lane-$N.log"
+      echo "[lane $N] capacity transfer: yielded to peers for ${CAPACITY_YIELD_SECS}s (gate=key) — the credential is ${KEY_GATE_REMEDY}." >> "$O/logs/lane-$N.log"
     else
       echo "[lane $N] WARN: could not write $capacity_record — the refusal still releases the claim via chain-merge.sh's timeout path, but not promptly" >> "$O/logs/lane-$N.log"
     fi
-    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — \$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it. NOT a capacity refusal and nothing was consumed: put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file." >> "$O/logs/lane-$N.log"
-    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — the model credential \$${KEY_GATE_VAR:-?} is missing; see $O/logs/lane-$N.log" >&2
+    # ⛔ THESE TWO LINES FOLLOW THE REASON TOO (round 23, P2, measured): round 22 fixed only the capacity-transfer
+    # sentence above, so a `store-invalid`/`auth-store-unreadable` refusal still told the operator here that
+    # "$VAR holds no value in the environment this lane would run with ... put the credential where this lane's own
+    # env sources it" - the exact prescription the gate's own line in the SAME log refutes ("this is a verdict about
+    # the FILE, not about a missing variable ... `export %s` cannot help"), and with no template the variable renders
+    # as the non-existent `$<none>`. The suite missed it because the guard greps one fixed phrase.
+    case "${KEY_GATE_REASON:-credential-missing}" in
+      store-invalid|auth-store-unreadable|auth-store-null)
+        # ⛔ NO `$<none>` IN AN INSTRUCTION (round 25, P3, measured): with no models.json template the gate sets
+        # `KEY_GATE_VAR` to the literal `<none>`, so the `${VAR:-<none>}` form below rendered "exporting $<none>" — a
+        # shell token that does not exist — inside a remedy the operator is meant to follow. The clause is dropped
+        # entirely when there is no variable to name (the gate…s own line does the same, printing `var=<none>`).
+        # ⛔ TWO WHOLE CLAUSES, NOT ONE CLAUSE WITH A HOLE (round 26, P3, measured): dropping just the export half left
+        # "and neither a models.json template rescues that" — a dangling conjunction that also claims a template exists
+        # on the shape where none does. Each branch is a sentence an operator can act on.
+        case "${KEY_GATE_VAR:-}" in
+          ""|"<none>"|"unknown")
+            KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and no models.json template applies here; repair or delete that file and re-dispatch" ;;
+          *)
+            KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and neither a models.json template nor exporting \$${KEY_GATE_VAR} rescues that; repair or delete that file and re-dispatch" ;;
+        esac ;;   # the outer arm needs its own terminator: the inner `esac` does not end it
+      *)
+        KEY_GATE_WHY="\$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it; put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file" ;;
+    esac
+    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — ${KEY_GATE_WHY}. NOT a capacity refusal and nothing was consumed." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: KEY gate refused (exit $KEY_GATE_RC) — ${KEY_GATE_REASON:-credential-missing}: ${KEY_GATE_WHY}; see $O/logs/lane-$N.log" >&2
     exit "$KEY_GATE_RC"
   fi
 fi
@@ -854,7 +899,8 @@ if grep -qE 'github\.com/[^ ]+/pull/[0-9]+|(^|[^A-Z_])PR_OPENED([^A-Z_]|$)' "$O/
   echo "[lane $N] ⚠️ NO merge-phase verdict (state/lanemerge-issue-$N.verdict absent) — the lane ended without either reaching merged or naming a blocker; merge-rate.sh will count it as PR_OPENED (or UNKNOWN if the log carries no status token), never as MERGED." >> "$O/logs/lane-$N.log"
 fi
 # A gate refusal reports AGENT_FORK_REFUSED (73), AGENT_LOAD_REFUSED (75), AGENT_LAND_BACKLOG (74),
-# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71)
+# AGENT_BRIEF_REFUSED (80), AGENT_CAPABILITY_REFUSED (71), AGENT_HARNESS_SKEW_REFUSED (83),
+# AGENT_MEM_REFUSED (81)
 # or AGENT_DISK_REFUSED (77);
 # AGENT_STARTED is authoritative rather than the exit code, because `pi` shares the 0–255 status
 # namespace and could exit 75 itself (#1720).
@@ -871,9 +917,14 @@ if [ "$AGENT_STARTED" = "0" ]; then
     "${AGENT_BRIEF_REFUSED:-80}")        lane_outcome refused "brief-gate" ;;
     "${AGENT_LOAD_REFUSED:-75}")         lane_outcome refused "load-gate" ;;
     "${AGENT_FORK_REFUSED:-73}")         lane_outcome refused "fork-gate" ;;
+    # ⛔ THE MEMORY GATE'S OWN OUTCOME NAME (#2387), for the reason the comment above gives: an
+    # operator told "refused" still cannot tell a fork-exhausted box (73) from one whose memory floor
+    # is gone (81), and the remedies are mutually exclusive — a fork needs an external restart, a
+    # memory floor clears when resident lanes finish.
+    "${AGENT_MEM_REFUSED:-81}")          lane_outcome refused "mem-gate" ;;
     "${AGENT_DISK_REFUSED:-77}")         lane_outcome refused "disk-gate" ;;
     "${AGENT_LAND_BACKLOG:-74}")         lane_outcome refused "land-backlog" ;;
-    "${AGENT_HARNESS_SKEW_REFUSED:-81}") lane_outcome refused "harness-skew" ;;
+    "${AGENT_HARNESS_SKEW_REFUSED:-83}") lane_outcome refused "harness-skew" ;;
     "${AGENT_CAPABILITY_REFUSED:-71}")   lane_outcome refused "capability-gate" ;;
     # ⛔ NO `pi-gate` ARM: THE CODE CANNOT REACH HERE (review, P2, measured). `run_agent` translates the
     # spawn point's `PI_GATE_REFUSED` (76) into `AGENT_LOAD_REFUSED` (75) before returning
@@ -897,9 +948,12 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # to the pool.
   #
   # ⛔ AND THE REFUSAL IS RECORDED, so "returns to the pool" is not merely claimed here — see the
-  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `disk`,
-  # `capability`, `skew` and `land` are the six values the gate can refuse on, and each is chosen by the
+  # CAPACITY TRANSFER block above for the format and its two readers. `fork`, `load`, `mem`, `disk`,
+  # `capability`, `skew` and `land` are the seven values the gate can refuse on, and each is chosen by the
   # code its own caller already distinguishes, so the record can never disagree with the exit status.
+  # `mem` (#2387) is transferable like `load` — a peer box with free RAM can run the work this box's
+  # memory floor refused — which is why it takes the capacity-transfer branch below and not the `land`
+  # stand-down one.
   # ⛔ THE BRIEF REFUSAL IS NOT A CAPACITY REFUSAL, AND SAYING SO IS THE WHOLE POINT (#2258). A
   # capacity refusal clears (load) or clears when the volume is reclaimed (disk), and both travel
   # with the BOX — so `capacity-refused-<N>` correctly yields the item to a peer, and
@@ -935,10 +989,15 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # of THIS box, so yielding the issue to a peer is exactly the right remedy (the brief-refusal
     # argument, read in the other direction). Tolerant default for the same $O-skew reason as the rest:
     # a helper predating the code can never return it.
+    # ⛔ AND `mem` TAKES THE SAME YIELD PATH FOR THE SAME REASON (#2387): `mem` is transferable like
+    # `load` — a peer box with free RAM can run the work this box's memory floor refused — which is
+    # why it is a capacity value and NOT a `land` stand-down. Its code is 81, outside the band the
+    # other gates occupy, so a future renumbering cannot quietly make this arm unreachable.
     if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
+    elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then _cap_gate=mem
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
-    elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then _cap_gate=skew
+    elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then _cap_gate=skew
     elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
     else _cap_gate=load; fi
     # ⛔ THE YIELD IS GATE-INDEPENDENT, AND THAT IS A RECORDED DECISION — NOT AN OVERSIGHT TO TIDY.
@@ -964,10 +1023,10 @@ if [ "$AGENT_STARTED" = "0" ]; then
         # ⛔ A SIXTH VALUE, AND THE SECOND WHOSE RECORD IS NOT A CAPACITY CLAIM (follow-up review of
         # #2991, P2). The refusal is a helper/consumer VERSION SKEW or a corrupt helper: it is a property
         # of the PAIR, not of this box, so "yielded to peers" is false — a peer running the same pair
-        # refuses identically, and the operator's remedy is a `cp` of the helper pair on EVERY box. The
-        # record is still written (chain-merge.sh must stop waiting for a PR that cannot appear), and
-        # the words say exactly what it buys, the same way `land` does.
-        echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is `cp scripts/orchestrator-harness/*.sh \$O/` wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
+        # refuses identically, and the operator's remedy is a VERIFIED redeploy of the helper pair on
+        # EVERY box. The record is still written (chain-merge.sh must stop waiting for a PR that
+        # cannot appear), and the words say exactly what it buys, the same way `land` does.
+        echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
       else
         echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
       fi
@@ -994,20 +1053,25 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # had been MET — a false cause, and the same #1765 class (a remedy for the wrong condition) this
     # block exists to prevent. Both are named, and the refusing line above carries the numbers.
     echo "[lane $N] NOT started: DISK gate refused — either the filesystem is below DISK_MIN_FREE_MB, or it is above the floor but has no headroom for one lane's dependency tree (DISK-NOHEADROOM, agent-infra#2721). The '[disk-gate] REFUSED' line above says which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches; --scratch for /tmp) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
+  elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then
+    # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
+    # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
+    # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.
+    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool. (The reading, the floor and how the floor was derived — a measured reserve, or an operator-set MEM_MIN_AVAIL_MB — are on the [mem-gate] REFUSED line in this log.)" >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is
     # already idle; the reading they need is the repo's open-PR count against its landing rate, which
     # is on the `[land-backlog] REFUSED` line in the same log.
     echo "[lane $N] NOT started: LAND-BACKLOG — the repo holds more open PRs than its own measured landing rate can absorb (#2409), so new creation is held. This is NOT a capacity refusal: the box is fine and waiting will not clear it. The work is the PR queue — review, rebase or land an open PR; a P0-blocker or a base-red repair is exempt by evidence. Issue returns to the pool." >> "$O/logs/lane-$N.log"
-  elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+  elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
     # ⛔ NAMED, AND NAMED AS NOT-A-BOX-FAULT (follow-up review of #2991, P2, measured). The refusal is a
     # VERSION SKEW between this caller and the deployed `cell-lane-preflight.sh`, or a corrupt copy of
     # it — the harness's own files, identical on every box. The capability arm below would send the
     # operator to "repair this box (installed pi/extension set, provider credential) or dispatch the
     # issue to another box", and both are wrong here: the extension set is fine and the peer refuses
-    # identically. The fix is one `cp` on every box that runs lanes.
-    echo "[lane $N] NOT started: HARNESS/MISMATCH gate refused — this box's caller and its deployed cell-lane-preflight.sh do not agree (a usage/argument skew, or a corrupt copy), so the probe could not measure anything (agent-infra#2991), OR the spawn gate could not resolve capacity.sh at all (the fork resolver's `nodeploy` arm, agent-infra#2293 follow-up). This is NOT a property of this box and load has nothing to do with it: every box running the same pair refuses identically, so do NOT dispatch the issue to another box. Sync the helper pair — cp scripts/orchestrator-harness/*.sh \$O/ — then re-dispatch. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
+    # identically. The fix is one verified redeploy on every box that runs lanes.
+    echo "[lane $N] NOT started: HARNESS/MISMATCH gate refused — this box's caller and its deployed cell-lane-preflight.sh do not agree (a usage/argument skew, or a corrupt copy), so the probe could not measure anything (agent-infra#2991), OR the spawn gate could not resolve capacity.sh at all (the fork resolver's `nodeploy` arm, agent-infra#2293 follow-up). This is NOT a property of this box and load has nothing to do with it: every box running the same pair refuses identically, so do NOT dispatch the issue to another box. Sync the helper pair with a VERIFIED redeploy — bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O — then re-dispatch. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ NAMED, BECAUSE THE REMEDY IS THE ONE THING WAITING CANNOT BUY (review of #2991, P1). Without
     # this arm a capability refusal fell into the `else` below and the operator read "load gate refused

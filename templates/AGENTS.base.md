@@ -331,7 +331,11 @@ A brief handed to a lane, a fixer, a reviewer, a background worker or a pane ord
 `RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:` line naming the tool) and a
 `CONTRADICTION TEST:` line. Absent any of them the dispatch is refused with exit 80 by
 `scripts/orchestrator-harness/brief-gate.sh` — no model call, no session, no claim — and the refusal
-names every missing element and prints the block to paste. The canonical block is
+names every missing element and prints the block to paste. The same gate also refuses a brief with no
+`PREVIOUS WORK` block (`CLAIM:` + `WIP:` + `BRANCH:` + `WORKTREE:` + `PRIOR:`), and a `WIP:` line that
+names no `refs/wip/…` ref is REFUSED when origin holds a rescued snapshot for the issue it is keyed to
+(agent-infra#3484 — 222 rescued archives existed and nothing told the next actor to look). The
+canonical block is
 `brief-gate.sh --section <lane|fixer|reviewer|worker>`; `templates/LANE-BRIEF.md` carries it for
 controller-written briefs. If YOUR brief is refused, add what it names; do not route around the gate
 (agent-infra#2258: two lanes in one day acted on a false premise — one re-derived a root the tracker
@@ -349,9 +353,18 @@ already held, one opened a duplicate PR — both brief defects, not lane defects
 2. **CONFIRM DIRECTION before you dispatch or start building** — create/link the point that says what this task is for, *unless a very recent point for the same task already does* (same task, days not months, and it still describes the work).
 3. **WRITE after you finish** — the measurement, the refutation, the root cause, the dead end. **Read the write skill first: `skills/how-to-use-tortoise/SKILL.md`.** One claim per point; a finding needs a **number or a source** — `tortoise-graph.sh evidence` refuses one with no digit.
 
+⛔ **THE MCP ENTRY IS `lazy: true` — LOAD IT BEFORE CALLING IT.** Since #3374 the `tortoise` entry in
+`templates/.mcp.base.json` is lazy, because the hosted cold handshake exceeds pi's default connect
+budget and a core server would block every session start on a memory-constrained box. So a fresh
+session has **no** `mcp__tortoise__*` tools until you run **`mcp_load tortoise`** once; calling the
+tool names without it is the "the tool does not exist" failure this note exists to prevent. The
+shell client below needs no load step and is the reason it is the primary route on a fleet box.
+
 ```bash
-# ⛔ THE FARMED PATH IS THE ONE THAT ALWAYS EXISTS. `pi-bootstrap/setup.sh`'s `fleet_srcs` declares
-# these two files, so any box that has run the farm (or a cell that ran `cell-install.sh`) carries them
+# ⛔ THE FARMED PATH IS THE ONE THAT ALWAYS EXISTS. `pi-bootstrap/setup.sh`'s `graph_srcs` array
+# declares these two files (it was `fleet_srcs` until #3374 gave the hosted-graph fallback its own
+# array — a pair declared in BOTH is copied twice and appears twice in the farm's declared set),
+# so any box that has run the farm (or a cell that ran `cell-install.sh`) carries them
 # at `$HOME/.pi/agent/scripts/`, with no checkout required.
 # The repo-relative form below resolves only where `scripts/` IS A REAL TRACKED TREE. Where `scripts/`
 # is the machine-local pointer instead (⛔ a gitignored symlink, never tracked — tortoise#9475), a

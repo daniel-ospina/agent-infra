@@ -83,6 +83,273 @@ LANES = [
 SUSPECT_AGE = 300      # 5 min
 CHILD_SUSPECT_AGE = 600  # 10 min
 
+# ── the lane census gets a SECOND population to disagree with ─────────────
+# ⛔ A FROZEN ROSTER IS NOT A CENSUS (measured 2026-11-03). `LANES` above is a fixed list of
+# seven session ids. On a box where none of them is present -- a fresh cell, a reboot, a
+# renamed lane -- the table still prints seven rows, each one `pid None / life ?`, and because
+# every row is UNMEASURED rather than FLAGGED nothing lands in `suspects`; with a readable
+# hook store the summary underneath then reads `✅ no suspects`. That is a false PASS from a
+# liveness instrument: a clean result over ZERO measured lanes, while pi processes were
+# demonstrably running on the box. Reproduced with a readable store containing no rostered
+# session: seven unmeasured rows and `✅ no suspects`, no mention of the running processes.
+#
+# The cure is not a bigger roster (a hardcoded list can always fall behind). It is to count a
+# population the roster does not control -- the process table -- and DISAGREE LOUDLY when the
+# two cannot be reconciled. `lanes=<N> pi=<M>` both unmeasured is a fact worth an alarm; it is
+# never a clean scan.
+PI_PS_ARGV = ["ps", "-Ao", "pid=,command="]
+
+
+def pi_process_count():
+    """How many `pi` processes are running on THIS box, or None when unreadable.
+
+    `None` is the abstention and is NOT interchangeable with `0`: a failed `ps` must never
+    manufacture the "no processes, so no mismatch" clean result this reconciliation exists to
+    prevent (the same unknown-vs-zero rule the identity probe follows).
+
+    ⛔ EXACT BASENAME, NOT A PREFIX (review cycle 1, finding 4). The matcher was
+    `base == "pi" or base.startswith("pi-")`, which counts every `pi-*` HELPER --
+    `pi-cache-reap`, `pi-reap-orphans.sh`, `pi-task-session-prune.sh` -- as a lane-bearing pi.
+    Measured: `exec -a pi-cache-reap sleep` is counted by the prefix form. That over-count feeds
+    the census a population the fleet does not have, and on a box whose roster is current it
+    fabricates a MISMATCH out of a reaper. The fleet's own binary is exactly `pi` (measured: 18
+    processes, argv0 `pi`), so an exact basename is both correct and narrower.
+
+    ⛔ AN EMPTY TABLE IS AN UNREADABLE READ, NOT A MEASURED ZERO (review cycle 3, finding 3).
+    A `ps` that exits 0 and prints no rows fell through the loop as `0`, which the census maps to
+    its silent arm — the pre-fix false PASS reached through the gate's own input, on any host where
+    `ps` degrades. That is also the contract this repo ALREADY pins one level down:
+    `scripts/lib/pid-identity.sh` `pid_table_nonempty` -- "a read that 'succeeds' but prints no
+    table is not 'no such process' ... an empty table is an UNREADABLE read, never absence"
+    (#1178 C3). The probing process itself must appear in any real table, so zero parsed rows is
+    reported as None here rather than as a second, contradicting ps contract.
+
+    ⛔ "PARSED" MEANS A ROW WITH A NUMERIC PID, NOT MERELY TWO FIELDS (review cycle 10, finding 2).
+    The guard counted any line with two whitespace-separated fields, so a `ps` that printed a
+    HEADER (`PID COMMAND` -- which is what a `ps` that does not honour the trailing `=` on
+    `pid=,command=` emits) counted as a row while contributing no pid: `rows=1, n=0`, which returns
+    a MEASURED ZERO and takes the census's silent arm. Measured: a header-only table yielded
+    `pi_process_count()==0` and `lane_census(0,0,0,7)==None`, i.e. `✅ no suspects` and exit 0 --
+    the exact fail-open this guard was added to close, reached through a read the format did not
+    match. Requiring `parts[0].isdigit()` makes the guard test what the comment claims it tests.
+    """
+    try:
+        cp = subprocess.run(PI_PS_ARGV, capture_output=True, text=True, timeout=20)
+    except Exception:
+        return None
+    if cp.returncode != 0:
+        return None
+    n = 0
+    rows = 0
+    for line in cp.stdout.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2 or not parts[0].isdigit() or not parts[1].strip():
+            continue
+        rows += 1
+        argv0 = parts[1].split()[0]
+        if os.path.basename(argv0) == "pi":
+            n += 1
+    if rows == 0:
+        return None      # empty table = unreadable, never "zero pi processes"
+    return n
+
+
+def lane_census(alive, dead, pi_count, roster_size):
+    """The census note, or None when the census is RECONCILED.
+
+    ⛔ THE OLD SUMMARY LINE WAS FALSE IN BOTH DIRECTIONS (review cycle 13, finding 1). It read
+    "or None when every rostered lane carries a CONCLUSIVE verdict", and the code contradicts it
+    both ways: `lane_census(0, 0, 0, 7)` is silent with NO lane conclusive (a MEASURED-EMPTY
+    population cannot mislead about anything), and `lane_census(5, 2, None, 7)` returns a note with
+    EVERY lane conclusive (a complete roster over an UNREADABLE table is UNVERIFIED, never clean).
+    Silence is about whether the roster and the population AGREE, not about how many lanes resolved
+    — see SILENT ARMS, EXHAUSTIVELY below, which is the authority this line summarises.
+
+    ⛔ SILENCE REQUIRES A CONCLUSION PER LANE, NOT A RECORD PER LANE (review cycle 2, finding 1).
+    The previous form keyed silence on "the store has a record for some rostered lane", which
+    let a SINGLE pid-less or abstaining record silence a census in which nothing was established
+    while 18 pi processes ran — `✅ no suspects`, exit 0, the original defect one input over.
+
+    * `alive` -- lanes the ONE verdict function positively bound to a live incarnation (`holder`).
+    * `dead` -- lanes POSITIVELY dead (`absent` / `zombie`). An ABSTENTION (unreadable / off-fence)
+      is neither, which is the whole point: an identity read that did not happen must never be
+      counted as an established one.
+    * `pi_count` -- the independent population, or None when unreadable.
+
+    ⛔ "A CONCLUSIVE VERDICT" IS NOT "THE ROSTER ACCOUNTS FOR THE BOX" (review cycle 7, finding 1).
+    Silence was keyed on `alive + dead >= roster_size` alone, so seven `PID DEAD` lanes silenced the
+    census while the box's pi processes were demonstrably running — the roster names NONE of that
+    population, which is the original defect, reached through the all-dead arm. A `dead` verdict is
+    conclusive about the RECORDED PID only; it says nothing about the processes the roster has never
+    heard of. Reproduced end-to-end (readable store, a record for every rostered session carrying an
+    ended pid): seven `PID DEAD` rows, NO census line, `✅ no suspects`, exit 0 from the lane section
+    — while `ps` showed ~18 live `pi` processes. So the population decides, not the dead count.
+
+    ⛔ SILENT ARMS, EXHAUSTIVELY: `alive >= roster_size` (every lane is a live bound incarnation,
+    whatever the process table says); or every lane conclusive with at least one attributed alive
+    AND a MEASURED population (the roster accounts for at least one running process, so it is not
+    contradicted); or every lane conclusive over a MEASURED-EMPTY population (the population can
+    CONTRADICT nothing, and no lane is live — see the argv0 note in that arm); or a MEASURED-EMPTY
+    population on an inconclusive roster (a MISMATCH needs at least one pi process the roster does
+    not account for, so an empty population has nothing to object to). ⛔ `None` IS NOT IN THAT ARM
+    (review cycle 18, finding 4): it is a population that WAS NOT READ, and it returns UNRECONCILED
+    immediately above — before either `pi_count <= 0` guard is reached. That ORDERING is the fix;
+    the guards' `<= 0` form is otherwise the measured-zero arm, and the producer never yields a
+    negative, so the only reachable input through it is `0`.
+    Nothing else is silent — in particular a conclusive roster that is PARTLY live
+    (`0 < alive < roster_size`) over an UNREADABLE table is UNVERIFIED, not silent (see the arm
+    below), while a FULLY-live roster is the first arm's exemption. That arm is written `>=` to also
+    cover `alive > roster_size` (`lane_census(8, 0, None, 7)` is silent), not because `==` would
+    change the fully-live cell.
+
+    ⛔ AN ABSTENTION IS NAMED, NOT SWALLOWED. When a lane's verdict is missing AND the process
+    table cannot be read, returning None would render that state identically to `pi_count == 0`
+    -- "reconciled, nothing running" -- and the summary would print `✅ no suspects` with exit 0.
+    That is the pre-fix false PASS arriving through the new gate's own input, so it gets its own
+    UNRECONCILED note instead.
+
+    ⛔ AN UNREADABLE TABLE IS NOT A MEASURED ZERO, NOT EVEN ON AN ALL-DEAD ROSTER (review cycle 8,
+    finding 1). The all-dead arm collapsed `pi_count is None` into `<= 0`, so on a host whose `ps`
+    degrades (an EMPTY `-Ao` table is `None` — see `pi_process_count`) a fully DEAD roster printed
+    `✅ no suspects` with no census line, while the same box with a working `ps` printed STALE
+    ROSTER. The read FAILING flipped the verdict from ALARM to CLEAN — the fail-open direction, and
+    a direct violation of R2 ("`pi_count is None` ⇒ abstain: no mismatch, no clean claim, never
+    `0`") FOR ANY ROSTER THAT IS NOT FULLY LIVE. An all-dead roster over an unreadable table
+    genuinely cannot be distinguished from an idle fleet, so it now says exactly that instead of
+    claiming the clean one.
+
+    ⛔ R2 IS SCOPED, AND THE SCOPING IS THE POINT (review cycle 12, finding 1). Above, R2 is
+    ONTOLOGICALLY about a population that WAS NOT READ. `alive >= roster_size` is the one state whose
+    silence rests on a POSITIVE PER-LANE measurement instead: every rostered lane was bound to a live
+    incarnation, so the box is accounted for without the table. Quoting R2 unscoped here would tell
+    a reader to add `if pi_count is None: return UNVERIFIED` ABOVE the first arm — which would make
+    every healthy box with a degraded `ps` alarm forever, the un-clearable false alarm review cycle
+    10 exists to prevent. `alive >= roster_size` is therefore the ONE exemption from R2, and it is
+    the only arm whose silence does not depend on the population at all.
+
+    ⛔ …AND THE DIAGNOSIS MUST NOT CONTRADICT THE ROWS IT SITS BENEATH (review cycle 9, finding 1).
+    That arm was gated on `established >= roster_size`, so it also fired when SOME lanes were ALIVE
+    and printed "all 7 rostered lanes are DEAD/absent … an idle fleet and a stale roster are
+    indistinguishable" directly under a `life running` row — naming the two causes the state
+    excludes. The alarm was right; the sentence was false. There are two shapes of UNVERIFIED and
+    each names its own.
+    """
+    established = alive + dead
+    if alive >= roster_size:
+        # Every rostered lane is positively bound to a live incarnation: the roster IS the box, and
+        # any remaining pi processes are task children the roster does not claim to cover.
+        return None
+    if established >= roster_size:
+        # Every rostered lane has a conclusive verdict, so nothing here is UNMEASURED. What is left
+        # to decide is whether that roster still describes the box — the population does that:
+        #   * UNREADABLE table (`None`)  -> undecidable: an idle fleet and a stale roster look the
+        #                                  same, so it is named, NOT rendered as the clean one;
+        #   * MEASURED empty table       -> the population has NOTHING TO CONTRADICT: with no lane
+        #                                  live (tested FIRST, below) the resolved roster is the
+        #                                  whole picture and there is nothing to reconcile against;
+        #   * some lane alive            -> the roster accounts for at least one running process;
+        #   * every lane DEAD while pi runs -> a STALE ROSTER (this is the branch cycle 6 lacked).
+        if pi_count is None:
+            if not alive:
+                return ("LANE CENSUS UNVERIFIED: all %d rostered lanes are DEAD/absent and the "
+                        "process table could not be read — an idle fleet and a stale roster are "
+                        "indistinguishable here, so this is NOT a clean result" % roster_size)
+            return ("LANE CENSUS UNVERIFIED: %d of the %d rostered lanes is alive and %d are "
+                    "DEAD/absent, but the process table could not be read — the population "
+                    "cannot be reconciled against the roster, so this is NOT a clean result"
+                    % (alive, roster_size, dead))
+        # ⛔ THE EXEMPTION IS TESTED BEFORE THE EMPTY-POPULATION ARM, AND IT IS BEHAVIOUR-NEUTRAL
+        # (review cycle 17, finding 1 — the earlier wording here claimed this reorder was "the fix"
+        # and that a pin "stops the exemption being split from its arm". Both claims were FALSE: BOTH
+        # arms `return None`, so the ORDER IS UNOBSERVABLE through the verdict, and a verdict-level
+        # pin cannot see it. Measured against the pre-fix MODULE on a box whose identity probe
+        # resolves (the shipped base — a DIFFERENT thing from this ordering): `71 passed, 44 failed`
+        # = 38 `CENSUS` + 5 `EXITLINE` + 1 ambient `HARNESS`, i.e. 43 census checks red (the 44th
+        # `❌` is the ambient HARNESS failure, red on the UNMUTATED module too — quoting 44 as a
+        # CENSUS count is the same two-populations conflation this file exists to keep apart). So
+        # the pins are sensitive to the FIX and blind to the ORDER. ⛔ THESE INTEGERS TRACK THE
+        # SUITE'S SIZE — every check added to this leg moves them — so they are a measurement to
+        # RE-RUN (`--_mutant <pre-fix module>`), never a constant to quote. This is stated for what
+        # it is —
+        # the comment now matches the code it sits on, and the exemption sits adjacent to the arm it
+        # governs so the two cannot drift apart unnoticed. The value is the HONEST REASON and the
+        # PINS below, not an ordering guarantee.
+        #
+        # The reason the two reads may disagree is NOT a wrapper/interpreter argv0 — the fleet's own
+        # `pi` presents argv0 exactly `pi` (measured: 20 `ps` rows, all basename `pi`; the
+        # process-title rewrite means no interpreter prefix appears). It is that the two reads are
+        # DIFFERENT PREDICATES over DIFFERENT things: `alive` is an identity check on the RECORDED
+        # incarnation — the hook store's `pid` + `pidStartSeconds`, fenced by `liveness.probe_pid` —
+        # and NOTHING requires that process to be the `pi` binary; `pi_count` counts only `ps` rows
+        # whose argv0 basename is exactly `pi`. A lane whose recorded pid is a wrapper, a tmux
+        # client, or any other non-`pi` incarnation is therefore legitimately `alive` while adding
+        # nothing to `pi_count`. `alive > 0` beside a MEASURED-EMPTY population is that state, not a
+        # contradiction — and the previous ordering answered it with a comment ("nothing is
+        # running") that is provably FALSE whenever a lane is live: a lane positively bound to a
+        # live incarnation IS a running process. Measured before this: `lane_census(2, 5, 0, 7)` and
+        # `lane_census(2, 1, 0, 7)` both returned None through that arm.
+        if alive:
+            return None
+        if pi_count <= 0:
+            return None
+        return ("LANE CENSUS STALE ROSTER: all %d rostered lanes are DEAD/absent but %d pi "
+                "process(es) are running — the roster names NONE of them, so it no longer "
+                "describes this box (not an idle fleet, and NOT a clean result)"
+                % (roster_size, pi_count))
+    if pi_count is None:
+        return ("LANE CENSUS UNRECONCILED: only %d of the %d rostered lanes has a conclusive "
+                "verdict (%d alive, %d dead) and the process table could not be read — the scan "
+                "is UNMEASURED, not clean" % (established, roster_size, alive, dead))
+    if pi_count <= 0:
+        # The population is MEASURED EMPTY, so it can CONTRADICT nothing — a MISMATCH needs at least
+        # one pi process the roster does not account for. ⛔ NOT "nothing is running at all" (review
+        # cycle 16, finding 1): `alive` may be non-zero here (e.g. `lane_census(2, 1, 0, 7)`), for the
+        # argv0 reason documented in the complete-roster arm above. An inconclusive roster cannot
+        # mislead about a box whose population contradicts nothing.
+        return None
+    return ("LANE CENSUS MISMATCH: %d pi process(es) running but only %d of the %d rostered lanes "
+            "has a conclusive verdict (%d alive, %d dead) — the roster is stale on this box or "
+            "its lanes are unattributable, so every row without a verdict is UNMEASURED "
+            "(not dead, and NOT a clean result)"
+            % (pi_count, established, roster_size, alive, dead))
+
+
+
+def census_exit_verdict(note, attributed, established, roster_size):
+    """The exit line's `(word, tail)` for a census note.
+
+    ⛔ THE LABEL MUST BE DERIVED FROM THE NOTE, NOT FROM A COUNT THAT HAPPENS TO CORRELATE WITH IT
+    (review cycles 7, 8 and 9 — three consecutive rounds found a word or a tail that described a
+    state the note did not). `attributed + dead >= roster_size` was such a correlation: STALE ROSTER
+    was the only note reachable with a complete roster *until* UNVERIFIED became a second one. A
+    pure function is used so the pairing is PINNED directly, instead of only being reachable through
+    a live-pid fixture.
+
+    ⛔ AND THAT RULE APPLIES TO THE TAIL TOO (review cycle 13, finding 2). The two UNVERIFIED arms
+    were split by the `attributed` COUNT, so `census_exit_verdict()` could emit a tail its own note
+    excluded: handed the all-dead note
+    ("all 7 rostered lanes are DEAD/absent … an idle fleet and a stale roster are indistinguishable")
+    with a non-zero `attributed`, it printed "the population cannot be reconciled", which that note
+    explicitly is not. `main()` passes consistent arguments today, so this was latent, not yet a
+    wrong line — but it is the exact defect this function exists to prevent, so the discriminator is
+    now the NOTE's own words. `attributed`/`established`/`roster_size` are kept for the callers that
+    pass them and are deliberately NOT consulted here.
+    """
+    if note.startswith("LANE CENSUS STALE ROSTER"):
+        return ("STALE ROSTER", "no rostered lane is a running pi process")
+    if note.startswith("LANE CENSUS UNVERIFIED"):
+        # The note says which of the two shapes it is; the count cannot. "is alive and" appears only
+        # in the PARTLY-live note ("N of the M rostered lanes is alive and K are DEAD/absent").
+        if "is alive and" in note:
+            # Some lanes ARE live: do not claim the box is dark, and do not claim it is idle.
+            return ("UNVERIFIED", "the process table could not be read, so the population cannot "
+                                  "be reconciled against the roster")
+        return ("UNVERIFIED", "the process table could not be read, so an idle fleet and a stale "
+                              "roster are indistinguishable here")
+    # MISMATCH (partial census) and UNRECONCILED (inconclusive roster, unreadable table) both leave
+    # rows without a verdict, which is exactly what INCOMPLETE says.
+    return ("INCOMPLETE", "rows without a verdict are not a verdict")
+
 
 def walk_records(obj, out):
     """Collect every dict that looks like a session record, whatever the hook file's shape."""
@@ -283,6 +550,46 @@ def _reaper_is_scheduled():
     return False
 
 
+def _class_note(kv):
+    """The per-class verdicts that are NOT an ordinary reading, appended to the record line.
+
+    ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST — the same rule this repo's
+    `cloud-cell-supervisor.sh` states for `delegate_verdict_worktree`. `verdict_runner_work=abstained`
+    and `=partial` are the class's ONLY "could not measure" outcomes, and this reader used to drop
+    them: the record answered `ok=1 rc=0` (correct — an abstention is not a failure of the pass), the
+    `detail` that names the abstention was thrown away in the `ok == "1"` branch, and the class verdict
+    was never read at all — so a cell whose runner `_work` sink was filling behind a permission mismatch
+    read HEALTHY here for ever, which is the exact state `docs/ops/disk-reaper.md` claims was removed.
+
+    ⛔ IT IS PRINTED, NOT ALARMED, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT. The abstention is
+    deliberately rc 0 with the RECORD as the alarm channel (``docs/ops/disk-reaper.md`` — an hourly red
+    for a permission mismatch is the alarm-fatigue shape this family forbids); alarming here on any
+    non-`ok` verdict would reverse that decision in the one reader that runs fleet-wide. Visibility is
+    the half this function owes: a human scanning fleet health must SEE the word.
+
+    Benign spellings stay silent (`ok`, `not-run`, `?`, absent) so a healthy cell gains no noise; every
+    other spelling is printed — FAIL-LOUD on an unrecognised one, the same polarity as `_dclass`.
+
+    ⛔ ONLY `runner_work` PUBLISHES THE TALLY (#3057 review, measured). `disk-reaper.sh` writes
+    `unmeasurable_runner_work=` — its owner answers `unmeasurable=` — and writes NO
+    `unmeasurable_duplicate_install=`, because that owner has no such field. Looking the tally up for
+    every class made the `duplicate-install` clause unrenderable: a `⚠️ duplicate-install=partial`
+    could never be followed by a count, so the operator it was written for ("one unreadable root or
+    fifty?") got nothing, and the sentence above implied a guarantee the record does not carry. The
+    VERDICT loop stays over both classes — both verdict fields are written — and the tally is gated on
+    the classes that actually publish it.
+    """
+    tally_classes = ("runner_work",)
+    out = ""
+    for cls in ("runner_work", "duplicate_install"):
+        verdict = kv.get(f"verdict_{cls}", "")
+        if verdict in ("", "ok", "not-run", "?"):
+            continue
+        unm = kv.get(f"unmeasurable_{cls}", "") if cls in tally_classes else ""
+        out += f" ⚠️ {cls.replace('_', '-')}={verdict}" + (f" unmeasurable={unm}" if unm else "")
+    return out
+
+
 def disk_reaper_record():
     """Return (detail, alarm) from the pass record. Absence/unreadability/staleness is an alarm."""
     try:
@@ -326,9 +633,22 @@ def disk_reaper_record():
         return (f"record is STALE: last pass {age}s ago (bound {stale}s) — the job is scheduled but is not running",
                 True)
     if ok == "1":
+        # ⛔ THE CAUSE IS NOT DERIVED FROM `freed_mb_unmeasured=` (#3057 review, P2). That field answers
+        # WHOSE reclaim was not measured; the REASON is split in the pass's own `detail=`
+        # (`df could not measure …` vs `owner never answered its ledger …`), because a cut-short sweep has
+        # a mount that DID answer. Synthesising "df could not measure" from the list here re-asserted the
+        # exact false cause the record had just stopped claiming — one reader over.
+        # ⛔ SO THE REASON IS PRINTED FROM THE FIELD THAT HOLDS IT — and printed HERE, because this branch
+        # used to drop `detail=` entirely while every sibling branch prints it. That was not cosmetic:
+        # `ok=1` beside an unmeasured class IS reachable (measured: `DF_BIN=/nonexistent/df --apply --only
+        # venv` records `ok=1 rc=0 freed_mb=unmeasured detail=df could not measure the reclaim for: venv`),
+        # so dropping detail left the fleet panel naming the CLASS and losing the CAUSE. A benign pass
+        # (`detail=ok`) still gains no noise, the same polarity `_class_note` uses for class verdicts.
         unm = kv.get("freed_mb_unmeasured", "")
+        det = kv.get("detail", "") or ""
+        why = f" detail={det}" if det and det != "ok" else ""
         return (f"record ok=1 rc={kv.get('rc', '?')} freed_mb={kv.get('freed_mb', '?')}"
-                f"{f' (df could not measure: {unm})' if unm else ''} age={age}s", False)
+                f"{f' freed_mb_unmeasured={unm}' if unm else ''}{why} age={age}s{_class_note(kv)}", False)
     # ⛔ A ROUTINE OUTCOME IS NOT A FLEET ALARM. rc 6 (a delegate DEFERRED the pass because the box is
     # busy — the lock was held, or a live tool holds the cache) and rc 5 (a DRY RUN that found work it
     # would do) are the states the runbook tells operators to EXPECT on a healthy busy cell; alarming on
@@ -340,7 +660,7 @@ def disk_reaper_record():
     if rc_field in ("5", "6"):
         return (f"record ok=0 rc={rc_field} (expected on a busy cell) detail={kv.get('detail', '?')} age={age}s",
                 False)
-    return (f"record ok={ok or 'MISSING'} rc={rc_field} detail={kv.get('detail', '?')} age={age}s", True)
+    return (f"record ok={ok or 'MISSING'} rc={rc_field} detail={kv.get('detail', '?')} age={age}s{_class_note(kv)}", True)
 
 
 def _tortoise_repo_resolved():
@@ -626,6 +946,8 @@ def main():
     print(f"fleet health — {time.strftime('%H:%M:%S', time.localtime(now))}\n")
     print(f"{'lane':4} {'pid':>7} {'life':9} {'q':>2} {'ctx-age':>8} {'cpu-delta':>10}  flag")
     print("-" * 62)
+    attributed = 0
+    dead = 0          # lanes POSITIVELY absent/zombie; every other non-holder is UNESTABLISHED
     for lane, sid in LANES:
         rec = hook.get(sid, {})
         pid = rec.get("pid")
@@ -647,9 +969,12 @@ def main():
         flag = ""
         quiet = ""
         observed = _observed(pid, rec.get("pidStartSeconds")) if pid else None
+        if observed == HOLDER_OBSERVED:
+            attributed += 1      # positively bound to a live incarnation — see lane_census()
         if observed in DEAD_OBSERVED:
             # A positively absent/zombie incarnation: the process is gone, so the
             # transcript ladder has nothing left to add.
+            dead += 1
             flag = "PID DEAD"
         else:
             # An ABSTENTION is NOT a clean bill of health. Name it, and STILL run the
@@ -678,6 +1003,23 @@ def main():
 
         age_txt = f"{age:.0f}s" if age is not None else "-"
         print(f"{lane:4} {str(pid):>7} {life[:9]:9} {str(depth):>2} {age_txt:>8} {delta_txt:>10}  {flag}")
+
+    # ── lane census reconciliation (see lane_census) ────────────────────
+    # The roster above is a frozen list; the process table is not. When the roster accounts
+    # for NONE of the running pi processes, the table is not a census and must say so rather
+    # than let the summary below read as a clean scan.
+    # ⛔ NO CENSUS VERDICT WITHOUT A STORE READ (review cycle 2, finding 3). With `hook_ok` False
+    # no lane has a record at all, so the census would report "the roster is stale on this box"
+    # beside "hook store unreadable" — asserting a cause it never established, and pointing an
+    # operator at editing the roster when the STORE READ is the fault. The store failure already
+    # has its own INCOMPLETE path below; the census simply has nothing to say about a roster it
+    # could not read.
+    census_note = (lane_census(attributed, dead, pi_process_count(), len(LANES))
+                   if hook_ok else None)
+    if census_note:
+        print()
+        print(f"⚠️  {census_note}")
+        suspects.append(("census", census_note))
 
     # --- task children -------------------------------------------------
     kids = []
@@ -728,6 +1070,29 @@ def main():
         # SUPPRESS a suspect the ladder did find, which is the same defect one level up
         # from where the identity abstention was fixed.
         print("⚠️  hook store unreadable or shape-drifted — scan INCOMPLETE (lane identity not established)")
+        return 1
+    if census_note:
+        # ⛔ REPORTED, NOT DEGRADED TO A WARNING: a census note means the scan is NOT a clean result,
+        # and it must reach a scheduler the same way the unreadable store above does — a census that
+        # prints rows and exits 0 is exactly the false PASS this guards.
+        # ⛔ THIS BRANCH DELIBERATELY CHARACTERISES NOTHING. What KIND of note it is, and what that
+        # kind says about the rows, is `lane_census`'s own docstring; the word and tail printed below
+        # come from `census_exit_verdict`. Every attempt to summarise those states here in one
+        # sentence has been false for at least one of them ("some lanes did not reach a conclusive
+        # verdict" — untrue of STALE ROSTER; "contradicted by the population" — untrue of UNVERIFIED,
+        # whose population was never read), so the summary is gone rather than re-worded.
+        # ⛔ AND IT NAMES THE NUMBER IT ACTUALLY HAS (review cycle 3, finding 2): the line used to
+        # read "0 rostered lanes measured" for EVERY note, including a partial mismatch where 1-6
+        # lanes WERE established — telling an operator the census established nothing when it had.
+        # ⛔ AND IT MUST NOT SAY "INCOMPLETE" ABOUT A COMPLETE ROSTER (review cycle 7, finding 1):
+        # the all-dead arm reaches here with EVERY lane conclusive, so "INCOMPLETE — rows without a
+        # verdict" was false twice over. The word and the tail come from `census_exit_verdict`, which
+        # derives them from the NOTE rather than from `established` — a count that only correlated
+        # with the note while STALE ROSTER was the sole complete-roster arm (review cycle 9).
+        established = attributed + dead
+        word, tail = census_exit_verdict(census_note, attributed, established, len(LANES))
+        print("⚠️  lane census %s (%d of %d rostered lanes conclusive, %d attributed alive) — %s"
+              % (word, established, len(LANES), attributed, tail))
         return 1
     if sched_alarms:
         # A reaper alarm does not make the LANE rows wrong, so it is reported after them — but it
