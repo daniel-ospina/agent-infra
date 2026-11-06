@@ -296,7 +296,7 @@ for N in "$@"; do
   _wt_rc=$?
   case "$_wt_rc" in
     0) echo "#$N: worktree ok — $WT_RESULT" ;;
-    *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; continue ;;
+    *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; drop_dispatched_rows "$N"; continue ;;
   esac
   WT_ABS="$REPO_ABS/.worktrees/$WT"
   # ── THE POST-BUILD ASSERTION (agent-infra#2724/#2694) ───────────────────────────────────────

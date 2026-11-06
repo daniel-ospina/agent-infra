@@ -335,6 +335,12 @@ d4=$?
 # assertion exits 72, but the branch half runs per ISSUE and can refuse a REUSED worktree (the lane
 # was left on another named branch) — then the loop `continue`s and the script exits 0 with `K` still
 # counting the claim. `dispatch-merge.sh` publishes what reached a spawn; the controller recounts.
+# ⛔ THERE ARE NOW **TWO** PER-ISSUE REFUSAL ARMS, AND BOTH MUST DROP THE ROW. #2033/#2102 moved the
+# worktree build into `wt_provision`, whose refusal ("path is a worktree of a DIFFERENT branch …") fires
+# BEFORE the post-build repo/branch assertion — so the arm this case was written for is no longer the
+# one that refuses this fixture. That newer arm skipped `drop_dispatched_rows`, which is the defect this
+# arm caught; the message match below therefore accepts EITHER arm, and the row-drop conjunct is what
+# keeps it discriminating.
 DMO5="$T/o-dm5"; mkdir -p "$DMO5/logs" "$DMO5/state"; printf '6001\n' > "$DMO5/dispatched.txt"
 # the CI-queue gate must ALLOW this batch, or the deferral (rc 3) exits before the per-issue arm.
 printf '%s\n' 'ciq_read() { return 0; }' 'ciq_eval() { return 0; }' 'ciq_defer_note_here() { return 0; }' \
@@ -344,7 +350,7 @@ printf '%s\n' 'ciq_read() { return 0; }' 'ciq_eval() { return 0; }' 'ciq_defer_n
 $REAL_GIT -C "$TT" worktree add -q "$TT/.worktrees/tm-6001" -b d5-other 2>/dev/null || true
 O="$DMO5" bash "$DM" "$TT" daniel-ospina/tortoise 6001 > "$T/dm5.out" 2>&1
 d5=$?
-{ [ "$d5" -eq 0 ] && grep -q 'REFUSED (branch assertion)' "$T/dm5.out" \
+{ [ "$d5" -eq 0 ] && grep -Eq 'REFUSED \((branch|repo) assertion\)|refusing to reuse it' "$T/dm5.out" \
     && [ -f "$DMO5/.dispatched-ids" ] && [ ! -s "$DMO5/.dispatched-ids" ] \
     && ! grep -qx '6001' "$DMO5/dispatched.txt"; }; ck "D5 per-issue branch refusal -> exit 0 BUT .dispatched-ids is EMPTY and the row dropped (rc=$d5)" $?
 # ...and the controller's recount, extracted from orch-loop.sh and driven through both shapes.
