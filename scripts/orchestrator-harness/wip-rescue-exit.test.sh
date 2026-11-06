@@ -3353,7 +3353,14 @@ n45_push_domain="pushed nothing running unmeasured detached verify-unanswered pu
           # unmeasured, and contradicted by the same terminal's own [wip] line. Each now has its own.
           FAILED) case "$n45_out" in *"no ref this run wrote pins the uncommitted work at "*'compare that sha before deciding'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
           UNAVAILABLE) case "$n45_out" in *'the rescue NEVER RAN'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac
-            case "$n45_out" in *'refs/wip/<slug> PREDATES this run'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat-predate)" ;; esac ;;
+            # ⛔ AND IT MUST SCOPE THAT TO THE ARCHIVE (P1 — REPRODUCED): the rescue runs AFTER the
+            # branch push, so `push=verify-*|push-killed` + `rescue=UNAVAILABLE` is reachable and those
+            # arms have MEASURED a push — an unscoped "pushed nothing" puts two contradicting
+            # measurements in one terminal (the D4b shape). The branch must be named as a SEPARATE
+            # measurement, and the unmeasured provenance claim ("PREDATES this run") must be gone.
+            case "$n45_out" in *'pushed nothing to refs/wip/<slug>'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat-scope)" ;; esac
+            case "$n45_out" in *'was NOT written by this run'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat-predate)" ;; esac
+            case "$n45_out" in *'PREDATES this run'*) n45_bad="$n45_bad $n45_cell(rescue-caveat-provenance)" ;; *) : ;; esac ;;
           archived-local) case "$n45_out" in *'archived to the LOCAL pin'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
         esac
         case "$n45_tree" in
