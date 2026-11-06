@@ -267,7 +267,7 @@ function decl_operand(p,   q) {
   }
   return (q ~ /(^|[;&|({})])[ \t"']*(export|local|declare|readonly|typeset)([ \t]+-[A-Za-z]+)*$/)
 }
-function residual(pre, tail, s, name, f, ln,   p, t2, v, _r) {
+function residual(pre, tail, s, name, f, ln,   p, t2, v, _r, _arith) {
   # ⛔ A SUBSCRIPT MAY CONTAIN BRACKETS OF ITS OWN (`X[a[0]]=83`) — `[^]]*` stopped at the INNER `]`,
   # matched no arm, and the form read GREEN with 0 rows (review of PR #3237, finding 2, measured).
   # Scan to the ASSIGNMENT instead of to the first bracket. A COMPARISON on an element still stays
@@ -286,7 +286,23 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v, _r) {
   # an assignment operator is GLUED to the `]`, so `X[0]=83` / `X[0]+=83` / `${X[0]:=83}` / a nested
   # `X[a[0]]=83` / an `=`-bearing `X[a==b]=83` all match, while a comparison never does — it has a
   # space or a quote between the bracket and the `=`.
-  if (tail ~ /^\[.*\][:]?\+?=/) { print "unparseable", name, s, f, ln; return }
+  # ⛔ EXCEPT IN ARITHMETIC CONTEXT, WHERE POSITION DISTINGUISHES NOTHING (review round 4, P1 —
+  # measured). Inside `(( ))` spaces around `=` are INSIGNIFICANT, so the glued-operator rule inverts
+  # the verdict twice on the same class: `(( X[0] = 83 ))` and `(( X[0] += 83 ))` ASSIGN 83
+  # (`bash -c 'unset X; (( X[0] = 83 )); echo $X'` → 83) and read GREEN with 0 rows, while
+  # `(( X[0]==83 ))`, which declares nothing, was REFUSED — a fail-open AND a false RED, one space
+  # apart. `==` must stay a comparison (`[^=]` after the `=`), and the bare `X[0] =83` — NOT an
+  # assignment, `bash: X[0]: command not found` — is untouched because it is not arithmetic.
+  # ⛔ AND `==` IS A COMPARISON IN EVERY SPELLING — the glued test lacked the guard too (review round
+  # 4, P1 — measured). `[0]==83` satisfies "an operator GLUED to the `]`" while declaring nothing, so
+  # `(( X[0]==83 ))` was REFUSED as an `unparseable` declaration: a false RED on a comparison, made
+  # while the real assignment `(( X[0] = 83 ))` one space away read GREEN. `[^=]` after the `=` is the
+  # same exclusion the sibling `^=([^=]|$)` arm already uses; `[^=]` still matches every operand that
+  # declares a code (`=83`, `="83"`, `:=83`, `+=83`), so nothing is lost on the fail-closed side.
+  _arith = (pre ~ /\(\([ \t]*$/)
+  if (tail ~ /^\[.*\][:]?\+?=[^=]/ || (_arith && tail ~ /^\[.*\][ \t]*:?[+]?=[^=]/)) {
+    print "unparseable", name, s, f, ln; return
+  }
   # ⛔ A QUOTED OPERAND IS STILL THE SAME BUILTIN: `printf -v "X" %d 83` and `read -r -d "" X`. The
   # anchors below required a TRAILING SPACE, so a quoted argument between the builtin and the name
   # defeated them and the declaration again read GREEN with 0 rows (finding 2). Strip trailing quotes
@@ -376,7 +392,7 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v, _r) {
   }
 }
 # ⛔ `X="${X:-83}"` IS A DECLARATION OF 83 WHEN UNSET (review round 2, P2 — measured), and it is the
-# HOUSE IDIOM for a defaulted constant: `scripts/pi-reap-worktrees.sh:835` declares
+# HOUSE IDIOM for a defaulted constant: `scripts/pi-reap-worktrees.sh:851` declares
 # `REAP_WT_PRESERVE_KEEP_DAYS="${REAP_WT_PRESERVE_KEEP_DAYS:-14}"` exactly that way, and that is the
 # very declaration the registry row in this PR is about. The scanner read the right-hand side as an
 # operand it could not resolve and emitted `unknown` — a RED naming no duplicate, with a message a
@@ -443,7 +459,7 @@ function selfdefault(nm, rhs,   m, head) {
 #       n+=1
 #       if fam.search(s[m.start():]): hits+=1
 #   print(n,hits)"
-#   → 1149 0
+#   → 1161 0
 # ZERO. So this costs the real tree NOTHING, and the real-tree scan is byte-identical (`claims=15`,
 # `unparseable: none`, RC=0). A model would have bought nothing it did not also risk.
 # This SUPERSEDES the earlier "an inline comment is documentation too" rule, which was added to silence
@@ -584,6 +600,14 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
   _fr = scan
   _off = 0
   while (match(_fr, /[A-Z_][A-Z0-9_]*/)) {
+    # ⛔ THE RESOLVED VALUE MUST NOT SURVIVE AN ITERATION (review round 4, P2 — measured). `_vv` is a
+    # function local assigned only on the paths that RESOLVE a value, so when a later name's operand
+    # is unreadable the PREVIOUS name's code is still in it and the `foreign` row below names a
+    # declaration that does not exist: `for A_GATE_MEM in 81; do :; done; for B_GATE_MEM in "$LIST";
+    # do :; done` reported `B_GATE_MEM=81`, while bash binds `B_GATE_MEM=a b`. A false claim about a
+    # SPECIFIC constant is worse than a generic red — a reader acting on it sanctions a name that
+    # declares nothing.
+    _vv = ""
     _nm  = substr(_fr, RSTART, RLENGTH)
     # ⛔ THE PREFIX MUST BE ABSOLUTE, NOT LOCAL TO THE REMAINDER (review round 4, measured). `_p`
     # relative to the CURRENT `_fr` is the whole line only for the FIRST name; for a later one it is
@@ -2014,12 +2038,13 @@ chmod +x "$RO/gh-limit/gh"
 # measured; corrected by the review of `3a94b3b`, which measured the premise below to be FALSE). Once
 # the stub answers, `chain-merge.sh` no longer exits on its own no-PR timeout — it runs the REAL path,
 # and that path has TWO waits, neither of which these rows are about (they assert PROPAGATION):
-#   1. the PHASE wait (`chain-merge.sh:367`) — `while [ ! -f "$PR_PHASE" ] … PHASE_GRACE`. The rig has
+#   1. the PHASE wait (`chain-merge.sh:386`, `while [ ! -f "$PR_PHASE" ] && … PHASE_GRACE`). The rig has
 #      NO `lanemerge-<PR>.phase` marker (`$RO/state` is empty of one: this file mentions `.phase`
 #      nowhere else), so the loop is not skipped — it spins out the DEFAULT `PHASE_GRACE=90` at
 #      `CHAIN_POLL=1s`. That is ~90 s PER ARM, ~4.5 min for the three. Measured on `3a94b3b`: the
 #      three arms finished at 03:12:47, 03:14:27 and 03:16:02 — ~95-100 s each.
-#   2. the HANDOFF wait (`chain-merge.sh:400`) — reachable only when a marker DOES exist; bounded
+#   2. the HANDOFF wait (`chain-merge.sh:419`, `while [ "$waited" -lt "$HANDOFF_WAIT" ]`) — reachable
+#      only when a marker DOES exist; bounded
 #      anyway so a future fixture that plants one cannot make the arm unbounded.
 # `LANE_PHASE_GRACE=1` bounds the first (the one that actually burns today) and `LANE_HANDOFF_WAIT=1`
 # the second — the same class of bound as `CHAIN_POLLS=1` below, stated for the same reason: an arm
@@ -2497,7 +2522,7 @@ ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_
 # corruption fallback), so a sixth gate would be published with the load remedy to the operator, and
 # no check noticed — precisely the hand-maintained-list defect the preamble names as a root cause.
 # The set is derived from the CALLERS' own assignments: `lane.sh` is the ONLY writer of the record's
-# third field (`:572` writes `$_cap_gate` into `state/capacity-refused-<N>`) and `chain-merge.sh` is
+# third field (`:955` — `lane_standdown_write "$_cap_gate" …` — writes it into `state/capacity-refused-<N>`) and `chain-merge.sh` is
 # its only consumer, so `_cap_gate=<word>` over those two files is the population. Both directions
 # are required (a word with no row is unchecked; a row with no word is a dead assertion), and the
 # non-vacuity clause is what stops an EMPTY derivation from passing as equality.
@@ -2864,6 +2889,18 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
 ck "(decl/second-operand) a code in the SECOND operand of \`export\` is still a \`foreign\` row — position must not decide the verdict (rc=$CODE_RC; $CODE_MSG)" $rc
 
+# (d6) A RESOLVED VALUE MUST NOT LEAK INTO THE NEXT NAME (review round 4, P2 — measured). The foreign
+# net's `_vv` was assigned only on the paths that RESOLVE a value, so a later name whose operand is
+# unreadable inherited the PREVIOUS name's code and was published as `foreign B_GATE_MEM=81` — a
+# claim about a specific constant that bash never binds (`for B_GATE_MEM in "$LIST"` binds `a b`).
+# A false NAMED claim is worse than a generic red: a reader acting on it would sanction a name that
+# declares nothing.
+_codemut_dir="$(_codemut loop-stale-value)"
+printf '\nfor A_GATE_MEM in 81; do :; done; for B_GATE_MEM in "$LIST"; do :; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:B_GATE_MEM"*) rc=1 ;; *) rc=0 ;; esac
+ck "(loop/stale-value) an UNREADABLE loop operand does not inherit the PREVIOUS name's code — no \`foreign: …B_GATE_MEM\` row naming a declaration that does not exist (rc=$CODE_RC; $CODE_MSG)" $rc
+
 _codemut_dir="$(_codemut decl-not-builtin)"
 printf '\necho AGENT_DEBUG=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
@@ -2977,6 +3014,8 @@ arith-assign|claim|(( AGENT_NEW_GATE_REFUSED = 83 ))
 array-nested-subscript|unparseable|AGENT_NEW_GATE_REFUSED[a[0]]=83
 printf-v-glued|claim|printf -vAGENT_NEW_GATE_REFUSED %d 83
 array-subscript-eq|unparseable|AGENT_NEW_GATE_REFUSED[a==b]=83
+arith-array-spaced|unparseable|(( AGENT_NEW_GATE_REFUSED[0] = 83 ))
+arith-array-pluseq|unparseable|(( AGENT_NEW_GATE_REFUSED[0] += 83 ))
 subscript-prefix-assign|unparseable|FOO=1 AGENT_NEW_GATE_REFUSED[0]=83
 arith-computed|unparseable|(( AGENT_NEW_GATE_REFUSED = 70 + 13 ))
 read-flag-operand|unparseable|read -u 3 AGENT_NEW_GATE_REFUSED
@@ -3018,17 +3057,21 @@ ck "...and EVERY one of them REDDENS the code check as a NAMED collision or 'unp
 # element COMPARISON (which was red when unquoted and silent when quoted — punctuation deciding a
 # verdict), a `${X#*=}` strip, and a bare `exit "$X"`.
 _codemut_dir="$(_codemut residual-control)"
-printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\n' >> "$_codemut_dir/spawn-gate.sh"
+printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\n(( AGENT_NEW_GATE_REFUSED[0]==83 ))\n(( AGENT_NEW_GATE_REFUSED[0] == 83 ))\n(( AGENT_NEW_GATE_REFUSED[0] != 83 ))\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
-ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip and a bare exit \"\$X\" all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
+ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip, a bare exit \"\$X\", and an ARITHMETIC \`==\` in BOTH spellings all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (f1c2) ⛔ AN INLINE COMMENT NAMING A FAMILY TOKEN IS NOW REFUSED, AND THAT IS DELIBERATE. This is the
 # arm that stops the strip from coming back. Four attempts to model "is this `#` a comment" each failed
 # OPEN (see the block above `row()`), so no text is discarded any more — and the price is that a
 # commented-out declaration reads as a RED instead of being silently ignored. It is the visible
-# direction, and it costs the shipped tree nothing: measured, ZERO of its 1132 inline comments name a
-# family token. A future "helpful" re-introduction of the strip fails HERE, by name.
+# direction, and it costs the shipped tree nothing: measured ZERO — re-run the command above `row()`
+# and the count is however many inline comments the tree has on the day you read it. Two DIVERGENT
+# integers for one measurement (this arm said 1132 while the header said 1149) is the class this file
+# spent four rounds eliminating, so the integer lives in ONE place, with its command, and this arm
+# states only the property that actually justifies the trade. A future "helpful" re-introduction of
+# the strip fails HERE, by name.
 _codemut_dir="$(_codemut inline-comment-decl)"
 printf '\ntrue # AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
