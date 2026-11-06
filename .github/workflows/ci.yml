@@ -600,10 +600,13 @@ jobs:
         # Its own step, not a flag on the step above (one verdict cannot suppress the other).
         run: python3.12 tools/fleet/fleet_health.test.py
       - name: fleet-health REAPER-table mutation evidence (#1862, zero-dep)
-        # The suite above is only a pin if it can FAIL. Four mutations are written to TEMP copies of
-        # the module and re-imported: drop the orphan row (the pre-#1862 module), re-file `orphan` as
-        # `worktree`, drop the label from `REQUIRED_LABELS`, and flatten exit 4 to a benign ok — each
-        # must turn its paired leg RED. Its own step, same rule as every suite here.
+        # The suite above is only a pin if it can FAIL. Eight mutations are written to TEMP copies of
+        # the module and re-imported: the four lane-CENSUS ones (neuter the reconciliation, drop
+        # `attributed`, split the UNVERIFIED tails on `attributed` instead of the note, and let the
+        # census speak about a roster it could not read), plus the four #1862 reaper ones (drop the
+        # orphan row, re-file `orphan` as `worktree`, drop the label from `REQUIRED_LABELS`, and
+        # flatten exit 4 to a benign ok) — each must turn its paired leg RED. Its own step, same rule
+        # as every suite here.
         run: python3.12 tools/fleet/fleet_health.test.py --red-control
       - name: Outcome-canary suite (fleet outcome assertions, zero-dep)
         # The fleet's failures are OUTCOMES that are absent while every component is up: a

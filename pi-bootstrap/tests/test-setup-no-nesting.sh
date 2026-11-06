@@ -1883,10 +1883,32 @@ time.sleep(60)' "$zpid_file" &
 open(sys.argv[1], "a").close()
 os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   write_prom_store "$$"
+  # ⛔ MAKE THE CPU-DELTA BRANCH DETERMINISTIC (review cycle 14, finding 1). The strict anchor below
+  # requires the lane to be filed as a SUSPECT, and the ladder files one only when it prints a `**`
+  # verdict. It prints the `(identity unmatched — not attributable)` form instead whenever the
+  # recorded pid CONSUMED CPU — so whether this leg passed depended on whether a whole-second
+  # `ps -o cputime=` tick landed between run (g) and this one. That is not a fixture, it is a race.
+  # Seeding the previous snapshot with an IMPOSSIBLY LARGE cpu seconds makes the delta negative, so
+  # the ladder deterministically prints `** SUSPECT: quiet Ns AND no CPU consumed **` and the leg
+  # asserts its stated property rather than whichever branch the host happened to take.
+  # (review cycle 14 also found the previous relaxation WRONG: accepting the
+  # `quiet … identity unmatched — not attributable` row made this leg pass on a body whose summary
+  # read `✅ no suspects` over a 20-minute-stale lane — the exact state its own header says must fail.
+  # The relaxation is gone; only the suspect bullet is accepted again.)
+  mkdir -p "$phome/.pi/agent/state"
+  python3 -c 'import json,sys,time
+json.dump({sys.argv[2]: {"cpu": 1e9, "at": time.time()}}, open(sys.argv[1], "w"))' \
+    "$phome/.pi/agent/state/fleet-health-prev.json" "$$"
   out="$(run_promotion)" || true
   if grep -q "PID DEAD" <<<"$out"; then
     fail "$label: off-fence + stale transcript read PID DEAD"
-  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+  # ⛔ THE LANE'S OWN BULLET, NOT THE `suspect(s)` TOKEN (measured 2026-11-03). `fleet-health.py`'s
+  # census now files `- census: LANE CENSUS MISMATCH ...` in the same list, so on any box with a
+  # running `pi` process the generic token is satisfied by the CENSUS ALONE — even when this
+  # lane's suspect was dropped, which is exactly the regression this leg exists to catch. Keyed on
+  # the lane bullet so only the lane's own suspect can satisfy it. The delta is seeded above, so the
+  # bullet is deterministic and no relaxation is needed.
+  elif grep -q "PID ? (off-fence)" <<<"$out" && grep -qE '^[[:space:]]+- B1:' <<<"$out"; then
     echo "ok: $label an abstaining lane with a stale transcript stays a SUSPECT (the abstention does not suppress the ladder)"
   else
     fail "$label: abstention SUPPRESSED the suspect ladder — a stale lane read as clean: $(grep -E '^B1 |no suspects' <<<"$out")"
@@ -1898,7 +1920,10 @@ os.utime(sys.argv[1], (time.time() - 1200, time.time() - 1200))' "$tfile"
   # captured with `|| rc=$?` because `out="$(cmd)"; rc=$?` aborts the suite under `set -e`.
   printf '{"sessions":{' > "$store"
   rc=0; out="$(run_promotion)" || rc=$?
-  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out" && grep -q "suspect(s)" <<<"$out"; then
+  # Same reasoning as (h): pin the LANE's bullet. (Here the census is silent because the store
+  # read failed, but the token must not be satisfiable by any other channel that happens to file
+  # a suspect — this assertion is about the stale LANE, and must stay about it.)
+  if [ "$rc" -eq 1 ] && grep -q "INCOMPLETE" <<<"$out" && grep -qE '^[[:space:]]+- B1:' <<<"$out"; then
     echo "ok: $label unreadable hook store ⇒ INCOMPLETE (exit 1) and the stale lane is still a SUSPECT"
   else
     fail "$label: unreadable hook store did not abstain (rc=$rc): $(grep -E '^B1 |no suspects|INCOMPLETE' <<<"$out")"
