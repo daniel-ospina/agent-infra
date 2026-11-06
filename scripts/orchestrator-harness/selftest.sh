@@ -1299,6 +1299,18 @@ PY
   O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-real.sh" > "$TMP/holderinc-noreg.out" 2>&1
   case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "holder-only INCOMPLETE with NO claim registry on the box is NOT queued" $rc
+  # ⛔ AND THE ARM MUST SHOW ITS OWN SUBJECT ANSWERED (review of this change, P2). "Not queued" ALONE
+  # cannot tell the real reader's INCOMPLETE (rc 2) from a call that never found a reader: an empty
+  # extraction gives rc 127, and the loop body's own "unrecognised verdict" default
+  # (refresh-candidates.sh:4617) resolves 127 to INCOMPLETE too — so on a drifted signature
+  # (`sed` is anchored on the literal `^issue_claim_verdict() {`) this arm stayed GREEN while proving
+  # nothing, which is the exact class this arm was rewritten to fix. Pin the producer's sentence, the
+  # way `(2952b)` already does, so the drift reds THIS arm instead of silencing it.
+  case "$(cat "$TMP/holderinc-noreg.out")" in
+    *"is NOT INSTALLED"*) rc=0 ;;
+    *) rc=1; echo "      out: $(grep -F '#10' "$TMP/holderinc-noreg.out" | head -3)" ;;
+  esac
+  ck "…and the refusal names the MISSING registry (the real reader answered, not a 127 fallback)" $rc
   mv "$HI/claims.sh.away" "$HI/claims.sh"
   # (iii) a SECOND unreadable surface means the tool could not judge the work: no re-route.
   HI2="$TMP/holderinc2"; mkdir -p "$HI2/fakesc/.venv/bin"
@@ -2389,8 +2401,18 @@ ck "reaching MAX_FIX_TRIES parks the PR instead of re-reviewing forever" $rc
 # exists — a pin on the spelling reds on a rename while proving nothing. What the chain path depends on
 # is that the spawn guard consults the CROSS-BOX lease (which is exactly what the chain writes and
 # releases), so assert that call survives inside `claim_live()`.
-sed -n '/^claim_live() {/,/^}$/p' "$LOOP" | grep -q 'claim_lease_live "\$1"' && rc=0 || rc=1
-ck "controller honours the claim written by the chain path (the spawn guard consults the cross-box lease)" $rc
+# ⛔ AND A BODY PIN ALONE IS NOT A CALL-SITE PIN (review of this change, P2). Pinning only
+# `claim_live()`'s body stays GREEN with NOTHING calling it — measured: replace `orch-loop.sh:3272`
+# with `:` and the body still matches, so the arm passed while the controller honoured no claim at all,
+# which is the exact vacuity this change exists to remove. So pin BOTH: a call site exists
+# (`claim_live "`, spelling-agnostic so a `$PR`→`$pr` rename cannot red it) AND the callee consults
+# the lease.
+# ⛔ SCOPE, STATED: that call site is `pr_owner_live`'s `PL_MOD=0` fallback. With the liveness module
+# present (`PL_MOD=1`, the normal path in this repo) ownership is decided by `pr_owned`/`pl_verdict`
+# instead, so this arm covers the SPAWN-GUARD FALLBACK — which is what its name now says. Pinning the
+# `PL_MOD=1` chain is a separate gap, not silently claimed here.
+sed -n '/^claim_live() {/,/^}$/p' "$LOOP" | grep -q 'claim_lease_live "\$1"' && grep -q 'claim_live "' "$LOOP" && rc=0 || rc=1
+ck "the spawn-guard fallback honours the claim written by the chain path (a caller reaches claim_live, which consults the cross-box lease)" $rc
 
 # ── 10) template / renderer placeholder parity ───────────────────────────────────
 tpl="$(grep -oE '__[A-Z_]+__' "$HERE/launchd.plist.template" | sort -u)"
