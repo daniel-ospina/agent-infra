@@ -581,8 +581,11 @@ else
         # ⛔ ON ITS OWN FRESH CLONE (review P1, 2026-11-06). Run on the clone above — as this arm used
         # to — the branch is ALREADY checked out at $_awt, so `wt_provision` takes its "branch $br is
         # already checked out at <other path>" arm and returns 2 BEFORE `$base` is ever read
-        # (wt-lifecycle.sh:344-365; `base` is consulted only by `wt_ahead_count` and the
-        # `worktree add -b` branch). Measured: rc=2 with the CORRECT base too, so the old arm's
+        # (the `elif` arm on `symbolic-ref --short HEAD = "$br"` in `wt-lifecycle.sh`'s `wt_provision`;
+        # `base` is consulted only by `wt_ahead_count` and the `worktree add -b` branch — cited by
+        # SYMBOL, not by line: this diff's own 110-line insertion into `wt-lifecycle.sh` moved the
+        # ranges these three citations used to name (`344-365`, `298-301`, `394-419`), so a line number
+        # here is a stale number waiting to happen). Measured: rc=2 with the CORRECT base too, so the old arm's
         # "non-zero ⇒ the 4th argument is load-bearing" verdict was decided by the PATH, not the argv —
         # and rc=127 (library absent) printed OK too. A fresh clone makes the base the only variable.
         # ⛔ BOTH SPELLINGS OF THE CORRECT BASE (review P2, 2026-11-06). Pinning the rewrite to one
@@ -611,7 +614,8 @@ else
                     *"worktree add failed"*) _mbase=1 ;;
                     *) _mbase=0 ;;
                 esac
-                # wt_provision's WHOLE contract (wt-lifecycle.sh:298-301): 0 = a usable worktree exists
+                # wt_provision's WHOLE contract (the rc rows of `wt_provision`'s doc comment in
+                # `wt-lifecycle.sh` — cited by SYMBOL, not by line): 0 = a usable worktree exists
                 # (what the shipped arm asserts); 1 = nothing created and nothing left behind — the clean
                 # mutant measurement; 3 = the SAME worktree-add failure whose ROLLBACK also failed, so
                 # residue remains (it returns 3 BEFORE setting the 'worktree add failed' account, so
@@ -640,7 +644,9 @@ else
         # — `wt_provision` must ATTACH it (`worktree add "$path" "$br"`), not refuse on `-b`.
         # ⛔ THE BRANCH MUST HOLD WORK (review P2, 2026-11-06). The previous fixture pointed the local
         # branch AT refs/remotes/origin/$BR — 0 commits ahead — which `wt_provision` classifies as a
-        # GHOST and CAS-DELETES before taking the `-b` path (wt-lifecycle.sh:394-419). So this arm drove
+        # GHOST and CAS-DELETES before taking the `-b` path (the `A ghost:` arm inside `wt_provision`
+        # that ends in `WT_RESULT="refs/heads/$br is a 0-ahead ghost …"` — cited by SYMBOL, not by
+        # line). So this arm drove
         # the SAME code as (a) while reporting "ALREADY-LOCAL branch … no -b collision", and the attach
         # path `adopt-fix.sh:35-37` calls "the normal adopt case" was covered by nothing. The assertion
         # is on the DISTINGUISHING EFFECT — the materialised HEAD is the LOCAL commit, not `origin/$BR`
