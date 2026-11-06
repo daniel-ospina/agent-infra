@@ -198,9 +198,13 @@
 # ⛔ THE DECLARED RESIDUAL. A check NAME main never publishes cannot be shown to be "a check
 # main itself fails", so there is no evidence to exclude it and it keeps blocking. Measured on
 # this repo: `ci.yml` declares a `verify` job; `ci-main.yml` declares NO `verify` job at all
-# (its jobs are extension-tests, script-validate, skill-lint, cost-config-guard,
-# sigpipe-grep-guard, pi-config-extensions-guard, python-ci, auto-file-on-failure), so main can
-# never publish that NAME and this rule can never fire for it.
+# (`grep -rn '^  verify:' .github/workflows/` → `ci.yml:371` only), so main can never publish
+# that NAME and this rule can never fire for it.
+# ⛔ NO ENUMERATION OF THE BASE'S JOBS BELONGS HERE, and this line is the scar: an earlier
+# revision listed them and MISSED `bash32-parse-guard` — a pattern that does not admit digits
+# skips it — which is the same "absence asserted without resolving coverage" mistake the
+# paragraph below warns about, committed inside the paragraph. Name the ONE fact that carries
+# the argument and let a reader run the grep.
 # ⛔ THE UNIT HERE IS THE NAME, NOT THE PROGRAM, and the difference decides which fix is owed.
 # Many of the programs the `verify` job runs DO run on main — some named literally in
 # ci-main.yml, others picked up by the `extension-tests` job's globs — but under OTHER JOB
@@ -224,7 +228,8 @@
 # it: `named_unattributable_runs` (step 1c) still names it, and #3415's `bash-shard::`
 # reproduction still runs the residual on a pristine base worktree and refuses anything
 # the base does NOT reproduce. A PR-caused failure inside a shared shard is therefore
-# refused for its OWN reason, after this exclusion. The exclusion is a statement about a
+# refused for its OWN reason — and it is refused BEFORE this exclusion is ever reached, since
+# both attribution legs run ahead of §4.5. The exclusion is a statement about a
 # NAME the base already fails; it is never a licence for a NEW failure inside that name.
 # ⛔ WHAT THE SUITE DOES AND DOES NOT PROVE. §80's fixtures carry no failing run, so the
 # "blocked by the decision -> re-run" leg is not entered and §4.5 is the SOLE blocker in
