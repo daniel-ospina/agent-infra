@@ -134,6 +134,27 @@ if [ "$1" = "api" ] && [ "$2" = "-X" ] \
     exit 0
 fi
 if [ "$1" = "api" ]; then
+    # #1224 — the review-evidence COMMENT: the copy that TRAVELS (a CI runner's
+    # $HOME has no record store, and the record file is per box). Placed before
+    # every other arm because the LIST form `issues/<n>/comments` must not be
+    # shadowed by the evidence arms below, which key on `issues/comments/<id>`
+    # (singular, with an id) and are a different surface.
+    #   STUB_COMMENTS         → the list read's `.[].body` answer (already-posed
+    #                           markers, for the idempotency pin).
+    #   STUB_COMMENTS_FAIL=1  → a transient READ failure: the comment post must
+    #                           then be SKIPPED, not duplicated.
+    #   STUB_COMMENT_CAPTURE  → sink for a POST body, so the suite can assert the
+    #                           COMMENT really carries the marker.
+    if grep -qE -- "/issues/[0-9]+/comments" <<<"$*"; then
+        if grep -qF -- "--jq" <<<"$*"; then
+            [ "${STUB_COMMENTS_FAIL:-0}" = "1" ] && exit 1
+            printf '%s' "${STUB_COMMENTS:-}"
+            exit 0
+        fi
+        if [ -n "${STUB_COMMENT_CAPTURE:-}" ]; then cat >"$STUB_COMMENT_CAPTURE"; else cat >/dev/null; fi
+        printf '{}\n'
+        exit 0
+    fi
     # #633 review finding 2: model the TRANSPORT, not just the URL. Real `gh api`
     # switches to POST as soon as ANY `-f`/`-F` parameter is added, and
     # `GET /commits/{ref}/check-runs` is GET-only — so a parameterized call with
@@ -611,6 +632,187 @@ else
     bad "evidence PATCH posted"
 fi
 [ -f "$Q6" ] && ok "record written in guard+evidence flow" || bad "record written in guard+evidence flow"
+
+# ── #1224 — ONE MINT, TWO ARTIFACTS, AND THEY MUST AGREE ──────────────────
+# check (c) now reads the head-bound RECORD FILE first and falls back to the
+# BODY marker only when no record covers the head (agent-infra#1224). That makes
+# AGREEMENT between the two a correctness property: if one run could write a
+# record at head H with verdict V and append a marker naming a DIFFERENT
+# revision, the fallback would be evidence for a revision nobody recorded — the
+# gate's own fallback certifying an unreviewed head. The assertion is on the
+# (pr, verdict, head, repo) fields only; the marker's optional ` diff=`/` sig=`
+# are tolerated, because those are the producer's signing/CARRY contract (#2982)
+# and are not part of the binding the gate reads.
+# The SECOND run pins idempotency from the outside: the record must come back
+# BYTE-IDENTICAL (no churned `reviewed_at`; the #1709 rec 7 no-op is §15.4) and
+# the body post must remain a no-op-once-posted append (§12). Together they are
+# what makes a duplicate execution harmless — and a duplicate execution is the
+# documented remedy for a skipped post.
+Q6V="$(sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6H="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6_RE="review recorded: reviews/424246\.json verdict=${Q6V} @ ${Q6H}( diff=[0-9a-f]{64})? \(daniel-ospina/agent-infra\)( sig=[0-9a-f]{64})?$"
+Q6_RE_SIG="review recorded: reviews/424246\.json verdict=${Q6V} @ ${Q6H}( diff=[0-9a-f]{64})? \(daniel-ospina/agent-infra\)( sig=[0-9a-f]{64})?"
+cp "$Q6" "$T/q6-before.json" 2>/dev/null || true
+P1224="$T/p1224-patch.json"; : > "$P1224"
+STUB_CAPTURE="$P1224" run_record "daniel-ospina/agent-infra" 424246
+# The capture is the PATCH payload (`{"body": "…"}`, exactly what the producer
+# sends), so the assertion reads `.body` rather than grepping the JSON envelope —
+# the envelope would defeat the end-anchor below. Without jq the raw file is read:
+# the marker line is then embedded in JSON and the anchor simply does not apply.
+P1224_BODY="$T/p1224-body.txt"
+if command -v jq >/dev/null 2>&1; then
+    jq -r '.body // ""' "$P1224" > "$P1224_BODY" 2>/dev/null || cp "$P1224" "$P1224_BODY"
+else
+    cp "$P1224" "$P1224_BODY"
+fi
+if [ "$RECORD_RC" = "0" ] && grep -qE "$Q6_RE" "$P1224_BODY" 2>/dev/null; then
+    ok "#1224 the body marker and the record AGREE on (pr, verdict, head, repo) — the gate's fallback is evidence for the revision the record certifies"
+else
+    bad "#1224 the body marker and the record DISAGREE (or the re-run posted nothing) — check (c)'s fallback would certify a different revision than the record"
+fi
+if cmp -s "$Q6" "$T/q6-before.json"; then
+    ok "#1224 a duplicate run left the record BYTE-IDENTICAL (idempotent — reviewed_at not churned)"
+else
+    bad "#1224 a duplicate run REWROTE the record (non-idempotent write / reviewed_at churn)"
+fi
+unset P1224 P1224_BODY
+
+# ── #1224 review finding 3 — THE RECORD FILE IS SIGNED ────────────────────
+# The record store is private and leaves NO trace on the PR, so the gate now
+# accepts a record as evidence only when its `sig` verifies. That is a CONTRACT
+# between two files: the canonical text is declared once in the gate
+# (`review_record_sig_text`) and once here (`record_sig_for`), and a divergence
+# would make every legitimate record unusable while each file kept passing its
+# own tests. This assertion recomputes the GATE's text and checks the producer's
+# file against it, so a drift reds the producer's suite.
+Q6_SIG="$(sed -n 's/.*"sig":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6_EXPECT="$(printf '%s' "review-record:v1:424246:${Q6H}:${Q6V}:daniel-ospina/agent-infra" \
+    | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+if [ -n "$Q6_SIG" ] && [ "$Q6_SIG" = "$Q6_EXPECT" ]; then
+    ok "#1224 the record FILE carries a sig= over the gate's canonical text (pr,head,verdict,repo) — the private artifact is authenticated, not merely well-shaped"
+else
+    bad "#1224 the record FILE's sig= does not verify over the gate's canonical text (got: ${Q6_SIG:-<absent>}, want: $Q6_EXPECT) — the gate would refuse every legitimate record"
+fi
+unset Q6_SIG Q6_EXPECT
+
+# ── #1224 review finding 2 — THE COPY THAT TRAVELS IS A PR COMMENT ──────────
+# The required `pipeline-compliance` check runs on a clean CI runner whose $HOME
+# has no `~/.pi/agent/reviews`, so a record-first gate can never answer there.
+# The marker must therefore also land in a PR COMMENT (`gh pr edit` cannot wipe
+# one) — and posting it must be IDEMPOTENT, because the documented remedy for a
+# skipped post is to re-run the recorder, and a re-run that re-posted would
+# bury the timeline.
+Q1224C="$T/p1224-comment.json"; : > "$Q1224C"
+STUB_COMMENT_CAPTURE="$Q1224C" run_record "daniel-ospina/agent-infra" 424246
+Q1224C_BODY="$T/p1224-comment-body.txt"
+if command -v jq >/dev/null 2>&1; then
+    jq -r '.body // ""' "$Q1224C" > "$Q1224C_BODY" 2>/dev/null || cp "$Q1224C" "$Q1224C_BODY"
+else
+    cp "$Q1224C" "$Q1224C_BODY"
+fi
+if [ "$RECORD_RC" = "0" ] && grep -qE "$Q6_RE_SIG" "$Q1224C_BODY" 2>/dev/null; then
+    ok "#1224 the review attestation is ALSO posted as a PR COMMENT — the copy a body edit cannot wipe and a CI runner CAN read"
+else
+    bad "#1224 no PR COMMENT carrying the marker was posted — the fix stays inert on the required check, whose runner has no record store (finding 2)"
+fi
+# IDEMPOTENCE: the marker is already in the list, so a re-run must post nothing.
+# ⛔ THE FIXTURE SPEAKS THE FRAME THE GATE ADMITS (review finding 2): the read asks
+# for `"<author_association>\u001f<body>"` and the "already present" test requires a
+# TRUSTED association AND the body equal to the marker. The old fixture handed a
+# bare body, which is why a plain line-grep looked correct.
+Q1224D="$T/p1224-comment-2.json"; : > "$Q1224D"
+STUB_COMMENTS="OWNER"$'\037'"$(cat "$Q1224C_BODY")"$'\036' STUB_COMMENT_CAPTURE="$Q1224D" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224D" ]; then
+    bad "#1224 a re-run DUPLICATED the evidence comment (the marker was already there) — every re-record would bury the timeline"
+else
+    ok "#1224 a re-run posts NO second comment when the marker is already present (idempotent, like the body append)"
+fi
+# ⛔ NEGATIVE CONTROL 1 — AN UNATTESTED AUTHOR IS NOT "ALREADY PRESENT". On a public
+# repo the marker is visible in the PR body, so ANY account can paste it; treating
+# that as delivered would (a) skip the producer's own post forever and (b) let an
+# unprivileged account suppress the only evidence channel CI can read. Reverting the
+# association test reddens THIS vector and leaves the idempotency one green.
+Q1224F="$T/p1224-comment-4.json"; : > "$Q1224F"
+STUB_COMMENTS="NONE"$'\037'"$(cat "$Q1224C_BODY")"$'\036' STUB_COMMENT_CAPTURE="$Q1224F" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224F" ]; then
+    ok "#1224 a marker pasted by an UNATTESTED account does not count as delivered — the producer posts its own copy"
+else
+    bad "#1224 an unattested commenter's pasted marker SUPPRESSED the producer's post — any account could silence the evidence channel, and the run would report it delivered (finding 2)"
+fi
+# ⛔ NEGATIVE CONTROL 2 — A QUOTING COMMENT IS NOT "ALREADY PRESENT". The gate
+# requires the marker to be the comment's WHOLE body; a multi-line comment that
+# merely CONTAINS the marker line is REFUSED by the gate, so honouring it here would
+# report delivery for an artifact the gate throws away.
+Q1224G="$T/p1224-comment-5.json"; : > "$Q1224G"
+STUB_COMMENTS="OWNER"$'\037'"Here is the attestation I saw:
+$(cat "$Q1224C_BODY")
+— a reviewer quoting it"$'\036' STUB_COMMENT_CAPTURE="$Q1224G" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224G" ]; then
+    ok "#1224 a QUOTING comment does not count as delivered — the whole-body rule matches the gate"
+else
+    bad "#1224 a comment that merely QUOTED the marker suppressed the producer's post — the producer would report delivery for an artifact the gate refuses (finding 2)"
+fi
+# ⛔ NEGATIVE CONTROL 3 — A MARKER AS THE FIRST LINE WITH TEXT BENEATH IT (review
+# round 3 finding 1a). This is the shape that fooled the LINE-based reader: line 1
+# is "OWNER\x1f<marker>", so `$1 == OWNER` and `body == marker` both held, the
+# producer skipped its own post and reported DELIVERED — while the gate requires the
+# marker to be the WHOLE body and refuses that comment. This is a human paste, not
+# an attack, and the producer's comment was never posted again.
+Q1224J="$T/p1224-comment-9.json"; : > "$Q1224J"
+STUB_COMMENTS="OWNER"$'\037'"$(cat "$Q1224C_BODY")"$'\n'"One line of context under it"$'\036' STUB_COMMENT_CAPTURE="$Q1224J" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224J" ]; then
+    ok "#1224 a comment whose FIRST LINE is the marker but which continues beneath it does NOT count as delivered — the whole-body rule is what the gate applies"
+else
+    bad "#1224 a marker with a note under it suppressed the producer's post — the comment is not the artifact the gate admits, so the evidence was never delivered (finding 1a)"
+fi
+# ⛔ THE DELIMITER STRIP IS A SOURCE-LEVEL CONTRACT, so it is pinned at the source
+# (review round 3 finding 1b). A behavioural vector cannot see it: the `gh` stub
+# returns the ALREADY-JQ'd frame, so a producer that forgot the `gsub` would be fed
+# a frame it never produced. The gate strips 0x1e/0x1f from every comment body
+# before framing (its REVIEW_COMMENTS_JQ, pinned by the gate's own 1224T), so a
+# comment body can never manufacture a second record. Without the strip HERE an
+# unattested account could satisfy the producer's dedup and suppress its post.
+Q14STRIP="$(grep -c 'gsub("\[\\u001e\\u001f\]"; "")' "$RECORD" 2>/dev/null || echo 0)"
+Q14TERM="$(grep -c 'u001e' "$RECORD" 2>/dev/null || echo 0)"
+if [ "${Q14STRIP:-0}" -ge 1 ] && [ "${Q14TERM:-0}" -ge 1 ]; then
+    ok "#1224 the comment read strips BOTH frame delimiters and terminates records (0x1e/0x1f) — the same frame the gate builds, so a comment body cannot forge a record"
+else
+    bad "#1224 the producer's comment read does not strip/terminate the frame (strip=$Q14STRIP term=$Q14TERM) — an unattested commenter could forge an admitted record and suppress the evidence post (finding 1b)"
+fi
+unset Q14STRIP Q14TERM
+# A FAILED LIST READ IS NOT "NO COMMENTS": posting on it would duplicate the
+# evidence on every transient API error, so the post must be skipped instead.
+Q1224E="$T/p1224-comment-3.json"; : > "$Q1224E"
+STUB_COMMENTS_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224E" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224E" ]; then
+    bad "#1224 an unreadable comment list was treated as 'no comment' and the evidence was re-posted — a transient 5xx duplicates evidence"
+else
+    ok "#1224 an unreadable comment list SKIPS the post (skipped, never duplicated)"
+fi
+# ── THE BODY-READ-FAILURE ARM: exit 0 ONLY when the comment VERIFIABLY posted ──
+# (prior review finding 3: reverting this whole arm — or making the comment post
+# return 0 unconditionally — left the suite 970/0 GREEN, so the exit-0/exit-5
+# contract had no coverage at all and the false-delivery claim was invisible.)
+# ONE VECTOR PER OUTCOME, so each half of the contract is separately load-bearing:
+#   (a) body read fails, comment posts        ⇒ rc 0 (CI CAN see the marker)
+#   (b) body read fails, comment CANNOT post   ⇒ rc 5 (`body-marker-unposted`)
+Q1224H="$T/p1224-comment-6.json"; : > "$Q1224H"
+STUB_BODY_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224H" run_record_rc "daniel-ospina/agent-infra" 424248 "$SHA"
+if [ "$RECORD_RC" = "0" ] && [ -s "$Q1224H" ]; then
+    ok "#1224 a body-read failure still exits 0 WHEN the evidence comment posted — the marker is visible to the required check, so the run is a success, not a false green"
+else
+    bad "#1224 a body-read failure did not use the comment channel (rc=$RECORD_RC, comment_posted=$([ -s "$Q1224H" ] && echo yes || echo no)) — either a review that IS evidenced reports failure, or it reports success with nothing delivered"
+fi
+Q1224I="$T/p1224-comment-7.json"; : > "$Q1224I"
+STUB_BODY_FAIL=1 STUB_COMMENTS_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224I" run_record_rc "daniel-ospina/agent-infra" 424249 "$SHA"
+Q1224I_PENDING="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424249.marker"
+if [ "$RECORD_RC" = "5" ] && [ ! -s "$Q1224I" ] && [ -f "$Q1224I_PENDING" ]; then
+    ok "#1224 with NEITHER channel available the run exits 5 (body-marker-unposted) and KEEPS the pending marker — a failed delivery is a named state, never a warning on a zero exit"
+else
+    bad "#1224 a double delivery failure was not reported as the named exit-5 state (rc=$RECORD_RC, posted=$([ -s "$Q1224I" ] && echo yes || echo no), pending=$([ -f "$Q1224I_PENDING" ] && echo yes || echo no)) — the record would be invisible to CI while the run looks successful"
+fi
+unset Q1224H Q1224I Q1224I_PENDING
+unset Q1224C Q1224C_BODY Q1224D Q1224E Q1224F Q1224G Q1224J Q6V Q6H Q6_RE Q6_RE_SIG
 
 echo "── 7. Stale-sha refusal: mismatched head → exit 3, no record ────"
 MISMATCH_SHA="$(printf 'b%.0s' $(seq 1 40))" # 40×b — stub answers aaaa…, so bbbb… is stale
@@ -4712,6 +4914,65 @@ FL_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$F
 # other assertion here, and the empty-pending-file mutant did exactly that.
 if grep -qF -- "-X PATCH" "$LOG"; then ok "14.10b the flush actually PATCHed the body (transport, not just an exit code)"; else bad "14.10b the flush exited 0 without a PATCH — deletion is not delivery (log: $(cat "$LOG"))"; fi
 assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
+# 14.10q A BODY THAT ONLY *QUOTES* THE MARKER IS NOT DELIVERY (review round 2
+#       finding 3). `post_marker` tested the marker with `grep -qF` — a SUBSTRING
+#       test — while the gate anchors `^…$`. Measured before the fix: a body that
+#       merely quoted the marker made `--flush-pending` return 0, print "delivered",
+#       and DELETE the pending file — defect A on the retry channel, destroying the
+#       only surviving copy of a marker that was never delivered. The vector needs
+#       BOTH halves: a PATCH must happen, and the delivered body must carry the
+#       marker as its OWN line.
+Q14C_MARKER='review recorded: reviews/424329.json verdict=clean @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)'
+mkdir -p "$F_HOME/.pi/agent/reviews/pending"
+printf '%s\n' "$Q14C_MARKER" > "$PEND14"
+Q14C_CAP="$T/flushcap14c"; : > "$Q14C_CAP"; : > "$LOG"
+Q14C_RC=0
+Q14C_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$Q14C_CAP" \
+    STUB_BODY="A reviewer pasted this into their notes: $Q14C_MARKER — quoted mid-line" \
+    bash "$RECORD" --flush-pending 424329 daniel-ospina/agent-infra 2>&1)" || Q14C_RC=$?
+if grep -qF -- "-X PATCH" "$LOG"; then
+    ok "14.10q a body that merely QUOTES the marker is not delivery — the flush PATCHed (transport, not an early return)"
+else
+    bad "14.10q the flush treated a QUOTED marker as delivered and did not PATCH (log: $(cat "$LOG")) — the pending marker would be deleted undelivered"
+fi
+if grep -qF -- '\n\nreview recorded: reviews/424329.json verdict=clean @ ' "$Q14C_CAP" 2>/dev/null; then
+    ok "14.10q …and the delivered body carries the marker as its OWN line, which is what the gate anchors on"
+else
+    bad "14.10q the delivered body does not carry the marker as its own line — the gate would still refuse it"
+fi
+assert_eq "$Q14C_RC" "0" "14.10q the flush succeeds once it really delivers (rc 0)"
+unset Q14C_MARKER Q14C_CAP Q14C_RC Q14C_OUT
+
+# 14.10u AN UNSIGNED MARKER IS NEVER PUBLISHED AS A COMMENT (review round 2
+#       finding 4: dropping the `MARKER_SIGNED` guard left the suite 974/0 green,
+#       though the guard is a stated doctrine and it gates the exit-0/5 contract).
+#       With no gate key the marker cannot be signed, so the comment channel must
+#       not be used at all — not even attempted.
+Q14E_CAP="$T/p1224-comment-8.json"; : > "$Q14E_CAP"
+# ⛔ IT MUST REACH THE COMMENT STAGE (review round 3 finding 2). The first version of
+# this vector minted a bare `clean` with NO `--evidence`, so it died at the
+# tortoise#7391 guard (rc 3) and never built a marker — vacuous, and the guard it
+# claimed to pin stayed removable with the suite green (measured). `--evidence`
+# lets the mint proceed, and the transport assertion below proves the comment
+# endpoint was never even called.
+Q14E_RC=0
+# ⛔ STUB_EVIDENCE_PR IS LOAD-BEARING (verification pass): without it the stub answers
+# the evidence read with `parent: …/issues/0`, the tortoise#7391 guard refuses
+# (`rc 3`) and NO marker is ever built — so the vector was satisfied by "nothing
+# ever happened" and deleting the guard stayed green. Measured: with it set the mint
+# proceeds (rc 0) and dropping the guard makes the comment POST (capture=138 bytes).
+# The pass condition ALSO requires the mint to have happened, so the vector cannot
+# go vacuous again silently.
+Q14E_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_COMMENT_CAPTURE="$Q14E_CAP" \
+    STUB_EVIDENCE_PR=424252 AI_REVIEW_GATE_KEY="" \
+    bash "$RECORD" 424252 "$SHA" clean daniel-ospina/agent-infra --evidence comment:1 2>&1)" || Q14E_RC=$?
+if [ "$Q14E_RC" = "0" ] && [ ! -s "$Q14E_CAP" ] && ! grep -qE "X POST repos/[^ ]*/issues/[0-9]+/comments" "$LOG"; then
+    ok "14.10u an UNSIGNED marker is NOT published as a comment (mint succeeded, endpoint never called) — a comment cannot be retracted and an unsigned marker is never evidence"
+else
+    bad "14.10u the unsigned-marker rule did not hold (rc=$Q14E_RC — 3 means the mint never happened, so the vector proves nothing; capture=$([ -s "$Q14E_CAP" ] && echo yes || echo no), log: $(grep -oE 'X POST repos/[^ ]*/issues/[0-9]+/comments' "$LOG" | head -1)) — the gate can never accept an unsigned marker, and a published one cannot be undone"
+fi
+unset Q14E_CAP Q14E_RC Q14E_OUT
+
 # 14.10d an EMPTY pending file is NOT a delivered marker (cycle-2 P1: the helper
 #       used to `rm -f` it and return 0, so the flush claimed delivery and then
 #       destroyed the only copy).
