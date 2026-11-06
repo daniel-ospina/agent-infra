@@ -2107,7 +2107,7 @@ lane_end_next() {
       refs/wip/*)
         # ⛔ THE THIRD ARM OF THE SAME INVARIANT (review of PR #3399 round 13, P2 — REPRODUCED). `pushed`
         # is granted against the PROVEN push url, and `bg-rescue-wip.sh` writes the archive with
-        # `git push -q origin "$C:refs/wip/$SLUG"` (lines 308/313) — a PUSH, which honours
+        # `git push -q origin "$C:refs/wip/$SLUG"` (lines 328/333/354, all three push functions) — a PUSH, which honours
         # `remote.origin.pushurl`. This instruction was a FETCH through `origin`, which honours
         # `remote.origin.url`. With the two diverging (a configuration this code deliberately supports)
         # the archive lands in the push repository and the artifact's own command answers `fatal:

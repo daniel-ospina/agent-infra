@@ -2721,7 +2721,7 @@ n49c="$( bash -c '
 case "$n49c" in *'are NOT on origin either'*) rcn49c=1 ;; *'LOCAL refs/remotes/*'*) rcn49c=0 ;; *) rcn49c=1 ;; esac
 ck "N49c …and for refused-protected, the other member that reaches the helper" $rcn49c
 # ⛔ N50 — THE ARCHIVE RECOVERY NAMES THE PROVEN PUSH URL (review of PR #3399 round 13, P2 — REPRODUCED).
-# `bg-rescue-wip.sh` WRITES the archive with `git push origin "$C:refs/wip/$SLUG"` (308/313), so it lands
+# `bg-rescue-wip.sh` WRITES the archive with `git push origin "$C:refs/wip/$SLUG"` (328/333/354, all three push functions), so it lands
 # in the PUSH repository; this instruction was a FETCH through `origin`, which reads remote.origin.url.
 # With the two diverging, the artifact's own command answers "couldn't find remote ref" over an archive
 # that exists in the other repository — the round-3 failure verbatim, in a third arm of that invariant.
