@@ -1977,8 +1977,11 @@ testAsync("#1662: a background dispatch is not counted until its terminal task_c
         // #3155: and neither is a TERMINAL collect whose record carries no composed payload —
         // certification is a property of the REAP, not of the verb (a payload-less reap is refused
         // through task_status above, so counting it here would be a false PASS reachable by
-        // following this gate's own advice). The fixture below is producer-shaped because a real
-        // settled `task_collect` always carries `details` (`{model, provider}` on a clean success).
+        // following this gate's own advice). The payload is present on a clean success and on the
+        // abort shapes that compose one; it is ABSENT for a child that produced NOTHING and was
+        // reaped by the hard cap / silence threshold / backstop (`doResolve(undefined)` → record
+        // `status:"failed"`, `final_details` dropped), which is why that shape must still be
+        // classified — see the dedicated ATTEMPT test below.
         await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-NOPAYLOAD" } });
         const b3 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(b3 && b3.block === true, "a terminal collect with no composed payload must NOT count");
@@ -2123,7 +2126,7 @@ testAsync("#3155: a terminal task_status with NO composed details is never count
         // A producer that does not carry `final_details` (version skew) or a record with none:
         // the datum needed to certify a verdict is MISSING, and the floor fails CLOSED. The
         // remedy is the terminal `task_collect`, which carries the payload by contract.
-        for (const missing of [{}, { final_details: null }, { final_details: [] }]) {
+        for (const missing of [{}, { final_details: null }, { final_details: [] }, { final_details: {} }]) {
           await fire("tool_result", {
             toolName: "task_status",
             details: { terminal: true, status: "done", exit_code: 0, run_id: `RUN-NOEVID-${JSON.stringify(missing)}`, ...missing },

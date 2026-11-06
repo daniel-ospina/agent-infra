@@ -8386,12 +8386,15 @@ export function auditCommand(command: string, limit = 2000): string {
  * `details.final_details`; BOTH feed the one classifier, so both narrow the same way and through
  * this one function. ⛔ AN ARRAY IS NOT A PAYLOAD (fresh review): `typeof [] === "object"` and
  * `[] !== null`, so the obvious guard accepts `[]`, the spread merges nothing, and the run's own
- * `status: "done"` label decides — certifying a verdict the payload never carried. `null`,
- * primitives and arrays are all UNKNOWN, never "nothing to see".
+ * `status: "done"` label decides — certifying a verdict the payload never carried. ⛔ AN EMPTY
+ * OBJECT IS THE SAME HOLE (round-2 fresh review, measured): `{}` merges nothing either, so it
+ * carries no evidence, and a reap with `final_details: {}` was COUNTED off the view's own `done`
+ * label on BOTH verbs. `null`, primitives, arrays and empty objects are all UNKNOWN.
  */
 export function composedDetailsOf(payload: unknown): Record<string, unknown> | null {
   if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
-  return payload as Record<string, unknown>;
+  const record = payload as Record<string, unknown>;
+  return Object.keys(record).length === 0 ? null : record;
 }
 
 export function describeDispatchFloorRead(
