@@ -1062,7 +1062,7 @@ _got="$(rrspend "$CAP" $(( CAP - 1 )) $(( CAP + 3 )))"
 [ "$_got" = "$(( CAP + 4 ))" ] && ok "(c4o) a book a CONCURRENT writer moved ahead is never overwritten: round $(( CAP - 1 )) against a book of $(( CAP + 3 )) lands $(( CAP + 4 )), not a REFUND back to $(( CAP - 1 ))" \
   || bad "(c4o) the spend wrote the TOP-OF-FILE round over a higher book (book=$(( CAP + 3 )) -> $(printf '%s' "$_got"), expected $(( CAP + 4 ))) — the counter moves BACKWARDS, so each such interleaving refunds a round and the per-PR ceiling is loose by exactly as many as happen"
 # ⛔ AND THE WRITER'S CLAMPS, WHICH WERE PINNED BY NOTHING (fresh review of #3441, P3). Both READERS
-# coerce a 10-digit book (the `(c4j)`/`(c4k)` arms above), so a writer that EMITS one is invisible until a
+# coerce a 10-digit book (the `(c4j)`/`(c4k)` arms BELOW drive both readers), so a writer that EMITS one is invisible until a
 # reader launders it. The reachable one is the SPEND'S OWN clamp, not the top-of-file one: the ceiling
 # check reads the book once, near the top, and the spend re-reads it afterwards, so a book that reached
 # 999999999 during an already-allowed review hands `+ 1` a 10-digit candidate. MUTANT (measured): delete

@@ -352,7 +352,7 @@ fi
 # 999999999, and with this line deleted the book becomes 1000000000. What is genuinely unreachable is
 # only the NEXT RUN's spend: that run's ceiling check refuses at `book >= max` before it can spend.
 # ⛔ SO THE CLAMP BELOW IS **CANONICALISATION**, AND SAYING WHICH ONE IS WHICH IS THE POINT (fresh
-# review of #3441, P3). The reader's own bound is the reachable, load-bearing clamp (see the note at
+# review of #3441, P3). The WRITER's in-spend clamp is the reachable, load-bearing one (see the note at
 # the spend's re-derivation: a book that moved past 9 digits DURING an already-allowed review). This
 # top-of-file one keeps the value ASSIGNED HERE a 9-digit numeral, and what it guarantees is exactly
 # that assignment — it does NOT make a 10-digit write impossible (the spend's own clamp does, in
