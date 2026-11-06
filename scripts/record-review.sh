@@ -1700,9 +1700,8 @@ $m"
     #     invalid — while the mirror order refused. Order-dependence is not containment, and
     #     a reviewer quoting the brief's range before their own is ordinary prose. So EVERY
     #     stated range is checked and ALL must pass.
-    # A body that states no range at all still falls to the bare needle, which is the case
-    # that arm exists for; a body that names a `delta:` token but states no parseable range
-    # REFUSES, so an unreadable claim is never reinterpreted as a bare-head one.
+    # A body that states no range at all used to fall to the bare needle (a match on B's sha
+    # alone). THAT FALLBACK IS GONE FOR AN AUTHORED RANGE — see the refusal below.
     _scan="$EVIDENCE_BODY"; _any=0; _all_ok=1
     while [[ "$_scan" =~ ([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; do
       _any=1
@@ -1734,14 +1733,38 @@ $m"
     fi
     if [ "$_any" -eq 1 ]; then
       body_claim=1
-    elif [ "$_delta_tok" -eq 1 ]; then
-      echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as <40-hex>..<40-hex> (or ...), or run a fresh review at the head and use plain --evidence comment:<id>." >&2
-      return 1
-    else
-      for _needle in "$to" "${to:0:12}"; do
-        case "$EVIDENCE_BODY" in *"$_needle"*) body_claim=1; break ;; esac
-      done
     fi
+    # ⛔ NO BARE-NEEDLE FALLBACK FOR AN AUTHORED RANGE (fifth review cycle, P1 — and the reason
+    # it took five cycles is worth stating). Each previous fix widened the SPELLING the parser
+    # accepts: two dots, then three, then case-insensitive tokens, then `hex..hex` anywhere in
+    # the body. Each one closed the vector in front of it and left the next spelling open,
+    # because a guard that ENUMERATES spellings fails open on the first one nobody listed. The
+    # measured vector this time was an EN DASH: `Reviewed only A1–HEAD` matched neither the
+    # range regex nor the `delta:` token, so both layers stayed 0 and the body fell to the
+    # bare needle — which it satisfies by naming B — and the record asserted `delta_range=A..B`
+    # over a range the artifact had explicitly narrowed. The identical sentence with `..`
+    # refused. U+2026 (what macOS and Word substitute for `...`) and the word "through" were
+    # accepted identically.
+    #
+    # So the requirement is inverted: an AUTHORED range now REQUIRES a stated, parseable range.
+    # No alphabet can be silently missing from a requirement, and no abbreviation length can
+    # either — a body that states no range refuses, whatever else it contains. This costs
+    # NOTHING that the fallback provided, which is why it is a fix and not a trade: a verdict
+    # at the head that states no range is still recordable with plain `--evidence comment:<id>`
+    # — the same head binding, asserting exactly what the artifact says and no more. The
+    # fallback only ever bought a way to make the range claim the artifact never made.
+    # The MERGE-ONLY arm below is untouched: it has its own requirement (the cover must name
+    # the reviewed head A), which is a name, not a range, and is checked there.
+    if [ "$_any" -ne 1 ]; then
+      if [ "$_delta_tok" -eq 1 ]; then
+        echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as <40-hex>..<40-hex> (or ...), or run a fresh review at the head and use plain --evidence comment:<id>." >&2
+      else
+        echo "   delta: the covering artifact '$cover' does not STATE the range ${from:0:12}…..${to:0:12}… — naming ${to:0:12}… alone is not a statement that the reviewer covered the authored commits, and a range inferred from the head's name is precisely the claim this record would assert with no evidence behind it. (A stated range is REQUIRED here; it is not inferred from the artifact's notation, length or wording.)" >&2
+        echo "   → quote the range in the artifact (e.g. delta:${from:0:12}..${to:0:12}); or, if the reviewer's verdict is at ${to:0:12}… and they did not state a range, record it as a plain --evidence comment:<id> attestation — the same head binding, without a range claim this record cannot support." >&2
+      fi
+      return 1
+    fi
+    body_claim=1
     fi
     if [ "$body_claim" -ne 1 ]; then
       echo "   delta: the covering artifact '$cover' does not NAME the range ${from:0:12}…..${to:0:12}… (it names neither the range nor ${to:0:12}…) — and a verdict that does not state which range it covered cannot be extended over authored commits by DATE alone, because a commit's date records when it was CREATED: an old-dated branch merged in after the review slips through an anchor built only from dates." >&2
