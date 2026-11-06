@@ -2233,10 +2233,22 @@ done
 # ACCEPTS (measured), so it must stay certified AND preserved:
 #   bare `host:` (URL reads no port) · trailing root dot · underscore · IDN (punycoded by URL) ·
 #   an already-punycoded host · `[v6]:port` · loopback over plain http · a non-default port.
+# ⛔ AND THE UPPERCASE AND DECOMPOSED SPELLINGS OF THE SAME IDN (#3374 review, round 15 P2). Byte
+# equality against the UTS46 mapping refused both: `MÜNCHEN` maps to `münchen` and the decomposed
+# `mu\u0308nchen` composes to it, so neither is a fixed point — and their `--install` REPLACED the
+# operator's own daemon with the hosted default (measured), while the ASCII fast path accepted the
+# identical case change on `MYHOST.example`. They are the SAME HOST under DNS identity, so they belong
+# here; the arm is what makes "the rule is identity, not bytes" a red-able claim.
+# ⛔ AND THIS IS ALSO WHAT MAKES THE `idna` VERSION A TESTED FACT RATHER THAN AN ASSUMPTION (#3374
+# review, round 15 P2). Every other arm that depends on the UTS46 mapping could pass on a box with no
+# `idna` — the stdlib-only branch declines non-ASCII, so a refused spoof looks the same whether the
+# mapping rule ran or not. `münchen` must CERTIFY, and only the real mapping can certify it, so a
+# runner without `idna` REDS here instead of silently testing a rule it never executed.
 for _good in 'https://localhost:8000/mcp' 'http://localhost:8000/mcp' \
              'https://127.0.0.1:8000/mcp' 'http://[::1]:8000/mcp' \
              'https://myhost.example./mcp/' 'https://my_host:8000/mcp' \
              'https://host:/mcp/' 'https://münchen.example/mcp/' \
+             'https://MÜNCHEN.example/mcp/' "https://mu$(printf '\u0308')nchen.example/mcp/" \
              'https://xn--mnchen-3ya.example/mcp/' 'https://api.premiselabs.co:8443/mcp/'; do
   python3 - "$DEST/.mcp.json" "$_good" <<'PY'
 import json, sys
@@ -2255,16 +2267,25 @@ PY
     && ok "a usable self-host is PRESERVED and certified — no over-block ($_good)" \
     || fail "a self-host the CLIENT accepts ($_good) was refused or replaced (rc=$rc) — a false block on a working config, and for a self-host the repair destroys it"
 done
-# ⛔ DOT-EQUIVALENT SPOOFS ARE REFUSED BY NAME (#3374 review, round 13 P1). `new URL` applies UTS46,
-# which maps U+3002/U+FF0E/U+FF61/U+FE52/U+2024 to `.` — so each of these resolves in the CLIENT to a
-# DIFFERENT host (`api.premiselabs.co。evil.example` -> `api.premiselabs.co.evil.example`) while the
-# predicate read one harmless label, printed `SELFHOSTED:` rc=0 and left
-# `Bearer ${TORTOISE_MCP_API_KEY}` attached: the tenant key blessed to an attacker's host. No arm
-# covered this class before — the table pinned `%40`, `|`, `^` and a genuine `münchen` IDN, and a
-# dot-equivalent is neither. The `_good` loop above is the other half: `münchen.example` must STAY
-# certified, so the fix cannot be "refuse all non-ASCII".
+# ⛔ DOT-EQUIVALENT **AND** DELETING-MAPPING SPOOFS ARE REFUSED BY NAME (#3374 review, round 13 P1,
+# widened in round 15 P1). `new URL` applies UTS46, which maps U+3002/U+FF0E/U+FF61/U+FE52/U+2024 to
+# `.`, and which DELETES a set of code points outright — so each of these resolves in the CLIENT to a
+# DIFFERENT host (`api.premiselabs.co。evil.example` -> `api.premiselabs.co.evil.example`,
+# `api.premiselabs.co<filler>.evil.example` -> `api.premiselabs.co.evil.example`) while the predicate
+# read one harmless label, printed `SELFHOSTED:` rc=0 and left `Bearer ${TORTOISE_MCP_API_KEY}`
+# attached: the tenant key blessed to an attacker's host. The `_good` loop above is the other half:
+# `münchen.example` must STAY certified, so the fix cannot be "refuse all non-ASCII".
+# ⛔ THE TWO CLASSES ARE NAMED SEPARATELY ON PURPOSE. `\u00ad` (Cf) and `\u200b` (Cf) and the HANGUL
+# FILLERS are refused because UTS46 DELETES them; only `\u3002`/`\uff0e`/`\uff61`/`\ufe52`/`\u2024`
+# are dot-equivalents. They arrive by the same ordinary-category mechanism, which is why the same
+# loop drives them — but a red on a filler must not send anyone to `_DOT_EQUIVALENT`, which is not
+# what refuses it.
 for _spoof in "https://api.premiselabs.co$(printf '\u00ad')evil.example/mcp/" \
               "https://api.premiselabs.co$(printf '\u200b')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\u3164')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\u115f')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\u1160')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\uffa0')evil.example/mcp/" \
               "https://api.premiselabs.co$(printf '\u3002')evil.example/mcp/" \
               "https://api.premiselabs.co$(printf '\uff0e')evil.example/mcp/" \
               "https://api.premiselabs.co$(printf '\uff61')evil.example/mcp/" \
@@ -2341,35 +2362,88 @@ for u in table:
         sys.exit(1)
 sys.exit(0)
 PY
-# ⛔ AND THE GUARD MUST HOLD ON A BOX WITH NO `idna` — WHICH IS THE ONLY REASON IT IS ORDERED FIRST
-# (#3374 review, round 14 P3). `_label_ok` accepts every non-ASCII label when `_idna is None`, so the
-# UTS46 fixed-point rule is simply absent there; the NFKC dot check and the `Cf`/`Mn`/`Me` refusal are
-# what keep a dot-equivalent and a DELETING mapping (`co\xad` -> `co`) refused on a stdlib-only box.
-# Nothing exercised that branch: every arm runs where `idna` is installed, and the `except ImportError`
-# arm is marked `# pragma: no cover`, so a mutant that deleted the guard stayed GREEN. Forced here.
+# ⛔ AND THE GUARD MUST HOLD ON A BOX WITH NO `idna` — the branch that DECLINES every non-ASCII
+# label (#3374 review, rounds 14-15). Two successive category-deny-list attempts were wrong in BOTH
+# directions, and the second was still a false PASS: U+115F/U+1160/U+3164/U+FFA0 (HANGUL FILLERS) are
+# category `Lo` and are UTS46-ignored, i.e. DELETED — so a `Cf`/`Mn`/`Me` list CERTIFIED
+# `api.premiselabs.co\u3164.evil.example` with the key attached — while 1737 of the 2027 Cf/Mn/Me code
+# points are NOT deleted, so that same list false-BLOCKED real combining-mark IDNs. The branch now
+# declines instead of enumerating, and this arm pins BOTH halves of that decision so neither
+# "certify any non-ASCII" nor "certify the Cf/Mn/Me-free ones" can come back green.
 NOIDNA_CHECK="$TMP/noidna_check.py"
 cat > "$NOIDNA_CHECK" <<'NOIDNA'
 import importlib.util, sys
 spec = importlib.util.spec_from_file_location("mm", sys.argv[1])
 mm = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mm)
-mm._idna = None                      # simulate the stdlib-only box
+mm._idna = None                      # simulate the stdlib-only box after the module loaded
 bad = 0
-for host in ("api.premiselabs.co\u00ad.evil.example", "api.premiselabs.co\u200b.evil.example",
-             "api.premiselabs.co\u3002evil.example", "api.premiselabs.co\uff0eevil.example",
+# (i) the spoofs a category deny-list MISSES — the HANGUL FILLERS are `Lo`, so only a branch that
+# declines the whole non-ASCII class can refuse them.
+for host in ("api.premiselabs.co\u115f.evil.example", "api.premiselabs.co\u1160.evil.example",
+             "api.premiselabs.co\u3164.evil.example", "api.premiselabs.co\uffa0.evil.example",
+             "api.premiselabs.co\u00ad.evil.example", "api.premiselabs.co\u200b.evil.example",
+             "api.premiselabs.co\u3002.evil.example", "api.premiselabs.co\uff0eevil.example",
              "api.premiselabs.co\u2024evil.example"):
     if mm.authority_names_a_host(host) is not False:
         print("CERTIFIED with idna absent: %r" % host, file=sys.stderr)
         bad += 1
-for host in ("api.premiselabs.co", "localhost", "127.0.0.1", "my_host", "my-daemon.internal"):
+# (ii) a legitimate non-ASCII self-host is DECLINED here TOO — deliberately: the branch does not
+# guess the client's mapping, it declines (the merge then repairs the entry to the hosted default).
+# Pinned in BOTH directions: a mutant that accepts every non-ASCII label reds here, and so does one
+# that accepts only the Cf/Mn/Me-free labels.
+for host in ("münchen.example", "mu\u0308nchen.example"):
+    if mm.authority_names_a_host(host) is not False:
+        print("not DECLINED with idna absent: %r" % host, file=sys.stderr)
+        bad += 1
+# (iii) and nothing ASCII is touched by the branch — no over-block on the common config.
+for host in ("api.premiselabs.co", "localhost", "127.0.0.1", "my_host", "my-daemon.internal",
+             "xn--mnchen-3ya.example"):
     if mm.authority_names_a_host(host) is not True:
         print("FALSE BLOCK with idna absent: %r" % host, file=sys.stderr)
         bad += 1
 sys.exit(1 if bad else 0)
 NOIDNA
 python3 "$NOIDNA_CHECK" "$ROOT/pi-bootstrap/lib/merge-mcp.py" \
-  && ok "the dot-equivalent and DELETING spoofs stay REFUSED with no idna installed (the stdlib-only branch)" \
-  || fail "with idna absent a spoof was CERTIFIED — the guard is ordered before the idna branch for exactly this box, and nothing held it to that"
+  && ok "with no idna the HANGUL-FILLER and DELETING spoofs are DECLINED, and no ASCII host is over-blocked" \
+  || fail "with idna absent a spoof was CERTIFIED (or an ASCII host was blocked) — the stdlib-only branch must decline the class, not enumerate it"
+# ⛔ THE SAME ARM, DRIVEN OVER **BOTH** COPIES (round 15 P2). `--verify` is certified by the marker
+# inside `cell-install.sh`, and the drift arm below cannot cover it here because with `idna`
+# importable NEITHER copy takes the fallback — so emptying the marker's guard left every arm GREEN.
+# The marker's own heredoc is exec'd here (not a paraphrase), with its `import idna` forced to fail.
+NOIDNA="$TMP/noidna_marker.py"
+cat > "$NOIDNA" <<'NOIDNA'
+import importlib.util, re, sys
+src = open(sys.argv[2]).read()
+start = src.index("def _port_ok(")   # NOT `_dns_identity`: the slice must carry `_HOST_FORBIDDEN`
+end = src.index("    return all(_label_ok(lab) for lab in labels)") + len("    return all(_label_ok(lab) for lab in labels)")
+slice_ = src[start:end]
+assert "import idna as _idna" in slice_, "the marker no longer imports idna here — update this arm"
+ns = {"re": re, "ipaddress": __import__("ipaddress"), "unicodedata": __import__("unicodedata")}
+exec(compile(slice_.replace("import idna as _idna", "raise ImportError"), "<marker-noidna>", "exec"), ns)
+assert ns["_idna"] is None, "the forced-ImportError arm did not land on the stdlib-only branch"
+# the marker's copy must decline the same class the module's copy declines
+spec = importlib.util.spec_from_file_location("mm", sys.argv[1])
+mm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mm)
+mm._idna = None
+bad = 0
+for host in ("api.premiselabs.co\u115f.evil.example", "api.premiselabs.co\u3164.evil.example",
+             "api.premiselabs.co\u00ad.evil.example", "api.premiselabs.co\u200b.evil.example",
+             "api.premiselabs.co\u3002.evil.example", "api.premiselabs.co\uff0eevil.example",
+             "münchen.example", "localhost", "api.premiselabs.co", "my_host"):
+    a, b = ns["authority_names_a_host"](host), mm.authority_names_a_host(host)
+    if a is not b:
+        print("DRIFT with idna absent on %r: marker=%r merge-mcp.py=%r" % (host, a, b), file=sys.stderr)
+        bad += 1
+    if a is not (host in ("localhost", "api.premiselabs.co", "my_host")):
+        print("WRONG VERDICT with idna absent on %r: %r" % (host, a), file=sys.stderr)
+        bad += 1
+sys.exit(1 if bad else 0)
+NOIDNA
+python3 "$NOIDNA" "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/pi-bootstrap/cell-install.sh" \
+  && ok "the MARKER's copy agrees with merge-mcp.py on the no-idna branch — the box --verify actually runs" \
+  || fail "the marker's stdlib-only branch DISAGREES with merge-mcp.py — install and verify judge the same url differently on a box with no idna, and the marker is the one that certifies a cell"
 # ⛔ THE TEMPLATE READ WAS THE ONE REMAINING RAW TRACEBACK ON THE **VERIFY** SIDE (#3374 review P3).
 # `merge-mcp.py` got a named FATAL for a template that is missing, unparseable, or the wrong SHAPE;
 # the marker kept `json.load(open(...))` then `tpl.get(...)`, so all of them raised straight out and
