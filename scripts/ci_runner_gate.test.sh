@@ -996,6 +996,15 @@ assert_contains "$OUT" "ghost_runs=3" "the ghost population is reported"
 assert_contains "$OUT" "queued_demanding=7" "the length leg sees 7 runs, not the raw 10"
 assert_not_contains "$OUT" "queue/component/incident leg" "3 ghosts do not push a 7-run queue over the threshold"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "an inflated count does not engage the pool"
+# ⛔ AND THE VERDICT LINE MUST NOT CONTRADICT ITSELF (cycle-4 review, finding 1). The length leg tests
+# `queued_demanding`, but `write_verdict` publishes `queued=` from the RAW depth on the SAME line — so
+# a healthy reason that said "queue < 10" printed `queued=10` beside it on every ghost-discounted
+# pass. The reason now quotes the operand the leg tested, under a key that is not the raw one.
+assert_contains "$OUT" "demand_runs=7 < 10" "the healthy reason quotes the count the LENGTH LEG tested"
+assert_not_contains "$OUT" "queue < 10" "…and never claims a raw-depth bound it did not apply"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "queued=10" "the verdict file still publishes the RAW depth (a queue-depth consumer wants that)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand_runs=7 < 10" "…and the reason beside it quotes the demanding count"
+assert_eq "$(grep -o 'queued=[0-9]*' "$STATE_DIR/ci-runner-gate.verdict" | wc -l | tr -d ' ')" "1" "exactly ONE queued= value on the line, so a key=value reader cannot see two numbers"
 
 # ⛔ THE OTHER DIRECTION, and it is the one that would be silent: an UNREADABLE jobs read must never
 # be read as "no queued job". Discounting on a failed call drops real demand, so the run stays the
@@ -1020,6 +1029,17 @@ assert_eq "$RC" "0" "a demand head on page 2 exits 0"
 assert_contains "$OUT" "ghost_runs=0" "the run with a queued job past page 1 is NOT discounted"
 assert_contains "$OUT" "queue_head_run=4001" "it stays the queue head (its age is the clock)"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "the age still stands, so stuck demand still engages the pool"
+
+# ⛔ A READ THAT ANSWERED BUT RETURNED AN UNSPELLABLE LABEL SET IS NOT A FAILED READ (cycle-4 review,
+# finding 3). Both leave the run as the head with no discount, but only one of them is a failure, and
+# the diagnostic used to say "jobs read FAILED" with an empty error buffer for the one that succeeded.
+echo "── #2344: an unspellable label set is NAMED as such, not as a failed read ──"
+run_gate ghost-unspellable GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND="gpu ubuntu-latest" \
+  GH_QUEUE_ROWS_SPEC="4001:9000;4002:60" --
+assert_eq "$RC" "0" "an unspellable label set does not refuse the pass"
+assert_contains "$OUT" "ANSWERED with a label set this read cannot spell" "the log separates 'answered, unspellable' from 'failed'"
+assert_not_contains "$OUT" "jobs read FAILED" "…and does NOT name a failure that did not happen"
+assert_contains "$OUT" "ghost_runs=0" "nothing was discounted"
 
 # ⛔ THE SCAN IS BOUNDED, and a bound that runs out is a COULD-NOT-MEASURE — never "no demand" (that
 # would strip the pool during a real stall) and never "the ghost's age" (that is the defect).
@@ -1074,7 +1094,7 @@ run_gate ghost-inconsistent-all GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS=
   GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" --
 assert_eq "$RC" "2" "two ghost rows over a depth of 1 → exit 2 on the all-ghosts path too"
 assert_contains "$OUT" "INCONSISTENT" "the all-ghosts contradiction is NAMED, never clamped to zero"
-assert_not_contains "$OUT" "ghost records, not backlog" "it is not read as a complete measurement"
+assert_not_contains "$OUT" "nothing is waiting for a runner" "it is not read as a complete measurement"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "the all-ghosts contradiction advanced no state file"
 # ⛔ THE BOUND BREAK IS NOT A COMPLETE SCAN (cycle-2 review, blocking). `scanned` is capped by
 # `QUEUE_HEAD_SCAN_MAX`, so with `queued == QUEUE_HEAD_SCAN_MAX` a bound break left `scanned == queued`

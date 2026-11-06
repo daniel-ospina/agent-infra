@@ -240,6 +240,13 @@ UNHEALTHY_LEG=""
 ABSORPTION_OLDEST_S=""
 ABSORPTION_IN_PROGRESS=""
 ABSORPTION_QUEUED=""
+# ⛔ THE DISCOUNTED COUNT AND THE GHOST COUNT ARE GLOBALS TOO (#2344), and for the same reason
+# `ABSORPTION_QUEUED` is (see below): `queued_demanding`/`QUEUE_GHOSTS` are `local` to `evaluate`, but
+# the healthy reason line — built in `main` — has to quote the operand the LENGTH LEG actually tested.
+# Without them the reason said "queue < 10" while the same verdict line published `queued=10`, i.e. a
+# verdict contradicting itself on any ghost-discounted pass (cycle-4 review, finding 1).
+ABSORPTION_DEMANDING=""
+ABSORPTION_GHOSTS=""
 
 # ── capacity census state (agent-infra#2904 · #2897 · #2931) ───────────────────────────────────
 # CENSUS_VERDICT is the CAPACITY question's answer, kept separate from the MODE answer on purpose:
@@ -518,11 +525,14 @@ $labels" ;;
 #
 # ⛔ A QUEUED RUN IS NOT A QUEUED JOB (agent-infra#2344) — the primitive the head scan is built on.
 # rc 0 with NO output means the read SUCCEEDED and this run has no job in `queued` status: the GHOST
-# shape. rc 1 means the read could not be made, which is a DIFFERENT fact and must never be read as the
-# ghost one — that direction silently discounts real demand. `gh` propagates jq's failure, and an empty
-# array (`[]`) is a successful read that emits nothing, so the exit status alone carries the distinction
-# (measured against the live API 2026-11-06: the ghost run 37642335832 → rc 0, no output; a run with
-# queued jobs → rc 0, `ubuntu-latest`; a run id GitHub does not know → rc 1).
+# shape. rc 1 means the read could not be made. ⛔ rc 2 is a THIRD fact (cycle-4 review, finding 3):
+# the read ANSWERED and this run HAS queued jobs, but a label set it returned cannot be spelled, so the
+# run cannot be used as demand. Both non-zero statuses are "no discount" to the caller, but they are
+# different diagnoses and the scan's log names which happened — collapsing them printed "jobs read
+# FAILED" for a read that succeeded, beside an empty error buffer. `gh` propagates jq's failure, and
+# an empty array (`[]`) is a successful read that emits nothing, so the status alone carries the
+# ghost/not-ghost distinction (measured against the live API 2026-11-06: the ghost run 37642335832 →
+# rc 0, no output; a run with queued jobs → rc 0, `ubuntu-latest`; an unknown run id → rc 1).
 run_queued_demand() {
   local rid="$1" out l sets=0
   case "$rid" in ''|*[!0-9]*) return 1 ;; esac
@@ -543,10 +553,10 @@ run_queued_demand() {
   # multi-job run is now several lines — see DEMAND_LABELS).
   while IFS= read -r l; do
     [ -n "$l" ] || continue
-    case "$l" in *[!A-Za-z0-9._,+-]*) return 1 ;; esac
+    case "$l" in *[!A-Za-z0-9._,+-]*) return 2 ;; esac
     sets=$((sets+1))
   done <<<"$out"
-  [ "$sets" -gt 0 ] || return 1
+  [ "$sets" -gt 0 ] || return 2
   printf '%s' "$out"
 }
 
@@ -677,7 +687,7 @@ evaluate() {
   # ⛔ DECLARED AT THE TOP, not where they are first assigned (agent-infra#2344). The head scan runs
   # BEFORE the census and sets these; a `local X=0` further down would RESET the count the scan had
   # already computed — a global re-declared mid-function is still a re-initialisation.
-  local QUEUE_GHOSTS=0 queued_demanding=${queued:-0} candidates scanned scan_exhausted cand cand_id cand_created cand_demand
+  local QUEUE_GHOSTS=0 queued_demanding=${queued:-0} candidates scanned scan_exhausted cand cand_id cand_created cand_demand cand_rc
   local demand_head_id demand_head_created oldest_created head_run_id
 
   summary="$(probe_status)" || { log "status probe FAILED (network/status api)"; return 2; }
@@ -855,14 +865,19 @@ print(comp, len(inc))
         *)   cand_id="$cand"; cand_created="" ;;
       esac
       case "$cand_id" in '' | *[!0-9]*) log "queue candidate row UNREADABLE ('${cand}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
-      if cand_demand="$(run_queued_demand "$cand_id")"; then
+      cand_demand="$(run_queued_demand "$cand_id")"; cand_rc=$?
+      if [ "$cand_rc" -eq 0 ]; then
         if [ -n "$cand_demand" ]; then
           demand_head_id="$cand_id"; demand_head_created="$cand_created"; DEMAND_LABELS="$cand_demand"
           break
         fi
         QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1))
       else
-        log "queue candidate run $cand_id: jobs read FAILED — cannot prove it is a ghost, so it STAYS the queue head (no discount); $(head -c 200 "$GH_ERR" 2>/dev/null)"
+        if [ "$cand_rc" -eq 2 ]; then
+          log "queue candidate run $cand_id: the jobs read ANSWERED with a label set this read cannot spell — cannot prove it is a ghost, so it STAYS the queue head (no discount)"
+        else
+          log "queue candidate run $cand_id: jobs read FAILED — cannot prove it is a ghost, so it STAYS the queue head (no discount); $(head -c 200 "$GH_ERR" 2>/dev/null)"
+        fi
         demand_head_id="$cand_id"; demand_head_created="$cand_created"
         break
       fi
@@ -935,6 +950,7 @@ print(age)
 
   log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
   ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
+  ABSORPTION_DEMANDING="$queued_demanding"; ABSORPTION_GHOSTS="$QUEUE_GHOSTS"
 
   # ⛔ THE THROUGHPUT LEG'S OPERANDS ARE SHAPE-CHECKED EXACTLY AS THE EXISTING ONES ARE, for the
   # same reason (agent-infra#1704): an unreadable number makes `[ … -gt … ]` ERROR, and the `||`
@@ -1039,13 +1055,17 @@ print(age)
   # publishes `queued=` from the RAW depth on the same line, so a second `queued=` here would give one
   # line two different values for one key and break any `grep -o 'queued=[0-9]*'` reader. The
   # machine-readable surface keeps the raw depth (what a queue-depth consumer wants); the discount is
-  # named `demand_runs=`/`ghost_runs=` in prose and in the log.
+  # named `demand_runs=`/`ghost_runs=` in prose and in the log. ⛔ AND THE HEALTHY REASON BELOW MUST
+  # QUOTE THE SAME OPERAND (cycle-4 review, finding 1): it used to say "queue < N" while the verdict
+  # line carried the raw depth, so a ghost-discounted pass printed `queued=10` beside `queue < 10`.
   if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued_demanding" -ge "$QUEUE_THRESHOLD" ]; then
     UNHEALTHY_LEG="queue/component/incident leg: demand_runs=$queued_demanding (threshold $QUEUE_THRESHOLD; raw queued=$queued, ghost_runs=$QUEUE_GHOSTS), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
   fi
   # ⛔ A SATURATED PAGE LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather than certified
-  # (review P2). Reaching here means the length leg did NOT fire (`queued < QUEUE_THRESHOLD`), yet the
+  # (review P2). Reaching here means the LENGTH leg did NOT fire (`queued_demanding < QUEUE_THRESHOLD`
+  # — the operand that leg tests since #2344; the RAW `queued` may be at or above the threshold here,
+  # which is precisely what a ghost discount does), yet the
   # queue is deeper than one page — which can only happen when an operator has raised
   # QUEUE_THRESHOLD above the page size. In that state `oldest_queued_s` is a LOWER BOUND on the
   # head's age (newest-first page), so a stalled queue can read young and the gate would certify
@@ -1623,7 +1643,7 @@ if [ "$healthy" = 0 ]; then
     idle-unused|all-offline|unknown)
       reason="GitHub-hosted legs pass BUT CAPACITY NOT CERTIFIED (capacity=$CENSUS_VERDICT: $CENSUS_DETAIL; $absorption)" ;;
     *)
-      reason="GitHub Actions healthy (component operational, no Actions incident, queue < $QUEUE_THRESHOLD, $absorption; capacity=$CENSUS_VERDICT: $CENSUS_DETAIL)" ;;
+      reason="GitHub Actions healthy (component operational, no Actions incident, demand_runs=${ABSORPTION_DEMANDING:-unmeasured} < $QUEUE_THRESHOLD, $absorption; capacity=$CENSUS_VERDICT: $CENSUS_DETAIL)" ;;
   esac
 else
   want="local"
