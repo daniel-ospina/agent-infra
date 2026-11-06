@@ -7361,7 +7361,11 @@ run_record_delta $EH23 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518301" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
     STUB_EVIDENCE_BODY="reviewed delta:abc1234..def5678 at $DG_HEAD; no issues found."
 assert_eq "$RECORD_RC" "3" "20h19 an UNPARSEABLE delta: range is REFUSED (rc 3), never fallen past"
-assert_contains "$RECORD_ERR" "cannot parse" "20h19 the refusal names the unparseable range rather than accepting a bare-head match"
+# ⚠️ RE-ANCHORED (ninth cycle): the range parser's floor is now 4 rather than 12, so `abc1234..def5678`
+# IS parsed and the RANGE COMPARISON is what refuses it — a stronger arm than "cannot parse", and the
+# vector's fail-closed intent is unchanged. The `cannot parse` message still decides the shapes this
+# code genuinely cannot parse (a non-hex separator: 20h20's `delta: A1 till HEAD`).
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h19 the unparseable range is PARSED and compared (rc 3), never written off as prose"
 [ -f "$(Q2 $EH23)" ] && bad "20h19 no record was written" || ok "20h19 no record was written"
 
 # 20h20/20h21 THE TOKEN'S SPELLING MUST NOT DISABLE THE GUARD. The third review cycle found
@@ -7684,6 +7688,73 @@ if printf '### Mutation-Attribution\n\n| assertion | mutant | reddened row | obs
 else
     bad "20h38 brief-gate did NOT accept the non-canonical heading — the vector would prove nothing"
 fi
+# 20h39 THE HEADING LINE IS NOT DROPPED WHOLE (ninth cycle, P1). The exclusion removes the section
+#       NAME; anything a reviewer writes on the heading line is prose. MEASURED on the eighth
+#       cycle's head: the body below recorded rc 0 over the WIDE range, because the entire heading
+#       line went into the bin and the stated narrowing with it. (Control: move the same sentence one
+#       line down — 20h37 already pins that direction.)
+EH46=425228; rm -f "$(Q2 $EH46)"
+run_record_delta $EH46 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION — I also only read ${DG_A1}–${DG_HEAD}
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h39 a narrowing ON the kill-table heading line is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h39 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH46)" ] && bad "20h39 no record was written" || ok "20h39 no record was written"
+# 20h40 A SECOND MUTATION-ATTRIBUTION SECTION IS STILL A KILL TABLE (ninth cycle, P2). The eighth
+#       cycle located ONE heading/end pair, so a second block's rows fell outside the exclusion and
+#       were read as the reviewer's claim: an artifact built as an addendum (the ordinary shape) was
+#       refused for a row it is entitled to carry. brief-gate's own parser re-opens the section on
+#       every matching heading, and this mirrors it.
+EH47=425230; rm -f "$(Q2 $EH47)"
+BODY40='reviewed delta:'"$DG_BASE"'..'"$DG_HEAD"'; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| one | y | z | rc 3 |
+
+## MUTATION ATTRIBUTION (addendum, same verdict)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| two | the row that reddens delta:'"$DG_A1"'..'"$DG_HEAD"' | two | rc 3 |'
+run_record_delta $EH47 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="$BODY40"
+assert_eq "$RECORD_RC" "0" "20h40 a SECOND kill-table block's rows are excluded too (rc 0)"
+[ -f "$(Q2 $EH47)" ] || bad "20h40 no record was written for a valid two-block artifact"
+if printf '%s' "$BODY40" | bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" --mutation-missing - >/dev/null 2>&1; then
+    ok "20h40 brief-gate accepts the two-block artifact (the vector is not vacuous)"
+else
+    bad "20h40 brief-gate did NOT accept the two-block artifact — the vector would prove nothing"
+fi
+# 20h41 THE FLOOR BELOW 7 (ninth cycle, P1). git resolves a 4-6 char unique prefix, and the two
+#       scans' floors were 12 (dots parser) and 7 (token rule) — so a narrowing written with a
+#       6-char start was invisible to BOTH and recorded rc 0 over the wide range. 20h31's 8-char
+#       vector is what made the gap look covered.
+EH48=425232; rm -f "$(Q2 $EH48)"
+run_record_delta $EH48 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ${DG_A1:0:6}..${DG_HEAD:0:6}; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h41 a narrowing in 6-char abbreviations is REFUSED (rc 3)"
+[ -f "$(Q2 $EH48)" ] && bad "20h41 no record was written" || ok "20h41 no record was written"
+# and the SHORT-UNRESOLVABLE form is PROSE, not a range claim: a hex-looking pair beside dots (a
+# review of hex literals) must not be refused as a contradicting range.
+EH49=425234; rm -f "$(Q2 $EH49)"
+run_record_delta $EH49 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+The literals 0xdead..0xbeef and f00d..babe are unrelated to this range."
+assert_eq "$RECORD_RC" "0" "20h41 unresolvable short hex beside dots reads as PROSE (rc 0)"
+[ -f "$(Q2 $EH49)" ] || bad "20h41 a hex-literal pair falsely blocked a correct artifact"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7932,7 +8003,7 @@ I only actually reviewed HEAD~1..HEAD."
 #       `## ` heading, the seventh cycle's span ran to the last row — both dropped PROSE, and both
 #       re-accepted a narrowing written there. The mutant restores the span shape (skip the whole
 #       section) and 20h34's `### Scope caveat` narrowing is accepted again.
-MUT="$(mk_mutant spanblock '            if (L[i] ~ /^[ \t>]*[|]/) continue' '            continue')"
+MUT="$(mk_mutant spanblock '          if (ins && line ~ /^[ \t>]*[|]/) continue' '          if (ins) continue')"
 mut_check "M23 the exclusion is the ROWS, not the whole section" 425212 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 
 ## MUTATION ATTRIBUTION (agent-infra#3442)
@@ -7946,7 +8017,7 @@ I only actually reviewed ${DG_A1}–${DG_HEAD}; the base-side merge was not read
 # M26 — THE TABLE ROWS ARE ACTUALLY EXCLUDED (20h32). The other direction of M23: with the row
 #       predicate broken the kill table is compared as the reviewer's own claim, so a CORRECT
 #       artifact is refused because of a row describing a mutant pinned to the range.
-MUT="$(mk_mutant norowskip '            if (L[i] ~ /^[ \t>]*[|]/) continue' '            if (0) continue')"
+MUT="$(mk_mutant norowskip '          if (ins && line ~ /^[ \t>]*[|]/) continue' '          if (0) continue')"
 mut_check "M26 the kill table's rows ARE excluded from the claim" 425208 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 
 ## MUTATION ATTRIBUTION (agent-infra#3442)
@@ -7958,7 +8029,7 @@ mut_check "M26 the kill table's rows ARE excluded from the claim" 425208 "$DG_HE
 #       spelling leaves a brief-gate-VALID block unexcluded, so its row is read as the claim and a
 #       valid artifact is refused with a false accusation. The mutant restores the canonical-only
 #       matcher; 20h38's `### Mutation-Attribution` then refuses.
-MUT="$(mk_mutant canonhead 'tolower(substr(L[i], RLENGTH + 1)) ~ /^[ \t]*mutation[ -]attribution/' 'tolower(substr(L[i], RLENGTH + 1)) ~ /^[ \t]*mutation attribution/')"
+MUT="$(mk_mutant canonhead 'htxt ~ /^[ \t]*mutation[ -]attribution/' 'htxt ~ /^[ \t]*mutation attribution/')"
 mut_check "M27 the heading contract mirrors brief-gate's" 425226 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 
 ### Mutation-Attribution
@@ -7966,6 +8037,39 @@ mut_check "M27 the heading contract mirrors brief-gate's" 425226 "$DG_HEAD" "del
 | assertion | mutant (reverts the fix) | reddened row | observed |
 |---|---|---|---|
 | the verdict covers ${DG_A1} | y | z | rc 3 |"
+# M28 — THE FLOOR BELOW 7 (20h41). Restoring the 12-char floor makes a 6-char narrowing invisible to
+#       both scans again, which is the ninth cycle's P1. The vector is 20h41 and the mutant must
+#       ACCEPT it.
+MUT="$(mk_mutant shortfloor '([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40})' '([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40})')"
+mut_check "M28 the range parser's floor is 4, not 12" 425232 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ${DG_A1:0:6}..${DG_HEAD:0:6}; the rest was not read."
+# M29 — THE HEADING LINE'S TAIL (20h39). Dropping the whole heading line bins whatever a reviewer
+#       wrote on it, so a narrowing stated there is never scanned — the ninth cycle's P1.
+MUT="$(mk_mutant headtail 'if (rest !~ /^[ \t]*$/) print rest' 'if (0) print rest')"
+mut_check "M29 the heading line's prose is scanned" 425228 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522901" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION — I also only read ${DG_A1}–${DG_HEAD}
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |"
+# M30 — EVERY BLOCK, NOT JUST THE FIRST (20h40). Re-opening the section only once leaves a second
+#       block's rows outside the exclusion, so an addendum artifact is refused for a row it may
+#       carry — the ninth cycle's P2.
+MUT="$(mk_mutant secondblock '                ins = 1; depth = nh' '                opened++; if (opened > 1) { ins = 0 } else { ins = 1; depth = nh }')"
+mut_check "M30 every MUTATION-ATTRIBUTION block is excluded" 425230 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| one | y | z | rc 3 |
+
+## MUTATION ATTRIBUTION (addendum, same verdict)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| two | the row that reddens delta:${DG_A1}..${DG_HEAD} | two | rc 3 |"
 # M24 — THE UNRELATED-LINEAGE BOUND (20h36). Dropping the "is it LATER than A" test makes every
 #       resolvable token that is not reviewed history a contradiction, which is the seventh
 #       cycle's false block: an artifact quoting a commit on an UNRELATED lineage is refused for

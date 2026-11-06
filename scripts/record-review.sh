@@ -1673,31 +1673,37 @@ $m"
       END {
         gsub(/\\n/, "\n", rec)
         n = split(rec, L, "\n")
-        h = 0; hd = 0
-        for (i = 1; i <= n && h == 0; i++) {
-          if (match(L[i], /^[ \t]*#+/)) {
-            lead = index(L[i], "#") - 1
+        # A LINE-BY-LINE STATE MACHINE, mirroring brief-gate.sh s own `ins`/`depth`: open on a
+        # heading match, close on a heading at or above that depth (subsections stay inside), and
+        # drop ONLY table rows while inside — every heading is RE-TESTED, so a second block in the
+        # same artifact is excluded too (ninth review cycle, P2: locating ONE `h`/`end` pair left a
+        # second block s rows outside the exclusion, so a valid two-block artifact — the ordinary
+        # addendum shape — was refused for a row it is allowed to carry).
+        # ⛔ AND THE HEADING LINE IS NOT DROPPED WHOLE (ninth cycle, P1 — MEASURED: `## MUTATION
+        # ATTRIBUTION — I also only read A1..HEAD` recorded rc 0 over the WIDE range, because the
+        # entire heading line went into the bin and the range with it. Only the section NAME comes
+        # off; anything a reviewer writes on that line is prose and is scanned).
+        ins = 0; depth = 0; opened = 0
+        for (i = 1; i <= n; i++) {
+          line = L[i]
+          if (match(line, /^[ \t]*#+/)) {
+            lead = index(line, "#") - 1
             nh = RLENGTH - lead
-            if (lead <= 3 && tolower(substr(L[i], RLENGTH + 1)) ~ /^[ \t]*mutation[ -]attribution/) {
-              h = i; hd = nh
+            if (lead <= 3) {
+              htxt = tolower(substr(line, RLENGTH + 1))
+              if (ins && nh <= depth) ins = 0
+              if (htxt ~ /^[ \t]*mutation[ -]attribution/) {
+                ins = 1; depth = nh
+                rest = substr(line, RLENGTH + 1)          # after the heading hashes
+                if (match(tolower(rest), /^[ \t]*mutation[ -]attribution/))
+                  rest = substr(rest, RLENGTH + 1)        # the section NAME comes off, nothing else
+                if (rest !~ /^[ \t]*$/) print rest
+                continue
+              }
             }
           }
-        }
-        if (h == 0) { for (i = 1; i <= n; i++) print L[i]; exit }
-        # a heading at or above the section closes it (subsections stay inside)
-        end = n
-        for (i = h + 1; i <= n; i++) {
-          if (match(L[i], /^[ \t]*#+/)) {
-            lead = index(L[i], "#") - 1
-            if (lead <= 3 && RLENGTH - lead <= hd) { end = i - 1; break }
-          }
-        }
-        for (i = 1; i <= n; i++) {
-          if (i >= h && i <= end) {
-            if (i == h) continue                                   # the heading itself
-            if (L[i] ~ /^[ \t>]*[|]/) continue                     # a table row
-          }
-          print L[i]
+          if (ins && line ~ /^[ \t>]*[|]/) continue               # a table row inside the block
+          print line
         }
       }
     ' 2>/dev/null || true)"
@@ -1780,7 +1786,22 @@ $m"
     # (`$_claim` — the body with the #3442 kill table excluded, computed above so the
     # merge-only arm reads the same form — is what the two scans below consume.)
     _scan="$_claim"; _any=0; _all_ok=1
-    while [[ "$_scan" =~ ([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; do
+    # ⛔ THE FLOOR IS 4, NOT 12, AND IT IS THE SECOND HALF OF "ABBREVIATION-LENGTH-INDEPENDENT"
+    # (ninth review cycle, P1 — MEASURED: git resolves a 4-6 char unique prefix, and a body stating
+    # a narrowing as `A1:0:6..HEAD` was invisible to BOTH layers — this parser needed 12 chars on
+    # each side and the token rule needs 7 — so it recorded rc 0 over the WIDE range. 20h31 pinned
+    # 8 chars, which is exactly what made the gap look covered.) 12 stays the floor for a token that
+    # cannot be resolved at all: an unresolvable 12+ hex run is a sha this checkout does not have (a
+    # claim about a real commit, refused), while an unresolvable 4-11 run is a hex-LOOKING word
+    # (`0xdead..0xbeef` in a review of hex literals) and reading it as a range claim would be a
+    # false block. So: 4-6 hex beside dots AND unresolvable = PROSE; it is skipped, never silently
+    # accepted as a range. 7-11 unresolvable still REFUSES, because that is a sha-shaped claim
+    # (20h19 pins it, and it fails closed for exactly the reason that arm exists).
+    # DECLARED RESIDUAL, bounded by that: an AMBIGUOUS 4-6 char prefix does not resolve either, so it
+    # reads as prose. git itself refuses to name a commit by an ambiguous prefix, so no reader could
+    # verify such a claim either; the typed ranges that carry a real in-range commit are caught at 6
+    # (20h41), 8 (20h31) and 12+, and a 4-6 char REAL sha resolves here and is compared.
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}) ]]; do
       _any=1
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
@@ -1789,9 +1810,12 @@ $m"
       _scan="${_scan#*"${BASH_REMATCH[0]}"}"
       _ok=0
       case "$to" in "$_st"*) _ok=1 ;; esac
+      _sfs="$(delta_git "$root" rev-parse --verify "${_sf}^{commit}" 2>/dev/null || true)"
+      if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
+        continue
+      fi
       if [ "$_ok" = 1 ]; then
         _ok=0
-        _sfs="$(delta_git "$root" rev-parse --verify "${_sf}^{commit}" 2>/dev/null || true)"
         if [ -n "$_sfs" ]; then
           _r=0
           delta_git "$root" merge-base --is-ancestor "$_sfs" "$from" 2>/dev/null || _r=$?
@@ -1864,8 +1888,11 @@ $m"
     # reviewer covering A..B may name — the endpoints of the accepted range satisfy it by
     # construction, and a commit LATER than A is refused as a narrowing in whatever notation it
     # was written. Unresolvable runs are prose, not commits, and are ignored (a sha that is not
-    # in this repo cannot narrow this range). Alphabet-independent,
-    # abbreviation-length-independent, and it does not need to know the word "through".
+    # in this repo cannot narrow this range). Alphabet-independent, and it does not need to know the
+    # word "through". Its length floor is 7 for a PROSE token (4-6 hex runs are ordinary words), and
+    # that is not a gap: a dots-adjacent 4-6 run is handled by the parser above at the SAME floor,
+    # which is where a typed abbreviation actually appears (ninth cycle, P1 — the two layers' floors
+    # used to be 12 and 7, leaving 4-6 invisible to both).
     # ⛔ THE UNRELATED-LINEAGE HALF IS NOT SLACK, IT IS THE BOUND OF THE RULE (seventh review
     # cycle, P2 — MEASURED: the sixth cycle refused a commit reachable from NEITHER endpoint, so
     # an artifact quoting another PR's sha, or a base tip that is not in this branch's history,
