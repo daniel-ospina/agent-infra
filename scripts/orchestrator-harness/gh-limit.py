@@ -2062,6 +2062,7 @@ def flight_publish(key, meta, rc, out, err):
     tmp = path + ".tmp-%d" % os.getpid()
     rec = {"flight": meta.get("flight") or "%d@%.3f" % (meta["pid"], meta["started_at"]),
            "request": meta.get("request", ""),
+           "cred": _CRED_CLASS,
            "started_at": meta["started_at"], "finished_at": _now(), "rc": rc,
            "out_b64": base64.b64encode(out).decode("ascii"),
            "err_b64": base64.b64encode(err).decode("ascii")}
@@ -2080,9 +2081,18 @@ def flight_publish(key, meta, rc, out, err):
 
 def flight_result(d, key):
     """The last PUBLISHED outcome for `key`, with its completion time, or None. A corrupt or
-    half-written entry is a miss, never an error."""
+    half-written entry is a miss, never an error.
+
+    ⛔ AND AN OUTCOME PUBLISHED BY THE OTHER CREDENTIAL IS A MISS (#3429). Coalescing exists to share
+    ONE request between callers of the SAME argv, and two boxes can decide differently for that argv
+    (one has the App, one does not). Replaying the App's answer to a user-credentialed caller is the
+    same cross-credential body replay the ETag/read/pass caches now refuse — the waiters simply take
+    the key over and run the call themselves, which is already the honest degradation for an entry
+    too large to share."""
     rec = _read_json(os.path.join(d, key + ".json"))
     if rec is None:
+        return None
+    if not _cred_class_ok(rec):
         return None
     try:
         return {"rc": int(rec["rc"]),
