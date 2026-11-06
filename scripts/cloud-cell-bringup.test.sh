@@ -713,7 +713,7 @@ br ok normal --check
   && ok "…and the oauth record is left untouched (a refresh token it could not recreate)" \
   || bad "the bring-up overwrote an oauth record"
 case "$BR_OUT" in
-  *"does not rewrite"*) ok "…naming it as a shape the script will not judge or replace" ;;
+  *"will not rewrite"*) ok "…naming it as a shape the script will not judge or replace" ;;
   *) bad "the oauth refusal does not say what it will not do: $BR_OUT" ;;
 esac
 
