@@ -374,15 +374,20 @@ wt_provision() {
                 # The probe answers in the caller's own name so the refusal is actionable, and rc 2 is
                 # the documented "refuses to touch, nothing changed". What each caller does with it is
                 # NOT uniform, so do not assume "retry next cycle" everywhere: `dispatch-merge.sh`
-                # skips the issue, releases its claim and drops its row (retried next cycle, by which
-                # time the orphan is normally gone and `wt_reap_if_empty` can take the tree back);
-                # `fix-one.sh` refunds the booked fixer attempt and ABORTS; `adopt-fix.sh` aborts.
-                # ⛔ THE TWO REPAIR ARMS ABOVE AND BELOW ARE DELIBERATELY EXEMPT, and the reason is
-                # not an oversight: neither is on the reuse path this comment is about. The
-                # stale-`initializing` repair is reached only once the record is OLDER than the
-                # lock-age floor (a younger one is refused, not repaired), and the unusable-worktree
-                # repair only when HEAD is unresolvable — in both the record itself already proves the
-                # checkout is not usable, which is a different question from "may I hand it out".
+                # skips the issue, releases its claim and drops its row (the next attempt RE-USES the
+                # checkout — this arm hands it out, it does not reap it — and the orphan is normally
+                # gone by then); `fix-one.sh` refunds the booked fixer attempt and ABORTS;
+                # `adopt-fix.sh` aborts.
+                # ⛔ THE TWO REPAIR ARMS ABOVE AND BELOW ARE DELIBERATELY EXEMPT, and the difference is
+                # real rather than a loophole: they do not HAND OUT the checkout, they DELETE it
+                # (`wt_rollback`: unlock, `worktree remove --force`, `rm -rf`), so a holder there is
+                # the case `wt_reap_if_empty` already governs — preserve on any doubt — and not this
+                # arm. Each is gated on evidence that the tree is unusable: the stale-`initializing`
+                # repair only fires once the record is OLDER than the lock-age floor (a younger one is
+                # REFUSED, not repaired), and the unusable-worktree repair only when HEAD cannot be
+                # resolved or is on another branch. Whether those repairs should ALSO probe for a
+                # holder is a separate question about the reaper, recorded as a residual on agent-infra
+                # #3511 rather than settled here.
                 # rc 2 from the probe itself ("the argv witness could not be evaluated") is FAIL-CLOSED,
                 # matching `wt_reap_if_empty`: handing out a checkout on an unevaluable probe is how a
                 # second writer gets in, and the cost of refusing is one cycle.
@@ -613,13 +618,19 @@ wt_live_holders() {
             # the path is `C`, a name character, and rejecting it made a REAL holder invisible — in
             # the one caller that DELETES (`wt_reap_if_empty`) that is a fail-safe turned fail-open,
             # so an option letter immediately before the path counts as a boundary too.
+            # ⛔ THE OPTION MUST BE A REAL ONE, AND AT A WORD START (#3511 review cycle 5, P2): a bare
+            # `-<alnum>` before the path is not enough, because a LONGER path whose own prefix ends in
+            # `-<alnum>` (`/mnt/snap-2/…/tm-1`, `/Volumes/backup-1/…`) would be accepted as an option
+            # and re-admit the longer-prefix false positive the left test exists to reject. So: `-`,
+            # then exactly one letter, then the path — and the character before the `-` must not be a
+            # name character (or `p == 3`, where the `-` IS the first character, as in `-C/tmp/x`).
             # `/` is not special-cased on the right: the negated class below already admits it, and
             # saying so twice would invite the next reader to believe a narrower class is in force.
             s = cmd
             while ((p = index(s, path)) > 0) {
                 nxt = substr(s, p + length(path), 1)
                 prv = (p > 1) ? substr(s, p - 1, 1) : ""
-                glued_opt = (p > 2) && (substr(s, p - 2, 1) == "-")
+                glued_opt = (p > 2) && (substr(s, p - 2, 1) == "-") && (substr(s, p - 1, 1) ~ /^[A-Za-z]$/) && (p == 3 || substr(s, p - 3, 1) !~ /[0-9A-Za-z._-]/)
                 if (nxt !~ /[0-9A-Za-z._-]/ && (prv !~ /[0-9A-Za-z._-]/ || glued_opt)) {
                     print pid "\targv-lists-the-worktree"; exit
                 }

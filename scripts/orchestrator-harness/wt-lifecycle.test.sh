@@ -340,11 +340,10 @@ assert_contains "$OUT" "WT_RESULT=reused" "W8 …and reports a reuse"
 # `wt_reap_if_empty` names and refuses to reap ("a live process still holds the checkout … kept").
 # The only thing suppressing a re-dispatch into that checkout was this box's `dispatched.txt` row, and
 # #3511's third per-issue arm drops that row the moment the claim is released — so the guard has to
-# live HERE, in the one place every caller passes through: rc=2 = "refuses to touch, nothing changed",
-# which is rc=2 = "refuses to touch, nothing changed". ⛔ WHAT THE CALLERS DO WITH IT DIFFERS and the
-# two must not be described as one: `dispatch-merge.sh` skips + releases the claim + drops the row;
-# `fix-one.sh` refunds the booked attempt and ABORTS; `adopt-fix.sh` aborts. (See the note on the
-# refusal itself in wt-lifecycle.sh.)
+# live HERE, in the one place every caller passes through: rc=2 = "refuses to touch, nothing changed".
+# ⛔ WHAT THE CALLERS DO WITH IT DIFFERS and the two must not be described as one:
+# `dispatch-merge.sh` skips + releases the claim + drops the row; `fix-one.sh` refunds the booked
+# attempt and ABORTS; `adopt-fix.sh` aborts. (See the note on the refusal itself in wt-lifecycle.sh.)
 # The holder's ARGV names the checkout (a positional argument to `python3 -c`), so the arm drives
 # the ARGV witness and does not depend on `lsof` being installed. ⛔ NOT `bash -c "cd <wt> && sleep"`:
 # bash EXEC-OPTIMISES that into a bare `sleep N`, whose argv no longer carries the path, so the arm
@@ -418,6 +417,21 @@ wait "$LONG_PID" 2>/dev/null
 assert_contains "$LONG_HELD" "rc=0" "W11 the LONGER absolute path IS a holder of itself (the probe still fires)"
 assert_contains "$OUT" "rc=0" "W11 a live process naming /mnt<wt> does not make <wt> look held"
 assert_contains "$OUT" "WT_RESULT=reused" "W11 …<wt> reuses normally"
+
+# …and the LONGER-PATH class must not be re-admitted through the short-option exception: a prefix that
+# itself ends in `-<alnum>` (`/mnt/snap-2`) is NOT an option glued to the path, and accepting it would
+# undo the left boundary (#3511 review cycle 5, P2 — the exception must require `-` + ONE LETTER at a
+# word start, not any `-<alnum>`).
+ENV=W11b; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-17 feat/17-tm origin/main" "$REPO" >/dev/null
+python3 -c 'import time; time.sleep(30)' "/mnt/snap-2$REPO/.worktrees/tm-17" &
+DASHY_PID=$!
+sleep 1
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-17 feat/17-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+kill "$DASHY_PID" 2>/dev/null
+wait "$DASHY_PID" 2>/dev/null
+assert_contains "$OUT" "rc=0" "W11b a prefix ending in -<alnum> (/mnt/snap-2<wt>) is not mistaken for an option glued to <wt>"
+assert_contains "$OUT" "WT_RESULT=reused" "W11b …<wt> reuses normally"
 
 # ── W12: a REAL holder GLUED to a short option is still detected ───────
 # #3511 review cycle 4, P1. `git -C<wt>` puts an option LETTER immediately before the path, so a
