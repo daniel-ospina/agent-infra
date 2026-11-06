@@ -2650,7 +2650,7 @@ done
 # over `refs/remotes/*` — a CACHE. The `nothing` arm was scoped to it; this group still asserted "exist
 # only on this disk", an off-box claim, reachable-and-false when a peer on a reused branch name pushed and
 # this worktree never fetched.
-for _n48p in UNAVAILABLE detached refused-unknown-default refused-pushurl-divergent refused-pushurl-unresolved; do
+for _n48p in UNAVAILABLE refused-unknown-default refused-pushurl-divergent refused-pushurl-unresolved; do
   n48="$( bash -c '
     . "$1"
     LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH="$2"
@@ -2779,6 +2779,99 @@ n51e="$( bash -c '
   lane_end_next' _ "$GATE" "$N51E" 2>/dev/null )"
 case "$n51e" in *'git fetch origin refs/wip/fix-x'*) rcn51e=0 ;; *) rcn51e=1 ;; esac
 ck "N51e …while TWO push urls answer origin — an ambiguous target is not this code's to pick, the same way the push half refuses it by name [${n51e:0:60}]" $rcn51e
+
+# ⛔ N52 — A DETACHED HEAD'S COMMITS ARE HELD BY NO BRANCH (review of PR #3399 round 15, P2 — REPRODUCED).
+# `push=detached` shared the `UNAVAILABLE|refused-*` group in BOTH consumers, whose sentences end "The
+# commits survive the worktree being removed". That is true for a commit on a BRANCH — the branch ref lives
+# in the shared object database — and FALSE here: nothing but this worktree's own HEAD and reflog references
+# a detached commit, and `git worktree remove` deletes `.git/worktrees/<id>/HEAD` with its reflog, after
+# which the object is unreachable and `git gc` prunes it. Measured on a linked worktree: HEAD detached, one
+# commit, `for-each-ref --contains HEAD` EMPTY, object PRUNED by `gc --prune=now` after removal. The claim
+# stood in the direction that LOSES WORK, so both consumers are driven here.
+DETW="$TMP/wtdet"; rm -rf "$DETW"
+git -C "$WT" worktree add -q --detach "$DETW" 2>/dev/null
+git -C "$DETW" config user.name t; git -C "$DETW" config user.email t@t
+git -C "$DETW" commit -q --allow-empty -m "a commit on a detached head"
+# FIXTURE: the HEAD really is detached and the commit really is held by no branch.
+[ -z "$(git -C "$DETW" symbolic-ref -q --short HEAD)" ] && [ -z "$(git -C "$DETW" for-each-ref --contains HEAD --format='%(refname)' 2>/dev/null)" ]; rcn52a=$?
+ck "N52a FIXTURE: the fixture worktree is DETACHED and no ref contains its HEAD — else this arm cannot see the class" $rcn52a
+: > "$O/logs/det.log"; rm -f "$O/state/lane-exit-det.state"
+WIP_PATH="$DETW" O="$O" bash -c '
+  . "$1"
+  terminal_wip_rescue "det" 0 0 "$2"
+' _ "$GATE" "$O/logs/det.log" 2>>"$O/logs/det.log.agent"
+grep -qx 'push=detached' "$O/state/lane-exit-det.state" 2>/dev/null; rcn52b=$?
+ck "N52b …and the terminal really reaches push=detached (the verdict this arm is about) [$(grep -m1 '^push=' "$O/state/lane-exit-det.state" 2>/dev/null)]" $rcn52b
+! grep -qi 'survive this WORKTREE being removed' "$O/logs/det.log" && grep -q 'DETACHED HEAD' "$O/logs/det.log"; rcn52c=$?
+ck "N52c …and the LANE LOG does NOT promise that a detached commit survives the worktree being removed" $rcn52c
+det_next="$(grep -m1 '^next=' "$O/state/lane-exit-det.state" 2>/dev/null | sed 's/^next=//')"
+case "$det_next" in *'survive the worktree being removed'*) rcn52d=1 ;; *'DETACHED HEAD'*'unreachable'*) rcn52d=0 ;; *) rcn52d=1 ;; esac
+ck "N52d …and next= likewise says the commits become unreachable, instead of the branch-survival sentence [${det_next:0:70}]" $rcn52d
+# …and the group it LEFT still carries its own survival sentence, so N52c is not passing by deletion.
+# …and the group `detached` LEFT still carries its own survival sentence, so N52c is not passing because
+# the file lost the sentence everywhere. (A detached commit is on no branch, so the sentence is right for
+# `UNAVAILABLE` and wrong only here — the two facts must not be collapsed into one arm.)
+det_unav="$( bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH=UNAVAILABLE
+  LANE_END_UNPUSHED=1; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$det_unav" in *'survive the worktree being removed'*) rcn52e=0 ;; *) rcn52e=1 ;; esac
+ck "N52e …while the group it LEFT still carries the branch-survival sentence (the fact is split per verdict, not deleted)" $rcn52e
+# ⛔ N53 — NO UNESCAPED BACKTICK IN A DOUBLE-QUOTED LOG STRING (review of PR #3399 round 15, P1 — MY OWN
+# REGRESSION). Round 14's NOTE rewrite put `git fetch --prune` in RAW BACKTICKS inside a DOUBLE-QUOTED
+# `echo`, so the exit path EXECUTED it: measured, a terminating lane ran `git fetch --prune` against the
+# checked-out repo and PRUNED `refs/remotes/origin/gone` — mutating the very cache this artifact family
+# reasons about — unbounded, on the one path R3 forbids unbounded network calls on. N15h could not see it:
+# it greps words that survived the substitution, while the substitution ate the words around them. The
+# existing N14 scanner strips prose before counting `git`, so a substitution inside a message is invisible
+# to it by construction — hence a scanner for the CLASS, not for one sentence.
+n53_scan() { # n53_scan <file> -> number of `echo "` lines carrying an UNESCAPED backtick
+  awk '
+    { line = $0; gsub(/\\`/, "", line)
+      if (line ~ /echo "/ && index(line, "`") > 0) { n++; if (n <= 3) print "  line " NR ": " substr(line, 1, 100) > "/dev/stderr" } }
+    END { printf "%d", n + 0 }' "$1"
+}
+n53="$(n53_scan "$GATE" 2>/dev/null)"
+[ "$n53" = "0" ]; rcn53=$?
+ck "N53 …no DOUBLE-QUOTED log line carries an UNESCAPED backtick — a command substitution in a message is a live command on the exit path (found $n53)" $rcn53
+# ⛔ AND THE SCANNER IS SHOWN TO SEE THE CLASS: a COPY with the defect restored must be counted.
+N53M="$TMP/n53mut"; rm -rf "$N53M"; mkdir -p "$N53M"
+sed 's/'"'"'git fetch --prune'"'"'/`git fetch --prune`/' "$GATE" > "$N53M/spawn-gate.sh" 2>/dev/null
+n53m="$(n53_scan "$N53M/spawn-gate.sh" 2>/dev/null)"
+[ "$n53m" != "0" ]; rcn53b=$?
+ck "N53b …and the scanner is LOAD-BEARING: the defect restored in a copy is counted ($n53m line(s)), so a green N53 is not a scan that sees nothing" $rcn53b
+# ⛔ N54 — "NOT ON THAT REF" IS NOT "ONLY ON THIS DISK" IN THE LANE LOG EITHER (review of PR #3399
+# round 15, P2 — REPRODUCED). The `FAILED`/`branch_on_origin`-empty NOTE is the third consumer to make the
+# claim, and splitting `FAILED` in round 5 changed the ARM without narrowing the READ: the measurement is
+# `ls-remote --heads <pushurl> refs/heads/<br>` answering NOTHING, which is an absence about ONE REF NAME.
+# Its sibling arm already declines the inference in as many words; this one did not. Reachable: a peer
+# pushed these commits under another name and this worktree never fetched, and the exit path's own push of
+# `refs/heads/<br>` was refused by a hook — the log then says the work exists only on this disk while the
+# push repository holds it under another ref. Driven through the real `terminal_wip_rescue`.
+mkdir -p "$TMP/bin-empty"
+# push fails; the HEADS read ANSWERS with nothing (rc=0, empty) — that is `FAILED` with `branch_on_origin`
+# empty. `ls-remote --symref` must still answer, or the arm is refused earlier for an unknown default.
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 1 ;; *" ls-remote --heads "*) exit 0 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-empty/git"
+chmod +x "$TMP/bin-empty/git"
+git -C "$WT" worktree add -q "$TMP/wtempty" -b emptyheads 2>/dev/null
+git -C "$TMP/wtempty" config user.name t; git -C "$TMP/wtempty" config user.email t@t
+git -C "$TMP/wtempty" commit -q --allow-empty -m "an unpushed commit"
+: > "$O/logs/emptynote.log"; rm -f "$O/state/lane-exit-emptynote.state"
+PATH="$TMP/bin-empty:$PATH" O="$O" bash -c '
+  . "$1"
+  terminal_wip_rescue "emptynote" 0 0 "$2"
+' _ "$GATE" "$O/logs/emptynote.log" 2>>"$O/logs/emptynote.log.agent"
+grep -qx 'push=FAILED' "$O/state/lane-exit-emptynote.state" 2>/dev/null \
+  && grep -qx 'origin=' "$O/state/lane-exit-emptynote.state" 2>/dev/null; rcn54a=$?
+ck "N54a FIXTURE: the terminal reaches push=FAILED with branch_on_origin EMPTY — the arm this is about [$(grep -m1 '^push=' "$O/state/lane-exit-emptynote.state" 2>/dev/null)]" $rcn54a
+! grep -q 'exist ONLY locally' "$O/logs/emptynote.log" \
+  && grep -q 'not on THAT ref' "$O/logs/emptynote.log" \
+  && grep -q 'Whether they are on some OTHER ref was NOT measured here' "$O/logs/emptynote.log"; rcn54b=$?
+ck "N54b …and the [wip] NOTE does NOT turn a one-ref absence into 'only on this disk'" $rcn54b
+# …and the survival facts survive the scoping, so this is a narrowed claim and not a deleted one.
+grep -q 'They survive this WORKTREE being removed' "$O/logs/emptynote.log"; rcn54c=$?
+ck "N54c …while still naming what does and does not survive" $rcn54c
 echo
 
 # ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).
