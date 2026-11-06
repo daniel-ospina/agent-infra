@@ -284,8 +284,10 @@ if ! build_fixture "$COMPLETE" fast; then
   echo "❌ run-bash-shards.recap: cannot build the fixture — refusing to report"
   exit 2
 fi
-# The same spawn-site contract as ARM 1's child above (:188) — see the note there for what it is and
-# is not. Kept inline for the same reason: `env` execs in place, so `$?` is the runner's own status.
+# The same spawn-site contract as ARM 1's child above — see the ⛔ note in the ARM 1 section for what
+# it is and is not. (Deliberately NOT a line number: a same-file pin drifts on every edit above it, and
+# this comment's own first draft carried a stale one. The other pins in this file name OTHER files.)
+# Kept inline for the same reason: `env` execs in place, so `$?` is the runner's own status.
 env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
   bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
 CRC=$?
