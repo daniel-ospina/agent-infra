@@ -3177,7 +3177,14 @@ ck "§27b harness_repo_of REFUSES the same directory-at-marker-path shape" \
 # refused — i.e. a regression to a literal-path marker shipped green).
 # `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for `HARNESS_REPO`; a reader that
 # tested the literal path would refuse it and the deploy probe would read CANNOT VERIFY forever.
-out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+# ⛔ AND THE CANDIDATE MUST BE A FIXTURE, NOT THE AMBIENT CHECKOUT (#3160). This arm used
+# `$HERE_TOP/scripts` — the checkout the suite happens to run in — and then grepped for a `ref:`
+# line, which requires `origin/main` to RESOLVE there. `actions/checkout` fetches one ref (or
+# `refs/remotes/pull/N/merge`), so on every PR/batch checkout `origin/main` does not exist, no ref
+# line is printed at all, and the arm reds for a reason that has nothing to do with
+# subdirectory-acceptance. `$REPO_SRC` is this suite's own fixture: it tracks the marker and has its
+# own `origin/main` (`git push --quiet origin main` above), so the assertion tests the RESOLVER.
+out="$(env REPO= HARNESS_REPO="$REPO_SRC/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b box-status ACCEPTS a SUBDIRECTORY candidate of the harness repo" \
    "$(grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
