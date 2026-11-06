@@ -6,7 +6,8 @@
 # Exits 0 when ALL assertions pass, 1 on any failure. Hermetic: every log and
 # lock is a fixture in a temp directory, and the scripts are driven with `HOME`
 # pointed there, so no real state is read or written. Host facilities used:
-# `mktemp`, `mkdir`, `grep`, `sed`, `wc`, `tr`, `cat`, `basename`, `date`, `touch`, `chmod`, and `bash -n`.
+# `mktemp`, `mkdir`, `grep`, `sed`, `awk`, `wc`, `tr`, `cat`, `basename`, `date`, `touch`, `chmod`, and
+# `bash -n`.
 #
 # ⛔ THREE SCRIPTS, TWO KINDS OF PROBE. `stat -f %m` (mtime) is repaired in
 # `monitor-worker.sh` and `lane-scan-fallback.sh`; `stat -f %z` (size) is repaired in
@@ -77,15 +78,33 @@ trap 'rm -rf "$T"' EXIT
 #   * `cat` — leaves every comment.
 # So: strip trailing comments FIRST from a WORD START (line start, whitespace, or a shell
 # metacharacter), then drop what remains that is a full-line comment.
-# ⛔ THE STRIP HAS NO EXCLUSIONS (#3509 review round 7). A tail class excluding quotes/backticks
-# (`#[^"`]*$`) made the strip a NO-OP for the natural comment form in this repo — every rationale
-# here quotes the variable — which cut BOTH ways, measured: a correct `date -r` probe carrying a
-# trailing `# NOT stat -f %m "$LOG" (BSD-only)` red the negative arm (a FALSE RED on correct code),
-# while a GNU-only probe carrying `# the opposite of stat -c %Y "$LOG"` kept its comment in the view
-# and passed. Strip from the first word-start `#` unconditionally: a comment may never satisfy an arm.
+# ⛔ THE STRIP IS QUOTE-AWARE, and that is load-bearing in BOTH directions (#3509 review rounds 7-8):
+#   * a tail class excluding quotes and backticks (`#[^"`]*$`) made the strip a NO-OP for the natural
+#     comment form in this repo, where every rationale quotes the variable. It cut BOTH ways,
+#     measured: a correct `date -r` probe carrying a trailing `# NOT stat -f %m "$LOG" (BSD-only)`
+#     red the negative arm (a FALSE RED on correct code), while a GNU-only probe carrying
+#     `# the opposite of stat -c %Y "$LOG"` kept its comment in the view and passed;
+#   * an UNCONDITIONAL strip with no quote awareness is the mirror error: a `#` INSIDE a quoted
+#     string deleted the rest of the line, so `echo "note # mtime next" ; MTIME="$(date -r …)"` lost
+#     its real probe and red the positive arm — measured, again a FALSE RED on correct code.
+# A comment may never satisfy an arm; a quoted string is never a comment. Only a scanner can tell
+# them apart, so the strip is a small quote-state scanner, not a regex.
 # ⛔ A text view is still only a PREFILTER: the mtime arms are paired with BEHAVIOURAL runs on a
 # modelled BSD-like host (below), so a spelling this view cannot see is still red if it breaks.
-executed_view() { sed -E 's/(^|[[:space:];&|()<>`])#.*$/\1/' "$1" | grep -v '^[[:space:]]*#'; }
+executed_view() {
+    awk '
+        { out = ""; sq = 0; dq = 0; esc = 0; prev = ""
+          for (k = 1; k <= length($0); k++) {
+            c = substr($0, k, 1)
+            if (esc) { out = out c; esc = 0; prev = c; continue }
+            if (c == "\\" && !sq) { out = out c; esc = 1; prev = c; continue }
+            if (!sq && !dq && c == "#" && (k == 1 || prev ~ /[[:space:];&|()<>`]/)) break
+            if (!dq && c == "\047") sq = !sq
+            else if (!sq && c == "\"") dq = !dq
+            out = out c; prev = c
+          }
+          print out }' "$1"
+}
 
 echo
 echo "── executed-view pins (the rationale MAY name the trap; executed code may not) ──"
@@ -129,8 +148,8 @@ assert_not_contains "$(executed_view "$UNBLOCK")" 'stat -f' \
 # that the refactor is unportable.
 assert_eq "$(executed_view "$UNBLOCK" | grep -c 'wc -c' || true)" 3 \
     "all THREE unblock-lane.sh size probes read with the portable 'wc -c' (a partial revert is a regression)"
-assert_eq "$(executed_view "$UNBLOCK" | grep 'wc -c' | grep -cE '<[[:space:]]*"\$F"' || true)" 3 \
-    "all THREE wc -c probes read the SESSION FILE ('\"\$F\"'), not some other path"
+assert_eq "$(executed_view "$UNBLOCK" | grep 'wc -c' | grep -cE '\$\{?F\}?' || true)" 3 \
+    "all THREE wc -c probes read the SESSION FILE ('\$F'/'\${F}'/'cat \$F'), not some other path"
 assert_not_contains "$(executed_view "$UNBLOCK")" 'stat -c %s' \
     "unblock-lane.sh reads no size with the GNU-only 'stat -c %s' (the mirror of the BSD-only trap)"
 
@@ -329,16 +348,23 @@ assert_contains "$out" "session $BEFORE_BYTES -> $AFTER_BYTES bytes" \
 # redirect and a stderr redirect, the stderr redirect must be in effect before the input redirect can
 # fail — whichever way either is spelled. That is the actual property, so no spelling can evade it.
 # ⛔ AND THE GROUP FORM IS NOT A LEAK, so it must not be red (measured: `{ wc -c <"$F"; } 2>/dev/null`
-# with an unset `$F` prints NOTHING, because the redirect applies to the whole group). A bare
-# position test flagged it, i.e. it red a correct spelling this file's own comment promises to accept.
-# So a group close (`}` or `)`) BETWEEN the input redirect and the stderr redirect marks the redirect
-# as covering the group and clears the line.
+# with an unset `$F` prints NOTHING, because the redirect applies to the whole group). But WHICH group
+# matters: `before_size=$(wc -c <"$F" | tr …) 2>/dev/null` is a redirect on the ASSIGNMENT, not inside
+# the substitution, so it LEAKS — and a bare "group close before the redirect" test cleared it (a
+# false PASS of the exact round-4 defect). So a `}` clears the line, a `)` clears it only when the
+# enclosing opener is a PLAIN subshell `(` rather than a command substitution `$(`.
+# And the arm joins `\`-continuations, because redirections split across lines leak identically.
 leaky="$(executed_view "$UNBLOCK" | awk '
-    /wc -c/ { i = index($0, "<"); j = index($0, "2>")
-              if (i > 0 && j > 0 && j > i) {
-                  pre = substr($0, i, j - i)
-                  if (pre !~ /[})]/) printf "%d: %s\n", NR, $0
-              } }')"
+    { line = (buf == "" ? $0 : buf " " $0)
+      if (line ~ /\\$/) { buf = line; sub(/[[:space:]]*\\$/, "", buf); next }
+      buf = ""
+      if (line !~ /wc -c/) next
+      i = index(line, "<"); j = index(line, "2>")
+      if (i == 0 || j == 0 || j < i) next
+      pre = substr(line, i, j - i); head = substr(line, 1, i - 1)
+      if (pre ~ /}/) next
+      if (pre ~ /\)/ && head ~ /(^|[^$])\([^(]*$/) next
+      printf "%d: %s\n", NR, line }')"
 assert_eq "$leaky" "" \
     "no wc -c probe puts its stderr redirect AFTER the input redirection (the error would leak into the report)"
 

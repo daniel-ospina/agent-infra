@@ -1017,7 +1017,25 @@ echo "── 10c. portability pins (the launchd clock is macOS) ──"
 # prose). In each case a comment alone satisfies an arm, which is a false PASS on the one thing these
 # two lines exist to pin (agent-infra#3509 review, measured: a GNU-only `stat -c` probe carrying a
 # trailing `# … date -r …` passed both arms).
-reaper_executed_view() { sed 's/[[:space:]]#.*$//' "$REAPER" | grep -v '^[[:space:]]*#'; }
+# ⛔ AND IT IS QUOTE-AWARE (#3509 review round 8). A space-anchored strip (`s/[[:space:]]#.*$//`)
+# still leaves a comment that begins a WORD — `;# …` is a comment in bash and survived, so a GNU-only
+# probe plus `;# … the family idiom is stat -f %m …` satisfied BOTH arms (measured) — while an
+# unconditional strip deletes real code after a `#` inside a quoted string. The scanner is the same
+# one `scripts/mtime-probe-portability.test.sh` carries; keep the two in step.
+reaper_executed_view() {
+    awk '
+        { out = ""; sq = 0; dq = 0; esc = 0; prev = ""
+          for (k = 1; k <= length($0); k++) {
+            c = substr($0, k, 1)
+            if (esc) { out = out c; esc = 0; prev = c; continue }
+            if (c == "\\" && !sq) { out = out c; esc = 1; prev = c; continue }
+            if (!sq && !dq && c == "#" && (k == 1 || prev ~ /[[:space:];&|()<>`]/)) break
+            if (!dq && c == "\047") sq = !sq
+            else if (!sq && c == "\"") dq = !dq
+            out = out c; prev = c
+          }
+          print out }' "$REAPER"
+}
 assert_not_contains "$(reaper_executed_view)" 'date -r' "the reaper keeps a SINGLE probe shape — no second 'date -r' mtime read in EXECUTED code"
 assert_contains "$(reaper_executed_view)" 'stat -f %m' "mtime is read with the family's portable stat idiom (in EXECUTED code)"
 
