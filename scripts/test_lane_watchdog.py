@@ -175,6 +175,26 @@ def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W, monkeypatch
     assert W.frozen_subtrees(a, b) == [], "the grandchild is working -- nothing here is frozen"
 
 
+def test_a_busy_descendant_is_excluded_by_the_SUBTREE_sum_not_by_its_kind(W, monkeypatch):
+    """⛔ THE SHAPE WHERE GATE 1's SUBTREE SUM IS THE ONLY THING THAT CAN REFUSE.
+
+    `test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate` states "THE SUBTREE, NOT THE
+    PROCESS" as its subject, but its grandchild is a `curl` -- a NON-`pi` descendant -- so the
+    "only `pi` may be under a candidate" rule excludes that parent FIRST and gate 1's subtree
+    accumulation is never load-bearing. EXECUTED: mutating the sum to `for q in [pid]:` (process
+    only, ignoring every descendant) left that test, and the whole file's failure set, unchanged.
+
+    A nested dispatch is the one shape where the two gates disagree: `pi -> pi` is ALLOWED by the
+    kind rule, so a parked parent whose nested `pi` child is burning CPU is refused ONLY by the
+    subtree sum. MUTANT that reddens this: the process-only sum above.
+    """
+    parked(W, monkeypatch)
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 400: T(300, cpu=5.0, cmd="pi")}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 400: T(300, cpu=10.0, cmd="pi")}
+    assert W.frozen_subtrees(a, b) == [], (
+        "the nested `pi` burned 5.0 CPU-s -- the subtree is WORKING even though the parent is parked")
+
+
 def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W, monkeypatch):
     """The real positive: three children of the orchestrator, `Ss`, dCPU exactly 0, no transcript."""
     parked(W, monkeypatch)
@@ -408,24 +428,16 @@ def test_dry_run_never_signals(W, monkeypatch, capsys, tmp_path):
     """`--apply` is the only path that signals, and it is off by default: the action is a kill."""
     killed = []
     monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
-    monkeypatch.setattr(W, "STATE", str(tmp_path / "s.json"))
-    monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
-    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
-    monkeypatch.setattr(W, "ps_table", lambda: {
-        **BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
-        200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
-    monkeypatch.setattr(W.time, "sleep", lambda s: None)
-    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
-    # ⛔ DRIVE IT ALL THE WAY TO `ripe`, or the test passes vacuously: with an empty state a
-    # candidate is only ever "first observation", so `killed == []` would hold even if --apply
-    # defaulted to True. This state is exactly what a ripe candidate looks like on the next tick.
-    monkeypatch.setattr(W, "STATE", str(tmp_path / "ripe.json"))
-    import json as _json
-    (tmp_path / "ripe.json").write_text(_json.dumps(
-        {"300": {"first_seen": time.time() - W.FROZEN_MIN - 10, "ticks": W.FROZEN_TICKS,
-                 "subtree": [300]}}))
-    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py", "--json"])
-    W.main()
+    # ⛔ VIA `ripen()` — THIS TEST WAS THE NINTH LEAK, and the one whose vacuity guard it defeated.
+    # It hand-rolled four of `main()`'s five inputs and left `has_live_connection` reading the host's
+    # REAL `lsof`, so on a box where lsof is unreadable `main()` exited 3 with `reaped: []` and
+    # `connection_unreadable: 1` — and `'"reaped": []'` then held for the REFUSAL, not for the dry
+    # run. EXECUTED both ways: with the host probe in place, deleting the dry-run gate
+    # (`if args.apply and ripe:` -> `if ripe:`) left this test GREEN; with the probe stubbed the same
+    # mutant reddens it. The status line is asserted too, because "exit 3, nothing reaped" and
+    # "exit 0, nothing reaped" are different worlds and the old test only checked the second half.
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    assert W.main() == 0, "a readable dry run must exit 0 — 3 means the tick REFUSED, not that it held"
     assert killed == [], "a dry run must never signal, even with a ripe candidate"
     assert '"reaped": []' in capsys.readouterr().out
 

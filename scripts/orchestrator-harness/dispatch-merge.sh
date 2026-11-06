@@ -117,6 +117,13 @@ drop_dispatched_rows() {
 # refusal says the checkout/branch is not what the target claims, so the owner of the thing is
 # exactly what is in question; it is reported (`REFUSED … claim released`) instead of deleted.
 reap_unused_worktree() { # <issue> <why> — reports; never changes the caller's status
+  # ⛔ IT DERIVES ITS OWN TARGET FROM THE ISSUE IT REPORTS ON. `$WT`/`$BR` are LOOP GLOBALS set per
+  # iteration, so a helper that took `$1` for its REPORT and the globals for its KILL could delete one
+  # issue's checkout while reporting under another's id — and `wt_reap_if_empty`'s "only a provably
+  # EMPTY checkout goes back" gate would not catch it, because an empty checkout is exactly what a
+  # wrong target usually is. Both current call sites are inside the same iteration, so this is not a
+  # live bug; it is a helper whose two inputs could disagree, which is one input too many.
+  local WT="tm-$1" BR="feat/$1-tm"
   echo "#$1: $2 — taking the checkout back"
   wt_reap_if_empty "${REPO_ABS:-$REPO}" ".worktrees/$WT" "$BR" "dispatch #$1"
   case $? in

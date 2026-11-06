@@ -159,7 +159,7 @@ assert_contains "$T/t1/log" "#2047: lane-2047 NOT spawned" "T1 the fixture reall
 assert_nodir "$REPO/.worktrees/tm-2047" "T1 the provisioned checkout is GONE"
 assert_nobranch "$REPO" feat/2047-tm "T1 …and the 0-ahead branch it created"
 assert_clean_of "$REPO" 2047 "T1 the issue's own indicator holds: nothing named 2047 is left"
-assert_contains "$T/t1/log" "reaped" "T1 the take-back is REPORTED, not silent"
+assert_contains "$T/t1/log" "produced no commits" "T1 the take-back is REPORTED, not silent"
 assert_nofile "$O/claim-releases.log" "T1 the issue claim was NOT released (the chain is alive and waiting; a peer must not duplicate it)"
 if git -C "$REPO" worktree list --porcelain | grep -qxF "worktree $REPO/.worktrees/tm-2047"; then
     bad "T1 the worktree is still REGISTERED in git's own list"
