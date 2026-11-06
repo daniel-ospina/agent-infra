@@ -98,6 +98,20 @@ assert_bounded_arm() { # assert_bounded_arm <fixture> <label> [<want>]
     || bad "$l: an attempt is missing http.lowSpeedLimit/lowSpeedTime — a stalled remote holds the rescue for the full wall clock"
 }
 
+# assert_plain_untouched <fixture> <label> — the FIRST push consults the configured credential chain.
+# ⛔ ATTEMPT 1 WAS NEVER CHECKED FOR HELPER TAMPERING (review round 10, P1). The unshadow arm asserted it
+# for attempt 2 only, so re-introducing the shipped defect's shape (`-c credential.helper=` clearing the
+# chain) on the PRIMARY path was fully green — and on a cell with no keychain and no ambient token that
+# leaves `push_plain` with NO credential at all, i.e. every rescue degrading to local-only.
+assert_plain_untouched() { # assert_plain_untouched <fixture> <label>
+  local f="$T/$1" l="$2"
+  if grep -q 'credential\.helper' "$f/shim/argv.1" 2>/dev/null; then
+    bad "$l: the FIRST push touched the credential-helper list — it must consult what git is configured with: $(tr '\n' ' ' < "$f/shim/argv.1")"
+  else
+    ok "$l: the first push consults git's CONFIGURED credential chain (no helper override on the primary path)"
+  fi
+}
+
 # mk_repo <name> — a bare "origin" plus a clone with one commit on branch fix/lane-one.
 # Returns NON-ZERO if any step failed: with `set -uo pipefail` and no `-e`, a silent fixture failure
 # would otherwise degrade an arm into a green assertion about nothing.
@@ -594,6 +608,7 @@ try_rescue() { # try_rescue <name> <mode> <branch> <retry-env>
 # (1) THE DEFECT ITSELF: a workflow-scope refusal, a keychain credential that works.
 try_rescue wfretry wf_then_ok
 assert_bounded_arm wfretry wfretry
+assert_plain_untouched wfretry wfretry
 WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
 [ "$RC" -eq 0 ] \
   && ok "wfretry: exit 0 — a workflow-bearing snapshot is RESCUED, not degraded to local-only" \
@@ -666,9 +681,13 @@ grep -qx 'GIT_TERMINAL_PROMPT=0' "$T/wfretry/shim/attempts.env.2" 2>/dev/null \
 [ "$(git -C "$T/wfretry/wt" config --list --show-origin 2>/dev/null | sort)" = "$CFG_BEFORE" ] \
   && ok "wfretry: git config is byte-identical at EVERY scope after the retry (read-only rescue, global included)" \
   || bad "wfretry: the rescue WROTE git config (any scope) — a rescue must not change the state it is rescuing"
+# ⛔ THE SUCCESS LINE ITSELF, NOT A SUBSTRING ANYWHERE IN THE OUTPUT (review round 10, P2). The mid-run
+# ANNOUNCE line ("retrying ONCE with the osxkeychain credential …") also contains the name, so a success
+# line that named the wrong credential — or dropped the claim — stayed green.
 case "$OUT" in
-  *OSXKEYCHAIN*|*osxkeychain*) ok "wfretry: says WHICH credential published it (a clean run must not imply the PAT worked)" ;;
-  *) bad "wfretry: the success message does not name the credential used — $OUT" ;;
+  *"pushed with the osxkeychain credential after the configured one was refused"*)
+    ok "wfretry: the SUCCESS line names the credential that published it (a clean run must not imply the PAT worked)" ;;
+  *) bad "wfretry: the success line does not name the credential it used — $OUT" ;;
 esac
 # ⛔ THE SHA IN THE MESSAGE IS THE SHA THAT WAS PUSHED. A message printing a re-chained or shortened sha
 # hands the operator a handle that does not resolve — and the failure hint recommends exactly that retry.
@@ -862,6 +881,7 @@ assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label> <attempt-1 token
   grep -qx 'GIT_TERMINAL_PROMPT=0' "$f/shim/attempts.env.2" 2>/dev/null \
     && ok "$l: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
     || bad "$l: the stored-credential retry did not disable the terminal prompt — a missing store entry could hang the rescue"
+  assert_plain_untouched "$1" "$l"
   # ⛔ AND IT IS TIME-BOUNDED (review round 5, P2; SHARED with the helper path in round 6). The docblock
   # claims all three push functions carry "the same bounds"; deleting `bounded 45 ` from ANY of them was
   # green while only this arm measured it. The fixture records every `timeout` invocation, so two 45 s
@@ -883,8 +903,9 @@ assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label> <attempt-1 token
     || bad "$l: the stored-credential rescue WROTE git config (any scope) — a rescue must not change the state it is rescuing"
   case "$OUT" in
     *osxkeychain*|*OSXKEYCHAIN*) bad "$l: claims the keychain credential on a host that has none — $OUT" ;;
-    *STORED*credential*) ok "$l: names the credential that published it (the stored one, shadow removed)" ;;
-    *) bad "$l: the success message does not name the credential used — $OUT" ;;
+    *"pushed with the STORED credential (the ambient GH_TOKEN/GITHUB_TOKEN was removed for that attempt) after the configured one was refused"*)
+      ok "$l: the SUCCESS line names the credential that published it (the stored one, shadow removed)" ;;
+    *) bad "$l: the success line does not name the credential used (the mid-run announce line does not count) — $OUT" ;;
   esac
 }
 
@@ -1003,15 +1024,24 @@ fi
 try_rescue wfhelpername wf_then_store fix/lane-one \
   "-u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=store"
 assert_bounded_arm wfhelpername wfhelpername
+assert_plain_untouched wfhelpername wfhelpername
 [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
   && ok "wfhelpername: a NON-DEFAULT helper named by the operator is used and the snapshot is rescued" \
   || bad "wfhelpername: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the named helper was not used — $OUT"
 [ "$(cat "$T/wfhelpername/shim/attempts.helper.2" 2>/dev/null)" = "store" ] \
   && ok "wfhelpername: the retry ran with the helper the operator NAMED (not a hard-coded default)" \
   || bad "wfhelpername: the retry's helper was '$(cat "$T/wfhelpername/shim/attempts.helper.2" 2>/dev/null)' — a hard-coded default is not the operator's choice"
+# ⛔ ON THE SUCCESS LINE, AND WITH THE WRONG-NAME EXCLUSION (review round 10, P2): the announce line also
+# carries the name, and a run that used `store` could print "pushed with the osxkeychain credential" and
+# stay green.
 case "$OUT" in
-  *"the store credential"*) ok "wfhelpername: the message names the credential that actually ran" ;;
-  *) bad "wfhelpername: the message does not name the operator's helper — $OUT" ;;
+  *"pushed with the store credential after the configured one was refused"*)
+    ok "wfhelpername: the SUCCESS line names the credential that actually ran" ;;
+  *) bad "wfhelpername: the success line does not name the operator's helper — $OUT" ;;
+esac
+case "$OUT" in
+  *osxkeychain*|*OSXKEYCHAIN*) bad "wfhelpername: names the keychain credential although the operator named store — $OUT" ;;
+  *) ok "wfhelpername: never claims a different credential than the one it ran" ;;
 esac
 
 # ⛔ THE OTHER HALF OF THE SHADOW PREDICATE (review round 4, P1): `GITHUB_TOKEN` alone. gh reads EITHER
@@ -1038,6 +1068,42 @@ else
     "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN GITHUB_TOKEN=shadow-readonly-pat"
   assert_unshadow_arm wfshadow3 wfshadow3 'GH_TOKEN=unset GITHUB_TOKEN=shadow-readonly-pat'
 fi
+
+# ⛔ THE STORED-CREDENTIAL RETRY'S **FAILURE** BRANCH HAD NO ARM AT ALL (review round 10, P0). Every
+# unshadow fixture used `wf_shadowed`, which accepts once the ambient token is gone, and
+# `assert_unshadow_arm` hard-requires `RC=0` — so `push_unshadowed`'s `else` was unreachable, and a
+# mutant that reported PUSHED=1 over a REFUSED stored-credential retry ("rescued … pushed with the STORED
+# credential", exit 0, nothing on origin) was fully green: the one outcome this tool exists to prevent.
+# This is also the shape of the PR's own declared residual (i) — a `store`/`cache` host whose helper never
+# read the ambient token — where the retry MUST fail. `wf_always` refuses every attempt.
+try_rescue wfunshadowfail wf_always fix/lane-one \
+  "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN BG_RESCUE_PUSH_UNSHADOW=1 GH_TOKEN=shadow-readonly-pat"
+[ "$RC" -eq 2 ] \
+  && ok "wfunshadowfail: a REFUSED stored-credential retry exits 2 (never a cheerful 0)" \
+  || bad "wfunshadowfail: rc=$RC (want 2) — a refused stored-credential retry was reported as a rescue — $OUT"
+[ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfunshadowfail: both attempts ran (the retry is the thing being refused)" \
+  || bad "wfunshadowfail: ${ATTEMPTS:-0} attempt(s) (want 2)"
+[ -z "$(ref_of "$T/wfunshadowfail/origin.git" refs/wip/fix-lane-one)" ] \
+  && ok "wfunshadowfail: nothing reached origin, so the exit 2 is true" \
+  || bad "wfunshadowfail: a ref landed on origin while the run reported failure"
+case "$OUT" in
+  *"rescued"*) bad "wfunshadowfail: claimed a rescue that did not happen — $OUT" ;;
+  *) ok "wfunshadowfail: does not claim a rescue it did not perform" ;;
+esac
+case "$OUT" in
+  *"ALSO failed"*) ok "wfunshadowfail: reports the retry's own outcome" ;;
+  *) bad "wfunshadowfail: says nothing about the retry's own failure — $OUT" ;;
+esac
+case "$OUT" in
+  *"no second credential was tried"*)
+    bad "wfunshadowfail: also claims there was no second credential, although it retried — two mutually exclusive diagnoses — $OUT" ;;
+  *) ok "wfunshadowfail: does not also claim there was no second credential" ;;
+esac
+case "$OUT" in
+  *"STILL ONLY ON THIS DISK"*) ok "wfunshadowfail: still says the work is on this disk only" ;;
+  *) bad "wfunshadowfail: the at-risk warning is missing — $OUT" ;;
+esac
 
 # ⛔ A RETRIED RESCUE THAT IS STILL PARTIAL MUST EXIT 2 (review round 4, P2). The partial-archive guard
 # was pinned only on a NON-retried rescue, so `if [ "${#SKIPPED[@]}" -gt 0 ] && [ "$RETRIED" -eq 0 ]` — a
