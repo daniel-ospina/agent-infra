@@ -219,11 +219,16 @@ function jobBlock(text, name) {
   if (start < 0) return "";
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
-    // Any 2-space-indent YAML key ends the job — not only a BARE one. A legal header carrying a
-    // trailing comment (`  lint-docs:  # advisory`) or a quoted name (`  "lint-docs":`) would slip
-    // past a bare-only matcher, the block would then over-extend into that later job, and a guard
-    // line inside THAT job would satisfy an assertion about this one. That is the fail-open direction.
-    if (/^  (?:[A-Za-z0-9_-]+|"[^"]*"|'[^']*'):(?:\s+#.*)?\s*$/.test(lines[i])) { end = i; break; }
+    // ⛔ ANY 2-space-indent YAML key ends the job — matched by INDENT, not by header SHAPE. An
+    // enumerated-shape terminator (`bare`, `# comment`, `"quoted"`) is a list of the spellings someone
+    // thought of, and every spelling it omits lets the block over-extend into a LATER job, where that
+    // job's guard satisfies an assertion about THIS one — the fail-open direction. Measured: with the
+    // guard deleted and the two intervening headers written as flow mappings
+    // (`  revalidate-on-issue-comment: {name: r}`), an enumerated terminator matched neither, the block
+    // ran on into `workflow-drift`'s guard, and the arm read ok/rc=0.
+    // A job's own children live at 4 spaces, so a non-space, non-`#`, non-`-` character at column 2 is
+    // a sibling key and nothing else.
+    if (/^ {2}[^\s#-]/.test(lines[i])) { end = i; break; }
   }
   return lines.slice(start, end).join("\n");
 }
@@ -384,8 +389,18 @@ function checkPipelineComplianceUnchanged() {
   // keeps firing.
   const PC_ALLOWED_ON = ["workflow_call", "pull_request"];
   const PC_ADMITTED_EXTRA = ["issue_comment"];
-  // `.*` before `github.event_name` tolerates a compound `if:`; the INDENT is what jobKeyIs binds.
-  const PC_COMMENT_GUARD = /.*github\.event_name\s*!=\s*'issue_comment'/;
+  // ⛔ THE GUARD MUST BE THE WHOLE EXPRESSION, OR THE GUARD **AND** SOMETHING — never "anything then
+  // the guard text". A leading `.*` tolerates a COMPOUND `if:`, but it tolerates it in the WRONG
+  // DIRECTION: `if: true || github.event_name != 'issue_comment'` contains the guard text and
+  // evaluates to TRUE, so the required job DOES run on the comment event while this gate reads green —
+  // the exact fail-open the admission exists to prevent (measured: ok/rc=0 under a leading `.*`).
+  // Conversely a NARROWING suffix (`… && github.event.action != 'deleted'`) is safe by construction —
+  // ANDing with the guard can only exclude more events — yet a leading `.*` refused it (measured:
+  // rc=1). So the shape is `<guard>` optionally followed by `&& …`, optionally wrapped in `${{ }}`
+  // (GitHub documents the wrapper as equivalent, and refusing it is a false block on a guarded tree),
+  // with the event name quotable either way — YAML permits both, and a formatter may switch them.
+  const PC_COMMENT_GUARD =
+    /(?:\$\{\{\s*)?github\.event_name\s*!=\s*['"]issue_comment['"](?:\s*&&[^}]*)?(?:\s*\}\})?/;
   const onNames = onKeys(region, childIndent);
   const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
   const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));

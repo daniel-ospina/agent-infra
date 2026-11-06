@@ -44,6 +44,11 @@
 #      `if: github.event_name != 'issue_comment'` line on the `pipeline-compliance` JOB — not on the
 #      `workflow-drift` twin, which carries the same text — so the required context can never be
 #      satisfied by a comment. A genuinely new trigger beside the admitted one is still refused BY NAME.
+#      The GUARD'S SHAPE is pinned in both directions too: `if: true || <guard>` (contains the guard
+#      text, evaluates TRUE) must FAIL, while a NARROWING `… && …` suffix and the equivalent `${{ … }}`
+#      / double-quoted spellings must PASS — a tolerance that accepts the weakening half and refuses
+#      the safe half is backwards. And the block terminator is an INDENT test, so a flow-mapped job
+#      header (`  job: {name: x}`) ends the block just as a bare or commented one does.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
@@ -512,6 +517,94 @@ if apply_mutation "$PC" "$PC_OVEREXT_MID1" \
       run_check 1 "a job header carrying a trailing comment still ENDS the required job's block" PC_FILE="$PC_OVEREXT"
     fi
   fi
+fi
+
+# ⛔ AND "ENDS THE BLOCK" MUST BE AN INDENT TEST, NOT AN ENUMERATION OF HEADER SPELLINGS. The arm
+# above pins ONE omitted spelling (a trailing YAML comment); any list of spellings has more, and each
+# omission lets the block run on into a later job where THAT job's guard satisfies an assertion about
+# this one. Here the two intervening headers are legal FLOW MAPPINGS (`  job: {name: x}`), which no
+# bare/quoted/comment terminator matches — measured: an enumerated terminator read ok/rc=0 on this
+# mutant. A job's children are at 4 spaces, so "a non-space, non-# character at column 2" is the
+# complete test, and this arm is what keeps it complete.
+PC_FLOWEXT_MID1="$TMP/pc-flowext-mid1.yml"
+PC_FLOWEXT_MID2="$TMP/pc-flowext-mid2.yml"
+PC_FLOWEXT="$TMP/pc-flowext.yml"
+if apply_mutation "$PC" "$PC_FLOWEXT_MID1" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event." \
+  "the required job's guard must be removable for the flow-mapped-extension arm"; then
+  if apply_mutation "$PC_FLOWEXT_MID1" "$PC_FLOWEXT_MID2" \
+    "  revalidate-on-issue-comment:
+" \
+    "  revalidate-on-issue-comment: {name: revalidate-on-issue-comment}
+" \
+    "the next job header must be flow-mappable"; then
+    if apply_mutation "$PC_FLOWEXT_MID2" "$PC_FLOWEXT" \
+      "  workflow-drift:
+" \
+      "  workflow-drift: {name: workflow-drift}
+" \
+      "the twin's job header must be flow-mappable"; then
+      run_check 1 "a FLOW-MAPPED job header still ENDS the required job's block" PC_FILE="$PC_FLOWEXT"
+    fi
+  fi
+fi
+
+# ⛔ AND THE GUARD MUST BE THE WHOLE EXPRESSION, NOT MERELY "ANYTHING, THEN THE GUARD TEXT". A
+# leading `.*` ("tolerate a compound `if:`") tolerates the compound in the WRONG DIRECTION: `if: true
+# || <guard>` CONTAINS the guard text and evaluates to TRUE, so the required job runs on the comment
+# event while this gate reads green — the fail-open the admission exists to prevent. The same `.*`
+# refused a NARROWING suffix, which is safe by construction (ANDing with the guard can only exclude
+# more events). Both directions are pinned, so a future "just make the regex tolerant" edit reds here.
+PC_ORGUARD="$TMP/pc-orguard.yml"
+if apply_mutation "$PC" "$PC_ORGUARD" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: true || github.event_name != 'issue_comment'" \
+  "the required job's guard must be weakenable with an always-true prefix"; then
+  run_check 1 "an always-true \`||\` prefix does NOT satisfy the required job's guard" PC_FILE="$PC_ORGUARD"
+  case "$FINDINGS" in
+    *"no longer carries"*) pass "…and the refusal still says the job no longer carries the guard" ;;
+    *) fail "the always-true-prefix refusal did not name the lost guard" ;;
+  esac
+fi
+
+# ⛔ AND A STRICTLY-NARROWING SUFFIX IS ACCEPTED. `… && <anything>` can only exclude MORE events than
+# the guard alone, so it is safe by construction and must not read as a lost guard — a false block on a
+# guarded tree is its own defect (the over-block direction), and it is what a leading `.*` produced.
+PC_NARROW="$TMP/pc-narrow.yml"
+if apply_mutation "$PC" "$PC_NARROW" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment' && github.event.action != 'deleted'" \
+  "the required job's guard must be narrowable with a suffix"; then
+  run_check 0 "a NARROWING suffix on the guard is ACCEPTED (it can only exclude more events)" PC_FILE="$PC_NARROW"
+fi
+
+# ⛔ AND AN EQUIVALENT SPELLING IS NOT A LOST GUARD. `${{ … }}` is the form GitHub documents as
+# equivalent, and YAML permits single OR double quotes on `issue_comment` — a formatter may switch
+# them. Refusing either is a false block on a correctly-guarded tree (category-B over-block), so both
+# spellings are pinned as ACCEPTED rather than left to drift into a red nobody can explain.
+PC_DOLLAR="$TMP/pc-dollar.yml"
+PC_DQUOTE="$TMP/pc-dquote.yml"
+if apply_mutation "$PC" "$PC_DOLLAR" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: \${{ github.event_name != 'issue_comment' }}" \
+  "the required job's guard must be wrappable in \${{ }}"; then
+  run_check 0 "GitHub's equivalent \`\${{ … }}\` wrapper is ACCEPTED, not a false block" PC_FILE="$PC_DOLLAR"
+fi
+if apply_mutation "$PC" "$PC_DQUOTE" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != \"issue_comment\"" \
+  "the required job's guard must be re-quotable"; then
+  run_check 0 "a DOUBLE-QUOTED \`issue_comment\` (YAML-identical) is ACCEPTED" PC_FILE="$PC_DQUOTE"
 fi
 
 echo "== 8. ADMISSION: every path the doctor step can read is admitted =="
