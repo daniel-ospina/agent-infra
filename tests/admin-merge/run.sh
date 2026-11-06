@@ -3547,6 +3547,14 @@ grep -q "pr merge" "$SCEN/calls" && fail "(h) a merge was attempted on a PR-uniq
   # and inside `( … )` they incremented a child's — all six assertions printed ✅ and counted for
   # nothing, so the arms they exist to pin stayed revertible with the suite green. Measured.
   # shellcheck disable=SC1090
+  # ⛔ THE ISOLATION HARNESS MUST LOAD THE ONE LITERAL TOO (#3415 review 2).
+  # These three functions now DERIVE the shard family's prefix from
+  # `SHARD_REPRO_ID_PREFIX` instead of respelling it, so extracting a function
+  # without its dependency would leave the pattern empty: under this file's
+  # `set -u` the function aborts, and without it the `sed`/`case` pattern goes
+  # blank and the assertions below would measure the HARNESS instead of the rail
+  # (measured: 4 red, "main_baseline_units collapsed bash-shard:: to '<none>'").
+  eval "$(sed -n '/^SHARD_REPRO_ID_PREFIX=/p' "$ADM")"
   eval "$(sed -n '/^main_baseline_units() {/,/^}/p' "$ADM")"
   eval "$(sed -n '/^main_measured_files() {/,/^}/p' "$ADM")"
   eval "$(sed -n '/^failure_file_key() {/,/^}/p' "$ADM")"

@@ -6702,18 +6702,17 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
-# ⛔ ONE PATTERN FOR "an id NO LOCAL REPRODUCTION can execute" (#3715, #1185).
-# These families name no pytest nodeid, so handed to the runner as ARGV ONE of
-# them makes pytest EXIT 4 having run NOTHING (`ERROR: file or directory not
-# found`) and the whole base run clears nothing. TWO readers ask this question —
-# `reproduce_residual_on_base`, which must not hand them to the runner, and the
-# #3715 block, which reports that the surviving candidate set names nothing a
-# local run could execute. A second copy of the REGEX is exactly the drift the
-# rail's one-derivation rule forbids, so the regex lives here and nowhere else.
-# (This is ONE pattern with TWO readers, not one enumeration of the families:
-# `repro_scope`'s `case` arms answer a DIFFERENT question — admission into the
-# candidate set, which is #1185's narrowing — so a family added here must be
-# considered there too, and vice versa.)
+# ⛔ THE PATTERNS FOR "an id a LOCAL REPRODUCTION can (and cannot) execute"
+# (#3715, #1185, #3415). The non-executable families name no pytest nodeid, so
+# handed to the runner as ARGV ONE of them makes pytest EXIT 4 having run NOTHING
+# (`ERROR: file or directory not found`) and the whole base run clears nothing.
+# TWO readers ask that question — `reproduce_residual_on_base`, which must not
+# hand them to the runner, and the #3715 block, which reports that the surviving
+# candidate set names nothing a local run could execute. A second copy of the
+# REGEX is exactly the drift the rail's one-derivation rule forbids, so the regex
+# lives here and nowhere else. (``repro_scope``'s `case` arms answer a DIFFERENT
+# question — admission into the candidate set, which is #1185's narrowing — so a
+# family added here must be considered there too, and vice versa.)
 #
 # ⛔ TWO PATTERNS, NOT ONE, SINCE #3415 — AND THE SPLIT IS THE POINT. There are
 # two different questions and they no longer have the same answer:
@@ -6741,15 +6740,19 @@ build_evidence() {
 # pytest is the same exit-4-having-run-nothing defect. Derive it, never respell
 # it, so a family added to either half cannot be forgotten by the runner.
 NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^runner::|^pipeline-compliance::'
-# ⛔ ONE LITERAL FOR THE FAMILY, because the ID PREFIX is respelled in two places
-# the rest cannot see: the pytest filter above, and the extraction that routes a
-# token to the shard arm (`sed -n 's/^<prefix>\(.*\)$/\1/p'`). A family whose
-# regex was widened while the extraction still spelled `bash-shard::` would be
-# excluded from the pytest argv AND never extracted — i.e. it would be silently
-# routed to NEITHER arm, which is exactly the permanently-unattributable defect
-# #3415 removes. So the prefix is stated once and derived from. (A SECOND
-# shard-shaped family still needs its own arm; this only makes the respelling
-# impossible.)
+# ⛔ ONE LITERAL FOR THE FAMILY (`SHARD_REPRO_ID_PREFIX`), DERIVED FROM BY EVERY
+# CODE SITE THAT MATCHES OR BUILDS THE ID: the pytest boundary above, the
+# extraction that routes a token to the shard arm, the constructed id in that arm,
+# and the four pre-existing READERS of the family — `main_measured_files`,
+# `main_baseline_units` (two spellings there), `failure_file_key` and
+# `repro_scope`'s admission arm. The literal is a MATCHING PATTERN in all of them,
+# so a respelled copy is not a nit: widening the regex while any reader still names
+# the old string routes a family to NEITHER arm (excluded from the pytest argv,
+# never extracted) — the permanently-unattributable defect #3415 removes,
+# reintroduced silently and with no test that would see it. (A SECOND shard-shaped
+# family still needs its own arm and its own readers; this makes the literal exist
+# once in code. Human-readable prose and the operator-facing messages still spell
+# it, because those are not patterns.)
 SHARD_REPRO_ID_PREFIX='bash-shard::'
 SHARD_REPRO_ID_RE="^${SHARD_REPRO_ID_PREFIX}"
 PYTEST_REPRO_ID_RE="${SHARD_REPRO_ID_RE}|${NON_LOCAL_REPRO_ID_RE}"
@@ -7283,7 +7286,7 @@ main_measured_files() {
     sed '/^guard-step::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     # #2643: the shard path IS the measured file (see the note above).
-    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
+    sed -n "s/^${SHARD_REPRO_ID_PREFIX}\\(.*\\)$/\\1/p" "$mainfails"
     # #1185: a gate identity is keyed by its CHECK, not by a file — the same
     # per-entry identity `job-unreadable::` uses, and for the same reason: a main
     # baseline red on a DIFFERENT check must not read as a pre-existing failure in
@@ -7306,7 +7309,7 @@ main_baseline_units() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^bash-shard::/d; /^runner::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
+    sed "/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^${SHARD_REPRO_ID_PREFIX}/d; /^runner::/d; /^pipeline-compliance::/d; s/::.*//" "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
     sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
@@ -7319,7 +7322,7 @@ main_baseline_units() {
     # generic `s/::.*//` above is suppressed for the family, every shard collapses
     # onto the literal `bash-shard`, and a main baseline red in ONE shard reads as
     # pre-existing in a DIFFERENT one.
-    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
+    sed -n "s/^${SHARD_REPRO_ID_PREFIX}\\(.*\\)$/\\1/p" "$mainfails"
     sed -n 's/^runner::\(.*\)$/\1/p' "$mainfails"
     # #1185: the unit is the CHECK (`pipeline-compliance::<letter>`), for exactly
     # the #7131 reason — main red on check (a) must not read as a pre-existing
@@ -7352,7 +7355,7 @@ failure_file_key() {
     # would collapse every shard onto the literal `bash-shard` (and every JS
     # aggregate onto `runner`), so a main baseline red in one shard would be
     # reported as "measured on this lane" for a DIFFERENT shard's failure.
-    bash-shard::*) printf '%s\n' "${1#bash-shard::}" ;;
+    "${SHARD_REPRO_ID_PREFIX}"*) printf '%s\n' "${1#"$SHARD_REPRO_ID_PREFIX"}" ;;
     runner::*) printf '%s\n' "${1#runner::}" ;;
     # #1185: the unit is the CHECK, `pipeline-compliance::<letter>` — main red on
     # check (a) must not read as a pre-existing failure in this PR's check (c),
@@ -7459,7 +7462,7 @@ repro_scope() {
         ;;
       collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
       # #3415: `bash-shard::` is NOT here — it is reproducible by the shard arm.
-      bash-shard::*) ;;
+      "${SHARD_REPRO_ID_PREFIX}"*) ;;
       runner::*|pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
