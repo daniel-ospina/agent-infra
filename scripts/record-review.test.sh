@@ -7541,6 +7541,87 @@ I only actually reviewed HEAD~1..HEAD."
 assert_eq "$RECORD_RC" "3" "20h33 a tip-relative range beside a passing decoy is REFUSED (rc 3)"
 assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h33 the refusal names the tip-relative notation"
 [ -f "$(Q2 $EH37)" ] && bad "20h33 no record was written" || ok "20h33 no record was written"
+# 20h34 THE KILL-TABLE EXCLUSION MUST BE THE BLOCK, NOT THE REGION AFTER IT (seventh cycle, P1).
+#       The sixth cycle ended the skip only at the next `## ` heading, so ANY prose between the
+#       table and the next level-2 heading was dropped from the claim — including a `### `
+#       subsection. MEASURED on that head: the body below recorded rc 0 with
+#       `delta_range=BASE..HEAD`, minting a signed `clean` over the range's only authored commit
+#       while the artifact said in words that it had not been read. The mirror false block (a
+#       body whose only range statement follows the table) is refused by the same fix.
+EH38=425212; rm -f "$(Q2 $EH38)"
+run_record_delta $EH38 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 20h34 a narrowing after the table is caught | re-point this cell at delta:${DG_A1}..${DG_HEAD} | 20h34 | rc 3 |
+
+### Scope caveat
+I only actually reviewed ${DG_A1}–${DG_HEAD}; the base-side merge was not read."
+assert_eq "$RECORD_RC" "3" "20h34 a narrowing in a ### subsection AFTER the kill table is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h34 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH38)" ] && bad "20h34 no record was written" || ok "20h34 no record was written"
+# and the MIRROR direction: prose that follows the table is scanned, so a body whose only
+# range statement sits there is ACCEPTED — the fix must not turn the exclusion into a region.
+EH39=425214; rm -f "$(Q2 $EH39)"
+run_record_delta $EH39 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="No issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+The range I read was delta:${DG_BASE}..${DG_HEAD}."
+assert_eq "$RECORD_RC" "0" "20h34 the range stated AFTER the kill table is still found (rc 0, no region-wide skip)"
+[ -f "$(Q2 $EH39)" ] || bad "20h34 no record was written for a correct artifact"
+# 20h35 THE MERGE-ONLY ARM MUST READ THE CLAIM TOO (seventh cycle, P2). The sixth cycle applied
+#       "the kill table is not a claim" to the authored arm only, so the merge-only arm's
+#       "names A" needle was satisfied by a kill-table ROW naming A — while that arm's own
+#       comment says the table cannot be the statement the record relies on. A merge-only delta
+#       EXTENDS an attestation, so its cover must BE the verdict at A.
+EH40=425216; rm -f "$(Q2 $EH40)"
+printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
+run_record_delta $EH40 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42521701" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" \
+    STUB_EVIDENCE_BODY="No issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | the row that reddens delta:${DG_A1}..${DG_HEAD} | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h35 a merge-only cover naming A ONLY in the kill table is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "does not name" "20h35 the refusal is the merge-only needle, not a later arm"
+[ -f "$(Q2 $EH40)" ] && bad "20h35 no record was written" || ok "20h35 no record was written"
+# control: the SAME body with A named in the prose records clean — the arm still works.
+EH41=425218; rm -f "$(Q2 $EH41)"
+run_record_delta $EH41 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42521901" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed $DG_A1; no issues found."
+assert_eq "$RECORD_RC" "0" "20h35 a merge-only cover naming A in the PROSE still records clean (rc 0)"
+# 20h36 ONLY A LATER COMMIT CAN NARROW (seventh cycle, P2). A commit reachable from NEITHER
+#       endpoint cannot narrow A..B at all — refusing it is a false block over prose, and the
+#       only remedy for a false block here is the full re-review this feature exists to avoid.
+#       MEASURED before the fix: quoting an unrelated commit (another PR's head) refused.
+DG_UNREL="$(git -C "$DG" commit-tree "$(git -C "$DG" rev-parse "$DG_BASE^{tree}")" -m 'unrelated root' 2>/dev/null || true)"
+EH42=425220; rm -f "$(Q2 $EH42)"
+run_record_delta $EH42 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+For context, the other PR's head was ${DG_UNREL} and it is unrelated to this range."
+if [ -n "$DG_UNREL" ] && ! git -C "$DG" merge-base --is-ancestor "$DG_UNREL" "$DG_BASE" 2>/dev/null && ! git -C "$DG" merge-base --is-ancestor "$DG_BASE" "$DG_UNREL" 2>/dev/null; then
+    ok "20h36 fixture: the quoted commit is on an UNRELATED lineage (neither ancestor nor descendant)"
+else
+    bad "20h36 fixture: DG_UNREL is not unrelated — the vector would not test the unrelated-lineage arm"
+fi
+assert_eq "$RECORD_RC" "0" "20h36 a commit on an UNRELATED lineage does not refuse the claim (rc 0)"
+[ -f "$(Q2 $EH42)" ] || bad "20h36 no record was written for a correct artifact"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7774,9 +7855,50 @@ mut_check "M21 every resolvable commit in the claim is checked" 425204 "$DG_HEAD
 Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
 # M22 — THE TIP-RELATIVE ARM (20h33). Disabling it re-accepts `HEAD~1..HEAD` beside the decoy,
 #       which is the one narrowing notation the meaning rule cannot reach (no hex token).
-MUT="$(mk_mutant relativehead '    case "$_claim" in' '    case "" in')"
+# ⛔ THE ANCHOR INCLUDES THE PATTERN LINE, NOT JUST THE `case` — the merge-only arm's
+# `case "$_claim" in` is the SAME SUBSTRING one indent deeper, so an anchor of `case "$_claim" in`
+# with four leading spaces matched inside the merge-only line and mutated the WRONG ARM; the cell
+# then reported "mutant still refused" and the tip-relative arm was left UNMEASURED for a cycle.
+# A mutation anchor must be ≥ the whole statement it means to break, not a suffix of another one.
+MUT="$(mk_mutant relativehead '    case "$_claim" in
+      *HEAD~*|*HEAD^*' '    case "" in
+      *HEAD~*|*HEAD^*')"
 mut_check "M22 a tip-relative range is refused" 425210 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD~1..HEAD."
+# M23 — THE BLOCK BOUND (20h34). The sixth cycle ended the kill-table skip at the next `## `
+#       heading, which is a REGION, not the block. Restoring that shape (here: letting the block
+#       run to the end of the body) re-accepts a narrowing written under a `### ` subsection
+#       after the table — the false pass the seventh cycle measured.
+MUT="$(mk_mutant blockbound '        stop = last' '        stop = n')"
+mut_check "M23 the kill-table exclusion is the BLOCK, not the region after it" 425212 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+### Scope caveat
+I only actually reviewed ${DG_A1}..${DG_HEAD}; the base-side merge was not read."
+# M24 — THE UNRELATED-LINEAGE BOUND (20h36). Dropping the "is it LATER than A" test makes every
+#       resolvable token that is not reviewed history a contradiction, which is the seventh
+#       cycle's false block: an artifact quoting a commit on an UNRELATED lineage is refused for
+#       a commit that cannot narrow A..B at all. The vector is 20h36 and the mutant must REFUSE.
+MUT="$(mk_mutant unrelbound '      delta_git "$root" merge-base --is-ancestor "$from" "$_tsha" 2>/dev/null || _r=$?
+      [ "$_r" -eq 0 ] || continue' '      :')"
+mut_check "M24 only a commit LATER than A can narrow the range" 425220 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+For context, the other PR's head was ${DG_UNREL} and it is unrelated to this range."
+# M25 — THE MERGE-ONLY CLAIM FORM (20h35). Reading the RAW body in the merge-only arm re-accepts
+#       a cover whose only mention of A is a kill-table row — a table is not a claim, and that arm
+#       exists to require the VERDICT at A.
+MUT="$(mk_mutant rawbody '      case "$_claim" in' '      case "$EVIDENCE_BODY" in')"
+mut_check "M25 the merge-only arm reads the CLAIM, not the raw body" 425216 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42521701" accepted STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="No issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | the row that reddens delta:${DG_A1}..${DG_HEAD} | z | rc 3 |"
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
