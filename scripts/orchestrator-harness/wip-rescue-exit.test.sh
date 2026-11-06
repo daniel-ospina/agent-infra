@@ -3347,7 +3347,13 @@ n45_push_domain="pushed nothing running unmeasured detached verify-unanswered pu
       # the caveat for the value THAT CELL set is required.
       case "$n45_out" in *'could NOT be read (push=unmeasured)'*)
         case "$n45_rescue" in
-          FAILED|UNAVAILABLE) case "$n45_out" in *"no ref this run wrote pins the uncommitted work at "*'the local pin write is guarded and the push runs after it'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
+          # ⛔ FAILED AND UNAVAILABLE ARE DIFFERENT FACTS (P1 — REPRODUCED). They shared one
+          # sentence, and for UNAVAILABLE it claimed "an archive may exist at refs/wip/<slug>" when
+          # the callee NEVER RAN (tool not found / not a worktree root) — impossible, not merely
+          # unmeasured, and contradicted by the same terminal's own [wip] line. Each now has its own.
+          FAILED) case "$n45_out" in *"no ref this run wrote pins the uncommitted work at "*'compare that sha before deciding'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
+          UNAVAILABLE) case "$n45_out" in *'the rescue NEVER RAN'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac
+            case "$n45_out" in *'refs/wip/<slug> PREDATES this run'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat-predate)" ;; esac ;;
           archived-local) case "$n45_out" in *'archived to the LOCAL pin'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
         esac
         case "$n45_tree" in
