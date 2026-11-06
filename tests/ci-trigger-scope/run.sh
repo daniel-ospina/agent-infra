@@ -862,6 +862,25 @@ fi
 #    `issue_comment` (measured; pyyaml shows two jobs named `pipeline-compliance`). Only two header values
 #    are classified: empty (a block mapping) and a value leading with `{` (a flow mapping, read to its
 #    close). Anything else is refused.
+# ⛔ AND A DOUBLE-QUOTED `name:` IS NOT ITS SOURCE TEXT — YAML DECODES ESCAPES. `name:
+# "\x70ipeline-compliance"` evaluates to `pipeline-compliance` (pyyaml), but peeling the quotes and
+# returning the literal made it a DIFFERENT context, so the shadow stopped counting as a minter, the
+# "exactly one minter" check held, and the gate read ok/rc=0 while a second job minted the required
+# context with `if: true` (measured — three spellings: `\x70…`, `\u002D…`, and an escaped line break).
+# Decoding escapes is a YAML parser's job, so any escape in a double-quoted value is REFUSED rather
+# than half-implemented: an unmodelled shape exits 2 and never guesses.
+PC_SHADOW_ESCAPE="$TMP/pc-shadow-escape.yml"
+if apply_mutation "$PC" "$PC_SHADOW_ESCAPE" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow:
+    name: "\x70ipeline-compliance"
+    if: true' \
+  "an escape-decoded shadow name must be constructible"; then
+  run_check 2 "a shadow whose \`name:\` uses a YAML ESCAPE is CANNOT-VERIFY, never green" PC_FILE="$PC_SHADOW_ESCAPE"
+fi
+
 PC_SHADOW_ANCHOR="$TMP/pc-shadow-anchor.yml"
 if apply_mutation "$PC" "$PC_SHADOW_ANCHOR" \
   '          echo "✅ no symlinks under .github/workflows"' \

@@ -644,12 +644,24 @@ function yamlScalar(raw) {
     if (ch === "#" && (i === 0 || /\s/.test(s[i - 1]))) break;
     out += ch;
   }
+  // An UNTERMINATED quote is not a scalar this reader can report a value for.
+  if (quote !== null) return null;
   out = out.trim();
   if (out === "") return null;
   out = out.replace(/^&\S+\s*/, ""); // anchor — not part of the value
   const m = /^(['"])([\s\S]*)\1$/.exec(out);
-  if (m) out = m[2];
-  else if (/^[|>{[]/.test(out) || /^[*&!]/.test(out)) return null; // block/flow/alias: not modelled
+  if (m) {
+    // ⛔ A DOUBLE-QUOTED SCALAR IS NOT ITS SOURCE TEXT — YAML DECODES ESCAPES. `name:
+    // "\x70ipeline-compliance"` evaluates to `pipeline-compliance` (pyyaml), yet peeling the quotes and
+    // returning the literal made it a DIFFERENT context: the shadow stopped counting as a minter, the
+    // "exactly one minter" check held, and the gate read ok/rc=0 while a second job minted the required
+    // context with `if: true` (measured, three spellings: `\x70…`, `\u002D…`, and an escaped line
+    // break). Decoding escapes is a YAML parser's job, so rather than half-implement one, any escape in
+    // a double-quoted value is REFUSED — this file's contract is that an unmodelled shape exits 2 and
+    // never guesses. Single-quoted scalars are literal text in YAML, so they need no decoding.
+    if (m[1] === '"' && m[2].includes("\\")) return null;
+    out = m[2];
+  } else if (/^[|>{[]/.test(out) || /^[*&!]/.test(out)) return null; // block/flow/alias: not modelled
   return out;
 }
 
