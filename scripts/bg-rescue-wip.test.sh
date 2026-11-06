@@ -750,6 +750,21 @@ assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label>
   [ -n "$r1" ] && [ "$r1" = "$r2" ] \
     && ok "$l: both attempts push the SAME refspec (changing the credential cannot change WHAT is published)" \
     || bad "$l: the retry's refspec differs from the first push's ('${r1:-none}' vs '${r2:-none}')"
+  # ⛔ THE STORED-CREDENTIAL RETRY MUST NOT TOUCH THE HELPER LIST (review round 2, P1). This arm's whole
+  # claim is "same push, ambient token out of the way, the configured helper answers" — and the SHIPPED
+  # bug was exactly `-c credential.helper=` clearing the configured chain, which leaves a cell with NO
+  # credential at all. Without this assertion a mutant that re-adds that clear to `push_unshadowed` was
+  # fully GREEN (measured: `PASS=108 FAIL=0`), i.e. the suite would certify the defect this PR fixes.
+  if grep -q 'credential\.helper' "$f/shim/argv.2" 2>/dev/null; then
+    bad "$l: the stored-credential retry touched the credential-helper list — it must leave the CONFIGURED helpers alone and remove only the ambient token: $(tr '\n' ' ' < "$f/shim/argv.2")"
+  else
+    ok "$l: the retry leaves git's CONFIGURED helpers alone (only the ambient token is removed — the shipped bug cleared them)"
+  fi
+  # ⛔ AND IT MAY NOT PROMPT (review round 2, P2). This branch is the one every cell takes, and it runs in
+  # the second before a cap kill: an absent store entry must FAIL, not wait on a terminal nobody watches.
+  grep -qx 'GIT_TERMINAL_PROMPT=0' "$f/shim/attempts.env.2" 2>/dev/null \
+    && ok "$l: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
+    || bad "$l: the stored-credential retry did not disable the terminal prompt — a missing store entry could hang the rescue"
   for p in "$f/shim/argv.1" "$f/shim/argv.2"; do
     [ -f "$p" ] && grep -qE '^(\+|--force$|-f$)' "$p" 2>/dev/null && force=1
   done
@@ -798,6 +813,37 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
 else
   skip "wfhelper: the osxkeychain default only exists on macOS, and this host is $(uname -s 2>/dev/null)"
 fi
+
+# ⛔ THE DOCUMENTED PRECEDENCE, PINNED (review round 2, P2). The header says the explicit helper "wins
+# everywhere"; nothing observed it, so swapping the two `if` lines in `retry_credential` was GREEN. An
+# operator who sets `BG_RESCUE_PUSH_HELPER=<store>` and inherits `BG_RESCUE_PUSH_UNSHADOW=1` from a
+# wrapper must get the store they named. The stub accepts ONLY a helper-named attempt, so an inverted
+# precedence lands on `exit 2` instead of a rescue.
+try_rescue wfprecedence wf_then_ok fix/lane-one \
+  "-u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=osxkeychain BG_RESCUE_PUSH_UNSHADOW=1 GH_TOKEN=shadow-readonly-pat"
+[ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfprecedence: the explicit HELPER wins over BG_RESCUE_PUSH_UNSHADOW=1 (exit 0, 2 attempts)" \
+  || bad "wfprecedence: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the documented precedence is inverted — $OUT"
+[ "${WHO:-}" = "plain keychain " ] \
+  && ok "wfprecedence: the second attempt selected the named helper, not the unshadow candidate" \
+  || bad "wfprecedence: the seam precedence is wrong — attempts were: ${WHO:-none}"
+
+# ⛔ AND THE SEAM CANNOT BUY A DIFFERENT CREDENTIAL OUT OF NOTHING (review round 2, P2). With no ambient
+# token to remove, `BG_RESCUE_PUSH_UNSHADOW=1` used to select an attempt BYTE-IDENTICAL to the one that
+# just failed — with a message claiming a removal that never happened. It must now decline the retry.
+try_rescue wfseammsgs wf_always fix/lane-one \
+  "-u BG_RESCUE_PUSH_HELPER -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_UNSHADOW=1"
+[ "${ATTEMPTS:-0}" = "1" ] \
+  && ok "wfseammsgs: with no ambient token, BG_RESCUE_PUSH_UNSHADOW=1 spends NO retry (it cannot differ)" \
+  || bad "wfseammsgs: ${ATTEMPTS:-0} attempt(s) — a retry was spent removing a shadow that does not exist"
+case "$OUT" in
+  *"retrying ONCE"*) bad "wfseammsgs: claims a retry that was withheld — $OUT" ;;
+  *) ok "wfseammsgs: claims no retry it did not make" ;;
+esac
+case "$OUT" in
+  *UNSHADOW=1*) bad "wfseammsgs: recommends BG_RESCUE_PUSH_UNSHADOW=1 on the one host shape where it cannot help — $OUT" ;;
+  *) ok "wfseammsgs: does not recommend the unshadow seam where it is guaranteed useless" ;;
+esac
 
 
 # ⛔ AND WHEN NO CANDIDATE CAN BE A DIFFERENT CREDENTIAL, THERE IS NO RETRY. A second attempt carrying the
