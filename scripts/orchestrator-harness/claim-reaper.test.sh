@@ -19,7 +19,7 @@
 #   C  a claim whose holder is unidentifiable is REPORTED, never released
 #   D  the dry run lists every candidate WITH ITS EVIDENCE and changes nothing
 #   E  the per-pass bound (`--max`) holds
-#   F  an unparseable lease is LIVENESS, never staleness (claims.sh's recorded rule) — reported only
+#   F  an unparseable lease is an ABSTENTION (never LIVENESS, never staleness — agent-infra#3203) (claims.sh's recorded rule) — reported only
 #   G  a holder box this process cannot query is not evidence of a dead lane — reported only; the one
 #      exception is an explicit `CLAIM_DEAD_HOSTS` declaration WITH an expired lease
 #   H  an instrument that cannot see THIS process cannot witness a holder's death (no release)
@@ -42,6 +42,7 @@
 # load-bearing and must not ship.
 #     identity -> C      lease   -> F      age   -> A      host -> G      recordable -> A
 #     pid      -> B,H    work    -> B      dryrun-> D      recordable -> A   bound -> E
+#     wip      -> O      (the handover line: disabling it must make case O RED — #3484)
 # (`--mutations` is the executable form of that table; the PR body records its measured output.)
 #
 # ⛔ NOT PROVEN HERE, STATED RATHER THAN IMPLIED: the real `ps`/`lsof` behaviour behind `CR_PS` and
@@ -114,6 +115,22 @@ mkclaim() {
           commit-tree "$EMPTY_TREE" -m "claim owner=$owner lease_until=$until nonce=suite$$-$key" 2>/dev/null)"
   [ -n "$sha" ] || { echo "❌ fixture: could not build a claim commit for $key"; exit 2; }
   git -C "$WS/work" push -q origin "$sha:refs/claims/$key" 2>/dev/null || { echo "❌ fixture: could not push refs/claims/$key"; exit 2; }
+}
+
+# mkraw <ref-suffix> <owner> <lease_until> <committer-line-tail>
+# A RAW commit object whose `committer` line is SHAPE-BROKEN — a trailing space, a 3-digit tz — which
+# `git commit-tree` will not produce but a peer CAN mint (`git hash-object --literally -w`) and a plain
+# `git push` ACCEPTS (measured). Used to prove this tool measures the claim's age through claims.sh's
+# oracle (`_claim_commit_time`, whose `sed` is anchored on `$`) and not through `git log --format=%ct`.
+mkraw() {
+  local key="$1" owner="$2" until="$3" tail="$4" ct raw sha
+  ct=$(( $(date +%s) - 90000 ))
+  raw="$(printf 'tree %s\nauthor fleet-claim <claims@localhost> %s +0000\ncommitter fleet-claim <claims@localhost> %s %s\n\nclaim owner=%s lease_until=%s nonce=suite$$-%s\n' \
+          "$EMPTY_TREE" "$ct" "$ct" "$tail" "$owner" "$until" "$key")"
+  sha="$(printf '%s' "$raw" | git -C "$WS/work" hash-object -t commit --literally -w --stdin 2>/dev/null)" \
+    || { echo "❌ fixture: could not write a raw commit for $key"; exit 2; }
+  git -C "$WS/work" push -q origin "$sha:refs/claims/$key" 2>/dev/null \
+    || { echo "❌ fixture: could not push refs/claims/$key"; exit 2; }
 }
 
 # cr <args…> — run the reaper against the fixture registry with the fixture probes.
@@ -192,6 +209,24 @@ case_A() {
   : > "$WS/empty.tsv"
   out="$(CR_LIVE_ROWS="$WS/empty.tsv" cr)"
   ckg "A: an EMPTY-but-answered census is absence, not unmeasured" "verdict=RELEASABLE" "$out"
+
+  # ⛔ THE AGE COMES FROM THE ORACLE, NOT FROM `git log` (review round 22, agent-infra#3203). This gate
+  # asked `git log --format=%ct` while `claim_prune` asks `_claim_commit_time`, and on these two stamps
+  # (BOTH peer-mintable and BOTH accepted by a plain `git push` — measured) the ANS was LIBERAL: the
+  # oracle's `sed` is anchored on `$`, so a trailing space or a 3-digit tz makes the stamp unusable and
+  # the age UNMEASURABLE, while `log` printed the digits and computed an age of ~6.2e7s for a claim
+  # minutes old — clearing the `CR_MIN_AGE` floor and releasing it.
+  DEAD_PIDS="910051 910052 910053"
+  mkraw "issue-8211" "$HOSTN:910052" "$(( $(date +%s) + 3600 ))" "+0000 "   # trailing space
+  mkraw "issue-8212" "$HOSTN:910053" "$(( $(date +%s) + 3600 ))" "+000"    # 3-digit tz
+  out="$(cr --release)"
+  ck  "A: both shape-broken committer stamps are UNMEASURABLE" "2" \
+      "$(printf '%s\n' "$out" | grep -c 'verdict=UNMEASURABLE')"
+  ckg "A: ...the refusal names the unreadable age" "could not be read" "$out"
+  ck  "A: ...and NEITHER is released, however dead its holder is" "present" \
+      "$(has_ref issue-8211 && echo present || echo absent)"
+  ck  "A: ...the 3-digit-tz claim survives too" "present" \
+      "$(has_ref issue-8212 && echo present || echo absent)"
 }
 
 # ── B. a present holder — or present WORK — is never released ───────────────────────────────────
@@ -303,7 +338,10 @@ case_E() {
   ck  "E: an overflowing --max is refused (exit 3)" "3" "$(cr --release --max 99999999999999999999 >/dev/null; echo $?)"
 }
 
-# ── F. an unparseable lease is LIVENESS, never staleness (claims.sh's recorded rule) ────────────
+# ── F. an unparseable lease is an ABSTENTION (never LIVENESS, never staleness — agent-infra#3203) (claims.sh's recorded rule) ────────────
+# ⚠️ agent-infra#3203 changed what the report SAYS about that rule (the class is an ABSTENTION, and
+# its block is bounded by claim_prune) — not what this tool DOES with it: still never released on
+# holder evidence. The quoted-rule assertion follows the wording, so a stale quote cannot linger.
 case_F() {
   setup
   DEAD_PIDS="910051"
@@ -311,7 +349,8 @@ case_F() {
 
   out="$(cr --release)"
   ckg "F: an unparseable lease is reported as UNREADABLE-LEASE" "verdict=UNREADABLE-LEASE" "$out"
-  ckg "F: the report quotes the recorded rule it obeys" "an unparseable lease is LIVE and is never re-examined for orphanhood" "$out"
+  ckg "F: the report quotes the recorded rule it obeys" "never a live window" "$out"
+  ckg "F: ...and names the bounded reap that ends the block" "CLAIM_UNREADABLE_LEASE_MAX_AGE" "$out"
   ck  "F: the claim is NOT released, however dead its holder is" "present" "$(has_ref issue-8201 && echo present || echo absent)"
   ck  "F: nothing was recorded" "0" "$(records_n)"
 }
@@ -720,7 +759,62 @@ STUBGIT
   ck  "N: exactly one reclamation recorded (the vanished one is not one)" "1" "$(records_n)"
 }
 
-# ── the driver ─────────────────────────────────────────────────────────────────────────────────
+# ── O. a release NAMES the WIP behind the claim — the handover (#3484) ───────────────────────
+# A released claim reads as "nothing happened here"; it must read as "here is what someone already
+# did". Measured 2026-11-05: 222 rescued refs/wip/* archives existed and nothing told the next actor
+# to look. The line is NOT a gate — WIP presence must never keep a claim whose holder is gone — so the
+# arms below assert BOTH: the line appears, and the release still happens.
+mkwip() { # mkwip <ref-suffix> — a real snapshot commit under refs/wip/ on the fixture origin
+  local sha
+  sha="$(git -C "$WS/work" -c user.name=fleet-wip -c user.email=wip@localhost \
+          commit-tree "$EMPTY_TREE" -m "wip: $1" 2>/dev/null)"
+  [ -n "$sha" ] || { echo "❌ fixture: could not build a wip commit"; exit 2; }
+  git -C "$WS/work" push -q origin "$sha:refs/wip/$1" 2>/dev/null || { echo "❌ fixture: could not push refs/wip/$1"; exit 2; }
+}
+
+case_O() {
+  setup
+  DEAD_PIDS="910201 910202"
+  mk_wip_ok=0; mkwip "issue-9501-first-attempt" >/dev/null 2>&1 && mk_wip_ok=1
+  ck  "O: fixture: the origin carries a rescued snapshot for the issue" "1" "$mk_wip_ok"
+  mkclaim "issue-9501" "$HOSTN:910201" "$(( $(date +%s) + 3600 ))" 90000   # releasable, WIP exists
+  mkclaim "issue-9502" "$HOSTN:910202" "$(( $(date +%s) + 3600 ))" 90000   # releasable, no WIP
+
+  out="$(cr)"
+  ckg "O: the dry run NAMES the rescued ref at release" "WIP AT RELEASE: refs/wip/issue-9501-first-attempt @" "$out"
+  ckg "O: …and tells the next actor what to do with it" "NEXT ACTOR MUST: read that before starting" "$out"
+  ckg "O: an issue with NO rescued ref says so, rather than saying nothing" "WIP AT RELEASE: none — no refs/wip ref and no issue-named worktree matched #9502" "$out"
+  ck  "O: the dry run still released NOTHING" "2" "$(refs_n)"
+
+  out="$(cr --release)"
+  ck  "O: the claim IS still released (WIP is a handover, never a veto)" "absent" \
+      "$(has_ref issue-9501 && echo present || echo absent)"
+  rec="$(cat "$WS/state/reclaimed/"* 2>/dev/null)"
+  ckg "O: the record CARRIES the WIP line" "wip=refs/wip/issue-9501-first-attempt @" "$rec"
+  ckg "O: …and the next-actor instruction" "wip_next_actor=read that before starting" "$rec"
+  ckg "O: --records prints it for the lane that comes back" "wip=refs/wip/issue-9501-first-attempt" "$(cr --records)"
+
+  # ── A RELATIVE `CLAIM_REPO` IS STILL MEASURED (fresh-context review of #3484, P2). `claims.sh`
+  # supports `CLAIM_REPO="."` for a caller standing at a work-tree root, and the handover line resolves
+  # the repository from a NEUTRAL cwd; `.` resolved from /tmp names a different tree, so the line read
+  # UNMEASURED on a box whose origin answered fine. Measured before the fix; this arm pins the cure.
+  W_REL="$(cd "$WS/work" && env CLAIM_REPO=. bash -c '. "$1"; claim_wip_line 9501' _ "$HERE/claims.sh" 2>/dev/null)"
+  ckg "O: a RELATIVE CLAIM_REPO ('.') still finds the refs/wip snapshot" "refs/wip/issue-9501-first-attempt" "$W_REL"
+  case "$W_REL" in *UNMEASURED*) bad "O: …and it is not reported UNMEASURED (the repository was resolvable)" ;; *) ok "O: …and it is not reported UNMEASURED (the repository was resolvable)" ;; esac
+
+  # ⛔ UNMEASURED IS NOT "NONE" (#3382 invariant 1). A box where refs/wip cannot be read must say so;
+  # rendering it as "none" would be the false-clean this tool refuses everywhere else. The state is
+  # reached the way a box reaches it: the tool installed WITHOUT `brief-gate.sh` beside it.
+  mkclaim "issue-9503" "$HOSTN:910203" "$(( $(date +%s) + 3600 ))" 90000
+  mkdir -p "$WS/bare"
+  cp "$HERE/claim-reaper.sh" "$WS/bare/claim-reaper.sh" && cp "$HERE/claims.sh" "$WS/bare/claims.sh"
+  out="$(env -u CLAIM_OWNER_HOST O="$WS/bare" CR_TEST_SEAMS=1 CLAIM_REPO="$WS/work" \
+        CLAIM_STATE_DIR="$WS/state" CR_PS="$WS/fake-ps" CR_PROC_TABLE="$PROC_TABLE" \
+        CR_LIVE_ROWS="$WS/live.tsv" DEAD_PIDS="910203" bash "$WS/bare/claim-reaper.sh" 2>&1)"
+  ckg "O: an unmeasurable refs/wip is UNMEASURED, never 'none'" "WIP AT RELEASE: UNMEASURED" "$out"
+}
+
+
 title() {
   case "$1" in
     A) echo "absent holder + old ⇒ released ONLY with --release; young never" ;;
@@ -737,12 +831,13 @@ title() {
     L) echo "an infrastructure failure is not a lost race, and a final record is never downgraded" ;;
     M) echo "the reaper's own probe subtree is not its own evidence" ;;
     N) echo "a claim that vanishes mid-pass is counted once and the summary reconciles" ;;
+    O) echo "a release NAMES the WIP behind the claim, and never vetoes on it (#3484)" ;;
   esac
 }
 
 run_all() {
   local c rc overall=0
-  for c in A B C D E F G H I J K L M N; do
+  for c in A B C D E F G H I J K L M N O; do
     PASS=0; FAIL=0
     printf '=== %s. %s\n' "$c" "$(title "$c")"
     # ⛔ THE CASE'S VERDICT IS ITS FAILED-ASSERTION COUNT, NOT ITS EXIT STATUS: the case body is a
@@ -763,13 +858,22 @@ run_all() {
 # The gate bodies are rewritten at their `MUT-ANCHOR:<name>` comment, so the mutation cannot silently
 # target the wrong line — a missing anchor is itself a failure of this driver.
 mutate_to() { # <gate> <out-file>
-  local g="$1" out="$2"
-  awk -v g="$g" '
-    $0 == "cr_gate_" g "() {" { print "cr_gate_" g "() { return 0; } # MUT-ANCHOR:" g; skip = 1; n++; next }
-    skip == 1 && index($0, "} # MUT-ANCHOR:") == 1 { skip = 0; next }
+  local g="$1" out="$2" fn
+  # ⛔ `wip` IS NOT A GATE and is named differently on purpose (#3484): the handover line must never be
+  # able to veto a release, so it is `cr_wip_evidence`, not `cr_gate_wip`. The matrix still requires it
+  # to be load-bearing — disabling it must make its owning case RED.
+  case "$g" in wip) fn="cr_wip_evidence" ;; *) fn="cr_gate_$g" ;; esac
+  awk -v fn="$fn" -v g="$g" '
+    $0 == fn "() {" { print fn "() { return 0; } # MUT-ANCHOR:" g; skip = 1; n++; next }
+    skip == 1 && index($0, "} # MUT-ANCHOR:") == 1 { skip = 0; t++; next }
     skip == 1 { next }
     { print }
-    END { if (n != 1) exit 3 }' "$CR_BIN" > "$out" || return 1
+    # ⛔ BOTH ENDS ARE ASSERTED (fresh-context review of #3484, P1). Without the terminator count, a
+    # function that forgot its `} # MUT-ANCHOR:` silently swallowed EVERY REMAINING LINE of the tool:
+    # the `wip` mutant became a 616-line file with no `cr_judge` and no release loop, so its case went
+    # RED because the program could not run — a mutation that proves nothing, reported as proof. A
+    # missing anchor is a failure of THIS driver, in either direction.
+    END { if (n != 1 || t != 1) exit 3 }' "$CR_BIN" > "$out" || return 1
   bash -n "$out" 2>/dev/null || return 1
   chmod +x "$out" 2>/dev/null || return 1   # an unexecutable copy fails with EACCES, which reads as
                                             # "the gate held" if only the assertions are inspected
@@ -780,7 +884,7 @@ run_mutations() {
   local row gate cases c rc tmp overall=0
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/cr-mut.XXXXXX")" || exit 2
   # gate:owning-case(s). Every gate must appear; every case must be owned by at least one gate.
-  for row in identity:C lease:F age:A host:G pid:B,H work:B dryrun:D recordable:A bound:E; do
+  for row in identity:C lease:F age:A host:G pid:B,H work:B dryrun:D recordable:A bound:E wip:O; do
     gate="${row%%:*}"; cases="${row#*:}"
     if ! mutate_to "$gate" "$tmp/claim-reaper.sh"; then
       bad "MUTATION $gate: could not build the mutated copy (anchor missing?)"; overall=1; continue
@@ -805,5 +909,5 @@ case "${1:-}" in
   --case)      shift; setup; "case_${1}"; rc=$?; cleanup; exit "$rc" ;;
   --mutations) setup; PASS=0; FAIL=0; run_mutations; rc=$?; cleanup; printf '\n(%s ok, %s failed)\n' "$PASS" "$FAIL"; exit "$rc" ;;
   "")          run_all ;;
-  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I|J|K|L|M|N | --mutations]"; exit 3 ;;
+  *)           echo "usage: $0 [--case A|B|C|D|E|F|G|H|I|J|K|L|M|N|O | --mutations]"; exit 3 ;;
 esac

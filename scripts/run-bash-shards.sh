@@ -875,11 +875,61 @@ shard_kill_group() {
 # rc 124, which a suite is free to exit with itself). `shard_bound` 0 short-circuits to the plain
 # invocation, so disabling the bound is not a second code path — it is the ABSENCE of the watchdog,
 # which is what `SHARD_BOUND=0` promises.
+# ⛔ A SHARD DOES NOT INHERIT THIS PROCESS'S OWN DISPATCH DECISION (agent-infra#3415/#2741, measured).
+# The three variables in this runner's env contract describe the CALLER's dispatch — which slice THIS
+# process runs, what bound THIS process applies to each shard — and none of them is a fact about a
+# shard's own children. Handing them over unmodified made every RE-ENTRANT suite (one whose fixture
+# runs the real runner on its own staged list) read the parent's slice as its own:
+#
+#   ❌ BASH_SHARD_SLICE asks for 8 slice(s) of 3 listed shard(s) — a slice would run nothing   (exit 2)
+#
+# Measured 2026-11-05 on head c012d438: EIGHTEEN suites red across all 8 `bash-suites` slices — every
+# one of them green on a laptop, where nothing exports these — while `bash-suites-gate` (unsliced) and
+# main's `script-validate` (a single unsliced job) both stayed GREEN. So the red was in no suite and in
+# no diff: it was this handover. `tests/run-bash-shards-bound/run.sh:76-92` had already written the
+# defect down and worked around it for ITSELF; `tests/ci-lane-parity/run.sh` spells the same workaround
+# at 18 call sites. That is the tell that the root was here — every re-entrant suite was being made
+# responsible for a fact about its caller that it has no way to see, and the ones written since simply
+# did not know to. Fixed once, here.
+#
+# ⛔ CLEARING A BOUND CANNOT REMOVE A BOUND. The shard process is ALREADY bounded from outside by
+# `shard_run_bounded`'s own watchdog, so an inherited `SHARD_BOUND` is not what protects this run — it
+# would only re-apply the PARENT's per-shard figure to an unrelated nested list. And `BASH_SHARDS_BUDGET_SECS`
+# is a whole-list deadline that `slice_skip` has already refuted composing with a slice
+# (this file, `shard_budget` vs `BASH_SHARD_SLICE`): inheriting it into a nested runner is the same
+# ~N-times-too-lenient deadline the refusal above exists to prevent.
+#
+# `env -u` (not a subshell `unset`), because a subshell would have to *know* which variables to drop
+# and the list already drifts between call sites. It is also the idiom this repo's own suites use for
+# the same reason (`env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS`, tests/ci-lane-parity/run.sh).
+#
+# ⛔ `$!` HERE IS THE PROCESS-GROUP LEADER, NOT THE SHARD'S OWN PID — measured, and the first draft of
+# this comment claimed the opposite. `shard_exec "$1" &` backgrounds a FUNCTION, so bash forks a WRAPPER
+# subshell for its body; the wrapper then forks `env`, which execs `bash "$1"` in place. Measured on the
+# shipped shape: `$!`=wrapper, shard=wrapper+2 (a direct `env … bash … &`, or a function whose body ends
+# in `exec`, preserves the pid — the function form does NOT). What makes that safe is the GROUP, not the
+# pid: under `set -m` the backgrounded wrapper IS the leader of a new group and the shard INHERITS that
+# group (measured: wrapper pgid == `$!`, shard pgid == wrapper pgid), so `shard_shard_escalate`'s
+# `kill -TERM -"$1"` / `kill -KILL -"$1"` reach the shard exactly as before. The bare-pid fallback is
+# therefore unreachable while the shard lives — `-<pgid>` fails only when NO member of the group is
+# alive, which means the shard is already gone — so it can never orphan a live shard here.
+# ⚠️ STATED RESIDUAL: the `kill -0` / `ps -o stat=` reads in `shard_watchdog` also name the WRAPPER. It
+# proxies the shard faithfully (it exits when its foreground child does, and is then this driver's zombie
+# until `wait` reaps it, which is the `Z*` case the bound already handles), but between the shard's exit
+# and the wrapper's own is a short window where the read is `S`. ⛔ WHAT THAT COSTS, stated honestly: the
+# watchdog then writes the timeout marker, and the marker branch below DISCARDS `shard_bg_rc`, prints
+# `⏱ SHARD TIMEOUT` and returns 124 — so a shard that finished in time is reported as a TIMEOUT and the
+# run goes RED. It is a FALSE-RED RACE, not a false pass and not cosmetic (a plausible first draft said
+# "cosmetic" because the rc was assumed intact; it is not on that path). Restoring exact pid identity
+# would mean inlining the `env -u` at the `&` site, which moves the string the three ci-lane-parity
+# mutants pin — the P0 this branch already had to repair once.
+shard_exec() { env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND bash "$1"; }
+
 shard_run_bounded() {
-  if [ "$shard_bound" -lt 1 ]; then bash "$1" </dev/null; return $?; fi
+  if [ "$shard_bound" -lt 1 ]; then shard_exec "$1" </dev/null; return $?; fi
   : >"$shard_timeout_marker" 2>/dev/null || true
   set -m                                  # job control ⇒ each background job LEADS its own group
-  bash "$1" </dev/null &
+  shard_exec "$1" </dev/null &
   shard_bg_pid=$!
   # ⛔ THE WATCHDOG'S OUTPUT GOES TO /dev/null, and that is load-bearing rather than tidy: the timer
   # must never be able to hold the driver's stdout open. A caller that runs this driver inside

@@ -218,6 +218,30 @@
 # 3-segment refs (it cannot parse them) and falls to `bound=no_probe`, which refuses rather than
 # guessing — the fail-closed direction.
 #
+# ── EXPECTED vs PUBLISHED: THE FLEET WE CAN SEE IS NOT NECESSARILY THE FLEET THAT EXISTS (#3446) ──
+# Everything above is fail-closed in ONE direction: a box that cannot publish is INELIGIBLE to its
+# peers. That is right for SAFETY and it cannot tell a DEAD box from a FULL one, because both publish
+# nothing — so the fleet can shrink silently and every gate above still answers. MEASURED 2026-11-04:
+# `cmux vm ls` reported **5 of 5 machines running** while `git ls-remote --refs origin 'refs/boxes/*'`
+# returned **exactly one** ref, and a controller concluded, confidently, "there is no usable remote
+# capacity" while ~87 lanes sat idle across four running cells.
+#
+# `cap_fleet_line` joins the two readings in ONE line, so the absence is a READING rather than a
+# silence — the same rule as the check-run one this fleet already applies (a missing check is not a
+# green check; a missing box is not an idle box):
+#
+#   fleet: expected=5 published=1 INELIGIBLE=4 (pi-cell-1, pi-cell-3, pi-cell-4, pi-cell-5) src=cmux
+#
+# `expected` comes from an explicit roster (`CAP_EXPECTED_BOXES`), an explicit count (`CAP_EXPECTED`),
+# or the provider's own running-machine inventory (`cmux vm list --json`), whose `network.ipv4` is the
+# VERY identity `cap_boxid` publishes under — that mapping is what lets the line NAME the missing
+# boxes instead of only counting them. When the expectation cannot be read the line says
+# `expected=UNKNOWN` WITH ITS REASON, never `expected=0`; and an unreadable channel says
+# `published=UNREADABLE`, never `published=0`. `stale=(…)` separates "up, but its controller stopped
+# publishing" from "gone", which is the distinction the original defect destroyed.
+# ⛔ THE POLARITY OF THIS LINE IS THE POINT: it is the ONLY place in this file that reads an EMPTY set
+# as an alarm rather than as a quiet fleet of one, and the suite grades that with a mutant.
+#
 # USAGE (library)
 #   . capacity.sh
 #   rec="$(cap_probe_local "$REPO" "$LANES")"      # one record line, or empty (unreadable)
@@ -226,22 +250,49 @@
 #   cap_place "$(cap_host)" "$fleet" <<<""         # 0 = place=…, 1 = refuse bound=…, 2 = usage
 #   cap_fork_bound "$rec"                          # the FORK bound that refuses this record ('' = none)
 #   cap_fork_headroom "$rec"                       # spare processes, or `unbounded`
+#   cap_fleet_line "$REPO"                         # expected vs published, ONE line (rc 1 incomplete)
+#   cap_fleet_line_from "$fleet" "$rc"             # the same line from a fleet read already in hand
 #
-# USAGE (CLI)   bash capacity.sh probe|fork|place|fleet|publish [args]
+# USAGE (CLI)   bash capacity.sh probe|fork|place|fleet|fleet-line|publish [args]
 # EXIT          0 decided · 1 refused (a REFUSAL IS NOT A FAILURE, it is the answer) · 2 cannot answer
 #               254 the read itself COULD NOT FORK (bash terminates on a failed fork; see FORK HEADROOM)
+#               fleet-line: 0 both sides known · 1 a side is UNKNOWN/UNREADABLE · 2 the channel
+#               itself is unreadable (the line still prints in every case: see cap_fleet_line_from)
 
 # ── seams (every one overridable so the suite is hermetic) ──────────────────────────────────────
-CAP_LPC_CEILING="${CAP_LPC_CEILING:-800}"      # hundredths of load-per-CPU => 8.00 (REFUSE line)
+# ⛔ A SEAM THE SHELL CANNOT COMPARE MUST NOT DISABLE ITS OWN GATE (fresh review round 11, P1). Every
+# comparison below is `[ "$x" -ge "$y" ]`, and an ERRORING test is FALSE — so a seam spelled the way the
+# docs themselves spell it in prose (`CAP_LPC_CEILING` = 8.00 load-per-cpu, the DECIMAL form) or a
+# 20-digit one made its gate error out, the diagnostic went to a stderr both emitters discard, and
+# placement answered `place=h1 … eligible=1` for a box that was over the ceiling, out of disk, out of
+# memory or unable to fork. ONE predicate, applied AT LOAD to every numeric ceiling/floor, so the gate
+# cannot be silently switched off by its own input: a value the shell cannot hold falls back to the
+# DEFAULT (never to 0, which would make every box ineligible — nor to the seam as typed) and says so on
+# stderr once, where a human running the command sees it. `cap_bound_secs` has done exactly this for the
+# timeout seams since round 8; this is the same shape for the placement bounds.
+cap_int_seam() {  # <name> <value> <default> -> the integer to APPLY, or the default (named)
+  case "${2:-}" in
+    ''|*[!0-9]*|0?*)
+      printf 'capacity.sh: %s=%s is not a plain integer (no sign, no decimal, no unit, no leading 0) — applying the default %s\n' \
+        "$1" "${2:-<empty>}" "$3" >&2
+      printf '%s' "$3"; return 0 ;;
+  esac
+  if [ "${#2}" -gt 12 ]; then
+    printf 'capacity.sh: %s=%s is beyond what this shell can represent — applying the default %s\n' "$1" "$2" "$3" >&2
+    printf '%s' "$3"; return 0
+  fi
+  printf '%s' "$((10#$2))"
+}
+CAP_LPC_CEILING="$(cap_int_seam CAP_LPC_CEILING "${CAP_LPC_CEILING:-800}" 800)"   # hundredths of load-per-CPU => 8.00 (REFUSE line)
 # ⛔ AND A SECOND, LOWER LINE — because "yield to the least-loaded peer" with no margin is a THRASH
 # machine: every box would stand down for any box that happens to be 1% idler, and the fleet would
 # dispatch nothing while all of it was healthy. `CAP_YIELD_AT_LPC` is the PREFER-ELSEWHERE line: a box
 # at or above it hands a candidate to a materially-less-loaded peer; a box below it TAKES the work,
 # whoever else is idler. That keeps throughput (a lightly-loaded box never stands down) while still
 # moving work OFF a box that is piling up — and it is a load-per-CPU line, never a lane count.
-CAP_YIELD_AT_LPC="${CAP_YIELD_AT_LPC:-400}"    # hundredths of load-per-CPU => 4.00
-CAP_MIN_DISK_MB="${CAP_MIN_DISK_MB:-500}"      # same floor spawn-gate.sh enforces before a spawn
-CAP_MIN_MEM_MB="${CAP_MIN_MEM_MB:-512}"        # same floor the controller's own mem gate uses
+CAP_YIELD_AT_LPC="$(cap_int_seam CAP_YIELD_AT_LPC "${CAP_YIELD_AT_LPC:-400}" 400)"  # hundredths of load-per-CPU => 4.00
+CAP_MIN_DISK_MB="$(cap_int_seam CAP_MIN_DISK_MB "${CAP_MIN_DISK_MB:-500}" 500)"      # same floor spawn-gate.sh enforces before a spawn
+CAP_MIN_MEM_MB="$(cap_int_seam CAP_MIN_MEM_MB "${CAP_MIN_MEM_MB:-512}" 512)"        # same floor the controller's own mem gate uses
 CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STALE, never eligible
 # ⛔ THE FORK MARGIN (agent-infra#2293): spare processes a box must still have before it may take
 # another lane. It is a MARGIN, not a cap: the incident's numbers are nowhere near it (cell-1 was
@@ -250,7 +301,30 @@ CAP_PROBE_TTL="${CAP_PROBE_TTL:-900}"          # a record older than this is STA
 # git/gh/awk in the controller and its lanes -- and it is deliberately far below any healthy box's
 # reading so it cannot become the new Lane Cap Fetish the owner ruled out on 2026-10-17: nothing here
 # counts LANES, it asks whether this box can still SPAWN.
-CAP_MIN_FORK_HEADROOM="${CAP_MIN_FORK_HEADROOM:-200}"
+CAP_MIN_FORK_HEADROOM="$(cap_int_seam CAP_MIN_FORK_HEADROOM "${CAP_MIN_FORK_HEADROOM:-200}" 200)"
+# ⛔ THE EXPECTED SIDE OF THE FLEET LINE (#3446). Three seams, in the order cap_expected_boxes reads
+# them; every one is empty by default so nothing here changes a box that sets none of them.
+CAP_EXPECTED_BOXES="${CAP_EXPECTED_BOXES:-}"   # explicit roster: `<label>:<boxid>` or `<boxid>` tokens
+CAP_EXPECTED="${CAP_EXPECTED:-}"               # explicit expected COUNT (names unattributable)
+CAP_CMUX_BIN="${CAP_CMUX_BIN:-}"               # path to the provider CLI (default: resolved)
+CAP_CMUX_LIST="${CAP_CMUX_LIST:-}"             # the inventory command LINE (default: `<cmux> vm list --json`)
+# ⛔ THE INVENTORY CALL IS A NETWORK CALL AND IT IS BOUNDED (fresh review, P2). `cmux vm list --json`
+# talks to the provider; unbounded, a wedged provider hangs the DRAINER TICK THAT HOLDS THE LOCK — every
+# later tick then exits `SKIP: drainer already running` and the box stops topping up entirely — and it
+# sits on every controller cycle too. `timeout` is GNU and macOS ships it nowhere, so the bound is
+# `timeout` -> `gtimeout` -> a bash-native watchdog (the same contract as `repo-authority.sh`'s
+# `_gh_bounded` for the identical macOS constraint). A timeout is a NAMED reading, never a zero.
+CAP_INVENTORY_TIMEOUT="${CAP_INVENTORY_TIMEOUT:-10}"  # seconds
+# ⛔ AND THE CHANNEL SIDE IS A NETWORK READ TOO (fresh review round 3, P2). `git ls-remote` was raw and
+# unbounded, and `ai-drainer.sh` now takes the fleet reading BEFORE its guards while holding the tick
+# lock — a wedged/unreachable origin, or a credential prompt, would block that tick forever and every
+# later tick would log `SKIP: drainer already running`. Same consequence the provider bound exists for,
+# on the other half of the same reading. `CAP_CHANNEL_TIMEOUT` bounds it; a timeout is `channel-timeout`.
+CAP_CHANNEL_TIMEOUT="${CAP_CHANNEL_TIMEOUT:-10}"      # seconds
+# ⛔ WHICH ARM OF THE BOUND TO USE: `auto` (default) walks it, `watchdog` FORCES the third arm. The third
+# arm is the macOS case and CI is Linux, so without a seam the arm the fleet actually depends on could
+# never be graded — the same reason the drainer suite pins `DRAINER_OS` instead of inheriting `uname`.
+CAP_BOUND_IMPL="${CAP_BOUND_IMPL:-auto}"      # auto | watchdog
 CAP_NS="${CAP_NS:-refs/boxes}"                 # the namespace peers publish under
 CAP_HOST="${CAP_HOST:-}"                       # identity seam (default: hostname -s)
 CAP_BOXID="${CAP_BOXID:-}"                     # per-box identity seam (default: derived, see cap_boxid)
@@ -752,6 +826,11 @@ cap_fork_bound() {
   p="$(cap_kv "$r" procs)"; m="$(cap_kv "$r" procs_max)"; f="$(cap_kv "$r" fork)"
   case "$p" in ''|*[!0-9]*) printf 'fork_unknown'; return 0 ;; esac
   case "$m" in ''|*[!0-9]*) printf 'fork_unknown'; return 0 ;; esac
+  # …and the fork pair gets the same width bound as every other numeric field (fresh review round 11):
+  # `cap_h_for` compares them, and an ERRORING comparison returns "unbounded" — the fail-OPEN direction
+  # for a box that cannot spawn. 12 digits is far above any real `ulimit -u`/proc count.
+  [ "${#p}" -le 12 ] || { printf 'fork_unknown'; return 0; }
+  [ "${#m}" -le 12 ] || { printf 'fork_unknown'; return 0; }
   case "$f" in
     '') printf 'fork_unknown'; return 0 ;;
     '1') : ;;
@@ -820,6 +899,15 @@ cap_valid_base_record() {
   for k in ncpu load1 lpc lanes disk_free_mb mem_free_mb at; do
     v="$(cap_kv "$r" "$k")"
     case "$v" in ''|*[!0-9]*) return 1 ;; esac
+    # ⛔ A FIELD THE SHELL CANNOT REPRESENT IS A REFUSAL, NOT A PASS (fresh review round 10, P1). Every
+    # gate below is `[ "$x" -ge "$y" ]`, and an ERRORING test is FALSE — so a channel record carrying a
+    # 20-digit `lpc` bypassed the load ceiling (`[: …: integer expression expected` on a discarded stderr)
+    # and `cap_place` answered `place=cell-9 eligible=1` for the box that is saturated. The same shape
+    # held for `disk_free_mb` and `mem_free_mb`, and `at` has its own: `$(( 10#18446744075502150016 ))`
+    # wraps MODULO 2^64, so a stamp 500 years ahead read as "just published" AND NEVER AGED OUT — both
+    # readers agreeing on the wrong thing. 12 digits keeps `at` valid past 2286 and bounds every reading
+    # well inside int64; one predicate, consulted by placement, the line and the pruner alike.
+    [ "${#v}" -le 12 ] || return 1
   done
   case "$(cap_kv "$r" host)" in ''|*[!A-Za-z0-9._-]*) return 1 ;; esac
   return 0
@@ -871,11 +959,34 @@ cap_lpc_human() { awk -v x="${1:-0}" 'BEGIN{printf "%.2f", x/100}'; }
 # The order is fixed so a refusal names a STABLE reason for a given fleet state, and it is
 # FORK -> DISK -> LOAD -> MEMORY (see the FORK HEADROOM header for why this order and not another).
 cap_bound_hit() {
-  local r="${1:-}" now="${2:-}" at age lpc disk mem forkb boxb
+  local r="${1:-}" now="${2:-}" at age lpc disk mem forkb boxb _ttl
   cap_valid_base_record "$r" || { printf 'probe_unreadable'; return 0; }
-  at="$(cap_kv "$r" at)"; age=$(( now - at ))
+  at="$(cap_kv "$r" at)"
+  # ⛔ `at` IS CHANNEL-CONTROLLED AND `08` IS NOT ZERO (fresh review round 6, P1). `case ''|*[!0-9]*`
+  # accepts `08`, but bash reads it as BAD OCTAL: the ASSIGNMENT aborts, so the caller gets NO LINE AT
+  # ALL (the contract says the line is printed in every case) and the drainer then names a false cause
+  # (`why=capacity.sh-incomplete — a STALE copy: re-seed $O`) that sends the operator to the wrong
+  # repair. `10#` is the arithmetic, and a non-digit `now` is a refusal, not a guess.
+  case "$at" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
+  case "$now" in ''|*[!0-9]*) printf 'probe_unreadable'; return 0 ;; esac
+  # ⛔ THE CLOCK GETS THE SAME WIDTH BOUND, AND PLACEMENT MUST AGREE WITH THE LINE ABOUT IT (fresh review
+  # round 11, P2). The line refuses a `now` the shell cannot represent (`clock-unreadable`), but this
+  # path checked only that it was DIGITS: `CAP_NOW=18446744075502150016` wraps to the record's own `at`
+  # modulo 2^64, the age computes as 0, and placement certified `eligible=1` on bytes the line reports
+  # as UNREADABLE — the two readers disagreeing, which is the exact class rounds 9-10 closed for `at`.
+  [ "${#at}" -le 12 ] || { printf 'probe_unreadable'; return 0; }
+  [ "${#now}" -le 12 ] || { printf 'probe_unreadable'; return 0; }
+  age=$(( 10#$now - 10#$at ))
+  # ⛔ THE PLACEMENT PATH REFUSES ON THE SAME TWO DATUMS THE LINE REFUSES ON (fresh review round 9, P1).
+  # An unusable TTL and a stamp beyond the window in the FUTURE are both "this record cannot be aged":
+  # unguarded, `[ "$age" -gt "15m" ]` errored and `cap_place` placed on the record — measured
+  # `place=h1 eligible=1` on bytes the line reports as `published=UNREADABLE why=ttl-unreadable`, and a
+  # broken-RTC record (`at = now + 1e8`) placed the same way. Both are `probe_unreadable`.
+  _ttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"
+  [ -n "$_ttl" ] || { printf 'probe_unreadable'; return 0; }
+  if [ "$age" -lt 0 ] && [ $(( 0 - age )) -gt "$_ttl" ]; then printf 'probe_unreadable'; return 0; fi
   [ "$age" -lt 0 ] && age=0
-  if [ "$age" -gt "$CAP_PROBE_TTL" ]; then printf 'probe_stale'; return 0; fi
+  if [ "$age" -gt "$_ttl" ]; then printf 'probe_stale'; return 0; fi
   # 0. IDENTITY — before fork, disk, load and memory, because every other bound is a statement ABOUT A
   # BOX and this read is what makes the box nameable. An unattributable record is refused here, named,
   # rather than judged on its reading.
@@ -1062,7 +1173,7 @@ cap_record_from_ref() {
 # marks and `place=cmux` — a false PASS in this detector. `ncpu` is ALWAYS compared; `boot` only when both
 # readings are known.
 cap_parse_lsremote() {
-  awk -v ns="$CAP_NS" -v now="$(cap_now)" -v ttl="$CAP_PROBE_TTL" '
+  awk -v ns="$CAP_NS" -v now="$(cap_now)" -v ttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")" '
     function rec_for(ref,   p, seg, nseg, h, bid, rest, n, f, i, lpc, r) {
       p = ref; sub("^" ns "/", "", p)
       if (p == ref) return ""                       # not in our namespace
@@ -1125,14 +1236,604 @@ cap_parse_lsremote() {
 }
 
 # cap_read_fleet <repo> -> every box's newest record, one per line. rc 2 when the channel cannot be
-# read (no repo, no origin, git failure) — the CALLER must then refuse to place, never place blind.
+# read (no repo, no origin, git failure) and rc 124 when the read TIMED OUT (both leave the channel
+# UNREADABLE to a caller; the distinct code is what lets the line name `why=channel-timeout` instead of
+# the generic token) — the CALLER must then refuse to place, never place blind.
 cap_read_fleet() {
   local repo="${1:-.}" out rc
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { printf 'CAPACITY: not a git checkout: %s\n' "$repo" >&2; return 2; }
   git -C "$repo" remote get-url origin >/dev/null 2>&1 || { printf 'CAPACITY: %s has no origin — the fleet channel is unreadable\n' "$repo" >&2; return 2; }
-  out="$(git -C "$repo" ls-remote --refs origin "$CAP_NS/*" 2>/dev/null)"; rc=$?
+  # `GIT_TERMINAL_PROMPT=0` in the subshell: a credential prompt is a hang with the lock held, not a
+  # question anyone is there to answer (the same reason `claims.sh` sets it).
+  out="$(export GIT_TERMINAL_PROMPT=0; cap_bounded "$CAP_CHANNEL_TIMEOUT" git -C "$repo" ls-remote --refs origin "$CAP_NS/*" 2>/dev/null)"; rc=$?
+  [ "$rc" -ne 124 ] || { printf 'CAPACITY: git ls-remote %s/* timed out after %ss — the fleet channel is UNREADABLE\n' "$CAP_NS" "$(cap_bound_secs "$CAP_CHANNEL_TIMEOUT")" >&2; return 124; }
   [ "$rc" -eq 0 ] || { printf 'CAPACITY: git ls-remote %s/* failed (rc=%s) — the fleet channel is UNREADABLE\n' "$CAP_NS" "$rc" >&2; return 2; }
   printf '%s\n' "$out" | cap_parse_lsremote
+}
+
+# ── EXPECTED vs PUBLISHED (#3446) — see the header. FOUR functions, no second transport: the expected
+# side is read from the provider (or an operator's roster) and the published side is the SAME
+# `cap_read_fleet` every other reader uses, so this line cannot disagree with placement about who is
+# visible.
+
+# cap_cmux_bin -> the provider CLI's path (rc 1 when there is none). Resolution order is the fleet's
+# own (`lane-artifacts.sh`): the pin, then PATH, then the macOS app bundle — the Mac is where cmux is
+# NOT on PATH, and a resolver that only asked PATH would answer `UNKNOWN` on the one box whose
+# inventory is authoritative.
+cap_cmux_bin() {
+  local c
+  if [ -n "${CAP_CMUX_BIN:-}" ]; then
+    [ -x "$CAP_CMUX_BIN" ] || return 1
+    printf '%s' "$CAP_CMUX_BIN"; return 0
+  fi
+  c="$(command -v cmux 2>/dev/null)" || c=""
+  [ -n "$c" ] && { printf '%s' "$c"; return 0; }
+  c="/Applications/cmux.app/Contents/Resources/bin/cmux"
+  [ -x "$c" ] && { printf '%s' "$c"; return 0; }
+  return 1
+}
+
+# cap_bounded <secs> <cmd...> — `timeout` -> `gtimeout` -> a bash-native watchdog (rc 124 on timeout).
+# ⛔ THE THIRD ARM IS THE macOS CASE, NOT A COURTESY: `timeout` is GNU coreutils and macOS ships it
+# nowhere (`gtimeout` only with Homebrew), so on the platform this fleet runs its inventory from neither
+# of the first two can fire. No `sleep` at all => run direct rather than fake a 124.
+# ⛔ THE WATCHDOG WRITES THE CHILD'S STDOUT TO A FILE, AND THAT IS LOAD-BEARING (fresh review, P2).
+# `kill -9 "$_p"` reaches the DIRECT pid only, so a descendant the provider left behind (a wrapper, an
+# `ssh`, `( … ) &`) inherits our stdout and keeps the CALLER'S `$( )` pipe open past the bound: MEASURED
+# with `timeout`/`gtimeout` removed from PATH, `cap_bounded 2 bash -c '( sleep 20; echo late ) & sleep 20'`
+# returned after the FULL 20s with rc 124 — a bound that bounds nothing on the only arm macOS can reach.
+# Giving the child a file instead of our stdout means no descendant can hold the reader open; the bytes
+# are `cat`ed after the wait, and a lingering grandchild is then the provider's business, not a wedge in
+# the drainer tick that holds the lock.
+# cap_bound_secs <seam-value> -> the seconds a bound will REALLY use. Normalised NUMERICALLY, because
+# matching spellings is not enough: `0`, `00` and `000` are all "no timeout" to GNU `timeout` while the
+# watchdog arm treats them as an instant expiry, so a legal-looking seam both removed the bound on the
+# arm every Linux cell takes and made the two arms disagree (fresh review rounds 7-8). Whole seconds,
+# 1..999999999; anything else — empty, non-numeric, zero in any spelling, out of range — is the 10 s
+# fallback, and the ONE place that decides is the same one the diagnostics print.
+# cap_ttl_secs <seam-value> -> the freshness window in seconds, or EMPTY when the seam is unusable.
+# ⛔ ONE VALIDATED TTL, CONSULTED BY EVERY READER (fresh review round 9, P1). The line validated
+# `CAP_PROBE_TTL` in three places while `cap_bound_hit` — the function that decides PLACEMENT — used it
+# raw: with `CAP_PROBE_TTL=15m` (the duration typo this file already records) the line refused
+# (`why=ttl-unreadable`) and `cap_place` PLACED on the same bytes (`place=h1 eligible=1`, plus a bash
+# error on stderr), i.e. the controller routed to a record whose age it could not compute — the dead-box-
+# reads-as-present shape this whole change exists to kill. `cap_parse_lsremote` had the third variant:
+# awk reads `15m` as 15, silently shrinking the collision window from 900 s to 15 s.
+cap_ttl_secs() {
+  local n
+  case "${1:-}" in ''|*[!0-9]*) return 0 ;; esac
+  case "$1" in 0?*) return 0 ;; esac
+  [ "${#1}" -le 10 ] || return 0
+  n=$(( 10#$1 ))
+  [ "$n" -ge 0 ] || return 0
+  printf '%s' "$n"
+}
+
+cap_bound_secs() {
+  local n
+  case "${1:-}" in ''|*[!0-9]*) printf '10'; return 0 ;; esac
+  n=$(( 10#$1 ))
+  if [ "$n" -ge 1 ] && [ "$n" -le 999999999 ]; then printf '%s' "$n"; else printf '10'; fi
+}
+
+cap_bounded() {
+  local s="${1:-}" impl="${CAP_BOUND_IMPL:-auto}"; shift 2>/dev/null || true
+  [ "$#" -gt 0 ] || return 2
+  # ⛔ `0` IS NOT A BOUND, AND NEITHER IS `00` (fresh review rounds 7-8, P2). GNU `timeout` reads
+  # `0`, `00`, `000` all as NO TIMEOUT, so a legal-looking seam dropped the bound on the arm every Linux
+  # cell takes (measured: a 6 s provider call under `CAP_INVENTORY_TIMEOUT=00` ran unbounded) while the
+  # watchdog arm returned an instant 124. Normalised NUMERICALLY, in the one helper the diagnostics use.
+  s="$(cap_bound_secs "$s")"
+  # ⛔ THE CHILD NEVER INHERITS OUR STDOUT — ON EVERY ARM, NOT JUST THE WATCHDOG (fresh review round 6,
+  # P1). `kill` reaches the direct pid only, so a descendant the provider left behind keeps the caller's
+  # `$( )` open past the bound. Rounds 3-4 fixed that inside the WATCHDOG arm only, and the `timeout` /
+  # `gtimeout` arms — which is what every Linux cell (and macOS with coreutils) takes — still handed the
+  # child the pipe: MEASURED, a child that `setsid`s a `sleep 12` held the caller for the full 12 s under
+  # a 1 s bound, while the same command through the watchdog arm returned in 1 s. This bound exists so the
+  # reading can be taken INSIDE the drainer's tick lock, so the leak is a wedge, not a slow read. The
+  # destination is a per-process file (no `mktemp`: a `mktemp` that fails must never fall back to
+  # inheriting the pipe), and a redirect that cannot be created fails the command — a named non-zero.
+  local _tmp _to _p _w _rc
+  _tmp="${TMPDIR:-/tmp}/cap-bounded.$$.$RANDOM"
+  # ⛔ AND THE `timeout` ARM KILLS, NOT JUST ASKS (fresh review round 9, P1). A child that IGNORES SIGTERM
+  # ignored the bound: `timeout 1 sh -c 'trap "" TERM; sleep 10'` returned after the child's full 10 s
+  # (rc 124, so the verdict looked right) while the watchdog arm bounded the same child in 1 s — on the
+  # arm every Linux cell takes, in the function whose stated reason for existing is that the reading is
+  # taken INSIDE the drainer's tick lock. `-k` sends SIGKILL one second after the TERM, and the
+  # kill-after status (137) is normalised to the documented 124 so a refusal keeps its NAME.
+  if [ "$impl" != "watchdog" ]; then
+    # ⛔ 137 IS A TIMEOUT ONLY IF THE BOUND ELAPSED (fresh review round 10, P2). `-k` made a
+    # TERM-ignoring child die by SIGKILL (137), but the blanket normalisation also relabelled a child that
+    # killed ITSELF: `cap_bounded 10 sh -c 'kill -9 $$'` returned in 0 s and reported `timed out after
+    # 10s`, while the watchdog arm said `exited 137` — the two arms disagreeing again. The verdict is
+    # normalised only when the clock says the bound really ran out.
+    if command -v timeout >/dev/null 2>&1; then
+      _s0=$SECONDS
+      timeout -k 1 "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      _el=$(( SECONDS - _s0 ))
+      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
+      case "$_rc" in 137) [ "$_el" -ge "$s" ] && _rc=124 ;; esac
+      return "$_rc"
+    fi
+    if command -v gtimeout >/dev/null 2>&1; then
+      _s0=$SECONDS
+      gtimeout -k 1 "$s" "$@" >"$_tmp" 2>/dev/null; _rc=$?
+      _el=$(( SECONDS - _s0 ))
+      cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null
+      case "$_rc" in 137) [ "$_el" -ge "$s" ] && _rc=124 ;; esac
+      return "$_rc"
+    fi
+  fi
+  # No `sleep` at all: nothing here can bound anything, so say so with a command that cannot hang by a
+  # mechanism this function removed — it is the ONE arm where the caller waits for the child itself.
+  command -v sleep >/dev/null 2>&1 || {
+    "$@" >"$_tmp" 2>/dev/null; _rc=$?
+    cat "$_tmp" 2>/dev/null; rm -f "$_tmp" 2>/dev/null; return "$_rc"
+  }
+  # ⛔ AND THE TIMEOUT IS DECIDED BY A SENTINEL, NOT BY `kill -0` (fresh review round 5, P2). Liveness
+  # was read AFTER `wait`, when the watchdog subshell had not necessarily exited yet: 40 timed runs of
+  # `cap_bounded 1 sleep 5` on the watchdog arm gave rc 124 26 times and rc 137 14 times, and the
+  # emitter then says `why=channel-unreadable`/`exited 137` instead of the documented `channel-timeout`.
+  # The watchdog marks the file BEFORE it kills, so the verdict cannot be lost to a race.
+  _to="${TMPDIR:-/tmp}/cap-bounded-to.$$.$RANDOM"
+  rm -f "$_to" 2>/dev/null
+  "$@" >"$_tmp" 2>/dev/null & _p=$!
+  { sleep "$s"; : >"$_to"; kill -9 "$_p" 2>/dev/null; } >/dev/null 2>&1 & _w=$!
+  wait "$_p" 2>/dev/null; _rc=$?
+  [ -e "$_to" ] && _rc=124
+  kill "$_w" 2>/dev/null
+  cat "$_tmp" 2>/dev/null; rm -f "$_tmp" "$_to" 2>/dev/null
+  return "$_rc"
+}
+
+# cap_parse_inventory — PURE: the provider's machine listing (JSON) on stdin -> `<name> <ipv4|->` per
+# RUNNING machine, in listing order. rc 1 when the input carried no machine it could read.
+# ⛔ IT IS A FIELD EXTRACTOR, NOT A JSON PARSER, AND IT REFUSES RATHER THAN GUESSES. The listing is a
+# flat array of flat machine objects (`name`, `status`, `network:{ipv4,…}`), so each object is split on
+# `},{` and two string fields are read. A missing `ipv4` is reported as `-` (a real state: the box is
+# expected, its key is underivable), and "nothing readable" is rc 1 so the caller can say
+# `expected=UNKNOWN` instead of `expected=0`.
+# ⛔ AN OBJECT IT CANNOT **CLASSIFY** IS FATAL FOR THE WHOLE LISTING (fresh review, P1). Treating an
+# unreadable/absent `status` (or an absent `name`) like `stopped` shrank the denominator silently:
+# MEASURED on a listing of four running machines where one carried `"status":"Running"` and one
+# carried no `status` key at all — `expected=2 published=1 INELIGIBLE=1 (pi-cell-3)`, rc 0, no `why=`,
+# two running boxes DROPPED. A smaller `expected` reads as a whole fleet, which is the exact false PASS
+# this line exists to kill; only a `status` that WAS READ as something other than `running` is parked.
+# ⛔ `status` IS PART OF THE TEST: a STOPPED machine is not expected to publish, so counting it would
+# manufacture an INELIGIBLE out of a box the operator deliberately parked.
+cap_parse_inventory() {
+  awk '
+    function jget(s, key,   pat, rest, q) {
+      pat = "\"" key "\"[ \t]*:[ \t]*\""
+      if (!match(s, pat)) return ""
+      rest = substr(s, RSTART + RLENGTH)
+      q = index(rest, "\"")
+      if (q == 0) return ""
+      return substr(rest, 1, q - 1)
+    }
+    # ⛔ ONE TOKEN PER FIELD IS THE OUTPUT CONTRACT OF THIS FUNCTION (fresh review round 12, P2). The
+    # consumer splits each line on whitespace, so a provider NAME carrying a space — `pi cell 1` — was
+    # read as `label=pi`, `bid=cell 1 10.0.0.1`: a PHANTOM box named `pi`, the real box reported
+    # INELIGIBLE beside a published one, and rc 0.
+    # MEASURED `expected=1 published=1 INELIGIBLE=1 (pi)` — the line DID break its own
+    # `published − extra = expected − INELIGIBLE` invariant, and named a live box as missing, from a
+    # DISPLAY-ONLY label. The label is normalised to the token charset (the same one `cap_ref_token`
+    # applies on the roster path); the JOIN key is the address, so nothing a reader compares is lost.
+    function labeltok(s) { gsub(/[^A-Za-z0-9._-]+/, "_", s); return s }
+    { buf = buf $0 }
+    END {
+      if (buf == "") exit 1
+      # ⛔ NORMALISE BEFORE SPLITTING, AND REFUSE A SPLIT THAT DID NOT HAPPEN (fresh review, P2).
+      # The split is on `},{` with spaces/tabs allowed between; ANY other byte at the boundary (`\r`
+      # from a CRLF listing, a stray separator) left the WHOLE listing as ONE fragment, which yields
+      # only the FIRST machine — `got=1`, rc 0, no `why=`. MEASURED: two running machines, CRLF
+      # separated -> `expected=1 published=1 INELIGIBLE=0`, a whole-fleet-healthy line with a live box
+      # invisible. So `\r` is dropped, and a listing that still hides objects in one fragment is
+      # caught structurally: the number of `"status"` keys must equal the number of machine objects.
+      gsub(/\r/, "", buf)
+      # ⛔ A TRUNCATED LISTING IS NOT A SHORTER FLEET (fresh review round 5, P1). The `\r` fix above
+      # caught one class of unsplit body; a body CUT SHORT passed every check, because the cut runs off
+      # the end rather than hiding objects in one fragment: a 5-machine body cut inside the 3rd object
+      # left fragments 1 and 2 classifiable, `nstatus == objs`, and the line read `expected=2
+      # published=2 INELIGIBLE=0` rc 0 — the whole-fleet-healthy shape, from a listing that named two
+      # of five machines. A JSON body is balanced, so completeness is checked structurally: every `{`
+      # has its `}` and every `[` its `]`. (The live CLI emits `{"machines":[…]}` — `]}` — so neither
+      # shape is assumed; only BALANCE is.)
+      _cb = buf; nb = gsub(/\{/, "", _cb); _cb = buf; nbc = gsub(/\}/, "", _cb)
+      _cb = buf; nk = gsub(/\[/, "", _cb); _cb = buf; nkc = gsub(/\]/, "", _cb)
+      if (nb != nbc || nk != nkc) { print "UNCLASSIFIED 1"; exit 1 }
+      _cp = buf; nstatus = gsub(/"status"[ \t]*:/, "", _cp)
+      n = split(buf, m, /}[ \t]*,[ \t]*\{/)
+      got = 0; bad = 0; objs = 0; acc = ""
+      for (i = 1; i <= n; i++) {
+        # A fragment carrying neither machine field is not a machine object (the wrapper head, or an
+        # empty array) — that is not an unclassifiable OBJECT.
+        if (m[i] !~ /"name"[ \t]*:/ && m[i] !~ /"status"[ \t]*:/) continue
+        objs++
+        st = jget(m[i], "status")
+        nm = jget(m[i], "name")
+        if (st == "" || nm == "") { bad++; continue }
+        # ⛔ ONLY A STATUS THAT WAS **READ** AS `stopped` IS PARKED. Anything else that is not
+        # literally `running` (a case variant, a status this extractor has never seen, a `starting`)
+        # is UNCLASSIFIABLE, not parked: dropping it shrinks `expected`, and a smaller denominator
+        # reads as a whole fleet — the exact false PASS this line exists to kill.
+        if (st == "stopped") continue
+        if (st != "running") { bad++; continue }
+        ip = jget(m[i], "ipv4")
+        # ⛔ AN ADDRESS IS THE KEY AND MAY NOT CARRY WHITESPACE (fresh review round 12, P2). Unlike the
+        # label this is not a display nicety: `network.ipv4` IS the identity `cap_boxid` publishes
+        # under, so a value that cannot be one token cannot match any published record — the object is
+        # UNCLASSIFIABLE (which refuses the listing) rather than a key that silently never joins.
+        if (ip != "" && ip ~ /[ \t]/) { bad++; continue }
+        # ⛔ THE COLLISION COMPARE RUNS ON THE **RAW** NAME, THE OUTPUT ON THE TOKEN ONE (fresh review
+        # round 13, P2). Normalising `nm` BEFORE the `ipseen[ip] != nm` test below defeated that gate:
+        # `pi cell 2` and `pi_cell_2` normalise to the SAME token, so two distinct machines behind one
+        # address compared equal and collapsed into one expected entry — MEASURED both `pi_cell_2
+        # 10.8.0.9` rc 0 where the pre-fix build refused `DUPLICATEKEY 10.8.0.9` rc 1. A key that two
+        # live boxes answer to is the false PASS the gate exists to stop, so the comparison keeps the
+        # name the provider actually sent and only the emitted label is normalised.
+        raw = nm
+        nm = labeltok(raw)
+        # ⛔ TWO MACHINES BEHIND ONE IPv4 IS A COLLISION, NOT A TYPO (fresh review round 6, P1). The
+        # expected-side dedupe ("the same box named twice is one box") is right for a roster row and
+        # WRONG for the provider inventory, where the key is `network.ipv4`: it silently dropped the
+        # second machine from `expected` AND from the name list — measured, 5 running machines with
+        # pi-cell-2 reusing the address of pi-cell-1 read `expected=4 published=1 INELIGIBLE=3` rc 0, so a
+        # live machine became invisible to the instrument built to stop exactly that (round 5 graded the
+        # same smaller-denominator shape P1). Refuse the listing instead of picking a winner.
+        if (ip != "") {
+          if ((ip in ipseen) && ipseen[ip] != raw) dup = ip
+          else ipseen[ip] = raw
+        }
+        acc = acc nm " " (ip == "" ? "-" : ip) "\n"
+        got = 1
+      }
+      # The structural check: more `status` keys than objects means the splitter did not split.
+      if (nstatus > objs) bad += (nstatus - objs)
+      # A repeated address under two names: the listing cannot say which machine publishes for it.
+      if (dup != "") { print "DUPLICATEKEY " dup; exit 1 }
+      # ⛔ A REFUSED LISTING PRINTS NO PARTIAL LIST: the whole answer is UNKNOWN, so a caller can never
+      # read the objects it happened to classify as the fleet that exists. (The count rides on the one
+      # line the caller parses.)
+      if (bad > 0) { print "UNCLASSIFIED " bad; exit 1 }
+      if (!got) exit 1
+      printf "%s", acc
+    }'
+}
+
+# cap_fleet_inventory -> the provider's running boxes (`<name> <ipv4|->` lines, rc 0), or ONE line
+# `UNKNOWN <reason>` (rc 1). The reason is a TOKEN an operator can grep, plus a parenthesised detail.
+cap_fleet_inventory() {
+  local out rc bin cmd prc detail
+  if [ -n "${CAP_CMUX_LIST:-}" ]; then
+    # An operator-pinned command LINE (its own wrapper, possibly bounded). Word-split on purpose.
+    # shellcheck disable=SC2086
+    out="$(cap_bounded "$CAP_INVENTORY_TIMEOUT" $CAP_CMUX_LIST </dev/null 2>/dev/null)"; rc=$?
+    cmd="$CAP_CMUX_LIST"
+  else
+    bin="$(cap_cmux_bin)" || { printf 'UNKNOWN provider-inventory-unavailable(no cmux: $CAP_CMUX_BIN, PATH and /Applications/cmux.app/Contents/Resources/bin all refused — a cell carries no provider CLI, so pin CAP_EXPECTED_BOXES or CAP_EXPECTED there)\n'; return 1; }
+    out="$(cap_bounded "$CAP_INVENTORY_TIMEOUT" "$bin" vm list --json </dev/null 2>/dev/null)"; rc=$?
+    cmd="$bin vm list --json"
+  fi
+  # ⛔ A TIMEOUT IS ITS OWN READING (rc 124, both the `timeout`/`gtimeout` arms and the watchdog agree),
+  # because "the provider did not answer in BOUNDED time" sends an operator somewhere different from
+  # "the provider refused".
+  [ "$rc" -ne 124 ] || { printf 'UNKNOWN provider-inventory-unreadable(%s timed out after %ss — CAP_INVENTORY_TIMEOUT)\n' "$cmd" "$(cap_bound_secs "$CAP_INVENTORY_TIMEOUT")"; return 1; }
+  [ "$rc" -eq 0 ] || { printf 'UNKNOWN provider-inventory-unreadable(%s exited %s)\n' "$cmd" "$rc"; return 1; }
+  out="$(printf '%s' "$out" | cap_parse_inventory)"; prc=$?
+  if [ "$prc" -ne 0 ]; then
+    # The parser names HOW MANY objects it could not classify; carry that onto the line rather than
+    # reporting the strictly weaker "nothing could be read" (which is also what a parked fleet says).
+    case "${out:-}" in
+      'UNCLASSIFIED '*) detail="${out#UNCLASSIFIED } machine object(s) could not be classified (an unreadable status, name or address — a value a single output field cannot carry) — a parse failure is not a parked fleet" ;;
+      'DUPLICATEKEY '*) detail="two machines report the same address (${out#DUPLICATEKEY }) — a key that names two boxes cannot say which one publishes" ;;
+      *)                detail="no running machine could be read from it" ;;
+    esac
+    printf 'UNKNOWN provider-inventory-unparseable(%s answered, but %s)\n' "$cmd" "$detail"; return 1
+  fi
+  case "${out:-}" in
+    '') printf 'UNKNOWN provider-inventory-unparseable(%s answered, but no running machine could be read from it)\n' "$cmd"; return 1 ;;
+  esac
+  printf '%s\n' "$out"
+  return 0
+}
+
+# cap_expected_src -> WHICH source answers, by the precedence the header states. ONE place holds the
+# order, and `cap_expected_boxes` dispatches on THIS answer, so the line's `src=` and the data cannot
+# disagree.
+cap_expected_src() {
+  if [ -n "${CAP_EXPECTED_BOXES:-}" ]; then printf 'roster'
+  elif [ -n "${CAP_EXPECTED:-}" ]; then printf 'count'
+  else printf 'cmux'; fi
+}
+
+# cap_expected_boxes -> ONE line per expected box, `<label> <boxid|->`, in the source's order (rc 0),
+# or ONE line `UNKNOWN <reason>` (rc 1). Empty output with rc 0 is a REAL answer only for an explicit
+# count of zero — every refusal path prints the UNKNOWN line, so a caller can never read `no output`
+# as `no boxes expected` (#3446's rule: the absence of a record must not read as a healthy state).
+cap_expected_boxes() {
+  local raw tok label bid n src out seen
+  src="$(cap_expected_src)"
+  case "$src" in
+    roster)
+      raw="$(printf '%s' "$CAP_EXPECTED_BOXES" | tr ',' ' ')"
+      seen=0
+      # shellcheck disable=SC2086
+      for tok in $raw; do
+        case "$tok" in
+          *:*) label="${tok%%:*}"; bid="${tok#*:}" ;;
+          *)   label="$tok";        bid="$tok" ;;
+        esac
+        # ⛔ THE LABEL IS DISPLAY-ONLY AND IS EMITTED AS ONE TOKEN TOO (fresh review round 14, P2).
+        # The line prints the missing boxes as `(label, label)` and the stale ones as `stale=(label)`,
+        # so a label carrying the LIST (comma) or PAREN characters corrupts the field it is printed
+        # into. `cap_ref_token` is the same sanitiser the KEY has been through since this function was
+        # written; applying it here makes "one token per field" true of the whole line.
+        # ⛔ AND A ROSTER ROW CANNOT CARRY A SPACE AT ALL: `$CAP_EXPECTED_BOXES` is split on commas AND
+        # whitespace (it is a plist seam), so `pi cell 1:10.0.0.1` IS three rows and reads as
+        # `expected=3 … (pi, cell)` — a malformed seam, not a lost label. That is why the
+        # one-token guarantee is enforced on the PROVIDER listing (whose names arrive as JSON fields,
+        # where a space is representable) and stated as a seam rule here.
+        [ -n "$label" ] || label="$bid"
+        label="$(cap_ref_token "$label")"; [ -n "$label" ] || label="$bid"
+        bid="$(cap_ref_token "$bid")"
+        printf '%s %s\n' "$label" "${bid:--}"
+        seen=$((seen + 1))
+      done
+      # ⛔ A ROSTER THAT TOKENIZES TO NOTHING IS A REFUSAL, NOT A FLEET OF ZERO (review, P1). A
+      # `CAP_EXPECTED_BOXES=","` (an empty list joined into a plist, a stray space) used to emit no
+      # lines and return 0, so the caller read `expected=0 … INELIGIBLE=0` — a clean bill of health
+      # built from nothing. That is the exact case this function's contract forbids one screen up.
+      [ "$seen" -gt 0 ] && return 0
+      printf 'UNKNOWN roster-empty(CAP_EXPECTED_BOXES="%s" produced no box token)\n' "$CAP_EXPECTED_BOXES"
+      return 1 ;;
+    count)
+      case "$CAP_EXPECTED" in
+        *[!0-9]*) printf 'UNKNOWN expected-count-unparseable(CAP_EXPECTED="%s" is not a whole number)\n' "$CAP_EXPECTED"; return 1 ;;
+      esac
+      # ⛔ A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL, NOT A FLEET OF ZERO (fresh review round 3,
+      # P1). `[ "$n" -lt "$CAP_EXPECTED" ]` fails on a 19+-digit value (`integer expression
+      # expected`, rc 2), the loop body NEVER runs and the function returned 0 with no output — so the
+      # line certified `expected=0 published=1 INELIGIBLE=0 extra=1`, rc 0, with the cause on stderr
+      # that BOTH emitters discard. That is the `expected=0` false PASS the function's own contract
+      # forbids, reachable from one mangled seam. Bound the magnitude BEFORE the loop.
+      #
+      # ⛔ AND THE LEADING-ZERO REFUSAL IS A CONVENTION, NOT A SHELL LIMITATION (fresh review round
+      # 12, P2). The comment that stood here claimed `test` reads `08` as a bad octal — MEASURED
+      # FALSE on bash 5.2.21 and on bash 3.2.57: `[ 0 -lt 08 ]` → rc 0 and `[ 8 -lt 010 ]` → rc 0, so
+      # `test` compares these DECIMALLY, and the pre-guard arm on `CAP_EXPECTED=08` emitted 8 expected
+      # lines rather than none. `08` is therefore not the fail-open this guard was written for; it is
+      # refused because a zero-padded count is not a count anyone writes on purpose, and silently
+      # re-reading an operator's value as a different number is its own surprise. Same refusal, true
+      # reason — a rationale that names a shell behaviour that does not exist teaches the next reader
+      # to trust a hazard that is not there.
+      case "$CAP_EXPECTED" in
+        0?*) printf 'UNKNOWN expected-count-unusable(CAP_EXPECTED="%s" has a leading zero — refused BY CONVENTION (the value would compare fine; a zero-padded count is not re-read as a different number))\n' "$CAP_EXPECTED"; return 1 ;;
+      esac
+      if [ "${#CAP_EXPECTED}" -gt 4 ]; then
+        printf 'UNKNOWN expected-count-unusable(CAP_EXPECTED="%s" is out of range — a fleet of more than 9999 boxes is not a count this instrument can compare)\n' "$CAP_EXPECTED"; return 1
+      fi
+      n=0
+      while [ "$n" -lt "$CAP_EXPECTED" ]; do printf -- '- -\n'; n=$((n + 1)); done
+      return 0 ;;
+  esac
+  cap_fleet_inventory
+}
+
+# cap_fleet_line_from <fleet-text> <read-rc> -> the ONE line (see the header).
+#   rc 0 = both sides known and attributable · 1 = a side is UNKNOWN/UNREADABLE, or the expectation
+#   carries no key so the missing boxes cannot be NAMED. There is NO `return 2` here: a non-zero
+#   <read-rc> is reported as `published=UNREADABLE` and rc 1 — the `2` in the CLI contract belongs to
+#   `cap_fleet_line`, which passes the channel's own rc through.
+# ⛔ IT ALWAYS PRINTS. An instrument that answers a broken read with silence is the defect (#3446): the
+# line carries the state and the exit code carries the completeness, so a `$( )` caller still gets the
+# reading while a gating caller can key on the rc.
+cap_fleet_line_from() {
+  local fleet="${1:-}" rrc="${2:-0}" spec erc now rec bid at age label
+  local exp_n=0 pub_n=0 miss_n=0 stale_n=0 extra_n=0 attrib=1 unk_exp=0 unk_pub=0 src=""
+  local fresh=" " staleids=" " expids=" " names="" stalen="" why="" exp_f pub_f inel_f rc
+  now="$(cap_now)"
+
+  src="$(cap_expected_src)"
+  spec="$(cap_expected_boxes)"; erc=$?
+  if [ "$erc" -ne 0 ]; then
+    unk_exp=1
+    # The reason TOKEN, from the ONE line cap_expected_boxes answers a refusal with. Parsed with
+    # parameter expansion (no pipe, so no SIGPIPE on a truncated reader — #841/#864's class).
+    why="${spec%%$'\n'*}"
+    why="${why#UNKNOWN }"
+    why="${why%%(*}"
+    why="${why%% *}"
+    [ -n "$why" ] || why="expected-unreadable"
+  fi
+  [ "$rrc" -eq 0 ] || { unk_pub=1; [ "$rrc" -eq 124 ] && why="channel-timeout"; }
+  # ⛔ AN UNREADABLE CLOCK IS *NOT* "EVERY RECORD IS FRESH" (review, P1). The old fallback set `now=0`,
+  # which makes every age negative, the clamp below turn it into 0, and `age > CAP_PROBE_TTL` false for
+  # EVERY record — including one dated 2001 — so the line certified a whole fleet from a clock it never
+  # read. `cap_place` refuses on the same datum (`refuse bound=usage detail=clock-unreadable`); this
+  # line reports it in the same vocabulary instead of guessing.
+  case "${now:-}" in
+    ''|*[!0-9]*) unk_pub=1; why="${why:-clock-unreadable}" ;;
+  esac
+  [ "${#now}" -le 12 ] || { unk_pub=1; why="${why:-clock-unreadable}"; }
+  # ⛔ AND A TTL THE SHELL CANNOT COMPARE IS NOT "EVERY RECORD IS FRESH" (fresh review rounds 4, 6 and
+  # 9). `[ "$age" -gt "$CAP_PROBE_TTL" ]` with a non-numeric seam (`15m`), a numeric-but-out-of-range one
+  # (20 digits) or a leading-zero one FAILS, the stale branch is skipped, and EVERY record is counted
+  # fresh: MEASURED, a 100,000,000-second-old record read `published=1 INELIGIBLE=0`, rc 0, with the
+  # only diagnostic on a stderr both emitters discard. ONE predicate (`cap_ttl_secs`) decides, and
+  # `cap_bound_hit` / `cap_parse_lsremote` consult the SAME one.
+  TTL_S="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"
+  [ -n "$TTL_S" ] || { unk_pub=1; why="${why:-ttl-unreadable}"; }
+
+  # THE PUBLISHED SIDE: fresh + attributable records. A record that is merely STALE is NOT published —
+  # that box stopped republishing, which is exactly the state a dead controller produces.
+  if [ "$unk_pub" -eq 0 ]; then
+    while IFS= read -r rec; do
+      [ -n "${rec:-}" ] || continue
+      # ⛔ A RECORD THE LINE CANNOT VALIDATE IS NOT "THIS BOX IS NOT PUBLISHING" (fresh review round
+      # 12, P2). Every field is checked by `cap_valid_base_record`, and `cap_place` REFUSES a record it
+      # cannot place — but this loop DROPPED such a record and then reported the box as INELIGIBLE:
+      # MEASURED `fleet: expected=1 published=0 INELIGIBLE=1 (cell-1)` rc 0 ("both sides known and
+      # attributable") from a record `cap_place` answers `bound=probe_unreadable` on, sending the
+      # operator to restart a controller whose record is merely malformed. The line must not CERTIFY A
+      # MEMBERSHIP placement refuses; it refuses the published reading and names the reason instead.
+      # (Conservative in one direction: placement still evaluates the records it CAN read, so a single
+      # malformed peer blanks the line while placement keeps placing on the others — the safe direction,
+      # and the line says why.)
+      if ! cap_valid_base_record "$rec"; then unk_pub=1; why="${why:-record-unreadable}"; break; fi
+      bid="$(cap_kv "$rec" boxid)"
+      # ⛔ A RECORD WITH NO ATTRIBUTABLE KEY IS NOT "THIS BOX IS NOT PUBLISHING" EITHER (fresh review
+      # round 13, P2 — the same class one `continue` further in). An older peer's record carries no
+      # `boxid` (a pre-#2707 writer; `cap_parse_lsremote` passes it through) and `cap_place` REFUSES it
+      # (`bound=box_unknown`) — while this loop dropped the record and the line asserted
+      # `published=0 INELIGIBLE=1 (cell-1)` rc 0, i.e. a membership claim and "both sides attributable"
+      # about a record whose owner cannot be named. The line must not certify a membership placement
+      # refuses, so an unattributable record refuses the reading and says why.
+      if ! cap_boxid_ok "$bid"; then unk_pub=1; why="${why:-box-unreadable}"; break; fi
+      # ⛔ A COLLIDED KEY IS NOT A PUBLISHED BOX (fresh review round 5, P1). `cap_parse_lsremote` marks
+      # such a record (`collide=1`, `capacity.sh:cap_parse_lsremote`) and `cap_place` refuses the WHOLE
+      # evaluation on it (`bound=identity_collision`) — because two machines under one key mean the
+      # last writer masks the other, which is exactly #3446's dead-box-reads-as-present. The line was
+      # dropping the datum it had just been handed: MEASURED, two machines under one key with one of
+      # them dead read `expected=1 published=1 INELIGIBLE=0` rc 0 while `cap_place` refused the same
+      # bytes. The line and placement must not disagree about who is visible.
+      if [ "$(cap_kv "$rec" collide)" = "1" ]; then unk_pub=1; why="${why:-identity-collision}"; break; fi
+      at="$(cap_kv "$rec" at)"
+      # ⛔ NO GUARD HERE, DELIBERATELY: `cap_valid_base_record` above already requires every numeric
+      # field (including `at`) to be digits and at most 12 long, so the age below cannot abort on a
+      # non-digit or wrap on an oversized stamp. (Fresh review round 14 found the arm that used to sit
+      # here INERT — reverting it changed no reading, because that predicate had already closed the
+      # hole; an arm that can never fire is the "inert enforcer" this file keeps erasing.) Keep the
+      # guarantee where it is MADE, not a second copy of it that can drift.
+      # ⛔ `10#`: a leading-zero `at` (`08`) is CHANNEL-LEGAL and makes plain arithmetic ABORT the whole
+      # function — no line printed, against a documented contract that says one is printed in every case
+      # (fresh review round 6, P1; measured end-to-end: `capacity.sh: line 1500: 08: value too great for
+      # base`, rc 1, and the drainer then blamed a STALE capacity.sh copy).
+      age=$(( 10#$now - 10#$at ))
+      # ⛔ A STAMP BEYOND THE FRESHNESS WINDOW IN THE FUTURE IS NOT A CLOCK DISAGREEMENT — IT IS AN
+      # UNREADABLE AGE (fresh review round 4, P2). A second or two between two boxes' clocks is normal
+      # and clamps to 'just published'; a record dated past `now + CAP_PROBE_TTL` would otherwise be
+      # certified PUBLISHED for ever (a box with a broken RTC read `published=1` and keeps reading
+      # published after it dies). Refuse the reading, in the same vocabulary as the clock arm.
+      if [ "$age" -lt 0 ] && [ $(( 0 - age )) -gt "${TTL_S:-900}" ]; then
+        unk_pub=1; why="${why:-clock-skew}"; break
+      fi
+      [ "$age" -lt 0 ] && age=0
+      case "$fresh" in *" $bid "*) continue ;; esac
+      if [ "$age" -gt "${TTL_S:-900}" ]; then
+        case "$staleids" in *" $bid "*) : ;; *) staleids="$staleids$bid " ;; esac
+        continue
+      fi
+      fresh="$fresh$bid "; pub_n=$((pub_n + 1))
+    done <<EOF
+$fleet
+EOF
+  fi
+
+  # THE EXPECTED SIDE: count them, and when each carries a key, say WHICH are ineligible.
+  # ⛔ AND WHEN THE CHANNEL IS UNREADABLE NOTHING IS COMPARED (review, P2): with `fresh` never computed
+  # every expected box would fall into `missing` and the line would NAME them as ineligible — asserting
+  # "these are not publishing" when the truth is "nobody read the channel". The counts are still
+  # reported; only the membership claim is withheld, and `why=` says why.
+  if [ "$unk_exp" -eq 0 ]; then
+    while read -r label bid; do
+      [ -n "${label:-}" ] || continue
+      case "${bid:--}" in
+        '-'|'') exp_n=$((exp_n + 1)); attrib=0; continue ;;
+      esac
+      # ⛔ THE SAME BOX NAMED TWICE IS ONE BOX (review round 2): `exp_n` counts ENTRIES while `pub_n`
+      # counts DISTINCT keys, so a duplicated roster row made `expected` exceed every other field and
+      # the advertised `published - extra = expected - INELIGIBLE` silently over-reported. Reachable
+      # without a typo — `cap_ref_token` DELETES rather than escapes, so `cell-1:HOST-1` and
+      # `cell-1:host-1` sanitise to the same key.
+      case "$expids" in *" $bid "*) continue ;; esac
+      expids="$expids$bid "
+      exp_n=$((exp_n + 1))
+      [ "$unk_pub" -eq 0 ] || continue
+      case "$fresh" in *" $bid "*) continue ;; esac
+      case "$staleids" in
+        *" $bid "*) stale_n=$((stale_n + 1)); stalen="${stalen}${stalen:+, }$label" ;;
+        *)           miss_n=$((miss_n + 1));  names="${names}${names:+, }$label" ;;
+      esac
+    done <<EOF2
+$spec
+EOF2
+  fi
+  [ "$unk_pub" -eq 0 ] || why="${why:-channel-unreadable}"
+
+  # ⛔ PUBLISHED COUNTS EVERY PUBLISHING BOX, INCLUDING ONE THE EXPECTATION DOES NOT NAME (a Mac is in
+  # no provider VM listing but does publish), so `published` and `INELIGIBLE` need not reconcile on
+  # their own — and a line where expected==published while every expected box is silent would read as
+  # health (the suite's own counter-example: expected=3 published=3 INELIGIBLE=3). `extra=` names that
+  # surplus, so `published - extra = expected - INELIGIBLE` is checkable on the line itself.
+  # ⛔ AND NOT WHEN THE EXPECTATION ITSELF IS UNKNOWN (review round 2): `expids` is empty then, so every
+  # publishing box would be counted as "a box the expectation does not name" — a surplus asserted about
+  # a list nobody read. Same rule as the withheld `(…)` beside it: no comparison, no membership claim.
+  if [ "$unk_pub" -eq 0 ] && [ "$unk_exp" -eq 0 ] && [ "$attrib" -eq 1 ]; then
+    for bid in $fresh; do
+      case "$expids" in *" $bid "*) : ;; *) extra_n=$((extra_n + 1)) ;; esac
+    done
+  fi
+
+  if [ "$unk_exp" -eq 1 ]; then exp_f="UNKNOWN"; else exp_f="$exp_n"; fi
+  if [ "$unk_pub" -eq 1 ]; then pub_f="UNREADABLE"; else pub_f="$pub_n"; fi
+  rc=0
+  if [ "$unk_exp" -eq 1 ] || [ "$unk_pub" -eq 1 ]; then
+    inel_f="unknown"; rc=1
+  elif [ "$attrib" -eq 1 ]; then
+    inel_f=$(( miss_n + stale_n ))
+  else
+    # ⛔ AN UNATTRIBUTABLE ROSTER CANNOT COUNT INELIGIBLE (review round 2). This arm used to SUBTRACT
+    # (`exp_n - pub_n`), which cannot know which expected box a published record belongs to: with a
+    # mixed roster it printed `INELIGIBLE=0 (cell-1)` — the count contradicting the name beside it on
+    # the same line — and with strangers publishing it read `expected=2 published=2`, the equality the
+    # whole change exists to stop. The keyed boxes that ARE provably missing are still named; the count
+    # is `unknown`, which is what the reading supports.
+    inel_f="unknown"; rc=1
+    [ -n "$why" ] || why="expected-has-no-boxid"
+  fi
+  printf 'fleet: expected=%s published=%s INELIGIBLE=%s' "$exp_f" "$pub_f" "$inel_f"
+  [ "$extra_n" -gt 0 ] && printf ' extra=%s' "$extra_n"
+  [ -z "$names" ]  || printf ' (%s)' "$names"
+  [ -z "$stalen" ] || printf ' stale=(%s)' "$stalen"
+  [ -z "$why" ]    || printf ' why=%s' "$why"
+  printf ' src=%s' "$src"
+  # ⛔ WHICH CHANNEL THIS READING CAME FROM (fresh review round 7, P1). `src=` names the EXPECTED side
+  # only, so a `published=0` line was unattributable: the drainer defaulted `FLEET_REPO` to a LANE
+  # checkout whose origin is not the queue repo, and reported a healthy 3-of-5 fleet as
+  # `published=0 INELIGIBLE=5` rc 0 with nothing on the line to say where it had looked. Set only when
+  # the caller read a real channel (`cap_fleet_line`); a direct `cap_fleet_line_from` has no repo.
+  [ -z "${CAP_CHAN:-}" ] || printf ' chan=%s' "$CAP_CHAN"
+  printf '\n' 
+  return "$rc"
+}
+
+# cap_fleet_line <repo> -> read the channel, then the ONE line. rc: 2 when `cap_read_fleet` could not
+# read it (the line still prints `published=UNREADABLE`), otherwise cap_fleet_line_from's rc.
+# cap_chan_of <repo> -> the attributable channel string for `chan=` (no scheme, no userinfo, no `.git`).
+# ⛔ ONE DERIVATION, USED BY EVERY EMITTER (fresh review round 9, P2): the drainer took the field and the
+# controller's three emissions did not, so the controller's `published=0` stayed unattributable — the very
+# gap `chan=` was added for. The userinfo strip is `##*@` (LONGEST match) because a password may itself
+# contain `@`: the shortest-match form left `chan=ss@host` on a line logged every tick.
+cap_chan_of() {
+  local repo="${1:-.}" _o _chan
+  _o="$(git -C "$repo" remote get-url origin 2>/dev/null)" || _o=""
+  _chan="${_o#*://}"; _chan="${_chan##*@}"; _chan="${_chan%.git}"
+  printf '%s' "${_chan:-$repo}"
+}
+
+cap_fleet_line() {
+  local repo="${1:-.}" fleet rrc frc _o _chan
+  # ⛔ NO CREDENTIAL ON THE LINE, AND NO CARRY-OVER (fresh review rounds 8-9, P2). `https://x-access-
+  # token:…@` origins are a CI convention this repo already guards against elsewhere; printing one would
+  # write the token into the drainer's log on every tick. And a module-global leaked the LAST call's
+  # channel onto an unrelated `cap_fleet_line_from`, so the value is passed on the one command that read
+  # a repo (see `cap_chan_of`).
+  _chan="$(cap_chan_of "$repo")"
+  fleet="$(cap_read_fleet "$repo" 2>/dev/null)"; rrc=$?
+  CAP_CHAN="${_chan:-$repo}" cap_fleet_line_from "$fleet" "$rrc"; frc=$?
+  [ "$rrc" -eq 0 ] || return 2
+  return "$frc"
 }
 
 # ── the authorship ledger — the ONE proof of "this box wrote that ref" ────────────────────
@@ -1212,12 +1913,16 @@ cap_ledger_drop() {
 # authorship let the second publisher delete the first box's live ref (reproduced: ncpu 4 vs 8, same key,
 # same boot → one ref left, `foreign=0`, reader saw one box). Authorship is a fact, not a guess.
 cap_ref_deletable() {
-  local orec="${1:-}" oref="${2:-}" ledger="${3:-}" now="${4:-}" oat age
+  local orec="${1:-}" oref="${2:-}" ledger="${3:-}" now="${4:-}" oat age _pttl
   cap_valid_base_record "$orec" || return 1
   cap_ledger_has "$ledger" "$oref" && return 0                  # (a) proven ours
   oat="$(cap_kv "$orec" at)"; case "$oat" in ''|*[!0-9]*) oat=0 ;; esac
-  age=$(( now - oat )); [ "$age" -lt 0 ] && age=0
-  [ "$age" -gt "$CAP_PROBE_TTL" ] && return 0                   # (b) stale
+  case "$now" in ''|*[!0-9]*) return 1 ;; esac
+  age=$(( 10#$now - 10#$oat )); [ "$age" -lt 0 ] && age=0
+  # The ONE validated window (fresh review round 10): a duration typo used to make this comparison error,
+  # which stopped pruning entirely — safe polarity, but the docs claim one predicate for every reader.
+  _pttl="$(cap_ttl_secs "${CAP_PROBE_TTL:-}")"; [ -n "$_pttl" ] || return 1
+  [ "$age" -gt "$_pttl" ] && return 0                           # (b) stale
   return 1
 }
 
@@ -1351,11 +2056,14 @@ cap_cli() {
       printf '%s headroom=%s min_fork_headroom=%s\n' \
         "$fr" "$(cap_fork_headroom "$fr")" "$CAP_MIN_FORK_HEADROOM" ;;
     fleet)   cap_read_fleet "${1:-.}" ;;
+    # `fleet-line` is the OPERATOR's verb for the one-line reconciliation (#3446): the raw records are
+    # `fleet`'s answer, and "is the fleet still whole?" is a different question that no other verb asks.
+    fleet-line) cap_fleet_line "${1:-.}" ;;
     publish) cap_publish "${1:-.}" "${2:-}" ;;
     place)   cap_place "${1:-}" ;;
     ''|-h|--help|help)
       sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) printf 'capacity: unknown command %s (try: probe|fork|place|fleet|publish)\n' "$v" >&2; return 2 ;;
+    *) printf 'capacity: unknown command %s (try: probe|fork|place|fleet|fleet-line|publish)\n' "$v" >&2; return 2 ;;
   esac
 }
 
