@@ -2297,6 +2297,31 @@ case "$out" in
   *'no-such-origin'*) ok "…and what GIT actually said reaches the refusal (the fixture's remote path), so stderr is captured and not merely described" ;;
   *) bad "the tick's refusal does not carry git's own words: $out" ;;
 esac
+# ⛔ (a-bis) …AND THE ARM IS ONLY DISCRIMINATING WHEN THE RUN-PRIVATE REF ALREADY EXISTS (round-15 review,
+# P2). `$BADHOME` above is a FRESH clone, so TWO independent rules produce the same verdict on it: the
+# failed-fetch arm AND the unreadable-target arm (`git rev-parse --verify "${fetch_ref}^{commit}"` is empty
+# because no fetch ever wrote that ref). `if false; then` over the fetch-failed arm therefore left the suite
+# at 418 ok / 0 failed — the leg could not say WHICH rule it had exercised, so neither rule was gated. The
+# shape a converged box is actually in on every tick after the first is the one below: a SUCCESSFUL reading
+# first (which writes `refs/cell-self-pin/fetch-*`), the remote broken AFTERWARDS, and the record still at
+# the old tip — so the unrefreshed ref is the ONLY thing that can decide, and what the arm-less code decides
+# is `current` + exit 0. MEASURED with the arm deleted: rc=0, `verdict        current`.
+GOODHOME="$T/home-goodfetch-then-broken"
+mkdir -p "$GOODHOME/harness" "$GOODHOME/orchestrator"
+git clone -q "$T/origin.git" "$GOODHOME/harness/tree" 2>/dev/null
+printf '%s\n' "$GOODHOME/harness/tree" >"$GOODHOME/.harness-path"
+out="$(pinrun "$GOODHOME" --status 2>&1)"; rc=$?
+[ "$rc" -eq 0 ] && ok "(control) a healthy --status on this fixture reads current, so the run-private fetch ref EXISTS before the remote is broken" \
+  || bad "(control) the pre-break --status exited $rc, not 0, so the leg below could pass through the unreadable-target rule instead of the fetch arm: $out"
+git -C "$GOODHOME/harness/tree" remote set-url origin "$T/no-such-origin.git"
+out="$(pinrun "$GOODHOME" --status 2>&1)"; rc=$?
+[ "$rc" -eq 2 ] && ok "…and with the run-private fetch ref ALREADY present, a failed fetch still exits 2 — the fetch arm is REACHED, so this verdict is the arm's and not the unreadable-target rule's" \
+  || bad "a failed fetch on a fixture that ALREADY has the run-private ref exited $rc, not 2 (unknown): the unreadable-target rule cannot answer here, so this is the fetch arm failing to decide: $out"
+case "$out" in
+  *'verdict        current'*) bad "…but with the run-private ref present, a FAILED fetch printed 'verdict current' — an unrefreshed ref decided a reading the pass itself calls not a green, which is #3194's false PASS with a green exit" ;;
+  *'UNKNOWN (2) — the fetch failed'*) ok "…and the verdict names the FAILED FETCH as its reason, so the two rules are distinguishable on the operator's line too" ;;
+  *) bad "…but the verdict does not name the failed fetch: $out" ;;
+esac
 # ⛔ (b) A RENDER REFUSES WHEN `CELL_HOME` IS UNSET. The installer's default is `$HOME`; the READER of the
 # record it derives from defaults to `/tmp/cell-home` (cloud-cell-supervisor.sh:134). Rendering bakes
 # `Environment=CELL_HOME=` into /etc/systemd/system for ever, and `verify_unit`'s CELL_HOME assertion is
