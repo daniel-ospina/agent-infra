@@ -270,9 +270,14 @@ cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$T/"   # so doctor_path() 
 # session whose named state dir does NOT exist is a DEAD peer (a retired pin root / removed cell
 # home), and since 6b6daa49 the supervisor REPLACES it deliberately ("belongs to the retired state
 # dir … replacing it") rather than dying — with no way to clear a dead one, `start` could never
-# succeed again. So `/other/cell/orchestrator` must be a LIVE peer here: it exists, therefore the
-# supervisor must refuse and print the remedy. The fixture used to leave it absent, which put the
-# arm on the pre-#2315 branch and made it red on a correct supervisor.
+# succeed again. So the peer's state dir (`$T/peer6`, below) must EXIST here: it does, therefore
+# the supervisor must refuse and print the remedy. The fixture used to hard-code
+# `O='/other/cell/orchestrator'` and never create it, which put the arm on the pre-#2315 branch and
+# made it red on a correct supervisor. Note what does NOT discriminate here: the "message carries
+# the state dir" arm is content-sensitive (it reddens if the message stops naming the dir) but it is
+# green on BOTH branches, because `doctor_session_orphaned_foreign()` and the refusal `die` print the
+# same `doctor_session_state_dir` parse. Branch discrimination is carried by the rc, the remedy text
+# and the killed-nothing arms below.
 mkdir -p "$T/o6/state/roles" "$T/stub6" "$T/peer6"
 cat > "$T/stub6/tmux" <<'EOF'
 #!/bin/sh
