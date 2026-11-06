@@ -576,7 +576,20 @@ keys_env_has_value() {
 # a cell lane does not have.
 # ⛔ THE VALIDITY CHECK IS WHOLE-FILE (every entry), the USABILITY check is per-provider. An earlier
 # version validated only the wanted provider, so `{"deepseek":{valid},"openai":false}` certified a
-# store pi throws on — measured against pi, then fixed here.
+# store pi REJECTS — measured against pi, then fixed here.
+#
+# ⛔ `key` ABSENT IS VALID; `key: null` IS **NOT** (measured, 2026-11-06). pi's own rule is
+# `value.key === undefined || typeof value.key === "string"`, and jq's `.key == null` is TRUE for an
+# EXPLICIT JSON null as well as for an absent key — so `(.key == null)` certified
+# `{"openai":{"type":"api_key","key":null}}`, which pi cannot read. That is not a cosmetic
+# difference: a real launch over it prints `No API key found for the selected model` and exits, and it
+# does so for EVERY provider in the file — including one whose own entry is valid:
+#
+#   {"deepseek":{"type":"api_key","key":"sk-…"}, "openai":{"type":"api_key","key":null}}
+#     $ env -i HOME=… pi -p 'reply OK'   →  No API key found for the selected model
+#   …while `{"deepseek":{…"key":"sk-…"}, "openai":false}` (non-object entry) LAUNCHES and reaches
+#   the provider (401 with the key's tail). So the two shapes are NOT the same severity, and this
+#   predicate must match pi's `undefined` test exactly — `has("key") | not` — not `== null`.
 STORE_ENTRY_VALID_JQ='
   def nbstring: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
   def valid_env: ((has("env") | not)
@@ -584,7 +597,7 @@ STORE_ENTRY_VALID_JQ='
                       and ([(.env // {})[] | (type == "string")] | all)));
   (type == "object") and (
     ((.type == "api_key")
-      and ((.key == null) or ((.key | type) == "string"))
+      and (((has("key")) | not) or ((.key | type) == "string"))
       and valid_env)
     or ((.type == "oauth")
         and (.access | nbstring) and (.refresh | nbstring)
@@ -624,6 +637,15 @@ provider_var() {
 #   unreadable not a JSON object at all (a scalar, an array, or unparseable) — never clobbered
 store_provider_state() {
   local auth="$1" prov="$2" st
+  # ⛔ AN UNREADABLE FILE IS NOT AN EMPTY ONE (review round 4, measured). `grep -q` exits 2 — not 1 —
+  # when it cannot OPEN the file, and `! grep` folds BOTH into "no non-space content". So a store the
+  # process cannot read (mode 000, a root-owned file, an EACCES parent) was classified `empty` and the
+  # writer then REPLACED it, destroying the credential it holds. Measured: a mode-000 store carrying an
+  # `anthropic` oauth record came back as a single deepseek api_key, with the repair line reporting
+  # success. The classify-don't-clobber contract below is only true if this branch exists.
+  if [ -e "$auth" ] && [ ! -r "$auth" ]; then
+    printf 'unreadable\n'; return 0
+  fi
   if [ ! -e "$auth" ] || [ ! -s "$auth" ] || ! grep -q '[^[:space:]]' "$auth" 2>/dev/null; then
     printf 'empty\n'; return 0
   fi
@@ -737,10 +759,16 @@ repair_provider_store() {
       log_line "FATAL: the provider store at $auth is not a readable JSON object — refusing to replace the cell's identity. Inspect it by hand (it should be a JSON object, e.g. {\"$want\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move it aside deliberately and re-run." >&2
       return 1 ;;
     malformed)
-      # pi's `load()` throws on the WHOLE file for any invalid entry, so nothing in it authenticates.
-      # The remedy is not to overwrite it: the entry may be one keystroke away from valid, and a
-      # cell's store is the identity this script must not destroy. Refuse, name it, leave the edit.
-      log_line "FATAL: the provider store at $auth holds an entry pi REJECTS when it reads the file (api_key: a string key and an env map of STRINGS; oauth: access+refresh strings and a finite numeric expires; any other type is invalid) — pi throws, so NO provider in this file can authenticate. Refusing to overwrite the cell's identity: fix the offending entry by hand (or move the file aside deliberately) and re-run." >&2
+      # ⛔ THE MECHANISM IS STATED EXACTLY, because an operator acts on it (review round 4). pi's
+      # `ReadOnlyAuthStorage.load()` — the whole-file validator `pi auth check` uses — throws on ANY
+      # invalid entry, which is what this predicate mirrors. What is NOT true is that every such file
+      # breaks a lane: a non-object entry (`{"openai": false}`) still lets a real `pi -p` authenticate
+      # as another provider (measured, 401 with the key's tail). The shapes that DO kill every launch
+      # are the ones `load()` and the launch path agree on — a `key: null` (or any non-string key)
+      # yields `No API key found for the selected model` for the WHOLE store (measured). So this
+      # refuses on the file, not on a per-provider guess: a store that pi's own validator rejects is
+      # not a cell identity to build on, and the fix is one hand-edit of the named entry.
+      log_line "FATAL: the provider store at $auth holds an entry pi REJECTS when it validates the file (api_key: the `key` field ABSENT or a STRING — an explicit null is rejected — and an env map of STRINGS; oauth: access+refresh strings and a finite numeric expires; any other type is invalid). A `key: null` or a non-string key makes pi report 'No API key found' for EVERY provider and the lane dies at startup; the other shapes keep a launch working but make `pi auth check` fail. Refusing to overwrite the cell's identity: fix the offending entry by hand (or move the file aside deliberately) and re-run." >&2
       return 1 ;;
   esac
   # `mergeable` and `empty` reach here: the file is sound (or absent) and this provider has no usable
@@ -752,6 +780,17 @@ repair_provider_store() {
   if ! keys_env_has_value "$var"; then
     log_line "provider store: $ENV_FILE names $var but its value is EMPTY — NOT materialising a credential pi could not use"
     return 2
+  fi
+  # ⛔ A STORED KEY THAT IS PRESENT BUT BLANK IS REPLACED, AND IT IS SAID OUT LOUD (review round 4). pi
+  # treats ANY non-empty `key` string as the credential — measured: `key: "   "` is sent as the auth
+  # header (`401 … auth header format should be Bearer sk-…`) and the environment is NEVER consulted,
+  # because pi returns at the store. So this is not "an existing credential" being clobbered; it is a
+  # value pi would fail with, and leaving it would leave the box dead. `key: ""` and a keyless entry
+  # are different: pi falses through to the environment (measured), so those need no report.
+  if [ "$st" = mergeable ] && jq -e --arg p "$want" \
+       '((.[$p] // null) | type == "object") and ((.[$p].type == "api_key") and (((.[$p].key // "") | length) > 0))' \
+       "$auth" >/dev/null 2>&1; then
+    log_line "provider store: $auth holds a BLANK (whitespace-only) '$want' key — pi treats it as the credential and never falls through to \$ENV_FILE, so replacing it with the delivered value. This is a repair of a value pi cannot use, not an overwrite of a credential."
   fi
   write_store_entry "$auth" "$want" "$var" || return 1
   log_line "REPAIRED provider store: $auth — added '$want' from $ENV_FILE, mode 600. This is a REPAIR of the store pi READS, not a copy: the key was already on this box, and nothing was taken from a checkout."

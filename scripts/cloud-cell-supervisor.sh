@@ -2529,7 +2529,7 @@ SUP_STORE_ENTRY_VALID_JQ='
                       and ([(.env // {})[] | (type == "string")] | all)));
   (type == "object") and (
     ((.type == "api_key")
-      and ((.key == null) or ((.key | type) == "string"))
+      and (((has("key")) | not) or ((.key | type) == "string"))
       and valid_env)
     or ((.type == "oauth")
         and (.access | nbstring) and (.refresh | nbstring)
@@ -2544,15 +2544,29 @@ sup_store_entry_usable_jq() {
   printf '  or ($e.type == "oauth"))'
 }
 
-# sup_store_state <auth.json> <provider> -> present | mergeable | malformed | empty | unreadable
+# sup_store_state <auth.json> <provider> -> present | shadowed | mergeable | malformed | empty | unreadable
 #   present    a credential for this provider that pi can USE
-#   mergeable  the file is VALID and this provider has no usable key (no entry, or an api_key with no
-#              or blank key) — a key could be ADDED, which is the bring-up's job
-#   malformed  pi THROWS reading this file (any invalid entry anywhere), so NO provider in it works
+#   shadowed   the provider HAS an entry that pi will USE, but it is not a usable credential (a
+#              whitespace-only `key`, a non-string `key`, or an `oauth` record where an api key is
+#              needed). pi returns AT THE STORE, so `$ENV_FILE` can never rescue this — see below.
+#   mergeable  the file is VALID and this provider has no usable key (no entry, or an api_key whose
+#              key is absent or the empty string) — pi falls through to the environment, which a lane
+#              does not have, so a key could be ADDED to the store: the bring-up's job
+#   malformed  pi's credential VALIDATOR rejects an entry in this file (`key: null` and a non-string
+#              key also make a real launch report 'No API key found' for every provider)
 #   empty      absent file, 0 bytes, WHITESPACE ONLY, or `{}` — the measured defect
-#   unreadable not a JSON object at all (a scalar, an array, or unparseable)
+#   unreadable not a JSON object at all (a scalar, an array, a non-JSON body), or a file this process
+#              cannot read (EACCES) — never "empty", because an empty store is OVERWRITTEN
 sup_store_state() {
   local auth="$1" prov="$2"
+  # ⛔ AN UNREADABLE FILE IS NOT AN EMPTY ONE (review round 4, measured). `grep -q` exits 2 — not 1 —
+  # when it cannot OPEN the file, and `! grep` folds BOTH into "no non-space content", so a store the
+  # process cannot read was classified `empty` and its `unreadable` refusal below was unreachable for
+  # exactly the shape it exists for. Measured: a mode-000 store carrying an `anthropic` oauth record
+  # was classified `empty`; the bring-up's writer then replaced it with a deepseek api_key.
+  if [ -e "$auth" ] && [ ! -r "$auth" ]; then
+    printf 'unreadable\n'; return 0
+  fi
   if [ ! -e "$auth" ] || [ ! -s "$auth" ] || ! grep -q '[^[:space:]]' "$auth" 2>/dev/null; then
     printf 'empty\n'; return 0
   fi
@@ -2567,6 +2581,22 @@ sup_store_state() {
   fi
   if jq -e "$(sup_store_entry_usable_jq "$prov")" "$auth" >/dev/null 2>&1; then
     printf 'present\n'; return 0
+  fi
+  # ⛔ SHADOWED — the branch that was missing, and the reason a box could be CERTIFIED while its lanes
+  # die (review round 4, measured against pi). `sup_store_entry_usable_jq` requires a TRIMMED non-empty
+  # key, so `key: "   "` reads as "no usable key" and the env-delivered branch below then claimed "the
+  # key comes from $ENV_FILE instead". pi does not do that: it returns AT THE STORE for any non-empty
+  # `key` string, so a real launch sent the whitespace as the auth header
+  # (`401 … auth header format should be Bearer sk-…`) and never looked at `$ENV_FILE`. An `oauth`
+  # record is the same shape for a different reason: pi uses it, and it is not an api-key credential.
+  # The distinction from `mergeable` is pi's OWN falsiness rule: an ABSENT key and `key: ""` fall
+  # through to the environment (measured), a whitespace key does NOT.
+  if jq -e --arg p "$prov" '
+        (.[$p] // null) as $e | ($e != null) and (
+          (($e.type == "api_key")
+            and ((($e.key | type) == "string") and ((($e.key) | length) > 0)))
+          or ($e.type == "oauth"))' "$auth" >/dev/null 2>&1; then
+    printf 'shadowed\n'; return 0
   fi
   printf 'mergeable\n'
 }
@@ -2598,9 +2628,22 @@ check_provider_store() {
       log_line "ok: the provider store holds a usable '$prov' credential ($auth) — pi consults the store FIRST, so a launch does not need the key in its environment"
       return 0 ;;
     malformed)
-      # pi's `load()` validates EVERY entry and throws on the whole file, so this claim is about the
-      # FILE and it is true: one invalid entry makes every provider unreadable.
-      die "$auth holds an entry pi REJECTS when it reads the file (api_key: a string key and an env map of STRINGS; oauth: access+refresh strings and a finite numeric expires; any other type is invalid) — pi throws, so NO provider in this file can authenticate and every lane dies at startup. Do not delete it blindly (it is the cell's identity): fix the offending entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move the file aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
+      # ⛔ THE MECHANISM IS STATED EXACTLY (review round 4). pi's credential VALIDATOR
+      # (`ReadOnlyAuthStorage.load()`, what `pi auth check` uses) throws on the whole file for any
+      # invalid entry, and this predicate mirrors it — so the file-level claim is true. It is NOT true
+      # that every such shape breaks a lane: `{"openai": false}` still launches and authenticates as
+      # another provider (measured). The shapes that kill EVERY launch are the ones the validator and
+      # the launch path agree on — an explicit `key: null` or any non-string key yields `No API key
+      # found for the selected model` for the whole store (measured). This refuses on the file rather
+      # than guessing per provider, because a store pi's own validator rejects is not an identity to
+      # certify a box on, and the repair is one hand-edit of the named entry.
+      die "$auth holds an entry pi REJECTS when it validates the credential file (api_key: the `key` field ABSENT or a STRING — an explicit null is rejected — and an env map of STRINGS; oauth: access+refresh strings and a finite numeric expires; any other type is invalid). A `key: null` or a non-string key makes pi report 'No API key found' for EVERY provider, so every lane dies at startup; the other shapes keep a launch working but fail `pi auth check`. Do not delete it blindly (it is the cell's identity): fix the offending entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}), or move the file aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
+    shadowed)
+      # pi returns AT THE STORE for any non-empty `key` string, so `$ENV_FILE` is never consulted and
+      # "a lane sources keys.env itself" does not rescue this box. Certifying it is the exact defect
+      # this verb exists to stop; the remedy is a store edit (or the bring-up, which replaces a value
+      # pi cannot use).
+      die "this box CANNOT ANSWER A PROMPT, so 'check' must not certify it: $auth carries an '$prov' entry that pi WILL USE but cannot authenticate with ($st) — a whitespace-only key, a non-string key, or an oauth record where an api-key credential is needed. pi returns AT THE STORE, so the key in $ENV_FILE is never reached, and a lane dies with an auth error no matter what keys.env carries. FIX: re-run the bring-up (it replaces a key pi cannot use, from the box's own keys.env): HOME=\$HOME CELL_HOME=\$CELL_HOME bash cloud-cell-bringup.sh --check — or fix that entry by hand ({\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}) (agent-infra#2024)." ;;
     unreadable)
       die "$auth exists but is not a readable JSON object, so this check cannot say whether '$prov' has a credential — and CANNOT-VERIFY IS NOT A PASS. It is also pi's credential store: do not delete it blindly. Inspect it (it should be a JSON object such as {\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}); if it is unusable, move it aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
   esac

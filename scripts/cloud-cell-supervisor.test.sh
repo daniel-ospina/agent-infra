@@ -898,6 +898,56 @@ cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "…and passes it when keys.env delivers the key (the bring-up can merge one in)" \
                    || bad "check false-blocked a keyless entry on a box whose keys.env carries the key (rc=$CC_RC): $CC_OUT"
 rm -f "$F/keys.env"
+# (h2) `key: null` IS NOT `key` ABSENT (review round 4, MEASURED against pi). pi's rule is
+# `value.key === undefined || typeof value.key === "string"`, so an EXPLICIT JSON null makes pi reject
+# the WHOLE store — `No API key found for the selected model`, for every provider — while a keyless
+# entry falls through to the environment. `.key == null` is true for BOTH shapes and certified the
+# first; `has("key") | not` is the rule pi actually applies.
+printf '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":{"type":"api_key","key":null}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a store carrying an explicit \`key: null\` (pi rejects the whole file)" \
+                   || bad "check certified a store with \`key: null\`, over which a real pi prints 'No API key found' and exits"
+case "$CC_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) bad "check printed the CELL CAN RUN banner over a store pi cannot read" ;;
+  *) ok "…and never prints the CELL CAN RUN banner" ;;
+esac
+# (h3) A WHITESPACE-ONLY STORED KEY IS THE CREDENTIAL (review round 4, MEASURED). pi returns AT THE
+# STORE for any non-empty `key` string, so the spaces are sent as the auth header
+# (`401 … auth header format should be Bearer sk-…`) and `$ENV_FILE` is NEVER reached. The arm this
+# replaces said the exact opposite — "the key comes from $ENV_FILE instead" — which is the false PASS
+# that certified a box whose lanes die. `key: ""` and an absent key are the OTHER shape: pi falses
+# through to the environment, so those stay a pass (arm (h)).
+printf '{"deepseek":{"type":"api_key","key":"   "}}\n' > "$AUTH"
+printf 'DEEPSEEK_API_KEY=sk_fixture_only\n' > "$F/keys.env"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a whitespace-only stored key even when keys.env delivers a good one (the store wins)" \
+                   || bad "check certified a box whose stored whitespace key pi sends as the credential while keys.env is never read"
+case "$CC_OUT" in
+  *"the key comes from"*) bad "the refusal still claims keys.env is the source — pi never reaches the environment here: $CC_OUT" ;;
+  *) ok "…and does NOT claim the key comes from \$ENV_FILE" ;;
+esac
+case "$CC_OUT" in
+  *"WILL USE"*) ok "…naming the shadowing entry as the reason (the operator's fix is the STORE, not the provider)" ;;
+  *) bad "the shadow is not explained: $CC_OUT" ;;
+esac
+rm -f "$F/keys.env"
+# (h4) A STORE THIS PROCESS CANNOT READ IS NOT AN EMPTY ONE (review round 4, measured): `grep -q`
+# exits 2 when it cannot open the file and `! grep` folded that into "no non-space content", so the
+# `unreadable` refusal below was unreachable for exactly the shape it exists for.
+if [ "$(id -u)" -eq 0 ]; then
+  ok "SKIP (running as root: mode 000 does not deny the reader, so the EACCES arm cannot be expressed)"
+else
+  printf '{"anthropic":{"type":"oauth","access":"acc","refresh":"ref","expires":9999999999}}\n' > "$AUTH"
+  chmod 000 "$AUTH"
+  cellcheck 0
+  chmod 600 "$AUTH"
+  [ "$CC_RC" -ne 0 ] && ok "check REFUSES a store this process cannot read (EACCES is not an empty store)" \
+                     || bad "check read an EACCES store as empty and certified the box"
+  case "$CC_OUT" in
+    *"not a readable JSON object"*) ok "…classifying it as unreadable, which is CANNOT-VERIFY, never a pass" ;;
+    *) bad "the EACCES store was not classified as unreadable: $CC_OUT" ;;
+  esac
+fi
 # restore the fixture for every arm after this block
 rm -f "$F/keys.env"; seed_provider_store "$F/home"
 cellcheck 0

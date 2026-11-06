@@ -526,6 +526,39 @@ grep -q "denied extension is PRESENT on the cell: extensions/cmux-session.ts" "$
   && ok "--verify refuses the omitted cmux-session.ts too (both halves read the cell, not the ship-list)" \
   || fail "--verify certified a cell carrying cmux-session.ts that its ship-list omits"
 
+# ── the deny must match what pi LOADS, not one SPELLING of it (review round 4, measured) ──────────
+# pi loads a top-level `extensions/*.ts` / `*.js` whatever the letter case, and it does not care what
+# a file is for. So `Tortoise-Capture.ts` (a case variant on a case-SENSITIVE filesystem) and
+# `tortoise-capture.test.ts` (a test-suffixed copy) are BOTH loaded — measured: a capitalised copy was
+# executed by a real `pi -p`, while a case-sensitive stem glob certified the home as clean. The
+# counter-arms matter as much: this sweep may `rm -rf`, so `<stem>-helper.ts` (a DIFFERENT extension)
+# and `<stem>-notes.txt` (not loadable) must NOT be refused.
+: > "$NOELOG"
+mkdir -p "$NEDEST/extensions"
+echo '// a copy under another capitalisation' > "$NEDEST/extensions/Tortoise-Capture.ts"
+echo '// a test-suffixed copy' > "$NEDEST/extensions/tortoise-capture.test.ts"
+echo '// a different extension that shares the prefix' > "$NEDEST/extensions/tortoise-capture-helper.ts"
+echo '// not loadable by pi' > "$NEDEST/extensions/tortoise-capture-notes.txt"
+CELL_HOME="$NOEHOME" INFRA_ROOT="$NOENTRY" PATH="$FAKEBIN:$PATH" \
+  bash "$INSTALLER" --verify >> "$NOELOG" 2>&1
+if grep -qF "/extensions/Tortoise-Capture.ts" "$NOELOG" && grep -qF "$CAPTURE_LINE" "$NOELOG"; then
+  ok "--verify refuses a CASE-VARIANT copy (Tortoise-Capture.ts) with the capture's named line"
+else
+  fail "--verify certified a cell carrying a loadable Tortoise-Capture.ts — pi loads it and the dead-lane sentence is missing: $(grep -m1 -i capture "$NOELOG")"
+fi
+if grep -qF "/extensions/tortoise-capture.test.ts" "$NOELOG"; then
+  ok "--verify refuses a TEST-SUFFIXED copy (tortoise-capture.test.ts) — pi loads it regardless of its purpose"
+else
+  fail "--verify certified a cell carrying tortoise-capture.test.ts, which pi loads as an extension"
+fi
+if grep -qF "tortoise-capture-helper.ts" "$NOELOG" || grep -qF "tortoise-capture-notes.txt" "$NOELOG"; then
+  fail "the deny swept a name that is NOT a copy of the denied entry — it may rm -rf, so a prefix is not enough: $(grep -E 'tortoise-capture-(helper|notes)' "$NOELOG" | head -1)"
+else
+  ok "…and does NOT sweep <stem>-helper.ts (a different extension) or <stem>-notes.txt (not loadable)"
+fi
+rm -f "$NEDEST/extensions/Tortoise-Capture.ts" "$NEDEST/extensions/tortoise-capture.test.ts" \
+      "$NEDEST/extensions/tortoise-capture-helper.ts" "$NEDEST/extensions/tortoise-capture-notes.txt"
+
 if [ ! -e "$DEST/tools/fleet" ]; then
   ok "a legacy tools/fleet/ was migrated out of pi's boot-blocking namespace (#1277)"
 else

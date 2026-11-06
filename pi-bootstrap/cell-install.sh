@@ -241,7 +241,11 @@ denied_extension_stem() {
 # greps a bring-up log for exactly this sentence — so re-word it only together with the tests that
 # assert it (pi-bootstrap/tests/test-cell-install.sh, scripts/cloud-cell-bringup.test.sh).
 denied_extension_note() {
-  case "${1%/}" in
+  # ⛔ CASE-INSENSITIVE, and the reason is the deny itself (review round 4): the sweep matches a copy
+  # under ANY capitalisation because pi loads `*.ts`/`*.js` whatever the case, so a `Tortoise-Capture.ts`
+  # reaches this function. A case-sensitive `case` here gave it the generic note — the operator grepping
+  # for the dead-lane cause would miss the one sentence that names it.
+  case "$(printf '%s' "${1%/}" | tr '[:upper:]' '[:lower:]')" in
     tortoise-capture*) printf 'it blocks session_start and corrupts the provider probe' ;;
     cmux-session*)     printf 'its surface is absent on a Linux cell' ;;
     *)                 printf 'the cell must not run it' ;;
@@ -352,18 +356,30 @@ denied_shipped_names() {
 #   <stem>.ts | .js            (the entry itself, re-spelled)
 #   <stem>.bak[.ts] | -bak     .old | -old | .orig | .copy | .save | .keep | .dist | .local | .tmp
 #   <stem>[.-_]disabled[.ts]   <stem>-off
+#   <stem>.test[.ts] | .spec   (a test/compat copy — pi does not care what a file is FOR)
 #   <stem>.1 | -2 | _3 …       (numbered copies)
+# ⛔ THE COMPARISON IS CASE-INSENSITIVE (review round 4, measured). pi loads a top-level `*.ts` / `*.js`
+# extension whatever the LETTER CASE, and a Linux filesystem is case-sensitive, so `Tortoise-Capture.ts`
+# is a DIFFERENT, LOADABLE file that a case-sensitive stem match certified as absent:
+#
+#   $ CELL_HOME=/tmp/iv … cell-install.sh --verify   →  no FAIL for Tortoise-Capture.ts
+#   $ ls /tmp/pi-ext-probe | grep LOADED             →  LOADED-uppercase   (pi executed it)
+#
+# The deny's whole doctrine is "match what pi LOADS", not "match one spelling": a copy is a copy under
+# any capitalisation, and the ship-list guard below still protects a name the repo really ships.
 # ⛔ A name that does not reduce to one of these is NOT swept: `<stem>-helper.ts` is a different
 # extension, and the sweep is allowed to `rm -rf`.
 denied_copy_variant() {
-  local base="${1%/}" stem="${2%/}" rest
-  rest="${base#"$stem"}"
-  [ "$rest" = "$base" ] && return 1          # does not start with the stem at all
+  local base="${1%/}" stem="${2%/}" rest lb ls
+  lb="$(printf '%s' "$base" | tr '[:upper:]' '[:lower:]')"
+  ls="$(printf '%s' "$stem" | tr '[:upper:]' '[:lower:]')"
+  rest="${lb#"$ls"}"
+  [ "$rest" = "$lb" ] && return 1          # does not start with the stem at all
   rest="${rest//.ts/}"; rest="${rest//.js/}"  # an extension suffix is not a marker
   rest="${rest#.}"; rest="${rest#-}"; rest="${rest#_}"
   [ -z "$rest" ] && return 0
   case "$rest" in
-    bak|backup|old|orig|copy|save|keep|dist|local|tmp|disabled|off) return 0 ;;
+    bak|backup|old|orig|copy|save|keep|dist|local|tmp|disabled|off|test|spec) return 0 ;;
   esac
   case "$rest" in [0-9]|[0-9][0-9]) return 0 ;; esac
   return 1
@@ -374,7 +390,12 @@ denied_extension_copies() { # <agent-dir>
   [ -d "$dir" ] || return 0
   for d in "${DENY_EXTENSIONS[@]}"; do
     stem="$(denied_extension_stem "$d")"
-    for f in "$dir/$stem"*; do
+    # ⛔ ENUMERATE THE DIRECTORY, DO NOT GLOB THE STEM (review round 4). `"$dir/$stem"*` is a
+    # case-sensitive prefix on a case-sensitive filesystem, so a loadable `Tortoise-Capture.ts` was
+    # never even considered — measured present on a home that `--verify` certified and `--install`
+    # left in place. `denied_extension_copies` is the sweep that may `rm -rf`, so it must see the same
+    # population pi sees.
+    for f in "$dir"/*; do
       # ⛔ TWO CLAUSES, because the deny has two subjects.
       # (1) THE DENIED ENTRY ITSELF, at its own name, however it currently resolves. `-e` follows a
       # symlink, so `-L` is what catches a DANGLING link at exactly this path — and a dangling link
@@ -1526,7 +1547,10 @@ verify_layer() {
       # missing" — it is "the box stops running lanes and the bring-up probe lies about it". An
       # operator grepping the log for the dead-lane cause must find that sentence; the generic
       # "denied extension" wording would read as a cosmetic surface mismatch.
-      case "$dname" in
+      # ⛔ MATCHED CASE-INSENSITIVELY (review round 4): the sweep above is case-insensitive because pi
+      # is, so `Tortoise-Capture.ts` arrives here — and a case-sensitive `case` sent it to the generic
+      # line, which is the diagnosability this branch exists to provide.
+      case "$(printf '%s' "$dname" | tr '[:upper:]' '[:lower:]')" in
         tortoise-capture*)
           fail "capture extension present on a cell: $(denied_extension_note "$dname") — $f" ;;
         *)

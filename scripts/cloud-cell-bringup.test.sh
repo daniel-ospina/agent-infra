@@ -710,6 +710,20 @@ br ok normal --check
   && ok "…and the entry was left BYTE-IDENTICAL (the cell's identity is never overwritten)" \
   || bad "the bring-up overwrote an entry it could not read"
 
+# (i2) `key: null` IS NOT `key` ABSENT (review round 4, MEASURED against pi). pi's own rule is
+# `value.key === undefined || typeof value.key === "string"`, so an EXPLICIT JSON null makes pi reject
+# the WHOLE store: with `{"deepseek":{key:valid},"openai":{key:null}}` a real launch prints
+# `No API key found for the selected model` and exits — for every provider. The jq predicate is
+# `has("key") | not`, NOT `.key == null` (which is true for both shapes and certified this one).
+printf '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":{"type":"api_key","key":null}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "a \`key: null\` entry REFUSES the cell (pi rejects the whole file — measured)" \
+                   || bad "bring-up certified a store with an explicit \`key: null\`, which makes pi report 'No API key found' for EVERY provider"
+[ "$(cat "$AUTH")" = '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":{"type":"api_key","key":null}}' ] \
+  && ok "…and the file was left BYTE-IDENTICAL" \
+  || bad "the bring-up rewrote a store it should have refused"
+
 # (j) A WHOLE-FILE INVALID STORE — an invalid entry for a provider NOBODY asked about still makes pi
 # THROW on the whole file (measured against pi's own `ReadOnlyAuthStorage.load()`), so it must be
 # refused rather than certified on the strength of the provider this run happens to want.
@@ -721,6 +735,26 @@ br ok normal --check
 [ "$(cat "$AUTH")" = '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":false}' ] \
   && ok "…and the file was left BYTE-IDENTICAL" \
   || bad "the bring-up rewrote a store it should have refused"
+
+# (j2) A STORE THIS PROCESS CANNOT READ IS NOT AN EMPTY ONE (review round 4, measured). `grep -q`
+# exits 2 — not 1 — when it cannot OPEN the file, and `! grep` folded BOTH into "no non-space content",
+# so a mode-000 store was classified `empty` and then REPLACED by the writer: a mode-000 store holding
+# an `anthropic` oauth record came back as a single deepseek api_key, with the repair line claiming
+# success. The readable check is what makes the classify-don't-clobber contract true.
+if [ "$(id -u)" -eq 0 ]; then
+  ok "SKIP (running as root: mode 000 does not deny the reader, so the EACCES arm cannot be expressed)"
+else
+  printf '{"anthropic":{"type":"oauth","access":"acc","refresh":"ref","expires":9999999999}}\n' > "$AUTH"
+  chmod 000 "$AUTH"
+  printf '%s\n' "$TOK_BODY" > "$TOK"
+  br ok normal --check
+  [ "$BR_RC" -ne 0 ] && ok "a store this process CANNOT READ REFUSES the cell (it is not 'empty')" \
+                     || bad "bring-up read an EACCES store as empty and certified the box"
+  chmod 600 "$AUTH"
+  [ "$(cat "$AUTH")" = '{"anthropic":{"type":"oauth","access":"acc","refresh":"ref","expires":9999999999}}' ] \
+    && ok "…and the oauth record it could not read SURVIVED (nothing was overwritten)" \
+    || bad "the bring-up replaced a store it could not read — the refresh token is gone"
+fi
 
 # (k) A ROTATED KEY: the store WINS over keys.env (pi reads the store first), so a stale stored key
 # shadows a good one and the probe 401s. The repair must not overwrite the credential, but it must
@@ -734,6 +768,22 @@ br ok normal --check
 case "$BR_OUT" in
   *"DIFFERENT 'deepseek' key"*) ok "…and the SHADOW is reported by name, so a rotation is diagnosable" ;;
   *) bad "a stale stored key shadows keys.env silently — the operator would chase the wrong half: $BR_OUT" ;;
+esac
+
+# (k2) A WHITESPACE-ONLY STORED KEY IS THE CREDENTIAL, not an absence (review round 4, MEASURED):
+# pi returns AT THE STORE for any non-empty `key` string, so `key: "   "` is sent as the auth header
+# (`401 … auth header format should be Bearer sk-…`) and `$ENV_FILE` is NEVER consulted. `key: ""` and
+# an absent key are the opposite — pi falses through to the environment (also measured). So this shape
+# must be REPAIRED and the replacement REPORTED, while a stale real key must not be (arm (k)).
+printf '{"deepseek":{"type":"api_key","key":"   "}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "a whitespace-only stored key is REPLACED by the delivered value (pi would send the spaces and never see keys.env)" \
+  || bad "the whitespace-only stored key was left in place: pi sends it as the credential and the lane 401s: $(jq -c . "$AUTH" 2>/dev/null)"
+case "$BR_OUT" in
+  *"BLANK (whitespace-only)"*) ok "…and the replacement is REPORTED, so it is not an invisible overwrite" ;;
+  *) bad "the blank-key replacement was silent — an operator cannot tell a repair from a clobber: $BR_OUT" ;;
 esac
 
 # (l) AN UNLISTED LANE PROVIDER is DERIVED, not refused-on-unknown: `PI_LANE_PROVIDER=zai` +
