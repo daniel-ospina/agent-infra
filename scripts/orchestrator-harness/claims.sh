@@ -1178,8 +1178,13 @@ _claim_acquire_at() {
     # misdirection this block's own prose correction exists to remove. What the message now does: it
     # states the CEILING VALUE inside `ceiling ( … )` and nothing else, then lists the three ceiling
     # variables as CANDIDATES for "raise the ceiling for that keying". No caller names its variable —
-    # `_claim_acquire_at` receives only `ref/ttl/dflt/max` — so the list is a literal here, and the
-    # assertions that pin it live in `branch-claim.test.sh` case 10. ⛔ AND THE CALL SITES ARE NAMED,
+    # `_claim_acquire_at` receives only `ref/ttl/dflt/max` — so the list is a literal here. What the
+    # tests pin, split by what each KEYING can express: `branch-claim.test.sh` case 10 pins the
+    # branch keying's value, its knob-following and its candidate list; the value being `$max` and
+    # NOT `$dflt` is only observable on a keying where the two DIFFER, and that arm lives in
+    # `claim-orphan.test.sh` O14 (`claim_acquire`, whose `dflt` is `CLAIM_TTL` and whose `max` is
+    # `CLAIM_TTL_MAX`) — the branch keying passes one variable for both, so it cannot tell them
+    # apart. ⛔ AND THE CALL SITES ARE NAMED,
     # NOT NUMBERED (review round 7, P2): this comment used to cite line numbers
     # (836/1079/1088/1098), which were exact at fe99acb92 and became WRONG the moment round 7
     # inserted two lines above them — stale references shipped by the very commit that exists to

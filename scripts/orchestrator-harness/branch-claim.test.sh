@@ -66,11 +66,12 @@ export O="$T/orch" CLAIM_STATE_DIR="$T/orch/state"
 # pins the DEFAULT term, so a cell that legitimately raised the knob — the operation `claims.sh`
 # advertises — would get a FALSE RED on correct code. Measured (round 7, this `unset` deleted and
 # `CLAIM_BRANCH_TTL=18000` exported): case 10 reddens on EVERY arm that pins a term — the default
-# lease, the unparseable-ttl fallback, the printed ceiling and the over-ceiling clamp (four at this
-# head) — a lease that was doing exactly what it was told, read as four defects. The arms are NAMED
-# by subject rather than counted because a count rots the moment an arm is added: round 1 wrote
-# "2 failures" here, by round 5 the same experiment reddened 3, and the round-12 fallback arm made
-# it 4 — so a reader re-running it must compare SUBJECTS, not a number. Empty is safe: `claims.sh`
+# lease, the at-ceiling lease (the bound is a strict `-gt`), the unparseable-ttl fallback, the printed
+# ceiling and the over-ceiling clamp — a lease that was doing exactly what it was told, read as five
+# defects. The arms are NAMED by subject rather than counted because a count rots the moment an arm is
+# added: round 1 wrote "2 failures" here, by round 5 the same experiment reddened 3, the round-12
+# fallback arm made it 4, and the round-13 boundary arm made it 5 — so a reader re-running it must
+# compare SUBJECTS, not a number. Empty is safe: `claims.sh`
 # falls back to 14400 / 9600 on an empty or unparseable value.
 unset CLAIM_REPO CLAIM_OWNER_HOST CLAIM_BRANCH_TTL CLAIM_TTL_MAX
 
@@ -274,10 +275,12 @@ if [ -n "$L1" ]; then lease_arm "the DEFAULT lease is the branch key's own 14400
 # path requests a ttl EXACTLY EQUAL to `max`. Under a `-ge` bound that acquire is "clamped": nothing
 # is shortened, but every batch acquire prints `lease ttl 14400s exceeds this keying ceiling
 # (14400s) — clamped.` on stderr — telling an operator to raise a knob while the lease is exactly what
-# was asked for, on the path `merge-one.sh` runs with stdout discarded. Measured: flipping the bound
-# to `-ge` left this suite 45 passed, 0 failed, while `merge-one.sh` asserts the strictness as a FACT
-# ("its test is a STRICT `-gt`, so a lease of exactly the ceiling is never clamped"). So the
-# AT-CEILING acquire runs with the streams SPLIT and its stderr is read three ways — grep's exit 2
+# was asked for, on the path `merge-one.sh` runs with stdout discarded. Measured BEFORE the arm
+# below existed: flipping the bound to `-ge` left this suite 45 passed, 0 failed — nothing pinned the
+# strictness, although `merge-one.sh` states it as a FACT ("its test is a STRICT `-gt`, so a lease of
+# exactly the ceiling is never clamped"). With the arm in place the same flip reddens exactly that
+# arm and nothing else. The AT-CEILING acquire runs with the streams SPLIT and its stderr is read
+# three ways — grep's exit 2
 # (unreadable operand) must not read as "no warning", the same fail-closed rule as the arm above.
 NOW=$(date +%s)
 ( cd "$T/owner" && "$BC" acquire "$BR_LEASE_BOUNDARY" >"$T/bnd.stdout" 2>"$T/bnd.stderr" )
@@ -353,9 +356,10 @@ grep -q 'exceeds this keying ceiling' "$T/acq.stderr" && ok "an over-ceiling ttl
 # shipped message does. If the list sentence is ever reworded the arm reddens — fail-CLOSED, because a
 # contract the test does not recognise is not a pass.
 # ⛔ AND THERE IS EXACTLY ONE CLAUSE (round 9 self-check, P2). "First clause" is only the OPERATIVE
-# clause if no earlier decoy exists: measured on this head, "the branch ceiling (14400s) is documented
-# here. lease ttl %ss exceeds this keying ceiling (9600s) — clamped. …" ran 43 passed, 0 failed while a
-# fixer reads 9600. The contract is ONE clause, so any second `ceiling (` — before OR after it — is RED.
+# clause if no earlier decoy exists: on the head that round was written on, "the branch ceiling
+# (14400s) is documented here. lease ttl %ss exceeds this keying ceiling (9600s) — clamped. …" ran
+# 43 passed, 0 failed while a fixer reads 9600 (the count is that round's; re-run by SUBJECT). The
+# contract is ONE clause, so any second `ceiling (` — before OR after it — is RED.
 clause_report() { # <message-file> -> the arm's structured verdict (see the comment above)
 awk '
   { msg = $0
@@ -453,10 +457,11 @@ case "$KNOB_CLAUSE_REPORT" in
 esac
 # ⛔ AND THE OTHER HALF OF THE SAME PROPERTY (review round 3, P2): the CEILING following the knob does
 # not prove the DEFAULT does. The default arm above runs with the knob UNSET, where a hardcoded
-# `${3:-14400}` is indistinguishable from `$CLAIM_BRANCH_TTL` — measured, that mutant left EVERY
-# assertion green (naming the count here would rot, as the `unset` comment above records) while `CLAIM_BRANCH_TTL=20000` produced a 14400 s DEFAULT against a 20000 s ceiling:
-# exactly the "longer than its own clamp" split these arms exist to forbid. So the knob is moved once
-# more, on the DEFAULT path.
+# `${3:-14400}` is indistinguishable from `$CLAIM_BRANCH_TTL` — BEFORE the arm below existed, that
+# mutant left EVERY assertion green (naming the count here would rot, as the `unset` comment above
+# records); with the arm in place it reddens exactly that arm. Without it, `CLAIM_BRANCH_TTL=20000`
+# produced a 14400 s DEFAULT against a 20000 s ceiling — exactly the "longer than its own clamp" split
+# these arms exist to forbid. So the knob is moved once more, on the DEFAULT path.
 NOW=$(date +%s)
 CLAIM_BRANCH_TTL=20000 acquire_from owner "$BR_LEASE_KNOB_DEF"
 L4="$(lease_of refs/claims/branch-integration-lease-knob-default)"

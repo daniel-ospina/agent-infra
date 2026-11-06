@@ -699,6 +699,19 @@ grep -q 'clamped' <<<"$CLAMP"
 ck "O14 [RED→GREEN] a ttl above the ceiling reports the clamp (stderr) instead of shortening silently" $?
 grep -q 'CLAIM_TTL_MAX' <<<"$CLAMP"
 ck "O14 [RED→GREEN] the clamp message names the ceiling knob to raise" $?
+# ⛔ AND THE NUMBER IT PRINTS IS `$max`, NOT `$dflt` (review round 13, P3) — an arm that can only live
+# on THIS keying. `claim_acquire` passes `CLAIM_TTL` (1800) as `dflt` and `CLAIM_TTL_MAX` (9600) as
+# `max`, so the two are distinguishable here; the branch keying passes the SAME variable for both, so
+# `branch-claim.test.sh` cannot tell a `%ss`-from-`$max` message from one that prints `$dflt`, and
+# measured, swapping `"$max"` for `"$dflt"` in the clamp's `printf` left branch-claim.test.sh 48/0
+# and this suite green. The regression that survives that is the one this PR exists to remove: the
+# message would print `ceiling (1800s)` while clamping to the real 9600 s ceiling — a fixer reads a
+# number that is not the ceiling. The two knobs are passed EXPLICITLY so an ambient raise cannot make
+# this arm assert a number the run did not use.
+CLAMP2="$(as_box "$ORIG14" tbox 'claim_acquire "" 9209441 0123456789abcdef0123 999999999 >/dev/null
+  printf "DONE=%s\n" "$?"' 2>&1 CLAIM_TTL=1800 CLAIM_TTL_MAX=9600)"
+grep -qE 'ceiling \(9600s\)' <<<"$CLAMP2"
+ck "O14 [RED→GREEN] the clamp message's operative ceiling is the CEILING (9600s), not the shorter PR default (1800s)" $?
 
 # ══ O16: `claim_live()` (orch-loop's PR-keyed reader) applies the SAME orphan rules ══
 # ⛔ THE FOURTH CALL SITE, AND THE ONE NO SUITE DROVE (agent-infra#2094 cycle-3 review). An orphan rule
