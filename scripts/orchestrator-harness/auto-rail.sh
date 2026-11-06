@@ -1173,7 +1173,15 @@ PY
         # further down), so this is a no-op on every pass after the first. A RED head is left out: it
         # cannot be landed by an attestation, its owner is the red arm, and its state is already
         # visible as a red check.
-        [ "$_kind" = green ] && [ "$_att" != at-head ] && publish_review_state "$repo" "$pr" awaiting-review
+        # ⛔ AND A `rejected` HEAD IS EXCLUDED, BECAUSE THE CLAIM WOULD BE FALSE (P2, review round 7): the
+        # text below promises "a reviewer is dispatched as soon as this repo has a free slot", but
+        # `review_candidate_arm` maps `*:rejected` to `skip` \u2014 a head whose record says `not-clean` is
+        # TERMINAL and no reviewer ever comes. Publishing it left the PR's newest state claiming a review
+        # that would never arrive, on the exact population the previous commit set out to make readable
+        # (#3333/#3308/#3231), and under sustained cap saturation \u2014 the NORMAL state, and the only state
+        # in which this line runs \u2014 the pass never advances far enough to publish `review-found-issues`, so
+        # the false claim could stand indefinitely. That is #3489's invisibility, inverted.
+        [ "$_kind" = green ] && [ "$_att" != at-head ] && [ "$_att" != rejected ] && publish_review_state "$repo" "$pr" awaiting-review
         continue
       fi
       # ⛔ A FAILED HEAD READ IS NOT AN EMPTY HEAD. `gh` failing here used to write the cooldown key
