@@ -1574,19 +1574,23 @@ DRIFTED=""
 # all: it is the STABLE program the plist execs (see the STABLE_PROG block above), so a `$O` copy that
 # drifted from the pin is the one file whose divergence turns every launchd tick into exit 127 while
 # `launchctl list` still reports the job `loaded`. It is also a $O seed, so it belongs here.
+# mandate-preflight.sh (#3377) is the disclosure half of the same class: both `run_agent` copies resolve
+# it at SPAWN time, and a `$O` that lost it makes every lane report the mandate files' state as
+# UNVERIFIED — the silence this change exists to end, restored silently.
 # key-gate.sh (#3331) is the same class for the same reason, one gate later: `lane.sh` sources it
 # fail-loud and refuses to start a lane whose model credential nothing asserts, so a $O without it stops
 # every dispatch on the box — and the refusal is *meant* to be loud, which is why the DRIFT must be
 # detected here rather than discovered as a box-wide standstill with nothing naming the cause.
 # ⛔ EVERY NAME HERE IS MAINTAINED, NONE IS EITHER/OR: `stall-fix.sh` came from #2929,
-# `orch-pin-exec.sh` from #3309, `key-gate.sh`/`lane-env.sh` from #3331. No side of any of those
-# merges was a superset of another — dropping one leaves a file its caller executes UNCHECKED,
-# which is the exact defect this list exists to catch. Merge conflicts here resolve as a UNION.
+# `orch-pin-exec.sh` from #3309, `mandate-preflight.sh` from #3377, `key-gate.sh`/`lane-env.sh` from
+# #3331. No side of any of those merges was a superset of another — dropping one leaves a file its
+# caller executes UNCHECKED, which is the exact defect this list exists to catch. Merge conflicts here
+# resolve as a UNION.
 # lane-env.sh (#3060) is the SAME defect already live one line up in `lane.sh`: that file sources it and
 # `exit 78`s without it, and it was in NEITHER list (review of #3331, verified `grep -c` = 0 on both), so
 # a $O deployed before #3060 — or half-synced — stops every lane while this check reports no divergence
 # and the operator is told nothing. Presence + byte comparison is all this list does, so it is one word.
-for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh lane-env.sh; do
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh lane-env.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done

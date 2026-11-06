@@ -577,12 +577,32 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # and an undeclared one reddens this equality. Measured: unregistered, this arm fails with
 # `ADDED: scripts/test_cmux_payload.py`, which is exactly the attributable red the census exists for.
 # ⛔ AND THE LIST IS AN EQUALITY, SO IT MUST BE KEPT CURRENT BY WHOEVER MOVES THE SCAN (#1881 LANE,
-# measured). The five `orchestrator-harness` entries without a comment above arrived on `main` after
-# the last time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the
-# four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
-# superset), independently of any branch. Declared here because an equality that is red on its own
-# base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# measured). The `orchestrator-harness` entries without a comment above arrived on `main` after the last
+# time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the suites drive
+# gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict superset),
+# independently of any branch. Declared here because an equality that is red on its own base stops being
+# a signal: every PR inherits the same red and nobody can attribute it.
+# ⛔ THE COUNT IS DELIBERATELY NOT NAMED (this list changes; a pinned integer is the drift
+# `check-single-source.sh` warns about). What each entry IS still has to be said:
+#   * `mandate-preflight.sh` / `mandate-preflight.test.sh` (#3377) are REFERENCERs — the helper names
+#     `brief-gate.sh` in its header prose and the suite quotes it — and neither dispatches a `pi`
+#     invocation, so they join this equality without joining the dispatch population.
+#   * `check-farm-drift.sh` (88c720f54, #3120) and `nonblocking-dispatch.test.sh` (e9b8b7663, #3219 —
+#     issue #3162) landed on `main` after the list was last edited and are the same class: a REFERENCER
+#     (it names the gate in prose, `:19`) and a SUITE (it stubs the gate). They are TWO of the four names
+#     that kept this equality red at this change's base — measured there (29b3af07), `found`=30 vs the 26
+#     declared — which is the condition this block's own paragraph calls out: an equality red on its own
+#     base attributes nothing, so a NEW dispatch path added tomorrow would inherit the same red and stay
+#     invisible. They are declared here so the arm can pass and therefore say something again.
+#   * `cloud-cell-supervisor.sh` and `key-gate.sh` (29b3af07, #3331/#3342) are the OTHER two of those
+#     four, arriving with that same commit and declared for the same reason: the supervisor NAMES the
+#     gate in prose and in its own preflight list (`:2654`, `:2656`), the key gate names it in prose
+#     (`:33`). Measured at this change's rebase head (19f1c6fe), `found`=32 vs the 30 declared. Neither
+#     dispatches a `pi` invocation, so neither joins the dispatch population.
+#   * ⛔ THE `pi`-INVOKER CENSUS COVERS THE HELPER ONLY, NOT ITS SUITE (measured): `spawn-gate.test.sh`'s
+#     scan excludes `*.test.*` by name, so `mandate-preflight.test.sh` is invisible to it. That is why the
+#     suite's own E5 states its residual in-line instead of pointing at that census for protection.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

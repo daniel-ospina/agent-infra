@@ -124,6 +124,25 @@ if [ -z "$brief_gate_sh" ]; then
   echo "[merge $PR] FATAL: brief-gate.sh missing — no reviewer started" >&2
   exit 78
 fi
+# ── WHERE the mandate-file disclosure lives (#3377) ────────────────────────────────────────────────
+# Resolved the same way and in the same order as the sibling above. ⛔ THE BOX'S HOME IS `$O` — a cell
+# runs the harness flat from `$O=$HOME/orchestrator` (`deploy-harness.sh` copies `$SRC/.` there), and
+# `pi-bootstrap/setup.sh`'s farm arrays carry no `orchestrator-harness` script (measured on cell-3:
+# `$O/brief-gate.sh` exists, `~/.pi/agent/scripts/orchestrator-harness/` does not), so the fourth entry
+# is a LEGACY fallback, not the cell's home. ⛔ Absent is NOT fatal here: the helper only DISCLOSES box
+# state, so a `$O` predating it loses a warning, not a gate — the `run_agent` below then says CANNOT
+# VERIFY out loud rather than staying silent, which is the half that matters.
+# ⛔ THIS IS A COPY OF `spawn-gate.sh::mandate_preflight_lib`, AND THE COPY HAD ALREADY DIVERGED (this
+# change's review, P2): it carried no `MANDATE_PREFLIGHT_SH` entry, so an override that worked for lanes,
+# fixers and workers was SILENTLY IGNORED for the reviewer `pi` session — the two seams disagreed about
+# where the helper is on exactly the box that needed the override. The entry is added here, in the same
+# POSITION (first) and with the same `[ -f ]` condition, so the two lists are identical in effect; the
+# duplication itself stays a declared residual (`run_agent` is duplicated in both files, #2208), and any
+# future entry must be added to BOTH — `mandate-preflight.test.sh` §E6 pins that they agree.
+mandate_sh=""
+for _ms in "${MANDATE_PREFLIGHT_SH:-}" "$O/mandate-preflight.sh" "$_M1_HERE/mandate-preflight.sh" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh" "${HOME:-}/.pi/agent/scripts/mandate-preflight.sh"; do
+  [ -n "$_ms" ] && [ -f "$_ms" ] && { mandate_sh="$_ms"; break; }
+done
 REVIEW_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section reviewer)" || {
   echo "[merge $PR] FATAL: brief-gate.sh --section reviewer failed — refusing to pay for a review whose brief omits the research contract (#2258)" >> "$L.log"
   exit 78; }
@@ -134,7 +153,7 @@ REVIEW_RESEARCH_BRIEF="$(bash "$brief_gate_sh" --section reviewer)" || {
 # agent in the background with a watchdog subshell that kills it after N seconds. The stale-worker
 # reaper in orch-loop.sh is the second line of defence.
 run_agent() { # run_agent <seconds> <logfile> <promptfile>
-  local t="$1" log="$2" prompt="$3" pid w rc start elapsed bgrc
+  local t="$1" log="$2" prompt="$3" pid w rc start elapsed bgrc _mt_why _md_last _md_prefix
   AGENT_STARTED=0
   # ── THE BRIEF GATE (#2258), first and fail-closed, for the reason spawn-gate.sh gives: a brief
   # refusal is DETERMINISTIC (it will not clear by waiting, and it follows the item to any box), so
@@ -162,6 +181,52 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile>
   # Keep the two defaults IDENTICAL: a lane must not run a different model than its reviewer.
   local lane_provider="${PI_LANE_PROVIDER:-deepseek}" lane_model="${PI_LANE_MODEL:-deepseek-flash}"
   echo "[agent] provider=$lane_provider model=$lane_model" >> "$log"
+  # ── THE MANDATE FILES (#3377), named on THIS seam too ──────────────────────────────────────────
+  # This is the reviewer `pi` session — a `pi` agent governed by `AGENTS.md`, so a consumer repo's
+  # (tortoise) skill table orders it to read
+  # `~/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md` before it derives, exactly as a lane is. The sibling
+  # seam in `spawn-gate.sh` discloses the same absence, and this file's own history is the argument for
+  # covering both: #2208 fixed a resolved model in ONE `run_agent` and left the identical hardcode in
+  # this one, "which leaves the defect exactly where it costs most". The ACTION is the helper's, not a
+  # copy here — a second implementation is the drift, not the fix. Disclosure only: never refuses, and
+  # a helper that cannot be found says so instead of staying silent.
+  # ⛔ THE REASON STRING IS BUILT BY ASSIGNMENT, NOT BY NESTED `${x:+…}` — an unescaped `(` inside a
+  # `${var:-…}` default can terminate the parameter expansion and make the whole FILE unparseable
+  # (measured on the sibling seam in `spawn-gate.sh`, which this change's own review caught).
+  if [ -z "${mandate_sh:-}" ]; then
+    _mt_why="not found (looked in $O, ${_M1_HERE:-<unresolved>}, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts)"
+  else
+    _mt_why="at $mandate_sh is unusable"
+  fi
+  if [ -n "${mandate_sh:-}" ] && . "$mandate_sh" 2>>"$log" && declare -F mandate_preflight_emit >/dev/null 2>&1; then
+    mandate_preflight_emit "$log" "$prompt" "reviewer PR #$PR"
+  else
+    echo "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR: mandate-preflight.sh $_mt_why — this spawn cannot tell whether the files it orders a reviewer to read exist (#3377). Proceeding: a helper that cannot run is not a reading about the box." >> "$log"
+    # ⛔ THE LOG IS NOT THE REVIEWER (this change's review cycle 2, P1): the same reason `spawn-gate.sh`
+    # gives on the identical branch — a notice only an operator can read leaves the reviewer as blind as it
+    # was before the disclosure existed, and this is the branch an un-provisioned box takes.
+    # ⛔ GROUP THE REDIRECT WITH THE COMMAND AND BRANCH ON ITS STATUS — the sibling seam's fix, for the
+    # same measured reason (#3379 review, P2): an ungrouped `printf … >> "$prompt"` on an unwritable brief
+    # emits its own `line N: <path>: Permission denied` to the CALLER's stderr (a trailing `2>/dev/null`
+    # cannot retract it — redirections apply left to right) and NOTHING records that the reviewer was never
+    # told, so the `CANNOT VERIFY` line above reads identically either way.
+    # ⛔ END-ANCHORED — the sibling seam's fix, for the same measured reason (#3379 review, P2): a
+    # whole-file `grep` for the notice matched an OLD copy earlier in the brief, so on a flip-back the
+    # reviewer kept a stale "BOTH mandated files are now PRESENT" as its last mandate claim and nothing was
+    # appended. The claim that matters is the one the brief ENDS with.
+    _md_prefix="[mandate-preflight] CANNOT VERIFY reviewer PR #$PR:"
+    _md_last="$(tail -n 1 "$prompt" 2>/dev/null)" || :
+    if [ "${_md_last#"$_md_prefix"}" = "$_md_last" ]; then
+      # ⛔ AND IT CARRIES THE SENTINEL — the sibling seam's fix, for the same measured reason (#3379
+      # review, P1): without the marker the emit's `stamped` guard can never retire this block, so a
+      # provisioned box keeps a false "treat every mandated file as unread" as the reviewer's last claim.
+      if { printf '%s\n%s\n' '<!-- mandate-preflight #3377 -->' "[mandate-preflight] CANNOT VERIFY reviewer PR #$PR: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"; } 2>/dev/null; then
+        :
+      else
+        { echo "[mandate-preflight] WARN reviewer PR #$PR: could not append the degraded notice to $prompt, so only THIS LOG names it and the REVIEWER will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null || :
+      fi
+    fi
+  fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 &
   pid=$!
   ( sleep "$t"; kill -TERM "$pid" 2>/dev/null; sleep 15; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
