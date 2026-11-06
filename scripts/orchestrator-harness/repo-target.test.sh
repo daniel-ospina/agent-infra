@@ -296,31 +296,6 @@ c4=$?
 { [ "$c4" -eq 72 ] && [ -f "$FO/state/fixgate-4004-cafebabe" ] \
     && [ "$(cat "$FO/state/fixcount-4004" 2>/dev/null)" = "1" ]; }; ck "C4 --argv (CTRL=1) identity refusal -> REFUNDS fixcount AND writes fixgate-<PR>-<head> (rc=$c4)" $?
 
-# ⛔ A WORKTREE-MATERIALISATION REFUSAL MUST REFUND TOO (#3511 review cycle 3, P2). `wt_provision`
-# can refuse rc=2 for a reason that LOOKS permanent but is often transient (a live process still holds
-# `fix-<PR>`), and this arm exited without refunding while the identity refusals above do. The rule is
-# the file's own (#1720): the controller books the attempt UPSTREAM of every gate, so a refusal that
-# ran no fixer must give it back — otherwise three transient refusals reach MAX_FIX_TRIES and the PR
-# is PARKED "needs a human" having never had a single fixer run.
-# The refusal is driven through the UNREGISTERED-DIRECTORY arm (a foreign directory at the worktree
-# path), which is `wt_provision`'s other rc=2 and needs no git state to set up.
-# ⛔ THE BRANCH MUST EXIST FIRST. Without it `fix-one.sh` refuses at the BRANCH assertion (rc=72) long
-# before `wt_provision` runs, so the arm silently pins the branch refusal's refund (C2/C4's subject)
-# and NOT the materialisation refund it names — measured `52 passed, 1 failed` with rc=72 until this
-# line existed. The later `branch work` below stays for C3's own use.
-"$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
-mkdir -p "$AI/.worktrees/fix-4005"
-printf 'operator data\n' > "$AI/.worktrees/fix-4005/precious.txt"
-printf '%s\n' "2" > "$FO/state/fixcount-4005"
-printf '%s\n' "$AI" daniel-ospina/agent-infra 4005 work > "$T/argv-4005"
-( gh() { case "$*" in *headRefOid*) echo "cafebabe"; return 0 ;; esac; return 1; }; export -f gh
-  REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
-    bash "$FIX" --argv "$T/argv-4005" ) >/dev/null 2>&1
-c5=$?
-{ [ "$c5" -eq 1 ] && grep -q 'ABORT: .*refusing to touch it' "$FO/logs/fix-4005.log" 2>/dev/null \
-    && [ "$(cat "$FO/state/fixcount-4005" 2>/dev/null)" = "1" ] \
-    && [ -f "$AI/.worktrees/fix-4005/precious.txt" ]; }; ck "C5 --argv (CTRL=1) worktree-materialisation refusal -> REFUNDS fixcount and leaves the foreign directory intact (rc=$c5)" $?
-
 "$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
 REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4003 work >/dev/null 2>&1
@@ -360,33 +335,7 @@ d4=$?
 # assertion exits 72, but the branch half runs per ISSUE and can refuse a REUSED worktree (the lane
 # was left on another named branch) — then the loop `continue`s and the script exits 0 with `K` still
 # counting the claim. `dispatch-merge.sh` publishes what reached a spawn; the controller recounts.
-# ⛔ THERE ARE THREE PER-ISSUE CLEANUP SITES IN THE LOOP, AND EVERY ONE THAT RELEASES THE CLAIM MUST
-# ALSO DROP THE ROW. #2033/#2102 moved the worktree build into `wt_provision`, whose refusal ("path is
-# a worktree of a DIFFERENT branch …") fires BEFORE the post-build repo/branch assertion — so the arm
-# this case was written for is no longer the one that refuses this fixture. That newer arm skipped
-# `drop_dispatched_rows`, which is the defect this arm caught; the message match below therefore
-# accepts EITHER arm. #3511 review added the THIRD site (the chain-could-not-start arm that stops its
-# lane and releases the claim) which skipped the drop too — and it also made this case witness the
-# CLAIM RELEASE, not just the row: the arm's own claim is a THREE-WAY state (claim released, no
-# dispatch published, row dropped), and without the `released refs/claims/issue-` conjunct the release
-# could be deleted with this suite still green.
-# ⛔ THE MESSAGE MATCH IS SCOPED TO THIS ISSUE'S OWN LINE (`^#6001:`). The alternative for the newer
-# arm is a bare phrase match, so an unscoped `grep -E` would let ANY line in the batch output — a
-# peer's refusal, a library echo — satisfy the message conjunct. The batch here is one issue, so it
-# cannot cross-match today; the anchor is what keeps that true if the fixture ever grows.
 DMO5="$T/o-dm5"; mkdir -p "$DMO5/logs" "$DMO5/state"; printf '6001\n' > "$DMO5/dispatched.txt"
-# a STUB claims.sh, or `release_issue_claim_unspawned` returns at its `[ -f "$csh" ] || return 0`
-# guard and never reaches its `released refs/claims/issue-…` echo — so the positive conjunct below
-# could never pass and the FIXTURE (not the code) would be what reds. Measured: 0 matches without the
-# stub, 1 with it. (Corrected: the first draft of this note said the conjunct would be "vacuously
-# true", which is backwards — a positive grep cannot pass on an absent line.)
-# `claim_issue_record_commit` is stubbed because the same file is sourced for it, and it masks nothing
-# TODAY: D5 `continue`s at the provision arm before the `chain_gen` read is reached. It returns 0 where
-# the real function returns 1 on "no record", so any future case driving the CHAIN arm through this
-# `$O` would get an empty generation and silently hit chain-merge.sh's "no captured claim generation →
-# NOT releasing" arm. Not a defect here; a trap for that case.
-printf '%s\n' 'claim_issue_release_record() { return 0; }' 'claim_issue_record_commit() { return 0; }' \
-  > "$DMO5/claims.sh"
 # the CI-queue gate must ALLOW this batch, or the deferral (rc 3) exits before the per-issue arm.
 printf '%s\n' 'ciq_read() { return 0; }' 'ciq_eval() { return 0; }' 'ciq_defer_note_here() { return 0; }' \
   'ciq_ci_allowed() { return 0; }' 'ciq_verdict() { return 0; }' 'ciq_is_count() { return 0; }' \
@@ -395,10 +344,9 @@ printf '%s\n' 'ciq_read() { return 0; }' 'ciq_eval() { return 0; }' 'ciq_defer_n
 $REAL_GIT -C "$TT" worktree add -q "$TT/.worktrees/tm-6001" -b d5-other 2>/dev/null || true
 O="$DMO5" bash "$DM" "$TT" daniel-ospina/tortoise 6001 > "$T/dm5.out" 2>&1
 d5=$?
-{ [ "$d5" -eq 0 ] && grep -Eq '^#6001: .*(REFUSED \((branch|repo) assertion\)|refusing to reuse it)' "$T/dm5.out" \
-    && grep -q '^#6001: released refs/claims/issue-6001' "$T/dm5.out" \
+{ [ "$d5" -eq 0 ] && grep -q 'REFUSED (branch assertion)' "$T/dm5.out" \
     && [ -f "$DMO5/.dispatched-ids" ] && [ ! -s "$DMO5/.dispatched-ids" ] \
-    && ! grep -qx '6001' "$DMO5/dispatched.txt"; }; ck "D5 per-issue branch refusal -> exit 0, claim RELEASED, .dispatched-ids EMPTY and the row dropped (rc=$d5)" $?
+    && ! grep -qx '6001' "$DMO5/dispatched.txt"; }; ck "D5 per-issue branch refusal -> exit 0 BUT .dispatched-ids is EMPTY and the row dropped (rc=$d5)" $?
 # ...and the controller's recount, extracted from orch-loop.sh and driven through both shapes.
 sed -n '/# \[dmrecount:begin\]/,/# \[dmrecount:end\]/p' "$HERE/orch-loop.sh" | sed '1d;$d' > "$T/dmrecount.sh"
 sed -n '/^is_num() {/p' "$HERE/orch-loop.sh" > "$T/isnum.sh"

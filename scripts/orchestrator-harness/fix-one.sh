@@ -231,14 +231,6 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
   if [ "$?" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
-    # ⛔ REFUND HERE TOO (#3511 review cycle 3, P2). `wt_provision` can now refuse `rc=2` for a
-    # PERMANENT-looking but ultimately TRANSIENT reason — a live process still holds `fix-$PR` —
-    # and this arm exited without refunding while the branch refusal three lines up does. The rule
-    # this file already states (#1720, above `refund_gate_attempt`): the controller books the
-    # attempt UPSTREAM of every gate, so a refusal that ran no fixer must give it back or three
-    # transient refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never had
-    # a single fixer run. The refund is a no-op on a manual (CTRL=0) run.
-    refund_gate_attempt
     exit 1
   fi
   WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
@@ -818,7 +810,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
   # no attempt was consumed. Tolerant reference for the same $O-skew reason as the disk code.
   if [ "$ar" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
     why="BRIEF gate: the generated fixer brief failed brief-gate.sh (a HARNESS defect, not a capacity refusal and not a finding about this PR) — read the [brief-gate] block in the log; the fix is in the brief's own build, not in the box"
-  elif [ "$ar" = "${AGENT_HARNESS_SKEW_REFUSED:-81}" ]; then
+  elif [ "$ar" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
     # ⛔ A HARNESS DEFECT, LIKE THE BRIEF ARM ABOVE, AND FOR THE SAME REASON (follow-up review of
     # #2991, P2): the fixer's caller and the deployed `cell-lane-preflight.sh` disagree (a usage/version
     # skew) or the copy is corrupt, so the probe measured nothing. The capability arm below would have
