@@ -974,29 +974,31 @@ green=[]; red=[]
 # THIS ACTUATOR'S: any recorded verdict at this head is `at-head`, because the question asked here is
 # only "does an attestation exist for the head that would merge?" (a non-clean record still names a
 # review that happened, and re-buying a review of the same head is not the remedy for it).
-# ⛔ ANCHORED AT BOTH ENDS, IN THE GATE'S OWN SHAPE — A LINE-ANCHOR ALONE STILL ADMITS A QUOTATION
-# (review round 4, P2, measured). The gate's regex is `^review recorded: … @ <40hex>( diff=<64hex>)?
-# \(<owner/repo>\)( sig=<64hex>)?$` — and the `$` is what makes a marker a RECORD rather than a line
-# that merely STARTS with one. With only `^`, a body line reading `review recorded: … (<repo>) — pasted
-# from the review` (or one with a single trailing space) read `at-head` here while check (c) rejected it.
-# `at-head` is the ONLY value that disables the review arm, so such a PR could be reviewed by nobody and
-# passed by nothing, for ever: the #3489 failure (invisible, no owner, permanent) reproduced by the change
-# that exists to remove it — the same defect as the missing `^`, reachable from the other end of the line.
-# ⛔ AND IT MUST ACCEPT EVERY SHAPE record-review.sh ACTUALLY EMITS, or every PR reads `absent` and NOTHING
-# is ever `at-head` (a total merge stall). It emits, on ONE line, `(<repo>)` then — for `not-clean` only —
-# ` findings=<n>[ note=<text>]`, then ` sig=<64hex>` when signing is configured. Those are the optional
-# trailers below, in the order the recorder appends them. Verified against every open PR body on both
-# driven repos: the at-head/stale/absent split is unchanged by this anchoring.
+# ⛔ TWO PATTERNS, BECAUSE THE TWO VERDICT FAMILIES HAVE DIFFERENT TAIL GUARANTEES (review round 5, P2).
+# The `$` anchor only means something if the text before it is bounded. For the CLEAN family it is: the gate's
+# own shape is exact, so a line that starts with a clean marker and then carries prose (or a trailing space)
+# is a QUOTATION, and the strict form below rejects it — that is the guarantee that stops a quotation from
+# disabling the review arm for ever.
+# ⛔ A NOT-CLEAN MARKER CANNOT HAVE THAT GUARANTEE. Its recorded tail is ` findings=<n>[ note=<free text>]`,
+# and `note=` is documented FREE-FORM, single-line plain text — `note=1 open P2` is record-review.sh's OWN
+# example (it rejects only quotes/backslashes/control chars, not spaces), and a live body carries
+# `findings=9 note=3 open P1 (…)+ 6 P2 sig=…` on agent-infra#3201. There is no delimiter between that text
+# and anything appended after it, so no pattern can accept the note and reject prose — a `\S+` rejects BOTH,
+# and rejecting the real shape is the worse error: it reads a recorded review as `absent`, which on a green
+# head buys a PAID review of a head that already carries a record (`review-pr.sh`'s E_ALREADY short-circuit
+# only matches `verdict=clean`, so it does pay). The permissive tail is therefore DELIBERATE and bounded to
+# `not-clean`, which check (c) refuses on ANY shape (`clean|clean-micro|clean-low` only) — so nothing about
+# whether this PR can LAND turns on it; it only keeps the loop's verdict-blind policy (any record at this
+# head is at-head) working for the one family whose tail cannot be anchored.
+# Verified against every open PR body on both driven repos: the at-head/stale/absent split is identical to
+# the pre-anchoring parse, and the #3201 note form classifies.
 # The repo is CAPTURED and compared exactly, not tested as a substring of the line: the gate binds it, and
 # `(<owner/repo>)` appearing anywhere on a marker line is not the same claim as the marker naming that repo.
-MARKER_RE = re.compile(
-    r'^review recorded: reviews/(\d+)\.json verdict=([a-z][a-z-]*) @ ([0-9a-f]{40})'
-    r'(?: diff=[0-9a-f]{64})?'      # #3315: the reviewed diff, so a merge-only update can carry
-    r' \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)'
-    r'(?: findings=[0-9]+)?'        # #3400: the not-clean trailer, appended AFTER `(<repo>)`
-    r'(?: note=\S+)?'
-    r'(?: sig=[0-9a-f]{64})?$'      # the signed form; the gate verifies it, this loop only classifies
-)
+_HEAD_RE = r'^review recorded: reviews/(\d+)\.json verdict=%s @ ([0-9a-f]{40})(?: diff=[0-9a-f]{64})? \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)'
+# The gate's exact clean shape: optional `diff=`, optional `sig=`, NOTHING else before end of line.
+CLEAN_MARKER_RE = re.compile(_HEAD_RE % r'(clean|clean-micro|clean-low)' + r'(?: sig=[0-9a-f]{64})?$')
+# The not-clean shape: its recorded tail, including the free-form note (see above).
+NOTCLEAN_MARKER_RE = re.compile(_HEAD_RE % r'(not-clean)' + r'(?: findings=[0-9]+)?(?: note=.*)?(?: sig=[0-9a-f]{64})?$')
 
 def attestation(body, head, pr, repo):
     "at-head | stale | absent | nohead — never an inference from a partial match."
@@ -1004,7 +1006,8 @@ def attestation(body, head, pr, repo):
         return "nohead"          # no head means nothing can be at it; the reviewer re-reads the head
     seen = []
     for line in (body or "").splitlines():
-        m = MARKER_RE.match(line)    # `match` + the pattern's own `^`/`$`: the record shape EXACTLY
+        # `match` + the patterns' own `^`/`$`: the RECORD shape exactly, not a line that starts with one.
+        m = CLEAN_MARKER_RE.match(line) or NOTCLEAN_MARKER_RE.match(line)
         if not m:
             continue                 # not a record line: indented, prefixed, or carrying prose after it
         if m.group(1) != str(pr):

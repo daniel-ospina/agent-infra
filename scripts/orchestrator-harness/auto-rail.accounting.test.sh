@@ -590,6 +590,26 @@ _ckline "review recorded: reviews/7.json verdict=clean @ $H7 diff=$(printf 'a%.0
   "the SIGNED marker record-review.sh emits must still classify as at-head (a lexer that rejects the real shape turns every attested PR into a paid review and a permanent merge stall)"
 _ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3" "$H7" 'green\t7\tat-head' \
   "the not-clean trailer (' findings=N' appended AFTER '(repo)') must still be RECOGNISED — 'which verdicts may land' is the gate's decision, and this loop asks only whether a record exists at the head; silently un-classifying this shape would buy a review of a head already reviewed"
+# ⛔ AND THE FREE-FORM NOTE IS THE SHAPE A `\\S+` SILENTLY DROPS (review round 5, P2, measured). The
+# recorder documents `note=1 open P2` as its OWN example — spaces and parentheses included — so a pattern
+# that refuses whitespace reads a REAL marker as `absent`, which on a green head buys a PAID review of a
+# head that already has a record (`review-pr.sh`'s E_ALREADY only short-circuits `verdict=clean`). Measured
+# live on agent-infra#3201: `findings=9 note=3 open P1 (…)+ 6 P2 sig=…`.
+_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=9 note=3 open P1 (User=root drop-in false PASS) + 6 P2 sig=$(printf 'b%.0s' $(seq 1 64))" "$H7" 'green\t7\tat-head' \
+  "the recorder's FREE-FORM note ('note=1 open P2' is its own documented example, so the value CONTAINS SPACES) must still classify — a whitespace-refusing pattern reads a real marker as 'absent' and buys a paid review of a head that already carries a record"
+# ⛔ THE PERMISSIVE TAIL IS BOUNDED TO `not-clean`, AND THAT BOUND IS PINNED HERE, NOT LEFT TO CHANCE (review
+# round 5, verifier). A note is free-form with no delimiter, so NOTHING can accept the real note shape and
+# reject prose after it — the choice is which error to take. It is taken on `not-clean` only (whose landing
+# check (c) refuses on ANY shape, so nothing about whether the PR can merge turns on it), and NOT on the
+# clean family, where the strict `$` is the guarantee that a quotation cannot disable the review arm. The
+# arm below states that asymmetry so a later "tidy-up" that merges the two patterns reddens instead of
+# silently widening the clean one.
+_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3 note=1 open P2 — pasted from the review" "$H7" 'green\t7\tat-head' \
+  "a not-clean marker with prose after its FREE-FORM note is ACCEPTED on purpose — there is no delimiter between the note and anything appended (§ above), and check (c) refuses a not-clean marker on every shape, so this cannot certify a landing; a strict tail here would read the REAL note shape as 'absent' and buy a paid re-review instead"
+# ⛔ AND THE CLEAN FAMILY KEEPS THE STRICT TAIL: the SAME prose on a CLEAN marker must still be refused,
+# or a quotation disables the review arm for ever (the #3489 stall). This is the pair that pins the split.
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise) findings=3 note=1 open P2 — pasted from the review" "$H7" 'green\t7\tabsent' \
+  "a CLEAN marker never carries a findings/note trailer (record-review.sh only appends it for not-clean), so prose on a clean marker is a QUOTATION and must not read as at-head"
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (some-other-org/tortoise)" "$H7" 'green\t7\tabsent' \
   "a marker naming another REPO must not read as this PR's attestation — the gate binds the repo too"
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "" 'green\t7\tnohead' \
