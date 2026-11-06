@@ -1889,7 +1889,7 @@ lane_end_next() {
     # instead of the flat claim, because the flat claim tells an operator to hold and re-publish a branch
     # that already exists.
     detached)
-      printf 'MANUAL — nothing was pushed, and this worktree is on a DETACHED HEAD: its HEAD is not ATTACHED to any branch (measured — symbolic-ref answered nothing), so the %s commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them — do NOT reap %s and do NOT remove it — removing the worktree deletes its own HEAD and reflog, which are the only things referencing such a commit — so IF no other ref reaches them, removing the worktree makes them unreachable and gc prunable. Push them onto a branch first (`git -C %s push %s HEAD:NEW-BRANCH` — the name is yours to choose), then re-check. That the HEAD is not ATTACHED is measured; whether some OTHER branch or ref ALREADY holds these same commits is NOT (no for-each-ref --contains is run here, and the unpushed count enumerates the LOCAL refs/remotes/* cache of this repository only)%s\n' \
+      printf 'MANUAL — nothing was pushed, and this worktree is on a DETACHED HEAD: its HEAD is not ATTACHED to any branch (measured — symbolic-ref answered nothing), so the %s commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them — do NOT reap %s and do NOT remove it — removing the worktree deletes its own HEAD and reflog, the only refs THIS RUN measured as referencing such a commit — so IF no other ref reaches them, removing the worktree makes them unreachable and gc prunable. Push them onto a branch first (`git -C %s push %s HEAD:NEW-BRANCH` — the name is yours to choose), then re-check. That the HEAD is not ATTACHED is measured; whether some OTHER branch or ref ALREADY holds these same commits is NOT (no for-each-ref --contains is run here, and the unpushed count enumerates the LOCAL refs/remotes/* cache of this repository only)%s\n' \
         "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "$(lane_end_push_repo)" \
         "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
     UNAVAILABLE|refused-unknown-default|refused-pushurl-divergent|refused-pushurl-unresolved)
@@ -1961,7 +1961,7 @@ lane_end_next() {
     cannot-verify)
       printf 'MANUAL — the tree at %s measured cannot-verify (rescue=%s): the listing was not PROVEN complete, so this terminal did NOT certify the tree and the rescue did not certify it either — which is NOT the same as the tree being clean. Do NOT reap %s on the strength of this row — read the [wip] line in the lane log%s%s\n' \
         "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_ROOT:-<unknown>}" \
-        "$(case "${LANE_END_RESCUE:-}" in refs/wip/*) printf ' — the archive is %s (its tree is NOT PROVEN to be the worktree as it was left — a tracked file git cannot read lands in NEITHER the archive NOR the list the callee reports as skipped and still exits 0 — and the paths the INCOMPLETE listing never saw are in NEITHER)' "${LANE_END_RESCUE}" ;; archived-local) printf ' — AND the archive is the LOCAL pin %s only (no off-box copy), and it cannot cover the paths the incomplete listing never saw%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;; esac)" \
+        "$(case "${LANE_END_RESCUE:-}" in refs/wip/*) printf ' — the archive is %s (its tree is NOT PROVEN to be the worktree as it was left — a tracked file git cannot read lands in NEITHER the archive NOR the list the callee reports as skipped and still exits 0 — and the paths the INCOMPLETE listing never saw are in NEITHER)' "${LANE_END_RESCUE}" ;; archived-local) printf ' — AND the archive is the LOCAL pin %s, which this row does NOT establish to be the only copy (bg-rescue-wip.sh exits 2 both for a push that FAILED and for a PARTIAL archive whose push SUCCEEDED, so check refs/wip/<slug> in the push repository), and it cannot cover the paths the incomplete listing never saw%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;; esac)" \
         "$(lane_end_push_caveat)"; return 0 ;;
   esac
   # ⛔ THE REFUSED-PUSH ARMS SIT **ABOVE** THE `archived-local` REPORTER (review cycle 12, P1 — REPRODUCED).
@@ -1989,7 +1989,9 @@ lane_end_next() {
           # reachable state — so with `rescue=archived-local` (a full disk: the archive could only be
           # written to the LOCAL pin) it printed `rescue=archived-local, wip_ref=refs/wip-local/…` and told
           # the reader to "recover the uncommitted state from the rescue ref", while omitting the one fact
-          # that makes the state the worst: that pin has NO off-box copy and dies with the cell volume.
+          # that makes the state the worst: that pin is the only copy THIS ROW can NAME, and it dies with the
+          # cell volume (whether a SECOND copy exists off-box is NOT established — see
+          # `lane_end_rescue_caveat`, which now says exactly that instead of "no off-box copy").
           # Naming the raw `rescue=` value is not naming the fact; that loophole is what kept the helper
           # from being structural.
           printf 'MANUAL — commit(s) on %s were NOT pushed (see the lane log) AND this terminal left uncommitted work at %s (tree=%s, rescue=%s, wip_ref=%s): do NOT reap it. Re-dispatch and push from a lane branch, and recover the uncommitted state from the rescue ref if one is named here%s\n' \
@@ -2044,7 +2046,7 @@ lane_end_next() {
         # configuration this code deliberately supports (and refuses across, when it cannot prove them
         # equal) — so naming `origin` here points the reader at a repository nobody read, while
         # `push_url=` two lines away in the same artifact names the right one. Same fix, both arms.
-        printf 'retrieve the archive %s (the LOCAL pin — exit 2 ALSO covers a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository even though this row cannot name which) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so only the uncommitted work is local-only%s\n' \
+        printf 'retrieve the archive %s (the LOCAL pin — exit 2 ALSO covers a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository even though this row cannot name which) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so the uncommitted work is the half whose off-box copy this row cannot establish%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
           "$(lane_end_push_repo)" "${LANE_END_ORIGIN:-<sha>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0 ;;
       nothing)
@@ -2059,7 +2061,7 @@ lane_end_next() {
         # bounded `ls-remote --heads` upgrades a row to `remote-holds:`. The sentence is now scoped to what
         # was read, so it cannot state more safety than the enumeration covered. The `unpushed=0` token is
         # kept literally (arms N31b pin it).
-        printf 'retrieve the archive %s (the LOCAL pin — exit 2 ALSO covers a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository even though this row cannot name which) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and only the uncommitted work is local-only%s\n' \
+        printf 'retrieve the archive %s (the LOCAL pin — exit 2 ALSO covers a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository even though this row cannot name which) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and the uncommitted work is the half whose off-box copy this row cannot establish%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
           "${LANE_END_BRANCH:-<unknown>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0 ;;
     esac
@@ -2202,7 +2204,7 @@ lane_end_next() {
 lane_end_rescue_caveat() {
   case "${LANE_END_RESCUE:-}" in
     FAILED|UNAVAILABLE) printf ' \u2014 AND no ref this run wrote pins the uncommitted work at %s (rescue=%s) — which is NOT the same as nothing having been archived: the local pin write is guarded and the push runs after it, so an archive may exist at refs/wip/<slug> in the push repository; this row cannot tell you which' "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE}" ;;
-    archived-local) printf ' \u2014 the uncommitted work is archived to the LOCAL pin %s only (no off-box copy)%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;;
+    archived-local) printf ' \u2014 the uncommitted work is archived to the LOCAL pin %s, and this row does NOT establish that the pin is the only copy: bg-rescue-wip.sh exits 2 both for a push that FAILED and for a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository \u2014 check it there before treating this pin as the last copy%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;;
   esac
 }
 # ⛔ THE PUSH DOMAIN'S MANUAL FACT, EXPRESSED ONCE (review cycle 19, P2). The two rescue MANUAL arms
@@ -2649,7 +2651,7 @@ terminal_wip_rescue() {
           # this function: HEAD detached, one commit, `for-each-ref --contains HEAD` EMPTY, and the object
           # PRUNED by `gc --prune=now` after `worktree remove` — over a log line that had promised it would
           # survive exactly that.
-          echo "[wip] NOTE label=$label: this worktree is on a DETACHED HEAD — its HEAD is not ATTACHED to any branch — so the $unpushed commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them, and nothing but this worktree's own HEAD and reflog references such a commit — so IF no other ref reaches them, removing the worktree makes them unreachable and gc prunable (the survival sentence in the other arms does NOT apply here). Whether some OTHER branch or ref ALREADY holds these same commits was NOT measured (this path runs no for-each-ref --contains). Do NOT remove or reap it until they are pushed onto a branch ('git -C $root push $(lane_end_push_repo) HEAD:refs/heads/<name>'). Nothing was pushed, and push=${LANE_END_PUSH:-not-attempted} says why in the [lane-exit] line above" >> "$log" ;;
+          echo "[wip] NOTE label=$label: this worktree is on a DETACHED HEAD — its HEAD is not ATTACHED to any branch — so the $unpushed commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them, and this run measured NO ref but this worktree's own HEAD and reflog referencing such a commit — so IF no other ref reaches them, removing the worktree makes them unreachable and gc prunable (the survival sentence in the other arms does NOT apply here). Whether some OTHER branch or ref ALREADY holds these same commits was NOT measured (this path runs no for-each-ref --contains). Do NOT remove or reap it until they are pushed onto a branch ('git -C $root push $(lane_end_push_repo) HEAD:refs/heads/<name>'). Nothing was pushed, and push=${LANE_END_PUSH:-not-attempted} says why in the [lane-exit] line above" >> "$log" ;;
         *)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br are held by NO ref in this repository's LOCAL refs/remotes/* cache (a CACHE — 'git fetch --prune' and a deleted remote branch are not visible here, and this is NOT a claim about any remote) and nothing was pushed — push=${LANE_END_PUSH:-not-attempted}, and the [lane-exit] line above says why. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted, and they do not survive a cell's volume being discarded either. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log" ;;
       esac

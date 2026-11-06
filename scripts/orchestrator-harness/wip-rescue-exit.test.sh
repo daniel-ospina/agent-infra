@@ -2199,19 +2199,27 @@ nx27c="$( bash -c '
 case "$nx27c" in MANUAL*) rcn27c=0 ;; *) rcn27c=1 ;; esac
 case "$nx27c" in *"do NOT reap"*) : ;; *) rcn27c=1 ;; esac
 case "$nx27c" in *"refs/wip-local/develop"*) : ;; *) rcn27c=1 ;; esac
-# ⛔ AND IT MUST SAY THE PIN HAS NO OFF-BOX COPY (review cycle 16, P2 — REPRODUCED). This arm is the one
-# written FOR the fleet's worst state, and it named the raw `rescue=` value while omitting the fact that
-# makes the state worst — so a reclaimer on a cell was told to "recover … from the rescue ref", a pin that
-# dies with the volume. N27c/N27d asserted only `MANUAL*` and could not see the omission.
-case "$nx27c" in *"no off-box copy"*) : ;; *) rcn27c=1 ;; esac
-ck "N27c a REFUSED push over a LOCAL-ONLY archive is MANUAL / do-not-reap, still names the pin AND says the pin has no off-box copy [${nx27c:0:72}]" $rcn27c
+# ⛔ AND IT MUST SAY THE PIN IS NOT ESTABLISHED TO BE THE ONLY COPY (review cycle 16, P2 — REPRODUCED).
+# This arm is the one written FOR the fleet's worst state, and it named the raw `rescue=` value while
+# omitting the fact that makes the state worst — so a reclaimer on a cell was told to "recover … from the
+# rescue ref", a pin that dies with the volume. N27c/N27d asserted only `MANUAL*` and could not see it.
+# ⛔ THE OMISSION IS NOW STATED AS AN ABSENCE OF EVIDENCE, NOT AS AN ABSENCE OF A COPY (P1 — REPRODUCED).
+# `archived-local` is `rc2 != 0` AND a ref this run wrote; `bg-rescue-wip.sh` exits 2 for a PARTIAL archive
+# whose push SUCCEEDED as well as for a failed push, so the pin CAN coexist with an off-box archive at
+# `refs/wip/<slug>`. Measured: a worktree holding an unborn nested repo (SKIPPED ⇒ PARTIAL) plus a real
+# push left `refs/wip/wtlane` ON ORIGIN while the terminal printed "archived to the LOCAL pin … only (no
+# off-box copy)". So the unprovable claim is asserted AGAINST here, and the honest sentence FOR.
+case "$nx27c" in *"no off-box copy"*) rcn27c=1 ;; *) : ;; esac
+case "$nx27c" in *"does NOT establish that the pin is the only copy"*) : ;; *) rcn27c=1 ;; esac
+case "$nx27c" in *"check it there"*) : ;; *) rcn27c=1 ;; esac
+ck "N27c a REFUSED push over a LOCAL-ONLY archive is MANUAL / do-not-reap, still names the pin, and says the pin is NOT established to be the only copy (a PARTIAL archive that PUSHED reaches this arm too) [${nx27c:0:72}]" $rcn27c
 nx27d="$( bash -c '
   . "$1"
   LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_PUSH=refused-protected
   LANE_END_REF=refs/wip-local/develop; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
   lane_end_next' _ "$GATE" 2>/dev/null )"
-case "$nx27d" in MANUAL*"do NOT reap"*"no off-box copy"*) rcn27d=0 ;; *) rcn27d=1 ;; esac
-ck "N27d …the same holds for refused-protected, including the no-off-box-copy fact (the pair is one arm, so it is asserted as one)" $rcn27d
+case "$nx27d" in MANUAL*"do NOT reap"*"does NOT establish that the pin is the only copy"*) rcn27d=0 ;; *) rcn27d=1 ;; esac
+ck "N27d …the same holds for refused-protected, including the not-established-as-only-copy fact (the pair is one arm, so it is asserted as one)" $rcn27d
 # ⛔ N33 — A TIMED-OUT PUSH IS NOT A MEASURED ABSENCE EITHER (review cycle 12, P2). `rc=124` means the
 # TIMER KILLED THE CLIENT — the ref may already have been applied server-side — yet the log said "STILL only
 # on this disk", contradicting itself in one breath ("the remote never answered") and breaking this file's
@@ -3347,6 +3355,14 @@ n45_push_domain="pushed nothing running unmeasured detached verify-unanswered pu
       case "$n45_out" in *'reap  '*|*'reap `'*|*'before removing ;'*|*'before removing `'*) n45_bad="$n45_bad $n45_cell(root-slot)" ;; esac
       case "$n45_out" in *'push=)'*|*'push=,'*|*'push= '*) n45_bad="$n45_bad $n45_cell(empty-verdict)" ;; esac
       case "$n45_out" in *'%s'*) n45_bad="$n45_bad $n45_cell(unfilled-specifier)" ;; esac
+      # ⛔ "no off-box copy" IS NOT A CLAIM THIS CODE CAN MAKE, IN ANY CELL (P1 — REPRODUCED). The phrase
+      # stood in `lane_end_rescue_caveat`'s `archived-local` arm AND in the `cannot-verify` arm's nested copy
+      # of it, and it is FALSE whenever the rescue was a PARTIAL archive whose push SUCCEEDED — the exact
+      # `rc2 != 0` + new-pin shape that IS `archived-local`. Fixing one site and leaving the other is the
+      # standard way this class returns, so the ban is arm-agnostic and sweeps the whole matrix instead of
+      # the two sites that held it: a `refs/wip/<slug>` copy this row cannot NAME is still a copy, and a
+      # terminal that denies it sends the operator to the wrong place to look.
+      case "$n45_out" in *'no off-box copy'*) n45_bad="$n45_bad $n45_cell(offbox-absence-claim)" ;; esac
     done
   done
 done
