@@ -3216,8 +3216,9 @@ ISSUES 2')"
   # refuses by name otherwise, because a REPO that is not the intended checkout is how a box graded the
   # wrong repo silently. A plain `mkdir` therefore made report.sh exit 2 before ANY queue line, so the
   # arms read `[]` and were red for a reason that had nothing to do with the counting they pin.
-  # `git init` is the smallest thing that satisfies the check: the counting arms never ask the checkout
-  # for a commit, a remote or a ref.
+  # `git init` is the smallest thing that satisfies `resolve_repo`. The counting arms read only the
+  # QUEUE lines; the report's claims section does run `git ls-remote origin 'refs/claims/*'`, which
+  # fails harmlessly here (no origin) and prints its own `→ live: 0` — not asserted by any arm below.
   git init -q "$RPT/repo"
   # ⛔ TWO markers for the SAME open PR and one for a PR that is not open (review round 2, P2): a
   # file count would print 3, an open-PR-only count prints 2, and the correct per-PR count prints 1.
@@ -3315,9 +3316,12 @@ GHOPEN3
   # human queue as a measured one; the stale line on the same path already names its degradation, so the
   # parked line must too. Driven, not grepped: two parks exist, NEITHER of which can be attributed on
   # this path (that is the whole reason the count is raw).
-  # ⛔ ONE DEGRADED PATH NOW, NOT TWO. The "no checkout at all" half of this pair was retired by
-  # `resolve_repo` (see (9c) above — that state is a refusal and publishes no lines at all), so the
-  # provenance note is driven on the path report.sh still owns: a checkout whose listing is unreadable.
+  # ⛔ THE DEGRADED SET IS NOT EMPTY, AND ONE OF ITS BRANCHES IS STILL LIVE. `resolve_repo` retired
+  # the "REPO is not a checkout" trigger (see (9c) above: that state is a refusal and publishes no
+  # lines at all), but report.sh reaches the SAME `OPEN_STATE=norepo` branch through `! command -v gh`
+  # — a supported state (its header promises a missing `gh` makes its section say so, never abort the
+  # report). That branch is driven in (9c5) below, and this arm drives the other one: a checkout whose
+  # listing is UNREADABLE.
   printf '%s\n' livehead > "$RPT/state/parked-6001"
   printf '%s\n' oldhead > "$RPT/state/parked-6999"
   cat > "$TMP/ghstub/gh" <<'GHFAIL2'
@@ -3329,6 +3333,39 @@ GHFAIL2
   case "$_rpt_unread_parked" in
     *" 2  (raw marker count"*) echo "  ✅ with an unreadable open-PR list the parked line keeps the count (2) and says it is RAW too"; PASS=$((PASS+1)) ;;
     *) echo "  ❌ with an unreadable open-PR list the parked line printed [$_rpt_unread_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
+  esac
+  # (9c5) ⛔ THE SECOND `norepo` TRIGGER — NO `gh` ON THE BOX AT ALL — and it is the one a real box
+  # hits. It is the same fail-open class (9c) exists for: a blind read printed as a clean queue. The
+  # fixture is a REAL checkout (so `resolve_repo` is satisfied and the branch under test is the `gh`
+  # one), with a PATH that carries everything report.sh needs and NO `gh`. ⛔ THE PATH IS BUILT FROM
+  # THE BOX'S OWN, MINUS `gh`, NOT FROM A HAND LIST: a curated list is a second dependency surface
+  # (the review that asked for this arm measured `resolve_repo` refusing under one, because the
+  # helper reaches for an external the list did not name). No `gh` is reachable, so the assertion
+  # below pins the branch and not a stub.
+  mkdir -p "$TMP/nogh"
+  _oifs="$IFS"; IFS=:
+  for _d in $PATH; do
+    [ -d "$_d" ] || continue
+    for _f in "$_d"/*; do
+      _b="${_f##*/}"
+      case "$_b" in gh|gh-*) continue ;; esac
+      [ -e "$TMP/nogh/$_b" ] || ln -s "$_f" "$TMP/nogh/$_b" 2>/dev/null
+    done
+  done
+  IFS="$_oifs"
+  _rpt_nogh="$( O="$RPT" REPO="$RPT/repo" PATH="$TMP/nogh" bash "$REPORT" 2>/dev/null )"
+  _nogh_dep="$(grep -c 'needs a repo checkout and gh' <<<"$_rpt_nogh")"
+  if [ -n "$(PATH="$TMP/nogh" command -v gh 2>/dev/null)" ]; then
+    echo "  ❌ could not build a gh-free PATH — the missing-gh arm below would be vacuous"; FAIL=$((FAIL+1))
+  elif [ "$_nogh_dep" != "2" ] \
+       || grep -qE 'open PRs: 0|stale evidence \(needs re-review\): 0' <<<"$_rpt_nogh"; then
+    echo "  ❌ with no gh on the box report.sh printed [$(grep -E 'open PRs|stale evidence' <<<"$_rpt_nogh" | tr '\n' '|')] — expected BOTH lines to name the dependency and no confident 0 (named=$_nogh_dep)"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ with no gh on the box both queue lines NAME the dependency ($_nogh_dep) and neither prints a confident 0"; PASS=$((PASS+1))
+  fi
+  case "$_rpt_nogh" in
+    *"parked (needs a human): 2  (raw marker count"*) echo "  ✅ …and the missing-gh parked line keeps the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ with no gh on the box the parked line printed [$(grep 'parked (needs' <<<"$_rpt_nogh")] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
   esac
   rm -f "$RPT/state/parked-6001" "$RPT/state/parked-6999"
   wpin "orch-loop.sh classifies the red gate before dispatching" "$ORCH" '_rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"'
