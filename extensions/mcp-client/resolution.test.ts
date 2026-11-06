@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { resolveMcpJsonPath, expandEnvVars, buildMcpServerEnv } from "./index.js";
+import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv } from "./index.js";
 
 let passed = 0;
 let failed = 0;
@@ -161,6 +161,10 @@ await test("parses as valid config with the expected server set", () => {
     "gemini",
     "seo-intelligence",
     "tortoise",
+    // #3382 — the orchestrator MCP ships in the base so every repo receives it; it is lazy, and it
+    // is an INTERNAL tool, which is precisely why it belongs here (machine-local, never shipped)
+    // rather than in a product repo's tracked `.mcp.json`.
+    "orchestrator",
   ];
   deepEqual(Object.keys(config.mcpServers).sort(), [...expected].sort());
 
@@ -284,6 +288,79 @@ for (const dir of TMP_DIRS) {
     /* best-effort */
   }
 }
+
+
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+// THE BASE IS A LAYER, NOT A FALLBACK. Measured 2026-11-06: `orchestrator` reached agent-infra
+// (which has its own .mcp.json) and never tortoise, because the resolver returned the FIRST file it
+// found and the hub's base was only a fallback — so a server added to the hub later was invisible to
+// every repo that carries a local config. The only workaround was writing internal tooling into a
+// TRACKED PRODUCT file, which is the hub/product confusion this fleet must not create.
+// ══════════════════════════════════════════════════════════════════════════════════════════════
+section("base layer + repo delta");
+
+await test("BOTH layers resolve — a repo config does not hide the base", () => {
+  const repo = tempDir("mcp-layers-both-");
+  gitInit(repo);
+  writeJson(repo, ".mcp.json", { mcpServers: { repoOnly: { command: "x" } } });
+  const home = tempDir("mcp-layers-both-home-");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeJson(join(home, ".pi", "agent"), ".mcp.json", { mcpServers: { baseOnly: { command: "y" } } });
+
+  const origHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    const layers = resolveMcpConfigPaths(repo);
+    equal(layers.repo, join(repo, ".mcp.json"), "repo layer resolved");
+    equal(layers.base, join(home, ".pi", "agent", ".mcp.json"),
+      "base layer resolved TOO — this is the fix (it used to be a fallback only)");
+  } finally {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+  }
+});
+
+await test("a repo entry of the SAME name wins; the base's other servers survive", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { shared: { command: "base-cmd" }, onlyBase: { command: "b" } } } as never,
+    { mcpServers: { shared: { command: "repo-cmd" } } } as never,
+  );
+  equal(merged.shared?.command, "repo-cmd", "the REPO entry wins a name collision");
+  ok(merged.onlyBase, "and the base's other servers are not lost");
+});
+
+await test("base ONLY still resolves (the old fallback path, preserved)", () => {
+  const cwd = tempDir("mcp-layers-baseonly-");
+  const home = tempDir("mcp-layers-baseonly-home-");
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeJson(join(home, ".pi", "agent"), ".mcp.json", { mcpServers: { baseOnly: { command: "y" } } });
+
+  const origHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    const layers = resolveMcpConfigPaths(cwd);
+    equal(layers.repo, null, "no repo layer");
+    equal(layers.base, join(home, ".pi", "agent", ".mcp.json"), "base layer resolved");
+  } finally {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+  }
+});
+
+await test("neither layer → both null (nothing invented)", () => {
+  const cwd = tempDir("mcp-layers-none-");
+  const home = tempDir("mcp-layers-none-home-");
+  const origHome = process.env.HOME;
+  try {
+    process.env.HOME = home;
+    const layers = resolveMcpConfigPaths(cwd);
+    equal(layers.repo, null, "no repo layer");
+    equal(layers.base, null, "no base layer");
+  } finally {
+    if (origHome === undefined) delete process.env.HOME;
+    else process.env.HOME = origHome;
+  }
+});
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);

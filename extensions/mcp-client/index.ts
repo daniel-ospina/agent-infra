@@ -577,8 +577,55 @@ function expandExpr(str: string): string {
  *
  * Exported (named) for unit tests; the default export stays the extension hook.
  */
+/**
+ * BOTH layers that can define MCP servers (#<issue>).
+ *
+ * ⛔ THE BASE IS A LAYER, NOT A FALLBACK. `agent-infra` is the hub: skills, gates, AGENTS.md and the
+ * harness are authored there and derived into every repo, and `~/.pi/agent/.mcp.json` is the same kind
+ * of thing — the hub's per-machine shared config, installed from `templates/.mcp.base.json` and shipped
+ * to nobody. A repo's own `.mcp.json` is a DELTA on that layer.
+ *
+ * The first-match rule made the base inert for every repo that carries a local config: adding a server
+ * to the hub's base reached only the repos WITHOUT one. For a product repo (tortoise) the only workaround
+ * was to write internal tooling into a TRACKED product file — the hub/product confusion this fleet must
+ * not create. Measured 2026-11-06.
+ */
+/**
+ * Merge the hub's BASE layer with a repo's DELTA: the repo wins on a name collision.
+ *
+ * The repo is spread LAST on purpose: it may pin a different URL or command for its own copy of a
+ * server, and the base must never shadow what a repo declares — the base is machine-local, so
+ * letting it override a repo would make one box's config change what a checked-out repo means.
+ *
+ * Pure and exported so the ordering is pinned by a test rather than by reading the spread.
+ */
+export function mergeMcpLayers(
+  base: McpJson | null,
+  repo: McpJson | null,
+): Record<string, McpServerConfig> {
+  return {
+    ...((base?.mcpServers ?? {}) as Record<string, McpServerConfig>),
+    ...((repo?.mcpServers ?? {}) as Record<string, McpServerConfig>),
+  };
+}
+
+export interface McpConfigPaths {
+  /** `~/.pi/agent/.mcp.json` — the hub's shared layer. Never ships, may be absent. */
+  base: string | null;
+  /** The first `.mcp.json` walking up from the cwd — the repo's delta. May be absent. */
+  repo: string | null;
+}
+
+/** Back-compat shape: repo-local if present, else the base. Kept for existing callers/tests. */
 export function resolveMcpJsonPath(startDir: string = process.cwd()): string | null {
+  const layers = resolveMcpConfigPaths(startDir);
+  return layers.repo ?? layers.base;
+}
+
+export function resolveMcpConfigPaths(startDir: string = process.cwd()): McpConfigPaths {
   let topLevel: string | null = null;
+  let repo: string | null = null;
+  let base: string | null = null;
   try {
     // realpath the git output once so the walk-up stop comparison below is
     // symlink-robust (worktrees / symlinked checkouts may resolve differently).
@@ -597,7 +644,7 @@ export function resolveMcpJsonPath(startDir: string = process.cwd()): string | n
   let dir = resolve(startDir);
   while (true) {
     const candidate = join(dir, ".mcp.json");
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(candidate)) { repo = candidate; break; }
     if (topLevel) {
       let realDir: string | null = null;
       try {
@@ -612,9 +659,13 @@ export function resolveMcpJsonPath(startDir: string = process.cwd()): string | n
     dir = parent;
   }
 
-  // Fallback: bootstrapped base config.
+  // ⛔ THE BASE IS RESOLVED WHETHER OR NOT A REPO FILE WAS FOUND. It used to be a FALLBACK, taken
+  // only when the walk found nothing — which made the hub's shared layer inert in every repo that
+  // carries its own config (measured 2026-11-06: `orchestrator` reached agent-infra and never
+  // tortoise, and the only workaround was writing internal tooling into a TRACKED product file).
   const homeFallback = join(homedir(), ".pi", "agent", ".mcp.json");
-  return existsSync(homeFallback) ? homeFallback : null;
+  base = existsSync(homeFallback) ? homeFallback : null;
+  return { base, repo };
 }
 
 /** Connect to a single MCP server with a timeout. Cleans up on failure to avoid orphan processes. */
@@ -728,6 +779,42 @@ export class McpServerManager {
       console.log(`[mcp-client] Could not read ${mcpJsonPath}, skipping MCP`);
       return;
     }
+    await this.connectConfig(config);
+  }
+
+  /**
+   * Connect from BOTH layers: the hub's base config underneath, the repo's `.mcp.json` over it.
+   *
+   * ⛔ MERGE ORDER IS `{ **base, **repo }` — the repo is LAST, so a repo entry of the same name WINS
+   * (it may pin a different URL or command for its own copy of a server). The base must never be able
+   * to shadow what a repo declares: `~/.pi/agent/.mcp.json` is machine-local, and letting it override
+   * a repo would make one box's config change what a checked-out repo means.
+   *
+   * Read-side only: nothing is written, and `setup.sh`'s `{**dst, **src}` policy for the base file is
+   * untouched. A missing or unparseable layer is logged and skipped — a broken repo file must not take
+   * the hub's servers away with it, and vice versa.
+   */
+  async connectAllLayers(paths: McpConfigPaths): Promise<void> {
+    const read = async (p: string | null): Promise<McpJson | null> => {
+      if (!p) return null;
+      try {
+        return JSON.parse(await readFile(p, "utf-8")) as McpJson;
+      } catch {
+        console.log(`[mcp-client] Could not read ${p} — skipping that layer`);
+        return null;
+      }
+    };
+    const base = await read(paths.base);
+    const repo = await read(paths.repo);
+    if (!base && !repo) {
+      console.log("[mcp-client] No readable .mcp.json in either layer");
+      return;
+    }
+    const merged = mergeMcpLayers(base, repo);
+    await this.connectConfig({ ...(repo ?? base ?? {}), mcpServers: merged } as McpJson);
+  }
+
+  private async connectConfig(config: McpJson): Promise<void> {
     this.config = config;
 
     const servers = config.mcpServers;
@@ -1346,10 +1433,11 @@ export default async function (pi: ExtensionAPI) {
   // a ~/.pi/agent/.mcp.json fallback, instead of cwd-only. Log the search
   // path at warn level so a zero-server session is diagnosable at a glance.
   const searchedDir = process.cwd();
-  const mcpJsonPath = resolveMcpJsonPath(searchedDir);
-  if (mcpJsonPath) {
+  const layers = resolveMcpConfigPaths(searchedDir);
+  if (layers.repo || layers.base) {
     console.log(
-      `[mcp-client] Resolved .mcp.json: ${mcpJsonPath} (searched up from ${searchedDir} incl. ~/.pi/agent fallback)`
+      `[mcp-client] MCP layers: base=${layers.base ?? "(none)"} repo=${layers.repo ?? "(none)"} ` +
+        `(repo wins on a name collision; searched up from ${searchedDir})`
     );
   } else {
     console.log(
@@ -1358,7 +1446,7 @@ export default async function (pi: ExtensionAPI) {
     return;
   }
 
-  await manager.connectAll(mcpJsonPath);
+  await manager.connectAllLayers(layers);
   await manager.registerTools(pi);
   // #199: catalog + on-demand load tools (also present in sub-agents).
   manager.registerLifecycleTools(pi);
