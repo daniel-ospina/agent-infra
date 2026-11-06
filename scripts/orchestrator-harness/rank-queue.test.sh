@@ -1856,8 +1856,9 @@ elif [ "$(_dwit "$_dwp/forge.trace" '' '')" != '[refresh] forged order' ]; then
 else rc=0; fi
 ck "a printed line WEARING the trace prefix names NO witness (the per-run nonce refuses it — and, with the nonce dropped, DOES)" $rc
 
-# ⛔ AND THE ANCHOR ITSELF (review P3, cycle 53): every fixture above is refused by the NONCE conjunct, so
-# deleting `^\++` left the suite at 132/0 — the anchor was claimed by a check's NAME and graded by nothing.
+# ⛔ AND THE ANCHOR ITSELF (review P3, cycle 53): every fixture above is refused by a conjunct OTHER than the
+# anchor — the `fn` conjunct (`other.sh`), the ` echo ` conjunct (`printf.sh`), or the nonce (the rest) — so
+# deleting `^\++` left the suite at 132/0: the anchor was claimed by a check's NAME and graded by nothing.
 # This fixture puts the WHOLE `fn [nonce] echo ` sequence MID-LINE: the nonce cannot refuse it, only the
 # requirement that the sequence starts the traced command can.
 printf '%s\n' \
@@ -2208,8 +2209,6 @@ for _arm14m in \
     rc=1; echo "      the STRIP did not apply to the $_ml arm (strip=$_mstrip, clip occurrences before-after=$_mclips) — the awk needle drifted or the arm already lacks the clip, so this check would report a mutation it never made"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null && ! grep -qF "$_mm" <<<"$_mo"; then
     rc=1; echo "      the $_ml arm's echo did not run at all — neither stream carries its sentence (the shim's rename AND strip were verified to apply, so the arm is unreachable or its echo is gone)"
-  elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null && ! grep -qF "$_mm" <<<"$_mo"; then
-    rc=1; echo "      the $_ml arm's echo did not run at all — neither stream carries its sentence (the shim's rename and strip were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null; then
     rc=1; echo "      the $_ml arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the absence of the clause proves nothing"
   elif grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
