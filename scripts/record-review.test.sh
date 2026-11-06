@@ -7115,6 +7115,37 @@ run_record_delta $EH23 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518301" \
 assert_eq "$RECORD_RC" "3" "20h19 an UNPARSEABLE delta: range is REFUSED (rc 3), never fallen past"
 assert_contains "$RECORD_ERR" "cannot parse" "20h19 the refusal names the unparseable range rather than accepting a bare-head match"
 [ -f "$(Q2 $EH23)" ] && bad "20h19 no record was written" || ok "20h19 no record was written"
+
+# 20h20/20h21 THE TOKEN'S SPELLING MUST NOT DISABLE THE GUARD. The third review cycle found
+#       the SAME P1 again, and the reason is the lesson: the first attempt made detection
+#       independent of the REGEX but both still opened with the lower-case literal `delta:`,
+#       so `Delta:`, `DELTA:` and `delta :` turned detection OFF and failed the parse AT THE
+#       SAME TIME — two guards sharing a literal share a blind spot, so the refusal arm was
+#       never reached and the body fell to the bare needle. `Delta:` beginning a sentence is
+#       ordinary reviewer prose, not a contrived spelling. Both layers are now
+#       case-insensitive with optional padding, so these must reach the RANGE arm.
+EH24=425184; rm -f "$(Q2 $EH24)"
+run_record_delta $EH24 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed Delta: $DG_A1..$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h20 a CAPITALISED narrower token is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h20 the capitalised token is PARSED and compared, not disabled into the fallback"
+[ -f "$(Q2 $EH24)" ] && bad "20h20 no record was written" || ok "20h20 no record was written"
+EH25=425186; rm -f "$(Q2 $EH25)"
+run_record_delta $EH25 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta : $DG_A1..$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h21 a token padded BEFORE the colon is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h21 the padded token is PARSED and compared, not disabled into the fallback"
+[ -f "$(Q2 $EH25)" ] && bad "20h21 no record was written" || ok "20h21 no record was written"
+# 20h22 …AND THE TOLERANCE IS NOT A FALSE RED. The widened token must still ACCEPT an
+#       artifact that states the EXACT recorded range in a padded/capitalised spelling —
+#       otherwise the fix would block correct reviewers, which is its own defect.
+EH26=425188; rm -f "$(Q2 $EH26)"
+run_record_delta $EH26 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518901" \
+    STUB_EVIDENCE_BODY="reviewed Delta: $DG_BASE .. $DG_HEAD; no issues found."
+assert_eq "$RECORD_RC" "0" "20h22 a padded CAPITALISED spelling of the RECORDED range still records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EH26)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h22 the accepted record is the normal one, not a special case"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7234,12 +7265,6 @@ mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_
 #       NARROWER range satisfy the claim for a wider one (20h15).
 MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
 mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
-# M15 — THE SEPARATOR ITSELF. M14 breaks the ancestry test AFTER a match; M15 breaks the
-#       MATCH, so it exercises the FALL-THROUGH path (20h17) that a one-character change in
-#       the artifact used to reach. Reverting `(\.\.\.?)` to `(\.\.)` reproduces the pre-fix
-#       recorder exactly: the three-dot body stops matching, the bare-needle fallback accepts
-#       a body naming B alone, and the vector's refusal flips to ACCEPTED. Distinct from M14
-#       by construction, not by label.
 # M15 — THE PRE-FIX RECORDER, REPRODUCED EXACTLY. This cell mutates BOTH layers of the
 #       fix, because either one ALONE still refuses and would make the cell vacuous: the
 #       separator tolerance (`(\.{2,3})` → `(\.\.)`) AND the refuse-on-unparseable arm
@@ -7259,6 +7284,16 @@ mut_check "M15 a three-dot narrower stated range is refused" 425174 "$DG_HEAD" "
 #       stops a range this code cannot read from being reinterpreted as a bare-head claim.
 MUT="$(mk_mutant unparseablepassed '    elif [ "$_delta_tok" -eq 1 ]; then' '    elif false; then')"
 mut_check "M16 an unparseable stated range is refused, not reinterpreted" 425182 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:abc1234..def5678 at $DG_HEAD; no issues found."
+# M17 — THE SHARED LITERAL, i.e. the third cycle's P1. Reverting BOTH token spellings to the
+#       lower-case literal `delta:` is exactly the pre-fix state AND exactly the mistake the
+#       first fix made: detection and parse then miss `Delta:` together, the refusal arm is
+#       never reached, and the bare needle accepts a body naming B alone. Two replacements
+#       because the token appears in the detection AND in the parse — mutating one alone
+#       leaves the other refusing, which would make this cell vacuous (the same lesson M15
+#       records).
+MUT="$(mk_mutant casetoken '[Dd][Ee][Ll][Tt][Aa][[:space:]]*:' 'delta:')"
+mk_mutant2 "$MUT" '[Dd][Ee][Ll][Tt][Aa][[:space:]]*:' 'delta:'
+mut_check "M17 a capitalised/padded delta token is refused, not fallen past" 425184 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed Delta: $DG_A1..$DG_HEAD only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
