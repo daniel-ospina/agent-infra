@@ -1768,6 +1768,45 @@ brief_gate_lib() {
   return 1
 }
 
+# mandate_preflight_lib — WHERE the mandate-file disclosure lives, resolved the same way as its sibling
+# above and for the same measured reason. Nearest copy wins.
+#
+# ⛔ THE BOX'S HOME IS `$O` (this change's review, P2). A cell runs the harness FLAT from
+# `$O=$HOME/orchestrator` (`deploy-harness.sh` copies `$SRC/.` there), and
+# `pi-bootstrap/setup.sh`'s farm arrays carry no `orchestrator-harness` script — measured on cell-3, where
+# `$O/brief-gate.sh` exists and `~/.pi/agent/scripts/orchestrator-harness/` does NOT. The fourth entry
+# below is a LEGACY fallback (harmless, and dropped only when every deployed box is on `$O`); it is not
+# the cell's home, and describing it as one is how a resolver keeps a dead path looking load-bearing.
+#
+# ⛔ A MISSING HELPER IS NOT A REFUSAL HERE (#3377). `brief_gate_lib` fails closed because an
+# unvalidated brief must never reach an agent; this helper only DISCLOSES box state, so a box that
+# cannot run it loses a warning, not a gate — and making it exit 78 would let an out-of-date install
+# make every box undispatchable, the over-block the file's own header refuses. The caller says
+# CANNOT VERIFY out loud instead of staying silent, which is the half that matters.
+mandate_preflight_lib() {
+  local c here
+  # ⛔ AN OVERRIDE IS A CANDIDATE, NOT A VERDICT (this change's review, P2, MEASURED). This returned
+  # `$MANDATE_PREFLIGHT_SH` on `[ -n ]` alone while the four real candidates below were each tested with
+  # `[ -f ]` — so a STALE path in that ambient variable short-circuited the resolver to something that is
+  # not a file, `. "$_mp_sh"` then failed at the call site, and the disclosure silently degraded to the
+  # LOG-ONLY `CANNOT VERIFY` line on a box whose `$O/mandate-preflight.sh` is present and correct. The
+  # lane-visible half — the half this whole change exists to deliver — would be gone, while `install.sh`'s
+  # DRIFTED list and `check-single-source.sh`'s EXECUTED arm still reported the helper verified. An
+  # override that is not a file is therefore SKIPPED, exactly like `O=`-relative candidates that are
+  # absent, and the resolver keeps looking. (The polarity is deliberately NOT `brief_gate_lib`'s:
+  # a brief gate refuses loudly, this one discloses.)
+  if [ -n "${MANDATE_PREFLIGHT_SH:-}" ] && [ -f "${MANDATE_PREFLIGHT_SH}" ]; then printf '%s\n' "$MANDATE_PREFLIGHT_SH"; return 0; fi
+  here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  for c in "${O:-}/mandate-preflight.sh" "$here/mandate-preflight.sh" \
+           "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness/mandate-preflight.sh" \
+           "${HOME:-}/.pi/agent/scripts/mandate-preflight.sh"; do
+    [ -n "$c" ] && [ -f "$c" ] || continue
+    printf '%s\n' "$c"
+    return 0
+  done
+  return 1
+}
+
 # brief_gate_role — the validator role for THIS dispatch, from the harness's own `KIND` vocabulary.
 #
 # ⛔ THIS IS A MAPPING, NOT A GUESS. The validator's roles are lane|fixer|reviewer|worker (its `--section`
@@ -2349,6 +2388,83 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       fi
     fi
   }
+
+  # ── THE MANDATE FILES, NAMED WHERE THE LANE WILL ACTUALLY READ THEM (#3377) ─────────────────────
+  # A brief may open with "READ §0 and §0b of LANE-BRIEF-PREAMBLE.md FIRST", and a consumer repo's
+  # (tortoise) `AGENTS.md` skill table orders
+  # every lane to read `~/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md` before it derives anything.
+  # Measured 2026-11-03 (cell-3 `vm-915c3930…`): NEITHER file exists on a cell — `ls -l` is rc=2 for
+  # both — and nothing said so, so the lane proceeded exactly as though it had read them. A mandate
+  # that cannot be satisfied, in silence, is an inert enforcer; the lane cannot report what it was
+  # never told was missing.
+  #
+  # ⛔ THE LOG IS NOT ENOUGH — THE BRIEF IS (#2981's append precedent). The lane's context is the file
+  # `pi` reads (`"$(cat "$prompt")"`, the line below), not this log, which only an operator greps. So
+  # `mandate_preflight_emit` APPENDS the block to the brief, marker-guarded so a re-dispatch cannot
+  # stack copies. ⛔ The ACTION lives in the helper, not here: `merge-one.sh` carries its own `run_agent`
+  # (a declared residual in this file's own header), and a second copy of this logic is the drift this
+  # seam exists to avoid — both copies call the one implementation.
+  # ⛔ It is a DISCLOSURE, never a gate: every branch PROCEEDS. The absence is box state that no brief
+  # author can fix from the brief (the fix is a provisioning path — #1193 owns the content), so refusing
+  # here would be an over-block that halts the fleet instead of a warning that reaches it.
+  local _mp_sh _mp_why _md_last _md_prefix
+  _mp_sh="$(mandate_preflight_lib)" || _mp_sh=""
+  # ⛔ SOURCING SUCCESS IS NOT HELPER USABILITY (this change's review, P2). A bare
+  # `. "$_mp_sh" && mandate_preflight_emit …` turns "the helper was found but is unusable" (a stale or
+  # partial `$O` copy predating this function, or a corrupt file) into SILENCE: the `&&` short-circuits,
+  # the caller's stderr goes untagged with `command not found`, and the spawn proceeds exactly as it did
+  # before this change — the #3377 defect, in the one state the else branch below was written to catch.
+  # `declare -F` asks the question that matters.
+  # ⛔ THE REASON STRING IS BUILT BY ASSIGNMENT, NOT BY NESTED `${x:+…}` (P2, and a hard lesson: an
+  # unescaped `(` inside a `${var:-…}` default terminated the parameter expansion and made this whole
+  # FILE unparseable — every lane on the box would have failed to start).
+  if [ -z "$_mp_sh" ]; then
+    _mp_why="not found (looked in \$O, this helper's dir, \$AGENT_INFRA_PATH/scripts/orchestrator-harness, ~/.pi/agent/scripts)"
+  else
+    _mp_why="at $_mp_sh is unusable"
+  fi
+  if [ -n "$_mp_sh" ] && . "$_mp_sh" 2>>"$log" && declare -F mandate_preflight_emit >/dev/null 2>&1; then
+    mandate_preflight_emit "$log" "$prompt" "$label"
+  else
+    echo "[mandate-preflight] CANNOT VERIFY $label: mandate-preflight.sh $_mp_why — this spawn cannot tell whether the files it orders a lane to read exist (#3377). Proceeding: a helper that cannot run is not a reading about the box. Sync it: cp scripts/orchestrator-harness/mandate-preflight.sh \$O/" >> "$log"
+    # ⛔ THE LOG IS NOT THE LANE (this change's review cycle 2, P1, MEASURED). #3377 is about the LANE being
+    # ordered to read files that do not exist, and a notice only an operator can read leaves the lane
+    # exactly as blind as before it existed. This branch is the one EVERY box that has not yet received the
+    # helper takes — the population #3377 measured — so the notice goes into the brief as well, where every
+    # other mandate disclosure lands. Idempotent on the same marker the emit uses, or a degraded box would
+    # grow the brief by a line per dispatch.
+    # ⛔ GROUP THE REDIRECT WITH THE COMMAND AND BRANCH ON ITS STATUS (#3379 review, P2, MEASURED). An
+    # ungrouped `printf … >> "$prompt"` on an unwritable brief emits its own `line N: <path>: Permission
+    # denied` to the CALLER's stderr — an untagged bash error escaping `run_agent`'s log contract, which a
+    # trailing `2>/dev/null` cannot retract because redirections apply left to right — and NOTHING recorded
+    # that the lane was never told, so the `CANNOT VERIFY` line above read identically whether the append
+    # landed or not. That is #3377's silence restored, in the one branch an un-provisioned box takes. The
+    # helper's own emit already refuses this shape (`mandate-preflight.sh`'s `if { printf … } 2>/dev/null`
+    # with a WARN on the else); this is the same `if`/`else` in the seam.
+    # ⛔ END-ANCHORED, NOT "THE PHRASE OCCURS SOMEWHERE" (#3379 review, P2, MEASURED). The guard used to be
+    # `grep -qF '[mandate-preflight] CANNOT VERIFY' "$prompt"` — a whole-FILE substring test. Now that a
+    # healed box ends its brief with "BOTH mandated files are now PRESENT … do not claim a mandated file is
+    # missing", a LATER dispatch whose helper is unavailable again matched the OLD notice earlier in the
+    # brief, appended NOTHING, and left that stale PRESENT claim as the lane's last word while the log said
+    # CANNOT VERIFY — the flip-back hole the emit's own guard records as fixed, left one layer out. The rule
+    # is the emit's (`mandate_ends_with`): the claim that matters is the one the brief ENDS with.
+    _md_prefix="[mandate-preflight] CANNOT VERIFY $label:"
+    _md_last="$(tail -n 1 "$prompt" 2>/dev/null)" || :
+    if [ "${_md_last#"$_md_prefix"}" = "$_md_last" ]; then
+      # ⛔ AND IT CARRIES THE SENTINEL, LIKE EVERY OTHER SHAPE (#3379 review, P1, MEASURED). Without the
+      # marker the emit's content-aware guard (`stamped`) can NEVER retire this block: on a box that is later
+      # provisioned, the lane keeps reading "treat every mandated file as unread … never claim to have read
+      # one" as its LAST mandate claim, the log says nothing, and the remedy this very line prints (`Sync it:
+      # cp …`) is the trigger. `ARCHITECTURE.md` states the invariant — ONE sentinel line every shape
+      # carries — and this was the one shape that did not. The literal is written here because this is the
+      # branch where the helper is NOT sourceable, so `$(mandate_sentinel)` cannot be called.
+      if { printf '%s\n%s\n' '<!-- mandate-preflight #3377 -->' "[mandate-preflight] CANNOT VERIFY $label: the disclosure helper (mandate-preflight.sh) is not available to this spawn, so whether the files this brief orders you to read exist is UNKNOWN — treat every mandated file as unread, say so in your report, and never claim to have read one (#3377)." >> "$prompt"; } 2>/dev/null; then
+        :
+      else
+        { echo "[mandate-preflight] WARN $label: could not append the degraded notice to $prompt, so only THIS LOG names it and the LANE will not. Proceeding (a disclosure, not a gate)." >> "$log"; } 2>/dev/null || :
+      fi
+    fi
+  fi
   pi -p --provider "$lane_provider" --model "$lane_model" --no-session "$(cat "$prompt")" >> "$log" 2>&1 < /dev/null &
   pid=$!
   # ⛔ THE WATCHDOG IS LAUNCHED UNDER THE SAME JOB CONTROL, and that is not cosmetic: `set +m`

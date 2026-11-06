@@ -3109,14 +3109,63 @@ implemented or explicitly not claimed:
 | remove by proof, not by label | `lc_guard_mutate` reads the loaded job's `path =` and refuses unless it is this plist |
 | an unreadable domain is UNKNOWN | `lc_probe` is the tri-state read, and every DECISION POINT that must distinguish 'not loaded' from 'could not read' re-probes with it: `lc_ensure`, the `--uninstall` read-back in `install.sh` (`block="$(lc_probe "$LABEL")"` — its verdict is the probe's own status, not a derived second read), `lc_guard_mutate`, `lc_assert_running`, `lc_assert_stable`, and `lc_bootout` (which refuses to treat a label as 'not loaded' rather than removing by a failed read). The thin wrappers `lc_pid` and `lc_runs` fold UNKNOWN into empty, so their callers must not read empty as 'not loaded'. Those decisions re-probe — **except `lc_restart`, and that is a hole this row names rather than hides**: a restart is unconditional, so it needs no probe to decide *whether* to act, but the folded `lc_pid` read it takes BEFORE the start is passed into `lc_assert_running` as `replaced`, so when that read is UNREADABLE (rather than 'not loaded') `replaced` is empty and the "the old process survived the start" check is silently SKIPPED. Not every read in the file is tri-state: `lc_min_runtime` falls back to launchd's own 10 s default, and a successful-but-empty `print-disabled` reads as `unset` (no override), because that is exactly what it means |
 
-⛔ **What is still GAP is the reporting side, and it is the item that matters most**: nothing
-**detects** a job that has been disabled or booted out — `KeepAlive`/`RunAtLoad`
-(`launchd.plist.template:15-18`) relaunch a job that EXITS, which is not the same state as one launchd
-no longer has, and `com.eldato.lane-liveness.plist` watches LANES by design with no controller alive.
-On 2026-10-17 the label was disabled twice more *during this PR's own review* by agent sessions running
-the pre-#1975 flow from other checkouts; both times a human reading `launchctl print` found it, not an
-instrument. A watchdog that runs `enable` + `bootstrap` when the label is absent, and reports it, is
-the missing piece — agent-infra#1860.
+**Status: the DETECTION/reporting half is now CLOSED too (agent-infra#1986), inside the tracked
+watchdog.** The paragraph that used to sit here said *"a watchdog that runs `enable` + `bootstrap`
+when the label is absent, and reports it, is the missing piece — agent-infra#1860"*. The gap it named
+was measured: on 2026-10-17 the label was disabled twice more *during that PR's own review* by agent
+sessions running the pre-#1975 flow from other checkouts, and both times a human reading
+`launchctl print` found it, not an instrument — `KeepAlive`/`RunAtLoad` relaunch a job that EXITS,
+which is not the same state as one launchd no longer has. That arm now
+lives in the ONE tracked watchdog, `scripts/orchestrator-harness/watchdog-loop.sh` (launchd job
+`com.eldato.controller-watchdog`, `StartInterval` 300; the cell timer runs the same file):
+
+| state, MEASURED with `launchctl print` in **both** `gui/` and `user/` | the ONE verb the loop issues |
+|---|---|
+| loaded (rc 0) | `launchctl kickstart -k <domain>/<label>` — in the DOMAIN the read found it (`gui/` or `user/`; a job loaded from an SSH session lives in `user/`, where a `gui/`-only verb could never reach it) — the wedge cure it always had |
+| **REMOVED** (absent from every domain, **and no controller process alive**) | `launchctl enable` then `launchctl bootstrap <domain> <plist>` — the state `KeepAlive` cannot reach, and the one a routine `-w`/`bootout` flow leaves behind. ⛔ ONLY when the controller is **GONE**: the arm re-probes the recorded pid at the moment of the mutation, because a bootstrap beside a live (`WEDGED`) controller is a SECOND controller on one PR queue. ⚠ **AND IT THEREFORE CLEARS A DELIBERATE STOP TOO** (review P2, cycle 11): `launchctl disable`/`bootout` leaves exactly this state, and on this evidence a `Disabled` override is indistinguishable from the `-w` residue the arm exists to clear — so an operator who wants the fleet stopped must keep a live controller, or point `WATCHDOG_PLIST` at nothing. This row used to imply the arm protected a deliberate stop; the live-controller re-probe is what it actually protects. ⚠ THAT RE-PROBE IS SCOPED AND MUST SEE THE **PIN TREE**: launchd runs `bash __HARNESS__/__ENTRY__` (`launchd.plist.template:24`), which is neither `$O` nor the watchdog's own dir — measured on a live box, `bash /home/cmux/harness/<sha12>/scripts/orchestrator-harness/orch-loop.sh`, while `$O` is the deployed harness dir. So the probe also scans the pin root (`PIN_ROOT`, `$HOME/harness` by default); without that it is lock-only and a controller alive with an absent/stale lock gets bootstrapped over (measured) |
+| **UNREADABLE** ⚠ CORRECTED (`rc 64` `Unrecognized target specifier.`, or any non-zero whose text names neither a missing service nor a missing domain) | `kickstart` only — never a bootstrap, because that action must not re-load a job that may exist |
+| REMOVED **with no plist on disk** | nothing; `verdict=RESTART-UNAVAILABLE` names the label and the path it looked for — and its `detail=` remedy is **label-aware** (review P2, cycle 4): for the default **stack** label (`com.eldato.orchestrator-stack`, the box's own supervision job — `orchestrator-bringup.sh:1065-1069`) it says `install.sh` does **NOT** repair it, because that script renders the **loop** label only (`com.eldato.orchestrator-loop`) and following it would load a DIFFERENT job beside the box's model (the duplicate-controller class, #1761). For `com.eldato.orchestrator-loop` itself it names `install.sh`, which on that box IS the correct provisioning verb. ⚠ this row used to claim unconditionally that the line never names `install.sh`, which was false for the one label where that advice is right |
+| REMOVED, plist present but **not this job** (its `Label` is another label, or its `ProgramArguments` name a controller outside every root this box owns) | nothing; `verdict=RESTART-REFUSED` says nothing was issued and names the `Label` it actually found. ⛔ PROVENANCE IS READ BEFORE ANY MUTATION (review P1, cycle 4): `launchctl bootstrap` resolves the job by the plist's OWN `Label`, never by the file name, so "a file exists at `$PLIST_PATH`" is not evidence that loading it restores THIS label — a stale, copied or foreign plist there would `enable` a label launchd does not hold and load a DIFFERENT job beside the box's model (#1761/#1715), then report it as a failed restart of a controller nothing touched. ⛔ **AND IT IS READ AS XML, NOT AS RAW TEXT** (review P1, cycle 11): `launchctl` resolves the plist with CFPropertyList, so the proof decodes character references exactly as the loader does — `&#46;&#46;` IS `..` (a raw-text read passed a path that resolves outside every root, measured), and a root holding `&`/non-ASCII written `&amp;`/`&#233;` is not refused for its own spelling. A reference this reader does not resolve is REFUSED with that reason (never guessed at: `sprintf(\"%c\", n)` for n > 126 means a code point in gawk and a single BYTE in BWK awk), so the arm cannot be silently inert for a character it cannot prove. The proof is the plist's `Label` **and** a `ProgramArguments` program under `$O`, this file's tree, or
+`$PIN_ROOT` — the same three roots the liveness probe uses. ⛔ It is deliberately NOT a basename
+allowlist: the shipped stack label runs `/bin/bash $O/supervisor.sh` while `com.eldato.orchestrator-loop`
+runs `orch-loop.sh`, so a name list refuses the box's own configuration and makes the arm inert (the
+regression §8b(s) now pins). The doctrine is `orchestrator-bringup.sh`'s `launchd_job_for_state_dir()`: operate the job that is already here, never load a new one |
+| REMOVED **while a controller process is alive** | nothing; `verdict=RESTART-REFUSED` names the live pid and says why (this is the `WEDGED` shape, and it is not a failed restart — no verb ran). The mechanism is the lock, not deference: `orch-loop.sh:1573-1574` makes a newcomer beside a LIVE lock-holder exit at once (so a bootstrapped job is `KeepAlive` thrash), and where that lock is absent or stale the newcomer TAKES OVER — a second controller on one PR queue (#1715) |
+| `WATCHDOG_LAUNCHCTL_PIN` set, and `command -v launchctl` is a different binary | nothing at all — `RESTART-REFUSED`, not even the state read. A test that enters this arm pins its PATH shim, so a shim that failed to be written cannot fall through to the host's real `launchctl` |
+
+⚠ **CORRECTED 2026-11-01 (review of #1986), on the live box:** the UNREADABLE row used to name `Bad request.` as the marker. Measured, that is the FIRST line of every **not-found** read (`rc 113` — `Bad request.` then `Could not find service …`, for both `gui/<uid>` and `user/<uid>`); the genuinely unreadable read is `rc 64 Unrecognized target specifier.`. The polarity was right either way (not-found and unreadable both avoid a bootstrap), but the marker was wrong and `watchdog-loop.test.sh` §8b(d) pinned a fixture launchd does not produce. It now carries the measured one, and §8b(a) carries the measured not-found shape.
+
+⚠ **CORRECTED AGAIN (second review cycle of #1986): a REFUSAL IS NOT AN EXIT CODE.** It used to be signalled by the reserved value `RC_REFUSED=75`, which shares its value space with the verbs' own statuses: this file documents launchctl answering `rc 64` (EX_USAGE), i.e. **sysexits.h**, where 75 is `EX_TEMPFAIL` — so an `enable`/`kickstart` that FAILED with 75 was read as "a refusal" and the pass logged **no verdict at all** (no `RESTART-FAILED`, no refusal line, rc 0). The distinction is now carried out of band, and §8b(i) pins it (a verb exiting 75 is `RESTART-FAILED rc=75`). The same cycle fixed a second false verdict: the empty-plist arm (`RESTART-UNAVAILABLE`) also let `main` add `RESTART-FAILED … verb=unknown` on top of it, claiming a verb failed when none ran — §8b(c) now asserts that line is ABSENT.
+
+⚠ **THIRD CORRECTION (fourth review cycle of #1986): A REFUSAL CLAIMS NOTHING AND COSTS NOTHING.** A
+refused pass used to emit its normal decision line — `restart=1`, and at the cap "ONE probe restart" —
+BEFORE the refusal test, so the durable log recorded a restart for passes in which `launchctl.calls` held
+nothing but `print` reads; and the streak had already been incremented and persisted, so three harmless
+refusals latched the box into `<verdict>_STOPPED` and withheld the arm for up to `2 x MAX_CONSEC` further
+passes — a dead arm traded for a safe one. A refused pass now records the SAME observation with
+`restart=0` (the verdict it refused to act on is still worth reading) and restores the streak it read, so
+a withheld restart is never counted as a failed one. §8b(r) pins both halves across four consecutive
+refusals; §8b(f) pins that the `WEDGED` observation survives the refusal.
+
+⛔ IT IS NOT A SECOND AGENT, AND THAT IS THE WHOLE POINT. A second launchd watchdog was proposed and
+reviewed (#1986) and the review rejected it on this repo's own recorded decision: `templates/launchd/RETIRED`
+(#2303) retires the hand-provisioned `com.eldato.orchestrator-watchdog` **because two loaded watchdogs
+are two MUTATING actors restarting one controller**, and `docs/ops/fleet-liveness.md` names
+`watchdog-loop.sh` as its replacement. The capability was folded into that file instead: one actor, one
+`controller-watchdog.streak` budget, no label for `install-launchd.sh`'s `retire_pass` to fight and no
+second plist for `install.sh` to render. Proven by `watchdog-loop.test.sh` §8b (a stubbed `uname` + a
+`launchctl` argv log, entered only behind `WATCHDOG_LAUNCHCTL_PIN`: REMOVED with the controller GONE →
+`enable`+`bootstrap`, loaded → `kickstart -k` in the domain it was found in, unreadable → `kickstart`,
+no-plist → `RESTART-UNAVAILABLE` (and NO `RESTART-FAILED` over it, and its remedy is LABEL-AWARE: it
+names `install.sh` only for the one label `install.sh` renders), REMOVED over a LIVE controller →
+`RESTART-REFUSED`, a failed `enable` → `RESTART-FAILED` naming the verb, a verb failing with `rc 75` →
+`RESTART-FAILED rc=75` (never a refusal), and a pin that does not match the `launchctl` on PATH → nothing
+runs at all), which reddens on the pre-fold script. §8c covers the CELL arm on the same terms: a box with
+no `cloud-cell-supervisor.sh` reports `RESTART-UNAVAILABLE` and is never restated as a failed verb. The
+third review cycle added four more: §8b(k) the macOS arm with no `launchctl` at all, §8b(l) a live
+controller at the **pinned** path with no lock (the bypass the lock-only re-probe allowed), §8b(m) the
+cell supervisor's own pin (`WATCHDOG_SUPERVISOR_PIN`), and §8b(n) a cross-file pin that the label literal
+in the remedy still equals `install.sh`'s rendered label.
 
 ### 6.5.7 The cell's own roles run on a schedule, not when someone looks
 
