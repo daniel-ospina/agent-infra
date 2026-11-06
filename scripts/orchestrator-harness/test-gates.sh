@@ -3301,8 +3301,13 @@ GHOPEN3
   # `stale evidence …: 0`, and the refusal names REPO so the operator is not left to invent a third
   # way to set it.
   _rpt_norepo_out="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2>"$TMP/rpt-norepo.err" )"; _rpt_norepo_rc=$?
+  # ⛔ A HERE-STRING, NOT A PIPE INTO A QUIET grep (#841/#864 — and this suite's own file is scanned
+  # by scripts/check-no-sigpipe-grep.sh, a HARD gate: the piped form here was refused as an undeclared
+  # SIGPIPE idiom, which reds the `sigpipe-grep` job for a defect in a test). Under `set -o pipefail`
+  # the piped form fails the pipeline when printf takes SIGPIPE, and the `!` in front of it then flips
+  # that failure to TRUE — the arm would pass for the wrong reason. The here-string cannot.
   if [ "$_rpt_norepo_rc" -eq 2 ] \
-     && ! printf '%s\n' "$_rpt_norepo_out" | grep -qE 'open PRs: 0|stale evidence \(needs re-review\): 0' \
+     && ! grep -qE 'open PRs: 0|stale evidence \(needs re-review\): 0' <<<"$_rpt_norepo_out" \
      && grep -q 'REPO=.* is not a git checkout' "$TMP/rpt-norepo.err"; then
     echo "  ✅ with no repo checkout report.sh REFUSES by name (rc 2) — it never prints a confident 0"; PASS=$((PASS+1))
   else
