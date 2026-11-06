@@ -348,10 +348,12 @@ push_unshadowed() {
 # credential from the one just refused wins:
 #   1. `BG_RESCUE_PUSH_HELPER=<name>` — the operator's explicit choice, for a store this script cannot
 #      guess (trusted exactly as the caller is: it reaches the shell git would run anyway);
-#   2. `BG_RESCUE_PUSH_UNSHADOW=1` — an explicit request for the STORED credential below. Needed because
-#      the macOS default is unconditional, so without this the unshadow candidate is UNREACHABLE there
-#      (a reviewer caught the earlier text claiming `BG_RESCUE_PUSH_HELPER=` did this: an EMPTY value is
-#      unset to `${…:-}`, so it selected nothing);
+#   2. `BG_RESCUE_PUSH_UNSHADOW=1` — an explicit request for the STORED credential below, which is the
+#      only way to reach that candidate on macOS (where the platform default is unconditional). ⛔ IT
+#      REQUIRES AN AMBIENT TOKEN TO REMOVE: with none set the retry would be BYTE-IDENTICAL to the one
+#      that was just refused, so none is attempted (a reviewer measured exactly that — two identical
+#      argv lines, a message claiming a removal that never happened, 45 s spent in the second before a
+#      kill). A seam cannot buy a different credential out of nothing;
 #   3. `osxkeychain` on Darwin — the proven macOS credential, unchanged behaviour there;
 #   4. `unshadow` elsewhere, when an ambient token is actually set to remove;
 #   5. nothing — and then NO retry is attempted. A second attempt carrying the same credential cannot
@@ -368,7 +370,11 @@ RETRY_HELPER="${BG_RESCUE_PUSH_HELPER:-}"
 RETRY_UNSHADOW="${BG_RESCUE_PUSH_UNSHADOW:-0}"
 retry_credential() {  # echoes "helper <name>" | "unshadow" | "" (nothing that can differ)
   if [ -n "$RETRY_HELPER" ]; then printf 'helper %s' "$RETRY_HELPER"; return 0; fi
-  if [ "$RETRY_UNSHADOW" = "1" ]; then printf 'unshadow'; return 0; fi
+  # ⛔ THE SEAM IS CONDITIONAL ON A SHADOW EXISTING (review round 2, P2): asking to remove an ambient
+  # token that is not set selects the credential the first push already used — it cannot succeed, and
+  # the message would then be LYING about a removal that never happened. Same predicate as the platform
+  # default below: one rule, `unshadow` only when there is something to unshadow.
+  if [ "$RETRY_UNSHADOW" = "1" ] && [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then printf 'unshadow'; return 0; fi
   if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then printf 'helper osxkeychain'; return 0; fi
   if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then printf 'unshadow'; return 0; fi
   printf ''
@@ -434,6 +440,10 @@ else
         # case, and it is an owner decision — accept the loud local-only outcome, or an off-box channel
         # that keeps the snapshot whole. Do not narrow the snapshot instead: the whole-tree commit is
         # what this tool guarantees.)
+        # ⛔ AND THE ADVICE NAMES ONLY THE HELPER SEAM (review round 2, P2). `BG_RESCUE_PUSH_UNSHADOW=1`
+        # cannot help on the shape that reaches this line — it is reached precisely when there is NO
+        # ambient token to unshadow, and the seam is conditional on one existing — so recommending it
+        # would send the operator after a guaranteed-useless 45 s retry, the outcome this gate avoids.
         NO_SECOND=1
         ;;
     esac
@@ -472,7 +482,7 @@ if [ "$NO_SECOND" -eq 1 ]; then
   # the reader knows the rescue had no second credential to select on $(uname -s 2>/dev/null) and that
   # the fix is to supply one. The retry was deliberately NOT attempted — re-sending the same credential
   # cannot succeed, and it is the one attempt that would turn a named cause into a timeout.
-  WHY+=("no second credential was tried: on $(uname -s 2>/dev/null), the retry would have re-sent the SAME credential (no ambient GH_TOKEN/GITHUB_TOKEN to unshadow, and no osxkeychain). Supply a workflow-scoped one with BG_RESCUE_PUSH_HELPER=<helper-name>, or force the stored credential with BG_RESCUE_PUSH_UNSHADOW=1.")
+  WHY+=("no second credential was tried: on $(uname -s 2>/dev/null), the retry would have re-sent the SAME credential (no ambient GH_TOKEN/GITHUB_TOKEN to unshadow, and no osxkeychain). Supply a workflow-scoped one with BG_RESCUE_PUSH_HELPER=<helper-name>.")
 fi
 
 if [ "$LOCAL_OK" -eq 1 ]; then
