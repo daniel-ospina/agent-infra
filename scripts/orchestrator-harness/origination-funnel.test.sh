@@ -886,6 +886,18 @@ case "$OUT_DRIVE" in
   *"refresh ok"*) ok "caller: 'skipped' says the refresh is healthy" ;;
   *) bad "caller: 'skipped' does not say the refresh is healthy — $OUT_DRIVE" ;;
 esac
+# ⛔ AND ITS PRINTF ARITY, LIKE EVERY OTHER COUNT ARM (review P2, cycle 22). This is the arm that means
+# "origination WORKS and real work is held" — the highest-traffic one — and it was the ONLY count arm with
+# no line-count/prtail guard. Measured: one surplus `printf` argument emitted a SECOND, fabricated
+# `[dispatch]` line and both suites stayed green; `orch-loop.sh:2231-2239` records that exact defect
+# shipping once before.
+_dn="$(printf '%s\n' "$OUT_DRIVE" | grep -c '^\[dispatch\]' || true)"
+if [ "$_dn" = "1" ]; then ok "caller: 'skipped' emits exactly ONE [dispatch] line"
+else bad "caller: 'skipped' emitted $_dn [dispatch] lines — printf recycled the format over a surplus argument: $OUT_DRIVE"; fi
+case "$OUT_DRIVE" in
+  *"| PR path: stub PR path"*) ok "caller: 'skipped' keeps its \`| PR path:\`" ;;
+  *) bad "caller: 'skipped' displaced the prtail — $OUT_DRIVE" ;;
+esac
 
 # ── 3b) A SECOND PASS CARRIES THE HEAD OVER — AND SAYS SO (provenance honesty) ──
 # The same sandbox, one more cycle: #42 is already `checked`, so no candidate is judged and the queue
@@ -1103,7 +1115,7 @@ _recorded_line_check() {   # $1=handed, $2=label, $3=backlog (default 0), $4=res
   mkdir -p "$D/o/state"
   # ⛔ A `result=running` RECORD CARRYING A COUNT IS NOT A SHAPE THE WRITER EMITS (review P3, cycle 28): the
   # only running write is the tombstone, which has `why=`+`cmd=?` and NO `backlog=`/`handed=`
-  # (`refresh-candidates.sh:1991-1993`) — and `_bl_state=RECORDED` needs a numeric `backlog=`. This branch
+  # (`refresh-candidates.sh:1992-1994`) — and `_bl_state=RECORDED` needs a numeric `backlog=`. This branch
   # exists to pin `printf` ARITY on the `running` gate (a surplus argument recycles the format and
   # fabricates a line), which it does; the record is a HAND-EDITED / partly-written one, so it grades the
   # arity and NOT a state production can enter. Do not read it as coverage of a tombstone.
@@ -1392,7 +1404,7 @@ mk_tool_clean "$D"
 printf 'garbage-head\n300\n200\n' > "$D/o/candidates.txt"
 printf '#!/usr/bin/env bash\nexit 1\n' > "$D/bin/wc"; chmod +x "$D/bin/wc"
 mkdir -p "$D/o/state"
-printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=2\nbacklog=2\nhanded=300\nhanded_why=judged CLEAN\n' "$(date +%s)" > "$D/o/state/refresh-last"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=2\nbacklog=2\nhanded=300\nhanded_why=carried over from an earlier pass — the highest-ranked CLEAN entry in the pool-ordered queue\n' "$(date +%s)" > "$D/o/state/refresh-last"
 OUT_DRIVE="$(O="$D/o" LOG=/dev/null PATH="$D/bin:$PATH" bash -c 'set -u; . "$1"; . "$2"; . "$3"; dispatch_gate_line "$4" 0 0 "stub PR path"' _ "$ISNUM" "$HELPFNS" "$FNS" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)" 2>&1)"
 case "$OUT_DRIVE" in
   *"the queue is EMPTY"*|*"nothing to defer"*) bad "depth-recorded: the gate read a 2-row queue as empty/undrained-and-idle — $OUT_DRIVE" ;;
@@ -1410,7 +1422,7 @@ esac
 D2="$T/drained"; mkdir -p "$D2/state"
 # a box that HAS a refresh script (the no-script state is section 10's)
 printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$D2/refresh-candidates.sh"
-printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=3\nhanded=42\nhanded_why=judged CLEAN by THIS pass\n' "$(date +%s)" > "$D2/state/refresh-last"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=3\nhanded=42\nhanded_why=judged CLEAN by THIS pass, and the highest-ranked CLEAN entry in the pool-ordered queue\n' "$(date +%s)" > "$D2/state/refresh-last"
 : > "$D2/candidates.txt"
 drive_gate "$D2" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
@@ -1533,7 +1545,7 @@ esac
 # `backlog=` — a `fail` record carries none — so a `result=fail` + `backlog=5` fixture modelled an
 # impossible state and the reachable arms stayed ungraded.
 mkdir -p "$T/mask-rec/state"
-printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=judged CLEAN\n' "$(date +%s)" > "$T/mask-rec/state/refresh-last"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=carried over from an earlier pass — the highest-ranked CLEAN entry in the pool-ordered queue\n' "$(date +%s)" > "$T/mask-rec/state/refresh-last"
 : > "$T/mask-rec/.refresh-unrecorded"
 printf 'stage=handoff\nrc=1\nat=%s\nwhy=record write failed\n' "$(date +%s)" >> "$T/mask-rec/.refresh-unrecorded"
 printf '7\n8\n' > "$T/mask-rec/candidates.txt"; chmod 000 "$T/mask-rec/candidates.txt"
@@ -1598,7 +1610,7 @@ done
 # `result=running` is what a pass that died mid-flight leaves behind. With a queued candidate the
 # deferral is real (so `deferred`), and with an empty queue there is no evidence at all (so BLOCKED).
 mkdir -p "$T/running/state"
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet\ncmd=?\n' "$(date +%s)" > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\ncmd=?\n' "$(date +%s)" > "$T/running/state/refresh-last"
 printf '7\n' > "$T/running/candidates.txt"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
@@ -1634,11 +1646,11 @@ esac
 grep -q 'RUNNING_STALE_MIN="\${REFRESH_RUNNING_STALE_MIN:-\$REFRESH_STALE_LOCK_MIN}"' "$LOOP" \
   && ok "bound: RUNNING_STALE_MIN DEFAULTS FROM that one constant (no second number to drift)" \
   || bad "bound: the reader's RUNNING_STALE_MIN no longer derives from REFRESH_STALE_LOCK_MIN — two bounds can drift apart"
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - (LOCK_MIN + 60) * 60 ))" > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$(( $(date +%s) - (LOCK_MIN + 60) * 60 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 # ⛔ JUST OUTSIDE THE BOUND (LOCK_MIN + 1 minutes): the smallest stale reading there is. A reader that
 # hardcoded a different number — or stopped deriving from the controller's constant — shows up here.
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - (LOCK_MIN + 1) * 60 ))" > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$(( $(date +%s) - (LOCK_MIN + 1) * 60 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   "[dispatch] BLOCKED: a refresh pass wrote its start marker"*"stale bound"*) ok "running+stale: a marker 1 min past the ${LOCK_MIN}m bound is BLOCKED" ;;
@@ -1647,7 +1659,7 @@ esac
 # ⛔ AND JUST INSIDE IT (LOCK_MIN - 5 minutes): still IN FLIGHT. This is the fixture that kills a
 # hardcoded literal in EITHER direction — a reader whose bound drifted below the controller's would call
 # this dead, and one whose bound drifted above would never call anything dead (caught above).
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - (LOCK_MIN - 5) * 60 ))" > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$(( $(date +%s) - (LOCK_MIN - 5) * 60 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   "[dispatch] nothing to defer ("*) ok "bound: a marker 5 min INSIDE the ${LOCK_MIN}m bound is still in flight, not BLOCKED" ;;
@@ -1655,7 +1667,7 @@ case "$OUT_DRIVE" in
 esac
 # ⛔ THE FULL AGE LADDER (review P3): `Nh ago` had no fixture at all, so a hardcoded '<1m ago' or a
 # missing hour rung stayed green.
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - 3 * 3600 ))" > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$(( $(date +%s) - 3 * 3600 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   *"start marker 3h ago"*) ok "age: a 3-hour-old stamp renders '3h ago' (the hour rung exists)" ;;
@@ -1665,13 +1677,13 @@ case "$OUT_DRIVE" in
   *"<1m ago"*) bad "running+stale: the stale marker was rendered as fresh — $OUT_DRIVE" ;;
   *) ok "running+stale: and its age is not rendered as fresh" ;;
 esac
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) - 600 ))" > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$(( $(date +%s) - 600 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   *"start marker 10m ago"*) ok "age: a 600 s old stamp prints '10m ago'" ;;
   *) bad "age: a 600 s old stamp did not print '10m ago' — $OUT_DRIVE" ;;
 esac
-printf 'result=running\nstage=provision\nrc=0\nrepo=daniel-ospina/agent-infra\nwhy=started\n' > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   *"age unknown"*) ok "age: a record with NO at= reports 'age unknown', never a fresh-looking stamp" ;;
@@ -1686,7 +1698,7 @@ esac
 # ⛔ AND THE CAUSE MUST BE THE REAL ONE (review P2): a stamp in the FUTURE is not "no readable at=" —
 # the record's `at=` is perfectly readable, the CLOCK is the problem, and an operator sent to look for a
 # missing key would find a present one.
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(( $(date +%s) + 7200 ))" > "$T/running/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$(( $(date +%s) + 7200 ))" > "$T/running/state/refresh-last"
 drive_gate "$T/running" "merge-priority (1 un-owned of 3 open PR(s) — PRs before issues)"
 case "$OUT_DRIVE" in
   *"its at= is in the FUTURE"*) ok "age: a FUTURE stamp is named as a clock problem, not as a missing key" ;;
@@ -1813,7 +1825,7 @@ fi
 mk_case fail-unrecordable 42
 mk_tool_incomplete "$D"
 mkdir -p "$D/o/state"
-printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=1\nqueued=1\nbacklog=1\nhanded=7\nhanded_why=judged CLEAN by THIS pass\n' "$(date +%s)" > "$D/o/state/refresh-last"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\njudged=1\nqueued=1\nbacklog=1\nhanded=7\nhanded_why=judged CLEAN by THIS pass, and the highest-ranked CLEAN entry in the pool-ordered queue\n' "$(date +%s)" > "$D/o/state/refresh-last"
 printf '7\n' > "$D/o/candidates.txt"
 if [ "$(id -u)" = "0" ]; then
   echo "  ⚠ skipping the unwritable-state-dir case: running as root, chmod cannot make a directory unwritable"
@@ -1870,7 +1882,7 @@ fi
 # pass that failed — the mask returning through its own fix (review P1).
 mk_case marker-empty 42
 mkdir -p "$D/o/state"
-printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\nqueued=1\nbacklog=1\nhanded=7\nhanded_why=judged CLEAN by THIS pass\n' "$(date +%s)" > "$D/o/state/refresh-last"
+printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed\nqueued=1\nbacklog=1\nhanded=7\nhanded_why=judged CLEAN by THIS pass, and the highest-ranked CLEAN entry in the pool-ordered queue\n' "$(date +%s)" > "$D/o/state/refresh-last"
 printf '7\n' > "$D/o/candidates.txt"
 : > "$D/o/.refresh-unrecorded"          # 0 bytes: the full-disk shape
 drive_gate "$D/o" "merge-priority (2 un-owned of 5 open PR(s) — PRs before issues)"
@@ -2139,7 +2151,7 @@ printf '%s\n' '#!/usr/bin/env bash' \
 printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$SKEW/self/refresh-candidates.sh"
 # An intact box: the seeded copy itself can record.
 printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$SKEW/ok/o/refresh-candidates.sh"
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' \
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' \
   "$(( $(date +%s) - 3 * 3600 ))" > "$SKEW/o/state/refresh-last"
 printf '7\n' > "$SKEW/o/candidates.txt"
 
@@ -2225,7 +2237,7 @@ case "$OUT_DRIVE" in
 esac
 # ⛔ AND A YOUNG RECORD IS STILL IN FLIGHT, not SEED-SKEW: a reader that fired on that would invent a
 # second wrong cause for the ordinary in-flight state.
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$(date +%s)" > "$SKEW/o/state/refresh-last"
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$(date +%s)" > "$SKEW/o/state/refresh-last"
 drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
 case "$OUT_DRIVE" in
   *"SEED-SKEW"*) bad "unwritable+young: a fresh start marker was read as a seed skew — $OUT_DRIVE" ;;
@@ -2249,7 +2261,7 @@ esac
 # non-numeric `at=` used to fall into "cannot be told apart from a pass that DIED" — the very sentence
 # this verdict exists to stop, on a box where nothing can write the record.
 for bad_at in "$(( $(date +%s) + 7200 ))" "notanumber"; do
-  printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' "$bad_at" > "$SKEW/o/state/refresh-last"
+  printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' "$bad_at" > "$SKEW/o/state/refresh-last"
   drive_gate_self "$SKEW/o" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/none"
   case "$OUT_DRIVE" in
     *"DIED"*) bad "unwritable+unageable(at=$bad_at): the gate fell through to the death reading — $OUT_DRIVE" ;;
@@ -2304,7 +2316,7 @@ esac
 # `$SKEW/no-script` exercised the *absent* record arm (`[ -z "$at" ]`), never the stale numeric one —
 # the state this comment claims to test.
 mkdir -p "$SKEW/no-script/state"
-printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=started\n' \
+printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\n' \
   "$(( $(date +%s) - 16 * 3600 ))" > "$SKEW/no-script/state/refresh-last"
 printf '7\n' > "$SKEW/no-script/candidates.txt"
 drive_gate_self "$SKEW/no-script" "merge-priority (5 un-owned of 9 open PR(s) — PRs before issues)" "$SKEW/no-script2"
@@ -2477,8 +2489,8 @@ printf '%s\n' '#!/usr/bin/env bash' ': nothing here can record' > "$_skewdir/non
 # production while omitting fields the writer always emits (`queue_readable=`, `unusable=`) certifies a
 # pre-witness record; and one whose VALUES the writer cannot produce (`handed_why=` with no rank clause, a
 # truncated `why=`) certifies nothing either. Every `_head_rank` arm and BOTH `_head_why` arms end in
-# `, and $_head_rank` / `— $_head_rank` (`refresh-candidates.sh:5930-5949`), and `why=` is the writer's
-# whole template (`:5974`) — so what follows are its literal strings, not abbreviations of them.
+# `, and $_head_rank` / `— $_head_rank` (`refresh-candidates.sh:5929-5949`), and `why=` is the writer's
+# whole template (`:5975`) — so what follows are its literal strings, not abbreviations of them.
 printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed; queue depth 5; head #7 is what dispatch takes next\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=judged CLEAN by THIS pass, and the highest-ranked CLEAN entry in the pool-ordered queue\nqueue_readable=1\nunusable=\n' \
   "$(( $(date +%s) - 3 * 3600 ))" > "$_skewdir/o/state/refresh-last"
 printf '7\n8\n' > "$_skewdir/o/candidates.txt"; chmod 000 "$_skewdir/o/candidates.txt"
@@ -2508,7 +2520,7 @@ mkdir -p "$_dieddir/o/state" "$_dieddir/self"
 printf '%s\n' '#!/usr/bin/env bash' 'refresh_record_write() { :; }' > "$_dieddir/self/refresh-candidates.sh"
 cp "$_dieddir/self/refresh-candidates.sh" "$_dieddir/o/refresh-candidates.sh"
 # the tombstone's own bytes — the writer's WHOLE `why=` (it continues PAST "outcome yet") and `cmd=?`
-# (`refresh_record_write running provision 0`, `refresh-candidates.sh:1991-1993`)
+# (`refresh_record_write running provision 0`, `refresh-candidates.sh:1992-1994`)
 printf 'result=running\nstage=provision\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=this pass started and has not recorded an outcome yet — if this line is what the beat reports, the pass died before finishing\ncmd=?\n' \
   "$(( $(date +%s) - 60 * 60 ))" > "$_dieddir/o/state/refresh-last"
 printf '7\n8\n' > "$_dieddir/o/candidates.txt"
@@ -2529,6 +2541,66 @@ case "$OUT_DRIVE" in
   *"2 usable candidate(s) still queued from an earlier pass"*) ok "tailnote/unageable: the unreadable-stamp arm carries the measured-count note" ;;
   *) bad "tailnote/unageable: that arm lost the note — $OUT_DRIVE" ;;
 esac
+
+echo
+# ── 11b) THE FIXTURES ABOVE ARE PINNED TO THE SHIPPED WRITER (review P2, cycle 22) ──
+# ⛔ THE FIDELITY WAS ASSERTED IN PROSE AND ENFORCED BY NOTHING. Nothing READS `handed_why=` or a
+# `running` record's `why=`, so the writer could revert to the exact strings those fixtures call
+# unproducible — `_head_why="judged CLEAN by THIS pass"` (leaving a dangling `, and `), or a truncated
+# tombstone — and the whole suite stayed green (measured 3×). The literals are therefore READ FROM THE
+# SHIPPED SCRIPT, the way the in-flight bound above is, and the fixtures must hold what it holds: a
+# reversion on EITHER side is RED.
+_why_ok="$(grep -o 'pass completed; queue depth [^"]*' "$REFRESH" | head -1)"
+case "$_why_ok" in
+  *'is what dispatch takes next'*)
+    # ⛔ COUNTED ON THE FIXTURE LINES, NOT `grep -q` OVER THE FILE (this pin's own copy of the literal
+    # satisfied an unanchored search, so a fully reverted fixture left it green — the same self-match
+    # that made the tombstone pin report 15 fixtures for 14). A fixture that writes a `queue depth` into
+    # its ok `why=` is claiming the writer's template, so it must carry the writer's tail.
+    _fx_tmpl="$(grep -cE "^[[:space:]]*printf 'result=ok.*why=[^\\\\]*queue depth" "$0" || true)"
+    _fx_tail="$(grep -cE "^[[:space:]]*printf 'result=ok.*why=.*is what dispatch takes next" "$0" || true)"
+    if [ "$_fx_tmpl" = "$_fx_tail" ] && [ "$_fx_tmpl" != "0" ]; then
+      ok "pin/writer: all $_fx_tmpl ok fixture(s) claiming the template carry the shipped tail (\`head #N is what dispatch takes next\`)"
+    else
+      bad "pin/writer: $_fx_tmpl ok fixture(s) claim the writer's template but $_fx_tail carry its tail — \`$_why_ok\`"
+    fi ;;
+  *) bad "pin/writer: the ok \`why=\` template no longer ends 'is what dispatch takes next' — the fixtures' bytes are stale: \`$_why_ok\`" ;;
+esac
+# the tombstone: the writer's whole sentence, tail clause included — a truncated fixture certifies nothing
+_DTH='if this line is what the beat reports, the pass died before finishing'
+if grep -qF -- "$_DTH" "$REFRESH"; then
+  # ⛔ PER SITE, NOT "SOMEWHERE IN THE FILE": a single `grep -q` is satisfied by the 12 OTHER copies, so
+  # one fixture could go back to the pre-fix stub with the suite green. Every `result=running` record in
+  # this file is a tombstone, so the two counts must agree.
+  _tomb_lines="$(grep -cE "^[[:space:]]*printf 'result=running.*stage=provision" "$0" || true)"
+  # anchored on `printf 'result=running` so this line cannot match ITSELF — an unanchored pattern here
+  # counted its own invocation and reported 15 fixtures for 14
+  _tomb_lit="$(grep -cE "^[[:space:]]*printf 'result=running.*pass died before finishing" "$0" || true)"
+  if [ "$_tomb_lines" = "$_tomb_lit" ]; then
+    ok "pin/writer: all $_tomb_lines tombstone fixtures carry the shipped \`why=\` (death clause included)"
+  else
+    bad "pin/writer: $_tomb_lines tombstone fixture(s) but $_tomb_lit carry the writer's whole \`why=\` — a truncated fixture models a record the writer cannot write"
+  fi
+else
+  bad "pin/writer: refresh-candidates.sh no longer writes the tombstone's death clause — the fixtures are stale"
+fi
+# and BOTH `_head_why` arms must still END in the rank clause they write into the durable record
+for _arm in 'judged CLEAN by THIS pass, and $_head_rank' 'carried over from an earlier pass — $_head_rank'; do
+  grep -qF -- "$_arm" "$REFRESH" \
+    && ok "pin/writer: \`_head_why\` still ends in the rank clause (\`$_arm\`)" \
+    || bad "pin/writer: \`_head_why\` lost its rank clause (\`$_arm\`) — \`handed_why=\` becomes a dangling phrase in the durable record"
+done
+# the ranked arm's own string, which the ok fixtures now carry verbatim
+_RANKED='the highest-ranked CLEAN entry in the pool-ordered queue'
+_hw_fx="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=" "$0" || true)"
+# BOTH arms of `_head_why` end in the rank clause, so the count is "ends in the RANKED string", not
+# "starts with the judged-by-THIS-pass wording" — two fixtures model a CARRIED-over head.
+_hw_rank="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=.*the highest-ranked CLEAN entry in the pool-ordered queue" "$0" || true)"
+if grep -qF -- "$_RANKED" "$REFRESH" && [ "$_hw_fx" = "$_hw_rank" ] && [ "$_hw_fx" != "0" ]; then
+  ok "pin/writer: all $_hw_fx fixture \`handed_why=\` value(s) end in the rank clause the writer appends"
+else
+  bad "pin/writer: $_hw_fx fixture \`handed_why=\` value(s) but $_hw_rank end in the writer's rank clause — the ranked arm \`$_RANKED\` is not what they hold"
+fi
 
 echo
 # ── 12) THE DRIVERS RUN IN THE MODE orch-loop.sh RUNS IN (review P2, cycle 17) ──
