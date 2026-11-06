@@ -6711,6 +6711,22 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
         export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         for kv in "$@"; do export "$kv"; done
+        # ⛔ AND IT MUST CARRY THE #3442 BLOCK. `verify_review_evidence` now refuses a FRESH
+        # `clean` verdict over an artifact with no `## MUTATION ATTRIBUTION` table, and every
+        # vector in this section mints one — so without the block EVERY arm below refused at 3
+        # for a reason unrelated to what it pins (the unrelated-row trap #3442's own fixture
+        # note names). Applied AFTER the caller's overrides so a vector's own body is
+        # byte-unchanged up to the blank line: the delta arms below SCAN that body for stated
+        # ranges, and the block must not be the thing they compare. A vector that deliberately
+        # omits the block opts out with DELTA_NO_VACUITY_BLOCK=1 rather than relying on order.
+        if [ "${DELTA_NO_VACUITY_BLOCK:-0}" != 1 ]; then
+            case "$STUB_EVIDENCE_BODY" in
+                *"MUTATION ATTRIBUTION"*) : ;;
+                *) STUB_EVIDENCE_BODY="$STUB_EVIDENCE_BODY
+
+$VACUITY_BLOCK"; export STUB_EVIDENCE_BODY ;;
+            esac
+        fi
         rc=0
         # shellcheck disable=SC2086  # EXTRA_ARGS is intentionally word-split (one flag)
         bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" ${EXTRA_ARGS:-} 2>"$errfile" || rc=$?
@@ -6816,12 +6832,16 @@ assert_contains "$RECORD_ERR" "could not read the PR's BASE" "20d4 the refusal n
 # for the shape it exists to pin, which made 20e red for a reason it does not
 # measure. The clean shapes are what backward compat means here.
 EE=425108; rm -f "$(Q2 $EE)"
-EV_REF="comment:42510801" run_record_ev $EE STUB_EVIDENCE_BODY='**Outcome: CLEAN — verified, no issues.**'
+EV_REF="comment:42510801" run_record_ev $EE STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified, no issues.**
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "20e comment:<id> evidence still records clean (rc 0)"
 assert_contains "$(cat "$(Q2 $EE)" 2>/dev/null || true)" '"evidence":"comment:42510801"' "20e the record still names the comment"
 if grep -qF 'delta_' "$(Q2 $EE)" 2>/dev/null; then bad "20e a comment record grew delta fields"; else ok "20e a comment record carries NO delta fields (shape unchanged)"; fi
 EE2=425109; rm -f "$(Q2 $EE2)"
-EV_REF="review:42510901" run_record_ev $EE2 STUB_REVIEW_STATE=APPROVED STUB_EVIDENCE_BODY='**Outcome: CLEAN — verified, no issues.**'
+EV_REF="review:42510901" run_record_ev $EE2 STUB_REVIEW_STATE=APPROVED STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified, no issues.**
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "20e review:<id> evidence still records clean (rc 0)"
 
 # ── 20f — the OTHER refusal arms ─────
@@ -7425,6 +7445,21 @@ mut_run() { # <mutant-script> <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main STUB_COMMIT_DATES_DIR="$T/dates"
         export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         for kv in "$@"; do export "$kv"; done
+        # ⛔ THE MUTATION HARNESS MINTS A FRESH `clean` TOO, so it owes the same #3442 block
+        # (`verify_review_evidence`'s non-vacuity arm) — without it every mutant refused at 3
+        # from a DIFFERENT guard than the one it mutates, which is the exact vacuity this
+        # matrix exists to detect, reported against itself. Applied after the overrides, on
+        # the same terms as `run_record_delta` (a vector may opt out with
+        # DELTA_NO_VACUITY_BLOCK=1), so the body each vector wrote up to the blank line is
+        # what the range-scanning arms below actually see.
+        if [ "${DELTA_NO_VACUITY_BLOCK:-0}" != 1 ]; then
+            case "$STUB_EVIDENCE_BODY" in
+                *"MUTATION ATTRIBUTION"*) : ;;
+                *) STUB_EVIDENCE_BODY="$STUB_EVIDENCE_BODY
+
+$VACUITY_BLOCK"; export STUB_EVIDENCE_BODY ;;
+            esac
+        fi
         rc=0
         bash "$mut" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" >/dev/null 2>"$T/merr" || rc=$?
         printf '%s' "$rc" > "$T/mrc"
