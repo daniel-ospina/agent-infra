@@ -1934,9 +1934,16 @@ GIT_HOOK_FLAGS = ("--no-ext-diff", "--no-textconv")
 # (`_repo_config_fault`), and if it declares any of these the call is refused with a typed refusal
 # naming the key. Adding a key to the pin list would not close this — a driver name cannot be guessed.
 GIT_UNPINNABLE_KEY_RE = re.compile(
-    r"^(filter\..+\.(clean|smudge|process)|merge\..+\.driver)$", re.IGNORECASE)
-GIT_LAZY_FETCH_KEY_RE = re.compile(
-    r"^(extensions\.partialclone|remote\..+\.promisor)$", re.IGNORECASE)
+    r"^(filter\..+\.(clean|smudge|process)|merge\..+\.driver|remote\..+\.uploadpack)$",
+    re.IGNORECASE)
+# ⛔ `extensions.partialClone` IS A STRING NAMING THE PROMISOR REMOTE, NOT A BOOLEAN. Sharing a
+# false-set test with `remote.<name>.promisor` meant `[extensions] partialClone = false` — a real
+# promisor remote whose NAME is "false" — read as "not a partial clone" and was ALLOWED (measured: git
+# then fetched from that remote and ran its `remote.<name>.uploadpack` program). Presence is the
+# signal, so presence refuses.
+GIT_PARTIAL_CLONE_RE = re.compile(r"^extensions\.partialclone$", re.IGNORECASE)
+# only `remote.<name>.promisor` is a BOOLEAN, and only here does a false-set make sense
+GIT_LAZY_FETCH_KEY_RE = re.compile(r"^remote\..+\.promisor$", re.IGNORECASE)
 # ⛔ A BARE ARGUMENT TO `hostname` IS THE SETTER FORM, NOT A QUERY. `hostname NAME` and
 # `hostname -F <file>` RENAME the box (`hostname --help`: `{hostname|-F file}  set host name`), and
 # `ALLOWLIST["hostname"] = ([], 1)` bounds only the COUNT — so `["hostname", "pwned-cell"]` passed this
@@ -1974,31 +1981,61 @@ def _repo_config_fault(cmux: str, target: str) -> Tuple[str, bool]:
     """
     got = run([cmux, "vm", "exec", "--timeout", "20", target, "--",
                "git", "config", "--includes", "--list", "-z"], timeout=45.0, cap=MAX_CAP)
-    if got.rc != 0:
-        return "", False
-    if got.truncated:
-        return ("the target checkout's config listing did not fit in %d bytes, so it could not be "
-                "checked for a program-naming key — refused rather than run with an unread config"
-                % MAX_CAP), True
-    for record in (got.stdout or "").split("\0"):
+    # ⛔ PARSE WHATEVER WAS ALREADY DRAINED, BEFORE JUDGING THE READ. `run()` drains into stdout even
+    # on a timeout, so a key it already printed must still refuse — discarding it would be the same
+    # "cut short is clean" mistake the truncation branch exists to prevent.
+    listing = (got.stdout or "")
+    fault = ""
+    saw_repo = False
+    for record in listing.split("\0"):
         if not record:
             continue
         key, _, value = record.partition("\n")
         key = key.strip()
+        if key.lower() == "core.repositoryformatversion":
+            saw_repo = True
+        if GIT_PARTIAL_CLONE_RE.match(key):
+            fault = fault or ("the target checkout declares a PARTIAL CLONE (%s): an object read can "
+                              "trigger a LAZY FETCH from the promisor remote, which runs that "
+                              "remote's program (`remote.<name>.uploadpack`, `core.sshCommand`, "
+                              "`remote.<name>.proxy`, or an `ext::<program>` URL)" % key)
+            continue
         if GIT_UNPINNABLE_KEY_RE.match(key):
-            return ("the target checkout's config names a program this surface CANNOT neutralise "
-                    "(%s): a filter/merge driver is chosen by `.gitattributes`, so its key name "
-                    "cannot be pinned by a `-c` argument — the exec is refused rather than run with "
-                    "a program the repo chose" % key), True
+            fault = fault or ("the target checkout's config names a program this surface CANNOT "
+                              "neutralise (%s): a filter/merge driver is chosen by "
+                              "`.gitattributes`, so its key name cannot be pinned by a `-c` "
+                              "argument — the exec is refused rather than run with a program the "
+                              "repo chose" % key)
+            continue
         if GIT_LAZY_FETCH_KEY_RE.match(key):
             # ⛔ A VALUELESS ENTRY IS `true` IN GIT (`[remote "origin"] promisor` prints with no `=`),
             # so an empty/missing value must NOT read as false; and `off`/`n`/`f` ARE legal false
-            # spellings. The earlier allow-list inverted both directions.
+            # spellings. Only THIS key is a boolean — see GIT_PARTIAL_CLONE_RE for the string one.
             if value.strip().lower() not in ("false", "no", "off", "0", "n", "f"):
-                return ("the target checkout declares a PARTIAL CLONE / promisor remote (%s), so an "
-                        "object read can trigger a LAZY FETCH, which runs the repo's transport "
-                        "program (`core.sshCommand`, `remote.<name>.proxy`, or a remote URL of the "
-                        "form `ext::<program>`)" % key), True
+                fault = fault or ("the target checkout declares a PROMISOR remote (%s), so an object "
+                                  "read can trigger a LAZY FETCH that runs a transport program" % key)
+    if fault:
+        return fault, True
+    # ⛔ A READ THAT DID NOT FINISH IS NOT EVIDENCE, AND IT MUST NOT FALL THROUGH TO THE EXEC.
+    # `run()` returns rc=None on a TIMEOUT — a read cut short, the same category as truncation and the
+    # opposite of a clean answer. (The pre-check budget is deliberately smaller than the exec's, so a
+    # slow config is exactly the case that can lose the pre-check and still finish the verb.)
+    if got.timed_out or got.error:
+        return ("the target checkout's config could not be READ (%s), so it cannot be checked for a "
+                "program-naming key — refused rather than run with an unread config"
+                % (got.error or "timed out"), True)
+    if got.truncated:
+        return ("the target checkout's config listing was CUT SHORT by the %s-byte channel cap "
+                "(truncated is a CHANNEL fact over stdout+stderr, not a statement about the "
+                "listing), so it could not be checked for a program-naming key" % got.cap), True
+    if got.rc != 0:
+        return "", False
+    # ⛔ AND `rc 0` DOES NOT PROVE A REPOSITORY WAS READ. Without `--local`, `git config --list`
+    # SUCCEEDS OUTSIDE a repository (global+system scope only), so "not a checkout" would report
+    # `clean` — the conflation the tri-state exists to end. `git init` always writes
+    # `core.repositoryformatversion`, so its absence means no checkout was consulted.
+    if not saw_repo:
+        return "", False
     return "", True
 
 

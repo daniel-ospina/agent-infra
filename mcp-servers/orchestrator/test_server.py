@@ -1516,10 +1516,17 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
                            (z(("filter.lfs.process", "git-lfs filter-process")), "filter.lfs.process"),
                            (z(("merge.md.driver", "/tmp/m.sh %O %A %B")), "merge.md.driver"),
                            (z(("extensions.partialClone", "origin")), "PARTIAL CLONE"),
-                           (z(("remote.origin.promisor", "true")), "PARTIAL CLONE"),
+                           # ⛔ `extensions.partialClone` IS A REMOTE NAME, NOT A BOOLEAN: a promisor
+                           # remote literally named `false`/`off` passed the shared false-set while
+                           # git happily fetched from it. Presence alone must refuse.
+                           (z(("extensions.partialClone", "false")), "PARTIAL CLONE"),
+                           (z(("extensions.partialClone", "off")), "PARTIAL CLONE"),
+                           (z(("remote.origin.promisor", "true")), "PROMISOR"),
                            # ⛔ A VALUELESS ENTRY IS `true` IN GIT and must refuse; a subsection
                            # containing `=` must not hide the key from the parser.
-                           (z("remote.origin.promisor"), "PARTIAL CLONE"),
+                           (z("remote.origin.promisor"), "PROMISOR"),
+                           # ⛔ `remote.<name>.uploadpack` IS A PROGRAM on the fetch path
+                           (z(("remote.origin.uploadpack", "/tmp/mark.sh")), "uploadpack"),
                            (z(("filter.a=b.clean", "/tmp/x.sh")), "filter.a=b.clean"),
                            (z(("merge.a=b.driver", "/tmp/m.sh")), "merge.a=b.driver")):
         cfg.write_text(config)
@@ -1537,10 +1544,12 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
                                         "does read: %r" % (precheck,))
 
     # a config that names NO program is fine, and the exec runs — with the pre-check REPORTED, so the
-    # caller can tell a clean pre-check from one that never ran
-    for config in (z(("user.email", "a@b"), ("core.pager", "less")),
-                   z(("remote.origin.promisor", "false")),
-                   z(("remote.origin.promisor", "off"))):
+    # caller can tell a clean pre-check from one that never ran. `core.repositoryformatversion` is the
+    # POSITIVE evidence of a checkout: `git init` always writes it.
+    for config in (z(("core.repositoryformatversion", "0"), ("user.email", "a@b")),
+                   z(("core.repositoryformatversion", "0"), ("core.pager", "less")),
+                   z(("core.repositoryformatversion", "0"), ("remote.origin.promisor", "false")),
+                   z(("core.repositoryformatversion", "0"), ("remote.origin.promisor", "off"))):
         cfg.write_text(config)
         is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
         assert payload.get("refused") is None, (config, payload)
@@ -1553,25 +1562,43 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     cfg.write_text(z(("fill.k", "y" * 2_100_000), ("filter.evil.clean", "/tmp/x.sh")))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
     assert payload.get("refused") == "repo-config-names-a-program", payload
-    assert "did not fit" in payload["reason"], payload
+    assert "CUT SHORT" in payload["reason"], payload
 
-    # ⛔ AND A PRE-CHECK THAT COULD NOT READ IS `unmeasured`, NEVER `clean` — the field exists to tell
-    # those two apart. (A non-repo answer is the ordinary case: rc 128.)
-    cmux_fail = stub(tmp_path, "cmux_fail.sh",
-                     "import sys\n"
-                     "if 'config' in sys.argv[1:]:\n"
-                     "    sys.stderr.write('fatal: not a git repository\\n'); sys.exit(128)\n"
-                     "print('ok')\n")
-    monkeypatch.setenv("ORCH_MCP_CMUX", cmux_fail)
+    # ⛔ NEITHER DOES A TIMEOUT FALL THROUGH TO THE EXEC. `run()` returns rc=None on a timeout, and the
+    # pre-check's budget is SMALLER than the exec's — so a slow config is exactly the case that can
+    # lose the pre-check and still finish the verb. Driven directly: the real function against a
+    # timed-out read whose stdout ALREADY holds a dangerous key.
+    real_run = mod.run
+    try:
+        mod.run = lambda *a, **kw: mod.Ran(
+            ["git"], rc=None, timed_out=True,
+            stdout="filter.evil.clean\n/tmp/x.sh\0")
+        fault, measured = mod._repo_config_fault("cmux", "box")
+        assert "filter.evil.clean" in fault, fault          # the drained stdout is PARSED, not discarded
+        assert measured is True
+        mod.run = lambda *a, **kw: mod.Ran(["git"], rc=None, error="OSError: boom")
+        fault, measured = mod._repo_config_fault("cmux", "box")
+        assert fault and "could not be READ" in fault, fault
+    finally:
+        mod.run = real_run
+
+    # ⛔ AND `rc 0` OUTSIDE A REPO IS NOT `clean`. Without `--local`, `git config --list` SUCCEEDS
+    # outside a checkout (global+system scope only), so "no checkout" would report `clean` — the
+    # conflation the tri-state exists to end. `git init` always writes `core.repositoryformatversion`,
+    # so its ABSENCE is the signal.
+    cfg.write_text(z(("user.email", "a@b"), ("core.pager", "less")))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
     assert payload.get("refused") is None, payload
     assert payload["repo_config"] == "unmeasured", payload
 
-    # a NON-git program never pays the pre-check (the stub would have printed the config)
-    cfg.write_text("filter.evil.clean=/tmp/x.sh\n")
+    # a NON-git program never pays the pre-check — asserted on the REAL argv log (the cmux stub above is
+    # still installed: it logs every `config` invocation), not on its stdout.
+    before = len(argv_log.read_text().splitlines()) if argv_log.exists() else 0
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["ls", "-l"]})
     assert payload.get("refused") is None, payload
-    assert "filter.evil.clean" not in (payload.get("stdout") or ""), payload
+    after = len(argv_log.read_text().splitlines()) if argv_log.exists() else 0
+    assert after == before, ("a NON-git program paid the git pre-check: %r"
+                             % (argv_log.read_text(),))
 
 
 def test_T_box_exec_disables_the_program_git_config_can_name():
