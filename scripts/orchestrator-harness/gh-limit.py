@@ -1148,12 +1148,67 @@ def cred_purpose(argv):
     return "request"
 
 
+# ⛔ A POSITIVE READ ALLOW-LIST, BECAUSE `is_mutating()` IS THE WRONG POLARITY FOR THIS QUESTION.
+# `is_mutating()` answers "may the PACING layer treat this as a mutation" from `MUTATING_PAIRS`, which
+# is a partial table and says so: an unlisted verb (`gh issue lock`, `gh run delete`, `gh workflow
+# disable`, `gh secret set`, `gh repo create`) reads there as a read, and the budget question's safe
+# default is the other way (an unknown argv is ASSUMED to spend the pool — see `reaches_api`).
+#
+# Served a credential, the table's gaps are not a lost second of pacing, they are the WRONG CREDENTIAL:
+# measured in review, `issue lock 42`, `run delete 5`, `workflow disable ci.yml` and `issue pin 3`
+# were ALL sent to the installation token, and `gh-cred.py --which` answered "user" for the same
+# argv — the operator's diagnostic contradicting production. Nothing in this code checks that the
+# installation is read-only (that is a DEPLOYMENT assumption), so an install carrying ANY write
+# permission would have executed those mutations as the App bot, unattributable, on the rail's own
+# surfaces.
+#
+# So the question is inverted: a call is served by the app only when it is PROVABLY a read, and
+# everything else keeps the user credential. The cost of a miss is a read that stays on the user
+# bucket — visible as the arm `not-provably-read` in `--stats`, and fixed by adding the verb here.
+# The cost of the other direction is an unattributable write, which no retry can undo.
+READ_SUBCOMMANDS = frozenset((
+    ("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
+    ("issue", "view"), ("issue", "list"),
+    ("run", "view"), ("run", "list"), ("run", "download"),
+    ("release", "view"), ("release", "list"),
+    ("repo", "view"), ("repo", "list"),
+    ("label", "list"), ("workflow", "list"), ("workflow", "view"),
+    ("cache", "list"), ("secret", "list"), ("variable", "list"),
+    ("gist", "view"), ("gist", "list"),
+    ("project", "view"), ("project", "list"), ("project", "field-list"),
+    ("org", "list"), ("extension", "list"),
+))
+# Bare verbs that take no subcommand and never write.
+READ_BARE = frozenset(("status", "browse", "search"))
+
+
+def cred_kind(argv):
+    """`read` ONLY when the call is provably a read; `write` when it is provably a write; `unproven`
+    for everything else. BOTH non-read answers keep the user credential (#3429).
+
+    `gh api` is decided by `api_is_mutating()`, which already defaults the safe way for `api` (any
+    non-GET method, any `-f/-F/--field/--raw-field/--input`, or POST-inferring data is a mutation;
+    `api graphql` is a read unless spelled otherwise). Every subcommand verb must be NAMED in
+    `READ_SUBCOMMANDS` to be served by the app; `unproven` exists so the amount left on the user
+    bucket is a NUMBER an operator can read and act on (`--stats`, arm `not-provably-read`) instead of
+    an invisible wish."""
+    if not argv:
+        return "unproven"
+    if argv[0] == "api":
+        return "write" if api_is_mutating(argv) else "read"
+    if argv[0] in READ_BARE:
+        return "read"
+    if len(argv) >= 2 and (argv[0], argv[1]) in READ_SUBCOMMANDS:
+        return "read"
+    return "unproven"
+
+
 def credential_for(argv):
     """The `gh-cred` Decision for this argv. Cached per (kind, purpose) — one mint per process."""
     mod = cred_helper()
     if mod is None:
         return _NoCred()
-    kind = "write" if is_mutating(argv) else "read"
+    kind = cred_kind(argv)
     purpose = cred_purpose(argv)
     key = (kind, purpose)
     if key not in _CRED_CACHE:
@@ -1171,27 +1226,30 @@ class _NoCred(object):
     token = None
 
 
-# An installation token that the App itself REJECTS must not fail the call — #3429's fourth arm. It
-# is a 401/403 whose text says the credential (not the request) is the problem, and the retry is on
-# the user credential for a READ only (a write never goes to the app, so it can never reach here).
-_APP_REFUSAL = ("resource not accessible by integration", "insufficient", "bad credentials",
-                "must have admin rights", "not accessible by personal access token")
+# ⛔ AN APP-SERVED FAILURE FALLS BACK, AND THE TEST IS "IT FAILED", NEVER A TEXT ALLOWLIST.
+# The first version gated this on five literal substrings. Measured on review: an installation token's
+# REAL failures — `API rate limit exceeded for installation ID <id>. (HTTP 403)` and `Not Found (HTTP
+# 404)` for a repo the installation is not granted — match NONE of them, so the fallback never fired,
+# the `app-dry` arm was DEAD CODE, `note_app_refusal()` (its only caller) never ran, and a read hung
+# through four backoff attempts and then failed. That is worse than before the layer existed, on the
+# box that holds the key. Wording is not a contract; `rc != 0` is. The cost of the broad rule is ONE
+# extra request when a genuine 404 is retried on the user credential, which returns the same 404.
 
-
-def _app_refused(res):
-    if res.rc == 0:
-        return False
-    blob = (res.err or b"") + (res.out or b"")
-    txt = blob.decode("utf-8", "replace").lower()
-    return any(p in txt for p in _APP_REFUSAL)
+def _app_failed(res):
+    """The app served this call and the call did not succeed. Fall back on the user credential."""
+    return res.rc != 0
 
 
 def _app_dry(res):
-    """The app's own bucket is empty. Recorded so the NEXT call takes the `floor` arm, and the caller
-    still gets a real answer because the retry uses the user credential."""
+    """Was the app's failure its OWN bucket being empty? Recorded so the NEXT call takes the `floor`
+    arm, and the caller still gets a real answer because the retry uses the user credential.
+
+    ⛔ THIS IS THE ONLY WRITER of the app budget outside a mint, so it must run on EVERY app failure
+    and not only on a rate limit — `note_app_refusal` is what turns "the installation is dry" into
+    the `floor` arm for the rest of the hour. A non-rate-limit failure simply does not."""
     blob = (res.err or b"") + (res.out or b"")
     txt = blob.decode("utf-8", "replace").lower()
-    if "rate limit" not in txt and "abuse" not in txt:
+    if "rate limit" not in txt and "abuse" not in txt and "quota" not in txt:
         return False
     mod = cred_helper()
     try:
@@ -1228,18 +1286,39 @@ def run(real_gh, argv, extra=None, timeout=None):
         # The app token is injected into the CHILD's env only. `os.environ` is left alone on purpose:
         # `_cred_digest()` and any nested child see the box's own credential, so the identity of the
         # cache key cannot flip depending on which arm happened to serve a call.
-        env["GH_TOKEN"] = cred.token
-        env.pop("GITHUB_TOKEN", None)
+        # ⛔ ALL FOUR NAMES, not `GH_TOKEN` alone. On a non-`github.com` host `gh` ignores `GH_TOKEN`
+        # and reads `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` — a precedence this file's own
+        # `_cred_digest` docstring states and which `cache_key`/`GH_CRED_API` contemplate. Setting one
+        # name would have served such a box from the USER credential while the arm, `_CRED_CLASS` and
+        # `--stats` all said `app`: a false PASS of this change's own regression assertion (found in
+        # review).
+        for _name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+            env[_name] = cred.token
     env["GH_CRED_SERVED_ARM"] = cred.arm
     res = _run_child(cmd, env, timeout)
-    if cred.credential == "app" and (cred_purpose(list(argv)) == "request") and _app_refused(res):
-        # ARM 4 (#3429): the App answered "not for you". Retry ONCE on the user credential and say
-        # so. Bounded to a single retry and to reads — a write never reaches here (arm `write`), so
-        # the rail's merge path cannot be silently retried with a different credential.
-        arm = "app-dry" if _app_dry(res) else "scope-403"
-        log_event("credential fallback arm=%s — the application credential was refused; retrying "
-                  "once on the user credential (#3429)" % arm)
+    if cred.credential == "app" and cred_purpose(list(argv)) == "request" and _app_failed(res):
+        # ARM 4/6 (#3429): the app served the call and it did not succeed — a dry installation bucket,
+        # a repo the installation is not granted (a 404, which is what GitHub returns outside an
+        # installation's scope), a revoked token. Retry ONCE on the user credential and say which arm
+        # fired. Bounded to a single retry and to reads (a write never reaches here: `cred_kind` keeps
+        # the user credential for anything not PROVABLY a read), so the rail's merge path can never be
+        # silently re-issued under a different credential.
+        # ⛔ AND THE APP'S OWN REFUSAL NEVER REACHES THE BOX-WIDE MARKER. Because this returns the
+        # RETRY's result, `classify()`/`record_limit()` see the user credential's outcome: without
+        # that, an INSTALLATION-bucket 403 was published as box/account pacing state (`bucket=graphql
+        # status=403` in `last-limit`), i.e. the credential layer moved the pacing it promised not to.
+        arm = "app-dry" if _app_dry(res) else "app-refused"
+        log_event("credential fallback arm=%s — the application credential failed (rc=%s); retrying "
+                  "once on the user credential (#3429)" % (arm, res.rc))
         cred.arm = arm
+        # ⛔ AND THE ANSWER THAT COMES BACK WAS PRODUCED BY THE USER CREDENTIAL, so the class the
+        # cache writers stamp must say so. It did not, and the result was the one case where the two
+        # credentials PROVABLY differ in visibility (the app was refused, the user could see it) being
+        # cached as `cred: app` and replayed to app-served callers — threat T3 defeated on the exact
+        # path it exists for (found in review). The writers all run AFTER `run()` returns, so setting
+        # the module global here is what they read.
+        global _CRED_CLASS
+        _CRED_CLASS = "user"
         retry_env = dict(os.environ)
         retry_env[REENTRANCY_ENV] = "1"
         retry_env["GH_CRED_SERVED_ARM"] = arm

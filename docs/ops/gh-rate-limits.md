@@ -1076,13 +1076,27 @@ goes through it and none can opt out. The arms, **in order — the order is the 
 | # | condition | arm | credential |
 |---|---|---|---|
 | 0 | the call is the **meter** (`gh api rate_limit`) or credential **introspection** (`gh auth …`) | `purpose:meter` / `purpose:introspect` | user |
-| 1 | the call is a **write** (merge, comment, push, label, review…) | `write` | user |
+| 1 | the call is **provably a write** (`gh api` with a non-GET method or data flags) | `write` | user |
+| 1b | the verb is **not on the read allow-list** — which covers every unlisted mutate verb | `not-provably-read` | user |
 | 2 | `GH_CRED_APP=0` | `disabled` | user |
 | 3 | no readable private key | `no-key` | user |
-| 4 | minting the installation token failed | `mint-failed` | user |
+| 4 | minting the installation token failed (negative-cached for `GH_CRED_MINT_COOLDOWN`, 60 s) | `mint-failed` | user |
 | 5 | the app bucket is at or below the floor (`GH_CRED_FLOOR`, default **500**) | `floor` | user |
-| 6 | the App refused the call (401/403) | `scope-403`, or `app-dry` when the refusal was a rate limit | user — after ONE retry |
-| 7 | otherwise | `app` | **app** |
+| 6 | the App served the call and it **failed** (dry bucket → `app-dry`, anything else → `app-refused`) | `app-dry` / `app-refused` | user — after ONE retry |
+| 7 | otherwise — **only a provably-read verb** | `app` | **app** |
+
+**Arm 1b is the fail-closed one, and it exists because the first version was not.** That version asked
+`is_mutating()`, whose `MUTATING_PAIRS` is a *partial* table by design (the file says so), so
+`gh issue lock`, `gh run delete`, `gh workflow disable` and `gh issue pin` were all routed to the
+installation token. Nothing in this code checks that the installation is read-only — that is a
+*deployment* assumption — so an install carrying any write permission would have executed those as the
+App bot, unattributable, on the rail's own surfaces. The question is therefore inverted: **the app is
+used only for a verb that is provably a read**, and everything else keeps the user credential. The
+cost of a miss is a read that stays on the user bucket, visible as `not-provably-read` in `--stats`
+and fixed by adding the verb; the cost of the other direction cannot be retried away. Arm 6's trigger
+is **"the app served it and it failed"**, not a text allowlist — an installation 404 (a repo outside
+its scope) and an installation rate-limit 403 read nothing alike, and the first version matched
+neither.
 
 **Arm 0 is not a preference — it is what keeps this change from disarming the layer it sits in.**
 `gh api rate_limit` is what the pacing layer reads to decide whether the *account* is out. Served

@@ -57,8 +57,10 @@
 # anywhere: `deploy-harness.sh` walks this source tree and copies FILES UNDER IT, and the key lives
 # at `~/.pi/agent/gh-app.pem` — outside every checkout. So the App credential exists on exactly the
 # boxes an operator placed it on, and every other box reports the named arm `no-key` (a visible
-# "this box still spends the user bucket"), never a silent one. See docs/ops/gh-credential.md for
-# the blast-radius statement and the distribution design that is deliberately NOT built here.
+# "this box still spends the user bucket"), never a silent one. The blast-radius statement, the arms
+# table and the operator note live in `docs/ops/gh-rate-limits.md` ("Which credential", "Blast
+# radius") — that file, not a separate page: an operator command that points at a path nobody can
+# open is worse than no pointer at all (caught in review).
 #
 # DEPENDENCIES: stdlib + `openssl` for the RS256 signature. Deliberately NOT `gh`: this file is
 # called from INSIDE the `gh` shim, so invoking `gh` would re-enter the layer (and, on a box whose
@@ -121,6 +123,16 @@ ENABLED_DEFAULT = not (os.environ.get("GH_CRED_APP") or "").strip().lower() in (
 ARM_OVERRIDE = (os.environ.get("GH_CRED_ARM_OVERRIDE") or "").strip()
 
 TOKEN_FILE = "token.json"
+MINT_FAIL_FILE = "mint-failure.json"
+# ⛔ A FAILED MINT IS NEGATIVELY CACHED, and this is not politeness — it is the difference between a
+# revoked key costing ONE attempt and costing EVERY gh call. `resolve()` runs once per gh invocation,
+# so without a cooldown a controller with a rotated/revoked key pays a JWT sign plus a network attempt
+# — up to `GH_CRED_MINT_TIMEOUT` (10 s) — on every single read, on the box whose reads gate dispatch.
+# Measured on review: three sequential reads against a failing mint = three mint attempts, and one read
+# paid 2.09 s of pure mint latency. The cooldown is SHORT on purpose: a re-placed key must take effect
+# within a minute, with no restart and no human step — the same "zero scheduled maintenance" property
+# the token lifetime rests on.
+MINT_COOLDOWN = int(os.environ.get("GH_CRED_MINT_COOLDOWN") or 60)
 BUDGET_FILE = "app-budget.json"
 COUNTER_FILE_LEGACY = "counters.json"
 DECISIONS_FILE = "decisions.log"
@@ -131,7 +143,7 @@ DECISIONS_MAX_BYTES = 256 * 1024
 # defect the regression assertion counts — an arm name that is not one of these and is not `app`
 # means the wiring chose the user credential without a reason, which is what #3429 measured.
 USER_READ_ARMS = frozenset((
-    "mint-failed", "floor", "disabled", "no-key", "no-helper", "scope-403", "app-dry",
+    "mint-failed", "floor", "disabled", "no-key", "no-helper", "app-refused", "app-dry",
 ))
 
 
@@ -373,12 +385,18 @@ def mint():
     return tok, exp
 
 
+def _record_mint_failure(why):
+    """Open a cooldown window. Best-effort: a failure to record must not itself fail a call."""
+    _write(MINT_FAIL_FILE, {"until": int(now()) + max(1, MINT_COOLDOWN),
+                            "at": int(now()), "why": str(why)[:200]})
+
+
 def current_token(force=False):
     """A usable installation token, minting/refreshing transparently. None when unavailable.
 
     ⛔ THE EXPIRY IS NEVER SURFACED. A cached token with less than RETIRE_MARGIN left is replaced
     BEFORE it is returned, so no caller ever receives a token that dies under it; and a token the
-    API rejects mid-call is handled by the retry arm in gh-limit.py (`scope-403` / `app-dry`), not
+    API rejects mid-call is handled by the retry arm in gh-limit.py (`app-refused` / `app-dry`), not
     by an error the caller has to interpret. That is the whole "short-lived token, zero scheduled
     maintenance" property, in one place.
     """
@@ -388,14 +406,27 @@ def current_token(force=False):
         exp = int(cached.get("expires_at") or 0)
         if tok and exp and (exp - int(now())) > RETIRE_MARGIN:
             return tok
+        # A recent failure means "do not try again this minute", so a broken credential costs one
+        # attempt per cooldown per box instead of one per call.
+        failed = _read(MINT_FAIL_FILE) or {}
+        if int(failed.get("until") or 0) > int(now()):
+            log("arm=mint-failed why=%r (cooldown until %s)"
+                % (str(failed.get("why"))[:160], int(failed["until"])))
+            return None
     try:
         tok, _exp = mint()
     except MintError as exc:
+        _record_mint_failure(str(exc))
         log("arm=mint-failed why=%r" % str(exc)[:200])
         return None
     except Exception as exc:                        # never let a credential bug crash a gh call
+        _record_mint_failure("%s: %s" % (type(exc).__name__, exc))
         log("arm=mint-failed why=%r" % ("%s: %s" % (type(exc).__name__, exc))[:200])
         return None
+    try:
+        os.unlink(os.path.join(_cache_dir(), MINT_FAIL_FILE))
+    except OSError:
+        pass
     # One budget probe per mint (~once an hour) keeps the floor current without putting a network
     # call on the hot path. A probe failure just leaves the budget UNKNOWN, which `decide()` treats
     # as "not below the floor" — see its note on why that direction is the safe one.
@@ -492,6 +523,17 @@ def decide(kind, purpose="request", enabled=None, key_present=None, token_ok=Non
     if kind == "write":
         return Decision("write", "user",
                         "a write is never sent to a read-only installation token")
+    if kind == "unproven":
+        # ⛔ THE FAIL-CLOSED ARM, AND THE ONE THE REVIEW FOUND MISSING. A call whose verb is not on the
+        # READ allow-list keeps the user credential even though it is probably a read. The label says
+        # exactly that, so `--stats` shows how much is being left on the user bucket and a missing
+        # verb is an actionable number rather than a silent wish. The opposite default is what sent
+        # `gh issue lock`, `gh run delete`, `gh workflow disable` and `gh issue pin` to the
+        # installation token: `MUTATING_PAIRS` is a partial table on purpose, so "not in the write
+        # table" must never mean "safe for the app".
+        return Decision("not-provably-read", "user",
+                        "the verb is not on the read allow-list, so the call keeps the user credential "
+                        "(fail-closed: an unlisted WRITE must never reach the installation token)")
     if not enabled:
         return Decision("disabled", "user", "GH_CRED_APP=0 — the app credential is turned off")
     if not key_present:
@@ -515,9 +557,10 @@ def resolve(kind, purpose="request", argv=None):
     token = None
     remaining = None
 
-    # The token is only worth minting when the decision could possibly use it — a write or a meter
-    # call must not spend a mint (one HTTP request) to learn it will not use the answer.
-    if enabled and key_present and purpose == "request" and kind != "write":
+    # The token is only worth minting when the decision could possibly use it — a call that is not
+    # PROVABLY a read (write or unproven) or one of the pinned purposes must not spend a mint (one
+    # HTTP request) to learn it will not use the answer.
+    if enabled and key_present and purpose == "request" and kind == "read":
         token = current_token()
         token_ok = token is not None
         if token_ok:
@@ -728,8 +771,14 @@ def main(argv):
     if verb == "--which":
         # What WOULD serve this argv. Runs the real decision path (including a mint), which is what
         # an operator debugging "why is this box still on the user bucket" needs.
+        #
+        # ⛔ THE KIND COMES FROM `gh-limit.py`'s OWN CLASSIFIER, NOT A SECOND COPY. An earlier version
+        # kept a local verb table here, and it drifted immediately: `gh-cred.py --which -- issue lock
+        # 42` answered "user/write" while production sent that same argv to the installation token.
+        # A diagnostic that disagrees with the thing it diagnoses is worse than none. If the sibling
+        # cannot be loaded the answer is `unproven`, which is the fail-closed default.
         args = rest[1:] if rest[:1] == ["--"] else rest
-        kind = "write" if _looks_like_write(args) else "read"
+        kind = _authoritative_kind(args)
         d = resolve(kind, "request", args)
         sys.stdout.write("credential=%s arm=%s kind=%s why=%s\n"
                          % (d.credential, d.arm, kind, d.why))
@@ -739,26 +788,20 @@ def main(argv):
     return 2
 
 
-# `--which` only needs to CLASSIFY for a diagnostic line, and it must not fork gh-limit.py's
-# authoritative predicate (one classifier, and it lives in gh-limit.py — this is a lookup table for
-# the operator verb, and the file's own header says so). The production path never calls this: there
-# `gh-limit.py` passes `is_mutating()`'s answer in.
-_WRITE_VERBS = frozenset(("merge", "close", "reopen", "edit", "create", "delete", "comment",
-                          "review", "ready", "lock", "unlock", "pin", "unpin", "transfer", "rename",
-                          "upload", "set", "add", "remove", "rerun", "cancel", "enable", "disable"))
-
-
-def _looks_like_write(argv):
-    if not argv:
-        return False
-    if argv[0] == "api":
-        for i, a in enumerate(argv):
-            if a in ("-X", "--method") and i + 1 < len(argv):
-                return argv[i + 1].upper() not in ("GET", "HEAD")
-            if a in ("-f", "--field", "-F", "--raw-field", "--input"):
-                return True
-        return False
-    return any(a in _WRITE_VERBS for a in argv[1:2])
+# ⛔ `--which` ASKS `gh-limit.py` RATHER THAN KEEPING ITS OWN VERB TABLE. Two classifiers for the
+# same question is how the diagnostic came to answer the OPPOSITE of production (`issue lock 42`:
+# "user" here, the installation token there). Loading the sibling is best-effort; failing to load it
+# answers `unproven`, which is the fail-closed direction and needs no network, mint or key.
+def _authoritative_kind(argv):
+    import importlib.util
+    limit = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh-limit.py")
+    try:
+        spec = importlib.util.spec_from_file_location("gh_limit", limit)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod.cred_kind(list(argv))
+    except Exception:
+        return "unproven"
 
 
 if __name__ == "__main__":

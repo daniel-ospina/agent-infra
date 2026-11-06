@@ -138,6 +138,16 @@ ck "gh auth … introspection keeps the user credential" \
 ck "an unknown app budget resolves toward the APP, not the user bucket" \
    "$([ "$(armof --kind read --key present --token ok)" = app ] && echo 0 || echo 1)"
 
+# ⛔ THE FAIL-CLOSED ARM. `MUTATING_PAIRS` is a PARTIAL table on purpose, so "not in the write table"
+# must never mean "safe for the app". Measured in review: `gh issue lock`, `gh run delete`,
+# `gh workflow disable` and `gh issue pin` were ALL routed to the installation token. Nothing checks
+# that the installation is read-only (a DEPLOYMENT assumption), so an install carrying any write
+# permission would have executed those as the App bot, unattributable.
+ck "an UNPROVEN verb keeps the user credential (arm=not-provably-read)" \
+   "$([ "$(armof --kind unproven --key present --token ok --remaining 99999)" = not-provably-read ] && echo 0 || echo 1)"
+ck "  …and it resolves to the USER credential" \
+   "$([ "$(credoff --kind unproven --key present --token ok --remaining 99999)" = user ] && echo 0 || echo 1)"
+
 # ── §2 non-vacuity: REMOVE each arm and watch the assertion fail ───────────────────────────────
 echo "§2 non-vacuity — each arm deleted from a copy must break its own assertion"
 mutate() {  # <src> <out> <oldtext> <newtext>
@@ -162,6 +172,12 @@ mut() {  # <label> <mutated-src> <explain args> <arm expected WITHOUT the arm>
 
 MUT="$TMP/mut"
 mkdir -p "$MUT"
+# ⛔ THE HELPER MUST SIT BESIDE EVERY MUTANT OF `gh-limit.py`. It resolves `gh-cred.py` as a SIBLING
+# (the deployment contract), so a mutant in a bare directory loads no helper, takes the `no-helper`
+# arm, and every read falls back to the USER credential — which made the very first fallback mutation
+# below pass for the wrong reason (the read succeeded because nothing was deciding, not because the
+# predicate survived). Copying it here keeps each mutation testing the ONE thing it removes.
+cp "$CRED" "$MUT/gh-cred.py"
 body() { cat; }
 
 if mutate "$CRED" "$MUT/nowrite.py" '    if kind == "write":
@@ -264,7 +280,13 @@ cat >"$TMP/stub-gh" <<'STUB'
 #!/usr/bin/env bash
 printf '%s ARGV=%s\n' "${GH_TOKEN:-<none>}|${GH_CRED_SERVED_ARM:-<none>}" "$*" >>"$GH_CRED_TEST_LOG"
 if [ -n "${GH_CRED_TEST_REFUSE_APP:-}" ]; then
-  case "${GH_TOKEN:-}" in tok-*) echo "Resource not accessible by integration (403)" >&2; exit 1 ;; esac
+  # ⛔ THE REAL WORDING, NOT A CONVENIENT ONE. An installation token whose bucket is empty answers
+  # `API rate limit exceeded for installation ID <id>.` — an earlier version of this layer only
+  # matched `resource not accessible by integration`, so THIS case never fell back: the read hung
+  # through four backoff attempts and then failed, on the box that holds the key (found in review).
+  case "${GH_TOKEN:-}" in
+    tok-*) echo "API rate limit exceeded for installation ID 179404600. (HTTP 403)" >&2; exit 1 ;;
+  esac
 fi
 printf '{"ok":true}\n'
 STUB
@@ -291,8 +313,21 @@ viah() {
 fresh
 ck "a READ through the layer is served by the INSTALLATION token" \
    "$([ "$(viah pr view 7 | cut -d' ' -f1)" = "tok-1|app" ] && echo 0 || echo 1)"
+# ⛔ THE CLASSIFIER ITSELF, PINNED. An unlisted mutating verb must keep the user credential — the
+# review measured four of them being served by the installation token because the gate was
+# `is_mutating()`'s partial table instead of a positive read allow-list.
+ck "an UNLISTED mutating verb (issue lock) keeps the user credential" \
+   "$([ "$(viah issue lock 42 | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "an UNLISTED mutating verb (run delete) keeps the user credential" \
+   "$([ "$(viah run delete 5 | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "an UNLISTED mutating verb (workflow disable) keeps the user credential" \
+   "$([ "$(viah workflow disable ci.yml | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "a PROVEN write (api -X POST) keeps the user credential" \
+   "$([ "$(viah api -X POST repos/o/r/issues/1/comments -f body=x | cut -d' ' -f1)" = "$AMB|write" ] && echo 0 || echo 1)"
+ck "a PROVEN read (api GET) is served by the app — the allow-list is not so narrow it kills the fix" \
+   "$([ "$(viah api repos/o/r/pulls/1 | cut -d' ' -f1)" = "tok-1|app" ] && echo 0 || echo 1)"
 ck "a WRITE through the layer keeps the USER credential" \
-   "$([ "$(viah pr merge 7 --squash | cut -d' ' -f1)" = "$AMB|write" ] && echo 0 || echo 1)"
+   "$([ "$(viah pr merge 7 --squash | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
 ck "the METER through the layer keeps the USER credential" \
    "$([ "$(viah api rate_limit | cut -d' ' -f1)" = "$AMB|purpose:meter" ] && echo 0 || echo 1)"
 ck "credential INTROSPECTION through the layer keeps the USER credential" \
@@ -306,17 +341,97 @@ fresh
 ck "a mint failure falls back THROUGH the layer (arm=mint-failed)" \
    "$([ "$( (export GH_CRED_TEST_MINT_FAIL=1; viah pr view 9) | cut -d' ' -f1)" = "$AMB|mint-failed" ] && echo 0 || echo 1)"
 
-# ⛔ ARM 4 — the App REFUSES a read. The call must still answer, on the USER credential, once.
+# ⛔ ARM 4/6 — THE APP'S REAL FAILURE MUST FALL BACK, AND THE CALL MUST STILL ANSWER.
+# This is the review-found P1, pinned: an installation bucket that is empty answers
+# `API rate limit exceeded for installation ID <id>. (HTTP 403)`, which matches no credential-shaped
+# phrase. The layer must retry ONCE on the user credential, the call must SUCCEED, and the app budget
+# must be corrected so the NEXT call takes the `floor` arm instead of repeating the failure all hour.
 fresh
-( export GH_CRED_TEST_REFUSE_APP=1; viah pr view 10 >/dev/null )
-ck "the App refusing a read retries ONCE on the USER credential" \
-   "$([ "$(tail -1 "$GH_CRED_TEST_LOG" | cut -d' ' -f1)" = "$AMB|scope-403" ] && echo 0 || echo 1)"
-fresh
-rc_refused=$( export GH_CRED_TEST_REFUSE_APP=1
+rc_refused=$( export GH_CRED_TEST_REFUSE_APP=1 2>/dev/null
   GH_LIMIT_DIR="$TMP/lr" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE=0 GH_LIMIT_CONDITIONAL=0 \
   GH_LIMIT_FLIGHT=0 GH_LIMIT_REAL_GH="$TMP/stub-gh" \
   python3 "$LIMIT" --real-gh "$TMP/stub-gh" -- pr view 10 >/dev/null 2>&1; echo $? )
-ck "  …and the refused call still returns a SUCCESSFUL answer (not an error)" "$(ok "$rc_refused")"
+fresh
+( export GH_CRED_TEST_REFUSE_APP=1; viah pr view 10 >/dev/null )
+ck "a dry installation bucket RETRIES once on the user credential (arm=app-dry)" \
+   "$([ "$(tail -1 "$GH_CRED_TEST_LOG" | cut -d' ' -f1)" = "$AMB|app-dry" ] && echo 0 || echo 1)"
+ck "  …and the read still returns a SUCCESSFUL answer (it does not hang or fail)" "$(ok "$rc_refused")"
+ck "  …and the app budget is RECORDED as dry, so the next call takes the floor arm" \
+   "$([ "$(sed -n 's/.*"remaining": *\([0-9]*\).*/\1/p' "$GH_CRED_CACHE_DIR/app-budget.json" 2>/dev/null)" = 0 ] && echo 0 || echo 1)"
+
+# ⛔ THE 404 SHAPE. GitHub answers `Not Found` for a resource outside an installation's granted
+# scope — no credential-shaped phrase at all — so a text allowlist left the read permanently failing
+# with "Not Found", which callers read as "the resource does not exist" (#3584's class).
+fresh
+STUB_404=1
+cat >"$TMP/stub-404" <<'S404'
+#!/usr/bin/env bash
+printf '%s ARGV=%s\n' "${GH_TOKEN:-<none>}|${GH_CRED_SERVED_ARM:-<none>}" "$*" >>"$GH_CRED_TEST_LOG"
+case "${GH_TOKEN:-}" in tok-*) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;; esac
+printf '{"ok":true}\n'
+S404
+chmod +x "$TMP/stub-404"
+: >"$GH_CRED_TEST_LOG"
+rc_404=$( GH_LIMIT_DIR="$TMP/l404" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE=0 \
+  GH_LIMIT_CONDITIONAL=0 GH_LIMIT_FLIGHT=0 GH_LIMIT_REAL_GH="$TMP/stub-404" \
+  python3 "$LIMIT" --real-gh "$TMP/stub-404" -- pr view 12 >/dev/null 2>&1; echo $? )
+ck "an installation 404 (repo outside its scope) falls back and the read SUCCEEDS" "$(ok "$rc_404")"
+ck "  …named arm=app-refused, so the failure is attributable to the credential" \
+   "$([ "$(tail -1 "$GH_CRED_TEST_LOG" | cut -d' ' -f1)" = "$AMB|app-refused" ] && echo 0 || echo 1)"
+
+# ⛔ AND THE ANSWER PRODUCED BY THE RETRY IS STAMPED WITH THE CREDENTIAL THAT PRODUCED IT. It was
+# stamped `app` while the bytes came from the user credential — defeating T3 on the one path where the
+# two PROVABLY differ in visibility. The pass cache is inspected directly because that is the entry a
+# later caller would have replayed.
+fresh
+cat >"$TMP/readstub" <<'RS'
+#!/usr/bin/env bash
+printf '%s ARGV=%s\n' "${GH_TOKEN:-<none>}|${GH_CRED_SERVED_ARM:-<none>}" "$*" >>"$GH_CRED_TEST_LOG"
+case "${GH_TOKEN:-}" in tok-*) echo 'gh: Not Found (HTTP 404)' >&2; exit 1 ;; esac
+printf '{"ok":true}\n'
+RS
+chmod +x "$TMP/readstub"
+: >"$GH_CRED_TEST_LOG"
+PASSD="$TMP/pass1"
+GH_LIMIT_DIR="$TMP/lstamp" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE="$PASSD" \
+  GH_LIMIT_CONDITIONAL=0 GH_LIMIT_FLIGHT=0 GH_LIMIT_REAL_GH="$TMP/readstub" \
+  python3 "$LIMIT" --real-gh "$TMP/readstub" -- api user >/dev/null 2>&1 || true
+_stamp="$(cat "$PASSD"/*.json 2>/dev/null | sed -n 's/.*"cred": *"\([a-z]*\)".*/\1/p' | head -1)"
+ck "an answer produced by the post-fallback retry is cached as cred=user, not cred=app (got '${_stamp:-none}')" \
+   "$([ "${_stamp:-none}" = user ] && echo 0 || echo 1)"
+
+# ⛔ AND ALL FOUR CREDENTIAL NAMES ARE SET, not `GH_TOKEN` alone: on a non-github.com host `gh`
+# reads the ENTERPRISE pair, so a single-name injection would serve that box from the user credential
+# while the arm, `_CRED_CLASS` and `--stats` all said `app` — a false PASS of the regression assertion.
+fresh
+cat >"$TMP/envstub" <<'ES'
+#!/usr/bin/env bash
+printf 'TOK=%s ENT=%s ENT2=%s\n' "${GH_TOKEN:-}" "${GH_ENTERPRISE_TOKEN:-}" "${GITHUB_ENTERPRISE_TOKEN:-}" >>"$GH_CRED_TEST_LOG"
+printf '{"ok":true}\n'
+ES
+chmod +x "$TMP/envstub"
+: >"$GH_CRED_TEST_LOG"
+GH_LIMIT_DIR="$TMP/lenv" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE=0 GH_LIMIT_CONDITIONAL=0 \
+  GH_LIMIT_FLIGHT=0 GH_LIMIT_REAL_GH="$TMP/envstub" \
+  python3 "$LIMIT" --real-gh "$TMP/envstub" -- pr view 13 >/dev/null 2>&1 || true
+_envline="$(grep '^TOK=' "$GH_CRED_TEST_LOG" | tail -1)"
+ck "the app token is set for ALL four credential names (enterprise hosts read the pair, not GH_TOKEN)" \
+   "$(printf '%s' "$_envline" | grep -q '^TOK=tok-.*ENT=tok-.*ENT2=tok-' && echo 0 || echo 1)"
+
+# ⛔ NON-VACUITY: with the fallback predicate removed, the SAME read must FAIL. If this row passed
+# with the predicate gone, the three assertions above would be proven by nothing.
+if mutate "$LIMIT" "$MUT/nofallback.py" 'def _app_failed(res):
+    """The app served this call and the call did not succeed. Fall back on the user credential."""
+    return res.rc != 0' 'def _app_failed(res):
+    return False'; then
+  fresh
+  rc_nofb=$( export GH_CRED_TEST_REFUSE_APP=1 2>/dev/null
+    GH_LIMIT_DIR="$TMP/lrnf" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE=0 GH_LIMIT_CONDITIONAL=0 \
+    GH_LIMIT_FLIGHT=0 GH_LIMIT_NO_WAIT=1 GH_LIMIT_REAL_GH="$TMP/stub-gh" \
+    timeout 120 python3 "$MUT/nofallback.py" --real-gh "$TMP/stub-gh" -- pr view 11 >/dev/null 2>&1; echo $? )
+  ck "  …and removing the fallback predicate makes the same read FAIL (the arm is load-bearing)" \
+     "$([ "$rc_nofb" -ne 0 ] && echo 0 || echo 1)"
+else fail=$((fail+1)); echo "  FAIL fallback-predicate mutation target missing"; fi
 
 # ⛔ NON-VACUITY OF THE WIRING ITSELF: with the injection deleted from a copy of gh-limit.py, the
 # same read must be served by the USER credential. Without this row §5 could pass on a gh-cred.py
@@ -402,6 +517,22 @@ if mutate "$LIMIT" "$MUT/nocredguard.py" '            if not _cred_class_ok(d):
   ck "  …and removing the guard makes the app's answer visible to the user credential (it bites)" \
      "$([ "$(_probe "$MUT/nocredguard.py" "$TMP/cachep2" k2 read-user)" = hit ] && echo 0 || echo 1)"
 else fail=$((fail+1)); echo "  FAIL credential-guard mutation target missing"; fi
+
+# ── §8 a failing mint is NEGATIVELY CACHED ─────────────────────────────────────────────────────
+echo "§8 a failed mint is cooled down — a revoked key costs ONE attempt, not one per call"
+# ⛔ WITHOUT THIS, EVERY gh CALL PAYS A MINT. `resolve()` runs once per invocation, so a rotated key
+# on the controller (the only box that holds one) adds a JWT sign plus a network attempt — up to
+# GH_CRED_MINT_TIMEOUT seconds — to every read, on the path that gates dispatch. Measured in review:
+# three reads, three mint attempts, 2.09 s of pure mint latency on one read.
+fresh
+for _i in 1 2 3; do
+  GH_CRED_TEST_MINT_FAIL=1 python3 "$CRED" --token >/dev/null 2>&1 || true
+done
+ck "three sequential reads against a FAILING mint attempt it only ONCE (cooldown absorbs the rest)" \
+   "$([ "$(cat "$MINT_N")" = 1 ] && echo 0 || echo 1)"
+fresh
+ck "…and a FAILING mint still reports failure to the caller (the cooldown hides no error)" \
+   "$([ "$(GH_CRED_TEST_MINT_FAIL=1 python3 "$CRED" --token >/dev/null 2>&1; echo $?)" != 0 ] && echo 0 || echo 1)"
 
 echo
 printf '%s\n' "----------------------------------------"
