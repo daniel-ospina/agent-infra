@@ -40,9 +40,19 @@ RECORD="$SCRIPT_DIR/record-review.sh"
 # fixed once. Pinning the root to THIS tree is the isolation. It SUPPLIES a resolution root rather than
 # opening a gate (the `spawn-gate.test.sh` rule): the fail-closed case is still pinned, by 13v4's
 # stale-validator arm, which wins on the `$SELF`-adjacent rung ABOVE this one.
-export AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-
+#
+# ⛔ NOT `export VAR="$(…)"` (the #2569 shape, and the same fix `install-launchd.test.sh` carries).
+# A DECLARATION builtin's exit status is the BUILTIN's, not the substitution's, so a FAILED `cd` and an
+# EMPTY answer are the same observable — and an EMPTY root is the exact regression the block above
+# exists to prevent: the pin silently stops being a pin and every arm below reads the ambient rung
+# again, while the suite still prints PASS. A bare assignment carries the substitution's status, so
+# the `||` is a real check; `scripts/check-false-pass-shapes.sh` then no longer reports the
+# `discarded-status` shape this file was red for on main (#2741).
+AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)" || {
+    echo "record-review.test.sh: cannot resolve the checkout root from SCRIPT_DIR='$SCRIPT_DIR'" >&2
+    exit 1
+}
+export AGENT_INFRA_PATH
 
 PASS=0
 FAIL=0
