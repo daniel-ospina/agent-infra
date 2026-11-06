@@ -55,7 +55,11 @@
 #
 # Exit:
 #   0  every worktree was MEASURED, and (apply) every dirty one was archived, and (dry-run) nothing
-#      was found to archive. This is the only code that means "nothing is left at risk here".
+#      was found to archive. This means NO UNCOMMITTED WORK IS LEFT AT RISK on the worktrees examined —
+#      NOT "nothing is left at risk here": this tool archives uncommitted work only (bg-rescue-wip.sh's
+#      own scope, #2045), so commits that exist only locally are counted and printed
+#      (`unpushed_worktrees=` in the record, one `COMMITS ONLY ON THIS DISK` line per worktree) and are
+#      NOT saved by this pass. Do not restate exit 0 as "the disk is safe".
 #   1  INCOMPLETE — the per-pass cap or the pass budget stopped the pass with work still unarchived,
 #      or this was a DRY RUN and it found work it would have archived. Not a failure, and NOT clean:
 #      there is unarchived work on this box right now.
@@ -210,33 +214,69 @@ if [ "$MODE" = status ]; then
     echo "detail=no pass record at $STATUS_FILE"
     exit 3
   fi
-  cat "$STATUS_FILE"
   S_TS="$(sed -n 's/^ts=//p' "$STATUS_FILE")"
   S_ST="$(sed -n 's/^status=//p' "$STATUS_FILE")"
   S_RC="$(sed -n 's/^rc=//p' "$STATUS_FILE")"
   NOW_S="$(date -u '+%s')"
-  # ⛔ AN UNREADABLE RECORD CLOCK IS NOT "FRESH". `[ "$S_TS" -gt 0 ] 2>/dev/null` made a record with
-  # no `ts=` line, or one whose `ts=` is not a number, SKIP the staleness test entirely and answer 0 —
-  # i.e. a pass record from any age read as current, which is the same "unparseable bound means no
-  # bound" defect `need_int` refuses for the other four bounds. A record whose clock cannot be read is
-  # unmeasurable, and unmeasurable is a failure to answer, not a pass.
+  # ⛔ THE JUDGEMENT IS MADE FIRST, THEN PRINTED ONCE, WITH THE DERIVED STATUS (review finding).
+  # `cat`-ing the file and THEN exiting 3 printed `status=ok` from a record this very run had just
+  # judged stale — so a consumer parsing the key=value surface the doc nominates read `ok` off a box
+  # that is not being swept. Three ways a record is unjudgeable, and every one of them now prints a
+  # status that AGREES with the exit code:
+  #   * `ts=` missing or unparseable — an uncomputable age is not freshness (and `[ "$S_TS" -gt 0 ]
+  #     2>/dev/null` used to SKIP the whole test, the same "unparseable bound means no bound" defect
+  #     `need_int` refuses for the four bounds);
+  #   * `ts=` in the FUTURE — a clock step backwards (VM/volume restore, NTP, a re-image) would
+  #     otherwise disable staleness for the whole skew. `scripts/disk-reaper.sh:523` tests
+  #     `-lt 0 || -gt STALE`; this is that polarity, so the header's claim is now true;
+  #   * `ts=` older than the window — stale.
+  DERIVED=failed
+  DERIVED_WHY=""
   case "$S_TS" in
-    ''|*[!0-9]*)
-      err "the pass record at $STATUS_FILE carries no readable ts= ('${S_TS:-<none>}') — cannot tell whether the sweep is running"
-      exit 3 ;;
+    ''|*[!0-9]*) DERIVED_WHY="the record carries no readable ts= ('${S_TS:-<none>}') — cannot tell whether the sweep is running" ;;
+    *)
+      AGE_S=$((NOW_S - S_TS))
+      if [ "$AGE_S" -lt 0 ]; then
+        DERIVED=stale
+        DERIVED_WHY="the record is dated ${AGE_S#-}s in the FUTURE — a clock skew (VM restore, NTP step, re-image)"
+      elif [ "$AGE_S" -gt "$STALE_SECONDS" ]; then
+        DERIVED=stale
+        DERIVED_WHY="the record is ${AGE_S}s old (> ${STALE_SECONDS}s) — the sweep is not running"
+      else
+        # ⛔ ALLOW-LIST, NOT A BLACKLIST. An unnamed status, an empty one, and a record that lost its
+        # status line are all "I cannot tell you this box is safe", which is a failure to answer.
+        case "${S_ST:-}" in
+          ok) DERIVED=ok ;;
+          incomplete) DERIVED=incomplete ;;
+          never) DERIVED=never ;;
+          *) DERIVED=failed ;;
+        esac
+      fi ;;
   esac
-  AGE_S=$((NOW_S - S_TS))
-  if [ "$AGE_S" -gt "$STALE_SECONDS" ]; then
-    err "the last pass record is ${AGE_S}s old (> ${STALE_SECONDS}s) — STALE: the sweep is not running"
-    exit 3
-  fi
-  case "${S_ST:-}" in
+  # The record's own keys, minus the status pair, then `recorded_status=` (the audit trail) and
+  # `status=` LAST — last-wins for every line-oriented reader.
+  # NO EMITTED KEY MAY CONTAIN THE SUBSTRING `status=ok` (review finding 3, round 2). The first cut
+  # printed the raw value as `recorded_status=ok`, which CONTAINS `status=ok` — so a `grep 'status=ok'`
+  # consumer, the very reader shape this fix targets, still read green off a stale record while the
+  # script exited 3. The recorded values are `recorded=` / `recorded_rc=` (neither can collide), and
+  # `rc=` / `status=` are emitted LAST and DERIVED, so every line-oriented reader agrees with the exit.
+  case "$DERIVED" in
+    ok) _DERIVED_RC=0 ;;
+    incomplete) _DERIVED_RC=1 ;;
+    *) _DERIVED_RC=3 ;;
+  esac
+  grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded'
+  printf 'recorded=%s\n' "${S_ST:-<none>}"
+  printf 'recorded_rc=%s\n' "${S_RC:-?}"
+  printf 'rc=%s\n' "$_DERIVED_RC"
+  printf 'status=%s\n' "$DERIVED"
+  [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$DERIVED_WHY"
+  case "$DERIVED" in
     ok) exit 0 ;;
     incomplete) exit 1 ;;
     never) exit 3 ;;
-    # ⛔ ALLOW-LIST, NOT A BLACKLIST. An unnamed status, an empty one, and a record that lost its
-    # status line are all "I cannot tell you this box is safe", which is a failure to answer.
-    *) err "the last pass recorded status='${S_ST:-<none>}' rc='${S_RC:-?}' — a human must look; see $RECORD"; exit 3 ;;
+    stale) err "$DERIVED_WHY"; exit 3 ;;
+    *) err "the pass record at $STATUS_FILE cannot be judged (${DERIVED_WHY:-recorded status='${S_ST:-<none>}' rc='${S_RC:-?}'}) — a human must look; see $RECORD"; exit 3 ;;
   esac
 fi
 
@@ -295,27 +335,38 @@ T0="$SECONDS"
 TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
 NOW_S="$(date -u '+%s')"
 
+BUDGET_STOPPED=0
+STOP_EXAMINE=0
+N_UNPUSHED=0
 N_SEEN=0; N_CLEAN=0; N_SKIPPED=0; N_DIRTY=0; N_ARCHIVED=0; N_DEFERRED=0; N_UNMEASURED=0; N_FAILED=0; N_NO_ISSUE=0
 DETAIL=""
 FAILED=0   # latched: once this pass has failed to measure or to archive, it never ends clean
 
 # issue_of <branch> — the first 2-8 digit run, or "" (see THE INDEX above for what it is for).
+# ⛔ A DETACHED HEAD IS NOT AN ISSUE LINK (review finding). `bg-rescue-wip.sh` synthesises
+# `detached-<short-sha>` as the branch for a detached worktree, and the 2-8 digit run below matches HEX:
+# `detached-a1234bc` reported `issue=1234` and `detached-45df0df` reported `issue=45`, so the index
+# asserted a false attribution AND the `NO ISSUE LINK` report never fired — on a worktree shape that
+# really occurs (a bisect, a review checkout). The synthetic branch is excluded by name.
 issue_of() {
   local b="$1"
+  case "$b" in detached-*|'-'|'') return 0 ;; esac
   if [[ "$b" =~ (^|[^0-9])([0-9]{2,8})([^0-9]|$) ]]; then
     printf '%s' "${BASH_REMATCH[2]}"
   fi
 }
 
-# record <repo> <path> <branch> <head> <verdict> <paths> <age_h> <issue> <ref> <note>
+# record <repo> <path> <branch> <head> <verdict> <paths> <age_h> <issue> <ref> <note> [unpushed]
 # TSV, appended, one row per worktree EXAMINED. `note` never carries a tab (it is built from fixed
 # tokens here, not from delegate output).
 record() {
   if [ ! -s "$RECORD" ]; then
-    printf '#wip-sweep-record-v1\tts\trepo\tpath\tbranch\thead\tverdict\tpaths\tage_h\tissue\tref\tnote\n' >> "$RECORD" 2>/dev/null || { err "cannot write the index $RECORD"; FAILED=1; return; }
+    # ONE field per column, exactly as the data rows: the first cut prefixed a 13th
+    # `#wip-sweep-record-v1` field, so a header-driven reader mis-resolved EVERY column.
+    printf '#ts\trepo\tpath\tbranch\thead\tverdict\tpaths\tage_h\tissue\tref\tnote\tunpushed\n' >> "$RECORD" 2>/dev/null || { err "cannot write the index $RECORD"; FAILED=1; return; }
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-    "$TS" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" >> "$RECORD" 2>/dev/null \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$TS" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" "${11:--}" >> "$RECORD" 2>/dev/null \
     || { err "cannot append to the index $RECORD"; FAILED=1; }
 }
 
@@ -400,6 +451,18 @@ examine() {
     return 0
   fi
 
+  # COMMITS THAT EXIST ONLY LOCALLY ARE REPORTED, AND ARE NOT ARCHIVED BY THIS TOOL (review finding
+  # P1). bg-rescue-wip.sh archives UNCOMMITTED work and says so; the ordinary mode still prints a
+  # warning for this case, and --verdict cannot (it is read-only and one line). Without this the SWEEP
+  # claimed exit 0 = "nothing left at risk" over a worktree whose only copy of three commits was that
+  # disk — which on the quiesce path is the same total loss, one state over. It is counted and printed
+  # here, and named in the doc's "not covered" list; archiving it is a separate capability.
+  unpushed="$(tb_timeout "$STATUS_TIMEOUT" git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null)"
+  case "${unpushed:-}" in
+    ''|*[!0-9]*) unpushed="?" ;;
+    *) if [ "$unpushed" -gt 0 ]; then N_UNPUSHED=$((N_UNPUSHED + 1)); err "COMMITS ONLY ON THIS DISK — $path is on '$br' with $unpushed commit(s) that no remote has. bg-rescue-wip archives UNCOMMITTED work only, so this pass does NOT save them."; fi ;;
+  esac
+
   ct="$(tb_timeout "$STATUS_TIMEOUT" git -C "$path" log -1 --format=%ct HEAD 2>/dev/null)"
   case "${ct:-}" in
     ''|*[!0-9]*) age="?" ;;
@@ -408,7 +471,7 @@ examine() {
 
   if [ "$verdict" = clean ]; then
     N_CLEAN=$((N_CLEAN + 1))
-    record "$repo" "$path" "$br" "$head" "clean" "${paths:-0}" "$age" "${issue:--}" "-" "nothing-at-risk"
+    record "$repo" "$path" "$br" "$head" "clean" "${paths:-0}" "$age" "${issue:--}" "-" "nothing-at-risk" "${unpushed:-?}"
     return 0
   fi
 
@@ -420,18 +483,18 @@ examine() {
   fi
 
   if [ "$DRY_RUN" -eq 1 ]; then
-    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "dry-run-would-archive"
+    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "dry-run-would-archive" "${unpushed:-?}"
     N_DEFERRED=$((N_DEFERRED + 1))
     return 0
   fi
 
   if [ "$MAX" -gt 0 ] && [ "$N_ARCHIVED" -ge "$MAX" ]; then
-    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-per-pass-cap"
+    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-per-pass-cap" "${unpushed:-?}"
     N_DEFERRED=$((N_DEFERRED + 1))
     return 0
   fi
   if budget_exhausted; then
-    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-pass-budget"
+    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-pass-budget" "${unpushed:-?}"
     N_DEFERRED=$((N_DEFERRED + 1))
     return 0
   fi
@@ -462,17 +525,17 @@ examine() {
     case "$?" in
       0)
         N_ARCHIVED=$((N_ARCHIVED + 1))
-        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "$ref" "archived-ref-present-on-origin"
+        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "$ref" "archived-ref-present-on-origin" "${unpushed:-?}"
         note "archived $br ($path) → origin $ref (ref read back from origin)" ;;
       2)
         # The tree went clean under this pass, or the push silently did nothing: either way there is no
         # archive ref, and "the rescue exited 0" is not a reason to claim one.
         N_FAILED=$((N_FAILED + 1)); FAILED=1
-        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "rescue-exited-0-but-ref-absent-on-origin"
+        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "rescue-exited-0-but-ref-absent-on-origin" "${unpushed:-?}"
         err "the rescue exited 0 for $path but origin holds no $ref — NOT recorded as archived. The tree may have gone clean between the verdict and the rescue; if it did not, this work is still only on this disk." ;;
       *)
         N_FAILED=$((N_FAILED + 1)); FAILED=1
-        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "$ref" "archive-ref-unverifiable"
+        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "$ref" "archive-ref-unverifiable" "${unpushed:-?}"
         err "the rescue exited 0 for $path and named $ref, but origin could not be read back to confirm it — this is UNVERIFIED, not archived." ;;
     esac
     return 0
@@ -486,6 +549,27 @@ examine() {
   err "STILL ONLY ON THIS DISK — the rescue FAILED for $path (exit $vrc); branch '$br' is unarchived."
   printf '%s\n' "$vout" | sed 's/^/wip-sweep:     /' >&2
   return 0
+}
+
+# flush_record <repo> <path> <head> <branch-ref> <bare> <prunable> — one completed porcelain record.
+# ONE PLACE DECIDES "EXAMINE OR RECORD AS UNREACHED", so the budget guard cannot reach only some of the
+# call sites (it reached one of three when this was inlined).
+# ⛔ TWO THINGS THE FIRST CUT GOT WRONG HERE, AND THEY ARE WHY THIS FUNCTION HAS ITS OWN PARAGRAPH.
+#   1. THE ARGUMENT ORDER. This function takes `<head>` THEN `<branch-ref>` (porcelain order: `HEAD` is
+#      emitted before `branch`), while `record` takes `<branch>` THEN `<head>`. Forwarding `"$3" "$4"`
+#      wrote the head sha into the branch column and the branch into the head column, so a stopped
+#      pass's index could not be reconciled against `git worktree list` WHILE LOOKING COMPLETE. A
+#      comment claiming "a helper cannot drift from itself" did not prevent it; the assertion that does
+#      is arm C5d, which checks the COLUMNS rather than the row count.
+#   2. THE BRANCH MUST BE NORMALISED. `$4` is porcelain's raw `refs/heads/<b>`; `examine` strips that
+#      prefix, so a bare swap still emits `refs/heads/<b>` in a column whose other rows carry `<b>` —
+#      reconciliation by branch fails again, one step later. Hence `${4#refs/heads/}`.
+flush_record() {
+  if [ "$STOP_EXAMINE" -eq 1 ]; then
+    record "$1" "$2" "${4#refs/heads/}" "$3" "unreached" "-" "-" "-" "-" "deferred-pass-budget"
+  else
+    examine "$1" "$2" "$3" "$4" "$5" "$6"
+  fi
 }
 
 # ── sweep one repo, one `git worktree list` record at a time ─────────────────────────────────────
@@ -506,19 +590,36 @@ sweep_repo() {
     return 0
   fi
   while IFS= read -r line || [ -n "$line" ]; do
+    # THE PASS BUDGET BOUNDS THE PASS, NOT ONLY THE ARCHIVES (review finding). It used to be tested
+    # once, inside the dirty/apply branch, so a pass over 139 CLEAN worktrees cost
+    # `worktree_count x WIP_SWEEP_STATUS_TIMEOUT` no matter what `WIP_SWEEP_BUDGET` said — 2.3 h on the
+    # very checkout this file cites, on the path a cell quiesce runs before the box goes. An operator
+    # who sized a reclaim timeout against the documented 900 s bound got no such bound.
+    # AND A STOP IS STATED PER WORKTREE (review finding 2, round 2). The first cut tested the budget
+    # here AND `break`-ed, guarded by `[ "$started" -eq 1 ]` — but `started` is reset to 0 at every
+    # record boundary, which is the ONLY place this loop can observe an exhausted budget, so the row was
+    # written only inside a microsecond window and a stopped pass left NO row for the worktrees it never
+    # reached (measured: 3 worktrees, budget 1s -> exit 1 and ZERO unreached rows). An index that cannot
+    # be reconciled against `git worktree list` under-reports in the OPTIMISTIC direction, on the one
+    # surface the doc nominates for that reconciliation.
+    # So: once the budget is spent, STOP EXAMINING but keep READING the list — reading costs no
+    # examination and no git call — and record every remaining record as `unreached`.
+    [ "$STOP_EXAMINE" -eq 0 ] && budget_exhausted && { BUDGET_STOPPED=1; STOP_EXAMINE=1; }
     case "$line" in
       'worktree '*)
-        if [ "$started" -eq 1 ]; then examine "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"; fi
+        [ "$started" -eq 1 ] && flush_record "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
         cur="${line#worktree }"; cur_head=""; cur_branch=""; cur_bare=0; cur_prunable=0; started=1 ;;
       'HEAD '*)   [ "$started" -eq 1 ] && cur_head="${line#HEAD }" ;;
       'branch '*) [ "$started" -eq 1 ] && cur_branch="${line#branch }" ;;
       'bare')     [ "$started" -eq 1 ] && cur_bare=1 ;;
       'prunable'*) [ "$started" -eq 1 ] && cur_prunable=1 ;;
-      '')         if [ "$started" -eq 1 ]; then examine "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"; fi
+      '')         if [ "$started" -eq 1 ]; then
+                    flush_record "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
+                  fi
                   cur=""; cur_head=""; cur_branch=""; cur_bare=0; cur_prunable=0; started=0 ;;
     esac
   done < "$LISTF"
-  [ "$started" -eq 1 ] && examine "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
+  [ "$started" -eq 1 ] && flush_record "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
   return 0
 }
 
@@ -526,6 +627,33 @@ MODE_WORD=dry-run
 [ "$DRY_RUN" -eq 0 ] && MODE_WORD=apply
 note "pass start mode=$MODE_WORD max=$MAX budget=${BUDGET}s repos=${#REPOS[@]} watchdog=$TB_TIMEOUT_KIND"
 note "index: $RECORD"
+
+# ⛔ A PASS IN FLIGHT SAYS SO, AND THAT IS THE WHOLE POINT OF THIS WRITE (review finding P1).
+# The record used to be written ONLY at the end. So a pass that crashed, was OOM-killed, was cut off by
+# a quiesce, or could not write its record at the end left the PREVIOUS pass's `status=ok` standing —
+# fresh, on the surface the doc nominates for a fleet instrument, for up to WIP_SWEEP_STALE_SECONDS. A
+# box being swept nowhere read as swept. Measured: an unwritable state dir with one prior good pass
+# exited 3 and `--print-status` still answered `rc=0 status=ok`.
+# Now the record is overwritten with `status=running` BEFORE any worktree is touched, and the verdict
+# write replaces it at the end. `--print-status`'s allow-list already maps an unnamed status to exit 3,
+# so an interrupted pass answers `failed` instead of `ok` — the same polarity `disk-reaper.sh` gets from
+# the scheduler's own exit status, held here without a scheduler.
+# ⛔ THE LIMIT, STATED: a state dir that is unwritable at BOTH ends cannot be marked at all — the old
+# record then stands, and the pass can only be loud on stderr and non-zero in its exit code. That is a
+# host problem to fix, and the READER cannot see it; it is not claimed away.
+if REC_TMP="$(mktemp "$STATE_DIR/.wip-sweep-status.XXXXXX" 2>/dev/null)"; then
+  {
+    printf 'status=running\n'
+    printf 'rc=?\n'
+    printf 'ts=%s\n' "$NOW_S"
+    printf 'mode=%s\n' "$MODE_WORD"
+    printf 'detail=pass started, no verdict recorded yet\n'
+  } > "$REC_TMP" 2>/dev/null && mv -f "$REC_TMP" "$STATUS_FILE" 2>/dev/null \
+    || { err "cannot write the pass-start marker $STATUS_FILE — an interrupted pass will NOT be distinguishable from the last good one"; }
+  REC_TMP=""
+else
+  err "cannot create a temp file in $STATE_DIR — a pass that dies will NOT be distinguishable from the last good one"
+fi
 
 for one in ${REPOS[@]+"${REPOS[@]}"}; do
   # ⛔ BOUNDED, LIKE EVERY OTHER SUBPROCESS HERE — and this is on the quiesce path, before the box is
@@ -555,9 +683,13 @@ STATUS=ok
 if [ "$FAILED" -eq 1 ]; then
   RC=3; STATUS=failed
   DETAIL="unmeasured=${N_UNMEASURED} rescue_failed=${N_FAILED}"
-elif [ "$N_DEFERRED" -gt 0 ]; then
+elif [ "$N_DEFERRED" -gt 0 ] || [ "$BUDGET_STOPPED" -eq 1 ]; then
   RC=1; STATUS=incomplete
   DETAIL="deferred=${N_DEFERRED} (cap=$MAX budget=${BUDGET}s)"
+  # A STOP IS STATED (review finding). The bound used to gate only archives, so WIP_SWEEP_BUDGET
+  # could be spent while the pass kept classifying — the record now says the bound is what ended it,
+  # and the exit code is 1 rather than a green 0 over worktrees it never reached.
+  [ "$BUDGET_STOPPED" -eq 1 ] && DETAIL="$DETAIL budget_stopped=yes"
 fi
 
 # The pass record is written LAST and atomically: a record that exists is a pass that reached its
@@ -586,18 +718,30 @@ if [ -n "$REC_TMP" ]; then
     printf 'unmeasured=%s\n' "$N_UNMEASURED"
     printf 'failed=%s\n' "$N_FAILED"
     printf 'no_issue=%s\n' "$N_NO_ISSUE"
+    # Commits no remote holds. NOT a failure of this pass (the tool cannot archive them) and NOT
+    # silently zero: the count is on the monitoring surface so "the pass was green and three commits
+    # died with the box" cannot be read off a clean summary.
+    printf 'unpushed_worktrees=%s\n' "$N_UNPUSHED"
     printf 'repos=%s\n' "${#REPOS[@]}"
     printf 'watchdog=%s\n' "$TB_TIMEOUT_KIND"
     printf 'detail=%s\n' "${DETAIL:-none}"
   } > "$REC_TMP" 2>/dev/null && mv -f "$REC_TMP" "$STATUS_FILE" 2>/dev/null || {
+    # ⛔ STATUS TOO, NOT ONLY RC (review finding P1). Only `RC=3` was set here, so the pass's own summary
+    # line printed `pass done status=ok rc=3` — the same "a green word beside a red code" class that arms
+    # I7/I7b were added to keep out of `--print-status`. The start marker (`status=running`) is left in
+    # place deliberately: it is now the truth — a pass started and reached no verdict.
     err "cannot write the pass record $STATUS_FILE — this pass cannot be reported on, so it is not a success"
-    RC=3; rm -f "$REC_TMP"
+    RC=3; STATUS=failed; rm -f "$REC_TMP"
   }
   REC_TMP=""
 else
   err "cannot create a temp file in $STATE_DIR — the pass record was NOT written, so this pass cannot be reported on"
-  RC=3
+  # STATUS TOO, for the same reason as the write-failure branch above: without it the console summary
+  # reads `pass done status=ok rc=3`, the green-word-beside-a-red-code class this file keeps out of
+  # `--print-status`. (The RECORD is already honest here — the start marker says `running` — but the
+  # summary line is what a human reads at the end of a quiesce.)
+  RC=3; STATUS=failed
 fi
 
-note "pass done status=$STATUS rc=$RC seen=$N_SEEN clean=$N_CLEAN skipped=$N_SKIPPED dirty=$N_DIRTY archived=$N_ARCHIVED deferred=$N_DEFERRED unmeasured=$N_UNMEASURED failed=$N_FAILED no_issue=$N_NO_ISSUE"
+note "pass done status=$STATUS rc=$RC seen=$N_SEEN clean=$N_CLEAN skipped=$N_SKIPPED dirty=$N_DIRTY archived=$N_ARCHIVED deferred=$N_DEFERRED unmeasured=$N_UNMEASURED failed=$N_FAILED no_issue=$N_NO_ISSUE unpushed_worktrees=$N_UNPUSHED"
 exit "$RC"

@@ -5,8 +5,9 @@
 # rescues a lane that stops THROUGH that function — and nothing else. A lane killed by the OOM reaper,
 # a crash, or a cell quiesce leaves its work in the working tree and nowhere else, and a quiesce then
 # destroys the disk. `wip-sweep.sh` is the sweep that closes that gap, and because of what it is for,
-# every case here is driven against a REAL bare remote and the properties that matter are pinned
-# separately:
+# the suite builds REAL `git init --bare` remotes for the runs it makes (one arm then repoints origin at
+# a missing path, deliberately, to assert the unreadable-origin case) and the properties that matter are
+# pinned separately:
 #
 #   1. the work REACHES ORIGIN — and its CONTENT is the content that was dirty (a ref that exists but
 #      does not carry the work is vacuous, so the case reads the blob back);
@@ -16,14 +17,17 @@
 #   4. the per-pass cap DEFERS, and says so: a capped pass is INCOMPLETE, never clean;
 #   5. `UNMEASURED` is its own verdict and is NEVER "nothing to rescue" — an unreadable worktree, an
 #      unresolvable repo, a missing delegate and a failed archive all fail the pass loudly;
-#   6. every ref the sweep creates can be tied to an issue, and one that cannot BE REPORTED.
+#   6. a ref the sweep creates is either tied to an issue or REPORTED as not tied — F1/F3/F5 pin the
+#      report, and the doc says the archive still reaches origin without a link.
 #
-# ⛔ EVERY ARM HERE WAS BUILT TO GO RED. The `--verdict` cases specifically pin the ONE classifier the
-# sweeper reads (arms K1-K5): if `bg-rescue-wip.sh` ever answered `clean` for a tree it could not read,
-# the sweep would report a clean fleet over a disk full of unfiled work and NOTHING else in this file
-# would notice — that is the mutation the verdict arms exist to catch.
-#
-# Run:  bash scripts/wip-sweep.test.sh
+# WHAT THIS FILE DOES NOT DO, stated so a green run is not over-read: not every arm touches a remote.
+# The suite builds real `git init --bare` remotes for the runs it makes and reads the records those runs
+# write; some arms drive no remote at all (a refusal against an unreadable path, a `--print-status` read
+# of a hand-written record), and a refusal arm may still build a fixture, because a refusal is a claim
+# about that fixture's effect rather than about its absence. No assertion is recorded without an
+# observation from that run, and NO INVENTORY OF WHICH ARM TOUCHES A REMOTE IS WRITTEN HERE: four
+# attempts at one were wrong within a round of being written, so this header states the shape and lets
+# the arms speak for themselves.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -167,6 +171,15 @@ ROW="$(grep 'fix-3485-acc' "$T/state-acc/wip-sweep.tsv" 2>/dev/null | head -1)"
 has "$ROW" 'archived' && has "$ROW" 'refs/wip/fix-3485-acc' && has "$ROW" '3485' \
   && ok "A7 the INDEX row names the verdict, the ref and the issue link (agent-infra#3484's ask, in the record)" \
   || bad "A7 the index row is missing verdict/ref/issue: $ROW"
+# ⛔ THE ISSUE COLUMN ITSELF, POSITIVELY (review finding P1). A7's `has "$ROW" '3485'` was satisfied by
+# the BRANCH column (`fix/3485-acc`) and the REF column (`refs/wip/fix-3485-acc`), both present whatever
+# the `issue` column held — so deleting issue derivation entirely left the suite at PASS. Measured: with
+# `issue="$(issue_of "$br")"` replaced by `issue=""` the whole suite stayed green. This arm reads column 9.
+ACCIssue="$(awk -F'\t' '$4 == "fix/3485-acc" {print $9; exit}' "$T/state-acc/wip-sweep.tsv" 2>/dev/null)"
+[ "$ACCIssue" = "3485" ] \
+  && ok "A7b the index row's issue COLUMN is 3485 (derived from the branch, not inferred from another column)" \
+  || bad "A7b the issue column is '$ACCIssue' (want 3485) — the link agent-infra#3484 needs is absent"
+
 # ⛔ THE ARCHIVE IS READ BACK FROM ORIGIN, NOT INFERRED FROM AN EXIT CODE (review round 1, finding F3).
 # `bg-rescue-wip.sh` exits 0 BOTH for "archived and pushed" AND for "clean — nothing at risk", so a tree
 # that went clean between the verdict and the rescue would otherwise be recorded as archived with a ref
@@ -212,6 +225,50 @@ grep -q '^deferred=2$' "$T/state-cap/wip-sweep.status" 2>/dev/null \
 grep -q '^archived=1$' "$T/state-cap/wip-sweep.status" 2>/dev/null \
   && ok "C4 the record distinguishes archived=1 from deferred=2" \
   || bad "C4 the record cannot distinguish archived from deferred"
+# ⛔ THE PASS BUDGET BOUNDS THE PASS, NOT ONLY THE ARCHIVES (review finding). It used to be tested
+# inside the dirty/apply branch only, so a pass over many CLEAN worktrees cost
+# `count × status-timeout` whatever the budget said — 2.3 h on the checkout this file cites, on the path
+# a cell quiesce runs before the box goes. A stub whose `--verdict` sleeps longer than the budget is the
+# cheap deterministic reproduction: three worktrees, budget 1s, and the pass must STOP and SAY so.
+mk_fixture bud fix/3485-bud || { echo "❌ fixture failed (bud)"; exit 1; }
+git -C "$T/bud/wt" worktree add -q "$T/bud/w2" -b fix/3485-bud-b 2>/dev/null
+git -C "$T/bud/wt" worktree add -q "$T/bud/w3" -b fix/3485-bud-c 2>/dev/null
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *" --verdict "*) sleep 2; echo "verdict=clean paths=0 branch=x slug=x"; exit 0 ;;' \
+  'esac' \
+  'exit 0' > "$T/stub-slow.sh"
+chmod +x "$T/stub-slow.sh"
+O="$(WIP_SWEEP_RESCUE="$T/stub-slow.sh" WIP_SWEEP_BUDGET=1 sweep "$T/state-bud" --apply --repo "$T/bud/wt" 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] && ok "C5 a spent pass budget ends the pass with exit 1 (INCOMPLETE), not a green 0" \
+                || bad "C5 a spent budget exited $RC (want 1): $O"
+grep -q 'budget_stopped=yes' "$T/state-bud/wip-sweep.status" 2>/dev/null \
+  && ok "C5b the record says the BUDGET ended the pass (not the cap, not a clean finish)" \
+  || bad "C5b the record does not name the budget stop"
+# A ROW FOR EVERY WORKTREE THE PASS DID NOT REACH (review finding 2, round 2). The first cut wrote the
+# row inside a microsecond window and left NOTHING behind, so a stopped pass's index could not be
+# reconciled against `git worktree list` — an under-report in the OPTIMISTIC direction.
+# ⛔ COUNT THE COLUMN, NOT THE WORD (review finding, round 3). `grep -c 'unreached'` matches the word in
+# ANY field — a path, a note, a ref — so it could be inflated to pass while a row was missing. Column 6
+# is the verdict.
+# EXACTLY one per un-reached worktree: `-ge 2` would also pass a regression that wrote the same row
+# twice (a flush at the record boundary AND at EOF), which is the duplicate this whole parser shape can
+# produce.
+NUR="$(awk -F'\t' '$6 == "unreached" {c++} END {print c+0}' "$T/state-bud/wip-sweep.tsv" 2>/dev/null)"
+[ "${NUR:-0}" -eq 2 ] \
+  && ok "C5c exactly one unreached row per skipped worktree (${NUR:-0} of 2, counted in column 6)" \
+  || bad "C5c ${NUR:-0} unreached row(s) for 2 un-reached worktrees (want exactly 2)"
+# and the columns are not transposed: 4 is `branch`, 5 is `head`
+URBAD="$(awk -F'\t' '$6 == "unreached" && ($4 !~ /^fix\// || $5 !~ /^[0-9a-f]+$/) {print; exit}' "$T/state-bud/wip-sweep.tsv" 2>/dev/null)"
+[ -z "$URBAD" ] \
+  && ok "C5d the unreached rows carry branch in column 4 and head in column 5 (not swapped)" \
+  || bad "C5d an unreached row has its columns transposed: $URBAD"
+# ⛔ AND THE BRANCH IS NORMALISED, like every examined row's: a bare swap still leaves
+# `refs/heads/<b>` in the branch column, so reconciliation by branch fails one step later.
+URREF="$(awk -F'\t' '$6 == "unreached" && $4 ~ /^refs\// {print $4; exit}' "$T/state-bud/wip-sweep.tsv" 2>/dev/null)"
+[ -z "$URREF" ] \
+  && ok "C5e the unreached rows\' branch is normalised (no raw refs/heads/<b>) — the same shape as examined rows" \
+  || bad "C5e an unreached row carries a raw ref in the branch column: $URREF"
 
 # ── D) UNMEASURED IS NEVER CLEAN (the sweep's own copy of the three-verdict rule) ──────────────────
 echo; echo "── D. an UNMEASURED worktree fails the pass; it is never 'nothing to rescue' ──"
@@ -314,6 +371,26 @@ grep -q "$(printf 'topic-no-digits')" "$T/state-noi/wip-sweep.tsv" 2>/dev/null \
   || bad "F3 the unlinked work was not archived/recorded"
 [ "$RC" -eq 0 ] && ok "F4 a MISSING issue link is a report, not a pass failure (the archive landed)" \
                 || bad "F4 an unlinkable branch failed the pass (rc=$RC)"
+# ⛔ A DETACHED HEAD IS NOT AN ISSUE LINK (review finding). `--verdict` synthesises
+# `detached-<short-sha>`, and the 2-8 digit extraction matched HEX out of it (`detached-a1234bc` →
+# `issue=1234`), so the index asserted a false attribution AND the NO ISSUE LINK report never fired on a
+# shape that really occurs (a bisect or a review checkout).
+mk_fixture det fix/3485-det || { echo "❌ fixture failed (det)"; exit 1; }
+git -C "$T/det/wt" worktree add -q --detach "$T/det/dw" HEAD 2>/dev/null
+printf 'work on a detached checkout\n' > "$T/det/dw/det.txt"
+O="$(sweep "$T/state-det" --apply --repo "$T/det/wt" 2>&1)"; RC=$?
+has "$O" 'NO ISSUE LINK' \
+  && ok "F5 a DETACHED worktree reports NO ISSUE LINK (a hex run in detached-<sha> is not an issue)" \
+  || bad "F5 a detached worktree was silently given an issue link: $O"
+grep -q '^no_issue=1$' "$T/state-det/wip-sweep.status" 2>/dev/null \
+  && ok "F5b the pass record counts it in no_issue" \
+  || bad "F5b a detached worktree was not counted in no_issue"
+# column 9 of the TSV is `issue`, column 4 is `branch`
+ISSUECOL="$(awk -F'\t' '$4 ~ /^detached-/ {print $9; exit}' "$T/state-det/wip-sweep.tsv" 2>/dev/null)"
+[ "$ISSUECOL" = "-" ] \
+  && ok "F5c the detached row records issue=- (no number fabricated out of the short sha)" \
+  || bad "F5c the detached row carries an issue it cannot have: '$ISSUECOL'"
+
 
 # ── G) NO REPO / NO DELEGATE: REFUSE, NEVER "NOTHING TO RESCUE" ───────────────────────────────────
 echo; echo "── G. nothing to sweep is NOT 'nothing to rescue' ──"
@@ -357,6 +434,38 @@ O="$(sweep "$T/state-cln" --apply --repo "$T/cln/wt")"; RC=$?
 [ "$RC" -eq 0 ] && ok "H1 a clean worktree exits 0" || bad "H1 clean exit $RC (want 0): $O"
 [ "$(n_refs "$T/cln/origin.git")" = "0" ] && ok "H2 no ref is manufactured for a clean tree" \
                                           || bad "H2 a ref was pushed for a clean tree"
+# ⛔ COMMITS ONLY ON THIS DISK ARE REPORTED (review finding P1). The rescue archives UNCOMMITTED work and
+# says so; a clean tree with unpushed commits therefore read as `clean`, and the pass reported exit 0 =
+# "nothing left at risk" over a worktree whose only copy of those commits was that disk. The pass still
+# cannot save them — but it must SAY so, count them, and put them on the monitoring surface.
+mk_fixture unp fix/3485-unp || { echo "❌ fixture failed (unp)"; exit 1; }
+printf 'a commit no remote has\n' > "$T/unp/wt/local-only.txt"
+git -C "$T/unp/wt" add local-only.txt 2>/dev/null
+git -C "$T/unp/wt" commit -qm "local only" 2>/dev/null
+O="$(sweep "$T/state-unp" --apply --repo "$T/unp/wt" 2>&1)"; RC=$?
+has "$O" 'COMMITS ONLY ON THIS DISK' \
+  && ok "U1 a clean tree with unpushed commits is REPORTED, not silently 'nothing at risk'" \
+  || bad "U1 unpushed commits were not reported: $O"
+grep -q '^unpushed_worktrees=1$' "$T/state-unp/wip-sweep.status" 2>/dev/null \
+  && ok "U1b the pass record counts it (a green summary cannot hide a worktree that dies with the box)" \
+  || bad "U1b the pass record does not count unpushed worktrees"
+UPCNT="$(awk -F'\t' '$4 == "fix/3485-unp" {print $12; exit}' "$T/state-unp/wip-sweep.tsv" 2>/dev/null)"
+[ "$UPCNT" = "1" ] \
+  && ok "U1c the index row carries the unpushed count (column 12 = 1)" \
+  || bad "U1c the index row does not carry the unpushed count (got '$UPCNT')"
+[ "$RC" -eq 0 ] && ok "U1d it is a REPORT, not a failure (this tool cannot archive branch commits)" \
+                || bad "U1d unpusheable work failed the pass (rc=$RC)"
+# AND THE COUNT SURVIVES ON THE DEFERRED ROWS (review finding 4, round 2): those are exactly the rows
+# where work was NOT archived, so a '-' there hid the highest-risk case.
+mk_fixture upc fix/3485-upc || { echo "x fixture failed (upc)"; exit 1; }
+git -C "$T/upc/wt" worktree add -q "$T/upc/w2" -b fix/3485-upc-b 2>/dev/null
+printf 'x\n' > "$T/upc/w2/x.txt"
+printf 'y\n' >> "$T/upc/wt/base.txt"
+sweep "$T/state-upc" --apply --max 1 --repo "$T/upc/wt" >/dev/null 2>&1
+DEFCNT="$(awk -F'\t' '$11 ~ /deferred/ && $12 != "-" && $12 != "" {c++} END {print c+0}' "$T/state-upc/wip-sweep.tsv" 2>/dev/null)"
+[ "${DEFCNT:-0}" -ge 1 ] \
+  && ok "U1e a DEFERRED row still carries its unpushed count (not '-')" \
+  || bad "U1e a deferred row dropped the unpushed column"
 grep -q 'nothing-at-risk' "$T/state-cln/wip-sweep.tsv" 2>/dev/null \
   && ok "H3 the index records the clean verdict" || bad "H3 the index has no clean row"
 grep -q '^seen=1$' "$T/state-cln/wip-sweep.status" 2>/dev/null \
@@ -373,6 +482,34 @@ mkdir -p "$T/state-stale" && printf 'status=ok\nrc=0\nts=1\ndetail=x\n' > "$T/st
 WIP_SWEEP_STATE_DIR="$T/state-stale" bash "$SW" --print-status >/dev/null 2>&1; RC=$?
 [ "$RC" -eq 3 ] && ok "I3 a STALE record answers 3 — a sweeper that stopped running is not a green box" \
                 || bad "I3 stale record answered $RC (want 3)"
+# ⛔ AND IT MUST NOT PRINT `ok` WHILE EXITING 3 (review finding). The verb `cat`-ed the record — which
+# says `status=ok` — and then exited 3, so a consumer parsing the key=value surface the doc nominates
+# read a green status off a box that is not being swept.
+OST="$(WIP_SWEEP_STATE_DIR="$T/state-stale" bash "$SW" --print-status 2>/dev/null)"
+has "$OST" 'status=stale' \
+  && ok "I7 a STALE record PRINTS status=stale — the printed surface agrees with the exit code" \
+  || bad "I7 a stale record printed a status that disagrees with its exit code: $OST"
+# NOT A LINE-ANCHORED MATCH: the first cut printed the raw value as `recorded_status=ok`, which
+# CONTAINS `status=ok` — so a `grep 'status=ok'` consumer still read green off a stale record. This arm
+# is a SUBSTRING test on the whole print, deliberately.
+if grep -q 'status=ok' <<<"$OST"; then
+  bad "I7b the stale print still contains the substring status=ok — a grep consumer reads green"
+else
+  ok "I7b no emitted key CONTAINS status=ok (recorded= / recorded_rc= cannot collide)"
+fi
+OST_RC="$(sed -n 's/^rc=//p' <<<"$OST" | tail -1)"
+[ "$OST_RC" = "3" ] \
+  && ok "I7c the printed rc= is the DERIVED one (3), not the recorded rc of a stale pass" \
+  || bad "I7c the printed rc= is '$OST_RC' while the exit code is 3"
+# A clock step BACKWARDS is not freshness either: `-gt` alone let a future-dated record answer 0 for
+# the whole skew, on the one gate this pass hardened twice.
+mkdir -p "$T/state-future"
+printf 'status=ok\nrc=0\nts=%s\ndetail=x\n' "$(( $(date -u '+%s') + 31536000 ))" > "$T/state-future/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$T/state-future" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I8 a record dated in the FUTURE answers 3 (a clock step backwards is not freshness)" \
+                || bad "I8 a future-dated record answered $RC (want 3): $O"
+has "$O" 'status=stale' \
+  && ok "I8b it says stale, not ok" || bad "I8b a future-dated record's printed status is not stale: $O"
 WIP_SWEEP_STATE_DIR="$T/state-cap" bash "$SW" --print-status >/dev/null 2>&1; RC=$?
 [ "$RC" -eq 1 ] && ok "I4 an INCOMPLETE record answers 1 (work was deferred — not clean, not failed)" \
                 || bad "I4 incomplete record answered $RC (want 1)"
@@ -405,6 +542,35 @@ O="$(cd "$T" && WIP_SWEEP_BUDGET=0 WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$SW"
 O="$(sweep "$T/state-max0" --apply --max 0 --repo "$T/cln/wt")"; RC=$?
 [ "$RC" -eq 0 ] && ok "I5f --max 0 is still ACCEPTED (0 is a documented disable for the per-pass cap)" \
                 || bad "I5f --max 0 was refused (rc=$RC, want 0): $O"
+# ⛔ ACCEPTED IS NOT THE CLAIM — the SEAM MUST REACH ITS EFFECT (review finding P2). I5f ran against a
+# CLEAN fixture, so "no cap" was indistinguishable from "a cap of zero"; and I5e ran `--print-status`,
+# which never consults the budget at all. Measured: flipping `[ "$MAX" -gt 0 ]` to `-ge 0` (so `--max 0`
+# archives NOTHING) and `[ "$BUDGET" -gt 0 ]` to `return 0` (so a zero budget is always exhausted) both
+# left the suite green. These two arms run against a DIRTY fixture and require the work to move.
+mk_fixture mx0 fix/3485-mx0 || { echo "x fixture failed (mx0)"; exit 1; }
+printf 'work that --max 0 must still archive\n' >> "$T/mx0/wt/base.txt"
+O="$(sweep "$T/state-mx0" --apply --max 0 --repo "$T/mx0/wt")"; RC=$?
+[ "$RC" -eq 0 ] && [ "$(n_refs "$T/mx0/origin.git")" = "1" ] \
+  && ok "I5g --max 0 means NO CAP: a dirty worktree is still archived (it is not a cap of zero)" \
+  || bad "I5g --max 0 did not archive (rc=$RC, refs=$(n_refs "$T/mx0/origin.git")): $O"
+mk_fixture bd0 fix/3485-bd0 || { echo "x fixture failed (bd0)"; exit 1; }
+printf 'work that WIP_SWEEP_BUDGET=0 must still archive\n' >> "$T/bd0/wt/base.txt"
+O="$(cd "$T" && WIP_SWEEP_BUDGET=0 WIP_SWEEP_STATE_DIR="$T/state-bd0" bash "$SW" --apply --repo "$T/bd0/wt" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && [ "$(n_refs "$T/bd0/origin.git")" = "1" ] \
+  && ok "I5h WIP_SWEEP_BUDGET=0 means NO BUDGET: the pass still archives (it is not 'always exhausted')" \
+  || bad "I5h a zero budget did not archive (rc=$RC, refs=$(n_refs "$T/bd0/origin.git")): $O"
+# ⛔ AN INTERRUPTED PASS MUST NOT READ AS OK (review finding P1). The record is now overwritten with
+# `status=running` before any worktree is touched, so a pass that crashed / was OOM-killed / was cut off
+# by a quiesce / could not write its verdict leaves `running` — never the previous pass's fresh `ok`.
+# Measured before the fix: an unwritable state dir with one prior good pass exited 3 and `--print-status`
+# still answered `rc=0 status=ok`.
+mkdir -p "$T/state-run" && printf 'status=running\nrc=?\nts=%s\ndetail=pass started\n' "$(date -u '+%s')" > "$T/state-run/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$T/state-run" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I9 a pass that never reached its verdict (status=running) answers 3, not ok" \
+                || bad "I9 an interrupted pass answered $RC (want 3): $O"
+has "$O" 'status=failed' \
+  && ok "I9b it prints status=failed — the same word the pass would have written" \
+  || bad "I9b an interrupted pass printed a status that reads green: $O"
 mkdir -p "$T/state-nots" && printf 'status=ok\nrc=0\ndetail=x\n' > "$T/state-nots/wip-sweep.status"
 WIP_SWEEP_STATE_DIR="$T/state-nots" bash "$SW" --print-status >/dev/null 2>&1; RC=$?
 [ "$RC" -eq 3 ] && ok "I6 a record with NO ts= answers 3 — an unreadable clock is not freshness" \

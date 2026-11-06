@@ -51,10 +51,26 @@ step "supervisor: ${SW:-<none found — will start tmux directly>}"
 
 # Locate the WIP sweep (agent-infra#3485). It lives beside bg-rescue-wip.sh in the clone's scripts/
 # (they are a pair: the sweep classifies with `bg-rescue-wip.sh --verdict` and archives with
-# `bg-rescue-wip.sh`), with the runtime dir and the farmed home as fallbacks.
+# `bg-rescue-wip.sh`), with the PINNED HARNESS TREE, the runtime dir and the farmed home as fallbacks.
+#
+# ⛔ THE PIN IS A FILE THAT CONTAINS A PATH, NOT A DIRECTORY (review finding). `.harness-path` is the
+# pin's PATH RECORD — a regular file holding the harness directory the controller execs
+# (`scripts/harness-exec.sh:67`, `scripts/orchestrator-harness/orch-pin-exec.sh:78`,
+# `scripts/harness-apply-pass.sh:207`). A candidate spelled `<root>/.harness-path/scripts/wip-sweep.sh`
+# is therefore not a file and could never match: on a box where the sweep exists ONLY in the pinned
+# tree, this script would have reported `FATAL: wip-sweep.sh not found`, archived NOTHING, and named a
+# path that cannot exist — #3485's gap un-closed on exactly that box, with a misleading remedy. Read
+# the record and use its CONTENT, the same way the harness launcher does.
+HARNESS_PIN_REC="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+PINNED_DIR=""
+# Read it the way the launcher reads it — FIRST LINE, CR/LF stripped
+# (`scripts/harness-exec.sh:83`, `scripts/orchestrator-harness/orch-pin-exec.sh:86`). A record rewritten
+# on a box that ever wrote CRLF otherwise yields `<dir>\r`, a candidate that cannot exist, and the sweep
+# reads as absent on the one box this fallback exists for.
+[ -f "$HARNESS_PIN_REC" ] && PINNED_DIR="$(head -1 "$HARNESS_PIN_REC" 2>/dev/null | tr -d '\r\n')"
 SWEEP=""
 for c in "$REPO/scripts/wip-sweep.sh" \
-         "$REPO/.harness-path/scripts/wip-sweep.sh" \
+         ${PINNED_DIR:+"$PINNED_DIR/scripts/wip-sweep.sh"} \
          "$O/wip-sweep.sh" \
          "${HOME:-/nonexistent}/.pi/agent/scripts/wip-sweep.sh"; do
   [ -f "$c" ] && { SWEEP="$c"; break; }
@@ -107,7 +123,7 @@ step "sweep clean: 0 orch-loop, $(tmux ls 2>/dev/null | wc -l | tr -d ' ') tmux 
 # failing one: "a missing rescuer must never read as nothing to rescue".
 WIP_RC=0; WIP_WHY=""
 if [ -z "$SWEEP" ]; then
-  WIP_RC=3; WIP_WHY="wip-sweep.sh not found (looked at \$REPO/scripts, \$REPO/.harness-path/scripts, $O, \$HOME/.pi/agent/scripts)"
+  WIP_RC=3; WIP_WHY="wip-sweep.sh not found (looked at \$REPO/scripts, the tree the pin record ${HARNESS_PIN_REC} names, $O, \$HOME/.pi/agent/scripts)"
   step "FATAL: wip-sweep: $WIP_WHY"
   step "FATAL: wip-sweep: UNCOMMITTED WORK ON THIS BOX WAS NOT ARCHIVED. Any dirty worktree here is lost if this cell is reclaimed."
 else
