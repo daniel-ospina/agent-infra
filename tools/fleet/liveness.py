@@ -30,7 +30,9 @@ log-lane axis publishes, from the same ``evaluate``:
 
 Its progress contract is COPIED from ``scripts/orchestrator-harness/lane-bound.sh``
 (two independent signals — subtree CPU delta and output growth — and only BOTH
-flat for the full window is a freeze), and its terminal states come from the
+flat is a freeze: the log silent for the freeze window and the CPU delta flat over
+the sample window, durations that differ on purpose — §13.3), and its terminal
+states come from the
 verdict line that supervisor ALREADY writes. It is an evidence field of
 ``evaluate``, never a second classifier: inert when ``log_read is None``, and a
 ``log_read`` supplied on a session query is refused by name.
@@ -262,17 +264,34 @@ STATES = ("dead", "running-quiet", "wedged", "idle", "unknown")
 #              advanced inside the sample window. This is the state a long
 #              SILENT TOOL CALL must read: `pi -p` writes nothing to its log
 #              while a tool runs, so log age alone reported such a lane as not
-#              live (#…, the measured 50 %-look-dead class).
-#   frozen     the process tree is alive AND ZERO progress on EVERY signal for
-#              the full ``LOG_FREEZE_MS`` window. Both halves are required, and
-#              the window is echoed in ``Verdict.detail`` so no reader has to
-#              look it up.
+#              live (#1777, the measured 50 %-look-dead class).
+#   frozen     the process tree is alive AND ZERO progress on EVERY signal, with
+#              the LOG's silence spanning the full ``LOG_FREEZE_MS`` window and the
+#              SAMPLED signals (CPU, transcript) flat across ``LOG_WINDOW_MS``.
+#              ⛔ THE TWO DURATIONS DIFFER on purpose and are NOT the same claim:
+#              this is "no output for the freeze window AND no CPU in the sample
+#              window", never "no CPU for the freeze window". Both windows are
+#              echoed in ``Verdict.detail`` (``freeze_ms=``/``window_ms=``) so a
+#              reader can always tell which it received — §13.3 states the
+#              boundary and what it costs (``lane-bound.sh`` resets its own
+#              no-progress clock on EITHER signal, so this axis can say ``frozen``
+#              while the supervisor still calls the lane progressing).
 #   finished   the process tree is GONE and the lane WROTE A VERDICT that says
 #              its turn completed (``lane-bound.sh``'s own line).
-#   no-verdict the process tree is GONE and the lane wrote NO verdict at all —
-#              the process ended and told us nothing. A NEW, honest state: it
-#              is what the 200–400 B artefacts of 2026-11-03 were, and reading
-#              that shape as ``dead`` is the false negative this axis removes.
+#   no-verdict the process tree is GONE and the lane's turn is NOT established as
+#              COMPLETE. ⛔ TWO ARMS REACH IT, and each says which in ``reason``:
+#              (a) ``process-gone-no-verdict`` — NO recognisable BOUND verdict was
+#                  written. This is NOT "told us nothing": the LAUNCHER's own
+#                  `rc=<n>` may be perfectly readable and is reported in
+#                  ``detail`` (`merge-one.sh` has no bound at all).
+#              (b) a verdict WAS written and says `verdict=finished`, but an `rc=`
+#                  — on the bound line or on the launcher's — shows the turn did
+#                  NOT complete: ``bound-finished-rc:<n>`` /
+#                  ``bound-finished-runner-rc:<n>``. That is the CRASHED lane the
+#                  `rc` conjunct exists to keep out of ``finished``.
+#              A NEW, honest state: it is what the 200–400 B artefacts of
+#              2026-11-03 were, and reading that shape as ``dead`` is the false
+#              negative this axis removes.
 #
 # ⛔ A PROCESS THAT HAS EXITED IS TERMINAL, NEVER ``frozen``/``working``.
 # ``frozen`` is a statement about a LIVE tree that stopped progressing; a tree
@@ -285,22 +304,34 @@ LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown")
 # over. `LANE_REAP_WINDOW` default 30 s (scripts/orchestrator-harness/lane-reap.sh),
 # the fleet's existing two-sample span.
 LOG_WINDOW_MS = 30_000
-# The freeze window: how long EVERY signal must have been flat before a LIVE tree
-# is called ``frozen``. 45 min = `scripts/orchestrator-harness/lane-bound.sh`'s
-# `LANE_BOUND_IDLE_S` default (2700 s, `lane-bound.sh:172`) — the fleet's own
-# declared NO-PROGRESS allowance, and since agent-infra#2888 the bound that decides
-# wedged-vs-slow. Copied from there, so a long silent tool call is not read as death
-# by a second, unreviewed number.
-#
-# ⛔ NOT `LANE_REAP_LIVE_MIN`, AND NOT THE WALL. This comment once said the value was
-# `LANE_REAP_LIVE_MIN`'s 45 min "chosen above `lane.sh`'s 2400 s wall limit". Every
-# half was wrong: `LANE_REAP_LIVE_MIN` defaults to 125 min (`lane-reap.sh:176`), and
-# the lane's wall is `LANE_BACKSTOP_S` = 7200 s (`spawn-gate.sh:1480`), consumed as
-# the default in `lane.sh`'s `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}"` call —
-# so the number was described as sitting ABOVE a bound it actually sat 75 min below
-# (45 vs 120). The 45 min is the progress
-# allowance because that is the bound that asks the SAME question ("is this lane
-# still working?").
+# The freeze window: how long the LOG's bytes must have been flat before a LIVE
+# tree is called ``frozen``. ⛔ IT IS THE LOG'S WINDOW ONLY — the CPU and transcript
+# signals are sampled over ``LOG_WINDOW_MS``, so ``frozen`` means "no OUTPUT for the
+# freeze window AND no CPU in the sample window", never "no CPU for the freeze
+# window". The ``LOG_STATES`` entry above and §13.3 state that asymmetry and its
+# consequence, which is why ``frozen`` is not a licence to kill.
+# 45 min = 2700 s is the fleet's ALREADY DECLARED no-progress allowance, copied
+# rather than invented: it is ``lane-bound.sh``'s ``--idle`` default
+# (``LANE_BOUND_IDLE_S``, scripts/orchestrator-harness/lane-bound.sh) and
+# ``DEFAULT_PROGRESS_AGE_MS`` = 2_700_000 ms
+# (extensions/shared/heartbeat-progress-edges.ts, the builtin-tools ``no-progress``
+# clause #5195). ⛔ ``frozen`` BORROWS `--idle`'s DURATION, NOT ITS MEASUREMENT:
+# `--idle` resets its clock on EITHER signal, so the two instruments CAN disagree
+# and this is NOT "the same question" (§13.3). The duration is taken because the
+# fleet already declared that allowance — not because the two agree.
+# ⛔ IT IS **NOT** ``LANE_REAP_LIVE_MIN``, and an earlier revision of this comment
+# said it was. That constant is 125 min since agent-infra#2888, because it is an
+# MTIME-ONLY window and must sit ABOVE the wall backstop so a live lane inside one
+# silent tool call does not read as dead. This axis is decided on CPU as well, so
+# its analogue is the PROGRESS bound, not the mtime window; re-pointing this at
+# 125 min would make ``frozen`` unreachable on exactly the wedge class it names.
+# ⛔ AND IT SITS BELOW THE WALL ON PURPOSE. ``lane-bound.sh``'s ``--wall``
+# (``LANE_BACKSTOP_S`` = 7200 s) is a BACKSTOP; since #2888 the PROGRESS bound is
+# primary, so it must fire FIRST — otherwise the wall pre-empts it and a lane that
+# is still working is killed by elapsed time, which is the measured defect #2888
+# fixes. An earlier revision called this ordering a defect and cited stale
+# literals (``lane.sh``'s ``3300``; ``--wall`` default ``3300``; a 1200 s
+# ``--idle``): ``lane.sh`` now passes ``LANE_TIMEOUT:-$LANE_BACKSTOP_S``.
 LOG_FREEZE_MS = 45 * 60 * 1000
 # The CPU tolerance: a delta at or below this is NOT progress. `LANE_REAP_CPU_TOL_CS`
 # default 10 (0.10 s) — a sub-0.1 s twitch is indistinguishable from a parked fork
@@ -316,17 +347,33 @@ BOUND_VERDICTS = ("finished", "stalled", "exceeded-wallclock")
 # child's REAL exit status in `rc=` on the same line, so `verdict=finished rc=7` is a
 # crashed lane. Measured: `lane-bound.sh run --log L -- sh -c 'exit 7'` →
 # `VERDICT verdict=finished … rc=7`. `BOUND_OK_RC` is the only set that may be read as
-# completion; `na` is `watch` mode's shape (the supervised pid's status is not the
-# bound's to report), and `0` is `run` mode's success.
+# completion; `0` is `run` mode's success.
+#
+# ⛔ `na` IS **NOT** COMPLETION EVIDENCE — it is the ABSENCE of exit-status evidence.
+# `lane-bound.sh` sets `V_RC=na` UNCONDITIONALLY in `watch` mode (its own `V_RC=na`), and
+# `watch` is what `spawn-gate.sh`'s `run_agent` passes for EVERY lane/fixer/worker.
+# `run` mode is the only one that puts the child's real status on the bound line, and
+# nothing in the fleet invokes it. ⛔ AND `spawn-gate.sh` IS NOT THE ONLY LAUNCHER:
+# `merge-one.sh`'s reviewer run is its own plain sleep watchdog that never invokes
+# `lane-bound.sh`, so it writes NO bound line at all (the launcher witness is the only
+# status evidence it has — see ``gather_log_lane``). Neither path can put a completion
+# fact in `rc=na`. So `rc=na` carries no completion fact at all: reading it as OK made the
+# `rc` conjunct INERT for the axis's entire production population, and a crashed /
+# OOM-killed / watchdog-killed lane published `finished` — the exact false PASS the
+# conjunct exists to remove.
+# `na` is therefore NOT in `BOUND_OK_RC`; it must be CORROBORATED by the launcher's own
+# `[timeout] agent pid=<pid> … rc=<n>` line (`parse_runner_line`), and only a
+# corroborated `rc=0` is `finished`.
 BOUND_FINISHED = frozenset({"finished"})
-BOUND_OK_RC = frozenset({"0", "na"})
+BOUND_OK_RC = frozenset({"0"})
 _BOUND_VERDICT_RE = None  # compiled lazily, so importing the module stays cheap
 _BOUND_RC_RE = None
 _BOUND_PID_RE = None
-# Presence of a `pid=` FIELD, whatever its value. Kept separate from `_BOUND_PID_RE` so
-# "the line names no incarnation" (ADOPT) and "the line names an unusable one" (DROP) stay
-# distinguishable — see `parse_bound_pid`.
-_BOUND_PID_FIELD_RE = None
+_BOUND_LINE_RE = None    # the `[lane-bound] VERDICT` MARKER alone (the line, not its token)
+_BOUND_RC_PRESENT_RE = None  # `rc=` presence only — "absent" vs "present but unreadable"
+_RUNNER_MARKER_RE = None  # the LAUNCHER's `[timeout] agent` line (location only, no allow-list)
+_RUNNER_PID_TOKEN_RE = None  # the `pid=` token read off that line
+_RUNNER_RC_TOKEN_RE = None  # the status token read off that line
 # `rc=` is captured on the SAME line, because a verdict without its exit status is
 # not a completion (see BOUND_OK_RC).
 
@@ -643,7 +690,7 @@ class Evidence:
     # the claim logic is reachable ONLY when a caller explicitly supplies it, so
     # the existing verdict ladder is unchanged (pinned by a test + mutation).
     claim_read: Optional[ClaimRead] = None
-    # The LOG-LANE evidence axis (#…). ``None`` for every session-lane caller, so
+    # The LOG-LANE evidence axis (#1777). ``None`` for every session-lane caller, so
     # the existing ladder is untouched — the log logic is reachable ONLY when a
     # caller explicitly says "this is a log lane" (pinned by a test AND a
     # mutation, the same shape as the claim axis).
@@ -1010,7 +1057,9 @@ def claim_verdict(cr: ClaimRead) -> Verdict:
 #      `NO-VERDICT` for exactly this shape in review verdicts; this axis adopts
 #      the same name rather than inventing a parallel one.
 #   3. real death: the completion watchdog's
-#      `sub-agent completed but did not exit within 15s — killing`, a provider
+#      `[task] sub-agent (pid N) completed but did not exit within 15s — killing
+#      (completion watchdog)` (`extensions/builtin-tools/index.ts`, the default
+#      `logFn` prefix), a provider
 #      stall, or a true hang — and `lane-bound.sh`'s own `verdict=stalled` /
 #      `verdict=exceeded-wallclock` lines ARE that death, reported.
 #
@@ -1048,8 +1097,10 @@ def claim_verdict(cr: ClaimRead) -> Verdict:
 # `ep_poll` reads exactly 0 cs; an active lane reads tens to hundreds.
 #
 # ⛔ AND THE DIRECTION OF EACH RULE IS THE SAFETY PROPERTY. Progress is a VETO
-# (it protects, it never convicts); ``frozen`` needs BOTH signals flat for the
-# FULL ``LOG_FREEZE_MS`` AND a live tree; an unreadable signal ABSTAINS
+# (it protects, it never convicts); ``frozen`` needs BOTH signals flat — the LOG
+# silent for the FULL ``LOG_FREEZE_MS`` and the sampled deltas flat over
+# ``LOG_WINDOW_MS`` (the two durations differ; §13.3) — plus a live tree; an
+# unreadable signal ABSTAINS
 # (``unknown``) and never becomes ``frozen`` or ``dead``; and absence of a log is
 # an ABSTENTION — never death.
 
@@ -1061,13 +1112,6 @@ def _bound_pid_re():
     return _BOUND_PID_RE
 
 
-def _bound_pid_field_re():
-    global _BOUND_PID_FIELD_RE
-    if _BOUND_PID_FIELD_RE is None:
-        _bound_verdict_re()
-    return _BOUND_PID_FIELD_RE
-
-
 def _bound_rc_re():
     global _BOUND_RC_RE
     if _BOUND_RC_RE is None:
@@ -1076,19 +1120,28 @@ def _bound_rc_re():
     return _BOUND_RC_RE
 
 
+def _bound_rc_present_re():
+    """``rc=`` PRESENCE only (no allow-list) — "absent" vs "present but unreadable"."""
+    global _BOUND_RC_PRESENT_RE
+    if _BOUND_RC_PRESENT_RE is None:
+        _bound_verdict_re()
+        assert _BOUND_RC_PRESENT_RE is not None
+    return _BOUND_RC_PRESENT_RE
+
+
 def _bound_verdict_re():
-    # ⛔ ALL THREE, DECLARED `global`, ASSIGNED DIRECTLY (review P2). This block lazy-inits the
-    # sibling patterns that `_bound_rc_re` / `_bound_pid_re` consume, so it must bind them in the
-    # MODULE namespace. It used to do that for two of the three through `globals()[...]` while the
-    # third was a plain assignment under a `global _BOUND_VERDICT_RE` declaration — which made
-    # `_BOUND_RC_RE = _re.compile(...)` a LOCAL, compiling the pattern twice and discarding one.
-    # It happened to work only because the `globals()` write came first, so deleting that line as
-    # "redundant with the next one" would have silently broken `_bound_rc_re`'s
-    # `assert _BOUND_RC_RE is not None`. Four entries, one idiom, nothing to trip over.
-    # The fourth (`_BOUND_PID_FIELD_RE`) records that a `pid=` FIELD was present at all, which
-    # `_BOUND_PID_RE` alone cannot distinguish from the field being absent — see
-    # `parse_bound_pid`'s DROP-vs-ADOPT split.
-    global _BOUND_VERDICT_RE, _BOUND_RC_RE, _BOUND_PID_RE, _BOUND_PID_FIELD_RE
+    # ⛔ DECLARED `global`, ASSIGNED DIRECTLY (review P2). This block lazy-inits the sibling
+    # patterns that `_bound_rc_re` / `_bound_pid_re` consume, so it must bind them in the MODULE
+    # namespace. It once did that through `globals()[...]` for the siblings while the verdict
+    # pattern itself was a plain assignment under a `global _BOUND_VERDICT_RE` declaration — which
+    # made `_BOUND_RC_RE = _re.compile(...)` a LOCAL, compiling the pattern twice and discarding
+    # one. It happened to work only because the `globals()` write came first, so deleting that
+    # line as "redundant with the next one" would have silently broken `_bound_rc_re`'s
+    # `assert _BOUND_RC_RE is not None`. Three entries, one idiom, nothing to trip over.
+    # (There is no `_BOUND_PID_FIELD_RE`: a `pid=` field that is PRESENT but unusable is detected
+    # by the TOKEN allow-list in `parse_bound_pid`, which is why `_BOUND_PID_RE` captures `\S*`
+    # rather than `[0-9]+` — and why "present but unusable" and "absent" stay distinguishable.)
+    global _BOUND_VERDICT_RE, _BOUND_RC_RE, _BOUND_PID_RE
     if _BOUND_VERDICT_RE is None:
         import re as _re
         # ⛔ THE VERDICT TOKEN AND THE `rc=` ARE PARSED SEPARATELY, for three reasons
@@ -1102,11 +1155,147 @@ def _bound_verdict_re():
         # So: match the token alone, then scan that line's HEAD (everything before
         # ` log=`) for `rc=` and take the LAST one.
         _BOUND_VERDICT_RE = _re.compile(r"\[lane-bound\]\s+VERDICT\b.*?\bverdict=([a-z][a-z-]*)")
-        _BOUND_RC_RE = _re.compile(r"\brc=([0-9]+|na)\b")
-        _BOUND_PID_RE = _re.compile(r"\bpid=([0-9]+)\b")
-        _BOUND_PID_FIELD_RE = _re.compile(r"\bpid=")
+        # ⛔ THE `rc` TOKEN IS BOUNDED TOO. An exit STATUS is a small number (a POSIX
+        # status is 0-255; a shell reports 128+signal), so `{1,10}` is generous. The old
+        # unbounded `[0-9]+` matched a RUNAWAY token (measured: 400 digits) and the whole
+        # thing was interpolated into `reason`; bounding it makes an unreadable status
+        # ABSTAIN (`rc=None` -> `finished-rc-unreadable` -> `unknown`), which is the same
+        # doctrine the runner line and the census column follow. `na` is kept verbatim.
+        _BOUND_RC_RE = _re.compile(r"\brc=([0-9]{1,10}|na)\b")
+        # Presence only (no allow-list) — tells "absent" from "present but unreadable".
+        globals()["_BOUND_RC_PRESENT_RE"] = _re.compile(r"\brc=")
+        _BOUND_RC_PRESENT_RE = globals()["_BOUND_RC_PRESENT_RE"]
+        # ⛔ THE LOCATOR CARRIES NO ALLOW-LIST. `pid=([0-9]+)` meant a bound line whose
+        # `pid=` was PRESENT but unusable in a non-all-digit form (`?`, `0x1f`, empty,
+        # `abc`, `-1`, `1e5`) produced NO match — i.e. `""`, the value reserved for "the
+        # line names no incarnation", which `_bind_verdict` ADOPTS. So a previous
+        # dispatch's `verdict=finished` was published as this lane's terminal state (the
+        # stale-verdict FALSE PASS this axis exists to remove), while the census dropped
+        # the identical token. The allow-list now applies to the TOKEN, as in
+        # `parse_runner_line`; `""` means the line genuinely carries no `pid=`.
+        globals()["_BOUND_PID_RE"] = _re.compile(r"\bpid=(\S*)")
+        # ⛔ THE MARKER ALONE, with NO token requirement. `_BOUND_VERDICT_RE` demands
+        # `verdict=` followed by `[a-z][a-z-]*`, so a FINAL line whose token is
+        # uppercase, empty, or spaced (`verdict = stalled`) produced NO match and the
+        # parser silently returned the PREVIOUS line's verdict — measured:
+        # `"…verdict=finished … rc=0\n…VERDICT verdict=None … rc=0"` -> ('finished','0').
+        # That is the stale-verdict false PASS the "last line wins" rule exists to stop,
+        # so the MARKER is located first and the token is read off THAT line only.
+        globals()["_BOUND_LINE_RE"] = _re.compile(r"\[lane-bound\]\s+VERDICT\b")
+        _BOUND_LINE_RE = globals()["_BOUND_LINE_RE"]
+        _BOUND_TOKEN_RE = _re.compile(r"\bverdict=([a-z][a-z-]*)")
+        globals()["_BOUND_TOKEN_RE"] = _BOUND_TOKEN_RE
+        # The LAUNCHER's exit-status line (`spawn-gate.sh`'s `[timeout] agent`):
+        #   [timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>
+        # It is the ONLY witness of the child's real status in `watch` mode, so it is
+        # what corroborates `rc=na` (see BOUND_OK_RC).
+        # ⛔ THE LOCATOR CARRIES NO ALLOW-LIST. It used to be `pid=(\d{1,10})`, so a
+        # line whose pid token was unusable (`0x1f`, `?`, empty, 11 digits) never
+        # matched and the parser returned `("", None)` — the shape reserved for "NO line
+        # at all" — and the verdict then asserted "no corroborating launcher reading"
+        # over a log that DEMONSTRABLY had one (with a readable `rc=`). The pid is read
+        # off the located line separately and an unusable one is `"?"`, this module's
+        # existing present-but-unusable token (`parse_bound_pid`, census `_pidcol`).
+        globals()["_RUNNER_MARKER_RE"] = _re.compile(r"\[timeout\]\s+agent\b")
+        _RUNNER_MARKER_RE = globals()["_RUNNER_MARKER_RE"]
+        globals()["_RUNNER_PID_TOKEN_RE"] = _re.compile(r"\bpid=(\S*)")
+        _RUNNER_PID_TOKEN_RE = globals()["_RUNNER_PID_TOKEN_RE"]
+        globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\brc=(\d{1,3})\b")
+        _RUNNER_RC_TOKEN_RE = globals()["_RUNNER_RC_TOKEN_RE"]
     return _BOUND_VERDICT_RE
 
+
+def _last_bound_line(text: str):
+    """The LAST ``[lane-bound] VERDICT`` LINE in ``text``, or ``None``.
+
+    ONE locator, shared by :func:`parse_bound_line` and :func:`parse_bound_pid`, so
+    "the line" cannot mean two different lines in the two parsers. It matches the
+    MARKER only — never the verdict token — so a final line the token regex cannot
+    match still *is* the final line, and its unreadable token yields "no verdict"
+    instead of silently promoting an earlier recognised one.
+    """
+    if not text:
+        return None
+    _bound_verdict_re()  # ensures the compiled globals exist
+    last = None
+    for m in _BOUND_LINE_RE.finditer(text):
+        last = m
+    if last is None:
+        return None
+    line_end = text.find("\n", last.start())
+    return text[last.start(): line_end if line_end >= 0 else len(text)]
+
+
+def parse_runner_line(text: str):
+    """``(pid, rc)`` from the LAST launcher ``[timeout] agent … rc=`` line, or ``("", None)``.
+
+    ⛔ WHY THIS EXISTS — THE `rc=na` HOLE. `lane-bound.sh` writes
+    ``VERDICT verdict=finished … rc=na`` UNCONDITIONALLY in ``watch`` mode
+    (``lane-bound.sh``'s ``V_RC=na``), and ``watch`` is the mode ``spawn-gate.sh``'s
+    ``run_agent`` uses for EVERY lane/fixer/worker. ``run`` mode — the only
+    one that puts the child's real status on the bound line — is never used by the
+    fleet. So the bound line's ``rc`` can NEVER witness completion in production, and a
+    crashed / OOM-killed / watchdog-killed lane wrote exactly the same
+    ``verdict=finished rc=na``.
+
+    The real status IS written to the same log, one line later, by the caller:
+    ``[timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>``
+    (``spawn-gate.sh``'s ``[timeout] agent`` line). That line is the corroborating
+    witness for ``na``.
+
+    Last line wins (the log is appended to across dispatches), and ``pid`` is returned so
+    the caller can require it belong to the SAME incarnation as the bound line.
+
+    ⛔ AN UNREADABLE ``rc`` IS AN ABSTENTION, NOT A NEGATIVE FACT. The token is an exit
+    STATUS — 1-3 digits (a POSIX status is 0-255, and a shell reports 128+signal) — so
+    anything else (`0x0`, `exit:0`, a non-ASCII digit, or a runaway token) makes the whole
+    line unparseable and the witness ABSENT. Matching any non-space token and testing
+    `!= "0"` read
+    a corrupt token as the positive claim "the child did NOT complete" — the same class of
+    error as reading an unreadable log as death — and a 5000-digit token was interpolated
+    whole into the reason string. The bound line's own `rc=` already uses a strict
+    allow-list and abstains (`finished-rc-unreadable`); this matches it.
+
+    ⛔ "MARKER ABSENT" AND "MARKER PRESENT, STATUS UNREADABLE" ARE DIFFERENT FACTS, and
+    the return shape says which: ``("", None)`` means NO line at all; ``(<pid>, None)``
+    means a line named this incarnation but its status could not be read. Collapsing the
+    two made the verdict publish "no launcher line to corroborate it" over a log that
+    demonstrably HAD one — the wrong-fact-in-the-detail class T49 closed for the
+    no-progress branch. The LAST marker wins, so a trailing unreadable line is not
+    rescued by an earlier readable one.
+    """
+    if not text:
+        return "", None
+    _bound_verdict_re()  # ensures the compiled globals exist
+    # ⛔ A `[timeout] agent` LINE WITH NO `pid=` TOKEN IS NOT A LAUNCHER REPORT. A
+    # TRUNCATED or garbled write can carry the marker with no status token, and taking
+    # the LAST marker unconditionally made that line the witness: it has no `pid=`, so it
+    # became `"?"` (asserting a pid token existed) and it SHADOWED an earlier readable
+    # launcher line, downgrading a corroborated `finished` to `unknown`. Only a marker
+    # line that carries a `pid=` is a launcher report; `"?"` stays reserved for a `pid=`
+    # that is PRESENT and unusable (`0x1f`, empty value, non-ASCII, over-long).
+    #
+    # ⛔ AND THE COMPLETION WATCHDOG'S PROSE NEVER REACHES HERE AT ALL. Its real line is
+    # `[task] sub-agent (pid N) completed but did not exit within 15s — killing
+    # (completion watchdog)` (`extensions/builtin-tools/index.ts`, whose default `logFn`
+    # prefixes `[task] `), so it carries no `[timeout] agent` marker to match — it is
+    # ABSENT to this parser, not present-but-unusable. An earlier revision of this
+    # comment claimed the watchdog shared the marker and was skipped for its missing
+    # `pid=`: that was wrong (it never matched), and doc §13.4 states the correct guard.
+    last = None
+    for m in _RUNNER_MARKER_RE.finditer(text):
+        line_end = text.find("\n", m.start())
+        cand = text[m.start(): line_end if line_end >= 0 else len(text)]
+        if _RUNNER_PID_TOKEN_RE.search(cand) is None:
+            continue                      # prose, not a launcher report line
+        last = cand
+    if last is None:
+        return "", None
+    pid_tok = _RUNNER_PID_TOKEN_RE.search(last).group(1)
+    pid = (pid_tok if (pid_tok.isascii() and pid_tok.isdigit()
+                       and len(pid_tok) <= 10) else "?")
+    tok = _RUNNER_RC_TOKEN_RE.search(last)
+    return pid, (tok.group(1) if tok else None)
 
 def parse_bound_line(text: str):
     """``(verdict, rc)`` from the LAST ``[lane-bound] VERDICT`` line, or ``("", None)``.
@@ -1129,22 +1318,38 @@ def parse_bound_line(text: str):
     # `VERDICT verdict=needs-review ... rc=0` parsed as `finished`, which is the
     # false-PASS class this axis exists to remove. An unrecognised final token is
     # "no verdict", never "the previous one".
-    last = None
-    for m in _bound_verdict_re().finditer(text):
-        last = m
-    if last is None:
+    #
+    # ⛔ THAT RULE IS ONLY TRUE IF THE *LINE* IS LOCATED, NOT THE TOKEN. Locating the
+    # last `verdict=<lowercase-token>` MATCH lets a final line the token regex cannot
+    # match — uppercase, empty, or spaced (`verdict = stalled`) — simply not exist, so
+    # an earlier `finished` is returned. Measured before this fix:
+    #   "…verdict=finished … rc=0\n…VERDICT verdict=FINISHED … rc=0" -> ('finished','0')
+    #   "…verdict=finished … rc=0\n…VERDICT tag=t pid=1 rc=0"     -> ('finished','0')
+    # Both are a stale false PASS. So: find the last MARKER, then read the token on
+    # that line, and an unreadable token there is NO VERDICT.
+    line = _last_bound_line(text)
+    if line is None:
         return "", None
-    verdict = last.group(1)
+    tok = _BOUND_TOKEN_RE.search(line) if globals().get("_BOUND_TOKEN_RE") else None
+    if tok is None:
+        # A FINAL marker whose token is missing/unparseable is "no verdict".
+        return "", None
+    verdict = tok.group(1)
     if verdict not in BOUND_VERDICTS:
         # An unrecognised FINAL token is "no verdict", never the previous one.
         return "", None
     # The `rc=` lives on the SAME line, before ` log=`. A missing/unparseable one is
     # None, which the verdict function turns into `finished-rc-unreadable`.
-    line_end = text.find("\n", last.start())
-    line = text[last.start(): line_end if line_end >= 0 else len(text)]
     head = line.split(" log=")[0]
     rcs = _bound_rc_re().findall(head)
-    return (verdict, rcs[-1] if rcs else None)
+    if rcs:
+        return (verdict, rcs[-1])
+    # ⛔ "NO `rc=`" AND "`rc=` PRESENT BUT UNREADABLE" ARE DIFFERENT FACTS. Collapsing
+    # them made the verdict publish "no rc= on the line" over a line that carried one
+    # (`rc=0x0`, a runaway token), and over a `--log-census` row that has no line at all.
+    # `"?"` is this module's existing "present but unusable" token (see `parse_bound_pid`);
+    # the verdict function words the two cases separately and never claims a line.
+    return (verdict, "?" if _bound_rc_present_re().search(head) else None)
 
 
 def parse_bound_pid(text: str):
@@ -1161,48 +1366,27 @@ def parse_bound_pid(text: str):
     """
     if not text:
         return ""
-    last = None
-    for m in _bound_verdict_re().finditer(text):
-        last = m
-    if last is None:
+    # The PID must come from the same LAST MARKER line `parse_bound_line` reads, or the
+    # two functions disagree about which line is "the line" (they did while each carried
+    # its own `last-match` loop — the defect `_bind_verdict` exists to prevent).
+    line = _last_bound_line(text)
+    if line is None:
         return ""
-    line_end = text.find("\n", last.start())
-    line = text[last.start(): line_end if line_end >= 0 else len(text)]
-    pid_head = line.split(" log=")[0]
-    pids = _bound_pid_re().findall(pid_head)
+    pids = _bound_pid_re().findall(line.split(" log=")[0])
     if not pids:
-        # ⛔ A `pid=` FIELD THAT IS PRESENT BUT UNPARSEABLE IS NOT AN ABSENT ONE (review P2).
-        # "Absent from the line" is the ADOPT row of the doc's binding table; "a pid that cannot
-        # be resolved" is the DROP row. This returned "" for both, so a line carrying `pid=abc`
-        # took the ADOPT arm and published a verdict whose binding was never checked.
-        #
-        # WHERE SUCH A LINE COMES FROM — stated narrowly, because the first version of this
-        # comment overclaimed it and a later reviewer falsified the claim. It is NOT the shipped
-        # writer: `lane-bound.sh --pid` takes the value verbatim (`:161`) but no emission path can
-        # carry a non-numeric one — `watch` mode refuses first (`:465` → `pid_alive`, whose
-        # `case "${1:-}" in *[!0-9]*) return 1` guard at `:234` has been on `main` since the bound
-        # was introduced) and `run` mode overwrites `PID=$!` (`:475`). Measured:
-        # `lane-bound.sh watch --log … --pid abc` → "refusing: --pid 'abc' is not a live
-        # process — nothing to bound", rc=2, nothing emitted. So the producers that reach this
-        # arm are a FOREIGN or hand-edited verdict file (`$log.lanebound`), a restored state dir,
-        # or a FUTURE producer — the same producer class this file names for every other hostile
-        # state value. That makes this defence in depth, not a live production bypass, and the
-        # guard is justified without the overclaim: the doc's binding table requires the DROP row
-        # for an unresolvable pid, and `_bind_verdict`'s `invalid-bound-verdict-pid` arm already
-        # existed for a non-pid token but was UNREACHABLE from this parser — which is what marks
-        # the intent. `"?"` reaches it.
-        # `\bpid=` does not match `ppid=` / `cpu_delta_cs=` (a word boundary needs a non-word
-        # char before `p`), so this only fires on a real `pid=` field.
-        if _bound_pid_field_re().search(pid_head):
-            return "?"
+        # The line names NO pid at all — the one shape that is adopted-and-declared.
         return ""
-    # A pid token is capped at 10 digits DEFENSIVELY, not because `PID_MAX_DEFAULT` (4194304)
-    # is 7 digits long. The cap exists so `int()` below never sees a 4300-digit token and
-    # raises "Exceeds the limit" — an exception is not a state. Any token longer than the cap
-    # is NOT a pid.
+    # A real pid is <= 7 digits (PID_MAX_DEFAULT 4194304), but the allow-list here is
+    # SLACK at 10 so that an over-long token can never reach `int()` — `int()` on a huge
+    # token raises "Exceeds the limit (4300 digits)", which is an exception and not a
+    # state. The same 10-digit bound is used by `parse_runner_line`, `_bind_verdict` and
+    # the census's `_pidtok`; a token that passes here but is not a live pid is dropped by
+    # `_pid_within`, so the slack is never adopted.
     # `"?"` marks "present but unusable", which the binding DROPS; `""` means "the line
-    # names no incarnation", which is ADOPTED and declared.
-    return pids[-1] if len(pids[-1]) <= 10 else "?"
+    # names no incarnation", which is ADOPTED and declared. The allow-list applies to the
+    # TOKEN, never to the locator, or every unusable form above would read as "absent".
+    tok = pids[-1]
+    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"
 
 
 def _pid_within(root: int, child: int, *, hops: int = 64):
@@ -1210,6 +1394,23 @@ def _pid_within(root: int, child: int, *, hops: int = 64):
 
     The ppid chain is read from ``/proc`` where it exists and from ``ps`` otherwise.
     ``None`` (unverifiable) is NOT "no": the caller decides, and it fails closed.
+
+    ⛔ LIMITATION, STATED BECAUSE IT IS LOAD-BEARING: the chain is read from the LIVE
+    process table, and a verdict is only *used* when ``alive is False`` — i.e. when the
+    tree has already EXITED. Measured: a real parent/child pair returns ``True`` while
+    both are alive and ``None`` immediately after they exit, and ``None`` DROPS the
+    verdict (``unbound-bound-verdict``). So after exit only EXACT PID EQUALITY (the
+    ``child == root`` short-circuit) survives, and a verdict naming a genuine
+    DESCENDANT of the queried pid degrades to ``no-verdict``. That direction is the
+    safe one (an abstention, never a false PASS) and it is why the doc's binding table
+    says row 2 holds only while the tree is live. ⛔ AND BARE EQUALITY IS NOT AN
+    INCARNATION FENCE: it proves a process with that PID NUMBER wrote the verdict, not that
+    THIS dispatch did, and `lane.sh` appends to one log file per lane number, so a recycled
+    pid can carry a previous dispatch's `finished`. The fix is an incarnation id (or
+    `pid_start=`) on the PRODUCED line, bound together with the pid — a producer change and
+    a separate one. The launcher's `pid=`-carrying `[timeout] agent` line is NOT it: it
+    carries the same bare pid and is consumed only for `runner_rc`. `docs/ops/fleet-liveness.md`
+    §13.4 states this as a named residual.
     """
     if child == root:
         return True
@@ -1242,7 +1443,11 @@ def _parent_of(pid: int):
                              timeout=30).stdout.decode("utf-8", "replace").strip()
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
-    return int(out) if out.isdigit() else None
+    # ⛔ `.isdigit()` admits non-ASCII digits and a 5000-digit run; `int()` raises on
+    # both, where this helper's contract is `None`. It reaches this on the BINDING path
+    # after the tree exits (`/proc` gone -> `ps`), i.e. exactly when a terminal state is
+    # being decided.
+    return (int(out) if (out.isascii() and out.isdigit() and len(out) <= 10) else None)
 
 
 def parse_bound_verdict(text: str) -> str:
@@ -1290,9 +1495,20 @@ class LogRead:
     alive: Optional[bool] = None        # process-tree existence: True/False/None
     verdict: str = ""               # BOUND_VERDICTS member, or ""
     rc: Optional[str] = None        # the bound's `rc=` on the same line: "0" | "na" | "7" …
+    # The LAUNCHER's own exit status for this lane (`[timeout] agent … rc=<n>`,
+    # `spawn-gate.sh`'s `[timeout] agent` line). REQUIRED to corroborate `rc=na`, which is
+    # `watch` mode's
+    # shape and carries NO completion fact (see `BOUND_OK_RC`).
+    runner_rc: Optional[str] = None
     verdict_line_pid: str = ""      # the `pid=` on that line — the verdict's own incarnation
     verdict_source: str = ""        # "log" | "verdict-file" | "caller" | ""
-    window_ms: int = LOG_WINDOW_MS
+    # ⛔ THE SAMPLE SPAN THE DELTAS WERE TAKEN OVER — and ``None`` is a REAL value:
+    # "this surface did not measure the window", which is the census's only honest
+    # answer (it takes its deltas from the caller). Rendering the module default here
+    # asserted a 30 s span the census never measured (review P1): measured,
+    # ``--log-census`` on a caller row published ``window_ms=30000`` while the caller
+    # had measured whatever it measured.
+    window_ms: Optional[int] = LOG_WINDOW_MS
     detail: str = ""
 
 
@@ -1341,8 +1557,10 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
     (a veto), then — only with both signals flat and the full window elapsed —
     ``frozen``. Every unreadable branch abstains. Nothing here can reach
     ``frozen`` without a LIVE tree, a STATED window, and ZERO progress on every
-    signal, and nothing can reach ``finished``/``no-verdict`` without positive
-    evidence that the tree is gone.
+    signal — the log silent for ``freeze_ms`` AND the sampled deltas flat over
+    ``window_ms``; the two durations differ and both are echoed in the detail —
+    and nothing can reach ``finished``/``no-verdict`` without positive evidence
+    that the tree is gone.
     """
     if lr is None:
         return Verdict("unknown", "no-log-read")
@@ -1360,6 +1578,39 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # from turning a future producer's new spelling into `dead/bound-verdict:<it>`.
         # `parse_bound_line` and the census seam both filter; this is the third door.
         verdict = lr.verdict if lr.verdict in BOUND_VERDICTS else ""
+        # ⛔ NORMALISE THE `rc` HERE, AT THE ONE DOOR. A `LogRead` can be built by a DIRECT
+        # caller — the reader §13.5 says is next — and an unreadable status must not become
+        # a fact: without this, `rc=0x0` published `no-verdict/bound-finished-rc:0x0`, the
+        # POSITIVE claim "the child did NOT complete" from nothing readable, and a runaway
+        # token was interpolated whole into `reason`. `parse_bound_line` applies the same
+        # 1-10-digit-or-`na` allow-list, and the census deliberately does NOT re-implement
+        # it (a second copy was tried and had to be reverted: it masked its own mutation,
+        # because either copy alone produced the identical observable state). One rule, one
+        # place. An unreadable status ABSTAINS.
+        rc = lr.rc
+        # `"?"` = the field was PRESENT and could not be read; `None` = it was ABSENT.
+        # Both ABSTAIN, but they are different diagnoses and the detail says which.
+        rc_unreadable = rc == "?"
+        if rc == "?":
+            rc = None
+        elif (rc is not None and rc != "na"
+                and not (rc.isascii() and rc.isdigit() and len(rc) <= 10)):
+            rc = None
+            rc_unreadable = True
+        # ⛔ THE SAME RULE FOR THE LAUNCHER'S STATUS, which is the *other* half of the same
+        # decision. `runner_rc` was consumed RAW: any non-None value that is not "0" was
+        # decoded as "the child did NOT complete" — so `0x0`, `exit:0`, a non-ASCII digit,
+        # `""` (the census's own "present but not read" shape) and a 400-digit token all
+        # published `no-verdict/bound-finished-runner-rc:<junk>`, interpolating the token
+        # whole into `reason`. The shipped producer is strict (`\brc=(\d{1,3})\b`), which is
+        # exactly why nothing caught it: the parser refuses those tokens, so only a DIRECT
+        # caller — the reader §13.5 says is next — reaches the door with one. The doc's
+        # matrix already promises `unknown` here.
+        runner_rc = lr.runner_rc
+        if (runner_rc is not None
+                and not (runner_rc.isascii() and runner_rc.isdigit()
+                         and len(runner_rc) <= 3)):
+            runner_rc = None
         if verdict:
             if verdict in BOUND_FINISHED:
                 # ⛔ `verdict=finished` ALONE IS NOT A COMPLETION — it means "no bound
@@ -1367,37 +1618,129 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                 # `lane-bound.sh run --log L -- sh -c 'exit 7'` → `verdict=finished rc=7`.
                 # Reading that as finished is a FALSE PASS over lost work: nobody
                 # re-dispatches it, and the lane's turn never completed.
-                if lr.rc is None:
+                if rc is None:
                     return Verdict("unknown", "finished-rc-unreadable",
-                                   detail="verdict=finished but no rc= on the line; "
-                                          "completion is undecidable")
-                if lr.rc not in BOUND_OK_RC:
-                    return Verdict("no-verdict", "bound-finished-rc:%s" % lr.rc,
-                                   detail=("verdict=finished rc=%s — the bound fired nothing, "
-                                           "but the turn did NOT complete" % lr.rc)
+                                   detail=("verdict=finished, but the `rc=` was PRESENT and "
+                                           "UNREADABLE, so completion is undecidable"
+                                           if rc_unreadable else
+                                           "verdict=finished and no readable `rc=` was "
+                                           "supplied, so completion is undecidable")
                                           + _also(lr.detail))
+                if rc == "na":
+                    # ⛔ `na` IS NOT COMPLETION — IT IS THE ABSENCE OF EXIT-STATUS
+                    # EVIDENCE. `lane-bound.sh watch` writes it UNCONDITIONALLY
+                    # (`lane-bound.sh`'s `V_RC=na`) and `watch` is what `spawn-gate.sh`'s
+                    # `run_agent` uses for EVERY lane/fixer/worker, so in the fleet's actual
+                    # population `finished` + `rc=na` is written by a lane that
+                    # COMPLETED and by a lane that CRASHED, was OOM-killed, or was
+                    # killed by the completion watchdog's 15 s TERM->KILL —
+                    # identically. Accepting `na` on its own made the `rc` conjunct
+                    # INERT for that whole population and published `finished` for a
+                    # crashed lane: the false PASS over lost work this conjunct exists
+                    # to remove.
+                    #
+                    # The real status IS in the same log, one line later, from the
+                    # caller: `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh`'s launcher
+                    # line).
+                    # Corroborate with it, and require it to describe THIS incarnation.
+                    if runner_rc is None:
+                        return Verdict("unknown", "finished-rc-uncorroborated",
+                                       detail=("verdict=finished rc=na and no CORROBORATING "
+                                               "launcher `rc=` reading; completion is "
+                                               "undecidable")
+                                              + _also(lr.detail))
+                    if runner_rc != "0":
+                        return Verdict("no-verdict", "bound-finished-runner-rc:%s" % runner_rc,
+                                       detail=("verdict=finished rc=na but the launcher "
+                                               "reported rc=%s — the bound fired nothing, "
+                                               "yet the child did NOT complete" % runner_rc)
+                                              + _also(lr.detail))
+                    return Verdict("finished", "bound-verdict:%s" % verdict,
+                                   detail=("verdict_source=%s rc=na runner_rc=0"
+                                           % (lr.verdict_source or "log"))
+                                          + _also(lr.detail))
+                if rc not in BOUND_OK_RC:
+                    return Verdict("no-verdict", "bound-finished-rc:%s" % rc,
+                                   detail=("verdict=finished rc=%s — the bound fired nothing, "
+                                           "but the turn did NOT complete" % rc)
+                                          + _also(lr.detail))
+                # ⛔ A NON-ZERO LAUNCHER `rc=` DEFEATS A CLEAN BOUND `rc=` TOO (review P1).
+                # The `na` arm above already corroborates against the launcher; this arm did
+                # not, so a bound line claiming `rc=0` published `finished` even when the
+                # CALLER — `spawn-gate.sh`, the process that actually reaped the child —
+                # reported a non-zero status. Measured before this guard:
+                # `LogRead(verdict="finished", rc="0", runner_rc="7")` -> `finished`.
+                # In WATCH mode (every lane/fixer/worker: `spawn-gate.sh`'s `run_agent`)
+                # `V_RC` is `na` unconditionally (`lane-bound.sh`), so `rc=0` reaches here
+                # only from `run` mode, a hand-edited `$log.lanebound`, or a foreign
+                # producer — exactly the population where a disagreement between the bound
+                # line and the caller's own line must resolve FAIL-CLOSED, not to success.
+                # §13.4 already stated this rule ("a `verdict=finished` whose `rc=` is
+                # non-zero, on the bound line or on the launcher line"); the code now
+                # implements it instead of the narrower bound-line-only reading.
+                if runner_rc is not None and runner_rc != "0":
+                    return Verdict("no-verdict", "bound-finished-runner-rc:%s" % runner_rc,
+                                   detail=("verdict=finished rc=%s but the launcher "
+                                           "reported rc=%s — the two disagree, so "
+                                           "completion is NOT established"
+                                           % (rc, runner_rc)) + _also(lr.detail))
                 return Verdict("finished", "bound-verdict:%s" % verdict,
                                detail=("verdict_source=%s rc=%s"
-                                       % (lr.verdict_source or "log", lr.rc))
+                                       % (lr.verdict_source or "log", rc))
                                       + _also(lr.detail))
             # `stalled` / `exceeded-wallclock` — the bound's own kill verdict. That is
             # REAL DEATH (mechanism 3), reported by the producer that caused it.
             return Verdict("dead", "bound-verdict:%s" % verdict,
                            detail=("verdict_source=%s rc=%s"
-                                   % (lr.verdict_source or "log", _n(lr.rc)))
+                                   % (lr.verdict_source or "log", _n(rc)))
+                                  + _also(lr.detail))
+        # ⛔ NO BOUND VERDICT IS **NOT** THE SAME FACT AS "NO EVIDENCE". The population
+        # that has no bound at all (`merge-one.sh`) still writes the launcher line, so
+        # when `runner_rc` was read we must report it rather than asserting the process
+        # "told us nothing". The state stays `no-verdict`: without a bound verdict we
+        # cannot assert the bound fired nothing, so a launcher `rc=0` is EVIDENCE, not a
+        # completion — promoting it to `finished` is a separate claim this axis does not
+        # make (docs §13.4, and the `finished` rule that a bound verdict is required).
+        if runner_rc is not None:
+            return Verdict("no-verdict", "process-gone-no-verdict",
+                           detail=("bytes=%s age_ms=%s (the process ended and wrote NO bound "
+                                   "verdict; the launcher reported rc=%s — so it did NOT "
+                                   "tell us nothing, but completion stays undecidable "
+                                   "without a bound verdict)"
+                                   % (_n(lr.size), _n(lr.age_ms), runner_rc))
                                   + _also(lr.detail))
         return Verdict("no-verdict", "process-gone-no-verdict",
-                       detail=("bytes=%s age_ms=%s (the process ended and told us nothing)"
+                       detail=("bytes=%s age_ms=%s (the process ended and wrote no verdict)"
                                % (_n(lr.size), _n(lr.age_ms)))
                               + ((" | " + lr.detail) if lr.detail else ""))
     if lr.alive is None:
         return Verdict("unknown", "process-identity-unreadable", detail=lr.detail)
 
     # (2) PROGRESS — a VETO. Either signal advancing is positive evidence of work.
+    #
+    # ⛔ THE TOLERANCE IS A RATE, NOT A FIXED DELTA. `cpu_tol_cs` is quoted for the
+    # `LOG_WINDOW_MS` sample span (10 cs / 30 s ~= 3.3 mCPU), but `--window-ms` is a
+    # caller-settable knob, so using the raw constant at any other window silently
+    # redefines the threshold: a lane burning ~1% of a core accumulates 5 cs in 5 s,
+    # which is BELOW 10 — so a LIVE, WORKING lane read `frozen/no-progress` for every
+    # `--window-ms` up to ~10 s. That is the `frozen`-on-a-working-lane class this axis
+    # exists to delete (§13.1 ranks it the ~50% false-negative), reachable by nothing
+    # more exotic than a diagnostic run that shortens the window for speed. Scaling the
+    # tolerance by the window restores the RATE the constant means:
+    #   delta_cs = f * span_s * 100, tol = rate * window_s * 100  =>  a lane at or above
+    #   the rated CPU rate reads `working` at EVERY window (span >= window, because the
+    #   second sample is taken after sleeping the window, so the scaling can only be
+    #   conservative). The `max(1, ...)` floor keeps a sub-`LOG_WINDOW_MS` window from
+    #   rounding the tolerance to 0 — which would make ANY CPU at all progress — while
+    #   still refusing to freeze a lane whose tree burns CPU at all.
+    eff_tol_cs = cpu_tol_cs
+    if lr.window_ms is not None and lr.window_ms > 0:
+        eff_tol_cs = max(1, (int(cpu_tol_cs) * int(lr.window_ms)) // LOG_WINDOW_MS)
+
     kinds = []
     if lr.size_delta is not None and lr.size_delta > 0:
         kinds.append("bytes")
-    if lr.cpu_delta_cs is not None and lr.cpu_delta_cs > cpu_tol_cs:
+    if lr.cpu_delta_cs is not None and lr.cpu_delta_cs > eff_tol_cs:
         kinds.append("cpu")
     if lr.transcript_grew is True:
         kinds.append("transcript")
@@ -1410,8 +1753,8 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         if "transcript" in kinds:
             numbers.append("transcript-grew")
         return Verdict("working", "progress:%s" % "+".join(kinds),
-                       detail="%s window_ms=%d tol_cs=%d"
-                              % (" ".join(numbers), lr.window_ms, cpu_tol_cs))
+                       detail="%s window_ms=%s tol_cs=%d"
+                              % (" ".join(numbers), _n(lr.window_ms), eff_tol_cs))
 
     # (3) ANY single signal that could not be read is an ABSTENTION — never "flat".
     # ⛔ THE CONJUNCT IS `or`, AND THAT IS THE WHOLE SAFETY PROPERTY. With `and`, a
@@ -1448,11 +1791,17 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # neighbouring branches both print their numbers.
         return Verdict("unknown", "no-progress-signal-readable",
                        detail=("bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s "
-                               "cpu_unreadable=%s window_ms=%d"
+                               "cpu_unreadable=%s window_ms=%s"
                                % (_n(lr.size_delta), _n(lr.transcript_grew),
                                   _n(lr.cpu_delta_cs), int(bool(lr.cpu_unreadable)),
-                                  lr.window_ms)) + _also(lr.detail))
-    if lr.age_ms is None:
+                                  _n(lr.window_ms))) + _also(lr.detail))
+    if lr.age_ms is None or lr.age_ms < 0:
+        # ⛔ A NEGATIVE AGE IS A BROKEN READING, NOT "less than the freeze window". The
+        # acquisition path clamps it (`max(0, …)`), so this is the census surface: with
+        # `age_ms < freeze_ms` read as "nothing is happening YET", a negative age published
+        # `working/within-window` and the freeze check could never fire — the identical rule
+        # this function already applies to the two deltas (a stable log cannot lose bytes or
+        # CPU), and the row printed its own contradicting evidence beside `freeze_ms=`.
         return Verdict("unknown", "log-age-unreadable", detail=lr.detail)
 
     # (4) Both signals flat. Inside the window the lane is still working — a
@@ -1463,16 +1812,18 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         # the sample span the deltas were taken over. One name for two numbers made a
         # machine reader unable to tell which it had received.
         return Verdict("working", "within-window",
-                       detail="bytes_delta=%s cpu_delta_cs=%s age_ms=%d freeze_ms=%d window_ms=%d"
+                       detail="bytes_delta=%s cpu_delta_cs=%s age_ms=%d freeze_ms=%d window_ms=%s"
                               % (_n(lr.size_delta), _n(lr.cpu_delta_cs), lr.age_ms, freeze_ms,
-                                 lr.window_ms))
+                                 _n(lr.window_ms)))
 
-    # (5) FROZEN — live tree, ZERO progress on every signal, full window elapsed.
+    # (5) FROZEN — live tree, ZERO progress on every signal: the log silent for the full
+    # freeze window AND the sampled deltas flat over the sample window. The two durations
+    # differ on purpose (§13.3 states the weaker evidence duration and its consequence).
     return Verdict("frozen", "no-progress",
                    detail="bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s tol_cs=%d "
-                          "age_ms=%d freeze_ms=%d window_ms=%d"
+                          "age_ms=%d freeze_ms=%d window_ms=%s"
                           % (_n(lr.size_delta), _n(lr.transcript_grew), _n(lr.cpu_delta_cs),
-                             cpu_tol_cs, lr.age_ms, freeze_ms, lr.window_ms))
+                             eff_tol_cs, lr.age_ms, freeze_ms, _n(lr.window_ms)))
 
 
 def _n(v) -> str:
@@ -1502,7 +1853,7 @@ def evaluate(ev: Evidence) -> Verdict:
         # evidence in the same query means the caller has a second axis's answer in
         # hand, and resolving silently to the log axis would DISCARD it — the
         # #1777 B7 shape. Naming the refusal beats picking a winner.
-        # ⛔ AN ABSTENTION IS EVIDENCE TOO (T50). `ps_ok`/`store_ok` are the session
+        # ⛔ AN ABSTENTION IS EVIDENCE TOO (T55). `ps_ok`/`store_ok` are the session
         # axis answering `unknown/ps-unreadable` / `unknown/store-unreadable`. This
         # guard once listed only the POSITIVE session fields, so a log read resolved
         # over a FAILED read — and a `frozen` log read then CONVICTED a lane on
@@ -2198,7 +2549,22 @@ def gather(
     )
 
 
-def _proc_cpu_cs(root: str = "/proc") -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
+PROC_ROOT = "/proc"
+
+
+class _ProcUnreadable(Exception):
+    """A ``PROC_ROOT`` entry was PRESENT but could not be read or parsed.
+
+    ⛔ THIS IS NOT "this host has no procfs". That is a plain ``None`` (macOS) and it
+    DOES fall back to ``ps``. Falling back here would be wrong: ``ps`` reads the SAME
+    rows through a coarser lens (whole seconds), so a member this reader could not see
+    is one ``ps`` cannot see either — it would return a SHORT total, and a short total
+    is how a busy tree reads flat → ``frozen``. So this is an exception, and the caller
+    abstains for the whole read.
+    """
+
+
+def _proc_cpu_cs(root: str = PROC_ROOT) -> Optional[Dict[int, Tuple[int, Optional[int]]]]:
     """``{pid: (ppid, cpu_cs)}`` read from ``/proc`` at ``SC_CLK_TCK`` resolution.
 
     ⛔ WHY NOT JUST ``ps -o time=``: **GNU procps prints whole seconds only.**
@@ -2210,35 +2576,60 @@ def _proc_cpu_cs(root: str = "/proc") -> Optional[Dict[int, Tuple[int, Optional[
     ``utime``+``stime`` in clock ticks (``SC_CLK_TCK`` = 100 Hz on every Linux these
     cells run), i.e. true centiseconds, which is the resolution this axis claims.
 
-    Returns ``None`` when ``/proc`` is not readable (macOS) so the caller falls back
-    to ``ps``; a pid that vanishes mid-walk is simply absent (it is gone).
+    Returns ``None`` when there is NO procfs to read (macOS), so the caller falls back
+    to ``ps``; a pid that vanishes mid-walk is simply absent (it is gone). ⛔ A member
+    that is present but unreadable or unparseable RAISES ``_ProcUnreadable`` instead —
+    see that class for why a fallback is the wrong answer there.
 
-    ``root`` is injectable ONLY so the malformed-row arm below can be driven from a
-    synthetic tree: ``/proc`` does not exist on the Mac, so without a seam that arm had
-    no test at all and it shipped encoding an unreadable row as ``(0, None)``.
+    ``root`` is a seam (the same pattern ``successor_preflight.py`` ships as
+    ``DEFAULT_PROC_ROOT``): a fixture directory lets the reader's failure polarity be
+    EXECUTED rather than asserted, which is how the shrink below went unnoticed.
     """
+    root = root or PROC_ROOT
     try:
         names = os.listdir(root)
     except (OSError, ValueError):
         return None
     out: Dict[int, Tuple[int, Optional[int]]] = {}
     for name in names:
-        if not name.isdigit():
+        # ⛔ `str.isdigit()` IS NOT A PID TEST. It is TRUE for non-ASCII digits (`\u00b2`,
+        # `\u0663`, …) that `int()` REJECTS — and the `int(name)` below sits OUTSIDE both
+        # try blocks, so such a name raised `ValueError` straight out of
+        # `subtree_cpu_cs` where the contract is "``None`` on any unreadable read". This is
+        # the same class #3449 files for three pre-existing sites; the allow-list here is
+        # the one the module's other pid parsers already use, so `int(name)` is safe by
+        # construction rather than by luck.
+        if not (name.isascii() and name.isdigit() and len(name) <= 10):
             continue
         try:
             raw = open(os.path.join(root, name, "stat"), "rb").read().decode("utf-8", "replace")
-        except (OSError, ValueError):
+        except FileNotFoundError:
+            # The pid VANISHED between `listdir` and the read: it is genuinely GONE, so it
+            # is absent from the tree — the same fact the `ps` path gets when a row is
+            # simply not there. (A child that exits mid-window loses its accumulated CPU
+            # on both paths; that race is inherent to sampling, not a shrink we created.)
             continue
+        except ProcessLookupError:
+            # ⛔ THE SAME FACT ONE SYSCALL LATER. `open()` succeeds while the pid exists,
+            # then `.read()` returns ESRCH because it exited in between — "genuinely gone",
+            # exactly what the arm above says. Without this arm it fell into the generic
+            # `OSError` clause and abstained the WHOLE reading, so an unrelated short-lived
+            # process exiting made this lane's CPU signal unreadable (measured 1 in 200
+            # full walks under a fork storm, mean walk 23.8 ms).
+            continue
+        except (OSError, ValueError):
+            # ⛔ PRESENT BUT UNREADABLE IS NOT ABSENT. `_sum_subtree` promises ``None`` when
+            # ANY member is unread, and the `ps` path returns ``None`` for a malformed row
+            # for exactly this reason: dropping the row makes the total SMALLER, and a
+            # smaller total is how a busy tree reads FLAT → ``frozen`` — the false
+            # negative this axis exists to remove. Abstain the whole read.
+            raise _ProcUnreadable("unreadable %s/%s/stat" % (root, name))
         # `comm` may contain spaces and parentheses: split on the LAST ')'
         close = raw.rfind(")")
         if close < 0:
-            # ⛔ A ROW WITH NO `)` IS MALFORMED, NOT VANISHED (review P2, same rule as the
-            # parse arm below). `open()` succeeded, so the pid still existed when it was
-            # read; the content simply is not a `stat` line. Skipping it drops its CPU from
-            # the total — a SMALLER total, which reads as flat and then `frozen`. A process
-            # that truly vanished is the `OSError` arm above, which is the only arm here
-            # that is allowed to `continue`.
-            return None
+            # A stat line with no `)` cannot be parsed and cannot be attributed to a
+            # subtree — the same abstention as an unreadable row, never a silent skip.
+            raise _ProcUnreadable("unparseable %s/%s/stat" % (root, name))
         rest = raw[close + 2:].split()
         # rest[0] = state (field 3), so field N is rest[N-3]
         try:
@@ -2246,16 +2637,13 @@ def _proc_cpu_cs(root: str = "/proc") -> Optional[Dict[int, Tuple[int, Optional[
             utime = int(rest[11])         # field 14
             stime = int(rest[12])         # field 15
         except (IndexError, ValueError):
-            # ⛔ AN UNPARSEABLE ROW ABSTAINS THE WHOLE READ — IT IS NOT ENCODED AS `(0, None)`
-            # (review P2). `(0, …)` re-parents the pid to 0, so the walk from our root NEVER
-            # REACHES IT: `kids[root]` does not contain it, `cpu.get(p) is None` never fires, and
-            # its CPU silently leaves the total — a SMALLER total, which is exactly how a busy
-            # tree reads flat and then `frozen`, the failure `_sum_subtree`'s docstring forbids.
-            # Encoding it also orphans its own descendants, which hang off a pid nobody visits.
-            # The `ps` arm below already does the right thing for this same shape (`return None`
-            # on `len(parts) < 3`); this arm now matches it instead of being the one path that
-            # turns an unread member into a missing one.
-            return None
+            # ⛔ THE SAME RULE ONE BRANCH DOWN, and this one was still shrinking. Storing
+            # the row as ``(0, None)`` REWRITES its ppid to 0: that detaches the pid AND
+            # its whole subtree from the walk (`kids` hangs off the original parent), and
+            # its ``cpu=None`` can never be reached because `_sum_subtree` only abstains
+            # for members it VISITS. Measured: a tree ``500 → 600 (truncated) → 700``
+            # returned ``3`` instead of abstaining — a busy tree reading flat.
+            raise _ProcUnreadable("truncated %s/%s/stat" % (root, name))
         out[int(name)] = (ppid, (utime + stime) * 100 // _CLK_TCK)
     return out or None
 
@@ -2272,7 +2660,8 @@ def _clk_tck() -> int:
 _CLK_TCK = _clk_tck()
 
 
-def subtree_cpu_cs(pid: int, *, ps_bin: Optional[str] = None) -> Optional[int]:
+def subtree_cpu_cs(pid: int, *, ps_bin: Optional[str] = None,
+                   proc_root: Optional[str] = None) -> Optional[int]:
     """Cumulative CPU of ``pid`` **and every descendant**, in centiseconds.
 
     S2 of the progress contract. ``None`` on any unreadable read — an unread
@@ -2291,7 +2680,14 @@ def subtree_cpu_cs(pid: int, *, ps_bin: Optional[str] = None) -> Optional[int]:
     """
     # Linux: /proc, at real centisecond resolution. BSD/macOS has no /proc, so the
     # `ps` walk below is the fallback (there `time=` carries `.cc`).
-    proc = _proc_cpu_cs() if ps_bin is None else None
+    #
+    # ⛔ AN UNREADABLE `/proc` MEMBER IS NOT "NO /proc". Only the latter falls back: `ps`
+    # reads the same rows more coarsely, so falling back on an unread member would
+    # return a SHORT total and the tree would read flat. Abstain instead.
+    try:
+        proc = _proc_cpu_cs(proc_root or PROC_ROOT) if ps_bin is None else None
+    except _ProcUnreadable:
+        return None
     if proc is not None:
         return _sum_subtree(pid, {p: v[0] for p, v in proc.items()},
                             {p: v[1] for p, v in proc.items()})
@@ -2371,6 +2767,8 @@ def _cpu_time_cs(text: str) -> Optional[int]:
         d, _, body = body.partition("-")
         if not (d.isascii() and d.isdigit()):
             return None
+        if not (d.isascii() and d.isdigit() and len(d) <= 6):
+            return None
         days = int(d)
     frac = 0
     if "." in body:
@@ -2382,7 +2780,13 @@ def _cpu_time_cs(text: str) -> Optional[int]:
     # `.isdigit()` admits non-ASCII digits (`\u00b2`), which `int()` then REJECTS —
     # so the guard passed and the parse raised, where this function's contract is
     # `None` on an unreadable read (and `subtree_cpu_cs` promises the same).
-    if not 1 <= len(fields) <= 3 or not all(f.isascii() and f.isdigit() for f in fields):
+    # ⛔ A DIGIT RUN LONGER THAN THIS IS NOT A TIME. `.isdigit()` admits 5000 digits, and
+    # `int()` then raises "Exceeds the limit (4300 digits)" — where this function's
+    # contract, and `subtree_cpu_cs`'s, is `None` on an unreadable read. `a63acffd` closed
+    # the non-ASCII-digit door here and left the length hazard open; a `time=` field can
+    # never legitimately exceed 6 digits in any component.
+    if (not 1 <= len(fields) <= 3
+            or not all(f.isascii() and f.isdigit() and len(f) <= 6 for f in fields)):
         return None
     vals = [int(f) for f in fields]
     if len(vals) == 1:
@@ -2447,9 +2851,29 @@ def gather_log_lane(
             lr.readable = False
             lr.detail = "not-a-regular-file:%s mode=%o" % (log_path, st.st_mode)
         else:
-            lr.readable = True
-            lr.size = int(st.st_size)
-            lr.age_ms = max(0, int(now - st.st_mtime * 1000))
+            # ⛔ A REGULAR FILE THAT STATS FINE IS STILL NOT A READABLE LOG. `S_ISREG`
+            # says what the inode IS, never that we may READ it — a mode-000 file (or one
+            # under a directory we cannot traverse, or an EACCES/EPERM mount) stats,
+            # reports a size, and yields no bytes. Deciding `readable` from `stat` alone
+            # made that case publish `frozen/no-progress` with `bytes_delta=0`: the byte
+            # channel was NEVER READ (`_log_tail` swallows the OSError and returns ""),
+            # so an unread channel was published as a positively FLAT one — the exact
+            # "an unread value is not zero" rule this module applies to a negative CPU
+            # delta and to an unread CPU channel, and the exact failure the comment above
+            # describes for a directory. Measured at mode 000: `frozen/no-progress
+            # bytes_delta=0 ... cpu_delta_cs=0` on a file that was never opened.
+            # The READABILITY CLAIM IS THEREFORE PROVED WITH THE READ IT DEPENDS ON —
+            # one open, closed immediately; the size channel still comes from `stat`.
+            try:
+                with open(log_path, "rb"):
+                    pass
+            except OSError as exc:
+                lr.readable = False
+                lr.detail = "unreadable:%s (%s)" % (log_path, exc.__class__.__name__)
+            else:
+                lr.readable = True
+                lr.size = int(st.st_size)
+                lr.age_ms = max(0, int(now - st.st_mtime * 1000))
 
     # The verdict the supervisor writes. The FILE is preferred (it is the
     # programmatic surface); the log's own tail is the fallback, because a lane
@@ -2508,7 +2932,56 @@ def gather_log_lane(
             lr.detail = " | ".join(x for x in (lr.detail, note) if x)
         if why:
             lr.detail = " | ".join(x for x in (lr.detail, why) if x)
-            lr.verdict, lr.rc = "", None
+            # ⛔ CLEAR THE INCARNATION WITH THE VERDICT. Dropping a stale/unbound bound
+            # verdict but KEEPING its `verdict_line_pid` leaves the launcher block below
+            # binding to the incarnation we just refused: measured, a log holding
+            # dispatch 1's `pid=<A> rc=na` + its own `[timeout] agent pid=<A> … rc=0`
+            # and then dispatch 2's header — queried as `<B>` — dropped the verdict and
+            # still adopted `runner_rc=0` from `<A>`, publishing "the launcher reported
+            # rc=0" for a lane that had said nothing. With the pid cleared, an unadopted
+            # incarnation can only fall through to `runner_pid == str(pid)`, which is the
+            # queried lane — over-refusal is the safe direction here.
+            lr.verdict, lr.rc, lr.verdict_line_pid = "", None, ""
+
+    # ⛔ READ THE LAUNCHER'S OWN LINE FOR **EVERY READABLE LOG** — NOT ONLY FOR `rc=na`.
+    # `na` is `watch` mode's unconditional shape (`lane-bound.sh`'s `V_RC=na`) and the
+    # fleet ALWAYS uses `watch` (`spawn-gate.sh`'s `run_agent`), so it carries no
+    # completion fact — see `BOUND_OK_RC`. The child's real status is written to the SAME
+    # log by the caller as `[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh`'s launcher
+    # line). Accept it only when it names THIS lane's incarnation — a leftover line from
+    # an earlier dispatch appended to the same log is not this lane's exit status.
+    #
+    # ⛔ AND NOT ONLY WHEN A BOUND VERDICT EXISTS. `merge-one.sh`'s reviewer run is its OWN
+    # plain sleep watchdog that never invokes `lane-bound.sh` (stated in that file's own
+    # correction comment), so it writes the launcher line and NO bound line — and
+    # `merge-one.sh` is named in this axis's population (docs §13, first paragraph).
+    # Gating on `rc == "na"` discarded exactly that witness, so a finished reviewer run
+    # published `no-verdict/process-gone-no-verdict` with the detail "the process ended and
+    # told us nothing" while the log plainly said `rc=0`. Reading it always costs one
+    # `_log_tail` on a path that has already decided the tree is gone.
+    if lr.readable:
+        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))
+        if runner_pid == "?":
+            # The launcher line EXISTS but names no usable pid, so it can never be bound
+            # to this incarnation — say so, rather than implying there is no line.
+            lr.detail = " | ".join(x for x in (
+                lr.detail, "runner-pid-unreadable runner_pid=?") if x)
+        elif runner_pid and runner_rc is None:
+            # A launcher line IS present but its status is unreadable: name THAT fact, not
+            # the absence of the line. The state is the same (no witness -> abstain), but
+            # the detail is what a reader diagnoses from.
+            lr.detail = " | ".join(x for x in (
+                lr.detail, "runner-rc-unreadable runner_pid=%s" % runner_pid) if x)
+        elif runner_rc is not None:
+            same_incarnation = ((runner_pid == lr.verdict_line_pid)
+                                if lr.verdict_line_pid else (runner_pid == str(pid)))
+            if same_incarnation:
+                lr.runner_rc = runner_rc
+            else:
+                lr.detail = " | ".join(x for x in (
+                    lr.detail,
+                    "runner-rc-unbound bound_pid=%s runner_pid=%s"
+                    % (lr.verdict_line_pid or "?", runner_pid)) if x)
 
     # S2, reading 1.
     cpu0 = subtree_cpu_cs(pid)
@@ -2518,9 +2991,18 @@ def gather_log_lane(
     # S1b, reading 1 — the transcript's size, when the lane HAS one.
     tsize0 = _size_or_none(transcript) if transcript else None
 
+    # ⛔ THE SPAN IS MEASURED, NOT ASSUMED. `window_ms` is the window the caller ASKED for;
+    # the walk of the process tree plus the sleep means the two deltas are actually taken
+    # over a longer stretch. Echoing the requested number as `window_ms=` (and, since the
+    # tolerance is a RATE, scaling by it) would under-report the span that was really
+    # sampled — the same "a number that names a different quantity" defect `freeze_ms=` /
+    # `window_ms=` were split to fix. So the span is taken from the clock and becomes the
+    # `window_ms` every later reader sees.
+    span_start = time.time()
     if sample and lr.readable:
         (sleep_fn or time.sleep)(max(0.0, window_ms / 1000.0))
         cpu1 = subtree_cpu_cs(pid)
+        lr.window_ms = max(1, int(round((time.time() - span_start) * 1000)))
         if cpu0 is None or cpu1 is None:
             lr.cpu_unreadable = True
             lr.cpu_delta_cs = None
@@ -2642,6 +3124,7 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
     log = pid = vfile = transcript = None
     start_seconds = None
     window_ms = LOG_WINDOW_MS
+    window_ms_set = False
     sample = True
     as_json = False
     census = False
@@ -2674,9 +3157,13 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             except ValueError:
                 print("liveness.py: --window-ms must be an integer", file=sys.stderr)
                 return 2
+            window_ms_set = True
             # ⛔ A ZERO-LENGTH WINDOW CANNOT PRODUCE A DELTA. It collapses both readings
             # into one instant, so both progress signals are trivially flat and a LIVE,
-            # working lane reads `frozen` — measured end to end with a CPU burner.
+            # working lane reads `frozen` — measured end to end with a CPU burner. This
+            # refusal covers ONLY the undefined 0: every window >= 1 is legitimate because
+            # `log_lane_verdict` scales the CPU tolerance by the window it measured
+            # (T56) — a fixed tolerance froze a working lane at every window under ~10 s.
             if window_ms < 1:
                 print("liveness.py: --window-ms must be >= 1 (a zero-length window cannot "
                       "produce a delta)", file=sys.stderr)
@@ -2692,9 +3179,27 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
         return 2
 
     if census:
-        if log or pid is not None:
-            print("liveness.py: --log-census reads its lanes from stdin; "
-                  "do not also pass --log/--pid", file=sys.stderr)
+        # ⛔ REFUSE, RATHER THAN SILENTLY DROP, EVERY PER-LANE FLAG. `--log`/`--pid` were
+        # already refused by name; `--verdict-file`, `--transcript`, `--start-seconds` and
+        # `--json` were ACCEPTED AND IGNORED. That is not harmless: measured with a valid
+        # `$log.lanebound`, the single-lane arm publishes `finished` for the same file the
+        # census then publishes as `no-verdict / process-gone-no-verdict` — "the lane told
+        # us nothing" for a lane that finished, which is the §13.1 false-negative class —
+        # and `--json` silently changed nothing about the TSV output. Both exited 0, so no
+        # caller could tell it had been ignored. A refusal is consistent with the surface's
+        # own contract (it reads lanes AND their evidence from stdin).
+        # ⛔ `--window-ms` IS REFUSED FOR A STRONGER REASON THAN THE OTHERS (review P1). It is
+        # not merely inert: the census takes its DELTAS from the caller (`?` = unread), so it
+        # never measures over a window at all, yet it interpolated this value into every row's
+        # `detail` as `window_ms=`. Measured: `--log-census --window-ms 5` on a caller row with
+        # `age_ms=3000000` published `window_ms=5`, telling a reader the flat deltas were
+        # measured over 5 ms when the caller measured them over its own window. A lying
+        # diagnostic is worse than a dropped flag, so this one is refused too.
+        if (log or pid is not None or vfile or transcript or start_seconds is not None
+                or as_json or not sample or window_ms_set):
+            print("liveness.py: --log-census reads its lanes and their evidence from stdin; "
+                  "do not also pass --log/--pid/--verdict-file/--transcript/"
+                  "--start-seconds/--json/--no-sample/--window-ms", file=sys.stderr)
             return 2
         rc = 0
         for line in sys.stdin:
@@ -2709,11 +3214,21 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # manufacture "the process is gone" and publish `no-verdict` over a live
             # lane. Anything outside the allow-lists is `None` = NOT READ = abstain,
             # which is the whole doctrine. `?` (and an absent field) is NOT 0 either.
-            def _opt(idx):
+            def _opt(idx, maxdigits=10):
+                # ⛔ A TOKEN LONGER THAN `maxdigits` IS NOT A READING. `int()` accepts a
+                # 40-digit value happily, so an out-of-range cell became a STATE and was
+                # interpolated whole: `size_delta=9…` published `working/progress:bytes`,
+                # and a 40-digit `age_ms` published `frozen/no-progress`. Every other token
+                # on this axis is bounded exactly this way; a byte delta, a CPU delta and
+                # an mtime age all fit in 10 digits by many orders of magnitude.
                 if idx >= len(f) or f[idx] in ("", "?"):
                     return None
+                tok = f[idx].strip()
+                body = tok[1:] if tok.startswith("-") else tok
+                if not (body.isascii() and body.isdigit() and len(body) <= maxdigits):
+                    return None
                 try:
-                    return int(f[idx])
+                    return int(tok)
                 except ValueError:
                     return None
 
@@ -2732,27 +3247,51 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             # IS NOT. The census's own "not read" token is `?`, so a row whose pid column
             # was `?` aborted the WHOLE run with a traceback after printing only the rows
             # before it (measured: `?\t<log>\t0\t?\tfinished\t...` -> ValueError, rc=1).
-            def _num(idx):
-                # ⛔ "PRESENT BUT UNUSABLE" IS NOT "ABSENT" (cycle-6 review, P2). This used to
-                # return "" for BOTH, so a census row whose column 11 was the documented
-                # not-read token `?` fell through to the `else` arm below — the one the comment
-                # labels "Column 11 absent" — and the verdict was ADOPTED with
-                # `bound-verdict-without-pid`, claiming a binding the row never carried. The
-                # doc's binding table says the opposite (`docs/ops/fleet-liveness.md`: "a pid
-                # that cannot be resolved | unbound-bound-verdict | dropped → no-verdict", and
-                # the same five rules apply to column 11), and `_bind_verdict` already encodes
-                # it for `--verdict-file`. So the unresolvable token is reported as `?` and the
-                # ONE binding implementation decides — the two paths cannot drift again.
-                tok = f[idx].strip() if idx < len(f) else ""
-                if not tok:
-                    return ""
-                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"
+            def _pidtok(tok):
+                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10
+                        else "")
 
-            verdict_pid = _num(10)
+            def _num(idx):
+                return _pidtok(f[idx].strip() if idx < len(f) else "")
+
+            def _pidcol(idx):
+                # ⛔ "" IS "COLUMN ABSENT"; "?" IS "PRESENT BUT UNUSABLE". Collapsing
+                # the two (`_num` did) made a PRESENT-but-unreadable column 11 fall into
+                # the `else:` arm below — the one that ADOPTS an unbound verdict and says
+                # so — so a caller following the census's own documented "NOT READ"
+                # convention (`?`) had a previous dispatch's `finished` published, while
+                # `gather_log_lane` DROPPED the identical token. Same rule, same three
+                # outcomes, or the seam is the fail-open door.
+                if idx >= len(f):
+                    return ""
+                return _pidtok(f[idx].strip()) or "?"
+
+            verdict_pid = _pidcol(10)
             row_pid = _num(0)
             path = f[1] if len(f) > 1 else ""
-            lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=_opt(3),
-                         window_ms=window_ms, verdict=verdict,
+            # ⛔ THE CENSUS OWNS NO WINDOW AND MUST NOT NAME ONE (review P1). Its deltas
+            # come from the caller (column 3/4), so `window_ms` is passed as ``None`` —
+            # "not measured here" — rather than the module default, which told a reader
+            # the flat deltas spanned 30 s when the caller measured them over its own.
+            # ⛔ AND AN UNREAD CPU IS `cpu_unreadable=1`, NOT `0` (review P2). Column 4
+            # is `?` for NOT READ, which IS the unread case; leaving the flag at its
+            # `False` default made one detail line assert both "the CPU channel was not
+            # read" and "the CPU channel was not unread". A NEGATIVE delta is the same
+            # fact one branch over — the acquisition path normalises it to
+            # `cpu_unreadable=True` + `cpu_delta_cs=None` for exactly this reason — so the
+            # census marks it too rather than abstaining on a reading it reports as fine.
+            cpu_delta = _opt(3)
+            lr = LogRead(path=path, size_delta=_opt(2), cpu_delta_cs=cpu_delta,
+                         cpu_unreadable=(cpu_delta is None or cpu_delta < 0),
+                         window_ms=None, verdict=verdict,
+                         # ⛔ THE `rc` ALLOW-LIST IS NOT RE-IMPLEMENTED HERE. It lives
+                         # at ONE door — `log_lane_verdict`, which normalises an
+                         # unreadable status to `None` -> `finished-rc-unreadable`
+                         # -> `unknown` — so this seam cannot decide a state the
+                         # verdict function would not. A second copy here would be
+                         # the second implementation of one rule (and it was: it
+                         # masked its own mutation, because either copy alone
+                         # produced the same observable state).
                          rc=(f[9] if len(f) > 9 and f[9] not in ("", "?") else None),
                          verdict_line_pid=verdict_pid,
                          verdict_source="caller" if verdict else "")
@@ -2803,8 +3342,20 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
                     lr.detail = "unreadable:%s (%s)" % (path, exc.__class__.__name__)
                 else:
                     if stat.S_ISREG(st.st_mode):
-                        lr.readable = True
-                        lr.present = True
+                        # ⛔ THE SAME READ PROOF AS `gather_log_lane`: a regular file that
+                        # cannot be OPENED is not a readable log, and `readable=True` on it
+                        # publishes an unread byte channel as a flat one (mode 000 measured
+                        # as `frozen/no-progress`). One open per row; no read.
+                        try:
+                            with open(path, "rb"):
+                                pass
+                        except OSError as exc:
+                            lr.readable = False
+                            lr.present = True
+                            lr.detail = "unreadable:%s (%s)" % (path, exc.__class__.__name__)
+                        else:
+                            lr.readable = True
+                            lr.present = True
                     else:
                         lr.readable = False
                         lr.present = True

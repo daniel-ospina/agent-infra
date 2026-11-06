@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-Fifty-one tests with seventy-two paired mutations: every mutation re-
+57 tests with 112 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
-evidence mechanical. Seven (#1254) pin the TURN-BOUNDARY rule:
+evidence mechanical. (These numbers are the measured ones, and they are DIGITS so
+that `check_header_counts()` can hold every occurrence to the suite: the opening
+sentence above, and the two command examples below. A count in a verification
+artifact is a claim like any other.)
+Seven of them pin the #1254 TURN-BOUNDARY rule:
 ``wedged`` requires positive evidence of an OPEN turn, so a turn-ended lane
 is never a stall and a frozen lane with an unreadable boundary abstains. Two
 more close cycle-1 review findings on that rule: a message carrying tool calls
@@ -17,8 +21,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 51 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (72)
+    python3 tools/fleet/liveness.test.py                # the 57 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (112)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1446,14 +1450,25 @@ def t24_length_truncated_call_is_not_a_tool():
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# THE LOG-LANE AXIS (T32–T51) — a lane that writes a log and no transcript
+# THE LOG-LANE AXIS (T32–T55) — a lane that writes a log and no transcript
 # ══════════════════════════════════════════════════════════════════════════
-# 20 tests, in the same groups the §13 regression contract states (keep the two
+# 24 tests, in the same groups the §13 regression contract states (keep the two
 # in step — a banner naming only T32–T38 told a reader the axis was 7 tests and
 # left T43–T51 covered by nothing the owning section named):
 #   T32–T38 VERDICT · T39–T42 ACQUISITION · T43–T44 BINDING · T45–T46 drop-reason
-#   + census binding · T47–T49 broken readings + fact-naming · T50 the
-#   abstention-masking refusal · T51 the `/proc` reader's own abstention.
+#   + census binding · T47–T49 broken readings + fact-naming · T50–T52 the
+#   corroboration and no-verdict population · T53–T54 the `/proc` reader's own
+#   abstentions · T55 the abstention-masking refusal.
+#
+# ⛔ THIS BANNER IS AN INDEX, SO IT IS PINNED BY THE TESTS IT NAMES. It carried the
+# PRE-REASSIGNMENT map for a round (`T32–T51`, `20 tests`, "T50 the
+# abstention-masking refusal · T51 the /proc reader's own abstention") after the
+# #3404 train rebase moved those behaviours to T54/T55 — and it pointed the reader
+# at T50, which is the `LOG_STATES` vocabulary pin and stays GREEN when the masking
+# guard is deleted. A stale index is how the guard shipped unpinned in the first
+# place, so the ids here are the measured ones: T50 = LOG_STATES vocabulary, T51 =
+# `gather_log_lane`'s `rc=na` witness, T52 = the no-bound-verdict population,
+# T53 = `_sum_subtree`, T54 = the `/proc` reader, T55 = the masking refusal.
 #
 # These are the MUTATION tests the 2026-11-03 measurement demands. Each one is
 # stated so that it FAILS against the pre-fix behaviour (for the VERDICT group
@@ -1495,7 +1510,7 @@ def t33():
               "an exited process that told us nothing reads `no-verdict`, got %s (age %d)"
               % (v.state, age))
         check(v.state != "frozen", "an exited process is TERMINAL, never frozen")
-        check("the process ended and told us nothing" in v.detail,
+        check("the process ended and wrote no verdict" in v.detail,
               "the detail says what happened; got %r" % v.detail)
     # And it is the SAME answer through the dispatcher a consumer calls.
     v = liv.evaluate(liv.Evidence(log_read=LR(alive=False, verdict="")))
@@ -1596,11 +1611,49 @@ def t37():
     check(liv.parse_bound_line(line + "\n[lane-bound] VERDICT verdict=needs-review tag=t rc=0\n")
           == ("", None),
           "an unrecognised FINAL token is no-verdict, never the previous verdict")
+    # ⛔ …AND THE *LINE* MUST BE LOCATED, NOT THE TOKEN. A final marker whose token the
+    # token regex cannot match (uppercase, absent, or spaced) is still the FINAL LINE, so
+    # it must yield NO VERDICT — not silently promote the previous `finished`. Measured
+    # before this fix: all three cases below returned ('finished', '0').
+    for final in ("[lane-bound] VERDICT verdict=FINISHED tag=t pid=7 rc=0",
+                  "[lane-bound] VERDICT tag=t pid=7 rc=0",
+                  "[lane-bound] VERDICT verdict = stalled tag=t pid=7 rc=0"):
+        check(liv.parse_bound_line(line + "\n" + final + "\n") == ("", None),
+              "an unmatchable FINAL marker is no-verdict, never the previous one: %r" % final)
+        # …and the pid is read off that SAME final line, so the two parsers cannot
+        # disagree about which line is "the line" (they did while each kept its own
+        # last-MATCH loop).
+        check(liv.parse_bound_pid(line + "\n" + final + "\n") == "7",
+              "the pid comes from the FINAL line, not the earlier one: %r" % final)
     # ⛔ `rc=` is the LAST one on the line: a non-greedy match took the first, so an
     # earlier `tag=rc=7` made a completed lane read `no-verdict`.
     check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished tag=rc=7 pid=42 rc=0\n")
           == ("finished", "0"),
           "the real rc= wins over an earlier rc=-shaped field")
+    # ⛔ AND THE rc TOKEN IS BOUNDED: an exit status is a small number, so a runaway
+    # token is UNREADABLE and abstains rather than being interpolated into the reason.
+    # ⛔ AND THE UNREADABLE CASE IS ITS OWN FACT (`"?"`), NOT "absent" (`None`). Collapsing
+    # them made the verdict publish "no rc= on the line" over a line that carried one.
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=%s\n"
+                               % ("9" * 40)) == ("finished", "?"),
+          "a runaway rc token is PRESENT-BUT-UNREADABLE, not absent")
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=0x0\n")
+          == ("finished", "?"), "a non-numeric rc token is present-but-unreadable")
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1\n")
+          == ("finished", None), "a line with NO rc= is the ABSENT fact")
+    # …and the verdict's DETAIL must say which of the two it actually saw.
+    _v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="?"))
+    check(_v.state == "unknown" and _v.reason == "finished-rc-unreadable",
+          "a present-but-unreadable rc abstains; got %s/%s" % (_v.state, _v.reason))
+    check("PRESENT and UNREADABLE" in (_v.detail or ""),
+          "…and says it was PRESENT; got %r" % (_v.detail,))
+    _v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=None))
+    check("no readable `rc=` was supplied" in (_v.detail or ""),
+          "…while an absent rc says it was not supplied; got %r" % (_v.detail,))
+    check("on the line" not in (_v.detail or ""),
+          "…and neither wording claims a LINE (the census has none); got %r" % (_v.detail,))
+    check(liv.parse_bound_line("[lane-bound] VERDICT verdict=finished pid=1 rc=255\n")
+          == ("finished", "255"), "a real 3-digit status is still read")
 
     # ⛔ `verdict=finished` IS NOT "the turn completed". `lane-bound.sh` writes it
     # whenever NO BOUND FIRED and puts the child's real status in `rc=` on the same
@@ -1611,14 +1664,96 @@ def t37():
     check(v.state == "no-verdict", "a crashed lane under verdict=finished is NOT finished; got %s"
           % v.state)
     check(v.reason == "bound-finished-rc:7", "the rc is named; got %r" % v.reason)
-    # `na` is `watch` mode's shape (the supervised pid's status is not the bound's).
+    # `na` is `watch` mode's UNCONDITIONAL shape (`lane-bound.sh`'s `V_RC=na`), and `watch`
+    # is the mode `spawn-gate.sh`'s `run_agent` uses for EVERY lane/fixer/worker.
+    # `run` mode — the only one that puts the child's real status on the
+    # bound line — is never used by the fleet. So `rc=na` carries NO completion fact:
+    # a lane that COMPLETED and a lane that CRASHED / was OOM-killed / was killed by
+    # the completion watchdog write the identical `verdict=finished rc=na`. Accepting
+    # `na` on its own made the rc conjunct INERT for the whole production population.
+    # It must be CORROBORATED by the launcher's own `[timeout] agent … rc=` line.
     v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na"))
-    check(v.state == "finished", "watch-mode `rc=na` with verdict=finished is finished; got %s"
+    check(v.state == "unknown" and v.reason == "finished-rc-uncorroborated",
+          "`rc=na` alone is NOT completion evidence; got %s/%s" % (v.state, v.reason))
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na", runner_rc="0"))
+    check(v.state == "finished", "`rc=na` corroborated by a launcher rc=0 is finished; got %s"
           % v.state)
+    for bad_rc in ("7", "137", "1"):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na", runner_rc=bad_rc))
+        check(v.state == "no-verdict",
+              "`rc=na` + a launcher rc=%s is NOT finished; got %s" % (bad_rc, v.state))
+        check(v.reason == "bound-finished-runner-rc:%s" % bad_rc,
+              "the launcher's rc is named; got %r" % v.reason)
+    # ⛔ THE LAUNCHER IS CONSULTED FOR EVERY ACCEPTED `rc=`, NOT ONLY `na` (review P1).
+    # §13.4's `no-verdict` row says a non-zero `rc=` "on the bound line OR ON THE
+    # LAUNCHER LINE" is `no-verdict`, while its own `rc=0` row said the launcher is "not
+    # consulted" — and the code implemented the narrower one. Measured before this pin:
+    # `LogRead(verdict="finished", rc="0", runner_rc="7")` -> `finished`, a false PASS of
+    # exactly the class this axis exists to remove. `rc=0` only reaches here from `run`
+    # mode (production is `watch`: `V_RC=na`), a hand-edited `$log.lanebound`, or a foreign
+    # producer — the population where a disagreement must resolve FAIL-CLOSED.
+    v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="0", runner_rc="7"))
+    check(v.state == "no-verdict" and v.reason == "bound-finished-runner-rc:7",
+          "`rc=0` + a launcher rc=7 DISAGREE, so completion is not established; got %s/%s"
+          % (v.state, v.reason))
+    # …and the agreement/absence directions still complete, so the guard is not a blanket
+    # refusal of the `run`-mode shape.
+    for ok_runner in ("0", None):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="0",
+                                    runner_rc=ok_runner))
+        check(v.state == "finished",
+              "`rc=0` with the launcher rc=%r still completes; got %s"
+              % (ok_runner, v.state))
+    # ⛔ THE LAUNCHER LINE IS PARSED LAST-WINS, and its pid is what binds it to an
+    # incarnation (an earlier dispatch's `[timeout]` line is still in the same log).
+    check(liv.parse_runner_line(
+        "[timeout] agent pid=4242 wall_limit=3300s elapsed=9s rc=7\n"
+        "[timeout] agent pid=4242 wall_limit=3300s elapsed=99s rc=0") == ("4242", "0"),
+          "the LAST launcher rc= wins")
+    check(liv.parse_runner_line("no launcher line here") == ("", None),
+          "no launcher line is no witness, never rc=0")
+    # ⛔ AND AN UNREADABLE LAUNCHER STATUS IS NO WITNESS EITHER — at the VERDICT door, not
+    # just in the parser. The shipped producer is strict (`\brc=(\d{1,3})\b`), so only a
+    # DIRECT caller reaches the door with a junk token; consuming it raw decoded any
+    # non-"0" value as "the child did NOT complete" — including `""` (the census's own
+    # "present but not read" shape) — and interpolated a runaway token whole into
+    # `reason`. The doc's matrix already promises `unknown` for this row.
+    for junk_runner in ("0x0", "exit:0", "\u00b2", "9" * 400, ""):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na",
+                                   runner_rc=junk_runner))
+        check(v.state == "unknown" and v.reason == "finished-rc-uncorroborated",
+              "an unreadable launcher status must ABSTAIN at the door; got %s/%s"
+              % (v.state, v.reason))
+        check(len(v.reason) < 64,
+              "…and must not be interpolated into the reason; got %d chars" % len(v.reason))
+    for good_runner in ("7", "137", "255"):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc="na",
+                                    runner_rc=good_runner))
+        check(v.state == "no-verdict"
+              and v.reason == "bound-finished-runner-rc:%s" % good_runner,
+              "a real launcher status is still named; got %s/%s" % (v.state, v.reason))
     # An rc that cannot be read is an ABSTENTION, never an assumed success.
     v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=None))
     check(v.state == "unknown" and v.reason == "finished-rc-unreadable",
           "a verdict without a readable rc abstains; got %s/%s" % (v.state, v.reason))
+    # ⛔ AN UNREADABLE `rc` IS NOT A NEGATIVE FACT AT *THIS* DOOR EITHER. Both shipped
+    # producers apply a 1-10-digit-or-`na` allow-list, but a DIRECT caller — the reader
+    # §13.5 says is next — could hand the verdict function any token, and it published
+    # `bound-finished-rc:0x0`: the positive claim "the child did NOT complete" from nothing
+    # readable, which is the shape the census column had to be fixed for. Same for a
+    # runaway token, which was interpolated whole into `reason`.
+    for junk_rc in ("0x0", "exit:0", "\u00b2", "9" * 40):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=junk_rc))
+        check(v.state == "unknown" and v.reason == "finished-rc-unreadable",
+              "an unreadable rc token must ABSTAIN at the verdict door too; got %s/%s"
+              % (v.state, v.reason))
+        check(len(v.reason) < 64,
+              "…and must not be interpolated into the reason; got %d chars" % len(v.reason))
+    # …while a REAL status still names itself, so the guard is not a blanket abstain.
+    for good_rc in ("7", "255", "137"):
+        v = liv.log_lane_verdict(LR(alive=False, verdict="finished", rc=good_rc))
+        check(v.state == "no-verdict" and v.reason == "bound-finished-rc:%s" % good_rc,
+              "a real non-zero status is still named; got %s/%s" % (v.state, v.reason))
 
     # A bound KILL is real death (mechanism 3), and it must not read `finished`.
     for killed in ("stalled", "exceeded-wallclock"):
@@ -1679,6 +1814,13 @@ def t39():
         # permanently unreadable there.
         "0:00.50": 50, "1:02.33": 6233, "1:02:03.45": 372345,
         "": None, "garbage": None, "1:99": None, "1:02:60": None,
+        # ⛔ A DIGIT RUN LONGER THAN ANY REAL `time=` FIELD IS NOT A TIME. `.isdigit()`
+        # admits 5000 digits and `int()` then raises "Exceeds the limit (4300 digits)" —
+        # where this function's contract, and `subtree_cpu_cs`'s, is `None`. The DAYS
+        # component is bounded too, so the raise cannot come back through that field.
+        "9" * 5000: None, ("9" * 4301) + "-00:01": None,
+        "9" * 7: None, ("9" * 7) + "-00:01:00": None,
+        "\u00b2:00": None, "1:\u00b200": None,
     }
     for text, want in cases.items():
         got = liv._cpu_time_cs(text)
@@ -1710,6 +1852,29 @@ def t39():
         check(liv.subtree_cpu_cs(4242, ps_bin=shim) is None, "an absent pid is not 0 CPU")
         check(liv.subtree_cpu_cs(100, ps_bin=os.path.join(d, "nope")) is None,
               "an unreadable ps is an abstention")
+        # ⛔ `_parent_of` MUST NOT RAISE EITHER. It reaches its `ps` fallback when `/proc`
+        # has no row (an exited pid), and it is called from the BINDING path — i.e. exactly
+        # when a terminal state is being decided. `.isdigit()` admits a 5000-digit run and
+        # `int()` then raises, where this helper's contract is `None`.
+        dead_pid = 2 ** 31 - 1          # never live, so /proc always misses
+        for junk in ("9" * 5000, "\u00b2", "abc"):
+            with open(table, "w", encoding="utf-8") as fh:
+                fh.write(junk + "\n")
+            with open(shim, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\ncat %s\n" % table)
+            os.chmod(shim, 0o755)
+            old_ps = os.environ.get("PS_BIN")
+            os.environ["PS_BIN"] = shim
+            try:
+                got_parent = liv._parent_of(dead_pid)
+            finally:
+                if old_ps is None:
+                    os.environ.pop("PS_BIN", None)
+                else:
+                    os.environ["PS_BIN"] = old_ps
+            check(got_parent is None,
+                  "an unreadable ppid row abstains, never raises: %r -> %r"
+                  % (junk[:12], got_parent))
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -1733,6 +1898,30 @@ def t40():
         check(liv.evaluate(liv.Evidence(log_read=lr)).state == "unknown",
               "an unreadable identity/CPU abstains")
 
+        # ⛔ THE SECOND SAMPLE HAS ITS OWN FAILURE ARM, AND IT HAD ZERO COVERAGE. A log
+        # that disappears between the two readings must abstain (`unreadable-on-second-read`)
+        # and must NOT hand back a fabricated flat `size_delta=0` — the same "an unread value
+        # is not zero" rule as the mode-000 case, one door down. Replacing that arm with
+        # `lr.size_delta = 0` used to leave the suite at PASS=57 FAIL=0, which also made this
+        # test's own title ("every failure path") untrue.
+        vanish = os.path.join(d, "L-vanish.log")
+        with open(vanish, "w", encoding="utf-8") as fh:
+            fh.write("working...\n")
+
+        def _unlink_then_sleep(_seconds):
+            os.unlink(vanish)
+
+        lr = liv.gather_log_lane(vanish, os.getpid(), sample=True,
+                                 sleep_fn=_unlink_then_sleep, now_ms=NOW_MS)
+        check(not lr.readable and (lr.detail or "").startswith("unreadable-on-second-read:"),
+              "a log that vanishes between samples is UNREADABLE, said so; got readable=%r "
+              "detail=%r" % (lr.readable, lr.detail))
+        check(lr.size_delta is None,
+              "and its byte channel is NOT published as a flat 0; got %r" % (lr.size_delta,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown" and v.reason == "log-unreadable",
+              "so it ABSTAINS; got %s/%s %s" % (v.state, v.reason, v.detail))
+
         lr = liv.gather_log_lane(os.path.join(d, "nope.log"), os.getpid(), sample=False,
                                  now_ms=NOW_MS)
         check(not lr.readable and not lr.present, "absent is absent")
@@ -1741,8 +1930,44 @@ def t40():
 
         lr = liv.gather_log_lane(d, os.getpid(), sample=False, now_ms=NOW_MS)
         check(not lr.readable and lr.present, "present-but-unreadable is its own fact")
+        check((lr.detail or "").startswith("not-a-regular-file:"),
+              "and it NAMES that fact (`not-a-regular-file:`), rather than reporting a generic "
+              "unreadable — the doc gives them different reasons and a reader routes on it; "
+              "got %r" % (lr.detail,))
         check(liv.evaluate(liv.Evidence(log_read=lr)).state == "unknown",
               "an unreadable log must never publish a state")
+
+        # ⛔ A REGULAR FILE THAT STATS BUT CANNOT BE OPENED IS THE SAME FACT (measured
+        # false FROZEN). `S_ISREG` alone decided `readable`, so a mode-000 log passed the
+        # check, `_log_tail` swallowed the EACCES and returned "", and the second sample
+        # computed `size_delta = st_size - st_size = 0` from a channel it never read —
+        # published as a positively FLAT one, so a LIVE lane read `frozen/no-progress
+        # bytes_delta=0`. `skip` on a platform where the mode cannot be enforced (root).
+        noperm = os.path.join(d, "L-noperm.log")
+        with open(noperm, "w", encoding="utf-8") as fh:
+            fh.write("working...\n")
+        os.utime(noperm, (NOW_MS / 1000.0 - 7200, NOW_MS / 1000.0 - 7200))
+        os.chmod(noperm, 0)
+        try:
+            _probe = open(noperm, "rb")
+        except OSError:
+            _can_enforce = True
+        else:
+            _probe.close()
+            _can_enforce = False   # running as root: mode 000 does not deny us
+        if _can_enforce:
+            lr = liv.gather_log_lane(noperm, os.getpid(), sample=True, sleep_fn=lambda _s: None,
+                                     now_ms=NOW_MS)
+            check(lr.present and not lr.readable,
+                  "a mode-000 regular file is PRESENT but NOT READABLE; got present=%r "
+                  "readable=%r detail=%r" % (lr.present, lr.readable, lr.detail))
+            check(lr.size_delta is None,
+                  "its byte channel must NOT be published as a flat 0; got %r" % (lr.size_delta,))
+            v = liv.evaluate(liv.Evidence(log_read=lr))
+            check(v.state == "unknown" and v.reason == "log-unreadable",
+                  "a mode-000 log ABSTAINS, never `frozen` (measured: it froze a live lane); "
+                  "got %s/%s %s" % (v.state, v.reason, v.detail))
+        os.chmod(noperm, 0o600)
 
         # the verdict FILE outranks the log's tail, and the rc travels with it
         me = os.getpid()
@@ -1822,8 +2047,47 @@ def t41():
             "29\t%s\t0\t0\t\t1\t3000000\t9\t0" % as_dir,
             # a NEGATIVE cpu delta is a broken reading, not a flat one
             "30\t%s\t0\t-200\t\t1\t3000000\t9\t0" % log,
+            # ⛔ AN IMPLAUSIBLE NUMBER IS NOT A READING. `int()` accepts a 40-digit cell, so
+            # a runaway `size_delta`/`age_ms` became a STATE and was interpolated whole.
+            # Each of these three must abstain exactly as an unread cell does.
+            "34\t%s\t%s\t0\t\t1\t1000\t100\t?\t\t34" % (log, "9" * 40),
+            "35\t%s\t0\t%s\t\t1\t1000\t100\t?\t\t35" % (log, "9" * 40),
+            "36\t%s\t0\t0\t\t1\t%s\t100\t?\t\t36" % (log, "9" * 40),
+            # ⛔ AN UNREADABLE EXIT STATUS IS NOT A NEGATIVE FACT — the same rule the
+            # bound line and the launcher line apply. This column used to accept any
+            # non-empty, non-`?` token, so `0x0` published `no-verdict/bound-finished-rc:0x0`
+            # (the positive claim "the child did NOT complete") where the log path for the
+            # SAME bytes abstains as `finished-rc-unreadable` — and a runaway token was
+            # interpolated whole into the reason.
+            "31\t%s\t0\t0\tfinished\t0\t3000000\t9\t?\t0x0\t31" % log,
+            "32\t%s\t0\t0\tfinished\t0\t3000000\t9\t?\t%s\t32" % (log, "9" * 40),
+            # …and a REAL non-zero status still names itself, so the guard is not a
+            # blanket abstain.
+            "33\t%s\t0\t0\tfinished\t0\t3000000\t9\t?\t7\t33" % log,
+            # a FROZEN row, so the census's `window_ms=` assertion covers that branch too.
+            "40\t%s\t0\t0\t\t1\t3000000\t9\t0" % log,
         ])
         by_pid = {r[0]: (r[1], r[2]) for r in rows}
+        full = {r[0]: r for r in rows}
+        # ⛔ THE CENSUS OWNS NO SAMPLE WINDOW, SO IT MUST NOT NAME ONE (review P1). Its deltas
+        # come from the CALLER (columns 3/4), so the census never measures over a window at
+        # all — yet it interpolated the module default into every row's `detail`, telling a
+        # machine reader (whose contract is `window_ms=` = "the span the deltas were taken
+        # over") that flat deltas spanned 30 s. It now publishes `?`, the same "NOT READ"
+        # convention the row format uses everywhere else.
+        for row_pid in ("11", "25", "40"):
+            detail = full[row_pid][3] if len(full[row_pid]) > 3 else ""
+            check("window_ms=?" in detail,
+                  "a census row must not CLAIM a sample window it never measured (pid %s); "
+                  "got %r" % (row_pid, detail))
+        # ⛔ AND AN UNREAD CPU IS `cpu_unreadable=1`, NOT `0` (review P2). Column 4 is `?`
+        # for NOT READ, which IS the unread case; leaving the flag at its `False` default
+        # made one detail line assert both "the CPU channel was not read" and "the CPU
+        # channel was not unread".
+        d25 = full["25"][3] if len(full["25"]) > 3 else ""
+        check("cpu_delta_cs=?" in d25 and "cpu_unreadable=1" in d25,
+              "a `?` CPU cell must report cpu_unreadable=1, never 0 alongside it; got %r"
+              % (d25,))
         check(by_pid["11"] == ("working", "within-window"), "row 11: %r" % (by_pid["11"],))
         check(by_pid["12"][0] == "unknown",
               "an unreadable `alive` must ABSTAIN, not publish a terminal state; got %r"
@@ -1849,9 +2113,87 @@ def t41():
         check(by_pid["28"][0] == "unknown", "row 28: %r" % (by_pid["28"],))
         check(by_pid["29"][0] == "unknown",
               "a directory is not a readable log; got %r" % (by_pid["29"],))
+        # …and the census NAMES the fact, so the `S_ISREG` guard is pinned rather than
+        # merely subsumed by the read proof (a directory also fails `open()`).
+        d29 = full["29"][3] if len(full["29"]) > 3 else ""
+        check(d29.startswith("not-a-regular-file:"),
+              "the census must name `not-a-regular-file:`, not a generic unreadable; got %r" % (d29,))
+
+        # ⛔ AND THE CENSUS'S OWN READ PROOF IS PINNED BY A MODE-000 ROW. A directory never
+        # reaches the `open()` (the `S_ISREG` check above refuses it first), so rows 29/27/28
+        # cannot see the census arm's read proof AT ALL: deleting it left the whole suite at
+        # PASS=57 FAIL=0 while the identical row read `frozen/no-progress bytes_delta=0` from a
+        # byte channel that was never read. `skip` where the mode cannot be enforced (root).
+        noperm = os.path.join(d, "L-census-noperm.log")
+        with open(noperm, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        os.chmod(noperm, 0)
+        try:
+            open(noperm, "rb").close()
+        except OSError:
+            _census_can_enforce = True
+        else:
+            _census_can_enforce = False
+        if _census_can_enforce:
+            rc_np, rows_np = census(["77\t%s\t0\t0\t\t1\t3000000\t6\t0\t\t77" % noperm])
+            row_np = rows_np[0] if rows_np else ["", "", "", ""]
+            check(row_np[1] == "unknown" and row_np[2] == "log-unreadable",
+                  "a mode-000 census row must ABSTAIN (the census's read proof), not publish "
+                  "`frozen` from an unread byte channel; got %r rc=%r" % (row_np, rc_np))
+            d_np = row_np[3] if len(row_np) > 3 else ""
+            check(d_np.startswith("unreadable:"),
+                  "and it names `unreadable:`; got %r" % (d_np,))
+        os.chmod(noperm, 0o600)
         check(by_pid["30"][0] == "unknown",
               "a NEGATIVE cpu delta is a broken reading, not a flat one; got %r"
               % (by_pid["30"],))
+        # ⛔ AND THE DETAIL MUST AGREE WITH THE STATE (review P2). The state abstains BECAUSE
+        # the reading is broken, so `cpu_unreadable` must say so — the census used to derive
+        # the flag from `?` alone and print `cpu_delta_cs=-200 cpu_unreadable=0`, one detail
+        # line reporting the channel as fine beside the number it refuses to trust. The
+        # acquisition path normalises the identical fact to `cpu_unreadable=True` +
+        # `cpu_delta_cs=None` (`A NEGATIVE DELTA IS NOT 'FLAT'`), so the two surfaces now agree.
+        d30 = full["30"][3] if len(full["30"]) > 3 else ""
+        check("cpu_unreadable=1" in d30,
+              "a NEGATIVE cpu delta must report cpu_unreadable=1 beside the value it "
+              "refuses to trust; got %r" % (d30,))
+        check(by_pid["31"][0] == "unknown",
+              "an unreadable `rc` at the seam must ABSTAIN, never claim a crash; got %r"
+              % (by_pid["31"],))
+        check(by_pid["32"][0] == "unknown",
+              "a runaway `rc` token must ABSTAIN, not be interpolated into the reason; got %r"
+              % (by_pid["32"][:1] + (by_pid["32"][1][:40],),))
+        check(len(by_pid["32"][1]) < 64,
+              "the reason must not carry a runaway token verbatim; got %d chars"
+              % len(by_pid["32"][1]))
+        check(by_pid["33"] == ("no-verdict", "bound-finished-rc:7"),
+              "a REAL non-zero rc is still named; got %r" % (by_pid["33"],))
+        for row in ("34", "35", "36"):
+            check(by_pid[row][0] == "unknown",
+                  "an IMPLAUSIBLE number must ABSTAIN, never become a state (row %s); got %r"
+                  % (row, by_pid[row]))
+        # ⛔ A PER-LANE FLAG MUST BE REFUSED, NOT SILENTLY DROPPED. `--verdict-file`,
+        # `--transcript`, `--start-seconds` and `--json` were ACCEPTED AND IGNORED: measured
+        # with a valid `$log.lanebound`, the single-lane arm published `finished` for a file
+        # the census then published as `no-verdict / process-gone-no-verdict` — "the lane told
+        # us nothing" for a lane that finished — and `--json` changed nothing about the TSV.
+        # Both exited 0, so no caller could tell. A refusal is the surface's own contract.
+        # ⛔ `--window-ms` IS THE WORSE CASE AND IS LISTED HERE FOR THAT REASON (review P1).
+        # It was not merely ignored — the census INTERPOLATED it into every row's `detail` as
+        # `window_ms=`, while the deltas came from the caller over the caller's own window.
+        # Measured before the refusal: `--log-census --window-ms 5` on a row with
+        # `age_ms=3000000` published `window_ms=5`, i.e. it told a reader that flat deltas were
+        # measured over 5 ms. A lying diagnostic is worse than a dropped flag.
+        for argv in (["--log-census", "--json"],
+                     ["--log-census", "--verdict-file", os.path.join(d, "V")],
+                     ["--log-census", "--transcript", os.path.join(d, "T")],
+                     ["--log-census", "--start-seconds", "5"],
+                     ["--log-census", "--no-sample"],
+                     ["--log-census", "--window-ms", "5"]):
+            refuse_rc, refuse_rows = census([], argv)
+            check(refuse_rc == 2,
+                  "%r must be REFUSED, not ignored; got rc=%r" % (argv[1:], refuse_rc))
+            check(refuse_rows == [], "…and must publish no rows; got %r" % (refuse_rows,))
         check(rc == 3, "an abstaining census exits 3 (cannot-verify); got %r" % (rc,))
     finally:
         shutil.rmtree(d, ignore_errors=True)
@@ -1932,6 +2274,30 @@ def t43():
         check("unbound-bound-verdict" in lr.detail, "and named; got %r" % lr.detail)
         check(liv.evaluate(liv.Evidence(log_read=lr)).state == "no-verdict",
               "still terminal, still honest")
+
+        # ⛔ A `pid=` PRESENT BUT UNUSABLE IS "PRESENT" (`"?"`), NOT "ABSENT" (`""`). The
+        # LOCATOR used to be `pid=([0-9]+)`, so every non-all-digit form produced NO match
+        # -> `""` -> ADOPTED -> a previous dispatch's `verdict=finished` published as this
+        # lane's terminal state (the stale-verdict FALSE PASS this axis exists to remove),
+        # while the census dropped the identical token. Executed on the REAL path.
+        for bad in ("?", "0x1f", "", "abc", "-1", "1e5"):
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%s rc=0 "
+                         "log=%s\n" % (bad, log))
+            lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+            v = liv.evaluate(liv.Evidence(log_read=lr))
+            check(v.state == "no-verdict",
+                  "an unusable `pid=` (%r) must be DROPPED, never adopted as finished; got %s"
+                  % (bad, v.state))
+            check("unbound-bound-verdict" in (lr.detail or ""),
+                  "…and named as unbound; got %r" % (lr.detail,))
+        # …while a line that names NO pid at all is still the adopted-and-declared shape.
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane rc=0 log=%s\n" % log)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS)
+        check("bound-verdict-without-pid" in (lr.detail or ""),
+              "a genuinely pid-less line is adopted AND declared; got %r" % (lr.detail,))
+
         # ⛔ RE-GATHER: the previous sub-case already dropped its verdict, so evaluating
         # that stale `LogRead` asserted a conclusion about an object the appended log
         # never reached — "asserted evidence it does not have", the class this suite's
@@ -2123,6 +2489,22 @@ def t46():
                              stdout=subprocess.PIPE).stdout.decode()
         check("finished" in out,
               "a correctly bound census verdict IS published; got %r" % out)
+
+        # ⛔ A PRESENT-BUT-UNUSABLE col 11 IS NOT AN ABSENT ONE. `?` is the census's own
+        # documented "NOT READ" token, so a caller following the convention handed the
+        # seam an unread pid — and collapsing that to "" fell through to the ADOPT arm
+        # ("column 11 absent"), publishing a previous dispatch's `finished` while
+        # `gather_log_lane` DROPPED the identical token. Measured before this fix: all
+        # three tokens below published `finished`.
+        for unusable in ("?", "zzz", "9" * 30):
+            out = subprocess.run([sys.executable, liv.__file__, "--log-census"],
+                                 input=row(unusable).encode(),
+                                 stdout=subprocess.PIPE).stdout.decode()
+            check("finished" not in out,
+                  "a present-but-unusable col 11 (%r) must NOT publish the verdict; got %r"
+                  % (unusable[:8], out))
+            check("no-verdict" in out,
+                  "…it falls to the honest terminal state; got %r" % out)
     finally:
         shutil.rmtree(d, ignore_errors=True)
 
@@ -2150,6 +2532,23 @@ def t47():
     lr.size_delta = 0
     v = liv.evaluate(liv.Evidence(log_read=lr))
     check(v.state == "frozen", "a flat log still freezes; got %s" % v.state)
+    # ⛔ A NEGATIVE LOG AGE IS A BROKEN READING, not "less than the freeze window". The
+    # acquisition path clamps it (`max(0, …)`), so this is the census surface: read as
+    # "nothing is happening YET", a negative age published `working/within-window` and the
+    # freeze check could never fire — while the row printed its own contradicting evidence
+    # (`age_ms=-1` beside `freeze_ms=`). Same rule the two deltas already get.
+    for bad_age in (-1, -999999999):
+        broken = liv.LogRead(readable=True, present=True, path="/x", size_delta=0,
+                             cpu_delta_cs=0, transcript_grew=False, alive=True,
+                             age_ms=bad_age, window_ms=liv.LOG_WINDOW_MS)
+        v = liv.evaluate(liv.Evidence(log_read=broken))
+        check(v.state == "unknown" and v.reason == "log-age-unreadable",
+              "a negative age must ABSTAIN, never read as within-window; got %s/%s"
+              % (v.state, v.reason))
+    # …and a zero age is legitimate (the log was just written), so this is not a blanket rule.
+    broken.age_ms = 0
+    v = liv.evaluate(liv.Evidence(log_read=broken))
+    check(v.state == "working", "a zero age is still within-window; got %s" % v.state)
 
 
 @test("T48 the census survives the `?` it prints itself, and declares an unbound row")
@@ -2224,8 +2623,477 @@ def t49():
               "a non-ASCII digit is unreadable, not an exception: %r" % bad)
 
 
-@test("T50 the masking refusal covers the session axis's ABSTENTIONS, not only its evidence")
+@test("T50 the LOG STATES are a pinned vocabulary, and overlap the session tuple only on "
+       "`dead`/`unknown`")
 def t50():
+    # ⛔ `STATES` IS FROZEN BY A TEST (it has been unchanged since #1178), and that freeze is
+    # the reason this axis carries a SECOND tuple instead of widening the first. Without the
+    # same pin here, a rename or an added log state kept all tests green while silently
+    # breaking every consumer and the doc's disjointness claim.
+    check(liv.LOG_STATES == ("working", "frozen", "finished", "no-verdict", "dead", "unknown"),
+          "the log-state vocabulary is exactly the documented one; got %r" % (liv.LOG_STATES,))
+    check(set(liv.LOG_STATES) & set(liv.STATES) == {"dead", "unknown"},
+          "the two tuples overlap ONLY on dead/unknown; got %r"
+          % (set(liv.LOG_STATES) & set(liv.STATES),))
+    # …and the session tuple is still the frozen five, so the second tuple was not bought
+    # by widening the first.
+    check(liv.STATES == ("dead", "running-quiet", "wedged", "idle", "unknown"),
+          "the session tuple is unchanged; got %r" % (liv.STATES,))
+
+
+@test("T51 `gather_log_lane` POPULATES the `rc=na` witness and binds it to the incarnation")
+def t51():
+    # ⛔ THE ACQUISITION HALF, EXECUTED. T37 stacks `LR(..., runner_rc=...)` by hand, so the
+    # pure verdict matrix is green even if `gather_log_lane` never fills the field — which is
+    # exactly the "guard present, INERT in production" shape the previous round found in the
+    # `rc` conjunct itself. And the witness is only this lane's if it names the SAME
+    # incarnation: the log is APPENDED to across dispatches (`tee -a` / `>>`), so an earlier
+    # dispatch's `[timeout] agent … rc=0` would otherwise corroborate a crash into a
+    # completion. Both are asserted here against a REAL log and a REAL reaped pid.
+    d = tempfile.mkdtemp(prefix="liv-runner-rc-")
+    try:
+        log = os.path.join(d, "lane.log")
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = child.pid
+        child.wait()
+
+        def write(runner_pid, runner_rc):
+            with open(log, "w", encoding="utf-8") as fh:
+                # `lane-bound.sh watch` writes `rc=na` UNCONDITIONALLY (`V_RC=na`) — this
+                # is the fleet's real shape, not a contrivance.
+                fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                         "elapsed=61s log=%s\n" % (dead, log))
+                fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=%s\n"
+                         % (runner_pid, runner_rc))
+
+        # (a) A launcher rc=0 for THIS incarnation corroborates `na` into completion.
+        write(dead, "0")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.rc == "na", "the bound line's `na` is read; got %r" % (lr.rc,))
+        check(lr.runner_rc == "0",
+              "gather_log_lane POPULATES runner_rc from the launcher line; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "finished",
+              "a corroborated `na` is finished through the REAL path; got %s/%s"
+              % (v.state, v.reason))
+
+        # (b) The launcher's rc is a CRASH — the same evidence that used to read `finished`.
+        write(dead, "7")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "no-verdict" and v.reason == "bound-finished-runner-rc:7",
+              "a crashed lane is NOT finished through the REAL path; got %s/%s"
+              % (v.state, v.reason))
+
+        # (c) A witness naming ANOTHER incarnation must not corroborate this verdict.
+        write(2 ** 31 - 1, "0")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.runner_rc is None,
+              "a witness from another incarnation is NOT adopted; got %r" % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown" and v.reason == "finished-rc-uncorroborated",
+              "…and the lane abstains rather than assuming success; got %s/%s"
+              % (v.state, v.reason))
+
+        # (d) An UNREADABLE launcher rc is an ABSTENTION, never a negative fact — and it is
+        # a DIFFERENT FACT from "no launcher line": the pid is still returned, so the
+        # verdict can name what it could not read instead of asserting the line is absent.
+        for junk in ("\u00b2", "0x0", "exit:0", "9" * 40):
+            check(liv.parse_runner_line(
+                "[timeout] agent pid=%d wall_limit=3300s elapsed=1s rc=%s" % (dead, junk))
+                  == (str(dead), None),
+                  "an unreadable launcher rc is NO witness, never a crash: %r" % junk)
+        check(liv.parse_runner_line("[timeout] agent pid=%d wall_limit=1s" % dead)
+              == (str(dead), None),
+              "a launcher line with NO status is the same distinction")
+        # ⛔ A LAUNCHER LINE WITH AN UNUSABLE `pid=` IS STILL A LINE. The LOCATOR used to
+        # carry the pid allow-list, so such a line never matched and the verdict asserted
+        # "no corroborating reading" over a log that had one (with a readable `rc=`).
+        for bad_pid in ("0x1f", "?", "", "11111111111"):
+            got = liv.parse_runner_line(
+                "[timeout] agent pid=%s wall_limit=1s rc=0" % bad_pid)
+            check(got == ("?", "0"),
+                  "a line with an unusable pid is PRESENT and its rc is still read; %r"
+                  % (got,))
+        # …and the LOG-LEVEL detail names the fact rather than the absence.
+        write(dead, "0x0")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown" and v.reason == "finished-rc-uncorroborated",
+              "an unreadable launcher status abstains; got %s/%s" % (v.state, v.reason))
+        check("runner-rc-unreadable" in (v.detail or ""),
+              "…and the detail names the UNREADABLE reading, not a missing line; got %r"
+              % (v.detail,))
+        check("no CORROBORATING launcher" in (v.detail or ""),
+              "the static sentence claims no corroborating reading, not no line; got %r"
+              % (v.detail,))
+        # ⛔ …and an UNUSABLE pid is its own fact: named, and NEVER adopted (it can never
+        # equal the verdict's own pid, so it falls to the abstention, not a completion).
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                     "elapsed=61s log=%s\n" % (dead, log))
+            fh.write("[timeout] agent pid=0x1f wall_limit=3300s elapsed=61s rc=0\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown",
+              "a line with an unusable pid is NEVER adopted; got %s" % v.state)
+        check("runner-pid-unreadable" in (v.detail or ""),
+              "…and the detail says a line EXISTS with an unusable pid; got %r"
+              % (v.detail,))
+        # ⛔ THE COMPLETION-WATCHDOG LINE IS NOT A LAUNCHER REPORT — and the REAL shape is
+        # `[task] sub-agent (pid N) completed but did not exit within 15s — killing
+        # (completion watchdog)` (`extensions/builtin-tools/index.ts`, the default `logFn`
+        # prefix). An earlier revision of this fixture quoted a `[timeout] agent completed
+        # but did not exit …` line that NO producer writes. The real line is skipped because
+        # it carries no `[timeout] agent` marker at all — NOT because it lacks a `pid=` — and
+        # getting that backwards would mis-describe which guard is doing the work.
+        wd = ("[task] sub-agent (pid %d) completed but did not exit within 15s \u2014 "
+              "killing (completion watchdog)" % dead)
+        check(liv.parse_runner_line(wd) == ("", None),
+              "the REAL completion-watchdog line is not a launcher report; got %r"
+              % (liv.parse_runner_line(wd),))
+        # ⛔ AND THE SEPARATE, DEFENSIVE ARM: a `[timeout] agent` marker whose `pid=` token is
+        # ABSENT (a truncated or garbled write) is `absent`, never `present-but-unusable` —
+        # that second diagnosis belongs to a token that IS there and cannot be read
+        # (`runner-pid-unreadable`, above).
+        check(liv.parse_runner_line("[timeout] agent wall_limit=1s rc=0") == ("", None),
+              "a pid-less line is ABSENT, not present-but-unusable")
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                     "elapsed=61s log=%s\n" % (dead, log))
+            fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=0\n" % dead)
+            fh.write(wd + "\n")
+            fh.write("[timeout] agent wall_limit=1s rc=0\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "finished",
+              "trailing non-launcher lines must not shadow the readable witness; got %s/%s"
+              % (v.state, v.reason))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T52 a lane with NO bound verdict still REPORTS the launcher's rc (merge-one.sh)")
+def t52():
+    # ⛔ THE POPULATION WITH NO BOUND AT ALL. `merge-one.sh`'s reviewer run is its own plain
+    # sleep watchdog that never invokes `lane-bound.sh` (stated in that file's own correction
+    # comment), so a finished reviewer run writes `[timeout] agent … rc=0` and NO
+    # `[lane-bound] VERDICT` line — and `merge-one.sh` is named in this axis's population
+    # (§13, first paragraph). The gather step used to consult the launcher line ONLY when the
+    # bound line said `rc=na`, so for this population the witness was thrown away and the
+    # verdict published "the process ended and told us nothing" over a log that said rc=0.
+    d = tempfile.mkdtemp(prefix="liv-no-bound-")
+    try:
+        log = os.path.join(d, "merge-42.log")
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead = child.pid
+        child.wait()
+
+        def write(line):
+            with open(log, "w", encoding="utf-8") as fh:
+                fh.write("[merge 42] reviewer started\n")
+                if line:
+                    fh.write(line)
+
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=900s rc=0\n" % dead)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.verdict == "", "there is no bound line; got %r" % (lr.verdict,))
+        check(lr.runner_rc == "0",
+              "the launcher's rc is READ even with no bound verdict; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "no-verdict",
+              "no bound verdict is still an abstention, never `finished`; got %s/%s"
+              % (v.state, v.reason))
+        check("rc=0" in (v.detail or ""),
+              "…but the detail reports what the launcher SAID; got %r" % (v.detail,))
+        check("wrote NO bound verdict" in (v.detail or ""),
+              "…and names a missing BOUND verdict as the gap; got %r" % (v.detail,))
+
+        # A CRASHED reviewer is the same state and is still NOT `dead`: only the bound's own
+        # kill verdict is death. It is also not a completion.
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=900s rc=7\n" % dead)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "no-verdict",
+              "a crashed reviewer is not `dead` (no bound killed it); got %s" % v.state)
+        check("rc=7" in (v.detail or ""), "…and rc=7 is reported; got %r" % (v.detail,))
+
+        # NO launcher line at all keeps the old, honest answer.
+        write("")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check("wrote no verdict" in (v.detail or ""),
+              "with no witness at all the detail says so plainly; got %r" % (v.detail,))
+
+        # The junk-token rule is ONE door: it applies on this path too.
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=1s rc=0x0\n" % dead)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.runner_rc is None,
+              "an unreadable launcher token is NO witness on this path either; got %r"
+              % (lr.runner_rc,))
+
+        # ⛔ AND THE BINDING STILL HOLDS WHEN THERE IS NO BOUND LINE. Widening the gate to
+        # `if lr.readable:` must not turn the launcher line into a witness for a lane it
+        # does not describe — the appended-log premise this axis states everywhere.
+        # (a) a launcher line naming a pid that is NEITHER the queried pid NOR any bound
+        #     pid is not this lane's witness.
+        other = subprocess.Popen([sys.executable, "-c", "pass"])
+        other_pid = other.pid
+        other.wait()
+        write("[timeout] agent pid=%d wall_limit=1800s elapsed=900s rc=0\n" % other_pid)
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.runner_rc is None,
+              "a launcher line naming ANOTHER incarnation is not adopted; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check("reported rc=" not in (v.detail or ""),
+              "…and the detail does not claim it heard an rc; got %r" % (v.detail,))
+
+        # (b) ⛔ THE STALE PAIR — the regression the widened gate introduced and this arm
+        #     exists to prevent. Dispatch 1 left BOTH a bound verdict and its own launcher
+        #     line naming the SAME pid; the verdict is DROPPED as stale for the queried
+        #     lane, so its incarnation must be dropped with it. Keeping
+        #     `verdict_line_pid` let the launcher block bind dispatch 1's `rc=0` to
+        #     dispatch 2 and publish "the launcher reported rc=0" for a lane that said
+        #     nothing — a self-contradicting detail (`reported rc=0` next to
+        #     `unbound-bound-verdict`).
+        with open(log, "w", encoding="utf-8") as fh:
+            fh.write("[lane-bound] VERDICT verdict=finished tag=lane pid=%d rc=na "
+                     "elapsed=61s log=%s\n" % (other_pid, log))
+            fh.write("[timeout] agent pid=%d wall_limit=3300s elapsed=61s rc=0\n"
+                     % other_pid)
+            fh.write("=== next dispatch ===\n")
+        lr = liv.gather_log_lane(log, dead, sample=False, now_ms=NOW_MS, window_ms=1)
+        check(lr.verdict == "", "the stale bound verdict is dropped; got %r" % (lr.verdict,))
+        check(lr.verdict_line_pid == "",
+              "the DROPPED verdict's incarnation is cleared with it; got %r"
+              % (lr.verdict_line_pid,))
+        check(lr.runner_rc is None,
+              "a launcher line belonging to the DROPPED verdict is not adopted; got %r"
+              % (lr.runner_rc,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check("reported rc=" not in (v.detail or ""),
+              "…and the detail never says it heard an rc from another dispatch; got %r"
+              % (v.detail,))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T53 `_sum_subtree` ABSTAINS when a member's CPU is unread, never shrinking")
+def t53():
+    # ⛔ THE INVARIANT THE `/proc` READER USED TO BREAK, and it had NO test at all —
+    # which is why an asserted invariant and an implementation could diverge unnoticed.
+    # Dropping an unread member makes the total SMALLER, and a smaller total is how a
+    # busy tree reads FLAT → `frozen` — the false negative this axis exists to remove.
+    # The `ps` path always abstained (a malformed row -> `None`); `_proc_cpu_cs` silently
+    # `continue`d, so a row it could not open or parse left the population entirely. It
+    # now abstains too (a VANISHED pid is still `continue` — that one is genuinely gone).
+    ppid = {100: 1, 101: 100, 102: 100, 103: 101}
+    cpu = {100: 10, 101: 20, 102: 30, 103: 40, 999: 90}
+    check(liv._sum_subtree(100, ppid, cpu) == 100,
+          "a fully-read tree sums the root and every descendant; got %r"
+          % (liv._sum_subtree(100, ppid, cpu),))
+    check(liv._sum_subtree(100, ppid, cpu) is not None
+          and liv._sum_subtree(100, ppid, cpu) < 190,
+          "a process OUTSIDE the tree (999) is not counted")
+    for unread in (100, 101, 102, 103):
+        bad = dict(cpu)
+        bad[unread] = None
+        check(liv._sum_subtree(100, ppid, bad) is None,
+              "an UNREAD member (%d) abstains the whole total; got %r"
+              % (unread, liv._sum_subtree(100, ppid, bad)))
+    check(liv._sum_subtree(100, ppid, {101: 20}) is None,
+          "the root absent from the map is an abstention, never 0")
+    check(liv._sum_subtree(100, ppid, {100: 10, 101: 20}) is None,
+          "a descendant present in ppid but missing from cpu abstains too, never shrinks")
+
+
+@test("T54 the `/proc` reader ABSTAINS on an unreadable/truncated member, never shrinks")
+def t54():
+    # ⛔ THE BRANCH THAT HAD NO EXECUTION AT ALL. `_proc_cpu_cs` read the real `/proc`
+    # through a local literal, so its failure polarity could only be ASSERTED — and two
+    # of its branches shrank the tree instead of abstaining, which is how a busy tree
+    # reads flat → `frozen`. The root is now a seam (the pattern `successor_preflight.py`
+    # ships as `DEFAULT_PROC_ROOT`), so the polarity is EXECUTED here.
+    d = tempfile.mkdtemp(prefix="liv-proc-")
+    try:
+        def stat_line(pid, comm, ppid, utime, stime):
+            # fields 3..15 (13 tokens): state ppid pgrp session tty_nr tpgid flags
+            # minflt cminflt majflt cmajflt utime stime  — so rest[11]/rest[12] are
+            # utime/stime exactly as the reader indexes them.
+            toks = ["S", str(ppid)] + ["0"] * 9 + [str(utime), str(stime)]
+            return "%d (%s) %s\n" % (pid, comm, " ".join(toks))
+
+        def write(pid, text):
+            with open(os.path.join(d, str(pid), "stat"), "w", encoding="utf-8") as fh:
+                fh.write(text)
+
+        for p in (500, 600, 700):
+            os.makedirs(os.path.join(d, str(p)))
+
+        # (a) a fully-readable tree: 500 -> 600 -> 700.
+        write(500, stat_line(500, "lane", 1, 1, 2))
+        write(600, stat_line(600, "pi", 500, 3, 4))
+        write(700, stat_line(700, "tool", 600, 5, 6))
+        m = liv._proc_cpu_cs(d)
+        check(m is not None and set(m) == {500, 600, 700},
+              "the fixture is read; got %r" % (m,))
+        cs = lambda u, s: (u + s) * 100 // liv._CLK_TCK
+        check(m[700][0] == 600, "ppid is field 4 via rest[1]; got %r" % (m[700],))
+        check(m[700][1] == cs(5, 6),
+              "cpu is utime+stime via rest[11]/rest[12]; got %r" % (m[700],))
+        check(liv.subtree_cpu_cs(500, proc_root=d) == cs(1, 2) + cs(3, 4) + cs(5, 6),
+              "the whole tree sums; got %r" % (liv.subtree_cpu_cs(500, proc_root=d),))
+
+        # (b) a `comm` containing ')' must not shift the field decode (rfind).
+        write(700, stat_line(700, "tool) x", 600, 5, 6))
+        m = liv._proc_cpu_cs(d)
+        check(m[700][0] == 600 and m[700][1] == cs(5, 6),
+              "`comm` may contain ')'; the LAST ')' is the split; got %r" % (m[700],))
+
+        # (c) ⛔ A TRUNCATED row must ABSTAIN, not detach the pid with ppid=0. This is
+        # the residual shrink: (0, None) removed the pid AND its subtree from the walk.
+        write(600, "600 (pi) S 500 0 0\n")
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "a truncated stat row must RAISE _ProcUnreadable, not shrink")
+        except liv._ProcUnreadable:
+            check(True, "a truncated stat row abstains the read")
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller ABSTAINS rather than returning a short total; got %r"
+              % (liv.subtree_cpu_cs(500, proc_root=d),))
+        # ⛔ AND IT ABSTAINS EVEN FOR A PID THE COARSER `ps` WOULD HAPPILY ANSWER.
+        # Without this, "abstain" and "silently fall back to ps" are indistinguishable in
+        # the fixture (neither ps nor the fixture knows pid 500), so the fallback the
+        # `_ProcUnreadable` class exists to forbid would mutate GREEN. pid 1 always exists
+        # on this host, so a fallback returns a NUMBER here and the assertion reddens.
+        check(liv.subtree_cpu_cs(1, proc_root=d) is None,
+              "an unread member ABSTAINS — it must not fall back to `ps` for a live pid; "
+              "got %r" % (liv.subtree_cpu_cs(1, proc_root=d),))
+
+        # (d) PRESENT BUT UNREADABLE (a directory where `stat` should be) is the same
+        # abstention — uid-independent, so it holds for root too.
+        write(600, stat_line(600, "pi", 500, 3, 4))
+        os.remove(os.path.join(d, "600", "stat"))
+        os.makedirs(os.path.join(d, "600", "stat"))
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "an unreadable stat must RAISE _ProcUnreadable")
+        except liv._ProcUnreadable:
+            check(True, "an unreadable stat abstains the read")
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller abstains, NEVER falling back to the coarser `ps`")
+
+        # (e) NO procfs at all is a DIFFERENT fact: it is `None`, so the caller may fall
+        # back to `ps` (macOS). The two must not collapse into one answer.
+        check(liv._proc_cpu_cs(os.path.join(d, "nope-not-here")) is None,
+              "a missing procfs is None (fallback), not an abstention")
+
+        # (f) ⛔ A PID NAMED WITH NON-ASCII DIGITS. `str.isdigit()` is TRUE for '\u00b2' and
+        # `int()` REJECTS it; the store below sits outside both try blocks, so such a name
+        # raised `ValueError` straight out of `subtree_cpu_cs`. Same class as #3449.
+        # (Case (d) left `600/stat` as a DIRECTORY, so the whole 600 entry is replaced.)
+        shutil.rmtree(os.path.join(d, "600"))
+        os.makedirs(os.path.join(d, "\u00b2\u00b3"))
+        with open(os.path.join(d, "\u00b2\u00b3", "stat"), "w", encoding="utf-8") as fh:
+            fh.write(stat_line(0, "odd", 1, 1, 1))
+        try:
+            m = liv._proc_cpu_cs(d)
+            check(set(m) == {500, 700},
+                  "a non-ASCII digit name is SKIPPED, not int()'d; got %r" % (m,))
+        except ValueError as exc:
+            check(False, "a non-ASCII digit name must not raise out of the reader: %s" % exc)
+        shutil.rmtree(os.path.join(d, "\u00b2\u00b3"))
+        os.makedirs(os.path.join(d, "600"))
+
+        # (f2) ⛔ THE OTHER HALF OF THAT GUARD, AND it is LOAD-BEARING ON A REAL `/proc`:
+        # its top level holds files AND dirs that are ASCII and not digits — `dma`,
+        # `net`, `self`, `thread-self`, `cpuinfo`, … Without `isdigit()` the guard admits
+        # `net`, `open('/proc/net/stat')` is ENOTDIR, and the WHOLE reading abstains —
+        # permanently, on every Linux invocation. Case (f) pins `isascii()`; this pins
+        # `isdigit()`, which nothing exercised before.
+        os.makedirs(os.path.join(d, "self"))
+        with open(os.path.join(d, "self", "stat"), "w", encoding="utf-8") as fh:
+            fh.write(stat_line(0, "odd", 1, 1, 1))
+        try:
+            m = liv._proc_cpu_cs(d)
+            check(set(m) == {500, 700},
+                  "an ASCII non-digit name (`self`) is SKIPPED, never int()'d; got %r"
+                  % (m,))
+        except ValueError as exc:
+            check(False, "an ASCII non-digit name must not reach int(): %s" % exc)
+        shutil.rmtree(os.path.join(d, "self"))
+
+        # (h) ⛔ ESRCH FROM THE READ. `open()` can succeed while the pid then exits, so
+        # `.read()` raises `ProcessLookupError` — the same "genuinely GONE" fact as a
+        # missing file, one syscall later. A fixture cannot produce that race, so `open`
+        # is stubbed for exactly one path: without the arm it fell into the generic
+        # `OSError` clause and abstained the WHOLE reading (measured 1 in 200 full walks
+        # under a fork storm), so an unrelated process exiting blanked this lane's signal.
+        import builtins
+        real_open = builtins.open
+        target = os.path.join(d, "700", "stat")
+
+        class _Gone:
+            def read(self):
+                raise ProcessLookupError(3, "No such process")
+
+        def _fake_open(path, *a, **k):
+            if str(path) == target:
+                return _Gone()
+            return real_open(path, *a, **k)
+
+        builtins.open = _fake_open
+        try:
+            m = liv._proc_cpu_cs(d)
+            check(set(m) == {500},
+                  "an ESRCH from the read is GONE (skipped), not unreadable; got %r" % (m,))
+        except liv._ProcUnreadable:
+            check(False, "an ESRCH from the read must NOT abstain the whole reading")
+        finally:
+            builtins.open = real_open
+
+        # (g) ⛔ A STAT LINE WITH NO ')' MUST ABSTAIN — the third failure branch, which had
+        # no fixture case and no mutation, so a `continue` there stayed GREEN while it
+        # dropped the row from the population without abstaining (the shrink class).
+        write(600, "600 pi S 500 0 0 0 0 0 0 0 0 3 4\n")
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "a stat line with no ')' must RAISE _ProcUnreadable")
+        except liv._ProcUnreadable:
+            check(True, "a paren-less stat line abstains the read")
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller abstains; got %r" % (liv.subtree_cpu_cs(500, proc_root=d),))
+
+        # (i) ⛔ A FULL-LENGTH ROW WHOSE **ppid TOKEN IS NON-NUMERIC** MUST ABSTAIN TOO.
+        # This is the PARSE arm, not the `)` arm: the row has a valid `)` and every field
+        # present, so `rest[1]` exists — it is `int("abc")` that raises `ValueError`. The
+        # `except` must therefore catch `ValueError` as well as `IndexError`, and only this
+        # shape distinguishes them. Measured before this case existed (the #3404 train had
+        # a pin for it that the rebase dropped): narrowing `except (IndexError, ValueError):`
+        # to `except IndexError:` left PASS=55 FAIL=0, and `ValueError` would then escape
+        # `_proc_cpu_cs` straight out of `subtree_cpu_cs`, whose contract is `None` or
+        # `_ProcUnreadable` — an exception is not a state.
+        write(600, "600 (pi) S abc 0 0 0 0 0 0 0 0 3 4\n")
+        try:
+            liv._proc_cpu_cs(d)
+            check(False, "a non-numeric ppid must RAISE _ProcUnreadable, not skip the row")
+        except liv._ProcUnreadable:
+            check(True, "a non-numeric ppid abstains the read")
+        except ValueError as exc:
+            check(False, "a non-numeric ppid must not raise ValueError out of the reader: %s"
+                  % exc)
+        check(liv.subtree_cpu_cs(500, proc_root=d) is None,
+              "…and the caller abstains rather than returning a short total; got %r"
+              % (liv.subtree_cpu_cs(500, proc_root=d),))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T55 the masking refusal covers the session axis's ABSTENTIONS, not only its evidence")
+def t55():
     """⛔ AN ABSTENTION IS EVIDENCE TOO (#1777 B7 on the log axis).
 
     `ps_ok=False` / `store_ok=False` ARE the session axis answering: they are the
@@ -2233,6 +3101,12 @@ def t50():
     guard listed only the POSITIVE session fields, so a log read resolved over a
     FAILED read — and because the log axis CAN reach `frozen`, that did not merely
     mask the abstention, it CONVICTED a lane on evidence it had just discarded.
+
+    ⛔ THIS TEST WAS LOST IN THE #3404 TRAIN REBASE AND IS RE-LANDED HERE AS T55.
+    The train merged the guard into `evaluate` but not into this suite, and the PR's
+    own T50 is the LOG_STATES vocabulary test — so the guard was pinned by nothing and
+    deleting `not ev.ps_ok or not ev.store_ok` left the suite at PASS/FAIL=0.
+    Measured before this test was restored: the guard removed -> PASS=54 FAIL=0.
     """
     lr_working = LR(alive=True, size_delta=7, transcript_grew=True, cpu_delta_cs=99,
                     age_ms=10, window_ms=liv.LOG_WINDOW_MS)
@@ -2259,61 +3133,107 @@ def t50():
               % (label, v.state, v.reason))
 
 
-@test("T51 the /proc reader ABSTAINS on a malformed row instead of re-parenting it to 0")
-def t51():
-    """⛔ THE SAME RULE AS T39, ON THE PLATFORM WHERE THE FLEET'S LANES LIVE.
+@test("T56 the CPU tolerance is a RATE — a short `--window-ms` cannot freeze a working lane")
+def t56():
+    """⛔ THE TOLERANCE IS A RATE, NOT A FIXED DELTA (measured false FROZEN).
 
-    T39 pins the `ps` arm. The `/proc` arm had no test at all — `/proc` does not exist on
-    the Mac, so nothing ever drove it — and it shipped encoding an unparseable row as
-    `(0, None)`. `0` SEVERS the child's parent link: the walk from our root never reaches
-    the pid, `cpu.get(p) is None` never fires, and the CPU leaves the total. That is a
-    SMALLER total, which is exactly how a busy tree reads flat and then `frozen` — the
-    undercount T39's docstring forbids. Encoding it also orphans its own descendants.
+    `cpu_tol_cs` is quoted for `LOG_WINDOW_MS` (10 cs / 30 s ~= 3.3 mCPU), but
+    `--window-ms` is caller-settable. Applying the raw constant at a shorter window
+    silently raises the bar: a lane burning ~1% of a core accumulates 5 cs in 5 s,
+    which is BELOW 10 — so a LIVE, WORKING lane read `frozen/no-progress`.
+
+    Measured on this host, ONE CPU burner, the SAME instant:
+      --window-ms 30000 -> working progress:cpu cpu+2891cs
+      --window-ms 50    -> frozen no-progress ... cpu_delta_cs=9
+    ``frozen`` on a working lane is the ~50% false-negative class (§13.1) this whole
+    axis exists to delete, so the tolerance is scaled by the window that was used and
+    the effective threshold is echoed.
     """
-    d = tempfile.mkdtemp(prefix="liv-proc-")
-    try:
-        def row(pid, ppid, utime, stime=0, broken=None):
-            if broken == "noparen":
-                stat = "not a stat line"          # no `)` at all
-            elif broken == "badfield":
-                # HAS a `)` but a non-numeric ppid — the parse arm, not the `)` arm
-                stat = "%d (cmd) S xx 0 0 0 0 0 0 0 0 0 %d %d" % (pid, utime, stime)
-            else:
-                # pid (comm) state ppid … utime stime …  — field N is rest[N-3]
-                stat = "%d (cmd) S %d 0 0 0 0 0 0 0 0 0 %d %d" % (pid, ppid, utime, stime)
-            os.makedirs(os.path.join(d, str(pid)), exist_ok=True)
-            with open(os.path.join(d, str(pid), "stat"), "w", encoding="utf-8") as fh:
-                fh.write(stat)
+    def lr(**kw):
+        base = dict(alive=True, size_delta=0, transcript_grew=False,
+                    age_ms=liv.LOG_FREEZE_MS + H)
+        base.update(kw)
+        return LR(**base)
 
-        # root 100 (1 s) + child 101 (2 s) = 3 s = 300 cs. A non-pid dir is ignored.
-        row(100, 1, 100)
-        row(101, 100, 200)
-        os.makedirs(os.path.join(d, "self"), exist_ok=True)
-        proc = liv._proc_cpu_cs(d)
-        check(proc == {100: (1, 100), 101: (100, 200)},
-              "the /proc reader parses (ppid, cpu_cs) and skips non-pid entries; got %r" % (proc,))
-        check(liv._sum_subtree(100, {p: v[0] for p, v in proc.items()},
-                               {p: v[1] for p, v in proc.items()}) == 300,
-              "the subtree sums root+descendants")
+    # (a) THE DEFECT: at a short window, real CPU work IS progress.
+    for w, delta in ((50, 9), (1000, 4), (5000, 5), (5000, 26)):
+        v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=delta, window_ms=w)))
+        check(v.state == "working" and "cpu" in v.reason,
+              "window_ms=%d with cpu_delta_cs=%d is a WORKING lane; got %s/%s %s"
+              % (w, delta, v.state, v.reason, v.detail))
 
-        # THE DISCRIMINATING CASES. Both arms used to SILENTLY SKIP a malformed row: the
-        # parse arm encoded it as `(0, None)` (severed parent link — the walk never reached
-        # pid 102, so its CPU vanished) and the no-`)` arm `continue`d outright. Pre-fix,
-        # both left the total at 300: a clean-looking undercount of a subtree that holds an
-        # unreadable member.
-        for shape in ("badfield", "noparen"):
-            for stale in ("102",):
-                shutil.rmtree(os.path.join(d, stale), ignore_errors=True)
-            row(102, 100, 0, broken=shape)
-            check(liv._proc_cpu_cs(d) is None,
-                  "a malformed row (%s) ABSTAINS the whole /proc read — it is never "
-                  "re-parented to 0 and never skipped" % shape)
+    # (b) ⛔ NOT NEUTERED — a genuinely flat lane still freezes at EVERY window. This is
+    # the half that stops the fix from being "make everything progress".
+    for w in (50, 1000, 5000, liv.LOG_WINDOW_MS):
+        v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=0, window_ms=w)))
+        check(v.state == "frozen" and v.reason == "no-progress",
+              "a FLAT lane still freezes at window_ms=%d; got %s/%s" % (w, v.state, v.reason))
 
-        # …and a non-existent root is an abstention, never an empty map that reads as "no CPU".
-        check(liv._proc_cpu_cs(os.path.join(d, "absent")) is None,
-              "an unreadable /proc is an abstention")
-    finally:
-        shutil.rmtree(d, ignore_errors=True)
+    # …and the documented default threshold is unchanged and STRICT (`>`, not `>=`).
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=liv.LOG_CPU_TOL_CS,
+                                             window_ms=liv.LOG_WINDOW_MS)))
+    check(v.state == "frozen", "at the default window the tolerance is still STRICTLY above")
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=liv.LOG_CPU_TOL_CS + 1,
+                                             window_ms=liv.LOG_WINDOW_MS)))
+    check(v.state == "working", "one cs above the rated tolerance is progress")
+
+    # (c) THE ECHO IS THE THRESHOLD THAT DECIDED, so a reader is never told about a
+    # different number from the one applied.
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=5, window_ms=5000)))
+    check("tol_cs=1" in (v.detail or "") and "window_ms=5000" in (v.detail or ""),
+          "the detail echoes the SCALED tolerance actually applied; got %r" % (v.detail,))
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=0, window_ms=liv.LOG_WINDOW_MS)))
+    check("tol_cs=10" in (v.detail or ""), "at the default window the echo is the rated 10")
+    # An UNKNOWN window (the census seam, where the caller owns the samples) abstains from
+    # scaling rather than inventing one — the tolerance stays the rated constant.
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=5, window_ms=None)))
+    check("tol_cs=10" in (v.detail or ""),
+          "window_ms=None does not scale (no span to scale by); got %r" % (v.detail,))
+
+
+@test("T57 EVERY conjunct of the masking refusal is pinned ALONE, not only in aggregate")
+def t57():
+    """⛔ EIGHT OF THE TEN CONJUNCTS COULD BE DELETED WITH THE SUITE STILL GREEN.
+
+    T36 drove the refusal through `ev()`, whose base sets `sid`, `jsonl_grew` AND
+    `jsonl_age_ms` TOGETHER — so any one surviving conjunct kept the guard firing and a
+    single deletion was invisible. Measured before this test, each of these removed
+    alone left `PASS=55 FAIL=0`: `ev.sid`, `ev.claim_read`, `ev.candidates`, `ev.record`,
+    `ev.jsonl_grew`, `ev.jsonl_age_ms`, `ev.tool`, `ev.jsonl_turn`.
+
+    That is the same defect the file already records once ("the guard listed only
+    POSITIVE session fields once" -> T55), and it lands as a false PASS in the MASKING
+    direction: drop one conjunct and `Evidence(log_read=frozen, claim_read=...)` resolves
+    to `frozen`, convicting a lane on evidence the query also carried, with a green suite
+    and `--mutations` at 107/107.
+    """
+    lr_frozen = LR(alive=True, size_delta=0, transcript_grew=False, cpu_delta_cs=0,
+                   age_ms=liv.LOG_FREEZE_MS + H, window_ms=liv.LOG_WINDOW_MS)
+
+    # CONTROL FIRST: with ONLY log_read, the convicting state is legitimate — otherwise
+    # "refuse everything" would pass this test.
+    check(liv.evaluate(liv.Evidence(log_read=lr_frozen)).state == "frozen",
+          "a clean log-only query still reaches frozen")
+
+    # ONE field at a time. The sentinels are never inspected: the refusal must fire on
+    # PRESENCE, which is exactly what masking is.
+    lone = [
+        ("sid", dict(sid="sid-1")),
+        ("claim_read", dict(claim_read=object())),
+        ("candidates", dict(candidates=[C(1, NOW_MS)])),
+        ("record", dict(record=object())),
+        ("jsonl_grew", dict(jsonl_grew=False)),
+        ("jsonl_age_ms", dict(jsonl_age_ms=H)),
+        ("tool", dict(tool=object())),
+        ("jsonl_turn", dict(jsonl_turn=object())),
+        ("ps_ok=False", dict(ps_ok=False)),
+        ("store_ok=False", dict(store_ok=False)),
+    ]
+    for label, kw in lone:
+        v = liv.evaluate(liv.Evidence(log_read=lr_frozen, **kw))
+        check(v.state == "unknown" and v.reason == "log-read-on-session-query",
+              "%s ALONE must refuse the log axis; got %s/%s %s"
+              % (label, v.state, v.reason, v.detail))
 
 
 class Mutation:
@@ -2332,6 +3252,20 @@ MUTATIONS = [
         '    if False and kinds:\n        numbers = []',
         "the progress VETO is dropped, so a lane working through a long silent tool call "
         "reads `frozen` — the log-mtime-keyed behaviour the 2026-11-03 table measured",
+    ),
+    # ⛔ RESTORED FROM `main` (#3404). `08772f153` added this entry because "T38 was the ONE
+    # test in the axis with no paired mutation, so nothing proved it could fail" — and the
+    # branch's own `891f071f1` then dropped those three lines, replacing the slot with its
+    # own T50 (`LOG_STATES`) mutation. At the pre-restore head `grep '"T38"'` was 0, so the
+    # axis's own before/after table — the §13.1 measurement, the land-10762 false negative —
+    # had no RED control while `--mutations` still printed a clean 105/105.
+    Mutation(
+        "T38", "module",
+        'BOUND_FINISHED = frozenset({"finished"})',
+        'BOUND_FINISHED = frozenset()',
+        "an exited lane's `verdict=finished` reads `dead`, so the before/after table's "
+        "FINISHED row convicts a lane that completed — the 2026-11-03 false negative "
+        "(land-10762) that the whole §13.1 measurement exists to pin",
     ),
     Mutation(
         "T33", "module",
@@ -2364,7 +3298,7 @@ MUTATIONS = [
         "read can mask it (the #1777 B7 shape, reconstructed on the new axis)",
     ),
     Mutation(
-        "T50", "module",
+        "T55", "module",
         '        if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \\\n'
         '                or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \\\n'
         '                or ev.tool is not None or ev.jsonl_turn is not None \\\n'
@@ -2400,7 +3334,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T37", "module",
-        '                if lr.rc not in BOUND_OK_RC:',
+        '                if rc not in BOUND_OK_RC:',
         '                if False:',
         "the rc conjunct is dropped, so `verdict=finished rc=7` — a CRASHED lane — reads "
         "`finished` and nobody re-dispatches the work it lost",
@@ -2458,15 +3392,21 @@ MUTATIONS = [
         "T41", "module",
         '                    if stat.S_ISREG(st.st_mode):',
         '                    if True:',
-        "the census seam stops checking the path is a regular file, so a directory reads as "
-        "a readable log and its 0-byte delta looks flat",
+        "the census seam stops naming a non-regular path as its own FACT: it falls through to "
+        "the read proof, so a directory is reported as a generic `unreadable:` "
+        "(IsADirectoryError) instead of `not-a-regular-file:`. The state is the same, so this "
+        "is pinned by the DETAIL — the doc distinguishes the two facts and a reader routes on "
+        "the named reason",
     ),
     Mutation(
         "T40", "module",
         '        if not stat.S_ISREG(st.st_mode):',
         '        if False:',
-        "a path that stats but is not a regular file (a directory) reads as a readable log, "
-        "so its 0-byte delta looks flat",
+        "a path that stats but is not a regular file stops naming itself as that fact and falls "
+        "through to the read proof, so a directory is reported as `unreadable: "
+        "(IsADirectoryError)` instead of `not-a-regular-file:` — and, on a platform where the "
+        "open succeeds, a fifo/socket/device would be OPENED (a blocking read on every census "
+        "row). Pinned by the named detail",
     ),
     Mutation(
         "T1", "lib",
@@ -2739,8 +3679,8 @@ MUTATIONS = [
     ),
     Mutation(
         "T43", "module",
-        '        if _bound_pid_field_re().search(pid_head):\n            return "?"',
-        '        if False:\n            return "?"',
+        '    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
+        '    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else ""',
         "a `pid=` field that is PRESENT but unparseable (a FOREIGN / hand-edited verdict "
         "file, a restored state dir, or a future producer — NOT the shipped writer, which "
         "refuses a non-numeric `--pid`) is collapsed into \"no pid at all\", so the verdict "
@@ -2777,19 +3717,20 @@ MUTATIONS = [
     ),
     Mutation(
         "T43", "module",
-        '    return pids[-1] if len(pids[-1]) <= 10 else "?"',
-        '    return pids[-1]',
+        '    return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
+        '    return tok',
         "the cap is gone, so an unusable pid token falls through to the FALLBACK guard: "
         "the drop reason becomes invalid-bound-verdict-pid instead of unbound-bound-verdict "
         "(and but for that guard, int() would raise out of gather_log_lane)",
     ),
     Mutation(
         "T49", "module",
-        '    if not 1 <= len(fields) <= 3 or not all(f.isascii() and f.isdigit() for f in fields):',
-        '    if not 1 <= len(fields) <= 3 or not all(f.isdigit() for f in fields):',
+        '            or not all(f.isascii() and f.isdigit() and len(f) <= 6 for f in fields)):',
+        '            or not all(f.isdigit() and len(f) <= 6 for f in fields)):',
         "a non-ASCII digit passes .isdigit() and raises in int(), where _cpu_time_cs' "
         "contract is None on an unreadable read (the Mac `ps` path)",
-    ),    Mutation(
+    ),
+    Mutation(
         "T46", "module",
         '            if lr.verdict:',
         '            if False:',
@@ -2805,26 +3746,27 @@ MUTATIONS = [
     ),
     Mutation(
         "T48", "module",
-        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
-        '                return tok if (tok.isascii() and tok.isdigit()) else "?"',
-        "the digit cap is gone, so an out-of-range row pid reaches int() BEFORE `_bind_verdict` "
-        "decides and raises ValueError (the 4300-digit conversion limit), taking the whole "
-        "census run down after printing only the rows before it",
-    ),
-    Mutation(
-        "T48", "module",
-        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else "?"',
-        '                return tok if (tok.isascii() and tok.isdigit() and len(tok) <= 10) else ""',
-        "a col-11 pid that is PRESENT but unusable is collapsed into \"absent\", so the census "
-        "takes the ADOPT arm and publishes a verdict whose binding was never checked — the "
-        "fail-open the col-11 rule exists to close",
-    ),
-    Mutation(
-        "T48", "module",
         '                    note = "bound-verdict-without-pid source=census"',
         '                    note = ""',
         "the census adopts an unbound 10-column row SILENTLY, so the fifth rule of the "
         "binding table is false on the fleet-wide surface",
+    ),
+    # ⛔ RESTORED FROM `main` (#3404), the sibling of round 5's T38. `main` proved BOTH census
+    # pid-seam defects RED from one anchor; this branch's refactor moved `_pidtok` from
+    # `… else "?"` to a wrapped `… else ""`, and only the PRESENT-BUT-UNUSABLE half was
+    # re-homed (as T46's `_pidcol(10)` -> `_num(10)`). The DIGIT-CAP half was simply dropped,
+    # so `--mutations` printed a clean 106/106 while nothing re-introduced it. Verified before
+    # restoring: the anchor occurs exactly once (`liveness.py:3194`) and applying it reddens
+    # T48 with the ValueError main's `why` describes.
+    Mutation(
+        "T48", "module",
+        '                return (tok if tok.isascii() and tok.isdigit() and len(tok) <= 10\n'
+        '                        else "")',
+        '                return (tok if tok.isascii() and tok.isdigit()\n'
+        '                        else "")',
+        "the digit cap is gone, so an out-of-range row pid reaches int() BEFORE `_bind_verdict` "
+        "decides and raises ValueError (the 4300-digit conversion limit), taking the whole "
+        "census run down after printing only the rows before it",
     ),
     Mutation(
         "T43", "module",
@@ -2833,23 +3775,338 @@ MUTATIONS = [
         "a caller that bypasses `parse_bound_pid` hands a non-numeric token to int(), so "
         "the drop becomes a ValueError out of `gather_log_lane`",
     ),
+    # ── the 2026-11-04 review round: `rc=na` is not completion evidence ─────────────
     Mutation(
-        "T51", "module",
-        '            # turns an unread member into a missing one.\n            return None',
-        '            # turns an unread member into a missing one.\n'
-        '            out[int(name)] = (0, None)\n            continue',
-        "an unparseable /proc row is encoded as `(0, None)`, so the walk never visits it "
-        "and the subtree total silently UNDERCOUNTS — the `/proc` twin of T39's defect, on "
-        "the platform where the fleet's lanes actually live",
+        "T37", "module",
+        '                if rc == "na":',
+        '                if False and rc == "na":',
+        "the `rc=na` corroboration is dropped, so `watch` mode's unconditional token — the "
+        "shape `spawn-gate.sh`'s `run_agent` writes for every lane via `lane-bound.sh "
+        "watch` — is no longer required to be witnessed by the caller's rc line",
     ),
     Mutation(
-        "T38", "module",
-        'BOUND_FINISHED = frozenset({"finished"})',
-        'BOUND_FINISHED = frozenset()',
-        "an exited lane's `verdict=finished` reads `dead`, so the before/after table's "
-        "FINISHED row convicts a lane that completed — the 2026-11-03 false negative "
-        "(land-10762) that the whole §13.1 measurement exists to pin. T38 was the ONE test "
-        "in the axis with no paired mutation, so nothing proved it could fail",
+        "T37", "module",
+        '                    if runner_rc != "0":',
+        '                    if False:',
+        "the launcher's NON-ZERO rc is ignored, so a crashed / OOM-killed / "
+        "watchdog-killed lane publishes `finished` — the false PASS over lost work the "
+        "whole rc conjunct exists to remove",
+    ),
+    Mutation(
+        "T37", "module",
+        'globals()["_BOUND_LINE_RE"] = _re.compile(r"\\[lane-bound\\]\\s+VERDICT\\b")',
+        'globals()["_BOUND_LINE_RE"] = _re.compile(r"\\[lane-bound\\]\\s+VERDICT\\b.*?\\bverdict=([a-z][a-z-]*)")',
+        "the locator requires a MATCHABLE token again, so an UNMATCHABLE final marker "
+        "(uppercase / absent / spaced token) is never found and the previous recognised "
+        "verdict is silently promoted",
+    ),
+    Mutation(
+        "T46", "module",
+        '            verdict_pid = _pidcol(10)',
+        '            verdict_pid = _num(10)',
+        "a PRESENT-but-unusable col 11 collapses to \"absent\", so the census ADOPTS a "
+        "previous dispatch's verdict that `gather_log_lane` drops",
+    ),
+    Mutation(
+        "T50", "module",
+        'LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown")',
+        'LOG_STATES = ("working", "frozen", "finished", "no-verdict", "dead", "unknown", "gone")',
+        "the log-state vocabulary grows silently, breaking every consumer and the doc's "
+        "disjointness claim while the whole suite stays green",
+    ),
+    # ── the ACQUISITION half: T51 fails if either of these is dropped ────────────────
+    Mutation(
+        "T51", "module",
+        '    if lr.readable:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        '    if False:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        "gather_log_lane stops POPULATING the launcher witness, so every completed "
+        "watch-mode lane loses its corroboration and reads `unknown` — the pure verdict "
+        "matrix stays green because T37 stacks the field by hand",
+    ),
+    # ── the NO-BOUND-VERDICT population (`merge-one.sh`): T52 fails if either is dropped ──
+    Mutation(
+        "T52", "module",
+        '        if runner_rc is not None:\n            return Verdict("no-verdict", "process-gone-no-verdict",',
+        '        if False:\n            return Verdict("no-verdict", "process-gone-no-verdict",',
+        "a lane with no bound verdict goes back to asserting it 'told us nothing' "
+        "over a log whose launcher line said rc=0 — the merge-one.sh false negative",
+    ),
+    Mutation(
+        "T52", "module",
+        '    if lr.readable:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        '    if lr.rc == "na" and lr.readable:\n        runner_pid, runner_rc = parse_runner_line(_log_tail(log_path))',
+        "the launcher witness is consulted ONLY for `rc=na` again, which discards it for "
+        "every lane that has no bound line at all (`merge-one.sh`)",
+    ),
+    Mutation(
+        "T51", "module",
+        '            same_incarnation = ((runner_pid == lr.verdict_line_pid)',
+        '            same_incarnation = (True or (runner_pid == lr.verdict_line_pid)',
+        "the witness is not bound to an incarnation, so on an APPENDED log a previous "
+        "dispatch's `[timeout] agent … rc=0` corroborates a crash into a completion",
+    ),
+    Mutation(
+        "T51", "module",
+        'globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\\brc=(\\d{1,3})\\b")',
+        'globals()["_RUNNER_RC_TOKEN_RE"] = _re.compile(r"\\brc=([^\\s]+)\\b")',
+        "an UNREADABLE launcher status is accepted as a status again, so the acquisition "
+        "path stops recording `runner-rc-unreadable` and the detail reverts to claiming "
+        "the launcher line is ABSENT — a fact the log contradicts. (The state is guarded "
+        "twice — the door normalises too — so the DETAIL is what discriminates here.)",
+    ),
+    # ── round 3: the unbounded bound-line token ───────────────────────────────────────
+    # (the census `rc` column needs no mutation of its own: the allow-list lives at ONE
+    # door — `log_lane_verdict` — and the `T37` "stops normalising `rc`" mutation below
+    # is what discriminates it. A census-local copy was tried and reverted: it masked
+    # its own mutation, since either copy alone produced the same observable state.)
+    Mutation(
+        "T37", "module",
+        '        _BOUND_RC_RE = _re.compile(r"\\brc=([0-9]{1,10}|na)\\b")',
+        '        _BOUND_RC_RE = _re.compile(r"\\brc=([0-9]+|na)\\b")',
+        "an UNBOUNDED rc token matches a runaway value that then reads as a status and "
+        "is interpolated whole into the reason",
+    ),
+    # ── round 4: the verdict door, and the silently-dropped census flags ─────────────
+    Mutation(
+        "T37", "module",
+        '        elif (rc is not None and rc != "na"',
+        '        elif False and (rc is not None and rc != "na"',
+        "the verdict function stops normalising `rc`, so a DIRECT caller publishes "
+        "`bound-finished-rc:0x0` — a negative fact from an unreadable status — that both "
+        "shipped producers abstain on",
+    ),
+    Mutation(
+        "T41", "module",
+        '        if (log or pid is not None or vfile or transcript or start_seconds is not None\n'
+        '                or as_json or not sample or window_ms_set):',
+        '        if log or pid is not None:',
+        "`--log-census` silently DROPS the per-lane flags again, so a `--verdict-file` that "
+        "makes the single-lane arm say `finished` is ignored and the census publishes "
+        "`no-verdict` for that lane with exit 0",
+    ),
+    Mutation(
+        "T41", "module",
+        '                or as_json or not sample or window_ms_set):',
+        '                or as_json or not sample):',
+        "`--log-census` accepts `--window-ms` again and interpolates it into every row's "
+        "`detail`, so the census reports a window the caller's deltas were never measured "
+        "over — a lying diagnostic, which is worse than a dropped flag",
+    ),
+    # ── round 5: the launcher status at the door, and a negative log age ───────────
+    Mutation(
+        "T41", "module",
+        '                         cpu_unreadable=(cpu_delta is None or cpu_delta < 0),',
+        '                         cpu_unreadable=(cpu_delta is None),',
+        "a NEGATIVE cpu delta is reported as a FINE channel (`cpu_unreadable=0`) beside the "
+        "value the verdict refuses to trust, so the detail and the abstention contradict "
+        "each other on one line",
+    ),
+    Mutation(
+        "T37", "module",
+        '                if runner_rc is not None and runner_rc != "0":',
+        '                if False and runner_rc is not None and runner_rc != "0":',
+        "a CLEAN bound `rc=` stops consulting the launcher, so a bound line claiming `rc=0` "
+        "publishes `finished` while the CALLER's own line says the child exited non-zero — "
+        "the two disagree and completion is not established",
+    ),
+    Mutation(
+        "T37", "module",
+        '        if (runner_rc is not None',
+        '        if False and (runner_rc is not None',
+        "the verdict function stops normalising the LAUNCHER status, so a DIRECT caller's "
+        "unreadable token becomes the positive claim \"the child did NOT complete\"",
+    ),
+    Mutation(
+        "T47", "module",
+        '    if lr.age_ms is None or lr.age_ms < 0:',
+        '    if lr.age_ms is None:',
+        "a NEGATIVE log age reads as \"less than the freeze window\" again, so a broken "
+        "reading publishes `working/within-window` and the freeze check can never fire",
+    ),
+    # ── round 7: present-but-unreadable vs absent, and an implausible number ─────────
+    Mutation(
+        "T37", "module",
+        '    return (verdict, "?" if _bound_rc_present_re().search(head) else None)',
+        '    return (verdict, None)',
+        "a PRESENT-but-unreadable `rc=` collapses into ABSENT again, so the detail claims "
+        "\"no rc= on the line\" over a line that carried one — a fact the log contradicts",
+    ),
+    Mutation(
+        "T41", "module",
+        '                if not (body.isascii() and body.isdigit() and len(body) <= maxdigits):',
+        '                if not (body.isascii() and body.isdigit()):',
+        "an IMPLAUSIBLE census number (40 digits) is accepted as a reading again, so a "
+        "runaway `size_delta`/`age_ms` becomes a state and is interpolated whole",
+    ),
+    # ── round 8: the launcher LOCATOR, and an unbounded digit run reaching int() ──────
+    Mutation(
+        "T51", "module",
+        'globals()["_RUNNER_MARKER_RE"] = _re.compile(r"\\[timeout\\]\\s+agent\\b")',
+        'globals()["_RUNNER_MARKER_RE"] = _re.compile(r"\\[timeout\\]\\s+agent\\s+pid=(\\d{1,10})\\b")',
+        "the LOCATOR carries the pid allow-list again, so a launcher line with an unusable "
+        "pid never matches and the verdict asserts \"no corroborating reading\" over a log "
+        "that has one",
+    ),
+    Mutation(
+        "T51", "module",
+        '        elif runner_pid and runner_rc is None:',
+        '        elif False:',
+        "the \"present but unreadable\" runner fact is dropped, so the detail reverts to "
+        "claiming no launcher line exists",
+    ),
+    Mutation(
+        "T39", "module",
+        '        if not (d.isascii() and d.isdigit() and len(d) <= 6):',
+        '        if not (d.isascii() and d.isdigit()):',
+        "the DAYS field is unbounded again, so a long digit run raises where the contract "
+        "is `None`",
+    ),
+    Mutation(
+        "T39", "module",
+        '    return (int(out) if (out.isascii() and out.isdigit() and len(out) <= 10) else None)',
+        '    return (int(out) if (out.isascii() and out.isdigit()) else None)',
+        "`_parent_of`'s digit bound is dropped again, so an unreadable ppid row raises "
+        "ValueError on the BINDING path, where the contract is `None`",
+    ),
+    Mutation(
+        "T43", "module",
+        'globals()["_BOUND_PID_RE"] = _re.compile(r"\\bpid=(\\S*)")',
+        'globals()["_BOUND_PID_RE"] = _re.compile(r"\\bpid=([0-9]+)\\b")',
+        "the bound-line PID LOCATOR carries the allow-list again, so an unusable `pid=` "
+        "reads as ABSENT and is ADOPTED — a previous dispatch's `finished` published as "
+        "this lane's terminal state",
+    ),
+    Mutation(
+        "T52", "module",
+        '            # queried lane — over-refusal is the safe direction here.\n            lr.verdict, lr.rc, lr.verdict_line_pid = "", None, ""',
+        '            # queried lane — over-refusal is the safe direction here.\n            lr.verdict, lr.rc = "", None',
+        "a DROPPED bound verdict keeps its incarnation, so the launcher block binds the "
+        "refused dispatch's own `rc=0` to the queried lane and publishes 'the launcher "
+        "reported rc=0' for a lane that said nothing (the stale-pair regression the "
+        "widened gate introduced)",
+    ),
+    Mutation(
+        "T52", "module",
+        '                                if lr.verdict_line_pid else (runner_pid == str(pid)))',
+        '                                if lr.verdict_line_pid else True)',
+        "with NO bound line the launcher witness is adopted unconditionally, so ANY "
+        "appended `[timeout] agent … rc=0` from an earlier dispatch corroborates this lane",
+    ),
+    Mutation(
+        "T53", "module",
+        '        if cpu.get(p) is None:\n            return None',
+        '        if cpu.get(p) is None:\n            continue',
+        "an unread member is SKIPPED instead of abstaining, so the subtree total shrinks "
+        "and a busy tree reads flat -> `frozen` (the invariant `_sum_subtree` states and "
+        "the `ps` path honours; `_proc_cpu_cs` used to violate it)",
+    ),
+    Mutation(
+        "T54", "module",
+        '            raise _ProcUnreadable("unreadable %s/%s/stat" % (root, name))',
+        '            continue',
+        "an UNREADABLE `/proc` member is dropped from the population instead of "
+        "abstaining, so the subtree total shrinks and a busy tree reads flat -> `frozen`",
+    ),
+    Mutation(
+        "T54", "module",
+        '            raise _ProcUnreadable("truncated %s/%s/stat" % (root, name))',
+        '            out[int(name)] = (0, None)\n            continue',
+        "a TRUNCATED stat row is stored with ppid rewritten to 0 — detaching the pid and "
+        "its whole subtree from the walk, with its cpu=None unreachable — the residual "
+        "shrink that survived the first fix",
+    ),
+    Mutation(
+        "T54", "module",
+        '    except _ProcUnreadable:\n        return None',
+        '    except _ProcUnreadable:\n        proc = None',
+        "an unreadable `/proc` member FALLS BACK to the coarser `ps` instead of abstaining, "
+        "which reads the same blind spot at whole-second resolution and returns a number",
+    ),
+    Mutation(
+        "T54", "module",
+        '            raise _ProcUnreadable("unparseable %s/%s/stat" % (root, name))',
+        '            continue',
+        "a PAREN-LESS stat row is dropped from the population instead of abstaining — the "
+        "third failure branch, which had no fixture case and no mutation",
+    ),
+    Mutation(
+        "T54", "module",
+        '        if not (name.isascii() and name.isdigit() and len(name) <= 10):',
+        '        if not name.isdigit():',
+        "`str.isdigit()` admits non-ASCII digits that `int()` rejects, so a non-ASCII name "
+        "raises ValueError straight out of the reader (#3449's class)",
+    ),
+    Mutation(
+        "T54", "module",
+        '        except ProcessLookupError:',
+        '        except ZeroDivisionError:',
+        "an ESRCH from the READ is not caught, so it falls into the generic OSError clause "
+        "and abstains the whole reading instead of treating the pid as gone (one unrelated "
+        "process exiting blanks the lane's CPU signal)",
+    ),
+    Mutation(
+        "T54", "module",
+        '        if not (name.isascii() and name.isdigit() and len(name) <= 10):',
+        '        if not (name.isascii() and len(name) <= 10):',
+        "the `isdigit()` conjunct is dropped, so `net`/`self`/`dma` reach `open(root/net/stat)` "
+        "-> ENOTDIR -> the WHOLE reading abstains on every real `/proc`",
+    ),
+    Mutation(
+        "T54", "module",
+        '        except (IndexError, ValueError):\n            # ⛔ THE SAME RULE ONE BRANCH DOWN',
+        '        except IndexError:\n            # ⛔ THE SAME RULE ONE BRANCH DOWN',
+        "a FULL-LENGTH row whose `ppid` token is non-numeric raises ValueError straight out "
+        "of `_proc_cpu_cs` (the parse arm), escaping `subtree_cpu_cs`, whose contract is "
+        "`None` or `_ProcUnreadable` — the `)` arm is caught either way, so only that shape "
+        "distinguishes the two",
+    ),
+    Mutation(
+        "T51", "module",
+        '        if _RUNNER_PID_TOKEN_RE.search(cand) is None:',
+        '        if False:',
+        "a marker line with NO `pid=` token is taken as the launcher report again: it asserts "
+        "a pid token existed AND shadows an earlier readable witness, downgrading a "
+        "corroborated `finished` to `unknown`",
+    ),
+    Mutation(
+        "T56", "module",
+        '        eff_tol_cs = max(1, (int(cpu_tol_cs) * int(lr.window_ms)) // LOG_WINDOW_MS)',
+        '        eff_tol_cs = cpu_tol_cs',
+        "the tolerance goes back to a FIXED delta, so a lane WORKING at a short "
+        "`--window-ms` reads `frozen` again (measured: cpu+9cs at `--window-ms 50`, "
+        "cpu+4cs at 2000) — a false FROZEN on the state this axis exists to get right",
+    ),
+    Mutation(
+        "T40", "module",
+        '            try:\n                with open(log_path, "rb"):\n                    pass\n            except OSError as exc:',
+        '            try:\n                pass\n            except OSError as exc:',
+        "the READ PROOF is dropped, so `readable` is decided by `S_ISREG` alone again: a mode-000 "
+        "regular file passes, its byte channel is never read, and `size_delta = st_size - st_size "
+        "= 0` is published as a positively FLAT reading — a LIVE lane reads `frozen/no-progress`",
+    ),
+    Mutation(
+        "T41", "module",
+        '                        try:\n                            with open(path, "rb"):\n                                pass',
+        '                        try:\n                            pass',
+        "the CENSUS read proof is dropped, so a mode-000 row publishes `frozen/no-progress "
+        "bytes_delta=0` from a byte channel it never read — measured on the census seam, the "
+        "surface §13.5 names as the fleet reader's home (T41 row 77 pins it)",
+    ),
+    Mutation(
+        "T40", "module",
+        '            lr.readable = False\n            lr.detail = "unreadable-on-second-read:%s" % log_path',
+        '            lr.size_delta = 0',
+        "a log that vanishes between the two samples is published as a fabricated FLAT "
+        "`size_delta=0` instead of abstaining — the same `unread is not zero` rule as the "
+        "mode-000 case, one door down (T40's vanish case pins it)",
+    ),
+    Mutation(
+        "T57", "module",
+        'or ev.candidates or ev.record is not None',
+        'or ev.record is not None',
+        "ONE conjunct of the masking refusal is dropped — invisible before T57 because the "
+        "guard was pinned only in aggregate (#1777 B7 rebuilt: a `frozen` log read then "
+        "convicts a lane whose claim/candidate evidence the query carried)",
     ),
 ]
 
@@ -2950,11 +4207,58 @@ def run_mutations():
     return bad == 0
 
 
+def check_header_counts() -> int:
+    """Hold EVERY count this file states to the measurement.
+
+    ⛔ A COUNT IN A VERIFICATION ARTIFACT IS A CLAIM, and this header has been stale
+    before: the first version of this gate read only the two command examples below,
+    while its own docstring claimed it checked "these two numbers" in the opening
+    sentence — so editing the sentence alone left the suite GREEN and the gate
+    announcing a match it had never tested (measured: exit 0 with a wrong first
+    sentence). Every occurrence is checked now, and the prose uses digits so the
+    words-form cannot drift out of reach.
+
+    Provenance, verified per commit rather than asserted (the first version of this
+    docstring got it wrong and a reviewer falsified it): `main`'s baseline was 51/72
+    (`origin/main:tools/fleet/liveness.test.py:20-21`), `dceeb68e8` moved the header
+    53/93 -> 54/96, `aa424dafc` reached 99 -> 100, and the rescue commits after the
+    #3404 rebase brought it here.
+    """
+    import re as _re
+    with open(__file__, encoding="utf-8") as fh:
+        src = fh.read()
+    m_p = _re.search(r"^(\d+) tests with (\d+) paired mutations", src, _re.M)
+    m_t = _re.search(r"# the (\d+) tests, green", src)
+    m_m = _re.search(r"each mutation, RED \((\d+)\)", src)
+    # (label, stated, measured) — one row per OCCURRENCE, so no copy can be skipped.
+    rows = [
+        ("opening sentence, tests", int(m_p.group(1)) if m_p else None, len(TESTS)),
+        ("opening sentence, mutations", int(m_p.group(2)) if m_p else None, len(MUTATIONS)),
+        (":run example, tests", int(m_t.group(1)) if m_t else None, len(TESTS)),
+        (":run example, mutations", int(m_m.group(1)) if m_m else None, len(MUTATIONS)),
+    ]
+    bad = 0
+    for label, stated, measured in rows:
+        if stated != measured:
+            print("   ❌ HEADER STALE — %s says %r, the suite holds %d"
+                  % (label, stated, measured))
+            bad += 1
+    if not bad:
+        print("   ok   every stated count matches the suite (%d tests, %d mutations)"
+              % (len(TESTS), len(MUTATIONS)))
+    return bad
+
+
 def main(argv):
     if "--mutations" in argv:
         return 0 if run_mutations() else 1
     print("── #1178 liveness acceptance suite (%d tests) ──" % len(TESTS))
-    return 0 if run_tests(os.environ.get("LIVENESS_ONLY")) else 1
+    ok = run_tests(os.environ.get("LIVENESS_ONLY"))
+    # ⛔ run LAST so the counts above are the real ones, and only in the full-suite path:
+    # the mutation harness runs one test in a subprocess and must not pay for this.
+    if os.environ.get("LIVENESS_ONLY") is None:
+        ok = (check_header_counts() == 0) and ok
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
