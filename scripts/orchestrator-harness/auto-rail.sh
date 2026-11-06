@@ -133,6 +133,22 @@ case "${REVIEW_COOLDOWN_S}" in ''|*[!0-9]*)
 REVIEW_PER_PASS=${REVIEW_PER_PASS:-1}
 case "${REVIEW_PER_PASS}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: REVIEW_PER_PASS='${REVIEW_PER_PASS}' is not a non-negative integer — 0 is legal and means 'publish awaiting-review and dispatch nothing' (it disables the review arm rather than the bound), a non-number makes the comparison an ERROR, which reads as FALSE, i.e. no bound at all" >> "$LOG"; exit 3;; esac
+# ⛔ PER-PASS IS NOT A LIFETIME BOUND, AND `retry` WAS THE HOLE IN IT (measured by review, 2026-11-05).
+# `REVIEW_PER_PASS` bounds one pass; it says nothing about the SAME head being re-bought on the next one.
+# A reviewer that runs the full review and then fails AFTER it was paid for — `review-pr.sh` rc=6 (no
+# verdict line), rc=9 (the record/artifact arm), rc=10 (the P0/P1/P2 scanner did not run) — leaves state
+# `retry`, and the retry window is measured from the DISPATCH epoch, which by then is already older than
+# COOLDOWN_TRANSIENT_S because the review itself outlasts it. So every pass re-dispatched immediately:
+# one full paid review per review-duration, at one head, for ever, with the record truncated on each
+# replay so an operator could not even count the attempts. `review-pr.sh`'s own header names this
+# remedy defect from the other side ("re-running the recorder is the remedy, not re-reviewing").
+# The bound is a durable per-head ATTEMPT LEDGER, counted only after a dispatch is VERIFIED to have
+# started (a rollback must consume nothing), and EXHAUSTED is a terminal answer that publishes itself
+# on the PR instead of dispatching again. A new head is a new key, so a fix still gets its review.
+REVIEW_MAX_ATTEMPTS=${REVIEW_MAX_ATTEMPTS:-3}
+case "${REVIEW_MAX_ATTEMPTS}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: REVIEW_MAX_ATTEMPTS='${REVIEW_MAX_ATTEMPTS}' is not a non-negative integer — a non-number makes the attempt comparison an ERROR, which reads as FALSE, i.e. no bound at all" >> "$LOG"; exit 3;; esac
+[ "$REVIEW_MAX_ATTEMPTS" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_MAX_ATTEMPTS='${REVIEW_MAX_ATTEMPTS}' is not a POSITIVE integer — 0 makes every head EXHAUSTED before its first dispatch, which is the review arm silently disabled while the log reads clean; REVIEW_PER_PASS=0 is the lawful way to disable it" >> "$LOG"; exit 3; }
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
 #    PARALLEL    defaulted to `/tmp/jobs2/rail-parallel.sh`              -> MISSING
@@ -209,16 +225,6 @@ fi
 if [ ! -f "$RAIL_SCRIPT" ]; then
   echo "$(date -u +%FT%TZ) REFUSED: rail not found at $RAIL_SCRIPT — this actuator cannot land anything" >> "$LOG"
   exit 3
-fi
-# ⛔ THE REVIEW SEAM'S ABSENCE IS LOUD BUT NOT FATAL, AND THE DIFFERENCE IS DELIBERATE. A missing RAIL
-# is fatal because nothing can land; a missing REVIEWER is not, because the rail still lands every
-# PR that already carries an attestation. Exiting here would turn a missing capability into a total
-# merge stall — the larger failure. So it is said ONCE at start, in the log an operator reads the pass
-# line in, and the pass then names each PR it could not serve.
-REVIEW_AVAILABLE=1
-if [ ! -f "$REVIEW_SCRIPT" ]; then
-  REVIEW_AVAILABLE=0
-  echo "$(date -u +%FT%TZ) REVIEW-UNAVAILABLE: no reviewer at $REVIEW_SCRIPT — unattested green PRs will stay unattested (the rail path is unaffected)" >> "$LOG"
 fi
 # ⛔ PRs the consolidation pass (aiconsol2, 2026-10-24) flagged as one of a DUPLICATE PAIR whose
 # survivor is not yet decided. Green checks do not make a duplicate safe to merge: the pair exists
@@ -640,21 +646,41 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
 review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or nothing
   head -1 "$1" 2>/dev/null | sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p'
 }
+# How many PAID dispatches this head has already spent. The ledger is APPEND-ONLY and lives beside the
+# record (same (repo, PR, head) key), because the record itself is truncated on every replay — a count
+# kept inside it would be destroyed by exactly the replay it is supposed to bound.
+review_attempts() {  # $1 = the head-keyed attempt ledger; prints the dispatch count (0 when absent)
+  local n
+  # ⛔ `-f` FIRST: `wc -l < missing` is BASH failing to open the redirect, not `wc` failing, so a
+  # `2>/dev/null` on `wc` does not silence it — the suite printed "No such file or directory" for a
+  # question it asked on purpose.
+  [ -f "$1" ] || { printf '0\n'; return 0; }
+  n=$(wc -l < "$1" 2>/dev/null | tr -d ' ')
+  case "${n:-}" in ''|*[!0-9]*) printf '0\n'; return 0;; esac
+  printf '%s\n' "$n"
+}
 # ── THE ACTION, IN ONE PLACE ───────────────────────────────────────────────────────────────────────
 # rc 0 = WAIT (a review is already owed at this head), 1 = DISPATCH now, 2 = TERMINAL at this head (a
-# fix or the recorder is owed — never another review). A function, so a test pins the SHIPPED predicate
-# instead of a copy of it: the whole anti-thrash arm IS these ten lines.
-review_action() {  # $1 = state (from review_state), $2 = seconds since dispatch
-  local age=${2:-0}
+# fix or the recorder is owed — never another review), 3 = EXHAUSTED (this head has spent its paid
+# attempts and still has no verdict — terminal too, but it must SAY so instead of reading like a wait).
+# A function, so a test pins the SHIPPED predicate instead of a copy of it: the whole anti-thrash arm IS
+# these lines.
+review_action() {  # $1 = state, $2 = seconds since dispatch, $3 = attempts already spent at this head
+  local age=${2:-0} att=${3:-0}
   case "${1:-}" in
     issues|clean) return 2;;
     # A dispatched review is a WAIT, and it is longer than a rail's: only the reviewer's own exit (or
     # its own 1800 s cap) can end it, and neither is observable from here while it runs.
-    pending) [ "$age" -lt "$REVIEW_COOLDOWN_S" ] && return 0; return 1;;
-    # It RAN AND LEFT NO VERDICT (or was refused before it started): short retry — a rate-limit window
-    # or a moved head is cheap to retry, and a head that can only change with a fix cools down by KEY
-    # instead (this file is named for the head, so a new head is a different file).
-    retry)   [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0; return 1;;
+    pending) [ "$age" -lt "$REVIEW_COOLDOWN_S" ] && return 0
+             [ "$att" -lt "$REVIEW_MAX_ATTEMPTS" ] && return 1
+             return 3;;
+    # It RAN AND LEFT NO VERDICT (or was refused before it started). ⛔ THIS IS THE ARM THAT MUST BE
+    # BOUNDED (review, P1): rc=6/9/10 arrive AFTER the review was paid for, so their age is already
+    # past the short window and an unbounded retry is one paid review per review-duration, for ever, at
+    # one head. Cheap refusals (rc=3/4/75, nothing consumed) ride the same counter and never reach it.
+    retry)   [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0
+             [ "$att" -lt "$REVIEW_MAX_ATTEMPTS" ] && return 1
+             return 3;;
     *)       return 1;;
   esac
 }
@@ -689,6 +715,10 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
       text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ). auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
     review-found-issues)
       text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
+    review-retries-exhausted)
+      text="⛔ **auto-rail: the reviewer could not produce a verdict** at \`${head:0:12}\` after ${REVIEW_MAX_ATTEMPTS} paid dispatch(es). No attestation exists, and auto-rail will NOT dispatch another one at this revision — a head that keeps failing after the review was paid for is not a head a fourth run will fix. The reviewer's own output is in the log; push a new head and it gets a new review.";;
+    review-record-unbound)
+      text="⚠️ **auto-rail: a review record exists at \`${head:0:12}\` but the PR body carries no marker this loop can bind.** Re-running \`record-review.sh\` for this PR re-posts the signed marker at the same head (that write is idempotent). auto-rail never writes records, so it cannot do this itself — and it is deliberately NOT buying a second review, which would not help. **It is not waiting on a lane.**";;
     *) text="auto-rail: review state \`${state}\`.";;
   esac
   # ⛔ A FAILED READ IS NOT "NO MARKER": this script has no `pipefail`, so a `gh` that cannot run would
@@ -720,15 +750,25 @@ export -f run_review
 # `( … ) &` returns 0 whether or not anything ran (measured cycle 4 on this very file for the rail), and
 # a dispatch that never started must be RETRIED next pass, not remembered as in flight for
 # REVIEW_COOLDOWN_S. So the record is removed on proof that nothing started.
-launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file; rc 0 = an attempt started
-  local repo=$1 pr=$2 head=$3 out=$4 pid
+launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file, $5 = attempt ledger; rc 0 = started
+  local repo=$1 pr=$2 head=$3 out=$4 led=${5:-} pid
   printf 'REVIEW-DISPATCHED at=%s head=%s repo=%s pr=%s\n' "$(date +%s)" "$head" "$repo" "$pr" > "$out" \
     || { log_line "$repo #$pr REVIEW-LAUNCH-FAILED: cannot write the review record at $out — nothing was dispatched and no cooldown was consumed"; return 1; }
   nohup bash -c 'run_review "$@"' _ "$REVIEW_SCRIPT" "$pr" "$repo" "$out" >> "$LOG" 2>&1 &
   pid=$!
   log_line "$repo #$pr no attestation at head $head -> dispatching reviewer (KIND=reviewer, $REVIEW_SCRIPT)"
   sleep "$LAUNCH_VERIFY_S"
-  if kill -0 "$pid" 2>/dev/null || [ "$(wc -l < "$out")" -gt 1 ]; then return 0; fi
+  if kill -0 "$pid" 2>/dev/null || [ "$(wc -l < "$out")" -gt 1 ]; then
+    # ⛔ THE ATTEMPT IS COUNTED **HERE**, NOT AT THE RECORD WRITE (review, P1). A dispatch that never
+    # started is rolled back two lines below and must consume NOTHING — otherwise three transient
+    # `nohup` failures would read as three paid reviews and mark the head EXHAUSTED without one ever
+    # having run. Only verified dispatches are money, so only verified dispatches are counted.
+    if [ -n "$led" ]; then
+      printf '%s\n' "$(date +%s)" >> "$led" 2>/dev/null \
+        || log_line "$repo #$pr REVIEW-ATTEMPT-UNRECORDED: could not append to $led — this dispatch is running but is NOT counted against REVIEW_MAX_ATTEMPTS, so the per-head bound is weaker than it says"
+    fi
+    return 0
+  fi
   log_line "$repo #$pr REVIEW-LAUNCH-FAILED — nothing started within ${LAUNCH_VERIFY_S}s (no live child, nothing beyond the dispatch line in $out); the record is removed so this head is retried next pass instead of being reported as in flight for ${REVIEW_COOLDOWN_S}s"
   rm -f "$out"
   return 1
@@ -760,6 +800,29 @@ if [ -d "$RAIL_HUB/.git" ]; then
 else
   log_line "REFUSED: no rail clone at $RAIL_HUB — the rail cannot be executed from ~/Documents (TCC)"
   exit 3
+fi
+# ⛔ THE REVIEW SEAM'S ABSENCE IS LOUD BUT NOT FATAL, AND THE DIFFERENCE IS DELIBERATE. A missing RAIL
+# is fatal because nothing can land; a missing REVIEWER is not, because the rail still lands every
+# PR that already carries an attestation. Exiting here would turn a missing capability into a total
+# merge stall — the larger failure. So it is said ONCE at start, in the log an operator reads the pass
+# line in, and the pass then names each PR it could not serve.
+# ⛔ AND IT IS COMPUTED **AFTER** THE REFRESH ABOVE, WHICH IS THE WHOLE POINT OF THE SEAM (review, P2).
+# `REVIEW_SCRIPT` defaults to `$RAIL_HUB/scripts/review-pr.sh` — the file the refresh is what fetches —
+# so an existence test taken BEFORE it answers a question about the PREVIOUS clone. Latched there, a job
+# that starts while `~/rail-hub` is behind `origin/main` (the tolerated "running … (possibly stale)"
+# case) would read REVIEW_AVAILABLE=0 and log "no reviewer at $REVIEW_SCRIPT" — naming a path that the
+# refresh two lines earlier has just created — for the entire lifetime of the process, dispatching
+# nothing. An inert review arm with a clean log is this file's characteristic failure, not a new one.
+# ⛔ EXISTENCE IS NOT CAPABILITY, and the bar is this repo's own (`gate-policy.sh`): a file that merely
+# has the right NAME proves nothing about being callable. A zero-byte `review-pr.sh` is valid bash: it
+# exits 0, `run_review` writes `REVIEW-EXIT rc=0`, the head reads `clean` and — because clean is
+# TERMINAL — a head nobody reviewed is reported "REVIEW-RECORDED cleanly" and never looked at again.
+REVIEW_AVAILABLE=0
+if [ -f "$REVIEW_SCRIPT" ] && [ -x "$REVIEW_SCRIPT" ] && [ -s "$REVIEW_SCRIPT" ] \
+   && bash -n "$REVIEW_SCRIPT" 2>/dev/null; then
+  REVIEW_AVAILABLE=1
+else
+  echo "$(date -u +%FT%TZ) REVIEW-UNAVAILABLE: no usable reviewer at $REVIEW_SCRIPT (needs to exist, be executable, non-empty and parseable) — unattested green PRs will stay unattested (the rail path is unaffected)" >> "$LOG"
 fi
 log_line "auto-rail started max=$MAX max_total=$MAX_TOTAL interval=${INTERVAL}s red_cap=$RED_CAP rail=$RAIL_SCRIPT"
 
@@ -936,12 +999,26 @@ PY
         # the same reason `$TRIED` is for the rail — a verdict that only a new head can change must not
         # be re-bought every 180 s, and a new head is a different key by construction.
         _rout="$RAIL_DIR/review-$(printf '%s' "$repo" | tr '/' '-')-$pr-$head.out"
+        # The attempt ledger is a SEPARATE append-only file with the SAME (repo, PR, head) key: the
+        # record is truncated on every replay, so a count kept in it would be destroyed by the very
+        # replay it bounds. A new head is a new key, so a fix always starts from a clean count.
+        _ratt="$RAIL_DIR/review-$(printf '%s' "$repo" | tr '/' '-')-$pr-$head.attempts"
         _rstate=$(review_state "$_rout")
+        _rattn=$(review_attempts "$_ratt")
         _rdat=$(review_dispatched_at "$_rout")
         case "${_rdat:-}" in ''|*[!0-9]*) _rage=0;; *) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;; esac
-        review_action "$_rstate" "$_rage"; _ract=$?
+        review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?
         if [ "$_ract" -eq 0 ]; then
           log_line "$repo #$pr review $_rstate at $head — dispatched $(( _rage / 60 ))m ago, within its ${REVIEW_COOLDOWN_S}s window; waiting, not re-dispatching (a slow review is not a stuck one)"
+          continue
+        fi
+        if [ "$_ract" -eq 3 ]; then
+          # ⛔ EXHAUSTED IS NOT A WAIT AND NOT A RETRY: this head has spent its paid attempts and still
+          # has no verdict, so dispatching again buys the same failure at review prices. Publishing it
+          # is what keeps the PR from reading as "a lane is working on it" — the rest of this step only
+          # exists to keep that from happening.
+          publish_review_state "$repo" "$pr" review-retries-exhausted "$head"
+          log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head after $_rattn dispatch(es) (cap $REVIEW_MAX_ATTEMPTS, state $_rstate, record $_rout, ledger $_ratt) — NOT dispatching again: only a NEW head (a new key) buys another review"
           continue
         fi
         if [ "$_ract" -eq 2 ]; then
@@ -949,7 +1026,15 @@ PY
             publish_review_state "$repo" "$pr" review-found-issues "$head"
             log_line "$repo #$pr REVIEW-FOUND-ISSUES at $head ($_rout) — no attestation was recorded and this head is NOT re-reviewed; it needs a fix, and a new head gets a new review"
           else
-            log_line "$repo #$pr REVIEW-RECORDED cleanly at $head but the PR body carries no marker this actuator can bind ($_rout) — re-running the recorder is the remedy here, and re-reviewing would not be"
+            # ⛔ rc=0/5 MEANS A RECORD EXISTS AT THIS HEAD AND THE **BODY** DOES NOT CARRY ITS MARKER —
+            # a state `review-pr.sh` documents as expected (its evidence post is best-effort, and a body
+            # edit wipes the marker: agent-infra#1224). Logging "re-running the recorder is the remedy"
+            # while nothing performs it left the PR exactly as invisible as #3489's `reviewDecision=empty`
+            # — for ever, because the key never changes without a new head (review, P2). This actuator
+            # must NOT call the recorder (a record is minted only from a fresh reviewer's evidence), so
+            # the remedy is PUBLISHED where a human/operator will read it instead.
+            publish_review_state "$repo" "$pr" review-record-unbound "$head"
+            log_line "$repo #$pr REVIEW-RECORDED cleanly at $head but the PR body carries no marker this actuator can bind ($_rout) — the recorder remedy is published on the PR; this actuator never writes records and is NOT re-reviewing (a second review would not help)"
           fi
           continue
         fi
@@ -961,7 +1046,7 @@ PY
           continue
         fi
         publish_review_state "$repo" "$pr" review-in-flight "$head"
-        launch_review "$repo" "$pr" "$head" "$_rout" || continue
+        launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" || continue
         _rdispatched=$(( _rdispatched + 1 ))
         continue
       fi
