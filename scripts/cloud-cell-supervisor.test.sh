@@ -851,7 +851,7 @@ cellcheck 0
 [ "$CC_RC" -ne 0 ] && ok "check REFUSES a store it cannot read (cannot-verify is not a pass)" \
                    || bad "check accepted a cell whose credential store it could not read"
 case "$CC_OUT" in
-  *"not a readable JSON object"*) ok "…and says why, instead of implying the credential is absent" ;;
+  *"not a JSON object a lane can parse"*) ok "…and says why, in the terms a LANE experiences it" ;;
   *) bad "the unreadable-store refusal is not explained: $CC_OUT" ;;
 esac
 # (e) A KEY pi CANNOT READ (`key: 123` makes a lane's `read()` THROW) is not a credential — but it is
