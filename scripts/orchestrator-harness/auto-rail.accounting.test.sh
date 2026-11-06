@@ -1713,20 +1713,25 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
   *)
     [ "$_R3A" -lt "$_RBR" ] && [ "$_RBR" -lt "$_RCAP" ] && [ "$_RCAP" -lt "$_RMEA" ] && [ "$_RMEA" -lt "$_R3B" ] \
       || bad "the EXHAUSTED log must BRANCH on the basis INSIDE the rc-3 arm (rc3=${_R3A} branch=${_RBR} capLog=${_RCAP} measuredLog=${_RMEA} rc2=${_R3B}) — an unconditional line leaves no cap log at all (reproduced, review round 7)"
-    # ⛔ LINE ORDER IS NOT CONTAINMENT (review round 8, P2, REPRODUCED). Ordering the four lines only says the
-    # branch sits between the two `-eq` TESTS — anything in that gap satisfies it, including the whole block MOVED
-    # BELOW the drain's own `continue`/`fi`. That mutant is semantically the reverted defect and it stayed GREEN:
-    # on the EXHAUSTED path no REVIEW-RETRIES-EXHAUSTED line is emitted at all (the drain continues past it), and
-    # on other paths it fabricates "$_rattn dispatch(es)". So containment is measured on the DRAIN BODY — from the
-    # `-eq 3` test to its FIRST `continue` — by extraction, not by line numbers. This is the same lesson the
-    # in-flight publish arm already carries (position IS the fix; existence is not position).
-    _RCONT=$(awk -v a="$_R3A" 'NR>a && /^[[:space:]]*continue$/ {print NR; exit}' "$SUT")
-    case "${_RCONT:-x}" in
-      *[!0-9]*) bad "the rc-3 drain's `continue` could not be located below line ${_R3A} — the drain shape changed, so containment of the EXHAUSTED log cannot be measured" ;;
+    # ⛔ AND THE DRAIN'S OWN TERMINATOR IS PART OF THE STRUCTURE (review round 8, P1, REPRODUCED). Taking "the
+    # first `continue` anywhere below the `-eq 3` test" made the containment arm VACUOUS the moment that arm's
+    # own `continue` was deleted: the extraction silently widened to the NEXT arm's terminator (15 lines → 31),
+    # both greps still matched, and the missing-terminator `bad` could not fire while any later `continue`
+    # existed — a no-op gate. That mutant is not cosmetic: with no `continue`, the EXHAUSTED path falls through
+    # into the `-eq 2` arm and on to `launch_review`, so the loop BUYS the paid review it has just published
+    # "not dispatching another review at this revision" about. The file already treats the identical class as
+    # P1 for the WAIT branch; this is its counterpart. So the arm's terminator is bound to the arm's OWN close
+    # (the next 8-space `fi`), and the line immediately before that close must BE the `continue`.
+    _R3F=$(awk -v a="$_R3A" 'NR>a && /^        fi$/ {print NR; exit}' "$SUT")
+    _RCONT=$(awk -v a="$_R3A" -v b="${_R3F:-0}" 'NR>a && NR<b && /^[[:space:]]*continue$/ {print NR; exit}' "$SUT")
+    case "${_R3F:-x}${_RCONT:-x}" in
+      *[!0-9]*) bad "the rc-3 arm's own terminator could not be located (arm closes at ${_R3F:-MISSING}, its \`continue\` at ${_RCONT:-MISSING}) — the drain shape changed, so containment of the EXHAUSTED log cannot be measured" ;;
       *)
-        _R3BODY=$(sed -n "${_R3A},${_RCONT}p" "$SUT")
+        [ "$_RCONT" -eq "$(( _R3F - 1 ))" ] \
+          || bad "the rc-3 drain must END IN ITS OWN \`continue\` (the arm closes at ${_R3F}, but the line before that close is not one; first \`continue\` found at ${_RCONT}) — without it the EXHAUSTED path falls through the -eq 2 arm into launch_review and RE-BUYS the paid review this state exists to stop, while the containment arm silently widens to the NEXT arm's terminator and stays green (reproduced, review round 8)"
+        _R3BODY=$(sed -n "${_R3A},${_R3F}p" "$SUT")
         grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read' <<<"$_R3BODY" \
-          || bad "the CAP log line must be INSIDE the rc-3 drain (between the `-eq 3` test at ${_R3A} and its first `continue` at ${_RCONT}) — moved below the drain it is unreachable on the EXHAUSTED path, so a stuck head emits NO exhaustion line at all while the ordering arm still passes (reproduced, review round 8)"
+          || bad "the CAP log line must be INSIDE the rc-3 drain (between the \`-eq 3\` test at ${_R3A} and its own \`continue\` at ${_RCONT}) — moved below the drain it is unreachable on the EXHAUSTED path, so a stuck head emits NO exhaustion line at all while the ordering arm still passes (reproduced, review round 8)"
         grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside' <<<"$_R3BODY" \
           || bad "the MEASURED log line must be INSIDE the rc-3 drain too (between lines ${_R3A} and ${_RCONT}) — outside it, the readable case prints no count where the count is exactly what it should state" ;;
     esac
@@ -1746,7 +1751,7 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
       *) bad "the CAP log line must NAME the non-self-healing fact ('that window will NOT roll by itself') — the phrase the line is located by survives the reversion, so without this the operator's log says the state clears itself when no window can ever roll (reproduced, review round 8)" ;;
     esac
     case "$_RCAPTXT" in
-      *'until the window rolls'*) bad "the CAP log line must NOT say 'until the window rolls' — there is no window in this case (the ledger is unreadable, so `review_attempts` returns the cap without ever consulting the clock); that clause IS the false instruction, restored" ;;
+      *'until the window rolls'*) bad "the CAP log line must NOT say 'until the window rolls' — there is no window in this case (the ledger is unreadable, so \`review_attempts\` returns the cap without ever consulting the clock); that clause IS the false instruction, restored" ;;
     esac
     case "$_RCAPTXT" in
       *'$_rattn'*) bad "the CAP log line must NOT print \$_rattn — that value IS the fail-closed cap, so putting it in this line asserts a past-tense measurement the loop never took, which is precisely the defect (adding it back kept this suite green before this arm existed)" ;;
