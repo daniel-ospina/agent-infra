@@ -877,8 +877,19 @@ O_R2="$(WIP_SWEEP_STALE_SECONDS=abc WIP_SWEEP_STATE_DIR="$T/state-envb" \
 # library. Its baseline is a fresh `ok` record — with a `running` record every seam looks refused for the
 # wrong reason (R1's first version made exactly that mistake).
 printf '#!/usr/bin/env bash\nexit 0\n' > "$T/notalib.sh"; chmod +x "$T/notalib.sh"
+# ⛔ THE THREE RESCUER SHAPES `[ -f ]` BLESSED (#3588 review), all GENERATED here so the arm cannot depend
+# on the host: a 0-byte farmed copy (the realistic truncation), a file that does not parse, and — the one
+# that defeats `-s` + `bash -n` — a file that is non-empty and PARSES but has no `--verdict` mode. That last
+# one is the most plausible broken farm of the three, and only a BEHAVIOURAL probe catches it. (The first
+# cut used `/etc/hostname` as the "not a script" fixture; on this host it contains one word that is valid
+# bash, so `bash -n` accepted it and the arm reddened on the fixture instead of the code.)
+: > "$T/empty-rescuer.sh"
+printf '%s\n' 'this is ( not bash' > "$T/not-a-script.sh"
+printf '%s\n' 'echo "this parses but has no --verdict mode"' > "$T/parses-not-rescuer.sh"
 for _seam in "WIP_SWEEP_BUDGET=abc" "WIP_SWEEP_MAX=abc" "WIP_SWEEP_RESCUE=$T/no-such-rescuer" \
-             "WIP_SWEEP_BOUNDED_LIB=$T/notalib.sh" "WIP_SWEEP_STALE_SECONDS=0"; do
+             "WIP_SWEEP_BOUNDED_LIB=$T/notalib.sh" "WIP_SWEEP_STALE_SECONDS=0" \
+             "WIP_SWEEP_RESCUE=$T/empty-rescuer.sh" "WIP_SWEEP_RESCUE=$T/not-a-script.sh" \
+             "WIP_SWEEP_RESCUE=$T/parses-not-rescuer.sh"; do
   O_R3="$(env "$_seam" WIP_SWEEP_STATE_DIR="$T/state-rlib" bash "$SW" --print-status 2>&1)"; RC_R3=$?
   if [ "$RC_R3" -eq 0 ] || has "$O_R3" 'status=ok'; then
     bad "R3 '${_seam%%=*}' answers GREEN over a box whose sweep refuses every pass (rc=$RC_R3): $O_R3"
@@ -886,6 +897,24 @@ for _seam in "WIP_SWEEP_BUDGET=abc" "WIP_SWEEP_MAX=abc" "WIP_SWEEP_RESCUE=$T/no-
     ok "R3 '${_seam%%=*}' is never green on the reader surface (rc=$RC_R3)"
   fi
 done
+
+# ⛔ THE UNMEASURED MESSAGE'S BACKTICKS, PINNED (#3588 review). `err "UNMEASURED — `git worktree list`
+# answered …"` was a LIVE COMMAND SUBSTITUTION inside double quotes: bash ran it and spliced its output into
+# the warning. Restoring the backticks left the suite fully green, so the fix was unpinned.
+mk_fixture elist fix/3485-elist || { echo "x fixture failed (elist)"; exit 1; }
+mkdir -p "$T/emptybin"
+REAL_GIT_E="$(command -v git)"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *" worktree list "*) exit 0 ;;' \
+  'esac' \
+  "exec $REAL_GIT_E \"\$@\"" > "$T/emptybin/git"
+chmod +x "$T/emptybin/git"
+ELIST_ERR="$(cd "$T" && PATH="$T/emptybin:$PATH" WIP_SWEEP_STATE_DIR="$T/state-elist" \
+  bash "$SW" --apply --repo "$T/elist/wt" 2>&1 >/dev/null)"
+has "$ELIST_ERR" "'git worktree list' answered" \
+  && ok "S4 the UNMEASURED message quotes the command LITERALLY (its backticks were a live substitution)" \
+  || bad "S4 the empty-listing message no longer contains the literal 'git worktree list' — a backtick in a double-quoted err string RUNS it: $ELIST_ERR"
 
 # ── S) A REPO THAT LISTED NOTHING IS ESCALATED ON ITS OWN ────────────────────────────────────────────
 echo; echo "── S. a repo that listed NOTHING is escalated even when a sibling repo deferred rows ──"

@@ -67,7 +67,10 @@ if [ "$PREFLIGHT_OK" -ne 1 ]; then
   echo "     run where it cannot prove its stubs are the ones resolved. Re-run with TMPDIR set to an"
   echo "     executable location (a noexec /tmp is the usual cause)."
   echo "  PASS=0 FAIL=0 SKIP=0 (refused — nothing was run, and nothing on this host was touched)"
-  exit 0
+  # ⛔ A REFUSAL IS NOT A PASS (#3588 review). This exited 0, so a shard that could not execute a single
+  # arm reported GREEN — the no-op-gate shape: "exits 0, or silently does nothing, when it cannot run".
+  # The message already says nothing was run; the exit code now agrees with it. Pinned by arms G1/G2 below.
+  exit 1
 fi
 
 # mk_world <name> — a REPO with the stub supervisor + sweep, a HARNESS with claims.sh, a log.
@@ -239,6 +242,22 @@ if [ "$HAS_PROC" = 1 ]; then
 else
   skip "F2/F3 the success path's EXIT CODE needs /proc/<pid>/environ (step 7), absent on this host — the ordering arms above still ran"
 fi
+
+# ⛔ G) A REFUSAL IS NOT A PASS, PINNED BY RE-RUNNING THIS SUITE (#3588 review). The stub preflight above
+# refuses when $TMPDIR cannot hold executable stubs (a noexec /tmp). It used to `exit 0` there, so a shard
+# that ran ZERO arms reported GREEN. Nothing reddened when that was reverted (measured: PASS=17 FAIL=0),
+# because the refusal branch is unreachable on a host whose $TMPDIR is healthy — the only way to reach it is
+# to re-invoke this file with an unusable TMPDIR, which also proves the preflight cannot be talked past by
+# the very environment it exists to detect.
+echo; echo "── G. the preflight refuses with a NON-ZERO exit when it cannot prove its stubs ──"
+SELFQ="${BASH_SOURCE[0]}"
+QG="$(TMPDIR=/nonexistent-quiesce-preflight-probe bash "$SELFQ" 2>&1)"; QRC=$?
+[ "$QRC" -ne 0 ] && grep -q 'REFUSING TO RUN' <<<"$QG" \
+  && ok "G1 an unusable \$TMPDIR makes the preflight exit NON-ZERO (rc=$QRC) — a shard that ran zero arms is RED, not green" \
+  || bad "G1 the preflight answered rc=$QRC with no refusal message when it could not run a single arm: $(tail -3 <<<"$QG")"
+grep -q 'PASS=0 FAIL=0 SKIP=0' <<<"$QG" \
+  && ok "G2 and it says so plainly (PASS=0 FAIL=0 SKIP=0), so the exit code and the words agree" \
+  || bad "G2 the refusal message does not state that nothing ran: $(tail -3 <<<"$QG")"
 
 echo
 echo "── summary ──"
