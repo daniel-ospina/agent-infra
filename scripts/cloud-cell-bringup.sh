@@ -597,25 +597,35 @@ IFS= read -r -d '' STORE_STATE_PY <<'PYEOF_STORE' || true
 import json, math, os, re, sys
 path, prov = sys.argv[1], sys.argv[2]
 warn = len(sys.argv) > 3 and sys.argv[3] == "warn"
+
+def emit(state):
+    """One shape of output for EVERY arm: in warn mode a list line first (empty when nothing was
+    inspected), then the state. An early exit that printed only the state made line 1 a STATE that
+    the caller read as an entry name (measured: a fresh cell logged "the pi CLI would reject
+    (empty)")."""
+    if warn:
+        print("")
+    print(state)
+    sys.exit(0)
 try:
     with open(path, "rb") as f:
         raw = f.read()
 except FileNotFoundError:
-    print("empty"); sys.exit(0)
+    emit("empty")
 except OSError:
     # EXISTS but cannot be READ (mode 000, an ACL, a directory). That is NOT "empty": classifying it
     # as empty let the writer replace a store full of credentials it never saw (measured).
-    print("unreadable"); sys.exit(0)
+    emit("unreadable")
 if not raw.strip():
-    print("empty"); sys.exit(0)
+    emit("empty")
 try:
     doc = json.loads(raw.decode("utf-8", "replace"))
 except Exception:
-    print("unreadable"); sys.exit(0)
+    emit("unreadable")
 if not isinstance(doc, dict):
-    print("unreadable"); sys.exit(0)
+    emit("unreadable")
 if not doc:
-    print("empty"); sys.exit(0)
+    emit("empty")
 
 def nonblank(v):
     return isinstance(v, str) and v.strip() != ""
@@ -626,8 +636,9 @@ def cli_valid(c):
     if c.get("type") == "api_key":
         if "key" in c and c["key"] is not None and not isinstance(c["key"], str):
             return False
-        e = c.get("env", None)
-        return e is None or (isinstance(e, dict) and all(isinstance(x, str) for x in e.values()))
+        # `env` ABSENT and `env: null` are different to pi's validator: only absent is valid.
+        return "env" not in c or (isinstance(c["env"], dict)
+                                  and all(isinstance(x, str) for x in c["env"].values()))
     if c.get("type") == "oauth":
         x = c.get("expires")
         return (isinstance(c.get("access"), str) and isinstance(c.get("refresh"), str)
@@ -649,8 +660,6 @@ def state_for(c):
             return "mergeable"                  # absent/blank/null/non-string: a lane reads no key
         if key.startswith("!"):
             return "other"                      # pi EXECUTES it; not judgeable offline, never rewritten
-        if key.startswith("$$") or key.startswith("$!"):
-            return "present"                     # an escaped literal
         refs = set(REF.findall(ESCAPE.sub("", key)))
         if not refs:
             return "present"                     # a literal: `env` is never consulted for these
@@ -808,7 +817,7 @@ repair_provider_store() {
       # An entry this script will not rewrite (an `oauth` record, an unknown type). Refusing to touch
       # it is right — it may be a working credential this script could never recreate — and whether it
       # RESOLVES is pi's answer, not this file's, so the refusal says exactly that.
-      log_line "FATAL: the provider store at $auth holds a '$want' entry this script does not rewrite (an oauth record, or an entry whose type it does not know) — it may well be a working credential, and this script will not overwrite one it cannot recreate. Verify it by execution: env -i HOME=$home PATH=\"\$PATH\" pi -p 'reply with exactly PROVIDER_OK' — or move the file aside deliberately and re-run." >&2
+      log_line "FATAL: the provider store at $auth holds a '$want' entry this script will not rewrite — a '!command' key it cannot execute offline, an unknown credential type, or an oauth record with no usable access token. It may well be a WORKING credential (pi can run that command or refresh that token), and this script will not overwrite one it cannot recreate. Verify it by execution: env -i HOME=$home PATH=\"\$PATH\" pi -p 'reply with exactly PROVIDER_OK' — if that answers, the store is fine and this refusal is the bring-up declining to certify on something it cannot judge; if it fails, move the file aside deliberately and re-run." >&2
       return 1 ;;
   esac
   # `mergeable` and `empty` reach here: the file is sound (or absent) and this provider has no usable

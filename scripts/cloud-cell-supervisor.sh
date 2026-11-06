@@ -2515,25 +2515,35 @@ IFS= read -r -d '' STORE_STATE_PY <<'PYEOF_STORE' || true
 import json, math, os, re, sys
 path, prov = sys.argv[1], sys.argv[2]
 warn = len(sys.argv) > 3 and sys.argv[3] == "warn"
+
+def emit(state):
+    """One shape of output for EVERY arm: in warn mode a list line first (empty when nothing was
+    inspected), then the state. An early exit that printed only the state made line 1 a STATE that
+    the caller read as an entry name (measured: a fresh cell logged "the pi CLI would reject
+    (empty)")."""
+    if warn:
+        print("")
+    print(state)
+    sys.exit(0)
 try:
     with open(path, "rb") as f:
         raw = f.read()
 except FileNotFoundError:
-    print("empty"); sys.exit(0)
+    emit("empty")
 except OSError:
     # EXISTS but cannot be READ (mode 000, an ACL, a directory). That is NOT "empty": classifying it
     # as empty let the writer replace a store full of credentials it never saw (measured).
-    print("unreadable"); sys.exit(0)
+    emit("unreadable")
 if not raw.strip():
-    print("empty"); sys.exit(0)
+    emit("empty")
 try:
     doc = json.loads(raw.decode("utf-8", "replace"))
 except Exception:
-    print("unreadable"); sys.exit(0)
+    emit("unreadable")
 if not isinstance(doc, dict):
-    print("unreadable"); sys.exit(0)
+    emit("unreadable")
 if not doc:
-    print("empty"); sys.exit(0)
+    emit("empty")
 
 def nonblank(v):
     return isinstance(v, str) and v.strip() != ""
@@ -2544,8 +2554,9 @@ def cli_valid(c):
     if c.get("type") == "api_key":
         if "key" in c and c["key"] is not None and not isinstance(c["key"], str):
             return False
-        e = c.get("env", None)
-        return e is None or (isinstance(e, dict) and all(isinstance(x, str) for x in e.values()))
+        # `env` ABSENT and `env: null` are different to pi's validator: only absent is valid.
+        return "env" not in c or (isinstance(c["env"], dict)
+                                  and all(isinstance(x, str) for x in c["env"].values()))
     if c.get("type") == "oauth":
         x = c.get("expires")
         return (isinstance(c.get("access"), str) and isinstance(c.get("refresh"), str)
@@ -2567,8 +2578,6 @@ def state_for(c):
             return "mergeable"                  # absent/blank/null/non-string: a lane reads no key
         if key.startswith("!"):
             return "other"                      # pi EXECUTES it; not judgeable offline, never rewritten
-        if key.startswith("$$") or key.startswith("$!"):
-            return "present"                     # an escaped literal
         refs = set(REF.findall(ESCAPE.sub("", key)))
         if not refs:
             return "present"                     # a literal: `env` is never consulted for these
@@ -2665,7 +2674,7 @@ check_provider_store() {
     unreadable)
       die "$auth is not a JSON object a lane can parse (pi's storage keeps its last snapshot — empty on a fresh process — so NO credential exists), and CANNOT-VERIFY IS NOT A PASS. It is also pi's credential store: do not delete it blindly. Inspect it (it should be a JSON object such as {\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}); if it is unusable, move it aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
     other)
-      die "$auth holds a '$prov' entry this check will not judge or replace (an oauth record, an unknown type, or an api_key whose env map is unusable) — it may well be a working credential, and nothing here may overwrite one. Verify it BY EXECUTION: env -i HOME=\$HOME PATH=\"\$PATH\" pi -p 'reply with exactly PROVIDER_OK' — and if that fails, move the file aside deliberately and re-run the bring-up (agent-infra#2024)." ;;
+      die "$auth holds a '$prov' entry this check will not judge or replace — a '!command' key it cannot execute offline, an unknown credential type, or an oauth record with no usable access token. It may well be a WORKING credential (pi can run that command or refresh that token), and nothing here may overwrite one it cannot recreate. Verify it BY EXECUTION: env -i HOME=\$HOME PATH=\"\$PATH\" pi -p 'reply with exactly PROVIDER_OK' — if that answers, the store is fine and this is the gate declining to certify what it cannot judge; if it fails, move the file aside deliberately and re-run the bring-up (agent-infra#2024)." ;;
   esac
   # From here the store is sound but this provider has no usable key.
   var="$(sup_provider_var "$prov")"
