@@ -225,7 +225,7 @@ PYAPPLY
 fi
 case "$*" in
   # ── `/actions/runs/{id}/jobs` serves TWO callers, told apart by the jq they ask for ────────
-  #   demand (queue_demand)           → the `labels` of the queued jobs
+  #   demand (run_queued_demand)     → the `labels` of the queued jobs
   #   mode inference (mode_from_jobs) → `runner_group_name` of the executing jobs
   *"/jobs"*)
     case "$*" in
@@ -513,6 +513,17 @@ GATE_UNDER_TEST_ORIG="$GATE_UNDER_TEST"
 GH_THRESHOLD_DEFAULT="$(sed -n 's/^QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-\([0-9][0-9]*\)}".*/\1/p' "${GATE_UNDER_TEST:-$GATE}" | head -1)"
 if [ -z "$GH_THRESHOLD_DEFAULT" ]; then
   echo "❌ FATAL: cannot read QUEUE_THRESHOLD's own default out of ${GATE_UNDER_TEST:-$GATE} — the suite refuses to guess it" >&2
+  exit 3
+fi
+
+# ⛔ THE SHIPPED HEAD-SCAN BOUND IS DERIVED TOO (agent-infra#2344), and from the file in THIS checkout
+# rather than from `GATE_UNDER_TEST`: the arm that needs it pins a property of the shipped behaviour
+# (a scan stopped by the bound is not a complete scan), so following a mutant's value would let a
+# mutant that merely changes the bound skip the arm. Fatal when unreadable — a fixture that cannot
+# restate the bound must not silently test a different number.
+QUEUE_HEAD_SCAN_SHIPPED="$(sed -n 's/^QUEUE_HEAD_SCAN_MAX="${CI_GATE_QUEUE_HEAD_SCAN_MAX:-\([0-9][0-9]*\)}".*/\1/p' "$GATE" | head -1)"
+if [ -z "$QUEUE_HEAD_SCAN_SHIPPED" ]; then
+  echo "❌ FATAL: cannot read QUEUE_HEAD_SCAN_MAX's own default out of $GATE — the suite refuses to guess it" >&2
   exit 3
 fi
 
@@ -934,14 +945,15 @@ assert_not_contains "$OUT" "UNREADABLE" "an empty queue is a readable zero, not 
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "an idle repo records mode=github"
 
 # ⛔ agent-infra#2344 — A QUEUED *RUN* IS NOT A QUEUED *JOB*.
-# GitHub leaves a run whose jobs were never created in `status=queued` FOREVER (it cannot be
-# cancelled — 409 — or deleted), and such a run sits at the HEAD of the queue. Because the
-# throughput leg's age came from `min(created_at)` over every run GitHub calls queued, one such
-# record made the age clause true on EVERY pass for the rest of the repo's life. Measured
-# 2026-11-06: daniel-ospina/agent-infra's head was 2,612,687 s (30.2 days) old with ZERO jobs, over
-# a repo whose real demand was 11 h old. The consequence is not a wrong number in a log: the gate
-# engages the local pool whenever nothing happens to be executing, and routing CI onto the agent
-# fleet's own box is the 2026-10-12 harm the fallback-only rule exists to prevent.
+# GitHub leaves a run with nothing in a schedulable state in `status=queued` FOREVER (measured: 0
+# total jobs on the three records below; such a run cannot be cancelled — 409 — or deleted), and it
+# sits at the HEAD of the queue. Because the throughput leg's age came from `min(created_at)` over
+# every run GitHub calls queued, one such record made the age clause true on EVERY pass for the rest
+# of the repo's life. Measured 2026-11-06: daniel-ospina/agent-infra's head was 2,612,687 s (30.2
+# days) old with ZERO jobs, over a repo whose real demand was 11 h old. The consequence is not a
+# wrong number in a log: the gate engages the local pool whenever nothing happens to be executing,
+# and routing CI onto the agent fleet's own box is the 2026-10-12 harm the fallback-only rule exists
+# to prevent.
 # The predicate is POSITIVE EVIDENCE, not age: a run is discounted only when a READABLE read shows
 # zero jobs in `queued` status. (Age cannot express it — measured the same day, tortoise's real
 # demand head was 28 h old WITH a queued job, and 8-11 h old zero-job runs exist too.)
@@ -952,7 +964,7 @@ assert_eq "$RC" "0" "a ghost-only queue exits 0 (it acts, it does not fail)"
 assert_contains "$OUT" "ghost_runs=3" "the probe reports the ghost records it proved"
 assert_contains "$OUT" "queued_demanding=0" "none of the three is counted as demand"
 assert_contains "$OUT" "oldest_queued_s=0" "the age is the empty queue's, not a 30-day ghost's"
-assert_contains "$OUT" "ghost records, not backlog" "the pass NAMES why the records are not backlog"
+assert_contains "$OUT" "nothing is waiting for a runner" "the pass NAMES what the read established (nothing is waiting for a runner)"
 assert_not_contains "$OUT" "not absorbing" "a ghost-only queue is NOT read as a stall"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "a ghost-only queue keeps the gate on GitHub-hosted"
 assert_not_contains "$(put_body_for 101)" "ubuntu-latest" "a ghost-only queue never ARMS a runner (the fresh box's PUT is the strip to its own pool label)"
@@ -1032,7 +1044,7 @@ run_gate ghost-inconsistent GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="400
 assert_eq "$RC" "2" "more ghost rows than the reported depth → exit 2"
 assert_contains "$OUT" "INCONSISTENT" "the refusal names the contradiction, not a clamp"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "an inconsistent queue read advanced no state file"
-# ⛔ …AND THE SAME CONTRADICTION IS REFUSED ON THE ALL-GHOSTS PATH (review P2). There, `scanned` is
+# ⛔ AND THE SAME CONTRADICTION IS REFUSED ON THE ALL-GHOSTS PATH (review P2). There, `scanned` is
 # booked as the ghost count, so a `>=` test clamped the contradiction into a readable "no demand" —
 # the fail-open direction, on the very branch whose comment rejects clamping.
 run_gate ghost-inconsistent-all GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
@@ -1041,6 +1053,28 @@ assert_eq "$RC" "2" "two ghost rows over a depth of 1 → exit 2 on the all-ghos
 assert_contains "$OUT" "INCONSISTENT" "the all-ghosts contradiction is NAMED, never clamped to zero"
 assert_not_contains "$OUT" "ghost records, not backlog" "it is not read as a complete measurement"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "the all-ghosts contradiction advanced no state file"
+# ⛔ THE BOUND BREAK IS NOT A COMPLETE SCAN (cycle-2 review, blocking). `scanned` is capped by
+# `QUEUE_HEAD_SCAN_MAX`, so with `queued == QUEUE_HEAD_SCAN_MAX` a bound break left `scanned == queued`
+# and the "whole queue was read" branch certified "nothing is waiting" over a page it had NOT read —
+# including a 30-day run WITH a queued job sitting just past the bound, i.e. exactly the stalled shape
+# the leg exists to catch, certified `github` with `oldest_queued_s=0`. The fixture is the shipped
+# bound (5), five ghosts, and a sixth row that HAS demand.
+echo "── #2344: a bound-limited scan is never mistaken for a complete one ──"
+run_gate ghost-bound-truncated GH_QUEUED="$QUEUE_HEAD_SCAN_SHIPPED" GH_INPROGRESS=0 \
+  GH_DEMAND_GHOST_IDS="4001 4002 4003 4004 4005" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000;4003:2580000;4004:2570000;4005:2560000;4006:2592000" --
+assert_eq "$RC" "2" "a bound break over a deeper page → exit 2 (could-not-measure), not 'no demand'"
+assert_contains "$OUT" "beyond the ${QUEUE_HEAD_SCAN_SHIPPED}-run scan window" "the refusal names the bound that stopped it"
+assert_not_contains "$OUT" "nothing is waiting for a runner" "it is NOT read as a complete measurement"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a bound-limited scan advanced no state file"
+# …and a TRUNCATED page (fewer rows than the depth it reports) is refused for its own reason, rather
+# than being reported as a scan window that ran out — the two are different reads.
+echo "── #2344: a page shorter than the depth it reports is TRUNCATED, and refused ──"
+run_gate ghost-truncated GH_QUEUED=9 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" --
+assert_eq "$RC" "2" "a page shorter than its own depth → exit 2"
+assert_contains "$OUT" "TRUNCATED" "the refusal names the truncation"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a truncated page advanced no state file"
 
 # ⛔ A LEG THAT ERRORS is neither healthy NOR unhealthy-but-act (#2904): every unreadable input below
 # must exit 2, leave the mode alone, notify nothing and relabel nothing.
@@ -1614,8 +1648,8 @@ assert_contains "$OUT" "CAPACITY NOT CERTIFIED" "(2) the reason refuses to certi
 assert_not_contains "$OUT" "GitHub Actions healthy" "(2) and never prints the word 'healthy' over it"
 
 # ⛔ THE FALL-THROUGH RE-CREATED THE MISREADING (#3002 review P1). The arm above is mode=local with a
-# READABLE demand; when the demand cannot be measured (a space-bearing label `queue_demand` rejects, or
-# any mode=github tick) the verdict used to fall through to `saturated` whenever ANY runner was busy —
+# READABLE demand; when the demand cannot be measured (a space-bearing label that `run_queued_demand`
+# rejects, or any mode=github tick) the verdict used to fall through to `saturated` whenever ANY runner was busy —
 # so 7 IDLE runners and 2 busy ones printed `capacity=saturated … (idle=7 busy=2)` and, because
 # `saturated` is a CERTIFYING word, the reason read "GitHub Actions healthy". Same census, same queue,
 # demand unmeasurable: the pool's own state still decides, and it has idle capacity.

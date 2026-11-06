@@ -112,7 +112,13 @@ QUEUE_PAGE=100
 # the 2026-10-12 harm the fallback-only rule exists to prevent — CI competing with the agent fleet on
 # the same box.
 # A run is discounted as a GHOST only when a READABLE jobs read shows ZERO jobs in `queued` status:
-# positive evidence, never an age guess. ⛔ AGE IS NOT THE PREDICATE, and the measurement says so —
+# positive evidence, never an age guess. ⛔ THE READ PROVES "NOTHING OF THIS RUN IS WAITING FOR A
+# RUNNER", which is all the discount needs — it does NOT prove the cause. Measured, the cause on these
+# records was never-created jobs (0 total jobs on all three); a job held in a pre-queue state
+# (`waiting` on a concurrency group or an environment approval) answers identically, and is correctly
+# discounted for the same reason (it cannot take a pool slot) while being a different diagnosis — so
+# the messages below say "nothing in a schedulable state", not "the jobs were never created".
+# ⛔ AGE IS NOT THE PREDICATE, and the measurement says so —
 # the same day, tortoise's real demand head was 28 h old WITH a queued job (run 42064937107, 1 of its
 # 22 jobs queued), so an "ignore runs older than a day" rule would discard genuine backlog; while
 # 8-11 h old runs with zero queued jobs also exist (GitHub creates a run's jobs progressively), which
@@ -671,7 +677,7 @@ evaluate() {
   # ⛔ DECLARED AT THE TOP, not where they are first assigned (agent-infra#2344). The head scan runs
   # BEFORE the census and sets these; a `local X=0` further down would RESET the count the scan had
   # already computed — a global re-declared mid-function is still a re-initialisation.
-  local QUEUE_GHOSTS=0 queued_demanding=${queued:-0} candidates scanned cand cand_id cand_created cand_demand
+  local QUEUE_GHOSTS=0 queued_demanding=${queued:-0} candidates scanned scan_exhausted cand cand_id cand_created cand_demand
   local demand_head_id demand_head_created oldest_created head_run_id
 
   summary="$(probe_status)" || { log "status probe FAILED (network/status api)"; return 2; }
@@ -821,11 +827,17 @@ print(comp, len(inc))
     if [ -z "$candidates" ]; then
       log "queue HEAD UNIDENTIFIABLE: queued=$queued but the read carried neither the row order nor a head run id — FAIL-CLOSED, changing nothing"; return 2
     fi
-    scanned=0
+    # ⛔ `scan_exhausted` IS THE COMPLETENESS EVIDENCE, NOT `scanned == queued` (review #2, blocking).
+    # `scanned` is ALSO capped by the probe bound, so on a page carrying more rows than `total_count`
+    # with `queued == QUEUE_HEAD_SCAN_MAX` the bound break left `scanned == queued` and the
+    # "the WHOLE queue was read" branch below certified "nothing is waiting" over a page it had not
+    # read — the same fail-open direction as the clamp, one condition over. Only running OUT OF ROWS
+    # proves the scan reached the end of the page.
+    scanned=0; scan_exhausted=1
     while IFS= read -r cand; do
       [ -n "$cand" ] || continue
       scanned=$((scanned + 1))
-      if [ "$scanned" -gt "$QUEUE_HEAD_SCAN_MAX" ]; then scanned=$((scanned - 1)); break; fi
+      if [ "$scanned" -gt "$QUEUE_HEAD_SCAN_MAX" ]; then scanned=$((scanned - 1)); scan_exhausted=0; break; fi
       case "$cand" in
         *,*) cand_id="${cand%%,*}"; cand_created="${cand#*,}" ;;
         *)   cand_id="$cand"; cand_created="" ;;
@@ -852,14 +864,17 @@ print(comp, len(inc))
       if [ "$scanned" -gt "$queued" ]; then
         log "queue reading INCONSISTENT: $scanned run(s) read from a page the API reports as $queued deep — FAIL-CLOSED, changing nothing"; return 2
       fi
-      if [ "$scanned" -eq "$queued" ]; then
-        # The WHOLE queue was read and not one run has a queued job: a COMPLETE measurement whose
-        # answer is "nothing is waiting for a runner". Not a refusal — there is nothing unread.
-        log "queue: all $queued queued run(s) report ZERO jobs in 'queued' status — ghost records, not backlog (a run GitHub reports as queued whose jobs were never created; nothing is waiting for a runner)"
+      if [ "$scan_exhausted" = 1 ] && [ "$scanned" -eq "$queued" ]; then
+        # The scan ran out of rows with every reported run read, and not one of them has a queued
+        # job: a COMPLETE measurement whose answer is "nothing is waiting for a runner". Not a
+        # refusal — there is nothing unread.
+        log "queue: all $queued queued run(s) report ZERO jobs in 'queued' status — nothing is waiting for a runner (a run GitHub reports as queued with nothing in a schedulable state)"
         QUEUE_GHOSTS="$queued"
+      elif [ "$scan_exhausted" = 1 ]; then
+        # The page ENDED before the queue did: a truncated read, not an empty one.
+        log "queue: the page carried only $scanned run row(s) for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the page is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing"; return 2
       else
-        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status (ghost records) and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing"
-        return 2
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing"; return 2
       fi
     fi
     # ⛔ A READ THAT CONTRADICTS ITSELF IS REFUSED, NOT CLAMPED. The page's rows cannot outnumber the
@@ -978,14 +993,20 @@ print(age)
   # READABLE to a human: a matrix run reads `self-hosted-arm64;self-hosted-x64`.
   DEMAND_SHOWN=""
   [ -n "$DEMAND_LABELS" ] && DEMAND_SHOWN="${DEMAND_LABELS//$'\n'/;}"
-  # Re-classify with the demand now known: the first pass classified the label sets before there was
-  # anything to match them against. Cheap (it reads the rows already in memory) and it keeps the
-  # counts and the matches derived from ONE body rather than two reads that could disagree.
+  # ⛔ RE-CLASSIFY BECAUSE `demand=` IS DERIVED IN BETWEEN, NOT BECAUSE THE FIRST PASS LACKED DEMAND
+  # (review #2, cycle 2 — the previous wording described the pre-#2344 order and was false after it).
+  # Since the head scan (#2344) `DEMAND_LABELS` is known BEFORE the census read, so the first
+  # `census_classify` already counts `demanding_idle`/`demanding_busy` correctly; the ONE thing that
+  # changes between the two calls is `DEMAND_SHOWN` (built just above from `DEMAND_LABELS`), which
+  # only reaches the KV. Keeping the second call is therefore about the KV's `demand=` field, and a
+  # lane that deletes it as "redundant" silently reverts `demand=` to `unknown` — which is why this
+  # comment names the reason rather than the sequence.
   # ⛔ THIS CANNOT FAIL INDEPENDENTLY: the same rows passed `census_classify` at the top of this leg and
-  # returned 2 there, and nothing about them changes in between — the only input that moves is
-  # DEMAND_LABELS, which affects the MATCH counts and never the shapes. The guard stays so a future
-  # caller cannot reach the deny arms having skipped a classification, but it is a guard, not a second
-  # check — it does not make the unreadable-body arm more proven than the one above (#3002 review P2).
+  # returned 2 there, and nothing about them changes in between — the only inputs that move are
+  # DEMAND_SHOWN/DEMAND_LABELS, which affect the MATCH counts and the KV and never the shapes. The
+  # guard stays so a future caller cannot reach the deny arms having skipped a classification, but it
+  # is a guard, not a second check — it does not make the unreadable-body arm more proven than the one
+  # above (#3002 review P2).
   census_classify "$census_rows" || { log "runner census UNREADABLE on re-classify — FAIL-CLOSED, changing nothing"; CENSUS_VERDICT=unknown; CENSUS_BLIND=1; return 2; }
   # The counts AND the verdict are computed on EVERY pass, before any leg decides: this line is the
   # instrument's raw reading, so "why did it say that" is answerable from the durable log alone —
