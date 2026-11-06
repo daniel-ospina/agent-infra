@@ -384,7 +384,7 @@ function selfdefault(nm, rhs,   m, head) {
 #       if fam.search(s[m.start():]): hits+=1
 #   print(n,hits)"
 #   → 1132 0
-# ZERO. So this costs the real tree NOTHING, and the real-tree scan is byte-identical (`claims=14`,
+# ZERO. So this costs the real tree NOTHING, and the real-tree scan is byte-identical (`claims=15`,
 # `unparseable: none`, RC=0). A model would have bought nothing it did not also risk.
 # This SUPERSEDES the earlier "an inline comment is documentation too" rule, which was added to silence
 # a false RED and is what produced fail-opens 1-4 above. A false RED is cheaper than a missed duplicate.
@@ -494,7 +494,7 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
   # and `codes_verdict` REDs on it. Two filters keep it precise: the token must be in assignment
   # position (`cmdpos`), and the OPERAND must READ AS a 70..89 code — so `MEM_BUDGET_PCT=75` in prose,
   # `rc=75` lowercase, `FOO=$bar` and the like never appear. Measured on this tree it yields EXACTLY
-  # the 14 family claims and nothing else, which is the property the arm asserts.
+  # the 15 family claims and nothing else, which is the property the arm asserts.
   # ⛔ THE OPERAND IS READ WITH `valof`, NOT MATCHED BARE (review of PR #3237, P2 at head 5e6ab20c).
   # The first cut's regex required a BARE two-digit literal, so the SAME declaration red or green
   # depending on how it was SPELLED — measured through the shipped predicate on a copy of the deploy
