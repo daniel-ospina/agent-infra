@@ -831,6 +831,12 @@ try_rescue wfprecedence wf_then_ok fix/lane-one \
 # ⛔ AND THE SEAM CANNOT BUY A DIFFERENT CREDENTIAL OUT OF NOTHING (review round 2, P2). With no ambient
 # token to remove, `BG_RESCUE_PUSH_UNSHADOW=1` used to select an attempt BYTE-IDENTICAL to the one that
 # just failed — with a message claiming a removal that never happened. It must now decline the retry.
+# ⛔ NON-DARWIN ONLY, for the same reason `wfnocred` is: on macOS the DEFAULT candidate (osxkeychain)
+# exists regardless of the seam, so "no retry is spent" is false there — the platform simulation caught
+# this arm red on the macOS path, which is the exact class of false red round 1 was about.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  skip "wfseammsgs: on macOS the default candidate is osxkeychain, so a retry IS available with no shadow to remove"
+else
 try_rescue wfseammsgs wf_always fix/lane-one \
   "-u BG_RESCUE_PUSH_HELPER -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_UNSHADOW=1"
 [ "${ATTEMPTS:-0}" = "1" ] \
@@ -844,6 +850,7 @@ case "$OUT" in
   *UNSHADOW=1*) bad "wfseammsgs: recommends BG_RESCUE_PUSH_UNSHADOW=1 on the one host shape where it cannot help — $OUT" ;;
   *) ok "wfseammsgs: does not recommend the unshadow seam where it is guaranteed useless" ;;
 esac
+fi
 
 
 # ⛔ AND WHEN NO CANDIDATE CAN BE A DIFFERENT CREDENTIAL, THERE IS NO RETRY. A second attempt carrying the
