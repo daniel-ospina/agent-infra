@@ -44,13 +44,18 @@
 #     #2292). The predicate is the refusal TEXT, not the remote host or the snapshot's paths: any host
 #     whose pre-receive output matches that wording takes the retry, and a host that words it
 #     differently does not. Every other refusal is reported as-is — see section 6.
-#   - the retry's credential is chosen PER HOST, and it is never the one that was just refused:
-#     `osxkeychain` on macOS, else the STORED credential with an ambient `GH_TOKEN`/`GITHUB_TOKEN`
-#     removed for that attempt (the cell shape), else `BG_RESCUE_PUSH_HELPER=<helper>`. On a host where
-#     none of those can be a DIFFERENT credential, no retry is attempted and the run says so rather
-#     than spending 45 s re-sending the same token — and a host with NO workflow-scoped credential at
-#     all still ends local-only, loudly. That last case is a recorded owner decision on #2292 (accept
-#     the loud local-only outcome), not an oversight; do not "fix" it by narrowing the snapshot.
+#   - the retry's credential is chosen PER HOST, and it is never the one that was just refused, in this
+#     order: `BG_RESCUE_PUSH_HELPER=<helper>` (an explicit choice, so it wins everywhere), then
+#     `BG_RESCUE_PUSH_UNSHADOW=1` (an explicit request for the STORED credential, which is the only way
+#     to reach that candidate on macOS), then the platform default — `osxkeychain` on macOS, else the
+#     STORED credential with an ambient `GH_TOKEN`/`GITHUB_TOKEN` removed for that attempt (the cell
+#     shape). On a host where none of those can be a DIFFERENT credential, no retry is attempted and
+#     the run says so rather than spending 45 s re-sending the same token.
+#   - a host with NO workflow-scoped credential at all still ends local-only, loudly (cause + a valid
+#     `refs/wip-local/<slug>` + exit 2). That is what SHIPS today and the alternatives are OPEN with the
+#     owner on #2292 — an off-box channel that keeps the snapshot whole (`git bundle` as a release
+#     asset), or item 4. ⛔ The one part that IS decided is that the snapshot stays WHOLE: excluding
+#     `.github/workflows/` into a side patch is a recorded refusal, so do not "fix" this case that way.
 #
 # Exit: 0 = nothing at risk, or rescued and pushed (prints the ref + sha)
 #       1 = the path is not the root of a git worktree
@@ -343,22 +348,27 @@ push_unshadowed() {
 # credential from the one just refused wins:
 #   1. `BG_RESCUE_PUSH_HELPER=<name>` — the operator's explicit choice, for a store this script cannot
 #      guess (trusted exactly as the caller is: it reaches the shell git would run anyway);
-#   2. `osxkeychain` on Darwin — the proven macOS credential, unchanged behaviour there;
-#   3. `unshadow` elsewhere, when an ambient token is actually set to remove;
-#   4. nothing — and then NO retry is attempted. A second attempt carrying the same credential cannot
+#   2. `BG_RESCUE_PUSH_UNSHADOW=1` — an explicit request for the STORED credential below. Needed because
+#      the macOS default is unconditional, so without this the unshadow candidate is UNREACHABLE there
+#      (a reviewer caught the earlier text claiming `BG_RESCUE_PUSH_HELPER=` did this: an EMPTY value is
+#      unset to `${…:-}`, so it selected nothing);
+#   3. `osxkeychain` on Darwin — the proven macOS credential, unchanged behaviour there;
+#   4. `unshadow` elsewhere, when an ambient token is actually set to remove;
+#   5. nothing — and then NO retry is attempted. A second attempt carrying the same credential cannot
 #      succeed, and in the second before a kill it costs 45 s to learn what the first attempt already
 #      said; the run reports "no second credential" instead, which is a different operator action from
 #      "the retry also failed" (that is what the `unclassified`/`NO USABLE CREDENTIAL HELPER` causes are
 #      for, and the message names the seam above rather than leaving the operator to guess).
-# ⛔ DECLARED RESIDUAL: on macOS the order is unconditional, so a Mac whose configured helper is gh's
-# (ambient token shadowing a keychain-stored one) takes the osxkeychain candidate first and does not
-# reach the unshadow arm. That is deliberate — the keychain path is the one measured there, and
-# reordering a PROVEN macOS behaviour to cover a shape this fleet has not measured is a worse trade —
-# and it is reachable: `BG_RESCUE_PUSH_HELPER=` on that host selects whatever store it actually uses.
-# The unshadow arm is what makes the choice platform-independent on Linux, where nothing was proven.
+# ⛔ DECLARED RESIDUAL: on macOS the DEFAULT is `osxkeychain`, so a Mac whose configured helper is gh's
+# (ambient token shadowing a keychain-stored one) does not reach the unshadow candidate unless the
+# operator asks for it (`BG_RESCUE_PUSH_UNSHADOW=1`). That is deliberate — the keychain path is the one
+# measured there, and reordering a PROVEN macOS behaviour to cover a shape this fleet has not measured
+# on that platform is a worse trade — and it is reachable, which the previous text got wrong.
 RETRY_HELPER="${BG_RESCUE_PUSH_HELPER:-}"
+RETRY_UNSHADOW="${BG_RESCUE_PUSH_UNSHADOW:-0}"
 retry_credential() {  # echoes "helper <name>" | "unshadow" | "" (nothing that can differ)
   if [ -n "$RETRY_HELPER" ]; then printf 'helper %s' "$RETRY_HELPER"; return 0; fi
+  if [ "$RETRY_UNSHADOW" = "1" ]; then printf 'unshadow'; return 0; fi
   if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then printf 'helper osxkeychain'; return 0; fi
   if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then printf 'unshadow'; return 0; fi
   printf ''
@@ -462,7 +472,7 @@ if [ "$NO_SECOND" -eq 1 ]; then
   # the reader knows the rescue had no second credential to select on $(uname -s 2>/dev/null) and that
   # the fix is to supply one. The retry was deliberately NOT attempted — re-sending the same credential
   # cannot succeed, and it is the one attempt that would turn a named cause into a timeout.
-  WHY+=("no second credential was tried: on $(uname -s 2>/dev/null), the retry would have re-sent the SAME credential (no ambient GH_TOKEN/GITHUB_TOKEN to unshadow, and no osxkeychain). Supply a workflow-scoped one with BG_RESCUE_PUSH_HELPER=<helper-name>.")
+  WHY+=("no second credential was tried: on $(uname -s 2>/dev/null), the retry would have re-sent the SAME credential (no ambient GH_TOKEN/GITHUB_TOKEN to unshadow, and no osxkeychain). Supply a workflow-scoped one with BG_RESCUE_PUSH_HELPER=<helper-name>, or force the stored credential with BG_RESCUE_PUSH_UNSHADOW=1.")
 fi
 
 if [ "$LOCAL_OK" -eq 1 ]; then

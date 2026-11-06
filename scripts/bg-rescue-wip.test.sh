@@ -718,41 +718,87 @@ echo; echo "── the retry's CREDENTIAL is chosen per host and never re-sends 
 #
 # These arms therefore measure AVAILABILITY (does the workflow-bearing snapshot reach origin on a host
 # with no osxkeychain), not the wording of a message.
-try_rescue wfshadow wf_shadowed fix/lane-one \
-  "-u BG_RESCUE_PUSH_HELPER -u GITHUB_TOKEN GH_TOKEN=shadow-readonly-pat"
-SH_SHA="$(ref_of "$T/wfshadow/origin.git" refs/wip/fix-lane-one)"
-[ "$RC" -eq 0 ] \
-  && ok "wfshadow: exit 0 — the snapshot is RESCUED on a host with no osxkeychain (the cell shape)" \
-  || bad "wfshadow: exit $RC (want 0) — the retry did not reach the stored credential — $OUT"
-[ "${ATTEMPTS:-0}" = "2" ] \
-  && ok "wfshadow: exactly TWO attempts (one shadowed, one with the shadow removed)" \
-  || bad "wfshadow: ${ATTEMPTS:-0} attempt(s) (want exactly 2) — no retry, or a retry storm"
-grep -qx 'GH_TOKEN=shadow-readonly-pat GITHUB_TOKEN=unset' "$T/wfshadow/shim/attempts.env.1" 2>/dev/null \
-  && ok "wfshadow: attempt 1 really ran SHADOWED by the ambient token (so the arm is not vacuous)" \
-  || bad "wfshadow: attempt 1 did not see the shadow token — the fixture proves nothing: $(cat "$T/wfshadow/shim/attempts.env.1" 2>/dev/null)"
-grep -qx 'GH_TOKEN=unset GITHUB_TOKEN=unset' "$T/wfshadow/shim/attempts.env.2" 2>/dev/null \
-  && ok "wfshadow: attempt 2 ran with the ambient token REMOVED (that removal is the mechanism)" \
-  || bad "wfshadow: attempt 2 still carried the ambient token — the retry re-sent the credential that was just refused: $(cat "$T/wfshadow/shim/attempts.env.2" 2>/dev/null)"
-[ -n "$SH_SHA" ] && has_blob "$T/wfshadow/origin.git" "$SH_SHA" .github/workflows/ci.yml 'name: ci' \
-  && ok "wfshadow: the WORKFLOW FILE reached origin — the work left the disk without any keychain" \
-  || bad "wfshadow: origin has no snapshot carrying the workflow file (ref: ${SH_SHA:-none})"
-SH_RS1="$(tail -1 "$T/wfshadow/shim/argv.1" 2>/dev/null)"
-SH_RS2="$(tail -1 "$T/wfshadow/shim/argv.2" 2>/dev/null)"
-[ -n "$SH_RS1" ] && [ "$SH_RS1" = "$SH_RS2" ] \
-  && ok "wfshadow: both attempts push the SAME refspec (removing a variable cannot change WHAT is published)" \
-  || bad "wfshadow: the retry's refspec differs from the first push's ('${SH_RS1:-none}' vs '${SH_RS2:-none}')"
-SH_FORCE=0
-for _p in "$T/wfshadow/shim/argv.1" "$T/wfshadow/shim/argv.2"; do
-  [ -f "$_p" ] && grep -qE '^(\+|--force$|-f$)' "$_p" 2>/dev/null && SH_FORCE=1
-done
-[ "$SH_FORCE" -eq 0 ] \
-  && ok "wfshadow: NEITHER attempt carries a force form (a forced rescue can overwrite a peer clone's snapshot)" \
-  || bad "wfshadow: an attempt used a FORCE form"
-case "$OUT" in
-  *osxkeychain*|*OSXKEYCHAIN*) bad "wfshadow: claims the keychain credential on a host that has none — $OUT" ;;
-  *STORED*credential*) ok "wfshadow: names the credential that published it (the stored one, shadow removed)" ;;
-  *) bad "wfshadow: the success message does not name the credential used — $OUT" ;;
-esac
+#
+# ⛔ AND EACH ARM RUNS ONLY WHERE ITS CANDIDATE EXISTS. The first draft of this block asserted the
+# unshadow MECHANISM unconditionally, so on macOS — where the DEFAULT candidate is osxkeychain — it went
+# red on a CORRECT tree (4 false reds, and the Darwin branch was green nowhere: red on the Mac, dead
+# code on Linux). A fresh reviewer reproduced it by flipping the platform comparisons. There are now
+# three arms, and every one of them is green on the platform whose branch it covers:
+#   wfshadow   — the DEFAULT unshadow candidate (non-Darwin)
+#   wfunshadow — the candidate ASKED FOR (`BG_RESCUE_PUSH_UNSHADOW=1`), on every platform — which is
+#                also the only way to reach it on macOS, and is what makes that seam tested
+#   wfhelper   — the macOS DEFAULT (`osxkeychain`), on Darwin
+assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label>
+  local f="$T/$1" l="$2" sha r1 r2 force=0 p
+  sha="$(ref_of "$f/origin.git" refs/wip/fix-lane-one)"
+  [ "$RC" -eq 0 ] \
+    && ok "$l: exit 0 — the snapshot is RESCUED with no osxkeychain anywhere" \
+    || bad "$l: exit $RC (want 0) — the retry did not reach the stored credential — $OUT"
+  [ "${ATTEMPTS:-0}" = "2" ] \
+    && ok "$l: exactly TWO attempts (one shadowed, one with the shadow removed)" \
+    || bad "$l: ${ATTEMPTS:-0} attempt(s) (want exactly 2) — no retry, or a retry storm"
+  grep -qx 'GH_TOKEN=shadow-readonly-pat GITHUB_TOKEN=unset' "$f/shim/attempts.env.1" 2>/dev/null \
+    && ok "$l: attempt 1 really ran SHADOWED by the ambient token (so the arm is not vacuous)" \
+    || bad "$l: attempt 1 did not see the shadow token — the fixture proves nothing: $(cat "$f/shim/attempts.env.1" 2>/dev/null)"
+  grep -qx 'GH_TOKEN=unset GITHUB_TOKEN=unset' "$f/shim/attempts.env.2" 2>/dev/null \
+    && ok "$l: attempt 2 ran with the ambient token REMOVED (that removal is the mechanism)" \
+    || bad "$l: attempt 2 still carried the ambient token — the retry re-sent the credential that was just refused: $(cat "$f/shim/attempts.env.2" 2>/dev/null)"
+  [ -n "$sha" ] && has_blob "$f/origin.git" "$sha" .github/workflows/ci.yml 'name: ci' \
+    && ok "$l: the WORKFLOW FILE reached origin — the work left the disk without any keychain" \
+    || bad "$l: origin has no snapshot carrying the workflow file (ref: ${sha:-none})"
+  r1="$(tail -1 "$f/shim/argv.1" 2>/dev/null)"; r2="$(tail -1 "$f/shim/argv.2" 2>/dev/null)"
+  [ -n "$r1" ] && [ "$r1" = "$r2" ] \
+    && ok "$l: both attempts push the SAME refspec (changing the credential cannot change WHAT is published)" \
+    || bad "$l: the retry's refspec differs from the first push's ('${r1:-none}' vs '${r2:-none}')"
+  for p in "$f/shim/argv.1" "$f/shim/argv.2"; do
+    [ -f "$p" ] && grep -qE '^(\+|--force$|-f$)' "$p" 2>/dev/null && force=1
+  done
+  [ "$force" -eq 0 ] \
+    && ok "$l: NEITHER attempt carries a force form (a forced rescue can overwrite a peer clone's snapshot)" \
+    || bad "$l: an attempt used a FORCE form"
+  case "$OUT" in
+    *osxkeychain*|*OSXKEYCHAIN*) bad "$l: claims the keychain credential on a host that has none — $OUT" ;;
+    *STORED*credential*) ok "$l: names the credential that published it (the stored one, shadow removed)" ;;
+    *) bad "$l: the success message does not name the credential used — $OUT" ;;
+  esac
+}
+
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  skip "wfshadow: on macOS the DEFAULT candidate is osxkeychain — the unshadow mechanism is covered by wfunshadow there, and the Darwin default by wfhelper"
+else
+  try_rescue wfshadow wf_shadowed fix/lane-one \
+    "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN GH_TOKEN=shadow-readonly-pat"
+  assert_unshadow_arm wfshadow wfshadow
+fi
+
+# ⛔ THE CANDIDATE ASKED FOR BY NAME (`BG_RESCUE_PUSH_UNSHADOW=1`) — platform-independent, because it is
+# the only route to the stored credential on macOS (where the default is unconditional) and a seam that
+# only exists in a comment is not a seam.
+# ⛔ EVERY `-u` COMES BEFORE EVERY ASSIGNMENT. POSIX `env` stops option parsing at the first non-option
+# word, so `env -u A B=1 -u C cmd` tries to EXEC `-u` (rc 127) and the arm silently never runs — measured
+# on this suite's own first draft of this line, which reported 7 reds whose first line was
+# `env: '-u': No such file or directory`.
+try_rescue wfunshadow wf_shadowed fix/lane-one \
+  "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN BG_RESCUE_PUSH_UNSHADOW=1 GH_TOKEN=shadow-readonly-pat"
+assert_unshadow_arm wfunshadow wfunshadow
+
+# ⛔ THE macOS DEFAULT, ASSERTED WHERE IT EXISTS. Without this arm the `uname = Darwin` branch is green
+# nowhere: red on the Mac (via the bug above) and dead code on Linux.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  try_rescue wfhelper wf_then_ok fix/lane-one "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW"
+  [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+    && ok "wfhelper: the Darwin default retries ONCE with a helper credential and rescues (exit 0, 2 attempts)" \
+    || bad "wfhelper: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — $OUT"
+  [ "${WHO:-}" = "plain keychain " ] \
+    && ok "wfhelper: the retry selected the KEYCHAIN helper (the macOS default is not silently dropped)" \
+    || bad "wfhelper: the Darwin default selected no helper credential — attempts were: ${WHO:-none}"
+  [ -n "$(ref_of "$T/wfhelper/origin.git" refs/wip/fix-lane-one)" ] \
+    && ok "wfhelper: the snapshot reached origin" \
+    || bad "wfhelper: nothing was published"
+else
+  skip "wfhelper: the osxkeychain default only exists on macOS, and this host is $(uname -s 2>/dev/null)"
+fi
+
 
 # ⛔ AND WHEN NO CANDIDATE CAN BE A DIFFERENT CREDENTIAL, THERE IS NO RETRY. A second attempt carrying the
 # credential the remote just refused cannot succeed, and in the second before a cap kill it costs a
@@ -762,7 +808,7 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
   skip "wfnocred: the default candidate on macOS IS osxkeychain, so the no-second-credential arm cannot run here"
 else
   try_rescue wfnocred wf_always fix/lane-one \
-    "-u BG_RESCUE_PUSH_HELPER -u GH_TOKEN -u GITHUB_TOKEN"
+    "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN"
   [ "$RC" -eq 2 ] \
     && ok "wfnocred: exit 2 — still an honest local-only failure when there is nothing else to try" \
     || bad "wfnocred: exit $RC (want 2) — $OUT"
