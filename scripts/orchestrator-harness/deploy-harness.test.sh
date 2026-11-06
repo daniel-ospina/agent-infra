@@ -1246,6 +1246,15 @@ fi
 # floor exists for. Re-cut to the measured counts, per the rule stated above:
 #   `lane.sh` 3→5, `spawn-gate.sh` 3→5, `fix-one.sh` 2→3, `dispatch-merge.sh` 2→3, `chain-merge.sh` 1→2.
 # Each new number is `grep -c 'deploy-harness\.sh' <file>` at this head; no entry was lowered.
+#   ⛔ `spawn-gate.sh`'s 5 INCLUDES ONE COMMENT, and the floor is kept at 5 ANYWAY — the residual is
+#   stated rather than hidden, the way `check-deployed-drift.sh`'s is. Four of the five are live
+#   remedy sites (2223, 2257, 2264, 2399); the fifth is the comment at `spawn-gate.sh:1161`. Cutting
+#   the floor to the four remedy-shaped sites would re-open exactly the hole this block closes (revert
+#   ONE remedy and the count lands ON the floor, green), and under this repo's A/B rule a false PASS
+#   (a reverted remedy nobody notices) outranks a false block. So the cost is named instead: REWORDING
+#   that comment now reds arm (1) over correct code, which is friction in the B direction, not a
+#   correctness hole. Counting remedy-shaped lines rather than mentions would remove the whole class;
+#   that is a change to the ARM, so it is a follow-up, not a number smuggled in here.
 REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:23 dispatch-merge.sh:3 chain-merge.sh:2 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:3 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:5 lane-merge.sh:2 spawn-gate.sh:5"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"

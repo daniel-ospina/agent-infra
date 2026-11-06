@@ -964,7 +964,8 @@ if [ "$AGENT_STARTED" = "0" ]; then
         # ⛔ A SIXTH VALUE, AND THE SECOND WHOSE RECORD IS NOT A CAPACITY CLAIM (follow-up review of
         # #2991, P2). The refusal is a helper/consumer VERSION SKEW or a corrupt helper: it is a property
         # of the PAIR, not of this box, so "yielded to peers" is false — a peer running the same pair
-        # refuses identically, and the operator's remedy is a `cp` of the helper pair on EVERY box. The
+        # refuses identically, and the operator's remedy is a VERIFIED redeploy of the helper pair on
+        # EVERY box. The
         # record is still written (chain-merge.sh must stop waiting for a PR that cannot appear), and
         # the words say exactly what it buys, the same way `land` does.
         echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
@@ -1006,7 +1007,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # it — the harness's own files, identical on every box. The capability arm below would send the
     # operator to "repair this box (installed pi/extension set, provider credential) or dispatch the
     # issue to another box", and both are wrong here: the extension set is fine and the peer refuses
-    # identically. The fix is one `cp` on every box that runs lanes.
+    # identically. The fix is one verified redeploy on every box that runs lanes.
     echo "[lane $N] NOT started: HARNESS/MISMATCH gate refused — this box's caller and its deployed cell-lane-preflight.sh do not agree (a usage/argument skew, or a corrupt copy), so the probe could not measure anything (agent-infra#2991). This is NOT a property of this box and load has nothing to do with it: every box running the same pair refuses identically, so do NOT dispatch the issue to another box. Sync the helper pair with a VERIFIED redeploy — bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O — then re-dispatch. Nothing was consumed; the issue does not need re-authoring." >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ NAMED, BECAUSE THE REMEDY IS THE ONE THING WAITING CANNOT BUY (review of #2991, P1). Without
