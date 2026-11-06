@@ -152,7 +152,7 @@ done
 # which is the very leak this change removes.
 WTL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/wt-lifecycle.sh"
 # shellcheck source=/dev/null
-. "$WTL" || { echo "dispatch-merge: FATAL: $WTL is missing — refusing to create lane worktrees without their rollback (a failed add would leave a branch behind, #2033). Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ~/orchestrator" >&2; exit 78; }
+. "$WTL" || { echo "dispatch-merge: FATAL: $WTL is missing — refusing to create lane worktrees without their rollback (a failed add would leave a branch behind, #2033). Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >&2; exit 78; }
 
 # ⛔ TWO MODULES, ONE `wt_` NAMESPACE, AND NO SHARED NAME — for now. `worker-terminal.sh` and
 # `wt-lifecycle.sh` both prefix their verbs `wt_`, so a future addition to either can silently SHADOW

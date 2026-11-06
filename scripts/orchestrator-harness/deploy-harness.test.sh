@@ -1238,24 +1238,40 @@ fi
 # arm (1) is silent on it and arm (2) is silent on a remedy replaced by prose.
 # ⛔ FIVE FLOORS RE-CUT 2026-11-06 (PR #3508, #3073 roots 2+3) — the same drift the two entries above
 # record, found again one round later. Seven remedies were reverted to the unverified depth-1 copy
-# (chain-merge.sh:307, dispatch-merge.sh:155, fix-one.sh:819, lane.sh:970,1010, spawn-gate.sh:2223,2257)
+# (chain-merge.sh:313, dispatch-merge.sh:155, fix-one.sh:819, lane.sh:970,1010, spawn-gate.sh:2275,2309)
 # and the fix that restored them ALSO left all five floors at their pre-revert numbers, so each restore
 # was invisible to arm (1): reverting any ONE of the seven keeps the count at or above the old floor and
 # arm (1) stays GREEN. Arm (2) does catch the `cp *.sh` shape — that is how the class was found — but a
 # remedy DELETED or reworded to name a third mechanism is arm (2)'s blind spot, which is the case a
 # floor exists for. Re-cut to the measured counts, per the rule stated above:
-#   `lane.sh` 3→5, `spawn-gate.sh` 3→5, `fix-one.sh` 2→3, `dispatch-merge.sh` 2→3, `chain-merge.sh` 1→2.
-# Each new number is `grep -c 'deploy-harness\.sh' <file>` at this head; no entry was lowered.
-#   ⛔ `spawn-gate.sh`'s 5 INCLUDES ONE COMMENT, and the floor is kept at 5 ANYWAY — the residual is
-#   stated rather than hidden, the way `check-deployed-drift.sh`'s is. Four of the five are live
-#   remedy sites (2223, 2257, 2264, 2399); the fifth is the comment at `spawn-gate.sh:1161`. Cutting
-#   the floor to the four remedy-shaped sites would re-open exactly the hole this block closes (revert
-#   ONE remedy and the count lands ON the floor, green), and under this repo's A/B rule a false PASS
-#   (a reverted remedy nobody notices) outranks a false block. So the cost is named instead: REWORDING
-#   that comment now reds arm (1) over correct code, which is friction in the B direction, not a
+#   `lane.sh` 3→5, `spawn-gate.sh` 4→6, `fix-one.sh` 2→3, `dispatch-merge.sh` 2→3, `chain-merge.sh` 1→2.
+# ⛔ EACH NUMBER WAS RE-MEASURED ON THE MERGED HEAD (review P1, 2026-11-06), NOT ON THE PRE-MERGE BRANCH
+# HEAD. The first cut measured the branch tree, and the forward merge with `origin/main` added another
+# `deploy-harness.sh` comment to `spawn-gate.sh` (`:1787`), taking it to 6 against a floor of 5 — so
+# reverting ONE remedy landed the count ON the floor, `-ge` stayed green, and the hole this block exists
+# to close was re-opened in the very file it re-cut. A floor is only a floor while it is the count of the
+# tree it ships with: ANY merge that touches these files invalidates every entry below, so re-run
+# `grep -c 'deploy-harness\.sh'` after one. (The line numbers above moved with that merge too: the
+# converted sites are `chain-merge.sh:313` and `spawn-gate.sh:2275,2309` at this head, not the pre-merge
+# `307` / `2223,2257`.)
+#   ⛔ `spawn-gate.sh`'s 6 INCLUDES TWO COMMENTS, and the floor is kept at 6 ANYWAY — the residual is
+#   stated rather than hidden, the way `check-deployed-drift.sh`'s is. Four of the six are live remedy
+#   sites (2275, 2309, 2316, 2528); the other two are the comments at `:1161` and `:1787`. Cutting the
+#   floor to the four remedy-shaped sites would re-open exactly the hole this block closes (revert ONE
+#   remedy and the count lands ON the floor, green), and under this repo's A/B rule a false PASS (a
+#   reverted remedy nobody notices) outranks a false block. So the cost is named instead: REWORDING
+#   either comment now reds arm (1) over correct code, which is friction in the B direction, not a
 #   correctness hole. Counting remedy-shaped lines rather than mentions would remove the whole class;
 #   that is a change to the ARM, so it is a follow-up, not a number smuggled in here.
-REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:23 dispatch-merge.sh:3 chain-merge.sh:2 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:3 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:5 lane-merge.sh:2 spawn-gate.sh:5"
+# ⛔ FOUR MORE ENTRIES WERE ALREADY ONE BELOW THEIR MEASURED COUNT (review P2, 2026-11-06) and are re-cut
+# here rather than carried: this block's own claim is that each number IS the measured count, and four
+# were not — each tolerated exactly ONE silently reverted remedy, which is the defect the paragraphs
+# above name. `orch-loop.sh` 23→24, `refresh-candidates.sh` 5→6, `report.sh` 1→2, `merge-one.sh` 1→2.
+# `orch-loop.sh` and `merge-one.sh` each count one comment (at `:756` and `:129`), carrying the same
+# stated residual as `spawn-gate.sh`; `refresh-candidates.sh` and `report.sh` count remedy sites only.
+# `check-deployed-drift.sh:1` REMAINS the one DELIBERATE exception, for the reason recorded above — it is
+# not drift, and "correcting" it to 3 would pin two prose sentences and red arm (1) on a comment reword.
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:24 dispatch-merge.sh:3 chain-merge.sh:2 refresh-candidates.sh:6 check-deployed-drift.sh:1 report.sh:2 merge-one.sh:2 cloud-cell-supervisor.sh:1 fix-one.sh:3 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:5 lane-merge.sh:2 spawn-gate.sh:6"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
