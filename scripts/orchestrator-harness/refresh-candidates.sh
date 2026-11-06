@@ -4087,19 +4087,32 @@ queue_order_from_pool() {
   # opens it — the same mechanism the `.queue-rank` comment twenty lines up documents. `cat` gives an
   # OBSERVABLE status for every shape at once, so the read cannot fail silently and the two cases below
   # are decided by what actually happened. Absent record: no clause, and `_sat_unread` stays 0.
-  if ! _sat_raw="$(cat "$o/.pool-sat" 2>/dev/null)"; then
-    if [ -e "$o/.pool-sat" ] || [ -L "$o/.pool-sat" ]; then
+  # ⛔ `[ -f ]` BEFORE THE READ, AND THE READ ITSELF IS THE SECOND TEST (review P3, cycle 42). `cat` on a
+  # FIFO or a `/dev/zero` symlink is UNBOUNDED — there is no timeout anywhere on this path — and `-s` was
+  # false for both, so the previous test-shaped guard never opened them while a plain `cat` would hang the
+  # pass. Only a REGULAR file is read (a symlink to one still is), and a non-regular shape is classified
+  # unread rather than opened. `tr -d '\000'` strips NUL before the substitution can warn about it: a NUL
+  # in the record is data, not a reason to print the shell's own message above an operator line.
+  # ⛔ THE READ IS WRAPPED IN A BRACE GROUP SO ITS REDIRECT FAILURE IS SUPPRESSIBLE (review P2, cycle 42).
+  # `tr -d ... < "$o/.pool-sat" 2>/dev/null` does NOT cover the `<` — that redirect is set up before the
+  # `2>/dev/null` applies, exactly as the `.queue-rank` comment above documents, so an unreadable record
+  # still printed `Permission denied` and §14d-bis reddened on it. The group's stderr covers the redirect
+  # AND the command substitution still carries the failing status, which is what the branch tests.
+  if [ -e "$o/.pool-sat" ] || [ -L "$o/.pool-sat" ]; then
+    if [ -f "$o/.pool-sat" ] && _sat_raw="$( { tr -d '\000' < "$o/.pool-sat"; } 2>/dev/null )"; then
+      if [ -n "$_sat_raw" ]; then
+        while IFS= read -r _sat_tier; do
+          case "$_sat_tier" in
+            P0-blocker|P1-severe|P2-moderate) _sat="${_sat:+$_sat,}$_sat_tier" ;;
+            "") : ;;
+            *) _sat_junk=1 ;;
+          esac
+        done <<<"$_sat_raw"
+        [ -n "$_sat" ] || _sat="unrecognised"
+      fi
+    else
       _sat_unread=1
     fi
-  elif [ -n "$_sat_raw" ]; then
-    while IFS= read -r _sat_tier; do
-      case "$_sat_tier" in
-        P0-blocker|P1-severe|P2-moderate) _sat="${_sat:+$_sat,}$_sat_tier" ;;
-        "") : ;;
-        *) _sat_junk=1 ;;
-      esac
-    done <<<"$_sat_raw"
-    [ -n "$_sat" ] || _sat="unrecognised"
   fi
   _sat_said=""
   # ⛔ `unrecognised` DOES NOT ASSERT A CLIP (review P2, cycle 40). Cycle 39 moved the clip out of the
@@ -4108,14 +4121,18 @@ queue_order_from_pool() {
   # whole meaning is "no recognised tier was recorded". Two distinct states share that word: junk lines
   # in the record, and a record that could not be read at all. Neither may claim a clip, and the
   # unreadable one may not be reduced to "no clip" either.
+  # ⛔ THE SHAPE IT CANNOT DISTINGUISH, STATED (review P2, cycle 42): a record already written and then
+  # REMOVED by a concurrent pass's entry `rm -f` is indistinguishable from one that was never written, so
+  # it reads as "no tier was clipped" — the normal case. Detecting it would need a second durable marker
+  # (`-e` is false for a file that is gone), and the producer's writes are a PIPELINE SUBSHELL, so no
+  # in-process flag survives either. That is a residual, not a claim: the docs say the same.
   case "$_sat" in
     "") [ "$_sat_unread" -eq 1 ] && _sat_said=" — the tier-window record EXISTED but could not be READ, so this pass measured no clip and asserts none" ;;
     unrecognised)
-      if [ "$_sat_junk" -eq 1 ]; then
-        _sat_said=" — the tier-window record carried no tier name this code recognises, so NO clip is asserted and no tier is repeated here"
-      else
-        _sat_said=" — the tier-window record held nothing this code could classify, so NO clip is asserted"
-      fi ;;
+      # A non-empty record that matched no tier ALWAYS has at least one unrecognised line, so the former
+      # non-junk arm here was unreachable (review P3, cycle 42): a record of blank lines reads as empty,
+      # and an empty or absent record prints no clause at all — which is the truth for it.
+      _sat_said=" — the tier-window record carried no tier name this code recognises, so NO clip is asserted and no tier is repeated here" ;;
     *) _sat_said=" — windows=TRUNCATED($_sat): a tier window ended FULL with a next page still advertised, so that tier's NEWEST members are NOT in .pool and any of them that is queued sits in the unranked TAIL, behind every ranked row of every LOWER tier"
        [ "$_sat_junk" -eq 1 ] && _sat_said="$_sat_said (the window record also carried a line that is not a tier name — it is NOT repeated here)" ;;
   esac

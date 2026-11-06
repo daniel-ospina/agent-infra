@@ -1693,7 +1693,13 @@ sat_ctl="$(cat "$TMP/sat/out" 2>/dev/null)"
 printf 'P1-severe\n' > "$TMP/sat/o/.pool-sat"
 ( cd "$TMP/sat" && HOME="$TMP/sat" bash drive.sh "$TMP/sat/o" ) > "$TMP/sat/out-sat" 2>&1
 sat_out="$(cat "$TMP/sat/out-sat" 2>/dev/null)"
+# ⛔ THE POLARITY IS GRADED, NOT JUST THE CLIP (review P3, cycle 42). Dropping the exists-gate made
+# every ORDINARY pass (no truncation, so no record) print "the tier-window record EXISTED but could not
+# be READ" — a claim about a file that does not exist — and this check stayed green because it only
+# forbade the clip. An absent record must print NEITHER clause.
 if [ -n "$sat_ctl" ] && ! grep -q 'windows=TRUNCATED' <<<"$sat_ctl" \
+   && ! grep -q 'could not be READ' <<<"$sat_ctl" \
+   && ! grep -q 'carried no tier name this code recognises' <<<"$sat_ctl" \
    && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$sat_out"; then rc=0
 else rc=1; echo "      control (no .pool-sat) '$(printf '%s' "$sat_ctl" | tr '\n' '|' | head -c 200)' / saturated '$(printf '%s' "$sat_out" | tr '\n' '|' | head -c 260)'"; fi
 ck "a TRUNCATED tier window is NAMED on the order line, and the clause is ABSENT when no tier was clipped" $rc
@@ -1712,7 +1718,7 @@ ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not rep
 MUT_NOSAT="$TMP/fns-nosat.sh"
 # The anchor is the READ itself, so it survives a change of guard shape (it has already drifted once,
 # from `[ -s ]` to the read-status form: the `cmp` below caught it rather than passing vacuously).
-sed 's|if ! _sat_raw=.*then|if false; then|' "$FNS" > "$MUT_NOSAT"
+sed 's|^  if \[ -e "\$o/.pool-sat" \] || \[ -L "\$o/.pool-sat" \]; then|  if false; then|' "$FNS" > "$MUT_NOSAT"
 if cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null; then rc=1; echo "      the .pool-sat mutation did not apply — the sed anchor drifted"; else
   d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"
   printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
@@ -1808,10 +1814,61 @@ printf 'aaa\nbbb\n' > "$_d14d/o/candidates.txt"; printf '200\n' > "$_d14d/o/.poo
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14d/drive.sh"
 ( cd "$_d14d" && HOME="$_d14d" bash drive.sh "$_d14d/o" ) > "$_d14d/out" 2>&1
 _y14="$(cat "$_d14d/out" 2>/dev/null)"
-if grep -q 'could not be READ' <<<"$_y14" && ! grep -q 'held nothing this code could classify' <<<"$_y14" \
+# ⛔ THE `_why_none` CLAUSE IS GRADED HERE, because this shape is unreadable for EVERY uid while the
+# chmod-000 fixture skips on root (review P2, cycle 42): deleting that branch left the suite green for
+# the one environment the author measured. The dead "held nothing this code could classify" wording is
+# gone with the unreachable arm that printed it, so it is no longer asserted either way.
+if grep -q 'could not be READ' <<<"$_y14" \
+   && grep -q 'tier-window record could not be read, so no cause is asserted' <<<"$_y14" \
+   && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_y14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_y14" && ! grep -qi 'is a directory' <<<"$_y14"; then rc=0
 else rc=1; echo "      directory record '$(printf '%s' "$_y14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) a window-record PATH that cannot be opened is reported as unread, not as empty" $rc
+
+# 14d-quater) A RECORD WHOSE LAST LINE HAS NO TRAILING NEWLINE (review P3, cycle 42). The pre-fix read
+# used `done < file`, whose LOOP CONDITION is the `read`'s EOF status — a one-line record written without
+# its newline yielded `unrecognised` and the order line then asserted "NO clip is asserted" for the
+# false cause this whole PR removes. Reachable: the writer emits `"P1-severe\n"` in one chunk and a
+# concurrent read can see the bytes before the newline. `<<<"$_sat_raw"` appends the newline; nothing
+# asserted the difference, so reverting to the file redirect was 0 red.
+_d14e="$TMP/arm-clip-nonl"; rm -rf "$_d14e"; mkdir -p "$_d14e/o"
+printf 'aaa\nbbb\n' > "$_d14e/o/candidates.txt"; printf '200\n' > "$_d14e/o/.pool"
+printf 'P2-moderate' > "$_d14e/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14e/drive.sh"
+( cd "$_d14e" && HOME="$_d14e" bash drive.sh "$_d14e/o" ) > "$_d14e/out" 2>&1
+_n14="$(cat "$_d14e/out" 2>/dev/null)"
+if grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$_n14" && ! grep -q 'carried no tier name' <<<"$_n14"; then rc=0
+else rc=1; echo "      no-trailing-newline record '$(printf '%s' "$_n14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a record with NO trailing newline still names its clipped tier (the read does not lose the line)" $rc
+
+# 14d-quinquies) A NON-REGULAR RECORD IS NEVER OPENED (review P3, cycle 42). `cat` on a FIFO or a
+# `/dev/zero` symlink is UNBOUNDED — no timeout exists on this path — and `-s` was false for both, so the
+# previous test-shaped guard never opened them while a bare `cat` would hang the pass. A `/dev/null`
+# symlink is the safe witness: `cat` succeeds with ZERO bytes, so without the `[ -f ]` guard it reads as
+# "empty record, no clip" while WITH the guard it is an unread state. It is also the only shape in this
+# section that can distinguish the guard from the read.
+_d14f="$TMP/arm-clip-devnull"; rm -rf "$_d14f"; mkdir -p "$_d14f/o"
+printf 'aaa\nbbb\n' > "$_d14f/o/candidates.txt"; printf '200\n' > "$_d14f/o/.pool"
+ln -s /dev/null "$_d14f/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14f/drive.sh"
+( cd "$_d14f" && HOME="$_d14f" bash drive.sh "$_d14f/o" ) > "$_d14f/out" 2>&1
+_v14="$(cat "$_d14f/out" 2>/dev/null)"
+if grep -q 'could not be READ' <<<"$_v14" && ! grep -q 'windows=TRUNCATED' <<<"$_v14"; then rc=0
+else rc=1; echo "      non-regular record '$(printf '%s' "$_v14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a NON-REGULAR window record (a device symlink) is classified unread, never opened" $rc
+
+# 14d-sexies) A NUL IN THE RECORD IS DATA, NOT A SHELL WARNING (review P3, cycle 42). `cat` alone made
+# bash print `warning: command substitution: ignored null byte in input` onto the log above the honest
+# line — the same class §14d-bis forbids for `permission denied`. The tier still has to be recognised.
+_d14g="$TMP/arm-clip-nul"; rm -rf "$_d14g"; mkdir -p "$_d14g/o"
+printf 'aaa\nbbb\n' > "$_d14g/o/candidates.txt"; printf '200\n' > "$_d14g/o/.pool"
+printf 'P1-severe\000\n' > "$_d14g/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14g/drive.sh"
+( cd "$_d14g" && HOME="$_d14g" bash drive.sh "$_d14g/o" ) > "$_d14g/out" 2>&1
+_u14g="$(cat "$_d14g/out" 2>/dev/null)"
+if grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_u14g" && ! grep -qi 'null byte' <<<"$_u14g"; then rc=0
+else rc=1; echo "      NUL-bearing record '$(printf '%s' "$_u14g" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a NUL-bearing record still recognises its tier and leaks no shell 'null byte' warning" $rc
 
 # 14e) NON-VACUITY — remove the clause from the arms and the checks above must redden.
 MUT_NOSAT2="$TMP/fns-nosat2.sh"
