@@ -70,9 +70,18 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
 - **Bounded twice.** `--max N` (default 25) caps ARCHIVES per pass, and the pass budget
   (`WIP_SWEEP_BUDGET`, default 900 s) bounds the WHOLE pass: it is tested before every examination, not
   only before an archive, so a pass over a checkout with hundreds of CLEAN worktrees is still bounded by
-  the budget rather than by `worktree_count x WIP_SWEEP_STATUS_TIMEOUT`. A budget stop is stated —
-  `status=incomplete`, `detail=… budget_stopped=yes`, exit `1` — never a green 0 over worktrees it did
-  not reach.
+  the budget rather than by `worktree_count x WIP_SWEEP_STATUS_TIMEOUT`.
+  ⛔ **And every bounded call INSIDE an examination is clamped to what is left of the budget** — the
+  verdict, the commit count, the age read, the rescue and the origin read-back all run under
+  `min(their own bound, remaining budget)`. Without that, the true worst case was
+  `WIP_SWEEP_BUDGET + one examination` (up to 540 s with the defaults), and a rescue cut off mid-PUSH
+  loses the very work it exists to move — on a quiesce whose own reclaim timeout the operator sized
+  against this number. A call the budget cuts off is a **DEFERRAL**, not a failure: it is recorded
+  `deferred-pass-budget`, counted in `deferred=`, and makes the pass `incomplete` (exit 1), never
+  `failed`. A budget stop is stated — `status=incomplete`, `detail=… budget_stopped=yes` — never a green
+  0 over worktrees it did not reach.
+  **One exception:** `cloud-cell-quiesce.sh` passes `--max 0`, because on the path that destroys the disk
+  a cap is a silent partial archive and nothing re-runs the pass.
   ⛔ **`0` is a disable for exactly those two and nothing else.** `tb_timeout 0 …` means *unbounded*, and
   a zero staleness window means *everything is stale* while reading as *do not check* — so
   `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT` and `WIP_SWEEP_STALE_SECONDS` must be greater
@@ -179,7 +188,9 @@ can only be loud on stderr with a non-zero exit — that is a host problem, and 
 (`disk-reaper.sh` gets its equivalent witness from the scheduler's own exit status; this pass has no
 scheduler yet, so the marker is the substitute.)
 
-`--print-status` answers from that record alone: `0` ok, `1` incomplete, `3` failed / stale / never.
+`--print-status` answers from that record alone: `0` ok, `1` incomplete, `3` failed / stale / never, and
+it prints a derived `rc=` on EVERY path including `never` (a consumer keyed on `rc=` finds a value even on
+a box that has never run).
 **`never` and `stale` are not success** — a sweeper that has not run is a box whose WIP is on the disk
 and nowhere else. The printed `status=` and `rc=` are the **derived** ones, emitted last, so the
 key=value surface agrees with the exit code; the recorded values are kept beside them as `recorded=` and

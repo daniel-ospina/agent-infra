@@ -128,7 +128,12 @@ if [ -z "$SWEEP" ]; then
   step "FATAL: wip-sweep: UNCOMMITTED WORK ON THIS BOX WAS NOT ARCHIVED. Any dirty worktree here is lost if this cell is reclaimed."
 else
   step "wip-sweep: archiving uncommitted work to refs/wip/* on origin BEFORE this cell is handed on"
-  WIP_OUT="$(O="$O" WIP_SWEEP_STATE_DIR="$O/state" bash "$SWEEP" --apply --repo "$REPO" 2>&1)"; WIP_RC=$?
+  # ⛔ `--max 0` ON THIS PATH, AND ONLY ON THIS PATH (review finding). The sweep's default cap (25
+  # archives) exists to bound a PERIODIC pass. Here the disk is about to stop existing and nothing re-runs
+  # the pass, so a cap is a silent partial archive: on a cell holding 40 dirty lane trees, 25 are archived,
+  # 15 are deferred, and the box is handed on. `--max 0` is the documented "no cap" value and it is the
+  # configuration that matches this caller's intent.
+  WIP_OUT="$(O="$O" WIP_SWEEP_STATE_DIR="$O/state" bash "$SWEEP" --apply --max 0 --repo "$REPO" 2>&1)"; WIP_RC=$?
   printf '%s\n' "$WIP_OUT" | sed 's/^/  wip-sweep: /'
   case "$WIP_RC" in
     0) step "wip-sweep: every dirty worktree of $REPO is archived on origin (other clones on this box were NOT swept)" ;;
