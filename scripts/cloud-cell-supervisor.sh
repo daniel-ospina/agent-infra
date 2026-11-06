@@ -2563,6 +2563,11 @@ def cli_valid(c):
                 and isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x))
     return False
 
+# ⚠️ DECLARED APPROXIMATION: this is a `$`-scan, not pi's left-to-right parser. pi treats an
+# UNRECOGNISED `${…}` as literal text, so `${DSK` (unterminated) and `${$$X}` resolve to a
+# LITERAL there and would be classified `mergeable` here (and rewritten with the real key).
+# The practical risk is nil — neither is a usable provider key — and the arm set covers every
+# shape a real key takes; a full port of `resolve-config-value` is the fix if it ever matters.
 ESCAPE = re.compile(r"\$\$|\$!")
 REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
 
@@ -2674,7 +2679,7 @@ check_provider_store() {
     unreadable)
       die "$auth is not a JSON object a lane can parse (pi's storage keeps its last snapshot — empty on a fresh process — so NO credential exists), and CANNOT-VERIFY IS NOT A PASS. It is also pi's credential store: do not delete it blindly. Inspect it (it should be a JSON object such as {\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}); if it is unusable, move it aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
     other)
-      die "$auth holds a '$prov' entry this check will not judge or replace — a '!command' key it cannot execute offline, an unknown credential type, or an oauth record with no usable access token. It may well be a WORKING credential (pi can run that command or refresh that token), and nothing here may overwrite one it cannot recreate. Verify it BY EXECUTION: env -i HOME=\$HOME PATH=\"\$PATH\" pi -p 'reply with exactly PROVIDER_OK' — if that answers, the store is fine and this is the gate declining to certify what it cannot judge; if it fails, move the file aside deliberately and re-run the bring-up (agent-infra#2024)." ;;
+      die "$auth holds a '$prov' entry this check will not judge or replace — a '!command' key it cannot execute offline, an unknown credential type, an oauth record with no usable access token, or an entry that is not a JSON object at all. It may well be a WORKING credential (pi can run that command or refresh that token), and nothing here may overwrite one it cannot recreate. Verify it BY EXECUTION: env -i HOME=\$HOME PATH=\"\$PATH\" pi -p 'reply with exactly PROVIDER_OK' — if that answers, the store is fine and this is the gate declining to certify what it cannot judge; if it fails, move the file aside deliberately and re-run the bring-up (agent-infra#2024)." ;;
   esac
   # From here the store is sound but this provider has no usable key.
   var="$(sup_provider_var "$prov")"

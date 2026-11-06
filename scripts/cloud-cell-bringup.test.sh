@@ -833,6 +833,48 @@ chmod 600 "$AUTH"
   && ok "…and it was NOT replaced: the oauth record inside it is still there" \
   || bad "the bring-up REPLACED a store it could not read — a credential it cannot recreate is gone"
 
+# (o) THE ESCAPED-LITERAL SHORTCUT WAS A FAIL-OPEN, and this arm is what keeps it closed. `$$DSK` is
+# an escaped literal (pi yields the string "$DSK") — but `$$DSK$x` STARTS escaped and still carries an
+# unresolved `$x`, and pi resolves that to NO KEY. A shortcut that returned "present" on the `$$`
+# prefix certified such a box; measured against pi, then closed here.
+printf '{"deepseek":{"type":"api_key","key":"$$DSK"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = '$$DSK' ] \
+  && ok "an ESCAPED literal ('\$\$DSK') is a credential and is left alone" \
+  || bad "an escaped-literal key was rewritten — pi resolves it to a literal string"
+
+printf '{"deepseek":{"type":"api_key","key":"$$DSK$x"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "'\$\$DSK\$x' is REPAIRED (pi resolves it to no key at all — a shortcut would have certified it)" \
+  || bad "an escaped prefix hid an unresolved variable: the box was certified on a key pi cannot yield"
+
+# (p) A STORE WITH NOTHING IN IT must never draw a CLI-invalid report: the warn path once read its own
+# first line off by one, so a fresh cell logged "the pi CLI would reject (empty)".
+rm -f "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+case "$BR_OUT" in
+  *"the pi CLI would reject"*) bad "a store with no entries was REPORTED as holding CLI-invalid entries: $BR_OUT" ;;
+  *) ok "an absent/empty store draws NO CLI-invalid report (the warn path reads the right line)" ;;
+esac
+
+# (q) …while a store the CLI WOULD reject is reported — even though the lane path uses the key fine.
+# `env: null` is INVALID to `ReadOnlyAuthStorage` (which validates the whole file) and ignored by a
+# lane's `read()` for a literal. Both halves are asserted: the key survives AND the report fires.
+printf '{"deepseek":{"type":"api_key","key":"sk-literal","env":null}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "sk-literal" ] \
+  && ok "a literal key with env:null is NOT rewritten (pi ignores env for literals)" \
+  || bad "the repair rewrote a working literal credential"
+case "$BR_OUT" in
+  *"the pi CLI would reject"*deepseek*) ok "…but the CLI-invalid entry IS reported (pi auth would refuse the file)" ;;
+  *) bad "an entry the pi CLI rejects is silent — the one signal that says 'pi auth' will refuse: $BR_OUT" ;;
+esac
+
 # restore a healthy store for every arm after this block
 rm -f "$AUTH"
 printf '%s\n' "$TOK_BODY" > "$TOK"

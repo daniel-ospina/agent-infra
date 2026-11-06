@@ -931,6 +931,15 @@ cellcheck 0
                    || bad "check false-blocked a working literal credential over an env field pi ignores"
 seed_provider_store "$F/home"
 
+# (i0) A STORE WITH NO ENTRIES must never be REPORTED as holding CLI-invalid ones — the warn path
+# once read its own first line off by one, so a fresh cell logged "the pi CLI would reject (empty)".
+rm -f "$AUTH"
+cellcheck 0
+case "$CC_OUT" in
+  *"the pi CLI would reject"*) bad "check reported an EMPTY store as holding CLI-invalid entries: $CC_OUT" ;;
+  *) ok "an absent/empty store draws NO CLI-invalid report" ;;
+esac
+
 # (i) A PROVIDER THIS FILE DOES NOT LIST must still be judged. `PI_LANE_PROVIDER=zai` is a real
 # fixture in this repo (key-gate.test.sh), and an earlier "this file does not know the variable, so
 # NOT VERIFIED" path printed the banner over a box with `{}` and an empty keys.env — the #2024 death,
