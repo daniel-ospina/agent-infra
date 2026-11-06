@@ -268,16 +268,24 @@ cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$T/"   # so doctor_path() 
 # ⛔ THE FOREIGN DIR MUST **EXIST** FOR THIS ARM TO MEAN ANYTHING (#2315). The case asserts the
 # REFUSAL branch, and that branch is selected by `doctor_session_orphaned_foreign()`: a foreign
 # session whose named state dir does NOT exist is a DEAD peer (a retired pin root / removed cell
-# home), and since 6b6daa49 the supervisor REPLACES it deliberately ("belongs to the retired state
-# dir … replacing it") rather than dying — with no way to clear a dead one, `start` could never
-# succeed again. So the fixture's peer dir (a few lines below) must EXIST here: it does, therefore
-# the supervisor must refuse and print the remedy. The fixture used to hard-code
-# `O='/other/cell/orchestrator'` and never create it, which put the arm on the pre-#2315 branch and
-# made it red on a correct supervisor. Note what does NOT discriminate here: the "message carries
-# the state dir" arm is content-sensitive (it reddens if the message stops naming the dir) but it is
-# green on BOTH branches, because `doctor_session_orphaned_foreign()` and the refusal `die` print the
-# same `doctor_session_state_dir` parse. Branch discrimination is carried by the rc, the remedy text
-# and the killed-nothing arms below.
+# home), and since 6b6daa49 the supervisor REPLACES it deliberately rather than dying — with no way
+# to clear a dead one, `start` could never succeed again. So the peer state dir created below must
+# EXIST here: it does, therefore the supervisor must refuse and print the remedy. The fixture used
+# to hard-code the path /other/cell/orchestrator and never create it, which put the arm on the
+# pre-#2315 branch and made it red on a correct supervisor.
+#
+# ⛔ NO APOSTROPHES IN THIS BLOCK. `main-worktree-guard` tokenises a script it must read, splitting
+# command segments on a newline ONLY outside a quote (`_wtCommandSegments`, in
+# extensions/main-worktree-guard/index.ts). One unbalanced apostrophe therefore swallows the whole
+# rest of the file into a single quoted run, the guard can no longer resolve the script statically,
+# and it fails closed BEFORE executing it — so a lane asked to re-verify #3514 gets a refusal
+# instead of a result. Keep this block apostrophe-free.
+#
+# Note what does NOT discriminate here: the "message carries the state dir" arm is
+# content-sensitive (it reddens when the message stops naming the dir) but it is green on BOTH
+# branches, because `doctor_session_orphaned_foreign()` and the refusal `die` print the same
+# `doctor_session_state_dir` parse. Branch discrimination is carried by the rc, the remedy-text and
+# the killed-nothing arms below.
 mkdir -p "$T/o6/state/roles" "$T/stub6" "$T/peer6"
 cat > "$T/stub6/tmux" <<'EOF'
 #!/bin/sh
