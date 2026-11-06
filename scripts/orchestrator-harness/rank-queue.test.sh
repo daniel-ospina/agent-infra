@@ -725,13 +725,16 @@ chmod +x "$SH/bin/cmp"
 {
   drive_prologue
   cat "$FNS"
-  printf 'queue_order_from_pool "$1"\nexit $?\n'
+  printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'
 } > "$SH/drive.sh"
 ( cd "$SH" && HOME="$SH" PATH="$SH/bin:$PATH" PRUNE_SEED="$SH/seed" PRUNE_QUEUE="$SH/o/candidates.txt" bash drive.sh "$SH/o" ) > "$SH/out" 2>&1
 race_rc=$?
 race_rows="$(tr '\n' ' ' < "$SH/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+# ⛔ AND THE STATE IT RECORDS (review P3, cycle 54): `queue_order_refuse`'s single line is what the durable
+# `why=`/`handed_why=` copy, and deleting it left the suite green — a refused install would then be recorded
+# as "provenance NOT recorded" while the log said `priority-unreadable`.
 if [ "$race_rc" -ne 0 ] && [ "$race_rows" = "111 222" ] \
-   && grep -q 'priority-unreadable' "$SH/out" 2>/dev/null \
+   && grep -q 'STATE=priority-unreadable' "$SH/out" 2>/dev/null \
    && ! grep -q 'the queue is EMPTY' "$SH/out" 2>/dev/null \
    && [ ! -e "$SH/o/.cand.ranked" ]; then rc=0
 else rc=1; echo "      rc=$race_rc rows='$race_rows' (want '111 222'); out: $(tr '\n' '|' < "$SH/out" 2>/dev/null | head -c 300)"; fi
@@ -880,8 +883,13 @@ printf '200\n300\n' > "$PQ/o/candidates.product.txt"
 ( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log" 2>&1
 prod_a="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" 2>/dev/null | sed 's/ *$//')"
 head_a="$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt")"
-if [ "$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')" = "300 200" ] && [ "$prod_a" = "300 200" ] && [ "$head_a" = "300" ]; then rc=0
-else rc=1; echo "      queue '$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')' product '$prod_a' floor-head '$head_a' (want 300 200 / 300 200 / 300 — the queue ARRIVED '200 300', so the reorder must really run; a numeric sort would leave the product at '200 300' and the head at 200)"; fi
+# ⛔ AND IT MUST SAY SO (review P3, cycle 54): the only report that the product file was re-sequenced (and
+# how many rows it now holds) could be deleted with the suite green, while all four of its FAILURE lines were
+# pinned. The success sentence is asserted here, on the fixture that emits it.
+pf_said="$(grep -c 'candidates.product.txt re-sequenced onto the queue' "$PQ/log" 2>/dev/null || true)"
+if [ "$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')" = "300 200" ] && [ "$prod_a" = "300 200" ] && [ "$head_a" = "300" ] \
+   && [ "${pf_said:-0}" -ge 1 ]; then rc=0
+else rc=1; echo "      queue '$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')' product '$prod_a' floor-head '$head_a' said='${pf_said:-0}' (want 300 200 / 300 200 / 300 and a 're-sequenced onto the queue' line — the queue ARRIVED '200 300', so the reorder must really run; a numeric sort would leave the product at '200 300' and the head at 200)"; fi
 ck "a SKIPPED pass re-sequences candidates.product.txt onto the queue's order, so the floor slot takes the queue's head (200 -> 300)" $rc
 # B) NO NEEDLESS REWRITE: an already-aligned product file keeps its INODE (same reasoning as check 8 —
 #    a swap races a reader for no gain). Positive pair: A above really did move bytes.
@@ -1724,7 +1732,10 @@ ck "a TRUNCATED tier window is NAMED on the order line, and the clause is ABSENT
 printf 'EVIL;rm -rf /tmp/x\nP2-moderate\n' > "$TMP/sat/o/.pool-sat"
 ( cd "$TMP/sat" && HOME="$TMP/sat" bash drive.sh "$TMP/sat/o" ) > "$TMP/sat/out-junk" 2>&1
 junk_out="$(cat "$TMP/sat/out-junk" 2>/dev/null)"
+# ⛔ AND THE DISCLOSURE IS GRADED (review P3, cycle 54): only the "never repeated" half was pinned, so the
+# sentence that tells an operator a junk line was SEEN could be deleted with the suite green.
 if grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$junk_out" \
+   && grep -q 'the window record also carried a line that is not a tier name' <<<"$junk_out" \
    && ! grep -q 'EVIL' <<<"$junk_out"; then rc=0
 else rc=1; echo "      junk fixture '$(printf '%s' "$junk_out" | tr '\n' '|' | head -c 260)'"; fi
 ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not repeated into the log)" $rc

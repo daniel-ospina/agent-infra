@@ -4008,14 +4008,13 @@ queue_order_from_pool() {
   # `orch-loop.sh:6614` skips any id in `dispatched.txt` (`grep -qx "$ISS" … && continue`) — so the
   # worst case is one wasted row that the walker ignores, not duplicate work. Stated here with the
   # pointer so the next reader can check the claim instead of trusting it.
-  if [ ! -s "$o/.cand.ranked" ] && [ -s "$o/candidates.txt" ]; then
-    queue_order_refuse "$o" "the reorder produced an EMPTY queue while $o/candidates.txt holds rows — the queue changed under this pass (a concurrent prune truncated and refilled it); NOTHING was installed, so the queue keeps its rows and its order is UNVERIFIED"
-    return 1
-  fi
-  if [ "$(LC_ALL=C sort -u "$o/candidates.txt" 2>/dev/null)" != "$(LC_ALL=C sort -u "$o/.cand.ranked" 2>/dev/null)" ]; then
-    queue_order_refuse "$o" "the reorder's ROW SET differs from the one $o/candidates.txt holds NOW — the queue changed under this pass (a concurrent prune, or a torn read); NOTHING was installed and the queue is untouched"
-    return 1
-  fi
+  # ⛔ ONE GUARD FAMILY, AND IT IS THE GRADED ONE (review P3, cycle 54). Two PRE-INSTALL guards used to live
+  # here — "the reorder produced an EMPTY queue while candidates.txt holds rows" and "the ROW SET differs
+  # from the one candidates.txt holds NOW" — testing exactly the conditions the adjacent re-check below tests
+  # at the moment of the `mv`, so the only difference they could make was WHICH sentence an operator reads,
+  # and neither sentence was graded: deleting them (together or one at a time, measured) left the suite at
+  # 133/0. The re-check below IS graded (`rank-queue.test.sh` §11, the prune-race fixture), so it owns the
+  # state and the sentence now.
   _wrote=0
   if cmp -s "$o/.cand.ranked" "$o/candidates.txt"; then
     rm -f "$o/.cand.ranked" 2>/dev/null
