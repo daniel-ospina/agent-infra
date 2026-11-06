@@ -882,7 +882,8 @@ sed 's|^WIP:.*|WIP:       issue-4242 -> none (measured: git ls-remote refs/wip/*
 grep -qF 'refs/wip/*' "$TMP/pw-contradicted.txt"; ck $? "§H fixture: the absence claim carries a MEASUREMENT NOTE naming refs/wip/* — a note must not be mistaken for a named ref"
 bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H11) a brief claiming 'no WIP for issue 4242' while refs/wip holds one is REFUSED (got $rc)"
-PW_OUT="$(bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" 2>&1)"grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$PW_OUT"; rc=$?
+PW_OUT="$(bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" 2>&1)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$PW_OUT"; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(H12) …the refusal does not print the raw token at the author (it is translated)"
 grep -q 'refs/wip/issue-4242-first-attempt' <<<"$PW_OUT"; ck $? "(H13) …it NAMES the ref that contradicts the claim (a refusal that names nothing sends the author to grep)"
 grep -q 'CONTINUE that work' <<<"$PW_OUT"; ck $? "(H14) …and says what to do about it, which is the whole point of the handover"
@@ -1013,7 +1014,8 @@ diff -q "$GATE" "$MUT_PW" >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(H38) the cross-check mutation REALLY changed the file (its anchor still matches)"
 bash -n "$MUT_PW"; ck $? "(H39) …and the mutant still parses"
 bash "$MUT_PW" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(H40) MUTATION: (v) now FAILS — with the cross-check removed the contradicted brief is admitted (rc=$rc)"bash "$MUT_PW" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H40) MUTATION: (v) now FAILS — with the cross-check removed the contradicted brief is admitted (rc=$rc)"
+bash "$MUT_PW" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H41) …and the SHAPE refusal is untouched by that mutant, so (ii) was not green because of it (rc=$rc)"
 # ⛔ THE EVERY-VALUE READER NEEDS ITS OWN MUTANT (review cycle 3, P2). `pw=""` deletes the whole check,
 # which proves nothing about WHICH values are read. This revert restores "the last WIP line wins" — the
