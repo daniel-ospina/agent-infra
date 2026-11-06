@@ -66,6 +66,20 @@ n_refs() {
   git -C "$1" for-each-ref refs/wip --format=x 2>/dev/null | grep -c '' 2>/dev/null || true
 }
 
+# assert_bounded_arm <fixture> <label> — both pushes of a retried rescue went through `bounded 45`.
+# ⛔ ONE HELPER FOR ALL THREE PUSH FUNCTIONS (review round 6, P1). The assertion used to live inside
+# `assert_unshadow_arm`, so it measured only the UNShadow path: deleting `bounded 45` from
+# `push_with_helper` — the macOS default and every `BG_RESCUE_PUSH_HELPER` host — was fully green, i.e.
+# an unbounded retry in the second before a cap kill. `bounded` resolves `timeout` through PATH and the
+# fixture records every invocation, so the count is available on every arm.
+assert_bounded_arm() { # assert_bounded_arm <fixture> <label> [<want>]
+  local f="$T/$1" l="$2" want="${3:-2}" got
+  got="$(grep -c '^45$' "$f/shim/timeout.log" 2>/dev/null)"
+  [ "${got:-0}" = "$want" ] \
+    && ok "$l: BOTH pushes ran under the 45 s bound (an unbounded retry can hang the pre-kill rescue)" \
+    || bad "$l: ${got:-0} bounded push(es) recorded (want $want) — this retry path is UNBOUNDED"
+}
+
 # mk_repo <name> — a bare "origin" plus a clone with one commit on branch fix/lane-one.
 # Returns NON-ZERO if any step failed: with `set -uo pipefail` and no `-e`, a silent fixture failure
 # would otherwise degrade an arm into a green assertion about nothing.
@@ -551,6 +565,7 @@ try_rescue() { # try_rescue <name> <mode> <branch> <retry-env>
 
 # (1) THE DEFECT ITSELF: a workflow-scope refusal, a keychain credential that works.
 try_rescue wfretry wf_then_ok
+assert_bounded_arm wfretry wfretry
 WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
 [ "$RC" -eq 0 ] \
   && ok "wfretry: exit 0 — a workflow-bearing snapshot is RESCUED, not degraded to local-only" \
@@ -800,13 +815,11 @@ assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label> <attempt-1 token
   grep -qx 'GIT_TERMINAL_PROMPT=0' "$f/shim/attempts.env.2" 2>/dev/null \
     && ok "$l: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
     || bad "$l: the stored-credential retry did not disable the terminal prompt — a missing store entry could hang the rescue"
-  # ⛔ AND IT IS TIME-BOUNDED (review round 5, P2). The docblock claims all three push functions carry
-  # "the same bounds"; deleting `bounded 45 ` from `push_unshadowed` was green. The fixture records every
-  # `timeout` invocation, so TWO 45 s bounds (first push + retry) must be present.
-  T45="$(grep -c '^45$' "$f/shim/timeout.log" 2>/dev/null)"
-  [ "${T45:-0}" = "2" ] \
-    && ok "$l: BOTH pushes ran under the 45 s bound (an unbounded retry can hang the pre-kill rescue)" \
-    || bad "$l: ${T45:-0} bounded push(es) recorded (want 2) — the stored-credential retry is UNBOUNDED"
+  # ⛔ AND IT IS TIME-BOUNDED (review round 5, P2; SHARED with the helper path in round 6). The docblock
+  # claims all three push functions carry "the same bounds"; deleting `bounded 45 ` from ANY of them was
+  # green while only this arm measured it. The fixture records every `timeout` invocation, so two 45 s
+  # bounds (first push + retry) must be present on EVERY path that retries.
+  assert_bounded_arm "$1" "$l"
   for p in "$f/shim/argv.1" "$f/shim/argv.2"; do
     [ -f "$p" ] && grep -qE '^(\+|-f$|-[fF]$|--force)' "$p" 2>/dev/null && force=1
   done
@@ -893,8 +906,14 @@ try_rescue wfseammsgs wf_always fix/lane-one \
   && ok "wfseammsgs: with no ambient token, BG_RESCUE_PUSH_UNSHADOW=1 spends NO retry (it cannot differ)" \
   || bad "wfseammsgs: ${ATTEMPTS:-0} attempt(s) — a retry was spent removing a shadow that does not exist"
 case "$OUT" in
-  *"retrying ONCE"*) bad "wfseammsgs: claims a retry that was withheld — $OUT" ;;
-  *) ok "wfseammsgs: claims no retry it did not make" ;;
+  # ⛔ BOTH TENSES, AND THE RETRY'S OWN LINE (review round 6, P2). Only `retrying ONCE` (the attempt's
+  # PRESENT-participle line) was matched, while the at-risk block renders a made retry as
+  # `retried ONCE with … it ALSO failed:` — so hoisting `RETRIED=1` above the plan printed a
+  # self-contradicting block ("retried ONCE … it ALSO failed" immediately above "no second credential was
+  # tried") and BOTH properties reported as holds. Match the claim, not one tense.
+  *"retrying ONCE"*|*"retried ONCE"*|*"ALSO failed"*)
+    bad "wfseammsgs: claims a retry that was withheld — $OUT" ;;
+  *) ok "wfseammsgs: claims no retry it did not make (neither tense, and no retry-outcome line)" ;;
 esac
 case "$OUT" in
   *UNSHADOW=1*) bad "wfseammsgs: recommends BG_RESCUE_PUSH_UNSHADOW=1 on the one host shape where it cannot help — $OUT" ;;
@@ -909,6 +928,7 @@ fi
 # arm names a different store and the stub accepts only that one.
 try_rescue wfhelpername wf_then_store fix/lane-one \
   "-u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=store"
+assert_bounded_arm wfhelpername wfhelpername
 [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
   && ok "wfhelpername: a NON-DEFAULT helper named by the operator is used and the snapshot is rescued" \
   || bad "wfhelpername: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the named helper was not used — $OUT"
@@ -1003,8 +1023,12 @@ else
     *) bad "wfnocred: names no way to supply a credential — $OUT" ;;
   esac
   case "$OUT" in
-    *"retrying ONCE"*) bad "wfnocred: claims a retry that was deliberately not made — $OUT" ;;
-    *) ok "wfnocred: does not claim a retry it did not make" ;;
+    # ⛔ BOTH TENSES AND THE RETRY'S OWN LINE (review round 6, P2) — see the sibling arm above: matching
+    # only `retrying ONCE` let `retried ONCE with … it ALSO failed:` print beside "no second credential
+    # was tried" while this property stayed green.
+    *"retrying ONCE"*|*"retried ONCE"*|*"ALSO failed"*)
+      bad "wfnocred: claims a retry that was deliberately not made — $OUT" ;;
+    *) ok "wfnocred: does not claim a retry it did not make (neither tense, and no retry-outcome line)" ;;
   esac
   case "$OUT" in
     *"STILL ONLY ON THIS DISK"*) ok "wfnocred: still says the work is on this disk only (never a cheerful exit)" ;;
