@@ -231,20 +231,24 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
   if [ "$?" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
-    # ⛔ REFUND HERE TOO (#3511 review cycle 3, P2; cause corrected in cycles 7 and 8, P3). This arm
-    # exited without refunding while the branch refusal three lines up does, and the rule this file
-    # already states (#1720, above `refund_gate_attempt`) does not ask the refusal to be transient: the
-    # controller books the attempt UPSTREAM of every gate, so a refusal that ran no fixer must give it
-    # back, or three refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never
-    # had a single fixer run (#2223 makes the same point for a DISK refusal, which never clears by
-    # waiting). ⛔ The causes reachable from THIS call site are persistent, and naming a false one is
-    # what two review cycles caught: `wt_provision` has NO holder probe (`wt_live_holders` is called
-    # only from `wt_reap_if_empty`), and its young `initializing` arm cannot fire here because the
-    # `[ -z "$WT" ]` guard at `:189` and `wt_worktree_path_for_branch` read the SAME `git worktree
-    # list --porcelain` branch match — an empty `$WT` means `wt_registered` is empty too. What is left
-    # is the unregistered-foreign-directory refusal, the different-branch record, and the ghost-ref
-    # removal race (all `rc=2`), plus a rolled-back `worktree add` failure, which is `rc=1` and names
-    # its own `rc` in `$WT_RESULT`. The refund is a no-op on a manual (CTRL=0) run.
+    # ⛔ REFUND HERE TOO (#3511). This arm exited without refunding while the branch refusal three
+    # lines up does. The rule is #1720's: the controller books the attempt UPSTREAM of every gate, so
+    # a refusal that ran no fixer gives it back — otherwise three refusals reach MAX_FIX_TRIES and the
+    # PR is PARKED "needs a human" having never had a single fixer run.
+    # ⛔ THE CAUSE IS `wt_provision`'s TO NAME, NOT THIS COMMENT'S TO ENUMERATE. Every refusal arm it
+    # has can land here (`rc=1` repo-absent / unsafe branch name / add-failed / add-succeeded-but-
+    # unusable, `rc=2` path or record conflicts, `rc=3` rollback left residue), so this arm reads
+    # `$WT_RESULT` and refunds on any non-zero rc instead of on a list. Two review cycles falsified
+    # two successive attempts to enumerate that list here — one named a holder probe the helper does
+    # not have (it was reverted), the next ignored that a concurrent `worktree add` for this branch
+    # can register a young lock between the `$WT` read at `:167` and the call below, since nothing
+    # serialises provisioning. The list was the defect; the invariant is not.
+    # ⛔ AND THIS IS NOT `prlock_refuse`'s RULE (`:515`), which CONSUMES the attempt: a `$PRLOCK` that
+    # is not a regular file, or a `$O/state` this box cannot write, is a bookkeeping state no
+    # re-dispatch can change, so refunding it spins for ever — spawn, defer, refund, `fixcount` nets
+    # to zero, `MAX_FIX_TRIES` never trips, nothing parks. The distinguishing test: those arms never
+    # reach a checkout, while here the checkout IS what failed and each cycle names its repair in
+    # `fix-$PR.log`, so a refused materialisation is a lost attempt, not a spin.
     refund_gate_attempt
     exit 1
   fi
