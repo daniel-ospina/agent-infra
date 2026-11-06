@@ -1878,6 +1878,13 @@ git -C "$X/samerepo" remote add origin https://github.com/acme/widget.git
 # `--check` claims gate (#2466, 8a3e5359) refuses this fixture with its OWN NOT PROVISIONABLE, and
 # the assertion below still passes because `[refresh] check: repo=…` is printed BEFORE that gate —
 # so "ACCEPTED (no false block)" was green about a run the claims gate refused end-to-end.
+# ⛔ AND THE PATTERN NAMES THE *CLAIMS* SENTENCE, NOT THE TOKEN. `NOT PROVISIONABLE` is emitted by
+# every gate that runs AFTER the resolver — a jq that resolves but does not RUN
+# (refresh-candidates.sh:1299), an interpreter below the tool's floor (:1358) — so pinning the bare
+# token reds this arm on a tool-poor box for a fact about the box, which is exactly the host-movement
+# the comment below forbids. The claims gate has ONE sentence of its own, on its absent-registry
+# branch (:1326): pin that, so the arm still reds when the registry is missing and holds still when
+# a later gate answers instead.
 mkdir -p "$TMP/repoexplicit/o3"; printf 'claim_issue_preflight() { return 0; }\n' > "$TMP/repoexplicit/o3/claims.sh"
 ( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
   HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1 )
@@ -1892,7 +1899,7 @@ case "$(cat "$TMP/repo-explicit-ok.out")" in
 esac
 ck "an EXPLICIT REPO that IS a checkout of the queue target is ACCEPTED (no false block)" $xr
 case "$(cat "$TMP/repo-explicit-ok.out")" in
-  *"NOT the queue target"*|*"has no readable 'origin'"*|*"NOT PROVISIONABLE"*) xr=1 ;;
+  *"NOT the queue target"*|*"has no readable 'origin'"*|*"cross-box claim registry is NOT INSTALLED"*) xr=1 ;;
   *) xr=0 ;;
 esac
 ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray rc)" $xr
@@ -1924,7 +1931,10 @@ case "$(cat "$TMP/repo-localpath.out")" in
 esac
 ck "a local-path origin with an UNDECLARED \$OR is TOLERATED and ANNOUNCED (the stated residual, not silence)" $xr
 case "$(cat "$TMP/repo-localpath.out")" in
-  *"NOT PROVISIONABLE"*) xr=1 ;;
+  # ⛔ NARROWED TO THE CLAIMS SENTENCE, not the bare token — the reason is stated in the
+  # `repoexplicit` block above: the post-resolver jq and interpreter gates emit `NOT PROVISIONABLE`
+  # too, and this arm is named for the RESOLVER's tolerance.
+  *"cross-box claim registry is NOT INSTALLED"*) xr=1 ;;
   *) xr=0 ;;
 esac
 ck "…and it is TOLERATED, not refused (the residual is the tolerance; a refusal here would block local dev clones)" $xr
@@ -1949,7 +1959,7 @@ mkdir -p "$TMP/repolocalpath/op0"; printf 'claim_issue_preflight() { return 0; }
   HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=0 O="$TMP/repolocalpath/op0" bash "$REFRESH" --check > "$TMP/repo-localpath-loop.out" 2>&1 ) || true
 case "$(cat "$TMP/repo-localpath-loop.out")" in
   *"cannot prove it is a checkout"*) xr=1 ;;
-  *"NOT PROVISIONABLE"*) xr=1 ;;
+  *"cross-box claim registry is NOT INSTALLED"*) xr=1 ;;
   *"the pairing is not cross-checked"*) xr=0 ;;
   *) xr=1; echo "      out: $(head -3 "$TMP/repo-localpath-loop.out")" ;;
 esac
