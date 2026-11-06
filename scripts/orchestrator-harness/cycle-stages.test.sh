@@ -523,14 +523,28 @@ ck "  …while a real value and 'ns' are still returned unchanged" \
    "$(if [ "$(cycle_stage_get 'stages=sweep:41,l4_review:ns' sweep)" = "41" ] && \
          [ "$(cycle_stage_get 'stages=sweep:41,l4_review:ns' l4_review)" = "ns" ]; then echo 0; else echo 1; fi)"
 
-# 9.5 THE `record` STAGE MAY NOT BE MARKED AFTER THE PREPARATION IT NAMES.
-# The marks used to sit immediately above `stg_field`, i.e. AFTER the `tr`/`sed`/`cut` work, so that
-# work was credited to `l5_issue` and `record` measured two adjacent calls. Asserts ORDER in the
-# shipped loop: the `stg_mark record` line precedes the `_cr_ids` preparation it claims to measure.
-_rec_line="$(grep -n 'stg_mark record' "$ORCH" | grep -vE ':[[:space:]]*#' | head -1 | cut -d: -f1)"
-_cprep="$(grep -n '_cr_ids="\$(tr' "$ORCH" | head -1 | cut -d: -f1)"
-ck "stg_mark record precedes the ids=/selected= preparation it measures (record line ${_rec_line:-?}, prep line ${_cprep:-?})" \
-   "$(if [ -n "$_rec_line" ] && [ -n "$_cprep" ] && [ "$_rec_line" -lt "$_cprep" ]; then echo 0; else echo 1; fi)"
+# 9.5 `record` MUST BE CLOSED AFTER THE PREPARATION, NOT BEFORE IT — asserted by VALUE, not by order.
+# ⛔ THE PREVIOUS VERSION OF THIS ARM LOCKED IN THE DEFECT (fourth fresh-context review, P0): it
+# asserted `stg_mark record` came BEFORE the `ids=`/`selected=` preparation, which is the arrangement
+# that makes `record` close a ~0 µs sliver, opens an interval nothing closes, and DROPS the
+# preparation's fork time entirely (strictly worse than attributing it to `l5_issue`). It was green on
+# the broken tree and RED on the fix — an arm that fails the correction is worse than no arm.
+# `stg_mark <stage>` closes the open interval INTO <stage>, so the correct arrangement is exactly:
+#   reset -> mark l5_issue -> preparation (1.2 s) -> mark record -> stg_field
+# which must emit `record >= 1`. The broken arrangement (mark record before the prep) emits 0 and
+# loses the 1.2 s from the tiled partition altogether. Driving the SHIPPED clock proves the value.
+stg_cycle_reset
+stg_mark l5_issue
+sleep 1.2                     # stand in for the tr/sed/cut/drain_stall_label preparation
+stg_mark record
+stg_field STG_FIELD
+get "$STG_FIELD" record >/dev/null 2>&1 || true
+_rec_v="$(get "$STG_FIELD" record)"
+ck "the clock's own semantics: a 1.2 s span between marks is closed INTO the later stage (record=${_rec_v}) — the property the shipped placement relies on" \
+   "$(if [ "${_rec_v:-0}" != "ns" ] && [ "${_rec_v:-0}" -ge 1 ] 2>/dev/null; then echo 0; else echo 1; fi)"
+# …and structurally: the shipped closing mark must sit adjacent to the emit it precedes.
+ck "the shipped 'stg_mark record' is immediately before 'stg_field' (the only placement that closes the prep)" \
+   "$(if printf '%s\n' "$_loop_nc" | awk 'prev ~ /^[[:space:]]*stg_mark record[[:space:]]*$/ && $0 ~ /^[[:space:]]*stg_field/ {found=1} {prev=$0} END {exit !found}'; then echo 0; else echo 1; fi)"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

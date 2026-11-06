@@ -7650,15 +7650,17 @@ PY
   # preparation (the `tr`/`sed`/`cut` that build `ids=` and `selected=`), which is real forking work on
   # the cycle path and is therefore worth attributing. The append is measured instead by the
   # before/after overhead numbers in the PR that added this field.
-  # ⛔ SO THE MARKS COME BEFORE THAT PREPARATION, NOT AFTER IT (fresh-context review, P2). They used to
-  # sit immediately above `stg_field`, i.e. AFTER the `tr`/`sed`/`cut`/`drain_stall_label` work, which
-  # credited all of it to `l5_issue` and left `record` measuring the microseconds between two adjacent
-  # calls. `record:0` then read as "the record block is free" — the opposite of what this comment
-  # says the stage is for. `l5_issue` is marked OUTSIDE the `if` because the issue batch happened
-  # whether or not `cycle-record.sh` was loadable; `record` stays `ns` when no record block runs.
+  # ⛔ SO THE `record` MARK GOES **AFTER** THAT PREPARATION, NOT BEFORE IT (and my first attempt at
+  # this got it backwards — third/fourth fresh-context review, P0). `stg_mark <stage>` CLOSES the open
+  # tiled interval INTO <stage> and then opens a new one, so:
+  #   · mark BEFORE the prep  ⇒ `record` closes a ~0 µs sliver, opens an interval that NOTHING ever
+  #     closes (`stg_field` emits, it does not settle), and the prep's fork time is DROPPED ENTIRELY —
+  #     strictly worse than the original bug, which at least attributed it to `l5_issue`;
+  #   · mark AFTER the prep (here) ⇒ the prep's interval is closed INTO `record`, which is the
+  #     attribution the comment above promises. The final tiled interval (from `record` to the append)
+  #     is still unclosed, and is the same documented sliver the doc calls out.
   stg_mark l5_issue   # the issue batch ends here: floor/order/placement/claim/dispatch
   if [ "${CYCREC:-0}" = "1" ]; then
-    stg_mark record   # from here to `stg_field` is the record block's own preparation (see above)
     _cr_ids=""
     [ "${K:-0}" -gt 0 ] && _cr_ids="$(tr '\n' ',' < "$O/.batch" 2>/dev/null | sed 's/,$//')"
     case "${LO_CHOICE:-none}" in
@@ -7683,6 +7685,11 @@ PY
       _cr_tags="${PRDISP_SPAWN_TAGS:-}"
       [ -n "$_cr_tags" ] || { [ -n "${PRDISP_SPAWNS:-}" ] && _cr_tags="none" || _cr_tags="UNMEASURED"; }
     fi
+    # ⛔ THE CLOSING MARK FOR `record` SITS HERE, IMMEDIATELY BEFORE THE EMIT — see the note beside
+    # `stg_mark l5_issue`. This single placement is the whole fix: it closes the preparation's interval
+    # INTO `record`, so the fork work is attributed instead of vanishing. Moving it up next to
+    # `stg_mark l5_issue` measures ~0 and drops the preparation from the tiled partition entirely.
+    stg_mark record
     stg_field STG_FIELD
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \

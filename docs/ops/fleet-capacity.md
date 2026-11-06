@@ -547,9 +547,13 @@ TOLERANCE OF A FEW SECONDS.** Three things move the arithmetic, all of them smal
 stated so a reader does not misread them as a broken instrument:
 
 - **Only a cycle that reaches the end of its body marks every tiled stage.** On the **disk-held** arm
-  and the **fork-starved** arm the cycle `continue`s early, so every stage it never reached reads `ns`
-  and `sum(tiled)` is legitimately SHORT of `end - start`. `ns` is the label that says so. The same is
-  true of the tail after `stg_mark record` (the field is built, then the line is appended, then the nap).
+  the cycle `continue`s early, so every stage it never reached reads `ns` and `sum(tiled)` is
+  legitimately SHORT of `end - start`. `ns` is the label that says so. The same is true of the tail
+  after `stg_mark record` (the field is built, then the line is appended, then the nap). ⛔ **The
+  fork-starved arm is the opposite case and must not be lumped in:** its record is written
+  `start=$_ft0 end=$_ft0`, i.e. `end - start = 0`, so its tiled sum can only be EQUAL or LONGER —
+  never short — and `CYCLE_T0` is never taken there, so the next bullet's explanation does not apply
+  to it either.
 - **Each stage is truncated to WHOLE SECONDS** when emitted, so eleven tiled stages can sum up to ~11 s
   short of the body even on a full cycle — with no `ns` anywhere to explain it.
 - **`boot` opens at `stg_cycle_reset`, which runs BEFORE `CYCLE_T0="$(date +%s)"`**, so the sum can also
