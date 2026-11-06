@@ -575,6 +575,21 @@ _ckline "  review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/to
   "an INDENTED marker must not read as at-head: record-review.sh emits the marker as its own line and check (c) anchors on '^', so an indented copy is a quotation (got a false at-head, which disables the review arm for ever)"
 _ckline "see review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise) above" "$H7" 'green\t7\tabsent' \
   "a MID-SENTENCE marker must not read as at-head — the gate matches '^review recorded:', so anything the gate will not certify must not be reported as an attestation"
+# ⛔ AND A LINE THAT MERELY *STARTS* WITH A MARKER IS STILL A QUOTATION: THE GATE ANCHORS AT `$` TOO
+# (review round 4, P2, measured). With only the `^`, appending anything the gate's `…( sig=<64hex>)?$`
+# refuses left this parse reading `at-head` while check (c) rejected the line — and `at-head` is the only
+# value that disables the review arm, so the same #3489 stall comes back from the OTHER end of the line.
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise) — pasted from the review" "$H7" 'green\t7\tabsent' \
+  "a marker line with PROSE appended must not read as at-head — check (c) anchors at '\$', so a line the gate rejects must not be reported as an attestation (that is the #3489 stall, from the other end of the line)"
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise) " "$H7" 'green\t7\tabsent' \
+  "a trailing SPACE must not read as at-head — the gate's '\$' refuses it, and 'at-head' is the only value that disables the review arm"
+# ⛔ AND THE OTHER DIRECTION: THE REAL EMITTED SHAPES MUST STILL CLASSIFY, or every PR reads `absent` and a
+# total merge stall follows. These two are the forms record-review.sh actually writes and the first cut of
+# this anchoring had to keep: the SIGNED form, and the `not-clean` trailer appended AFTER `(<repo>)`.
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 diff=$(printf 'a%.0s' $(seq 1 64)) (daniel-ospina/tortoise) sig=$(printf 'b%.0s' $(seq 1 64))" "$H7" 'green\t7\tat-head' \
+  "the SIGNED marker record-review.sh emits must still classify as at-head (a lexer that rejects the real shape turns every attested PR into a paid review and a permanent merge stall)"
+_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3" "$H7" 'green\t7\tat-head' \
+  "the not-clean trailer (' findings=N' appended AFTER '(repo)') must still be RECOGNISED — 'which verdicts may land' is the gate's decision, and this loop asks only whether a record exists at the head; silently un-classifying this shape would buy a review of a head already reviewed"
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (some-other-org/tortoise)" "$H7" 'green\t7\tabsent' \
   "a marker naming another REPO must not read as this PR's attestation — the gate binds the repo too"
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "" 'green\t7\tnohead' \
@@ -708,6 +723,14 @@ _empty_arm=$(_arm "" "")
 # `[ "$_kind" != green ] ... continue` that dropped every red candidate.
 grep -qF '_rarm=$(review_candidate_arm "$_kind" "$_att")' "$SUT" \
   || bad "the candidate loop must CONSULT review_candidate_arm ('_rarm=\$(review_candidate_arm \"\$_kind\" \"\$_att\")') — an inline condition here is what dropped every red candidate by BOTH arms (P1)"
+# ⛔ PRESENCE IS NOT POSITION (review round 4, P2, measured). The grep above is a whole-FILE presence test,
+# so moving the predicate block BELOW the review branch — the natural refactor, since they are adjacent —
+# left the suite GREEN: `_rarm` kept its `rail` default, the review branch was never entered, and every
+# unattested candidate was handed to the rail with the producer dead. That is #3489 itself, reported PASS.
+_call_ln=$(grep -nF '_rarm=$(review_candidate_arm "$_kind" "$_att")' "$SUT" | head -1 | cut -d: -f1)
+_branch_ln=$(grep -nF 'if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then' "$SUT" | head -1 | cut -d: -f1)
+[ -n "${_call_ln:-}" ] && [ -n "${_branch_ln:-}" ] && [ "$_call_ln" -lt "$_branch_ln" ] \
+  || bad "the predicate must be CONSULTED BEFORE the review branch that consumes it (predicate call at line ${_call_ln:-MISSING}, branch at ${_branch_ln:-MISSING}) — below it, '_rarm' keeps its 'rail' default, the review arm is never entered, and every unattested candidate is railed with the producer dead while this suite stays green"
 printf '%s\n' "$_branch" | grep -qF '[ "$_kind" != green ]' \
   && bad "the REVIEW branch must not carry its own red-kind guard — the red decision belongs to review_candidate_arm, and a second copy inside the branch is exactly the P1 (a 'continue' that bypasses the rail path)"
 grep -A3 -F 'if [ "$_rarm" = skip ]; then' "$SUT" | grep -qF 'continue' \

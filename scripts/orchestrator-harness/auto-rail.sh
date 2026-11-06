@@ -759,12 +759,18 @@ review_should_defer() {  # $1 = reviews already dispatched for THIS repo in THIS
 # review arm refused it (red) and the `continue` prevented the rail path below. Measured 2026-11-06 on
 # this box: `gh pr list` on daniel-ospina/agent-infra classified **33 candidates, green=0, red=33** (main
 # is red on `bash-suites (1)-(8)` and `verify`, so every PR inherits a red it does not own) — 14 of them
-# red-with-a-stale-marker. That class is LANDABLE and was landable on the base: check (c) accepts a
-# STALE marker whose `diff=` equals the live diff (`record-review.sh --check-carry`, #3315) and the rail's
-# exemption engine merges when the residual reds are not PR-unique. So the `continue` removed reachability
-# that existed before this change and no other arm supplies it: `orch-loop.sh` merges only on `GREEN`, the
-# red-fixer fires on a RAIL REFUSAL (which no longer happens for a candidate that is never railed), and
-# the line's own claim — "the red arm owns this PR" — names the branch it is standing in.
+# red-with-a-stale-marker. THAT CLASS IS NOT AUTOMATICALLY LANDABLE, AND THIS ARM DOES NOT CLAIM IT IS:
+# `record-review.sh --check-carry` re-measured over those 14 the same day returned `carry` for ONE (#3134,
+# whose `pipeline-compliance` is green) and `fresh` for the other 13 — the reviewed DIFF moved, so a fresh
+# review is genuinely owed. The rest of the fleet cannot supply one: `orch-loop.sh` merges only on `GREEN`,
+# the red-fixer fires on a RAIL REFUSAL, and `pr-sickness` repairs but never merges. So the arm's claim is
+# narrower and still correct: the base HANDED these candidates to the rail, no other arm supplies that, and
+# dropping them was a silent removal of reachability (the one that can carry, plus the refusal signal the
+# fixer loop reads). The line's own claim — "the red arm owns this PR" — named the branch it was standing in.
+# ⛔ WHAT THIS ARM DELIBERATELY DOES NOT DO IS BUY A REVIEW FOR A RED HEAD. That would be the larger change
+# (#3440 records the proposal that an attestation must carry its check-surface verdict, not that a red head
+# is never reviewed), and it is NOT made here: the green gate is the author's deliberate choice, and
+# reversing it is a reopen, not a review finding. It is stated as the residual it is on the PR.
 # ⛔ AND THE ASYMMETRY IS THE POINT: an unattested head cannot merge, so a review it does not get is work
 # left undone; a markerless red head has NOTHING for the rail to carry (check (c) is red on the missing
 # marker alone), so railing it is the noise-and-slot-burn the base's substring filter existed to avoid.
@@ -968,16 +974,29 @@ green=[]; red=[]
 # THIS ACTUATOR'S: any recorded verdict at this head is `at-head`, because the question asked here is
 # only "does an attestation exist for the head that would merge?" (a non-clean record still names a
 # review that happened, and re-buying a review of the same head is not the remedy for it).
-# ⛔ ANCHORED AT THE START OF THE LINE, EXACTLY AS THE GATE IT FEEDS IS. The gate's own regex
-# (`check-pipeline-compliance.sh`: `^review recorded: reviews/<PR>.json verdict=(clean|clean-micro|clean-low)
-# @ <sha>...`) is line-anchored on purpose: an INDENTED or mid-sentence marker is a QUOTATION, not a
-# record — record-review.sh emits the marker as a line of its own. The first cut of this parse had no
-# `^`, so a body that merely quoted the shape on a line carrying the repo slug read `at-head`: the rail is
-# then launched for something check (c) will refuse for ever, and — worse — `at-head` is the ONLY value
-# that disables the review arm, so the PR could never be reviewed either. That is the #3489 failure
-# (invisible, unattributable, permanent) reproduced by the change that exists to remove it. `^` here is
-# per-LINE because the loop below feeds this one line at a time; it is not MULTILINE and must not be.
-MARKER_RE = re.compile(r"^review recorded: reviews/(\d+)\.json verdict=[a-z][a-z-]* @ ([0-9a-f]{40})")
+# ⛔ ANCHORED AT BOTH ENDS, IN THE GATE'S OWN SHAPE — A LINE-ANCHOR ALONE STILL ADMITS A QUOTATION
+# (review round 4, P2, measured). The gate's regex is `^review recorded: … @ <40hex>( diff=<64hex>)?
+# \(<owner/repo>\)( sig=<64hex>)?$` — and the `$` is what makes a marker a RECORD rather than a line
+# that merely STARTS with one. With only `^`, a body line reading `review recorded: … (<repo>) — pasted
+# from the review` (or one with a single trailing space) read `at-head` here while check (c) rejected it.
+# `at-head` is the ONLY value that disables the review arm, so such a PR could be reviewed by nobody and
+# passed by nothing, for ever: the #3489 failure (invisible, no owner, permanent) reproduced by the change
+# that exists to remove it — the same defect as the missing `^`, reachable from the other end of the line.
+# ⛔ AND IT MUST ACCEPT EVERY SHAPE record-review.sh ACTUALLY EMITS, or every PR reads `absent` and NOTHING
+# is ever `at-head` (a total merge stall). It emits, on ONE line, `(<repo>)` then — for `not-clean` only —
+# ` findings=<n>[ note=<text>]`, then ` sig=<64hex>` when signing is configured. Those are the optional
+# trailers below, in the order the recorder appends them. Verified against every open PR body on both
+# driven repos: the at-head/stale/absent split is unchanged by this anchoring.
+# The repo is CAPTURED and compared exactly, not tested as a substring of the line: the gate binds it, and
+# `(<owner/repo>)` appearing anywhere on a marker line is not the same claim as the marker naming that repo.
+MARKER_RE = re.compile(
+    r'^review recorded: reviews/(\d+)\.json verdict=([a-z][a-z-]*) @ ([0-9a-f]{40})'
+    r'(?: diff=[0-9a-f]{64})?'      # #3315: the reviewed diff, so a merge-only update can carry
+    r' \(([A-Za-z0-9._-]+/[A-Za-z0-9._-]+)\)'
+    r'(?: findings=[0-9]+)?'        # #3400: the not-clean trailer, appended AFTER `(<repo>)`
+    r'(?: note=\S+)?'
+    r'(?: sig=[0-9a-f]{64})?$'      # the signed form; the gate verifies it, this loop only classifies
+)
 
 def attestation(body, head, pr, repo):
     "at-head | stale | absent | nohead — never an inference from a partial match."
@@ -985,11 +1004,14 @@ def attestation(body, head, pr, repo):
         return "nohead"          # no head means nothing can be at it; the reviewer re-reads the head
     seen = []
     for line in (body or "").splitlines():
-        if ("(%s)" % repo) not in line:
+        m = MARKER_RE.match(line)    # `match` + the pattern's own `^`/`$`: the record shape EXACTLY
+        if not m:
+            continue                 # not a record line: indented, prefixed, or carrying prose after it
+        if m.group(1) != str(pr):
+            continue                 # a record for a DIFFERENT PR is not this PR's attestation
+        if m.group(4).lower() != repo.lower():
             continue                 # the gate binds the repo; a marker naming another repo is not ours
-        for m in MARKER_RE.finditer(line):
-            if m.group(1) == str(pr):
-                seen.append(m.group(2).lower())
+        seen.append(m.group(3).lower())
     if head in seen:
         return "at-head"
     return "stale" if seen else "absent"
@@ -1116,7 +1138,7 @@ PY
           # DROPPING IT HERE WAS THE P1 REVIEW FINDING. There is a carry (`diff=` unchanged) and an
           # exemption engine that can land this revision; nothing else in the fleet can. The line is
           # logged so the pass says which arm took it instead of implying a lane is working on the PR.
-          log_line "$repo #$pr RED with a marker at an OLDER head ($_att) — NOT reviewed; handed to the RAIL, where a diff-matched carry plus the exemption engine is the only path that can land a red head (dropping it here would remove reachability the base had)"
+          log_line "$repo #$pr RED with a marker at an OLDER head ($_att) — NOT reviewed; handed to the RAIL, where check (c)'s carry (only when the reviewed DIFF is unchanged) and the exemption engine are what can land a red head. When the diff moved this head still needs the fresh review the green gate withholds (#3440), so it is railed, not fixed — said plainly rather than reported as progress"
         fi
       fi
       if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then
