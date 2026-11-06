@@ -239,10 +239,12 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # PRE-BOOKS. The red-tree arm books `fixcount` BEFORE `wt_spawn` (that ordering was a fix in its own
     # right: booking after the spawn let the child's decrement be overwritten by the controller's
     # pre-refusal value). The CONFLICTED, NEEDS-FIX and CI-red arms still book AFTER the spawn, so a
-    # refund landing in that window is overwritten and the attempt is consumed anyway — and the per-head
-    # `fixgate-<PR>-<HEAD>` marker, which this call writes too, is consumed only by the red-tree arm.
-    # That residual is filed (#3562); this call is still correct and still the fix, because the arm that
-    # most needs it pre-books and the others shrink the window rather than widening it.
+    # refund landing in that window is overwritten and the attempt is consumed anyway. The per-head
+    # `fixgate-<PR>-<HEAD>` marker this call also writes does not rescue them either: among those four
+    # `fixcount` arms only the red-tree one consumes it, and the roles that DO honour it (the sickness
+    # queue's `psick` counter, `merge-one.sh`, `cloud-cell-doctor.sh`) refund their own budgets, not
+    # `fixcount`. That residual is filed (#3562); this call is still correct and still the fix, because
+    # the arm that most needs it pre-books and the others shrink the window rather than widening it.
     # The test is the exit code and nothing else: ANY non-zero `wt_provision` rc refunds. The helper
     # names the cause in `$WT_RESULT`, which is logged on the line above — this comment does not restate
     # the cause list, because a list here is a second definition that goes stale the next time the
@@ -258,8 +260,9 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # `fix-$PR.log` and re-spawned rather than silently parked. ⛔ What bounds that re-spawn is per-cycle
     # capacity only (the `$MF` fix-lane ceiling, the cross-box claim, `can_spawn`) — it is THROTTLED per
     # cycle, not bounded across cycles, and the fix that would let it park is a `REPAIR:` line in
-    # `wt_provision`'s refusals, which carries none today (recorded on #2632; no repair text is what a
-    # human gets from a sticky one). No line numbers in this block on purpose: a citation here already
+    # `wt_provision`'s refusals, which carries none today (its absence is recorded in the comment on
+    # #2632; none of those refusals carries repair text, which is why a human gets a cause and no next
+    # step). No line numbers in this block on purpose: a citation here already
     # rotted once when an edit to this comment shifted the function it pointed at.
     refund_gate_attempt
     exit 1

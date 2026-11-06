@@ -306,7 +306,7 @@ c4=$?
 # names the cause in `$WT_RESULT` (logged as `ABORT:`). No
 # cause list is restated here or in the source — see the arm's comment in `fix-one.sh` for why.
 # The refusal is driven through the UNREGISTERED-DIRECTORY arm (a foreign directory at the worktree
-# path), which is `wt_provision`'s other rc=2 and needs no git state to set up.
+# path), which is one of `wt_provision`'s five rc=2 arms and needs no branch/commit state to set up.
 # ⛔ THE BRANCH MUST EXIST FIRST. Without it `fix-one.sh` refuses at the BRANCH assertion (rc=72) long
 # before `wt_provision` runs, so the arm silently pins the branch refusal's refund and NOT the
 # materialisation refund it names — measured `52 passed, 1 failed` with rc=72 until this line existed.
