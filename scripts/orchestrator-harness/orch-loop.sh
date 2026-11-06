@@ -1455,7 +1455,15 @@ prune_orphan_markers() {
     mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
-    rm -f "$mf"
+    # ⛔ THE ROUND BOOK IS REMOVED THROUGH ITS OWNER, NOT WITH `rm -f` (fresh review of #3441, P2).
+    # `review_round_read` treats a NON-REGULAR book as CORRUPTION, and a stray DIRECTORY at this path is
+    # exactly the corruption this file's remedies name — so `rm -f` fails (`Is a directory`, rc=1, no
+    # redirection here, so it printed on every cycle) and the directory SURVIVED this sweep while the
+    # `-ot` gate stayed true for a dead PR: permanent stderr noise per corrupt book, and the documented
+    # prune remedy (`README.md` — "cleared … by prune_orphan_markers") silently false. `review_round_clear`
+    # already uses `rm -rf` for this exact case, so route the family through it rather than widening the
+    # verb for the sibling file-markers (which are never directories).
+    if [ "${mf##*/}" = "reviewround-$mp" ]; then review_round_clear "$mp"; else rm -f "$mf"; fi
   done
   return 0
 }
