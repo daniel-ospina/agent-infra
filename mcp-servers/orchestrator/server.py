@@ -1767,7 +1767,10 @@ ALLOWLIST = {
 }
 
 GIT_OK_VERBS = ("status", "log", "rev-parse", "ls-files", "show", "diff")
-DISK_OK_VERBS = ("-l", "-la", "-lh", "-lah", "-t", "-lt")
+# ⛔ `DISK_OK_VERBS` USED TO SIT HERE AND WAS REFERENCED NOWHERE (review finding, P2). Every verb it
+# would have gated passes `None` as its prefix, so it constrained nothing while reading like an
+# enforced rule — a reader could trust it or delete it and the behaviour was identical. Deleted rather
+# than wired in: `ls` is bounded by `max_args`, which is the limit that actually applies.
 # ⛔ `--output` IS A FILE WRITE, AND THE ALLOWLIST ABOVE GATES THE VERB ONLY. Measured on this tree:
 # `git show --output=/tmp/x HEAD` → rc=0, 7762 B written; `git log --output=/tmp/x -1` → 2038 B;
 # `git diff --output=/tmp/x` likewise. The metacharacter filter does not catch it (there is no `>`), so a
@@ -1792,6 +1795,30 @@ HOSTNAME_OK_FLAGS = ("-a", "-A", "-d", "-f", "-i", "-I", "-s", "-y", "-V", "--ve
                      "-h", "--help")
 
 
+
+def _harden_argv(argv):
+    """Close the configuration escape that no allowlist entry can see.
+
+    A plain, fully-allowlisted `git diff` still spawns a program named in git CONFIG
+    (`diff.external`) or in `GIT_EXTERNAL_DIFF`; `git show` does the same through a textconv driver.
+    The program allowlist bounds the program and the argv bounds the flags — configuration escaped
+    both, which is the same class as the `--output` write the surface already refuses.
+
+    `cmux vm exec` forwards no environment, so a hardened env cannot be passed: the guarantee has to
+    travel inside the argv. Git takes the LAST occurrence of a flag, so appending the disables also
+    neutralises a caller-supplied `--ext-diff` / `--textconv` rather than merely being present.
+
+    Scoped to `git diff` / `git show` — the only allowlisted verbs that consult a config-named
+    program. A blanket append would false-block nothing today, but would quietly become a claim
+    about programs that never had the hole.
+    """
+    out = list(argv)
+    if len(out) >= 2 and out[0] == "git" and out[1] in ("diff", "show"):
+        for flag in ("--no-ext-diff", "--no-textconv"):
+            if flag not in out:
+                out.append(flag)
+    return out
+
 def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[bool, Dict[str, Any]]:
     if read_only:
         return True, {"refused": "read-only",
@@ -1808,6 +1835,16 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         payload["note"] = ("pass the command and its arguments as SEPARATE strings; a shell string is "
                            "refused by type because no allowlist survives `sh -c`")
         return True, payload
+    # ⛔ A PLAIN, FULLY-ALLOWLISTED `git diff` COULD STILL SPAWN A PROGRAM THE ALLOWLIST NEVER SAW.
+    # Found by review (P1), measured: with `diff.external` set in git config — or `GIT_EXTERNAL_DIFF` in
+    # the environment — `["git","diff"]` runs that program, with no flag at all; `["git","show"]` does
+    # the same through a textconv driver. So the program allowlist bounded the PROGRAM and the argv
+    # bounded the flags, while the EFFECT escaped through configuration, which is the same class as the
+    # `--output` write it already refuses.
+    # `cmux vm exec` forwards no environment, so this cannot be fixed by passing a hardened env: the
+    # guarantee has to travel INSIDE the argv. Appending the disables is that guarantee — and git takes
+    # the LAST occurrence of a flag, so a caller-supplied `--ext-diff` cannot re-enable it.
+    argv = _harden_argv(argv)
     allowed, why = _allowlisted(argv)
     if not allowed:
         payload["refused"] = "command-not-allowlisted"

@@ -1314,3 +1314,24 @@ def test_T_saved_work_unreadable_is_unmeasured_never_none(tmp_path):
     assert "not a directory" in got["unmeasured"], got
     # and it still carries the caveat, so a caller cannot read the absence as evidence
     assert got["save_coverage"] == "normal-exit-only", got
+
+
+def test_T_box_exec_disables_the_program_git_config_can_name():
+    """[P1, review] A fully-allowlisted `git diff` still runs `diff.external` FROM CONFIG, with no flag.
+
+    Measured before this fix: with `diff.external` set (or `GIT_EXTERNAL_DIFF` in the env), argv
+    `["git","diff"]` — every element allowlisted — spawned that program. The program allowlist bounded
+    the program and the argv bounded the flags; configuration escaped both, the same class as the
+    `--output` write the surface already refuses. `cmux vm exec` forwards no environment, so the
+    guarantee has to travel inside the argv — and it must come LAST, because git honours the last
+    occurrence of a flag and a caller-supplied `--ext-diff` would otherwise re-enable the hook.
+    """
+    mod = _saved_mod()
+    assert mod._harden_argv(["git", "diff"]) == ["git", "diff", "--no-ext-diff", "--no-textconv"]
+    re_enable = mod._harden_argv(["git", "diff", "--ext-diff"])
+    assert re_enable[-2:] == ["--no-ext-diff", "--no-textconv"], re_enable
+    textconv = mod._harden_argv(["git", "show", "--textconv", "HEAD"])
+    assert textconv[-2:] == ["--no-ext-diff", "--no-textconv"], textconv
+    # a verb with no such hook is untouched — the hardening is scoped, not a blanket append
+    assert mod._harden_argv(["git", "status"]) == ["git", "status"]
+    assert mod._harden_argv(["cat", "/etc/hostname"]) == ["cat", "/etc/hostname"]
