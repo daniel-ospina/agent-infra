@@ -47,6 +47,10 @@
 #      Pinning one trigger's filters is not enough: a second trigger re-opens all of it.
 #  7f. MUTANT: a `push:` trigger added to `pipeline-compliance.yml`  → must FAIL (the same `on:`
 #      key-set pin on the required context).
+#  7g. MUTANTS: the three facts that make `issue_comment:` admissible, each driven — the required job
+#      still REFUSES the comment event, the `revalidate-on-issue-comment` job still OWNS it, and the
+#      trigger itself is still PRESENT → each deletion must FAIL. An allow-list refuses EXTRA
+#      triggers and can never see an absence, which is why the presence arm exists separately.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
@@ -400,6 +404,57 @@ if apply_mutation "$PC" "$PC_PUSH" \
   case "$FINDINGS" in
     *"declares [push]"*) pass "the refusal NAMES the added trigger" ;;
     *) fail "the refusal did not name the added trigger in its FINDING line" ;;
+  esac
+fi
+
+echo "== 7g. MUTANTS: the \`issue_comment\` admission lives or dies by the guards that own it =="
+# The admission in `check.mjs` rests on THREE facts that no allow-list can see: the trigger is PRESENT,
+# the required job REFUSES the comment event, and `revalidate-on-issue-comment` OWNS it. Measured on
+# the pre-pin delta: deleting the trigger block left `check.mjs` at rc 0, and so did deleting the
+# required job's `if:` — 39/39 arms green over a guard that had stopped existing. Each arm below is
+# driven by a verified mutation, so a pin that cannot fail is not a pin.
+PC_NOCOND="$TMP/pc-no-comment-condition.yml"
+if apply_mutation "$PC" "$PC_NOCOND" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'
+" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+" \
+  "the required job's \`issue_comment\` guard must be removable"; then
+  run_check 1 "a required job that no longer REFUSES \`issue_comment\` is REFUSED" PC_FILE="$PC_NOCOND"
+  case "$FINDINGS" in
+    *"\`pipeline-compliance\` job no longer carries"*) pass "the refusal NAMES the required job's missing guard" ;;
+    *) fail "the refusal did not name the required job's guard" ;;
+  esac
+fi
+
+PC_NOTRIGGER="$TMP/pc-no-issue-comment-trigger.yml"
+if apply_mutation "$PC" "$PC_NOTRIGGER" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+" \
+  "" \
+  "the \`issue_comment:\` trigger must be removable"; then
+  run_check 1 "a silent revert of the \`issue_comment:\` trigger is REFUSED (an allow-list cannot see an absence)" PC_FILE="$PC_NOTRIGGER"
+  case "$FINDINGS" in
+    *"no longer declares \`issue_comment:\`"*) pass "the refusal NAMES the lost trigger and why it exists" ;;
+    *) fail "the refusal did not name the lost \`issue_comment:\` trigger" ;;
+  esac
+fi
+
+PC_NOREVAL="$TMP/pc-revalidate-other-event.yml"
+if apply_mutation "$PC" "$PC_NOREVAL" \
+  "    if: >-
+      github.event_name == 'issue_comment' &&" \
+  "    if: >-
+      github.event_name == 'workflow_dispatch' &&" \
+  "the revalidation job's guard must be rewritable"; then
+  run_check 1 "a revalidation job that stops OWNING the comment event is REFUSED" PC_FILE="$PC_NOREVAL"
+  case "$FINDINGS" in
+    *"no longer keys its \`if:\` on"*) pass "the refusal NAMES the revalidation guard" ;;
+    *) fail "the refusal did not name the revalidation guard" ;;
   esac
 fi
 

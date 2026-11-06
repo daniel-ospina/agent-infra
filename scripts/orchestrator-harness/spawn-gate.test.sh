@@ -786,12 +786,20 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 # finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
 # any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
 # ⛔ AND THE SET IS RE-DERIVED, NOT REMEMBERED. This list said "the three names below are the full
-# set" while `watchdog-loop.sh:RESTART_REFUSED` was already on the tree — the sentence was a
-# measurement nobody re-took, so the suite went RED on every run (bash-shards never run on a main
-# push, so nothing surfaced it). The claim is checkable in one command, and it is the command to run
-# whenever this list is edited — it prints every family-shaped declaration whose value is not a
-# 70..89 code, i.e. exactly the population this list must name:
-#   awk -f "$TMP/refusal-codes.awk" scripts/orchestrator-harness/*.sh | awk -F'\t' '$1=="unknown"'
+# set" while `watchdog-loop.sh:RESTART_REFUSED` was already on the tree: the sentence was a
+# measurement nobody re-took, and nothing forced it to be. ⛔ THE RED WAS VISIBLE, NOT HIDDEN — a
+# first draft of this comment claimed "bash-shards never run on a main push", and that is FALSE:
+# `.github/workflows/ci-main.yml` runs this same shard list on every main push (`bash
+# scripts/run-bash-shards.sh`), and it reported these shards red — main run 42225299527 on cf3c46c6d
+# names `spawn-gate.test.sh`, `test-gates.sh`, `tests/ci-trigger-scope/run.sh` and
+# `tests/record-review/run.sh`. So the gap was never the signal; it was that a prose COUNT in a
+# list is a claim nobody re-derives. The next editor re-derives it in one command (the `REFUSAL_AWK`
+# heredoc above, over the deploy unit), which prints every family-shaped declaration whose value is
+# not a 70..89 code — i.e. exactly the population this list must name:
+#   awk '/^cat > "\$TMP\/refusal-codes.awk" <<.REFUSAL_AWK.$/{f=1;next} /^REFUSAL_AWK$/{f=0} f' \
+#     scripts/orchestrator-harness/spawn-gate.test.sh > /tmp/refusal-codes.awk
+#   awk -f /tmp/refusal-codes.awk scripts/orchestrator-harness/*.sh \
+#     | awk -F'\t' '$1=="unknown"'
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
 #   an exit code; nothing compares a shell status against it.
 #   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
