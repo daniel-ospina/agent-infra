@@ -159,7 +159,11 @@ which **no remote has** — see "What this does NOT do"; it is `?` when HEAD or 
 read, and it is carried on the cap/budget-DEFERRED rows too (those are the rows where work was **not**
 archived). An `unreached` row cannot carry it (nothing was read), and neither can a `skip` row.
 
-`issue` is derived from the branch (`feat/8090-tm`, `fix/3442-nonvacuity` → the issue number). A dirty
+`issue` is the issue number the classifier itself read out of the branch — `bg-rescue-wip.sh --verdict`
+reports it as `issue=<N>` beside the `slug=` it named the ref from, and this index copies that field. It
+is **not** re-derived here: a second rule is a second answer, and it disagreed with the ref in both
+directions (`fix/lane-3485` got a `3485` the ref does not carry, while `fix/1-x` got no link the ref
+plainly has). One rule, one home. A dirty
 worktree whose branch carries no issue number is **reported** (`issue=-`, a loud line, `no_issue=N`) —
 the archive still exists on origin, but nothing ties it to an issue, and searching the existing refs —
 whose names are inconsistent, because the slug is sometimes an issue number and sometimes a topic — is
