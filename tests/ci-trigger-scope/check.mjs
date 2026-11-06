@@ -288,11 +288,20 @@ function jobBlock(text, name) {
     if (nameOfJobHeader(l) !== null) return;
     const m = KEY_RE.exec(l);
     if (m && m[1].length === 2) return; // a readable sibling key: fine
-    if (/^ {2}[?:](?:\s|$)/.test(l)) {
+    // ⛔ NOT GATED ON THE HEADER INDENT. Gating on 2 spaces refused `  ? push` (a trigger) and
+    // `  ? pipeline-compliance` (a job id) but left the JOB KEY indent (4) unguarded, so
+    //     if: github.event_name != 'issue_comment'
+    //     ? if
+    //     : true
+    // was neither matched by `ownRe` NOR refused — gate ok/rc=0 while YAML's effective `if` is `True`,
+    // i.e. the required job runs on the comment event. That is the same fail-open one indent below the
+    // shape that was already refused. Both indents that can hold a KEY, plus the step-item indent,
+    // are refused here because an explicit key is never modelled anywhere in this reader.
+    if (/^ {2,6}[?:](?:\s|$)/.test(l)) {
       refuse(
-        `line ${i + 1}: cannot read the job header ${JSON.stringify(
+        `line ${i + 1}: cannot read the key ${JSON.stringify(
           l
-        )} — YAML explicit-key syntax is not modelled, so the job set is UNVERIFIED.`
+        )} — YAML explicit-key syntax is not modelled, so the job is UNVERIFIED.`
       );
     }
   });
@@ -522,6 +531,47 @@ function checkHarnessSingleSource() {
 // marker that `record-review.sh` writes AFTER the last push. Removing it there is the mistake this
 // change most invites ("finish the job"), and it would be a silent fail-open: a forged
 // `verdict=clean-micro` marker would ride a stale green check to merge.
+// requiredContextJobId(text) — the JOB ID whose `name:` is the required status context.
+//
+// ⛔ BY NAME, AND IT MUST BE UNIQUE. The required context is a NAME (the workflow's header says main
+// branch protection requires exactly `pipeline-compliance`), so the reader has to resolve the name to
+// the job that mints it. Two jobs minting the same context — one guarded, one not — means the comment
+// event satisfies the required context through the unguarded one while every assertion about the
+// guarded job's own `if:` still passes. Measured: rc=0 with a shadow job `name: pipeline-compliance,
+// if: True`. Zero or several matches is a refusal, never a guess.
+function requiredContextJobId(text, contextName = "pipeline-compliance") {
+  const lines = String(text ?? "").split("\n");
+  const ids = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = KEY_RE.exec(lines[i]);
+    if (!m || m[1].length !== 2) continue;
+    const id = (m[2] ?? m[3] ?? m[4] ?? "").trim();
+    if (!id) continue;
+    // GitHub uses `name:` when the job declares one, otherwise the id itself.
+    let ctx = id;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const nm = KEY_RE.exec(lines[j]);
+      if (nm) {
+        if (nm[1].length <= 2) break; // next job header or a top-level key
+        if (nm[1].length === 4 && (nm[2] ?? nm[3] ?? nm[4]) === "name") {
+          ctx = (nm[5] ?? "").trim().replace(/^(['"])([\s\S]*)\1$/, "$2");
+          break;
+        }
+      }
+    }
+    ids.push({ id, ctx });
+  }
+  const matching = ids.filter((x) => x.ctx === contextName).map((x) => x.id);
+  if (matching.length !== 1) {
+    refuse(
+      `${PC_FILE}: ${matching.length} job(s) mint the required status context ${JSON.stringify(
+        contextName
+      )}${matching.length ? ` (${matching.join(", ")})` : ""}. Exactly one must, and the guard is asserted on THAT job — with zero or several, which job the merge is gated on is not something this reader can answer.`
+    );
+  }
+  return matching[0];
+}
+
 function checkPipelineComplianceUnchanged() {
   const text = read(PC_FILE);
   const { region, childIndent } = onRegion(text, PC_FILE);
@@ -562,9 +612,18 @@ function checkPipelineComplianceUnchanged() {
   const onNames = onKeys(region, childIndent);
   const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
   const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));
+  // ⛔ THE REQUIRED CONTEXT IS THE JOB **NAME**, NOT THE JOB ID. The workflow's own header says main
+  // branch protection requires EXACTLY the check context `pipeline-compliance`, and GitHub derives that
+  // context from `jobs.<id>.name` when it is present. Asserting the guard on the ID therefore asserts it
+  // on an identifier that need not be the context: a second job carrying `name: pipeline-compliance`
+  // with `if: true` mints the required context ON A COMMENT EVENT while the guarded `pipeline-compliance`
+  // job still satisfies every assertion about its own `if:` (measured: rc=0, effective shadow job
+  // `name: pipeline-compliance, if: True`). So the job that mints the context is located BY NAME, and
+  // exactly one job may do it.
+  const pcJobId = requiredContextJobId(text);
   if (
     admitted.length &&
-    !jobKeyIs(jobBlock(text, "pipeline-compliance"), "if", PC_COMMENT_GUARD)
+    !jobKeyIs(jobBlock(text, pcJobId), "if", PC_COMMENT_GUARD)
   ) {
     findings.push(
       // ⛔ AND IT MUST NOT CLAIM THE GUARD IS *ABSENT*. This reader models a ONE-LINE plain scalar

@@ -782,6 +782,44 @@ jobs:
   run_check 2 "a DUPLICATE top-level \`jobs:\` is CANNOT-VERIFY, never green" PC_FILE="$PC_DUP_JOBS"
 fi
 
+# (c1e2) ⛔ AND THE REQUIRED JOB IS THE ONE THAT MINTS THE CONTEXT — BY **NAME**, NOT BY ID. The
+#        workflow's own header says branch protection requires EXACTLY the check context
+#        `pipeline-compliance`, and GitHub derives that context from `jobs.<id>.name` when present. So a
+#        second job carrying `name: pipeline-compliance` and `if: true` mints the required context ON A
+#        COMMENT EVENT while the guarded `pipeline-compliance` job still satisfies every assertion about
+#        its own `if:` — measured rc=0 with the shadow job's effective `if` = `True`. The unguarded one
+#        is the context that counts, so a duplicated context NAME must be CANNOT-VERIFY (which job the
+#        merge is gated on becomes unanswerable), never a green read of the wrong block.
+PC_SHADOW_JOB="$TMP/pc-shadow-job.yml"
+if apply_mutation "$PC" "$PC_SHADOW_JOB" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow:
+    name: pipeline-compliance
+    if: true
+    runs-on: ubuntu-latest' \
+  "a shadow job minting the required context must be constructible"; then
+  run_check 2 "a SECOND job minting the required context NAME is CANNOT-VERIFY" PC_FILE="$PC_SHADOW_JOB"
+fi
+
+# (c1f0) ⛔ AND AN EXPLICIT KEY AT THE JOB *KEY* INDENT IS THE SAME UNMODELLED SHAPE. The refusal was
+#        gated on the 2-space HEADER indent, so `? if` / `: true` at 4 spaces was neither matched by
+#        `ownRe` nor refused: gate ok/rc=0 while YAML's effective `if` is `True` — a duplicate `if:`
+#        hidden one indent below the shape already refused. An explicit key is not modelled at ANY
+#        indent, so it is refused at every indent that can hold one.
+PC_EXPLICIT_IF="$TMP/pc-explicit-if.yml"
+if apply_mutation "$PC" "$PC_EXPLICIT_IF" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'
+    ? if
+    : true" \
+  "an explicit-key duplicate \`if:\` must be constructible"; then
+  run_check 2 "an EXPLICIT-KEY duplicate \`if:\` at the job's key indent is CANNOT-VERIFY" PC_FILE="$PC_EXPLICIT_IF"
+fi
+
 # (c1f) ⛔ AND AN UNCLASSIFIABLE LINE IS CANNOT-VERIFY, NOT A SILENT DROP. YAML's explicit-key syntax
 #       (`? push` / `: value`) is legal; `onKeys` filtered every line KEY_RE did not match, so a trigger
 #       written that way was invisible while being effective (measured: effective key set included
