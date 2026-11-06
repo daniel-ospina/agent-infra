@@ -3962,7 +3962,7 @@ queue_order_refuse() {
 # ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
 # silently inert, and a caller that skipped it would leave every assertion here green.
 queue_order_from_pool() {
-  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_raw _sat_said _sat_unread _why_none
+  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_raw _sat_said _sat_unread _sat_notopen _why_none
   [ -n "$o" ] || return 1
   rm -f "$o/.queue-rank" "$o/.cand.ranked" 2>/dev/null
   if ! rank_queue_by_pool "$o/.pool" "$o/candidates.txt" "$o/.cand.ranked" "$o/.queue-rank"; then
@@ -4077,7 +4077,7 @@ queue_order_from_pool() {
   # ⛔ SANITISED, NOT ECHOED: only the three tier names are ever repeated, so a foreign or corrupt file
   # cannot inject text into an operator-facing line. An unreadable mix is disclosed as such rather than
   # printed. Absent file = no tier was truncated (the normal case) and no clause is added.
-  _sat=""; _sat_junk=0; _sat_tier=""; _sat_unread=0
+  _sat=""; _sat_junk=0; _sat_tier=""; _sat_unread=0; _sat_notopen=0
   # ⛔ THE READ IS GUARDED, AND THE GUARD IS THE READ ITSELF (review P3, cycle 40; hardened cycle 41). A
   # `[ -r ]` test is a TOCTOU, not a read guard: a directory passes `[ -s ]` AND `[ -r ]`, is never read,
   # and was then reported as "held nothing this code could classify" — a measured claim over zero bytes.
@@ -4098,8 +4098,20 @@ queue_order_from_pool() {
   # `2>/dev/null` applies, exactly as the `.queue-rank` comment above documents, so an unreadable record
   # still printed `Permission denied` and §14d-bis reddened on it. The group's stderr covers the redirect
   # AND the command substitution still carries the failing status, which is what the branch tests.
+  # ⛔ TWO FAILURES, TWO SENTENCES (review P3, cycle 43). "Not a regular file, so this pass did NOT open
+  # it" and "it EXISTS but could not be READ" are different facts, and the old single sentence asserted the
+  # second for the first — false for the very shape the device fixture uses, where a read would HAVE
+  # succeeded (`/dev/null` yields zero bytes). `_sat_notopen` and `_sat_unread` are kept apart so the line
+  # says which one happened.
   if [ -e "$o/.pool-sat" ] || [ -L "$o/.pool-sat" ]; then
-    if [ -f "$o/.pool-sat" ] && _sat_raw="$( { tr -d '\000' < "$o/.pool-sat"; } 2>/dev/null )"; then
+    if [ ! -f "$o/.pool-sat" ]; then
+      _sat_notopen=1
+    elif _sat_raw="$( { tr '\000' '\001' < "$o/.pool-sat"; } 2>/dev/null )"; then
+      # ⛔ A NUL IS RE-PLACED, NOT DELETED (review P3, cycle 43). `tr -d` made a record of `P0-blo\0cker`
+      # MATCH the `P0-blocker` tier — asserting a measured clip from bytes this code cannot classify — and
+      # made a NUL-only record indistinguishable from an EMPTY one, so it printed no clause at all. Mapped
+      # to `\001` the byte SURVIVES as data: no line containing it can equal a tier name, so the record is
+      # JUNK (the no-clip sentence), and the shell still emits no "ignored null byte" warning.
       if [ -n "$_sat_raw" ]; then
         while IFS= read -r _sat_tier; do
           case "$_sat_tier" in
@@ -4127,7 +4139,11 @@ queue_order_from_pool() {
   # (`-e` is false for a file that is gone), and the producer's writes are a PIPELINE SUBSHELL, so no
   # in-process flag survives either. That is a residual, not a claim: the docs say the same.
   case "$_sat" in
-    "") [ "$_sat_unread" -eq 1 ] && _sat_said=" — the tier-window record EXISTED but could not be READ, so this pass measured no clip and asserts none" ;;
+    "") if [ "$_sat_notopen" -eq 1 ]; then
+          _sat_said=" — the tier-window record EXISTS but is NOT A REGULAR FILE, so this pass did NOT open it (reading a FIFO or a device is unbounded) and measured no clip"
+        elif [ "$_sat_unread" -eq 1 ]; then
+          _sat_said=" — the tier-window record EXISTED but could not be READ, so this pass measured no clip and asserts none"
+        fi ;;
     unrecognised)
       # A non-empty record that matched no tier ALWAYS has at least one unrecognised line, so the former
       # non-junk arm here was unreachable (review P3, cycle 42): a record of blank lines reads as empty,
@@ -4242,8 +4258,8 @@ queue_order_from_pool() {
     # "the pass could not tell WHICH tier was clipped". Asserting a clip there is a claim the pass did not
     # take, on a corrupt/foreign record. Only a RECOGNISED tier name makes the clip a fact.
     case "$_sat" in
-      "") if [ "$_sat_unread" -eq 1 ]; then
-            _why_none="no ranked row was left for this queue, and its tier-window record could not be read, so no cause is asserted"
+      "") if [ "$_sat_unread" -eq 1 ] || [ "$_sat_notopen" -eq 1 ]; then
+            _why_none="no ranked row was left for this queue, and its tier-window record could not be USED (it was not a regular file, or it could not be read), so no cause is asserted"
           else
             _why_none="no P0-blocker/P1-severe/P2-moderate row matched"
           fi ;;

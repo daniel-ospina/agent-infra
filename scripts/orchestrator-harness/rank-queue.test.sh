@@ -1716,10 +1716,20 @@ ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not rep
 
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
 MUT_NOSAT="$TMP/fns-nosat.sh"
-# The anchor is the READ itself, so it survives a change of guard shape (it has already drifted once,
-# from `[ -s ]` to the read-status form: the `cmp` below caught it rather than passing vacuously).
-sed 's|^  if \[ -e "\$o/.pool-sat" \] || \[ -L "\$o/.pool-sat" \]; then|  if false; then|' "$FNS" > "$MUT_NOSAT"
-if cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null; then rc=1; echo "      the .pool-sat mutation did not apply — the sed anchor drifted"; else
+# The anchor is the READ itself, so it survives a change of guard shape (it has drifted twice, from
+# `[ -s ]` to the read-status form). ⛔ `@` IS THE DELIMITER ON PURPOSE (review P2, cycle 43): the pattern
+# contains `||`, so a `|`-delimited `s///` made sed die with "unknown option to `s'" and left a 0-BYTE
+# mutant — which `cmp` reported as "applied", and the check then passed on `command not found`. The
+# mutation is now required to have sed's own success AND to leave the function under test present.
+# `_mut_ok` is its OWN flag, never the previous check's `rc`: an earlier failure must not be able to
+# stand in for "the mutation was applied".
+_mut_ok=1
+sed 's@^  if \[ -e "\$o/.pool-sat" \] || \[ -L "\$o/.pool-sat" \]; then@  if false; then@' "$FNS" > "$MUT_NOSAT" 2>"$TMP/.mut-sed-err" || _mut_ok=0
+grep -q '^queue_order_from_pool() {' "$MUT_NOSAT" 2>/dev/null || _mut_ok=0
+cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null && _mut_ok=0
+if [ "$_mut_ok" = "0" ]; then
+  rc=1; echo "      the .pool-sat mutation could not be applied whole (sed: '$(tr '\n' ' ' < "$TMP/.mut-sed-err" 2>/dev/null | head -c 120)', mutant bytes '$(wc -c < "$MUT_NOSAT" 2>/dev/null)') — the anchor drifted"
+else
   d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"
   printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
   { drive_prologue; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
@@ -1800,7 +1810,7 @@ if [ "$_bis_skipped" = "1" ]; then
 elif grep -qi 'permission denied' <<<"$_x14"; then
   rc=1; echo "      the shell's own message reached the operator line '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
 elif grep -q 'could not be READ' <<<"$_x14" \
-     && grep -q 'tier-window record could not be read, so no cause is asserted' <<<"$_x14" \
+     && grep -q 'tier-window record could not be USED' <<<"$_x14" \
      && ! grep -q 'windows=TRUNCATED' <<<"$_x14" \
      && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_x14"; then rc=0
 else rc=1; echo "      unreadable record '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"; fi
@@ -1818,12 +1828,13 @@ _y14="$(cat "$_d14d/out" 2>/dev/null)"
 # chmod-000 fixture skips on root (review P2, cycle 42): deleting that branch left the suite green for
 # the one environment the author measured. The dead "held nothing this code could classify" wording is
 # gone with the unreachable arm that printed it, so it is no longer asserted either way.
-if grep -q 'could not be READ' <<<"$_y14" \
-   && grep -q 'tier-window record could not be read, so no cause is asserted' <<<"$_y14" \
+if grep -q 'is NOT A REGULAR FILE, so this pass did NOT open it' <<<"$_y14" \
+   && grep -q 'tier-window record could not be USED' <<<"$_y14" \
    && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_y14" \
+   && ! grep -q 'could not be READ' <<<"$_y14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_y14" && ! grep -qi 'is a directory' <<<"$_y14"; then rc=0
 else rc=1; echo "      directory record '$(printf '%s' "$_y14" | tr '\n' '|' | head -c 320)'"; fi
-ck "(14d) a window-record PATH that cannot be opened is reported as unread, not as empty" $rc
+ck "(14d) a window-record PATH that is not a regular file is reported as NOT OPENED (not as unread, not as empty)" $rc
 
 # 14d-quater) A RECORD WHOSE LAST LINE HAS NO TRAILING NEWLINE (review P3, cycle 42). The pre-fix read
 # used `done < file`, whose LOOP CONDITION is the `read`'s EOF status — a one-line record written without
@@ -1853,9 +1864,11 @@ ln -s /dev/null "$_d14f/o/.pool-sat"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14f/drive.sh"
 ( cd "$_d14f" && HOME="$_d14f" bash drive.sh "$_d14f/o" ) > "$_d14f/out" 2>&1
 _v14="$(cat "$_d14f/out" 2>/dev/null)"
-if grep -q 'could not be READ' <<<"$_v14" && ! grep -q 'windows=TRUNCATED' <<<"$_v14"; then rc=0
+if grep -q 'is NOT A REGULAR FILE, so this pass did NOT open it' <<<"$_v14" \
+   && ! grep -q 'could not be READ' <<<"$_v14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_v14"; then rc=0
 else rc=1; echo "      non-regular record '$(printf '%s' "$_v14" | tr '\n' '|' | head -c 320)'"; fi
-ck "(14d) a NON-REGULAR window record (a device symlink) is classified unread, never opened" $rc
+ck "(14d) a NON-REGULAR window record (a device symlink) is reported as NOT OPENED — never as unread, never opened" $rc
 
 # 14d-sexies) A NUL IN THE RECORD IS DATA, NOT A SHELL WARNING (review P3, cycle 42). `cat` alone made
 # bash print `warning: command substitution: ignored null byte in input` onto the log above the honest
@@ -1866,9 +1879,24 @@ printf 'P1-severe\000\n' > "$_d14g/o/.pool-sat"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14g/drive.sh"
 ( cd "$_d14g" && HOME="$_d14g" bash drive.sh "$_d14g/o" ) > "$_d14g/out" 2>&1
 _u14g="$(cat "$_d14g/out" 2>/dev/null)"
-if grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_u14g" && ! grep -qi 'null byte' <<<"$_u14g"; then rc=0
+if grep -q 'NO clip is asserted and no tier is repeated here' <<<"$_u14g" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_u14g" && ! grep -qi 'null byte' <<<"$_u14g"; then rc=0
 else rc=1; echo "      NUL-bearing record '$(printf '%s' "$_u14g" | tr '\n' '|' | head -c 320)'"; fi
-ck "(14d) a NUL-bearing record still recognises its tier and leaks no shell 'null byte' warning" $rc
+ck "(14d) a NUL-bearing record is JUNK — no clip is invented from bytes it cannot classify (and no shell warning)" $rc
+
+# 14d-septies) A NUL MID-TIER MUST NOT BE PROMOTED TO A TIER (review P3, cycle 43). Deleting the NUL (the
+# previous shape) turned `P0-blo\0cker` into `P0-blocker` — a measured clip asserted from corrupted bytes.
+# A record of ONLY NULs must likewise not fold into "empty" and print nothing: it is junk, and says so.
+_d14h="$TMP/arm-clip-nulmid"; rm -rf "$_d14h"; mkdir -p "$_d14h/o"
+printf 'aaa\nbbb\n' > "$_d14h/o/candidates.txt"; printf '200\n' > "$_d14h/o/.pool"
+printf 'P0-blo\000cker\n' > "$_d14h/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14h/drive.sh"
+( cd "$_d14h" && HOME="$_d14h" bash drive.sh "$_d14h/o" ) > "$_d14h/out" 2>&1
+_w14="$(cat "$_d14h/out" 2>/dev/null)"
+if ! grep -q 'windows=TRUNCATED' <<<"$_w14" && grep -q 'NO clip is asserted' <<<"$_w14" \
+   && ! grep -qi 'null byte' <<<"$_w14"; then rc=0
+else rc=1; echo "      NUL mid-tier '$(printf '%s' "$_w14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a NUL INSIDE a tier name is not promoted to a recognised tier" $rc
 
 # 14e) NON-VACUITY — remove the clause from the arms and the checks above must redden.
 MUT_NOSAT2="$TMP/fns-nosat2.sh"
