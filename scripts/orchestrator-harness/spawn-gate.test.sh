@@ -795,9 +795,14 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 # ⛔ AND THE SET IS RE-DERIVED, NOT REMEMBERED. This comment said "the three names below are the full
 # set" while `watchdog-loop.sh:RESTART_REFUSED` was already on the tree, so the collision arm read RED
 # on every run over a flag that declares no code. The sentence is a measurement, so it is taken by a
-# command rather than by memory — this one prints every family-shaped declaration whose value is not a
-# 70..89 code, i.e. exactly the population this list must name. Run it whenever this list is edited:
-#   awk -f "$TMP/refusal-codes.awk" scripts/orchestrator-harness/*.sh | awk -F'\t' '$1=="unknown"'
+# command rather than by memory. The scanner lives in a `mktemp -d` this suite deletes on exit, so the
+# command MATERIALISES it first — run both lines whenever this list is edited; the second prints
+# exactly the `file:NAME` population this list must name (`-u`, because a declaration may be read
+# more than once):
+#   sed -n '/^cat > .*refusal-codes.awk/,/^REFUSAL_AWK$/p' scripts/orchestrator-harness/spawn-gate.test.sh \
+#     | sed '1d;$d' > /tmp/refusal-codes.awk
+#   awk -f /tmp/refusal-codes.awk scripts/orchestrator-harness/*.sh \
+#     | awk -F'\t' '$1=="unknown"{print $4":"$2}' | sort -u
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
 #   an exit code; nothing compares a shell status against it.
 #   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
@@ -5212,9 +5217,12 @@ rdrive() { # rdrive <label> <registry:0|1> [<cap seconds>] -> "rc=… started=�
 rlist() { # the registry's own reader, against the fixture origin only
   # ⛔ "THE FIXTURE ORIGIN ONLY" IS WHAT THIS COMMENT CLAIMED, AND WHAT IT DID NOT DO (measured).
   # `--remote` redirects only the SHARED read; when that read fails the helper falls back to the box's
-  # own witness (~/.pi/agent/state/lanes — the ambient fleet, 281 records here), so an unreadable
-  # fixture origin made every R-arm below grade ambient state. The fixture's own state root is passed,
-  # exactly as `rdrive`/`r_end` already pass it to the lane under test.
+  # own witness (~/.pi/agent/state/lanes — the ambient fleet, hundreds of records on a live box). The
+  # R-arms above always read the REACHABLE `$RREG/origin.git`, so they never fell back — but the day
+  # the fixture origin became unreadable they would have graded ambient state without saying so. The
+  # fixture's own state root is passed explicitly, exactly as `rdrive`/`r_end` pass it to the lane
+  # under test. (R4 is the arm that breaks the origin today, and its own probe had exactly this
+  # defect — see its comment.)
   env LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
       LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
       python3 "$HERE/lane_registry.py" list --remote "$RREG/origin.git" --json 2>/dev/null
@@ -5325,7 +5333,7 @@ rm -rf "$RREG/state/lanes"
 # ⛔ THE PROBE MUST BE HERMETIC TOO (measured — it was not, and part of this arm's RED was that).
 # `--remote` redirects only the SHARED read; with it broken the reader falls back to the box's own
 # witness, which without the fixture's env is the REAL one — so this clause read `rc=0, coverage:
-# local-only` over 281 AMBIENT records while the lane beside it (already driven with these variables)
+# local-only` over the ambient fleet while the lane beside it (already driven with these variables)
 # was reading the fixture. One arm, two different registries. The fixture's own state root is passed to
 # every read below, exactly as `rdrive`/`r_end` pass it.
 _r4_reg() { env LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
@@ -5333,22 +5341,23 @@ _r4_reg() { env LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/sta
   python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>/dev/null; }
 # (a) With the witness EMPTY no answer can be assembled, so the read ABSTAINS: rc 3, never a 0. An empty
 # local witness is explicitly not an empty fleet.
-_r4_before="$(_r4_reg)"; _r4_before_rc=$?
-res="$(rdrive "registry-unreachable" 1)"; rc=$?
+_r4_reg >/dev/null; _r4_before_rc=$?
+res="$(rdrive "registry-unreachable" 1)"
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-# (b) …and once the lane has run, ITS OWN terminal record is the local witness — so the read HAS an
-# answer and returns it. ⛔ THE EXPECTATION IS THEN PROVENANCE, NOT A CODE: the payload must say
-# `local-only`, because the shared store never answered. Demanding rc=3 here (as this arm once did)
-# asked for a state the arm cannot be in after the lane it just drove wrote its record; what must never
-# happen is a confident `shared` read over an unreachable ref store.
+# (b) …and once the lane has run, ITS OWN terminal record is the local witness, so the read HAS an
+# answer and returns it. ⛔ THE EXPECTATION IS THEN PROVENANCE — `local-only`, EXACTLY. Demanding rc=3
+# here (as this arm once did) asked for a state the arm cannot be in after the lane it just drove
+# wrote its record; and accepting an UNMEASURED abstention instead would make the arm GREEN in the
+# one state its own comment says must not exist — a lane that left NO local record, or a regression
+# that dropped the local fallback, would read exactly like success. What must never happen is a
+# confident `shared` read over an unreachable ref store.
 _r4_after="$(_r4_reg)"
 unreachable="$(printf '%s' "$_r4_after" | python3 -c 'import json,sys
 try: d=json.load(sys.stdin)
 except Exception: print("UNPARSEABLE"); raise SystemExit
 print(d.get("coverage") or ("UNMEASURED" if d.get("unmeasured") else "NO-PROVENANCE"))' 2>/dev/null)"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (empty witness: rc=$_r4_before_rc; after the lane: coverage=${unreachable:-<none>})" \
-   $([ "${rcval:-x}" = "0" ] && [ "$_r4_before_rc" = "3" ] \
-      && { [ "${unreachable:-}" = "local-only" ] || [ "${unreachable:-}" = "UNMEASURED" ]; } && echo 0 || echo 1)
+   $([ "${rcval:-x}" = "0" ] && [ "$_r4_before_rc" = "3" ] && [ "${unreachable:-}" = "local-only" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
 
 echo
