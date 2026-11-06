@@ -185,8 +185,34 @@ ck "e4a fleet_srcs is exactly one single-line array and it DELIVERS the wrapper"
    '[ "$(printf "%s\n" "$FARM_LINE" | wc -l | tr -d " ")" = 1 ] && case " $FARM_LINE " in *" pr-doctor-machine.sh "*) true ;; *) false ;; esac'
 ck "e4b lib_srcs is exactly one single-line array and it DELIVERS the reader" \
    '[ "$(printf "%s\n" "$LIB_LINE" | wc -l | tr -d " ")" = 1 ] && case " $LIB_LINE " in *" repo-set.sh "*) true ;; *) false ;; esac'
-ck "e4c the membership arm is not satisfiable by the names appearing in prose (the first cut's defect)" \
-   '! printf "%s" "$FARM_LINE$LIB_LINE" | grep -q "#"' 
+# ⛔ `e4c` IS A MUTATION, NOT A TAUTOLOGY (review round 2, P2). The first cut asserted "the array line
+# contains no `#`", which is true in every state including the broken one — it proved nothing. What
+# actually has to be shown is that `e4a`/`e4b` REDDEN when the entries are removed, i.e. that they read
+# the array rather than the prose around it (the names appear in this change's own comments).
+SETUP_MUT="$T/setup-mut.sh"
+python3 - "$REPO_ROOT/pi-bootstrap/setup.sh" "$SETUP_MUT" <<'PY2'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+def drop(name, entry):
+    global t
+    m = re.search(r"^%s=\((.*)\)$" % name, t, re.M)
+    assert m, "array %s not found" % name
+    words = [w for w in m.group(1).split() if w != entry]
+    assert len(words) == len(m.group(1).split()) - 1, "entry %s not in %s" % (entry, name)
+    t = t[:m.start()] + "%s=(%s)" % (name, " ".join(words)) + t[m.end():]
+drop("fleet_srcs", "pr-doctor-machine.sh")
+drop("lib_srcs", "repo-set.sh")
+open(dst, "w").write(t)
+PY2
+MUT_FARM="$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP_MUT")"
+MUT_LIB="$(sed -n 's/^lib_srcs=(\(.*\))$/\1/p' "$SETUP_MUT")"
+ck "e4c the mutation really removed both entries (a mutation that did not apply proves nothing)" \
+   '! printf "%s" "$MUT_FARM$MUT_LIB" | grep -qE "(pr-doctor-machine\.sh|repo-set\.sh)"'
+ck "e4d …and e4a/e4b' EXACT expressions REDDEN on it — they read the ARRAY, not the prose" \
+   '! { case " $MUT_FARM " in *" pr-doctor-machine.sh "*) true ;; *) false ;; esac; } && ! { case " $MUT_LIB " in *" repo-set.sh "*) true ;; *) false ;; esac; }'
+ck "e4e …while the names still appear in setup.sh PROSE (so a file-wide grep would have passed)" \
+   'grep -q "pr-doctor-machine.sh" "$SETUP_MUT" && grep -q "repo-set.sh" "$SETUP_MUT"' 
 
 # ── (f) the wrapper's three states, driven through a stub doctor ──────────────────────────────
 # A stub that records what it was EXECUTED with: argv on one line, PR_DOCTOR_REPOS on the next. The
@@ -212,9 +238,14 @@ ck "f2 the set is handed over in configured_repos()'s entry form" \
 ck "f3 the mode line names the file and the count (a box can see what was graded)" \
    'run_wrapper_err "$CONF" | grep -q "grading 2 repo(s)"'
 
-out="$(run_wrapper "$nofile")"
-ck "f4 NO set DEGRADES: the single-repo form runs (every existing box keeps grading)" \
-   '[ "$(printf "%s\n" "$out" | sed -n "s/^ARGV //p")" = "" ]'
+# ⛔ `f4` MUST PROVE THE PASS RAN, NOT THAT STDOUT WAS EMPTY. An empty stdout is also what a REFUSAL
+# produces, so the first cut passed on a wrapper that never exec'd the doctor — the exact false PASS
+# review round 2 found in this arm's neighbourhood. It asserts the stub's own ARGV line now, with `OR`
+# set, which is the shape that can actually name a repo without a set.
+ck "f4 NO set + OR set DEGRADES: the single-repo form RUNS (stub executed, no argv)" \
+   'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+ck "f4b ...and it says which repo it is grading, from the box own evidence" \
+   'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null | grep -q "in OR=daniel-ospina/tortoise"'
 ck "f5 …and the degradation is LOGGED every pass, with the file to create" \
    'run_wrapper_err "$nofile" | grep -q "DEGRADED — NO-REPO-SET: $nofile does not exist"'
 ck "f6 …and it names the line format so the fix is copy-paste" \
@@ -231,6 +262,23 @@ ck "f10 the wrapper takes NO arguments (a plist flags nobody reads is the NOT_A_
    'REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" --dry-run >/dev/null 2>&1; [ $? = 2 ]'
 ck "f11 a missing sibling reader is a NAMED farm gap, not a silent one-repo box" \
    'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; printf "%s" "$o" | grep -q "lib_srcs.*declares it"'   # bash-ok
+# ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
+# doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
+# default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
+# production. These arms drive the REAL proof function: a `REPO` that proves nothing, with no `OR`.
+mkdir -p "$T/unprovable"   # exists, not a work tree
+ck "f13 no set + OR set -> DEGRADED runs the single-repo form (rank 3 names it)" \
+   'o="$(REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)"; printf "%s" "$o" | grep -q "^ARGV $" && REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null | grep -q "in OR=daniel-ospina/tortoise"'
+ck "f14 no set + REPO that PROVES its slug -> DEGRADED runs (rank 4 names it)" \
+   'REPO_SET_FILE="$nofile" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1'
+ck "f15 no set + REPO that proves NOTHING + no OR -> REFUSES (rc 2), it does not pretend to grade" \
+   '[ "$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
+ck "f16 …and it says WHY, and names both fixes (create the set / set OR or a provable REPO)" \
+   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "proves no repo" && printf "%s" "$o" | grep -q "(1) create the repo set above" && printf "%s" "$o" | grep -q "(2) set OR=OWNER/NAME"'
+ck "f17 ...and the doctor was never executed on that path" \
+   '[ -z "$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)" ]'
+ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
+   '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
    'REPO_SET_FILE="$CONF" bash -c ". \"$READER\"; type repo_set_doctor_repos >/dev/null" >/dev/null 2>&1'
 
@@ -354,6 +402,21 @@ mut2_rc="$(REPO_SET_FILE="$T/case-dup.conf" bash "$M2/lib/repo-set.sh" list >/de
 ck "l1 the shipped reader refuses two case-spellings (rc 5)" '[ "$(run_reader_rc "$T/case-dup.conf" list)" = 5 ]'
 ck "l2 with the fold removed the SAME fixture is accepted as two repos (rc 0) — the fold discriminates" \
    '[ "$mut2_rc" = 0 ]'
+
+# ── (m) the state-dir guard folds case too (APFS/HFS+ are case-insensitive by default) ────
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/Orchestrator\nslug=daniel-ospina/agent-infra checkout=%s state=%s/orchestrator\n' \
+  "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/case-state.conf"
+ck "m1 two state dirs differing only by CASE are the shared-state refusal (one dir on macOS)" \
+   'run_reader "$T/case-state.conf" check | grep -q "is shared with another repo in this set"'
+
+# ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
+# The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
+# heartbeat steps render from the same list). A library that turns on `-u` in its caller breaks the
+# caller's own idioms — a named, reproducible defect.
+ck "n1 a consumer that sources the reader keeps its OWN shell options (no inherited -u)" \
+   'bash -c ". \"$READER\"; [ -z \"\${UNSET_THING-}\" ] && if [ \"\$UNSET_THING\" = 1 ]; then :; fi" >/dev/null 2>&1'
+ck "n2 …and the strict flags still exist, on the EXECUTED path" \
+   'o="$(grep -n "set -uo pipefail" "$READER" | head -1 | cut -d: -f1)"; [ -n "$o" ] && [ "$o" -gt "$(grep -n "^_rs_main() {" "$READER" | cut -d: -f1)" ]'
 
 # ── recap ─────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
