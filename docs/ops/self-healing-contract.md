@@ -998,17 +998,36 @@ still where the next cut should start.
   `dispatched=2`, i.e. **0.054 issues/h against an 8.1/h bound (0.7%)**, while the PR path consumed
   8.59 workers/h — the box was saturated by PR work and produced almost nothing else, and the same
   barrier is what let a stalled drain hide behind itself.
-  - **Spawn gates remain the ONLY capacity limit** (`MAX_LANES`, `MAX_LOAD`, the memory floor, fork
-    headroom via `can_spawn`). The cascade adds no pacing, no nap, no new threshold. Level 5 is
-    *lowest priority, not blocked*.
+  - **Spawn gates remain the ONLY limit on how much runs at once** (`MAX_LANES`, `MAX_LOAD`, the
+    memory floor, fork headroom via `can_spawn`). The cascade adds no pacing, no nap, no new
+    threshold. **It is not the only thing that can withhold work, and this document will not claim it
+    is** (corrected 2026-11-06, review P1): the WIP-limit arm (`LANDING_FLOOR`) still closes the issue
+    path on its own, and a cascade LEVEL holds the room while it drains. So "spawn gates are the only
+    capacity limit" is true of *concurrency*, and false of *dispatch*.
+  - **Level 5 is lowest priority, NOT "always reachable".** It gets what levels 1-4 left free, so on a
+    pass where a level holds, level 5 gets nothing — by design, that is what a priority means. The
+    precise claim that survives is the one the 2026-10-18 barrier made false and this change restores:
+    **an un-owned PR merely EXISTING no longer closes the issue path.** What does close it is a level
+    with work of its own above it.
+  - **⛔ EXCEPTION, MEASURED, AND AN OPEN OWNER DECISION — LEVEL 1 CAN HOLD WITHOUT AN ACTOR.** Level 1
+    (`FIX_MAIN`) is the one level whose *holding* is not backed by any dispatch in the controller: it
+    sets `CASCADE_ISSUE_SLOTS=0` and nothing in `orch-loop.sh` spawns, orders or nominates work for it
+    (see the review record on PR #3594). Its input is main's own check-runs, which include `push`-only
+    lanes (`ci-main.yml`) whose only repair route is the GitHub issue that `ci-main.yml`'s
+    `auto-file-on-failure` files — an issue the issue batch would dispatch, and the batch level 1
+    zeroes. On this repo main carries such reds often, so level 1 is not a corner case there. Two
+    candidate remedies — *level 1 dispatches the main repair* or *level 1's input is narrowed to what
+    the merge rail itself measures* — are a **behavioural policy choice and an owner decision**; this
+    change deliberately implements neither and `test-cascade.sh` pins the state so the choice is made
+    against evidence rather than by drift.
   - **An unreadable un-owned count still fails CLOSED** (no room granted) — the polarity that used to
     ride along inside the barrier is now enforced where the room is granted, because losing it would
     make a rate-limited `gh` listing the one condition that dispatches new work.
   - **`merge-priority` no longer assigns `GATE_WHY`**, so it can no longer mask a capacity gate: it is
     computed into `MP_PRIORITY` and printed as a level, and the capacity arms decide the cycle.
-  - Graded by `test-cascade.sh` (127 assertions, 18 mutants — each mutation makes a named assertion go
-    RED) plus the existing `test-gates.sh` vector tests, `live-ownership.test.sh` and
-    `pr-owner-liveness.test.sh`.
+  - Graded by `test-cascade.sh` (assertion and mutant counts are the suite's own printed totals, not a
+    claim made here — each mutation makes a named assertion go RED) plus the existing `test-gates.sh`
+    vector tests, `live-ownership.test.sh` and `pr-owner-liveness.test.sh`.
   **OVERRIDES:** the "WIP limit / stop-starting threshold" reading of the 2026-10-18 ruling — i.e. the
   absolute "ANY un-owned PR ⇒ the issue path is closed" barrier — because it produced measurable
   throughput collapse (0.66% of cycles dispatched), not because a vendor or a standard says so.

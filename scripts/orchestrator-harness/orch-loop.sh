@@ -3147,8 +3147,18 @@ cascade_main_probe() {
   # ⛔ DECLARED LIMIT: the rail additionally EXEMPTS a red whose workflow declares no `pull_request`
   # trigger (a push-only job cannot be measured by a PR) and reds on non-code events. This probe does
   # NOT reproduce that classifier — a second implementation of it is the defect class this file names
-  # — so a push-only workflow that is legitimately red on main reads RED here. That is the honest
-  # residual, it is filed, and it fails in the direction that keeps a red-looking main first.
+  # — so a push-only workflow that is legitimately red on main reads RED here, and it fails in the
+  # direction that keeps a red-looking main first.
+  # ⛔ AND THE COST OF THAT LIMIT IS NOT HYPOTHETICAL, SO IT IS NOT WRITTEN OFF AS "FILED" (review P1,
+  # 2026-11-06 — this comment previously claimed it WAS filed and no such issue existed, the
+  # claim-with-no-artifact class). Level 1 holds the issue batch at zero and NOTHING in this file
+  # spawns, orders or nominates work for it, so the level can be pinned by a red whose only repair
+  # route is the issue that `ci-main.yml`'s `auto-file-on-failure` files — an issue the issue batch
+  # would dispatch and level 1 zeroes. What level 1 DOES when it holds is an OWNER DECISION (dispatch
+  # the main repair, or narrow this input to what the merge rail itself measures); neither is
+  # implemented here, and the documented state — with the evidence — is
+  # `docs/ops/self-healing-contract.md` §6, "LEVEL 1 CAN HOLD WITHOUT AN ACTOR". `test-cascade.sh`
+  # pins that state rather than pre-empting the decision.
   # Payload: one TSV row per ATTEMPT via `--jq` (that is what makes `--paginate` concatenable — `gh`
   # emits one JSON object PER PAGE, and a naive `json.load` reads only the first).
   # ⛔ `gh` IS READ FIRST, INTO A VARIABLE, SO ITS FAILURE CANNOT READ AS GREEN. Piping `gh` straight
