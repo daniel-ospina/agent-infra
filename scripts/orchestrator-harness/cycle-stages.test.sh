@@ -22,6 +22,11 @@
 #   §5  the TILED stages tile: their sum is the body's wall time, so no time escapes the instrument
 #   §6  FORK-FREE — the clock runs BEFORE `fork_gate`, on the path where one `$( )` kills the
 #       controller (agent-infra#2293). Asserted structurally against the shipped block.
+#   §9.1c–f THE SHIPPED WIRING — the mechanisms are graded at their real call sites, not only through
+#       arrangements this suite writes itself: the trailing settle, the post-`done` fold, each nap's
+#       pre-nap stamp, `stages=` on BOTH early-exit records, a mark site for every TILED stage,
+#       `stg_field`'s own fold, and the monotonic clamp. Added because TWENTY-TWO mutations of the
+#       shipped arrangement and reader left the earlier suite fully green.
 #   §7  BACKWARDS COMPATIBILITY — a record with NO `stages=` field still parses for EVERY reader
 #   §8  the record stays ONE space-separated `k=v` line: the new field cannot break the grammar that
 #       the other twenty fields share
@@ -478,6 +483,73 @@ for _nln in $(printf '%s\n' "$_loop_nc" | grep -n '^[[:space:]]*stg_nap_mark[[:s
 done
 ck "every stg_nap_mark call site samples STG_WAIT_T0 BEFORE the nap it measures, so prev_wait is one gap${_nap_bad:+ (bad line(s):$_nap_bad)}" \
    "$([ -z "$_nap_bad" ] && echo 0 || echo 1)"
+
+# 9.1d THE REST OF THE SHIPPED WIRING — the holes 9.1c did not reach (this review, measured).
+# Every arm below was GREEN before it existed: deleting the `stages=` field from either early-exit
+# record, deleting a tiled stage's `stg_mark` call site, deleting the disk-held arm's `stg_nap_mark`,
+# deleting `stg_field`'s own fold, and removing the monotonic clamp ALL left the suite at 76/0.
+# 9.1d-i: BOTH EARLY-EXIT RECORDS CARRY THE FIELD. These are the cycles that produced NOTHING — the
+# ones an operator most needs to attribute, and the ones the docs call "the very arms the 161-minute
+# narrative is about". Enumerated by arm name so a NEW early-exit record cannot silently omit it.
+_emit_n="$(printf '%s\n' "$_loop_nc" | grep -c 'stages="\${STG_FIELD:-}"')"
+ck "all THREE record-write sites carry stages= (full cycle + disk-held + fork-starved; got ${_emit_n})" \
+   "$(if [ "${_emit_n:-0}" -ge 3 ]; then echo 0; else echo 1; fi)"
+_nostage=""
+for _arm in disk_held fork_held; do
+  # find the arm's own record write and prove the field is inside it
+  printf '%s\n' "$_loop_nc" | awk -v a="$_arm" '$0 ~ ("placement=\"" a "\"") {seen=1} seen && /stages="\$\{STG_FIELD:-\}"/ {ok=1} seen && /^[[:space:]]*else$/ {seen=0} END{exit !ok}' \
+    || _nostage="$_nostage $_arm"
+done
+ck "  …and neither EARLY-EXIT arm was dropped from that set${_nostage:+ — missing:$_nostage}" \
+   "$(if [ -z "$_nostage" ]; then echo 0; else echo 1; fi)"
+# 9.1d-ii: EVERY TILED STAGE HAS A MARK SITE. §4 proves the EMITTER walks the registry, so a registered
+# stage always APPEARS — and can appear as `ns` forever if nothing ever marks it. That is a missing
+# instrument wearing a valid label, and it reddened nothing before this arm.
+_unmarked=""
+for _s in $STG_REGISTRY_TILED; do
+  printf '%s\n' "$_loop_nc" | grep -qE "^[[:space:]]*stg_mark $_s([[:space:]]|\$|;|\|)" || _unmarked="$_unmarked $_s"
+done
+ck "every TILED stage has a stg_mark call site in the shipped loop${_unmarked:+ — unmarked:$_unmarked}" \
+   "$(if [ -z "$_unmarked" ]; then echo 0; else echo 1; fi)"
+# 9.1d-iii: NO NAP SITE MAY BE DROPPED. 9.1c grades the SAMPLE of each nap that exists; it cannot see a
+# nap that was deleted outright, which is how the disk-held arm loses `prev_wait` entirely.
+_nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
+ck "all THREE nap sites still call stg_nap_mark (fork-starved + disk-held + end of body; got ${_nap_n})" \
+   "$(if [ "${_nap_n:-0}" -ge 3 ]; then echo 0; else echo 1; fi)"
+
+# 9.1e `stg_field` FOLDS BEFORE IT EMITS — driven, not grepped.
+# The post-`done` fold is not the last word: an overlay interval that closes at TOP level afterwards is
+# still queued, and the field must report it rather than the value from one fold ago. Deleting the fold
+# inside `stg_field` left the suite at 76/0 before this arm.
+STG_LVL_TMP="$TMP/lvlq-field"; : >"$STG_LVL_TMP"
+STG_OPEN_LVL=""; STG_OPEN_T0=0
+stg_cycle_reset
+stg_lvl_fold || :                       # the post-sweep fold: queue empty
+stg_lvl_start l2_merge || :              # a TOP-LEVEL interval closing after that fold
+sleep 1.1
+stg_lvl_settle || :
+_queued_before="${STG_V_l2_merge:-0}"
+stg_field _qfield                        # NO explicit fold — stg_field must do it
+_qv="$(cycle_stage_get "stages=$_qfield" l2_merge 2>/dev/null || echo ABSENT)"
+ck "an overlay closed AFTER the post-sweep fold still reaches the field (queued=${_queued_before} us, l2_merge='$_qv')" \
+   "$(if [ "${_queued_before:-1}" -eq 0 ] && [ "$_qv" = "1" ]; then echo 0; else echo 1; fi)"
+STG_LVL_TMP=""
+
+# 9.1f THE CLOCK IS MONOTONIC — driven. `EPOCHREALTIME` is a WALL clock, so an ntp step or a VM resume
+# can move it BACKWARDS, and a negative interval is indistinguishable in a record from a stage that
+# never ran. The clamp is the whole protection; removing it left the suite at 76/0 before this arm.
+_mono_hi=$(( ${STG_LAST_US:-0} + 60000000 ))
+STG_LAST_US="$_mono_hi"
+_m1=0; stg_now_us_vars _m1 || _m1=-1
+ck "a BACKWARDS clock step never yields a value below the last one (last=${_mono_hi} us, got ${_m1} us)" \
+   "$(if [ "${_m1:-0}" -ge "${_mono_hi}" ]; then echo 0; else echo 1; fi)"
+_el=0; stg_now_us_vars _el || _el=-1
+_mono_hi=$(( _el + 5000000 ))
+STG_LAST_US="$_mono_hi"
+_m2=0; stg_now_us_vars _m2 || _m2=-1
+ck "  …and the clamp holds when the stored high-water mark is AHEAD of the wall clock (floor=${_mono_hi} us, got ${_m2} us)" \
+   "$(if [ "${_m2:-0}" -ge "${_mono_hi}" ]; then echo 0; else echo 1; fi)"
+STG_LAST_US=0
 
 # 9.2 `prev_wait` IS ONE GAP, NOT THE LIFETIME SUM OF EVERY NAP.
 # `stg_add` accumulates, so the pre-review `stg_nap_mark` made the field grow every cycle (measured

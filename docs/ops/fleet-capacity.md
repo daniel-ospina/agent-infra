@@ -534,12 +534,15 @@ matters when reading a line:
 |---|---|---|
 | **tiled** | `boot disk reap refresh authority claims caches sweep gate l5_issue record` | marked once per cycle, in body order — they **tile** the body, so on a FULL cycle their sum *is* the cycle's own duration |
 | **overlay** | `l2_merge l3_fix l4_review` | a merge-cascade level's **cumulative** wall time inside the sweep; a *breakdown of* `sweep`, never an addition to it (`sum(l1..l4) <= sweep`). Each level's intervals are queued in `$O/state/.stg-lvl` by the sweep's subshell and folded back into the parent after it — a shell variable written inside that pipeline would die at `done` and report a fabricated `0` |
-| **carried** | `prev_wait` | the post-record gap (async backlog spawn + the `CYC` nap), read one cycle later — the record is written *before* the nap, and must be, or a HUNG cycle would look fresh for its whole duration. It is **one gap, overwritten each cycle, never a running total** |
+| **carried** | `prev_wait` | the post-record gap — the `CYC` nap — read one cycle later: the record is written *before* the nap, and must be, or a HUNG cycle would look fresh for its whole duration. It is **one gap, overwritten each cycle, never a running total** (that defect was measured as `1`, `2`, `3` over three 1 s naps, and would reach ~2400 by cycle 10 on a `CYC=240` box). The async backlog spawn is *launched* inside this window but is **not** part of it: the post-nap stamp is taken after the launch, so the spawn's runtime overlaps the nap instead of adding to it |
 
 `l5_issue` is a tiled stage because issue launch is contiguous; `l1_main` (the cascade's *fix main if
 red*) is registered and reads **`ns`** until that level exists — `ns` ("registered, never sampled") is a
 different reading from `0` ("measured, cost nothing"), deliberately, so an unimplemented level can
-never read as a measured zero-cost one. `l4_review` is the review-**dispatch** arm's own body time: the
+never read as a measured zero-cost one. ⛔ **AND ON A TILED STAGE, `0` MUST BE READ AS "sampled,
+under one second"** — values are whole seconds, so the genuinely sub-second stages (`boot`, `disk`,
+`reap`, `authority`, `claims`, `caches`) read `0` on a perfectly healthy cycle. `ns` is the only
+token that means "nothing sampled this stage"; `0` always means the sampler ran. `l4_review` is the review-**dispatch** arm's own body time: the
 controller spawns the reviewer and moves on, so it is small by design and is not the reviewer's runtime.
 
 ⛔ **THE TILING INVARIANT IS A FULL-CYCLE PROPERTY, NOT A UNIVERSAL ONE, AND IT IS TRUE ONLY WITHIN A

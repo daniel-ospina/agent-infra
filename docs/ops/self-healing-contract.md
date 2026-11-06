@@ -184,8 +184,9 @@ DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (never a pass)** (`cycle-record.sh`
 **Where the cycle's TIME went** is the sibling question, and it is answered by the same line's
 `stages=` field (`bash cycle-record.sh stages --dir $O`): the **tiled** stages tile the body so on a
 FULL cycle their sum is the cycle's own duration, `l2_merge`/`l3_fix`/`l4_review` are cascade-level
-overlays *inside* `sweep`, `prev_wait` is the carried post-record gap (async backlog spawn + the nap,
-**one gap overwritten each cycle, not a running total**), and `ns` means registered-but-never-sampled
+overlays *inside* `sweep`, `prev_wait` is the carried post-record gap — the `CYC` nap, **one gap
+overwritten each cycle, not a running total** (the async backlog spawn is launched inside that window,
+but the post-nap stamp is taken after the launch, so its runtime overlaps the nap rather than adding), and `ns` means registered-but-never-sampled
 (distinct from a measured `0`). ⛔ A cycle that exits early — the disk-held and fork-starved arms
 `continue` before the end of the body — leaves the stages it never reached reading `ns`, so its tiled
 sum is legitimately SHORT of `end - start`; check for `ns` before reading a shortfall as a broken

@@ -834,8 +834,15 @@ if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; e
 # where a single `$( )` kills the controller (a failed fork TERMINATES bash; agent-infra#2293). So:
 # no command substitution, no `date`, no `tr`. Only parameter expansion, `[`, `printf -v` and integer
 # arithmetic. `stg_now_us_vars` is the writer and `stg_now_us` the printer, deliberately in the
-# `cr_san_vars`/`cr_san` and `cap_h_for_vars`/`cap_h_for` shape this repo already uses for exactly
-# this reason.
+# `cr_san_vars`/`cr_san` shape this repo already uses for exactly this reason (as does the capacity
+# module's headroom helper pair).
+# ⛔ NO NEW `cap_*`-SHAPED TOKEN MAY APPEAR ANYWHERE IN THIS FILE, COMMENTS INCLUDED.
+# `capacity-placement.test.sh` §9 derives its wiring requirement with `grep -o 'cap_[a-z_]*'` over the
+# WHOLE of orch-loop.sh and then demands every `cap_*` the module DEFINES appear in the `declare -f`
+# gate list — so prose that names a capacity function the controller does not call reddens that suite.
+# Measured: this comment previously spelled the headroom printer out in full (the `…_vars` helper's
+# bare printer name) and failed §9 with `missing: <that name>` — green at the base commit, red here.
+# Name such a helper indirectly, and do NOT write the offending token here either.
 #
 # ⛔ MONOTONIC BY CONSTRUCTION. `EPOCHREALTIME` is a WALL clock: an ntp step or a VM resume can move
 # it BACKWARDS, and a negative interval is indistinguishable in a record from a stage that never ran.
