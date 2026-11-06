@@ -279,7 +279,7 @@ export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
 # `$CELL_HOME` (the same defect `ATOMIC_LAND_REGISTRY_SYNC` exists to prevent in tests/atomic-land).
 # The cases that DO exercise the registry set it back to a fixture script and a fixture store.
 export DOCTOR_REGISTRY_SYNC=off
-# The SAME hermetic-by-default rule for the repo-identity walk (agent-infra#2148): its shipped roots are
+# The SAME hermetic-by-default rule for the repo-identity walk (agent-infra#3521): its shipped roots are
 # the cell's one home, `/tmp/cell-ai` and `/tmp/cell-home`, and a suite that let those stand would grade
 # THE MACHINE THAT RUNS IT (on a cell, `/tmp/cell-ai` really is a checkout — and a mislabelled one would
 # redden every doctor arm here for a reason no arm names). Cases that exercise the walk point it at their
@@ -1591,7 +1591,7 @@ rm -f "$T/tmux/ls_rc" "$T/tmux/ls_msg"
   && ok "doctor: not-started + unreadable reap -> the record is rc=3 (not a clean 'not started')" \
   || bad "doctor: not-started recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state") (want 3)"
 
-say_case "doctor: a directory on this box that LIES about its repo is reported and fails the pass (#2148)"
+say_case "doctor: a directory on this box that LIES about its repo is reported and fails the pass (#3521)"
 # The bring-up REFUSES a mislabelled checkout at provisioning time; this is the same verdict on a running
 # box, because the measured failure was SILENCE: `/home/cmux/agent-infra` was a tortoise checkout and every
 # lane told to `cd` there worked the wrong repository with no error. A doctor that ran the reap, restarted
@@ -1631,7 +1631,7 @@ result_has "[identity] ⛔ FATAL" \
 [ "$RC" -ne 1 ] && ok "doctor: and the pass rc stays off 1 (rc=$RC)" \
   || bad "doctor: a clean box still exited 1"
 
-say_case "doctor: a cannot-verify identity is NOT folded to a clean rc by the POLICY-INERT reap (#2148)"
+say_case "doctor: a cannot-verify identity is NOT folded to a clean rc by the POLICY-INERT reap (#3521)"
 # ⛔ THE FOLD ORDER IS THE BUG THIS PINS. `rrc=4` (policy-inert — "the pass completed and judged nothing",
 # the STEADY STATE of a Linux cell's reaper) collapses to 0 so it cannot mask a supervision result. Folding
 # the identity verdict in BEFORE that collapse meant `[ irc -eq 3 ] && [ rrc -eq 0 ]` never fired, the 4

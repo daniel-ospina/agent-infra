@@ -134,7 +134,7 @@ SWAP_SWAPPINESS="${SWAP_SWAPPINESS:-30}"
 # (the suite's seam); `false` is how a case reproduces a cell that cannot escalate.
 SWAP_SUDO="${SWAP_SUDO-sudo -n}"
 
-# ── the SHARED slug parser + repo-identity walker (agent-infra#2148) ─────────────────────────────
+# ── the SHARED slug parser + repo-identity walker (agent-infra#3521) ─────────────────────────────
 # ⛔ SOURCED FROM THE CHECKOUT THIS SCRIPT LIVES IN, and only as a fallback from the deployed harness
 # the cell will actually execute. `repo-slug.sh` is the one place that turns a checkout into
 # `owner/name`; the identity check below compares a directory's NAME against that answer, so using a
@@ -689,7 +689,7 @@ check_gh() {
     && ok "push permission: true" || die "no push permission on $REPO_SLUG — lanes cannot open PRs"
 }
 
-# ── repo identity: a directory must not lie about which repo it is (agent-infra#2148) ──────────
+# ── repo identity: a directory must not lie about which repo it is (agent-infra#3521) ──────────
 # MEASURED 2026-11-05 on cell-2: `/home/cmux/agent-infra` was a checkout of `daniel-ospina/tortoise`.
 # Nothing errored. `pull/3456/head` would not resolve, its `main` reported commits no other box had, and
 # every lane told `cd /home/cmux/agent-infra` was doing tortoise work — silently. A dead box is visible;
@@ -716,9 +716,9 @@ check_repo_identity() {
     # whose parser is missing would be a false block. The statement is that the identity is UNVERIFIED —
     # never that it is fine.
     if [ -n "$REPO_SLUG_LIB_STALE" ]; then
-      warn "repo identity UNVERIFIED: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check — it carries no repo_identity_scan, so it is the harness the LAST release deployed and nothing here can compare a checkout's name to its origin. An unanswered identity is not a pass (agent-infra#2148). Deploying the current harness ('cloud-cell-supervisor.sh apply', or bringing up from a full checkout) makes this checkable"
+      warn "repo identity UNVERIFIED: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check — it carries no repo_identity_scan, so it is the harness the LAST release deployed and nothing here can compare a checkout's name to its origin. An unanswered identity is not a pass (agent-infra#3521). Deploying the current harness ('cloud-cell-supervisor.sh apply', or bringing up from a full checkout) makes this checkable"
     else
-      warn "repo identity UNVERIFIED: repo-slug.sh was not found in this bring-up's checkout (${BRINGUP_HERE:-<unresolved>}/orchestrator-harness/) nor in the deployed harness (${CELL_HOME:-${HOME:-}}/orchestrator/), so no checkout's name could be checked against its origin — an unanswered identity is not a pass (agent-infra#2148)"
+      warn "repo identity UNVERIFIED: repo-slug.sh was not found in this bring-up's checkout (${BRINGUP_HERE:-<unresolved>}/orchestrator-harness/) nor in the deployed harness (${CELL_HOME:-${HOME:-}}/orchestrator/), so no checkout's name could be checked against its origin — an unanswered identity is not a pass (agent-infra#3521)"
     fi
     return 0
   fi
@@ -739,7 +739,7 @@ check_repo_identity() {
   # ⛔ FAIL-CLOSED ON A VERDICT THIS CODE CANNOT READ (the walker returned non-zero but printed no
   # `fatal` line). Continuing here would be the silent pass the whole check exists to remove.
   if [ "$rc" -ne 0 ] && [ "$seen_fatal" -eq 0 ]; then
-    die "CHECK FAILED [repo identity]: the identity walker returned rc=$rc without naming a directory — cannot say whether any checkout on this box lies about its repo, and cannot-verify is never a pass (agent-infra#2148)"
+    die "CHECK FAILED [repo identity]: the identity walker returned rc=$rc without naming a directory — cannot say whether any checkout on this box lies about its repo, and cannot-verify is never a pass (agent-infra#3521)"
   fi
   # The banner may now say what was actually measured — fully, partially, or not at all.
   if [ "$seen_unverified" -eq 1 ]; then

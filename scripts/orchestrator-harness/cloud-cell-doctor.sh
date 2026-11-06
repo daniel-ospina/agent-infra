@@ -31,7 +31,7 @@
 #
 # ROLES (each idempotent; each writes its own last-pass record under `$O/state/roles/`)
 #   reap      one wedged-session pass (the safety core; see REAP below)
-#   doctor    reap + REPO IDENTITY (does any checkout on this box lie about which repo it is? #2148 —
+#   doctor    reap + REPO IDENTITY (does any checkout on this box lie about which repo it is? #3521 —
 #             the same verdict the bring-up refuses on, so a box that drifts afterwards is not silent)
 #             + controller supervision (restart the dispatcher when its session is gone)
 #   merge     land PRs that have a clean attestation at head, through the standard rail
@@ -83,7 +83,7 @@ fi
 # it exists would be a bare "command not found" on the operator's terminal. The degraded state is
 # named at the REFUSAL instead (see the merge role), which is the moment it costs something.
 
-# ── the SHARED slug parser + repo-identity walker (agent-infra#2148) ────────────────────────────
+# ── the SHARED slug parser + repo-identity walker (agent-infra#3521) ────────────────────────────
 # A cell can carry MORE THAN ONE checkout of a repo, and a checkout whose DIRECTORY NAME names a
 # different repo than its `origin` (measured 2026-11-05: `/home/cmux/agent-infra` was a tortoise
 # checkout, and every lane told to `cd` there worked the wrong repository silently). The bring-up
@@ -2527,7 +2527,7 @@ service_controller_present() {
   return 0
 }
 
-# ── REPO IDENTITY: does any directory on this box lie about which repo it is? (agent-infra#2148) ─
+# ── REPO IDENTITY: does any directory on this box lie about which repo it is? (agent-infra#3521) ─
 # The bring-up REFUSES a mislabelled checkout; this reports the same verdict on a running cell, so a
 # box that drifts after provisioning is not silent. READ-ONLY: it names, and changes nothing — moving a
 # checkout is a human decision (the measured tree held three worktrees whose commits existed nowhere
@@ -2544,9 +2544,9 @@ repo_identity_report() {
   local out v m rc=0 seen_fatal=0
   if [ -z "$REPO_SLUG_LIB" ]; then
     if [ -n "$REPO_SLUG_LIB_STALE" ]; then
-      log "[identity] CANNOT-VERIFY: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check (no repo_identity_scan in it) — it is the harness the LAST release deployed, so no checkout's name could be checked against its origin (an unanswered identity is not a pass; agent-infra#2148)"
+      log "[identity] CANNOT-VERIFY: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check (no repo_identity_scan in it) — it is the harness the LAST release deployed, so no checkout's name could be checked against its origin (an unanswered identity is not a pass; agent-infra#3521)"
     else
-      log "[identity] CANNOT-VERIFY: repo-slug.sh is not at ${O%/}/ nor beside the doctor, so no checkout's name could be checked against its origin (an unanswered identity is not a pass; agent-infra#2148)"
+      log "[identity] CANNOT-VERIFY: repo-slug.sh is not at ${O%/}/ nor beside the doctor, so no checkout's name could be checked against its origin (an unanswered identity is not a pass; agent-infra#3521)"
     fi
     return 3
   fi
@@ -2562,7 +2562,7 @@ repo_identity_report() {
   done <<< "$out"
   # FAIL-CLOSED on a non-zero rc with no readable `fatal` line: an unreadable verdict is not a pass.
   if [ "$rc" -ne 0 ] && [ "$seen_fatal" -eq 0 ]; then
-    log "[identity] CANNOT-VERIFY: the identity walker returned rc=$rc without naming a directory — whether any checkout on this box lies about its repo is unknown (agent-infra#2148)"
+    log "[identity] CANNOT-VERIFY: the identity walker returned rc=$rc without naming a directory — whether any checkout on this box lies about its repo is unknown (agent-infra#3521)"
     return 3
   fi
   [ "$seen_fatal" -eq 0 ] || return 1

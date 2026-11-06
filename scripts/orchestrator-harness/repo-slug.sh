@@ -212,7 +212,7 @@ _resolve_repo_remedy() {
 REMEDY
 }
 
-# ══ REPO IDENTITY — a directory must not lie about which repo it is (agent-infra#2148) ══════════
+# ══ REPO IDENTITY — a directory must not lie about which repo it is (agent-infra#3521) ══════════
 #
 # THE MEASURED DEFECT (2026-11-05, cell-2). `/home/cmux/agent-infra` was a checkout of
 # `daniel-ospina/tortoise`. Nothing errored: `pull/3456/head` would not resolve, its `main` reported
@@ -459,14 +459,14 @@ repo_identity_scan() {
       # pass on it either. It is not `fatal` because an unreadable origin cannot be shown to name a
       # WRONG repo, and refusing a bring-up on it would be a false block on a legitimate local mirror.
       printf '%s\t%s\n' warn \
-        "repo identity UNVERIFIED: ${_sp[$i]}$where carries a .git but no readable 'origin' remote, so whether its name ($base) names the repo it actually is cannot be answered — an unanswered identity is not a pass (agent-infra#2148)"
+        "repo identity UNVERIFIED: ${_sp[$i]}$where carries a .git but no readable 'origin' remote, so whether its name ($base) names the repo it actually is cannot be answered — an unanswered identity is not a pass (agent-infra#3521)"
       _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
       i=$((i + 1)); continue
     fi
     slug="$(repo_slug_from_remote "$url" 2>/dev/null)" || slug=""
     if [ -z "$slug" ]; then
       printf '%s\t%s\n' warn \
-        "repo identity UNVERIFIED: ${_sp[$i]}$where origin ($url) is not an <owner>/<name> slug this fleet accepts, so its name ($base) cannot be checked against it — a readable origin that names no GitHub repo is still not an answer (agent-infra#2148)"
+        "repo identity UNVERIFIED: ${_sp[$i]}$where origin ($url) is not an <owner>/<name> slug this fleet accepts, so its name ($base) cannot be checked against it — a readable origin that names no GitHub repo is still not an answer (agent-infra#3521)"
       _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
       i=$((i + 1)); continue
     fi
@@ -489,12 +489,12 @@ repo_identity_scan() {
       # A generic cell-checkout name on a box that declares no repo of its own: nothing was measured, so
       # this is UNVERIFIED — not a lie, and not a pass either.
       printf '%s\t%s\n' warn \
-        "repo identity UNVERIFIED: ${_sp[$i]}$where is a checkout of $slug under the generic cell-checkout name '$base' — $reason (agent-infra#2148)"
+        "repo identity UNVERIFIED: ${_sp[$i]}$where is a checkout of $slug under the generic cell-checkout name '$base' — $reason (agent-infra#3521)"
       i=$((i + 1)); continue
     fi
     if [ -n "$exp" ] && { [ "$exp" = '*' ] || [ "$(repo_identity_fold "$exp")" = "$(repo_identity_fold "$want")" ]; }; then
       printf '%s\t%s\n' warn \
-        "repo identity: ${_sp[$i]}$where is a checkout of $slug under the DECLARED exception name '$base' — $reason. Deliberate, not a defect; named so the exception stays visible, and a DIFFERENT repo at this name is still refused (agent-infra#2148)"
+        "repo identity: ${_sp[$i]}$where is a checkout of $slug under the DECLARED exception name '$base' — $reason. Deliberate, not a defect; named so the exception stays visible, and a DIFFERENT repo at this name is still refused (agent-infra#3521)"
       i=$((i + 1)); continue
     fi
     fatal=$((fatal + 1))
@@ -566,10 +566,10 @@ repo_identity_scan() {
           slug="${_slug[$i]}"
           if [ "$(printf '%s' "$hlist" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
             printf '%s\t%s\n' ok \
-              "repo identity: $slug is checked out at $n paths ($dup — all at the same head) and $resolves; several trees can be legitimate, so this is reported rather than refused (agent-infra#2148)"
+              "repo identity: $slug is checked out at $n paths ($dup — all at the same head) and $resolves; several trees can be legitimate, so this is reported rather than refused (agent-infra#3521)"
           else
             printf '%s\t%s\n' warn \
-              "repo identity: $slug is checked out at $n paths at DIFFERENT heads ($dup) and $resolves. A lane that cd's into the wrong one builds against a different tree, and nothing in either tree says which is canonical (measured on cell-1, four agent-infra checkouts at four heads) — not fatal, since several can be legitimate, but silence here is how the stale one gets used (agent-infra#2148)"
+              "repo identity: $slug is checked out at $n paths at DIFFERENT heads ($dup) and $resolves. A lane that cd's into the wrong one builds against a different tree, and nothing in either tree says which is canonical (measured on cell-1, four agent-infra checkouts at four heads) — not fatal, since several can be legitimate, but silence here is how the stale one gets used (agent-infra#3521)"
           fi
         fi
       fi
@@ -581,7 +581,7 @@ repo_identity_scan() {
     # An EMPTY population is not a pass: it means the walk found nothing to ask, which on a cell is
     # itself suspicious (a cell with no checkout of its own repo cannot be right).
     printf '%s\t%s\n' warn \
-      "repo identity: NO checkout was found under any of the roots checked ($*), so nothing's name was verified against its origin — an empty population is not a pass (agent-infra#2148)"
+      "repo identity: NO checkout was found under any of the roots checked ($*), so nothing's name was verified against its origin — an empty population is not a pass (agent-infra#3521)"
   fi
   [ "$fatal" -eq 0 ] || return 1
   return 0

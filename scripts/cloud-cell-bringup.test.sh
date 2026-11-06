@@ -286,7 +286,7 @@ mkdir -p "$T/home" "$T/tok" "$T/ident-empty"
 # `REPO_IDENTITY_ROOTS` (or `BR_IDENT_ROOTS`) still wins over this default.
 export REPO_IDENTITY_ROOTS="$T/ident-empty"
 
-# ── repo identity (agent-infra#2148): the fixture boxes ──────────────────────────────────────
+# ── repo identity (agent-infra#3521): the fixture boxes ──────────────────────────────────────
 # The walk is hermetic by seam: every `br` run points `REPO_IDENTITY_ROOTS` at `$T/ident-empty`
 # unless the case names a fixture population, so the SHIPPED default (the cell's one home,
 # `/tmp/cell-ai`, `/tmp/cell-home`) never grades the machine that runs this suite. The checkouts are
@@ -1539,7 +1539,7 @@ case "$SA_OUT" in
 esac
 rm -rf "$T/standalone"
 
-# ══ REPO IDENTITY (agent-infra#2148) — a directory must not lie about which repo it is ══════════
+# ══ REPO IDENTITY (agent-infra#3521) — a directory must not lie about which repo it is ══════════
 # MEASURED 2026-11-05 on cell-2: `/home/cmux/agent-infra` was a checkout of `daniel-ospina/tortoise`.
 # Nothing errored — `pull/3456/head` would not resolve, its `main` reported commits no other box had,
 # and every lane told `cd /home/cmux/agent-infra` did tortoise work, silently. The four other cells
