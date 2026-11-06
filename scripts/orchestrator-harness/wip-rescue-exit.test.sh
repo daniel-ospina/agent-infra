@@ -2513,8 +2513,8 @@ PATH="$TMP/bin-rej:$PATH" O="$O" bash -c '
 ' _ "$GATE" "$TMP/wt12" "$O/logs/rejected.log" > "$TMP/n43.out" 2>&1
 grep -qx "push=FAILED origin=$rej_old" "$TMP/n43.out"; rcn43a=$?
 ck "N43a a NON-ZERO push is VERIFIED against the remote, so FAILED carries the sha the remote reported rather than an unread absence [$(cat "$TMP/n43.out" 2>/dev/null | tr -d '\n')]" $rcn43a
-grep -q 'origin holds refs/heads/rejbase at' "$O/logs/rejected.log"; rcn43b=$?
-ck "N43b …and the log replays what the REMOTE answered (the sha it holds), which is the only thing that establishes a non-delivery" $rcn43b
+grep -q "holds refs/heads/rejbase at $rej_old" "$O/logs/rejected.log"; rcn43b=$?
+ck "N43b …and the log replays what the REMOTE answered (the repository AND the sha it holds), which is the only thing that establishes a non-delivery" $rcn43b
 # and when the VERIFY read cannot answer on a non-zero push, the verdict is neither delivery nor absence.
 # Match ONLY `ls-remote --heads` so the pre-push symref read still answers (see N43a's note).
 mkdir -p "$TMP/bin-rej2"
@@ -2533,6 +2533,123 @@ grep -qx 'push=push-unreported' "$TMP/n43b.out"; rcn43c=$?
 ck "N43c …and a non-zero push whose read ALSO cannot answer records push=push-unreported — never FAILED, which would assert an absence nobody read" $rcn43c
 case "$(cat "$TMP/n43.next" 2>/dev/null)" in MANUAL*"does NOT know"*"do NOT reap"*) rcn43d=0 ;; *) rcn43d=1 ;; esac
 ck "N43d …and next= refuses a reclaim while asserting it does NOT know what origin holds [$(cut -c1-56 "$TMP/n43.next" 2>/dev/null)]" $rcn43d
+# ⛔ N46 — A REJECTED PUSH IS NOT AN ADVANCE "INSIDE THE VERIFY WINDOW" (review of PR #3399 round 12, P2 —
+# REPRODUCED). The rc≠0 path FALLS THROUGH to the ancestry arm on purpose, so `anc_rc=0` is reachable over a
+# push that REPORTED FAILURE. That arm then wrote "a peer push or the rail advanced the ref inside the
+# verify window" unconditionally — while for a REJECTED ref the advance is precisely the cause that PRECEDES
+# the push, and the replayed `[rejected]` line sits in the same log. The verdict `pushed` is right either
+# way (the commits ARE off-box); the CAUSE was fabricated. This fixture makes the remote a DESCENDANT and
+# fails only the push, so the arm is driven with both facts at once.
+N46="$TMP/n46"
+rm -rf "$N46-origin.git" "$N46-hub" "$N46-lane" "$N46-peer"
+git init -q --bare -b main "$N46-origin.git"
+git init -q -b main "$N46-hub"
+git -C "$N46-hub" config user.name t; git -C "$N46-hub" config user.email t@t
+git -C "$N46-hub" remote add origin "$GHURL"
+git -C "$N46-hub" config url."$N46-origin.git".insteadOf "$GHURL"
+printf 'n46 seed\n' > "$N46-hub/seed.txt"
+git -C "$N46-hub" add seed.txt && git -C "$N46-hub" commit -q -m 'n46 seed' \
+  && git -C "$N46-hub" push -q origin HEAD:refs/heads/main \
+  && git -C "$N46-hub" fetch -q origin \
+  && git -C "$N46-hub" worktree add -q "$N46-lane" -b rejlane
+git -C "$N46-lane" config user.name t; git -C "$N46-lane" config user.email t@t
+printf 'the lane commit\n' > "$N46-lane/local.txt"
+git -C "$N46-lane" add local.txt && git -C "$N46-lane" commit -q -m 'the lane commit'
+n46_mine="$(git -C "$N46-lane" rev-parse HEAD 2>/dev/null)"
+# THE ADVANCE COMES FIRST, which is what makes the lane's push a rejection rather than a delivery.
+git -C "$N46-hub" worktree add -q "$N46-peer" -b peerrejlane "$n46_mine"
+git -C "$N46-peer" config user.name t; git -C "$N46-peer" config user.email t@t
+printf 'peer advance\n' > "$N46-peer/peer.txt"
+git -C "$N46-peer" add peer.txt && git -C "$N46-peer" commit -q -m 'a peer advanced the ref FIRST'
+git -C "$N46-peer" push -q origin HEAD:refs/heads/rejlane
+n46_origin="$(git -C "$N46-origin.git" rev-parse refs/heads/rejlane 2>/dev/null)"
+: > "$O/logs/n46.log"
+PATH="$TMP/bin-rej:$PATH" bash -c '
+  . "$1"
+  lane_end_push n46 "$2" "$3" rejlane 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$O/logs/n46.log" "$N46-lane" 2>/dev/null > "$TMP/n46.out"
+# ⛔ THE FIXTURE IS ASSERTED, NOT ASSUMED: the remote must really be AHEAD and is_oid must really hold.
+[ -n "$n46_mine" ] && [ "$n46_mine" != "$n46_origin" ] \
+  && git -C "$N46-origin.git" merge-base --is-ancestor "$n46_mine" "$n46_origin" 2>/dev/null; rcn46a=$?
+ck "N46a FIXTURE: origin holds a DESCENDANT of the lane's HEAD ($(printf '%s' "$n46_mine" | cut -c1-8) → $(printf '%s' "$n46_origin" | cut -c1-8)) and bin-rej fails ONLY the push — so both facts are present" $rcn46a
+grep -qx 'push=pushed' "$TMP/n46.out" && ! grep -qx 'push=FAILED' "$TMP/n46.out"; rcn46b=$?
+ck "N46b …a REJECTED push whose remote already holds a descendant still records DELIVERY (every commit of this lane IS on that ref) [$(cat "$TMP/n46.out" 2>/dev/null | tr -d '\n')]" $rcn46b
+! grep -q 'inside the verify window' "$O/logs/n46.log"; rcn46c=$?
+ck "N46c …but it does NOT claim the advance happened INSIDE THE VERIFY WINDOW — over a rejection that advance is the cause, and it predates the push" $rcn46c
+grep -q 'CLIENT REPORTED FAILURE (rc=1)' "$O/logs/n46.log" && grep -q 'BEFORE the push' "$O/logs/n46.log" \
+  && grep -q 'DELIVERED NOTHING' "$O/logs/n46.log"; rcn46d=$?
+ck "N46d …and the line states what was measured: the client failed, this terminal delivered nothing, and the commits are off-box anyway" $rcn46d
+# …and the CONVERGED case is unchanged, so N46c cannot be passing by suppressing the sentence everywhere.
+# ⛔ `unpushed` MUST BE 1 HERE: `lane_end_push` short-circuits on `unpushed <= 0` and answers `nothing`
+# before any push — the first cut of this control passed 0 and asserted a `push=pushed` that the function
+# never reaches (measured: `push=nothing`). The push itself is shimmed to exit 0 (the real one would be
+# REJECTED by the remote that is already ahead), which is exactly the state this control is about: rc=0
+# with the advance still present, where "inside the verify window" IS the measured reading.
+mkdir -p "$TMP/bin-pushok"
+{ printf '#!/bin/sh\ncase " $* " in *" push "*) exit 0 ;; esac\nexec %s "$@"\n' "$REAL_GIT"; } > "$TMP/bin-pushok/git"
+chmod +x "$TMP/bin-pushok/git"
+: > "$O/logs/n46ok.log"
+PATH="$TMP/bin-pushok:$PATH" bash -c '
+  . "$1"
+  lane_end_push n46ok "$2" "$3" rejlane 1 1
+  printf "push=%s\n" "$LANE_END_PUSH"
+' _ "$GATE" "$O/logs/n46ok.log" "$N46-lane" 2>/dev/null > "$TMP/n46ok.out"
+grep -qx 'push=pushed' "$TMP/n46ok.out" && grep -q 'inside the verify window' "$O/logs/n46ok.log"; rcn46e=$?
+ck "N46e …while a push that really exited 0 keeps the 'inside the verify window' reading (the branch is a branch, not a deletion) [$(cat "$TMP/n46ok.out" 2>/dev/null | tr -d '\n')]" $rcn46e
+# ⛔ N47 — A `pushed` REMEDY NAMES THE REPOSITORY THE VERDICT IS ABOUT (review of PR #3399 round 12, P2 —
+# REPRODUCED). Round 3 wrote that invariant for `verify-ancestry-unmeasured` and fixed ONE arm; two arms
+# kept a hardcoded `origin`, while `pushed` is granted against the PROVEN push url. With
+# `remote.origin.pushurl` diverging from `remote.origin.url`, the artifact's own prescribed command then
+# names a repository nobody read. Both arms are driven here, plus the no-divergence control.
+for _n47 in unpushed-only archived; do
+  case "$_n47" in
+    unpushed-only) _n47args='LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing' ;;
+    archived)      _n47args='LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_REF=refs/wip-local/x' ;;
+  esac
+  for _n47u in /srv/push-repo.git ''; do
+    n47="$( bash -c "
+      . \"\$1\"
+      $_n47args; LANE_END_PUSH=pushed; LANE_END_PUSH_URL='$_n47u'
+      LANE_END_ORIGIN=abc1234; LANE_END_UNPUSHED=0; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+      lane_end_next" _ "$GATE" 2>/dev/null )"
+    if [ -n "$_n47u" ]; then
+      case "$n47" in *"$_n47u"*'abc1234'*) rcn47=0 ;; *) rcn47=1 ;; esac
+      case "$n47" in *'origin'*) rcn47b=1 ;; *) rcn47b=0 ;; esac
+      ck "N47 [$_n47] the remedy names the PROVEN push url ($_n47u), never a hardcoded origin [${n47:0:64}]" $([ "$rcn47" -eq 0 ] && [ "$rcn47b" -eq 0 ] && echo 0 || echo 1)
+    else
+      case "$n47" in *'origin'*'abc1234'*) rcn47c=0 ;; *) rcn47c=1 ;; esac
+      ck "N47 [$_n47] …and with NO divergence it still names origin (the arm is a fence, not a blanket rewrite) [${n47:0:64}]" $rcn47c
+    fi
+  done
+done
+# ⛔ N48 — AN OFF-BOX ABSENCE IS NOT MEASURABLE FROM A LOCAL CACHE IN THE `unpushed>0` DIRECTION EITHER
+# (review of PR #3399 round 12, P2 — REPRODUCED). `unpushed>0` is `rev-list --count HEAD --not --remotes`
+# over `refs/remotes/*` — a CACHE. The `nothing` arm was scoped to it; this group still asserted "exist
+# only on this disk", an off-box claim, reachable-and-false when a peer on a reused branch name pushed and
+# this worktree never fetched.
+for _n48p in UNAVAILABLE detached refused-unknown-default refused-pushurl-divergent refused-pushurl-unresolved; do
+  n48="$( bash -c '
+    . "$1"
+    LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH="$2"
+    LANE_END_UNPUSHED=2; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+    lane_end_next' _ "$GATE" "$_n48p" 2>/dev/null )"
+  case "$n48" in
+    *'exist only on this disk'*) rcn48=1 ;;
+    MANUAL*'LOCAL refs/remotes/*'*'CACHE'*'NOT a claim about what any remote holds'*) rcn48=0 ;;
+    *) rcn48=1 ;;
+  esac
+  ck "N48 [$_n48p] the abstention is scoped to the LOCAL refs/remotes/* cache and explicitly NOT a claim about any remote — never 'exist only on this disk' [${n48:0:60}]" $rcn48
+done
+n48b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=unpushed-only; LANE_END_RESCUE=nothing; LANE_END_PUSH=UNAVAILABLE
+  LANE_END_UNPUSHED=2; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n48b" in MANUAL*'do NOT reap'*'discarded'*) rcn48b=0 ;; *) rcn48b=1 ;; esac
+ck "N48b …and it still REFUSES the reclaim and still names the volume hazard (fail-closed, and not a blanket abstention)" $rcn48b
+case "$n48b" in *'unpushed=2'*) rcn48c=0 ;; *) rcn48c=1 ;; esac
+ck "N48c …and carries the count it read, so the reader can see what the scoped sentence is about" $rcn48c
 echo
 
 # ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).
