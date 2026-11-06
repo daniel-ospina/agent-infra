@@ -262,6 +262,34 @@ function extraSet(names, allowed) {
 // `if: github.event_name != 'issue_comment'` appears on BOTH `pipeline-compliance` and
 // `workflow-drift`, so a text-wide match would have reported the required job guarded while its own
 // guard was gone. Scoping by job is what makes the guard assertion non-vacuous.
+// jobsBounds(lines) — [start, end) of the single top-level `jobs:` block.
+//
+// ⛔ A 2-SPACE KEY IS NOT NECESSARILY A JOB. `permissions:` declares its children at two spaces too
+// (`  contents: read`), so scanning the whole file for "a key at indent 2" read `contents`, `issues`
+// and `pull-requests` as jobs — harmless while the check only compared names, but a refusal keyed on a
+// job HEADER's shape fired on `contents: read` and red the live workflow (measured). Job headers are the
+// indent-2 keys INSIDE `jobs:`, and nothing else.
+function jobsBounds(lines) {
+  let start = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = KEY_RE.exec(lines[i]);
+    if (m && m[1].length === 0 && (m[2] ?? m[3] ?? m[4]) === "jobs") {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const m = KEY_RE.exec(lines[i]);
+    if (m && m[1].length === 0) {
+      end = i;
+      break;
+    }
+  }
+  return { start, end };
+}
+
 function jobBlock(text, name) {
   const lines = String(text ?? "").split("\n");
   // ⛔ THE START IS FOUND BY THE SAME RULE AS THE TERMINATOR: the indent SHAPE, then the key NAME read
@@ -274,6 +302,8 @@ function jobBlock(text, name) {
   // the LAST one — with `if: true`, or with no `if:` at all. Measured: rc=0 over an effective `if` of
   // `True`. KEY_RE is the one key reader this file already uses; it tolerates quotes, whitespace
   // before the colon, and any value shape.
+  const bounds = jobsBounds(lines);
+  const inJobs = (i) => bounds !== null && i > bounds.start && i < bounds.end;
   const nameOfJobHeader = (line) => {
     const m = KEY_RE.exec(line);
     if (!m || m[1].length !== 2) return null; // job headers sit at 2 spaces, one level under `jobs:`
@@ -285,6 +315,7 @@ function jobBlock(text, name) {
   // `True` — invisible. Anything at a job header's own indent that is not a key we can read means the
   // job set is not fully understood, and a partially-read job set must not answer "green".
   lines.forEach((l, i) => {
+    if (!inJobs(i)) return; // outside `jobs:` a 2-space key is some other block's child
     if (nameOfJobHeader(l) !== null) return;
     const m = KEY_RE.exec(l);
     if (m && m[1].length === 2) return; // a readable sibling key: fine
@@ -307,7 +338,7 @@ function jobBlock(text, name) {
   });
   const starts = lines
     .map((l, i) => ({ l, i }))
-    .filter(({ l }) => nameOfJobHeader(l) === name)
+    .filter(({ l, i }) => inJobs(i) && nameOfJobHeader(l) === name)
     .map(({ i }) => i);
   // ⛔ A DUPLICATE JOB ID IS LAST-WINS in YAML, and a first-match reader answers about the WRONG job.
   // Measured: a second `  pipeline-compliance:` appended with no `if:` at all leaves the effective
@@ -327,8 +358,8 @@ function jobBlock(text, name) {
   // about has to say so (rc 2), because reporting it as a guard FINDING sends the reader after a
   // fault that does not exist.
   if (start < 0) refuse(`${PC_FILE}: no \`${name}\` job found under \`jobs:\` — cannot verify its \`if:\``);
-  let end = lines.length;
-  for (let i = start + 1; i < lines.length; i++) {
+  let end = bounds ? Math.min(lines.length, bounds.end) : lines.length;
+  for (let i = start + 1; i < end; i++) {
     // ⛔ ANY 2-space-indent YAML key ends the job — matched by INDENT, not by header SHAPE. An
     // enumerated-shape terminator (`bare`, `# comment`, `"quoted"`) is a list of the spellings someone
     // thought of, and every spelling it omits lets the block over-extend into a LATER job, where that
@@ -624,8 +655,12 @@ function yamlScalar(raw) {
 
 function requiredContextJobId(text, contextName = "pipeline-compliance") {
   const lines = String(text ?? "").split("\n");
+  const bounds = jobsBounds(lines);
+  if (bounds === null) {
+    refuse(`${PC_FILE}: no top-level \`jobs:\` key — the required context's job is UNVERIFIED.`);
+  }
   const ids = [];
-  for (let i = 0; i < lines.length; i += 1) {
+  for (let i = bounds.start + 1; i < bounds.end; i += 1) {
     const m = KEY_RE.exec(lines[i]);
     if (!m || m[1].length !== 2) continue;
     const id = (m[2] ?? m[3] ?? m[4] ?? "").trim();
@@ -638,13 +673,41 @@ function requiredContextJobId(text, contextName = "pipeline-compliance") {
     // matched at a key indent, and the job was counted as minting its id — a real second minter went
     // invisible (measured rc=0 with pyyaml showing two). The first deeper non-blank, non-comment line
     // decides which shape this is.
-    let flowSource = /^\s*\{/.test(m[5] ?? "") ? { value: m[5], at: i } : null;
+    // ⛔ A HEADER VALUE THE READER CANNOT CLASSIFY IS REFUSED — never silently treated as an empty block
+    // mapping. `^\s*\{` recognises a flow mapping only when the brace LEADS, so `shadow: &a {name:
+    // pipeline-compliance, if: true}`, `shadow: !!map {…}` and an ALIAS value (`shadow: *shared`) all fell
+    // through to the block path, where no `name:` key line exists — `ctx` stayed the job id, the shadow
+    // was counted as a NON-minter, and a real second minter with `if: true` went invisible (measured:
+    // gate ok/rc=0 with pyyaml showing two jobs named `pipeline-compliance`, on a workflow that admits
+    // `issue_comment`). Three outcomes only: an EMPTY value is a block mapping, a value leading with `{`
+    // is a flow mapping (read to its close), and ANYTHING ELSE — anchor, tag, alias, or a shape not
+    // considered here — is refused, because this reader cannot say whether that job declares a `name:`.
+    const headerValue = (m[5] ?? "").replace(/\s+#.*$/, "").trim();
+    let flowSource = null;
+    if (headerValue.startsWith("{")) {
+      flowSource = { value: m[5], at: i };
+    } else if (headerValue !== "") {
+      refuse(
+        `line ${i + 1}: the \`${id}\` job header carries ${JSON.stringify(
+          headerValue
+        )}, which this reader cannot classify (an anchor, tag, alias or other shape). Whether that job declares a \`name:\` is UNVERIFIED, so the set of jobs minting the required context is too.`
+      );
+    }
     if (!flowSource) {
       for (let j = i + 1; j < lines.length; j += 1) {
         const raw = lines[j];
         if (raw.trim() === "" || /^\s*#/.test(raw)) continue;
         if (raw.length - raw.trimStart().length <= 2) break; // next job / top-level key
+        // The body's FIRST line decides the shape too: a flow mapping may open here, and an anchor /
+        // alias / tag here is equally unclassifiable.
         if (/^\s*\{/.test(raw)) flowSource = { value: raw, at: j };
+        else if (/^\s*[&*!]/.test(raw)) {
+          refuse(
+            `line ${j + 1}: the \`${id}\` job body opens with ${JSON.stringify(
+              raw.trim()
+            )}, which this reader cannot classify (an anchor, tag or alias). Whether that job declares a \`name:\` is UNVERIFIED.`
+          );
+        }
         break;
       }
     }
@@ -660,7 +723,10 @@ function requiredContextJobId(text, contextName = "pipeline-compliance") {
       // instead of rc=1 with the blanket rule. The header text is all a line reader has, so if the
       // CONTEXT NAME does not appear in it, no `name:` inside can equal the context and the job cannot
       // mint it; if it does appear, the reader genuinely cannot tell and refuses.
-      if (!flow.complete || flow.text.includes(contextName)) {
+      // ⛔ AND AN ALIAS OR ANCHOR INSIDE THE MAPPING IS UNREADABLE TOO: `{name: *ctx, if: true}` mints
+      // whatever `*ctx` was bound to, and a line reader cannot resolve it. Refusing `*`/`&`/`!` in the
+      // flow text keeps this the same rule as everywhere else — what cannot be resolved is not green.
+      if (!flow.complete || flow.text.includes(contextName) || /[*&!]/.test(flow.text)) {
         refuse(
           `line ${flowSource.at + 1}: the \`${id}\` job${
             flow.complete ? ` carrying ${JSON.stringify(contextName)}` : " this reader cannot read to its close"

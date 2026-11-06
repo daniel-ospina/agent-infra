@@ -854,6 +854,24 @@ if apply_mutation "$PC" "$PC_SHADOW_FLOW_MULTI" \
   run_check 2 "a FLOW MAPPING continued over lines still COUNTS its minter" PC_FILE="$PC_SHADOW_FLOW_MULTI"
 fi
 
+# ⛔ AND A HEADER VALUE THAT DOES NOT *LEAD* WITH `{` IS STILL A FLOW MAPPING — or not a shape this
+#    reader can read at all, which is the same answer. `^\s*\{` caught only a leading brace, so
+#    `shadow: &a {name: pipeline-compliance, if: true}`, `shadow: !!map {…}` and an ALIAS value fell to
+#    the BLOCK path, where no `name:` key line exists — the job was counted as minting its own id, a real
+#    second minter with `if: true` went invisible, and the gate read ok/rc=0 on a workflow that admits
+#    `issue_comment` (measured; pyyaml shows two jobs named `pipeline-compliance`). Only two header values
+#    are classified: empty (a block mapping) and a value leading with `{` (a flow mapping, read to its
+#    close). Anything else is refused.
+PC_SHADOW_ANCHOR="$TMP/pc-shadow-anchor.yml"
+if apply_mutation "$PC" "$PC_SHADOW_ANCHOR" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow: &a {name: pipeline-compliance, if: true}' \
+  "an anchor-prefixed flow mapping shadow must be constructible"; then
+  run_check 2 "a flow mapping behind an ANCHOR (\`&a {…}\`) still COUNTS its minter" PC_FILE="$PC_SHADOW_ANCHOR"
+fi
+
 PC_SHADOW_FLOW_NEXT="$TMP/pc-shadow-flow-next.yml"
 if apply_mutation "$PC" "$PC_SHADOW_FLOW_NEXT" \
   '          echo "✅ no symlinks under .github/workflows"' \
