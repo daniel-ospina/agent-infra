@@ -2580,9 +2580,17 @@ else
 # recording it as a `;;#` comment ON the `severity` line left `_narms=5` and the whole suite GREEN
 # (measured). `;` `(` `)` `|` `&` `<` `>` therefore end the line too. `{` `}` `/` `:` `%` do NOT — they
 # legitimately precede `#` in `${x#y}`, `${#a[@]}`, `${a##*/}`.
-# RESIDUALS, stated rather than hidden: a heredoc body line beginning with `#` is still dropped (already
-# true of the full-line strip; no pinned literal lives in one), and a `#` inside a `\`-continued string
-# keeps the rest of the line.
+# RESIDUALS, MEASURED AGAINST REAL BASH rather than asserted (review P3, cycle 28 — the first version of
+# this paragraph was BACKWARDS on the continuation case and silent on two others). All three cut CODE,
+# not a comment, and all three fail CLOSED for this pin: a truncation that hit `_head_rank="…"` drops a
+# match and reds `_narms`, it can never silently green it. `bash -n` on the stripped writer is clean and
+# none of the 69 cut lines has an unbalanced quote in the kept prefix.
+#   • a `#` heading a `\`-continued word (`foo=\` + newline + `#bar`) — bash keeps `#bar` as one word;
+#     this strips it, because the quote state resets per line;
+#   • `$'it\'s #data'` — the `\'` closes the quote state early, so the rest of the assignment is cut;
+#   • an unquoted `)#` after a command substitution (`echo $(echo hi)#there`) — bash keeps `#there`;
+#     this cuts it, because `)` is a boundary here (it IS one after a subshell `( … )`).
+#   • and a heredoc body line beginning with `#` is dropped (already true of the full-line strip).
 # ⛔ THE STRIPPER IS A FUNCTION, so the checks below grade THE MECHANISM ITSELF rather than trusting it
 # (review P2, cycle 27: the first version was only ever tested against a ` #` spelling, and every other
 # shell comment spelling stayed green).
@@ -2605,18 +2613,47 @@ awk '
 }'
 }
 _WCODE="$(_strip_comments < "$REFRESH")"
-# ⛔ ONE PROBE PER SHELL COMMENT SPELLING, because the mechanism — not just its ` #` form — is what the
-# pin trusts. `;)` `|` `&` end a comment in every shell; `#` inside quotes and `${#a[@]}` are DATA.
-_strip_probe="$(printf '%s\n' 'A=1;# stale' 'B=2)# stale' 'C=3|# stale' 'D=4&&# stale' \
-  'E="head #5 is data"  # stale' 'G="${OR##*/}"' 'H=${#arr[@]}' | _strip_comments)"
+# ⛔ ONE PROBE PER SPELLING IN THE BOUNDARY SET (review P3, cycle 28): the first probe set skipped
+# TAB, `(`, `<` and `>`, so narrowing the set kept the sentence green while the sentence said "EVERY
+# spelling" (measured: dropping `&` reddened, dropping TAB or `<`/`>` did not). `)` is probed on a
+# SUBSHELL close, the form where it really is a boundary — `B=2)# stale` is a syntax error, not a
+# shell spelling, and `echo $(echo hi)#there` keeps the `#` as data (a disclosed residual above).
+_strip_probe="$(printf '%s\n' 'A=1;# stale' '(echo hi)# stale' 'C=3|# stale' 'D=4&&# stale' \
+  'E=5(# stale' 'F=6<# stale' 'I=7># stale' $'J=8\t# stale' \
+  'K="head #5 is data"  # stale' 'L="${OR##*/}"' 'M=${#arr[@]}' | _strip_comments)"
 _strip_bad=""
-for _want in 'A=1;' 'B=2)' 'C=3|' 'D=4&&' 'E="head #5 is data"  ' 'G="${OR##*/}"' 'H=${#arr[@]}'; do
+for _want in 'A=1;' '(echo hi)' 'C=3|' 'D=4&&' 'E=5(' 'F=6<' 'I=7>' $'J=8\t' \
+              'K="head #5 is data"  ' 'L="${OR##*/}"' 'M=${#arr[@]}'; do
   grep -qxF -- "$_want" <<<"$_strip_probe" || _strip_bad="$_strip_bad[$_want]"
 done
 if [ -z "$_strip_bad" ]; then
-  ok "pin/writer: the comment stripper cuts every shell comment spelling and keeps \`#\` inside quotes and \`\${#arr[@]}\`"
+  ok "pin/writer: the comment stripper cuts all 8 boundary spellings and keeps \`#\` inside quotes and \`\${#arr[@]}\`"
 else
   bad "pin/writer: the comment stripper missed $_strip_bad — a stale sentence written in that spelling stays in the graded view"
+fi
+# ⛔ AND THE VIEW IS THE STRIPPED ONE (review P2, cycle 28 — CATEGORY A, a bypass): the probes above grade
+# the FUNCTION, and nothing graded that the predicates CONSUME its output. Replacing the assignment with
+# `_WCODE="$(cat "$REFRESH")"` left the whole suite 291/0 GREEN, because the writer's current bytes hold
+# no stale comment for the strip to remove — so the one defence that makes findings like cycle 25's
+# impossible could be deleted in a single line with no signal. Two assertions wire it:
+#   (a) the stripped view is strictly SHORTER than the file (the writer is comment-dense);
+#   (b) a FABRICATED writer whose only `_head_rank=` arm hides behind a `;;#` yields ZERO arms through
+#       the same pipeline — a shape the real writer has no instance of today, so it cannot be satisfied
+#       by today's bytes.
+_raw_lines="$(grep -c . "$REFRESH" || true)"
+_view_lines="$(grep -c . <<<"$_WCODE" || true)"
+if [ "${_view_lines:-0}" -lt "${_raw_lines:-0}" ]; then
+  ok "pin/writer: the graded view is the STRIPPED one ($_view_lines lines vs $_raw_lines) — comments are not reaching the predicates"
+else
+  bad "pin/writer: the graded view has $_view_lines lines and the file $_raw_lines — the strip is NOT wired (\`_WCODE\` is the raw file), so every predicate below grades comments, not code"
+fi
+_synth_writer="$(printf '%s\n' 'severity) _head_rank="the ranked one" ;;# was: unranked) _head_rank="the hidden one" ;;' \
+  'empty) _head_rank="the empty one" ;;')"
+_synth_arms="$(_strip_comments <<<"$_synth_writer" | grep -c '_head_rank="' || true)"
+if [ "${_synth_arms:-x}" = "2" ]; then
+  ok "pin/writer: an arm hidden behind a \`;;#\` is NOT an arm — the pipeline yields 2 of the 3 texts"
+else
+  bad "pin/writer: the pipeline yielded ${_synth_arms:-<unreadable>} arm(s) from a fixture whose third one is behind a comment (want 2) — a stale arm would satisfy the count"
 fi
 
 _why_ok="$(grep -o 'pass completed; queue depth [^"]*' <<<"$_WCODE" | head -1)"

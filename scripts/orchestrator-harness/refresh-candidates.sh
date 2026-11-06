@@ -3838,9 +3838,15 @@ ledger_all_live() {
 # discard a CLEAN-judged candidate — and the unranked count is printed, so an unranked population can
 # never read as a ranked one.
 # ⛔ AND A QUEUE IT CANNOT RANK IS NOT A QUEUE "IN AGE ORDER". When the pool ranks NOTHING, this does
-# NOT leave arrival order standing as if it were a decision: it says `priority-unreadable` and refuses
-# to let the order be read as severity. That silent degradation — a ladder that returns "no priority"
-# for everything and reads exactly like a healthy FIFO — is what produced the measured beat.
+# NOT leave arrival order standing as if it were a decision: it says `unranked` and refuses to let the
+# order be read as severity. That silent degradation — a ladder that returns "no priority" for
+# everything and reads exactly like a healthy FIFO — is what produced the measured beat.
+# ⛔ TWO DIFFERENT WORDS, AND THE OTHER ONE IS NOT THIS STATE (review P3, cycle 28). `unranked` means
+# the reorder RAN and ranked nothing; `priority-unreadable` means it did NOT RUN (unreadable or absent
+# `.pool`, failed install). This header said `priority-unreadable` for the ranks-nothing case, which is
+# the same conflation `81f9b3402` removed and that ARCHITECTURE.md in this same tree spends a paragraph
+# forbidding — and it sat in the header of the very function that emits `unranked`. One word for both
+# sends an operator after the wrong cause.
 rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written, verified reorder
   local pool="${1:-}" queue="${2:-}" out="${3:-}" cnt="${4:-}"
   # ⛔ THE INPUTS ARE CHECKED FOR SHAPE BEFORE ANYTHING IS DERIVED FROM THEM (review P1, cycle 4).
