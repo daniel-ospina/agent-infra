@@ -1153,6 +1153,16 @@ LANE_END_UNPUSHED=0     # commits on this branch that exist only locally — and
                         # (see lane_end_push); the column still NAMES them, because a push can fail, be
                         # refused (landing branch / hub) or be impossible (detached head)
 LANE_END_ROOT=""        # the tree that was MEASURED — the only column that can expose a wrong-tree archive
+# ⛔ THE WIDTH OF THE UNPUSHED READ, DEFINED ONCE (fresh review of PR #3399, P2/N55). `LANE_END_UNPUSHED`
+# comes from `git rev-list --count HEAD --not --remotes`, an enumeration over this repository's LOCAL
+# `refs/remotes/*` CACHE. A positive count establishes "no ref in that cache reaches HEAD" and NOTHING
+# about what any remote holds — a deleted remote branch, a peer's push under another name, or a
+# `refs/pull/*` head are all invisible to it. Every operator-facing line that reports this count
+# interpolates THIS phrase, so the sentences cannot drift apart the way hand-written copies would.
+# ⛔ IT LIVES AT FILE SCOPE, NOT IN `lane_end_push`: round 16 scoped ten lines and MISSED three in the
+# `pushed` arm precisely because the phrase was a function-local, i.e. available only where its author
+# happened to be working. A shared constant is the fix for the class, not for the ten.
+LANE_END_LOCAL_SCOPE="held by NO ref in this repo's LOCAL refs/remotes/* cache (a CACHE — a deleted remote branch, and a ref some OTHER name holds, are not visible here, and this is NOT a claim about any remote)"
 LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 # ── THE DURABLE EXIT ARTIFACT (the other half of #2834 ask 1; sibling of #3391) ─────────────────
 # ⛔ WHAT THE #2834 FIX DID NOT DO, AND WHY THAT HALF COSTS A CELL ITS DISK. The exit path above
@@ -1266,16 +1276,10 @@ lane_bound_lib() {
 lane_end_push() {
   local label="$1" log="$2" root="$3" br="$4" unpushed="$5" uok="$6"
   local sym rc out lib
-  # ⛔ "ONLY ON THIS DISK" IS NOT WHAT THE COUNT MEASURES (fresh review of PR #3399, P2 — REPRODUCED).
-  # `unpushed` comes from `git rev-list --count HEAD --not --remotes`, an enumeration over this
-  # repository's LOCAL `refs/remotes/*` cache. A positive count establishes that no ref in that CACHE
-  # reaches HEAD; it does NOT establish that no remote holds the commit — a deleted remote branch, a
-  # peer's push under another name, or a `refs/pull/*` head are all invisible to it. TEN `[lane-exit]`
-  # lines stated the cache reading as an off-box absence ("exist ONLY on this disk", "are local-only"),
-  # which is the same defect this PR scopes in `lane_end_next` and in the `[wip]` NOTEs: those readers
-  # were counted, and this one was not. Defined ONCE and interpolated, so the ten lines cannot drift
-  # apart the way ten copies of one sentence would.
-  local loscope="held by NO ref in this repo's LOCAL refs/remotes/* cache (a CACHE — a deleted remote branch, and a ref some OTHER name holds, are not visible here, and this is NOT a claim about any remote)"
+  # ⛔ "ONLY ON THIS DISK" IS NOT WHAT THE COUNT MEASURES — see LANE_END_LOCAL_SCOPE at the top of this
+  # block. Bound to a shorter local name only because these lines read as prose; the VALUE is the shared
+  # constant, never a copy.
+  local loscope="$LANE_END_LOCAL_SCOPE"
   LANE_END_PUSH=""; LANE_END_ORIGIN=""
   if [ "$uok" != "1" ]; then
     LANE_END_PUSH="unmeasured"
@@ -1647,7 +1651,7 @@ lane_end_push() {
       # the right verdict (every commit of this lane IS on that ref); only the CAUSE is read from the exit
       # status now instead of assumed from the shape of the success.
       if [ "${PUSH_RC:-0}" -eq 0 ]; then
-        echo "[lane-exit] pushed $br → origin refs/heads/$br — $unpushed commit(s) that existed only on this disk are now off-box. $pushurl holds $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine): a peer push or the rail advanced the ref inside the verify window, and the commits it advanced over are this lane's" >> "$log" 2>/dev/null || true
+        echo "[lane-exit] pushed $br → origin refs/heads/$br — $unpushed commit(s) that had been $LANE_END_LOCAL_SCOPE are now off-box. $pushurl holds $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine): a peer push or the rail advanced the ref inside the verify window, and the commits it advanced over are this lane's" >> "$log" 2>/dev/null || true
       else
         # ⛔ `PUSH_RC≠0` ESTABLISHES THAT THE CLIENT DID NOT REPORT SUCCESS — AND NOTHING ELSE ABOUT THE
         # CAUSE (review of PR #3399 round 13, P2 — REPRODUCED). Round 12 replaced one exit-status-derived
@@ -1671,7 +1675,7 @@ lane_end_push() {
     fi
   else
     LANE_END_PUSH="pushed"
-    echo "[lane-exit] pushed $br → origin refs/heads/$br ($LANE_END_ORIGIN = this worktree's HEAD) — $unpushed commit(s) that existed only on this disk are now off-box" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] pushed $br → origin refs/heads/$br ($LANE_END_ORIGIN = this worktree's HEAD) — $unpushed commit(s) that had been $LANE_END_LOCAL_SCOPE are now off-box" >> "$log" 2>/dev/null || true
   fi
   declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
   return 0
@@ -1761,7 +1765,7 @@ lane_end_next() {
       # establish: `timeout 1 sh -c 'kill -9 $$'` returns 137 through GNU timeout with the timer never
       # firing, an OOM killer produces it with no timer at all, and the coreutils manual says the two cases
       # "cannot be distinguished". The [lane-exit] line names the code; this artifact names the measurement.
-      printf 'MANUAL — the push CLIENT WAS KILLED at the exit path before it could report (the timer at its bound, or a signal — the [lane-exit] line in the lane log names which), so this terminal did NOT establish whether origin received the commit(s) on %s: the remote may have applied the ref before the kill, and it may not. Nothing here proves they are off-box and nothing here proves they are lost — do NOT reap %s until `git ls-remote --heads %s refs/heads/%s` answers%s\n' \
+      printf 'MANUAL — the push CLIENT WAS KILLED at the exit path before it could report (the timer at its bound, or a signal — rc=124 is the timer, and rc=137 is a SIGKILL whose SIGNAL is NOT measurable from here, so the [lane-exit] line in the lane log names the rc and says which of the two it can prove), so this terminal did NOT establish whether origin received the commit(s) on %s: the remote may have applied the ref before the kill, and it may not. Nothing here proves they are off-box and nothing here proves they are lost — do NOT reap %s until `git ls-remote --heads %s refs/heads/%s` answers%s\n' \
         "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "$(lane_end_push_repo)" "${LANE_END_BRANCH:-<unknown>}" \
         "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
   esac
@@ -1841,15 +1845,23 @@ lane_end_next() {
     # FALSE (review of PR #3399 round 15, P2 — REPRODUCED). `detached` shared the group below, whose
     # sentence ends "The commits survive the worktree being removed but NOT a cell volume being
     # discarded". That is true for a commit on a BRANCH — the branch ref lives in the shared object
-    # database. It is NOT true for a commit made on a DETACHED HEAD, which is exactly what this verdict
-    # MEASURED (`symbolic-ref --short -q HEAD` answered nothing): nothing but this worktree's own HEAD and
-    # reflog references it, and `git worktree remove` deletes `.git/worktrees/<id>/HEAD` together with that
-    # reflog — after which the commit is unreachable and `git gc` prunes it. Measured on a linked worktree:
-    # HEAD detached, one commit, `git for-each-ref --contains HEAD` EMPTY, and after removal the object was
-    # PRUNED by `gc --prune=now`. The claim stood in the direction that LOSES WORK, so this verdict now
-    # carries the remedy that keeps it.
+    # database. It is NOT true for a commit reachable only from a detached HEAD: nothing but this
+    # worktree's own HEAD and reflog references such a commit, and `git worktree remove` deletes
+    # `.git/worktrees/<id>/HEAD` together with that reflog — after which it is unreachable and `git gc`
+    # prunes it. Measured on a linked worktree: HEAD detached, one commit, `for-each-ref --contains HEAD`
+    # EMPTY, and after removal the object was PRUNED by `gc --prune=now`. The claim stood in the direction
+    # that LOSES WORK, so this verdict now carries the remedy that keeps it.
+    # ⛔ AND "ON NO BRANCH" IS NOT WHAT *THIS* VERDICT MEASURED (fresh review, P2 — REPRODUCED). Round 15
+    # reworded this arm to say "they are on no BRANCH … That they are on no BRANCH is measured", but the
+    # measurement behind `LANE_END_PUSH=detached` is ONE call — `symbolic-ref --short -q HEAD` answering
+    # nothing — which establishes that the HEAD is not ATTACHED, never that no branch REF holds these
+    # commits: this path runs no `for-each-ref --contains`. Reproduced: a linked worktree detached at a sha
+    # that `refs/heads/held` already holds reaches this very arm, while `for-each-ref --contains HEAD`
+    # answers `refs/heads/held` and the object survives `worktree remove`. The conditionality is now stated
+    # instead of the flat claim, because the flat claim tells an operator to hold and re-publish a branch
+    # that already exists.
     detached)
-      printf 'MANUAL — nothing was pushed, and this worktree is on a DETACHED HEAD, so the %s commit(s) it holds are on NO branch: do NOT reap %s and do NOT remove it — removing the worktree deletes its own HEAD and reflog, which are the only things referencing them, so they become unreachable and are pruned by gc. Push them onto a branch first (`git -C %s push %s HEAD:NEW-BRANCH` — the name is yours to choose), then re-check. That they are on no BRANCH is measured; whether some OTHER ref or remote already holds them is NOT — the unpushed count enumerates this repository'"'"'s LOCAL refs/remotes/* cache only%s%s\n' \
+      printf 'MANUAL — nothing was pushed, and this worktree is on a DETACHED HEAD: its HEAD is not ATTACHED to any branch (measured — symbolic-ref answered nothing), so the %s commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them — do NOT reap %s and do NOT remove it — removing the worktree deletes its own HEAD and reflog, which are the only things referencing such a commit, so it becomes unreachable and is pruned by gc. Push them onto a branch first (`git -C %s push %s HEAD:NEW-BRANCH` — the name is yours to choose), then re-check. That the HEAD is not ATTACHED is measured; whether some OTHER branch or ref ALREADY holds these same commits is NOT (no for-each-ref --contains is run here, and the unpushed count enumerates the LOCAL refs/remotes/* cache of this repository only)%s%s\n' \
         "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "$(lane_end_push_repo)" \
         "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
     UNAVAILABLE|refused-unknown-default|refused-pushurl-divergent|refused-pushurl-unresolved)
@@ -2189,7 +2201,7 @@ lane_end_push_caveat() {
       if [ -n "${LANE_END_ORIGIN:-}" ]; then
         printf ' — AND the remote holds refs/heads/%s at a DIFFERENT sha (push=FAILED, branch_on_origin=%s), so the commits from this lane did NOT reach that ref; whether they are on some OTHER ref is not measured here, and re-running the rescue does NOT fix it' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ORIGIN}"
       else
-        printf ' — AND the commit(s) on %s are NOT on origin either (push=FAILED), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}"
+        printf ' — AND the remote ANSWERED and does NOT hold refs/heads/%s (push=FAILED, branch_on_origin empty), so the commit(s) from this lane did NOT reach THAT ref; whether they are on some OTHER ref is not measured here, and re-running the rescue does NOT fix it: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}"
       fi ;;
     # ⛔ `unmeasured` IS NOT IN THE ABSENCE GROUP EITHER (review cycle 21, P2 — MEASURED). It means the
     # `rev-list --count` that would have produced the number FAILED, and the arm that consumes it says the
@@ -2542,7 +2554,7 @@ terminal_wip_rescue() {
     if [ "$unpushed" -gt 0 ] 2>/dev/null; then
       case "${LANE_END_PUSH:-}" in
         pushed)
-          echo "[wip] NOTE label=$label: $unpushed commit(s) on $br existed ONLY locally and the exit path PUSHED them to origin refs/heads/$br (see the [lane-exit] line above) — bg-rescue-wip.sh archives UNCOMMITTED work only, so the branch push is what covers this case" >> "$log" ;;
+          echo "[wip] NOTE label=$label: $unpushed commit(s) on $br were $LANE_END_LOCAL_SCOPE and the exit path PUSHED them to origin refs/heads/$br (see the [lane-exit] line above) — bg-rescue-wip.sh archives UNCOMMITTED work only, so the branch push is what covers this case" >> "$log" ;;
         verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured|verify-head-unreadable)
           # ⛔ SAME RULE AS THE ARTIFACT (review cycles 11 and 12): none of these verdicts measured delivery
           # OR loss, so the log may not say "were NOT pushed" any more than `next=` may say "exist only on
@@ -2589,7 +2601,7 @@ terminal_wip_rescue() {
           # this function: HEAD detached, one commit, `for-each-ref --contains HEAD` EMPTY, and the object
           # PRUNED by `gc --prune=now` after `worktree remove` — over a log line that had promised it would
           # survive exactly that.
-          echo "[wip] NOTE label=$label: this worktree is on a DETACHED HEAD and the $unpushed commit(s) it holds are on NO branch — nothing but this worktree's own HEAD and reflog references them, so removing the worktree makes them unreachable and gc prunable (the survival sentence in the other arms does NOT apply here). Do NOT remove or reap it until they are pushed onto a branch ('git -C $root push $(lane_end_push_repo) HEAD:refs/heads/<name>'). Nothing was pushed, and push=${LANE_END_PUSH:-not-attempted} says why in the [lane-exit] line above" >> "$log" ;;
+          echo "[wip] NOTE label=$label: this worktree is on a DETACHED HEAD — its HEAD is not ATTACHED to any branch — so the $unpushed commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them, and nothing but this worktree's own HEAD and reflog references such a commit, so removing the worktree makes them unreachable and gc prunable (the survival sentence in the other arms does NOT apply here). Whether some OTHER branch or ref ALREADY holds these same commits was NOT measured (this path runs no for-each-ref --contains). Do NOT remove or reap it until they are pushed onto a branch ('git -C $root push $(lane_end_push_repo) HEAD:refs/heads/<name>'). Nothing was pushed, and push=${LANE_END_PUSH:-not-attempted} says why in the [lane-exit] line above" >> "$log" ;;
         *)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br are held by NO ref in this repository's LOCAL refs/remotes/* cache (a CACHE — 'git fetch --prune' and a deleted remote branch are not visible here, and this is NOT a claim about any remote) and nothing was pushed — push=${LANE_END_PUSH:-not-attempted}, and the [lane-exit] line above says why. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted, and they do not survive a cell's volume being discarded either. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log" ;;
       esac

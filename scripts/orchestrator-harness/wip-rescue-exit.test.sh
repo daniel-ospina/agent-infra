@@ -398,7 +398,7 @@ ck "D4 …and the log NAMES the ref it moved, so 'on origin' is a statement with
 # ⛔ THE LOG MAY NOT CONTRADICT ITSELF (review P1). The `at_risk=0` arm printed "bg-rescue-wip.sh … does
 # not push a branch, so they were not pushed" AFTER the push line — the false statement last, which is
 # the order an operator reads. The NOTE is now keyed on the push verdict; both directions are asserted.
-grep -q 'existed ONLY locally and the exit path PUSHED' "$O/logs/unpushed.log" && \
+grep -q 'and the exit path PUSHED' "$O/logs/unpushed.log" && \
   ! grep -q 'so they were not pushed' "$O/logs/unpushed.log"; rc=$?
 ck "D4b …and one terminal log never carries both 'now off-box' and 'they were not pushed' — the NOTE follows the push verdict" $rc
 mk="$O/state/lane-exit-unpushed_exit.state"
@@ -2880,6 +2880,42 @@ ck "N54b …and the [wip] NOTE does NOT turn a one-ref absence into 'only on thi
 # …and the survival facts survive the scoping, so this is a narrowed claim and not a deleted one.
 grep -q 'They survive this WORKTREE being removed' "$O/logs/emptynote.log"; rcn54c=$?
 ck "N54c …while still naming what does and does not survive" $rcn54c
+# ⛔ N55 — NO OPERATOR-FACING LINE STATES AN OFF-BOX ABSENCE WITHOUT THE SCOPE OF THE READ THAT PRODUCED
+# IT (fresh review of PR #3399 at af13bcf4f, P2 — REPRODUCED). Round 16 scoped ten `[lane-exit]` lines with
+# a `loscope` definition and MISSED three in the `pushed` arm ("existed only on this disk", "existed ONLY
+# locally"), so the half-applied fix shipped green: N45/N45b/N45c pin sentence SHAPE and domain
+# completeness, and N48/N54 pin `next=`/NOTE wording — NOTHING grepped the `[lane-exit]` lines for scope,
+# which is why the miss was invisible. The scanner below is for the CLASS, not for the three sentences.
+# A COMMENT is not an operator-facing line: this file's own review history quotes the phrases it removed,
+# and stripping comments is what keeps that history from reading as a live claim.
+n55_scan() { # n55_scan <file> -> number of operator-facing lines carrying an UNSC0PED absence phrase
+  awk '
+    { line = $0
+      sub(/^[ \t]+/, "", line)
+      if (substr(line, 1, 1) == "#") next            # a comment records history; it is not a claim to an operator
+      if (line !~ /(echo|printf)/) next
+      if (line !~ /ONLY on this disk|only on this disk|ONLY locally|only locally|existed only on|exist only on|are local-only|NOT on origin either|are on NO branch/) next
+      if (line ~ /loscope|LANE_END_LOCAL_SCOPE|LOCAL refs\/remotes|NOT measured|not measured|MIGHT/) next
+      n++; if (n <= 3) print "  line " NR ": " substr(line, 1, 110) > "/dev/stderr"
+    }
+    END { printf "%d", n + 0 }' "$1"
+}
+n55="$(n55_scan "$GATE" 2>/dev/null)"
+[ "$n55" = "0" ]; rcn55=$?
+ck "N55 …no operator-facing line claims an off-box absence ('only on this disk' / 'only locally' / 'on NO branch') without the scope of the read that produced it (found $n55)" $rcn55
+# ⛔ AND THE SCANNER IS SHOWN TO SEE THE CLASS: a COPY with one unscoped line planted must be counted.
+N55M="$TMP/n55mut"; rm -rf "$N55M"; mkdir -p "$N55M"
+awk 'NR==1{print; print "  echo \"claimed: N commit(s) exist ONLY on this disk\""; next} {print}' "$GATE" > "$N55M/spawn-gate.sh" 2>/dev/null
+n55m="$(n55_scan "$N55M/spawn-gate.sh" 2>/dev/null)"
+[ "$n55m" = "1" ]; rcn55b=$?
+ck "N55b …and the scanner is LOAD-BEARING: ONE planted unscoped line is counted ($n55m), so a green N55 is not a scan that sees nothing" $rcn55b
+# ⛔ AND IT IS A SCAN FOR SCOPE, NOT A BAN ON VOCABULARY: the SAME phrase carrying the scope is NOT counted,
+# so quoting the words in an honest sentence must stay possible (the whole family is worded that way).
+N55S="$TMP/n55scope"; rm -rf "$N55S"; mkdir -p "$N55S"
+awk 'NR==1{print; print "  echo \"were $LANE_END_LOCAL_SCOPE — only on this disk until pushed\""; next} {print}' "$GATE" > "$N55S/spawn-gate.sh" 2>/dev/null
+n55s="$(n55_scan "$N55S/spawn-gate.sh" 2>/dev/null)"
+[ "$n55s" = "0" ]; rcn55c=$?
+ck "N55c …while the SAME phrase carrying the scope is NOT counted, so the scan tests scope and not vocabulary ($n55s)" $rcn55c
 echo
 
 # ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).
