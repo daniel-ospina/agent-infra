@@ -851,7 +851,7 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   tag="<!-- auto-rail-review:${state}${head:+:$head} -->"
   case "$state" in
     awaiting-review)
-      text="🔎 **auto-rail: review needed.** This PR is mergeable and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot. **It is not waiting on a lane.**";;
+      text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot and the environment allows it. **It is not waiting on a lane.**";;
     review-in-flight)
       text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
     review-found-issues)
@@ -1117,6 +1117,14 @@ for p in prs:
     # A DRAFT CAN NEVER MERGE: the rail refuses it in one line ("PR is a DRAFT").
     if p.get("isDraft"):
         continue
+    # ⛔ A HEAD THAT CANNOT LAND MUST NOT BUY A REVIEW (review round 5, P2, measured): `mergeable` was
+    # fetched here and never read, so a green-but-CONFLICTING head — checks pass, then `main` moves under
+    # the PR and the rollup stays green — was dispatched a PAID review whose verdict nothing can use (the
+    # rail refuses a conflicted head), and the rebase that fixes it is a NEW head, which buys a second one.
+    # Only a DEFINITE `CONFLICTING` is skipped: GitHub computes `mergeable` lazily and reports `UNKNOWN` on
+    # a fresh head, and skipping that would stall exactly the heads this loop exists to review.
+    if (p.get("mergeable") or "").upper() == "CONFLICTING":
+        continue
     g={}
     for c in p.get("statusCheckRollup") or []:
         k=c.get("name") or c.get("context")
@@ -1338,9 +1346,20 @@ PY
         # `launch_review` wrote already says DISPATCHED, and the state machine reads the record.
         launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" \
           || { publish_review_state "$repo" "$pr" review-dispatch-failed "$head"; continue; }
-        # ⛔ position, not presence — see `publish_review_state`: a success after a rolled-back dispatch
-        # must be able to correct that notice.
-        publish_review_state "$repo" "$pr" review-in-flight "$head"
+        # ⛔ A SUCCESS MEANS THE LAUNCH STARTED — NOT THAT A REVIEW IS STILL RUNNING (review round 5, P2,
+        # measured). `launch_review` also accepts a child that started AND FINISHED inside LAUNCH_VERIFY_S,
+        # and `review-pr.sh` exits 4/9/75 in about a second on a loaded box or a missing `pi` — so this
+        # point is reached with the record already carrying an outcome. Publishing "review in flight" then
+        # is a false claim on the PR that NOTHING ever corrects: the outcome state is `refused`/`retry`, and
+        # `refused` retries on time alone and publishes nothing, so the marker would outlive the review for
+        # ever. Say what the record says. A verdict (clean/issues) is published by its own path on the next
+        # pass, so nothing is published for it here.
+        # position, not presence — see `publish_review_state`: a success after a rolled-back dispatch must be
+        # able to correct that notice.
+        case "$(review_state "$_rout")" in
+          pending) publish_review_state "$repo" "$pr" review-in-flight "$head" ;;
+          refused|retry) publish_review_state "$repo" "$pr" awaiting-review ;;
+        esac
         _rdispatched=$(( _rdispatched + 1 ))
         continue
       fi

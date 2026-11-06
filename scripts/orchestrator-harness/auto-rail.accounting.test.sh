@@ -564,6 +564,22 @@ _ckline() {  # $1 = the PR's JSON body text; $2 = headRefOid (or '' for absent);
   [ "$_pyrc2" -eq 0 ] || bad "a healthy search must exit 0 (got $_pyrc2: $(cat "$_pydir/err2"))"
   [ "$got" = "$(printf '%b' "$want")" ] || bad "$why (got: '$got', wanted: '$(printf '%b' "$want")')"
 }
+# ⛔ A HEAD THAT CANNOT LAND MUST BUY NOTHING (review round 5, P2, measured): `mergeable` was fetched by
+# the search and never read, so a green-but-CONFLICTING head was dispatched a PAID review whose verdict
+# nothing can use -- the rail refuses a conflicted head -- and the rebase that fixes it is a NEW head that
+# buys a second one. Driven through the shipped heredoc, because that is where the filter lives.
+_conf() {  # $1 = mergeable value; prints the candidate lines for one green PR with no record
+  _ghbody "[{\"number\": 11, \"mergeable\": \"$1\", \"isDraft\": false, \"headRefOid\": \"$H7\", \"body\": \"none\", \"statusCheckRollup\": [{\"name\": \"ci\", \"status\": \"COMPLETED\", \"conclusion\": \"SUCCESS\"}]}]"
+  PATH="$_badbin:$PATH" python3 "$_pysrc" daniel-ospina/tortoise 2 2>/dev/null
+}
+[ -z "$(_conf CONFLICTING)" ] \
+  || bad "a CONFLICTING head must not be a candidate (got '$(_conf CONFLICTING)') -- the rail refuses a conflicted head, so the review is money spent on a revision that cannot land, and the rebase that fixes it is a new head that buys a second one"
+# …but UNKNOWN MUST STILL BE REVIEWED: GitHub computes `mergeable` lazily and reports UNKNOWN on a fresh
+# head, and skipping that would stall exactly the heads this loop exists to review.
+[ "$(_conf UNKNOWN)" = "$(printf 'green\t11\tabsent')" ] \
+  || bad "a head whose mergeability is UNKNOWN must still be a CANDIDATE (got '$(_conf UNKNOWN)') -- GitHub computes it lazily, so a filter on anything but a DEFINITE CONFLICTING stalls every fresh head"
+[ "$(_conf MERGEABLE)" = "$(printf 'green\t11\tabsent')" ] \
+  || bad "a MERGEABLE head with no record must still be a CANDIDATE (got '$(_conf MERGEABLE)') -- this is the #3489 shape"
 # STATE 1 — ATTESTED AT HEAD: the rail path, and nothing else, is what this PR is for.
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 diff=$(printf 'a%.0s' $(seq 1 64)) (daniel-ospina/tortoise)" "$H7" 'green\t7\tat-head' \
   "a clean record AT the current head must classify as at-head (the rail's own precondition)"
@@ -1123,13 +1139,28 @@ review_forgive_refusal "$_led"
 # function was rewritten to prevent, restored by a one-character edit nothing could see. Timestamps are
 # now distinct and the surviving CONTENT is asserted, so oldest-vs-newest is observable.
 _led="$_rdir/forgive.order.attempts"
-printf '%s\n%s\n%s\n' 1001 1002 1003 > "$_led"   # paid, paid, refusal(newest)
+# ⛔ IN-WINDOW VALUES, NOT DECORATION (review round 5, P2, measured): the first version used 1001/1002/1003
+# to make oldest-vs-newest observable, but `review_attempts` WINDOWS by `REVIEW_ATTEMPT_WINDOW_S`, so those
+# epochs were filtered out and every downstream arm read 0 — the cross-state arm then fed `att=0` and could
+# not fail, and the empty-ledger arms were vacuous. Distinct AND recent is the only form that discriminates
+# newest-from-oldest while still counting.
+_now2=$(date +%s); _o1=$(( _now2 - 30 )); _o2=$(( _now2 - 20 )); _o3=$(( _now2 - 10 ))
+printf '%s\n%s\n%s\n' "$_o1" "$_o2" "$_o3" > "$_led"   # paid, paid, refusal(newest)
 review_forgive_refusal "$_led"
-[ "$(tr '\n' ' ' < "$_led")" = "1001 1002 " ] \
-  || bad "the forgiver must drop the NEWEST ledger entry (the refusal's own) and keep the earlier PAID ones — got '$(tr '\n' ' ' < "$_led")', want '1001 1002 '; dropping the oldest forgives a paid attempt and re-opens the paid retry loop"
-rm -f "$_led"
+[ "$(tr '\n' ' ' < "$_led")" = "$_o1 $_o2 " ] \
+  || bad "the forgiver must drop the NEWEST ledger entry (the refusal's own) and keep the earlier PAID ones — got '$(tr '\n' ' ' < "$_led")', want '$_o1 $_o2 '; dropping the oldest forgives a paid attempt and re-opens the paid retry loop"
+[ "$(review_attempts "$_led")" = 2 ] \
+  || bad "the two surviving entries must still COUNT (got '$(review_attempts "$_led")', want 2) — if they are outside REVIEW_ATTEMPT_WINDOW_S the arms below read 0 and test nothing"
+# ⛔ AND THE ARMS MUST READ THE LEDGER THEY BUILT (review round 5, P2, measured): a stray `rm -f` before
+# these assertions deleted it, so `review_attempts` returned 0 — the cross-state arm fed `att=0` instead of
+# the 2 its own message names, and the two arms after it were vacuous (and redundant with the explicit
+# missing-file arm at the end). A vacuous arm here is not cosmetic: it is the ONLY composition pin
+# (refusal forgiven → a LATER paid retry still dispatches), so the paid-retry loop could reopen with the
+# suite green.
 review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) "$(review_attempts "$_led")"; [ $? -eq 1 ] \
-  || bad "CROSS-STATE: after forgivING one refusal, a paid retry with 2 of $REVIEW_MAX_ATTEMPTS spent must still DISPATCH (got $?) — the refusal consumed a budget the next paid attempt reads"
+  || bad "CROSS-STATE: after forgiving ONE refusal, a paid retry with 2 of $REVIEW_MAX_ATTEMPTS spent must still DISPATCH (got $? on att=$(review_attempts "$_led")) — the refusal consumed a budget the next paid attempt reads"
+[ "$(review_attempts "$_led")" = 2 ] \
+  || bad "the cross-state arm must see the 2 SURVIVING entries, not a deleted ledger (got '$(review_attempts "$_led")')"
 review_forgive_refusal "$_led"; review_forgive_refusal "$_led"
 [ "$(review_attempts "$_led")" = 0 ] || bad "forgiving down to empty must leave 0, not a corrupt ledger (got '$(review_attempts "$_led")')"
 review_forgive_refusal "$_led"
@@ -1373,6 +1404,22 @@ launch_review acme/widget 42 "$H" "$_r8" "$_r8led" \
 [ "$(review_attempts "$_r8led")" = 1 ] \
   || bad "a FINISHED dispatch must consume exactly one attempt (got '$(review_attempts "$_r8led")') — uncounted, the per-head bound is weaker than it says"
 rm -f "$_rfast"
+
+# ⛔ "STARTED" IS NOT "STILL RUNNING" (review round 5, P2, measured): `launch_review` also accepts a child
+# that started AND FINISHED inside LAUNCH_VERIFY_S (`wc -l > 1` once the wrapper appends REVIEW-EXIT), and
+# `review-pr.sh` exits 4/9/75 in about a second on a loaded box — so the in-flight marker must be gated on
+# the RECORD still being `pending`. Published unconditionally it is a false claim that nothing ever
+# corrects: the outcome state is `refused`/`retry`, and `refused` retries on time alone and publishes
+# nothing, so "review in flight" would outlive the review for ever.
+_rdl=$(sed -n '/\[ "\$_rstate" = refused \] && review_forgive_refusal/,/^        continue$/p' "$SUT")
+printf '%s\n' "$_rdl" | grep -qF 'case "$(review_state "$_rout")" in' \
+  || bad "the in-flight publish must be GATED ON THE RECORD (no 'case \"\$(review_state \"\$_rout\")\" in' in the dispatch block) — ungated, a reviewer that already refused is reported as in flight on the PR and no state ever corrects it"
+printf '%s\n' "$_rdl" | grep -qF 'refused|retry) publish_review_state "$repo" "$pr" awaiting-review' \
+  || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — otherwise the PR's newest comment claims a live review while the state machine knows there is none"
+_og=$(printf '%s\n' "$_rdl" | grep -nF 'publish_review_state "$repo" "$pr" review-in-flight "$head"' | head -1 | cut -d: -f1)
+_oc=$(printf '%s\n' "$_rdl" | grep -nF 'case "$(review_state "$_rout")" in' | head -1 | cut -d: -f1)
+[ -n "$_og" ] && [ -n "$_oc" ] && [ "$_og" -gt "$_oc" ] \
+  || bad "the in-flight publish must sit INSIDE the pending arm (in-flight at ${_og:-MISSING}, case at ${_oc:-MISSING})"
 
 # ⛔ A DISPATCH MUST NOT EAT THE LOOP'S CANDIDATE LIST (review round 4, P2, reproduced): the loop body
 # runs from `done < "$_cand"`, so a backgrounded child INHERITS the candidate file as fd 0 — and `pi -p`
