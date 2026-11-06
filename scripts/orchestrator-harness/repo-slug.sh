@@ -269,7 +269,16 @@ repo_identity_declared() {
   # (`HARNESS_PIN_DIR=$HOME/.harness`) is not handed a false block by a name this table did not guess.
   # ${HARNESS_PIN_DIR:-} because this file is sourced under `set -u` — and NOT inside the `case` pattern
   # below, where an unset variable would be a fatal expansion rather than an empty match.
-  if [ "${1:-}" = 'harness' ] || { [ -n "${HARNESS_PIN_DIR:-}" ] && [ "${1:-}" = "${HARNESS_PIN_DIR##*/}" ]; }; then
+  # ⛔ AND ITS PRESERVED COPIES — `harness.<suffix>` (review finding, P2). `disk-floor.sh` names
+  # `$O/harness.stray-*` / `$O/harness.preserved-*` as its stale-copy class and refuses to delete any
+  # candidate that carries `.git` "whatever it is called", and `docs/ops/disk-consumers.md` MEASURES
+  # `harness.preserved-012629` (180 MB) inside `/tmp/cell-home` — a default ROOT of both the bring-up and
+  # the doctor. A preserved copy is a real clone of agent-infra, so `harness.old` / `harness.preserved-…`
+  # read FATAL, with a remedy inviting a rename or quarantine of a preserved copy on a healthy cell: the
+  # start of exactly the conversation this table exists to prevent. Same expectation as `harness` itself.
+  case "${1:-}" in harness.*) _pin_family=1 ;; *) _pin_family=0 ;; esac
+  if [ "$_pin_family" -eq 1 ] || [ "${1:-}" = 'harness' ] \
+     || { [ -n "${HARNESS_PIN_DIR:-}" ] && [ "${1:-}" = "${HARNESS_PIN_DIR##*/}" ]; }; then
     printf '%s\n%s\n' 'agent-infra' \
       'the harness PIN ROOT (or a legacy flat pin, where the root itself is a linked worktree at a commit) — the harness always comes from agent-infra, and the directory names its role, not the repo'
     return 0
@@ -662,9 +671,16 @@ repo_identity_scan() {
             [ -n "$pv" ] || continue
             rp="$( ( cd "$pv" 2>/dev/null && pwd -P ) )" || rp=""
             [ -n "$rp" ] || continue
+            # ⛔ SCOPED TO THIS GROUP (review finding, P2). This matched `$rp` against EVERY scanned
+            # checkout, so with two duplicated repos the tortoise line reported the AGENT-INFRA path as
+            # the tree `REPO` resolves to — a false attribution on the one line an operator uses to pick
+            # a canonical tree — and the non-empty `resolves` then SUPPRESSED the honest "nothing here
+            # resolves" sentence below, replacing a true statement with a false one.
             j=0
             while [ "$j" -lt "${#_cd[@]}" ]; do
-              [ "${_cd[$j]}" = "$rp" ] && resolves="${resolves}${resolves:+, }${v}->${_cd[$j]}"
+              if [ "${_cd[$j]}" = "$rp" ] && [ "${_fold[$j]:-}" = "${_fold[$i]}" ]; then
+                resolves="${resolves}${resolves:+, }${v}->${_cd[$j]}"
+              fi
               j=$((j + 1))
             done
           done

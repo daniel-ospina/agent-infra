@@ -1828,6 +1828,42 @@ case "$UNBORN_OUT" in
   *) bad "an unreadable-head group produced no honest line: $(printf '%s' "$UNBORN_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
 esac
 
+say_case "repo identity: a preserved HARNESS copy is not a lying directory, and a group reports only ITS own resolution"
+# ⛔ TWO REVIEW FINDINGS, ONE FIXTURE EACH.
+# (a) `harness.<suffix>` — `disk-floor.sh` names `harness.stray-*`/`harness.preserved-*` as its stale-copy
+#     class and refuses to delete anything carrying `.git`; `docs/ops/disk-consumers.md` MEASURES
+#     `harness.preserved-012629` inside `/tmp/cell-home`, a default root. A preserved copy is a real clone of
+#     agent-infra, so it read FATAL — a remedy inviting a rename of a preserved copy on a healthy cell.
+# (b) the duplicate report's `resolves` scan was not scoped to its group, so the TORTOISE line could report
+#     the AGENT-INFRA path as the tree REPO resolves to (and that non-empty value suppressed the honest
+#     "nothing here resolves" sentence).
+mk_checkout "$T/ident-pinpre/home/harness.preserved-012629" "https://github.com/daniel-ospina/agent-infra.git" pp1 \
+  && ok "fixture: a preserved harness copy under the cell home" \
+  || bad "fixture: could not create the preserved harness copy"
+BR_IDENT_ROOTS="$T/ident-pinpre/home" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a PRESERVED HARNESS COPY was refused — the remedy invites renaming a preserved copy: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+  *"DECLARED exception name 'harness.preserved-012629'"*) ok "a preserved harness copy is a declared exception, not a directory to move" ;;
+  *) bad "the preserved harness copy produced no verdict: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+for r in agent-infra ai tortoise tortoise-old; do
+  case "$r" in agent-infra|ai) url=https://github.com/daniel-ospina/agent-infra.git ;; *) url=https://github.com/daniel-ospina/tortoise.git ;; esac
+  mk_checkout "$T/ident-two/$r" "$url" "g-$r" || bad "fixture: could not create …/$r"
+done
+ok "fixture: TWO duplicated repos, so a group can pick up the wrong group's path"
+TWO_OUT="$(REPO="$T/ident-two/agent-infra" REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; repo_identity_scan "$2"' _ "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-two" 2>&1)" || true
+# the tortoise group's line must NOT claim REPO (an agent-infra path) as its resolution
+TORTOISE_LINE="$(printf '%s\n' "$TWO_OUT" | grep -F 'daniel-ospina/tortoise is checked out')"
+case "$TORTOISE_LINE" in
+  *"REPO->"*) bad "the tortoise group reported the AGENT-INFRA path as its resolution — a false attribution: $TORTOISE_LINE" ;;
+  *) ok "each duplicate group reports only its own resolution" ;;
+esac
+case "$TORTOISE_LINE" in
+  *"neither REPO"*|*"no REPO, WORKDIR or O"*) ok "…and the honest 'nothing here resolves' sentence is not suppressed" ;;
+  *) bad "the tortoise group named no resolution at all (the honest sentence was suppressed): $TORTOISE_LINE" ;;
+esac
+
 say_case "repo identity: a SUFFIXED working copy is not lying, whatever the separator"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P2. The exemption was dash-only, so `tortoise.old`, `tortoise_wip` and
 # `tortoise2` — each naming the repo it holds — were refused FATAL with a remedy inviting a rename.
