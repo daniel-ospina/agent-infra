@@ -2565,8 +2565,31 @@ else
 # file records a previous wording — satisfied the pin while the writer no longer wrote them. Measured:
 # regressing `_head_why` and quoting the old string in a comment stayed 288/0 GREEN, and deleting an
 # `_head_rank` arm whose value survived in a comment kept `_narms=5`. The writer is read ONCE with its
-# comment lines removed and every predicate grades that view.
-_WCODE="$(grep -v '^[[:space:]]*#' "$REFRESH")"
+# comments removed and every predicate grades that view.
+# ⛔ AND A TRAILING COMMENT IS STILL A COMMENT (review P2, cycle 26): dropping only FULL-LINE comments
+# left 94 code lines with a trailing `# …` in the graded view, so deleting the `unranked` arm and
+# recording it beside the `severity` arm kept `_narms=5` and BOTH suites green — while the surviving
+# `case` writes the `priority-unreadable` sentence into the durable `handed_why=`, exactly the
+# conflation `81f9b3402` removed. The strip is therefore QUOTE-AWARE: a `#` inside '…' or "…" is data
+# (`head #$_head_issue` and the printf templates are full of them), and a `#` at a word boundary
+# outside quotes ends the line. RESIDUAL: a heredoc body line beginning with `#` is still dropped —
+# already true of the full-line strip, and no pinned literal lives in one.
+_WCODE="$(awk '
+{
+  out = ""; q = ""; prev = "";
+  n = length($0);
+  for (i = 1; i <= n; i++) {
+    c = substr($0, i, 1);
+    if (q == "") {
+      if (c == "\047" || c == "\"") { q = c; out = out c; prev = c; continue }
+      if (c == "#" && (prev == "" || prev == " " || prev == "\t")) break
+    } else if (c == q) {
+      q = ""; out = out c; prev = c; continue
+    }
+    out = out c; prev = c;
+  }
+  print out
+}' "$REFRESH")"
 _why_ok="$(grep -o 'pass completed; queue depth [^"]*' <<<"$_WCODE" | head -1)"
 case "$_why_ok" in
   *'is what dispatch takes next'*)
@@ -2653,15 +2676,16 @@ fi
 # (measured: the sibling assertion reddened but this sentence claimed a measurement never taken).
 _head_why_pref="$(grep -o '_head_why="[^"]*"' <<<"$_WCODE" | sed 's/^_head_why="//; s/"$//' \
   | sed 's/\$_head_rank$//; s/\${_head_rank}$//' | grep -v '^$' || true)"
-if [ "$(grep -c . <<<"$_head_why_pref" || true)" = "2" ]; then
-  for _pfx in "$(sed -n 1p <<<"$_head_why_pref")" "$(sed -n 2p <<<"$_head_why_pref")"; do
-    grep -qF -- "$_pfx" <<<"$_WCODE" && _pfx_ok=1
-  done
-  [ "${_pfx_ok:-0}" = "1" ] && ok "pin/writer: both \`_head_why\` prefixes are read from the writer" \
-    || bad "pin/writer: a \`_head_why\` prefix does not appear in the writer's code"
-  _pfx_ok=0
+# ⛔ THE OLD CHECK COULD NOT FAIL (review P3): each derived prefix was grepped BACK into the view it was
+# derived from, so `grep -qF` always hit, its `bad` branch was dead code, and `_pfx_ok` was a sticky OR
+# that would have said "both" on one match. What is falsifiable is the SET: the writer must expose two
+# DISTINCT prefixes (the pass judged the head, or carried it over) and the fixtures must actually model
+# both — a count, not a membership test.
+_npfx="$(printf '%s\n' "$_head_why_pref" | sort -u | grep -c . || true)"
+if [ "${_npfx:-x}" = "2" ]; then
+  ok "pin/writer: the writer exposes TWO distinct \`_head_why\` prefixes (judged-by-THIS-pass and carried-over)"
 else
-  bad "pin/writer: could not read TWO \`_head_why\` prefixes from the writer (got $(grep -c . <<<"$_head_why_pref" || true)) — the fixture prefixes are ungraded"
+  bad "pin/writer: the writer exposes ${_npfx:-<unreadable>} distinct \`_head_why\` prefix(es) (want 2) — with one arm gone, every \`handed_why=\` claim that arm made is now unsupported"
 fi
 _hw_fx="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" || true)"
 _hw_bad=0
@@ -2671,16 +2695,18 @@ for _ln in $(grep -nE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" 
   # not start with it, so a fixture holding the BARE arm — a record the writer cannot emit, since it always
   # writes one of the two prefixes — was accepted. Measured: stripping the prefix from a fixture stayed
   # 288/0 GREEN, and a doubled prefix stayed GREEN too.
-  _tail=""; _matched=0
+  _tail=""; _matched=0; _matched_pfx=""
   while IFS= read -r _pfx; do
     [ -n "$_pfx" ] || continue
     case "$_val" in
-      "$_pfx"*) _tail="${_val#"$_pfx"}"; _matched=1; break ;;
+      "$_pfx"*) _tail="${_val#"$_pfx"}"; _matched=1; _matched_pfx="$_pfx"; break ;;
     esac
   done <<<"$_head_why_pref"
   if [ "$_matched" = "0" ]; then
     _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` carries NEITHER of the writer's \`_head_why\` prefixes — the writer always writes one, so this value cannot exist: '$_val'"; continue
   fi
+  _fx_pfx_used="${_fx_pfx_used:-}
+$_matched_pfx"
   if [ -z "$_tail" ]; then
     _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` has a prefix and an EMPTY rank clause — a dangling phrase in the durable record: '$_val'"
   elif ! grep -qxF -- "$_tail" <<<"$_head_ranks"; then
@@ -2691,6 +2717,12 @@ if [ "${_hw_fx:-x}" != "7" ]; then
   bad "pin/writer: ${_hw_fx:-<unreadable>} fixture \`handed_why=\` value(s) (want 7) — if you ADDED a faithful fixture, update this number; if you did not, a fixture lost its field"
 elif [ "$_hw_bad" = "0" ]; then
   ok "pin/writer: all 7 fixture \`handed_why=\` values carry a writer prefix and end in an arm the writer writes"
+  # ⛔ AND BOTH ARM STYLES ARE MODELLED — otherwise the carried-over sentence has no fixture at all and
+  # its deletion would be invisible.
+  _fx_pfx_n="$(printf '%s\n' "$_fx_pfx_used" | sort -u | grep -c . || true)"
+  [ "${_fx_pfx_n:-x}" = "2" ] \
+    && ok "pin/writer: the fixtures model both \`_head_why\` prefixes (a judged head and a carried-over one)" \
+    || bad "pin/writer: the fixtures model ${_fx_pfx_n:-<unreadable>} of the writer's 2 \`_head_why\` prefixes — the missing arm's sentence is ungraded"
 fi
 fi
 
