@@ -321,12 +321,82 @@ def resolve(cfg, env):
     return ("ok", out) if out.strip() else ("missing", None)
 
 
+# MODE=builtin — pi\x27s OWN built-in provider table, which is how a provider is provisioned when models.json declares
+# nothing for it (`dist/env-api-keys.js` `getApiKeyEnvVars`, the same table `getEnvApiKey` and `findEnvKeys` read).
+# ⛔ THIS IS THE NORMAL CELL SHAPE, AND IT WAS THE #3443 DEFECT: with no models.json there is no template to name a
+# variable, so the gate answered `cannot-resolve-provider-credential` (rc 0, "nothing wrong") on a box where `pi -p`
+# printed `No API key found for deepseek.` and exited — measured on the installed pi, both directions: with
+# DEEPSEEK_API_KEY exported pi reaches the provider (401), without it pi says exactly that line and stops.
+# A provider whose var is NOT sufficient on its own stays `uncertain` and refuses nothing — measured:
+# CLOUDFLARE_API_KEY alone still answers `No API key found for cloudflare-workers-ai.`, and GOOGLE_CLOUD_API_KEY alone
+# makes pi attempt the call (so ADC is an alternate path we cannot see), and AZURE_OPENAI_API_KEY alone dies on
+# `Azure OpenAI base URL is required` — a different datum, not the credential.
+BUILTIN_ENV = {
+    "ant-ling": ["ANT_LING_API_KEY"],
+    "qwen-token-plan": ["QWEN_TOKEN_PLAN_API_KEY"],
+    "qwen-token-plan-cn": ["QWEN_TOKEN_PLAN_CN_API_KEY"],
+    "qwen-token-plan-individual": ["QWEN_TOKEN_PLAN_API_KEY"],
+    "openai": ["OPENAI_API_KEY"],
+    "nvidia": ["NVIDIA_API_KEY"],
+    "deepseek": ["DEEPSEEK_API_KEY"],
+    "google": ["GEMINI_API_KEY"],
+    "groq": ["GROQ_API_KEY"],
+    "cerebras": ["CEREBRAS_API_KEY"],
+    "xai": ["XAI_API_KEY"],
+    "typesafe": ["TYPESAFE_API_KEY"],
+    "openrouter": ["OPENROUTER_API_KEY"],
+    "vercel-ai-gateway": ["AI_GATEWAY_API_KEY"],
+    "zai": ["ZAI_API_KEY"],
+    "zai-coding-cn": ["ZAI_CODING_CN_API_KEY"],
+    "mistral": ["MISTRAL_API_KEY"],
+    "minimax": ["MINIMAX_API_KEY"],
+    "minimax-cn": ["MINIMAX_CN_API_KEY"],
+    "moonshotai": ["MOONSHOT_API_KEY"],
+    "moonshotai-cn": ["MOONSHOT_API_KEY"],
+    "huggingface": ["HF_TOKEN"],
+    "fireworks": ["FIREWORKS_API_KEY"],
+    "together": ["TOGETHER_API_KEY"],
+    "baseten": ["BASETEN_API_KEY"],
+    "opencode": ["OPENCODE_API_KEY"],
+    "opencode-go": ["OPENCODE_API_KEY"],
+    "kimi-coding": ["KIMI_API_KEY"],
+    "meta": ["META_API_KEY"],
+    "xiaomi": ["XIAOMI_API_KEY"],
+    "xiaomi-token-plan-cn": ["XIAOMI_TOKEN_PLAN_CN_API_KEY"],
+    "xiaomi-token-plan-ams": ["XIAOMI_TOKEN_PLAN_AMS_API_KEY"],
+    "xiaomi-token-plan-sgp": ["XIAOMI_TOKEN_PLAN_SGP_API_KEY"],
+    "anthropic": ["ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"],
+}
+BUILTIN_UNCERTAIN = {
+    "azure": "AZURE_OPENAI_API_KEY:measured, the key alone answers `Azure OpenAI base URL is required`",
+    "google-vertex": "GOOGLE_CLOUD_API_KEY:measured, the key alone attempts the call, and ADC is an alternate path",
+    "cloudflare-workers-ai": "CLOUDFLARE_API_KEY:measured, the key alone still answers `No API key found`",
+    "cloudflare-ai-gateway": "CLOUDFLARE_API_KEY:needs CLOUDFLARE_ACCOUNT_ID and CLOUDFLARE_GATEWAY_ID too",
+    "github-copilot": "COPILOT_GITHUB_TOKEN:OAuth is the store path this gate already probed",
+    "radius": "RADIUS_API_KEY:measured on this fleet via `oauth: radius` in models.json, an alternate store path",
+}
+if sys.argv[2] == "builtin":
+    _p = sys.argv[3] if len(sys.argv) > 3 else ""
+    if _p in BUILTIN_UNCERTAIN:
+        print("uncertain:" + BUILTIN_UNCERTAIN[_p].split(":", 1)[0])
+        print("why:" + BUILTIN_UNCERTAIN[_p].split(":", 1)[1].lstrip(":"))
+        raise SystemExit(0)
+    _v = BUILTIN_ENV.get(_p)
+    if _v:
+        print("certain:" + ",".join(_v))
+    raise SystemExit(0)
+
 try:
-    doc = read_json(sys.argv[1], jsonc=(sys.argv[2] == "var"))
+    doc = read_json(sys.argv[1], jsonc=(sys.argv[2] in ("var", "compose")))
 except FileNotFoundError:
     # `var` and `default` are the two "print nothing = cannot say" modes, and for them an ABSENT file is a real
     # answer: no template to resolve, no pin to assert. Only `store` distinguishes absence (rc 1) from
     # unreadability, because only it asserts a positive "no credential".
+    # ⛔ `var` DOES SAY WHICH (round 28): "no models.json" is the shape where pi falls back to the provider\x27s own
+    # built-in variable, and "present but unparseable" is a datum this gate did not read — folding them into one
+    # silent cannot-say is what left #3443\x27s scenario unanswerable.
+    if sys.argv[2] == "var":
+        print("__KG_ATTR__absent")
     raise SystemExit(0 if sys.argv[2] in ("var", "default") else 1)
 except Exception:
     # ⛔ A PRESENT-BUT-UNPARSEABLE `default` FILE IS NOT AN ABSENT PIN (fresh-context review round 4, P3,
@@ -336,6 +406,8 @@ except Exception:
     # ⛔ rc 4 = CANNOT SAY, FOR `store` TOO (round 14, P1, measured): rc 1 is the POSITIVE "no credential", and a
     # store that failed to PARSE is not that — with a BOM the gate refused 82 a box pi runs, on a file pi read fine.
     # `var` stays 0 (it prints nothing either way); `default` and `store` say "cannot say".
+    if sys.argv[2] == "var":
+        print("__KG_ATTR__unreadable")
     raise SystemExit(6 if sys.argv[2] == "store" else (4 if sys.argv[2] == "default" else 0))
 
 if sys.argv[2] == "default":
@@ -778,10 +850,63 @@ if sys.argv[2] == "var":
     prov = (doc.get("providers") or {}).get(sys.argv[3]) or {}
     key = prov.get("apiKey")
     if not isinstance(key, str):
+        # The file parsed and names nothing for this provider, so pi falls back to the provider\x27s own variable
+        # (`findEnvKeys`) exactly as if the file were absent — that is a `none`, not an unreadable datum.
+        print("__KG_ATTR__none")
         raise SystemExit(0)
     kind, names = template_parts(key)
+    # ⛔ THE KIND IS PART OF THE ANSWER (round 28, P2, measured): without it, "no variable names" was one undifferentiated
+    # cannot-say, and three DIFFERENT facts about the box collapsed into it — pi provisions this provider from a LITERAL
+    # in models.json (no variable applies at all), pi runs a `!command` (only pi can evaluate it), or the file names no
+    # apiKey and pi falls back to the provider\x27s OWN built-in variable. Only the third one is a question this gate can
+    # answer, and it is the NORMAL cell shape (no models.json), so folding them together left #3443\x27s own scenario
+    # silent. Printed as a sentinel line so `key_gate_var`\x27s name output is unchanged.
+    if kind == "cmd":
+        print("__KG_ATTR__cmd")
+        raise SystemExit(0)
+    if not names:
+        print("__KG_ATTR__literal" if key.strip() else "__KG_ATTR__none")
+        raise SystemExit(0)
+    print("__KG_ATTR__template")
     for nm in names:
         print(nm)
+    raise SystemExit(0)
+
+if sys.argv[2] == "compose":
+    # ⛔ pi COMPOSES models.json a SECOND time, and that pass can DISCARD what this gate just read (round 28, P2,
+    # measured on the installed pi). `applyModelsJson` throws, `composeProvider` catches and returns `base`, and
+    # `recomposeProvider` then DELETES the provider when it is not built in — so the apiKey this gate read is gone.
+    # Two shapes are decidable from the document and BOTH were measured:
+    #   oauth without baseUrl -> throws for built-ins too, and the provider\x27s apiKey override is LOST with it:
+    #     `{"deepseek":{"apiKey":"$MYK","oauth":"radius"}}` with MYK unset and DEEPSEEK_API_KEY exported -> pi RAN on
+    #     its built-in key, so this gate\x27s `check=fail result=REFUSED var=MYK` was a FALSE 82 on a box pi runs.
+    #   a model definition with no `api`/`baseUrl` -> throws only when the provider is NOT built in (pi resolves both
+    #     from the built-in model it composes from: `findModelDefaults`, provider-composer.js:117-123), and a custom
+    #     provider is then DELETED — measured: `pi -p --provider myprov --model m1` -> `Unknown provider "myprov"`.
+    try:
+        _d = read_json(sys.argv[1], jsonc=True)
+    except Exception:
+        raise SystemExit(0)
+    if not isinstance(_d, dict):
+        raise SystemExit(0)
+    _provs = _d.get("providers")
+    if not isinstance(_provs, dict):
+        raise SystemExit(0)
+    _body = _provs.get(sys.argv[3])
+    if not isinstance(_body, dict):
+        raise SystemExit(0)
+    if _body.get("oauth") and not _body.get("baseUrl"):
+        print("oauth-no-baseurl")
+        raise SystemExit(0)
+    for _m in _body.get("models") or []:
+        if not isinstance(_m, dict):
+            continue
+        if not (_m.get("api") or _body.get("api")):
+            print("no-api:" + str(_m.get("id")))
+            raise SystemExit(0)
+        if not (_m.get("baseUrl") or _body.get("baseUrl")):
+            print("no-baseurl:" + str(_m.get("id")))
+            raise SystemExit(0)
     raise SystemExit(0)
 
 # MODE=store
@@ -899,6 +1024,7 @@ if status == "cmd":
 # variable that was never consulted. The fallback chain is pi\x27s, not ours to model, so the honest
 # answer is "cannot say" — which asserts nothing and therefore cannot be wrong in either direction.
 raise SystemExit(3 if cannot else 4)
+
 '
 
 # key_gate_bounded <secs> <cmd...> — run a probe under a TIME BOUND (review round 4, P1, measured).
@@ -1025,7 +1151,51 @@ key_gate_var() {
   # A TEMPLATE prints EVERY name it references (review cycle 1, P2): `sk-${A}${B}` is a shape pi fully
   # resolves and the old single-name `fullmatch` answered "cannot resolve" for — a gate that goes quiet
   # on a readable config. One name per line; empty output is still the "cannot say" answer.
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" var "$prov" 2>/dev/null
+  # ⛔ THE KIND LINE IS FILTERED HERE (round 28): `var` mode now emits `__KG_ATTR__<kind>` first, so the answer to
+  # "which variables does the template name" stays exactly what it was. `key_gate_apikind` below reads that line.
+  # `|| return 0`: with only the sentinel line, `grep -v` exits 1 — a caller under `set -e` would abort on the
+  # cannot-say answer, which is the one case that must never be fatal.
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" var "$prov" 2>/dev/null \
+    | grep -v '^__KG_ATTR__' || return 0
+}
+
+# key_gate_apikind <home> [<provider>] [<cwd>] -> `template` | `literal` | `cmd` | `none` | (nothing = no file)
+# ⛔ WHY THE KIND MATTERS (round 28, P2, measured): three different answers were folded into one cannot-say. pi
+# provisions a provider from a LITERAL `apiKey` in models.json, so there is no environment variable to check and no
+# refusal is possible; a `!command` is pi's to evaluate; and a file that names NOTHING leaves pi on the provider's
+# built-in variable — the ONLY one of the three this gate can answer, and the normal cell shape (#3443).
+key_gate_apikind() {
+  local home="${1:-}" prov="${2:-}" cwd="${3:-${PWD:-}}" agent_dir mj
+  agent_dir="$(key_gate_agent_dir "$home" "$cwd")"
+  [ -n "$agent_dir" ] || return 0
+  mj="$agent_dir/models.json"
+  [ -n "$prov" ] || prov="${PI_LANE_PROVIDER:-deepseek}"
+  command -v python3 >/dev/null 2>&1 || return 0
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" var "$prov" 2>/dev/null \
+    | sed -n 's/^__KG_ATTR__//p' | head -1
+}
+
+# key_gate_builtin <provider> -> `certain:VAR[,VAR...]` | `uncertain:VAR:<why>` | (nothing = pi ships no env var)
+# pi's OWN table (`dist/env-api-keys.js`), so this is the vendor's answer and not this gate's guess.
+key_gate_builtin() {
+  local prov="${1:-}"
+  [ -n "$prov" ] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" /dev/null builtin "$prov" 2>/dev/null
+}
+
+# key_gate_compose <home> <provider> <model> [<cwd>] -> the reason pi's COMPOSER rejects this provider's
+# models.json (`oauth-no-baseurl` | `no-api:<id>` | `no-baseurl:<id>`), or nothing.
+# ⛔ pi COMPOSES models.json A SECOND TIME and can DISCARD what this gate just read (round 28, P2, measured).
+key_gate_compose() {
+  local home="${1:-}" prov="${2:-}" model="${3:-}" cwd="${4:-${PWD:-}}" agent_dir mj
+  agent_dir="$(key_gate_agent_dir "$home" "$cwd")"
+  [ -n "$agent_dir" ] || return 0
+  mj="$agent_dir/models.json"
+  [ -n "$prov" ] || prov="${PI_LANE_PROVIDER:-deepseek}"
+  command -v python3 >/dev/null 2>&1 || return 0
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" compose "$prov" 2>/dev/null \
+    | head -1
 }
 
 # key_gate_value_present <VARNAME> — 0 iff THIS environment holds a non-blank value.
@@ -1536,9 +1706,63 @@ key_gate_box_default_assert() {
   # the store there is nothing to assert FROM the template: an empty `names` would otherwise fall through to the
   # `check=ok` arm below with a blank `var=`, which is a pass line about nothing.
   if [ -z "$names" ]; then
+    # ⛔ THE PIN OF A BUILT-IN PROVIDER IS DECIDABLE TOO (round 28, P2, measured — the same fact the LANE path now
+    # uses): a box pinned to `deepseek` with no models.json is provisioned from pi's own table, so `--probe
+    # --box-default` can answer instead of abstaining. The alternative was a documented verification that prints
+    # "skipped" on the ordinary cell shape, which reads as "nothing wrong" on the very box #3443 measured.
+    local pakind pblt pwhy pvar phit="" pb
+    pakind="$(key_gate_apikind "$home" "$prov" "$cwd")"
+    case "$pakind" in
+      literal)
+        [ "$quiet" = 1 ] && return 0
+        printf '[key-gate] %s check=skipped reason=literal-api-key-in-models-json model=%s box_default=%s provider=%s settings_json=%s — this provider has a LITERAL `apiKey` in models.json (no `$NAME` reference), which pi uses as the credential itself: no environment variable is the question, and the pin is NOT refused\n' \
+          "$label" "$dm" "$dm" "$prov" "$sj"
+        return 0 ;;
+      absent|none) : ;;
+      *)
+        [ "$quiet" = 1 ] && return 0
+        printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s box_default=%s provider=%s settings_json=%s — the apiKey template for the STARTUP provider is not resolvable (an UNPARSEABLE models.json, a read the bound killed, a `!command`), so nothing is asserted here\n' \
+          "$label" "$dm" "$dm" "$prov" "$sj"
+        return 0 ;;
+    esac
+    pblt="$(key_gate_builtin "$prov")"
+    case "$pblt" in
+      certain:*)
+        while read -r pb; do
+          [ -n "$pb" ] || continue
+          if key_gate_value_present "$pb"; then phit="$pb"; break; fi
+        done <<< "$(printf '%s' "${pblt#certain:}" | tr ',' '\n')"
+        if [ -n "$phit" ]; then
+          [ "$quiet" = 1 ] && return 0
+          printf '[key-gate] %s check=ok box_default=%s model=%s provider=%s var=%s settings_json=%s source=pi-builtin-env — the CREDENTIAL for the startup pair this box pins resolves from the pi provider table (%s), which holds a value here, and %s/auth.json has NO entry for this provider; no models.json template applies\n' \
+            "$label" "$dm" "$dm" "$prov" "$phit" "$sj" "${pblt#certain:}" "${agent_dir:-<none>}"
+          return 0
+        fi
+        pvar="${pblt#certain:}"; pvar="${pvar%%,*}"
+        if [ "$quiet" = 1 ]; then
+          printf '[key-gate] %s check=warn reason=box-default-not-provisioned box_default=%s model=%s provider=%s var=%s settings_json=%s source=pi-builtin-env — this box pins its STARTUP model to %s, and NONE of the pi variables for this provider (%s) holds a value here, so a `pi` launched with NO model flag will NOT start on %s: pi uses the saved default only when the provider is provisioned and otherwise falls through to step 4 of `findInitialModel` — the first model with a valid key — so it either runs a model nobody pinned and spends tokens on it (the #2208 class), or exits 1 with `No API key found for the selected model.` %s Pin a PROVISIONED defaultProvider/defaultModel, or launch with `--provider … --model …` (agent-infra#3443)\n' \
+            "$label" "$dm" "$dm" "$prov" "$pvar" "$sj" "$dm" "${pblt#certain:}" "$dm" \
+            "$( [ -n "$sel" ] && printf 'THIS LANE PINS provider=%s model=%s, so this line does not stop it — every bare `pi` on this box is affected.' "${sel%%$'\t'*}" "${sel#*$'\t'}" )"
+          return 0
+        fi
+        cands="$(key_gate_candidates "$home" | paste -sd '|' - 2>/dev/null)"
+        [ -n "$cands" ] || cands="<none-derivable>"
+        printf '[key-gate] %s check=fail result=REFUSED reason=box-default-not-provisioned model=%s box_default=%s provider=%s var=%s settings_json=%s models_json=%s candidates=%s source=pi-builtin-env\n' \
+          "$label" "$dm" "$dm" "$prov" "$pvar" "$sj" "${agent_dir:+$agent_dir/models.json}" "${pblt#certain:}"
+        printf '[key-gate] %s: the STARTUP model this box pins (%s under provider %s) takes its credential from the pi provider table for that provider (%s), and NONE of those variables holds a value here — measured: `pi -p --no-session --provider %s --model %s` answers "No API key found for %s." and exits. This is a verdict about the PIN, NOT a claim that the box cannot run an agent: export %s (or point ENV_FILE at a file that does), or pin a provisioned pair.\n' \
+          "$label" "$dm" "$prov" "${pblt#certain:}" "$prov" "$dm" "$prov" "$pvar"
+        return "$KEY_GATE_REFUSED" ;;
+      uncertain:*)
+        pvar="${pblt#uncertain:}"; pvar="${pvar%%$'\n'*}"
+        pwhy="$(printf '%s\n' "$pblt" | sed -n 's/^why://p')"
+        [ "$quiet" = 1 ] && return 0
+        printf '[key-gate] %s check=warn reason=provider-credential-unverifiable provider=%s model=%s box_default=%s candidates=%s why=%s settings_json=%s — this pin names a provider pi ships whose credential needs more than that one variable (the pi note: %s), so this gate cannot decide the pin from the environment alone; the pin is NOT refused\n' \
+          "$label" "$prov" "$dm" "$dm" "$pvar" "${pwhy:-<none>}" "$sj" "${pwhy:-<none>}"
+        return 0 ;;
+    esac
     [ "$quiet" = 1 ] && return 0
-    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s box_default=%s provider=%s settings_json=%s — the apiKey template for the STARTUP provider is not resolvable, so nothing is asserted here\n' \
-      "$label" "$dm" "$dm" "$prov" "$sj"
+    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s box_default=%s provider=%s settings_json=%s — the apiKey template for the STARTUP provider is not resolvable, and the vendor built-in provider table names no environment variable for %s either, so nothing is asserted here\n' \
+      "$label" "$dm" "$dm" "$prov" "$sj" "$prov"
     return 0
   fi
   for n in $names; do
@@ -1619,6 +1843,21 @@ key_gate_assert_main() {
   local store_rc=1
   key_gate_stored_credential "$home" "$KEY_GATE_PROVIDER" "$cwd"; store_rc=$?
   names="$(key_gate_var "$home" "$KEY_GATE_PROVIDER")"
+  # ⛔ THE COMPOSER CAN TAKE THE TEMPLATE AWAY (round 28, P2, measured): `applyModelsJson` throws on `oauth` without a
+  # provider-level `baseUrl`, `composeProvider` catches and returns the built-in base, and the provider's own `apiKey`
+  # override is LOST with it — so the variable this template names is one pi never consults. Measured on the installed
+  # pi: `{"deepseek":{"apiKey":"$MYK","oauth":"radius"}}` with MYK unset and DEEPSEEK_API_KEY exported -> pi RAN on its
+  # built-in key (401 from deepseek), while this gate printed `check=fail result=REFUSED var=MYK`; the same box with MYK
+  # exported and no DEEPSEEK_API_KEY answered `No API key found for deepseek.` — i.e. the template was inert BOTH ways.
+  # So the names are dropped and the answer falls through to the store/built-in arms that pi actually resolves.
+  local drop="" discarded=0
+  drop="$(key_gate_compose "$home" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$cwd")"
+  if [ "$drop" = "oauth-no-baseurl" ] && [ -n "$names" ]; then
+    printf '[key-gate] %s check=warn reason=models-json-api-key-discarded why=oauth-no-baseurl provider=%s model=%s var=%s home=%s agent_dir=%s — a models.json for this provider sets `oauth` with no `baseUrl`, and the pi composer THROWS on that (`provider-composer.js:154`), so the provider apiKey override is discarded and $%s is NOT the variable pi resolves here; the answer below comes from the store and the provider built-in variable instead
+' \
+      "$label" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${names%%$'\n'*}" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${names%%$'\n'*}"
+    names=""; discarded=1
+  fi
   if [ "$store_rc" = "5" ]; then
     # The variable is unknown when the template is absent, so the line names the provider instead of pretending.
     KEY_GATE_VAR="${names:-<none>}"
@@ -1686,9 +1925,66 @@ key_gate_assert_main() {
     return 0
   fi
   if [ -z "$names" ]; then
-    # Blindness is not a refusal (see the header's polarity rule).
-    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s provider=%s home=%s — the apiKey template for this provider is not resolvable from %s (absent, unparseable, a literal, no python3, a `!command` value, or a provider pi authenticates itself), so NOTHING is asserted here\n' \
-      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}"
+    # ⛔ THE KIND DECIDES WHICH CANNOT-SAY THIS IS (round 28, P2, measured). See `key_gate_apikind`.
+    local akind blt bvar bwhy hit="" b
+    # A DISCARDED template is not "the file names a template" any more (round 28): pi drops the apiKey with the config,
+    # so the same built-in fallback applies as if the file named nothing for this provider.
+    if [ "$discarded" = "1" ]; then akind="none"; else akind="$(key_gate_apikind "$home" "$KEY_GATE_PROVIDER" "$cwd")"; fi
+    if [ "$akind" = "literal" ]; then
+      # pi provisions the provider from the literal itself (`resolveConfigValue` returns it unchanged), so there is no
+      # environment variable to assert AND no absence to refuse — a verdict here would be a false block on any box.
+      printf '[key-gate] %s check=skipped reason=literal-api-key-in-models-json provider=%s model=%s home=%s models_json=%s — %s declares a LITERAL `apiKey` for this provider (no `$NAME` reference), which pi uses as the credential itself, so NO environment variable is the question and nothing is asserted here\n' \
+        "$label" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${home:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}" "${KEY_GATE_MODELS_JSON:-models.json}"
+      return 0
+    fi
+    # ⛔ ONLY `absent`/`none` REACH THE BUILT-IN ARM (round 28, P3, measured): an UNPARSEABLE models.json and a READ
+    # THAT DID NOT FINISH are data this gate did not see, and pi may well read them at runtime — so they keep the
+    # cannot-say answer. A `!command` is pi's to evaluate. Refusing on either would be the false block this file's
+    # header forbids, and the suite's bound-fired arm caught exactly that.
+    case "$akind" in absent|none) ;; *)
+      printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s provider=%s home=%s — the apiKey template for this provider is not resolvable from %s (absent, unparseable, a literal, no python3, a `!command` value, or a provider pi authenticates itself), so NOTHING is asserted here\n' \
+        "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}"
+      return 0 ;;
+    esac
+    # ⛔ A BUILT-IN PROVIDER IS DECIDABLE WITHOUT models.json, AND THAT IS THE #3443 CELL SHAPE (round 28, P2,
+    # measured both directions on the installed pi): with no models.json at all, `pi -p --provider deepseek --model
+    # deepseek-flash` answers `No API key found for deepseek.` without DEEPSEEK_API_KEY and reaches the provider (401)
+    # with it. The old cannot-say here was rc 0 on a box pi dies on — the silence #3331 exists to remove, and the
+    # exact line the issue reports. pi's own table (`dist/env-api-keys.js` `getApiKeyEnvVars`) is the authority.
+    blt="$(key_gate_builtin "$KEY_GATE_PROVIDER")"
+    case "$blt" in
+      certain:*)
+        while read -r b; do
+          [ -n "$b" ] || continue
+          if key_gate_value_present "$b"; then hit="$b"; break; fi
+        done <<< "$(printf '%s' "${blt#certain:}" | tr ',' '\n')"
+        if [ -n "$hit" ]; then
+          printf '[key-gate] %s check=ok var=%s provider=%s model=%s home=%s source=pi-builtin-env — pi provisions this BUILT-IN provider from its own variable (%s), which holds a value in the environment this lane runs with, and %s/auth.json has NO entry for this provider; no models.json template applies here\n' \
+            "$label" "$hit" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${home:-<none>}" "${blt#certain:}" "${KEY_GATE_AGENT_DIR:-<none>}"
+          return 0
+        fi
+        bvar="${blt#certain:}"; bvar="${bvar%%,*}"
+        KEY_GATE_VAR="$bvar"; KEY_GATE_REASON="credential-missing"
+        printf '[key-gate] %s check=fail result=REFUSED reason=%s var=%s provider=%s model=%s agent_dir=%s models_json=%s candidates=%s source=pi-builtin-env\n' \
+          "$label" "$KEY_GATE_REASON" "$bvar" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}" "${blt#certain:}"
+        printf '[key-gate] %s: pi resolves this BUILT-IN provider from %s alone (its own table, `dist/env-api-keys.js`), and NOTHING in the environment this lane would run with holds a value for any of them — measured: `pi -p --no-session --provider %s --model %s` answers "No API key found for %s." and exits having done nothing. ⛔ ON A CELL THIS IS THE TRAP: HOME is redirected to the operational home (%s) so the operational layer is found, and the credential usually lives in the ACCOUNT home instead — export %s (or point ENV_FILE at a file that does) and re-dispatch. No models.json apiKey template is involved here (%s)\n' \
+          "$label" "${blt#certain:}" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "${CELL_HOME:-/tmp/cell-home}" "$bvar" "${KEY_GATE_MODELS_JSON:-<none>}"
+        return "$KEY_GATE_REFUSED" ;;
+      uncertain:*)
+        # A built-in whose env var alone is NOT the whole answer refuses NOTHING (see the table measured notes):
+        # the line names the variable to check so the operator has something to act on, and the polarity stays.
+        # ⛔ `candidates=` STAYS ONE TOKEN (round 28, P3): the measured reason used to be spliced into it, which put
+        # spaces in a field a scanner cuts — it is carried on its own `why=` field instead.
+        bvar="${blt#uncertain:}"; bvar="${bvar%%$'\n'*}"
+        bwhy="$(printf '%s\n' "$blt" | sed -n 's/^why://p')"
+        printf '[key-gate] %s check=warn reason=provider-credential-unverifiable provider=%s model=%s candidates=%s why=%s home=%s — this provider is one pi ships, but its credential needs more than that one variable (the pi note: %s), so this gate cannot decide it from the environment alone; NOTHING is refused, and the variable above is the one to check\n' \
+          "$label" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$bvar" "${bwhy:-<none>}" "${home:-<none>}" "${bwhy:-<none>}"
+        return 0 ;;
+    esac
+    # Blindness is not a refusal (see the header's polarity rule). pi has no env-var entry for this provider either,
+    # so this is the genuinely undecidable case (a provider pi authenticates through a registry this gate cannot read).
+    printf '[key-gate] %s check=skipped reason=cannot-resolve-provider-credential model=%s provider=%s home=%s — the apiKey template for this provider is not resolvable from %s (absent, unparseable, a literal, no python3, a `!command` value, or a provider pi authenticates itself), and the vendor built-in provider table names no environment variable for %s either, so NOTHING is asserted here\n' \
+      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "${home:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}" "$KEY_GATE_PROVIDER"
     return 0
   fi
   # EVERY name a multi-reference template names must hold a value (review cycle 1, P2): pi refuses the
@@ -1698,6 +1994,18 @@ key_gate_assert_main() {
     key_gate_value_present "$n" || { missing="$n"; break; }
   done
   [ -n "$missing" ] && KEY_GATE_VAR="$missing"
+  case "$drop" in
+    no-api:*|no-baseurl:*)
+      # ⛔ A MODEL DEFINITION pi CANNOT COMPOSE TAKES THE PROVIDER WITH IT WHEN THE PROVIDER IS NOT BUILT IN (round 28,
+      # P3, measured): `modelFromJson` throws on a missing `api`/`baseUrl`, the catch returns `base` (undefined for a
+      # custom provider) and `recomposeProvider` DELETES it — `pi -p --provider myprov --model m1` -> `Unknown provider
+      # "myprov"`. A BUILT-IN provider composes both from its own model (`findModelDefaults`), so the config survives and
+      # the assertion below stands. Warn-only: a provider this gate does not recognise must never block a lane.
+      if [ -z "$(key_gate_builtin "$KEY_GATE_PROVIDER")" ]; then
+        printf '[key-gate] %s check=warn reason=models-json-provider-dropped why=%s provider=%s model=%s var=%s models_json=%s — a model definition here declares neither `api` nor `baseUrl` and the provider body declares neither either, which makes the pi composer THROW; for a provider the vendor does not ship that DELETES the provider (measured: `pi -p --provider <custom> --model <id>` -> `Unknown provider`), so this credential assertion names a variable pi may never consult — check `pi --list-models`. A built-in provider composes both from its own model and is unaffected\n' \
+          "$label" "$drop" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${KEY_GATE_VAR:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}"
+      fi ;;
+  esac
   if [ -z "$missing" ]; then
     printf '[key-gate] %s check=ok var=%s provider=%s model=%s home=%s — the credential holds a value in the environment this lane runs with, and %s/auth.json has NO entry for this provider (so the environment is the source pi resolves)\n' \
       "$label" "$KEY_GATE_VAR" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}"
