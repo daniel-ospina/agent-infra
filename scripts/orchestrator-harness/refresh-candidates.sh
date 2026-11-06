@@ -4061,10 +4061,11 @@ queue_order_from_pool() {
   case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
   # ⛔ WHETHER THE BYTES MOVED IS REPORTED, NOT TYPED (review P3, cycle 10). Every arm below runs after EITHER
   # the `mv` OR the byte-identical `cmp` branch, so "INSTALLED" is false half the time. `_wrote` is the
-  # witness: it is initialised to 0 on the nothing-written path and set to 1 only on the `mv` branch above,
-  # and the `unranked` arm below reads it for exactly the same reason ("whether the bytes moved is reported,
-  # not assumed"). One sentence, decided by the write that actually happened — never by which branch the
-  # reader assumes was taken.
+  # witness: initialised to 0 BEFORE the `cmp`/`mv` branch — unconditionally, it is not a condition on the
+  # nothing-written path — and set to 1 only on the `mv` branch. BOTH readers use it for the same reason
+  # ("whether the bytes moved is reported, not assumed"): the `_inst_said` derivation immediately below and
+  # the `unranked` arm. One sentence, decided by the write that actually happened — never by which branch
+  # the reader assumes was taken.
   if [ "${_wrote:-0}" -eq 1 ]; then
     _inst_said="the reorder was DERIVED AND INSTALLED"
   else

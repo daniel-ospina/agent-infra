@@ -1730,19 +1730,50 @@ ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not rep
 # ⛔ AND IT MUST BE A LINE THE DRIVE ACTUALLY PRINTS (review P3, cycle 47). An indentation anchor still
 # matches a line that merely LOOKS like an echo: a heredoc BODY is printed text, not an executed statement,
 # and a decoy there became the witness — after which both guards were green over a function that printed
-# no arm at all (measured). So the candidates are filtered against a BASELINE drive of the unmutated source
+# no arm at all (measured). So candidates are filtered against a BASELINE drive of the unmutated source
 # and the first one it truly prints wins. That is a measurement, not an inference from the shape of a line.
+# ⛔ AND THE CANDIDATE SCAN EXCLUDES HEREDOC BODIES (review P2, cycle 48). "Occurs in the drive's stdout" is
+# satisfied by printed DATA, so a heredoc decoy still qualified — and `sort -u` could even PREFER it over the
+# real line, because nothing ties the chosen prefix to an executed `echo` unless the scan does. The awk below
+# tracks `<<WORD` to its terminator and never looks inside: a body cannot name an arm.
+_cands="$(awk '
+  BEGIN { hd = "" }
+  {
+    line = $0
+    if (hd != "") {
+      t = line; sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+      if (t == hd) hd = ""
+      next
+    }
+    if (match(line, /<<-?[ \t]*["\047]?[A-Za-z_][A-Za-z0-9_]*["\047]?/)) {
+      tok = substr(line, RSTART, RLENGTH)
+      sub(/^<<-?[ \t]*/, "", tok); gsub(/["\047]/, "", tok)
+      hd = tok
+    }
+    if (match(line, /^[ \t]*echo "\[[a-z]*\] [a-z -]*order/)) {
+      s2 = substr(line, RSTART, RLENGTH)
+      sub(/^[ \t]*echo "/, "", s2)
+      print s2
+    }
+  }' "$FNS" 2>/dev/null | sort -u)"
+# ⛔ AND EACH CHECK GRADES WITH THE WITNESS ITS OWN FIXTURE PRINTS (review P2, cycle 48). One global prefix is
+# not enough: §14c drives the SEVERITY arm and §14e drives the HEAD-NOT-NUMERIC arm, so a prefix that only
+# one of them emits made the other report "the mutant did not run" over a healthy source (measured, one
+# added `echo` in the severity arm). `_wit_in` therefore resolves the witness against THAT check's own
+# unmutated control run, and an unresolvable witness is a RED, never a literal.
+_wit_in() {  # _wit_in <control-output-file> -> the first candidate that output actually prints
+  while IFS= read -r _c; do
+    [ -n "$_c" ] || continue
+    if grep -qF "$_c" "$1" 2>/dev/null; then printf '%s' "$_c"; return 0; fi
+  done <<<"$_cands"
+  return 0
+}
 _base="$TMP/witness"; rm -rf "$_base"; mkdir -p "$_base/o"
 printf '300\n9\n200\n' > "$_base/o/candidates.txt"; printf '200\n300\n' > "$_base/o/.pool"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_base/drive.sh"
 ( cd "$_base" && HOME="$_base" bash drive.sh "$_base/o" ) > "$_base/out" 2>&1
-_wit=""
-while IFS= read -r _cand; do
-  [ -n "$_cand" ] || continue
-  if grep -qF "$_cand" "$_base/out" 2>/dev/null; then _wit="$_cand"; break; fi
-done <<<"$(grep -o '^[[:space:]]*echo "\[[a-z]*\] [a-z -]*order' "$FNS" 2>/dev/null | sed 's/^[[:space:]]*echo "//' | sort -u)"
-ck "the anti-vacuity witness is a prefix the UNMUTATED drive actually prints ('${_wit:-<none>}')" "$([ -n "$_wit" ] && echo 0 || echo 1)"
-_wit="${_wit:-[refresh] queue order}"
+_wit_base="$(_wit_in "$_base/out")"
+ck "the anti-vacuity witness is a prefix the UNMUTATED drive actually prints ('${_wit_base:-<none>}')" "$([ -n "$_wit_base" ] && echo 0 || echo 1)"
 
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
 MUT_NOSAT="$TMP/fns-nosat.sh"
@@ -1769,7 +1800,11 @@ else
   # all three, the drive dies, and the only predicate (absence of the clause) is satisfied by the failure —
   # the same "green on `command not found`" the drift guard was hardened for. The drive's own line is the
   # witness (measured: the correct mutation prints exactly one, a syntax-error mutant zero).
-  if ! grep -qF "$_wit" "$d/out" 2>/dev/null; then
+  # The control for THIS fixture is §14a's unmutated run over the same `.pool-sat`-less queue.
+  _wit_c="$(_wit_in "$TMP/sat/out")"
+  if [ -z "$_wit_c" ]; then
+    rc=1; echo "      no witness could be resolved for THIS fixture — the check cannot prove the mutated drive ran, so it does not pass"
+  elif ! grep -qF "$_wit_c" "$d/out" 2>/dev/null; then
     rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
   elif grep -q 'windows=TRUNCATED' "$d/out" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
 fi
@@ -2022,12 +2057,20 @@ done
 MUT_NOSAT2="$TMP/fns-nosat2.sh"
 sed -e 's/\$_sat_said"$/"/' -e 's/^\$_sat_said$//' "$FNS" > "$MUT_NOSAT2"
 if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said mutation did not apply — the sed anchor drifted"; else
-  _d="$_d14b"; { drive_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
+  _d="$_d14b"
+  # ⛔ ITS OWN CONTROL FIRST (review P2, cycle 48): this fixture lands on the HEAD-NOT-NUMERIC arm, not on the
+  # severity arm §14c drives, so the witness has to be resolved against an unmutated run of THIS fixture.
+  { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-ctl.sh"
+  ( cd "$_d" && HOME="$_d" bash drive-ctl.sh "$_d/o" ) > "$_d/out-ctl" 2>&1
+  { drive_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
   ( cd "$_d" && HOME="$_d" bash drive-mut.sh "$_d/o" ) > "$_d/out-mut" 2>&1
   # ⛔ AND THE MUTANT MUST HAVE RUN HERE TOO (review P3, cycle 45). This check had exactly the defect §14c
   # was hardened for one commit earlier: a dead driver satisfies "the clause is absent" for the wrong
   # reason. Same witness, derived the same way.
-  if ! grep -qF "$_wit" "$_d/out-mut" 2>/dev/null; then
+  _wit_e="$(_wit_in "$_d/out-ctl")"
+  if [ -z "$_wit_e" ]; then
+    rc=1; echo "      no witness could be resolved for THIS fixture — the check cannot prove the mutated drive ran, so it does not pass"
+  elif ! grep -qF "$_wit_e" "$_d/out-mut" 2>/dev/null; then
     rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
   elif grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
 fi
