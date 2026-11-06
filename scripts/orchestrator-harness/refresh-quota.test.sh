@@ -168,6 +168,67 @@ SH
   shell_valid "$d/bin/gh"
 }
 
+# mk_gh_sat <case-dir> — a `gh` stub whose TIER listings answer a FULL page (100 rows) with a
+# `link: … rel="next"` header, so `rest_list` ends the window FULL with more still advertised and sets
+# `REST_WINDOW_FILLED=1` — the exact condition the `.pool-sat` writer records.
+# ⛔ EVERY ROW CARRIES AN ASSIGNEE, so the shared `POOL_JQ` drops all of them: the POOL stays empty (the
+# reorder is not what §7 grades) while the WINDOW is genuinely truncated. The URL decides whether the
+# Link header is sent — only `labels=` listings are tiers; `/issues?` keeps its no-Link shape so the
+# reaper's `.open_iss` read is not turned into a spurious "0 rows but a next page" refusal.
+# ⛔ The bodies are DELIBERATELY quoted heredocs (`<<'SH'`) and derive `d` from `$0`, so nothing is
+# interpolated: this file's own header warns that an interpolating heredoc can serve empty bodies while
+# still parsing. §7 grades a WRITER, so a stub bug must redden an assertion, never silently write nothing.
+mk_gh_sat() {
+  local d="$1"
+  cat > "$d/bin/gh.body" <<'SH'
+#!/bin/bash
+# ⛔ THE CASE DIR IS THE PARENT OF bin/ (the wrapper in bin/ sets ITS `d` to bin/). Deriving it as
+# `dirname "$0"` here pointed `core` at bin/core: the budget then read 0 and the pass refused
+# "remaining=0 cannot buy one candidate", which reddened the positive case for a fixture reason.
+d="$(cd "$(dirname "$0")/.." && pwd)"
+charge() { local c; c="$(cat "$d/core")"; c=$(( c - $1 )); [ "$c" -lt 0 ] && c=0; printf '%s' "$c" > "$d/core"; }
+rows_page() {  # 100 ASSIGNED rows: POOL_JQ drops every one, so only the WINDOW is exercised
+  local i out="["
+  for i in $(seq 1 100); do
+    [ "$i" -gt 1 ] && out="$out,"
+    out="$out{\"number\":$((500+i)),\"title\":\"assigned $i\",\"assignees\":[{\"login\":\"someone\"}]}"
+  done
+  printf '%s]' "$out"
+}
+case "$*" in
+  "auth token") exit 0 ;;
+  "api rate_limit") printf '{"resources":{"core":{"remaining":%s},"graphql":{"remaining":4990}}}\n' "$(cat "$d/core")" ;;
+  *"labels=P0-blocker"*|*"labels=P1-severe"*|*"labels=P2-moderate"*) charge 1; rows_page ;;
+  *"/pulls?"*) charge 1; printf '[]\n' ;;
+  *"/issues?"*) charge 1; printf '[]\n' ;;
+  *) printf '[]\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
+  shell_valid "$d/bin/gh.body"
+  cat > "$d/bin/gh" <<'SH'
+#!/bin/bash
+d="$(cd "$(dirname "$0")" && pwd)"
+if [ "$1" = api ] && [ "$2" = -i ]; then
+  shift 2
+  printf '%s\n' "$*" >> "$d/gh.argv"
+  out="$("$d/gh.body" api "$@" 2>"$d/.gh.err")"; rc=$?
+  [ -s "$d/.gh.err" ] && cat "$d/.gh.err" >&2
+  rm -f "$d/.gh.err"
+  [ "$rc" -eq 0 ] || exit "$rc"
+  # The `-i` framing, with a `Link` header on TIER listings ONLY (a tier is the query that carries
+  # `labels=`). Emitted by separate printf calls so the escapes are the FORMAT's, not -v's.
+  printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n'
+  case "$*" in *labels=*) printf 'link: <https://api.github.com/x?page=2>; rel="next"\r\n' ;; esac
+  printf '\r\n%s\n' "$out"
+  exit 0
+fi
+exec "$d/gh.body" "$@"
+SH
+  chmod +x "$d/bin/gh"
+  shell_valid "$d/bin/gh"
+}
+
 # mk_tool <path> — the pre-flight stand-in. Charges the MODELED board rebuild unless the pass-scoped
 # cache is enabled (then only the first invocation pays), records the cache seam it was handed, and
 # answers CLEAN so a queued candidate is observable.
@@ -418,6 +479,54 @@ for _tier in P0-blocker P1-severe P2-moderate; do
     *) bad "tier-order: $_tier listing has no direction=asc — a truncated tier would lose its OLDEST members: $_url" ;;
   esac
 done
+
+# ── 7) A CLIPPED TIER WINDOW IS RECORDED BY THE WRITER, NOT ONLY READ BACK (review cycle 36, P2) ──
+# ⛔ WHY THIS ARM EXISTS — MEASURED, NOT IMAGINED. The `.pool-sat` READER and its SANITISER are pinned in
+# `rank-queue.test.sh` §14b/§14c, but those cases HAND-WRITE the fixture (`printf 'P1-severe\n' >
+# …/.pool-sat`), so they grade the consumer. Deleting the three `>> "$O/.pool-sat"` lines from the SHIPPED
+# tier block left `rank-queue` at 106/0 and this suite at 28/0 — i.e. the ONLY disclosure this change has
+# for the cross-tier truncation residual (a clipped `P1` landing behind every ranked `P2`) could go inert
+# without a single red, while the order line went on printing a clean `severity-first`. A signal whose
+# producer is untested is a signal that can vanish quietly; that is this repo's "an enforcer whose red path
+# has never been executed" class.
+# This arm drives the shipped tier block: a FULL page with `rel="next"` is exactly `REST_WINDOW_FILLED=1`.
+mk_case sat-writer 1000
+mk_gh_sat "$D"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+SAT="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"; 
+case "$SAT" in
+  *P0-blocker*) ok "truncation-writer: a FULL tier window with a next page still advertised is RECORDED — .pool-sat names P0-blocker" ;;
+  *) bad "truncation-writer: .pool-sat does NOT name the truncated tier (got '${SAT:-<absent>}') — the producer the order line's windows=TRUNCATED() disclosure rests on wrote nothing" ;;
+esac
+# ⛔ NON-VACUITY, THE POINT OF THE ARM: delete the three writer lines from the SHIPPED script and the
+# assertion above must be the one that reddens. Without this, the case could pass on a fixture artifact
+# (a stale file, a `d` that never resolved) and pin nothing about the writer.
+mk_case sat-writer-mut 1000
+mk_gh_sat "$D"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+MUT_SAT="$T/mut-sat/refresh-candidates.sh"; mkdir -p "$T/mut-sat"
+sed '/\[ "\${REST_WINDOW_FILLED:-0}" = "1" \] && echo "P[012]-[a-z]*" >> "\$O\/\.pool-sat"/d' \
+  "$REFRESH" > "$MUT_SAT"
+if cmp -s "$REFRESH" "$MUT_SAT" 2>/dev/null; then
+  bad "truncation-writer: the writer-deletion mutation did not apply — the sed anchor drifted, so the non-vacuity check below would pass by vacuity"
+else
+  REFRESH_SAVED="$REFRESH"
+  REFRESH="$MUT_SAT"; rf "$D" refresh; REFRESH="$REFRESH_SAVED"
+  if [ -s "$D/o/.pool-sat" ]; then
+    bad "truncation-writer: with the .pool-sat writer DELETED the record was still written ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the fixture, not the writer, is producing it"
+  else
+    ok "truncation-writer: deleting the three .pool-sat writes removes the record (the check above can fail, so it grades the WRITER)"
+  fi
+fi
+# And the NEGATIVE: an ordinary short listing (no full window, no next page) records NOTHING, so the
+# clause cannot appear on the routine path where no tier was clipped.
+mk_case sat-writer-none 1000
+mk_gh "$D" "$(rows 2)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+[ ! -s "$D/o/.pool-sat" ] && ok "truncation-writer: an UNSATURATED listing writes no .pool-sat (the clause is not emitted for a tier that fit)" \
+                          || bad "truncation-writer: .pool-sat exists for an unsaturated listing ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the signal would fire on every pass and stop meaning anything"
 
 echo
 echo "  $PASS passed, $FAIL failed"
