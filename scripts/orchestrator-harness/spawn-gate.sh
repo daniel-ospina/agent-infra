@@ -1147,6 +1147,14 @@ cap_wip_snapshot() {
 # dirty or unreadable. A per-lane push for every clean lane would be a rate-limit defect of its own, on
 # an account 22 concurrent landers already share.
 LANE_END_TREE=""        # dirty | clean | unpushed-only | cannot-verify | not-a-worktree | not-measured
+# ⛔ `dirty` AND "the listing was complete" ARE TWO FACTS, NOT ONE (fresh review, P1 — REPRODUCED).
+# `git status --porcelain -uall` can BOTH name dirty paths AND print a warning (a chmod'ed directory, an
+# extract owned by another user). The classification used to read that as `dirty` and never consult
+# `st_noise`, so the incompleteness was dropped: the porcelain section was published as the worktree's
+# state while a modified file the walk never reached was in NEITHER that section NOR any archive — and
+# the remedy still said "retrieve the archive … before removing", i.e. remove after archiving something
+# that is not the whole tree. This flag carries the second fact to the caveat that reports it.
+LANE_END_LISTING_INCOMPLETE=0
 LANE_END_RESCUE=""      # refs/wip/<slug> | archived-local | nothing | FAILED | UNAVAILABLE | DISABLED
 LANE_END_REF=""         # the LOCAL refs/wip-local pin; empty over an archive only when the callee could not write it
 LANE_END_UNPUSHED=0     # commits on this branch that exist only locally — and since #3396 they are PUSHED
@@ -1163,6 +1171,15 @@ LANE_END_ROOT=""        # the tree that was MEASURED — the only column that ca
 # `pushed` arm precisely because the phrase was a function-local, i.e. available only where its author
 # happened to be working. A shared constant is the fix for the class, not for the ten.
 LANE_END_LOCAL_SCOPE="held by NO ref in this repo's LOCAL refs/remotes/* cache (a CACHE — a deleted remote branch, and a ref some OTHER name holds, are not visible here, and this is NOT a claim about any remote)"
+# ⛔ `archived-local` DOES NOT PROVE THE ARCHIVE IS COMPLETE (fresh review, P1 — REPRODUCED). The verdict is
+# assigned on `rc2 != 0` plus "a ref this run wrote", and `bg-rescue-wip.sh` exits 2 for BOTH a PARTIAL
+# archive and a failed push. Its skipped paths are in NEITHER `refs/wip-local/<slug>` NOR `refs/wip/<slug>`,
+# so "retrieve the archive … before removing" named a retrieval that does not cover the tree — an operator
+# who did exactly that destroyed work no archive held. `terminal_wip_rescue`'s own `[wip]` NOTE says this
+# out loud ("read the replayed lines above for which one this was — this line does not guess"), and that
+# restraint has to reach the REMEDY too, which is the line a reclaim pass actually obeys. Defined once and
+# appended through a %s slot by every `archived-local` remedy.
+ARCHIVE_MAY_BE_PARTIAL=" — AND this archive may be PARTIAL: bg-rescue-wip.sh exits 2 both for a partial archive and for a push that failed, so any path it reported as unarchivable is in NEITHER this ref NOR any other archive named here, and is on this disk alone — read the replayed rescue lines above and retrieve those paths by hand before removing anything"
 LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 # ── THE DURABLE EXIT ARTIFACT (the other half of #2834 ask 1; sibling of #3391) ─────────────────
 # ⛔ WHAT THE #2834 FIX DID NOT DO, AND WHY THAT HALF COSTS A CELL ITS DISK. The exit path above
@@ -1476,7 +1493,7 @@ lane_end_push() {
   case "$_protected" in
     *" $sym "*)
       LANE_END_PUSH="refused-protected"
-      echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but $sym is a LANDING branch of this remote (checked against:$_protected) and this exit path will NOT push it — a landing branch moves only through the repo's merge rail with a recorded review, and a push from a dying lane would bypass both. Nothing was pushed; the commits are in the local object store" >> "$log" 2>/dev/null || true
+      echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but $sym is in the set of names this exit path TREATS as landing branches (checked against:$_protected) and it will NOT push it — a landing branch moves only through the repo's merge rail with a recorded review, and a push from a dying lane would bypass both. ⛔ WHICH NAME IN THAT SET IS MEASURED IS NOT UNIFORM: '$def' is the remote's default as 'ls-remote --symref' answered it, while 'main'/'master' are convention and the clone's cached refs/remotes/origin/HEAD is a CACHE that a renamed default leaves stale (a plain fetch does not re-point it) — so the REFUSAL is sound and this sentence is not a claim that $sym is provably this remote's landing branch. Nothing was pushed; the commits are in the local object store" >> "$log" 2>/dev/null || true
       declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
       return 0 ;;
   esac
@@ -2016,9 +2033,9 @@ lane_end_next() {
         # configuration this code deliberately supports (and refuses across, when it cannot prove them
         # equal) — so naming `origin` here points the reader at a repository nobody read, while
         # `push_url=` two lines away in the same artifact names the right one. Same fix, both arms.
-        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so only the uncommitted work is local-only\n' \
+        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so only the uncommitted work is local-only%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
-          "$(lane_end_push_repo)" "${LANE_END_ORIGIN:-<sha>}"; return 0 ;;
+          "$(lane_end_push_repo)" "${LANE_END_ORIGIN:-<sha>}" "$ARCHIVE_MAY_BE_PARTIAL"; return 0 ;;
       nothing)
         # ⛔ `unpushed=0` IS A MEASUREMENT ABOUT THE **LOCAL TRACKING REFS**, NOT ABOUT THE REMOTE (review of
         # PR #3399, P1 — REPRODUCED). It used to read "every commit on %s is already on a remote ref", which
@@ -2031,12 +2048,12 @@ lane_end_next() {
         # bounded `ls-remote --heads` upgrades a row to `remote-holds:`. The sentence is now scoped to what
         # was read, so it cannot state more safety than the enumeration covered. The `unpushed=0` token is
         # kept literally (arms N31b pin it).
-        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and only the uncommitted work is local-only\n' \
+        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and only the uncommitted work is local-only%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
-          "${LANE_END_BRANCH:-<unknown>}"; return 0 ;;
+          "${LANE_END_BRANCH:-<unknown>}" "$ARCHIVE_MAY_BE_PARTIAL"; return 0 ;;
     esac
-    printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the branch push recorded push=%s, which this artifact does NOT classify — it asserts neither delivery nor absence for it, so read the [lane-exit] line in the lane log before removing anything, and do NOT read the archive as the only copy of the branch\n' \
-      "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_PUSH:-<unset>}"; return 0
+    printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the branch push recorded push=%s, which this artifact does NOT classify — it asserts neither delivery nor absence for it, so read the [lane-exit] line in the lane log before removing anything, and do NOT read the archive as the only copy of the branch%s\n' \
+      "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_PUSH:-<unset>}" "$ARCHIVE_MAY_BE_PARTIAL"; return 0
   fi
   # ⛔ `unpushed-only` IS NOT A DIRTY TREE (review cycle 2, finding 3 — REPRODUCED). `at_risk=0` for a
   # clean tree, so `rescue=nothing` deterministically and NO `refs/wip/<slug>` is ever created — yet this
@@ -2173,7 +2190,7 @@ lane_end_next() {
 lane_end_rescue_caveat() {
   case "${LANE_END_RESCUE:-}" in
     FAILED|UNAVAILABLE) printf ' \u2014 AND the uncommitted work at %s is NOT archived either (rescue=%s)' "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE}" ;;
-    archived-local) printf ' \u2014 the uncommitted work is archived to the LOCAL pin %s only (no off-box copy)' "${LANE_END_REF:-refs/wip-local/<slug>}" ;;
+    archived-local) printf ' \u2014 the uncommitted work is archived to the LOCAL pin %s only (no off-box copy)%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;;
   esac
 }
 # ⛔ THE PUSH DOMAIN'S MANUAL FACT, EXPRESSED ONCE (review cycle 19, P2). The two rescue MANUAL arms
@@ -2243,6 +2260,12 @@ lane_end_tree_caveat() {
   case "${LANE_END_TREE:-}" in
     cannot-verify) printf ' \u2014 AND the tree listing was NOT PROVEN complete (tree=cannot-verify): the paths it never saw are in NEITHER the porcelain section NOR any archive named here' ;;
   esac
+  # ⛔ THE `dirty` HALF OF THE SAME FACT (fresh review, P1 — REPRODUCED). A listing that named dirty paths
+  # AND warned is still an INCOMPLETE walk; without this arm `dirty` was the one verdict that could never
+  # carry the caveat, so "retrieve the archive, then remove" read as covering the whole tree.
+  if [ "${LANE_END_LISTING_INCOMPLETE:-0}" = 1 ]; then
+    printf ' \u2014 AND the tree listing was NOT PROVEN complete even though it named dirty paths (git status WARNED): the paths it never saw are in NEITHER the porcelain section NOR any archive named here, so an archive retrieved from this row is NOT the whole worktree'
+  fi
 }
 
 lane_end_unpushed_col() {
@@ -2407,6 +2430,7 @@ terminal_wip_rescue() {
   local st_errf="" st_noise=0 st_note="" cv_status=0 root_top root_real root_top_real why=""
   root="${WIP_PATH:-$PWD}"
   LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0; LANE_END_ROOT="$root"
+  LANE_END_LISTING_INCOMPLETE=0
   # ⛔ THE DURABLE-ARTIFACT GLOBALS ARE RESET **HERE**, AT THE TOP, BEFORE THE OPERATOR HATCH BELOW CAN
   # RETURN. `fix-one.sh` calls `run_agent` more than once in one shell, so a second terminal would
   # otherwise inherit the FIRST one's branch/head/push verdict and this marker would describe a tree it
@@ -2500,10 +2524,17 @@ terminal_wip_rescue() {
   if [ "$st_rc" -ne 0 ]; then
     LANE_END_TREE="cannot-verify"; at_risk=1; cv_status=1
   elif [ -n "$st_out" ]; then
-    # A listing that DID name dirty paths is the stronger fact, whether or not it also warned: the
-    # rescue runs either way, and `dirty` is what was actually measured. `cannot-verify` is reserved
-    # for the case where the listing is EMPTY and we cannot prove it is complete.
+    # A listing that DID name dirty paths is the stronger fact for the TREE column, whether or not it also
+    # warned: the rescue runs either way, and `dirty` is what was actually measured. `cannot-verify` is
+    # reserved for the case where the listing is EMPTY and we cannot prove it is complete.
+    # ⛔ BUT "WHICH TREE IS THIS" AND "DID THE WALK SEE ALL OF IT" ARE TWO QUESTIONS (fresh review, P1 —
+    # REPRODUCED). Setting `dirty` and moving on DROPPED the second one, so `lane_end_tree_caveat` — whose
+    # only arm was `cannot-verify` — never fired for the one shape that both names paths AND warns. The
+    # consequence was not cosmetic: an operator was told to retrieve the archive and then remove the
+    # worktree, while a modified file outside the walk was in NEITHER the porcelain section NOR the
+    # archive. The flag is what makes the caveat reachable here; `cv_status` makes the log say it out loud.
     LANE_END_TREE="dirty"; at_risk=1
+    if [ "${st_noise:-0}" -gt 0 ]; then LANE_END_LISTING_INCOMPLETE=1; cv_status=1; fi
   elif [ "${st_noise:-0}" -gt 0 ]; then
     LANE_END_TREE="cannot-verify"; at_risk=1; cv_status=1
   elif [ "$unpushed_ok" != 1 ]; then
@@ -2516,7 +2547,12 @@ terminal_wip_rescue() {
   else
     LANE_END_TREE="clean"
   fi
-  if [ "$cv_status" = 1 ]; then
+  if [ "${LANE_END_LISTING_INCOMPLETE:-0}" = 1 ]; then
+    # ⛔ THE `dirty`-AND-WARNED SHAPE, NAMED BEFORE THE EMPTY-LISTING ONE (fresh review, P1 — REPRODUCED).
+    # The message below says "an EMPTY listing does NOT mean clean", which is the wrong cause here: the
+    # listing was NOT empty. Reusing it would have been a second false statement in the fix for the first.
+    echo "[wip] ⛔ label=$label: the worktree listing at $root is INCOMPLETE ($st_note) AND it named dirty paths — so the porcelain section is NOT all of them, and any path the walk never reached is in NEITHER that section NOR any archive named in this row. Do NOT read 'the archive holds what was listed' as 'the archive holds the worktree' — do NOT reap this worktree until the listing is complete" >> "$log"
+  elif [ "$cv_status" = 1 ]; then
     echo "[wip] ⛔ label=$label: the worktree listing at $root is INCOMPLETE ($st_note) — an EMPTY listing does NOT mean clean, so this is NOT a clean verdict. The rescue is attempted on what could be read rather than skipped, because 'no output' and 'nothing changed' are different measurements (a chmod'ed directory, an extract owned by another user, a corrupt index)" >> "$log"
   elif [ "$LANE_END_TREE" = "cannot-verify" ]; then
     # ⛔ THE OTHER CAUSE, NAMED SEPARATELY: `git status` was complete and quiet, and the UNPUSHED count
