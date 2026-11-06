@@ -403,8 +403,12 @@ repo_set_check() {
     #
     # THE RULE, THEN, AND IT IS THE WHOLE RULE: only a PROVEN fault refuses. A slug the doctor's own
     # `_origin_slug()` returns that differs from the declared one is proven. Everything else — absent,
-    # denied, not a directory, no `origin`, no `git`, no `python3` — is UNVERIFIABLE and warns, and the
-    # pass grades that repo read-only, which is exactly what the doctor does with the same evidence.
+    # denied, not a directory, no `origin`, no `git`, no `python3` — is UNVERIFIABLE and warns.
+    #
+    # ⛔ AND A WARN IS A STATEMENT ABOUT THIS ENTRY'S CHECKOUT, NOT ABOUT THE PASS. The doctor resolves
+    # each entry through `_checkout_that_proves()`, which falls back to `REPO` and then the cwd, so it
+    # may still find a spawnable checkout for this slug and may grade read-only if it does not. The
+    # reader cannot know which; promising "nothing will be spawned" was overreach (review round 5).
     local proof why
     proof="$(_rs_origin_slug "$checkout")"; why="${proof#*$'\t'}"; proof="${proof%%$'\t'*}"
     if [ -n "$proof" ]; then
@@ -412,7 +416,13 @@ repo_set_check() {
         problems="$problems; $checkout is a checkout of $proof, not $slug — refusing to grade a repo the checkout does not prove"
       fi
     else
-      printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves no repo (%s); its queue will be graded read-only and nothing will be spawned\n' "$slug" "$checkout" "$why"
+      # ⛔ THIS WARNS ABOUT *THIS ENTRY'S OWN* CHECKOUT, AND DOES NOT PROMISE THE OUTCOME (review
+      # round 5, P2). `run_all_repos()` passes the entry to `resolve_repo()`, whose `_checkout_that_
+      # proves()` falls back to `REPO` and then the cwd when the entry's own checkout proves nothing —
+      # so the doctor CAN still find a spawnable checkout for this slug, and "nothing will be
+      # spawned" was a promise this reader cannot make. What it can state is the fact it measured:
+      # THIS checkout proves no repo.
+      printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves no repo (%s); the doctor may still adopt another checkout for this repo, or grade it read-only\n' "$slug" "$checkout" "$why"
     fi
 
     if [ -n "$state" ]; then
