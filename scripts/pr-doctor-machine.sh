@@ -164,14 +164,23 @@ case "$_rc" in
     #     refused here with "no repo to name", while the doctor would have run a full pass.
     _degraded=""
     _why_not=""
-    _seam="$(printf '%s' "${PR_DOCTOR_REPO:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-    _seam_dir="${PR_DOCTOR_REPO_DIR:-}"
-    _or="$(printf '%s' "${OR:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    # ⛔ ALL FOUR ARE TRIMMED, BECAUSE `resolve_repo()` TRIMS ALL FOUR (review round 5, P2). The slug
+    # seams were trimmed and the two PATH seams were used raw, so a value carrying surrounding
+    # whitespace — a CRLF `keys.env` is the measured shape — made the reader's proof fail
+    # (`os.path.isdir` on the padded path) while the doctor saw a clean one, and the two reached
+    # OPPOSITE verdicts: `OR` + a CR-padded `REPO` printed "Grading the ONE repo …" and the doctor
+    # then refused the pair, while a bare CR-padded `REPO` was refused here with "is not a directory"
+    # for a path that plainly is one (the CR is invisible in the message). One trim rule, every value.
+    _trim() { printf '%s' "${1:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'; }
+    _seam="$(_trim "${PR_DOCTOR_REPO:-}")"
+    _seam_dir="$(_trim "${PR_DOCTOR_REPO_DIR:-}")"
+    _or="$(_trim "${OR:-}")"
+    _repo="$(_trim "${REPO:-}")"
     _proved=""; _proved_why=""
-    if [ -n "${REPO:-}" ]; then
+    if [ -n "$_repo" ]; then
       # The reader's own proof function — the same one `check` uses, and it is pr-doctor's own
       # `_origin_slug()` underneath, so the two cannot disagree.
-      _p="$(_rs_origin_slug "$REPO")"; _proved_why="${_p#*$'\t'}"; _proved="${_p%%$'\t'*}"
+      _p="$(_rs_origin_slug "$_repo")"; _proved_why="${_p#*$'\t'}"; _proved="${_p%%$'\t'*}"
     fi
 
     # ⛔ EACH SEAM IS DECISIVE AT ITS OWN RANK, exactly as `resolve_repo()` treats it: rank 2
@@ -211,23 +220,30 @@ case "$_rc" in
       if [ -z "$_or_n" ]; then
         _why_not="OR='$_or' is not an owner/name slug"
       elif [ -n "$_proved" ] && [ "$(_rs_lower "$_proved")" != "$(_rs_lower "$_or_n")" ]; then
-        _why_not="the box names two different repos: OR=$_or but REPO=$REPO is a checkout of $_proved"
+        _why_not="the box names two different repos: OR=$_or but REPO=$_repo is a checkout of $_proved"
       else
         _degraded="$_or_n"; _say "  Grading the ONE repo this unit declares in OR=$_or_n."
       fi
     fi
     if [ "$_decided" = 0 ] && [ -n "$_proved" ]; then
-      _degraded="$_proved"; _say "  Grading the ONE repo REPO proves: $_proved (from $REPO)."
+      _degraded="$_proved"; _say "  Grading the ONE repo REPO proves: $_proved (from $_repo)."
     fi
 
     if [ -z "$_degraded" ]; then
       if [ -n "$_why_not" ]; then _say "  $_why_not — so this pass has NO usable repo."; fi
-      if [ -n "${REPO:-}" ] && [ -z "$_proved" ] && [ "$_decided" = 0 ]; then
-        _say "  REPO=$REPO proves no repo ($_proved_why)."
-      elif [ -z "${REPO:-}" ] && [ -z "$_seam" ] && [ -z "$_or" ]; then
+      if [ -n "$_repo" ] && [ -z "$_proved" ] && [ "$_decided" = 0 ]; then
+        _say "  REPO=$_repo proves no repo ($_proved_why)."
+      elif [ -z "$_repo" ] && [ -z "$_seam" ] && [ -z "$_or" ]; then
         _say "  Neither PR_DOCTOR_REPO, OR nor REPO is set — so this pass has NO repo to name."
       fi
-      _say "REFUSING — a pass with no usable repo would exit 2 on its first line, having graded nothing."
+      # ⛔ THE REASON IS STATED, AND IT IS A DELIBERATE DIFFERENCE FROM THE DOCTOR (review round 5,
+      # P2). `resolve_repo` has a rank-5 arm — the CURRENT WORKING DIRECTORY's `origin` — so "would
+      # exit 2 on its first line" was false for a unit or hand-run whose cwd happens to be a checkout.
+      # This wrapper does not adopt an ambient cwd (the #2238/#2280 doctrine: the box's directory is
+      # not the box's declaration), and it says so instead of asserting a fact about the doctor.
+      _say "REFUSING — no repo is DECLARED for this pass."
+      _say "  (The doctor would fall back to the current directory's git origin; this wrapper does not"
+      _say "   adopt an ambient cwd, because a working directory is not a declaration.)"
       _say "  Fix, either way:"
       _say "    (1) create the repo set above — one line per repo this box serves; or"
       _say "    (2) set PR_DOCTOR_REPO=OWNER/NAME or OR=OWNER/NAME (or point REPO at a checkout whose git origin proves it)."

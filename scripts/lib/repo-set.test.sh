@@ -359,6 +359,16 @@ ck "f24 no set + PR_DOCTOR_REPO as a URL -> RUNS (the doctor own parser normalis
    'REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=https://github.com/daniel-ospina/agent-infra.git HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
 ck "f25 no set + PR_DOCTOR_REPO and a PR_DOCTOR_REPO_DIR of ANOTHER repo -> REFUSES" \
    '[ "$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=daniel-ospina/tortoise PR_DOCTOR_REPO_DIR="$T/decoy" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
+# ⛔ EVERY SEAM IS TRIMMED LIKE `resolve_repo()` TRIMS IT (review round 5, P2). A CRLF `keys.env` is
+# the measured shape: a CR on `REPO` made the reader's proof fail while the doctor resolved cleanly,
+# so the two reached opposite verdicts (and the message showed a path that "is not a directory" for a
+# path that plainly is one — the CR is invisible).
+ck "f26 OR + a CR-padded REPO -> REFUSES, matching the doctor (the pair disagrees)" \
+   'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise REPO="$T/agent-infra"$'"'"'\r'"'"' HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null | grep -q "two different repos"'
+ck "f27 a CR-padded REPO alone -> RUNS (the trim, not a false refusa) " \
+   'REPO_SET_FILE="$nofile" REPO="$T/tortoise"$'"'"'\r'"'"' HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+ck "f28 the refusal asserts no fact about the DOCTOR (rank 5 exists, so its reason is stated, not claimed)" \
+   'o="$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "current directory" && ! printf "%s" "$o" | grep -q "would exit 2 on its first line"'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
