@@ -6,7 +6,7 @@
 # Exits 0 when ALL assertions pass, 1 on any failure. Hermetic: every log and
 # lock is a fixture in a temp directory, and the scripts are driven with `HOME`
 # pointed there, so no real state is read or written. Host facilities used:
-# `mktemp`, `mkdir`, `grep`, `sed`, `wc`, `tr`, `cat`, `basename`, `date`, `touch`, and `bash -n`.
+# `mktemp`, `mkdir`, `grep`, `sed`, `wc`, `tr`, `cat`, `basename`, `date`, `touch`, `chmod`, and `bash -n`.
 #
 # ⛔ THREE SCRIPTS, TWO KINDS OF PROBE. `stat -f %m` (mtime) is repaired in
 # `monitor-worker.sh` and `lane-scan-fallback.sh`; `stat -f %z` (size) is repaired in
@@ -63,31 +63,55 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/mtime-probe-portability.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 
 # ⛔ THE EXECUTED VIEW DROPS *FULL-LINE AND TRAILING* COMMENTS — never `cat`, and never a
-# column-0-only strip. Three ways a comment alone satisfies a positive arm, all measured:
+# column-0-only strip. Four ways a comment alone satisfies a positive arm, all measured:
 #   * `grep -v '^#'`  — leaves INDENTED comments (the probe in `lane-scan-fallback.sh` sits inside
 #     an `if`, so a comment written next to it is indented by construction);
 #   * `grep -v '^[[:space:]]*#'` — still leaves a TRAILING comment. `MTIME="$(stat -c %Y "$LOG")"
 #     \  # equivalently: date -r "$LOG" +%s` carried `date -r` in its view and passed 16/16 while
 #     being GNU-only, i.e. the one defect these arms exist to catch;
+#   * `sed 's/[[:space:]]#.*$//'` — still leaves a comment that starts a WORD without preceding
+#     whitespace. Bash opens a comment at a word boundary, so `;# …` (and `&#`, `|#`, `(#`) is a
+#     comment the space-anchored strip does not see. Measured: the GNU-only probe
+#     `MTIME="$(stat -c %Y "$LOG" 2>/dev/null || echo 0)";# equivalently date -r "$LOG" +%s`
+#     scored PASS=23 FAIL=0 on this suite, i.e. the pin was satisfiable by a comment again;
 #   * `cat` — leaves every comment.
-# So: strip trailing comments FIRST, then drop what remains that is a full-line comment.
-executed_view() { sed 's/[[:space:]]#.*$//' "$1" | grep -v '^[[:space:]]*#'; }
+# So: strip trailing comments FIRST from a WORD START (line start, whitespace, or a shell
+# metacharacter), then drop what remains that is a full-line comment.
+# ⛔ A text view is still only a PREFILTER: the mtime arms are paired with a BEHAVIOURAL run on a
+# modelled BSD-like host (below), so a spelling this view cannot see is still red if it breaks.
+executed_view() { sed -E 's/(^|[[:space:];&|()<>`])#[^"`]*$/\1/' "$1" | grep -v '^[[:space:]]*#'; }
 
 echo
 echo "── executed-view pins (the rationale MAY name the trap; executed code may not) ──"
+# ⛔ WHAT IS PINNED IS THE ONE-SIDED BSD-FIRST PROBE, NOT THE SPELLING `date -r`. A TWO-SIDED chain
+# (`stat -c %Y … || stat -f %m …`, GNU first) is portable on both platforms and is the idiom
+# `scripts/check-portability-traps.sh:1344` blesses and `orchestrator-harness/auto-rail.sh:341`
+# already ships — measured: this suite red it 2/2 before this rule was written, i.e. a later lane
+# re-spelling a file to main's OWN idiom got a red suite for correct code.
 for f in "$MONITOR" "$LANE_SCAN"; do
     name="$(basename "$f")"
-    assert_not_contains "$(executed_view "$f")" 'stat -f %m' \
-        "$name reads no mtime with the BSD-only 'stat -f %m'"
-    assert_contains "$(executed_view "$f")" 'date -r' \
-        "$name reads mtime with a form that works on GNU and BSD"
+    view="$(executed_view "$f")"
+    one_sided="$(grep -n 'stat -f %m' <<<"$view" | grep -v 'stat -c' || true)"
+    assert_eq "$one_sided" "" \
+        "$name carries no ONE-SIDED BSD-first 'stat -f %m' (a two-sided chain is fine)"
+    if grep -qF -- 'date -r' <<<"$view" || grep -qF -- 'stat -c' <<<"$view"; then
+        ok "$name reads mtime with a form that works on GNU and BSD (date -r, or a two-sided stat chain)"
+    else
+        bad "$name reads mtime with a form that works on GNU and BSD (missing: date -r / a two-sided stat chain)"
+    fi
 done
 # unblock-lane.sh is the SIZE probe, not the mtime one: `stat -f %z` is the same GNU mis-parse
 # (`-f` = --file-system), and its positive replacement is `wc -c`, not `date -r`.
 assert_not_contains "$(executed_view "$UNBLOCK")" 'stat -f' \
     "unblock-lane.sh reads no size with the BSD-only 'stat -f'"
-assert_contains "$(executed_view "$UNBLOCK")" 'wc -c' \
-    "unblock-lane.sh reads size with a form that works on GNU and BSD"
+# ⛔ COUNTED, not merely present. `assert_contains 'wc -c'` is satisfied by ONE surviving occurrence,
+# so reverting a single probe of the three to GNU-only `stat -c %s` scored PASS=23 FAIL=0 — measured.
+# All three (the before-read, the loop read, and the not-resumed report) must be the portable form.
+# The view has already dropped every comment, so this counts REAL uses only.
+assert_eq "$(executed_view "$UNBLOCK" | grep -c 'wc -c' || true)" 3 \
+    "all THREE unblock-lane.sh size probes read with the portable 'wc -c' (a partial revert is a regression)"
+assert_not_contains "$(executed_view "$UNBLOCK")" 'stat -c %s' \
+    "unblock-lane.sh reads no size with the GNU-only 'stat -c %s' (the mirror of the BSD-only trap)"
 
 echo
 echo "── the shipped probe actually dates a real file (no non-numeric value) ──"
@@ -121,6 +145,51 @@ touch -t "$(date -v-2H +%Y%m%d%H%M 2>/dev/null || date -d '2 hours ago' +%Y%m%d%
 out="$(bash "$MONITOR" "$OLD" 60 2>&1)"; rc=$?
 assert_eq "$rc" 1 "an aged log exits 1 (STALE)"
 assert_contains "$out" 'appears STALE' "an aged log is reported STALE"
+
+echo
+echo "── the FAILING HOST, modelled: a BSD-like stat (accepts -f, refuses -c) ──"
+# ⛔ A TEXT VIEW IS A PREFILTER, NOT A PROOF (#3509 review round 6). Two measured escapes, both
+# closed here by BEHAVIOUR instead of by another spelling:
+#   * a comment can satisfy a positive arm — the `;#` form above scored PASS=23 FAIL=0 on a
+#     GNU-ONLY probe, so no amount of comment-stripping makes the text arms sufficient on their own;
+#   * a spelling pin reds correct code — a GNU-first `stat -c || stat -f` chain is portable and this
+#     repo blesses it, yet the `date -r`-only pin red it 2/2.
+# On a BSD-like host `stat -f %m` works and `-c` is refused, which is exactly what macOS does; the
+# scripts must read a real mtime there whichever portable idiom they use, and a GNU-only one must not.
+SHIM="$T/bsd-like-stat"
+mkdir -p "$SHIM"
+cat > "$SHIM/stat" <<'SHIM_EOF'
+#!/usr/bin/env bash
+# BSD-like `stat`: `-f <fmt>` is the macOS spelling and works; `-c` is not an option.
+[ "${1:-}" = "-f" ] || { printf 'stat: illegal option -- %s\n' "${1#-}" >&2; exit 1; }
+case "${2:-}" in
+    %m) exec date -r "${3:?}" +%s ;;
+    %z) wc -c <"${3:?}" | tr -d '[:space:]' ;;
+    *)  printf 'stat: unsupported format %s\n' "${2:-}" >&2; exit 1 ;;
+esac
+SHIM_EOF
+chmod +x "$SHIM/stat"
+# NON-VACUITY, BOTH WAYS: a shim that broke every stat would red correct code, and a shim that
+# accepted everything would model nothing. Pin the two facts the arms below rest on.
+if [ -n "$(PATH="$SHIM:$PATH" stat -f %m "$FRESH" 2>/dev/null)" ]; then
+    ok "the modelled host ACCEPTS 'stat -f %m' (as macOS does) — the arms below are not vacuous"
+else
+    bad "the modelled host REFUSES 'stat -f %m' — it does not model macOS, so it cannot certify anything"
+fi
+if PATH="$SHIM:$PATH" stat -c %Y "$FRESH" >/dev/null 2>&1; then
+    bad "the modelled host ACCEPTS 'stat -c' — a GNU-only probe would pass it vacuously"
+else
+    ok "the modelled host REFUSES 'stat -c' (GNU-only), which is the platform this suite exists for"
+fi
+# ⛔ THE ARMS. A GNU-only probe fails BOTH (it cannot read the mtime at all); a portable one —
+# `date -r <path>` or the two-sided chain — passes BOTH, which is what "works on GNU and BSD" means.
+out="$(PATH="$SHIM:$PATH" bash "$MONITOR" "$FRESH" 60 2>&1)"; rc=$?
+assert_eq "$rc" 0 "on a BSD-like host a FRESH log still exits 0"
+assert_contains "$out" 'worker is ALIVE' \
+    "on a BSD-like host the worker reads ALIVE (the probe needs no GNU-only stat)"
+out="$(PATH="$SHIM:$PATH" bash "$MONITOR" "$OLD" 60 2>&1)"; rc=$?
+assert_eq "$rc" 1 "on a BSD-like host an AGED log still reads STALE (a probe hardcoding now cannot pass both)"
+assert_contains "$out" 'appears STALE' "on a BSD-like host an aged log is reported STALE"
 
 echo
 echo "── lane-scan-fallback.sh: the LOCK AGE is computed (behavioural, not textual) ──"
@@ -199,7 +268,12 @@ assert_contains "$out" "session $BEFORE_BYTES -> $AFTER_BYTES bytes" \
 # ⛔ MUTANT NAMED: restoring `wc -c <"$F" 2>/dev/null` (or `<"$F"` with the redirection last) reds
 # this arm. It accepts BOTH correct spellings — `wc -c 2>/dev/null <"$F"` and
 # `{ wc -c <"$F"; } 2>/dev/null` — so it pins the DEFECT, not one of its fixes.
-leaky="$(executed_view "$UNBLOCK" | grep 'wc -c' | grep -F '<"$F" 2>/dev/null' || true)"
+# ⛔ SPELLING-INDEPENDENT (#3509 review round 6): a literal `grep -F '<"$F" 2>/dev/null'` misses the
+# SAME leak written `< "$F" 2>/dev/null` (one space, valid bash) — measured PASS=23 FAIL=0, while
+# `out=$(wc -c < "$F" 2>/dev/null)` still prints `/bin/bash: … No such file or directory` on bash
+# 5.2.21. The pattern therefore allows whitespace around the redirection and either variable spelling.
+leaky="$(executed_view "$UNBLOCK" | grep 'wc -c' \
+    | grep -E '<[[:space:]]*"\$\{?F\}?"[[:space:]]*2>/dev/null' || true)"
 assert_eq "$leaky" "" \
     "no wc -c probe puts 2>/dev/null after the input redirection (the error would leak into the report)"
 
