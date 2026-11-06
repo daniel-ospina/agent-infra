@@ -355,7 +355,11 @@ denied_copy_variant() {
   # (they end in `.ts`). Split on the separators real names use, lower-case, and require EVERY remaining
   # part to be a copy marker or a version/number.
   local segs
-  segs="$(printf '%s' "$rest" | tr 'A-Z' 'a-z' | tr '._- ' '\n\n\n\n' | sed '/^$/d')"
+  # `-` FIRST in the tr set. It is literal only first-or-last, and LAST is the space here:
+  # GNU tr reads `._ -` as the range `_`-` ` and dies with "range-endpoints … in reverse
+  # collating sequence order" (measured on a cell), while BSD tr accepts it — so the arm
+  # passed locally and the sweep silently matched nothing on Linux.
+  segs="$(printf '%s' "$rest" | tr 'A-Z' 'a-z' | tr -- '-._ ' '\n\n\n\n' | sed '/^$/d')"
   [ -z "$segs" ] && return 0                 # the entry itself, or the entry re-spelled `.ts`/`.js`
   while IFS= read -r seg; do
     case "$seg" in
