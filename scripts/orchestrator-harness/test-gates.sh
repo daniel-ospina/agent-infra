@@ -1533,7 +1533,11 @@ FAKE
   else
     echo "  ✅ no fixer spawn site is left on the unraised MAX_FIX (absence pin)"; PASS=$((PASS+1))
   fi
-  wpin "the gate receives the WORKABLE UNOWNED count" "$ORCH" 'GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"'
+  # ⛔ THE NAME CHANGED, THE INPUT DID NOT (owner ruling 2026-11-04). `merge-priority` no longer
+  # ASSIGNS `GATE_WHY` (that assignment was the barrier); it is computed into `MP_PRIORITY`, from the
+  # SAME workable-un-owned count and the SAME four arguments. The pin follows the binding, because a
+  # pin that followed the old spelling would have graded a line the controller no longer runs.
+  wpin "the cascade receives the WORKABLE UNOWNED count" "$ORCH" 'MP_PRIORITY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"'
   # ⛔ ONE POPULATION PER CYCLE: the total and its parts are computed together from the RICHEST source
   # that read — state/last-open-prs first, the swept REST set only as its FALLBACK (GraphQL is the
   # listing that fails first under a rate limit, which is why OPEN_N can be a synthetic number), and
@@ -3683,6 +3687,10 @@ if [ "$(printf '%s' "$GV" | grep -c .)" -lt 10 ]; then
 else
   gv() { # gv [VAR=value ...] -> "GATE_WHY<TAB>GATE_VEC"; sane defaults, then the caller's overrides
     ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=0
+      # ⛔ THE CYCLE COMPUTES THESE BEFORE THE VECTOR BLOCK, so the rig must model them too: without
+      # them `set -u` aborts the whole eval and EVERY arm below reads as a failure for one cause that
+      # is not the arm's (measured: 13 assertions red on an unbound variable).
+      MP_PRIORITY=""; CASCADE_ISSUE_SLOTS=""
       FORK_STARVED=0; FORK_WHY=""; CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000
       LANES_UNKNOWN=0; LANES=0; MAX_LANES=20; L=1; MAX_LOAD=12
       CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none
@@ -3706,12 +3714,18 @@ else
   # ⛔ THE MEASURED CO-BINDING CASE (#2924 indicator (b)). merge-priority fires AND the queue is deep
   # AND slots are free. The winner must STILL be merge-priority — the vector is additive, never a
   # change of decision — while the queue arm is now VISIBLE beside it.
-  _t="$(gv GATE_WHY='merge-priority(2 un-owned PR(s))' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
+  # ⛔ THE ASSERTION WAS INVERTED BY THE OWNER'S REFINEMENT (2026-11-04): `merge-priority` now
+  # ORDERS and no longer DECIDES, so the winner here must be the CAPACITY arm it used to mask — and
+  # the priority must still be legible on the vector. The old form asserted that merge-priority WON,
+  # i.e. it pinned the barrier the refinement removes; keeping it would have made the suite demand
+  # the defect back.
+  _t="$(gv MP_PRIORITY='merge-priority(2 un-owned of 15 open PR(s) — PRs before issues)' UPN_WORK=2 CIQ=1 CIQ_RC=0 \
            CIQ_VER='deep(queued=44 running=5 runners=~3 ceiling=6)' LANES=3 MAX_LANES=20)"
   _why="$(printf '%s' "$_t" | cut -f1)"; _vec="$(printf '%s' "$_t" | cut -f2)"
   case "$_why" in
-    merge-priority*) echo "  ok (v3) the winner is UNCHANGED (merge-priority still decides the cycle)" && PASS=$((PASS+1)) ;;
-    *) echo "  ❌ (v3) the vector changed the DECISION (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
+    merge-priority*) echo "  ❌ (v3) merge-priority DECIDED the cycle again — the barrier is back (winner: $_why)"; FAIL=$((FAIL+1)) ;;
+    ci-queue*) echo "  ok (v3) the priority ORDERS and the capacity arm it masked now decides the cycle" && PASS=$((PASS+1)) ;;
+    *) echo "  ❌ (v3) the winner is neither the capacity arm nor merge-priority: $_why"; FAIL=$((FAIL+1)) ;; esac
   case "$_vec" in
     *'merge-priority('*) echo "  ok (v4) …and merge-priority is in the vector" && PASS=$((PASS+1)) ;;
     *) echo "  ❌ (v4) merge-priority is missing from the vector: $_vec"; FAIL=$((FAIL+1)) ;; esac
@@ -3793,6 +3807,7 @@ ARMS
   # false on 3 of 5 branches. These two cases drive the door from the UNREADABLE and out-of-range
   # branches specifically, which is where a broken listing actually lands.
   _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=''; FORK_STARVED=0; FORK_WHY=""
+         MP_PRIORITY=""; CASCADE_ISSUE_SLOTS=""
          CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
          L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
          SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
@@ -3804,6 +3819,7 @@ ARMS
   [ "$_why" = "<open>" ] && echo "  ok (v19) the emergency door covers the UNREADABLE branch too" && PASS=$((PASS+1)) \
     || { echo "  ❌ (v19) an emergency did not stand the floor down on an UNREADABLE count: $_why"; FAIL=$((FAIL+1)); }
   _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=99999999999999999999; FORK_STARVED=0
+         MP_PRIORITY=""; CASCADE_ISSUE_SLOTS=""
          FORK_WHY=""; CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0
          LANES=0; MAX_LANES=20; L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none
          CIQ=0; CIQ_RC=1; CIQ_VER=""; SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0
@@ -3821,6 +3837,7 @@ ARMS
     landing-floor*) : ;;  # baseline only — the assertion is the stand-down below
     *) echo "  ❌ (v17) baseline: the floor did not arm without an emergency (winner: $_why)"; FAIL=$((FAIL+1)) ;; esac
   _t="$( GVX=1; ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=68; FORK_STARVED=0; FORK_WHY=""
+         MP_PRIORITY=""; CASCADE_ISSUE_SLOTS=""
          CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
          L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
          SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512
@@ -3851,6 +3868,7 @@ ARMS
   # the reason nowhere — the silent-threshold defect, one field over. v21 drives the exemption and
   # asserts it is named in the vector, which is what feeds `FLOOR_VERDICT`.
   _t="$( ( GATE_WHY=""; UPN=0; UPN_WORK=0; SEL_TOTAL=0; OPEN_N=68; FORK_STARVED=0; FORK_WHY=""
+         MP_PRIORITY=""; CASCADE_ISSUE_SLOTS=""
          CAP_FORK_BOUND_SELF=""; FORK_PROCS=100; FORK_MAX=4000; LANES_UNKNOWN=0; LANES=0; MAX_LANES=20
          L=1; MAX_LOAD=12; CAP_STATE=ok; CAP_PLACE=""; CAP_BOUND=none; CIQ=0; CIQ_RC=1; CIQ_VER=""
          SWTOTAL=0; SWFREE=99999; MIN_SWAP_FREE=600; MEM_UNKNOWN=0; MEMAVAIL_MB=4096; MIN_MEM_FREE_MB=512

@@ -65,7 +65,7 @@ measurement** — and is marked as such.
 | epic row (or mandate item) | measured 2026-10-24 | verdict |
 |---|---|---|
 | `eldato-orchestrator` on cell-4 — the epic's false-PASS example: *"cell-4's controller unit is `inactive` and it still looked healthy in the fleet report"* | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402), with `MainPID = /bin/bash …/cloud-cell-supervisor.sh start`, whose journal line is `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)` | **The proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, live `merge-*` worker sessions — 3 at 14:46Z, 2 at 14:47Z). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
-| **precedence rule: ">N unmerged PRs ⇒ merging outranks new work"** — the epic's cell: *"❌ implemented nowhere"* | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's mandate item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §6, `OVERRIDES:`). |
+| **precedence rule: ">N unmerged PRs ⇒ merging outranks new work"** — the epic's cell: *"❌ implemented nowhere"* | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** ⛔ **CORRECTED 2026-11-04:** the *observable* quoted in this row (`nothing=gate:merge-priority_(…)`) is now stale — `merge-priority` no longer assigns `GATE_WHY`, so it no longer appears as a gate at all; it is a LEVEL of the five-level cascade (§6). The row's verdict (no threshold) still holds, and the ordering it describes still ships; what changed is that the ordering stopped being a barrier. #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's mandate item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §6, `OVERRIDES:`). |
 | **universal dispatcher (one seam: place this lane on the machine with headroom)** — the epic's cell: *"❌ two ad-hoc scripts (`dispatch_generic.py`, `nonblocking-dispatch.sh`)"* | `capacity.sh` ships `cap_probe_local` / `cap_publish` / `cap_read_fleet` / `cap_place`, is sourced each cycle by `orch-loop.sh` (from `$O`, falling back to its own directory), and every cycle writes `[capacity] placement=… place=… lpc_self=… ceiling_lpc=… bound=…`. Cell-4's cycle record: `placement=place placed_on=cmux bound=none lpc_self=57` | **The seam exists.** Its *real* defect is different and worse: **its fleet view collapses to one box** (§3.10, measured). |
 | *"no machine except the Mac has an actuator that lands anything"* (the epic's own reading of its table) | tortoise **16 PRs merged in the 8 h to 14:50Z**, two of them at **14:47:28Z** and **14:47:52Z**; agent-infra **11** in the same window; cell-4 held live `merge-*` worker sessions at 14:46Z | **Cells do land work.** ⚠️ Attribution is the gap: **no landing record carries the box that landed it** (§3.3), so "can this machine land?" is unanswerable from the artifacts — which is the dispatcher's own question. |
 | **`pr-doctor` actually running** (epic: ❌ on every cell) | cell-4: `pgrep -f '[p]r-doctor.py'` → `0`; `pr-doctor.log` mtime `2026-10-22T12:55:05Z` (2 days); `0` systemd/launchd units matching `pr-doctor` | ✅ **Confirmed on cell-4.** Peers `UNREADABLE` (§1.1). |
@@ -221,7 +221,8 @@ remaining half.
 last line `date: write error: No space left on device` — while the controller was cycling and landing.
 
 **What repairs it.** `nothing=gate:load…` → wait (a load refusal clears itself). `gate:merge-priority`
-→ drain the queue: this is the gate working, not a fault. `placement=refuse bound=…` → the *fleet*
+(since 2026-11-04: a `[cascade] priority=…` line, not a `gate:` refusal) → drain the queue: this is the
+priority working, not a fault. `placement=refuse bound=…` → the *fleet*
 needs a box (`load_per_cpu`), a prune (`disk`), or a restart (`fork_*`). `DEGRADED` (freshness) →
 restart the controller (`cloud-cell-supervisor.sh stop && start`; on the Mac `install.sh --restart`,
 never `unload -w`). `FORK-STARVED` → **from outside the box** (nothing inside can fork to clean up).
@@ -986,6 +987,31 @@ still where the next cut should start.
   merge-queue scheduler — the fleet decided against a number here, because a gate whose opening
   condition the automation cannot meet is a **drain defect, not a licence to open the gate**
   (measured 2026-10-18: three cells at `52 unowned of 54 open PRs`, `lanes=0`, for HOURS).
+- **⭐ THE PRECEDENCE IS AN ORDER, NOT A BARRIER — and "PRs before issues" survives as a level.**
+  Owner ruling 2026-11-04: the controller fills work down a **five-level cascade** — (1) fix main if
+  red, (2) merge PRs, (3) fix PRs with post-review findings, (4) the review→findings→fix→re-review
+  loop, (5) open new issue work — draining each level before descending, and descending only into the
+  capacity the spawn gates left free. **The 2026-10-18 ruling above is REFINED, not reversed**: the
+  ORDERING (PR work outranks new work, and is attempted first) is kept exactly; what is removed is its
+  second effect — that *any* un-owned PR closed the issue path unconditionally. Measured cost of that
+  second effect, 1,219 consecutive cycles: `dispatched>0` in **8** of them (**0.66%**), always
+  `dispatched=2`, i.e. **0.054 issues/h against an 8.1/h bound (0.7%)**, while the PR path consumed
+  8.59 workers/h — the box was saturated by PR work and produced almost nothing else, and the same
+  barrier is what let a stalled drain hide behind itself.
+  - **Spawn gates remain the ONLY capacity limit** (`MAX_LANES`, `MAX_LOAD`, the memory floor, fork
+    headroom via `can_spawn`). The cascade adds no pacing, no nap, no new threshold. Level 5 is
+    *lowest priority, not blocked*.
+  - **An unreadable un-owned count still fails CLOSED** (no room granted) — the polarity that used to
+    ride along inside the barrier is now enforced where the room is granted, because losing it would
+    make a rate-limited `gh` listing the one condition that dispatches new work.
+  - **`merge-priority` no longer assigns `GATE_WHY`**, so it can no longer mask a capacity gate: it is
+    computed into `MP_PRIORITY` and printed as a level, and the capacity arms decide the cycle.
+  - Graded by `test-cascade.sh` (102 assertions, 15 mutants — each mutation makes a named assertion go
+    RED) plus the existing `test-gates.sh` vector tests, `live-ownership.test.sh` and
+    `pr-owner-liveness.test.sh`.
+  **OVERRIDES:** the "WIP limit / stop-starting threshold" reading of the 2026-10-18 ruling — i.e. the
+  absolute "ANY un-owned PR ⇒ the issue path is closed" barrier — because it produced measurable
+  throughput collapse (0.66% of cycles dispatched), not because a vendor or a standard says so.
 - **Dispatch is gated on capacity, not on a lane count.** Owner ruling 2026-10-17: *"dispatch should be
   gated on capacity, not on number of lanes"* (`MAX_LANES` is 2.5×cores as a derived *ceiling*, and
   `capacity.sh` explicitly refuses to be a lane cap).

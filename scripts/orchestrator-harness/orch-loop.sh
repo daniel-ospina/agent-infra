@@ -1781,10 +1781,15 @@ is_limit "${STALE_MIN:-}" || STALE_MIN=40
 # same module the spawner uses, so "what the controller counts", "what it reaps" and "what it starts"
 # cannot disagree. The tmux sessions it used to kill are still covered: they are in the same census.
 reap_stale_workers() {
-  local s f age m
+  local s f age m _wn=0 _wl=""
   while IFS="$(printf '\t')" read -r s _st; do
     case "$s" in ''|*[!A-Za-z0-9-]*) continue ;; esac
-    case "$s" in merge-*|lane-*|fix-*) : ;; *) continue ;; esac
+    # ⛔ `review-*` IS IN THIS LIST NOW (owner ruling 2026-11-04) AND IT WAS THE EXPENSIVE OMISSION.
+    # A reviewer reads the PR through `gh` and holds no branch, so it is invisible to the cwd probe;
+    # the census is the ONLY thing that knows it exists — and this reaper did not walk its records.
+    # A hung reviewer therefore held its PR owned (via the census) AND held a lane slot, for ever: the
+    # exact corpse `lane-bound.sh` measured (a `pi` parked in `ep_poll` at 0 bytes / 0 CPU for 3h32m).
+    case "$s" in merge-*|lane-*|fix-*|review-*) : ;; *) continue ;; esac
     f="$O/logs/$s.log"
     [ -f "$f" ] || continue
     # An unreadable mtime means the age is UNKNOWN, and unknown is not evidence of a hang: skip the
@@ -1793,6 +1798,9 @@ reap_stale_workers() {
     # (#1702): set -u turned the unassigned `age` into `File: unbound variable`.
     m="$(file_mtime_epoch "$f")" || continue
     age=$(( $(date +%s) - m ))
+    # The wedge measurement the cascade reports (owner ask: "check for wedged lanes"). Counted here,
+    # at the ONE place that already walks the census with an age, rather than in a second walk.
+    if [ "$age" -gt $(( $( _wedge_min ) * 60 )) ]; then _wn=$(( _wn + 1 )); _wl="${_wl:+$_wl,}$s(${age}s)"; fi
     [ "$age" -gt $(( 10#${STALE_MIN} * 60 )) ] || continue
     echo "[reap-worker] $s silent ${age}s -> closing its worker surface" >> "$LOG"
     # ⛔ A KILL THAT CANNOT BE PROVEN IS NOT A KILL. wt_close() re-reads the surface after closing and
@@ -1805,6 +1813,17 @@ reap_stale_workers() {
   done <<EOF
 $(wt_table)
 EOF
+  # ⛔ THE COUNT IS PRINTED EVEN WHEN IT IS ZERO-BOUND, because a silent reaper is the same defect
+  # class as a silent threshold: an operator reading `lanes=0/25` beside an idle box must be able to
+  # tell "nothing wedged" from "nothing looked". `find` over the logs is the only new cost and it is
+  # one call. `wedged=` counts records past the EXCLUSION bound (`_wedge_min`), which is twice the
+  # reaper's own bound — i.e. a record that survived two reap attempts, the only state in which a
+  # corpse can still be holding a PR.
+  if [ "${_wn:-0}" -gt 0 ]; then
+    echo "[reap-worker] wedged=$_wn records alive past $( _wedge_min )m with no log progress: $_wl — these are EXCLUDED from ownership this pass (the PRs they held are dispatchable again) and are re-closed every cycle until the close can be proven" >> "$LOG"
+  else
+    echo "[reap-worker] wedged=0 (no worker record is alive past $( _wedge_min )m with a log that has stopped advancing)" >> "$LOG"
+  fi
 }
 
 heartbeat() { date +%s > "$O/heartbeat"; }
@@ -2934,10 +2953,15 @@ park_ctrl() { # park_ctrl <pr> <head> <reason…> — returns non-zero when the 
   printf '%s\n' "$3" > "$O/state/parkreason-$1" && printf '%s\n' "$2" > "$O/state/parked-$1"
 }
 
-# Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs.
+# Merge priority: PR work OUTRANKS new work and is dispatched FIRST. It is a LEVEL, not a barrier —
+# the box fills down a five-level cascade (fix main → merge → fix PRs → review PRs → open issues) and
+# new issue work takes only the capacity the levels above it left free. `mp_reason` therefore produces
+# a PRIORITY LABEL (`MP_PRIORITY`), not a gate: it never assigns `GATE_WHY`, so it can never mask a
+# capacity gate. ⛔ Refined by the owner ruling of 2026-11-04; the 2026-10-18 ruling's ORDER is kept and
+# its absolute BARRIER is dropped (`cascade_issue_slots` below carries the `OVERRIDES:` line).
 # These functions hold the rule so it is directly testable (and so a regression cannot hide behind a
 # comment):
-#   mp_reason    -> the gate reason when draining should outrank dispatching (empty otherwise)
+#   mp_reason    -> the ordering label ("N un-owned of M open PR(s) — PRs before issues"), empty if none
 #   review_slots -> reviewer concurrency, with headroom once a backlog exists
 #   fix_slots    -> fixer concurrency, the SAME headroom (see the note on fix_slots)
 # ⛔ THE THRESHOLD IS GONE AND THAT IS THE FIX (owner ruling, 2026-10-18). This used to gate on
@@ -2957,6 +2981,231 @@ mp_reason() { # <unowned_prs> <lanes> <workers> [<open_prs>]
   if [ "${1:-0}" -gt 0 ]; then
     echo "merge-priority (${1} un-owned of ${4:-${1}} open PR(s) — PRs before issues)"
   fi
+}
+
+# ── THE PRIORITY CASCADE: merge-priority ORDERS, IT DOES NOT BARRIER (owner ruling 2026-11-04) ────
+# ⛔ THE MEASURED DEFECT THIS REPLACES. `mp_reason` was assigned to `GATE_WHY`, and `GATE_WHY` is the
+# ONE string that closes the issue path, so on a box holding any un-owned PR the issue batch could not
+# run at ANY capacity. Live record, 1,219 cycles: `dispatched>0` in 8 (0.66%), each exactly
+# `dispatched=2` — 16 issues in 12.45 days = 0.054/h against an 8.1/h pacing bound (0.7%) — while the
+# PR path ran 8.59 workers/h in the same window. The loop was not idle; it was entirely consumed by PR
+# takeovers and never started an issue. Two independent causes, both fixed here and in `pr_owned`: the
+# count called PRs "un-owned" when review/fix/CI was live (so it never reached zero), and the gate made
+# "un-owned" an absolute bar rather than a priority.
+# ⛔ WHAT THE OWNER ASKED FOR, IN HIS OWN SENSE: "we should launch that first priority", then cascade
+# to the rest of the capacity. So the ORDER survives exactly as recorded — PR work is dispatched first
+# and takes slots first (the sweep runs earlier in this pass and its spend is already in `LANES` when
+# the issue batch asks for room) — and the BARRIER goes. What bounds the fleet is unchanged and is the
+# ONLY thing that bounds it: MAX_LANES, MAX_LOAD, the memory floor and fork headroom, all of which
+# still close `GATE_WHY` exactly as before. This allocator adds no pacing, no threshold and no age;
+# it answers one question: how many ISSUES may be queued for the room those gates have left.
+# ⛔ OVERRIDES: the 2026-10-18 owner ruling "while ANY un-owned PR remains, issues are not opened",
+# AS AN ABSOLUTE BAR — kept as the ORDER (PRs before issues, first call on every free slot), dropped
+# as a barrier (an idle lane may not be held while a dispatchable issue waits). Reason: 0.7% issue
+# dispatch over 12.45 days with 6 workers spawned per pass, i.e. the absolute form produced neither
+# draining nor producing. The WIP-limit ruling (`LANDING_FLOOR`, "the fleet is FORCED to raise the
+# landing rate rather than open a 68th PR") is NOT reversed and NOT touched: it is a separate arm on
+# the TOTAL open count, it keeps its own gate, and it can still close the issue path on its own.
+cascade_issue_slots() { # <max_lanes> <lanes> <backlog> [<can_spawn 0|1>] -> issues this pass may queue
+  local maxl="${1:-}" lanes="${2:-}" bl="${3:-0}" ok="${4:-1}" room iss
+  # An unreadable room is NOT room (the same polarity the lane census itself takes: an unreadable
+  # census must not ADD work), and neither is a refused capacity probe.
+  is_num "${maxl:-}" && is_num "${lanes:-}" || { printf '0\n'; return 0; }
+  is_num "${bl:-}" || bl=0
+  [ "${ok:-1}" = "1" ] || { printf '0\n'; return 0; }
+  room=$(( maxl - lanes ))
+  [ "$room" -gt 0 ] || { printf '0\n'; return 0; }
+  # ⛔ ONE ISSUE COSTS TWO WORKER RECORDS. dispatch-merge.sh starts `lane-<N>` and then the
+  # `chain-<N>` that lands its PR (two `wt_spawn` sites), so the room in LANES overstates the room in
+  # ISSUES by 2x. Halving is the only reading that cannot overshoot MAX_LANES; a room of one still
+  # buys one issue (a lane that parks early never attaches its chain), so the floor is 1, never 0,
+  # whenever the box has room at all. `BATCH` is NOT consulted: it is a pacing cap, and the owner's
+  # ask is explicit that a pass must not stop at one batch while capacity sits idle.
+  iss=$(( room / 2 ))
+  [ "$iss" -ge 1 ] || iss=1
+  [ "$iss" -le "$bl" ] || iss="$bl"
+  printf '%s\n' "$iss"
+}
+
+# cascade_wait <nap_seconds> -> 0 the moment a slot is free (re-cycle NOW) · 1 the interval expired.
+# ⛔ "DO NOT NAP FOR A FIXED 240s WHILE SLOTS SIT IDLE" (owner ask 3). When a pass ends with zero room
+# and work waiting, the interval is spent POLLING the same census the gate reads, so the box re-cycles
+# the instant a lane finishes instead of sleeping through it. The poll is CASCADE_POLL seconds (20) —
+# a measurement cadence, not a pacing rule: it decides nothing except how soon the same question is
+# asked again, and the loop's own bound (the jittered CYC interval) still ends it.
+cascade_wait() { # <nap_seconds>
+  local left="${1:-0}" poll="${CASCADE_POLL:-20}" used=0 ok
+  is_num "${left:-}" || left=0
+  is_num "${poll:-}" || poll=20
+  [ "$poll" -ge 1 ] || poll=20
+  [ "$left" -gt 0 ] || return 1
+  while [ "$left" -gt 0 ]; do
+    [ "$left" -lt "$poll" ] && poll="$left"
+    fork_free_sleep "$poll" || sleep "$poll" 2>/dev/null
+    left=$(( left - poll )); used=$(( used + poll ))
+    L="$(load1)"
+    measure_lanes
+    ok=0; can_spawn && ok=1
+    if [ "$(cascade_issue_slots "${MAX_LANES:-}" "${LANES:-}" "1" "$ok")" -gt 0 ]; then
+      echo "[cascade] a slot freed after ${used}s (lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?}) — RE-CYCLING NOW instead of napping the rest of the ${CYC:-240}s interval. Owner ruling 2026-11-04: fill the capacity, do not sleep through it." >> "$LOG"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ── THE FIVE LEVELS: a champagne flute, filled from the top down ────────────────────────────────
+# ⛔ THE ALLOCATOR ABOVE ANSWERS "HOW MUCH ROOM IS LEFT". THIS ANSWERS "IS ANY OF IT ISSUES'".
+# They are not the same question and the difference is the whole pyramid. `cascade_issue_slots`
+# hands the issue batch every slot PR work did not take — which, on its own, would dispatch an issue
+# while a MERGEABLE PR waits for a merge lane the merge ceiling refused. The recorded order is not
+# "PR jobs that already started come first"; it is that the LEVELS are drained in order:
+#
+#   1. FIX_MAIN   main must be green before anything lands on it.
+#   2. MERGE      mergeable + review-satisfied. This is where throughput is actually won.
+#   3. FIX_PR     a review returned findings (or the tree is red/conflicted): the fixer goes first.
+#   4. REVIEW_PR  the review loop. Its finding feeds level 3 on the NEXT pass — that IS the loop.
+#   5. ISSUES     lowest priority, NEITHER blocked NOR a default: it gets what 1-4 did not consume.
+#
+# So a pass that resolves to level 1-4 grants the issue batch ZERO slots, whatever room is left — and
+# the funnel says so (`DEFERRED`), instead of the pre-change `CLOSED`, because the box is not refusing
+# to produce: it is draining a higher level first, and the next pass re-checks from level 1.
+#
+# ⛔ LEVEL 1 IS MEASURED FROM MAIN'S OWN CHECK-RUNS, AND ITS ABSENCE IS NOT A RED. Most checks in
+# this repo are `pull_request`-only and never run on main at all (`sigpipe-grep`, `sanctioned-pin`,
+# `verify`, `drift-check`, `bash-suites`, `test`, `vendor-drift`, `workflow-lock`), so their absence
+# from main's check-runs says NOTHING about main. `cascade_main_probe` therefore reads the runs that
+# DID execute on main and asks only whether one of them concluded non-green — a `verify` that is
+# broken on current main is red, and a `verify` that never ran on main is not.
+#
+# ⛔ AN UNMEASURED LEVEL IS NOT A GATE. When the population cannot be read the level is `?` and this
+# function decides nothing: the room the gates left is spent exactly as `cascade_issue_slots` said.
+# The safe direction for a PRIORITY is to not-schedule it, never to block production behind a
+# measurement nobody took — the polarity `mp_reason`'s fail-closed arm already takes for the COUNT.
+cascade_level_name() {
+  case "${1:-}" in
+    1) echo FIX_MAIN ;;
+    2) echo MERGE ;;
+    3) echo FIX_PR ;;
+    4) echo REVIEW_PR ;;
+    5) echo ISSUES ;;
+    *) echo UNMEASURED ;;
+  esac
+}
+
+# cascade_main_probe [<repo>] — record `state/main-verdict` from MAIN's own check-runs.
+#   RED(:name,name…)  a run that EXECUTED on main concluded non-green (the repo's own polarity:
+#                     everything except success/neutral/skipped/cancelled/stale — an unnamed new
+#                     conclusion must never fall through a gap).
+#   GREEN             runs executed and every one of them is non-red.
+#   UNMEASURED        the listing could not be read (no gh, no auth, a transport failure). NOT red.
+# ⛔ ONE API CALL, BOUNDED TO 100 RUNS, AND THE REF IS `main` ITSELF — never the local tree, which
+# on a box that has not fetched is a different commit and would grade the wrong tree.
+# ⛔ IT WRITES, AND A FAILED WRITE REMOVES THE RECORD: a verdict this box cannot persist must not
+# leave yesterday's `GREEN` sitting under today's tree (the stale-flag class).
+cascade_main_probe() {
+  local repo="${1:-${OR:-}}" raw n tok out
+  [ -n "$repo" ] || { rm -f "$O/state/main-verdict" 2>/dev/null || true; return 1; }
+  out="$O/state/main-verdict"
+  raw="$(gh api "repos/$repo/commits/main/check-runs?per_page=100&filter=all" 2>/dev/null \
+        | python3 -c '
+import json,sys
+try:
+    d=json.load(sys.stdin)
+except Exception:
+    sys.exit(3)
+red=[]
+for c in d.get("check_runs") or []:
+    if c.get("status") != "completed":
+        continue
+    if c.get("conclusion") in ("success","neutral","skipped","cancelled","stale"):
+        continue
+    red.append(str(c.get("name") or "?"))
+print(("RED:" + ",".join(sorted(set(red))[:8])) if red else "GREEN")
+' 2>/dev/null)" || raw=""
+  case "${raw:-}" in
+    RED*|GREEN) : ;;
+    *)  # an unreadable listing is UNMEASURED — neither a red nor an all-clear, and it must not
+        # leave a previous verdict standing (see the write note above).
+        printf 'UNMEASURED the listing could not be read this pass\n' > "$out" 2>/dev/null && return 1
+        rm -f "$out" 2>/dev/null || true
+        return 1 ;;
+  esac
+  printf '%s\n' "$raw" > "$out" 2>/dev/null || { rm -f "$out" 2>/dev/null || true; return 1; }
+  return 0
+}
+
+# cascade_main_red [<state-dir>] -> 1 ONLY for a RED record (see cascade_main_probe's polarity).
+cascade_main_red() {
+  local d="${1:-$O/state}" t=""
+  [ -f "$d/main-verdict" ] && t="$(head -1 "$d/main-verdict" 2>/dev/null)"
+  case "${t:-}" in RED|RED:*) printf '1\n' ;; *) printf '0\n' ;; esac
+}
+
+# cascade_level [<state-dir>] — sets, in THIS shell (never echoed: a `$( )` would lose them):
+#   CASCADE_LEVEL        1..5, or `?` when the population could not be read
+#   CASCADE_LEVEL_NAME   the level's name (cascade_level_name)
+#   CASCADE_N_MERGE / _FIX / _REVIEW / _UNOWNED   the counts the level was resolved from
+# ⛔ IT CLASSIFIES WITH THE SWEEP'S OWN OBSERVATION (`state/prclass.tsv`, head-bound) AND THE GATE'S
+# OWN OWNERSHIP PREDICATE (`pr_owned`). A second definition of "owned" here is how the count and the
+# spawn arms came to disagree in the first place — so this asks `pr_owned`, once per un-owned PR.
+# ⛔ HEAD-BOUND: a class row for a head the listing no longer shows is not an observation of THIS
+# tree (`measure_ci_inflight` makes the same point for the CI arm). It falls to level 4 — work, of an
+# unclassified kind — rather than to a level that claims to know what it needs.
+cascade_level() {
+  local d="${1:-$O/state}" list tok pr rest sha br n_m=0 n_f=0 n_r=0 n_u=0
+  CASCADE_LEVEL="?"; CASCADE_LEVEL_NAME="UNMEASURED"
+  CASCADE_N_MERGE=0; CASCADE_N_FIX=0; CASCADE_N_REVIEW=0; CASCADE_N_UNOWNED=0
+  CASCADE_MAIN_RED="$(cascade_main_red "$d")"
+  # Level 1 has no count: one verdict outranks every population below it.
+  if [ "${CASCADE_MAIN_RED:-0}" = "1" ]; then
+    CASCADE_LEVEL=1; CASCADE_LEVEL_NAME="$(cascade_level_name 1)"
+    return 0
+  fi
+  list="$(cat "$d/last-open-prs" 2>/dev/null || true)"
+  # NO ROWS IS NOT "NO WORK" (the same reading `unowned_scan` takes): a listing that could not be
+  # read cannot say a mergeable PR is absent, so this level decides nothing and the room is spent as
+  # the gates said. It is printed as `?`, never as level 5.
+  [ -n "${list// /}" ] || return 0
+  # ONE pass over the class file into a lookup STRING (` pr:head:class `), then one pass over the
+  # listing. Pure `case` matching, so a 70-PR box pays no fork for the join — the loop's fork
+  # headroom is itself a dispatch gate (agent-infra#2293), so this must not add one per PR per cycle.
+  # ⛔ EVERY FIELD IS SANITISED BEFORE IT ENTERS THE STRING: the head must look like a git object id
+  # and the class must be one of the four the sweep writes, so a crafted row cannot forge a token
+  # that matches some other PR (the same hardening `disp()` applies to its own record).
+  local clsf="$d/prclass.tsv" cls_set=" " _p _h _c
+  if [ -f "$clsf" ]; then
+    while IFS="$(printf '\t')" read -r _p _h _c; do
+      case "${_p:-}" in ''|*[!0-9]*) continue ;; esac
+      case "${_c:-}" in GREEN|RED|PENDING|NOCHECKS) : ;; *) continue ;; esac
+      case "${_h:-}" in ''|*[!A-Za-z0-9]*) continue ;; esac
+      case "$cls_set" in *" $_p:$_h:$_c "*) : ;; *) cls_set="$cls_set$_p:$_h:$_c " ;; esac
+    done < "$clsf"
+  fi
+  for tok in $list; do
+    pr="${tok%%:*}"; rest="${tok#*:}"; sha="${rest%%:*}"; br="${rest#*:}"
+    case "$pr" in ''|*[!0-9]*) continue ;; esac
+    [ "$br" = "$sha" ] && br=""
+    # OWNED = busy. The widened predicate, not a second one.
+    pr_owned "$pr" "$sha" "$br" && continue
+    n_u=$(( n_u + 1 ))
+    # HEAD-BOUND: only a class observation of THIS head may decide the level.
+    case "$cls_set" in
+      *" $pr:$sha:GREEN "*) n_m=$(( n_m + 1 )) ;;
+      *" $pr:$sha:RED "*)   n_f=$(( n_f + 1 )) ;;
+      *)                    n_r=$(( n_r + 1 )) ;;
+    esac
+  done
+  CASCADE_N_UNOWNED=$n_u; CASCADE_N_MERGE=$n_m; CASCADE_N_FIX=$n_f; CASCADE_N_REVIEW=$n_r
+  # ⛔ THE FILL ORDER, IN ONE PLACE. The first level with actionable work wins and nothing below it
+  # is consulted — that is what makes this a cascade and not four independent gates.
+  if   [ "$n_m" -gt 0 ]; then CASCADE_LEVEL=2
+  elif [ "$n_f" -gt 0 ]; then CASCADE_LEVEL=3
+  elif [ "$n_r" -gt 0 ]; then CASCADE_LEVEL=4
+  else                        CASCADE_LEVEL=5
+  fi
+  CASCADE_LEVEL_NAME="$(cascade_level_name "$CASCADE_LEVEL")"
+  return 0
 }
 mp_recent_land() { # [<state-dir>]
   # ⛔ THE WALK IS BOUNDED. `state/merged-<PR>.done` is never pruned — merge-one.sh only ever WRITES
@@ -3400,12 +3649,127 @@ open_pr_count() { # -> echoes the open-PR count; never 0 on failure; writes stat
 #      as owned until its lease expires is a claim from a host none of those rules can judge: an
 #      unknown name with no roster. That is an UNDER-count of orphanhood on purpose; the over-count
 #      direction steals a live peer's work.
+# ── WHAT "OWNED" MEANS NOW (owner ruling 2026-11-04): UNDER REVIEW, BEING FIXED, OR IN CI ────────
+# ⛔ THE MEASURED DEFECT THIS CLOSES. Live evidence, 1,219 recorded cycles on the box:
+#     [select] 15 PRs: 13 un-owned (2 owned, 0 parked/needs-human excluded) -> dispatching
+#              PR-takeover … 6 worker(s) spawned
+#     nothing=gate:merge-priority_(13_un-owned_of_15_open_PR(s) — PRs before issues)
+#   Six workers had just been spawned on those PRs. `pr_owned` knew only a live cwd holding the
+#   branch — and a REVIEWER reads the PR through `gh` and holds no branch (the residual this file's
+#   header has always named) — so a PR mid-review, mid-fix or mid-CI read UN-OWNED to the COUNT while
+#   the SPAWN arms (which consult the worker census) refused to double-work it. One state, two
+#   opposite verdicts: the count claimed 13 PRs needed work, the arms said they were taken, the issue
+#   path read "PRs first" for ever, and the box did 0.66% issue dispatch while the PR path ran 8.59
+#   workers/h. The owner's refinement: a PR under review, being fixed, or going through CI IS OWNED.
+#
+# ⛔ ONE CENSUS READ PER CYCLE, NOT THREE FORKS PER PR. `sess`/`wt_alive` per PR would be three
+# subshell+awk forks per PR (70 PRs -> 420 forks) on a box whose FORK HEADROOM is itself a dispatch
+# gate (agent-infra#2293). One `wt_table` and one awk pass yield the same two facts for a fixed cost.
+# A `dead` row is excluded (the census proves it) and `unknown` counts ALIVE — the census's own loose
+# polarity — so a probe failure can never free a slot.
+# ⛔ `pr_in_set` IS A `case` MATCH, NOT A COMMAND: it is called once per PR per cycle (`unowned_scan`)
+# and once per candidate (`INFLIGHT_ISSUE_SET`), so it must not fork.
+pr_in_set() { # <set> <value> -> 0 when the (space-delimited, space-padded) set contains the value
+  [ -n "${2:-}" ] || return 1
+  case "${1:- }" in *" ${2} "*) return 0 ;; esac
+  return 1
+}
+
+# measure_ownership_sets — the per-cycle facts the ownership predicate and the pass's dedup read.
+#   WORKING_PR_SET      PRs a live review-/fix-/merge- worker record holds (under review, being fixed,
+#                       on the merge rail) — a live worker.
+#   INFLIGHT_ISSUE_SET  issues a live lane-/chain- worker already has — the pass must not queue them
+#                       twice (owner ask: "each pass must also dedup").
+#   WEDGED_SET          records that are ALIVE but whose work log has not advanced past WEDGE_IDLE_MIN
+#                       — a corpse holding a PR (owner ask: "a lane that is alive but making no progress
+#                       must not hold a slot or a gate").
+# ⛔ THE WEDGE BOUND IS DELIBERATELY LONGER THAN THE REAPER'S. `reap_stale_workers` closes a silent
+# worker at STALE_MIN and runs EARLIER in this same pass, so on the happy path the record is already
+# gone when this runs. This bound only catches the failure `wt_close` cannot prove (its own rule: "a
+# kill that cannot be proven is not a kill"): a record whose close failed, twice. Excluding such a
+# record from ownership is what stops ONE corpse holding a PR for ever — the #3096 shape, where one
+# state read OWNED to the spawn gate and ABANDONED to the fixer and the box did neither. The two
+# bounds are spelled from the SAME knob so they cannot drift.
+measure_ownership_sets() {
+  local tbl old n st fam num f wed=" "
+  WORKING_PR_SET=" "; INFLIGHT_ISSUE_SET=" "; WEDGED_SET=" "
+  tbl="$(wt_table 2>/dev/null)" || tbl=""
+  # ONE portable age probe over the worker logs. `find -mmin` means the same thing on GNU and BSD
+  # userlands (the reason `mp_recent_land` uses it); a record with NO log cannot be judged and is NOT
+  # called wedged — lane-reap.sh's "no log evidence is not evidence of staleness" rule, which once
+  # flagged a lane SEVEN MINUTES old.
+  old="$(find "$O/logs" -maxdepth 1 -type f -name '*.log' -mmin +"$( _wedge_min )" 2>/dev/null || true)"
+  while IFS= read -r f; do
+    [ -n "$f" ] && wed="$wed${f##*/} "
+  done <<MOEOF
+$old
+MOEOF
+  while IFS="$(printf '\t')" read -r n st; do
+    [ -n "$n" ] || continue
+    case "$st" in dead) continue ;; esac
+    case "$n" in
+      review-*|fix-*|merge-*)
+        num="${n#*-}"
+        case "$num" in ''|*[!0-9]*) continue ;; esac
+        pr_in_set "$wed" "$n.log" && { WEDGED_SET="$WEDGED_SET$n "; continue; }
+        WORKING_PR_SET="$WORKING_PR_SET$num " ;;
+      lane-*|chain-*)
+        num="${n#*-}"
+        case "$num" in ''|*[!0-9]*) continue ;; esac
+        pr_in_set "$wed" "$n.log" && { WEDGED_SET="$WEDGED_SET$n "; continue; }
+        INFLIGHT_ISSUE_SET="$INFLIGHT_ISSUE_SET$num " ;;
+    esac
+  done <<MOEOF2
+$tbl
+MOEOF2
+  OWNERSHIP_SETS_AT="${CYCLE_T0:-0}"
+  return 0
+}
+_wedge_min() { # -> the wedge bound in minutes: STALE_MIN * 2 (the reaper's bound, twice)
+  local m="${STALE_MIN:-40}"
+  is_limit "${m:-}" || m=40
+  [ "$m" -ge 1 ] || m=40
+  [ "$m" -le 500000 ] || m=40
+  printf '%s\n' $(( m * 2 ))
+}
+
+# measure_ci_inflight — "going through CI" is OWNERSHIP, and it is bound to the HEAD (owner ruling
+# 2026-11-04). The sweep observes every PR's check class each cycle and records it in
+# `state/prclass.tsv` as `<pr>\t<head>\t<class>`; `PENDING` is its "checks in flight" token. A PENDING
+# row is ownership ONLY for the head it names AND only while the listing still shows that head — a
+# PENDING observation of a head that has since been pushed over describes a different tree, and
+# counting it would make a PR owned by its own history (the "declaration about the past" failure this
+# file's ownership rewrite exists to remove). No age knob: the head is the binding, and it is exact.
+# ONE awk pass over two small files, no per-PR fork (same reason as measure_ownership_sets).
+measure_ci_inflight() {
+  CI_INFLIGHT_SET=" "
+  [ -s "$O/state/last-open-prs" ] || return 0
+  [ -s "$O/state/prclass.tsv" ] || return 0
+  CI_INFLIGHT_SET=" $(awk -F"$(printf '\t')" '
+    FILENAME == ARGV[1] {
+      n = split($0, t, " ")
+      for (i = 1; i <= n; i++) { split(t[i], q, ":"); if (q[1] ~ /^[0-9]+$/) heads[q[1]] = q[2] }
+      next
+    }
+    NF >= 3 && $1 ~ /^[0-9]+$/ { hd[$1] = $2; cls[$1] = $3 }
+    END { for (p in cls) if (cls[p] == "PENDING" && hd[p] != "" && heads[p] == hd[p]) printf "%s ", p }
+  ' "$O/state/last-open-prs" "$O/state/prclass.tsv" 2>/dev/null || true)"
+  return 0
+}
+
 pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently working this PR
   local pr="$1" sha="${2:-}" br="${3:-}"
   case "$pr" in ''|*[!0-9]*) return 1 ;; esac
   # 1. THE LIVE FACT. `lo_pr_owned` reads the once-per-cycle snapshot of every visible process's
   #    cwd; an unavailable module (LO_SCAN=0) or a row with no branch falls through to the arms below.
   if [ "${LO_SCAN:-0}" = "1" ] && [ -n "${br:-}" ] && lo_pr_owned "$LO_LIVE" "$pr" "$br"; then return 0; fi
+  # 1b. A LIVE WORKER RECORD — the PR is UNDER REVIEW, BEING FIXED, or on the merge rail. This is the
+  #     census fact (`measure_ownership_sets`), i.e. EXACTLY the one the SPAWN arms already consult to
+  #     refuse a second worker, so the count and the arms can no longer disagree about the same PR.
+  #     A `dead` record is not in the set; a WEDGED one is not either.
+  pr_in_set "${WORKING_PR_SET:- }" "$pr" && return 0
+  # 1c. A CHECK IN PROGRESS ON THIS HEAD — "going through CI" (measure_ci_inflight, head-bound).
+  pr_in_set "${CI_INFLIGHT_SET:- }" "$pr" && return 0
   # 2. A LIVE LOCAL LOCK (the merge worker's own pid file) — a live fact, BOUND TO THE WORKER.
   local f="$O/state/mergeclaim-$pr.lock" p _pcl
   if [ -f "$f" ]; then
@@ -4259,6 +4623,15 @@ while true; do
     fi
   fi
 
+  # ── THE PER-CYCLE OWNERSHIP SETS, BEFORE ANYONE ASKS WHO IS WORKING WHAT ─────────────────────────
+  # ⛔ ORDER IS LOAD-BEARING AND IT IS HERE, NOT AT ITS USE SITES: `reap_stale_workers` (a few
+  # hundred lines above) has already had its chance to close a silent worker, so the census read here
+  # is the POST-REAP one — a worker that was reaped this pass is not ownership, and the PR it held goes
+  # back into the queue in the SAME cycle instead of one later. `CI_INFLIGHT_SET` needs only the two
+  # records the listing stage wrote, so it is measured here too and both are fresh for the whole pass
+  # (the gate count at :UPN, the sweep, and the issue batch's dedup all read these same sets).
+  if declare -f wt_table >/dev/null 2>&1; then measure_ownership_sets; else OWNERSHIP_SETS_AT=""; fi
+  measure_ci_inflight
   # ── OWNERSHIP + SELECTION ORDER (owner ruling, 2026-10-18) ───────────────────────────────────
   # ⛔ ONE LIVE SCAN PER CYCLE, then everything below reads its output. `lo_scan` asks the MACHINE
   # (every visible process's cwd, joined against this repo's worktrees) who is actually holding a
@@ -6222,7 +6595,88 @@ PY
   else
     echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   fi
-  GATE_WHY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
+  # ── MERGE PRIORITY IS A PRIORITY HERE, NOT A BARRIER (owner ruling 2026-11-04) ────────────────
+  # ⛔ THIS ONE LINE USED TO CLOSE THE ISSUE PATH. `GATE_WHY="$(mp_reason …)"` set the single string
+  # that gates the issue batch, so any un-owned PR closed it at any capacity — measured: 0.66% of
+  # cycles dispatched anything, 0.054 issues/h against an 8.1/h bound. `MP_PRIORITY` carries the SAME
+  # fact and the SAME wording, and the capacity gates below (lanes/load/mem/fork/placement/ci-queue)
+  # are now the ONLY arms that can close the path. The order the owner asked to keep is preserved
+  # STRUCTURALLY, not by a promise: the PR sweep ran earlier in this pass and its workers are already
+  # in `LANES`, so `cascade_issue_slots` is handed the room that is LEFT after PR work took its slots.
+  # ⛔ LEVEL 1 HAS TO BE FED, OR IT IS DECORATION (the inert-enforcer class). The probe reads MAIN's
+  # own check-runs every pass and records the verdict; `cascade_level` consumes it below. It is ONE
+  # API call — the same order of cost as the CI-queue read beside it — and an unreadable answer
+  # records UNMEASURED rather than leaving the previous pass's verdict standing. It sits OUTSIDE the
+  # cascade block on purpose: that block is extracted and driven by test-cascade.sh, which must not
+  # reach the network. ⛔ THE MARKER NAME IS NOT SPELLED IN PROSE — the extractor is a LINE RANGE, so
+  # a comment that quotes the begin marker makes the range start there and swallow this call into the
+  # rig (measured: the suite then graded the LIVE API's verdict as its fixture).
+  cascade_main_probe "${OR:-}" >/dev/null 2>&1 || true
+  # [cascade:begin] (extracted and DRIVEN by test-cascade.sh — keep the markers)
+  MP_PRIORITY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
+  CASCADE_BACKLOG="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+  is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=0
+  CASCADE_CAN=0; can_spawn && CASCADE_CAN=1
+  CASCADE_ISSUE_SLOTS="$(cascade_issue_slots "${MAX_LANES:-}" "${LANES:-}" "$CASCADE_BACKLOG" "$CASCADE_CAN")"
+  is_num "${CASCADE_ISSUE_SLOTS:-}" || CASCADE_ISSUE_SLOTS=0
+  # ⛔ POLARITY INHERITED FROM THE BARRIER, AND NOT DROPPED WITH IT. `merge-priority` used to carry
+  # two independent things in one string: the ORDERING (PRs before issues — kept) and the BARRIER
+  # (any un-owned PR closes the issue path — removed). A THIRD thing rode along inside the first:
+  # its fail-closed guard. `mp_reason` turns an UNREADABLE un-owned count into a non-empty reason, so
+  # the barrier closed the path on a rate-limited listing. With the barrier gone, nothing would: a
+  # failed `gh` read would print `un-owned unreadable` and hand the room to the issue batch, i.e. the
+  # one condition that should drain hardest would dispatch new work. So the guard moves HERE, where
+  # the room is actually granted.
+  # ⛔ AND IT IS `is_limit`, NOT `is_num`: `[ 99999999999999999999 -gt 0 ]` ERRORS, an errored test is
+  # FALSE, and that is a fail-OPEN in the opposite direction — `mp_reason` has exactly that hole today
+  # for any out-of-range count that is all digits. The room is withheld on both.
+  CASCADE_UPN_UNREADABLE=0
+  if ! is_limit "${UPN_WORK:-${UPN:-0}}"; then
+    CASCADE_UPN_UNREADABLE=1; CASCADE_ISSUE_SLOTS=0
+  fi
+  # ── THE PYRAMID: WHICH LEVEL HOLDS THE ROOM THIS PASS ──────────────────────────────────────────
+  # ⛔ THE ROOM ABOVE ANSWERS "WHAT DID PR WORK LEAVE". IT DOES NOT ANSWER "IS ANY OF IT LOWER
+  # PRIORITY". A mergeable PR whose merge lane the MERGE CEILING refused leaves lanes free and the
+  # allocator would hand them to the issue batch — producing new work while the thing that wins
+  # throughput waits. So the levels are drained in order and a pass that resolves to 1-4 grants the
+  # issue batch NOTHING, keeping the room for the level that owns it. The next pass re-checks from
+  # level 1, which is what makes the whole thing a loop rather than a single descent.
+  # ⛔ IT IS MEASURED ONLY WHEN THERE IS ROOM TO GIVE, and that is a cost decision with a stated
+  # limit: at `slots=0` no level can change the outcome, so the per-PR ownership walk is skipped and
+  # the line says `level=? UNMEASURED(slots=0)`. The limit is that a full box does not report its
+  # level — it reports the reason it has no room, which is the question an operator has there.
+  CASCADE_LEVEL=""; CASCADE_LEVEL_NAME="NOT-MEASURED"; CASCADE_MAIN_RED=0
+  CASCADE_LEVEL_HOLDS=0
+  if [ "${CASCADE_ISSUE_SLOTS:-0}" -gt 0 ]; then
+    cascade_level "$O/state"
+    case "${CASCADE_LEVEL:-?}" in
+      1|2|3|4) # A HIGHER LEVEL HAS ACTIONABLE WORK: the room is not the issue path's this pass.
+               CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;
+      *) : ;;   # 5 = nothing above → issues; `?` = unmeasured → decide nothing (see cascade_level)
+    esac
+  fi
+  # ⛔ THE PASS ENDED WITH WORK WAITING AND NO ROOM: that is the one state in which the interval is
+  # worth spending on a poll (`cascade_wait`) instead of a fixed nap. Work waiting means EITHER issue
+  # backlog OR un-owned PR work — both are dispatched by the next pass that finds a free slot.
+  CASCADE_WAIT=0
+  if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && { [ "${CASCADE_BACKLOG:-0}" -gt 0 ] || [ -n "${MP_PRIORITY:-}" ] || [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ]; }; then
+    CASCADE_WAIT=1
+  fi
+  # ⛔ THE FUNNEL'S ONE NEW INPUT, DERIVED FROM THE SAME MEASUREMENT THE BATCH USES (never a second
+  # derivation: two answers to "is PR work still waiting" is how the total and its parts came to
+  # disagree in this file once already). `1` = PR work still holds the cycle — un-owned PR work is
+  # waiting, a HIGHER LEVEL is draining and holds the room, or the box has no room to give anybody.
+  # `0` = the cascade is open.
+  CASCADE_PR_WAITING=0
+  # ⛔ AN UNREADABLE COUNT IS PART OF "PR WORK STILL WAITING", even though `mp_reason` cannot name it:
+  # `[ 99999999999999999999 -gt 0 ]` ERRORS, so an out-of-range (all-digit) count yields an EMPTY
+  # priority string. Without this term `pr_waiting=0` would tell the funnel "the PR sweep left room"
+  # on a pass where the room was WITHHELD — the funnel would print "DISPATCH — CASCADE" and nothing
+  # would dispatch, which is a false PASS rather than a wrong number.
+  if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] \
+     && { [ -n "${MP_PRIORITY:-}" ] || [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ] || [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; }; then CASCADE_PR_WAITING=1; fi
+  # [cascade:end]
+  echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_BACKLOG:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
   # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
   # ⛔ ONLY THE FIRST GATE THAT FIRED WAS EVER VISIBLE. `GATE_WHY` is ONE string and the arms were an
   # `elif` chain, so the first arm that fired MASKED every arm behind it — and the arm that fires first
@@ -6241,8 +6695,17 @@ PY
   # predicate is never written down twice (the defect that lets a gate and its report drift apart).
   # [gatevec:begin] (extracted and DRIVEN by test-gates.sh — keep the markers)
   GATE_VEC=""
-  if [ -n "$GATE_WHY" ]; then
-    GATE_VEC="merge-priority(${UPN_WORK:-${UPN:-?}} un-owned PR(s) workable, ${SEL_TOTAL:-${OPEN_N:-?}} candidate(s))"
+  # ⛔ `${MP_PRIORITY:-}`, NOT `$MP_PRIORITY`. Both driver suites (test-gates, selftest) extract this
+  # block and run it under `set -u`; a bare reference aborts the WHOLE chain on an unbound input, and
+  # an aborted chain leaves `GATE_WHY` empty — which is "dispatch everything", the fail-OPEN direction
+  # this block exists to prevent. It is the same defect selftest recorded for `WORKERS` in 2026-10-14,
+  # one variable over: every arm used `${X:-…}` except this one.
+  if [ -n "${MP_PRIORITY:-}" ]; then
+    # ⛔ THE WORD "PRIORITY" IS THE POINT, NOT DECORATION: a reader who finds `merge-priority` in a
+    # vector must be able to tell that it ORDERED this cycle from a state in which it would have
+    # CLOSED it. The issue slots the cascade granted are printed BESIDE it, so "PRs first" and "four
+    # issues queued anyway" cannot read as a contradiction.
+    GATE_VEC="merge-priority(priority: ${UPN_WORK:-${UPN:-?}} un-owned PR(s) workable, ${SEL_TOTAL:-${OPEN_N:-?}} candidate(s); issue slots=${CASCADE_ISSUE_SLOTS:-0})"
   else
     GATE_VEC="merge-priority=clear"
   fi
@@ -6421,7 +6884,7 @@ PY
   declare -f lo_select >/dev/null 2>&1 && LO_SELECT_DEFINED=1
   SEL_LINE=""
   if [ "$LO_SELECT_DEFINED" = "1" ]; then
-    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" "${PRDISP_ACTS:-}" "${PRDISP_WAITS:-}" "${PRDISP_REC:-unknown}" "${PRDISP_SPAWNS:-}" > "$SELFILE" 2>/dev/null || true
+    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" "${PRDISP_ACTS:-}" "${PRDISP_WAITS:-}" "${PRDISP_REC:-unknown}" "${PRDISP_SPAWNS:-}" "${CASCADE_PR_WAITING:-}" > "$SELFILE" 2>/dev/null || true
     SEL_LINE="$(cat "$SELFILE" 2>/dev/null)"
   fi
   rm -f "$SELFILE"
@@ -6745,6 +7208,20 @@ PY
     # Not blocked by un-owned PRs: a streak from an earlier stall is a stale flag and is cleared.
     [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
   elif [ "${PL_MOD:-0}" = "1" ] && pl_escape_open "$O/state" "${UPN_WORK:-}" "$_eb"; then
+    # ⛔ THE ESCAPE MUST NOT PROMISE A DISPATCH IT CANNOT MAKE (owner ruling 2026-11-04). With the
+    # cascade in place this block is largely redundant — the issue path opens by itself whenever the
+    # box has room — and the one state it can still be reached from is the state it CANNOT fix: a FULL
+    # box (`LO_CHOICE=pr` because `CASCADE_ISSUE_SLOTS` is 0). Firing there would print "OPENING the
+    # issue path" and dispatch nothing, which is the P0 this block's own comment records, sign-
+    # reversed. So it stands down WITH ITS REASON and takes no record: the streak is left alone, and
+    # the ordinary `pl_streak_reset` clears it on the first pass that is not PR-held.
+    # ⛔ `${CASCADE_ISSUE_SLOTS-1}` — NOT `:-`. An UNSET variable means "this block is being driven by
+    # a suite/older caller that does not compute the cascade" (pr-owner-liveness.test.sh drives it
+    # EXACTLY that way), and that case must keep the pre-change behaviour. Only an EXPLICIT 0 stands
+    # the escape down, so the module's drivability is not traded away for this.
+    if [ "${CASCADE_ISSUE_SLOTS-1}" = "0" ]; then
+      echo "[dispatch] DRAIN ESCAPE WITHHELD — the PR path is inert, but the box has NO ROOM (issue slots=0 under MAX_LANES/mem/load), so opening the issue path would dispatch nothing. No escape is taken and no record is written; the cascade opens the issue path by itself the moment a slot frees (owner ruling 2026-11-04)." >> "$LOG"
+    else
     printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
     if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
       echo "[dispatch] DRAIN ESCAPE RECORDED -> state/drain-escape (issue path OPEN this cycle; the inert-path counter reset to 0, so the next escape needs $_eb more stalled pass(es))" >> "$LOG"
@@ -6761,6 +7238,7 @@ PY
     GATE_WHY=""
     echo "[dispatch] DRAIN ESCAPE lifted the issue-path gate (was: ${_lifted}) — the merge-priority gate is what this escape overrides for one cycle" >> "$LOG"
     LO_CHOICE=issue
+    fi
   fi
   # [drain-escape:end]
   # The printed decision is AUTHORITATIVE over the issue path: if the funnel did not choose issue
@@ -6854,7 +7332,22 @@ PY
     Y=0
     while read -r ISS; do
       [ -z "${ISS:-}" ] && continue
+      # A pass with no room queues nothing — the invariant `cascade_issue_slots` encodes, restated at
+      # the ONE place that spends it, so a future edit to the allocator cannot silently overshoot.
+      [ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] 2>/dev/null || break
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
+      # ── DEDUP: ALREADY IN FLIGHT IS NOT A CANDIDATE (owner ruling 2026-11-04: "each pass must also
+      # dedup — do not dispatch something already in flight"). `dispatched.txt` is the SAME-BOX ledger
+      # and dispatch-merge.sh prunes it when a lane completes, so it lags a live worker by a cycle in
+      # both directions. A live `lane-<N>` / `chain-<N>` worker record is the MEASUREMENT that the work
+      # is happening NOW (`measure_ownership_sets` read it once this pass, from the census the spawner
+      # itself uses). The cost of not asking was a second lane on one issue — the duplicate-dispatch
+      # class the claim CAS exists for. This CHARGES NOTHING: the item stays in `candidates.txt`, so a
+      # lane that dies frees it next cycle with no blacklist to undo.
+      if pr_in_set "${INFLIGHT_ISSUE_SET:- }" "$ISS"; then
+        echo "[dispatch] #$ISS NOT queued — already in flight (a live lane-$ISS/chain-$ISS worker record holds it; this pass will not queue the same issue twice)" >> "$LOG"
+        continue
+      fi
       # ── CAPACITY TRANSFER (agent-infra#1909): a refused item is a PEER's to take ─────────────
       # `continue` WITHOUT touching `dispatched.txt` or claiming the ref: the issue stays in
       # `candidates.txt` (so this box may take it once the yield expires) and stays unowned in the
@@ -6971,7 +7464,14 @@ PY
         echo "[dispatch] #$ISS NOT dispatched — claim-unreadable: no registry at $O/claims.sh, so this box can neither take the issue claim nor see a peer's; an absent registry is not evidence of freedom. Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
         continue
       fi
-      echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "$BATCH" ] && break
+      # ⛔ THE BATCH CAP IS THE CASCADE'S, NOT `BATCH` (owner ruling 2026-11-04). `BATCH` was the
+      # pacing cap that made one pass dispatch two issues and then sleep through the rest of the
+      # capacity — the measured `dispatched=2` on all 8 productive cycles in 1,219. What limits a pass
+      # now is the room the EXISTING gates have left after the PR sweep (`cascade_issue_slots`), which
+      # is 0 exactly when the box is full — and then the lanes gate has already closed `GATE_WHY` and
+      # this block never runs. `BATCH` is still the product floor's sizing input; it is no longer a
+      # ceiling on capacity that is demonstrably idle.
+      echo "$ISS" >> "$O/.batch"; echo "$ISS" >> "$O/dispatched.txt"; K=$((K+1)); [ "$K" -ge "${CASCADE_ISSUE_SLOTS:-${BATCH:-2}}" ] && break
     done < "$ORDER_FILE"
     # ⛔ AN UNMET FLOOR LOGS AND DEGRADES (indicator (b)) — and it carries the QUEUE-STATE TOKEN, because
     # otherwise `product-floor unmet` on a blind intake is indistinguishable from "there is no product
@@ -7455,6 +7955,15 @@ PY
   if [ "${FORK_STARVED:-0}" = "1" ]; then
     fork_free_sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) \
       || sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) 2>/dev/null
+  elif [ "${CASCADE_WAIT:-0}" = "1" ]; then
+    # ── THE CASCADE'S INTERVAL (owner ruling 2026-11-04) ────────────────────────────────────────
+    # ⛔ "DO NOT STOP AT ONE BATCH AND SLEEP THROUGH THE REST OF THE CAPACITY." This pass ended with
+    # work waiting and no room, so the interval is spent POLLING the census the gate itself reads —
+    # the box re-cycles the moment a lane finishes instead of sleeping up to `${CYC}` seconds past it.
+    # `cascade_wait` always consumes the interval (it returns early once a slot appears, never before
+    # having slept), so this branch REPLACES the nap below rather than preceding it — a slot-poll on
+    # top of a full nap would be the same wasted cycle with extra forks.
+    cascade_wait $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) || true
   else
     sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
   fi
