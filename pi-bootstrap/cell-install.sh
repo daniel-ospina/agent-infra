@@ -937,6 +937,42 @@ def _endpoint_key(u):
                                             or (scheme == "http" and port == "80"))):
         port = None
     return "%s%s://%s%s%s" % (prefix, scheme, host, (":" + port) if port else "", s[m.end():])
+
+
+def _authority_key(u):
+    """`scheme://host[:non-default-port]` — `_endpoint_key` with the PATH, QUERY and FRAGMENT cut off.
+
+    ⛔ "IS THIS THE HOSTED ENDPOINT?" IS A QUESTION ABOUT THE AUTHORITY, NOT ABOUT THE PATH (#3374
+    review, round 12 P1 — a FALSE PASS, and the most reachable one in this file). `_endpoint_key`
+    appends `s[m.end():]` VERBATIM, so every spelling the client normalises in the PATH — and the
+    FRAGMENT, which is never even sent — keyed DIFFERENTLY from `HOSTED_DEFAULT_URL` and escaped the
+    hosted branch entirely. Measured at the head that introduced `_endpoint_key`, with a self-host
+    template and `Bearer ${SOME_OTHER_VAR}` (an EMPTY Bearer, #3275/#3289):
+        https://api.premiselabs.co/mcp            → SELFHOSTED: rc=0
+        https://api.premiselabs.co/foo/../mcp/    → SELFHOSTED: rc=0
+        https://api.premiselabs.co/mcp/?x=1       → SELFHOSTED: rc=0
+        https://api.premiselabs.co/mcp/#x         → SELFHOSTED: rc=0
+    and `node -e 'new URL(u).href'` normalises ALL FOUR onto the canonical hosted url, which answers
+    HTTP 401 to an unauthenticated POST — i.e. each one is the live hosted endpoint, certified with
+    no credential at all. The reachable-by-accident form needs no marker and no hand-edit: a TEMPLATE
+    whose own url is the hosted host spelled without the trailing slash installed an entry carrying
+    `headers: null` and `--verify` certified it `SELFHOSTED:`, so install and verify CONVERGED on the
+    false pass this entire change exists to close.
+
+    No path, query or fragment on the hosted AUTHORITY can make an entry a self-host, because the
+    credential requirement is about the HOST the key is sent to. A genuine self-host is a DIFFERENT
+    authority — another host, or the same host on a non-default port (`:8443`) — and `_endpoint_key`
+    keeps the port, so this does not narrow the exemption at all.
+
+    ⛔ DERIVED FROM `_endpoint_key`, NOT A SECOND PARSER. The host/port/userinfo/leading-zero rules
+    (and their measurements) live in exactly one place above; re-deriving the authority from `s`
+    would be another regex for the same question in a repo where the drift between such copies is
+    what rounds 10-12 kept closing.
+    """
+    k = _endpoint_key(u)
+    m = re.match(r"^((?:userinfo@)?[a-z][a-z0-9+.\-]*://[^/?#]*)", k, re.I)
+    return m.group(1) if m else k
+
 # ⛔ A DIFFERING url is not automatically fine, and a MISSING Authorization is not automatically
 # broken: the two questions are linked. Accepting any non-empty http url let a cell whose endpoint
 # was a typo (or copied from another box) be certified LAYER VERIFIED while pointing at nothing — a
@@ -962,14 +998,32 @@ def _endpoint_key(u):
 # cannot make the hosted endpoint stop being the hosted endpoint. So a hosted url skips this arm
 # (`_url_is_hosted` below) and is judged by the hosted branch — WHICH STILL DEMANDS THE HOSTED
 # CREDENTIAL. That is the point: the bypass this closes is the *exemption*, not the endpoint.
-_url_is_hosted = _endpoint_key(url) == _endpoint_key(HOSTED_DEFAULT_URL)
+# ⛔ AND THE QUESTION IS ASKED OF THE AUTHORITY (`_authority_key`), NOT THE WHOLE KEY (#3374 review,
+# round 12 P1). With `_endpoint_key` here, a hosted url spelled `/mcp` (no trailing slash),
+# `/foo/../mcp/`, `/mcp/?x=1` or `/mcp/#x` keyed DIFFERENTLY, took the exemption, and was certified
+# `SELFHOSTED:` rc=0 over an EMPTY Bearer — see `_authority_key`'s docstring for the measurement.
+# The two questions are now distinct on purpose:
+#   `_url_is_hosted`    — is this the hosted AUTHORITY? Then the hosted credential is REQUIRED, and
+#                         no marker and no template can exempt it.
+#   `_url_is_canonical` — is it the hosted endpoint spelled EXACTLY as `HOSTED_DEFAULT_URL`? Only
+#                         that spelling is certified; every other hosted spelling is a typo the
+#                         installer normalises, so it is refused by the same name `URL_NOT_DEFAULT`
+#                         and `merge-mcp.py` canonicalisation makes the repair converge.
+_url_is_hosted = _authority_key(url) == _authority_key(HOSTED_DEFAULT_URL)
+_url_is_canonical = _endpoint_key(url) == _endpoint_key(HOSTED_DEFAULT_URL)
 _selfhosted_shape = False
-if want_url and _endpoint_key(url) != _endpoint_key(want_url):
-    if not _url_is_hosted:
-        if not t.get("_selfHosted"):
-            print("URL_NOT_DEFAULT:%s" % shown_url(url))
-            sys.exit(1)
-        _selfhosted_shape = True
+if _url_is_hosted:
+    if not _url_is_canonical:
+        # The hosted host, spelled some other way: NOT a self-host (so never exempt), and NOT the
+        # default, so `--verify` refuses it by name and `--install` normalises it to
+        # `HOSTED_DEFAULT_URL`. Before this arm existed these spellings were CERTIFIED as self-hosts.
+        print("URL_NOT_DEFAULT:%s" % shown_url(url))
+        sys.exit(1)
+elif want_url and _endpoint_key(url) != _endpoint_key(want_url):
+    if not t.get("_selfHosted"):
+        print("URL_NOT_DEFAULT:%s" % shown_url(url))
+        sys.exit(1)
+    _selfhosted_shape = True
 elif want_url and _endpoint_key(want_url) != _endpoint_key(HOSTED_DEFAULT_URL):
     # The TEMPLATE requests a non-hosted endpoint and the cell points exactly there: the operator
     # declared it once, in the file this cell was built from, so no per-box `_selfHosted` is owed.
@@ -986,7 +1040,10 @@ elif want_url and _endpoint_key(want_url) != _endpoint_key(HOSTED_DEFAULT_URL):
 # path is decided by the ENDPOINT, so it is decided here by key and the hosted credential is required.
 # …and it is stated as ONE invariant over BOTH arms above rather than repeated in each, so a later
 # edit to either arm cannot reintroduce the false pass by forgetting it (this file's round-12
-# pattern: the rule was written per-branch and one branch was missed).
+# pattern: the rule was written per-branch and one branch was missed). UNREACHABLE BY CONSTRUCTION
+# today — `_url_is_hosted` returns before either arm can set the flag — and kept deliberately as the
+# invariant it encodes, so the guarantee is restated where the exemption is granted rather than only
+# implied by the control flow above.
 if _selfhosted_shape and _url_is_hosted:
     _selfhosted_shape = False
 if _selfhosted_shape:
@@ -1666,10 +1723,19 @@ def key(u):
         port = None
     return "%s%s://%s%s%s" % (prefix, scheme, host, (":" + port) if port else "", s[m.end():])
 
+def akey(u):
+    # MUST MATCH `_authority_key` above — "is the template the hosted endpoint?" is an AUTHORITY
+    # question (#3374 review, round 12 P1). A template spelled `/mcp` without the trailing slash IS
+    # the hosted default, and the merge now writes that default, so a byte key here reported the
+    # truth backwards: a correctly-installed hosted cell was summarised as "NOT the hosted default".
+    k = key(u)
+    m = re.match(r"^((?:userinfo@)?[a-z][a-z0-9+.\-]*://[^/?#]*)", k, re.I)
+    return m.group(1) if m else k
+
 sys.exit(
     0
     if key(have.get("url")) == key(sys.argv[3])
-    and key(want.get("url")) == key(sys.argv[3])
+    and akey(want.get("url")) == akey(sys.argv[3])
     and not have.get("_selfHosted")
     else 1
 )
