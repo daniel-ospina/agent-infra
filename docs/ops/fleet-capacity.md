@@ -784,7 +784,13 @@ registration is unattributable must not read as a clean one):
 The same fail-closed rule governs **attribution**: a registry name no cell claims is a phantom only when
 **every** requested cell was measured **and** every registry was read; while either is short — or a box was excluded by `--box` — it is
 `cannot-attribute` (the reason names which side), because that registration may be serving jobs in the
-part nobody could read. A `defect` token is carried through with `=` rendered as `:`
+part nobody could read. ⛔ **And the phantom claim names its REAL boundary**: the roster is the provider's
+**running** inventory (`cap_fleet_inventory` drops a `stopped` machine — an unreadable status is
+UNCLASSIFIED, not parked), so a registration held by a box the operator **parked** appears here with no
+local evidence, exactly like one that lost its box. The reason is therefore
+`no-running-cell-claims-it`, not "no measured cell claims it", and the remedy such a line invites
+(`reclaim`) must not be applied before checking `cmux vm list` for a stopped machine that will need that
+registration when it returns. A `defect` token is carried through with `=` rendered as `:`
 (`verdict=defect-tmpdir-mode:755`), so the remedy printed is the one the defect needs (`chmod 700`,
 not `restart`).
 
@@ -792,8 +798,10 @@ not `restart`).
 are counted: a registration they carry is `cannot-attribute(<N>-cell-not-requested)`, never a phantom,
 so a scoped run never prints advice whose remedy is `reclaim` on a live runner, and the summary prints
 `skipped=` for it. A name carried by **more than one registry** (names are unique per repo, and two
-registries are read by default) is attributed to **neither**: the local row prints
-`verdict=cannot-attribute`, and every registry row carrying it is
+registries are read by default) is attributed to **neither** — but the LOCAL facts still decide first:
+such a row prints `dead-listener` / `orphaned` / `quarantine` / `defect-<token>` where those apply, and
+`cannot-attribute` only when no local fact does (the restart-vs-reclaim and restart-vs-chmod distinctions
+are not lost to an unjoinable name). Every registry row carrying it is
 `cannot-attribute(name-carried-by-more-than-one-registry)`. The per-box `status` block does not say
 which repo an install is registered to, so binding to the first matching row would compute one cell's
 verdict from another repo's registration (a false `ok`, or a false `offline`) and fire a

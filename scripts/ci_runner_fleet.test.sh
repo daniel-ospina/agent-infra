@@ -188,7 +188,7 @@ assert_omits "$OUT" "slots=0" "B: an unreadable pool never reads as an EMPTY poo
 # the registry name only cell-y could claim must NOT be called a phantom
 assert_contains "$OUT" "registry-unclaimed name=pi-runner-y-1 registry=o/a status=online reason=cannot-attribute(1-cell-unmeasured)" \
   "B: while a cell is unmeasured, an unclaimed name is cannot-attribute — never a phantom"
-assert_omits "$OUT" "no-measured-cell-claims-it" "B: no phantom is claimed from an incomplete fleet"
+assert_omits "$OUT" "no-running-cell-claims-it" "B: no phantom is claimed from an incomplete fleet"
 assert_contains "$OUT" "measured=1 unmeasured=1" "B: the summary counts BOTH sides"
 
 # ══ C. THE OTHER DIRECTION: a registration no measured cell carries IS a phantom (all measured) ══
@@ -198,7 +198,7 @@ cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111    
 reg o/a pi-runner-a-1 online false pi-runner-lost-9 offline false
 run_fleet bash "$FLEET"
 assert_eq "$RC" 3 "C: a measured fleet that does not account for a registration => exit 3"
-assert_contains "$OUT" "registry-unclaimed name=pi-runner-lost-9 registry=o/a status=offline reason=no-measured-cell-claims-it" \
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-lost-9 registry=o/a status=offline reason=no-running-cell-claims-it" \
   "C: the registration that lost its box is named, with the reason a measured fleet supports"
 assert_contains "$OUT" "unclaimed=1" "C: the summary counts it"
 
@@ -375,7 +375,7 @@ assert_eq "$RC" 2 "P: an unclassifiable line => exit 2, never a fabricated row"
 assert_contains "$OUT" "read=cannot-measure why=block-unparseable rc=0 unclassified=1 detail=my runner 111 live pi-runner-a-1" \
   "P: the cell is refused, and the offending line is quoted"
 assert_omits "$OUT" "verdict=quarantine" "P: no row is invented from it"
-assert_omits "$OUT" "reason=no-measured-cell-claims-it" "P: and no phantom is claimed from a fleet with a refused cell"
+assert_omits "$OUT" "reason=no-running-cell-claims-it" "P: and no phantom is claimed from a fleet with a refused cell"
 
 # ══ Q. A defect TOKEN is carried verbatim, so the remedy it names is the one printed (review P3-8) ═
 world
@@ -403,7 +403,7 @@ run_fleet bash "$FLEET" --box cell-a
 assert_eq "$RC" 0 "S: a scoped run over a healthy fleet is not a defect"
 assert_contains "$OUT" "registry-unclaimed name=pi-runner-b-1 registry=o/a status=online reason=cannot-attribute(1-cell-not-requested)" \
   "S: the excluded box's registration is an abstention, and the reason NAMES the exclusion"
-assert_omits "$OUT" "no-measured-cell-claims-it" "S: never a phantom, so never the destructive 'reclaim' advice"
+assert_omits "$OUT" "no-running-cell-claims-it" "S: never a phantom, so never the destructive 'reclaim' advice"
 
 # ══ T. A REPO SEAM THAT WORD-SPLITS TO NOTHING IS AN UNREAD REGISTRY (cycle-2 P2) ══════════════
 # `RUNNER_FLEET_REPOS=" "` iterated zero times, the registry half vanished, and every healthy runner
@@ -467,6 +467,44 @@ assert_contains "$OUT" "local=live github=offline" "X: the row carries both fact
 assert_contains "$OUT" "verdict=defect-tmpdir-missing" "X: the defect names the row verdict"
 assert_contains "$OUT" "disagreements=1" "X: and the disagreement is STILL counted (it is not the verdict's to hide)"
 
+# ══ Y. THE REGISTRY SIDE ALONE MUST BE ABLE TO MAKE A FLEET UNCLEAN (round-5 P3) ════════════════
+# `unjoinable` counts unattributable readings on BOTH sides. Before this case, only the LOCAL increment
+# was pinned: deleting the registry-side one left the suite green while a fleet whose every
+# registration is unattributable printed `unjoinable=0 not_ok=0` and exited 0 — a clean bill over two
+# `cannot-attribute` registrations.
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 0 "$(block cell-a 8 3 0 14375 3584 "" 0 0 0 0 0 0)"
+reg o/a pi-runner-x-1 online false pi-runner-x-2 online false
+reg o/b pi-runner-x-1 online false pi-runner-x-2 online false
+run_fleet bash "$FLEET"
+assert_eq "$RC" 2 "Y: no local row can claim any of these, so the fleet is not clean -- exit 2"
+assert_contains "$OUT" "unjoinable=4" "Y: every unattributable reading is counted, on BOTH sides"
+assert_omits "$OUT" "reason=no-running-cell-claims-it" "Y: and none of them is called a phantom"
+
+# ══ Z. A `|` IN AN INSTANCE NAME IS UNCLASSIFIABLE, NOT A FABRICATED ROW (round-5 P3) ═══════════
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 0 "host=cell-a ncpu=8 ceiling=3 slots=1 mem_available=14375 MB (14.04 GB) floor=3584 MB (3.50 GB)
+NAME                             LISTENER  STATE     GITHUB_NAME
+weird|dir 111 live pi-runner-pipe-1
+summary live=1 dead=0 slots=1 ceiling=3 pool_read=process-table-live-only orphaned=0 registrations=1 quarantine=0 tmpdir_defects=0"
+reg o/a pi-runner-pipe-1 online false
+run_fleet bash "$FLEET"
+assert_eq "$RC" 2 "Z: a name carrying the record separator => exit 2"
+assert_contains "$OUT" "read=cannot-measure why=block-unparseable" "Z: the cell is refused"
+assert_omits "$OUT" "verdict=quarantine" "Z: no row is fabricated from it"
+assert_omits "$OUT" "reason=no-running-cell-claims-it" "Z: and no phantom is claimed"
+
+# ══ AA. A REPEATED LABEL IN THE EXPLICIT ROSTER PROBES THE BOX ONCE (round-5 P3) ════════════════
+world
+cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 0)"
+reg o/a pi-runner-a-1 online false
+run_fleet env RUNNER_FLEET_BOXES="cell-a cell-a" bash "$FLEET"
+assert_eq "$RC" 0 "AA: a duplicated roster label is one box, not a collision"
+assert_omits "$OUT" "name-collision" "AA: and it does not manufacture a name collision"
+assert_contains "$OUT" "cells=1 " "AA: the roster is deduped before the sweep"
+
 # ══ R. THE MUTANTS — each one must make a named case FAIL ══════════════════════════════════════
 # ⛔ A TEST THAT PASSES AGAINST THE MUTANT PINS NOTHING. Each mutant below removes exactly ONE guard
 # this suite claims to cover, and the assertion is that the case built for that guard FLIPS.
@@ -497,7 +535,7 @@ world
 export RUNNER_FLEET_BOXES="cell-a cell-y"
 cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 0)"
 reg o/a pi-runner-a-1 online false pi-runner-y-1 online false
-mutant_case attribution-guard 's/if \[ "\$unmeasured" -eq 0 \] && \[ "\$skipped" -eq 0 \] && \[ "\$reg_unread" -eq 0 \]; then/if [ 1 -eq 1 ]; then/' 'reason=no-measured-cell-claims-it'
+mutant_case attribution-guard 's/if \[ "\$unmeasured" -eq 0 \] && \[ "\$skipped" -eq 0 \] && \[ "\$reg_unread" -eq 0 \]; then/if [ 1 -eq 1 ]; then/' 'reason=no-running-cell-claims-it'
 
 # R3 — match the claim on the INSTANCE DIRECTORY instead of the agentName
 world
@@ -513,6 +551,16 @@ cell cell-partial 2 "$(block cell-partial 8 3 1 14375 3584 "gh-runner-p-1       
 cannot-measure why=pool-root-incomplete root=/tmp/actions-runner outside=/opt/a,/tmp/b — a LIVE listener runs from an instance dir OUTSIDE RUNNER_ROOT"
 reg o/a pi-runner-p-1 online false
 mutant_case producer-rc-gate 's/case "\$rc" in 0|3) : ;; \*)/case "$rc" in 0|3|2) : ;; *)/' 'cell label=cell-partial read=ok host=cell-partial'
+
+# R5 — drop the REGISTRY-side `unjoinable` increment (case Y must stop refusing)
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 0 "$(block cell-a 8 3 0 14375 3584 "" 0 0 0 0 0 0)"
+reg o/a pi-runner-x-1 online false
+reg o/b pi-runner-x-1 online false
+# what flips is the SUMMARY: the mutant stops counting the registry side, so `unjoinable` drops to 0
+# and the fleet reads clean (the shipped build reports 2 and exits 2 — case Y).
+mutant_case registry-unjoinable 's/reg_unclaimed=$((reg_unclaimed + 1)); unjoinable=$((unjoinable + 1))/reg_unclaimed=$((reg_unclaimed + 1))/' 'unjoinable=0'
 
 echo
 echo "── ${PASS} passed, ${FAIL} failed ──"

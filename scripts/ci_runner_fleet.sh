@@ -141,9 +141,12 @@ usage: ci_runner_fleet.sh [report] [options]
     runner   cell=… name=… github_name=… listener=… local=… github=… busy=… registry=… verdict=…
              verdict ∈ ok | dead-listener | orphaned | quarantine | defect-<token> |
                        github-offline | github-unreadable | unregistered | cannot-attribute
-    registry-unclaimed name=… registry=… status=… reason=no-measured-cell-claims-it |
+    registry-unclaimed name=… registry=… status=… reason=no-running-cell-claims-it |
              cannot-attribute(<N>-cell-unmeasured[,<N>-cell-not-requested][,<N>-registry-unread] |
                               name-carried-by-more-than-one-registry)
+             `no-running-cell-claims-it` is the ONLY phantom claim: the roster is the provider's
+             RUNNING inventory, so a registration held by a STOPPED/parked box lands here too — check
+             `cmux vm list` before acting on it.
     name-collision name=… cells=…
     summary  cells=… measured=… unmeasured=… skipped=… registry=… registry_unread=… claimed=…
              unclaimed=… unregistered=… unjoinable=… disagreements=… collisions=… not_ok=…
@@ -288,7 +291,13 @@ function isstate(s) {
 /^NAME[ \t]+LISTENER/ { next }
 /^[ \t]*$/ { next }
 {
-  if (NF >= 3 && isstate($3)) {
+  # ⛔ A FIELD CARRYING THE RECORD SEPARATOR IS UNCLASSIFIABLE, NOT A ROW (review round 5, P3). This
+  # awk emits `R|name|listener|state|github_name|defect` and the reader splits on `|`, so an instance
+  # directory containing `|` re-split AFTER `isstate()` had passed: measured `name=weird
+  # github_name=live listener=dir local=111 … verdict=quarantine` — a fabricated row AND a phantom
+  # registration with `reclaim` advice, on a healthy runner. The space-in-a-name case (suite case P) is
+  # the same class one byte over.
+  if (NF >= 3 && isstate($3) && $0 !~ /\|/) {
     # ⛔ NOT `RS`: that name is the awk RECORD SEPARATOR builtin, and indexing it is a syntax error
     # under mawk (the awk every cell ships, #2637). The state column is `ST[n]`.
     n++; RN[n] = $1; RL[n] = $2; ST[n] = $3
@@ -436,7 +445,7 @@ awk -F'\t' '{c[$1]++} END {for (n in c) if (c[n] > 1) print n}' "$TMPD/reg" >"$T
 # ── 2. the roster ────────────────────────────────────────────────────────────────────────────────
 if [ -n "$FLEET_BOXES" ]; then
   # shellcheck disable=SC2086
-  printf '%s\n' $FLEET_BOXES | awk 'NF {print $1}' >"$TMPD/roster"
+  printf '%s\n' $FLEET_BOXES | awk 'NF && !seen[$1]++ {print $1}' >"$TMPD/roster"
 else
   roster="$(cap_fleet_inventory)"; rrc=$?
   if [ "$rrc" -ne 0 ]; then
@@ -661,7 +670,14 @@ while IFS=$'\t' read -r rname rrepo2 rstatus2 rbusy2; do
   fi
   reg_unclaimed=$((reg_unclaimed + 1))
   if [ "$unmeasured" -eq 0 ] && [ "$skipped" -eq 0 ] && [ "$reg_unread" -eq 0 ]; then
-    printf 'registry-unclaimed name=%s registry=%s status=%s reason=no-measured-cell-claims-it\n' "$rname" "$rrepo2" "$rstatus2"
+    # ⛔ THE CLAIM IS BOUNDED BY WHICH BOXES EXIST, AND THE BOUNDARY IS NAMED (review round 5, P2).
+    # The roster is the provider RUNNING inventory (`cap_fleet_inventory` deliberately drops a
+    # `stopped` machine — an unreadable status is UNCLASSIFIED, not parked), so a registration held by
+    # a box the operator parked appears here with no local evidence, exactly like one that lost its
+    # box. Saying "no MEASURED cell claims it" claimed more than was read; the remedy it prints
+    # (`reclaim`) then deletes a valid registration the parked box needs when it returns. The token
+    # now names what was actually observed — no RUNNING cell — and `--help`/docs carry the caveat.
+    printf 'registry-unclaimed name=%s registry=%s status=%s reason=no-running-cell-claims-it\n' "$rname" "$rrepo2" "$rstatus2"
     not_ok=$((not_ok + 1))
   else
     why=""
