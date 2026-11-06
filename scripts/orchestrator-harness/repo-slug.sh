@@ -365,11 +365,21 @@ repo_identity_head() {
 # UNVERIFIED rather than as an exemption (a `*` there would exempt every repo, which is the hole this
 # whole check exists to close).
 repo_identity_own_repo() {
-  local slug="" url=""
-  if [ -n "${REPO:-}" ] && [ -e "${REPO}/.git" ]; then
-    url="$(repo_identity_origin "$REPO")" || url=""
+  local slug="" url="" cand
+  # ⛔ `$WORKDIR` FIRST (review finding, P1). The bring-up's canonical checkout is `WORKDIR` — it never
+  # sets `REPO` at all (its own dispatch check passes `REPO="$WORKDIR"`), so reading only `$REPO` meant
+  # `own` fell through to `$REPO_SLUG`, whose DEFAULT is `daniel-ospina/tortoise` on EVERY box. On an
+  # agent-infra cell that made the generic-name row bless a `$CELL_HOME/clone` holding tortoise (a
+  # different repo, reported as a declared exception and never compared) AND refuse the same name holding
+  # the cell's OWN repo (FATAL, with a remedy inviting a rename of a tree that is not lying). Both
+  # directions were measured. The tree the box WORKS IN is the honest answer, and it comes before any
+  # declaration.
+  for cand in "${WORKDIR:-}" "${REPO:-}"; do
+    [ -n "$cand" ] && [ -e "$cand/.git" ] || continue
+    url="$(repo_identity_origin "$cand")" || url=""
     if [ -n "$url" ]; then slug="$(repo_slug_from_remote "$url" 2>/dev/null)"; fi
-  fi
+    [ -n "$slug" ] && break
+  done
   # ⛔ VALIDATE EVERY CANDIDATE WITH THE ONE SHAPE RULE (review finding, P2). `repo_slug_valid` above is
   # the single owner of "what is an owner/name slug", and without this an unvalidated `$REPO_SLUG`/`$OR`
   # is handed straight into the generic-name row as the EXPECTED repo — where the literal `*` is the
@@ -529,7 +539,12 @@ repo_identity_scan() {
     fi
     hsha="$(repo_identity_head "$p")"
     want="${slug#*/}"
-    _slug[${#_slug[@]}]="$slug"; _fold[${#_fold[@]}]="$(repo_identity_fold "$want")"
+    # ⛔ THE DUPLICATE GROUPING KEY IS THE FULL SLUG, FOLDED (review finding, P2). Keying it on the repo
+    # NAME alone (`want`) made `daniel-ospina/tortoise` and `someone-else/tortoise` one group, so the report
+    # announced "daniel-ospina/tortoise is checked out at 2 paths at DIFFERENT heads" about two DIFFERENT
+    # repos — a false statement in the one message an operator uses to pick a canonical tree. The BASE
+    # comparison above still uses `want` (a directory names the repo, not the owner).
+    _slug[${#_slug[@]}]="$slug"; _fold[${#_fold[@]}]="$(repo_identity_fold "$slug")"
     _head[${#_head[@]}]="${hsha:-<unreadable>}"
     if [ "$(repo_identity_fold "$base")" = "$(repo_identity_fold "$want")" ]; then
       printf '%s\t%s\n' ok \
@@ -569,8 +584,14 @@ repo_identity_scan() {
     # holding tortoise stays FATAL (base 'agent-infra' is not 'tortoise-*'), and `tortoise-wip` holding
     # agent-infra stays FATAL (it is not 'agent-infra-*'). The prefix is FOLDED, because `dmeer-wt` must
     # match `DMeer`.
+    # ⛔ THE SEPARATOR FAMILY, NOT JUST `-` (review finding, P2). `tortoise.old`, `tortoise_wip`,
+    # `tortoise2` and `tortoise.bak` all name the repo they hold and none of them claims another repo, yet
+    # the dash-only pattern refused each one FATAL — a false block on a healthy box with a remedy inviting a
+    # rename of a tree that is not lying. The family stays ANCHORED ON THE REPO THE ORIGIN NAMES, so the
+    # discriminator is intact: `agent-infra` holding tortoise is still FATAL (it starts with neither
+    # `tortoise-`, `.`, `_` nor a digit after it).
     case "$(repo_identity_fold "$base")" in
-      "$(repo_identity_fold "$want")"-*)
+      "$(repo_identity_fold "$want")"-*|"$(repo_identity_fold "$want")".*|"$(repo_identity_fold "$want")"_*|"$(repo_identity_fold "$want")"[0-9]*)
         printf '%s\t%s\n' warn \
           "repo identity: ${_sp[$i]}$where is a WORKING COPY of $slug under the suffixed name '$base' — the name names the repo it holds, so it does not lie about which repo it is. Named so the exception stays visible (agent-infra#3521)"
         i=$((i + 1)); continue ;;
@@ -586,8 +607,21 @@ repo_identity_scan() {
       # `repo identity PARTIALLY verified`, because that name genuinely was not compared. That is the
       # honest reading; a refinement (treat a branch-shaped name as "nothing to verify" rather than
       # "unverified") is a separate change with its own evidence.
-      printf '%s\t%s\n' unverified \
-        "repo identity UNVERIFIED: ${_sp[$i]}$where is a LINKED WORKTREE of $slug (its .git is a file, not a directory), so its directory name '$base' names a BRANCH, not a repository — nothing to compare against its origin, and it is never a directory lying about itself. Named so the tree is visible (agent-infra#3521)"
+      # ⛔ `ok`, NOT `unverified` (review finding, P1 — and it reverses a call this file made two commits
+      # ago). A linked worktree's name is a BRANCH, not a claim about a repository, so there is nothing
+      # unanswered about THIS BOX — while the fleet's own launcher recipe is `git worktree add
+      # $HOME/wt-<slug>`, and `$CELL_HOME` IS `/tmp/cell-home` (measured: 8 such trees). Reporting them
+      # `unverified` made every BUSY cell's doctor answer cannot-verify on every pass — an alarm that can
+      # never clear, and `status` red on a healthy box. A tree whose name is not a claim is not a hole in
+      # the check; it is a tree the check has nothing to compare, and it is still NAMED here and still
+      # listed in the duplicate report below.
+      # STATED RESIDUAL (review finding, P2 — named, not hidden): a worktree at a path spelled after
+      # ANOTHER repo (`git worktree add $HOME/agent-infra -b x` inside a tortoise checkout) therefore
+      # reads clean. Distinguishing that from a lane worktree needs the branch shape, which is unbounded
+      # (`wt-<slug>`, `<repo>-wip`, task ids…), while treating every worktree as fatal was a measured P0
+      # (every busy cell refused). The measured incident itself was a real CLONE and is still FATAL.
+      printf '%s\t%s\n' ok \
+        "repo identity: ${_sp[$i]}$where is a LINKED WORKTREE of $slug (its .git is a file, not a directory), so its directory name '$base' names a BRANCH, not a repository — nothing to compare against its origin, and it is never a directory lying about itself. Named so the tree is visible; the duplicate report below still lists every path and head (agent-infra#3521)"
       i=$((i + 1)); continue
     fi
     fatal=$((fatal + 1))

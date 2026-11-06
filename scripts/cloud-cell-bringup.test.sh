@@ -1761,6 +1761,66 @@ case "$EMPTY_TOK" in
   *) bad "unexpected banner token for an empty population: $EMPTY_TOK" ;;
 esac
 
+say_case "repo identity: the box's OWN repo is read from the tree it WORKS IN, not from a default"'
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P1. `own` was read from `$REPO` — which the bring-up NEVER SETS — so
+# it fell through to `$REPO_SLUG`, whose DEFAULT is `daniel-ospina/tortoise` on every box. On an
+# agent-infra cell that blessed a `clone` holding tortoise (another repo, reported as a declared exception
+# and never compared) and refused the same name holding the cell's OWN repo. `$WORKDIR` is the tree the
+# box works in, and it is read first now.
+mk_checkout "$T/ident-own/cell" "https://github.com/daniel-ospina/agent-infra.git" o1 \
+  && mk_checkout "$T/ident-own/home/clone" "https://github.com/daniel-ospina/agent-infra.git" o2 \
+  && ok "fixture: the cell's WORKDIR is agent-infra, and …/clone holds the SAME repo" \
+  || bad "fixture: could not create the own-repo fixture"
+# ⛔ `BR_AMBIENT_REPO`, NOT `BR_EXTRA_ENV`: `br()` assigns WORKDIR (and REPO) AFTER the extra-env list, so an
+# extra-env override of WORKDIR is silently discarded — the first cut of this arm asserted against a fixture
+# that never ran. `REPO` is the second candidate the walker reads, and the property it pins (the tree the box
+# WORKS IN, before the declared default) is the same one.
+BR_IDENT_ROOTS="$T/ident-own/home" BR_AMBIENT_REPO="$T/ident-own/cell" br ok normal --check
+case "$BR_OUT" in
+  *"clone"*"DECLARED exception"*|*"DECLARED exception name 'clone'"*) ok "…/clone holding the cell's OWN repo is a declared exception" ;;
+  *) bad "the cell's own repo under a generic name was not recognised — the own repo is being read from a default: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "the cell's OWN repo under …/clone was REFUSED (own read from a hardcoded default, not from WORKDIR)" ;;
+  *) ok "and it is not refused" ;;
+esac
+# …and the mirror direction: a DIFFERENT repo under that name is still refused, with the same WORKDIR.
+mk_checkout "$T/ident-own-bad/cell" "https://github.com/daniel-ospina/agent-infra.git" o3 \
+  && mk_checkout "$T/ident-own-bad/home/clone" "https://github.com/daniel-ospina/tortoise.git" o4 \
+  && ok "fixture: WORKDIR is agent-infra, and …/clone holds tortoise" \
+  || bad "fixture: could not create the own-repo negative fixture"
+BR_IDENT_ROOTS="$T/ident-own-bad/home" BR_AMBIENT_REPO="$T/ident-own-bad/cell" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) ok "a DIFFERENT repo under …/clone is still FATAL — the own repo is the tree the box works in" ;;
+  *) bad "a foreign repo under a generic name read clean: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+
+# ⛔ AND THE `$WORKDIR` PATH ITSELF, at the function level: `br()` always sets WORKDIR, so the full-run arm
+# above cannot reach it. This is the exact P1 — the tree the box WORKS IN, read before the declared default.
+mkdir -p "$T/own-bringup/orchestrator-harness"
+sed 's/^main "\$@"$/:/' "$BRINGUP" > "$T/own-bringup/cloud-cell-bringup.sh"
+cp "$HERE/orchestrator-harness/repo-slug.sh" "$T/own-bringup/orchestrator-harness/repo-slug.sh"
+OWN_OUT="$(WORKDIR="$T/ident-own/cell" REPO_SLUG=daniel-ospina/tortoise \
+  bash -c '. "$1"; repo_identity_own_repo' _ "$T/own-bringup/cloud-cell-bringup.sh" 2>&1)"
+[ "$OWN_OUT" = "agent-infra" ] \
+  && ok "the box's own repo is WORKDIR's origin (agent-infra), not the REPO_SLUG default (tortoise)" \
+  || bad "own repo read as '$OWN_OUT' with WORKDIR an agent-infra checkout — a hardcoded default is being used"
+
+say_case "repo identity: a SUFFIXED working copy is not lying, whatever the separator"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P2. The exemption was dash-only, so `tortoise.old`, `tortoise_wip` and
+# `tortoise2` — each naming the repo it holds — were refused FATAL with a remedy inviting a rename.
+for suffix in '.old' '_wip' '2'; do
+  d="$T/ident-suffix$suffix/home/tortoise$suffix"
+  mk_checkout "$d" "https://github.com/daniel-ospina/tortoise.git" "sf$suffix" \
+    && ok "fixture: …/tortoise$suffix holding tortoise" \
+    || bad "fixture: could not create the …/tortoise$suffix fixture"
+  BR_IDENT_ROOTS="$T/ident-suffix$suffix/home" br ok normal --check
+  case "$BR_OUT" in
+    *"CHECK FAILED [repo identity]"*) bad "…/tortoise$suffix holding tortoise was refused — the separator family is not covered" ;;
+    *) ok "…/tortoise$suffix holding tortoise is not refused" ;;
+  esac
+done
+
 say_case "repo identity: a LEGACY FLAT HARNESS PIN is a declared exception, never a directory to move"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P1. `HARNESS_PIN_DIR` defaults to `$CELL_HOME/harness` and
 # `check_harness_pin` supports a LEGACY FLAT PIN where that directory is ITSELF a linked worktree of the
@@ -1872,12 +1932,14 @@ case "$BR_OUT" in
 esac
 [ "$BR_RC" -ne 0 ] && ok "…and that refusal exits non-zero (rc=$BR_RC)" || bad "a lying <repo>-wt working copy exited 0"
 
-say_case "repo identity: a LINKED WORKTREE carries UNVERIFIED, so the banner cannot claim full verification"
-# ⛔ A REVIEW FOUND THIS AND IT WAS A P1. The worktree warn's own text says "nothing to compare against
-# its origin", but it carried no UNVERIFIED literal — and that LITERAL is what `check_repo_identity`
-# matches to pick the `CELL READY` token. So a worktree placed at a path named after ANOTHER repo (the
-# measured cell-2 shape, reached via `git worktree add` instead of `git clone`) left the banner printing
-# `all links verified` over a directory a lane would work as the wrong repo.
+say_case "repo identity: a LINKED WORKTREE is NAMED and does not fake a verification answer"
+# ⛔ TWO REVIEWS MET HERE, AND THE SECOND REVERSED THE FIRST. The worktree's name is a BRANCH, so there is
+# nothing the check failed to measure for it — and the fleet's own launcher leaves ~8 such trees on a busy
+# cell (`git worktree add $HOME/wt-<slug>`, `$CELL_HOME` = `/tmp/cell-home`). Carrying it as "unverified"
+# made every busy cell's doctor abstain forever, so it answers `ok` and is still NAMED (never silent), and
+# the duplicate report still lists its path and head. STATED RESIDUAL: a worktree spelled after ANOTHER
+# repo therefore reads clean — distinguishing that from a lane worktree needs the branch shape, which is
+# unbounded, while treating every worktree as fatal was a measured P0 (a healthy cell refused).
 mk_checkout "$T/ident-wtunv/r" "https://github.com/daniel-ospina/tortoise.git" y1 \
   && ok "fixture: the cell's own repo to branch from" \
   || bad "fixture: could not create the worktree source"
@@ -1886,8 +1948,12 @@ git -C "$T/ident-wtunv/r" worktree add --detach "$T/ident-wtunv/home/agent-infra
   || bad "fixture: could not create the mis-named worktree"
 BR_IDENT_ROOTS="$T/ident-wtunv/home" br ok normal --check
 case "$BR_OUT" in
-  *"UNVERIFIED"*"LINKED WORKTREE"*) ok "…the worktree line carries UNVERIFIED, so the token drops to PARTIALLY verified" ;;
-  *) bad "the LINKED WORKTREE line does not carry UNVERIFIED, so CELL READY still claims all links were verified: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+  *"LINKED WORKTREE"*) ok "…the worktree is NAMED (never silent), with the reason its name is not a claim" ;;
+  *) bad "the LINKED WORKTREE was not named at all: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a lane worktree was refused — every busy cell would fail provisioning" ;;
+  *) ok "…and it is not refused (a healthy cell holds these by design)" ;;
 esac
 
 say_case "repo identity: an UNPARSEABLE own-repo declaration is UNVERIFIED, never a wildcard and never a refusal"

@@ -1678,6 +1678,33 @@ case "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state" 2>/dev/null)" in
   *) bad "doctor: the record says rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state" 2>/dev/null) for an unanswered identity" ;;
 esac
 
+say_case "doctor: a linked WORKTREE is not cannot-verify — a busy cell must not red forever (#3521)"
+# ⛔ THIS REVERSES A CALL THIS FILE MADE ONE ROUND AGO, and the reason is a measured steady state: the
+# fleet's own launcher recipe is `git worktree add $HOME/wt-<slug>`, `$CELL_HOME` IS `/tmp/cell-home`, and a
+# busy cell carries ~8 such trees. Folding them to cannot-verify made EVERY pass rc=3 and `status` red on a
+# healthy box — an alarm that can never clear. A worktree's name is a BRANCH, so there is nothing the check
+# failed to measure for it.
+reset_state; reset_tmux; rm -f "$T/o/state/roles/.desired"
+rm -rf "$T/ident-wt-busy"; mkdir -p "$T/ident-wt-busy"
+git init -q "$T/ident-wt-busy/tortoise" >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" remote add origin https://github.com/daniel-ospina/tortoise.git >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" config user.email f@x.invalid >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" config user.name f >/dev/null 2>&1
+: > "$T/ident-wt-busy/tortoise/f" && git -C "$T/ident-wt-busy/tortoise" add -A >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" commit -q -m t >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" worktree add -q --detach "$T/ident-wt-busy/wt-fix-x" >/dev/null 2>&1 \
+  && ok "fixture: a healthy checkout plus a LINKED WORKTREE, as the fleet's launcher leaves them" \
+  || bad "fixture: could not create the lane worktree"
+OUT="$(DOCTOR_REPO_IDENTITY_ROOTS="$T/ident-wt-busy" bash "$DOCTOR" doctor 2>&1)"; RC=$?
+result_has "[identity] ok: repo identity:" && result_has "LINKED WORKTREE" \
+  && ok "doctor: the worktree is NAMED, and not as a failure" \
+  || bad "doctor: the worktree produced no verdict, or the checkout did not read ok — $OUT"
+result_has "[identity] CANNOT-VERIFY" \
+  && bad "doctor: a lane worktree made the identity pass abstain — every busy cell would red forever: $OUT" \
+  || ok "doctor: a lane worktree does not make the pass abstain"
+[ "$RC" -ne 1 ] && [ "$RC" -ne 3 ] && ok "doctor: the pass stays off 1 and off 3 (rc=$RC)" \
+  || bad "doctor: a healthy box with one lane worktree produced rc=$RC — $OUT"
+
 say_case "doctor: a cannot-verify identity is NOT folded to a clean rc by the POLICY-INERT reap (#3521)"
 # ⛔ THE FOLD ORDER IS THE BUG THIS PINS. `rrc=4` (policy-inert — "the pass completed and judged nothing",
 # the STEADY STATE of a Linux cell's reaper) collapses to 0 so it cannot mask a supervision result. Folding

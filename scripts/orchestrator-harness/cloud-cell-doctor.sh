@@ -2535,8 +2535,13 @@ service_controller_present() {
 #
 # rc: 0 = nothing fatal (a `warn` verdict does NOT change the pass — a declared exception, a quarantine
 # or several legitimate trees would otherwise redden a healthy cell), 1 = a directory's NAME claims one
-# repo while its origin IS another (the measured defect; the pass must not read clean), 3 = the shared
-# parser is not on this box, so no identity could be checked at all (cannot-verify is never a pass).
+# repo while its origin IS another (the measured defect; the pass must not read clean), 3 = the identity
+# could not be VERIFIED for at least one line: the shared parser is not on this box, a checkout's origin
+# is unreadable or is not a slug, a generic cell-checkout name with no declared repo, an empty
+# population, or a verdict this build cannot classify (cannot-verify is never a pass).
+# ⛔ A LINKED WORKTREE IS NOT ONE OF THOSE (it answers `ok`): its name is a BRANCH, so there is nothing
+# the check failed to measure, and treating it as unverified put every busy cell — where the fleet's own
+# launcher leaves 8 `wt-*` trees — into a permanent cannot-verify that could never clear.
 #
 # The verdicts come from `repo_identity_scan`, the SAME function the bring-up calls, so the two paths
 # cannot disagree about one box.
@@ -2564,6 +2569,11 @@ repo_identity_report() {
       unverified) seen_unverified=1; log "[identity] warn: $m" ;;
       warn)  log "[identity] warn: $m" ;;
       ok)    log "[identity] ok: $m" ;;
+      # ⛔ AN UNRECOGNISED VERDICT IS CANNOT-VERIFY, NEVER SILENT (review finding, P2). This role prefers
+      # `$O/repo-slug.sh` — the DEPLOYED copy, which can be NEWER than this doctor — so a fifth verdict is
+      # a live compatibility case, not a hypothetical one. Dropping it would leave `seen_*` at 0 and the
+      # pass green over a line nothing classified.
+      *)     seen_unverified=1; log "[identity] warn: UNRECOGNISED VERDICT '$v' from the identity walker — this doctor cannot classify it, so the identity is not verified (agent-infra#3521): $m" ;;
     esac
   done <<< "$out"
   # FAIL-CLOSED on a non-zero rc with no readable `fatal` line: an unreadable verdict is not a pass.

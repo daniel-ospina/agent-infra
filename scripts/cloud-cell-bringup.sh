@@ -736,6 +736,12 @@ check_repo_identity() {
       unverified) seen_unverified=1; warn "$m" ;;
       warn)  warn "$m" ;;
       ok)    ok "$m" ;;
+      # ⛔ EVERY UNRECOGNISED VERDICT IS UNVERIFIED, NEVER SILENT (review finding, P2). A `case` with no
+      # default drops a verdict a NEWER walker may emit — and because `rc` is 0 for anything that is not
+      # `fatal`, the pass would read clean while the walker said something this caller could not classify.
+      # (`repo-slug.sh` can come from a cell's `$O`, i.e. it may be NEWER than this bring-up.) The rail's
+      # own allow-list polarity is the same rule: an unnamed value must never fall through a gap.
+      *)     seen_unverified=1; warn "repo identity UNVERIFIED: the identity walker returned an unrecognised verdict ('$v') — this bring-up cannot classify it, so nothing about that line is claimed as verified (agent-infra#3521): $m" ;;
     esac
   done <<< "$out"
   # ⛔ FAIL-CLOSED ON A VERDICT THIS CODE CANNOT READ (the walker returned non-zero but printed no
