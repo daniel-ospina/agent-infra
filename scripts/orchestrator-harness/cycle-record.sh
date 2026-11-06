@@ -129,10 +129,13 @@ CR_STAGES_FIELD="stages"
 # `stages=` field or the field does not name <stage>. Never errors on an old-format record.
 cycle_stage_get() {
   local _sg_rec="${1:-}" _sg_want="${2:-}" _sg_rest _sg_f _sg_val="" _sg_v
-  # ⛔ THE WANTED NAME IS VALIDATED BEFORE IT IS USED AS A `case` PATTERN (below). A caller that
-  # passed `*` would otherwise MATCH the first stage in the field and return its value as if it were
-  # the requested one — a silent wrong answer, which is worse here than a refusal because the whole
-  # point of the field is that its numbers can be trusted.
+  # ⛔ THE WANTED NAME IS VALIDATED BEFORE IT IS USED AS A `case` PATTERN (below), AND THAT IS DEFENCE
+  # IN DEPTH RATHER THAN THE THING THAT SAVES US — the correction matters, because the earlier text here
+  # claimed the opposite. The patterns below are QUOTED (`"${_sg_want}:"`, `"${_sg_want}:"*`), so a glob
+  # stays LITERAL: measured with this guard deleted, `*`, `?`, `[bs]oot` and `boot*` are all still
+  # refused. The validation is kept because it refuses a name that could never be a stage at all —
+  # cheaply, before the walk — and because a future edit that drops the quoting would make the glob real
+  # in exactly the way the earlier text described.
   case "$_sg_want" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
   case "$_sg_rec" in *"${CR_STAGES_FIELD}="*) ;; *) return 1 ;; esac
   # ⛔ A HAND-ROLLED TOKEN WALK, NOT `for _f in $_rec`. Word splitting would also GLOB: the

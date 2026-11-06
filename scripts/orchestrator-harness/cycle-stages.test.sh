@@ -67,6 +67,15 @@ CR="$HERE/cycle-record.sh"; ORCH="$HERE/orch-loop.sh"; HARNESS_BIN="$ROOT/bin/ha
 for f in "$CR" "$ORCH"; do
   [ -s "$f" ] || { echo "❌ missing $f — this suite grades the shipped files, so it cannot run"; exit 2; }
 done
+# ⛔ ONE STRIPPER, THREE VIEWS, DEFINED BEFORE ANY ARM USES THEM. `_strip_tc` removes a TRAILING
+# ` #…` from every CODE line and leaves FULL-LINE comments alone; `_loop_nc` then drops those comment
+# lines too. Both views are needed: the structural arms want no comments at all (prose must not
+# re-supply a deleted call — measured: a deleted `stg_lvl_start l4_review` re-supplied as a trailing
+# comment stayed GREEN), while the region arms need the `# [redfix:begin]`-style MARKERS, which ARE
+# comment lines (and a full-line-comment strip deletes them).
+_strip_tc() { awk '{ if ($0 ~ /^[[:space:]]*#/) { print; next } sub(/[[:space:]]#.*$/, ""); print }' "$1"; }
+_loop_tc="$(_strip_tc "$ORCH")"
+_loop_nc="$(printf '%s\n' "$_loop_tc" | grep -vE '^[[:space:]]*#')"
 echo "==> cycle-stages self-test ($HERE)"
 
 # ── §0 sources, and the existence gate that stops an absence scoring as a pass ────────────────
@@ -309,7 +318,7 @@ ck "no 'date' fork in the clock's code (the whole point is a clock without a pro
 # matched the DOC COMMENT at the function definition, which sits above `fork_gate` — so moving the real
 # CALL below the gate left the suite at 75 passed. Fixed by stripping full-line comments and keying on
 # the CALL ONLY (`^  stg_cycle_reset$`), so the prose cannot satisfy its own arm.
-_loopcode6="$(grep -vE '^[[:space:]]*#' "$ORCH")"
+_loopcode6="$(printf '%s\n' "$_loop_tc" | grep -vE '^[[:space:]]*#')"
 _when="$(printf '%s\n' "$_loopcode6" | awk '/^while true; do/{W=NR} /^[[:space:]]*stg_cycle_reset[[:space:]]*$/{if(!R)R=NR} /^  fork_gate$/{if(!F)F=NR}
                  END{ if (R && F && R < F) print "ok"; else print "bad" }')"
 ck "the reset is CALLED (not merely defined) above fork_gate in the shipped loop (so a starved cycle is timed at all)" \
@@ -434,8 +443,12 @@ STG_LVL_TMP=""
 # 9.1b THE LAST ROW'S OPEN INTERVAL MUST NOT DIE AT `done`.
 # The top-of-iteration settle closes the PREVIOUS row's level, so the FINAL row had no closer and its
 # interval died with the subshell. Measured before the fix: three 1 s rows accumulated 2004 us x 1000
-# instead of ~3000 — one row's worth of cascade dropped in EVERY cycle. This arm drives the shipped
-# loop's own arrangement (settle at top AND at the end of the body) over three rows.
+# instead of ~3000 — one row's worth of cascade dropped in EVERY cycle.
+# ⛔ THIS ARM WRITES THAT ARRANGEMENT ITSELF — it does NOT read the shipped loop, and the earlier text
+# here said otherwise (sixth fresh-context review, P3 — measured: deleting the shipped TOP-OF-ROW
+# `stg_lvl_settle` leaves this arm green). The shipped settle sites are graded by §9.1c, which reads
+# `orch-loop.sh`; the top-of-row one is deliberately not, because the next row's `stg_lvl_start`
+# settles it anyway and the observable loss is a bounded per-row sliver.
 STG_LVL_TMP="$TMP/lvlq2"; : >"$STG_LVL_TMP"
 STG_V_l2_merge=0; STG_OPEN_LVL=""; STG_OPEN_T0=0
 printf 'r1\nr2\nr3\n' | while read -r _prow; do
@@ -455,7 +468,13 @@ STG_LVL_TMP=""
 # settle and the shipped post-`done` fold left the suite at "72 passed"). These two arms read the
 # real file. Comments are NOT stripped here on purpose — the assertion is about executable lines, so
 # it matches only lines that are not full-line comments AND names the exact call.
-_loop_nc="$(grep -vE '^[[:space:]]*#' "$ORCH")"
+# ⛔ FULL-LINE STRIPPING IS NOT ENOUGH, AND EVERY COUNT/GREP ARM BELOW DEPENDS ON THIS (sixth
+# fresh-context review, P2 — measured). `grep -vE '^[[:space:]]*#'` leaves TRAILING comments in the
+# stream, so deleting a real call and leaving `: # (was: stg_lvl_start l4_review)` on any code line
+# re-supplies the token the arm greps for. Measured: the plain deletions redden (92/1) and the
+# prose-satisfied forms stayed at 93/0 — for `stg_lvl_start l4_review` (this PR's own P0 fix),
+# `stg_field STG_FIELD` and `stages="${STG_FIELD:-}"` alike. So trailing comments are stripped too, and
+# every pattern that matters is anchored at `^[[:space:]]*<identifier>`.
 # ⛔ THE SETTLE ARM MUST REQUIRE THE **ADJACENT** LINE, NOT "SOME settle before SOME done" (my own
 # first draft of this arm was VACUOUS: it matched the TOP-OF-LOOP settle and stayed green after the
 # shipped end-of-body settle was deleted — verified, 75 passed with the line removed). The top-of-loop
@@ -486,15 +505,23 @@ ck "the shipped sweep FOLDS the overlay queue AFTER its 'done', in the parent ('
 # the sample and the nap re-zeroes the stamp and reproduces the uptime defect while a proximity test
 # still passes (measured 83/0). A window-glob cannot tell the two apart — this walks the stripped code
 # line by line, so it sees ORDER and a CLOBBER independently.
+# ⛔ THE WALK MUST KNOW THE NAP LINE. Without a pattern for it, "a sample precedes the mark" is ALSO
+# satisfied by a sample taken BETWEEN the nap and the mark — and that ordering is the other half of the
+# defect: `sample AFTER the nap` makes `prev_wait` a fabricated 0 for the whole gap, on every cycle
+# (measured on the shipped clock: 1 s nap ⇒ prev_wait 129 us). The sixth fresh-context review found
+# exactly that: swapping the two lines in all three sites left the suite at 93/0. So the walk latches
+# `nap`, and requires BOTH `have==1` AND `nap==1` at the mark.
 _nap_rep="$(printf '%s\n' "$_loop_nc" | awk '
-  /^[[:space:]]*stg_cycle_reset[[:space:]]*$/ { have=0; next }
+  /^[[:space:]]*stg_cycle_reset[[:space:]]*$/ { have=0; nap=0; next }
   /^[[:space:]]*stg_now_us_vars STG_WAIT_T0([[:space:]]|$)/ { have=1; next }
   /^[[:space:]]*STG_WAIT_T0=0[[:space:]]*$/ { if (have) have="clobber"; next }
+  /^[[:space:]]*(fork_free_sleep|sleep)([[:space:]]|$)/ { if (have) nap=1; next }
   /^[[:space:]]*stg_nap_mark([[:space:]]|$)/ {
     sites++
-    if (have == 1) ok++
-    else bad = bad sprintf(" line=%d(%s)", NR, (have == "clobber" ? "clobbered" : "no-sample"))
-    have = 0; next
+    if (have == 1 && nap == 1) ok++
+    else bad = bad sprintf(" line=%d(%s)", NR, \
+      (have == "clobber" ? "clobbered" : (have != 1 ? "no-sample" : "sampled-AFTER-the-nap")))
+    have = 0; nap = 0; next
   }
   END { printf "%d %d%s", sites+0, ok+0, bad }')"
 _nap_sites="${_nap_rep%% *}"
@@ -551,13 +578,23 @@ for _s in $STG_REGISTRY_TILED; do
 done
 ck "every TILED stage has a stg_mark call site in the shipped loop${_unmarked:+ — unmarked:$_unmarked}" \
    "$(if [ -z "$_unmarked" ]; then echo 0; else echo 1; fi)"
-_dup_mark=""
-for _st in boot disk; do
-  _c="$(printf '%s\n' "$_loop_nc" | grep -cE "^[[:space:]]*stg_mark $_st([[:space:]]|$)")"
-  [ "${_c:-0}" -ge 2 ] || _dup_mark="$_dup_mark $_st(only ${_c})"
-done
-ck "  …and the two stages marked on an EARLY-EXIT path keep that arm's own site too${_dup_mark:+ — lost:$_dup_mark}" \
-   "$(if [ -z "$_dup_mark" ]; then echo 0; else echo 1; fi)"
+# ⛔ A COUNT OF TWO IS NOT AN ARM (sixth fresh-context review, P2 — measured): deleting the fork-starved
+# arm's `stg_mark boot` and adding a SECOND `stg_mark boot` on the main path left the suite at 93/0, and
+# the production effect is that a fork-starved cycle's record reads `boot:ns` even though `boot` — the
+# fork probe — is the one stage that DID complete, on exactly the cycles this field exists to explain.
+# So the requirement is ADJACENCY INSIDE THE ARM: each early-exit `stg_field STG_FIELD` must be
+# immediately preceded, in stripped code, by the `stg_mark` for the stage that arm actually ran.
+_arm_marks="$(printf '%s\n' "$_loop_nc" | awk '
+  /^[[:space:]]*stg_mark ([A-Za-z0-9_]+)[[:space:]]*$/ { pending=$2; next }
+  /^[[:space:]]*stg_field STG_FIELD[[:space:]]*$/ { if (pending != "") out = out " " pending; pending=""; next }
+  /^[[:space:]]*$/ { next }
+  { if ($0 !~ /^[[:space:]]*(fi|then|do|else)$/) pending="" }
+  END { print out }')"
+_mkmiss=""
+case " $_arm_marks " in *" boot "*) : ;; *) _mkmiss="$_mkmiss boot" ;; esac
+case " $_arm_marks " in *" disk "*) : ;; *) _mkmiss="$_mkmiss disk" ;; esac
+ck "each EARLY-EXIT arm marks the stage it actually ran, ADJACENT to its own stg_field call (got '${_arm_marks:- none}')${_mkmiss:+ — missing:$_mkmiss}" \
+   "$(if [ -z "$_mkmiss" ]; then echo 0; else echo 1; fi)"
 
 # 9.1d-iii: NO NAP SITE MAY BE DROPPED, and the count is derived from the NAPS the loop performs.
 _nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
@@ -566,6 +603,9 @@ ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} s
    "$(if [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
 
 # 9.1g THE READER REFUSES A GLOB AS A STAGE NAME.
+# ⛔ THESE ARMS PIN THE OBSERVABLE, NOT THE GUARD. The wanted name is validated AND used quoted, so the
+# observable survives deletion of either; what they forbid is a future edit that drops the quoting and
+# lets `*` match the first stage in the field.
 # `cycle_stage_get` validates the WANTED name and then uses it as a `case` PATTERN. Without that guard a
 # caller passing `*` matches the FIRST stage in the field and returns its value as if it were the one
 # requested — a silent wrong answer, which is worse than a refusal because the whole point of the field
@@ -602,7 +642,7 @@ _mf=""
 stg_field _mf || _mf=""
 _mark_l2="$(cycle_stage_get "stages=$_mf" l2_merge 2>/dev/null || echo ABSENT)"
 ck "stg_mark SETTLES an open overlay into its own level — it cannot be credited to the tiled stage (l2_merge='$_mark_l2')" \
-   "$(if [ "$_mark_l2" = "1" ]; then echo 0; else echo 1; fi)"
+   "$(if [ "${_mark_l2:-0}" -ge 1 ] 2>/dev/null && [ "${_mark_l2:-0}" -le 5 ] 2>/dev/null; then echo 0; else echo 1; fi)"
 # ⛔ THE CLAIM IS ABOUT THE BOUNDARY, NOT ABOUT WHETHER THE TILED STAGE ALSO SEES THE TIME. An overlay
 # is a BREAKDOWN of the tiled stage it ran inside, so both legitimately count it (`sum(l1..l4) <=
 # sweep`). What must NOT happen is an overlay interval SPANNING the boundary — which is what an unclosed
@@ -610,9 +650,44 @@ ck "stg_mark SETTLES an open overlay into its own level — it cannot be credite
 # LATER tiled interval with no overlay opened accrues nothing to it.
 ck "  …so the mark CLOSED the overlay: no level is left open after it (STG_OPEN_LVL='${_open_after_mark}')" \
    "$(if [ "$_open_after_mark" = "" ]; then echo 0; else echo 1; fi)"
-ck "  …and a LATER tiled interval (no overlay opened) adds NOTHING to the level — it cannot span the boundary (l2_merge='$_mark_l2', stayed 1 s over 2.2 s of body)" \
-   "$(if [ "$_mark_l2" = "1" ]; then echo 0; else echo 1; fi)"
+ck "  …and a LATER tiled interval (no overlay opened) adds NOTHING to the level — it cannot span the boundary (l2_merge='$_mark_l2' over ~2.2 s of body)" \
+   "$(if [ "${_mark_l2:-0}" -ge 1 ] 2>/dev/null && [ "${_mark_l2:-0}" -le 3 ] 2>/dev/null; then echo 0; else echo 1; fi)"
 STG_LVL_TMP=""
+
+# 9.1d-iv: THE QUEUE MUST ACTUALLY BE WIRED TO A REAL PATH BEFORE THE SWEEP.
+# ⛔ §9.1/§9.1b SET `STG_LVL_TMP` THEMSELVES, so they grade the MECHANISM and cannot see the two lines
+# that make it reachable in production. Deleting `STG_LVL_TMP="$O/state/.stg-lvl"` and its truncate left
+# the suite at 93/0 while (measured, driving a real pipeline) `l2_merge:1` became `l2_merge:ns` on every
+# cycle — the whole cascade half of the field silently dead, which is exactly the P0 §9.1 exists to
+# prevent. The assignment is required on stripped code, and it must precede the sweep's pipeline.
+_q_wire="$(printf '%s\n' "$_loop_nc" | grep -nE '^[[:space:]]*STG_LVL_TMP="\$O/state/\.stg-lvl"' | head -1 | cut -d: -f1)"
+_q_trunc="$(printf '%s\n' "$_loop_nc" | grep -nE '^[[:space:]]*: >"\$STG_LVL_TMP"' | head -1 | cut -d: -f1)"
+_q_sweep="$(printf '%s\n' "$_loop_nc" | grep -nE '^[[:space:]]*printf .*\|$' | head -1 | cut -d: -f1)"
+ck "the overlay queue is WIRED to a real path before the sweep (assign=${_q_wire:- MISSING}, truncate=${_q_trunc:- MISSING}, sweep=${_q_sweep:-?})" \
+   "$(if [ -n "$_q_wire" ] && [ -n "$_q_trunc" ] && [ -n "$_q_sweep" ] && [ "$_q_wire" -lt "$_q_sweep" ] && [ "$_q_trunc" -lt "$_q_sweep" ]; then echo 0; else echo 1; fi)"
+ck "  …and a failure to CREATE it is flagged, not merely ignored (STG_LVL_QOK-style, or the path cleared)" \
+   "$(grep -qE ': >"\$STG_LVL_TMP" 2>/dev/null \|\| .*STG_LVL_TMP=""' <<<"$_loop_nc" && echo 0 || echo 1)"
+
+# 9.1d-v: THE PER-PR CASCADE SITES ARE PINNED BY REGION, NOT JUST BY EXISTENCE.
+# §9.3 requires a `stg_lvl_start l<N>_` call site SOMEWHERE for each declared level, so it cannot see a
+# site deleted from the region that owns it. Measured: deleting the red-fixer block's `l3_fix` open left
+# the suite at 95/0, and the loss is real — with nothing open, the whole block's interval is attributed
+# to no level at all. The regions are delimited by the markers the extracted suites already rely on.
+# ⛔ `$_loop_tc`, NOT `$_loop_nc`: the markers ARE comment lines, and `_loop_nc` has stripped them.
+# Here-strings, not a `printf | awk` pipe — the suite's own header forbids a piped quiet consumer and
+# this payload is ~200 KB.
+_redfix_l3="$(awk '
+  /# \[redfix:begin\]/ { inb=1; next }
+  /# \[redfix:end\]/   { inb=0 }
+  inb && /^[[:space:]]*stg_lvl_start l3_fix([[:space:]]|$)/ { f=1 }
+  END { exit !f }' <<<"$_loop_tc" && echo 0 || echo 1)"
+ck "the RED-FIXER block opens cascade level 3 inside its own region ([redfix:begin]..[redfix:end])" "$_redfix_l3"
+_redfix_close="$(awk '
+  /# \[redfix:end\]/ { seen=1 }
+  seen && /^[[:space:]]*stg_lvl_settle([[:space:]]|$)/ { f=1 }
+  seen && /^[[:space:]]*V="\$\(gh pr checks/ { exit }
+  END { exit !f }' <<<"$_loop_tc" && echo 0 || echo 1)"
+ck "  …and CLOSES it before the per-PR check classifier, so classification is not charged to a cascade level" "$_redfix_close"
 
 # 9.1e `stg_field` FOLDS BEFORE IT EMITS — driven, not grepped.
 # The post-`done` fold is not the last word: an overlay interval that closes at TOP level afterwards is
@@ -628,8 +703,10 @@ stg_lvl_settle || :
 _queued_before="${STG_V_l2_merge:-0}"
 stg_field _qfield                        # NO explicit fold — stg_field must do it
 _qv="$(cycle_stage_get "stages=$_qfield" l2_merge 2>/dev/null || echo ABSENT)"
+# ⛔ A RANGE, NOT AN EQUALITY: values are WHOLE SECONDS, so a scheduling stall on a loaded box pushes a
+# 1.1 s span to `2` and an exact `= "1"` reddens a required check for a reason that is not the change.
 ck "an overlay closed AFTER the post-sweep fold still reaches the field (queued=${_queued_before} us, l2_merge='$_qv')" \
-   "$(if [ "${_queued_before:-1}" -eq 0 ] && [ "$_qv" = "1" ]; then echo 0; else echo 1; fi)"
+   "$(if [ "${_queued_before:-1}" -eq 0 ] && [ "${_qv:-0}" -ge 1 ] 2>/dev/null && [ "${_qv:-0}" -le 5 ] 2>/dev/null; then echo 0; else echo 1; fi)"
 STG_LVL_TMP=""
 
 # 9.1f THE CLOCK IS MONOTONIC — driven. `EPOCHREALTIME` is a WALL clock, so an ntp step or a VM resume
@@ -673,7 +750,7 @@ ck "  …and the second gap is a real measurement, not a cleared-to-zero field" 
 # for `l1_main`. Asserts against the SHIPPED loop, with FULL-LINE COMMENTS STRIPPED first: a comment
 # that merely names the call must not satisfy the arm (the fix for this defect explains itself in
 # prose, so an unstripped grep would have passed on the broken tree).
-_loopcode="$(grep -vE '^[[:space:]]*#' "$ORCH")"
+_loopcode="$(printf '%s\n' "$_loop_tc" | grep -vE '^[[:space:]]*#')"
 for _lvl in $STG_REGISTRY_LVL; do
   ck "cascade level '$_lvl' has a stg_lvl_start call site in the shipped loop (not just a registry entry)" \
      "$(if qF "stg_lvl_start $_lvl" "$_loopcode"; then echo 0; else echo 1; fi)"

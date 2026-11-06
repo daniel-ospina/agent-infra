@@ -5352,6 +5352,18 @@ while true; do
       fi
     fi
     # [redfix:end]
+    # ⛔ CLOSE LEVEL 3 AT THE END OF THIS BLOCK — AND THE MISSING CLOSE WAS A REAL MISATTRIBUTION
+    # (fresh-context review, P2). The open at `[redfix:begin]` is correct: while this block decides
+    # whether a rail REFUSAL becomes a fixer lane, level 3 IS the active work. But nothing closed it,
+    # and `stg_lvl_start` only settles at the NEXT open — which is the conflict case's, ALSO level 3. So
+    # every PR that merely FELL THROUGH this block carried level 3 across the per-PR CHECK CLASSIFIER
+    # (`gh pr checks`, one network round trip per PR) and the conflict/mergeable re-read: a GREEN PR
+    # that nothing was fixing reported its classification cost as `l3_fix`, and `l2_merge` opened only
+    # AFTER both network reads. Charging network cost to the wrong cascade level is exactly what this
+    # field exists to end, so the block closes on exit and the classifier is honestly charged to NO
+    # level — an un-overlaid interval is a reading the record can express (`sum(l1..l4) < sweep`: no
+    # cascade level was the active work).
+    stg_lvl_settle || :
     # parked = the fixer cap was reached at THIS head; a later push re-arms the PR.
     [ -n "${HEAD_N:-}" ] && [ "$(cat "$O/state/parked-$PR" 2>/dev/null)" = "$HEAD_N" ] && { disp "$PR" "$HEAD_N" - wait "parked at this head — needs a human"; continue; }
     # Authority UNKNOWN (unreadable branch protection, above): no merge, no auto-arm, no worker
