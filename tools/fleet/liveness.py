@@ -1183,8 +1183,18 @@ def _bound_verdict_re():
         # so the MARKER is located first and the token is read off THAT line only.
         globals()["_BOUND_LINE_RE"] = _re.compile(r"\[lane-bound\]\s+VERDICT\b")
         _BOUND_LINE_RE = globals()["_BOUND_LINE_RE"]
-        _BOUND_TOKEN_RE = _re.compile(r"\bverdict=([a-z][a-z-]*)")
+        _BOUND_TOKEN_RE = _re.compile(r"\[lane-bound\]\s+VERDICT\s+verdict=([a-z][a-z-]*)")
         globals()["_BOUND_TOKEN_RE"] = _BOUND_TOKEN_RE
+        # ⛔ THE TOKEN IS ANCHORED TO THE FIELD THAT FOLLOWS THE MARKER, NOT SCAVENGED FROM
+        # THE LINE. `\bverdict=([a-z][a-z-]*)` matched ANY later field, so the line's PATH
+        # could supply the verdict when the real field was absent or unparseable. Measured:
+        #   `…VERDICT tag=t pid=4242 rc=0 elapsed=1s log=/tmp/verdict=finished.log`
+        #   -> ('finished','0')   … the lane published FINISHED with no verdict at all
+        #   `…VERDICT verdict=None … log=/tmp/verdict=stalled.log` -> ('stalled','0') -> `dead`
+        # That is the SAME asymmetry the `rc=` reader was fixed for ("a greedy match let
+        # `log=/tmp/L-rc=5.log` supply the exit status") and the same false-PASS class this
+        # axis exists to remove: `lane.sh` appends per-lane logs whose NAMES are lane content,
+        # and a foreign or future producer's line is exactly where such a field appears.
         # The LAUNCHER's exit-status line (`spawn-gate.sh`'s `[timeout] agent`):
         #   [timeout] agent pid=<pid> wall_limit=<t>s elapsed=<e>s rc=<n>
         # It is the ONLY witness of the child's real status in `watch` mode, so it is

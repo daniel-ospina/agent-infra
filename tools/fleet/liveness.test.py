@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-57 tests with 112 paired mutations: every mutation re-
+57 tests with 113 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 57 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (112)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (113)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1601,6 +1601,24 @@ def t37():
     check(liv.parse_bound_line(line) == ("finished", "0"),
           "the rc travels with the verdict; got %r" % (liv.parse_bound_line(line),))
     check(liv.parse_bound_verdict("nothing here") == "", "no line is NO verdict, not some verdict")
+    # ⛔ THE TOKEN IS ANCHORED TO THE FIELD AFTER `VERDICT`, NOT SCAVENGED FROM THE LINE.
+    # `\bverdict=([a-z][a-z-]*)` matched ANY later field, so the line's PATH supplied the
+    # verdict whenever the real field was missing or unparseable — measured:
+    #   `…VERDICT tag=t pid=4242 rc=0 … log=/tmp/verdict=finished.log` -> ('finished','0')
+    # i.e. a lane with NO verdict published FINISHED (nobody re-dispatches it), and a
+    # `verdict=stalled.log` path manufactured `dead`. The same asymmetry the `rc=` reader
+    # was fixed for, and lane log NAMES are lane content.
+    for hostile in (
+            "[lane-bound] VERDICT tag=t pid=4242 rc=0 elapsed=1s log=/tmp/verdict=finished.log",
+            "[lane-bound] VERDICT verdict=None tag=t pid=4242 rc=0 log=/tmp/verdict=stalled.log",
+            "[lane-bound] VERDICT verdict=FINISHED tag=t pid=4242 rc=0 log=/tmp/verdict=finished.log",
+    ):
+        check(liv.parse_bound_line(hostile) == ("", None),
+              "a verdict-shaped PATH must not supply the verdict; got %r for %r"
+              % (liv.parse_bound_line(hostile), hostile))
+        check(liv.parse_bound_verdict(hostile) == "",
+              "…and the verdict accessor agrees; got %r" % (liv.parse_bound_verdict(hostile),))
+
     check(liv.parse_bound_verdict("[lane-bound] VERDICT verdict=invented-later rc=0") == "",
           "an unrecognised verdict token is NOT adopted (it would decide an unmodelled state)")
     check(liv.parse_bound_verdict("".join([line, "\n"]) + line) == "finished",
@@ -4091,6 +4109,14 @@ MUTATIONS = [
         "the CENSUS read proof is dropped, so a mode-000 row publishes `frozen/no-progress "
         "bytes_delta=0` from a byte channel it never read — measured on the census seam, the "
         "surface §13.5 names as the fleet reader's home (T41 row 77 pins it)",
+    ),
+    Mutation(
+        "T37", "module",
+        '        _BOUND_TOKEN_RE = _re.compile(r"\\[lane-bound\\]\\s+VERDICT\\s+verdict=([a-z][a-z-]*)")',
+        '        _BOUND_TOKEN_RE = _re.compile(r"\\bverdict=([a-z][a-z-]*)")',
+        "the verdict token is SCAVENGED from the whole line again, so a `log=/tmp/verdict=finished.log` "
+        "PATH supplies it: a lane with no readable verdict publishes `finished` (work lost, nobody "
+        "re-dispatches) and a `verdict=stalled.log` path manufactures `dead`",
     ),
     Mutation(
         "T40", "module",
