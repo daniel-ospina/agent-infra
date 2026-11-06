@@ -948,15 +948,16 @@ ANCHORS = {
     ),
     # (4) delete the sha-record root derivation, so a `.harness-path` under a CUSTOM pin root is a
     # silent miss (`check-farm-drift.sh:161-208` measures the same class one variable over).
-    # ⛔ THE ANCHOR IS THE DERIVATION LINE, NOT THE ONE-LINE `case` ARM. (4f) below put a body on that
-    # arm, so the pre-cycle-7 spelling `*/state/HARNESS-PIN) pin_root=… ;;` matched 0 times — measured
-    # as "anchor matched 0 times (want 1)" plus a red G15-M4, which is the exit 9 of
-    # `mutate_reaper_anchored` doing its job. The DECISION is unchanged (delete the derivation), so the anchor follows the code:
-    # the mutant keeps the arm and blanks only the strip, leaving `pin_root` the FULL record path — the
-    # `-z` leg is then false, the derived source is `…/state/HARNESS-PIN/.harness-path` and misses.
+    # ⛔ THE ANCHOR IS THE DERIVATION, NOT THE RULE. This arm has been re-spelled three times
+    # (one-liner → multi-line body → one-liner carrying `pin_matched`), and each time the previous
+    # anchor matched 0 times — which `mutate_reaper_anchored` reports as "anchor matched 0 times
+    # (want 1)" and exits 9 on, reddening G15-M4 instead of silently skipping the leg. The DECISION is
+    # unchanged (delete the derivation), so the anchor follows the code: the mutant KEEPS `pin_matched=1`
+    # and blanks only the strip, leaving `pin_root` the FULL record path — the empty-root guard is then
+    # false, and the derived source is `…/state/HARNESS-PIN/.harness-path`, which misses.
     "no-pin-root-derivation": (
-        "        */state/HARNESS-PIN)\n            pin_root=\"${pin_root%/state/HARNESS-PIN}\"",
-        "        */state/HARNESS-PIN)\n            :   # MUTANT: the derivation is deleted",
+        "        */state/HARNESS-PIN) pin_matched=1; pin_root=\"${pin_root%/state/HARNESS-PIN}\" ;;",
+        "        */state/HARNESS-PIN) pin_matched=1 ;;   # MUTANT: the derivation is deleted",
     ),
     # (4b) delete the `//` COLLAPSE only — the trailing-slash strip still runs — but keep the derivation, so a
     # non-canonical spelling of the sha record derives the WRONG root — `<root>/.pi/agent/` — where the
@@ -998,13 +999,16 @@ ANCHORS = {
         "    case \"$pin_root\" in\n        [[:space:]]*|[[:cntrl:]]*|*[[:space:]]|*[[:cntrl:]])\n            PIN_VERDICT=\"pin-tree\"",
         "    case \"$pin_root\" in\n        __mutant_pin_root_trailing_junk__)\n            PIN_VERDICT=\"pin-tree\"",
     ),
-    # (4f) a `$HARNESS_PIN` that IS `…/state/HARNESS-PIN` but whose root strips to EMPTY
-    # (`/state/HARNESS-PIN` means the pin root is `/`). The suffix strip leaves `pin_root=""`, the
-    # `%s:+…` guard then SKIPS the derived source entirely, and the arm fails open. Deleting this leg
-    # restores that; G15z asserts it.
+    # (4f) a recognised sha-record spelling whose root strips to EMPTY — `/state/HARNESS-PIN` (pin
+    # root `/`), or `/.pi/agent/state/HARNESS-PIN` (the `pi-bootstrap/setup.sh:1109` spelling with
+    # `$HOME=/`); the `.pi/agent` strip below the first one can empty it too. The `${pin_root:+…}`
+    # guard then SKIPS the derived source entirely and the arm fails open. ⛔ THE GUARD IS BOUND TO
+    # `pin_matched`, so deleting it must leave a NON-record spelling still falling back — which is
+    # why the G15-M4 fixture (a different spelling, one source short) must stay green under this
+    # mutant. G15z drives both empty-root shapes and G15-M17/G15-M18 assert the mutant reclaims.
     "no-pin-root-empty-root": (
-        "            if [ -z \"$pin_root\" ]; then\n                PIN_VERDICT=\"pin-tree\"",
-        "            if false; then\n                PIN_VERDICT=\"pin-tree\"",
+        "    if [ \"$pin_matched\" = 1 ] && [ -z \"$pin_root\" ]; then\n        PIN_VERDICT=\"pin-tree\"",
+        "    if false; then\n        PIN_VERDICT=\"pin-tree\"",
     ),
     # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
     # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
@@ -5518,6 +5522,17 @@ OUT="$(HARNESS_PIN_OVERRIDE="/state/HARNESS-PIN" \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$WSZWT")")" "pin-tree" \
     "G15z a recognised spelling whose root strips to EMPTY PRESERVES (root '/', not 'no record')"
+# ⛔ THE SECOND EMPTY-ROOT SHAPE, and the one the first fix MISSED: `/.pi/agent/state/HARNESS-PIN`.
+# That is the spelling `pi-bootstrap/setup.sh:1109` actually writes (`--pin-file "$DEST/state/HARNESS-PIN"`
+# with `DEST=$HOME/.pi/agent`), and with `$HOME=/` it strips to `/.pi/agent` at the sha-record arm and
+# to "" at the `.pi/agent` arm — so a guard placed BETWEEN the two strips did not cover it and the
+# tree was `remove … rule=3`. Only a fixture on THIS spelling can see that, which is why it is here
+# rather than assumed covered by the leg above.
+OUT="$(HARNESS_PIN_OVERRIDE="/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSZWT")")" "pin-tree" \
+    "G15z a '/.pi/agent'-rooted sha-record spelling — the documented one, emptied by the SECOND strip — PRESERVES too"
 
 # ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
 # ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
@@ -5643,6 +5658,14 @@ OUT="$(HARNESS_PIN_OVERRIDE="/state/HARNESS-PIN" REAPER_OVERRIDE="$MUTP17" \
     run_reaper pin_tree_wspin2 --dry-run --repo "$T/pin_tree_wspin2/repo")"
 assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wspin2/opt/5b1b09aad2c1")")" "reclaimable" \
     "G15-M17 MUTATION: without the empty-root arm a '/'-rooted sha-record spelling skips the derived source and the tree is WRONGLY rule-3 residue => G15z is discriminating"
+# G15-M18: the SAME arm, driven through the SECOND strip. One arm covers both strips, so one anchor
+# deletes both — but a mutant leg per shape is what proves the arm is the thing standing between each
+# shape and a reclaim, rather than the other three record sources happening to name this tree.
+OUT="$(HARNESS_PIN_OVERRIDE="/.pi/agent/state/HARNESS-PIN" REAPER_OVERRIDE="$MUTP17" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wspin2 --dry-run --repo "$T/pin_tree_wspin2/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wspin2/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M18 MUTATION: without the empty-root arm the '/.pi/agent'-rooted spelling — emptied by the second strip — also reclaims, so the moved guard is what covers it"
 
 # G15-M8: delete the FAIL-CLOSED arm for an unreadable record. The mutant answers like the pre-fix
 # `[ -r "$rec" ] || continue` did — an unreadable record reads as "no record" — so the tree the box

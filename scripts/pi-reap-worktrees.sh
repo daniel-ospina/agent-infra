@@ -3059,8 +3059,12 @@ abstain_gate() {
 # directory already gone, and `unreadable-path` is a PRESERVE. ⛔ NOT an enumeration to keep: rule 5
 # is a KEEP (`preserve pr-closed-unmerged`), the removal set is wider than any list written here,
 # and the authority is the code — `grep -n -F "printf 'remove\t" scripts/pi-reap-worktrees.sh` (the
-# escape is LITERAL in the format string) `| grep -v ':#'`. The unfiltered form also lists the summary
-# counters `printf 'remove=%s`/`printf 'removed=%s` and the lines quoting the pattern.
+# escape is LITERAL in the format string) `| grep -v ':#'`. ⛔ TWO COMMANDS, NOT ONE: that `-F` form,
+# comments filtered out, yields the removal sites and the line quoting the pattern — and NOTHING
+# else. The PLAIN `grep "printf 'remove"` is what additionally lists the summary counters
+# `printf 'remove=%s`/`printf 'removed=%s`. Collapsing the two into one sentence is how this claim
+# was false: `printf 'remove=%s` does not contain `printf 'remove\t`, so it cannot appear in `-F`
+# output at all (measured). The precedence header at the top of the rule table spells this correctly.
 #
 # TWO PROBES, and the second exists because the first can be silent:
 #   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
@@ -3193,24 +3197,31 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         pin_root="$(printf '%s' "$pin_root" | tr -s '/')"   # collapse `//` — POSIX, no bashism
         while [ "${pin_root%/}" != "$pin_root" ]; do pin_root="${pin_root%/}"; done
     fi
+    # ⛔ A RECOGNISED SPELLING THAT DERIVES AN EMPTY ROOT IS NOT A DIFFERENT FILE NAME (#10114
+    # cycle 7). TWO strips below can empty the root, and the first draft guarded only the first of
+    # them: `/.pi/agent/state/HARNESS-PIN` — the spelling `pi-bootstrap/setup.sh:1109` writes
+    # (`--pin-file "$DEST/state/HARNESS-PIN"`, `DEST=$HOME/.pi/agent`) — becomes `/.pi/agent` at the
+    # sha-record strip and "" at the `.pi/agent` strip, so a guard sitting BETWEEN them let it
+    # through. Measured: `remove … rule=3` on an intact pin tree, i.e. the box reaped the harness it
+    # EXECUTES. With the root empty the `${pin_root:+…}` guard in the source list SKIPS the derived
+    # source entirely and the arm fails OPEN.
+    # ⛔ THE REFUSAL IS BOUND TO `pin_matched`, NOT TO EMPTINESS. A `$HARNESS_PIN` that is not this
+    # spelling at all reaches the `*)` arm on purpose and MUST still fall back to the other three
+    # sources; refusing on a bare `-z` after the strips would turn every unrelated spelling into a
+    # box-wide preserve. The root is EMPTY, NOT ABSENT only on the matched path.
+    local pin_matched=0
     case "$pin_root" in
-        */state/HARNESS-PIN)
-            pin_root="${pin_root%/state/HARNESS-PIN}"
-            # ⛔ A RECOGNISED SPELLING THAT DERIVES AN EMPTY ROOT IS NOT A DIFFERENT FILE NAME (#10114
-            # cycle 7). `HARNESS_PIN=/state/HARNESS-PIN` means the pin root is `/`, so the dir record is
-            # `/.harness-path`; the strip leaves `pin_root=""`, the `%s:+…` guard then SKIPS the source
-            # entirely, and the arm fails open. Measured: `remove … rule=3`. The root is empty, not
-            # absent — refuse rather than synthesise a `//`-spelled candidate out of it.
-            if [ -z "$pin_root" ]; then
-                PIN_VERDICT="pin-tree"
-                PIN_PROOF="\$HARNESS_PIN ('$HARNESS_PIN') is rooted at / , so the dir record it derives is '/.harness-path' — this probe will not synthesise that candidate from an empty root; 'cannot place it' is not 'names something else'; failed CLOSED"
-                return 0
-            fi ;;
+        */state/HARNESS-PIN) pin_matched=1; pin_root="${pin_root%/state/HARNESS-PIN}" ;;
         *)                   pin_root="" ;;
     esac
     case "$pin_root" in
         */.pi/agent) pin_root="${pin_root%/.pi/agent}" ;;
     esac
+    if [ "$pin_matched" = 1 ] && [ -z "$pin_root" ]; then
+        PIN_VERDICT="pin-tree"
+        PIN_PROOF="\$HARNESS_PIN ('$HARNESS_PIN') is a recognised sha-record spelling whose root strips to EMPTY — the pin root is '/', so the dir record it derives is '/.harness-path'; this probe will not synthesise that candidate from an empty root; 'cannot place it' is not 'names something else'; failed CLOSED"
+        return 0
+    fi
     # THE FOUR SOURCES, and each one is DISCRIMINATINGLY exercised by a fixture (G15p, G15n, G15k,
     # G15m — plus G15a/G15l for the co-rooted and whitespace-HOME spellings of the `$HOME` element):
     #   `${HARNESS_PIN_FILE}`  the production variable — `cloud-cell-bringup.sh:89` and
