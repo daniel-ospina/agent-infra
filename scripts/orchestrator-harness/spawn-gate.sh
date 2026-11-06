@@ -1183,9 +1183,9 @@ ARCHIVE_MAY_BE_PARTIAL=" — AND this archive may be PARTIAL: bg-rescue-wip.sh e
 # ⛔ AND EXIT 0 DOES NOT PROVE THE ARCHIVE'S TREE IS THE WORKTREE (fresh review, P1 — REPRODUCED, and it
 # FALSIFIED the premise this branch used to leave the `refs/wip/*` arm untouched). Round 18 argued "the
 # callee skips no paths on exit 0", so "its tree is the worktree as it was left" was left standing. That is
-# wrong, and `scripts/bg-rescue-wip.sh` shows why: `git add -A` runs first (`:182`) and on failure falls back
-# to `git add -u` with stderr DISCARDED (`:190`), then adds each `git ls-files -o` entry — i.e. UNTRACKED
-# paths only — collecting `SKIPPED` from those alone (`:192-193`). A TRACKED file git cannot read fails both
+# wrong, and `scripts/bg-rescue-wip.sh` shows why: `git add -A` runs first (`:201`) and on failure falls back
+# to `git add -u` with stderr DISCARDED (`:209`), then adds each `git ls-files -o` entry — i.e. UNTRACKED
+# paths only — collecting `SKIPPED` from those alone (`:211-212`). A TRACKED file git cannot read fails both
 # the bulk add and `add -u`, is never in the untracked sweep, and so is in NEITHER the archive NOR the
 # skipped list — `write-tree` succeeds, the push succeeds, the callee exits 0. Reproduced: a tracked,
 # modified `notes.txt` with `chmod 000` produced `rescue=refs/wip/<slug>`, exit 0, no "could NOT be
