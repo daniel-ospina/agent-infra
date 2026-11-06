@@ -167,7 +167,7 @@ assert_contains "$OUT" "runner cell=cell-a name=gh-runner-a-2 github_name=pi-run
 assert_contains "$OUT" "cell label=cell-b read=ok host=cell-b ncpu=4 ceiling=2 slots=2 mem_available_mb=9000" \
   "A: a SECOND cell is reported with ITS OWN memory reading and ceiling, not the first cell's"
 assert_contains "$OUT" "verdict=ok" "A: a row that both sources agree on is ok"
-assert_contains "$OUT" "summary cells=2 measured=2 unmeasured=0 registry=4 registry_unread=0 claimed=4 unclaimed=0 unregistered=0 unjoinable=0" \
+assert_contains "$OUT" "summary cells=2 measured=2 unmeasured=0 skipped=0 registry=4 registry_unread=0 claimed=4 unclaimed=0 unregistered=0 unjoinable=0" \
   "A: the summary reconciles the two sources — no name is counted twice, across BOTH registries"
 assert_omits "$OUT" "cannot-measure" "A: nothing is reported unmeasured when everything was read"
 
@@ -186,7 +186,7 @@ assert_contains "$OUT" "detail=cmux: link to 'cell-y' exited" \
 assert_omits "$OUT" "cell label=cell-y read=ok" "B: an unreadable cell is never rendered as a measured one"
 assert_omits "$OUT" "slots=0" "B: an unreadable pool never reads as an EMPTY pool (the #2381 class)"
 # the registry name only cell-y could claim must NOT be called a phantom
-assert_contains "$OUT" "registry-unclaimed name=pi-runner-y-1 registry=a status=online reason=cannot-attribute(1-cell-unmeasured)" \
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-y-1 registry=o/a status=online reason=cannot-attribute(1-cell-unmeasured)" \
   "B: while a cell is unmeasured, an unclaimed name is cannot-attribute — never a phantom"
 assert_omits "$OUT" "no-measured-cell-claims-it" "B: no phantom is claimed from an incomplete fleet"
 assert_contains "$OUT" "measured=1 unmeasured=1" "B: the summary counts BOTH sides"
@@ -198,7 +198,7 @@ cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111    
 reg o/a pi-runner-a-1 online false pi-runner-lost-9 offline false
 run_fleet bash "$FLEET"
 assert_eq "$RC" 3 "C: a measured fleet that does not account for a registration => exit 3"
-assert_contains "$OUT" "registry-unclaimed name=pi-runner-lost-9 registry=a status=offline reason=no-measured-cell-claims-it" \
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-lost-9 registry=o/a status=offline reason=no-measured-cell-claims-it" \
   "C: the registration that lost its box is named, with the reason a measured fleet supports"
 assert_contains "$OUT" "unclaimed=1" "C: the summary counts it"
 
@@ -235,7 +235,7 @@ gh-runner-unconn          777       live      pi-runner-unconn" 1 1 0 0 2 0)"
 reg o/a pi-runner-dead online false pi-runner-unconn offline false
 run_fleet bash "$FLEET"
 assert_eq "$RC" 3 "F: a dead listener and a live-but-offline runner => exit 3"
-assert_contains "$OUT" "name=gh-runner-dead github_name=pi-runner-dead listener=- local=DEAD github=online busy=false registry=a verdict=dead-listener" \
+assert_contains "$OUT" "name=gh-runner-dead github_name=pi-runner-dead listener=- local=DEAD github=online busy=false registry=o/a verdict=dead-listener" \
   "F: GitHub says online while the box says DEAD — the incident #2373 measured, named as dead-listener"
 assert_contains "$OUT" "name=gh-runner-unconn github_name=pi-runner-unconn listener=777 local=live github=offline" \
   "F: a live listener GitHub reports offline is its own row, not a silent 'ok'"
@@ -249,8 +249,8 @@ cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111    
 : >"$FIXTURE/gh.fail"
 run_fleet bash "$FLEET"
 assert_eq "$RC" 2 "G: an unreadable registry => exit 2"
-assert_contains "$OUT" "registry repo=a read=cannot-measure why=registry-unreadable" "G: the registry half reports its own failure"
-assert_omits "$OUT" "registry repo=a read=ok runners=0" "G: a refused registry never reads as an EMPTY one"
+assert_contains "$OUT" "registry repo=o/a read=cannot-measure why=registry-unreadable" "G: the registry half reports its own failure"
+assert_omits "$OUT" "registry repo=o/a read=ok runners=0" "G: a refused registry never reads as an EMPTY one"
 assert_omits "$OUT" "registry-unclaimed" "G: and nothing is attributed as a phantom from a read that did not happen"
 # ⛔ THE JOIN DIRECTION (review P2-7): the registry LINE being honest is not enough — the local row must
 # not be turned into a defect the unread registry could neither confirm nor deny.
@@ -355,7 +355,7 @@ cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111    
 printf 'pi-runner-a-1\t\tfalse\n' >"$FIXTURE/gh.o_a"
 run_fleet bash "$FLEET"
 assert_eq "$RC" 3 "O: an unclassifiable registry status => exit 3"
-assert_contains "$OUT" "github=unread busy=false registry=a verdict=github-unreadable" \
+assert_contains "$OUT" "github=unread busy=false registry=o/a verdict=github-unreadable" \
   "O: the row says UNREAD (not ABSENT, not ok) and names the verdict"
 assert_omits "$OUT" "verdict=ok" "O: an empty status field is never agreement"
 
@@ -401,7 +401,7 @@ cell cell-b 0 "$(block cell-b 4 2 1 9000 3584 "gh-runner-b-1            222     
 reg o/a pi-runner-a-1 online false pi-runner-b-1 online false
 run_fleet bash "$FLEET" --box cell-a
 assert_eq "$RC" 0 "S: a scoped run over a healthy fleet is not a defect"
-assert_contains "$OUT" "registry-unclaimed name=pi-runner-b-1 registry=a status=online reason=cannot-attribute(1-cell-not-requested)" \
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-b-1 registry=o/a status=online reason=cannot-attribute(1-cell-not-requested)" \
   "S: the excluded box's registration is an abstention, and the reason NAMES the exclusion"
 assert_omits "$OUT" "no-measured-cell-claims-it" "S: never a phantom, so never the destructive 'reclaim' advice"
 
@@ -433,10 +433,13 @@ cell cell-a 3 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111    
 reg o/a pi-runner-a-1 online false
 reg o/b pi-runner-a-1 offline false
 run_fleet bash "$FLEET"
-assert_contains "$OUT" "registry=a" "V: the first registry keeps the attribution"
-assert_contains "$OUT" "registry-unclaimed name=pi-runner-a-1 registry=b status=offline reason=cannot-attribute(name-carried-by-more-than-one-registry)" \
-  "V: the second registry's registration is NAMED, not swallowed"
-assert_contains "$OUT" "unjoinable=1" "V: and counted as an abstention"
+assert_contains "$OUT" "local=live github=unread busy=? registry=- verdict=cannot-attribute" \
+  "V: the LOCAL row refuses to claim either registration (the per-box view does not name the repo)"
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-a-1 registry=o/a status=online reason=cannot-attribute(name-carried-by-more-than-one-registry)" \
+  "V: the first registry's registration is NAMED, not bound"
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-a-1 registry=o/b status=offline reason=cannot-attribute(name-carried-by-more-than-one-registry)" \
+  "V: so is the SECOND registry's — neither is swallowed"
+assert_omits "$OUT" "name-collision" "V: and two repos' registrations are not a name collision"
 assert_eq "$RC" 2 "V: an unattributable registration => exit 2"
 
 # ══ W. THE PRODUCER'S OWN why= TOKEN SURVIVES THE rc-DERIVED ONE (cycle-2 P3) ════════════════════

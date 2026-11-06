@@ -145,8 +145,9 @@ usage: ci_runner_fleet.sh [report] [options]
              cannot-attribute(<N>-cell-unmeasured[,<N>-cell-not-requested][,<N>-registry-unread] |
                               name-carried-by-more-than-one-registry)
     name-collision name=… cells=…
-    summary  cells=… measured=… unmeasured=… registry=… registry_unread=… claimed=… unclaimed=…
-             unregistered=… unjoinable=… disagreements=… collisions=… not_ok=…
+    summary  cells=… measured=… unmeasured=… skipped=… registry=… registry_unread=… claimed=…
+             unclaimed=… unregistered=… unjoinable=… disagreements=… collisions=… not_ok=…
+             (`skipped=` counts the roster boxes --box EXCLUDED — a scope, never a failure)
 
   Seams: RUNNER_FLEET_BOXES (explicit roster), RUNNER_FLEET_EXEC (exec template, `{box}` substituted),
   RUNNER_FLEET_REPOS (registry repos), RUNNER_FLEET_ROOT / RUNNER_FLEET_ROOTS (RUNNER_ROOT per fleet /
@@ -339,12 +340,14 @@ derive_root() {
 # the caller). ⛔ `--paginate` WITH `--jq` APPLIES THE FILTER PER PAGE (gh's documented behaviour), so
 # a pool larger than one page is never truncated to its first 100 — the same reason
 # `ci_runner_gate.sh` paginates.
-registry_read() {
-  # ⛔ STDERR IS MERGED HERE TOO (review cycle 2, P3). `cap_bounded` redirects the child's stderr to
-  # /dev/null on every arm, so the caller's `2>"$TMPD/regerr"` never received it and every refusal
-  # read `detail=no-output` — 404, auth and rate-limit indistinguishable, which is the failure the
-  # cell arm explicitly refuses to flatten. Same `sh -c 'exec "$@" 2>&1'` wrapper `exec_box` uses.
-  cap_bounded "$FLEET_TIMEOUT" sh -c 'exec "$@" 2>&1' _ \
+registry_read() {  # <owner/name> <stderr-file>
+  # ⛔ STDERR GOES TO A FILE, NOT INTO THE ROWS (review cycle 3, P2). `cap_bounded` sends the child's
+  # stderr to /dev/null on every arm, so the caller's `2>file` never received it (every refusal read
+  # `detail=no-output`, with 404/auth/rate-limit indistinguishable) — and the obvious repair (`2>&1`)
+  # is WORSE: on a SUCCESSFUL read a gh warning becomes a ROW, is parsed as a registration, and a
+  # healthy fleet reads `registry-unclaimed name=warning: gh 2.40.0 is out of date ... not_ok=1` and
+  # exits 3. The wrapper hands the child its own stderr fd, so the two streams never meet.
+  cap_bounded "$FLEET_TIMEOUT" sh -c 'errf="$1"; shift; exec "$@" 2>"$errf"' _ "${2:-/dev/null}" \
     "$FLEET_GH" api --paginate \
     "repos/$1/actions/runners?per_page=100" \
     --jq '.runners[] | [.name, .status, (.busy|tostring)] | @tsv' </dev/null
@@ -361,7 +364,7 @@ registry_read() {
 unmeasured=0; measured=0; cells=0
 reg_unread=0; reg_total=0; reg_claimed=0; reg_unclaimed=0
 local_rows=0; unregistered=0; unjoinable=0; disagreements=0; not_ok=0; collision=0
-skipped=0; reg_scope=0
+skipped=0; reg_scope=0; reg_tokens=0; missing_seen=""
 # ⛔ A BOX DELIBERATELY EXCLUDED BY --box IS NOT A BOX THAT FAILED (review cycle 2, P1). Leaving it
 # uncounted made the attribution guard read a scoped run as a COMPLETE one, so `--box cell-a` on a
 # healthy two-cell fleet printed cell-b's registration as `registry-unclaimed …
@@ -373,7 +376,9 @@ skipped=0; reg_scope=0
 : >"$TMPD/claim"   # github_name<TAB>cell<TAB>name
 
 # ── 1. the registries (independent of the cells, so a fleet with no reachable cell still gets them) ─
+reg_tokens=0
 for repo in $FLEET_REPOS; do
+  reg_tokens=$((reg_tokens + 1))
   # ⛔ A MALFORMED REPO TOKEN IS AN UNREAD REGISTRY, NOT A SKIP (review P1-3, related). It used to
   # `continue` with no counter, so a typo'd seam left the registry half EMPTY while `summary …
   # registry=0` read as "this repo has no runners" — the absence-reads-as-zero shape, one seam in.
@@ -381,24 +386,31 @@ for repo in $FLEET_REPOS; do
     printf 'registry repo=%s read=cannot-measure why=repo-token-malformed detail=%s\n' "$repo" "not owner/name"
     reg_unread=$((reg_unread + 1)); continue ;;
   esac
-  short="${repo#*/}"; reg_scope=$((reg_scope + 1))
+  reg_scope=$((reg_scope + 1))
   : >"$TMPD/regerr"
-  if reg_out="$(registry_read "$repo" 2>"$TMPD/regerr")"; then
+  reg_rc=0
+  reg_out="$(registry_read "$repo" "$TMPD/regerr")" || reg_rc=$?
+  if [ "$reg_rc" -eq 0 ]; then
     # ⛔ AN EMPTY REGISTRY IS A LEGITIMATE READING (a repo whose jobs run on GitHub-hosted runners —
     # `ci-queue.sh` names that shape). It is NOT `cannot-measure`, and it is NOT "the fleet is gone".
     n="$(printf '%s\n' "$reg_out" | awk 'NF' | wc -l)"; n=$((n))
-    printf 'registry repo=%s read=ok runners=%s\n' "$short" "$n"
+    printf 'registry repo=%s read=ok runners=%s\n' "$repo" "$n"
     # ⛔ TAB-AWARE, BECAUSE `@tsv` YIELDS EMPTY FIELDS AND WHITESPACE SPLITTING COLLAPSES THEM
     # (review P1-2). A null `.status` renders as `name<TAB><TAB>false`; the old default-FS split made
     # that `name false` — status="false", busy="" — and the polarity test `= offline` fell through to
     # `verdict=ok`, certifying a runner whose registry row could not be read. Measured:
     # `runner … github=false busy=? registry=a verdict=ok`.
-    printf '%s\n' "$reg_out" | awk -F'\t' -v R="$short" '
+    printf '%s\n' "$reg_out" | awk -F'\t' -v R="$repo" '
       /^[ \t]*$/ { next }
       { printf "%s\t%s\t%s\t%s\n", $1, R, (NF >= 2 ? $2 : ""), (NF >= 3 ? $3 : "") }' >>"$TMPD/reg"
   else
     why="$(awk 'NF {print; exit}' "$TMPD/regerr")"
-    printf 'registry repo=%s read=cannot-measure why=registry-unreadable detail=%s\n' "$short" "${why:-no-output}"
+    # ⛔ A TIMEOUT IS ITS OWN READING, because "the API did not answer in bounded time" sends an
+    # operator somewhere different from "the API refused" (measured: the box's `gh` shim serialises
+    # its calls, so a queued registry read can exceed FLEET_TIMEOUT and produce NO stderr at all —
+    # which used to print `detail=no-output`, naming nothing).
+    [ "$reg_rc" -eq 124 ] && why="${why:-timed-out-after-${FLEET_TIMEOUT}s}"
+    printf 'registry repo=%s read=cannot-measure why=registry-unreadable rc=%s detail=%s\n' "$repo" "$reg_rc" "${why:-no-output}"
     reg_unread=$((reg_unread + 1))
   fi
 done
@@ -406,12 +418,17 @@ done
 # `RUNNER_FLEET_REPOS=" "` iterated zero times, so the registry half simply vanished: `registry=0` read
 # as "this repo has no runners" and every healthy runner was then `verdict=unregistered` — the same
 # class the malformed-token arm covers, one value over.
-if [ "$reg_scope" -eq 0 ]; then
+if [ "$reg_tokens" -eq 0 ]; then
   printf 'registry repo=- read=cannot-measure why=repo-list-empty detail=RUNNER_FLEET_REPOS is empty
 '
   reg_unread=$((reg_unread + 1))
 fi
 reg_total="$(awk 'NF' "$TMPD/reg" | wc -l)"; reg_total=$((reg_total))
+# ⛔ THE AMBIGUITY TABLE IS BUILT HERE, BEFORE ANY CELL IS READ, because BOTH loops consume it: the
+# row join (a name in more than one registry cannot be bound from the local side) and the unclaimed
+# pass (each such registry row is an abstention, never a phantom). Built ONCE and read as a FILE
+# ARGUMENT, never piped into a quiet `grep` (the class scripts/check-no-sigpipe-grep.sh refuses).
+awk -F'\t' '{c[$1]++} END {for (n in c) if (c[n] > 1) print n}' "$TMPD/reg" >"$TMPD/ambig"
 
 # ── 2. the roster ────────────────────────────────────────────────────────────────────────────────
 if [ -n "$FLEET_BOXES" ]; then
@@ -421,7 +438,7 @@ else
   roster="$(cap_fleet_inventory)"; rrc=$?
   if [ "$rrc" -ne 0 ]; then
     printf 'cell roster=cannot-measure why=roster-unreadable detail=%s\n' "${roster#UNKNOWN }"
-    printf 'summary cells=UNKNOWN measured=0 unmeasured=UNKNOWN registry=%s registry_unread=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN unjoinable=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' \
+    printf 'summary cells=UNKNOWN measured=0 unmeasured=UNKNOWN skipped=UNKNOWN registry=%s registry_unread=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN unjoinable=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' \
       "$reg_total" "$reg_unread"
     exit 2
   fi
@@ -435,7 +452,7 @@ fi
 # that tokenises to nothing).
 if [ ! -s "$TMPD/roster" ] || ! awk 'NF {found = 1} END {exit !found}' "$TMPD/roster"; then
   printf 'cell roster=cannot-measure why=roster-empty detail=no-usable-label-in-the-roster\n'
-  printf 'summary cells=0 measured=0 unmeasured=UNKNOWN registry=%s registry_unread=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN unjoinable=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' \
+  printf 'summary cells=0 measured=0 unmeasured=UNKNOWN skipped=UNKNOWN registry=%s registry_unread=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN unjoinable=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' \
     "$reg_total" "$reg_unread"
   exit 2
 fi
@@ -444,7 +461,10 @@ fi
 # provider renamed) otherwise reports `cells=0` and exits 0 — a clean bill of health built from
 # nothing, the shape `cap_expected_boxes` refuses one namespace over.
 for want in $ONLY_BOXES; do
+  # ⛔ ONCE PER LABEL: `--box typo --box typo` counted cells=2 / unmeasured=2 for one missing label.
+  case " $missing_seen " in *" $want "*) continue ;; esac
   if ! grep -qxF -- "$want" "$TMPD/roster"; then
+    missing_seen="$missing_seen $want"
     cells=$((cells + 1)); unmeasured=$((unmeasured + 1))
     printf 'cell label=%s read=cannot-measure why=box-not-in-roster detail=not-in-cmux-vm-list\n' "$want"
   fi
@@ -532,6 +552,18 @@ while read -r box <&3; do
     [ "$kind" = "R" ] || continue
     local_rows=$((local_rows + 1))
     rstatus=""; rbusy=""; rrepo=""; hit=""
+    # ⛔ A NAME CARRIED BY MORE THAN ONE REGISTRY IS NOT BINDABLE FROM THE LOCAL SIDE (review cycle 3,
+    # P2). Names are unique PER REPO and two registries are read by default, so one agentName may
+    # legitimately exist in both while the per-box `status` block does not say which repo an install is
+    # registered to. Binding to the FIRST row was measured to compute cell-b's verdict from cell-a's
+    # registration (a false `ok`, or a false `github-offline`), to print the wrong `registry=`, and to
+    # fire a `name-collision` on a perfectly healthy two-cell fleet.
+    if [ -n "$ghname" ] && grep -qxF -- "$ghname" "$TMPD/ambig"; then
+      unjoinable=$((unjoinable + 1))
+      printf 'runner cell=%s name=%s github_name=%s listener=%s local=%s github=unread busy=? registry=- verdict=cannot-attribute\n' \
+        "$box" "$name" "$ghname" "${listener:--}" "$state"
+      continue
+    fi
     if [ -n "$ghname" ]; then
       hit="$(awk -F'\t' -v n="$ghname" '$1==n {print; exit}' "$TMPD/reg")"
       if [ -n "$hit" ]; then
@@ -557,7 +589,7 @@ while read -r box <&3; do
     elif [ "$state" = "ORPHANED" ]; then
       verdict="orphaned"; not_ok=$((not_ok + 1))
     elif [ "$state" = "DEAD" ]; then
-      verdict="dead-listener"; not_ok=$((not_ok + 1)); disagreements=$((disagreements + 1))
+      verdict="dead-listener"; not_ok=$((not_ok + 1))
     elif [ -n "$dtok" ]; then
       verdict="defect-$(printf '%s' "$dtok" | tr '=' ':')"; not_ok=$((not_ok + 1))
     elif [ -z "$ghname" ]; then
@@ -579,11 +611,15 @@ while read -r box <&3; do
     if [ -z "$rstatus" ]; then
       if [ -n "$hit" ]; then gshow="unread"; else gshow="ABSENT"; fi
     else gshow="$rstatus"; fi
-    # ⛔ THE DISAGREEMENT IS COUNTED INDEPENDENTLY OF WHICH VERDICT WON (review cycle 2, P3): the
-    # `-n "$dtok"` arm sits before the offline arm, so a row carrying BOTH a tmpdir defect and
-    # `github=offline` never reached `disagreements++` and the summary printed `disagreements=0` on a
-    # box that had one — the counter the docs advertise as "the disagreements between the two sources".
-    [ "$rstatus" = "offline" ] && disagreements=$((disagreements + 1))
+    # ⛔ ONE PAIR TEST, COUNTED INDEPENDENTLY OF WHICH VERDICT WON (review cycles 2 and 3, P3). The
+    # increments used to live inside the verdict arms, which was wrong in BOTH directions: the
+    # `defect` arm sat before the offline arm so a row carrying both never counted (a disagreement
+    # vanished), while `DEAD` incremented AND the offline test incremented again — so
+    # `local=DEAD github=offline` (the sources AGREEING) counted 2 and `local=ORPHANED github=online`
+    # (a real disagreement) counted 0. The state:status PAIR is the whole rule.
+    case "$state:$rstatus" in
+      live:offline|DEAD:online|ORPHANED:online) disagreements=$((disagreements + 1)) ;;
+    esac
     printf 'runner cell=%s name=%s github_name=%s listener=%s local=%s github=%s busy=%s registry=%s verdict=%s\n' \
       "$box" "$name" "${ghname:--}" "${listener:--}" "$state" "$gshow" "${rbusy:-?}" "${rrepo:--}" "$verdict"
     [ -n "$ghname" ] && printf '%s\t%s\t%s\n' "$ghname" "$box" "$name" >>"$TMPD/claim"
@@ -602,21 +638,15 @@ done 3<"$TMPD/roster"
 # attributed to the FIRST and the rest are an abstention, named.
 # ⛔ NO PIPE INTO A QUIET GREP (scripts/check-no-sigpipe-grep.sh's class): both tables are built once,
 # then read as FILE ARGUMENTS, so a truncated reader cannot turn a valid answer into a SIGPIPE failure.
-awk -F'\t' '{c[$1]++} END {for (n in c) if (c[n] > 1) print n}' "$TMPD/reg" >"$TMPD/ambig"
-awk -F'\t' '!seen[$1]++ { print $1 "\t" $2 }' "$TMPD/reg" >"$TMPD/regfirst"
 while IFS=$'\t' read -r rname rrepo2 rstatus2 rbusy2; do
   [ -n "$rname" ] || continue
+  if grep -qxF -- "$rname" "$TMPD/ambig"; then
+    reg_unclaimed=$((reg_unclaimed + 1)); unjoinable=$((unjoinable + 1))
+    printf 'registry-unclaimed name=%s registry=%s status=%s reason=cannot-attribute(name-carried-by-more-than-one-registry)\n' \
+      "$rname" "$rrepo2" "$rstatus2"
+    continue
+  fi
   if awk -F'\t' -v n="$rname" '$1==n {found=1} END {exit !found}' "$TMPD/claim"; then
-    if grep -qxF -- "$rname" "$TMPD/ambig"; then
-      # the FIRST registry carrying this name is the attribution; every later one is an abstention
-      if grep -qxF -- "$rname"$'\t'"$rrepo2" "$TMPD/regfirst"; then
-        reg_claimed=$((reg_claimed + 1)); continue
-      fi
-      reg_unclaimed=$((reg_unclaimed + 1)); unjoinable=$((unjoinable + 1))
-      printf 'registry-unclaimed name=%s registry=%s status=%s reason=cannot-attribute(name-carried-by-more-than-one-registry)\n' \
-        "$rname" "$rrepo2" "$rstatus2"
-      continue
-    fi
     reg_claimed=$((reg_claimed + 1)); continue
   fi
   reg_unclaimed=$((reg_unclaimed + 1))
@@ -643,13 +673,14 @@ done <"$TMPD/reg"
 # registration (or a stale `.runner`), and starting both is not twice the capacity — the rule #2381
 # encodes as "DEDUPED BY agentName".
 for dup in $(awk -F'\t' '{c[$1]++; cell[$1]=cell[$1] "," $2} END {for (n in c) if (c[n] > 1) print n}' "$TMPD/claim"); do
+  grep -qxF -- "$dup" "$TMPD/ambig" && continue
   printf 'name-collision name=%s cells=%s\n' "$dup" "$(awk -F'\t' -v n="$dup" '$1==n {printf "%s,", $2}' "$TMPD/claim" | sed 's/,$//')"
   collision=$((collision + 1)); not_ok=$((not_ok + 1))
 done
 
 # ── 6. the verdict ───────────────────────────────────────────────────────────────────────────────
-printf 'summary cells=%s measured=%s unmeasured=%s registry=%s registry_unread=%s claimed=%s unclaimed=%s unregistered=%s unjoinable=%s disagreements=%s collisions=%s not_ok=%s\n' \
-  "$cells" "$measured" "$unmeasured" "$reg_total" "$reg_unread" "$reg_claimed" "$reg_unclaimed" "$unregistered" "$unjoinable" "$disagreements" "$collision" "$not_ok"
+printf 'summary cells=%s measured=%s unmeasured=%s skipped=%s registry=%s registry_unread=%s claimed=%s unclaimed=%s unregistered=%s unjoinable=%s disagreements=%s collisions=%s not_ok=%s\n' \
+  "$cells" "$measured" "$unmeasured" "$skipped" "$reg_total" "$reg_unread" "$reg_claimed" "$reg_unclaimed" "$unregistered" "$unjoinable" "$disagreements" "$collision" "$not_ok"
 # ⛔ 2 OUTRANKS 3: a report that could not read a cell, a registry, or the join between them cannot
 # certify anything about what it holds, so "a defect was found" is the weaker claim and must not mask
 # the unmeasured one.

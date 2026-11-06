@@ -788,11 +788,14 @@ not `restart`).
 
 ⛔ **`--box` is a SCOPE, not a claim that the rest of the fleet does not exist.** The boxes it excludes
 are counted: a registration they carry is `cannot-attribute(<N>-cell-not-requested)`, never a phantom,
-so a scoped run never prints advice whose remedy is `reclaim` on a live runner. A name carried by
-**more than one registry** (names are unique per repo, and two registries are read by default) is
-attributed to the first and the rest are `cannot-attribute(name-carried-by-more-than-one-registry)` —
-one local row cannot claim the same name in both, which would both miscount `claimed=` and swallow the
-second registry's registration (the lost-its-box class clause 2 exists for). Exit `0` all measured and
+so a scoped run never prints advice whose remedy is `reclaim` on a live runner, and the summary prints
+`skipped=` for it. A name carried by **more than one registry** (names are unique per repo, and two
+registries are read by default) is attributed to **neither**: the local row prints
+`verdict=cannot-attribute`, and every registry row carrying it is
+`cannot-attribute(name-carried-by-more-than-one-registry)`. The per-box `status` block does not say
+which repo an install is registered to, so binding to the first matching row would compute one cell's
+verdict from another repo's registration (a false `ok`, or a false `offline`) and fire a
+`name-collision` on a healthy two-cell fleet. Exit `0` all measured and
 agreed · `2` cannot measure (outranks 3; any of the three counters non-zero) · `3` measured with a named
 defect.
 
@@ -806,8 +809,8 @@ clause 3 behaving correctly from day one. The transport is a seam (`RUNNER_FLEET
 one-line #2345 fix lands there without touching the aggregation, attribution or exit contract. The
 tool is NOT allowed to route around it with a hand-rolled `--carrier` socket (AGENTS "Fix Broken
 Infrastructure"); its suite proves the aggregation and the reconciliation hermetically
-(`scripts/ci_runner_fleet.test.sh`, 77 assertions), with four mutants keeping the measured gate, the
-producer-rc gate, the attribution guard and the claim key honest.
+(`scripts/ci_runner_fleet.test.sh`), with four mutants keeping the measured gate, the producer-rc gate,
+the attribution guard and the claim key honest.
 
 ⚠️ Two smaller residuals, stated: the tool reads every cell **through** the transport, including the
 box it runs on (use `ci_runner_pool.sh status` for that one); and `RUNNER_FLEET_ROOTS` exists because a
