@@ -141,8 +141,16 @@ drive_prologue() { printf 'set -u\nQUEUE_ORDER_STATE=""\n'; }
 # `PS4=… bash -x …` prefix is DROPPED when the shell runs as root — the trace then reads `+ echo '…'`
 # with no function name, so every witness check would red for the wrong reason on a root host. Set on
 # the script's own first lines, it is honoured for every uid.
+# ⛔ AND THE PREFIX CARRIES A PER-RUN NONCE (review P3, cycle 52). The anchored matcher proves a TEXT SHAPE
+# on the trace stream, and ANY line written to FD 2 can wear that shape — measured: a heredoc body whose line
+# begins `+queue_order_from_pool echo '[refresh] …'` is accepted by the anchored regex with no echo
+# executed. The nonce is generated per drive and written ONLY into that drive's `PS4`, so data that does not
+# carry THIS run's value cannot name a witness; a forgery would have to read the drive file that invoked it
+# (residual, stated). `_dwit` requires the nonce, and one probe grades BOTH directions.
+_xtrace_nonce() { printf 'n%d' "$RANDOM$RANDOM"; }
 drive_xtrace_prologue() {
-  printf '%s\n' 'set -u' 'QUEUE_ORDER_STATE=""' "PS4='+\${FUNCNAME[0]:-main} '" 'set -x'
+  local _n="${1:-}"; [ -n "$_n" ] || _n="$(_xtrace_nonce)"
+  printf '%s\n' 'set -u' 'QUEUE_ORDER_STATE=""' "PS4='+\${FUNCNAME[0]:-main} [${_n}] '" 'set -x'
 }
 
 drive() {
@@ -1727,20 +1735,24 @@ ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not rep
 # because a heredoc BODY is printed data that reads exactly like an arm's line: filtering comments did not
 # exclude bodies; excluding bodies still left the witness resolved by grepping STDOUT, which the body
 # fills; and a body can even be printed (`cat <<A <<B`) after the tracker had already stopped looking. So
-# the witness is now taken from an XTRACE with a function-attributed PS4: a heredoc body appears in the
-# output but NEVER as `+queue_order_from_pool echo '…'`, and the trace names the function the line came
-# from. `_dwit` reads that trace and returns the printed PREFIX (up to the first `:`), which is text the
+# the witness is now taken from an XTRACE with a function-attributed, NONCE-carrying PS4: a traced echo reads
+# `+<fn> [<nonce>] echo '…'` — the function the line came from, and a value only THIS run's `PS4` holds.
+# Printed data cannot wear that shape unless it reproduces the run's nonce (measured: a body line opening
+# `+queue_order_from_pool echo` used to be accepted; with the nonce it names nothing, without it, it does —
+# both directions are asserted by the `forge.sh` probe). `_dwit` reads that trace and returns the printed PREFIX (up to the first `:`), which is text the
 # drive really produced, so it can be searched for in stdout without guessing at quoting.
-_dwit() {  # _dwit <xtrace-file> [function-name] -> the prefix of the first echo EXECUTED in that function
+_dwit() {  # _dwit <xtrace-file> [function-name] [nonce] -> the prefix of the first echo EXECUTED in that fn
   # ⛔ THE MATCH IS ANCHORED TO THE TRACE'S COMMAND POSITION (review P2, cycle 51). A substring match on
   # `fn` + ` echo ` accepted ANY line carrying both tokens — measured: an assignment that traces a heredoc
   # body verbatim (`_d="$(cat <<'Z' … Z"`) yields `+queue_order_from_pool _d='queue_order_from_pool echo
   # '''[refresh] …'`, which named a witness with no echo executed at all. With `PS4='+${FUNCNAME[0]:-main} '`
   # the traced command starts at the FIRST token after the `+`-run (a nested `$()` adds one more `+`), so the
   # regex `^\++<fn> echo ` is exact and the assignment line cannot match it.
-  awk -v fn="${2:-queue_order_from_pool}" '
-    $0 ~ ("^\\++" fn " echo ") {
-      s = $0
+  awk -v fn="${2:-queue_order_from_pool}" -v nx="${3:-}" '
+    BEGIN { np = (nx == "" ? "" : " \\[" nx "\\]") }
+    $0 ~ ("^\\++" fn np " echo ") {
+      e = index($0, " echo "); if (e == 0) next
+      s = substr($0, e + 6)
       i = index(s, "["); if (i == 0) next
       s = substr(s, i)
       j = index(s, ":"); if (j == 0) next
@@ -1749,11 +1761,11 @@ _dwit() {  # _dwit <xtrace-file> [function-name] -> the prefix of the first echo
 }
 # The same run, again, with the trace on: this is the ONLY reading that can distinguish "the arm echoed"
 # from "something printed the same text".
-_base="$TMP/witness"; rm -rf "$_base"; mkdir -p "$_base/o"
+_base="$TMP/witness"; rm -rf "$_base"; mkdir -p "$_base/o"; _n_base="$(_xtrace_nonce)"
 printf '300\n9\n200\n' > "$_base/o/candidates.txt"; printf '200\n300\n' > "$_base/o/.pool"
-{ drive_xtrace_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_base/drive.sh"
+{ drive_xtrace_prologue "$_n_base"; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_base/drive.sh"
 ( cd "$_base" && HOME="$_base" bash drive.sh "$_base/o" ) > "$_base/out" 2>"$_base/trace"
-_wit_base="$(_dwit "$_base/trace")"
+_wit_base="$(_dwit "$_base/trace" '' "$_n_base")"
 ck "an echo INSIDE queue_order_from_pool is EXECUTED by the unmutated drive ('${_wit_base:-<none>}')" "$([ -n "$_wit_base" ] && echo 0 || echo 1)"
 if [ -n "$_wit_base" ] && grep -qF "$_wit_base" "$_base/out" 2>/dev/null; then rc=0
 else rc=1; echo "      the witness named by the trace ('${_wit_base:-<none>}') is not in the drive's own STDOUT"; fi
@@ -1762,11 +1774,11 @@ ck "the witness the trace names is text this drive actually PRINTED" $rc
 # ⛔ AND THE PARSER IS GRADED IN BOTH DIRECTIONS (review P3, cycle 49). The previous tracker was graded by a
 # one-off manual experiment and deleting it left the suite green. These two probes are the red and green
 # paths, permanently: printed DATA inside the function must yield NO witness, and a real `echo` must.
-_dwp="$TMP/wit-parse"; rm -rf "$_dwp"; mkdir -p "$_dwp"
+_dwp="$TMP/wit-parse"; rm -rf "$_dwp"; mkdir -p "$_dwp"; _n_p="$(_xtrace_nonce)"
 # The body CARRIES THE TOKEN PAIR on purpose: a body without it proves nothing about the matcher (it would
 # have failed even the weakest predicate). `_dwit` must still name nothing, because no `echo` ran.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' 'set -v' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
   'queue_order_from_pool() {' \
   "  cat <<'ZZZ'" \
   "  queue_order_from_pool echo '[refresh] decoy order: printed DATA'" \
@@ -1775,13 +1787,20 @@ printf '%s\n' \
   '}' \
   'queue_order_from_pool' > "$_dwp/decoy.sh"
 ( cd "$_dwp" && bash decoy.sh ) > "$_dwp/decoy.out" 2>"$_dwp/decoy.trace"
-ck "a heredoc body carrying the TOKEN PAIR names NO witness (printed data is not an executed echo)" \
-   "$([ -z "$(_dwit "$_dwp/decoy.trace")" ] && echo 0 || echo 1)"
+# ⛔ AND THE BODY MUST HAVE REACHED THE STREAM (review P3, cycle 52): `set -v` is the ONLY reason the body is on
+# FD 2, and an absence assertion over a stream the body never reached passes for ANY matcher — measured:
+# deleting `set -v` left the suite at 131/0 with the pre-fix substring matcher still in place.
+if ! grep -qF "queue_order_from_pool echo '[refresh] decoy order" "$_dwp/decoy.trace" 2>/dev/null; then
+  rc=1; echo "      the heredoc body is NOT in the trace stream — 'set -v' did not take effect, so the absence proves nothing"
+elif [ -n "$(_dwit "$_dwp/decoy.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      the body NAMED a witness ('$(_dwit "$_dwp/decoy.trace" '' "$_n_p")') — printed data is not an executed echo"
+else rc=0; fi
+ck "a heredoc body carrying the TOKEN PAIR names NO witness (printed data is not an executed echo)" $rc
 
 # ⛔ AND THE ASSIGNMENT SHAPE, which traces the body INSIDE the assignment rather than as a command — the
 # exact line a substring matcher accepted (review P2, cycle 51).
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
   'queue_order_from_pool() {' \
   "  _d=\"\$(cat <<'ZZZ'" \
   "queue_order_from_pool echo '[refresh] assign order: body traced inside an assignment'" \
@@ -1792,38 +1811,62 @@ printf '%s\n' \
   'queue_order_from_pool' > "$_dwp/assign.sh"
 ( cd "$_dwp" && bash assign.sh ) > "$_dwp/assign.out" 2>"$_dwp/assign.trace"
 ck "a heredoc traced INSIDE an assignment names NO witness (the match is anchored to the command position)" \
-   "$([ -z "$(_dwit "$_dwp/assign.trace")" ] && echo 0 || echo 1)"
+   "$([ -z "$(_dwit "$_dwp/assign.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
 
 # ⛔ THE ` echo ` CONJUNCT, graded on its own: a function whose only command is a `printf` carrying the same
 # text must name nothing — drop that conjunct and this fixture becomes a witness.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
   'queue_order_from_pool() {' \
   "  printf '%s\\n' '[refresh] printf order: not an echo'" \
   '}' \
   'queue_order_from_pool' > "$_dwp/printf.sh"
 ( cd "$_dwp" && bash printf.sh ) > "$_dwp/printf.out" 2>"$_dwp/printf.trace"
 ck "a PRINTF in the function names NO witness (an echo is required, not merely a line of text)" \
-   "$([ -z "$(_dwit "$_dwp/printf.trace")" ] && echo 0 || echo 1)"
+   "$([ -z "$(_dwit "$_dwp/printf.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
 
 # ⛔ AND THE `fn` CONJUNCT: an echo in ANOTHER function must not be attributed to the one under test.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
   'other_function() { echo "[refresh] other order: a different function"; }' \
   'queue_order_from_pool() { other_function; }' \
   'queue_order_from_pool' > "$_dwp/other.sh"
 ( cd "$_dwp" && bash other.sh ) > "$_dwp/other.out" 2>"$_dwp/other.trace"
-ck "an echo in a DIFFERENT function names NO witness for the function under test" \
-   "$([ -z "$(_dwit "$_dwp/other.trace")" ] && echo 0 || echo 1)"
+# ⛔ AND THE FORGERY ITSELF (review P3, cycle 52): a body whose line WEARS the trace prefix. The NONCE is what
+# refuses it, and both directions are asserted — with the nonce it names nothing, WITHOUT it the same stream
+# names the forgery. Delete the nonce from the matcher and this check reddens instead of quietly weakening.
+# (Residual, stated: data that reproduces THIS run's nonce would still match — it would have to read the drive
+# file that invoked it.)
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  'queue_order_from_pool() {' \
+  "  cat <<'ZZZ' >/dev/null" \
+  "+queue_order_from_pool echo '[refresh] forged order: X'" \
+  'ZZZ' \
+  '  return 0' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/forge.sh"
+( cd "$_dwp" && bash forge.sh ) > "$_dwp/forge.out" 2>"$_dwp/forge.trace"
+if ! grep -qF "+queue_order_from_pool echo '[refresh] forged order" "$_dwp/forge.trace" 2>/dev/null; then
+  rc=1; echo "      the FORGED line never reached the trace stream — the fixture proves nothing"
+elif [ -n "$(_dwit "$_dwp/forge.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      a printed line wearing the trace prefix NAMED a witness ('$(_dwit "$_dwp/forge.trace" '' "$_n_p")') — the nonce is not being required"
+elif [ "$(_dwit "$_dwp/forge.trace" '' '')" != '[refresh] forged order' ]; then
+  rc=1; echo "      the forgery is not a forgery: WITH THE NONCE DROPPED the same stream names '$(_dwit "$_dwp/forge.trace" '' '')' instead of '[refresh] forged order' — so this check proves nothing about the nonce"
+else rc=0; fi
+ck "a printed line WEARING the trace prefix names NO witness (the per-run nonce refuses it — and, with the nonce dropped, DOES)" $rc
+
+ck "an echo in a DIFFERENT function names NO witness for the function under test" \
+   "$([ -z "$(_dwit "$_dwp/other.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
   'queue_order_from_pool() {' \
   '  echo "[refresh] queue order: severity-first from the pool — head #1"' \
   '}' \
   'queue_order_from_pool' > "$_dwp/real.sh"
 ( cd "$_dwp" && bash real.sh ) > "$_dwp/real.out" 2>"$_dwp/real.trace"
 ck "an executed arm echo DOES name a witness, and it is the prefix the drive printed" \
-   "$([ "$(_dwit "$_dwp/real.trace")" = '[refresh] queue order' ] && echo 0 || echo 1)"
+   "$([ "$(_dwit "$_dwp/real.trace" '' "$_n_p")" = '[refresh] queue order' ] && echo 0 || echo 1)"
 
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
 MUT_NOSAT="$TMP/fns-nosat.sh"
@@ -1841,9 +1884,9 @@ cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null && _mut_ok=0
 if [ "$_mut_ok" = "0" ]; then
   rc=1; echo "      the .pool-sat mutation could not be applied whole (sed: '$(tr '\n' ' ' < "$TMP/.mut-sed-err" 2>/dev/null | head -c 120)', mutant bytes '$(wc -c < "$MUT_NOSAT" 2>/dev/null)') — the anchor drifted"
 else
-  d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"
+  d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"; _n_m="$(_xtrace_nonce)"
   printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
-  { drive_xtrace_prologue; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
+  { drive_xtrace_prologue "$_n_m"; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
   ( cd "$d" && HOME="$d" bash drive.sh "$d/o" ) > "$d/out" 2>"$d/trace"
   # ⛔ AND THE MUTANT MUST HAVE RUN (review P2, cycle 44). The three application gates observe that the
   # mutation was WRITTEN, never that the mutated driver EXECUTED: a syntactically broken replacement passes
@@ -1853,7 +1896,7 @@ else
   # ⛔ THE WITNESS COMES FROM THIS DRIVE'S OWN TRACE (review P2, cycle 49): an `echo` executed INSIDE
   # `queue_order_from_pool` is what proves the mutated function ran its arm. Reading a control's stdout
   # instead let printed DATA stand in for an executed statement.
-  _wit_c="$(_dwit "$d/trace")"
+  _wit_c="$(_dwit "$d/trace" '' "$_n_m")"
   if [ -z "$_wit_c" ]; then
     rc=1; echo "      NO echo was executed inside queue_order_from_pool — the mutant did not run, so the absence of the clause proves nothing"
   elif ! grep -qF "$_wit_c" "$d/out" 2>/dev/null; then
@@ -2035,7 +2078,12 @@ _arm14() {  # _arm14 <label> <count-content|-> -> print the drive's output
   printf '200\n300\n' > "$_ad/o/candidates.txt"; printf '200\n300\n' > "$_ad/o/.pool"
   printf 'P1-severe\n' > "$_ad/o/.pool-sat"
   sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_ad/fns-shim.sh"
-  { drive_xtrace_prologue; cat "$_ad/fns-shim.sh"
+  # ⛔ THE RENAME MUST HAVE HAPPENED (review P3, cycle 52). Ungated, a drifted anchor means `_rq_real` never
+  # exists, the drive takes `priority-unreadable`, NO arm's sentence is in either stream — and the "absent
+  # from the output as well" branch reported that as a PRODUCT defect. The verdict is the first output line
+  # because this function runs inside a command substitution (a variable would never reach the caller).
+  if cmp -s "$FNS" "$_ad/fns-shim.sh" 2>/dev/null; then printf '__SHIM__rename=noop\n'; else printf '__SHIM__rename=ok\n'; fi
+  { drive_xtrace_prologue "$(_xtrace_nonce)"; cat "$_ad/fns-shim.sh"
     printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; '
     if [ "$2" = "-" ]; then printf 'rm -f "$4"'; else printf 'printf "%%s\\n" "%s" > "$4"' "$2"; fi
     printf '; return $_rq_rc; }\n'
@@ -2057,8 +2105,12 @@ for _arm14_case in \
   _al="${_arm14_case%%|*}"; _rest="${_arm14_case#*|}"
   _ac="${_rest%%|*}"; _am="${_rest#*|}"
   _ao="$(_arm14 "$_al" "$_ac")"
-  if ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null && ! grep -qF "$_am" <<<"$_ao"; then
-    rc=1; echo "      the $_al arm's sentence is ABSENT FROM THE OUTPUT as well — the arm's echo is GONE, not merely untraced (a product defect, not a dead fixture)"
+  _shim_ren=noop
+  case "$_ao" in '__SHIM__rename=ok'*) _shim_ren=ok; _ao="$(printf '%s\n' "$_ao" | sed '1d')" ;; esac
+  if [ "$_shim_ren" != ok ]; then
+    rc=1; echo "      the shim RENAME did not apply for the $_al arm — the sed anchor drifted, so '_rq_real' never exists, the drive takes priority-unreadable and NO arm behaviour is graded (a FIXTURE defect)"
+  elif ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null && ! grep -qF "$_am" <<<"$_ao"; then
+    rc=1; echo "      the $_al arm's echo did not run at all — neither stream carries its sentence (the shim's rename and count injection were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null; then
     rc=1; echo "      the $_al arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the sentence proves nothing"
   elif grep -qF "$_am" <<<"$_ao" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_ao"; then rc=0
@@ -2074,6 +2126,8 @@ _arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line>
   printf '200\n300\n' > "$_amd/o/candidates.txt"; printf '200\n300\n' > "$_amd/o/.pool"
   printf 'P1-severe\n' > "$_amd/o/.pool-sat"
   sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_amd/fns-ren.sh"
+  # Both gates travel on ONE first line (`rename=` and `strip=`), same subshell reason as `_arm14`.
+  if cmp -s "$FNS" "$_amd/fns-ren.sh" 2>/dev/null; then _shim_ren=noop; else _shim_ren=ok; fi
   # `sub(/[$]_sat_said/, "")` — the `[$]` bracket keeps the `$` out of the regex as an anchor, and the
   # VARIABLE is deleted while the closing quote is left standing, so the echo stays valid shell. (A
   # replacement string spelled `"\""` is a syntax error in this awk: measured, it silently produced a
@@ -2087,8 +2141,9 @@ _arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line>
   # a command substitution, i.e. a SUBSHELL, so a flag it sets never reaches the caller — measured: all four
   # per-arm checks reported "the strip did NOT apply" for four successful strips. The first output line is
   # the verdict; the drive's own output follows it.
-  if cmp -s "$_amd/fns-ren.sh" "$_amd/fns-shim.sh" 2>/dev/null; then printf '__STRIP_NOOP__\n'; else printf '__STRIP_OK__\n'; fi
-  { drive_xtrace_prologue; cat "$_amd/fns-shim.sh"
+  if cmp -s "$_amd/fns-ren.sh" "$_amd/fns-shim.sh" 2>/dev/null; then _shim_strip=noop; else _shim_strip=ok; fi
+  printf '__SHIM__strip=%s,rename=%s\n' "$_shim_strip" "$_shim_ren"
+  { drive_xtrace_prologue "$(_xtrace_nonce)"; cat "$_amd/fns-shim.sh"
     printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; printf "%%s\\n" "%s" > "$4"; return $_rq_rc; }\n' "$3"
     printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
   } > "$_amd/drive.sh"
@@ -2106,12 +2161,15 @@ for _arm14m in \
   _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _rest="${_rest#*|}"
   _mc="${_rest%%|*}"; _mm="${_rest#*|}"
   _mo="$(_arm14_mut "$_ml" "$_mn" "$_mc")"
-  _mok=0
-  case "$_mo" in '__STRIP_OK__'*) _mok=1; _mo="$(printf '%s\n' "$_mo" | sed '1d')" ;; esac
-  if [ "$_mok" -ne 1 ]; then
+  _mok=0; _mren=no
+  case "$_mo" in '__SHIM__strip=ok,rename=ok'*) _mok=1; _mren=yes ;; esac
+  case "$_mo" in '__SHIM__'*) _mo="$(printf '%s\n' "$_mo" | sed '1d')" ;; esac
+  if [ "$_mren" != yes ]; then
+    rc=1; echo "      the shim did NOT apply for the $_ml arm (strip=$_mok, rename=$_mren) — a drifted sed anchor means nothing here is graded"
+  elif [ "$_mok" -ne 1 ]; then
     rc=1; echo "      the strip did NOT apply to the $_ml arm — it already lacks the clip, so this check would report a mutation it never made"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null && ! grep -qF "$_mm" <<<"$_mo"; then
-    rc=1; echo "      the $_ml arm's sentence is ABSENT FROM THE OUTPUT as well — the arm's echo is GONE, not merely untraced (a product defect, not a dead mutant)"
+    rc=1; echo "      the $_ml arm's echo did not run at all — neither stream carries its sentence (the shim's rename and strip were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null; then
     rc=1; echo "      the $_ml arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the absence of the clause proves nothing"
   elif grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
@@ -2126,14 +2184,15 @@ if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said
   _d="$_d14b"
   # ⛔ ITS OWN CONTROL FIRST (review P2, cycle 48): this fixture lands on the HEAD-NOT-NUMERIC arm, not on the
   # severity arm §14c drives, so the witness has to be resolved against an unmutated run of THIS fixture.
-  { drive_xtrace_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-ctl.sh"
+  _n_c="$(_xtrace_nonce)"
+  { drive_xtrace_prologue "$_n_c"; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-ctl.sh"
   ( cd "$_d" && HOME="$_d" bash drive-ctl.sh "$_d/o" ) > "$_d/out-ctl" 2>"$_d/trace-ctl"
   { drive_xtrace_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
   ( cd "$_d" && HOME="$_d" bash drive-mut.sh "$_d/o" ) > "$_d/out-mut" 2>"$_d/trace-mut"
   # ⛔ AND THE MUTANT MUST HAVE RUN HERE TOO (review P3, cycle 45). This check had exactly the defect §14c
   # was hardened for one commit earlier: a dead driver satisfies "the clause is absent" for the wrong
   # reason. Same witness, derived the same way.
-  _wit_e="$(_dwit "$_d/trace-ctl")"
+  _wit_e="$(_dwit "$_d/trace-ctl" '' "$_n_c")"
   if [ -z "$_wit_e" ] || ! grep -qF "$_wit_e" "$_d/trace-mut" 2>/dev/null; then
     rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
   elif grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
