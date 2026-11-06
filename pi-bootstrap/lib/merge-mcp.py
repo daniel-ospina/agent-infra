@@ -669,7 +669,16 @@ def usable(entry, want_url):
     # `type` field at all (it selects StreamableHTTP from `url` alone), so a self-hosted entry that
     # spells `type: "sse"` for its own daemon WORKS — replacing it would destroy the operator's
     # config and point them at an endpoint they have no key for.
-    if (entry.get("url") or "").strip() == (want_url or "").strip() and entry.get("type") not in (None, "http"):
+    # ⛔ "IS THIS THE HOSTED DEFAULT?" IS AN AUTHORITY QUESTION, NOT BYTE EQUALITY (#3374 review,
+    # round 16 P2 — measured). This arm compared `entry["url"]` to `want_url` BYTE-FOR-BYTE while
+    # every sibling rule in this function asks `endpoint_key`/`authority_key`, so a DEFAULT-PORT
+    # spelling of the hosted endpoint (`https://api.premiselabs.co:443/mcp/`) escaped the
+    # disqualification, survived `usable()`, and was then NORMALISED to the canonical url at the
+    # `_cur_view`/`on_hosted_authority` rewrite with its `type: "sse"` still attached — the merge
+    # exited 0 having written a file `--verify` refuses as `NOTHTTP:sse`, so the repair loop could
+    # never converge. `authority_key`'s own docstring states the rule this arm was missing: no
+    # path, query, fragment or default port can make a hosted AUTHORITY a self-host.
+    if on_hosted_authority(entry.get("url")) and entry.get("type") not in (None, "http"):
         return False, "type"
     auth = (headers or {}).get("Authorization") or ""
     if not isinstance(auth, str):
@@ -700,7 +709,20 @@ def usable(entry, want_url):
     if not url.lower().startswith("https://") \
             and endpoint_key("https://" + url.split("://", 1)[1]) == endpoint_key(want_url):
         return False, "insecure"
-    if endpoint_key(url) != endpoint_key(want_url):
+    # ⛔ THE SELF-HOST EXEMPTION IS `on_hosted_authority`-GUARDED TOO (#3374 review, round 16 P1).
+    # `endpoint_key` is PATH-SENSITIVE, so a hosted url spelled `/mcp` (no trailing slash) keyed
+    # DIFFERENTLY from `HOSTED_DEFAULT_URL` and took this early return — "a self-hosted daemon may
+    # need no key at all" — and was then rewritten to the canonical hosted url by AUTHORITY
+    # (`on_hosted_authority`, path-INSENSITIVE) with its missing/foreign credential still attached.
+    # Measured on the real repair path with a self-host TEMPLATE: merge rc=0 wrote
+    # `{"url": "https://api.premiselabs.co/mcp/"}` with NO Authorization, and `--verify` answered
+    # `NOAUTH` rc=1 — the installer writing exactly what the verifier refuses, on a loop
+    # `cloud-cell-bringup.sh` runs as verify -> install -> verify. Round 13 fixed this for the
+    # TEMPLATE (`want`) and never for `cur`; the caller now hands this function a canonical view of
+    # `cur`, and this guard keeps the exemption unreachable even if a future caller forgets.
+    # A genuine self-host is NOT on the hosted authority (`endpoint_key` keeps the scheme and a
+    # non-default port), so `http://localhost:8000/mcp` and `:8443` still take the exemption.
+    if not on_hosted_authority(url) and endpoint_key(url) != endpoint_key(want_url):
         # a self-hosted daemon may need no key at all (docs/quickstart-selfhosted.md), and its
         # header may legitimately name a different variable — it is the operator's daemon.
         return True, ""
@@ -940,7 +962,23 @@ def main(argv):
         # credential?" is about the HOSTED endpoint only. With the template's url here, a cell
         # already pointing at the operator's own daemon on a self-host template demanded a key it
         # does not need and was rewritten toward an endpoint the operator never chose.
-        ok_entry, why = usable(cur, HOSTED_DEFAULT_URL)
+        # ⛔ JUDGE THE URL THAT IS ACTUALLY WRITTEN, NOT THE SPELLING THE CELL HAPPENS TO CARRY
+        # (#3374 review, round 16 P1 — the same fix round 13 applied to `want` two hundred lines up,
+        # and never applied to `cur`). `usable()` answers "does this need the hosted credential?" by
+        # `endpoint_key` (path-SENSITIVE) while the rewrite below normalises by `authority_key`
+        # (path-insensitive) — so a hosted url spelled `/mcp`, `/mcp/?x=1` or `/foo/../mcp/` was
+        # classified as a self-host that needs no key, and was THEN written as the canonical hosted
+        # endpoint with that empty credential. Measured with a self-host template: merge rc=0 wrote a
+        # hosted entry with NO Authorization and `--verify` answered `NOAUTH` rc=1. With the shipped
+        # template the same divergence showed up on a `:443` spelling carrying `type: "sse"`
+        # (`NOTHTTP:sse` rc=1) — reachable on the common path, not just the exotic one.
+        # `cur` is NOT mutated: the existing `normalised this cell's HOSTED tortoise url` NOTE must
+        # still fire off the operator's actual bytes, and this file's contract is that nothing here
+        # is silent.
+        _cur_url = cur.get("url")
+        _cur_view = dict(cur, url=HOSTED_DEFAULT_URL) \
+            if isinstance(_cur_url, str) and on_hosted_authority(_cur_url) else cur
+        ok_entry, why = usable(_cur_view, HOSTED_DEFAULT_URL)
         if ok_entry and near_miss((cur.get("url") or "").strip(), (want.get("url") or "").strip()):
             # ⛔ A TYPO IS NOT A SELF-HOST, AND THE INSTALLER MUST NOT BLESS ONE. Marking ANY
             # differing url `_selfHosted` let this file certify the exact config `--verify`'s
@@ -1068,6 +1106,12 @@ def main(argv):
                     entry["headers"] = headers
                 have["tortoise"] = entry
         else:
+            # ⛔ THE OLD SENTENCE SAID "with the hosted default", AND IT WAS ONLY TRUE WHEN THE
+            # TEMPLATE WAS THE HOSTED ONE (#3374 review, round 16 P1). On a SELF-HOST template this
+            # branch writes the TEMPLATE's entry, so an operator reading "REPLACED … with the hosted
+            # default" got an endpoint they never chose and no line saying so — the sentence-false-
+            # about-the-artifact class this PR keeps correcting (rounds 11, 13). It names the url
+            # that is actually written now, and it says whose it is.
             print(
                 "NOTE: REPLACED an unusable tortoise entry (reason: %s — the hosted endpoint needs an "
                 "env-indirect Authorization, no entry may carry a literal key, a credential may not "
@@ -1076,7 +1120,8 @@ def main(argv):
                 "what a host-spoof looks like), and no authority may name a host the client cannot "
                 "build a request from (an empty host, a space, a bad port, a percent-encoded host, "
                 "or a name DNS cannot resolve) — all of that is the minimum `--verify` will certify) "
-                "with the hosted default; a preserved one could never be repaired" % why
+                "with the template's entry (%s); a preserved one could never be repaired"
+                % (why, (want.get("url") or ""))
             )
             have["tortoise"] = want
     else:

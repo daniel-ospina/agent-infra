@@ -3891,6 +3891,68 @@ _converge_case "a LAN http daemon with no key (control)" \
 _converge_case "the hosted HOST on a non-default port (control)" \
   '{"mcpServers":{"tortoise":{"type":"http","url":"http://api.premiselabs.co:8443/mcp"}}}'
 
+# ⛔ THE INVARIANT WAS ONLY EVER DRIVEN FROM AN **EMPTY** DESTINATION (#3374 review, round 16 P1/P2 —
+# both measured). Every `_converge_case` above writes `{"mcpServers":{}}` first, so the shape they
+# exercise is always "what does the merge make of the TEMPLATE"; the cell's OWN entry — the one an
+# already-provisioned box carries, i.e. the input the REPAIR path actually meets — never reached
+# `usable()`. It diverged. `usable()` answers "does this need the hosted credential?" by
+# `endpoint_key` (path-SENSITIVE) while the rewrite below it normalises by `authority_key`
+# (path-insensitive), so a hosted url spelled `/mcp` was classified as a self-host that needs no key
+# and was THEN written as the canonical hosted endpoint with that empty credential. Measured pre-fix:
+# merge rc=0 wrote `{"url":"https://api.premiselabs.co/mcp/"}` with NO Authorization and `--verify`
+# answered `NOAUTH` rc=1; and on the SHIPPED template a `:443` spelling carrying `type:"sse"` came out
+# merge rc=0 / `NOTHTTP:sse` rc=1 — reachable on the COMMON path, not only the exotic one. Same
+# one-line invariant, asked of the other input.
+_converge_case_dst() { # <name> <template-json> <pre-existing destination `tortoise` entry json>
+  printf '%s' "$2" > "$TMP/cvd-tpl.json"
+  printf '{"mcpServers":{%s}}' "$3" > "$TMP/cvd-dst.json"
+  cp "$TMP/cvd-dst.json" "$TMP/cvd-before.json"
+  python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/cvd-tpl.json" "$TMP/cvd-dst.json" --cell \
+    > "$TMP/cvd-merge.out" 2>&1
+  _mrc=$?
+  _mout="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" \
+             "$TMP/cvd-dst.json" "$TMP/cvd-tpl.json" 2>&1)"
+  _vrc=$?
+  if [ "$_mrc" -ne 0 ]; then
+    cmp -s "$TMP/cvd-dst.json" "$TMP/cvd-before.json" \
+      && ok "CONVERGES-BY-REFUSAL: $1 — merge rc=$_mrc and the cell's entry is UNCHANGED" \
+      || fail "$1: the merge refused (rc=$_mrc) but STILL WROTE the destination"
+  elif [ "$_vrc" -eq 0 ]; then
+    ok "CONVERGES: $1 — merge rc=0 and --verify certifies what it wrote ($_mout)"
+  else
+    fail "$1: NON-CONVERGENT — a PRE-EXISTING cell entry was rewritten (rc=0) into a file --verify REFUSES ($_mout rc=$_vrc); the repair loop can never clear it"
+  fi
+}
+_SELF_TPL='{"mcpServers":{"tortoise":{"type":"http","url":"http://localhost:8000/mcp"}}}'
+_converge_case_dst "self-host template + a cell entry spelling the hosted host /mcp with no Authorization" \
+  "$_SELF_TPL" '"tortoise":{"url":"https://api.premiselabs.co/mcp"}'
+_converge_case_dst "self-host template + a cell entry at the hosted :443 with a non-http transport" \
+  "$_SELF_TPL" '"tortoise":{"type":"sse","url":"https://api.premiselabs.co:443/mcp/","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}'
+_converge_case_dst "the SHIPPED template + a cell entry at the hosted :443 with a non-http transport" \
+  "$(cat "$ROOT/templates/.mcp.base.json")" '"tortoise":{"type":"sse","url":"https://api.premiselabs.co:443/mcp/","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}'
+_converge_case_dst "the SHIPPED template + a cell entry spelling the hosted host /mcp with no Authorization" \
+  "$(cat "$ROOT/templates/.mcp.base.json")" '"tortoise":{"url":"https://api.premiselabs.co/mcp"}'
+# …and the CONTROLS that keep the fix from being bought cheaply. It must not have repointed every cell
+# at the template, and it must not have started refusing non-canonical spellings: a genuine self-host
+# daemon is still PRESERVED and certified, and a default-port spelling with a GOOD credential is still
+# NORMALISED with that credential KEPT.
+_converge_case_dst "the SHIPPED template + a genuine self-host daemon entry (control)" \
+  "$(cat "$ROOT/templates/.mcp.base.json")" '"tortoise":{"type":"sse","url":"http://localhost:8000/mcp","_selfHosted":true}'
+_converge_case_dst "the SHIPPED template + a cell entry at the hosted :443 with a GOOD credential (control)" \
+  "$(cat "$ROOT/templates/.mcp.base.json")" '"tortoise":{"type":"http","url":"https://api.premiselabs.co:443/mcp/","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}'
+# ⛔ …AND THE SENTENCE THAT SAYS WHAT IT WROTE. The unusable-entry branch said "with the hosted
+# default" while, on a SELF-HOST template, writing the TEMPLATE's url — false about the artifact on
+# exactly the input round 16's P1 was reached from (a sentence-false-about-the-artifact is this PR's
+# most-repeated defect class). It now names the url actually written.
+printf '%s' "$_SELF_TPL" > "$TMP/cvd-tpl.json"
+printf '%s' '{"mcpServers":{"tortoise":{"url":"https://api.premiselabs.co/mcp"}}}' > "$TMP/cvd-dst.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/cvd-tpl.json" "$TMP/cvd-dst.json" --cell \
+  > "$TMP/cvd-note.out" 2>&1
+grep -qF 'with the template' "$TMP/cvd-note.out" \
+  && grep -qF '(http://localhost:8000/mcp)' "$TMP/cvd-note.out" \
+  && ok "the REPLACED note names the url it ACTUALLY wrote (a self-host template's), not 'the hosted default'" \
+  || fail "the replacement note does not name the url it wrote (got '$(tr '\n' '|' < "$TMP/cvd-note.out" | cut -c1-170)') — the operator is told a url the file does not carry"
+
 # and the VERIFIER's own side of it: a hand-edited config that names the hosted host in cleartext with
 # no credential must be REFUSED BY NAME, never certified as a self-host.
 printf '{"mcpServers":{"tortoise":{"type":"http","url":"http://localhost:8000/mcp","headers":{"Authorization":"Bearer ${SOME_OTHER_VAR}"}}}}' > "$TMP/clear-tpl.json"
