@@ -1626,8 +1626,8 @@ AGENT_CAPABILITY_REFUSED=71
 # 81 made the MEMORY arm of every caller UNREACHABLE, because each caller compares in arm order and
 # the skew arm comes first: reproduced in `fix-one.sh` (skew at :795, mem at :818 on that tree), where
 # a memory refusal exited 81 and was published as "HARNESS/MISMATCH gate". 79-82 are all spoken for
-# (79 adopt-fix.sh's deferral, 80 the brief gate, 81 and 82 #2387's memory gate — caller-facing and
-# spawn-point codes, the second of which lands with that same PR), so 83 is the lowest free code —
+# (79 adopt-fix.sh's deferral, 80 the brief gate, 81 #2387's memory gate, 82 `key-gate.sh`'s
+# KEY_GATE_REFUSED), so 83 is the lowest free code —
 # outside the sysexits range (none of EX_* exceeds 78) and outside bash's reserved 126/127/128+, so no
 # third-party process produces it by accident, the property #2258 chose 80 for.
 # `spawn-gate.test.sh` now DERIVES the set of gates and fails when two of them claim one code.
