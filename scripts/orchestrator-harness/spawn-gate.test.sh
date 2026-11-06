@@ -456,7 +456,15 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
   LN = ln                                     # rows report the declaration's FIRST physical line
   f = basename(fl)
   sub(/^[ \t]+/, "", s)
-  if (s ~ /^#/) next                          # documentation, never a declaration
+  # ⛔ `return`, NOT `next` — `next` is ILLEGAL INSIDE A FUNCTION in awk (GNU awk
+  # accepts it as an extension; mawk rejects it at PARSE time). The CI runner's
+  # `awk` is mawk, so `next` here made the whole program unrunnable there: every
+  # arm below then read `claims=0` and 44 arms went red while the SAME file was
+  # green under gawk on a dev box. The two call sites make it equivalent —
+  # `scan_unit(...)` is the LAST statement of the main rule and of `flush_unit()`,
+  # so returning, or skipping to the next record, leaves the record finished
+  # either way. A comment unit declares nothing, which is what both mean here.
+  if (s ~ /^#/) return                        # documentation, never a declaration
   # ⛔ A GLUED `printf -vNAME` IS THE SAME DECLARATION (review cycle 3, P2 — measured). bash accepts
   # the option and its operand joined (`printf -vAGENT_X %d 83` assigns 83 into AGENT_X), and the
   # token scan then found the family token ONE CHARACTER to the right of where it belongs: it matched
