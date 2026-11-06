@@ -367,8 +367,18 @@ ck "f26 OR + a CR-padded REPO -> REFUSES, matching the doctor (the pair disagree
    'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise REPO="$T/agent-infra"$'"'"'\r'"'"' HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null | grep -q "two different repos"'
 ck "f27 a CR-padded REPO alone -> RUNS (the trim, not a false refusa) " \
    'REPO_SET_FILE="$nofile" REPO="$T/tortoise"$'"'"'\r'"'"' HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
-ck "f28 the refusal asserts no fact about the DOCTOR (rank 5 exists, so its reason is stated, not claimed)" \
-   'o="$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "current directory" && ! printf "%s" "$o" | grep -q "would exit 2 on its first line"'
+# ⛔ THE REFUSAL TEXT MUST BE TRUE IN EVERY ARM THAT PRINTS IT (review round 6, P2). One block prints
+# from five states; the round-5 repair told all five "the doctor would fall back to the cwd", which is
+# true only when NOTHING is declared (rank 4 RAISES on a declared-but-unprovable `REPO`, so the cwd is
+# never reached there).
+ck "f28 nothing declared -> the cwd note IS printed (the one state where this wrapper differs)" \
+   'o="$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "CURRENT DIRECTORY" && ! printf "%s" "$o" | grep -q "would exit 2 on its first line"'
+ck "f29 an INVALID seam -> the cwd note is NOT printed (the doctor refuses there too)" \
+   'o="$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; ! printf "%s" "$o" | grep -q "CURRENT DIRECTORY"'
+ck "f30 a declared-but-unprovable REPO -> the cwd note is NOT printed (rank 4 raises first)" \
+   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; ! printf "%s" "$o" | grep -q "CURRENT DIRECTORY"'
+ck "f31 the refusal never says a repo is UNDECLARED when the line above says one IS (no self-contradiction)" \
+   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "no USABLE repo" && ! printf "%s" "$o" | grep -q "no repo is DECLARED"'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
