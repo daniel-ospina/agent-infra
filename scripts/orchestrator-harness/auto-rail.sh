@@ -1123,7 +1123,7 @@ for p in prs:
     # rail refuses a conflicted head), and the rebase that fixes it is a NEW head, which buys a second one.
     # Only a DEFINITE `CONFLICTING` is skipped: GitHub computes `mergeable` lazily and reports `UNKNOWN` on
     # a fresh head, and skipping that would stall exactly the heads this loop exists to review.
-    if (p.get("mergeable") or "").upper() == "CONFLICTING":
+    if str(p.get("mergeable") or "").upper() == "CONFLICTING":
         continue
     g={}
     for c in p.get("statusCheckRollup") or []:

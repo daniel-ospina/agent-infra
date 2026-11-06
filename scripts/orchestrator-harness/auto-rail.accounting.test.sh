@@ -361,7 +361,7 @@ mkdir -p "$_thumb/hub/scripts/gh-shim"
 : > "$_thumb/hub/scripts/admin-merge.sh"
 : > "$_sutlog"
 env MAX=8 LOG="$_sutlog" RAIL_SCRIPT="$_thumb/hub/scripts/admin-merge.sh" \
-    RAIL_DIR=/proc/no/such/rail-dir TRIED=/proc/no/such/tried.tsv \
+    RAIL_DIR=/dev/null/no-such/rail-dir TRIED=/dev/null/no-such/tried.tsv \
     bash "$SUT" >/dev/null 2>&1; _drc=$?
 [ "$_drc" -eq 3 ] || bad "an uncreatable rail-verdict directory must be REFUSED (exit 3), got rc=$_drc"
 grep -q "REFUSED: cannot create a writable rail-verdict directory" "$_sutlog" \
@@ -1418,12 +1418,27 @@ rm -f "$_rfast"
 _rdl=$(sed -n '/\[ "\$_rstate" = refused \] && review_forgive_refusal/,/^        continue$/p' "$SUT")
 grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
   || bad "the in-flight publish must be GATED ON THE RECORD (no 'case \"\$(review_state \"\$_rout\")\" in' in the dispatch block) — ungated, a reviewer that already refused is reported as in flight on the PR and no state ever corrects it"
-grep -qF 'refused|retry) publish_review_state "$repo" "$pr" awaiting-review' <<<"$_rdl" \
-  || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — otherwise the PR's newest comment claims a live review while the state machine knows there is none"
-_og=$(printf '%s\n' "$_rdl" | grep -nF 'publish_review_state "$repo" "$pr" review-in-flight "$head"' | head -1 | cut -d: -f1)
-_oc=$(printf '%s\n' "$_rdl" | grep -nF 'case "$(review_state "$_rout")" in' | head -1 | cut -d: -f1)
-[ -n "$_og" ] && [ -n "$_oc" ] && [ "$_og" -gt "$_oc" ] \
-  || bad "the in-flight publish must sit INSIDE the pending arm (in-flight at ${_og:-MISSING}, case at ${_oc:-MISSING})"
+grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
+  || bad "the in-flight publish must be GATED ON THE RECORD (no 'case \"\$(review_state \"\$_rout\")\" in' in the dispatch block) — ungated, a reviewer that already refused is reported as in flight on the PR and no state ever corrects it"
+# ⛔ REACHABILITY, NOT PRESENCE (review round 6, P1, REPRODUCED). The two arms this replaces asked only
+# whether the corrective text EXISTS and whether the in-flight publish sits somewhere AFTER the `case`
+# line — and BOTH single-edit reversions of this PR's fix satisfied that and left the suite GREEN:
+#   (a) `pending)` → `*)`: the catch-all shadows `refused|retry)`, so a finished dispatch publishes the
+#       in-flight claim again — the exact reverted defect — while the corrective arm's text is still
+#       there, merely unreachable. Measured: PASS (rc 0) before this comment, and the two arms below now
+#       redden it.
+#   (b) the publish moved OUT of the arm to just after `esac`: ordering still holds (`_og > _oc`), and the
+#       text still exists; only the whole-line and the count pins see it. Measured the same way.
+# A text pin cannot see reachability, so the arm is pinned as the SHIPPED LINE, and the shape that could
+# shadow it is forbidden outright.
+grep -qxF '          pending) publish_review_state "$repo" "$pr" review-in-flight "$head" ;;' <<<"$_rdl" \
+  || bad "the in-flight publish must BE the 'pending)' arm of the record gate — as the shipped single line, not text that happens to appear near it; without the pending) literal the branch is entered for every state and a finished dispatch re-publishes the false claim"
+grep -qxF '          refused|retry) publish_review_state "$repo" "$pr" awaiting-review ;;' <<<"$_rdl" \
+  || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — and it must be its OWN arm: a catch-all makes this line unreachable while leaving its text intact, which is how the reverted defect stayed GREEN"
+grep -qE '^[[:space:]]*\*\)' <<<"$_rdl" \
+  && bad "no catch-all '*)' arm may exist in the record gate — a '*)' placed before 'refused|retry)' shadows the corrective publish and restores the retry branch's own false 'review in flight' claim (reproduced: the suite stayed GREEN with it)"
+[ "$(grep -cF 'publish_review_state "$repo" "$pr" review-in-flight "$head"' <<<"$_rdl")" -eq 1 ] \
+  || bad "the in-flight publish must be the ONE publish inside the pending arm — measured: $(grep -cF 'publish_review_state "$repo" "$pr" review-in-flight "$head"' <<<"$_rdl") occurrence(s) in the dispatch block. An unconditional sibling after 'esac' satisfies 'after the case line' and re-publishes the claim for a dispatch that already finished"
 
 # ⛔ A DISPATCH MUST NOT EAT THE LOOP'S CANDIDATE LIST (review round 4, P2, reproduced): the loop body
 # runs from `done < "$_cand"`, so a backgrounded child INHERITS the candidate file as fd 0 — and `pi -p`
