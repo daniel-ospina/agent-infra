@@ -931,13 +931,22 @@ done
 #   REcompile() - panic: values still on machine stack for ^#{1,6}([ \t]|$)
 #   (exit 100)
 # so the scan could not run at all and this gate reported `NOT a clean result` on a
-# healthy tree for EVERY pull request. The split form is byte-for-byte equivalent
-# (differentially checked against gawk over 950 hash-run/suffix/prefix cases) and
-# both awks accept it.
-# The trigger is NOT the `$` — it is an INTERVAL EXPRESSION IMMEDIATELY FOLLOWED BY A
-# PARENTHESISED ALTERNATION, measured in mawk 1.3.4: `^#{1,6}([ \t]|x)` panics too
-# (no `$` present), as does `^a{1,6}([ ]|$)`, while `^(#{1,6})([ \t]|$)` and
-# `^a([ ]|$)` are fine. So do not "fix" a panic here by deleting the `$`.
+# healthy tree for EVERY pull request. The split form below is equivalent to the
+# original and both awks accept it.
+#
+# The trigger is NOT the `$` and NOT the alternation: it is an INTERVAL EXPRESSION
+# ({m,n} or {m}) IMMEDIATELY FOLLOWED BY AN OPENING PARENTHESIS. Measured in mawk
+# 1.3.4 with `echo ab | mawk -v re=… 'BEGIN{r=re} $0 ~ r'`:
+#   PANIC rc=100   ^a{1,6}(b)   ^a{2}(b)   ^{1,6}(b)   a{1,6}(b)
+#   FINE  rc=0     ^a{1,6}$   ^a{1,6}[bc]   (a{1,6})(b)   ^a{1,6} (b)   ^a+(b)
+# — note `^a{1,6}$` is FINE while `^a{1,6}(b)` dies, so do NOT "fix" a panic here
+# by deleting the `$`, and do not assume a group without an alternation is safe.
+#
+# Verify any rewrite against BOTH awks over the same input; the two must agree on
+# every line, and mawk must not print an REcompile panic:
+#   printf '## H.\n' | mawk '{ if ($0 ~ /^#{1,6}[ \t]/ || $0 ~ /^#{1,6}$/) print "ok" }'
+#   printf '## H.\n' | gawk '{ if ($0 ~ /^#{1,6}([ \t]|$)/)                 print "ok" }'
+#
 # The safe set is ASCII alphanumerics plus `_` `)` `?`, a backtick, and `*`.
 # If a legitimate heading trips this, widen the set in `md026_scan` — do NOT
 # narrow the class of reported characters back into a deny-list.
