@@ -855,7 +855,15 @@ def test_I6_the_stale_clock_fixture_is_RED_against_the_pre_fix_blob(tmp_path):
 # ── the ten tools: one test per wrapped implementation ──────────────────────────────────────
 
 def test_T_lane_artifact_maps_the_words_and_files_axes(tmp_path, monkeypatch):
+    # ⛔ PIN THE STATE DIR — the board read is an INPUT, so the test must supply it (#3577 CI red).
+    # `server_mod` sets ORCH_MCP_STATE_DIR to `""`, which `_state_dir()` reads as UNSET and resolves
+    # against the ambient `$CELL_HOME`/`$HOME`. On a dev box `~/.pi/agent/state` EXISTS, so the read
+    # yields the dict arm by luck; on a fresh runner it does not, `os.listdir` raises OSError, and
+    # `_lane_done_line` returns its NAMED ABSTENTION — a STRING — so indexing `["value"]` raised
+    # `TypeError`. Green on the author's machine, red on every runner: a test that never controlled
+    # its own input. `monkeypatch_tmp` is this suite's existing idiom for exactly that pin.
     mod = server_mod(monkeypatch)
+    monkeypatch_tmp(monkeypatch)
     ok = stub_json(tmp_path, "wip_ok.py", {"lane": "L1", "verdict": "WIP-IDLE", "turns": ["wip"],
                                            "measured_at": 1})
     monkeypatch.setenv("ORCH_MCP_LANE_WIP", ok)
@@ -881,6 +889,15 @@ def test_T_lane_artifact_maps_the_words_and_files_axes(tmp_path, monkeypatch):
     monkeypatch.setenv("ORCH_MCP_LANE_ARTIFACTS", stub(tmp_path, "arts3.py", "print('none')", code=3))
     is_err, payload = one(mod, "lane.artifact", {"lane": "L1", "name": "x"})
     assert payload["files"]["outcome"] == "ABSENT-EVERYWHERE"
+
+    # ⛔ AN UNREADABLE BOARD DIR IS AN ABSTENTION, NOT "none written" — and the two are DIFFERENT
+    # SHAPES, which is what this case pins. MUTANT that reddens it: `_lane_done_line` returning
+    # `{"value": "none written"}` from its `except OSError` arm — claiming a MEASURED absence from a
+    # directory it could not read, which is the false VALUE the impl's own docstring forbids.
+    monkeypatch.setenv("ORCH_MCP_STATE_DIR", str(tmp_path / "no-such-state-dir"))
+    is_err, payload = one(mod, "lane.artifact", {"lane": "L1"})
+    assert isinstance(payload["terminal_verdict"], str), payload["terminal_verdict"]
+    assert payload["terminal_verdict"].startswith("UNMEASURED(read board dir "), payload
 
 
 def test_T_pr_queue_maps_the_fifteen_actions_onto_the_six_classes(tmp_path, monkeypatch):
