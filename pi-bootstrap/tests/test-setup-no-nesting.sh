@@ -482,7 +482,15 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957"
 # undeclared entry here would grow the `DELIVERED BY NOTHING` set by two names while the PR reported
 # itself clean (measured: this landing adds exactly `script:install-ci-runner-x64.sh` and
 # `script:runner_autoscale.py` to it).
-LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174"
+# `cloud-cell-doctor.sh` joined on 2026-11-06 (#3530) — the fourth producer a farmed consumer now
+# EXECS, and the one the farm cannot carry. `cloud-cell-supervisor.sh` (farmed below, beside the
+# `cloud-cell-quiesce.sh` that execs it) resolves the doctor by absolute path and `die`s without it
+# (`doctor_path`, `die "cloud-cell-doctor.sh not found"`), but it does not exist at
+# `scripts/cloud-cell-doctor.sh` at all: it lives at `scripts/orchestrator-harness/cloud-cell-doctor.sh`,
+# a DIFFERENT destination delivered by the harness installer, whose file list is not one of FARM_ARRAYS
+# (the suite names that boundary itself below). #3530 owns whether it gains an `harness_srcs` array or a
+# first-class residual list; until then it is WITHHELD and DECLARED, never silently undelivered.
+LANE_PRODUCERS_EXEMPT="lane-status.py:#1553 heartbeat-loop.sh:#1553 install-ci-runner-x64.sh:#2403 runner_autoscale.py:#2403 repo-target.sh:#3174 cloud-cell-doctor.sh:#3530"
 # A ROOT of the derivation rather than a producer found by it: `heartbeat-loop.sh` is run by a launchd job
 # on the owner's box (no plist template in this repo names it; the label `com.tortoise.heartbeat-loop`
 # appears only in a comment at scripts/lane-status.py:41) and NO farmed consumer execs it (measured at
@@ -540,20 +548,46 @@ check_farm_arrays() { # <repo-root> <label>
 # green over a population that shrank — which is exactly the #1899 defect.
 # Format: `kind:name`, kind ∈ script | lib | state | foreign | other.
 LANE_PRODUCERS_CANONICAL="
-script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh script:disk-reaper-run.sh
-script:disk-reaper.sh script:fleet-cost-report.sh script:goal-state.py script:harness-apply-pass.sh
-script:install-ci-runner-x64.sh script:heartbeat-loop.sh script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh
-script:lane-status.py script:lane-watchdog.py script:merge-queue.py script:objective.py
-script:orchestrator-heartbeat.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
+script:admin-merge.sh script:ask-owner.py script:beta-progress.py script:cadence-nudge.sh
+script:cloud-cell-doctor.sh script:cloud-cell-supervisor.sh script:disk-reaper-run.sh script:disk-reaper.sh
+script:fleet-cost-report.sh script:fleet-schedule.py script:goal-state.py script:harness-apply-pass.sh
+script:heartbeat-loop.sh script:install-ci-runner-x64.sh script:install-controller-service.sh
+script:lane-actions.py script:lane-guard.py script:lane-scan-fallback.sh script:lane-status.py
+script:lane-watchdog.py script:merge-queue.py script:objective.py script:orchestrator-heartbeat.sh
+script:pi-cache-reap.sh script:pi-reap-worktrees-launchd.py script:pi-reap-worktrees.sh
 script:pr-doctor-trigger.py script:pr-doctor.py script:pr-repair-loop.sh script:publish-live-workspaces.py
-script:record-review.sh script:repo-target.sh script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
-script:turn-classify.py
-script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py script:watch-truncation.sh
+script:reap-lane-venvs.sh script:record-review.sh script:registry-sync.sh script:repo-target.sh
+script:runner_autoscale.py script:session-postmortem.sh script:tortoise_graph_client.py
+script:turn-classify.py script:turn-end.py script:undelivered-answers.py script:venv-real-cost.py
+script:watch-truncation.sh
 lib:beat-pair.sh lib:bounded.sh lib:cmux_payload.py lib:diff-normalize.py lib:live-paths.sh
 lib:pid-identity.sh lib:transcript-patterns.sh
 state:lane-confirm.py state:lane-triage.py state:lane-verdict.py
 foreign:cmux_dispatch.py
-other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh"
+other:orchestrator-harness/brief-gate.sh other:orchestrator-harness/capacity.sh
+other:orchestrator-harness/cloud-cell-doctor.sh"
+# RE-CUT 2026-11-06 (computed by `--cut`, never hand-typed), nine producers ADDED and NONE removed:
+# `admin-merge.sh`, `cloud-cell-doctor.sh`, `cloud-cell-supervisor.sh`, `install-controller-service.sh`,
+# `fleet-schedule.py`, `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `registry-sync.sh`, and the `other:`
+# form of `cloud-cell-doctor.sh`.
+#
+# FOUR of them were `DELIVERED BY NOTHING` — the #1552 shape the same run names: a fresh
+# `$DEST/scripts` gets a farmed consumer WITHOUT the executable it calls. Verified against the CODE,
+# not the diff (#1899):
+#   · `cloud-cell-quiesce.sh` (fleet_srcs) resolves and EXECs the supervisor — `for c in
+#     "$REPO/scripts/cloud-cell-supervisor.sh" …` then `bash "$SW" stop` (:44-55).
+#   · `cloud-cell-supervisor.sh` execs `cloud-cell-doctor.sh` (`doctor_path`/`die "cloud-cell-doctor.sh
+#     not found"`, :4247-4261) and names `install-controller-service.sh --install` as its own repair
+#     (:3410, :4020).
+#   · `admin-merge.sh` is the merge rail the gate set already carries by name
+#     (`record-review.sh:627` allow-lists it beside `verify-admin-merge-evidence.sh`).
+# So all four are FARMED rather than exempt: `cloud-cell-{doctor,supervisor}.sh` and
+# `install-controller-service.sh` join `fleet_srcs` (destination `$DEST/scripts/`, beside the
+# `cloud-cell-quiesce.sh` that calls them), and `admin-merge.sh` joins `merge_gate_srcs` (beside
+# `verify-admin-merge-evidence.sh`). The remaining five were already DELIVERED and are a pure re-pin.
+# The closure scans each of these files already, so farming them adds no new producers — it only
+# delivers the ones the adjacent consumer calls.
+#
 # `script:harness-apply-pass.sh` joined on 2026-10-23 (PR #2427): the harness-apply timer's unit and
 # its plist exec the pass (`install-harness-apply-timer.sh` renders both from templates/), so it is a
 # producer a farmed consumer EXECS. It is DELIVERED — `pi-bootstrap/setup.sh`'s `fleet_srcs` farms it,
