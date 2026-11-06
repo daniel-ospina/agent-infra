@@ -31,11 +31,39 @@
 #      count — round-3 review, P2: the validator enforced this while the schema did not say it):
 #        COMPARABLES: <non-empty>   what comparable / competitor implementations do for the mechanism
 #      A SEPARATE label, not a word inside EXTERNAL — see the round section below for why.
+#   4. a `PREVIOUS WORK` heading (any case, any `#` depth), and INSIDE that section:
+#        CLAIM: WIP: BRANCH: WORKTREE: PRIOR:   — each with a non-empty value, and WIP's value
+#        BEGINNING `issue-<N>` (`pr-<N>` for a fixer's PR key). See the fourth contract below.
 #
 # Two labelled fields are not decoration: they are the two halves of the pass that the two measured
 # incidents each skipped, and the rung line is what stops "research" from degrading into "I thought
 # about it" — rung 3 (`web_fetch`) is always available, so the field is never unsatisfiable.
 #
+# ── THE FOURTH CONTRACT: PREVIOUS WORK (#3484) ──────────────────────────────────────────────────
+# Two mechanisms make a reaped claim safe, and BOTH were voluntary: `scripts/lane-wip.py` ("did the
+# lane finish, or stop mid-WIP, and WHAT is the WIP?", invoked by nothing on the dispatch path) and
+# `scripts/bg-rescue-wip.sh` (archives uncommitted work to `refs/wip/<slug>` on origin). Measured
+# 2026-11-05: **222 rescued `refs/wip/*` archives existed and nothing told the next actor to look at
+# them**, `claims.sh`/`claim-reaper.sh` mentioned WIP ZERO times, and the same session produced three
+# branches for one issue, two for another, and a dispatch on an issue whose PR already existed. A
+# released claim reads as *"nothing happened here"* when it should read as *"here is what someone
+# already did"*.
+#
+# So the brief must carry the measurement, and — the half that is not prose — the gate REFUSES a
+# `WIP:` line that names NO ref while `refs/wip/*` holds one that belongs to the issue the line is
+# keyed to. `silence is not freedom`, the polarity `claim-unreadable` already uses for the claim
+# registry. The check is a CONTRADICTION test, not a substance test: it cannot tell whether the
+# author READ the ref, and the next actor still has to read it.
+#
+# ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO. It needs a repository
+# and a reachable `origin`; when either is missing the gate says so LOUDLY on stderr
+# (`PREVIOUS-WORK-WIP-UNMEASURED` / `-NOREPO`) and ADMITS the brief, because refusing every dispatch
+# on a moment's network failure converts a memory gap into a fleet-wide outage. It bites whenever the
+# box can reach origin, which is the normal case — the claim pre-flight on this same dispatch path
+# already hard-depends on exactly that. The refusal is deterministic and per-issue, so it is a real
+# check rather than a hopeful one; and `--wip-refs` (the verb `claim-reaper.sh` and `claims.sh`
+# consume) fails CLOSED for the handover record, where abstaining costs nothing.
+
 # ── THE SECOND CONTRACT, AND WHY IT LIVES IN THIS FILE (#3442) ───────────────────────────────────
 # For role `reviewer` there is a THIRD requirement, on top of the two above:
 #
@@ -220,6 +248,142 @@ brief_gate_missing() { # brief_gate_missing <brief-file|-> [role] [round]
   fi
 }
 
+# ── PREVIOUS WORK (#3484): the ONE reader of `refs/wip/*`, and the contradiction check ──────────
+# `BRIEF_GATE_WIP_AWK` prints the VALUE of the `WIP:` line of the PREVIOUS WORK section (and nothing
+# else), so the cross-check and the shape check can never disagree about which line is the claim.
+# Two consumers read this file's ref matcher — this gate, and `--wip-refs` (called by
+# `claim-reaper.sh` and `claims.sh::claim_prune` for the handover line). ⛔ ONE DEFINITION, because two
+# matchers would drift and the drift would be invisible: a ref the gate matched and the reaper did not
+# is a handover that silently stops being reported.
+# shellcheck disable=SC2016
+BRIEF_GATE_WIP_AWK='
+function _strip(s) { sub(/^[ \t]+/, "", s); sub(/^[-*+][ \t]+/, "", s); sub(/^[0-9]+[.)][ \t]+/, "", s);
+  sub(/^(\*\*|__)/, "", s); sub(/^[ \t]+/, "", s); return s }
+BEGIN { ins = 0; depth = 0; val = "" }
+{
+  lc = tolower($0); nh = 0
+  if (lc ~ /^#+/) { match(lc, /^#+/); nh = RLENGTH }
+  if (ins && nh > 0 && nh <= depth) ins = 0
+  if (!ins && nh > 0 && lc ~ /^#+[ \t]*previous[ -]work/) { ins = 1; depth = nh; next }
+  if (!ins) next
+  t = _strip($0)
+  if (tolower(t) ~ /^wip[ \t]*:/) {
+    sub(/^[^:]*:/, "", t)
+    sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+    # …and the value is measured UNDRESSED, for the reason given in the `_label` comment above a
+    # decorated label must not turn an honest `issue-<N> -> none` into an unkeyed value.
+    gsub(/^[*_`]+/, "", t); gsub(/[*_`]+$/, "", t)
+    sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
+    val = t
+  }
+}
+END { if (length(val) > 0) print val }
+'
+
+# brief_gate_wip_value <file|-> — the `WIP:` value of the PREVIOUS WORK section, or nothing.
+brief_gate_wip_value() { # brief_gate_wip_value <file|->
+  local f="${1:--}"
+  if [ "$f" != "-" ] && { [ ! -e "$f" ] || [ ! -r "$f" ]; }; then return 0; fi
+  if [ "$f" = "-" ]; then awk "$BRIEF_GATE_WIP_AWK"; else awk "$BRIEF_GATE_WIP_AWK" "$f"; fi
+}
+
+# brief_gate_repo [explicit] — WHICH repository `refs/wip/*` is read from. Resolution, in order:
+#   1. the caller's explicit argument (a dispatch path that knows its repo should pass it);
+#   2. `$CLAIM_REPO` — the claim registry's own repository resolution (claims.sh). ⛔ NOT a disable
+#      switch: it SELECTS the repository measured, and an unusable value degrades to UNMEASURED, the
+#      same direction as passing nothing;
+#   3. `$REPO` — the controller's repo variable, present in the shells that dispatch lanes;
+#   4. `git rev-parse --show-toplevel` of the cwd, which is the truth inside a worktree.
+# Prints the path, or nothing when none is usable (the caller then reports UNMEASURED, never "none").
+brief_gate_repo() { # brief_gate_repo [explicit]
+  local r="${1:-}"
+  # ⛔ AN EXPLICIT PATH IS TAKEN STRICTLY: a caller that names a repository it then cannot measure gets
+  # UNMEASURED, never a silent fallback to some other tree. Falling back here would let a typo in a
+  # dispatch path quietly measure a DIFFERENT repo and report "no rescued WIP" about it.
+  if [ -n "$r" ]; then
+    if [ -d "$r" ]; then printf '%s\n' "$r"; fi
+    return 0
+  fi
+  r="${CLAIM_REPO:-}"
+  [ -n "$r" ] || r="${REPO:-}"
+  if [ -n "$r" ] && [ -d "$r" ]; then printf '%s\n' "$r"; return 0; fi
+  git rev-parse --show-toplevel 2>/dev/null
+  return 0
+}
+
+# brief_gate_wip_refs <issue> [repo] — every `refs/wip/*` ref that BELONGS TO issue <issue>, one
+# `<ref>\t<sha12>` per line on stdout.
+# Exit: 0 the remote answered (an EMPTY answer is a real answer: no ref for this issue), 2 UNMEASURED
+#       (no repository, no issue, or `git ls-remote` could not answer — never a pass, never "none").
+# ⛔ THE MATCH IS THE DECLARED NAMING RULE, AND IT IS LOOSE ON PURPOSE. `bg-rescue-wip.sh` now names a
+# new ref `refs/wip/issue-<N>-<slug>`, but the 222 archives that already exist are named from the
+# BRANCH (`fix-3442`, `ai-3194`, `fix-3442-nonvacuity`), so a strict prefix match would report every
+# one of them as unlinked and the reader would be blind to the whole population it exists for. A ref
+# matches when its slug carries <N> as a STANDALONE number token — which both families do.
+brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
+  local issue="${1:-}" repo="${2:-}" out rc
+  case "$issue" in ''|*[!0-9]*) printf '[brief-gate] --wip-refs needs an ISSUE NUMBER (got "%s")\n' "$issue" >&2; return 2 ;; esac
+  repo="$(brief_gate_repo "$repo")"
+  if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+    printf '[brief-gate] --wip-refs: no repository to read refs/wip from (repo=%s)\n' "${repo:-<none>}" >&2
+    return 2
+  fi
+  # BOUNDED, because this runs on the dispatch path. `timeout` is absent on macOS — the harness runs
+  # there — so its absence falls back to the unbounded call rather than skipping the check entirely.
+  if command -v timeout >/dev/null 2>&1; then
+    out="$(timeout 20 git -C "$repo" ls-remote --refs origin 'refs/wip/*' 2>/dev/null)"; rc=$?
+  else
+    out="$(git -C "$repo" ls-remote --refs origin 'refs/wip/*' 2>/dev/null)"; rc=$?
+  fi
+  if [ "$rc" -ne 0 ]; then
+    printf '[brief-gate] --wip-refs: `git ls-remote origin refs/wip/*` exited %s in %s — UNMEASURED (unknown is not zero)\n' "$rc" "$repo" >&2
+    return 2
+  fi
+  printf '%s\n' "$out" | awk -v n="$issue" '
+    NF >= 2 && $2 ~ /^refs\/wip\// {
+      slug = $2; sub(/^refs\/wip\//, "", slug)
+      if (slug ~ ("(^|[^0-9])" n "([^0-9]|$)")) printf "%s\t%s\n", $2, substr($1, 1, 12)
+    }'
+  return 0
+}
+
+# brief_gate_previous_work <brief-file|-> [repo] — print ONE token when the PREVIOUS WORK block
+# CONTRADICTS what `refs/wip/*` holds; nothing when it is consistent, unmeasurable-but-usable, or when
+# the block's own shape tokens already speak (a shape refusal must not be doubled by a guess).
+#
+# ⛔ THE ABSENCE CLAIM IS THE PART *AFTER* THE KEY, NOT THE WHOLE LINE — and this is the shape the
+# first draft got wrong. Reading the whole value for a `refs/wip/` substring made the MOST natural
+# honest line (`issue-4242 -> none (measured: git ls-remote refs/wip/* at …)`) look like a named ref,
+# so the check silently skipped exactly the briefs that did the measurement properly. The value is
+# `issue-<N> -> <claim>`, and the claim is what decides: it begins `refs/wip/` ⇒ a ref is named;
+# anything else (`none`, `unclaimed`, `nothing`, `-`, a half-finished sentence) ⇒ a claim of absence,
+# which is then CHECKED. No word list to defeat, and no measurement note that can switch it off.
+brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo]
+  local f="${1:--}" repo="${2:-}" val claim issue refs rc hits
+  val="$(brief_gate_wip_value "$f")"
+  [ -n "$val" ] || return 0
+  case "$val" in
+    issue-[0-9]*) issue="${val#issue-}"; issue="${issue%%[!0-9]*}" ;;
+    *) return 0 ;;                                   # a pr-<N> key: no issue to look up
+  esac
+  [ -n "$issue" ] || return 0
+  claim="$(printf '%s' "$val" | sed -e 's/^issue-[0-9][0-9]*//' -e 's/^[[:space:]]*\(->\|→\|:\)[[:space:]]*//')"
+  case "$claim" in refs/wip/*) return 0 ;; esac     # a NAMED ref: not a claim of absence
+  repo="$(brief_gate_repo "$repo")"
+  if [ -z "$repo" ] || [ ! -d "$repo" ]; then
+    printf '[brief-gate] PREVIOUS WORK: refs/wip was NOT measured (no repository resolvable from here) — admitting the brief; the claim that #%s has no rescued WIP is UNVERIFIED.\n' "$issue" >&2
+    return 0
+  fi
+  refs="$(brief_gate_wip_refs "$issue" "$repo" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf '[brief-gate] PREVIOUS WORK: refs/wip could not be read for #%s — the claim that none exists is UNVERIFIED (admitted; see --wip-refs).\n' "$issue" >&2
+    return 0
+  fi
+  hits="$(printf '%s\n' "$refs" | awk 'NF >= 1')"
+  [ -z "$hits" ] || printf 'PREVIOUS-WORK-WIP-CONTRADICTED\t%s\n' "$(printf '%s' "$hits" | tr '\n' ',' | sed 's/,$//')"
+  return 0
+}
+
 # brief_gate_mutation_missing <brief-or-artifact-file|-> — the NON-VACUITY contract alone (#3442),
 # with NO research requirement. This is the verb `record-review.sh` calls on a review ARTIFACT: an
 # artifact is not a brief, so asking it for `RESEARCH FIRST` would refuse every honest review. One
@@ -256,12 +420,21 @@ function _label(s,   t) {
     _rest = substr(t, RLENGTH + 1)
     sub(/^[ \t]+/, "", _rest)
     sub(/[ \t]+$/, "", _rest)
+    # ⛔ THE VALUE IS MEASURED UNDRESSED (#3484). A DECORATED label (`**WIP:** issue-3484 -> none`,
+    # `` `CLAIM:` … ``) is normal markdown, and a value test that reads the decoration instead of the
+    # value refuses an honest brief — the same one-sided-strip defect the mutation parser (§3442) had.
+    # Ornament around a genuinely empty value then reads as empty, which is the direction that refuses.
+    gsub(/^[*_`]+/, "", _rest)
+    gsub(/[*_`]+$/, "", _rest)
+    sub(/^[ \t]+/, "", _rest)
+    sub(/[ \t]+$/, "", _rest)
     return _lab
   }
   _lab = ""; _rest = ""
   return ""
 }
-BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 0; cmp = 0 }
+BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 0; cmp = 0
+        pins = 0; pdepth = 0; pwsec = 0; pwcla = 0; pwwip = 0; pwbr = 0; pwwt = 0; pwpri = 0 }
 {
   line = $0
   lc = tolower(line)
@@ -270,9 +443,17 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
 
   # A heading at or above the research heading closes the section (subsections stay inside it).
   if (ins && nh > 0 && nh <= depth) { ins = 0 }
+  # …and the same rule closes the PREVIOUS WORK section (#3484), independently: the two sections
+  # must not be able to lend each other their labels, or a brief could satisfy one contract with the
+  # text of the other.
+  if (pins && nh > 0 && nh <= pdepth) { pins = 0 }
 
   if (!ins && nh > 0 && lc ~ /^#+[ \t]*research[ -]first/) {
     ins = 1; depth = nh; sec = 1
+    next
+  }
+  if (!pins && nh > 0 && lc ~ /^#+[ \t]*previous[ -]work/) {
+    pins = 1; pdepth = nh; pwsec = 1
     next
   }
 
@@ -291,6 +472,24 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
   }
   # CONTRADICTION TEST is the one label allowed ANYWHERE (it may sit outside the section, and the
   # schema says so). The COMPARABLES label is scoped to the section, above.
+  # ── PREVIOUS WORK (#3484). Five labelled facts about the work that already exists for this key.
+  # `WIP` is measured by SHAPE here — it must be keyed to an issue (or, for a fixer, a PR) so the
+  # contradiction check below can tell WHICH issue the claim of absence is about. Requiring the key
+  # is what makes `unclaimed` (the wording the issue itself uses) checkable instead of unfalsifiable: the shape
+  # the issue proposed had no slot for the issue number at all.
+  if (pins) {
+    if (_lab == "claim" && length(_rest) > 0) pwcla = 1
+    # ⛔ THREE ACCEPTED KEYS, AND `keyless` IS THE THIRD ON PURPOSE (#3484). `issue-<N>` is the normal
+    # case and the only one the cross-check can resolve; `pr-<N>` is a fixer working one PR; and a
+    # DIAGNOSIS lane (stall-fix, the drainer) genuinely has no key, so refusing it would force a FALSE
+    # one — the choice is between an honest `keyless — <why>` and an invented issue number. An author
+    # who means to evade can invent a number more easily than they can justify `keyless`, so nothing is
+    # gained by withholding the honest form.
+    if (_lab == "wip" && (_rest ~ /^(issue|pr)-/ || _rest ~ /^keyless[ \t]+[^ \t]/)) pwwip = 1
+    if (_lab == "branch" && length(_rest) > 0) pwbr = 1
+    if (_lab == "worktree" && length(_rest) > 0) pwwt = 1
+    if (_lab == "prior" && length(_rest) > 0) pwpri = 1
+  }
   if (_lab == "contradiction test" && length(_rest) > 0) ct = 1
 }
 END {
@@ -307,6 +506,14 @@ END {
   # hidden: the mandate is only reachable when the caller supplies the round, which `merge-one.sh`
   # always does for a review (it derives it from `state/reviewround-<PR>`).
   if (gr_role == "reviewer" && (gr_round + 0) >= (gr_cmp + 0) && !cmp) print "EXTERNAL-COMPARABLES"
+  if (!pwsec) print "PREVIOUS-WORK-SECTION"
+  else {
+    if (!pwcla) print "PREVIOUS-WORK-CLAIM"
+    if (!pwwip) print "PREVIOUS-WORK-WIP"
+    if (!pwbr)  print "PREVIOUS-WORK-BRANCH"
+    if (!pwwt)  print "PREVIOUS-WORK-WORKTREE"
+    if (!pwpri) print "PREVIOUS-WORK-PRIOR"
+  }
 }
 '
 
@@ -537,8 +744,8 @@ END {
 
 # brief_gate_verify <brief-file|-> [role] [round] — 0 = allowed, REFUSED with the teaching message, or
 # UNAVAILABLE. Prints NOTHING on success (a silent pass is a pass; the callers already log).
-brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round]
-  local f="${1:--}" role="${2:-lane}" rnd miss=""
+brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
+  local f="${1:--}" role="${2:-lane}" rnd miss="" repo="${4:-}" tmpf="" pw=""
   case "$role" in
     lane|fixer|reviewer|worker) : ;;
     *)
@@ -549,8 +756,25 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round]
   esac
   # stdin is INHERITED through the command substitution, so `-` reads the caller's pipe.
   rnd="$(brief_gate_round_norm "${3:-0}")"
+  # ⛔ STDIN IS MATERIALISED ONCE, HERE (#3484). TWO passes read the brief — the research/shape parse
+  # and the PREVIOUS WORK cross-check — and a second `-` reader would sit at EOF, silently reporting
+  # "no WIP line" for a brief that has one, i.e. the cross-check would be INERT on exactly the carrier
+  # (a pane order piped inline) it most needs to cover. A temp file makes both passes read one body.
+  if [ "$f" = "-" ]; then
+    tmpf="$(mktemp "${TMPDIR:-/tmp}/brief-gate.XXXXXX" 2>/dev/null)" || {
+      printf '[brief-gate] CANNOT VERIFY: no temp file for the stdin brief — refusing (a cannot-verify is never a pass).\n' >&2
+      return "$BRIEF_GATE_UNAVAILABLE"; }
+    cat > "$tmpf"
+    f="$tmpf"
+  fi
   miss="$(brief_gate_missing "$f" "$role" "$rnd")"
-  [ -n "$miss" ] || return 0
+  pw="$(brief_gate_previous_work "$f" "$repo")"
+  [ -n "$pw" ] && miss="${miss:+$miss$'\n'}${pw}"
+  if [ -z "$miss" ]; then
+    [ -n "$tmpf" ] && rm -f "$tmpf"
+    return 0
+  fi
+
 
   # ── THE REFUSAL MUST TEACH (delivery D) ───────────────────────────────────────────────────────
   # One line per item that is actually missing, in the order the author has to add them, then the
@@ -558,6 +782,13 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round]
   # author still has to guess the shape, and guessing is how the field came to be skipped.
   local nl=$'\n' lines="" tok body=""
   while IFS= read -r tok; do
+    # ⛔ THE CONTRADICTION TOKEN CARRIES ITS EVIDENCE (`TOKEN<TAB>ref,ref`), because a refusal that says
+    # "a matching ref exists" while naming none sends the author to grep for the thing that refused
+    # them. The token is split OFF before the case, and the evidence is printed on its own line.
+    local pwev=""
+    case "$tok" in PREVIOUS-WORK-WIP-CONTRADICTED*)
+      pwev="${tok#PREVIOUS-WORK-WIP-CONTRADICTED}"; pwev="${pwev#$'\t'}"; tok=PREVIOUS-WORK-WIP-CONTRADICTED ;;
+    esac
     case "$tok" in
       NO-FILE)   lines="${lines}  • the brief file does not exist or is not readable — a dispatch with no brief carries no contract${nl}" ;;
       EMPTY)     lines="${lines}  • the brief is EMPTY — there is nothing to research and nothing to do${nl}" ;;
@@ -568,6 +799,20 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round]
       RUNG)      lines="${lines}  • \`RUNG: <1|2|3> — <tool>\` — which rung of the research ladder, naming the tool (one of: ${BRIEF_GATE_TOOLS})${nl}" ;;
       CONTRADICTION-TEST)
                  lines="${lines}  • \`CONTRADICTION TEST:\` — which RECORDED DECISION covers this work, quoted; or that none does${nl}" ;;
+      PREVIOUS-WORK-SECTION)
+                 lines="${lines}  • a \`## PREVIOUS WORK\` heading, containing CLAIM:, WIP:, BRANCH:, WORKTREE: and PRIOR: (#3484)${nl}" ;;
+      PREVIOUS-WORK-CLAIM)
+                 lines="${lines}  • \`CLAIM:\` — the claim that owns this key right now (\`refs/claims/issue-<N> -> <holder>:<pid>, lease_until <ts>\`) or \`unclaimed\`${nl}" ;;
+      PREVIOUS-WORK-WIP)
+                 lines="${lines}  • \`WIP:\` — START the value with the key: \`issue-<N> -> refs/wip/<ref> @ <sha12>\`, or \`issue-<N> -> none (measured: <cmd> at <ts>)\`, or \`keyless — <why>\` for a dispatch with no issue/PR key. The key is what makes your absence claim CHECKABLE — this gate refuses it when \`refs/wip/*\` holds a matching ref${nl}" ;;
+      PREVIOUS-WORK-WIP-CONTRADICTED)
+                 lines="${lines}  • …and it CONTRADICTS \`refs/wip/*\`, which holds a rescued snapshot for the issue your WIP line is keyed to: ${pwev}${nl}  •   read it (fetch that ref locally and inspect the files it carries) and either CONTINUE that work or say why it is superseded — do not re-derive it${nl}" ;;
+      PREVIOUS-WORK-BRANCH)
+                 lines="${lines}  • \`BRANCH:\` — an existing \`fix/<N>\`/\`rescue/<N>\` for this key (head, commits ahead, reviewed?) or \`none\`${nl}" ;;
+      PREVIOUS-WORK-WORKTREE)
+                 lines="${lines}  • \`WORKTREE:\` — a worktree already on this key (path, and clean/<N> dirty files) or \`none\` — a dirty one may be your predecessor's finished work${nl}" ;;
+      PREVIOUS-WORK-PRIOR)
+                 lines="${lines}  • \`PRIOR:\` — what the previous attempt concluded and why it stopped, or \`no previous attempt\`${nl}" ;;
       MUTATION-ATTRIBUTION)
                  lines="${lines}  • a \`## MUTATION ATTRIBUTION\` section — per NEW assertion, the mutant that reverts the fix and the row it turns RED; or \`NO NEW ASSERTIONS: <why>\` when the diff adds none (#3442)${nl}" ;;
       MUTATION-EXEMPTION-INDENTED)
@@ -594,6 +839,7 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round]
     printf '[brief-gate] why: two lanes in one day acted on a false premise because their brief never forced the pass — one re-derived a root the tracker already held, one opened a duplicate PR. Both were brief defects, not lane defects (agent-infra#2258).\n'
     printf '[brief-gate] the pass is checked for PRESENCE and SHAPE only — a green run is not evidence the research was good; you still review the substance.\n'
   } >&2
+  [ -n "$tmpf" ] && rm -f "$tmpf"
   return "$BRIEF_GATE_REFUSED"
 }
 
@@ -650,6 +896,29 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
     \`no recorded decision reaches this work\` if none does. If a finding contradicts a recorded
     decision, it is NOT a candidate for adoption: reopen the decision and argue it in its own home;
     never adopt over it.
+
+## PREVIOUS WORK — did someone already start this? (agent-infra#3484)
+
+A released claim reads as "nothing happened here" unless someone looks, and 222 rescued \`refs/wip/*\`
+snapshots existed on this repo that nothing told the next actor about. Measure the four facts below
+and paste the MEASUREMENT — this is the handover the reaper cannot write for you, because only you
+know what the previous attempt concluded.
+
+⛔ \`WIP:\` MUST START WITH THE KEY (\`issue-<N>\`, or \`pr-<N>\` for a fixer's PR key). That is what
+makes the absence claim checkable instead of unfalsifiable: a \`WIP:\` value that names no
+\`refs/wip/…\` ref is read as "there is none", and the dispatch is REFUSED when \`refs/wip/*\` holds
+a snapshot for that issue. Silence is not freedom.
+
+CLAIM:     refs/claims/issue-<N> -> <holder>:<pid>, lease_until <ts>   ·   or "unclaimed"
+WIP:       issue-<N> -> refs/wip/<ref> @ <sha12>   ·   or   issue-<N> -> none (measured: <cmd> at <ts>)
+           ·   or   keyless — <why this dispatch has no issue/PR key>
+BRANCH:    fix/<N> / rescue/<N> -> <head>, <N> commits ahead, reviewed | unreviewed   ·   or "none"
+WORKTREE:  <path> -> clean | <N> dirty files   ·   or "none"
+PRIOR:     what the previous attempt concluded, and why it stopped   ·   or "no previous attempt"
+
+Commands that answer it: \`git ls-remote origin 'refs/claims/*' 'refs/wip/*'\`,
+\`git ls-remote --heads origin 'fix/<N>*' 'rescue/<N>*'\`, \`git worktree list\`, and
+\`bash scripts/orchestrator-harness/brief-gate.sh --wip-refs <N>\` (the typed form of the WIP line).
 BRIEF
   # ⛔ THE NON-VACUITY CONTRACT IS FOR THE REVIEWER ROLE ONLY (#3442), and the canonical block is a
   # WORKED EXAMPLE, not a template: its table is filled in, so a reviewer sees the shape it must
@@ -711,31 +980,37 @@ MUTBRIEF
 brief_gate_line() { # brief_gate_line [role]
   local role="${1:-lane}"
   if [ "$role" = "reviewer" ]; then
-    printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80). [gate] #3442 non-vacuity: a CLEAN verdict must also carry a MUTATION ATTRIBUTION block — per new assertion, the mutant that reverts it and the row that goes RED (or `NO NEW ASSERTIONS: <why>`). A verdict without it is INCOMPLETE, not clean, and record-review.sh refuses to mint `clean` over it.'
+    printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80). [gate] #3484 previous work: a PREVIOUS WORK block (CLAIM / WIP / BRANCH / WORKTREE / PRIOR) is required too, WIP keyed `issue-<N>` — a WIP line that names no ref is REFUSED when refs/wip/* holds a snapshot for that issue. [gate] #3442 non-vacuity: a CLEAN verdict must also carry a MUTATION ATTRIBUTION block — per new assertion, the mutant that reverts it and the row that goes RED (or `NO NEW ASSERTIONS: <why>`). A verdict without it is INCOMPLETE, not clean, and record-review.sh refuses to mint `clean` over it.'
     return 0
   fi
-  printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80).'
+  printf '[gate] #2258 research-first: this brief carries a RESEARCH FIRST section (INTERNAL + EXTERNAL + RUNG/tool) and a CONTRADICTION TEST line. Do the pass BEFORE deciding anything; if the work is already done or already decided, report that with evidence instead of re-deriving it. The dispatch is REFUSED without both (brief-gate.sh, exit 80). [gate] #3484 previous work: the same refusal applies without a PREVIOUS WORK block (CLAIM / WIP / BRANCH / WORKTREE / PRIOR), WIP keyed `issue-<N>`; a WIP line that names no ref is refused when refs/wip/* holds a snapshot for that issue.'
 }
 
 # ── CLI: for callers, for tests, and for a human who wants the exact text ────────────────────────
-#   bash brief-gate.sh --check <file|-> [role] [round]  → 0 pass · 80 refused (message on stderr) · 78 cannot verify
-#   bash brief-gate.sh --missing <file|-> [role] [round] → the missing tokens, one per line
+#   bash brief-gate.sh --check <file|-> [role] [round] [repo]  → 0 pass · 80 refused (message on stderr) · 78 cannot verify
+#   bash brief-gate.sh --missing <file|-> [role] [round] [repo] → the missing tokens, one per line
 #   bash brief-gate.sh --mutation-missing <file|-> → the NON-VACUITY tokens alone (the artifact verb;
 #                                                   `record-review.sh` calls this on a review comment)
+#   bash brief-gate.sh --wip-refs <issue> [repo]  → `<ref>\t<sha12>` per refs/wip ref belonging to the
+#                                                   issue · 0 answered (empty IS an answer) · 2 unmeasured
+#                                                   (the ONE ref matcher: claim-reaper.sh and claims.sh
+#                                                   call this for the handover line, #3484)
 #   bash brief-gate.sh --section [role] [round]  → the canonical brief block
 #   bash brief-gate.sh --mutation-section        → the canonical NON-VACUITY block alone
 #   bash brief-gate.sh --line [role]             → the one-line disclosure
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
-    --check)   shift; brief_gate_verify "${1:--}" "${2:-lane}" "${3:-0}" ;;
-    --missing) shift; brief_gate_missing "${1:--}" "${2:-lane}" "${3:-0}" ;;
+    --check)   shift; brief_gate_verify "${1:--}" "${2:-lane}" "${3:-0}" "${4:-}" ;;
+    --missing) shift; brief_gate_missing "${1:--}" "${2:-lane}" "${3:-0}"; brief_gate_previous_work "${1:--}" "${4:-}" ;;
+    --wip-refs) shift; brief_gate_wip_refs "${1:-}" "${2:-}" ;;
     --mutation-missing) shift; brief_gate_mutation_missing "${1:--}" ;;
     --section) shift; brief_gate_section "${1:-lane}" "${2:-0}" ;;
     --mutation-section) brief_gate_mutation_section ;;
     --line)    shift; brief_gate_line "${1:-lane}" ;;
     *)
-      printf 'usage: %s --check <brief-file|-> [lane|fixer|reviewer|worker] [round]\n' "$0" >&2
-      printf '       %s --missing <brief-file|-> [role] [round] | --mutation-missing <file|->\n' "$0" >&2
+      printf 'usage: %s --check <brief-file|-> [lane|fixer|reviewer|worker] [round] [repo]\n' "$0" >&2
+      printf '       %s --missing <brief-file|-> [role] [round] [repo] | --mutation-missing <file|->\n' "$0" >&2
+      printf '       %s --wip-refs <issue> [repo]\n' "$0" >&2
       printf '       %s --section [role] [round] | --mutation-section | --line [role]\n' "$0" >&2
       exit "$BRIEF_GATE_UNAVAILABLE" ;;
   esac
