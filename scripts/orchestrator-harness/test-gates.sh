@@ -3359,9 +3359,9 @@ GHOPEN3
     # fragments are required here — the parked note's own wording AND that stale line.
     case "$_rpt_nogh_out" in
       *"parked (needs a human): 2  (raw marker count"*"without a repo checkout and gh"*"stale evidence (needs re-review): <needs a repo checkout and gh>"*)
-        echo "  ✅ with no gh on PATH the parked line KEEPS the count (2) and says it is RAW — on the `norepo` branch, which the stale line names"; PASS=$((PASS+1)) ;;
+        echo "  ✅ with no gh on PATH the parked line KEEPS the count (2) and says it is RAW — on the norepo branch, which the stale line names"; PASS=$((PASS+1)) ;;
       *)
-        echo "  ❌ the no-gh run did not read as the `norepo` branch: [$(printf '%s\n' "$_rpt_nogh_out" | grep -E 'parked \(needs a human\)|stale evidence' | tr '\n' ' ')] — expected the RAW count plus the `norepo` stale line"; FAIL=$((FAIL+1)) ;;
+        echo "  ❌ the no-gh run did not read as the norepo branch: [$(printf '%s\n' "$_rpt_nogh_out" | grep -E 'parked \(needs a human\)|stale evidence' | tr '\n' ' ')] — expected the RAW count plus the norepo stale line"; FAIL=$((FAIL+1)) ;;
     esac
   else
     echo "  ❌ could not build a gh-less PATH (git=$([ -x "$NOGH_BIN/git" ] && echo yes || echo no) bash=$([ -x "$NOGH_BIN/bash" ] && echo yes || echo no) gh=$([ -x "$NOGH_BIN/gh" ] && echo present || echo absent)) — the no-gh arm is unproven"; FAIL=$((FAIL+1))
