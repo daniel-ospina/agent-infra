@@ -2998,6 +2998,14 @@ chmod 755 "$N57W/sub" 2>/dev/null
 n57next="$(grep -m1 '^next=' "$O/state/lane-exit-n57.state" 2>/dev/null | sed 's/^next=//')"
 case "$n57next" in *'NOT PROVEN complete'*) rcn57c=0 ;; *) rcn57c=1 ;; esac
 ck "N57c FIXTURE: a REAL listing that names 'M top.txt' AND warns (chmod 000 sub/) sets the flag, so the caveat reaches an operator [$(grep -m1 '^state=' "$O/state/lane-exit-n57.state" 2>/dev/null)]" $rcn57c
+# …and the `dirty` field must not read as a WHOLE-LISTING measurement over that same warning walk (review
+# cycle 21, P3 — VERIFIED against this file's own rule and README's "`dirty` … is `?` whenever that listing
+# is untrusted"). The count came from a listing the terminal had just declined to certify, so it is `?`;
+# publishing `dirty=2` there invited a reclaim pass to read a trusted count beside a porcelain section the
+# caveat says is incomplete.
+n57dirty="$(grep -m1 '^dirty=' "$O/state/lane-exit-n57.state" 2>/dev/null)"
+case "$n57dirty" in 'dirty=?') rcn57d=0 ;; *) rcn57d=1 ;; esac
+ck "N57d FIXTURE: …and the marker's dirty field is '?' over that warned listing, so no field presents a trusted count over an untrusted walk [$n57dirty]" $rcn57d
 # ⛔ N58 — EXIT 0 DOES NOT PROVE THE ARCHIVE'S TREE IS THE WORKTREE (fresh review at 4f50e6718, P1 —
 # REPRODUCED, and it FALSIFIED the premise round 18 used to leave this arm alone: "the callee skips no
 # paths on exit 0"). `scripts/bg-rescue-wip.sh` runs `git add -A` (`:182`), falls back to `git add -u` with

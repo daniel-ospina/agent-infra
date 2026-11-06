@@ -2337,9 +2337,23 @@ lane_end_marker() {
   # and already says `?` exactly when its own enumeration (`rev-list`) failed; repeating this case list on
   # `unpushed_shown` too was a second, drift-prone expression of the same rule — and it was wrong for
   # `cannot-verify`, where the count IS measured while the listing is not.
-  case "${LANE_END_TREE:-}" in
-    ""|not-measured|not-a-worktree|cannot-verify) dirty_shown="?" ;;
-  esac
+  #
+  # ⛔ AND `dirty` IS NOT A MEASUREMENT WHEN THE WALK ITSELF SAID IT SAW INCOMPLETELY (review cycle 21,
+  # P3 — VERIFIED against this function's own rule above and README's "`dirty` … is `?` whenever that
+  # listing is untrusted"). The case list below used to key on the TREE VERDICT alone, so
+  # `tree=dirty, LANE_END_LISTING_INCOMPLETE=1` — the one state `terminal_wip_rescue` marks precisely
+  # because `git status --porcelain` WARNED and did not reach every path — still published a concrete
+  # count. `dirty=7` was then read beside a porcelain section that `lane_end_tree_caveat` itself says is
+  # not all of them: a WHOLE-LISTING measurement that the same terminal had just declined to certify.
+  # The flag is consulted FIRST because it is the narrower fact: a complete walk is what makes the count
+  # a reading, whatever the verdict says.
+  if [ "${LANE_END_LISTING_INCOMPLETE:-0}" = "1" ]; then
+    dirty_shown="?"
+  else
+    case "${LANE_END_TREE:-}" in
+      ""|not-measured|not-a-worktree|cannot-verify) dirty_shown="?" ;;
+    esac
+  fi
   # ⛔ `label` AND `root` ARE THE TWO FIELDS THAT CAN CARRY A NEWLINE INTO THIS LINE-ORIENTED FILE (review
   # cycle 8, P2). The ledger's own writer already flattens exactly this hazard for its path column
   # (`root_col="$(… tr '\t\n' '  ')"`, with the comment "a tab or newline in the path would shift every
