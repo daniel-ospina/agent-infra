@@ -1402,6 +1402,39 @@ def test_T_saved_work_counts_a_MERGE_snapshot(tmp_path):
         "count is a false zero on exactly the snapshot that matters most: %r" % (entry,))
 
 
+def test_T_saved_work_reads_a_RELATIVE_origin_without_writing_the_checkout(tmp_path):
+    """⛔ THE READ-ONLY FIX MUST NOT CHANGE THE ANSWER. A RELATIVE remote (`../origin.git`) is resolved
+    by git against the process cwd, so fetching it from the scratch dir looks in the wrong place and
+    turns a previously-measured snapshot into UNMEASURED — the safety fix buying itself with a
+    behaviour change. The URL is absolutised against the caller's checkout, and the checkout still
+    ends the call with the refs it started with.
+    """
+    import subprocess
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+    git = lambda *a: subprocess.run(["git", "-C", str(work), *a], check=True, capture_output=True,
+                                    text=True)
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (work / "a.sh").write_text("echo a\n")
+    git("add", "a.sh")
+    git("commit", "-q", "-m", "work")
+    git("push", "-q", "origin", "HEAD:refs/wip/ai-9001")
+    git("remote", "set-url", "origin", "../origin.git")     # RELATIVE, as measured in review
+
+    mod = _saved_mod()
+    got = mod._saved_for_issue(str(work), 9001)
+    assert got["count"] == 1, got
+    entry = got["matches"][0]
+    assert entry["file_count"] == 1, entry
+    assert "UNMEASURED" not in str(entry["age"]), entry
+    refs = subprocess.run(["git", "-C", str(work), "for-each-ref", "--format=%(refname)"],
+                          check=True, capture_output=True, text=True).stdout
+    assert "refs/wip-remote" not in refs, refs
+
+
 def test_T_saved_work_unreadable_is_unmeasured_never_none(tmp_path):
     """An unreadable registry is `UNMEASURED`, never `none` — invariant 1 on the saved axis.
 
@@ -1432,17 +1465,31 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     # the verb. `status` is NOT untouched: `core.fsmonitor` is exactly the hook a plain `git status`
     # runs, so a diff-only hardening leaves the commonest call on the surface able to execute one.
     assert mod._harden_argv(["git", "diff"]) == ["git", "-c", "core.fsmonitor=", "diff",
+                                                  "--no-ext-diff", "--no-textconv",
                                                   "--no-ext-diff", "--no-textconv"]
     assert mod._harden_argv(["git", "status"]) == ["git", "-c", "core.fsmonitor=", "status"]
-    re_enable = mod._harden_argv(["git", "diff", "--ext-diff"])
-    assert re_enable[-2:] == ["--no-ext-diff", "--no-textconv"], re_enable
-    textconv = mod._harden_argv(["git", "show", "--textconv", "HEAD"])
-    assert textconv[-2:] == ["--no-ext-diff", "--no-textconv"], textconv
+    # ⛔ THE PAIR IS EMITTED TWICE, AND BOTH COPIES ARE LOAD-BEARING — see `_harden_argv`. The FIRST
+    # copy is the only one a value-taking option cannot swallow (nothing can precede it); the LAST is
+    # the only one that beats a caller flag that would re-enable a hook. Measured with
+    # `git diff --dst-prefix --no-ext-diff --no-textconv`: `--dst-prefix` consumes `--no-ext-diff` as
+    # its VALUE (rc 0, no "invalid option") and the external driver runs.
+    hardened = mod._harden_argv(["git", "diff", "--dst-prefix"])
+    assert hardened.count("--no-ext-diff") == 2 and hardened.count("--no-textconv") == 2, hardened
+    assert hardened[4:6] == ["--no-ext-diff", "--no-textconv"], hardened
+    # ⛔ AND THE RE-ENABLING SPELLINGS `--ext-diff`/`--textconv` NEVER REACH THE ARGV AT ALL: the
+    # allowlist refuses them AND every unambiguous abbreviation of them (`--ext`, `--ex`, `--textc`),
+    # which a token-equality denylist cannot enumerate.
+    for tok in ("--ext-diff", "--ext", "--ex", "--textconv", "--textc"):
+        ok, why = mod._allowlisted(["git", "diff", tok])
+        assert ok is False, tok
+    # `--text` is a REAL, different diff option (not an abbreviation of `--textconv`), so it stays
+    assert mod._allowlisted(["git", "log", "--text"])[0] is True
     # ⛔ AND LAST MEANS LAST BEFORE `--`, NEVER AFTER IT. Everything following the separator is a
     # PATHSPEC, so an append past it hardens NOTHING and adds a bogus path — `git diff -- .` is an
     # ordinary invocation, so that placement would let a caller defeat the guard by accident.
     assert mod._harden_argv(["git", "diff", "--", "src/"]) == [
-        "git", "-c", "core.fsmonitor=", "diff", "--no-ext-diff", "--no-textconv", "--", "src/"], \
+        "git", "-c", "core.fsmonitor=", "diff", "--no-ext-diff", "--no-textconv",
+        "--no-ext-diff", "--no-textconv", "--", "src/"], \
         mod._harden_argv(["git", "diff", "--", "src/"])
     # `git log -p` reaches the SAME diff machinery, so it is covered with `diff`/`show`.
     assert mod._harden_argv(["git", "log", "-p"])[-2:] == ["--no-ext-diff", "--no-textconv"], \

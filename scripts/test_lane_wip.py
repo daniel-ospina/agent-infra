@@ -158,6 +158,42 @@ def test_a_json_line_that_is_not_an_object_is_skipped_not_a_crash(monkeypatch, t
     assert p["turns"] == ["hi"], p["turns"]
 
 
+def test_a_text_block_whose_text_is_not_a_string_is_not_a_crash(monkeypatch, tmp_path):
+    """⛔ `{"type": "text", "text": null}` RAISES `TypeError` OUT OF THE JOIN, not an `OSError`.
+
+    `" ".join(...)` requires `str`; a `null` or numeric `text` (which a compaction or a provider can
+    emit) is `TypeError: sequence item 0: expected str instance, NoneType/in found` — so it escaped
+    `collect()`'s `except OSError` and the process exited 1 with empty stdout: the retired code again,
+    on a session file that is merely unusual. Measured with `scripts/lane-wip.py WS1 --json`.
+    """
+    lw = _load()
+    f = tmp_path / "sid-abc12345.jsonl"
+    f.write_text('{"message": {"role": "assistant", "content": '
+                 '[{"type": "text", "text": null}, {"type": "text", "text": 5}, '
+                 '{"type": "text", "text": "real"}]}}\n')
+    monkeypatch.setattr(lw, "lane_rows",
+                        lambda: [{"ws": "WS1", "lane": "L1", "sid": "sid-abc12345",
+                                  "verdict": "WORKING"}])
+    monkeypatch.setattr(lw, "session_file", lambda sid: str(f))
+    rc, p = lw.collect("WS1")
+    assert rc == 0, (rc, p)
+    assert p["turns"] == ["5 real"], p["turns"]
+
+
+def test_a_lane_row_that_is_not_an_object_is_skipped(monkeypatch):
+    """⛔ `lane_rows()` ONLY CHECKS THAT THE PAYLOAD IS A LIST, so `null` / `"WS1"` / `[]` elements
+    reach the row scan and `.get()` raises `AttributeError` — the same non-OSError escape the
+    line-level guard closes one layer down. A row that is not an object cannot match a lane."""
+    lw = _load()
+    monkeypatch.setattr(lw, "lane_rows",
+                        lambda: [None, "WS1", [], {"ws": "WS1", "lane": "L1", "sid": "sid-x",
+                                                     "verdict": "WORKING"}])
+    monkeypatch.setattr(lw, "session_file", lambda sid: None)
+    rc, p = lw.collect("WS1")
+    assert rc == 3, "the dict row matched and had no session file, so rc 3 (not a crash): %r" % (rc,)
+    assert "UNMEASURED(" in (p.get("unmeasured") or ""), p
+
+
 def test_a_session_file_that_vanishes_during_the_glob_is_not_found(monkeypatch):
     """⛔ `session_file()`'s `max(..., key=getmtime)` RACES THE FILE IT JUST GLOBBED.
 

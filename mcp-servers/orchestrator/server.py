@@ -68,6 +68,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -1575,12 +1576,23 @@ def _saved_for_issue(repo: str, issue: int) -> Dict[str, Any]:
     # "Read-only.", and one `--read-only` could not refuse because `_claim_check` takes no mode. (It
     # also degraded to UNMEASURED on a checkout the server may not write, for a question that needed
     # no write.) A PRIVATE bare repo answers every question below with the caller's repo untouched.
+    # ⛔ AND THE URL IS RESOLVED THE WAY THE CALLER'S REPO WOULD RESOLVE IT, OR THE ANSWER MOVES. A
+    # RELATIVE remote (`../origin.git`) is resolved by git against the process cwd, so fetching it from
+    # the scratch dir would look in the wrong place and turn a previously-measured snapshot into
+    # UNMEASURED — the read-only fix must not buy its safety with a behaviour change. A relative path
+    # is absolutised against the caller's checkout; a URL with a scheme (or scp-style `host:`) is passed
+    # through untouched. Declared limit: URL-rewriting config in the caller's repo
+    # (`url.<base>.insteadOf`) is NOT applied — an absolutised path cannot be rewritten wrongly, and a
+    # remote that needs it reports UNMEASURED rather than a guess.
     scratch: Optional[str] = None
     url = ""
     fetch_fault = ""
     if matches:
         got_url = run(["git", "-C", repo, "remote", "get-url", "origin"], timeout=30.0)
         url = (got_url.stdout or "").strip() if got_url.rc == 0 else ""
+        if url and "://" not in url and not re.match(r"^[^/]+\.?[^/]*:", url):
+            # no scheme and no scp-style `host:` — a filesystem path, possibly relative
+            url = os.path.normpath(os.path.join(repo, url))
         if not url:
             fetch_fault = ("UNMEASURED(git -C %s remote get-url origin + %s)"
                            % (repo, (got_url.stderr or "rc=%d" % got_url.rc).strip()[:120]))
@@ -1850,6 +1862,12 @@ WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
 # surface's authority), reached through a verb that IS read-only — so the verb gate cannot see it, and
 # neither can the metacharacter filter (there is no shell metacharacter in either flag).
 EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv")
+# ⛔ AN ABBREVIATION RE-ENABLES IT, AND A TOKEN-EQUALITY CHECK CANNOT ENUMERATE ONE. Git accepts any
+# UNAMBIGUOUS prefix of a long option, so `--ext`, `--ex`, `--textc`… all mean the flags above. These
+# two stems are the only spellings that are both a prefix of an exec-escape and NOT an exact option of
+# their own (`--text` IS a real diff option and resolves to itself, so it stays allowed — and it cannot
+# enable textconv). Refusing a stem therefore has no false block.
+EXEC_ESCAPE_STEMS = ("--ex", "--textc")
 # ⛔ AND REFUSING TWO FLAG SPELLINGS DOES NOT CLOSE THE CLASS — THE TRIGGER IS THE TARGET REPO'S
 # CONFIG, NOT A FLAG. Porcelain git runs repo-configured helpers BY DEFAULT: `diff.external`,
 # `diff.<driver>.textconv` (reached through `.gitattributes`), and `core.fsmonitor` all execute on an
@@ -1883,10 +1901,20 @@ def _harden_argv(argv: List[str]) -> List[str]:
     * `-c core.fsmonitor=` is a GLOBAL option, so it precedes the verb — and it covers every
       allowlisted verb, `status` included (`status` is exactly where fsmonitor runs). A diff-only
       fix leaves `core.fsmonitor` reachable through the most ordinary call on the surface.
-    * `--no-ext-diff`/`--no-textconv` are DIFF options, so they follow the verb, and they go LAST
-      among options: git honours the last occurrence, so a caller-supplied `--ext-diff` — or an
-      unambiguous ABBREVIATION of it, which the token denylist cannot predict — is neutralised
-      rather than merely accompanied.
+    * `--no-ext-diff`/`--no-textconv` are DIFF options, so they follow the verb, and they are emitted
+      TWICE: once IMMEDIATELY after the verb, and once LAST among options. Both copies are
+      load-bearing, and neither alone is enough:
+        - the LAST copy is what beats a caller flag that would re-enable a hook (git honours the last
+          occurrence) — but a caller-supplied VALUE-TAKING option swallows it: measured,
+          `git diff --dst-prefix --no-ext-diff --no-textconv` makes `--dst-prefix` consume
+          `--no-ext-diff` as its VALUE (rc 0, no "invalid option", and `diff.external` runs), so
+          "last" is only last among the tokens that ARE flags;
+        - the FIRST copy cannot be swallowed by anything, because it is the first token after the
+          verb and no caller token can precede it — so the disables are applied whatever the caller
+          does afterwards.
+      Together they mean a caller cannot both re-enable a hook and swallow the disarm. The
+      ABBREVIATION route to re-enabling (`--ext`, `--textc`) is refused outright in `_allowlisted`,
+      because a token denylist cannot enumerate prefixes.
     * LAST means last BEFORE the `--` separator, never after it: everything following `--` is a
       PATHSPEC. Appending past it would harden NOTHING and add a bogus path, so the completely
       ordinary `git diff -- .` would silently defeat the guard.
@@ -1905,6 +1933,11 @@ def _harden_argv(argv: List[str]) -> List[str]:
     verb = rest[0]
     out = ["git", "-c", "core.fsmonitor=", verb] + rest[1:]
     if verb in GIT_DIFF_VERBS:
+        # FIRST copy: immediately after the verb (index 3 is the verb, so 4 is after it), where no
+        # caller token can precede it (or swallow it), so the disables are applied whatever the caller
+        # does later.
+        out = out[:4] + list(GIT_HOOK_FLAGS) + out[4:]
+        # LAST copy: at the end of the options, so it beats a caller flag that re-enables a hook.
         sep = out.index("--") if "--" in out else len(out)
         out = out[:sep] + list(GIT_HOOK_FLAGS) + out[sep:]
     return out
@@ -2038,6 +2071,14 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
                     return False, ("refusing %r: %s makes git EXECUTE a program named by the target "
                                    "repo's config/.gitattributes — an argv surface allowlisted for "
                                    "READING is not an execution channel" % (token, bad))
+            # ⛔ INCLUDING EVERY ABBREVIATION OF THOSE TWO. Git resolves any unambiguous prefix of a long
+            # option, so an equality check on the full spelling is a denylist an attacker steps around
+            # with `--ext` (measured: `git diff --ext` IS `--ext-diff`).
+            for stem in EXEC_ESCAPE_STEMS:
+                if low.startswith(stem):
+                    return False, ("refusing %r: that is an ABBREVIATION of an exec-escape flag — git "
+                                   "resolves any unambiguous prefix of it, so %r can be reached without "
+                                   "ever spelling it" % (token, stem))
     # ⛔ `hostname` WITH A BARE ARGUMENT RENAMES THE BOX (see HOSTNAME_OK_FLAGS). Flags only.
     if prog == "hostname":
         for token in rest:

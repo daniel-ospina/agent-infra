@@ -102,7 +102,10 @@ def turns(path, want):
         if isinstance(c, str):
             txt = c
         elif isinstance(c, list):
-            txt = " ".join(x.get("text", "") for x in c
+            # ⛔ `str(...)` IS THE GUARD, NOT TIDINESS: a text block whose `"text"` is `null` or a
+            # NUMBER raises `TypeError: sequence item 0: expected str instance, NoneType/in found` out
+            # of `join` — not an OSError, so it escaped `collect()`'s guard to rc 1 and empty stdout.
+            txt = " ".join(str(x.get("text") or "") for x in c
                            if isinstance(x, dict) and x.get("type") == "text")
         else:
             txt = ""
@@ -125,9 +128,13 @@ def collect(key, chars=400, want=1):
         return 3, dict(base, unmeasured=(
             "UNMEASURED(lane-status.py --json --sample 2 + no parseable rows: the lane table could "
             "not be read, so this lane's activity is unknown)"))
-    row = next((r for r in rows
-                if str(r.get("ws", "")).upper() == key
-                or str(r.get("lane", "")).upper() == key), None)
+    # ⛔ EVERY ROW IS A `dict` IN PRACTICE AND NOT BY CONTRACT: `lane_rows()` only checks that the
+    # payload is a LIST, so a `null`/`"WS1"`/`[]` element makes `.get()` raise AttributeError here —
+    # the same non-OSError escape the line-level guard below closes, one layer up. A row that is not an
+    # object cannot match a lane, so it is skipped rather than trusted.
+    row = next((r for r in rows if isinstance(r, dict)
+                and (str(r.get("ws", "")).upper() == key
+                     or str(r.get("lane", "")).upper() == key)), None)
     if not row:
         return 2, dict(base, unmeasured=None,
                        note="no lane matches %r — run lane-status.py for the list" % key)
