@@ -5152,11 +5152,13 @@ Their ENOSPC behaviour is exactly what it was; each is a place where a lane can 
 volume.
 
 ⛔ **NO COUNT IS GIVEN HERE, DELIBERATELY.** An earlier revision of this paragraph said "five" and
-named exactly five; that number was **false** — measured at that head, 26 non-test scripts call
-`worktree add` directly and only 5 are harness files (~21 ungated production call sites). A
-hand-maintained count rots and a reader sizing the exposure from it is off by 4x. Enumerate instead:
+named exactly five. That number was **false**, and so was every numeral that replaced it: the census
+below returns many more files than five, most of them not harness files. A hand-maintained count rots
+and a reader sizing the exposure from a number nobody re-measures is worse off than one who
+enumerates. Enumerate instead:
 `git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired` is a
-**superset** to audit (it deliberately admits comments and tests); the three gated callers
+**superset** to audit (it deliberately admits comments — a comment-only mention still lists the
+file — and the filters below then drop tests); the three gated callers
 (`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`), the seam's own `wt-lifecycle.sh`, and this file
 are the rows to drop from it. Moving the rest onto `wt_provision` (or the `--disk-admit` verb) is the
 follow-up this change does not do.
