@@ -116,8 +116,20 @@ git -C "$AI_MAIN" fetch -q origin main 2>/dev/null || true
 REV="$(git -C "$AI_MAIN" rev-parse --short "$SRC_REF" 2>/dev/null)"
 [ -n "$REV" ] || { log "FATAL: cannot resolve $SRC_REF in $AI_MAIN"; exit 1; }
 rm -rf "$STAGE"; mkdir -p "$STAGE"
-git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness scripts/lib/lane-ceiling.sh | tar -x -C "$STAGE" || {
+git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness | tar -x -C "$STAGE" || {
   log "FATAL: could not extract the harness from $SRC_REF"; exit 1; }
+# ⛔ `scripts/lib/lane-ceiling.sh` IS OPTIONAL AT THE SOURCE REF, SO ITS ABSENCE MUST NOT FAIL THE
+# WHOLE ARCHIVE. A ref that predates the library — or any fixture repo containing only the harness
+# dir — made `git archive` abort with "pathspec ... did not match any files", which took every
+# REQUIRED file with it: the deploy exited 1 before staging anything, and the flat-layout arm a few
+# lines below (`:305-312`) never ran. That arm exists precisely to say "no lane-ceiling.sh at this
+# ref — install.sh will report the ceiling as unavailable (loud, not silent)", so the optional
+# pathspec contradicts the code that consumes it. Extract it separately and keep it FAIL-CLOSED for
+# the case that matters: the file IS at the ref but could not be extracted.
+if git -C "$AI_MAIN" cat-file -e "$SRC_REF:scripts/lib/lane-ceiling.sh" 2>/dev/null; then
+  git -C "$AI_MAIN" archive "$SRC_REF" scripts/lib/lane-ceiling.sh | tar -x -C "$STAGE" || {
+    log "FATAL: $SRC_REF HAS scripts/lib/lane-ceiling.sh but it could not be extracted"; exit 1; }
+fi
 H="$STAGE/scripts/orchestrator-harness"
 [ -f "$H/claims.sh" ] || { log "FATAL: $SRC_REF has no claims.sh — refusing to deploy"; exit 1; }
 [ -f "$H/orch-loop.sh" ] || { log "FATAL: $SRC_REF has no orch-loop.sh"; exit 1; }
