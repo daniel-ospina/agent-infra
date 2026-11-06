@@ -1054,7 +1054,17 @@ def attestation(body, head, pr, repo):
         return "nohead"          # no head means nothing can be at it; the reviewer re-reads the head
     seen = []
     clean = []
-    for line in (body or "").splitlines():
+    # ⛔ `split("\n")`, NEVER `splitlines()` — THE PARSER MUST BE NO MORE PERMISSIVE THAN THE GATE (P1,
+    # review round 6, measured). `splitlines()` also breaks on `\r`, `\v`, `\f`, `\x1c`-`\x1e`, `\x85`
+    # and `\u2028/\u2029`, so it SPLITS A LINE THE GATE READS WHOLE, and strips the `\r` that makes the
+    # gate's `$` fail. Measured by driving both readers on one body: a CRLF-terminated marker line — the
+    # shape `gh pr create --body-file` produces from a CRLF file, or any body round-tripped through a CRLF
+    # tool — read `at-head` here while check (c)'s `while IFS= read -r line` (which splits on `\n` alone,
+    # leaving the `\r` inside `$line`) refused it. `at-head` is the ONE value that disables the review arm,
+    # so the only producer of attestations would be switched off for that PR for ever while every
+    # COOLDOWN_TRANSIENT_S pass burned a MAX slot railing a head the gate refuses. The gate's own reader is
+    # the specification; this reproduces it exactly, including the failure.
+    for line in (body or "").split("\n"):
         # `match` + the patterns' own `^`/`$`: the RECORD shape exactly, not a line that starts with one.
         # ⛔ WHICH PATTERN MATCHED IS THE VERDICT — there is no second list of "verdicts that may land" to
         # drift from `CLEAN_MARKER_RE`, and `(clean|clean-micro|clean-low)` is check (c)'s own set. A line

@@ -607,6 +607,19 @@ _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tort
   "a marker line with PROSE appended must not read as at-head — check (c) anchors at '\$', so a line the gate rejects must not be reported as an attestation (that is the #3489 stall, from the other end of the line)"
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise) " "$H7" 'green\t7\tabsent' \
   "a trailing SPACE must not read as at-head — the gate's '\$' refuses it, and 'at-head' is the only value that disables the review arm"
+# ⛔ AND THE LINE SPLITTER ITSELF IS PART OF THE SHAPE (P1, review round 6, measured). `splitlines()`
+# breaks on `\r`, `\v`, `\f`, `\x1c`-`\x1e`, `\x85`, `\u2028/\u2029`, so it SPLITS a line the gate
+# reads WHOLE and STRIPS the `\r` that makes the gate's `\$` fail — the parser was strictly MORE
+# permissive than check (c)'s `while IFS= read -r line` (which splits on `\n` alone). `at-head` is the one
+# value that disables the review arm, so the only producer of attestations went dark for such a PR for
+# ever while each pass burned a MAX slot railing a head the gate refuses. Measured by driving both
+# readers on one body: a CRLF-terminated marker line (the shape `gh pr create --body-file` produces from a
+# CRLF file) read at-head here and REFUSE in the gate. These two arms pin the splitter: each is at-head
+# under `splitlines()` and must be `absent` now.
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise)$(printf '\r')" "$H7" 'green\t7\tabsent' \
+  "a CRLF-terminated marker line must NOT read as at-head — check (c) reads lines with 'IFS= read -r' (splitting on \\n alone) so the \\r stays in the line and the gate's '\$' REFUSES it; a parser using splitlines() strips the \\r and reports at-head, which disables the review arm for a PR the gate will never accept"
+_ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise)$(printf '\v')trailing prose" "$H7" 'green\t7\tabsent' \
+  "a marker line carrying PROSE after a VERTICAL TAB must not read as at-head — splitlines() treats \\v as a line break and splits the prose off, leaving a line the pattern accepts; the gate's \\n split does not, and its '\$' refuses it"
 # ⛔ AND THE OTHER DIRECTION: THE REAL EMITTED SHAPES MUST STILL CLASSIFY, or every PR reads `absent` and a
 # total merge stall follows. These two are the forms record-review.sh actually writes and the first cut of
 # this anchoring had to keep: the SIGNED form, and the `not-clean` trailer appended AFTER `(<repo>)`.
