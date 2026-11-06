@@ -348,6 +348,16 @@ function checkPipelineComplianceUnchanged() {
       `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\`, \`pull_request:\` and \`issue_comment:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
     );
   }
+  // ⛔ AN ALLOW-LIST CANNOT SEE AN ABSENCE, SO THE ADMITTED TRIGGER'S PRESENCE IS ITS OWN ARM (review
+  // of this delta, P2 — measured: deleting the whole `issue_comment:` block left this program at rc 0
+  // with all 39 arms green). The allowance above refuses EXTRA triggers; the revert direction —
+  // dropping #2467's arm and leaving the required context non-deterministic in time again — was
+  // invisible here, and it is invisible everywhere else too.
+  if (!onKeys(region, childIndent).includes("issue_comment")) {
+    findings.push(
+      "pipeline-compliance.yml no longer declares `issue_comment:`. That arm is #2467's fix for a required check whose checks (b)–(e) read the LINKED ISSUE: creating the scoping comment fires NO `pull_request` event, so without this trigger the SAME check on the SAME commit answers `[b] no scoping comment` or `success` depending only on queue latency (measured on #3122: two runs, one commit, opposite verdicts). Re-add `issue_comment: types: [created, edited]`."
+    );
+  }
 
   // ⛔ AND NO PATH FILTER UNDER IT (review cycle 1, P1). This is the change the current sweep most
   // invites — "finish the job, filter the required check too" — and it is the one that hurts most:
@@ -379,9 +389,80 @@ function checkPipelineComplianceUnchanged() {
   }
 }
 
+// ── `jobs.<name>`: the guard that makes admitting `issue_comment:` safe ──────────────────────────
+// ⛔ WHY THIS READER EXISTS (review of this delta, P2 — measured). Admitting `issue_comment:` above is
+// only sound while the required JOB refuses that event: the `on:` entry says the workflow MAY be
+// invoked by a comment, and the job's `if:` is what stops such a run from satisfying the repo's ONLY
+// required status context. Measured on the pre-fix delta: deleting that `if:` left this program at
+// rc 0 with all 39 arms green, so the invariant the admission rests on was pinned by a COMMENT —
+// exactly the shape this file exists to refuse. Same take-while model as `onRegion`: `jobs:` at
+// column 0, jobs at the first deeper indent, and a job's block ends at the next line at or above that
+// indent. Anything else is exit 2 — never a guess.
+function jobsRegion(text, file) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((raw) => /^jobs:[ \t]*(?:#.*)?$/.test(raw));
+  if (start < 0) refuse(`${file}: no top-level \`jobs:\` key — the guards the \`issue_comment:\` admission rests on cannot be read`);
+  const region = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const raw = lines[i];
+    if (blank(raw) || comment(raw)) continue;
+    if (indentOf(raw) === 0) break;
+    region.push({ raw, indent: indentOf(raw), no: i + 1 });
+  }
+  if (region.length === 0) refuse(`${file}: the \`jobs:\` block declares no jobs — nothing to read`);
+  return { region, childIndent: Math.min(...region.map((l) => l.indent)) };
+}
+
+// jobBlock(region, childIndent, jobName) — the content lines of ONE job, or null when it is absent.
+function jobBlock(region, childIndent, jobName) {
+  const idx = region.findIndex((l) => {
+    if (l.indent !== childIndent) return false;
+    const k = keyOf(l);
+    return k !== null && k.key === jobName;
+  });
+  if (idx < 0) return null;
+  const out = [];
+  for (let i = idx + 1; i < region.length; i += 1) {
+    if (region[i].indent <= childIndent) break;
+    out.push(region[i]);
+  }
+  return out;
+}
+
+const EXCLUDES_COMMENT = /github\.event_name[ \t]*!=[ \t]*['"]issue_comment['"]/;
+const ADMITS_COMMENT = /github\.event_name[ \t]*==[ \t]*['"]issue_comment['"]/;
+
+function checkIssueCommentOwnership() {
+  const text = read(PC_FILE);
+  const { region, childIndent } = jobsRegion(text, PC_FILE);
+
+  const required = jobBlock(region, childIndent, "pipeline-compliance");
+  if (required === null) {
+    findings.push(
+      "pipeline-compliance.yml declares no `pipeline-compliance` job. That job NAME is the repo's required status context (branch protection = exactly [\"pipeline-compliance\"]), so a rename silently disables the required check."
+    );
+  } else if (!EXCLUDES_COMMENT.test(required.map((l) => l.raw).join("\n"))) {
+    findings.push(
+      "pipeline-compliance.yml's `pipeline-compliance` job no longer carries `if: github.event_name != 'issue_comment'`. With `issue_comment:` admitted under `on:`, that guard is the ONLY thing keeping a comment event from running — and satisfying — the repo's required context; the comment event belongs to `revalidate-on-issue-comment`, which re-runs an EXISTING run and mints no verdict."
+    );
+  }
+
+  const revalidate = jobBlock(region, childIndent, "revalidate-on-issue-comment");
+  if (revalidate === null) {
+    findings.push(
+      "pipeline-compliance.yml no longer declares `revalidate-on-issue-comment` while `on:` still admits `issue_comment:`. Nothing answers the comment event then, and the required context goes back to depending on whether the issue's scoping marker happened to exist when the queued run executed."
+    );
+  } else if (!ADMITS_COMMENT.test(revalidate.map((l) => l.raw).join("\n"))) {
+    findings.push(
+      "pipeline-compliance.yml's `revalidate-on-issue-comment` job no longer keys its `if:` on `github.event_name == 'issue_comment'`. The job exists to own the comment event; a guard that admits some other event runs it on the wrong surface, and the arm reads as present while the comment event has no owner."
+    );
+  }
+}
+
 checkWorkflowLock();
 checkHarnessSingleSource();
 checkPipelineComplianceUnchanged();
+checkIssueCommentOwnership();
 
 if (findings.length) {
   for (const f of findings) process.stdout.write(`FINDING: ${f}\n`);
