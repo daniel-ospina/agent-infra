@@ -106,7 +106,7 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew|key` and r
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 harness-skew / 82 key), not a gate: an
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 82 key / 83 harness-skew), not a gate: an
   # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
@@ -282,14 +282,20 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
       # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
-      # 81 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
+      # 83 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
       # and either rejected its own arguments (a usage/version skew between the caller and the deployed
       # helper) or died without a verdict (`rc=2` on a corrupt copy). ⛔ IT MUST NOT BE 71: every reader
       # treats 71 as a property of THIS box, so the operator is told to repair the box's pi/extension
       # set or hand the item to a peer — and the peer runs the SAME helper pair and refuses identically.
       # The chain still stops here (no PR can appear), and the EXIT trap still releases
       # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
-      skew) _cap_rc=81 ;;
+      # ⛔ AND IT IS 83, NOT 81 (2026-11-01): 81 belongs to `AGENT_MEM_REFUSED` (#2387), which claimed it
+      # nine days before this gate was written, and this literal is what pinned the collision into a
+      # second caller. ⛔ SCOPED, NOT OWNED: #2387 is a BRANCH, so nothing on THIS tree declares 81 and
+      # the derived distinctness guard in `spawn-gate.test.sh` cannot see it — a lane that re-derives
+      # "which codes are free" from the tree alone reads 81 as free and re-claims it green. That is the
+      # exact failure this PR exists to prevent, so the sentence must not be read as a registry entry.
+      skew) _cap_rc=83 ;;
       # 82 is key-gate.sh's KEY_GATE_REFUSED (#3331): the lane REFUSED before spawning the agent because
       # its environment holds no model credential for the provider. Named rather than folded, for the
       # same reason as every other arm: an operator told 75 waits for load to fall on a box whose
