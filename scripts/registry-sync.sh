@@ -13,6 +13,11 @@
 # (an unreadable peer ref or stamp, a mis-keyed record) — an unreadable store is not a converged
 # one, and 0 must never be reported over records this box could not use.
 #
+# Every summary line ends with `unchanged=N`: the number of records the CONVERGED PRE-PASS skipped
+# as byte-identical (counted once per half, exactly as `same=` is — so a converged `union` reports
+# `same=2N unchanged=2N`), plus `same=`, which the per-record path also increments for a record it
+# examined and found identical.
+#
 # ── WHY THIS EXISTS ───────────────────────────────────────────────────────────────────────
 # `record-review.sh` writes ~/.pi/agent/reviews/<owner>-<repo>-<pr>.json and NOTHING replicated
 # that directory. So the merge gate and the rail answer "no review record" for a PR that WAS
@@ -90,8 +95,10 @@
 # * It never edits or renames a legacy file.
 # * It keeps no per-box cache of what it has already pushed. A cache would make a converged run
 #   cheap, and it was rejected: a cache that goes stale silently SKIPS a newer record, which is
-#   the one failure this file exists to prevent. The cost is paid where it is affordable — a
-#   landing, which already waits minutes — and it is one fetch plus a per-record comparison.
+#   the one failure this file exists to prevent. (#3180 made that cost acceptable WITHOUT reversing
+#   this decision: a converged run now compares the store's own listing against the local files'
+#   content hashes, in one batch, so nothing is remembered between runs and a stale cache cannot
+#   exist. See "THE CONVERGED PRE-PASS" below.)
 #
 # ── WHERE IT RUNS ───────────────────────────────────────────────────────────────────────
 # `atomic-land.sh` runs `union` before it reads the review record (both directions, at the one
@@ -161,11 +168,40 @@ git_b() { # <git args…>
 }
 
 # ── fields ───────────────────────────────────────────────────────────────────────────────
-# sed, not jq: record-review.sh WRITES a record with one printf in a fixed field order and reads
-# its own fields back the same way, so a second JSON parser here would be a second definition of
-# the record's shape (the same reason that script's record_identity() is an exact-string compare).
+# ⛔ NO `jq` — and, since agent-infra#3180, NO `sed` EITHER. `record-review.sh` WRITES a record with
+# one `printf` and reads its own fields back the same way, so this stays a STRING read: a second JSON
+# parser here would be a second definition of the record's shape (the same reason that script's
+# record_identity() is an exact-string compare).
+#
+# ⛔ THIS IS A `sed` REPLACEMENT, NOT AN IMPROVEMENT — the `sed` cost 2 process spawns per call and
+# the sync calls it 3-8 times PER RECORD, which measured 0.37 s/record on the landing path (#3180).
+# It is now pure parameter expansion, and its semantics are the OLD ONES EXACTLY: per LINE, the LAST
+# feasible occurrence of `"<name>":` (sed's greedy leading `.*`), an OPTIONAL opening quote, a
+# maximal run of [^",}], an optional closing quote; the FIRST matching line wins. Parity with the
+# `sed` is ASSERTED in scripts/registry-sync.test.sh §27 rather than argued here — including the
+# cases a "cleaner" reimplementation gets wrong (a nested duplicate key, where the LAST wins rather
+# than the top-level one; an unquoted number; a value containing `,` or `}`).
+#
+# ⛔ THREE trims, never one bracket class: `${rest%%[,\"}]*}` ends the EXPANSION at the `}` inside the
+# class and leaves literal garbage in the value (reproduced). The three trims are order-independent:
+# each takes the prefix before the first occurrence of its own character.
 field() { # <file> <name>
-  sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | command head -1
+  local f="$1" n="$2" line rest
+  [ -f "$f" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      *"\"$n\":"*) ;;
+      *) continue ;;
+    esac
+    rest="${line##*"\"$n\":"}"    # greedy-LAST occurrence — sed's leading `.*`
+    rest="${rest#\"}"               # the OPTIONAL opening quote (`\{0,1\}` in the sed)
+    rest="${rest%%[,]*}"            # ┐
+    rest="${rest%%\}*}"             # ├ sed's [^",}] class, applied as three prefix trims
+    rest="${rest%%\"*}"            # ┘
+    printf '%s' "$rest"
+    return 0
+  done < "$f"
+  return 0
 }
 
 # ── what the CONSUMER can actually use ───────────────────────────────────────────────────
@@ -333,7 +369,28 @@ write_local() { # <key> <content-file>
 
 same_bytes() { [ -f "$1" ] && [ -f "$2" ] && cmp -s "$1" "$2"; }
 
-PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0
+PUSHED=0 SKIPPED_OLDER=0 SAME=0 WROTE=0 CONFLICT=0 UNKEYED=0 UNREADABLE=0 FAILED=0 PUSH_FAILED=0 UNCHANGED=0
+# ── ONE listing per run (agent-infra#3180) ───────────────────────────────────────────────────────
+# `union` = `do_pull` then `do_push`, and both called `fetch_refs` — 4 git network calls to read the
+# SAME namespace twice (measured: ls-remote 2.4-3.9 s + fetch 3.7 s, so ~10-15 s of a land bought
+# nothing). `fetch_once` memoizes the first listing for the rest of the call.
+# ⛔ IT MUST NOT MEMOIZE THE RETRY. `push_one` re-lists deliberately before re-deciding: a refusal
+# means a peer moved the ref, and re-deciding from the STALE listing would compare against the state
+# the attempt just lost and be refused again, forever. So the retry calls `refresh_listing`, which
+# drops the memo and does a REAL fetch.
+FETCHED=0
+fetch_once() {
+  [ "$FETCHED" -eq 1 ] && return 0
+  fetch_refs || return 1
+  FETCHED=1
+  # any batch keyed on the listing is now stale
+  [ -n "$TMPD" ] && rm -f "$TMPD/store.tsv" "$TMPD/store.blobs" "$TMPD/store.keys"
+  return 0
+}
+refresh_listing() {
+  FETCHED=0
+  fetch_refs >/dev/null 2>&1
+}
 CONFLICT_KEYS=""
 
 conflict() { # <key> <local-at> <remote-at> <local-file>
@@ -470,7 +527,7 @@ push_one() { # <key> <source-file>
     # A refusal means the state CHANGED under this attempt. Loop again so the DECISION is re-taken
     # against what is actually there now — never re-push the comparison this attempt just lost.
     if [ "$attempt" -ge 2 ]; then break; fi
-    fetch_refs >/dev/null 2>&1
+    refresh_listing
   done
   warn "  ⚠️ FAILED $key — the push was refused twice (a peer moved the ref, or this box cannot push to $REMOTE). The record stays LOCAL and is not lost; re-run to retry."
   FAILED=$((FAILED + 1)); PUSH_FAILED=$((PUSH_FAILED + 1)); return 0
@@ -648,25 +705,302 @@ local_record_for_key() { # <key>
   return 1
 }
 
+# ── THE CONVERGED PRE-PASS (agent-infra#3180) ──────────────────────────────────────────────
+# THE MEASURED PROBLEM. Every land runs `union`, and `union` examined all 4,027 records ONE AT A
+# TIME with ~10 process spawns each — `store_oid`'s awk re-scanning the whole listing, `git show`,
+# 3-8 `field` seds, a `python3`, a `mktemp` — on records whose bytes were ALREADY IDENTICAL on both
+# sides. Measured on the hub box: 0.37 s/record for the pull half and 0.25 s for the push half, i.e.
+# tens of minutes of local CPU before a land does anything useful. The network was never the problem
+# (`union` makes 4 git calls, two of them redundant).
+#
+# WHAT THIS DOES. A record's identity IS its bytes. The store's own listing names, per ref, the
+# commit whose tree carries `record.json`; ONE `git cat-file --batch-check` resolves all of them to
+# blob OIDs, and ONE `git hash-object --stdin-paths` hashes every local file. A pair whose OIDs are
+# equal is byte-identical, so it is already converged and needs none of the per-record machinery.
+# Every other pair takes the ORIGINAL path, unchanged — all four #2374 merge rules, `record_usable`,
+# the key-vs-record identity test, the exit 3/4 accounting.
+#
+# ⛔ IT IS NOT A CACHE, and the distinction is the point. The file's header rejects a cache of "what
+# it has already pushed" because a stale cache SILENTLY SKIPS a newer record. Nothing here is
+# remembered between runs: each run re-reads the store's own listing and re-hashes the local files,
+# so a record that changed on either side cannot be skipped. The cost is paid in O(1) processes plus
+# O(n) in-process comparisons, instead of O(n) process spawns.
+#
+# ⛔ THE SKIP CANNOT OUT-VOTE TODAY'S CHECKS: a byte-identical pair is short-circuited only after
+# the REAL `field` passes `pull_one`'s own value tests (non-empty `reviewed_at`, numeric `pr`,
+# non-empty `repo`, and `<owner>-<repo>-<pr> == key`) and — for the pull half — `record_usable`'s own
+# JSON rules via ONE `python3` process (a dict, a 40-hex `head_sha`, a non-empty `verdict`). Any doubt
+# falls through to the full path, so `unreadable`/`unkeyed`/conflict accounting is preserved exactly.
+TMPD=""
+sync_scratch() { # create the run's scratch dir once; 0 on success
+  [ -n "$TMPD" ] && return 0
+  TMPD="$(mktemp -d "${TMPDIR:-/tmp}/registry-sync.XXXXXX" 2>/dev/null)" || TMPD=""
+  [ -n "$TMPD" ]
+}
+# `--quiet` is used by callers that CAPTURE this verb's output (cloud-cell-doctor runs
+# `union --quiet` and takes the first non-`union:` line as the reason it did not converge), so a
+# heartbeat printed under `--quiet` would become that caller's diagnosis. Progress honours it.
+progress() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*" >&2; }
+
+# The store's refs as `key<TAB>oid`, sorted by KEY (`LC_ALL=C`) so everything downstream can merge-join.
+store_sorted() { # <out>
+  printf '%s\n' "$STORE_REFS" | awk 'NF >= 2 { k=$2; sub(/^refs\/reviews\//, "", k); print k "\t" $1 }' \
+    | LC_ALL=C sort > "$1"
+}
+store_key_list() { # <store-sorted> <out>  — just the keys
+  command cut -f1 "$1" > "$2"
+}
+
+# `key<TAB>bloboid` for every store ref, ONE git process for all of them. An oid that cannot be
+# resolved here is EMPTY, never "equal": `<expr> missing` is a well-formed reply line (a count guard
+# alone would pass over it), so field 2 must be `blob` and field 1 must be 40 hex or the key cannot
+# possibly match a local file and takes the full path.
+store_blob_map() { # <store-sorted> <out> → 0 ok, 1 unusable (caller falls back to the full path)
+  local list="$1" out="$2" q="$TMPD/q" r="$TMPD/r" lr="$TMPD/lr" nq nr
+  [ -f "$out" ] && return 0
+  : > "$q"; : > "$lr"
+  # ⛔ THE BATCH IS PASTED BACK AGAINST THE ROWS IT WAS BUILT FROM, so both must be the SAME rows. A
+  # row with no oid has no query, and skipping it in the query loop alone (`[ -n "$oid" ] ||
+  # continue`) left `$list` one line longer than the replies — `paste` then paired every key from
+  # that row onward with the PREVIOUS record's objectname, producing `key<TAB>wrongblob`. A wrong
+  # blob that happens to equal a local file's OID SKIPS a pair that is not converged (a pull/push
+  # silently dropped), which is precisely what the guard four lines below exists to prevent and
+  # could not see. Dropping the row from both sides here makes the alignment structural.
+  command awk -F'\t' -v lr="$lr" -v q="$q" '
+    NF >= 2 && $2 != "" { print $1 "\t" $2 > lr; print $2 ":record.json" > q }
+  ' "$list"
+  nq="$(command wc -l < "$q" | tr -d ' ')"
+  git_b cat-file --batch-check='%(objectname) %(objecttype)' < "$q" > "$r" 2>/dev/null || return 1
+  nr="$(command wc -l < "$r" | tr -d ' ')"
+  # WITHIN this batch the reply is one line per query: a short or long reply pairs keys with OTHER
+  # records' oids, and a wrong pairing is a wrong `same`. Discard the whole map, not one line.
+  [ "$nq" = "$nr" ] || return 1
+  paste "$lr" "$r" | awk -F'\t' 'BEGIN{OFS="\t"} {
+      n = split($3, a, " ")
+      blob = (n >= 2 && a[2] == "blob" && length(a[1]) == 40) ? a[1] : ""
+      print $1, blob
+    }' > "$out"
+  return 0
+}
+
+# `key<TAB>path<TAB>bloboid` for a `key<TAB>path` list, ONE git process for all of them.
+# ⛔ `git hash-object --stdin-paths` ABORTS at the first unreadable path and emits only a PREFIX of
+# the hashes, so the count check below is load-bearing, not decoration.
+hash_pairs() { # <key<TAB>path file> <out>
+  local pairs="$1" out="$2" paths="$TMPD/paths" oids="$TMPD/oids" np no
+  : > "$out"
+  [ -s "$pairs" ] || return 0
+  command cut -f2 "$pairs" > "$paths"
+  np="$(command wc -l < "$paths" | tr -d ' ')"
+  git_b hash-object --stdin-paths < "$paths" > "$oids" 2>/dev/null || return 1
+  no="$(command wc -l < "$oids" | tr -d ' ')"
+  [ "$np" = "$no" ] || return 1
+  paste "$pairs" "$oids" > "$out"
+  return 0
+}
+
+# The pairs whose bytes are identical on both sides, KEY-INDEXED (never by line position — the two
+# sides legitimately have different lengths: 4,027 store refs vs 4,023 local files on the hub box).
+# A key present on one side only is simply not paired, so it takes the full path.
+identical_pairs() { # <store-blob-map> <hashed-pairs> <out> → 0 ok, 1 could not be computed
+  local map="$1" hashed="$2" out="$3" sm="$TMPD/sorted-map" sp="$TMPD/sorted-pairs" jn="$TMPD/joined"
+  : > "$out"
+  LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$map" > "$sm"
+  LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$hashed" > "$sp"
+  # ⛔ `join` COMPARES UNDER THE AMBIENT LOCALE, so it must be pinned to the collation its inputs
+  # were sorted with. Both `sort`s above are `LC_ALL=C`; an unqualified `join` merges under the
+  # ambient locale instead, and on a mixed-case key set (`Zeta-…` sorts before `alpha-…` in C and
+  # after it under en_US) its order check disagrees with the inputs: measured on coreutils 9.4,
+  # `join --check-order` reports "input is not in sorted order", exits 1 and emits only a PREFIX of
+  # the pairs. One such key anywhere in a 4,027-key store is then enough to make the whole pre-pass
+  # degrade — every record back to ~21 spawns apiece, i.e. the 26-minute land #3180 removes — and
+  # the old `return 0` made that a SILENT no-op. So: pin the collation, and report the failure so
+  # the caller can say it fell back instead of pretending it converged.
+  LC_ALL=C join -t "$(printf '\t')" -1 1 -2 1 "$sm" "$sp" > "$jn" || return 1
+  awk -F'\t' '$2 != "" && $2 == $4 { print $1 "\t" $3 }' "$jn" > "$out"
+  return 0
+}
+
+# `record_usable`'s OWN rules, applied to a whole candidate list in ONE process (a per-record python3
+# measured 69-88 ms, which is most of the old cost). No value extraction happens here: `repo`/`pr`/
+# `reviewed_at` are read by `field` in bash, exactly as `pull_one` reads them.
+usable_pairs() { # <key<TAB>path file> <out key list> → 0 ok
+  local pairs="$1" out="$2"
+  : > "$out"
+  command -v python3 >/dev/null 2>&1 || return 1
+  python3 - "$pairs" "$out" <<'PY' || return 1
+import json, re, sys
+pairs, out = sys.argv[1], sys.argv[2]
+keep = []
+with open(pairs) as fh:
+    for line in fh:
+        line = line.rstrip("\n")
+        if not line:
+            continue
+        key, _, path = line.partition("\t")
+        try:
+            with open(path, "rb") as f:
+                d = json.load(f)
+        except Exception:
+            continue
+        if not isinstance(d, dict):
+            continue
+        h, v = d.get("head_sha", ""), d.get("verdict", "")
+        if not (isinstance(h, str) and re.fullmatch(r"[0-9a-fA-F]{40}", h)):
+            continue
+        if not (isinstance(v, str) and v.strip()):
+            continue
+        keep.append(key)
+with open(out, "w") as fh:
+    for k in keep:
+        fh.write(k + "\n")
+PY
+  return 0
+}
+
+# pull's view: the key is the unit, and the file is the one `read_record` would act on.
+converged_pull() { # <store-sorted> <out key list>
+  local list="$1" out="$2" cand="$TMPD/pull.cand" map="$TMPD/store.blobs" hashed="$TMPD/pull.hashed"
+  local ident="$TMPD/pull.ident" same="$TMPD/pull.samefields" k path
+  : > "$out"; : > "$cand"; : > "$hashed"; : > "$same"
+  store_blob_map "$list" "$map" || return 1
+  while IFS=$'\t' read -r k _; do
+    [ -n "$k" ] || continue
+    path="$(local_record_for_key "$k")" || continue
+    [ -n "$path" ] && [ -f "$path" ] || continue
+    printf '%s\t%s\n' "$k" "$path" >> "$cand"
+  done < "$list"
+  hash_pairs "$cand" "$hashed" || return 1
+  identical_pairs "$map" "$hashed" "$ident" || return 1   # could not be computed ≠ nothing identical
+  # `pull_one`'s own value tests, with the real `field` (spawn-free since #3180).
+  while IFS=$'\t' read -r k path; do
+    [ -n "$k" ] || continue
+    local rat repo pr
+    rat="$(field "$path" reviewed_at)"
+    [ -n "$rat" ] || continue
+    pr="$(field "$path" pr)"
+    case "$pr" in ''|*[!0-9]*) continue ;; esac
+    repo="$(field "$path" repo)"
+    [ -n "$repo" ] || continue
+    [ "${repo%/*}-${repo#*/}-$pr" = "$k" ] || continue
+    printf '%s\t%s\n' "$k" "$path" >> "$same"
+  done < "$ident"
+  # `record_usable`'s rule, batched. A missing/broken python3 leaves the list EMPTY (nothing is
+  # skipped), which is today's behaviour and today's warning.
+  usable_pairs "$same" "$out" || : > "$out"
+  return 0
+}
+
 do_pull() {
-  fetch_refs || return 1
-  local key
+  fetch_once || return 1
+  local total=0 conv=0 changed=0 examined=0 key store_sorted_f keys same_f changed_f
+  if ! sync_scratch; then
+    progress "registry-sync: pull — no scratch dir; examining every record (no pre-pass)"
+    while IFS= read -r key; do
+      [ -n "$key" ] || continue
+      pull_one "$key"
+    done <<<"$(remote_refs)"
+    return 0
+  fi
+  store_sorted_f="$TMPD/store.tsv"; keys="$TMPD/store.keys"
+  same_f="$TMPD/pull.converged"; changed_f="$TMPD/pull.changed"
+  store_sorted "$store_sorted_f"
+  store_key_list "$store_sorted_f" "$keys"
+  total="$(command wc -l < "$keys" | tr -d ' ')"
+  : > "$same_f"; : > "$changed_f"
+  if converged_pull "$store_sorted_f" "$same_f"; then
+    conv="$(command wc -l < "$same_f" | tr -d ' ')"
+    SAME=$((SAME + conv))
+    UNCHANGED=$((UNCHANGED + conv))
+    LC_ALL=C sort "$same_f" > "$TMPD/pull.converged.sorted"
+    LC_ALL=C comm -23 "$keys" "$TMPD/pull.converged.sorted" > "$changed_f"
+  else
+    progress "registry-sync: pull — the converged pre-pass could not run; examining all $total records"
+    command cat "$keys" > "$changed_f"
+  fi
+  changed="$(command wc -l < "$changed_f" | tr -d ' ')"
+  progress "registry-sync: pull — $total record(s) in the store, $conv already identical, $changed to examine"
+  [ "$changed" -eq 0 ] && progress "registry-sync: nothing to sync — every record is already identical on both sides"
   while IFS= read -r key; do
     [ -n "$key" ] || continue
+    examined=$((examined + 1))
+    [ $((examined % 25)) -eq 0 ] && progress "registry-sync: pull progress $examined/$changed"
     pull_one "$key"
-  done <<<"$(remote_refs)"
+  done < "$changed_f"
+  return 0
 }
 
 do_push() {
-  fetch_refs || return 1
-  local key name list
+  fetch_once || return 1
+  local key name list conv=0 changed=0 examined=0 total=0 map="" report=""
+  local changed_f keyedcf list_sort
   list="$(mktemp "${TMPDIR:-/tmp}/registry-sync-keys.XXXXXX")" || return 1
   local_keyed "$list" <<<"$(registry_names)"
+  total="$(command wc -l < "$list" | tr -d ' ')"
+  if ! sync_scratch; then
+    while IFS=$'\t' read -r key name; do
+      [ -n "$key" ] || continue
+      push_one "$key" "$REG_DIR/${name:-$key.json}"
+    done < "$list"
+    rm -f "$list"
+    return 0
+  fi
+  changed_f="$TMPD/push.changed"; keyedcf="$TMPD/push.keyed"; list_sort="$TMPD/push.keyed.sorted"
+  : > "$changed_f"; : > "$keyedcf"
+  # `local_keyed` emits `key<TAB>filename` — the PAIR is the push unit, not the key: a qualified
+  # record and a newer legacy `<pr>.json` legitimately share a key, and skipping by key alone would
+  # suppress the newer one's publication.
   while IFS=$'\t' read -r key name; do
     [ -n "$key" ] || continue
-    push_one "$key" "$REG_DIR/${name:-$key.json}"
+    printf '%s\t%s/%s\n' "$key" "$REG_DIR" "${name:-$key.json}" >> "$keyedcf"
   done < "$list"
+  LC_ALL=C sort -t "$(printf '\t')" -k1,1 "$keyedcf" > "$list_sort"
+  # The store's blob map is the pull half's product under `union`; a standalone `push` computes it.
+  if [ ! -f "$TMPD/store.blobs" ]; then
+    store_sorted "$TMPD/store.tsv"
+    store_blob_map "$TMPD/store.tsv" "$TMPD/store.blobs" || : > "$TMPD/store.blobs"
+  fi
+  map="$TMPD/store.blobs"
+  if [ -s "$map" ] && hash_pairs "$keyedcf" "$TMPD/push.hashed" 2>/dev/null; then
+    if ! identical_pairs "$map" "$TMPD/push.hashed" "$TMPD/push.ident"; then
+      progress "registry-sync: push — the converged pre-pass could not run; examining all $total records"
+      : > "$TMPD/push.ident"
+    fi
+    # `push_one` refuses a record with no readable `reviewed_at` BEFORE any comparison, so a
+    # byte-identical record may NOT be skipped when that field is empty.
+    : > "$TMPD/push.stamp"
+    while IFS=$'\t' read -r key name; do
+      [ -n "$key" ] || continue
+      [ -n "$(field "$name" reviewed_at)" ] && printf '%s\t%s\n' "$key" "$name" >> "$TMPD/push.stamp"
+    done < "$TMPD/push.ident"
+    conv="$(command wc -l < "$TMPD/push.stamp" | tr -d ' ')"
+    SAME=$((SAME + conv))
+    UNCHANGED=$((UNCHANGED + conv))
+    # (key, PATH) is the set identity: a second file for a converged key is still examined.
+    # ⛔ `NR == FNR` FAILS ON AN EMPTY FIRST FILE (the second file's first line would be taken as the
+    # first file's), which silently dropped every local record from `changed` — a record the store
+    # does not hold yet was then never published. Guard the empty case explicitly.
+    if [ -s "$TMPD/push.stamp" ]; then
+      awk -F'\t' 'NR == FNR { keep[$1 "\t" $2] = 1; next } !(($1 "\t" $2) in keep)' \
+        "$TMPD/push.stamp" "$list_sort" > "$changed_f"
+    else
+      command cat "$list_sort" > "$changed_f"
+    fi
+  else
+    progress "registry-sync: push — the converged pre-pass could not run; examining all $total records"
+    command cat "$list_sort" > "$changed_f"
+  fi
+  changed="$(command wc -l < "$changed_f" | tr -d ' ')"
+  progress "registry-sync: push — $total local record(s), $conv already identical, $changed to examine"
+  [ "$changed" -eq 0 ] && progress "registry-sync: nothing to sync — every local record is already in the store"
+  while IFS=$'\t' read -r key name; do
+    [ -n "$key" ] || continue
+    examined=$((examined + 1))
+    [ $((examined % 25)) -eq 0 ] && progress "registry-sync: push progress $examined/$changed"
+    push_one "$key" "$name"
+  done < "$changed_f"
   rm -f "$list"
+  return 0
 }
 
 registry_hash() {
@@ -716,8 +1050,8 @@ do_status() {
 }
 
 summary() { # <verb>
-  printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s\n' \
-    "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$CONFLICT" "$UNKEYED" "$UNREADABLE" "$FAILED"
+  printf '%s: wrote=%s pushed=%s same=%s older_refused=%s conflicts=%s unkeyed=%s unreadable=%s failed=%s unchanged=%s\n' \
+    "$1" "$WROTE" "$PUSHED" "$SAME" "$SKIPPED_OLDER" "$CONFLICT" "$UNKEYED" "$UNREADABLE" "$FAILED" "$UNCHANGED"
   if [ "$FAILED" -gt 0 ]; then
     # WHICH SIDE failed matters at the caller: a failed PULL means the fleet is UNKNOWN here, while a
     # failed PUSH means the records WERE read and this box could not publish. Naming both as "the
@@ -743,6 +1077,10 @@ summary() { # <verb>
 }
 
 resolve_store || exit 1
+# The run's scratch (the converged pre-pass's batches) is removed on EVERY exit path, including the
+# `exit 1` arms below — a land must not leave debris behind on a box whose disk is the constraint.
+cleanup_scratch() { [ -n "$TMPD" ] && rm -rf "$TMPD" 2>/dev/null; TMPD=""; }
+trap cleanup_scratch EXIT
 case "$VERB" in
   pull)   do_pull  || exit 1; summary pull;  exit $? ;;
   push)   do_push  || exit 1; summary push;  exit $? ;;

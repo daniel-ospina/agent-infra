@@ -97,8 +97,9 @@
 #     N DISJOINT windows. Rotation is capped at the number of distinct slices
 #     (`SLICE_TOTAL/SLICE_WIDTH`), because a 13th lane on 7 windows would land on lane 6's: fewer
 #     lanes is the correct answer, not overlapping ones. ⛔ AND ACROSS TICKS: a lane keeps its window
-#     for up to LANE_TIMEOUT (~2.5 ticks), so the windows LIVE lanes hold are read from their records
-#     and skipped — a tick whose ring is fully held dispatches nothing and says so.
+#     for up to LANE_TIMEOUT (the 2 h backstop, ~6 ticks at the shipped cadence), so the windows LIVE
+#     lanes hold are read from their records and skipped — a tick whose ring is fully held dispatches
+#     nothing and says so.
 #   * NO RUN-AWAY — the tick can never start more than `target − alive`, `target` is bounded by memory
 #     AND by the cpu ceiling, and each lane is one dispatcher call (not a fork fan-out).
 #
@@ -112,6 +113,9 @@
 #   SEED_REPO         checkout to branch the lane's worktree from   default: $HOME/agent-infra-main
 #   SEED_REF          ref the worktree is created at                default: origin/main
 #   REPO_SLUG         owner/name the brief names                    default: daniel-ospina/agent-infra
+#   FLEET_REPO        checkout whose origin carries `refs/boxes/*` default: $REPO, else $SEED_REPO when
+#                     its origin IS $REPO_SLUG, else the line refuses with `why=channel-unverified`
+#                     (`REPO` is accepted too — it is the fleet's ambient work repo)
 #   MAX_LANES         CPU-side ceiling of the target        default: DERIVED — floor(ncpu × 5/2)
 #                     (0 is legal and means "never dispatch"; an explicit value is never recomputed)
 #   TARGET_LANES      pin the WHOLE target, overriding both derivations (operator's explicit call)
@@ -126,7 +130,8 @@
 #                     level, so it would refuse EVERY box silently; a deliberate stop is MAX_LANES=0.
 #                     An unusable value warns and falls back to 2, never silently.
 #   LPC_CEILING       load-per-cpu at which no lane is added          default: 8
-#   LANE_TIMEOUT      the lane's own wall-clock cap (seconds)         default: 3000
+#   LANE_TIMEOUT      the lane's BACKSTOP (seconds) — the absolute ceiling, not the primary bound
+#                                                            default: $LANE_BACKSTOP_S (7200)
 #   RC_GRACE_S        grace after a lane's pid dies for its status file (s)  default: 30
 #   PR_BUDGET         PRs one lane may process                        default: 6
 #   SLICE_WIDTH       PRs per slice                                   default: 10
@@ -173,7 +178,16 @@ MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
 MIN_SWAP_MB="${MIN_SWAP_MB:-700}"
 MAX_MEM_PRESSURE_LEVEL="${MAX_MEM_PRESSURE_LEVEL:-2}"
 LPC_CEILING="${LPC_CEILING:-8}"
-LANE_TIMEOUT="${LANE_TIMEOUT:-3000}"
+# ⛔ THIS IS THE BACKSTOP, NOT THE LANE'S PRIMARY BOUND (agent-infra#2888), and it takes the harness
+# seam rather than a literal of its own. Two things read it, and a flat 3000 broke BOTH once the wall
+# stopped being the primary bound:
+#   * it is passed to `nonblocking-dispatch.sh` as the spawn's ceiling, and 3000 sat above the 2700
+#     progress allowance by only 5 minutes, so a lane doing real work was still wall-killed at 50 min;
+#   * it is the window a LIVE lane holds its rotation window for (§ rotation), so a lane allowed to run
+#     past it gets its slice re-dispatched to a second lane — duplicate work on the same PRs.
+# `LANE_BACKSTOP_S` is spawn-gate.sh's one default; it is not sourced here, so the literal fallback is
+# pinned to that seam by `lane-bound.test.sh` (i0).
+LANE_TIMEOUT="${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}"
 PR_BUDGET="${PR_BUDGET:-6}"
 SLICE_WIDTH="${SLICE_WIDTH:-10}"
 SLICE_TOTAL="${SLICE_TOTAL:-70}"
@@ -192,6 +206,76 @@ mkdir -p "$AI/state" "$AI/logs" "$LANES_DIR" 2>/dev/null || {
   exit 1
 }
 log_line() { printf '%s\t%s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*" >>"$LOG" 2>/dev/null; }
+
+# ── THE FLEET LINE — EXPECTED vs PUBLISHED, ONE LINE PER TICK (agent-infra#3446) ────────────────
+# WHY A *DISPATCHER* OWES THIS READING. Everything in this file measures THIS box: the target is this
+# box's memory and cores, the census counts this box's lanes, the guards are this box's floors. A tick
+# that tops up one box while four of five cells have gone silent is INERT for the fleet and looks
+# perfectly healthy from inside, and MEASURED 2026-11-04 that is exactly what happened: `cmux vm ls`
+# reported 5 of 5 machines running while `refs/boxes/*` held ONE ref, and the conclusion drawn was
+# "there is no usable remote capacity" while ~87 lanes sat idle. The drainer is the component that ACTS
+# on that reading, so it must also REPORT when the fleet it is filling is not the fleet that exists.
+#
+# The instrument is `capacity.sh`'s (`cap_fleet_line`), never a second derivation here — the same rule
+# the census already applies to `worker-terminal.sh`: one implementation, two adapters. A missing or
+# stale module is NAMED on the line (`why=capacity.sh-unreachable`), never silence: a tick that cannot
+# see the fleet is not a tick on a healthy fleet.
+CAPACITY_MOD="${CAPACITY_MOD:-}"
+if [ -z "$CAPACITY_MOD" ]; then
+  for _cap_cand in "$O/capacity.sh" "$SELF_DIR/capacity.sh"; do
+    [ -f "$_cap_cand" ] && { CAPACITY_MOD="$_cap_cand"; break; }
+  done
+fi
+# The queue repo whose origin carries `refs/boxes/*` — the SAME channel the controller reads. `REPO`
+# is the fleet's ambient work repo; `SEED_REPO` is this drainer's own checkout, used as the last resort
+# because a checkout of ANY repo that shares that origin answers the identical question.
+# ⛔ AND A LANE CHECKOUT IS NOT THE FLEET CHANNEL (fresh review round 7, P1). This defaulted to
+# `SEED_REPO` — this drainer's own lane checkout — on the reasoning that "a checkout of ANY repo that
+# shares that origin answers the identical question". The origin is never compared: measured, with no
+# `FLEET_REPO`/`REPO` and `SEED_REPO` on an agent-infra checkout, a tick read `published=0
+# INELIGIBLE=5 (cell-1 … cell-5)` rc 0 — all five named ineligible, three of them publishing on the real
+# channel — and nothing on the line said which repo it had read. That is the 2026-11-04 "no usable
+# remote capacity" conclusion, produced by the instrument built to prevent it. So: an explicit
+# `FLEET_REPO`/`REPO` is used; otherwise this drainer's own checkout is used ONLY IF ITS ORIGIN IS THE
+# FLEET'S (the `REPO_SLUG` this drainer already knows) — the comparison the old default assumed instead of
+# checking; otherwise REFUSE by name. `cap_fleet_line` stamps `chan=` so a `published=0` is attributable.
+FLEET_REPO="${FLEET_REPO:-${REPO:-}}"
+if [ -z "$FLEET_REPO" ] && [ -n "${SEED_REPO:-}" ] && [ -n "${REPO_SLUG:-}" ]; then
+  _seed_origin="$(git -C "$SEED_REPO" remote get-url origin 2>/dev/null)" || _seed_origin=""
+  _seed_slug="${_seed_origin%.git}"
+  # ⛔ ONLY THE ALTERNATIVES THAT CAN ACTUALLY MATCH (fresh review round 10, P2). Two of the original
+  # four were unreachable — `*":${REPO_SLUG}.git"` cannot match because `.git` is stripped above, and
+  # `git@${REPO_SLUG%%/*}:${REPO_SLUG#*/}` expands to `git@daniel-ospina:agent-infra`, not an scp URL —
+  # so a reader would believe the guard accepted spellings it never accepted. The scp form is handled by
+  # the second arm, which normalises it first.
+  case "$_seed_slug" in
+    "$REPO_SLUG"|*"/$REPO_SLUG") FLEET_REPO="$SEED_REPO" ;;
+    git@*) _seed_slug="${_seed_slug#*:}"; [ "$_seed_slug" = "$REPO_SLUG" ] && FLEET_REPO="$SEED_REPO" ;;
+  esac
+fi
+[ -n "$CAPACITY_MOD" ] && [ -f "$CAPACITY_MOD" ] && . "$CAPACITY_MOD" 2>/dev/null
+fleet_line() { # log ONE `fleet:` line per tick — the reading, or a NAMED reason it could not be taken
+  local line=""
+  if [ -z "${FLEET_REPO:-}" ]; then
+    line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=channel-unverified(no FLEET_REPO/REPO, and $SEED_REPO is not a checkout of $REPO_SLUG — a lane origin is not necessarily the fleet channel: set FLEET_REPO to the queue repo)"
+  elif command -v cap_fleet_line >/dev/null 2>&1; then
+    line="$(cap_fleet_line "$FLEET_REPO" 2>/dev/null)" || true   # rc says completeness; the LINE is the answer
+  fi
+  case "${line:-}" in
+    'fleet: '*) : ;;
+    *)
+      # ⛔ THE REASON IS DERIVED, NOT ASSUMED (review, P2). "absent" and "present but stale" are
+      # different states with different remedies (`re-seed $O`, vs install the instrument), and the
+      # stale case is the one the `declare -f` interface gate exists for in the controller. Naming a
+      # file "unreachable" while it sits there sourced sends the operator to the wrong remedy.
+      if [ -n "${CAPACITY_MOD:-}" ] && [ -f "$CAPACITY_MOD" ]; then
+        line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=capacity.sh-incomplete($CAPACITY_MOD is present and was sourced, but defines no cap_fleet_line — a STALE copy: re-seed \$O)"
+      else
+        line="fleet: expected=UNKNOWN published=UNREADABLE INELIGIBLE=unknown why=capacity.sh-unreachable(the expected-vs-published instrument is neither beside this drainer nor in \$O: ${CAPACITY_MOD:-<none>})"
+      fi ;;
+  esac
+  log_line "$line"
+}
 
 # Every numeric seam is validated: an unvalidated value turns a fence into an abort (`[ '' -lt 700 ]`
 # is a bash error) or a silent skip. A bad value falls back to the shipped default and says so.
@@ -231,7 +315,7 @@ MEM_BUDGET_PCT="$(_num MEM_BUDGET_PCT "$MEM_BUDGET_PCT" 75)"
 [ "$MEM_BUDGET_PCT" -le 100 ] || { log_line "WARN: MEM_BUDGET_PCT=$MEM_BUDGET_PCT > 100 — using 100"; MEM_BUDGET_PCT=100; }
 LPC_CEILING="$(_num LPC_CEILING "$LPC_CEILING" 8)"
 [ "$LPC_CEILING" -ge 1 ] || { log_line "WARN: LPC_CEILING=0 — using 1"; LPC_CEILING=1; }
-LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 3000)"
+LANE_TIMEOUT="$(_num LANE_TIMEOUT "$LANE_TIMEOUT" 7200)"
 # (No LANE_WAIT_MAX any more — but `LANE_TIMEOUT` still feeds the dispatcher, so it still gets the
 # validation that `30m` used to defeat: an unvalidated value made bash print "value too great for
 # base" and left a variable UNSET, which under `set -u` killed the tick mid-lock.)
@@ -355,6 +439,10 @@ trap cleanup EXIT
 # a full or swap-bound box — written only after a dispatch, every legitimate skip would read LATE.
 beat() { printf '%s\n' "$(date +%s)" >"$AI/state/ai-drainer.beat" 2>/dev/null; }
 beat
+# ⛔ AND THE FLEET LINE IS TAKEN HERE TOO, for the SAME reason the beat is: a skipped tick (swap floor,
+# load ceiling, pressure) is a normal steady state, and a fleet reading taken only after a dispatch
+# would make every skip look like a silent fleet. One line per tick that owns the lock.
+fleet_line
 
 # ── THE PROBES (each one fail-closed: an unreadable probe is a FAILURE, never "0", never a skip) ──
 # `0` is a real answer for every one of these numbers, so an empty read folded into 0 is the defect the
@@ -672,7 +760,8 @@ _census_launcher() { # prints the count, or nothing when unreadable
 # ── WHICH SLICES ARE ALREADY BEING WORKED ────────────────────────────────────────────────────
 # ⛔ THE RING CLAMP ALONE DOES NOT PREVENT A DOUBLE-DISPATCH ACROSS TICKS. `n` is capped at the
 # number of distinct windows (SLICE_TOTAL/SLICE_WIDTH = 7 at the shipped defaults), but a LIVE lane
-# keeps its window for up to LANE_TIMEOUT (3000 s ≈ 2.5 ticks): tick 1 takes offsets 0…60, tick 2
+# keeps its window for up to LANE_TIMEOUT (~2 backstop-hours ≈ 6 ticks at the shipped 20 m cadence):
+# tick 1 takes offsets 0…60, tick 2
 # walks the ring from cursor=7 back to 0 and hands 0/10/20 to NEW lanes while the first lanes are
 # still on them — two lanes per window, two reviews per head, two merge attempts per PR. So the
 # cursor alone is not enough: the offsets a live lane HOLDS are read from the lane records and

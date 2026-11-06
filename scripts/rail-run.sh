@@ -188,7 +188,9 @@ age_s() { # <path> -> integer seconds since it was last written, or nothing
 # of its base-red family, verbatim: "The refusal is a re-measurement request, never a verdict on the
 # PR" (:8485), and the stale-surface refusal's remedy is "RE-MEASURE against the current base, then
 # re-run the rail" (:8433). `never TESTED main` is called "a MISCONFIGURATION in which none did"
-# (:7748) whose remedy is an INVOCATION change (`add --any-workflow`), and `--no-rerun` is the
+# (now reported as BASELINE-INAPPLICABLE) whose remedy is an INVOCATION change
+# (`--baseline-workflow <main-lane>`, or recording that there is no base-side measurement — never
+# `add --any-workflow`, which the rail now refuses as a baseline), and `--no-rerun` is the
 # CALLER's own flag. All four say nothing about the diff: they must stay `unknown` (25), which
 # prints the rail's words and lets the reader re-measure. Listing them as `refused` re-buys the
 # #2412 cost through a stem instead of a read failure — the lane is told its head is bad while its

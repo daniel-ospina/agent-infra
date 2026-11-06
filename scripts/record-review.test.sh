@@ -716,13 +716,70 @@ else
     bad "#1224 no PR COMMENT carrying the marker was posted — the fix stays inert on the required check, whose runner has no record store (finding 2)"
 fi
 # IDEMPOTENCE: the marker is already in the list, so a re-run must post nothing.
+# ⛔ THE FIXTURE SPEAKS THE FRAME THE GATE ADMITS (review finding 2): the read asks
+# for `"<author_association>\u001f<body>"` and the "already present" test requires a
+# TRUSTED association AND the body equal to the marker. The old fixture handed a
+# bare body, which is why a plain line-grep looked correct.
 Q1224D="$T/p1224-comment-2.json"; : > "$Q1224D"
-STUB_COMMENTS="$(cat "$Q1224C_BODY")" STUB_COMMENT_CAPTURE="$Q1224D" run_record "daniel-ospina/agent-infra" 424246
+STUB_COMMENTS="OWNER"$'\037'"$(cat "$Q1224C_BODY")"$'\036' STUB_COMMENT_CAPTURE="$Q1224D" run_record "daniel-ospina/agent-infra" 424246
 if [ -s "$Q1224D" ]; then
     bad "#1224 a re-run DUPLICATED the evidence comment (the marker was already there) — every re-record would bury the timeline"
 else
     ok "#1224 a re-run posts NO second comment when the marker is already present (idempotent, like the body append)"
 fi
+# ⛔ NEGATIVE CONTROL 1 — AN UNATTESTED AUTHOR IS NOT "ALREADY PRESENT". On a public
+# repo the marker is visible in the PR body, so ANY account can paste it; treating
+# that as delivered would (a) skip the producer's own post forever and (b) let an
+# unprivileged account suppress the only evidence channel CI can read. Reverting the
+# association test reddens THIS vector and leaves the idempotency one green.
+Q1224F="$T/p1224-comment-4.json"; : > "$Q1224F"
+STUB_COMMENTS="NONE"$'\037'"$(cat "$Q1224C_BODY")"$'\036' STUB_COMMENT_CAPTURE="$Q1224F" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224F" ]; then
+    ok "#1224 a marker pasted by an UNATTESTED account does not count as delivered — the producer posts its own copy"
+else
+    bad "#1224 an unattested commenter's pasted marker SUPPRESSED the producer's post — any account could silence the evidence channel, and the run would report it delivered (finding 2)"
+fi
+# ⛔ NEGATIVE CONTROL 2 — A QUOTING COMMENT IS NOT "ALREADY PRESENT". The gate
+# requires the marker to be the comment's WHOLE body; a multi-line comment that
+# merely CONTAINS the marker line is REFUSED by the gate, so honouring it here would
+# report delivery for an artifact the gate throws away.
+Q1224G="$T/p1224-comment-5.json"; : > "$Q1224G"
+STUB_COMMENTS="OWNER"$'\037'"Here is the attestation I saw:
+$(cat "$Q1224C_BODY")
+— a reviewer quoting it"$'\036' STUB_COMMENT_CAPTURE="$Q1224G" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224G" ]; then
+    ok "#1224 a QUOTING comment does not count as delivered — the whole-body rule matches the gate"
+else
+    bad "#1224 a comment that merely QUOTED the marker suppressed the producer's post — the producer would report delivery for an artifact the gate refuses (finding 2)"
+fi
+# ⛔ NEGATIVE CONTROL 3 — A MARKER AS THE FIRST LINE WITH TEXT BENEATH IT (review
+# round 3 finding 1a). This is the shape that fooled the LINE-based reader: line 1
+# is "OWNER\x1f<marker>", so `$1 == OWNER` and `body == marker` both held, the
+# producer skipped its own post and reported DELIVERED — while the gate requires the
+# marker to be the WHOLE body and refuses that comment. This is a human paste, not
+# an attack, and the producer's comment was never posted again.
+Q1224J="$T/p1224-comment-9.json"; : > "$Q1224J"
+STUB_COMMENTS="OWNER"$'\037'"$(cat "$Q1224C_BODY")"$'\n'"One line of context under it"$'\036' STUB_COMMENT_CAPTURE="$Q1224J" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224J" ]; then
+    ok "#1224 a comment whose FIRST LINE is the marker but which continues beneath it does NOT count as delivered — the whole-body rule is what the gate applies"
+else
+    bad "#1224 a marker with a note under it suppressed the producer's post — the comment is not the artifact the gate admits, so the evidence was never delivered (finding 1a)"
+fi
+# ⛔ THE DELIMITER STRIP IS A SOURCE-LEVEL CONTRACT, so it is pinned at the source
+# (review round 3 finding 1b). A behavioural vector cannot see it: the `gh` stub
+# returns the ALREADY-JQ'd frame, so a producer that forgot the `gsub` would be fed
+# a frame it never produced. The gate strips 0x1e/0x1f from every comment body
+# before framing (its REVIEW_COMMENTS_JQ, pinned by the gate's own 1224T), so a
+# comment body can never manufacture a second record. Without the strip HERE an
+# unattested account could satisfy the producer's dedup and suppress its post.
+Q14STRIP="$(grep -c 'gsub("\[\\u001e\\u001f\]"; "")' "$RECORD" 2>/dev/null || echo 0)"
+Q14TERM="$(grep -c 'u001e' "$RECORD" 2>/dev/null || echo 0)"
+if [ "${Q14STRIP:-0}" -ge 1 ] && [ "${Q14TERM:-0}" -ge 1 ]; then
+    ok "#1224 the comment read strips BOTH frame delimiters and terminates records (0x1e/0x1f) — the same frame the gate builds, so a comment body cannot forge a record"
+else
+    bad "#1224 the producer's comment read does not strip/terminate the frame (strip=$Q14STRIP term=$Q14TERM) — an unattested commenter could forge an admitted record and suppress the evidence post (finding 1b)"
+fi
+unset Q14STRIP Q14TERM
 # A FAILED LIST READ IS NOT "NO COMMENTS": posting on it would duplicate the
 # evidence on every transient API error, so the post must be skipped instead.
 Q1224E="$T/p1224-comment-3.json"; : > "$Q1224E"
@@ -732,7 +789,30 @@ if [ -s "$Q1224E" ]; then
 else
     ok "#1224 an unreadable comment list SKIPS the post (skipped, never duplicated)"
 fi
-unset Q1224C Q1224C_BODY Q1224D Q1224E Q6V Q6H Q6_RE Q6_RE_SIG
+# ── THE BODY-READ-FAILURE ARM: exit 0 ONLY when the comment VERIFIABLY posted ──
+# (prior review finding 3: reverting this whole arm — or making the comment post
+# return 0 unconditionally — left the suite 970/0 GREEN, so the exit-0/exit-5
+# contract had no coverage at all and the false-delivery claim was invisible.)
+# ONE VECTOR PER OUTCOME, so each half of the contract is separately load-bearing:
+#   (a) body read fails, comment posts        ⇒ rc 0 (CI CAN see the marker)
+#   (b) body read fails, comment CANNOT post   ⇒ rc 5 (`body-marker-unposted`)
+Q1224H="$T/p1224-comment-6.json"; : > "$Q1224H"
+STUB_BODY_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224H" run_record_rc "daniel-ospina/agent-infra" 424248 "$SHA"
+if [ "$RECORD_RC" = "0" ] && [ -s "$Q1224H" ]; then
+    ok "#1224 a body-read failure still exits 0 WHEN the evidence comment posted — the marker is visible to the required check, so the run is a success, not a false green"
+else
+    bad "#1224 a body-read failure did not use the comment channel (rc=$RECORD_RC, comment_posted=$([ -s "$Q1224H" ] && echo yes || echo no)) — either a review that IS evidenced reports failure, or it reports success with nothing delivered"
+fi
+Q1224I="$T/p1224-comment-7.json"; : > "$Q1224I"
+STUB_BODY_FAIL=1 STUB_COMMENTS_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224I" run_record_rc "daniel-ospina/agent-infra" 424249 "$SHA"
+Q1224I_PENDING="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424249.marker"
+if [ "$RECORD_RC" = "5" ] && [ ! -s "$Q1224I" ] && [ -f "$Q1224I_PENDING" ]; then
+    ok "#1224 with NEITHER channel available the run exits 5 (body-marker-unposted) and KEEPS the pending marker — a failed delivery is a named state, never a warning on a zero exit"
+else
+    bad "#1224 a double delivery failure was not reported as the named exit-5 state (rc=$RECORD_RC, posted=$([ -s "$Q1224I" ] && echo yes || echo no), pending=$([ -f "$Q1224I_PENDING" ] && echo yes || echo no)) — the record would be invisible to CI while the run looks successful"
+fi
+unset Q1224H Q1224I Q1224I_PENDING
+unset Q1224C Q1224C_BODY Q1224D Q1224E Q1224F Q1224G Q1224J Q6V Q6H Q6_RE Q6_RE_SIG
 
 echo "── 7. Stale-sha refusal: mismatched head → exit 3, no record ────"
 MISMATCH_SHA="$(printf 'b%.0s' $(seq 1 40))" # 40×b — stub answers aaaa…, so bbbb… is stale
@@ -2543,7 +2623,194 @@ if grep -qF 'if [ "$CC_DIFF" = "$DIFF_HASH" ]; then' "$CC_MUT"; then
 else
     bad "11.13j the mutation anchor 'if [ \"\\\$CC_DIFF\" = \"\\\$DIFF_HASH\" ]; then' is gone — re-anchor the mutant rather than dropping the pin"
 fi
-unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_FILE CC_MUT CC_TAB CC_NONDIFF CC_CAP406
+
+# ── 11.13k #3315 — THE CALLER-SUPPLIED RECORD PAIR (--recorded-diff/-head) ──
+# WHY THIS EXISTS. check-pipeline-compliance.sh's check (c) is a REQUIRED status
+# check and it runs on a CI runner, which has no $HOME/.pi/agent/reviews — it can
+# only see the PR BODY's marker. So two gates read one record and disagreed: the
+# producer said "the reviewed DIFF is UNCHANGED — carry it, do NOT re-review" from
+# the record FILE, while check (c) refused the SAME record because its marker
+# named an earlier head, and the only way through was minting an UNATTESTED marker
+# at the current head — the shape tortoise#7391 forbids ("naming the PR's current
+# head is not evidence"). The gate now hands in the marker's own
+# (head, diff_sha256) pair and this mode answers.
+#
+# ⛔ THE VECTORS THAT MATTER ARE THE NEGATIVE ONES. A supplied pair must go
+# through the SAME arms a record file does — carry / fresh / unreadable — and must
+# never be accepted where it could not be: a changed diff, an unreadable diff, a
+# non-identity digest (the empty-body constant), or any verb other than
+# --check-carry. If any of those passed, the gate would be able to carry a record
+# the merge gate refuses, which is the same two-gate disagreement inverted.
+run_check_carry_pair() { # <pr> <repo> <recorded-head> <recorded-diff> -> CC_OUT / CC_RC
+    CC_RC=0
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="${STUB_DIFF_FILE:-$CC_DIFF}" STUB_DIFF_FAIL="${STUB_DIFF_FAIL:-0}" \
+        STUB_HEAD_SHA="${STUB_HEAD_SHA:-$CC_HEAD}" \
+        bash "$RECORD" --check-carry "$1" "$2" --recorded-diff "$4" --recorded-head "$3" 2>"$T/cc-err")" || CC_RC=$?
+}
+CC_PRIOR="$(printf 'e%.0s' $(seq 1 40))"
+# (k1) THE CARRY, WITH NO RECORD FILE AT ALL — the CI-runner shape, and the whole
+# point of the flag: same digest, different head, content identical.
+rm -f "$CC_RDIR/424930.json" "$CC_FILE-424930.json"
+run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "$CC_SHA"
+assert_eq "$CC_RC" "0" "11.13k1 a SUPPLIED pair matching the live diff is a carry without any record file (exit 0)"
+assert_eq "$CC_OUT" "carry${CC_TAB}${CC_SHA}${CC_TAB}${CC_SHA}" "11.13k1 …and prints both digests, so the claim is checkable"
+assert_contains "$(cat "$T/cc-err")" "caller-supplied record pair" "11.13k1 …and says WHICH source decided (the marker, not this box's file)"
+# (k2) …and the SAME supplied shape with a CHANGED diff is still `fresh`: the flag
+# buys an answer, never a lenient one.
+run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "$CC_DIFF_B"
+assert_eq "$CC_RC" "1" "11.13k2 a supplied pair that does NOT match the live diff is 'fresh' (exit 1)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "fresh" "11.13k2 …reports 'fresh'"
+# (k3) AN UNREADABLE DIFF IS NEVER A CARRY, with or without a record file — the
+# fail-open this whole mode forbids ("could not read" → "unchanged").
+STUB_DIFF_FAIL=1 run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "$CC_SHA"
+assert_eq "$CC_RC" "3" "11.13k3 a supplied pair over an UNREADABLE diff is refused (exit 3)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "unreadable" "11.13k3 …reports 'unreadable', never a carry"
+unset STUB_DIFF_FAIL
+# (k4) THE IDENTITY RULE STILL APPLIES: the empty-body constant would make every
+# record match every PR, so it is `nodigest`, not a carry — however it was supplied.
+run_check_carry_pair 424930 "$CC_REPO" "$CC_PRIOR" "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+assert_eq "$CC_RC" "5" "11.13k4 the EMPTY-BODY constant is refused even when a caller supplies it (exit 5)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "nodigest" "11.13k4 …reports 'nodigest', not a carry"
+# (k5) THE SUPPLIED PAIR IS THE QUESTION, NOT A HINT — a record file on this box
+# must not override it. This box's record carries the OLD digest while the marker's
+# is the live one; the caller asked about the marker, so `carry` is the answer.
+cc_rec 424931 "$CC_STALE" "$CC_DIFF_B"
+run_check_carry_pair 424931 "$CC_REPO" "$CC_PRIOR" "$CC_SHA"
+assert_eq "$CC_RC" "0" "11.13k5 the supplied pair is answered even when a DIFFERENT record file exists (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "carry" "11.13k5 …so it short-circuits the file lookup instead of deferring to it"
+rm -f "$CC_FILE-424931.json"
+# (k6..k8) THE FLAG CANNOT BE SMUGGLED ONTO ANOTHER VERB, and a malformed value
+# is a usage error — never a silent pass. Each is its own exit-2, because each
+# would otherwise let a caller believe something was pinned/recorded that was not.
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-head "$CC_PRIOR" 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13k6 --recorded-head without --recorded-diff is refused (exit 2)"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" 424932 "$CC_HEAD" clean "$CC_REPO" --recorded-diff "$CC_SHA" 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13k7 --recorded-diff on a MINTING invocation is refused (exit 2)"
+assert_eq "$(ls "$CC_RDIR"/*424932* 2>/dev/null | wc -l | tr -d ' ')" "0" "11.13k7 …and no record was written"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-diff "deadbeef" 2>/dev/null)" || CC_RC=$?
+assert_eq "$CC_RC" "2" "11.13k8 a malformed --recorded-diff (not 64-hex) is refused (exit 2)"
+# (k9) THE MUTATION PIN FOR THE SHORT-CIRCUIT: with the supplied arm removed, k1
+# must fall back to the record lookup and answer `norecord` — proving k1 tests the
+# supplied arm rather than a path that happened to be taken anyway.
+CC_MUT2="$T/record-review-cc-supplied-mutant.sh"
+cp "$RECORD" "$CC_MUT2"
+if grep -q 'if \[ -n "\$RECORDED_DIFF" \]; then' "$CC_MUT2"; then
+    sed -i.bak 's/^  if \[ -n "\$RECORDED_DIFF" \]; then$/  if false; then/' "$CC_MUT2"
+    rm -f "$CC_MUT2.bak"
+    if cmp -s "$RECORD" "$CC_MUT2"; then
+        bad "11.13k9 the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
+    fi
+    CC_RC=0
+    # ⚠️ THE MUTANT'S ARGUMENT PARSER STILL ACCEPTS THE FLAGS (only the arm is
+    # disabled), so the flags must not be rejected as unknown here.
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="$CC_DIFF" STUB_HEAD_SHA="$CC_HEAD" \
+        bash "$CC_MUT2" --check-carry 424930 "$CC_REPO" --recorded-diff "$CC_SHA" --recorded-head "$CC_PRIOR" 2>/dev/null)" || CC_RC=$?
+    if [ "$CC_RC" = "4" ]; then
+        ok "11.13k9 mutation CAUGHT: with the supplied arm disabled the SAME request answers 'norecord' — so the arm is load-bearing"
+    else
+        bad "11.13k9 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — k1 does not test the supplied arm"
+    fi
+else
+    bad "11.13k9 the mutation anchor 'if [ -n \"\\\$RECORDED_DIFF\" ]; then' is gone — re-anchor it rather than dropping the pin"
+fi
+# (k10) A DIGEST-ONLY SUPPLIED PAIR IS A SUPPORTED SHAPE (review of #3315, P2):
+# a pre-#2982 marker carries no head, so the gate hands in --recorded-diff alone.
+# The content-identity verdict must be the same; only the head-binding arm and the
+# rebase arm are unavailable, and NOTHING may be invented from the absent head
+# (no `head` verdict, no `carry-patch` guess). Both directions are pinned here
+# because both are reachable from check (c).
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    STUB_DIFF_FILE="$CC_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$CC_HEAD" \
+    bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-diff "$CC_SHA" 2>"$T/cc-err")" || CC_RC=$?
+assert_eq "$CC_RC" "0" "11.13k10 --recorded-diff WITHOUT --recorded-head still carries on content identity (exit 0)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "carry" "11.13k10 …reports 'carry' (the absent head invents nothing)"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    STUB_DIFF_FILE="$CC_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$CC_HEAD" \
+    bash "$RECORD" --check-carry 424930 "$CC_REPO" --recorded-diff "$CC_DIFF_B" 2>"$T/cc-err")" || CC_RC=$?
+assert_eq "$CC_RC" "1" "11.13k10 …and a NON-matching digest without a head is 'fresh', never a carry"
+
+# (n) #10177 / #10522 (defect B): a CARRY that records NO PROOF is not a record.
+#     The measured shape is tortoise#10677's: `mint:"carried"` onto a head whose
+#     tree differed by 4 files/+178, with no `carry_arm` and no `evidence` — a
+#     verdict re-bound to code nobody reviewed, and nothing in the artifact a
+#     reader could check. The answer must be `norecord` (what a reader can act
+#     on), never `head`.
+CC_REC_10177="$CC_FILE-424919.json"
+CC_HEAD_SAVED="$CC_HEAD"
+CC_HEAD="$CC_SHA"
+# A LITERAL 64-hex identity, not $CC_DIFF: §11.13's earlier arms reassign that
+# variable, and a fixture digest that is not a valid identity makes every arm
+# below answer `nodigest` for a reason of the fixture's own making.
+CC_D64="$(printf 'c%.0s' {1..64})"
+printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carried_from":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+    "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_REPO" > "$CC_REC_10177"
+run_check_carry 424919 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13n an UNPROVEN carry is NOT a record (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13n …it answers norecord, not head/carry"
+assert_contains "$(cat "$T/cc-err")" "CARRY with NO recorded proof" "11.13n …and names the reason a reader can act on"
+# (n2) the SAME record WITH its proof binds at the head — the rule discriminates
+#      on provenance, not on the word "carried".
+printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carry_arm":"lane","reviewed_diff_sha256":"%s","evidence":"comment:1","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+    "$CC_SHA" "$CC_D64" "$CC_D64" "$CC_REPO" > "$CC_REC_10177"
+run_check_carry 424919 "$CC_REPO"
+if [ "${CC_OUT%%"$CC_TAB"*}" != "norecord" ] && [ "$CC_RC" != "4" ]; then
+    ok "11.13n2 the same carry WITH its proof is NOT denied as unproven (out=${CC_OUT%%"$CC_TAB"*}, rc=$CC_RC)"
+else
+    bad "11.13n2 a PROVEN carry is still refused as unproven (rc=$CC_RC, out=$CC_OUT) — the rule keys on the word 'carried', not on provenance"
+fi
+# (n3) MUTATION PIN — the unproven-carry rule must be LOAD-BEARING: with the
+#      provenance test removed, the unproven record reads as a healthy head
+#      again. That is the false green defect B is about, so a pin that stays
+#      green on the mutant proves nothing.
+CC_MUT_K="$T/record-review-10177-mutant.sh"
+cp "$RECORD" "$CC_MUT_K"
+if grep -qF 'if [ -z "$CC_ARM_F" ] || [ -z "$CC_EV_F" ]; then' "$CC_MUT_K"; then
+    sed -i.bak 's/^[[:space:]]*if \[ -z "\$CC_ARM_F" \] || \[ -z "\$CC_EV_F" \]; then$/    if false; then/' "$CC_MUT_K"
+    rm -f "$CC_MUT_K.bak"
+    if cmp -s "$RECORD" "$CC_MUT_K"; then
+        bad "11.13n3 the mutant is byte-identical to the script — the sed did not apply (re-anchor it)"
+    fi
+    printf '{"pr":424919,"head_sha":"%s","diff_sha256":"%s","mint":"carried","carried_from":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+        "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_REPO" > "$CC_REC_10177"
+    run_check_carry 424919 "$CC_REPO" "$CC_MUT_K"
+    if [ "${CC_OUT%%"$CC_TAB"*}" != "norecord" ]; then
+        ok "11.13n3 MUTATION CAUGHT: without the provenance test the UNPROVEN carry stops reading as 'norecord' (it answers ${CC_OUT%%"$CC_TAB"*}) — so 11.13n is load-bearing"
+    else
+        bad "11.13n3 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — 11.13n cannot fail, so it proves nothing"
+    fi
+else
+    bad "11.13n3 the mutation anchor 'if [ -z \"\\\$CC_ARM_F\" ] || [ -z \"\\\$CC_EV_F\" ]; then' is gone — re-anchor the pin rather than dropping it"
+fi
+# (n4) #10583 × #10177 — a `mint:"delta"` record IS a carry, so the same provenance rule
+#      must reach it. A delta re-binds a verdict minted at ANOTHER head exactly as a
+#      `carried` record does (the only difference is how the reviewed head was found), so
+#      exempting it would make the delta verb the ONE carry path that can re-bind a `clean`
+#      onto a tree with nothing in the record a reader could check — the tortoise#10677
+#      shape. The record here carries a full `delta` object and still names NO arm and NO
+#      evidence, so the refusal must come from the missing PROOF, not from the mint word:
+#      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
+#      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
+#      (scripts/record-review.sh:4226 at this head — RE-DERIVE it, do not trust the number: a bare
+#      line citation here rotted once already, :4174 -> :4210, and this comment is not what makes
+#      the assertion true). One command answers it:
+#        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
+printf '{"pr":424920,"head_sha":"%s","diff_sha256":"%s","mint":"delta","carried_from":"%s","delta":{"from":"%s","to":"%s","proved":"lane","arm":"lane"},"verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
+    "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_FILE-424920.json"
+run_check_carry 424920 "$CC_REPO"
+assert_eq "$CC_RC" "4" "11.13n4 an UNPROVEN delta is NOT a record either (exit 4)"
+assert_eq "${CC_OUT%%"$CC_TAB"*}" "norecord" "11.13n4 …it answers norecord, not head — a delta cannot escape the provenance rule"
+rm -f "$CC_FILE-424920.json"
+rm -f "$CC_REC_10177"
+CC_HEAD="$CC_HEAD_SAVED"
+
+unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_FILE CC_MUT CC_TAB CC_NONDIFF CC_CAP406 CC_PRIOR CC_MUT2
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -2587,9 +2854,16 @@ run_recover() { # <pr> <repo> [script] -> RB_OUT / RB_RC
 # (a) THE RECOVERY: a record file is absent, the body carries a valid signed
 #     marker → the record is rebuilt, with the marker's own head/diff/verdict.
 rb_clear
-export STUB_BODY="Some PR description.
+# status CHECKED, then exported. This site is the class the scanner's rule CANNOT see (a declaration
+# builtin whose value spans lines is not "a substitution on the same line"), and it is still the shape:
+# a marker that failed to BUILD leaves the prose prefix non-empty, so the arm goes red for the wrong
+# reason instead of refusing to judge. The marker is therefore built and checked BEFORE it is embedded.
+RB_M_A="$(rb_marker 424911 "review recorded: reviews/424911.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — the 11.14a arm would otherwise fail on a MISSING marker"
+STUB_BODY="Some PR description.
 
-$(rb_marker 424911 "review recorded: reviews/424911.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+$RB_M_A"
+export STUB_BODY
 run_recover 424911 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14a a verified marker rebuilds the missing record (exit 0)"
 assert_eq "$RB_OUT" "recovered${RB_TAB}${RB_HEAD}${RB_TAB}${RB_DIFF}" "11.14a …and prints the restored head + digest, so the claim is checkable"
@@ -2613,7 +2887,12 @@ assert_contains "$(cat "$T/rb-err")" "does not certify" "11.14a …and says it r
 #     the old carry-forward arm accepted; it must not survive the HMAC check.
 rb_clear
 RB_TEXT_B="review recorded: reviews/424912.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)"
-export STUB_BODY="$RB_TEXT_B sig=$(printf '0%.0s' $(seq 1 64))"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$RB_TEXT_B sig=$(printf '0%.0s' $(seq 1 64))" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424912 "$RB_REPO"
 assert_eq "$RB_RC" "3" "11.14b a forged sig=<64 zeros> is REFUSED (exit 3)"
 if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424912.json" ]; then bad "11.14b a forged marker minted a record"; else ok "11.14b …and nothing is written"; fi
@@ -2641,7 +2920,12 @@ assert_contains "$(cat "$T/rb-err")" "body EDIT" "11.14d …and says why an unve
 # (e) FOREIGN REPO: PR numbers collide across repos, which is why the record is
 #     repo-qualified. A signed marker naming another repo must not be adopted.
 rb_clear
-export STUB_BODY="$(rb_marker 424915 "review recorded: reviews/424915.json verdict=clean @ $RB_HEAD diff=$RB_DIFF (daniel-ospina/tortoise)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424915 "review recorded: reviews/424915.json verdict=clean @ $RB_HEAD diff=$RB_DIFF (daniel-ospina/tortoise)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424915 "$RB_REPO"
 assert_eq "$RB_RC" "3" "11.14e a marker signed for ANOTHER repo is refused (exit 3)"
 assert_contains "$(cat "$T/rb-err")" "DIFFERENT repo" "11.14e …and names the collision, not a signature failure"
@@ -2674,7 +2958,12 @@ rb_clear
 RB_EXIST="$RB_RDIR/daniel-ospina-agent-infra-424918.json"
 printf '%s\n' '{"pr":424918,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_EXIST"
 RB_BEFORE="$(cat "$RB_EXIST")"
-export STUB_BODY="$(rb_marker 424918 "review recorded: reviews/424918.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424918 "review recorded: reviews/424918.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424918 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14h an existing record is not replaced (exit 5)"
 assert_eq "$(cat "$RB_EXIST")" "$RB_BEFORE" "11.14h …byte-identical afterwards"
@@ -2682,7 +2971,12 @@ assert_eq "$(cat "$RB_EXIST")" "$RB_BEFORE" "11.14h …byte-identical afterwards
 # (i) AN HONEST reviewed_at IS NOT NEGOTIABLE. If the head commit's date cannot
 #     be read, refuse — stamping `now` as a mint time is the tortoise#7391 defect.
 rb_clear
-export STUB_BODY="$(rb_marker 424919 "review recorded: reviews/424919.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424919 "review recorded: reviews/424919.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 export STUB_COMMIT_FAIL=1
 run_recover 424919 "$RB_REPO"
 unset STUB_COMMIT_FAIL
@@ -2707,7 +3001,12 @@ sed 's@if \[ -z "$_expect" \] || \[ "$_expect" != "$_sig" \]; then@if false; the
 if grep -q 'if false; then' "$RB_MUT"; then
     rb_clear
     RB_TEXT_M="review recorded: reviews/424921.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)"
-    export STUB_BODY="$RB_TEXT_M sig=$(printf '0%.0s' $(seq 1 64))"
+    # status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+    # status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+    # below refuse for the WRONG reason and still pass.
+    STUB_BODY="$RB_TEXT_M sig=$(printf '0%.0s' $(seq 1 64))" \
+      || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+    export STUB_BODY
     run_recover 424921 "$RB_REPO" "$RB_MUT"
     assert_eq "$RB_RC" "0" "11.14k WITHOUT the HMAC check the forged marker mints (the pin has teeth)"
 else
@@ -2719,7 +3018,12 @@ unset STUB_BODY STUB_BODY_FAIL STUB_COMMIT_FAIL RB_OUT RB_RC RB_REC RB_EXIST RB_
 #     across repos), so an unresolvable repo is a USAGE error, not a guess.
 rb_clear
 export STUB_REPO_NAME=""
-export STUB_BODY="$(rb_marker 424922 "review recorded: reviews/424922.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424922 "review recorded: reviews/424922.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
     bash "$RECORD" --recover-body 424922 2>"$T/rb-err")" || RB_RC=$?
@@ -2731,7 +3035,12 @@ assert_contains "$(cat "$T/rb-err")" "no repo resolved" "11.14l …and names the
 #     body edit by definition. Minting on trust would make the whole check
 #     decorative, so this is a REFUSAL even when a valid-looking marker exists.
 rb_clear
-export STUB_BODY="$(rb_marker 424923 "review recorded: reviews/424923.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424923 "review recorded: reviews/424923.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" AI_REVIEW_GATE_KEY="" \
     bash "$RECORD" --recover-body 424923 "$RB_REPO" 2>"$T/rb-err")" || RB_RC=$?
@@ -2746,14 +3055,24 @@ if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424923.json" ]; then bad "11.14m a r
 rb_clear
 RB_LEG="$RB_RDIR/424924.json"
 printf '%s\n' '{"pr":424924,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_LEG"
-export STUB_BODY="$(rb_marker 424924 "review recorded: reviews/424924.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424924 "review recorded: reviews/424924.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424924 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14n a legacy record naming THIS repo is not replaced (exit 5)"
 if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424924.json" ]; then bad "11.14n a qualified record was minted beside an existing legacy one"; else ok "11.14n …and no qualified record is minted beside it"; fi
 rb_clear
 printf '%s\n' '{"pr":424925,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/424925.json"
 RB_FOREIGN_BEFORE="$(cat "$RB_RDIR/424925.json")"
-export STUB_BODY="$(rb_marker 424925 "review recorded: reviews/424925.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424925 "review recorded: reviews/424925.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424925 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14n a FOREIGN legacy record does not block this repo's recovery (exit 0)"
 assert_eq "$(cat "$RB_RDIR/424925.json")" "$RB_FOREIGN_BEFORE" "11.14n …and the other repo's record is left byte-identical, never deleted"
@@ -2765,8 +3084,17 @@ unset STUB_BODY RB_OUT RB_RC RB_LEG RB_FOREIGN_BEFORE
 rb_clear
 RB_OLD_HEAD="$(printf '7%.0s' $(seq 1 40))"
 RB_OLD_DIFF="$(printf '8%.0s' $(seq 1 64))"
-export STUB_BODY="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean @ $RB_OLD_HEAD diff=$RB_OLD_DIFF ($RB_REPO)")
-$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean-micro @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED PER MARKER, then exported. ⛔ A single trailing guard on a TWO-substitution value
+# checks only the LAST one (`X="…$(a)…$(b)"` returns b's status), so a failing FIRST marker would still
+# be discarded — and the arm asserts the LAST marker wins by name, so it would stay green while proving
+# nothing about supersession. Each marker is built and checked on its own, so either failure is loud.
+RB_M_FIRST="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean @ $RB_OLD_HEAD diff=$RB_OLD_DIFF ($RB_REPO)")" \
+  || bad "fixture: the SUPERSEDED marker could not be BUILT — 11.14o would otherwise prove nothing about supersession"
+RB_M_LAST="$(rb_marker 424926 "review recorded: reviews/424926.json verdict=clean-micro @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: the LAST marker could not be BUILT — an empty last marker would make recovery refuse for the WRONG reason"
+STUB_BODY="$RB_M_FIRST
+$RB_M_LAST"
+export STUB_BODY
 run_recover 424926 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14o two markers for one PR: recovery succeeds (exit 0)"
 assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424926.json" 2>/dev/null)" "\"head_sha\":\"$RB_HEAD\"" "11.14o …restoring the LAST marker's head, not the first"
@@ -2777,7 +3105,12 @@ assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424926.json" 2>/dev/n
 #     and `--check-carry` answers `nodigest` (5), not `fresh` (1): "no digest to
 #     compare" and "the diff changed" are different facts with different remedies.
 rb_clear
-export STUB_BODY="$(rb_marker 424927 "review recorded: reviews/424927.json verdict=clean @ $RB_HEAD ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424927 "review recorded: reviews/424927.json verdict=clean @ $RB_HEAD ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424927 "$RB_REPO"
 assert_eq "$RB_RC" "0" "11.14p a diff-less (pre-#2982) marker still recovers (exit 0)"
 assert_eq "$RB_OUT" "recovered${RB_TAB}${RB_HEAD}${RB_TAB}-" "11.14p …and prints '-' for the digest it does not have"
@@ -2801,7 +3134,12 @@ assert_eq "${RB_CC_OUT%%"$RB_TAB"*}" "nodigest" "11.14p …and the verdict WORD 
 #     would make the rail skip its base guard while the gate blocks the same
 #     record as `base_unverifiable` — one record, two verdicts.
 rb_clear
-export STUB_BODY="$(rb_marker 424928 "review recorded: reviews/424928.json verdict=clean-low @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424928 "review recorded: reviews/424928.json verdict=clean-low @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424928 "$RB_REPO"
 assert_eq "$RB_RC" "3" "11.14q a clean-low marker is refused (exit 3)"
 assert_contains "$(cat "$T/rb-err")" "FRESH mint (not a carry" "11.14q …and names the remedy that IS available, correctly labelled (a fresh mint, not a carry)"
@@ -2812,7 +3150,12 @@ if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424928.json" ]; then bad "11.14q a c
 #     read-only answer and exit 0 having written NOTHING — a successful-looking
 #     recovery that did not happen.
 rb_clear
-export STUB_BODY="$(rb_marker 424929 "review recorded: reviews/424929.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424929 "review recorded: reviews/424929.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
     bash "$RECORD" --recover-body 424929 "$RB_REPO" --check-carry 2>"$T/rb-err")" || RB_RC=$?
@@ -2827,7 +3170,12 @@ if [ -f "$RB_RDIR/daniel-ospina-agent-infra-424929.json" ]; then bad "11.14r the
 rb_clear
 printf '%s\n' '{"pr":424930,"head_sha":"ffffffffffffffffffffffffffffffffffffffff","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/daniel-ospina-agent-infra-424930.json"
 RB_OTHER_BEFORE="$(cat "$RB_RDIR/daniel-ospina-agent-infra-424930.json")"
-export STUB_BODY="$(rb_marker 424930 "review recorded: reviews/424930.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424930 "review recorded: reviews/424930.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424930 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14s a qualified file embedding ANOTHER repo is not overwritten (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "daniel-ospina/tortoise" "11.14s …and the refusal names the repo whose verdict is at stake"
@@ -2841,7 +3189,12 @@ unset STUB_BODY RB_OUT RB_RC RB_OLD_HEAD RB_OLD_DIFF RB_OTHER_BEFORE
 #     it — the "walk the gate backwards" failure the whole rule exists to prevent.
 #     The stub performs the concurrent mint as a side effect of the LAST read.
 rb_clear
-export STUB_BODY="$(rb_marker 424931 "review recorded: reviews/424931.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424931 "review recorded: reviews/424931.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RACE="$RB_RDIR/daniel-ospina-agent-infra-424931.json"
 RB_RACE_JSON='{"pr":424931,"head_sha":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","diff_sha256":"1111111111111111111111111111111111111111111111111111111111111111","verdict":"clean","mint":"fresh","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-12-01T00:00:00Z"}'
 export STUB_RACE_PATH="$RB_RACE" STUB_RACE_RECORD="$RB_RACE_JSON"
@@ -2856,7 +3209,12 @@ assert_contains "$(cat "$T/rb-err")" "appeared WHILE" "11.14t …and the refusal
 #     first and answer for a PR whose recovery never ran).
 for _combo in --print-diff-hash --print-tier; do
     rb_clear
-    export STUB_BODY="$(rb_marker 424932 "review recorded: reviews/424932.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+    # status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+    # status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+    # below refuse for the WRONG reason and still pass.
+    STUB_BODY="$(rb_marker 424932 "review recorded: reviews/424932.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+      || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+    export STUB_BODY
     RB_RC=0
     RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
         bash "$RECORD" --recover-body 424932 "$RB_REPO" "$_combo" 2>"$T/rb-err")" || RB_RC=$?
@@ -2871,11 +3229,21 @@ unset STUB_BODY RB_OUT RB_RC RB_RACE RB_RACE_JSON _combo
 #     the same class as 11.14t, which is why it is checked at the write too.
 rb_clear
 RB_FOREIGN_JSON='{"pr":424933,"head_sha":"dddddddddddddddddddddddddddddddddddddddd","verdict":"clean","mint":"fresh","repo":"daniel-ospina/tortoise","reviewed_at":"2026-12-01T00:00:00Z"}'
-export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 export STUB_RACE_PATH="$RB_RDIR/daniel-ospina-agent-infra-424933.json" STUB_RACE_RECORD="$RB_FOREIGN_JSON"
 run_recover 424933 "$RB_REPO"
 unset STUB_RACE_PATH STUB_RACE_RECORD
-export STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424933 "review recorded: reviews/424933.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 assert_eq "$RB_RC" "5" "11.14v a FOREIGN record appearing mid-recovery is not destroyed (exit 5)"
 assert_eq "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424933.json" 2>/dev/null)" "$RB_FOREIGN_JSON" "11.14v …the other repo's verdict survives byte-identical"
 
@@ -2884,7 +3252,12 @@ assert_eq "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424933.json" 2>/dev/null)" 
 #     would assert there is nothing to fix about a file the GATE calls corrupt.
 rb_clear
 printf '%s' '{"pr":424934,"head_sha":"abc' > "$RB_RDIR/daniel-ospina-agent-infra-424934.json"
-export STUB_BODY="$(rb_marker 424934 "review recorded: reviews/424934.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424934 "review recorded: reviews/424934.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424934 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14w a corrupt record is refused (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14w …and it is named as unusable, not as 'nothing to repair'"
@@ -2894,7 +3267,12 @@ assert_contains "$(cat "$T/rb-err")" "move it aside" "11.14w …with a way out"
 #     take $2 as the repo and DISCARD the verdict and head, minting the marker's
 #     verdict with exit 0 while the caller believed it had chosen one.
 rb_clear
-export STUB_BODY="$(rb_marker 424935 "review recorded: reviews/424935.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424935 "review recorded: reviews/424935.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 RB_RC=0
 RB_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
     bash "$RECORD" --recover-body 424935 "$RB_REPO" clean-low "$RB_HEAD" 2>"$T/rb-err")" || RB_RC=$?
@@ -2908,7 +3286,12 @@ unset STUB_BODY RB_OUT RB_RC RB_FOREIGN_JSON
 #     would walk the gate BACKWARDS. It must be treated as an existing record.
 rb_clear
 printf '%s\n' '{' '  "pr": 424936,' '  "head_sha": "ffffffffffffffffffffffffffffffffffffffff",' '  "verdict": "clean",' '  "repo": "daniel-ospina/agent-infra",' '  "reviewed_at": "2026-02-02T00:00:00Z"' '}' > "$RB_RDIR/daniel-ospina-agent-infra-424936.json"
-export STUB_BODY="$(rb_marker 424936 "review recorded: reviews/424936.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424936 "review recorded: reviews/424936.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424936 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14y a pretty-printed (jq round-trip) record counts as existing (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "already exists" "11.14y …and is NOT called unusable, because the gate reads it fine"
@@ -2919,7 +3302,12 @@ assert_contains "$(cat "$T/rb-err")" "already exists" "11.14y …and is NOT call
 #      about — the round-2 loop, narrowed to a present-but-untyped key.
 rb_clear
 printf '%s\n' '{"pr":424938,"head_sha":null,"verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2026-02-02T00:00:00Z"}' > "$RB_RDIR/daniel-ospina-agent-infra-424938.json"
-export STUB_BODY="$(rb_marker 424938 "review recorded: reviews/424938.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")"
+# status CHECKED, then exported: `export X="$(…)"` discards the substitution's
+# status, so a fixture that failed to BUILD (empty STUB_BODY) would make the arm
+# below refuse for the WRONG reason and still pass.
+STUB_BODY="$(rb_marker 424938 "review recorded: reviews/424938.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — this arm would otherwise pass on an EMPTY body"
+export STUB_BODY
 run_recover 424938 "$RB_REPO"
 assert_eq "$RB_RC" "5" "11.14y2 a record with an untyped head_sha is refused (exit 5)"
 assert_contains "$(cat "$T/rb-err")" "NOT a usable record" "11.14y2 …as an unusable record, matching what the gate sees (absent)"
@@ -3482,7 +3870,7 @@ MUTANT_PRE="$T/mutant-verdict-reverted.sh"
 # Portable across GNU and BSD sed: a `c\` command is not portable, so the
 # loose mutant neutralises the guard's DECISION at its call site instead.
 sed 's#clean_low_shape_ok "\$ROWS"#true#' "$RECORD" > "$MUTANT_LOOSE"
-sed 's#^  clean|clean-micro|clean-low) ;;#  clean|clean-micro) ;;#' "$RECORD" > "$MUTANT_PRE"
+sed 's#^  clean|clean-micro|clean-low|not-clean) ;;#  clean|clean-micro) ;;#' "$RECORD" > "$MUTANT_PRE"
 bash -n "$MUTANT_LOOSE" && ok "mutation: neutered-guard mutant parses" || bad "mutation: neutered-guard mutant is not valid bash"
 bash -n "$MUTANT_PRE" && ok "mutation: reverted-verdict mutant parses" || bad "mutation: reverted-verdict mutant is not valid bash"
 if cmp -s "$MUTANT_LOOSE" "$RECORD"; then bad "mutation: guard-neutering sed did not change the script"; else ok "mutation: guard-neutering sed changed the script"; fi
@@ -3926,7 +4314,28 @@ assert_contains "$R13H" "\"reviewed_at\":\"$T1\"" "13h reviewed_at is PRESERVED 
 assert_contains "$R13H" "\"head_sha\":\"$SHA\"" "13h the carried record binds the CURRENT head"
 # NB: no backticks in these strings — they would run as COMMAND SUBSTITUTION
 # (the same defect this file warns about at §11.5e, and one it caught here).
-if grep -q '"evidence"' <<<"$R13H"; then bad "13h the carry claims an unverified evidence field"; else ok "13h the carry claims no evidence field (it was not verified)"; fi
+# ── #10177 / #10522 (defect B): a carry must SAY WHAT IT CARRIED ─────────
+# Before this, a carried record was indistinguishable from a stale re-record: no
+# arm, no reviewed digest, and no evidence (the measured tortoise#10677 record
+# carried `clean` across 4 files/+178 with `evidence:null`). The evidence field
+# is now ALWAYS populated, and never with the caller's unverified --evidence.
+assert_contains "$R13H" '"evidence":"comment:' "13h the carry INHERITS the predecessor's evidence ref (a carry re-binds a verdict, it does not mint one)"
+assert_not_contains "$R13H" '"evidence":""' "13h a carried record NEVER mints an empty evidence field (\"no verdict\", not \"trust me\")"
+assert_contains "$R13H" '"carry_arm":"diff"' "13h the record names the ARM that proved the artifact unchanged"
+assert_contains "$R13H" '"reviewed_diff_sha256":' "13h the record keeps the digest the REVIEWED head carried"
+assert_contains "$R13H" '"reviewed_diff_source":"marker"' "13h …and says where that digest came from"
+# `carried_delta_sha256` is written only when BOTH commits are local, and this
+# fixture's heads are synthetic (`aaaa…`/`bbbb…`), so here the field is legitimately
+# absent. ⛔ ITS WRITER IS THEREFORE **NOT PINNED BY THIS SECTION** — fresh-review
+# cycle 3 measured that deleting the write leaves every assertion above green, and an
+# "absent ⇒ ok" arm is not a test (cycle 2's version claimed a premise no world could
+# falsify). The honest pin needs a LANE-arm fixture with real commits; it is filed as
+# a follow-up rather than faked here. What is asserted instead is the SHAPE of the
+# field whenever it IS present, so a malformed digest still reddens.
+if grep -q '"carried_delta_sha256":"' <<<"$R13H"; then
+    R13H_DELTA="$(sed -n 's/.*"carried_delta_sha256":"\([^"]*\)".*/\1/p' <<<"$R13H")"
+    if [[ "$R13H_DELTA" =~ ^[0-9a-f]{64}$ ]]; then ok "13h carried_delta_sha256 is a 64-hex digest when written"; else bad "13h carried_delta_sha256 is not a 64-hex digest ($R13H_DELTA)"; fi
+fi
 
 # 13i — an unreadable ORIGINAL mint time must be LOUD, never silently the carry
 # time (the pre-tortoise#7391 behaviour that made the mint time unrecoverable).
@@ -4300,6 +4709,10 @@ assert_eq "$_probe_rc" "3" "13o2 T17 positive control: a run that reached its su
 run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
     local pr="$1" sha="$2" cruns="$3"; shift 3
     local rcfile="$T/rc633" errfile="$T/err633" cap="$T/cap633"
+    # RR633_SCRIPT lets a mutation pin run the SAME vector against a mutated copy
+    # of the recorder (the #10177 pin needs it: a rule that cannot be removed in a
+    # copy cannot be shown to be load-bearing).
+    local rec="${RR633_SCRIPT:-$RECORD}"
     : > "$LOG"; : > "$cap"; rm -f "$errfile"
     (
         export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
@@ -4318,7 +4731,7 @@ run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
         export AI_REVIEW_GATE_CHECK_NAME="${AI_REVIEW_GATE_CHECK_NAME-}"
         [ -n "${STUB_HEAD_SHA:-}" ] && export STUB_HEAD_SHA
         rc=0
-        bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" || rc=$?
+        bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
     ) 2>/dev/null || true
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
@@ -4470,18 +4883,163 @@ else
     ok "14.9 in-flight gate run suppresses the rerun"
 fi
 
-# 14.10 No SIGNED marker in the body (PATCH failure) → remediation MUST NOT fire:
-#      a rerun of a marker-less body re-evaluates to a guaranteed red. Record
-#      still saves (best-effort).
+# 14.10 A body PATCH failure is a NAMED non-zero state (defect A, #10522), never
+#      "record still saved" + exit 0: the record is invisible to CI in that state,
+#      so reporting success is how a correctly reviewed PR (tortoise#10677) sat
+#      blocked by a bookkeeping failure. The marker is kept so delivery is
+#      retryable WITHOUT re-recording.
 STUB_BODY="PR body — no review evidence yet" STUB_PATCH_FAIL=1 run_record_633 424329 "$SHA" \
     '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":500}]'
-[ "$RECORD_RC" = "0" ] && ok "14.10 PATCH failure still saves the record (rc 0)" || bad "14.10 PATCH failure saves record (rc=$RECORD_RC, err=$RECORD_ERR)"
+[ "$RECORD_RC" = "5" ] && ok "14.10 PATCH failure is a NAMED non-zero exit (rc 5)" || bad "14.10 PATCH failure exit (rc=$RECORD_RC, want 5; err=$RECORD_ERR)"
 [ -f "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json" ] && ok "14.10 record written despite PATCH failure" || bad "14.10 record written despite PATCH failure"
-assert_contains "$RECORD_ERR" "could not post review evidence" "14.10 PATCH failure notes on stderr"
+assert_contains "$RECORD_ERR" "body-marker-unposted" "14.10 the failure has a NAMED state (body-marker-unposted)"
+PEND14="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424329.marker"
+[ -f "$PEND14" ] && ok "14.10 the signed marker is KEPT for retry (durable pending file)" || bad "14.10 no durable pending marker — the evidence would be lost"
+if grep -qF 'review recorded:' "$PEND14" 2>/dev/null; then ok "14.10 …and it holds the marker line verbatim"; else bad "14.10 the pending file does not hold the marker line"; fi
 if grep -qF -- "actions/jobs/" "$LOG"; then
     bad "14.10 no rerun without a posted marker (log: $(cat "$LOG"))"
 else
     ok "14.10 no rerun without a posted marker"
+fi
+# 14.10b …and `--flush-pending` DELIVERS it later without a second review and
+#       without touching the record (a re-record would dilute the evidence).
+REC_BEFORE_14B="$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json" 2>/dev/null || true)"
+FL_RC=0
+FL_CAP="$T/flushcap"
+: > "$FL_CAP"; : > "$LOG"
+FL_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$FL_CAP" \
+    STUB_BODY="PR body — no review evidence yet" \
+    bash "$RECORD" --flush-pending 424329 daniel-ospina/agent-infra 2>&1)" || FL_RC=$?
+# ⛔ DELIVERY, NOT DELETION (fresh-review P2): `rm -f` + exit 0 satisfied every
+# other assertion here, and the empty-pending-file mutant did exactly that.
+if grep -qF -- "-X PATCH" "$LOG"; then ok "14.10b the flush actually PATCHed the body (transport, not just an exit code)"; else bad "14.10b the flush exited 0 without a PATCH — deletion is not delivery (log: $(cat "$LOG"))"; fi
+assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
+# 14.10q A BODY THAT ONLY *QUOTES* THE MARKER IS NOT DELIVERY (review round 2
+#       finding 3). `post_marker` tested the marker with `grep -qF` — a SUBSTRING
+#       test — while the gate anchors `^…$`. Measured before the fix: a body that
+#       merely quoted the marker made `--flush-pending` return 0, print "delivered",
+#       and DELETE the pending file — defect A on the retry channel, destroying the
+#       only surviving copy of a marker that was never delivered. The vector needs
+#       BOTH halves: a PATCH must happen, and the delivered body must carry the
+#       marker as its OWN line.
+Q14C_MARKER='review recorded: reviews/424329.json verdict=clean @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)'
+mkdir -p "$F_HOME/.pi/agent/reviews/pending"
+printf '%s\n' "$Q14C_MARKER" > "$PEND14"
+Q14C_CAP="$T/flushcap14c"; : > "$Q14C_CAP"; : > "$LOG"
+Q14C_RC=0
+Q14C_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$Q14C_CAP" \
+    STUB_BODY="A reviewer pasted this into their notes: $Q14C_MARKER — quoted mid-line" \
+    bash "$RECORD" --flush-pending 424329 daniel-ospina/agent-infra 2>&1)" || Q14C_RC=$?
+if grep -qF -- "-X PATCH" "$LOG"; then
+    ok "14.10q a body that merely QUOTES the marker is not delivery — the flush PATCHed (transport, not an early return)"
+else
+    bad "14.10q the flush treated a QUOTED marker as delivered and did not PATCH (log: $(cat "$LOG")) — the pending marker would be deleted undelivered"
+fi
+if grep -qF -- '\n\nreview recorded: reviews/424329.json verdict=clean @ ' "$Q14C_CAP" 2>/dev/null; then
+    ok "14.10q …and the delivered body carries the marker as its OWN line, which is what the gate anchors on"
+else
+    bad "14.10q the delivered body does not carry the marker as its own line — the gate would still refuse it"
+fi
+assert_eq "$Q14C_RC" "0" "14.10q the flush succeeds once it really delivers (rc 0)"
+unset Q14C_MARKER Q14C_CAP Q14C_RC Q14C_OUT
+
+# 14.10u AN UNSIGNED MARKER IS NEVER PUBLISHED AS A COMMENT (review round 2
+#       finding 4: dropping the `MARKER_SIGNED` guard left the suite 974/0 green,
+#       though the guard is a stated doctrine and it gates the exit-0/5 contract).
+#       With no gate key the marker cannot be signed, so the comment channel must
+#       not be used at all — not even attempted.
+Q14E_CAP="$T/p1224-comment-8.json"; : > "$Q14E_CAP"
+# ⛔ IT MUST REACH THE COMMENT STAGE (review round 3 finding 2). The first version of
+# this vector minted a bare `clean` with NO `--evidence`, so it died at the
+# tortoise#7391 guard (rc 3) and never built a marker — vacuous, and the guard it
+# claimed to pin stayed removable with the suite green (measured). `--evidence`
+# lets the mint proceed, and the transport assertion below proves the comment
+# endpoint was never even called.
+Q14E_RC=0
+# ⛔ STUB_EVIDENCE_PR IS LOAD-BEARING (verification pass): without it the stub answers
+# the evidence read with `parent: …/issues/0`, the tortoise#7391 guard refuses
+# (`rc 3`) and NO marker is ever built — so the vector was satisfied by "nothing
+# ever happened" and deleting the guard stayed green. Measured: with it set the mint
+# proceeds (rc 0) and dropping the guard makes the comment POST (capture=138 bytes).
+# The pass condition ALSO requires the mint to have happened, so the vector cannot
+# go vacuous again silently.
+Q14E_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_COMMENT_CAPTURE="$Q14E_CAP" \
+    STUB_EVIDENCE_PR=424252 AI_REVIEW_GATE_KEY="" \
+    bash "$RECORD" 424252 "$SHA" clean daniel-ospina/agent-infra --evidence comment:1 2>&1)" || Q14E_RC=$?
+if [ "$Q14E_RC" = "0" ] && [ ! -s "$Q14E_CAP" ] && ! grep -qE "X POST repos/[^ ]*/issues/[0-9]+/comments" "$LOG"; then
+    ok "14.10u an UNSIGNED marker is NOT published as a comment (mint succeeded, endpoint never called) — a comment cannot be retracted and an unsigned marker is never evidence"
+else
+    bad "14.10u the unsigned-marker rule did not hold (rc=$Q14E_RC — 3 means the mint never happened, so the vector proves nothing; capture=$([ -s "$Q14E_CAP" ] && echo yes || echo no), log: $(grep -oE 'X POST repos/[^ ]*/issues/[0-9]+/comments' "$LOG" | head -1)) — the gate can never accept an unsigned marker, and a published one cannot be undone"
+fi
+unset Q14E_CAP Q14E_RC Q14E_OUT
+
+# 14.10d an EMPTY pending file is NOT a delivered marker (cycle-2 P1: the helper
+#       used to `rm -f` it and return 0, so the flush claimed delivery and then
+#       destroyed the only copy).
+mkdir -p "$F_HOME/.pi/agent/reviews/pending"
+: > "$PEND14"
+: > "$LOG"
+EMPTY_RC=0
+EMPTY_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_BODY="PR body" \
+    bash "$RECORD" --flush-pending 424329 daniel-ospina/agent-infra 2>&1)" || EMPTY_RC=$?
+assert_eq "$EMPTY_RC" "5" "14.10d an EMPTY pending marker fails closed (rc 5) [out: $(printf '%s' "$EMPTY_OUT" | tr '\n' ' ')]"
+if [ -f "$PEND14" ]; then ok "14.10d …and the (corrupt) pending file is KEPT, not silently deleted"; else bad "14.10d the empty pending file was deleted — the marker is now unrecoverable"; fi
+if grep -qF -- "-X PATCH" "$LOG"; then bad "14.10d an empty marker was PATCHed (log: $(cat "$LOG"))"; else ok "14.10d …and nothing was posted"; fi
+rm -f "$PEND14"
+# 14.10e the gh-MISSING arm must not persist an empty marker (cycle-2 P1: MARKER is
+#       built inside the gh-available block, so the old write persisted a 1-byte
+#       file that a later flush "delivered" and deleted).
+if declare -F run_record_no_gh >/dev/null 2>&1; then
+    run_record_no_gh clean-micro "daniel-ospina/agent-infra" 424332 || true
+    assert_eq "$RECORD_RC" "5" "14.10e with gh missing the record is written but the exit is a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+    assert_contains "$RECORD_ERR" "gh CLI is missing" "14.10e …and the message names the cause"
+    if [ -e "$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424332.marker" ]; then
+        bad "14.10e the gh-missing arm persisted a pending marker (it cannot have built one — MARKER is set inside the gh block)"
+    else
+        ok "14.10e …and no empty pending marker was persisted"
+    fi
+else
+    # A GUARD WITH NO ELSE IS A FAIL-OPEN GATE (fresh-review cycle 3): renaming the
+    # helper would delete this P1 pin silently, and the suite would still print a
+    # summary. A skipped vector is a FAILURE, never a pass.
+    bad "14.10e vector SKIPPED — run_record_no_gh is not defined; the empty-pending-marker pin did NOT run"
+fi
+assert_eq "$FL_RC" "0" "14.10b --flush-pending delivers the pending marker (rc 0) [out: $(printf '%s' "$FL_OUT" | tr '\n' ' ')]"
+if [ -f "$PEND14" ]; then bad "14.10b the pending file survives a SUCCESSFUL flush (a retry would re-post forever)"; else ok "14.10b a successful flush clears the pending file"; fi
+assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json")" "14.10b the flush does NOT re-record (the verdict and its reviewed_at are untouched)"
+# 14.10c MUTATION PIN — the exit-5 rule must be load-bearing. With it reverted to
+#       the old `exit 0`, a failed post reads as success again, which is exactly
+#       the invisible-record state defect A reported.
+FL_MUT="$T/record-review-a-mutant.sh"
+cp "$RECORD" "$FL_MUT"
+if grep -qF 'body-marker-unposted: the signed marker for $REPO#$PR could NOT be PATCHed' "$FL_MUT"; then
+    # The mutant restores the pre-fix behaviour on THAT branch only: warn and exit 0.
+    # ⛔ ANCHORED TO THE BRANCH, AND THE SCOPE IS ASSERTED (fresh-review P2): two
+    # lines in the script carry exactly six spaces before `exit 5` (this one and
+    # --recover-body's refusal), so an address-free `s/^      exit 5$/…/` mutates
+    # BOTH — a mutant wider than its declaration, whose extra change could mask a
+    # fail-closed regression in later assertions.
+    sed -i.bak '/body-marker-unposted: the signed marker for \$REPO#\$PR could NOT be PATCHed/,/^      exit 5$/ s/^      exit 5$/      exit 0/' "$FL_MUT"
+    rm -f "$FL_MUT.bak"
+    if cmp -s "$RECORD" "$FL_MUT"; then
+        bad "14.10c the mutant is byte-identical to the script — the exit-5 sed did not apply (re-anchor it)"
+    fi
+    # `diff` exits 1 ON DIFFERENCES, so the pipeline needs `|| true`: under
+    # `set -euo pipefail` the assignment would abort the harness instead of
+    # reporting the count (this bit once, and the suite reported a bare
+    # "aborted BEFORE its summary").
+    MUT_CHANGED="$( { diff "$RECORD" "$FL_MUT" || true; } | grep -c '^<' || true)"
+    assert_eq "$MUT_CHANGED" "1" "14.10c the mutant changes EXACTLY one line (scope = the declared branch)"
+    rm -f "$PEND14"
+    RR633_SCRIPT="$FL_MUT" STUB_BODY="PR body — no review evidence yet" STUB_PATCH_FAIL=1 run_record_633 424331 "$SHA" '[]'
+    if [ "$RECORD_RC" = "0" ] && ! grep -qF 'review recorded:' "$T/cap633" 2>/dev/null; then
+        ok "14.10c MUTATION CAUGHT: with exit 5 reverted to exit 0 the post failure reads as SUCCESS while the body has no marker — so 14.10 is load-bearing"
+    else
+        bad "14.10c mutation NOT caught (rc=$RECORD_RC) — 14.10 cannot fail, so it proves nothing"
+    fi
+    rm -f "$F_HOME/.pi/agent/reviews/pending/daniel-ospina-agent-infra-424331.marker"
+else
+    bad "14.10c the mutation anchor (body-marker-unposted … could NOT be PATCHed) is gone — re-anchor the pin rather than dropping it"
 fi
 
 # 14.11 gh-200 whose payload fails the LOCAL jq stage (shape drift, broken jq):
@@ -4789,6 +5347,388 @@ run_record_raw "$E_NOREPO" "$SHA" clean --expect-head "$SHA"
 assert_contains "$RECORD_ERR" "could not verify the PR head" "19.6 the refusal says the pin could not be checked"
 [ ! -f "$(Q2 $E_NOREPO)" ] && ok "19.6 no record written" || bad "19.6 a record was written for an unverifiable pin"
 [ ! -f "$F_HOME/.pi/agent/reviews/$E_NOREPO.json" ] && ok "19.6 no legacy record written" || bad "19.6 a legacy record was written for an unverifiable pin"
+
+# The repo root, so §20 can read the merge gate's OWN allowlist rather than a
+# restatement of it (a copied list is how a new verdict drifts out of the gate).
+REPO_ROOT="$(cd "$(dirname "$RECORD")/.." && pwd)"
+
+# ═════════════════════════════════════════════════════════════════════════
+# 20. #3400 — THE NEGATIVE VERDICT, AND RECENCY-AWARE MARKER READING
+# ═════════════════════════════════════════════════════════════════════════
+# The defect this section pins is a reviewed artifact moving under its record
+# with nothing noticing. Three live instances in one night: a train whose head
+# moved after its composite review, a composed tree that carried code REMOVING a
+# fail-open fix, and tortoise#3295 whose body said `verdict=clean` while the most
+# recent review at that head was NOT CLEAN. The last one survived because the
+# recorder had NO negative verdict (agent-infra#3400) and the marker reader could
+# not SEE a negative marker (agent-infra#3410): a `verdict=not-clean` line fell
+# into RB_NBAD ("a marker whose signature does not verify"), so the keep-LAST rule
+# — which already existed at the base commit, `1f69ab544:2521` — could never be
+# given a negative to keep, and an earlier `clean` won by being the only readable
+# marker. (Stated precisely: the delta is VISIBILITY, not recency. "Recency was
+# presence-based" would be false — the recency rule was already there.)
+#
+# ⛔ EVERY ARM BELOW IS A DISCRIMINATOR, not a smoke test: 20.2 fails if recency
+# handling is removed (first-marker-wins would recover `clean`), and 20.4 fails
+# if `not-clean` grows a path that skips the evidence requirement `clean` has.
+echo "── 20. #3400: the negative verdict + recency-aware marker reading ────────────"
+
+# 20.0 THE MINT. A `not-clean` verdict must be RECORDABLE at all — that was the
+# defect: the verdict list admitted clean|clean-micro|clean-low, so a review that
+# found a defect could not be written down anywhere a gate reads.
+NEG_F=1
+run_record_neg() { # <pr> [extra args…]; $EV_REF names the artifact (empty ⇒ omit)
+    local pr="$1"; shift
+    local rcfile="$T/negrc" errfile="$T/negerr"
+    rm -f "$errfile"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        rc=0
+        if [ -n "${EV_REF:-}" ]; then
+            bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+                --findings "${NEG_F:-1}" --evidence "$EV_REF" "$@" 2>"$errfile" || rc=$?
+        else
+            bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+                --findings "${NEG_F:-1}" "$@" 2>"$errfile" || rc=$?
+        fi
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+}
+NEG_PR=424950
+EV_REF="comment:42495001"
+STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+1 open P2: the retry loop re-reads the claim after the lock is released.'
+export STUB_EVIDENCE_BODY
+run_record_neg "$NEG_PR"
+assert_eq "$RECORD_RC" "0" "20.0 a not-clean verdict MINTS (rc 0) — before #3400 this was exit 2 and no record could exist"
+NEG_REC="$(Q2 "$NEG_PR")"
+if [ -f "$NEG_REC" ]; then ok "20.0 the negative record file is written"; else bad "20.0 no record written for not-clean"; fi
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"verdict":"not-clean"' "20.0 the record carries verdict=not-clean"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"findings":1' "20.0 …and the FINDING COUNT, so the gate can say WHAT is open"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" "\"head_sha\":\"$SHA\"" "20.0 …bound to the head exactly as a clean record is"
+assert_contains "$(cat "$NEG_REC" 2>/dev/null)" '"evidence":"comment:42495001"' "20.0 …and it names the VERIFIED artifact it rests on"
+assert_contains "$RECORD_ERR" "review evidence verified" "20.0 …because the evidence gate actually RAN (not skipped by the negative verdict)"
+
+# 20.1 THE GATE READS IT AS A FAILURE NAMING THE FINDING — not as "no record".
+# The merge gate's allowlist (`extensions/review-enforcer::ACCEPTED_VERDICTS`) is
+# the ONE place a verdict unlocks a merge, so a recorded negative must be ABSENT
+# from it (recording one must never license a merge) while the gate's own
+# not-clean branch names the head and the count (so a lane is not sent to "record
+# a review" it already did, which is the "no record found" confusion).
+ENF="$REPO_ROOT/extensions/review-enforcer/index.ts"
+if [ -f "$ENF" ]; then
+    ACC_LIST="$(command grep -n 'export const ACCEPTED_VERDICTS' "$ENF" | command head -1)"
+    case "$ACC_LIST" in
+        *not-clean*) bad "20.1 not-clean is in ACCEPTED_VERDICTS — recording a negative would license a merge" ;;
+        *) ok "20.1 not-clean is NOT in the merge allowlist (a negative record blocks, as it must)" ;;
+    esac
+    command grep -q 'reviewed NOT CLEAN at' "$ENF" \
+        && ok "20.1 the gate NAMES the finding (\"reviewed NOT CLEAN at <sha>: N open finding(s)\"), not \"no record found\"" \
+        || bad "20.1 the gate has no not-clean branch — a recorded negative would read as an absent record"
+    command grep -q 'record.findings' "$ENF" \
+        && ok "20.1 …and it reads the recorded COUNT" \
+        || bad "20.1 the gate never reads the recorded finding count"
+else
+    bad "20.1 fixture: extensions/review-enforcer/index.ts not found at $ENF"
+fi
+
+# 20.2 RECENCY. Two markers at the SAME head, `clean` FIRST and `not-clean`
+# SECOND — the exact tortoise#3295 shape. The reader must take the LATEST one.
+# ⛔ MUTATION PIN: with recency handling removed (keep-first, or a presence test
+# that stops at the first match), the recovered record is `clean` and this arm
+# FAILS. That is what makes it a discriminator rather than a smoke test.
+rb_clear
+NEG_HEAD="$(printf 'd%.0s' $(seq 1 40))"
+NEG_DIFF="$(printf '7%.0s' $(seq 1 64))"
+NEG_M_CLEAN="$(rb_marker 424952 "review recorded: reviews/424952.json verdict=clean @ $NEG_HEAD diff=$NEG_DIFF ($RB_REPO)")" \
+  || bad "fixture: the clean marker could not be BUILT — 20.2 would otherwise fail on a missing marker"
+NEG_M_NEG="$(rb_marker 424952 "review recorded: reviews/424952.json verdict=not-clean @ $NEG_HEAD diff=$NEG_DIFF ($RB_REPO) findings=2")" \
+  || bad "fixture: the not-clean marker could not be BUILT — 20.2 would otherwise fail on a missing marker"
+export STUB_BODY="Some PR description.
+
+$NEG_M_CLEAN
+
+$NEG_M_NEG"
+run_recover 424952 "$RB_REPO"
+NEG_REC2="$RB_RDIR/daniel-ospina-agent-infra-424952.json"
+assert_eq "$RB_RC" "0" "20.2 a body with clean-then-not-clean recovers (exit 0)"
+assert_contains "$(cat "$NEG_REC2" 2>/dev/null)" '"verdict":"not-clean"' \
+  "20.2 the LATEST marker wins: verdict=not-clean, NOT the earlier clean (#3410)"
+assert_contains "$(cat "$NEG_REC2" 2>/dev/null)" '"findings":2' \
+  "20.2 …carrying the negative marker's own finding count"
+if command grep -q '"verdict":"clean"' "$NEG_REC2" 2>/dev/null; then
+    bad "20.2 the recovered record says clean — a later NOT CLEAN did not supersede it (recency handling missing)"
+else
+    ok "20.2 …and the superseded clean verdict is not in the record"
+fi
+
+# 20.3 REGRESSION GUARD — the negative verdict must not open a hole in the CLEAN
+# path. §13f proves a clean mint over a NOT-CLEAN artifact refuses; this re-runs
+# that pair AFTER a successful not-clean mint, because the (1b) declared-negative
+# arm is the thing most likely to be refactored while adding a negative family.
+#
+# ⛔ WHAT THIS ARM DOES *NOT* PROVE (review, P3-3): it is NOT a (1b) discriminator.
+# Its artifact carries NO `Outcome:` line, so the LOOSE arm (2) refuses it too on
+# its own (`not[[:space:]_-]*clean`, unsuppressed) — delete arm (1b) entirely and
+# this arm still goes green with rc 3. It is a guard that the CLEAN path still
+# refuses at all, which is worth keeping and is all it claims. The pins that can
+# ONLY pass through (1b) are §13n4/§13n5 (an `**Outcome: CLEAN …**` line, which
+# SUPPRESSES arm (2), plus a declared NOT-CLEAN header) and §20.3b below, which is
+# the same shape placed next to this arm so the claim and its pin travel together.
+rb_clear
+STUB_EVIDENCE_BODY='## Review — NOT CLEAN
+2 P1s remain: unbounded retry, missing auth check.'
+EV_REF="comment:42495301" run_record_ev 424953
+assert_eq "$RECORD_RC" "3" "20.3 a CLEAN mint over a declared-negative artifact still REFUSES (rc 3) — arm (2) alone suffices here; the (1b) pin is 20.3b"
+if [ -f "$(Q2 424953)" ]; then bad "20.3 the refused clean mint wrote a record"; else ok "20.3 …and writes nothing"; fi
+
+# 20.4 `not-clean` DOES NOT BUY A CHEAPER PATH. It is held to `--evidence` exactly
+# as `clean` is: without an artifact it must refuse with exit 3, or a lane could
+# park a PR with a recorded negative it never earned.
+rb_clear
+EV_REF=""
+run_record_neg 424954
+assert_eq "$RECORD_RC" "3" "20.4 a not-clean mint with NO --evidence refuses (exit 3)"
+if [ -f "$(Q2 424954)" ]; then bad "20.4 an unevidenced negative wrote a record"; else ok "20.4 …and writes nothing"; fi
+assert_contains "$RECORD_ERR" "NEGATIVE verdict is still a claim" "20.4 …and says WHY a negative verdict needs evidence"
+
+# 20.5 `--findings` is REQUIRED on not-clean and REFUSED elsewhere. Both are
+# silently wrong otherwise: a negative with no count cannot be reported, and a
+# clean record that swallowed a count looks like it recorded findings it cannot
+# carry.
+NEG_F=0
+EV_REF="comment:42495501"
+run_record_neg 424955
+assert_eq "$RECORD_RC" "2" "20.5 --findings 0 is a contradiction and refuses (rc 2)"
+if [ -f "$(Q2 424955)" ]; then bad "20.5 --findings 0 wrote a record"; else ok "20.5 …and writes nothing"; fi
+NEG_F=1
+run_record_raw 424956 "$SHA" clean "daniel-ospina/agent-infra" --findings 3 $EV_ARGS
+assert_eq "$RECORD_RC" "2" "20.5 --findings on a CLEAN verdict is refused, not silently dropped (rc 2)"
+assert_contains "$RECORD_ERR" "only meaningful with 'not-clean'" "20.5 …and names why"
+
+# ── 20.6 (review P2-1) THE COUNT IS A CANONICAL JSON NUMBER, NOT A SPELLING ──
+# The record writes `"findings":$FINDINGS` UNQUOTED, because every reader binds it
+# as a JSON NUMBER (review-enforcer: `typeof record.findings === "number"`). So a
+# zero-padded count is not cosmetic: `007` emits `"findings":007`, which does not
+# parse, and the gate reads an unparseable record as NO RECORD — the #3400
+# confusion, re-created by the feature that ends it.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX ARM AND CANNOT PASS BY ACCIDENT: before the fix
+# `^[0-9]+$` accepted `007`, `[ 007 -lt 1 ]` was FALSE (bash reads a leading zero
+# as octal) and the raw value was written straight through.
+run_record_neg_cap() { # <pr> [extra args…] — the mint, CAPTURING the posted marker
+    local pr="$1"; shift
+    local rcfile="$T/negrc" errfile="$T/negerr" cap="$T/negcap"
+    rm -f "$errfile"; : > "$cap"
+    (
+        export HOME="$F_HOME"
+        export PATH="$T/bin:$PATH"
+        export GH_STUB_LOG="$LOG"
+        export STUB_CAPTURE="$cap"
+        export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
+        rc=0
+        bash "$RECORD" "$pr" "$SHA" not-clean "daniel-ospina/agent-infra" \
+            --findings "${NEG_F:-1}" --evidence "${EV_REF}" "$@" 2>"$errfile" || rc=$?
+        printf '%s' "$rc" > "$rcfile"
+    ) 2>/dev/null
+    RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
+    RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
+    NEG_CAP="$(cat "$cap" 2>/dev/null || true)"
+    # The PATCH sink holds the gh API ENVELOPE (`{"body":"…\n…"}`), whose marker
+    # line is a `\n`-ESCAPED string rather than a line. Decode it: a round-trip has
+    # to start from the body a reader of the PR would actually see.
+    NEG_BODY="$(command python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["body"])' "$cap" 2>/dev/null || true)"
+    [ -n "$NEG_BODY" ] || NEG_BODY="$NEG_CAP"
+}
+NEG_F=007
+EV_REF="comment:42496001"
+run_record_neg_cap 424961
+assert_eq "$RECORD_RC" "0" "20.6 --findings 007 is ACCEPTED and NORMALISED, not written verbatim (rc 0)"
+NEG_PAD_REC="$(Q2 424961)"
+assert_contains "$(cat "$NEG_PAD_REC" 2>/dev/null)" '"findings":7,' "20.6 …the record carries the canonical integer 7"
+if command grep -q '"findings":007' "$NEG_PAD_REC" 2>/dev/null; then
+    bad "20.6 the record holds a ZERO-PADDED count — that is invalid JSON, and the gate would report 'No review record found'"
+else
+    ok "20.6 …and no zero-padded spelling reached the record"
+fi
+# ⛔ THE ASSERTION THAT ACTUALLY MATTERS: the record PARSES. A string comparison
+# ( `grep` above) cannot tell a valid number from a token that only looks like one.
+if command python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["findings"]==7 and isinstance(d["findings"],int) else 1)' "$NEG_PAD_REC" 2>"$T/negpy"; then
+    ok "20.6 …and the record PARSES as JSON with findings==7 as a NUMBER (not a string)"
+else
+    bad "20.6 the record does not parse as JSON with an integer findings — the gate would read it as NO RECORD: $(command head -1 "$T/negpy" 2>/dev/null)"
+fi
+assert_contains "$NEG_CAP" " findings=7 " "20.6 …the posted marker carries the same canonical count"
+# `08` is the case that made the OLD arm emit a bash error as well as a bad record:
+# `[ 08 -lt 1 ]` aborts with "value too great for base".
+NEG_F=08
+run_record_neg_cap 424962
+assert_eq "$RECORD_RC" "0" "20.6b --findings 08 (the octal-abort case) is accepted and normalised (rc 0)"
+assert_contains "$(cat "$(Q2 424962)" 2>/dev/null)" '"findings":8,' "20.6b …recorded as the canonical integer 8"
+# All-zero spellings are still the 'clean' contradiction, and are still refused.
+NEG_F=00
+run_record_neg_cap 424963
+assert_eq "$RECORD_RC" "2" "20.6c --findings 00 is still the zero-findings contradiction (rc 2)"
+if [ -f "$(Q2 424963)" ]; then bad "20.6c a zero count wrote a record"; else ok "20.6c …and writes nothing"; fi
+# A NON-INTEGER is refused at the input arm, not normalised into existence.
+NEG_F=1.5
+run_record_neg_cap 424964
+assert_eq "$RECORD_RC" "2" "20.6d --findings 1.5 (a float) is refused (rc 2)"
+NEG_F=1
+
+# ── 20.7 (review P3-2) A NOTE CANNOT REBIND THE RECOVERED HEAD ─────────────
+# `--recover-body` used to read the head with a GREEDY `s/.* @ \([0-9a-f]\{40\}\).*/\1/p`,
+# i.e. "the LAST ` @ <40hex>` in the line" — and the line carries the free-form
+# `note=`. A note naming a sha ("also fails at @ <sha>", a plausible thing to
+# write) therefore WON the match and the recovered record bound to a head the
+# negative was never minted at.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX READER: measured, it recovered the NOTE's sha.
+# The marker is SIGNED properly, so this is not an HMAC vector — it is the parse.
+rb_clear
+NEG_H_HEAD="$(printf 'b%.0s' $(seq 1 40))"
+NEG_H_FAKE="$(printf 'a%.0s' $(seq 1 40))"
+NEG_H_DIFF="$(printf '5%.0s' $(seq 1 64))"
+NEG_M_HOSTILE="$(rb_marker 424965 "review recorded: reviews/424965.json verdict=not-clean @ $NEG_H_HEAD diff=$NEG_H_DIFF ($RB_REPO) findings=3 note=also fails at @ $NEG_H_FAKE")" \
+  || bad "fixture: the hostile-note marker could not be BUILT — 20.7 would otherwise pass on a missing marker"
+STUB_BODY="$NEG_M_HOSTILE"
+run_recover 424965 "$RB_REPO"
+NEG_H_REC="$RB_RDIR/daniel-ospina-agent-infra-424965.json"
+assert_eq "$RB_RC" "0" "20.7 a not-clean marker whose NOTE names a sha still recovers (exit 0)"
+assert_contains "$(cat "$NEG_H_REC" 2>/dev/null)" "\"head_sha\":\"$NEG_H_HEAD\"" \
+  "20.7 the recovered head is the MINTED one, not the sha the note names"
+if command grep -q "\"head_sha\":\"$NEG_H_FAKE\"" "$NEG_H_REC" 2>/dev/null; then
+    bad "20.7 the record's HEAD bound to the note's sha — a hostile note moved the head (the greedy-sed defect)"
+else
+    ok "20.7 …and the note's sha is not the head the record binds"
+fi
+assert_contains "$(cat "$NEG_H_REC" 2>/dev/null)" '"findings":3' "20.7 …the finding count survives the hostile note"
+
+# ── 20.8 (review P3-4) THE `--check-carry` NEGATIVE DIAGNOSIS AND THE note= ROUND-TRIP ──
+# `cc_report_negative` / `cc_num_field` had ZERO assertions, so the arm that must
+# stop a lane being told "land it" over an open finding rested on reading alone.
+rb_clear
+NEG_F=02
+EV_REF="comment:42496601"
+# `run_check_carry` reads the live head and the live diff from the fixture globals
+# the 11.13 vectors set; this section owns its own, so a lane asking at the
+# CURRENT head is the vector (the negative report must fire there too).
+CC_HEAD="$SHA"
+CC_DIFF="$T/neg-diff"
+printf '%s\n' 'diff --git a/x b/x' > "$CC_DIFF"
+run_record_neg_cap 424966
+assert_eq "$RECORD_RC" "0" "20.8 fixture: the not-clean record mints (rc 0)"
+run_check_carry 424966 "daniel-ospina/agent-infra"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "reviewed NOT CLEAN at" \
+  "20.8a --check-carry STATES the negative verdict (cc_report_negative) instead of advising 'land it' in silence"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "2 open finding(s)" \
+  "20.8b …naming the COUNT it read back with cc_num_field (--findings 02 normalised to 2)"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "NOT a licence to merge" \
+  "20.8c …and refusing the mis-reading: a carried negative is not a permission"
+# cc_num_field reads an UNQUOTED JSON number and nothing else — the same binding the
+# gate makes (`typeof record.findings === "number"`). A quoted count is therefore
+# NOT a count, and the diagnosis must degrade to "no number" rather than print one.
+rb_clear
+CC_HEAD="$NEG_H_HEAD"
+printf '%s\n' "{\"pr\":424967,\"head_sha\":\"$NEG_H_HEAD\",\"diff_sha256\":\"$NEG_H_DIFF\",\"verdict\":\"not-clean\",\"repo\":\"daniel-ospina/agent-infra\",\"findings\":\"4\"}" > "$(Q2 424967)"
+run_check_carry 424967 "daniel-ospina/agent-infra"
+assert_contains "$(cat "$T/cc-err" 2>/dev/null)" "reviewed NOT CLEAN at" \
+  "20.8d a string-typed findings is still a negative verdict"
+if command grep -q "open finding(s)" "$T/cc-err" 2>/dev/null; then
+    bad "20.8d cc_num_field read a QUOTED findings — it must bind an unquoted number, as the gate does"
+else
+    ok "20.8d …and cc_num_field does NOT report a count it cannot bind as a number"
+fi
+# THE ROUND-TRIP: mint → posted marker → --recover-body, with the note intact.
+rb_clear
+NEG_F=3
+EV_REF="comment:42496801"
+run_record_neg_cap 424968 --findings-note "1 P2 + 2 P3"
+assert_eq "$RECORD_RC" "0" "20.8e fixture: a not-clean record with --findings-note mints (rc 0)"
+assert_contains "$(cat "$(Q2 424968)" 2>/dev/null)" '"findings_note":"1 P2 + 2 P3"' \
+  "20.8e the record carries the note it was given"
+assert_contains "$NEG_CAP" " note=1 P2 + 2 P3" "20.8e …and the POSTED marker carries it as the trailer"
+rb_clear
+STUB_BODY="$NEG_BODY"
+run_recover 424968 "$RB_REPO"
+assert_eq "$RB_RC" "0" "20.8f the minted marker RECOVERS on a box that lost the record (exit 0)"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424968.json" 2>/dev/null)" '"findings_note":"1 P2 + 2 P3"' \
+  "20.8f …with the note= ROUND-TRIPPED, not dropped"
+assert_contains "$(cat "$RB_RDIR/daniel-ospina-agent-infra-424968.json" 2>/dev/null)" '"findings":3' \
+  "20.8f …and the count alongside it"
+unset NEG_CAP NEG_BODY STUB_BODY
+
+# ── 20.9 (review P3-5) THE SECOND WRITER OF THE UNQUOTED COUNT ─────────────
+# `--recover-body` writes `"findings":$RB_FINDINGS` — the SAME unquoted JSON number
+# the mint writes, and for the same reason (every reader binds `typeof … ===
+# "number"`) — but it filtered the marker's value with `*[!0-9]*` ONLY. So the
+# P2-1 canonicaliser the mint holds was never applied on the second writer.
+# Measured: `findings=007` (admissible by RB_RE's `findings=[0-9]+`) recovered to
+# `"findings":007`, which does not parse, so the gate read NO RECORD — while the
+# file now EXISTED, so the next recovery refused ("recovery fills an ABSENCE").
+# A dead end needing manual removal, created by the one verb whose purpose is to
+# avoid a dead end — strictly worse than the absent record it replaced.
+#
+# ⛔ THIS ARM FAILS ON THE PRE-FIX WRITER: `007` was written verbatim (the record
+# does not parse) and `00` was written as `"findings":00` with exit 0, where the
+# mint refuses a zero count outright ('not-clean' with zero findings IS 'clean').
+rb_clear
+NEG_Z_HEAD="$(printf 'e%.0s' $(seq 1 40))"
+NEG_Z_DIFF="$(printf '6%.0s' $(seq 1 64))"
+NEG_M_ZPAD="$(rb_marker 424970 "review recorded: reviews/424970.json verdict=not-clean @ $NEG_Z_HEAD diff=$NEG_Z_DIFF ($RB_REPO) findings=007")" \
+  || bad "fixture: the zero-padded marker could not be BUILT — 20.9 would otherwise pass on a missing marker"
+export STUB_BODY="$NEG_M_ZPAD"
+run_recover 424970 "$RB_REPO"
+NEG_Z_REC="$RB_RDIR/daniel-ospina-agent-infra-424970.json"
+assert_eq "$RB_RC" "0" "20.9 a signed marker carrying findings=007 recovers (exit 0)"
+assert_contains "$(cat "$NEG_Z_REC" 2>/dev/null)" '"findings":7,' "20.9 …writing the CANONICAL count 7, not the marker's spelling"
+if command grep -q '"findings":007' "$NEG_Z_REC" 2>/dev/null; then
+    bad "20.9 the recovered record holds a ZERO-PADDED count — invalid JSON, so the gate reads NO record while the file blocks the next recovery"
+else
+    ok "20.9 …and no zero-padded spelling reached the recovered record"
+fi
+# ⛔ THE ASSERTION THAT MATTERS: the record PARSES. `grep` cannot tell a valid
+# number from a token that only looks like one — and the consequence a reader sees
+# is a JSONDecodeError, then a permanent "a record already exists" refusal.
+if command python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["findings"]==7 and isinstance(d["findings"],int) else 1)' "$NEG_Z_REC" 2>"$T/negzpy"; then
+    ok "20.9 …and the recovered record PARSES as JSON with findings==7 as a NUMBER"
+else
+    bad "20.9 the recovered record does not parse as JSON with an integer findings — the gate would read it as NO RECORD: $(command head -1 "$T/negzpy" 2>/dev/null)"
+fi
+# The other half: `00` is not a count, it is the 'clean' contradiction. Recovery
+# must REFUSE and leave NO file, or the refusal itself becomes the dead end.
+rb_clear
+NEG_M_ZERO="$(rb_marker 424971 "review recorded: reviews/424971.json verdict=not-clean @ $NEG_Z_HEAD diff=$NEG_Z_DIFF ($RB_REPO) findings=00")" \
+  || bad "fixture: the zero-count marker could not be BUILT — 20.9b would otherwise pass on a missing marker"
+export STUB_BODY="$NEG_M_ZERO"
+run_recover 424971 "$RB_REPO"
+assert_eq "$RB_RC" "3" "20.9b a marker carrying findings=00 is REFUSED (exit 3) — zero findings is what 'clean' means"
+if [ -f "$(Q2 424971)" ]; then bad "20.9b a zero-count marker wrote a record"; else ok "20.9b …and writes nothing, so no unparseable file is left blocking the next recovery"; fi
+unset STUB_BODY
+
+# 20.3b REGRESSION GUARD, shape of 13n4/13n5 — the arm that ACTUALLY pins (1b).
+# 20.3 above does NOT (review, P3-3): its artifact has no `Outcome:` line, so the
+# loose arm (2) refuses it too and deleting (1b) leaves 20.3 green. The genuine
+# (1b)-only shape is `**Outcome: CLEAN …**` PLUS a declared NOT-CLEAN header: the
+# Outcome line SUPPRESSES arm (2), so only the declared-negative arm (1b) can
+# refuse. This arm is 20.3's real discriminator, next to it so the claim and the
+# pin travel together.
+rb_clear
+STUB_EVIDENCE_BODY='**Outcome: CLEAN — verified, no issues.**
+
+## Review — NOT CLEAN
+1 P1 remains: the retry loop re-reads the claim after the lock is released.'
+EV_REF="comment:42496901" run_record_ev 424969
+assert_eq "$RECORD_RC" "3" "20.3b (1b) refuses a CLEAN mint whose artifact declares NOT CLEAN even when an Outcome: CLEAN line suppresses arm (2) (rc 3)"
+if [ -f "$(Q2 424969)" ]; then bad "20.3b the refused clean mint wrote a record"; else ok "20.3b …and writes nothing"; fi
+assert_contains "$RECORD_ERR" "DECLARES a non-clean outcome" "20.3b …and names the declaration it refused on, which only (1b) can see"
+NEG_F=1
+EV_REF="comment:42495501"
 
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"

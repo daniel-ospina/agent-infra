@@ -913,7 +913,15 @@ sync_review_registry() {
     log_line "atomic-land: DRY RUN — skipping the cross-box registry union (it writes to the local registry)"
     return 0
   fi
-  out="$(bash "$sync" union 2>&1)" || rc=$?
+  # ⛔ THE RUN MUST NOT BE SILENT (agent-infra#3180), AND THE EXIT MUST BE THE SYNC'S.
+  # `out="$(…)"` swallowed every byte the sync wrote until it finished: on a loaded box a run that
+  # spent 26 minutes in the per-record loop showed a 0-byte log, and an operator could not tell
+  # "syncing" from "hung". `tee /dev/stderr` inside the substitution shows it LIVE while `out` keeps
+  # exactly what it held before (both streams, as `2>&1` already folded them in).
+  # ⛔ AND THE EXIT IS TAKEN INSIDE THE SUBSTITUTION: `${PIPESTATUS[0]}` read AFTER the assignment
+  # names the ASSIGNMENT's status, not the pipeline's (measured: a sync exiting 4 was reported rc=0,
+  # i.e. CONVERGED — a false PASS on the one signal that says the fleet's records are UNKNOWN).
+  out="$( bash "$sync" union 2>&1 | tee /dev/stderr; exit "${PIPESTATUS[0]}" )" || rc=$?
   case "$rc" in
     0) log_line "atomic-land: registry union — $(printf '%s\n' "$out" | grep -E '^union:' | tail -1)"
        # A converged run can still carry per-record notices, and this arm used to drop every one of

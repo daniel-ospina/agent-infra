@@ -183,13 +183,67 @@ ACCOUNT_FLEET_SIZE = cfg_int("GH_LIMIT_ACCOUNT_FLEET_SIZE", 4, 1, 64)
 ACCOUNT_BUDGET_PER_HOUR = cfg_int("GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR", 5000, 60, 100000)
 ACCOUNT_SAFETY = max(0.1, min(_finite("GH_LIMIT_ACCOUNT_SAFETY", 0.8), 1.0))
 ACCOUNT_WINDOW_S = cfg_secs("GH_LIMIT_ACCOUNT_WINDOW_S", 60, 10, 3600)
-# WHICH buckets are partitioned. `graphql` by default: that is the measured exhaustion (#1762/#1939)
-# and the bucket the heartbeat's ~513-call refresh bursts use. `core` is deliberately NOT paced by
-# default — #1962/#2137 move the hot reads ONTO REST, so pacing REST here would push the fleet back
-# onto the bucket that is already refusing. An operator who measures core pressure opts in with
-# `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`.
+# WHICH buckets are partitioned. BOTH, and `core` is the reversal of an earlier default that had a
+# MEASURED premise which has since inverted.
+#
+# ⛔ THE OLD DEFAULT (agent-infra#2137) WAS `graphql` ONLY, and its reasoning was sound WHEN WRITTEN:
+# the measured exhaustion was graphql (#1762/#1939), the heartbeat's ~513-call refresh bursts spend
+# graphql, and #1962/#2137 had just moved the hot reads ONTO REST — so pacing REST looked like it
+# would push the fleet back onto a bucket that was already refusing. It was written as an operator
+# opt-in for exactly the case where that premise stopped holding: "An operator who measures core
+# pressure opts in with `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`".
+#
+# ⛔ THAT OPT-IN IS NOW THE DEFAULT, because the premise inverted and was measured (2026-11-03,
+# 01:34Z / 01:41Z): `core` was at 0/5000 — every `gh run list`, `gh run view` and `gh api` in the
+# fleet refused with "API rate limit exceeded for user ID 81560491" — while `graphql` sat at
+# 4973/5000, i.e. the ONE bucket the partition covered was ~99% UNUSED while the bucket it
+# deliberately ignored was the one at zero. The dominant consumer is now REST: `admin-merge.sh`'s
+# waits poll `gh run list` (FIRST-CHECKS) and `gh run view` (re-run wait) per lane, and ~20 lanes
+# share this account. A partition that bounds the idle bucket while leaving the spent one unbounded
+# is the defect it was meant to prevent.
+#
+# ⛔ WHY THIS IS PACING AND NOT A RAIL CHANGE: the share is a per-box SLIDING WINDOW over a file
+# lock (`_budget_take`), so the fleet's REST calls serialise instead of bursting, and the rail's own
+# decisions, bounds and verdicts are untouched — a paced call arrives later, never differently.
+# ⛔ AND WHY IT CANNOT STARVE A BOX: the floor is 1 call/window (`account_share`), a `NO_WAIT`
+# caller proceeds and RECORDS the overdraw instead of parking (`budget_gate`), and a slot more than
+# `MAX_WAIT` away is refused with 75 rather than held — a slow fleet, never a dead one.
+# ⛔ THE ESCAPE HATCH IS KEPT, inverted: `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql` restores the
+# old behaviour for an operator who measures the opposite pressure.
 ACCOUNT_PARTITION_BUCKETS = tuple(
-    b.strip().lower() for b in cfg("GH_LIMIT_ACCOUNT_PARTITION_BUCKETS", "graphql").split(",") if b.strip())
+    b.strip().lower() for b in cfg("GH_LIMIT_ACCOUNT_PARTITION_BUCKETS", "graphql,core").split(",") if b.strip())
+
+
+def budget_token(remaining, reset):
+    """`GH-BUDGET(remaining=<n>, resets_at=<ISO-8601|?>)` — the ONE cheap read for the fleet.
+
+    ⛔ WHY A SECOND TOKEN RATHER THAN A NEW VERB. The heartbeat, `fleet_state.py` and every lane
+    already read `--health` (local files only: no request, no credentials, no quota) at the exact
+    moment every `gh` call is being refused. Putting the budget on THAT line costs zero new calls
+    and means the datum is where the reader already looks — so the next beat can tell QUOTA
+    EXHAUSTION from a PRODUCT FAULT instead of filing the second as the first (the 2026-11-03
+    incident: three lanes reported a "broken rail" that was an account at 0/5000).
+
+    ⛔ `resets_at=?` IS NOT A TIMESTAMP NOBODY MEASURED, and it is never omitted: an UNDATED record
+    (one whose refusal carried no `reset`/`remaining` header — `fail_loudly`'s `rem is None` arm,
+    `record_core_exhausted(None, None)`) has an UNKNOWN window, and printing a synthetic 15m one is
+    the wrong-window failure `health_token` already documents for `resets_in`. A reader that needs
+    the number gets `?`, which is the truth.
+    ⛔ AND `remaining` IS PASSED IN, NOT RE-DERIVED, because the two facts are not always the same:
+    a dated exhaustion state is a MEASURED 0, while an UNDATED record stores `remaining=?` (no call
+    ever counted one), so hard-coding 0 here would report a measurement nobody made — the exact
+    defect `resets_at=?` refuses. `None` renders `?` for the same reason.
+    ⛔ `OverflowError` IS CAUGHT: `time.gmtime` raises it (not ValueError) for an out-of-range reset,
+    and a corrupt health record would then take the ONE verb that works during an outage down with a
+    traceback and rc 1 — a shape this file already pins (`test L22`, "one 24-digit name raised
+    OverflowError out of state_dir()")."""
+    try:
+        iso = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(int(reset)))
+               if reset is not None else "?")
+    except (TypeError, ValueError, OverflowError, OSError):
+        iso = "?"
+    shown = "?" if remaining is None else remaining
+    return "GH-BUDGET(remaining=%s, resets_at=%s)" % (shown, iso)
 # A marker older than this is not evidence about now (matches `orch-loop.sh`'s GH_LIMIT_STALE_S).
 MARKER_MAX_AGE = cfg_secs("GH_LIMIT_MARKER_MAX_AGE", 900, 60, 86400)
 # A wait longer than this is worth ONE exempt REST read before committing to it (requirement 3).
@@ -2984,6 +3038,15 @@ def classify(res, argv, headers):
     """
     if res.rc == 0:
         return None
+    # ⛔ A CONTENDED VERDICT IS NOT A LIMIT. `scripts/gh-shim/gh` exits 75 (EX_TEMPFAIL) when a
+    # shared cooldown outlived its own wait budget and no exempt read cleared it (#3230/#3228). That
+    # says "I could not ask", NOT "the account is out of quota": classifying it as a limit retries a
+    # budget that was already spent (4 attempts under the shim's own 120 s), sleeps 60/120/240 s on
+    # top, and lets `record_limit` write a box-wide `last-limit` marker for a refusal that never
+    # happened — blocking OTHER lanes. Keyed on the rc, never on the message, because the message is
+    # prose and prose drifts (#3228 review, finding 1).
+    if res.rc == 75:
+        return None
     text = (res.err or b"").decode("utf-8", "replace")
     # The status the RESPONSE carried beats a regex over stderr: gh's error prose is not an API.
     status = res.status
@@ -3716,7 +3779,8 @@ def health_token():
             if mreset <= clock():
                 return "gh-ok", 0
             if rem == 0:
-                return "gh-core-exhausted resets_in=%s" % resets_in(mreset), 3
+                return ("gh-core-exhausted resets_in=%s %s"
+                        % (resets_in(mreset), budget_token(0, mreset)), 3)
             # ⛔ THE LOW-WATER BAND IS NOT EXHAUSTION — the same distinction `core_pressure` makes for
             # writes. An operator reading `gh-core-exhausted` at remaining=50 would chase a window that
             # has not started; the failover is a transport choice, not a pool state.
@@ -3732,7 +3796,8 @@ def health_token():
         # line, from the one verb an operator is told to trust (measured, review round 6).
         rec_reset = core_record_reset()
         if rec_reset is not None:
-            return "gh-core-exhausted resets_in=%s" % resets_in(rec_reset), 3
+            return ("gh-core-exhausted resets_in=%s %s"
+                    % (resets_in(rec_reset), budget_token(0, rec_reset)), 3)
         # ⛔ “I COULD NOT READ THE RECORD” IS NOT “THE POOL IS FINE”. A record that exists but cannot be
         # parsed (a truncated write, a hand edit, a version skew) used to be served as `gh-ok` rc 0 — an
         # answer that was never obtained, reported as healthy, from the one verb an operator trusts at
@@ -3742,8 +3807,11 @@ def health_token():
             return "gh-health-unknown", 3
         return "gh-ok", 0
     if not dated:
-        return "gh-core-exhausted resets_in=?", 3
-    return "gh-core-exhausted resets_in=%s" % resets_in(reset), 3
+        # An UNDATED record has no reset to name and NO MEASURED COUNT (`remaining=?` in the record),
+        # so the cheap read says so for both rather than inventing either (see budget_token).
+        return "gh-core-exhausted resets_in=? %s" % budget_token(None, None), 3
+    return ("gh-core-exhausted resets_in=%s %s"
+            % (resets_in(reset), budget_token(0, reset)), 3)
 
 
 # ── the GraphQL equivalents (EXACT bodies only) ──────────────────────────────────────────────

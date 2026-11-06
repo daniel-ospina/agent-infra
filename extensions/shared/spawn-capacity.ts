@@ -438,7 +438,7 @@ export function describeSpawnCapacity(
     `   → This is a ${spawnFaultLabel(cls)}, NOT a compliance one: ${headline},`,
     "     so re-running the blocked git operation cannot satisfy this floor — the datum it needs is a",
     "     reviewer VERDICT, not a retry of the same command.",
-    "     NOTHING IN THE BLOCKED COMMAND RAN (a blocked tool call is a no-op).",
+    "     THIS REFUSAL blocked THIS call, so THAT command did not run.",
     "   → WHAT THIS GATE COULD NOT SEE: which PROMPT a failed dispatch carried. It reads the spawn",
     "     RESULT, so an intended reviewer and any other sub-agent are the same event here — the tool",
     "     and the evidence above are all it has.",

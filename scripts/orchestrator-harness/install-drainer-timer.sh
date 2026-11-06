@@ -13,10 +13,11 @@
 # controller and the backlog the drainer exists for may belong to a repo that controller is not bound
 # to at all — and the fleet already schedules periodic one-shots this way.
 # ⛔ This paragraph used to say the drainer's lock "must OUTLIVE its own pass (it waits up to
-# LANE_TIMEOUT=3000s for the lane it dispatched), so a role would block the loop's merge and doctor
-# passes and trip the loop's stall bound". That described #2639's lock scope, which is WITHDRAWN: the
-# lock now covers ONE TICK'S CRITICAL SECTION (settle → census → target → dispatch) and the tick never
-# waits for a lane — a lane that outlives its tick is simply counted by the next one. See templates/systemd/eldato-ai-drainer.service for the full reasoning (and
+# LANE_TIMEOUT — the lane's backstop — for the lane it dispatched), so a role would block the loop's merge
+# and doctor passes and trip the loop's stall bound". That described #2639's lock scope, which is
+# WITHDRAWN: the lock now covers ONE TICK'S CRITICAL SECTION (settle → census → target → dispatch) and the
+# tick never waits for a lane — a lane that outlives its tick is simply counted by the next one. See
+# templates/systemd/eldato-ai-drainer.service for the full reasoning (and
 # for why the bring-up does not install it: a lane dispatcher is per-repo and costs model spend, so
 # it is an explicit, per-cell operator step, exactly like the disk reaper's arming).
 #
@@ -36,6 +37,7 @@
 #   DRAINER_STATE      the drainer's state dir ($AI)                   default: $HOME/orchestrator-ai
 #   DRAINER_REPO_SLUG  owner/name the brief names                      default: daniel-ospina/agent-infra
 #   DRAINER_SEED_REPO  checkout the lane's worktree is branched from    default: $HOME/agent-infra-main
+#   DRAINER_FLEET_REPO checkout whose origin carries refs/boxes/*      default: $DRAINER_SEED_REPO
 #   MAX_LANES          CPU-side ceiling of the lane target. RENDERED BLANK by default, so the unit
 #                      carries no pin and the drainer DERIVES it from this box's cores on every tick
 #                      (floor(ncpu x 5/2), the fleet's 2026-10-17 ruling) — a value rendered here is a
@@ -70,6 +72,16 @@ DRAINER_O="${DRAINER_O:-$HOME_DIR/orchestrator}"
 DRAINER_STATE="${DRAINER_STATE:-$HOME_DIR/orchestrator-ai}"
 DRAINER_REPO_SLUG="${DRAINER_REPO_SLUG:-daniel-ospina/agent-infra}"
 DRAINER_SEED_REPO="${DRAINER_SEED_REPO:-$HOME_DIR/agent-infra-main}"
+# The queue repo whose origin carries `refs/boxes/*`. Rendered into the unit so the fleet line can say
+# WHICH channel it read (`chan=`). The seed checkout is the default because it carries the same origin
+# on this fleet — and ⛔ AN INSTALLED UNIT DOES NOT RE-CHECK THAT (fresh review round 12, P2; the
+# comment that stood here claimed the opposite). The drainer's seed-origin guard runs ONLY while
+# `FLEET_REPO` is EMPTY (`ai-drainer.sh`: `[ -z "$FLEET_REPO" ] && [ -n "${SEED_REPO:-}" ] …`), and this
+# installer always renders `Environment=FLEET_REPO={{FLEET_REPO}}`, so on every unit it writes that
+# guard is DEAD CODE. What the installed path does get is ATTRIBUTION: `chan=` stamps the channel it
+# actually read, so a wrong-but-readable seed reports `published=0 INELIGIBLE=N … chan=<that repo>` —
+# named, not silent. Override `DRAINER_FLEET_REPO` when the seed checkout is not the fleet's channel.
+DRAINER_FLEET_REPO="${DRAINER_FLEET_REPO:-$DRAINER_SEED_REPO}"
 SYSTEMCTL="${SYSTEMCTL:-}"
 SUDO="${SUDO:-sudo -n}"
 
@@ -113,6 +125,20 @@ resolve_target || {
 }
 [ -n "${SYSTEMCTL:-}" ] || SYSTEMCTL="$([ "$TARGET" = system ] && printf 'sudo -n systemctl' || printf 'systemctl --user')"
 
+# ⛔ THE LANE'S BOUND IS RENDERED FROM THE SEAM, NOT FROM A LOCAL LITERAL (agent-infra#2888 review,
+# P2 — verified). This used to render `${LANE_TIMEOUT:-3000}` at INSTALL time into an `Environment=` PIN,
+# and a pin WINS over the script's own default — so on every box this installer touched,
+# `ai-drainer.sh`'s `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` could never take effect and drainer
+# lanes stayed killed at 50 min: 300 s above the 2700 s progress allowance, i.e. the censoring survived
+# on the box whose job is to drain the backlog, and raising `LANE_BACKSTOP_S` changed nothing there.
+# Resolved ONCE here, from the harness copy being installed, so the two cannot drift.
+DRAINER_LANE_TIMEOUT="${LANE_BACKSTOP_S:-}"
+if [ -z "$DRAINER_LANE_TIMEOUT" ]; then
+    DRAINER_LANE_TIMEOUT="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' \
+                              "$(dirname "${BASH_SOURCE[0]}")/spawn-gate.sh" 2>/dev/null | head -1)"
+fi
+case "$DRAINER_LANE_TIMEOUT" in ''|*[!0-9]*|0) DRAINER_LANE_TIMEOUT=7200 ;; esac
+
 render() { # <template> <dest>
     local v tmp
     # ⛔ RENDER TO A TEMP FILE AND CHECK THE RESULT. Writing straight to "$2" let the shell truncate
@@ -127,9 +153,10 @@ render() { # <template> <dest>
         -e "s|{{AI}}|$DRAINER_STATE|g" \
         -e "s|{{REPO_SLUG}}|$DRAINER_REPO_SLUG|g" \
         -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
+        -e "s|{{FLEET_REPO}}|$DRAINER_FLEET_REPO|g" \
         -e "s|{{MAX_LANES}}|${MAX_LANES:-}|g" \
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
-        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-3000}|g" \
+        -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}|g" \
         -e "s|{{DRAINER}}|$DRAINER|g" \
         "$1" >"$tmp" || { rm -f "$tmp"; err "sed could not render $1 (a value carries '|' or '&'?) — refusing to install a partial unit"; return 1; }
     # A value carrying `|`/`&` corrupts the substitution; a leftover `{{…}}` means a placeholder

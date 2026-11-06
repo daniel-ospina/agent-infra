@@ -105,9 +105,13 @@ chmod +x "$DISPATCH"
 #   RUN_WT_MOD      worker-terminal.sh for the launcher census     default: a path that does not exist
 _drainer_env() { # <tag> → echoes the env assignments, one per line (callers use `env`)
   local o="$ROOT/o-$1" ai="$ROOT/ai-$1"
+  # The channel: the fixture seed by default, `RUN_FLEET_REPO` to name one, and `RUN_NO_FLEET_REPO=1` for
+  # "nothing configured" — a state the drainer must REFUSE by name rather than resolve to a lane checkout.
+  local _fleet_v="${RUN_FLEET_REPO:-$SEED}"
+  [ "${RUN_NO_FLEET_REPO:-0}" = 1 ] && _fleet_v=""
   mkdir -p "$o/bg" "$ai"
   printf '%s\n' \
-    "O=$o" "AI=$ai" "DISPATCH=$DISPATCH" "SEED_REPO=$SEED" "SEED_REF=$SEED_REF" \
+    "O=$o" "AI=$ai" "DISPATCH=$DISPATCH" "SEED_REPO=${RUN_SEED_REPO:-$SEED}" "SEED_REF=$SEED_REF" \
     "TARGET_LANES=${RUN_TARGET:-}" "MAX_LANES=${RUN_MAX_LANES:-}" \
     "NCPU=${RUN_NCPU:-4}" "MEM_AVAIL_MB=${RUN_MEM:-8192}" "LOAD1_100=${RUN_LOAD:-100}" \
     "SWAP_TOTAL_MB=${RUN_SWAP_TOTAL:-9999}" "SWAP_FREE_MB=${RUN_SWAP:-9999}" \
@@ -117,6 +121,7 @@ _drainer_env() { # <tag> → echoes the env assignments, one per line (callers u
     "LANE_TIMEOUT=${RUN_LANE_TIMEOUT:-60}" "PS=${RUN_PS:-ps}" \
     "SLICE_WIDTH=${RUN_SLICE_WIDTH:-10}" "SLICE_TOTAL=${RUN_SLICE_TOTAL:-70}" \
     "FAKE_LANE_SECS=${FAKE_LANE_SECS:-0}" "FAKE_RC=${FAKE_RC:-0}" "FAKE_NO_PIDFILE=${FAKE_NO_PIDFILE:-0}" \
+    "FLEET_REPO=${_fleet_v}" "CAPACITY_MOD=${RUN_CAPACITY_MOD:-}" "CAP_EXPECTED_BOXES=${RUN_EXPECTED:-}" \
     "FAKE_DISPATCH_SLEEP=${FAKE_DISPATCH_SLEEP:-0}" \
     "RC_GRACE_S=${RUN_RC_GRACE:-2}"
   return 0
@@ -135,7 +140,10 @@ run_drainer_fg() { # <tag> [drainer-path] → sets LAST_RC
   local -a envs
   envs=()
   while IFS= read -r line; do envs+=("$line"); done < <(_drainer_env "$tag")
-  env -u SWAP_FREE_MB -u SWAP_TOTAL_MB "${envs[@]}" bash "$script" >/dev/null 2>&1
+  # ⛔ THE OPERATOR'S `REPO` MUST NOT DECIDE THIS SUITE'S CHANNEL (fresh review round 7). The drainer's own
+  # default chain is `FLEET_REPO -> REPO -> (refuse)`, and a lane shell routinely exports `REPO` for its
+  # own work; inheriting it made (f3) read a REAL fleet channel instead of the fixture's originless seed.
+  env -u REPO -u SWAP_FREE_MB -u SWAP_TOTAL_MB "${envs[@]}" bash "$script" >/dev/null 2>&1
   LAST_RC=$?
   LAST_O="$ROOT/o-$tag"; LAST_AI="$ROOT/ai-$tag"
   return 0
@@ -157,6 +165,7 @@ reset_run() {
   RUN_TARGET=; RUN_MAX_LANES=; RUN_NCPU=; RUN_MEM=; RUN_LOAD=; RUN_SWAP=; RUN_SWAP_TOTAL=
   RUN_LANE_TIMEOUT=; RUN_SLICE_WIDTH=; RUN_SLICE_TOTAL=; RUN_RC_GRACE=; RUN_WT_MOD=; RUN_PS=
   RUN_DRAINER_OS=; RUN_PRESSURE=; RUN_MAX_PRESSURE=
+  RUN_FLEET_REPO=; RUN_NO_FLEET_REPO=0; RUN_SEED_REPO=; RUN_CAPACITY_MOD=; RUN_EXPECTED=
   FAKE_LANE_SECS=0; FAKE_RC=0; FAKE_NO_PIDFILE=0; FAKE_DISPATCH_SLEEP=0
 }
 # A lane-shaped live process in $O/bg, so the CENSUS sees it. A pidfile alone is not enough (the
@@ -705,17 +714,25 @@ reset_run
 # lock, and both dispatch. `mv` can only succeed once.
 o="$ROOT/o-m2"; ai="$ROOT/ai-m2"; mkdir -p "$o/bg" "$ai/state"
 mkdir -p "$ai/state/ai-drainer.lock"; printf '999999' >"$ai/state/ai-drainer.lock/pid"   # dead holder
+: >"$ROOT/pids-m"
 for i in 1 2 3; do
   ( O="$o" AI="$ai" DISPATCH="$DISPATCH" SEED_REPO="$SEED" SEED_REF="$SEED_REF" \
     NCPU=4 MEM_AVAIL_MB=8192 LOAD1_100=100 SWAP_TOTAL_MB=9999 SWAP_FREE_MB=9999 \
     WT_MOD="$ROOT/no-such-worker-terminal.sh" TARGET_LANES=2 LANE_TIMEOUT=60 \
-    FAKE_LANE_SECS=90 RC_GRACE_S=1 bash "$DRAINER" >/dev/null 2>&1 & echo "$!" >>"$ROOT/pids" ) 2>/dev/null
+    FAKE_LANE_SECS=90 RC_GRACE_S=1 bash "$DRAINER" >/dev/null 2>&1 & echo "$!" >>"$ROOT/pids-m" ) 2>/dev/null
 done
 i=0; while [ "$i" -lt 100 ]; do
   [ "$(grep -c 'START:' "$ai/logs/ai-drainer.log" 2>/dev/null || echo 0)" -ge 1 ] && break
   sleep 0.2; i=$((i + 1))
 done
-sleep 2                                 # let every contender get through the guard
+# ⛔ WAIT FOR THE CONTENDERS TO EXIT, NOT FOR A FIXED WINDOW (review round 3). Each tick now also takes
+# the fleet reading (a `git ls-remote`, a provider probe, an `awk` pass) before its guards, so a fixed
+# `sleep 2` that was ample when a tick only probed the local box can close while a slow contender is
+# still inside its guard — measured 1 red in 4 runs on this branch, 0 in 2 on the pre-change tree. The
+# determinate event is EXIT; the bound only stops a hung tick from hanging the suite.
+for pid in $(cat "$ROOT/pids-m" 2>/dev/null); do
+  i=0; while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 150 ]; do sleep 0.2; i=$((i + 1)); done
+done
 check "(m) three ticks racing over ONE stale lock dispatch from exactly ONE of them" \
   '[ "$(grep -c "START:" "$ai/logs/ai-drainer.log" 2>/dev/null || echo 0)" -eq 1 ] && [ "$(dispatched "$ai/logs/ai-drainer.log")" -eq 2 ]' \
   "starts=$(grep -c 'START:' "$ai/logs/ai-drainer.log" 2>/dev/null) dispatched=$(dispatched "$ai/logs/ai-drainer.log")"
@@ -828,6 +845,19 @@ SC_EOF
       && grep -q "active" <<<"$out"' "rc=$rc · $(printf "%s" "$out" | tail -1)"
   check "installer: the installed service carries an ExecStart" \
     'grep -q "^ExecStart=" "$T/units/eldato-ai-drainer.service"'
+  # ⛔ THE UNIT IS AN `Environment=` PIN, SO WHATEVER IS RENDERED HERE WINS FOREVER (agent-infra#2888
+  # review, P2 — verified). It used to render a retired 3000 s literal, which shadowed
+  # ai-drainer.sh's own `${LANE_TIMEOUT:-${LANE_BACKSTOP_S:-7200}}` on every installed box: drainer lanes
+  # stayed capped at 50 min (300 s above the 2700 s progress allowance) and raising the seam changed
+  # nothing there — the censoring surviving on the box whose job is to drain the backlog. Rendered with
+  # LANE_TIMEOUT scrubbed so this measures the SEAM, not whatever the harness env happens to carry.
+  T4="$ROOT/inst4"; mkdir -p "$T4"
+  SEAM_T="$(sed -n 's/^LANE_BACKSTOP_S="${LANE_BACKSTOP_S:-\([0-9][0-9]*\)}".*/\1/p' "$HERE/spawn-gate.sh" | head -1)"
+  ( unset LANE_TIMEOUT; PATH="$T/bin:$PATH" SYSTEMD_UNIT_DIR="$T4/units" DRAINER="$DRAINER" \
+      DRAINER_STATE="$T4/state" DRAINER_O="$T4" bash "$INSTALLER" >/dev/null 2>&1 )
+  check "installer: the installed unit pins LANE_TIMEOUT to the SEAM (${SEAM_T:-?}s), not a retired 3000s literal" \
+    'v="$(sed -n "s/^Environment=LANE_TIMEOUT=//p" "$T4/units/eldato-ai-drainer.service" 2>/dev/null)"; [ -n "$SEAM_T" ] && [ "$v" = "$SEAM_T" ]' \
+    "rendered='$(sed -n 's/^Environment=LANE_TIMEOUT=//p' "$T4/units/eldato-ai-drainer.service" 2>/dev/null)' seam='${SEAM_T:-}'"
 else
   bad "installer missing at $INSTALLER"
 fi
@@ -859,6 +889,110 @@ if [ -f "$LAUNCHER" ]; then
 else
   bad "launcher missing at $LAUNCHER"
 fi
+
+# ── THE FLEET LINE: EXPECTED vs PUBLISHED (agent-infra#3446) ──────────────────────────────────
+# A drainer measures THIS box (target, census, guards), so a tick that tops up one box while four of
+# five cells have gone silent is inert for the fleet and looks healthy from inside. MEASURED
+# 2026-11-04: `cmux vm ls` reported 5 of 5 machines running while `refs/boxes/*` held ONE ref, and the
+# conclusion drawn was "there is no usable remote capacity" while ~87 lanes sat idle. Each tick now
+# reports the reconciliation, and these arms grade that it is taken — and that it never fabricates a
+# healthy one when the instrument is missing.
+echo
+# ⚠️ RUNNING THIS SUITE FROM A LANE WORKTREE: a direct `bash scripts/orchestrator-harness/ai-drainer.test.sh`
+# is refused by the worktree guard (`Working-tree discard blocked … script-indirection`) because it reads
+# every `bash <operand>` in this file and several are `$VAR` paths — this suite's own fixture dispatcher
+# included, so changing the SPELLING does not lift it (measured 2026-11-05). The route that works is the
+# shard runner, which invokes the suite by a literal path:
+#   HARNESS_SUITE_ALLOW_LIVE_CELL=1 BASH_SHARD_SLICE=<i>/<n> bash scripts/run-bash-shards.sh
+# Recorded on #3243. CI is unaffected — the same glob covers this file there.
+echo "== the fleet line (#3446) =="
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1 cell-2:10.0.0.2"
+run_drainer_fg fleet
+FL="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f1) every tick that owns the lock logs ONE fleet line ($(printf '%s' "$FL" | head -1))" \
+  '[ "$(grep -c "fleet:" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)" -eq 1 ]'
+check "(f2) the line carries expected/published/INELIGIBLE and its source" \
+  'grep -q "fleet: expected=2 " <<<"$FL" && grep -q "published=" <<<"$FL" && grep -q "INELIGIBLE=" <<<"$FL" && grep -q "src=roster" <<<"$FL"'
+# ⛔ THE CHANNEL HERE HAS NO ORIGIN, SO THE READING IS `UNREADABLE` — NOT `published=0`. A zero would be
+# a claim that nobody publishes on a fleet whose channel was never read, which is the defect itself.
+check "(f3) an unreadable channel reads published=UNREADABLE, never published=0" \
+  'grep -q "published=UNREADABLE" <<<"$FL" && ! grep -q "published=0" <<<"$FL"'
+# And with NO instrument beside the drainer the tick still says so, by name: silence here would make a
+# box that cannot see the fleet indistinguishable from one on a healthy fleet.
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_CAPACITY_MOD="$ROOT/no-such-capacity.sh"
+run_drainer_fg fleet2
+FL2="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f4) a missing instrument is NAMED (why=capacity.sh-unreachable), never silence ($(printf '%s' "$FL2" | head -1))" \
+  'grep -q "why=capacity.sh-unreachable" <<<"$FL2" && grep -q "expected=UNKNOWN" <<<"$FL2"'
+# ⛔ "ABSENT" AND "PRESENT BUT STALE" ARE DIFFERENT STATES WITH DIFFERENT REMEDIES (review round 2).
+# The stale case is a module that sources cleanly and lacks `cap_fleet_line` — the case the controller's
+# own `declare -f` interface gate exists for. Naming a present file "unreachable" sends the operator to
+# the wrong remedy, and `published=UNKNOWN` is outside the vocabulary the instrument emits.
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_CAPACITY_MOD="$ROOT/stale-capacity.sh"
+printf 'true\n' > "$ROOT/stale-capacity.sh"
+run_drainer_fg fleet3
+FL3="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f5) a STALE instrument is named as such (why=capacity.sh-incomplete, never 'unreachable': $(printf '%s' "$FL3" | head -1))" \
+  'grep -q "why=capacity.sh-incomplete" <<<"$FL3" && ! grep -q "why=capacity.sh-unreachable" <<<"$FL3" && grep -q "published=UNREADABLE" <<<"$FL3"'
+reset_run
+# ⛔ …AND THE GUARDED SEED FALLBACK FIRES, IT IS NOT ONLY THE REFUSAL BRANCH (fresh review round 10, P2):
+# (f7) exercises "nothing configured" with an ORIGINLESS seed, so deleting the accepting arm of the
+# comparison left every drainer arm green while the path the docs rely on ("a hand-run tick, the macOS
+# arm, a box whose unit predates this") was gone.
+SEEDW="$ROOT/seed-with-origin"
+git init -q "$SEEDW" 2>/dev/null
+( cd "$SEEDW" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m s \
+  && git remote add origin "https://github.com/daniel-ospina/agent-infra.git" ) >/dev/null 2>&1
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NO_FLEET_REPO=1 RUN_SEED_REPO="$SEEDW"
+run_drainer_fg seedmatch
+FL8="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f8) an unset channel falls back to a seed whose ORIGIN IS the fleet repo, and says which ($(printf '%s' "$FL8" | head -1))" \
+  'grep -q "chan=github.com/daniel-ospina/agent-infra" <<<"$FL8" && ! grep -q "why=channel-unverified" <<<"$FL8"'
+SEEDF="$ROOT/seed-foreign"
+git init -q "$SEEDF" 2>/dev/null
+( cd "$SEEDF" && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m s \
+  && git remote add origin "https://github.com/daniel-ospina/tortoise.git" ) >/dev/null 2>&1
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NO_FLEET_REPO=1 RUN_SEED_REPO="$SEEDF"
+run_drainer_fg seedforeign
+FL8F="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f8) …while a FOREIGN seed origin still REFUSES ($(printf '%s' "$FL8F" | head -1))" \
+  'grep -q "why=channel-unverified" <<<"$FL8F"'
+# ⛔ A SKIPPING TICK STILL REPORTS THE FLEET (fresh review round 7, P2). The line is taken BEFORE the
+# guards for the same reason the beat is: a swap-bound or load-bound box skips every tick in steady state,
+# and a reading taken only after a dispatch would make every skip look like a silent fleet. Moving the
+# call below the guards (the plausible "fix" for a slow tick) left all five arms above green while every
+# skipping tick went blind — so the position itself is graded here. The skip is forced with LOAD (the
+# swap seam is deliberately unset by the harness so the real box cannot mask it).
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NCPU=4 RUN_LOAD=3300 RUN_MEM=8192 RUN_TARGET=
+run_drainer_fg skip
+FL6="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+SK6="$(grep 'SKIP' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null | head -1)"
+check "(f6) a SKIPPING tick still logs its ONE fleet line ($(printf '%s' "$FL6" | head -1))" \
+  '[ "$(grep -c "fleet:" "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)" -eq 1 ] && grep -q "fleet: expected=1 " <<<"$FL6" && grep -q "SKIP: load" "$LAST_AI/logs/ai-drainer.log"' \
+  "SKIP line: ${SK6:-<none>}"
+# ⛔ …AND A LANE CHECKOUT IS NOT THE FLEET CHANNEL (fresh review round 7, P1). Unset `FLEET_REPO`/`REPO`
+# used to fall back to `SEED_REPO` — this drainer's own lane checkout — so a tick read an agent-infra
+# origin and reported `published=0 INELIGIBLE=5` rc 0 for a healthy 3-of-5 fleet, naming every box
+# ineligible. Unset now REFUSES, by name, and never publishes a count it did not measure.
+reset_run
+RUN_EXPECTED="cell-1:10.0.0.1"
+RUN_NO_FLEET_REPO=1
+run_drainer_fg norepo
+FL7="$(grep 'fleet:' "$LAST_AI/logs/ai-drainer.log" 2>/dev/null)"
+check "(f7) no channel configured REFUSES by name, never a published=0 reading ($(printf '%s' "$FL7" | head -1))" \
+  'grep -q "why=channel-unverified" <<<"$FL7" && grep -q "published=UNREADABLE" <<<"$FL7" && grep -q "expected=UNKNOWN" <<<"$FL7"'
+reset_run
 
 echo
 printf 'ai-drainer.test: %d passed, %d failed\n' "$PASS" "$FAIL"

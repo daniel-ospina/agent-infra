@@ -553,12 +553,49 @@ def harness_apply_record():
     if fetch_state not in ("ok", ""):
         return (f"record rc={rc} was written from a comparison that was NOT fresh (fetch={fetch_state}) — "
                 f"deployed={deployed} ref={ref} — cannot-verify is not current", True)
+    # ⛔ THE DEPLOYED-DRIFT READING MUST BE READ, OR WRITING IT CHANGES NOTHING (review round 10, P2).
+    # `harness-apply-pass.sh` records `drift=` so an instrument can see whether the box actually runs
+    # this repo's code; this reader ignored the key, so `drift=not-run:absent` (the checker was NOT
+    # FOUND — the arm is inert) printed as `record ok rc=0 … action=current` and the operator-facing
+    # instrument CERTIFIED a box whose executing-tree question was never answered. That is the same
+    # silent green this whole change exists to end, one level up: the pass is honest, and the reader
+    # above it threw the honesty away.
+    drift = kv.get("drift", "")
+    # ⛔ THE FIELD IS `<state>:<token>`, SO MATCH THE TOKEN, NOT THE WHOLE FIELD (review round 11, P1
+    # — the round-10 fix was DEAD because of this). `harness-apply-pass.sh` writes
+    # `${DRIFT_STATE}${DRIFT_TOKEN:+:$DRIFT_TOKEN}`, and on the red arm the state IS `drift`, so the
+    # record reads `drift=drift:executes:/gone/…` — `startswith("executes:")` therefore NEVER matched
+    # and the alarm that exists to stop this instrument certifying a box whose executing tree is gone
+    # could not fire. The `not-run` half happened to work, which is exactly why the asymmetry was
+    # invisible.
+    token = drift.split(":", 1)[1] if ":" in drift else drift
+    # ⛔ AND THE ABSENT-CHECKER ALARM MUST KEY ON THE TOKEN TOO (review round 11, P2). The pre-flow
+    # refusals that run AFTER a successful fetch (`action=unresolvable-ref`, `action=unresolvable-head`)
+    # write a BARE `drift=not-run` — the token half is EMPTY, because `DRIFT_TOKEN` is unset at that point
+    # (`write_record`'s pre-init callers run before the drift read) — so a `startswith("not-run")` test
+    # names a MISSING CHECKER on a box whose real fault is an unresolvable ref, and printed neither
+    # `action=` nor `detail=`, so the true refusal appeared nowhere. Only `absent` means the checker was
+    # not found. (Round 14, P2: this comment used to say those refusals write `not-run:not-run`, which
+    # nothing can produce — the changed `fleet_health.test.py` asserts the bare form, so the reader and
+    # its own test contradicted each other inside one change.)
+    if token.startswith("executes:"):
+        return (f"THE BOX EXECUTES A HARNESS TREE IT DOES NOT HAVE ({drift}) — deployed={deployed} "
+                f"ref={ref} rc={rc} action={kv.get('action', '?')}; redeploying the copy at rest does "
+                f"not clear it", True)
+    if token == "absent":
+        return (f"record rc={rc} deployed={deployed} ref={ref} behind={behind} drift={drift} "
+                f"action={kv.get('action', '?')} — the deployed-drift check was NEVER RUN (no "
+                f"check-deployed-drift.sh was found), so nothing here measured whether the box runs "
+                f"this repo's code", True)
+    # An EMPTY key is a record written before this field existed. NAMED, not alarmed: the next cadence
+    # writes it, and alarming on the upgrade would red every box once for a field it is about to gain.
+    drift_note = f"drift={drift}" if drift else "drift=<not recorded by this pass>"
     if rc in ("0", "10", "11") and behind_n == 0:
         return (f"record ok rc={rc} deployed={deployed} head={head} ref={ref} behind=0 age={age}s "
-                f"action={kv.get('action', '?')}", False)
+                f"action={kv.get('action', '?')} {drift_note}", False)
     if behind_n is not None and behind_n > 0:
         return (f"BEHIND origin/{ref}: {behind_n} commit(s) — deployed={deployed} (rc={rc}, "
-                f"action={kv.get('action', '?')}) — the box is not being moved", True)
+                f"action={kv.get('action', '?')}, {drift_note}) — the box is not being moved", True)
     return (f"record rc={rc} deployed={deployed} head={head} ref={ref} behind={behind} "
             f"action={kv.get('action', '?')} detail={kv.get('detail', '?')} age={age}s — a human must look "
             f"(an ahead box may hold work that exists nowhere else)", True)

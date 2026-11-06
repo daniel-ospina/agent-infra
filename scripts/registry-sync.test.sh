@@ -31,6 +31,9 @@
 #   §22 a legacy <pr>.json whose own `pr` field denies its filename is never published
 #   §23 `status` counts the STORE's records, not this box's cache
 #   §24 every network op is BOUNDED and cannot block on an invisible prompt
+#   §27 the spawn budget is O(1) in the record count (#3180)
+#   §28 the pre-pass's `join` is pinned to the collation its inputs were sorted with, and a
+#       pre-pass that cannot be computed is NAMED rather than reported as converged (#3249 P1)
 
 set -uo pipefail
 
@@ -663,6 +666,145 @@ assert_contains "$RS_LAST" "not readable here" "§26 ...and each such key is NAM
 assert_contains "$RS_LAST" "unreadable=" "§26 ...and counted"
 assert_contains "$RS_LAST" "failed=0" "§26 ...as unreadable, not as a failed move"
 if grep -qE 'unreadable=0' <<<"$RS_LAST"; then bad "§26 the run counted NOTHING despite receiving nothing"; else ok "§26 the counter is non-zero (the pre-fix arm reported 0/0 and exited 0)"; fi
+
+# ═══ 27. THE SPAWN BUDGET (agent-infra#3180) ══════════════════════════════════════
+# THE MEASURED DEFECT. `union` examined every record one at a time with ~21 process spawns each
+# (store_oid's awk over the whole listing, git show, 3-8 `field` seds, a python3, a mktemp) — on
+# records whose bytes were ALREADY identical on both sides. Measured on this harness: a converged
+# 10-record union cost 291 spawns and 40 records cost 1,131 (21/record); a land carries 4,027
+# records, so ~85,000 spawns before anything useful happened.
+#
+# The assertion is the SCALING, not a constant: any per-record cost makes the count grow with N, and
+# no constant hides it. Mutation proof: delete the converged pre-pass from `do_pull` and this
+# section goes red by hundreds.
+echo "── §27 the spawn budget is O(1) in the number of records (the #3180 regression)"
+SPAWN_SHIM="$T/spawn-shim"; mkdir -p "$SPAWN_SHIM"
+for tool in git sed awk python3 comm join sort cut wc mktemp paste head cat tr cmp; do
+  real_tool="$(command -v "/usr/bin/$tool" 2>/dev/null || command -v "$tool")"
+  [ -n "$real_tool" ] || continue
+  printf '#!/bin/sh\nprintf "%%s\\n" %s >> "${SPAWN_LOG:-/dev/null}"\nexec %s "$@"\n' "$tool" "$real_tool" > "$SPAWN_SHIM/$tool"
+  chmod +x "$SPAWN_SHIM/$tool"
+done
+spawns_for_union() { # <root> <n> → "<spawns>\n<summary line>\n<stderr>"
+  local rt="$1" n="$2" i pr out
+  mkdir -p "$rt/reg"
+  git init -q --bare "$rt/origin.git"
+  git init -q "$rt/store"
+  git -C "$rt/store" remote add origin "$rt/origin.git"
+  i=1
+  while [ "$i" -le "$n" ]; do
+    pr=$((100 + i))
+    printf '{"pr":%s,"head_sha":"%s","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-01-01T00:%02d:00Z"}\n' \
+      "$pr" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$i" > "$rt/reg/acme-widget-$pr.json"
+    i=$((i + 1))
+  done
+  bash "$SYNC" union --repo "$rt/store" --dir "$rt/reg" --remote origin --timeout 30 >/dev/null 2>&1
+  : > "$T/spawns.log"
+  out="$(PATH="$SPAWN_SHIM:$PATH" SPAWN_LOG="$T/spawns.log" bash "$SYNC" union --repo "$rt/store" --dir "$rt/reg" --remote origin --timeout 30 2>&1)"
+  printf '%s\n%s\n' "$(wc -l < "$T/spawns.log" | tr -d ' ')" "$out"
+}
+SP10="$(spawns_for_union "$T/n10" 10)"
+SP25="$(spawns_for_union "$T/n25" 25)"
+S10="$(head -1 <<<"$SP10" | tr -d ' ')"
+S25="$(head -1 <<<"$SP25" | tr -d ' ')"
+O10="$(tail -n +2 <<<"$SP10")"
+echo "     spawns: N=10 → $S10   N=25 → $S25   (before #3180: 291 → 1131)"
+case "$S10$S25" in
+  ''|*[!0-9]*) bad "§27 could not count spawns (N=10='$S10', N=25='$S25')" ;;
+  *)
+    DELTA=$((S25 - S10))
+    if [ "$DELTA" -le 2 ]; then
+      ok "§27 the spawn count is FLAT in N (N=10 → $S10, N=25 → $S25, delta $DELTA)"
+    else
+      bad "§27 spawns grow with the record count (N=10 → $S10, N=25 → $S25, delta $DELTA) — the per-record path is still walked"
+    fi ;;
+esac
+assert_contains "$O10" "same=20" "§27 a converged union counts each record ONCE PER HALF (same=2N)"
+assert_contains "$O10" "unchanged=20" "§27 ...and reports the pre-pass's own count (unchanged=2N)"
+assert_contains "$O10" "wrote=0" "§27 ...and writes nothing"
+assert_contains "$O10" "pushed=0" "§27 ...and pushes nothing"
+assert_contains "$O10" "nothing to sync" "§27 ...and says so on stderr (a converged run is never silent about it)"
+# A converged run must never be able to skip a CHANGED record: one byte of difference and the record
+# takes the full path again.
+printf '{"pr":105,"head_sha":"%s","verdict":"clean","repo":"acme/widget","reviewed_at":"2026-02-01T00:00:00Z"}\n' \
+  "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" > "$T/n10/reg/acme-widget-105.json"
+ONE_CHANGED="$(bash "$SYNC" union --repo "$T/n10/store" --dir "$T/n10/reg" --remote origin --timeout 30 2>&1)"
+assert_contains "$ONE_CHANGED" "unchanged=18" "§27 a ONE-BYTE change drops the pre-pass count (9 per half)"
+assert_contains "$ONE_CHANGED" "pushed acme-widget-105" "§27 ...and the changed record is published"
+
+# ═══ 28. the pre-pass's join is pinned to the collation its inputs were sorted with ══════
+# Review finding P1 on PR #3249: `identical_pairs` sorted BOTH inputs `LC_ALL=C` and then ran an
+# UNQUALIFIED `join`, so the merge was evaluated under the ambient locale over data ordered by C.
+# The two disagree on a mixed-case key set (`Acme-Widget-101` is before `acme-widget-102` in C and
+# after it under en_US), and a locale-collating `join` then mis-merges or refuses: measured on
+# coreutils 9.4, `join --check-order` under en_US.utf8 prints "input is not in sorted order", exits
+# 1 and emits only a PREFIX of the pairs. Every record then falls back to the per-record path (~21
+# spawns apiece) — silently, because `identical_pairs` ended in `return 0`.
+#
+# The shim below IS such a join: it refuses unless the call carries `LC_ALL=C`, which is the property
+# under test and is checkable on a host with NO non-C locale installed (the ambient locale is forced
+# to `C.UTF-8`, a non-`C` STRING whether or not its collation actually differs). Reverting the fix
+# makes this section red — the pre-pass then cannot run at all.
+echo "── §28 the pre-pass's join is pinned to C (a mixed-case key set cannot disable it)"
+LC_ROOT="$T/lc"; LC_REG="$LC_ROOT/reg"; LC_JOIN_SHIM="$T/lc-join-shim"
+mkdir -p "$LC_REG" "$LC_JOIN_SHIM"
+git init -q --bare "$LC_ROOT/origin.git"
+git init -q "$LC_ROOT/store"
+git -C "$LC_ROOT/store" remote add origin "$LC_ROOT/origin.git"
+lc_record() { # <owner/repo> <pr> <n> — the key is DERIVED from repo+pr, exactly as local_keyed does
+  local repo="$1" pr="$2" n="$3" key
+  key="$(printf '%s-%s-%s' "${repo%%/*}" "${repo#*/}" "$pr")"
+  printf '{"pr":%s,"head_sha":"%s","verdict":"clean","repo":"%s","reviewed_at":"2026-01-01T00:%02d:00Z"}\n' \
+    "$pr" "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" "$repo" "$n" > "$LC_REG/$key.json"
+}
+lc_record Acme/Widget 201 1
+lc_record acme/widget 202 2
+lc_record _0dot/x     203 3
+lc_record 9lives/x    204 4
+lc_record Zeta/Beta   205 5
+lc_record zeta/beta   206 6
+# premise: the fixture really carries mixed-case keys (the discrimination is C-vs-locale ORDER)
+if [ -f "$LC_REG/Acme-Widget-201.json" ] && [ -f "$LC_REG/acme-widget-202.json" ]; then
+  ok "§28 (premise) the fixture carries mixed-case keys whose C order is not their locale order"
+else
+  bad "§28 (premise) the fixture lost its mixed-case keys"
+fi
+bash "$SYNC" union --repo "$LC_ROOT/store" --dir "$LC_REG" --remote origin --timeout 30 >/dev/null 2>&1
+REAL_JOIN="$(command -v join)"
+cat > "$LC_JOIN_SHIM/join" <<EOS
+#!/bin/sh
+printf '%s\n' "\${LC_ALL:-<unset>}" >> "$T/join.locale"
+if [ "\${LC_ALL:-}" != "C" ]; then
+  echo "join: input is not in sorted order" >&2
+  exit 1
+fi
+exec "$REAL_JOIN" "\$@"
+EOS
+chmod +x "$LC_JOIN_SHIM/join"
+: > "$T/join.locale"
+LC28="$(LC_ALL=C.UTF-8 PATH="$LC_JOIN_SHIM:$PATH" bash "$SYNC" union --repo "$LC_ROOT/store" --dir "$LC_REG" --remote origin --timeout 30 2>&1)"
+# NON-VACUITY: if `join` were never reached, the assertions below would pass for the wrong reason.
+if [ -s "$T/join.locale" ]; then ok "§28 (premise) the emulated locale-collating join WAS invoked"; else bad "§28 (premise) join was never invoked — the pre-pass is not exercised"; fi
+assert_eq "$(LC_ALL=C sort -u "$T/join.locale" | tr '\n' ' ')" "C " \
+  "§28 every join call carries LC_ALL=C (the ambient locale is forced to C.UTF-8)"
+assert_contains "$LC28" "unchanged=12" "§28 the pre-pass still skips all 6 records on both halves (2N)"
+assert_contains "$LC28" "same=12" "§28 ...and the summary agrees the records were examined and identical"
+
+# §28b — a pre-pass that genuinely cannot be computed is NAMED, not `return 0`-ed into silence.
+# This is the other half of the P1: the rc is propagated, so `do_pull`/`do_push` take their existing
+# all-records fallback and SAY SO. Correctness is untouched (every record still converges); what is
+# recovered is the signal that the optimisation did not run.
+cat > "$LC_JOIN_SHIM/join" <<EOS
+#!/bin/sh
+echo "join: input is not in sorted order" >&2
+exit 1
+EOS
+chmod +x "$LC_JOIN_SHIM/join"
+LC_LAST="$(LC_ALL=C.UTF-8 PATH="$LC_JOIN_SHIM:$PATH" bash "$SYNC" union --repo "$LC_ROOT/store" --dir "$LC_REG" --remote origin --timeout 30 2>&1)"; LC_RC=$?
+assert_eq "$LC_RC" "0" "§28b a pre-pass that cannot be computed STILL converges (slower, never wrong)"
+assert_contains "$LC_LAST" "the converged pre-pass could not run" "§28b ...and the fallback is NAMED instead of silently reported as converged"
+assert_contains "$LC_LAST" "unchanged=0" "§28b ...reporting ZERO skipped rather than a count it did not compute"
+assert_contains "$LC_LAST" "same=12" "§28b ...and every record still converges through the per-record path"
 
 # ═══ 10 (continued). nothing above deleted a record either ══════════════════════
 for pair in "$BOX1:$KEYA" "$BOX5:$KEYB"; do

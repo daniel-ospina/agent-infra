@@ -248,9 +248,13 @@ Two properties worth knowing before you debug it:
   defaults, whose share is floored at 1 so a conservative setting cannot brick a box. No cross-box
   messaging is needed, which is the point: a partition is testable and does not depend on an
   unreachable peer. What is *still* not bounded: a box whose declaration is wrong (too small a fleet
-  ⇒ too generous a share), and **`core`/REST is not paced by default** — the hot reads were
-  deliberately moved onto REST (#1962/#2137), so pacing it here would push the fleet back onto the
-  bucket that is refusing; opt in with `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`.
+  ⇒ too generous a share), and **both `graphql` and `core`/REST are paced by default**
+  (`GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql,core`). REST joined the default on 2026-11-03, when
+  the earlier premise inverted and was measured: `core` at 0/5000 with every `gh run list` / `gh run
+  view` refused, while `graphql` sat at 4973/5000 — the partitioned bucket was idle and the spent one
+  was unbounded, because the rail's waits poll REST per lane. Set
+  `GH_LIMIT_ACCOUNT_PARTITION_BUCKETS=graphql` to restore the old graphql-only pacing if you measure
+  the opposite pressure.
 - **A bounded caller proceeds OVER the partition.** `GH_LIMIT_NO_WAIT` callers (the heartbeat's eight
   telemetry tools) cannot be paced without outliving their own subprocess bound, so they take the
   slot check and proceed when it is exhausted, recording the overdraw in `events.log`. Pacing them
@@ -404,7 +408,8 @@ WITH its age on stderr; off by default), `GH_LIMIT_FLIGHT_STALE_MAX_AGE` (30 s),
 `GH_LIMIT_ACCOUNT_BUDGET_PER_HOUR` (5000 — GitHub's per-account, per-bucket primary limit),
 `GH_LIMIT_ACCOUNT_SAFETY` (0.8 — headroom kept inside the share),
 `GH_LIMIT_ACCOUNT_WINDOW_S` (60 s — the window the share is spent over),
-`GH_LIMIT_ACCOUNT_PARTITION_BUCKETS` (`graphql` — which buckets are paced; `graphql,core` opts REST in),
+`GH_LIMIT_ACCOUNT_PARTITION_BUCKETS` (`graphql,core` — which buckets are paced; `graphql` alone
+restores the pre-2026-11-03 behaviour),
 `GH_LIMIT_MARKER_MAX_AGE` (900 s — a marker older than this is not evidence about now) and
 `GH_LIMIT_GATE_REVALIDATE_S` (30 s — the wait above which a marker is revalidated before it is paid).
 The conditional-GET PASS CACHE has its own three: `GH_LIMIT_PASS_CACHE` (unset/`0` disables it; any
@@ -474,8 +479,32 @@ Every `gh` call that goes through the argv-level shim (`scripts/gh-shim/gh`, ins
 - on a rate-limit refusal: honour `retry-after`, else wait `AGENT_GH_GATE_RETRY_BASE`
   (**60 s**), doubling per attempt, and write a **shared cooldown** so the other lanes on
   the box wait instead of walking into the same window. Never an immediate retry.
-- state lives in `~/.pi/agent/gh-gate` (`slots/`, `cooldown.*`). A stale slot is reaped by
-  PID, so a killed lane cannot wedge the fleet.
+- ⛔ **a shared cooldown is re-derived before it is slept on, and the wait is bounded.** One
+  exempt `GET /rate_limit` (`AGENT_GH_GATE_REVALIDATE`, default 1) may **lift** an open window
+  when the read is positive about **every** bucket; a read that fails, times out or is
+  unreadable **keeps** it. It can never lift a window a secondary refusal wrote
+  (`secondary.window`) or one the server itself instructed (`retry-after.window`) — neither is
+  visible to that read. The read is single-flighted box-wide, so a window never turns N blocked
+  lanes into N concurrent requests. A bucket counts as **low** — the state in which a window stays
+  credible and is honoured without discharge — under three conditions, and only these:
+  `remaining <= 0` (exhausted), or at or below 10 % of its own `limit` (which is what catches a
+  bucket sitting at 400/5000, and keeps the small `search` budget from making the gate inert), or
+  `remaining` at or below `AGENT_GH_GATE_REVALIDATE_FLOOR` (default **100**) **and** at or below
+  **half its own `limit`**. That second half of the floor condition is what keeps the floor from
+  calling a healthy account low: a bucket carrying one request of headroom in a 101-request budget
+  is not depleted, whatever floor value an operator — or a poisoned environment — supplies. The
+  floor can therefore only ever CORROBORATE a window on a bucket that is genuinely more than half
+  spent. The half-limit condition REPLACES the older `limit >= floor` test, which accepted a bucket
+  with one request of headroom above the floor: `100/101` read as low at the documented default, so
+  the discharge was inert exactly where it was most needed.
+- **the wait itself has ONE budget**, `AGENT_GH_GATE_WAIT_BUDGET` (seconds, default **120** per
+  `gh` call, not per attempt). Spent with a window still open, the call returns **`gh-contended`,
+  exit 75** — a distinct verdict, so "I could not ask" never reads as "the answer is empty". A
+  caller with its own bound sets `GH_LIMIT_NO_WAIT=1` and gets the refusal back at once; the
+  cooldown is still written, so the box benefits.
+- state lives in `~/.pi/agent/gh-gate` (`slots/`, `cooldown.*`, `secondary.window`,
+  `retry-after.window`, `revalidate.lock`). A stale slot or a dead single-flight holder is reaped
+  by PID, so a killed lane cannot wedge the fleet.
 
 ⚠️ **A caller that resolves the real `gh` by absolute path, or clears PATH, is not paced.**
 The one that did deliberately for read-only queries was the retired
@@ -836,9 +865,16 @@ answers a different question).
 
 ```bash
 python3 scripts/orchestrator-harness/gh-limit.py --health
-# gh-core-exhausted resets_in=12m     (exit 3)
+# gh-core-exhausted resets_in=12m GH-BUDGET(remaining=0, resets_at=2026-11-03T02:07:36Z)   (exit 3)
 # gh-ok                              (exit 0)
 ```
+
+The `GH-BUDGET(...)` token rides the SAME local-only read (no request, no credentials, no quota), so
+at the moment every `gh` call is being refused a lane can still tell **quota exhaustion** from a
+**product fault** with one cheap read — the 2026-11-03 misdiagnosis, where three lanes reported a
+broken rail that was an account at 0/5000. `remaining=?` / `resets_at=?` mean nothing measured that
+field (an undated record from a refusal that carried no reset); they are never filled in with a
+plausible number.
 
 It reads **local state only** — no request, no credentials, no quota — which is what makes it usable at
 exactly the moment every `gh` call is being refused, and it is age-bounded — by the record's own reset

@@ -212,6 +212,16 @@ CFS="$ROOT/scripts/ci-failure-set.sh"
 ADM="${ADMIN_MERGE_SUITE_ADM:-$ROOT/scripts/admin-merge.sh}"
 DETECTOR="$ROOT/.github/workflows/admin-merge-detector.yml"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
+# ⛔ THE SUITE MUST NOT TOUCH THE MACHINE-GLOBAL LEASE ROOT (#3194, review cycle 3 finding 5).
+# The rail now takes a per-PR lease; without this, every one of this suite's ~1843 rail
+# invocations would lease the REAL `$HOME/.pi/agent/state/rail-locks/agent-infra-42`, so two
+# concurrent suite runs on this box (routine: several lanes and reviewers per repo), or a live
+# rail on that key, would hit ALREADY-RAILING (exit 75) and cascade misleading failures — and
+# the suite would delete leases out of the directory a live rail depends on. Each suite run
+# gets its own root.
+ADMIN_MERGE_LOCK_ROOT="$TMP/rail-locks"
+export ADMIN_MERGE_LOCK_ROOT
+mkdir -p "$ADMIN_MERGE_LOCK_ROOT"
 checks=0
 failures=0
 # The two new windows default to "one observation, no waiting" for the WHOLE
@@ -4728,15 +4738,397 @@ rc=$?
 grep -q "never TESTED main" "$TMP/err" \
   && pass "the block says the lane provides no baseline" \
   || fail "expected the no-baseline reason on stderr"
-grep -q -- "--any-workflow" "$TMP/err" \
-  && pass "the block names the way to a real baseline (--any-workflow)" \
-  || fail "the block offers no way out of the split"
+# ⛔ THE OLD REMEDY IS GONE ON PURPOSE (BASELINE-INAPPLICABLE). `--any-workflow`
+# widens the BASE side to every workflow on main, and that sample is SATISFIED by
+# runs that measure nothing — measured on main's 200-run window, 187 were
+# `Pipeline Compliance` (issue_comment: 148 skipped, 38 success, 1 other) and the
+# widening stopped at width 40 with 11 "measurements" = 8 bookkeeping + 2 detector
+# + 1 code-lane run. The refusal now names three honest exits (one spanning lane, a
+# NAMED --baseline-workflow, or no main-side measurement at all) and
+# says out loud that the widening is not one of them.
+grep -q "add --any-workflow\|use --any-workflow\|instead: --any-workflow" "$TMP/err" \
+  && fail "the no-baseline block still OFFERS --any-workflow as the way to a baseline" \
+  || pass "the no-baseline block no longer offers --any-workflow as a baseline source"
+grep -q -- "NOT --any-workflow" "$TMP/err" \
+  && pass "…it REFUSES the widening by name instead (and says why)" \
+  || fail "the block dropped the remedy without naming the widening it refuses"
+grep -q -- "--baseline-workflow" "$TMP/err" \
+  && pass "…and names the real way to a baseline (--baseline-workflow)" \
+  || fail "the block names no way to a real baseline"
 grep -q "vacuous comparison" "$TMP/err" \
   && fail "a MISCONFIGURATION is reported as a vacuous COMPARISON — the two must be distinguishable" \
   || pass "the no-baseline fault is not mislabelled as a vacuous comparison"
 [ -f "$SCEN/comment" ] && fail "no evidence may be posted against a baseline that does not exist" \
   || pass "no evidence comment posted"
 grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# ── 28b. BASELINE-INAPPLICABLE — a PR-ONLY lane has no base population ────
+# THE MEASURED ROOT CAUSE. The baseline is a union over the base branch's runs of
+# the SAME workflow, so on a `pull_request`-only lane that population is EMPTY BY
+# CONSTRUCTION: `gh run list --branch main --workflow ci.yml` → `[]`. The rail
+# therefore cannot judge, and its old advice (`add --any-workflow`) widened to a
+# sample SATISFIED BY RUNS THAT MEASURE NOTHING (measured on main's 200-run
+# window: 187 `Pipeline Compliance` — issue_comment, 148 skipped / 38 success /
+# 1 other — 7 detector, 6 `CI on main`; the widening stopped at width 40 with 11
+# "measurements" = 8 bookkeeping + 2 detector + 1 code-lane run).
+#
+# The fix is TWO LANE NAMES (`--baseline-workflow`) plus a first-class state for
+# the case where nobody named one. ⛔ WHAT IT MAY NOT DO IS WEAKEN THE REFUSAL:
+# with an empty base population and no --baseline-workflow the outcome is
+# BASELINE-INAPPLICABLE, never a pass.
+echo "== 28b. BASELINE-INAPPLICABLE, and the two-name fix (--baseline-workflow) =="
+
+# (a) THE STATE. A pull_request-only lane selected by --workflow, no baseline
+# named: the base population is empty, so the rail refuses AND NAMES THE STATE.
+new_scen pronly
+HEAD_PR2="b4b4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_PR2" > "$SCEN/head"
+lane_pass "$HEAD_PR2" 7401 > "$SCEN/runs-$HEAD_PR2"
+# main is BUSY — a code lane DOES run there — but not in THIS lane:
+#   * the unfiltered window carries main's real runs,
+#   * the ci.yml-filtered listing is EMPTY (a pull_request-only workflow),
+# so a rail that quietly widened would find "measurements" while one that read the
+# filtered window finds none. The fixture makes both visible at once.
+lane_fail mainbusy 7402 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_main' > "$SCEN/log-7402"
+: > "$SCEN/runs-main.by-workflow.ci.yml"
+run_admin 42 --workflow ci.yml --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a PR-only lane, no --baseline-workflow → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0 — an EMPTY base population CERTIFIED the merge"
+grep -q "BASELINE-INAPPLICABLE" "$TMP/err" \
+  && pass "…as the first-class state BASELINE-INAPPLICABLE" \
+  || fail "the empty base population is not reported as BASELINE-INAPPLICABLE"
+grep -q "the baseline lane 'ci.yml' never TESTED main" "$TMP/err" \
+  && pass "…naming the workflow it looked for" \
+  || fail "the state does not name the workflow that was looked for"
+grep -q "Looked for: runs of 'ci.yml' on main" "$TMP/err" \
+  && pass "…and says WHERE it looked (the base population) and whose name that was" \
+  || fail "the state does not say where it looked"
+grep -q "the base population is EMPTY" "$TMP/err" \
+  && pass "…and states the population is EMPTY (not green)" \
+  || fail "the state does not distinguish an EMPTY population from a green one"
+grep -q "1. ONE LANE THAT RUNS ON BOTH SIDES" "$TMP/err" \
+  && grep -q -- "--workflow <spanning-lane>" "$TMP/err" \
+  && pass "…remedy 1: ONE lane that runs on both sides (the cheapest correct fix, and the code supports it)" \
+  || fail "the state omits the spanning-lane remedy the default path already implements"
+grep -q "2. TWO LANES" "$TMP/err" \
+  && grep -q -- "--baseline-workflow <main-lane>" "$TMP/err" \
+  && pass "…remedy 2: name a --baseline-workflow that DOES run on the base" \
+  || fail "the state does not name the --baseline-workflow remedy"
+grep -q "3. NO MAIN-SIDE MEASUREMENT AT ALL" "$TMP/err" \
+  && pass "…remedy 3: when no workflow measures main, the rail cannot judge (a decision, not a knob)" \
+  || fail "the state pretends there is a measurement when there is none"
+grep -q "There is no third" "$TMP/err" \
+  && fail "the state still asserts an absolute the code contradicts" \
+  || pass "…and no longer claims there is no third option"
+grep -q -- "NOT --any-workflow" "$TMP/err" \
+  && pass "…and REFUSES the widening by name, with the measurement that rules it out" \
+  || fail "the state does not say why --any-workflow is not an answer"
+[ -f "$SCEN/comment" ] && fail "no evidence may be posted against an EMPTY base population" \
+  || pass "no evidence comment posted"
+grep -q "pr merge" "$SCEN/calls" && fail "no merge may be attempted" || pass "no merge attempted"
+
+# (b) THE FIX. The same PR-only head lane, but a NAMED main-side lane that has
+# real runs — and one that reproduces the PR's failure, so the comparison is
+# actually PERFORMED rather than merely reachable.
+new_scen baselinelane
+HEAD_BL="b5b5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BL" > "$SCEN/head"
+lane_fail "$HEAD_BL" 7501 > "$SCEN/runs-$HEAD_BL"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-7501"
+# ci.yml is PR-only: EMPTY on main, by construction.
+: > "$SCEN/runs-main.by-workflow.ci.yml"
+# …and the MIRROR of that fixture: the head's ci-main.yml-filtered listing is EMPTY
+# too, so a HEAD-side read that wrongly used the baseline lane would select nothing
+# and block. Nothing else in the suite can see that swap.
+: > "$SCEN/runs-$HEAD_BL.by-workflow.ci-main.yml"
+# …and the NAMED baseline lane measured main, over the min_runs floor, failing
+# the SAME id — which is exactly what the decision needs to exempt it.
+{ main_red_n bmain 7502 3 'tests/test_pre.py::test_pre'
+} > "$SCEN/runs-main.by-workflow.ci-main.yml"
+run_admin 42 --workflow ci.yml --baseline-workflow ci-main.yml --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a named --baseline-workflow with real runs → JUDGED (exit 0)" \
+  || { fail "the named baseline did not let the rail judge (exit $rc)"; sed 's/^/      /' "$TMP/err" | tail -20; }
+grep -q "BASELINE-INAPPLICABLE" "$TMP/err" \
+  && fail "the rail still reported BASELINE-INAPPLICABLE with a real baseline named" \
+  || pass "…it is no longer INAPPLICABLE"
+grep -q "main compared (union of 3 runs of ci-main.yml)" "$TMP/out" \
+  && pass "…and the evidence states the PROVENANCE of the measurement (the named baseline lane)" \
+  || fail "the evidence does not name the baseline lane it compared against"
+grep -q '^test lane: ci.yml$' "$TMP/out" \
+  && pass "…while the PR's own lane is still the one the head was read from" \
+  || fail "the PR-side lane name was not preserved"
+grep -q "baseline-workflow" "$TMP/out" \
+  && fail "the evidence body carries CLI vocabulary instead of the measured fact" \
+  || pass "…and the certificate says WHICH lane, not which flag"
+grep -q -- "--workflow ci-main.yml" "$SCEN/calls" \
+  && pass "…and main's window was filtered by the baseline lane, not the PR's" \
+  || fail "main's window was not read through the named baseline lane"
+grep -- '--commit' "$SCEN/calls" | grep -q -- 'ci-main.yml' \
+  && fail "a HEAD-side read used the BASELINE lane — the two directions must not swap" \
+  || pass "…and no head-side (--commit) read used the baseline lane"
+
+# (b2) THE PARITY GATE READS THE SAME BASE LANE. On a CLEAN PR both measured sets
+# are empty, so the vacuous-comparison gate runs — and if it kept asking main's
+# population for the PR-ONLY lane it would find nothing and refuse, with a remedy
+# (--any-workflow) the base side must not take. The named baseline IS the lane
+# main is measured by, so the coverage question must use it.
+new_scen baselineparity
+HEAD_BP="b6b6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BP" > "$SCEN/head"
+lane_pass "$HEAD_BP" 7601 > "$SCEN/runs-$HEAD_BP"
+: > "$SCEN/runs-main.by-workflow.ci.yml"
+{ lane_pass mainok1 7602; lane_pass mainok2 7603
+} > "$SCEN/runs-main.by-workflow.ci-main.yml"
+run_admin 42 --workflow ci.yml --baseline-workflow ci-main.yml --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a CLEAN PR-only lane with a named baseline → certify (exit 0)" \
+  || { fail "the clean case refused (exit $rc)"; sed 's/^/      /' "$TMP/err" | tail -20; }
+grep -q "lane parity: PR ⊇ main" "$TMP/out" \
+  && pass "…on a lane-parity comparison that could happen (main measured by the baseline lane)" \
+  || fail "the clean case certified nothing — the parity gate read the PR-only lane on main"
+# …AND THE CERTIFICATE NAMES BOTH LANES. The two measured sets came from DIFFERENT
+# workflows by declaration, so a single `(lane: …)` would misname the base
+# population — and the closing sentence ('Correct … ONLY when both sides ran the
+# SAME lane') would contradict the run it describes.
+grep -qF "measured sets: PR failing runs=0 | main failing runs=0 (lanes: PR=ci.yml, main=ci-main.yml)" "$TMP/out" \
+  && pass "…and the vacuous body names BOTH lanes instead of mislabelling the base side" \
+  || fail "the vacuous body still prints one lane for a two-lane run"
+# ⛔ THE CONSOLE TWIN IS A DIFFERENT LINE and needs its own pin: both renderings land on
+# stdout, so the body alone satisfied the arm above. Reverting ONLY the `info` line left
+# the suite green while one run carried two contradictory accounts of the base population.
+grep -qF '⚠️  vacuous comparison — measured sets: PR failing=0 | main failing=0 (lanes: PR=ci.yml, main=ci-main.yml)' "$TMP/out" \
+  && pass "…and the CONSOLE summary names both lanes too (one run, one account)" \
+  || fail "the console summary still prints one lane for a two-lane run"
+# PER CALL SCOPE, not a bare count: the rate and signature passes alone supply the
+# baseline name, so `grep -c` stayed GREEN with the parity rebind reverted (proven
+# by mutation). What distinguishes the parity read is that a BRANCH-scoped listing
+# carries the baseline and NO branch-scoped listing carries the PR lane.
+n_base="$(grep -- '--branch main' "$SCEN/calls" | grep -c -- '--workflow ci-main.yml')"
+n_base_pr="$(grep -- '--branch main' "$SCEN/calls" | grep -c -- '--workflow ci.yml')"
+[ "${n_base:-0}" -ge 3 ] \
+  && pass "…and the baseline lane served EVERY base-side read (rates, signatures, parity: $n_base branch-scoped calls)" \
+  || fail "only ${n_base:-0} branch-scoped read(s) used the baseline lane, so parity still read the PR lane"
+[ "${n_base_pr:-0}" -eq 0 ] \
+  && pass "…and NO base-side read was filtered by the PR's lane" \
+  || fail "${n_base_pr:-0} base-side read(s) still used the PR lane"
+
+# (b3) A FAILING PARITY REFUSAL NAMES THE LANE THAT WAS READ. When main's window
+# under the BASELINE lane holds no executed job, the refusal is a claim about the
+# BASELINE lane — naming the PR's lane would send the operator to the lane the base
+# side never read, and pointing at --any-workflow would offer the widening this
+# change exists to stop.
+new_scen baselineparityrefuse
+HEAD_BR="baba000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BR" > "$SCEN/head"
+lane_pass "$HEAD_BR" 7651 > "$SCEN/runs-$HEAD_BR"
+: > "$SCEN/runs-main.by-workflow.ci.yml"
+# The baseline lane HAS a completed run — whose only job is `skipped`, so the
+# window yields NO EXECUTED job (the same branch a purged job list lands in,
+# without needing an unreadable-list fixture).
+lane_line completed success bmain 7652 > "$SCEN/runs-main.by-workflow.ci-main.yml"
+lane_jobset 7652 skipped 'test (a)'
+run_admin 42 --workflow ci.yml --baseline-workflow ci-main.yml --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "a base-side window with no EXECUTED job → BLOCK (exit $rc)" \
+  || fail "expected a non-zero exit, got 0"
+grep -q "check the lane selector 'ci-main.yml'" "$TMP/err" \
+  && pass "…and the reason names the lane that was actually READ (the baseline)" \
+  || fail "the parity refusal names the wrong lane for a base-side population"
+grep -qF "lane coverage could not be established (lane: ci-main.yml)" "$TMP/err" \
+  && pass "…in the renderer too, not only in WHY" \
+  || fail "the renderer still names the PR lane for a base-side window"
+grep -q "for a trigger-split repo" "$TMP/err" \
+  && fail "the refusal still offers --any-workflow on a run that already named a baseline" \
+  || pass "…and it does not offer the widening as the remedy"
+
+# (b4) THE BASE-SIDE LABEL UNDER --any-workflow IS "any workflow", NEVER THE DEFAULT
+# LANE. With the filter DROPPED the base read is unfiltered, so naming $WORKFLOW would
+# name a lane that appears in no `run list` call — and would point the operator at a
+# knob that cannot change the read. Rebuilding the label from $WORKFLOW left every arm
+# green before this one existed.
+new_scen anyworkflowlabel
+HEAD_AW="bcbc000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_AW" > "$SCEN/head"
+lane_pass "$HEAD_AW" 7681 > "$SCEN/runs-$HEAD_AW"
+# main's window is READABLE and carries a run, but its only job is `skipped` — so the
+# window yields NO EXECUTED job and the parity gate refuses. Both measured sets are
+# empty, which is what routes the run into the vacuous/parity branch.
+lane_line completed success anmain 7682 > "$SCEN/runs-main"
+lane_jobset 7682 skipped 'python-ci / test (a)'
+run_admin 42 --any-workflow --main-runs 10 --dry-run >/dev/null 2>&1
+grep -qF "lane coverage could not be established (lane: any workflow)" "$TMP/err" \
+  && pass "…an --any-workflow base-side refusal names the side it read ('any workflow')" \
+  || fail "the base-side refusal names a lane that was never read under --any-workflow"
+grep -qF "(lane: python-ci.yml)" "$TMP/err" \
+  && fail "the refusal names the DEFAULT lane for an UNFILTERED base read" \
+  || pass "…and never names the default lane it did not read"
+
+# (c) --any-workflow IS STILL REFUSED AS A BASELINE SOURCE. A widened sample is
+# not a baseline: it is satisfied by bookkeeping runs, so accepting it would
+# restore the exact failure the flag exists to remove. Refused BY NAME, before
+# any gh call.
+new_scen nobaselineany
+printf '%s\n' "$HEAD_PR2" > "$SCEN/head"
+run_admin 42 --workflow ci.yml --baseline-workflow any --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "--baseline-workflow any → REFUSED (exit 2)" \
+  || fail "'any' was accepted as a baseline source (exit $rc)"
+grep -q "a baseline is a NAMED" "$TMP/err" \
+  && pass "…naming the rule (a baseline is a NAMED workflow, never a widening)" \
+  || fail "the refusal does not state the rule it applies"
+grep -q "187" "$TMP/err" \
+  && pass "…with the measurement that makes the widening unusable (187/200 bookkeeping runs)" \
+  || fail "the refusal asserts the widening is unusable without the evidence"
+# …AND THE NEAR-MISS SPELLINGS TOO. The case is on a TRIMMED, case-folded value, so
+# whitespace variants are refused pre-gh instead of reaching `gh run list --workflow ''`.
+new_scen sentinelspace
+printf '%s\n' "$HEAD_PR2" > "$SCEN/head"
+for v in ' any' 'ANY ' '  '; do
+  run_admin 42 --workflow ci.yml --baseline-workflow "$v" --dry-run >/dev/null 2>&1
+  rc=$?
+  [ "$rc" -eq 2 ] && pass "…and '${v}' is refused (exit 2), not passed to gh" \
+    || fail "the near-miss baseline value '${v}' was not refused (exit $rc)"
+done
+[ -s "$SCEN/calls" ] && fail "a near-miss sentinel reached gh before being refused" \
+  || pass "…all of them refused BEFORE any gh call"
+[ -s "$SCEN/calls" ] && fail "the refusal made a gh call before refusing" \
+  || pass "…and no gh call was made (it is refused before any CI work)"
+
+# (c2) …and the SAME refusal for the flag-as-value spelling, which would
+# otherwise be swallowed as a filename and silently become a widening request.
+run_admin 42 --workflow ci.yml --baseline-workflow --any-workflow --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "--baseline-workflow --any-workflow (a flag as its value) → REFUSED (exit 2)" \
+  || fail "a flag was accepted as the baseline's value (exit $rc)"
+# (c3) THE INLINE SPELLING BEFORE `--` IS REFUSED, not handed to gh. Without this
+# arm `--baseline-workflow=x` falls through to the pass-through and the operator's
+# selector is SILENTLY IGNORED — the certificate is computed against a lane they
+# did not ask for, and the refusal then claims no baseline was named.
+new_scen inlinebaseline
+printf '%s\n' "$HEAD_PR2" > "$SCEN/head"
+run_admin 42 --baseline-workflow=ci-main.yml --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "--baseline-workflow=<v> (inline, before '--') → REFUSED (exit 2)" \
+  || fail "an inline baseline spelling was accepted or forwarded to gh (exit $rc)"
+grep -q "take their value as the NEXT" "$TMP/err" \
+  && pass "…naming why: the value would never reach the rail" \
+  || fail "the inline refusal does not say what is wrong with the spelling"
+[ -s "$SCEN/calls" ] && fail "the inline refusal made a gh call" || pass "…pre-gh, as required"
+# (c4) A TRAILING FLAG WITH NO VALUE MUST RETURN, NOT SPIN. `shift 2` with one
+# argument left fails and leaves `$#` unchanged, so the parse loop would re-read
+# the same token forever ("shift count out of range" on stderr, rail never exits).
+# The assertion is the exit code: a spin hangs this suite instead of failing it.
+run_admin 42 --baseline-workflow --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "a trailing --baseline-workflow with no value → REFUSED (exit 2), not a spin" \
+  || fail "a trailing --baseline-workflow did not refuse cleanly (exit $rc)"
+grep -q "it must name the WORKFLOW" "$TMP/err" \
+  && pass "…with the documented empty-value message" \
+  || fail "the trailing flag did not reach the empty-value refusal"
+# …and the EXPLICIT empty value, which is the shape an unset variable produces
+# (`--baseline-workflow $BASELINE` with BASELINE empty). It must hit the same
+# refusal: an empty value would otherwise be indistinguishable from "not given"
+# and silently fall back to --workflow — the silent-widening class this flag exists
+# to remove, not to re-introduce.
+run_admin 42 --workflow ci.yml --baseline-workflow "" --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 2 ] && pass "--baseline-workflow '' (an unset variable) → REFUSED (exit 2)" \
+  || fail "an EMPTY baseline value was accepted — it would fall back to --workflow silently (exit $rc)"
+grep -q "it must name the WORKFLOW" "$TMP/err" \
+  && pass "…and it says why: a value is required" \
+  || fail "the empty-value refusal does not explain itself"
+
+# (c5) THE REFUSAL SAYS WHOSE NAME IT LOOKED FOR. Three different invocation
+# shapes produce the same state with three different truths about the command the
+# operator typed; a constant sentence would be FALSE in two of them.
+new_scen baselinenote
+HEAD_BN="b9b9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BN" > "$SCEN/head"
+lane_pass "$HEAD_BN" 7903 > "$SCEN/runs-$HEAD_BN"
+: > "$SCEN/runs-main.by-workflow.ci.yml"
+: > "$SCEN/runs-main.by-workflow.typo.yml"
+run_admin 42 --workflow ci.yml --baseline-workflow typo.yml --dry-run >/dev/null 2>&1
+grep -q "that name came from --baseline-workflow, which you named" "$TMP/err" \
+  && pass "a named-but-empty baseline says the name came from the flag" \
+  || fail "the refusal misstates where the lane name came from"
+new_scen anynote
+printf '%s\n' "$HEAD_BN" > "$SCEN/head"
+lane_pass "$HEAD_BN" 7904 > "$SCEN/runs-$HEAD_BN"
+: > "$SCEN/runs-main"
+run_admin 42 --any-workflow --dry-run >/dev/null 2>&1
+grep -q "the lane filter was DROPPED for this run (--any-workflow" "$TMP/err" \
+  && pass "…and an --any-workflow run says the filter was dropped, not that a flag named a lane" \
+  || fail "the note is constant across invocation shapes — a false statement in this one"
+
+# (d) GOLDEN: A DEFAULT INVOCATION IS UNCHANGED. No flag means ONE name for both
+# sides, exactly as before — the PR lane and the base lane are the SAME workflow,
+# the evidence carries the same two line shapes, and none of the new vocabulary
+# leaks into it. This is the arm that fails if the two names ever drift apart for
+# callers who never asked for two.
+new_scen goldenone
+HEAD_GO="b7b7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_GO" > "$SCEN/head"
+lane_fail "$HEAD_GO" 7701 > "$SCEN/runs-$HEAD_GO"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-7701"
+{ main_red_n gmain 7702 3 'tests/test_pre.py::test_pre'
+} > "$SCEN/runs-main"
+run_admin 42 --workflow python-ci.yml --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a default --workflow invocation still certifies (exit 0)" \
+  || { fail "the default invocation changed behaviour (exit $rc)"; sed 's/^/      /' "$TMP/err" | tail -20; }
+grep -q '^test lane: python-ci.yml$' "$TMP/out" \
+  && pass "…its evidence still names the one lane on the head side" \
+  || fail "the head-side lane name changed for a default invocation"
+grep -q "main compared (union of 3 runs of python-ci.yml)" "$TMP/out" \
+  && pass "…and the SAME lane on the base side (one name, as before)" \
+  || fail "the base-side lane name diverged from the head side without the flag"
+grep -q "BASELINE-INAPPLICABLE\|--baseline-workflow" "$TMP/out" "$TMP/err" \
+  && fail "the new vocabulary/code path fired on an invocation that did not ask for it" \
+  || pass "…and none of the new state or flag vocabulary appears"
+
+# (e) A DISPLAY NAME WITH SPACES SURVIVES AS ONE ARGUMENT. `--workflow` accepts a
+# display NAME as well as a file, and agent-infra's own push lane displays as
+# `CI on main`. The base-side selector is assembled into an ARRAY and expanded at
+# the call site, so an unquoted array expansion would split that name into three
+# arguments and hand the parser a mangled selector — a bug the file-shaped
+# fixtures above cannot see.
+new_scen baselinespaces
+HEAD_BS="b8b8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BS" > "$SCEN/head"
+lane_fail "$HEAD_BS" 7801 > "$SCEN/runs-$HEAD_BS"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-7801"
+: > "$SCEN/runs-main.by-workflow.ci.yml"
+{ main_red_n smain 7802 3 'tests/test_pre.py::test_pre'
+} > "$SCEN/runs-main"
+run_admin 42 --workflow ci.yml --baseline-workflow "CI on main" --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a spaced display name is passed through as ONE argument (exit 0)" \
+  || { fail "a spaced baseline display name was word-split (exit $rc)"; sed 's/^/      /' "$TMP/err" | tail -10; }
+grep -q "main compared (union of 3 runs of CI on main)" "$TMP/out" \
+  && pass "…and the evidence names it whole" \
+  || fail "the spaced display name did not survive into the evidence"
+# (e2) …AND THE SAME MUST HOLD FOR A DEFAULT INVOCATION (no baseline flag). The
+# base-side selector DEFAULTS to the head-side one, so the spaced name reaches the
+# base read through the default path — where an unquoted array COPY
+# (`arr=(${other[@]})`) would split it even though the flag itself was handled
+# correctly. This is the golden property, in the one case that can see the copy.
+new_scen spaceddefault
+HEAD_SD="b9b9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SD" > "$SCEN/head"
+lane_fail "$HEAD_SD" 7901 > "$SCEN/runs-$HEAD_SD"
+log_failed 'tests/test_pre.py::test_pre' > "$SCEN/log-7901"
+{ main_red_n dmain 7902 3 'tests/test_pre.py::test_pre'
+} > "$SCEN/runs-main"
+run_admin 42 --workflow "CI on main" --main-runs 10 --dry-run >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "a spaced --workflow with NO baseline flag keeps the default path intact (exit 0)" \
+  || { fail "the default base-side selector word-split a spaced --workflow (exit $rc)"; sed 's/^/      /' "$TMP/err" | tail -10; }
+grep -q "main compared (union of 3 runs of CI on main)" "$TMP/out" \
+  && pass "…because the base side copies the head side's selector as ONE argument" \
+  || fail "the default base-side selector did not name the same lane whole"
 
 # (c) THE OTHER DIRECTION: a MAIN-ONLY lane, i.e. the lane has runs on main and
 # none for the head. "The lane ran but exercised nothing" and "this lane does not
@@ -11510,9 +11902,18 @@ lane_fail mainbusy1 8802 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_main' > "$SCEN/log-8802"
 : > "$SCEN/runs-main.by-workflow.python-ci.yml"
 run_admin_here 42 --main-runs 10 --dry-run >/dev/null 2>&1
+# ⛔ THE REMEDY CHANGED WITH #3229, THE PROPERTY DID NOT. This block used to offer
+# `add --any-workflow BEFORE the -- separator`; it now refuses that widening by name
+# and offers `--baseline-workflow` instead (see 28b). What #4078 is about — the
+# printed remedy must WORK AS WRITTEN, with every parser flag BEFORE the separator —
+# is therefore pinned on the NEW text: the remedy shows no post-`--` spelling, and
+# the widening it used to print is gone.
+grep -q -- "--workflow <pr-lane> --baseline-workflow <main-lane>" "$SCEN/err" \
+  && pass "(#4078) the lane block prints a remedy that works as written (both parser flags before '--')" \
+  || { fail "(#4078/#3229) the lane block prints no usable remedy"; sed 's/^/      /' "$SCEN/err"; }
 grep -q "add --any-workflow BEFORE the -- separator" "$SCEN/err" \
-  && pass "(#4078) the lane block prints the remedy in the order that WORKS" \
-  || { fail "(#4078) the lane block still prints an order-dependent remedy"; sed 's/^/      /' "$SCEN/err"; }
+  && fail "(#3229) the lane block still prints the WIDENING as the remedy" \
+  || pass "(#4078/#3229) …and it no longer prints the order-dependent widening advice"
 
 # (g) …and so must the HEAD-side lane block — the exact output the issue observed.
 new_scen argorder-remedy-head
@@ -15470,6 +15871,26 @@ fi
 grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
   && fail "(o7) the reported bound is the stale pre-clamp 3600s value" \
   || pass "(o7) the reported bound is the clamped one, not the stale explicit value"
+
+
+# #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
+# file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is
+# executed by NOTHING (not even check-bash32-parse.sh, which only does a syntax check)
+# — the inert-enforcer class. That is exactly how the lease's remaining reclaim race
+# shipped green through five review cycles: the test existed and never ran.
+RAIL_EXIT_TEST="$(dirname "${BASH_SOURCE[0]}")/rail-exit.test.sh"
+# ⛔ A MISSING TEST FILE IS A FAILURE, NOT A SKIP (review cycle 6 finding 3). The previous
+# guard made a renamed, deleted or sparse-checkout-missing suite a NO-OP — no check
+# counted, no failure, green summary — which is the inert-enforcer class this very block's
+# comment invokes. And pass/fail ALREADY increment `checks`, so the previous explicit
+# increment counted this block TWICE in the denominator (finding 4).
+if [ ! -f "$RAIL_EXIT_TEST" ]; then
+  fail "(p) rail-exit.test.sh is MISSING at $RAIL_EXIT_TEST — the terminal-exit/lease/deadline regression guard did not run"
+elif bash "$RAIL_EXIT_TEST"; then
+  pass "(p) rail-exit.test.sh — terminal exit, whole-attempt deadline, per-PR lease"
+else
+  fail "(p) rail-exit.test.sh FAILED — see its output above"
+fi
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

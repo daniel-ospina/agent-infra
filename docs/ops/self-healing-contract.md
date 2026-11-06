@@ -69,7 +69,7 @@ measurement** — and is marked as such.
 | **universal dispatcher (one seam: place this lane on the machine with headroom)** — the epic's cell: *"❌ two ad-hoc scripts (`dispatch_generic.py`, `nonblocking-dispatch.sh`)"* | `capacity.sh` ships `cap_probe_local` / `cap_publish` / `cap_read_fleet` / `cap_place`, is sourced each cycle by `orch-loop.sh` (from `$O`, falling back to its own directory), and every cycle writes `[capacity] placement=… place=… lpc_self=… ceiling_lpc=… bound=…`. Cell-4's cycle record: `placement=place placed_on=cmux bound=none lpc_self=57` | **The seam exists.** Its *real* defect is different and worse: **its fleet view collapses to one box** (§3.10, measured). |
 | *"no machine except the Mac has an actuator that lands anything"* (the epic's own reading of its table) | tortoise **16 PRs merged in the 8 h to 14:50Z**, two of them at **14:47:28Z** and **14:47:52Z**; agent-infra **11** in the same window; cell-4 held live `merge-*` worker sessions at 14:46Z | **Cells do land work.** ⚠️ Attribution is the gap: **no landing record carries the box that landed it** (§3.3), so "can this machine land?" is unanswerable from the artifacts — which is the dispatcher's own question. |
 | **`pr-doctor` actually running** (epic: ❌ on every cell) | cell-4: `pgrep -f '[p]r-doctor.py'` → `0`; `pr-doctor.log` mtime `2026-10-22T12:55:05Z` (2 days); `0` systemd/launchd units matching `pr-doctor` | ✅ **Confirmed on cell-4.** Peers `UNREADABLE` (§1.1). |
-| **`auto-rail` actuator running** (epic: ✅ on the Mac, ❌ elsewhere) | a tree search for `auto-rail` and for `autorail`, **and** `git log --all -S'auto-rail'` over the history **excluding this document** (`-- . ':(exclude)docs/ops/self-healing-contract.md'` — the file you are reading is the only thing in this repo that names the string) → **no source hits**; not in tortoise's tree or history either | ⛔ **Unattributable capability**: `com.tortoise.auto-rail` exists only as a launchd label on one machine, with **no source in any repo**. It cannot be repaired from a branch and cannot be audited off the Mac. See `C5`. |
+| **`auto-rail` actuator running** (epic: ✅ on the Mac, ❌ elsewhere) | a tree search for `auto-rail` and for `autorail`, **and** `git log --all -S'auto-rail'` over the history **excluding this document** (`-- . ':(exclude)docs/ops/self-healing-contract.md'` — the file you are reading is the only thing in this repo that names the string) → **no source hits**; not in tortoise's tree or history either | ⛔ **Unattributable capability**: `com.tortoise.auto-rail` exists only as a launchd label on one machine, with **no source in any repo**. It cannot be repaired from a branch and cannot be audited off the Mac. See `C5`. **⛔ CORRECTED 2026-11-02 (#3225): the provenance half of this row is now FALSE** — `scripts/orchestrator-harness/auto-rail.sh` is tracked in this repo, so both searches above would now hit a source and this document is no longer the only thing naming the string. The measurement stands as of its date; the verdict does not. What remains unmeasured is the OTHER half: whether the copy launchd runs is that tracked file (the §1.3 skew), which no artifact here answers. |
 | the mandate's item 3, verbatim — *"a per-spawn gate let `pr-doctor` put 16 workers on a Mac already at load 57"* | no such measurement is recorded in the repo. The measured instance on record in `spawn-gate.sh`'s comment beginning *"There is no `lane.sh` in that path"* is **three lanes at load 258 on 10 cores** (`MAX_LOAD=100`) via a `tmux new-session` runner that never sourced the gate | ⚠️ **The epic's figure is UNVERIFIED here.** The *mechanism* it describes is real and documented (§3.9). |
 
 **The doubled pid in the first row is a second, independent finding:** the shipped emitter composes that phrase once (`_who="pid $(_pids_join "$_own")"` in `cloud-cell-supervisor.sh`, with the comment recording `"pid 15562491556249"` as the round-9 #2402 defect), so the **running** copy on this box predates that fix — the same skew §1.3 measures (pin `130638e40658`, running `d4ccaf6ee8e6`). The quote is verbatim from the journal at 14:47:43Z.
@@ -842,7 +842,7 @@ is what §3.10's placement is for.
 | `pr-doctor` running | ❌ (log 2 d old, 0 procs) | NC | NC | REC ✅ |
 | `pr-doctor` survives its session | ❌ no unit | NC | NC | REC ✅ (with TCC caveat) |
 | `nonblocking-dispatch` takes `prfix` | ✅ | NC | NC | NC |
-| `auto-rail` actuator | ❌* no source in any repo | ❌* | ❌* | REC (label only) |
+| `auto-rail` actuator | NC — no per-box read of this capability exists, and the provenance fact that made it `❌*` is gone: the source is now tracked (#3225), so absence is no longer provable | NC | NC | REC (label only) |
 | precedence rule (merge before new work) | ✅ in code + observed in the cycle record | NC | NC | NC |
 | placement seam present | ✅ | INF (publishes) | NC | REC ✅ (publishes) |
 | **placement sees more than one box** | ❌ (§3.10) | ❌* | ❌* | ❌* |
@@ -858,9 +858,13 @@ flatten them again — and neither should a reader who quotes only this list):
 - **`pr-doctor`'s activation and survivability: `❌` on cell-4, `NC` on cell-3 and cell-1 (no read
   channel), `REC ✅` on the Mac** — the Mac's ✅ is a RECORD, not a re-measurement.
   Both of those are `C5` (#2709).
-- **`❌*` on every cell, `REC (label only)` on the Mac**: `auto-rail`'s provenance — it has no source in
-  any repo (a fleet-wide provenance fact, not four per-box reads), so the Mac's label is a RECORD, not a
-  measurement. → `C5` (#2709).
+- **`NC` on cell-4, cell-3 and cell-1; `REC (label only)` on the Mac — CORRECTED 2026-11-02 (#3225)**:
+  `auto-rail`'s provenance. **As measured 2026-10-22** it had no source in any repo — a fleet-wide
+  provenance fact, not four per-box reads — which is what justified `❌*` on every cell. That fact is now
+  FALSE: `scripts/orchestrator-harness/auto-rail.sh` is tracked in this repo. `NC` is the honest code for
+  the three boxes that were never read, because neither the old provenance argument nor a measurement
+  supports a per-box verdict there; the Mac keeps `REC (label only)` because no artifact says the
+  DEPLOYED copy is the tracked file (§1.3 skew). → `C5` (#2709).
 - **`❌` on cell-4, `❌*` on the other three**: the fleet view — the transport is per work-repo, so no box
   can see another (`❌*`: a fact about the channel, not a read of each peer). → `C3` (#2707).
 - **`C6`** (#2710) is not one of these rows: it is the *shape* of the answer for all of them — a
@@ -1008,7 +1012,7 @@ still where the next cut should start.
 | **C2** | **#2708** — effect-based self-tests for the capabilities in §5.2 that earn one | C1 | the pattern is proven (§5.1); applying it 8× is its own work |
 | **C3** | **#2707** — the fleet view: a per-box identity + a transport that is not partitioned by work repo (and a `cap_place` that refuses to decide on a fleet of one) | C1 | needs a design decision with a measured basis; §3.10 carries the evidence |
 | **C4** | merge precedence — **already shipped** (#2099 / #2126 / #2203), observable, and pinned by `test-gates.sh` | — | **no child filed**: it exists. The epic's "threshold" phrasing is superseded by the #2099 ruling (§6) |
-| **C5** | **#2709** — per-machine parity + activation: `pr-doctor` and a land actuator on every cell, an `auto-rail` that has a source, and one parity surface | C1, C2, #2135, #2345, #1761 | blocked on a read channel (§1.1) and on the cell doctor's own inert role pass |
+| **C5** | **#2709** — per-machine parity + activation: `pr-doctor` and a land actuator on every cell, an `auto-rail` that has a source, and one parity surface | C1, C2, #2135, #2345, #1761 | blocked on a read channel (§1.1) and on the cell doctor's own inert role pass. **The `auto-rail` source half is satisfied by #3225** (`scripts/orchestrator-harness/auto-rail.sh` is tracked); parity and activation remain |
 | **C6** | **#2710** — "refusal is a verdict": a refusal carries a NAME, a REASON and a NEXT ACTION on every capability, and `UNKNOWN` is never a pass | C1, #2291 | **Landed:** `objective.py` (§3.7) and the repair actuator (§3.6) both refuse in the line AND the code, and §3.14 records who owns running-vs-pin. **Still open on this child:** the remaining capabilities' exit codes have not been graded against the §2 polarity rule (each needs its own measurement before it is changed), and `#2291` still owns separating "the box has no room" from "the transport refused" |
 
 Every child carries the same research mandate as the epic: **read

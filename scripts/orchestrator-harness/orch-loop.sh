@@ -275,6 +275,26 @@ MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # fails CLOSED to `MERGE_PRIORITY_AT + 1`, i.e. "treat the count as over the line"), and `MR`/`MF`
 # (review_slots/fix_slots) still scale the worker budgets with the backlog. Neither can open the gate.
 MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+# ── THE LANDING FLOOR: a WIP LIMIT ON OPEN PRs (stop starting, start finishing) ──────────────
+# WHY IT EXISTS: `mp_reason` gates the issue path on the UN-OWNED count, and a lane CLAIMS the PR it
+# opens — so every unit of production REMOVES itself from the gate's population. The gate therefore
+# cannot see WIP: 68 open PRs with all of them claimed reads `merge-priority=clear` and the box opens
+# more. Measured 2026-11-03 (2h window, de-batched): agent-infra opened 6 / merged 1; tortoise opened
+# 8 / merged 2 — a ~4:1 produce:land ratio with 68 and 37 open respectively. `MERGE_PRIORITY_AT`
+# does NOT throttle this: it only feeds `review_slots`/`fix_slots` headroom and the unreadable-count
+# fallback. Nothing in the knob set bounds total WIP, which is why the queue grows monotonically.
+# WHAT IT IS: ONE MORE ARM IN THE SAME GATE VECTOR — it sets `GATE_WHY` (so the ISSUE path closes)
+# exactly as `merge-priority` does, and nothing else. It is a WIP limit, not a quota: an unreadable
+# or out-of-range count fails CLOSED (drain). A red-tree / P0 that `floor_emergency` can see stands
+# the arm down (see the call site — the bound on what that covers is stated there, not glossed).
+# WHY 25, AND WHY PER-REPO: 25 is the OWNER's own chosen queue size (the `MERGE_PRIORITY_AT` ruling —
+# "something more like 10 PRs who are not being processed", scaled to 25). It is applied PER REPO
+# because WIP is only landable where it lives — a merged PR in tortoise does not drain agent-infra's
+# queue, so a fleet-wide sum would let one repo's backlog close another repo's issue path.
+# Little's law, for the justification: WIP = throughput x cycle-time. At the measured ~1.5 lands/h,
+# 25 open is ~17h of queue at today's landing rate — the point is that the fleet is FORCED to raise
+# the landing rate rather than open a 68th PR.
+LANDING_FLOOR="${LANDING_FLOOR:-25}"
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
 # printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
 # backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
@@ -483,6 +503,11 @@ is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 # count), rather than on a bare `[ … -ge 1 ]` test a mutation could delete unseen.
 is_limit "${MERGE_PRIORITY_MAX_AGE_MIN:-}" || MERGE_PRIORITY_MAX_AGE_MIN=180; [ "${MERGE_PRIORITY_MAX_AGE_MIN:-0}" -ge 1 ] || MERGE_PRIORITY_MAX_AGE_MIN=180
 is_limit "${FUNNEL_MAX_AGE_MIN:-}" || FUNNEL_MAX_AGE_MIN=30; [ "${FUNNEL_MAX_AGE_MIN:-0}" -ge 1 ] || FUNNEL_MAX_AGE_MIN=30
+# The landing floor follows the same bounded-shape rule. An unreadable value falls back to the
+# owner's existing 25 (never to 0, which would disarm the gate silently, and never to empty, which
+# would make the `-ge` test error and read FALSE — an errored test OPENS a gate).
+is_limit "${LANDING_FLOOR:-}" || LANDING_FLOOR=${MERGE_PRIORITY_AT:-25}
+[ "${LANDING_FLOOR:-0}" -ge 1 ] || LANDING_FLOOR=${MERGE_PRIORITY_AT:-25}
 is_limit "${MAX_FIX:-}"           || MAX_FIX=3
 is_limit "${MAX_FIX_TRIES:-}"     || MAX_FIX_TRIES=3
 # Both red-fixer caps fail OPEN in the same shape MAX_FIX_TRIES documents above (`[ "$n" -ge "$cap" ]`
@@ -732,9 +757,17 @@ done
 # failed copy — passed the gate as WIRED, then `cap_publish_logged … || true` swallowed `command not
 # found` (rc 127) and the box published NOTHING, silently: the exact defect this change fixes. The list
 # is what makes a stale module read as unwired, and the message names what is missing.
-if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars >/dev/null 2>&1; then CAPACITY=1; else
+# ⛔ SAY WHAT IT CHECKS, NOT MORE (review round 3): this is the DIRECT interface — the names the cycle
+# calls, plus the first hop of the #3446 line (`cap_fleet_line_from` → `cap_expected_boxes` /
+# `cap_fleet_inventory` / `cap_cmux_bin` / `cap_parse_inventory`), because a missing CONSUMER of the
+# cycle is what reads as wired-and-silent. It is NOT the transitive closure (that is 50 names, and a
+# list that long rots); a deeper helper that is absent still fails CLOSED and loudly — `command not
+# found` on the controller's stderr, and a line that over-reports ineligibility rather than certifying
+# a fleet. What this gate exists to stop is the SILENT false pass, and that is what the names below
+# cover.
+if declare -f cap_probe_local cap_place cap_read_fleet cap_publish cap_publish_logged cap_pub_why cap_host cap_kv cap_bound_hit cap_fork_bound cap_fork_probe cap_h_for_vars cap_procs_pair_vars cap_fleet_line_from cap_chan_of cap_expected_src cap_expected_boxes cap_fleet_inventory cap_cmux_bin cap_parse_inventory >/dev/null 2>&1; then CAPACITY=1; else
   CAPACITY=0
-  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, and this box publishes NOTHING to peers\n' >> "$LOG" 2>/dev/null || true
+  [ -n "$_cap_mod" ] && printf '[capacity] capacity.sh is present but INCOMPLETE (needs cap_probe_local/cap_place/cap_read_fleet/cap_publish/cap_publish_logged/cap_pub_why/cap_host/cap_kv/cap_bound_hit/cap_fork_bound/cap_fork_probe/cap_h_for_vars/cap_procs_pair_vars/cap_fleet_line_from/cap_chan_of/cap_expected_src/cap_expected_boxes/cap_fleet_inventory/cap_cmux_bin/cap_parse_inventory) — placement falls back to the LOCAL gates only; work is NOT moved off a saturated box, this box publishes NOTHING to peers, and nothing reconciles EXPECTED against PUBLISHED (the #3446 fleet line is not emitted, so a dead box reads the same as a full one)\n' >> "$LOG" 2>/dev/null || true
 fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
@@ -2658,8 +2691,30 @@ mp_recent_land() { # [<state-dir>]
   # Only a land inside 2x the gate's window can matter, so `find -mmin` shortlists and the loop stats
   # only those. A land older than that reads as "no recent land" — which is exactly the gate's own
   # question (a land outside the window releases anyway), and `[cap]`'s `last_land=` prints `?`.
-  local d="${1:-$O/state}" f m newest="" bound list
-  bound=$(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))
+  local d="${1:-$O/state}" f m newest="" bound list _b
+  # ⛔ SELF-CONTAINED, AND NOT VIA `is_limit` (review P2, 2026-11-01). The `10#` below ERRORS on a
+  # non-numeric knob, and an errored assignment leaves `bound` unset — `find -mmin -""` then fails and
+  # this function prints NOTHING. Since #2929 an empty answer is a DEFINITE escalation (and a dispatched
+  # worker), so a typo would have become a stall report about a measurement that never happened. The
+  # coercion is spelled out in `case` form for the reason `floor_norm` documents in this same file: the
+  # test harnesses extract these functions STANDALONE (`test-gates.sh`'s `drain_helpers.sh` and
+  # `pr_all.sh` carry `is_num` and NOT `is_limit`), so a call to `is_limit` here is 127 there — which
+  # would have made the guard a silent no-op in exactly the context it was added for, and it disagreed
+  # with the drain block's own normalisation for `0`. `0` is refused as well: `find -mmin -0` matches
+  # nothing, i.e. a permanently empty answer, i.e. a permanent false stall.
+  _b="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+  case "$_b" in ''|*[!0-9]*) _b=180 ;; *) _b=$(( 10#$_b )) ;; esac
+  [ "$_b" -ge 1 ] || _b=180
+  # ⛔ AND THE UPPER CLAMP, so the SEARCH and any caller reporting this window cannot disagree
+  # (fresh-context review, 2026-11-02). Bash wraps silently rather than erroring: `_b * 2` on an
+  # overflowing knob produces a NEGATIVE bound, and `find -mmin --2` SUCCEEDS AND MATCHES NOTHING —
+  # so the function answers "no recent land" for a search it never ran. The drain block clamps to
+  # 1000000 and this function did not, so a box that landed 5 minutes ago could be reported as stalled
+  # over "the 360m window" that was never searched. Both copies now spell the SAME two clamps for the
+  # same reason the `is_num` copy above is spelled inline (test harnesses extract this function
+  # STANDALONE, so a shared helper would be 127 there).
+  [ "$_b" -le 1000000 ] || _b=180
+  bound=$(( _b * 2 ))
   list="$(find "$d" -maxdepth 1 -name 'merged-*.done' -mmin -"$bound" 2>/dev/null || true)"
   # A here-string, not `find … | while`: under `pipefail` the reader can exit first and make the
   # pipeline read FAILED (#841's class), and the process substitution would lose `newest` to a
@@ -2711,7 +2766,7 @@ spawns_since() { # spawns_since <since-epoch>  ->  "<n>\t<tag,tag,...>" (empty n
 # records a past state and is never revalidated" failure this file keeps removing, so a land newer
 # than the marker deletes it here — the writer does not have to remember to.
 drain_stall_token() {
-  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl
+  local f="$O/state/drain-stall" at passes spawns unowned lage m lbl agesrc _agefield
   [ -f "$f" ] || return 0
   at="$(sed -n 's/^at=//p' "$f" 2>/dev/null | head -1)"
   if is_num "${at:-}"; then
@@ -2722,9 +2777,24 @@ drain_stall_token() {
   spawns="$(sed -n 's/^spawns=//p' "$f" 2>/dev/null | head -1)"
   unowned="$(sed -n 's/^unowned=//p' "$f" 2>/dev/null | head -1)"
   lage="$(sed -n 's/^age=//p' "$f" 2>/dev/null | head -1)"
+  # ⛔ A SYNTHESISED AGE IS A BOUND, NOT A MEASUREMENT (review P3, #2929), and this is the line every
+  # reader parses — so it must say so. `>=` on the `no_land=` field is the distinction; a MEASURED age
+  # keeps the exact format every existing reader and `test-gates.sh` pin (`no_land=240m`). A record
+  # written before `agesrc` existed has no field, reads as measured, and is rendered exactly as before.
+  # ⛔ AND AN UNMEASURED AGE IS NOT A SMALLER BOUND (review P2, 2026-11-02): `agesrc=unmeasured` means the
+  # marker search never ran (a missing or unreadable `state/`), so the number in `age=` is the window
+  # that could not be searched — printing `>=360m` for it would be a claim about this box's stall that
+  # nothing took. The field prints `?`: absence of a measurement, in the shape every other
+  # unmeasurable field in this tree uses.
+  agesrc="$(sed -n 's/^agesrc=//p' "$f" 2>/dev/null | head -1)"
+  case "${agesrc:-}" in
+    synth)      _agefield=">=${lage:--}m" ;;
+    unmeasured) _agefield="?" ;;
+    *)          _agefield="${lage:--}m" ;;
+  esac
   lbl="$(drain_stall_label "$f")"
-  printf ' drain=%s(passes=%s,unowned=%s,no_land=%sm,spawns=%s)' \
-    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${lage:--}" "${spawns:-?}"
+  printf ' drain=%s(passes=%s,unowned=%s,no_land=%s,spawns=%s)' \
+    "${lbl:-UNMEASURED}" "${passes:-?}" "${unowned:--}" "${_agefield}" "${spawns:-?}"
 }
 # ── THE ESCALATION'S LABEL, DERIVED FROM ITS OWN MEASUREMENT (review c-1, 2026-10-23) ─────────────
 # ⛔ THE MARKER IS WRITTEN BY BOTH STALL ARMS, SO ITS *EXISTENCE* CANNOT MEAN "DEADLOCK". A STALLED
@@ -3449,6 +3519,18 @@ while true; do
       printf '[cycle] disk_held (cycle-record.sh absent — this state is NOT recorded anywhere)\n' >> "$LOG" 2>/dev/null || true
     fi
     _nap="$(( 10#${CYC:-240} + (10#${CYC:-240} / 5) ))"
+    # ⛔ A HELD CYCLE STILL REPORTS THE FLEET (fresh review, P2 — agent-infra#3446). This `continue`
+    # exits ~2,200 lines BEFORE the capacity block, so a disk-held cycle used to emit no `fleet:` line
+    # at all while §6a and the harness README claimed the reading is taken on "every cycle except the
+    # fork-exhausted one". A box holding for disk is precisely a SKIPPING cycle — the state the line
+    # exists to keep visible — and grepping for `fleet:` on such a box read as "instrument not
+    # deployed". The fork-starved arm above is the ONE exclusion, for a different reason (it must be
+    # builtins-only); this arm already forks freely through `disk_floor_gate`.
+    if [ "${CAPACITY:-0}" = "1" ]; then
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
+      CAP_CHAN_V="$(cap_chan_of "$REPO")"
+      echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
+    fi
     fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
     continue
   fi
@@ -5647,6 +5729,18 @@ PY
     elif [ -z "${CAP_REC:-}" ]; then
       CAP_STATE=unreadable
       echo "[capacity] this box's probe is UNREADABLE (no load/ncpu/disk/mem reading) — it is INELIGIBLE, and it will not place work on itself blind either" >> "$LOG"
+      # ⛔ EXPECTED vs PUBLISHED IS *NOT* SKIPPED HERE (agent-infra#3446, review). A box whose own probe
+      # failed is exactly the box an operator is asking about, and the fleet reading is independent of
+      # this box's probe — so the reconciliation is taken from the channel alone (`"" 0` on the record
+      # side only if the channel itself is unreadable, which `cap_fleet_line_from "" 2` would say). Here
+      # the channel is READ, and this box's own missing record simply does not count as published.
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
+      CAP_CHAN_V="$(cap_chan_of "$REPO")"
+      echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
+      # ⛔ THE ONE PATH THAT DOES NOT TAKE IT IS THE FORK-EXHAUSTED ONE ABOVE, deliberately: every step
+      # of `cap_fleet_line_from` forks (`date`, `cmux`, `git`), and that arm is built from BUILTINS ONLY
+      # because a failed fork terminates the shell (see FORK HEADROOM). A fork-starved box therefore
+      # reports `[fork]`/`[capacity]` and is seen by its PEERS' lines instead — stated, not hidden.
     else
       # THE LOCAL FORK BOUND, from the SAME record placement reads — one implementation, two consumers.
       CAP_FORK_BOUND_SELF="$(cap_fork_bound "$CAP_REC" 2>/dev/null)" || CAP_FORK_BOUND_SELF=""
@@ -5658,8 +5752,20 @@ PY
       # line AND is driven by the suite (§14 (16)-(18)), so its polarity, its reason parsing and its
       # CAP_BOXID gate are graded behaviour rather than a grep of this file's text.
       cap_publish_logged "$REPO" "$CAP_REC" "$LOG" "$CAP_NS" || true
-      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)" || CAP_FLEET=""
+      CAP_FLEET="$(cap_read_fleet "$REPO" 2>/dev/null)"; CAP_FLEET_RC=$?
       [ -n "${CAP_FLEET:-}" ] || echo "[capacity] NO peer reading could be read from $CAP_NS — an absent record is not 'fine': every box without one is INELIGIBLE (this box's own record is still used)" >> "$LOG"
+      # ⛔ EXPECTED vs PUBLISHED, EVERY CYCLE THAT HAS A READABLE PROBE (agent-infra#3446). Everything
+      # above is fail-closed in ONE direction — a box that cannot publish is INELIGIBLE — which is right
+      # for SAFETY and cannot tell a DEAD box from a FULL one, because both publish nothing. MEASURED
+      # 2026-11-04: `cmux vm ls` said 5 of 5 machines running while `refs/boxes/*` held ONE ref, and a
+      # controller concluded "there is no usable remote capacity" while ~87 lanes sat idle across four
+      # running cells. This line joins the two readings so the absence is a READING:
+      # `expected=5 published=1 INELIGIBLE=4 (…)`, or `expected=UNKNOWN` WITH its reason — never
+      # `expected=0`, and never `published=0` for a read that failed. `CAP_FLEET_RC` is passed in so an
+      # unreadable channel says `published=UNREADABLE`; a `published=0` here would be a false claim of a
+      # quiet fleet of one. (The fork-exhausted cycle above does not take it — builtins only, see there.)
+      CAP_CHAN_V="$(cap_chan_of "$REPO")"
+      echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
       # THIS box's own record is appended even when its publish failed: it is MEASURED, not inferred.
       CAP_VERDICT="$(printf '%s\n' "${CAP_FLEET:-}" "$CAP_REC" | cap_place "$(cap_host)")" || true
       case "${CAP_VERDICT:-}" in
@@ -5673,7 +5779,16 @@ PY
       echo "[capacity] placement=$CAP_STATE place=${CAP_PLACE:-none} lpc_self=${CAP_LPC_SELF:-?} ceiling_lpc=${CAP_LPC_CEILING:-800}${CAP_BOUND:+ bound=$CAP_BOUND} — $( [ "$CAP_STATE" = refuse ] && printf 'REFUSED: %s' "${CAP_VERDICT:-?}" || printf '%s' "${CAP_VERDICT:-?}" )" >> "$LOG"
     fi
   else
-    echo "[capacity] capacity.sh is NOT available (looked in \$O and the script directory) — placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle" >> "$LOG"
+    # ⛔ PRESENT-BUT-INCOMPLETE IS NOT ABSENT (fresh review round 11, P2). This branch told the operator
+    # to look in `$O` and the script directory for a file that IS `$O/capacity.sh` and was sourced — so a
+    # STALE copy sent them to re-install instead of to re-seed, and the truthful line (printed ONCE at
+    # load, above) was long out of sight in the log. The drainer has named the two states apart since
+    # round 8; the controller half is the same two names.
+    if [ -n "${_cap_mod:-}" ]; then
+      echo "[capacity] capacity.sh is PRESENT but INCOMPLETE ($_cap_mod was sourced and defines none of the interface: a STALE copy) — re-seed \$O. Placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle, and the #3446 fleet line is NOT emitted" >> "$LOG"
+    else
+      echo "[capacity] capacity.sh is NOT available (looked in \$O and the script directory) — placement falls back to the LOCAL gates ONLY: no box can move work off a saturated box this cycle" >> "$LOG"
+    fi
   fi
   # swap_total=0 => swap uninitialised (fresh boot), NOT pressure — allow. An UNREADABLE probe is
   # UNKNOWN and takes that same allow, for the reason above; unlike 0 it is a distinguishable state
@@ -5758,6 +5873,73 @@ PY
     GATE_VEC="merge-priority(${UPN_WORK:-${UPN:-?}} un-owned PR(s) workable, ${SEL_TOTAL:-${OPEN_N:-?}} candidate(s))"
   else
     GATE_VEC="merge-priority=clear"
+  fi
+  # ── THE LANDING FLOOR ARM (WIP limit on OPEN PRs) ────────────────────────────────────────────
+  # ⛔ WHAT IT ADDS THAT NO OTHER ARM CAN: `merge-priority` counts UN-OWNED PRs, and a lane claims
+  # the PR it opens — so producing MORE work moves the gate's own input toward zero. Total WIP is
+  # invisible to it. This arm reads the total open count, which is the population the queue actually
+  # grows in, and closes the issue path at `LANDING_FLOOR`.
+  # ⛔ THE DOOR FOR A RED TREE / P0 IS THIS CALL, NOT A CLAIM IN A COMMENT. An emergency that
+  # `floor_emergency` can see OUTRANKS the floor: the arm stands down and the cycle produces the
+  # repair instead. `declare -f` guards the call because this block is EXTRACTED and evaled STANDALONE
+  # by the suite, where the function is unbound (the same `declare -f lo_select` idiom used below) —
+  # an unguarded call would return 127 and read as "no emergency", the fail-OPEN direction.
+  # ⚠️ BOUND ON THAT DOOR, STATED SO IT IS NOT OVERREAD: `floor_emergency` only speaks when it has a
+  # product row it could reorder (its own gate (0)), so on an EMPTY product backlog the floor still
+  # arms. That reachability is the same one `merge-priority` already had and is not widened here —
+  # the exemption is the mechanism, and what it does not cover is said rather than assumed.
+  LF_M="${LANDING_FLOOR:-25}"
+  case "$LF_M" in ''|*[!0-9]*|0?*) LF_M=25 ;; esac
+  [ "$LF_M" -ge 1 ] || LF_M=25
+  LF_EMERG=""
+  LF_VERDICT=""
+  declare -f floor_emergency >/dev/null 2>&1 && LF_EMERG="$(floor_emergency "${O:-}" "${BATCH:-1}" 2>/dev/null)"
+  # ⛔ THE EMERGENCY DOOR IS TESTED FIRST, SO IT COVERS EVERY BRANCH (review round 3, P2). It used to
+  # sit in the deepest `else`, which meant the three fail-closed branches (UNREADABLE, out-of-range,
+  # and the stale-fallback branch round 2 added) each assigned GATE_WHY WITHOUT ever consulting it —
+  # so the arm's own contract ("an emergency that floor_emergency can see OUTRANKS the floor") was
+  # false on 3 of 5 branches, and the one that is reachable on a broken listing was one of them.
+  # Hoisting it makes the statement structurally true instead of true-in-the-happy-path, and it is
+  # also the shortest form: stand down, or decide.
+  # ⛔ NOTE ON PROVENANCE (review round 3, P2 — a CORRECTION of round 2): `open_pr_count` never returns
+  # a non-numeric, but that does NOT let a stale/fabricated number slip past this arm in the shipped
+  # loop — `unowned_scan` (see its `[ -n "${list// /}" ] || { echo "$n"; return 0; }`) reads a
+  # listing-less failure as "NOTHING is owned", so `UPN == OPEN_N > 0` and `mp_reason` sets GATE_WHY
+  # from the FIRST arm, before this one runs. A broken listing therefore fail-CLOSES on `merge-priority`
+  # and this arm can never be the winner on those cycles. Round 2 added a state-file marker + a branch
+  # + two tests for that case; round 3 measured that deleting the marker left the suite green and the
+  # gate behaviour unchanged, so the mechanism was INERT and its tests graded a composition the shipped
+  # loop cannot reach. It has been REMOVED rather than pinned — a check that cannot fail is worse than
+  # no check, and an unpinnable one is worse still. The guards below are defence-in-depth for the arm's
+  # own contract, NOT a live fix for a fail-open.
+  if [ -n "$LF_EMERG" ]; then
+    LF_VERDICT="exempt(${LF_EMERG})"
+    GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+  else
+    case "${OPEN_N:-}" in
+      ''|*[!0-9]*|0?*)
+        LF_VERDICT="UNKNOWN"
+        GATE_WHY="${GATE_WHY:-landing-floor(open PR count UNREADABLE — landing before producing)}"
+        GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT" ;;
+      *)
+        # ⛔ THE LENGTH BOUND IS NOT DECORATION: `[` ERRORS at or above 2^63 and an ERRORED test is
+        # FALSE, which OPENS the gate — that is the exact reason `is_limit` exists. `is_limit` is not
+        # in scope inside this extracted block, so the bound is stated here.
+        if [ "${#OPEN_N}" -gt 6 ]; then
+          LF_VERDICT="UNKNOWN(out-of-range)"
+          GATE_WHY="${GATE_WHY:-landing-floor(open PR count OUT OF RANGE (${#OPEN_N} digits) — landing before producing)}"
+          GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+        else
+          if [ "${OPEN_N}" -ge "$LF_M" ]; then
+            LF_VERDICT="REFUSE(${OPEN_N}>=${LF_M})"
+            GATE_WHY="${GATE_WHY:-landing-floor(${OPEN_N} open PR(s) >= ${LF_M} — landing before producing)}"
+            GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+          else
+            LF_VERDICT="ok(${OPEN_N}<${LF_M})"
+            GATE_VEC="$GATE_VEC landing-floor=$LF_VERDICT"
+          fi
+        fi ;;
+    esac
   fi
   # ⛔ FORK HEADROOM IS THE FIRST CAPACITY GATE, AHEAD OF LOAD (agent-infra#2293). A box at 0.32x load
   # can be completely unable to spawn, so a chain that reports `load=` first describes the wrong
@@ -5905,12 +6087,24 @@ PY
     # issues would have made it invisible.
     # ⛔ The datum already exists and needs no new state: `mp_recent_land` reads the
     # `state/merged-<PR>.done` markers the merge sweep writes on every land. Its shortlist is bounded
-    # (2x the merge-priority window), so an EMPTY answer means "no land inside that bound" — which is
-    # the stalled condition, not an absence of evidence, PROVIDED a marker exists at all. A box that
-    # has never landed anything prints nothing: an unread baseline must not be reported as a stall
-    # (agent-infra#1931).
-    _land_any=0
-    for _f in "$O"/state/merged-*.done; do [ -e "$_f" ] && { _land_any=1; break; }; done
+    # (2x the merge-priority window), so an EMPTY answer means "no land inside that bound" — which IS
+    # the stalled condition, and it is the gate's own question.
+    # ⛔ AN EMPTY ANSWER IS THE STALL, NOT "UNKNOWN" (agent-infra#2929, measured 2026-10-27). This
+    # block used to escalate ONLY when `mp_recent_land` returned a number, i.e. only when a land was
+    # already inside the window — the dead-man's-switch inversion: an escalation that fires only on a
+    # SUCCESS event cannot report the ABSENCE of success events. On this Mac: 178 `merged-*.done`, 0
+    # within 360m, 16-19 un-owned PRs, `lanes=0` — the arm that exists for exactly that state never
+    # ran, for hours, and wrote no escalation record and no artifact.
+    # ⛔ IT DELIBERATELY REVERSES THE EARLIER CARVE-OUT. The previous arm kept SILENCE for a box whose
+    # markers were all outside the window, on the grounds that "an unread baseline must not be reported
+    # as a stall" (agent-infra#1931). The markers are THIS box's own merge-one successes, so after a
+    # state loss their absence is unmeasurable in BOTH directions — and #2929 names silence as the
+    # wrong side of that ambiguity: a box that cannot show it has landed is a box to escalate, not one
+    # to leave quiet. What keeps that honest is the WINDOW, not the carve-out: the synthesised age is
+    # `mp_recent_land`'s OWN bound (`2 x MERGE_PRIORITY_MAX_AGE_MIN`), the largest floor the empty
+    # answer proves, so a stall is UNDERSTATED and never invented, the printed line says the answer was
+    # empty, and a fresh numeric stamp still reads
+    # "drain alive" — the polarity of #2929 ask 3 is unchanged.
     # ⛔ NORMALISE THE TUNABLE (review P3): `[ "200m" -ge … ]` ERRORS (rc 2), an errored test is
     # FALSE, and the else arm would print "drain alive" — a false all-clear on the very condition this
     # line exists to name, every cycle. Every other knob in this file is normalised first (`is_num`,
@@ -5923,9 +6117,65 @@ PY
     _stallraw="${MERGE_STALL_MIN:-180}"
     _stallmin=180
     case "$_stallraw" in ''|*[!0-9]*) : ;; *) _stallmin=$(( 10#$_stallraw )) ;; esac
+    # ⛔ THE EMPTY ANSWER'S ONLY JUSTIFIED AGE IS THE WINDOW'S OWN BOUND (review P3, #2929). An empty
+    # `mp_recent_land` PROVES exactly one thing: no `merged-*.done` is inside `2 x
+    # MERGE_PRIORITY_MAX_AGE_MIN` (that is the `-mmin -bound` in the function). So the largest floor the
+    # answer supports is that bound — and it must be read from the SAME knob the function reads, not
+    # from `MERGE_STALL_MIN`, which is a DISPLAY threshold. Measured with the threshold-derived value:
+    # `MERGE_STALL_MIN=2000` + an empty answer printed `no PR merged in 2001m … the age is the window's
+    # lower bound`, i.e. 1641m of staleness the box never measured — the opposite of the `OVERRIDES:`
+    # claim that a stall is UNDERSTATED rather than invented. Normalised like `_stallmin` above: a
+    # non-numeric knob must not make this arithmetic error.
+    _wraw="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
+    _wmin=180
+    case "$_wraw" in ''|*[!0-9]*) : ;; *) _wmin=$(( 10#$_wraw )) ;; esac
+    # ⛔ THE SAME TWO CLAMPS `mp_recent_land` APPLIES, SPELLED HERE (fresh-context review, 2026-11-02).
+    # The function refuses `0` (`find -mmin -0` matches nothing: a permanently empty answer, i.e. a
+    # permanent false stall) and falls back to 180 — this copy did not, so `MERGE_PRIORITY_MAX_AGE_MIN=0`
+    # printed `no PR merged in 0m … the 0m window` for a window the function actually searched at
+    # 360m: an age claim the empty answer does not support. A magnitude that overflows `_wmin * 2` is
+    # worse: `_wbound` goes NEGATIVE and is printed as the box's own stall age (`no PR merged in -2m`,
+    # `age=-2`), which no reader can tell from a clock fault. Both clamp to the default, which is what
+    # the function this window is read from already does.
+    [ "$_wmin" -ge 1 ] || _wmin=180
+    [ "$_wmin" -le 1000000 ] || _wmin=180
+    _wbound=$(( _wmin * 2 ))
+    # ⛔ THE DISPATCH BELOW MUST SEE "DID THIS PASS STALL", NOT "WHAT IS THE COUNTER".
+    # `_dpass` is set only inside the stall arm; read on the drain-alive path it defaults to 0,
+    # and `0 % 3 == 0` dispatched a stall-repair worker on every HEALTHY pass (verifier,
+    # 2026-10-27). Initialised here — at the top of the block, so every pass resets it, which is
+    # also the reset the drain-alive path needs — and set to 1 only inside the stall arm.
+    _stalled=0
+    # ⛔ THE DISPATCH CADENCE NEEDS A COUNTER THAT WAS ACTUALLY PERSISTED (fresh-context review,
+    # 2026-11-02, P2). `_dpass` is re-read from `state/drain-stall` and incremented, and the write is
+    # checked — but the dispatch below was taken from `_dpass` regardless of whether that write
+    # succeeded, which fails in BOTH directions from one cause: an UNWRITABLE record (ENOSPC, a
+    # read-only `state/`) leaves `_dpass` at 1 forever, so `1 % EVERY != 0` and stall-fix.sh dispatches
+    # NOBODY under exactly the degraded-disk condition it should act on; a record FROZEN at a multiple
+    # of `EVERY` (a read-only mount) reads the same pass number every time, so `EVERY % EVERY == 0`
+    # dispatches a worker on EVERY stalled pass (~7 overlapping 1800 s workers). A counter that could
+    # not be persisted is not a cadence: `_dpok` gates the dispatch on the write.
+    _dpok=0
+    # ⛔ AN UNSEARCHABLE STATE DIR IS NOT A MEASURED ABSENCE (review P2). `find` on a missing or
+    # unreadable `state/` returns the SAME empty answer as "nothing landed", so the line below would
+    # report a fact about this box's markers that it never read. The VERDICT does not change: #2929
+    # rules that an empty answer IS the stall, and its `OVERRIDES:` records that after a state loss the
+    # markers' absence is unmeasurable in BOTH directions, so silence stays the wrong side. Only the
+    # CLAIM is narrowed to what was actually taken.
+    _lmread=0
+    [ -d "$O/state" ] && [ -r "$O/state" ] && _lmread=1
     _lm="$(mp_recent_land 2>/dev/null || true)"
     if is_num "${_lm:-}"; then
+      _lmsyn=0
       _lage=$(( ( $(date +%s) - (10#${_lm}) ) / 60 ))
+    else
+      # ⛔ NO LAND MARKER INSIDE THE WINDOW IS THE STALL ITSELF (#2929 ask 1). Synthesise the stamp so
+      # the gate EVALUATES instead of skipping, and use the MEASUREMENT'S OWN FLOOR (`_wbound`, the
+      # window `mp_recent_land` searched) — never a threshold — so the printed age is a bound the empty
+      # answer actually proves. Understating stays the safe direction; inventing does not.
+      _lmsyn=1
+      _lage=$_wbound
+    fi
       # ⛔ A FUTURE STAMP IS NOT A FRESH LAND (review cycle 3, P2). `find -mmin -N` passes a file
       # stamped in the future (a negative age is "less than N minutes ago"), so clamping it to 0 would
       # render a clock step-back as "drain alive" — and after the release valve was removed this line
@@ -5933,9 +6183,10 @@ PY
       # ruling removed. `dispatch_funnel` refuses the same shape for its own record ("A FUTURE at= IS
       # NOT A FRESH RECORD"). Print the UNMEASURED
       # case instead: it is neither a stall nor an all-clear, and it says which it is.
-      if [ "$_lage" -lt 0 ]; then
+      if [ "$_lmsyn" = "0" ] && [ "$_lage" -lt 0 ]; then
         echo "[dispatch] DRAIN STALL UNMEASURED — the newest land marker (state/merged-*.done) is stamped ${_lage#-}m in the FUTURE, so the drain's age cannot be read. This is neither a stall nor an all-clear; ${UPN_WORK:-?} un-owned remain and the issue path stays CLOSED (un-owned PRs first)." >> "$LOG"
-      elif [ "$_lage" -ge "$_stallmin" ]; then
+      elif [ "$_lmsyn" = "1" ] || [ "$_lage" -ge "$_stallmin" ]; then
+        _stalled=1
         # ── THE STALL IS ALSO AN ESCALATION (agent-infra#2590) ───────────────────────────────
         # The stall line alone escalated to nobody: it was printed 8 times on a live box that sat at
         # `lanes=0`, 9 un-owned, nothing landing for 3.4h, and its operator read the log as normal.
@@ -5956,9 +6207,24 @@ PY
         _dpass=$(( _dpass + 1 ))
         # ⛔ THE RECORD IS WRITE-CHECKED, like every other record this loop trusts: an escalation the
         # box cannot persist is an escalation that dies with the pass it was printed in.
-        if printf 'at=%s\npasses=%s\nage=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
-             "$(date +%s)" "$_dpass" "$_lage" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
+        # ⛔ THE RECORD CARRIES THE AGE'S PROVENANCE (review P3, #2929). Only the LOG line was labelled,
+        # so `drain_stall_token` printed the synthesised bound through the same `no_land=<age>m` field a
+        # MEASURED age uses — on the one line every reader parses. `agesrc` is additive (no reader is
+        # broken by a field it does not know) and is what lets the token say `>=` for a bound.
+        # ⛔ AN UNSEARCHABLE `state/` MAKES THE AGE UNMEASURED, NOT A LOWER BOUND (fresh-context review of
+        # #3181, 2026-11-02, P2). `_lmread=0` means no marker search HAPPENED — a missing or unreadable
+        # `state/` returns the same empty answer as "nothing landed" — so `_lage` is the window this pass
+        # never searched, and "no PR merged in 360m" is unknown rather than understated. The VERDICT is
+        # unchanged (the escalation is still taken: #2929 overrides the silence, and the markers' absence
+        # is unmeasurable in both directions); only the CLAIM moves into a third provenance, so `agesrc`
+        # has exactly one vocabulary — measured | synth | unmeasured — and no reader has to guess.
+        if [ "${_lmsyn:-0}" = "1" ] && [ "${_lmread:-1}" = "0" ]; then _agesrc=unmeasured
+        elif [ "${_lmsyn:-0}" = "1" ]; then _agesrc=synth
+        else _agesrc=measured; fi
+        if printf 'at=%s\npasses=%s\nage=%s\nagesrc=%s\nunowned=%s\nspawns=%s\nacts=%s\n' \
+             "$(date +%s)" "$_dpass" "$_lage" "$_agesrc" "${UPN_WORK:-?}" "${_spk:-UNMEASURED}" "${PRDISP_ACTS:-UNMEASURED}" \
              > "$O/state/drain-stall" 2>/dev/null; then
+          _dpok=1
           # ⛔ THE LABEL IS DERIVED, NOT HARD-CODED (review 3-P2). A STALLED pass records `spawns=4`
           # and `drain_stall_label` then prints STALLED, so promising "drain=DEADLOCK" here told the
           # operator to expect a token that is not there — the label drift the "one definition, two
@@ -6012,8 +6278,21 @@ PY
           _whysrc="$_whysrc; dominant named wait: \"${PRDISP_TOP:0:140}\""
         fi
         _whysrc="$_whysrc)"
+        # ⛔ THE LINE MUST NOT PRESENT THE SYNTHESISED AGE AS A MEASURED ONE. When the marker answer was
+        # EMPTY the age is the window's own lower bound, not "when this box last landed" — so the line
+        # says which it is, in the same place the age is printed (#2929's own reading: an empty answer
+        # means no recent land, "which is exactly the gate's own question").
+        _lmtail=""
+        if [ "${_lmsyn:-0}" = "1" ] && [ "${_lmread:-1}" = "0" ]; then
+          # ⛔ "THE AGE IS A LOWER BOUND" IS FALSE HERE (review P2): nothing was searched, so there is no
+          # window whose bound the empty answer proves. Say the age is UNMEASURED and name the window that
+          # was ATTEMPTED, so an operator cannot read a number this box never took as one it took.
+          _lmtail=" (state/ could not be searched, so whether a land marker exists is UNMEASURED — the escalation is still taken (#2929), and the age is NOT a reading: the ${_wbound}m window below is the one that could not be searched, so this box's real stall age is unknown, not ${_lage}m)"
+        elif [ "${_lmsyn:-0}" = "1" ]; then
+          _lmtail=" (no land marker inside the ${_wbound}m window at all — the empty answer to 'has this box landed' IS the stall, so the age is AT LEAST that window's own bound and the real stall may be older)"
+        fi
         if [ "${_spk:-}" = "0" ]; then
-          echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
+          echo "[dispatch] DRAIN DEADLOCK — no PR merged in ${_lage}m${_lmtail}, ${UPN_WORK:-?} un-owned remain, and this pass STARTED NO WORKER (0 worker records created; ${PRDISP_ACTS:-?} disposition action(s), none of which spawns)${_whysrc}. The issue path stays CLOSED (owner ruling 2026-10-18: no new work while un-owned PRs remain) — this pass escalates instead of opening work. ${_esc}.${_refsuf:-}" >> "$LOG"
         else
           # ⛔ AN UNMEASURED COUNT MUST NOT CARRY A POSITIVE DIAGNOSIS (review 2-P2). "the workers run
           # and nothing lands" is a claim ABOUT SPAWNS, and the UNMEASURED arm did not measure them —
@@ -6023,7 +6302,7 @@ PY
           else
             _spn_tail="this pass cannot say whether any worker was started — the LAND problem is measured, the spawn reading is not"
           fi
-          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — ${_spn_tail}. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}.${_refsuf:-}" >> "$LOG"
+          echo "[dispatch] DRAIN STALLED — no PR merged in ${_lage}m${_lmtail} while ${UPN_WORK:-?} un-owned remain, and this pass ${_spn_txt}${_whysrc} — ${_spn_tail}. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work. ${_esc}.${_refsuf:-}" >> "$LOG"
         fi
       else
         echo "[dispatch] drain alive — last land ${_lage}m ago; ${UPN_WORK:-?} un-owned remain" >> "$LOG"
@@ -6035,8 +6314,26 @@ PY
         # its own line claimed N — a false statement about consecutiveness and a bound quietly cut to 1.
         [ "${PL_MOD:-0}" = "1" ] && pl_streak_reset "$O/state"
       fi
-    elif [ "${_land_any:-0}" = "1" ]; then
-      echo "[dispatch] DRAIN STALLED — no PR merged within the last $(( 10#${MERGE_PRIORITY_MAX_AGE_MIN:-180} * 2 ))m while ${UPN_WORK:-?} un-owned remain. The issue path stays CLOSED (un-owned PRs first): this is a land/capacity problem to fix, not a reason to open new work.${_refsuf:-}" >> "$LOG"
+    # ── THE ESCALATION MUST DISPATCH, NOT ONLY COMPLAIN (owner decision 2026-10-27) ──────────────
+    # Printed 8 times on a live box at lanes=0 for 3.4h; nothing was ever done about the stall itself.
+    # Owner ruling: the issue path MAY open (the #2832 escape), and a stall must ALSO put a worker on
+    # the LAND problem. It hangs off `_stalled` — the flag the ONE stall arm sets — so it fires on
+    # BOTH stall shapes ("started nothing" = DEADLOCK, "workers run, nothing lands" = STALLED) and on
+    # NEITHER of the other two ("drain alive", "UNMEASURED"), which is the whole gate: a dispatcher
+    # reading the pass COUNTER instead of the stall dispatched on every healthy pass (`0 % 3 == 0`).
+    # ⛔ IT IS BOUNDED AND IT FAILS CLOSED: stall-fix.sh dispatches one read-only diagnostician per
+    # DRAIN_STALL_FIX_EVERY stalled passes, and it never touches a PR a lane holds; when it cannot
+    # dispatch (no brief dir, no dispatch script, no worktree) it SAYS so instead of returning silently.
+    # ⛔ ITS OUTPUT GOES TO $LOG, like every other line this block prints: on launchd the loop's stdout
+    # is a different file, and an escalation the operator cannot find where he reads is not one.
+    if [ "${_stalled:-0}" = "1" ] && [ "${_dpok:-0}" != "1" ]; then
+      echo "[dispatch] DRAIN STALL -> STALL FIX SKIPPED (the pass counter could not be persisted to state/drain-stall, so the one-per-${DRAIN_STALL_FIX_EVERY:-3} bound cannot be enforced — dispatching anyway would fire on every stalled pass)" >> "$LOG"
+    elif [ "${_stalled:-0}" = "1" ] && [ -x "$O/stall-fix.sh" ]; then
+      O="$O" UPN_WORK="${UPN_WORK:-}" HARNESS_REPO="${HARNESS_REPO:-}" \
+        PRDISP_SPAWNS="${PRDISP_SPAWNS:-}" _AGESRC="${_agesrc:-measured}" \
+        bash "$O/stall-fix.sh" "${_dpass:-0}" "${_lage:-?}" >> "$LOG" 2>&1 || true
+    elif [ "${_stalled:-0}" = "1" ]; then
+      echo "[dispatch] DRAIN STALL -> STALL FIX MISSING ($O/stall-fix.sh absent or not executable) — the escalation recorded the stall and dispatched nobody" >> "$LOG"
     fi
     # [drain-health:end]
   else
@@ -6106,6 +6403,26 @@ PY
   if [ "${LO_CHOICE:-none}" != "issue" ] && [ -z "$GATE_WHY" ]; then
     GATE_WHY="selection (funnel chose '${LO_CHOICE:-?}', not issues)"
   fi
+  # ── THE LANDING-FLOOR LINE: ONE LINE PER CYCLE, THE NUMBERS THE DECISION USED ────────────────
+  # ⛔ A SILENT THRESHOLD IS THE SAME DEFECT CLASS AS A SILENT REAPER: a reader must be able to tell
+  # WHY the fleet did or did not dispatch, from the log alone, without reconstructing the gate. This
+  # line is emitted AFTER every arm has had its say, so `MODE` is the cycle's real decision and not a
+  # prediction of one. `MODE(land)` = the issue path is closed and the capacity is on the PR queue;
+  # `MODE(produce)` = the issue path is open. `FLOOR=` and `OPEN_PRS=` are printed even when the floor
+  # is not the binding reason, so the margin is visible before it is crossed — and `BINDING=` names
+  # which gate actually won, so a floor that is satisfied cannot be misread as the cause.
+  # ⛔ `FLOOR_VERDICT=` IS ON THIS LINE BECAUSE `GATE_VEC` IS NOT (review round 4, P2). `GATE_VEC` is
+  # printed only on the IDLE path, so a cycle where `floor_emergency` stood the floor down and the box
+  # dispatched — the very case R6 creates — read `MODE(produce) BINDING(none)` with the exemption
+  # nowhere on the line. That is the "silent threshold" defect this line exists to prevent, one field
+  # over. Now every cycle states the floor's own verdict, whether or not the floor was the winner,
+  # and whether or not the box dispatched.
+  # ⛔ `FLOOR=` PRINTS THE VALUE THE ARM ENFORCED (`LF_M`, already coerced), NOT THE RAW KNOB (review
+  # round 2, P2): the arm re-coerces independently, so `LANDING_FLOOR=0` with `MERGE_PRIORITY_AT=0`
+  # survives the main coercion as 0, is rejected by the arm as 25, and the line used to print
+  # `FLOOR=0` while enforcing 25 — on the one line whose entire purpose is to make the threshold
+  # trustworthy.
+  echo "[landing-floor] OPEN_PRS=${OPEN_N:-?}@${OR:-?} FLOOR=${LF_M:-${LANDING_FLOOR:-?}} FLOOR_VERDICT=${LF_VERDICT:-?} → MODE($([ -z "${GATE_WHY:-}" ] && echo produce || echo land)) BINDING(${GATE_WHY:-none})" >> "$LOG"
   if [ -z "$GATE_WHY" ]; then
     : > "$O/.batch"; K=0
     # ── THE PRODUCT FLOOR, APPLIED AS AN ORDER (agent-infra#2054) ───────────────────────────────

@@ -61,8 +61,22 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
                agent names: the box's own inventory, attributable to a name and a repo.
   3. READ      the repo's pool (`gh api …/actions/runners`): name, status, busy, labels.
   4. CLASSIFY  each local install — the ORDER of these checks is the safety property
-               OTHER-REPO  its `.runner` names a DIFFERENT repo. Checked FIRST: this repo's pool
-                         cannot see that registration at all, so the absence below would
+               CONFIG-LOST its `.runner` is present and EMPTY (0 bytes). Checked first, before any
+                         pool comparison, because the install has no agentName and no URL: it must
+                         be REPORTED, not folded into a state that describes something else.
+                         Without this branch an empty `repo` compares UNEQUAL to `--repo`, so the
+                         install reads OTHER-REPO — never repaired either, but SILENT: it would
+                         leave `config_lost` and `notes` empty, a positive claim that nothing is
+                         lost, on the only CLASS-LEVEL channel a machine reader has (the same fact
+                         is also visible per install as `runners[*].state`, see `--json` above;
+                         `config_lost` exists because a consumer asking "is any slot dead?" should
+                         not have to filter `runners`). Never repaired (the agent
+                         name a re-registration needs is exactly what it lost). Its LIVENESS is
+                         still measured: a truncated config does not stop a listener that is
+                         already up. A NON-empty unparseable config is NOT this state — it may
+                         still describe a live registration, so it aborts the pass.
+               OTHER-REPO  its `.runner` names a DIFFERENT repo. Checked before this repo's pool:
+                         the pool cannot see that registration at all, so the absence below would
                          otherwise read as ORPHANED and re-register it HERE with `--replace`,
                          deleting another repo's registration and cancelling its job. Reported,
                          never touched.
@@ -78,8 +92,10 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
                if it is demonstrably still offline is it re-registered (`--replace`), and an
                UNREADABLE pool is never treated as offline. ORPHANED → re-register under its own
                name with `--replace` (adopts the stale registration; never a duplicate), keeping
-               the labels it already carries. A BUSY, SERVING or OTHER-REPO runner is never
-               restarted, relabelled or removed.
+               the labels it already carries. A BUSY, SERVING, OTHER-REPO or CONFIG-LOST runner is
+               never restarted, relabelled or removed — CONFIG-LOST because the agent name a
+               re-registration needs is exactly what it lost, so the arm would act on an invented
+               name.
   6. FILL      while live < target: add ONE runner, printing `mem_available_mb` before and after,
                and stop if the next addition would leave < MEM_RESERVE_MB. A NEW install is
                created by the provisioner (`tools/install-ci-runner-x64.sh`, the one registration
@@ -169,6 +185,21 @@ USAGE  (the interpreter is NAMED, so a box whose `python3` is older than 3.12 is
     RUNNER_AUTOSCALE_CRONTAB       `crontab` used to answer that question (default: on PATH; a TEST
                                    seam). A COMMENTED-OUT line is not a schedule
 
+  ⛔ `--json` CONSUMERS: `config_lost` is the DEDICATED class-level key for an install whose
+  `.runner` was destroyed (a 0-byte file). It is a LIST of install directories, and the same fact is
+  also visible per install as `runners[*].state == "CONFIG-LOST"` with its `dir` — `config_lost`
+  exists because a consumer asking "is any slot dead?" should not have to filter `runners`, and
+  because it survives a pass that stops early. It is deliberately NOT a `problem`: `problems` sets
+  `verdict="action-failed"` above the starvation
+  branch, so a standing lost slot reported there would DELETE `starvation` and return exit 3 on a
+  box that owes the starved exit 4 — the alarm muted by the condition it exists to report. It gets
+  its OWN verdict (`config-lost`, exit 6) placed BELOW the starvation branch, so the slot is loud
+  without ever muting the queue alarm; a box that needs a human must not read as "nothing to do". It is
+  derived from the classification at record-build time, so it is present (and NAMES the slot) on
+  passes that stop early — a `--want` refusal included. Read it as "this slot is dead until a
+  human re-registers it", not as "the box is short a runner": its listener may still be live and
+  still counted in `running`/`live`.
+
   ⛔ `--json` CONSUMERS: `starvation` is THREE-VALUED and the healthy value is `"ok"`. `"starved"` is
   the alarm; `"unmeasured"` means the queue could not be read and the invariant was NOT evaluated —
   never read that as healthy (a monitor whose test is `starvation != "starved"` treats blindness as
@@ -203,6 +234,11 @@ EXIT  0 converged / nothing to do, or a CAPACITY ANSWER that is not a failure (`
         path, or more than one ExecStart= on a non-oneshot type) — or an audit that read nothing at
         all. A READ-ONLY finding, deliberately distinct from 3: a consumer keying on "an action
         failed" must not confuse it with "my units are misconfigured".
+      6 an install's `.runner` config was DESTROYED (a 0-byte file). The pass COMPLETED and the box
+        WAS measured — so this is deliberately not 2 — but the slot holds no agentName and no URL,
+        so this tool cannot re-register it: it stays dead until a human does. Placed BELOW
+        STARVATION, so a starved box still exits 4; everything below it in the verdict chain is
+        exit 0, because a box that needs a human is not "nothing to do".
       A pass whose provisioner refuses while THIS tool's disk arm says one more runner fits reports
       the verdict `guard-conflict` (exit 3, both sides' numbers in the notes): the two guards answer
       different questions, and the disagreement is a decision for a human, not an action failure.
@@ -258,13 +294,16 @@ STARVATION_CONFIRM_DEFAULT_S = 30.0
 STARVATION_CONFIRM_MAX_S = 300.0
 
 # ⛔ THE GATE'S OWN ENGAGEMENT THRESHOLD, COPIED DELIBERATELY AND PINNED BY THE SUITE
-# (`ci_runner_gate.sh:43` `QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-60}"`; T43 reads THAT file and
-# fails if this constant drifts from its default). It is the ONE number
+# (`ci_runner_gate.sh` `QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"`; T43 reads THAT file and
+# fails if this constant drifts from its default). The gate's default moved 60 -> 10 on the owner
+# ruling of 2026-11-02 (daniel-ospina/tortoise#9878), and this copy MUST move with it: left at 60 the
+# starvation alarm would only fire on a queue the gate itself had already stopped calling unhealthy,
+# i.e. the term would be dead exactly when the pool is being engaged. It is the ONE number
 # the project already uses to say "this queue is a GitHub-hosted backlog that is not draining". The
 # starvation alarm needs it as an ELIGIBILITY term (see `starvation_eligible`): `queued>0` alone is
 # true of a perfectly healthy fallback-only pool, and a deep queue with an idle pool is a mismatch
 # worth paging on whatever the pool advertises (review finding P1).
-GATE_QUEUE_THRESHOLD = 60
+GATE_QUEUE_THRESHOLD = 10
 
 # ⛔ AND THE ONE DATUM A CELL *CAN* MEASURE WHEN THE GATE'S INTENT IS UNKNOWABLE: THE AGE OF THE
 # OLDEST WAITING RUN (review finding P1, round 11). The eligibility terms above need something only a
@@ -510,6 +549,14 @@ class LocalRunner:
     name: str
     repo: str
     alive: bool = False
+    # ⛔ A CONFIG THAT IS EMPTY IS NOT A CONFIG THAT IS UNREADABLE. `.runner` present with ZERO
+    # bytes records NO registration at all: no agentName, no URL, so it cannot describe a live
+    # runner anywhere. That makes it the one unparseable shape this exemption is safe for — which is
+    # the hazard the `Unmeasurable` in `_read_runner_config` exists to prevent. In the MEASURED
+    # 2026-11-03 shape its `.credentials` and `.credentials_rsaparams` were truncated in the same
+    # breath, but this file does NOT stat those two: the exemption rests on the empty `.runner`
+    # ALONE (see `discover()`).
+    config_lost: bool = False
 
     @property
     def unit(self) -> str:
@@ -545,6 +592,18 @@ def _read_runner_config(directory: Path) -> tuple[str, str]:
         data = json.loads(cfg.read_text(encoding="utf-8-sig", errors="replace"))
     except (OSError, ValueError) as exc:
         raise Unmeasurable(f"{cfg} is not a readable runner config ({exc})") from exc
+    if not isinstance(data, dict):
+        # ⛔ A `.runner` whose bytes are VALID JSON but not an OBJECT (`null`, `[]`, `"x"`) is
+        # unreadable in exactly the same sense as a truncated one, and it must leave through the
+        # SAME door. Measured: `data.get(...)` on those shapes raised `AttributeError`, which is not
+        # `Unmeasurable`, so it escaped the tool's error contract and printed a traceback instead of
+        # the one line the log is read for — the pass still aborted (exit 2), so nothing was repaired
+        # on a guess, but the cause was unreadable. Non-empty is NOT exempt (see `discover()`'s
+        # `st_size == 0` gate): anything with bytes could describe a live registration.
+        raise Unmeasurable(
+            f"{cfg} is not a readable runner config (top-level JSON is not an object: "
+            f"{type(data).__name__})"
+        )
     name = str(data.get("agentName") or "").strip()
     repo = str(data.get("gitHubUrl") or "").strip()
     if not name or not repo:
@@ -600,10 +659,29 @@ def discover(root: str | Path) -> list[LocalRunner]:
     """Every runner install under `root/gh-runner*`, sorted by directory name.
 
     A sibling directory with no `.runner` is SKIPPED (a download that never registered is a fact
-    about the box, not a reason to abort the pass). A `.runner` that exists and cannot be parsed
-    RAISES: silently dropping it would make the box think it has one fewer runner than it has,
-    and it would then register a duplicate under a new name. An install this account cannot INSPECT
-    raises `Unmeasurable` for the same reason — "unreadable" is not "absent" (review finding P1).
+    about the box, not a reason to abort the pass). A `.runner` that exists, is NON-EMPTY and
+    cannot be parsed RAISES: silently dropping it would make the box think it has one fewer runner
+    than it has, and it would then register a duplicate under a new name. An install this account
+    cannot INSPECT raises `Unmeasurable` for the same reason — "unreadable" is not "absent"
+    (review finding P1).
+
+    ⛔ A ZERO-BYTE `.runner` IS NEITHER OF THOSE, AND IT USED TO ABORT THE WHOLE PASS. The raise
+    above is right about a config that MIGHT describe a live registration; an empty one cannot —
+    it carries no agentName and no URL. In the MEASURED shape its `.credentials` and
+    `.credentials_rsaparams` were truncated in the same breath, so nothing could authenticate as it —
+    and this file does NOT stat those two, so the exemption rests on the empty `.runner` alone. Treating it as `Unmeasurable` made ONE destroyed install —
+    exactly the state a disk that fills mid-write leaves behind, and the state every repair arm in
+    this file exists to heal — fatal to the entire pass, so the box was never measured, the
+    ceiling predicate never ran, and no runner was ever repaired. MEASURED on cell `cmux`
+    2026-11-03: `/opt/gh-runner-x64-5/.runner` was truncated to 0 bytes (with `.credentials` and
+    `.credentials_rsaparams`) by the ENOSPC that also killed `runsvc.sh` with `No space left on
+    device`, and `runner-autoscale.service` then failed every ~9 minutes with
+    `UNMEASURABLE (nothing changed): … not a readable runner config` for 6 hours (42 consecutive
+    passes, 02:38Z–08:29Z) while 111 jobs sat queued and 0 of them held a runner. The install is
+    reported as `CONFIG-LOST` instead: named in `config_lost` and `notes` — NOT in `problems`, which
+    would set `verdict="action-failed"` above the starvation branch and mute exit 4 — and never
+    repaired (its identity is gone, so it cannot be re-registered under its old name). Its liveness
+    is still MEASURED (a truncated config does not stop a listener that is already up).
     """
     base = Path(root)
     # ⛔ EVERY PROBE HERE IS THREE-VALUED, like `_inspect_path` — because the pass runs this FIRST
@@ -649,6 +727,25 @@ def discover(root: str | Path) -> list[LocalRunner]:
                 "counted, and counting it as absent would register a duplicate"
             )
         if cfg_stat is None:
+            continue
+        # ⛔ BEFORE `_read_runner_config`, not inside it: the raise there is load-bearing for a
+        # config that might describe a live registration, and only the EMPTY case is exempt.
+        if cfg_stat.st_size == 0:
+            # ⛔ `alive` IS MEASURED HERE, NOT FORCED FALSE (review finding P1). A CONFIG-LOST
+            # install can still have a spinning `Runner.Listener` — `_listener_dirs()` sees it, and
+            # its own docstring is explicit that liveness is "MEASURED, never inferred". Forcing
+            # False dropped a real listener out of `running`/`live`, so the pass under-counted the
+            # box and then ADDED a runner onto an already-full machine — the round-2 over-fill on
+            # the one arm (cores) that does not depend on `live` at all.
+            found.append(
+                LocalRunner(
+                    directory=entry,
+                    name="",
+                    repo="",
+                    alive=str(entry) in alive,
+                    config_lost=True,
+                )
+            )
             continue
         name, repo = _read_runner_config(entry)
         found.append(LocalRunner(directory=entry, name=name, repo=repo, alive=str(entry) in alive))
@@ -790,7 +887,7 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
 
     ⛔ THAT REFUSAL IS DEFENSIVE, AND ITS RATIONALE IS STATED RATHER THAN IMPLIED (round-13 review,
     2nd round). The age read is only taken when the DEPTH term has not already decided, i.e. when
-    `queued < GATE_QUEUE_THRESHOLD` (60) — and `QUEUE_AGE_PAGE` is 100. So at the shipped constants a
+    `queued < GATE_QUEUE_THRESHOLD` (10) — and `QUEUE_AGE_PAGE` is 100. So at the shipped constants a
     saturated page cannot arise here, and the `total` this read sees always equals the `queued` the
     depth term already declined to alarm on. It is kept because the two numbers are INDEPENDENT (the
     gate's threshold is operator-settable while its counterpart here is a module constant), and
@@ -901,7 +998,7 @@ def starvation_eligible(
       * the pool ADVERTISES the fallback label right now — work can be handed to us and is not; or
       * the gate WANTS `local` — the pool should be carrying it and is not (this is #2875's own shape:
         the label had been stripped while the gate was asking for the fallback); or
-      * the queue is at/above the GATE'S OWN threshold (`GATE_QUEUE_THRESHOLD`, the same 60 the gate
+      * the queue is at/above the GATE'S OWN threshold (`GATE_QUEUE_THRESHOLD`, the same 10 the gate
         uses to call a GitHub-hosted backlog unhealthy) — a deep queue with an idle pool is worth a
         page whatever the labels say, and the pool read is the only other evidence available; or
       * the queue's OLDEST waiting run is older than `STARVATION_QUEUE_AGE_S` — the one term a CELL
@@ -1629,8 +1726,10 @@ def _clear_local_config(directory: Path) -> dict[str, tuple[int, bytes]]:
     it back exactly as it was.
 
     ⛔ Safe only where it is called from: `register()` is reached for DEAD and ORPHANED installs
-    only — the classifier never repairs a BUSY, SERVING or OTHER-REPO runner — so nothing that may
-    be serving a job loses its credentials.
+    only — the classifier never repairs a BUSY, SERVING, OTHER-REPO or CONFIG-LOST runner — so
+    nothing that may be serving a job loses its credentials, and nothing whose identity is GONE
+    is put through a `--replace` on an empty name (which would delete these files and leave
+    nothing to re-register from).
     ⛔ And it is STASHED, not just deleted: if the re-registration then fails (no network, a spent
     token), the install would otherwise lose its `.runner`, become invisible to `discover()` — which
     requires it — and look FREE to the provisioner, which sends the next pass down the "fresh
@@ -2907,6 +3006,7 @@ def converge(
         # printing `DEAD r-3` two lines above it. Two fields, two claims: what was done, and what a
         # real pass would do.
         "would_repair": [],
+        "config_lost": [],
         "plan": [],
         "notes": [],
         "verdict": "",
@@ -2935,7 +3035,18 @@ def converge(
     for r in local:
         entry = pool.get(r.name)
         # ⛔ THE ORDER OF THESE BRANCHES IS THE SAFETY PROPERTY (review rounds 1–2).
-        #  1. ANOTHER REPO first: `pool` is ONE repo's pool, so an install whose `.runner` names
+        #  0. A LOST CONFIG first, before ANY pool comparison — and the cost of removing it is
+        #     SILENCE, not a `--replace` (corrected: an earlier version of this comment claimed
+        #     `pool.get("")` would answer `None` → ORPHANED → a re-registration. It cannot: an
+        #     empty `r.repo` is UNEQUAL to `--repo` at the next `elif`, so the chain stops at
+        #     OTHER-REPO and the `entry is None` arm is never reached. OTHER-REPO is never repaired
+        #     either, so the defective outcome was never destruction — it is that the lost slot
+        #     would vanish from `config_lost` and `notes` and be reported as ANOTHER REPO'S runner,
+        #     a positive claim that nothing is lost, on the one CLASS-LEVEL channel a machine reader
+        #     has.)
+        #     It is therefore REPORTED (`config_lost` + `notes`) and never repaired; its slot stays
+        #     dead until a human (or a future arm that can name it) re-registers it.
+        #  1. ANOTHER REPO next: `pool` is ONE repo's pool, so an install whose `.runner` names
         #     a different repo is simply ABSENT from it — indistinguishable from ORPHANED by the
         #     pool read alone. Treating that absence as ORPHANED re-registers it against `--repo`
         #     with `--replace`, which DELETES the other repo's registration and cancels whatever
@@ -2944,7 +3055,9 @@ def converge(
         #     runner the pool does not list at all — a listener that lost its broker connection
         #     can be executing while the API says nothing about it, and `--replace` would kill it.
         #  3. Only then the pool's own view.
-        if _repo_slug(r.repo) != _repo_slug(repo):
+        if r.config_lost:
+            state = "CONFIG-LOST"
+        elif _repo_slug(r.repo) != _repo_slug(repo):
             state = "OTHER-REPO"
         elif _worker_alive(r) or (entry is not None and entry.busy):
             state = "BUSY"
@@ -2987,6 +3100,23 @@ def converge(
         )
     ceil, bound, reading = ceiling(ncpu, mem_mb, running, disk_free_mb, per_runner_disk_mb)
     reading = f"{reading} {disk_reading}"
+    for c in classified:
+        if c["state"] != "CONFIG-LOST":
+            continue
+        # ⛔ A NOTE, NOT A `problem` (see the classify branch): `problems` short-circuits the
+        # starvation PROBE itself, so a standing lost-config slot would delete `record["starvation"]`
+        # and return exit 3 where a starved box owes exit 4.
+        record["notes"].append(
+            f"CONFIG-LOST {c['dir']}: .runner is EMPTY (0 bytes) — the install has lost its "
+            "identity, so it cannot be re-registered under its old name and nothing was repaired. "
+            "To re-register deliberately: STOP that slot's listener/service FIRST (its config is "
+            "gone but the process is not), THEN remove the empty .runner — the installer treats any "
+            ".runner as an OCCUPIED slot, so a re-registration over it looks like a silent no-op. "
+            "Order matters: removing it while the listener is still up drops a live listener out of "
+            "`running`/`live` (a pass measures liveness by the listener, not by the config), which "
+            "makes this slot look FREE to the provisioner — it then installs a SECOND runner into "
+            "the directory that listener is still running from."
+        )
     record.update(
         ncpu=ncpu,
         mem_available_mb=mem_mb,
@@ -2996,6 +3126,14 @@ def converge(
         ceiling=ceil,
         reading=reading,
         runners=classified,
+        # ⛔ DERIVED FROM `classified` HERE, NOT APPENDED IN THE REPAIR LOOP (review finding P2).
+        # The repair loop can be left before it reaches a CONFIG-LOST entry — by a `--want` refusal
+        # and by any `stop_pass` break — and the field is the ONLY CLASS-LEVEL channel a machine
+        # reader has (the same fact is per install in `runners[*].state`, which IS published above; a
+        # consumer asking "is any slot dead?" should not have to filter `runners`). This is
+        # deliberately not a `problem`. Appending there published `"config_lost": []`, a
+        # positive claim that nothing is lost, on exactly the passes that stopped early.
+        config_lost=[str(c["dir"]) for c in classified if c["state"] == "CONFIG-LOST"],
         local=[{"dir": str(r.directory), "name": r.name} for r in local],
         pool_total=len(pool),
         pool_online=sum(1 for e in pool.values() if e.online),
@@ -3026,7 +3164,7 @@ def converge(
 
     target = ceil if want is None else want
 
-    # 5. REPAIR (DEAD / ORPHANED) — NEVER a BUSY, SERVING or OTHER-REPO runner ------------------
+    # 5. REPAIR (DEAD / ORPHANED) — NEVER a BUSY, SERVING, OTHER-REPO or CONFIG-LOST runner ------
     # ⛔ `live` IS THE BOX TOTAL, MEASURED — not a count of our own repairs. `ceiling` is also a box
     # total (`running` includes every listener alive on this box, another repo's included, because
     # their memory is really gone from MemAvailable), so the fill decision must compare like with
@@ -3050,7 +3188,21 @@ def converge(
     for r in local:
         by_name.setdefault(r.name, []).append(str(r.directory))
     duplicates = {name: dirs for name, dirs in by_name.items() if len(dirs) > 1}
+    # ⛔ THERE IS NO `""` GUARD HERE, AND ADDING ONE BACK WOULD BE DEAD CODE (#3355 review P2). It
+    # reads like it prevents a CONFIG-LOST install from being deduplicated, but `_read_runner_config`
+    # raises on an empty `agentName`/`gitHubUrl` (`_read_runner_config`'s `if not name or not repo:`
+    # guard — deliberately cited by NAME, not by line: a number here was wrong once already, #3355
+    # review), so `r.name == ""` iff `r.config_lost` —
+    # and every
+    # CONFIG-LOST entry `continue`s below, BEFORE `duplicates` is ever consulted (its only consumer is
+    # the duplicate check inside this loop). A `""` key can therefore sit in `by_name` and never be
+    # read: measured, replacing the old guard with `if False:` left the suite byte-identical.
     for c in classified:
+        if c["state"] == "CONFIG-LOST":
+            # Reported (in `record["config_lost"]` + `notes`, both filled at record-build time) and
+            # never repaired: `register(..., repo)` needs the agent name this install no longer has,
+            # so a repair would either invent a new name or `--replace` on a name it guessed.
+            continue
         if c["state"] in ("SERVING", "BUSY", "OTHER-REPO"):
             # OTHER-REPO is reported and never repaired: it is not this repo's runner, so
             # `register(..., repo)` would move it here (`--replace` deletes the other repo's
@@ -3604,6 +3756,29 @@ def converge(
             "between what the jobs ask for and what the runners advertise (labels/arch/gate), not a "
             "lack of capacity (agent-infra#2875)"
         )
+    elif record.get("config_lost"):
+        # ⛔ A BOX WHOSE ONLY FAULT IS A DESTROYED CONFIG MUST NOT REPORT HEALTHY (#3355 review).
+        # `config_lost` is deliberately NOT a `problem` — that branch sits ABOVE the alarm and would
+        # mute exit 4 — so before this verdict existed the only machine channel for a lost slot left
+        # the verdict chain untouched: a box with a 0-byte `.runner` and nothing else wrong fell
+        # through to `at-ceiling` and **exit 0**, byte-identical to a fully converged box, for an
+        # install no pass can repair and only a human can re-register. The pre-exemption behaviour
+        # was loud by ACCIDENT (the pass did not complete, it ABORTED as `unmeasurable` → exit 2,
+        # which is why 42 consecutive systemd passes failed) and that loudness must not be traded
+        # away as the price of the exemption.
+        # ⛔ PLACED BELOW `starvation` ON PURPOSE. Both exits are non-zero, and exit 4 is the one
+        # exit a health check pages on, so the new verdict must never be the thing that mutes a
+        # starved queue (T57 pins both the single-fault exit and this precedence). Everything BELOW
+        # this line is exit 0 under the contract, so a lost config outranks all of it: a box that
+        # needs a human is not "nothing to do".
+        record["verdict"] = "config-lost"
+        record["error"] = (
+            f"CONFIG-LOST: {len(record['config_lost'])} install(s) carry a DESTROYED config "
+            f"({', '.join(record['config_lost'])}) — a 0-byte `.runner` holds no agentName and no "
+            "URL, so this tool cannot re-register it and the box cannot converge until a human "
+            "does. Nothing was changed for that slot; its listener may still be up and is still "
+            "counted in `running`/`live`"
+        )
     elif record.get("problem_kind") == "refusal":
         record["verdict"] = "provisioner-refused"
     elif live > ceil:
@@ -3909,7 +4084,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"starvation={record['starvation']}")
         if record.get("refusal"):
             print(record["refusal"], file=sys.stderr)
-        if record["verdict"] == "starvation":
+        if record["verdict"] in ("starvation", "config-lost"):
             print(record.get("error", ""), file=sys.stderr)
         print(f"verdict={record['verdict']}")
     if record["verdict"] == "refused":
@@ -3920,6 +4095,8 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if record["verdict"] == "starvation":
         return 4
+    if record["verdict"] == "config-lost":
+        return 6
     return 0
 
 

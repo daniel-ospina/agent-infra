@@ -3,7 +3,7 @@ name: research
 description: "Use for ANY non-trivial research — whether the user says 'research this' or the agent needs to investigate a technical question, compare approaches, evaluate trade-offs, understand a new domain, or make architecture decisions. Provides problem reframing, domain detection (Clear/Complicated/Complex), internal+external search, adversarial queries, and depth scaling. NOT for trivial single-fact lookups or content-pipeline keyword/SERP research (use content-research for that)."
 subjects.team: organisation-design-team
 allowed-tools: read write edit bash grep find web_search web_fetch todo_write task mcp_load mcp__seo-intelligence__perplexity_search mcp__seo-intelligence__perplexity_research
-version: 1.3.0
+version: 1.4.0
 ---
 > ⛔ **This skill MUST be read in full — not skimmed.** Formal review gates depend on its workflow.
 > Skipping steps silently bypasses quality checks. Missing gates = undetected breakages.
@@ -14,6 +14,7 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 
 **Protocol compliance self-audit:**
 ```
+☐ Tortoise graph checked BEFORE deriving (Step 0.0b) — and the finding WRITTEN BACK to it
 ☐ Search-tool rung resolved at PREFLIGHT (Step 0.0) and stated in the output
 ☐ Domain classified before research (with rationale)
 ☐ Domain classification challenged (Standard+)
@@ -33,13 +34,14 @@ This skill follows the [research-protocol](../reference/research-protocol/SKILL.
 
 ## Purpose
 
-General-purpose research skill that combines **three knowledge sources** to answer any question:
+General-purpose research skill that combines **four knowledge sources** to answer any question:
 
+0. **The Tortoise graph** (Step 0.0b) — the fleet's memory: what we already concluded, and what we already **ruled out**
 1. **Codebase & internal docs** — what we already know and have built
 2. **External search** — outside knowledge, best practices, competitor patterns, how others solve this (Perplexity when it loads, otherwise `web_search` with the cheapest model — see the **Step 0.0 search ladder**)
 3. **context7** — library/framework documentation (when the topic involves a specific library)
 
-The bias is toward **using all three sources**, especially external search. Outside knowledge adds context, validates assumptions, and surfaces patterns we wouldn't find internally.
+The bias is toward **using all four sources** — the graph first, and external search next. Outside knowledge adds context, validates assumptions, and surfaces patterns we wouldn't find internally.
 
 ## When to Use
 
@@ -83,6 +85,51 @@ The bias is toward **using all three sources**, especially external search. Outs
 
 **PREFLIGHT output line (required in the research output):** `Search tool: <tool + model actually used> — <rung N | rung 1 unavailable: <observed error>> — queries: <attempted> attempted / <returned> returned`. If you moved past rung 1, the reason is stated there. **The two counts are mandatory and must reconcile with the queries the output reports as searched.** A `returned` count below `attempted` is a **partial run** — name every query that did not return, and never let the shortfall pass as a complete evidence set. On rung 2 the counts also expose the rate-limit failure below: a fan-out wider than the bound loses calls to HTTP 429 (Step 3, "Concurrency and 429").
 
+### Step 0.0b — GRAPH FIRST (MANDATORY — before the problem reframing)
+
+**The fleet's memory is the Tortoise hosted graph, not `MEMORY.md`** (owner ruling, 2026-11-02: *every dispatch uses the research skill, and the research skill checks the graph*). A conclusion the graph already holds — **especially one it has already refuted** — costs two `curl`s to read and a whole lane to re-derive. Measured twice in one night: a root cause re-investigated that was already mapped, and a false "the SDK cannot delete an operator" that one call would have disproved.
+
+**Reads (tested 2026-11-02).** Two reads, and they are **not** interchangeable: **`/v1/search?q=` is the only one that answers "what does the graph hold about this question"**, while **`/v1/context` is a recency digest** — it returns the ~20 most recently written points fleet-wide, takes **no query filter** (`?q=` is accepted and **ignored**: a nonsense token and an unrelated query returned the same 19 points, 19/19 overlap, measured 2026-11-02) and carries no `truncated` marker. A digest row is not a hit and a short digest is not a miss.
+
+The credential is the **standard** variable `TORTOISE_MCP_API_KEY`; `TORTOISE_API_KEY` is the legacy compat alias, still exported with the same token (measured: identical value, Bearer → `200`) — a name to prefer away from, **not poison**. **The trap is the shell, not the name: bash sees neither variable** (`bash -c` reads length 0, `env | grep TORTOISE` → only `TORTOISE_HOME`) while every zsh route reads 35 (`zsh -c`, `zsh -lc`, `zsh -ic` alike, the exports now living in `~/.zshenv`). So read the key **through zsh** and **print the status code**: an error body is not "0 hits".
+
+```bash
+# Both reads print status + byte count and write the body to a per-run FILE: /v1/context is
+# ~350 KB and a pasted body arrives truncated — a silently partial read of the evidence this
+# step makes mandatory. Read fields with jq, never by dumping the file. The name carries `$$`
+# because a fixed /tmp path lets two concurrent lanes read EACH OTHER's body and report its
+# count and ids as their own (the #729 collision class).
+# /v1/search is the HIT SOURCE (it pages at `limit`, default 10, and reports `truncated`).
+# `-G --data-urlencode` is not optional: a raw `?q=` breaks on a space (curl exit 3, `HTTP 000`)
+# and silently drops a `#` as a URL fragment — a bare `#3253` becomes an EMPTY query that answers
+# `200 count=0`, i.e. a zero for a graph that was never asked.
+zsh -ic 'curl -s -G --connect-timeout 10 --max-time 60 -o "$1" -w "HTTP %{http_code} bytes=%{size_download}\n" \
+  -H "Authorization: Bearer $TORTOISE_MCP_API_KEY" \
+  --data-urlencode "q=KEYWORDS" "https://api.premiselabs.co/v1/search"' _ "/tmp/tortoise-search.$$.json"
+jq -r '.truncated, .count, (.results[] | "\(.id)  \(.similarity*1000|round/1000)  \(.content[:120])")' "/tmp/tortoise-search.$$.json" | head -21
+
+# /v1/context is the RECENCY DIGEST — no query filter, ~20 latest points, not hits.
+zsh -ic 'curl -s --connect-timeout 10 --max-time 60 -o "$1" -w "HTTP %{http_code} bytes=%{size_download}\n" \
+  -H "Authorization: Bearer $TORTOISE_MCP_API_KEY" \
+  "https://api.premiselabs.co/v1/context"' _ "/tmp/tortoise-ctx.$$.json"
+jq -r '.recent_points[] | "\(.id)  \(.content[:120])"' "/tmp/tortoise-ctx.$$.json" | head -20
+```
+
+**`HTTP 200` is the only pass.** Only `401` is a credential fix (the key was empty or rejected); `402` is quota; `504` is a wait budget — retry once, and if it 504s again the query **did not run** (record it as not returned) rather than holding nothing. **`HTTP 000` means no response came back at all** — read curl's exit code instead of guessing: **3** = the URL was malformed (fix the encoding), **28** = it timed out (the query did not run), 6/7 = DNS/connect (did not run). The `--max-time 60` bound is what turns a slow server into a `failed:` entry instead of a stalled lane. None of them is a hit count of zero.
+
+The BRIEF at `~/.pi/agent/state/TORTOISE-GRAPH-BRIEF.md` carries the write path and the error-code table (`401` = key empty or rejected, `402` = quota, **`504` = server wait-budget, not auth — retry once**); **two of its lines are superseded by this step and must not be followed**: its read recipe #1 (`/v1/context?q=…`, presented as question-scoped — it takes no query filter) and its "`TORTOISE_API_KEY` is EMPTY / a token swap 401s" credential note (the alias is populated and identical). *(The wrapper has LANDED: `~/.pi/agent/scripts/tortoise-graph.sh` on every box that runs `pi-bootstrap/setup.sh` / `cell-install.sh` (it is declared in `fleet_srcs`, agent-infra#3253), and `scripts/tortoise-graph.sh` in a repo whose `scripts/` pointer resolves to the agent-infra scripts tree. Prefer it: it reads the key at call time, so it works in a long-lived process whose MCP entry pinned an empty bearer. The curl recipe remains the tested fallback when the client is absent.)*
+
+**Why it is a hard step, not a courtesy call:** the graph is cheap to query and expensive to contradict — and neither of the two failures above skipped research. Both followed every other step perfectly; that is the class this step closes.
+
+**Three rules:**
+
+**(a) A hit is a PRIMARY SOURCE.** Cite the point — its `id` and its text — and build on it; do not re-derive a held conclusion as if it were new. If the point **contradicts** what you are finding, **that conflict IS the research question**: resolve it in the output (which one holds, on what evidence), never by silently preferring whichever sounds fresher.
+
+**(b) A miss is NOT a finding.** Zero hits is a statement about your **query**, not about the graph — re-query in the domain's own vocabulary (a synonym, a subsystem name, an issue number) before concluding the graph holds nothing; and a row of the `/v1/context` digest is never a hit, so its absence is never a miss. ⛔ The **local** `tortoise` **MCP server is bound to a dead database** — `TORTOISE_DB_URI` → `127.0.0.1:16379`, port closed (measured 2026-11-02; agent-infra#3253) — so **an empty MCP result is MEANINGLESS**, never evidence that the graph holds nothing. Do not "fix" that by loading the server and reporting its silence as a finding. Two opposite errors to avoid when it answers badly: its *auth* failure inside a long-lived pi process is an **empty `${TORTOISE_MCP_API_KEY}` expansion, not a dead service** — the **hosted** endpoint `https://api.premiselabs.co/mcp/` is healthy (`initialize` → 200 over SSE; tool count varies — 69 with the fleet's graph-scoped key on 2026-11-02 — so read `tools/list` rather than trusting a number; graph point `1a19a9401a6-d74d62e9cd04`, re-measured), so never conclude "hosted is not configured" from it — and the *silence* of the local dead-DB entry is not a miss either. From a shell, the REST reads above are the tested route. (Step 1.7's `tortoise-memory.mjs` is that step's own script path and **not a substitute for this step**; it reads `TORTOISE_API_KEY` from the **process**, and a non-interactive shell has neither variable — so prefix the call as Step 1.7 shows, or its `not_configured` is a shell-visibility artifact, not a finding. A real credential gap is proven by a **`401`** on that read — a `402`, a `5xx`, or a `504` (the search read is wait-budget-flaky under load; retry once) leaves the credential question **open**, not answered.)
+
+**(c) WRITE BACK at the end.** Every research output lands as a **point with edges** — the edges are what make it findable, and an orphan point is invisible: **IMPL** for what it addresses, **NAND + the reason** for what it rules out, **mitigations with strengths**, and its relation to the issue/epic. *(Step 5.4's `write-claim` script persists the claim text; it cannot do the edge work, and the edge work is the difference between filed and findable.)* ⛔ **Read `how-to-use-tortoise` IN FULL before any graph write** — this is a gate, not a reference: a **batch-connected mitigation nukes EP weights graph-wide**, mitigations are **0.10–0.50**, **annotate rather than create** when unsure, and a superseded operator must not leave live edges behind. Keep it current in the same session: a merge, a fix, or a **reversal** updates the point that describes it, because a lagging graph is not neutral — it is confidently wrong, and the next lane acts on it.
+
+**PREFLIGHT output line (required, next to the Step 0.0 line):** `Graph: <n> hit(s) over <k> queries (<q1>, <q2>…) — <built on it | nothing held, re-derived | contradicted, conflict resolved | unread — no query ran | partial — <j> of <m> angles unanswered> | wrote: <session <id> → points <id,…> + edges | point <id> + edges | not written — <write attempted> → <result observed>> | failed: <qN> <code> (did not run)`. Both counts are mandatory: `0` after one query and `0` after five in-vocabulary queries are different claims, and only the second one is a miss you may report. **`<k>` counts queries that RAN** — a query listed in `failed:` is not one of them, so a partial run can never pad the count past the lazy-zero rule. `<n>` comes from `/v1/search` only — never from the `/v1/context` digest, whose rows are not hits. `/v1/search` pages at `limit` (default 10), so when its `.truncated` is `true` the `<n>` is a **page**, not the holdings — write `≥<n>` and narrow the query. The `wrote:` field is what the checklist's "WRITTEN BACK" half is audited against, so it names the point **with its edges** (`IMPL → <id>`, `NAND <id> — <reason>`, `mitigation <id> @ <strength>`, or `edges: none — <why>`), or the session **plus the point ids it produced and their edge record** — a bare point id is an orphan and a bare session id hides one, and rule (c) exists because an orphan is invisible. A `not written` must name the write it **attempted** and the result it observed (`not written — POST /v1/sessions → 504 twice`); a bare "nothing to write" is not a value. **A query that did not run is listed in `failed:` and is never counted as a miss** — and never inside `<k>`: `504` twice on one of two queries is `0 hit(s) over 1 query (q1) — partial — q2's angle unanswered | wrote: session <id> → points <id,…> + IMPL → <id> | failed: q2 504×2 (did not run)`: **`partial` is not a clean disposition** — it records that a re-query is owed, which is what Step 5.5 asks you for. When **every** query landed under `failed:`, the disposition is **`unread — no query ran`**, because no other value is true — and `nothing held` is refused at `k = 1`, so an unrun angle can never be laundered into a miss. The slot itself is never omitted: when every query ran, write **`failed: none`**.
 
 ### Step 0 — Problem Reframing (NEW)
 
@@ -156,20 +203,26 @@ Other `--team` values belong to the #4930 2-axis scope system and are orthogonal
 # https://api.premiselabs.co.
 # The read path distinguishes three states in its `status` field (tortoise#3805):
 # "ok" (the store answered — an EMPTY store is still "ok", read `count`),
-# "not_configured" (no USABLE TORTOISE_API_KEY — never set up, or the key was
-# rejected with HTTP 401/403; a set-up gap, not an outage), and
+# "not_configured" (EITHER the probe's GET /v1/team answered 401/403 — a
+# graph-scoped key gets 403 GRAPH_SCOPED_TEAM_SURFACE BY DESIGN — OR
+# TORTOISE_API_KEY was unset IN THIS PROCESS and no request was made, which with
+# no interactive-zsh prefix is the shell-visibility artifact Step 0.0b measured), and
 # "tortoise_unavailable" (key set, but the store could not be reached).
 # Data subcommands always exit 0 so a missing optional dependency never fails the
-# skill (skip the step); the `status` probe exits 0 / 4 / 3 so a harness can tell
-# the three states apart.
-node scripts/tortoise-memory.mjs query-prior-research --domain "<topic-or-domain>"
+# skill (Step 0.0b is the mandatory read; this one is additive); the `status`
+# probe exits 0 / 4 / 3 so a harness can tell the three states apart.
+# The script reads process.env.TORTOISE_API_KEY, and a non-interactive shell has
+# NEITHER variable (Step 0.0b's measurement) — so a bare call reports not_configured
+# having made no request at all. Hand it the key explicitly:
+TORTOISE_API_KEY="$(zsh -ic 'printf %s "$TORTOISE_MCP_API_KEY"')" \
+  node scripts/tortoise-memory.mjs query-prior-research --domain "<topic-or-domain>"
 ```
 
 **Interpretation:**
 - **Results found:** Summarize prior claims. Use them to refine the research scope — what was already established? What gaps remain? What assumptions were made previously?
-- **`"status": "not_configured"`:** no usable `TORTOISE_API_KEY` on this machine — memory was never set up here, or the configured key was rejected (HTTP 401/403). Either way it is **not** an outage: check/re-set `TORTOISE_API_KEY`. Skip this step — proceed with fresh research.
-- **`"status": "tortoise_unavailable"`:** a key is set but the API was unreachable — the store is down or the address is wrong. Skip this step and note it; this is the state worth surfacing.
-- **Zero results:** First research on this topic. Note "no prior epistemic claims found" and proceed.
+- **`"status": "not_configured"`:** two different causes, and they are not interchangeable. (i) The key is set and the *probe* reached `GET /v1/team`, which answers 401/403 — a **graph-scoped** key is refused there **by design** (`403 GRAPH_SCOPED_TEAM_SURFACE`), so on this box it is the **expected** answer, not a credential gap (measured 2026-11-02: probe → `not_configured`, exit 4, while `query-prior-research` on the same key returned `{"status":"ok","count":10}`). (ii) `TORTOISE_API_KEY` was unset **in the process** and no request was made — with the prefix above that cannot happen, so a bare call reporting this is the **shell-visibility** artifact, not a credential gap; the gap is real only when the Step 0.0b read answers **`401`**; a `402`/`5xx`/`504` leaves the credential question open, not answered — and that read, not this probe, is the credential test. **Run the data subcommand anyway** — it does not use the probe — and this script is **not** a substitute for the Step 0.0b reads.
+- **`"status": "tortoise_unavailable"`:** **this request** failed — a timeout or a 5xx, which fires on a healthy store too (measured 2026-11-02: a per-request timeout while the REST reads answered `HTTP 200`). The Step 0.0b reads, not this word, decide whether the store is up; never report "the graph is down" from it.
+- **Zero results:** a statement about the **query** — re-query in the domain's vocabulary (Step 0.0b rule (b)) before recording a miss. `0` after one query is not "no prior claims".
 
 **Preserve provenance:** When citing prior claims in the research output, reference the Point ID and authoredBy field so the reader can trace the claim's origin.
 
@@ -356,7 +409,7 @@ Extract claims from PaperResult metadata (title + abstract). File claims in wiki
 
 ### Step 5 — Synthesize
 
-Combine all three sources into a **research summary**. Structure:
+Combine all four sources into a **research summary**. Structure:
 
 ```markdown
 ## Research Summary: [Topic]
@@ -364,6 +417,8 @@ Combine all three sources into a **research summary**. Structure:
 **Date:** YYYY-MM-DD
 
 **Search + queries (Step 0.0 PREFLIGHT line):** `<tool + model> — <rung N | rung 1 unavailable: …> — queries: <attempted> attempted / <returned> returned`. When `<returned> < <attempted>`, name the queries that did not return and the angle each covered — the evidence set is partial and the synthesis must say so.
+
+**Graph (Step 0.0b PREFLIGHT line):** `<n> hit(s) over <k> queries (<q1>, <q2>…) — <built on it | nothing held, re-derived | contradicted, conflict resolved | unread — no query ran | partial — <j> of <m> angles unanswered> | wrote: <session <id> → points <id,…> + edges | point <id> + edges | not written — <write attempted> → <result observed>> | failed: <qN> <code> (did not run)`. Use `≥<n>` when `/v1/search` returned `truncated: true` — a page is not the holdings. Every hit named here is cited in the body by `id` — a hit that only appears in this line is a claim the synthesis dropped.
 
 ### What We Have Internally
 - [Summary of codebase findings, existing patterns, prior decisions]
@@ -407,8 +462,12 @@ Keep it concise. The goal is actionable insight, not an exhaustive report.
 **After synthesis, log key claims to the memory system so future research builds on accumulated knowledge.** At minimum, write one claim per Medium+ confidence tier. Low-confidence and speculative claims are optional — they carry a hypothesis tag and should only be written if they represent a useful direction.
 
 ```bash
-# From the agent-infra checkout (hosted Tortoise API — see Step 1.7 for env):
-node scripts/tortoise-memory.mjs write-claim \
+# From the agent-infra checkout (hosted Tortoise API — see Step 1.7 for env). Same
+# shell-visibility trap as Step 1.7: the script reads process.env.TORTOISE_API_KEY,
+# which a non-interactive shell does not have — pass it in, or the write silently
+# never leaves the box.
+TORTOISE_API_KEY="$(zsh -ic 'printf %s "$TORTOISE_MCP_API_KEY"')" \
+  node scripts/tortoise-memory.mjs write-claim \
   --content "<claim text>" \
   --kind "statement" \
   --authored-by "research-skill" \
@@ -429,7 +488,7 @@ node scripts/tortoise-memory.mjs write-claim \
 | Low (1 source) | 0.3 | hypothesis |
 | Speculative | 0.1 | hypothesis |
 
-**Graceful degradation:** If `status` is `not_configured` (no usable `TORTOISE_API_KEY` — memory was never set up here, or the key was rejected with HTTP 401/403; a set-up gap, **not** an outage) or `tortoise_unavailable` (the API could not be reached — the store is down or the address is wrong, the state worth surfacing) → skip this step. Log note: "Memory not available — claims not persisted to epistemic graph."
+**Graceful degradation:** act on the **write's** result, never on a probe. `not_configured` from the script's `status` probe is usually `GET /v1/team` refusing a graph-scoped key (`403 GRAPH_SCOPED_TEAM_SURFACE`, measured 2026-11-02) — the data subcommands do not use it, and on the same key `query-prior-research` returned `{"status":"ok","count":10}`; `tortoise_unavailable` also fires on a timeout while the REST reads answer `200`. So run `write-claim` and read its **stdout `status`**: `"ok"` is the pass, and the **exit code is `0` for every data-subcommand outcome** (agent-infra#1182) — so the exit is not evidence that a write happened. Fall back only when `status` is not `ok`, and then to the BRIEF's tested `POST /v1/sessions` capture — but read what that capture **is**: it persists the **point** and has no edge API, so on its own it is an orphan, and `session → points` with no edge record is `missing-write-back` (Step 5.5). The fallback is **capture, then edges** — add the edge record through an edge-capable route, or write `edges: none — <why>` — never a fabricated `+ edges` on a route that cannot make one. It is never a licence to write nothing. `not_configured` is a statement about one endpoint, and a mandatory write-back that a health probe can silently disable is no gate. Rule (c)'s edge work needs an edge-capable route — `tools/list` on the hosted MCP at `https://api.premiselabs.co/mcp/` carries `tortoise_create_edge`, `tortoise_create_point`, `tortoise_create_operator` and `tortoise_mitigate_operator`; look for those names rather than trusting a tool count. Log note: name the route the claim actually took.
 
 ### Step 5.5 — Research Verifier (CPI-5: fresh-session review)
 
@@ -441,7 +500,7 @@ task(prompt='[VGATE] Review this research output for completeness and accuracy. 
 1. Every claim section has a confidence tag
 2. Contradictions between sources are flagged in a Contradictions section
 3. Single-source claims have verify-when-available note
-4. KG facts filed for key claims (skip if `"not_configured"` — no usable key: never set up, or the key was rejected with HTTP 401/403 — or `"tortoise_unavailable"` — the store was unreachable)
+4. Write-back recorded: the Step 0.0b `Graph:` line carries its hit AND query counts, a disposition, a `wrote:` value, and a `failed:` slot. A missing write is `missing-write-back`; so is a `not written` that names no attempted write; so is **any `wrote:` value that names point ids without an edge record** — bare, or via `session → points` (`IMPL`/`NAND`/`mitigation`, or `edges: none — <why>`) — an orphan point is the failure rule (c) exists to prevent, and the `POST /v1/sessions` capture produces exactly that shape, which is why the edge route must be named. When the search answered `truncated: true`, the count must be written `≥<n>`: a plain `<n>` taken from a page is `unreconciled-graph-count`. A query listed under `failed:` did not run and **cannot** be counted as a miss. The script's `not_configured` probe is **not** an excuse — it is `GET /v1/team` refusing a graph-scoped key, or `TORTOISE_API_KEY` being absent from the process (Step 5.4) — and never a reason to skip.
 5. Log entry appended to wiki/log.md per WIKI_SCHEMA.md INGEST format
 6. The Step 0.0 PREFLIGHT line is present, names the search tool + model actually used, states the rung taken (or that rung 1 was unavailable and the reason), and its `attempted / returned` query counts reconcile with the queries the output reports as searched — a silently substituted rung is a gap, and so is an unreconciled shortfall (a rung-2 batch that lost queries to 429 and still reads as complete)
 
@@ -453,7 +512,7 @@ RESEARCH OUTPUT: <full text>
 **ISSUE block format:**
 ```
 ISSUE:
-  check_type: missing-confidence|unflagged-contradiction|untagged-single-source|missing-kg-fact|missing-log-entry|missing-search-preflight|unreconciled-query-count
+  check_type: missing-confidence|unflagged-contradiction|untagged-single-source|missing-kg-fact|missing-log-entry|missing-search-preflight|unreconciled-query-count|missing-graph-check|missing-write-back|unreconciled-graph-count
   severity: P1|P2
   location: [claim section name]
   description: <what is missing>
@@ -461,6 +520,8 @@ ISSUE:
 ```
 
 **Gate:** If issues found → fix deterministically. Re-dispatch. Max 2 fix cycles. On 3rd cycle with issues → surface to user. Zero issues → CLEAN, proceed to wiki filing.
+
+**The graph is checked too:** the reviewer asks for the Step 0.0b `Graph:` line (query text, hit + query counts, disposition, `wrote:` value) and re-dispatches `missing-graph-check` / `missing-write-back` for its absence. Two shapes are **refusals, not misses**: a `nothing held` disposition over a single query (`k = 1`) — Step 0.0b requires a re-query in the domain's vocabulary first, so `0` after one query is a lazy zero, not a miss — and a `not written` that names no attempted write. A run that lost a query to a transport or wait-budget failure is **`partial`**, not `nothing held`.
 
 ### Step 5.6 — The Adoption Gate (step-0 of the adoption path: contradiction test + `OVERRIDES`)
 
@@ -522,6 +583,7 @@ RESEARCH OUTPUT: <the full research summary>
 4. Does the recommendation follow from the evidence presented?
 5. Were adversarial queries included and addressed?
 6. Does the output carry the Step 0.0 PREFLIGHT line — the search tool + model actually used, the rung taken (or that rung 1 was unavailable and why), and the `attempted / returned` query counts — and do those counts reconcile with the queries the output reports as searched (an unreconciled shortfall = a partial batch presented as complete)?
+7. Does it carry the Step 0.0b `Graph:` line — query text, hit and query counts, disposition, the `wrote:` value **with its edge record**, and the `failed:` slot — and is every hit that line names actually cited in the body by `id`? A `nothing held` over a single query is not a miss (Step 0.0b requires a re-query before that claim), and a lost query makes the run `partial`, not `nothing held`; a `not written` that names no attempted write is not a write-back; a count taken from a `truncated: true` page without `≥` is a page reported as the holdings; and a query listed under `failed:` did not run, so it cannot be counted as a miss.
 
 Return: PASS or ISSUES with specific gaps and suggested fixes.
 ```

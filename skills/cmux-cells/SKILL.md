@@ -49,6 +49,21 @@ writable `HOME=/home/cmux`), but because **the operational layer is installed un
 reads an empty home and silently loses the merge path. (`scripts/cloud-cell-bringup.sh` still carries an older
 `/home/ubuntu` explanation — that part is stale.)
 
+⛔ **AND THE SAME REDIRECTION IS WHAT HIDES THE CREDENTIAL — the half of this fact that bites (agent-infra#3331, measured
+2026-11-02).** The model credential normally lives in the **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), i.e. *not*
+under the `HOME` a lane runs with; and the harness's own `lane-env.sh` sources `${ENV_FILE:-$HOME/keys.env}`, the redirected
+one. So the one setting that makes the operational layer work is the setting that hides the credential: `pi` starts, finds no
+key, and exits having done nothing. Since #3331 `lane.sh` REFUSES that shape before spawning `pi` — `[key-gate] … check=fail
+result=REFUSED var=<NAME>` naming the variable, the provider, `models.json` and every candidate file, exit **82** — and every
+lane log now ends with `outcome=<done|refused|failed|died> reason=<token>`. ⛔ **BUT THE KEY IS ONE OF FOUR FALSIFIED CAUSES,
+NOT THE CAUSE** (see “the launch directory” below): the same issue's record shows `keys.env` sourced, `api-key-errors=0`, and
+the lane STILL dying silently. Do not conclude “a key fixed it” from a green key gate — that gate closes the *reporting*
+half, it does not make a lane run. **If the terminal line is absent**, three things produce that: a box that predates #3331, a
+lane the kernel or `lane-bound.sh` KILLed (no trap runs after SIGKILL), or a cleanup that outran the TERM→KILL grace — so
+check `[lane-bound] KILL` and `dmesg | grep -ci 'killed process'` before blaming provisioning. And never use
+`pgrep -f "pi -p"` for liveness: it matches your own command line. **And what actually made cell lanes run is the launch
+directory — see below.**
+
 **⚠️ One thing is still missing after a verified install — plus a trap for boxes installed before the fix:**
 
 | missing | symptom | fix |
@@ -77,7 +92,20 @@ quoting any ceiling:
 | **test-running lane** (pi tree + pytest workers + per-lane FalkorDB) | **~0.4–0.7 GB** peak | a FalkorDB/PG sidecar is **~5–105 MB in a normal sample**, with **peaks seen at 207.9 MB (cell-3) and 313 MB (cell-1)** — `docker stats --no-stream`, per sidecar container, cells **1, 3 and 4**, 2026-10-27 (the 313 MB peak is **cell-1's**, so a cells-3–4 re-sample will not reproduce it); plan on the peak, not on ~150 MB, and re-measure per box. The scheduler budgets 512 MB (`ai-drainer.sh` `LANE_MEM_MB`) |
 | plan each lane at | **~1 GB** (test) / **~0.5 GB** (analysis) | the PEAK, not the idle |
 | worktree `.venv` | **`du` 5.6 GB, but only ~316 MB marginal** under a warm hardlinked cache — the gate reserves **6144 MB** | the figures are `spawn-gate.sh`'s own measurement block (`du` 5,625 MB, ~316 MB marginal, RESERVE 6144); agent-infra#2721 is the incident that made the gate reserve it. #2159 recorded ~1.1 GB per **venv-bearing** worktree (134 MB for one without) — all right about different quantities |
-| CPU | load 4.3 with 23 lanes | almost never the limit — but the gate still refuses at `MAX_LOAD` (below) |
+| CPU | **load up to 8–10× the CPU count is normal — a load of 80 on 10 CPUs is neither a wedge nor grounds to reap a lane** (owner, 2026-11-02). Measured reference: load 4.3 with 23 lanes | Two instruments encode this at different lines and **neither is to be tightened**: **spawn** admits up to `MAX_LOAD` = `nproc × 10` (`spawn-gate.sh:119`); **placement** refuses at `CAP_LPC_CEILING` = 8.00 load-per-cpu (nicknamed "DO NOT PLACE HERE" at `capacity.sh:100`, default `:235`, enforced `:890`), mirrored by `ai-drainer.sh:175` `LPC_CEILING=8` (rejection at `:866`). ⛔ Both comparisons are **`>=`**, so **exactly 8.00 is already refused for ADDING work** — the tolerance covers work already RUNNING (do not call the box wedged, do not reap a live lane), and is never a licence to place more |
+
+**⛔ Why a load of 8–10× the core count is fine on a CELL — and why that number must not travel:** these boxes
+run I/O-heavy work — git, container churn, disk, network — so the runnable/`D`-state task count stacks far
+above the core count while the box still makes real progress. A cell at load 80 on 10 CPUs is working, not
+wedged — **though at that exact reading the placement gate already refuses to ADD work**, so this is
+tolerance for what is already running, not headroom for more. **This is a CELLS rule, and it is the OPPOSITE
+of the rule the laptop obeys.** `~/.pi/agent/AGENTS.md`
+carries the global line *"Keep concurrent workstreams ≤ ~12; load above ~12 on 10 CPUs makes sessions
+unreachable"* **with no platform qualifier**, so a cell session reading only that file would treat a load of
+20 as a wedge. **This skill owns that split — the global file does not make it.** On the laptop the load IS
+the fleet competing for attention, and the remedy is fewer concurrent workstreams; on a cell the load is
+largely I/O wait, and the remedy is to read RAM and disk (below) instead. Do not carry this tolerance back
+to the laptop, and do not read a laptop load of 80 as healthy.
 
 The old row read "`pi` process ~0.6–1 GB RSS per lane". Measured, that is a **test-running peak**; an idle
 lane's whole tree is ~0.2 GB. The old arithmetic applied that peak to EVERY lane and then stacked a flat
@@ -418,6 +446,36 @@ killed 37 processes *and the tmux server*, losing every lane. The gate would hav
   ```
   and 60 s after launch check `grep -c 'No API key found' /tmp/cell-home/L-<slug>.log` — **0 is the pass condition**. A
   lane log that sits at ~5 KB without a tool call is almost always this, not a slow model.
+- ⛔ **AND THE REDIRECTED `HOME` IS WHAT HIDES IT — the trap this bullet used to state only half of** (agent-infra#3331,
+  measured 2026-11-02 on two cells). A lane MUST run with `HOME=$CELL_HOME` (default `/tmp/cell-home`), because the
+  operational layer — `record-review.sh`, the gh shim, the extensions — lives under `$CELL_HOME/.pi/agent`. But the
+  credential normally lives in the **ACCOUNT** home's `keys.env` (`/home/cmux/keys.env`), and `lane-env.sh` sources
+  `${ENV_FILE:-$HOME/keys.env}` — the *redirected* one. So **the single setting that makes the operational layer work is the
+  setting that hides the credential**, and the lane dies in seconds having done nothing. Two consequences for an operator:
+  source the key into the LAUNCH line (`HOME=/tmp/cell-home bash -lc '. /tmp/cell-home/keys.env; . /home/cmux/keys.env; …'`),
+  and read the lane's LAST log line before concluding anything — since #3331 `lane.sh` refuses a keyless environment
+  **before** spawning `pi` (`[key-gate] … result=REFUSED var=<NAME>`, exit **82**) and every lane log ends with
+  `outcome=<done|refused|failed|died> reason=<token>`. ⛔ but a log that STOPS is not proof of a key problem: the #3331
+  record falsified that, and the cause it VALIDATED is the launch directory (next bullet).
+- ⛔ **`pgrep -f "pi -p"` IS NOT A LIVENESS TEST — IT MATCHES THE DIAGNOSTIC'S OWN COMMAND LINE.** Measured during the
+  #3331 investigation: `pgrep -fc "pi -p|pi --"` returned **3 for a dead lane**, because the pattern appears in the
+  command the operator just typed (and in any monitor that greps for it). It reported "alive" until the read was
+  re-measured with a CPU-time delta. Liveness comes from a POSITIVE read of the lane's own artifact — the
+  **run-scoped** verdict `cat $O/logs/lane-<N>.outcome` (written by the lane's exit trap, removed AND re-owned by the
+  next dispatch of the same issue, so its absence means "no verdict for this run"), a
+  transcript mtime/size delta, or a CPU-time delta (`lane-status.py`, `lane-bound.sh`'s
+  `cpu_cs`) — never from a process-name match. ⛔ **and the run-scoped file is not absolute either**: a previous attempt
+  that is still ALIVE can write its line into the new run's file in the dispatch handover window (read → re-stamp →
+  write is three steps, stated as a residual in `lane.sh`), and the log is append-only, so `grep '^outcome=' <log> |
+  tail -1` can hand you the PREVIOUS attempt's verdict. Cross-check the timestamp and `lane=`/`rc=` fields rather than
+  trusting either source alone. See `docs/ops/fleet-liveness.md` (agent-infra) for the one verdict
+  function, and prefer a bracket (`pi [-]-model`) or a script file run detached when a kill pattern is unavoidable.
+- ⛔ **LAUNCH A CELL LANE WITH ITS CWD INSIDE A GIT REPOSITORY OR WORKTREE — NEVER A BARE DIRECTORY LIKE `/tmp`.** This is the
+  cause the #3331 record VALIDATED after four falsified hypotheses: a lane launched from a non-repo directory dies on the first
+  git-dependent hook (`fatal: not a git repository (or any of the parent directories): .git`), and the *only* difference between
+  a 6,180-byte log that died mid-work and a 16,812-byte log that reached `agent_end → session_shutdown` was the launch
+  directory. The probes that "worked" from `/tmp` (a PONG, a local read) were runs that never triggered a git call. So: `cd`
+  into the checkout (or the lane's worktree) before launching, and treat "worked from /tmp" as evidence of the opposite.
 - A 0-byte lane log with a live `bash` pane means **`pi` was killed inside the session** — check `dmesg | grep -ci 'killed
   process'` and `free -m`: that is the OOM cliff, and the fix is fewer lanes, not a restart.
 - Ship a brief by base64+gzip (`printf %s '<b64>' | base64 -d | gunzip > brief.md`) — a 113 KB inline heredoc times out,
@@ -452,7 +510,106 @@ bash scripts/admin-merge.sh <pr>                                                
 - A record for a non-current head is **refused (exit 3)**. Never `--force-stale`.
 - **Never edit the PR body after recording** — it wipes the attestation.
 - One reviewer child per PR; two rail attempts. A refusal while an attestation exists at the head is a **harness defect to
-  record**, not a loop to retry. `queued` / `in progress` is neither a failure nor a stall.
+  record**, not a loop to retry. ⛔ **Scope: that rule is about refusals of the EVIDENCE** — the gate rejecting an
+  attestation that exists. It does **not** cover the rail refusing because the **base tree** is red; that is the rail
+  working correctly, and it names its own remedy (see §6.5). `queued` / `in progress` is neither a failure nor a stall.
+
+### 6.5 Batching several reviewed PRs into one landing
+
+**Measure first — batching is a fix for a queue that may not exist.** Before building a batch, measure whether CI
+concurrency is actually binding. If there are free GitHub-hosted slots and runs finish in single-digit minutes,
+batching buys nothing. Measured 2026-11-02 on this account: **12 of 40 hosted slots in use, 28 free, 1 job queued,
+runs finishing in 1–8 minutes** — the waits were elsewhere. Quote the reading you took, not this one.
+
+**What a batch does and does not save.** It saves **(a)** CI runs — one run instead of N — and **(b)** base-drift
+re-reviews, because N PRs are judged against one base instead of each being re-reviewed as `main` moves under it.
+It does **NOT** remove the review of a **changed diff**: if a PR gained commits after its review, someone must read
+those changes whether they land alone or in a batch. One review of the union, not zero reviews.
+
+**⛔ Eligibility — ask `--check-carry`, never "it is probably still fine".** A record is bound to a head *and* to a
+`diff_sha256`. "Slightly stale" is not something you can judge by eye: a moved **base** and a PR's own **content
+changing** look identical from the outside, and only one of them is safe.
+
+```bash
+scripts/record-review.sh --check-carry <pr> <owner/repo>   # prints: <verdict> TAB <record digest|-> TAB <live digest|fetch-status>
+```
+
+⚠️ **The verdicts are not three, and THREE of them cost you a review cycle if you misread them** (`carry-patch`,
+`nodigest`, `unreadable`). The columns are **not uniform** — `norecord`/`nodigest` print `-` in column 2, and
+`unreadable` prints the **fetch status** in column 3 instead of a digest — so **branch on the verdict, never parse the
+columns**. Read all of
+them off the tool's own output/exit code — never off this table alone, and never off "it looks stale":
+
+| verdict | meaning | what to DO |
+|---|---|---|
+| `head` | bound to the CURRENT head | ✅ land it |
+| `carry` | the reviewed **DIFF is unchanged** — only the base moved | ✅ the gate carries it — land, do not re-review |
+| `carry-patch` | the reviewed **PATCH is byte-identical** but the rendered diff moved (a rebase/base move). The gate will NOT carry it as-is | ⚠️ **re-record at the current head — do NOT run a review cycle** |
+| `nodigest` | the record carries no usable diff digest (legacy, or minted during a degraded read) | ⚠️ re-record at the current head — that is a **CARRY, not a fresh review** |
+| `fresh` | **the DIFF CHANGED** — the record does not cover what would merge | ⛔ run a review, or drop it from the batch |
+| `norecord` | no record in **this box's** store | ⛔ a review — **but take the cheaper paths the tool prints first**: `scripts/registry-sync.sh pull` (it may have run on another box) and `record-review.sh --recover-body <pr> <owner/repo>` (the PR body carries a signed marker). An absence here is **not** evidence no review happened |
+| `unreadable` | the PR's live diff **could not be READ** (transport, shared gate queue, rate limit) | ⚠️ **RETRY** — this is NOT a changed diff and NOT a carry |
+
+`carry-patch`, `nodigest` and `unreadable` are the expensive mistakes: each one *looks* like "needs re-review" and
+isn't. `unreadable` in particular is a transient read failure, and a lane that re-reviews on it burns a full review
+cycle for nothing.
+
+**A conflict resolved at batch time does NOT repair `fresh`.** Resolving a conflict reconciles a moved base; it says
+nothing about an unreviewed diff. Measured 2026-11-02 to show how sharp this is: of six open PRs carrying a *clean*
+record, **five returned `fresh`** — the batch was two PRs, not six.
+
+**⛔ `main` must be green before the batch means anything.** A batch branch is cut from `main`, so it inherits every
+red on `main`, and a batch is then red for a reason that has nothing to do with its contents. **Read `main`'s own sha**
+(never a rollup, never `/status`), and group check-runs by **(app, workflow, job name)**, taking the newest attempt by
+**`id`** — because **a re-run ADDS a red, it does not clear one**. `~/.pi/agent/AGENTS.md` holds that rule and the reason
+it is not just "by job name": two workflows can publish the same job name, so a name-only grouping lets the newest of
+one mask the other and yields a **FALSE GREEN on `main`**. Do not simplify the key.
+
+**⛔ Do NOT paraphrase the rail's red-base refusals — read them off the rail.** It has several (an already-red base the
+PR does not repair; a base red the PR has not measured; a merge ref lagging a red base; a merge-ref base parent it
+could not read), **each printing its own message**, and this skill is not their source of truth. A paraphrase written
+from review findings was wrong in a new way on five consecutive rounds, which is the signal to stop writing it: run the
+rail and read what it prints.
+Two things worth knowing before you guess a remedy — **the remedy differs per step** (one step says fix the failing
+check; two re-measure and re-run; one says check auth/network), and when a review record is bound to the PR head the
+rail will **not** move that head (`refresh_pr_branch`), so "just re-run it until it passes" is not a remedy for every
+step.
+
+**Fixing `main` is the higher-leverage move: one green `main` makes EVERY PR attestable, while batching makes only the
+handful in the batch.**
+
+**Build it**
+
+```bash
+git fetch origin            # ALL branches: merging origin/<branch> refs this clone never refreshed silently lands
+                            #   stale tips — a different commit set than --check-carry approved above
+git worktree add .worktrees/batch-<date> -b batch/<date> origin/main
+cd .worktrees/batch-<date>
+for b in <branch1> <branch2> ...; do git merge --no-ff "origin/$b" -m "batch: $b"; done   # resolve conflicts HERE
+git push origin batch/<date>
+gh pr create --base main --title "batch(<date>): N reviewed PRs" --body-file <file>
+```
+
+Then treat it as ONE PR under §6 above: **one** fresh review of the **union** diff, **one** `record-review.sh` at the
+batch head, **one** rail. The constituents' own records justify *inclusion*; the attestation that lands is the
+batch's. ⛔ **The constituents will NOT close as merged.** The rail defaults to `--squash`
+(`scripts/admin-merge.sh:558-566`, applied at `:7754`), and a squash lands a **NEW** commit — the constituents' tips
+never become ancestors of `main`, so GitHub has no ancestry to close them on, and they stay **open**, closable only as
+"closed". So do exactly one of two things, and say which you did: **close them by hand** after confirming their
+content is in the batch commit, or land the batch with an explicit method —
+`bash scripts/admin-merge.sh <pr> -- --merge` (the pass-through is an allow-list, `:550-556`) — and only then may you
+rely on ancestry. **Verify which actually happened; do not assume either.**
+
+**Traps**
+
+- **Blast radius.** One bad commit in a batch blocks N changes and makes the revert N-wide. Prefer small batches of
+  related work over one grand bundle.
+- **A conflict resolution is an unreviewed change.** It produces a NEW diff on the batch branch that nobody has read.
+  If a constituent conflicted during the build, the batch review must cover that resolution explicitly.
+- **`fresh` is not "slightly stale".** The check exists precisely because the safe and unsafe cases are
+  indistinguishable to the eye.
+- **Never edit a PR body after recording** (§6) — and the batch body is the one people forget, because it naturally
+  wants updating as members land. Put new information in a comment.
 
 ## 7. Fleet roles and what "full capacity" means
 

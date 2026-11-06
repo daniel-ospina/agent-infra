@@ -294,8 +294,8 @@ fdlink 701 1 "$MID_LOG"; fdlink 701 2 "$MID_LOG"
 out="$(run_reap "$T/t-mid" "" -- --dry-run)"
 hasnt "$out" "WOULD REAP" "DEFAULT: a 90 m idle log is UNDER the shipped LANE_IDLE_MIN (2 h)"
 # ⛔ `trees=<working>/<judged>` MUST ACCOUNT FOR EVERY JUDGED TREE (#2163 review, P3). `live` was
-# incremented only for a CPU delta above the tolerance or a log younger than LIVE_MIN (45 m), so a
-# lane idle BETWEEN 45 m and 2 h — this one — counted as neither working nor a candidate and the field
+# incremented only for a CPU delta above the tolerance or a log younger than LIVE_MIN (125 m), so a
+# lane idle BETWEEN the live window and 2 h — this one — counted as neither working nor a candidate and the field
 # under-reported the box. A judged tree is working unless it is a candidate.
 has "$out" "trees=1/1" "DEFAULT: an idle-but-not-stale lane is counted WORKING in trees=<working>/<judged>"
 out="$(LANE_REAP_IDLE_MIN=60 run_reap "$T/t-mid" "" -- --dry-run)"

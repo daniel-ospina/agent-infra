@@ -2609,13 +2609,21 @@ def t33_starvation_eligibility_healthy():
     alarm exists for (#2875) becomes invisible.
 
     The alarm's second half is ELIGIBILITY (`starvation_eligible`): the pool advertises the fallback,
-    OR the gate wants `local`, OR the queue is at/above the gate's own backlog threshold."""
+    OR the gate wants `local`, OR the queue is at/above the gate's own backlog threshold.
+
+    ⛔ THE DEPTH IS THRESHOLD-RELATIVE, NOT 14, SINCE THE 2026-11-02 RULING. The case's whole point is
+    the FALLBACK-ONLY population — a queue the gate calls GitHub-hosted's work — so it must sit BELOW
+    the gate's trigger. It was written with the measured 14 when that trigger was 60; at the shipped
+    10 a 14-deep queue is at/above it, and the third eligibility term now fires correctly, which would
+    make this case assert the opposite of what it exists to pin. The ≥-threshold behaviour has its own
+    case (T43). Deriving the depth keeps the two in step if the trigger moves again."""
     with Env():
         box = Box("starve-ineligible")
         try:
             # The pool is up and idle; NOTHING advertises ubuntu-latest, and the gate says github.
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64", "Linux"])])
-            box.queued(14)
+            below_threshold = ra.GATE_QUEUE_THRESHOLD - 1
+            box.queued(below_threshold)
             box.gate_state("github")
             record = converge(box, want=0)
             check(
@@ -2628,7 +2636,7 @@ def t33_starvation_eligibility_healthy():
             )
             check(record["verdict"] != "starvation", f"verdict: {record['verdict']}")
             # ⛔ THE EVIDENCE SURVIVES THE VERDICT: the counts and the reason are still published.
-            check(record.get("queued_runs") == 14, f"the counts must stay published: {record}")
+            check(record.get("queued_runs") == below_threshold, f"the counts must stay published: {record}")
             blob = " ".join(record["notes"])
             contains(blob, "starvation NOT armed", "the record")
             contains(blob, "GitHub-hosted", "the record")
@@ -3016,7 +3024,7 @@ def t42_absent_gate_record_is_absence():
 def t43_deep_queue_threshold():
     """The third eligibility term exists for a queue nobody's labels explain: a DEEP backlog with an
     idle pool is worth a page whatever the pool advertises, and the number is the gate's own
-    (`ci_runner_gate.sh:43`, `CI_GATE_QUEUE_THRESHOLD:-60`) rather than a second opinion invented
+    (`ci_runner_gate.sh`, `CI_GATE_QUEUE_THRESHOLD:-10`) rather than a second opinion invented
     here. Review finding P1: without this case the constant was documented as "PINNED BY THE SUITE"
     with zero references in it, so a drift from 60 — or the term being dropped — was invisible."""
     with Env():
@@ -3427,9 +3435,9 @@ def t31_fill_adds_one_runner():
 def t32_busy_reread_before_replace():
     """`wait_online` re-reads the POOL only — the view that already called the runner offline — and
     `--replace` DELETES a registration. A runner that comes up at the last second and takes a job
-    would therefore lose it, against this file's own invariant ("a BUSY, SERVING or OTHER-REPO runner
-    is never restarted"). The re-check has to be FRESH, too: the classification value is cached, and
-    a cached `False` would certify exactly what the re-check exists to refuse."""
+    would therefore lose it, against this file's own invariant ("a BUSY, SERVING, OTHER-REPO or
+    CONFIG-LOST runner is never restarted"). The re-check has to be FRESH, too: the classification value
+    is cached, and a cached `False` would certify exactly what the re-check exists to refuse."""
     with Env():
         box = Box("busy-reread")
         try:
@@ -3496,9 +3504,12 @@ def t44_queue_age_eligibility():
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
             # #2875's own counts: the label is GONE from every runner (the gate on the hub stripped
-            # it), the pool is online and IDLE, and 53 runs are waiting (below the gate's 60).
+            # it), and the pool is online and IDLE. The depth sits BELOW the gate's own trigger on
+            # purpose: this case exists to prove the AGE term decides when the other terms do not, so
+            # a depth at/above the 2026-11-02 trigger of 10 would let the depth term answer first and
+            # the case would certify nothing (measured: it failed exactly that way at 53).
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
-            box.queued(53)
+            box.queued(ra.GATE_QUEUE_THRESHOLD - 1)
             # ⛔ ROW 0 IS NOT THE OLDEST (round-13 review finding P1). The runs endpoint is
             # newest-first and ignores `sort`/`direction`, so the page's first row is the run that
             # arrived a moment ago — and a queue STILL RECEIVING WORK is exactly #2875's shape. Pin
@@ -3539,7 +3550,7 @@ def t44_queue_age_eligibility():
                 "the reason must name the age bound it did not reach",
             )
             check(
-                record.get("starvation_queued") == 53,
+                record.get("starvation_queued") == ra.GATE_QUEUE_THRESHOLD - 1,
                 f"the counts are published on BOTH verdicts: {record}",
             )
         finally:
@@ -3556,7 +3567,7 @@ def t56_queue_age_reader_refusals():
         state for exactly this read.
         ⛔ PINNED AT THE UNIT BOUNDARY ON PURPOSE. In *this* tool the state is unreachable end to end:
         the age read is taken only after the depth term declines, i.e. at `queued <
-        GATE_QUEUE_THRESHOLD` (60), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
+        GATE_QUEUE_THRESHOLD` (10), and `QUEUE_AGE_PAGE` is 100. A case that faked `total_count=150`
         while the depth read reported 53 would assert an API response that cannot exist (both reads
         are the same endpoint) and would claim a false-open this tool cannot produce. The guard is
         kept for when the two numbers cross — the gate's threshold is operator-settable, its
@@ -3624,7 +3635,10 @@ def t56_queue_age_reader_refusals():
             box.install("gh-runner-x64", "r-1")
             box.alive([box.installs["gh-runner-x64"]])
             box.pool([("r-1", "online", False, ["self-hosted", "self-hosted-x64"])])
-            box.queued(53)
+            # Below the gate's trigger: an unreadable head must be reported as `unmeasured`, and a
+            # depth past the trigger would let the depth term decide first and mask the refusal.
+            measured_depth = ra.GATE_QUEUE_THRESHOLD - 1
+            box.queued(measured_depth)
             record = converge(box, nproc="2", dry_run=True)
             check(
                 record.get("starvation") == "unmeasured",
@@ -3640,7 +3654,7 @@ def t56_queue_age_reader_refusals():
                 "the refusal must carry its cause to the record, not a bare `unmeasured`",
             )
             check(
-                record.get("queued_runs") == 53,
+                record.get("queued_runs") == measured_depth,
                 f"and the depth the sample DID measure must survive the failed read — `--json` "
                 f"reporting it as absent is the round-7 defect: {record.get('queued_runs')}",
             )
@@ -4279,6 +4293,194 @@ def t55_restore_cannot_lose_the_key_quietly():
         for d in (short, stuck, gone):
             if d:
                 shutil.rmtree(d, ignore_errors=True)
+
+
+@test("T57 a ZERO-BYTE `.runner` is a reported CONFIG-LOST slot, never an unmeasurable box")
+def t57_empty_runner_config_does_not_abort_the_pass():
+    """Measured on cell `cmux` 2026-11-03: `/opt/gh-runner-x64-5/.runner` was truncated to 0 bytes
+    (with `.credentials` and `.credentials_rsaparams`) by the ENOSPC that also killed `runsvc.sh`
+    with `No space left on device`. `discover()` raised `Unmeasurable` on it, so ONE destroyed
+    install made the whole pass fatal — `runner-autoscale.service` failed every ~9 minutes for 6
+    hours (42 consecutive passes, 02:38Z–08:29Z) and the box was never measured, its ceiling
+    predicate never ran, and its dead runner was never repaired, while 111 jobs sat queued and 0 of
+    them held a runner.
+
+    The raise in `_read_runner_config` is load-bearing for a config that might describe a LIVE
+    registration. An EMPTY one cannot: it carries no agentName and no URL. In the measured 2026-11-03
+    shape its `.credentials` and `.credentials_rsaparams` were truncated in the same breath, but this
+    file does NOT stat those two — the exemption rests on the 0-byte `.runner` ALONE (see the module
+    header). This case pins the three properties that make the exemption safe — the pass MEASURES, the
+    slot is REPORTED, and it is NEVER handed to the re-registration arm (whose `--replace` would act
+    on an invented name)."""
+    with Env():
+        box = Box("config-lost")
+        try:
+            up = [box.install("gh-runner-x64", "r-1"), box.install("gh-runner-x64-2", "r-2")]
+            lost = box.install("gh-runner-x64-3", "r-3")
+            # the measured shape: the config AND its credentials truncated to nothing
+            for name in (".runner", ".credentials", ".credentials_rsaparams"):
+                with open(os.path.join(lost, name), "wb"):
+                    pass
+            box.alive(up + [lost])  # its service is still spinning; the listener cannot register
+            box.pool(
+                [
+                    ("r-1", "online", False, ["self-hosted-x64"]),
+                    ("r-2", "online", False, ["self-hosted-x64"]),
+                    ("r-3", "offline", False, ["self-hosted-x64"]),
+                ]
+            )
+            record = converge(box, nproc="8", want=2, dry_run=True)
+            states = {c["dir"]: c["state"] for c in record["runners"]}
+            check(
+                states.get(lost) == "CONFIG-LOST",
+                f"an empty config is its OWN state, not OTHER-REPO/ORPHANED: {states}",
+            )
+            # ⛔ `ceiling == 3` STOOD HERE AND COULD NOT FAIL (#3355 review P3): ceiling is
+            # `min(3, running+headroom)`, and the CONFIG-LOST install is neither in `running` nor able
+            # to move it — dropping the install entirely, or forcing `alive=False`, leaves ceiling 3
+            # (measured). It pinned the core-ceiling table, not this exemption, while reading as the
+            # "the box is still MEASURED" assertion. The measurement this case actually needs is the
+            # VERDICT, which the branch mutation DOES redden (`elif False` -> `at-ceiling`), and the
+            # LIVENESS below, which the `alive=False` mutation reddens.
+            check(
+                record["verdict"] == "config-lost",
+                f"the pass COMPLETED, measured the box, and reported the lost slot: {record['verdict']}",
+            )
+            check(
+                lost in record["config_lost"],
+                f"the lost config is NAMED for a machine reader: {record.get('config_lost')}",
+            )
+            check(
+                any(lost in n and "EMPTY" in n for n in record["notes"]),
+                f"…and for a human, never silent: {record['notes']}",
+            )
+            check(
+                record["problems"] == [],
+                "a standing lost slot must NOT become an `action-failed` problem: that verdict sits "
+                f"above `starvation`, so it would mute the queue alarm — {record['problems']}",
+            )
+            # ⛔ ITS LISTENER IS UP (it was put in `box.alive`), so it must still COUNT as live.
+            # Forcing `alive=False` dropped a measured listener out of `running`/`live`, and the fill
+            # loop then added a runner onto an already-full box on the cores arm, which does not read
+            # `live` at all — the round-2 over-fill, re-opened by this exemption.
+            check(
+                record["live"] == 3,
+                f"a spinning listener keeps its liveness even with a lost config: live={record['live']}",
+            )
+            check(
+                any(c["dir"] == lost and c["alive"] for c in record["runners"]),
+                f"…and the classified entry says so: {record['runners']}",
+            )
+            # ⛔ THIS KEYS ON THE STATE, NOT ON THE DIRECTORY (review finding P1, re-verified).
+            # `would_repair` entries are `f"would repair {c['name']} ({c['state']})"`, and a
+            # CONFIG-LOST install's `name` is EMPTY — so the entry a repair-by-mistake appends reads
+            # `would repair  (CONFIG-LOST)` and NEVER contains the install's directory. The earlier
+            # `lost in w` form was therefore satisfied BY CONSTRUCTION: it stayed green with the
+            # repair-loop guard deleted, i.e. it guarded nothing while reading like the assertion
+            # that protects the destructive arm. The paired mutation below is what proves it bites.
+            check(
+                not any("(CONFIG-LOST)" in w for w in record["would_repair"]),
+                f"it must never reach the re-registration arm: {record['would_repair']}",
+            )
+            # ⛔ AND THE DESTRUCTIVE ARM IS SHOWN UNREACHED FOR REAL, not only in `would_repair`. A
+            # dry run never executes a repair, so `would_repair` alone cannot demonstrate that
+            # `config.sh --replace` was never invoked on the empty name — nor that
+            # `_clear_local_config` did not DELETE the credentials on the way there (it unlinks
+            # before `config.sh` runs, and only restores on failure). Measured with the guard
+            # removed: `config.sh --name  --labels self-hosted-x64 --replace`.
+            real = converge(box, nproc="8", want=2, dry_run=False)
+            check(
+                not [c for c in box.calls("config-calls.log") if "argv=" in c],
+                f"`config.sh` must never be invoked on the empty name: {box.calls('config-calls.log')}",
+            )
+            check(
+                all(
+                    os.path.exists(os.path.join(lost, n))
+                    for n in (".runner", ".credentials", ".credentials_rsaparams")
+                ),
+                "the config AND its credentials must survive a real pass — the destructive arm "
+                f"unlinks them before `config.sh` runs: {os.listdir(lost)}",
+            )
+            check(
+                real.get("config_lost") == [lost],
+                f"a real pass names the lost slot too: {real.get('config_lost')}",
+            )
+            # ⛔ THIS ASSERTION USED TO BE UNFALSIFIABLE (#3355 review P2). It read
+            # `record["verdict"] not in ("unmeasurable",)`, which no mutation of this diff could
+            # ever make red: `unmeasurable` needs `record["unverified"]`, and that is set only when a
+            # MEASUREMENT fails after a restart or an install — while this fixture has no DEAD entry
+            # to restart, so the flag can never be raised. "The pass completed" was already proven by
+            # `converge` returning at all. It is now the assertion the design gap needs instead: the
+            # lost slot has its OWN non-zero verdict, and THAT is reachable by mutating the branch
+            # (`elif False:` → falls back to `at-ceiling`, exit 0).
+            check(
+                record["verdict"] == "config-lost",
+                "a box whose ONLY fault is a destroyed config must NOT report healthy — before this "
+                f"verdict it fell through to `at-ceiling`/exit 0: verdict={record['verdict']}",
+            )
+            # ⛔ AND THE EXIT CODE, not just the word (#3355 review — the design gap). `config_lost`
+            # is deliberately not a `problem`, so with no verdict of its own it left the chain
+            # untouched: a box with a 0-byte `.runner` and nothing else wrong exited **0** — the same
+            # answer a timer gets from a fully converged box — for an install nothing but a human can
+            # re-register. The pre-exemption behaviour was loud by ACCIDENT (the pass ABORTED as
+            # `unmeasurable`, exit 2: the 42 consecutive failed systemd passes). 6 restores the
+            # loudness without claiming a measurement failed, because this pass measured the box fine.
+            rc, out = cli(box, "--root", box.root, "--want", "2")
+            check(rc == 6, f"a destroyed config must not exit 0 — got {rc}: {out[:400]}")
+            contains(out, "verdict=config-lost", "the human output")
+            contains(out, "CONFIG-LOST", "the cause a human reads")
+            # ⛔ AND STARVATION STILL WINS (exit 4). The lost-slot verdict is placed BELOW the
+            # starvation branch ON PURPOSE: exit 4 is the one exit a health check pages on, so the
+            # new non-zero verdict must never be the thing that mutes a starved queue. 53 queued
+            # against online-but-idle runners is the measured #2875 shape from T9.
+            box.queued(53)
+            rc, out = cli(box, "--root", box.root, "--want", "2")
+            check(
+                rc == 4,
+                f"starvation must KEEP exit 4 when a lost config also applies — got {rc}: {out[:400]}",
+            )
+            contains(out, "STARVATION", "the alarm is what the exit code names")
+            box.queued(0)  # disarm the alarm again: the rest of this case is about the lost slot
+            # the mutation the exemption must not open: a NON-EMPTY config still aborts — and the
+            # boundary is 0 BYTES, so every non-empty shape must go through the raise, including the
+            # 1-byte ones a short write can leave. Measured before these cases existed: mutating the
+            # guard to `st_size <= 1` left the whole suite GREEN, so the exemption's exact boundary
+            # was unpinned. Silently skipping a non-empty config would let the provisioner read its
+            # slot FREE and add a second install over the top of a registration that may be live.
+            for shape in ("{", " ", "\n", "{}", "null", "[]", '"x"', "{ truncated"):
+                with open(os.path.join(lost, ".runner"), "w", encoding="utf-8") as fh:
+                    fh.write(shape)
+                try:
+                    converge(box, nproc="8", want=2, dry_run=True)
+                except ra.Unmeasurable as exc:
+                    # `{}` is valid JSON and IS an object, so it leaves through the OTHER
+                    # `Unmeasurable` arm (no agentName/gitHubUrl); every other shape cannot be read
+                    # as a runner config at all. Both are the same door — the assertion names which,
+                    # so a message that silently widens or narrows is visible.
+                    expect = (
+                        "has no agentName/gitHubUrl" if shape == "{}" else "not a readable runner config"
+                    )
+                    contains(str(exc), expect, f"the abort cause ({shape!r})")
+                else:
+                    check(False, f"a NON-EMPTY config must still raise Unmeasurable ({shape!r})")
+            # ⛔ AND IT SURVIVES AN EARLY-RETURN PASS. A `--want N` above the ceiling refuses before
+            # the repair loop runs; when the report was filled IN that loop, the refusal published
+            # `"config_lost": []` — a positive claim that nothing is lost, on the one CLASS-LEVEL
+            # channel a machine reader has (this is deliberately not a `problem`).
+            # (the case above left a GARBAGE config in place — restore the measured 0-byte shape)
+            with open(os.path.join(lost, ".runner"), "wb"):
+                pass
+            refused = converge(box, nproc="8", want=9, dry_run=True)
+            check(
+                refused.get("verdict") == "refused",
+                f"the fixture must really refuse: {refused.get('verdict')}",
+            )
+            check(
+                lost in refused.get("config_lost", []),
+                f"a refusal pass still NAMES the lost slot: {refused.get('config_lost')}",
+            )
+        finally:
+            box.destroy()
 
 
 MUTATIONS = [
@@ -5069,7 +5271,7 @@ MUTATIONS = [
     ),
     Mutation(
         "T43",
-        "GATE_QUEUE_THRESHOLD = 60",
+        "GATE_QUEUE_THRESHOLD = 10",
         "GATE_QUEUE_THRESHOLD = 55",
         "the alarm's copy of the gate's threshold drifts away from the gate's own default",
     ),
@@ -5096,6 +5298,80 @@ MUTATIONS = [
         '            record["unverified_cause"] = "disk-unreadable-midpass"',
         '            record["unverified_cause"] = "mid-pass-measurement"',
         "the mid-pass disk failure loses its own cause, so the rendered error blames an install",
+    ),
+    # ── the CONFIG-LOST exemption, ONE MUTATION PER ARM IT RESTED ON (#3355 review P1) ───────────
+    Mutation(
+        "T57",
+        # ⛔ THE LIVENESS LEG, WHICH IS THE ONE THE EXEMPTION ITSELF RE-OPENED (#3355 review P1). It
+        # is a SEPARATE mutation from the repair-arm one below because it defends a DIFFERENT arm:
+        # the guard mutation protects the DESTRUCTIVE arm (never `--replace` the empty name), this
+        # one protects the FILL DECISION (never add a runner to a box whose listeners are already
+        # spinning). Measured on the mutant: `live` drops 3→2 and the case reports
+        # `a spinning listener keeps its liveness even with a lost config: live=2`.
+        "                    alive=str(entry) in alive,",
+        "                    alive=False,  # MUTATION: the measured listener is discarded",
+        "a CONFIG-LOST install's listener is MEASURED as spinning but reported not-alive, so it drops "
+        "out of `running`/`live`: the pass under-counts the box and the fill loop then ADDS a runner "
+        "onto an already-full machine, on the core arm that does not read `live` at all — the round-2 "
+        "over-fill, re-opened by the exemption that was added to stop the pass aborting",
+    ),
+    # ── the `config-lost` VERDICT: the loudness the exemption nearly traded away (#3355 review) ──
+    Mutation(
+        "T57",
+        '    elif record.get("config_lost"):',
+        '    elif False:  # MUTATION: a destroyed config leaves the verdict chain untouched',
+        "a box whose ONLY fault is a 0-byte `.runner` falls back through the chain to `at-ceiling` "
+        "and exits **0** — byte-identical, to a 9-minute timer, to a fully converged box — for an "
+        "install no pass can re-register and only a human can — the `exit 0 for a box that needs a "
+        "human` half of the review's design gap",
+    ),
+    Mutation(
+        "T57",
+        '    elif starvation.get("state") == "starved":',
+        '    elif starvation.get("state") == "starved" and not record.get("config_lost"):',
+        "a lost config MUTES THE ALARM: a starved, 53-queued box that also carries one destroyed "
+        "`.runner` stops exiting 4 and exits 6 instead, so the one exit a health check pages on is "
+        "lost to a condition that is merely standing — the exact precedent `problems` was kept out "
+        "of the chain to avoid, and the reason `config-lost` must sit BELOW the starvation branch",
+    ),
+    Mutation(
+        "T57",
+        '    if record["verdict"] == "config-lost":\n        return 6',
+        '    if False:  # MUTATION: the verdict is published but the exit code stays 0\n        return 6',
+        "the verdict is CORRECT and the EXIT CODE is 0 — a 9-minute timer reads `config-lost` in the "
+        "log while the unit's own exit status says the pass was clean, which is the gap the review "
+        "named: nothing in the repo consumes `--json`, so the exit code is the only channel a "
+        "scheduler has",
+    ),
+    Mutation(
+        "T57",
+        '        if c["state"] == "CONFIG-LOST":\n'
+        "            # Reported (in `record[\"config_lost\"]` + `notes`, both filled at record-build time) and\n"
+        "            # never repaired: `register(..., repo)` needs the agent name this install no longer has,\n"
+        "            # so a repair would either invent a new name or `--replace` on a name it guessed.\n"
+        "            continue",
+        '        if False:  # MUTATION: a CONFIG-LOST install falls through to the repair arm\n'
+        "            continue",
+        "a lost-config install reaches `register(..., --replace)` under the EMPTY agent name it no "
+        "longer has — measured `config.sh --name  --labels self-hosted-x64 --replace` — and "
+        "`_clear_local_config` permanently deletes `.credentials` and `.credentials_rsaparams` on "
+        "the way, so the one class of install that cannot re-register is also the class that loses "
+        "the key a human needs to re-register it",
+    ),
+    Mutation(
+        "T57",
+        # ⛔ THE NON-OBJECT JSON LEG, added with the `isinstance(data, dict)` guard (#3355 review
+        # P3). A `.runner` holding `null` / `[]` / `"x"` is VALID JSON and NOT an object, so without
+        # the guard `data.get(...)` raised `AttributeError` — which is not `Unmeasurable` and escaped
+        # the tool's error contract as a traceback instead of the one line the log is read for.
+        # Measured on the mutant: `FAIL T57 … AttributeError: 'NoneType' object has no attribute
+        # 'get'` (PASS=0 FAIL=1), so the leg is pinned rather than merely present.
+        "    if not isinstance(data, dict):",
+        "    if False:  # MUTATION: a non-object `.runner` escapes as AttributeError",
+        "a `.runner` whose bytes are valid JSON but not an object (`null`) reaches `data.get(…)` and "
+        "dies with `AttributeError` — outside the `Unmeasurable` contract every other unreadable "
+        "config goes through, so the pass aborts on a traceback the log reader is not looking for "
+        "instead of the named cause",
     ),
 ]
 

@@ -167,7 +167,21 @@ from typing import Dict, List, Optional, Sequence, Tuple
 # launchd job is never a candidate (gate 4). Both exclusions are positive identification, so a
 # new Apple helper that happens to sit at ppid 1 is reported-not-reaped rather than killed.
 OURS = re.compile(r"^/Users/[^/]+/Documents/GitHub/")
-TESTISH = re.compile(r"pytest|^\.?/?.+\.venv/bin/python|uvicorn|gunicorn|/bin/bash -c ", re.I)
+# ⛔ TWO VENV ARMS, AND THE FIRST IS NOT REPLACED BY THE SECOND (#2285). The original arm is
+# anchored, so it only matches an interpreter path that follows the START of argv (`/…/.venv/bin/
+# python`, `./.venv/bin/python`). A **bare-relative** `argv[0]` — `.venv/bin/python …`, which is
+# what an ACTIVATED venv or any invocation written without `./` actually puts in `ps args` — never
+# matched, so that shape was silently absent from the pool this file's header claims
+# (`ours, test/tooling-shaped, any depth`). The second arm matches the same executable when it sits
+# at the start of argv or after whitespace / a slash. It ADDS a spelling of the same class; it
+# narrows nothing, and the class itself (ours, orphaned, parked 2 h, gates 1-5) is unchanged — the
+# gates, not this regex, decide a reap, and a bare-relative candidate must still pass all five.
+# ⚠️ REACH, MEASURED 2026-11-02: `OURS` above is still required for the shipped selector, so this
+# arm reaches the default population only when the argv also names our checkout; its effect on the
+# bare-relative shape alone is under `--include-any-owner`. The dry run on a Linux cell measured a
+# delta of 0 (a cell has no `/Users/…` path at all — `OURS` matched 0 of 502 rows); the shape lives
+# on the hub, where a `ps` census with this arm on/off is the measurement, not this comment.
+TESTISH = re.compile(r"pytest|^\.?/?.+\.venv/bin/python|(?:^|[\s/])\.venv/bin/python|uvicorn|gunicorn|/bin/bash -c ", re.I)
 # ⛔ NOT IN THIS TOOL'S CLASS: embedded `redislite` redis-server processes. Another agent owner
 # already exists for them — `tortoise/tools/embedded_orphans.py` (the bounded census), the launchd
 # job `com.tortoise.embedded-reaper`, and issue #3599 — whose only_safe mode exists precisely

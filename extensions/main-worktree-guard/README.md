@@ -446,9 +446,16 @@ it, which on a clean checkout sent the reader hunting a phantom dirty tree. The
 dirty arm (`discardDestroysWip` returned true — the status WAS read) keeps both
 the claim and the hatch.
 
-**Escape hatches are unchanged**: M5 sits after the env-hatch / TTL-marker
-return, so `AGENT_ALLOW_MAIN_EDITS=1` and the `~/.pi/agent/.allow-main-edits`
-marker bypass it exactly as they bypass M2/M3. Task children are unhatched by
+**Escape hatches differ — do not conflate them** (round 14):
+`AGENT_ALLOW_MAIN_EDITS=1` (session start) is a FULL guard bypass — M2/M3/M4 all
+off, whole-tree discards included — and it cannot be set on a running process.
+The `~/.pi/agent/.allow-main-edits` MARKER is the scoped one: it bypasses M2/M3 and
+opens ONE narrow M4/M5 RECOVERY WINDOW — a single bare
+`git checkout -- <named path>` / `git restore [--staged] [--worktree] <named path>`
+run from the disordered hub, so a dirty hub can actually be cleared. Everything
+else stays frozen under the marker, and a wrapped / compound / `-C` /
+`GIT_DIR`-retargeted / whole-tree (`./`, glob, brace, `..`) form is refused
+exactly as on main (#1484 D3). Task children are unhatched by
 default (#617/#623), so for the `pi -p` fixer M5 — not a prose rule — is the
 enforcement surface.
 
@@ -853,7 +860,8 @@ a DIFFERENT checkout the message never named.
 | `git checkout main` / `git checkout master` | `git commit`, `git add` |
 | `git pull --ff-only` (plain pull may merge → blocked) | `git checkout -b` / `switch -c`, any other checkout |
 | `git fetch` | `git push` to any branch but the checked-out one |
-| `git status`, `git log`, read-only ops (`diff`, `show`, …) | `git merge` / `rebase` / `reset` / `clean` / `restore` |
+| `git status`, `git log`, read-only ops (`diff`, `show`, …) | `git merge` / `rebase` / `reset` / `clean` |
+| `git restore [--staged] [--worktree] <named path>`, `git checkout [HEAD] -- <named path>` — **only under an active TTL marker**, run from the hub (the #1484 recovery window) | `git restore` with `--source`; a whole-tree operand (`.`, `./`, glob, brace, `..`); a wrapper/compound/`-C`/`GIT_DIR` retarget; or any of these with NO marker |
 | `git worktree add/list/prune/remove` | `git push -f` / `--delete` (see #436 carve-out below) |
 | `git push origin <currently-checked-out-branch>` (WIP preservation) | write/edit OVERWRITES in the hub (see #436 carve-out below) |
 | `touch ~/.pi/agent/.allow-main-edits` (escape marker) | |
@@ -1072,13 +1080,21 @@ a stranded lane's work never silently dies before recovery.
 **Escape-hatch interaction (D3):** M4 **stays ACTIVE under the TTL marker** —
 consistent with the #265 contract that M1 detection stays active under the
 hatch. A stranded lane can recover with the marker (or even without it — the
-sanctioned recovery ops above are allowed directly), but **cannot resume
+sanctioned recovery ops above are allowed directly, plus the named-path restore
+window), but **cannot resume
 feature work in the hub**. Only `AGENT_ALLOW_MAIN_EDITS=1` (env, set at
 session start, deliberate solo session) disables M4. The sanctioned terminal
 one-liner (`cd <repo> && git checkout main && git pull --ff-only`) is
 touched only by humans and is unaffected — a human terminal is never
 intercepted, and inside the disordered hub M4's recovery allowlist admits the
-compound. (An AGENT on a CLEAN hub has no M4 active and must run the sync on its
+compound. It is the right route for an **off-main AND clean** hub only: on a
+DIRTY hub it cannot RECOVER — `git checkout main` may refuse or carry the change
+along, and `git pull --ff-only` may fast-forward or refuse; none of it clears the
+dirty paths — so clear
+the dirt first with the named-path restore window
+(`git restore --staged --worktree <path>` / `git restore <path>` under the
+marker; `mv <untracked> /tmp/` for `??`). (An AGENT on a CLEAN hub has no M4
+active and must run the sync on its
 own: the #1144 effect arm refuses the compound because its effect evidence
 covers only the first sync op. See "The clean-hub sync allowance" above.)
 
@@ -1341,6 +1357,153 @@ outer mode runs is M4-sanctioned or read-only (fetch / status / branch
 --show-current / rev-parse / rev-list / show), and the sub-script independently
 refuses a non-main-checkout, an off-main hub, a dirty hub, or — on the discard
 path — a content-carrying commit.
+
+## The REMOTE-EXEC boundary — a command that runs on another box is not gated locally (#3444)
+
+**The defect.** Every gate in this extension resolves PATHS and HUB STATE against
+the LOCAL checkout. That is correct for a command that runs here and wrong for a
+command whose execution target is another box — and the guards held the datum
+that said so (`cmux vm exec <vm> --` marks a remote context) without reading it.
+Measured 2026-11-04 from a hub-rooted session, with every one of these refused:
+
+| # | command | refusal |
+|---|---|---|
+| 1 | `cmux vm exec cell -- sh -c 'git worktree add rev-3168'` | **#1919** — and the message named the LOCAL path (`/Users/…/.worktrees/rev-3168`) for a command that runs on a cell |
+| 2 | `cmux vm exec cell -- sh -c 'cd /srv/repo && git checkout feat/x'` | **#1484** (dirty hub) / M3 branch-state (clean hub) — both judged the LOCAL checkout |
+| 3 | `cmux vm exec cell -- sh -c 'cd /srv/repo && git pull --ff-only && make test'` | **#1144** — the sync allowance read the LOCAL tree state |
+| 4 | `cmux vm exec cell -- sh -c 'printf "git checkout -- a.txt" \| bash -s'` | **#709** — a piped payload that never runs here, failed closed |
+
+It made ~87 idle lanes across four running cells unusable from any hub-rooted
+session. The only route that worked was spelling an ABSOLUTE remote path, which
+cannot be mistaken for a local one.
+
+**The fix — a mask, not a bypass.** `classify-git.mjs maskRemoteExecPayloads()`
+recognises three boundaries — `cmux vm exec … <vm> -- <payload>`, `ssh [opts]
+<host> [payload]`, `docker exec [opts] <container> [payload]` — and replaces the
+payload with one inert word (`_remote_payload_`) before ANY local gate sees the
+command. `index.ts` applies it at BOTH bash gate call sites (the main gate and the
+M5 path) and threads the masked string through M4/M5, the #1919 worktree gate, the
+#1484/#627 backdoor, the tracked write gate, the degradation classifier and the
+full M3/M2/#1144 decision; the audit RECORD deliberately keeps the raw command.
+A command with no boundary is returned **byte-for-byte unchanged**, so no local
+guard is relaxed by a byte unless a boundary is really present.
+
+**What stays exactly as strict (the safety half — each has a pinned case):**
+
+- a LOCAL segment **after** the remote command (`… 'x' ; git worktree add loc`):
+  the mask ends at the first top-level separator;
+- a LOCAL segment **before** it (`git worktree add lead && cmux vm exec …`);
+- a REDIRECTION and its target (`cmux vm exec … > a.txt`), because redirecting a
+  remote command's stdout is a LOCAL file write — and the same holds for a
+  redirect in the OPERAND position (`ssh cell-a > a.txt` truncates a local file
+  and hands ssh no command at all), so such a form is not a boundary;
+- a substitution that RUNS LOCALLY: an unquoted or double-quoted backtick region
+  is ONE local token (the whole region is kept, not just the opening one), a
+  DOUBLE-quoted `$(…)` is kept with the token that holds it, and a single-quoted
+  spelling is masked with the rest of the payload because it runs remotely;
+- a COMMENT's text, which the shell discards: a `#` at the start of a word is
+  scanned to end-of-line WITHOUT quote handling, because a quote inside a comment
+  used to open a region that swallowed the newline and masked the next, genuinely
+  local, line. The same class covers ANSI-C quoting (`$'…'`, where `\'` escapes),
+  and a scan that ends inside a quote leaves the whole command UNMASKED;
+- a payload piped INTO a local shell (`cmux vm exec … | bash -s`, `… |& bash`,
+  `… | (bash -s)`, `… | { bash; }`, `… | "$SHELL"`, `… | busybox sh`), because the
+  pipe is built here and the remote stdout is executed as a local script: the
+  command is left unmasked so the #709 arm still refuses it. The polarity is a
+  CLOSED allow-list: the mask survives only when every downstream stage head is a
+  proven DATA consumer (`grep`/`rg`/`cat`/`tee`/`head`/`tail`/`wc`/`sort`/`jq`/
+  `base64`/…) — anything else bails to today's gating. An open list of shells was
+  tried first and lost three times (`|& bash`, `| (bash)`, `| { bash; }`,
+  `| "$SHELL"`, `| busybox sh`, `| timeout 5 bash`, `| > /tmp/f bash -s`, `|<NL>
+  bash`), because a spelling list can never be complete while a false bail only
+  re-gates a command and a false allow EXECUTES it;
+- a payload handed to a LOCAL command through such a REDIRECT-style construct:
+  a PROCESS SUBSTITUTION (`bash <(cmux …)`, `bash < <(cmux …)`) and a COMMAND
+  SUBSTITUTION whose enclosing command word is not a data consumer
+  (`bash -c $(cmux …)`, `env bash -c $(…)`, `python3 -c $(…)`, or a bare `$(cmux
+  …)` at command position). A pure ASSIGNMENT (`x=$(cmux … )`) has no consumer
+  here and stays masked; the two-step `x=$(…); eval $x` is beyond a single-string
+  scan (same class as `bash /tmp/f`) and is recorded as a residual rather than
+  pretended closed;
+- an UNQUOTED `$(` or `((`, which ends the mask like any other top-level
+  separator — the remainder is then gated exactly as before the fix (fail-closed;
+  a remote command with an unquoted substitution still sees today's refusals);
+- a heredoc's TERMINATOR line, which is structure rather than payload: masking it
+  fused the delimiter onto the terminator (`<<'EOS'EOS`), no downstream parser
+  could close the heredoc, and the next LOCAL command read as body data — a
+  fail-open found by this suite while the fix was being written. Plain `<<`
+  requires the terminator at column 0 (an INDENTED terminator does not close it,
+  so the rest stays body and stays masked); `<<-` ignores leading tabs;
+- the REST OF THE DELIMITER LINE (`… <<'EOS'; cmd`, `… <<'EOS' && cmd`,
+  `… <<'EOS' | tee f`, `… <<'EOS' > f`), which bash runs HERE after consuming the
+  body. Those tokens used to be dropped from the gated string — not masked,
+  dropped — so the local command or local write on that line was invisible to
+  every gate (a fail-open found by review cycle 3). The body starts after the
+  LOGICAL line, not the first PHYSICAL newline: a `\`+newline continuation or a
+  quote spanning a newline joins the line, and cutting at the physical newline
+  dropped the joined remainder (review cycle 4);
+- a heredoc DELIMITER word goes through SHELL QUOTE REMOVAL, so `<<$'EOS'`,
+  `<<$"EOS"`, `<<E"OS"` and `<<\EOS` all terminate at `EOS`. Keeping the quotes
+  meant no terminator ever matched, the mask ran to end-of-string, and every LOCAL
+  command after the real terminator was hidden (review cycle 4). An EXPANSION in a
+  delimiter (`<<$X`) stays literal, exactly as bash leaves it; a word this remover
+  cannot resolve leaves the command UNMASKED;
+- wrapper heads we do not model (`sudo cmux …`, `env K=V cmux …`, a
+  `bash -c '…'` payload that hides the head): these stay GATED (fail-closed
+  residual), because a boundary recogniser that guessed would relax a local guard
+  for a command it had not actually resolved. Two further unprovable shapes bail
+  out to today's gating rather than guess: TWO heredocs on one command line (the
+  body order is source-positional, not token-order) and a redirect-only remote
+  form (`ssh <host> 2>/dev/null cmd`).
+
+**Boundary recognition, not just masking.** A heredoc is accepted as the payload
+itself (`ssh cell <<'EOS'` — the spelling a lane uses when it has no command word
+to hand over), and a value flag that carries its value (`-p22`,
+`-L8080:host:80`, `-oK=V`) no longer swallows the host: consuming the next word
+there lost the boundary entirely and left a legitimate remote dispatch refused.
+
+**Recognised boundaries are exactly:** `cmux vm exec … <vm> -- …`,
+`ssh [opts] <host> …`, `docker exec [opts] <container> …`. `docker container exec`
+and `docker compose exec` are NOT modelled — they stay gated (fail-closed); say so
+rather than let a lane assume otherwise.
+
+**Scope note, measured rather than assumed.** The issue also reports a BASE64
+payload piped to a remote shell. At this head that spelling alone is not refused
+(`echo <b64> | base64 -d | sh`, remote or local): the piped-payload arm keys on a
+discard VERB in the visible text, which an encoded payload does not carry. The
+family that IS refused — and that the suite pins as case 4 — is a payload piped
+to a shell whose text is visible. Encoded payloads are covered on the mask side:
+opaque content is masked with the rest of the payload either way.
+
+**Tests.** `test-remote-context.mjs` (below) pins both directions for each case
+and carries TWENTY-ONE mutants that MUST redden it: the pre-fix identity mask, an
+over-reaching mask that ignores separators, the swallowed heredoc terminator, a
+mask that keeps only the opening token of an unquoted backtick region, a
+quote-scanned comment, an ANSI-C quote read as a plain quote, a piped payload
+that blinds the local-shell arm, a dropped heredoc delimiter-line tail, a
+pipe-head shell allow-list (the pre-inversion polarity), a heredoc body cut at the
+physical newline, a delimiter word without quote removal, a pipe bail that skips
+no redirection target, an array literal treated as command position, an
+undecodable ANSI-C escape taken literally, a CRLF delimiter word trimmed, a
+paren depth ignored for the heredoc newline, a process substitution that is not
+bailed, a substitution feeding a local command, a delimiter continuation kept as a
+newline, a local substitution masked with its spawner, and a redirection `&`
+treated as a job separator.
+
+**Known cosmetic residual.** The placeholder `_remote_payload_` is an ordinary
+word, so the tracked-write probe may `git ls-files` it (one stderr line, benign).
+A repo that really tracked a file with that name would have that path probed
+instead — no gate decision depends on it.
+
+**Parser limits this mask cannot fix, and does not pretend to (each MEASURED on
+both heads).** The mask keeps a heredoc delimiter line's local tail visible, but
+a `\`+newline CONTINUATION on that line is still read as BODY by the guard's own
+heredoc parser, and a pipeline whose stage head is a VARIABLE INDIRECTION
+(`| { S=bash; $S -s; }`) is not recognised by the #709 arm — both were allowed at
+`origin/main` too, so this PR neither creates nor fixes them. A quoted delimiter
+(`<<$'EOS'; git worktree add …`) IS refused at `origin/main` (#1919), which is why
+the mask must resolve that delimiter exactly (above) — a wrong word there would
+have regressed a real refusal. Recorded rather than silently inherited.
 
 ## Hub-WIP hygiene warnings — put WIP in a worktree (#350) + #437 tracked-write gate
 
@@ -1653,7 +1816,7 @@ NOT routine options, and using any of them while the hub is disordered makes
 | env hatch | `AGENT_ALLOW_MAIN_EDITS=1` at session start | Full guard bypass of the BLOCKING gates — M2/M3/M4 off (M1 deviation detection stays active, warn-only). Nothing automated exempts agent-infra main dirt anymore (#615/#619 — hub-state-check now includes agent-infra + the sibling hub repos tortoise/premise-labs/DMeer/eldato; sibling sessions in the hub are unprotected and will be disrupted). Prefer `hub-worktree.sh <branch>` instead. |
 | TTL escape marker (#207) | `touch ~/.pi/agent/.allow-main-edits  # reason` as its own bash call | Bypasses M2/M3 for 15 min — but **M4 stays ACTIVE** (D3): in an off-main/dirty hub you can only run sanctioned recovery ops, never resume feature work. The audit log records your session id. |
 | script backdoor | ~~write /tmp/x.sh + bash /tmp/x.sh~~ | **CLOSED (#1484)** — git-bearing scripts are gated by the M4 allowlist. **#1485** narrows the surface to what is actually READ (an opaque executable has no program to read), and adds the merge rail + the argv gh shim to the named `SANCTIONED_SCRIPT_RELPATHS` list; a general "committed repo script" exemption was rejected at review (committed is purchasable — see the #1485 note in the backdoor section). **#627:** the non-shell sibling (`python -c`, `node -e`, `ruby -e`, `perl -e`, `php -r`, `pwsh -Command`) is closed for INLINE payloads too; residuals: `python -m`/bare-stdin/pipe payloads, dynamic string construction, and file/shebang payloads (`python x.py`, `./x.py`). Env hatch / TTL marker still bypass it. |
-| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | THE sanctioned recovery (#206). Terminals are never intercepted; this is how a stranded hub gets un-stranded. |
+| terminal | a human runs `cd <repo> && git checkout main && git pull --ff-only` | The sanctioned **branch** recovery (#206) — correct for an off-main AND CLEAN hub; on a DIRTY hub it cannot clear the dirt (`git checkout main` may refuse or carry the change along; `git pull --ff-only` may fast-forward or refuse), so clear the dirt first with the named-path restore window above. Terminals are never intercepted. |
 
 Rule of thumb: **if you are not recovering the hub or working alone, you
 should be in a worktree — `hub-worktree.sh <branch>` makes it one command.**
@@ -1996,9 +2159,10 @@ marker fixes **guard-blocked** sessions only.
 
 | Suite | Command | Covers |
 |---|---|---|
-| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions) |
+| `test.mjs` | `node extensions/main-worktree-guard/test.mjs` | `classify-git.mjs` + `branch-ownership.mjs` decision surfaces (pure functions). **3 KNOWN PRE-EXISTING REDS at this base** (identical at `origin/main`: `git worktree` detached at `d5c6dc753` gives 1904/3) — named so the next lane does not re-discover them: `bd runtime with set (unchecked-out) → recovery: block`, `bd runtime branch -D unchecked-out → recovery: block` (#1150 cwd-sensitive cases) and `X2: partial craft (two-way passes, porcelain disagrees) → rejected by cross-check` (#2964). None touches `maskRemoteExecPayloads` |
 | `test-command-position.mjs` | `node extensions/main-worktree-guard/test-command-position.mjs` | **command POSITION for the `git` token (#1158)** — the highest-leverage false positive in the stack: an OPERAND `git` (`command -v git >/dev/null 2>&1 || exit 1`) started a phantom invocation whose "verb" was the next shell operator, so the canonical defensive idiom refused the whole script (`check-deployed-drift.sh`, `harness-refresh.sh`). Part A pins the predicate (operand shapes ALLOW; command-position, newline/`then`/pipe/`!`/subshell/case separators, path-qualified invocations, process substitution, and **every wrapper word in `SPAWNER_WORDS` — one fixture each** — still REFUSE); Part B the script-content verdict; Part C the REAL `tool_call` handler against a hermetic MAIN checkout (the idiom ALLOWED, the idiom beside a real destructive invocation STILL BLOCKED, `git status --porcelain` ALLOWED); Part D **measured pins of five KNOWN-FALSE shapes deliberately left unfixed** (`bash -n` noexec, a leading `~`, `<<<` whole-file co-occurrence, `join(" ")` prose rejoin, quoted `\|` alternation) each with a control, so the next lane inherits a map rather than a surprise |
 | `test-module-load.mjs` | `node extensions/main-worktree-guard/test-module-load.mjs` | **the `index.ts` LOAD path** — the wiring `test.mjs` cannot see |
+| `test-remote-context.mjs` | `node extensions/main-worktree-guard/test-remote-context.mjs` (mutation leg: `… --mutations`) | **the REMOTE-EXEC boundary (#3444)** — Part A pins `maskRemoteExecPayloads` (identity for every non-remote command; `cmux vm exec`/`ssh`/`docker exec` payloads masked including multi-line, heredoc, base64 and direct-argv spellings; LOCAL text after/before the boundary, redirect targets — including a redirect in the OPERAND position — locally-executed substitutions and whole backtick regions preserved; heredoc terminator kept on its own line with `<<`/`<<-` semantics, the delimiter line's LOCAL tail kept verbatim, quoted delimiters (`<<$'EOS'`, `<<E"OS"`) resolved through shell quote removal; wrapper heads, path-qualified/quoted heads, redefined transports and two-heredoc lines NOT masked; a trailing separator does not throw). Part B drives the REAL `index.ts` handler against a hermetic hub and pins BOTH directions of every measured refusal — the remote form ALLOWED and the SAME command run locally still REFUSED by the guard that owns it (#1919 for `git worktree add`, #1484/M3 for `git checkout`, #1144 for a compound `git pull`, #709 for a piped payload, plus the `ssh` bare-argv and `docker exec` spellings) — on a clean AND a dirty hub, with the local-redirect / local-backtick / trailing-local / heredoc-then-local safety pins. Part M (`--mutations`, its own CI step, which FAILS rather than skips if the real-module loader is unavailable) rebuilds a TEMP copy of the extension and requires TWENTY-ONE mutants — the pre-fix identity mask, an over-reaching mask that ignores top-level separators, a swallowed heredoc terminator, a split unquoted-backtick region, a quote-scanned comment, an ANSI-C quote read as a plain quote, a piped payload that blinds the local-shell arm, a dropped heredoc delimiter-line tail, a pipe-head shell allow-list, a heredoc body cut at the physical newline, a delimiter word without quote removal, a pipe bail that skips no redirection target, an array literal treated as command position, an undecodable ANSI-C escape taken literally, a CRLF delimiter word trimmed, a paren depth ignored for the heredoc newline, a process substitution not bailed, a substitution feeding a local command, a delimiter continuation kept as a newline, a local substitution masked anyway (the spawner-wrapper loss), and a redirection `&` treated as a job separator — to redden exactly the pins they revert |
 | `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout NOT exempt — allowed on a pristine fixture and BLOCKED while a candidate checkout carries tracked dirt; a linked-worktree copy still gated; set-scoped so a direct discard in the same command is still blocked; a wrapper that SOURCES the helper still blocked; a `-c` payload naming the helper still blocked; a **quoted** path piped into a shell walked like the unquoted spelling, the two NEGATIVE pipe cases — an unquoted word pair must not invent a joined seed, a quoted word with a space must not be over-split — and an eight-row pipeline-seed **shell-fidelity** table over single quotes, escaped spaces, a backslash inside single quotes, an apostrophe inside double quotes and an escaped quote inside double quotes; the unclean-vs-unresolvable message split, a cause-neutral fail-closed headline, the absolute-path remedy being itself allowed, a discard aimed at a non-checkout target allowed, and a null-anchor/guard-without-`scripts/` case where the inert exemption leaves the discard GATED — a BLOCK with the `#709` reason, driven from a hermetic DIRTY cwd so the assertion cannot depend on the runner's own checkout), the #1060 state predicate for `git show <rev>:<path> > <target>` (Part D: the X4 self-overwrite BLOCKED from both hub-rooted and worktree-rooted sessions and ALLOWED on a pristine hub; the redirect target named rather than the source; bare reads — including a `$var` source — and `/dev/null` allowed; untracked-only dirt allowed; the declared outside-checkout fail-closed cost on a dirty tree; the #940 four-shape matrix on a pristine vs a tracked-dirty hub; M4 no longer shadowing M5 on a disordered hub; and the negative controls), #1125 (the read-only `scripts/stale-main-triage.sh` RUNS on the dirty hub it diagnoses; a `for`-loop `git cat-file -e` existence probe with no write surface is allowed; and the negative controls — a `$f`-to-`$f` redirect hint, a resolvable hint landing on its own path, and the M4 block naming the disordered checkout + `dirty: N path(s)` on BOTH the bash and write/edit routes), and both escape hatches |
 
 `test-discard-gate.mjs` also takes `--mutations` (#2161): it reintroduces the
@@ -2065,7 +2229,119 @@ shared main checkout of a project with the guard active:
    since #1484 — the stamp-ordering fix; before that the touch was swallowed
    by the allow-non-git early return and the marker was inert).
 3. `git checkout main && git pull --ff-only` in the **FOLLOW-UP** call →
-   succeeds.
+   succeeds **on an off-main AND clean hub**. On a DIRTY hub this step is
+   **not a recovery** (`git checkout main` may refuse or carry the change along;
+   `git pull --ff-only` may fast-forward or refuse) — there the recovery is
+   the named-path restore the marker's window permits:
+   `git restore --staged --worktree <path>` (staged), `git restore <path>`
+   (worktree), `mv <untracked> /tmp/` (`??`). Any `.`/glob/brace/`..` operand,
+   a wrapper, a compound, or a `-C`/`GIT_DIR` retarget stays refused. A
+   DIRECTORY operand (`src`, `src/`) is admitted and discards that subtree.
+4. `cat ~/.pi/agent/.allow-main-edits` → shows `session_id` + `reason` + `ts`.
+5. `tail ~/.pi/agent/audit/gate-events.jsonl` → a `gate_bypass` /
+   `main_edits_marker` line with session_id + marker content + expires_at.
+6. Wait 15+ minutes → the same recovery op is **blocked again**.
+7. Re-`touch` → immediately allowed again (refresh).
+8. **M4 matrix (disordered hub):** with the hub on a non-main branch or
+   dirty — `git commit` / `git checkout -b x` / `git push origin main`
+   (foreign) / edit tool → **blocked**; `git checkout main`, `git pull
+   --ff-only`, `git fetch`, `git status`, `git worktree add`, `git push
+   origin <checked-out-branch>` → **allowed**. With the marker active,
+   recovery ops stay allowed and feature ops stay blocked (D3); with
+   `AGENT_ALLOW_MAIN_EDITS=1` everything is allowed (env = full bypass).
+9. **Backdoor closure:** in the hub, `bash /tmp/recover.sh` where the script
+   contains `git commit` → **blocked** with the closure reason; a script with
+   only `fetch`/`worktree add`/`status` → runs.
+10. `bash scripts/checkout-hygiene/hub-state-check.sh --repo <hub>` → exit 0
+    on main+clean, exit 1 + recovery command on off-main/dirty.
+11. **#350 WIP hygiene:** from the hub main checkout — an OVERWRITE of an
+    existing/tracked file (`cat > docs/plans/wip.md` in a DISORDERED hub —
+    the #437 tracked-write gate — or `write docs/plans/wip.md` in any hub
+    state) → **blocked**; the write/edit block reason names the `docs/plans/`
+    pattern on the main+clean gate (#615 removed the agent-infra warn-only
+    exemption). A NEW untracked file in a disordered hub passes the #436
+    collision-free new-file carve-out (hub stays dirty — #628 now warns at
+    write time for every new hub file, escalates past the budget, and blocks
+    past the cap); a
+    WORKTREE session writing `docs/plans/wip.md` into the hub via an absolute
+    path → `HUB WIP — PUT IT IN A WORKTREE` warning, command still runs
+    (never blocked); `echo x > /tmp/foo.tmp` → no warning (outside the hub);
+    the session-start banner lists untracked
+    `docs/plans/`/`migrations/`/scratch files when present.
+| `test-discard-gate.mjs` | `node extensions/main-worktree-guard/test-discard-gate.mjs` | **the M5 discard gate (#709)** — pure extraction/effect (Part A) + the REAL `index.ts` handler driven against a hermetically built hub + linked worktree (Part B): dirty/clean targets, staged-only, untracked-only, hub-targeted from a worktree session, prefix spellings, quote-split verbs, bare-path/`-f <path>` ref-vs-path, magic pathspecs, numeric stages, `rm`/`read-tree`/`apply -R [-R3]`/`checkout -p`/`checkout --ours`/`checkout-index`, script + `eval` + heredoc (plain and punctuated delimiter) + list-form-heredoc + filtered head + piped-script + backtick + `$( )` + alias + ANSI-C + `$VAR` + verb-indirection + xargs-feeder + here-string + process-substitution + opaque `-c` + `--work-tree` bypass closures, fail-closed forms, false-positive guards (heredoc data, arithmetic `<<`, mid-line/escaped-whitespace comments, substitution-in-data, index-only `rm`/`restore`/`apply -R`, report-only `apply -R`, `checkout-index --prefix`/`-a`, cd chains, conflict resolution, phantom heredocs), the #1139 sanctioned-script exemption (the recovery helper allowed from a hub-rooted session; the same content at the same relpath in another checkout NOT exempt — allowed on a pristine fixture and BLOCKED while a candidate checkout carries tracked dirt; a linked-worktree copy still gated; set-scoped so a direct discard in the same command is still blocked; a wrapper that SOURCES the helper still blocked; a `-c` payload naming the helper still blocked; a **quoted** path piped into a shell walked like the unquoted spelling, the two NEGATIVE pipe cases — an unquoted word pair must not invent a joined seed, a quoted word with a space must not be over-split — and an eight-row pipeline-seed **shell-fidelity** table over single quotes, escaped spaces, a backslash inside single quotes, an apostrophe inside double quotes and an escaped quote inside double quotes; the unclean-vs-unresolvable message split, a cause-neutral fail-closed headline, the absolute-path remedy being itself allowed, a discard aimed at a non-checkout target allowed, and a null-anchor/guard-without-`scripts/` case where the inert exemption leaves the discard GATED — a BLOCK with the `#709` reason, driven from a hermetic DIRTY cwd so the assertion cannot depend on the runner's own checkout), the #1060 state predicate for `git show <rev>:<path> > <target>` (Part D: the X4 self-overwrite BLOCKED from both hub-rooted and worktree-rooted sessions and ALLOWED on a pristine hub; the redirect target named rather than the source; bare reads — including a `$var` source — and `/dev/null` allowed; untracked-only dirt allowed; the declared outside-checkout fail-closed cost on a dirty tree; the #940 four-shape matrix on a pristine vs a tracked-dirty hub; M4 no longer shadowing M5 on a disordered hub; and the negative controls), #1125 (the read-only `scripts/stale-main-triage.sh` RUNS on the dirty hub it diagnoses; a `for`-loop `git cat-file -e` existence probe with no write surface is allowed; and the negative controls — a `$f`-to-`$f` redirect hint, a resolvable hint landing on its own path, and the M4 block naming the disordered checkout + `dirty: N path(s)` on BOTH the bash and write/edit routes), and both escape hatches |
+
+`test-discard-gate.mjs` also takes `--mutations` (#2161): it reintroduces the
+closed M5 walk defect (`$'…'` escape handling) into a TEMP copy of
+`classify-git.mjs` and requires the paired pin to go BLIND. A pin that cannot
+fail is not a pin, so CI runs that leg as its own step (`node … --mutations`)
+alongside the plain run. `)` as a word end is deliberately NOT closed — see the
+`_wtScanLine` docstring and #2161 for the three measured rounds.
+
+`test-module-load.mjs` exists because of a real regression (#744): #697 added a
+rename-destructuring assignment (`extractCodePayload: _extractCodePayload, …`)
+whose five `_`-prefixed targets were declared NOWHERE. An assignment to an
+undeclared identifier is a `ReferenceError` in ESM (always strict mode); it
+threw inside the guarded `await import("./classify-git.mjs")` block and the
+catch logged `bash git guard DISABLED`. The assignment runs left-to-right, so
+the 21 targets listed before `_extractCodePayload` were already bound to the
+real exports — the legacy classifier, the #73 coordinated-delete arm and the
+script-content gate kept working — while every binding at or after it kept its
+fail-safe default, so **those later gates silently degraded in every session**
+— while `test.mjs`
+stayed green, because it imports `classify-git.mjs` directly (and its comments
+assert that `index.ts` is not importable in tests). TypeScript flags the bug
+(`TS2552: Cannot find name '_extractCodePayload'`, and the same for its four
+siblings), but the repo has no root `tsconfig.json`, so the CI typecheck job
+self-skips.
+
+The suite has two parts, both zero-dependency (no `node_modules`, so it runs in
+CI):
+
+- **Part A — static scope tripwire.** Parses the `({ … } = …)` assignment
+  patterns out of `index.ts` and asserts every target is a declared binding
+  somewhere in the file. Catches the exact bug class anywhere.
+- **Part B — real module load** (Node ≥ 22.13). Imports the REAL `index.ts`
+  through `module-load-hooks.mjs`, which type-strips the TS sources and stubs
+  `@earendil-works/pi-coding-agent` — the same shapes pi's jiti loader
+  produces. It then drives the registered `tool_call` handler against a
+  hermetic MAIN checkout and asserts BEHAVIOR: the #627 inline-interpreter gate
+  blocks an argv-form git payload the legacy string classifier misses, the
+  disordered-hub write gate blocks a tracked overwrite, and the #628 new-file
+  cap blocks write #26. Those paths read the very bindings that stay stubbed
+  when the import degrades, so the suite is red on the pre-#744 module.
+  (The `#628` boundary assertion is the one part of this suite with a known
+  flake — a transient block inside the `1..25` carve-out window shifts it; the
+  failure message says so when that happens, and it is tracked as #768.)
+
+**CI wiring.** Per-PR: the `verify` job in `ci.yml` runs it as a named step
+(added by #744) — not in the pinned `ci` job, whose `test-command` value
+(`scripts/check-pi-pin-lockstep.mjs`, guard (j)) pins to exactly this one
+accumulator invocation. Post-merge: the
+`extensions/*/test*.mjs` glob in `ci-main.yml` (`push` → main) picks it up
+automatically, so no explicit line is needed there — an explicit one would
+double-run it. Both are plain zero-dep `node` invocations, neither needs
+`npm ci`.
+
+## Manual verification checklist
+
+Claims in this README are kept minimal and implementation-literal. From the
+shared main checkout of a project with the guard active:
+
+1. `git checkout main` → **blocked** (guard reason shown) when the hub is
+   clean; **allowed** (M4 sanctioned recovery) when the hub is off-main/dirty.
+2. `touch ~/.pi/agent/.allow-main-edits  # recovery` as its **OWN** bash
+   call → allowed; the session logs the 🔓 escape-marker line (this works
+   since #1484 — the stamp-ordering fix; before that the touch was swallowed
+   by the allow-non-git early return and the marker was inert).
+3. `git checkout main && git pull --ff-only` in the **FOLLOW-UP** call →
+   succeeds **on an off-main AND clean hub**. On a DIRTY hub this step is
+   **not a recovery** (`git checkout main` may refuse or carry the change along;
+   `git pull --ff-only` may fast-forward or refuse) — there the recovery is
+   the named-path restore the marker's window permits:
+   `git restore --staged --worktree <path>` (staged), `git restore <path>`
+   (worktree), `mv <untracked> /tmp/` (`??`). Any `.`/glob/brace/`..` operand,
+   a wrapper, a compound, or a `-C`/`GIT_DIR` retarget stays refused. A
+   DIRECTORY operand (`src`, `src/`) is admitted and discards that subtree.
 4. `cat ~/.pi/agent/.allow-main-edits` → shows `session_id` + `reason` + `ts`.
 5. `tail ~/.pi/agent/audit/gate-events.jsonl` → a `gate_bypass` /
    `main_edits_marker` line with session_id + marker content + expires_at.

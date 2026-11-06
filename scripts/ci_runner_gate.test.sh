@@ -424,7 +424,28 @@ GATE_UNDER_TEST="${GATE_UNDER_TEST:-}"
 # evidence a "this arm is load-bearing" claim rests on. Restoring the caller's value makes the
 # lever work end to end; for a normal run the value is empty, so nothing else changes.
 GATE_UNDER_TEST_ORIG="$GATE_UNDER_TEST"
-GH_THRESHOLD_DEFAULT=60
+# ⛔ THE SUITE'S DEFAULT IS DERIVED FROM THE GATE, NEVER RE-TYPED (review P1, #3261).
+# This line used to read a literal `60`. Measured consequence: with the gate shipping `:-10`, the
+# suite still exported 60 for every arm that did not override it, so the same 433 assertions were
+# byte-identically GREEN against a copy of the gate with `:-60` restored
+# (`GATE_UNDER_TEST=<gate with :-60> bash scripts/ci_runner_gate.test.sh` -> all 433 passed).
+# A fixture that restates a production constant cannot fail when that constant moves, and the arm
+# named `page-saturated-shipped` ("at the shipped threshold") was not at it.
+# Reading the value out of the gate is what makes the shipped number the thing under test: T43 in
+# runner_autoscale.test.py pins the mirror this way, and one refactor cannot leave the two disagreeing.
+# ⛔ …AND IT READS THE GATE UNDER TEST, NOT A FIXED PATH (review P1, #3261). Reading `$GATE` here made
+# the derivation blind to this suite's own mutation lever: `GATE_UNDER_TEST=<gate with :-60>` exported 10
+# (from the SHIPPED file) to a gate shipping 60, and all 472 assertions stayed GREEN — the very mutation
+# this comment offers as its measurement. With `${GATE_UNDER_TEST:-$GATE}` the harness follows whatever
+# gate is actually about to run. Computed ONCE, here, BEFORE any mutant below is installed, so the
+# MUT1..MUT8 / ARM_MUT blocks are unaffected (each installs its own GATE_UNDER_TEST afterwards and
+# restores GATE_UNDER_TEST_ORIG).
+# ⛔ A missing/unreadable default is FATAL, not silently 60 — an absent read must never read as a value.
+GH_THRESHOLD_DEFAULT="$(sed -n 's/^QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-\([0-9][0-9]*\)}".*/\1/p' "${GATE_UNDER_TEST:-$GATE}" | head -1)"
+if [ -z "$GH_THRESHOLD_DEFAULT" ]; then
+  echo "❌ FATAL: cannot read QUEUE_THRESHOLD's own default out of ${GATE_UNDER_TEST:-$GATE} — the suite refuses to guess it" >&2
+  exit 3
+fi
 
 # run_gate <case> [ENV=…]... -- [gate args] — one hermetic invocation.
 # CI_GATE_ORCH_WS="" keeps the cmux leg out of the picture: the durable inbox file is the
@@ -465,6 +486,7 @@ PYDROP
     export CMUX_LOG
     export CI_GATE_STATE_DIR="$STATE_DIR"
     export CI_GATE_REPO="test-org/test-repo"
+    # The shipped default, DERIVED above — an arm that pins its own value overrides it via ENV=… .
     export CI_GATE_QUEUE_THRESHOLD="$GH_THRESHOLD_DEFAULT"
     # The disengage streak is a PRODUCTION default of 3 (agent-infra#3060): one hostile reading must
     # not strip the label the queue is using. Arms that are not about the streak keep the immediate
@@ -541,6 +563,35 @@ assert_contains "$OUT" "no change (mode=github want=github)" "steady run reports
 assert_not_contains "$OUT" "TRANSITION" "steady run re-notifies nothing"
 assert_absent "$STATE_DIR/orchestrator-inbox.log" "steady run writes no inbox record"
 assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "steady run relabels nothing"
+
+# ⛔ TWO DIFFERENT THINGS, AND CONFLATING THEM IS HOW THIS SUITE WENT BLIND (agent-infra#3261 P1).
+#
+#   (i) WHAT THE ARMS RUN AT — DERIVED from the gate, near the top of this file. An arm that exists to
+#       prove the ABSORPTION or CENSUS leg must not also be re-tested against a stale backlog number,
+#       so the harness follows the gate instead of restating it.
+#   (ii) WHAT THE GATE MUST SHIP — LITERAL, here. The number is the owner's DECISION
+#       (daniel-ospina/tortoise#9878, 2026-11-02), and a pin that derives from the artefact can never
+#       fail when the artefact changes. That is precisely the blindness the previous head had: the same
+#       suite was GREEN against a gate shipping 60, because every arm that cared about the number
+#       overrode it and the harness merely followed. A test that cannot fail is not a test.
+#
+# The split is deliberate and each half is checked for the property it can actually see: the literal
+# pin catches a REVERSAL of the decision; the routing arms below catch a gate that ships 10 and does not
+# USE it. Neither alone covers both, so both are here.
+echo "── #3261: the gate SHIPS the decided backlog threshold (10), and routes on it at the boundary ──"
+assert_eq "$GH_THRESHOLD_DEFAULT" "10" \
+  "the gate ships QUEUE_THRESHOLD=10 (owner ruling 2026-11-02, tortoise#9878) — reversing it must redden THIS line"
+# …and the number is WIRED, not merely present: a queue exactly AT the shipped threshold takes the
+# fallback, one job under it does not. (Threshold-relative on purpose — see (i): this half proves the
+# constant reaches the LENGTH leg, and the literal above proves which constant it is.)
+run_gate threshold-at-default GH_QUEUED="$GH_THRESHOLD_DEFAULT" GH_FALLBACK_N=0 --
+assert_contains "$OUT" "TRANSITION unknown -> local" "a queue exactly AT the shipped threshold engages the pool"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a queue AT the shipped threshold records mode=local"
+run_gate threshold-under-default GH_QUEUED="$((GH_THRESHOLD_DEFAULT - 1))" GH_FALLBACK_N=0 --
+assert_contains "$OUT" "TRANSITION unknown -> github" "one job UNDER the shipped threshold stays on GitHub-hosted"
+# (No PUT assertion here: a FRESH box converges the labels before recording the transition — that is
+# the pre-existing, separately pinned behaviour (`a fresh box converges the labels before recording…`),
+# and asserting 'no PUT' would contradict it rather than test the threshold.)
 
 echo "── #1704(1): an unreadable queue count must FAIL CLOSED ──"
 run_gate q-null GH_MODE=queued-null GH_QUEUED=5 GH_FALLBACK_N=0 --
@@ -765,7 +816,12 @@ KEEP_STATE=0
 # on 2026-10-27 the live repo held a queue HEAD 3,943-12,583 s old while hosted was serving 2..14 runs, so
 # an age-only leg would have fired continuously on a healthy repo.
 echo "── #2904: a STALLED queue (healthy component, nothing executing) takes the fallback path ──"
-run_gate stall GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 --
+# ⛔ THIS ARM PINS ITS OWN THRESHOLD, AND MUST (agent-infra#3261). It isolates the ABSORPTION/STALL
+# leg, so the LENGTH leg must NOT decide first. At the shipped 10 an 18-deep queue is unhealthy by
+# LENGTH and the pass returns before absorption is ever read — measured: with the suite deriving the
+# shipped default, this arm reddened on "not absorbing" / "TRANSITION unknown -> local" / mode.
+# 20 is above the 18 it feeds, so the queue length is a non-event here and the leg under test decides.
+run_gate stall GH_QUEUED=18 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=3600 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=20 --
 assert_eq "$RC" "0" "a stalled queue with a healthy component still exits 0 (it ACTS, it does not fail)"
 assert_contains "$OUT" "oldest_queued_s=36" "the probe reports the queue-wait age in SECONDS"
 assert_contains "$OUT" "in_progress=0" "the probe reports the absorption field it branched on"
@@ -779,7 +835,10 @@ assert_contains "$(cat "$GH_LOG")" "-X PUT" "a stalled queue actually relabels t
 # head 12,583 s (3 h 29 m) old is what the live repo looked like while 13 runs were executing. Hosted was
 # absorbing; the gate must stay on github.
 echo "── #2904: a DEEP BUT SERVING queue (old head, runs executing) leaves mode=github ──"
-run_gate serving GH_QUEUED=54 GH_INPROGRESS=13 GH_QUEUE_OLDEST_AGE=12400 GH_FALLBACK_N=0 --
+# Pins its own threshold: it isolates the ABSORPTION leg (a 54-deep queue that is still SERVING must
+# stay github), so LENGTH must not decide first. Above the 54 it feeds, the queue length is a
+# non-event and absorption is what routes the pass — which is the whole claim of this arm.
+run_gate serving GH_QUEUED=54 GH_INPROGRESS=13 GH_QUEUE_OLDEST_AGE=12400 GH_FALLBACK_N=0 CI_GATE_QUEUE_THRESHOLD=60 --
 assert_eq "$RC" "0" "a deep but serving queue exits 0"
 assert_contains "$OUT" "in_progress=13" "the probe reports the runs that ARE executing"
 assert_not_contains "$OUT" "not absorbing" "a deep but serving queue is NOT read as a stall"
@@ -871,13 +930,16 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a 150-
 # re-tested every tick by the legs that existed before this one) — it is pinned here so nobody
 # reads it as this leg's verdict.
 echo "── #2904 (P1): while the pool is engaged, the reason never claims hosted is absorbing ──"
-run_gate fallback-attribution GH_QUEUED=16 GH_INPROGRESS=2 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+# Both arms pin their own threshold: they isolate the ATTRIBUTION wording and the DENY direction, so
+# the LENGTH leg must not decide first (at the shipped 10 a 16-deep queue is unhealthy by length and
+# the pass never reaches absorption, which is what the pool-engaged arms exist to read).
+run_gate fallback-attribution GH_QUEUED=16 GH_INPROGRESS=2 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 CI_GATE_QUEUE_THRESHOLD=20 --
 assert_eq "$RC" "0" "a drained queue with the pool serving exits 0"
 assert_contains "$OUT" "absorption NOT attributable in mode=local" "the reason says the reading cannot be attributed to hosted"
 assert_contains "$OUT" "in_progress=2" "the reason still QUOTES the figures it read"
 assert_not_contains "$OUT" "queue absorbing" "the reason never claims hosted absorption while the pool is executing"
 # The deny direction is unchanged in fallback mode: pool engaged, nothing executing, stuck head ⇒ stay.
-run_gate fallback-deny GH_QUEUED=16 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 --
+run_gate fallback-deny GH_QUEUED=16 GH_INPROGRESS=0 GH_QUEUE_OLDEST_AGE=4000 GH_FALLBACK_N=2 CI_GATE_QUEUE_THRESHOLD=20 --
 assert_eq "$RC" "0" "a stuck queue with nothing executing exits 0 in fallback mode too"
 assert_contains "$OUT" "not absorbing" "and it is still named as not absorbing (the deny holds in both modes)"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a stuck queue with nothing executing keeps the pool engaged"
@@ -993,9 +1055,175 @@ KEEP_STATE=1
 run_gate partial GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=1 GH_POOL_IDS="101 102" \
   CI_GATE_QUEUE_THRESHOLD=1 --
 assert_eq "$RC" "0" "the retry pass exits 0"
-assert_contains "$OUT" "set_labels ok=2 fail=0" "the retry pass re-applies the labels to the WHOLE pool"
+assert_contains "$OUT" "set_labels ok=2 fail=0" "the retry pass re-applies the labels to the whole ARM (the whole pool only when |pool| <= cap)"
 assert_contains "$OUT" "TRANSITION unknown -> local" "the retry pass records the transition once it converged"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "the retry pass records mode=local"
+
+# ⛔ THE ARM CAP IS THE SAFETY ARGUMENT FOR REVERSING #2327, AND IT HAD NO TEST (agent-infra#3261
+# review P1). The `OVERRIDES:` line at the head of the gate lifts #2327's fallback-only timing rule on
+# the strength of "bounded instead by the capped arm below and by the memory floor" — but until this
+# section, `grep -rn 'arm_ids\|FALLBACK_ARM_MAX' scripts/` found the mechanism ONLY inside the gate: the
+# containment the reversal rests on was unverified by the only suite that runs the file. The gap is not
+# theoretical — the empty-arm defect below (a refusal placed BEFORE the disarm sweep, logging an action
+# that had not run) shipped through it.
+# ⛔ THE CONTRACT, in one line: the bound is on WHAT THE POOL MAY TAKE, never on what it may give back.
+# A capped DISARM would strand `ubuntu-latest` on the runners outside the arm, where it outlives the
+# fallback and keeps accepting CI onto a box the gate believes it released — so `on` is capped, `off`
+# is the full managed set, and every arm below pins one half of that asymmetry.
+echo "── #3261: FALLBACK_ARM_MAX bounds what the pool may TAKE — and is UNCAPPED on disarm ──"
+P5="101 102 103 104 105"
+
+# (cap3) 5 managed runners, cap 3: the three lowest ids are armed, and the TWO OUTSIDE the arm are
+# swept off in the same pass. A cap that only limited the ids this pass WROTE would leave an
+# already-armed pool (the measured `set_labels ok=12`) taking the whole queue while the log said
+# `bound=3` — the cap would change the sentence and not the load.
+run_gate arm-cap3 GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=3 --
+assert_eq "$RC" "0" "(cap3) a capped engage still completes the pass"
+assert_contains "$OUT" "bound=3" "(cap3) the log names the bound it applied"
+assert_contains "$OUT" "armed_ids=[101,102,103]" "(cap3) exactly the three lowest ids are ARMED"
+assert_contains "$OUT" "disarming=[104,105]" "(cap3) the two runners OUTSIDE the arm are disarmed on engage"
+assert_contains "$(put_body_for 104)" 'self-hosted-arm64' "(cap3) a runner outside the arm is written back to its OWN pool label"
+assert_not_contains "$(put_body_for 104)" 'ubuntu-latest' "(cap3) …and does NOT carry ubuntu-latest after the sweep"
+assert_contains "$(cat "$GH_LOG")" "runners/101/labels" "(cap3) an id INSIDE the arm was written"
+assert_eq "$RC" "0" "(cap3) exit 0 (the cap is a bound, not a failure)"
+
+# (cap2) the bound is the value the ruling names, not a constant the test re-states: at 2, at most two.
+run_gate arm-cap2 GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=2 --
+assert_eq "$RC" "0" "(cap2) a two-runner arm completes the pass"
+assert_contains "$OUT" "bound=2" "(cap2) the log names 2"
+assert_contains "$OUT" "armed_ids=[101,102]" "(cap2) exactly two ids are armed"
+assert_not_contains "$OUT" "armed_ids=[101,102,103" "(cap2) a THIRD id is not armed — at most 2 means at most 2"
+assert_contains "$OUT" "disarming=[103,104,105]" "(cap2) the other three are disarmed"
+
+# (cap0) the DOCUMENTED OFF SWITCH (:188-190, "the fallback is DISARMED: the pool is released and the
+# engaging pass refuses"). ⛔ This is the review P1 that had shipped: the empty-arm refusal used to
+# `return 1` BEFORE the complement sweep while its message claimed "the complement was disarmed above".
+# Measured then: `rc=1` with **0** PUTs, so every pool member kept `ubuntu-latest` from an earlier pass,
+# kept accepting CI, and was never swept — because every later pass refused for the same reason.
+run_gate arm-cap0 GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=0 --
+assert_eq "$RC" "2" "(cap0) cap=0 REFUSES the engaging pass (fail-closed, not a silent no-op)"
+assert_not_contains "$OUT" "armed_ids=[1" "(cap0) NO arm is armed — an empty arm arms nothing"
+assert_contains "$OUT" "the complement was disarmed above" "(cap0) the refusal still names the disarm"
+for _id in $P5; do
+  assert_contains "$(put_body_for "$_id")" 'self-hosted-arm64' "(cap0) runner $_id was WRITTEN back to its own pool label (a PUT exists, so the release is not vacuous)"
+  assert_not_contains "$(put_body_for "$_id")" 'ubuntu-latest' "(cap0) runner $_id was RELEASED, not left carrying ubuntu-latest"
+done
+# ⛔ THE ANTI-FABRICATION ASSERTION — THE POINT OF THIS ARM. A log line may not CLAIM an action that was
+# skipped. So the claim above is not believed on its own: the side effect it names is counted, and the
+# two are asserted TOGETHER. Reverting the control-flow fix (refusing before the sweep) reddens this
+# line specifically with "the claim is unwitnessed", which is exactly the defect.
+_CAP0_PUTS="$(grep -c -- '-X PUT' "$GH_LOG" 2>/dev/null || true)"
+if [ "${_CAP0_PUTS:-0}" -ge 5 ]; then
+  ok "(cap0) the logged disarm is WITNESSED: the claim is backed by $_CAP0_PUTS PUT(s) over all five runners"
+else
+  bad "(cap0) THE CLAIM IS UNWITNESSED: the log says 'the complement was disarmed above' but only ${_CAP0_PUTS:-0} PUT(s) ran — a message asserting an action that did not happen"
+fi
+
+# (cap0-partial) the `fail>0` REFUSAL BRANCH — the arm a review found MISSING (P2, #3261). The gate
+# conditions "the complement was disarmed above" on `fail=0` and otherwise quotes its counts, so a sweep
+# that LEFT A RUNNER UN-DISARMED cannot claim it completed. That conditioning is the only thing standing
+# between this fix and a silent re-creation of the original defect at reduced scope, and it had ZERO
+# coverage — `grep -c 'NOT disarmed'` was 0, so collapsing the two branches would have stayed green.
+# Fixture: 101 and 102 are fully labelled pool members; 103 carries the POOL marker but NO HOST arch
+# label, so `labels_for` cannot classify it, logs `left as-is`, and it keeps what it has.
+ARMF="$T/rows-arm-partial.tsv"
+printf '101\tself-hosted\n101\tLinux\n101\tARM64\n101\tself-hosted-arm64\n101\tubuntu-latest\n102\tself-hosted\n102\tLinux\n102\tARM64\n102\tself-hosted-arm64\n102\tubuntu-latest\n103\tself-hosted\n103\tLinux\n103\tself-hosted-arm64\n' > "$ARMF"
+run_gate arm-cap0-partial GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$ARMF" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=0 --
+assert_eq "$RC" "2" "(cap0p) the refusal still stands even when the sweep could not finish"
+assert_eq "$(grep -c -- '-X PUT' "$GH_LOG")" "2" "(cap0p) exactly the two CLASSIFIABLE runners were swept — 103 could not be"
+assert_contains "$OUT" "left 1 runner(s) NOT disarmed" "(cap0p) the refusal COUNTS what it failed to release instead of claiming completion"
+assert_contains "$OUT" "ok=2 fail=1" "(cap0p) …and quotes both counts, so the shortfall is arithmetic, not prose"
+assert_not_contains "$OUT" "the complement was disarmed above, and the engaging pass refuses" \
+  "(cap0p) THE CLAIM IS WITHHELD: a partial sweep may NOT say the complement was disarmed above"
+
+# (mutant) the `fail=0` conditioning must be LOAD-BEARING, not decoration: collapsing the two branches
+# back into one unconditional "the complement was disarmed above" is the original P1 at reduced scope,
+# and it must redden the arm above. Without this, a future simplification would pass unnoticed.
+PART_MUT="$T/ci_runner_gate.mutant-claimunconditional.sh"
+if python3 - "$GATE" "$PART_MUT" <<'PYPMUT'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+anchor = '    if [ "$fail" -eq 0 ]; then\n      log "WARNING: fallback arm resolved EMPTY'
+if anchor not in text:
+    sys.exit("mutation anchor not found — the empty-arm refusal moved, so this mutation is stale")
+text = text.replace(anchor, '    if true; then\n      log "WARNING: fallback arm resolved EMPTY', 1)
+open(sys.argv[2], "w", encoding="utf-8").write(text)
+PYPMUT
+then
+  ok "(cap0p-mut) the unconditional-claim mutant was generated from the SHIPPED gate (anchor present)"
+  GATE_UNDER_TEST="$PART_MUT"
+  run_gate mutant-claimunconditional GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_RUNNER_ROWS_FILE="$ARMF" \
+    CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=0 --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  # The kill: under the mutant the very claim the shipped arm withholds MUST appear, so re-running the
+  # shipped arm's own condition against the mutant is the differential — one of the two reds.
+  assert_contains "$OUT" "the complement was disarmed above, and the engaging pass refuses" "(cap0p-mut) the mutant DOES make the full-disarm claim it did not achieve — so (cap0p)'s withholding assertion is load-bearing, not vacuous"
+else
+  bad "(cap0p-mut) the mutant gate could not be generated (the conditioning anchor moved) — the guard is unproven"
+fi
+
+# (cap-abc) a cap that is not a number must REFUSE, never read as 'no cap' — the bound fail-OPEN is the
+# one direction a blast-radius cap must not fail (`arm_ids` returns 1 for it, and `set_labels` refuses).
+run_gate arm-capunreadable GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=abc --
+assert_eq "$RC" "2" "(capabc) an unreadable cap REFUSES the pass"
+assert_contains "$OUT" "UNREADABLE" "(capabc) …and names it as unreadable, not as an absent bound"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "(capabc) an unreadable cap changes NO label (never the whole pool)"
+
+# (disarm) the OTHER half of the asymmetry, and the reason the cap cannot strand a label: a DISARM
+# ignores the cap entirely and sweeps EVERY managed runner, even with the cap set to 1.
+# GH_QUEUED=0 (nothing queued) ⇒ healthy ⇒ want=github, while one runner still carries the label ⇒
+# mode=local, so this pass is a DISENGAGE and the cap must not narrow it.
+run_gate arm-disarm-uncapped GH_MODE=ok GH_QUEUED=0 GH_FALLBACK_N=1 GH_POOL_IDS="$P5" \
+  CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=1 --
+assert_eq "$RC" "0" "(disarm) an uncapped disarm completes"
+assert_contains "$OUT" "engagement=off bound=uncapped" "(disarm) a disengage reports bound=uncapped, cap or no cap"
+# ⛔ THE SWEEP IS COUNTED, NOT ASSUMED (review P1, #3261). These per-runner "was swept" lines used to be
+# `assert_not_contains "$(put_body_for id)" ubuntu-latest`, and `put_body_for` returns "" for a runner
+# with NO PUT — so the assertion passed on an absent write. Measured: a mutant that honoured the cap on
+# the DISARM path swept ONE runner of five, stranding `ubuntu-latest` on 102-105, and all five lines
+# stayed GREEN. The only other check was a `bound=uncapped` log string that `set_labels` emits
+# unconditionally on `off`, so it passed too — meaning the UNCAPPED-DISARM half of the safety property,
+# which the gate's own docstring calls "the asymmetry", was untested.
+assert_eq "$(grep -c -- '-X PUT' "$GH_LOG")" "5" "(disarm) every one of the FIVE managed runners received a PUT — a sweep that skipped four is visible"
+for _id in $P5; do
+  assert_contains "$(put_body_for "$_id")" 'self-hosted-arm64' "(disarm) runner $_id was WRITTEN (a PUT exists for it, so the next line is not vacuous)"
+  assert_not_contains "$(put_body_for "$_id")" 'ubuntu-latest' "(disarm) runner $_id was swept, not left armed by the cap of 1"
+done
+
+# (mutant) the cap must be LOAD-BEARING, not incidental: a gate whose `arm_ids` ignores the bound arms
+# the whole pool, and (cap3) must catch it. Without this, the section would pass for a mechanism that
+# happened to work on a five-runner fixture with no bound at all.
+ARM_MUT="$T/ci_runner_gate.mutant-uncapped.sh"
+if python3 - "$GATE" "$ARM_MUT" <<'PYMUT'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+anchor = "'NR<=n'"
+if anchor not in text:
+    sys.exit("mutation anchor not found — the arm cap moved, so this mutation is stale")
+open(sys.argv[2], "w", encoding="utf-8").write(text.replace(anchor, "'NR<=999999'", 1))
+PYMUT
+then
+  ok "(mutant) the uncapped-arm mutant was generated from the SHIPPED gate (anchor present)"
+  GATE_UNDER_TEST="$ARM_MUT"
+  run_gate mutant-uncapped GH_MODE=ok GH_QUEUED=5 GH_FALLBACK_N=0 GH_POOL_IDS="$P5" \
+    CI_GATE_QUEUE_THRESHOLD=1 CI_GATE_FALLBACK_ARM_MAX=3 --
+  GATE_UNDER_TEST="$GATE_UNDER_TEST_ORIG"
+  # ⛔ THE KILL IS THE DIFFERENTIAL, AND IT IS ALREADY ASSERTED TWO WAYS. (cap3) asserts the shipped
+  # gate arms exactly three; this mutant asserts removing the bound arms all five. A mutation that
+  # produced the SAME armed set would make one of the two red, so "mutation killed" is not a separate
+  # check to invent — and asserting on the STATE FILE here would be a dead test, because both passes
+  # exit 0 and both record mode=local (the pool is armed either way). The carrier COUNT is the only
+  # observable that separates them, and it is exactly the blast radius this bound exists to limit.
+  assert_contains "$OUT" "armed_ids=[101,102,103,104,105]" "(mutant) with the bound gone, ALL five are armed — the red above is the property, not a crash"
+  assert_contains "$OUT" "bound=3" "(mutant) the mutant still BELIEVES it is bounded (it logs 3) while arming five — the sentence and the load diverge, which is the defect the cap exists to prevent"
+else
+  bad "(mutant) the mutant gate could not be generated (the cap anchor moved) — the bound is unproven"
+fi
 
 echo "── #2327: a runner's labels describe THAT runner, not the pool it joined first ──"
 # The live pool, read from `gh api repos/daniel-ospina/tortoise/actions/runners` on 2026-10-22:
@@ -1195,8 +1423,11 @@ assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "capaci
 # all that could distinguish this from "9 busy" — so it certified the state that keeps the pool out of
 # the queue while seven runners sat unused.
 echo "── #2904: IDLE CAPACITY WHILE WORK WAITS is measured, named, and NEVER certified ──"
+# Pins its own threshold: the CENSUS/verdict leg is what decides here, not queue length. At the
+# shipped 10 a 54-deep queue is unhealthy by LENGTH, which engages the pool and starves the census of
+# the state it exists to name — so LENGTH is held above the 54 this arm feeds.
 run_gate census-idle-unused GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 \
-  GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" --
+  GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" CI_GATE_QUEUE_THRESHOLD=60 --
 assert_eq "$RC" "0" "(2) idle capacity is a report, not an action — the pass still completes"
 assert_contains "$OUT" "online_idle=7" "(2) the SEVEN IDLE runners are counted, per runner"
 assert_contains "$OUT" "online_busy=2" "(2) …separately from the two that are busy"
@@ -1211,8 +1442,9 @@ assert_not_contains "$OUT" "GitHub Actions healthy" "(2) and never prints the wo
 # `saturated` is a CERTIFYING word, the reason read "GitHub Actions healthy". Same census, same queue,
 # demand unmeasurable: the pool's own state still decides, and it has idle capacity.
 echo "── #3002 P1: an UNMEASURABLE demand must not turn 7 idle runners into 'saturated' ──"
+# Same pin as the arm above — the census/verdict leg decides, not queue length (see `census-idle-unused`).
 run_gate census-mixed-demand-unknown GH_QUEUED=54 GH_FALLBACK_N=0 GH_INPROGRESS=2 GH_DEMAND_MODE=fail \
-  GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" --
+  GH_CENSUS="idle,idle,idle,idle,idle,idle,idle,busy,busy" CI_GATE_QUEUE_THRESHOLD=60 --
 assert_eq "$RC" "0" "(2b) the pass completes (idle capacity is a report, not a deny)"
 assert_contains "$OUT" "demand=unknown" "(2b) the demand really was unmeasured in this state"
 assert_contains "$OUT" "online_idle=7" "(2b) seven online runners are idle"
@@ -1228,8 +1460,9 @@ assert_not_contains "$OUT" "GitHub Actions healthy" "(2b) the words 'healthy' ne
 # Actions healthy". The pool is exhausted FOR THIS DEMAND while capacity sits idle — a report an
 # operator needs (it may mean the label reached only one runner), never a certification.
 echo "── #3002 P1 (round 3): demand-matching exhaustion is NOT 'saturated' while other runners idle ──"
+# Same pin — the DEMAND/CENSUS leg decides here, not queue length (see `census-idle-unused`).
 run_gate census-demand-busy-idle-other GH_QUEUED=54 GH_FALLBACK_N=1 GH_INPROGRESS=2 \
-  GH_CENSUS="busy@self-hosted|Linux|X64|self-hosted-x64|ubuntu-latest,idle@self-hosted|Linux|X64|self-hosted-x64,idle@self-hosted|Linux|X64|self-hosted-x64" --
+  GH_CENSUS="busy@self-hosted|Linux|X64|self-hosted-x64|ubuntu-latest,idle@self-hosted|Linux|X64|self-hosted-x64,idle@self-hosted|Linux|X64|self-hosted-x64" CI_GATE_QUEUE_THRESHOLD=60 --
 assert_eq "$RC" "0" "(2c) the pass completes (a report, not a deny)"
 assert_contains "$OUT" "demanding_busy=1" "(2c) the ONE demand-matching runner is busy"
 assert_contains "$OUT" "demanding_idle=0" "(2c) no demand-matching runner is idle"
