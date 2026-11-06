@@ -591,10 +591,12 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     `pushed` (verified by reading the remote back, and it now also covers a remote that a PEER
     fast-forwarded inside the verify window — ancestry is measured with `git merge-base --is-ancestor`,
     because a descendant sha means our commits ARE on the ref and recording `FAILED` there would be a
-    durable false absence; ⛔ and the CAUSE beside it is read from the push's exit status, because the
-    `rc≠0` path deliberately falls through to that same ancestry read — over a REJECTED ref the advance
-    predates the push and is the reason for the rejection, so that arm says the client failed and this
-    terminal delivered nothing, instead of claiming an advance "inside the verify window"),
+    durable false absence; ⛔ and the CAUSE beside it is NOT read from the push's exit status, because the
+    `rc≠0` path deliberately falls through to that same ancestry read — a non-zero exit covers a rejected
+    ref, a transport failure, a pre-receive hook and a server that applied the ref then failed to report,
+    so that arm names the measurement (the client did not report success; the remote held a descendant at
+    verify time; therefore every commit of this lane is on that ref) and explicitly declines to name a
+    cause — neither "advanced inside the verify window" nor "predates the push" is asserted),
     `verify-ancestry-unmeasured` (the remote ANSWERED with a sha this worktree
     does not HAVE, so `--is-ancestor` exited 128 and no relation was established — a DIFFERENT fact from
     `FAILED`, and the abstaining verdict for it: `FAILED` is only for the measured `rc=1`),
@@ -641,10 +643,16 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     `UNAVAILABLE|detached|refused-*`) still asserted the commits "exist only on this disk" — an off-box
     claim, false whenever a peer on a reused branch name pushed and this worktree never fetched. Both
     readings are about the CACHE, so both sentences are now scoped to it and say so, and neither asserts
-    anything about a remote. ⛔ **AND A REMEDY NAMES THE REPOSITORY ITS VERDICT IS ABOUT:** `pushed` is
+    anything about a remote — and that includes the SHARED caveat helper `lane_end_push_caveat`, which is
+    appended to the same MANUAL arms and carried the same unscoped sentence (its `refused-protected` /
+    `refused-main-checkout` members are NOT consumed by an arm above it, so it is reachable, not latent).
+    ⛔ **AND A REMEDY NAMES THE REPOSITORY ITS VERDICT IS ABOUT:** `pushed` is
     granted against the PROVEN push url, so every `next=` sentence beside it prints
     `${LANE_END_PUSH_URL:-origin}` — a `remote.origin.pushurl` that diverges from `remote.origin.url` is
-    supported, and a hardcoded `origin` would send the reader to a repository nobody read.
+    supported, and a hardcoded `origin` would send the reader to a repository nobody read. That covers
+    the `refs/wip/<slug>` archive recovery too: `bg-rescue-wip.sh` WRITES the archive with
+    `git push origin "$C:refs/wip/$SLUG"`, so it lands in the push repository and the instruction must
+    FETCH from there rather than from `origin`'s fetch url.
     ⛔ **AND THE OTHER DOMAINS' MANUAL FACTS ARE
     APPENDED BY SHARED HELPERS, NOT RE-TYPED PER ARM** (`lane_end_rescue_caveat`, `lane_end_tree_caveat`,
     `lane_end_push_caveat`): four consecutive review cycles each found a fresh arm that dropped one — a
