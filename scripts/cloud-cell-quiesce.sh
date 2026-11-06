@@ -49,6 +49,18 @@ for c in "$REPO/scripts/cloud-cell-supervisor.sh" \
 done
 step "supervisor: ${SW:-<none found — will start tmux directly>}"
 
+# Locate the WIP sweep (agent-infra#3485). It lives beside bg-rescue-wip.sh in the clone's scripts/
+# (they are a pair: the sweep classifies with `bg-rescue-wip.sh --verdict` and archives with
+# `bg-rescue-wip.sh`), with the runtime dir and the farmed home as fallbacks.
+SWEEP=""
+for c in "$REPO/scripts/wip-sweep.sh" \
+         "$REPO/.harness-path/scripts/wip-sweep.sh" \
+         "$O/wip-sweep.sh" \
+         "${HOME:-/nonexistent}/.pi/agent/scripts/wip-sweep.sh"; do
+  [ -f "$c" ] && { SWEEP="$c"; break; }
+done
+step "wip-sweep: ${SWEEP:-<none found — WORK ON THIS BOX WILL NOT BE ARCHIVED>}"
+
 # 2. Stop the supervised controller, then kill EVERY session and ANY stray
 #    controller. tmux kill-server is the only reliable sweep: kill-session -t orch
 #    leaves the fix-*/merge-*/chain-* sessions (and their claim leases) behind.
@@ -70,6 +82,45 @@ if [ "$LEFT" != "0" ]; then
   exit 1
 fi
 step "sweep clean: 0 orch-loop, $(tmux ls 2>/dev/null | wc -l | tr -d ' ') tmux session(s)"
+
+# 3b. ⛔ ARCHIVE EVERY DIRTY WORKTREE BEFORE THIS BOX IS HANDED ON (#3485) — THE TOTAL-LOSS ROW.
+# A lane's uncommitted work is rescued by `bg-rescue-wip.sh` from inside `run_agent`, so it survives a
+# cap kill. It does NOT survive the two routes that bypass that function, and this script is one of
+# them: an OOM-killed lane, or any lane this quiesce just killed, leaves its work in the working tree
+# and nothing in the object database. Everything else this script does — kill the sessions, re-seed,
+# restart — is fine; reclaiming or rebuilding the VM afterwards is what makes the disk stop existing.
+# `refs/wip/*` lives on ORIGIN, so archiving is what turns "the work was on that box" into "the work is
+# still there".
+#
+# ARMED (`--apply`), and that is a deliberate departure from the #1678 rule that a tool acting on a box
+# ships dry-run: that rule governs DELETION, where the default must be safe. This ADDS data to origin
+# and touches nothing locally (a throwaway index, no branch move, no working-tree write), and a
+# dry-run-by-default hook on the path that destroys the disk would archive nothing for ever while
+# reading as a safeguard — the inert-enforcer shape.
+#
+# ⛔ THE FAILURE IS LOUD AND IT IS NOT SWALLOWED, BUT IT DOES NOT STOP SUPERVISION BEING RESTORED.
+# Aborting here would leave the cell with ZERO controllers — a worse state than the one this script
+# exists to end. So the pass runs to completion and this script exits NON-ZERO at the end, which is
+# what `cloud-cell-bringup.sh --check` and the operator read. A missing sweep is the same class as a
+# failing one: "a missing rescuer must never read as nothing to rescue".
+WIP_RC=0; WIP_WHY=""
+if [ -z "$SWEEP" ]; then
+  WIP_RC=3; WIP_WHY="wip-sweep.sh not found (looked at \$REPO/scripts, \$REPO/.harness-path/scripts, $O, \$HOME/.pi/agent/scripts)"
+  step "FATAL: wip-sweep: $WIP_WHY"
+  step "FATAL: wip-sweep: UNCOMMITTED WORK ON THIS BOX WAS NOT ARCHIVED. Any dirty worktree here is lost if this cell is reclaimed."
+else
+  step "wip-sweep: archiving uncommitted work to refs/wip/* on origin BEFORE this cell is handed on"
+  WIP_OUT="$(O="$O" WIP_SWEEP_STATE_DIR="$O/state" bash "$SWEEP" --apply --repo "$REPO" 2>&1)"; WIP_RC=$?
+  printf '%s\n' "$WIP_OUT" | sed 's/^/  wip-sweep: /'
+  case "$WIP_RC" in
+    0) step "wip-sweep: every dirty worktree of $REPO is archived on origin (other clones on this box were NOT swept)" ;;
+    1) WIP_WHY="the pass was INCOMPLETE (exit 1: work was deferred by the per-pass cap or the budget, so it is NOT archived)"
+       step "FATAL: wip-sweep: $WIP_WHY" ;;
+    *) WIP_WHY="the pass FAILED (exit $WIP_RC) — see the run above"
+       step "FATAL: wip-sweep: $WIP_WHY"
+       step "FATAL: wip-sweep: work on this box is NOT fully archived; it is LOST if this cell is reclaimed. Record: $O/state/wip-sweep.tsv" ;;
+  esac
+fi
 
 # 4. Re-seed the runtime from the harness (the source of truth) and restart ONE.
 [ -d "$REPO" ] || { step "FATAL: no clone at $REPO"; exit 1; }
@@ -138,4 +189,13 @@ case "$EFF_REPO" in
   "REPO=$REPO") : ;;
   *) step "FATAL: live REPO does not match intended ($EFF_REPO vs REPO=$REPO)"; exit 1 ;;
 esac
+
+# 8. The quiesce is only DONE when the work that was on this box is on origin (#3485). One controller
+# restored AND zero archived work is not a success: the next reclaim takes the work with it. Reported
+# last, so the operator sees the true state of the cell, and via the exit code, so a scripted bring-up
+# sees it too.
+if [ "$WIP_RC" != "0" ]; then
+  step "NOT DONE — one controller IS restored on $REPO, but the WIP archive did not complete: $WIP_WHY"
+  exit 1
+fi
 step "DONE — cell has exactly one controller on $REPO"

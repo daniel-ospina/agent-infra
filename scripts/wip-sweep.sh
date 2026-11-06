@@ -1,0 +1,599 @@
+#!/usr/bin/env bash
+# wip-sweep.sh — archive EVERY dirty worktree's uncommitted work to `refs/wip/<slug>` on origin, on a
+# clock, without waiting for a lane to end (agent-infra#3485).
+#
+# ⛔ WHY THIS EXISTS — THE ABANDONMENT MATRIX. `scripts/bg-rescue-wip.sh` (#2045) archives a worktree's
+# uncommitted work to `refs/wip/<slug>` ON ORIGIN, and `spawn-gate.sh` calls it inside `run_agent` AT
+# ITS END. So it rescues exactly the lanes that stop THROUGH that function. Every other abandonment
+# route leaves the work on the local disk only:
+#
+#   how the worktree is abandoned              WIP on origin?   WIP destroyed?
+#   lane ends normally through run_agent       yes              no
+#   lane killed at its cap (spawn-gate)        yes              no
+#   OOM / SIGKILL / crash / reboot             NO               not yet — disk only
+#   cell quiesce / reclaim / VM destroyed      NO               YES, totally
+#
+# The rescue is a CALL INSIDE A LIFECYCLE, not a sweep. This is the sweep. It walks every worktree of
+# every repo it is handed, asks `bg-rescue-wip.sh --verdict` what is at risk, and archives each dirty
+# one. Once it has run, local disk is no longer authoritative, so the last row of that matrix — the
+# only one where the work is GONE rather than merely at risk — loses nothing.
+#
+# ⛔ IT OWNS NO ARCHIVE RULE OF ITS OWN. The commit-tree/throwaway-index/no-`git stash` machinery, the
+# accumulate-don't-replace chaining, the workflow-scope credential retry and the credential classification
+# all live in `bg-rescue-wip.sh`, and this script re-implements NONE of them. It decides WHICH
+# worktrees to hand over, and it reads the rescue's EXIT CODE, which is the rescue's own contract
+# (`:48-51`): for a worktree that has work at risk, exit 0 means archived-and-pushed and exit 2 means
+# NOT — so a failed archive can never be recorded as a clean one here.
+#
+# ⛔ AND IT OWNS NO "IS ANYTHING AT RISK" RULE EITHER. The three verdicts — `clean` / `dirty` /
+# `cannot-verify` — come from `bg-rescue-wip.sh --verdict`, which is the same code path the rescue
+# itself uses (§2 of that file). A sweeper that re-derived the rule from its own `git status` would be
+# a second implementation of the one rule this whole feature exists to get right: a FAILED status, or
+# a status that could not read part of the tree, is NOT `clean`. Two implementations drift; the one
+# that drifts is the one nobody is looking at, and it reports a clean fleet while archiving nothing.
+#
+# ⛔ `UNMEASURED` IS ITS OWN VERDICT, AND IT IS NEVER "NOTHING TO RESCUE". An unreadable worktree is
+# counted separately, printed loudly, and makes the pass FAIL (exit 3). "I could not look" and "I
+# looked and there was nothing" are different facts; collapsing them is how a sweeper with a broken
+# enumerate reports a green fleet over a disk full of unfiled work.
+#
+# Usage:
+#   wip-sweep.sh [--repo PATH]... [--apply] [--dry-run] [--max N] [--print-status] [--help]
+#
+#   (no mode flag)   DRY RUN — classify and report, archive NOTHING. This is the default, matching
+#                    `scripts/pi-reap-worktrees.sh`: a tool that moves work off a box ships
+#                    report-only, and the arming decision is visible in the caller's command line.
+#   --apply          archive every dirty worktree it finds (subject to --max and the pass budget)
+#   --repo PATH      a repo whose worktrees are swept (repeatable). Default: $WIP_SWEEP_REPOS
+#                    (colon-separated), else the current directory when it is a worktree. ⛔ THERE IS
+#                    NO AMBIENT-`$REPO` DEFAULT — see §repos for why that was removed.
+#   --max N          archive at most N worktrees this pass (default 25; 0 = no cap). The cap counts
+#                    ARCHIVES, not examinations, and what it defers is NAMED as deferred — never
+#                    silently dropped.
+#   --print-status   print the last pass record and exit: 0 = ok, 1 = incomplete, 3 = failed/stale/never
+#   --help           this text
+#
+# Exit:
+#   0  every worktree was MEASURED, and (apply) every dirty one was archived, and (dry-run) nothing
+#      was found to archive. This is the only code that means "nothing is left at risk here".
+#   1  INCOMPLETE — the per-pass cap or the pass budget stopped the pass with work still unarchived,
+#      or this was a DRY RUN and it found work it would have archived. Not a failure, and NOT clean:
+#      there is unarchived work on this box right now.
+#   2  usage
+#   3  FAIL-CLOSED — a worktree could not be measured, a rescue exited non-zero (the work is STILL
+#      ONLY ON THIS DISK), no repo resolved, the bounded-execution library or the rescue is missing,
+#      or the pass record could not be written. Never "nothing to rescue".
+#
+# Env seams:
+#   WIP_SWEEP_REPOS          colon-separated repos (see --repo)
+#   WIP_SWEEP_MAX            per-pass archive cap        (default 25)
+#   WIP_SWEEP_BUDGET         whole-pass wall bound, secs (default 900; 0 disables)
+#   WIP_SWEEP_STATUS_TIMEOUT per-worktree bound, secs    (default 60)
+#   WIP_SWEEP_RESCUE_TIMEOUT per-rescue bound, secs      (default 300)
+#   WIP_SWEEP_RESCUE         explicit path to bg-rescue-wip.sh
+#   WIP_SWEEP_STATE_DIR      record + status dir (default ${O:-$HOME/orchestrator}/state)
+#   WIP_SWEEP_RECORD         the index file     (default $WIP_SWEEP_STATE_DIR/wip-sweep.tsv)
+#   WIP_SWEEP_STATUS_FILE    the pass record    (default $WIP_SWEEP_STATE_DIR/wip-sweep.status)
+#   WIP_SWEEP_STALE_SECONDS  a pass record older than this is STALE (default 86400)
+#   WIP_SWEEP_BOUNDED_LIB    the bounded-execution helper (default lib/bounded.sh beside this script,
+#                            then $HOME/.pi/agent/scripts/lib/). SET-but-missing is a REFUSAL at
+#                            startup, never a silent different file (#2046).
+#
+# THE INDEX (acceptance item: "each `refs/wip/*` carries its issue link; a ref without one is
+# reported"). Every worktree examined adds one TSV row to $WIP_SWEEP_RECORD:
+#
+#   ts  repo  path  branch  head  verdict  paths  age_h  issue  ref  note
+#
+# `issue` is derived from the branch name — the first 2-8 digit run the harness's own lane branches
+# carry (`feat/8090-tm`, `fix/3442-nonvacuity`, `rescue/3442-earlier-attempt`). A dirty worktree whose
+# branch yields NO issue link is REPORTED (`issue=-`, one loud line, and `no_issue=N` in the pass
+# record): the archive still exists on origin, but nothing ties it to the issue it belongs to, and
+# searching 222 inconsistently-named refs is not a substitute for an index. The typed version of this
+# (and the naming rule for the refs themselves) is agent-infra#3484 — deliberately not re-decided here.
+#
+# THE PASS RECORD (read by `--print-status`, and the surface a fleet instrument should read):
+#   status=ok|incomplete|failed|never   rc=…  mode=apply|dry-run  ts=…
+#   seen=… clean=… skipped=… dirty=… archived=… deferred=… unmeasured=… failed=… no_issue=…
+#   repos=… detail=… watchdog=…
+# `seen = clean + skipped + dirty + unmeasured` holds, and `skipped` is NOT folded into `clean`: a bare
+# repo and a git-`prunable` record were not examined, and a summary that counts them as clean cannot be
+# told apart from one over a disk where nothing is at risk.
+set -uo pipefail
+
+SELF_DIR=""
+if [ -n "${BASH_SOURCE[0]:-}" ]; then
+  SELF_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+fi
+
+err() { echo "wip-sweep: ⛔ $*" >&2; }
+note() { echo "wip-sweep: $*" >&2; }
+
+usage() {
+  sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" 2>/dev/null | sed -n 's/^# \{0,1\}//p'
+}
+
+# ── arguments ─────────────────────────────────────────────────────────────────────────────────────
+DRY_RUN=1
+MAX="${WIP_SWEEP_MAX:-25}"
+MODE=sweep
+REPOS=()
+
+need_int() { # need_int <name> <value> — a bound that does not parse is a REFUSAL, never "unbounded"
+  case "$2" in
+    ''|*[!0-9]*) err "$1 is not a non-negative integer: '$2' (an unparseable bound must never mean 'no bound')"; exit 2 ;;
+  esac
+}
+# need_pos_int <name> <value> — the WATCHDOG bounds, where `0` is NOT a disable.
+# ⛔ WHY THE TWO HELPERS (review round 2, residuals R1/R2). `tb_timeout 0 …` means "run unbounded"
+# (`scripts/lib/bounded.sh:176`), and a zero Stale window means "everything is stale" but READS as
+# "do not check". Both are defeatable by a plausible-looking value rather than a typo, and both sit on
+# the quiesce path — a `WIP_SWEEP_STATUS_TIMEOUT=0` on a hung mount is the box that never finishes
+# dying, and `WIP_SWEEP_STALE_SECONDS=0` makes a record from 1970 answer `ok`. Exactly TWO seams are
+# documented as taking `0`: `--max 0` (no cap) and `WIP_SWEEP_BUDGET=0` (no pass budget). Everything
+# else must be a real bound.
+need_pos_int() {
+  need_int "$1" "$2"
+  [ "$2" -gt 0 ] 2>/dev/null || { err "$1 must be greater than 0: '$2' (0 is only a disable for --max and WIP_SWEEP_BUDGET; for a watchdog or a staleness window it silently removes the bound)"; exit 2; }
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply)   DRY_RUN=0; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --repo)
+      [ $# -ge 2 ] && [ -n "$2" ] || { err "--repo needs a path"; exit 2; }
+      REPOS[${#REPOS[@]}]="$2"; shift 2 ;;
+    --max)
+      [ $# -ge 2 ] && [ -n "$2" ] || { err "--max needs a number"; exit 2; }
+      need_int --max "$2"; MAX="$2"; shift 2 ;;
+    --print-status) MODE=status; shift ;;
+    --help|-h) usage; exit 0 ;;
+    *) err "unknown argument: $1"; echo "wip-sweep: see --help" >&2; exit 2 ;;
+  esac
+done
+
+cleanup_all() {
+  [ -n "${LISTF:-}" ] && rm -f "$LISTF"
+  [ -n "${ERRF:-}" ] && rm -f "$ERRF"
+  [ -n "${REC_TMP:-}" ] && rm -f "$REC_TMP"
+  command -v tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
+}
+trap cleanup_all EXIT
+
+# ── the bounded-execution helper — REFUSED when missing, never a silent different file ───────────
+# Every subprocess below is bounded: `git status` on a 179 GB worktree and a `git push` to a remote
+# that has stopped answering are both unbounded by nature, and this pass is what a cell quiesce calls
+# BEFORE the box is destroyed — a hang here is a box that never finishes dying.
+BOUNDED_LIB="${WIP_SWEEP_BOUNDED_LIB:-}"
+if [ -n "$BOUNDED_LIB" ]; then
+  [ -f "$BOUNDED_LIB" ] || { err "WIP_SWEEP_BOUNDED_LIB=$BOUNDED_LIB does not exist — REFUSING (a pin that is wrong must be named, not ignored)"; exit 3; }
+elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/lib/bounded.sh" ]; then
+  BOUNDED_LIB="$SELF_DIR/lib/bounded.sh"
+elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/lib/bounded.sh" ]; then
+  BOUNDED_LIB="$HOME/.pi/agent/scripts/lib/bounded.sh"
+else
+  err "no scripts/lib/bounded.sh (looked at \$WIP_SWEEP_BOUNDED_LIB, ${SELF_DIR:-<no script dir>}/lib, \$HOME/.pi/agent/scripts/lib) — REFUSING: an unbounded sweep is worse than none. Farm it: bash pi-bootstrap/setup.sh"
+  exit 3
+fi
+# shellcheck source=/dev/null
+. "$BOUNDED_LIB" || { err "cannot source $BOUNDED_LIB"; exit 3; }
+# An INHERITED pin is the caller's; an absent one is "no pin", not an unbound-variable abort under -u.
+TB_TIMEOUT_BIN="${TB_TIMEOUT_BIN:-}"
+if ! tb_resolve_timeout; then
+  err "no usable watchdog for bounded execution (TB_TIMEOUT_BIN='${TB_TIMEOUT_BIN:-}') — REFUSING"
+  exit 3
+fi
+TB_TIMEOUT_KIND="${TB_TIMEOUT_KIND:-unknown}"
+
+BUDGET="${WIP_SWEEP_BUDGET:-900}"
+STATUS_TIMEOUT="${WIP_SWEEP_STATUS_TIMEOUT:-60}"
+RESCUE_TIMEOUT="${WIP_SWEEP_RESCUE_TIMEOUT:-300}"
+STALE_SECONDS="${WIP_SWEEP_STALE_SECONDS:-86400}"
+need_int WIP_SWEEP_BUDGET          "$BUDGET"
+need_pos_int WIP_SWEEP_STATUS_TIMEOUT  "$STATUS_TIMEOUT"
+need_pos_int WIP_SWEEP_RESCUE_TIMEOUT  "$RESCUE_TIMEOUT"
+need_pos_int WIP_SWEEP_STALE_SECONDS   "$STALE_SECONDS"
+need_int WIP_SWEEP_MAX             "$MAX"
+
+STATE_DIR="${WIP_SWEEP_STATE_DIR:-${O:-${HOME:-/tmp}/orchestrator}/state}"
+RECORD="${WIP_SWEEP_RECORD:-$STATE_DIR/wip-sweep.tsv}"
+STATUS_FILE="${WIP_SWEEP_STATUS_FILE:-$STATE_DIR/wip-sweep.status}"
+
+# ── --print-status: answer "did the last pass run, and what did it find" from the RECORD alone ────
+# Same polarity as `disk-reaper.sh --print-status`: `never` and `stale` are NOT success, because a
+# sweeper that has not run is a box whose WIP is on the disk and nowhere else.
+if [ "$MODE" = status ]; then
+  if [ ! -f "$STATUS_FILE" ]; then
+    echo "status=never"
+    echo "detail=no pass record at $STATUS_FILE"
+    exit 3
+  fi
+  cat "$STATUS_FILE"
+  S_TS="$(sed -n 's/^ts=//p' "$STATUS_FILE")"
+  S_ST="$(sed -n 's/^status=//p' "$STATUS_FILE")"
+  S_RC="$(sed -n 's/^rc=//p' "$STATUS_FILE")"
+  NOW_S="$(date -u '+%s')"
+  # ⛔ AN UNREADABLE RECORD CLOCK IS NOT "FRESH". `[ "$S_TS" -gt 0 ] 2>/dev/null` made a record with
+  # no `ts=` line, or one whose `ts=` is not a number, SKIP the staleness test entirely and answer 0 —
+  # i.e. a pass record from any age read as current, which is the same "unparseable bound means no
+  # bound" defect `need_int` refuses for the other four bounds. A record whose clock cannot be read is
+  # unmeasurable, and unmeasurable is a failure to answer, not a pass.
+  case "$S_TS" in
+    ''|*[!0-9]*)
+      err "the pass record at $STATUS_FILE carries no readable ts= ('${S_TS:-<none>}') — cannot tell whether the sweep is running"
+      exit 3 ;;
+  esac
+  AGE_S=$((NOW_S - S_TS))
+  if [ "$AGE_S" -gt "$STALE_SECONDS" ]; then
+    err "the last pass record is ${AGE_S}s old (> ${STALE_SECONDS}s) — STALE: the sweep is not running"
+    exit 3
+  fi
+  case "${S_ST:-}" in
+    ok) exit 0 ;;
+    incomplete) exit 1 ;;
+    never) exit 3 ;;
+    # ⛔ ALLOW-LIST, NOT A BLACKLIST. An unnamed status, an empty one, and a record that lost its
+    # status line are all "I cannot tell you this box is safe", which is a failure to answer.
+    *) err "the last pass recorded status='${S_ST:-<none>}' rc='${S_RC:-?}' — a human must look; see $RECORD"; exit 3 ;;
+  esac
+fi
+
+# ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
+RESCUE="${WIP_SWEEP_RESCUE:-}"
+if [ -n "$RESCUE" ]; then
+  [ -f "$RESCUE" ] || { err "WIP_SWEEP_RESCUE=$RESCUE does not exist — REFUSING"; exit 3; }
+elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/bg-rescue-wip.sh" ]; then
+  RESCUE="$SELF_DIR/bg-rescue-wip.sh"
+elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh" ]; then
+  RESCUE="$HOME/.pi/agent/scripts/bg-rescue-wip.sh"
+fi
+# ⛔ A MISSING RESCUER MUST NEVER READ AS "NOTHING TO RESCUE". This is the same rule
+# `spawn-gate.sh`'s rescue seam already enforces (`rescue=UNAVAILABLE`, never `rescue=nothing`): the
+# absence of the tool says nothing about the state of the worktrees, so this REFUSES.
+if [ -z "$RESCUE" ]; then
+  err "bg-rescue-wip.sh not found (looked at \$WIP_SWEEP_RESCUE, ${SELF_DIR:-<no script dir>}, \$HOME/.pi/agent/scripts) — REFUSING: without it this sweep cannot archive anything, and a sweep that cannot archive is NOT 'nothing to rescue'."
+  exit 3
+fi
+
+# ── repos ────────────────────────────────────────────────────────────────────────────────────────
+# ⛔ NO AMBIENT-`$REPO` DEFAULT, DELIBERATELY. `$REPO` is a generic name the cell supervisor and the
+# Mac bring-up both export, and a sweep that silently adopts it archives work from a repo nobody
+# asked it about — measured while writing this file: an arm that meant to prove "no repo resolvable"
+# instead swept the TORTOISE checkout (139 worktrees, 7 archives pushed to a real origin) because the
+# harness shell had `REPO` set. A sweep moves work between machines; WHICH repo is not a thing it may
+# inherit from the environment. `cloud-cell-quiesce.sh` therefore passes `--repo "$REPO"` explicitly.
+# With nothing to sweep this REFUSES (exit 3): a pass that scanned zero repos is not a pass, it is a
+# green light over an unexamined disk.
+if [ "${#REPOS[@]}" -eq 0 ]; then
+  SRC="${WIP_SWEEP_REPOS:-}"
+  if [ -z "$SRC" ]; then
+    # Bounded like every other subprocess here: this runs on the cell-quiesce path, so a git call that
+    # wedges on a hung mount must fail rather than hold the box open.
+    if tb_timeout "$STATUS_TIMEOUT" git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+      SRC="$(tb_timeout "$STATUS_TIMEOUT" git rev-parse --show-toplevel 2>/dev/null)"
+    fi
+  fi
+  rest="$SRC:"
+  while [ -n "$rest" ]; do
+    one="${rest%%:*}"
+    rest="${rest#*:}"
+    [ -n "$one" ] && REPOS[${#REPOS[@]}]="$one"
+  done
+fi
+if [ "${#REPOS[@]}" -eq 0 ]; then
+  err "no repo to scan (pass --repo PATH, set WIP_SWEEP_REPOS, or run inside a worktree) — REFUSING: a sweep that scans nothing is NOT a pass."
+  exit 3
+fi
+
+mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR — REFUSING (a pass with no record has no alarm channel)"; exit 3; }
+ERRF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-err.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
+LISTF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-list.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
+
+T0="$SECONDS"
+TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+NOW_S="$(date -u '+%s')"
+
+N_SEEN=0; N_CLEAN=0; N_SKIPPED=0; N_DIRTY=0; N_ARCHIVED=0; N_DEFERRED=0; N_UNMEASURED=0; N_FAILED=0; N_NO_ISSUE=0
+DETAIL=""
+FAILED=0   # latched: once this pass has failed to measure or to archive, it never ends clean
+
+# issue_of <branch> — the first 2-8 digit run, or "" (see THE INDEX above for what it is for).
+issue_of() {
+  local b="$1"
+  if [[ "$b" =~ (^|[^0-9])([0-9]{2,8})([^0-9]|$) ]]; then
+    printf '%s' "${BASH_REMATCH[2]}"
+  fi
+}
+
+# record <repo> <path> <branch> <head> <verdict> <paths> <age_h> <issue> <ref> <note>
+# TSV, appended, one row per worktree EXAMINED. `note` never carries a tab (it is built from fixed
+# tokens here, not from delegate output).
+record() {
+  if [ ! -s "$RECORD" ]; then
+    printf '#wip-sweep-record-v1\tts\trepo\tpath\tbranch\thead\tverdict\tpaths\tage_h\tissue\tref\tnote\n' >> "$RECORD" 2>/dev/null || { err "cannot write the index $RECORD"; FAILED=1; return; }
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$TS" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" >> "$RECORD" 2>/dev/null \
+    || { err "cannot append to the index $RECORD"; FAILED=1; }
+}
+
+# budget_exhausted — 1 when the whole-pass wall bound has been spent. Checked BETWEEN worktrees, so no
+# single examination is left unbounded (that is `--verdict`'s own STATUS_TIMEOUT).
+budget_exhausted() {
+  [ "$BUDGET" -gt 0 ] 2>/dev/null || return 1
+  [ $((SECONDS - T0)) -ge "$BUDGET" ]
+}
+
+# ── examine <repo> <path> <head> <branch-ref> <bare> <prunable> ───────────────────────────────────
+# One worktree. Everything it decides is recorded, including the reasons it decided nothing.
+examine() {
+  local repo="$1" path="$2" head="$3" bref="$4" bare="$5" prunable="${6:-0}"
+  local vout="" vrc=0 verdict="" paths="" br="" slug="" issue="" age="?" ref="-" ct=""
+  N_SEEN=$((N_SEEN + 1))
+  [ -n "$head" ] || head="-"
+  [ -n "$bref" ] || bref="-"
+
+  # A bare repo has no working tree, so there is no uncommitted work to lose. Recorded as such
+  # (`verdict=skip`) rather than measured — it is not `clean` because nothing was examined, and it is
+  # not `cannot-verify` because the reason is a fact about the repository, not a failed read.
+  if [ "$bare" = 1 ]; then
+    record "$repo" "$path" "-" "$head" "skip" "-" "-" "-" "-" "bare-repo-no-working-tree"
+    N_SKIPPED=$((N_SKIPPED + 1))
+    return 0
+  fi
+
+  # ⛔ TWO FACTS, BOTH REQUIRED, BEFORE A RECORD MAY BE SKIPPED AS "GONE".
+  #   * the checkout DIRECTORY is absent, and
+  #   * `git worktree list` itself says the record is `prunable` (`gitdir file points to non-existent
+  #     location`), i.e. GIT has concluded the checkout is gone, from its own admin record.
+  # A directory that does not exist cannot hold uncommitted work, so that record is a `skip` — not an
+  # UNMEASURED. Requiring git's own verdict is what stops this becoming a fail-open on a permission
+  # blip: a parent that momentarily denies search makes `[ -d ]` false WITHOUT git declaring prunable,
+  # and that case is `cannot-verify` below. The divergence between the two (git says prunable, the
+  # directory is still there with files in it) is the opposite hazard — real work in an unreadable git
+  # state — so it is measured and, when it cannot be read, fails the pass.
+  # Measured need: a live pass on a 139-worktree checkout reported `unmeasured=2` for two records whose
+  # directories had been reaped after they were listed, and failed the whole box for work that could
+  # not exist.
+  if [ ! -d "$path" ]; then
+    if [ "$prunable" = 1 ]; then
+      record "$repo" "$path" "-" "$head" "skip" "-" "-" "-" "-" "prunable-checkout-dir-absent"
+      N_SKIPPED=$((N_SKIPPED + 1))
+      return 0
+    fi
+    N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
+    record "$repo" "$path" "-" "$head" "cannot-verify" "-" "-" "-" "-" "checkout-dir-vanished-unprunable"
+    err "UNMEASURED — $path is listed as a worktree but its directory is GONE while git does NOT call the record prunable. Something changed under this pass; this record is not measured, and it is not clean."
+    return 0
+  fi
+
+  vout="$(tb_timeout "$STATUS_TIMEOUT" bash -- "$RESCUE" --verdict "$path" 2>"$ERRF")"
+  vrc=$?
+  verdict="$(printf '%s\n' "$vout" | sed -n 's/^verdict=\([a-z-][a-z-]*\).*$/\1/p')"
+  paths="$(printf '%s\n' "$vout" | sed -n 's/.* paths=\([0-9][0-9]*\).*$/\1/p')"
+  br="$(printf '%s\n' "$vout" | sed -n 's/.* branch=\([^ ]*\).*$/\1/p')"
+  slug="$(printf '%s\n' "$vout" | sed -n 's/.* slug=\([^ ]*\).*$/\1/p')"
+
+  # ⛔ THE EXIT CODE AND THE WORD MUST AGREE. The classifier's contract is 0/1/2 = clean/dirty/
+  # cannot-verify; a 124 (its status timed out), a 127 (the delegate is gone) or a word/exit mismatch
+  # is NOT a verdict, and every one of them lands in `cannot-verify`. Allow-list polarity: only the
+  # three named pairs are accepted, so a code this script has never seen cannot fall through to clean.
+  case "$verdict:$vrc" in
+    clean:0) ;;
+    dirty:1) ;;
+    cannot-verify:2) ;;
+    *) verdict="cannot-verify" ;;
+  esac
+
+  [ "$br" = "-" ] && br=""
+  [ -n "$br" ] || br="${bref#refs/heads/}"
+  [ -n "$br" ] || br="-"
+  issue="$(issue_of "$br")"
+
+  if [ "$verdict" = cannot-verify ]; then
+    N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
+    record "$repo" "$path" "$br" "$head" "cannot-verify" "-" "-" "${issue:--}" "-" "unmeasured-status-exit-$vrc"
+    err "UNMEASURED — could not classify $path (bg-rescue-wip --verdict exit $vrc). This worktree was NOT swept; it is not clean, it is unknown."
+    head -3 "$ERRF" 2>/dev/null | sed 's/^/wip-sweep:     /' >&2
+    return 0
+  fi
+
+  ct="$(tb_timeout "$STATUS_TIMEOUT" git -C "$path" log -1 --format=%ct HEAD 2>/dev/null)"
+  case "${ct:-}" in
+    ''|*[!0-9]*) age="?" ;;
+    *) age=$(( (NOW_S - ct) / 3600 )) ;;
+  esac
+
+  if [ "$verdict" = clean ]; then
+    N_CLEAN=$((N_CLEAN + 1))
+    record "$repo" "$path" "$br" "$head" "clean" "${paths:-0}" "$age" "${issue:--}" "-" "nothing-at-risk"
+    return 0
+  fi
+
+  # ── dirty: this is the work the pass exists to move off this disk ──────────────────────────────
+  N_DIRTY=$((N_DIRTY + 1))
+  if [ -z "$issue" ]; then
+    N_NO_ISSUE=$((N_NO_ISSUE + 1))
+    err "NO ISSUE LINK — $path is dirty on branch '$br', which carries no issue number, so the archive cannot be tied back to an issue. Report only: refs/wip name-keying is agent-infra#3484."
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "dry-run-would-archive"
+    N_DEFERRED=$((N_DEFERRED + 1))
+    return 0
+  fi
+
+  if [ "$MAX" -gt 0 ] && [ "$N_ARCHIVED" -ge "$MAX" ]; then
+    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-per-pass-cap"
+    N_DEFERRED=$((N_DEFERRED + 1))
+    return 0
+  fi
+  if budget_exhausted; then
+    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-pass-budget"
+    N_DEFERRED=$((N_DEFERRED + 1))
+    return 0
+  fi
+
+  # The rescue's note travels into the archive commit message, so the next actor sees WHY it exists.
+  vout="$(tb_timeout "$RESCUE_TIMEOUT" bash -- "$RESCUE" "$path" "wip-sweep: uncommitted work archived without a lane ending (agent-infra#3485)" 2>&1)"
+  vrc=$?
+  if [ "$vrc" -eq 0 ]; then
+    # ⛔ EXIT 0 IS AMBIGUOUS, SO IT IS NOT THE EVIDENCE (review round 1, finding F3). The rescue exits 0
+    # BOTH for "archived and pushed" AND for "clean — nothing at risk" (`bg-rescue-wip.sh:186-196`), and
+    # the two are distinguishable only by which path it took. A lane that COMMITS between the verdict
+    # above and this call — a live lane on the periodic path, or simply a tree that changed under us —
+    # makes the rescue take the clean path and push nothing, and a sweep that trusted the exit code then
+    # records `archived`, increments the counter, and prints a ref that does not exist. The whole point
+    # of this tool is the promise "the work is on ORIGIN", so the promise is what gets read back: ONE
+    # bounded `ls-remote` for the ref, and the row says `archived` only when origin answers with it.
+    if [ -n "$slug" ]; then ref="refs/wip/$slug"; else ref=""; fi
+    if [ -z "$ref" ]; then
+      N_FAILED=$((N_FAILED + 1)); FAILED=1
+      record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "archived-but-ref-unparsed"
+      err "the rescue exited 0 for $path but named no slug — the archive ref is UNKNOWN, so it is not recorded as archived"
+      return 0
+    fi
+    # Bounded, and the THREE verdicts are kept apart. `--exit-code` is what makes "no matching ref" a
+    # distinct 2 instead of an empty success; any other non-zero (a network failure, a timeout) is
+    # "could not read", which is NOT "not archived" and NOT "archived".
+    tb_timeout "$STATUS_TIMEOUT" git -C "$path" ls-remote --exit-code origin "$ref" >/dev/null 2>&1
+    case "$?" in
+      0)
+        N_ARCHIVED=$((N_ARCHIVED + 1))
+        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "$ref" "archived-ref-present-on-origin"
+        note "archived $br ($path) → origin $ref (ref read back from origin)" ;;
+      2)
+        # The tree went clean under this pass, or the push silently did nothing: either way there is no
+        # archive ref, and "the rescue exited 0" is not a reason to claim one.
+        N_FAILED=$((N_FAILED + 1)); FAILED=1
+        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "rescue-exited-0-but-ref-absent-on-origin"
+        err "the rescue exited 0 for $path but origin holds no $ref — NOT recorded as archived. The tree may have gone clean between the verdict and the rescue; if it did not, this work is still only on this disk." ;;
+      *)
+        N_FAILED=$((N_FAILED + 1)); FAILED=1
+        record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "$ref" "archive-ref-unverifiable"
+        err "the rescue exited 0 for $path and named $ref, but origin could not be read back to confirm it — this is UNVERIFIED, not archived." ;;
+    esac
+    return 0
+  fi
+
+  # ⛔ NOT CLEAN, AND LOUD. The rescue's own output already says which stage failed and why; the pass
+  # re-prints it and records the row, so the work being left behind is a fact in the index rather than
+  # a line somebody has to notice in a log.
+  N_FAILED=$((N_FAILED + 1)); FAILED=1
+  record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "rescue-exit-$vrc"
+  err "STILL ONLY ON THIS DISK — the rescue FAILED for $path (exit $vrc); branch '$br' is unarchived."
+  printf '%s\n' "$vout" | sed 's/^/wip-sweep:     /' >&2
+  return 0
+}
+
+# ── sweep one repo, one `git worktree list` record at a time ─────────────────────────────────────
+# ⛔ ENUMERATION IS `git worktree list --porcelain` (admin files only) — never a directory walk over
+# `.worktrees/`, which descends into every node_modules on the box. Each record is: `worktree <path>`,
+# `HEAD <sha>`, `branch <ref>`|`detached`, an optional `bare`/`locked`/`prunable`, then a BLANK line.
+# The list is written to a FILE and iterated from it: a `for x in $(cmd)` / `done < <(cmd)` feeder can
+# iterate ZERO times, and a fleet sweeper that examined no worktree and reported success is the exact
+# defect this file exists to remove, one layer in.
+sweep_repo() {
+  local repo="$1" line="" cur="" cur_head="" cur_branch="" cur_bare=0 cur_prunable=0 started=0
+  : > "$LISTF"
+  if ! tb_timeout "$STATUS_TIMEOUT" git -C "$repo" worktree list --porcelain > "$LISTF" 2>"$ERRF"; then
+    err "UNMEASURED — git worktree list failed for $repo; NOTHING in it was swept. This repo is not clean, it is unknown."
+    head -3 "$ERRF" 2>/dev/null | sed 's/^/wip-sweep:     /' >&2
+    N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
+    record "$repo" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "worktree-list-failed"
+    return 0
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      'worktree '*)
+        if [ "$started" -eq 1 ]; then examine "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"; fi
+        cur="${line#worktree }"; cur_head=""; cur_branch=""; cur_bare=0; cur_prunable=0; started=1 ;;
+      'HEAD '*)   [ "$started" -eq 1 ] && cur_head="${line#HEAD }" ;;
+      'branch '*) [ "$started" -eq 1 ] && cur_branch="${line#branch }" ;;
+      'bare')     [ "$started" -eq 1 ] && cur_bare=1 ;;
+      'prunable'*) [ "$started" -eq 1 ] && cur_prunable=1 ;;
+      '')         if [ "$started" -eq 1 ]; then examine "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"; fi
+                  cur=""; cur_head=""; cur_branch=""; cur_bare=0; cur_prunable=0; started=0 ;;
+    esac
+  done < "$LISTF"
+  [ "$started" -eq 1 ] && examine "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
+  return 0
+}
+
+MODE_WORD=dry-run
+[ "$DRY_RUN" -eq 0 ] && MODE_WORD=apply
+note "pass start mode=$MODE_WORD max=$MAX budget=${BUDGET}s repos=${#REPOS[@]} watchdog=$TB_TIMEOUT_KIND"
+note "index: $RECORD"
+
+for one in ${REPOS[@]+"${REPOS[@]}"}; do
+  # ⛔ BOUNDED, LIKE EVERY OTHER SUBPROCESS HERE — and this is on the quiesce path, before the box is
+  # destroyed. The `! A && ! B` form also keeps the live list honest: an UNREADABLE repo and a repo
+  # that is neither a work tree nor bare both land in the same refusal, and neither reads as swept.
+  if ! tb_timeout "$STATUS_TIMEOUT" git -C "$one" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+     && ! tb_timeout "$STATUS_TIMEOUT" git -C "$one" rev-parse --is-bare-repository >/dev/null 2>&1; then
+    err "UNMEASURED — '$one' is not a git repository this pass can read; it was NOT swept"
+    N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
+    record "$one" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "not-a-repo"
+    continue
+  fi
+  note "sweeping $one"
+  sweep_repo "$one"
+done
+
+# ⛔ A PASS THAT EXAMINED ZERO WORKTREES HAS NOT SWEPT ANYTHING. Repos resolved and every one of them
+# listed at least its own main worktree, so zero here means the enumeration broke — never "no work to
+# rescue".
+if [ "$N_SEEN" -eq 0 ]; then
+  err "UNMEASURED — no worktree was examined at all, though ${#REPOS[@]} repo(s) resolved. This pass swept NOTHING; it is not a clean one."
+  FAILED=1
+fi
+
+RC=0
+STATUS=ok
+if [ "$FAILED" -eq 1 ]; then
+  RC=3; STATUS=failed
+  DETAIL="unmeasured=${N_UNMEASURED} rescue_failed=${N_FAILED}"
+elif [ "$N_DEFERRED" -gt 0 ]; then
+  RC=1; STATUS=incomplete
+  DETAIL="deferred=${N_DEFERRED} (cap=$MAX budget=${BUDGET}s)"
+fi
+
+# The pass record is written LAST and atomically: a record that exists is a pass that reached its
+# verdict, and a torn one would be read as a verdict by `--print-status`.
+REC_TMP="$(mktemp "$STATE_DIR/.wip-sweep-status.XXXXXX" 2>/dev/null)"
+if [ -n "$REC_TMP" ]; then
+  {
+    printf 'status=%s\n' "$STATUS"
+    printf 'rc=%s\n' "$RC"
+    printf 'ts=%s\n' "$NOW_S"
+    printf 'mode=%s\n' "$MODE_WORD"
+    printf 'seen=%s\n' "$N_SEEN"
+    printf 'clean=%s\n' "$N_CLEAN"
+    # ⛔ `skip` IS NOT `clean` (review round 5, finding F-b). Both `verdict=skip` rows are records that
+    # were NOT examined: a bare repo, and a worktree record git itself calls `prunable`. They used to be
+    # folded into `clean=` while the comment beside them said the opposite, so an instrument reading the
+    # summary could not tell 5 measured-clean trees from 3 clean + 2 never-examined — a lossy count in
+    # the OPTIMISTIC direction, on the surface the doc nominates for monitoring. They have their own
+    # counter, and `seen = clean + skipped + dirty + unmeasured` holds.
+    printf 'skipped=%s\n' "$N_SKIPPED"
+    printf 'dirty=%s\n' "$N_DIRTY"
+    printf 'archived=%s\n' "$N_ARCHIVED"
+    printf 'deferred=%s\n' "$N_DEFERRED"
+    printf 'unmeasured=%s\n' "$N_UNMEASURED"
+    printf 'failed=%s\n' "$N_FAILED"
+    printf 'no_issue=%s\n' "$N_NO_ISSUE"
+    printf 'repos=%s\n' "${#REPOS[@]}"
+    printf 'watchdog=%s\n' "$TB_TIMEOUT_KIND"
+    printf 'detail=%s\n' "${DETAIL:-none}"
+  } > "$REC_TMP" 2>/dev/null && mv -f "$REC_TMP" "$STATUS_FILE" 2>/dev/null || {
+    err "cannot write the pass record $STATUS_FILE — this pass cannot be reported on, so it is not a success"
+    RC=3; rm -f "$REC_TMP"
+  }
+  REC_TMP=""
+else
+  err "cannot create a temp file in $STATE_DIR — the pass record was NOT written, so this pass cannot be reported on"
+  RC=3
+fi
+
+note "pass done status=$STATUS rc=$RC seen=$N_SEEN clean=$N_CLEAN skipped=$N_SKIPPED dirty=$N_DIRTY archived=$N_ARCHIVED deferred=$N_DEFERRED unmeasured=$N_UNMEASURED failed=$N_FAILED no_issue=$N_NO_ISSUE"
+exit "$RC"
