@@ -307,7 +307,14 @@ BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen =
   if (!ins && nh > 0 && lc ~ /^#+[ \t]*previous[ -]work/) { ins = 1; depth = nh; next }
   if (!ins) next
   t = _strip(line)
-  if (tolower(t) ~ /^wip[ \t]*:/) {
+  # ⛔ THE SAME RECOGNIZER AS THE SHAPE PARSER, OR THE TWO DISAGREE AND THE GATE FAILS OPEN
+  # (review cycle 3, P1). `_label` folds `[ \t-]+` into one space and strips it, so `WIP-:`, `WIP --:`,
+  # `WIP- :` are all the `wip` LABEL to the shape check — while this reader required `^wip[ \t]*:` and
+  # therefore collected NOTHING, so the cross-check abstained and the brief was ADMITTED with an
+  # unchecked claim of absence (measured: `WIP-: issue-4242 -> none` → rc 0 against an existing ref).
+  # The class below is exactly the set of separators `_label` normalises away (space, underscore,
+  # hyphen) and DELIBERATELY not TAB, which the `_label` class [A-Za-z0-9 _-]* cannot span.
+  if (tolower(t) ~ /^wip[ _-]*:/) {
     sub(/^[^:]*:/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
     # …and the value is measured UNDRESSED, for the reason given in the `_label` comment above a
@@ -320,18 +327,8 @@ BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen =
 # ⛔ EVERY `WIP:` VALUE, one per line, prefixed `V<TAB>` — the earlier "last one wins" shape made the
 # cross-check trivially bypassable: append a second `WIP:` line (unfenced, and the canonical block IS
 # such a line) and the checker abstained on it while the shape check was satisfied by the first.
-END {}
-{
-  for (_i = 1; _i <= _n; _i++) printf "V\t%s\n", _v[_i]
-}
+END { for (_i = 1; _i <= _n; _i++) printf "V\t%s\n", _v[_i] }
 '
-
-# brief_gate_wip_value <file|-> — the `WIP:` value of the PREVIOUS WORK section, or nothing.
-brief_gate_wip_value() { # brief_gate_wip_value <file|->
-  local f="${1:--}"
-  if [ "$f" != "-" ] && { [ ! -e "$f" ] || [ ! -r "$f" ]; }; then return 0; fi
-  if [ "$f" = "-" ]; then awk "$BRIEF_GATE_WIP_AWK"; else awk "$BRIEF_GATE_WIP_AWK" "$f"; fi
-}
 
 # brief_gate_repo [explicit] — WHICH repository `refs/wip/*` is read from. Resolution, in order:
 #   1. the caller's explicit argument (a dispatch path that knows its repo should pass it);
@@ -473,7 +470,12 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
         # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
         # claim of absence (an earlier draft read the whole value and switched itself off)
         rest="${val#issue-}"; rest="${rest#"$issue"}"
-        claim="$(printf '%s' "$rest" | sed -e 's/^[[:space:]]*\(->\|→\|:\)[[:space:]]*//')"
+        # ⛔ ERE, NOT GNU's `\|` (review cycle 3, P2). BSD sed — macOS, where install.sh and launchd
+        # run — does not implement `\|` in a BRE, so this substitution was INERT there: the arrow
+        # stayed in `claim`, the claim no longer began `refs/wip/`, and an HONEST brief that named its
+        # ref was falsely REFUSED on the exact platforms the fleet runs on while Linux stayed green.
+        # Same class as orch-loop.sh:1329 and fleet-inventory.sh:927.
+        claim="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*(->|→|:)[[:space:]]*//')"
         case "$claim" in refs/wip/*) : ;; *) issues="$issues $issue" ;; esac ;;
       pr-[0-9]*)
         # A PR key is the FIXER's and the REVIEWER's key (they hold `refs/claims/<pr>-<sha>`); for a
