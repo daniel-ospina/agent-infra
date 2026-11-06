@@ -324,9 +324,12 @@ has "$OUT" "agent_dir=$OV3" "2k7 …and it reads the expanded directory, not the
 
 
 # ── 3. BLINDNESS IS NOT A REFUSAL (polarity, the direction that stops a fleet) ───────────────────
-for spec in "absent:ABSENT" \
-            "literal:{\"providers\":{\"deepseek\":{\"apiKey\":\"sk_literal_not_a_template\"}}}" \
-            "noprovider:{\"providers\":{\"other\":{\"apiKey\":\"\$KG_CANARY_KEY\"}}}" \
+# ⛔ TWO OF THE FOUR SHAPES THAT USED TO SIT IN THIS LOOP ARE *DECIDABLE* (round 28, P2, measured), and keeping them
+# here pinned the #3443 silence: with NO models.json, or one that names nothing for this provider, pi reads the
+# provider's OWN variable (`dist/env-api-keys.js` `getApiKeyEnvVars` -> `getEnvApiKey`), so "no key anywhere" is a
+# positive answer, not a datum we failed to read. `literal` and `notjson` are the genuinely undecidable pair and are
+# the whole of the loop below; the decidable pair is arms 3z1-3z3.
+for spec in "literal:{\"providers\":{\"deepseek\":{\"apiKey\":\"sk_literal_not_a_template\"}}}" \
             "notjson:{ this is not json"; do
   name="${spec%%:*}"; body="${spec#*:}"
   HH="$(mkhome "$name" "$body")"
@@ -336,6 +339,121 @@ for spec in "absent:ABSENT" \
      "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
   has "$OUT" "check=skipped" "3 $name: it SAYS it could not resolve, rather than passing silently"
 done
+
+# ── 3z: A BUILT-IN PROVIDER IS DECIDABLE WITHOUT models.json — THE #3443 CELL SHAPE ───────
+# ⛔ MEASURED ON THE INSTALLED pi, BOTH DIRECTIONS: with no models.json at all, `pi -p --no-session --provider
+# deepseek --model deepseek-flash` answers `No API key found for deepseek.` with nothing exported, and reaches the
+# provider (401) with DEEPSEEK_API_KEY exported. pi's own table is the authority this arm asserts against, and the
+# old cannot-say here was rc 0 — a green gate over a lane that dies, which is exactly what #3443 reports.
+HZ="$(mkhome builtin_nokey ABSENT)"
+OUT="$(run_gate "$HZ" KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+eqv "$(rc_of "$OUT")" "82" "3z1 no models.json and no key REFUSES (rc=$(rc_of "$OUT")) — pi dies on this box"
+has "$OUT" "check=fail result=REFUSED reason=credential-missing var=DEEPSEEK_API_KEY" \
+    "3z2 …naming the variable pi's own table resolves for this provider"
+has "$OUT" "source=pi-builtin-env" "3z3 …and the REFUSAL says which authority the answer came from"
+OUT="$(run_gate "$HZ" DEEPSEEK_API_KEY=sk_x KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+ck "3z4 with that variable set the same box passes (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=DEEPSEEK_API_KEY provider=deepseek" "3z5 …and the green line names the same variable"
+has "$OUT" "source=pi-builtin-env" "3z5b …and the GREEN line carries its authority too (the two branches are separate printfs)"
+# A file that parses and names NOTHING for this provider is the same answer as no file at all: pi's fallback is the
+# provider's own variable (`findEnvKeys`), so this is decidable too.
+HZ2="$(mkhome builtin_otherprov '{"providers":{"other":{"apiKey":"$KG_CANARY_KEY"}}}')"
+OUT="$(run_gate "$HZ2" KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+eqv "$(rc_of "$OUT")" "82" "3z6 a models.json naming ANOTHER provider still refuses (rc=$(rc_of "$OUT"))"
+has "$OUT" "var=DEEPSEEK_API_KEY" "3z7 …on the provider's built-in variable, not on the other provider's template"
+# A LITERAL apiKey is a credential pi uses as-is (`resolveConfigValue` returns it unchanged): there is no variable to
+# assert and no absence to refuse, so this stays a cannot-say — with its OWN reason, because the old shared line
+# claimed "a literal" was a failure to resolve.
+HZ3="$(mkhome literal2 '{"providers":{"deepseek":{"apiKey":"sk-literal-credential"}}}')"
+OUT="$(run_gate "$HZ3" KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+ck "3z8 a LITERAL apiKey refuses nothing (rc=$(rc_of "$OUT")) — pi uses it as the credential" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "reason=literal-api-key-in-models-json" "3z9 …and says that is what it found"
+# Multi-variable built-ins: ANY of pi's variables provisions the provider (measured with ANTHROPIC_AUTH_TOKEN, which
+# pi sends as a bearer token), so the arm asserts the one that is present rather than the first in the list.
+HZ4="$(mkhome anthropic_multi ABSENT)"
+OUT="$(run_gate "$HZ4" ANTHROPIC_OAUTH_TOKEN=tok KG_PROV=anthropic KG_MODEL=claude-x)"
+ck "3z10 any ONE of a multi-variable built-in's variables passes (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=ANTHROPIC_OAUTH_TOKEN" "3z11 …and names the one that is set"
+OUT="$(run_gate "$HZ4" KG_PROV=anthropic KG_MODEL=claude-x)"
+eqv "$(rc_of "$OUT")" "82" "3z12 none of them set refuses (rc=$(rc_of "$OUT"))"
+has "$OUT" "candidates=ANTHROPIC_AUTH_TOKEN,ANTHROPIC_OAUTH_TOKEN,ANTHROPIC_API_KEY" \
+    "3z13 …and the candidates list every variable pi would try"
+# ⛔ A PROVIDER WHOSE CREDENTIAL NEEDS MORE THAN ONE ENVIRONMENT VALUE REFUSES NOTHING (measured: AZURE_OPENAI_API_KEY
+# alone answers `Azure OpenAI base URL is required`, CLOUDFLARE_API_KEY alone still answers `No API key found`, and
+# GOOGLE_CLOUD_API_KEY alone makes pi attempt the call because ADC is a second path). The line names the variable to
+# check; the polarity stays, because a false block costs a lane and this gate cannot tell.
+OUT="$(run_gate "$HZ" KG_PROV=azure KG_MODEL=gpt-x)"
+ck "3z14 a provider pi needs MORE than one value for refuses nothing (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=warn reason=provider-credential-unverifiable provider=azure" "3z15 …but says so, and why"
+has "$OUT" "candidates=AZURE_OPENAI_API_KEY why=" "3z16 …naming the variable to check, as its own token"
+# A provider pi does not ship and models.json does not declare is the genuinely undecidable case, and the line says so
+# in both halves (no template AND no built-in variable) instead of claiming only the first.
+OUT="$(run_gate "$HZ" KG_PROV=nosuchprov KG_MODEL=m)"
+ck "3z17 an unknown provider refuses nothing (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=skipped reason=cannot-resolve-provider-credential" "3z18 …and says it could not resolve it"
+has "$OUT" "built-in provider table names no environment variable" \
+    "3z19 …naming the second half it could not read, not only the template"
+# ⛔ AND AN UNPARSEABLE FILE MUST NOT FALL INTO THE BUILT-IN REFUSAL (round 28, P3, measured by MUTATION of this very
+# arm): pi may read that file at runtime, so a refusal here is the false block the header forbids. This is the
+# difference between absent (`3z1` refuses) and unreadable (this must not).
+HZ5="$(mkhome unparsable_nokey '{ not json')"
+OUT="$(run_gate "$HZ5" KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+ck "3z20 an UNPARSEABLE models.json never refuses (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=skipped" "3z21 …it is a datum we did not read, not the positive \"no credential\""
+# A `!command` apiKey is pi's to evaluate; the built-in arm must not speak over it either.
+HZ6="$(mkhome builtin_cmd '{"providers":{"deepseek":{"apiKey":"!echo sk-from-command"}}}')"
+OUT="$(run_gate "$HZ6" KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+ck "3z22 a \`!command\` apiKey refuses nothing (rc=$(rc_of "$OUT")) — only pi can evaluate it" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=skipped" "3z23 …and the line says the template is not resolvable"
+
+# ── 3y: pi COMPOSES models.json A SECOND TIME, AND THE COMPOSER CAN TAKE THE TEMPLATE AWAY ─────────
+# ⛔ MEASURED ON THE INSTALLED pi (round 28, P2): `applyModelsJson` throws on `oauth` with no provider-level `baseUrl`
+# (`provider-composer.js:154`), `composeProvider` catches and returns the built-in base, and the provider's own
+# `apiKey` override is LOST with it. So `{"deepseek":{"apiKey":"$MYK","oauth":"radius"}}` with MYK unset and
+# DEEPSEEK_API_KEY exported makes pi RUN (401 from deepseek) while the old gate refused `var=MYK` — a false 82 — and
+# the same box with MYK exported and no DEEPSEEK_API_KEY made pi answer `No API key found` while the gate certified
+# `$MYK`: the template is inert in BOTH directions, so the gate must stop asserting it.
+HY="$(mkhome discarded_store ABSENT)"
+printf '{"providers":{"deepseek":{"apiKey":"$MYK","oauth":"radius"}}}
+' > "$HY/.pi/agent/models.json"
+OUT="$(run_gate "$HY" DEEPSEEK_API_KEY=sk_x KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+ck "3y1 a DISCARDED template does not refuse a box pi runs (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=warn reason=models-json-api-key-discarded why=oauth-no-baseurl" \
+    "3y2 …it says the apiKey was discarded, and why"
+has "$OUT" "var=DEEPSEEK_API_KEY" "3y3 …and the verdict is on the variable pi actually resolves"
+hasnt "$OUT" "REFUSED reason=credential-missing var=MYK" "3y4 …never on the discarded \$MYK"
+OUT="$(run_gate "$HY" MYK=sk_myk KG_PROV=deepseek KG_MODEL=deepseek-flash)"
+eqv "$(rc_of "$OUT")" "82" "3y5 with \$MYK set and no built-in key it refuses (rc=$(rc_of "$OUT")) — pi answers \"No API key found\""
+has "$OUT" "var=DEEPSEEK_API_KEY" "3y6 …still naming the built-in variable, because \$MYK is inert"
+# The WARN line names the discarded variable on purpose (it is what was discarded); the VERDICT must not.
+hasnt "$(printf '%s\n' "$OUT" | grep -F 'REFUSED')" "var=MYK" \
+    "3y7 …and the VERDICT never names the discarded one, only the variable pi resolves"
+# A model definition pi cannot compose DELETES a provider pi does not ship (measured: `Unknown provider "myprov"`),
+# while a BUILT-IN composes api/baseUrl from its own model (`findModelDefaults`, provider-composer.js:117-123). The
+# warn is therefore conditional, and the built-in half is the arm that keeps it from crying wolf.
+HY2="$(mkhome dropped_custom '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
+OUT="$(run_gate "$HY2" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"
+ck "3y8 an unbuildable model definition refuses nothing (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=warn reason=models-json-provider-dropped why=no-api:m1" \
+    "3y9 …it warns that pi DELETES this provider"
+has "$OUT" "check=ok var=MYV" "3y10 …and the credential assertion still stands for a provider that composes"
+HY3="$(mkhome builtin_noapi '{"providers":{"deepseek":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
+OUT="$(run_gate "$HY3" MYV=sk_myv KG_PROV=deepseek KG_MODEL=m1)"
+hasnt "$OUT" "reason=models-json-provider-dropped" \
+    "3y11 a BUILT-IN provider with the same shape is NOT reported as dropped — pi composes it (measured: m1 registered, \$MYV used)"
+HY4="$(mkhome composes_custom '{"providers":{"myprov":{"api":"openai-completions","baseUrl":"http://127.0.0.1:9/v1","apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
+OUT="$(run_gate "$HY4" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"
+hasnt "$OUT" "reason=models-json-provider-dropped" "3y12 a provider that composes cleanly never warns"
+has "$OUT" "check=ok var=MYV" "3y13 …and passes on its template variable"
 
 # ── 3b: A TEMPLATE WITH TEXT AROUND THE REFERENCE, OR WITH TWO REFERENCES (review cycle 1, P2) ────
 # ⛔ pi's grammar interpolates `$NAME` ANYWHERE in the string and refuses the provider unless EVERY name
@@ -572,6 +690,38 @@ run_box_at() {
              out="$(key_gate_box_default_assert box "$KG_HOME" refused "$KG_CWD")"; rc=$?
              printf "RC=%s\n%s\n" "$rc" "$out"' 2>&1
 }
+# ── 8z: THE PIN OF A BUILT-IN PROVIDER IS DECIDABLE WITHOUT models.json (round 28, P2) ────────────
+# ⛔ THE DOCUMENTED VERIFICATION PATH USED TO ABSTAIN HERE, and this is the ordinary cell shape: `settings.json` pins a
+# provider pi ships and there is no models.json at all, so "skipped" read as "nothing wrong" on the very box #3443
+# measured. pi provisions such a provider from its OWN variable, so the probe answers and refuses when none is set
+# (measured both directions on the installed pi).
+HSB2="$(mkset boxbuiltin ABSENT '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HSB2" "$T/nocwd")"; rc="$(rc_of "$OUT")"
+eqv "${rc:-none}" "82" "8z1 a pinned BUILT-IN with no key refuses (rc=${rc:-none}) — pi dies on this box"
+has "$OUT" "check=fail result=REFUSED reason=box-default-not-provisioned model=deepseek-flash box_default=deepseek-flash provider=deepseek var=DEEPSEEK_API_KEY" \
+    "8z2 …naming the pin AND the variable pi resolves it from"
+has "$OUT" "source=pi-builtin-env" "8z3 …and saying which authority the answer came from"
+OUT="$(run_box_at "$HSB2" "$T/nocwd" DEEPSEEK_API_KEY=sk_x)"; rc="$(rc_of "$OUT")"
+eqv "${rc:-none}" "0" "8z4 with that variable set the pinned box passes (rc=${rc:-none})"
+has "$OUT" "check=ok box_default=deepseek-flash" "8z5 …on a line about the PIN, not the lane"
+has "$OUT" "var=DEEPSEEK_API_KEY" "8z6 …naming the variable that answered"
+# A provider whose credential needs more than one value warns: the pin is NOT refused, because a false 82 on a box
+# that would run costs a lane and this gate cannot tell.
+HSB3="$(mkset boxazure ABSENT '{"defaultProvider":"azure","defaultModel":"gpt-4o"}')"
+OUT="$(run_box_at "$HSB3" "$T/nocwd")"; rc="$(rc_of "$OUT")"
+eqv "${rc:-none}" "0" "8z7 a pinned provider pi needs more than one value for refuses nothing (rc=${rc:-none})"
+has "$OUT" "check=warn reason=provider-credential-unverifiable provider=azure" "8z8 …but says so, with the variable to check"
+# And the shapes the probe cannot read must NOT fall into the refusal: an unparseable models.json is a datum it did not
+# get, and a literal apiKey IS the credential.
+HSB4="$(mkset boxunparsable '{ not json' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HSB4" "$T/nocwd")"; rc="$(rc_of "$OUT")"
+eqv "${rc:-none}" "0" "8z9 an UNPARSEABLE models.json never refuses the pin (rc=${rc:-none})"
+has "$OUT" "check=skipped reason=cannot-resolve-provider-credential" "8z10 …it abstains and says why"
+HSB5="$(mkset boxliteral '{"providers":{"deepseek":{"apiKey":"sk-literal-credential"}}}' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HSB5" "$T/nocwd")"; rc="$(rc_of "$OUT")"
+eqv "${rc:-none}" "0" "8z11 a LITERAL apiKey is the credential, so the pin is not refused (rc=${rc:-none})"
+has "$OUT" "reason=literal-api-key-in-models-json" "8z12 …and the line says that is what it found"
+
 SET_UNPROV='{"defaultProvider":"venice","defaultModel":"venice-uncensored"}'
 HB="$(mkset boxdefault "$TWO_JSON" "$SET_UNPROV")"
 OUT="$(run_box_at "$HB" "$T/nocwd" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
