@@ -2220,7 +2220,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
               # `capacity-refused-<N>` record from it, so the item is yielded to a peer), and a skewed
               # pair is identical on that peer. The remedy below is the only correct one, and the code
               # is what makes the readers publish it instead of "repair the box / dispatch elsewhere".
-              _pf_remedy="This does NOT clear by waiting and it is NOT a property of this box: the probe REJECTED its own arguments (the usage-error in the line above), which is a helper/consumer VERSION SKEW — the same pair refuses identically on every other box, so do NOT dispatch the item elsewhere. Sync the helper pair: cp scripts/orchestrator-harness/*.sh \$O/ ." ;;
+              _pf_remedy="This does NOT clear by waiting and it is NOT a property of this box: the probe REJECTED its own arguments (the usage-error in the line above), which is a helper/consumer VERSION SKEW — the same pair refuses identically on every other box, so do NOT dispatch the item elsewhere. Sync the helper pair with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O ." ;;
             *)  _pf_remedy="This does NOT clear by waiting: the reading above names the refusal." ;;
           esac
           if [ "$_pf_reason" = "no-answer" ]; then
@@ -2254,7 +2254,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
           # still warns: that is the absence of a probe, not a reading from one.
           if [ "${_pf_rc:-0}" -eq 2 ]; then
             AGENT_STARTED=0
-            echo "[capability-gate] REFUSED $label: LANE_CAPABILITY rc=2 with NO verdict line — the probe RAN and reported CANNOT MEASURE, which its own EXIT table says every caller must refuse too. This is a helper/consumer VERSION SKEW (a caller passing a flag the deployed copy predates) or a corrupt/truncated copy ($_pf_sh), NOT a reading about this box: every box running the same pair refuses identically, so do NOT dispatch the item elsewhere. Sync it: cp scripts/orchestrator-harness/*.sh \$O/ . Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
+            echo "[capability-gate] REFUSED $label: LANE_CAPABILITY rc=2 with NO verdict line — the probe RAN and reported CANNOT MEASURE, which its own EXIT table says every caller must refuse too. This is a helper/consumer VERSION SKEW (a caller passing a flag the deployed copy predates) or a corrupt/truncated copy ($_pf_sh), NOT a reading about this box: every box running the same pair refuses identically, so do NOT dispatch the item elsewhere. Sync it with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O . Override with LANE_PREFLIGHT=0 once an operator has measured it by hand." >> "$log"
             [ "$was_m" = "1" ] || { [ "$jobctl" = "1" ] && set +m 2>/dev/null; }
             return "$AGENT_HARNESS_SKEW_REFUSED"
           fi
