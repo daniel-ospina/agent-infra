@@ -763,7 +763,10 @@ a machine-visible success.
 
 **The polarity is `claims.sh`'s own, and that is not an accident.** `lease_state ∈ {live, expired,
 unknown}` where **absent / `0` / non-digit / more than 18 digits ⇒ `unknown`, and `unknown` is NOT
-expired**. `claim_acquire`, `claim_prune` and `claim_live` all treat that class as LIVE; a tighter
+expired**. `claim_acquire`, `claim_prune` and `claim_live` all treat that class as NOT EXPIRED
+(`claim_acquire`/`claim_live` never steal it; since agent-infra#3203 `claim_prune` reaps it only once
+its own commit passes `CLAIM_UNREADABLE_LEASE_MAX_AGE`, and every reader REPORTS it as an abstention
+rather than as live); a tighter
 reading here would re-create the two-readers-disagree defect those call sites document (a
 controller re-spawning a fixer that `claim_acquire` refuses, and un-parking the PR every cycle so
 the attempt cap never trips). The 18-digit bound is the precise magnitude guard: `lease_until` is

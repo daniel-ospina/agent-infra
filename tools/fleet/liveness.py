@@ -620,7 +620,9 @@ class Claim:
     ``unknown`` (an absent, ``0``, non-digit, or >18-digit value) is deliberately
     **NOT expired** — the fleet's own conservative polarity (``claims.sh``'s
     ``claim_acquire``/``claim_prune`` and ``orch-loop.sh``'s ``claim_live`` all
-    treat an unparseable lease as live, and a *tighter* reading here would
+    treat an unparseable lease as NOT EXPIRED — never as live; ``claim_prune``
+    reaps it only past ``CLAIM_UNREADABLE_LEASE_MAX_AGE``, agent-infra#3203 — and
+    a *tighter* reading here would
     re-create the two-readers-disagree defect those sites document).
     """
 

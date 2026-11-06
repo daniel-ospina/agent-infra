@@ -1975,8 +1975,11 @@ esac
 # healthiest-looking output this script can print. The two counters added for #2094 must each be able
 # to be NON-ZERO, or the operator gets a column that always reads 0 (the absence of a measurement is
 # not a measurement of emptiness). (a) above already produced the WITHHELD case; assert it there.
+# ⚠️ The matcher names the STABLE part of the line: since agent-infra#3203 the aggregate also covers a
+# lease that cannot be parsed (an ABSTENTION counted as withheld), so "live" is no longer the whole
+# story and the assertion is on the prefix both cases share.
 case "$OUT" in
-  *"WITHHELD by a live cross-box claim"*) ok "claim-withheld: a live peer claim is counted as WITHHELD (the short backlog is claims, not an empty pool)" ;;
+  *"WITHHELD by a cross-box claim"*) ok "claim-withheld: a peer-claim hold (live, or an unparseable-lease abstention) is counted as WITHHELD (the short backlog is claims, not an empty pool)" ;;
   *) bad "claim-withheld: the withheld aggregate did not print — output: $OUT" ;;
 esac
 case "$OUT" in

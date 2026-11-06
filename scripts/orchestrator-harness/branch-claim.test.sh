@@ -200,6 +200,30 @@ else
   bad "owner push refused after reclaim: $(cat "$T/p7.err")"
 fi
 
+echo "== 7b. an UNPARSEABLE lease on a branch claim is an ABSTENTION, never a live holder (#3203)"
+# ⛔ THE PUSH GATE IS THE ONE REFUSAL SITE WHOSE WORD A LANE ACTUALLY READS. Before agent-infra#3203
+# a branch claim whose `lease_until` cannot be parsed fell through to `reason=held-by-live`, telling
+# the lane a PEER IS WORKING on it — when in truth nobody could ever judge the term (and, before the
+# bounded reap, nobody could ever release it). The answer is unchanged (rc 1, nothing released); the
+# LABEL is the fix, and a lane cannot be told to wait for a holder that does not exist.
+BCREF="refs/claims/branch-integration-land-batch-2"
+( cd "$T/owner" && export CLAIM_REPO="$T/owner" CLAIM_OWNER_HOST=boxA && . "$SELFDIR/claims.sh" \
+  && c="$(_claim_commit "peerbox:4242" 0)" && _git push -q --force origin "$c:$BCREF" ) 2>/dev/null \
+  || bad "fixture: cannot seed an unparseable-lease branch claim"
+guard_from stray "$BR"; eq "an unparseable branch lease still REFUSES the lane (rc 1)" "$?" "1"
+grep -q 'reason=lease-unreadable' "$T/guard.err" \
+  && ok "the refusal names the real fault (reason=lease-unreadable)" \
+  || bad "the push gate still mislabels the class: $(cat "$T/guard.err")"
+grep -q 'held-by-live' "$T/guard.err" \
+  && bad "the refusal claims a LIVE holder for a lease nobody can parse: $(cat "$T/guard.err")" \
+  || ok "...and does NOT claim a live holder (no held-by-live)"
+grep -q 'CLAIM_UNREADABLE_LEASE_MAX_AGE\|agent-infra#3203' "$T/guard.err" \
+  && ok "...and names the bounded reap that will end the block, or the hand remedies" \
+  || bad "the refusal names no way out: $(cat "$T/guard.err")"
+( cd "$T/origin.git" && git rev-parse --verify -q "$BCREF" >/dev/null ) \
+  && ok "the unparseable claim was NOT released by the guard (a refusal is never a release)" \
+  || bad "the guard DELETED an unparseable claim it should only have refused"
+
 echo "== 8. MUTANT — remove the enforcement; the same stray push succeeds and the head MOVES"
 # A FRESH clone with NO hook installed: the mutant is "the guard is absent", not "the guard is
 # bypassed by a fixture accident", and a fresh clone also has the remote tip as its base.

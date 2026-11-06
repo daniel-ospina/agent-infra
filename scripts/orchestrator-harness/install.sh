@@ -97,7 +97,11 @@ MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 # value the loop uses. The one explicit value this CAN touch is one identical to the derivation —
 # the same absurd probe-derived number — so bounding that is the repair, not a substitution.
 if [ "$MAX_LANES" = "$(( 10#$_NCPU * 5 / 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=10; fi
-MAX_REVIEW="${MAX_REVIEW:-4}"
+# ⛔ 10, NOT 4 (#3441): this is BOTH the reviewer-concurrency cap and the per-PR review-ROUND
+# ceiling the loop enforces (`state/reviewround-<PR>`), and the two must be the same number here and
+# in `orch-loop.sh` — the self-test resolves all limit defaults in both scripts and asserts they agree.
+# The sync comment in `orch-loop.sh` names the three places (this file, the loop, README §4).
+MAX_REVIEW="${MAX_REVIEW:-10}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # NOTE (BP0, tortoise#8468 — NOT shipped, reconciled onto main's rule): the tortoise fork's P0
 # override (a P0-blocker at the backlog head clearing ONLY the merge-priority reason) is NOT carried
@@ -1239,6 +1243,29 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
 for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
+  # ⛔ `MAX_REVIEW` IS NO LONGER ONLY CONCURRENCY — SAY SO AT THE RENDER (round 9 review, P2). Since
+  # agent-infra#3441 this ONE knob is BOTH the concurrent-`review-<PR>` cap AND the per-PR cumulative
+  # REVIEW-ROUND budget, at which the head is PARKED with a `REVIEW-CEILING` escalation. So a box whose
+  # plist still pins the old default (`4`, chosen when the number meant concurrency only) now parks
+  # PRs after FOUR review rounds — converting the owner's ruling ("raise 4 so the loop converges")
+  # into exactly the early exit it was made to remove. A WARNING, not a refusal: 2..9 are legitimate
+  # values for a small box, and over-blocking an install is worse than naming the consequence.
+  # ⛔ TWO RESIDUALS, NAMED RATHER THAN IMPLIED (round-16 review, P3). (1) THIS CANNOT SEE A STALE
+  # PLIST: the knob is seeded from `${MAX_REVIEW:-10}` above and this script never reads the INSTALLED
+  # plist's `EnvironmentVariables`, so a plist rendered before #3441 that pins `4` produces NO warning —
+  # re-rendering simply takes the new default (harmless, but it is not the population the README row
+  # used to say this catches). (2) IT IS UNPINNED: no suite runs a render with `MAX_REVIEW=4` and greps
+  # for this line (the install-check groups in `selftest.sh` are macOS-only and skip on Linux), so
+  # deleting the block would redden nothing. Both are stated here because an unasserted print is the
+  # first thing the next lane removes as dead, and `MAX_REVIEW=4` is the configuration this exists to
+  # make visible.
+  if [ "$_n" = "MAX_REVIEW" ]; then
+    case "${_v:-}" in ''|*[!0-9]*) : ;; *)
+      if [ "${_v}" -ge 2 ] && [ "${_v}" -lt 10 ]; then
+        echo "⚠️  MAX_REVIEW=$_v is ALSO the per-PR review-ROUND ceiling (agent-infra#3441): a PR is PARKED with a REVIEW-CEILING escalation after $_v review rounds. The shipped default is 10 — the OLD default was 4, chosen when this knob meant concurrency only, so a plist rendered before #3441 still pins it. Re-render (this run does) to take the new value." >&2
+      fi ;;
+    esac
+  fi
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
     # ⛔ A WINDOW IS NOT A COUNT (review round 5). MERGE_PRIORITY_MAX_AGE_MIN / FUNNEL_MAX_AGE_MIN are

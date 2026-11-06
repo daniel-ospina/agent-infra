@@ -75,8 +75,9 @@
 #      budgets), which is the duplicate-dispatch failure the registry exists to prevent.
 #   O8 [RED→GREEN] the PRE-FLIGHT reads an orphaned claim as CLEAN (free to reclaim) instead of
 #      COLLISION, and a live peer's as COLLISION naming `held-by-live`.
-#   O9 [PINNED]     a lease whose lease_until cannot be parsed is still LIVE — the existing
-#      unparseable-is-live polarity must survive the orphan arm (it is the arm most likely to
+#   O9 [PINNED]     a lease whose lease_until cannot be parsed ABSTAINS (rc=1) — never stolen, and
+#                   (agent-infra#3203) never reported as `held-by-live`. The never-expired
+#      polarity must survive the orphan arm (it is the arm most likely to
 #      reorder the checks).
 #   O10 [RED→GREEN] a rename SELF-HEALS WITH NO ROSTER: the box remembers the names it has carried
 #      and treats its OWN former names as dead. No roster ships in this repo, so without this the
@@ -378,17 +379,19 @@ as_box "$ORIG15" ctrlbox 'claim_prune' >/dev/null 2>&1
 has_ref "$ORIG15" refs/claims/9209451-0123456789ab && rc15=1 || rc15=0
 ck "O15 [RED→GREEN] ... while the SAME dead pid on a PR claim IS pruned (the rule is keyed, not dead)" $rc15
 
-# ══ O9: unparseable lease is still LIVE (must survive the orphan arm) ══
+# ══ O9: an unparseable lease ABSTAINS — never reported live, never stolen (must survive the orphan arm) ══
 echo
-echo "── O9: an unparseable lease stays LIVE even when the owner host looks orphaned ─────"
+echo "── O9: an unparseable lease abstains (rc=1, nothing stolen) even when the owner host looks orphaned ─────"
 as_box "$ORIG5" localbox 'c="$(_claim_commit "localbox:999995" 0)"
   _git push -q origin "$c:refs/claims/issue-9209408" 2>/dev/null; printf "PUSHED=%s\n" "$?"' >/dev/null
 # ⛔ THE OWNER HOST MUST BE ONE THE RULES ACTUALLY JUDGE (P1, cycle-17 review). `localbox` is a seam
 # name with no `claim-hosts` entry, no deny-list entry and no roster, so nothing could have called this
 # claim orphaned: the case passed pre-fix, at head, AND under a mutation that let the acquire's orphan
 # arm run for an unparseable lease (measured — it reclaimed the claim with rc=0 while the suite stayed
-# green). The host is now on the DEAD list, so the ONLY thing keeping the claim LIVE is the guard this
-# case names, and the control below proves the same arm still reclaims a PARSEABLE expired lease.
+# green). The host is now on the DEAD list, so the ONLY thing keeping the claim from being reclaimed is the
+# guard this case names, and the control below proves the same arm still reclaims a PARSEABLE expired
+# lease. ⚠️ agent-infra#3203 renamed that guard's OUTPUT (`held-by-unreadable-lease`, not a claim that
+# the lease is live) but not its ANSWER: rc=1, nothing stolen, the orphan arm never consulted.
 NOLEASE="$(as_box "$ORIG5" localbox 'CLAIM_DEAD_HOSTS=localbox claim_issue_acquire "" 9209408 >/dev/null 2>&1
   printf "RC=%s\nRESULT=%s\n" "$?" "${CLAIM_RESULT:-}"')"
 NOLRES="$(field "$NOLEASE" RESULT)"
@@ -396,7 +399,7 @@ NOLRES="$(field "$NOLEASE" RESULT)"
 # ⛔ [PINNED], NOT [RED→GREEN] (cycle-18 review, measured): on the pre-change tree nothing consults
 # `CLAIM_DEAD_HOSTS` at all, so this passes there VACUOUSLY — the deny list it relies on does not exist.
 # It is still the case that pins the ORDERING, which is why the mutation below is what gives it teeth.
-ck "O9 [PINNED] an UNPARSEABLE lease reads LIVE even when the owner host is on the DEAD list ('$NOLRES')" $NOL_RC
+ck "O9 [PINNED] an UNPARSEABLE lease ABSTAINS (rc=1) even when the owner host is on the DEAD list ('$NOLRES')" $NOL_RC
 # CONTROL: the same host, the same deny list, a PARSEABLE expired lease — the orphan arm DOES reclaim it,
 # so a mutation that skips the unparseable guard for orphaned hosts reddens the pair.
 PARSEABLE="$(as_box "$ORIG5" localbox 'c="$(_claim_commit "localbox:999994" "1000000000")"
@@ -419,6 +422,17 @@ as_box "$ORIG2" peerhost 'c="$(_claim_commit "peerhost:1" "$(( $(date +%s) + 108
 has_ref "$ORIG2" refs/claims/issue-9209411 && has_ref "$ORIG2" refs/claims/issue-9209412 \
   && has_ref "$ORIG2" refs/claims/issue-9209413
 ck "O2 (setup) the three fixture claims are on the origin" $?
+# ── O2b: THE RELEASE IS THE HANDOVER (#3484) ─────────────────────────────────────────────────────
+# A released claim reads as "nothing happened here" unless the pass says what was behind it. Measured
+# 2026-11-05: 222 rescued `refs/wip/*` archives existed on this repo and nothing told the next actor
+# to look. So `claim_prune` prints the WIP clause for EVERY reaped ref — matched, absent, or
+# unmeasurable — and this is the arm that keeps it from going quiet again.
+W_TREE="$("$REAL_GIT" -C "$T/repo" hash-object -t tree /dev/null 2>/dev/null)"
+W_SHA="$("$REAL_GIT" -C "$T/repo" -c user.name=wip -c user.email=wip@localhost \
+          commit-tree "$W_TREE" -m 'wip: fixture snapshot for issue 9209411' 2>/dev/null)"
+[ -n "$W_SHA" ] && "$REAL_GIT" -C "$T/repo" push -q origin "$W_SHA:refs/wip/issue-9209411-handover" 2>/dev/null
+has_ref "$ORIG2" refs/wip/issue-9209411-handover
+ck "O2b (setup) a rescued refs/wip snapshot sits on the origin for the issue under test" $?
 PRUNE="$(as_box "$ORIG2" newhost 'claim_prune' CLAIM_KNOWN_HOSTS='newhost peerhost')"
 grep -q 'refs/claims/issue-9209411' <<<"$PRUNE"; ck "O2 [RED→GREEN] claim_prune reaps the ORPHANED-HOST claim (lease had hours left)" $?
 grep -q -i 'orphan' <<<"$PRUNE"; ck "O2 [RED→GREEN] the orphan reap says so by name" $?
@@ -427,6 +441,12 @@ ck "O2 [RED→GREEN] the orphaned-host claim is gone from the origin" $rc
 grep -q 'refs/claims/issue-9209412' <<<"$PRUNE"; ck "O3 [PINNED] claim_prune still reaps the EXPIRED claim" $?
 has_ref "$ORIG2" "refs/claims/issue-9209412" && rc=1 || rc=0
 ck "O3 [PINNED] the expired claim is gone from the origin" $rc
+grep -q 'WIP AT RELEASE: refs/wip/issue-9209411-handover' <<<"$PRUNE"
+ck "O2b [RED→GREEN] the reap of #9209411 NAMES the rescued ref behind it (#3484)" $?
+grep -q 'read it before starting; do not re-derive it' <<<"$PRUNE"
+ck "O2b …and tells the next actor what to do with it, not just that it exists" $?
+grep -q 'WIP AT RELEASE: none — no refs/wip ref matched #9209412' <<<"$PRUNE"
+ck "O3b [PINNED] a reap with NO rescued ref says 'none' for THAT issue — the line is per ref, not a global" $?
 has_ref "$ORIG2" "refs/claims/issue-9209413"; ck "O4 [PINNED] the KNOWN live host's claim SURVIVED the prune" $?
 
 # ══ O8: the PRE-FLIGHT must read an orphaned claim as CLEAN, a live peer's as COLLISION ══
@@ -774,16 +794,21 @@ snap refs/claims/9209462-0123456789ab "$(hostname -s):999999" "$FUT"
 [ "$(cl 9209462 $SHA16)" = "NOTLIVE" ]
 O16_RC=$?
 ck "O16 [RED→GREEN] a PR claim whose minting pid is GONE is NOT in flight (PR keying: the pid IS the worker)" $O16_RC
-# The ordering guard: an UNPARSEABLE lease keeps its polarity (LIVE) even when the owner host is a
-# former name — the orphan rules are a reason to stop trusting a TERM, not evidence about the holder.
+# The ordering guard: an UNPARSEABLE lease keeps pointing at an ABSTENTION ("in flight", never
+# stealable) even when the owner host is a former name — the orphan rules are a reason to stop
+# trusting a TERM, not evidence about the holder. `LIVE` is the fourth reader's word for
+# "do not steal", which it keeps (#3203 moved the REPORTED label, not this reader's answer).
 snap refs/claims/9209463-0123456789ab "boxOldName:$DEADPID16" "0"
 [ "$(cl 9209463 $SHA16)" = "LIVE" ]
-ck "O16 [PINNED] an UNPARSEABLE lease stays LIVE in claim_live() too (the orphan arm runs after it)" $?
-# ⛔ THE FOURTH READER'S CLOCK PROBE MUST ABSTAIN TOWARD LIVE (P2, cycle-23 review). `[ "$(date +%s)" -le
+ck "O16 [PINNED] an UNPARSEABLE lease is still not stealable by claim_live() (the orphan arm runs after it)" $?
+# ⛔ THE FOURTH READER'S CLOCK PROBE MUST ABSTAIN TOWARD "NOT FREE" (P2, cycle-23 review). `[ "$(date +%s)" -le
 # "$until" ]` folded an UNREADABLE clock into "not in flight" (and printed `[: …: integer expression
 # expected` on every call), so during a clock failure every worker-held PR read as free: the sweep
 # attempted a spawn per PR and `claim_acquire` refused each on its own clock guard. The three readers in
-# claims.sh all treat that clock as LIVE; this one is the fourth, and it must agree.
+# claims.sh all refuse that clock too (the acquire's token is `held-by-unreadable-clock` and it refuses
+# the MINT at **rc 1, not rc 2** — rc 2 is read by merge-one.sh/fix-one.sh as "registry unavailable,
+# proceed", which would drop the cross-box exclusion — so no epoch-0 lease is ever written), this one is
+# the fourth, and it must agree.
 # ⛔ THE HOLDER MUST BE ONE THE ORPHAN ARM LEAVES ALONE, or the fixture proves the wrong thing: a live
 # local pid is neither a former name nor a dead host, so the CLOCK probe is the only guard left to judge.
 snap refs/claims/9209465-0123456789ab "$(hostname -s):$$" "$FUT"
@@ -1093,6 +1118,13 @@ ck "O19 [PINNED] a probe that exits 0 with EMPTY output abstains too (got '${FOR
 # `_lease_unparseable` continue. Mutation (cycle-5 review): deleting that `continue` left every suite
 # green while the prune DELETED an unparseable-lease claim on an orphan guess. Losing a claim is the
 # duplicate window; keeping one costs a lease.
+# ⚠️ AMENDED BY agent-infra#3203, NARROWED TO ITS INTENT. "Must not be REAPED on an orphan guess" is
+# unchanged and is still asserted (the ref's existence, and no `pruned … issue-7003` line). What the
+# pin used to assert in passing — that the pass did not NAME the ref AT ALL — is now the opposite of
+# the requirement: an unparseable lease is an abstention, and an abstention that reaches the operator
+# must be NAMED every pass (`kept unreadable-lease …`, with its age). The fixture's claim commit is
+# ~0s old, i.e. INSIDE the reap bound, so the bounded arm keeps it here and the assertions below pin
+# both halves: named as KEPT, never named as PRUNED.
 echo
 echo "── O20: claim_prune leaves an UNPARSEABLE lease alone, even from an orphaned host ────"
 ORIG20="$(mk_origin o20)"; ensure_work_repo "$ORIG20" || { echo "❌ fixture"; exit 2; }
@@ -1105,8 +1137,10 @@ ck "O20 (setup) an UNPARSEABLE lease and an EXPIRED one are both planted" $?
 PRUNE20="$(as_box "$ORIG20" livebox 'claim_prune' CLAIM_DEAD_HOSTS=deadbox 2>&1)"
 has_ref "$ORIG20" refs/claims/issue-7003
 ck "O20 [PINNED] the unparseable-lease claim SURVIVES a prune that names its host DEAD" $?
-grep -q 'issue-7003' <<<"$PRUNE20" && P20=1 || P20=0
-ck "O20 [PINNED] the prune does not even NAME it as reaped" $P20
+grep -q 'pruned .*issue-7003' <<<"$PRUNE20" && P20=1 || P20=0
+ck "O20 [PINNED] the prune does not REAP it (no 'pruned … issue-7003' line)" $P20
+grep -q 'kept unreadable-lease refs/claims/issue-7003' <<<"$PRUNE20" && P20B=0 || P20B=1
+ck "O20 [RED→GREEN] ...and NAMES it as kept with the fault, so the abstention reaches the operator (#3203)" $P20B
 # Non-vacuity: the SAME host's EXPIRED claim IS reaped by this prune, and so is its ORPHANED one.
 has_ref "$ORIG20" refs/claims/issue-7004 && pr20=1 || pr20=0
 ck "O20 [PINNED] the expired claim from the same dead host IS still reaped (the arm is alive)" $pr20
@@ -1427,8 +1461,14 @@ PRE26() { # PRE26 <issue> <owner> <lease-until> <CLAIM_DEAD_HOSTS-or-empty>
 O26A="$(PRE26 9209900 'deadhostq:4242' 0 'deadhostq')"
 [ "$(field "$O26A" RC)" = "1" ]; O26A_RC=$?
 ck "O26 [PINNED] an UNPARSEABLE lease on a DEAD-listed host is NOT clean (rc=$(field "$O26A" RC))" $O26A_RC
-case "$(field "$O26A" R)" in *held-by-live*) O26B_RC=0 ;; *) O26B_RC=1 ;; esac
-ck "O26 [PINNED] ... and it names the token ('$(field "$O26A" R)')" $O26B_RC
+case "$(field "$O26A" R)" in *held-by-unreadable-lease*) O26B_RC=0 ;; *) O26B_RC=1 ;; esac
+ck "O26 [PINNED] ... and it names the ABSTENTION token ('$(field "$O26A" R)')" $O26B_RC
+# ⛔ AND IT MUST NOT CLAIM A LIVE HOLDER (agent-infra#3203): the same reason used to say
+# `held-by-live`, which asserted the one thing this reader cannot see (the lease does not parse, so
+# no window can be established). The refusal (rc=1 above) is unchanged; only the claim about WHY it
+# refuses changed.
+case "$(field "$O26A" R)" in *held-by-live*) O26D_RC=1 ;; *) O26D_RC=0 ;; esac
+ck "O26 [RED→GREEN] ... and does not claim the lease is live (no held-by-live token)" $O26D_RC
 O26C="$(PRE26 9209901 'deadhostq:4243' 1000000000 'deadhostq')"
 [ "$(field "$O26C" RC)" = "0" ]; O26C_RC=$?
 ck "O26 [PINNED] CONTROL: a PARSEABLE expired lease on the same host IS clean (rc=$(field "$O26C" RC))" $O26C_RC

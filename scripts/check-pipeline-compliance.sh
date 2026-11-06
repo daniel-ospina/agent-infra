@@ -5476,6 +5476,77 @@ $big_filler"
   # the producer's, not "any word after verdict=".
   expect_record 'an invented verdict' "$(bound_marker approve)" absent
 
+  # ⛔ #3164 — THE VERDICT IS THE PRODUCER'S CLEAN FAMILY, AND NOTHING ELSE. record-review.sh MINTS
+  # four verdicts (`clean|clean-micro|clean-low|not-clean`); this gate accepts exactly the three that
+  # are an APPROVAL, and `not-clean` is the recorder's NEGATIVE verdict — admitted there so the newest
+  # negative review is SEEN (#3410), never so it can merge. So a `not-clean` marker must not satisfy
+  # check (c), and neither may a negated, empty or prefix-widened verdict.
+  #
+  # ⛔ Anchors in this block were RE-MEASURED after #3164's change was re-applied onto main (main's
+  # record-first rewrite, #2983/#3454, moved this file ~1713 lines and `record-review.sh` inside the
+  # cited regions). Cite the tree you are reading, not the PR body: the body quotes the pre-merge
+  # numbers and an append-only proof comment cannot be corrected, so this copy is the live one.
+  #
+  # ⛔ WHY THESE VECTORS EXIST (measured, not hypothetical): NO control above can see the widening
+  # THIS ISSUE IS ABOUT — admitting `not-clean`, the verdict the recorder MINTS FOR A REFUSAL
+  # (`record-review.sh:1718`). The controls that name a verdict assert `clean` (`:5449`, `:5473`),
+  # which every widening of this form still ADMITS; `approve` (`:5477`) is refused, but only a `(.*)`
+  # widening reddens it (one of the 5 reds below) — `+ not-clean` leaves it GREEN, because `approve`
+  # and `not-clean` are different strings; the two phrase controls (`:5444`, `:5446`) name no verdict.
+  #
+  # ⛔ AND A REFUSAL IS NOW REFUSED TWICE, WHICH IS WHY THERE ARE TWO NOT-CLEAN ROWS. A `not-clean`
+  # marker is not just a different verdict: `record-review.sh:5287-5294` appends its `findings=<N>`
+  # trailer AFTER `(<repo>)`, DELIBERATELY ("the only consequence is that those parsers do not
+  # certify the line as clean — which is the CORRECT outcome for a NOT CLEAN record"), and this
+  # gate's `… (\(…\))( sig=…)?$` anchor stops at the repo group. So the refusal holds on two
+  # independent mechanisms: the verdict allow-list, and the trailer defeating the anchor. A lane
+  # that widens the allow-list alone therefore still cannot admit the producer's record — but a lane
+  # that widens the allow-list AND teaches the anchor the trailer (a perfectly ordinary "make the
+  # gate able to SEE the negative record" change, which is the #3410 motivation this comment block
+  # cites) admits a refusal the recorder can actually mint.
+  #
+  # ⛔ AND THE TWO ROWS PIN THE TWO-MECHANISM DEFENCE AS A SET, NOT ONE-APIECE. Measured: teaching the
+  # anchor the trailer ALONE (allow-list untouched) reds NOTHING — 267 ✅ / 0 ❌ / rc 0, stdout
+  # byte-identical to the green control — because a `not-clean` verdict still fails the allow-list. Only the COMBINED
+  # mutant reddens the producer-shaped row. So the anchor half is pinned JOINTLY, and a lane that
+  # widens the anchor tail by itself will see a fully green self-test. Do not read the row pair as
+  # "neither mechanism can be dropped silently": the ALLOW-LIST can be, alone (1 red); the ANCHOR
+  # cannot — nothing reds for it on its own. That is stated rather than papered over because a
+  # comment promising a per-mechanism pin would be the same class of defect as an unpinned pin (#3164
+  # review r15 measured the anchor-only widening at 255/0 and falsified the earlier wording here;
+  # RE-MEASURED at this tree it is 267/0 — same verdict, larger green control, because main added
+  # assertions above this block (#2983/#1224, #3454/#3440). Re-measure, do not carry a count across a
+  # base.)
+  #
+  # WHICH MUTANT REDDENS WHICH ROW (measured, one mutant per row group — a widening is not one shape):
+  #   · `+ not-clean` in the allow-list → the TRAILERLESS not-clean row alone (1 red); the
+  #     producer-shaped row stays green because the trailer still defeats the anchor.
+  #   · `+ not-clean` AND a `findings=( note=…)?` trailer admitted before the optional `sig=` → both
+  #     not-clean rows (2 red). This is the mutant that admits a mintable REFUSAL — the false PASS.
+  #   · `verdict=(.*)` (the allow-list stops being a vocabulary at all) → 5 red: the TRAILERLESS
+  #     not-clean row, negated, empty, prefix-widened, and the pre-existing `invented verdict`
+  #     control. The producer-shaped row survives even this, because its trailer still defeats the
+  #     anchor — only the mutant above (allow-list AND trailer) reddens it.
+  #   · narrowed to `verdict=(clean)` → the two clean-family controls below (+ the #1356/#3315/#1825
+  #     FAIL_ALL paths), i.e. the opposite mutation: the one that would false-BLOCK every micro and
+  #     low record. MEASURED at this tree: 20 assertions red (274 ✅, rc 2), 16 of them leading-`❌`
+  #     lines — up from the 8 recorded pre-merge because main's #1224 and #3315/#3440 FAIL_ALL paths
+  #     now abort on the SAME narrowing. The DIRECTION is what this row pins; the count moves with
+  #     the FAIL_ALL surface, so re-measure it rather than trusting this number.
+  # Do not simplify this to "every row is red against the widening": FOUR of the five ABSENT rows in
+  # this block survive `+ not-clean` by construction (only the trailerless row reddens), and a lane
+  # that validates these pins with the wrong mutant learns the opposite of the truth.
+  expect_record 'a NOT-CLEAN verdict — a recorded refusal is not an attestation' "$(bound_marker not-clean)" absent
+  expect_record 'a NOT-CLEAN verdict in the PRODUCER shape (`findings=2` trailer)' \
+    "$(bound_marker not-clean) findings=2" absent
+  expect_record 'a NEGATED verdict (`clean is not claimed`)' "$(bound_marker 'clean is not claimed')" absent
+  expect_record 'an EMPTY verdict' "$(bound_marker '')" absent
+  expect_record 'a PREFIX-WIDENED verdict (`cleanish`)' "$(bound_marker cleanish)" absent
+  # ...and the rest of the family the producer mints still attests, so the allow-list can never be
+  # narrowed to the one spelling the vectors above happen to name.
+  expect_record 'the bound marker, clean-micro (a micro-tier approval)' "$(bound_marker clean-micro)" present
+  expect_record 'the bound marker, clean-low (a content-shape approval)' "$(bound_marker clean-low)" present
+
   # The FAIL_ALL simulation is the PRODUCTION path for check (c)'s fixtures, and
   # CI runs SELF_TEST (never FAIL_ALL) — so the passes that carry the #1825
   # vectors are driven here or they pin nothing (#991).

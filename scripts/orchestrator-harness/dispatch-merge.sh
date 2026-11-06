@@ -74,7 +74,8 @@ release_issue_claim_unspawned() { # <issue>
 # reaper prunes it. The CI-queue deferral already did this correctly (and exits 3 so the cycle record
 # says `dispatched=0`); the BATCH-level repo-target refusals must do the same, and do — every one of
 # them exits 72, which orch-loop.sh's `_dmrc` arm turns into `K=0` for the batch. One helper, used by
-# every refusal path, so no path can drop a claim and keep the row.
+# every refusal path, so no path can drop a claim and keep the row — EXCEPT the chain-could-not-start
+# site, which KEEPS its row on purpose (see the block at the third per-issue cleanup site).
 #   ⚠️ SCOPE: a PER-ISSUE refusal (`continue`, below) used to leave this script's exit status 0 — the
 #   controller then counted a batch that started nothing as dispatched. It is not latent: the same arm
 #   gates on the BRANCH assertion, and a REUSED `.worktrees/tm-<N>` (checked out on another named
@@ -371,7 +372,7 @@ for N in "$@"; do
   _wt_rc=$?
   case "$_wt_rc" in
     0) echo "#$N: worktree ok — $WT_RESULT" ;;
-    *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; continue ;;
+    *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; drop_dispatched_rows "$N"; continue ;;
   esac
   WT_ABS="$REPO_ABS/.worktrees/$WT"
   # ── THE POST-BUILD ASSERTION (agent-infra#2724/#2694) ───────────────────────────────────────
@@ -476,6 +477,32 @@ for N in "$@"; do
     else
       echo "#$N: lane-$N stopped — releasing the issue claim"
       release_issue_claim_unspawned "$N"
+      # ⛔ THIS IS THE THIRD PER-ISSUE CLEANUP SITE IN THE LOOP, AND IT DOES **NOT** DROP THE ROW — a
+      # KNOWN, DELIBERATE gap (#3511 review), not an oversight. The other two arms that release the
+      # claim (the `wt_provision` refusal and the post-build repo/branch assertion) also call
+      # `drop_dispatched_rows`, so "claim released ⇒ row dropped" is the invariant everywhere BUT here.
+      # The naive fix was written and reverted: dropping the row lets the NEXT cycle re-dispatch this
+      # issue, and `wt_provision`'s reuse arm had no holder probe, so the new lane could be spawned
+      # into a checkout an ORPHANED GRANDCHILD is still writing in (`wt_close` signals the pane pid
+      # only) — two writers on one branch and one checkout. The probe that would close that
+      # (`wt_live_holders` in the reuse arm) was ALSO written and reverted: its argv witness matches
+      # any process whose command line names the path, and a box's tmux SERVER inherits the argv of the
+      # client that created it (`new-session … cd '<wt>' && …`, reparented to ppid 1, argv never
+      # changes), so the probe refuses that checkout for ever and the issue becomes undispatchable on
+      # that box — a permanent false block, which is worse than the skip it fixes.
+      # So the row is kept here ON PURPOSE until the probe can tell a daemon that merely MENTIONS the
+      # path from a process WORKING in it (corroborate the argv match against the pid's own cwd), and
+      # until that probe's false-positive class is witnessed by a test. Recorded on #3511.
+      # The cost meanwhile is a skip whose END depends on which class the row is in, and the two are not
+      # the same: for an issue inside the 500-newest open window the reaper's dispatched re-check drops
+      # the row on its next pass — but ONLY when no PR in that window's listing names it, because that
+      # loop keeps an entry whose branch a listed PR names (`has_pr` over `.pr_brs`), and a stopped lane
+      # may already have pushed and opened one; a WINDOW-BLIND entry is released ONLY when the issue
+      # CLOSES (that file: "SO ONLY A CLOSED ISSUE IS RELEASED" — it may not requeue on an OPEN issue
+      # whose PR already merged), and `orch-loop` skips on any row still present, so an OPEN window-blind
+      # issue stays undispatchable on this box until it closes. The reaper counts and NAMES that class on
+      # the operator line every pass (measured: 169 of 203 rows outside the window), so it is a stated
+      # deficit rather than an invisible one.
       # ── and take its EMPTY worktree back (#2033) ─────────────────────────────────────────────
       # The lane is confirmed gone and no chain will ever look at this checkout, so an empty one is
       # residue by definition — and residue is what makes the issue undispatchable everywhere. Same
