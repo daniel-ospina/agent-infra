@@ -265,25 +265,33 @@ sed '/^case ".*1:-status.*in$/,$d' "$SUP" > "$SUPLIB"
 grep -q '^start_doctor_loop()' "$SUPLIB" && ! grep -q '^  merge)' "$SUPLIB" \
   || bad "fixture: could not load the shipped supervisor functions"
 cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$T/"   # so doctor_path() finds a shipped doctor
-mkdir -p "$T/o6/state/roles" "$T/stub6"
+# ⛔ THE FOREIGN DIR MUST **EXIST** FOR THIS ARM TO MEAN ANYTHING (#2315). The case asserts the
+# REFUSAL branch, and that branch is selected by `doctor_session_orphaned_foreign()`: a foreign
+# session whose named state dir does NOT exist is a DEAD peer (a retired pin root / removed cell
+# home), and since 6b6daa49 the supervisor REPLACES it deliberately ("belongs to the retired state
+# dir … replacing it") rather than dying — with no way to clear a dead one, `start` could never
+# succeed again. So `/other/cell/orchestrator` must be a LIVE peer here: it exists, therefore the
+# supervisor must refuse and print the remedy. The fixture used to leave it absent, which put the
+# arm on the pre-#2315 branch and made it red on a correct supervisor.
+mkdir -p "$T/o6/state/roles" "$T/stub6" "$T/peer6"
 cat > "$T/stub6/tmux" <<'EOF'
 #!/bin/sh
 case "$1" in
   has-session) exit 0 ;;
-  list-panes) echo "bash -c O='/other/cell/orchestrator' exec cell-doctor"; exit 0 ;;
+  list-panes) echo "bash -c O='${FOREIGN_O:?}' exec cell-doctor"; exit 0 ;;
   kill-session) echo "KILLED $*" >> "${TMUX_STUB_LOG:-/dev/null}"; exit 0 ;;
 esac
 exit 0
 EOF
 chmod +x "$T/stub6/tmux"
-OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6" OR=daniel-ospina/tortoise \
+OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6" FOREIGN_O="$T/peer6" OR=daniel-ospina/tortoise \
         O="$T/o6" HOME="$T" CELL_HOME="$T" ENV_FILE="$T/keys6.env" \
         bash -c '. "$1"; start_doctor_loop' _ "$SUPLIB" 2>&1 )"; RC=$?
 [ "$RC" -ne 0 ] && ok "red/fatal: a FOREIGN doctor session -> REFUSED (rc=$RC)" \
                || bad "a foreign doctor session was accepted (rc=$RC): $OUT"
 case "$OUT" in *"tmux kill-session -t 'cell-doctor'"*) ok "message carries the exact remedy (tmux kill-session -t …)" ;;
                 *) bad "message does not carry the remedy — $OUT" ;; esac
-case "$OUT" in *"/other/cell/orchestrator"*) ok "message carries the state dir it belongs to" ;;
+case "$OUT" in *"$T/peer6"*) ok "message carries the state dir it belongs to" ;;
                 *) bad "message does not name the owning state dir — $OUT" ;; esac
 [ -s "$T/kills6" ] && bad "message-only: the supervisor KILLED the foreign session" \
                   || ok "message-only: nothing was killed (the remedy is printed, never executed)"
