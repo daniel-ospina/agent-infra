@@ -1091,6 +1091,82 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
       return 1
     fi
   fi
+  # ── agent-infra#3442 — THE NON-VACUITY ARM ──────────────────────────────────
+  # A FRESH `clean` verdict is the only claim in this system that a review HAPPENED and
+  # found nothing. Until this arm, nothing on the record path asked whether the guards that
+  # review approved could FAIL — so five PRs in ONE night were reviewed clean, three times
+  # each, over assertions that stay GREEN with the bug restored (agent-infra#3442; the
+  # instances are recorded in `docs/ops/review-non-vacuity-baseline.md`). #3368's own review
+  # named the root verbatim: "No mutation leg for the new gate — which is exactly how findings
+  # 1 and 2 survived three recorded clean reviews." The ABSENCE of the mutation leg is not a
+  # missing test; it is why the vacuous assertions went undetected.
+  #
+  # The check is PRESENCE AND SHAPE, never substance — the same posture and the same stated
+  # limit as `brief-gate.sh`'s research contract. It cannot tell a mutant that really reddens
+  # the named row from an invented one, and it cannot tell an EQUIVALENT mutant from a killed
+  # one. What it removes is the measured failure: a clean verdict carrying NO attribution at
+  # all, which is indistinguishable from a guard nobody ever tried to break.
+  #
+  # ⛔ ONE PARSER, NOT TWO. The predicate lives in `brief-gate.sh --mutation-missing` (the
+  # file the reviewer's OWN brief is rendered from, so the shape taught and the shape demanded
+  # cannot drift). It is resolved through the same four homes merge-one.sh uses for that same
+  # script; the repo copy is one directory DEEPER than the installed flat `$O` copy, hence
+  # both shapes in the ladder. A validator that cannot be FOUND refuses: a cannot-verify is
+  # never a pass, which is this file's whole posture (`verify_review_evidence` above).
+  #
+  # ⛔ THIS ARM IS UNREACHABLE FOR `not-clean` — by ORDER, not by a second condition. The
+  # polarity early-return above hands a negative verdict back before this line, because an
+  # artifact that declares findings legitimately carries no kill table.
+  local ma_self ma_dir ma_gate ma_miss ma_rc _ma_d
+  ma_self="${BASH_SOURCE[0]}"
+  ma_dir="$(cd "$(dirname "$ma_self")" 2>/dev/null && pwd)"
+  ma_gate=""
+  # ⛔ THE LADDER IS `$SELF`-ADJACENT FIRST, DELIBERATELY, AND NOT `$O` (review of #3442, P2 — declined
+  # with a reason). `merge-one.sh` renders the reviewer's brief from `$O/brief-gate.sh` and validates
+  # with the same copy, so a box whose `$O` is stale gets a brief with no block and a record it cannot
+  # mint. Two remedies were possible: put `$O` first here, or make the SKEW LOUD. `$O` first was tried
+  # and reverted: it makes this function's resolution depend on an environment variable that unrelated
+  # callers and suites set for their own purposes, so a stale `$O/brief-gate.sh` silently becomes the
+  # validator for every record in a tree whose own gate is fine — measured as six unrelated arms
+  # reddening in `record-review.test.sh`. The skew is instead reported by the status refusal below,
+  # which NAMES the validator and says a stale copy is harness skew rather than a review defect.
+  for _ma_d in "$ma_dir" "$ma_dir/orchestrator-harness" "${AGENT_INFRA_PATH:-}/scripts/orchestrator-harness" "${HOME:-}/.pi/agent/scripts"; do
+    [ -n "$_ma_d" ] && [ -f "$_ma_d/brief-gate.sh" ] && { ma_gate="$_ma_d/brief-gate.sh"; break; }
+  done
+  if [ -z "$ma_gate" ]; then
+    echo "   cannot check the NON-VACUITY contract without brief-gate.sh (looked in ${ma_dir}, ${ma_dir}/orchestrator-harness, \$AGENT_INFRA_PATH/scripts/orchestrator-harness and ~/.pi/agent/scripts) — a cannot-verify is never a pass." >&2
+    return 1
+  fi
+  # ⛔ `|| ma_rc=$?`, NEVER `ma_miss="$(…)"; ma_rc=$?` — this file runs under `set -euo pipefail` (see
+  # the top), and a plain assignment whose command substitution fails ABORTS the script with the
+  # validator's own status (measured: exit 78 out of the record path, no message, the operator left
+  # reading a bare number). A command in an `||` list is exempt from errexit, so the status is captured
+  # and turned into the teaching refusal below.
+  ma_rc=0
+  ma_miss="$(printf '%s' "$body" | bash "$ma_gate" --mutation-missing - 2>/dev/null)" || ma_rc=$?
+  # ⛔ FOUND-BUT-UNANSWERABLE IS ALSO A CANNOT-VERIFY (fresh-context review of this change, P1). The
+  # first cut read STDOUT as the verdict and never the status, so a `brief-gate.sh` that predates this
+  # verb — the pre-#3442 CLI falls through to `printf usage >&2; exit 78` — produced EMPTY stdout,
+  # which read as "the artifact is fine" and minted the clean record: the exact defect #3442 closes,
+  # restored by a box whose installed copy is one generation behind, with a green audit line. Reading
+  # only stdout is the fail-open; the status is the half that cannot be faked by silence.
+  if [ "$ma_rc" -ne 0 ]; then
+    echo "   the non-vacuity validator at $ma_gate could not answer (\`--mutation-missing\` exited $ma_rc — a copy that predates agent-infra#3442 answers 78 for it) — a cannot-verify is NEVER a pass, so no record is minted." >&2
+    echo "   → Refresh that copy (\`bash scripts/orchestrator-harness/install.sh\`, or \$AGENT_INFRA_PATH), then re-run. A stale validator is a HARNESS skew, not a review defect: do not re-review the code for it." >&2
+    return 1
+  fi
+  if [ -z "$ma_miss" ]; then
+    : # the artifact names its mutants (or declares there are none) — the verdict may be minted
+  elif [ "$ma_miss" = "NO-FILE" ]; then
+    echo "   the non-vacuity validator could not read the artifact — a cannot-verify is never a pass." >&2
+    return 1
+  else
+    echo "   $kind $id carries no MUTATION ATTRIBUTION block for this revision ($(printf '%s' "$ma_miss" | tr '\n' ' ')) — a CLEAN verdict is a claim that the new assertions CAN FAIL, and a verdict that never says which mutant reddens which row is INCOMPLETE, not clean (agent-infra#3442)." >&2
+    echo "   Measured cost of leaving it implicit: five PRs reviewed clean in one night over guards that stay GREEN with the bug restored (#3355 x2, #3368 x2, #3374)." >&2
+    echo "   The reviewer must add, to the posted comment, one row per NEW assertion — assertion | mutant (the edit that reverts the fix) | reddened row | observed — or one labelled 'NO NEW ASSERTIONS: <why>' line when the diff adds none." >&2
+    echo "   The exact shape: bash brief-gate.sh --mutation-section   (every generated reviewer brief already carries it: the reviewer was told, and this is the half that makes the claim un-mintable without it)." >&2
+    return 1
+  fi
   printf '%s %s on %s#%s, created %s, postdates head %s\n' "$kind" "$id" "$REPO" "$PR" "$created" "${head:0:12}"
   return 0
 }
