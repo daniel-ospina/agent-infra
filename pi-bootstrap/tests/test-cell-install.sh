@@ -4021,6 +4021,41 @@ _out="$(env -u TORTOISE_MCP_API_KEY -u TORTOISE_API_KEY \
 [ -s "$TMP/keyfn-unguarded.sh" ] && grep -qF "$_SENTINEL" <<<"$_out" \
   && ok "NEGATIVE CONTROL: with the guard removed the same arm DOES print the key — so the two arms above can fail" \
   || fail "the xtrace arm is VACUOUS — removing the guard still does not surface the key, so it would certify a leak as clean"
+# ⛔ …AND THE SAME GUARD MUST COVER THE LEGACY-ALIAS HINT (#3374 review, round 15 P1). `graph_
+# credential_note` read the ALIAS through `[ -n "${TORTOISE_API_KEY:-}" ]` and `[ -n "$(…)" ]`, and
+# `set -x` traces both WITH THE VALUE — measured `+ '[' -n tt_… ']'` on exactly the population the hint
+# exists for (primary name unset, legacy alias set). This arm drives the REAL note through that branch.
+{
+  sed -n '/^_no_group_world_write()/,/^}/p' "$INSTALLER"
+  sed -n '/^graph_mcp_var()/,/^}/p' "$INSTALLER"
+  sed -n '/^graph_key_from_env_file()/,/^}/p' "$INSTALLER"
+  sed -n '/^_graph_key_read()/,/^}/p' "$INSTALLER"
+  sed -n '/^_graph_key_present()/,/^}/p' "$INSTALLER"
+  sed -n '/^graph_key_resolve()/,/^}/p' "$INSTALLER"
+  sed -n '/^graph_credential_note()/,/^}/p' "$INSTALLER"
+} > "$TMP/notefn.sh"
+mkdir -p "$TMP/xt-legacy-home"
+printf 'TORTOISE_API_KEY=%s\n' "$_SENTINEL" > "$TMP/xt-legacy-home/keys.env"
+chmod 600 "$TMP/xt-legacy-home/keys.env"
+cat > "$TMP/xtnote.sh" <<'XT'
+#!/usr/bin/env bash
+set -uo pipefail
+KEYFN="$1"; DEST="$2"; HOME="$3"; CELL_HOME="$HOME"; GRAPH_VAR=""
+. "$KEYFN"
+log_line() { printf '%s\n' "$*"; }
+set -x
+graph_credential_note || true
+set +x
+XT
+_out="$(env -u TORTOISE_MCP_API_KEY -u TORTOISE_API_KEY \
+        bash "$TMP/xtnote.sh" "$TMP/notefn.sh" "$TMP/xt-dest" "$TMP/xt-legacy-home" 2>&1)"
+if grep -qF "$_SENTINEL" <<<"$_out"; then
+  fail "a 'bash -x' run of graph_credential_note printed the LEGACY key — the alias hint expands it inside the traced test"
+elif ! grep -q 'LEGACY name TORTOISE_API_KEY IS set' <<<"$_out"; then
+  fail "the legacy-alias arm did not reach the hint branch at all (got '$(tr '\n' ' ' <<<"$_out" | cut -c1-100)') — it would pass whether or not the leak is fixed"
+else
+  ok "the legacy-alias hint fires under 'bash -x' WITHOUT printing the key it just found"
+fi
 
 # -------------------------------------------------------------------------
 hdr "syntax"
