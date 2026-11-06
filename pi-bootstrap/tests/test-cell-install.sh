@@ -426,7 +426,7 @@ sys.exit(0 if "cell-local" in ((json.load(open(sys.argv[1])).get("mcpServers")) 
 PY
 # ⛔ HEADERS THIS MACHINE ADDED ARE KEPT **AND NAMED** (#3374 review P2). `entry = dict(want)`
 # discarded every non-Authorization header with no output at all, while the merge's own contract
-# (merge-mcp.py:54) is that every decision is a `NOTE:` line and "nothing here is silent". A cell
+# (merge-mcp.py:65) is that every decision is a `NOTE:` line and "nothing here is silent". A cell
 # behind a gateway that requires `X-Tenant` lost it on EVERY install.
 python3 - "$DEST/.mcp.json" <<'PY'
 import json, sys
@@ -3796,6 +3796,147 @@ run_install >/dev/null 2>&1
 [ -x "$SHIM_DST" ] \
   && ok "the fixture restored the installed shim after the ABSENT arm" \
   || fail "the ABSENT arm left the cell without an installed shim — later sections would measure the wrong tree"
+
+# ── (m) round 13: canonicalise BEFORE judging, a DNS root dot, and two credential sinks ─────────
+# Every arm below was measured RED against the pre-fix code before it was accepted.
+hdr "the template is judged on the url that is WRITTEN (verify -> install -> verify converges)"
+
+# The marker is extracted ONCE for this section too: an earlier section's copy is not guaranteed to
+# still exist by the time these arms run, and an arm that cannot find its instrument reports a
+# FAILURE it cannot attribute (measured while writing this: rc=127 read as "NON-CONVERGENT").
+MARKER_FN="$TMP/graph_mcp_marker_r13.sh"
+sed -n '/^graph_mcp_marker()/,/^}/p' "$ROOT/pi-bootstrap/cell-install.sh" > "$MARKER_FN"
+[ -s "$MARKER_FN" ] && ok "the round-13 arms found their instrument (graph_mcp_marker extracted)" \
+  || fail "graph_mcp_marker could not be extracted — every arm below would measure nothing"
+
+# ⛔ THE MERGE AND THE VERIFIER ASKED THE SAME QUESTION WITH DIFFERENT PREDICATES (#3374 round 13
+# P1). `usable()` answers by ENDPOINT (path-SENSITIVE); the canonicalisation answers by AUTHORITY
+# (path-insensitive) and REWRITES the url. With the check first, a template spelling the hosted host
+# `/mcp` (no trailing slash) took `usable()`'s SELF-HOST early return ("a daemon may need no key")
+# and was THEN written as THE hosted endpoint — so the installer wrote exactly what `--verify`
+# refuses, on a loop `cloud-cell-bringup.sh` runs as verify -> install -> verify. Measured pre-fix:
+# no Authorization -> merge rc=0 then `NOAUTH` rc=1; `Bearer ${OTHER}` -> rc=0 then `WRONG_AUTH`
+# rc=1; `type: "sse"` -> rc=0 then `NOTHTTP:sse` rc=1. A cell could never come up.
+# The invariant is one line, so it is asserted as one line over every shape: THE MERGE MUST EITHER
+# REFUSE (non-zero, nothing written) OR WRITE A FILE THE MARKER CERTIFIES.
+_converge_case() { # <name> <template-json>
+  printf '%s' "$2" > "$TMP/cv-tpl.json"
+  printf '{"mcpServers":{}}' > "$TMP/cv-dst.json"
+  cp "$TMP/cv-dst.json" "$TMP/cv-before.json"
+  python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$TMP/cv-tpl.json" "$TMP/cv-dst.json" --cell \
+    > "$TMP/cv-merge.out" 2>&1
+  _mrc=$?
+  _mout="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" \
+             "$TMP/cv-dst.json" "$TMP/cv-tpl.json" 2>&1)"
+  _vrc=$?
+  if [ "$_mrc" -ne 0 ]; then
+    cmp -s "$TMP/cv-dst.json" "$TMP/cv-before.json" \
+      && ok "CONVERGES-BY-REFUSAL: $1 — merge rc=$_mrc and the destination is UNCHANGED" \
+      || fail "$1: the merge refused (rc=$_mrc) but STILL WROTE the destination"
+  elif [ "$_vrc" -eq 0 ]; then
+    ok "CONVERGES: $1 — merge rc=0 and --verify certifies it ($_mout)"
+  else
+    fail "$1: NON-CONVERGENT — merge rc=0 wrote a file --verify REFUSES ($_mout rc=$_vrc); the repair loop can never clear it"
+  fi
+}
+_converge_case "hosted /mcp, no trailing slash, NO Authorization" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co/mcp","lazy":true}}}'
+_converge_case "hosted /mcp, no trailing slash, a FOREIGN credential variable" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co/mcp","headers":{"Authorization":"Bearer ${SOME_OTHER_VAR}"},"lazy":true}}}'
+_converge_case "hosted /mcp, no trailing slash, a non-http transport" \
+  '{"mcpServers":{"tortoise":{"type":"sse","url":"https://api.premiselabs.co/mcp","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}}}'
+_converge_case "hosted /mcp/?x=1 with a query string" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co/mcp/?x=1","lazy":true}}}'
+_converge_case "hosted /foo/../mcp/ dot-segment" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co/foo/../mcp/","lazy":true}}}'
+# …and the CONTROL that stops the guard passing by refusing EVERYTHING (the false-block direction: a
+# fresh box would get no graph at all). A correctly-credentialed non-canonical spelling must be
+# NORMALISED and certified, not refused.
+_converge_case "hosted /mcp, no trailing slash, the CORRECT credential (control)" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co/mcp","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"},"lazy":true}}}'
+_converge_case "the SHIPPED template (control)" \
+  "$(cat "$ROOT/templates/.mcp.base.json")"
+_converge_case "a genuine self-host daemon (control)" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"http://localhost:8000/mcp","headers":{"Authorization":"Bearer ${SOME_OTHER_VAR}"}}}}'
+
+# ⛔ A TRAILING ROOT DOT IS THE SAME DNS NAME, AND IT WAS CERTIFIED WITH AN EMPTY BEARER (#3374
+# round 13 P1 — a FALSE PASS). `api.premiselabs.co.` is the FQDN spelling of the hosted host: the
+# client's own parser keeps the dot and DNS resolves it to the same server, so a request there
+# reaches the LIVE hosted endpoint and needs the hosted key. Measured pre-fix:
+# `https://api.premiselabs.co./mcp/` + `_selfHosted: true` + `Bearer ${SOME_OTHER_VAR}` (an EMPTY
+# Bearer — the #3275/#3289 401 this change exists to close) was certified `SELFHOSTED:` rc=0, and
+# with no header at all too. Both directions are asserted: the dotted spelling must not be
+# EXEMPTED, and the dotted spelling carrying a real credential must still certify (same endpoint —
+# a rule that refused the dot outright would be a false block on a working config).
+printf '{"mcpServers":{"tortoise":{"type":"http","url":"http://localhost:8000/mcp","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}}}' > "$TMP/dot-tpl.json"
+for _dot in '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co./mcp/","_selfHosted":true,"headers":{"Authorization":"Bearer ${SOME_OTHER_VAR}"}}}}' \
+            '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co./mcp/","_selfHosted":true}}}'; do
+  printf '%s' "$_dot" > "$TMP/dot-cfg.json"
+  out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$TMP/dot-cfg.json" "$TMP/dot-tpl.json" 2>&1)"
+  rc=$?
+  [ "$rc" -ne 0 ] && ! grep -q SELFHOSTED <<<"$out" \
+    && ok "a trailing ROOT DOT on the hosted host is NOT a self-host exemption — refused '$out'" \
+    || fail "a trailing-dot hosted url was certified '$out' rc=$rc — the empty-Bearer 401 blessed as 'a self-host needs none'"
+done
+printf '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co./mcp/","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}}}' > "$TMP/dot-good.json"
+out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$TMP/dot-good.json" "$TMP/dot-tpl.json" 2>&1)"
+rc=$?
+# the marker reports the CONFIG'S OWN spelling (`shown_url`), so the assertion is on the VERDICT
+# (`OK:` = the hosted branch, credential present) and not on the normalised text it prints.
+[ "$rc" -eq 0 ] && case "$out" in OK:*) true ;; *) false ;; esac \
+  && ok "...while the dotted spelling carrying the REAL credential certifies (same endpoint, not a false block)" \
+  || fail "a correctly-credentialed dotted hosted url was refused '$out' rc=$rc — that is a false block on a working config"
+
+# ⛔ A BACKUP IS A SECOND COPY OF THE CREDENTIAL (#3374 round 13 P2). `copy2` preserved the SOURCE
+# mode, so a 0644 `.mcp.json` — the common case, and the one an operator hand-edits — produced a
+# 0644 `.mcp.json.bak` holding whatever literal credential it had, while `--verify` scans the
+# destination ONLY and certified the layer `OK:`. Measured pre-fix: a `Bearer tt_…` inside an
+# unparseable `.mcp.json` survived into `.bak` at the source's mode beside a green verdict. The
+# merge must not DELETE operator bytes, so the assertion is on the MODE, not on the bytes.
+printf '%s' '{"mcpServers":{"acme":{"headers":{"Authorization":"Bearer tt_AAAABBBBCCCCDDDD"}}},}' > "$TMP/bak-dst.json"
+chmod 644 "$TMP/bak-dst.json"
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$ROOT/templates/.mcp.base.json" "$TMP/bak-dst.json" --cell > "$TMP/bak.out" 2>&1
+rc=$?
+_bakwide="$(python3 -c 'import os,stat,sys
+try: print(stat.S_IMODE(os.stat(sys.argv[1]).st_mode) & 0o077)
+except OSError: print("absent")' "$TMP/bak-dst.json.bak")"
+[ "$rc" -eq 0 ] && [ "$_bakwide" = "0" ] && grep -q 'tt_AAAABBBBCCCCDDDD' "$TMP/bak-dst.json.bak" \
+  && ok "the replaced config's bytes are KEPT in .bak, but the backup is OWNER-ONLY (no group/other bits) — a credential is not widened by being backed up" \
+  || fail "the .bak of a 0644 config kept group/other bits ($_bakwide) — the credential survives in a second, unscanned file"
+
+# ⛔ THE ASSIGNMENT IS WHERE THE PLAINTEXT APPEARS (#3374 round 13 P2). bash traces the SUBSTITUTED
+# VALUE of a plain assignment, so a `bash -x` bring-up printed the resolved key — past every
+# redaction the installer does — into a log that gets pasted into issues fleet-wide. Asserted as
+# DATA on the two functions themselves (hermetic, and it cannot pass by breaking resolution): the
+# sentinel must be ABSENT from the trace, and the value must still resolve to its full length.
+_SENTINEL="tt_SENTINELSENTINELSENTINEL12345"
+printf 'TORTOISE_MCP_API_KEY=%s\n' "$_SENTINEL" > "$TMP/sent-keys.env"
+chmod 600 "$TMP/sent-keys.env"
+{
+  sed -n '/^_no_group_world_write()/,/^}/p' "$INSTALLER"
+  sed -n '/^graph_key_from_env_file()/,/^}/p' "$INSTALLER"
+} > "$TMP/keyfn.sh"
+cat > "$TMP/xtrace.sh" <<'XT'
+#!/usr/bin/env bash
+set -uo pipefail
+KEYFN="$1"; KEYFILE="$2"
+. "$KEYFN"
+set -x
+case $- in *x*) _had_xtrace=1 ;; *) _had_xtrace=0 ;; esac
+set +x
+val="$(graph_key_from_env_file "$KEYFILE" TORTOISE_MCP_API_KEY)"
+if [ "$_had_xtrace" = 1 ]; then set -x; fi
+set +x
+echo "RESOLVED_LEN=${#val}"
+XT
+out="$(bash "$TMP/xtrace.sh" "$TMP/keyfn.sh" "$TMP/sent-keys.env" 2>&1)"
+if grep -qF "$_SENTINEL" <<<"$out"; then
+  fail "a 'bash -x' trace printed the resolved graph key verbatim — the assignment is traced, so every bring-up log can carry the tenant key"
+elif grep -q "RESOLVED_LEN=${#_SENTINEL}" <<<"$out"; then
+  ok "a 'bash -x' run does NOT trace the resolved key, and still RESOLVES it — the guard is not a silent disable"
+else
+  fail "the xtrace arm could not resolve the key at all (got '$(tr '\n' ' ' <<<"$out" | cut -c1-80)') — the arm is vacuous"
+fi
 
 # -------------------------------------------------------------------------
 hdr "syntax"

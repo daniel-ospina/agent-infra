@@ -410,7 +410,17 @@ graph_key_resolve() {
     [ -n "$base" ] || continue
     f="$base/keys.env"
     [ -f "$f" ] || continue
+    # ⛔ THE ASSIGNMENT IS WHERE THE PLAINTEXT APPEARS (#3374 review, round 13 P2). bash's trace
+    # prints `val=<the resolved key>` for a plain assignment, so a `bash -x` bring-up leaked the
+    # tenant key past every redaction this file does — and `bash -x` is not hypothetical here: the
+    # `log_line` note below describes debugging this layer exactly that way, and a bring-up log is
+    # what gets pasted into issues fleet-wide. The gate in `graph_key_from_env_file` is unaffected
+    # (it stats before sourcing and discards its own stderr); only the ASSIGNMENT is traced, so
+    # `set +x` is scoped to the one substitution and restored only if it was on.
+    case $- in *x*) _had_xtrace=1 ;; *) _had_xtrace=0 ;; esac
+    set +x
     val="$(graph_key_from_env_file "$f" "$GRAPH_VAR")"
+    if [ "$_had_xtrace" = 1 ]; then set -x; fi
     GRAPH_KEY_SRC="$f ($GRAPH_VAR)"
     if [ -n "$val" ]; then
       GRAPH_KEY="$val"
@@ -573,7 +583,7 @@ want_url = want_url.strip()
 # `tortoise` entry carries no `url` (the pre-#3374 stdio shape, and any hand-edited/forked template):
 #   cell url `https://api.premiselab.co/mcp/` (one-letter typo) -> `OK:https://api.premiselab.co/mcp/:…` rc=0
 #   cell url `https://evil.example/mcp/`                        -> `OK:https://evil.example/mcp/:…` rc=0
-# `merge-mcp.py:555` already REFUSES this same template (`FATAL: … declares no usable tortoise
+# `merge-mcp.py:807` already REFUSES this same template (`FATAL: … declares no usable tortoise
 # entry`, exit 3), so install and verify DISAGREED about one file; this converges them in the safe
 # direction — a template that cannot establish the default certifies NOTHING, it never certifies
 # everything. Named, so the operator is told which file is the broken one.
@@ -922,6 +932,16 @@ def _endpoint_key(u):
     if not m:
         return s                       # an unparseable url compares by its own bytes
     scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    # ⛔ A TRAILING ROOT DOT IS THE SAME DNS NAME (#3374 review, round 13 P1 — MUST MATCH
+    # `merge-mcp.py`, which carries the full rationale and the measurement). `api.premiselabs.co.`
+    # is the FQDN spelling of the hosted host: the client's parser keeps the dot and DNS resolves it
+    # to the same server, so a request there reaches the LIVE hosted endpoint and needs the hosted
+    # key. Measured before this rule: `https://api.premiselabs.co./mcp/` plus `_selfHosted: true`
+    # and `Bearer ${SOME_OTHER_VAR}` was certified `SELFHOSTED:` rc=0 — the empty-Bearer 401 this
+    # change exists to close, blessed as "a self-hosted daemon needs none". Stripping the root dot
+    # narrows NO exemption: a genuine self-host is a different HOST, and `:8443` stays distinct.
+    if host.endswith("."):
+        host = host[:-1]
     # ⛔ USERINFO FORCES THE KEY TO DIFFER — never let a spoof url key to the hosted endpoint by
     # DROPPING it (MUST MATCH `merge-mcp.py`). Otherwise `https://user:pw@api.premiselabs.co/mcp/`
     # takes the hosted path and skips the arm that refuses userinfo outright.
@@ -1707,6 +1727,12 @@ def key(u):
     if not m:
         return s
     scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    # ⛔ A TRAILING ROOT DOT IS THE SAME DNS NAME (#3374 review, round 13 P1 — MUST MATCH
+    # `_endpoint_key` above and `merge-mcp.py`). `api.premiselabs.co.` IS the hosted host, so this
+    # key must not separate it from the canonical spelling; without it, `merge_tortoise_is_hosted`
+    # would report a correctly-installed hosted cell as "NOT the hosted default".
+    if host.endswith("."):
+        host = host[:-1]
     # ⛔ USERINFO FORCES THE KEY TO DIFFER — never let a spoof url key to the hosted endpoint by
     # DROPPING it (MUST MATCH `merge-mcp.py`). Otherwise `https://user:pw@api.premiselabs.co/mcp/`
     # takes the hosted path and skips the arm that refuses userinfo outright.
