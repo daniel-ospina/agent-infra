@@ -142,6 +142,18 @@ function cmdpos(pre,   p) {
   if (p ~ /(^|[;&|({})])[ \t"']*printf[ \t]+-v$/) return 1
   return 0
 }
+function forkw(p,   q) {
+  # ⛔ A LOOP KEYWORD IS AN ASSIGNMENT ONLY IN COMMAND POSITION (review round 3, P2 — measured). The
+  # first cut tested `(^|[ \t;&|({])(for|select)$`, whose space alternative makes ANY word `for`
+  # qualify: `echo for AGENT_MEM_GATE in 81` claimed a `foreign` 81 for a phrase bash never executes
+  # as a loop, while the same sentence QUOTED stayed silent — punctuation deciding a verdict, the
+  # defect this file criticises elsewhere. Template it on `cmdpos` instead: strip the keyword, then
+  # the prefix must end at start-of-command (a separator or nothing), never merely at a space.
+  q = p
+  gsub(/[ \t"']+$/, "", q)
+  if (!sub(/(for|select)$/, "", q)) return 0
+  return (q ~ /(^|[;&|({})])[ \t"']*$/)
+}
 # The value: everything up to the first character that can end it (`X=$y`, `X=83;`, `X=83 # note`,
 # `${X:-83}`), or up to the matching quote when the operand is QUOTED (`${X:-"81"}`, `X='83'`). The
 # quoted form is not decoration: cutting at the leading quote turned `${X:-"81"}` into an EMPTY value,
@@ -240,7 +252,22 @@ function codeval(t,   v, i) {
 # ignored. The subscript test is anchored at the OPERATOR being GLUED TO THE `]`: `X[0]=83` is an
 # assignment, `X[0] =83` is not (`bash: X[0]: command not found`) and `[ $X[0] = 83 ]` is a
 # comparison, so the operator's position — not the presence of a quote — is what separates them.
-function residual(pre, tail, s, name, f, ln,   p, t2, v) {
+function decl_operand(p,   q) {
+  # ⛔ A DECLARATION BUILTIN WRITES EVERY OPERAND, NOT JUST THE FIRST (review round 3, P2 — measured).
+  # `cmdpos` recognises only the operand IMMEDIATELY after `export`/`local`/`declare`/`readonly`/
+  # `typeset`, so every later one was skipped in silence by the foreign net: `export AGENT_DEBUG=1
+  # AGENT_MEM_GATE=81` produced no row and a GREEN verdict, while the same code in the FIRST slot
+  # (`export AGENT_MEM_GATE=81 E1=1`) was caught — position deciding a verdict. The family net never
+  # had the gap. Multi-operand `local` is house style, so a code landing in a later slot is a
+  # realistic edit. Strip trailing simple `WORD=value` operands; what remains must END at the builtin.
+  q = p
+  gsub(/[ \t"']+$/, "", q)
+  while (q ~ /[ \t][A-Za-z_][A-Za-z0-9_]*=[^ \t]*$/) {
+    sub(/[ \t][A-Za-z_][A-Za-z0-9_]*=[^ \t]*$/, "", q)
+  }
+  return (q ~ /(^|[;&|({})])[ \t"']*(export|local|declare|readonly|typeset)([ \t]+-[A-Za-z]+)*$/)
+}
+function residual(pre, tail, s, name, f, ln,   p, t2, v, _r) {
   # ⛔ A SUBSCRIPT MAY CONTAIN BRACKETS OF ITS OWN (`X[a[0]]=83`) — `[^]]*` stopped at the INNER `]`,
   # matched no arm, and the form read GREEN with 0 rows (review of PR #3237, finding 2, measured).
   # Scan to the ASSIGNMENT instead of to the first bracket. A COMPARISON on an element still stays
@@ -272,16 +299,31 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v) {
   # chain saw no `=` and this residual arm matched none of its shapes, so the line produced NO ROW
   # and the verdict stayed GREEN over a real duplicate of the skew code. It is NOT covered by the
   # STATED LIMIT above: that scopes out a token with "NO assignment operator AND NO ASSIGNMENT BUILTIN
-  # writing it", and a loop binding is a write. Claimed from `in`; anything that is not one readable
-  # literal (a multi-value list, a computed operand) is REFUSED rather than silently claimed, which
-  # is this arm's standing rule. Gated on the keyword in COMMAND position so an ordinary argument
-  # that merely contains the token stays silent.
-  if (p ~ /(^|[ \t;&|({])(for|select)$/ && tail ~ /^[ \t]+in[ \t]/) {
+  # writing it", and a loop binding is a write. The keyword must be in COMMAND position (`forkw`), so
+  # an ordinary argument that merely CONTAINS the token stays silent — measured: `echo for
+  # AGENT_MEM_GATE in 81` binds nothing and must not claim one.
+  if (forkw(p) && tail ~ /^[ \t]+in[ \t]/) {
     t2 = tail
     sub(/^[ \t]+in[ \t]+/, "", t2)
     v = valof(t2)
-    if (t2 ~ /^[0-9]+[ \t]*([;&]|$)/ && v != "") row("claim", name, v, f, ln)
-    else                                        print "unparseable", name, s, f, ln
+    # ONE literal operand, QUOTED OR BARE. The first cut required a bare `[0-9]+`, so `for X in "83"`
+    # — which binds 83 exactly like the bare form — was `unparseable` instead of a COLLIDING claim:
+    # red, but never NAMING the duplicate, which is the property this check exists for. Strip what
+    # `valof` read and require a terminator next, so a multi-value list is still REFUSED (the loop
+    # variable does not durably hold one code).
+    _r = t2
+    sub(/^["']/, "", _r)
+    _r = substr(_r, length(v) + 1)
+    if (iscode(v) && _r ~ /^["']?[ \t]*([;&]|$)/) row("claim", name, v, f, ln)
+    else                                          print "unparseable", name, s, f, ln
+    return
+  }
+  # ⛔ THE OPERAND MAY BE ON THE NEXT PHYSICAL LINE. `for X` + newline + `in 83; do …; done` is legal
+  # bash and needs NO backslash, so the continuation join never sees it (measured: it binds 83 while
+  # the scanner emitted no row and stayed GREEN). An unreadable operand here is REFUSED, never
+  # dropped — the same rule the backslash spelling is already held to.
+  if (forkw(p) && tail ~ /^[ \t]*$/) {
+    print "unparseable", name, s, f, ln
     return
   }
   if (p ~ /(^|[ \t;&|({])printf[ \t]+-v$/) {
@@ -540,9 +582,16 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
   # old regex reddened `X=81abc` as `foreign 81`; that was a side effect of its `([^0-9]|$)`
   # terminator, not a code claim.
   _fr = scan
+  _off = 0
   while (match(_fr, /[A-Z_][A-Z0-9_]*/)) {
     _nm  = substr(_fr, RSTART, RLENGTH)
-    _p   = substr(_fr, 1, RSTART - 1)
+    # ⛔ THE PREFIX MUST BE ABSOLUTE, NOT LOCAL TO THE REMAINDER (review round 4, measured). `_p`
+    # relative to the CURRENT `_fr` is the whole line only for the FIRST name; for a later one it is
+    # the text since the previous name (`=1 ` in `export A=1 B=81`), which no position test can
+    # recognise — so the multi-operand arm below could never fire. The offset makes every name be
+    # judged against the line as written.
+    _p   = substr(scan, 1, _off + RSTART - 1)
+    _off = _off + RSTART + RLENGTH - 1
     _fr  = substr(_fr, RSTART + RLENGTH)
     # ⛔ THE SKIP MUST BE THE *SAME* TEST THE CLAIM SCAN USES (review cycle 2, P2). A bare suffix test
     # (`/_(REFUSED|…)$/`) skipped `_REFUSED` itself, while the claim scan's pattern requires a
@@ -550,16 +599,22 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
     # `_REFUSED=81` → 0 rows, verdict GREEN (bash: `_REFUSED=81; exit "$_REFUSED"` → 81). One
     # population, one predicate.
     if (_nm ~ /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) continue
-    if (_p ~ /(^|[ \t;&|({])(for|select)[ \t]*$/ && _fr ~ /^[ \t]+in[ \t]/) {
+    if (forkw(_p) && _fr ~ /^[ \t]+in[ \t]/) {
       # ⛔ THE FOREIGN NET WAS BLIND TO THE SAME SHAPE (review round 3, P2 — measured): the loop
       # binding carries no `=`, and `cmdpos("for ")` is false, so `for AGENT_MEM_GATE in 81` emitted
       # no row at all — the same code declared under a name outside the family, invisible. Read the
-      # operand from `in`, so the two nets see one population.
+      # operand from `in`, so the two nets see one population. ONE literal only: a LIST
+      # (`for N in 83 84`) does not durably hold a single code and must not be read as a declaration
+      # of its first element (that was a false RED, measured).
       _t3 = _fr
       sub(/^[ \t]+in[ \t]+/, "", _t3)
-      _vv = codeval(_t3)
+      _t4 = valof(_t3)
+      _t5 = _t3
+      sub(/^["']/, "", _t5)
+      _t5 = substr(_t5, length(_t4) + 1)
+      if (iscode(_t4) && _t5 ~ /^["']?[ \t]*([;&]|$)/) _vv = _t4
     } else {
-      if (!cmdpos(_p)) continue
+      if (!cmdpos(_p) && !decl_operand(_p)) continue
       _vv = codeval(_fr)
     }
     if (_vv != "") print "foreign", _nm, _vv + 0, f, LN
@@ -2770,6 +2825,50 @@ for _loopshape in for select; do
   case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
   ck "(loop/$_loopshape) a \`$_loopshape\` LOOP VARIABLE outside the family is a \`foreign\` row — the foreign net was blind for the same reason (rc=$CODE_RC; $CODE_MSG)" $rc
 done
+
+# (d4) THE FOUR SHAPES AROUND THE LOOP ARM (review round 3, P2 — each measured). Every one of these
+# failed before this round: the first two dropped a REAL declaration in silence, the last two are the
+# CONTROLS that keep the fix from becoming the over-claim it replaced (a word `for` in an ordinary
+# argument is not a loop, and a multi-value list does not durably hold one code).
+_codemut_dir="$(_codemut loop-newline)"
+printf '\nfor AGENT_NEW_GATE_REFUSED\nin 83; do echo x; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"rejected: unparseable declaration: spawn-gate.sh:"*) rc=0 ;; *) rc=1 ;; esac
+ck "(loop/newline) a \`for\` header SPLIT across two physical lines is REFUSED, not dropped — bash binds it and needs no backslash (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut loop-quoted)"
+printf '\nfor AGENT_NEW_GATE_REFUSED in "83"; do echo x; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(loop/quoted) a QUOTED literal operand binds the same 83 and COLLIDES by NAME — not merely 'unparseable', which would red without naming the duplicate (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut loop-not-a-loop)"
+printf '\necho for AGENT_MEM_GATE in 81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign:"*|*"rejected:"*) rc=1 ;; *) rc=0 ;; esac
+ck "(loop/not-a-loop) a word \`for\` inside an ORDINARY ARGUMENT is SILENT — bash binds nothing there, and claiming it is the over-claim the space-inclusive match produced (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut loop-list)"
+printf '\nfor AGENT_MEM_GATE in 83 84; do echo x; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(loop/list) a MULTI-VALUE list is not a declaration of its first element — no \`foreign\` row, which would be a false RED (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d5) EVERY OPERAND OF A DECLARATION BUILTIN IS A DECLARATION (review round 3, P2 — measured).
+# `cmdpos` recognises only the operand immediately after the builtin, so a code in a LATER slot was
+# skipped in silence: `export AGENT_DEBUG=1 AGENT_MEM_GATE=81` read GREEN while the same code in the
+# FIRST slot was caught. Multi-operand `local` is house style, so this is a realistic edit.
+_codemut_dir="$(_codemut decl-second-operand)"
+printf '\nexport AGENT_DEBUG=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
+ck "(decl/second-operand) a code in the SECOND operand of \`export\` is still a \`foreign\` row — position must not decide the verdict (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut decl-not-builtin)"
+printf '\necho AGENT_DEBUG=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(decl/not-builtin) the same text after \`echo\` is SILENT — the multi-operand rule is scoped to declaration builtins, not to any command (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # (e) FINDING 1, the root case: a population the scan CANNOT READ. ⛔ This is NOT the `claims=0`
 # branch: with an empty directory the glob does not expand, awk cannot open the literal `*.sh`, and
