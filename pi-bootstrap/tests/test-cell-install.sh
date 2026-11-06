@@ -2245,11 +2245,23 @@ done
 # `idna` — the stdlib-only branch declines non-ASCII, so a refused spoof looks the same whether the
 # mapping rule ran or not. `münchen` must CERTIFY, and only the real mapping can certify it, so a
 # runner without `idna` REDS here instead of silently testing a rule it never executed.
+# ⛔ AND THE UTS46 **`mapped`** CLASS — a compatibility DECOMPOSITION, which is the same character and
+# therefore the SAME HOST (#3572 review P1, ANSWERED here rather than obeyed). `a\ufb00b` is mapped by
+# UTS46 to `affb`, so neither side of the identity comparison is a fixed point — exactly like `MÜNCHEN`
+# — and the host the client dials IS the host this name denotes, because the mapping is a Unicode
+# compatibility decomposition (~NFKD) and not a substitution. So it belongs on the CERTIFY side.
+# ⛔ THIS ARM IS THE MUTANT-PIN FOR `casefold` vs `lower`, and the reason not to "tighten" it: the
+# suggested fix of comparing case-ONLY (`lower`) REFUSES this spelling, i.e. re-introduces the false
+# block on a legitimate IDN that the rule exists to remove — measured on this box, `_label_ok('a\ufb00b')`
+# is True under `casefold` and False under `lower`. Measured over all of Unicode: 0 of the UTS46
+# DELETIONS are erased by `casefold`, and every one of the 1097 non-case renames it hides satisfies
+# `NFKD(ch) == uts46_remap(ch)`. So the deleting class still cannot hide, and this spelling must stay.
 for _good in 'https://localhost:8000/mcp' 'http://localhost:8000/mcp' \
              'https://127.0.0.1:8000/mcp' 'http://[::1]:8000/mcp' \
              'https://myhost.example./mcp/' 'https://my_host:8000/mcp' \
              'https://host:/mcp/' 'https://münchen.example/mcp/' \
              'https://MÜNCHEN.example/mcp/' "https://mu$(printf '\u0308')nchen.example/mcp/" \
+             "https://a$(printf '\ufb00')b.example/mcp/" \
              'https://xn--mnchen-3ya.example/mcp/' 'https://api.premiselabs.co:8443/mcp/'; do
   python3 - "$DEST/.mcp.json" "$_good" <<'PY'
 import json, sys

@@ -927,13 +927,28 @@ except ImportError:                           # pragma: no cover — stdlib-only
 
 
 def _dns_identity(label):
-    """The label as DNS compares it: NFC-composed and case-folded.
+    """The label as DNS compares it: NFC-composed, then case-folded to its canonical form.
 
     The unit of the spoof rule in `_label_ok`. Two spellings are the SAME host when they are
-    canonically equivalent and differ only in case (`MÜNCHEN` / `münchen` / `mu\u0308nchen`) and a
-    DIFFERENT host when the client's mapping deletes or introduces a code point (`co\xad` -> `co`).
-    NFC here rather than the NFKC of the dot check: NFKC folds `ﬁ` to `fi`, which would let a
-    compatibility rewrite hide a deletion.
+    Unicode-equivalent apart from case — `MÜNCHEN` / `münchen` / `mu\u0308nchen`, and also
+    `a\ufb00b` / `affb`, which UTS46 maps as a compatibility DECOMPOSITION — and a DIFFERENT host
+    when the client's mapping DELETES a code point (`co\xad` -> `co`) or introduces a separator
+    (`co\u3002evil` -> `co.evil`, caught earlier by the NFKC/dot check).
+
+    ⛔ WHY `casefold` AND NOT `lower`. `casefold` is FULL case folding, so it also absorbs the
+    compatibility renames UTS46 itself performs (`ﬁ` -> `fi`, `ſ` -> `s`, `µ` -> `μ`). That is
+    deliberate, not an oversight, and it is the whole point: the rule asks "is this the same
+    HOST", and a UTS46 compatibility decomposition is the same character by Unicode's definition,
+    not a substitution. Narrowing this to `lower` would REFUSE `a\ufb00b` / `affb` — i.e.
+    re-introduce the false block on legitimate IDNs that this rule exists to remove.
+
+    Measured over all 0x110000 code points, so the justification above is a number and not a
+    belief: UTS46 renames 6465 of them to a non-empty string, 2531 of those are invisible to this
+    predicate (1241 `Lu` + 27 `Lt` + 166 `Ll` case, plus 1097 non-case of which EVERY ONE satisfies
+    `NFKD(ch) == uts46_remap(ch)`, i.e. a compatibility decomposition rather than a substitution),
+    and **0 of the UTS46 DELETIONS are erased by `casefold`** — so the deleting class this rule
+    exists to catch can never hide here. (Earlier text claimed NFC-not-NFKC avoided the `ﬁ` fold;
+    that was false, `casefold` performs it too. The fold is intended; the claim was not.)
     """
     return unicodedata.normalize("NFC", label).casefold()
 
