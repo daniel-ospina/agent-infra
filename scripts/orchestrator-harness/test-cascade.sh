@@ -25,6 +25,8 @@
 #  11  THE PYRAMID: levels 1-5, filled top-down, and 1-4 hold the room           → mutants: M11-M13
 #  12  level 1 is fed by MAIN's own check-runs, and UNMEASURED is NOT red       → mutants: M13, M14
 #  13  level 4 is a LOOP: a fix moves the head, and the next pass reviews again → (drives review_disp_decide)
+#  14  the escape VALVE: a level holding the room still QUEUES, and cannot record what it cannot spend
+#                                                                              → mutant: M19
 #
 # ⛔ EVERY FUNCTION UNDER TEST IS EXTRACTED FROM THE SHIPPED SCRIPT, never re-implemented here: a
 # mirror would grade itself. Every mutation is applied to a COPY of the shipped file and the SAME
@@ -386,6 +388,8 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
   printf '%s\n' "$6" > "$w/state/last-open-prs"
   : > "$w/state/prclass.tsv"
   [ -n "${7:-}" ] && [ "${7}" != "-" ] && printf '%s' "$7" > "$w/state/prclass.tsv"
+  # <main-verdict> models MAIN's own recorded verdict, which `cascade_level` reads to reach level 1.
+  [ -n "${9:-}" ] && printf '%s\n' "$9" > "$w/state/main-verdict"
   ( O="$w"; LOG=/dev/null; UPN_WORK="$1"; UPN="$1"; SEL_TOTAL=15; OPEN_N=15; WORKERS=0
     LANES="$2"; LANES_DISPLAY="$2"; MAX_LANES="$3"; SEL_PARKED=0; TEST_CAN_SPAWN="$5"
     : > "$w/candidates.txt"; _i=0
@@ -421,6 +425,22 @@ ck "a BUSY PR (owned) is not a level — it does not hold the room" \
 ck "…while the SAME work UN-owned holds it (the pair is the discriminator)" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
 ' -)" "0 1 0 3"
+
+# ⛔ THE STATE THAT DECIDES THE WHOLE FLEET TODAY, PINNED (review P1, fix round): a RED MAIN on a box
+# with FREE ROOM. Level 1 holds the room, so the issue path is closed — and it must be the LEVEL holding
+# it, not a full box: `lanes=2` of `max=25` here, so an implementation that keyed on the room alone would
+# dispatch issue work into a red main. The reviewer's OTHER half — "level 1 has no actor" — is NOT
+# decided by this assertion and must not be: what level 1 DOES when it holds (dispatch a main-fix, or
+# narrow its input to what the rail itself measures) is an owner decision, and nothing here pre-empts it.
+# What IS pinned is that this state is not a DEADLOCK: 14e drives the SAME `room > 0 / slots == 0` shape
+# and shows the drain escape really GRANTS a slot, so a main that stays red while the PR path produces
+# nothing re-opens the issue path instead of closing it for ever.
+ck "a RED MAIN on a box with FREE ROOM is level 1 and CLOSES the issue path (an issue must NOT be dispatched)" \
+   "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
+' - 'RED:verify')" "0 1 0 1"
+ck "…and it is the LEVEL holding it, not a FULL box (23 lanes are free, so the poll is not armed)" \
+   "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
+' - 'RED:verify' | cut -d' ' -f3)" "0"
 
 # ── 12. LEVEL 1 IS FED BY MAIN'S OWN CHECK-RUNS ─────────────────────────────────────────────────
 # ⛔ AN UNFED LEVEL IS DECORATION. These arms drive `cascade_main_probe` against a stub `gh` and pin
@@ -549,6 +569,68 @@ ck "no baseline -> it still SPENDS the interval (returning 1 without sleeping is
 # lanes idle. Withholding on the slots disabled the valve exactly where it exists (a merge ceiling
 # that keeps refusing), and printed a cause ("NO ROOM … under MAX_LANES/mem/load") that is false.
 ckin "…withheld only when the ROOM is exhausted" "$SRC" 'if [ "${CASCADE_ROOM:-1}" -le 0 ] 2>/dev/null; then'
+
+ echo "=== 14e. the PAIR: a level HOLDS the room while the escape is open — the escape must QUEUE ==="
+# ⛔ P1 (fix round). 14c proved the escape is withheld only on NO ROOM; section 11 proved that a
+# higher level HOLDS the room. The two were never DRIVEN TOGETHER, so nothing graded the state the
+# valve actually exists for: `CASCADE_ROOM > 0` (there is a slot to give) with `CASCADE_ISSUE_SLOTS = 0`
+# (a level is holding it). Driving the shipped block in that state found the escape recording
+# `issue=OPENED-BY-ESCAPE`, printing "issue path OPEN this cycle" and resetting the inert-path streak
+# over a batch whose FIRST statement (`[ "${CASCADE_ISSUE_SLOTS-1}" -ge 1 ] || break`) is guaranteed
+# to break — zero issues queued, and the measured evidence of the stall destroyed by a pass that did
+# nothing. Pre-change the same escape really DID dispatch (it was capped by `BATCH`), so that is a
+# REGRESSION in precisely the state a refusing merge ceiling leaves behind (level 4's review loop).
+# So the escape GRANTS the slots it spends. These arms drive the grant, its ROOM bound, and both
+# stand-downs; M19 removes the grant and must redden them.
+PLMOD="$HERE/pr-owner-liveness.sh"
+[ -f "$PLMOD" ] || { echo "❌ $PLMOD not found"; exit 1; }
+. "$PLMOD"
+ESCBLK="$TMP/escape-blk.sh"
+awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(f) exit}' "$ORCH" > "$ESCBLK"
+ck "the [drain-escape] block was FOUND in orch-loop.sh (a marker rename would otherwise skip 14e)" \
+   "$([ -s "$ESCBLK" ] && grep -q 'pl_escape_open' "$ESCBLK" && echo yes || echo no)" "yes"
+ck "…and it carries the SLOT GRANT (the fix; without it the escape records what it cannot spend)" \
+   "$(grep -q 'DRAIN ESCAPE GRANTS' "$ESCBLK" && echo yes || echo no)" "yes"
+# The block is shipped shell, so it must PARSE before it is driven: a stray `fi` would abort the
+# source midway, the assertions would read the fixture's own pre-set values, and a broken block would
+# grade GREEN — the same false PASS `pr-owner-liveness.test.sh` records for its own drive.
+bash -n "$ESCBLK" 2>/dev/null || bad "the extracted [drain-escape] block is not valid shell — the drive would abort midway"
+
+esc_pair() { # <id> <room> <slots> <unread> [<batch>] -> "<slots> <record|none>"
+  # ⛔ THE FIXTURE DIRECTORY IS DERIVED FROM `$TMP`, NOT FROM A POSITIONAL ARG. The main-worktree-guard
+  # refuses any `rm -rf` whose target it cannot resolve statically (a `$1`-derived path reads as a
+  # possible WHOLE-TREE discard and fails closed, #709), and that refusal lands on the SUITE, not on the
+  # fixture — the whole file becomes unrunnable. `$TMP/ep-<id>` is resolvable, so the discard is
+  # statically visible and the suite stays executable.
+  local d="$TMP/ep-$1" room="$2" slots="$3" unread="$4" batch="${5:-2}"
+  rm -rf "$d"; mkdir -p "$d/state"
+  # Prime the inert-path streak at the bound, so `pl_escape_open` answers YES on the shipped predicate
+  # rather than on a fixture that never got there.
+  pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
+  pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
+  ( set +e
+    # `O` is the PARENT of the state dir: the shipped block addresses `$O/state/...`, and a fixture
+    # that pointed the two at different directories would drive a block reading an EMPTY state dir.
+    O="$d"; LOG="$d/state/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
+    DRAIN_ESCAPE_PASSES=2; GATE_WHY="GW_SENTINEL"; LANES_DISPLAY=2; MAX_LANES=7
+    CASCADE_ROOM="$room"; CASCADE_ISSUE_SLOTS="$slots"; CASCADE_UPN_UNREADABLE="$unread"
+    BATCH="$batch"
+    . "$ESCBLK"
+    printf '%s %s\n' "${CASCADE_ISSUE_SLOTS:-unset}" \
+      "$( [ -s "$d/state/drain-escape" ] && echo record || echo none )" ) 2>/dev/null
+}
+ck "level HOLDS the room (room=5, slots=0) -> the escape GRANTS BATCH slots and RECORDS" \
+   "$(esc_pair 1 5 0 0 2)" "2 record"
+ck "…and the grant is LOGGED, naming the slots it spends" \
+   "$(grep -q 'DRAIN ESCAPE GRANTS 2 issue slot' "$TMP/ep-1/state/log" 2>/dev/null && echo yes || echo no)" "yes"
+ck "…bounded by the ROOM it proved: room=1 grants 1, never BATCH" \
+   "$(esc_pair 2 1 0 0 2)" "1 record"
+ck "a cascade that ALREADY granted 3 is not re-granted upward" \
+   "$(esc_pair 3 5 3 0 2)" "3 record"
+ck "NO ROOM still withholds the escape (cycle 2's ruling is KEPT, not reverted)" \
+   "$(esc_pair 4 0 0 0 2)" "0 none"
+ck "an UNREADABLE un-owned count withholds instead of spending a slot (fail-closed kept)" \
+   "$(esc_pair 5 5 0 1 2)" "0 none"
 
  echo "=== 14d. the funnel names WHICH of the three states deferred it ==="
 # ⛔ P2 (review cycle 2): one boolean, three causes, one sentence. `holds` and `unreadable` must not
@@ -794,6 +876,29 @@ grep -q 'cascade_wait $(( 10#${CYC} - JIT + RANDOM % (2 \* JIT + 1) )) "${LANES:
 PEOF
 mut "M18 the call site drops the baseline again (the interval is never spent)" \
     's/ "${LANES:-}" || true/ || true/' "$TMP/p-call.sh"
+
+cat > "$TMP/p-pair.sh" <<'PEOF'
+# THE PAIR, DRIVEN (fix round, P1): room to give + a level HOLDING the slots + the escape open.
+# The shipped block must GRANT a slot and QUEUE; the pre-fix shape opened the path, recorded
+# `issue=OPENED-BY-ESCAPE` and queued nothing. The block is extracted from `$TGT`, so the mutant is
+# graded on its OWN text rather than on a mirror.
+. "$ORCH_FNS"; . "$STUB"; . "$MODP"
+d="$FIX/e-pair"; rm -rf "$d"; mkdir -p "$d/state"
+pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
+pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
+awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(f) exit}' "$TGT" > "$FIX/pair-blk.sh"
+( set +e
+  O="$d"; LOG="$d/state/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
+  DRAIN_ESCAPE_PASSES=2; GATE_WHY="GW_SENTINEL"; LANES_DISPLAY=2; MAX_LANES=7
+  CASCADE_ROOM=5; CASCADE_ISSUE_SLOTS=0; CASCADE_UPN_UNREADABLE=0; BATCH=2
+  . "$FIX/pair-blk.sh"
+  [ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] && [ -s "$d/state/drain-escape" ] && echo yes || echo no ) 2>/dev/null
+PEOF
+# `mut` passes a fixed environment, so the module path travels as an EXPORTED var (the mutant copy
+# lives in $TMP and has no sibling module beside it).
+export MODP="$HERE/pr-owner-liveness.sh"
+mut "M19 the escape opens the issue path WITHOUT granting the slots it spends (the level-holds no-op restored)" \
+    's/^    if \[ "${CASCADE_ROOM:-1}" -ge 1 \] 2>\/dev\/null && \[ "${CASCADE_UPN_UNREADABLE:-0}" = "0" \] && \[ "${CASCADE_ISSUE_SLOTS:-1}" -le 0 \] 2>\/dev\/null; then$/    if false; then/' "$TMP/p-pair.sh"
 
 # ── 10. THE OVERRIDE IS RECORDED, NOT SILENT ───────────────────────────────────────────────────
 echo

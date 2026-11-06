@@ -3237,8 +3237,18 @@ cascade_level() {
   # the gates said. It is printed as `?`, never as level 5.
   [ -n "${list// /}" ] || return 0
   # ONE pass over the class file into a lookup STRING (` pr:head:class `), then one pass over the
-  # listing. Pure `case` matching, so a 70-PR box pays no fork for the join — the loop's fork
-  # headroom is itself a dispatch gate (agent-infra#2293), so this must not add one per PR per cycle.
+  # listing, where the LEVEL decision itself is pure `case` matching — so the JOIN costs no fork.
+  # ⛔ STATED RESIDUAL, NOT A CLAIM OF ZERO FORK (review P2, fix round). The loop below still calls
+  # `pr_owned` ONCE PER UN-OWNED PR, and `pr_owned` falls through to `claim_foreign_live` (a fork) on
+  # the widened predicate — so this walk DOES pay a fork per un-owned PR, and on a box with room it
+  # re-walks the ownership `unowned_scan` already measured this very cycle (its answer is already in
+  # `UPN_WORK`). The comment here used to claim "pure `case` matching … must not add one per PR per
+  # cycle": true of the class-file join, FALSE of the walk around it, and a future reader must not
+  # size the fork budget from it. Bounded (once per cycle, and only when the cascade runs at all,
+  # i.e. `slots > 0`), which is why it is a residual and not a defect repaired here: memoising would
+  # introduce a SECOND ownership predicate, the one thing this change must not add. `test-cascade.sh`
+  # stubs `pr_owned` in `drive_block`/`drive_level`, so the suite cannot grade this cost.
+  # The loop's fork headroom is itself a dispatch gate (agent-infra#2293).
   # ⛔ EVERY FIELD IS SANITISED BEFORE IT ENTERS THE STRING: the head must look like a git object id
   # and the class must be one of the four the sweep writes, so a crafted row cannot forge a token
   # that matches some other PR (the same hardening `disp()` applies to its own record).
@@ -7332,8 +7342,39 @@ PY
     # `CASCADE_ROOM` is the same arithmetic the allocator uses, derived in the cascade block above.
     # An UNSET `CASCADE_ROOM` means an older caller/driver rig that does not compute the cascade, and
     # that case keeps the pre-change behaviour (escape fires) — the same rule as `${SLOTS-1}`.
+    # ⛔ THE ROOM IS NOT THE GRANT, AND THE GRANT IS WHAT THE BATCH SPENDS (fix round, P1 — measured).
+    # `CASCADE_ROOM` answers "does a slot exist"; it does NOT answer "did this pass give the issue path
+    # one". A pyramid level HOLDING the room sets `CASCADE_ISSUE_SLOTS=0` while `CASCADE_ROOM > 0` (the
+    # allocator block above), so keying the withhold on the room ALONE let this escape take the else
+    # branch, print "issue path OPEN this cycle", write `issue=OPENED-BY-ESCAPE`, and reset the
+    # inert-path streak — over a batch whose FIRST statement (`[ "${CASCADE_ISSUE_SLOTS-1}" -ge 1 ] ||
+    # break`) is guaranteed to break, so ZERO issues were queued and the measured evidence of the stall
+    # was destroyed by a pass that did nothing. Pre-change that same escape really DID dispatch (it was
+    # capped by `BATCH`), so in the level-holds state this is a REGRESSION against main — and
+    # level-holds is precisely the state the valve exists for (review cycle 2's P1: a merge ceiling that
+    # keeps refusing leaves a level holding pass after pass). So the escape GRANTS what it needs rather
+    # than announcing an action it cannot take: bounded by the room it just proved AND by `BATCH` (the
+    # batch's own sizing input), never more, and never past a slot the box does not have.
+    # The withhold still keys on the ROOM (cycle 2's ruling is kept) and additionally stands down on
+    # `CASCADE_UPN_UNREADABLE`, because an unreadable count must never be the condition that dispatches
+    # new work — the allocator's own fail-closed rule (`CASCADE_UPN_UNREADABLE=1;
+    # CASCADE_ISSUE_SLOTS=0` above). An UNSET `CASCADE_ISSUE_SLOTS` is a driver rig/older caller and is
+    # left alone, the same terse-minus rule the batch guard one place down uses.
+    if [ "${CASCADE_ROOM:-1}" -ge 1 ] 2>/dev/null && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_ISSUE_SLOTS:-1}" -le 0 ] 2>/dev/null; then
+      _egrant="${BATCH:-2}"
+      is_num "${_egrant:-}" && [ "${_egrant:-0}" -ge 1 ] 2>/dev/null || _egrant=2
+      [ "${_egrant:-0}" -le "${CASCADE_ROOM:-0}" ] 2>/dev/null || _egrant="${CASCADE_ROOM:-0}"
+      CASCADE_ISSUE_SLOTS="$_egrant"
+      echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — a level was HOLDING the room (issue slots=0) while ${CASCADE_ROOM} lane(s) were free, so the escape is given the slots it spends instead of opening a path with nothing to queue into" >> "$LOG"
+    fi
     if [ "${CASCADE_ROOM:-1}" -le 0 ] 2>/dev/null; then
       echo "[dispatch] DRAIN ESCAPE WITHHELD — the PR path is inert and the box has NO ROOM (lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?}, issue slots=0), so opening the issue path would dispatch nothing. No escape is taken and no record is written; the cascade opens the issue path by itself the moment a slot frees (owner ruling 2026-11-04)." >> "$LOG"
+    elif [ "${CASCADE_ISSUE_SLOTS:-1}" -lt 1 ] 2>/dev/null; then
+      # The ONLY state that reaches here with no slot is an UNREADABLE un-owned count: the grant above
+      # refuses to spend a slot on a measurement that did not answer, and recording the escape anyway
+      # would be the same false promise one branch over. Named as its own cause, because "NO ROOM" is
+      # false here (there IS room — the count is what could not be read).
+      echo "[dispatch] DRAIN ESCAPE WITHHELD — the un-owned PR count could not be read (CASCADE_UPN_UNREADABLE=1), so no issue slot is granted and opening the issue path would dispatch nothing. No escape is taken and no record is written; an unreadable count must never be the condition that dispatches new work." >> "$LOG"
     else
     printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
     if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
