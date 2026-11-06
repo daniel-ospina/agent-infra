@@ -1443,6 +1443,20 @@ run_pass_unit() {
     [ -z "${FARM_CHECKER_P:-}" ] || e+=( HARNESS_APPLY_FARM_CHECKER="$FARM_CHECKER_P" )
     env -i "${e[@]}" bash "${PASS_UNDER_TEST:-$PASS_SH}" "$@"
 }
+# ⛔ NAMED RESIDUAL — WHAT THIS ARM CANNOT SEPARATE (review finding, P2, 2026-11-06). Of the six
+# values the pass forwards, only CELL_HOME / HARNESS_REPO / HARNESS_REF are INDEPENDENTLY
+# load-bearing here. The three pin paths are not, and cannot be on a faithful fixture: this pass
+# derives them from CELL_HOME (`:206-208`) and the child derives the same three from the same
+# CELL_HOME (`cloud-cell-supervisor.sh:1774-1775`), so with CELL_HOME forwarded they agree whether or
+# not they are forwarded; and where a unit DOES export HARNESS_PIN_DIR/HARNESS_PIN_FILE, the child
+# inherits them from the unit regardless of what this call site passes. Making them discriminating
+# would mean putting them in the PASS's environment, which is the one thing the fixture must not do —
+# the child would then inherit them and the defect this case exists to reproduce would be invisible
+# (measured: exactly that, on the first cut of this arm). So the assertion set pins the VALUES the
+# child ACTUALLY RESOLVES (the only thing the box can be wrong about) and leaves the forwarding of
+# the three derived paths as belt-and-braces. A future edit that drops one is not caught here; it is
+# also not a live defect while they remain derivable from CELL_HOME, and the comment at that call
+# site states the same boundary.
 # t26_case <dir> — one box: a pin TREE at the old commit plus the two records that name it.
 t26_case() {
     mkdir -p "$1/home/.pi/agent/state"
