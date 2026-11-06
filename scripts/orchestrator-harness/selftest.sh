@@ -1290,7 +1290,8 @@ PY
   # ⛔ IT MUST RUN THE REAL READER. `refreshloop-claim.sh` prepends a STUB whose whole body is
   # `return 0`, so moving `claims.sh` away changed NOTHING: the stub answered CLEAN and #10 was
   # queued — the fixture could no longer express the shape it is named for. #2466 (8a3e5359) moved
-  # the missing-file verdict INTO `issue_claim_verdict` (refresh-candidates.sh:1019-1024) and deleted
+  # the missing-file verdict INTO `issue_claim_verdict` (refresh-candidates.sh:1089-1115; the
+  # NOT-INSTALLED verdict itself is at :1092) and deleted
   # the loop's own `[ -f "$O/claims.sh" ]` arm, so the stub became the only decider.
   sed -n '/^issue_claim_verdict() {/,/^}$/p' "$REFRESH" > "$TMP/icv-real.sh"
   { cat "$TMP/icv-real.sh"; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-real.sh"
@@ -1302,7 +1303,7 @@ PY
   # ⛔ AND THE ARM MUST SHOW ITS OWN SUBJECT ANSWERED (review of this change, P2). "Not queued" ALONE
   # cannot tell the real reader's INCOMPLETE (rc 2) from a call that never found a reader: an empty
   # extraction gives rc 127, and the loop body's own "unrecognised verdict" default
-  # (refresh-candidates.sh:4617) resolves 127 to INCOMPLETE too — so on a drifted signature
+  # (refresh-candidates.sh:5243-5244) resolves 127 to INCOMPLETE too — so on a drifted signature
   # (`sed` is anchored on the literal `^issue_claim_verdict() {`) this arm stayed GREEN while proving
   # nothing, which is the exact class this arm was rewritten to fix. Pin the producer's sentence, the
   # way `(2952b)` already does, so the drift reds THIS arm instead of silencing it.
@@ -1872,6 +1873,12 @@ case "$(cat "$TMP/repo-explicit-noorigin.out")" in
 esac
 ck "the no-origin refusal names the missing remote (not a downstream provisioning failure)" $xr
 git -C "$X/samerepo" remote add origin https://github.com/acme/widget.git
+# ⛔ THIS FIXTURE'S $O MUST BE PROVISIONED TOO (review of this change, P2) — the SAME defect the
+# `repolocalpath` block below states, left in place 30 lines away. Without a registry the shared
+# `--check` claims gate (#2466, 8a3e5359) refuses this fixture with its OWN NOT PROVISIONABLE, and
+# the assertion below still passes because `[refresh] check: repo=…` is printed BEFORE that gate —
+# so "ACCEPTED (no false block)" was green about a run the claims gate refused end-to-end.
+mkdir -p "$TMP/repoexplicit/o3"; printf 'claim_issue_preflight() { return 0; }\n' > "$TMP/repoexplicit/o3/claims.sh"
 ( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
   HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1 )
 # The ACCEPTANCE is asserted on the resolver's own line, not on rc: `[refresh] check: repo=…` is printed
@@ -1885,7 +1892,7 @@ case "$(cat "$TMP/repo-explicit-ok.out")" in
 esac
 ck "an EXPLICIT REPO that IS a checkout of the queue target is ACCEPTED (no false block)" $xr
 case "$(cat "$TMP/repo-explicit-ok.out")" in
-  *"NOT the queue target"*|*"has no readable 'origin'"*) xr=1 ;;
+  *"NOT the queue target"*|*"has no readable 'origin'"*|*"NOT PROVISIONABLE"*) xr=1 ;;
   *) xr=0 ;;
 esac
 ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray rc)" $xr
@@ -1933,10 +1940,16 @@ ck "…and the resolver really returned 0 for it (the NOTE is not printed on the
 # production pass (rc 3 → `.refresh-blocked` → a merge-only cell), while the loop's own comment calls
 # that shape legitimate. The loop therefore passes its intent in `OR_OPERATOR_DECLARED`, and these
 # three arms pin the distinction: intent=0 tolerates, intent=1 proves, no marker keeps the old rule.
+# ⛔ op0's $O MUST BE PROVISIONED, for the reason stated above (review of this change, P2):
+# un-provisioned, the claims gate refuses with NOT PROVISIONABLE, yet "the pairing is not
+# cross-checked" is printed BEFORE it — so this arm read a downstream refusal as the resolver's
+# tolerance. `op1` deliberately stays un-provisioned: its refusal is the resolver's own.
+mkdir -p "$TMP/repolocalpath/op0"; printf 'claim_issue_preflight() { return 0; }\n' > "$TMP/repolocalpath/op0/claims.sh"
 ( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR; unset OR_OPERATOR_DECLARED
   HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=0 O="$TMP/repolocalpath/op0" bash "$REFRESH" --check > "$TMP/repo-localpath-loop.out" 2>&1 ) || true
 case "$(cat "$TMP/repo-localpath-loop.out")" in
   *"cannot prove it is a checkout"*) xr=1 ;;
+  *"NOT PROVISIONABLE"*) xr=1 ;;
   *"the pairing is not cross-checked"*) xr=0 ;;
   *) xr=1; echo "      out: $(head -3 "$TMP/repo-localpath-loop.out")" ;;
 esac
@@ -3585,10 +3598,11 @@ printf '#!/bin/bash\nexit 0\n' > "$BG/stub/tmux"
 chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
-# ⛔ THE ONE-HOME GATE RUNS BEFORE `check_gh` (cloud-cell-bringup.sh:387-413 -> :1994-1995, 0d6d630c).
+# ⛔ THE ONE-HOME GATE RUNS BEFORE `check_gh` (cloud-cell-bringup.sh:2116 `check_one_home env`, then
+# :2120 `check_gh`; 0d6d630c).
 # A sandbox `CELL_HOME` under the host temp dir is by design not this box's home, so the fixture must
 # supply the two seams the file itself declares: HOME equal to the cell home (the point of the arm —
-# a keys.env `HOME=` must not win), and `CELL_VOLATILE_ROOTS`, the documented FIXTURE SEAM at :327-332
+# a keys.env `HOME=` must not win), and `CELL_VOLATILE_ROOTS`, the documented FIXTURE SEAM at :380-385
 # that every hermetic cell suite already sets.
 GH_HOME_RECORD="$GH_HOME_RECORD" HOME="$BG/home" CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root \
   PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
