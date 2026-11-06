@@ -134,6 +134,27 @@ if [ "$1" = "api" ] && [ "$2" = "-X" ] \
     exit 0
 fi
 if [ "$1" = "api" ]; then
+    # #1224 — the review-evidence COMMENT: the copy that TRAVELS (a CI runner's
+    # $HOME has no record store, and the record file is per box). Placed before
+    # every other arm because the LIST form `issues/<n>/comments` must not be
+    # shadowed by the evidence arms below, which key on `issues/comments/<id>`
+    # (singular, with an id) and are a different surface.
+    #   STUB_COMMENTS         → the list read's `.[].body` answer (already-posed
+    #                           markers, for the idempotency pin).
+    #   STUB_COMMENTS_FAIL=1  → a transient READ failure: the comment post must
+    #                           then be SKIPPED, not duplicated.
+    #   STUB_COMMENT_CAPTURE  → sink for a POST body, so the suite can assert the
+    #                           COMMENT really carries the marker.
+    if grep -qE -- "/issues/[0-9]+/comments" <<<"$*"; then
+        if grep -qF -- "--jq" <<<"$*"; then
+            [ "${STUB_COMMENTS_FAIL:-0}" = "1" ] && exit 1
+            printf '%s' "${STUB_COMMENTS:-}"
+            exit 0
+        fi
+        if [ -n "${STUB_COMMENT_CAPTURE:-}" ]; then cat >"$STUB_COMMENT_CAPTURE"; else cat >/dev/null; fi
+        printf '{}\n'
+        exit 0
+    fi
     # #633 review finding 2: model the TRANSPORT, not just the URL. Real `gh api`
     # switches to POST as soon as ANY `-f`/`-F` parameter is added, and
     # `GET /commits/{ref}/check-runs` is GET-only — so a parameterized call with
@@ -219,6 +240,18 @@ if [ "$1" = "api" ]; then
     # per line; empty/absent = an empty surface.
     if grep -qF -- "check-runs" <<<"$*"; then
         [ "${STUB_CHECKS_FAIL:-0}" = "1" ] && exit 1
+        # #3440: PER-SHA rows, so ONE invocation can model a head whose surface differs
+        # from its base — the shape base-attribution is decided on, and the only way to
+        # tell "the PR caused this red" from "the base already had it" in one run.
+        # Inert unless a vector sets the dir (every pre-existing vector falls through to
+        # the plain STUB_CHECKS_ROWS arm below, unchanged).
+        if [ -n "${STUB_CHECKS_ROWS_DIR:-}" ]; then
+            cs_sha="$(printf '%s' "$*" | sed -n 's#.*/commits/\([0-9a-f]*\)/check-runs.*#\1#p')"
+            if [ -n "$cs_sha" ] && [ -f "${STUB_CHECKS_ROWS_DIR}/$cs_sha" ]; then
+                cat "${STUB_CHECKS_ROWS_DIR}/$cs_sha"; exit 0
+            fi
+            exit 0
+        fi
         [ -n "${STUB_CHECKS_ROWS:-}" ] && printf '%s\n' "${STUB_CHECKS_ROWS}"
         exit 0
     fi
@@ -611,6 +644,187 @@ else
     bad "evidence PATCH posted"
 fi
 [ -f "$Q6" ] && ok "record written in guard+evidence flow" || bad "record written in guard+evidence flow"
+
+# ── #1224 — ONE MINT, TWO ARTIFACTS, AND THEY MUST AGREE ──────────────────
+# check (c) now reads the head-bound RECORD FILE first and falls back to the
+# BODY marker only when no record covers the head (agent-infra#1224). That makes
+# AGREEMENT between the two a correctness property: if one run could write a
+# record at head H with verdict V and append a marker naming a DIFFERENT
+# revision, the fallback would be evidence for a revision nobody recorded — the
+# gate's own fallback certifying an unreviewed head. The assertion is on the
+# (pr, verdict, head, repo) fields only; the marker's optional ` diff=`/` sig=`
+# are tolerated, because those are the producer's signing/CARRY contract (#2982)
+# and are not part of the binding the gate reads.
+# The SECOND run pins idempotency from the outside: the record must come back
+# BYTE-IDENTICAL (no churned `reviewed_at`; the #1709 rec 7 no-op is §15.4) and
+# the body post must remain a no-op-once-posted append (§12). Together they are
+# what makes a duplicate execution harmless — and a duplicate execution is the
+# documented remedy for a skipped post.
+Q6V="$(sed -n 's/.*"verdict":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6H="$(sed -n 's/.*"head_sha":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6_RE="review recorded: reviews/424246\.json verdict=${Q6V} @ ${Q6H}( diff=[0-9a-f]{64})? \(daniel-ospina/agent-infra\)( sig=[0-9a-f]{64})?$"
+Q6_RE_SIG="review recorded: reviews/424246\.json verdict=${Q6V} @ ${Q6H}( diff=[0-9a-f]{64})? \(daniel-ospina/agent-infra\)( sig=[0-9a-f]{64})?"
+cp "$Q6" "$T/q6-before.json" 2>/dev/null || true
+P1224="$T/p1224-patch.json"; : > "$P1224"
+STUB_CAPTURE="$P1224" run_record "daniel-ospina/agent-infra" 424246
+# The capture is the PATCH payload (`{"body": "…"}`, exactly what the producer
+# sends), so the assertion reads `.body` rather than grepping the JSON envelope —
+# the envelope would defeat the end-anchor below. Without jq the raw file is read:
+# the marker line is then embedded in JSON and the anchor simply does not apply.
+P1224_BODY="$T/p1224-body.txt"
+if command -v jq >/dev/null 2>&1; then
+    jq -r '.body // ""' "$P1224" > "$P1224_BODY" 2>/dev/null || cp "$P1224" "$P1224_BODY"
+else
+    cp "$P1224" "$P1224_BODY"
+fi
+if [ "$RECORD_RC" = "0" ] && grep -qE "$Q6_RE" "$P1224_BODY" 2>/dev/null; then
+    ok "#1224 the body marker and the record AGREE on (pr, verdict, head, repo) — the gate's fallback is evidence for the revision the record certifies"
+else
+    bad "#1224 the body marker and the record DISAGREE (or the re-run posted nothing) — check (c)'s fallback would certify a different revision than the record"
+fi
+if cmp -s "$Q6" "$T/q6-before.json"; then
+    ok "#1224 a duplicate run left the record BYTE-IDENTICAL (idempotent — reviewed_at not churned)"
+else
+    bad "#1224 a duplicate run REWROTE the record (non-idempotent write / reviewed_at churn)"
+fi
+unset P1224 P1224_BODY
+
+# ── #1224 review finding 3 — THE RECORD FILE IS SIGNED ────────────────────
+# The record store is private and leaves NO trace on the PR, so the gate now
+# accepts a record as evidence only when its `sig` verifies. That is a CONTRACT
+# between two files: the canonical text is declared once in the gate
+# (`review_record_sig_text`) and once here (`record_sig_for`), and a divergence
+# would make every legitimate record unusable while each file kept passing its
+# own tests. This assertion recomputes the GATE's text and checks the producer's
+# file against it, so a drift reds the producer's suite.
+Q6_SIG="$(sed -n 's/.*"sig":"\([^"]*\)".*/\1/p' "$Q6" | head -1)"
+Q6_EXPECT="$(printf '%s' "review-record:v1:424246:${Q6H}:${Q6V}:daniel-ospina/agent-infra" \
+    | openssl dgst -sha256 -hmac "$TEST_GATE_KEY" | awk '{print $NF}')"
+if [ -n "$Q6_SIG" ] && [ "$Q6_SIG" = "$Q6_EXPECT" ]; then
+    ok "#1224 the record FILE carries a sig= over the gate's canonical text (pr,head,verdict,repo) — the private artifact is authenticated, not merely well-shaped"
+else
+    bad "#1224 the record FILE's sig= does not verify over the gate's canonical text (got: ${Q6_SIG:-<absent>}, want: $Q6_EXPECT) — the gate would refuse every legitimate record"
+fi
+unset Q6_SIG Q6_EXPECT
+
+# ── #1224 review finding 2 — THE COPY THAT TRAVELS IS A PR COMMENT ──────────
+# The required `pipeline-compliance` check runs on a clean CI runner whose $HOME
+# has no `~/.pi/agent/reviews`, so a record-first gate can never answer there.
+# The marker must therefore also land in a PR COMMENT (`gh pr edit` cannot wipe
+# one) — and posting it must be IDEMPOTENT, because the documented remedy for a
+# skipped post is to re-run the recorder, and a re-run that re-posted would
+# bury the timeline.
+Q1224C="$T/p1224-comment.json"; : > "$Q1224C"
+STUB_COMMENT_CAPTURE="$Q1224C" run_record "daniel-ospina/agent-infra" 424246
+Q1224C_BODY="$T/p1224-comment-body.txt"
+if command -v jq >/dev/null 2>&1; then
+    jq -r '.body // ""' "$Q1224C" > "$Q1224C_BODY" 2>/dev/null || cp "$Q1224C" "$Q1224C_BODY"
+else
+    cp "$Q1224C" "$Q1224C_BODY"
+fi
+if [ "$RECORD_RC" = "0" ] && grep -qE "$Q6_RE_SIG" "$Q1224C_BODY" 2>/dev/null; then
+    ok "#1224 the review attestation is ALSO posted as a PR COMMENT — the copy a body edit cannot wipe and a CI runner CAN read"
+else
+    bad "#1224 no PR COMMENT carrying the marker was posted — the fix stays inert on the required check, whose runner has no record store (finding 2)"
+fi
+# IDEMPOTENCE: the marker is already in the list, so a re-run must post nothing.
+# ⛔ THE FIXTURE SPEAKS THE FRAME THE GATE ADMITS (review finding 2): the read asks
+# for `"<author_association>\u001f<body>"` and the "already present" test requires a
+# TRUSTED association AND the body equal to the marker. The old fixture handed a
+# bare body, which is why a plain line-grep looked correct.
+Q1224D="$T/p1224-comment-2.json"; : > "$Q1224D"
+STUB_COMMENTS="OWNER"$'\037'"$(cat "$Q1224C_BODY")"$'\036' STUB_COMMENT_CAPTURE="$Q1224D" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224D" ]; then
+    bad "#1224 a re-run DUPLICATED the evidence comment (the marker was already there) — every re-record would bury the timeline"
+else
+    ok "#1224 a re-run posts NO second comment when the marker is already present (idempotent, like the body append)"
+fi
+# ⛔ NEGATIVE CONTROL 1 — AN UNATTESTED AUTHOR IS NOT "ALREADY PRESENT". On a public
+# repo the marker is visible in the PR body, so ANY account can paste it; treating
+# that as delivered would (a) skip the producer's own post forever and (b) let an
+# unprivileged account suppress the only evidence channel CI can read. Reverting the
+# association test reddens THIS vector and leaves the idempotency one green.
+Q1224F="$T/p1224-comment-4.json"; : > "$Q1224F"
+STUB_COMMENTS="NONE"$'\037'"$(cat "$Q1224C_BODY")"$'\036' STUB_COMMENT_CAPTURE="$Q1224F" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224F" ]; then
+    ok "#1224 a marker pasted by an UNATTESTED account does not count as delivered — the producer posts its own copy"
+else
+    bad "#1224 an unattested commenter's pasted marker SUPPRESSED the producer's post — any account could silence the evidence channel, and the run would report it delivered (finding 2)"
+fi
+# ⛔ NEGATIVE CONTROL 2 — A QUOTING COMMENT IS NOT "ALREADY PRESENT". The gate
+# requires the marker to be the comment's WHOLE body; a multi-line comment that
+# merely CONTAINS the marker line is REFUSED by the gate, so honouring it here would
+# report delivery for an artifact the gate throws away.
+Q1224G="$T/p1224-comment-5.json"; : > "$Q1224G"
+STUB_COMMENTS="OWNER"$'\037'"Here is the attestation I saw:
+$(cat "$Q1224C_BODY")
+— a reviewer quoting it"$'\036' STUB_COMMENT_CAPTURE="$Q1224G" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224G" ]; then
+    ok "#1224 a QUOTING comment does not count as delivered — the whole-body rule matches the gate"
+else
+    bad "#1224 a comment that merely QUOTED the marker suppressed the producer's post — the producer would report delivery for an artifact the gate refuses (finding 2)"
+fi
+# ⛔ NEGATIVE CONTROL 3 — A MARKER AS THE FIRST LINE WITH TEXT BENEATH IT (review
+# round 3 finding 1a). This is the shape that fooled the LINE-based reader: line 1
+# is "OWNER\x1f<marker>", so `$1 == OWNER` and `body == marker` both held, the
+# producer skipped its own post and reported DELIVERED — while the gate requires the
+# marker to be the WHOLE body and refuses that comment. This is a human paste, not
+# an attack, and the producer's comment was never posted again.
+Q1224J="$T/p1224-comment-9.json"; : > "$Q1224J"
+STUB_COMMENTS="OWNER"$'\037'"$(cat "$Q1224C_BODY")"$'\n'"One line of context under it"$'\036' STUB_COMMENT_CAPTURE="$Q1224J" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224J" ]; then
+    ok "#1224 a comment whose FIRST LINE is the marker but which continues beneath it does NOT count as delivered — the whole-body rule is what the gate applies"
+else
+    bad "#1224 a marker with a note under it suppressed the producer's post — the comment is not the artifact the gate admits, so the evidence was never delivered (finding 1a)"
+fi
+# ⛔ THE DELIMITER STRIP IS A SOURCE-LEVEL CONTRACT, so it is pinned at the source
+# (review round 3 finding 1b). A behavioural vector cannot see it: the `gh` stub
+# returns the ALREADY-JQ'd frame, so a producer that forgot the `gsub` would be fed
+# a frame it never produced. The gate strips 0x1e/0x1f from every comment body
+# before framing (its REVIEW_COMMENTS_JQ, pinned by the gate's own 1224T), so a
+# comment body can never manufacture a second record. Without the strip HERE an
+# unattested account could satisfy the producer's dedup and suppress its post.
+Q14STRIP="$(grep -c 'gsub("\[\\u001e\\u001f\]"; "")' "$RECORD" 2>/dev/null || echo 0)"
+Q14TERM="$(grep -c 'u001e' "$RECORD" 2>/dev/null || echo 0)"
+if [ "${Q14STRIP:-0}" -ge 1 ] && [ "${Q14TERM:-0}" -ge 1 ]; then
+    ok "#1224 the comment read strips BOTH frame delimiters and terminates records (0x1e/0x1f) — the same frame the gate builds, so a comment body cannot forge a record"
+else
+    bad "#1224 the producer's comment read does not strip/terminate the frame (strip=$Q14STRIP term=$Q14TERM) — an unattested commenter could forge an admitted record and suppress the evidence post (finding 1b)"
+fi
+unset Q14STRIP Q14TERM
+# A FAILED LIST READ IS NOT "NO COMMENTS": posting on it would duplicate the
+# evidence on every transient API error, so the post must be skipped instead.
+Q1224E="$T/p1224-comment-3.json"; : > "$Q1224E"
+STUB_COMMENTS_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224E" run_record "daniel-ospina/agent-infra" 424246
+if [ -s "$Q1224E" ]; then
+    bad "#1224 an unreadable comment list was treated as 'no comment' and the evidence was re-posted — a transient 5xx duplicates evidence"
+else
+    ok "#1224 an unreadable comment list SKIPS the post (skipped, never duplicated)"
+fi
+# ── THE BODY-READ-FAILURE ARM: exit 0 ONLY when the comment VERIFIABLY posted ──
+# (prior review finding 3: reverting this whole arm — or making the comment post
+# return 0 unconditionally — left the suite 970/0 GREEN, so the exit-0/exit-5
+# contract had no coverage at all and the false-delivery claim was invisible.)
+# ONE VECTOR PER OUTCOME, so each half of the contract is separately load-bearing:
+#   (a) body read fails, comment posts        ⇒ rc 0 (CI CAN see the marker)
+#   (b) body read fails, comment CANNOT post   ⇒ rc 5 (`body-marker-unposted`)
+Q1224H="$T/p1224-comment-6.json"; : > "$Q1224H"
+STUB_BODY_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224H" run_record_rc "daniel-ospina/agent-infra" 424248 "$SHA"
+if [ "$RECORD_RC" = "0" ] && [ -s "$Q1224H" ]; then
+    ok "#1224 a body-read failure still exits 0 WHEN the evidence comment posted — the marker is visible to the required check, so the run is a success, not a false green"
+else
+    bad "#1224 a body-read failure did not use the comment channel (rc=$RECORD_RC, comment_posted=$([ -s "$Q1224H" ] && echo yes || echo no)) — either a review that IS evidenced reports failure, or it reports success with nothing delivered"
+fi
+Q1224I="$T/p1224-comment-7.json"; : > "$Q1224I"
+STUB_BODY_FAIL=1 STUB_COMMENTS_FAIL=1 STUB_COMMENT_CAPTURE="$Q1224I" run_record_rc "daniel-ospina/agent-infra" 424249 "$SHA"
+Q1224I_PENDING="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424249.marker"
+if [ "$RECORD_RC" = "5" ] && [ ! -s "$Q1224I" ] && [ -f "$Q1224I_PENDING" ]; then
+    ok "#1224 with NEITHER channel available the run exits 5 (body-marker-unposted) and KEEPS the pending marker — a failed delivery is a named state, never a warning on a zero exit"
+else
+    bad "#1224 a double delivery failure was not reported as the named exit-5 state (rc=$RECORD_RC, posted=$([ -s "$Q1224I" ] && echo yes || echo no), pending=$([ -f "$Q1224I_PENDING" ] && echo yes || echo no)) — the record would be invisible to CI while the run looks successful"
+fi
+unset Q1224H Q1224I Q1224I_PENDING
+unset Q1224C Q1224C_BODY Q1224D Q1224E Q1224F Q1224G Q1224J Q6V Q6H Q6_RE Q6_RE_SIG
 
 echo "── 7. Stale-sha refusal: mismatched head → exit 3, no record ────"
 MISMATCH_SHA="$(printf 'b%.0s' $(seq 1 40))" # 40×b — stub answers aaaa…, so bbbb… is stale
@@ -4649,10 +4863,19 @@ STALE_SHA="$(printf 'b%.0s' $(seq 1 40))"
 STUB_BODY="PR body" run_record_633 424326 "$STALE_SHA" \
     '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":300}]' --force-stale
 [ "$RECORD_RC" = "0" ] && ok "14.7 force-stale record still saves (rc 0)" || bad "14.7 force-stale record still saves (rc=$RECORD_RC)"
-if grep -qF -- "/check-runs" "$LOG" || grep -qF -- "actions/jobs/" "$LOG"; then
-    bad "14.7 force-stale skips the stale-run remediation (log: $(cat "$LOG"))"
+# ⛔ THE PROPERTY IS "NO REMEDIATION", NOT "NO check-runs CALL" (#3440). The remediation is
+# a FILTERED read of the gate's own runs (`-f check_name=…`, raw envelope) plus a job
+# RE-RUN; a deliberate stale sha must never reach either, or the rerun lands in the PR's
+# per-PR concurrency group and cancels the REAL head's in-flight gate run. The record now
+# makes ONE read of its own — the #3440 surface observation, unfiltered and with `--jq` —
+# and that read is not the remediation. The count is pinned to exactly one so the
+# distinction cannot quietly rot into "the remediation stopped reading".
+if grep -qF -- "actions/jobs/" "$LOG" || grep -qF -- "check_name=" "$LOG"; then
+    bad "14.7 force-stale runs NO stale-run remediation — a filtered gate query or a rerun is the remediation (log: $(cat "$LOG"))"
+elif [ "$(grep -cF -- "/check-runs" "$LOG")" != "1" ]; then
+    bad "14.7 force-stale should make exactly ONE check-runs read (the #3440 surface observation), saw $(grep -cF -- "/check-runs" "$LOG") (log: $(cat "$LOG"))"
 else
-    ok "14.7 force-stale skips the stale-run remediation"
+    ok "14.7 force-stale runs no stale-run remediation (no filtered gate query, no rerun) and only the one surface read"
 fi
 
 # 14.8 check-runs query failure (gh/API error): warns LOUDLY on stderr and skips
@@ -4712,6 +4935,65 @@ FL_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$F
 # other assertion here, and the empty-pending-file mutant did exactly that.
 if grep -qF -- "-X PATCH" "$LOG"; then ok "14.10b the flush actually PATCHed the body (transport, not just an exit code)"; else bad "14.10b the flush exited 0 without a PATCH — deletion is not delivery (log: $(cat "$LOG"))"; fi
 assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
+# 14.10q A BODY THAT ONLY *QUOTES* THE MARKER IS NOT DELIVERY (review round 2
+#       finding 3). `post_marker` tested the marker with `grep -qF` — a SUBSTRING
+#       test — while the gate anchors `^…$`. Measured before the fix: a body that
+#       merely quoted the marker made `--flush-pending` return 0, print "delivered",
+#       and DELETE the pending file — defect A on the retry channel, destroying the
+#       only surviving copy of a marker that was never delivered. The vector needs
+#       BOTH halves: a PATCH must happen, and the delivered body must carry the
+#       marker as its OWN line.
+Q14C_MARKER='review recorded: reviews/424329.json verdict=clean @ aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa (daniel-ospina/agent-infra)'
+mkdir -p "$F_HOME/.pi/agent/reviews/pending"
+printf '%s\n' "$Q14C_MARKER" > "$PEND14"
+Q14C_CAP="$T/flushcap14c"; : > "$Q14C_CAP"; : > "$LOG"
+Q14C_RC=0
+Q14C_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$Q14C_CAP" \
+    STUB_BODY="A reviewer pasted this into their notes: $Q14C_MARKER — quoted mid-line" \
+    bash "$RECORD" --flush-pending 424329 daniel-ospina/agent-infra 2>&1)" || Q14C_RC=$?
+if grep -qF -- "-X PATCH" "$LOG"; then
+    ok "14.10q a body that merely QUOTES the marker is not delivery — the flush PATCHed (transport, not an early return)"
+else
+    bad "14.10q the flush treated a QUOTED marker as delivered and did not PATCH (log: $(cat "$LOG")) — the pending marker would be deleted undelivered"
+fi
+if grep -qF -- '\n\nreview recorded: reviews/424329.json verdict=clean @ ' "$Q14C_CAP" 2>/dev/null; then
+    ok "14.10q …and the delivered body carries the marker as its OWN line, which is what the gate anchors on"
+else
+    bad "14.10q the delivered body does not carry the marker as its own line — the gate would still refuse it"
+fi
+assert_eq "$Q14C_RC" "0" "14.10q the flush succeeds once it really delivers (rc 0)"
+unset Q14C_MARKER Q14C_CAP Q14C_RC Q14C_OUT
+
+# 14.10u AN UNSIGNED MARKER IS NEVER PUBLISHED AS A COMMENT (review round 2
+#       finding 4: dropping the `MARKER_SIGNED` guard left the suite 974/0 green,
+#       though the guard is a stated doctrine and it gates the exit-0/5 contract).
+#       With no gate key the marker cannot be signed, so the comment channel must
+#       not be used at all — not even attempted.
+Q14E_CAP="$T/p1224-comment-8.json"; : > "$Q14E_CAP"
+# ⛔ IT MUST REACH THE COMMENT STAGE (review round 3 finding 2). The first version of
+# this vector minted a bare `clean` with NO `--evidence`, so it died at the
+# tortoise#7391 guard (rc 3) and never built a marker — vacuous, and the guard it
+# claimed to pin stayed removable with the suite green (measured). `--evidence`
+# lets the mint proceed, and the transport assertion below proves the comment
+# endpoint was never even called.
+Q14E_RC=0
+# ⛔ STUB_EVIDENCE_PR IS LOAD-BEARING (verification pass): without it the stub answers
+# the evidence read with `parent: …/issues/0`, the tortoise#7391 guard refuses
+# (`rc 3`) and NO marker is ever built — so the vector was satisfied by "nothing
+# ever happened" and deleting the guard stayed green. Measured: with it set the mint
+# proceeds (rc 0) and dropping the guard makes the comment POST (capture=138 bytes).
+# The pass condition ALSO requires the mint to have happened, so the vector cannot
+# go vacuous again silently.
+Q14E_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_COMMENT_CAPTURE="$Q14E_CAP" \
+    STUB_EVIDENCE_PR=424252 AI_REVIEW_GATE_KEY="" \
+    bash "$RECORD" 424252 "$SHA" clean daniel-ospina/agent-infra --evidence comment:1 2>&1)" || Q14E_RC=$?
+if [ "$Q14E_RC" = "0" ] && [ ! -s "$Q14E_CAP" ] && ! grep -qE "X POST repos/[^ ]*/issues/[0-9]+/comments" "$LOG"; then
+    ok "14.10u an UNSIGNED marker is NOT published as a comment (mint succeeded, endpoint never called) — a comment cannot be retracted and an unsigned marker is never evidence"
+else
+    bad "14.10u the unsigned-marker rule did not hold (rc=$Q14E_RC — 3 means the mint never happened, so the vector proves nothing; capture=$([ -s "$Q14E_CAP" ] && echo yes || echo no), log: $(grep -oE 'X POST repos/[^ ]*/issues/[0-9]+/comments' "$LOG" | head -1)) — the gate can never accept an unsigned marker, and a published one cannot be undone"
+fi
+unset Q14E_CAP Q14E_RC Q14E_OUT
+
 # 14.10d an EMPTY pending file is NOT a delivered marker (cycle-2 P1: the helper
 #       used to `rm -f` it and return 0, so the flush claimed delivery and then
 #       destroyed the only copy).
@@ -4845,8 +5127,8 @@ else
 fi
 
 # 14.14 THE ALLOW-LIST POLARITY (review finding 1). The repo mandate (AGENTS.md
-#       §"Reading verification state" step 4, implemented by target_head_red in
-#       this same file) is: only success/neutral/skipped are green and
+#       §"Reading verification state" step 4, implemented by this file's `#633`
+#       rerun predicate) is: only success/neutral/skipped are green and
 #       cancelled/stale are non-red; EVERY OTHER conclusion is RED — including
 #       one GitHub has not documented and a null one. A CLOSED red-list
 #       (failure/cancelled/timed_out/action_required) read an unrecognised or
@@ -4875,7 +5157,9 @@ else
     ok "14.14c cancelled is non-red — no rerun"
 fi
 # 14.14d an unrecognised STATUS with a NULL conclusion is RED (in-flight is the
-#        named set only) — the same decision target_head_red makes.
+#        named set only) — the same decision the `#633` rerun predicate makes.
+#        (`target_head_red` was DELETED by #3440; cite the live predicate, never a
+#        name that no longer exists in record-review.sh.)
 STUB_BODY="PR body" run_record_633 424335 "$SHA" \
     '[{"name":"ai-review-gate","status":"something_new","conclusion":null,"id":613}]'
 grep -qF -- "actions/jobs/613/rerun" "$LOG" && ok "14.14d an unknown status with a NULL conclusion is RED" || bad "14.14d an unknown status read as pending/non-red (log: $(cat "$LOG"))"
@@ -5468,6 +5752,658 @@ if [ -f "$(Q2 424969)" ]; then bad "20.3b the refused clean mint wrote a record"
 assert_contains "$RECORD_ERR" "DECLARES a non-clean outcome" "20.3b …and names the declaration it refused on, which only (1b) can see"
 NEG_F=1
 EV_REF="comment:42495501"
+
+# ─────────────────────────────────────────────────────────────────────────
+# 21 #3440 — THE ATTESTATION PATH READS CI: the check surface on the recorded sha
+# ─────────────────────────────────────────────────────────────────────────
+# THE DEFECT. Nothing on the attestation path consulted CI. A PR could be reviewed
+# clean, attested `clean`, and handed over as merge-ready while its head carried a
+# FULLY RED check surface — MEASURED on #3355 (head 2823279e8…, 7 red: CI/bash-suites
+# (3)…(8) and CI/verify): `record-review.sh 3355 <head> clean` printed ✅,
+# `--check-carry` answered `head — nothing is stale and nothing needs re-review`, and
+# the red was never read. A false PASS, category A.
+#
+# WHAT THIS SECTION PINS, and it is deliberately not "the code mentions check-runs":
+#   21.1  control — a green surface still answers `head` (the change adds no block)
+#   21.2  a PR-CAUSED red answers `red-surface` (7), NOT a licence — + MUTATION PIN
+#   21.3  the SAME red, reproduced on the base, answers `red-base-owned` (0) and NAMES
+#         the groups: "not silently tolerated" is the whole of #3440's item 3
+#   21.4  a REFUSED read answers `surface-unknown` (8) — never a green one — + MUTATION PIN
+#   21.5  an EMPTY surface is not green either (normal answer, loud on stderr)
+#   21.6  the `carry` arm is gated too (the second licence-reading answer)
+#   21.7  the RECORD carries the surface at mint — + MUTATION PIN (the issue's own
+#         required mutant: drop the check-runs read and this must redden)
+#   21.8  the fleet's own evidence gate is excluded (or minting would ALWAYS say red)
+#   21.9  a hostile check name cannot break the record's JSON envelope
+#   21.10 an unreadable/empty surface records `unknown`, never `green`
+#   21.11 an UNPARSEABLE head row is never attributed to the base — + MUTATION PIN (the
+#         fail-open a review of this change found: the sentinel matched itself)
+#   21.12 the `carry` arm judges the LIVE head, not the recorded one — + MUTATION PIN
+#   21.13 an IN-FLIGHT surface keeps the normal answer and says so (deliberate policy)
+#   21.14 with NO repo resolvable the answer is surface-unknown (8), never a green
+#   21.15 the surface fields are VOLATILE in the #1709 rec 7 identity — + MUTATION PIN
+#   21.16 an UNREAD live head never answers from the RECORDED one — + 2 MUTATION PINS
+#   21.17 an ALL-EXCLUDED surface is `empty`, never `green` — + MUTATION PIN (review of
+#         `554d272`, P2: the early guard only caught an EMPTY RESPONSE)
+#   21.18 an ambient RED_EXCLUDE cannot hide a red from the licence — + MUTATION PIN
+#         (review of `988d0968`: a gate disabled by ambient env is category A)
+# ⛔ THE EVIDENCE BODY IS A §20 FIXTURE (a deliberately NOT-CLEAN artifact, used to pin the
+# falsified-evidence refusal) and the shared runner does not clear it, so every mint below
+# would be refused with "the named review evidence could not be verified" — a decision about
+# §20's subject, not about the surface. §21 owns its mints, so it clears it here.
+unset STUB_EVIDENCE_BODY
+echo "── 21 #3440: the attestation path reads CI (the check surface) ────"
+S21_REPO="daniel-ospina/agent-infra"
+S21_RDIR="$F_HOME/.pi/agent/reviews"
+mkdir -p "$S21_RDIR"
+S21_TAB="$(printf '\t')"
+S21_HEAD="$(printf 'a%.0s' $(seq 1 40))"     # the stub's .head.sha — the LIVE head
+S21_BASE="$(printf 'b%.0s' $(seq 1 40))"     # the PR's base, read via STUB_BASE_SHA
+S21_FILE="$S21_RDIR/daniel-ospina-agent-infra"
+S21_ROWS="$T/s21-rows"; mkdir -p "$S21_ROWS"
+# ⛔ MUTANT COPIES LIVE IN $S21_MUTDIR, WITH `lib/` BESIDE THEM. `record-review.sh` resolves its
+# one diff normalizer as `<dir of BASH_SOURCE>/lib/diff-normalize.py`; a copy dropped in `$T`
+# therefore has no normalizer, degrades the diff read, and a diff-dependent mutant answers `fresh`
+# for a reason unrelated to its mutation (measured: 21.12's first pin). Prepared once here.
+S21_MUTDIR="$T/s21-mut"; mkdir -p "$S21_MUTDIR"
+cp -r "$SCRIPT_DIR/lib" "$S21_MUTDIR/lib"
+# SELF-CONTAINED digest fixtures (§11.13 unsets CC_SHA at :2623, and the §11.12 note is
+# explicit that a section leaning on another's fixture is either an abort under `set -u`
+# or — worse — a silent comparison against bytes some other section computed). The
+# digest comes from the ONE shared normalizer, exactly as the producer and the GitHub
+# gate compute it.
+S21_DIFF="$T/s21-real.diff"
+printf 'diff --git a/docs/s21.md b/docs/s21.md\nindex 1111111..2222222 100644\n--- a/docs/s21.md\n+++ b/docs/s21.md\n@@ -1,3 +1,4 @@\n a\n+b\n c\n d\n' > "$S21_DIFF"
+S21_SHA="$(python3 "$SCRIPT_DIR/lib/diff-normalize.py" < "$S21_DIFF" | openssl dgst -sha256 | awk '{print $NF}')"
+S21_STALE="$(printf 'd%.0s' $(seq 1 40))"
+# A head-bound record: no digest at all, which is the commonest healthy shape and the
+# one that reaches the FIRST of the two licence-reading answers.
+s21_rec() { # <pr> <head>
+    printf '{"pr":%s,"head_sha":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+        "$1" "$2" "$S21_REPO" > "$S21_FILE-$1.json"
+}
+# TSV rows in the shape the recorder's own --jq asks gh for:
+#   app.slug|name|id|status|conclusion
+s21_rows() { # <file> <rows…>
+    local f="$1"; shift
+    printf '%s\n' "$@" > "$S21_ROWS/$f"
+}
+S21_GREEN='CI|bash-suites (3)|11|completed|success'
+S21_GREEN2='CI|verify|12|completed|success'
+S21_RED='CI|bash-suites (3)|11|completed|failure'
+S21_RED2='CI|verify|12|completed|failure'
+s21_run() { # <pr> <rows-head-file> <rows-base-file> [extra env assignments…] -> CC_RC/CC_OUT
+    CC_RC=0
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 \
+        STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+        STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+        bash "$RECORD" --check-carry "$1" "$S21_REPO" 2>"$T/s21-err")" || CC_RC=$?
+}
+
+# 21.1 CONTROL — a green surface changes nothing. Without this, every assertion below
+# could pass on a verb that refuses unconditionally.
+s21_rows "$S21_HEAD" "$S21_GREEN" "$S21_GREEN2"
+s21_rows "$S21_BASE" "$S21_GREEN" "$S21_GREEN2"
+s21_rec 425001 "$S21_HEAD"
+s21_run 425001
+assert_eq "$CC_RC" "0" "21.1 a GREEN surface still answers exit 0 (the change adds no block to a healthy head)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "head" "21.1 …and still reports 'head', so the healthy path is untouched"
+
+# 21.2 A PR-CAUSED RED — the measured false PASS. The base is GREEN and the head is
+# RED on the same group, so the red is this PR's. Answering `head` here would hand the
+# owner a merge-ready attestation over a failing build, which is #3355 exactly.
+s21_rows "$S21_HEAD" "$S21_RED" "$S21_RED2"
+s21_rows "$S21_BASE" "$S21_GREEN" "$S21_GREEN2"
+s21_rec 425002 "$S21_HEAD"
+s21_run 425002
+assert_eq "$CC_RC" "7" "21.2 a head-bound record over a PR-CAUSED red answers exit 7 (NOT mergeable)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "red-surface" "21.2 …with its own token, never 'head'"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "CI|bash-suites (3)" "21.2 …and NAMES the red group, so the operator sees what is failing"
+# (a) MUTATION PIN — remove the gate call and the same fixture must answer `head`.
+S21_MUT="$S21_MUTDIR/record-review-s21-nogate.sh"
+cp "$RECORD" "$S21_MUT"
+if grep -qF 'cc_surface_gate "$CC_HEAD" "${CC_DIFF:--}" "${DIFF_HASH:--}"' "$S21_MUT"; then
+    sed -i.bak 's#^    cc_surface_gate "\$CC_HEAD" "\${CC_DIFF:--}" "\${DIFF_HASH:--}"$#    : no-gate#' "$S21_MUT"
+    rm -f "$S21_MUT.bak"
+    if cmp -s "$RECORD" "$S21_MUT"; then
+        bad "21.2 mutation: the sed did not apply — re-anchor it rather than dropping the pin"
+    else
+        CC_RC=0
+        CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+            STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+            STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+            bash "$S21_MUT" --check-carry 425002 "$S21_REPO" 2>/dev/null)" || CC_RC=$?
+        if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "head" ]; then
+            ok "21.2 MUTATION PIN: with the surface gate removed the same fixture answers 'head'/0 — the gate is load-bearing"
+        else
+            bad "21.2 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — 21.2 passes without the gate"
+        fi
+    fi
+else
+    bad "21.2 the mutation anchor 'cc_surface_gate …' is gone from the head arm — re-anchor the pin"
+fi
+
+# 21.3 THE SAME RED, REPRODUCED ON THE BASE. Every red group is also red on the base,
+# so the PR did not cause it. The record still covers the artifact (exit 0, no review
+# owed) but the answer is a DISTINCT token with the groups NAMED — item 3 of the issue:
+# "not silently tolerated", even when the rail is the thing that will exempt it.
+s21_rows "$S21_HEAD" "$S21_RED" "$S21_RED2"
+s21_rows "$S21_BASE" "$S21_RED" "$S21_RED2"
+s21_rec 425003 "$S21_HEAD"
+s21_run 425003
+assert_eq "$CC_RC" "0" "21.3 a BASE-OWNED red still covers the head (exit 0 — no review is owed for the base's red)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "red-base-owned" "21.3 …but NOT as 'head': a distinct token, so it is never a bare green"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "BASE-OWNED" "21.3 …and the diagnosis says BASE-OWNED in words"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "CI|verify" "21.3 …naming EVERY group being accepted, which is what the operator signs off on"
+
+# 21.4 A REFUSED READ. The API call fails; a failed read is its OWN answer and must
+# never be laundered into a green one (#2342's rule, applied to this question).
+s21_rows "$S21_HEAD" "$S21_GREEN"
+s21_rows "$S21_BASE" "$S21_GREEN"
+s21_rec 425004 "$S21_HEAD"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+    STUB_CHECKS_ROWS_DIR="$S21_ROWS" STUB_CHECKS_FAIL=1 \
+    bash "$RECORD" --check-carry 425004 "$S21_REPO" 2>"$T/s21-err")" || CC_RC=$?
+assert_eq "$CC_RC" "8" "21.4 an UNREADABLE surface answers exit 8 (not a licence, not a re-review)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "surface-unknown" "21.4 …with its own token"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "COULD NOT BE READ" "21.4 …and says the read failed rather than implying anything about the tree"
+# (b) MUTATION PIN — a refused read must not fall through to the normal answer. The
+# mutant removes the `unreadable)` arm's REFUSAL (its `exit 8` becomes `exit 0`), which is
+# exactly the fail-open shape: the failed read still prints `surface-unknown`, and the
+# caller that keys on the exit code reads it as a normal answer.
+S21_MUT4="$S21_MUTDIR/record-review-s21-unreadable.sh"
+cp "$RECORD" "$S21_MUT4"
+if grep -q '^      unreadable)$' "$S21_MUT4"; then
+    perl -0pi -e 's/(      unreadable\)\n(?:.*\n)*?        exit )8 \;\;/${1}0 ;;/' "$S21_MUT4"
+    if cmp -s "$RECORD" "$S21_MUT4"; then
+        bad "21.4 mutation: the perl rewrite did not apply — re-anchor the pin"
+    else
+        CC_RC=0
+        CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+            STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+            STUB_CHECKS_ROWS_DIR="$S21_ROWS" STUB_CHECKS_FAIL=1 \
+            bash "$S21_MUT4" --check-carry 425004 "$S21_REPO" 2>/dev/null)" || CC_RC=$?
+        if [ "$CC_RC" = "0" ]; then
+            ok "21.4 MUTATION PIN: with the unreadable arm's refusal removed the same failed read exits 0 — the arm produces the refusal"
+        else
+            bad "21.4 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — something else is producing the exit 8"
+        fi
+    fi
+else
+    bad "21.4 the 'unreadable)' arm is gone — re-anchor the pin"
+fi
+
+# 21.5 AN EMPTY SURFACE IS NOT GREEN. It keeps the normal answer (a head whose checks
+# have not attached yet must not be refused — that is the deadlock #2342 avoids) but it
+# is LOUD, and the record below says `unknown`.
+printf '' > "$S21_ROWS/$S21_HEAD"
+s21_rec 425005 "$S21_HEAD"
+s21_run 425005
+assert_eq "$CC_RC" "0" "21.5 an EMPTY surface keeps the normal answer (no deadlock for a head whose checks have not attached)"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "NOT green" "21.5 …and is LOUD that absence is not green"
+# restore for the remaining arms
+s21_rows "$S21_HEAD" "$S21_GREEN" "$S21_GREEN2"
+
+# 21.6 THE CARRY ARM IS GATED TOO. `carry` is the second answer that reads as a licence
+# ("do NOT re-review … land it"), so it must not be printable over a red tree either.
+# ⛔ THE ROWS GO ON THE LIVE HEAD: the answer this arm publishes is a LICENCE ("the reviewed
+# diff is unchanged — land it") and the head that lands is the LIVE one, so that is the surface
+# judged. (The first version of this fixture reddened the RECORDED head and passed — for the
+# wrong reason: the arm was judging the recorded head at the time.)
+# ⛔ THE RED GOES ON THE **LIVE** HEAD. Since review round 2 the carry arm judges the head that
+# would MERGE (the live one) — see §21.12 for the recorded-head-is-green case, which is the
+# separate and sharper vector.
+s21_rows "$S21_HEAD" "$S21_RED" "$S21_RED2"
+s21_rows "$S21_STALE" "$S21_GREEN" "$S21_GREEN2"
+s21_rows "$S21_BASE" "$S21_GREEN" "$S21_GREEN2"
+printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+    "425006" "$(printf 'd%.0s' $(seq 1 40))" "$S21_SHA" "$S21_REPO" > "$S21_FILE-425006.json"
+s21_run 425006
+assert_eq "$CC_RC" "7" "21.6 the 'carry' arm is gated too: an unchanged diff over a red head answers exit 7"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "red-surface" "21.6 …never 'carry' (which merge-one reads as 'no review ordered')"
+
+# 21.11 THE UNPARSEABLE-ROW SENTINEL IS NEVER ATTRIBUTABLE — the fail-open a review of this
+# change FOUND (round 1, blocking). `check_surface_scan` emits `?|(unparseable row)` for a row
+# it cannot group, and the BASE scan emits the SAME STRING whenever ITS rows are unparseable —
+# including when those rows are GREEN. A plain name-comparison therefore matched the sentinel
+# against itself, `owned == total` held, and a PR-CAUSED red answered `red-base-owned` (exit 0),
+# which merge-one carries and check (c) passes. That is the exact false PASS #3440 exists to
+# close, reached through the attribution instead of through the surface.
+# THE SHAPE MEASURED: a head row whose NAME carries a literal pipe (`shard 1 | slow`), and a
+# base row that is the same job and is SUCCESS — piped, so equally unparseable.
+s21_rows "$S21_HEAD" 'CI|shard 1 | slow|11|completed|failure'
+s21_rows "$S21_BASE" 'CI|shard 1 | slow|11|completed|success'
+s21_rec 425011 "$S21_HEAD"
+s21_run 425011
+assert_eq "$CC_RC" "7" "21.11 an UNPARSEABLE head row over a PIPED-BUT-GREEN base is red-surface (7), never base-owned"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "red-surface" "21.11 …never 'red-base-owned' (the sentinel must not match itself)"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "unattributable" "21.11 …and the diagnosis says the row could not be attributed"
+# (c) MUTATION PIN — the guard is what makes that true. Drop it and the same fixture answers
+# `red-base-owned`/0, i.e. the PR-caused red becomes mergeable again.
+S21_MUT11="$S21_MUTDIR/record-review-s21-sentinel.sh"
+cp "$RECORD" "$S21_MUT11"
+if grep -qF -- 'if [ "$k" = "?|(unparseable row)" ]; then' "$S21_MUT11"; then
+    sed -i.bak 's#^      if \[ "\$k" = "?|(unparseable row)" \]; then$#      if false; then#' "$S21_MUT11"
+    rm -f "$S21_MUT11.bak"
+    if cmp -s "$RECORD" "$S21_MUT11"; then
+        bad "21.11 mutation: the sed did not apply — re-anchor the pin"
+    else
+        CC_RC=0
+        CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+            STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+            STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+            bash "$S21_MUT11" --check-carry 425011 "$S21_REPO" 2>/dev/null)" || CC_RC=$?
+        if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "red-base-owned" ]; then
+            ok "21.11 MUTATION PIN: without the sentinel guard the same PR-caused red answers 'red-base-owned'/0 — the guard is load-bearing"
+        else
+            bad "21.11 mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — the guard is not what produces 21.11"
+        fi
+    fi
+else
+    bad "21.11 the sentinel guard is gone — re-anchor the pin"
+fi
+
+# 21.12 THE `carry` ARM JUDGES THE **LIVE** HEAD — review round 2, BLOCKING. In that arm the
+# recorded head and the live head differ BY CONSTRUCTION, and the head that MERGES is the live one:
+# the ordinary `gh pr update-branch` / base-refresh shape is "diff unchanged, new head, CI re-runs".
+# The first version judged the RECORDED head, so a green recorded head with a RED live head answered
+# `carry`/0 — check (c) passed and merge-one went looking for a 20-40 minute review over a red tree.
+s21_rows "$S21_STALE" "$S21_GREEN" "$S21_GREEN2"     # the reviewed head is green
+s21_rows "$S21_HEAD"  "$S21_RED" "$S21_RED2"         # the LIVE head is red
+s21_rows "$S21_BASE"  "$S21_GREEN" "$S21_GREEN2"
+printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+    "425012" "$S21_STALE" "$S21_SHA" "$S21_REPO" > "$S21_FILE-425012.json"
+s21_run 425012
+assert_eq "$CC_RC" "7" "21.12 a RED LIVE head over an unchanged diff answers exit 7 (the head that merges is the one judged)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "red-surface" "21.12 …never 'carry' (which reads as 'land it')"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "${S21_HEAD:0:12}" "21.12 …and the diagnosis names the LIVE sha, so the operator can see which head is red"
+# (d) MUTATION PIN — judging the recorded head instead puts the licence back.
+S21_MUT12="$S21_MUTDIR/record-review-s21-recordedsha.sh"
+cp "$RECORD" "$S21_MUT12"
+if grep -qF -- 'cc_surface_gate "$CC_LIVE_HEAD" "$CC_DIFF" "$DIFF_HASH"' "$S21_MUT12"; then
+    sed -i.bak 's#^    cc_surface_gate "\$CC_LIVE_HEAD" "\$CC_DIFF" "\$DIFF_HASH"$#    cc_surface_gate "$CC_HEAD" "$CC_DIFF" "$DIFF_HASH"#' "$S21_MUT12"
+    rm -f "$S21_MUT12.bak"
+    if cmp -s "$RECORD" "$S21_MUT12"; then
+        bad "21.12 mutation: the sed did not apply — re-anchor the pin"
+    else
+        CC_RC=0
+        CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+            STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+            STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+            bash "$S21_MUT12" --check-carry 425012 "$S21_REPO" 2>/dev/null)" || CC_RC=$?
+        if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ]; then
+            ok "21.12 MUTATION PIN: judging the RECORDED head answers 'carry'/0 over the same red live head — the live-head choice is load-bearing"
+        else
+            bad "21.12 mutation NOT caught (rc=$CC_RC, out=$CC_OUT)"
+        fi
+    fi
+else
+    bad "21.12 the carry arm's gate call is gone — re-anchor the pin"
+fi
+
+# 21.16 AN UNREAD LIVE HEAD IS NEVER ANSWERED FROM THE RECORDED ONE — review of `988d0968`,
+# BLOCKING. The `carry` arm is the second answer that reads as a LICENCE ("Do NOT re-review …
+# land it"), and the population it exists for is exactly "the head moved, the reviewed diff did
+# not". The head IDENTITY read is a SINGLE un-retried `gh` call while the diff read retries
+# `DIFF_FETCH_ATTEMPTS` times, so "diff readable / head unreadable" is the ordinary degradation,
+# not the exotic one — and the arm used to substitute the RECORDED head for the unread one. That
+# is round 2's BLOCKING shape reached again through the identity read: a GREEN recorded head over
+# a head whose surface was never read answered `carry`/0, which check (c) reads as a PASSING
+# required check and `merge-one.sh`'s RECORD-RECOVERY arm reads as "no review owed".
+# HERE the recorded head IS green and the LIVE head is NOT READABLE (`gh` answers `null`, the
+# API's own shape for an unresolvable ref), so the only correct answer is `surface-unknown`/8.
+s21_rows "$S21_STALE" "$S21_GREEN" "$S21_GREEN2"   # the recorded head's surface: GREEN
+s21_rows "$S21_BASE"  "$S21_GREEN" "$S21_GREEN2"
+printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+    "425020" "$S21_STALE" "$S21_SHA" "$S21_REPO" > "$S21_FILE-425020.json"
+# The ABSENCE assertion below must not see a prior vector's check-runs calls (the §13a idiom).
+s21_unread() { # <script> -> CC_RC/CC_OUT, with the LIVE head UNREADABLE
+    CC_RC=0
+    CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+        STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="null" STUB_BASE_SHA="$S21_BASE" \
+        STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+        bash "$1" --check-carry 425020 "$S21_REPO" 2>"$T/s21-err")" || CC_RC=$?
+}
+: > "$LOG"
+s21_unread "$RECORD"
+assert_eq "$CC_RC" "8" "21.16 an UNREAD live head answers exit 8 (a failed read is not a carry)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "surface-unknown" "21.16 …never 'carry', which reads as 'land it'"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "LIVE head could not be READ" "21.16 …and the diagnosis names the unread LIVE head, so an operator is not sent at the record"
+if grep -qF -- "commits/$S21_STALE/check-runs" "$LOG" 2>/dev/null; then
+    bad "21.16 the RECORDED head's check surface was READ — it is not the head that merges, so its green certifies nothing about the merge"
+else
+    ok "21.16 …and the RECORDED head's surface is never read (its green would be a licence for a sha nobody read)"
+fi
+# (f) MUTATION PIN — THE PRE-FIX CODE, EXACTLY: the guard removed AND the recorded head
+# substituted for the unread one. This is the fail-open the finding names ("silently falls back to
+# the record"), so the pin asserts the OLD answer rather than merely "something else happened".
+# ⛔ THE TWO seds ARE ASSERTED INDIVIDUALLY, AND THE LICENCE'S SOURCE IS PART OF THE PIN (fresh
+# review of 1cc874984, P2). A single `cmp` against the original cannot tell a TWO-PART mutation from
+# a one-part one, and the one-part mutant (guard removed, gate call untouched) ALSO answers
+# `carry`/0 — for a different reason: a blank sha reaches `cc_surface_gate` and the scan's EMPTY arm
+# is a PASS (#2342), which is what pin (b) covers. Measured: with only the guard sed applied, this
+# pin printed its "the substitution IS the fail-open" line while the substitution was not present.
+# So the ok requires BOTH rewrites AND that the run actually READ the RECORDED head's check surface
+# — that read is the proof the green came from the record and not from the blank-sha pass.
+S21_MUT16A="$S21_MUTDIR/record-review-s21-unreadfallback.sh"
+cp "$RECORD" "$S21_MUT16A"
+sed -i.bak 's#^  if \[ -z "\$CC_LIVE_HEAD" \]; then$#  if false; then#' "$S21_MUT16A"
+sed -i.bak 's#^    cc_surface_gate "\$CC_LIVE_HEAD" "\$CC_DIFF" "\$DIFF_HASH"$#    cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"#' "$S21_MUT16A"
+rm -f "$S21_MUT16A.bak"
+if grep -qF -- 'if [ -z "$CC_LIVE_HEAD" ]; then' "$S21_MUT16A" \
+   || ! grep -qF -- 'cc_surface_gate "${CC_LIVE_HEAD:-$CC_HEAD}" "$CC_DIFF" "$DIFF_HASH"' "$S21_MUT16A"; then
+    bad "21.16(a) mutation: the TWO-PART pre-fix rewrite did not apply (the guard must be GONE and the fallback RESTORED) — re-anchor the pin"
+else
+    : > "$LOG"
+    s21_unread "$S21_MUT16A"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ] \
+       && grep -qF -- "commits/$S21_STALE/check-runs" "$LOG" 2>/dev/null; then
+        ok "21.16(a) MUTATION PIN: restoring the fallback over an UNREAD live head answers 'carry'/0 AND the run reads the RECORDED head's check surface — the recorded-head substitution IS the fail-open"
+    else
+        bad "21.16(a) mutation NOT caught (rc=$CC_RC, out=$CC_OUT, recorded-head check-runs reads=$(grep -cF -- "commits/$S21_STALE/check-runs" "$LOG" 2>/dev/null)) — either the answer is not 'carry'/0 or the licence did not come from the RECORDED head"
+    fi
+fi
+# (g) AND THE GUARD ALONE IS LOAD-BEARING — not merely "we happen to pass the right variable".
+# With only the guard deleted, `cc_surface_gate ""` is what runs; the scan's `empty` arm is a PASS
+# (#2342), so the same stub answers `carry`/0 — and the log shows the BLANK-SHA url, which is what
+# proves the licence came from the empty pass and not from the record. Correctness must not rest on
+# the real API turning a blank sha into a 422 — measured here so the guard cannot be tidied away as
+# redundant.
+S21_MUT16B="$S21_MUTDIR/record-review-s21-noguard.sh"
+cp "$RECORD" "$S21_MUT16B"
+sed -i.bak 's#^  if \[ -z "\$CC_LIVE_HEAD" \]; then$#  if false; then#' "$S21_MUT16B"
+rm -f "$S21_MUT16B.bak"
+if grep -qF -- 'if [ -z "$CC_LIVE_HEAD" ]; then' "$S21_MUT16B" \
+   || ! grep -qF -- 'cc_surface_gate "$CC_LIVE_HEAD" "$CC_DIFF" "$DIFF_HASH"' "$S21_MUT16B"; then
+    bad "21.16(b) mutation: the sed did not apply — re-anchor the pin"
+else
+    : > "$LOG"
+    s21_unread "$S21_MUT16B"
+    if [ "$CC_RC" = "0" ] && [ "${CC_OUT%%"$S21_TAB"*}" = "carry" ] \
+       && grep -qF -- "commits//check-runs" "$LOG" 2>/dev/null; then
+        ok "21.16(b) MUTATION PIN: without the guard the BLANK sha reaches cc_surface_gate and the same unread head answers 'carry'/0 via the scan's empty pass — the refusal is OURS, not the transport's"
+    else
+        bad "21.16(b) mutation NOT caught (rc=$CC_RC, out=$CC_OUT) — the guard is not what produces 21.16"
+    fi
+fi
+
+# 21.15 THE SURFACE FIELDS ARE VOLATILE IN THE #1709 rec 7 IDENTITY — review round 3, coverage.
+# A record re-minted at the SAME head that observes a DIFFERENT surface (red → green after a re-run)
+# must be a NO-OP: `reviewed_at` is the audit trail's only join to the authorising dispatch, and a
+# refresh must not move it. If either strip in `record_identity` is dropped, the second mint is
+# treated as a NEW record, rewrites the file and re-stamps `reviewed_at` — and nothing else in this
+# suite notices, because every other mint is one per PR.
+s21_rows "$S21_HEAD" "$S21_RED"
+rm -f "$S21_FILE-425015.json"
+export STUB_CHECKS_ROWS_DIR="$S21_ROWS"
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425015
+S21_REC15A="$(cat "$S21_FILE-425015.json" 2>/dev/null || echo)"
+assert_contains "$S21_REC15A" '"check_surface":"red"' "21.15 fixture: the first mint records the RED surface"
+S21_AT15="$(printf '%s' "$S21_REC15A" | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p')"
+sleep 1
+s21_rows "$S21_HEAD" "$S21_GREEN" "$S21_GREEN2"
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425015
+S21_REC15B="$(cat "$S21_FILE-425015.json" 2>/dev/null || echo)"
+assert_contains "$(printf '%s' "$S21_REC15B" | sed -n 's/.*"check_surface":"\([^"]*\)".*/\1/p')" "red" \
+  "21.15 a re-mint at the same head with a CHANGED surface is a #1709 rec 7 NO-OP (the first observation stands)"
+assert_contains "$(printf '%s' "$S21_REC15B" | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p')" "$S21_AT15" \
+  "21.15 …and reviewed_at did NOT move (the audit join is preserved)"
+assert_contains "$(printf '%s' "$RECORD_ERR" | command tr '\n' '|')" "idempotent" \
+  "21.15 …and the recorder SAYS it was a no-op, so the state is diagnosable"
+# (e) MUTATION PIN — drop the strip and the second mint rewrites the record.
+# ⛔ THE MUTANT IS BUILT WITH `grep -vF` ON A FIXED STRING, not a sed script: the line being
+# removed is itself full of shell/regex metacharacters (`'`, `"`, `[^"]*`), and a sed address
+# written to match it is a parsing puzzle rather than a test. Fixed-string deletion is exact.
+S21_MUT15="$S21_MUTDIR/record-review-s21-nostrip.sh"
+S21_STRIP_PAT='-e '"'"'s/"check_surface":"[^"]*",//'"'"''
+if grep -qF -- "$S21_STRIP_PAT" "$RECORD"; then
+    grep -vF -- "$S21_STRIP_PAT" "$RECORD" > "$S21_MUT15"
+    if cmp -s "$RECORD" "$S21_MUT15"; then
+        bad "21.15 mutation: the fixed-string deletion did not apply — re-anchor the pin"
+    else
+        s21_rows "$S21_HEAD" "$S21_RED"
+        rm -f "$S21_FILE-425016.json"
+        EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425016
+        s21_rows "$S21_HEAD" "$S21_GREEN" "$S21_GREEN2"
+        S21_REC16A="$(cat "$S21_FILE-425016.json" 2>/dev/null || echo)"
+        S21_AT16="$(printf '%s' "$S21_REC16A" | sed -n 's/.*"reviewed_at":"\([^"]*\)".*/\1/p')"
+        sleep 1
+        S21_SAVE="$RECORD"
+        RECORD="$S21_MUT15"
+        EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425016
+        RECORD="$S21_SAVE"
+        S21_REC16B="$(cat "$S21_FILE-425016.json" 2>/dev/null || echo)"
+        if [ "$(printf '%s' "$S21_REC16B" | sed -n 's/.*"check_surface":"\([^"]*\)".*/\1/p')" = "green" ]; then
+            ok "21.15 MUTATION PIN: with the strip removed the same head is RE-MINTED (surface rewritten to green) — the volatility rule is load-bearing"
+        else
+            bad "21.15 mutation NOT caught (record still: $(printf '%s' "$S21_REC16B" | command head -c 160))"
+        fi
+    fi
+else
+    bad "21.15 the record_identity strip is gone — re-anchor the pin"
+fi
+
+# 21.13 IN FLIGHT is a deliberate POLICY (it keeps the normal answer and says so). Pinned because
+# flipping it either way is invisible to every other assertion: refusing would deadlock every lane
+# that asks mid-CI, and silence would be the bare green #3440 exists to end.
+s21_rows "$S21_HEAD" 'CI|bash-suites (3)|11|in_progress|null' 'CI|verify|12|completed|success'
+s21_rec 425013 "$S21_HEAD"
+s21_run 425013
+assert_eq "$CC_RC" "0" "21.13 an IN-FLIGHT surface keeps the normal answer (refusing would deadlock every lane that asks mid-CI)"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "IN FLIGHT" "21.13 …and says IN FLIGHT, never reading an unfinished surface as green"
+
+# 21.14 NO REPO RESOLVED is a REFUSAL, not a pass — the check-runs query is repo-scoped, and a PR
+# number alone does not name one. Pinned because it is the only surface outcome whose remedy is
+# "pass the repo", and nothing else in the suite reaches it.
+s21_rows "$S21_HEAD" "$S21_GREEN" "$S21_GREEN2"
+s21_rec 425014 "$S21_HEAD"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+    STUB_CHECKS_ROWS_DIR="$S21_ROWS" STUB_REPO_NAME="" \
+    bash "$RECORD" --check-carry 425014 2>"$T/s21-err")" || CC_RC=$?
+assert_eq "$CC_RC" "8" "21.14 with NO repo resolvable the surface cannot be read, so the answer is exit 8 (never a green)"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "Pass it positionally" "21.14 …and the remedy names the argument to pass"
+
+# ── 21.7–21.10: THE MINT PATH ─────────────────────────────────────────────
+# The record must SAY what the surface was when the verdict was recorded. This is the
+# half that makes the datum readable AFTER the fact — `--check-carry` deliberately
+# re-reads LIVE instead of trusting a stored flag.
+s21_rows "$S21_HEAD" "$S21_RED"
+rm -f "$S21_FILE-425007.json"   # the MINT under test must create it: a pre-existing record
+# with the same deterministic identity makes the mint a #1709 rec 7 NO-OP, so the file would
+# keep the shape below and the assertion would measure nothing.
+export STUB_CHECKS_ROWS_DIR="$S21_ROWS"
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425007
+S21_REC7="$(cat "$S21_FILE-425007.json" 2>/dev/null || echo)"
+if [ ! -s "$S21_FILE-425007.json" ]; then
+    bad "21.7 fixture: the mint wrote NO record (rc=$RECORD_RC, err=$(printf '%s' "$RECORD_ERR" | command head -12 | command tr '\n' '|'))"
+fi
+assert_contains "$S21_REC7" '"check_surface":"red"' "21.7 a mint at a RED head records check_surface=red (the fact is in the artifact, not just on stderr)"
+assert_contains "$S21_REC7" '"check_surface_red":"CI|bash-suites (3)' "21.7 …and names the red group, so a later reader can see WHAT was red"
+assert_contains "$(printf '%s' "$S21_REC7" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("check_surface",""))' 2>/dev/null)" "red" "21.7 …and the record still PARSES as JSON (the field cannot break the envelope)"
+
+# (c) THE ISSUE'S OWN REQUIRED MUTANT: drop the check-runs read from the mint path.
+S21_MUT7="$S21_MUTDIR/record-review-s21-noread.sh"
+cp "$RECORD" "$S21_MUT7"
+if grep -q 'SURFACE_CELL="$(check_surface_scan "$SHA" 2>/dev/null)" || SURFACE_CELL="unreadable"' "$S21_MUT7"; then
+    sed -i.bak 's#SURFACE_CELL="$(check_surface_scan "$SHA" 2>/dev/null)" || SURFACE_CELL="unreadable"#SURFACE_CELL="green"#' "$S21_MUT7"
+    rm -f "$S21_MUT7.bak"
+    if cmp -s "$RECORD" "$S21_MUT7"; then
+        bad "21.7 mutation: the sed did not apply — re-anchor it rather than dropping the pin"
+    else
+        printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+            "425017" "$S21_HEAD" "$S21_SHA" "$S21_REPO" > "$S21_FILE-425017.json"
+        # ⛔ THE MUTANT IS DRIVEN BY POINTING `RECORD` AT IT, restored immediately after:
+        # an `VAR=… run_record …` prefix on a FUNCTION persists in bash, which makes the
+        # restore easy to get wrong and leaves every LATER section running the mutant.
+        S21_RECORD_SAVE="$RECORD"
+        RECORD="$S21_MUT7"
+        EV_REF="comment:7391001" run_record "$S21_REPO" 425017
+        RECORD="$S21_RECORD_SAVE"
+        S21_REC17="$(cat "$S21_FILE-425017.json" 2>/dev/null || echo)"
+        # ⛔ NO PIPE (#841/#864) — here-string, the transform the exceptions file records.
+        if grep -q '"check_surface":"green"' <<<"$S21_REC17"; then
+            ok "21.7 MUTATION PIN: with the check-runs read dropped the record says check_surface=green over the SAME red head — the read is load-bearing"
+        else
+            bad "21.7 mutation NOT caught (record: $S21_REC17) — 21.7 would pass on a mutant that never reads CI"
+        fi
+    fi
+else
+    bad "21.7 the mint-path surface read is gone — re-anchor the pin (this is #3440's required mutant)"
+fi
+
+# 21.8 THE FLEET'S OWN EVIDENCE GATE IS EXCLUDED — and this is LOAD-BEARING, not tidiness:
+# `ai-review-gate` is red precisely BECAUSE the evidence is not recorded yet, so at mint
+# time it is ALWAYS red. Counting it would make every fresh record say `red` and every
+# `--check-carry` after it refuse — the change would convert the whole attestation path
+# into a no-op. One green group + the gate red must therefore record `green`.
+s21_rows "$S21_HEAD" "$S21_GREEN" 'ai-review-gate|ai-review-gate|99|completed|failure'
+rm -f "$S21_FILE-425008.json"   # the MINT under test must create it: a pre-existing record
+# with the same deterministic identity makes the mint a #1709 rec 7 NO-OP, so the file would
+# keep the shape below and the assertion would measure nothing.
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425008
+S21_REC8="$(cat "$S21_FILE-425008.json" 2>/dev/null || echo)"
+if [ ! -s "$S21_FILE-425008.json" ]; then
+    bad "21.8 fixture: the mint wrote NO record (rc=$RECORD_RC, err=$(printf '%s' "$RECORD_ERR" | tail -3))"
+fi
+assert_contains "$S21_REC8" '"check_surface":"green"' "21.8 the fleet's own evidence gate is EXCLUDED (a gate red for stale evidence must not brand every fresh record red)"
+
+# 21.9 A HOSTILE CHECK NAME CANNOT BREAK THE ENVELOPE. A workflow name is repo content,
+# so a quote or a backslash in it would truncate the one-line JSON — and the gate reads
+# an unparseable record as NO RECORD (#3400's failure mode).
+s21_rows "$S21_HEAD" 'CI|evil"name\here|11|completed|failure'
+rm -f "$S21_FILE-425009.json"   # the MINT under test must create it: a pre-existing record
+# with the same deterministic identity makes the mint a #1709 rec 7 NO-OP, so the file would
+# keep the shape below and the assertion would measure nothing.
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425009
+if python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d["check_surface"]=="red" else 1)' "$S21_FILE-425009.json" 2>/dev/null; then
+    ok "21.9 a check name carrying quote/backslash still yields a PARSEABLE record with check_surface=red"
+else
+    bad "21.9 the hostile check name broke the record: $(cat "$S21_FILE-425009.json" 2>/dev/null | command head -c 200)"
+fi
+
+# 21.10 AN UNREADABLE SURFACE RECORDS `unknown`, NEVER `green`. Item 4 of the issue:
+# a surface that cannot be read is not green, and the record must say so.
+rm -f "$S21_FILE-425010.json"   # the MINT under test must create it: a pre-existing record
+# with the same deterministic identity makes the mint a #1709 rec 7 NO-OP, so the file would
+# keep the shape below and the assertion would measure nothing.
+CC_RC=0
+# A REFUSED read is an ENV effect, so it is exported rather than passed as a command
+# prefix: `VAR=… run_record_rc …` on a FUNCTION persists in bash and would leak the failure
+# into every later recorder call in the suite.
+export STUB_CHECKS_FAIL=1
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425010
+unset STUB_CHECKS_FAIL
+S21_REC10="$(cat "$S21_FILE-425010.json" 2>/dev/null || echo)"
+assert_contains "$S21_REC10" '"check_surface":"unknown"' "21.10 an UNREADABLE surface records 'unknown' (never 'green' — absence is not evidence)"
+if grep -q '"check_surface":"green"' <<<"$S21_REC10"; then
+    bad "21.10 a failed read was recorded as GREEN"
+else
+    ok "21.10 …and NOT 'green'"
+fi
+# 21.17 A SURFACE WHOSE ROWS ARE ALL EXCLUDED IS `empty`, NOT `green` — review of `554d272`, P2.
+# The early guard caught only an EMPTY RESPONSE, so a head whose only run is the excluded
+# `ai-review-gate` fell through to `green`: the record asserted `check_surface:green` about a
+# surface whose only observed check is RED (contradicting the scan's own contract, line 2470, and
+# the mint-path comment), and `--check-carry` printed NO not-green line where the design promises
+# one. "Nothing observable" must never be worded as "everything observed passed".
+s21_rows "$S21_HEAD" 'ai-review-gate|ai-review-gate|99|completed|failure'
+s21_rows "$S21_BASE" "$S21_GREEN" "$S21_GREEN2"
+s21_rec 425018 "$S21_HEAD"
+s21_run 425018
+assert_eq "$CC_RC" "0" "21.17 an all-excluded surface keeps the normal answer (the exclusion is a recorded decision, not a refusal)"
+assert_contains "$(cat "$T/s21-err" 2>/dev/null)" "NO readable check run" "21.17 …and is LOUD that nothing observable is not green (it used to be silently 'green')"
+export STUB_CHECKS_ROWS_DIR="$S21_ROWS"
+rm -f "$S21_FILE-425020.json"   # the MINT under test must create it: a pre-existing record
+# with the same deterministic identity makes the mint a #1709 rec 7 NO-OP, so the file would
+# keep the shape below and the assertion would measure nothing.
+EV_REF="comment:7391001" run_record_verdict clean "$S21_REPO" 425020
+S21_REC20="$(cat "$S21_FILE-425020.json" 2>/dev/null || echo)"
+if [ ! -s "$S21_FILE-425020.json" ]; then
+    bad "21.17 fixture: the mint wrote NO record (rc=$RECORD_RC, err=$(printf '%s' "$RECORD_ERR" | command tail -3))"
+fi
+assert_contains "$S21_REC20" '"check_surface":"unknown"' "21.17 an all-excluded surface records 'unknown', never 'green'"
+if grep -q '"check_surface":"green"' <<<"$S21_REC20"; then
+    bad "21.17 a surface with NOTHING observable was recorded as GREEN"
+else
+    ok "21.17 …and NOT 'green'"
+fi
+# (a) MUTATION PIN — revert the `nseen == 0` branch and the SAME fixture records `green`.
+S21_MUT18="$S21_MUTDIR/record-review-s21-excludedgreen.sh"
+cp "$RECORD" "$S21_MUT18"
+if grep -qF 'else if (nseen == 0) print "empty"' "$S21_MUT18"; then
+    sed -i.bak 's#else if (nseen == 0) print "empty"#else if (nseen == 0) print "green"#' "$S21_MUT18"
+    rm -f "$S21_MUT18.bak"
+    if cmp -s "$RECORD" "$S21_MUT18"; then
+        bad "21.17 mutation: the sed did not apply — re-anchor it rather than dropping the pin"
+    else
+        printf '{"pr":%s,"head_sha":"%s","diff_sha256":"%s","verdict":"clean","mint":"fresh","repo":"%s","reviewed_at":"2026-10-20T00:00:00Z"}\n' \
+            "425021" "$S21_HEAD" "$S21_SHA" "$S21_REPO" > "$S21_FILE-425021.json"
+        S21_RECORD_SAVE="$RECORD"
+        RECORD="$S21_MUT18"
+        EV_REF="comment:7391001" run_record "$S21_REPO" 425021
+        RECORD="$S21_RECORD_SAVE"
+        S21_REC21="$(cat "$S21_FILE-425021.json" 2>/dev/null || echo)"
+        # ⛔ NO PIPE (#841/#864) — here-string, the transform the exceptions file records.
+        if grep -q '"check_surface":"green"' <<<"$S21_REC21"; then
+            ok "21.17 MUTATION PIN: with the 'nothing observable' branch reverted the record says check_surface=green over the SAME excluded-only surface — the branch is load-bearing"
+        else
+            bad "21.17 mutation NOT caught (record: $S21_REC21) — 21.17 would pass on a reader that calls an unobservable surface green"
+        fi
+    fi
+else
+    bad "21.17 the 'nothing observable is empty' branch is gone — re-anchor the pin"
+fi
+
+# 21.18 AN AMBIENT `RECORD_REVIEW_RED_EXCLUDE` CANNOT HIDE A RED — review of `988d0968`, and it is
+# category A, not a nit: "disable a gate by ambient env" is a BYPASS. The exclusion used to be
+# `${RECORD_REVIEW_RED_EXCLUDE-…}`, so any caller could REPLACE it — including with the name of the
+# very job that is failing — and `--check-carry` then read the surface GREEN and answered `head` /
+# exit 0 (a merge licence), which check (c) passes on. The exclusion itself is a recorded decision
+# (#1590) and is unchanged; only the silent per-invocation override is gone.
+s21_rows "$S21_HEAD" "$S21_GREEN" 'CI|verify|12|completed|failure'   # only `verify` is RED on the head
+s21_rows "$S21_BASE" "$S21_GREEN" "$S21_GREEN2"
+s21_rec 425022 "$S21_HEAD"
+CC_RC=0
+CC_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+    RECORD_REVIEW_RED_EXCLUDE="verify" \
+    STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 \
+    STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+    STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+    bash "$RECORD" --check-carry 425022 "$S21_REPO" 2>"$T/s21-err")" || CC_RC=$?
+assert_eq "$CC_RC" "7" "21.18 an ambient RED_EXCLUDE naming the failing job still answers exit 7 (a gate cannot be disabled from the environment)"
+assert_eq "${CC_OUT%%"$S21_TAB"*}" "red-surface" "21.18 …with its own token, never 'head'"
+# (a) MUTATION PIN — restore the `${VAR-default}` override and the SAME invocation answers `head`/0.
+S21_MUT19="$S21_MUTDIR/record-review-s21-envoverride.sh"
+cp "$RECORD" "$S21_MUT19"
+if grep -qxF 'RECORD_REVIEW_RED_EXCLUDE="ai-review-gate ai-review-gate-tests"' "$S21_MUT19"; then
+    sed -i.bak 's#^RECORD_REVIEW_RED_EXCLUDE="ai-review-gate ai-review-gate-tests"$#RECORD_REVIEW_RED_EXCLUDE="${RECORD_REVIEW_RED_EXCLUDE-ai-review-gate ai-review-gate-tests}"#' "$S21_MUT19"
+    rm -f "$S21_MUT19.bak"
+    if cmp -s "$RECORD" "$S21_MUT19"; then
+        bad "21.18 mutation: the sed did not apply — re-anchor it rather than dropping the pin"
+    else
+        S21_RC19=0
+        HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" GH_REPO="" \
+            RECORD_REVIEW_RED_EXCLUDE="verify" \
+            STUB_DIFF_FILE="$S21_DIFF" STUB_DIFF_FAIL=0 \
+            STUB_HEAD_SHA="$S21_HEAD" STUB_BASE_SHA="$S21_BASE" \
+            STUB_CHECKS_ROWS_DIR="$S21_ROWS" \
+            bash "$S21_MUT19" --check-carry 425022 "$S21_REPO" >/dev/null 2>&1 || S21_RC19=$?
+        if [ "$S21_RC19" -eq 0 ]; then
+            ok "21.18 MUTATION PIN: with the ambient override restored the same invocation answers exit 0 over the SAME red head — the override was a bypass, not a convenience"
+        else
+            bad "21.18 mutation NOT caught (rc=$S21_RC19, wanted 0) — 21.18 would pass without the pin"
+        fi
+    fi
+else
+    bad "21.18 the constant exclusion assignment is gone — re-anchor the pin"
+fi
+unset STUB_CHECKS_ROWS_DIR
+rm -rf "$S21_ROWS"
 
 echo ""
 echo "  PASS=$PASS FAIL=$FAIL"

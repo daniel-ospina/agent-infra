@@ -65,8 +65,9 @@
 # `key_gate_stored_credential` is therefore consulted BEFORE the refusal, and its answer is the third
 # "cannot say" arm: it asserts nothing.
 
-# The refusal carries its own status: 82 is unassigned elsewhere in this tree (70-81 are spawn-gate's,
-# repo-target's and brief-gate's; 93-98 are the worker launch-line guards'), and a shared code would
+# The refusal carries its own status: 82 is unassigned elsewhere in this tree (70-83 are spawn-gate's,
+# repo-target's and brief-gate's — 83 is the HARNESS/SKEW gate since agent-infra#3237; 93-98 are the
+# worker launch-line guards'), and a shared code would
 # make two opposite remedies indistinguishable — the defect #2293 fixed for 73/74.
 KEY_GATE_REFUSED=82
 
