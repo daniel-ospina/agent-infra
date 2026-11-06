@@ -426,11 +426,11 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 # scout path, via `refresh-candidates.sh`), among others.
 # ⛔ NO COUNT IS GIVEN HERE, DELIBERATELY. This paragraph used to say "Five scripts" and name exactly
 # five. That number was FALSE, and so was every numeral that replaced it: run the census below and you
-# get many more files than five, most of them NOT harness files. A hand-maintained count rots, and a
-# reader sizing the exposure from a number nobody re-measures is worse off than one who enumerates. So
-# ENUMERATE instead — this is the script-scoped census, and it deliberately admits comments (a
-# comment-only mention still lists the file), which makes it a SUPERSET to audit rather than a list
-# that can silently shrink. Filter `\.test\.sh$`, `retired/`, and the three gated callers:
+# get many more files than five. A hand-maintained count rots, and a reader sizing the exposure from a
+# number nobody re-measures is worse off than one who enumerates. So ENUMERATE instead — this is the
+# script-scoped census, and it deliberately admits comments (a comment-only mention still lists the
+# file), which makes it a SUPERSET to audit rather than a list that can silently shrink. Filter
+# `\.test\.sh$`, `retired/`, and the three gated callers:
 #     git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired
 # Moving any of them onto `wt_provision` (or the `--disk-admit` verb) is the follow-up.
 #

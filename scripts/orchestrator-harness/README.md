@@ -5153,15 +5153,15 @@ volume.
 
 ⛔ **NO COUNT IS GIVEN HERE, DELIBERATELY.** An earlier revision of this paragraph said "five" and
 named exactly five. That number was **false**, and so was every numeral that replaced it: the census
-below returns many more files than five, most of them not harness files. A hand-maintained count rots
-and a reader sizing the exposure from a number nobody re-measures is worse off than one who
-enumerates. Enumerate instead:
+below returns many more files than five. A hand-maintained count rots and a reader sizing the
+exposure from a number nobody re-measures is worse off than one who enumerates. Enumerate instead:
 `git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired` is a
 **superset** to audit (it deliberately admits comments — a comment-only mention still lists the
-file — and the filters below then drop tests); the three gated callers
-(`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`), the seam's own `wt-lifecycle.sh`, and this file
-are the rows to drop from it. Moving the rest onto `wt_provision` (or the `--disk-admit` verb) is the
-follow-up this change does not do.
+file — and the filters below then drop tests). The rows to drop from it are the three gated callers
+(`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`) and the seam's own `wt-lifecycle.sh`. This file is
+NOT one of its rows: the population is `.sh`-scoped, so `README.md` is outside the printed census
+entirely. Moving the rest onto `wt_provision` (or the `--disk-admit` verb) is the follow-up this
+change does not do.
 
 Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
 the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real
