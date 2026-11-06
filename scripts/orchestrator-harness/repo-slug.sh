@@ -211,3 +211,334 @@ _resolve_repo_remedy() {
   REPO is the CHECKOUT PATH of the repo this box grades — never an owner/name slug.
 REMEDY
 }
+
+# ══ REPO IDENTITY — a directory must not lie about which repo it is (agent-infra#2148) ══════════
+#
+# THE MEASURED DEFECT (2026-11-05, cell-2). `/home/cmux/agent-infra` was a checkout of
+# `daniel-ospina/tortoise`. Nothing errored: `pull/3456/head` would not resolve, its `main` reported
+# commits no other box had, and EVERY lane told `cd /home/cmux/agent-infra` was doing tortoise work —
+# silently. A dead box is visible; a mis-pointed box produces plausible work against the wrong
+# repository, which is the expensive failure. The four other cells were clean, so the check did not
+# exist and nothing noticed. A second shape of the same class is still live: four checkouts of ONE
+# repo at four different heads, where a lane that `cd`s into the wrong one builds against a stale
+# tree and nothing says which is canonical.
+#
+# ⛔ THE DIRECTION OF THE COMPARISON IS THE WHOLE FIX. The bug was TRUSTING A NAME. So identity is read
+# from `remote.origin.url` — the checkout's own config file, through the same scrub `derive_or` uses —
+# and the DIRECTORY BASENAME is then compared against what the origin says it is. Never the reverse,
+# and never a name that is taken as evidence of anything.
+#
+# WHY THE WALKER LIVES HERE, WITH THE PARSER, RATHER THAN BESIDE EACH CALLER. `repo-slug.sh` is the one
+# place that turns a checkout into `owner/name`, and it is already seeded into every cell's `$O` and
+# listed in `install.sh`'s DRIFTED set — so one shared implementation reaches the bring-up and the
+# doctor with no new file to seed and no list to keep in step. Two spellings of "does this name match
+# its origin" is exactly how the next divergence starts: the bring-up would refuse a box the doctor
+# called healthy, or the reverse, and neither reader would be able to say which one was right.
+# ⛔ AND WHY NOT `check-deployed-drift.sh --surface`, which also enumerates trees on a box: its walker
+# answers a DIFFERENT question — whether each HARNESS dir's bytes match a git ref, which needs a
+# resolvable `$REF` and a `--repo` checkout and compares `*.sh` payloads. Its candidate set is
+# harness-shaped (the running controller's dir, `$O`, the pin root, the home-dir harness dirs), and it
+# is silent about a CHECKOUT whose name lies. Reusing it here would mean bending one instrument to
+# answer a question it was not built for; the shared piece is the SLUG PARSE (`repo_slug_from_remote`
+# above), which is what both use — so there are two walkers for two questions and ONE parser for one.
+
+# repo_identity_declared <basename> [<own-repo-name>] — a name that DELIBERATELY does not name its repo.
+# Prints two lines: the repo name this basename is allowed to carry (`*` = any), and the reason. rc 1
+# when the basename is not declared (the normal case: a directory is expected to name its repo).
+# `<own-repo-name>` is the repo THIS BOX is for (see `repo_identity_own_repo`), and only the generic
+# cell-checkout rows below use it — every other row names its repo explicitly.
+#
+# ⛔ DECLARED HERE, IN ONE TABLE, AND NOT INFERRED FROM THE BOX. An allowlist that lived in an env var
+# or was inferred from "this path looks like ours" would let the very defect it excuses ("this
+# directory is called X but holds Y") rewrite its own exemption. Adding a row is a deliberate act with
+# a written reason, and every row is a NAMED CELL LAYOUT fact, not a guess.
+# ⛔ AND A ROW COVERS EXACTLY ONE REPO — NOT ONE NAME. `harness-src` may carry agent-infra; an
+# `harness-src` holding a tortoise checkout is a directory lying about which repo it is, and is
+# refused like any other. A name-keyed exemption would have been a permanent hole in the check, on the
+# one box (cell-1) where three of these directories already exist.
+repo_identity_declared() {
+  case "${1:-}" in
+    # The per-commit harness tree: the harness is checked out AT A COMMIT, so the directory is named
+    # for its role, not for the repo. Legitimate (measured on cell-1 beside `agent-infra/`).
+    harness-src)
+      printf '%s\n%s\n' 'agent-infra' \
+        'a per-commit harness tree — the harness is checked out at a COMMIT, so the directory names its role, not the repo' ;;
+    # `cell-install.sh` clones agent-infra here and every cell calls it `cell-ai`; the supervisor's own
+    # doc line for it is "agent-infra checkout" (docs/ops/disk-consumers.md).
+    cell-ai|cell-ai-main)
+      printf '%s\n%s\n' 'agent-infra' \
+        'the bring-up checkout — cell-install.sh clones agent-infra to /tmp/cell-ai, and every cell names it by that role' ;;
+    # The cell's short alias for the same checkout, seen on cell-1 alongside `agent-infra/` and
+    # `harness-src/`. A host alias, not a repo name: allowed ONLY for agent-infra.
+    ai)
+      printf '%s\n%s\n' 'agent-infra' \
+        "the cell's short alias for the agent-infra checkout (measured on cell-1 beside agent-infra/ and harness-src/)" ;;
+    # A dated quarantine holds whatever a repair set aside, so it cannot name one repo — but the DATE
+    # is what makes it reviewable, and anything else in this shape is refused by the glob.
+    *-legacy-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
+      printf '%s\n%s\n' '*' \
+        'a dated QUARANTINE — a tree a repair set aside, kept because it may hold commits that exist nowhere else; the date is what keeps it reviewable' ;;
+    # ⛔ THE GENERIC CELL-CHECKOUT NAMES, AND WHY THEY BELONG HERE RATHER THAN IN A REFUSAL. This repo's
+    # OWN discovery code (`orchestrator-bringup.sh`'s `reseed_candidates`) names `$CELL_HOME/clone`,
+    # `$CELL_HOME/repo` and `$CELL_HOME/cell-*` as the places a cell's checkout may live. A check that
+    # REFUSED a layout this repo itself blesses would be an instrument false positive that blocks
+    # provisioning — and the rule is to fix the instrument, not to make an operator rename a directory
+    # to satisfy it.
+    # ⛔ IT IS STILL NOT A HOLE: the expectation is THE CELL'S OWN REPO, so a `clone` holding some
+    # OTHER repo is refused exactly like any other lying name. `cell-ai`/`cell-ai-main` are matched by
+    # the row ABOVE (first match wins), because those two are always the HARNESS checkout, never the
+    # cell's own.
+    clone|repo|cell|cell-*)
+      # ⛔ NO `*` FALLBACK. With the box's own repo unknown, `*` would exempt EVERY repo under these
+      # names while the message claimed the opposite — a fail-open with a reassuring sentence, which is
+      # the shape this repo treats as worse than a refusal. The `?` sentinel therefore means "this name
+      # is a generic cell-checkout name, and WHICH repo it may carry is not knowable on this box", and
+      # the scan reports that as UNVERIFIED: not a lie (nothing was measured), and never a pass.
+      if [ -n "${2:-}" ]; then
+        printf '%s\n%s\n' "$2" \
+          "a generic CELL CHECKOUT name (orchestrator-bringup.sh's own candidate list) — allowed only for THE CELL'S OWN repo ($2), so another repo here is still a lying directory"
+      else
+        printf '%s\n%s\n' '?' \
+          "a generic CELL CHECKOUT name (orchestrator-bringup.sh's own candidate list), but this box declares no repo of its own (no \$REPO origin, no \$REPO_SLUG, no \$OR) — so WHICH repo may sit here cannot be decided"
+      fi ;;
+    *) return 1 ;;
+  esac
+}
+
+# repo_identity_origin <dir> — the checkout's OWN `remote.origin.url`, or rc 1. Same reader, same
+# scrub and same `--local` as `derive_or` above (an ambient `GIT_DIR`/`insteadOf` must not re-point the
+# origin this comparison rests on). `.git` is tested with `-e`, never `-d`: a linked WORKTREE carries
+# `.git` as a FILE.
+repo_identity_origin() {
+  local dir="${1:-}" url=""
+  [ -n "$dir" ] || return 1
+  [ -e "$dir/.git" ] || return 1
+  url="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+    git -C "$dir" config --local --get remote.origin.url 2>/dev/null || true)"
+  [ -n "$url" ] || return 1
+  printf '%s\n' "$url"
+}
+
+# repo_identity_head <dir> — the short HEAD, or EMPTY (printed as `<unreadable>` by the caller).
+# `--verify --quiet` is load-bearing: a bare `rev-parse <unknown>` echoes its argument to stdout, so a
+# capture would read an unresolvable commit as resolved.
+repo_identity_head() {
+  local h
+  h="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+    git -C "${1:-}" rev-parse --verify --quiet HEAD 2>/dev/null || true)"
+  [ -n "$h" ] || return 0
+  printf '%s\n' "${h:0:12}"
+}
+
+# repo_identity_own_repo — the repo THIS BOX is for, when the caller knows it: the `owner/name` of
+# `$REPO`'s own origin first (the checkout the box works), else the declared `$REPO_SLUG`, else the
+# queue repo `$OR`. Prints the REPO NAME only (the segment a directory would carry), or nothing.
+# ⛔ It never decides whether a name is acceptable in general — only the generic cell-checkout rows use
+# it, and they use it to say WHICH one repo may sit under a name that omits the repo. When it prints
+# NOTHING the caller must not pretend it knows: `repo_identity_declared` reports the generic names as
+# UNVERIFIED rather than as an exemption (a `*` there would exempt every repo, which is the hole this
+# whole check exists to close).
+repo_identity_own_repo() {
+  local slug="" url=""
+  if [ -n "${REPO:-}" ] && [ -e "${REPO}/.git" ]; then
+    url="$(repo_identity_origin "$REPO")" || url=""
+    if [ -n "$url" ]; then slug="$(repo_slug_from_remote "$url" 2>/dev/null)"; fi
+  fi
+  [ -n "$slug" ] || slug="${REPO_SLUG:-}"
+  [ -n "$slug" ] || slug="${OR:-}"
+  [ -n "$slug" ] || return 0
+  printf '%s\n' "${slug#*/}"
+}
+
+# repo_identity_fold <text> — GitHub slugs are case-insensitive (`repo_slug_valid` above says so and the
+# fleet's comparer folds them), so a directory named `Agent-Infra` does not lie about `agent-infra`.
+repo_identity_fold() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+
+# repo_identity_scan <root>... — ONE verdict per finding, as `<verdict><TAB><message>`:
+#     ok | warn | fatal
+# rc 0 = nothing fatal, 1 = at least one `fatal` line was printed. The CALLER owns the wording prefix
+# (`ok`/`warn`/`die` for the bring-up, a log line for the doctor) and the refusal itself; this function
+# owns the VERDICT, so the two callers cannot disagree about what a box is.
+#
+# THE POPULATION, and why it is exactly this deep: for each root, the root ITSELF when it carries
+# `.git` (that is how `/tmp/cell-ai` is named) plus each IMMEDIATE child that carries `.git` (that is
+# `$HOME/*/`). One level is deliberate — a WORKTREE's directory is named after a BRANCH, not after a
+# repo, so walking into `.worktrees/` would report every lane's worktree as a mislabelled repo and the
+# check would be turned off on its first day. A root of `/` is refused: it is a caller bug, and
+# walking it is the fleet's most expensive habit.
+#
+# `$REPO`, `$REPO_SLUG`, `$WORKDIR` and `$O` (whichever the caller has set) are read ONLY to answer
+# "which of these trees does this cell resolve to" in a duplicate report and which repo the generic
+# cell-checkout names may carry (`repo_identity_own_repo`). They never decide whether a MISMATCH is fatal.
+repo_identity_scan() {
+  local -a _cd=() _slug=() _fold=() _head=() _base=() _sp=()
+  local root c r p base url slug hsha want exp reason decl own checked=0 fatal=0
+  local i j n dup listed heads resolves v pv rp
+
+  own="$(repo_identity_own_repo)"
+
+  # ⛔ `_cd` holds the RESOLVED path (dedupe, display, the "resolves to" match); `_base`/`_sp` hold the
+  # SPELLED one, because that is the NAME a lane types and therefore the name that can lie. A directory
+  # `$HOME/agent-infra` that is a SYMLINK to `…/real/tortoise` resolves to a basename of `tortoise` —
+  # reading the name off the resolved path would call that `ok` while `cd $HOME/agent-infra` does
+  # tortoise work, which is this check's own defect wearing the repair an operator is most likely to
+  # attempt. (Hosts whose HOME is itself a symlink are unaffected: only the CHILD's own last segment is
+  # taken from the spelled path, and an ancestor's spelling never changes it.)
+  _ident_add() { # <spelled-path>
+    local sp="$1" rr
+    # ⛔ A TRAILING SLASH MAKES `##*/` EMPTY (`"$root"/*/` produces one): normalise ONCE, so the last
+    # segment is the directory's NAME rather than the empty string — the first cut of this compared
+    # every directory against '' and would have refused the whole box.
+    while [ "${#sp}" -gt 1 ] && [ "${sp%/}" != "$sp" ]; do sp="${sp%/}"; done
+    [ -e "$sp/.git" ] || return 0
+    rr="$( ( cd "$sp" 2>/dev/null && pwd -P ) )" || return 0
+    [ -n "$rr" ] || return 0
+    local k=0
+    while [ "$k" -lt "${#_cd[@]}" ]; do
+      [ "${_cd[$k]}" = "$rr" ] && return 0
+      k=$((k + 1))
+    done
+    _cd[${#_cd[@]}]="$rr"; _sp[${#_sp[@]}]="$sp"; _base[${#_base[@]}]="${sp##*/}"
+  }
+
+  for root in "$@"; do
+    [ -n "$root" ] || continue
+    case "$root" in /|.) continue ;; esac          # a caller bug, never a walk of the whole disk
+    [ -d "$root" ] || continue
+    _ident_add "$root"
+    for c in "$root"/*/; do _ident_add "$c"; done
+  done
+  # ⛔ THE TREE THIS BOX ACTUALLY WORKS IN, even when it sits outside every root (`/tmp/cell-t3` is a
+  # SIBLING of `/tmp/cell-ai`, not a child of any root — measured layout, docs/ops/disk-consumers.md).
+  # Leaving it out was not just a gap: the duplicate report matches `$REPO`/`$WORKDIR` against SCANNED
+  # paths, so it would print "neither REPO, WORKDIR nor O resolves to any of these checkouts" while the
+  # cell's own checkout was one of them — a false statement in the one message an operator uses to pick
+  # the canonical tree.
+  [ -n "${WORKDIR:-}" ] && _ident_add "$WORKDIR"
+  [ -n "${REPO:-}" ] && _ident_add "$REPO"
+
+  i=0
+  while [ "$i" -lt "${#_cd[@]}" ]; do
+    p="${_cd[$i]}"
+    base="${_base[$i]}"
+    checked=$((checked + 1))
+    url="$(repo_identity_origin "$p")" || url=""
+    if [ -z "$url" ]; then
+      # CANNOT-VERIFY, said out loud. A `.git` whose origin cannot be read is the one state where the
+      # name is all there is — and the name is exactly what this check refuses to trust, so it must not
+      # pass on it either. It is not `fatal` because an unreadable origin cannot be shown to name a
+      # WRONG repo, and refusing a bring-up on it would be a false block on a legitimate local mirror.
+      printf '%s\t%s\n' warn \
+        "repo identity UNVERIFIED: $p carries a .git but no readable 'origin' remote, so whether its name ($base) names the repo it actually is cannot be answered — an unanswered identity is not a pass (agent-infra#2148)"
+      _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
+      i=$((i + 1)); continue
+    fi
+    slug="$(repo_slug_from_remote "$url" 2>/dev/null)" || slug=""
+    if [ -z "$slug" ]; then
+      printf '%s\t%s\n' warn \
+        "repo identity UNVERIFIED: $p's origin ($url) is not an <owner>/<name> slug this fleet accepts, so its name ($base) cannot be checked against it — a readable origin that names no GitHub repo is still not an answer (agent-infra#2148)"
+      _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
+      i=$((i + 1)); continue
+    fi
+    hsha="$(repo_identity_head "$p")"
+    want="${slug#*/}"
+    _slug[${#_slug[@]}]="$slug"; _fold[${#_fold[@]}]="$(repo_identity_fold "$want")"
+    _head[${#_head[@]}]="${hsha:-<unreadable>}"
+    if [ "$(repo_identity_fold "$base")" = "$(repo_identity_fold "$want")" ]; then
+      printf '%s\t%s\n' ok \
+        "repo identity: $p is a checkout of $slug (origin $url, head ${hsha:-<unreadable>})"
+      i=$((i + 1)); continue
+    fi
+    exp=""; reason=""
+    decl="$(repo_identity_declared "$base" "$own")" || decl=""
+    if [ -n "$decl" ]; then
+      exp="$(printf '%s\n' "$decl" | sed -n 1p)"
+      reason="$(printf '%s\n' "$decl" | sed -n 2p)"
+    fi
+    if [ "$exp" = '?' ]; then
+      # A generic cell-checkout name on a box that declares no repo of its own: nothing was measured, so
+      # this is UNVERIFIED — not a lie, and not a pass either.
+      printf '%s\t%s\n' warn \
+        "repo identity UNVERIFIED: $p is a checkout of $slug under the generic cell-checkout name '$base' — $reason (agent-infra#2148)"
+      i=$((i + 1)); continue
+    fi
+    if [ -n "$exp" ] && { [ "$exp" = '*' ] || [ "$(repo_identity_fold "$exp")" = "$(repo_identity_fold "$want")" ]; }; then
+      printf '%s\t%s\n' warn \
+        "repo identity: $p is a checkout of $slug under the DECLARED exception name '$base' — $reason. Deliberate, not a defect; named so the exception stays visible, and a DIFFERENT repo at this name is still refused (agent-infra#2148)"
+      i=$((i + 1)); continue
+    fi
+    fatal=$((fatal + 1))
+    printf '%s\t%s\n' fatal \
+      "repo identity: '$p' is a checkout of $slug (origin $url) but its directory is named '$base'. Every lane told 'cd ${_sp[$i]}' would work $slug while the path says $base — silently, with no error (measured 2026-11-05: /home/cmux/agent-infra on cell-2 was a tortoise checkout, so pull/<n>/head would not resolve and its main reported commits no other box had). The path this repo belongs at is '${_sp[$i]%/*}/$want'. NOTHING IS MOVED OR DELETED BY THIS CHECK ON PURPOSE: the measured tree still held three worktrees whose commits existed nowhere else (is3446, rev3235, w3446) plus an unmerged pr-3235 branch, so renaming, re-cloning or quarantining it is a human decision — clear it by hand, then re-run"
+    i=$((i + 1))
+  done
+
+  # ── DUPLICATES: the same repo at more than one path ────────────────────────────────────────────────
+  # Not fatal — several trees CAN be legitimate (a harness tree, a bring-up checkout, a quarantine) —
+  # but never silent: "a lane that cd's into the wrong one builds against a stale tree, and nothing
+  # says which is canonical" is the second measured shape. Reported once per repo, with every path and
+  # head, and with the tree this cell actually RESOLVES to.
+  i=0
+  while [ "$i" -lt "${#_cd[@]}" ]; do
+    if [ -n "${_fold[$i]}" ]; then
+      # Report each repo ONCE: only from its first index, so a group of four is not printed four times.
+      listed=1
+      j=0
+      while [ "$j" -lt "$i" ]; do
+        [ -n "${_fold[$j]:-}" ] && [ "${_fold[$j]}" = "${_fold[$i]}" ] && { listed=0; break; }
+        j=$((j + 1))
+      done
+      if [ "$listed" -eq 1 ]; then
+        n=0; heads=""; dup=""
+        j=0
+        while [ "$j" -lt "${#_cd[@]}" ]; do
+          if [ "${_fold[$j]:-}" = "${_fold[$i]}" ]; then
+            n=$((n + 1))
+            dup="${dup}${dup:+, }${_cd[$j]}=${_head[$j]}"
+            heads="${heads}${heads:+, }${_head[$j]}"
+          fi
+          j=$((j + 1))
+        done
+        if [ "$n" -gt 1 ]; then
+          resolves=""
+          for v in REPO WORKDIR O; do
+            case "$v" in
+              REPO)    pv="${REPO:-}" ;;
+              WORKDIR) pv="${WORKDIR:-}" ;;
+              O)       pv="${O:-}" ;;
+            esac
+            [ -n "$pv" ] || continue
+            rp="$( ( cd "$pv" 2>/dev/null && pwd -P ) )" || rp=""
+            [ -n "$rp" ] || continue
+            j=0
+            while [ "$j" -lt "${#_cd[@]}" ]; do
+              [ "${_cd[$j]}" = "$rp" ] && resolves="${resolves}${resolves:+, }${v}->${_cd[$j]}"
+              j=$((j + 1))
+            done
+          done
+          [ -n "$resolves" ] || resolves="neither REPO, WORKDIR nor O resolves to any of these checkouts"
+          # Are all the heads the same? Then nothing is at stake YET — say so at `ok`, but say it: the
+          # divergence this reports is only invisible until someone commits.
+          slug="${_slug[$i]}"
+          if [ "$(printf '%s' "$heads" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
+            printf '%s\t%s\n' ok \
+              "repo identity: $slug is checked out at $n paths ($dup — all at the same head) and $resolves; several trees can be legitimate, so this is reported rather than refused (agent-infra#2148)"
+          else
+            printf '%s\t%s\n' warn \
+              "repo identity: $slug is checked out at $n paths at DIFFERENT heads ($dup) and $resolves. A lane that cd's into the wrong one builds against a different tree, and nothing in either tree says which is canonical (measured on cell-1, four agent-infra checkouts at four heads) — not fatal, since several can be legitimate, but silence here is how the stale one gets used (agent-infra#2148)"
+          fi
+        fi
+      fi
+    fi
+    i=$((i + 1))
+  done
+
+  if [ "$checked" -eq 0 ]; then
+    # An EMPTY population is not a pass: it means the walk found nothing to ask, which on a cell is
+    # itself suspicious (a cell with no checkout of its own repo cannot be right).
+    printf '%s\t%s\n' warn \
+      "repo identity: NO checkout was found under any of the roots checked ($*), so nothing's name was verified against its origin — an empty population is not a pass (agent-infra#2148)"
+  fi
+  [ "$fatal" -eq 0 ] || return 1
+  return 0
+}

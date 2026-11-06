@@ -136,7 +136,7 @@ printf '#!/bin/sh\nmkdir -p node_modules\necho x > node_modules/.package-lock.js
 # delegate: everything else keeps the fake answers the rest of this suite is written against, so no
 # other case changes behaviour. Delegating by VERB (not by case) is deliberate: a fixture that switched
 # git off wholesale would make check_repo/check_gh answer differently and redden unrelated arms.
-printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *)\n  if [ -n "${GIT_STUB_REAL:-}" ]; then\n    case "$*" in *" rev-parse --git-dir"*|*" rev-parse --git-common-dir"*|*" worktree list"*|*" worktree add"*|*" worktree remove"*|*" rev-parse --verify"*) exec /usr/bin/git "$@" ;; esac\n  fi\n  echo abc1234;; esac\n' > "$STUB/git"
+printf '#!/bin/sh\ncase "$1" in --version) echo "git version 2.39.0";; *)\n  if [ -n "${GIT_STUB_REAL:-}" ]; then\n    case "$*" in *" rev-parse --git-dir"*|*" rev-parse --git-common-dir"*|*" worktree list"*|*" worktree add"*|*" worktree remove"*|*" rev-parse --verify"*|*" config --local --get remote.origin.url"*) exec /usr/bin/git "$@" ;; esac\n  fi\n  echo abc1234;; esac\n' > "$STUB/git"
 # The probe stub also has to be able to reproduce the MEASURED #2100 shape: a layer that emits banner
 # lines and NEVER reaches the model, so the output carries no answer at all. It only answers when the
 # probe asks for a provider with extensions DISABLED (`--no-extensions`). That is what makes the
@@ -276,7 +276,34 @@ printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "swapoff $*" >> "$SWAP_ST
 printf '#!/bin/sh\n[ -n "${SWAP_STUB_LOG:-}" ] && echo "sysctl $*" >> "$SWAP_STUB_LOG"\nfor a in "$@"; do case "$a" in vm.swappiness=*) printf "%%s\\n" "${a#vm.swappiness=}" > "$SWAP_SYSCTL_FILE" ;; esac; done\nexit 0\n' > "$STUB/sysctl"
 chmod +x "$STUB"/*
 # ── fixtures: a HOME, a pre-existing clone (so check_repo never reaches the network), a keys.env ──
-mkdir -p "$T/home" "$T/tok"
+mkdir -p "$T/home" "$T/tok" "$T/ident-empty"
+# ⛔ EXPORTED, NOT ONLY PASSED BY `br()`. `br()` sets it for the arms it runs, but eight invocations in
+# this file call the bring-up DIRECTLY (the token-lifetime and standalone arms) — and with the SHIPPED
+# default they would walk `/tmp/cell-ai` and `/tmp/cell-home` on the host that runs the suite. On a real
+# cell `/tmp/cell-ai` IS an agent-infra checkout, so those arms would scan the machine and die at
+# `check_repo_identity` BEFORE reaching their own subject: a host dependency wearing a test's clothes,
+# the exact defect the `br()` comment below documents for the repo selectors. An explicit per-case
+# `REPO_IDENTITY_ROOTS` (or `BR_IDENT_ROOTS`) still wins over this default.
+export REPO_IDENTITY_ROOTS="$T/ident-empty"
+
+# ── repo identity (agent-infra#2148): the fixture boxes ──────────────────────────────────────
+# The walk is hermetic by seam: every `br` run points `REPO_IDENTITY_ROOTS` at `$T/ident-empty`
+# unless the case names a fixture population, so the SHIPPED default (the cell's one home,
+# `/tmp/cell-ai`, `/tmp/cell-home`) never grades the machine that runs this suite. The checkouts are
+# REAL git repositories with a REAL `remote.origin.url`, because the subject IS what `git config`
+# reports — a `.git` directory with a hand-written config file would test the reader's tolerance
+# instead of its answer.
+mk_checkout() { # <dir> <origin-url> <tag>
+  mkdir -p "$1" || return 1
+  git init -q "$1" >/dev/null 2>&1 || return 1
+  git -C "$1" config user.email fixture@example.invalid >/dev/null 2>&1
+  git -C "$1" config user.name fixture >/dev/null 2>&1
+  git -C "$1" config commit.gpgsign false >/dev/null 2>&1
+  git -C "$1" remote add origin "$2" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$3" > "$1/fixture" || return 1
+  git -C "$1" add -A >/dev/null 2>&1 || return 1
+  git -C "$1" commit -q -m "$3" >/dev/null 2>&1 || return 1
+}
 # ⛔ A REAL CHECKOUT, NOT AN EMPTY `.git` DIRECTORY (measured on CI, 2026-10-24). `mkdir -p "$T/cell/.git"`
 # is not a repository: real git refuses it, so the disk-reaper installer's `git -C <path> rev-parse
 # --git-dir` dropped the ONLY candidate it could have scanned and refused to install. Locally that was
@@ -360,6 +387,7 @@ br() {
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
             GH_TOKEN_FILE="$TOK" GH_STUB_MODE="$1" CURL_STUB_MODE="$2" \
             REPO_SLUG="daniel-ospina/tortoise" \
+            REPO_IDENTITY_ROOTS="${BR_IDENT_ROOTS:-$T/ident-empty}" \
             bash "$BRINGUP" "${@:3}" 2>&1)"
   BR_RC=$?
 }
@@ -1502,6 +1530,7 @@ SA_RC=0
 SA_OUT="$(PATH="$STUB:$PATH" CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="$T/keys.env" \
           GH_TOKEN_FILE="$TOK" GH_STUB_MODE=ok CURL_STUB_MODE=normal \
           INFRA_ROOT="$(cd "$HERE/.." && pwd)" REPO_SLUG="daniel-ospina/tortoise" \
+          REPO_IDENTITY_ROOTS="$T/ident-empty" \
           bash "$T/standalone/cloud-cell-bringup.sh" --check 2>&1)" || SA_RC=$?
 case "$SA_OUT" in
   *"controller supervised"*) ok "a standalone-pushed bring-up finds the installer in the layer checkout" ;;
@@ -1509,6 +1538,233 @@ case "$SA_OUT" in
   *) bad "the standalone run did not reach the controller check (rc=$SA_RC): $(printf '%s' "$SA_OUT" | tail -6 | tr '\n' ' ')" ;;
 esac
 rm -rf "$T/standalone"
+
+# ══ REPO IDENTITY (agent-infra#2148) — a directory must not lie about which repo it is ══════════
+# MEASURED 2026-11-05 on cell-2: `/home/cmux/agent-infra` was a checkout of `daniel-ospina/tortoise`.
+# Nothing errored — `pull/3456/head` would not resolve, its `main` reported commits no other box had,
+# and every lane told `cd /home/cmux/agent-infra` did tortoise work, silently. The four other cells
+# were clean, so the check did not exist and nothing noticed.
+#
+# WHAT EACH ARM PINS, and why the assertion is what it is:
+#   * the DIRECTION of the comparison — a directory named `tortoise` holding an agent-infra checkout must
+#     fail exactly as a directory named `agent-infra` holding tortoise does. A check that matched the
+#     name against ANY known slug, or that compared the origin to itself, passes the first arm and fails
+#     this one;
+#   * that a DECLARED exception is a warn and NOT an exemption from the repo it declares: `harness-src`
+#     may hold agent-infra, and `harness-src` holding tortoise is still a directory lying about itself;
+#   * that a duplicate repo at two heads is REPORTED with both paths and the tree the cell resolves to
+#     (not fatal — several trees can be legitimate — but never silent);
+#   * that a clean box passes and says `ok`, so the check cannot be an always-red arm that tells nobody
+#     anything;
+#   * that an EMPTY population is a warn, never a pass.
+# ⛔ THE ARMS ASSERT THE IDENTITY VERDICT, not the whole bring-up's exit status. On a host whose
+# launchd/schedule layer refuses (this suite's own documented temp-HOME shape) the run dies AFTER this
+# check, and an arm keyed on `rc` would then be measuring that environment rather than this predicate.
+# A FATAL arm therefore asserts the `CHECK FAILED [repo identity]` line (which is what a refusal by THIS
+# check prints) plus a non-zero rc; a warn/clean arm asserts the emitted verdict lines and the ABSENCE
+# of that refusal.
+say_case "repo identity: a directory named for one repo that IS another is FATAL, and names all three"
+mk_checkout "$T/ident-bad/agent-infra" "https://github.com/daniel-ospina/tortoise.git" a1 \
+  && ok "fixture: a checkout of daniel-ospina/tortoise placed at …/agent-infra" \
+  || bad "fixture: could not create the mislabelled checkout"
+BR_IDENT_ROOTS="$T/ident-bad" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) ok "--check REFUSES the mislabelled directory (the defect was silence; a report-only check would not fix it)" ;;
+  *) bad "--check did not refuse a checkout of tortoise sitting at …/agent-infra: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+[ "$BR_RC" -ne 0 ] && ok "and the run exits non-zero (rc=$BR_RC)" || bad "a mislabelled checkout exited 0"
+case "$BR_OUT" in
+  *"is a checkout of daniel-ospina/tortoise"*) ok "the refusal names the origin it actually is" ;;
+  *) bad "the refusal does not name the origin: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+case "$BR_OUT" in
+  *"its directory is named 'agent-infra'"*) ok "the refusal names the directory whose name lies" ;;
+  *) bad "the refusal does not name the lying directory" ;;
+esac
+case "$BR_OUT" in
+  *"belongs at is '"*"tortoise'"*) ok "the refusal names the path the repo should be at" ;;
+  *) bad "the refusal does not say where this repo belongs: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+case "$BR_OUT" in
+  *"NOTHING IS MOVED OR DELETED BY THIS CHECK"*) ok "it states that it refuses rather than tidying (the measured tree held worktrees whose commits existed nowhere else)" ;;
+  *) bad "the refusal does not say that repair is a human decision" ;;
+esac
+# The tree must still BE there: a check that repaired by moving the checkout would have destroyed the
+# only copy of three worktrees' commits on the live box.
+[ -d "$T/ident-bad/agent-infra" ] && ok "the mislabelled checkout is still in place (the check refused; it did not tidy)" \
+  || bad "the check MOVED or DELETED a checkout — repair is a human decision"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "the run claimed CELL READY over a mislabelled box" ;;
+  *) ok "it never claims CELL READY over a mislabelled box" ;;
+esac
+
+say_case "repo identity: the DIRECTION is proved — a tortoise-named dir holding agent-infra fails too"
+mk_checkout "$T/ident-rev/tortoise" "https://github.com/daniel-ospina/agent-infra.git" a2 \
+  && ok "fixture: a checkout of agent-infra placed at …/tortoise" \
+  || bad "fixture: could not create the reversed mislabel"
+BR_IDENT_ROOTS="$T/ident-rev" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*"is a checkout of daniel-ospina/agent-infra"*"belongs at is '"*"agent-infra'"*)
+    ok "the comparison reads origin and compares the NAME to it, in that direction" ;;
+  *) bad "the reversed mislabel was not refused the same way — the comparison may not be origin-vs-name: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+
+say_case "repo identity: a DECLARED exception is a warn naming its reason — and covers ONE repo only"
+mk_checkout "$T/ident-exc/harness-src" "https://github.com/daniel-ospina/agent-infra.git" a3 \
+  && ok "fixture: a per-commit harness tree (agent-infra at …/harness-src)" \
+  || bad "fixture: could not create the declared-exception checkout"
+BR_IDENT_ROOTS="$T/ident-exc" br ok normal --check
+case "$BR_OUT" in
+  *"DECLARED exception name 'harness-src'"*"per-commit harness tree"*) ok "…/harness-src is reported as a declared exception, with the reason that makes it legitimate" ;;
+  *) bad "a declared exception was not reported as one: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a DECLARED exception was treated as FATAL — the allowlist does not work" ;;
+  *) ok "and it is NOT fatal (an exception is not a defect)" ;;
+esac
+# The same declared NAME carrying a repo the row never covered: the exemption must not become a hole.
+mk_checkout "$T/ident-exc-bad/harness-src" "https://github.com/daniel-ospina/tortoise.git" a4 \
+  && ok "fixture: …/harness-src holding tortoise (a repo the row does not cover)" \
+  || bad "fixture: could not create the out-of-scope exception checkout"
+BR_IDENT_ROOTS="$T/ident-exc-bad" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) ok "a declared NAME carrying a repo the row does not cover is STILL fatal (the exemption is repo-scoped, not name-scoped)" ;;
+  *) bad "the allowlist exempted the NAME, so any repo may sit there — the check has a permanent hole: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+
+say_case "repo identity: two heads of one repo is a warn naming BOTH paths, both heads, and the resolved tree"
+mk_checkout "$T/ident-dup/agent-infra" "https://github.com/daniel-ospina/agent-infra.git" b1 \
+  && mk_checkout "$T/ident-dup/ai" "https://github.com/daniel-ospina/agent-infra.git" b2 \
+  && ok "fixture: two checkouts of agent-infra at different commits (…/agent-infra and …/ai)" \
+  || bad "fixture: could not create the two-head fixture"
+BR_IDENT_ROOTS="$T/ident-dup" BR_AMBIENT_REPO="$T/ident-dup/agent-infra" br ok normal --check
+case "$BR_OUT" in
+  *"is checked out at 2 paths at DIFFERENT heads"*) ok "the two heads are reported as such" ;;
+  *) bad "two heads of one repo went unreported (silence is the other half of the measured defect): $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+case "$BR_OUT" in
+  *"/ident-dup/agent-infra="*"/ident-dup/ai="*) ok "both paths are named, each with its head" ;;
+  *) bad "the duplicate report does not list both paths with their heads: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-700)" ;;
+esac
+case "$BR_OUT" in
+  *"REPO->"*) ok "it names which tree the cell RESOLVES to (an operator cannot choose without it)" ;;
+  *) bad "the duplicate report does not name the tree REPO resolves to: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "two heads were treated as FATAL — several trees can be legitimate" ;;
+  *) ok "and it is NOT fatal" ;;
+esac
+
+say_case "repo identity: a generic CELL CHECKOUT name is allowed for the cell's OWN repo, and refused for any other"
+# `orchestrator-bringup.sh`'s own discovery list names `$CELL_HOME/clone`, `$CELL_HOME/repo` and
+# `$CELL_HOME/cell-*` as places a cell's checkout may live, so refusing those would be an instrument
+# false positive that blocks provisioning. The exemption is REPO-SCOPED: the cell's own repo may sit
+# there, another repo may not.
+mk_checkout "$T/ident-generic/clone" "https://github.com/daniel-ospina/tortoise.git" d1 \
+  && ok "fixture: the cell's OWN repo (tortoise — REPO_SLUG in this suite) under the generic name …/clone" \
+  || bad "fixture: could not create the generic-name checkout"
+BR_IDENT_ROOTS="$T/ident-generic" br ok normal --check
+case "$BR_OUT" in
+  *"DECLARED exception name 'clone'"*) ok "…/clone holding the cell's own repo is a declared exception, not a failure" ;;
+  *) bad "a generic cell-checkout name holding the cell's own repo was not recognised: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a layout this repo's OWN discovery list names was refused — a false block on provisioning" ;;
+  *) ok "and it does not refuse the layout this repo itself blesses" ;;
+esac
+mk_checkout "$T/ident-generic-bad/clone" "https://github.com/daniel-ospina/agent-infra.git" d2 \
+  && ok "fixture: a DIFFERENT repo (agent-infra) under the same generic name" \
+  || bad "fixture: could not create the out-of-scope generic checkout"
+BR_IDENT_ROOTS="$T/ident-generic-bad" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) ok "…/clone holding ANOTHER repo is still refused (the exemption is repo-scoped)" ;;
+  *) bad "a generic name exempted ANY repo — that is a permanent hole: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+
+say_case "repo identity: a clean box is ok, and an empty population is not a pass"
+mk_checkout "$T/ident-clean/agent-infra" "https://github.com/daniel-ospina/agent-infra.git" c1 \
+  && ok "fixture: an agent-infra checkout under its own name" \
+  || bad "fixture: could not create the clean checkout"
+BR_IDENT_ROOTS="$T/ident-clean" br ok normal --check
+case "$BR_OUT" in
+  *"ok: repo identity: "*"is a checkout of daniel-ospina/agent-infra"*) ok "a checkout whose directory names its repo is reported ok" ;;
+  *) bad "a clean checkout is not reported as ok: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a CLEAN box was refused — the check is always-red and tells nobody anything" ;;
+  *) ok "a clean box is not refused (non-vacuity)" ;;
+esac
+# ⛔ TWO FACTS, ONE ARM. (a) The tree this cell WORKS IN is scanned even when it sits outside every root:
+# `WORKDIR`/`REPO` are candidates in their own right — `/tmp/cell-t3` is a SIBLING of `/tmp/cell-ai`, not a
+# child of any root (docs/ops/disk-consumers.md), so without this the box's own checkout was never
+# identity-checked AND the duplicate report printed "neither REPO, WORKDIR nor O resolves to any of these
+# checkouts" while `REPO` WAS one of them. `br()` points WORKDIR at the fixture's `$T/cell`, a real
+# repository with no origin — so the arm also pins (b): an origin-less `.git` is UNVERIFIED, not a pass.
+BR_IDENT_ROOTS="$T/ident-empty" br ok normal --check
+case "$BR_OUT" in
+  *"repo identity UNVERIFIED:"*"no readable 'origin'"*) ok "the cell's own WORKDIR is scanned even outside every root, and an origin-less .git is UNVERIFIED (not a pass)" ;;
+  *) bad "WORKDIR outside the roots was not scanned, or an origin-less .git read as fine: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+# (c) an EMPTY population is not a pass — driven at the function level, because every `br` run carries a
+# WORKDIR that really is a checkout.
+EMPTY_OUT="$(bash -c '. "$1"; ( unset REPO WORKDIR O REPO_SLUG OR; repo_identity_scan "$2" ); echo "rc=$?"' _ \
+  "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-empty" 2>&1)"
+case "$EMPTY_OUT" in
+  *"NO checkout was found"*"rc=0"*) ok "an empty population is reported, never silently passed" ;;
+  *) bad "a walk that found no checkout said nothing — an empty population must not read as clean: $EMPTY_OUT" ;;
+esac
+
+say_case "repo identity: a repo-slug.sh from the LAST release cannot brick --check, and it is NAMED"
+# ⛔ THE REAL CELL STATE THIS PINS. `$O/repo-slug.sh` is whatever the last release deployed — verified: the
+# base commit's copy has no `repo_identity_scan` at all — and the standalone bring-up path (a script
+# pushed to /tmp) can only resolve THAT one. Sourcing it succeeds while the walker does not exist, so the
+# call returns rc=127 into the fail-closed branch and `--check` REFUSES A HEALTHY BOX — with the repair
+# sitting BEHIND the gate that refused (the #8175 stale-flag shape). The check must instead skip a
+# candidate without the walker and say UNVERIFIED, naming the stale copy.
+LIBBR="$T/bringup-lib.sh"
+# ⛔ THE COPY LIVES BESIDE A STALE `orchestrator-harness/repo-slug.sh`, as on a box whose CHECKOUT is
+# the one thing that is current for nothing: `BRINGUP_HERE` is resolved from the script's own directory,
+# so the fixture must reproduce that layout or the loader arm would assert on a candidate list it never
+# built (measured: the first cut of this arm read `lib=[] stale=[]` for that reason).
+mkdir -p "$T/stale-bringup/orchestrator-harness" "$T/stale-lib" "$T/empty-home"
+sed 's/^main "\$@"$/:/' "$BRINGUP" > "$T/stale-bringup/cloud-cell-bringup.sh"
+LIBBR="$T/stale-bringup/cloud-cell-bringup.sh"
+grep -q '^main "\$@"$' "$LIBBR" && bad "fixture: main is still live in $LIBBR — the arms below would run a bring-up"
+# The previous release's shape, taken from THIS file: everything before the identity section.
+awk '/^# ══ REPO IDENTITY/{exit} {print}' "$HERE/orchestrator-harness/repo-slug.sh" > "$T/stale-lib/repo-slug.sh"
+cp "$T/stale-lib/repo-slug.sh" "$T/stale-bringup/orchestrator-harness/repo-slug.sh"
+if ! grep -q 'repo_slug_from_remote()' "$T/stale-lib/repo-slug.sh" || grep -q 'repo_identity_scan' "$T/stale-lib/repo-slug.sh"; then
+  bad "fixture: $T/stale-lib/repo-slug.sh is not the PREVIOUS-RELEASE shape (it must have the parser and no walker)"
+else
+  ok "fixture: a repo-slug.sh with the parser and NO walker (the last release's copy)"
+fi
+# (a) the loader must not choose a candidate that cannot answer
+LOADED="$(CELL_HOME="$T/empty-home" bash -c '. "$1"; printf "lib=[%s] stale=[%s]\n" "$REPO_SLUG_LIB" "$REPO_SLUG_LIB_STALE"' _ "$LIBBR" 2>&1)"
+case "$LOADED" in
+  *"lib=[] stale=["*"repo-slug.sh]"*) ok "a candidate with no walker is never the one the check calls ($LOADED)" ;;
+  *) bad "the loader accepted a lib that cannot answer — this is the rc=127 path: $LOADED" ;;
+esac
+# (b) the check itself must WARN and continue, naming the stale copy
+STALE_OUT="$(CELL_HOME="$T/empty-home" REPO_IDENTITY_ROOTS="$T/ident-bad" \
+  bash -c '. "$1"; REPO_SLUG_LIB=""; REPO_SLUG_LIB_STALE="'"$T/stale-lib/repo-slug.sh"'"; check_repo_identity; echo "rc=$?"' _ "$LIBBR" 2>&1)"; STALE_RC=$?
+case "$STALE_OUT" in
+  *"predates this check"*) ok "the run NAMES the stale copy instead of pretending it measured anything" ;;
+  *) bad "a stale repo-slug.sh was not named: $STALE_OUT" ;;
+esac
+case "$STALE_OUT" in
+  *"rc=0"*) ok "and it does not refuse the box (the UNVERIFIED path is a warning, not a block)" ;;
+  *) bad "a stale library REFUSED a healthy box — the repair sits behind the gate that refused: $STALE_OUT" ;;
+esac
+case "$STALE_OUT" in
+  *"FATAL"*) bad "a stale library produced a FATAL over a box nothing was measured on: $STALE_OUT" ;;
+  *) ok "no FATAL is raised over a box nothing was measured on" ;;
+esac
+# (c) and with NO copy at all, the UNVERIFIED line names what was looked for
+MISS_OUT="$(CELL_HOME="$T/empty-home" bash -c '. "$1"; REPO_SLUG_LIB=""; REPO_SLUG_LIB_STALE=""; check_repo_identity; echo "rc=$?"' _ "$LIBBR" 2>&1)"
+case "$MISS_OUT" in
+  *"was not found"*"rc=0"*) ok "with no copy at all it reports UNVERIFIED and continues (a bare VM is a documented path)" ;;
+  *) bad "an absent repo-slug.sh did not report UNVERIFIED, or refused the box: $MISS_OUT" ;;
+esac
 
 echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIPPED=$SKIP"

@@ -134,6 +134,39 @@ SWAP_SWAPPINESS="${SWAP_SWAPPINESS:-30}"
 # (the suite's seam); `false` is how a case reproduces a cell that cannot escalate.
 SWAP_SUDO="${SWAP_SUDO-sudo -n}"
 
+# ── the SHARED slug parser + repo-identity walker (agent-infra#2148) ─────────────────────────────
+# ⛔ SOURCED FROM THE CHECKOUT THIS SCRIPT LIVES IN, and only as a fallback from the deployed harness
+# the cell will actually execute. `repo-slug.sh` is the one place that turns a checkout into
+# `owner/name`; the identity check below compares a directory's NAME against that answer, so using a
+# second parser here would let the bring-up refuse a box the rails grade (or bless one they refuse).
+# The fallback exists because bring-up is normally pushed STANDALONE to a bare VM (see check_dispatch):
+# on that box the checkout's own harness dir is absent and the deployed `$O` is the only copy.
+REPO_SLUG_LIB=""
+REPO_SLUG_LIB_STALE=""
+for _rsl in "${BRINGUP_HERE:+$BRINGUP_HERE/orchestrator-harness/repo-slug.sh}" \
+            "${CELL_HOME:-${HOME:-}}/orchestrator/repo-slug.sh"; do
+  [ -n "$_rsl" ] && [ -r "$_rsl" ] || continue
+  . "$_rsl"
+  # ⛔ A LIB FROM THE PREVIOUS RELEASE IS THE NORMAL STATE OF A CELL, NOT AN EDGE CASE. `$O/repo-slug.sh`
+  # is the harness the LAST release deployed, and the standalone bring-up path (a script pushed to /tmp
+  # on a bare VM) can only resolve THAT one. Sourcing it succeeds while `repo_identity_scan` does not
+  # exist, so the call below returned rc=127 into a fail-closed branch and `--check` REFUSED a healthy
+  # box with a diagnosis about a box that "cannot say whether a checkout lies" — and the repair
+  # (re-deploying `$O`) sat BEHIND the gate that refused. So a candidate without the walker is not
+  # used: the loop keeps looking, and if none has it the check takes its UNVERIFIED path and NAMES the
+  # stale copy instead of pretending it measured anything.
+  if command -v repo_identity_scan >/dev/null 2>&1; then REPO_SLUG_LIB="$_rsl"; break; fi
+  [ -n "$REPO_SLUG_LIB_STALE" ] || REPO_SLUG_LIB_STALE="$_rsl"
+done
+# (No second `.` here: the loop sources every candidate it examines, so the one it CHOSE is already
+# loaded — and the chosen one is always the LAST source, so a stale candidate cannot shadow it.)
+#
+# The roots `check_repo_identity` walks, overridable for the same reason every other path here is: a
+# hermetic suite must never grade the machine that runs it. The DEFAULT is the cell's three real
+# populations — the one home, the bring-up checkout, and the legacy `/tmp/cell-home` a re-install or a
+# reboot leaves behind (a second tree no instrument looked at).
+REPO_IDENTITY_ROOTS="${REPO_IDENTITY_ROOTS:-${CELL_HOME:-${HOME:-}} /tmp/cell-ai /tmp/cell-home}"
+
 log_line()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { log_line "FATAL: $*" >&2; exit 1; }
 ok()   { log_line "ok: $*"; }
@@ -634,6 +667,57 @@ check_gh() {
   [ -n "$login" ] && ok "gh login: $login" || die "gh cannot read the API"
   gh api "repos/$REPO_SLUG" --jq '.permissions.push' 2>/dev/null | grep -q true \
     && ok "push permission: true" || die "no push permission on $REPO_SLUG — lanes cannot open PRs"
+}
+
+# ── repo identity: a directory must not lie about which repo it is (agent-infra#2148) ──────────
+# MEASURED 2026-11-05 on cell-2: `/home/cmux/agent-infra` was a checkout of `daniel-ospina/tortoise`.
+# Nothing errored. `pull/3456/head` would not resolve, its `main` reported commits no other box had, and
+# every lane told `cd /home/cmux/agent-infra` was doing tortoise work — silently. A dead box is visible;
+# a mis-pointed box produces PLAUSIBLE work against the wrong repository. The four other cells were
+# clean, so no check existed and nothing noticed.
+#
+# ⛔ THE DIRECTION OF THE COMPARISON IS THE FIX. Identity is read from `remote.origin.url` and the
+# DIRECTORY NAME is then compared against it — never the reverse. The bug was trusting a name.
+# ⛔ A REPORT IS NOT A FIX. The whole failure was silence, so a mismatch is FATAL and stops bring-up
+# here; the walker's verdicts are shared with the doctor (`repo_identity_scan` in repo-slug.sh), so the
+# self-healing path reports the same thing rather than a second opinion.
+# ⛔ IT REFUSES AND NAMES; IT NEVER TIDIES. On the live box the mislabelled tree still held three
+# worktrees whose commits existed nowhere else (is3446, rev3235, w3446) plus an unmerged `pr-3235`
+# branch. Moving or deleting a checkout is a human decision, so this check does neither.
+#
+# PLACED BEFORE `check_repo`, deliberately: that step CLONES `$WORKDIR` from `$REPO_SLUG`, so a check
+# running after it would grade the tree this run just created (the same "a check must not grade its own
+# repair" rule `check_one_home env` states above). What is judged here is the box as it arrived.
+check_repo_identity() {
+  local out v m rc=0 seen_fatal=0
+  if [ -z "$REPO_SLUG_LIB" ]; then
+    # CANNOT-VERIFY, said out loud, and not fatal: a standalone bring-up on a bare VM carries no harness
+    # at all (the same degraded state `check_dispatch` names), and refusing provisioning for a check
+    # whose parser is missing would be a false block. The statement is that the identity is UNVERIFIED —
+    # never that it is fine.
+    if [ -n "$REPO_SLUG_LIB_STALE" ]; then
+      warn "repo identity UNVERIFIED: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check — it carries no repo_identity_scan, so it is the harness the LAST release deployed and nothing here can compare a checkout's name to its origin. An unanswered identity is not a pass (agent-infra#2148). Deploying the current harness ('cloud-cell-supervisor.sh apply', or bringing up from a full checkout) makes this checkable"
+    else
+      warn "repo identity UNVERIFIED: repo-slug.sh was not found in this bring-up's checkout (${BRINGUP_HERE:-<unresolved>}/orchestrator-harness/) nor in the deployed harness (${CELL_HOME:-${HOME:-}}/orchestrator/), so no checkout's name could be checked against its origin — an unanswered identity is not a pass (agent-infra#2148)"
+    fi
+    return 0
+  fi
+  # shellcheck disable=SC2086  # the roots are a declared, space-separated list (REPO_IDENTITY_ROOTS)
+  out="$(repo_identity_scan $REPO_IDENTITY_ROOTS)" || rc=$?
+  while IFS="$(printf '\t')" read -r v m; do
+    [ -n "$v" ] || continue
+    case "$v" in
+      fatal) seen_fatal=1; die "CHECK FAILED [repo identity]: $m" ;;
+      warn)  warn "$m" ;;
+      ok)    ok "$m" ;;
+    esac
+  done <<< "$out"
+  # ⛔ FAIL-CLOSED ON A VERDICT THIS CODE CANNOT READ (the walker returned non-zero but printed no
+  # `fatal` line). Continuing here would be the silent pass the whole check exists to remove.
+  if [ "$rc" -ne 0 ] && [ "$seen_fatal" -eq 0 ]; then
+    die "CHECK FAILED [repo identity]: the identity walker returned rc=$rc without naming a directory — cannot say whether any checkout on this box lies about its repo, and cannot-verify is never a pass (agent-infra#2148)"
+  fi
+  return 0
 }
 
 # ── repo clone ──────────────────────────────────────────────────────────────────
@@ -1992,6 +2076,9 @@ main() {
       # (later steps rewrite WORKDIR/HARNESS_PIN_DIR, and a check that reads them afterwards grades
       # its own repair).
       check_one_home env
+      # BEFORE check_gh/check_repo: this judges the box as it ARRIVED. `check_repo` clones $WORKDIR, so a
+      # check placed after it would grade the tree this run just created.
+      check_repo_identity
       check_gh
       check_repo
       check_dispatch
@@ -2043,7 +2130,7 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      log_line "CELL READY — all links verified (one home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
+      log_line "CELL READY — all links verified (one home, repo identity, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
       ;;
     *)
       log_line "unknown mode: $MODE (use --check)"; exit 2 ;;
