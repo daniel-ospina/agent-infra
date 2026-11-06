@@ -60,6 +60,17 @@ Environment=CONTROLLER_UNIT={{UNIT_NAME}}
 # Restart=always within RestartSec) and `start` starts the unit when one is enabled (a tmux controller
 # beside an enabled unit is two dispatchers on one queue, #1761).
 Environment=ORCH_FOREGROUND=1
+# ⛔ WHICH REVISION THIS UNIT RUNS, rendered at install time (agent-infra#2697). `merged ≠ running` was the
+# second silent half of the ExecStart defect: a farmed copy can be days behind `main` and nothing on the box
+# recorded it, so "which code is this cell executing" was answered by `git -C` guesses at a path the unit
+# merely names. Read it with `systemctl show eldato-orchestrator -p Environment` (or `--status`), and note
+# the controller process inherits it. `<repo-toplevel>@<sha>`, or `unknown@unknown` for a supervisor outside
+# any git work tree (a farmed copy) — the installer RECORDS this, it never gates on it.
+Environment=ORCH_SUPERVISOR_PIN={{SUPERVISOR_PIN}}
+# ⛔ AND THE PATH ITSELF IS REFUSED WHEN IT CANNOT SURVIVE A CLEANING (agent-infra#2697). A lane worktree, or
+# a temp dir no deployment root declares, is a unit whose ExecStart stops resolving — measured on cell-1:
+# `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start`. The installer refuses to
+# render that and names the durable alternatives; it does not hand back a supervisor that looks installed.
 ExecStart=/bin/bash {{SUPERVISOR}} start
 # ⛔ `always`, NOT `on-failure`. The measured case is an ORDERLY exit: the lanes finish, the controller
 # returns 0, and nothing came back — `on-failure` reproduces that defect byte for byte. `Restart=always`
