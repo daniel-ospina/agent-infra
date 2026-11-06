@@ -293,6 +293,14 @@ hasnt "$(cat "$(LOG)" 2>/dev/null)" 'exporting $<none>' \
     "1f5 …and no remedy tells an operator to export the sentinel $<none>, on the shape that produces it"
 has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
     "1h2 …while the remedy still names the file to repair"
+
+# ⛔ AND THE NO-TEMPLATE CLAUSE IS A WHOLE SENTENCE (round 26, P3, measured): dropping only the export half left a
+# dangling conjunction — "and neither a models.json template rescues that" — which also claims a template exists on the
+# shape where none does. 1f5 rejects the SENTINEL but accepted the malformed sentence, so the grammar is pinned here.
+hasnt "$(cat "$(LOG)" 2>/dev/null)" "and neither a models.json template rescues" \
+    "1h3 …and the no-template branch is not a half "neither" clause"
+has "$(cat "$(LOG)" 2>/dev/null)" "no models.json template applies here" \
+    "1h4 …it names the shape out loud instead"
 # ⛔ AND THE SECOND STORE REASON HAS ITS OWN ARM (round 24, P2, measured): `auth-store-unreadable` is a DIFFERENT arm
 # of the gate (`key-gate.sh`'s rc 6), and the token/prose guards above were written for `store-invalid` only — deleting
 # the `KEY_GATE_REASON="auth-store-unreadable"` assignment left BOTH suites fully green, because the gate's PRINTED

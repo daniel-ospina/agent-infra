@@ -860,11 +860,15 @@ else
         # `KEY_GATE_VAR` to the literal `<none>`, so the `${VAR:-<none>}` form below rendered "exporting $<none>" — a
         # shell token that does not exist — inside a remedy the operator is meant to follow. The clause is dropped
         # entirely when there is no variable to name (the gate…s own line does the same, printing `var=<none>`).
+        # ⛔ TWO WHOLE CLAUSES, NOT ONE CLAUSE WITH A HOLE (round 26, P3, measured): dropping just the export half left
+        # "and neither a models.json template rescues that" — a dangling conjunction that also claims a template exists
+        # on the shape where none does. Each branch is a sentence an operator can act on.
         case "${KEY_GATE_VAR:-}" in
-          ""|"<none>"|"unknown") _kg_export="" ;;
-          *) _kg_export=" nor exporting \$${KEY_GATE_VAR}" ;;
-        esac
-        KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and neither a models.json template${_kg_export} rescues that; repair or delete that file and re-dispatch" ;;
+          ""|"<none>"|"unknown")
+            KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and no models.json template applies here; repair or delete that file and re-dispatch" ;;
+          *)
+            KEY_GATE_WHY="this box's credential STORE cannot answer for it — the [key-gate] line above names ${KEY_GATE_AGENT_DIR:-the agent dir}/auth.json, and neither a models.json template nor exporting \$${KEY_GATE_VAR} rescues that; repair or delete that file and re-dispatch" ;;
+        esac ;;   # the outer arm needs its own terminator: the inner `esac` does not end it
       *)
         KEY_GATE_WHY="\$${KEY_GATE_VAR:-?} holds no value in the environment this lane would run with, so pi would have died at its first model call with nothing to show for it; put the credential where this lane's own env sources it and re-dispatch. The '[key-gate]' lines above name the provider, its models.json, and every candidate file" ;;
     esac

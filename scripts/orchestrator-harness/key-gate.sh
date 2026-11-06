@@ -789,7 +789,16 @@ entry = doc.get(sys.argv[3])
 # The old reader here scanned for any `key`-ish field, so it answered `reason=stored-credential` for a store pi
 # cannot take a key from and suppressed the very refusal that would have named the missing variable. pi provably
 # cannot run this provider, so the honest answer is the stronger one: refuse, naming the STORE.
-if entry is None:
+# ⛔ pi\x27s "IS ANYTHING STORED?" TEST IS JS TRUTHINESS, NOT IDENTITY (round 26, P1, measured): `auth-storage.js:377-380`
+# hands the raw entry back (`if (credential?.type !== "api_key") return credential;`) and `pi-ai/dist/auth/resolve.js:24`
+# branches on `if (stored)`, so `null`, `false`, `0`/`0.0`/`-0` and `""` are all "nothing stored" and the AMBIENT env
+# decides — measured `{"deepseek":false}` / `{"deepseek":0}` / `{"deepseek":""}` with `DEEPSEEK_API_KEY` exported: pi
+# ran (401 from the env key). `entry is None` alone made the falsy scalars fall into the rc-5 arm, which REFUSES 82 a
+# box pi runs, with the destructive remedy "repair .../auth.json" — a regression against the base, and the polarity this
+# header forbids (refuse only on a positive reading).
+# ⛔ AND THE OPPOSITE SHAPES STAY rc 5: `[]`, `true` and a non-empty string ARE stored values that pi then cannot turn
+# into a key (measured `{"deepseek":[]}` -> `Provider is not configured`), so they remain a positive refusal.
+if entry is None or entry is False or (not isinstance(entry, dict) and entry in (0, "")):
     # NO ENTRY for this provider: the positive "no stored credential", so the environment decides (measured: an
     # absent entry plus `DEEPSEEK_API_KEY` exported runs, and without it pi prints `No API key found`).
     raise SystemExit(1)
@@ -923,7 +932,7 @@ key_gate_bounded() { # <secs> <cmd...>
 key_gate_agent_dir() {
   local home="${1:-}" cwd="${2:-${PWD:-}}"
   # ⛔ THE `~`/`~/` LOCATION CASES COME FIRST: they are the only forms pi EXPANDS, so they are answers in
-  # their own right (`normalizePath`'s `expandTilde` branch maps `~` to `homedir()` — `dist/config.js:478-479`).
+  # their own right (`normalizePath`'s `expandTilde` branch maps `~` to `homedir()` — `dist/utils/paths.js:70-77`).
   # Putting the relative branch ahead of them silently resolved `~/alt-agent` against the CWD instead — caught by
   # arm 2k7, which is exactly what it exists for.
   case "${PI_CODING_AGENT_DIR:-}" in
@@ -935,6 +944,23 @@ key_gate_agent_dir() {
       printf '%s\n' "$home/${PI_CODING_AGENT_DIR#'~/'}"; return 0 ;;
     /*)
       printf '%s\n' "$PI_CODING_AGENT_DIR"; return 0 ;;
+    # ⛔ A `file://` OVERRIDE IS A PATH TO pi, CONVERTED BEFORE THE ABSOLUTE TEST (round 26, P2, measured):
+    # `normalizePath` ends with "if the value matches file://, convert it with fileURLToPath"
+    # (`dist/utils/paths.js:78-80`), and `getAgentDir()` runs the override through it. Joining the URL onto `cwd`
+    # answered about a directory pi never reads - measured `PI_CODING_AGENT_DIR=file:///tmp/x/altagent`:
+    # `pi --list-models` listed that directory's provider while the gate answered
+    # `check=skipped ... not resolvable from <cwd>/file:///tmp/x/altagent/models.json` (blindness on a box pi runs, plus a
+    # bogus settings path for the trust probe). Only the host-less absolute form is reproduced; `file://host/...` has no
+    # local path, and a percent-escape needs `fileURLToPath`'s decoding, so both answer cannot-say rather than a path
+    # that is wrong in a way no caller can detect.
+    file://*)
+      case "${PI_CODING_AGENT_DIR#file://}" in
+        /*) case "${PI_CODING_AGENT_DIR#file://}" in
+              *%*) return 0 ;;
+              *) printf '%s\n' "${PI_CODING_AGENT_DIR#file://}"; return 0 ;;
+            esac ;;
+        *) return 0 ;;
+      esac ;;
     '')
       : ;;
     *)
