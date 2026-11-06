@@ -965,9 +965,8 @@ if [ "$AGENT_STARTED" = "0" ]; then
         # #2991, P2). The refusal is a helper/consumer VERSION SKEW or a corrupt helper: it is a property
         # of the PAIR, not of this box, so "yielded to peers" is false — a peer running the same pair
         # refuses identically, and the operator's remedy is a VERIFIED redeploy of the helper pair on
-        # EVERY box. The
-        # record is still written (chain-merge.sh must stop waiting for a PR that cannot appear), and
-        # the words say exactly what it buys, the same way `land` does.
+        # EVERY box. The record is still written (chain-merge.sh must stop waiting for a PR that
+        # cannot appear), and the words say exactly what it buys, the same way `land` does.
         echo "[lane $N] stand-down recorded: gate=skew, until +${_cap_yield}s — this stops THIS box re-claiming #$N while the harness pair is synced; it does NOT free the item for a peer to clear, because a peer running the same caller/probe pair refuses identically. The remedy is a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever lanes run, not a capacity transfer." >> "$O/logs/lane-$N.log"
       else
         echo "[lane $N] capacity transfer: yielded to peers for ${_cap_yield}s (gate=$_cap_gate) — chain-merge.sh releases refs/claims/issue-$N now instead of after 90 min, and orch-loop.sh will not re-claim it from this box while the yield is live" >> "$O/logs/lane-$N.log"
