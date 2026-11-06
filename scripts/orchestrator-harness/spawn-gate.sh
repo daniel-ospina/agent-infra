@@ -1639,7 +1639,18 @@ lane_end_push() {
       if [ "${PUSH_RC:-0}" -eq 0 ]; then
         echo "[lane-exit] pushed $br → origin refs/heads/$br — $unpushed commit(s) that existed only on this disk are now off-box. $pushurl holds $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine): a peer push or the rail advanced the ref inside the verify window, and the commits it advanced over are this lane's" >> "$log" 2>/dev/null || true
       else
-        echo "[lane-exit] pushed $br → origin refs/heads/$br — the push CLIENT REPORTED FAILURE (rc=$PUSH_RC), so THIS TERMINAL DELIVERED NOTHING; the $unpushed commit(s) are off-box anyway, because $pushurl already held $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine), BEFORE the push — an advance that predates it, and for a rejected ref the reason for the rejection. Every commit of this lane is on that ref, so the branch is not at risk; the replayed push output above says why the client refused" >> "$log" 2>/dev/null || true
+        # ⛔ `PUSH_RC≠0` ESTABLISHES THAT THE CLIENT DID NOT REPORT SUCCESS — AND NOTHING ELSE ABOUT THE
+        # CAUSE (review of PR #3399 round 13, P2 — REPRODUCED). Round 12 replaced one exit-status-derived
+        # cause ("advanced inside the verify window") with another ("BEFORE the push … the client
+        # REFUSED"). This function's own contract four hundred lines up lists four shapes behind a
+        # non-zero exit — a rejected ref, a transport failure, a pre-receive hook, and a server that
+        # APPLIED the ref and then failed to report — and only the first is a refusal. Measured shapes:
+        # a black-holed link gives rc≠0 with `Connection timed out` replayed into this same log (no
+        # refusal there), and an applied-then-unreported ref can be advanced by a peer INSIDE the verify
+        # window, which makes "BEFORE the push" false as well. So the line names the measurement (the
+        # client did not report success; the remote held a descendant at verify time; therefore every
+        # commit of this lane is on that ref) and explicitly does NOT name a cause.
+        echo "[lane-exit] ⛔ label=$label: the push CLIENT did not report success (rc=$PUSH_RC), but $pushurl already held refs/heads/$sym at $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine) — so every commit of this lane is on that ref and the branch is NOT at risk. WHICH of the shapes behind a non-zero exit this was is NOT established here (a rejected ref, a transport failure, a pre-receive hook and a server that applied the ref then failed to report all look alike), and whether a peer advanced the ref while this read was in flight is not excluded either; the replayed push output above is what the client actually said" >> "$log" 2>/dev/null || true
       fi
     elif [ "$anc_rc" -eq 1 ]; then
       LANE_END_PUSH="FAILED"
@@ -2007,8 +2018,16 @@ lane_end_next() {
     # above (local pin, no off-box copy) and the failure values refuse before this point.
     case "${LANE_END_RESCUE:-}" in
       refs/wip/*)
-        printf 'recover the uncommitted state: git fetch origin %s && git diff --stat HEAD FETCH_HEAD (%s); %s\n' \
-          "${LANE_END_RESCUE}" \
+        # ⛔ THE THIRD ARM OF THE SAME INVARIANT (review of PR #3399 round 13, P2 — REPRODUCED). `pushed`
+        # is granted against the PROVEN push url, and `bg-rescue-wip.sh` writes the archive with
+        # `git push -q origin "$C:refs/wip/$SLUG"` (lines 308/313) — a PUSH, which honours
+        # `remote.origin.pushurl`. This instruction was a FETCH through `origin`, which honours
+        # `remote.origin.url`. With the two diverging (a configuration this code deliberately supports)
+        # the archive lands in the push repository and the artifact's own command answers `fatal:
+        # couldn't find remote ref refs/wip/<slug>` — the round-3 failure verbatim, left hardcoded here.
+        # `LANE_END_PUSH_URL` already holds the proven push url on every state that reaches this arm.
+        printf 'recover the uncommitted state: git fetch %s %s && git diff --stat HEAD FETCH_HEAD (%s); %s\n' \
+          "${LANE_END_PUSH_URL:-origin}" "${LANE_END_RESCUE}" \
           "the archive commit's TREE is the worktree as it was left" \
           "then re-dispatch"
         return 0 ;;
@@ -2138,7 +2157,18 @@ lane_end_push_caveat() {
     unmeasured)
       printf ' — AND the unpushed-commit count on %s could NOT be read (push=unmeasured), so whether those commits exist anywhere but this disk is NOT established either way — read it yourself (`git -C %s rev-list --count HEAD --not --remotes`, the SAME endpoint-free enumeration this terminal used, so it answers the same question instead of a narrower one about a single remote that may not even carry the branch)' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" ;;
     UNAVAILABLE|detached|refused-unknown-default|refused-protected|refused-main-checkout|refused-pushurl-divergent|refused-pushurl-unresolved)
-      printf ' — AND the commit(s) on %s are NOT on origin either (push=%s), which re-running the rescue does NOT fix: push them from a lane branch' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
+      # ⛔ THE SAME OFF-BOX CLAIM, IN THE SHARED HELPER (review of PR #3399 round 13, P2 — REPRODUCED).
+      # Round 12 scoped `lane_end_next`'s abstention to the LOCAL `refs/remotes/*` cache and the README now
+      # says the scope is SYMMETRIC — but this helper, which is APPENDED to the same MANUAL arms, still said
+      # "the commit(s) on <br> are NOT on origin either". Reproduced on this head:
+      #   LANE_END_TREE=dirty LANE_END_RESCUE=FAILED LANE_END_PUSH=refused-main-checkout
+      # printed "… AND the commit(s) on develop are NOT on origin either (push=refused-main-checkout)"
+      # — the documented `fix-one.sh`-without-`WIP_PATH` hub case this file calls its worst reachable state,
+      # and a value that `lane_end_next`'s own abstention group does NOT consume, so the helper IS reached
+      # with it. The old note ("latent — every MANUAL push verdict returns above this helper's call sites")
+      # was false for `refused-protected`/`refused-main-checkout`. One artifact family may not carry a scoped
+      # and an unscoped claim for the same verdict.
+      printf ' — AND nothing was pushed (push=%s), so no ref under this repository'"'"'s LOCAL refs/remotes/* cache holds the commit(s) on %s either — that enumeration is a CACHE, not a statement about any remote, and re-running the rescue does NOT fix it: push them from a lane branch' "${LANE_END_PUSH}" "${LANE_END_BRANCH:-<unknown>}" ;;
     verify-unanswered|push-unreported|push-killed|verify-ancestry-unmeasured|verify-head-unreadable)
       printf ' — AND the branch push at %s did NOT establish delivery either (push=%s), which re-running the rescue does NOT fix' "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_PUSH}" ;;
     running)
