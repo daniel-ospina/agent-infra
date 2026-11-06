@@ -789,16 +789,37 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 # defect is that the guard's stated population was not the population it checked.)
 # A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
 # not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
-# now READS the bookkeeping assignments it used to drop, so the three names below are the full set it
+# now READS the bookkeeping assignments it used to drop, so the four names below are the full set it
 # finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
 # any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
+# ⛔ AND THE SET IS RE-DERIVED, NOT REMEMBERED. This list said "the three names below are the full
+# set" while `watchdog-loop.sh:RESTART_REFUSED` was already on the tree: the sentence was a
+# measurement nobody re-took, and nothing forced it to be. ⛔ THE RED WAS VISIBLE, NOT HIDDEN — a
+# first draft of this comment claimed "bash-shards never run on a main push", and that is FALSE:
+# `.github/workflows/ci-main.yml` runs this same shard list on every main push (`bash
+# scripts/run-bash-shards.sh`), and it reported these shards red — main run 42225299527 on cf3c46c6d
+# names `spawn-gate.test.sh`, `test-gates.sh`, `tests/ci-trigger-scope/run.sh` and
+# `tests/record-review/run.sh`. So the gap was never the signal; it was that a prose COUNT in a
+# list is a claim nobody re-derives. The next editor re-derives it in one command (the `REFUSAL_AWK`
+# heredoc above, over the deploy unit), which prints every family-shaped declaration whose value is
+# not a 70..89 code — i.e. exactly the population this list must name:
+#   awk '/^cat > "\$TMP\/refusal-codes.awk" <<.REFUSAL_AWK.$/{f=1;next} /^REFUSAL_AWK$/{f=0} f' \
+#     scripts/orchestrator-harness/spawn-gate.test.sh > /tmp/refusal-codes.awk
+#   awk -f /tmp/refusal-codes.awk scripts/orchestrator-harness/*.sh \
+#     | awk -F'\t' '$1=="unknown"'
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
 #   an exit code; nothing compares a shell status against it.
 #   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
 #   number, a `-`, or the empty string), printed into the funnel line; not an exit code.
 #   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
 #   (`claim-registry-absent`) or `none`; not an exit code either.
-_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED"
+#   watchdog-loop.sh:RESTART_REFUSED — the watchdog's per-pass VERDICT FLAG (0/1), set wherever the
+#   pass declined to issue a restart verb and read at the one place that decides whether `main`
+#   restates that verdict (#1986). It never leaves the process as a status: nothing assigns it to a
+#   command's `$?` and every read is `-eq 1`. Measured on the tree that added the required-declarer
+#   rule for `key-gate.sh`: with it unlisted the scan emitted its 0/1 rows as `unknown` and the whole
+#   deploy-unit check read RED over a flag that declares no code.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED watchdog-loop.sh:RESTART_REFUSED"
 # A declaration-position UPPERCASE `NAME=<70..89>` OUTSIDE the family namespace, named EXACTLY with its
 # reason (`file:NAME=code`). Empty on this tree, and that is ASSERTED below rather than assumed: the
 # derived filter yields exactly the family claims today, so the namespace costs nothing — and a future
@@ -1442,7 +1463,7 @@ chmod +x "$TMP/bin/pi"
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
 # 90 minutes later, and the reading that governs is the one taken at the spawn.
-got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   MAX_LOAD=10
@@ -1466,7 +1487,7 @@ ck "a spawn re-reads load (quiet dispatch, spiked spawn -> refused: '${got:-<non
 mkdir -p "$TMP/bin75"
 printf '#!/bin/sh\nexit 75\n' > "$TMP/bin75/pi"
 chmod +x "$TMP/bin75/pi"
-got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "0"; }
@@ -1760,7 +1781,7 @@ sleep 300 & LANDER_PID=$!
 printf '%s\n' "$LANDER_PID" > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
 rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc=$?
 [ "$plrc" -eq 0 ]; rc=$?
 ck "a fixer DEFERS (rc=0) when the LANDER holds the PR-owner lock (rc=$plrc) — contention is not a failure" $rc
@@ -1786,7 +1807,7 @@ kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
 sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
 printf '%s\n' "$STALE_PID" > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
 { [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG" && grep -q 'RECLAIMED a STALE claim' "$RO/logs/fix-7.log"; }; rc=$?
 ck "a STALE claim is TAKEN OVER, not refused: the fixer runs holding it and the chain re-runs (rc=$plrc2)" $rc
@@ -1858,7 +1879,7 @@ ck "an unrestorable displacement is reported as its OWN outcome (rc=2 + a WARNIN
 # mid-claim. The fixer must treat it as LIVE: defer, and leave it exactly as it found it.
 : > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2b=$?
 { [ "$plrc2b" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an EMPTY claim record is treated as LIVE and DEFERS (rc=$plrc2b, no agent) — a lander mid-claim is not a dead one" $rc
@@ -1884,7 +1905,7 @@ aged_empty() { # <writer> -> installs an AGED record at the fixer's lock path
 run_fixer() { # one fixer run against whatever record is installed; leaves PI_LOG/MERGE_LOG/log fresh
   fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
   rm -f "$RO/state/fixbail-7-"*
-  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
       PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1
 }
 aged_empty ': > "$PRLOCK7"'
@@ -1920,7 +1941,7 @@ ck "(9b-orphan) ...and the garbled record is left EXACTLY as found" $rc
 rm -f "$PRLOCK7"
 
 # ⛔ EVERY `prlock_defer` CAUSE IS MAPPED BY `adopt-fix.sh`, AND A REWORD SILENTLY UNMAPS IT (review of
-# #3096, P2 + the same class recorded at `fix-one.sh:411-414`). `adopt-fix.sh` matches the CAUSE TOKEN on
+# #3096, P2 + the same class recorded at `fix-one.sh:442-445`). `adopt-fix.sh` matches the CAUSE TOKEN on
 # the `[fix <PR>] DEFERRED: <cause>` line and maps each to an operator line + exit 79; a cause it does not
 # recognise gets NO line and exit 0 — SUCCESS reported for a run that pushed nothing. The orphan arm's two
 # new deferrals originally began `state/mergeclaim-…`, matching no arm at all. This pins the invariant
@@ -1943,7 +1964,7 @@ ck "(9b-orphan) …and no deferral is spelled with the raw lock path as its caus
 rm -f "$PRLOCK7"; mkdir -p "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
 rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc4=$?
 { [ "$plrc4" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an UNUSABLE lock path (a directory) refuses before any agent runs (rc=$plrc4)" $rc
@@ -1963,7 +1984,7 @@ rmdir "$PRLOCK7" 2>/dev/null || rm -rf "$PRLOCK7"
 # exists for.
 RO3="$RIG/O3"; rm -rf "$RO3"; mkdir -p "$RO3/logs"; : > "$RO3/state"
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$RO3/state/mergeclaim-7.lock" bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; plrc5=$?
 { [ "$plrc5" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an UNWRITABLE state dir refuses before any agent runs (rc=$plrc5) — the second non-refundable arm" $rc
@@ -1977,7 +1998,7 @@ ck "...and names the CAUSE it measured (the create failed on an absent path), no
 # (otherwise merge-one.sh takes the same lock first and exits "already owns this PR", skipping the
 # fixer's own re-review — #2132's strand).
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc3=$?
 { [ "$plrc3" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
 ck "POSITIVE CONTROL: with no lander the fixer RUNS and the chain is re-run (rc=$plrc3)" $rc
@@ -2003,7 +2024,7 @@ PI_STOP="$TMP/pi.stop"; rm -f "$PI_STOP"
 pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; i=0; while [ "$i" -lt 600 ]; do [ -f "${PI_STOP:-/nonexistent}" ] && return 0; sleep 0.1; i=$((i+1)); done; return 0; }
 export -f pi
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PI_STOP="$PI_STOP" PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1 & fixpid=$!
 i=0; while ! grep -q PI_RAN "$PI_LOG" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
 held="$(cat "$PRLOCK7" 2>/dev/null)"
@@ -2065,7 +2086,7 @@ done
 ck "the §9 rig carries every module fix-one.sh hard-requires (a rig missing one asserts a HALF-DEPLOYED refusal, not the claim refusal)" $rc
 printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arccb=$?
 [ "$arccb" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports a CROSS-BOX claim refusal as 79 (got $arccb) — not SUCCESS for a run that pushed nothing" $rc
@@ -2183,7 +2204,7 @@ ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not 
 sleep 300 & ADOPT_LANDER=$!
 printf '%s\n' "$ADOPT_LANDER" > "$RO/state/mergeclaim-7.lock"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79=$?
 [ "$arc79" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS for a run that pushed nothing" $rc
@@ -2191,7 +2212,7 @@ ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS 
 # who reads only adopt-<PR>.log unless this wrapper names it.
 rm -f "$RO/state/mergeclaim-7.lock"; mkdir -p "$RO/state/mergeclaim-7.lock"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79b=$?
 [ "$arc79b" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports an UNUSABLE PR-owner lock as 79 (got $arc79b) — not SUCCESS" $rc

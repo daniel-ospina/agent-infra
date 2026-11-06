@@ -37,6 +37,25 @@ WT=".worktrees/adopt-$PR"
 # trusting it. It replaces the directory-name probe, which tested a NAME rather than a branch (#2033).
 wt_provision "$REPO" "$WT" "$BR" "origin/$BR"
 _wt_rc=$?
+if [ "$_wt_rc" = 4 ]; then
+  # ── THE PRE-START DISK REFUSAL (agent-infra#3395): nothing was created, so rc 77 makes this log
+  # name the DISK gate rather than a materialisation failure. `worktree add` was never ATTEMPTED —
+  # that is the property that makes the refusal free, and the reason it must not read as an add error.
+  echo "[adopt-fix $PR] $WT_RESULT" | tee -a "$O/logs/adopt-$PR.log"
+  # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review round 5, P2 — MEASURED). BOTH
+  # pre-start arms reach rc 4 with `REFUSED-UNKNOWN`: an unreadable `df`, and a half-deployed `$O`
+  # missing `spawn-gate.sh` (`wt-lifecycle.sh`'s own arm pins that skew). This line used to tell the
+  # operator to "reclaim space; this will NOT clear by waiting" for both — a remedy that CANNOT ARRIVE
+  # for a broken probe or a version skew, which is the #2721 wrong-cause class this PR fixes one file
+  # over in `fix-one.sh`. `$WT_RESULT` already names which arm refused, so the remedy is read from it.
+  case "$WT_RESULT" in
+    *REFUSED-UNKNOWN*)
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-UNKNOWN: nothing was created, and this is NOT a full disk. The free-space probe could not answer, so check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh AND that the copy it carries DEFINES \`disk_admit\` — a presence check passes on an older copy that still refuses here (a half-deployed or skewed box fails closed here, #2033). Waiting will NOT clear it." | tee -a "$O/logs/adopt-$PR.log" ;;
+    *)
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-DISK: nothing created; reclaim space; this will NOT clear by waiting" | tee -a "$O/logs/adopt-$PR.log" ;;
+  esac
+  exit 77
+fi
 if [ "$_wt_rc" != 0 ]; then
   echo "[adopt-fix $PR] $WT_RESULT — cannot adopt $BR" | tee -a "$O/logs/adopt-$PR.log"
   exit 1
@@ -72,10 +91,24 @@ elif [ "$rc" = "72" ]; then
   # refused by fix-one.sh with 72. Name it in the log the manual operator reads (#1720/#2694).
   echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the worktree/branch is not $OR; nothing pushed, no attempt consumed. See $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "77" ]; then
-  # ⛔ CODE 77 IS TWO CONDITIONS (review round 1, P2): below the floor, and above it without the
-  # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
-  # operator a full filesystem was the cause when it was not.
-  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — either the filesystem is below DISK_MIN_FREE_MB, or it has no headroom for one lane's dependency tree (DISK-NOHEADROOM). The '[disk-gate] REFUSED' line in the spawn log names which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
+  # ⛔ CODE 77 IS THREE CONDITIONS, AND THIS ARM NAMED TWO (review round 6, P2 — MEASURED). The third
+  # arrived with agent-infra#3395: `fix-one.sh` now refuses BEFORE creating a worktree, and its log
+  # carries `[disk-admit] REFUSED-DISK(...)` / `REFUSED-UNKNOWN` — there is NO `[disk-gate] REFUSED`
+  # line on that path, so the old sentence sent the operator to grep a string that is absent, which is
+  # the same wrong-cause class the round-1 fix above this one exists for (#2721).
+  # Round 1 (P2) established the first two: below the floor, and above it without the headroom for one
+  # lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the operator a full
+  # filesystem was the cause when it was not.
+  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — one of THREE: (a) the filesystem is below DISK_MIN_FREE_MB, (b) it has no headroom for one lane's dependency tree (DISK-NOHEADROOM), or (c) the worktree was refused BEFORE it was created (agent-infra#3395 — nothing was attempted, no worktree and no branch). The spawn log names which: '[disk-gate] REFUSED' for (a)/(b), '[disk-admit] REFUSED-DISK' or 'REFUSED-UNKNOWN' for (c). " >> "$O/logs/adopt-$PR.log"
+  # ⛔ THE REMEDY FOLLOWS THE CAUSE ON THIS LINE TOO (review cycle 10, P2 — MEASURED). The summary
+  # above names REFUSED-UNKNOWN as one of THREE causes, but the sentence below it used to prescribe
+  # ONE remedy — "Reclaim space (…prune --caches, and --scratch for /tmp); waiting will NOT clear it" —
+  # for all three. For the UNKNOWN cause that remedy CANNOT ARRIVE: the probe could not answer, or
+  # `spawn-gate.sh` is missing, and no amount of pruning fixes either. That is the #2721 wrong-cause
+  # class the three rc-4 arms were fixed for, left standing in the one line this file's own comments
+  # call "the log a manual operator reads (#1720)". The `_c77` arm in disk-admission.test.sh PINNED
+  # the conflation rather than noticing it, so it is extended to assert the distinction.
+  echo "[adopt-fix $PR] remedy follows the cause, not this line: for (a), (b) and 'REFUSED-DISK' it is space -- run 'cloud-cell-supervisor.sh prune --caches' (and --scratch to clear /tmp). For 'REFUSED-UNKNOWN' it is NOT a full disk -- the free-space probe could not answer, or this box's \$O is missing spawn-gate.sh or carries a copy that predates \`disk_admit\` (a half-deployed or skewed box fails closed, #2033) -- so pruning will NOT clear it and the fix is to check that \`df\` is on PATH and that \$O carries spawn-gate.sh WITH \`disk_admit\` defined in it. Waiting clears none of them." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE 79 DEFERRALS ARE NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6 review, P2).
 # `fix-one.sh` exits 0 for each of them ON PURPOSE — a deferral is not an error the controller should
 # retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` would return

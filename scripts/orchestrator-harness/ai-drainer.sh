@@ -826,6 +826,15 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
 a plan doc, a decision comment on an issue? Quote it, or say `no recorded decision reaches this work`.
 If a finding contradicts a recorded decision, it is NOT a candidate for adoption: reopen it in its own
 home and argue it; never adopt over it.
+
+## PREVIOUS WORK — did someone already start this? (agent-infra#3484)
+
+CLAIM:     unclaimed — a drainer lane holds no single issue/PR key (it works a slice of PRs)
+WIP:       keyless — this lane reads PRs; there is no `refs/wip/*` archive keyed to it
+BRANCH:    none — it works each PR on that PR's own branch and pushes there
+WORKTREE:  none — it does not create one
+PRIOR:     check `state/prdisp.tsv` and the PR's own comments for the previous attempt before
+redoing it; the last drainer's note is the cheapest evidence on the box.
 GATE_EOF
   return 0
 }

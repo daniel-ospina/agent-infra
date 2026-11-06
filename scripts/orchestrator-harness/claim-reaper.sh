@@ -103,6 +103,10 @@
 #                                released_by · why
 #   `<state>/reclaimed/<slug>`   the same facts, readable, one `key=value` per line, for the lane that
 #                                comes back to a claim it still thinks it holds. `--records` prints them.
+#                                ⓘ Carries `wip=` / `wip_next_actor=` since #3484: the release IS the
+#                                handover, so the record names the `refs/wip/*` snapshot (and any
+#                                issue-named dirty worktree) behind the claim. An unmeasurable
+#                                `refs/wip` is recorded as UNMEASURED, never as "none".
 #   ⛔ THE RECORD IS WRITTEN *BEFORE* THE CLAIM IS DELETED, and it is what makes the promise true: an
 #      `intent` record is written first, the fenced delete follows, then the record is finalized as
 #      `released` (or `refused` if the fence moved). "Released and unrecorded" is the one state that
@@ -592,6 +596,79 @@ cr_gate_bound() {
   [ "${CR_RELEASED:-0}" -lt "$CR_MAX" ]
 } # MUT-ANCHOR:bound
 
+# ── THE WIP LINE AT RELEASE (#3484) ─────────────────────────────────────────────────────────
+# ⛔ THE MEASURED FAILURE. A released claim reads as *"nothing happened here"*. It should read as
+# *"here is what someone already did"*: measured 2026-11-05, 222 rescued `refs/wip/*` archives existed
+# on this repo and **nothing told the next actor to look at them** — `claims.sh` and `claim-reaper.sh`
+# mentioned WIP zero times, and one session produced three branches for one issue. The rescue saved
+# the work; no path found it again.
+#
+# So a release now PRINTS the WIP behind the claim and RECORDS it, which is what turns a silent
+# reclaim into a handover. ⚠️ IT IS NOT A GATE AND MUST NEVER BECOME ONE: WIP presence is not a reason
+# to keep a claim (the holder is already proven gone, so recorded decision (b) is not in play), and
+# this function answers a question about the CLAIM rather than vetoing the release. `--mutations`
+# covers it through the `wip` row, which requires the CASE that owns the line to go RED when the
+# function is disabled — the same non-vacuity the gates get.
+#
+# Sets CR_WIP (one printable clause) and CR_WIP_NEXT (the instruction to the next actor). UNMEASURED is
+# NAMED, never rendered as "none": #3382 invariant 1, `unknown != zero`, is the whole point of the line.
+CR_WIP=""; CR_WIP_NEXT=""
+cr_wip_evidence() {
+  local brief refs rc line wt dirty hits r s
+  CR_WIP=""; CR_WIP_NEXT=""
+  if [ -z "${CR_ISSUE:-}" ]; then
+    # A PR/branch key has no issue whose refs could be matched. Say WHICH, rather than nothing: an
+    # absent line is indistinguishable from "no WIP to report".
+    CR_WIP="n/a (${CR_REF##*/} is not an issue key, so no refs/wip ref maps to it)"
+    return 0
+  fi
+  brief="$HERE/brief-gate.sh"
+  if [ ! -f "$brief" ]; then
+    CR_WIP="UNMEASURED (brief-gate.sh is not beside this tool, so refs/wip cannot be read for #$CR_ISSUE)"
+    return 0
+  fi
+  # ⛔ THE PROBES RUN FROM A NEUTRAL CWD, for the reason gate 6 states: a child that inherited an
+  # issue-named cwd would carry the issue in the census this tool reads.
+  # ⛔ THE REPOSITORY IS ABSOLUTISED BEFORE THE NEUTRAL-cwd `cd` (fresh-context review of #3484, P2).
+  # `claims.sh` supports `CLAIM_REPO="."`, and `.` resolved from `/tmp` names a different tree —
+  # measured: the handover line read UNMEASURED on a box whose origin answered fine. Absent/unresolvable
+  # stays EMPTY, so the probe still abstains rather than measuring the wrong repository.
+  local repo_abs=""
+  [ -n "${CLAIM_REPO:-}" ] && repo_abs="$(cd "$CLAIM_REPO" 2>/dev/null && pwd)"
+  refs="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && bash "$brief" --wip-refs "$CR_ISSUE" "$repo_abs" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    CR_WIP="UNMEASURED (refs/wip could not be read for #$CR_ISSUE — unknown is not zero)"
+    return 0
+  fi
+  line=""
+  while IFS=$'\t' read -r r s; do
+    [ -n "${r:-}" ] || continue
+    line="${line}${line:+, }$r @ ${s}"
+  done <<< "$refs"
+  # The dirty worktree, only when its PATH carries the issue number: that is the population the WORK
+  # gate already over-matches, and a checkout named after the issue is the likeliest place a
+  # predecessor's half-finished tree still sits. Best-effort — an unreadable listing omits this half.
+  wt=""; dirty=""
+  if [ -n "$repo_abs" ] && [ -d "$repo_abs" ]; then
+    wt="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && git -C "$repo_abs" worktree list --porcelain 2>/dev/null \
+          | awk -v n="$CR_ISSUE" '/^worktree /{ p = substr($0, 10); if (p ~ ("(^|[^0-9])" n "([^0-9]|$)")) print p }' | head -1)"
+    if [ -n "$wt" ] && [ -d "$wt" ]; then
+      hits="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && GIT_OPTIONAL_LOCKS=0 git -C "$wt" status --porcelain -uall 2>/dev/null | grep -c '' 2>/dev/null)"
+      case "${hits:-}" in ''|*[!0-9]*) dirty="dirty state UNMEASURED" ;; 0) dirty="clean" ;; *) dirty="$hits dirty file(s)" ;; esac
+      wt="$wt ($dirty)"
+    else
+      wt=""
+    fi
+  fi
+  if [ -z "$line" ] && [ -z "$wt" ]; then
+    CR_WIP="none — no refs/wip ref and no issue-named worktree matched #$CR_ISSUE (measured: brief-gate.sh --wip-refs $CR_ISSUE)"
+    return 0
+  fi
+  CR_WIP="${line:-no refs/wip ref found}${wt:+; worktree $wt}"
+  CR_WIP_NEXT="read that before starting — do not re-derive it"
+  return 0
+} # MUT-ANCHOR:wip
+
 # ── judgement ───────────────────────────────────────────────────────────────────────────────────
 # cr_judge <ref> <sha> — fill the CR_* facts, then run the evidence gates in order.
 # `sha` is the ref's VALUE (what the fence and the record carry); `obj` is a local ref we fetched so
@@ -695,9 +772,10 @@ cr_record() {
   logf="$dir/claim-reaper.log"
   # Atomic per-ref record: write a sibling temp file, then rename. A torn record is not a record.
   tmp="$dir/reclaimed/.$slug.$$"
-  printf 'ref=%s\nholder=%s\nclaim_age_s=%s\nclaim_sha=%s\nreclaimed_at=%s\nreclaimed_at_epoch=%s\nreclaimed_by=%s\nresult=%s\nwhy=%s\nevidence=%s\nreleased_with=force-with-lease:%s\n' \
+  printf 'ref=%s\nholder=%s\nclaim_age_s=%s\nclaim_sha=%s\nreclaimed_at=%s\nreclaimed_at_epoch=%s\nreclaimed_by=%s\nresult=%s\nwhy=%s\nevidence=%s\nwip=%s\nwip_next_actor=%s\nreleased_with=force-with-lease:%s\n' \
     "$CR_REF" "$CR_HOLDER" "$CR_AGE" "$CR_SHA" "$at" "$CR_NOW" "$(claim_host):$$" "$result" "$why" \
-    "$(printf '%s' "$CR_EVIDENCE" | tr '\n' ' ')" "$CR_SHA" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
+    "$(printf '%s' "$CR_EVIDENCE" | tr '\n' ' ')" "$(printf '%s' "${CR_WIP:-}" | tr '\t\n' '  ')" \
+    "$(printf '%s' "${CR_WIP_NEXT:-}" | tr '\t\n' '  ')" "$CR_SHA" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
   mv -f "$tmp" "$dir/reclaimed/$slug" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 1; }
   CR_RECORD_PATH="$dir/reclaimed/$slug"
   # The log is the append-only audit trail, and it carries the RELEASES only: an `intent` or a
@@ -804,6 +882,15 @@ for _ref in $_refs; do
     "${CR_HOLDER:-?}" "${CR_AGE:--}" "$CR_MIN_AGE" "${CR_UNTIL:-?}" "$CR_VERDICT"
   printf '[claim-reaper]   evidence: %s\n' "${CR_EVIDENCE:-<none gathered>}"
   printf '[claim-reaper]   why: %s\n' "$CR_WHY"
+  # ── THE HANDOVER (#3484). Computed for exactly the claims this pass MAY act on, because releasing
+  # one is what destroys the only cheap pointer to the work behind it.
+  if [ "$CR_VERDICT" = "RELEASABLE" ]; then
+    cr_wip_evidence
+    if [ -n "$CR_WIP" ]; then
+      printf '[claim-reaper]   WIP AT RELEASE: %s\n' "$CR_WIP"
+      [ -n "$CR_WIP_NEXT" ] && printf '[claim-reaper]   NEXT ACTOR MUST: %s\n' "$CR_WIP_NEXT"
+    fi
+  fi
 
   case "$CR_VERDICT" in
     RELEASABLE)

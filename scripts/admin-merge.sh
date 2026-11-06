@@ -142,12 +142,104 @@
 #   * it applies ONLY on the base side (base -> PR). A PR check with no declared
 #     counterpart keeps the unqualified `NO BASE COUNTERPART` answer: this is one
 #     pair, not a policy that shell failures are probably fine.
-#   * it does not touch §4.5. The PR's own evaluated tree still BLOCKS on a red
-#     there, base-shared or not — that gate exists for the repair direction, which
-#     requires the red to be GONE from the PR's tree (#1261).
+#   * it does NOT exempt a §4.5 tree red by name alone. The gate exists for the
+#     repair direction, which requires the red to be GONE from the PR's tree (#1261),
+#     so a name match buys nothing there. (The SEPARATE #3322 exclusion below is keyed
+#     on the BASE's own measured red, not on this name map alone.)
 #
-# The value lives in `declared_base_equivalent`, its ONE implementation; the ONE
-# reader is the step-1c named refusal (`named_unattributable_runs`).
+# The value lives in `declared_base_equivalent`, its ONE implementation, and it has
+# TWO readers, both of which consult it for the SAME question — "is there a base-side
+# checker for this PR-side check?":
+#   1. the step-1c named refusal (`named_unattributable_runs`), which names the base
+#      red it found and exempts nothing; and
+#   2. `base_owned_check` (#3322), which EXCLUDES a PR-side red from the §4.5 required
+#      surface when the base itself is measurably RED under the equivalent name on a
+#      workflow no PR can run. See "A CHECK MAIN ITSELF FAILS" below.
+#
+# ── A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE (#3322) ────────────
+# THE DEFECT. This repo splits its suites by trigger: `ci.yml` is `pull_request`-only
+# and runs `bash-suites (1..n)`; `ci-main.yml` is `push`-only and runs the SAME sweep
+# UNSHARDED, as `script-validate` (cited in ci-main.yml's own comment). Main is red on
+# `script-validate`; every PR is red on the shards. The probe below correctly calls
+# main's red NOT-PR-EVALUABLE (#6807) and reports it without blocking — and that left
+# it in NO set the rail could use. §4.5 then read the PR's own tree, saw the shards
+# red, and refused with "a red still here means the repair is incomplete" for a red no
+# PR can ever clear: main fails the suite, so the PR CANNOT make it pass. Measured
+# 2026-11-05: three unrelated PRs (#3478 guard, #3168 attestation, #3486 MCP) were red
+# on the IDENTICAL nine checks, and #3478 had ZERO unique reds.
+#
+# THE RULE, and it is narrow on purpose. A red on the PR's evaluated tree is EXCLUDED
+# from the required surface iff BOTH hold:
+#   (i) the BASE's own check surface — read from GitHub by `check_surface_probe` on the
+#       base ref, not taken from a caller flag — carries a RED whose workflow declares
+#       no `pull_request`/`pull_request_target` trigger (the #6807 class: no PR can
+#       ever attach a check to a head sha for it); and
+#   (ii) that base red's NAME is this tree check's name, or the name
+#       `declared_base_equivalent` declares for it (the one cited pair,
+#       `bash-suites (<n>)` == `script-validate`).
+# So the evidence is MAIN'S OWN MEASURED SURFACE, and the exclusion fires only where
+# main is red on that suite at read time. Every fail-closed path holds:
+#   * an UNREADABLE or PARTIAL base read excuses NOTHING, but not because the set is empty:
+#     step 2c `exit 1`s on BOTH (a base the rail could not read is not a certificate, and
+#     4.6/4.7 are both gated on the base being RED), and that exit comes AFTER the name file
+#     is seeded — so the set may well be non-empty and §4.5 simply never consults it. An
+#     UNMEASURED base (0 checks, 0 statuses) writes no `exempt:` row at all, so there the set
+#     IS empty and §4.5 refuses as before. Nothing is excused on any of the three paths;
+#   * the base read is CLEAN -> no set -> the PR's red is its own and blocks, which is
+#     the #1261 incident (a lint red main does NOT carry) and every real regression;
+#   * the base red is on a workflow that DOES declare a PR trigger -> it is a BLOCKING
+#     base red, deliberately NOT in the set: that is the repair direction, where §4.5
+#     must keep insisting the red be GONE from the PR's tree;
+#   * a tree red with NO base counterpart does not match and blocks.
+# ⛔ IT IS NOT A BLANKET EXEMPTION AND IT IS NOT KEYED ON THE CHECK'S NAME ALONE. A
+# PR-side red named `bash-suites (3)` on a base whose `script-validate` is GREEN stays
+# blocking; deleting the base measurement from the rule would make every shell red
+# base-caused — the blanket excuse the #2610 mapping's own requirements forbid.
+# ⛔ THE DECLARED RESIDUAL. A check NAME main never publishes cannot be shown to be "a check
+# main itself fails", so there is no evidence to exclude it and it keeps blocking. Measured on
+# this repo: `ci.yml` declares a `verify` job; `ci-main.yml` declares NO `verify` job at all
+# (`grep -rn '^  verify:' .github/workflows/` → `ci.yml:371` only), so main can never publish
+# that NAME and this rule can never fire for it.
+# ⛔ NO ENUMERATION OF THE BASE'S JOBS BELONGS HERE, and this line is the scar: an earlier
+# revision listed them and MISSED `bash32-parse-guard` — a pattern that does not admit digits
+# skips it — which is the same "absence asserted without resolving coverage" mistake the
+# paragraph below warns about, committed inside the paragraph. Name the ONE fact that carries
+# the argument and let a reader run the grep.
+# ⛔ THE UNIT HERE IS THE NAME, NOT THE PROGRAM, and the difference decides which fix is owed.
+# Many of the programs the `verify` job runs DO run on main — some named literally in
+# ci-main.yml, others picked up by the `extension-tests` job's globs — but under OTHER JOB
+# names (`extension-tests / …`) that `declared_base_equivalent` has no arm for. It is also NOT
+# a clean split by "appears in the file", because a glob match is invisible to a text search:
+# do not restate this as a count without resolving the globs. So the residual is two things,
+# and neither is excused here:
+#   • a program main DOES run under an UNMAPPED job name needs a MAPPING arm — the
+#     `bash-suites-gate`-shaped residual stated in `declared_base_equivalent`'s docblock;
+#   • a program main truly never runs is #3415's "base-owned but unmeasurable from the base"
+#     family, where a base-side reproduction — never a name match — is the only evidence that
+#     could exist.
+# That is a refusal with a reason, never a silent pass.
+# ⛔ THE SECOND RESIDUAL, NAMED: THE EXCLUSION IS LANE-GRANULAR, NOT SHARD-GRANULAR.
+# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base
+# check `script-validate`, so while main is red on it, EVERY shard is excluded — including
+# a shard failure THIS PR introduced, whose cause is on no base. Per-shard attribution is
+# not available from base-side evidence (main publishes the sweep as ONE job-level red),
+# and inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
+# the guard for an ATTRIBUTABLE failure is deliberately NOT this rule and is untouched by
+# it: `named_unattributable_runs` (step 1c) still names it, and #3415's `bash-shard::`
+# reproduction still runs the residual on a pristine base worktree and refuses anything
+# the base does NOT reproduce. A PR-caused failure inside a shared shard is therefore
+# refused for its OWN reason — and it is refused BEFORE this exclusion is ever reached, since
+# both attribution legs run ahead of §4.5. The exclusion is a statement about a
+# NAME the base already fails; it is never a licence for a NEW failure inside that name.
+# ⛔ WHAT THE SUITE DOES AND DOES NOT PROVE. §80's fixtures carry no failing run, so the
+# "blocked by the decision -> re-run" leg is not entered and §4.5 is the SOLE blocker in
+# every scenario. §80 therefore pins the intended property — an inherited red no longer
+# refuses at §4.5, and the exclusion is named in BOTH stderr and the durable evidence —
+# and NOT an end-to-end merge in the shape #3322 measured (a tree red on both an inherited
+# shard and its own id-level residual). That second shape is decided by the attribution
+# legs above, which this change does not touch. §80(f) closes the last untested arm of
+# the rule itself: a NON-CODE tree red must stay excluded from the exclusion even when its
+# name matches a base-owned red.
 #
 # ── THE PR'S EVALUATED TREE (#1261) ───────────────────────────────────────
 # The incident, exactly. PR #4589 (commit ebe4e7e8f) landed three ruff
@@ -1499,9 +1591,12 @@ fetch_run_failed_job_names() {
 
 # declared_base_equivalent <pr-check-name> — THE DECLARED LANE EQUIVALENCE (#2610):
 # print the BASE-side check NAME this PR-side check is equivalent to, or nothing when
-# there is none. The pair, its reason and its citations are in the header ("THE ONE
-# DECLARED LANE EQUIVALENCE"); this is the ONE implementation and
-# `named_unattributable_runs` is its ONLY reader.
+# there is none. TWO readers, one question (see the header): `named_unattributable_runs`
+# names with it and exempts nothing; `base_owned_check` (#3322) uses it to decide a §4.5
+# exclusion, and only together with the base's own MEASURED red. The pair, its reason
+# and its citations are in the header ("THE ONE
+# DECLARED LANE EQUIVALENCE"); this is the ONE implementation, and a SECOND name-keyed
+# map is the drift the rail's one-derivation rule forbids.
 #
 # ⛔ STRUCTURAL, NOT A PREFIX, AND DELIBERATELY NARROW. Every arm is a specific,
 # cited pair. A rule that read "a shell suite failed" as an equivalence would make
@@ -1540,6 +1635,38 @@ declared_base_equivalent() {
       printf '%s\n' 'script-validate'
       ;;
   esac
+  return 0
+}
+
+# base_owned_check <pr-check-name> <base-owned-names-file> — #3322's matcher: print the
+# BASE-side check name that makes this PR-side red BASE-OWNED, or nothing when it is
+# not. `<base-owned-names-file>` is written by the caller from the BASE probe's own
+# MEASURED surface (one failing check name per line, restricted to the ones whose
+# workflow declares no PR trigger) — so this function only matches; it never decides
+# what main fails.
+#
+# ⛔ A MISSING OR EMPTY FILE ADMITS NOTHING. An unreadable base surface, a clean base,
+# and a base whose only reds are PR-evaluable all produce an empty file, and all three
+# must leave the red blocking (see "A CHECK MAIN ITSELF FAILS" in the header). A
+# matcher that treated "no evidence" as "no red on main" — or as "red on main" — would
+# turn the exclusion into the blanket pass it exists not to be.
+# ⛔ THE MATCH IS EXACT (`grep -F -x`), never a prefix: `bash-suites-gate` is NOT
+# `bash-suites (n)` and `script-validate` is not `extension-tests / script-validate`.
+# The declared mapping is the ONLY widening, and it is one cited pair.
+# ⛔ NO EXIT STATUS MEANS "NOT BASE-OWNED", exactly like `declared_base_equivalent`:
+# the answer is stdout, so a caller can never mistake an empty answer for a failure.
+base_owned_check() {
+  local name="${1:-}" names_file="${2:-}" mapped=""
+  [ -n "$name" ] && [ -s "$names_file" ] || return 0
+  if grep -Fxq -e "$name" -- "$names_file" 2>/dev/null; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  mapped="$(declared_base_equivalent "$name")"
+  [ -n "$mapped" ] || return 0
+  if grep -Fxq -e "$mapped" -- "$names_file" 2>/dev/null; then
+    printf '%s\n' "$mapped"
+  fi
   return 0
 }
 
@@ -5766,15 +5893,25 @@ lane_has_no_head_run() {
   return 0
 }
 
-# check_surface_probe <ref> <label> [<exempt-noncode-events>] — measure EVERY
-# workflow's check runs and commit statuses attached to <ref> (a branch name OR a
-# sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in the
-# summary lines, so a probe of the PR's evaluated tree never claims to be about
+# check_surface_probe <ref> <label> [<exempt-noncode-events>] [<base-owned-names-file>] —
+# measure EVERY workflow's check runs and commit statuses attached to <ref> (a branch
+# name OR a sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in
+# the summary lines, so a probe of the PR's evaluated tree never claims to be about
 # main. <exempt-noncode-events> is 1 ONLY for the BASE surface (the
 # `schedule`/`issues`/`issue_comment` exemption); the PR's evaluated tree passes 0
 # and BLOCKS on them — the third argument is explicit so the exemption can never
 # drift back onto the surface that gates the merge. Callers snapshot the scratch
 # into their own prefix (BASE_* / TREE_*) immediately; see step 2c and step 4.5.
+#
+# <base-owned-names-file> (#3322) is supplied ONLY for the PR's evaluated tree, and
+# only by §4.5. It holds the base-side check NAMES the base itself is measurably
+# failing on a workflow no PR can run; a tree red matching one (directly or via
+# `declared_base_equivalent`) is EXCLUDED from the required surface and reported
+# under its own heading rather than silently dropped. Omitted/empty = nothing is
+# excluded, which is the fail-closed direction: the base measurement is the ONLY
+# thing that can admit an exclusion, so a caller that forgets to pass it over-blocks
+# (a false block), never passes (a false PASS). See "A CHECK MAIN ITSELF FAILS" in
+# the header.
 #
 # A NON-CODE EVENT IS EXEMPT BY SURFACE, NOT BY EVENT (#1353). "Does this lane
 # measure a revision?" is a property of the EVENT; "would refusing this red
@@ -5782,10 +5919,10 @@ lane_has_no_head_run() {
 # appears on — the BASE. On the TREE the exemption can only ever exempt an
 # anomaly, because a default-branch run cannot attach to a PR head sha.
 check_surface_probe() {
-  local ref="$1" label="${2:-main}" allow_noncode="${3:-0}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one wf_path pr_evaluable
+  local ref="$1" label="${2:-main}" allow_noncode="${3:-0}" base_owned_file="${4:-}"
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one wf_path pr_evaluable base_owned
   local map_sel=()
-  local blocking=0 other=0 other_noneval=0
+  local blocking=0 other=0 other_noneval=0 baseowned=0
   local repo_args=()
   [ -n "${REPO:-}" ] && repo_args=(--repo "$REPO")
   MAIN_HEALTH_STATUS=""
@@ -5809,8 +5946,17 @@ check_surface_probe() {
   # this NAME?" needs the wider set: on agent-infra main's only red is `script-validate`
   # on a `push` run from ci-main.yml, which the probe correctly calls not-PR-evaluable —
   # so a reader built on RED_TS alone would answer "no such red" about the one red that
-  # exists. ONE probe, one extra accumulator: not a second reader.
+  # exists. TWO readers now consume that classification: `named_unattributable_runs`
+  # (which names a base counterpart) and step 2c's #3322 extraction (which turns the
+  # `exempt: this workflow declares no PR trigger` rows into the base-owned name list
+  # §4.5 excludes against). ONE probe, one extra accumulator: not a second reader.
   MAIN_HEALTH_ALL_REDS=""
+  # #3322: tree reds EXCLUDED because the BASE is measurably failing the same
+  # suite under its own lane's name, on a workflow no PR can run. Its own
+  # accumulator + its own display set, so an exclusion can never be mistaken for a
+  # red the surface did not carry (a silent drop) or for a red that blocked.
+  MAIN_HEALTH_REDS_BASEOWNED=""
+  MAIN_HEALTH_RED_BASEOWNED=0
   # The surface's own last-production time (max completed_at over its completed
   # checks) and that time as epoch seconds. Empty when the surface has no
   # completed check at all.
@@ -6219,7 +6365,31 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         if [ "$noncode" -eq 1 ]; then
           blocking_reason=" — NOT EXEMPT ON THIS SURFACE: a non-code event on the PR's evaluated tree is an ANOMALY, so BLOCKING"
         fi
-        if [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
+        # ── #3322: A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE ───────
+        # The base probe runs FIRST (step 2c) and leaves the base's own
+        # not-PR-evaluable reds on disk as names (`base_owned_file`). A red on
+        # the TREE whose name — or whose declared equivalent name — is one of
+        # them is the same suite under the other lane's name, already measured
+        # red on the base, and NO PR can make it pass. Excluding it is the
+        # difference between "the PR is red" and "the repo is red", and the
+        # defect this closes refused a merge over an inherited red that no diff
+        # could clear.
+        # ⛔ TREE ONLY (`allow_noncode=0`) and ⛔ NEVER A NON-CODE RED: on the base
+        # the #6807 arm above already owns this class, and a `schedule`/`issues`
+        # red on the tree is an ANOMALY, not an inherited defect.
+        # ⛔ NOTHING IS EXCLUDED WITHOUT THE BASE MEASUREMENT. An empty file (base
+        # unread, base clean, base reds all PR-evaluable) matches nothing.
+        base_owned=""
+        if [ "$allow_noncode" -eq 0 ] && [ "$noncode" -eq 0 ]; then
+          base_owned="$(base_owned_check "$job" "$base_owned_file")"
+        fi
+        if [ -n "$base_owned" ]; then
+            [ -n "$MAIN_HEALTH_REDS_BASEOWNED" ] && MAIN_HEALTH_REDS_BASEOWNED="${MAIN_HEALTH_REDS_BASEOWNED}"$'\n'
+            MAIN_HEALTH_REDS_BASEOWNED="${MAIN_HEALTH_REDS_BASEOWNED}   • ${job} — ${concl}${red_note_suffix} — the base itself fails '${base_owned}' on a workflow that declares no PR trigger, so NO PR can make this pass; this check is that suite under the PR lane's name — ${url}"
+            [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
+            MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}${job}"$'\t'"exempt: base-owned — the base itself fails '${base_owned}', which no PR can run"
+            baseowned=$((baseowned + 1))
+        elif [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
             MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev:-(unresolved)}' — ${concl}${red_note_suffix} — NOT pull-request-evaluable (this workflow declares no pull_request/pull_request_target trigger, so no PR can attach its checks to a head sha), so NOT blocking — ${url}"
             [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
@@ -6300,6 +6470,13 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   fi
   if [ "$other_noneval" -gt 0 ]; then
     MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $other_noneval further red check(s) on workflows that declare NO pull_request/pull_request_target trigger — NOT pull-request-evaluable, so reported, not blocking (no PR can attach their checks to a head sha, so no PR could ever measure them; #6807)"
+  fi
+  # #3322: an EXCLUSION is stated in the summary the evidence carries, never left
+  # to a display block a caller might not print. `MAIN_HEALTH_RED_BASEOWNED` is the
+  # count the §4.5 disclosure and the posted evidence read.
+  MAIN_HEALTH_RED_BASEOWNED="$baseowned"
+  if [ "$baseowned" -gt 0 ]; then
+    MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $baseowned red check(s) EXCLUDED as BASE-OWNED — the base itself fails the same suite under its own lane's name, on a workflow no PR can run, so no PR can make them pass (#3322)"
   fi
   return 0
 }
@@ -9736,10 +9913,56 @@ main() {
   # say whether the base is itself red — which is what makes a repair PR a repair —
   # but it NEVER blocks. It was the BLOCKING source in the previous revision, and
   # that is precisely what refused the PR that repairs a red main.
-  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH
+  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH BASE_ALL_REDS BASE_OWNED_REDS
   check_surface_probe "$base_ref" "the base branch '$base_ref'" 1
   BASE_STATUS="$MAIN_HEALTH_STATUS"; BASE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   BASE_REDS="$MAIN_HEALTH_REDS"; BASE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  # ── #3322: WHAT MAIN ITSELF FAILS, TAKEN FROM ITS OWN MEASURED SURFACE ────────
+  # The #6807 bucket above already decided which base reds NO PR CAN EVER RUN
+  # (workflow declares no pull_request/pull_request_target). Those reds are
+  # reported and not counted against the PR — and, until this line, they were also
+  # dropped on the floor, so §4.5 had no way to know that the PR's red on the SAME
+  # suite is the base's red carried forward. Materialise their NAMES once, here, and
+  # hand them to the tree probe.
+  # ⛔ THE CLASS IS NARROW ON PURPOSE: `exempt: this workflow declares no PR trigger`
+  # ONLY. A BLOCKING base red is deliberately not in this set — it is PR-evaluable,
+  # so §4.5/§4.6 must keep insisting the repair PR clear it (#1261). A NON-code
+  # event is not in it either: that red is noise from a cron lane, and a PR red
+  # that merely shares its name is not the same measurement.
+  # ⛔ EMPTY IS THE FAIL-CLOSED ANSWER and it is the common one: an UNMEASURED base (0 checks,
+  # 0 statuses), a clean base, and a base whose only reds are PR-evaluable all leave this file
+  # empty, which admits no exclusion at all. An UNREADABLE or PARTIAL base ALSO seeds nothing
+  # usable in effect — not because this file stays empty (step 2c seeds it and then `exit 1`s
+  # before §4.5 reads it), but because the rail never gets that far.
+  BASE_ALL_REDS="$MAIN_HEALTH_ALL_REDS"
+  BASE_OWNED_REDS="$TMP/base-owned-reds.txt"
+  : > "$BASE_OWNED_REDS"
+  if [ -n "$BASE_ALL_REDS" ]; then
+    # ⛔ THE SET IS NOT A FLAT NAME LIST. Two conditions, both fail-closed, both load-bearing:
+    #   (1) A NAME THAT ALSO HAS A `blocking:` ROW IS NOT EMITTED. The base can publish one
+    #       check NAME from two different apps/workflows — exempt on a push-only lane and
+    #       BLOCKING on a PR-evaluable one. Taking the name from the exempt row and ignoring
+    #       the blocking row would exclude a PR red on evidence the base contradicts (the
+    #       header: "the base red is on a workflow that DOES declare a PR trigger -> it is a
+    #       BLOCKING base red, deliberately NOT in the set").
+    #   (2) NEITHER NAMELESS PLACEHOLDER IS EMITTED. `(unnamed check)` / `(unnamed status)` are
+    #       the identities the probe gives a row with no name — they are not the NAME of
+    #       anything, so matching them would let ONE unnamed base red excuse ANY unnamed tree
+    #       red (#1353's "an unnamed red must never vanish", inverted into a waiver).
+    # Both are pinned by §80(g)/(h); the awk is the ONE place either rule lives.
+    printf '%s\n' "$BASE_ALL_REDS" \
+      | awk -F'\t' '
+          $2 ~ /^blocking:/ { blocked[$1] = 1 }
+          { row[$1] = row[$1] "\n" $2 }
+          END {
+            for (n in row) {
+              if (blocked[n]) continue
+              if (n == "(unnamed check)" || n == "(unnamed status)") continue
+              if (row[n] ~ /exempt: this workflow declares no PR trigger, so a PR can never run it/) print n
+            }
+          }' \
+      | sort -u > "$BASE_OWNED_REDS"
+  fi
   BASE_TOTAL="$MAIN_HEALTH_TOTAL"; BASE_RED="$MAIN_HEALTH_RED"; BASE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   BASE_PENDING="$MAIN_HEALTH_PENDING"; BASE_REF="$MAIN_HEALTH_REF"; BASE_SHA="$MAIN_HEALTH_SHA"
   # The base's BLOCKING reds with their start times, and the base surface's own
@@ -10238,10 +10461,13 @@ main() {
   # PROCEEDS on UNMEASURED (a surface with no checks certifies nothing, but is
   # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
   # look is never a green).
-  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_PENDINGS TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
-  check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0
+  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_PENDINGS TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH TREE_REDS_BASEOWNED TREE_RED_BASEOWNED
+  # #3322: the base's own not-PR-evaluable failing check names (step 2c). Passed here
+  # and ONLY here — the tree is the one surface where an inherited red is a false block.
+  check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0 "$BASE_OWNED_REDS"
   TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  TREE_REDS_BASEOWNED="$MAIN_HEALTH_REDS_BASEOWNED"; TREE_RED_BASEOWNED="$MAIN_HEALTH_RED_BASEOWNED"
   TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_PENDINGS="$MAIN_HEALTH_PENDINGS"
   TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
@@ -10280,6 +10506,14 @@ main() {
       if [ -n "${TREE_PENDINGS:-}" ]; then
         info "admin-merge:    in flight on this tree (reported, NOT blocking — a check still running is not a red):"
         printf '%s\n' "$TREE_PENDINGS"
+      fi
+      # #3322: an exclusion that is only an ABSENCE is indistinguishable from a
+      # silent drop, so every excluded red is printed with the base check that
+      # owns it. This is the arm the fix is read from — silence here means the
+      # rail did not exclude anything, which is a different claim entirely.
+      if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+        say_err "admin-merge:    EXCLUDED from the required surface (#3322) — the base itself fails the same suite, under its own lane's name, on a workflow no PR can run:"
+        printf '%s\n' "$TREE_REDS_BASEOWNED" | sed 's/^/      /' >&2
       fi ;;
     unmeasured)
       info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
@@ -10296,6 +10530,14 @@ main() {
         say_err "   (Also red on NON-code events — reported, not blocking here; a PR surface"
         say_err "    is not expected to carry one, so this is an anomaly:)"
         printf '%s\n' "$TREE_REDS_OTHER" >&2
+      fi
+      # #3322: the excluded reds are named even when the tree STILL refuses, so a
+      # mixed surface says which reds were inherited and which are the PR's own.
+      if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+        say_err "   EXCLUDED from the required surface (#3322) — the base itself fails the same suite,"
+        say_err "   under its own lane's name, on a workflow that declares no PR trigger, so no PR"
+        say_err "   can make it pass. These are NOT among the failures below:"
+        printf '%s\n' "$TREE_REDS_BASEOWNED" >&2
       fi
       say_err "   BASE CONTEXT: $BASE_SUMMARY"
       say_err "   If the base is red and THIS PR is the repair, the red should already be GONE"
@@ -10536,6 +10778,15 @@ Base check surface (every workflow and app on head of '$base_ref'): ${BASE_STATU
     health_line="$health_line
 Base red(s) reported but NOT blocking:
 $BASE_REDS_OTHER"
+  fi
+  # #3322: an EXCLUDED tree red is a decision this rail made about the PR's required
+  # surface, so it belongs in the durable record for the same reason the #6807 bucket
+  # does — otherwise the posted evidence shows a green tree with no trace of the red it
+  # set aside, and a reviewer cannot tell "the PR is clean" from "the repo is already red".
+  if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+    health_line="$health_line
+Tree red(s) EXCLUDED from the required surface (#3322) — ${TREE_RED_BASEOWNED} check(s) the base itself fails under its own lane's name, on a workflow that declares no PR trigger, so no PR can ever make them pass:
+$TREE_REDS_BASEOWNED"
   fi
   analyzed="$analyzed
 $health_line"
