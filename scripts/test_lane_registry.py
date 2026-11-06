@@ -633,7 +633,10 @@ def test_T17b_a_lane_id_cannot_escape_the_namespace(box, tmp_path):
     mod, origin, tmp_path = box
     for bad in ("../escape", "a/b", "", ".hidden", "-dash", "x" * 200, "a\n b",
                 # ⛔ ref-ILLEGAL but regex-plausible before this arm existed:
-                "a..b", "a.", "a.lock"):
+                "a..b", "a.", "a.lock",
+                # ⛔ AND `$`-vs-`\Z`: `$` matches before a trailing newline, so this passed .match()
+                # while git refused the ref. One byte was enough to mint a handle that never pushes.
+                "a\n", "a.b\n"):
         pushed, detail = mod._push({"lane_id": bad, "state": "RUNNING", "host": "h",
                                     "heartbeat_at": 1, "budget_s": 1, "lease_until": 2,
                                     "started_at": 1}, origin, 20.0)

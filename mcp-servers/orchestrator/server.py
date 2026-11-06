@@ -69,8 +69,10 @@ import importlib.util
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -1567,40 +1569,76 @@ def _saved_for_issue(repo: str, issue: int) -> Dict[str, Any]:
         if str(issue) in slug.split("-"):
             matches.append((parts[0], slug))
     found: List[Dict[str, Any]] = []
-    for sha, slug in matches[:_SAVED_MAX_MATCHES]:
-        local = "refs/wip-remote/%s" % slug
-        got = run(["git", "-C", repo, "fetch", "-q", "--no-tags", "origin",
-                   "+refs/wip/%s:%s" % (slug, local)], timeout=60.0)
-        entry: Dict[str, Any] = {"ref": "refs/wip/%s" % slug, "slug": slug, "sha": sha}
-        if got.rc != 0:
-            entry["age"] = ("UNMEASURED(git fetch +refs/wip/%s + %s)"
-                            % (slug, (got.stderr or "rc=%d" % got.rc).strip()[:120]))
-            entry["files"] = None
+    # ⛔ THE SAVED-WORK READ NEVER WRITES THE CALLER'S CHECKOUT. It used to `git fetch` into
+    # `refs/wip-remote/<slug>` INSIDE `repo`, which creates/updates local refs and downloads their
+    # objects — an ENVIRONMENT MUTATION by a tool annotated `readOnlyHint: true` and described as
+    # "Read-only.", and one `--read-only` could not refuse because `_claim_check` takes no mode. (It
+    # also degraded to UNMEASURED on a checkout the server may not write, for a question that needed
+    # no write.) A PRIVATE bare repo answers every question below with the caller's repo untouched.
+    scratch: Optional[str] = None
+    url = ""
+    fetch_fault = ""
+    if matches:
+        got_url = run(["git", "-C", repo, "remote", "get-url", "origin"], timeout=30.0)
+        url = (got_url.stdout or "").strip() if got_url.rc == 0 else ""
+        if not url:
+            fetch_fault = ("UNMEASURED(git -C %s remote get-url origin + %s)"
+                           % (repo, (got_url.stderr or "rc=%d" % got_url.rc).strip()[:120]))
+        else:
+            scratch = tempfile.mkdtemp(prefix="orch-mcp-wip-")
+            init = run(["git", "init", "-q", "--bare", scratch], timeout=30.0)
+            if init.rc != 0:
+                fetch_fault = ("UNMEASURED(git init --bare <scratch> + %s)"
+                               % ((init.stderr or "rc=%d" % init.rc).strip()[:120]))
+                shutil.rmtree(scratch, ignore_errors=True)
+                scratch = None
+    try:
+        for sha, slug in matches[:_SAVED_MAX_MATCHES]:
+            entry: Dict[str, Any] = {"ref": "refs/wip/%s" % slug, "slug": slug, "sha": sha}
+            if scratch is None:
+                entry["age"] = fetch_fault
+                entry["files"] = None
+                found.append(entry)
+                continue
+            local = "refs/wip/%s" % slug
+            got = run(["git", "-C", scratch, "fetch", "-q", "--no-tags", url,
+                       "+refs/wip/%s:%s" % (slug, local)], timeout=60.0)
+            if got.rc != 0:
+                entry["age"] = ("UNMEASURED(git fetch +refs/wip/%s + %s)"
+                                % (slug, (got.stderr or "rc=%d" % got.rc).strip()[:120]))
+                entry["files"] = None
+                found.append(entry)
+                continue
+            ts = run(["git", "-C", scratch, "log", "-1", "--format=%ct", local], timeout=30.0)
+            if ts.rc == 0 and (ts.stdout or "").strip().isdigit():
+                entry["age"] = _age(float((ts.stdout or "").strip()))
+                entry["committed_at"] = _iso(float((ts.stdout or "").strip()))
+            else:
+                entry["age"] = ("UNMEASURED(git log -1 --format=%%ct %s + %s)"
+                                % (local, (ts.stderr or "rc=%d" % ts.rc).strip()[:120]))
+            # ⛔ `--root` AND `-m` ARE BOTH LOAD-BEARING, AND FOR TWO DIFFERENT SNAPSHOT SHAPES.
+            # `--root` covers the ROOT-commit shape (the actuator commits a bare tree, so a
+            # parent-relative diff fails with "unknown revision" and every file count would be
+            # UNMEASURED on the snapshots that matter most). `-m` covers the MERGE shape: a rescue
+            # snapshot is committed with `-p HEAD -p <previous snapshot>`, so a SECOND rescue — the
+            # grace work, the one worth finding — is a MERGE, and `git diff-tree` prints NOTHING for a
+            # merge without `-m`, with rc=0. That published `file_count: 0` as a MEASURED zero for
+            # exactly the wrong shape (invariant 1: unknown is not zero). Lines are de-duplicated
+            # because `-m` emits one change set PER PARENT.
+            files = run(["git", "-C", scratch, "diff-tree", "--no-commit-id", "--name-only", "-r",
+                         "-m", "--root", local], timeout=30.0)
+            if files.rc == 0:
+                entry["files"] = sorted({f for f in (files.stdout or "").splitlines() if f.strip()})
+                entry["file_count"] = len(entry["files"])
+            else:
+                entry["files"] = None
+                entry["file_count"] = None
+                entry["file_count_detail"] = ("UNMEASURED(git diff-tree --root -m %s + %s)"
+                                              % (local, (files.stderr or "").strip()[:120]))
             found.append(entry)
-            continue
-        ts = run(["git", "-C", repo, "log", "-1", "--format=%ct", local], timeout=30.0)
-        if ts.rc == 0 and (ts.stdout or "").strip().isdigit():
-            entry["age"] = _age(float((ts.stdout or "").strip()))
-            entry["committed_at"] = _iso(float((ts.stdout or "").strip()))
-        else:
-            entry["age"] = ("UNMEASURED(git log -1 --format=%%ct %s + %s)"
-                            % (local, (ts.stderr or "rc=%d" % ts.rc).strip()[:120]))
-        # ⛔ `--root`, NOT `<ref>^..<ref>`. A rescue snapshot is frequently a ROOT commit (the
-        # actuator commits a bare tree onto `refs/wip/<slug>`), so a parent-relative diff fails with
-        # "unknown revision" and the file count would silently become UNMEASURED on exactly the
-        # snapshots that matter most. `diff-tree --root` lists the whole tree for a root commit and
-        # the change set otherwise, which is the same question answered for both shapes.
-        files = run(["git", "-C", repo, "diff-tree", "--no-commit-id", "--name-only", "-r",
-                     "--root", local], timeout=30.0)
-        if files.rc == 0:
-            entry["files"] = [f for f in (files.stdout or "").splitlines() if f.strip()]
-            entry["file_count"] = len(entry["files"])
-        else:
-            entry["files"] = None
-            entry["file_count"] = None
-            entry["file_count_detail"] = ("UNMEASURED(git diff-tree --root %s + %s)"
-                                          % (local, (files.stderr or "").strip()[:120]))
-        found.append(entry)
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
     return dict(base,
                 count=len(matches),
                 population=total,
@@ -1812,6 +1850,12 @@ WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
 # surface's authority), reached through a verb that IS read-only — so the verb gate cannot see it, and
 # neither can the metacharacter filter (there is no shell metacharacter in either flag).
 EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv")
+# ⛔ AND REFUSING TWO FLAG SPELLINGS DOES NOT CLOSE THE CLASS — THE TRIGGER IS THE TARGET REPO'S
+# CONFIG, NOT A FLAG. Porcelain git runs repo-configured helpers BY DEFAULT: `diff.external`,
+# `diff.<driver>.textconv` (reached through `.gitattributes`), and `core.fsmonitor` all execute on an
+# argv with no flag at all (`["git", "diff"]`, `["git", "status"]`). See `_harden_argv` for the pin.
+GIT_DIFF_VERBS = ("diff", "log", "show")
+GIT_HOOK_FLAGS = ("--no-ext-diff", "--no-textconv")
 # ⛔ A BARE ARGUMENT TO `hostname` IS THE SETTER FORM, NOT A QUERY. `hostname NAME` and
 # `hostname -F <file>` RENAME the box (`hostname --help`: `{hostname|-F file}  set host name`), and
 # `ALLOWLIST["hostname"] = ([], 1)` bounds only the COUNT — so `["hostname", "pwned-cell"]` passed this
@@ -1824,27 +1868,45 @@ HOSTNAME_OK_FLAGS = ("-a", "-A", "-d", "-f", "-i", "-I", "-s", "-y", "-V", "--ve
 
 
 
-def _harden_argv(argv):
-    """Close the configuration escape that no allowlist entry can see.
+def _harden_argv(argv: List[str]) -> List[str]:
+    """Close the configuration escapes that no allowlist entry can see.
 
     A plain, fully-allowlisted `git diff` still spawns a program named in git CONFIG
-    (`diff.external`) or in `GIT_EXTERNAL_DIFF`; `git show` does the same through a textconv driver.
-    The program allowlist bounds the program and the argv bounds the flags — configuration escaped
-    both, which is the same class as the `--output` write the surface already refuses.
+    (`diff.external`, `diff.<driver>.textconv`) or in `GIT_EXTERNAL_DIFF`; `git log -p` and
+    `git show` reach the SAME diff machinery; and `git status` runs `core.fsmonitor`. The program
+    allowlist bounds the PROGRAM and the argv bounds the FLAGS — configuration escaped both, which is
+    the same class as the `--output` write the surface already refuses.
 
     `cmux vm exec` forwards no environment, so a hardened env cannot be passed: the guarantee has to
-    travel inside the argv. Git takes the LAST occurrence of a flag, so appending the disables also
-    neutralises a caller-supplied `--ext-diff` / `--textconv` rather than merely being present.
+    travel inside the argv. Three placement rules, each load-bearing:
 
-    Scoped to `git diff` / `git show` — the only allowlisted verbs that consult a config-named
-    program. A blanket append would false-block nothing today, but would quietly become a claim
-    about programs that never had the hole.
+    * `-c core.fsmonitor=` is a GLOBAL option, so it precedes the verb — and it covers every
+      allowlisted verb, `status` included (`status` is exactly where fsmonitor runs). A diff-only
+      fix leaves `core.fsmonitor` reachable through the most ordinary call on the surface.
+    * `--no-ext-diff`/`--no-textconv` are DIFF options, so they follow the verb, and they go LAST
+      among options: git honours the last occurrence, so a caller-supplied `--ext-diff` — or an
+      unambiguous ABBREVIATION of it, which the token denylist cannot predict — is neutralised
+      rather than merely accompanied.
+    * LAST means last BEFORE the `--` separator, never after it: everything following `--` is a
+      PATHSPEC. Appending past it would harden NOTHING and add a bogus path, so the completely
+      ordinary `git diff -- .` would silently defeat the guard.
+
+    `git log` is covered with `diff`/`show` because `git log -p` consults the same diff machinery. A
+    non-git argv is returned as a copy, unchanged.
     """
     out = list(argv)
-    if len(out) >= 2 and out[0] == "git" and out[1] in ("diff", "show"):
-        for flag in ("--no-ext-diff", "--no-textconv"):
-            if flag not in out:
-                out.append(flag)
+    if not out or out[0] != "git":
+        return out
+    rest = out[1:]
+    if not rest or rest[0] not in GIT_OK_VERBS:
+        # Not a verb this module understands: `_allowlisted` refuses it, and inventing a shape for it
+        # here would be a claim about a command that never runs.
+        return out
+    verb = rest[0]
+    out = ["git", "-c", "core.fsmonitor=", verb] + rest[1:]
+    if verb in GIT_DIFF_VERBS:
+        sep = out.index("--") if "--" in out else len(out)
+        out = out[:sep] + list(GIT_HOOK_FLAGS) + out[sep:]
     return out
 
 def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[bool, Dict[str, Any]]:
@@ -1863,16 +1925,6 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         payload["note"] = ("pass the command and its arguments as SEPARATE strings; a shell string is "
                            "refused by type because no allowlist survives `sh -c`")
         return True, payload
-    # ⛔ A PLAIN, FULLY-ALLOWLISTED `git diff` COULD STILL SPAWN A PROGRAM THE ALLOWLIST NEVER SAW.
-    # Found by review (P1), measured: with `diff.external` set in git config — or `GIT_EXTERNAL_DIFF` in
-    # the environment — `["git","diff"]` runs that program, with no flag at all; `["git","show"]` does
-    # the same through a textconv driver. So the program allowlist bounded the PROGRAM and the argv
-    # bounded the flags, while the EFFECT escaped through configuration, which is the same class as the
-    # `--output` write it already refuses.
-    # `cmux vm exec` forwards no environment, so this cannot be fixed by passing a hardened env: the
-    # guarantee has to travel INSIDE the argv. Appending the disables is that guarantee — and git takes
-    # the LAST occurrence of a flag, so a caller-supplied `--ext-diff` cannot re-enable it.
-    argv = _harden_argv(argv)
     allowed, why = _allowlisted(argv)
     if not allowed:
         payload["refused"] = "command-not-allowlisted"
@@ -1908,7 +1960,16 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
     resolution = _resolve_box(cmux, box)
     payload["resolution"] = resolution
     target = resolution.get("name") or box
-    ran = run([cmux, "vm", "exec", "--timeout", str(timeout_s), target, "--"] + list(argv),
+    # ⛔ THE EXECUTED ARGV IS HARDENED, AND HARDENING HAPPENS AFTER VALIDATION ON PURPOSE. `_allowlisted`
+    # must bound what the CALLER sent — its `max_args` limit would otherwise be inflated by our own
+    # flags, refusing or admitting on the wrong count — and the argv that actually runs is ours to
+    # build. The caller's argv is reported as sent; the executed one is reported beside it whenever
+    # they differ, so the transform is visible rather than implied.
+    exec_argv = _harden_argv(list(argv))
+    payload["argv"] = list(argv)
+    if exec_argv != list(argv):
+        payload["executed_argv"] = exec_argv
+    ran = run([cmux, "vm", "exec", "--timeout", str(timeout_s), target, "--"] + exec_argv,
               timeout=timeout_s + CHANNEL_MARGIN_S, cap=cap)
     payload.update({
         "rc": ran.rc,

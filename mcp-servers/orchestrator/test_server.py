@@ -1108,20 +1108,38 @@ def test_T_the_clamp_never_rewrites_a_declared_call_site():
     assert max(timeouts) <= mod.MAX_TIMEOUT_S, (
         "a call site declares timeout=%s but MAX_TIMEOUT_S=%s, so the clamp silently shortens it "
         "(a slow-but-legitimate read becomes a false UNMEASURED)" % (max(timeouts), mod.MAX_TIMEOUT_S))
-    # ⛔ AND THE SCAN MUST SEE THE FORM IT COULD NOT: a COMPUTED call site. `box.exec` asks for
-    # `timeout_s + CHANNEL_MARGIN_S` DELIBERATELY — see CHANNEL_MARGIN_S — so the literal-only regex
-    # above skipped the one site that exceeds the caller's clamp by design, and this arm (whose whole
-    # job is "no declared call site may be silently rewritten") passed over the site where that was
-    # happening. The computed site's worst case is the caller's maximum PLUS its declared margin, and
-    # the channel bound must cover it.
-    margins = [int(x) for x in re.findall(r"\btimeout=\w+\s*\+\s*([0-9]+)\b", src)]
-    assert margins, ("the scan found no `timeout=<ident> + <int>` call site — the regex has drifted, "
-                     "or the declared channel margin was removed")
+    # ⛔ AND THE SCAN MUST SEE THE FORM IT COULD NOT — AND MUST READ CODE, NOT PROSE. `box.exec` asks
+    # for `timeout_s + CHANNEL_MARGIN_S` DELIBERATELY (see CHANNEL_MARGIN_S), so the literal-only
+    # regex above skipped the one site that exceeds the caller's clamp by design, and this arm (whose
+    # whole job is "no declared call site may be silently rewritten") passed over the site where that
+    # was happening.
+    # ⛔ THE FIRST VERSION OF THIS ARM WAS ITSELF A FALSE PASS. It matched `timeout=timeout_s + 30` in
+    # a COMMENT — the regex required an integer literal and the real site names a constant — so it
+    # went GREEN when the margin was deleted from the call site and RED when only the comment was
+    # reworded. Comments are stripped, the identifier form is matched, and the named constant is
+    # RESOLVED against the module, so the assertion is about the executed call site.
+    code = "\n".join(ln for ln in src.splitlines() if not ln.lstrip().startswith("#"))
+    computed = re.findall(r"\btimeout=timeout_s\s*\+\s*([A-Za-z_][A-Za-z0-9_]*|[0-9]+)\b", code)
+    assert computed, ("no `timeout=timeout_s + <margin>` CALL SITE — the channel margin was dropped "
+                      "from the one place it is applied (or the regex has drifted)")
+    resolved = []
+    for token in computed:
+        if token.isdigit():
+            resolved.append(int(token))
+        else:
+            assert hasattr(mod, token), (
+                "the call site names %r, which this module does not define — the margin is no longer "
+                "the constant the bound is computed from" % (token,))
+            resolved.append(int(getattr(mod, token)))
     assert mod.MAX_CHANNEL_TIMEOUT_S == mod.MAX_TIMEOUT_S + mod.CHANNEL_MARGIN_S
-    assert mod.MAX_TIMEOUT_S + max(margins) <= mod.MAX_CHANNEL_TIMEOUT_S, (
+    assert max(resolved) == mod.CHANNEL_MARGIN_S, (
+        "the call site asks for +%s but CHANNEL_MARGIN_S=%s — the bound covers the larger of the two, "
+        "so the smaller one silently loses the margin it declares" % (max(resolved),
+                                                                    mod.CHANNEL_MARGIN_S))
+    assert mod.MAX_TIMEOUT_S + max(resolved) <= mod.MAX_CHANNEL_TIMEOUT_S, (
         "a computed call site asks for <clamp>+%s but MAX_CHANNEL_TIMEOUT_S=%s, so the clamp still "
         "rewrites it and the transport's own answer is discarded as CHANNEL-TIMEOUT"
-        % (max(margins), mod.MAX_CHANNEL_TIMEOUT_S))
+        % (max(resolved), mod.MAX_CHANNEL_TIMEOUT_S))
     assert max(caps) <= mod.MAX_CAP, (
         "a call site declares cap=%s but MAX_CAP=%s" % (max(caps), mod.MAX_CAP))
 
@@ -1319,11 +1337,69 @@ def test_T_saved_work_is_found_by_slug_token(tmp_path):
     assert entry["file_count"] == 1, entry
     # the coverage caveat travels with the answer: `none` must never read as "no work was in progress"
     assert got["save_coverage"] == "normal-exit-only", got
+    # ⛔ AND THE READ MUST NOT WRITE THE CALLER'S CHECKOUT. It used to `git fetch` into
+    # `refs/wip-remote/<slug>` INSIDE `work` — a repo mutation by a tool declared `readOnlyHint: true`
+    # that `--read-only` could not refuse. Asserted on the refs, not on the code path.
+    refs = subprocess.run(["git", "-C", str(work), "for-each-ref", "--format=%(refname)"],
+                          check=True, capture_output=True, text=True).stdout
+    assert "refs/wip-remote" not in refs, ("the saved-work read wrote the caller's checkout: %s" % refs)
 
     # a slug that is NOT the token must not match: `ai-90010` is a different item
     other = mod._saved_for_issue(str(work), 90010)
     assert other["count"] == 0, other
     assert other["none_means"].startswith("no snapshot was found"), other
+
+
+def test_T_saved_work_counts_a_MERGE_snapshot(tmp_path):
+    """⛔ THE SECOND RESCUE IS A MERGE COMMIT, AND `diff-tree` PRINTS NOTHING FOR A MERGE.
+
+    `bg-rescue-wip.sh` commits a snapshot with `-p HEAD -p <previous snapshot>`, so the FIRST rescue is
+    a single parent and every LATER one — the grace-period work, the snapshot that matters most — is a
+    MERGE. `git diff-tree` emits no patch for a merge unless `-m` is passed, and exits 0, so the code
+    took the MEASURED branch and published `file_count: 0` with `files: []` — invariant 1's exact
+    failure (unknown reported as zero) for the wrong shape, and invisibly: the single-parent arm above
+    cannot see it. Measured on real origin data (`refs/wip-remote/fix-3377-mandate-preflight` has two
+    parents: `--name-only` against `^1` lists 1 file, `diff-tree` without `-m` lists none).
+    """
+    import subprocess
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    work = tmp_path / "work"
+    subprocess.run(["git", "clone", "-q", str(origin), str(work)], check=True)
+
+    def git(*a, **kw):
+        return subprocess.run(["git", "-C", str(work), *a], check=True, capture_output=True,
+                              text=True, **kw)
+
+    git("config", "user.email", "t@t")
+    git("config", "user.name", "t")
+    (work / "one.sh").write_text("echo one\n")
+    git("add", "one.sh")
+    git("commit", "-q", "-m", "first rescue")
+    first = git("rev-parse", "HEAD").stdout.strip()
+    git("push", "-q", "origin", "HEAD:refs/wip/ai-9002")
+    # the SECOND rescue: two parents, so it is a merge commit
+    git("checkout", "-q", "-b", "second", first)
+    (work / "two.sh").write_text("echo two\n")
+    git("add", "two.sh")
+    git("commit", "-q", "-m", "second rescue")
+    second = git("rev-parse", "HEAD").stdout.strip()
+    merged = git("commit-tree", second + "^{tree}", "-p", second, "-p", first,
+                 "-m", "rescue merge").stdout.strip()
+    parents = [ln for ln in git("cat-file", "-p", merged).stdout.split("\n\n")[0].splitlines()
+               if ln.startswith("parent ")]
+    assert len(parents) == 2, ("the fixture is not a two-parent commit: %r" % (parents,))
+    git("push", "-q", "origin", "%s:refs/wip/ai-9002" % merged)
+
+    mod = _saved_mod()
+    got = mod._saved_for_issue(str(work), 9002)
+    assert got["count"] == 1, got
+    entry = got["matches"][0]
+    assert entry["file_count"] is not None, (
+        "the merge snapshot's file count is UNMEASURED rather than measured: %r" % (entry,))
+    assert entry["file_count"] > 0, (
+        "a MERGE snapshot published file_count 0 — `diff-tree` needs `-m` for a merge, or the "
+        "count is a false zero on exactly the snapshot that matters most: %r" % (entry,))
 
 
 def test_T_saved_work_unreadable_is_unmeasured_never_none(tmp_path):
@@ -1352,11 +1428,25 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     occurrence of a flag and a caller-supplied `--ext-diff` would otherwise re-enable the hook.
     """
     mod = _saved_mod()
-    assert mod._harden_argv(["git", "diff"]) == ["git", "diff", "--no-ext-diff", "--no-textconv"]
+    # ⛔ EVERY ALLOWLISTED GIT VERB IS fsmonitor-PINNED, and `-c` is a GLOBAL option so it precedes
+    # the verb. `status` is NOT untouched: `core.fsmonitor` is exactly the hook a plain `git status`
+    # runs, so a diff-only hardening leaves the commonest call on the surface able to execute one.
+    assert mod._harden_argv(["git", "diff"]) == ["git", "-c", "core.fsmonitor=", "diff",
+                                                  "--no-ext-diff", "--no-textconv"]
+    assert mod._harden_argv(["git", "status"]) == ["git", "-c", "core.fsmonitor=", "status"]
     re_enable = mod._harden_argv(["git", "diff", "--ext-diff"])
     assert re_enable[-2:] == ["--no-ext-diff", "--no-textconv"], re_enable
     textconv = mod._harden_argv(["git", "show", "--textconv", "HEAD"])
     assert textconv[-2:] == ["--no-ext-diff", "--no-textconv"], textconv
-    # a verb with no such hook is untouched — the hardening is scoped, not a blanket append
-    assert mod._harden_argv(["git", "status"]) == ["git", "status"]
+    # ⛔ AND LAST MEANS LAST BEFORE `--`, NEVER AFTER IT. Everything following the separator is a
+    # PATHSPEC, so an append past it hardens NOTHING and adds a bogus path — `git diff -- .` is an
+    # ordinary invocation, so that placement would let a caller defeat the guard by accident.
+    assert mod._harden_argv(["git", "diff", "--", "src/"]) == [
+        "git", "-c", "core.fsmonitor=", "diff", "--no-ext-diff", "--no-textconv", "--", "src/"], \
+        mod._harden_argv(["git", "diff", "--", "src/"])
+    # `git log -p` reaches the SAME diff machinery, so it is covered with `diff`/`show`.
+    assert mod._harden_argv(["git", "log", "-p"])[-2:] == ["--no-ext-diff", "--no-textconv"], \
+        mod._harden_argv(["git", "log", "-p"])
+    # a non-git program and a non-verb are untouched — the hardening is scoped, not a blanket append
     assert mod._harden_argv(["cat", "/etc/hostname"]) == ["cat", "/etc/hostname"]
+    assert mod._harden_argv(["git", "--version"]) == ["git", "--version"]

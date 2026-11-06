@@ -68,7 +68,17 @@ def session_file(sid):
     if not sid:
         return None
     hits = glob.glob(os.path.join(SESS, "*", f"*{sid}*.jsonl"))
-    return max(hits, key=os.path.getmtime) if hits else None
+    if not hits:
+        return None
+    try:
+        return max(hits, key=os.path.getmtime)
+    except OSError:
+        # ⛔ A HIT THAT VANISHED BETWEEN THE GLOB AND THE STAT IS "NOT FOUND", NOT A CRASH. The glob
+        # proves a name existed a moment ago, not that it is still stat-able: a rotated/removed session
+        # file raises FileNotFoundError HERE, one call BEFORE `collect()`'s guard — so without this it
+        # still escaped `main()` as rc 1 with empty stdout, the code the `3 UNMEASURED` contract
+        # retires. `None` is the same answer the caller already handles as "no session file".
+        return None
 
 
 def turns(path, want):
@@ -78,6 +88,12 @@ def turns(path, want):
         try:
             o = json.loads(line)
         except Exception:
+            continue
+        # ⛔ A LINE THAT PARSES TO A NON-OBJECT IS SKIPPED, NOT A CRASH. `null`, `5`, `[]`, `"x"` all
+        # parse cleanly and then raise AttributeError from `.get()` — which is NOT an OSError, so it
+        # escaped both this function's own "tolerate an unparseable line" stance and `collect()`'s
+        # guard, and killed the process with rc 1 and empty stdout.
+        if not isinstance(o, dict):
             continue
         msg = o.get("message") if isinstance(o.get("message"), dict) else o
         if (msg or {}).get("role") != "assistant":

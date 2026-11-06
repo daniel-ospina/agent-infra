@@ -149,7 +149,10 @@ WRITABLE = ("RUNNING", "DONE", "FAILED")   # `EXPIRED` is DERIVED — see the mo
 # "cannot see this lane until it is" pushed. `?`-free by construction: git's rules for a ref component
 # are `..`, a trailing `.`, `.lock` and the control characters, and this pattern is the one place they
 # belong. See T17b for the shapes.
-LANE_ID_RE = re.compile(r"^(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9](?:[A-Za-z0-9._-]{0,158}[A-Za-z0-9_-])?$")
+# ⛔ `\Z`, NOT `$`. Python's `$` also matches IMMEDIATELY BEFORE A TRAILING NEWLINE, so `"good-1\n"`
+# passed `.match()` while `git check-ref-format` refused the ref — the same LOCAL-ONLY-forever handle
+# this pattern exists to prevent, reachable with one byte. `\Z` is the absolute end of the string.
+LANE_ID_RE = re.compile(r"^(?!.*\.\.)(?!.*\.lock\Z)[A-Za-z0-9](?:[A-Za-z0-9._-]{0,158}[A-Za-z0-9_-])?\Z")
 
 DEFAULT_BUDGET_S = 7200      # == spawn-gate.sh's LANE_BACKSTOP_S (the lane's absolute backstop)
 DEFAULT_BEAT_S = 60

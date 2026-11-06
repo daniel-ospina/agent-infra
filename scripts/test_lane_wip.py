@@ -137,3 +137,39 @@ def test_an_unreadable_session_file_is_still_UNMEASURED_not_exit_1(monkeypatch, 
     monkeypatch.setattr(lw, "session_file", lambda sid: str(tmp_path / "gone.jsonl"))
     rc, p = lw.collect("WS1")
     assert rc == 3 and "UNMEASURED(" in (p.get("unmeasured") or ""), (rc, p)
+
+
+def test_a_json_line_that_is_not_an_object_is_skipped_not_a_crash(monkeypatch, tmp_path):
+    """⛔ `null`, `5`, `[]` and `"x"` PARSE, then raise `AttributeError` from `.get()`.
+
+    That is not an `OSError`, so it slipped past both this function's own "tolerate an unparseable
+    line" stance and `collect()`'s guard, and killed the process with rc 1 and empty stdout — the
+    retired code again, on a session file that is merely unusual rather than unreadable.
+    """
+    lw = _load()
+    f = tmp_path / "sid-abc12345.jsonl"
+    f.write_text('null\n5\n[]\n"text"\n{"message": {"role": "assistant", "content": "hi"}}\n')
+    monkeypatch.setattr(lw, "lane_rows",
+                        lambda: [{"ws": "WS1", "lane": "L1", "sid": "sid-abc12345",
+                                  "verdict": "WORKING"}])
+    monkeypatch.setattr(lw, "session_file", lambda sid: str(f))
+    rc, p = lw.collect("WS1")
+    assert rc == 0, (rc, p)
+    assert p["turns"] == ["hi"], p["turns"]
+
+
+def test_a_session_file_that_vanishes_during_the_glob_is_not_found(monkeypatch):
+    """⛔ `session_file()`'s `max(..., key=getmtime)` RACES THE FILE IT JUST GLOBBED.
+
+    A rotated or removed session file raises `FileNotFoundError` INSIDE that call — one call BEFORE
+    `collect()`'s guard — so it escaped to rc 1 as well. A hit that is no longer stat-able is "no
+    session file", which the caller already answers with rc 3.
+    """
+    lw = _load()
+    monkeypatch.setattr(lw.glob, "glob", lambda pat: ["/tmp/vanished-sid-abc.jsonl"])
+
+    def boom(p):
+        raise FileNotFoundError(2, "No such file", p)
+
+    monkeypatch.setattr(lw.os.path, "getmtime", boom)
+    assert lw.session_file("sid-abc") is None
