@@ -752,6 +752,40 @@ review_action() {  # $1 = state, $2 = seconds since dispatch, $3 = attempts alre
 review_should_defer() {  # $1 = reviews already dispatched for THIS repo in THIS pass
   [ "${1:-0}" -ge "$REVIEW_PER_PASS" ]
 }
+# ── WHICH ARM OWNS A CANDIDATE: review | rail | skip ───────────────────────────────────────────────
+# ⛔ ONE PREDICATE, DRIVEN BY THE SUITE, BECAUSE GETTING IT WRONG IS A SILENT MERGE STALL (#3489, P1).
+# The first cut of this branch gated the review arm on `[ "$_kind" = green ]` and `continue`d for every
+# other candidate — so a RED candidate carrying a marker at an OLDER head was dropped by BOTH arms: the
+# review arm refused it (red) and the `continue` prevented the rail path below. Measured 2026-11-06 on
+# this box: `gh pr list` on daniel-ospina/agent-infra classified **33 candidates, green=0, red=33** (main
+# is red on `bash-suites (1)-(8)` and `verify`, so every PR inherits a red it does not own) — 14 of them
+# red-with-a-stale-marker. That class is LANDABLE and was landable on the base: check (c) accepts a
+# STALE marker whose `diff=` equals the live diff (`record-review.sh --check-carry`, #3315) and the rail's
+# exemption engine merges when the residual reds are not PR-unique. So the `continue` removed reachability
+# that existed before this change and no other arm supplies it: `orch-loop.sh` merges only on `GREEN`, the
+# red-fixer fires on a RAIL REFUSAL (which no longer happens for a candidate that is never railed), and
+# the line's own claim — "the red arm owns this PR" — names the branch it is standing in.
+# ⛔ AND THE ASYMMETRY IS THE POINT: an unattested head cannot merge, so a review it does not get is work
+# left undone; a markerless red head has NOTHING for the rail to carry (check (c) is red on the missing
+# marker alone), so railing it is the noise-and-slot-burn the base's substring filter existed to avoid.
+# Hence:
+#   green + anything but at-head        -> review  (the defect this change exists for)
+#   red   + absent                      -> skip    (no marker anywhere: the red arm owns it, and a review
+#                                                  is not bought for a red head — a red head must not be
+#                                                  attested clean, #3440)
+#   red   + stale|nohead (a marker)      -> rail    (the carry arm + the exemption engine: the only path
+#                                                  that can land it, and exactly what the base did)
+#   at-head (any kind)                  -> rail    (today's path, untouched)
+# ⛔ THE DEFAULT IS `rail`, NEVER `review`: an unclassifiable candidate must fall back to the arm that
+# spends nothing. Defaulting to `review` would turn a parse surprise into a paid dispatch.
+review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; prints review|rail|skip
+  case "$1:${2:-}" in
+    *:at-head)  printf 'rail\n';;    # an attestation at the head that would merge: today's path
+    green:*)    printf 'review\n';;  # no attestation for the head that would merge, and it could land
+    red:absent) printf 'skip\n';;    # red, and nothing to carry: the red arm owns it
+    *)          printf 'rail\n';;    # red WITH a marker (stale/nohead): hand it to the rail, as the base did
+  esac
+}
 # ── PUBLISHING THE STATE ON THE PR, IDEMPOTENTLY ───────────────────────────────────────────────────
 # ⛔ THIS IS THE PART THAT ACTUALLY KILLS THE DEFECT: `mergeable=MERGEABLE state=BLOCKED
 # reviewDecision=empty` with nothing written on the PR is indistinguishable from "a lane is working on
@@ -927,7 +961,16 @@ green=[]; red=[]
 # THIS ACTUATOR'S: any recorded verdict at this head is `at-head`, because the question asked here is
 # only "does an attestation exist for the head that would merge?" (a non-clean record still names a
 # review that happened, and re-buying a review of the same head is not the remedy for it).
-MARKER_RE = re.compile(r"review recorded: reviews/(\d+)\.json verdict=[a-z][a-z-]* @ ([0-9a-f]{40})")
+# ⛔ ANCHORED AT THE START OF THE LINE, EXACTLY AS THE GATE IT FEEDS IS. The gate's own regex
+# (`check-pipeline-compliance.sh`: `^review recorded: reviews/<PR>.json verdict=(clean|clean-micro|clean-low)
+# @ <sha>...`) is line-anchored on purpose: an INDENTED or mid-sentence marker is a QUOTATION, not a
+# record — record-review.sh emits the marker as a line of its own. The first cut of this parse had no
+# `^`, so a body that merely quoted the shape on a line carrying the repo slug read `at-head`: the rail is
+# then launched for something check (c) will refuse for ever, and — worse — `at-head` is the ONLY value
+# that disables the review arm, so the PR could never be reviewed either. That is the #3489 failure
+# (invisible, unattributable, permanent) reproduced by the change that exists to remove it. `^` here is
+# per-LINE because the loop below feeds this one line at a time; it is not MULTILINE and must not be.
+MARKER_RE = re.compile(r"^review recorded: reviews/(\d+)\.json verdict=[a-z][a-z-]* @ ([0-9a-f]{40})")
 
 def attestation(body, head, pr, repo):
     "at-head | stale | absent | nohead — never an inference from a partial match."
@@ -1039,9 +1082,10 @@ PY
         || { log_line "$repo #$pr HEAD-READ-FAILED: gh rc=$? — skipping this candidate (a cooldown keyed to an empty head would re-rail it every pass)"; continue; }
       [ -n "$head" ] || { log_line "$repo #$pr HEAD-READ-FAILED: gh returned an empty head — skipping this candidate"; continue; }
       # ⛔ THE ONE DECISION THIS CHANGE ADDS, AND IT IS MADE FROM THE ATTESTATION AT THE HEAD THAT WOULD
-      # MERGE (#3489). `at-head` is today's behaviour, untouched, below. Anything else means no review
-      # owns this PR — so the rail is NOT launched (it would refuse for "no head-bound record" in one
-      # line and consume a slot) and the reviewer step is dispatched instead.
+      # MERGE (#3489). `at-head` is today's behaviour, untouched, below. Anything else is decided by
+      # `review_candidate_arm` — which is NOT simply "review it": a RED head with a marker is handed to
+      # the rail below (the carry + exemption path, unchanged from the base), because the review arm
+      # cannot land a red head and dropping it was a silent merge stall (P1, review round 3).
       # The classification was computed by the candidate search from ITS `gh pr list` read (body +
       # headRefOid) while the head used for the state key below is this candidate's own read, a second
       # apart. ⛔ THAT RACE IS NAMED RATHER THAN CLOSED, because closing it costs a second `gh` call per
@@ -1049,11 +1093,26 @@ PY
       # re-reads the head itself and reviews what is really there (`review-pr.sh` binds its record to the
       # head it reviewed), and a record that landed in between means `review-pr.sh` exits 5 — "a clean
       # record already exists at this head" — having spent nothing.
+      # ⛔ WHICH ARM OWNS THIS CANDIDATE IS DECIDED ONCE, BY A DRIVEN PREDICATE (P1, review round 3).
+      # Default `rail` — the arm that spends nothing — so an at-head candidate (which never consults the
+      # predicate) and any unclassifiable one still take today's path, and a parse surprise can never
+      # become a paid dispatch.
+      _rarm=rail
       if [ "$_att" != at-head ]; then
-        if [ "$_kind" != green ]; then
-          log_line "$repo #$pr AWAITING-REVIEW ($_att) but its checks are RED — no review is bought for a head that has to change; the red arm owns this PR"
+        _rarm=$(review_candidate_arm "$_kind" "$_att")
+        if [ "$_rarm" = skip ]; then
+          log_line "$repo #$pr AWAITING-REVIEW ($_att) and its checks are RED — no marker at ANY head to carry and no review is bought for a red head (a red head must not be attested clean, #3440); the red arm owns this PR"
           continue
         fi
+        if [ "$_rarm" = rail ]; then
+          # ⛔ RED, BUT IT CARRIES A MARKER AT AN OLDER HEAD — SO THE RAIL IS STILL THE RIGHT ARM, AND
+          # DROPPING IT HERE WAS THE P1 REVIEW FINDING. There is a carry (`diff=` unchanged) and an
+          # exemption engine that can land this revision; nothing else in the fleet can. The line is
+          # logged so the pass says which arm took it instead of implying a lane is working on the PR.
+          log_line "$repo #$pr RED with a marker at an OLDER head ($_att) — NOT reviewed; handed to the RAIL, where a diff-matched carry plus the exemption engine is the only path that can land a red head (dropping it here would remove reachability the base had)"
+        fi
+      fi
+      if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then
         if [ "$REVIEW_AVAILABLE" != 1 ]; then
           log_line "$repo #$pr AWAITING-REVIEW ($_att) and this box has no reviewer at $REVIEW_SCRIPT — the PR stays unattested until one is reachable (said once at start, named here per candidate)"
           continue

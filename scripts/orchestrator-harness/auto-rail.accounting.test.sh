@@ -565,6 +565,16 @@ _ckline "no attestation in this body" "$H7" 'green\t7\tabsent' \
 # one for another PR, or names another repo, passed `"review recorded:" in body` and was never reviewed.
 _ckline "Example: review recorded: reviews/99.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "$H7" 'green\t7\tabsent' \
   "a marker for a DIFFERENT PR number must not read as this PR's attestation (quoting the shape is not a record)"
+# ⛔ AND AN INDENTED / MID-SENTENCE MARKER IS A QUOTATION, NOT A RECORD (review round 3, P2, measured).
+# The parse was unanchored, so a body that merely quoted THIS PR's marker shape at THIS head read `at-head`
+# — while check (c) is line-anchored and REJECTS it. `at-head` is the only value that disables the review
+# arm, so that PR could never be reviewed AND never pass check (c): the #3489 failure (invisible, no owner,
+# permanent) reproduced by its own fix. The `Example:` arm above does not cover this — it fails on the PR
+# NUMBER, not on the anchoring.
+_ckline "  review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "$H7" 'green\t7\tabsent' \
+  "an INDENTED marker must not read as at-head: record-review.sh emits the marker as its own line and check (c) anchors on '^', so an indented copy is a quotation (got a false at-head, which disables the review arm for ever)"
+_ckline "see review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise) above" "$H7" 'green\t7\tabsent' \
+  "a MID-SENTENCE marker must not read as at-head — the gate matches '^review recorded:', so anything the gate will not certify must not be reported as an attestation"
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (some-other-org/tortoise)" "$H7" 'green\t7\tabsent' \
   "a marker naming another REPO must not read as this PR's attestation — the gate binds the repo too"
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "" 'green\t7\tnohead' \
@@ -654,7 +664,7 @@ _marker_count() { grep -cF -- "<!-- auto-rail-review:$1" "$POSTED" 2>/dev/null |
 # the range until it swallowed the rail path's own `launch_rail`, and the `*launch_rail*` arm below fired
 # on a change that never touched the review branch. `/^      fi$/` is the branch's own close (every inner
 # `fi` is ≥ 8 spaces); the sanity arm after the extraction refuses a degenerate range outright.
-_branch=$(sed -n '/if \[ "\$_att" != at-head \]; then/,/^      fi$/p' "$SUT")
+_branch=$(sed -n '/if \[ "\$_att" != at-head \] && \[ "\$_rarm" = review \]; then/,/^      fi$/p' "$SUT")
 [ -n "$_branch" ] || bad "could not locate the review branch in $SUT — the arms below would then pin nothing"
 case "$_branch" in
   *'_out="$RAIL_DIR/auto-'*) bad "the review-branch extraction ran PAST its own close and swallowed the rail path (the end anchor stopped matching) — every arm below would then be pinning the rail path, not the review branch" ;;
@@ -671,17 +681,37 @@ case "$_branch" in
   *publish_review_state*) ;;
   *) bad "the review branch must PUBLISH the state on the PR — a state only this log knows is indistinguishable from waiting on a lane" ;;
 esac
-# ⛔ A RED HEAD MUST NOT BUY A REVIEW (review, P2 — the field's CONSUMER was never pinned). The candidate
-# line's first field is documented as the thing that "tells the loop whether a review may be bought at
-# all", and the suite pinned its EMISSION (`red\t9\tat-head`) but nothing pinned the refusal. With this
-# guard deleted, every red + unattested candidate buys a paid review per repo per pass on a head that
-# cannot land — and publishes `review-in-flight` for it — with the suite green.
-# ⛔ PINNING THE EXPRESSION IS NOT PINNING THE GATE (review round 2, P1, measured): deleting only the
-# `continue` — the guard expression untouched — left the suite GREEN while the loop logged "no review is
-# bought for a head that has to change" and then fell straight through to publish `review-in-flight` and
-# call `launch_review`. The `continue` IS the gate, so the ARM has to require it.
-printf '%s\n' "$_branch" | grep -A2 -F '[ "$_kind" != green ]' | grep -qF 'continue' \
-  || bad "the review branch must REFUSE to buy a review for a RED head — the '[ \"\$_kind\" != green ]' guard must be followed by a 'continue'; without it a red head dispatches a paid reviewer AND publishes 'review in flight', money spent on a revision that cannot land"
+# ⛔ A RED HEAD MUST NOT BUY A REVIEW — BUT IT MUST NOT BE DROPPED EITHER (review round 3, P1, measured).
+# The FIRST cut pinned this as "`[ \"$_kind\" != green ]` must be followed by a `continue`" — and that arm
+# pinned the DEFECT: the `continue` is what stopped a red candidate from ever reaching the rail path, so a
+# red PR carrying a marker at an OLDER head (landable through check (c)'s diff-matched carry plus the
+# rail's exemption engine) became unreachable by BOTH arms. Measured on daniel-ospina/agent-infra the day
+# it was found: 33 candidates, 0 green, 33 red — 14 of them red-with-a-stale-marker, i.e. the arm was
+# asserting the loss of every landable candidate the fleet had.
+# The decision now lives in ONE DRIVEN PREDICATE, so the arm can vary the input instead of grepping for a
+# string: `review_candidate_arm <kind> <att>` -> review | rail | skip. A guard is only pinned if a
+# mutation of IT reddens, and a mutation of the `red:absent)` arm (widened to `red:*)`) must redden here.
+eval "$(sed -n '/^review_candidate_arm() {/,/^}$/p' "$SUT")"
+command -v review_candidate_arm >/dev/null || bad "review_candidate_arm is missing from $SUT — the arm that owns a candidate must be a shipped, drivable function, not an inline condition nothing can vary"
+_arm() { review_candidate_arm "$1" "$2"; }
+[ "$(_arm green absent)"  = review ] || bad "a GREEN candidate with no attestation must be REVIEWED — this is the #3489 defect itself (got '$(_arm green absent)')"
+[ "$(_arm green stale)"   = review ] || bad "a GREEN candidate whose marker is at an older head must be REVIEWED (got '$(_arm green stale)')"
+[ "$(_arm green nohead)"  = review ] || bad "a GREEN candidate whose head could not be read must be REVIEWED (got '$(_arm green nohead)')"
+[ "$(_arm green at-head)" = rail ]   || bad "an ATTESTED candidate takes today's RAIL path, untouched (got '$(_arm green at-head)')"
+[ "$(_arm red at-head)"   = rail ]   || bad "an ATTESTED RED candidate takes the RAIL path — the rail's exemption engine is what lands a red head whose reds are not its own (got '$(_arm red at-head)')"
+[ "$(_arm red absent)"    = skip ]   || bad "a RED candidate with NO marker at any head must buy NOTHING: there is no record for check (c) to carry and no review is bought for a red head, which must not be attested clean (#3440) (got '$(_arm red absent)')"
+[ "$(_arm red stale)"     = rail ]   || bad "a RED candidate carrying a marker at an OLDER head must go to the RAIL, not be dropped — check (c) accepts a stale marker whose diff= matches the live diff (#3315) and the rail's exemption engine lands it; the 'continue' that skipped this is the P1 finding (got '$(_arm red stale)')"
+_empty_arm=$(_arm "" "")
+[ "$_empty_arm" = rail ] || bad "an UNCLASSIFIABLE candidate must default to the RAIL — the arm that spends nothing — never to a paid review (got '$_empty_arm')"
+# ⛔ AND THE LOOP MUST CONSULT IT, RESPECTING ALL THREE ANSWERS (review round 3, P1). A driven predicate
+# the loop ignores pins nothing: the arms above would stay green with the call site reverted to the
+# `[ "$_kind" != green ] ... continue` that dropped every red candidate.
+grep -qF '_rarm=$(review_candidate_arm "$_kind" "$_att")' "$SUT" \
+  || bad "the candidate loop must CONSULT review_candidate_arm ('_rarm=\$(review_candidate_arm \"\$_kind\" \"\$_att\")') — an inline condition here is what dropped every red candidate by BOTH arms (P1)"
+printf '%s\n' "$_branch" | grep -qF '[ "$_kind" != green ]' \
+  && bad "the REVIEW branch must not carry its own red-kind guard — the red decision belongs to review_candidate_arm, and a second copy inside the branch is exactly the P1 (a 'continue' that bypasses the rail path)"
+grep -A3 -F 'if [ "$_rarm" = skip ]; then' "$SUT" | grep -qF 'continue' \
+  || bad "the 'skip' arm must CONTINUE (never fall through to the rail) — a red candidate with no marker anywhere has nothing for check (c) to carry, so railing it burns a MAX slot on the one class the base's filter deliberately dropped"
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH: a missing reviewer must be named per candidate, not dispatched
 # into. Unpinned, deleting the guard left the suite green while the loop wrote a dispatch record and
 # published `review-in-flight` — a claim that something is running — on a box with no reviewer at all.
@@ -919,6 +949,19 @@ launch_review acme/widget 42 "$H" "$_rout" "$_rdir/attempts-a" || bad "the dispa
 review_action pending 0; [ $? -eq 0 ] || bad "a fresh pending review must WAIT (no second dispatch)"
 review_action pending $(( REVIEW_COOLDOWN_S - 1 )); [ $? -eq 0 ] || bad "one second INSIDE the cooldown must still WAIT — the boundary is the whole arm"
 review_action pending $(( REVIEW_COOLDOWN_S + 1 )); [ $? -eq 1 ] || bad "a pending review past the cooldown must be RETRIED — `review-pr.sh` caps itself at 1800 s, so 2700 s of silence is not a slow review, it is a dead one, and waiting for ever is a stall"
+# ⛔ THE WINDOWS MUST BE READ, NOT HARDCODED (review round 3, measured). The arms above and below probe
+# the cooldowns only at their SHIPPED defaults (2700 / 900), so replacing `[ "$age" -lt "$REVIEW_COOLDOWN_S" ]`
+# with `[ "$age" -lt 2700 ]` — the operator knob silently disarmed — left the suite GREEN (measured).
+# Every other knob in this block is varied for exactly that reason; a hardcoded window is worse than a
+# hardcoded cap, because the retry arm's age is ALREADY past the short window after any real review, so a
+# hardcoded value re-buys a paid review on every pass while the log reads normal. Vary both, both sides.
+_cooldown_saved=$REVIEW_COOLDOWN_S; _transient_saved=$COOLDOWN_TRANSIENT_S
+REVIEW_COOLDOWN_S=600; COOLDOWN_TRANSIENT_S=120
+review_action pending 599;  [ $? -eq 0 ] || bad "REVIEW_COOLDOWN_S must be READ, not hardcoded to its shipped default — at REVIEW_COOLDOWN_S=600 a pending review 599 s old must WAIT"
+review_action pending 601;  [ $? -eq 1 ] || bad "REVIEW_COOLDOWN_S must be READ, not hardcoded — at REVIEW_COOLDOWN_S=600 a pending review 601 s old must RETRY"
+review_action retry 119;    [ $? -eq 0 ] || bad "COOLDOWN_TRANSIENT_S must be READ, not hardcoded to its shipped default — at COOLDOWN_TRANSIENT_S=120 a retry 119 s old must WAIT"
+review_action retry 121;    [ $? -eq 1 ] || bad "COOLDOWN_TRANSIENT_S must be READ, not hardcoded — at COOLDOWN_TRANSIENT_S=120 a retry 121 s old must RETRY"
+REVIEW_COOLDOWN_S=$_cooldown_saved; COOLDOWN_TRANSIENT_S=$_transient_saved
 # the second cycle publishes nothing (same state+head), and the age comes from the RECORD
 publish_review_state acme/widget 42 review-in-flight "$H"
 [ "$(_marker_count 'review-in-flight')" = 2 ] || bad "the waiting cycle added a marker (got $(_marker_count 'review-in-flight'))"
