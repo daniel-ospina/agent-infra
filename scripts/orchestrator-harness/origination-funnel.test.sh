@@ -2489,8 +2489,8 @@ printf '%s\n' '#!/usr/bin/env bash' ': nothing here can record' > "$_skewdir/non
 # production while omitting fields the writer always emits (`queue_readable=`, `unusable=`) certifies a
 # pre-witness record; and one whose VALUES the writer cannot produce (`handed_why=` with no rank clause, a
 # truncated `why=`) certifies nothing either. Every `_head_rank` arm and BOTH `_head_why` arms end in
-# `, and $_head_rank` / `— $_head_rank` (`refresh-candidates.sh:5929-5949`), and `why=` is the writer's
-# whole template (`:5975`) — so what follows are its literal strings, not abbreviations of them.
+# `, and $_head_rank` / `— $_head_rank` (`refresh-candidates.sh:5964-5987`), and `why=` is the writer's
+# whole template (`:6014-6016`) — so what follows are its literal strings, not abbreviations of them.
 printf 'result=ok\nstage=handoff\nrc=0\nat=%s\nrepo=daniel-ospina/agent-infra\nwhy=pass completed; queue depth 5; head #7 is what dispatch takes next\njudged=3\nqueued=3\nbacklog=5\nhanded=7\nhanded_why=judged CLEAN by THIS pass, and the highest-ranked CLEAN entry in the pool-ordered queue\nqueue_readable=1\nunusable=\n' \
   "$(( $(date +%s) - 3 * 3600 ))" > "$_skewdir/o/state/refresh-last"
 printf '7\n8\n' > "$_skewdir/o/candidates.txt"; chmod 000 "$_skewdir/o/candidates.txt"
@@ -2543,63 +2543,98 @@ case "$OUT_DRIVE" in
 esac
 
 echo
-# ── 11b) THE FIXTURES ABOVE ARE PINNED TO THE SHIPPED WRITER (review P2, cycle 22) ──
+# ── 11b) THE FIXTURES ABOVE ARE PINNED TO THE SHIPPED WRITER (reviews at c51270805, d29d9091e) ──
 # ⛔ THE FIDELITY WAS ASSERTED IN PROSE AND ENFORCED BY NOTHING. Nothing READS `handed_why=` or a
-# `running` record's `why=`, so the writer could revert to the exact strings those fixtures call
-# unproducible — `_head_why="judged CLEAN by THIS pass"` (leaving a dangling `, and `), or a truncated
-# tombstone — and the whole suite stayed green (measured 3×). The literals are therefore READ FROM THE
-# SHIPPED SCRIPT, the way the in-flight bound above is, and the fixtures must hold what it holds: a
-# reversion on EITHER side is RED.
+# `running` record's `why=`, so the writer could revert to the exact strings these fixtures call
+# unproducible — `_head_why="judged CLEAN by THIS pass"` (leaving a dangling `, and ` in the DURABLE
+# record), or a truncated tombstone — and the suite stayed green (measured 3×).
+# ⛔ AND THE FIRST VERSION OF THIS PIN COULD NOT SEE ITS OWN SUBJECT: it derived BOTH its numerator and its
+# denominator from the same `printf 'result=running…stage=provision` prefix, so a fixture that reverted AND
+# dropped `stage=provision` satisfied both counts (measured: 286/0 GREEN). The POPULATION IS A PINNED
+# CONSTANT — the way the in-flight bound above is read from the shipped script rather than typed — so a
+# shape change moves one side of every comparison and reddens.
+# The path comes from BASH_SOURCE, not `$0`: under `bash -s < file` `$0` is `bash`, every count came back
+# "" , and "" = "" reported the whole block GREEN while asserting nothing (measured).
+_PINFILE="${BASH_SOURCE[0]:-$0}"
+if [ ! -r "$_PINFILE" ]; then
+  bad "pin/writer: cannot read this suite's own file (\`$_PINFILE\`) — every count below would compare \"\" with \"\" and report GREEN while asserting nothing"
+else
+# ── the ok record's `why=` template, and the substitution of its two variables ──────────────────────
 _why_ok="$(grep -o 'pass completed; queue depth [^"]*' "$REFRESH" | head -1)"
 case "$_why_ok" in
   *'is what dispatch takes next'*)
-    # ⛔ COUNTED ON THE FIXTURE LINES, NOT `grep -q` OVER THE FILE (this pin's own copy of the literal
-    # satisfied an unanchored search, so a fully reverted fixture left it green — the same self-match
-    # that made the tombstone pin report 15 fixtures for 14). A fixture that writes a `queue depth` into
-    # its ok `why=` is claiming the writer's template, so it must carry the writer's tail.
-    _fx_tmpl="$(grep -cE "^[[:space:]]*printf 'result=ok.*why=[^\\\\]*queue depth" "$0" || true)"
-    _fx_tail="$(grep -cE "^[[:space:]]*printf 'result=ok.*why=.*is what dispatch takes next" "$0" || true)"
-    if [ "$_fx_tmpl" = "$_fx_tail" ] && [ "$_fx_tmpl" != "0" ]; then
-      ok "pin/writer: all $_fx_tmpl ok fixture(s) claiming the template carry the shipped tail (\`head #N is what dispatch takes next\`)"
+    _fx_tmpl="$(grep -cE "^[[:space:]]*printf 'result=ok.*why=.*queue depth" "$_PINFILE" || true)"
+    _fx_tail="$(grep -cE "^[[:space:]]*printf 'result=ok.*why=.*is what dispatch takes next" "$_PINFILE" || true)"
+    if [ "${_fx_tmpl:-x}" = "2" ] && [ "${_fx_tail:-x}" = "2" ]; then
+      ok "pin/writer: both ok fixtures claiming the template carry the shipped tail (\`head #N is what dispatch takes next\`)"
     else
-      bad "pin/writer: $_fx_tmpl ok fixture(s) claim the writer's template but $_fx_tail carry its tail — \`$_why_ok\`"
-    fi ;;
+      bad "pin/writer: ${_fx_tmpl:-<unreadable>} ok fixture(s) claim the writer's template and ${_fx_tail:-<unreadable>} carry its tail (want 2 and 2) — \`$_why_ok\`"
+    fi
+    # ⛔ THE SUBSTITUTION (review P3). The writer fills the sentence and the two fields from the SAME
+    # variables (`refresh-candidates.sh:6014-6016`), so "queue depth 9; head #7" with its own
+    # `backlog=5` is a record it cannot produce — and nothing noticed (measured GREEN).
+    _sub_ok=1
+    for _ln in $(grep -nE "^[[:space:]]*printf 'result=ok.*why=.*queue depth" "$_PINFILE" | cut -d: -f1); do
+      _l="$(sed -n "${_ln}p" "$_PINFILE")"
+      _d="$(printf '%s' "$_l" | sed -n 's/.*queue depth \([0-9][0-9]*\).*/\1/p')"
+      _h="$(printf '%s' "$_l" | sed -n 's/.*head #\([0-9][0-9]*\).*/\1/p')"
+      _bk="$(printf '%s' "$_l" | sed -n 's/.*backlog=\([0-9][0-9]*\).*/\1/p')"
+      _hd="$(printf '%s' "$_l" | sed -n 's/.*handed=\([0-9][0-9]*\).*/\1/p')"
+      if [ "$_d" != "$_bk" ] || [ "$_h" != "$_hd" ]; then
+        _sub_ok=0; bad "pin/writer: line $_ln says 'queue depth $_d; head #$_h' but its own record holds backlog=$_bk handed=$_hd — the writer fills both from ONE variable, so this record cannot exist"
+      fi
+    done
+    [ "$_sub_ok" = "1" ] && ok "pin/writer: each ok fixture's 'queue depth N; head #M' equals its own backlog=/handed= — one variable fills both" ;;
   *) bad "pin/writer: the ok \`why=\` template no longer ends 'is what dispatch takes next' — the fixtures' bytes are stale: \`$_why_ok\`" ;;
 esac
-# the tombstone: the writer's whole sentence, tail clause included — a truncated fixture certifies nothing
+# ── the tombstone: the writer's whole sentence, the death clause included ────────────────────────────
 _DTH='if this line is what the beat reports, the pass died before finishing'
 if grep -qF -- "$_DTH" "$REFRESH"; then
-  # ⛔ PER SITE, NOT "SOMEWHERE IN THE FILE": a single `grep -q` is satisfied by the 12 OTHER copies, so
-  # one fixture could go back to the pre-fix stub with the suite green. Every `result=running` record in
-  # this file is a tombstone, so the two counts must agree.
-  _tomb_lines="$(grep -cE "^[[:space:]]*printf 'result=running.*stage=provision" "$0" || true)"
-  # anchored on `printf 'result=running` so this line cannot match ITSELF — an unanchored pattern here
-  # counted its own invocation and reported 15 fixtures for 14
-  _tomb_lit="$(grep -cE "^[[:space:]]*printf 'result=running.*pass died before finishing" "$0" || true)"
-  if [ "$_tomb_lines" = "$_tomb_lit" ]; then
-    ok "pin/writer: all $_tomb_lines tombstone fixtures carry the shipped \`why=\` (death clause included)"
+  # 17 `result=running` record fixtures exist: 14 model the writer's tombstone, and 3 are the HAND-EDITED
+  # ones (the arity pin and the two orphaned-record pins) which the writer cannot emit and which carry no
+  # `why=` at all. All three numbers are pinned, so a fixture that changes SHAPE leaves its bucket instead
+  # of hiding inside a matching numerator/denominator.
+  _run_fx="$(grep -cE "^[[:space:]]*printf 'result=running" "$_PINFILE" || true)"
+  _run_lit="$(grep -cE "^[[:space:]]*printf 'result=running.*pass died before finishing" "$_PINFILE" || true)"
+  _run_nowhy="$(grep -E "^[[:space:]]*printf 'result=running" "$_PINFILE" | grep -vc 'why=' || true)"
+  if [ "${_run_fx:-x}" = "17" ] && [ "${_run_lit:-x}" = "14" ] && [ "${_run_nowhy:-x}" = "3" ]; then
+    ok "pin/writer: all 14 tombstone fixtures carry the shipped \`why=\` (death clause included); the 3 hand-edited ones carry none"
   else
-    bad "pin/writer: $_tomb_lines tombstone fixture(s) but $_tomb_lit carry the writer's whole \`why=\` — a truncated fixture models a record the writer cannot write"
+    bad "pin/writer: result=running fixtures: ${_run_fx:-<unreadable>} total, ${_run_lit:-<unreadable>} with the writer's death clause, ${_run_nowhy:-<unreadable>} with no \`why=\` at all (want 17 / 14 / 3) — a truncated or reshaped fixture models a record the writer cannot write"
   fi
 else
   bad "pin/writer: refresh-candidates.sh no longer writes the tombstone's death clause — the fixtures are stale"
 fi
-# and BOTH `_head_why` arms must still END in the rank clause they write into the durable record
+# ── the `handed_why=` value: BOTH `_head_why` arms must still end in a rank clause ───────────────────
 for _arm in 'judged CLEAN by THIS pass, and $_head_rank' 'carried over from an earlier pass — $_head_rank'; do
   grep -qF -- "$_arm" "$REFRESH" \
     && ok "pin/writer: \`_head_why\` still ends in the rank clause (\`$_arm\`)" \
     || bad "pin/writer: \`_head_why\` lost its rank clause (\`$_arm\`) — \`handed_why=\` becomes a dangling phrase in the durable record"
 done
-# the ranked arm's own string, which the ok fixtures now carry verbatim
-_RANKED='the highest-ranked CLEAN entry in the pool-ordered queue'
-_hw_fx="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=" "$0" || true)"
-# BOTH arms of `_head_why` end in the rank clause, so the count is "ends in the RANKED string", not
-# "starts with the judged-by-THIS-pass wording" — two fixtures model a CARRIED-over head.
-_hw_rank="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=.*the highest-ranked CLEAN entry in the pool-ordered queue" "$0" || true)"
-if grep -qF -- "$_RANKED" "$REFRESH" && [ "$_hw_fx" = "$_hw_rank" ] && [ "$_hw_fx" != "0" ]; then
-  ok "pin/writer: all $_hw_fx fixture \`handed_why=\` value(s) end in the rank clause the writer appends"
+# ⛔ EVERY ARM THE WRITER CAN TAKE IS FAITHFUL (review P3): `_head_rank` has FIVE arms and only one says
+# "highest-ranked", so a fixture carrying the writer's exact `unranked`/`empty` sentence is CORRECT — the
+# previous pin called it wrong. A fixture value must end in SOME arm the writer actually writes.
+_head_ranks="$(grep -o '_head_rank="[^"]*"' "$REFRESH" | sed 's/^_head_rank="//; s/"$//')"
+_narms="$(printf '%s\n' "$_head_ranks" | grep -c . || true)"
+if [ "${_narms:-x}" = "5" ]; then
+  ok "pin/writer: \`_head_rank\` still has its 5 arms (a fixture may model any of them)"
 else
-  bad "pin/writer: $_hw_fx fixture \`handed_why=\` value(s) but $_hw_rank end in the writer's rank clause — the ranked arm \`$_RANKED\` is not what they hold"
+  bad "pin/writer: \`_head_rank\` has ${_narms:-<unreadable>} arm(s) (want 5) — the fixtures are graded against a moving set"
+fi
+_hw_fx="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" || true)"
+_hw_bad=0
+for _ln in $(grep -nE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" | cut -d: -f1); do
+  _val="$(sed -n "${_ln}p" "$_PINFILE" | sed -n 's/.*handed_why=\([^\\]*\).*/\1/p')"
+  _tail="${_val#judged CLEAN by THIS pass, and }"
+  _tail="${_tail#carried over from an earlier pass — }"
+  printf '%s\n' "$_head_ranks" | grep -qxF -- "$_tail" \
+    || { _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` does not end in any \`_head_rank\` arm the writer writes: '$_val'"; }
+done
+if [ "${_hw_fx:-x}" != "7" ]; then
+  bad "pin/writer: ${_hw_fx:-<unreadable>} fixture \`handed_why=\` value(s) (want 7) — the population moved, so this pin graded nothing"
+elif [ "$_hw_bad" = "0" ]; then
+  ok "pin/writer: all 7 fixture \`handed_why=\` values end in an arm the writer actually writes"
+fi
 fi
 
 echo
