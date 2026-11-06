@@ -472,8 +472,14 @@ fi
 # ⛔ AND THE GUARD MUST BE AT THE JOB'S OWN KEY INDENT — not merely somewhere in the job's text.
 # `^\s*if:` also matches a STEP's `if:`, and a step-level guard does NOT stop the job from running on
 # the comment event, so a text-wide matcher reports the required job guarded while the job itself
-# carries no `if:` at all and mints the required verdict from a comment. Measured: this mutant returned
-# ok/rc=0 under the text-wide binding.
+# carries no `if:` at all and mints the required verdict from a comment.
+#
+# ⛔ AND THE STEP'S `if:` MUST BE THE JOB BLOCK'S *LAST* LINE. A guard placed MID-job is a vacuous
+# mutant: the value fold appends everything below it (the rest of the steps) into one value, that value
+# fails the whole-expression match whatever the key anchor is, and the arm reads rc=1 under a text-wide
+# matcher too. MEASURED by sabotage — with `ownRe` widened to `^\s*`, the mid-job version left the
+# suite at PASS 64 · FAIL 0, i.e. the arm could not fail. As the last line of the block the fold
+# appends nothing, and the same sabotage is caught (PASS 64 · FAIL 1).
 PC_STEPGUARD_MID="$TMP/pc-stepguard-mid.yml"
 PC_STEPGUARD="$TMP/pc-stepguard.yml"
 if apply_mutation "$PC" "$PC_STEPGUARD_MID" \
@@ -482,15 +488,28 @@ if apply_mutation "$PC" "$PC_STEPGUARD_MID" \
   "    # gate for a PR only. The revalidation job below owns the comment event." \
   "the required job's guard must be removable for the step-guard arm"; then
   if apply_mutation "$PC_STEPGUARD_MID" "$PC_STEPGUARD" \
-    "      - name: Run pipeline compliance gate" \
-    "      - name: probe
-        if: github.event_name != 'issue_comment'
-        run: echo probe
-      - name: Run pipeline compliance gate" \
-    "a step-level guard must be insertable"; then
-    run_check 1 "a guard moved onto a STEP does not satisfy the required job's guard" PC_FILE="$PC_STEPGUARD"
+    '            echo "::notice::consumer checkout — materialize-agents suite skipped"
+          fi' \
+    '            echo "::notice::consumer checkout — materialize-agents suite skipped"
+          fi
+      - name: probe-last-line
+        if: github.event_name != '"'"'issue_comment'"'"'' \
+    "a step-level guard must be insertable as the job block's last line"; then
+    run_check 1 "a guard on a STEP (the block's last line) does not satisfy the required job's guard" PC_FILE="$PC_STEPGUARD"
   fi
 fi
+
+# ⛔ THE INTERVENING JOB'S `if: >-` MUST GO TOO, or this arm is VACUOUS. `revalidate-on-issue-comment`
+# sits between the required job and the twin that carries the same guard, and it owns a `if: >-` BLOCK
+# SCALAR — a spelling this reader deliberately does not model, so it fails the whole-expression match.
+# Left in place it poisons `every()`: the arm then reads rc=1 whether the block terminated correctly or
+# ran on to EOF, and the suite stays green with the terminator replaced by any broken shape. MEASURED by
+# sabotage: with the terminator reverted to a bare-only enumeration the suite read PASS 64 · FAIL 0.
+# With that `if:` removed, the arm is load-bearing again (correct terminator rc=1, broken rc=0).
+PC_NO_POISON_FIND="    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null"
+PC_NO_POISON_REPL="    # the intervening job's block-scalar guard is removed for this mutant"
 
 # ⛔ AND THE BLOCK MUST END ON A JOB HEADER THAT CARRIES A COMMENT. A legal header with a trailing YAML
 # comment does not match a bare-only terminator, so the required job's block over-extends into the NEXT
@@ -499,6 +518,7 @@ fi
 # carries the same guard line — with only the twin commented, a bare header still stops the block and
 # the arm cannot be driven (measured: that version of this arm was vacuous, it read rc=1 either way).
 PC_OVEREXT_MID1="$TMP/pc-overext-mid1.yml"
+PC_OVEREXT_DEPOISON="$TMP/pc-overext-depoison.yml"
 PC_OVEREXT_MID2="$TMP/pc-overext-mid2.yml"
 PC_OVEREXT="$TMP/pc-overext.yml"
 if apply_mutation "$PC" "$PC_OVEREXT_MID1" \
@@ -506,7 +526,9 @@ if apply_mutation "$PC" "$PC_OVEREXT_MID1" \
     if: github.event_name != 'issue_comment'" \
   "    # gate for a PR only. The revalidation job below owns the comment event." \
   "the required job's guard must be removable for the over-extension arm"; then
-  if apply_mutation "$PC_OVEREXT_MID1" "$PC_OVEREXT_MID2" \
+  if apply_mutation "$PC_OVEREXT_MID1" "$PC_OVEREXT_DEPOISON" "$PC_NO_POISON_FIND" "$PC_NO_POISON_REPL" \
+    "the intervening job's block-scalar guard must be removable"; then
+  if apply_mutation "$PC_OVEREXT_DEPOISON" "$PC_OVEREXT_MID2" \
     "  revalidate-on-issue-comment:
 " \
     "  revalidate-on-issue-comment:  # comment-driven revalidation
@@ -521,6 +543,7 @@ if apply_mutation "$PC" "$PC_OVEREXT_MID1" \
       run_check 1 "a job header carrying a trailing comment still ENDS the required job's block" PC_FILE="$PC_OVEREXT"
     fi
   fi
+  fi
 fi
 
 # ⛔ AND "ENDS THE BLOCK" MUST BE AN INDENT TEST, NOT AN ENUMERATION OF HEADER SPELLINGS. The arm
@@ -531,6 +554,7 @@ fi
 # mutant. A job's children are at 4 spaces, so "a non-space, non-# character at column 2" is the
 # complete test, and this arm is what keeps it complete.
 PC_FLOWEXT_MID1="$TMP/pc-flowext-mid1.yml"
+PC_FLOWEXT_DEPOISON="$TMP/pc-flowext-depoison.yml"
 PC_FLOWEXT_MID2="$TMP/pc-flowext-mid2.yml"
 PC_FLOWEXT="$TMP/pc-flowext.yml"
 if apply_mutation "$PC" "$PC_FLOWEXT_MID1" \
@@ -538,7 +562,9 @@ if apply_mutation "$PC" "$PC_FLOWEXT_MID1" \
     if: github.event_name != 'issue_comment'" \
   "    # gate for a PR only. The revalidation job below owns the comment event." \
   "the required job's guard must be removable for the flow-mapped-extension arm"; then
-  if apply_mutation "$PC_FLOWEXT_MID1" "$PC_FLOWEXT_MID2" \
+  if apply_mutation "$PC_FLOWEXT_MID1" "$PC_FLOWEXT_DEPOISON" "$PC_NO_POISON_FIND" "$PC_NO_POISON_REPL" \
+    "the intervening job's block-scalar guard must be removable"; then
+  if apply_mutation "$PC_FLOWEXT_DEPOISON" "$PC_FLOWEXT_MID2" \
     "  revalidate-on-issue-comment:
 " \
     "  revalidate-on-issue-comment: {name: revalidate-on-issue-comment}
@@ -552,6 +578,7 @@ if apply_mutation "$PC" "$PC_FLOWEXT_MID1" \
       "the twin's job header must be flow-mappable"; then
       run_check 1 "a FLOW-MAPPED job header still ENDS the required job's block" PC_FILE="$PC_FLOWEXT"
     fi
+  fi
   fi
 fi
 
@@ -716,6 +743,39 @@ if apply_mutation "$PC" "$PC_DUP_IF_SPACE" "$PC_GUARD_ANCHOR" \
     if : true" \
   "a duplicate \`if :\` must be constructible"; then
   run_check 1 "a duplicate \`if : true\` (space before the colon) cannot hide either" PC_FILE="$PC_DUP_IF_SPACE"
+fi
+
+# (c1b) ⛔ A DUPLICATE JOB ID IS LAST-WINS IN YAML, so a first-match reader answers about the WRONG
+#       job. A second `  pipeline-compliance:` block APPENDED AT EOF with no `if:` at all leaves the
+#       effective `if` ABSENT — the job RUNS on the comment event — while the FIRST block still carries
+#       the guard, so a first-match reader reports ok/rc=0. Measured: old reader rc=0, this reader rc=2.
+#       The duplicate is appended, never prepended: prepending puts the guard in the SECOND block, the
+#       first-match reader then finds no guard and reds at rc=1, and the arm would pin a false alarm
+#       instead of the fail-open it exists for (measured — that version of this arm was vacuous).
+#       The reader cannot answer which block is in force, so the only honest verdict is
+#       CANNOT-VERIFY (rc=2), never green: an unanswerable question is not a pass.
+PC_DUP_JOB="$TMP/pc-dup-job.yml"
+if apply_mutation "$PC" "$PC_DUP_JOB" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  pipeline-compliance:
+    name: pipeline-compliance' \
+  "a duplicate \`pipeline-compliance:\` job id must be appended"; then
+  run_check 2 "a DUPLICATE \`pipeline-compliance:\` job id is CANNOT-VERIFY, never green" PC_FILE="$PC_DUP_JOB"
+fi
+
+# (c1c) …and a WHOLE-SCALAR QUOTED `if:` is the SAME value: quoting the whole expression is how a
+#       `!`-leading one is made legal YAML, so refusing it was a false block on a guarded tree
+#       (measured rc=1 against PyYAML's identical string).
+PC_QUOTED_WHOLE="$TMP/pc-quoted-whole.yml"
+if apply_mutation "$PC" "$PC_QUOTED_WHOLE" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: \"!cancelled() && github.event_name != 'issue_comment'\"" \
+  "a whole-scalar quoted guard must be constructible"; then
+  run_check 0 "a WHOLE-SCALAR QUOTED guard (YAML-identical) is ACCEPTED" PC_FILE="$PC_QUOTED_WHOLE"
 fi
 
 # (c3) …while `if:` with the guard on the NEXT line is YAML's value being exactly the guard, and must be

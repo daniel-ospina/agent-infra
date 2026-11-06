@@ -224,7 +224,21 @@ function jobBlock(text, name) {
   const headerRe = new RegExp(
     `^ {2}(?:"${name}"|'${name}'|${name}):(?:\\s+#.*)?\\s*$`
   );
-  const start = lines.findIndex((l) => headerRe.test(l));
+  const starts = lines.map((l, i) => (headerRe.test(l) ? i : -1)).filter((i) => i >= 0);
+  // ⛔ A DUPLICATE JOB ID IS LAST-WINS in YAML, and a first-match reader answers about the WRONG job.
+  // Measured: a second `  pipeline-compliance:` appended with no `if:` at all leaves the effective
+  // `if` ABSENT — i.e. the job RUNS on the comment event — while this reader inspected the FIRST
+  // block, found the guard, and reported ok/rc=0. The same class the duplicate-`if:` arms close one
+  // level down; one level up it was open. A reader that cannot answer the question it was asked must
+  // say so (rc 2), never answer "green".
+  if (starts.length > 1) {
+    refuse(
+      `${PC_FILE}: \`${name}\` appears as a JOB ID ${starts.length} times (lines ${starts
+        .map((i) => i + 1)
+        .join(", ")}). YAML keeps only the LAST, so which block is in force is not something this reader can answer — the guard is UNVERIFIED.`
+    );
+  }
+  const start = starts.length === 1 ? starts[0] : -1;
   // ⛔ Cannot-locate is NOT "the guard is missing". A reader that cannot find the job it was asked
   // about has to say so (rc 2), because reporting it as a guard FINDING sends the reader after a
   // fault that does not exist.
@@ -292,6 +306,12 @@ function jobKeyIs(block, key, valueRe) {
       // `"… != 'issue_comment'"`).
       value += (value === "" ? "" : " ") + l.trim();
     }
+    // ⛔ A WHOLE-SCALAR QUOTED value is the SAME value. `if: "!cancelled() && <guard>"` parses to
+    // exactly the unquoted expression (PyYAML agrees), and quoting the whole scalar is how a
+    // `!`-leading expression is made legal YAML — so refusing it was a false block on a tree that is
+    // guarded. Peel one matching pair of quotes before matching; the inner text still has to match
+    // the whole-expression rule, so this cannot admit anything the unquoted form would not.
+    value = value.replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
     values.push(value);
   }
   // `every()` on a NON-EMPTY list: a duplicate key is caught by requiring EVERY own occurrence to
