@@ -201,6 +201,16 @@ def endpoint_key(url):
     scheme = u.split("://", 1)[0].lower()
     host = m.group(1).lower()
     port = m.group(2)
+    # ⛔ A TRAILING ROOT DOT IS THE SAME DNS NAME (#3374 review, round 13 P1 — a FALSE PASS).
+    # `api.premiselabs.co.` is the FQDN spelling of `api.premiselabs.co`: the client's own parser
+    # KEEPS the dot (`new URL("https://api.premiselabs.co./mcp/").host` → `api.premiselabs.co.`,
+    # measured with node v24) and DNS resolves it to the same server, so a request to it reaches the
+    # LIVE hosted endpoint and needs the hosted key. Without this rule the dotted spelling keyed
+    # DIFFERENTLY, fell out of the hosted branch into the `_selfHosted` exemption, and was certified
+    # `SELFHOSTED:` rc=0 with `Bearer ${SOME_OTHER_VAR}` (an EMPTY Bearer — #3275/#3289) or with no
+    # header at all: measured. Normalising it is the same move as the default-port and leading-zero
+    # rules above, and it narrows NO exemption — a genuine self-host is a different HOST, and
+    # `:8443` stays distinct because the port is kept.
     # ⛔ A KEY MUST NEVER EQUAL THE HOSTED ONE BY *DROPPING* USERINFO (#3374 review, round 12 P2).
     # The authority class above skips `user[:pw]@`, so without this an entry at
     # `https://user:pw@api.premiselabs.co/mcp/` would key to the HOSTED endpoint — taking the hosted
@@ -520,8 +530,15 @@ def _keep_backup(path):
 
     def _copy():
         shutil.copy2(real, dst)
-        if orig_mode is not None:
-            os.chmod(dst, orig_mode)
+        # ⛔ THE BACKUP IS OWNER-ONLY — NEVER WIDER THAN THE FILE IT COPIES (#3374 review, round 13
+        # P2). `copy2` preserves the SOURCE mode, so a 0644 `.mcp.json` — the common case, and the
+        # one an operator hand-edits — produced a 0644 `.mcp.json.bak` holding whatever literal
+        # credential that file had. `--verify` scans the DESTINATION only, so the layer certified
+        # `OK:` while the same secret sat on disk one file over: measured, a `Bearer tt_…` inside an
+        # unparseable `.mcp.json` survived into `.bak` beside a green verdict. The merge must not
+        # DELETE operator bytes (that is what these NOTE branches exist for), so the remedy is the
+        # mode, not a refusal: group/other bits are dropped, and nothing wider is ever created.
+        os.chmod(dst, (orig_mode & 0o600) if orig_mode is not None else 0o600)
 
     try:
         try:
@@ -822,6 +839,30 @@ def main(argv):
     # need the hosted credential?", and the hosted endpoint is a FIXED fact (`HOSTED_DEFAULT_URL`) —
     # passing `want["url"]` here made every self-host comparison a tautology and refused the
     # template the docs tell self-host operators to write (see HOSTED_DEFAULT_URL's note).
+    #
+    # ⛔ CANONICALISE **FIRST**, THEN JUDGE (#3374 review, round 13 P1 — a NON-CONVERGENT REPAIR).
+    # These two blocks ask the same question with different predicates: `usable()` answers by
+    # ENDPOINT (`endpoint_key`, path-SENSITIVE), the canonicalisation answers by AUTHORITY
+    # (`authority_key`, path-insensitive) and then REWRITES the url onto the hosted endpoint. In
+    # that order, a template spelling the hosted host `/mcp` (no trailing slash), `/foo/../mcp/`,
+    # `/mcp/?x=1` or `/mcp/#x` took `usable()`'s SELF-HOST early return — "a self-hosted daemon may
+    # need no key at all" — and was THEN written as THE hosted endpoint. Measured on the real repair
+    # path (`cloud-cell-bringup.sh` runs verify → install → verify):
+    #   template `/mcp` + NO Authorization     -> merge rc=0, wrote a headers-less hosted entry;
+    #                                             `--verify` NOAUTH          rc=1, for ever
+    #   template `/mcp` + `Bearer ${OTHER}`    -> merge rc=0; `--verify` WRONG_AUTH   rc=1
+    #   template `/mcp` + `type: "sse"`        -> merge rc=0; `--verify` NOTHTTP:sse   rc=1
+    # A cell in that state could never come up, and its own installer re-created the refusal on
+    # every pass — the same false block the merge side closed in rounds 5, 7 and 9, one level up.
+    # Canonicalising FIRST makes `usable()` judge the url that is actually WRITTEN, so both questions
+    # are asked of the same string and each of the three shapes above is REFUSED (exit 3, nothing
+    # written) instead of installed-and-then-rejected.
+    # ⛔ THE SCHEME IS NOT NORMALISED HERE: `authority_key` keeps it, so `http://api.premiselabs.co`
+    # keys to a DIFFERENT authority and is left for `usable()` to refuse as INSECURE_URL. Upgrading
+    # it would silently repair a template this file must REFUSE.
+    if on_hosted_authority(want.get("url")):
+        want["url"] = HOSTED_DEFAULT_URL
+
     _want_ok, _want_why = usable(want, HOSTED_DEFAULT_URL)
     if not _want_ok:
         sys.stderr.write(
@@ -834,19 +875,9 @@ def main(argv):
         )
         return 3
 
-    # ⛔ THE HOSTED ENDPOINT IS A FIXED FACT, SO ITS SPELLING IS TOO (#3374 review, round 12 P1).
-    # A template whose url is the hosted AUTHORITY spelled some other way — `/mcp` without the
-    # trailing slash, `/foo/../mcp/`, `/mcp/?x=1`, `/mcp/#x`, `:0443` — went into `.mcp.json`
-    # VERBATIM. Measured: the no-slash template installed an entry carrying `headers: null`, and
-    # `--verify` certified it `SELFHOSTED:` rc=0 — a false PASS over the LIVE hosted endpoint (it
-    # answers 401) with NO credential at all; `:0443` installed a non-canonical spelling instead.
-    # Both are wrong for one reason: a template cannot make the hosted endpoint stop being the hosted
-    # endpoint. The canonical url is what gets installed, so `verify -> install -> verify` converges.
-    # ⛔ THE SCHEME IS NOT NORMALISED HERE: `authority_key` keeps it, so `http://api.premiselabs.co`
-    # keys to a DIFFERENT authority and is left for `usable()` to refuse as INSECURE_URL. Upgrading
-    # it would silently repair a template this file must REFUSE.
-    if on_hosted_authority(want.get("url")):
-        want["url"] = HOSTED_DEFAULT_URL
+    # (the canonicalisation above is what made this check and `--verify` ask about the SAME url —
+    # see its comment. It is deliberately not repeated here.)
+
 
     # ⛔ TOTAL OVER THE DESTINATION'S *STRUCTURE*, not only over its entries. `usable()` was made
     # total one level down (a `headers` that is a string, a non-string url/Authorization) and these
