@@ -45,8 +45,10 @@
 #   Any other key is REFUSED (`UNKNOWN-KEY`) rather than ignored: `checkuot=` must not silently drop
 #   a repo's checkout.
 #
-# VALUES MAY NOT CONTAIN SPACES. A path with a space splits into two tokens and the second one has no
-# `=`, which is refused as `BAD-TOKEN` — loud, which is the point.
+# VALUES MAY NOT CONTAIN SPACES OR COMMAS. A path with a space splits into two tokens and the second
+# one has no `=`, which is refused as `BAD-TOKEN`. A comma is the separator `doctor-repos` renders
+# entries with, so a value carrying one is refused as `SEPARATOR-IN-VALUE` — both loud, which is the
+# point: a value that silently changed the SHAPE of the set is how one repo becomes two, or none.
 #
 # PATH. `$REPO_SET_FILE`, else `$HOME/.config/orchestrator/repos.conf`. `HOME` is the box's real home
 # on a Mac and the cell home on a cell (`/tmp/cell-home`), the same root `bringup.env` lives under —
@@ -57,23 +59,33 @@
 #   repo-set.sh list            # one `slug<TAB>checkout<TAB>state` line per repo
 #   repo-set.sh slugs           # one slug per line
 #   repo-set.sh doctor-repos    # the `PR_DOCTOR_REPOS` value: `slug=checkout` joined by `,`
-#   repo-set.sh check           # validate; print one line per repo and every refusal; rc 1 on any
+#   repo-set.sh check           # validate; print one line per repo and every refusal
 #
 # USAGE (sourced)   `. repo-set.sh` gives every function above without running a verb. A consumer
 #                   calls `repo_set_parse` (syntax + slug shape) or `repo_set_check` (that, plus the
 #                   checkout/state proofs) and acts on the return code — it never re-parses the file.
 #
-# RETURN CODES (both verbs and functions)
-#   0  the set is well formed (parse) / valid (check)
+# RETURN CODES — ONE TABLE, AND IT IS THE SAME FOR A VERB AND FOR THE FUNCTION IT CALLS
+#   0  OK                the set is well formed (parse) / valid (check)
 #   3  NO-REPO-SET       the file does not exist — the box has named no repo. NOT a default.
 #   4  NO-ENTRIES        the file exists and names nothing (comments/blank lines only).
-#   5  INVALID           at least one line was refused; the reasons are on stderr, by name and line.
+#   5  INVALID           the file exists and is not a usable set: unreadable, not a regular file, or
+#                        at least one line refused. The reasons are on stderr, by name and line.
+#   1  UNPROVEN          (check only) the file parses, but a checkout/state proof failed.
 #   2  usage
+#
+# ⛔ `repo_set_check` PROPAGATES 3/4/5 AND DOES NOT FOLD THEM INTO 1. Folding them inverted the one
+# branch that matters for a consumer: "this box names no repo" (degrade / report) would read as "this
+# box's file is broken" (refuse) — the two states `NO-REPO-SET` exists to keep apart. 1 is reserved
+# for a file that PARSED and whose proofs failed, which is a different fix.
 #
 # ⛔ THE ABSENT-FILE CODE IS ITS OWN (3) AND IS NOT AN ERROR OF THE FILE. A consumer must be able to
 # distinguish "this box names no repo" from "this box names a repo badly": the first is a
 # configuration the operator has not made yet (and the doctor's answer is to refuse loudly, which is
-# #2280's doctrine), the second is a broken file that must not be half-honoured.
+# #2280's doctrine), the second is a broken file that must not be half-honoured. A file that EXISTS
+# and cannot be read is the SECOND, never the first: telling an operator to create a file that is
+# already there sends them at the wrong defect, and degrading on it silently un-serves the second
+# repo — the exact failure #2281 exists to close.
 
 set -uo pipefail
 
@@ -85,18 +97,36 @@ repo_set_file() {
 # greppable by the single token `repo-set:`.
 _rs_say() { local s="$1"; shift; printf '%s\n' "$*" >&"$s"; }
 
+# _rs_lower <s> — the ONE case fold. ⛔ EVERY COMPARISON OF TWO SLUGS GOES THROUGH IT, because the
+# consumer this file feeds is case-INSENSITIVE and this file must not disagree with it:
+# `resolve_repo()` accepts a case-differing slug (`got.lower() == slug.lower()`), `repo_tag()`
+# lowercases the identity with an explicit note that the doctor "already treats the identity as
+# case-insensitive (#2980 review cycle 4, P2) … GitHub itself is case-insensitive", and
+# `configured_repos()` lowercases its dedupe key. A byte-exact comparison here produced BOTH failures,
+# measured in review of this change: (1) a set declaring `Daniel-Ospina/Tortoise` over a checkout whose
+# origin spells it lowercase was REFUSED — whole-machine exit 2, with a message asserting two
+# spellings of one repo are different repos, while `resolve_repo` accepts the identical pair; and
+# (2) two spellings of one slug passed DUPLICATE-SLUG while the doctor deduped them to one entry, so
+# the wrapper logged `grading 2 repo(s)` for ONE graded repo — the "a shorter set must not read as a
+# smaller machine" failure this file exists to prevent.
+_rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
+
 # _rs_slug_ok <s> — `owner/name`, and exactly one `/`. `case` rather than `[[ =~ ]]` so this file
 # parses under bash 3.2 (macOS) as readily as under bash 5 (cells) — the shard runs the same file on
 # both, and a `=~` that only one of them supports is a suite that fails on the box nobody is looking
-# at.
+# at. The OWNER's first character must be alphanumeric, matching `pr-doctor.py`'s `_SLUG_RE`
+# (`[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9_.-]+`): that regex refuses a leading `.`/`-`, so accepting one
+# here would bless a set the doctor then refuses — a disagreement, even a loud one.
 _rs_slug_ok() {
   local s="${1:-}" owner name
   [ -n "$s" ] || return 1
   case "$s" in *' '*) return 1 ;; esac          # a value with a space is two tokens upstream
+  case "$s" in *,*) return 1 ;; esac            # a value with a comma splits `doctor-repos` (below)
   case "$s" in */*/*) return 1 ;; esac          # more than one slash is not owner/name
   case "$s" in */*) : ;; *) return 1 ;; esac    # exactly one slash
   owner="${s%%/*}"; name="${s#*/}"
   [ -n "$owner" ] && [ -n "$name" ] || return 1
+  case "$owner" in [!A-Za-z0-9]*) return 1 ;; esac
   case "$owner$name" in *[!A-Za-z0-9._-]*) return 1 ;; esac
   return 0
 }
@@ -104,15 +134,26 @@ _rs_slug_ok() {
 # repo_set_parse — the SYNTAX half. Emits `slug<TAB>checkout<TAB>state`, or nothing and a refusal.
 repo_set_parse() {
   local f; f="$(repo_set_file)"
-  if [ ! -f "$f" ]; then
+  if [ ! -e "$f" ]; then
     _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
     _rs_say 2 "repo-set:   Create it, one repo per line:"
     _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
     return 3
   fi
+  # ⛔ `-e` IS TESTED FIRST. The absent arm used `[ ! -f ]`, so a DIRECTORY at the config path read as
+  # "this box names no repo" (code 3) and the wrapper DEGRADED on it — while telling the operator the
+  # path "does not exist", which it plainly does. An existing thing that is not a usable file is the
+  # broken-file state (5), never the absent one (3).
+  if [ ! -f "$f" ]; then
+    _rs_say 2 "repo-set: INVALID — $f exists but is not a regular file (a directory at the config path cannot name repos)."
+    return 5
+  fi
   if [ ! -r "$f" ]; then
-    _rs_say 2 "repo-set: NO-REPO-SET — $f exists but is not readable by $(id -un 2>/dev/null || echo this user)."
-    return 3
+    _rs_say 2 "repo-set: INVALID — $f exists but is not readable by $(id -un 2>/dev/null || echo this user)."
+    _rs_say 2 "repo-set:   A file that EXISTS and cannot be read is a BROKEN set, not an absent one: this box"
+    _rs_say 2 "repo-set:   has named repos and nothing can grade them. Fix that file's mode/ownership;"
+    _rs_say 2 "repo-set:   telling the operator to create it would send them at the wrong defect."
+    return 5
   fi
 
   local rc=0 n=0 line tok key val ln=0
@@ -153,17 +194,28 @@ repo_set_parse() {
     if ! _rs_slug_ok "$slug"; then
       _rs_say 2 "repo-set: BAD-SLUG — $f:$ln: \`$slug\` is not owner/name"; rc=5; continue
     fi
+    # ⛔ THE KEY IS CASE-FOLDED. `configured_repos()` lowercases its dedupe key and `repo_tag()`
+    # lowercases the state file, so two spellings of one repo are ONE repo to the doctor — a reader
+    # that called them two would render a set the doctor silently shrinks.
     case "$seen" in
-      *$'\n'"$slug"$'\n'*)
-        _rs_say 2 "repo-set: DUPLICATE-SLUG — $f:$ln: \`$slug\` is already named above; a set with the same repo twice grades it twice and dispatches it twice"
+      *$'\n'"$(_rs_lower "$slug")"$'\n'*)
+        _rs_say 2 "repo-set: DUPLICATE-SLUG — $f:$ln: \`$slug\` is already named above; a set with the same repo twice grades it twice and dispatches it twice (case-INSENSITIVE, like the doctor's own dedupe)"
         rc=5; continue ;;
     esac
-    seen="$seen"$'\n'"$slug"$'\n'
+    seen="$seen"$'\n'"$(_rs_lower "$slug")"$'\n'
 
     if [ -z "$checkout" ]; then
       _rs_say 2 "repo-set: MISSING-CHECKOUT — $f:$ln: \`$slug\` names no checkout, so nothing can be spawned for it (its queue could only be graded read-only)"
       rc=5; continue
     fi
+    # ⛔ A COMMA IS A SEPARATOR IN THE VALUE THIS FILE RENDERS, SO IT CANNOT APPEAR IN A VALUE.
+    # `repo_set_doctor_repos` joins entries with `,` and `configured_repos()` splits on `[,\s]+`, so a
+    # checkout path carrying one truncated the real checkout AND invented a phantom repo — measured in
+    # review of this change: a ONE-repo set rendered two entries, the second named `po`. A space is
+    # refused upstream as BAD-TOKEN; this is the same rule for the other separator.
+    case "$checkout$state" in
+      *,*) _rs_say 2 "repo-set: SEPARATOR-IN-VALUE — $f:$ln: a value contains a comma; \`,\` separates entries in the list this reader renders, so it cannot appear inside one"; rc=5; continue ;;
+    esac
     case "$checkout" in
       /*) : ;;
       *) _rs_say 2 "repo-set: RELATIVE-CHECKOUT — $f:$ln: \`$checkout\` is not absolute; a relative path is resolved against whatever cwd the reader happens to have"; rc=5; continue ;;
@@ -194,8 +246,9 @@ repo_set_parse() {
 }
 
 # _rs_origin_slug <checkout> — the `owner/name` this checkout's `origin` PROVES, or "" and a reason.
-# One parser, same shapes pr-doctor.py's `_origin_slug()` accepts, so the set's verdict and the
-# doctor's verdict about the same checkout cannot disagree.
+# One parser, same shapes pr-doctor.py's `_origin_slug()` accepts, and the CALLER compares it through
+# `_rs_lower()` like the doctor's `resolve_repo()` does — so the set's verdict and the doctor's verdict
+# about the same checkout cannot disagree, in either direction.
 _rs_origin_slug() {
   local dir="${1:-}" url=""
   command -v git >/dev/null 2>&1 || { printf '\tgit is not on PATH'; return 0; }
@@ -228,7 +281,9 @@ _rs_origin_slug() {
 repo_set_check() {
   local parsed rc
   parsed="$(repo_set_parse)"; rc=$?
-  if [ "$rc" != 0 ]; then return 1; fi
+  # ⛔ PROPAGATE 3/4/5, never fold them into 1 (see RETURN CODES): a consumer must be able to tell a
+  # box that names no repo (degrade / report) from one whose file is broken (refuse).
+  if [ "$rc" != 0 ]; then return "$rc"; fi
 
   local f; f="$(repo_set_file)"
   local bad=0 n=0 slug checkout state seen_states=""
@@ -247,7 +302,7 @@ repo_set_check() {
       local proof why
       proof="$(_rs_origin_slug "$checkout")"; why="${proof#*$'\t'}"; proof="${proof%%$'\t'*}"
       if [ -n "$proof" ]; then
-        if [ "$proof" != "$slug" ]; then
+        if [ "$(_rs_lower "$proof")" != "$(_rs_lower "$slug")" ]; then
           problems="$problems; $checkout is a checkout of $proof, not $slug — refusing to grade a repo the checkout does not prove"
         fi
       else
@@ -297,7 +352,10 @@ repo_set_doctor_repos() {
   parsed="$(repo_set_parse)"; rc=$?
   [ "$rc" = 0 ] || return "$rc"
   # `slug=checkout`, comma-joined — exactly the entry form `configured_repos()` accepts, including the
-  # `=<checkout>` half that lets one machine grade repos that do not share a `REPO` checkout.
+  # `=<checkout>` half that lets one machine grade repos that do not share a `REPO` checkout. ⛔ A
+  # comma INSIDE a value would be read as an entry boundary by that splitter, which is why
+  # `repo_set_parse` refuses one (`SEPARATOR-IN-VALUE`) rather than rendering a shape it cannot
+  # guarantee.
   printf '%s\n' "$parsed" | awk -F'\t' 'NF{ if (out != "") out = out ","; out = out $1 "=" $2 } END { printf "%s", out }'
   printf '\n'
 }

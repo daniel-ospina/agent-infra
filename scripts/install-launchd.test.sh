@@ -166,9 +166,13 @@ mkfakehome() { # $1 = home dir
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
     # #2281 §1: pr-doctor's unit now execs the machine wrapper (fleet_srcs), which resolves the repo
-    # SET reader as a sibling `lib/` file (lib_srcs). Both must exist or the broken-target arm the
-    # line above exists for would refuse this job — the correct verdict on a box that never ran the
-    # farm, and a spurious one here.
+    # SET reader as a sibling `lib/` file (lib_srcs). ⛔ BOTH ARE FIXTURE DATA, NOT A GUARD: the
+    # broken-target arm this loop exists for (`verify_targets`) inspects only ABSOLUTE PATHS in
+    # ProgramArguments, so it sees the wrapper and would NOT notice a missing `lib/repo-set.sh`. That
+    # sibling is caught at RUN time by the wrapper's own farm-gap refusal, which is loud and named —
+    # but it is not an install-time verdict, and a comment here claiming otherwise would send the next
+    # lane looking for a guard that does not exist. The pair is created here so the fixture mirrors
+    # what `setup.sh` actually delivers.
     touch "$1/.pi/agent/scripts/lib/repo-set.sh"
     chmod +x "$1/.pi/agent/scripts/lib/repo-set.sh"
     # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
