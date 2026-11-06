@@ -1059,6 +1059,25 @@ def _authority_key(u):
 #                         that spelling is certified; every other hosted spelling is a typo the
 #                         installer normalises, so it is refused by the same name `URL_NOT_DEFAULT`
 #                         and `merge-mcp.py` canonicalisation makes the repair converge.
+# ⛔ CLEARTEXT TO THE HOSTED HOST IS NOT A SELF-HOST, AND IT NEEDS NO CREDENTIAL TO BE WRONG (#3374
+# review, round 14 P2 — a FALSE PASS, measured). The INSECURE_URL floor above fires only when `auth` is
+# present, so a `http://api.premiselabs.co/mcp/` entry with NO Authorization skipped it, keyed by SCHEME
+# as a different endpoint, took the `_selfHosted`/template arms below, and printed `SELFHOSTED:` rc=0 —
+# LAYER VERIFIED over the LIVE hosted host in cleartext, with the sentence "a self-hosted daemon needs
+# none". The endpoint is https-only, so this is not an operator's daemon: the request either fails or is
+# answered by whatever the host serves in the clear, and the cell reports green either way.
+# `merge-mcp.py`'s `usable()` REFUSES this shape too (same rule, same reasoning), so install and verify
+# agree and `verify -> install -> verify` converges by refusal rather than looping.
+# The test is the endpoint identity with the scheme swapped for `https` — `_endpoint_key` owns the
+# default-port, leading-zero and root-dot rules, so this cannot drift from them, and a genuine self-host
+# on a different port (`http://localhost:8000/mcp`, `http://api.premiselabs.co:8443/mcp/`) is untouched.
+# It sits HERE, not beside the floor above, because `_endpoint_key` is defined further down this program
+# and calling it earlier raises NameError (caught by the arms below, which is why they run).
+if (url or "").lower().startswith("http://") \
+   and "://" in url \
+   and _endpoint_key("https://" + url.split("://", 1)[1]) == _endpoint_key(HOSTED_DEFAULT_URL):
+    print("INSECURE_URL:%s" % shown_url(url))
+    sys.exit(1)
 _url_is_hosted = _authority_key(url) == _authority_key(HOSTED_DEFAULT_URL)
 _url_is_canonical = _endpoint_key(url) == _endpoint_key(HOSTED_DEFAULT_URL)
 _selfhosted_shape = False
@@ -1192,7 +1211,7 @@ PY
       WRONG_AUTH:*)
         fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_MCP_API_KEY}' (or the legacy 'Bearer \${TORTOISE_API_KEY}') — the client sends headers VERBATIM, so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
       INSECURE_URL:*)
-        fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED. Use https, or drop the Authorization for a local daemon (which needs none)" ;;
+        fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) is CLEARTEXT (non-https) and not loopback, in one of two shapes and both refused: it carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED — or it names the HOSTED host, which is https-only whether or not a credential is attached, so the cell would be certified over an endpoint that cannot answer. Use https, or point at your own local daemon (a self-host needs no key)" ;;
       BADDERS:*)
         fail ".mcp.json's tortoise entry declares its headers value as a ${out#BADDERS:}, not an object — the Authorization cannot be read from it, so nothing can be certified. Make it an object: {\"Authorization\": \"Bearer \${TORTOISE_MCP_API_KEY}\"} — a re-install does this for you" ;;
       BADROOT:*|BADSERVERS:*)

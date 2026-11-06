@@ -3858,6 +3858,50 @@ _converge_case "the SHIPPED template (control)" \
   "$(cat "$ROOT/templates/.mcp.base.json")"
 _converge_case "a genuine self-host daemon (control)" \
   '{"mcpServers":{"tortoise":{"type":"http","url":"http://localhost:8000/mcp","headers":{"Authorization":"Bearer ${SOME_OTHER_VAR}"}}}}'
+# ⛔ A DOTTED HOSTED TEMPLATE MUST GO THROUGH THE *MERGE*, NOT ONLY THROUGH THE MARKER (#3374 review,
+# round 14 P1). The arms above build a DESTINATION and call the marker; nothing drove a dotted
+# TEMPLATE through `merge-mcp.py`, so it kept `endpoint_key` dot-BLIND while `cell-install.sh`'s two
+# key functions stripped the dot — the "MUST MATCH" comment described code that did not exist
+# (`merge-mcp.py`'s rationale was present and its `if host.endswith(".")` was NOT). Measured
+# pre-fix: the merge accepted these, wrote the dotted spelling, and `--verify` refused the result
+# `NOAUTH`/`WRONG_AUTH`/`NOTHTTP:sse` for ever — the non-convergent loop this whole section exists to
+# close, one spelling deeper. The invariant is the same one line, so they are the same cases.
+_converge_case "dotted hosted, no Authorization" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co./mcp/","lazy":true}}}'
+_converge_case "dotted hosted, a FOREIGN credential variable" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co./mcp/","headers":{"Authorization":"Bearer ${SOME_OTHER_VAR}"},"lazy":true}}}'
+_converge_case "dotted hosted, a non-http transport" \
+  '{"mcpServers":{"tortoise":{"type":"sse","url":"https://api.premiselabs.co./mcp/","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}}}'
+# …and the control: the dotted spelling with the CORRECT credential is the SAME endpoint, so it must be
+# normalised and certified — a rule that refused the dot outright would be a false block.
+_converge_case "dotted hosted, the CORRECT credential (control)" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co./mcp/","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"},"lazy":true}}}'
+# ⛔ CLEARTEXT TO THE HOSTED HOST IS NOT A SELF-HOST (#3374 review, round 14 P2 — a FALSE PASS). The
+# credential floor needs a CREDENTIAL to fire, so a template with NO Authorization escaped it and took
+# the self-host early return; measured pre-fix: merge rc=0, `http://api.premiselabs.co/mcp/` installed
+# verbatim, `--verify` `SELFHOSTED:` rc=0 — LAYER VERIFIED over the LIVE hosted host in cleartext with
+# no key at all. Both ends now refuse it by name, so the loop converges by refusal.
+_converge_case "cleartext hosted, no Authorization" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"http://api.premiselabs.co/mcp/","lazy":true}}}'
+# …and the CONTROLS that stop that rule passing by refusing every non-https url: a LAN daemon with no
+# key and a self-host on a NON-DEFAULT PORT are both legitimate and must stay preserved.
+_converge_case "a LAN http daemon with no key (control)" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"http://192.168.1.5:8000/mcp"}}}'
+_converge_case "the hosted HOST on a non-default port (control)" \
+  '{"mcpServers":{"tortoise":{"type":"http","url":"http://api.premiselabs.co:8443/mcp"}}}'
+
+# and the VERIFIER's own side of it: a hand-edited config that names the hosted host in cleartext with
+# no credential must be REFUSED BY NAME, never certified as a self-host.
+printf '{"mcpServers":{"tortoise":{"type":"http","url":"http://localhost:8000/mcp","headers":{"Authorization":"Bearer ${SOME_OTHER_VAR}"}}}}' > "$TMP/clear-tpl.json"
+for _clear in '{"mcpServers":{"tortoise":{"type":"http","url":"http://api.premiselabs.co/mcp/"}}}' \
+              '{"mcpServers":{"tortoise":{"type":"http","url":"http://api.premiselabs.co./mcp/"}}}'; do
+  printf '%s' "$_clear" > "$TMP/clear-cfg.json"
+  out="$(bash -c 'source "$1"; shift; graph_mcp_marker "$@"' _ "$MARKER_FN" "$TMP/clear-cfg.json" "$TMP/clear-tpl.json" 2>&1)"
+  rc=$?
+  [ "$rc" -ne 0 ] && case "$out" in INSECURE_URL:*) true ;; *) false ;; esac \
+    && ok "a CLEARTEXT hosted url is refused by name, never certified as a self-host — '$out'" \
+    || fail "a cleartext hosted url was NOT refused as INSECURE_URL (got '$out' rc=$rc) — LAYER VERIFIED over an endpoint that cannot answer"
+done
 
 # ⛔ A TRAILING ROOT DOT IS THE SAME DNS NAME, AND IT WAS CERTIFIED WITH AN EMPTY BEARER (#3374
 # round 13 P1 — a FALSE PASS). `api.premiselabs.co.` is the FQDN spelling of the hosted host: the
