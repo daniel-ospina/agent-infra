@@ -145,6 +145,22 @@ case "${REVIEW_PER_PASS}" in ''|*[!0-9]*)
 # The bound is a durable per-head ATTEMPT LEDGER, counted only after a dispatch is VERIFIED to have
 # started (a rollback must consume nothing), and EXHAUSTED is a terminal answer that publishes itself
 # on the PR instead of dispatching again. A new head is a new key, so a fix still gets its review.
+# ⛔ AND THE BUDGET MUST EXPIRE, OR A TRANSIENT FAILURE IS A PERMANENT LOCK (review round 3, P1).
+# The attempt ledger was a LIFETIME count, and not every failure that spends it is a paid review — far
+# from it: `review-pr.sh` exits 3 on 17 pre-review paths (no `gh`, no auth, cannot read the PR, the diff,
+# the issue list, no writable tmp) that run BEFORE it spawns a reviewer at all, and exits 9 pre-review on
+# two more ("refusing to pay for a review whose record step cannot run"). Three of those, ~900 s apart —
+# one rate-limit or auth window on the same shared bucket the INTERVAL guard exists to protect — used to
+# mark EVERY unattested head on the box EXHAUSTED, for ever, with a comment on each PR asserting money had
+# been spent. That is the #3489 symptom (a mergeable PR nobody can unblock) rebuilt as the fix.
+# So the count is WINDOWED: only dispatches inside `REVIEW_ATTEMPT_WINDOW_S` count. A head can therefore
+# spend at most REVIEW_MAX_ATTEMPTS paid reviews per window — the cost bound, stated as a RATE because a
+# rate is what can be honoured — and an environmental fault heals BY ITSELF when the window rolls, with
+# no new head and no operator action. A head that genuinely cannot be reviewed costs one window's worth.
+REVIEW_ATTEMPT_WINDOW_S=${REVIEW_ATTEMPT_WINDOW_S:-21600}
+case "${REVIEW_ATTEMPT_WINDOW_S}" in ''|*[!0-9]*)
+  echo "$(date -u +%FT%TZ) REFUSED: REVIEW_ATTEMPT_WINDOW_S='${REVIEW_ATTEMPT_WINDOW_S}' is not a non-negative integer — a non-number makes the window comparison an ERROR, which reads as FALSE, i.e. every attempt ever counted and the bound permanent" >> "$LOG"; exit 3;; esac
+[ "$REVIEW_ATTEMPT_WINDOW_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_ATTEMPT_WINDOW_S='${REVIEW_ATTEMPT_WINDOW_S}' is not a POSITIVE integer — 0 makes every attempt expire the instant it is written, i.e. no bound at all, which is the paid loop this counter exists to stop" >> "$LOG"; exit 3; }
 REVIEW_MAX_ATTEMPTS=${REVIEW_MAX_ATTEMPTS:-3}
 case "${REVIEW_MAX_ATTEMPTS}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: REVIEW_MAX_ATTEMPTS='${REVIEW_MAX_ATTEMPTS}' is not a non-negative integer — a non-number makes the attempt comparison an ERROR, which reads as FALSE, i.e. no bound at all" >> "$LOG"; exit 3;; esac
@@ -654,30 +670,37 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
 review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or nothing
   head -1 "$1" 2>/dev/null | sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p'
 }
-# How many PAID dispatches this head has already spent. The ledger is APPEND-ONLY and lives beside the
-# record (same (repo, PR, head) key), because the record itself is truncated on every replay — a count
-# kept inside it would be destroyed by exactly the replay it is supposed to bound.
-review_attempts() {  # $1 = the head-keyed attempt ledger; prints the dispatch count (0 when absent)
-  local n
-  # ⛔ `-f` FIRST: `wc -l < missing` is BASH failing to open the redirect, not `wc` failing, so a
-  # `2>/dev/null` on `wc` does not silence it — the suite printed "No such file or directory" for a
+# How many dispatches this head has already spent INSIDE THE WINDOW. The ledger is APPEND-ONLY and lives
+# beside the record (same (repo, PR, head) key), because the record itself is truncated on every replay —
+# a count kept inside it would be destroyed by exactly the replay it is supposed to bound. Entries older
+# than REVIEW_ATTEMPT_WINDOW_S stop counting: the bound is a rate, so a transient fault cannot lock a head
+# for ever (review round 3 — see the knob's comment).
+review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window dispatch count
+  local f=$1 n cut
+  # ⛔ `-f` FIRST: `wc`/`awk < missing` is BASH failing to open the redirect, not the tool failing, so a
+  # `2>/dev/null` on the tool does not silence it — the suite printed "No such file or directory" for a
   # question it asked on purpose.
-  [ -f "$1" ] || { printf '0\n'; return 0; }
-  n=$(wc -l < "$1" 2>/dev/null | tr -d ' ')
+  [ -f "$f" ] || { printf '0\n'; return 0; }
+  cut=$(( $(date +%s) - REVIEW_ATTEMPT_WINDOW_S ))
+  n=$(awk -v cut="$cut" '$1 ~ /^[0-9]+$/ && $1 > cut {c++} END {printf "%d", c+0}' "$f" 2>/dev/null)
   case "${n:-}" in ''|*[!0-9]*) printf '0\n'; return 0;; esac
   printf '%s\n' "$n"
 }
 # ── FORGIVING A REFUSAL, PRECISELY ───────────────────────────────────────────────────────────────
-# ⛔ IT DROPS **ONE** LINE — THE REFUSAL'S OWN — AND NEVER THE WHOLE LEDGER (review round 2, verifier).
-# `launch_review` counts every VERIFIED dispatch, and a refusal IS verified (its child starts, and
-# `run_review` appends its REVIEW-EXIT line, so the record is past the dispatch line), so the refusal's
-# attempt IS in the ledger. Truncating the file therefore forgave every PAID attempt before it: two paid
-# failures (att=2) followed by one load refusal (att=3) reset the budget to 0 and bought three more paid
-# reviews — the unbounded paid loop this PR exists to bound, re-opened by its own fix, and reachable on
-# exactly the intermittently-loaded box where the gate fires. Each dispatch appends exactly one line and
-# this runs only when the LAST dispatch is the refusal, so dropping that line is exact.
-# A failure here leaves the refusal counted, i.e. the budget is TIGHTER than intended — fail-closed, which
-# is the right direction for a bound.
+# ⛔ THE WINDOW DOES NOT MAKE THIS UNNECESSARY, AND DELETING IT WAS WRONG (review round 3, verifier).
+# The window bounds how long damage LASTS; it does not stop a refusal consuming the budget. On a loaded
+# box: three rc=75 refusals fill the window's allowance, the box quiets, the first REAL review then fails
+# rc=6 — and the head is EXHAUSTED on its FIRST paid failure, having spent one review, until the window
+# rolls. That is the round-2 defect intact, merely time-boxed. The two mechanisms answer different halves
+# and both are needed: this one keeps a free dispatch out of the budget at all, and the window covers the
+# classes auto-rail cannot see (rc=3/9 have pre-review paths too, so their state is `retry` and they DO
+# consume — there is no state that could tell those apart from a paid failure).
+# ⛔ IT DROPS ONE LINE — THE REFUSAL'S OWN. `launch_review` appends exactly one line per verified
+# dispatch and this runs only when the LAST dispatch is the refusal, so `sed '$d'` is exact. An earlier
+# version truncated the WHOLE ledger, which forgave paid attempts too (two paid failures + one refusal
+# reset the budget and bought three more paid reviews); the one-line form is what keeps that closed.
+# A failure here leaves the refusal counted — TIGHTER than intended, i.e. fail-closed, the right
+# direction for a bound.
 review_forgive_refusal() {  # $1 = attempt ledger; drops the newest entry if there is one
   local f=$1 n tmp
   [ -f "$f" ] || return 0
@@ -692,8 +715,9 @@ review_forgive_refusal() {  # $1 = attempt ledger; drops the newest entry if the
 }
 # ── THE ACTION, IN ONE PLACE ───────────────────────────────────────────────────────────────────────
 # rc 0 = WAIT (a review is already owed at this head), 1 = DISPATCH now, 2 = TERMINAL at this head (a
-# fix or the recorder is owed — never another review), 3 = EXHAUSTED (this head has spent its paid
-# attempts and still has no verdict — terminal too, but it must SAY so instead of reading like a wait).
+# fix or the recorder is owed — never another review), 3 = EXHAUSTED WITHIN THE WINDOW (this head has
+# spent its dispatch budget for REVIEW_ATTEMPT_WINDOW_S — terminal until the window rolls, NOT for ever,
+# because most of what can spend the budget is environmental and must heal without an operator).
 # A function, so a test pins the SHIPPED predicate instead of a copy of it: the whole anti-thrash arm IS
 # these lines.
 review_action() {  # $1 = state, $2 = seconds since dispatch, $3 = attempts already spent at this head
@@ -711,11 +735,12 @@ review_action() {  # $1 = state, $2 = seconds since dispatch, $3 = attempts alre
     retry)   [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0
              [ "$att" -lt "$REVIEW_MAX_ATTEMPTS" ] && return 1
              return 3;;
-    # ⛔ NOTHING WAS CONSUMED, SO NOTHING IS EXHAUSTED (review round 2, P2). A refusal waits out the
-    # short window and is retried whatever the attempt count says: an environment fault (a loaded box,
-    # no `pi`) must recover BY ITSELF, not permanently block the head with a message about money that
-    # was never spent. The loop clears the ledger when it dispatches out of this state, so a refusal
-    # never eats the paid budget either.
+    # ⛔ NOTHING WAS CONSUMED, SO NOTHING IS EXHAUSTED. A refusal waits out the short window and is
+    # retried whatever the attempt count says: an environment fault (a loaded box, no `pi`) must recover
+    # BY ITSELF, not block a head with a message about money that was never spent. The loop ALSO hands
+    # the refusal's own ledger entry back (`review_forgive_refusal`), because this arm only protects the
+    # refusal's own pass — without it, three load refusals would still exhaust the FIRST real review's
+    # retries, which is a defect merely time-boxed by the window, not fixed.
     refused) [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0; return 1;;
     *)       return 1;;
   esac
@@ -752,9 +777,11 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     review-found-issues)
       text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
     review-retries-exhausted)
-      text="⛔ **auto-rail: the reviewer could not produce a verdict** at \`${head:0:12}\` after ${REVIEW_MAX_ATTEMPTS} paid dispatch(es). No attestation exists, and auto-rail will NOT dispatch another one at this revision — a head that keeps failing after the review was paid for is not a head a fourth run will fix. The reviewer's own output is in the log; push a new head and it gets a new review.";;
+      text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${REVIEW_MAX_ATTEMPTS} dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s. No attestation exists, and auto-rail is not dispatching another review at this revision until that window rolls — which it does BY ITSELF, so an environmental cause (a rate-limit or auth window, a loaded box) needs no action at all. If this head genuinely cannot be reviewed, push a new head: a new head is a new review.";;
     review-record-unbound)
       text="⚠️ **auto-rail: a review record exists at \`${head:0:12}\` but the PR body carries no marker this loop can bind.** Re-running \`record-review.sh\` for this PR re-posts the signed marker at the same head (that write is idempotent). auto-rail never writes records, so it cannot do this itself — and it is deliberately NOT buying a second review, which would not help. **It is not waiting on a lane.**";;
+    review-dispatch-failed)
+      text="⚠️ **auto-rail: the reviewer was announced but never started** at \`${head:0:12}\` — the dispatch was rolled back (nothing ran, and no attempt was spent). This corrects the in-flight marker posted before the launch. The head is retried on a later pass; if this state persists, the actuator's reviewer path is broken and the log has the \`REVIEW-LAUNCH-FAILED\` line for it. **Nothing is reviewing this PR right now.**";;
     *) text="auto-rail: review state \`${state}\`.";;
   esac
   # ⛔ A FAILED READ IS NOT "NO MARKER": this script has no `pipefail`, so a `gh` that cannot run would
@@ -1045,7 +1072,15 @@ PY
         case "${_rdat:-}" in ''|*[!0-9]*) _rage=0;; *) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;; esac
         review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?
         if [ "$_ract" -eq 0 ]; then
-          log_line "$repo #$pr review $_rstate at $head — dispatched $(( _rage / 60 ))m ago, within its ${REVIEW_COOLDOWN_S}s window; waiting, not re-dispatching (a slow review is not a stuck one)"
+          # ⛔ THE WINDOW IN THE LOG MUST BE THE ONE THE PREDICATE USED (review round 3, P3): `_ract` is 0
+          # for `retry`/`refused` on COOLDOWN_TRANSIENT_S, NOT on REVIEW_COOLDOWN_S, so a single hardcoded
+          # number told the operator "within its 2700s window" about a 900 s comparison — on the file's own
+          # primary instrument.
+          case "$_rstate" in
+            pending) _rwin=$REVIEW_COOLDOWN_S;;
+            *)       _rwin=$COOLDOWN_TRANSIENT_S;;
+          esac
+          log_line "$repo #$pr review $_rstate at $head — dispatched $(( _rage / 60 ))m ago, within its ${_rwin}s window for this state; waiting, not re-dispatching (a slow review is not a stuck one)"
           continue
         fi
         if [ "$_ract" -eq 3 ]; then
@@ -1054,7 +1089,7 @@ PY
           # is what keeps the PR from reading as "a lane is working on it" — the rest of this step only
           # exists to keep that from happening.
           publish_review_state "$repo" "$pr" review-retries-exhausted "$head"
-          log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head after $_rattn dispatch(es) (cap $REVIEW_MAX_ATTEMPTS, state $_rstate, record $_rout, ledger $_ratt) — NOT dispatching again: only a NEW head (a new key) buys another review"
+          log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s (cap $REVIEW_MAX_ATTEMPTS, last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
           continue
         fi
         if [ "$_ract" -eq 2 ]; then
@@ -1081,12 +1116,21 @@ PY
           log_line "$repo #$pr AWAITING-REVIEW ($_att at $head) — $_rdispatched review(s) already dispatched for this repo this pass (cap $REVIEW_PER_PASS); this head is next in the queue"
           continue
         fi
-        # ⛔ A REFUSAL SPENT NOTHING, SO IT MUST NOT SPEND THE PAID BUDGET — AND ONLY ITS OWN LINE COMES
-        # OFF (review round 2; the truncate-all version forgave paid attempts and re-opened the paid
-        # loop). `review_forgive_refusal` is a driven function for exactly that reason.
+        # ⛔ A REFUSAL SPENT NOTHING, SO ITS OWN LEDGER LINE COMES STRAIGHT BACK (review rounds 2 and 3):
+        # the window bounds how long damage lasts but would still let three load refusals exhaust the
+        # FIRST real review's retries. `review_forgive_refusal` drops exactly that one line, and only when
+        # the last dispatch is the refusal — never a paid entry.
         [ "$_rstate" = refused ] && review_forgive_refusal "$_ratt"
         publish_review_state "$repo" "$pr" review-in-flight "$head"
-        launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" || continue
+        # ⛔ A ROLLED-BACK DISPATCH MUST CORRECT THE MARKER IT JUST POSTED (review round 3, P2). The
+        # in-flight publish is deliberately BEFORE the launch (a dispatched review must never be
+        # invisible), so when the launch is proven not to have started the comment is already on the PR
+        # claiming "a fresh-context reviewer was dispatched". The record is removed, so every later pass
+        # reads `none` and re-publishes the SAME tag — a no-op — leaving a PR that reads `review in flight`
+        # with nothing running and no attestation coming: the "indistinguishable from a lane" disguise this
+        # PR exists to remove, and the log line even claims the opposite.
+        launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" \
+          || { publish_review_state "$repo" "$pr" review-dispatch-failed "$head"; continue; }
         _rdispatched=$(( _rdispatched + 1 ))
         continue
       fi
