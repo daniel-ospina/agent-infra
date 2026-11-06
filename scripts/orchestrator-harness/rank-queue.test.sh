@@ -1732,8 +1732,14 @@ ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not rep
 # from. `_dwit` reads that trace and returns the printed PREFIX (up to the first `:`), which is text the
 # drive really produced, so it can be searched for in stdout without guessing at quoting.
 _dwit() {  # _dwit <xtrace-file> [function-name] -> the prefix of the first echo EXECUTED in that function
+  # ⛔ THE MATCH IS ANCHORED TO THE TRACE'S COMMAND POSITION (review P2, cycle 51). A substring match on
+  # `fn` + ` echo ` accepted ANY line carrying both tokens — measured: an assignment that traces a heredoc
+  # body verbatim (`_d="$(cat <<'Z' … Z"`) yields `+queue_order_from_pool _d='queue_order_from_pool echo
+  # '''[refresh] …'`, which named a witness with no echo executed at all. With `PS4='+${FUNCNAME[0]:-main} '`
+  # the traced command starts at the FIRST token after the `+`-run (a nested `$()` adds one more `+`), so the
+  # regex `^\++<fn> echo ` is exact and the assignment line cannot match it.
   awk -v fn="${2:-queue_order_from_pool}" '
-    index($0, fn) && index($0, " echo ") {
+    $0 ~ ("^\\++" fn " echo ") {
       s = $0
       i = index(s, "["); if (i == 0) next
       s = substr(s, i)
@@ -1757,18 +1763,58 @@ ck "the witness the trace names is text this drive actually PRINTED" $rc
 # one-off manual experiment and deleting it left the suite green. These two probes are the red and green
 # paths, permanently: printed DATA inside the function must yield NO witness, and a real `echo` must.
 _dwp="$TMP/wit-parse"; rm -rf "$_dwp"; mkdir -p "$_dwp"
+# The body CARRIES THE TOKEN PAIR on purpose: a body without it proves nothing about the matcher (it would
+# have failed even the weakest predicate). `_dwit` must still name nothing, because no `echo` ran.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' 'set -v' \
   'queue_order_from_pool() {' \
   "  cat <<'ZZZ'" \
-  '  [refresh] decoy order: printed DATA, never an executed echo' \
+  "  queue_order_from_pool echo '[refresh] decoy order: printed DATA'" \
   'ZZZ' \
   '  return 0' \
   '}' \
   'queue_order_from_pool' > "$_dwp/decoy.sh"
 ( cd "$_dwp" && bash decoy.sh ) > "$_dwp/decoy.out" 2>"$_dwp/decoy.trace"
-ck "a heredoc body that mimics an arm names NO witness (printed data is not a witness)" \
+ck "a heredoc body carrying the TOKEN PAIR names NO witness (printed data is not an executed echo)" \
    "$([ -z "$(_dwit "$_dwp/decoy.trace")" ] && echo 0 || echo 1)"
+
+# ⛔ AND THE ASSIGNMENT SHAPE, which traces the body INSIDE the assignment rather than as a command — the
+# exact line a substring matcher accepted (review P2, cycle 51).
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  'queue_order_from_pool() {' \
+  "  _d=\"\$(cat <<'ZZZ'" \
+  "queue_order_from_pool echo '[refresh] assign order: body traced inside an assignment'" \
+  'ZZZ' \
+  ')"' \
+  '  : "$_d"' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/assign.sh"
+( cd "$_dwp" && bash assign.sh ) > "$_dwp/assign.out" 2>"$_dwp/assign.trace"
+ck "a heredoc traced INSIDE an assignment names NO witness (the match is anchored to the command position)" \
+   "$([ -z "$(_dwit "$_dwp/assign.trace")" ] && echo 0 || echo 1)"
+
+# ⛔ THE ` echo ` CONJUNCT, graded on its own: a function whose only command is a `printf` carrying the same
+# text must name nothing — drop that conjunct and this fixture becomes a witness.
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  'queue_order_from_pool() {' \
+  "  printf '%s\\n' '[refresh] printf order: not an echo'" \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/printf.sh"
+( cd "$_dwp" && bash printf.sh ) > "$_dwp/printf.out" 2>"$_dwp/printf.trace"
+ck "a PRINTF in the function names NO witness (an echo is required, not merely a line of text)" \
+   "$([ -z "$(_dwit "$_dwp/printf.trace")" ] && echo 0 || echo 1)"
+
+# ⛔ AND THE `fn` CONJUNCT: an echo in ANOTHER function must not be attributed to the one under test.
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
+  'other_function() { echo "[refresh] other order: a different function"; }' \
+  'queue_order_from_pool() { other_function; }' \
+  'queue_order_from_pool' > "$_dwp/other.sh"
+( cd "$_dwp" && bash other.sh ) > "$_dwp/other.out" 2>"$_dwp/other.trace"
+ck "an echo in a DIFFERENT function names NO witness for the function under test" \
+   "$([ -z "$(_dwit "$_dwp/other.trace")" ] && echo 0 || echo 1)"
 printf '%s\n' \
   "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
   'queue_order_from_pool() {' \
@@ -2011,7 +2057,9 @@ for _arm14_case in \
   _al="${_arm14_case%%|*}"; _rest="${_arm14_case#*|}"
   _ac="${_rest%%|*}"; _am="${_rest#*|}"
   _ao="$(_arm14 "$_al" "$_ac")"
-  if ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null; then
+  if ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null && ! grep -qF "$_am" <<<"$_ao"; then
+    rc=1; echo "      the $_al arm's sentence is ABSENT FROM THE OUTPUT as well — the arm's echo is GONE, not merely untraced (a product defect, not a dead fixture)"
+  elif ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null; then
     rc=1; echo "      the $_al arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the sentence proves nothing"
   elif grep -qF "$_am" <<<"$_ao" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_ao"; then rc=0
   else rc=1; echo "      the $_al arm '$(printf '%s' "$_ao" | tr '\n' '|' | head -c 340)'"; fi
@@ -2062,6 +2110,8 @@ for _arm14m in \
   case "$_mo" in '__STRIP_OK__'*) _mok=1; _mo="$(printf '%s\n' "$_mo" | sed '1d')" ;; esac
   if [ "$_mok" -ne 1 ]; then
     rc=1; echo "      the strip did NOT apply to the $_ml arm — it already lacks the clip, so this check would report a mutation it never made"
+  elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null && ! grep -qF "$_mm" <<<"$_mo"; then
+    rc=1; echo "      the $_ml arm's sentence is ABSENT FROM THE OUTPUT as well — the arm's echo is GONE, not merely untraced (a product defect, not a dead mutant)"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null; then
     rc=1; echo "      the $_ml arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the absence of the clause proves nothing"
   elif grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
