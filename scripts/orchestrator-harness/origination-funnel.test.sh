@@ -2538,14 +2538,25 @@ echo
 # ⛔ THE SCAN IS A FUNCTION OF A FILE, so the mutation below is graded by the SAME code that grades the
 # real suite — running the mutant as a nested suite would re-enter this section and recurse forever.
 _drv_scan() {   # $1 = file to scan → sets _drv_total, _drv_unpinned
-  local _file="$1" _rest _pay _args
+  local _file="$1" _rest _pay _args _psep
   _drv_total=0; _drv_unpinned=""
   _rest="$(sed -n '1,/THE DRIVERS RUN IN THE MODE/p' "$_file")"
   while :; do
     case "$_rest" in *"bash -c"*) : ;; *) break ;; esac
     _rest="${_rest#*bash -c}"
     case "$_rest" in *"' _ "*) : ;; *) break ;; esac
-    _pay="${_rest%%"' _ "*}"
+    # ⛔ THE PATTERN IS A VARIABLE, NOT A QUOTED LITERAL INSIDE THE EXPANSION. Inline, this line read
+    # `_pay="${_rest%%"' _ "*}"` — valid bash, and it BEHAVES identically, but it DESYNCHRONISES
+    # `scripts/check-false-pass-shapes.sh`: that scanner's quote-carry model does not follow a `'...'`
+    # nested inside a `"..."` inside a `${...%%...}` expansion, so it reported `unterminated-quote` from
+    # this line and the WHOLE FILE became a partial scan — `0 finding(s)` but `1 partial scan(s)`, FAIL,
+    # and a red no later lane could attribute (the file is otherwise correct). Measured in an isolated
+    # tree: this line alone reproduces it, the other three `' _ '` lines here do not. A `${var%%pattern}`
+    # expansion is a PATTERN context and is never word-split, so the unquoted `$_psep` is equivalent.
+    # (The trailing quote is deliberately NOT in `_psep`: this arm splits BEFORE the closing quote, so
+    # `_pay` keeps the payload's opening `'`, exactly as the inline pattern did.)
+    _psep="' _ "
+    _pay="${_rest%%$_psep*}"
     _args="${_rest#*"' _ "}"; _args="${_args%%$'\n'*}"
     _rest="${_rest#*"' _ "}"
     case "$_pay" in *dispatch_gate_line*|*dispatch_funnel*) : ;; *) continue ;; esac
