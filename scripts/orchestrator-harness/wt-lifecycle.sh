@@ -299,7 +299,8 @@ wt_rollback() {
 #   1 = nothing was created and nothing was left behind          (WT_RESULT says why)
 #   2 = a pre-existing state this function refuses to touch      (nothing changed)
 #   3 = ROLLBACK FAILED — residue remains, and the caller must surface it (WT_RESULT names it)
-# Idempotent: a second call for the same (path, branch) is a no-op.
+# Idempotent: a second call for the same (path, branch) is a no-op — UNLESS a live process still
+# holds the checkout, which is refused with rc=2 rather than reported usable (see the reuse arm).
 wt_provision() {
     local repo="$1" path="$2" br="$3" base="${4:-${WT_BASE:-origin/main}}"
     local created=0 oid existing_oid ahead rc wt_registered cur_canon want_canon
@@ -376,6 +377,12 @@ wt_provision() {
                 # skips the issue, releases its claim and drops its row (retried next cycle, by which
                 # time the orphan is normally gone and `wt_reap_if_empty` can take the tree back);
                 # `fix-one.sh` refunds the booked fixer attempt and ABORTS; `adopt-fix.sh` aborts.
+                # ⛔ THE TWO REPAIR ARMS ABOVE AND BELOW ARE DELIBERATELY EXEMPT, and the reason is
+                # not an oversight: neither is on the reuse path this comment is about. The
+                # stale-`initializing` repair is reached only once the record is OLDER than the
+                # lock-age floor (a younger one is refused, not repaired), and the unusable-worktree
+                # repair only when HEAD is unresolvable — in both the record itself already proves the
+                # checkout is not usable, which is a different question from "may I hand it out".
                 # rc 2 from the probe itself ("the argv witness could not be evaluated") is FAIL-CLOSED,
                 # matching `wt_reap_if_empty`: handing out a checkout on an unevaluable probe is how a
                 # second writer gets in, and the cost of refusing is one cycle.
@@ -387,8 +394,8 @@ wt_provision() {
                 WT_RESULT="reused existing worktree $wt_registered"
                 return 0
             fi
-            # rc=2 is the caller's documented "refuses to touch, nothing changed" answer, which every
-            # caller turns into skip + release-claim — the pre-PR fail-closed behaviour.
+            # rc=2 is the caller's documented "refuses to touch, nothing changed" answer (the callers
+            # differ in what they then do — see the note on the reuse arm's holder refusal above).
             WT_RESULT="branch $br is already checked out at $wt_registered, NOT at the requested $path — refusing to report a usable worktree at a path that does not exist"
             return 2
         else
@@ -598,15 +605,22 @@ wt_live_holders() {
             # caller was `wt_reap_if_empty`, where a false holder merely KEEPS residue (fail-safe);
             # the reuse arm is the first call site where a false holder SKIPS a free issue.
             # A path matches only when the character AFTER it is not a NAME character (so `/x/tm-1`
-            # matches `/x/tm-1`, `/x/tm-1/` and `/x/tm-1/foo`, and never `/x/tm-10`), and the one
-            # BEFORE it is not a NAME character either (so `/a/x` never matches inside `/ba/x`).
-            # `/` deliberately counts as a non-match boundary on the right: a process working INSIDE
-            # the tree is a holder, and one working in a LONGER SIBLING name is not.
+            # matches `/x/tm-1`, `/x/tm-1/` and `/x/tm-1/foo`, and never `/x/tm-10`), and the occurrence
+            # is not a SUFFIX of some longer path (`/data/wt/tm-1` must not match
+            # `/mnt/data/wt/tm-1`, which is a different checkout on a longer prefix — the leading
+            # `/` of the path follows that prefix character, so a bare substring test caught it too).
+            # ⛔ A SHORT OPTION GLUED TO THE PATH IS STILL A BOUNDARY (`git -C<wt>`): the char before
+            # the path is `C`, a name character, and rejecting it made a REAL holder invisible — in
+            # the one caller that DELETES (`wt_reap_if_empty`) that is a fail-safe turned fail-open,
+            # so an option letter immediately before the path counts as a boundary too.
+            # `/` is not special-cased on the right: the negated class below already admits it, and
+            # saying so twice would invite the next reader to believe a narrower class is in force.
             s = cmd
             while ((p = index(s, path)) > 0) {
                 nxt = substr(s, p + length(path), 1)
                 prv = (p > 1) ? substr(s, p - 1, 1) : ""
-                if ((nxt == "" || nxt == "/" || nxt ~ /[^0-9A-Za-z._-]/) && prv !~ /[0-9A-Za-z._-]/) {
+                glued_opt = (p > 2) && (substr(s, p - 2, 1) == "-")
+                if (nxt !~ /[0-9A-Za-z._-]/ && (prv !~ /[0-9A-Za-z._-]/ || glued_opt)) {
                     print pid "\targv-lists-the-worktree"; exit
                 }
                 s = substr(s, p + 1)

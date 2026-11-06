@@ -341,7 +341,10 @@ assert_contains "$OUT" "WT_RESULT=reused" "W8 …and reports a reuse"
 # The only thing suppressing a re-dispatch into that checkout was this box's `dispatched.txt` row, and
 # #3511's third per-issue arm drops that row the moment the claim is released — so the guard has to
 # live HERE, in the one place every caller passes through: rc=2 = "refuses to touch, nothing changed",
-# which every caller already turns into skip + release-claim + retry next cycle.
+# which is rc=2 = "refuses to touch, nothing changed". ⛔ WHAT THE CALLERS DO WITH IT DIFFERS and the
+# two must not be described as one: `dispatch-merge.sh` skips + releases the claim + drops the row;
+# `fix-one.sh` refunds the booked attempt and ABORTS; `adopt-fix.sh` aborts. (See the note on the
+# refusal itself in wt-lifecycle.sh.)
 # The holder's ARGV names the checkout (a positional argument to `python3 -c`), so the arm drives
 # the ARGV witness and does not depend on `lsof` being installed. ⛔ NOT `bash -c "cd <wt> && sleep"`:
 # bash EXEC-OPTIMISES that into a bare `sleep N`, whose argv no longer carries the path, so the arm
@@ -396,6 +399,43 @@ wait "$SIB_PID" 2>/dev/null
 assert_contains "$SIB_HELD" "rc=0" "W10 the live sibling IS a holder of its OWN checkout (the probe still works)"
 assert_contains "$OUT" "rc=0" "W10 a live process in the LONGER sibling name (tm-141) does not make tm-14 look held"
 assert_contains "$OUT" "WT_RESULT=reused" "W10 …tm-14 reuses normally"
+
+# ── W11: a LONGER ABSOLUTE path ending with this one is not a holder ───
+# #3511 review cycle 4, P2: the left boundary was the one part of the anchoring that NOTHING pinned —
+# deleting it outright left every suite green — and the comment that described it gave an example that
+# cannot happen (`/a/x` is not a substring of `/ba/x`, because the path's own leading `/` follows the
+# `b`). The real class is a LONGER absolute path that ENDS with the checkout path: `.../tm-15` inside
+# `/mnt.../tm-15` is a different directory, and treating it as a holder skips a free issue.
+ENV=W11; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main" "$REPO" >/dev/null
+python3 -c 'import time; time.sleep(30)' "/mnt$REPO/.worktrees/tm-15" &
+LONG_PID=$!
+sleep 1
+LONG_HELD="$(in_wt "wt_live_holders '/mnt$REPO/.worktrees/tm-15'; echo rc=\$?" "$REPO")"
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-15 feat/15-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+kill "$LONG_PID" 2>/dev/null
+wait "$LONG_PID" 2>/dev/null
+assert_contains "$LONG_HELD" "rc=0" "W11 the LONGER absolute path IS a holder of itself (the probe still fires)"
+assert_contains "$OUT" "rc=0" "W11 a live process naming /mnt<wt> does not make <wt> look held"
+assert_contains "$OUT" "WT_RESULT=reused" "W11 …<wt> reuses normally"
+
+# ── W12: a REAL holder GLUED to a short option is still detected ───────
+# #3511 review cycle 4, P1. `git -C<wt>` puts an option LETTER immediately before the path, so a
+# left-boundary test of "the preceding char is not a name character" rejected a GENUINE holder — and
+# the retry cannot re-find it, because the scan consumes the path's own leading `/`. In
+# `wt_reap_if_empty` that is a fail-safe (preserve residue) turned FAIL-OPEN: the reaper proceeds past
+# the holder gate and removes a checkout a live `git` is working in. An option letter directly before
+# the path is therefore a boundary.
+ENV=W12; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main" "$REPO" >/dev/null
+python3 -c 'import time; time.sleep(30)' "-C$REPO/.worktrees/tm-16" &
+GLUED_PID=$!
+sleep 1
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-16 feat/16-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+kill "$GLUED_PID" 2>/dev/null
+wait "$GLUED_PID" 2>/dev/null
+assert_contains "$OUT" "rc=2" "W12 a holder glued to a short option (git -C<wt>) is still DETECTED (rc=2)"
+assert_contains "$OUT" "still holds" "W12 …and the refusal names the holder"
 
 # ── L-series: the lane's own exit path (wt_reap_if_empty) ──────────────
 echo "the lane exit path (a lane that produced nothing takes its checkout back)"
