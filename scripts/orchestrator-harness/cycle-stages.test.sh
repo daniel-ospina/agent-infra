@@ -731,10 +731,13 @@ ck "the fork-starved record writes start= and end= from the SAME token (got '${_
 # §6 scans only the extracted clock block, so `cycle="$(printf …)"` inside the starved record write —
 # the ONE path where a `$( )` TERMINATES bash (agent-infra#2293), and the path this change adds its
 # `stages=` line to — left the suite GREEN at this head (verified). The scan is the RECORD-WRITE
-# STATEMENT itself (`cycle_record_write` … through `stages=`), not the whole arm body: the body carries
-# inline comments and printf MESSAGES that name `$( )`, `date` and backticks to explain the ban, and a
-# match inside prose is exactly the vacuating shape §6 already had to strip once.
-_starved_body="$(printf '%s\n' "$_loop_nc" | awk '/FORK_STARVED:-0.*= "1"/{f=1} f && /cycle_record_write/{r=1} r{print} r && /stages=/ {exit}' | sed 's/\$((//g')"
+# STATEMENT: from `cycle_record_write` through the last continuation line, which INCLUDES the
+# `|| printf '…could not be recorded…'` failure branch — the branch that runs precisely when the starved
+# record CANNOT be written, and where a fork is equally fatal. ⛔ An earlier version of this arm stopped
+# at `stages=` and therefore left that branch ungraded (`$(date +%s)` added there stayed 97/0, verified).
+# It is still not the whole arm BODY: the body's inline comments and printf MESSAGES name `$( )`, `date`
+# and backticks to explain the ban, and matching inside prose is the vacuating shape §6 already stripped.
+_starved_body="$(printf '%s\n' "$_loop_nc" | awk '/FORK_STARVED:-0.*= "1"/{f=1} f && /cycle_record_write/{r=1} r{print; if ($0 !~ /\\$/) exit}' | sed 's/\$((//g')"
 _sb_n="$(printf '%s\n' "$_starved_body" | grep -c . || true)"
 ck "no command substitution in the FORK-STARVED arm's record write (${_sb_n:-0} lines scanned)" \
    "$(if [ -n "$_starved_body" ] && ! qF '$(' "$_starved_body"; then echo 0; else echo 1; fi)"

@@ -816,10 +816,10 @@ if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; e
 #                          An overlay is a BREAKDOWN OF the tiled stage it ran inside, never an
 #                          addition to it: `sum(l1..l4) <= sweep`, and `l5_issue` IS a tiled stage
 #                          because issue launch is contiguous. A level that was ENTERED **and whose
-#                          interval reached this emitter** is a measured `0`; a level NOTHING entered —
-#                          or one whose interval never crossed the queue (an unwritable
-#                          `$O/state/.stg-lvl`, or a level left unsettled by a `continue`) — reads
-#                          `ns`, the same distinction as every other stage here.
+#                          interval reached this emitter** reads its MEASURED SECONDS (`0` when the
+#                          interval was under a second); a level NOTHING entered — or one whose
+#                          interval never crossed the queue (an unwritable `$O/state/.stg-lvl`, or a
+#                          level left unsettled by a `continue`) — reads `ns`.
 #   CARRIED (STG_PREV)   — `prev_wait`, the post-record gap (the async backlog spawn + the `CYC` nap).
 #                          It CANNOT be in this cycle's number: the record is written BEFORE the nap,
 #                          and it must be (a record stamped at the end would make a HUNG cycle look
