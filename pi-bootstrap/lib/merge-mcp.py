@@ -308,6 +308,9 @@ _HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
 # maps all five of the above to `.`, which no single DNS label may contain.
 _DOT_EQUIVALENT = "\u3002\uff0e\uff61\ufe52\u2024"
 
+# The Unicode general categories UTS46 DELETES from a label (soft hyphen is `Cf`). See `_label_ok`.
+_UTS46_DELETES = ("Cf", "Mn", "Me")
+
 # Common Cyrillic/Greek homoglyphs of ASCII letters, which `idna` PUNYCODES rather than rejecting, so
 # they are NOT the same class as a dot-equivalent (a punycoded homoglyph is a DIFFERENT host, never the
 # hosted one) and are deliberately not refused here: refusing them would be a false block on a
@@ -320,32 +323,39 @@ except ImportError:                           # pragma: no cover — stdlib-only
 
 
 def _label_ok(lab):
-    """True when one DNS label is a name the client would accept.
-
-    ASCII labels get the structural rule only (non-empty, at least one alnum) — deliberately NOT
-    `idna.encode`, which is IDNA2008 and stricter than the client on ASCII (it refuses `-abc`, which
-    `new URL` accepts; refusing a spelling that WORKS is the false block this gate exists to avoid).
-    A non-ASCII label is the opposite case: the client applies UTS46, and only IDNA2008 agrees with
-    it — `١.example` passes an "alnum" test and `new URL` throws (`IDNABidiError`), while
-    `münchen.example` is accepted by both. So ask the library, and keep the residual visible: on a
-    box with no `idna` the label is accepted on the forbidden-code-point check alone.
-    """
     if not lab or not any(ch.isalnum() for ch in lab):
         return False
     if any(ch in _HOST_FORBIDDEN for ch in lab):
         return False
-    # ⛔ A DOT-EQUIVALENT SPLITS ONE LABEL INTO TWO — see `_DOT_EQUIVALENT`. Checked on the NFKC form so
-    # it holds on a stdlib-only box (no `idna`) too, and so a future lookalike that normalises to `.` is
-    # caught by the same rule rather than by a growing blocklist of spellings.
+    # (1) DOT-EQUIVALENTS SPLIT ONE LABEL INTO TWO. Checked on the NFKC form, in stdlib, so it holds
+    # on a box with no `idna` too.
     if any(ch in _DOT_EQUIVALENT for ch in lab) or "." in unicodedata.normalize("NFKC", lab):
         return False
-    if lab.isascii() or _idna is None:
+    if lab.isascii():
         return True
+    if _idna is None:
+        # (3) STDLIB-ONLY FALLBACK. UTS46 DELETES every Cf/Mn/Me code point, so `co\xad` maps to `co`
+        # and the client resolves a DIFFERENT host than the one written — `new URL` sends
+        # `api.premiselabs.co\xad.evil.example` to `api.premiselabs.co.evil.example`. Without `idna`
+        # there is no way to apply the real mapping, so refuse the code points it would delete. This
+        # is deliberately narrow (a legitimately combining IDN label is refused HERE and accepted once
+        # `idna` is installed) because the alternative is a false PASS that mails the tenant key to an
+        # attacker's host.
+        return not any(unicodedata.category(ch) in _UTS46_DELETES for ch in lab)
     try:
+        # (2) ⛔ THE RULE, AND IT IS NOT A BLOCKLIST: the label must be a FIXED POINT of the client's
+        # own UTS46 mapping. Rounds 12 and 13 each closed one SPELLING (`%2e`, then the five
+        # dot-equivalents) and each time the next spelling through the same mapping was still
+        # certified: a mapping that DELETES a code point (`co\xad` -> `co`) renames the label exactly
+        # as a mapping that INTRODUCES a separator (`co\u3002evil` -> `co.evil`) does. Comparing what
+        # we READ against what the CLIENT RESOLVES closes both, and closes the next one without an
+        # edit. Measured: `co\xad`/`co\u3002evil` change; `münchen`, `xn--mnchen-3ya`, `my_host`,
+        # `localhost`, `api.premiselabs.co` do not.
+        if _idna.uts46_remap(lab, std3_rules=False, transitional=False) != lab:
+            return False
         encoded = _idna.encode(lab, uts46=True)
     except Exception:
         return False
-    # Belt and braces: whatever the library maps to, a SINGLE label must encode to a SINGLE label.
     return b"." not in encoded
 
 
