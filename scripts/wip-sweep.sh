@@ -280,6 +280,52 @@ if [ "$MODE" = status ]; then
   esac
 fi
 
+MODE_WORD=dry-run
+[ "$DRY_RUN" -eq 0 ] && MODE_WORD=apply
+T0="$SECONDS"
+TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+NOW_S="$(date -u '+%s')"
+# ⛔ THE MARKER IS WRITTEN BEFORE EVERY REFUSAL THAT CAN FOLLOW, not just before the work
+# (review finding). It used to sit after the rescue / repo resolution, so a pass that REFUSED AT
+# STARTUP — a missing rescuer, no repo to scan — exited 3 having written nothing, and the PREVIOUS
+# pass's `status=ok` stayed in place and stayed fresh. Measured: a good pass, then uncommitted work
+# plus `WIP_SWEEP_RESCUE=/nonexistent` -> the sweep exits 3 and `--print-status` answers
+# `rc=0 status=ok`, i.e. a box being swept nowhere reads as swept WITH the work present on it.
+# So the state dir is created and marked here, BEFORE the delegate/repo refusals; a usage error
+# (exit 2) still comes earlier and deliberately does not touch the record, because a mistyped
+# argument is not a pass.
+mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR — REFUSING (a pass with no record has no alarm channel)"; exit 3; }
+# ⛔ A PASS IN FLIGHT SAYS SO, AND THAT IS THE WHOLE POINT OF THIS WRITE (review finding P1).
+# The record used to be written ONLY at the end. So a pass that crashed, was OOM-killed, was cut off by
+# a quiesce, or could not write its record at the end left the PREVIOUS pass's `status=ok` standing —
+# fresh, on the surface the doc nominates for a fleet instrument, for up to WIP_SWEEP_STALE_SECONDS. A
+# box being swept nowhere read as swept. Measured: an unwritable state dir with one prior good pass
+# exited 3 and `--print-status` still answered `rc=0 status=ok`.
+# Now the record is overwritten with `status=running` BEFORE any worktree is touched, and the verdict
+# write replaces it at the end. `--print-status`'s allow-list already maps an unnamed status to exit 3,
+# so an interrupted pass answers `failed` instead of `ok` — the same polarity `disk-reaper.sh` gets from
+# the scheduler's own exit status, held here without a scheduler.
+# ⛔ THE LIMIT, STATED: a state dir that is unwritable at BOTH ends cannot be marked at all — the old
+# record then stands, and the pass can only be loud on stderr and non-zero in its exit code. That is a
+# host problem to fix, and the READER cannot see it; it is not claimed away.
+if REC_TMP="$(mktemp "$STATE_DIR/.wip-sweep-status.XXXXXX" 2>/dev/null)"; then
+  {
+    printf 'status=running\n'
+    printf 'rc=?\n'
+    printf 'ts=%s\n' "$NOW_S"
+    printf 'mode=%s\n' "$MODE_WORD"
+    printf 'detail=pass started, no verdict recorded yet\n'
+  } > "$REC_TMP" 2>/dev/null && mv -f "$REC_TMP" "$STATUS_FILE" 2>/dev/null \
+    || { err "cannot write the pass-start marker $STATUS_FILE — an interrupted pass will NOT be distinguishable from the last good one"; }
+  REC_TMP=""
+else
+  err "cannot create a temp file in $STATE_DIR — a pass that dies will NOT be distinguishable from the last good one"
+fi
+# These two are needed by the sweep loop only, but they live here so the whole "this pass
+# started" prologue is in one place.
+ERRF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-err.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
+LISTF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-list.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
+
 # ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
 RESCUE="${WIP_SWEEP_RESCUE:-}"
 if [ -n "$RESCUE" ]; then
@@ -327,13 +373,7 @@ if [ "${#REPOS[@]}" -eq 0 ]; then
   exit 3
 fi
 
-mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR — REFUSING (a pass with no record has no alarm channel)"; exit 3; }
-ERRF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-err.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
-LISTF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-list.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
 
-T0="$SECONDS"
-TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-NOW_S="$(date -u '+%s')"
 
 BUDGET_STOPPED=0
 STOP_EXAMINE=0
@@ -623,37 +663,9 @@ sweep_repo() {
   return 0
 }
 
-MODE_WORD=dry-run
-[ "$DRY_RUN" -eq 0 ] && MODE_WORD=apply
 note "pass start mode=$MODE_WORD max=$MAX budget=${BUDGET}s repos=${#REPOS[@]} watchdog=$TB_TIMEOUT_KIND"
 note "index: $RECORD"
 
-# ⛔ A PASS IN FLIGHT SAYS SO, AND THAT IS THE WHOLE POINT OF THIS WRITE (review finding P1).
-# The record used to be written ONLY at the end. So a pass that crashed, was OOM-killed, was cut off by
-# a quiesce, or could not write its record at the end left the PREVIOUS pass's `status=ok` standing —
-# fresh, on the surface the doc nominates for a fleet instrument, for up to WIP_SWEEP_STALE_SECONDS. A
-# box being swept nowhere read as swept. Measured: an unwritable state dir with one prior good pass
-# exited 3 and `--print-status` still answered `rc=0 status=ok`.
-# Now the record is overwritten with `status=running` BEFORE any worktree is touched, and the verdict
-# write replaces it at the end. `--print-status`'s allow-list already maps an unnamed status to exit 3,
-# so an interrupted pass answers `failed` instead of `ok` — the same polarity `disk-reaper.sh` gets from
-# the scheduler's own exit status, held here without a scheduler.
-# ⛔ THE LIMIT, STATED: a state dir that is unwritable at BOTH ends cannot be marked at all — the old
-# record then stands, and the pass can only be loud on stderr and non-zero in its exit code. That is a
-# host problem to fix, and the READER cannot see it; it is not claimed away.
-if REC_TMP="$(mktemp "$STATE_DIR/.wip-sweep-status.XXXXXX" 2>/dev/null)"; then
-  {
-    printf 'status=running\n'
-    printf 'rc=?\n'
-    printf 'ts=%s\n' "$NOW_S"
-    printf 'mode=%s\n' "$MODE_WORD"
-    printf 'detail=pass started, no verdict recorded yet\n'
-  } > "$REC_TMP" 2>/dev/null && mv -f "$REC_TMP" "$STATUS_FILE" 2>/dev/null \
-    || { err "cannot write the pass-start marker $STATUS_FILE — an interrupted pass will NOT be distinguishable from the last good one"; }
-  REC_TMP=""
-else
-  err "cannot create a temp file in $STATE_DIR — a pass that dies will NOT be distinguishable from the last good one"
-fi
 
 for one in ${REPOS[@]+"${REPOS[@]}"}; do
   # ⛔ BOUNDED, LIKE EVERY OTHER SUBPROCESS HERE — and this is on the quiesce path, before the box is

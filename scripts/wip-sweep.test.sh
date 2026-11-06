@@ -564,6 +564,36 @@ O="$(cd "$T" && WIP_SWEEP_BUDGET=0 WIP_SWEEP_STATE_DIR="$T/state-bd0" bash "$SW"
 # by a quiesce / could not write its verdict leaves `running` — never the previous pass's fresh `ok`.
 # Measured before the fix: an unwritable state dir with one prior good pass exited 3 and `--print-status`
 # still answered `rc=0 status=ok`.
+# ⛔ AND THE WRITER, NOT ONLY THE READER (review finding P2). I9 hand-writes the marker, so DELETING the
+# whole start-marker block left the suite at PASS — the fix this file's last commit is named after could be
+# reverted silently. This arm runs a REAL pass whose delegate is slow, reads the record WHILE it is in
+# flight, and requires `running`; then requires that the finished pass replaced it. A `kill -9` of the pass
+# at that moment leaves a record that reads `failed`, never the previous `ok`.
+mk_fixture mk fix/3485-mk || { echo "x fixture failed (mk)"; exit 1; }
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *" --verdict "*) sleep 3; echo "verdict=clean paths=0 branch=x slug=x"; exit 0 ;;' \
+  'esac' \
+  'exit 0' > "$T/stub-slow2.sh"
+chmod +x "$T/stub-slow2.sh"
+( WIP_SWEEP_RESCUE="$T/stub-slow2.sh" WIP_SWEEP_STATE_DIR="$T/state-mk" \
+    bash "$SW" --apply --repo "$T/mk/wt" >/dev/null 2>&1 ) &
+MKD_PID=$!
+MID=""
+for _ in 1 2 3 4 5 6; do
+  sleep 1
+  MID="$(sed -n 's/^status=//p' "$T/state-mk/wip-sweep.status" 2>/dev/null)"
+  [ "$MID" = "running" ] && break
+done
+wait "$MKD_PID" 2>/dev/null
+[ "$MID" = "running" ] \
+  && ok "I10 a pass IN FLIGHT records status=running (the marker is written by the run, before the work)" \
+  || bad "I10 the in-flight record was '${MID:-<none>}' — nothing marks a pass as started"
+FINAL="$(sed -n 's/^status=//p' "$T/state-mk/wip-sweep.status" 2>/dev/null)"
+[ "$FINAL" = "ok" ] \
+  && ok "I10b the finished pass REPLACED the marker with its verdict (status=ok)" \
+  || bad "I10b the finished pass left status='$FINAL' (want ok)"
+
 mkdir -p "$T/state-run" && printf 'status=running\nrc=?\nts=%s\ndetail=pass started\n' "$(date -u '+%s')" > "$T/state-run/wip-sweep.status"
 O="$(WIP_SWEEP_STATE_DIR="$T/state-run" bash "$SW" --print-status 2>&1)"; RC=$?
 [ "$RC" -eq 3 ] && ok "I9 a pass that never reached its verdict (status=running) answers 3, not ok" \

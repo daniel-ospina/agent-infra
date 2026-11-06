@@ -167,14 +167,17 @@ list` refused, or a path that is not a repository) adds an `unmeasured` count an
 `cannot-verify` row and does **not** add to `seen` — it is a failure about the repository, not an
 examination of a worktree, and it always fails the pass (exit 3).
 
-⛔ **The record is written TWICE: `status=running` before any worktree is touched, then the verdict.**
-That is what makes an interrupted pass visible. A pass that crashes, is OOM-killed, is cut off by a
-quiesce, or cannot write its verdict leaves `running` — which `--print-status` maps to `failed`/exit 3 —
-instead of the PREVIOUS pass's `status=ok` standing there, fresh, for up to `WIP_SWEEP_STALE_SECONDS`. The
-limit is stated rather than implied: a state dir unwritable at BOTH the start and the end cannot be marked
-at all, so the old record stands and the pass can only be loud on stderr with a non-zero exit — that is a
-host problem, and the reader cannot see it. (`disk-reaper.sh` gets its equivalent witness from the
-scheduler's own exit status; this pass has no scheduler yet, so the marker is the substitute.)
+⛔ **The record is written TWICE: `status=running` before any worktree is touched — and before every
+startup refusal that follows it — then the verdict.** That is what makes an interrupted pass visible. A
+pass that crashes, is OOM-killed, is cut off by a quiesce, **refuses at startup** (a missing rescuer, no
+repo to scan), or cannot write its verdict leaves `running` — which `--print-status` maps to
+`failed`/exit 3 — instead of the PREVIOUS pass's `status=ok` standing there, fresh, for up to
+`WIP_SWEEP_STALE_SECONDS`. A usage error (exit 2) comes earlier and deliberately does not touch the
+record: a mistyped argument is not a pass. The one limit is stated rather than implied: a state dir
+unwritable at BOTH the start and the end cannot be marked at all, so the old record stands and the pass
+can only be loud on stderr with a non-zero exit — that is a host problem, and the reader cannot see it.
+(`disk-reaper.sh` gets its equivalent witness from the scheduler's own exit status; this pass has no
+scheduler yet, so the marker is the substitute.)
 
 `--print-status` answers from that record alone: `0` ok, `1` incomplete, `3` failed / stale / never.
 **`never` and `stale` are not success** — a sweeper that has not run is a box whose WIP is on the disk
