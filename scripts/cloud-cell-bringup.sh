@@ -562,79 +562,120 @@ keys_env_has_value() {
   [ -n "$(printf '%s' "$v" | tr -d '[:space:]')" ]
 }
 
-# ── what a STORE ENTRY has to look like before this script will call it a credential ────────────
-# ⛔ THE ORACLE IS THE PATH A LANE ACTUALLY TAKES, which is NOT the CLI's validator. Read from pi's
-# source and then EXERCISED against pi:
-#   * a lane boots `AuthStorage` (`core/model-runtime.js` → `core/auth-storage.js`), whose
-#     `parseStorageData` is a plain `JSON.parse` inside a try/catch that keeps the last snapshot. It
-#     does NOT validate entries — so `{"deepseek":{valid},"openai":false}` is a store a LANE WORKS
-#     WITH (measured: `read("deepseek")` → the good key).
-#   * `ReadOnlyAuthStorage.load()` is the strict one (it throws on any invalid entry) and it is used by
-#     exactly one caller: `pi auth … --no-refresh`, an operator CLI check.
-# An earlier version of this block cited the strict validator as "pi throws" and REFUSED such a store
-# — a false block on a box whose lanes run, sending an operator to hand-edit the cell's identity.
-# So: the FILE-LEVEL refusal is only for a file a lane cannot parse at all; an invalid entry for
-# ANOTHER provider is a WARNING; and the per-provider question is decided by whether a lane's
-# `read(<provider>)` would YIELD A KEY.
-#   * `read()` resolves `key` through `resolveConfigValue(key, env)`: a `key` that is a `$VAR`
-#     TEMPLATE or a `!command` yields whatever the environment supplies — and on a cell this script
-#     materialises a LITERAL key, because a clean-shell lane has no environment to resolve against.
-#   * a `key` that is `null` or a non-string makes `read()` THROW (`config.startsWith is not a
-#     function`) — so such an entry is not a credential, but it is REPAIRABLE in place: the key field
-#     is rewritten, and every other field is preserved.
-STORE_ENTRY_CLI_VALID_JQ='
-  def nbstring: (type == "string") and (((gsub("^\\s+|\\s+$"; "")) | length) > 0);
-  def valid_env: ((has("env") | not)
-                  or (((.env | type) == "object")
-                      and ([(.env // {})[] | (type == "string")] | all)));
-  (type == "object") and (
-    ((.type == "api_key")
-      and ((has("key") | not) or (.key == null) or ((.key | type) == "string"))
-      and valid_env)
-    or ((.type == "oauth")
-        and ((.access | type) == "string") and ((.refresh | type) == "string")
-        and ((.expires | type) == "number") and ((.expires | isinfinite) | not))
-  )'
+# ── the provider CREDENTIAL STORE: what counts as a credential, in pi's OWN terms ───────────────
+# ⛔ THE ORACLE IS THE PATH A LANE TAKES. A lane boots `AuthStorage` (`core/model-runtime.js` →
+# `core/auth-storage.js`), whose `parseStorageData` is a plain `JSON.parse` inside a try/catch that
+# keeps the last snapshot: it does NOT validate entries. (`ReadOnlyAuthStorage`, which throws on any
+# invalid entry, has exactly one caller — `pi auth … --no-refresh`, an operator CLI check.) So a store
+# like `{"deepseek":{valid},"openai":false}` is one a LANE works with; refusing it would be a false
+# block, and it is reported as a warning instead.
+#
+# ⛔ AND THE KEY-QUESTION IS `read()`'s, NOT A SHAPE ALLOW-LIST. `read(provider)` returns the entry
+# with `key` RESOLVED through `resolve-config-value`:
+#   * a literal key is the credential — `env` is not consulted for it at all;
+#   * `$$x` / `$!x` are ESCAPED literals (`$x` / `!x`);
+#   * `$VAR` / `${VAR}` resolve against the ENTRY'S `env` map FIRST, then the process environment;
+#   * `!command` is EXECUTED (no environment needed).
+# Measured on this host against pi: `!printf %s sk-…`, `$DSK` with `env.DSK`, `$$lit` and `$!lit` all
+# yield a usable key, and a literal key with `env: null` yields a usable key too. An earlier version of
+# this block treated "starts with `$`/`!`" as NOT a credential and REPLACED those keys with a literal
+# — destroying credentials pi's docs recommend for exactly this purpose.
+# What a CLEAN-SHELL lane cannot use is a `$VAR` template whose variables are supplied by neither the
+# entry's `env` (the only env a lane booted with no environment has) nor anything on this box: that is
+# what gets repaired, by writing a LITERAL key and preserving every other field.
+#
+# One python helper, used by both halves: the SHAPE and the RESOLUTION rule in one place, so a
+# classifier and a gate cannot drift. `python3` is a hard dependency of this script (`check_tools`) and
+# of the supervisor's own dependency loop, and keeping the rule in one program also removes the jq
+# PROGRAM-AS-STRING class of defect (a provider id spliced into a jq program once produced a syntax
+# error and a silently wrong verdict).
+#   $1 auth.json   $2 provider   [$3 = "warn"]   -> one of: present mergeable other empty unreadable
+#                                                  (with "warn": a comma-separated list of entries the
+#                                                   pi CLI would reject, then the state on line 2)
+IFS= read -r -d '' STORE_STATE_PY <<'PYEOF_STORE' || true
 
-# store_entry_usable_jq — the per-provider question, as a jq program parameterised by `--arg p`
-# (the provider id is DATA, never spliced into the program: a hand-edited PI_LANE_PROVIDER must not be
-# able to rewrite a jq program — measured: `store_entry_usable_jq 'a"b'` emitted a syntax error and
-# the classifier then answered `mergeable` for a provider it had not actually judged).
-# A `key` that is a `$VAR` template or a `!command` is NOT usable HERE: `read()` resolves it through
-# the environment, and a cell lane is launched with no environment to resolve against — which is the
-# whole reason this script writes a LITERAL key.
-store_entry_usable_jq() {
-  cat <<'JQ'
-def valid_env: ((has("env") | not)
-                or (((.env | type) == "object") and ([(.env // {})[] | (type == "string")] | all)));
-.[$p] as $e
-| ($e != null) and (
-    (($e.type == "api_key")
-     and ($e | valid_env)
-     and (($e.key | type) == "string")
-     and (((($e.key) | gsub("^\\s+|\\s+$"; "")) | length) > 0)
-     and ((($e.key) | startswith("$") or startswith("!")) | not))
-    or (($e.type == "oauth")
-        and (($e.access | type) == "string")
-        and (((($e.access) | gsub("^\\s+|\\s+$"; "")) | length) > 0)
-        and (($e.refresh | type) == "string")
-        and (($e.expires | type) == "number")
-        and ((($e.expires | isinfinite)) | not))
-  )
-JQ
-}
+import json, math, os, re, sys
+path, prov = sys.argv[1], sys.argv[2]
+warn = len(sys.argv) > 3 and sys.argv[3] == "warn"
+try:
+    with open(path, "rb") as f:
+        raw = f.read()
+except FileNotFoundError:
+    print("empty"); sys.exit(0)
+except OSError:
+    # EXISTS but cannot be READ (mode 000, an ACL, a directory). That is NOT "empty": classifying it
+    # as empty let the writer replace a store full of credentials it never saw (measured).
+    print("unreadable"); sys.exit(0)
+if not raw.strip():
+    print("empty"); sys.exit(0)
+try:
+    doc = json.loads(raw.decode("utf-8", "replace"))
+except Exception:
+    print("unreadable"); sys.exit(0)
+if not isinstance(doc, dict):
+    print("unreadable"); sys.exit(0)
+if not doc:
+    print("empty"); sys.exit(0)
 
-# store_entry_rewritable <auth.json> <provider> — 0 iff the wanted entry is an `api_key` shape whose
-# key field this script may REWRITE (missing, blank, null, non-string, or a template/command
-# reference) while preserving every other field. An `env` map that is not an object-of-strings is NOT
-# rewritten over (the entry would stay unusable), and an `oauth`/unknown type is never touched.
-store_entry_rewritable() {
-  jq -e --arg p "${2:-}" '
-def valid_env: ((has("env") | not)
-                or (((.env | type) == "object") and ([(.env // {})[] | (type == "string")] | all)));
-(.[$p] // null) as $e
-| ($e == null) or (($e.type == "api_key") and ($e | valid_env))' "$1" >/dev/null 2>&1
-}
+def nonblank(v):
+    return isinstance(v, str) and v.strip() != ""
+
+def cli_valid(c):
+    if not isinstance(c, dict):
+        return False
+    if c.get("type") == "api_key":
+        if "key" in c and c["key"] is not None and not isinstance(c["key"], str):
+            return False
+        e = c.get("env", None)
+        return e is None or (isinstance(e, dict) and all(isinstance(x, str) for x in e.values()))
+    if c.get("type") == "oauth":
+        x = c.get("expires")
+        return (isinstance(c.get("access"), str) and isinstance(c.get("refresh"), str)
+                and isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x))
+    return False
+
+ESCAPE = re.compile(r"\$\$|\$!")
+REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+def state_for(c):
+    if c is None:
+        return "mergeable"                     # nothing here: a literal key may be written
+    if not isinstance(c, dict):
+        return "other"                          # not a shape this script will rewrite
+    t = c.get("type")
+    if t == "api_key":
+        key = c.get("key")
+        if not nonblank(key):
+            return "mergeable"                  # absent/blank/null/non-string: a lane reads no key
+        if key.startswith("!"):
+            return "other"                      # pi EXECUTES it; not judgeable offline, never rewritten
+        if key.startswith("$$") or key.startswith("$!"):
+            return "present"                     # an escaped literal
+        refs = set(REF.findall(ESCAPE.sub("", key)))
+        if not refs:
+            return "present"                     # a literal: `env` is never consulted for these
+        env = c.get("env")
+        env = env if isinstance(env, dict) else {}
+        if all(nonblank(env.get(r)) for r in refs):
+            return "present"                     # resolvable from the entry's OWN env — no process env
+        return "mergeable"                       # a clean-shell lane cannot resolve it
+    if t == "oauth":
+        # A VALID record with a blank access token is not a credential a lane can use, and it is not
+        # this script's to rewrite (it carries a refresh token) — so it is "other": not counted, not
+        # touched, and the refusal says execution is how to settle it.
+        return "present" if (cli_valid(c) and nonblank(c.get("access"))) else "other"
+    return "other"
+
+if warn:
+    bad = [k for k, v in doc.items() if not cli_valid(v)]
+    print(", ".join(bad))
+    print(state_for(doc.get(prov, None)))
+else:
+    print(state_for(doc.get(prov, None)))
+
+PYEOF_STORE
+
+
 
 # provider_var <provider> — the variable `keys.env` carries that provider's key in. The four explicit
 # pairs are the fleet's own; ANY other provider derives pi's convention (`<PROVIDER>_API_KEY`,
@@ -651,73 +692,41 @@ provider_var() {
   printf '%s_API_KEY\n' "$(printf '%s' "$prov" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9\n' '_' | sed 's/_*$//')"
 }
 
-# store_provider_state <auth.json> <provider> -> present | mergeable | other | empty | unreadable
-#   present    a lane's `read(<provider>)` yields a usable key from this store
-#   mergeable  the file is sound and this provider has no usable key — no entry, or an api_key whose
-#              key field is missing/blank/null/non-string/a template — so a LITERAL key may be written
-#              into it, preserving every other field
-#   other      an entry this script will NOT rewrite (`oauth` in any form, an unknown type): whether
-#              it resolves is pi's answer, so it is neither counted as a credential nor overwritten
-#   empty      the measured defect and every shape of it: absent file, 0 bytes, WHITESPACE ONLY, `{}`
-#   unreadable the file is not a JSON object / does not parse — a lane's `reload()` keeps its last
-#              snapshot (empty on a fresh process), so NO credential exists; never clobbered
+# store_provider_state <auth.json> <provider> — one line: present | mergeable | other | empty | unreadable
 store_provider_state() {
-  local auth="$1" prov="$2"
-  if [ ! -e "$auth" ] || [ ! -s "$auth" ] || ! grep -q '[^[:space:]]' "$auth" 2>/dev/null; then
-    printf 'empty\n'; return 0
-  fi
-  if ! jq -e 'type == "object"' "$auth" >/dev/null 2>&1; then
-    printf 'unreadable\n'; return 0
-  fi
-  if jq -e 'length == 0' "$auth" >/dev/null 2>&1; then
-    printf 'empty\n'; return 0
-  fi
-  if jq -e "$(store_entry_usable_jq)" --arg p "$prov" "$auth" >/dev/null 2>&1; then
-    printf 'present\n'; return 0
-  fi
-  if store_entry_rewritable "$auth" "$prov"; then
-    printf 'mergeable\n'; return 0
-  fi
-  printf 'other\n'
+  local out
+  out="$(python3 -c "$STORE_STATE_PY" "${1:-}" "${2:-}" 2>/dev/null)" || out=""
+  [ -n "$out" ] || out="unreadable"          # the helper could not answer => cannot verify
+  printf '%s\n' "$out"
 }
 
-# store_has_credential <auth.json> <provider> — 0 iff a lane's `read(<provider>)` yields a key from
-# this store. The provider is REQUIRED: "a file exists" is not the question (`{}` is the measured
-# defect), and neither is "some provider has a key" when a lane uses one provider.
+# store_has_credential <auth.json> <provider> — 0 iff a lane's `read(<provider>)` yields a key.
+# The provider is REQUIRED: "a file exists" is not the question (`{}` is the measured defect), and
+# neither is "some provider has a key" when a lane uses one provider.
 store_has_credential() {
-  [ -s "${1:-}" ] || return 1
-  [ "$(store_provider_state "$1" "${2:-}")" = present ]
+  [ "$(store_provider_state "${1:-}" "${2:-}")" = present ]
 }
 
-# store_warn_other_invalid <auth.json> — report (never refuse) an entry for ANOTHER provider that the
-# CLI validator would reject. A LANE is unaffected (`AuthStorage` does not validate), but `pi auth`
-# is, and a future lane using that provider would hit it — so it is a warning, not a gate.
+# store_warn_other_invalid <auth.json> <provider> — report (never refuse) an entry the pi CLI would
+# reject. A LANE is unaffected (`AuthStorage` does not validate), but `pi auth` is — so this is a
+# warning, and the file is never rewritten for it.
 store_warn_other_invalid() {
-  local auth="$1" bad
-  # ⛔ THE RULE IS INLINED, NOT PASSED AS `--argjson`: a jq PROGRAM is not a JSON value, and
-  # `(.value | $ok)` against a value errors out — which silently produced NO warning at all (measured).
-  bad="$(jq -r '
-      def cli_valid:
-        (type == "object") and (
-          ((.type == "api_key")
-            and ((has("key") | not) or (.key == null) or ((.key | type) == "string"))
-            and ((has("env") | not)
-                 or (((.env | type) == "object") and ([(.env // {})[] | (type == "string")] | all))))
-          or ((.type == "oauth")
-              and ((.access | type) == "string") and ((.refresh | type) == "string")
-              and ((.expires | type) == "number") and ((.expires | isinfinite) | not)));
-      [ to_entries[] | select((.value | cli_valid) | not) | .key ] | join(", ")' "$auth" 2>/dev/null)"
-  if [ -n "$bad" ] && [ "$bad" != "null" ]; then
-    log_line "provider store: $auth holds entr(y/ies) the pi CLI would reject ($bad) — a LANE is unaffected (it does not validate entries), but 'pi auth' is. Not this script's to rewrite."
+  local out bad
+  out="$(python3 -c "$STORE_STATE_PY" "${1:-}" "${2:-}" warn 2>/dev/null)" || return 0
+  bad="$(printf '%s\n' "$out" | sed -n '1p')"
+  if [ -n "$bad" ]; then
+    log_line "provider store: $1 holds entr(y/ies) the pi CLI would reject ($bad) — a LANE is unaffected (it does not validate entries), but 'pi auth' is. A ${2:-provider} key this script CAN use is not judged by that rule."
   fi
 }
 
-# store_has_body <auth.json> — 0 iff the file is something jq can read AS A DOCUMENT. A whitespace
-# only file is `empty` to the classifier above, and to jq it is NO INPUT: `jq '.[$p]=…' file` then
-# emits NOTHING and exits 0, so writing through it would truncate the store to 0 bytes while the
-# repair line claimed success (measured). The writer therefore asks THIS, not `-s`.
+# store_has_body <auth.json> — 0 iff the file can be READ and holds a non-space byte. A whitespace-only
+# file is `empty` (jq reads NO input from it and would emit nothing), and a file that cannot be read at
+# all must never be written through — the writer asks THIS, not `-s`.
 store_has_body() {
-  [ -s "${1:-}" ] && grep -q '[^[:space:]]' "$1" 2>/dev/null
+  local c
+  c="$(cat -- "${1:-}" 2>/dev/null)" || return 1
+  case "$c" in *[![:space:]]*) return 0 ;; esac
+  return 1
 }
 
 # write_store_entry <auth.json> <provider> <VAR> — write ONE literal key, PRESERVING every other entry
@@ -774,7 +783,7 @@ repair_provider_store() {
   fi
   var="$(provider_var "$want")"
   st="$(store_provider_state "$auth" "$want")"
-  store_warn_other_invalid "$auth"
+  store_warn_other_invalid "$auth" "$want"
   case "$st" in
     present)
       # ⛔ THE STORE WINS, AND THAT IS THE HAZARD THIS LINE EXISTS FOR (review round 3): a lane reads

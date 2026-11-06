@@ -345,36 +345,30 @@ denied_shipped_names() {
 # `<stem>-old/`. It is combined with `loadable_extension_entry` so the match is the SHAPES pi loads,
 # not "any file whose name starts with the stem" — the difference is the arm that proves a
 # `<stem>-notes.txt` beside the extension is neither refused nor deleted.
-# denied_copy_variant <basename> <stem> — 0 iff <basename> is the STEM plus a COPY MARKER, i.e. a
-# suffixed/renamed copy of the denied entry rather than a different extension that happens to share
-# the prefix. The markers are the shapes copies actually take, and the list is deliberately explicit:
-#   <stem>                     (empty remainder)
-#   <stem>.ts | .js            (the entry itself, re-spelled)
-#   <stem>.bak[.ts] | -bak     .old | -old | .orig | .copy | .save | .keep | .dist | .local | .tmp
-#   <stem>[.-_]disabled[.ts]   <stem>-off
-#   <stem>.1 | -2 | _3 …       (numbered copies)
-# ⛔ A name that does not reduce to one of these is NOT swept: `<stem>-helper.ts` is a different
-# extension, and the sweep is allowed to `rm -rf`.
 denied_copy_variant() {
-  local base="${1%/}" stem="${2%/}" rest
+  local base="${1%/}" stem="${2%/}" rest seg
   rest="${base#"$stem"}"
   [ "$rest" = "$base" ] && return 1          # does not start with the stem at all
   rest="${rest//.ts/}"; rest="${rest//.js/}"  # an extension suffix is not a marker
-  # Leading separators repeat in real names (`.bak`, `-old`, ` -copy`), and a marker may carry a
-  # numeric/alnum suffix (`.bak2`, `-v2`, `.1`).
-  while :; do
-    case "$rest" in
-      [\ ._-]*) rest="${rest#?}" ;;
-      *) break ;;
+  # SEGMENTS, NOT ONE REMAINDER. A copy's name can compound (`-old-v2`, `.bak.1`, ` copy 2`), and each
+  # of those parts is a marker on its own — a single-segment match missed them while pi loads every one
+  # (they end in `.ts`). Split on the separators real names use, lower-case, and require EVERY remaining
+  # part to be a copy marker or a version/number.
+  local segs
+  segs="$(printf '%s' "$rest" | tr 'A-Z' 'a-z' | tr '._- ' '\n\n\n\n' | sed '/^$/d')"
+  [ -z "$segs" ] && return 0                 # the entry itself, or the entry re-spelled `.ts`/`.js`
+  while IFS= read -r seg; do
+    case "$seg" in
+      bak|backup|old|orig|copy|save|keep|dist|local|tmp|disabled|off) continue ;;
+      # a marker carrying a version/number (`bak2`, `disabled3`) — but not an arbitrary word
+      bak[0-9]*|backup[0-9]*|old[0-9]*|orig[0-9]*|copy[0-9]*|save[0-9]*|keep[0-9]*|dist[0-9]*|local[0-9]*|tmp[0-9]*|disabled[0-9]*|off[0-9]*) continue ;;
+      v[0-9]*|[0-9]*) continue ;;
+      *) return 1 ;;
     esac
-  done
-  [ -z "$rest" ] && return 0
-  case "$rest" in
-    bak|backup|old|orig|copy|save|keep|dist|local|tmp|disabled|off) return 0 ;;
-    bak[0-9]*|backup[0-9]*|old[0-9]*|orig[0-9]*|copy[0-9]*|save[0-9]*|disabled[0-9]*|off[0-9]*) return 0 ;;
-    v[0-9]*|[0-9]*) return 0 ;;
-  esac
-  return 1
+  done <<EOF
+$segs
+EOF
+  return 0
 }
 
 denied_extension_copies() { # <agent-dir>

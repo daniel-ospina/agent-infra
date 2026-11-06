@@ -790,6 +790,49 @@ BR_ENV_FILE="$T/keys-zai.env" BR_EXTRA_ENV="PI_LANE_PROVIDER=zai" br ok normal -
   && ok "an unlisted provider (zai) is materialised from its DERIVED variable (ZAI_API_KEY)" \
   || bad "PI_LANE_PROVIDER=zai was not materialised — the derived-variable path is broken: $(jq -c . "$AUTH" 2>/dev/null)"
 
+# (m) THE KEY-QUESTION IS `read()`'s, NOT A SHAPE ALLOW-LIST. Measured against pi on this host:
+# `!command` keys are EXECUTED, `$VAR` is resolved against the ENTRY's own `env` first, `$$`/`$!` are
+# escaped literals, and a LITERAL key never consults `env` at all. Every one of those is a working
+# credential, so the repair must not rewrite it — an earlier version classified them "not a
+# credential" and replaced the key, destroying exactly what pi's docs recommend.
+printf '{"deepseek":{"type":"api_key","key":"!printf %%s sk-from-op"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = '!printf %s sk-from-op' ] \
+  && ok "a '!command' key is NOT rewritten (pi executes it; this script cannot judge it offline)" \
+  || bad "the repair overwrote a '!command' credential — pi runs that command to get the key"
+[ "$BR_RC" -ne 0 ] \
+  && ok "…and the cell is refused as \"does not rewrite\" (execution is how to settle it)" \
+  || bad "the bring-up certified a box on the strength of a command key it never ran"
+
+printf '{"deepseek":{"type":"api_key","key":"$DSK","env":{"DSK":"sk-env-scoped"}}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = '$DSK' ] \
+  && ok "a \$VAR key the entry's OWN env supplies is left alone (pi resolves it there first)" \
+  || bad "the repair overwrote a template the entry's own env satisfies"
+
+printf '{"deepseek":{"type":"api_key","key":"sk-literal","env":null}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "sk-literal" ] \
+  && ok "a literal key with an unusable env map is still a credential (env is never consulted for literals)" \
+  || bad "a working literal credential was refused/rewritten because of an env field pi ignores for literals"
+
+# (n) A STORE THE PROCESS CANNOT READ must never be REPLACED. `grep` fails identically on "no match"
+# and on EACCES, so a stat/grep-based classifier calls a mode-000 store "empty" and writes over
+# credentials it never saw (measured before this arm existed).
+printf '{"openai":{"type":"oauth","access":"a","refresh":"r","expires":9},"deepseek":{"type":"api_key","key":"sk-good"}}\n' > "$AUTH"
+chmod 000 "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an UNREADABLE store REFUSES the cell (rc=$BR_RC)" \
+                   || bad "bring-up certified a cell whose credential store it could not read"
+chmod 600 "$AUTH"
+[ "$(jq -r '.openai.access // ""' "$AUTH" 2>/dev/null)" = "a" ] \
+  && ok "…and it was NOT replaced: the oauth record inside it is still there" \
+  || bad "the bring-up REPLACED a store it could not read — a credential it cannot recreate is gone"
+
 # restore a healthy store for every arm after this block
 rm -f "$AUTH"
 printf '%s\n' "$TOK_BODY" > "$TOK"
