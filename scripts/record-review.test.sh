@@ -7347,6 +7347,38 @@ run_record_delta $EH26 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518901" \
     STUB_EVIDENCE_BODY="reviewed Delta: $DG_BASE .. $DG_HEAD; no issues found."
 assert_eq "$RECORD_RC" "0" "20h22 a padded CAPITALISED spelling of the RECORDED range still records clean (rc 0)"
 assert_contains "$(cat "$(Q2 $EH26)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h22 the accepted record is the normal one, not a special case"
+
+# 20h23 THE RANGE CLAIM MUST NOT NEED THE WORD `delta:` TO ARM. Fourth review cycle,
+#       finding (a): the guard armed on the TOKEN, so an artifact stating "Reviewed only
+#       A1...HEAD" — an ordinary reviewer sentence — was invisible to BOTH layers and fell
+#       to the bare needle, which it satisfies by naming B. MEASURED: that body recorded
+#       rc 0 with `delta_range=BASE..HEAD`, marking the authored commit as reviewed on the
+#       strength of a range the artifact never quoted. The arm now keys on the RANGE SHAPE,
+#       so a stated range is compared whatever word introduces it; M18 restores the
+#       word-keyed arm, which is the exact pre-fix state.
+EH27=425190; rm -f "$(Q2 $EH27)"
+run_record_delta $EH27 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed only ${DG_A1}...${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "3" "20h23 a narrower range stated WITHOUT the word delta: is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h23 the stated range is reached and compared, not passed over as bare prose"
+[ -f "$(Q2 $EH27)" ] && bad "20h23 no record was written" || ok "20h23 no record was written"
+
+# 20h24 EVERY STATED RANGE IS CHECKED, NOT JUST THE FIRST. Fourth review cycle, finding
+#       (b): `=~` is a LEFTMOST match, so parsing ONE range made the arm ORDER-DEPENDENT —
+#       a body quoting the wide range first and the narrower one it actually read SECOND was
+#       accepted on the first, while the mirror order refused. Order-dependence is not
+#       containment, and a reviewer quoting the brief's range before their own is ordinary
+#       prose. The body below states the RECORDED range first (it passes every clause) and
+#       the narrower range it actually read second, so only an exhaustive scan refuses it.
+EH28=425192; rm -f "$(Q2 $EH28)"
+run_record_delta $EH28 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="delta:${DG_BASE}..${DG_HEAD} is the brief; I read delta:${DG_A1}...${DG_HEAD} only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h24 a NARROWER range stated SECOND is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h24 the arm is order-independent — a first passing range does not end the check"
+assert_contains "$RECORD_ERR" "EVERY range the artifact states is checked" "20h24 the refusal says the scan is exhaustive"
+[ -f "$(Q2 $EH28)" ] && bad "20h24 no record was written" || ok "20h24 no record was written"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7464,7 +7496,7 @@ MUT="$(mk_mutant evilanchor '    if [ -n "$evil_shas" ]; then' '    if false; th
 mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42514001" accepted STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
 # M14 — THE RANGE CONTAINMENT. Removing the ancestry test lets a body that declares a
 #       NARROWER range satisfy the claim for a wider one (20h15).
-MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
+MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$_sfs" "$from" 2>/dev/null || _r=$?' '          _r=0')"
 mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
 # M15 — THE PRE-FIX RECORDER, REPRODUCED EXACTLY. This cell mutates BOTH layers of the
 #       fix, because either one ALONE still refuses and would make the cell vacuous: the
@@ -7485,16 +7517,33 @@ mut_check "M15 a three-dot narrower stated range is refused" 425174 "$DG_HEAD" "
 #       stops a range this code cannot read from being reinterpreted as a bare-head claim.
 MUT="$(mk_mutant unparseablepassed '    elif [ "$_delta_tok" -eq 1 ]; then' '    elif false; then')"
 mut_check "M16 an unparseable stated range is refused, not reinterpreted" 425182 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:abc1234..def5678 at $DG_HEAD; no issues found."
-# M17 — THE SHARED LITERAL, i.e. the third cycle's P1. Reverting BOTH token spellings to the
-#       lower-case literal `delta:` is exactly the pre-fix state AND exactly the mistake the
-#       first fix made: detection and parse then miss `Delta:` together, the refusal arm is
-#       never reached, and the bare needle accepts a body naming B alone. Two replacements
-#       because the token appears in the detection AND in the parse — mutating one alone
-#       leaves the other refusing, which would make this cell vacuous (the same lesson M15
-#       records).
+# M17 — THE SHARED LITERAL, i.e. the third cycle's P1 — RE-TARGETED BY THE FOURTH. The PARSE
+#       no longer keys on the word at all (it keys on the range SHAPE, 20h23), so `Delta:`
+#       followed by a PARSEABLE range is now refused by the shape arm and mutating the token
+#       layer leaves the cell GREEN — which is exactly how this cell first reported "mutant
+#       still refused", a vacuous cell with a real guard behind it. What the token layer
+#       ALONE still decides is a body that mentions a range in a spelling the matcher cannot
+#       read (`abc1234` is below the 12-hex floor). There, detection is the only thing that
+#       stands between the body and the bare needle: case-sensitive detection turns OFF,
+#       `_any` stays 0, and the body is accepted because it names B alone. So the vector
+#       names an UNPARSEABLE range under a capitalised token; the second replacement is gone
+#       because the shape arm removed the token's second occurrence (see 20h23).
 MUT="$(mk_mutant casetoken '[Dd][Ee][Ll][Tt][Aa][[:space:]]*:' 'delta:')"
-mk_mutant2 "$MUT" '[Dd][Ee][Ll][Tt][Aa][[:space:]]*:' 'delta:'
-mut_check "M17 a capitalised/padded delta token is refused, not fallen past" 425184 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed Delta: $DG_A1..$DG_HEAD only; no issues found."
+mut_check "M17 a capitalised token before an UNPARSEABLE range is refused, not fallen past" 425184 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed Delta: abc1234..def5678 at $DG_HEAD; no issues found."
+# M18 — THE SHAPE ARM (20h23). Restoring the WORD-keyed arm is the pre-fix state the fourth
+#       cycle found: an artifact that states a narrower range without the word `delta:` is
+#       invisible again, `_any` stays 0, no range is compared, and the bare needle accepts a
+#       body naming B. Written as an `if` because the recorder runs under `set -euo pipefail`
+#       — the terse `[ … ] && _scan=…` form returns 1 when no token is present and would abort
+#       the mutant instead of reaching the fallback it is meant to demonstrate.
+MUT="$(mk_mutant wordkeyed '_scan="$EVIDENCE_BODY"; _any=0; _all_ok=1' '_scan=""; if [ "$_delta_tok" -eq 1 ]; then _scan="$EVIDENCE_BODY"; fi; _any=0; _all_ok=1')"
+mut_check "M18 the arm keys on the RANGE SHAPE, not the word" 425190 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed only ${DG_A1}...${DG_HEAD}; no issues found."
+# M19 — THE EXHAUSTIVE SCAN (20h24). Stopping after the FIRST match is the leftmost-match
+#       behaviour the fourth cycle found: the recorded range satisfies every clause, so the
+#       narrower range the artifact actually read is never examined and the record asserts a
+#       range over commits nobody reviewed.
+MUT="$(mk_mutant firstonly '      _scan="${_scan#*"${BASH_REMATCH[0]}"}"' '      _scan=""')"
+mut_check "M19 EVERY stated range is checked, not just the first" 425192 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="delta:${DG_BASE}..${DG_HEAD} is the brief; I read delta:${DG_A1}...${DG_HEAD} only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
