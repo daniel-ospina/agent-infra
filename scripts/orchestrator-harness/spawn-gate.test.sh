@@ -1714,7 +1714,7 @@ ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $r
 # memory: the third remedy is neither "wait for load" nor "reclaim disk" (a lane must FINISH), so a
 # caller that folds it into either sends the operator to a reading that will never move.
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
+( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MEM_MIN_AVAIL_MB=999999999 \
     PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; mrc=$?
 mgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
