@@ -1437,8 +1437,8 @@ cap_wip_snapshot() {
 # it. ⛔ THE REASON IS THE CALLEE'S CONTRACT, NOT BRANCH SAFETY (review P2, round 5, PR #2975). An
 # earlier version of this note argued that pushing would "move a branch" — it would not:
 # `bg-rescue-wip.sh` builds its archive with `commit-tree` and pushes `refs/wip/<slug>`, which is NOT a
-# branch and is pushed without force (`:283-296`). The real binding constraint is the callee's own
-# `AT_RISK` rule (`bg-rescue-wip.sh:150-166`): it archives only a NON-EMPTY `git status`, so a
+# branch and is pushed without force (`:326-355`, all three push functions). The real binding constraint is the callee's own
+# `AT_RISK` rule (`bg-rescue-wip.sh:141-157`): it archives only a NON-EMPTY `git status`, so a
 # clean-but-unpushed tree makes it `exit 0` having done nothing, and it never considers `HEAD`'s own
 # commits. Teaching it to archive `HEAD`'s tree when the tree is clean is a change to the SHIPPED
 # tool's contract (and to what "a rescue" means), deliberately not made in this PR — so ask 1 stays
@@ -1493,9 +1493,9 @@ ARCHIVE_MAY_BE_PARTIAL=" — AND this archive may be PARTIAL: bg-rescue-wip.sh e
 # ⛔ AND EXIT 0 DOES NOT PROVE THE ARCHIVE'S TREE IS THE WORKTREE (fresh review, P1 — REPRODUCED, and it
 # FALSIFIED the premise this branch used to leave the `refs/wip/*` arm untouched). Round 18 argued "the
 # callee skips no paths on exit 0", so "its tree is the worktree as it was left" was left standing. That is
-# wrong, and `scripts/bg-rescue-wip.sh` shows why: `git add -A` runs first (`:182`) and on failure falls back
-# to `git add -u` with stderr DISCARDED (`:190`), then adds each `git ls-files -o` entry — i.e. UNTRACKED
-# paths only — collecting `SKIPPED` from those alone (`:192-193`). A TRACKED file git cannot read fails both
+# wrong, and `scripts/bg-rescue-wip.sh` shows why: `git add -A` runs first (`:201`) and on failure falls back
+# to `git add -u` with stderr DISCARDED (`:209`), then adds each `git ls-files -o` entry — i.e. UNTRACKED
+# paths only — collecting `SKIPPED` from those alone (`:211-212`). A TRACKED file git cannot read fails both
 # the bulk add and `add -u`, is never in the untracked sweep, and so is in NEITHER the archive NOR the
 # skipped list — `write-tree` succeeds, the push succeeds, the callee exits 0. Reproduced: a tracked,
 # modified `notes.txt` with `chmod 000` produced `rescue=refs/wip/<slug>`, exit 0, no "could NOT be
@@ -2417,7 +2417,7 @@ lane_end_next() {
       refs/wip/*)
         # ⛔ THE THIRD ARM OF THE SAME INVARIANT (review of PR #3399 round 13, P2 — REPRODUCED). `pushed`
         # is granted against the PROVEN push url, and `bg-rescue-wip.sh` writes the archive with
-        # `git push -q origin "$C:refs/wip/$SLUG"` (lines 308/313) — a PUSH, which honours
+        # `git push -q origin "$C:refs/wip/$SLUG"` (lines 328/333/354, all three push functions) — a PUSH, which honours
         # `remote.origin.pushurl`. This instruction was a FETCH through `origin`, which honours
         # `remote.origin.url`. With the two diverging (a configuration this code deliberately supports)
         # the archive lands in the push repository and the artifact's own command answers `fatal:
@@ -2788,7 +2788,7 @@ terminal_wip_rescue() {
   # ⛔ THE ROOT RULE IS THE CALLEE'S OWN, NOT A WEAKER ONE (review P2, round 4, PR #2975). The guard
   # used to be `rev-parse --git-dir`, which SUCCEEDS ANYWHERE INSIDE A REPOSITORY — a subdirectory
   # included — so it ratified a root that this code then MEASURED and handed to `bg-rescue-wip.sh`,
-  # which refuses it one layer down at its own `:96-103` (`--show-toplevel` ≠ `pwd -P`) and returns
+  # which refuses it one layer down at its own `:117-123` (`--show-toplevel` ≠ `pwd -P`) and returns
   # `rescue=FAILED`. So the pre-check could not tell a lane's worktree from a corner of one, and the
   # fleet's record said the RESCUE failed rather than the POINTER. This is the same lesson as the
   # `st_noise` fix above and as `cap_wip_snapshot` (#2045): the gate that decides whether the
@@ -3008,8 +3008,8 @@ terminal_wip_rescue() {
       # every other), it is keyed by branch slug alone, and bg-rescue-wip.sh never removes it. So an
       # EARLIER rescue of the same slug — an earlier `run_agent` for this lane, or a PEER lane on a
       # reused branch (the case named in the header) — survives a run that archives NOTHING:
-      # `bg-rescue-wip.sh:62` exits 2 at `mktemp` and `:156-161` exits 0 on "nothing at risk", both
-      # BEFORE `:247`'s update-ref. Treating mere EXISTENCE as proof made the record say "this
+      # `bg-rescue-wip.sh:81` exits 2 at `mktemp` and `:166-180` exits 0 on "nothing at risk", both
+      # BEFORE `:266`'s update-ref. Treating mere EXISTENCE as proof made the record say "this
       # worktree's work IS archived and pinned" over work that is still single-copy — the full-disk
       # path, which is exactly where the rescue matters most. So read it BEFORE, read it AFTER, and
       # only a CHANGED sha counts as an archive this run produced.
@@ -3029,10 +3029,10 @@ terminal_wip_rescue() {
       # below is a ref that exists, not a claim), and it is readable without a network round trip.
       # Reading it only when rc2 = 0 collapsed THREE callee outcomes into `FAILED` with an EMPTY ref,
       # and two of those three leave a real archive behind:
-      #   * `bg-rescue-wip.sh:363-367` — PUSHED=1 and a partial listing: the commit IS on origin under
+      #   * `bg-rescue-wip.sh:468-480` — PUSHED=1 and a partial listing: the commit IS on origin under
       #     `refs/wip/<slug>`; the skipped paths are what stays local. Reported as "could not archive/
       #     push" (false) with no ref in the ledger — a pushed ref hidden from the fleet record.
-      #   * `:384-396` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
+      #   * `:503-514` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
       #     callee prints the sha, so the ONE pointer to the archived commit was neither shown nor
       #     recorded, while the line claimed the work was only at $root.
       # So: a ref THIS RUN wrote + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box
@@ -3051,9 +3051,9 @@ terminal_wip_rescue() {
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="refs/wip/$slug"
       elif [ "$rc2" -eq 0 ] && [ "$LANE_END_TREE" = "dirty" ]; then
         # ⛔ rc2=0 DOES NOT PROVE THE CALLEE ARCHIVED NOTHING (review P2, round 5, PR #2975). Exit 0 has
-        # TWO disjoint causes: "nothing at risk" (`bg-rescue-wip.sh:157-161`, reached BEFORE any
-        # archive) and "PUSHED=1 with no skipped paths" (`:362-368`) — and the second one is reached
-        # even when the LOCAL pin failed, because the pin is GUARDED (`:246-252` prints `⚠ could not
+        # TWO disjoint causes: "nothing at risk" (`bg-rescue-wip.sh:166-180`, reached BEFORE any
+        # archive) and "PUSHED=1 with no skipped paths" (`:468-480`) — and the second one is reached
+        # even when the LOCAL pin failed, because the pin is GUARDED (`:262-271` prints `⚠ could not
         # record refs/wip-local/<slug>` and carries on). So on a `dirty` tree, whose non-empty listing
         # proves the callee's own `AT_RISK` was 1, rc2=0 means the archive IS on origin. Recording
         # `nothing` there published "nothing needed saving" over work that is on origin, and made the
