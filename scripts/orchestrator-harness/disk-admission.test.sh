@@ -1078,6 +1078,92 @@ for _fx in no-tree no-floor zero-floor; do
 done
 
 echo
+echo "── J) every suite that DRIVES the provision seam neutralises the admission (the CLASS, not the file) ──"
+# ⛔ WHY THIS ARM EXISTS (measured 2026-11-06, fresh review P1 on #3409). Arm I above is SOUND BUT
+# PARTIAL, in exactly the direction that produced a false PASS in this file's FIRST revision:
+#   • its matcher only inspects a logical command that MATCHES the lane-term pattern, so a suite that
+#     neutralises NOTHING has no such command and is INVISIBLE to it; and
+#   • its population is `"$HERE"/*.test.sh` — THIS directory — so a suite authored one level up is not
+#     even read.
+# `scripts/pr-doctor-fetch-refspec.test.sh` is that suite: it drives the REAL `wt_provision` through
+# `run_shipped_provision` and carried no neutralisation at all. Measured with a 1 GB `df` stub:
+# 23 passed / 3 failed on this head, 26 passed / 0 failed on the same stub at the base commit — while
+# arm I printed "no suite leaves a term armed". A census whose population cannot contain the defect is
+# the false-PASS shape this whole file exists against, one level up from the one it already names.
+# ⛔ "DRIVES" IS A NON-COMMENT COMMAND REFERENCE TO THE SEAM (`wt-lifecycle.sh` / `wt_provision`), NOT a
+# mention: a suite that only READS a script's text spells the OTHER files' names (`fix-one.sh`,
+# `dispatch-merge.sh`) and is deliberately not in scope — measured across this population, that
+# predicate selects the real drivers and no static-analysis suite, so widening it adds no cry-wolf.
+# The population is EXPLICIT and BOUNDED (no recursion, per the repo's search policy): the suites in
+# this directory plus the three sibling places a suite that drives this seam is authored.
+# ⛔ THREE FUNCTIONS, ONE PREDICATE EACH, AND THE CONTROLS BELOW DRIVE THE SAME ONES THE CENSUS DOES.
+# ⛔ THE NEUTRALISATION CHECK STRIPS COMMENTS TOO — MEASURED, and it is why this arm is written as awk
+# rather than a `grep`. The first revision used `grep -qE "$NEUTRAL_LANE_TERMS"` on the whole file, so
+# a suite that mentioned the four terms in PROSE satisfied it: mutating the real export in
+# `pr-doctor-fetch-refspec.test.sh` into a `# [MUTANT] …` comment left the arm GREEN, and that file's
+# own fix comment quotes the terms. A census a comment can satisfy is the same false-PASS one level
+# down. Arm I already strips prose for exactly this reason; this arm must not undo it.
+provision_drives_seam() { # <file> -> 0 when a NON-COMMENT command references the seam
+  [ -f "$1" ] || return 1
+  awk '/^[ \t]*#/ { next } /wt-lifecycle\.sh|wt_provision/ { found = 1; exit } END { exit(found ? 0 : 1) }' "$1"
+}
+provision_has_neutralisation() { # <file> -> 0 when a NON-COMMENT line carries the lane terms
+  [ -f "$1" ] || return 1
+  awk -v PAT="$NEUTRAL_LANE_TERMS" '/^[ \t]*#/ { next } $0 ~ PAT { found = 1; exit } END { exit(found ? 0 : 1) }' "$1"
+}
+provision_neutralisation_offenders() { # <file>... -> each file that DRIVES the seam and neutralises NOTHING
+  local f
+  for f in "$@"; do
+    provision_drives_seam "$f" || continue
+    provision_has_neutralisation "$f" || printf '%s\n' "$f"
+  done
+}
+# Arm I owns "all four terms"; this arm owns "any neutralisation at all, in a suite that drives the
+# seam". A file must not be double-reported: one that neutralises INCOMPLETELY is arm I's red already.
+_drv_pop=( "$HERE"/*.test.sh "$HERE"/../*.test.sh "$HERE"/../../tests/*/run.sh "$HERE"/../../pi-bootstrap/tests/*.sh )
+_ounneut="$(provision_neutralisation_offenders "${_drv_pop[@]}")"
+[ -z "$_ounneut" ] \
+  && ok "J) every suite that DRIVES the provision seam carries the disk neutralisation — a suite that drives wt_provision without it measures THIS HOST's free space" \
+  || bad "J) a suite DRIVES the provision seam (wt-lifecycle.sh / wt_provision) but carries NO disk neutralisation, so it is decided by the host's free space:
+$_ounneut
+  remedy: add 'export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0' (all four terms — TREE defaults to 350 MB when unstated)"
+# NON-VACUITY: the population must actually contain drivers. An empty or shrunken population makes the
+# arm above pass by having nothing to inspect — the same trap arm I's floor exists for.
+_ndrv=0
+for _f in "${_drv_pop[@]}"; do
+  provision_drives_seam "$_f" && _ndrv=$((_ndrv + 1))
+done
+[ "$_ndrv" -ge 3 ] \
+  && ok "J) …and the census saw $_ndrv suite(s) driving the provision seam (floor 3 — an empty population is not a clean population)" \
+  || bad "J) only $_ndrv suite(s) driving the provision seam seen, floor 3 — the population or the predicate stopped matching, so the arm above is vacuous"
+# POSITIVE AND NEGATIVE CONTROLS, driving the SAME functions the census uses. The fixtures are written
+# with the term names spelled from the variables above rather than copied literally, so a literal
+# incomplete export never appears in this file's own source (that would be a TRUE positive against
+# arm I — correctly, and unhelpfully).
+mkdir -p "$T/drv"
+printf 'WTL="$HERE/wt-lifecycle.sh"\n' > "$T/drv/drives.test.sh"
+printf 'WTL="$HERE/wt-lifecycle.sh"\n# %s\nexport %s\n' "$_terms4" "$_terms4" > "$T/drv/drives-neut.test.sh"
+printf 'WTL="$HERE/wt-lifecycle.sh"\n# %s\n' "$_terms4" > "$T/drv/drives-prose.test.sh"
+printf '# wt_provision "$REPO" "$WT" "$BR"\necho static-analysis-only\n' > "$T/drv/mentions.test.sh"
+if [ -z "$(provision_neutralisation_offenders "$T/drv/drives-neut.test.sh")" ]; then
+  ok "J) …a suite that DRIVES the seam AND carries all four terms is NOT flagged (the census is not red on its own remedy)"
+else
+  bad "J) a correctly-neutralised DRIVER was flagged — the matcher is too broad and would be deleted, taking the real check with it"
+fi
+case "$(provision_neutralisation_offenders "$T/drv/drives.test.sh")" in
+  ?*) ok "J) POSITIVE CONTROL: a suite that DRIVES the seam and neutralises NOTHING IS flagged (the defect arm I could not see)" ;;
+  *) bad "J) POSITIVE CONTROL FAILED: an un-neutralised DRIVER was NOT flagged — the arm above proves nothing" ;;
+esac
+case "$(provision_neutralisation_offenders "$T/drv/drives-prose.test.sh")" in
+  ?*) ok "J) POSITIVE CONTROL: a DRIVER that mentions the four terms only in PROSE is still flagged — a comment is not a neutralisation (this arm's first revision was blind to exactly this, measured)" ;;
+  *) bad "J) POSITIVE CONTROL FAILED: a comment quoting the terms satisfied the census — the arm is satisfiable by prose, which is the false-PASS it exists to refuse" ;;
+esac
+case "$(provision_neutralisation_offenders "$T/drv/mentions.test.sh")" in
+  '') ok "J) NEGATIVE CONTROL: a suite that only MENTIONS the seam in a comment is not a driver and is not flagged (the predicate is not a mention-matcher)" ;;
+  *) bad "J) NEGATIVE CONTROL FAILED: a comment-only mention was flagged as a driver — the predicate is a mention-matcher and would red on static-analysis suites" ;;
+esac
+
+echo
 echo "── results: $PASS passed, $FAIL failed ──"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

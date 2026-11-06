@@ -233,10 +233,17 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   if [ "$_wt_rc" = 4 ]; then
     # ── THE PRE-START DISK REFUSAL (agent-infra#3395) ─────────────────────────────────────────
     # Nothing was created and no agent ran, so the attempt is REFUNDED and the exit code is the disk
-    # gate's own (77): `adopt-fix.sh` and `chain-merge.sh` both read 77 as "waiting will not clear
-    # this — reclaim space", and folding it into a generic rc=1 (the old `exit 1` below) is the
-    # misattribution #2721 fixed for the live arm. Measured cost of NOT distinguishing it: the
-    # operator is sent to wait for a load remedy that cannot arrive.
+    # gate's own (77): `adopt-fix.sh:93` reads 77 as "waiting will not clear this — reclaim space",
+    # and folding it into a generic rc=1 (the old `exit 1` below) is the misattribution #2721 fixed
+    # for the live arm. Measured cost of NOT distinguishing it: the operator is sent to wait for a
+    # load remedy that cannot arrive.
+    # ⛔ `chain-merge.sh` IS NOT A READER OF THIS CODE (review P2, #3409 — an earlier revision of this
+    # line named it, and that pointer does not exist). `chain-merge.sh` never references `fix-one.sh`
+    # (`grep -n fix-one chain-merge.sh` → empty); its own `77` at `:261` (`disk) _cap_rc=77 ;;`) is a
+    # PRODUCER that derives a disk code from a lane's capacity-refusal RECORD, and the only lane status
+    # it INTERPRETS is `merge-one.sh`'s `rc=75` (`:500-503`) — every other code it merely propagates
+    # (`:497-510`). Named here because a rationale that points at a guard which does not exist is the
+    # same wrong-cause class this seam exists to remove, one comment over.
     echo "[fix $PR] REFUSED before creating a worktree: $WT_RESULT" >> "$L.log"
     # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review cycle 4, P2 — MEASURED). BOTH
     # pre-start arms reach rc 4 with `REFUSED-UNKNOWN`: an unreadable `df`, and a half-deployed `$O`
