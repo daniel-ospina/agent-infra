@@ -1861,7 +1861,7 @@ WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
 # Same class as the `["/tmp/evil/git", …]` bypass above (a caller-chosen program running under this
 # surface's authority), reached through a verb that IS read-only — so the verb gate cannot see it, and
 # neither can the metacharacter filter (there is no shell metacharacter in either flag).
-EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature")
+EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature", "--remerge-diff")
 # ⛔ ABBREVIATIONS ARE NOT A HOLE, AND THIS COMMENT SAID THEY WERE. `--ext-diff`/`--textconv` are
 # parsed EXACT-MATCH in git's diff.c, so `--ext`, `--ext-d`, `--textc`, `--textco` all give
 # `error: invalid option` (measured on git 2.43.0) — fail-closed, and `--text`/`--exclude-standard`/
@@ -1883,16 +1883,17 @@ EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature")
 #                                per-command form too, which `core.pager` alone does not
 #   core.hooksPath            -> a hook is a program (measured: `status` runs post-index-change)
 # ⛔ THE LIST IS DERIVED FROM GIT'S OWN `git help --config`, FILTERED TO KEYS THAT NAME A PROGRAM AND
-# TO THE VERBS `GIT_OK_VERBS` ADMITS — not from the last review finding. The program-naming keys that
-# are deliberately NOT here and why: `core.sshCommand`, `credential.helper`, `core.gitProxy`,
-# `http.proxy`, `remote.<name>.proxy`, `core.askPass` (transport/auth — reached only by fetch/push);
-# `core.editor`, `sequence.editor` (commit/rebase); `notes.rewrite.<command>` (commit/amend);
-# `gpg.ssh.defaultKeyCommand` (SIGNING; verification uses `gpg.ssh.program`, which IS pinned);
-# `filter.<driver>.clean/smudge` (checkout); `diff.external`, `diff.<driver>.command`,
-# `diff.<driver>.textconv` (the diff machinery — disarmed per-argv by GIT_HOOK_FLAGS, which also
-# covers a NEW driver a caller cannot anticipate); `completion.commands`, `rebase.abbreviateCommands`,
-# `color.pager` (not executables a read verb runs). A NEW read-only verb must be re-checked against
-# `git help --config` beside this list — that check is what keeps the enumeration honest.
+# TO THE VERBS `GIT_OK_VERBS` ADMITS — not from the last review finding. Program-naming keys that are
+# deliberately NOT here, with the reason each is out of reach: `core.editor`, `sequence.editor`
+# (commit/rebase); `notes.rewrite.<command>` (commit/amend); `gpg.ssh.defaultKeyCommand` (SIGNING —
+# verification uses `gpg.ssh.program`, which IS pinned); `diff.external`, `diff.<driver>.command`,
+# `diff.<driver>.textconv`, `diff.<driver>.cachetextconv` (the diff machinery — disarmed per-argv by
+# GIT_HOOK_FLAGS, which also covers a driver a caller cannot anticipate); `completion.commands`,
+# `rebase.abbreviateCommands`, `color.pager` (not executables a read verb runs); `gc.recentObjectsHook`,
+# `uploadpack.packObjectsHook`, `browser.<tool>.cmd`, `man.<tool>.cmd`, `difftool.<tool>.cmd`,
+# `sendemail.*Cmd`, `interactive.diffFilter` (verbs/flows `GIT_OK_VERBS` never admits).
+# ⛔ AND TWO CLASSES ARE NOT PINNABLE AT ALL — see GIT_UNPINNABLE_KEY_RE below; they are refused rather
+# than pinned. A NEW read-only verb must be re-checked against `git help --config` beside this list.
 GIT_PIN_CONFIG = (
     "core.fsmonitor=",
     "core.alternateRefsCommand=",
@@ -1903,12 +1904,39 @@ GIT_PIN_CONFIG = (
     "gpg.ssh.program=/bin/false",
     "core.pager=cat",
     "core.hooksPath=/dev/null",
+    # DEFENCE IN DEPTH for the transport axis (the CONTROL is the fail-closed pre-check below): these
+    # are the fixed-name transport/auth keys. `protocol.ext.allow=never` matters because an
+    # `ext::<program>` remote URL execs that program and does NOT go through `core.sshCommand`.
+    "protocol.ext.allow=never",
+    "core.sshCommand=/bin/false",
+    "core.gitProxy=",
+    "credential.helper=",
+    "http.proxy=",
 )
 # `--no-pager` is a GLOBAL option and the only thing that neutralises `pager.<cmd>`, which takes
 # precedence over `core.pager` PER COMMAND and cannot be enumerated.
 GIT_GLOBAL_FLAGS = ("--no-pager",)
 GIT_DIFF_VERBS = ("diff", "log", "show")
 GIT_HOOK_FLAGS = ("--no-ext-diff", "--no-textconv")
+# ⛔ THE CLASS THAT CANNOT BE PINNED, AND WHY ENUMERATING KEYS WAS THE WRONG SHAPE. These keys' names
+# are UNBOUNDED and come from the checkout itself (a driver name in `.gitattributes`, a remote name),
+# so there is nothing to write into `GIT_PIN_CONFIG`:
+#   filter.<driver>.clean|smudge|process -> runs for `status`/`diff` on ANY dirty path whose attributes
+#       name the driver, and its STDOUT becomes the blob content (so it can also forge what those
+#       verbs report). Measured: a plain `git status` in a repo with `filter.evil.clean` runs it.
+#   merge.<driver>.driver -> runs for `log`/`show --remerge-diff`. A MERGE driver, not a diff driver,
+#       so `--no-ext-diff`/`--no-textconv` do not disarm it.
+#   a PARTIAL CLONE / promisor remote turns an OBJECT READ into a LAZY FETCH, which runs the repo's
+#       TRANSPORT program: `core.sshCommand`, `remote.<name>.proxy`, or `remote.<name>.url =
+#       ext::<program>` (the last survives pinning the helpers, which is exactly why the pins alone
+#       were not a fix).
+# So the exec FAILS CLOSED: the TARGET checkout's own local config is read first
+# (`_repo_config_fault`), and if it declares any of these the call is refused with a typed refusal
+# naming the key. Adding a key to the pin list would not close this — a driver name cannot be guessed.
+GIT_UNPINNABLE_KEY_RE = re.compile(
+    r"^(filter\..+\.(clean|smudge|process)|merge\..+\.driver)$", re.IGNORECASE)
+GIT_LAZY_FETCH_KEY_RE = re.compile(
+    r"^(extensions\.partialclone|remote\..+\.promisor)$", re.IGNORECASE)
 # ⛔ A BARE ARGUMENT TO `hostname` IS THE SETTER FORM, NOT A QUERY. `hostname NAME` and
 # `hostname -F <file>` RENAME the box (`hostname --help`: `{hostname|-F file}  set host name`), and
 # `ALLOWLIST["hostname"] = ([], 1)` bounds only the COUNT — so `["hostname", "pwned-cell"]` passed this
@@ -1919,6 +1947,42 @@ GIT_HOOK_FLAGS = ("--no-ext-diff", "--no-textconv")
 HOSTNAME_OK_FLAGS = ("-a", "-A", "-d", "-f", "-i", "-I", "-s", "-y", "-V", "--version",
                      "-h", "--help")
 
+
+
+def _repo_config_fault(cmux: str, target: str) -> str:
+    """Read the TARGET checkout's own local config; refuse if it names a program we cannot neutralise.
+
+    The control for the unpinnable classes (see GIT_UNPINNABLE_KEY_RE). It asks the SAME box, with the
+    SAME program name the exec will use, so a poisoned `~/.gitconfig` on the cell is irrelevant — only
+    the checkout's own config can make a read verb spawn a program, and only for the unbounded keys.
+
+    A repo with NO local config (not a checkout, or an unreadable one) is not a fault: there is nothing
+    that could name a program. That is the fail-OPEN direction by design, because the alternative is
+    refusing every ordinary read on a box where `git config` is slow — and the keys this protects are
+    only reachable when they are DECLARED.
+    """
+    # ⛔ `--includes` IS EXPLICIT AND LOAD-BEARING. Without it an `include.path` in the checkout's
+    # config can declare `filter.<driver>.clean` in a file this read never sees, and the EXEC would
+    # still run it — measured: `git config --file <cfg> --list` prints only `include.path`, while the
+    # same read with `--includes` prints the included file's keys too.
+    got = run([cmux, "vm", "exec", "--timeout", "20", target, "--",
+               "git", "config", "--local", "--includes", "--list"], timeout=45.0, cap=200_000)
+    if got.rc != 0:
+        return ""
+    for line in (got.stdout or "").splitlines():
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if GIT_UNPINNABLE_KEY_RE.match(key):
+            return ("the target checkout's local config names a program this surface CANNOT "
+                    "neutralise (%s): a filter/merge driver is chosen by `.gitattributes`, so its "
+                    "key name cannot be pinned by a `-c` argument — the exec is refused rather than "
+                    "run with a program the repo chose" % key)
+        if GIT_LAZY_FETCH_KEY_RE.match(key) and value.strip().lower() not in ("", "false", "0", "no"):
+            return ("the target checkout declares a PARTIAL CLONE / promisor remote (%s), so an "
+                    "object read can trigger a LAZY FETCH, which runs the repo's transport program "
+                    "(`core.sshCommand`, `remote.<name>.proxy`, or a `remote.<url>` of the form "
+                    "`ext::<program>`)" % key)
+    return ""
 
 
 def _harden_argv(argv: List[str]) -> List[str]:
@@ -2034,6 +2098,18 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
     resolution = _resolve_box(cmux, box)
     payload["resolution"] = resolution
     target = resolution.get("name") or box
+    if argv[0] == "git":
+        # ⛔ FAIL CLOSED ON THE CLASS THAT CANNOT BE PINNED. See GIT_UNPINNABLE_KEY_RE: a filter or
+        # merge driver is named by the CHECKOUT, so the only defence is to read the checkout's own
+        # config and refuse. Runs before the exec, on the same box, with the same cwd.
+        fault = _repo_config_fault(cmux, target)
+        if fault:
+            payload["refused"] = "repo-config-names-a-program"
+            payload["argv"] = list(argv)
+            payload["reason"] = fault
+            return True, payload
+        # the control is part of the answer: a caller can see the pre-check ran and found nothing
+        payload["repo_config"] = "clean"
     # ⛔ THE EXECUTED ARGV IS HARDENED, AND HARDENING HAPPENS AFTER VALIDATION ON PURPOSE. `_allowlisted`
     # must bound what the CALLER sent — its `max_args` limit would otherwise be inflated by our own
     # flags, refusing or admitting on the wrong count — and the argv that actually runs is ours to

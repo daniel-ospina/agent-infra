@@ -1466,6 +1466,75 @@ def test_T_saved_work_unreadable_is_unmeasured_never_none(tmp_path):
     assert got["save_coverage"] == "normal-exit-only", got
 
 
+def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, monkeypatch):
+    """⛔ THE CLASS THAT CANNOT BE PINNED, SO IT IS REFUSED INSTEAD.
+
+    `filter.<driver>.clean` runs for `status`/`diff` on any dirty path whose `.gitattributes` names
+    the driver — measured: a plain `git status` in a repo with `filter.evil.clean` executes it, and
+    its STDOUT becomes the blob content (so it can also forge what the verb reports).
+    `merge.<driver>.driver` is a MERGE driver, reached by `show --remerge-diff`; neither is disarmed by
+    `--no-ext-diff`/`--no-textconv`. Their KEY NAMES come from the checkout, so no `-c` pin can address
+    them. And a PARTIAL CLONE turns an object read into a LAZY FETCH, which runs the repo's transport
+    program (`core.sshCommand`, `remote.<name>.proxy`, or an `ext::<program>` URL that survives pinning
+    the helpers).
+
+    So the exec reads the TARGET checkout's own config and refuses, naming the key. The cmux stub below
+    answers the pre-check with a config file and every other invocation with `ok`, so the test drives
+    the real code path rather than stubbing the check itself.
+    """
+    mod = server_mod(monkeypatch)
+    cfg = tmp_path / "gitconfig.txt"
+    argv_log = tmp_path / "argv.log"
+    cmux = stub(tmp_path, "cmux_cfg.sh",
+                "import sys, os\n"
+                "args = sys.argv[1:]\n"
+                "if 'config' in args:\n"
+                "    open(os.environ['FAKE_ARGV_LOG'], 'a').write(' '.join(args) + '\\n')\n"
+                "    sys.stdout.write(open(os.environ['FAKE_GIT_CONFIG']).read())\n"
+                "else:\n"
+                "    print('ok')\n")
+    monkeypatch.setenv("ORCH_MCP_CMUX", cmux)
+    monkeypatch.setenv("FAKE_GIT_CONFIG", str(cfg))
+    monkeypatch.setenv("FAKE_ARGV_LOG", str(argv_log))
+
+    for config, needle in (("user.email=a@b\nfilter.evil.clean=/tmp/x.sh\n", "filter.evil.clean"),
+                           ("filter.lfs.process=git-lfs filter-process\n", "filter.lfs.process"),
+                           ("merge.md.driver=/tmp/m.sh %O %A %B\n", "merge.md.driver"),
+                           ("extensions.partialClone=origin\n", "PARTIAL CLONE"),
+                           ("remote.origin.promisor=true\n", "PARTIAL CLONE")):
+        cfg.write_text(config)
+        is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
+        assert is_err, (config, payload)
+        assert payload["refused"] == "repo-config-names-a-program", (config, payload)
+        assert needle in payload["reason"], (config, payload)
+
+    # ⛔ AND THE INCLUDED FILE IS READ TOO. `include.path` can declare a filter driver in a file that a
+    # plain `--local` read never prints (measured: `git config --file <cfg> --list` shows only
+    # `include.path`; the same read with `--includes` shows the included keys), so the pre-check must
+    # pass `--includes` — asserted on the REAL argv the stub was handed, not on the source text.
+    cfg.write_text("include.path=/tmp/inc\nfilter.evil.clean=/tmp/x.sh\n")
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
+    assert payload["refused"] == "repo-config-names-a-program", payload
+    assert argv_log.exists(), "the pre-check never ran"
+    precheck = argv_log.read_text().strip().splitlines()[-1].split()
+    assert "--includes" in precheck and "--local" in precheck, precheck
+
+    # a config that names NO program is fine, and the exec runs — with the pre-check REPORTED, so the
+    # caller can tell a clean pre-check from one that never ran
+    for config in ("user.email=a@b\ncore.pager=less\n", "remote.origin.promisor=false\n"):
+        cfg.write_text(config)
+        is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
+        assert payload.get("refused") is None, (config, payload)
+        assert payload["rc"] == 0, (config, payload)
+        assert payload["repo_config"] == "clean", (config, payload)
+
+    # a NON-git program never pays the pre-check (the stub would have printed the config)
+    cfg.write_text("filter.evil.clean=/tmp/x.sh\n")
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["ls", "-l"]})
+    assert payload.get("refused") is None, payload
+    assert "filter.evil.clean" not in (payload.get("stdout") or ""), payload
+
+
 def test_T_box_exec_disables_the_program_git_config_can_name():
     """[P1, review] A fully-allowlisted `git diff` still runs `diff.external` FROM CONFIG, with no flag.
 
@@ -1514,8 +1583,11 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     # abbreviations are `invalid option` IN GIT (measured) — so no stem rule is needed, and none is
     # applied (an earlier revision refused every `--ex…` and thereby FALSE-BLOCKED the bounded-search
     # primitive `git ls-files --others --exclude-standard`, which is pinned allowed below).
-    for tok in ("--ext-diff", "--textconv", "--show-signature"):
+    for tok in ("--ext-diff", "--textconv", "--show-signature", "--remerge-diff"):
         assert mod._allowlisted(["git", "diff", tok])[0] is False, tok
+    # the transport axis is pinned as defence in depth (the CONTROL is the fail-closed pre-check)
+    assert "protocol.ext.allow=never" in mod.GIT_PIN_CONFIG
+    assert "core.sshCommand=/bin/false" in mod.GIT_PIN_CONFIG
     for argv in (["git", "ls-files", "--others", "--exclude-standard"],
                  ["git", "ls-files", "--exclude=*.pyc"],
                  ["git", "log", "--extended-regexp", "--grep=one"],
