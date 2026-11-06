@@ -5164,7 +5164,9 @@ follow-up this change does not do.
 Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
 the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real
 worktree; `free == need` → admitted; `free - 1` → refused; an unreadable probe → `REFUSED-UNKNOWN`;
-and the verb prints `REFUSED-DISK(free=3.5GB, need=8.0GB, box=cell-3)` verbatim.
+and the verb prints the token #3395 specifies, prefixed exactly as the suite asserts it:
+`REFUSED-DISK(free=3.5GB, need=8.0GB, box=cell-3; free_mb=3584, need_mb=8144)` — the raw mebibytes
+ride along on purpose (one decimal of GiB cannot separate `free == need` from `free == need - 1`).
 
 
 ### 7.3 The harness is unversioned (this directory is the remedy)

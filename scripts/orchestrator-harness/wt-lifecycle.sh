@@ -341,14 +341,21 @@ wt_disk_admit() {
     if ! command -v disk_admit >/dev/null 2>&1; then
         # ⛔ SANITISE THE HOSTNAME FALLBACK TOO (review cycle 10, P2 — MEASURED). `disk_box_id`
         # REPLACES an illegal box id with UNIDENTIFIED (`spawn-gate.sh`), but this arm cannot call it —
-        # by definition `spawn-gate.sh` is the file that is MISSING — so it used a bare `hostname -s`
+        # by definition `spawn-gate.sh` is the file that is MISSING or TOO OLD to carry the predicate —
+        # so it used a bare `hostname -s`
         # and emitted a nodename containing a space or a comma verbatim, splitting `box=` into two
         # tokens in a line whose contract says that cannot happen, and stashing it in `WT_RESULT`,
         # which all three callers quote into their own logs. Same rule, applied inline: an id with a
         # character outside the legal set is REPLACED, never printed raw, and never merely defaulted.
         _wtl_box="$(hostname -s 2>/dev/null || printf '')"
         case "$_wtl_box" in ''|*[!A-Za-z0-9._:-]*) _wtl_box="UNIDENTIFIED" ;; esac
-        WT_RESULT="REFUSED-UNKNOWN disk-admit(free=?, need=?, box=$_wtl_box): ${WTL_DIR:-<unresolved>}/spawn-gate.sh is missing, so the ONE disk predicate cannot be loaded and this worktree's headroom CANNOT be verified — refusing to create $path on an unverifiable volume. Nothing was created (fail-closed; a box whose state dir is missing the disk gate cannot be trusted to have room)"
+        # ⛔ NAME BOTH CAUSES (review, P2 — MEASURED). This arm is reached whenever `disk_admit` is not
+        # callable, which is NOT the same state as "the file is absent": a `spawn-gate.sh` that PREDATES
+        # #3395 defines `disk_free_mb` and still has no `disk_admit`, so a `[ -f ]` probe says the file is
+        # there. Saying "is missing" sent the operator to a check a stale-but-present file PASSES, i.e. the
+        # #2721 wrong-cause class this seam exists to remove, one file over. A depth-1 `cp` that drops a
+        # file and discards its rc is a documented real mechanism (README §7.2e, cloud-cell-quiesce.sh).
+        WT_RESULT="REFUSED-UNKNOWN disk-admit(free=?, need=?, box=$_wtl_box): ${WTL_DIR:-<unresolved>}/spawn-gate.sh is missing OR PREDATES the disk predicate (it does not define disk_admit), so the ONE disk predicate cannot be loaded and this worktree's headroom CANNOT be verified — refusing to create $path on an unverifiable volume. Nothing was created (fail-closed; a box whose state dir is missing the disk gate, or carries a copy too old to define it, cannot be trusted to have room)"
         wt_log provision "$WT_RESULT"
         return 1
     fi
