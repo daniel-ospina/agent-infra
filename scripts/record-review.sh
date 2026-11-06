@@ -1626,13 +1626,74 @@ $m"
     # of A (it reviewed more than this delta needs), never one that starts below it.
     body_claim=0
     stated_from=""; stated_to=""
+    # ⛔ THE SCANNED FORM IS `_claim`, NOT THE RAW BODY, AND BOTH ARMS READ IT (seventh review
+    # cycle, P2 — the fix below was applied to the authored arm only, so the merge-only arm's
+    # "names A" needle was still satisfied by a kill-table ROW naming A: a `## MUTATION
+    # ATTRIBUTION` table is mandatory in every fresh clean artifact (#3442) and its rows quote
+    # shas as a matter of course, so the arm's own premise — "the table cannot be the statement
+    # the record relies on" — was false for exactly the shape #3442 mandates. Hoisted here so
+    # there is ONE scanned form and no second reading of the body to keep in step.)
+    # ⛔ THE SCAN EXCLUDES THE #3442 KILL TABLE, AND NOTHING ELSE (sixth review cycle, P2):
+    # `## MUTATION ATTRIBUTION` is MANDATORY in every fresh clean artifact and its rows quote
+    # ranges and shas as a matter of course — a row describing a mutant "pinned to A1..B" was
+    # compared as if it were the reviewer's own claim, so a CORRECT artifact was refused
+    # because of its kill table. The claim lives in the prose; the kill table is not a claim
+    # about what was reviewed.
+    # ⛔ THE EXCLUSION IS THE BLOCK ITSELF, NOT THE REGION AFTER IT (seventh review cycle, P1 —
+    # MEASURED on the sixth cycle's version, which ended the skip only at the next `## `
+    # heading: a narrowing written under a `### ` sub-heading after the table — e.g. "### Scope
+    # caveat / I only actually reviewed A1..HEAD" — was excluded from the claim, so the decoy
+    # `delta:BASE..HEAD` above it satisfied every check and a signed `clean` was minted over a
+    # commit the artifact said was not read. The exclusion skipped prose that was never part of
+    # the table, which is the `## `-vs-`###` distinction the header of brief-gate.sh's own
+    # parser documents.) The block now ends at its LAST table row — plus a trailing blank or
+    # `NO NEW ASSERTIONS:` line — so everything after it is scanned again, closing the false
+    # pass AND the mirror false block (a body whose only range statement follows the table used
+    # to be refused as "does not STATE the range").
+    # ⛔ AND THE BODY ARRIVES `@tsv`-ESCAPED — GitHub delivers a comment as ONE record with
+    # literal `\n` sequences, so a line-oriented scan sees no line starts at all and the block
+    # was never stripped (MEASURED: the kill table's own row was compared as the claim and
+    # refused a correct artifact instead of being excluded). This is the identical defect
+    # #3442's own parser paid for and documents; un-escaping FIRST is what makes the strip
+    # work, and it is also what lets a range split across a line break be seen. `gsub(/\\n/,
+    # "\n")` is awk rather than sed because BSD and GNU sed disagree about `\n` in a
+    # replacement and this file runs on both.
+    _claim="$(printf '%s\n' "$EVIDENCE_BODY" | command awk '
+      { rec = rec $0 "\n" }
+      END {
+        gsub(/\\n/, "\n", rec)
+        n = split(rec, L, "\n")
+        h = 0
+        for (i = 1; i <= n && h == 0; i++)
+          if (L[i] ~ /^##[[:space:]]+MUTATION[[:space:]]+ATTRIBUTION/) h = i
+        if (h == 0) { for (i = 1; i <= n; i++) print L[i]; exit }
+        # the block = its heading through the LAST table row before the next `## ` heading
+        last = 0
+        for (i = h + 1; i <= n; i++) {
+          if (L[i] ~ /^##[[:space:]]/) break
+          if (L[i] ~ /^[[:space:]]*[|]/) last = i
+        }
+        stop = h
+        if (last > 0) {
+          stop = last
+        } else {
+          # no table: the line form (`NO NEW ASSERTIONS: …`) is the whole block
+          for (i = h + 1; i <= n; i++) {
+            if (L[i] ~ /^[[:space:]]*$/) { stop = i; continue }
+            if (L[i] ~ /^[[:space:]]*NO NEW ASSERTIONS/) { stop = i; continue }
+            break
+          }
+        }
+        for (i = 1; i <= n; i++) if (i < h || i > stop) print L[i]
+      }
+    ' 2>/dev/null || true)"
     if [ "$DELTA_KIND" = "merge-only" ]; then
       # ⛔ A VERDICT AT A CANNOT NAME B — B did not exist when it was written. The
       # merge-only range's authored content is nil by construction (`--not $base_sha`
       # proved it) and `verify_review_evidence "$cover" "$anchor"` already ties the
       # artifact to A, so naming A IS the claim. Demanding B made the remedy printed
       # below unreachable for exactly the ordering this feature exists for.
-      case "$EVIDENCE_BODY" in
+      case "$_claim" in
         *"$from"*) body_claim=1 ;;
         *"${from:0:12}"*) body_claim=1 ;;
       esac
@@ -1702,37 +1763,8 @@ $m"
     #     stated range is checked and ALL must pass.
     # A body that states no range at all used to fall to the bare needle (a match on B's sha
     # alone). THAT FALLBACK IS GONE FOR AN AUTHORED RANGE — see the refusal below.
-    # ⛔ THE SCAN READS THE **CLAIM**, NOT THE WHOLE ARTIFACT (#3442 block excluded). Sixth
-    # review cycle, P2: `## MUTATION ATTRIBUTION` is MANDATORY in every fresh clean artifact
-    # (agent-infra#3442) and its rows quote ranges and shas as a matter of course — a row
-    # describing a mutant "pinned to A1..B" was compared as if it were the reviewer's own
-    # claim, so a CORRECT artifact was refused because of its kill table. The claim lives in
-    # the prose; the kill table is not a claim about what was reviewed. (The converse — a
-    # narrowed claim hidden inside the table — is not a hole, because the table cannot be the
-    # statement the record relies on: the rule below requires the CLAIM to state the range.)
-    # ⛔ AND THE BODY ARRIVES `@tsv`-ESCAPED — GitHub delivers a comment as ONE record with
-    # literal `\n` sequences, so a line-oriented scan sees no line starts at all and the block
-    # was never stripped (MEASURED: the kill table's own row was compared as the claim and
-    # refused a correct artifact instead of being excluded). This is the identical defect
-    # #3442's own parser paid for and documents; un-escaping FIRST is what makes the strip
-    # work, and it is also what lets a range split across a line break be seen. `gsub(/\\n/,
-    # "\n")` is awk rather than sed because BSD and GNU sed disagree about `\n` in a
-    # replacement and this file runs on both.
-    _claim="$(printf '%s\n' "$EVIDENCE_BODY" | command awk '
-      { rec = rec $0 "\n" }
-      END {
-        gsub(/\\n/, "\n", rec)
-        n = split(rec, L, "\n")
-        skip = 0
-        for (i = 1; i <= n; i++) {
-          if (L[i] ~ /^##[[:space:]]/) {
-            skip = (L[i] ~ /^##[[:space:]]+MUTATION[[:space:]]+ATTRIBUTION/)
-            if (skip) continue
-          }
-          if (!skip) print L[i]
-        }
-      }
-    ' 2>/dev/null || true)"
+    # (`$_claim` — the body with the #3442 kill table excluded, computed above so the
+    # merge-only arm reads the same form — is what the two scans below consume.)
     _scan="$_claim"; _any=0; _all_ok=1
     while [[ "$_scan" =~ ([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; do
       _any=1
@@ -1813,13 +1845,28 @@ $m"
     # the narrowing is invisible. MEASURED on the previous head: `delta:BASE..HEAD` followed
     # by `Reviewed only A1–HEAD` recorded rc 0 with delta_range=BASE..HEAD.
     # So the rule no longer asks what the notation IS; it asks what the artifact MEANS. Every
-    # 7-40 hex run in the claim that RESOLVES to a commit must be this range's head or an
-    # ancestor of its start (`from`): those are exactly the commits a reviewer covering
-    # A..B may name — the endpoints of the accepted range satisfy it by construction, and
-    # anything later than A is a narrowing in whatever notation it was written. Unresolvable
-    # runs are prose, not commits, and are ignored (a sha that is not in this repo cannot
-    # narrow this range). Alphabet-independent, abbreviation-length-independent, and it does
-    # not need to know the word "through".
+    # 7-40 hex run in the claim that RESOLVES to a commit must be this range's head, an
+    # ancestor of its start (`from`), or on an UNRELATED lineage: those are the commits a
+    # reviewer covering A..B may name — the endpoints of the accepted range satisfy it by
+    # construction, and a commit LATER than A is refused as a narrowing in whatever notation it
+    # was written. Unresolvable runs are prose, not commits, and are ignored (a sha that is not
+    # in this repo cannot narrow this range). Alphabet-independent,
+    # abbreviation-length-independent, and it does not need to know the word "through".
+    # ⛔ THE UNRELATED-LINEAGE HALF IS NOT SLACK, IT IS THE BOUND OF THE RULE (seventh review
+    # cycle, P2 — MEASURED: the sixth cycle refused a commit reachable from NEITHER endpoint, so
+    # an artifact quoting another PR's sha, or a base tip that is not in this branch's history,
+    # was refused for a commit that cannot narrow A..B at all — a false block whose only remedy
+    # is the full re-review this feature exists to avoid). Only a commit that is LATER than A
+    # can be a narrowing endpoint; anything else is a subject of prose.
+    # ⛔ DECLARED RESIDUAL, stated rather than half-closed: a commit INSIDE the range (B's
+    # ancestors after A, including a base-side commit a forward merge brought in) is STILL
+    # refused when the claim names it, even in an innocent reference like "the base advanced to
+    # <sha>". Telling a reference from a narrowing endpoint by what surrounds it means
+    # enumerating notations (a list of shas and `A1–HEAD` have the same shape), which is the
+    # spelling-enumeration failure this arm was written to end — six rounds of it are recorded
+    # above. The rule is therefore conservative in the FAIL-CLOSED direction, the refusal names
+    # the offending commit so the fix is one re-reading of the claim, and a false `clean` over
+    # commits nobody read is not the alternative on offer.
     _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{7,40}' | command tr 'A-F' 'a-f' | command sort -u || true)"
     for _tok in $_toks; do
       _tsha="$(delta_git "$root" rev-parse --verify "${_tok}^{commit}" 2>/dev/null || true)"
@@ -1828,8 +1875,14 @@ $m"
       _r=0
       delta_git "$root" merge-base --is-ancestor "$_tsha" "$from" 2>/dev/null || _r=$?
       [ "$_r" -eq 0 ] && continue
-      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — neither ${to:0:12}… (the head being attested) nor an ancestor of ${from:0:12}… (the range's start). That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
-      echo "   → the claim must name ONE range, ${from:0:12}…..${to:0:12}…, and name no commit later than ${from:0:12}…; quote it as delta:${from:0:12}..${to:0:12}." >&2
+      # Not A and not reviewed history. Only a LATER commit can narrow this range; a commit on
+      # an unrelated lineage (another PR's head, a base tip this branch does not carry) cannot,
+      # and refusing it would be a false block over prose.
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$from" "$_tsha" 2>/dev/null || _r=$?
+      [ "$_r" -eq 0 ] || continue
+      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — LATER than ${from:0:12}… (the range's start) and not ${to:0:12}… (the head being attested). That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
+      echo "   → the claim must name ONE range, ${from:0:12}…..${to:0:12}…, and name no commit later than ${from:0:12}…; quote it as delta:${from:0:12}..${to:0:12}, and refer to commits INSIDE the range by description rather than by sha." >&2
       return 1
     done
     # ⛔ AND A RANGE STATED RELATIVE TO THE TIP IS ALWAYS NARROWER THAN THE RANGE BEING
