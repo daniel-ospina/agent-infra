@@ -339,6 +339,48 @@ ck "…and a hostile hostname is REPLACED with UNIDENTIFIED, not printed raw ('b
 case "$SOUT2" in *'box=cell'*|*'box=cell '*) rc=1 ;; *) rc=0 ;; esac
 ck "…and the raw nodename never reaches the line" $rc
 
+# ⛔ THE THIRD PRODUCER OF `REFUSED-UNKNOWN` IS DRIVEN TOO (review cycle 11, P2 — MEASURED). THREE
+# arms reach rc 4 carrying `REFUSED-UNKNOWN`, and ALL THREE callers select their operator remedy from
+# that token (`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`), so a producer nobody exercises is a
+# verdict free to silently regress to `REFUSED-DISK` — the #2721 wrong-cause class, arriving through
+# the fallback. Arm D pins `spawn-gate.sh`'s unreadable-`df` arm and arm G pins the
+# missing-`spawn-gate.sh` arm; THIS one pins `wt_disk_admit`'s "refused without naming its numbers"
+# fallback, which no arm executed at all (the suite mentioned it only in prose). MEASURED before this
+# arm: reverting that one token to `REFUSED-DISK` on a copy left the suite at 88 passed / 0 failed.
+# The stub is the ONLY way that branch runs — a `disk_admit` that REFUSES without setting
+# `DISK_ADMIT_LINE` — and `disk_box_id` is stubbed so the arm never reads this host.
+mkdir -p "$T/noname"
+cp "$WTL" "$T/noname/wt-lifecycle.sh"
+_drive_noname() { # <wt-lifecycle-copy> -> "rc=<n>" + the WT_RESULT the seam produced
+  ( cd "$REPO" && bash -c '
+      disk_admit() { DISK_ADMIT_LINE=""; return 77; }
+      disk_box_id() { printf "cell-9"; }
+      . "$1" || exit 99
+      wt_disk_admit "$2" "$2/.worktrees/noname-tm"
+      printf "rc=%s\n%s\n" "$?" "$WT_RESULT"
+    ' _ "$1" "$REPO" 2>&1 )
+}
+NOUT="$(_drive_noname "$T/noname/wt-lifecycle.sh")"
+case "$NOUT" in *'rc=1'*) rc=0 ;; *) rc=1 ;; esac
+ck "wt_disk_admit REFUSES when disk_admit refuses without naming its numbers ($(printf '%s' "$NOUT" | head -1))" $rc
+case "$NOUT" in *'REFUSED-UNKNOWN(free=?'*) rc=0 ;; *) rc=1 ;; esac
+ck "…and names it REFUSED-UNKNOWN(free=?), never REFUSED-DISK, so an UNMEASURED refusal is not reported as a full disk" $rc
+case "$NOUT" in *'box=cell-9'*) rc=0 ;; *) rc=1 ;; esac
+ck "…and takes the box id from the ONE sanitiser (disk_box_id), not a private hostname read" $rc
+# NON-VACUITY, driven through the SAME runner: reverting that token to `REFUSED-DISK` on a COPY must
+# red the two arms above. The shipped file is untouched (the arm G idiom).
+sed 's/REFUSED-UNKNOWN(free=?, need=?/REFUSED-DISK(free=?, need=?/' \
+  "$WTL" > "$T/noname/wt-lifecycle-mut.sh"
+if cmp -s "$WTL" "$T/noname/wt-lifecycle-mut.sh"; then
+  bad "G2) the mutation did not change the copy — this non-vacuity proof proves nothing (the sed matched nothing)"
+else
+  MOUT="$(_drive_noname "$T/noname/wt-lifecycle-mut.sh")"
+  case "$MOUT" in
+    *'REFUSED-UNKNOWN(free=?'*) bad "G2) the arm is VACUOUS: reverting the fallback's token to REFUSED-DISK on a copy still reads REFUSED-UNKNOWN" ;;
+    *) ok "G2) …and that arm is NON-VACUOUS: reverting the fallback's token to REFUSED-DISK on a copy IS caught" ;;
+  esac
+fi
+
 echo
 # ── H) THE CALLERS KEEP THE MAPPING (review round 1, P3: rc 4 was pinned at the seam only) ─────
 # These are SOURCE-CENSUS arms, not drives: driving dispatch-merge/fix-one/adopt-fix needs the $O + argv
