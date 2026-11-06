@@ -2659,7 +2659,15 @@ echo; echo "── (32) post_marker: a marker already present is NOT re-patched 
 awk '/^post_marker\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$SRC" > "$TMP/pm-live.sh"
 if [ -s "$TMP/pm-live.sh" ] && grep -q 'post_marker()' "$TMP/pm-live.sh"; then
   # The MUTANT is the pre-#3347 line, written the way the script spelled it.
-  sed 's#if command grep -qF -- "[$]marker" <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep -qF -- "$marker"; then return 0; fi#' \
+  # ⛔ THE FLAG IS CAPTURED, NOT HARD-CODED (2026-11-06). The mutation's SUBJECT is the producer —
+  # a pipe into a quiet `grep -q` versus the here-string — and nothing else. Pinning the flag in the
+  # search text welded a second, unrelated fact to it: when #3327/#3442 widened `-qF` to the
+  # whole-line `-qxF` in `post_marker`, this `sed` stopped matching, the "mutant" was a byte copy of
+  # the live function, and the arm went vacuous in BOTH directions — (32a) red because no `printf |`
+  # form was written, (32c) red because a byte copy recognises a present marker like the shipped
+  # code does. Capturing `(-q[x]?F)` keeps the mutant faithful to whatever spelling ships, so the
+  # next flag change cannot silently disarm it.
+  sed -E 's#if command grep (-q[x]?F) -- "\$marker" <<<"\$body"; then return 0; fi#if printf "%s\\n" "$body" | command grep \1 -- "$marker"; then return 0; fi#' \
     "$TMP/pm-live.sh" > "$TMP/pm-old.sh"
   grep -q 'printf "%s' "$TMP/pm-old.sh" \
     && pass "(32a) the pre-fix pipe form was rebuilt for the mutation arm (the mutant is real, not a no-op)" \
