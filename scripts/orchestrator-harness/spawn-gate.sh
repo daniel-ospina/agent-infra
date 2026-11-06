@@ -2035,7 +2035,7 @@ lane_end_next() {
         # `push_url=` two lines away in the same artifact names the right one. Same fix, both arms.
         printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so only the uncommitted work is local-only%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
-          "$(lane_end_push_repo)" "${LANE_END_ORIGIN:-<sha>}" "$ARCHIVE_MAY_BE_PARTIAL"; return 0 ;;
+          "$(lane_end_push_repo)" "${LANE_END_ORIGIN:-<sha>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0 ;;
       nothing)
         # ⛔ `unpushed=0` IS A MEASUREMENT ABOUT THE **LOCAL TRACKING REFS**, NOT ABOUT THE REMOTE (review of
         # PR #3399, P1 — REPRODUCED). It used to read "every commit on %s is already on a remote ref", which
@@ -2050,10 +2050,10 @@ lane_end_next() {
         # kept literally (arms N31b pin it).
         printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and only the uncommitted work is local-only%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
-          "${LANE_END_BRANCH:-<unknown>}" "$ARCHIVE_MAY_BE_PARTIAL"; return 0 ;;
+          "${LANE_END_BRANCH:-<unknown>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0 ;;
     esac
     printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the branch push recorded push=%s, which this artifact does NOT classify — it asserts neither delivery nor absence for it, so read the [lane-exit] line in the lane log before removing anything, and do NOT read the archive as the only copy of the branch%s\n' \
-      "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_PUSH:-<unset>}" "$ARCHIVE_MAY_BE_PARTIAL"; return 0
+      "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_PUSH:-<unset>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0
   fi
   # ⛔ `unpushed-only` IS NOT A DIRTY TREE (review cycle 2, finding 3 — REPRODUCED). `at_risk=0` for a
   # clean tree, so `rescue=nothing` deterministically and NO `refs/wip/<slug>` is ever created — yet this

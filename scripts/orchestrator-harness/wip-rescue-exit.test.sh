@@ -2916,6 +2916,69 @@ awk 'NR==1{print; print "  echo \"were $LANE_END_LOCAL_SCOPE — only on this di
 n55s="$(n55_scan "$N55S/spawn-gate.sh" 2>/dev/null)"
 [ "$n55s" = "0" ]; rcn55c=$?
 ck "N55c …while the SAME phrase carrying the scope is NOT counted, so the scan tests scope and not vocabulary ($n55s)" $rcn55c
+# ⛔ N56 — A PARTIAL ARCHIVE MAY NOT BE REPORTED AS THE WHOLE TREE (fresh review of PR #3399 at
+# 11c3f7cd9, P1 — REPRODUCED). `rescue=archived-local` is assigned on `rc2 != 0` + "a ref this run
+# wrote", and `bg-rescue-wip.sh` exits 2 for BOTH a PARTIAL archive and a failed push. The skipped paths
+# of a partial archive are in NEITHER `refs/wip-local/<slug>` NOR `refs/wip/<slug>`, so a remedy that
+# said "retrieve the archive … before removing" without naming that possibility told an operator to
+# remove a worktree whose unarchivable paths no archive held. All four `archived-local` remedies are
+# driven here, because the sentence is composed in four places and was wrong in all four.
+for _n56 in pushed nothing FAILED UNAVAILABLE; do
+  n56="$( bash -c '
+    . "$1"
+    LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_REF=refs/wip-local/x@abc1234
+    LANE_END_PUSH="$2"; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop; LANE_END_ORIGIN=deadbee
+    lane_end_next' _ "$GATE" "$_n56" 2>/dev/null )"
+  case "$n56" in *'may be PARTIAL'*) rcn56=0 ;; *) rcn56=1 ;; esac
+  ck "N56 …an archived-local remedy (push=$_n56) names that the archive may be PARTIAL — exit 2 is also a partial archive, and its skipped paths are in NO archive named here" $rcn56
+done
+# …and the caveat is NOT emitted where it would be a different false claim: a `clean` tree has nothing
+# at risk, so its remedy must not carry an archive-partiality warning (non-vacuity for N56).
+n56b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=clean; LANE_END_RESCUE=nothing; LANE_END_PUSH=nothing; LANE_END_UNPUSHED=0
+  LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n56b" in *'may be PARTIAL'*) rcn56b=1 ;; *) rcn56b=0 ;; esac
+ck "N56b …while a clean-tree remedy does NOT carry it, so N56 is a scoped caveat and not a constant banner [${n56b:0:60}]" $rcn56b
+# ⛔ N57 — A LISTING THAT NAMED DIRTY PATHS **AND WARNED** IS STILL AN INCOMPLETE WALK (fresh review at
+# 11c3f7cd9, P1 — REPRODUCED). The classifier read `st_out` non-empty as `dirty` and never consulted
+# `st_noise`, and `lane_end_tree_caveat`'s only arm was `cannot-verify` — so `dirty` was the one verdict
+# that could NEVER carry the caveat, and the porcelain section was published as the worktree's state.
+n57="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_REF=refs/wip-local/x@abc1234
+  LANE_END_PUSH=nothing; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  LANE_END_LISTING_INCOMPLETE=1
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n57" in *'NOT PROVEN complete'*) rcn57=0 ;; *) rcn57=1 ;; esac
+ck "N57 …a dirty tree whose listing WARNED carries the incompleteness caveat — the paths the walk never saw are in neither the porcelain section nor any archive" $rcn57
+# …and the SAME dirty tree WITHOUT the flag does not, so N57 is driven by the measurement and not by `dirty`.
+n57b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=archived-local; LANE_END_REF=refs/wip-local/x@abc1234
+  LANE_END_PUSH=nothing; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  LANE_END_LISTING_INCOMPLETE=0
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n57b" in *'NOT PROVEN complete'*) rcn57b=1 ;; *) rcn57b=0 ;; esac
+ck "N57b …while the same dirty tree with a COMPLETE listing does not, so the caveat tracks the flag and not the verdict" $rcn57b
+# …and the FIXTURE half: the classifier must SET that flag for a listing that both names paths and warns.
+# Driven on a real worktree, because the flag is what the two arms above consume — asserting it there
+# would otherwise only ever test the test.
+N57W="$TMP/wtn57"; rm -rf "$N57W"
+git -C "$WT" worktree add -q "$N57W" -b incomplete57 2>/dev/null
+mkdir -p "$N57W/sub"; printf 'a\n' > "$N57W/sub/f.txt"; printf 'b\n' > "$N57W/top.txt"
+git -C "$N57W" add -A >/dev/null 2>&1; git -C "$N57W" -c user.name=t -c user.email=t@t commit -qm seed >/dev/null 2>&1
+printf 'MOD\n' >> "$N57W/top.txt"; printf 'MOD2\n' >> "$N57W/sub/f.txt"; chmod 000 "$N57W/sub"
+: > "$O/logs/n57.log"; rm -f "$O/state/lane-exit-n57.state"
+WIP_PATH="$N57W" O="$O" bash -c '
+  . "$1"
+  terminal_wip_rescue "n57" 0 0 "$2"
+' _ "$GATE" "$O/logs/n57.log" 2>>"$O/logs/n57.log.agent"
+chmod 755 "$N57W/sub" 2>/dev/null
+n57next="$(grep -m1 '^next=' "$O/state/lane-exit-n57.state" 2>/dev/null | sed 's/^next=//')"
+case "$n57next" in *'NOT PROVEN complete'*) rcn57c=0 ;; *) rcn57c=1 ;; esac
+ck "N57c FIXTURE: a REAL listing that names 'M top.txt' AND warns (chmod 000 sub/) sets the flag, so the caveat reaches an operator [$(grep -m1 '^state=' "$O/state/lane-exit-n57.state" 2>/dev/null)]" $rcn57c
 echo
 
 # ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).
