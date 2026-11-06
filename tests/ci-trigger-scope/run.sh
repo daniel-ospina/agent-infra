@@ -705,6 +705,32 @@ if apply_mutation "$PC" "$PC_DUP_IF" "$PC_GUARD_ANCHOR" \
   run_check 1 "a duplicate \`\"if\": true\` cannot hide behind the guarded \`if:\`" PC_FILE="$PC_DUP_IF"
 fi
 
+# (c2) …and WHITESPACE BEFORE THE COLON is the same key in YAML (`if :`). Requiring the colon hard
+#      against the name left the duplicate invisible to `every()`, one space away from the quoted form
+#      above, so the gate read ok/rc=0 over a job whose EFFECTIVE `if` is `True` (measured, PyYAML
+#      `True`). A key-matching rule that knows only the spellings someone wrote down repeats exactly
+#      the defect this section exists to close.
+PC_DUP_IF_SPACE="$TMP/pc-dup-if-space.yml"
+if apply_mutation "$PC" "$PC_DUP_IF_SPACE" "$PC_GUARD_ANCHOR" \
+  "$PC_GUARD_KEPT
+    if : true" \
+  "a duplicate \`if :\` must be constructible"; then
+  run_check 1 "a duplicate \`if : true\` (space before the colon) cannot hide either" PC_FILE="$PC_DUP_IF_SPACE"
+fi
+
+# (c3) …while `if:` with the guard on the NEXT line is YAML's value being exactly the guard, and must be
+#      ACCEPTED. The fold used to prepend a space to an empty first fragment, which the anchored match
+#      can never satisfy — a false block on a correctly guarded tree, in the one direction the fold was
+#      added to model. A false block is what invites loosening the guard regex, so it is pinned here.
+PC_IF_NEXTLINE="$TMP/pc-if-nextline.yml"
+if apply_mutation "$PC" "$PC_IF_NEXTLINE" "$PC_GUARD_ANCHOR" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if:
+      github.event_name != 'issue_comment'" \
+  "an \`if:\` with its value on the next line must be constructible"; then
+  run_check 0 "an \`if:\` whose guard sits on the NEXT line is ACCEPTED (same folded value)" PC_FILE="$PC_IF_NEXTLINE"
+fi
+
 # (d) The required job's OWN header carrying a trailing comment (or a quoted name) must NOT be read as
 #     "the guard is missing": that was a false block AND a misdiagnosis of a correctly guarded tree.
 PC_OWN_HEADER="$TMP/pc-own-header.yml"

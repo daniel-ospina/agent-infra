@@ -260,7 +260,11 @@ function jobKeyIs(block, key, valueRe) {
   // ⛔ The key is matched in EVERY quoting YAML permits (`if:`, `"if":`, `'if':`). Matching only the
   // bare spelling left a duplicate written `"if": true` invisible to `every()` — PyYAML confirms that
   // is the value the workflow evaluates — so the gate read green over an `if: true`.
-  const ownRe = new RegExp(`^${keyIndent}(?:"${key}"|'${key}'|${key}):`);
+  // ⛔ …AND YAML ALSO PERMITS WHITESPACE BEFORE THE COLON (`if :`), which is the SAME key. Requiring the
+  // colon hard against the name left a duplicate `if : true` invisible to `every()` — one space away
+  // from the quoted duplicate this list already closes — so the gate read ok/rc=0 over a job whose
+  // effective `if` is `True` (measured, PyYAML confirms `True`).
+  const ownRe = new RegExp(`^${keyIndent}(?:"${key}"|'${key}'|${key})\\s*:`);
   // ⛔ And the VALUE is the YAML-FOLDED scalar, not the first line. A plain scalar continues on any
   // following line indented deeper than the key, so
   //
@@ -282,7 +286,11 @@ function jobKeyIs(block, key, valueRe) {
       const l = lines[j];
       if (l.trim() === "" || /^\s*#/.test(l)) continue;
       if (l.length - l.trimStart().length <= keyIndent.length) break;
-      value += " " + l.trim();
+      // No separator when the key's own line carried no value: a leading space can never match the
+      // anchored `wholeRe` below, so `if:` with the guard on the NEXT line — YAML's value being exactly
+      // the guard — was a FALSE BLOCK on a correctly guarded tree (measured: rc=1, YAML
+      // `"… != 'issue_comment'"`).
+      value += (value === "" ? "" : " ") + l.trim();
     }
     values.push(value);
   }
@@ -470,7 +478,7 @@ function checkPipelineComplianceUnchanged() {
       // present in a spelling this reader does not model sends the reader after the wrong fault, and
       // the natural repair for a wrong diagnosis is to loosen this regex, which is how a fail-open is
       // born. So the message names both possibilities.
-      `pipeline-compliance.yml declares \`${admitted.join(", ")}:\` but its \`pipeline-compliance\` JOB does not carry \`if: github.event_name != 'issue_comment'\` as a WHOLE-EXPRESSION job-level \`if:\` (either the guard is missing, or it is written in a spelling this reader does not model — only a one-line plain scalar is understood, optionally \`&&\`-narrowed, \`\${{ }}\`-wrapped or \`!cancelled()\`-prefixed). The comment trigger is admitted ONLY as a guarded pair: without that guard on the REQUIRED job the COMMENT event satisfies the repo's only required status context, so a comment — not a PR head — produces the verdict a merge is gated on. (A guard on any OTHER job does not satisfy this: \`workflow-drift\` carries its own for its own reasons.)`
+      `pipeline-compliance.yml declares \`${admitted.join(", ")}:\` but its \`pipeline-compliance\` JOB does not carry \`if: github.event_name != 'issue_comment'\` as a WHOLE-EXPRESSION job-level \`if:\` (either the guard is missing, or it is written in a spelling this reader does not model — a plain scalar is understood, on one line or FOLDED across lines, optionally \`&&\`-narrowed, \`\${{ }}\`-wrapped, \`!cancelled()\`-prefixed or carrying a trailing comment; a \`>-\`/\`|\` BLOCK SCALAR is not). The comment trigger is admitted ONLY as a guarded pair: without that guard on the REQUIRED job the COMMENT event satisfies the repo's only required status context, so a comment — not a PR head — produces the verdict a merge is gated on. (A guard on any OTHER job does not satisfy this: \`workflow-drift\` carries its own for its own reasons.)`
     );
   }
   if (extraOn.length) {
