@@ -7363,28 +7363,59 @@ PY
     # capped by `BATCH`), so in the level-holds state this is a REGRESSION against main — and
     # level-holds is precisely the state the valve exists for (review cycle 2's P1: a merge ceiling that
     # keeps refusing leaves a level holding pass after pass). So the escape GRANTS what it needs rather
-    # than announcing an action it cannot take: bounded by the room it just proved AND by `BATCH` (the
-    # batch's own sizing input), never more, and never past a slot the box does not have.
+    # than announcing an action it cannot take.
+    # ⛔ THE GRANT IS THE ALLOCATOR'S OWN ARITHMETIC, NEVER A SECOND ONE (review round 4, P2 x3). A
+    # first version of this grant used `min(BATCH, ROOM)` and was wrong three ways, each measured:
+    #   • it discarded the 2-RECORDS-PER-ISSUE factor `cascade_issue_slots` treats as load-bearing
+    #     ("ONE ISSUE COSTS TWO WORKER RECORDS … Halving is the only reading that cannot overshoot
+    #     MAX_LANES"), so `room=2, BATCH=2` granted 2 issues = up to 4 records for 2 free lanes;
+    #   • it ignored the BACKLOG, so an EMPTY queue still granted slots and recorded an escape whose
+    #     own log line named a cause that was false ("a level was HOLDING the room" — with a 0-length
+    #     backlog no level is measured at all, because the cascade block runs only when slots > 0);
+    #   • `BATCH=0` — which `is_limit` treats as a VALID limit and the startup coercion therefore keeps
+    #     — fell through `is_num 0 && [ 0 -ge 1 ]` and became 2, silently inverting the operator.
+    # So the grant is `room / 2` with a floor of 1 whenever the box has room, ceilinged by the BACKLOG,
+    # and it does not read `BATCH` at all: `BATCH` is a pacing cap, and `cascade_issue_slots` documents
+    # that it is deliberately NOT consulted for capacity. `_ecan` then decides, from what the grant
+    # actually produced, whether this pass may record an escape at all — that is what makes the log
+    # true in every state instead of only in the one the defect was reported from.
     # The withhold still keys on the ROOM (cycle 2's ruling is kept) and additionally stands down on
     # `CASCADE_UPN_UNREADABLE`, because an unreadable count must never be the condition that dispatches
     # new work — the allocator's own fail-closed rule (`CASCADE_UPN_UNREADABLE=1;
     # CASCADE_ISSUE_SLOTS=0` above). An UNSET `CASCADE_ISSUE_SLOTS` is a driver rig/older caller and is
-    # left alone, the same terse-minus rule the batch guard one place down uses.
-    if [ "${CASCADE_ROOM:-1}" -ge 1 ] 2>/dev/null && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_ISSUE_SLOTS:-1}" -le 0 ] 2>/dev/null; then
-      _egrant="${BATCH:-2}"
-      is_num "${_egrant:-}" && [ "${_egrant:-0}" -ge 1 ] 2>/dev/null || _egrant=2
-      [ "${_egrant:-0}" -le "${CASCADE_ROOM:-0}" ] 2>/dev/null || _egrant="${CASCADE_ROOM:-0}"
+    # left alone, the same terse-minus rule the batch guard one place down uses — and the GRANT TEST
+    # now spells it terse-minus too (a first version used `:-1`, which reads a SET-BUT-EMPTY value as
+    # 1, so the escape recorded a dispatch while the batch's own `${CASCADE_ISSUE_SLOTS-1}` guard
+    # errored and broke: the exact false-PASS shape this block exists to remove).
+    _egrant=0
+    if [ "${CASCADE_ROOM:-1}" -ge 1 ] 2>/dev/null && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_ISSUE_SLOTS-1}" -le 0 ] 2>/dev/null; then
+      _egrant=$(( ${CASCADE_ROOM:-0} / 2 ))
+      [ "${_egrant:-0}" -ge 1 ] || _egrant=1
+      if is_num "${CASCADE_BACKLOG:-}"; then
+        [ "${_egrant:-0}" -le "${CASCADE_BACKLOG:-0}" ] || _egrant="${CASCADE_BACKLOG:-0}"
+      fi
       CASCADE_ISSUE_SLOTS="$_egrant"
-      echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — a level was HOLDING the room (issue slots=0) while ${CASCADE_ROOM} lane(s) were free, so the escape is given the slots it spends instead of opening a path with nothing to queue into" >> "$LOG"
+      [ "${_egrant:-0}" -ge 1 ] && echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — the issue path was granted none while ${CASCADE_ROOM} lane(s) were free, so the escape spends the room `cascade_issue_slots` would have granted (room/2, backlog ${CASCADE_BACKLOG:-?}) instead of opening a path with nothing to queue into" >> "$LOG"
     fi
+    # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
+    # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
+    # backlog is empty, means the batch WILL break and nothing may be recorded.
+    _ecan=0
+    if [ -z "${CASCADE_ISSUE_SLOTS+set}" ]; then _ecan=1; fi
+    # ⛔ TERSE-MINUS, NOT `:-0` (M17 pins that spelling out of this file on purpose: `${X:-0}` reads an
+    # UNSET count as "no room", which is the refresh-scout CI red). The UNSET case is handled one line
+    # above, so this test only has to answer for a SET value.
+    if is_num "${CASCADE_ISSUE_SLOTS:-}" && [ "${CASCADE_ISSUE_SLOTS-0}" -ge 1 ] 2>/dev/null; then _ecan=1; fi
     if [ "${CASCADE_ROOM:-1}" -le 0 ] 2>/dev/null; then
       echo "[dispatch] DRAIN ESCAPE WITHHELD — the PR path is inert and the box has NO ROOM (lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?}, issue slots=0), so opening the issue path would dispatch nothing. No escape is taken and no record is written; the cascade opens the issue path by itself the moment a slot frees (owner ruling 2026-11-04)." >> "$LOG"
-    elif [ "${CASCADE_ISSUE_SLOTS:-1}" -lt 1 ] 2>/dev/null; then
-      # The ONLY state that reaches here with no slot is an UNREADABLE un-owned count: the grant above
-      # refuses to spend a slot on a measurement that did not answer, and recording the escape anyway
-      # would be the same false promise one branch over. Named as its own cause, because "NO ROOM" is
-      # false here (there IS room — the count is what could not be read).
-      echo "[dispatch] DRAIN ESCAPE WITHHELD — the un-owned PR count could not be read (CASCADE_UPN_UNREADABLE=1), so no issue slot is granted and opening the issue path would dispatch nothing. No escape is taken and no record is written; an unreadable count must never be the condition that dispatches new work." >> "$LOG"
+    elif [ "$_ecan" = "0" ]; then
+      # ⛔ NO SLOT COULD BE GRANTED, SO THERE IS NOTHING TO OPEN (review round 4, P2). Two states reach
+      # here and the old text named only the first, asserting it in the state where it is FALSE: an
+      # UNREADABLE un-owned count (the grant above refuses to spend a slot on a measurement that never
+      # answered), or an EMPTY BACKLOG (the grant is ceilinged by it, and with 0 candidates the batch
+      # queues nothing whatever the slots say). Both are named, because a log line that picks one
+      # cause it did not observe is the same false-PASS class as the record itself.
+      echo "[dispatch] DRAIN ESCAPE WITHHELD — no issue slot could be granted, so opening the issue path would dispatch nothing (issue slots=${CASCADE_ISSUE_SLOTS-0}, backlog=${CASCADE_BACKLOG:-?}, un-owned count ${CASCADE_UPN_UNREADABLE:-0}=1 means UNREADABLE). No escape is taken and no record is written." >> "$LOG"
     else
     printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
     if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
