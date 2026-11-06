@@ -711,6 +711,16 @@ case "$OUT" in
   *"ALSO failed"*) ok "wfalways: reports the retry's own outcome instead of hiding it" ;;
   *) bad "wfalways: says nothing about the retry's own failure — $OUT" ;;
 esac
+# ⛔ AND IT MUST NOT ALSO SAY THE OPPOSITE (review round 8, P2). The at-risk block's two diagnoses are
+# mutually exclusive — "retried ONCE with <cred> — it ALSO failed" and "no second credential was tried" —
+# and only the PRESENCE of each was asserted, on the arm where it belongs. Hoisting `NO_SECOND=1` (the
+# mirror of round 6's hoisted `RETRIED=1`) printed both, the second factually false on that host, with
+# the suite green. Every retried-failure arm asserts the other arm's line is ABSENT.
+case "$OUT" in
+  *"no second credential was tried"*)
+    bad "wfalways: claims NO second credential after a retry DID run — two mutually exclusive diagnoses — $OUT" ;;
+  *) ok "wfalways: does not also claim there was no second credential (the two diagnoses are exclusive)" ;;
+esac
 case "$OUT" in
   *"rescued"*) bad "wfalways: claimed a rescue that did not happen — $OUT" ;;
   *) ok "wfalways: does not claim a rescue it did not perform" ;;
@@ -741,6 +751,15 @@ WF_RETRY_LINE="$(printf '%s\n' "$OUT" | awk '/ALSO failed/ {print NR; exit}')"
 [ -n "$WF_FIRST_LINE" ] && [ -n "$WF_RETRY_LINE" ] && [ "$WF_FIRST_LINE" -lt "$WF_RETRY_LINE" ] \
   && ok "wfthenauth: the FIRST cause is printed BEFORE the retry's (line $WF_FIRST_LINE vs $WF_RETRY_LINE)" \
   || bad "wfthenauth: the retry's cause prints before the first (lines '${WF_FIRST_LINE:-none}' vs '${WF_RETRY_LINE:-none}') — the operator is sent after the wrong cause"
+# ⛔ AND THE MIRROR (review round 8, P2): a retried-failure run must not ALSO claim there was no second
+# credential. Only the PRESENCE of each diagnosis was asserted, on the arm where it belongs, so hoisting
+# `NO_SECOND=1` (the mirror of round 6's hoisted `RETRIED=1`) printed both — the second factually false
+# on that host — with the suite green.
+case "$OUT" in
+  *"no second credential was tried"*)
+    bad "wfthenauth: claims NO second credential after a retry DID run — two mutually exclusive diagnoses — $OUT" ;;
+  *) ok "wfthenauth: does not also claim there was no second credential (the two diagnoses are exclusive)" ;;
+esac
 [ -z "$(ref_of "$T/wfthenauth/origin.git" refs/wip/fix-lane-one)" ] \
   && ok "wfthenauth: nothing published, consistent with the failure" \
   || bad "wfthenauth: a ref landed while the run reported failure"
@@ -882,6 +901,26 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
     || bad "wfhelper: nothing was published"
 else
   skip "wfhelper: the osxkeychain default only exists on macOS, and this host is $(uname -s 2>/dev/null)"
+fi
+
+# ⛔ THE macOS DEFAULT IS UNCONDITIONAL — ASSERTED ON A MAC WITH NO AMBIENT TOKEN AT ALL (review round 8,
+# P2). `wfhelper` sets a token, because that is what makes the candidate ORDER observable; the cost was
+# that no Darwin-runnable arm exercised the branch in a CLEAN environment, so gating it on "a shadow
+# exists" — a plausible tidy-up, given the header's own "one rule: unshadow only when there is something
+# to unshadow" — silently removed the macOS retry for the ordinary Mac (no GH_TOKEN exported) and NO
+# host could see it: green on Linux, green in the flipped run. This arm unsets every seam and both
+# tokens and requires the retry anyway.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  try_rescue wfhelper2 wf_then_ok fix/lane-one \
+    "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN"
+  [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+    && ok "wfhelper2: on a Mac with NO ambient token and no seams, the default retry still runs (exit 0, 2 attempts)" \
+    || bad "wfhelper2: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the macOS default became CONDITIONAL on an ambient token — $OUT"
+  [ "${WHO:-}" = "plain keychain " ] \
+    && ok "wfhelper2: and it selected the keychain helper (the pre-PR behaviour, unchanged)" \
+    || bad "wfhelper2: the macOS default is no longer unconditional — attempts were: ${WHO:-none}"
+else
+  skip "wfhelper2: the osxkeychain default only exists on macOS, and this host is $(uname -s 2>/dev/null)"
 fi
 
 # ⛔ THE DOCUMENTED PRECEDENCE, PINNED (review round 2, P2). The header says the explicit helper "wins
