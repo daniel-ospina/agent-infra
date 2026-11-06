@@ -1,0 +1,30 @@
+{
+  "_ref": "refs/lanes/cmux.kreviewer-0-1793975388-p2874968-45c24562",
+  "_sha": "c672e9b421b62eba5b1394ed54908ed97a8c2087",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/mandate-preflight.St4BOy/seam3c2.log"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 4,
+  "ended_at": 1793975392,
+  "exit_code": 0,
+  "heartbeat_at": 1793975392,
+  "host": "cmux",
+  "issue": 0,
+  "kind": "reviewer",
+  "lane_id": "cmux.kreviewer-0-1793975388-p2874968-45c24562",
+  "lease_until": 1793975997,
+  "pid": 2874968,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1793975388,
+  "state": "DONE",
+  "tag": "0",
+  "worktree": "/tmp/base3481"
+}
