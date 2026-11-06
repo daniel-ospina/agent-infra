@@ -2463,6 +2463,244 @@ cmd_check_provenance() {
 }
 
 # ── check: can this cell actually run a controller? ─────────────────────────────
+# ── the provider CREDENTIAL STORE — a box that cannot answer a prompt must not print a green check ──
+# (agent-infra#2024) MEASURED 2026-11-05 on all five cells: `~/.pi/agent/auth.json` — pi's PERSISTED
+# credential store — was `{}` (2 bytes), and `cell-install.sh` deliberately does not touch it. A launch
+# that does not source `keys.env` then prints `Use /login to log into a provider via OAuth or API key`
+# and exits in ~8 s, which a launch verifier reads as "ran": seven lanes on one box each produced a
+# log of EXACTLY 304 bytes and no process, while the controller reported RUNNING and the box was idle
+# for hours. A repaired box answers from a CLEAN SHELL with `DEEPSEEK_API_KEY` unset — the store is
+# the only source that survives a launch which sources nothing.
+#
+# ⛔ READ-ONLY HERE, AND THAT IS THE DESIGN. The WRITER is `cloud-cell-bringup.sh`'s
+# check_provider_store, which materialises the store from the box's OWN `keys.env` (never from the
+# repo or a template — the decision at `pi-bootstrap/cell-install.sh:125` and
+# `extensions/auto-sync.ts:20`). A `check` that MINTED credentials would be a second writer of the
+# cell's identity, and two writers of one secret are how a repaired box and a certified box drift
+# apart. So this verb judges, and names the one command that repairs.
+#
+# ⛔ THE CONDITION IS EXACTLY "empty AND keys.env cannot repair it", and the second half is not a
+# loophole for an ambient export. A lane sources `$ENV_FILE` itself (`lane-env.sh`), so a key the file
+# carries IS a delivered credential and refusing it would be a false block; but an export that lives
+# only in an operator's shell does NOT reach a worker (tmux serves the server's environment — the
+# same rule this file already applies to AI_REVIEW_GATE_KEY), so it can neither repair the store nor
+# justify a green check.
+# The provider→variable pairs are the SAME list `cloud-cell-bringup.sh` carries, deliberately
+# duplicated for the reason that file states: both scripts are pushed STANDALONE onto a cell, with no
+# library to source. This side only READS them; adding a provider is one entry in each.
+SUP_AUTH_STORE_PROVIDERS="deepseek:DEEPSEEK_API_KEY anthropic:ANTHROPIC_API_KEY openai:OPENAI_API_KEY openrouter:OPENROUTER_API_KEY"
+
+# ── the provider CREDENTIAL STORE: what counts as a credential, in pi's OWN terms ───────────────
+# ⛔ THE ORACLE IS THE PATH A LANE TAKES. A lane boots `AuthStorage` (`core/model-runtime.js` →
+# `core/auth-storage.js`), whose `parseStorageData` is a plain `JSON.parse` inside a try/catch that
+# keeps the last snapshot: it does NOT validate entries. (`ReadOnlyAuthStorage`, which throws on any
+# invalid entry, has exactly one caller — `pi auth … --no-refresh`, an operator CLI check.) So a store
+# like `{"deepseek":{valid},"openai":false}` is one a LANE works with; refusing it would be a false
+# block, and it is reported as a warning instead.
+# ⛔ AND THE KEY-QUESTION IS read()'s: a literal key is the credential (`env` is not consulted for it),
+# `$$x`/`$!x` are ESCAPED literals, `$VAR` resolves against the ENTRY env first and then the process
+# environment, and `!command` is EXECUTED. Measured against pi on this host: `!printf %s sk-…`,
+# `$DSK` with `env.DSK`, `$$lit`, `$!lit` and a literal key with `env: null` ALL yield a usable key —
+# an earlier version called those "not a credential" and would have DESTROYED them by rewriting the
+# key. What a clean-shell lane cannot use is a `$VAR` template whose variables the entry does not
+# carry.
+# ⛔ This copy is READ-ONLY and must stay the SAME program `cloud-cell-bringup.sh` carries (there,
+# beside the only writer): one box certified from two different answers is the defect this gate
+# exists to remove. `python3` is already in this script's dependency loop.
+# NOTE the assignment form: this repo runs on bash 3.2 as well as 5.x, and bash 3.2 CANNOT parse a
+# quoted heredoc inside `$( … )` inside a double-quoted assignment (measured: "unexpected EOF while
+# looking for matching `''"). `IFS= read -r -d ''` is the portable form.
+IFS= read -r -d '' STORE_STATE_PY <<'PYEOF_STORE' || true
+
+import json, math, os, re, sys
+path, prov = sys.argv[1], sys.argv[2]
+warn = len(sys.argv) > 3 and sys.argv[3] == "warn"
+
+def emit(state):
+    """One shape of output for EVERY arm: in warn mode a list line first (empty when nothing was
+    inspected), then the state. An early exit that printed only the state made line 1 a STATE that
+    the caller read as an entry name (measured: a fresh cell logged "the pi CLI would reject
+    (empty)")."""
+    if warn:
+        print("")
+    print(state)
+    sys.exit(0)
+try:
+    with open(path, "rb") as f:
+        raw = f.read()
+except FileNotFoundError:
+    emit("empty")
+except OSError:
+    # EXISTS but cannot be READ (mode 000, an ACL, a directory). That is NOT "empty": classifying it
+    # as empty let the writer replace a store full of credentials it never saw (measured).
+    emit("unreadable")
+if not raw.strip():
+    emit("empty")
+try:
+    doc = json.loads(raw.decode("utf-8", "replace"))
+except Exception:
+    emit("unreadable")
+if not isinstance(doc, dict):
+    emit("unreadable")
+if not doc:
+    emit("empty")
+
+def nonblank(v):
+    return isinstance(v, str) and v.strip() != ""
+
+def cli_valid(c):
+    if not isinstance(c, dict):
+        return False
+    if c.get("type") == "api_key":
+        if "key" in c and c["key"] is not None and not isinstance(c["key"], str):
+            return False
+        # `env` ABSENT and `env: null` are different to pi's validator: only absent is valid.
+        return "env" not in c or (isinstance(c["env"], dict)
+                                  and all(isinstance(x, str) for x in c["env"].values()))
+    if c.get("type") == "oauth":
+        x = c.get("expires")
+        return (isinstance(c.get("access"), str) and isinstance(c.get("refresh"), str)
+                and isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x))
+    return False
+
+# ⚠️ DECLARED APPROXIMATION: this is a `$`-scan, not pi's left-to-right parser. pi treats an
+# UNRECOGNISED `${…}` as literal text, so `${DSK` (unterminated) and `${$$X}` resolve to a
+# LITERAL there and would be classified `mergeable` here (and rewritten with the real key).
+# The practical risk is nil — neither is a usable provider key — and the arm set covers every
+# shape a real key takes; a full port of `resolve-config-value` is the fix if it ever matters.
+ESCAPE = re.compile(r"\$\$|\$!")
+REF = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?")
+
+def state_for(c):
+    if c is None:
+        return "mergeable"                     # nothing here: a literal key may be written
+    if not isinstance(c, dict):
+        return "other"                          # not a shape this script will rewrite
+    t = c.get("type")
+    if t == "api_key":
+        key = c.get("key")
+        if not nonblank(key):
+            return "mergeable"                  # absent/blank/null/non-string: a lane reads no key
+        if key.startswith("!"):
+            return "other"                      # pi EXECUTES it; not judgeable offline, never rewritten
+        refs = set(REF.findall(ESCAPE.sub("", key)))
+        if not refs:
+            return "present"                     # a literal: `env` is never consulted for these
+        env = c.get("env")
+        env = env if isinstance(env, dict) else {}
+        if all(nonblank(env.get(r)) for r in refs):
+            return "present"                     # resolvable from the entry's OWN env — no process env
+        return "mergeable"                       # a clean-shell lane cannot resolve it
+    if t == "oauth":
+        # A VALID record with a blank access token is not a credential a lane can use, and it is not
+        # this script's to rewrite (it carries a refresh token) — so it is "other": not counted, not
+        # touched, and the refusal says execution is how to settle it.
+        return "present" if (cli_valid(c) and nonblank(c.get("access"))) else "other"
+    return "other"
+
+if warn:
+    bad = [k for k, v in doc.items() if not cli_valid(v)]
+    print(", ".join(bad))
+    print(state_for(doc.get(prov, None)))
+else:
+    print(state_for(doc.get(prov, None)))
+
+PYEOF_STORE
+
+# sup_provider_var <provider> — the variable `keys.env` carries that provider's key in. The four
+# explicit pairs are the fleet's own; ANY other provider derives pi's convention
+# (`<PROVIDER>_API_KEY`, upper-cased, non-alphanumerics to `_`). ⛔ DERIVED, NOT UNKNOWN: a
+# `PI_LANE_PROVIDER` of `zai` is a real fixture in this repo, and a table lookup made this verb
+# unable to judge it at all — it printed the CELL CAN RUN banner over a box with no credential.
+sup_provider_var() {
+  local prov="${1:-}" pair
+  for pair in $SUP_AUTH_STORE_PROVIDERS; do
+    [ "${pair%%:*}" = "$prov" ] && { printf '%s\n' "${pair#*:}"; return 0; }
+  done
+  [ -n "$prov" ] || return 1
+  printf '%s_API_KEY\n' "$(printf '%s' "$prov" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9\n' '_' | sed 's/_*$//')"
+}
+
+# sup_store_state <auth.json> <provider> — present | mergeable | other | empty | unreadable
+#   present    a lane's `read(<provider>)` yields a usable key
+#   mergeable  the file is sound and this provider has no usable key (none, blank/null/non-string key,
+#              or a template the entry env does not supply) — the bring-up can write a literal one
+#   other      an entry this check does not judge or replace (`!command`, an unknown type, an
+#              unusable oauth record) — execution is how to settle it, never a rewrite
+#   empty      absent file, 0 bytes, WHITESPACE ONLY, or `{}` — the measured defect
+#   unreadable the file cannot be read or is not a JSON object: a lane keeps its last snapshot (empty
+#              on a fresh process), so NO credential exists
+sup_store_state() {
+  local out
+  out="$(python3 -c "$STORE_STATE_PY" "${1:-}" "${2:-}" 2>/dev/null)" || out=""
+  [ -n "$out" ] || out="unreadable"          # the helper could not answer => cannot verify
+  printf '%s\n' "$out"
+}
+
+# sup_store_warn_other_invalid <auth.json> <provider> — report (never refuse) an entry the pi CLI
+# would reject. A LANE is unaffected (`AuthStorage` does not validate); `pi auth` is.
+sup_store_warn_other_invalid() {
+  local out bad
+  out="$(python3 -c "$STORE_STATE_PY" "${1:-}" "${2:-}" warn 2>/dev/null)" || return 0
+  bad="$(printf '%s\n' "$out" | sed -n '1p')"
+  if [ -n "$bad" ]; then
+    log_line "warn: $1 holds entr(y/ies) the pi CLI would reject ($bad) — a LANE is unaffected (it does not validate entries), but 'pi auth' is."
+  fi
+}
+
+
+# sup_env_file_carries <VAR> — 0 iff $ENV_FILE NAMES that variable AND the value it put in this shell
+# is non-blank. Both halves matter: `keys.env` naming it with an empty assignment is the whitespace
+# case this file already refuses for AI_REVIEW_GATE_KEY (an empty value shadows nothing and supplies
+# nothing), and a value the file does not carry at all is the ambient-export case above.
+sup_env_file_carries() {
+  local v
+  [ -f "${ENV_FILE:-}" ] || return 1
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?$1[[:space:]]*=" "$ENV_FILE" 2>/dev/null || return 1
+  v="$(printenv "$1" 2>/dev/null)" || v=""
+  [ -n "$(printf '%s' "$v" | tr -d '[:space:]')" ]
+}
+
+# check_provider_store <provider> — the gate. Refuses a box with NO usable stored credential and NO
+# delivered one; otherwise states which source the credential comes from (silence is how the measured
+# box read healthy for hours).
+check_provider_store() {
+  local prov="${1:-deepseek}" auth st var
+  auth="$CELL_HOME/.pi/agent/auth.json"
+  st="$(sup_store_state "$auth" "$prov")"
+  sup_store_warn_other_invalid "$auth" "$prov"
+  case "$st" in
+    present)
+      # ⛔ SAY WHAT WAS READ, NOT WHAT FOLLOWS FROM IT. This verb is read-only and has no probe, so
+      # the honest claim is about the FILE ("a lane reads the store first, so the key need not be in
+      # the environment"), never "a launch answers" — which only a call can establish.
+      log_line "ok: the provider store holds a usable '$prov' credential ($auth) — a lane reads the store FIRST, so it does not need the key in its environment"
+      return 0 ;;
+    unreadable)
+      die "$auth is not a JSON object a lane can parse (pi's storage keeps its last snapshot — empty on a fresh process — so NO credential exists), and CANNOT-VERIFY IS NOT A PASS. It is also pi's credential store: do not delete it blindly. Inspect it (it should be a JSON object such as {\"$prov\":{\"type\":\"api_key\",\"key\":\"…\"}}); if it is unusable, move it aside deliberately and re-run the bring-up, which materialises a fresh one from $ENV_FILE (agent-infra#2024)." ;;
+    other)
+      die "$auth holds a '$prov' entry this check will not judge or replace — a '!command' key it cannot execute offline, an unknown credential type, an oauth record the CLI's validator rejects (a non-string access/refresh, or a non-numeric expires), or an entry that is not a JSON object at all — for THAT last shape a lane reads NO key, so the store must be repaired by hand. For the others it may well be a WORKING credential (pi can run that command or refresh that token), and nothing here may overwrite one it cannot recreate. Verify it BY EXECUTION: env -i HOME=\$HOME PATH=\"\$PATH\" pi -p 'reply with exactly PROVIDER_OK' — if that answers, the store is fine and this is the gate declining to certify what it cannot judge; if it fails, move the file aside deliberately and re-run the bring-up (agent-infra#2024)." ;;
+  esac
+  # From here the store is sound but this provider has no usable key.
+  var="$(sup_provider_var "$prov")"
+  # ⛔ AN EMPTY STORE IS A REFUSAL WHATEVER THE PROVIDER IS CALLED. `sup_provider_var` derives the
+  # conventional variable for ANY provider, but even where it cannot, "no credential at all" leaves a
+  # lane nothing to authenticate with — and this verb's own doctrine is that CANNOT-VERIFY IS NOT A
+  # PASS. An earlier version took a `NOT VERIFIED … return 0` path here and printed CELL CAN RUN A
+  # CONTROLLER over a box with `{}` and an empty keys.env.
+  if [ -n "$var" ] && sup_env_file_carries "$var"; then
+    # Delivered by the file a lane sources itself, so the box CAN answer — refusing would be a false
+    # block. It is still stated, because the store is the durable half and the bring-up is what makes
+    # it survive a launch that sources nothing.
+    log_line "warn: the provider store has no usable '$prov' credential ($auth is $st); the key comes from $ENV_FILE instead."
+    log_line "      That IS a delivered credential — a lane sources \$ENV_FILE itself — so this is not a refusal."
+    log_line "      To make it durable (a launch that sources nothing still answers): re-run the bring-up,"
+    log_line "      which materialises the store from \$ENV_FILE: HOME=\$HOME CELL_HOME=\$CELL_HOME bash cloud-cell-bringup.sh --check"
+    return 0
+  fi
+  die "this box CANNOT ANSWER A PROMPT, so 'check' must not certify it: the provider credential store at $auth has no usable '$prov' credential ($st), and $ENV_FILE carries no ${var:-provider key} to repair it from. A lane reads the STORE first and then the environment, so with neither it exits with 'No API key found for $prov' — a ~300-byte log and no process, which a launch verifier reads as a successful launch (agent-infra#2024). FIX: put ${var:-the provider key}=<the key> in $ENV_FILE and re-run the bring-up (it materialises the store from the box's own keys.env — never from the repo or a template), then re-run this check. An ambient export is NOT a substitute: tmux serves a worker the SERVER's environment, so a key that lives only in your shell does not reach the lane."
+}
+
 cmd_check() {
   validate_scope
   [ -d "$CELL_HOME" ] && [ -w "$CELL_HOME" ] || die "HOME=$CELL_HOME missing or not writable"
@@ -2577,6 +2815,12 @@ cmd_check() {
     esac
   fi
   gh auth status >/dev/null 2>&1 || die "gh not authenticated — run cloud-cell-bringup.sh --check"
+  # ── can this box ANSWER A PROMPT? (agent-infra#2024) ─────────────────────────────────────────
+  # Placed with the other SINGLE-VALUE preconditions (gh auth, repo, disk) and before the long
+  # provisioning probes: a box whose lanes die at pi startup must be refused here, not discovered as
+  # silence after `start` has blessed it. See `check_provider_store` for the predicate and why this
+  # verb READS the store while the bring-up is the one that WRITES it.
+  check_provider_store "$lane_provider"
   # ⛔ RESOLVE THE CHECKOUT BEFORE ANYTHING READS IT. Every verdict below is about THIS repo, and an
   # unresolved $REPO used to reach `die "no git repo at "` — an error naming an empty path, for a
   # value the operator never set. assert_repo() derives it or refuses with one actionable line, and
@@ -4131,11 +4375,21 @@ cmd_status() {
     log_line "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
+  # agent-infra#2048: the claim release-when-orphaned pass (claim-reaper.sh) runs on this box's clock
+  # as a BACKGROUND job — the same shape, and the same blind spot: its exit status is discarded at
+  # the call site in orch-loop.sh. Without this line an unarmed box whose stale claims are blocking
+  # dispatch reads exactly like a healthy idle one (`lanes: 0` is both), and a pass that could not
+  # answer (exit 3, CANNOT-VERIFY) or was stopped by its bound (exit 4) is indistinguishable from a
+  # claim registry that is genuinely empty. The pass writes this file on EVERY non-zero arm.
+  if [ -f "$O/state/.claim-reap-blocked" ]; then
+    log_line "⛔ CLAIM RELEASE NOT ENFORCED — the claim reaper's last pass:"
+    sed 's/^/    /' "$O/state/.claim-reap-blocked"
+  fi
   # agent-infra#2032: the scheduled DISK reaper. Its pass record is the only place that answers
   # "did the last unattended run succeed, and how much did it free" — a failed or STALE pass is
   # therefore a ⛔ line here, never an absence that reads like health. Disk exhaustion is the second
   # reason cells stopped working: at ~97% a controller still beats and every dispatch is refused.
-  local _dr _drs _drc _dst _det cand
+  local _dr _drs _drc _dst _det cand _dr_rw _dr_dup _dr_cls_all
   _dr=""
   for cand in "${DISK_REAPER:-}" \
               "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" \
@@ -4177,12 +4431,47 @@ cmd_status() {
     # verdict added to the reaper and not taught to this reader) is printed, never swallowed.
     _dr_del="$(printf '%s\n' "$_drs" | sed -n 's/^delegate_verdict_worktree=//p' | head -1)"
     _dr_del_note() { case "${_dr_del:-}" in ''|ok|'?'|not-run|dry-run|reclaimed|idle|mixed-benign) printf '' ;; *) printf ' ⛔ worktree-delegate=%s' "$_dr_del" ;; esac; }
+    # ⛔ THE OTHER TWO CLASSES THAT CAN SAY "I COULD NOT MEASURE" (#3057 review, P2). `verdict_runner_work`
+    # and `verdict_duplicate_install` are recorded by the reaper and were printed by NOTHING: the per-class
+    # lines below named only uv/venv/worktree, so `verdict_runner_work=partial` — a census that could read
+    # some of the runner `_work` sink and not the rest — reached no operator surface at all. A field the
+    # reader does not print does not exist, which is the rule this same block already states for
+    # `delegate_verdict_worktree`.
+    # ⛔ PRINTED, NOT ALARMED, for the recorded reason stated at the reaper (`docs/ops/disk-reaper.md`):
+    # `abstained`/`partial` are rc 0 by decision and the RECORD is the alarm channel — an hourly ⛔ for a
+    # permission mismatch is the alarm-fatigue shape the ⏸ symbol below exists to avoid. The benign
+    # spellings stay silent so a healthy cell gains no noise; anything unrecognised prints (FAIL-LOUD).
+    _dr_cls_note() { # <class-kebab> <verdict>
+      local _k
+      case "${2:-}" in ''|ok|'?'|not-run) printf '' ; return 0 ;; esac
+      case "$1" in runner-work) _k=runner_work ;; duplicate-install) _k=duplicate_install ;; *) _k="$1" ;; esac
+      printf ' ⚠️ %s=%s' "$1" "$2"
+      # ⛔ ONLY `runner_work` PUBLISHES `unmeasurable_=` (#3057 review, measured): `disk-reaper.sh`
+      # writes `unmeasurable_runner_work=` and NO `unmeasurable_duplicate_install=` — the
+      # duplicate-install owner has no such field — so the generic lookup below advertised a number
+      # that class can never show. The VERDICT above is written for both and stays printed.
+      case "$_k" in runner_work) _dr_unm "$_k" ;; esac
+    }
+    # The tally that makes the verdict honest: `partial` means the census could not read all of the class's
+    # population, and the CANDIDATE COUNT beside it is a LOWER BOUND — a reader that prints `partial`
+    # without the number leaves the operator unable to tell one unreadable root from fifty. `0` and an
+    # unanswered `?` stay silent (nothing was missed, or the tally itself did not answer — the verdict
+    # already says so).
+    _dr_unm() { # <record-key-suffix>
+      local _n
+      _n="$(printf '%s\n' "$_drs" | sed -n "s/^unmeasurable_$1=//p" | head -1)"
+      case "${_n:-}" in ''|0|'?') return 0 ;; esac
+      printf ' unmeasurable=%s' "$_n"
+    }
+    _dr_rw="$(printf '%s\n' "$_drs" | sed -n 's/^verdict_runner_work=//p' | head -1)"
+    _dr_dup="$(printf '%s\n' "$_drs" | sed -n 's/^verdict_duplicate_install=//p' | head -1)"
+    _dr_cls_all="$(_dr_cls_note runner-work "${_dr_rw:-}")$(_dr_cls_note duplicate-install "${_dr_dup:-}")"
     if [ "$_drc" -eq 0 ]; then
             # ⛔ THE UNIT IS CONDITIONAL. A per-class field may read `unmeasured` (df could not answer),
             # and the old format appended a hardcoded MB to it — `uv=unmeasuredMB` reads as a byte count
             # to every consumer. Numeric values keep their unit; the sentinel is printed as it stands.
             _dr_mb() { case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}" ;; *) printf '%sMB' "$1" ;; esac; }
-            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))$(_dr_del_note)"
+            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)")${_dr_cls_all})$(_dr_del_note)"
     elif [ "$_dst" = "never" ]; then
       log_line "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
     elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
@@ -4199,10 +4488,10 @@ cmd_status() {
       # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
       # the channel here — which is why it must not go quiet.)
       log_line "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1) runner-work=${_dr_rw:-?} duplicate-install=${_dr_dup:-?}$(_dr_del_note)"
     else
       log_line "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1) runner-work=${_dr_rw:-?} duplicate-install=${_dr_dup:-?}$(_dr_del_note)"
     fi
   fi
   # the loop's own view of itself
