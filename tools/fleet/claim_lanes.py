@@ -678,11 +678,11 @@ def _commit_body(obj: str) -> str:
 
 
 # ⛔ THE SHELL'S ACCEPTANCE, EXACTLY (review round 18, agent-infra#3203). `_claim_commit_time` takes the
-# stamp with `sed -n 's/^committer .* \([0123456789]\{1,\}\) [+-][0123456789]\{4\}$/\1/p'` — NO trailing
-# whitespace before EOL — and then rejects anything longer than 12 digits as UNMEASURABLE
-# (`case … |?????????????*`). This pattern used to allow `[ \t]*$` and any length, so the same object
-# was "unmeasurable" to the oracle and a fresh/aged stamp here: one datum, two answers, in the very
-# field the bounded reap is measured from.
+# stamp from the LAST `committer `-prefixed header line (see the selection note inside `_commit_time`),
+# parses that ONE line with an ANCHORED shape — NO trailing whitespace before EOL — and then rejects
+# anything longer than 12 digits as UNMEASURABLE (`case … |?????????????*`). This pattern used to allow
+# `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and a fresh/aged stamp
+# here: one datum, two answers, in the very field the bounded reap is measured from.
 # ⛔ UNBOUNDED, BECAUSE THE ORACLE'S IS (review round 21, agent-infra#3203): `\([0123456789][0123456789]*\)`
 # matches any run, and the LENGTH rule is a SEPARATE arm below — which is why a 13+ digit stamp rejects the
 # object instead of being skipped in favour of an earlier line. A bounded quantifier here silently changed
@@ -728,35 +728,46 @@ def _commit_time(obj: str) -> Optional[int]:
     # so taking the FIRST here dated a two-header commit 1970 (age ≈ 56 years in the fleet report)
     # while the shell dated it seconds old. The age is the bounded reap's INPUT; two layers answering
     # differently about one object is the defect, whichever direction it points.
-    # ⛔ "THE LAST STAMP" MEANS THE LAST LINE THE ORACLE'S `sed` MATCHED — NOT THE LAST `committer `
-    # PREFIX (review round 21, agent-infra#3203; round 20 got this wrong and said so in a comment that was
-    # FALSE about the oracle). `_claim_commit_time` is
-    #   `sed -n '/^$/q;p' | sed -n 's/^committer .* \([0123456789][0123456789]*\) [+-][0123456789]\{4\}$/\1/p' | tail -n 1`
-    # — the capture is UNBOUNDED, so a line whose SHAPE does not match (a trailing space, a 3-digit tz) is
-    # SKIPPED and an earlier valid line WINS; only the two value guards (13+ digits, leading zero) reject
-    # the OBJECT. Round 20 selected the last `committer `-prefixed line and required the bounded regex, so
-    # a shape-broken LAST line made this reader refuse a date the oracle measures (measured: 8 of 64
-    # committer-line combinations diverged, ALL in the conservative direction). Match with an unbounded
-    # run per line, take the LAST match, then apply the guards to that value.
-    m = _COMMITTER_TIME_RE.findall(head)
+    # ⛔ SELECT THE LAST `committer` LINE FIRST, THEN PARSE IT (review round 24, agent-infra#3203).
+    # `_claim_commit_time` used to be ONE anchored `sed` piped to `tail -n 1` — "the last line that
+    # MATCHES", which this reader mirrored faithfully at the time (round 21 pinned that rule, and it
+    # was correct about the oracle THEN). Round 24 of this change split the shell's parse in two —
+    # `sed -n '/^committer /p' | tail -n 1 | sed -n 's/…$/\1/p'` — because git dates an object from its
+    # last `committer` HEADER whatever else that line carries, so a newest header with a trailing token
+    # was dropped by the `$` anchor and `tail` returned an EARLIER committer line (measured: a claim
+    # `git log --format=%ct` dates as 1 s old reaped as `1793991810s old`, i.e. the forged-age steal the
+    # whole arm exists to close). THAT REWROTE THE RULE THIS FILE MIRRORS, and mirroring the old rule
+    # afterwards is the "one datum, two answers" defect rounds 11/18/21/22/23 each treated as blocking:
+    # measured on the shipped pair, a last line with a trailing space or a 3-digit tz answers
+    # UNMEASURABLE from the oracle (rc 1 — the claim is KEPT and NAMED) and `1700000000` here, and on the
+    # forged-age shape `committer … 1700000000 +0000 junk` the oracle keeps the claim while this reader
+    # reports an age of ~1.79e9 s. So: filter to `committer `-prefixed lines, take the LAST one, and apply
+    # the anchored shape parse to that single line ONLY. A last line that does not parse makes the age
+    # UNMEASURABLE — never a silent fall-back to older text a peer wrote, which is exactly the direction
+    # the oracle refuses.
+    lines = [_l for _l in head.split("\n") if _l.startswith("committer ")]
+    if not lines:
+        return None
+    m = _COMMITTER_TIME_RE.match(lines[-1])
     if not m:
         return None
+    stamp = m.group(1)
     # ⛔ A LEADING-ZERO STAMP IS UNMEASURABLE, NOT 1970 (review round 19, agent-infra#3203).
     # `_claim_commit_time` has THREE rejection arms — no trailing whitespace, 13+ digits, and
     # `case "${ct:-}" in …|0?*` — because a leading-zero operand aborts `$(( now - ct ))` as OCTAL.
     # Rounds 17–18 aligned the first two and left this one, so the same object was "unmeasurable" to the
     # oracle and `9999` here (rendered as ~56 years of age in the fleet report while the reaper printed
     # AGE IS UNMEASURABLE). `git fast-import` writes such a stamp with no flags.
-    if m[-1].startswith("0") and len(m[-1]) > 1:
+    if stamp.startswith("0") and len(stamp) > 1:
         return None
-    if len(m[-1]) > 12:
+    if len(stamp) > 12:
         # ⛔ THE 12-DIGIT CAP, AS ITS OWN ARM (review round 21): the oracle captures an unbounded run and
         # then refuses the object when it is longer than 12, so the answer is None — NOT a fall-back to an
-        # earlier header. (A bounded regex achieved the same answer by skipping the line only because
-        # EVERY line was matched individually; unbounded capture + this guard is the faithful form.)
+        # earlier header. `\1` is unbounded in the shell's sed too; the cap is a SEPARATE arm there
+        # (`[ "${#ct}" -le 12 ]`), so it is a separate arm here.
         return None
     try:
-        return int(m[-1])
+        return int(stamp)
     except ValueError:  # pragma: no cover - the regex bounds the digits
         return None
 
