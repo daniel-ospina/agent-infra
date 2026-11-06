@@ -911,7 +911,7 @@ W_COUNT="$(grep -cE '(>>?\||>>?|tee)[[:space:]]*(-[A-Za-z]+[[:space:]]+)*"?[^"[:
 # that only knew the `> "$_rr_f"` spelling would have found no writer at all and failed the arm for
 # the safer code. Either spelling is accepted here, and the behavioural halves below (inside the
 # helper, below every refusal arm) are unchanged.
-W_LINE="$(grep -nE '^  printf .%s.n. *"\$REVIEW_ROUND" > "\$_rr_(f|new)"' "$MW" | cut -d: -f1 | head -1)"
+W_LINE="$(grep -nE '^  (\{ )?printf .%s.n. *"\$REVIEW_ROUND" > "\$_rr_(f|new)"' "$MW" | cut -d: -f1 | head -1)"
 [ -n "$W_LINE" ] || W_LINE="$(grep -n '> "\$_rr_f" 2>/dev/null' "$MW" | cut -d: -f1 | head -1)"
 R_LINE="$(grep -n '^run_agent "${REVIEW_TIMEOUT' "$MW" | cut -d: -f1 | head -1)"
 # the guarded ingress CALL — the exact line, so an appended `&& false` / `|| true` cannot satisfy it
@@ -1252,11 +1252,54 @@ case "$RR_DIR" in
   'named=1 temps=0') ok "(c4r) an UNWRITABLE counter (a directory at the path) is NAMED in the log and leaves NO temp file behind — the failure branch is reachable, so the operator is not left with a silent false REVIEW-CEILING" ;;
   *) bad "(c4r) an unwritable counter is NOT reported cleanly ($RR_DIR, expected named=1 temps=0) — a directory at state/reviewround-<PR> makes the rename move the temp INSIDE it and exit 0, so the failure group never fires: the log says nothing, a temp file is left under state/, and the next reader coerces the book to 999999999 and parks a healthy PR with a false REVIEW-CEILING rounds=999999999/10" ;;
 esac
+# ⛔ (c4s) THE MESSAGE MUST STATE THE REAL CONSEQUENCE AND A REPAIR THAT WORKS (fresh review of #3441,
+# P2). The first version of that line said "the per-PR round ceiling cannot be counted on this path (the
+# per-head budget still binds)" — which reads as an INERT bound. What actually happens is the OPPOSITE
+# and worse: both readers coerce the unreadable book to 999999999, so the next cycle PARKS the PR with
+# `REVIEW-CEILING rounds=999999999/10` and a reason claiming a spent budget nobody spent. And the state
+# had NO exit: every clear site and both printed remedies said `rm -f`, which cannot remove a DIRECTORY.
+# Three claims, each pinned: the message names the false-park consequence, it names a repair, and the
+# repair is `rm -rf`.
+RR_MSG_LINE="$(awk '/review round counter .*CANNOT BE WRITTEN/ && !/^[[:space:]]*#/' "$MERGED_ONE_SH" | head -1)"
+case "$RR_MSG_LINE" in
+  *999999999*) ok "(c4s) the write-failure message names the REAL consequence (a false REVIEW-CEILING park at rounds=999999999) instead of claiming an inert bound" ;;
+  *) bad "(c4s) the write-failure message does not name the false-park consequence — an operator reads 'the ceiling cannot be counted here' as 'the bound is inert', while both readers actually coerce the unreadable book to 999999999 and park the PR on the NEXT cycle" ;;
+esac
+case "$RR_MSG_LINE" in
+  *'rm -rf'*) ok "(c4s) …and the repair it names is rm -rf (rm -f cannot remove the DIRECTORY that is the corruption most likely to cause it)" ;;
+  *) bad "(c4s) the write-failure message names no working repair (no rm -rf) — the state it describes has no exit that the operator is told about, so a directory at the counter outlives every documented remedy" ;;
+esac
+# ⛔ (c4t) THE FAILURE PATH MUST NOT LEAK TO STDERR (fresh review of #3441, P3 — MEASURED). Redirections
+# apply LEFT TO RIGHT, so `printf … > "$_rr_new" … 2>/dev/null` CANNOT retract the shell's own
+# `Permission denied` / `No such file or directory` for that redirect: it was already printed with the
+# ORIGINAL stderr. Driven against the SHIPPED helper on both unwritable shapes.
+rrspend_stderr() { # <shape: readonly|missing> -> the bytes the helper wrote to stderr
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  case "$1" in
+    readonly) chmod 500 "$d/state" ;;   # the redirect into it must fail
+    missing)  rmdir "$d/state" ;;       # no parent at all
+  esac
+  # shellcheck disable=SC1090
+  ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; MAX_REVIEW=10
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRSPEND"
+    review_round_spend ) 2>&1 >/dev/null
+  chmod 700 "$d/state" 2>/dev/null || true
+  mv "$d" "$TMP/rrspend.err.spent.$RANDOM" 2>/dev/null || true
+}
+RR_STDERR="$(rrspend_stderr readonly)$(rrspend_stderr missing)"
+if [ -z "$RR_STDERR" ]; then
+  ok "(c4t) a failed book write leaks NOTHING to stderr on either unwritable shape (read-only state/, missing state/) — the operator gets the log line, not a bare shell error beside it"
+else
+  bad "(c4t) a failed book write LEAKS to stderr: [$(printf '%s' "$RR_STDERR" | tr '\n' ';' | cut -c1-160)] — the redirect is not grouped, so the shell prints the redirect's own error before the trailing 2>/dev/null can apply"
+fi
 # MUTANT-Q: reintroduce the truncating spelling in a COPY and require the pin above to red. Mutation
 # tested rather than asserted, because "the write is atomic" is exactly the kind of claim a later tidy
 # silently reverts while every behavioural arm stays green.
 MWQ="$TMP/mutant-nonatomic.sh"
-sed 's|> \"$_rr_new\" 2>/dev/null|> \"$_rr_f\" 2>/dev/null|' "$MERGED_ONE_SH" > "$MWQ"
+# ⛔ THE ANCHOR IS THE printf LINE ONLY (the write moved into a group, so the old
+# `> "$_rr_new" 2>/dev/null` spelling no longer exists). An unaddressed sed would ALSO rewrite the
+# `mv` line's SOURCE and the mutant would fail its own "still renames onto the counter" precondition.
+sed '/printf .%s.n. "\$REVIEW_ROUND"/s|> "\$_rr_new"|> "\$_rr_f"|' "$MERGED_ONE_SH" > "$MWQ"
 diff -q "$MERGED_ONE_SH" "$MWQ" >/dev/null 2>&1; q_rc=$?
 if [ "$q_rc" -ne 0 ]; then
   sed -n '/^review_round_spend() {/,/^}$/p' "$MWQ" > "$TMP/q-helper.sh"
@@ -1456,6 +1499,38 @@ case "$_prune" in
   *'reviewround-*'*) ok "(c4m) prune_orphan_markers sweeps state/reviewround-* like every sibling marker family" ;;
   *) bad "(c4m) prune_orphan_markers does NOT sweep state/reviewround-* — the book accumulates one file per dead PR and the documented sweep is false" ;;
 esac
+# ── (c4u) THE CORRUPTION BOTH READERS DETECT MUST HAVE AN EXIT (fresh review of #3441, P2) ────────
+# Both readers treat a NON-REGULAR book as corruption and coerce it to 999999999, which PARKS the PR.
+# A stray DIRECTORY at the path is exactly the corruption this tree's remedies name, and it is the one
+# shape `rm -f` cannot remove (`Is a directory`, rc=1) — so with `rm -f` at every clear site, the state
+# had NO exit at all: not the CLEAN-verdict clear, not MERGED/CLOSED, and not the repair the park text
+# prints. The PR stayed parked at `rounds=999999999/10` for ever. Measured before the fix: the
+# directory SURVIVED each of those clears.
+# ⛔ THE CLEAR IS DRIVEN, NOT SCANNED: `review_round_clear` is extracted from the shipped controller.
+rrclear_dir() { # -> "present|gone" for a DIRECTORY planted at the book path
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( O="$d"; . "$TMP/islimit.sh"; . "$TMP/reviewround.sh"; review_round_clear 777 )
+  if [ -e "$d/state/reviewround-777" ]; then printf 'present\n'; else printf 'gone\n'; fi
+  mv "$d" "$TMP/rrclear.spent.$RANDOM" 2>/dev/null || true
+}
+RR_CLEARED="$(rrclear_dir)"
+[ "$RR_CLEARED" = "gone" ] && ok "(c4u) a DIRECTORY standing at state/reviewround-<PR> is actually CLEARED by review_round_clear — the MERGED/CLOSED exit reaches the corruption the readers park on" \
+  || bad "(c4u) review_round_clear LEFT the directory in place — \`rm -f\` cannot remove a directory and \`|| true\` hides the failure, so a PR parked at rounds=999999999/10 never clears: not on MERGED/CLOSED, and not through the remedy the park text prints"
+# …and the CLEAN-verdict clear in merge-one.sh must use the same verb. A text pin, because that function
+# needs the rail, gh and a signed marker to run; it names the exact spelling, like (c4m) does.
+_rsc_body="$(awk '/^review_state_clear\(\) \{/{f=1} f&&!/^[ \t]*#/{print} f&&/^}/{exit}' "$MERGED_ONE_SH" | c4mc)"
+case "$_rsc_body" in
+  *'rm -rf'*'reviewround-'*) ok "(c4u) merge-one.sh::review_state_clear removes the book with rm -rf, so a converged PR whose counter became a DIRECTORY is not left permanently parked" ;;
+  *) bad "(c4u) review_state_clear does not remove the book with rm -rf — the CLEAN-verdict clear (the one exit that matters) cannot remove a corrupt non-regular book, and the PR parks for ever with a REVIEW-CEILING reason asserting a budget nobody spent" ;;
+esac
+# …and BOTH printed remedies must name a verb that works. The park texts are strings, so this is the
+# only pin available; it is worth having because the text is what an operator pastes.
+for _f in "$MERGED_ONE_SH" "$ORCH"; do
+  _park_txt="$(grep -o "rm -rf[^\"]*reviewround-[^\"]*" "$_f" | head -1)"
+  [ -n "$_park_txt" ] && ok "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)" \
+    || bad "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy does not print a working rm -rf for the book — an operator pasting it cannot clear a corrupt (directory) book, so the documented repair is inert"
+done
 
 # ── (c5) NON-VACUITY FOR THE CEILING — two mutants, because the arm makes TWO claims ──────────────
 # The issue's acceptance is explicit: a mutant that SUPPRESSES the line must redden the suite. A suite

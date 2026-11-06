@@ -367,9 +367,15 @@ review_round_spend() {
   # same false-`REVIEW-CEILING` diagnosis this atomicity exists to prevent, reached by a non-torn route.
   # `[ ! -d "$_rr_f" ]` makes that case take the failure branch, which is the half that SPEAKS.
   local _rr_new="${_rr_f}.new.$$"
-  printf '%s\n' "$REVIEW_ROUND" > "$_rr_new" 2>/dev/null \
-    && [ ! -d "$_rr_f" ] && mv "$_rr_new" "$_rr_f" 2>/dev/null \
-    || { rm -f "$_rr_new" 2>/dev/null; echo "[merge $PR] review round counter $_rr_f CANNOT BE WRITTEN — the per-PR round ceiling cannot be counted on this path (the per-head budget still binds); this review is round $REVIEW_ROUND" >> "$L.log" 2>/dev/null || true; }
+  # ⛔ THE CHAIN IS A GROUP, SO A FAILED REDIRECT'S OWN ERROR IS SUPPRESSED WITH THE REST (fresh review
+  # of #3441, P3 — MEASURED LEAK). Redirections apply LEFT TO RIGHT, so a `2>/dev/null` written AFTER
+  # `> "$_rr_new"` cannot retract the shell's own `Permission denied` / `No such file or directory`
+  # for THAT redirect: it was already printed to the failing command's stderr (measured on a read-only
+  # `state/` and on a missing one). The group puts the whole chain behind one redirection. This is the
+  # same trap this file already documents on the sibling seam, repeated here by accident.
+  { printf '%s\n' "$REVIEW_ROUND" > "$_rr_new" \
+      && [ ! -d "$_rr_f" ] && mv "$_rr_new" "$_rr_f"; } 2>/dev/null \
+    || { rm -f "$_rr_new" 2>/dev/null; echo "[merge $PR] review round counter $_rr_f CANNOT BE WRITTEN (unwritable, or a DIRECTORY stands at the path) — this review is round $REVIEW_ROUND and the book is UNCHANGED. ⛔ THE CONSEQUENCE IS A FALSE DIAGNOSIS, NOT AN INERT BOUND: both readers coerce a book they cannot read to 999999999, so the NEXT review of this PR is PARKED with REVIEW-CEILING rounds=999999999/10 and a reason claiming a spent budget nobody spent. Nothing clears that automatically — a CLEAN verdict and MERGED/CLOSED both go through a removal that a DIRECTORY defeats — so repair the path by hand: rm -rf '$O/state/reviewround-$PR' (rm -f will NOT remove a directory, and every site swallows its failure). The per-head budget still binds meanwhile." >> "$L.log" 2>/dev/null || true; }
   _rr_written=1
 }
 # The EXIT hook. Registered on the trap, so it survives TERM/INT/an unexpected death, and it is inert
@@ -1747,7 +1753,7 @@ if _rr_ceiling_hit "$_rr_now" "$_rr_max"; then
   # Exit 3 = refused BEFORE the paid step with the cause left in `parkreason-<PR>`, which is the code
   # `chain-<N>` propagates and `lane-merge.sh` already reads as BLOCKED (not 75, whose readers report a
   # capacity refusal and would tell an operator to wait for a quieter box).
-  park "REVIEW-CEILING $PR rounds=${_rr_now}/${_rr_max} head=${HEAD:-?} — the per-PR review-round budget is SPENT, so NO further review is bought at this head. This is an ESCALATION EVENT, never a pass, and it is NOT a capacity refusal: nothing was spent here and waiting will not clear it. A push does NOT re-arm this book (it is cumulative across heads); only a CLEAN verdict or the PR leaving the queue clears it. To re-arm deliberately: rm -f '$O/state/reviewround-$PR' '$O/state/parked-$PR' '$O/state/parkreason-$PR'"
+  park "REVIEW-CEILING $PR rounds=${_rr_now}/${_rr_max} head=${HEAD:-?} — the per-PR review-round budget is SPENT, so NO further review is bought at this head. This is an ESCALATION EVENT, never a pass, and it is NOT a capacity refusal: nothing was spent here and waiting will not clear it. A push does NOT re-arm this book (it is cumulative across heads); only a CLEAN verdict or the PR leaving the queue clears it. ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which BOTH readers coerce to the 9-digit ceiling on purpose. To re-arm deliberately: rm -rf '$O/state/reviewround-$PR' '$O/state/parked-$PR' '$O/state/parkreason-$PR' (rm -rf, not rm -f: a DIRECTORY at the counter survives rm -f, which is how this state used to have no exit)"
   echo "[merge $PR] REVIEW-CEILING $PR rounds=${_rr_now}/${_rr_max} head=${HEAD:-?} — refusing to buy review round $(( _rr_now + 1 )); no reviewer started and NO round was spent (direct ingress, not the controller's dispatch arm)" >> "$L.log"
   exit 3
 fi
@@ -2147,7 +2153,14 @@ review_state_clear() {
   # next, unrelated round of work — the per-PR ceiling exists to bound a loop that is NOT converging,
   # and this one converged. Kept separate from `reviewdisp` above, which restarts for a different
   # reason (the run that just ended was not verdict-less — it produced the signed marker).
-  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewround-$PR" 2>/dev/null || true
+  rm -f "$O/state/needsreview-$PR-"* "$O/state/needsfix-$PR-$HEAD" "$O/state/fixspend-$PR-$HEAD" "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" 2>/dev/null || true
+  # ⛔ THE BOOK IS REMOVED WITH `rm -rf`, NOT `rm -f` (fresh review of #3441, P2). Both readers treat a
+  # NON-REGULAR book as corruption (`-e`, coerced to 999999999), and a stray DIRECTORY at this path is
+  # the corruption this tree's own remedies name — so the CLEAN-verdict clear is the last automatic exit
+  # from that state, and `rm -f` on a directory fails (`Is a directory`, rc=1) with every site swallowing
+  # it. Measured: with `rm -f` the directory SURVIVES the clear and the PR stays parked at
+  # `rounds=999999999/10` for ever, with the printed remedy unable to clear it either.
+  rm -rf "$O/state/reviewround-$PR" 2>/dev/null || true
   echo "[merge $PR] NEEDS-REVIEW cleared: signed evidence verified at head=$HEAD" >> "$L.log"
   return 0
 }

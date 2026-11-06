@@ -1351,7 +1351,12 @@ review_round_read() { # <pr> -> n (coerced: it feeds -ge and $(( + 1 )))
 # lane that found a dead function and wired it back in would have reintroduced the round-3 defect.
 # Deleted rather than left dormant; `(c4g2)` now asserts the ABSENCE of the name, not just of calls.
 # `merge-one.sh` is the one writer; `review_round_read`/`review_round_clear` below are the readers.
-review_round_clear() { rm -f "$O/state/reviewround-$1" 2>/dev/null || true; }
+# ⛔ `rm -rf`, NOT `rm -f` (fresh review of #3441, P2). `review_round_read` treats a NON-REGULAR book as
+# CORRUPTION (`-e`, coerced to 999999999) — a stray DIRECTORY at this path is exactly the corruption
+# this tree's remedies name — so this helper is the automatic exit from that state, and `rm -f` on a
+# directory fails (`Is a directory`, rc=1) while `|| true` swallows it. Measured: with `rm -f` the
+# directory SURVIVES the MERGED/CLOSED clear, and the PR's next cycle still reads 999999999.
+review_round_clear() { rm -rf "$O/state/reviewround-$1" 2>/dev/null || true; }
 # review_round_remaining <pr> -> "stale_findings=<n> heads=<csv|none>" — what this PR still carries
 # UNRESOLVED, read from DISK rather than from a verdict's prose, and DELIBERATELY named `stale_`
 # (fresh review of #3441, P2): this arm is reached only when the LIVE head has NO findings marker
@@ -5417,7 +5422,7 @@ while true; do
               _rcl="$(review_ceiling_line "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"
               # ⛔ THREE PLACES, so the diagnosis survives log-quiet (#943): the log, the ledger row
               # below, and the park reason file. A single `echo` is what #3331 measured being lost.
-              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict. stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 the reviewer produced no usable verdict at the live head (a live head WITH findings takes the fixer path and never reaches this line). A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head): rm -f '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewround-$PR'"; then
+              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict. stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 the reviewer produced no usable verdict at the live head (a live head WITH findings takes the fixer path and never reaches this line). A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head). ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewround-$PR' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"; then
                 echo "#$_rcl — review-round budget EXHAUSTED, PARKED (the next review is refused; a runaway guard, never a pass)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "parked: $_rcl — review budget exhausted, needs a human (bounded, never a silent stop)"
               else
