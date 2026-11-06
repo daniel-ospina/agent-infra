@@ -2311,7 +2311,12 @@ nx27e="$( bash -c '
   LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
   lane_end_next' _ "$GATE" 2>/dev/null )"
 case "$nx27e" in MANUAL*"NOT archived"*) rcn27e=0 ;; *) rcn27e=1 ;; esac
-case "$nx27e" in *"NOT on origin"*) : ;; *) rcn27e=1 ;; esac
+# ⛔ THE SECOND CLAUSE USED TO PIN `*"NOT on origin"*` — the very claim round 13 correctly REMOVED (review
+# of PR #3399 round 13, P2). Leaving it here would have made this arm a tombstone that forces the off-box
+# absence back in. N27e's actual subject is the UNION (both domains named), so it asserts the push verdict
+# is present by name and that the branch cannot be fixed by re-running the rescue — never the wording of
+# a claim nobody measured.
+case "$nx27e" in *"refused-main-checkout"*) : ;; *) rcn27e=1 ;; esac
 case "$nx27e" in *"re-running the rescue does NOT fix"*) : ;; *) rcn27e=1 ;; esac
 ck "N27e a FAILED archive beside a REFUSED push names BOTH facts and says the rescue cannot fix the branch [${nx27e:0:64}]" $rcn27e
 # ⛔ N28c/N28d — A MANUAL VERDICT MAY NOT SIT BELOW A REPORTER, AND `cannot-verify` IS ONE (review cycle 13,
@@ -2577,9 +2582,14 @@ grep -qx 'push=pushed' "$TMP/n46.out" && ! grep -qx 'push=FAILED' "$TMP/n46.out"
 ck "N46b …a REJECTED push whose remote already holds a descendant still records DELIVERY (every commit of this lane IS on that ref) [$(cat "$TMP/n46.out" 2>/dev/null | tr -d '\n')]" $rcn46b
 ! grep -q 'inside the verify window' "$O/logs/n46.log"; rcn46c=$?
 ck "N46c …but it does NOT claim the advance happened INSIDE THE VERIFY WINDOW — over a rejection that advance is the cause, and it predates the push" $rcn46c
-grep -q 'CLIENT REPORTED FAILURE (rc=1)' "$O/logs/n46.log" && grep -q 'BEFORE the push' "$O/logs/n46.log" \
-  && grep -q 'DELIVERED NOTHING' "$O/logs/n46.log"; rcn46d=$?
-ck "N46d …and the line states what was measured: the client failed, this terminal delivered nothing, and the commits are off-box anyway" $rcn46d
+grep -q 'did not report success (rc=1)' "$O/logs/n46.log" && grep -q 'branch is NOT at risk' "$O/logs/n46.log" \
+  && grep -q 'NOT established here' "$O/logs/n46.log"; rcn46d=$?
+ck "N46d …and the line names only what was measured: the client did not report success, the commits are on that ref anyway, and the CAUSE is explicitly not established" $rcn46d
+# ⛔ AND IT NAMES NO CAUSE AT ALL — round 12 replaced one exit-status-derived cause with another
+# (review of PR #3399 round 13, P2 — REPRODUCED), so both shapes are refused by name here.
+! grep -q 'BEFORE the push' "$O/logs/n46.log" && ! grep -q 'client refused' "$O/logs/n46.log" \
+  && ! grep -q 'inside the verify window' "$O/logs/n46.log"; rcn46d2=$?
+ck "N46d2 …and it does NOT replace that with a second exit-status cause: neither 'BEFORE the push' nor 'the client refused' nor 'inside the verify window' is asserted over an rc that cannot distinguish them" $rcn46d2
 # …and the CONVERGED case is unchanged, so N46c cannot be passing by suppressing the sentence everywhere.
 # ⛔ `unpushed` MUST BE 1 HERE: `lane_end_push` short-circuits on `unpushed <= 0` and answers `nothing`
 # before any push — the first cut of this control passed 0 and asserted a `push=pushed` that the function
@@ -2650,6 +2660,55 @@ case "$n48b" in MANUAL*'do NOT reap'*'discarded'*) rcn48b=0 ;; *) rcn48b=1 ;; es
 ck "N48b …and it still REFUSES the reclaim and still names the volume hazard (fail-closed, and not a blanket abstention)" $rcn48b
 case "$n48b" in *'unpushed=2'*) rcn48c=0 ;; *) rcn48c=1 ;; esac
 ck "N48c …and carries the count it read, so the reader can see what the scoped sentence is about" $rcn48c
+# ⛔ N49 — THE SAME OFF-BOX CLAIM IN THE SHARED CAVEAT HELPER (review of PR #3399 round 13, P2 —
+# REPRODUCED). Round 12 scoped `lane_end_next`'s abstention; `lane_end_push_caveat`, which is APPENDED to
+# the same MANUAL arms, kept "the commit(s) on <br> are NOT on origin either". This drives the EXACT state
+# the reviewer reproduced — the documented fix-one.sh-without-WIP_PATH hub case — because
+# `refused-main-checkout` is NOT consumed by the abstention group above, so the helper really is reached.
+# The old "latent" note claimed every MANUAL push verdict returns above the helper's call sites; that is
+# false for `refused-protected`/`refused-main-checkout`, which is why this arm exists.
+n49="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=refused-main-checkout
+  LANE_END_UNPUSHED=3; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n49" in
+  *'are NOT on origin either'*) rcn49=1 ;;
+  *'refused-main-checkout'*'LOCAL refs/remotes/*'*'CACHE'*'not a statement about any remote'*) rcn49=0 ;;
+  *) rcn49=1 ;;
+esac
+ck "N49 the SHARED push caveat scopes its absence claim to the LOCAL cache too, on the state the reviewer reproduced (dirty + rescue=FAILED + refused-main-checkout) [${n49:0:70}]" $rcn49
+# …and the caveat is still APPENDED there, so N49 cannot be passing by dropping the domain's fact.
+case "$n49" in MANUAL*'NOT archived'*'refused-main-checkout'*) rcn49b=0 ;; *) rcn49b=1 ;; esac
+ck "N49b …while the tree domain's MANUAL fact survives in the same sentence (the caveat is scoped, not deleted)" $rcn49b
+# …and it is not vacuous for the OTHER member of that group either.
+n49c="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=refused-protected
+  LANE_END_UNPUSHED=1; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=main
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n49c" in *'are NOT on origin either'*) rcn49c=1 ;; *'LOCAL refs/remotes/*'*) rcn49c=0 ;; *) rcn49c=1 ;; esac
+ck "N49c …and for refused-protected, the other member that reaches the helper" $rcn49c
+# ⛔ N50 — THE ARCHIVE RECOVERY NAMES THE PROVEN PUSH URL (review of PR #3399 round 13, P2 — REPRODUCED).
+# `bg-rescue-wip.sh` WRITES the archive with `git push origin "$C:refs/wip/$SLUG"` (308/313), so it lands
+# in the PUSH repository; this instruction was a FETCH through `origin`, which reads remote.origin.url.
+# With the two diverging, the artifact's own command answers "couldn't find remote ref" over an archive
+# that exists in the other repository — the round-3 failure verbatim, in a third arm of that invariant.
+for _n50u in /srv/push-repo.git ''; do
+  n50="$( bash -c '
+    . "$1"
+    LANE_END_TREE=dirty; LANE_END_RESCUE=refs/wip/fix-x; LANE_END_PUSH=pushed
+    LANE_END_PUSH_URL="$2"; LANE_END_ORIGIN=abc1234
+    LANE_END_UNPUSHED=0; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+    lane_end_next' _ "$GATE" "$_n50u" 2>/dev/null )"
+  if [ -n "$_n50u" ]; then
+    case "$n50" in *"git fetch $_n50u refs/wip/fix-x"*) rcn50=0 ;; *) rcn50=1 ;; esac
+    ck "N50 the archive recovery fetches from the PROVEN push url ($_n50u), not a hardcoded origin [${n50:0:64}]" $rcn50
+  else
+    case "$n50" in *'git fetch origin refs/wip/fix-x'*) rcn50b=0 ;; *) rcn50b=1 ;; esac
+    ck "N50 …and with NO divergence it still says origin (a fence, not a blanket rewrite) [${n50:0:64}]" $rcn50b
+  fi
+done
 echo
 
 # ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).
