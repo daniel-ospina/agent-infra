@@ -1036,7 +1036,7 @@ fleet_row_objective_reminder() {
 # The reapers, one row each — a group row would hide which of them is dead, and their schedules
 # differ by two orders of magnitude (1h … 24h), so a single freshness bound would be a lie.
 # The OWN LOG each reaper writes, cited from the script that opens it — never inferred:
-#   pi-reap-worktrees.sh:190            REAP_WT_LOG=$STATE_DIR/pi-reap-worktrees.log
+#   pi-reap-worktrees.sh:662            REAP_WT_LOG=$STATE_DIR/pi-reap-worktrees.log
 #   cleanup-stale-branches.sh:2415      ~/.pi/agent/state/cleanup-stale-branches.log
 #   pi-reap-idle.sh (session reaper)    ~/.pi/agent/state/pi-reap-idle.log
 #   fleet/lane_liveness.py              ~/.pi/agent/state/lane-liveness.log
