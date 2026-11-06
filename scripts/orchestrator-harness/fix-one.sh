@@ -605,7 +605,7 @@ elif PL_ORPHAN="$(prlock_no_owner_abandoned)"; then
   # `adopt-fix.sh` maps that token (its `DEFERRED: the PR-owner lock` arm) to an operator line and exit 79;
   # they began `state/mergeclaim-$PR.lock held NO pid…`, which matches NO arm there — so `adopt-fix <PR>`
   # returned SUCCESS and wrote nothing into `adopt-$PR.log` for a run that pushed nothing, and an
-  # `… && next` chain took the wrong branch. `fix-one.sh:411-414` records that exact failure once already.
+  # `… && next` chain took the wrong branch. `fix-one.sh:442-445` records that exact failure once already.
   if prlock_takeover "$PL_ORPHAN"; then
     echo "[fix $PR] PR-owner lock: RECLAIMED an ORPHANED claim — state/mergeclaim-$PR.lock held NO pid (empty record) and was older than ${PRLOCK_NO_OWNER_GRACE_MIN}m, so no create window explains it; this lane took the claim over instead of refusing the PR" >> "$L.log"
   else

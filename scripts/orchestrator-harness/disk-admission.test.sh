@@ -1000,7 +1000,7 @@ esac
 # ⛔ A CORRECTION, BECAUSE THE PREVIOUS SENTENCE HERE WAS FALSE (fresh review, P2 — MEASURED). It read
 # "`spawn-gate.test.sh` had always named all four …, which is why it was immune". It had NOT: this very
 # change is what makes THIRTEEN of that suite's lines carry all four terms — ELEVEN arms newly state the
-# three lane terms (ten repaired in the review commit plus `:2034` repaired earlier in the PR) and TWO
+# three lane terms (ten repaired in the review commit plus `:2041` repaired earlier in the PR) and TWO
 # already carried them and gain the floor. A rationale that tells a maintainer the sibling suite needs no
 # attention, while the diff repairs it, is the claim-vs-code drift this file exists against — so it is
 # deleted rather than re-worded.
@@ -1397,7 +1397,7 @@ else
   bad "J) a DRIVER with a real export beside a prose mention was flagged — the matcher is reading prose as the defect"
 fi
 if [ -z "$(provision_neutralisation_offenders "$T/drv/drives-prefix.test.sh")" ]; then
-  ok "J) …and an INLINE ENV PREFIX (<terms> bash -c …) counts as effective (spawn-gate.test.sh's idiom, 22 such lines)"
+  ok "J) …and an INLINE ENV PREFIX (<terms> bash -c …) counts as effective (spawn-gate.test.sh's idiom)"
 else
   bad "J) an inline env-prefix neutralisation was flagged — the effectivity rule only knows 'export', which is not the only effective spelling"
 fi

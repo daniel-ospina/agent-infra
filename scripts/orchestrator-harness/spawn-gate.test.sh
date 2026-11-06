@@ -1920,7 +1920,7 @@ ck "(9b-orphan) ...and the garbled record is left EXACTLY as found" $rc
 rm -f "$PRLOCK7"
 
 # ⛔ EVERY `prlock_defer` CAUSE IS MAPPED BY `adopt-fix.sh`, AND A REWORD SILENTLY UNMAPS IT (review of
-# #3096, P2 + the same class recorded at `fix-one.sh:411-414`). `adopt-fix.sh` matches the CAUSE TOKEN on
+# #3096, P2 + the same class recorded at `fix-one.sh:442-445`). `adopt-fix.sh` matches the CAUSE TOKEN on
 # the `[fix <PR>] DEFERRED: <cause>` line and maps each to an operator line + exit 79; a cause it does not
 # recognise gets NO line and exit 0 — SUCCESS reported for a run that pushed nothing. The orphan arm's two
 # new deferrals originally began `state/mergeclaim-…`, matching no arm at all. This pins the invariant

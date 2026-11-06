@@ -54,7 +54,7 @@ CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache-verify-$$}"; export CLAIM_CA
 # MISSED (fresh review, P1 — MEASURED). The floor alone stopped being sufficient when #3395 added a
 # PRE-START admission: `wt_provision` → `disk_admit` now charges `max(TREE, SELF) + 4×floor`, i.e.
 # 6,148 MB with the lane terms unstated, so on a box under ~6 GB free every arm here exits 77 BEFORE
-# `claim_acquire` (`fix-one.sh:231` → rc 4 → `:260` exit `${AGENT_DISK_REFUSED:-77}`, with `:259`
+# `claim_acquire` (`fix-one.sh:231` → rc 4 → `:261` exit `${AGENT_DISK_REFUSED:-77}`, with `:260`
 # refunding the gate attempt first) and reports a disk refusal where it asserts a claim outcome — the
 # same wrong-cause class this block already names for the 500 MB floor. It was invisible because the
 # file is named `test-crossbox.sh`, not `*.test.sh`; arm J's and arm K's populations now read
