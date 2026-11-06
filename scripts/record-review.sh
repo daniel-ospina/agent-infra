@@ -1830,8 +1830,16 @@ $m"
     # reads as prose. git itself refuses to name a commit by an ambiguous prefix, so no reader could
     # verify such a claim either; the typed ranges that carry a real in-range commit are caught at 6
     # (20h41), 8 (20h31) and 12+, and a 4-6 char REAL sha resolves here and is compared.
+    # ⛔ A TOKEN SKIPPED AS PROSE IS NOT A STATED RANGE (eleventh review cycle, P1 — MEASURED: the
+    # body "The literals 0xdead..0xbeef and f00d..babe are unrelated to this change." recorded rc 0
+    # with a `delta_range` inferred from DATES). `_any` used to be set BEFORE the 4-6-char skip
+    # below, so a prose token still marked the body as having STATED a range: `_all_ok` stayed 1, so
+    # the containment refusal could not fire, AND `_any` stayed 1, so the "a stated range is
+    # REQUIRED" refusal could not fire — the two arms cancelled and the body passed the very
+    # requirement the ninth cycle added, which is exactly what the skip's own comment promises it
+    # does not do ("it is skipped, never silently accepted as a range"). 20h41 could not see it:
+    # there a REAL range is stated beside the prose, so it takes the other branch.
     while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}) ]]; do
-      _any=1
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
       _st="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
@@ -1840,9 +1848,11 @@ $m"
       _ok=0
       case "$to" in "$_st"*) _ok=1 ;; esac
       _sfs="$(delta_git "$root" rev-parse --verify "${_sf}^{commit}" 2>/dev/null || true)"
+      # ⛔ ONLY A TOKEN THAT SURVIVED THE SKIP COUNTS AS A STATED RANGE.
       if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
         continue
       fi
+      _any=1
       if [ "$_ok" = 1 ]; then
         _ok=0
         if [ -n "$_sfs" ]; then
@@ -1951,7 +1961,22 @@ $m"
       _r=0
       delta_git "$root" merge-base --is-ancestor "$from" "$_tsha" 2>/dev/null || _r=$?
       [ "$_r" -eq 0 ] || continue
-      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — LATER than ${from:0:12}… (the range's start) and not ${to:0:12}… (the head being attested). That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
+      # ⛔ THE REFUSAL MUST NAME WHAT ACTUALLY HAPPENED (eleventh review cycle, P2 — MEASURED: an
+      # artifact that stated the CORRECT range and additionally LISTED the commits it read — the
+      # ordinary reviewer artifact, and what `skills/code-review/SKILL.md` asks a reviewer to return
+      # — was refused with "a NARROWER range … written in a notation this code does not parse", when
+      # the artifact narrowed nothing and the token was a plain sha. The RULE is unchanged and stays
+      # a declared residual above; only the DIAGNOSIS is now true. A token that is an ancestor of the
+      # attested head is INSIDE the range; one that is not can only be a narrowing endpoint written
+      # in a notation the range parser above did not tokenise.
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$_tsha" "$to" 2>/dev/null || _r=$?
+      if [ "$_r" -eq 0 ]; then
+        echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit INSIDE the range ${from:0:12}…..${to:0:12}…, but neither its start nor the head being attested. A commit inside the range may not be named by SHA in a claim that also asserts the range: from the text alone this code cannot tell a reviewer LISTING what they read from a reviewer NARROWING to it, so it takes the conservative reading (the arm's declared residual, stated above it). Nothing was written." >&2
+        echo "   → refer to commits INSIDE the range by description (\"the merge commit\", \"the lane commit\") rather than by sha, and state the range once as delta:${from:0:12}..${to:0:12}." >&2
+        return 1
+      fi
+      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — LATER than ${from:0:12}… (the range's start), not ${to:0:12}… (the head being attested), and not an ancestor of it, so it is outside the range altogether. That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
       echo "   → the claim must name ONE range, ${from:0:12}…..${to:0:12}…, and name no commit later than ${from:0:12}…; quote it as delta:${from:0:12}..${to:0:12}, and refer to commits INSIDE the range by description rather than by sha." >&2
       return 1
     done

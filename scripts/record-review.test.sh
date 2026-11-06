@@ -7815,6 +7815,47 @@ if printf '%s' "$BODY43" | bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh"
 else
     bad "20h43 brief-gate did NOT accept the no-outer-pipe table — the vector would prove nothing"
 fi
+# 20h44 A SKIPPED TOKEN IS NOT A STATED RANGE (eleventh cycle, P1). The prose skip exists so a
+#       hex-LOOKING pair (`0xdead..0xbeef`) is not refused as a contradicting range, and its own
+#       comment promises it is "skipped, never silently accepted as a range". But `_any` was set
+#       BEFORE the skip, so the skipped token still marked the body as having STATED a range:
+#       `_all_ok` stayed 1 (so the containment refusal could not fire) and `_any` stayed 1 (so the
+#       "a stated range is REQUIRED" refusal could not fire either) — the two arms cancelled and
+#       the body sailed through the very requirement the ninth cycle added. MEASURED: the body
+#       below states no range at all and recorded rc 0 with a `delta_range` derived from DATES,
+#       which is the case arm (10a) says "dates cannot settle". 20h41's vector could not see it
+#       because it takes the OTHER branch (a real range is stated beside the prose).
+EH52=425240; rm -f "$(Q2 $EH52)"
+run_record_delta $EH52 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="The literals 0xdead..0xbeef and f00d..babe are unrelated to this change.
+No issues found; the port handling is correct."
+assert_eq "$RECORD_RC" "3" "20h44 a body whose ONLY dots-token is PROSE has not stated a range (rc 3)"
+assert_contains "$RECORD_ERR" "does not STATE the range" "20h44 the refusal names the missing range statement"
+[ -f "$(Q2 $EH52)" ] && bad "20h44 no record was written" || ok "20h44 no record was written"
+# 20h45 THE REFUSAL MUST NAME WHAT ACTUALLY HAPPENED (eleventh cycle, P2). The arm refuses an
+#       artifact that names a commit LATER than A — a DECLARED residual, kept deliberately (see the
+#       note above it), because telling an innocent reference from a narrowing endpoint means
+#       enumerating notations. What was wrong is the DIAGNOSIS: for an artifact that states the
+#       CORRECT range and additionally LISTS the commits it read — the ordinary reviewer artifact,
+#       and what `skills/code-review/SKILL.md` asks a reviewer to return — the message asserted a
+#       "narrower range … written in a notation this code does not parse" when the artifact narrowed
+#       nothing and the token was a plain sha. The rule stays; the sentence now distinguishes a
+#       commit INSIDE the range from a narrowing endpoint.
+EH53=425242; rm -f "$(Q2 $EH53)"
+run_record_delta $EH53 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## What I reviewed
+
+| commit | subject |
+|---|---|
+| ${DG_A1} | the lane commit |
+| ${DG_HEAD} | the forward merge |"
+assert_eq "$RECORD_RC" "3" "20h45 naming a commit INSIDE the range is still refused (declared residual)"
+assert_contains "$RECORD_ERR" "INSIDE the range" "20h45 the refusal says INSIDE the range"
+assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h45 and does NOT accuse the artifact of an unparseable narrowing"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -8154,6 +8195,18 @@ assertion | mutant (reverts the fix) | reddened row | observed
 ---|---|---|---
 x | sed s/rc=80/rc=0/ | A (i) | rc=0
 - the guard added at ${DG_A1} | revert it | B (ii) | row red"
+# M33 — THE PROSE SKIP DOES NOT SATISFY THE REQUIREMENT (20h44). Putting `_any=1` back before the
+#       4-6-char skip restores the eleventh cycle's P1: both refusals cancel, and a body that stated
+#       no range records rc 0 with a `delta_range` inferred from dates. The mutant must ACCEPT.
+MUT="$(mk_mutant prosenotrange '      if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
+        continue
+      fi
+      _any=1' '      _any=1
+      if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
+        continue
+      fi')"
+mut_check "M33 a PROSE-skipped token is not a stated range" 425240 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The literals 0xdead..0xbeef and f00d..babe are unrelated to this change.
+No issues found; the port handling is correct."
 # M24 — THE UNRELATED-LINEAGE BOUND (20h36). Dropping the "is it LATER than A" test makes every
 #       resolvable token that is not reviewed history a contradiction, which is the seventh
 #       cycle's false block: an artifact quoting a commit on an UNRELATED lineage is refused for
