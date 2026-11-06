@@ -134,7 +134,11 @@ function cmdpos(pre,   p) {
   gsub(/[ \t"']+$/, "", p)
   if (p == "") return 1
   if (p ~ /(^|[;&|({})])[ \t"']*$/) return 1
-  if (p ~ /(^|[;&|({})])[ \t"']*(if|then|else|elif|while|until|do|!)$/) return 1
+  # ⛔ `let` AND `time` ARE ASSIGNMENT POSITIONS (review round 6, P3 — measured): `let X=81` and
+  # `time X=81` both assign 81 into `X` (`bash -c 'time X=81'` prints 81 on the next read), yet the
+  # foreign net emitted no row while the FAMILY net refused the same line. `time` takes its one POSIX
+  # flag, so `time -p X=81` must match too — measured silent before this arm existed.
+  if (p ~ /(^|[;&|({})])[ \t"']*(if|then|else|elif|while|until|do|!|let|time([ \t]+-[A-Za-z]+)*)$/) return 1
   if (p ~ /(^|[;&|({})])[ \t"']*(export|local|declare|readonly|typeset|int|integer)([ \t]+-[A-Za-z]+)*$/) return 1
   # ⛔ `printf -v NAME` IS A DECLARATION POSITION (review cycle 2, P2). The name is being ASSIGNED, so
   # the name token sits where a command may start — same shape as `local NAME`. Without this arm,
@@ -171,7 +175,14 @@ function arithctx(p,   i, depth, st, ch) {
   for (i = 1; i <= length(p); i++) {
     ch = substr(p, i, 1)
     if (ch == "(") { depth++; if (substr(p, i, 2) == "((") st = 1 }
-    else if (ch == ")") depth--
+    # ⛔ DEPTH MUST NOT GO NEGATIVE (review round 6, P2 — measured). An UNCLAMPED decrement lets two
+    # stray `)` to the LEFT of a real declaration drive depth to 0 and return false, so BOTH arms fall
+    # out of the fail-closed branch with NO row — the silent drop `residual()` exists to make
+    # impossible: `msg="1) x 2) y"; (( X = 83 ))` and `case x in a) :;; b) :;; esac; (( X[0] = 83 ))`
+    # both ASSIGN 83 (`bash -c 'msg="1) x 2) y"; (( X = 83 )); echo $X'` → 83) and both read GREEN.
+    # A `)` with nothing open is not a closing parenthesis; it is a character in a string or a `case`
+    # pattern, and it must leave the count alone.
+    else if (ch == ")" && depth > 0) depth--
   }
   return (st && depth > 0)
 }
@@ -182,13 +193,18 @@ function arithctx(p,   i, depth, st, ch) {
 # asymmetry `residual()` already records as fixed on its own path). A pure `WORD=value …` prefix list
 # is a command position. It is NOT a licence for `echo AGENT_MEM_GATE=81`: the whole remainder must be
 # assignment tokens, so the leading command name fails the test.
+# ⛔ THE PREFIX OPERAND MAY BE QUOTED OR ESCAPED (review round 6, P3 — measured). `[^ \t]*` cannot
+# cross a space, so a prefix list holding `FOO="a b"` or `FOO=a\ b` failed to match at all and the
+# name after it got NO row — while bash durably assigns it (`bash -c 'FOO="a b" X=81; echo $X'` → 81)
+# and the FAMILY mirror of the same line is refused. Quote- and escape-aware, but still ONE operand:
+# the whole remainder must be `WORD=value` tokens, so `echo FOO=1 …` still fails the test.
 function prefixonly(q,   t) {
   if (q == "") return 0
   # ⛔ THE TRAILING SEPARATOR IS PART OF THE SHAPE — never `gsub` it away (measured: stripping it made
   # `FOO=1` the whole operand and the `[ \t]+` that proves "this token ended" had nothing to match, so
   # the arm silently never fired).
   t = q
-  return (t ~ /(^|[;&|({})])[ \t"']*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+)+$/)
+  return (t ~ /(^|[;&|({})])[ \t"']*([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|([^ \t\\]|\\[ \t])*)[ \t]+)+$/)
 }
 # The value: everything up to the first character that can end it (`X=$y`, `X=83;`, `X=83 # note`,
 # `${X:-83}`), or up to the matching quote when the operand is QUOTED (`${X:-"81"}`, `X='83'`). The
@@ -2074,12 +2090,12 @@ chmod +x "$RO/gh-limit/gh"
 # measured; corrected by the review of `3a94b3b`, which measured the premise below to be FALSE). Once
 # the stub answers, `chain-merge.sh` no longer exits on its own no-PR timeout — it runs the REAL path,
 # and that path has TWO waits, neither of which these rows are about (they assert PROPAGATION):
-#   1. the PHASE wait (`chain-merge.sh:386`, `while [ ! -f "$PR_PHASE" ] && … PHASE_GRACE`). The rig has
+#   1. the PHASE wait (`chain-merge.sh:389`, `while [ ! -f "$PR_PHASE" ] && … PHASE_GRACE`). The rig has
 #      NO `lanemerge-<PR>.phase` marker (`$RO/state` is empty of one: this file mentions `.phase`
 #      nowhere else), so the loop is not skipped — it spins out the DEFAULT `PHASE_GRACE=90` at
 #      `CHAIN_POLL=1s`. That is ~90 s PER ARM, ~4.5 min for the three. Measured on `3a94b3b`: the
 #      three arms finished at 03:12:47, 03:14:27 and 03:16:02 — ~95-100 s each.
-#   2. the HANDOFF wait (`chain-merge.sh:419`, `while [ "$waited" -lt "$HANDOFF_WAIT" ]`) — reachable
+#   2. the HANDOFF wait (`chain-merge.sh:422`, `while [ "$waited" -lt "$HANDOFF_WAIT" ]`) — reachable
 #      only when a marker DOES exist; bounded
 #      anyway so a future fixture that plants one cannot make the arm unbounded.
 # `LANE_PHASE_GRACE=1` bounds the first (the one that actually burns today) and `LANE_HANDOFF_WAIT=1`
@@ -2948,6 +2964,29 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
 ck "(prefix-assignment) a code after a \`FOO=1\` prefix assignment is a \`foreign\` row — the family net already refused the same shape, so the namespace must not decide whether a declaration is seen (rc=$CODE_RC; $CODE_MSG)" $rc
 
+# (d8) THE PREFIX OPERAND MAY BE QUOTED OR ESCAPED, AND `let`/`time` ARE COMMAND POSITIONS (review
+# round 6, P3 — each measured). `[^ \t]*` could not cross a space, so `FOO="a b" X=81` matched no
+# operand and got NO row; and `let X=81` / `time X=81` / `time -p X=81` assign 81 yet read silent while
+# the FAMILY mirrors of the same lines were refused. The control keeps the widening honest: the same
+# text after `echo` declares nothing and must stay silent.
+_codemut_dir="$(_codemut prefix-quoted)"
+printf '\nFOO="a b" AGENT_MEM_GATE=81\nFOO=a\\ b AGENT_ESC_GATE=81\nlet AGENT_LET_GATE=81\ntime -p AGENT_TIME_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+_missing=""
+for _want in AGENT_MEM_GATE=81 AGENT_ESC_GATE=81 AGENT_LET_GATE=81 AGENT_TIME_GATE=81; do
+  # ⛔ The `foreign: ` prefix is printed ONCE, before the FIRST row — matching it on every row would
+  # fail for every row after the first, which is how this arm's first cut reported three false misses.
+  case "$CODE_MSG" in *"spawn-gate.sh:$_want"*) : ;; *) _missing="$_missing $_want" ;; esac
+done
+[ -z "$_missing" ]; rc=$?
+ck "(prefix-quoted) a QUOTED prefix operand, an ESCAPED one, \`let\` and \`time -p\` are all \`foreign\` rows — a space in the value, or a keyword, must not make the declaration invisible (missing:${_missing:- none}; rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut where-let-is-not)"
+printf '\necho let AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) the same words after \`echo\` stay SILENT — \`let\`/\`time\` are command positions only in command position (rc=$CODE_RC; $CODE_MSG)" $rc
+
 _codemut_dir="$(_codemut decl-not-builtin)"
 printf '\necho AGENT_DEBUG=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
@@ -3066,6 +3105,8 @@ arith-array-pluseq|unparseable|(( AGENT_NEW_GATE_REFUSED[0] += 83 ))
 arith-array-nested|unparseable|(( (AGENT_NEW_GATE_REFUSED[0] = 83) ))
 arith-array-and|unparseable|(( 1 && (AGENT_NEW_GATE_REFUSED[0] = 83) ))
 arith-array-empty|unparseable|AGENT_NEW_GATE_REFUSED[0]=
+arith-negative-depth|claim|msg=\"1) x 2) y\"; (( AGENT_NEW_GATE_REFUSED = 83 ))
+arith-negative-depth-sub|unparseable|case x in a) :;; b) :;; esac; (( AGENT_NEW_GATE_REFUSED[0] = 83 ))
 subscript-prefix-assign|unparseable|FOO=1 AGENT_NEW_GATE_REFUSED[0]=83
 arith-computed|unparseable|(( AGENT_NEW_GATE_REFUSED = 70 + 13 ))
 read-flag-operand|unparseable|read -u 3 AGENT_NEW_GATE_REFUSED
