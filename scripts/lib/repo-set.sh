@@ -71,7 +71,11 @@
 #   4  NO-ENTRIES        the file exists and names nothing (comments/blank lines only).
 #   5  INVALID           the file exists and is not a usable set: unreadable, not a regular file, or
 #                        at least one line refused. The reasons are on stderr, by name and line.
-#   1  UNPROVEN          (check only) the file parses, but a checkout/state proof failed.
+#   1  UNPROVEN          (check only) the file parses, but a proof failed: a checkout of a DIFFERENT
+#                        repo, two repos sharing a state dir, a set the doctor's own splitter would
+#                        divide differently from the lines named, or a set whose repo TAGS collide
+#                        (`set_tag_collisions`: two slugs rendering one register). The last two refuse
+#                        the SET rather than a line, and say so.
 #   2  usage
 #
 # ⛔ `repo_set_check` PROPAGATES 3/4/5 AND DOES NOT FOLD THEM INTO 1. Folding them inverted the one
@@ -225,10 +229,19 @@ repo_set_parse() {
   # silently degrades — measured in review round 7. A dotfile manager whose target moved (stow,
   # chezmoi) lands exactly here: the machine stops grading every repo but one and is told to create a
   # file that is already there. An existing LINK that does not resolve is the broken state (5).
+  # ⛔ THE ARM DOES NOT DIAGNOSE THE CAUSE, BECAUSE `[ ! -e ]` CANNOT (review round 8, P2). `-e` is false
+  # for EVERY stat failure — a missing target, an EACCES/EPERM denial on an ancestor (the same macOS TCC
+  # shape this file reasons about sixteen lines below), and an ELOOP link loop all land here. Round 7's
+  # first cut asserted "whose target does not exist", i.e. it turned the very test this file says can
+  # never PROVE absence into a proven claim, and sent an operator whose dotfile target is merely
+  # unreachable to "fix the link's target". The code (5, broken — never 3, absent) is right; the
+  # diagnosis is now the observation plus the two candidates.
   if [ -L "$f" ] && [ ! -e "$f" ]; then
-    _rs_say 2 "repo-set: INVALID — $f is a SYMLINK whose target does not exist, so this machine has"
-    _rs_say 2 "repo-set:   named no repo and nothing can read the set. Fix the link's target; creating the"
-    _rs_say 2 "repo-set:   file would replace the link."
+    _rs_say 2 "repo-set: INVALID — $f is a SYMLINK that does not RESOLVE. An existing link that leads"
+    _rs_say 2 "repo-set:   nowhere is the broken state, not the absent one: this machine has named a repo"
+    _rs_say 2 "repo-set:   set and nothing can read it. Causes: the target was moved/deleted, an ancestor"
+    _rs_say 2 "repo-set:   denies this process (launchd has no Full Disk Access under ~/Documents), or the"
+    _rs_say 2 "repo-set:   link loops. Check the target; creating the file would REPLACE the link."
     return 5
   fi
   if [ ! -e "$f" ]; then
@@ -294,12 +307,19 @@ repo_set_parse() {
     # ⛔ THE KEY IS CASE-FOLDED. `configured_repos()` lowercases its dedupe key and `repo_tag()`
     # lowercases the state file, so two spellings of one repo are ONE repo to the doctor — a reader
     # that called them two would render a set the doctor silently shrinks.
+    # ⛔ THE KEY IS THE DOCTOR'S OWN NORMALIZED IDENTITY (review round 8, P2), not a case fold: the
+    # parser this file already delegates to maps `owner/name`, `owner/name.git`, a host prefix and a URL
+    # onto ONE slug, so `daniel-ospina/tortoise` and `daniel-ospina/tortoise.git` are the same repo to
+    # every consumer — and `set_tag_collisions` compares NORMALIZED slugs, so it cannot catch this pair
+    # either. Two entries of one repo against one register is exactly what this arm forbids.
+    _dupkey="$(_rs_normalize_slug "$slug")"
+    [ -n "$_dupkey" ] || _dupkey="$(_rs_lower "$slug")"
     case "$seen" in
-      *$'\n'"$(_rs_lower "$slug")"$'\n'*)
+      *$'\n'"$(_rs_lower "$_dupkey")"$'\n'*)
         _rs_say 2 "repo-set: DUPLICATE-SLUG — $f:$ln: \`$slug\` is already named above; a set with the same repo twice grades it twice and dispatches it twice (case-INSENSITIVE, like the doctor's own dedupe)"
         rc=5; continue ;;
     esac
-    seen="$seen"$'\n'"$(_rs_lower "$slug")"$'\n'
+    seen="$seen"$'\n'"$(_rs_lower "$_dupkey")"$'\n'
 
     if [ -z "$checkout" ]; then
       _rs_say 2 "repo-set: MISSING-CHECKOUT — $f:$ln: \`$slug\` names no checkout; the doctor will fall back to REPO/cwd for one, or grade its queue read-only"
@@ -373,7 +393,16 @@ _rs_with_doctor() {
   local verb="${1:-}" arg="${2:-}" doc py
   doc="$(_rs_doctor_py)"
   [ -n "$doc" ] || return 0
-  py="$(command -v python3 2>/dev/null)"
+  # ⛔ THE SAME RESOLUTION THE WRAPPER USES (review round 8, P2). `command -v python3` alone fails on the
+  # launchd-shaped PATH this whole unit exists to survive, and because an empty answer means "no proof"
+  # the provenance arm silently downgraded from REFUSE to WARN and the tag guard silently no-op'd — so
+  # the wrapper announced a pass for a set the doctor then refused wholesale. An absolute fallback is
+  # not a nicety here; it is the difference between a proof and a silent skip.
+  py=""
+  local c
+  for c in python3 /usr/bin/python3 /usr/local/bin/python3; do
+    if command -v "$c" >/dev/null 2>&1; then py="$(command -v "$c")"; break; fi
+  done
   [ -n "$py" ] || return 0
   "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
 import importlib.util, sys
@@ -384,7 +413,10 @@ try:
     spec.loader.exec_module(mod)
 except Exception:
     raise SystemExit(0)
-if verb == "tags":
+if verb == "splitcount":
+    import re as _re
+    sys.stdout.write(str(len([x for x in _re.split(r"[,\s]+", arg) if x])))
+elif verb == "tags":
     sys.stdout.write(mod.set_tag_collisions(arg.split(",") if arg else []))
 elif verb == "norm":
     sys.stdout.write(mod._normalize_slug(arg))
@@ -427,6 +459,20 @@ _rs_tag_collision() {
   return 0
 }
 
+# _rs_split_count <comma-joined entries> — how many entries the DOCTOR'S OWN splitter
+# (`configured_repos`: `re.split(r"[,\s]+", raw)`) sees. The reader refuses `,` inside a value, but that
+# enumerates ONE character class of a splitter that also splits on `\v`, `\f`, `\r` and Unicode
+# whitespace — measured in review round 8, an NBSP inside a checkout path passed every arm, produced
+# `grading 1 repo(s)`, and the doctor split it into a TRUNCATED real entry plus a phantom repo it then
+# refused. Round-tripping the rendered list through the doctor's own splitter is the check that cannot
+# drift: any future separator it learns is covered the day the doctor learns it.
+_rs_split_count() {
+  local entries="${1:-}"
+  [ -n "$entries" ] || { printf '0'; return 0; }
+  _rs_with_doctor splitcount "$entries"
+  return 0
+}
+
 _rs_normalize_slug() {
   local v="${1:-}"
   [ -n "$v" ] || return 0
@@ -444,6 +490,9 @@ _rs_normalize_slug() {
 #     The split is the one `resolve_repo()` makes, and the reason is measured twice over: launchd has no Full Disk Access
 #     under `~/Documents` (the default checkout), so refusing there discarded a pass the doctor
 #     completes. "I could not look" must never be reported as "it is wrong".
+#   * the rendered list round-trips through the DOCTOR'S OWN splitter as exactly the declared number of
+#     entries, and the doctor's own `set_tag_collisions` accepts it — the two whole-set proofs the
+#     per-line arms cannot express (both delegated, both hard `rc 1`);
 #   * no two repos share a state dir — the silent-sharing failure `multi-repo-controller.sh` refuses
 #     by name, one level up: two controllers pointed at one state dir fight over ONE `.orch.lock`,
 #     ONE candidates list and ONE worker registry, so each believes it is alone on the box.
@@ -553,8 +602,20 @@ EOF
   # the one whole-set refusal the arms above cannot express, and without it a set this reader called OK
   # was refused wholesale by the doctor — so the wrapper's "grading N repo(s)" was false and nothing
   # was graded. Delegated for the same reason every other proof is: one rule, one home.
+  # ⛔ THE SHAPE ROUND-TRIP (review round 8, P2): the rendered list must yield exactly `n` entries under
+  # the doctor's OWN splitter. Anything that adds or removes one — a separator the reader does not
+  # enumerate, a value that splits — makes the graded set different from the validated one, which is the
+  # "a shorter set reads like a smaller machine" failure in the other direction.
+  local rendered splitn
+  rendered="$(repo_set_doctor_repos 2>/dev/null)"
+  splitn="$(_rs_split_count "$rendered")"
+  if [ -n "$splitn" ] && [ "$splitn" != "$n" ]; then
+    printf 'repo-set: REFUSED set — the doctor would split this set into %s entr(y/ies) but %s were named: a value contains a separator the list format cannot carry (a `,` or any whitespace, including a non-ASCII space)\n' "$splitn" "$n"
+    bad=1
+  fi
+
   local tagwhy
-  tagwhy="$(_rs_tag_collision "$(repo_set_doctor_repos 2>/dev/null)")"
+  tagwhy="$(_rs_tag_collision "$rendered")"
   if [ -n "$tagwhy" ]; then
     printf 'repo-set: REFUSED set — %s\n' "$tagwhy"
     bad=1

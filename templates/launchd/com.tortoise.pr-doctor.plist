@@ -116,8 +116,11 @@
         <string>{{PATH}}</string>
         <key>HOME</key>
         <string>{{HOME}}</string>
-        <!-- The CHECKOUT (not a slug) — the box's own evidence for the DEGRADED path (no repo set
-             yet): adopted only if its `origin` PROVES the slug the doctor resolves. -->
+        <!-- The CHECKOUT (not a slug), and it is used in BOTH modes — see the block above: as the
+             degraded path's evidence AND as the `_checkout_that_proves()` fallback for a set entry whose
+             own checkout proves nothing. In both, adopted only if its `origin` PROVES the slug. Do not
+             drop it as "degraded-only": that would turn such an entry from spawn-in-this-checkout into
+             read-only. -->
         <key>REPO</key>
         <string>{{TORTOISE_REPO}}</string>
     </dict>
