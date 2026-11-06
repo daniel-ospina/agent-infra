@@ -994,6 +994,14 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   {
+    name: "REAP_WT_PRESERVE_KEEP_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
+    axis: "retention",
+    guardedBy: NONE,
+    note: "#3405 review round 2 — the ARCHIVE bound on the reclaim path: a reclaimed worktree's evidence is copied into a dated archive, and only subdirectories strictly older than this many days are swept (0 disables the sweep entirely). It is a retention bound in the same family as REAP_WT_AGED_DAYS / REAP_WT_MERGED_AGE_DAYS above, so it is REGISTERED rather than exempted — a reader must be able to see the archive's retention move. It was missing from this registry when the bound shipped, which is why `verify`'s reverse scan failed on main for EVERY PR: the declaration landed, the registration did not, so a base-owned failure on a single unregistered constant held every open PR to a red check none of them caused.",
+  },
+  {
     name: "REAP_WT_BUDGET_SECONDS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_BUDGET_SECONDS:-300}",

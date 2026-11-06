@@ -14,6 +14,76 @@
 # alive and can only merge. `--check` answers the provisioning question up front, WITH THE REASON,
 # so a cell is never STARTED in that state (cloud-cell-supervisor.sh `check` calls it).
 set -u
+# ── THE POOL-ELIGIBILITY DEFINITION — THE ONLY COPY (issue #10951) ───────────────────────────
+# This line decides WHAT COUNTS AS A WORK UNIT. It used to exist four times, inline, and the
+# copies had drifted: the P0 query and the emergency-P0 floor excluded six container spellings,
+# while the P1-severe and P2-moderate queries excluded two (`epic|OWNER DECISION`) — so the P1
+# tier was the NARROWEST filter here and ranked a standing constraint (#10175, whose title says
+# "the cap is HELD deliberately — never override it") as a work unit. One definition, four call
+# sites, and `pool-filter.test.sh` drives THESE EXACT BYTES through real jq.
+#
+# TWO ARMS, because two different facts need expressing:
+#   1. THE TITLE KIND, marked STRUCTURALLY — the kind token followed by `(` or `:`, optionally
+#      with the ONE qualifier this repo uses (`epic-scope:`), or the `lane <id>:` umbrella form. The
+#      structural requirement is what makes the rule safe: the bare prefix this replaced also dropped
+#      WORK — `analysis-paralysis fix: …` (as `analysis`) and `lane reaper: …` (as `lane`). `analysis`
+#      and `investigation` are members the old rule CARRIED, kept rather than re-justified: they stay
+#      because dropping one would be an unreviewed widening. ⛔ DO NOT READ THE MEASUREMENT AS "UNUSED":
+#      the measured tortoise queue had no live row using them, but `analysis(` IS live in
+#      agent-infra — #1425 `analysis(review-enforcer): …` carries `P2-moderate`, and it is exactly the
+#      container shape this arm must keep excluding. A cleanup that deletes the kind makes that
+#      container pickable (review cycle 4, P3).
+#      ⛔ THE QUALIFIER IS ENUMERATED, NOT `-[A-Za-z0-9]+` (review cycle 3, P1). An unbounded
+#      qualifier silently DROPPED real work: `tracking-id: …`, `design-tokens: …`, `arch-lint: …`,
+#      `map-cache: …`, `measure-latency: …`, `coord-lock: …`, `residual-risk: …`,
+#      `requirement-ids: …` all match `<kind>-<word>:` and were excluded, with no `.pool-err` and a
+#      healthy-looking count — the exact silent-disappearance failure (#8465) this file exists to
+#      prevent. Adding a second qualifier is a TEST change (see `pool-filter.test.sh` §1), never a
+#      runtime guess.
+#      ⛔ AND A BARE `epic` WITH NO SEPARATOR IS DELIBERATELY **PICKABLE** (review cycle 3, P2): the
+#      pre-fix P0 rule excluded `epic of the v4 selection workstream` and `epic — end-to-end proof …`
+#      by prefix; the structural requirement now INCLUDES both, because excluding by bare prefix is
+#      what dropped `analysis-paralysis fix:` (as `analysis`) and `lane reaper:` (as `lane`) — hiding
+#      work is the worse direction. ⛔ `epidemic:` IS **NOT** A CASUALTY AND MUST NOT BE CITED AS ONE
+#      (review cycle 4, P2, measured): `^epic` cannot match `epidemic`, so the old rule never dropped
+#      it. It is pinned as a FORWARD-GUARD (§4) so a re-added bare prefix cannot pass — a forward-guard
+#      and a casualty are different claims, and inflating the casualty list is what makes a DELIBERATE
+#      widening (a bare `epic` container is now pickable) look better justified than it is.
+#      Pinned as an inclusion in the suite so the trade-off is a decision, not an omission.
+#   2. THE DECLARED LABEL — `standing-constraint`, and that label only. A standing constraint
+#      CANNOT be told from work by its title, and must not be inferred from its prose, so the
+#      declaration is the only honest marker (the same lesson #10902 records for folds: declare the
+#      property, do not infer it).
+#      ⛔ `epic` IS DELIBERATELY NOT A LABEL-ARM MEMBER — measured both ways. It gains nothing (all
+#      7 epic-labelled rows in the queue are also epic-TITLED, which the title arm already
+#      excludes) and it HIDES WORK: tortoise#9701 `bug(tooling): epic->child wiring is
+#      prose-only` carries the `epic` label. A label used that loosely cannot be an exclusion.
+#
+# ⛔ IT IS A DENYLIST AND AN UNKNOWN SPELLING STAYS PICKABLE — measured, not stylistic: 40 of the
+# 219 open P0/P1/P2 issues carry NO kind prefix at all (`P0 storage: …`, `MCP read surface: …`,
+# `Run the LongMemEval-S …`), so an allowlist would silently drop every one of them, P0-blockers
+# included, and the queue would report a healthy-but-empty backlog. This surface's documented
+# failure is SILENT DISAPPEARANCE (#8465), so adding a container kind is a TEST change, never a
+# runtime guess. Measured effect of the whole change on the live queue: 192 → 179 pickable, and
+# NOT ONE issue newly included — it can withhold a container, never hide work.
+# ⛔ AND THE WITHHELD SET IS NOT ONLY A POOL COUNT (review, P3). The same predicate now also decides the
+# EMERGENCY CLASS (`write_emergency_queue` below consults it), so a P0-TITLED container leaves the
+# emergency class too: tortoise#10977 `tracking: making the hosted graph usable …` carries `P0-blocker`
+# and is withheld, which means the product floor can stand down on a pass whose only unassigned P0 is a
+# container. That is the CORRECT consequence under the decision above (a tracking umbrella is not a
+# dispatchable unit, and the floor exists to weigh dispatchable work), but "it can withhold a container"
+# reads as a queue-size claim, and this one changes a FLOOR DECISION — so it is named here rather than
+# left to be inferred from the count.
+#
+# ⛔ `owner-decision` IS DELIBERATELY NOT IN THE LABEL ARM. Its description says "not for the
+# lane or orchestrator", but it is applied to real work rows — `fix(mcp): tortoise_create_source
+# cannot record the absent-raw state` (#5212), `defect(quota): …` (#4051) — so excluding it would
+# hide work. Narrowing that label's usage is a queue policy decision, not a filter edit.
+#
+# ⛔ THIS LINE IS EXTRACTED VERBATIM BY `pool-filter.test.sh`, so it stays ONE single-quoted
+# assignment on ONE line. `\\s` is doubled because a jq string literal needs it doubled; `$L`
+# and `$n` are jq variables and stay unexpanded inside the single quotes.
+POOL_JQ='select((.assignees|length)==0)|select((((.labels//[])|map(.name|ascii_downcase)) as $L|[$L[]|. as $n|select(["standing-constraint"]|index($n))]|length)==0)|select((.title//"")|test("^\\s*(?:((?:epic|decision|design|coord|measure|analysis|investigation|requirement|tracking|residual|map|arch|architecture|owner decision)|decision\\s+needed)(?:-scope)?\\s*[(:]|lane\\s+[A-Za-z]{0,2}[0-9][A-Za-z0-9._-]*\\s*:)";"i")|not)'
 OR_FROM_ENV="${OR:-}"
 # ⛔ "DECLARED" MEANS THE OPERATOR NAMED IT — NOT THAT THE VARIABLE IS PRESENT (#1977 review, P1).
 # `orch-loop.sh` EXPORTS `OR` on EVERY cycle, including the one where it fell back to its own default
@@ -2395,7 +2465,8 @@ rest_list() {
     page=$((page + 1))
   done
   # ⛔ /issues RETURNS PULL REQUESTS TOO. Left in, a labelled PR becomes a DISPATCH CANDIDATE: the tier
-  # programs below only require "no assignee and a non-epic title", so it would be queued as
+  # programs below apply the shared `POOL_JQ` definition (#10951) and a PR title rarely carries a
+  # container kind, so it would be queued as
   # `0 <PR#>`, land in `dispatched.txt`, and get a lane spawned for a PR number the pass never
   # adjudicated as an issue. The REAPER is exposed to the same rows for an unrelated reason —
   # `has_pr` (below) keys on PR head-BRANCH names, not on numbers, so a PR row whose branch does not
@@ -3472,7 +3543,9 @@ fi
 
 touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 
-# pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus epics/owner-decisions
+# pool = open unassigned P0-blocker ∪ P1-severe ∪ P2-moderate, minus container issues
+# ⛔ THE CONTAINER DEFINITION IS NOT IN THIS BLOCK — it is the single `POOL_JQ=` line near the top,
+# so the three tiers here and the emergency floor below cannot drift apart again (#10951).
 #
 # ⛔ SEVERITY FIRST, AGE SECOND. Each tier emits "<tier> <number>" and the sort keys on the tier
 # before the number. A bare `sort -n` over the numbers ALONE ordered by ISSUE NUMBER — i.e. oldest
@@ -3497,13 +3570,13 @@ touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 rm -f "$O/.pool-err" "$O/.pool-read"
 {
   if rest_list issues --repo "$OR" --state open --limit 300 --label P0-blocker \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
+    --jq '.[]|'"$POOL_JQ"'|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
   else echo "P0-blocker" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P1-severe \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
+    --jq '.[]|'"$POOL_JQ"'|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
   else echo "P1-severe" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate \
-    --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|OWNER DECISION)";"i")|not)|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+    --jq '.[]|'"$POOL_JQ"'|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 # ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
 # number is what is emitted, so the pool is priority-ordered, oldest-first inside a tier. (The fork's
@@ -5323,6 +5396,11 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
   fi
   # LOCAL, not a top-level constant: product-floor.test.sh extracts THIS FUNCTION BODY alone and drives it.
   local EQ_LIMIT=100 EQ_PAGES=1 eq_need=0 eq_ok=0 eq_n=""
+  # ⛔ THE POOL PREDICATE IS THE FILE-GLOBAL ONE DEFINITION (#10951), AND THIS BODY IS EXTRACTED ALONE —
+  # so the dependency is declared HERE, where the extractor can see it: product-floor.test.sh prepends
+  # the shipped `POOL_JQ=` line to the extracted text. An extractor that forgets fails with a NAMED
+  # message instead of bash's bare "unbound variable", and the definition is never duplicated.
+  local pool_jq="${POOL_JQ:?POOL_JQ is not in scope — a consumer that extracts this function must also extract the POOL_JQ= line from the shipped refresh (tortoise#10951)}"
   if [ -n "${CORE_NOW:-}" ] && [ -n "${CORE_RESERVE:-}" ]; then
     case "$CORE_NOW" in ''|*[!0-9]*) : ;; *)
       eq_need=$(( CORE_RESERVE + EQ_PAGES ))
@@ -5334,11 +5412,15 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
       fi ;;
     esac
   fi
-  # The same reachability filter the pool applies to this tier (unassigned, not an epic/lane/decision title):
-  # an ASSIGNED P0 is someone else's work, and it cannot be dispatched by this box no matter what the floor
-  # does — so it must not stand the floor down either.
+  # ⛔ THE CONTAINER DEFINITION IS NOT IN THIS BLOCK — it is the single `POOL_JQ=` line near the top
+  # (#10951), so the floor and the tiers cannot describe different populations. Do not restate the rule
+  # here: a restated rule is the second copy this consolidation removed.
+  #
+  # The pool's unassigned guard still applies to this tier: an ASSIGNED P0 is someone else's work, and
+  # it cannot be dispatched by this box no matter what the floor does — so it must not stand the floor
+  # down either.
   if rest_list issues --repo "$repo" --state open --limit "$EQ_LIMIT" --label P0-blocker \
-      --jq '.[]|select((.assignees|length)==0)|select(.title|test("^(epic|lane|OWNER DECISION|decision|analysis|investigation)";"i")|not)|.number' \
+      --jq '.[]|'"$pool_jq"'|.number' \
       > "$o/.emergency-issues" 2>/dev/null; then
     if [ "${REST_WINDOW_FILLED:-0}" = "1" ]; then
       weq_degrade "$o" \
