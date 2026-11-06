@@ -99,9 +99,14 @@ O_V="$(bash "$RR" --verdict "$T/vclean/wt" 2>&1)"; RC_V=$?
 [ "$RC_V" -eq 0 ] && has "$O_V" 'verdict=clean' && has "$O_V" 'paths=0' \
   && ok "K1 a CLEAN worktree is verdict=clean paths=0, exit 0" \
   || bad "K1 clean verdict wrong (rc=$RC_V): $O_V"
-has "$O_V" 'slug=fix-3485-vclean' \
-  && ok "K1b the verdict names the classifier's OWN slug — the caller never re-derives the ref name" \
-  || bad "K1b verdict did not carry slug=: $O_V"
+# ⛔ THE SLUG IS #3484's, NOT OURS. `fix/3485-vclean` follows the fleet's declared `<type>/<N>-<slug>`
+# convention, so the classifier answers with the ISSUE-carrying ref component
+# (`issue-3485-vclean`) — and the sweep must consume it rather than re-deriving a branch-shaped name.
+# This arm is therefore also the integration point between #3484 and #3485: it pins that the sweep's
+# caller reads WHAT THE CLASSIFIER WROTE, so a ref the rescue pushed is always the ref the index records.
+has "$O_V" 'slug=issue-3485-vclean' \
+  && ok "K1b the verdict names the classifier's OWN slug (#3484's issue-carrying form) — the caller never re-derives it" \
+  || bad "K1b verdict did not carry slug=issue-3485-vclean: $O_V"
 
 printf 'uncommitted edit\n' >> "$T/vclean/wt/base.txt"
 printf 'untracked\n' > "$T/vclean/wt/new.txt"
@@ -152,9 +157,10 @@ BEFORE_BR="$(ref_of "$A/wt" fix/3485-acc)"
 BEFORE_WT="$(git -C "$A/wt" status --porcelain | sort | tr '\n' '|')"
 O="$(sweep "$T/state-acc" --apply --repo "$A/wt")"; RC=$?
 [ "$RC" -eq 0 ] && ok "A1 --apply exits 0 with the work archived" || bad "A1 --apply exit $RC (want 0): $O"
-SHA="$(ref_of "$A/origin.git" refs/wip/fix-3485-acc)"
-[ -n "$SHA" ] && ok "A2 refs/wip/fix-3485-acc exists on ORIGIN (read back from the bare remote)" \
-               || bad "A2 no refs/wip/fix-3485-acc on origin — the sweep archived nothing"
+# The ref NAME is #3484's: a branch that carries an issue is archived under `refs/wip/issue-<N>-…`.
+SHA="$(ref_of "$A/origin.git" refs/wip/issue-3485-acc)"
+[ -n "$SHA" ] && ok "A2 refs/wip/issue-3485-acc exists on ORIGIN (read back from the bare remote)" \
+               || bad "A2 no refs/wip/issue-3485-acc on origin — the sweep archived nothing"
 has "$(blob_of "$A/origin.git" "$SHA" untracked.txt)" 'brand new untracked file' \
   && ok "A3 the UNTRACKED file's CONTENT is in the archived tree" \
   || bad "A3 the archived tree is missing the untracked file's content"
@@ -167,14 +173,15 @@ has "$(blob_of "$A/origin.git" "$SHA" base.txt)" 'lost to an OOM kill' \
 [ "$(git -C "$A/wt" status --porcelain | sort | tr '\n' '|')" = "$BEFORE_WT" ] \
   && ok "A6 the WORKING TREE is unchanged (safe to run under a live lane)" \
   || bad "A6 the working tree changed — the sweep touched what it was archiving"
-ROW="$(grep 'fix-3485-acc' "$T/state-acc/wip-sweep.tsv" 2>/dev/null | head -1)"
-has "$ROW" 'archived' && has "$ROW" 'refs/wip/fix-3485-acc' && has "$ROW" '3485' \
-  && ok "A7 the INDEX row names the verdict, the ref and the issue link (agent-infra#3484's ask, in the record)" \
-  || bad "A7 the index row is missing verdict/ref/issue: $ROW"
-# ⛔ THE ISSUE COLUMN ITSELF, POSITIVELY (review finding P1). A7's `has "$ROW" '3485'` was satisfied by
-# the BRANCH column (`fix/3485-acc`) and the REF column (`refs/wip/fix-3485-acc`), both present whatever
-# the `issue` column held — so deleting issue derivation entirely left the suite at PASS. Measured: with
-# `issue="$(issue_of "$br")"` replaced by `issue=""` the whole suite stayed green. This arm reads column 9.
+ROW="$(grep 'issue-3485-acc' "$T/state-acc/wip-sweep.tsv" 2>/dev/null | head -1)"
+has "$ROW" 'archived' && has "$ROW" 'refs/wip/issue-3485-acc' \
+  && ok "A7 the INDEX row names the verdict and the ISSUE-CARRYING ref (#3484's naming, in the record)" \
+  || bad "A7 the index row is missing verdict/ref: $ROW"
+# ⛔ THE ISSUE COLUMN ITSELF, POSITIVELY (review finding P1). A7 is satisfied by the REF column
+# (`refs/wip/issue-3485-acc`, whose `3485` arrives from the ref name) and by the BRANCH column
+# (`fix/3485-acc`), both of which are present whatever the `issue` column holds — so deleting issue
+# derivation entirely left the suite at PASS. Measured: with `issue="$(issue_of "$br")"` replaced by
+# `issue=""` the whole suite stayed green while A7 passed. This arm reads column 9 directly.
 ACCIssue="$(awk -F'\t' '$4 == "fix/3485-acc" {print $9; exit}' "$T/state-acc/wip-sweep.tsv" 2>/dev/null)"
 [ "$ACCIssue" = "3485" ] \
   && ok "A7b the index row's issue COLUMN is 3485 (derived from the branch, not inferred from another column)" \
