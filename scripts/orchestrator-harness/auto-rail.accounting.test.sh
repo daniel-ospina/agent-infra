@@ -1686,10 +1686,18 @@ case "$(sed -n "$(( _b1 + 1 )),\$p" "$POSTED")" in
 esac
 # …and the LOOP must pass the basis it computed: a bare publish (no 5th argument) would silently fall back
 # to the measured wording, which is the inert shape this fix replaced.
-grep -qF 'publish_review_state "$repo" "$pr" review-retries-exhausted "$head" "$_rbasis"' "$SUT" \
-  || bad "the loop must PASS its basis to the EXHAUSTED publish ('… review-retries-exhausted \"\$head\" \"\$_rbasis\"') — without the argument the comment falls back to asserting the CAP as a measured count, which is the defect this change closes"
-grep -qF 'if review_ledger_unreadable "$_ratt"; then _rbasis=cap; else _rbasis=; fi' "$SUT" \
-  || bad "the loop must ASK, directly, whether the ledger is unreadable ('if review_ledger_unreadable \"\$_ratt\"; then _rbasis=cap; else _rbasis=; fi') — a flag set inside \`\$(review_attempts …)\` never reaches the publisher (subshell)"
+# ⛔ ANCHORED WHOLE-LINE PINS, NOT SUBSTRINGS (review round 4, P2, REPRODUCED four ways). These shipped
+# statements must EXECUTE; a `grep -qF` on a literal that starts mid-statement is satisfied by a DEAD line —
+# `#`-prefixing the log line or the publish, or replacing `log_line` with `:`, left every arm below GREEN while
+# the stuck head emitted no exhaustion line at all and #3489's marker never posted. That is exactly the
+# "broken or disarmed with the suite still green" defect this file's header refuses. The whole line is the
+# unit, anchored at its own start, which is this file's existing convention for the same class (`pending)` arm).
+_PUBRE='^[[:space:]]*publish_review_state "\$repo" "\$pr" review-retries-exhausted "\$head" "\$_rbasis"$'
+_RBASRE='^[[:space:]]*if review_ledger_unreadable "\$_ratt"; then _rbasis=cap; else _rbasis=; fi$'
+grep -qE "$_PUBRE" "$SUT" \
+  || bad "the loop must PASS its basis to the EXHAUSTED publish ('… review-retries-exhausted \"\$head\" \"\$_rbasis\"') — without the argument the comment falls back to asserting the CAP as a measured count, which is the defect this change closes; ⛔ AND THE STATEMENT MUST BE LIVE (a `#` prefix or a `:` in place of the call keeps a substring match green while nothing is published)"
+grep -qE "$_RBASRE" "$SUT" \
+  || bad "the loop must ASK, directly, whether the ledger is unreadable ('if review_ledger_unreadable \"\$_ratt\"; then _rbasis=cap; else _rbasis=; fi') — a flag set inside \`\$(review_attempts …)\` never reaches the publisher (subshell); ⛔ ANCHORED so a commented-out computation cannot satisfy it"
 # ⛔ AND THE **LOG** HALF MUST BE PINNED AS HARD AS THE COMMENT HALF (review round 7, P2, REPRODUCED). The
 # delta's own comment says "the published comment AND the log say that", and only the comment had an arm: the
 # reviewer restored the single unconditional log line (the fail-closed cap printed as "N dispatch(es)" — a
@@ -1702,12 +1710,17 @@ grep -qF 'if review_ledger_unreadable "$_ratt"; then _rbasis=cap; else _rbasis=;
 _R3A=$(grep -nF 'if [ "$_ract" -eq 3 ]; then' "$SUT" | head -1 | cut -d: -f1)
 _R3B=$(grep -nF 'if [ "$_ract" -eq 2 ]; then' "$SUT" | head -1 | cut -d: -f1)
 _RBR=$(grep -nF 'if [ "$_rbasis" = cap ]; then' "$SUT" | head -1 | cut -d: -f1)
-_RCAP=$(grep -nF 'REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read' "$SUT" | head -1 | cut -d: -f1)
-_RMEA=$(grep -nF 'REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside' "$SUT" | head -1 | cut -d: -f1)
-grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read' "$SUT" \
-  || bad "the EXHAUSTED LOG LINE must not print the fail-closed CAP as a measured count — when the ledger cannot be read there is no log line stating the non-measured fact, so the operator's primary instrument asserts '\$_rattn dispatch(es)' as a past-tense fact the loop never measured (the defect this delta closes, restored, with this suite GREEN)"
-grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside' "$SUT" \
-  || bad "the MEASURED log line must still exist ('REVIEW-RETRIES-EXHAUSTED at \$head — \$_rattn dispatch(es) inside') — dropping it trades a fabricated count for no count at all in the readable case"
+# ⛔ THE LOCATORS ARE ANCHORED TOO: a substring locator would find a COMMENTED-OUT copy of the line first and
+# then assert the clause it is about to check against a dead line (reproduced — `#`-prefixing the CAP log left
+# `_RCAPTXT` holding the commented text and every clause arm green).
+_CAPRE='^[[:space:]]*log_line "\$repo #\$pr REVIEW-RETRIES-EXHAUSTED at \$head — the attempt ledger could not be read'
+_MEARE='^[[:space:]]*log_line "\$repo #\$pr REVIEW-RETRIES-EXHAUSTED at \$head — \$_rattn dispatch\(es\) inside'
+_RCAP=$(grep -nE "$_CAPRE" "$SUT" | head -1 | cut -d: -f1)
+_RMEA=$(grep -nE "$_MEARE" "$SUT" | head -1 | cut -d: -f1)
+grep -qE "$_CAPRE" "$SUT" \
+  || bad "the EXHAUSTED LOG LINE must not print the fail-closed CAP as a measured count — when the ledger cannot be read no LIVE log line states the non-measured fact, so the operator's primary instrument asserts '\$_rattn dispatch(es)' as a past-tense fact the loop never measured (the defect this delta closes, restored, with this suite GREEN); ⛔ anchored, so a `#`-commented or `:`-stubbed statement cannot satisfy it"
+grep -qE "$_MEARE" "$SUT" \
+  || bad "the MEASURED log line must still be LIVE ('log_line \"\$repo #\$pr REVIEW-RETRIES-EXHAUSTED at \$head — \$_rattn dispatch(es) inside') — dropping or commenting it trades a fabricated count for no count at all in the readable case"
 case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
   *[!0-9]*) bad "the EXHAUSTED log lines could not all be located (rc3=${_R3A:-MISSING} rc2=${_R3B:-MISSING} branch=${_RBR:-MISSING} capLog=${_RCAP:-MISSING} measuredLog=${_RMEA:-MISSING}) — the log stub changed shape, so this arm can no longer see it" ;;
   *)
@@ -1729,10 +1742,13 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
       *)
         [ "$_RCONT" -eq "$(( _R3F - 1 ))" ] \
           || bad "the rc-3 drain must END IN ITS OWN \`continue\` (the arm closes at ${_R3F}, but the line before that close is not one; first \`continue\` found at ${_RCONT}) — without it the EXHAUSTED path falls through the -eq 2 arm into launch_review and RE-BUYS the paid review this state exists to stop, while the containment arm silently widens to the NEXT arm's terminator and stays green (reproduced, review round 8)"
-        _R3BODY=$(sed -n "${_R3A},${_R3F}p" "$SUT")
-        grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read' <<<"$_R3BODY" \
+        # ⛔ COMMENT LINES ARE STRIPPED FROM THE BODY before containment is asked: the extraction includes the
+        # arm's own prose, and this region's comments QUOTE the very literals being located, so an unstripped
+        # body would satisfy containment from a comment after the code was disarmed (reproduced).
+        _R3BODY=$(sed -n "${_R3A},${_R3F}p" "$SUT" | grep -v '^[[:space:]]*#')
+        grep -qE "$_CAPRE" <<<"$_R3BODY" \
           || bad "the CAP log line must be INSIDE the rc-3 drain (between the \`-eq 3\` test at ${_R3A} and its own \`continue\` at ${_RCONT}) — moved below the drain it is unreachable on the EXHAUSTED path, so a stuck head emits NO exhaustion line at all while the ordering arm still passes (reproduced, review round 8)"
-        grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside' <<<"$_R3BODY" \
+        grep -qE "$_MEARE" <<<"$_R3BODY" \
           || bad "the MEASURED log line must be INSIDE the rc-3 drain too (between lines ${_R3A} and ${_RCONT}) — outside it, the readable case prints no count where the count is exactly what it should state" ;;
     esac
     # ⛔ AND THE BRANCH ALONE IS NOT ENOUGH — the CAP line must not CARRY the count (page 2 of the same defect,
@@ -1755,6 +1771,20 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
     esac
     case "$_RCAPTXT" in
       *'$_rattn'*) bad "the CAP log line must NOT print \$_rattn — that value IS the fail-closed cap, so putting it in this line asserts a past-tense measurement the loop never took, which is precisely the defect (adding it back kept this suite green before this arm existed)" ;;
+    esac
+    # ⛔ THE SIBLING DRAIN NEEDS THE SAME TERMINATOR PIN, AND FOR THE SAME MONEY (review round 4, P1, REPRODUCED).
+    # The `-eq 2` arm publishes "review-found-issues" / "review-record-unbound" and then MUST `continue`; deleting
+    # that one word left this suite GREEN while control fell through `review_should_defer 0` (false) into
+    # `launch_review` — a PAID dispatch on the head it has just told the operator "auto-rail will NOT re-review
+    # this head". Same class, same money as the rc-3 arm above, and the more common path (every issue-finding
+    # review reaches it). Pinned identically: the arm's own 8-space `fi`, and the line before it must be the
+    # `continue`.
+    _R2F=$(awk -v a="$_R3B" 'NR>a && /^        fi$/ {print NR; exit}' "$SUT")
+    _R2C=$(awk -v a="$_R3B" -v b="${_R2F:-0}" 'NR>a && NR<b && /^[[:space:]]*continue$/ {print NR; exit}' "$SUT")
+    case "${_R2F:-x}${_R2C:-x}" in
+      *[!0-9]*) bad "the rc-2 arm's own terminator could not be located (arm opens at ${_R3B}, closes at ${_R2F:-MISSING}, its \`continue\` at ${_R2C:-MISSING}) — the drain shape changed, so its fall-through cannot be measured" ;;
+      *) [ "$_R2C" -eq "$(( _R2F - 1 ))" ] \
+           || bad "the rc-2 arm must END IN ITS OWN \`continue\` (it closes at ${_R2F}, but the line before that close is not one; first \`continue\` found at ${_R2C}) — without it the arm that just published 'auto-rail will NOT re-review this head' falls through into launch_review and BUYS that review (fall-through reproduced with this suite GREEN, review round 4)" ;;
     esac ;;
 esac
 
