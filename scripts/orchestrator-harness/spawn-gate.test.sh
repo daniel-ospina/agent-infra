@@ -2831,6 +2831,7 @@ ck "every AGENT_*_REFUSED code is ACCOUNTED FOR — named in a caller's CODE or 
 # the ONE scanner defined at the top of this file, and $CODE_MSG carries its readings so a red says
 # WHICH of the three ways it failed: a required declarer absent or silent, a declaration it could not
 # read as a code, or a shared-code group that is not exactly the sanctioned table.
+printf 'DBG CODE_RC=%s\nDBG shared=[%s]\nDBG sanctioned=[%s]\nDBG absent=[%s] unk=[%s] unp=[%s] stale=[%s] foreign=[%s] conf=[%s] unread=[%s] n=[%s]\n' "$CODE_RC" "$_cv_shared" "$_codes_sanctioned" "$_cv_absent" "$_cv_unknown" "$_cv_unparsed" "$_cv_stale" "$_cv_foreign" "$_cv_conf" "$_cv_unread" "$_cv_n" >>/tmp/dbg.txt
 ck "no two refusal gates claim the SAME code across the deploy unit — the only sanctioned shares are 78's cannot-verify pair and 80's one-gate-two-names alias ($CODE_MSG)" $CODE_RC
 
 # ── THE MUTATIONS: the guard must go RED on each way a parse can MISS a claim ───────────────────
