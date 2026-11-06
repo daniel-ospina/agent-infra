@@ -2267,3 +2267,33 @@ def test_the_cli_argv_surface_is_real(monkeypatch, no_cache, capsys):
     # (c) A MALFORMED OR UNKNOWN ARGUMENT IS A USAGE ERROR (2), never a silent default.
     for argv in (["--repo"], ["--repo", "noslash"], ["--bogus"]):
         assert bp.main(argv) == 2, "%r must be a usage error (2)" % (argv,)
+
+
+def test_T_fix_repos_follows_the_repo_argument():
+    """[P2, review cycle 7] The merge's `FIX_REPOS` re-derivation was unpinned AND too wide.
+
+    Two defects, one arm each: (a) `globals()["FIX_REPOS"] = _derive_fix_repos(REPO)` could be replaced by
+    `pass` with all 49 tests still green, because every `--repo` arm stubs `compute` and never consumes
+    FIX_REPOS; (b) `_derive_fix_repos` kept a hardcoded tail, so `--repo owner/other` also counted
+    agent-infra PRs as coverage for that repo's issues — the attribution failure the module forbids.
+    Deleting the re-derivation, or restoring the unconditional tail, must red this arm.
+    """
+    # ⛔ `main(["--repo", …])` MUTATES MODULE GLOBALS, so this arm restores them — without that it
+    # leaves REPO/FIX_REPOS repointed and every later arm inherits the wrong repo (measured: this test
+    # passes alone and failed in the full run for exactly that reason).
+    saved = (bp.REPO, bp.FIX_REPOS)
+    try:
+        # ⛔ DO NOT ASSERT THE AMBIENT DEFAULT: an earlier `--repo` arm in this file may already have
+        # repointed the globals (measured). Establish the baseline by ASKING for the tracker repo.
+        assert bp.main(["--repo", "daniel-ospina/tortoise", "--json"]) in (0, 1)
+        assert bp.FIX_REPOS == ("daniel-ospina/tortoise", "daniel-ospina/agent-infra"), bp.FIX_REPOS
+        assert bp.main(["--repo", "owner/other", "--json"]) in (0, 1), "usage must not fail"
+        # (a) the re-derivation actually ran…
+        assert bp.FIX_REPOS == ("owner/other",), bp.FIX_REPOS
+        # (b) …and it does NOT inherit the tortoise-specific tail
+        assert "daniel-ospina/agent-infra" not in bp.FIX_REPOS, bp.FIX_REPOS
+        # naming the tail repo explicitly is its own single-element set, not a duplicate
+        assert bp.main(["--repo", "daniel-ospina/agent-infra", "--json"]) in (0, 1)
+        assert bp.FIX_REPOS == ("daniel-ospina/agent-infra",), bp.FIX_REPOS
+    finally:
+        bp.REPO, bp.FIX_REPOS = saved

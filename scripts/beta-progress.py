@@ -48,7 +48,9 @@ REPO = DEFAULT_REPO
 # line. `mcp-servers/orchestrator/server.py::_census` is exactly that caller: it fans out over
 # `repos` with `["--repo", repo, "--json"]`. Three things make it impossible: the payload NAMES the
 # repo it measured, a cache whose `repo` does not match is a MISS, and the file is keyed per repo.
-REPO = "daniel-ospina/tortoise"
+# ⛔ (a duplicate `REPO = "daniel-ospina/tortoise"` stood here after the merge — identical
+# value, so no behaviour changed, but two definitions of one name is how a future edit changes one and
+# not the other, and `_cache_path()` keys off `REPO == DEFAULT_REPO`.)
 # ⛔ THE TRACKER IS NOT THE ONLY REPO A FIX LANDS IN (tortoise#10951). `REPO` is where the ISSUES
 # live; it is not where every fix is written. This backlog is worked by the harness, whose PRs are
 # under `agent-infra`, so a single-repo PR read cannot see the PR a fix actually lives in. This
@@ -85,7 +87,17 @@ _FIX_REPOS_TAIL = "daniel-ospina/agent-infra"
 
 
 def _derive_fix_repos(repo):
-    return (repo, _FIX_REPOS_TAIL) if repo != _FIX_REPOS_TAIL else (repo,)
+    """Repos a fix for <repo>'s issues may land in.
+
+    ⛔ THE EXTRA SEPARATE REPO IS TORTOISE-BACKLOG-SPECIFIC (review cycle 7, P2). Re-deriving only the
+    HEAD kept a hardcoded tail, so `--repo owner/other` returned `('owner/other',
+    'daniel-ospina/agent-infra')` — counting agent-infra PRs as coverage for ANOTHER repo's issues,
+    which is the attribution failure this module's `--repo` comment exists to forbid, relocated. The
+    tail applies only when the tracker IS the one the tail was measured for.
+    """
+    if repo == DEFAULT_REPO:
+        return (repo, _FIX_REPOS_TAIL)
+    return (repo,)
 CACHE = os.path.expanduser("~/.pi/agent/state/beta-progress.json")
 
 
