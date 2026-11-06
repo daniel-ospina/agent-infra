@@ -231,18 +231,20 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
   if [ "$?" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
-    # ⛔ REFUND HERE TOO (#3511 review cycle 3, P2; cause corrected in cycle 7, P3). `wt_provision`
-    # refuses `rc=2` for reasons that are TRANSIENT even though the message reads as permanent — the
-    # reachable one on this path is its young `initializing` lock, whose own `WT_RESULT` says "retry
-    # next cycle" (`wt-lifecycle.sh`), plus a rolled-back `worktree add` failure; neither says the
-    # branch is wrong. (⛔ NOT "a live process still holds `fix-$PR`": `wt_provision` has no holder
-    # probe — `wt_live_holders` is called only from `wt_reap_if_empty` — and this arm is reached only
-    # when no worktree in this repo has `$BR` checked out.) This arm exited without refunding while
-    # the branch refusal three lines up does. The rule this file already states (#1720, above
-    # `refund_gate_attempt`): the controller books the attempt UPSTREAM of every gate, so a refusal
-    # that ran no fixer must give it back or three transient refusals reach MAX_FIX_TRIES and the PR
-    # is PARKED "needs a human" having never had a single fixer run. The refund is a no-op on a
-    # manual (CTRL=0) run.
+    # ⛔ REFUND HERE TOO (#3511 review cycle 3, P2; cause corrected in cycles 7 and 8, P3). This arm
+    # exited without refunding while the branch refusal three lines up does, and the rule this file
+    # already states (#1720, above `refund_gate_attempt`) does not ask the refusal to be transient: the
+    # controller books the attempt UPSTREAM of every gate, so a refusal that ran no fixer must give it
+    # back, or three refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never
+    # had a single fixer run (#2223 makes the same point for a DISK refusal, which never clears by
+    # waiting). ⛔ The causes reachable from THIS call site are persistent, and naming a false one is
+    # what two review cycles caught: `wt_provision` has NO holder probe (`wt_live_holders` is called
+    # only from `wt_reap_if_empty`), and its young `initializing` arm cannot fire here because the
+    # `[ -z "$WT" ]` guard at `:189` and `wt_worktree_path_for_branch` read the SAME `git worktree
+    # list --porcelain` branch match — an empty `$WT` means `wt_registered` is empty too. What is left
+    # is the unregistered-foreign-directory refusal, the different-branch record, and the ghost-ref
+    # removal race (all `rc=2`), plus a rolled-back `worktree add` failure, which is `rc=1` and names
+    # its own `rc` in `$WT_RESULT`. The refund is a no-op on a manual (CTRL=0) run.
     refund_gate_attempt
     exit 1
   fi

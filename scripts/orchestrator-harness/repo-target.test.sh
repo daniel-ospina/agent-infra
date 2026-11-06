@@ -296,12 +296,19 @@ c4=$?
 { [ "$c4" -eq 72 ] && [ -f "$FO/state/fixgate-4004-cafebabe" ] \
     && [ "$(cat "$FO/state/fixcount-4004" 2>/dev/null)" = "1" ]; }; ck "C4 --argv (CTRL=1) identity refusal -> REFUNDS fixcount AND writes fixgate-<PR>-<head> (rc=$c4)" $?
 
-# ⛔ A WORKTREE-MATERIALISATION REFUSAL MUST REFUND TOO (#3511 review cycle 3, P2). `wt_provision`
-# can refuse rc=2 for a reason that LOOKS permanent but is often transient (a live process still holds
-# `fix-<PR>`), and this arm exited without refunding while the identity refusals above do. The rule is
-# the file's own (#1720): the controller books the attempt UPSTREAM of every gate, so a refusal that
-# ran no fixer must give it back — otherwise three transient refusals reach MAX_FIX_TRIES and the PR
-# is PARKED "needs a human" having never had a single fixer run.
+# ⛔ A WORKTREE-MATERIALISATION REFUSAL MUST REFUND TOO (#3511 review cycle 3, P2; cause restated
+# cycle 8, P3). This arm exited without refunding while the identity refusals above do, and the rule
+# is the file's own (#1720, and #2223 above `refund_gate_attempt`): the controller books the attempt
+# UPSTREAM of every gate, so a refusal that ran no fixer must give it back — otherwise three refusals
+# reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never had a single fixer run. That
+# rule does not depend on the refusal being TRANSIENT: the #2223 note makes the point directly ("a
+# DISK refusal never clears by waiting, so this is deterministic") — a permanent misconfiguration
+# refunded forever is a loud stall, while "attempts exhausted" is a FALSE sentence about work that
+# never ran. ⛔ The reachable `rc=2` causes here are the unregistered-foreign-directory arm and the
+# different-branch record (both persistent), plus the ghost-ref removal race — NOT a live holder
+# (`wt_provision` has no holder probe) and NOT the young `initializing` lock (unreachable from this
+# call site: the `[ -z "$WT" ]` guard above and `wt_worktree_path_for_branch` read the SAME `git
+# worktree list --porcelain` branch match, so an empty `$WT` means `wt_registered` is empty too).
 # The refusal is driven through the UNREGISTERED-DIRECTORY arm (a foreign directory at the worktree
 # path), which is `wt_provision`'s other rc=2 and needs no git state to set up.
 # ⛔ THE BRANCH MUST EXIST FIRST. Without it `fix-one.sh` refuses at the BRANCH assertion (rc=72) long
