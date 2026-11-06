@@ -437,10 +437,17 @@ REAL="__REALGIT__"
 MODE="__MODE__"
 SHDIR="__SHDIR__"
 SLUG="__SLUG__"
-ispush=0; iskey=0
+ispush=0; iskey=0; helper=""
 for a in "$@"; do
   [ "$a" = push ] && ispush=1
-  [ "$a" = credential.helper=osxkeychain ] && iskey=1
+  # ⛔ ANY NAMED HELPER COUNTS, AND ITS NAME IS RECORDED (review round 4, P1). Hard-coding
+  # `credential.helper=osxkeychain` in `push_with_helper` was FULLY GREEN, because every fixture pinned
+  # that exact name — so `BG_RESCUE_PUSH_HELPER=<operator's store>` could be ignored while the message
+  # still named it. The clearing argument (`credential.helper=`, empty) is not a helper selection.
+  case "$a" in
+    credential.helper=)  : ;;
+    credential.helper=*) iskey=1; helper="${a#credential.helper=}" ;;
+  esac
 done
 # The real github.com refusal, verbatim (backticks included) — so the matcher is tested on the text
 # that actually arrives, not on a simplified version written to fit the regex.
@@ -468,7 +475,7 @@ if [ "$ispush" -eq 1 ]; then
   # attempt 1 and ABSENT on attempt 2. "It retried" alone passes an implementation that retries with the
   # IDENTICAL credential, which cannot succeed.
   echo "GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset}" >> "$SHDIR/attempts.env.$n"
-  if [ "$iskey" -eq 1 ]; then echo keychain >> "$SHDIR/attempts.who"; else echo plain >> "$SHDIR/attempts.who"; fi
+  if [ "$iskey" -eq 1 ]; then echo keychain >> "$SHDIR/attempts.who"; echo "$helper" > "$SHDIR/attempts.helper.$n"; else echo plain >> "$SHDIR/attempts.who"; fi
   case "$MODE" in
     wf_then_ok)   [ "$iskey" -eq 1 ] || { wf_reject; exit 1; } ;;
     wf_always)    wf_reject; exit 1 ;;
@@ -478,6 +485,10 @@ if [ "$ispush" -eq 1 ]; then
     # moment it is gone — so this mode measures whether the retry removed the shadow, not whether it
     # said the words.
     wf_shadowed)  if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then wf_reject; exit 1; fi ;;
+    # ⛔ AND THE HELPER'S NAME IS PART OF THE CONTRACT (review round 4, P1): a remote whose credential
+    # lives in `store` refuses anything else, so "the operator's named helper was actually used" is
+    # measured rather than assumed from the message.
+    wf_then_store) [ "$helper" = "store" ] || { wf_reject; exit 1; } ;;
     plain_ok)     : ;;
     other)        [ "$iskey" -eq 1 ] || { other_reject; exit 1; } ;;
     authfail)     auth_reject; exit 1 ;;
@@ -695,6 +706,14 @@ case "$OUT" in
     ok "wfthenauth: the retry's DIFFERENT cause is reported separately (both reasons reachable to the operator)" ;;
   *) bad "wfthenauth: the retry's own cause is not reported alongside the first — $OUT" ;;
 esac
+# ⛔ ORDER, NOT PRESENCE (review round 4, P2). The assertion above accepts EITHER ordering, so swapping
+# WHY[0] and WHY[1] — printing the retry's cause first, which is the wrong operator action — was fully
+# green. The first attempt's cause must come FIRST in the output.
+WF_FIRST_LINE="$(printf '%s\n' "$OUT" | awk '/cause: WORKFLOW SCOPE/ {print NR; exit}')"
+WF_RETRY_LINE="$(printf '%s\n' "$OUT" | awk '/ALSO failed/ {print NR; exit}')"
+[ -n "$WF_FIRST_LINE" ] && [ -n "$WF_RETRY_LINE" ] && [ "$WF_FIRST_LINE" -lt "$WF_RETRY_LINE" ] \
+  && ok "wfthenauth: the FIRST cause is printed BEFORE the retry's (line $WF_FIRST_LINE vs $WF_RETRY_LINE)" \
+  || bad "wfthenauth: the retry's cause prints before the first (lines '${WF_FIRST_LINE:-none}' vs '${WF_RETRY_LINE:-none}') — the operator is sent after the wrong cause"
 [ -z "$(ref_of "$T/wfthenauth/origin.git" refs/wip/fix-lane-one)" ] \
   && ok "wfthenauth: nothing published, consistent with the failure" \
   || bad "wfthenauth: a ref landed while the run reported failure"
@@ -732,8 +751,8 @@ echo; echo "── the retry's CREDENTIAL is chosen per host and never re-sends 
 #   wfunshadow — the candidate ASKED FOR (`BG_RESCUE_PUSH_UNSHADOW=1`), on every platform — which is
 #                also the only way to reach it on macOS, and is what makes that seam tested
 #   wfhelper   — the macOS DEFAULT (`osxkeychain`), on Darwin
-assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label>
-  local f="$T/$1" l="$2" sha r1 r2 force=0 p
+assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label> <attempt-1 token line>
+  local f="$T/$1" l="$2" tok1="$3" sha r1 r2 force=0 p
   sha="$(ref_of "$f/origin.git" refs/wip/fix-lane-one)"
   [ "$RC" -eq 0 ] \
     && ok "$l: exit 0 — the snapshot is RESCUED with no osxkeychain anywhere" \
@@ -741,9 +760,9 @@ assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label>
   [ "${ATTEMPTS:-0}" = "2" ] \
     && ok "$l: exactly TWO attempts (one shadowed, one with the shadow removed)" \
     || bad "$l: ${ATTEMPTS:-0} attempt(s) (want exactly 2) — no retry, or a retry storm"
-  grep -qx 'GH_TOKEN=shadow-readonly-pat GITHUB_TOKEN=unset' "$f/shim/attempts.env.1" 2>/dev/null \
+  grep -qx "$tok1" "$f/shim/attempts.env.1" 2>/dev/null \
     && ok "$l: attempt 1 really ran SHADOWED by the ambient token (so the arm is not vacuous)" \
-    || bad "$l: attempt 1 did not see the shadow token — the fixture proves nothing: $(cat "$f/shim/attempts.env.1" 2>/dev/null)"
+    || bad "$l: attempt 1 did not see the shadow token '$tok1' — the fixture proves nothing: $(cat "$f/shim/attempts.env.1" 2>/dev/null)"
   grep -qx 'GH_TOKEN=unset GITHUB_TOKEN=unset' "$f/shim/attempts.env.2" 2>/dev/null \
     && ok "$l: attempt 2 ran with the ambient token REMOVED (that removal is the mechanism)" \
     || bad "$l: attempt 2 still carried the ambient token — the retry re-sent the credential that was just refused: $(cat "$f/shim/attempts.env.2" 2>/dev/null)"
@@ -795,7 +814,7 @@ if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
 else
   try_rescue wfshadow wf_shadowed fix/lane-one \
     "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN GH_TOKEN=shadow-readonly-pat"
-  assert_unshadow_arm wfshadow wfshadow
+  assert_unshadow_arm wfshadow wfshadow 'GH_TOKEN=shadow-readonly-pat GITHUB_TOKEN=unset'
 fi
 
 # ⛔ THE CANDIDATE ASKED FOR BY NAME (`BG_RESCUE_PUSH_UNSHADOW=1`) — platform-independent, because it is
@@ -807,7 +826,7 @@ fi
 # `env: '-u': No such file or directory`.
 try_rescue wfunshadow wf_shadowed fix/lane-one \
   "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN BG_RESCUE_PUSH_UNSHADOW=1 GH_TOKEN=shadow-readonly-pat"
-assert_unshadow_arm wfunshadow wfunshadow
+assert_unshadow_arm wfunshadow wfunshadow 'GH_TOKEN=shadow-readonly-pat GITHUB_TOKEN=unset'
 
 # ⛔ THE macOS DEFAULT, ASSERTED WHERE IT EXISTS. Without this arm the `uname = Darwin` branch is green
 # nowhere: red on the Mac (via the bug above) and dead code on Linux.
@@ -865,7 +884,62 @@ esac
 fi
 
 
-# ⛔ AND WHEN NO CANDIDATE CAN BE A DIFFERENT CREDENTIAL, THERE IS NO RETRY. A second attempt carrying the
+# ⛔ THE OPERATOR'S HELPER NAME IS PART OF THE CONTRACT (review round 4, P1). Every other fixture pins
+# `BG_RESCUE_PUSH_HELPER=osxkeychain`, which is ALSO the Darwin default — so hard-coding that name in
+# `push_with_helper` was fully green while the message still named whatever the operator asked for. This
+# arm names a different store and the stub accepts only that one.
+try_rescue wfhelpername wf_then_store fix/lane-one \
+  "-u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=store"
+[ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfhelpername: a NON-DEFAULT helper named by the operator is used and the snapshot is rescued" \
+  || bad "wfhelpername: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the named helper was not used — $OUT"
+[ "$(cat "$T/wfhelpername/shim/attempts.helper.2" 2>/dev/null)" = "store" ] \
+  && ok "wfhelpername: the retry ran with the helper the operator NAMED (not a hard-coded default)" \
+  || bad "wfhelpername: the retry's helper was '$(cat "$T/wfhelpername/shim/attempts.helper.2" 2>/dev/null)' — a hard-coded default is not the operator's choice"
+case "$OUT" in
+  *"the store credential"*) ok "wfhelpername: the message names the credential that actually ran" ;;
+  *) bad "wfhelpername: the message does not name the operator's helper — $OUT" ;;
+esac
+
+# ⛔ THE OTHER HALF OF THE SHADOW PREDICATE (review round 4, P1): `GITHUB_TOKEN` alone. gh reads EITHER
+# variable, and cell/CI setups often export only this one; dropping `-u GITHUB_TOKEN`, or narrowing the
+# predicate to `GH_TOKEN` alone, was green with only `GH_TOKEN` exercised.
+# ⛔ AND IT ASKS FOR THE CANDIDATE BY NAME, so it is platform-NEUTRAL: on macOS the DEFAULT is
+# `osxkeychain`, and an arm that relied on the default would be a false red there — the exact defect
+# rounds 1 and 3a each fixed. `BG_RESCUE_PUSH_UNSHADOW=1` (conditional on an ambient token, which this
+# arm sets) is what makes the unshadow path run on every host.
+try_rescue wfshadow2 wf_shadowed fix/lane-one \
+  "-u BG_RESCUE_PUSH_HELPER -u GH_TOKEN BG_RESCUE_PUSH_UNSHADOW=1 GITHUB_TOKEN=shadow-readonly-pat"
+assert_unshadow_arm wfshadow2 wfshadow2 'GH_TOKEN=unset GITHUB_TOKEN=shadow-readonly-pat'
+
+# ⛔ A RETRIED RESCUE THAT IS STILL PARTIAL MUST EXIT 2 (review round 4, P2). The partial-archive guard
+# was pinned only on a NON-retried rescue, so `if [ "${#SKIPPED[@]}" -gt 0 ] && [ "$RETRIED" -eq 0 ]` — a
+# snapshot that touches `.github/workflows` AND carries an unarchivable path reporting exit 0 while a
+# path is still only on disk — was fully green. That combination is newly reachable: this PR is what
+# makes a retried push succeed.
+mk_repo wfpartial || { echo "❌ fixture failed (wfpartial)"; exit 1; }
+P2="$T/wfpartial"
+mkdir -p "$P2/wt/.github/workflows"
+printf 'name: ci\non: push\n' > "$P2/wt/.github/workflows/ci.yml"
+printf 'the work that must survive\n' > "$P2/wt/lane-work.txt"
+mkdir -p "$P2/wt/extra"; git -C "$P2/wt/extra" init -q 2>/dev/null   # nested repo, unborn HEAD
+printf 'inner\n' > "$P2/wt/extra/inner.txt"
+mk_pushshim "$P2/shim" wf_then_ok fix-lane-one || echo "❌ shim failed (wfpartial)"
+OUT="$(env -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=osxkeychain \
+  PATH="$P2/shim:$PATH" bash "$RR" "$P2/wt" "workflow-bearing and partial" 2>&1)"; RC=$?
+PATT=0; [ -f "$P2/shim/attempts" ] && PATT="$(cat "$P2/shim/attempts")"
+[ "$PATT" = "2" ] \
+  && ok "wfpartial: the retry DID run (2 attempts), so this arm is about the partial guard and not the gate" \
+  || bad "wfpartial: ${PATT} attempt(s) (want 2) — the refusal gate did not fire, so the arm proves nothing"
+[ "$RC" -eq 2 ] \
+  && ok "wfpartial: a RETRIED rescue that still skipped a path exits 2 (not a cheerful 0)" \
+  || bad "wfpartial: rc=$RC (want 2) — a retried PARTIAL archive was reported as a complete rescue"
+case "$OUT" in
+  *"the rescue above is PARTIAL"*) ok "wfpartial: the PARTIAL line is still printed after a retried push" ;;
+  *) bad "wfpartial: the partial warning is missing — $OUT" ;;
+esac
+
+# ⛔ AND NO CANDIDATE CAN BE A DIFFERENT CREDENTIAL, THERE IS NO RETRY. A second attempt carrying the
 # credential the remote just refused cannot succeed, and in the second before a cap kill it costs a
 # 45 s bound to re-learn what the first attempt said. What must NOT happen is that the run reads like "a
 # credential was rejected": the operator's action differs — supply one, via the documented seam.

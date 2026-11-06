@@ -1627,7 +1627,7 @@ ck "F3 …and the append-only ledger still holds a row for it — 'one row per t
 
 # ⛔ F4 — A PATH *INSIDE* A WORKTREE IS NOT ITS ROOT (review P2, round 4, PR #2975). The guard used to be
 # `rev-parse --git-dir`, which SUCCEEDS ANYWHERE INSIDE A REPOSITORY, so a subdirectory was ratified
-# here, measured, and then refused one layer down by `bg-rescue-wip.sh:96-103` — the record said the
+# here, measured, and then refused one layer down by `bg-rescue-wip.sh:117-123` — the record said the
 # RESCUE failed when the POINTER was wrong. The pre-check now carries the callee's own predicate, so
 # the verdict is `not-a-worktree` and it names the enclosing worktree.
 mkdir -p "$WT/nested/deep"
@@ -1786,7 +1786,7 @@ git -C "$WT" config url."$BARE".insteadOf "$GHURL"
 # ── I) A STALE refs/wip-local IS NOT THIS RUN'S ARCHIVE (review F1, round 3) ──────────────────────
 # `refs/wip-local/<slug>` lives in the repo's COMMON git dir and is keyed by branch slug alone, so an
 # EARLIER rescue of this branch leaves one behind. A run that archives NOTHING — an unwritable TMPDIR
-# is the cheap reproduction of `bg-rescue-wip.sh:62`, the full-disk shape — must not be recorded as
+# is the cheap reproduction of `bg-rescue-wip.sh:81`, the full-disk shape — must not be recorded as
 # `archived-local`, because that is a durability verdict about work that is still SINGLE-COPY. This
 # arm is the exact case: the ref exists (arms A/G wrote it), the rescue cannot archive, and the record
 # must say FAILED with no ref, naming the stale one as stale.
@@ -1880,8 +1880,8 @@ rm -rf "$WT/hidden"
 
 echo
 # ── K) A PUSHED ARCHIVE WITH NO LOCAL PIN IS NOT "nothing" (review P2, round 5, PR #2975) ─────────
-# ⛔ `bg-rescue-wip.sh` writes `refs/wip-local/<slug>` under a GUARD (`:246-252` warns and carries on), and
-# then exits 0 once the PUSH succeeds (`:362-368`). So `rc2=0` + no new local ref has TWO causes, and the
+# ⛔ `bg-rescue-wip.sh` writes `refs/wip-local/<slug>` under a GUARD (`:262-271` warns and carries on), and
+# then exits 0 once the PUSH succeeds (`:468-480`). So `rc2=0` + no new local ref has TWO causes, and the
 # caller used to record both as `rescue=nothing` — "nothing needed saving" — over work that IS on origin.
 # A D/F conflict is how that state is reached in one command: a ref named `refs/wip-local/<slug>/x` makes
 # `refs/wip-local/<slug>` unwritable, so the pin fails while the push does not.

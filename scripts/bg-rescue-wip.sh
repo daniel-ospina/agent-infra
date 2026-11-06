@@ -44,15 +44,20 @@
 #     #2292). The predicate is the refusal TEXT, not the remote host or the snapshot's paths: any host
 #     whose pre-receive output matches that wording takes the retry, and a host that words it
 #     differently does not. Every other refusal is reported as-is — see section 6.
-#   - the retry's credential is chosen PER HOST, and it is never the one that was just refused, in this
-#     order: `BG_RESCUE_PUSH_HELPER=<helper>` (an explicit choice, so it wins everywhere), then
-#     `BG_RESCUE_PUSH_UNSHADOW=1` (an explicit request for the STORED credential, which is the only way
-#     to reach that candidate on macOS), then the platform default — `osxkeychain` on macOS, else the
-#     STORED credential with an ambient `GH_TOKEN`/`GITHUB_TOKEN` removed for that attempt (the cell
-#     shape). On a host where none of those can be a DIFFERENT credential, no retry is attempted and
-#     the run says so rather than spending 45 s re-sending the same token. ⛔ DECLARED RESIDUAL: the
-#     stored-credential candidate fires when an ambient token is SET, and a helper that never read it
-#     (`store`, `cache`) then re-sends the same credential — see section 6.
+#   - the retry's credential is chosen PER HOST, and it is chosen to be one the CONFIGURED CHAIN did not
+#     just use, where this script can tell, in this order: `BG_RESCUE_PUSH_HELPER=<helper>` (an explicit
+#     choice, so it wins everywhere), then `BG_RESCUE_PUSH_UNSHADOW=1` (an explicit request for the STORED
+#     credential, which is the only way to reach that candidate on macOS), then the platform default —
+#     `osxkeychain` on macOS, else the STORED credential with an ambient `GH_TOKEN`/`GITHUB_TOKEN` removed
+#     for that attempt (the cell shape). On a host where none of those can be a DIFFERENT credential, no
+#     retry is attempted and the run says so rather than spending 45 s re-sending the same token.
+#   - ⛔ DECLARED RESIDUALS: WHAT IT CANNOT TELL. `retry_credential` knows which candidates EXIST, never
+#     which credential the configured chain actually returned — so two shapes still retry with the very
+#     credential that was just refused, and both are stated rather than implied: (i) a helper that never
+#     reads the environment (`store`, `cache`) on a host with an ambient token, and (ii) macOS whose
+#     configured helper IS `osxkeychain` with a keychain PAT that lacks `Workflows: write` — candidate 3
+#     is then the refused credential. Both are what today's code ships; the messages do not claim
+#     otherwise, and `BG_RESCUE_PUSH_HELPER=<a store that can push>` is the escape for either.
 #   - a host with NO workflow-scoped credential at all still ends local-only, loudly (cause + a valid
 #     `refs/wip-local/<slug>` + exit 2). That is what SHIPS today and the alternatives are OPEN with the
 #     owner on #2292 — an off-box channel that keeps the snapshot whole (`git bundle` as a release
