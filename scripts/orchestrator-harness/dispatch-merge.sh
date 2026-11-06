@@ -401,12 +401,14 @@ for N in "$@"; do
       # until that probe's false-positive class is witnessed by a test. Recorded on #3511.
       # The cost meanwhile is a skip whose END depends on which class the row is in, and the two are not
       # the same: for an issue inside the 500-newest open window the reaper's dispatched re-check drops
-      # the row on its next pass (`n in open_iss` in refresh-candidates.sh), so the skip is bounded there;
-      # but a WINDOW-BLIND entry is released ONLY when the issue CLOSES (that file: "SO ONLY A CLOSED
-      # ISSUE IS RELEASED" — it may not requeue on an OPEN issue whose PR already merged), and `orch-loop`
-      # skips on any row still present, so an OPEN window-blind issue stays undispatchable on this box
-      # until it closes. The reaper counts and NAMES that class on the operator line every pass (measured:
-      # 169 of 203 rows outside the window), so it is a stated deficit rather than an invisible one.
+      # the row on its next pass — but ONLY when no PR in that window's listing names it, because that
+      # loop keeps an entry whose branch a listed PR names (`has_pr` over `.pr_brs`), and a stopped lane
+      # may already have pushed and opened one; a WINDOW-BLIND entry is released ONLY when the issue
+      # CLOSES (that file: "SO ONLY A CLOSED ISSUE IS RELEASED" — it may not requeue on an OPEN issue
+      # whose PR already merged), and `orch-loop` skips on any row still present, so an OPEN window-blind
+      # issue stays undispatchable on this box until it closes. The reaper counts and NAMES that class on
+      # the operator line every pass (measured: 169 of 203 rows outside the window), so it is a stated
+      # deficit rather than an invisible one.
       # ── and take its EMPTY worktree back (#2033) ─────────────────────────────────────────────
       # The lane is confirmed gone and no chain will ever look at this checkout, so an empty one is
       # residue by definition — and residue is what makes the issue undispatchable everywhere.

@@ -360,16 +360,22 @@ d4=$?
 # assertion exits 72, but the branch half runs per ISSUE and can refuse a REUSED worktree (the lane
 # was left on another named branch) — then the loop `continue`s and the script exits 0 with `K` still
 # counting the claim. `dispatch-merge.sh` publishes what reached a spawn; the controller recounts.
-# ⛔ THERE ARE THREE PER-ISSUE CLEANUP SITES IN THE LOOP, AND EVERY ONE THAT RELEASES THE CLAIM MUST
-# ALSO DROP THE ROW. #2033/#2102 moved the worktree build into `wt_provision`, whose refusal ("path is
-# a worktree of a DIFFERENT branch …") fires BEFORE the post-build repo/branch assertion — so the arm
-# this case was written for is no longer the one that refuses this fixture. That newer arm skipped
-# `drop_dispatched_rows`, which is the defect this arm caught; the message match below therefore
-# accepts EITHER arm. #3511 review added the THIRD site (the chain-could-not-start arm that stops its
-# lane and releases the claim) which skipped the drop too — and it also made this case witness the
-# CLAIM RELEASE, not just the row: the arm's own claim is a THREE-WAY state (claim released, no
-# dispatch published, row dropped), and without the `released refs/claims/issue-` conjunct the release
-# could be deleted with this suite still green.
+# ⛔ THERE ARE THREE PER-ISSUE CLEANUP SITES IN THE LOOP. THE TWO THAT REFUSE A CHECKOUT RELEASE THE
+# CLAIM **AND** DROP THE ROW; THE THIRD DELIBERATELY KEEPS THE ROW — see the block at
+# `dispatch-merge.sh`'s third site before "fixing" it. #2033/#2102 moved the worktree build into
+# `wt_provision`, whose refusal ("path is a worktree of a DIFFERENT branch …") fires BEFORE the
+# post-build repo/branch assertion — so the arm this case was written for is no longer the one that
+# refuses this fixture. That newer arm skipped `drop_dispatched_rows`, which is the defect this arm
+# caught; the message match below therefore accepts EITHER arm. #3511 review established that the
+# THIRD site (the chain-could-not-start arm that stops its lane and releases the claim) does NOT drop
+# the row, ON PURPOSE: dropping it lets the next cycle re-dispatch into a checkout an orphaned
+# grandchild may still be writing in, and the holder probe that would close that was written and
+# REVERTED (a tmux server inherits its client's argv, so the probe would refuse the checkout for
+# ever). That gap is documented in the source, not here. D5 exercises the `wt_provision` arm only;
+# the third site's release ORDERING is pinned by `refresh-scout.test.sh` instead.
+# This case also witnesses the CLAIM RELEASE, not just the row: the arm's claim is a THREE-WAY state
+# (claim released, no dispatch published, row dropped), and without the `released refs/claims/issue-`
+# conjunct the release could be deleted with this suite still green.
 # ⛔ THE MESSAGE MATCH IS SCOPED TO THIS ISSUE'S OWN LINE (`^#6001:`). The alternative for the newer
 # arm is a bare phrase match, so an unscoped `grep -E` would let ANY line in the batch output — a
 # peer's refusal, a library echo — satisfy the message conjunct. The batch here is one issue, so it
