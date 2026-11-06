@@ -1162,6 +1162,8 @@ for P4BADC in 01792000000 99999999999999999999; do
   echo "  snapshot verdict, CLEAN read_at, clock='$P4BADC' :: $outP4SV"
   ck "A66 [RED→GREEN] a clean snapshot with an unreadable clock ('$P4BADC') NAMES it instead of aborting the caller" "rc=2 word=claim-unreadable" "$outP4SV"
 done
+  P4JREF=$(( P4JREF + 1 ))
+done
 # ⛔ THE BELT IS PINNED, NOT MERELY PRESENT (review round 19, agent-infra#3203). `_claim_lease_state`'s
 # `case "$?"` arm is UNREACHABLE while both guards hold — an unparseable lease and an unreadable clock
 # are each rejected before the comparison, so `[ "$now" -le "$lease" ]` can never return 2. That made
@@ -1198,7 +1200,12 @@ ck "A69 [RED→GREEN] ...and the floor FOLLOWS a raised branch term, so it canno
 # measurement behind the floor, promoted to a gate: a future refactor that hoists the bound into a local
 # before the clamp, or gives a reader its own default, keeps the value assertions above green while
 # restoring the scheduled steal.
-p4_seed pr-3231 weird3203 HAVOC 2 >/dev/null
+# ⛔ AND THE SEED IS ASSERTED, NOT SWALLOWED (review round 25). The mint used to be
+# `p4_seed … >/dev/null`, so a seed that failed (a non-fast-forward against a ref an earlier pass left
+# behind, a transport failure) reported nothing and the assertions below measured a STALE object — or
+# an absent one — while reading green. The suite's own A76a sets the pattern: a fixture that is not
+# proven to exist is not a fixture.
+ck "A70a (setup) a 2 s-old unparseable claim is MINTED for the floor case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3231 weird3203 HAVOC 2 2>/dev/null )"
 outP4FB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
               && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
 echo "  prune with CLAIM_UNREADABLE_LEASE_MAX_AGE=1 over a 2s-old unparseable claim:"; printf '%s\n' "$outP4FB" | sed 's/^/    /'
@@ -1220,7 +1227,7 @@ outP4CEIL2=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE
                  && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
 echo "  CEIL=3600 alone resolves to: $outP4CEIL2"
 ck "A73 [RED→GREEN] ...and it cannot undercut the DEFAULT bound either (3600 s is inside a 18000 s lease)" "^18000$" "$outP4CEIL2"
-p4_seed pr-3232 weird3203 HAVOC 2 >/dev/null
+ck "A72a (setup) a 2 s-old unparseable claim is MINTED for the ceiling case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3232 weird3203 HAVOC 2 2>/dev/null )"
 outP4CEILB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
                   CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=1 && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
 echo "  prune with MAXAGE=1 CEIL=1 over a 2s-old unparseable claim:"; printf '%s\n' "$outP4CEILB" | sed 's/^/    /'
@@ -1248,8 +1255,6 @@ outP4JUNKP=$( p4_prune )
 ck "A77 [RED→GREEN] ...so the claim is KEPT and NAMED (an unmeasurable age is not evidence of expiry)" "kept unreadable-lease refs/claims/pr-3233" "$outP4JUNKP"
 p4_has pr-3233 && P4JUNKK=0 || P4JUNKK=1
 ck "A78 [RED→GREEN] ...and it survives the pass instead of being reaped on an earlier forged header" "^0$" "$P4JUNKK"
-  P4JREF=$(( P4JREF + 1 ))
-done
 rm -rf "$P4ORIG" "$P4BOX"
 
 echo
