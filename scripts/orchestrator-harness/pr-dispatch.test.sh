@@ -903,7 +903,15 @@ W_COUNT="$(grep -cE '(>>?\||>>?|tee)[[:space:]]*(-[A-Za-z]+[[:space:]]+)*"?[^"[:
 #   * the ingress call must sit BELOW every refusal arm and be guarded by the exact `= "1"` test;
 #   * the exit hook must be DEFINED before `run_agent` and REGISTERED on the trap BEFORE
 #     `review_abandoned_record` (whose real definition is far below, so the stub otherwise wins).
-W_LINE="$(grep -n '^  printf .%s.n. *"\$REVIEW_ROUND" > "\$_rr_f"' "$MW" | cut -d: -f1 | head -1)"
+# ⛔ THE ANCHOR ACCEPTS BOTH SPELLINGS OF THE WRITE (fresh review of #3441, P2). The write is now
+# ATOMIC — `printf > "$_rr_new" && mv "$_rr_new" "$_rr_f"` — because `printf > "$_rr_f"` truncates
+# before it writes and both readers coerce a TORN (empty) book to 999999999, which parks a healthy PR
+# with a false `REVIEW-CEILING … rounds=999999999/10`. The temp name deliberately does NOT spell the
+# counter path, so `W_COUNT` still counts exactly ONE write into the destination (the `mv`); an anchor
+# that only knew the `> "$_rr_f"` spelling would have found no writer at all and failed the arm for
+# the safer code. Either spelling is accepted here, and the behavioural halves below (inside the
+# helper, below every refusal arm) are unchanged.
+W_LINE="$(grep -nE '^  printf .%s.n. *"\$REVIEW_ROUND" > "\$_rr_(f|new)"' "$MW" | cut -d: -f1 | head -1)"
 [ -n "$W_LINE" ] || W_LINE="$(grep -n '> "\$_rr_f" 2>/dev/null' "$MW" | cut -d: -f1 | head -1)"
 R_LINE="$(grep -n '^run_agent "${REVIEW_TIMEOUT' "$MW" | cut -d: -f1 | head -1)"
 # the guarded ingress CALL — the exact line, so an appended `&& false` / `|| true` cannot satisfy it
@@ -1163,6 +1171,80 @@ if [ "$(rr_drive 9 garbage)" = "allow" ]; then
 else
   bad "(c4h) a GARBAGE max refuses a book of 9 — the coercion fell back to a SMALL ceiling (3?), so on a box whose MAX_REVIEW is unreadable a PR parks after a few rounds instead of 10, with a REVIEW-CEILING reason asserting a budget that was never the configured one"
 fi
+# ── (c4p) THE TERMINAL LINE'S `rounds=<n>/<max>` FIELD MUST CARRY THE COERCED MAX (fresh review of
+# #3441, P2). The DECISION coerces a garbage / oversized `MAX_REVIEW` through `_rr_coerce_max`, but the
+# park reason and the log echo printed the RAW knob — so the one machine-read line read
+# `REVIEW-CEILING 4242 rounds=10/garbage` while the decision it reported used 10: a line that
+# DISAGREES with the refusal it describes, and a non-numeric field in the format README §4 documents.
+# `orch-loop.sh` cannot reach this (it normalises `MAX_REVIEW` at startup); `merge-one.sh` has no such
+# early normalisation, so it must coerce at the one place it reads.
+# ⛔ TWO HALVES, AND ONLY THE FIRST IS BEHAVIOURAL (stated, not implied): the coercion table below
+# drives the SHIPPED block, and the shape pin after it requires the assignment site to go THROUGH that
+# coercion. A residual remains — a future edit that coerced correctly and then re-read the raw knob
+# somewhere else in the message is caught by nothing here.
+rr_coerce_drive() { # <knob> -> the coerced max, from the SHIPPED block
+  # shellcheck disable=SC1090
+  ( . "$RRCEIL"; _rr_coerce_max "$1" )
+}
+COERCE_BAD=0
+for pair in "garbage:10" "09:9" "0:0" "$CAP:$CAP" "1000000000:10" ":10"; do
+  k="${pair%%:*}"; want="${pair#*:}"
+  got="$(rr_coerce_drive "$k")"
+  [ "$got" = "$want" ] || { COERCE_BAD=1; bad "(c4p) MAX_REVIEW='$k' coerces to '$got', expected '$want'"; }
+done
+[ "$COERCE_BAD" = "0" ] && ok "(c4p) _rr_coerce_max maps garbage / leading-zero / oversized / empty to the documented default, so the rounds=<n>/<max> field always has a number to print"
+RC_MAX_ASSIGN="$(grep -nE '^_rr_max=' "$MERGED_ONE_SH" | head -1)"
+RC_MAX_RHS="${RC_MAX_ASSIGN#*_rr_max=}"
+case "$RC_MAX_RHS" in
+  '"$(_rr_coerce_max'*) ok "(c4p) the ceiling's max is assigned THROUGH _rr_coerce_max (:${RC_MAX_ASSIGN%%:*}), so the line cannot print the raw knob again" ;;
+  *) bad "(c4p) _rr_max is assigned from the RAW knob (${RC_MAX_ASSIGN:-<none>}) — the REVIEW-CEILING field can then disagree with the decision that produced it (rounds=10/garbage)" ;;
+esac
+# ── (c4q) THE BOOK WRITE MUST BE ATOMIC — SIBLING, THEN RENAME (fresh review of #3441, P2) ────────
+# A `printf` redirected STRAIGHT ONTO the counter TRUNCATES before it writes, and BOTH readers coerce
+# an EMPTY book to 999999999 on purpose (an unreadable book is corruption, never round 0), so a
+# controller reading inside that window PARKS A HEALTHY PR with `REVIEW-CEILING … rounds=999999999/10`
+# and a reason asserting a budget nobody spent. A rename is atomic, so no reader can see a partial
+# book. ⛔ THIS IS A SHAPE PIN, AND IT IS THE RIGHT KIND HERE: the property ("the bytes never become
+# visible under the counter's name until they are complete") is a property of HOW the file is written,
+# not of what a caller can observe in a test — there is no deterministic way to lose a race on demand
+# in this suite. What it removes is the regression that reintroduces the window, and MUTANT-Q below
+# proves it can fail. Read from the EXTRACTED HELPER, not the whole file, so the comment block above
+# (which explains the hazard and therefore names it) cannot satisfy the pin.
+RR_ATOMIC=0
+if [ -s "$RRSPEND" ] \
+   && grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' "$RRSPEND" \
+   && grep -qF 'mv "$_rr_new" "$_rr_f"' "$RRSPEND"; then
+  RR_ATOMIC=1
+  ok "(c4q) the round book is written to a SIBLING and RENAMED onto the counter — a reader can never observe a torn (empty) book, which both readers would read as 999999999 and park a healthy PR"
+else
+  bad "(c4q) review_round_spend does NOT write the book atomically — a `printf` straight onto the counter truncates before it writes, a concurrent reader coerces the empty book to 999999999, and a healthy PR parks with a false REVIEW-CEILING rounds=999999999/10 diagnosis"
+fi
+# MUTANT-Q: reintroduce the truncating spelling in a COPY and require the pin above to red. Mutation
+# tested rather than asserted, because "the write is atomic" is exactly the kind of claim a later tidy
+# silently reverts while every behavioural arm stays green.
+MWQ="$TMP/mutant-nonatomic.sh"
+sed 's|> \"$_rr_new\" 2>/dev/null|> \"$_rr_f\" 2>/dev/null|' "$MERGED_ONE_SH" > "$MWQ"
+diff -q "$MERGED_ONE_SH" "$MWQ" >/dev/null 2>&1; q_rc=$?
+if [ "$q_rc" -ne 0 ]; then
+  sed -n '/^review_round_spend() {/,/^}$/p' "$MWQ" > "$TMP/q-helper.sh"
+  if grep -qF 'mv "$_rr_new" "$_rr_f"' "$TMP/q-helper.sh" \
+     && ! grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' "$TMP/q-helper.sh"; then
+    ok "MUTANT-Q: with the SIBLING redirect reverted to the counter itself, (c4q)'s pin reports ❌ — the atomicity assertion is live"
+  else
+    bad "MUTANT-Q did not remove the sibling redirect (the sed anchor stopped matching), so (c4q) proves nothing"
+  fi
+else
+  bad "MUTANT-Q produced an UNCHANGED file (the sed anchor stopped matching) — (c4q) is unverified"
+fi
+# MUTANT-P: the raw knob back on the ceiling line must red (c4p)'s shape pin.
+MWP="$TMP/mutant-rawmax.sh"
+sed 's|^_rr_max="$(_rr_coerce_max "${MAX_REVIEW:-}")"$|_rr_max="${MAX_REVIEW:-10}"|' "$MERGED_ONE_SH" > "$MWP"
+RP_ASSIGN="$(grep -nE '^_rr_max=' "$MWP" | head -1)"
+RP_RHS="${RP_ASSIGN#*_rr_max=}"
+case "$RP_RHS" in
+  '"$(_rr_coerce_max'*) bad "MUTANT-P did not revert the assignment (the sed anchor stopped matching) — (c4p) is unverified" ;;
+  *) ok "MUTANT-P: with the ceiling's max read from the RAW knob, (c4p)'s shape pin reports ❌ — the message field is pinned to the coerced value" ;;
+esac
 # ⛔ AND THE CALL SITE, NOT JUST THE FUNCTION — a correct predicate that nothing calls is the round-3
 # defect in a new place. The check must sit ABOVE the reviewer start (`REV_STARTED=1`), because below it
 # the round is already being paid for, and its refusal must NOT be `exit 75` (whose readers report a

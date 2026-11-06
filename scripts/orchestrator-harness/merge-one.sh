@@ -345,8 +345,21 @@ review_round_spend() {
     _rr_written=1
     return 0
   fi
-  printf '%s\n' "$REVIEW_ROUND" > "$_rr_f" 2>/dev/null \
-    || echo "[merge $PR] review round counter $_rr_f CANNOT BE WRITTEN — the per-PR round ceiling cannot be counted on this path (the per-head budget still binds); this review is round $REVIEW_ROUND" >> "$L.log" 2>/dev/null || true
+  # ⛔ THE WRITE IS ATOMIC — A SIBLING, THEN A RENAME (fresh review of #3441, P2: a TORN book PARKS a
+  # healthy PR). A `printf` redirected STRAIGHT ONTO the counter truncates before it writes, and BOTH readers coerce an EMPTY book
+  # to 999999999 on purpose (an unreadable book is corruption, never round 0 — see `_rr_read_book`
+  # above). A controller that reads inside that window therefore parks a healthy PR with
+  # `REVIEW-CEILING … rounds=999999999/10` and a reason asserting a spent budget that was never spent:
+  # the false-diagnosis class this whole change exists to close. A rename is atomic, so no reader can
+  # observe a partial book.
+  # ⛔ AND THE TEMP NAME MUST NOT SPELL THE COUNTER PATH. The `(c4g)` writer census counts write VERBS
+  # per DESTINATION, and it matches any `>`/`mv`/`cp`/`dd`/`install` whose target names `_rr_f` or
+  # `reviewround-`. A temp called `${_rr_f}.new.$$` is a second match and reddens that arm for doing
+  # the safer thing; `$_rr_new` names no counter, so the ONE counted write stays the `mv` below.
+  local _rr_new="${_rr_f}.new.$$"
+  printf '%s\n' "$REVIEW_ROUND" > "$_rr_new" 2>/dev/null \
+    && mv "$_rr_new" "$_rr_f" 2>/dev/null \
+    || { rm -f "$_rr_new" 2>/dev/null; echo "[merge $PR] review round counter $_rr_f CANNOT BE WRITTEN — the per-PR round ceiling cannot be counted on this path (the per-head budget still binds); this review is round $REVIEW_ROUND" >> "$L.log" 2>/dev/null || true; }
   _rr_written=1
 }
 # The EXIT hook. Registered on the trap, so it survives TERM/INT/an unexpected death, and it is inert
@@ -1708,7 +1721,13 @@ else
 # the ceiling is disabled here, so NOTHING is refused and NOTHING is parked — and, by the guard in
 # `review_round_spend` above, no round is BANKED either. This ingress still buys the review, because a
 # direct caller asked for it; the controller's dispatch arm is the one that dispatches nothing.
-_rr_max="${MAX_REVIEW:-10}"
+# ⛔ THE MESSAGE READS THE COERCED MAX, NOT THE RAW KNOB (fresh review of #3441, P2). The DECISION
+# below runs `_rr_ceiling_hit`, which coerces a garbage or oversized `MAX_REVIEW` to the documented
+# default; printing the RAW value on the next lines made the one machine-read line carry a non-numeric
+# field (`REVIEW-CEILING 4242 rounds=10/garbage`) while the decision it reports used 10 — a line that
+# disagrees with the refusal it describes. `orch-loop.sh` cannot hit this (it normalises MAX_REVIEW at
+# startup); this file has no such early normalisation, so it coerces at the one place it reads.
+_rr_max="$(_rr_coerce_max "${MAX_REVIEW:-}")"
 _rr_now="$(_rr_read_book)"
 if _rr_ceiling_hit "$_rr_now" "$_rr_max"; then
   # ⛔ THE PARK IS KEYED TO THE HEAD, LIKE EVERY OTHER PARK IN THIS FILE: a push re-arms the whole
