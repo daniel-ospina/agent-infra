@@ -358,8 +358,16 @@ wt_disk_admit() {
         # callers", so when the remedy was made verdict-selected it was fixed in the two files the
         # comment named and `dispatch-merge.sh` — a real `wt_provision` caller, listed as one in this
         # PR's own description — kept hardcoding "reclaim space" for a version skew. A comment that
-        # states a POPULATION must name it exhaustively or derive it; `disk-admission.test.sh`'s arm I
-        # now derives this one from the source and requires the selector in every caller's rc-4 arm.
+        # states a POPULATION must name it exhaustively or derive it.
+        # ⛔ AND THE FIRST VERSION OF THIS NOTE POINTED AT THE WRONG GUARD (review cycle 9, P2 —
+        # MEASURED). It said `disk-admission.test.sh`'s "arm I" derives this population. Arm I is the
+        # `DISK_LANE_*_MB` neutralisation census: it reads no caller and no remedy selector. What
+        # actually guards this, and what to keep in step, are three surfaces: arm H's `arm_of` token
+        # census (`AGENT_DISK_REFUSED` / `exit 77` / the arm terminator), the DERIVED
+        # `arm_selects_remedy` census over `census_pop`'s output that reds on any caller whose rc-4
+        # arm does not mention `REFUSED-UNKNOWN`, and the two behaviour-driven selector blocks plus
+        # H3 that execute the shipped selector with `$WT_RESULT` injected. A pointer to a guard that
+        # does not exist is worse than none: it is what stops the next reviewer looking.
         [ -n "$WT_RESULT" ] || WT_RESULT="REFUSED-UNKNOWN(free=?, need=?, box=$(disk_box_id 2>/dev/null || printf 'UNIDENTIFIED')): disk_admit refused without naming its numbers — a gate that refuses without stating what it measured is indistinguishable from a bug, so the caller is told the measurement is MISSING (and is NOT told to reclaim space: an unmeasured volume is not a full one)"
         wt_log provision "$WT_RESULT"
         return 1

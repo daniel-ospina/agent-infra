@@ -246,7 +246,7 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # misattribution #2721 fixed for the live arm, re-introduced one step earlier.
     case "$WT_RESULT" in
       *REFUSED-UNKNOWN*)
-        echo "[fix $PR] REFUSED-UNKNOWN (nothing created, attempt refunded) — the free-space probe could NOT answer, so this is NOT a full disk: check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033). Reclaiming space will NOT clear it." >> "$L.log" ;;
+        echo "[fix $PR] REFUSED-UNKNOWN (nothing created, attempt refunded) — the free-space probe could NOT answer, so this is NOT a full disk: check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033). Waiting will NOT clear it." >> "$L.log" ;;
       *)
         echo "[fix $PR] REFUSED-DISK (nothing created, attempt refunded) — reclaim space; this will NOT clear by waiting" >> "$L.log" ;;
     esac

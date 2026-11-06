@@ -50,7 +50,7 @@ if [ "$_wt_rc" = 4 ]; then
   # over in `fix-one.sh`. `$WT_RESULT` already names which arm refused, so the remedy is read from it.
   case "$WT_RESULT" in
     *REFUSED-UNKNOWN*)
-      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-UNKNOWN: nothing was created, and this is NOT a full disk. The free-space probe could not answer, so check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033). Reclaiming space will NOT clear it." | tee -a "$O/logs/adopt-$PR.log" ;;
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-UNKNOWN: nothing was created, and this is NOT a full disk. The free-space probe could not answer, so check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033). Waiting will NOT clear it." | tee -a "$O/logs/adopt-$PR.log" ;;
     *)
       echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-DISK: nothing created; reclaim space; this will NOT clear by waiting" | tee -a "$O/logs/adopt-$PR.log" ;;
   esac
