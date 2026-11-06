@@ -1625,13 +1625,28 @@ lane_end_push() {
     git -C "$root" merge-base --is-ancestor "$mine" "$LANE_END_ORIGIN" 2>/dev/null || anc_rc=$?
     if [ "$anc_rc" -eq 0 ]; then
       LANE_END_PUSH="pushed"
-      echo "[lane-exit] pushed $br → origin refs/heads/$br — $unpushed commit(s) that existed only on this disk are now off-box. Origin holds $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine): a peer push or the rail advanced the ref inside the verify window, and the commits it advanced over are this lane's" >> "$log" 2>/dev/null || true
+      # ⛔ THE VERDICT IS THE SAME, THE CAUSE IS NOT — AND THE PRE-FIX LINE FABRICATED ONE (review of PR
+      # #3399 round 12, P2 — REPRODUCED). The rc≠0 path above FALLS THROUGH here on purpose (a rejected
+      # re-push, a transport failure, a pre-receive hook), so this arm is reached with a push that
+      # REPORTED FAILURE. `anc_rc=0` then proves the remote already held a DESCENDANT of our HEAD — which
+      # for a rejected push is precisely WHY it was rejected, i.e. the advance happened BEFORE the push,
+      # not "inside the verify window" as this line claimed unconditionally. Measured: a push rejected
+      # `[rejected] (non-fast-forward)` whose remote ref is one commit ahead produced a log carrying both
+      # "rejected" and "advanced inside the verify window" over a terminal that delivered nothing — the
+      # contradiction D4b forbids, in the artifact that answers #3396's own question. `pushed` is still
+      # the right verdict (every commit of this lane IS on that ref); only the CAUSE is read from the exit
+      # status now instead of assumed from the shape of the success.
+      if [ "${PUSH_RC:-0}" -eq 0 ]; then
+        echo "[lane-exit] pushed $br → origin refs/heads/$br — $unpushed commit(s) that existed only on this disk are now off-box. $pushurl holds $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine): a peer push or the rail advanced the ref inside the verify window, and the commits it advanced over are this lane's" >> "$log" 2>/dev/null || true
+      else
+        echo "[lane-exit] pushed $br → origin refs/heads/$br — the push CLIENT REPORTED FAILURE (rc=$PUSH_RC), so THIS TERMINAL DELIVERED NOTHING; the $unpushed commit(s) are off-box anyway, because $pushurl already held $LANE_END_ORIGIN, a DESCENDANT of this worktree's HEAD ($mine), BEFORE the push — an advance that predates it, and for a rejected ref the reason for the rejection. Every commit of this lane is on that ref, so the branch is not at risk; the replayed push output above says why the client refused" >> "$log" 2>/dev/null || true
+      fi
     elif [ "$anc_rc" -eq 1 ]; then
       LANE_END_PUSH="FAILED"
-      echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine, and $mine is NOT an ancestor of what origin holds (merge-base --is-ancestor rc=$anc_rc) — so this lane's commits are not on that ref (a pre-receive hook, a shim that exited 0, or a concurrent move to an unrelated sha). Whether they are on some OTHER ref is not measured here; read the replayed push output above" >> "$log" 2>/dev/null || true
+      echo "[lane-exit] ⛔ label=$label: $pushurl holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree's HEAD is $mine, and $mine is NOT an ancestor of what that repository holds (merge-base --is-ancestor rc=$anc_rc) — so this lane's commits are not on that ref (a pre-receive hook, a shim that exited 0, or a concurrent move to an unrelated sha). Whether they are on some OTHER ref is not measured here; read the replayed push output above" >> "$log" 2>/dev/null || true
     else
       LANE_END_PUSH="verify-ancestry-unmeasured"
-      echo "[lane-exit] ⛔ label=$label: origin holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree does NOT HAVE that object (merge-base --is-ancestor rc=$anc_rc), so ANCESTRY COULD NOT BE MEASURED — this terminal asserts NEITHER delivery NOR loss for $unpushed commit(s) on that branch. The usual cause is a peer or the rail advancing the ref to a commit this lane never fetched. Fetch it and look before reaping: git -C $root fetch ${pushurl:-origin} refs/heads/$sym, then git -C $root merge-base --is-ancestor $mine FETCH_HEAD" >> "$log" 2>/dev/null || true
+      echo "[lane-exit] ⛔ label=$label: $pushurl holds refs/heads/$sym at $LANE_END_ORIGIN, but this worktree does NOT HAVE that object (merge-base --is-ancestor rc=$anc_rc), so ANCESTRY COULD NOT BE MEASURED — this terminal asserts NEITHER delivery NOR loss for $unpushed commit(s) on that branch. The usual cause is a peer or the rail advancing the ref to a commit this lane never fetched. Fetch it and look before reaping: git -C $root fetch ${pushurl:-origin} refs/heads/$sym, then git -C $root merge-base --is-ancestor $mine FETCH_HEAD" >> "$log" 2>/dev/null || true
     fi
   else
     LANE_END_PUSH="pushed"
@@ -1754,8 +1769,12 @@ lane_end_next() {
     # answered holding a DIFFERENT sha — where the same artifact prints `branch_on_origin=<sha>`, so the
     # two lines contradicted each other and, when that sha was a DESCENDANT (a peer push or a rail merge of
     # our commits), the absence was simply false. Its sentence now derives from which of the two was
-    # measured. `UNAVAILABLE|detached|refused-unknown-default` keep the absence claim: each of them means
-    # NOTHING WAS PUSHED while `unpushed>0` WAS measured by rev-list, which is exactly that fact.
+    # measured. `UNAVAILABLE|detached|refused-unknown-default|refused-pushurl-*` USED TO KEEP THE ABSENCE
+    # CLAIM ON THE ARGUMENT THAT "nothing was pushed while `unpushed>0` WAS measured by rev-list, which is
+    # exactly that fact" — and that argument was wrong (review round 12, P2): the enumeration is over the
+    # LOCAL `refs/remotes/*` cache, so it licenses "no ref in THIS cache holds them" and never "they exist
+    # only on this disk". That group's sentence is now scoped to the read that produced it, the same way
+    # `nothing` was.
     FAILED)
       if [ -n "${LANE_END_ORIGIN:-}" ]; then
         printf 'MANUAL — the remote ANSWERED and holds refs/heads/%s at %s, which is not the HEAD this terminal measured (%s): the commit(s) from this lane were NOT delivered to that ref. Whether they are on some OTHER ref is not measured here, so do NOT reap %s until that is settled — read the replayed push output in the lane log%s%s\n' \
@@ -1767,9 +1786,20 @@ lane_end_next() {
           "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"
       fi
       return 0 ;;
+    # ⛔ AN OFF-BOX ABSENCE IS NOT MEASURABLE FROM A LOCAL CACHE IN THIS DIRECTION EITHER (review of PR
+    # #3399 round 12, P2 — REPRODUCED). This arm printed "commit(s) on <br> exist only on this disk" from
+    # `unpushed>0`, i.e. from `git rev-list --count HEAD --not --remotes` — an enumeration over
+    # `refs/remotes/*`, the LOCAL tracking cache. `unpushed>0` says no ref in that cache holds them; it
+    # does NOT say no remote holds them, and the two differ in a reachable state: a peer lane on a reused
+    # branch name (a documented case here) pushes this branch, this worktree never fetches, and the exit
+    # path's own push is then refused — so the artifact asserts an absence origin contradicts, sending an
+    # operator to re-push a published branch and to hold a worktree whose work is safe. This is the
+    # SYMMETRIC half of the fix already applied to `nothing` above ("unpushed=0 IS A MEASUREMENT ABOUT THE
+    # LOCAL TRACKING REFS"): both readings are about the CACHE, so both sentences must be. The comment that
+    # used to justify the absence here ("which is exactly that fact") was the defect, not the licence.
     UNAVAILABLE|detached|refused-unknown-default|refused-pushurl-divergent|refused-pushurl-unresolved)
-      printf 'MANUAL — commit(s) on %s exist only on this disk; do NOT reap %s. They survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s%s\n' \
-        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" \
+      printf 'MANUAL — nothing was pushed, and NO ref under this repository'"'"'s LOCAL refs/remotes/* tracking refs holds the commit(s) on %s (unpushed=%s): do NOT reap %s. That enumeration is a CACHE — `git fetch --prune` and a deleted remote branch are not visible here — so this row is NOT a claim about what any remote holds. The commits survive the worktree being removed but NOT a cell volume being discarded. See the [lane-exit] line in the lane log%s%s\n' \
+        "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}" \
         "$(lane_end_rescue_caveat)" "$(lane_end_tree_caveat)"; return 0 ;;
     # ⛔ NO COMPARISON WAS MADE, SO NO DELIVERY VERDICT (review round 4, P1 — REPRODUCED). The push exited 0
     # and the remote answered with a sha, but this worktree's own HEAD could not be read, so the two were
@@ -1911,9 +1941,17 @@ lane_end_next() {
   if [ "${LANE_END_RESCUE:-}" = "archived-local" ]; then
     case "${LANE_END_PUSH:-}" in
       pushed)
-        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the BRANCH is the good half (push=pushed, origin holds %s), so only the uncommitted work is local-only\n' \
+        # ⛔ THE REMEDY NAMES THE REPOSITORY THE VERDICT IS ABOUT, NOT `origin` — THE SECOND ARM (review of
+        # PR #3399 round 12, P2 — REPRODUCED). Round 3 fixed this for `verify-ancestry-unmeasured` and wrote
+        # the invariant down ("every remedy printed beside a push verdict names the repo the verdict is
+        # about"), but two arms kept the hardcoded `origin`. `pushed` is granted by `lane_end_push` against
+        # the PROVEN push url, and `remote.origin.pushurl` diverging from `remote.origin.url` is a
+        # configuration this code deliberately supports (and refuses across, when it cannot prove them
+        # equal) — so naming `origin` here points the reader at a repository nobody read, while
+        # `push_url=` two lines away in the same artifact names the right one. Same fix, both arms.
+        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so only the uncommitted work is local-only\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
-          "${LANE_END_ORIGIN:-<sha>}"; return 0 ;;
+          "${LANE_END_PUSH_URL:-origin}" "${LANE_END_ORIGIN:-<sha>}"; return 0 ;;
       nothing)
         # ⛔ `unpushed=0` IS A MEASUREMENT ABOUT THE **LOCAL TRACKING REFS**, NOT ABOUT THE REMOTE (review of
         # PR #3399, P1 — REPRODUCED). It used to read "every commit on %s is already on a remote ref", which
@@ -1939,8 +1977,9 @@ lane_end_next() {
   # recover; say THAT, and name the sha the remote reported.
   if [ "${LANE_END_TREE:-}" = "unpushed-only" ]; then
     if [ "${LANE_END_PUSH:-}" = "pushed" ]; then
-      printf 'nothing to recover — the tree was clean and the branch IS on origin at %s (%s); re-dispatch from origin/%s\n' \
-        "${LANE_END_ORIGIN:-<sha>}" "${LANE_END_BRANCH:-<branch>}" "${LANE_END_BRANCH:-<branch>}"
+      printf 'nothing to recover — the tree was clean and the branch IS on %s at %s (%s); re-dispatch from %s/%s\n' \
+        "${LANE_END_PUSH_URL:-origin}" "${LANE_END_ORIGIN:-<sha>}" "${LANE_END_BRANCH:-<branch>}" \
+        "${LANE_END_PUSH_URL:-origin}" "${LANE_END_BRANCH:-<branch>}"
     else
       # ⛔ THE `else` IS DEAD AND MAY STILL NOT INVENT A VERDICT (review cycle 15, P2 — REPRODUCED).
       # `tree=unpushed-only` requires `unpushed>0` with a READABLE count, so `lane_end_push` always assigns
