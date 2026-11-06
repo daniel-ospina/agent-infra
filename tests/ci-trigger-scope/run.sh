@@ -53,6 +53,28 @@
 #      an INDENT test, so a flow-mapped job header (`  job: {name: x}`) ends the block just as a bare or
 #      commented one does. Not modelled: an `if: >-` block scalar — refused, and the FINDING says so
 #      rather than claiming the guard is absent.
+#  7i. MUTANT: the admitted `issue_comment:` trigger DELETED                   → must FAIL. The
+#      allow-list admits that trigger by name, and an allow-list can only refuse an EXTRA trigger —
+#      never see an ABSENCE. So presence is its own arm: deleting the block left this gate green while
+#      re-opening the #2467 window (checks (b)/(d) stay non-deterministic in time).
+#  7j. MUTANTS: the admitted trigger's ACTIVITY SET — `types:` reduced to `[created]`, and the flow-seq
+#      spelling `[created, edited]` → the first must FAIL, the second must PASS. `edited` is the
+#      retraction direction (a scoping marker REMOVED from a comment), and a one-sided read leaves the
+#      previous GREEN standing for ever. An ABSENT `types:` key stays ADMISSIBLE — GitHub's default for
+#      this trigger is `created, edited, deleted` — so the arm is "the effective set contains both",
+#      never "the key is present" (that would be a false block on a correct workflow).
+#  7k. MUTANTS: the event's OWNER — `revalidate-on-issue-comment` re-pointed at another event, and its
+#      body given `&& false` → each must FAIL. That job is the other half of #2467's justification: it
+#      re-runs the EXISTING run for open PRs cross-referencing the issue and can neither post a marker
+#      nor turn a red green. With it unable to run, the admitted event has no owner while every
+#      assertion about the required job still holds. An `if:` restricted by a NARROWING `&&` suffix,
+#      a one-line plain scalar and a `${{ }}` spelling must all still PASS (ANDing excludes more).
+#  7l. MUTANTS: the required context's ACTIVITY SET is a SET — `synchronize` dropped (the MIRROR
+#      fail-open: a new push never re-runs the gate, so the previous head's green stands) and the whole
+#      set replaced by `[edited]` → each must FAIL, and a REORDERED flow sequence must PASS.
+#  7m. MUTANT: the required context's `branches:` no longer admits `main` → must FAIL. An untriggered
+#      required check stays "Pending", so every PR to `main` becomes unmergeable — the same
+#      unsatisfiable-context class as a `paths:` filter. An ABSENT `branches:` key stays admissible.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
@@ -1090,6 +1112,192 @@ if apply_mutation "$PC" "$PC_BLOCK_SCALAR_OR" "$PC_GUARD_ANCHOR" \
       github.event_name != 'issue_comment' || true" \
   "a \`>-\` block scalar with \`||\` must be constructible"; then
   run_check 1 "a \`>-\` body carrying \`|| true\` is REFUSED (that body folds to TRUE)" PC_FILE="$PC_BLOCK_SCALAR_OR"
+fi
+
+echo "== 7i. MUTANT: the ADMITTED \`issue_comment:\` trigger DELETED =="
+# ⛔ AN ALLOW-LIST CANNOT SEE AN ABSENCE. `PC_ADMITTED_EXTRA` admits the trigger by NAME and every other
+# assertion in this file is about what the trigger must CARRY — so deleting the whole block left the
+# gate green (measured) while re-opening the #2467 window it exists to close. The presence arm is
+# separate for that reason, and it is not a presence check in the weakening sense: it is driven, and it
+# reddens on exactly one edit.
+PC_NOICTRIG="$TMP/pc-noic-trigger.yml"
+if apply_mutation "$PC" "$PC_NOICTRIG" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+" \
+  "" \
+  "the admitted comment trigger must be removable"; then
+  run_check 1 "DELETING the admitted \`issue_comment:\` trigger is REFUSED" PC_FILE="$PC_NOICTRIG"
+  case "$FINDINGS" in
+    *"no longer declares"*"issue_comment"*) pass "the refusal NAMES the trigger the workflow lost" ;;
+    *) fail "the refusal did not name the lost trigger in its FINDING line" ;;
+  esac
+fi
+
+echo "== 7j. MUTANTS: the admitted trigger's ACTIVITY SET =="
+# `created` re-runs the gate for an open PR that cross-references a newly-scoped issue; `edited` is the
+# RETRACTION direction — the file's own header calls that arm bidirectional, because a body edit can
+# REMOVE the marker and a one-sided read would leave the previous GREEN standing on evidence that no
+# longer exists.
+PC_IC_NOEDIT="$TMP/pc-ic-noedit.yml"
+if apply_mutation "$PC" "$PC_IC_NOEDIT" \
+  "  issue_comment:
+    types:
+      - created
+      - edited" \
+  "  issue_comment:
+    types:
+      - created" \
+  "the comment trigger must be able to lose \`edited\`"; then
+  run_check 1 "\`issue_comment: types:\` losing \`edited\` is REFUSED (the retraction arm)" PC_FILE="$PC_IC_NOEDIT"
+  case "$FINDINGS" in
+    *edited*) pass "the refusal NAMES the activity the set lost" ;;
+    *) fail "the refusal did not name the lost activity in its FINDING line" ;;
+  esac
+fi
+
+# ⛔ AND THE ARM MUST NOT REFUSE A CORRECT WORKFLOW IN ANOTHER SPELLING. Two directions:
+#  * a FLOW sequence carrying both activities is the same value (YAML permits it) → must PASS;
+#  * an ABSENT `types:` key is ADMISSIBLE — GitHub's default set for `issue_comment:` already contains
+#    both — so a reader that demanded the KEY would falsely block a workflow whose effective set is
+#    exactly right. Both are pinned because the natural over-correction here is "require the key".
+PC_IC_FLOW="$TMP/pc-ic-flow.yml"
+if apply_mutation "$PC" "$PC_IC_FLOW" \
+  "  issue_comment:
+    types:
+      - created
+      - edited" \
+  "  issue_comment:
+    types: [created, edited, deleted]" \
+  "a flow-sequence activity set must be constructible"; then
+  run_check 0 "a FLOW sequence carrying both activities (plus GitHub's \`deleted\`) PASSES" PC_FILE="$PC_IC_FLOW"
+fi
+PC_IC_NOTYPES="$TMP/pc-ic-notypes.yml"
+if apply_mutation "$PC" "$PC_IC_NOTYPES" \
+  "  issue_comment:
+    types:
+      - created
+      - edited" \
+  "  issue_comment:" \
+  "an implicit-default activity set must be constructible"; then
+  run_check 0 "an ABSENT \`issue_comment: types:\` PASSES — GitHub's default already carries both" PC_FILE="$PC_IC_NOTYPES"
+fi
+
+echo "== 7k. MUTANTS: the comment event must have an OWNER =="
+# ⛔ `revalidate-on-issue-comment` IS THE OTHER HALF OF THE ADMISSION. #2467 justifies the trigger
+# because THIS job re-runs the EXISTING run for each open PR cross-referencing the issue; it posts no
+# marker, holds no `contents: write` and cannot turn a red green. Re-point it at another event, or give
+# its body `&& false`, and the admitted event has no owner at all — while every assertion about the
+# required job still reads true (measured GREEN before these arms existed).
+PC_RV_WRONG="$TMP/pc-rv-wrong-event.yml"
+if apply_mutation "$PC" "$PC_RV_WRONG" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "      github.event_name == 'workflow_dispatch'" \
+  "the revalidation job must be re-pointable at another event"; then
+  run_check 1 "re-pointing \`revalidate-on-issue-comment\` at another event is REFUSED" PC_FILE="$PC_RV_WRONG"
+  case "$FINDINGS" in
+    *revalidate-on-issue-comment*) pass "the refusal NAMES the job that lost the event" ;;
+    *) fail "the refusal did not name the revalidation job in its FINDING line" ;;
+  esac
+fi
+PC_RV_FALSE="$TMP/pc-rv-false.yml"
+if apply_mutation "$PC" "$PC_RV_FALSE" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null && false" \
+  "the revalidation body must be poisonable with \`&& false\`"; then
+  run_check 1 "a revalidation body carrying \`&& false\` is REFUSED (it owns the event and can never run)" PC_FILE="$PC_RV_FALSE"
+fi
+
+# ⛔ AND A SAFE NARROWING MUST STILL PASS: `&&` binds tighter than `||`, so an ANDed suffix can only
+# EXCLUDE more events. A reader that refused it would be a false block on a correctly narrowed tree.
+PC_RV_NARROW="$TMP/pc-rv-narrow.yml"
+if apply_mutation "$PC" "$PC_RV_NARROW" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null &&
+      github.event.action != 'deleted'" \
+  "a narrowed revalidation guard must be constructible"; then
+  run_check 0 "a NARROWING \`&&\` suffix on the revalidation guard PASSES (ANDing excludes more)" PC_FILE="$PC_RV_NARROW"
+fi
+
+echo "== 7l. MUTANTS: the required context's ACTIVITY SET is a SET =="
+# ⛔ THE MIRROR OF ARM 7, AND IT WAS THE ONE STILL OPEN. Arm 7 pins that `edited` cannot be DROPPED;
+# the old reader tested MEMBERSHIP, so dropping `synchronize` instead was measured GREEN — and that is a
+# fail-open of the same family, from the other side: a new push never re-runs the gate, so the previous
+# head's green check keeps standing on a body of evidence nobody re-read.
+PC_NOSYNC="$TMP/pc-nosync.yml"
+if apply_mutation "$PC" "$PC_NOSYNC" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:
+      - opened
+      - reopened
+      - edited" \
+  "the required context must be able to lose \`synchronize\`"; then
+  run_check 1 "the required context losing \`synchronize\` is REFUSED (a new push would never re-run)" PC_FILE="$PC_NOSYNC"
+  case "$FINDINGS" in
+    *synchronize*) pass "the refusal NAMES the activity and what its loss lets stand" ;;
+    *) fail "the refusal did not name the lost activity in its FINDING line" ;;
+  esac
+fi
+PC_TYPESONLY="$TMP/pc-types-only.yml"
+if apply_mutation "$PC" "$PC_TYPESONLY" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types: [edited]" \
+  "the required context's activity set must be replaceable"; then
+  run_check 1 "the required context reduced to \`types: [edited]\` is REFUSED (three activities lost)" PC_FILE="$PC_TYPESONLY"
+fi
+PC_TYPESREORDER="$TMP/pc-types-reorder.yml"
+if apply_mutation "$PC" "$PC_TYPESREORDER" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types: [edited, reopened, synchronize, opened]" \
+  "a reordered flow-sequence activity set must be constructible"; then
+  run_check 0 "the SAME set in a REORDERED flow sequence PASSES (a set, not a sequence)" PC_FILE="$PC_TYPESREORDER"
+fi
+
+echo "== 7m. MUTANT: the required context's BRANCH FILTER must still admit main =="
+# An untriggered required check stays "Pending" and every PR to `main` is unmergeable — the same
+# unsatisfiable-context class as a `paths:` filter on the required context. An ABSENT `branches:` key is
+# a DIFFERENT fact: the trigger then fires for every target branch, `main` included, so it is pinned as
+# a PASS rather than refused.
+PC_BRANCHES="$TMP/pc-branches.yml"
+if apply_mutation "$PC" "$PC_BRANCHES" \
+  "    branches:
+      - main" \
+  "    branches:
+      - develop" \
+  "the required context's branch filter must be replaceable"; then
+  run_check 1 "the required context's \`branches:\` no longer admitting \`main\` is REFUSED" PC_FILE="$PC_BRANCHES"
+  case "$FINDINGS" in
+    *branches*) pass "the refusal NAMES the branch filter and the unmergeable consequence" ;;
+    *) fail "the refusal did not name the branch filter in its FINDING line" ;;
+  esac
+fi
+PC_NOBRANCHES="$TMP/pc-nobranches.yml"
+if apply_mutation "$PC" "$PC_NOBRANCHES" \
+  "    branches:
+      - main
+" \
+  "" \
+  "an absent branch filter must be constructible"; then
+  run_check 0 "an ABSENT \`branches:\` PASSES — it fires for every target branch, \`main\` included" PC_FILE="$PC_NOBRANCHES"
 fi
 
 echo "== 8. ADMISSION: every path the doctor step can read is admitted =="

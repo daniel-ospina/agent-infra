@@ -382,6 +382,37 @@ function jobBlock(text, name) {
 // while the job itself carries no `if:` at all and therefore RUNS on the comment event. Measured: move
 // `if: github.event_name != 'issue_comment'` from the job to its first step and a text-wide matcher
 // returns ok/rc=0. The key indent is what distinguishes the two, so it is what is asserted.
+// jobIfExprs(block) — the YAML-FOLDED value of each own-level `if:` in a job block, ONE entry per
+// occurrence. A separate reader from `jobKeyIs` on purpose: that one refuses an `if: >-` BLOCK SCALAR
+// for the REQUIRED job's guard (a `>-` body of `guard` + `|| true` folds to TRUE, and its arms pin the
+// refusal), while the revalidation job's own `if:` IS a block scalar in the live file. Stripping a
+// leading block indicator here does not weaken that refusal: it is applied to a DIFFERENT job, whose
+// predicates are required as a conjunction and whose disjunctions are refused below.
+function jobIfExprs(block) {
+  const lines = String(block ?? "").split("\n");
+  const headerIndent = (lines[0] ?? "").length - (lines[0] ?? "").trimStart().length;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(\s*)(?:"if"|'if'|if)\s*:(.*)$/.exec(lines[i]);
+    if (!m) continue;
+    const keyIndent = m[1].length;
+    // A job's own `if:` is deeper than its header. Anything at or left of the header belongs to
+    // `jobs:` or to the previous job, and must not be read as this job's.
+    if (keyIndent <= headerIndent) continue;
+    let v = m[2].trim();
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j];
+      if (l.trim() === "" || /^\s*#/.test(l)) continue;
+      if (l.length - l.trimStart().length <= keyIndent) break;
+      v += (v === "" ? "" : " ") + l.trim();
+    }
+    v = v.replace(/^(?:[>|][+-]?\d?)\s*/, "").trim();
+    v = v.replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
+    out.push(v);
+  }
+  return out;
+}
+
 function jobKeyIs(block, key, valueRe) {
   const lines = String(block ?? "").split("\n");
   const header = lines[0] ?? "";
@@ -866,6 +897,70 @@ function checkPipelineComplianceUnchanged() {
     );
   }
 
+  // ⛔ THE ADMISSION IS A PAIR *AND* AN OWNED ACTIVITY SET — NOT A NAME. Admitting `issue_comment` to
+  // the allow-list and pinning only the required job's guard leaves the OTHER half of #2467's
+  // justification unpinned, and it is the half that makes the trigger safe: the comment event is
+  // harmless because `revalidate-on-issue-comment` OWNS it and re-runs the EXISTING run. Each of the
+  // four facts below was measured GREEN on this reader before it existed (the mutation and its result
+  // are re-driven, one arm each, in `run.sh` 7o–7r):
+  //   * the `issue_comment:` trigger deleted            → green, so the trigger could vanish silently
+  //   * `issue_comment: types:` reduced to `[created]`    → green, so the retraction edit stopped
+  //     re-reading (retracting a scoping marker is an `edited` activity — the file's own header says
+  //     the arm is BIDIRECTIONAL and a one-sided read leaves the previous GREEN standing)
+  //   * the revalidation job re-pointed at another event, or its body given `&& false` → green, so the
+  //     event had no owner at all while every assertion about the required job still held
+  if (!onNames.includes("issue_comment")) {
+    findings.push(
+      `pipeline-compliance.yml no longer declares \`issue_comment:\`. That trigger is the ADMITTED one (${PC_ADMITTED_EXTRA.map((n) => `\`${n}:\``).join(", ")}): #2467 added it because checks (b) and (d) read the LINKED ISSUE, which fires no \`pull_request\` event, so without it the repo's only required context is non-deterministic in time (measured on PR #3122: two runs of the same check on the same commit disagreed, and only queue latency decided the difference). Removing it silently reopens that window. To remove it, remove it from \`PC_ADMITTED_EXTRA\` in this file AND record the decision it reverses — the allow-list is derived from those constants, never spelled out in prose, so the two cannot drift apart here.`
+    );
+  } else {
+    // ⛔ AND THE ACTIVITY SET IS PART OF THE PAIR. An absent `types:` is ADMISSIBLE here — GitHub's
+    // default for `issue_comment:` is `created`, `edited`, `deleted`, which already covers both
+    // activities this decision needs — but a DECLARED set that lost one of them is a refusal. So the
+    // rule is "the effective set contains both", not "the key is present": refusing an absent key
+    // would be a false block on a workflow that is correct.
+    const ic = trigger(region, childIndent, "issue_comment", PC_FILE);
+    const icIdx = ic.keys.findIndex((k) => k.key === "types");
+    const icTypes =
+      icIdx < 0 ? ["created", "edited", "deleted"] : readList(ic.keys[icIdx], valueLinesFor(ic.keys[icIdx], ic.lines));
+    const icMissing = ["created", "edited"].filter((a) => !icTypes.includes(a));
+    if (icMissing.length) {
+      findings.push(
+        `pipeline-compliance.yml's \`issue_comment:\` no longer carries the ${icMissing.length > 1 ? "activities" : "activity"} [${icMissing.join(", ")}] (declared: [${icTypes.join(", ")}]). \`created\` is what re-runs the gate for an open PR that cross-references a newly-scoped issue; \`edited\` is what re-reads it after a body edit, and the retraction direction (a scoping marker REMOVED from a comment) is why the file's header calls that arm bidirectional. Without it a retracted marker leaves the previous GREEN standing indefinitely. GitHub's default set for this trigger is \`created, edited, deleted\`, so an ABSENT \`types:\` key is admissible; a declared set missing either activity is not.`
+      );
+    }
+    // ⛔ AND THE EVENT MUST HAVE AN OWNER. `revalidate-on-issue-comment` is what makes the comment
+    // event safe: it re-runs the EXISTING run for each open PR cross-referencing the issue, posts no
+    // marker, holds no `contents: write` and cannot turn a red green. This is asserted on that job BY
+    // NAME, because a guard on any other job says nothing about who owns the event. Its `if:` is a
+    // `>-` BLOCK SCALAR in the live file, which the required job's guard reader deliberately does not
+    // model (a `>-` body of `guard` + `|| true` folds to TRUE) — so it is read here with the block
+    // indicator stripped and both predicates required as a CONJUNCTION, with any `||` or bare
+    // `true`/`false` literal refused. That is the safe direction: ANDing can only exclude more events.
+    const rv = jobBlock(text, "revalidate-on-issue-comment");
+    const rvExprs = jobIfExprs(rv);
+    if (!String(rv ?? "").trim()) {
+      findings.push(
+        "pipeline-compliance.yml no longer declares the `revalidate-on-issue-comment` job. It OWNS the `issue_comment:` event that the allow-list admits: on a scoping comment it re-runs the EXISTING gate run for each open PR cross-referencing the issue (it posts no marker, holds no `contents: write` and cannot turn a red green). With the trigger admitted and this job gone, the comment event re-runs nothing — checks (b)/(d) stay non-deterministic in time, which is the #2467 window itself."
+      );
+    } else if (rvExprs.length === 0) {
+      findings.push(
+        "pipeline-compliance.yml's `revalidate-on-issue-comment` job carries no job-level `if:`, so it runs on EVERY event the workflow fires — including `pull_request`, where it would re-run the gate run it is already inside. The job exists to own the `issue_comment` event and nothing else."
+      );
+    } else {
+      for (const expr of rvExprs) {
+        const keysEvent = /github\.event_name\s*==\s*['"]issue_comment['"]/.test(expr);
+        const keysIssue = /github\.event\.issue\.pull_request\s*==\s*null/.test(expr);
+        const escape = /\|\||\bfalse\b|(?<![=!<>])\btrue\b/.test(expr);
+        if (!keysEvent || !keysIssue || escape) {
+          findings.push(
+            `pipeline-compliance.yml's \`revalidate-on-issue-comment\` job \`if:\` is ${JSON.stringify(expr)}, which does not both (i) key on \`github.event_name == 'issue_comment'\` and (ii) require \`github.event.issue.pull_request == null\`, with no \`||\` disjunction and no bare \`true\`/\`false\` literal. That conjunction is what confines the job to comments on ISSUES (a comment on a PR must never re-run that PR's gate) — and it is the whole reason admitting the trigger is safe: the event is owned by a job that re-runs the EXISTING run and can neither post a marker nor turn a red green. A disjunction or an \`&& false\` body makes the owner unable to run while every assertion about the required job still reads true.`
+          );
+        }
+      }
+    }
+  }
+
   // ⛔ AND NO PATH FILTER UNDER IT (review cycle 1, P1). This is the change the current sweep most
   // invites — "finish the job, filter the required check too" — and it is the one that hurts most:
   // GitHub documents that "if a workflow is skipped due to path filtering … then checks associated
@@ -889,10 +984,54 @@ function checkPipelineComplianceUnchanged() {
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`pipeline-compliance pull_request types: ${items.join(", ") || "<none>"}\n`);
-  if (!items.includes("edited")) {
+  // ⛔ THE ACTIVITY SET IS A SET, NOT A MEMBERSHIP TEST. The decision is `opened, synchronize,
+  // reopened, edited` — all four, and nothing else:
+  //   * losing `edited` lets a forged `verdict=clean-micro` marker ride a stale green check to merge
+  //     (the marker is written to the PR body AFTER the last push, which is an `edited` activity);
+  //   * losing `synchronize` is the MIRROR fail-open and was measured GREEN on the membership test that
+  //     used to stand here: a new push never re-runs the gate, so the previous head's GREEN keeps
+  //     standing on a body of evidence nobody re-read — the exact staleness `edited` exists to prevent,
+  //     arriving from the other side;
+  //   * losing `opened` means the first commit of a PR is never gated at all;
+  //   * an EXTRA activity is a new run site on the repo's only required context, reported here rather
+  //     than silently admitted.
+  const PC_REQUIRED_TYPES = ["opened", "synchronize", "reopened", "edited"];
+  const lostTypes = PC_REQUIRED_TYPES.filter((a) => !items.includes(a));
+  const extraTypes = items.filter((a) => !PC_REQUIRED_TYPES.includes(a));
+  if (lostTypes.length || extraTypes.length) {
+    const parts = [];
+    if (lostTypes.length) {
+      parts.push(
+        `LOST [${lostTypes.join(", ")}]${
+          lostTypes.includes("edited")
+            ? " — `edited` is the #513 binding: `record-review.sh` PATCHes the marker into the PR body after the last push, so without it a forged `verdict=clean-micro` marker rides a stale green check to merge"
+            : ""
+        }${
+          lostTypes.includes("synchronize")
+            ? " — without `synchronize` a NEW PUSH never re-runs the gate, so the previous head's green keeps standing on evidence nobody re-read"
+            : ""
+        }`
+      );
+    }
+    if (extraTypes.length) parts.push(`ADDS [${extraTypes.join(", ")}], a new run site on the required context`);
     findings.push(
-      "pipeline-compliance.yml's `types:` LOST `edited`. That is the required context and its #513 binding depends on re-running after `record-review.sh` PATCHes the marker into the PR body; without `edited` a forged `verdict=clean-micro` marker rides a stale green check to merge. #3196 scopes this reduction to the ADVISORY guards precisely so this file is untouched."
+      `pipeline-compliance.yml's required-context \`types:\` is [${items.join(", ") || "<none>"}], not the decided set [${PC_REQUIRED_TYPES.join(", ")}]. ${parts.join("; ")}. #3196 scopes a reduction to the ADVISORY guards precisely so this file is untouched.`
     );
+  }
+  // ⛔ AND ITS BRANCH FILTER MUST STILL ADMIT main. An absent `branches:` key is ADMISSIBLE — the
+  // trigger then fires for every target branch, which still includes `main`, so the required context is
+  // still satisfiable and no false block is owed. A DECLARED filter that no longer lists `main` is the
+  // dangerous direction and was measured GREEN before this check existed: `pipeline-compliance` would
+  // never run on a PR to `main`, GitHub keeps a non-triggered required check "Pending", and every PR to
+  // `main` becomes unmergeable — the same unsatisfiable-context class as a `paths:` filter here.
+  const brIdx = t.keys.findIndex((k) => k.key === "branches");
+  if (brIdx >= 0) {
+    const branches = readList(t.keys[brIdx], valueLinesFor(t.keys[brIdx], t.lines));
+    if (!branches.includes("main")) {
+      findings.push(
+        `pipeline-compliance.yml's \`pull_request: branches:\` is [${branches.join(", ") || "<none>"}], which no longer admits \`main\`. This is the repo's ONLY required status context: on a PR to \`main\` the workflow would never trigger, GitHub keeps an untriggered required check "Pending", and that PR can never merge. (An ABSENT \`branches:\` key is admissible — it fires for every target branch and therefore still includes \`main\`.)`
+      );
+    }
   }
 }
 
