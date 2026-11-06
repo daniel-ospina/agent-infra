@@ -26,8 +26,9 @@
 #   §8  the record stays ONE space-separated `k=v` line: the new field cannot break the grammar that
 #       the other twenty fields share
 #   §9  THE THREE DEFECTS A FRESH-CONTEXT REVIEW FOUND, each armed so it cannot come back: an overlay
-#       written in the sweep's PIPELINE SUBSHELL must still reach the record, `prev_wait` must be ONE
-#       gap rather than a lifetime sum, and every declared cascade level must have a real call site
+#       written in the sweep's PIPELINE SUBSHELL must still reach the record — including the LAST
+#       row's interval, which no subsequent settle would ever close — `prev_wait` must be ONE gap
+#       rather than a lifetime sum, and every declared cascade level must have a real call site
 #       instead of a fabricated measured zero. §2–§3 could not catch these: they drive the clock in
 #       the MAIN shell, never through a subshell boundary and never across two cycles.
 #
@@ -413,6 +414,24 @@ ck "  …and folding twice adds nothing (the queue is drained), still ${STG_V_l2
    "$(if [ "${STG_V_l2_merge:-0}" -lt 3000000 ]; then echo 0; else echo 1; fi)"
 ck "  …and a level with no interval is still a MEASURED 0, not an accident of the mechanism" \
    "$(if [ "${STG_V_l3_fix:-x}" = "0" ]; then echo 0; else echo 1; fi)"
+STG_LVL_TMP=""
+
+# 9.1b THE LAST ROW'S OPEN INTERVAL MUST NOT DIE AT `done`.
+# The top-of-iteration settle closes the PREVIOUS row's level, so the FINAL row had no closer and its
+# interval died with the subshell. Measured before the fix: three 1 s rows accumulated 2004 us x 1000
+# instead of ~3000 — one row's worth of cascade dropped in EVERY cycle. This arm drives the shipped
+# loop's own arrangement (settle at top AND at the end of the body) over three rows.
+STG_LVL_TMP="$TMP/lvlq2"; : >"$STG_LVL_TMP"
+STG_V_l2_merge=0; STG_OPEN_LVL=""; STG_OPEN_T0=0
+printf 'r1\nr2\nr3\n' | while read -r _prow; do
+  stg_lvl_settle || :
+  stg_lvl_start l2_merge || :
+  sleep 1
+  stg_lvl_settle || :
+done
+stg_lvl_fold || :
+ck "three 1 s rows accumulate ~3 intervals, not 2 — the LAST row's interval is not lost at 'done' (got ${STG_V_l2_merge:-0} us)" \
+   "$(if [ "${STG_V_l2_merge:-0}" -ge 2700000 ]; then echo 0; else echo 1; fi)"
 STG_LVL_TMP=""
 
 # 9.2 `prev_wait` IS ONE GAP, NOT THE LIFETIME SUM OF EVERY NAP.

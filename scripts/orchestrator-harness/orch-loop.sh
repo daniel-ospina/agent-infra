@@ -6084,6 +6084,13 @@ while true; do
         disp "$PR" "${HEAD_N:-}" "${V:-NONE}" wait "check surface unreadable or empty (${V:-no class}) — nothing spawned" ;;
     esac
     # [acting-case:end]
+    # ⛔ SETTLE AT THE END OF THE BODY TOO, NOT ONLY AT THE START OF THE NEXT ROW (fresh-context
+    # review of this fix). The top-of-iteration settle closes the PREVIOUS row's open level; the LAST
+    # row has no next iteration, so its open interval used to die with the subshell and be lost.
+    # Measured: three rows of 1 s with a top-only settle accumulated 2004 ms instead of 3009 ms — one
+    # row's worth of the cascade silently dropped, every cycle. Idempotent, so the next top-of-loop
+    # settle is then a no-op and a `continue` still behaves exactly as before.
+    stg_lvl_settle || :
   done
   # ── FOLD THE OVERLAY QUEUE THE SWEEP'S SUBSHELL WROTE (#P0 review) ─────────────────────────────
   # Everything above this line ran in the pipeline's subshell and its `STG_V_l*` writes are GONE. The
