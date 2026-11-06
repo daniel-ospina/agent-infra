@@ -791,6 +791,207 @@ fi
 [ -n "$_cr_mod" ] && . "$_cr_mod"
 if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; else CYCREC=0; fi
 
+# ══ THE STAGE CLOCK: ATTRIBUTE A CYCLE'S WALL TIME TO THE STAGE THAT SPENT IT ═══════════════════
+# [stageclock:begin] (extracted and DRIVEN by cycle-stages.test.sh — keep the markers)
+#
+# WHAT WAS BROKEN. `state/cycles` gave ONE number per cycle (`end - start`) and nothing else about
+# time, so the only observable was the total. Measured cycles of 2, 17.5, 131, 145 and 161 minutes
+# against a designed `interval=240` proved that total does NOT track work volume — the 161-minute
+# cycle spawned ZERO workers, the 2.2-minute cycle also spawned zero, and a 17.5-minute cycle spawned
+# six. Time was therefore going somewhere STRUCTURAL (sweep? refresh? drain wait?) and NOTHING in the
+# record could say where. `CYC` bounds only the nap; the cycle BODY is unbounded, so an unbounded body
+# and an unobservable body were the same defect seen from two sides.
+#
+# WHAT THIS IS. A wall-clock clock over the cycle body, reported as ONE machine-parseable record field
+# (`stages=` — grammar and readers in cycle-record.sh). Two kinds of stage, and the difference matters
+# when you read a record:
+#
+#   TILED   (STG_TILED)  — marked UNCONDITIONALLY, once per cycle, in body order. They TILE the body:
+#                          their sum is the cycle's own duration, so `end - start` can be DECOMPOSED
+#                          and a reader can prove no time escaped. A tiled stage left unmarked is a
+#                          MISSING INSTRUMENT, so it reads `ns` — never a plausible `0`.
+#   OVERLAY (STG_LVL)    — a CASCADE LEVEL's cumulative wall time. The PR sweep interleaves its work
+#                          per PR (one merge arm here, one review arm there), so a level cannot tile;
+#                          it ACCUMULATES the intervals in which that level was the active work.
+#                          An overlay is a BREAKDOWN OF the tiled stage it ran inside, never an
+#                          addition to it: `sum(l1..l4) <= sweep`, and `l5_issue` IS a tiled stage
+#                          because issue launch is contiguous. Its arms are instrumented, so no
+#                          interval means genuine zero work — `0` is a MEASUREMENT here.
+#   CARRIED (STG_PREV)   — `prev_wait`, the post-record gap (the async backlog spawn + the `CYC` nap).
+#                          It CANNOT be in this cycle's number: the record is written BEFORE the nap,
+#                          and it must be (a record stamped at the end would make a HUNG cycle look
+#                          fresh for its whole duration). So it is carried forward one cycle and named
+#                          `prev_` so no reader mistakes it for this cycle's own time.
+#
+# ⛔ THE STAGE SET LIVES IN EXACTLY ONE PLACE — the four registry lines below — and both the reset and
+# the emitter walk that list. A stage added here appears in EVERY subsequent record with no second
+# edit; a stage added ONLY at a call site cannot appear in the record at all. That is the property
+# that stops a new stage silently vanishing from the record, which is the failure mode of every
+# hand-maintained field list.
+#
+# ⛔ THE CLOCK IS FORK-FREE **BY CONSTRUCTION**, and that is not an optimisation. This clock is reset
+# at the TOP of the loop, BEFORE `fork_gate` and therefore before the fork-starved arm — the one path
+# where a single `$( )` kills the controller (a failed fork TERMINATES bash; agent-infra#2293). So:
+# no command substitution, no `date`, no `tr`. Only parameter expansion, `[`, `printf -v` and integer
+# arithmetic. `stg_now_us_vars` is the writer and `stg_now_us` the printer, deliberately in the
+# `cr_san_vars`/`cr_san` and `cap_h_for_vars`/`cap_h_for` shape this repo already uses for exactly
+# this reason.
+#
+# ⛔ MONOTONIC BY CONSTRUCTION. `EPOCHREALTIME` is a WALL clock: an ntp step or a VM resume can move
+# it BACKWARDS, and a negative interval is indistinguishable in a record from a stage that never ran.
+# `stg_now_us_vars` therefore never returns a value below the last one it returned. A backwards step
+# is absorbed as a zero-length interval instead of fabricating a negative stage.
+#
+# ⛔ THE NUMBERS ARE DELTAS FROM A PROCESS BASE, not raw epochs. An epoch in MICROSECONDS is ~1.79e15:
+# it fits a 64-bit integer and nothing narrower, and the arithmetic here must never be the reason a
+# stage reads as garbage on some host. Every emitted number is therefore small (a cycle is < 1e11 µs).
+STG_REGISTRY_TILED="boot disk reap refresh authority claims caches sweep gate l5_issue record"
+STG_REGISTRY_LVL="l2_merge l3_fix l4_review"
+# ⛔ REGISTERED BUT NOT YET IMPLEMENTED — and it must NOT be lumped in with `STG_REGISTRY_LVL`.
+# `l1_main` is the merge cascade's LEVEL 1 (fix main if red). It has no site in the body this lane
+# instruments (main's redness is currently handled per-PR, by the red-fixer role), so it reads `ns`:
+# "registered, nothing sampled it". Initialising it to `0` would report "level 1 was checked and cost
+# nothing" every cycle on a box that never looked — a false pass on the one stage whose whole job is
+# to stop a red main from consuming the fleet.
+STG_REGISTRY_PENDING="l1_main"
+STG_REGISTRY_PREV="prev_wait"
+STG_REGISTRY="$STG_REGISTRY_TILED $STG_REGISTRY_LVL $STG_REGISTRY_PENDING $STG_REGISTRY_PREV"
+STG_BASE_US=""; STG_LAST_US=0
+STG_TILE_MARK=0; STG_OPEN_LVL=""; STG_OPEN_T0=0; STG_WAIT_T0=0; STG_FIELD=""
+
+# stg_now_us_vars <outvar> — set <outvar> to MONOTONIC microseconds since this process's first
+# sample. Builtins only: see the block comment. rc 1 on a bad outvar name.
+stg_now_us_vars() {
+  local _st_out="${1:-}" _st_t _st_s _st_f _st_us
+  case "$_st_out" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  _st_t="${EPOCHREALTIME:-}"
+  # ⛔ THE DECIMAL SEPARATOR IS LOCALE-DEPENDENT (a comma locale gives `1793983753,035728`), and a
+  # `%`-format reader would silently take the fraction for part of the seconds.
+  _st_t="${_st_t/,/.}"
+  case "$_st_t" in
+    *.*) _st_s="${_st_t%%.*}"; _st_f="${_st_t#*.}" ;;
+    '')  _st_s="";              _st_f=""                ;;
+    *)   _st_s="$_st_t";         _st_f=""                ;;
+  esac
+  case "${_st_s:-}" in ''|*[!0-9]*) _st_s="" ;; esac
+  case "${_st_f:-}" in *[!0-9]*) _st_f="" ;; esac
+  if [ -n "$_st_s" ]; then
+    # Pad/truncate the fraction to exactly six digits, so a shell that emits fewer (or more) cannot
+    # change the SCALE of the number by a factor of ten.
+    while [ "${#_st_f}" -lt 6 ]; do _st_f="${_st_f}0"; done
+    _st_f="${_st_f:0:6}"
+    _st_us=$(( 10#${_st_s} * 1000000 + 10#${_st_f:-0} ))
+  else
+    # bash 3.2 (macOS /bin/bash) has no `EPOCHREALTIME`. `SECONDS` is monotonic, integer, and — the
+    # point — needs no process at all.
+    _st_us=$(( 10#${SECONDS:-0} * 1000000 ))
+  fi
+  [ -n "${STG_BASE_US:-}" ] || STG_BASE_US="$_st_us"
+  _st_us=$(( _st_us - STG_BASE_US ))
+  [ "$_st_us" -ge "${STG_LAST_US:-0}" ] || _st_us="${STG_LAST_US:-0}"
+  STG_LAST_US="$_st_us"
+  printf -v "$_st_out" '%s' "$_st_us"
+  return 0
+}
+stg_now_us() { local _st_v=""; stg_now_us_vars _st_v || return 1; printf '%s' "$_st_v"; }
+
+# stg_add <name> <microseconds> — accumulate into `STG_V_<name>`. Never overwrites: two intervals of
+# the same level in one cycle must ADD, or the pyramid fill would report only the last PR's arm.
+stg_add() {
+  local _sa_n="${1:-}" _sa_d="${2:-0}" _sa_v
+  case "$_sa_n" in ''|*[!A-Za-z0-9_]*) return 0 ;; esac
+  case "$_sa_d" in ''|*[!0-9]*) _sa_d=0 ;; esac
+  _sa_v="STG_V_${_sa_n}"
+  printf -v "$_sa_v" '%s' "$(( ${!_sa_v:-0} + _sa_d ))"
+  return 0
+}
+
+# stg_lvl_settle — close an OPEN overlay interval into the level that owned it. Idempotent, so every
+# `continue` in the sweep may leave an interval open and the next `stg_lvl_start` or `stg_mark` closes
+# it against the RIGHT level. That self-healing property is why the ~40 `continue`s in the sweep do
+# not each need an instrumentation call: an unbalanced exit attributues its time to the level that was
+# active, which is the correct answer, instead of to whatever ran next.
+stg_lvl_settle() {
+  local _sl_now=0
+  [ -n "${STG_OPEN_LVL:-}" ] || return 0
+  stg_now_us_vars _sl_now || return 0
+  stg_add "$STG_OPEN_LVL" "$(( _sl_now - ${STG_OPEN_T0:-0} ))"
+  STG_OPEN_LVL=""; STG_OPEN_T0=0
+  return 0
+}
+
+# stg_lvl_start <level> — from now until the next settle, the active work is this cascade level.
+# ⛔ The mark must NEVER be able to change dispatch behaviour, so each call site is written
+# `stg_lvl_start … || :` and the sweep's extracted blocks (pr-dispatch.test.sh / red-fixer.test.sh
+# drive `[acting-case]` / `[redfix]` verbatim, outside this file) stay runnable where this function
+# does not exist. A typo in a stage name is visible anyway: `stg_add` rejects it and the registry
+# emitter reports that level as never-sampled.
+stg_lvl_start() {
+  stg_lvl_settle
+  STG_OPEN_LVL="${1:-}"
+  case "$STG_OPEN_LVL" in ''|*[!A-Za-z0-9_]*) STG_OPEN_LVL="" ;; esac
+  [ -n "$STG_OPEN_LVL" ] || return 0
+  STG_OPEN_T0=0
+  stg_now_us_vars STG_OPEN_T0 || { STG_OPEN_LVL=""; STG_OPEN_T0=0; }
+  return 0
+}
+
+# stg_mark <tiled-stage> — close the OPEN tiled interval into <stage> and start the next one here.
+# Always settles an open overlay first, so no overlay interval ever spans a tiled stage boundary (a
+# merge arm can never be credited with the time the next stage spent).
+stg_mark() {
+  local _sm_n="${1:-}" _sm_now=0
+  stg_lvl_settle
+  stg_now_us_vars _sm_now || return 0
+  stg_add "$_sm_n" "$(( _sm_now - ${STG_TILE_MARK:-0} ))"
+  STG_TILE_MARK="$_sm_now"
+  return 0
+}
+
+# stg_nap_mark — close the post-record gap into the CARRIED `prev_wait` stage. Call AFTER the nap.
+stg_nap_mark() {
+  local _sn_now=0
+  stg_now_us_vars _sn_now || return 0
+  stg_add "$STG_REGISTRY_PREV" "$(( _sn_now - ${STG_WAIT_T0:-0} ))"
+  return 0
+}
+
+# stg_cycle_reset — clear THIS cycle's numbers and open the first tiled interval. Fork-free (it runs
+# before `fork_gate`, on the starved path too). `prev_wait` SURVIVES the reset: it describes the gap
+# the PREVIOUS cycle spent outside its own body and is by definition read one cycle later.
+stg_cycle_reset() {
+  local _sr_n _sr_v
+  for _sr_n in $STG_REGISTRY_TILED $STG_REGISTRY_PENDING; do
+    _sr_v="STG_V_${_sr_n}"; printf -v "$_sr_v" '%s' ""     # "" => 'ns' (never sampled)
+  done
+  for _sr_n in $STG_REGISTRY_LVL; do
+    _sr_v="STG_V_${_sr_n}"; printf -v "$_sr_v" '%s' 0       # 0 => a MEASURED zero
+  done
+  STG_OPEN_LVL=""; STG_OPEN_T0=0; STG_TILE_MARK=0; STG_WAIT_T0=0
+  stg_now_us_vars STG_TILE_MARK || STG_TILE_MARK=0
+  return 0
+}
+
+# stg_field <outvar> — build the `stages=` VALUE by walking the registry, in registry order. ONE
+# emitter, so the field's shape cannot drift from the stage set. Values are whole SECONDS: the defect
+# being attributed is minute-scale (2..161 min against a 240 s interval), and seconds keep the record
+# line short enough to stay greppable.
+stg_field() {
+  local _sf_out="${1:-}" _sf_n _sf_v _sf_us _sf_line=""
+  case "$_sf_out" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  for _sf_n in $STG_REGISTRY; do
+    _sf_v="STG_V_${_sf_n}"; _sf_us="${!_sf_v:-}"
+    if [ -n "$_sf_us" ]; then
+      _sf_line="${_sf_line}${_sf_line:+,}${_sf_n}:$(( _sf_us / 1000000 ))"
+    else
+      _sf_line="${_sf_line}${_sf_line:+,}${_sf_n}:ns"
+    fi
+  done
+  printf -v "$_sf_out" '%s' "$_sf_line"
+  return 0
+}
+# [stageclock:end]
+
 # ── FORK HEADROOM, AND THE ONE PATH THAT MAY NOT FORK (agent-infra#2293) ────────────────────────
 # MEASURED 2026-10-21: local `com.eldato.orchestrator-loop` recorded a last exit of **128** and NEVER
 # CAME BACK. The mechanism is measured on this tree's bash (5.2.21): a failed `fork()` does not return
@@ -3678,6 +3879,13 @@ unowned_scan() { # <open_prs>
 # cannot run at all has a bigger problem than its record, and answering 0/1/2 would grade a controller
 # that would never start. A caller must read 78 as "cannot run", never as "healthy".
 while true; do
+  # ── THE STAGE CLOCK RESETS FIRST, AND IT IS FORK-FREE ON PURPOSE ──────────────────────────────
+  # ⛔ ABOVE `fork_gate`, WHICH IS ABOVE THE STARVED ARM. `stg_cycle_reset` uses only parameter
+  # expansion / `[` / `printf -v` / integer arithmetic, so it is legal on the one path where a single
+  # failed `fork()` TERMINATES the controller (agent-infra#2293). It also opens the first tiled
+  # interval, which is why `boot` covers the fork probe: a fork probe that costs seconds is exactly
+  # the kind of structural cost this instrument exists to surface.
+  stg_cycle_reset
   # ── 0) FORK HEADROOM, BEFORE THE FIRST FORK OF THE CYCLE (agent-infra#2293) ───────────────────
   # ⛔ THIS BLOCK MUST STAY ABOVE `date`/`git`/`gh`/ANY `$( )`. A box that cannot fork dies on the
   # first spawn (measured: bash exits, rc 254), so a gate placed after the clock is a gate that never
@@ -3710,11 +3918,18 @@ while true; do
     _cr_why="fork_exhausted"; _cr_bound="fork_probe"
     [ "${FORK_STATE:-unknown}" = "low" ] && { _cr_why="fork_headroom"; _cr_bound="fork_headroom"; }
     if [ "${CYCREC:-0}" = "1" ]; then
+      # ⛔ THE STAGE FIELD IS WRITTEN ON THE STARVED PATH TOO, and for the same reason the record
+      # itself is: these are the cycles an operator most needs to attribute (a box that produced
+      # NOTHING for 161 minutes was this shape). `boot` is the one stage that completed — the fork
+      # probe — so it is closed here before the record is built.
+      stg_mark boot
+      stg_field STG_FIELD
       cycle_record_write "$O" \
         start="${_ft0:-0}" end="${_ft0:-0}" cycle="${CYCLE_N}" interval="${CYC:-240}" \
         selected="none" selected_n=0 dispatched=0 ids=- \
         nothing="$_cr_why" placement="fork_held" placed_on=none bound="$_cr_bound" \
         lpc_self="?" shapes=0 fork="$_cr_fork" fork_procs="${FORK_PROCS:-?}" fork_max="${FORK_MAX:-?}" \
+        stages="${STG_FIELD:-}" \
         || printf '[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable) — a fork-starved box with no record is SILENT, which is the failure this file exists to end\n' >> "$LOG" 2>/dev/null || true
     else
       printf '[cycle] fork_starved (cycle-record.sh absent — this state is NOT recorded anywhere)\n' >> "$LOG" 2>/dev/null || true
@@ -3722,7 +3937,9 @@ while true; do
     printf '[fork] HELD cycle %s (%s): %s — this box is below its fork margin or cannot fork right now (procs=%s/%s). NO dispatch, NO refresh, NO git/gh this cycle: every one of them would spend a fork and the next failed fork KILLS this process (measured: bash exits 254). Backing off %ss and retrying. A box in this state cannot be cleaned from inside (agent-infra#2293) — restart it from outside, or let the lanes drain.\n' \
       "${CYCLE_N}" "${FORK_STATE:-unknown}" "${FORK_WHY:-fork_probe_failed}" "${FORK_PROCS:-?}" "${FORK_MAX:-?}" "${CYC:-240}" >> "$LOG" 2>/dev/null || true
     _nap="$(( 10#${CYC:-240} + (10#${CYC:-240} / 5) ))"
+    stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
     fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
+    stg_nap_mark        # CARRIED into the NEXT cycle's `prev_wait`: the gap is outside this body
     continue
   fi
   # ── THE CYCLE'S OWN CLOCK, and the record that proves it happened ─────────────────────────────
@@ -3755,6 +3972,7 @@ while true; do
   K=0; Y=0
   heartbeat
   res_line   # MEASURE every resource; decide nothing from it
+  stg_mark boot       # THE STAGE SPENT: the fork probe, the heartbeat, the resource measurement
   # ── 0b) THE PRE-DISPATCH DISK FLOOR (agent-infra — the night two cells stopped on bytes) ──────
   # ⛔ IT RUNS BEFORE `harness_refresh_cycle`, `reap_stale_workers` and EVERY provisioning path, and
   # that placement IS the fix. Measured twice in one night: a cell at 872MB free failed
@@ -3786,11 +4004,19 @@ while true; do
     # record with `nothing=`, a nap, a `continue`) so `bin/harness status` and `cycle-record.sh`
     # answer "why did this box dispatch nothing" from the record instead of from a grep.
     printf '%s\n' "$_df_line" >&2 2>/dev/null || true
+    # The stage field is carried here for the reason the record itself is: a disk-held cycle is
+    # exactly a cycle that produced nothing, so it is the one an operator must be able to attribute.
+    # `boot` was already closed above (it precedes the disk block); `disk` is closed here, and
+    # everything after it is `ns` — which is the truthful reading ("the body never got that far")
+    # and NOT a row of measured zeroes.
+    stg_mark disk
+    stg_field STG_FIELD
     if [ "${CYCREC:-0}" = "1" ]; then
       cycle_record_write "$O" \
         start="${CYCLE_T0:-0}" end="$(date +%s 2>/dev/null || echo 0)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
         selected="none" selected_n=0 dispatched=0 ids=- \
         nothing="disk_floor" placement="disk_held" placed_on=none bound="disk_floor" disk="${_df_line:-}" \
+        stages="${STG_FIELD:-}" \
         || printf '[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable) — a disk-held box with no record is SILENT, which is the failure this block exists to end\n' >> "$LOG" 2>/dev/null || true
     else
       printf '[cycle] disk_held (cycle-record.sh absent — this state is NOT recorded anywhere)\n' >> "$LOG" 2>/dev/null || true
@@ -3809,9 +4035,12 @@ while true; do
       echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
     fi
     fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
+    stg_nap_mark
     continue
   fi
+  stg_mark disk       # the disk-floor gate AND its reclaim pass (the held arm `continue`s above)
   reap_stale_workers
+  stg_mark reap       # the stale-worker census — on the cycle path because the 161-min cycle ran it
   # ⛔ THE LATCH IS RELEASED HERE, ONCE PER ITERATION — NOT AT LOAD. `_HR_DONE` starts at 0 and the
   # function sets it on entry, so a per-PROCESS latch would refresh once in the controller's whole
   # lifetime and then return early forever: every later cycle keeps the first cycle's token (empty on a
@@ -3826,6 +4055,7 @@ while true; do
   REFRESH_RESOLVED=0; REFRESH_RC=0; REFRESH_SH=""; REFRESH_SH_SKEW=""; REFRESH_TRIED=""
   harness_refresh_cycle   # re-pin / refuse / name a stale checkout; sets HARNESS_TOKEN
   L="$(load1)"
+  stg_mark refresh    # the INLINE harness re-pin/refuse (the async backlog spawn is post-record)
   # ⛔ MEASURE MEMORY HERE, ONCE, BEFORE THE FIRST SPAWN SITE — not only at the [cap] block below
   # (agent-infra#1732). The six `can_spawn` sites run in section 1-3 of the cycle and the [cap] block
   # runs in section 4, so a gate that read MEMAVAIL_MB there would decide on the PREVIOUS cycle's
@@ -4112,6 +4342,7 @@ while true; do
     fi
   fi
   # END sweep-listing
+  stg_mark authority
   # ── cross-box claim snapshot (agent-infra#1709 recs 1-3) ─────────────────────
   # ONE fetch refreshes every claim ref, so claim_live() answers "is another box on this?"
   # from a local file. Per-PR network calls would be 2 x N round trips per cycle.
@@ -4209,6 +4440,7 @@ while true; do
     echo "[claims] ⛔ claim-unreadable: no registry at $O/claims.sh — every PR reads claim-unreadable, so NOTHING is spawned or armed this cycle (silence is not freedom); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o ${O:-~/orchestrator}" >> "$LOG"
   fi
 
+  stg_mark claims
   # ── machine-global package caches (agent-infra#1987) ───────────────────────
   # The measured defect: on pi-cell-3 `~/.cache/uv` reached 7.1GB and the box refused EVERY
   # dispatch at 258MB free while this controller kept beating and the queue read fine. The refusal
@@ -4259,6 +4491,7 @@ while true; do
     fi
   fi
 
+  stg_mark caches
   # ── OWNERSHIP + SELECTION ORDER (owner ruling, 2026-10-18) ───────────────────────────────────
   # ⛔ ONE LIVE SCAN PER CYCLE, then everything below reads its output. `lo_scan` asks the MACHINE
   # (every visible process's cwd, joined against this repo's worktrees) who is actually holding a
@@ -4595,6 +4828,12 @@ while true; do
 
   printf '%s\n' "${SEL_WINDOW:-$SEL_ROWS}" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT OWN; do
+    # ⛔ CLOSE ANY LEVEL INTERVAL LEFT OPEN BY THE PREVIOUS PR'S `continue` (there are ~40 of them
+    # in the arms below). The interval belongs to the level that was ACTIVE when the exit happened,
+    # and the settle can only attribute it to that level — so no `continue` needs its own mark.
+    # This is what makes the overlay self-healing instead of 40 hand-placed end-marks, one of which
+    # would eventually be forgotten and silently credit a merge arm with the next PR's review time.
+    stg_lvl_settle || :
     [ -z "${PR:-}" ] && continue
     # Skip anything that is not a plain integer PR / simple ref — never let API data reach a shell.
     is_num "$PR" || { echo "#${PR:-?} SKIPPED (non-numeric PR id)" >>"$LOG"; disp "${PR:-?}" - - wait "non-numeric PR id (not acted on)"; continue; }
@@ -4681,6 +4920,10 @@ while true; do
          continue ;;
     esac
     # [redfix:begin] (extracted and DRIVEN by red-fixer.test.sh — keep the markers)
+    # ⛔ CASCADE LEVEL 3 (fix a PR) OPENS HERE. The red-fixer role is the pre-cascade body's L3: it
+    # turns a rail REFUSAL into a fixer lane. `|| :` because red-fixer.test.sh drives this block
+    # standalone, and an instrumentation mark must never be able to change dispatch behaviour.
+    stg_lvl_start l3_fix || :
     # ⛔ THE RED-FIXER ROLE: REFUSE -> SPAWN A FIXER -> RE-RAIL WHEN THE HEAD MOVES.
     #
     # MEASURED 2026-10-20, the week this exists to end: open=17, thirteen rails "running", ONE merge
@@ -5132,6 +5375,7 @@ while true; do
     # while nothing changes. Route it to the fixer, which integrates origin/main and resolves the
     # conflict, then re-runs the review chain. Capped and parkable like any other fix loop.
     # [conflict-case:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+    stg_lvl_start l3_fix || :   # a conflicting PR is repaired: cascade level 3
     case "$V" in
       GREEN|PENDING:*)
         MSTAT="$(gh pr view "$PR" --repo "$OR" --json mergeable --jq .mergeable 2>/dev/null)"
@@ -5186,6 +5430,11 @@ while true; do
     # [acting-case:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
     case "$V" in
       GREEN)
+        # ⛔ CASCADE LEVEL 2 (merge) OPENS HERE. Everything from `gh pr ready` to the rail spawn is a
+        # PR that has passed its gates and is being taken to a land — the pyramid level whose whole
+        # job is to shrink the open-PR queue. Crediting it here is what lets a record answer "was
+        # the long cycle merging, fixing, reviewing, or none of the above".
+        stg_lvl_start l2_merge || :
         gh pr ready "$PR" --repo "$OR" >/dev/null 2>&1 || true
         # ⛔ ONLY WHERE GREEN MEANS THE EVIDENCE EXISTS (review round 2, P2 — agent-infra#2132). On a
         # RAIL repo `ai-review-gate` is not in `$REQ`, so V=GREEN means "the required checks pass",
@@ -5269,6 +5518,9 @@ while true; do
           disp "$PR" "${HEAD_N:-}" "$V" wait "waiting: checks pending (rail mode — auto-merge deliberately not armed)"
         fi ;;
       FAILED:*)
+        # ⛔ CASCADE LEVEL 3: a red tree is REPAIRED. Its `HEAD_N` re-read and check classification
+        # are part of the level's cost, so the interval opens before them.
+        stg_lvl_start l3_fix || :
         echo "#$PR $V" >>"$LOG"
         # Which red names are REQUIRED checks other than the review gate? Derived from the
         # classifier's own output and from THIS repo's required set ($REQ) — never from a literal
@@ -5319,6 +5571,11 @@ while true; do
           # operator to re-record evidence that already existed. merge-one.sh is the single writer of
           # `needsreview-*`; this arm only READS it, and the log line says only what is known here.
           _rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"
+          # ⛔ CASCADE LEVEL 3: reviewer findings at this head — a FIXER is the remedy (level 4 would
+          # be another review, and a review of an unchanged head is the waste this arm exists to
+          # stop). The `elif` chain below alternates between levels, so each branch that does a
+          # different level's work re-starts the level, and `stg_lvl_start` settles the previous one.
+          stg_lvl_start l3_fix || :
           if [ "$_rgs" = "NEEDS-FIX" ]; then
             echo "#$PR NEEDS-FIX (reviewer findings at head=${HEAD_N:-?}) — a fixer is the remedy" >>"$LOG"
           else
@@ -5407,6 +5664,10 @@ while true; do
               echo "#$PR $V but the HEAD is UNREADABLE — no review dispatched (a review is head-scoped evidence; a review spent on an unnamed head cannot be keyed, compared, or recorded, and the budget would be spent against a key that means nothing)" >>"$LOG"
               disp "$PR" - "$V" wait "head unreadable — a review is not spent on a guess (re-read next cycle)"
             elif _rvd="$(review_disp_decide "$PR" "${HEAD_N:-}")"; [ "${_rvd%% *}" = "AT-HEAD" ]; then
+              # ⛔ CASCADE LEVEL 4 (review). This level is an INTERNAL LOOP — review, findings, fix,
+              # review again until green — and it is the one a measured 161-minute cycle is most
+              # likely to have spent its time in, so its arm time accumulates separately from the
+              # fixer arms above instead of being lumped into one "PR work" number.
               # ⛔ AT-HEAD DOES NOT DISPATCH — AND IT MUST NOT WAIT FOREVER EITHER (review of #2653, P2).
               # Its remedy is a RE-RECORD, which only merge-one.sh's CLEAN path mints, and this branch
               # is what withholds the spawn that would run it. Bounded here, so the state reaches a
@@ -6073,6 +6334,7 @@ PY
   # so the gate chain cannot emit "integer expression expected", and so the logged value IS the value
   # the gate used.
   is_num "${L:-}" || L=0
+  stg_mark sweep      # the PR sweep: populations, per-PR claims, and every cascade arm inside them
   # ── FLEET PLACEMENT: MEASURED, EVERY CYCLE, BEFORE A SINGLE LANE IS PLACED ────────────────────
   # The gate chain below is LOCAL: `load=$L>=max_load`, `lanes=`, `swap_free=`, `mem_avail=` all read
   # THIS box. Measured 2026-10-21 09:45 the fleet was cell-1 29.82 load on 8 cpu (saturated), cell-3
@@ -6775,6 +7037,7 @@ PY
   if [ "${LO_CHOICE:-none}" != "issue" ] && [ -z "$GATE_WHY" ]; then
     GATE_WHY="selection (funnel chose '${LO_CHOICE:-?}', not issues)"
   fi
+  stg_mark gate       # fleet placement, the CI queue, the gate vector, the floor and the funnel line
   # ── THE LANDING-FLOOR LINE: ONE LINE PER CYCLE, THE NUMBERS THE DECISION USED ────────────────
   # ⛔ A SILENT THRESHOLD IS THE SAME DEFECT CLASS AS A SILENT REAPER: a reader must be able to tell
   # WHY the fleet did or did not dispatch, from the log alone, without reconstructing the gate. This
@@ -7277,6 +7540,11 @@ PY
   # printed only when something WAS dispatched, so an idle cycle can never read as a working one, and
   # a cycle that could not write its record SAYS SO here (the status verb then reads ABSENT/DEGRADED,
   # never HEALTHY).
+  # ⛔ `record` IS THE LAST TILED STAGE, AND IT CANNOT CONTAIN THE APPEND ITSELF: the `stages=` value
+  # has to be built before the line it lives on is written. It measures the record BLOCK's own
+  # preparation (the `tr`/`sed`/`cut` that build `ids=` and `selected=`), which is real forking work on
+  # the cycle path and is therefore worth attributing. The append is measured instead by the
+  # before/after overhead numbers in the PR that added this field.
   if [ "${CYCREC:-0}" = "1" ]; then
     _cr_ids=""
     [ "${K:-0}" -gt 0 ] && _cr_ids="$(tr '\n' ',' < "$O/.batch" 2>/dev/null | sed 's/,$//')"
@@ -7302,12 +7570,16 @@ PY
       _cr_tags="${PRDISP_SPAWN_TAGS:-}"
       [ -n "$_cr_tags" ] || { [ -n "${PRDISP_SPAWNS:-}" ] && _cr_tags="none" || _cr_tags="UNMEASURED"; }
     fi
+    stg_mark l5_issue   # the issue batch: the floor/order/placement/claim/dispatch region
+    stg_mark record     # the record block's own preparation (see the note above)
+    stg_field STG_FIELD
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
       selected="$_cr_sel" selected_n="${SEL_TOTAL:-0}" dispatched="${K:-0}" ids="${_cr_ids:--}" \
       nothing="$_cr_nothing" placement="${CAP_STATE:-unavailable}" placed_on="${CAP_PLACE:-none}" \
       bound="${CAP_BOUND:-none}" lpc_self="${CAP_LPC_SELF:-?}" shapes="${SEL_TOTAL:-0}" \
       spawned_pr="${PRDISP_SPAWNS:-UNMEASURED}" spawn_tags="$_cr_tags" \
+      stages="${STG_FIELD:-}" \
       drain="$_cr_drain" \
       || echo "[cycle] ⚠️ THIS CYCLE COULD NOT BE RECORDED (state/ unwritable or the module is absent) — an absent record is NOT a healthy box: harness status reads it ABSENT/DEGRADED" >> "$LOG"
   else
@@ -7453,9 +7725,19 @@ PY
   # exits on a failed fork, and launchd's relaunch needs the same fork). `fork_free_sleep` blocks in
   # `read -t` on the FIFO opened at startup — no child at all.
   if [ "${FORK_STARVED:-0}" = "1" ]; then
+    stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
     fork_free_sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) \
       || sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) 2>/dev/null
   else
+    stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
     sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
   fi
+  # ⛔ THE GAP IS MEASURED HERE AND CARRIED INTO THE **NEXT** RECORD, as `prev_wait`. It cannot be in
+  # this cycle's `stages=`: the record was written BEFORE this code ran (it must be — a record stamped
+  # at the END reports the whole cycle as if it took no time, and a cycle that HUNG would look fresh
+  # for its entire duration). This is the one number that must cross the cycle boundary, and naming it
+  # `prev_` is what stops a reader crediting the nap to the cycle it is reading. It closes the model:
+  # `sum(tiled stages) + prev_wait + the append/fork-probe slivers ≈ the gap between two 'start='
+  # stamps', so a reader can check that no wall time escaped the instrument.
+  stg_nap_mark
 done

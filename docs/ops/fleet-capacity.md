@@ -517,7 +517,36 @@ fork terminates the shell; a fork-starved box is seen by its PEERS' lines instea
 ```
 start=… end=… cycle=… interval=240 selected=issue:#2216 selected_n=1 dispatched=1 ids=#2216
 nothing=none placement=place placed_on=cell-1 bound=none lpc_self=7 fork=ok fork_procs=412 fork_max=15641
+stages=boot:3,disk:1,reap:0,refresh:2,authority:1,claims:0,caches:0,sweep:41,gate:6,l5_issue:0,record:0,l1_main:ns,l2_merge:0,l3_fix:12,l4_review:29,prev_wait:241
 ```
+
+### 7.1 `stages=` — attributing the cycle's wall time
+
+`end - start` alone answers **how long**, never **where**. Measured cycles of 2.2, 17.5, 131, 145 and
+161 minutes against a designed `interval=240` did not track work at all (the 161-minute cycle spawned
+**zero** workers), so the total was an observable nobody could act on: `CYC` bounds only the nap, and
+the cycle BODY is unbounded.
+
+`stages=` is one space-free, comma-separated `name:secs` list. Three kinds of entry, and the difference
+matters when reading a line:
+
+| kind | examples | meaning |
+|---|---|---|
+| **tiled** | `boot disk reap refresh authority claims caches sweep gate l5_issue record` | marked unconditionally once per cycle, in body order — they **tile** the body, so their sum *is* the cycle's own duration |
+| **overlay** | `l2_merge l3_fix l4_review` | a merge-cascade level's **cumulative** wall time inside the sweep; a *breakdown of* `sweep`, never an addition to it (`sum(l1..l4) <= sweep`) |
+| **carried** | `prev_wait` | the post-record gap (async backlog spawn + the `CYC` nap), read one cycle later — the record is written *before* the nap, and must be, or a HUNG cycle would look fresh for its whole duration |
+
+`l5_issue` is a tiled stage because issue launch is contiguous; `l1_main` (the cascade's *fix main if
+red*) is registered and reads **`ns`** until that level exists — `ns` ("registered, never sampled") is a
+different reading from `0` ("measured, cost nothing"), deliberately, so an unimplemented level can
+never read as a measured zero-cost one.
+
+The stage SET lives in exactly one place — `orch-loop.sh`'s `STG_REGISTRY_*` block — and the emitter
+walks it, so a stage added there appears in every later record with no second edit. The grammar and the
+reader (`cycle_stage_get`, `cycle_stages_valid`) live in `cycle-record.sh`; `bash cycle-record.sh stages
+--dir $O` prints the newest breakdown. A record written before this field existed carries no `stages=`
+token at all and every reader still parses it — the file is append-only, so old and new lines coexist
+for ever.
 
 `bin/harness status` prints the last N and grades the **newest** record:
 

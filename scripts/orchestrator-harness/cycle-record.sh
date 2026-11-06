@@ -48,7 +48,7 @@
 # to "is the controller alive" is no, and the fix (start it) is different from the fix for a live but
 # fork-starved box (restart or drain the BOX from outside — nothing inside it can be cleaned up).
 #
-# USAGE (CLI)   bash cycle-record.sh status|history [--last N] [--interval S] [--dir O]
+# USAGE (CLI)   bash cycle-record.sh status|history|stages [--last N] [--interval S] [--dir O]
 # EXIT          0 HEALTHY · 1 DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (cannot answer — never a pass)
 
 CR_FILE_NAME="${CR_FILE_NAME:-cycles}"
@@ -83,6 +83,91 @@ cr_san() {
   local _cs_plain=""
   cr_san_vars _cs_plain "${1:-}" || return 1
   printf '%s' "$_cs_plain"
+}
+
+# ── THE STAGE FIELD: `stages=<name>:<secs|ns>,<name>:<secs|ns>,…` ────────────────────────────────
+# WHY. A cycle record's `start=`/`end=` gives ONE number: how long the cycle took. Measured
+# 2026-11 cycles of 2, 17, 131, 145 and 161 minutes against a designed 240s interval proved that
+# number does NOT track work (the 161-minute cycle spawned ZERO workers), so the total cannot say
+# WHICH part of the body consumed the time — and the body is unbounded while `CYC` bounds only the
+# nap. The stage field is what makes the total ATTRIBUTABLE instead of merely observable.
+#
+# THE GRAMMAR, and it is deliberately narrow so the record stays ONE space-separated `k=v` line:
+#   stages=<name>:<secs>,…      name = [A-Za-z0-9_]+, secs = non-negative integer, or the literal
+#                               `ns` = the stage was REGISTERED but never sampled this cycle.
+# ⛔ NO SPACES ANYWHERE IN THE VALUE. `cr_san_vars` maps a space to `_`, so a value built with
+# spaces would be rewritten into an unparseable blob by the writer rather than rejected — the field
+# is a comma-separated list for exactly that reason.
+# ⛔ `ns` IS NOT `0`, AND THE DIFFERENCE IS THE POINT. `0` is a MEASUREMENT ("this stage ran and
+# cost nothing"); `ns` is an ABSENCE ("nothing sampled this stage"). A registered stage that was
+# never instrumented must never read as a measured zero-cost stage — that is how a stage silently
+# vanishes from a record while still appearing in it.
+#
+# WHICH STAGES EXIST IS NOT DECIDED HERE. The stage SET lives in exactly ONE place — orch-loop.sh's
+# `STG_REGISTRY` block — so a stage added there appears in every subsequent record without a second
+# edit, and this library must never grow a list of its own (two lists is how a stage vanishes).
+# This code owns only the GRAMMAR and the READ.
+#
+# ⛔ BACKWARDS COMPATIBILITY IS A REQUIREMENT, NOT A NICETY. Records written before this field
+# existed carry no `stages=` token at all, and `/orchestrator/state/cycles` is APPEND-ONLY and never
+# rewritten — so old and new lines coexist in one file FOREVER. Every reader therefore answers
+# "absent" (rc 1) for a record without the field, and never an error: readers are
+#   • cycle_verdict / cycle_history (this file)  — prefix-search one field each, so an unknown token
+#     is ignored; they do not read `stages=` at all and are unaffected by it being present.
+#   • bin/harness `status` / `status --json` / `history` — pass the record through verbatim (the JSON
+#     arm escapes it as a string), so a new field flows through with no change.
+#   • cycle_stage_get / cycle_stages_valid (this file) — the only field-aware readers, and both
+#     answer rc 1 (absent) rather than failing on an old line.
+#   • the test suites (capacity-placement.test.sh, landing-read.test.sh) write OLD-format fixtures
+#     on purpose; cycle-stages.test.sh pins that those still parse.
+CR_STAGES_FIELD="stages"
+
+# cycle_stage_get <record> <stage> -> "<secs>" | "ns" on stdout; rc 1 when the record has no
+# `stages=` field or the field does not name <stage>. Never errors on an old-format record.
+cycle_stage_get() {
+  local _sg_rec="${1:-}" _sg_want="${2:-}" _sg_rest _sg_f _sg_val=""
+  # ⛔ THE WANTED NAME IS VALIDATED BEFORE IT IS USED AS A `case` PATTERN (below). A caller that
+  # passed `*` would otherwise MATCH the first stage in the field and return its value as if it were
+  # the requested one — a silent wrong answer, which is worse here than a refusal because the whole
+  # point of the field is that its numbers can be trusted.
+  case "$_sg_want" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  case "$_sg_rec" in *"${CR_STAGES_FIELD}="*) ;; *) return 1 ;; esac
+  # ⛔ A HAND-ROLLED TOKEN WALK, NOT `for _f in $_rec`. Word splitting would also GLOB: the
+  # sanitiser strips quotes but not `*`/`?`/`[`, and `disk=` carries bracketed text, so an unquoted
+  # expansion could be pathname-expanded against the CWD. The walk below splits on the literal space
+  # and never touches the filesystem.
+  _sg_rest="$_sg_rec "
+  while [ -n "$_sg_rest" ]; do
+    _sg_f="${_sg_rest%% *}"; _sg_rest="${_sg_rest#* }"
+    case "$_sg_f" in "${CR_STAGES_FIELD}="*) _sg_val="${_sg_f#*"${CR_STAGES_FIELD}="}"; break ;; esac
+  done
+  [ -n "$_sg_val" ] || return 1
+  _sg_rest="${_sg_val},"
+  while [ -n "$_sg_rest" ]; do
+    _sg_f="${_sg_rest%%,*}"; _sg_rest="${_sg_rest#*,}"
+    [ -n "$_sg_f" ] || continue
+    case "$_sg_f" in "${_sg_want}:"*) printf '%s' "${_sg_f#*:}"; return 0 ;; esac
+  done
+  return 1
+}
+
+# cycle_stages_valid <value> — rc 0 when the value matches the grammar above. The guard that keeps a
+# malformed field from entering the record file in the first place, where it would be permanent.
+cycle_stages_valid() {
+  local _sv_val="${1:-}" _sv_rest _sv_f _sv_name _sv_v
+  [ -n "$_sv_val" ] || return 1
+  _sv_rest="${_sv_val},"
+  while [ -n "$_sv_rest" ]; do
+    _sv_f="${_sv_rest%%,*}"; _sv_rest="${_sv_rest#*,}"
+    case "$_sv_f" in '') return 1 ;; esac          # a double or trailing comma
+    case "$_sv_f" in *:*) ;; *) return 1 ;; esac   # no separator at all
+    _sv_name="${_sv_f%%:*}"; _sv_v="${_sv_f#*:}"
+    case "$_sv_name" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+    # ⛔ A SECOND COLON CANNOT HIDE IN THE NAME (`${_f%%:*}` takes the FIRST field), so `a:1:2`
+    # fails on the VALUE test below — where the `:` is a non-digit — rather than needing its own arm.
+    if [ "$_sv_v" != "ns" ]; then case "$_sv_v" in ''|*[!0-9]*) return 1 ;; esac; fi
+  done
+  return 0
 }
 
 # cycle_record_write <O> <k=v ...> — append ONE cycle line. rc 1 (with the reason on stdout) when the
@@ -217,9 +302,39 @@ cr_cli() {
     history)
       if ! cycle_history "$O" "$last"; then printf 'ABSENT why=no_cycle_record path=%s\n' "$(cr_path "$O")"; return 2; fi
       return 0 ;;
+    stages)
+      # The operator-facing read of the stage field: one `name<TAB>secs` line per stage of the newest
+      # record, and an explicit UNKNOWN for a record that predates the field or whose field is
+      # malformed. ⛔ IT DOES NOT CLASSIFY (no "tiled" vs "cascade" grouping, no total, no ordering
+      # of its own): the stage SET and its order live in orch-loop.sh's registry, and a second opinion
+      # here is the duplicate-contract defect this file's header refuses.
+      local _sf _rec _val _rest
+      _sf="$(cr_path "$O")"
+      if [ ! -s "$_sf" ]; then printf 'ABSENT why=no_cycle_record path=%s\n' "$_sf"; return 2; fi
+      _rec="$(tail -n 1 "$_sf" 2>/dev/null)"
+      _val=""
+      case "$_rec" in *"${CR_STAGES_FIELD}="*) ;; *)
+        printf 'NO-STAGE-FIELD the newest record predates the %s= field (this is NOT an error — the file\n              is append-only and old lines stay old); nothing to attribute\n' "$CR_STAGES_FIELD"
+        return 0 ;; esac
+      _rest="$_rec "
+      while [ -n "$_rest" ]; do
+        _sf="${_rest%% *}"; _rest="${_rest#* }"
+        case "$_sf" in "${CR_STAGES_FIELD}="*) _val="${_sf#*"${CR_STAGES_FIELD}="}"; break ;; esac
+      done
+      if ! cycle_stages_valid "$_val"; then
+        printf 'UNREADABLE why=malformed_%s_field value=%s\n' "$CR_STAGES_FIELD" "$_val"
+        return 2
+      fi
+      _rest="${_val},"
+      while [ -n "$_rest" ]; do
+        _sf="${_rest%%,*}"; _rest="${_rest#*,}"
+        [ -n "$_sf" ] || continue
+        printf '%s\t%s\n' "${_sf%%:*}" "${_sf#*:}"
+      done
+      return 0 ;;
     ''|help|-h|--help)
       sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) printf 'cycle-record: unknown command %s (try: status|history)\n' "$v" >&2; return 2 ;;
+    *) printf 'cycle-record: unknown command %s (try: status|history|stages)\n' "$v" >&2; return 2 ;;
   esac
 }
 
