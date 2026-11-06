@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
-# mtime-probe-portability.test.sh — pins the mtime probe in the two scripts
-# agent-infra#3434 left behind, so the BSD-first spelling cannot come back.
+# mtime-probe-portability.test.sh — pins the BSD-first `stat -f` probes
+# agent-infra#3434 left behind, so the spelling cannot come back.
 #
 # Run: bash scripts/mtime-probe-portability.test.sh
 # Exits 0 when ALL assertions pass, 1 on any failure. Hermetic: every log and
 # lock is a fixture in a temp directory, and the scripts are driven with `HOME`
 # pointed there, so no real state is read or written. Host facilities used:
-# `mktemp`, `grep`, `basename`, `date`, `touch`, and `bash -n`.
+# `mktemp`, `mkdir`, `grep`, `sed`, `basename`, `date`, `touch`, and `bash -n`.
+#
+# ⛔ THREE SCRIPTS, TWO KINDS OF PROBE. `stat -f %m` (mtime) is repaired in
+# `monitor-worker.sh` and `lane-scan-fallback.sh`; `stat -f %z` (size) is repaired in
+# `unblock-lane.sh`, where the same GNU mis-parse yields a FALSE PASS rather than a wrong
+# age — two probes of an unchanged file differ as the box's free blocks churn. All three
+# are pinned here, because `check-portability-traps.sh` is blind to all three (below).
 #
 # WHY THIS SUITE EXISTS — the gate could not see the bug it is about.
 # `scripts/check-portability-traps.sh`'s `stat-c-gnu` rule (`:1371`) fires on
@@ -39,6 +45,7 @@ set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MONITOR="$SCRIPT_DIR/monitor-worker.sh"
 LANE_SCAN="$SCRIPT_DIR/lane-scan-fallback.sh"
+UNBLOCK="$SCRIPT_DIR/unblock-lane.sh"
 
 PASS=0
 FAIL=0
@@ -48,7 +55,7 @@ assert_contains()     { if grep -qF -- "$2" <<<"$1"; then ok "$3"; else bad "$3 
 assert_not_contains() { if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi }
 assert_eq()           { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: $1, want: $2)"; fi }
 
-for f in "$MONITOR" "$LANE_SCAN"; do
+for f in "$MONITOR" "$LANE_SCAN" "$UNBLOCK"; do
     [ -f "$f" ] || { echo "❌ missing $f"; exit 1; }
 done
 
@@ -75,6 +82,12 @@ for f in "$MONITOR" "$LANE_SCAN"; do
     assert_contains "$(executed_view "$f")" 'date -r' \
         "$name reads mtime with a form that works on GNU and BSD"
 done
+# unblock-lane.sh is the SIZE probe, not the mtime one: `stat -f %z` is the same GNU mis-parse
+# (`-f` = --file-system), and its positive replacement is `wc -c`, not `date -r`.
+assert_not_contains "$(executed_view "$UNBLOCK")" 'stat -f' \
+    "unblock-lane.sh reads no size with the BSD-only 'stat -f'"
+assert_contains "$(executed_view "$UNBLOCK")" 'wc -c' \
+    "unblock-lane.sh reads size with a form that works on GNU and BSD"
 
 echo
 echo "── the shipped probe actually dates a real file (no non-numeric value) ──"
@@ -135,8 +148,54 @@ assert_not_contains "$(cat "$LLOG" 2>/dev/null)" 'unbound variable' \
     "the lock age arithmetic did not die"
 
 echo
-echo "── the two scripts still parse ──"
-for f in "$MONITOR" "$LANE_SCAN"; do
+# ⛔ THIS ARM EXISTS BECAUSE THE TEXT PINS ALONE WERE NOT ENOUGH (agent-infra#3509 review round 4).
+# The executed-view arms above prove the file no longer SPELLS `stat -f`; they do not prove the
+# value reaching the comparison is a BYTE COUNT. `stat -f %z` on GNU coreutils writes the whole
+# filesystem block to stdout and exits 1, so two probes of an UNCHANGED file DIFFER as the box's
+# free blocks/inodes churn — and `unblock-lane.sh` then prints PARENT RESUMED about a parent that
+# never resumed. That is a false PASS on the one thing the tool exists to prove, and it is invisible
+# to a text pin. So the tool is driven end-to-end against a fixture session file that grows exactly
+# once, and the sizes it REPORTS must be the file's exact byte lengths — never a block (4096+).
+echo "── unblock-lane.sh: the size probe sees a REAL write, and only a real write (behavioural) ──"
+UH="$T/unblock-home"
+SESSDIR="$UH/.pi/agent/sessions/aaaabbbb-cccc-dddd-eeee-ffff00001111"
+mkdir -p "$SESSDIR"
+SESS="$SESSDIR/sess-fix3509.jsonl"
+printf '{"type":"user"}\n' > "$SESS"            # 16 bytes
+BEFORE_BYTES="$(wc -c <"$SESS" | tr -d '[:space:]')"
+AFTER_LINE='{"type":"assistant"}'
+AFTER_BYTES=$((BEFORE_BYTES + ${#AFTER_LINE} + 1))
+# A "parent" that resumes exactly once, AFTER the tool has taken its `before_size` reading (the
+# tool kills the child and sleeps 3 s before its first re-read, so a 1 s delay lands inside the gap).
+( sleep 1; printf '%s\n' "$AFTER_LINE" >>"$SESS" ) &
+WRITER=$!
+bash -c 'sleep 60' &                                # the parked child the tool kills
+CHILD=$!
+out="$(HOME="$UH" bash "$UNBLOCK" "$CHILD" fix3509 2>&1)"; rc=$?
+kill "$WRITER" "$CHILD" 2>/dev/null
+wait "$WRITER" "$CHILD" 2>/dev/null
+assert_eq "$rc" 0 "the tool exited 0 when the parent resumed"
+assert_contains "$out" 'PARENT RESUMED' "the resumed parent is reported as resumed"
+# The two sizes in that line must be the exact byte lengths. `session 16 -> 37 bytes`.
+assert_contains "$out" "session $BEFORE_BYTES -> $AFTER_BYTES bytes" \
+    "the reported sizes are the file's exact byte counts ($BEFORE_BYTES -> $AFTER_BYTES), not a filesystem block"
+assert_not_contains "$out" 'No such file or directory' \
+    "no shell redirection error leaked into the report"
+# …and the same redirection-order trap, pinned on the executable text rather than by driving the
+# 90 s not-resumed path: a command's redirections are applied LEFT TO RIGHT, and a failing `<"$F"`
+# is reported by the SHELL before `2>/dev/null` takes effect — so `wc -c <"$F" 2>/dev/null` prints
+# "No such file or directory" on EVERY probe (up to 32 of them) into the report. `$F` is empty
+# whenever no session file matches, so this is the common case, not an edge one.
+# ⛔ MUTANT NAMED: restoring `wc -c <"$F" 2>/dev/null` (or `<"$F"` with the redirection last) reds
+# this arm. It accepts BOTH correct spellings — `wc -c 2>/dev/null <"$F"` and
+# `{ wc -c <"$F"; } 2>/dev/null` — so it pins the DEFECT, not one of its fixes.
+leaky="$(executed_view "$UNBLOCK" | grep 'wc -c' | grep -F '<"$F" 2>/dev/null' || true)"
+assert_eq "$leaky" "" \
+    "no wc -c probe puts 2>/dev/null after the input redirection (the error would leak into the report)"
+
+echo
+echo "── the three scripts still parse ──"
+for f in "$MONITOR" "$LANE_SCAN" "$UNBLOCK"; do
     if bash -n "$f" 2>/dev/null; then ok "$(basename "$f") parses"; else bad "$(basename "$f") does not parse"; fi
 done
 

@@ -22,7 +22,14 @@ F=$(ls -1t "$HOME"/.pi/agent/sessions/*/*"$SID"*.jsonl 2>/dev/null | head -1)
 # would then compare equal by luck and DIFFER as the box's free blocks/inodes churn, with no write to
 # the session file at all: the "PARENT RESUMED" branch below fires on a parent that never resumed —
 # a false PASS on the one thing this script exists to prove. Same file shape as #3434.
-before_size=$(wc -c <"$F" 2>/dev/null | tr -d '[:space:]')
+#
+# ⛔ `2>/dev/null` MUST COME BEFORE `<"$F"` (#3509 review). Bash applies a command's redirections
+# LEFT TO RIGHT, and a failing input redirection is reported by the SHELL, not by `wc` — so with
+# `<"$F" 2>/dev/null` the "No such file or directory" is already on stderr by the time stderr is
+# pointed at /dev/null. `$F` is empty whenever no session file matches the id, and a session file
+# can be reaped mid-watch, so the shipped order printed that error on EVERY probe — up to 32 lines
+# interleaved into the one thing this tool produces, its report. Measured on bash 5.2.21.
+before_size=$(wc -c 2>/dev/null <"$F" | tr -d '[:space:]')
 before_cpu=$(ps -o time= -p "$CHILD" 2>/dev/null | tr -d ' ')
 ppid=$(ps -o ppid= -p "$CHILD" 2>/dev/null | tr -d ' ')
 p_cpu_before=$(ps -o time= -p "$ppid" 2>/dev/null | tr -d ' ')
@@ -41,7 +48,7 @@ ps -o pid= -p "$CHILD" >/dev/null 2>&1 && echo "  STILL ALIVE" || echo "  child 
 echo "watching the parent for 90s ..."
 i=0
 while [ "$i" -lt 30 ]; do
-  now_size=$(wc -c <"$F" 2>/dev/null | tr -d '[:space:]')
+  now_size=$(wc -c 2>/dev/null <"$F" | tr -d '[:space:]')
   if [ -n "$now_size" ] && [ "$now_size" != "$before_size" ]; then
     echo "  PARENT RESUMED after $((i*3))s: session $before_size -> $now_size bytes"
     echo "  parent cpu: $p_cpu_before -> $(ps -o time= -p "$ppid" 2>/dev/null | tr -d ' ')"
@@ -49,6 +56,6 @@ while [ "$i" -lt 30 ]; do
   fi
   i=$((i+1)); sleep 3
 done
-echo "  parent has NOT written in 90s (size still $(wc -c <"$F" 2>/dev/null | tr -d '[:space:]'))"
+echo "  parent has NOT written in 90s (size still $(wc -c 2>/dev/null <"$F" | tr -d '[:space:]'))"
 echo "  parent cpu: $p_cpu_before -> $(ps -o time= -p "$ppid" 2>/dev/null | tr -d ' ')"
 echo "  -> the child was not what the parent was waiting on, OR the parent is wedged"
