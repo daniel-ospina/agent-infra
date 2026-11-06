@@ -583,7 +583,7 @@ else
         # already checked out at <other path>" arm and returns 2 BEFORE `$base` is ever read
         # (the `elif` arm on `symbolic-ref --short HEAD = "$br"` in `wt-lifecycle.sh`'s `wt_provision`;
         # `base` is consulted only by `wt_ahead_count` and the `worktree add -b` branch — cited by
-        # SYMBOL, not by line: this diff's own 110-line insertion into `wt-lifecycle.sh` moved the
+        # SYMBOL, not by line: this diff's own insertion into `wt-lifecycle.sh` moved the
         # ranges these three citations used to name (`344-365`, `298-301`, `394-419`), so a line number
         # here is a stale number waiting to happen). Measured: rc=2 with the CORRECT base too, so the old arm's
         # "non-zero ⇒ the 4th argument is load-bearing" verdict was decided by the PATH, not the argv —

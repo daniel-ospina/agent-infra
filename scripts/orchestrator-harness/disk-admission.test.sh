@@ -1154,7 +1154,7 @@ caller_driving() { # <files|offenders> <file>... -> one driving COMMAND (mode=fi
 # the population is BOUNDED and is the same population arm J censuses — no recursion.
 # ⛔ IT MUST INCLUDE `test-*.sh`, NOT ONLY `*.test.sh` (fresh review, P1 — MEASURED).
 # `scripts/orchestrator-harness/test-crossbox.sh` drives the REAL `fix-one.sh` at five call sites and
-# carried `DISK_MIN_FREE_MB=1` alone (`:53`), so on a box under ~6 GB free every arm reports exit 77 —
+# carried `DISK_MIN_FREE_MB=1` alone (before this PR), so on a box under ~6 GB free every arm reports exit 77 —
 # the very wrong-cause class this PR removes — while BOTH censuses were green because the FILENAME does
 # not end in `.test.sh`. `spawn-gate.test.sh` already enumerates this file as a suite, so the repo knew
 # it was one and the census did not read it. The blast radius is bounded (it is not in CI's shard list);
