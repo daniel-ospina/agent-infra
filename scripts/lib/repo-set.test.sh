@@ -77,6 +77,9 @@ EOF
 # run_reader <conf> <verb...> — REPO_SET_FILE pinned per call, never inherited.
 run_reader() { local c="$1"; shift; REPO_SET_FILE="$c" bash "$READER" "$@" 2>&1; }
 run_reader_rc() { local c="$1"; shift; REPO_SET_FILE="$c" bash "$READER" "$@" >/dev/null 2>&1; echo $?; }
+# `run_reader` merges the refusal text into stdout ON PURPOSE (the arms above grep it). The arms that
+# assert NOTHING was emitted need the stdout-only form, or a correct refusal reads as output.
+run_reader_out() { local c="$1"; shift; REPO_SET_FILE="$c" bash "$READER" "$@" 2>/dev/null; }
 
 # ── (a) the valid set ──────────────────────────────────────────────────────────────────────────
 out="$(run_reader "$CONF" list)"
@@ -171,8 +174,19 @@ ck "e2 the unit names NO repo in its argv (the #2281 defect)" \
    '! printf "%s" "$PROG" | grep -qE "<string>(--repo|--all-repos|daniel-ospina/)"'
 ck "e3 no repo slug appears ANYWHERE inside ProgramArguments" \
    '! printf "%s" "$PROG" | grep -q "daniel-ospina"'
-ck "e4 the wrapper and its reader are DECLARED for the farm (an undeclared target is an uninstallable job)" \
-   'grep -q "pr-doctor-machine.sh" "$REPO_ROOT/pi-bootstrap/setup.sh" && grep -q "repo-set.sh" "$REPO_ROOT/pi-bootstrap/setup.sh"'
+# ⛔ ARRAY MEMBERSHIP, NOT A GREP OVER THE FILE (#2281 review P2). The first cut grepped the whole of
+# setup.sh for the two names — and this change's own explanatory comments contain both names, so the
+# arm passed with the entries DELETED from the arrays. `fleet_srcs=(…)` / `lib_srcs=(…)` are the
+# declarations that actually deliver the files (they are parsed by `sed -n 's/^fleet_srcs=(.*)$/…'`
+# elsewhere, so each is one physical line), and that is what must be asserted.
+FARM_LINE="$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$REPO_ROOT/pi-bootstrap/setup.sh")"
+LIB_LINE="$(sed -n 's/^lib_srcs=(\(.*\))$/\1/p' "$REPO_ROOT/pi-bootstrap/setup.sh")"
+ck "e4a fleet_srcs is exactly one single-line array and it DELIVERS the wrapper" \
+   '[ "$(printf "%s\n" "$FARM_LINE" | wc -l | tr -d " ")" = 1 ] && case " $FARM_LINE " in *" pr-doctor-machine.sh "*) true ;; *) false ;; esac'
+ck "e4b lib_srcs is exactly one single-line array and it DELIVERS the reader" \
+   '[ "$(printf "%s\n" "$LIB_LINE" | wc -l | tr -d " ")" = 1 ] && case " $LIB_LINE " in *" repo-set.sh "*) true ;; *) false ;; esac'
+ck "e4c the membership arm is not satisfiable by the names appearing in prose (the first cut's defect)" \
+   '! printf "%s" "$FARM_LINE$LIB_LINE" | grep -q "#"' 
 
 # ── (f) the wrapper's three states, driven through a stub doctor ──────────────────────────────
 # A stub that records what it was EXECUTED with: argv on one line, PR_DOCTOR_REPOS on the next. The
@@ -234,7 +248,7 @@ end = t.index('    esac\n', start) + len('    esac\n')
 open(dst, "w").write(t[:start] + "    :\n" + t[end:])
 PY
 ck "g0 the mutation really removed the arm (a mutation that did not apply proves nothing)" \
-   '! grep -q "DUPLICATE-SLUG" "$M/lib/repo-set.sh"'
+   '! grep -q "repo-set: DUPLICATE-SLUG" "$M/lib/repo-set.sh"'
 dupconf="$T/dup.conf"
 printf 'slug=o/n checkout=%s\nslug=o/n checkout=%s\n' "$T/tortoise" "$T/agent-infra" > "$dupconf"
 orig_rc="$(run_reader_rc "$dupconf" list)"
@@ -269,6 +283,77 @@ ck "h1 the shipped unit passes e2/e3" \
    '! printf "%s" "$PROG" | grep -qE "<string>(--repo|--all-repos|daniel-ospina/)"'
 ck "h2 the PRE-#2281 argv would FAIL e2 (the assertion discriminates the change)" \
    'printf "%s" "$OLDPROG" | grep -qE "<string>(--repo|daniel-ospina/)"'
+
+# ── (i) the CASE FOLD: the doctor is case-insensitive, so this reader must be too ───────────────
+# `resolve_repo()` accepts a case-differing slug, `repo_tag()` lowercases the state file, and
+# `configured_repos()` lowercases its dedupe key. A byte-exact reader produced BOTH failures: a valid
+# repo refused (whole-machine exit 2), and one repo counted twice. Both are pinned here, both ways.
+# The ORIGIN spells it lowercase while the SET declares it mixed case — the exact pair the doctor
+# accepts (`got.lower() == slug.lower()`) and a byte-exact reader refused.
+mk_repo "$T/Case-Repo" Daniel-Ospina/Tortoise https://github.com/daniel-ospina/tortoise.git
+printf 'slug=Daniel-Ospina/Tortoise checkout=%s\n' "$T/Case-Repo" > "$T/case-provenance.conf"
+ck "i1 a slug whose CASE differs from its origin is ACCEPTED (the doctor accepts the same pair)" \
+   '[ "$(run_reader_rc "$T/case-provenance.conf" check)" = 0 ]'
+printf 'slug=o/n checkout=%s\nslug=O/N checkout=%s\n' "$T/tortoise" "$T/agent-infra" > "$T/case-dup.conf"
+ck "i2 two CASE-spellings of one slug are DUPLICATE-SLUG (the doctor dedupes them to one)" \
+   'o="$(run_reader "$T/case-dup.conf" list)"; printf "%s" "$o" | grep -q "DUPLICATE-SLUG" && [ "$(run_reader_rc "$T/case-dup.conf" list)" = 5 ]'
+ck "i3 …and doctor-repos never renders the same repo twice under two spellings" \
+   '[ -z "$(run_reader_out "$T/case-dup.conf" doctor-repos)" ]'
+
+# ── (j) an EXISTING but unusable file is the BROKEN state (5), never the absent one (3) ─────
+# The wrapper DEGRADES on 3 and REFUSES on 5, so folding these together silently un-serves the second
+# repo on a box whose repos.conf launchd cannot read — the defect #2281 exists to close — while
+# telling the operator to create a file that is already there.
+: > "$T/unreadable.conf"; chmod 000 "$T/unreadable.conf"
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip j1-j2 (running as root: mode 000 is still readable)\n'
+else
+  ck "j1 an unreadable set is INVALID (5), NOT NO-REPO-SET (3)" '[ "$(run_reader_rc "$T/unreadable.conf" list)" = 5 ]'
+  ck "j2 …and the refusal says the file EXISTS, so the operator is not sent to create it" \
+     'run_reader "$T/unreadable.conf" list | grep -q "exists but is not readable"'
+fi
+chmod 644 "$T/unreadable.conf" 2>/dev/null
+mkdir -p "$T/dirset"
+ck "j3 a DIRECTORY at the config path is INVALID (5), not NO-REPO-SET (3)" '[ "$(run_reader_rc "$T/dirset" list)" = 5 ]'
+ck "j4 …and it says so rather than claiming the path does not exist" \
+   'run_reader "$T/dirset" list | grep -q "exists but is not a regular file"'
+ck "j5 check PROPAGATES 3 for an absent set (a consumer must be able to tell it from a broken file)" \
+   '[ "$(run_reader_rc "$nofile" check)" = 3 ]'
+ck "j6 check returns 1 for a set that PARSES but whose proof fails (a different fix from a broken file)" \
+   '[ "$(run_reader_rc "$T/proof-wrong-provenance.conf" check)" = 1 ]'
+printf 'slug=notaslug checkout=%s\n' "$T/tortoise" > "$T/malformed.conf"
+ck "j7 check PROPAGATES 5 for a genuinely malformed set (it must not fold 3/4/5 into 1)" \
+   '[ "$(run_reader_rc "$T/malformed.conf" check)" = 5 ]'
+
+# ── (k) a COMMA inside a value must not change the SHAPE of the set ─────────────────────
+# `doctor-repos` joins with `,` and `configured_repos()` splits on it, so a value carrying one
+# truncated the real checkout and INVENTED a phantom repo (measured: one 1-repo set → two entries,
+# the second named `po`).
+mk_repo "$T/re,po" o/n
+printf 'slug=o/n checkout=%s\n' "$T/re,po" > "$T/comma.conf"
+ck "k1 a comma in a checkout is SEPARATOR-IN-VALUE (5)" \
+   '[ "$(run_reader_rc "$T/comma.conf" list)" = 5 ] && run_reader "$T/comma.conf" list | grep -q "SEPARATOR-IN-VALUE"'
+ck "k2 …so doctor-repos can never render an entry the splitter would break in two" \
+   '[ -z "$(run_reader_out "$T/comma.conf" doctor-repos)" ]'
+
+# ── (l) NON-VACUITY for the case fold: revert `_rs_lower` to identity in a COPY ──────────
+# and the fixture (i2) that was refused is then ACCEPTED as two repos — proving the fold is what
+# refuses, not some other property of the fixture.
+M2="$T/mut2"; mkdir -p "$M2/lib"
+python3 - "$READER" "$M2/lib/repo-set.sh" <<'PY2'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+old = "_rs_lower() { printf '%s' \"${1:-}\" | tr '[:upper:]' '[:lower:]'; }"
+assert t.count(old) == 1, "the case-fold helper moved; the mutation cannot be expressed"
+open(dst, "w").write(t.replace(old, "_rs_lower() { printf '%s' \"${1:-}\"; }"))
+PY2
+ck "l0 the mutation really replaced the fold (a mutation that did not apply proves nothing)" \
+   '! grep -q "tr .\[:upper:\]. .:lower:.\]" "$M2/lib/repo-set.sh"'
+mut2_rc="$(REPO_SET_FILE="$T/case-dup.conf" bash "$M2/lib/repo-set.sh" list >/dev/null 2>&1; echo $?)"
+ck "l1 the shipped reader refuses two case-spellings (rc 5)" '[ "$(run_reader_rc "$T/case-dup.conf" list)" = 5 ]'
+ck "l2 with the fold removed the SAME fixture is accepted as two repos (rc 0) — the fold discriminates" \
+   '[ "$mut2_rc" = 0 ]'
 
 # ── recap ─────────────────────────────────────────────────────────────────────────────────────
 printf '\n%s passed, %s failed\n' "$PASS" "$FAIL"
