@@ -646,13 +646,23 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     anything about a remote — and that includes the SHARED caveat helper `lane_end_push_caveat`, which is
     appended to the same MANUAL arms and carried the same unscoped sentence (its `refused-protected` /
     `refused-main-checkout` members are NOT consumed by an arm above it, so it is reachable, not latent).
+    ⛔ AND THE THIRD CONSUMER OF THAT ENUMERATION IS THE `[wip] NOTE` THAT ENDS THE LANE LOG, which is the
+    line an operator reads LAST: its fallback arm said the commits "exist ONLY locally and were NOT
+    pushed". Scoped now too, so the count's three readers (`next=`, the shared caveat, the NOTE) all say
+    the same thing about the same cache.
     ⛔ **AND A REMEDY NAMES THE REPOSITORY ITS VERDICT IS ABOUT:** `pushed` is
     granted against the PROVEN push url, so every `next=` sentence beside it prints
     `${LANE_END_PUSH_URL:-origin}` — a `remote.origin.pushurl` that diverges from `remote.origin.url` is
     supported, and a hardcoded `origin` would send the reader to a repository nobody read. That covers
     the `refs/wip/<slug>` archive recovery too: `bg-rescue-wip.sh` WRITES the archive with
     `git push origin "$C:refs/wip/$SLUG"`, so it lands in the push repository and the instruction must
-    FETCH from there rather than from `origin`'s fetch url.
+    FETCH from there rather than from `origin`'s fetch url. ⛔ AND THE url HAS TO EXIST ON THE ARMS THAT
+    NEVER RESOLVED IT: `lane_end_push` proves `LANE_END_PUSH_URL` only once the unpushed count is > 0, so
+    `nothing`, `unmeasured`, `detached` and `running` all reach `next=` with it EMPTY and fell back to
+    `origin` — the one repository the archive is NOT in. Those arms resolve it through
+    `lane_end_push_repo`, which reads the push url from CONFIG (no network, no proof needed for a remedy)
+    and answers `origin` only when it cannot do better — no readable remote, or more than one push url,
+    which is not this code's to pick.
     ⛔ **AND THE OTHER DOMAINS' MANUAL FACTS ARE
     APPENDED BY SHARED HELPERS, NOT RE-TYPED PER ARM** (`lane_end_rescue_caveat`, `lane_end_tree_caveat`,
     `lane_end_push_caveat`): four consecutive review cycles each found a fresh arm that dropped one — a
