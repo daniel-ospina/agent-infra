@@ -441,10 +441,18 @@ STG_LVL_TMP=""
 # real file. Comments are NOT stripped here on purpose — the assertion is about executable lines, so
 # it matches only lines that are not full-line comments AND names the exact call.
 _loop_nc="$(grep -vE '^[[:space:]]*#' "$ORCH")"
-ck "the shipped sweep SETTLES at the end of the body — 'stg_lvl_settle || :' immediately before its 'done'" \
-   "$(if printf '%s\n' "$_loop_nc" | awk '/stg_lvl_settle \|\| :/ {seen=1; next} seen && /^[[:space:]]*done[[:space:]]*$/ {found=1} END {exit !found}'; then echo 0; else echo 1; fi)"
-ck "the shipped sweep FOLDS the overlay queue in the PARENT, after 'done' — 'stg_lvl_fold' before 'stg_mark sweep'" \
-   "$(if printf '%s\n' "$_loop_nc" | awk '/done$/ {after=1} after && /stg_lvl_fold/ {f=1} END {exit !f}'; then echo 0; else echo 1; fi)"
+# ⛔ THE SETTLE ARM MUST REQUIRE THE **ADJACENT** LINE, NOT "SOME settle before SOME done" (my own
+# first draft of this arm was VACUOUS: it matched the TOP-OF-LOOP settle and stayed green after the
+# shipped end-of-body settle was deleted — verified, 75 passed with the line removed). The top-of-loop
+# settle exists on every iteration, so only adjacency to `done` distinguishes the two.
+ck "the shipped sweep SETTLES as its LAST statement — 'stg_lvl_settle || :' immediately before its 'done'" \
+   "$(if printf '%s\n' "$_loop_nc" | awk 'prev ~ /stg_lvl_settle \|\| :/ && $0 ~ /^[[:space:]]*done[[:space:]]*$/ {found=1} {prev=$0} END {exit !found}'; then echo 0; else echo 1; fi)"
+# ⛔ AND IT MUST MATCH THE SWEEP'S OWN CALL, NOT `stg_field`'s (my second draft of this arm was
+# VACUOUS: `stg_field` is DEFINED after the sweep's `done` and its body contains a bare `stg_lvl_fold`,
+# so deleting the shipped post-`done` fold stayed GREEN — verified). The sweep's call is spelled
+# `stg_lvl_fold || :`, which is the form only that call site uses.
+ck "the shipped sweep FOLDS the overlay queue AFTER its 'done', in the parent ('stg_lvl_fold || :' after a 'done')" \
+   "$(if printf '%s\n' "$_loop_nc" | awk '$0 ~ /^[[:space:]]*done[[:space:]]*$/ {after=1} after && /^[[:space:]]*stg_lvl_fold[[:space:]]*\|\|[[:space:]]*:/ {f=1} END {exit !f}'; then echo 0; else echo 1; fi)"
 # ⛔ AND EVERY `stg_nap_mark` CALL SITE MUST SAMPLE `STG_WAIT_T0` FIRST. `stg_cycle_reset` zeroes that
 # sample, so a call site that omits it records the controller's WHOLE UPTIME as "the gap" — measured
 # 3004153 us for a 1000000 us nap on the disk-held arm, which is the fabricated-measurement class
