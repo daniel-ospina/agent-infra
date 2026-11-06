@@ -367,6 +367,12 @@ deriv_ok() {
   fi
 }
 
+# mask_q <string> → the string with every double-quoted span replaced by `""`, so a flag merely
+# NAMED inside a value cannot be read as an argument. The awk model does this with maskQ; shell callers
+# need the same, and `route-inline` was the last quote-blind spot (round 12: a row teaching
+# `--title "never --body inline, use --body-file"` red-ed with a message false about the document).
+mask_q() { printf '%s' "$1" | sed -E 's/"[^"]*"/""/g'; }
+
 # shipped_cmd <file> → the `issue create` command the file ACTUALLY prints, with its `\`-continuations
 # joined. A function (not an inline awk) so a fixture can exercise the collector itself: E4 once
 # matched a `#` COMMENT that showed the anti-pattern and reported the untouched EXAMPLE as refused.
@@ -437,8 +443,7 @@ recipe() {
       }
       return s
     }
-    function norm(s) { gsub(/[ \t\r]+/, " ", s); return trim(s) }
-    function emit(s) { gsub(/[\001-\037]/, " ", s); return s }
+    function norm(s) { gsub(/[ \t\r]+/, " ", s); return trim(s) }    function emit(s) { gsub(/[\001-\037]/, " ", s); return s }
     # maskQ(s) → the same string with everything INSIDE a double-quoted span replaced by `#`, so a
     # flag match cannot land inside a value. Length is preserved, so a position found in the mask is
     # a position in the original. Round 10 measured why this is needed: `--title` and `--label` come
@@ -476,8 +481,13 @@ recipe() {
       # carries, and the mutation arm (d) pins it in both directions.
       if (line ~ /^[ \t]*#/) {
         low = tolower(line)
+        # ⛔ THE NEGATION MUST BIND THE WRITE VERB, not merely appear on the line (round 12).
+        # `avoid|skip|no longer|...` matched ANYWHERE, so `avoid an inline body: write the body to
+        # THAT path with the write tool` — an affirmative instruction — red-ed the recipe arms. The
+        # pattern is `<negation> <verb>`: `avoid writing` negates, `avoid an inline body: write` does
+        # not. (`without` and the modals stay, because a following verb is what they bind.)
         if (printed != "" && !wrote && low ~ /write/ && low ~ /(write.*tool|tool.*write)/ \
-            && low !~ /(do not|don.t|never|must not|no need to|without|avoid|skip|no longer|not necessary|not required|need not)/) wrote = 1
+            && low !~ /(do not|don.t|never|must not|avoid|skip|need not|no longer|without)[ ]+(write|writing|use|using|put|putting|save|saving)/) wrote = 1
         next
       }
       # an assignment: remembered, and it is the ONLY way a per-CALL derivation is legitimate.
@@ -502,7 +512,15 @@ recipe() {
         while (match(p, /"[^"]*"/)) { span = substr(p, RSTART + 1, RLENGTH - 2); p = substr(p, RSTART + RLENGTH); n++ }
         if (n == 0) { span = line; sub(/.*[ \t]/, "", span) }
         cand = norm(resolve(span))
-        if (cand ~ /\// || cand ~ /(git rev-parse|mktemp)/) { printed = cand; order = "pre" }
+        if (cand ~ /\// || cand ~ /(git rev-parse|mktemp)/) {
+          printed = cand; order = "pre"
+          # ⛔ THE PRINT OWN `via` (round 12). `via` is computed from the FILED value, and arms that
+          # asked `deriv_ok "$printed" "$via"` paired the print with the FILE mediation: a file that
+          # printed a direct `$(mktemp)` and filed an ASSIGNED `$BODY` — two different files, one empty
+          # — stayed 63/0 green, because the filed side happened to be an assignment.
+          printed_via = "direct"
+          if (span ~ /^\$\{?[A-Za-z_][A-Za-z0-9_]*\}?$/) printed_via = "assign"
+        }
         next
       }
     }
@@ -528,6 +546,7 @@ recipe() {
         # is not a shape this repo teaches, and would be a fresh-shell bug anyway.
       }
       printf "printed=%s\n", emit(printed)
+      printf "printed_via=%s\n", printed_via
       printf "filed=%s\n",   emit(filed)
       printf "via=%s\n",     via
       printf "order=%s\n",   order
@@ -578,6 +597,7 @@ canon_reasons_missing() {
   REC="$(recipe "$f" 2>/dev/null)"
   rec_get() { printf '%s\n' "$REC" | sed -n "s/^$1=//p" | head -1; }
   P_PRINT="$(rec_get printed)"; P_FILE="$(rec_get filed)"; P_VIA="$(rec_get via)"
+  P_PVIA="$(rec_get printed_via)"
   P_ORDER="$(rec_get order)";    P_WRITE="$(rec_get write)"; P_QUOTE="$(rec_get quoted)"
   # call1-path — a path is PRINTED BEFORE the gh call and it carries a derivation. Checking only the
   # word `pi-issue-body-` let `echo "/tmp/pi-issue-body-shared.md"` satisfy it while reintroducing the
@@ -585,7 +605,9 @@ canon_reasons_missing() {
   # ⛔ A variable-mediated print (`echo "$BODY"`) IS this property when `BODY` is assigned the
   # derivation in the same fence: the model resolves it, and refusing it for spelling contradicted
   # derivation-unique own comment, which blesses exactly that shape (round 9).
-  { [ "$P_ORDER" = pre ] && [ -n "$P_PRINT" ] && carries_deriv "$P_PRINT"; } \
+  # ⛔ AND THE PRINT OWN `via` DECIDES (round 12): `echo "$(mktemp)"` is a per-CALL expansion at the
+  # print, so it is a DIFFERENT file from an assigned `$BODY` used at the gh call.
+  { [ "$P_ORDER" = pre ] && [ -n "$P_PRINT" ] && deriv_ok "$P_PRINT" "${P_PVIA:-direct}"; } \
     || miss="$miss call1-path"
   # call2-write — the instruction to WRITE the body, AFTER the path is printed. Deleting it left the
   # canonical example unrunnable and the shard green (round 6): call 1 prints a path, but nothing then
@@ -658,10 +680,15 @@ readme_route_absent() {
   ROUTE_VERDICT="$(printf '%s\n' "$ROUTE_SPANS" | while IFS= read -r sp; do
       [ -n "$sp" ] || continue
       val="$(printf '%s' "$sp" | sed -E 's/.*(-F|--body-file)[= ]+//' | sed -E 's/^"([^"]*)".*/\1/')"
-      case "$val" in */*|*\$*) ;; *) continue ;; esac
+      # ⛔ A PLACEHOLDER IS A METAVARIABLE, NOT "anything without a slash or a `$`" (round 12). That
+      # weaker rule is the LITERAL arm's own definition of an offender, so it classified
+      # `--body-file "issue-body.md"` — a bare relative literal, the #729 class — as documentation and
+      # skipped it: the row's own example taught a shared path while another span carried the
+      # derivation, 63/0 green (measured). `<path>` and `…` are metavariables; a file name is not.
+      case "$val" in '<'*|*'>'|'…'|'') continue ;; esac
       printf 'real\n'
       { printf '%s' "$val" | grep -q '\$' && deriv_ok "$val" direct; } || printf 'bad\n'
-      printf '%s' "$sp" | grep -qE -- '(^|[ ])--body[ =]' && printf 'inline\n'
+      printf '%s' "$(mask_q "$sp")" | grep -qE -- '(^|[ ])--body[ =]' && printf 'inline\n'
       printf 'span %s\n' "$sp"
     done)"
   ROUTE_N="$(printf '%s\n' "$ROUTE_VERDICT" | grep -c '^real$' || true)"
@@ -804,12 +831,15 @@ while IFS= read -r f; do
   P3P="$(printf '%s\n' "$R3" | sed -n 's/^printed=//p' | head -1)"
   P3F="$(printf '%s\n' "$R3" | sed -n 's/^filed=//p' | head -1)"
   P3V="$(printf '%s\n' "$R3" | sed -n 's/^via=//p' | head -1)"
+  P3PV="$(printf '%s\n' "$R3" | sed -n 's/^printed_via=//p' | head -1)"
   P3O="$(printf '%s\n' "$R3" | sed -n 's/^order=//p' | head -1)"
   # ⛔ `deriv_ok`, NOT a bare `carries_deriv` (round 11). `carries_deriv` matches the WORD `mktemp`, so
   # a census file could print one `$(mktemp)` and FILE a second, empty one and stay GREEN at 61/0 —
   # `deriv_ok` was applied to the canonical and the README only, i.e. to 1 of the 5 teach-sites plus
   # the row, and 4 of the 5 live in THIS loop. The rule the model documents is now the rule here.
-  { [ "$P3O" = pre ] && [ -n "$P3P" ] && deriv_ok "$P3P" "${P3V:-direct}"; } \
+  # ⛔ AND WITH THE PRINT OWN `via` (round 12) — `$P3V` is the FILED value mediation, so pairing it
+  # with the PRINTED value blessed a print of a direct `$(mktemp)` against a filed `$BODY`.
+  { [ "$P3O" = pre ] && [ -n "$P3P" ] && deriv_ok "$P3P" "${P3PV:-direct}"; } \
     || NO_PREP="$NO_PREP ${f#$ROOT/}"
   # ⛔ recipe-match IS A POPULATION PROPERTY, not a canonical-only one (round 10). It was applied to
   # `$CANON` alone, so `skills/carousel-b2b-strategy` could print `pi-issue-body-$(…)` and file
@@ -865,8 +895,16 @@ TAUGHT_OFF=""; TAUGHT_SEEN=""
 for nm in $(printf '%s' "$README_TAUGHT" | tr '`' '\n' | awk 'NR % 2 == 0' | tr ' ' '\n' | grep -v '^$'); do
   case "$nm" in *,|and|\&) continue ;; esac
   TAUGHT_SEEN="$TAUGHT_SEEN $nm"
-  if printf '%s\n' "$CENSUS" | grep -qF "/skills/$nm" || printf '%s\n' "$CENSUS" | grep -qF "/$nm"; then :
-  else TAUGHT_OFF="$TAUGHT_OFF $nm"
+  if printf '%s\n' "$CENSUS" | grep -qF "/skills/$nm"; then :
+  else
+    # ⛔ THE `/nm` SUFFIX ARM APPLIES ONLY TO A SLASHED NAME (round 12). Round 11 added it so
+    # `workflow/04-merge-deploy.md` resolves — but an unqualified suffix arm resolves ANY basename
+    # fragment, so appending `04-merge-deploy` or `SKILL.md` to the row passed and was printed back as
+    # a taught skill (measured: 63/0). A bare name must resolve as a real skill DIRECTORY.
+    case "$nm" in
+      */*) printf '%s\n' "$CENSUS" | grep -qF "/$nm" || TAUGHT_OFF="$TAUGHT_OFF $nm" ;;
+      *) TAUGHT_OFF="$TAUGHT_OFF $nm" ;;
+    esac
   fi
 done
 if [ -z "$README_TAUGHT" ]; then
@@ -1651,47 +1689,60 @@ else
   esac
 fi
 
-# (e) THE README EXAMPLE'S VALUE — not the whole command — must carry the derivation, and the sanctioned
-# span must be selected by SHAPE. Both were green holes in round 10.
-readme_route_span_mut() {  # readme_route_span_mut <suffix> <sed-expr> → the mutation verdict
-  sed -E "$2" "$ROOT/extensions/main-worktree-guard/README.md" > "$T/mut/readme-$1.md"
-  if cmp -s "$T/mut/readme-$1.md" "$ROOT/extensions/main-worktree-guard/README.md"; then
-    printf 'NOOP'; return 0
-  fi
-  readme_route_absent "$T/mut/readme-$1.md" | sed "s|$T/mut/readme-$1.md||" | tr '\n' ' '
+# (e) THE README EXAMPLE'S VALUE — not the whole command — must carry the derivation, and EVERY
+# candidate span must be measured rather than "the first one that mentions the command".
+#
+# ⛔ THE FIXTURES ARE SYNTHESIZED, NOT SED-ED (round 12). Every fixture here used to rewrite the real
+# row, so it was anchored to the current SPELLING, and a legitimate respelling — an unquoted value,
+# the `--body-file=<path>` form `gh` documents, a different derivation — made the substitution a no-op
+# and red-ed the suite with a MUTATOR FAULT on a correct document. A fixture this shard AUTHORS cannot
+# go stale, so a red here is always about the ARM. The CONTROL below is what makes that claim
+# checkable: a synthesized section carrying the shipped shape must be ACCEPTED.
+readme_row() {  # readme_row <suffix> <escape-cell> <how-cell> → the verdict on a synthesized section
+  local f="$T/mut/readme-$1.md"
+  {
+    printf '## Escape hatches\n\n'
+    printf '| Escape | How | Consequence (what you are opting into) |\n'
+    printf '|---|---|---|\n'
+    printf '| %s | %s | ⚠️ **None, and it is not a bypass** — a body passed by file never enters the command string, so nothing scans it. ⚠️ **The TITLE and LABEL are part of the command string too**: `--title "… git rebase …"` is refused, so keep the verb out of the title. |\n' "$2" "$3"
+    printf '\nRule of thumb: **stay in a worktree.**\n'
+  } > "$f"
+  readme_route_absent "$f" | sed "s|$f||" | tr '\n' ' '
 }
-# the derivation parked in the TITLE while the body path stays a fixed /tmp name
-ROUTE_MUT="$(readme_route_span_mut deriv-in-title 's#--title … (--body-file|-F)([[:blank:]]+|=)"[^"]*"#-F "/tmp/x.md" --title "tmp $(git rev-parse --absolute-git-dir)"#')"
+ROW_ESCAPE='`gh … --body-file <path>` (**not an escape — the SANCTIONED route**, #3445)'
+ROW_HOW_OK='Write the body with the `write` tool to a checkout-unique path, then: `gh issue create --title … --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir).md"`'
+ROUTE_MUT="$(readme_row control "$ROW_ESCAPE" "$ROW_HOW_OK")"
+if [ -z "$ROUTE_MUT" ]; then
+  ok 'CONTROL: a synthesized escape section carrying the shipped shape is ACCEPTED — so every red in the arms below is attributable to the mutation and not to the synthesizer'
+else
+  bad "the CONTROL row was refused ($ROUTE_MUT) — the synthesizer does not produce a document arm D accepts, so the arms below attribute nothing; fix the fixture before reading their verdicts"
+fi
+# (e1) the derivation parked in the TITLE while the body path is a fixed /tmp name: the pre-round-10
+# arm asked whether the COMMAND carried a derivation, so it blessed a literal body path.
+ROUTE_MUT="$(readme_row deriv-in-title "$ROW_ESCAPE" 'Then: `gh issue create --body-file "/tmp/x.md" --title "tmp $(git rev-parse --absolute-git-dir)"`')"
 case "$ROUTE_MUT" in
-  *NOOP*) bad 'the README derivation fixture did not change the row — the example moved, so this arm measured nothing (mutator fault)' ;;
   *route-path*) ok 'MUTATION: the derivation must be in the `--body-file` VALUE — parking it in the `--title` while the body path is a fixed `/tmp` name is REFUSED (before round 10 the whole-command carry blessed it at 51/0)' ;;
-  *) bad "the README row passed with a fixed \`/tmp\` body path because a derivation appeared elsewhere in the command ($ROUTE_MUT) — a derivation in the title does not make the body unique" ;;
+  *) bad "a row whose body path is a fixed \`/tmp\` name passed because a derivation appeared elsewhere in the command ($ROUTE_MUT) — a derivation in the title does not make the BODY path unique" ;;
 esac
-# a per-CALL `mktemp` cannot be blessed in an INLINE example: one expansion files an empty body
-ROUTE_MUT="$(readme_route_span_mut mktemp 's#(--body-file|-F)([[:blank:]]+|=)"[^"]*"#--body-file "$(mktemp)"#')"
+# (e2) a per-CALL `mktemp` cannot be blessed in an INLINE example: one expansion files an empty body.
+ROUTE_MUT="$(readme_row mktemp "$ROW_ESCAPE" 'Then: `gh issue create --title … --body-file "$(mktemp)"`')"
 case "$ROUTE_MUT" in
-  *NOOP*) bad 'the README mktemp fixture did not change the row — the example moved, so this arm measured nothing (mutator fault)' ;;
   *route-path*) ok 'MUTATION: a bare `$(mktemp)` in the README example is REFUSED — the row is inline, so one expansion creates a brand-new EMPTY file at the gh call (the skill arm already refused it; the README arm blessed it at 51/0 before round 10)' ;;
   *) bad "the README row blessed a bare \`\$(mktemp)\` body path ($ROUTE_MUT) — the reader would file an empty body, and the same shape is refused by the skill arm" ;;
 esac
-# (e3) A SECOND span is not a defect — a second span teaching a LITERAL path is. "Exactly one span"
-# was the wrong invariant: it false-RED four arms on a cosmetic edit (spelling the row's first column
-# out) and on one explanatory sentence, because `<path>` is DOCUMENTATION, not a command. Both halves
-# are pinned below.
-readme_route_span_placeholder() {  # placeholder-span spelling-out must stay CLEAN
-  readme_route_span_mut second-placeholder 's#^\| `gh . --body-file <path>`#| `gh issue create --body-file <path>`#'
-}
-ROUTE_MUT="$(readme_route_span_placeholder)"
+# (e3) a PLACEHOLDER second span is documentation, not a taught command — it must stay CLEAN, or a
+# cosmetic edit (spelling the first column out) reds a correct document.
+ROUTE_MUT="$(readme_row placeholder-span '`gh issue create --body-file <path>` (**not a bypass**)' "$ROW_HOW_OK")"
 case "$ROUTE_MUT" in
-  *NOOP*) bad 'the second-placeholder fixture did not change the row — the first column moved, so this arm measured nothing (mutator fault)' ;;
-  '') ok 'MUTATION: spelling the row first column out as `gh issue create --body-file <path>` is CLEAN — a PLACEHOLDER (no `/`, no `$`) is documentation, not a taught command, so a second candidate span does not refuse a correct document (measured, round 11: 57/4 before)' ;;
-  *) bad "a second PLACEHOLDER span (\`gh issue create --body-file <path>\`) reddened the README arm ($ROUTE_MUT) — that is a false RED on a cosmetic edit, not a defect of the document" ;;
+  '') ok 'MUTATION: a second span carrying a PLACEHOLDER value (`gh issue create --body-file <path>`) is CLEAN — a metavariable is documentation, not a taught command, so a correct document with two code spans is not refused (measured, round 11: 57/4 on a cosmetic edit)' ;;
+  *) bad "a second PLACEHOLDER span reddened the README arm ($ROUTE_MUT) — that is a false RED on a cosmetic edit, not a defect of the document" ;;
 esac
-ROUTE_MUT="$(readme_route_span_mut two-spans 's#^\| `gh . --body-file <path>`#| `gh issue create --title x --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir).md"`#; s#--title … (--body-file|-F)([[:blank:]]+|=)"[^"]*"#--body-file "/tmp/x.md"#')"
+# (e4) a DERIVED span does not bless a LITERAL body path in the row's own example — the round-10 hole
+# in its strongest form: candidacy must not depend on which span happens to come first.
+ROUTE_MUT="$(readme_row derived-elsewhere '`gh issue create --title x --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir).md"`' 'Then: `gh issue create --title … --body-file "issue-body.md"`')"
 case "$ROUTE_MUT" in
-  *NOOP*) bad 'the two-span fixture did not change the row — the first column moved, so this arm measured nothing (mutator fault)' ;;
-  *route-path*) ok 'MUTATION: a DERIVED span above the row does not bless a LITERAL body path in the row own example — every candidate span is measured, so `--body-file "/tmp/x.md"` still reds (before round 10 positional selection took the first span and the row stayed green at 51/0)' ;;
-  *) bad "a row whose own example teaches a fixed \`/tmp\` path passed because ANOTHER span carried the derivation ($ROUTE_MUT) — a correct span elsewhere does not make this one derived (#729)" ;;
+  *route-path*) ok 'MUTATION: a DERIVED span elsewhere does not bless a LITERAL body path in the row own example — every candidate span is measured, so a bare relative `issue-body.md` still reds (measured, round 12: 63/0 while a correct span carried the derivation)' ;;
+  *) bad "a row whose own example teaches a bare relative body path passed because ANOTHER span carried the derivation ($ROUTE_MUT) — a correct span elsewhere does not make this one derived (#729), and a relative path is as shared as an absolute one" ;;
 esac
 
 # ── NOTE (not an assertion): odd fence parity blinds arms B/B2 for the rest of that file ────────
