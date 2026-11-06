@@ -125,7 +125,7 @@ CR_STAGES_FIELD="stages"
 # cycle_stage_get <record> <stage> -> "<secs>" | "ns" on stdout; rc 1 when the record has no
 # `stages=` field or the field does not name <stage>. Never errors on an old-format record.
 cycle_stage_get() {
-  local _sg_rec="${1:-}" _sg_want="${2:-}" _sg_rest _sg_f _sg_val=""
+  local _sg_rec="${1:-}" _sg_want="${2:-}" _sg_rest _sg_f _sg_val="" _sg_v
   # ⛔ THE WANTED NAME IS VALIDATED BEFORE IT IS USED AS A `case` PATTERN (below). A caller that
   # passed `*` would otherwise MATCH the first stage in the field and return its value as if it were
   # the requested one — a silent wrong answer, which is worse here than a refusal because the whole
@@ -146,13 +146,35 @@ cycle_stage_get() {
   while [ -n "$_sg_rest" ]; do
     _sg_f="${_sg_rest%%,*}"; _sg_rest="${_sg_rest#*,}"
     [ -n "$_sg_f" ] || continue
-    case "$_sg_f" in "${_sg_want}:"*) printf '%s' "${_sg_f#*:}"; return 0 ;; esac
+    case "$_sg_f" in
+      "${_sg_want}:")
+        # A stage named with NO value at all is not a measurement.
+        return 1 ;;
+      "${_sg_want}:"*)
+        _sg_v="${_sg_f#*:}"
+        # ⛔ THE VALUE IS VALIDATED, NOT MERELY RETURNED (fresh-context review, P2). A corrupt field
+        # used to answer with whatever bytes followed the first colon — `a:1:2` returned `1:2` and
+        # `a:` returned the empty string, BOTH with rc 0 — so a caller could not tell a corrupt value
+        # from a measurement, which defeats the one property this field exists to have. Only digits or
+        # the literal `ns` is a reading; anything else is answered as ABSENT (rc 1), the same polarity
+        # the record's own read-side CLI uses when it calls the field malformed.
+        if [ "$_sg_v" = "ns" ]; then printf '%s' 'ns'; return 0; fi
+        case "$_sg_v" in ''|*[!0-9]*) return 1 ;; esac
+        printf '%s' "$_sg_v"; return 0 ;;
+    esac
   done
   return 1
 }
 
-# cycle_stages_valid <value> — rc 0 when the value matches the grammar above. The guard that keeps a
-# malformed field from entering the record file in the first place, where it would be permanent.
+# cycle_stages_valid <value> — rc 0 when the value matches the grammar above.
+# ⛔ IT IS A READ-SIDE GUARD, NOT A WRITER GATE, AND THE EARLIER TEXT HERE CLAIMED OTHERWISE
+# (fresh-context review, P1). It said this "keeps a malformed field from entering the record file in the
+# first place"; `cycle_record_write` never calls it, so that guarantee did not exist. The writer is
+# deliberately NOT the place to enforce it: `state/cycles` is append-only, and the writer runs on the
+# fork-starved path where refusing a line would DELETE the record the starved box needs to leave. A
+# malformed field must therefore be VISIBLE and unrepairable-by-deletion, not silently dropped — so the
+# grammar is enforced where it is READ (the `stages` CLI verb refuses a malformed field and says so)
+# and at the emitter, which can only ever produce `<registry-name>:<digits|ns>` (see `stg_field`).
 cycle_stages_valid() {
   local _sv_val="${1:-}" _sv_rest _sv_f _sv_name _sv_v
   [ -n "$_sv_val" ] || return 1

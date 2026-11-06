@@ -532,14 +532,23 @@ matters when reading a line:
 
 | kind | examples | meaning |
 |---|---|---|
-| **tiled** | `boot disk reap refresh authority claims caches sweep gate l5_issue record` | marked unconditionally once per cycle, in body order — they **tile** the body, so their sum *is* the cycle's own duration |
-| **overlay** | `l2_merge l3_fix l4_review` | a merge-cascade level's **cumulative** wall time inside the sweep; a *breakdown of* `sweep`, never an addition to it (`sum(l1..l4) <= sweep`) |
-| **carried** | `prev_wait` | the post-record gap (async backlog spawn + the `CYC` nap), read one cycle later — the record is written *before* the nap, and must be, or a HUNG cycle would look fresh for its whole duration |
+| **tiled** | `boot disk reap refresh authority claims caches sweep gate l5_issue record` | marked once per cycle, in body order — they **tile** the body, so on a FULL cycle their sum *is* the cycle's own duration |
+| **overlay** | `l2_merge l3_fix l4_review` | a merge-cascade level's **cumulative** wall time inside the sweep; a *breakdown of* `sweep`, never an addition to it (`sum(l1..l4) <= sweep`). Each level's intervals are queued in `$O/state/.stg-lvl` by the sweep's subshell and folded back into the parent after it — a shell variable written inside that pipeline would die at `done` and report a fabricated `0` |
+| **carried** | `prev_wait` | the post-record gap (async backlog spawn + the `CYC` nap), read one cycle later — the record is written *before* the nap, and must be, or a HUNG cycle would look fresh for its whole duration. It is **one gap, overwritten each cycle, never a running total** |
 
 `l5_issue` is a tiled stage because issue launch is contiguous; `l1_main` (the cascade's *fix main if
 red*) is registered and reads **`ns`** until that level exists — `ns` ("registered, never sampled") is a
 different reading from `0` ("measured, cost nothing"), deliberately, so an unimplemented level can
-never read as a measured zero-cost one.
+never read as a measured zero-cost one. `l4_review` is the review-**dispatch** arm's own body time: the
+controller spawns the reviewer and moves on, so it is small by design and is not the reviewer's runtime.
+
+⛔ **THE TILING INVARIANT IS A FULL-CYCLE PROPERTY, NOT A UNIVERSAL ONE.** Only a cycle that reaches
+the end of its body marks every tiled stage. On the **disk-held** arm and the **fork-starved** arm the
+cycle `continue`s early, so the stages it never reached read `ns` and `sum(tiled)` is legitimately SHORT
+of `end - start` — `ns` is the label that says so. The same is true of the tail after `stg_mark record`
+(the field is built, then the line is appended, then the nap). So a reader checking `sum == end - start`
+should first confirm no stage reads `ns`; where one does, the shortfall is the un-run remainder, not a
+broken instrument. The very arms the 161-minute narrative above is about are these early-exit ones.
 
 The stage SET lives in exactly one place — `orch-loop.sh`'s `STG_REGISTRY_*` block — and the emitter
 walks it, so a stage added there appears in every later record with no second edit. The grammar and the

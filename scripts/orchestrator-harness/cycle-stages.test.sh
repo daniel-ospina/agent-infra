@@ -25,6 +25,11 @@
 #   §7  BACKWARDS COMPATIBILITY — a record with NO `stages=` field still parses for EVERY reader
 #   §8  the record stays ONE space-separated `k=v` line: the new field cannot break the grammar that
 #       the other twenty fields share
+#   §9  THE THREE DEFECTS A FRESH-CONTEXT REVIEW FOUND, each armed so it cannot come back: an overlay
+#       written in the sweep's PIPELINE SUBSHELL must still reach the record, `prev_wait` must be ONE
+#       gap rather than a lifetime sum, and every declared cascade level must have a real call site
+#       instead of a fabricated measured zero. §2–§3 could not catch these: they drive the clock in
+#       the MAIN shell, never through a subshell boundary and never across two cycles.
 #
 # ⛔ THE VACUITY TRAP THIS FILE WAS BORN WITH, AND HOW IT IS CLOSED (driven, not guessed: the first
 # draft of this suite sourced only the extracted clock and never `cycle-record.sh`, so
@@ -75,7 +80,7 @@ fi
 _missingfn=""
 for _fn in cycle_stages_valid cycle_stage_get cycle_verdict cycle_history cycle_record_write \
            stg_cycle_reset stg_mark stg_lvl_start stg_lvl_settle stg_nap_mark stg_field \
-           stg_now_us stg_now_us_vars stg_add; do
+           stg_now_us stg_now_us_vars stg_add stg_lvl_accum stg_lvl_fold; do
   declare -f "$_fn" >/dev/null 2>&1 || _missingfn="$_missingfn $_fn"
 done
 ck "every function under test is defined by the shipped modules${_missingfn:+ (missing:$_missingfn)}" \
@@ -381,6 +386,87 @@ ck "  …and the pre-existing fields are untouched beside it (start/cycle/nothin
    "$(if qF 'start=100' "$_rec" && qF 'cycle=1' "$_rec" && qF 'nothing=none' "$_rec"; then echo 0; else echo 1; fi)"
 ck "  …so a reader that knows nothing about stages= still finds every field it uses" \
    "$(if qF 'interval=240' "$_rec" && qF 'dispatched=0' "$_rec"; then echo 0; else echo 1; fi)"
+
+echo
+# ── §9 the defects a fresh-context review found, now pinned ──────────────────────────────────────
+echo "── §9 REGRESSIONS the main-shell drives above could never catch (subshell, carry, call site) ──"
+
+# 9.1 AN OVERLAY CLOSED INSIDE A PIPELINE SUBSHELL MUST REACH THE RECORD.
+# The real sweep is `printf … | while read … done`, so `stg_lvl_settle` runs in a SUBSHELL. The shipped
+# code queues the interval in `$STG_LVL_TMP` and folds it in the parent; the pre-review code called
+# `stg_add` there and the write died at `done`, so every record said `l2_merge:0` whatever happened.
+# This arm drives that exact boundary — it is the only arm in the suite that does.
+STG_LVL_TMP="$TMP/lvlq"; : >"$STG_LVL_TMP"
+STG_V_l2_merge=0; STG_V_l3_fix=0; STG_V_l4_review=0; STG_OPEN_LVL=""; STG_OPEN_T0=0
+printf 'row\n' | while read -r _prow; do
+  stg_lvl_start l2_merge || :
+  sleep 1.2
+  stg_lvl_settle || :
+done
+ck "an overlay interval opened INSIDE a pipeline has NOT yet reached the parent (the variable is still 0)" \
+   "$(if [ "${STG_V_l2_merge:-0}" -eq 0 ]; then echo 0; else echo 1; fi)"
+stg_lvl_fold || :
+ck "  …and the FOLD turns that queued interval into the level's measured time (got ${STG_V_l2_merge:-0} us)" \
+   "$(if [ "${STG_V_l2_merge:-0}" -ge 1000000 ]; then echo 0; else echo 1; fi)"
+stg_lvl_fold || :
+ck "  …and folding twice adds nothing (the queue is drained), still ${STG_V_l2_merge:-0} us" \
+   "$(if [ "${STG_V_l2_merge:-0}" -lt 3000000 ]; then echo 0; else echo 1; fi)"
+ck "  …and a level with no interval is still a MEASURED 0, not an accident of the mechanism" \
+   "$(if [ "${STG_V_l3_fix:-x}" = "0" ]; then echo 0; else echo 1; fi)"
+STG_LVL_TMP=""
+
+# 9.2 `prev_wait` IS ONE GAP, NOT THE LIFETIME SUM OF EVERY NAP.
+# `stg_add` accumulates, so the pre-review `stg_nap_mark` made the field grow every cycle (measured
+# 1,2,3 over three 1 s naps; on a real box with CYC=240 it reaches ~2400 by cycle 10). Two resets and
+# two naps is exactly the sequence that produced that, so this arm fails on the old code.
+stg_cycle_reset
+stg_now_us_vars _pt1 >/dev/null 2>&1 || _pt1=0
+STG_WAIT_T0=$(( _pt1 - 1000000 )); stg_nap_mark
+_pw1="${STG_V_prev_wait:-}"
+stg_cycle_reset                      # next cycle: the reset deliberately CARRIES prev_wait
+ck "the reset CARRIES prev_wait (it is the previous gap, by definition read one cycle later)" \
+   "$(if [ -n "${STG_V_prev_wait:-}" ]; then echo 0; else echo 1; fi)"
+stg_now_us_vars _pt2 >/dev/null 2>&1 || _pt2=0
+STG_WAIT_T0=$(( _pt2 - 1000000 )); stg_nap_mark
+_pw2="${STG_V_prev_wait:-0}"
+ck "a SECOND cycle's nap OVERWRITES prev_wait instead of adding to it (1st ${_pw1:-?} us, 2nd ${_pw2} us)" \
+   "$(if [ "$_pw2" -lt 1500000 ]; then echo 0; else echo 1; fi)"
+ck "  …and the second gap is a real measurement, not a cleared-to-zero field" \
+   "$(if [ "$_pw2" -ge 1000000 ]; then echo 0; else echo 1; fi)"
+
+# 9.3 EVERY DECLARED CASCADE LEVEL HAS A REAL CALL SITE.
+# `l4_review` was declared in `STG_REGISTRY_LVL` (so the reset initialised it to `0`, "a MEASURED
+# zero") while nothing ever called `stg_lvl_start l4_review` — the exact false pass this file refuses
+# for `l1_main`. Asserts against the SHIPPED loop, with FULL-LINE COMMENTS STRIPPED first: a comment
+# that merely names the call must not satisfy the arm (the fix for this defect explains itself in
+# prose, so an unstripped grep would have passed on the broken tree).
+_loopcode="$(grep -vE '^[[:space:]]*#' "$ORCH")"
+for _lvl in $STG_REGISTRY_LVL; do
+  ck "cascade level '$_lvl' has a stg_lvl_start call site in the shipped loop (not just a registry entry)" \
+     "$(if qF "stg_lvl_start $_lvl" "$_loopcode"; then echo 0; else echo 1; fi)"
+done
+
+# 9.4 THE READER REFUSES A CORRUPT VALUE INSTEAD OF RETURNING IT.
+# `a:1:2` used to answer `1:2` and `a:` the empty string, BOTH rc 0 — a caller could not tell a corrupt
+# value from a measurement, which defeats the one property the field exists to have.
+ck "cycle_stage_get answers ABSENT for a value with a second colon ('1:2' is not a duration)" \
+   "$(if cycle_stage_get 'start=1 stages=sweep:1:2' sweep >/dev/null 2>&1; then echo 1; else echo 0; fi)"
+ck "  …and ABSENT for a stage named with no value at all — a REFUSAL (rc≠0), because an empty string\n              with rc 0 is indistinguishable from a reading at the call site" \
+   "$(if cycle_stage_get 'start=1 stages=sweep:' sweep >/dev/null 2>&1; then echo 1; else echo 0; fi)"
+ck "  …and ABSENT for a non-numeric value" \
+   "$(if cycle_stage_get 'start=1 stages=sweep:abc' sweep >/dev/null 2>&1; then echo 1; else echo 0; fi)"
+ck "  …while a real value and 'ns' are still returned unchanged" \
+   "$(if [ "$(cycle_stage_get 'stages=sweep:41,l4_review:ns' sweep)" = "41" ] && \
+         [ "$(cycle_stage_get 'stages=sweep:41,l4_review:ns' l4_review)" = "ns" ]; then echo 0; else echo 1; fi)"
+
+# 9.5 THE `record` STAGE MAY NOT BE MARKED AFTER THE PREPARATION IT NAMES.
+# The marks used to sit immediately above `stg_field`, i.e. AFTER the `tr`/`sed`/`cut` work, so that
+# work was credited to `l5_issue` and `record` measured two adjacent calls. Asserts ORDER in the
+# shipped loop: the `stg_mark record` line precedes the `_cr_ids` preparation it claims to measure.
+_rec_line="$(grep -n 'stg_mark record' "$ORCH" | grep -vE ':[[:space:]]*#' | head -1 | cut -d: -f1)"
+_cprep="$(grep -n '_cr_ids="\$(tr' "$ORCH" | head -1 | cut -d: -f1)"
+ck "stg_mark record precedes the ids=/selected= preparation it measures (record line ${_rec_line:-?}, prep line ${_cprep:-?})" \
+   "$(if [ -n "$_rec_line" ] && [ -n "$_cprep" ] && [ "$_rec_line" -lt "$_cprep" ]; then echo 0; else echo 1; fi)"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"

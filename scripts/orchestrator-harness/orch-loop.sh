@@ -858,6 +858,11 @@ STG_REGISTRY_PREV="prev_wait"
 STG_REGISTRY="$STG_REGISTRY_TILED $STG_REGISTRY_LVL $STG_REGISTRY_PENDING $STG_REGISTRY_PREV"
 STG_BASE_US=""; STG_LAST_US=0
 STG_TILE_MARK=0; STG_OPEN_LVL=""; STG_OPEN_T0=0; STG_WAIT_T0=0; STG_FIELD=""
+# The overlay queue. A PATH (never a variable) because the sweep's subshell cannot write its parent's
+# variables — see `stg_lvl_accum`. Empty means "no queue available": overlays then fall back to the
+# in-process add, which is correct at top level and lost inside the sweep, so a box that cannot write
+# this file reports its overlays as `ns`-adjacent zeros rather than fabricating them.
+STG_LVL_TMP=""
 
 # stg_now_us_vars <outvar> — set <outvar> to MONOTONIC microseconds since this process's first
 # sample. Builtins only: see the block comment. rc 1 on a bad outvar name.
@@ -906,6 +911,49 @@ stg_add() {
   return 0
 }
 
+# ⛔ OVERLAYS ACCUMULATE THROUGH A FILE, NOT THROUGH A SHELL VARIABLE — AND THAT IS NOT AN
+# OPTIMISATION, IT IS THE ONLY THING THAT WORKS. The sweep is `printf … | while read … done`, i.e. the
+# loop body runs in a PIPELINE SUBSHELL (this file records that hazard for its own use at the
+# `prclass.tsv` note: "every variable it sets dies at `done` and there is no `lastpipe` in this file").
+# Every `stg_lvl_start`/`stg_lvl_settle` site is INSIDE that subshell, so an `stg_add` there writes a
+# copy the parent never sees and every shipped record reports `l2_merge:0,l3_fix:0,l4_review:0` no
+# matter what the cascade did — a FABRICATED measured zero, which is the exact defect class this field
+# exists to end. So an overlay interval is APPENDED to `$STG_LVL_TMP` from wherever it closes, and the
+# parent FOLDS that file into `STG_V_*` (see `stg_lvl_fold`). A file crosses the subshell boundary; a
+# variable cannot. (Measured: 2 s of `l2_merge` through the shipped pipeline block yielded
+# `l2_merge:0` in the parent and `l2_merge:1` without the pipeline.)
+#
+# stg_lvl_accum <level> <us> — record ONE closed overlay interval, through the file when there is one.
+# Falls back to the in-process `stg_add` when the file cannot be appended (a read-only state dir), so a
+# top-level call still lands; the fallback is deliberately NOT silent about being a fallback in the
+# sense that it can never fabricate a zero: if neither path can record, the level reads `ns`.
+stg_lvl_accum() {
+  local _la_n="${1:-}" _la_d="${2:-0}"
+  case "$_la_n" in ''|*[!A-Za-z0-9_]*) return 0 ;; esac
+  case "$_la_d" in ''|*[!0-9]*) _la_d=0 ;; esac
+  if [ -n "${STG_LVL_TMP:-}" ] && printf '%s %s\n' "$_la_n" "$_la_d" >>"$STG_LVL_TMP" 2>/dev/null; then
+    return 0
+  fi
+  stg_add "$_la_n" "$_la_d"
+  return 0
+}
+
+# stg_lvl_fold — add every interval queued in `$STG_LVL_TMP` into `STG_V_*`, then truncate the queue.
+# IDEMPOTENT: a second fold finds an empty file and adds nothing, so it is safe to call both at the end
+# of the sweep and again immediately before the field is emitted. Reads with a REDIRECT (`< file`), not
+# a pipe, so the loop body runs in THIS shell — the mistake this whole mechanism exists to undo.
+stg_lvl_fold() {
+  local _lf_f="${STG_LVL_TMP:-}" _lf_n _lf_d
+  [ -n "$_lf_f" ] || return 0
+  [ -s "$_lf_f" ] || return 0
+  while read -r _lf_n _lf_d; do
+    [ -n "$_lf_n" ] || continue
+    stg_add "$_lf_n" "${_lf_d:-0}"
+  done <"$_lf_f"
+  : >"$_lf_f" 2>/dev/null || :
+  return 0
+}
+
 # stg_lvl_settle — close an OPEN overlay interval into the level that owned it. Idempotent, so every
 # `continue` in the sweep may leave an interval open and the next `stg_lvl_start` or `stg_mark` closes
 # it against the RIGHT level. That self-healing property is why the ~40 `continue`s in the sweep do
@@ -915,7 +963,7 @@ stg_lvl_settle() {
   local _sl_now=0
   [ -n "${STG_OPEN_LVL:-}" ] || return 0
   stg_now_us_vars _sl_now || return 0
-  stg_add "$STG_OPEN_LVL" "$(( _sl_now - ${STG_OPEN_T0:-0} ))"
+  stg_lvl_accum "$STG_OPEN_LVL" "$(( _sl_now - ${STG_OPEN_T0:-0} ))"
   STG_OPEN_LVL=""; STG_OPEN_T0=0
   return 0
 }
@@ -949,10 +997,16 @@ stg_mark() {
 }
 
 # stg_nap_mark — close the post-record gap into the CARRIED `prev_wait` stage. Call AFTER the nap.
+# ⛔ SET, NEVER ACCUMULATE. `prev_wait` is ONE gap — the gap THIS cycle spent outside its own body — and
+# it is read exactly once, by the NEXT record. `stg_add` accumulates, so calling it here made the field
+# the LIFETIME SUM of every nap in the process: measured `prev_wait:1`, then `2`, then `3` over three
+# one-second naps, and on a real box with `CYC=240` cycle 10 would report ~2400 and swamp every tiled
+# stage. The `prev_` prefix promises "the previous gap", and this assignment is what keeps that
+# promise. The reset deliberately leaves this variable alone (that is what CARRIES it).
 stg_nap_mark() {
   local _sn_now=0
   stg_now_us_vars _sn_now || return 0
-  stg_add "$STG_REGISTRY_PREV" "$(( _sn_now - ${STG_WAIT_T0:-0} ))"
+  printf -v "STG_V_${STG_REGISTRY_PREV}" '%s' "$(( _sn_now - ${STG_WAIT_T0:-0} ))"
   return 0
 }
 
@@ -968,6 +1022,9 @@ stg_cycle_reset() {
     _sr_v="STG_V_${_sr_n}"; printf -v "$_sr_v" '%s' 0       # 0 => a MEASURED zero
   done
   STG_OPEN_LVL=""; STG_OPEN_T0=0; STG_TILE_MARK=0; STG_WAIT_T0=0
+  # An overlay interval queued by a previous cycle must never be folded into this one. Truncation is a
+  # redirect with no fork, so it is safe on the starved path; a failure just leaves the queue absent.
+  if [ -n "${STG_LVL_TMP:-}" ]; then : >"$STG_LVL_TMP" 2>/dev/null || STG_LVL_TMP=""; fi
   stg_now_us_vars STG_TILE_MARK || STG_TILE_MARK=0
   return 0
 }
@@ -979,6 +1036,9 @@ stg_cycle_reset() {
 stg_field() {
   local _sf_out="${1:-}" _sf_n _sf_v _sf_us _sf_line=""
   case "$_sf_out" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  # Fold first: any overlay interval that closed after the sweep's own fold (a top-level settle) is
+  # still queued in the file, and the field must report it rather than the value from one fold ago.
+  stg_lvl_fold
   for _sf_n in $STG_REGISTRY; do
     _sf_v="STG_V_${_sf_n}"; _sf_us="${!_sf_v:-}"
     if [ -n "$_sf_us" ]; then
@@ -4826,6 +4886,12 @@ while true; do
   is_num "${SPAWNREF_BASE:-}" || SPAWNREF_BASE=0
   # [spawnref:end]
 
+  # ⛔ THE OVERLAY QUEUE IS A FILE BECAUSE THE SWEEP BELOW IS A PIPELINE. The `l2_merge`/`l3_fix`/
+  # `l4_review` intervals are opened and closed INSIDE the `while` body's subshell, so the only way
+  # their total can reach the parent is an append here and a fold after `done` (see `stg_lvl_accum`).
+  # A truncate failure disables the queue rather than pretending it worked.
+  STG_LVL_TMP="$O/state/.stg-lvl"
+  : >"$STG_LVL_TMP" 2>/dev/null || STG_LVL_TMP=""
   printf '%s\n' "${SEL_WINDOW:-$SEL_ROWS}" |
   while IFS="$(printf '\t')" read -r PR BR DRAFT OWN; do
     # ⛔ CLOSE ANY LEVEL INTERVAL LEFT OPEN BY THE PREVIOUS PR'S `continue` (there are ~40 of them
@@ -5762,6 +5828,15 @@ while true; do
               # sweep loop is one shell, so a bare `_rvn` set in the CAP branch above would still hold
               # THAT PR's count here — and this value is written to `reviewdisp-<PR>` and printed as
               # the attempt number, so a stale carry would silently spend another PR's budget.
+              # ⛔ CASCADE LEVEL 4 IS MARKED HERE, AND IT WAS MISSING (fresh-context review, P0).
+              # `l4_review` is declared in `STG_REGISTRY_LVL`, so `stg_cycle_reset` initialises it to `0`
+              # — "a MEASURED zero" — yet nothing ever called `stg_lvl_start l4_review`, so every record
+              # reported the review level as measured-and-free while this arm was the one doing its
+              # work. That is precisely the false pass this block refuses for `l1_main`. The mark is
+              # the review-DISPATCH arm's own body time: the controller spawns the worker and moves on,
+              # so this is small by design and is not the reviewer's own runtime — which is attributed
+              # inside the worker, not to the cycle body.
+              stg_lvl_start l4_review || :
               _rvn="${_rvd##* }"
               # ⛔ THE REVIEW-ROUND COUNTER IS READ HERE, BEFORE THE SPAWN, so the round this spawn
               # SPENDS is the one written after it succeeds (#3441). Same rule as `_rvn` above: a
@@ -6010,6 +6085,12 @@ while true; do
     esac
     # [acting-case:end]
   done
+  # ── FOLD THE OVERLAY QUEUE THE SWEEP'S SUBSHELL WROTE (#P0 review) ─────────────────────────────
+  # Everything above this line ran in the pipeline's subshell and its `STG_V_l*` writes are GONE. The
+  # intervals survived in `$STG_LVL_TMP`, and this is the parent read that turns them into the numbers
+  # the record will carry. Without it every record reports `l2_merge:0,l3_fix:0,l4_review:0` — a
+  # fabricated measured zero for the whole cascade half of the field.
+  stg_lvl_fold || :
   # [sweep-cursor:begin] (extracted and DRIVEN by pr-path-reads.test.sh — keep the markers)
   # ── THE CURSOR ADVANCES BY WHAT WAS ACTUALLY READ, AFTER THE PASS (#2640) ─────────────────────
   # ⛔ THE RESUME POINT IS THE UNFINISHED ROW, NOT THE START OF THE NEXT WINDOW. The sweep above is a
@@ -7545,7 +7626,15 @@ PY
   # preparation (the `tr`/`sed`/`cut` that build `ids=` and `selected=`), which is real forking work on
   # the cycle path and is therefore worth attributing. The append is measured instead by the
   # before/after overhead numbers in the PR that added this field.
+  # ⛔ SO THE MARKS COME BEFORE THAT PREPARATION, NOT AFTER IT (fresh-context review, P2). They used to
+  # sit immediately above `stg_field`, i.e. AFTER the `tr`/`sed`/`cut`/`drain_stall_label` work, which
+  # credited all of it to `l5_issue` and left `record` measuring the microseconds between two adjacent
+  # calls. `record:0` then read as "the record block is free" — the opposite of what this comment
+  # says the stage is for. `l5_issue` is marked OUTSIDE the `if` because the issue batch happened
+  # whether or not `cycle-record.sh` was loadable; `record` stays `ns` when no record block runs.
+  stg_mark l5_issue   # the issue batch ends here: floor/order/placement/claim/dispatch
   if [ "${CYCREC:-0}" = "1" ]; then
+    stg_mark record   # from here to `stg_field` is the record block's own preparation (see above)
     _cr_ids=""
     [ "${K:-0}" -gt 0 ] && _cr_ids="$(tr '\n' ',' < "$O/.batch" 2>/dev/null | sed 's/,$//')"
     case "${LO_CHOICE:-none}" in
@@ -7570,8 +7659,6 @@ PY
       _cr_tags="${PRDISP_SPAWN_TAGS:-}"
       [ -n "$_cr_tags" ] || { [ -n "${PRDISP_SPAWNS:-}" ] && _cr_tags="none" || _cr_tags="UNMEASURED"; }
     fi
-    stg_mark l5_issue   # the issue batch: the floor/order/placement/claim/dispatch region
-    stg_mark record     # the record block's own preparation (see the note above)
     stg_field STG_FIELD
     cycle_record_write "$O" \
       start="${CYCLE_T0:-0}" end="$(date +%s)" cycle="${CYCLE_N:-0}" interval="${CYC:-240}" \
