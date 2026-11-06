@@ -758,7 +758,9 @@ matching on the directory reports a healthy runner as BOTH unregistered and a ph
 `read=cannot-measure why=…` — never `0 runners`, the class #2381 closed one layer down. Four distinct
 readings are refused rather than published, and the summary keeps **three separate counters** for the
 three different places an operator must go (`unmeasured=` a CELL, `registry_unread=` a REGISTRY,
-`unjoinable=` a local row that could not be joined to either):
+`unjoinable=` an unattributable READING — on BOTH sides: a local row that could not be bound to a
+registration, and a registry row that could not be attributed to a cell, since a fleet where every
+registration is unattributable must not read as a clean one):
 
 - a **complete block behind a non-zero producer rc**. `ci_runner_pool.sh status` exits **2** for "a
   PARTIAL MEASUREMENT" and still prints `host=`, every row and `summary` — its own words are that

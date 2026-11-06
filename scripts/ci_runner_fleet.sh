@@ -360,7 +360,10 @@ registry_read() {  # <owner/name> <stderr-file>
 # registration as `cannot-attribute(1-cell-unmeasured)` — naming a cell that does not exist, and
 # sending an operator to hunt for it. They are separated here because the three populations send you
 # to three different places: a CELL you could not reach, a REGISTRY you could not read, and a local
-# row you could not JOIN to either.
+# row you could not JOIN to either. `unjoinable` spans BOTH sides of that join on purpose — a local row
+# that could not be bound to a registration AND a registry row that could not be attributed to one —
+# because a fleet where every registration is unattributable must not read as a clean one; the count is
+# therefore "unattributable readings", not "unjoined installs".
 unmeasured=0; measured=0; cells=0
 reg_unread=0; reg_total=0; reg_claimed=0; reg_unclaimed=0
 local_rows=0; unregistered=0; unjoinable=0; disagreements=0; not_ok=0; collision=0
@@ -558,13 +561,15 @@ while read -r box <&3; do
     # registered to. Binding to the FIRST row was measured to compute cell-b's verdict from cell-a's
     # registration (a false `ok`, or a false `github-offline`), to print the wrong `registry=`, and to
     # fire a `name-collision` on a perfectly healthy two-cell fleet.
-    if [ -n "$ghname" ] && grep -qxF -- "$ghname" "$TMPD/ambig"; then
-      unjoinable=$((unjoinable + 1))
-      printf 'runner cell=%s name=%s github_name=%s listener=%s local=%s github=unread busy=? registry=- verdict=cannot-attribute\n' \
-        "$box" "$name" "$ghname" "${listener:--}" "$state"
-      continue
-    fi
-    if [ -n "$ghname" ]; then
+    # ⛔ …AND THE AMBIGUITY IS RECORDED, NOT ACTED ON HERE (review round 4, P3): an early `continue`
+    # shadowed verdicts that need NO registry at all, so an ambiguous name that was ALSO a dead
+    # listener printed `verdict=cannot-attribute` instead of `dead-listener`, and a `defect
+    # tmpdir-mode=755` row lost its token entirely — the restart-vs-reclaim distinction this file
+    # treats as load-bearing, gone. It now only SKIPS THE JOIN, and the abstention sits in the ladder
+    # below, after the local facts.
+    ambig_name=0
+    if [ -n "$ghname" ] && grep -qxF -- "$ghname" "$TMPD/ambig"; then ambig_name=1; fi
+    if [ "$ambig_name" = 0 ] && [ -n "$ghname" ]; then
       hit="$(awk -F'\t' -v n="$ghname" '$1==n {print; exit}' "$TMPD/reg")"
       if [ -n "$hit" ]; then
         rstatus="$(printf '%s' "$hit" | cut -f3)"
@@ -592,6 +597,8 @@ while read -r box <&3; do
       verdict="dead-listener"; not_ok=$((not_ok + 1))
     elif [ -n "$dtok" ]; then
       verdict="defect-$(printf '%s' "$dtok" | tr '=' ':')"; not_ok=$((not_ok + 1))
+    elif [ "$ambig_name" = 1 ]; then
+      verdict="cannot-attribute"; unjoinable=$((unjoinable + 1))
     elif [ -z "$ghname" ]; then
       verdict="cannot-attribute"; unjoinable=$((unjoinable + 1))
     elif [ -z "$hit" ] && [ "$reg_unread" -gt 0 ]; then
@@ -608,7 +615,8 @@ while read -r box <&3; do
     # ⛔ ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS: a row the registry DID carry but whose status the
     # report cannot classify prints `github=unread`, never `ABSENT` (which is a claim about the
     # registry this read did not make).
-    if [ -z "$rstatus" ]; then
+    if [ "$ambig_name" = 1 ]; then gshow="unread"
+    elif [ -z "$rstatus" ]; then
       if [ -n "$hit" ]; then gshow="unread"; else gshow="ABSENT"; fi
     else gshow="$rstatus"; fi
     # ⛔ ONE PAIR TEST, COUNTED INDEPENDENTLY OF WHICH VERDICT WON (review cycles 2 and 3, P3). The
@@ -622,7 +630,9 @@ while read -r box <&3; do
     esac
     printf 'runner cell=%s name=%s github_name=%s listener=%s local=%s github=%s busy=%s registry=%s verdict=%s\n' \
       "$box" "$name" "${ghname:--}" "${listener:--}" "$state" "$gshow" "${rbusy:-?}" "${rrepo:--}" "$verdict"
-    [ -n "$ghname" ] && printf '%s\t%s\t%s\n' "$ghname" "$box" "$name" >>"$TMPD/claim"
+    # ⛔ AN AMBIGUOUS ROW RECORDS NO CLAIM: it cannot say which registration it is, and a claim here
+    # would make one of the two registry rows look attributed.
+    [ -n "$ghname" ] && [ "$ambig_name" = 0 ] && printf '%s\t%s\t%s\n' "$ghname" "$box" "$name" >>"$TMPD/claim"
   done <"$TMPD/parsed"
 done 3<"$TMPD/roster"
 
