@@ -789,7 +789,7 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 # defect is that the guard's stated population was not the population it checked.)
 # A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
 # not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
-# now READS the bookkeeping assignments it used to drop, so the three names below are the full set it
+# now READS the bookkeeping assignments it used to drop, so the four names below are the full set it
 # finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
 # any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
@@ -798,7 +798,14 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 #   number, a `-`, or the empty string), printed into the funnel line; not an exit code.
 #   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
 #   (`claim-registry-absent`) or `none`; not an exit code either.
-_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED"
+#   watchdog-loop.sh:RESTART_REFUSED — the watchdog's 0/1 "this pass's restart was WITHHELD" flag
+#   (its declaration records why an in-band sentinel was unsafe). Same shape as the three above: a
+#   bookkeeping boolean in the code spelling, compared only against 0/1, never used as a status.
+#   Sanctioned here rather than renamed, because THIS LIST IS THE CONTRACT for that case: a rename
+#   buys the same green while teaching the next reader that a boolean may not live under the code
+#   spelling — which is how a mistyped `AGENT_*_REFUSED=8` would start looking acceptable. The line
+#   is an EXACT name, so it admits nothing but this variable.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED watchdog-loop.sh:RESTART_REFUSED"
 # A declaration-position UPPERCASE `NAME=<70..89>` OUTSIDE the family namespace, named EXACTLY with its
 # reason (`file:NAME=code`). Empty on this tree, and that is ASSERTED below rather than assumed: the
 # derived filter yields exactly the family claims today, so the namespace costs nothing — and a future
@@ -5300,12 +5307,24 @@ done
 # ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
-# that does not exist, with this box's local witness removed so no fallback can answer either.
+# that does not exist, with the local witness removed so no fallback can answer either.
+# ⛔ AND "THE LOCAL WITNESS" MEANS ONE OF ITS OWN, PINNED BY NAME (2026-11-06). The probe below used to
+# run with the ambient environment, so `lane_registry.py` resolved its fallback witness through
+# `state_root()` → this BOX's registry (`AGENT_INFRA_PATH`/`CELL_HOME`) and found 194 real records: the
+# remote was unreachable and the read still answered `readable: true`, rc 0, from a peer trunk the
+# fixture never created. So the arm asserted a property of whatever machine ran it — green on a clean CI
+# runner, red on every cell and dev box, and never about the code.
+# ⛔ AND IT CANNOT BE `$RREG/state/lanes` EITHER: the `rdrive` below runs with `LANE_REGISTRY=1` and
+# therefore WRITES a lane record into that directory on every pass, so pinning the probe there still
+# answered `readable: true` from the fixture's own just-written record. The probe gets an empty witness
+# nothing in this arm writes to; that is the state the arm has always meant ("no fallback can answer").
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
 rm -rf "$RREG/state/lanes"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+R4_WITNESS="$TMP/r4-empty-witness"; rm -rf "$R4_WITNESS"
+unreachable="$(LANE_REGISTRY_LOCAL="$R4_WITNESS" LANE_REGISTRY_REPO="$RREG/work" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
