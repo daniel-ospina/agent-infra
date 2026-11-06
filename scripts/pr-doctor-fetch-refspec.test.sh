@@ -573,9 +573,14 @@ else
         # `worktree add -b` branch). Measured: rc=2 with the CORRECT base too, so the old arm's
         # "non-zero ⇒ the 4th argument is load-bearing" verdict was decided by the PATH, not the argv —
         # and rc=127 (library absent) printed OK too. A fresh clone makes the base the only variable.
-        _amut="$(printf '%s' "$_aprov" | sed 's|"origin/\$BR"|"$BR"|')"
+        # ⛔ BOTH SPELLINGS OF THE CORRECT BASE (review P2, 2026-11-06). Pinning the rewrite to one
+        # literal made a semantically identical `"origin/${BR}"` redden under "the argv pin would be
+        # vacuous" — a false red (measured: 25 passed, 1 failed on a clean tree) that also MISNAMED the
+        # cause. Each spelling is rewritten; a base spelled any other way still fails CLOSED here, and
+        # the message now says which spellings this arm knows.
+        _amut="$(printf '%s' "$_aprov" | sed -e 's|"origin/\$BR"|"$BR"|' -e 's|"origin/\${BR}"|"$BR"|')"
         if [ "$_amut" = "$_aprov" ]; then
-            bad "MUTANT: could not build the bare-base variant from the shipped call — the argv pin would be vacuous: $_aprov"
+            bad "MUTANT: could not build the bare-base variant from the shipped call — the argv pin would be vacuous. This arm rewrites the 4th argument from \"origin/\$BR\" or \"origin/\${BR}\"; a base spelled any other way cannot be mutated from the call and must be pinned another way: $_aprov"
         else
             _md="$WORK/sib-mut-$_PN"
             _mwt="$WORK/wt-mut-$_PN"
@@ -594,13 +599,14 @@ else
                     *"worktree add failed"*) _mbase=1 ;;
                     *) _mbase=0 ;;
                 esac
-                # wt_provision's WHOLE contract (wt-lifecycle.sh:299-302): 1 = nothing created and
-                # nothing left behind — the clean measurement; 3 = the SAME worktree-add failure whose
-                # ROLLBACK also failed, so residue remains (it returns 3 BEFORE setting the 'worktree add
-                # failed' account, so `_mbase` cannot see it — it is still a MEASURED base failure, and
-                # the most informative one); 2 = a path refusal; 98 = the runner could not load its
-                # library; 127 = wt_provision undefined. Only 1 is a clean verdict; 3 must be surfaced
-                # as residue rather than read either as a pass or as a foreign cause.
+                # wt_provision's WHOLE contract (wt-lifecycle.sh:298-301): 0 = a usable worktree exists
+                # (what the shipped arm asserts); 1 = nothing created and nothing left behind — the clean
+                # mutant measurement; 3 = the SAME worktree-add failure whose ROLLBACK also failed, so
+                # residue remains (it returns 3 BEFORE setting the 'worktree add failed' account, so
+                # `_mbase` cannot see it — it is still a MEASURED base failure, and the most informative
+                # one); 2 = a path refusal; 98 = the runner could not load its library; 127 =
+                # wt_provision undefined. Only 1 is a clean verdict; 3 must be surfaced as residue rather
+                # than read either as a pass or as a foreign cause.
                 if [ "$_mrc" = 3 ]; then
                     bad "MUTANT: the bare-branch base DID fail at 'worktree add' but its ROLLBACK failed too (rc=3) — residue was left in the fixture and must be surfaced, not read as a clean pass: $_mres"
                 elif [ "$_mrc" != 1 ]; then
