@@ -164,8 +164,21 @@ function onKeys(region, childIndent, file = PC_FILE) {
   // match, so nothing downstream can catch it.
   const seen = new Map();
   for (let i = 0; i < names.length; i++) {
-    const where = own[i].no === undefined ? "" : ` (first at line ${own[i].no})`;
     if (seen.has(names[i])) {
+      // ⛔ THE *FIRST* LINE IS THE ONE TO NAME FIRST, AND THE REPEAT IS NAMED TOO. Reporting the
+      // DUPLICATE own line as "first" is a diagnostic that points at the block YAML DISCARDS, so an
+      // operator deleting "the one at line N" removes the block that is NOT in force and silently
+      // changes the effective trigger (measured: the message said "first at line 95" for a first
+      // declaration at line 36).
+      const first = seen.get(names[i]);
+      const where =
+        first.no === undefined
+          ? own[i].no === undefined
+            ? ""
+            : ` (repeated at line ${own[i].no})`
+          : ` (first at line ${first.no}${
+              own[i].no === undefined ? "" : `; repeated at line ${own[i].no}`
+            })`;
       refuse(
         `${file}: \`on:\` declares \`${names[i]}:\` more than once${where}. YAML keeps only the LAST block and discards the rest, so which \`${names[i]}:\` is in force is UNANSWERABLE — a reader that takes the first would answer about the block that is NOT in force. Re-run after the duplicate is resolved.`
       );
@@ -619,7 +632,6 @@ function checkWorkflowLock() {
   // A DUPLICATE `types:` IS LAST-WINS TOO — routed through `singleKey` so the first copy can never be
   // answered for the block YAML actually keeps.
   const wlTypesEntry = singleKey(t.keys, "types", "pull_request_target:", WL_FILE);
-  const typesIdx = t.keys.findIndex((k) => k.key === "types");
   if (!wlTypesEntry) {
     findings.push(
       "workflow-lock.yml declares no `types:` under `pull_request_target:`. GitHub's default set happens to be the same three types, but an implicit default carries no artifact: the decision recorded above the trigger stops being readable, and the next editor cannot tell a deliberate three-type set from an inherited one. Write `types: [opened, synchronize, reopened]`."
@@ -1075,7 +1087,13 @@ function checkPipelineComplianceUnchanged() {
         const keysIssue = /(?:github\.event\.issue\.pull_request\s*==\s*null|!\s*github\.event\.issue\.pull_request\b)/.test(
           expr
         );
-        const escape = /\|\||\bfalse\b|(?<![=!<>])\btrue\b/.test(expr);
+        // ⛔ NOTHING LEGAL IN THE MODELLED CONJUNCTION CARRIES A BARE `true`/`false`. The old pattern
+        // used a `(?<![=!<>])` lookbehind so the harmless `x != true` spelling stayed accepted — but
+        // that lookbehind also suppressed `&& !true`, which is the ALWAYS-FALSE spelling this rule
+        // exists to catch: measured rc=0 on `… == null && !true`, i.e. the owner can never run while
+        // the gate prints ok (the #2467 window, in its minimal adversarial form). Over-blocking a
+        // `!=true` spelling is the safe direction; admitting a never-runs owner is not.
+        const escape = /\|\||\b!?\s*(?:true|false)\b/.test(expr);
         if (!keysEvent || !keysIssue || escape) {
           findings.push(
             `pipeline-compliance.yml's \`revalidate-on-issue-comment\` job \`if:\` is ${JSON.stringify(expr)}, which does not both (i) key on \`github.event_name == 'issue_comment'\` and (ii) require \`github.event.issue.pull_request == null\`, with no \`||\` disjunction and no bare \`true\`/\`false\` literal. That conjunction is what confines the job to comments on ISSUES (a comment on a PR must never re-run that PR's gate) — and it is the whole reason admitting the trigger is safe: the event is owned by a job that re-runs the EXISTING run and can neither post a marker nor turn a red green. A disjunction or an \`&& false\` body makes the owner unable to run while every assertion about the required job still reads true.`
@@ -1096,6 +1114,26 @@ function checkPipelineComplianceUnchanged() {
     findings.push(
       `pipeline-compliance.yml's \`pull_request:\` declares [${extraPc.join(", ")}]. It is the repo's ONLY required status context, so a path filter here does not narrow a check — it makes the required context UNSATISFIABLE on every head whose diff does not match: GitHub keeps a path-filtered workflow's checks "Pending", and a PR that requires them cannot merge. Allowed filter keys on this trigger are \`branches\` and \`types\` only.`
     );
+  }
+  // ⛔ THE BRANCH FILTER IS CHECKED BEFORE THE `types:` EARLY-RETURN, ON PURPOSE: both facts are about
+  // the required context being SATISFIABLE, and a `types:`-absent tree can also carry a `branches:`
+  // that no longer admits `main`. Checked below the return, the second fact was withheld until the first
+  // was fixed — two red rounds for one edit (measured: `types:` deleted AND `branches: [develop]` emitted
+  // only the `types:` finding, while PyYAML shows the effective trigger is `['branches']`).
+  // ⛔ AND ITS BRANCH FILTER MUST STILL ADMIT main. An absent `branches:` key is ADMISSIBLE — the
+  // trigger then fires for every target branch, which still includes `main`, so the required context is
+  // still satisfiable and no false block is owed. A DECLARED filter that no longer lists `main` is the
+  // dangerous direction and was measured GREEN before this check existed: `pipeline-compliance` would
+  // never run on a PR to `main`, GitHub keeps a non-triggered required check "Pending", and every PR to
+  // `main` becomes unmergeable — the same unsatisfiable-context class as a `paths:` filter here.
+  const brEntry = singleKey(t.keys, "branches", "pull_request:");
+  if (brEntry) {
+    const branches = readList(brEntry, valueLinesFor(brEntry, t.lines));
+    if (!branches.includes("main")) {
+      findings.push(
+        `pipeline-compliance.yml's \`pull_request: branches:\` is [${branches.join(", ") || "<none>"}], which no longer admits \`main\`. This is the repo's ONLY required status context: on a PR to \`main\` the workflow would never trigger, GitHub keeps an untriggered required check "Pending", and that PR can never merge. (An ABSENT \`branches:\` key is admissible — it fires for every target branch and therefore still includes \`main\`.)`
+      );
+    }
   }
   const idx = t.keys.findIndex((k) => k.key === "types");
   if (idx < 0) {
@@ -1145,21 +1183,6 @@ function checkPipelineComplianceUnchanged() {
     findings.push(
       `pipeline-compliance.yml's required-context \`types:\` is [${items.join(", ") || "<none>"}], not the decided set [${PC_REQUIRED_TYPES.join(", ")}]. ${parts.join("; ")}. #3196 scopes a reduction to the ADVISORY guards precisely so this file is untouched.`
     );
-  }
-  // ⛔ AND ITS BRANCH FILTER MUST STILL ADMIT main. An absent `branches:` key is ADMISSIBLE — the
-  // trigger then fires for every target branch, which still includes `main`, so the required context is
-  // still satisfiable and no false block is owed. A DECLARED filter that no longer lists `main` is the
-  // dangerous direction and was measured GREEN before this check existed: `pipeline-compliance` would
-  // never run on a PR to `main`, GitHub keeps a non-triggered required check "Pending", and every PR to
-  // `main` becomes unmergeable — the same unsatisfiable-context class as a `paths:` filter here.
-  const brEntry = singleKey(t.keys, "branches", "pull_request:");
-  if (brEntry) {
-    const branches = readList(brEntry, valueLinesFor(brEntry, t.lines));
-    if (!branches.includes("main")) {
-      findings.push(
-        `pipeline-compliance.yml's \`pull_request: branches:\` is [${branches.join(", ") || "<none>"}], which no longer admits \`main\`. This is the repo's ONLY required status context: on a PR to \`main\` the workflow would never trigger, GitHub keeps an untriggered required check "Pending", and that PR can never merge. (An ABSENT \`branches:\` key is admissible — it fires for every target branch and therefore still includes \`main\`.)`
-      );
-    }
   }
 }
 

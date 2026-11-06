@@ -1272,6 +1272,20 @@ fi
 
 # ⛔ AND A SAFE NARROWING MUST STILL PASS: `&&` binds tighter than `||`, so an ANDed suffix can only
 # EXCLUDE more events. A reader that refused it would be a false block on a correctly narrowed tree.
+# ⛔ AND THE ALWAYS-FALSE SPELLING, WHICH THE OLD TRUTHINESS RULE ADMITTED. `&& false` was caught; the
+# same intent written `&& !true` was rc=0, because the `(?<![=!<>])` lookbehind suppressed the
+# `!`-prefixed literal — i.e. it suppressed exactly the always-false spelling the rule exists for, while
+# also sparing a harmless `!= true`. Nothing legal in the modelled conjunction carries a bare
+# `true`/`false`, so the refusal is widened (over-blocking a `!=true` spelling is the safe direction).
+PC_RV_BANGTRUE="$TMP/pc-rv-bang-true.yml"
+if apply_mutation "$PC" "$PC_RV_BANGTRUE" \
+  "      github.event.issue.pull_request == null" \
+  "      github.event.issue.pull_request == null && !true" \
+  "the always-false owner body must be constructible"; then
+  run_check 1 "an always-FALSE owner body written \`&& !true\` is REFUSED (the owner can never run)" \
+    PC_FILE="$PC_RV_BANGTRUE"
+fi
+
 PC_RV_NARROW="$TMP/pc-rv-narrow.yml"
 if apply_mutation "$PC" "$PC_RV_NARROW" \
   "      github.event_name == 'issue_comment' &&
@@ -1347,6 +1361,35 @@ if apply_mutation "$PC" "$PC_BRANCHES" \
     *) fail "the refusal did not name the branch filter in its FINDING line" ;;
   esac
 fi
+# ⛔ AND THE TWO UNSATISFIABLE-CONTEXT FACTS ARE STATED TOGETHER. The branch filter used to be checked
+# BELOW the `types:` early-return, so a tree that had lost `types:` AND narrowed `branches:` to
+# `develop` reported only the first — the operator fixed it, re-ran, and discovered the unmergeable
+# filter a round later (measured: one finding, while PyYAML shows the effective trigger is
+# `['branches']`). One edit, two facts, one run.
+PC_TAINT2="$TMP/pc-types-and-branches2.yml"
+PC_TAINT3="$TMP/pc-types-and-branches3.yml"
+if apply_mutation "$PC" "$PC_TAINT2" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:" \
+  "the types block must be emptiable for the combined arm"; then
+  if apply_mutation "$PC_TAINT2" "$PC_TAINT3" \
+    "    branches:
+      - main" \
+    "    branches:
+      - develop" \
+    "the branch filter must be narrowable for the combined arm"; then
+    run_check 1 "a tree missing \`types:\` AND narrowing \`branches:\` is REFUSED" PC_FILE="$PC_TAINT3"
+    case "$FINDINGS" in
+      *"no longer admits"*) pass "…and the refusal states BOTH facts in one run (the branch filter is not withheld behind the \`types:\` return)" ;;
+      *) fail "the branch filter was withheld: only the \`types:\` fact was reported" ;;
+    esac
+  fi
+fi
+
 PC_NOBRANCHES="$TMP/pc-nobranches.yml"
 if apply_mutation "$PC" "$PC_NOBRANCHES" \
   "    branches:
