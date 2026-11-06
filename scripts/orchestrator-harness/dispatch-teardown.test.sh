@@ -275,8 +275,8 @@ echo "── T7: a take-back that CANNOT RUN must not bill a stale verdict (the 
 # shipped and `scripts/check-no-sigpipe-grep.sh` flagged all three as undeclared.
 T7_CODE="$(sed -n '/^reap_unused_worktree() {/,/^}$/p' "$DM_REL" | grep -v '^[[:space:]]*#')"
 grep -qF 'WT_RESULT=""' <<<"$T7_CODE" \
-    && ok "T7 the helper clears WT_RESULT before the call (a stale provision verdict cannot become the reap verdict)" \
-    || bad "T7 the helper leaves WT_RESULT as wt_provision set it — a missing verb would report 'created …' as why the reap failed"
+    && ok "T7 the helper resets WT_RESULT at entry (belt-and-braces: wt_reap_if_empty resets it too, and the verb guard below returns before the call without reading it)" \
+    || bad "T7 the helper no longer resets WT_RESULT before the call — NOT a live defect today (the module resets it, the guard returns unread), but a caller that later reads a verdict it never received would inherit wt_provision's 'created …' — the #2033 shape"
 if grep -qF 'command -v wt_reap_if_empty' <<<"$T7_CODE"; then
     ok "T7 …and it proves the verb exists, naming the missing verb instead of a wrong cause"
 else

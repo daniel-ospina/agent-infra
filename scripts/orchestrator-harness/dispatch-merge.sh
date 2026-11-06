@@ -147,6 +147,12 @@ reap_unused_worktree() { # <issue> <why> — reports; never changes the caller's
   # `command not found` (rc 127) straight into the `*)` arm — which then reported the PROVISION's
   # sentence, `created … on feat/N-tm from origin/main`, as the reason the reap FAILED. The one arm
   # that exists to surface a failed take-back named a wrong cause while the residue survived.
+  # ⚠️ SCOPED (#3577 review, P2 — VERIFIED against both files): with the guard in place the `*)` arm is
+  # UNREACHABLE today. `wt_reap_if_empty` resets `WT_RESULT` at its OWN entry — its first version
+  # (e83d41a15) already did — and the guard below returns without reading `WT_RESULT` at all. So the
+  # clear on the next line is belt-and-braces, not load-bearing: it is kept because it is one line and
+  # it is this caller's only protection if either the module's reset-at-entry or the guard is ever
+  # weakened. Do not read it as evidence that a stale verdict is reachable through the shipped path.
   WT_RESULT=""
   if ! command -v wt_reap_if_empty >/dev/null 2>&1; then
     echo "#$1: ⚠️ worktree NOT reaped — the sourced ${WTL:-wt-lifecycle.sh} has no wt_reap_if_empty (it predates the take-back); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"
