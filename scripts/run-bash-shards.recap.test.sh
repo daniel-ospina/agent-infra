@@ -116,8 +116,17 @@ rm -f "$SLOW_SHARD_MARKER"
 # `kill -TERM -<pid>` reaches the RUNNER *and* the shard it waits on. Bash defers a trap until the
 # foreground child finishes, so signalling the runner alone would print the recap only after the
 # shard returned — an hour later on the real job. GitHub terminates the process GROUP on a timeout.
+# ⛔ THE FIXTURE MUST NOT INHERIT THE CALLER'S DISPATCH DECISION. CI's `bash-suites` step exports
+# `BASH_SHARD_SLICE=<i>/8` (ci.yml:1381); the narrowed runner lists THREE shards, so it REFUSES —
+# `❌ BASH_SHARD_SLICE asks for 8 slice(s) of 3 listed shard(s)` (run-bash-shards.sh:432, rc 2) — and
+# every arm below then reads a refusal as if it were a recap. `run-bash-shards.sh` already sanitises
+# at its own `shard_exec` (:926), but this suite spawns the runner DIRECTLY, so that fix cannot reach
+# it. `env -u` (not `unset`) is that contract, and it keeps `$!` equal to the runner's pid because
+# `env` execs in place — a wrapper subshell would reintroduce the pid-vs-pgid ambiguity :907-925
+# documents.
 set -m
-bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+  bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
 kpid=$!
 set +m
 
@@ -201,7 +210,8 @@ if ! build_fixture "$COMPLETE" fast; then
   echo "❌ run-bash-shards.recap: cannot build the fixture — refusing to report"
   exit 2
 fi
-bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
+env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
+  bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
 CRC=$?
 COUT="$(cat "$TMP/complete.out" 2>/dev/null)"
 
