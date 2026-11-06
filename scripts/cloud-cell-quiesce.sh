@@ -68,12 +68,18 @@ PINNED_DIR=""
 # on a box that ever wrote CRLF otherwise yields `<dir>\r`, a candidate that cannot exist, and the sweep
 # reads as absent on the one box this fallback exists for.
 [ -f "$HARNESS_PIN_REC" ] && PINNED_DIR="$(head -1 "$HARNESS_PIN_REC" 2>/dev/null | tr -d '\r\n')"
+# ⛔ EXISTS IS NOT RUNS (#3588 review). `[ -f ]` selected a 0-BYTE `wip-sweep.sh`, and `bash <empty> --apply`
+# exits 0 — so the hook printed "every dirty worktree … is archived on origin" and `DONE`, rc=0, having
+# archived NOTHING. That is the false PASS this hook exists to prevent, on the one path where the disk stops
+# existing. `pi-bootstrap/setup.sh` farms with `cp -f` + `chmod +x`, so an interrupted copy leaves a 0-byte
+# executable: mechanically producible, not hypothetical. A candidate must be non-empty AND parse; if none is
+# usable, `SWEEP` stays empty and the existing loud "WORK ON THIS BOX WILL NOT BE ARCHIVED" path fires.
 SWEEP=""
 for c in "$REPO/scripts/wip-sweep.sh" \
          ${PINNED_DIR:+"$PINNED_DIR/scripts/wip-sweep.sh"} \
          "$O/wip-sweep.sh" \
          "${HOME:-/nonexistent}/.pi/agent/scripts/wip-sweep.sh"; do
-  [ -f "$c" ] && { SWEEP="$c"; break; }
+  { [ -s "$c" ] && bash -n "$c" >/dev/null 2>&1; } && { SWEEP="$c"; break; }
 done
 step "wip-sweep: ${SWEEP:-<none found — WORK ON THIS BOX WILL NOT BE ARCHIVED>}"
 

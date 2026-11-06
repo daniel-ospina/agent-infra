@@ -330,13 +330,39 @@ need_int WIP_SWEEP_MAX             "$MAX"
 
 
 # ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
-RESCUE="${WIP_SWEEP_RESCUE:-}"
-if [ -n "$RESCUE" ]; then
-  [ -f "$RESCUE" ] || refuse_startup 3 "WIP_SWEEP_RESCUE=$RESCUE does not exist — REFUSING (a pin that is wrong must be named, not ignored)"
-elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/bg-rescue-wip.sh" ]; then
-  RESCUE="$SELF_DIR/bg-rescue-wip.sh"
-elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh" ]; then
-  RESCUE="$HOME/.pi/agent/scripts/bg-rescue-wip.sh"
+# ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
+# ⛔ AND EXISTENCE IS NOT USABILITY HERE EITHER (#3588 review). The library check above learned this
+# lesson; the rescuer did not. `[ -f ]` blessed a 0-BYTE farmed copy (the realistic truncation —
+# `pi-bootstrap/setup.sh` farms with `cp -f`, so an interrupted copy leaves a 0-byte executable), any file
+# that is not a script (`/etc/hostname` — non-empty AND parses, so `-s` + `bash -n` still blesses it), and a
+# PRE-`--verdict` farmed copy (any cell farmed before this PR), which treats `--verdict` as a worktree path,
+# so every classification lands `cannot-verify` and every pass FAILS while the reader said `ok`.
+# So the probe is BEHAVIOURAL, in the rescuer's own read-only mode: run it against a path that cannot exist
+# and require a `verdict=` line. Measured discrimination — real rescuer `verdict=cannot-verify` (rc 2);
+# 0-byte file `rc=0` NO output; `/etc/hostname` `rc=0` junk; a parses-but-no-verdict script `rc=0` no verdict.
+# Only the real one passes, and that mode archives nothing.
+rescue_usable() { # rescue_usable <path> — it must actually ANSWER in its documented no-archive mode
+  [ -f "$1" ] || return 1
+  [ -s "$1" ] || return 1
+  local out
+  out="$(bash -- "$1" --verdict /nonexistent-wip-sweep-usability-probe 2>/dev/null)" || :
+  case "$out" in *verdict=*) return 0 ;; esac
+  return 1
+}
+RESCUE=""
+if [ -n "${WIP_SWEEP_RESCUE:-}" ]; then
+  # AN EXPLICIT PIN IS AUTHORITATIVE, INCLUDING WHEN IT IS WRONG — named, never replaced by a neighbour.
+  [ -f "$WIP_SWEEP_RESCUE" ] || refuse_startup 3 "WIP_SWEEP_RESCUE=$WIP_SWEEP_RESCUE does not exist — REFUSING (a pin that is wrong must be named, not ignored)"
+  rescue_usable "$WIP_SWEEP_RESCUE" || refuse_startup 3 "WIP_SWEEP_RESCUE=$WIP_SWEEP_RESCUE is not a USABLE bg-rescue-wip.sh (it must answer '--verdict') — REFUSING: a rescuer that cannot classify archives nothing, and a sweep that cannot archive is NOT 'nothing to rescue'"
+  RESCUE="$WIP_SWEEP_RESCUE"
+else
+  # THE FALLBACKS GET THE SAME TEST: a 0-byte copy at SELF_DIR or in the $HOME farm was still ACCEPTED
+  # there, and the reader answered `ok`/0 over a box whose every pass fails.
+  if [ -n "${SELF_DIR:-}" ] && rescue_usable "$SELF_DIR/bg-rescue-wip.sh"; then
+    RESCUE="$SELF_DIR/bg-rescue-wip.sh"
+  elif rescue_usable "${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh"; then
+    RESCUE="$HOME/.pi/agent/scripts/bg-rescue-wip.sh"
+  fi
 fi
 # ⛔ A MISSING RESCUER MUST NEVER READ AS "NOTHING TO RESCUE". This is the same rule
 # `spawn-gate.sh`'s rescue seam already enforces (`rescue=UNAVAILABLE`, never `rescue=nothing`): the
@@ -824,7 +850,7 @@ sweep_repo() {
   done < "$LISTF"
   [ "$started" -eq 1 ] && flush_record "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
   if [ "$listed" -eq 0 ]; then
-    err "UNMEASURED — `git worktree list` answered for '$repo' but named no worktree at all. This repo was NOT swept; it is not clean, it is unknown."
+    err "UNMEASURED — 'git worktree list' answered for '$repo' but named no worktree at all. This repo was NOT swept; it is not clean, it is unknown."
     N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
     record "$repo" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "worktree-list-empty"
   fi
