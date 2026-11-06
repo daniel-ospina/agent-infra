@@ -919,13 +919,23 @@ _HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
 # idna-only guard would leave it open. `merge-mcp.py` carries the SAME rule.
 _DOT_EQUIVALENT = "\u3002\uff0e\uff61\ufe52\u2024"
 
-# The Unicode general categories UTS46 DELETES from a label (soft hyphen is `Cf`). See `_label_ok`.
-_UTS46_DELETES = ("Cf", "Mn", "Me")
 
 try:                                          # IDNA2008/UTS46 — the standard the client applies
     import idna as _idna
 except ImportError:                           # pragma: no cover — stdlib-only box
     _idna = None
+
+
+def _dns_identity(label):
+    """The label as DNS compares it: NFC-composed and case-folded.
+
+    The unit of the spoof rule in `_label_ok`. Two spellings are the SAME host when they are
+    canonically equivalent and differ only in case (`MÜNCHEN` / `münchen` / `mu\u0308nchen`) and a
+    DIFFERENT host when the client's mapping deletes or introduces a code point (`co\xad` -> `co`).
+    NFC here rather than the NFKC of the dot check: NFKC folds `ﬁ` to `fi`, which would let a
+    compatibility rewrite hide a deletion.
+    """
+    return unicodedata.normalize("NFC", label).casefold()
 
 
 def _label_ok(lab):
@@ -940,28 +950,47 @@ def _label_ok(lab):
     if lab.isascii():
         return True
     if _idna is None:
-        # (3) STDLIB-ONLY FALLBACK. UTS46 DELETES every Cf/Mn/Me code point, so `co\xad` maps to `co`
-        # and the client resolves a DIFFERENT host than the one written — `new URL` sends
-        # `api.premiselabs.co\xad.evil.example` to `api.premiselabs.co.evil.example`. Without `idna`
-        # there is no way to apply the real mapping, so refuse the code points it would delete. This
-        # is deliberately narrow (a legitimately combining IDN label is refused HERE and accepted once
-        # `idna` is installed) because the alternative is a false PASS that mails the tenant key to an
-        # attacker's host.
-        return not any(unicodedata.category(ch) in _UTS46_DELETES for ch in lab)
+        # (2) STDLIB-ONLY FALLBACK — REFUSE EVERY NON-ASCII LABEL, because the question this branch
+        # has to answer ("did the client's UTS46 mapping RENAME this label?") CANNOT be answered
+        # without the mapping. Two attempts at approximating it by Unicode general category were both
+        # wrong, and the second was still a false PASS:
+        #   * `co\xad` (Cf) IS deleted, so a Cf/Mn/Me refusal blocks that one;
+        #   * but U+115F, U+1160, U+3164 and U+FFA0 (the HANGUL FILLERS) are category `Lo` and are ALL
+        #     UTS46-ignored, i.e. DELETED too — measured: with `_idna = None`,
+        #     `api.premiselabs.co\u3164.evil.example` was CERTIFIED as the hosted host with the key
+        #     attached, because they are Lo;
+        #   * and 1737 of the 2027 Cf/Mn/Me code points are NOT deleted (U+0300 COMBINING GRAVE is
+        #     `Mn` and maps to itself), so the same test false-BLOCKED legitimate combining-mark IDNs.
+        # No general category answers this question, and a category list is a BLOCKLIST — rounds 12-14
+        # are three proofs that the next spelling is one edit away. So this branch does not enumerate,
+        # it DECLINES. A non-ASCII self-host here is REPLACED by the hosted default (an unusable
+        # entry, which the merge repairs and `--verify` then accepts), the same declared over-block
+        # class as `:0` and the percent-encoded host above: a refusal an operator can see beats a
+        # false PASS that mails the tenant key to an attacker's host.
+        return False
     try:
-        # (2) ⛔ THE RULE, AND IT IS NOT A BLOCKLIST: the label must be a FIXED POINT of the client's
-        # own UTS46 mapping. Rounds 12 and 13 each closed one SPELLING (`%2e`, then the five
-        # dot-equivalents) and each time the next spelling through the same mapping was still
-        # certified: a mapping that DELETES a code point (`co\xad` -> `co`) renames the label exactly
-        # as a mapping that INTRODUCES a separator (`co\u3002evil` -> `co.evil`) does. Comparing what
-        # we READ against what the CLIENT RESOLVES closes both, and closes the next one without an
-        # edit. Measured: `co\xad`/`co\u3002evil` change; `münchen`, `xn--mnchen-3ya`, `my_host`,
-        # `localhost`, `api.premiselabs.co` do not.
-        if _idna.uts46_remap(lab, std3_rules=False, transitional=False) != lab:
+        # (3) ⛔ THE MAPPING MUST NOT RENAME THE HOST — and "renamed" is DNS IDENTITY, not byte
+        # equality. Rounds 12 and 13 each closed one SPELLING (`%2e`, then the five dot-equivalents)
+        # and each time the next spelling through the same mapping was still certified. Compare what
+        # we READ with what the CLIENT RESOLVES, under the rule DNS itself uses (NFC, case-folded):
+        #   * `co\xad` -> `co` and `co\u3164` -> `co` rename the label      → REFUSED;
+        #   * `co\u3002evil` -> `co.evil` adds a separator, caught above by `_DOT_EQUIVALENT` → REFUSED;
+        #   * `münchen` -> `münchen`, `MÜNCHEN` -> `münchen`, `mu\u0308nchen` -> `münchen` (NFC),
+        #     `xn--mnchen-3ya`, `my_host`, `localhost` are all the SAME host → CERTIFIED.
+        # ⛔ BYTE EQUALITY (`uts46_remap(lab) != lab`) was the previous spelling of this rule, and it
+        # false-BLOCKED `MÜNCHEN.example` and `mu\u0308nchen.example`: measured, `--install` then
+        # REPLACED the operator's IDN self-host with the hosted default, silently repointing their own
+        # daemon at the hosted graph — while the ASCII fast path above accepted the identical case
+        # change. The rule is the host's identity, not the string's.
+        if _dns_identity(_idna.uts46_remap(lab, std3_rules=False, transitional=False)) != _dns_identity(lab):
             return False
         encoded = _idna.encode(lab, uts46=True)
     except Exception:
         return False
+    # Cheap belt-and-braces, and say so honestly: with the checks above in place this can no longer
+    # fire — a punycode label cannot contain a dot, and a mapping that introduced one is caught by the
+    # NFKC/`_DOT_EQUIVALENT` check and by `_dns_identity`. It is kept as a last-resort assertion on the
+    # bytes we would actually send, NOT as the thing that catches a separator.
     return b"." not in encoded
 
 
