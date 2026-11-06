@@ -185,7 +185,7 @@ drive() { # drive <gate> <cap> <label> [wip-path]
   bash -c '
     . "$1"
     cd "$2" || exit 2
-    O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+    O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
     KIND=lane; TAG=2834
     load1() { printf 1; }
     if [ -n "$8" ]; then WIP_PATH="$8"; fi
@@ -225,7 +225,7 @@ drive_pf() { # drive_pf <LANE_PREFLIGHT> <lane-log> -> "rc=<n> started=<n>"
     bash -c '
       . "$1"
       cd "$2" || exit 2
-      O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+      O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
       KIND=lane; TAG=2834
       load1() { printf 1; }
       run_agent 300 "$4" "$5" "$6" >>"$4.agent" 2>&1
@@ -262,7 +262,7 @@ ck "S5 …with NO capability reading written at all, so the seam is a real escap
 # ── A) THE DEFECT ITSELF: a lane that ends BEFORE its cap, with work in the tree ──────────────────
 pi_stub dirty
 : > "$O/logs/lane.log"
-res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 drive "$GATE" 300 "early exit")"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 drive "$GATE" 300 "early exit")"
 arm "$O/logs/lane.log"
 ck "A1 the stub lane really ran and exited before its cap ($res)" $([ "$res" = "rc=0 started=1" ] && echo 0 || echo 1)
 [ -n "$(wiprefs)" ]; rc=$?
@@ -304,7 +304,7 @@ rm -f "$WT/early.txt"
 res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi2.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "mutant" >>"$4.agent" 2>&1
@@ -341,7 +341,7 @@ pi_stub clean
 res="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi3.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "clean exit" >>"$4.agent" 2>&1
@@ -380,7 +380,7 @@ rm -f "$O/state/lane-exit-unpushed_exit.state"
 PATH="$TMP/bin:$PATH" PI_LOG="$O/pi4.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "unpushed exit" >>"$4.agent" 2>&1
@@ -455,7 +455,7 @@ seed3="$(git -C "$WT3" rev-parse HEAD)"
 res3="$(PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "pre fix" >>"$4.agent" 2>&1
@@ -489,7 +489,7 @@ pi_stub unpushed_landing
 PATH="$TMP/bin:$PATH" PI_LOG="$O/pi6.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "landing" >>"$4.agent" 2>&1
@@ -510,7 +510,7 @@ pi_stub unpushed
 PATH="$TMP/bin-shim:$TMP/bin:$PATH" PI_LOG="$O/pi7.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "shim" >>"$4.agent" 2>&1
@@ -741,7 +741,7 @@ pi_stub unpushed_landing
 PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" PI_LOG="$O/pi8.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "unknown default" >>"$4.agent" 2>&1
@@ -1187,7 +1187,7 @@ pi_stub unpushed
 PATH="$TMP/bin-nocommondir:$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "shape unknown" >>"$4.agent" 2>&1
@@ -1228,7 +1228,7 @@ pi_stub clean
 PATH="$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "hub" >>"$4.agent" 2>&1
@@ -1272,7 +1272,7 @@ pi_stub unpushed
 HOME="$TMP/emptyhome" AGENT_INFRA_PATH= PATH="$TMP/bin:$PATH" PI_LOG="$O/pi10.log" bash -c '
   . "$1"
   cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "nobound" >>"$4.agent" 2>&1
@@ -1495,7 +1495,7 @@ pi_stub unpushed_landing
 : > "$O/logs/cloneref.log"
 PATH="$TMP/bin-nosymref:$TMP/bin:$PATH" PI_LOG="$O/pi9.log" bash -c '
   . "$1"; cd "$2" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   run_agent 300 "$4" "$5" "clone ref leg" >>"$4.agent" 2>&1
@@ -1689,7 +1689,7 @@ pi_stub dirty                                                         # …whose
 PATH="$TMP/bin:$PATH" PI_LOG="$O/pi5.log" bash -c '
   . "$1"
   cd "$5" || exit 2
-  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
   KIND=lane; TAG=2834
   load1() { printf 1; }
   WIP_PATH="$2"
@@ -1719,7 +1719,7 @@ drive_cap() { # drive_cap <label> <log>
   PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" bash -c '
     . "$1"
     cd "$2" || exit 2
-    O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+    O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_SELF_MB=0; DISK_LANE_RESERVE_MB=0
     KIND=lane; TAG=2834
     load1() { printf 1; }
     run_agent 1 "$4" "$5" "$6" >>"$4.agent" 2>&1

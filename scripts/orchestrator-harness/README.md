@@ -5122,6 +5122,97 @@ belongs to `fix-one.sh`'s own three pre-agent deferrals (the cross-box refusal, 
 PR-owner takeover that could not complete), which is where it is written.
 
 
+### 7.2i The disk gate existed and ran one step too late (agent-infra#3395)
+
+Measured, cell-3, 98 % used / 3.5 GB free:
+
+```
+dispatch -> fatal: cannot create directory at 'tools/ts': No space left on device
+```
+
+The harness's disk gate was already correct and already fail-closed on a readable reading — but it
+lived inside `run_agent`, i.e. it ran AFTER `wt_provision` had materialised the lane's checkout. On a
+full volume it was never reached, so a full box presented as a **dead lane** rather than a named
+refusal. The dispatcher that produced that line (an ad-hoc pusher, `/tmp/robust_push.py`) printed
+`df=` in a log line and asserted nothing, because there was nothing for it to call: a `df` in a log
+is a REPORT, and a report is not a gate.
+
+Three surfaces now exist, and they are ONE predicate — `spawn-gate.sh`'s `disk_free_mb` /
+`disk_readable` / `disk_worktree_terms` / `disk_worktree_need`, the SAME functions the live arm's
+`disk_lane_costs` / `disk_lane_need` are built on. ⛔ BOTH BOUNDS ARE COMPUTED BY `disk_lane_need`
+(`max(tree, self) + reserve`), so the two seams cannot disagree about how much room one lane needs
+(review round 5, P2 — they did: the PRE-START seam ignored a stated `DISK_LANE_TREE_MB` and admitted
+at 2,064 MB a lane `run_agent` then refused at 22,000 MB, i.e. the worktree was materialised and the
+refusal arrived one step late — #3395's own defect, under a configured bound). What differs is the
+TERM each side feeds in: the live arm CLASSIFIES the checkout (`python_target`) and charges the
+marginal `tree` when the shared cache holds; the PRE-START seam does not classify (no `--repo`) and
+charges the stated `self` worst case, because at that point the brief's install step is unknown and
+`tree` is true only while the warm shared uv cache holds — the cache is what gets pruned under
+pressure. A `tree` the OPERATOR states for the cell is honoured on both sides.
+
+| surface | when it is asked | verdict |
+|---|---|---|
+| `run_agent` (live dispatch) | immediately before the agent starts | `REFUSED … DISK-NOHEADROOM` (unchanged, fail-OPEN on an unreadable probe) |
+| `wt_provision` → `wt_disk_admit` (PRE-START) | before `git worktree add`, i.e. before anything is created | `REFUSED-DISK(free=…, need=…, box=…; free_mb=, need_mb=)`, return **4** |
+| `spawn-gate.sh --disk-admit <target>` (the VERB) | from a dispatcher that is not this tree's shell code | same lines, exit 0/77/64 |
+
+rc **4** is mapped by each caller to what ITS surface can express: `fix-one.sh` refunds the attempt
+and exits **77** (`AGENT_DISK_REFUSED`); `adopt-fix.sh` exits **77**; `dispatch-merge.sh` releases the
+claims of the unspawned remainder (never the lanes it already started) and **stops the batch**, because
+a full volume is a fact about the box rather than about one issue.
+
+The PRE-START arm fails **CLOSED** on an unreadable `df` (`REFUSED-UNKNOWN free=?`): refusing before
+anything is created costs a re-dispatch, while the live arm's documented fail-open protects a running
+fleet. Two postures, one predicate, each with the reason this tree already gives for it.
+
+The per-lane requirement at that seam is the **worst case** (6,144 MB default, or a larger
+`DISK_LANE_TREE_MB` if an operator states one), not the marginal tree (350 MB), plus the cell reserve
+(4x the dispatch floor = 2,000 MB) — so 8,144 MB at the shipped defaults, i.e. ~8.0 GB. The
+derivation is measured, not invented: two lanes consumed **11 GB in six minutes** (~5.5 GB each) on a
+cell whose `.worktrees` was 36.4 GB of 47 GB, and the check therefore takes the cell that will BUILD,
+not the box that decided. A box whose lanes are measured cheaper lowers `DISK_LANE_SELF_MB` /
+`DISK_LANE_RESERVE_MB` deliberately (the seams the live arm already documents).
+
+⛔ **THE TWO SEAMS SHARE THE NUMBERS BUT NOT THE CLASSIFIER, AND THAT IS SAID OUT LOUD.** `self` and
+`reserve` come from ONE place (`DISK_LANE_SELF_PY_DEFAULT`, `disk_lane_reserve_default()`), so raising
+the live arm's worst case cannot leave this seam admitting on the old figure; `disk-admission.test.sh`
+pins the seam's requirement against `disk_lane_costs`/`disk_lane_need` on a python fixture for exactly
+that reason. What the seam does NOT do is consult `python_target`: at this step the lane's install
+step is the BRIEF's, not the checkout's (a harness checkout whose lane runs a python suite pays the
+same 5.6 GB venv), and the marginal `tree` figure is only true while a warm shared cache holds — the
+cache that pressure prunes first. **The cost of that choice, stated:** a box at ~5 GB free refuses a
+harness lane the live gate would have admitted, until an operator states a smaller worst case.
+
+⚠️ **SCOPE:** these are the three DISPATCH paths' route to a lane checkout — not the only route to
+one. **Many** scripts create checkouts directly and are NOT gated here, which is a named residual of
+this change: `stall-fix.sh` (`git worktree add` for a throwaway mend checkout), `ai-drainer.sh` (its
+own per-lane working checkout, `wt-drainer-<name>`, created with a bare `git worktree add` and no
+admission at all), `refresh-candidates.sh`,
+`cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance checkouts), the merge rail's own
+base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (the live scout path) — among others.
+Their ENOSPC behaviour is exactly what it was; each is a place where a lane can still die on a full
+volume.
+
+⛔ **NO COUNT IS GIVEN HERE, DELIBERATELY.** An earlier revision of this paragraph said "five" and
+named exactly five. That number was **false**, and so was every numeral that replaced it: the census
+below returns many more files than five. A hand-maintained count rots and a reader sizing the
+exposure from a number nobody re-measures is worse off than one who enumerates. Enumerate instead:
+`git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired` is a
+**superset** to audit (it deliberately admits comments — a comment-only mention still lists the
+file — and the filters below then drop tests). The rows to drop from it are the three gated callers
+(`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`) and the seam's own `wt-lifecycle.sh`. This file is
+NOT one of its rows: the population is `.sh`-scoped, so `README.md` is outside the printed census
+entirely. Moving the rest onto `wt_provision` (or the `--disk-admit` verb) is the follow-up this
+change does not do.
+
+Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
+the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real
+worktree; `free == need` → admitted; `free - 1` → refused; an unreadable probe → `REFUSED-UNKNOWN`;
+and the verb prints the token #3395 specifies, prefixed exactly as the suite asserts it:
+`REFUSED-DISK(free=3.5GB, need=8.0GB, box=cell-3; free_mb=3584, need_mb=8144)` — the raw mebibytes
+ride along on purpose (one decimal of GiB cannot separate `free == need` from `free == need - 1`).
+
+
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
 Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, no review,
