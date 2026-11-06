@@ -477,7 +477,7 @@ a killed worker cannot take the controller down with it.
 | `logs/` | one log per worker: `lane-*.log`, `lane-merge-<PR>.log` (the lane's merge-loop chain), `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` — `merge-rate.sh` deliberately does NOT count `lane-merge-*.log` as a lane |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
 | `state/capwip.tsv` | one row per cap kill **on every path** — epoch, label, cap seconds, elapsed, exit status, the verdict (`COMPLETE`/`PARTIAL`/`NOTHING-LOST`/`LOST`/`UNSNAPSHOTABLE`) and the snapshot dir (empty where no directory exists). The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
-| `state/lane-end.tsv` | one row per **terminal agent transition, cap or not** (#2834) — epoch, label, exit status, cap flag, the tree verdict (`dirty`/`clean`/`unpushed-only`/`cannot-verify`/`not-a-worktree`/`not-measured`), the rescue (`refs/wip/<slug>`/`archived-local`/`nothing`/`FAILED`/`UNAVAILABLE`/`DISABLED`), the local ref that pins the archived commit, the unpushed-commit count, and **the root that was measured** (`root` — the only column that can expose a wrong-tree archive). ⛔ **Every path writes through ONE writer** (`lane_end_record`), including the two that return BEFORE the measurement — `not-measured` (the operator hatch) and `not-a-worktree` (a root that is not a worktree ROOT: not a repository at all, or a path *inside* one) — because an absence used to be indistinguishable from a lane that never ended. ⛔ The root rule is the CALLEE'S (`bg-rescue-wip.sh:96-103`, `--show-toplevel` = `pwd -P`), not a weaker one (`rev-parse --git-dir` succeeds anywhere inside a repo, so it used to ratify a corner of a checkout and then fail one layer down as `rescue=FAILED`); what it does **not** catch — and does not claim to — is a caller that sets no `WIP_PATH` while its cwd sits at the ROOT of another checkout, which is why the measured root is a recorded column rather than an assumed one. ⛔ **`FAILED` means the rescue failed AND no ref pins anything**; `archived-local` is the third state, `bg-rescue-wip.sh` having exited 2 while `refs/wip-local/<slug>` is valid (a PARTIAL archive and a failed push both land there — the replayed callee lines above say which). ⛔ **The `ref` column names the LOCAL `refs/wip-local` pin and is EMPTY over an archive in exactly one case**: `bg-rescue-wip.sh` pushed `refs/wip/<slug>` and could not write that pin (it is guarded — `:246-252` warns and carries on), so the row reads `rescue=refs/wip/<slug>` with an empty ref and a loud line saying so. An empty ref alone is **not** "nothing was archived". The exit-path companion to `capwip.tsv`: the cap is not the common termination (`hit its … cap` appeared in **0** of 373 lane logs on the measured session), so without this row a lane that simply ENDED left no trace at all — its report said IN PROGRESS, the branch had no new commit, and the only copy of the work was a scratch worktree a reaper eventually deletes |
+| `state/lane-end.tsv` | one row per **terminal agent transition, cap or not** (#2834) — epoch, label, exit status, cap flag, the tree verdict (`dirty`/`clean`/`unpushed-only`/`cannot-verify`/`not-a-worktree`/`not-measured`), the rescue (`refs/wip/<slug>`/`archived-local`/`nothing`/`FAILED`/`UNAVAILABLE`/`DISABLED`), the local ref that pins the archived commit, the unpushed-commit count, and **the root that was measured** (`root` — the only column that can expose a wrong-tree archive). ⛔ **Every path writes through ONE writer** (`lane_end_record`), including the two that return BEFORE the measurement — `not-measured` (the operator hatch) and `not-a-worktree` (a root that is not a worktree ROOT: not a repository at all, or a path *inside* one) — because an absence used to be indistinguishable from a lane that never ended. ⛔ The root rule is the CALLEE'S (`bg-rescue-wip.sh:96-103`, `--show-toplevel` = `pwd -P`), not a weaker one (`rev-parse --git-dir` succeeds anywhere inside a repo, so it used to ratify a corner of a checkout and then fail one layer down as `rescue=FAILED`); what it does **not** catch — and does not claim to — is a caller that sets no `WIP_PATH` while its cwd sits at the ROOT of another checkout, which is why the measured root is a recorded column rather than an assumed one. ⛔ **`FAILED` means the rescue failed AND no ref THIS RUN wrote pins THIS RUN's snapshot** — a pin from an EARLIER rescue may still exist, and an off-box `refs/wip/<slug>` may hold an earlier snapshot of the branch (a chain failure, a PARTIAL archive whose push succeeded, and a failed push all exit 2 — those are the causes that can leave a REF; six further paths exit 2 BEFORE any push or pin exists, when the archive cannot be BUILT at all — `mktemp`, `read-tree`, `write-tree`, `commit-tree` (`bg-rescue-wip.sh:62,167,172,177,212,234`), which is what a FULL DISK produces, and there nothing of this run was pushed and no ref of this run exists; and a failed pin write alone does NOT exit 2 — it is guarded and exits 0 when the push succeeded, which is the `rescue=refs/wip/<slug>` row with an empty ref below), so read the replayed callee lines before concluding nothing was archived; `archived-local` is the third state, `bg-rescue-wip.sh` having exited 2 while `refs/wip-local/<slug>` is valid (a PARTIAL archive and a failed push both land there — the replayed callee lines above say which). ⛔ **The `ref` column names the LOCAL `refs/wip-local` pin and is EMPTY over an archive in exactly one case**: `bg-rescue-wip.sh` pushed `refs/wip/<slug>` and could not write that pin (it is guarded — `:246-252` warns and carries on), so the row reads `rescue=refs/wip/<slug>` with an empty ref and a loud line saying so. An empty ref alone is **not** "nothing was archived". The exit-path companion to `capwip.tsv`: the cap is not the common termination (`hit its … cap` appeared in **0** of 373 lane logs on the measured session), so without this row a lane that simply ENDED left no trace at all — its report said IN PROGRESS, the branch had no new commit, and the only copy of the work was a scratch worktree a reaper eventually deletes |
 
 ### Why the *reviewer* is a separate process from the *controller*
 
@@ -541,13 +541,161 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
   * it costs a network call only when there IS something to save (one `git status` + one `rev-list`
     otherwise), and it never changes the lane's exit status: a lane's status and the fate of its
     worktree are different facts;
-  * `unpushed-only` is MEASURED and NAMED but never archived **here**, and the reason is the callee's
-    contract rather than branch safety: `bg-rescue-wip.sh` archives only a NON-EMPTY `git status`
-    (`:150-166`), so a clean-but-unpushed tree makes it exit 0 having done nothing, and `refs/wip/<slug>`
-    is a non-force ref built with `commit-tree` — not a branch. Teaching it to archive `HEAD`'s tree is a
-    change to that shipped tool's contract and is deliberately out of scope, so #2834's ask 1 is met for
-    the DIRTY half and recorded for the unpushed half: the commits live in the repo's object database and
-    survive the WORKTREE being removed, but not the BRANCH being deleted.
+  * `unpushed-only` is MEASURED, NAMED **and now PUSHED** (`lane_end_push`, #3396 — the half #2834 left
+    owed). `bg-rescue-wip.sh` archives only a NON-EMPTY `git status` and never moves a branch, so the
+    branch half is its own function: `git push origin HEAD:refs/heads/<branch>`, bounded (5 s push-target
+    proof + 15 s symref + 15 s push + 5 s verify = 40 s, the whole network budget, via
+    `lib/bounded.sh`), **never forced**, and **verified by reading the remote** (`ls-remote`) rather than
+    by the push's exit status — transport success is not delivery. ⛔ **AND NO `-u`:** an upstream belongs
+    to the lane's own setup, not to a dying terminal, and `-u` writes `branch.<b>.remote`/`.merge` into
+    the repository's SHARED config — which in a linked worktree is what every PEER worktree reads, so one
+    lane's exit would silently give another a `git pull`/`git push` default it never configured. It fires
+    only when the measured
+    unpushed count is > 0, so the majority of lanes cost no network call. It REFUSES, loudly and by name,
+    to push from a hub checkout (`--git-dir` == `--git-common-dir`) or onto the landing branch, because
+    either would publish a ref that only the merge rail may move. ⛔ **AND THE READ AND THE WRITE MUST
+    ADDRESS THE SAME REPOSITORY** — `git push origin` honours `remote.origin.pushurl` and
+    `url.<base>.pushInsteadOf`, while a read of `origin` (`ls-remote origin`) honours `remote.origin.url`,
+    so an exit path that read one and wrote the other derived the landing-branch set from repository A
+    and then moved repository B's landing branch (reproduced: B's `refs/heads/trunk` moved
+    `613382f..b4e6ab9` while the same terminal recorded `push=FAILED` "does NOT hold
+    refs/heads/trunk"). `lane_end_push` therefore resolves origin's push url ONCE
+    (`git remote get-url --push --all origin`), **proves** it (`git ls-remote --get-url` must expand to the
+    same URL — otherwise a read of it is a FETCH, which re-applies `url.<base>.insteadOf` on top of the
+    resolved push url while `git push origin` does not, so the landing set and the verify would describe
+    repository C while the ref was written to B), and only then uses it for BOTH network reads; the push
+    still goes through `git push origin` so git's own rewrite is applied exactly once, as
+    `cleanup-stale-branches.sh` does for the same reason. An unprovable endpoint refuses:
+    `push=refused-pushurl-divergent` (more than one push url, or the expansion differs) and
+    `push=refused-pushurl-unresolved` (the resolution itself failed — including a checkout with no
+    `origin`, whose disagreement is NOT a divergence and gets its own remedy). A DETACHED head is
+    `push=detached`:
+    nothing is invented, and the marker tells a reclaim pass to refuse that worktree. ⛔ **AND AN
+    UNANSWERED VERIFY IS NOT AN ABSENT REF** — `push=verify-unanswered` means the push exited 0 and the
+    verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
+    (`next=MANUAL … did NOT establish`); it is a distinct verdict from `push=FAILED` (the remote ANSWERED
+    and the ref is absent) exactly as the symref read on the same path already refuses to read silence as
+    "no protected names". `push=push-killed` is the same honesty for a push whose CLIENT WAS KILLED:
+    the timer signalled it (`rc=124`) or, on the fleet's internal watchdog with no sentinel, it was
+    SIGKILLed (`rc=137`), so the ref may already have been applied server-side and the terminal asserts
+    neither delivery nor loss — `FAILED` is reserved for an answer the remote actually gave. ⛔ **THE
+    CLASS, NOT ONE INTEGER:** `tb_bound_tmp` degrades to "no sentinel" when its scratch dir cannot be
+    made — the full-disk state this feature exists for — and `bounded.sh` then returns the killed child's
+    status, so keying on `124` alone left the most likely shape recording `FAILED` over an absence nobody
+    measured. ⛔ **AND THE VERDICT NAMES ONLY THE MEASUREMENT:** `137` is not the timer's signature
+    either — `timeout 1 sh -c 'kill -9 $$'` returns it through GNU `timeout` with the timer never firing,
+    and an OOM killer on these boxes produces it with no timer at all — so the value says `push-killed`
+    and the LOG carries the code and says which cause is *not* established. Claiming "TIMED OUT after 15s"
+    for an OOM kill would be a cause the exit path cannot know, written into the durable artifact.
+  * ⛔ **THE WHOLE `push=` VOCABULARY, IN ONE PLACE** — the marker's `push=` column is a closed set, and a
+    reader keying on it must be able to tell every value apart: `running` (the pre-network marker),
+    `pushed` (verified by reading the remote back, and it now also covers a remote that a PEER
+    fast-forwarded inside the verify window — ancestry is measured with `git merge-base --is-ancestor`,
+    because a descendant sha means our commits ARE on the ref and recording `FAILED` there would be a
+    durable false absence; ⛔ and the CAUSE beside it is NOT read from the push's exit status, because the
+    `rc≠0` path deliberately falls through to that same ancestry read — a non-zero exit covers a rejected
+    ref, a transport failure, a pre-receive hook and a server that applied the ref then failed to report,
+    so that arm names the measurement (the client did not report success; the remote held a descendant at
+    verify time; therefore every commit of this lane is on that ref) and explicitly declines to name a
+    cause — neither "advanced inside the verify window" nor "predates the push" is asserted),
+    `verify-ancestry-unmeasured` (the remote ANSWERED with a sha this worktree
+    does not HAVE, so `--is-ancestor` exited 128 and no relation was established — a DIFFERENT fact from
+    `FAILED`, and the abstaining verdict for it: `FAILED` is only for the measured `rc=1`),
+    `nothing` (the unpushed count read 0 — a statement about the LOCAL
+    `refs/remotes/*` CACHE, not about the remote, which is why the sentence says so), `unmeasured`,
+    `detached`, `verify-head-unreadable` (the remote ANSWERED with a sha, but this worktree's OWN `HEAD`
+    could not be read, so NO COMPARISON WAS MADE — it asserts neither delivery nor loss, and it is a
+    DIFFERENT fact from `FAILED`; the usual cause is a partial/promisor clone or a corrupt odb),
+    `verify-unanswered`, `push-unreported`, `push-killed`, `FAILED` (the remote ANSWERED and
+    the ref is absent or holds an unrelated sha), and the refusals: `refused-main-checkout` (a hub's
+    branch is not a dying lane's to publish), `refused-protected` (the landing branch moves only through
+    the rail), `refused-unknown-default` (the protected set could not be established — an unknown default
+    is not "no protected names"), `refused-pushurl-divergent` / `refused-pushurl-unresolved` (the read
+    and the write would address different repositories), and `UNAVAILABLE`, which has THREE causes the
+    `[lane-exit]` line distinguishes: an unreadable `--git-common-dir` (the hub-vs-worktree shape is
+    unknown), `scripts/lib/bounded.sh` not found, and the library not sourceable. Each refusal refuses
+    because an UNBOUNDED or MISADDRESSED network call on the exit path is worse than no push at all.
+    ⛔ **AND AN EMPTY `push=` IS A DECLARED STATE, NOT A GAP:** it means the terminal never ran the push
+    step at all (`state=not-measured` / `not-a-worktree` — the tree was never measured, so there was
+    nothing to push), and `lane_end_next` abstains for it rather than falling through to a removal
+    licence. Any value that is neither `pushed` nor `nothing` abstains.
+  * ⛔ **THE ARM ORDER IN `lane_end_next` IS A SAFETY PROPERTY, NOT A STYLE CHOICE** — any domain that says
+    `MANUAL` outranks a domain that only reports, and a reporter placed above a MANUAL arm silences it.
+    Three separate review cycles have now found the same defect in a neighbouring arm, so it is stated
+    rather than left emergent: `cannot-verify` is a MANUAL verdict (an incomplete listing cannot certify a
+    tree, and the paths it never saw are in neither the porcelain section nor the archive), so it sits in
+    the MANUAL block above the `archived-local` and `refs/wip/*` reporters while still NAMING the archive
+    it found. Every MANUAL arm NAMES the other domain's MANUAL fact instead of returning alone — a refused
+    push beside a failed archive says both, and says that re-running the rescue cannot fix the branch.
+    ⛔ **AND NO MANUAL ARM MAY ASSERT AN ABSENCE IT DID NOT MEASURE.** Four verdicts had that shape and
+    now say only what was established: `push=unmeasured` means the `rev-list --count` FAILED, so it says the
+    count could not be read rather than that the commits "exist only on this disk" (the enumeration that
+    failed is not evidence of existence); `push=running` is what the PRE-NETWORK marker holds, so it says
+    this MARKER did not establish a push verdict — and it names its possible causes WITHOUT asserting one,
+    because the same on-disk state is left by a kill during the push, by a successful push whose later
+    marker write did not land (a full disk — the very state this feature exists for), and by a kill in the
+    rescue that follows the push; it never says "killed mid-push", and never that the commits exist only
+    here, which the same row's own `unpushed=0` would contradict; `not-a-worktree` is not a verdict about any worktree
+    (nothing was examined — the cause is the CALLER's pointer, so `next=` names `WIP_PATH=` as the remedy);
+    and `rescue=UNAVAILABLE` means the rescue NEVER RAN — either the rescuer was not FOUND, or the
+    root is not the root of a worktree (`spawn-gate.sh:2480`, which returns BEFORE the tool is even
+    searched for at `:2661`, so an installed rescuer can be reported UNAVAILABLE and the real cause
+    is the caller's `WIP_PATH`); the `next=` remedy differs per cause for exactly that reason, so it
+    never says "re-run bg-rescue-wip.sh", a command one of the two causes cannot run. ⛔ **AND THE SCOPE IS SYMMETRIC, WHICH TOOK
+    ONE MORE CYCLE TO SEE:** `unpushed=0` was scoped to the LOCAL `refs/remotes/*` cache because that is
+    what the enumeration reads, but the SAME enumeration in the other direction (`unpushed>0`, printed by
+    `UNAVAILABLE|detached|refused-*`) still asserted the commits "exist only on this disk" — an off-box
+    claim, false whenever a peer on a reused branch name pushed and this worktree never fetched. Both
+    readings are about the CACHE, so both sentences are now scoped to it and say so, and neither asserts
+    anything about a remote — and that includes the SHARED caveat helper `lane_end_push_caveat`, which is
+    appended to the same MANUAL arms and carried the same unscoped sentence (its `refused-protected` /
+    `refused-main-checkout` members are NOT consumed by an arm above it, so it is reachable, not latent).
+    ⛔ AND THE THIRD CONSUMER OF THAT ENUMERATION IS THE `[wip] NOTE` THAT ENDS THE LANE LOG, which is the
+    line an operator reads LAST: its fallback arm said the commits "exist ONLY locally and were NOT
+    pushed". Scoped now too, so the count's three readers (`next=`, the shared caveat, the NOTE) all say
+    the same thing about the same cache.
+    ⛔ **AND A REMEDY NAMES THE REPOSITORY ITS VERDICT IS ABOUT:** `pushed` is
+    granted against the PROVEN push url, so every `next=` sentence beside it prints
+    `${LANE_END_PUSH_URL:-origin}` — a `remote.origin.pushurl` that diverges from `remote.origin.url` is
+    supported, and a hardcoded `origin` would send the reader to a repository nobody read. That covers
+    the `refs/wip/<slug>` archive recovery too: `bg-rescue-wip.sh` WRITES the archive with
+    `git push origin "$C:refs/wip/$SLUG"`, so it lands in the push repository and the instruction must
+    FETCH from there rather than from `origin`'s fetch url. ⛔ AND THE url HAS TO EXIST ON THE ARMS THAT
+    NEVER RESOLVED IT: `lane_end_push` proves `LANE_END_PUSH_URL` only once the unpushed count is > 0, so
+    `nothing`, `unmeasured`, `detached` and `running` all reach `next=` with it EMPTY and fell back to
+    `origin` — the one repository the archive is NOT in. Those arms resolve it through
+    `lane_end_push_repo`, which reads the push url from CONFIG (no network, no proof needed for a remedy)
+    and answers `origin` only when it cannot do better — no readable remote, or more than one push url,
+    which is not this code's to pick.
+    ⛔ **AND THE OTHER DOMAINS' MANUAL FACTS ARE
+    APPENDED BY SHARED HELPERS, NOT RE-TYPED PER ARM** (`lane_end_rescue_caveat`, `lane_end_tree_caveat`,
+    `lane_end_push_caveat`): four consecutive review cycles each found a fresh arm that dropped one — a
+    refused push silencing the archive, the archive silencing the refused push, a reporter silencing
+    `cannot-verify`, and finally `cannot-verify` itself being dropped by every MANUAL push and rescue arm
+    because its own arm sits below them. A caveat expressed once cannot get a case list subtly different —
+    and the two rescue arms that still re-typed the PUSH caveat by hand had already drifted (one listed
+    `UNAVAILABLE`, the other did not; neither listed `running`, which the `cannot-verify` list carries).
+  * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
+    aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
+    writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
+    `branch`, `head`, `root`, `unpushed`, `push`, `branch_on_origin` (the sha the REMOTE reported),
+    `push_url` (the repository those verdicts are about, so a divergence is readable after the fact),
+    `rescue`, `wip_ref`, `dirty`, `ended`, `next` (mechanically derived) and a `porcelain:` section. A
+    path that returned BEFORE the measurement writes `state=not-measured` and `next=MANUAL — …did NOT
+    measure`, never a clean bill of health: the hatch is an escape, not a licence to claim a reading
+    that was never taken. ⛔ **THE COUNT AND THE LISTING HAVE DIFFERENT ENUMERATIONS**, so `unpushed` and
+    `dirty` are blanked independently: `dirty` rides on `git status --porcelain` and is `?` whenever that
+    listing is untrusted (`cannot-verify` included), while `unpushed` comes from `git rev-list` and is `?`
+    only when THAT command failed — publishing `?` over a count that WAS measured is the inverse error,
+    and it made the ledger say "never measured" about a number the lane log beside it printed. Both the
+    ledger column and the marker read ONE derivation (`lane_end_unpushed_col`), so the two artifacts can
+    no longer drift. ⛔ `MANUAL` follows the RISK, not the tree verdict: a REFUSED push on a CLEAN
+    (unpushed-only) tree carries it too, because those commits are on that disk only just the same —
+    otherwise a consumer filtering on this file's own convention reclaims one and refuses the other for
+    the same fact. And the affirmative `nothing at risk … may be removed` sentence names its SCOPE (the
+    paths git does NOT ignore), so a lane whose only copy of its work is an ignored file cannot read more
+    safety out of the artifact than the enumeration covered. ⛔ It is deliberately NOT written into the worktree — a file at the worktree
+    root would make every clean worktree dirty, which is the exact predicate the reaper keys on.
   * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
     (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
     the spawn and therefore reach neither the rescue nor the ledger. That is the honest reading: nothing
