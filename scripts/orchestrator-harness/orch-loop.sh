@@ -818,8 +818,11 @@ if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; e
 #                          because issue launch is contiguous. A level that was ENTERED **and whose
 #                          interval reached this emitter** reads its MEASURED SECONDS (`0` when the
 #                          interval was under a second); a level NOTHING entered — or one whose
-#                          interval never crossed the queue (an unwritable `$O/state/.stg-lvl`, or a
-#                          level left unsettled by a `continue`) — reads `ns`.
+#                          interval could not cross the queue (an unwritable `$O/state/.stg-lvl`,
+#                          which leaves the level `ns` outright) — reads `ns`. ⛔ A `continue` does NOT
+#                          produce `ns`: the next row's top-of-loop settle closes that interval, which
+#                          is why no `continue` needs its own mark. Only the LAST window row taking a
+#                          `continue` loses its tail, and that is the disclosed one-row residual.
 #   CARRIED (STG_PREV)   — `prev_wait`, the post-record gap (the async backlog spawn + the `CYC` nap).
 #                          It CANNOT be in this cycle's number: the record is written BEFORE the nap,
 #                          and it must be (a record stamped at the end would make a HUNG cycle look
