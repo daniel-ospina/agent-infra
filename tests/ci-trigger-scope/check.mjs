@@ -204,26 +204,62 @@ function valueLinesFor(entry, lines) {
   return out;
 }
 
+// ⛔ A TRAILING YAML COMMENT IS NOT PART OF THE VALUE. YAML starts a comment at a `#` PRECEDED BY
+// WHITESPACE (outside quotes), so `- opened  # first gate run` is the item `opened`. Reading the whole
+// rest of the line fabricated a list like `[opened # first gate run, synchronize # every push]`, which a
+// SET comparison then reported as "LOST [opened, synchronize]" — rc=1 over a correct workflow, the
+// same "the printed list was FABRICATED" class the value-line reader was fixed for. Quotes are honoured:
+// `- 'a # b'` is one item, comment and all.
+function stripYamlComment(s) {
+  const t = String(s);
+  const open = t[0];
+  if (open === '"' || open === "'") {
+    const close = t.indexOf(open, 1);
+    if (close > 0) return t.slice(0, close + 1);
+    return t;
+  }
+  return t.replace(/\s+#.*$/, "");
+}
+
 // readList(entry, valueLines) — a flow list on the key's own line, or a block sequence below it.
 // Returns string[]; refuses anything else (see the exit-2 note in the header).
 function readList(entry, valueLines) {
-  const value = entry.value.trim();
+  const value = stripYamlComment(entry.value.trim()).trim();
   if (value) {
     const m = /^\[(.*)\]$/.exec(value);
     if (!m) refuse(`line ${entry.line.no}: the value of \`${entry.key}:\` is ${JSON.stringify(value)} — not a flow list`);
     return m[1]
       .split(",")
-      .map(unquote)
+      .map((s) => unquote(stripYamlComment(s.trim()).trim()))
       .filter((s) => s.length > 0);
   }
   const items = [];
   for (const l of valueLines) {
     const m = /^[ \t]*-[ \t]+(.*)$/.exec(l.raw);
     if (!m) refuse(`line ${l.no}: expected a \`- item\` block-sequence entry, got ${JSON.stringify(l.raw)}`);
-    const v = unquote(m[1]);
+    const v = unquote(stripYamlComment(m[1]).trim());
     if (v) items.push(v);
   }
   return items;
+}
+
+// singleKey(keys, key, where) — the trigger's ONE `key:` entry, or a refusal if it declares two.
+// ⛔ YAML IS LAST-WINS, SO A DUPLICATE MAKES THE QUESTION UNANSWERABLE — and a `findIndex` reader
+// answers it with the FIRST copy instead, which is the wrong block. Measured: appending a second
+// `types:` (`- created`) under `issue_comment:` leaves the effective set `[created]` (PyYAML) and the
+// read of the first block reported the decided set; same for a second `branches:` (`- develop`). This
+// file already closes last-wins at four other levels (`on:`, `jobs:`, the job id, a job's `if:`), so
+// the same verdict is owed here: CANNOT-VERIFY, never a green read of the wrong block. (The repo's own
+// parser refuses a duplicate key outright — `scripts/workflow-yaml.mjs` throws on it — so this can only
+// fire on a file that is already broken.)
+function singleKey(keys, key, where) {
+  const hits = keys.filter((k) => k.key === key);
+  if (hits.length > 1) {
+    refuse(
+      `${PC_FILE}: \`${where}\` declares \`${key}:\` ${hits.length} times. YAML keeps the LAST one and discards the rest, so which ${key} set is in force here is UNANSWERABLE — and a reader that takes the first would answer about the wrong block. Re-run after the duplicate is resolved.`
+    );
+  }
+  return hits[0] ?? null;
 }
 
 // trigger(region, childIndent, name, file) — the named trigger's filter keys, or a refusal.
@@ -388,17 +424,31 @@ function jobBlock(text, name) {
 // refusal), while the revalidation job's own `if:` IS a block scalar in the live file. Stripping a
 // leading block indicator here does not weaken that refusal: it is applied to a DIFFERENT job, whose
 // predicates are required as a conjunction and whose disjunctions are refused below.
+// ⛔ AND "OWN-LEVEL" MEANS THE JOB'S KEY INDENT, NOT "ANYTHING DEEPER THAN THE HEADER". A step's
+// `if:` is 8 spaces deep, so a `keyIndent > headerIndent` test read a STEP guard as the JOB's — in
+// BOTH directions, each measured: (a) delete the job's `if:` and move the same conjunction onto its
+// first step and the job RUNS on every event while this reader reported green (fail-open); (b) put an
+// unrelated `if: always()` on a step and the reader reported a FINDING claiming the JOB's guard is
+// wrong (false block, and a false statement about the job). The job's own keys are all at ONE indent —
+// the shallowest key line deeper than the header, exactly the way `jobKeyIs` derives it — so that is
+// what a job-level `if:` must equal.
 function jobIfExprs(block) {
   const lines = String(block ?? "").split("\n");
   const headerIndent = (lines[0] ?? "").length - (lines[0] ?? "").trimStart().length;
+  const ownIndents = lines
+    .slice(1)
+    .map((l) => KEY_RE.exec(l))
+    .filter((m) => m && m[1].length > headerIndent)
+    .map((m) => m[1].length);
+  const jobKeyIndent = ownIndents.length ? Math.min(...ownIndents) : headerIndent + 2;
   const out = [];
   for (let i = 0; i < lines.length; i++) {
     const m = /^(\s*)(?:"if"|'if'|if)\s*:(.*)$/.exec(lines[i]);
     if (!m) continue;
     const keyIndent = m[1].length;
-    // A job's own `if:` is deeper than its header. Anything at or left of the header belongs to
-    // `jobs:` or to the previous job, and must not be read as this job's.
-    if (keyIndent <= headerIndent) continue;
+    // A STEP's `if:` (deeper than the job's own key indent) is not the job's guard, and an `if:` at or
+    // left of the header belongs to `jobs:` or to the previous job.
+    if (keyIndent !== jobKeyIndent) continue;
     let v = m[2].trim();
     for (let j = i + 1; j < lines.length; j++) {
       const l = lines[j];
@@ -902,7 +952,7 @@ function checkPipelineComplianceUnchanged() {
   // justification unpinned, and it is the half that makes the trigger safe: the comment event is
   // harmless because `revalidate-on-issue-comment` OWNS it and re-runs the EXISTING run. Each of the
   // four facts below was measured GREEN on this reader before it existed (the mutation and its result
-  // are re-driven, one arm each, in `run.sh` 7o–7r):
+  // are re-driven, one arm each, in `run.sh` 7i–7m):
   //   * the `issue_comment:` trigger deleted            → green, so the trigger could vanish silently
   //   * `issue_comment: types:` reduced to `[created]`    → green, so the retraction edit stopped
   //     re-reading (retracting a scoping marker is an `edited` activity — the file's own header says
@@ -920,9 +970,8 @@ function checkPipelineComplianceUnchanged() {
     // rule is "the effective set contains both", not "the key is present": refusing an absent key
     // would be a false block on a workflow that is correct.
     const ic = trigger(region, childIndent, "issue_comment", PC_FILE);
-    const icIdx = ic.keys.findIndex((k) => k.key === "types");
-    const icTypes =
-      icIdx < 0 ? ["created", "edited", "deleted"] : readList(ic.keys[icIdx], valueLinesFor(ic.keys[icIdx], ic.lines));
+    const icTypesEntry = singleKey(ic.keys, "types", "issue_comment:");
+    const icTypes = icTypesEntry ? readList(icTypesEntry, valueLinesFor(icTypesEntry, ic.lines)) : ["created", "edited", "deleted"];
     const icMissing = ["created", "edited"].filter((a) => !icTypes.includes(a));
     if (icMissing.length) {
       findings.push(
@@ -937,9 +986,17 @@ function checkPipelineComplianceUnchanged() {
     // model (a `>-` body of `guard` + `|| true` folds to TRUE) — so it is read here with the block
     // indicator stripped and both predicates required as a CONJUNCTION, with any `||` or bare
     // `true`/`false` literal refused. That is the safe direction: ANDing can only exclude more events.
-    const rv = jobBlock(text, "revalidate-on-issue-comment");
+    // ⛔ AND THE JOB MUST EXIST — checked BEFORE `jobBlock`, because `jobBlock` REFUSES (rc 2,
+    // CANNOT-VERIFY) when it cannot locate a job, which is the right answer for "cannot verify this
+    // job's guard" but the WRONG one here: absence of the OWNER is a fact this reader can state. A
+    // `jobBlock`-first reader made the finding below unreachable (measured: deleting the whole job
+    // produced `CANNOT-VERIFY: no revalidate-on-issue-comment job found`, never this finding).
+    const rvHeader = /^ {2}(?:"revalidate-on-issue-comment"|'revalidate-on-issue-comment'|revalidate-on-issue-comment)\s*:/m.test(
+      text
+    );
+    const rv = rvHeader ? jobBlock(text, "revalidate-on-issue-comment") : "";
     const rvExprs = jobIfExprs(rv);
-    if (!String(rv ?? "").trim()) {
+    if (!rvHeader) {
       findings.push(
         "pipeline-compliance.yml no longer declares the `revalidate-on-issue-comment` job. It OWNS the `issue_comment:` event that the allow-list admits: on a scoping comment it re-runs the EXISTING gate run for each open PR cross-referencing the issue (it posts no marker, holds no `contents: write` and cannot turn a red green). With the trigger admitted and this job gone, the comment event re-runs nothing — checks (b)/(d) stay non-deterministic in time, which is the #2467 window itself."
       );
@@ -950,7 +1007,14 @@ function checkPipelineComplianceUnchanged() {
     } else {
       for (const expr of rvExprs) {
         const keysEvent = /github\.event_name\s*==\s*['"]issue_comment['"]/.test(expr);
-        const keysIssue = /github\.event\.issue\.pull_request\s*==\s*null/.test(expr);
+        // ⛔ `!github.event.issue.pull_request` IS THE SAME PREDICATE — on a comment event the field is
+        // absent for a plain issue, so the negation is true exactly when the `== null` form is. Not
+        // modelling it minted a FINDING asserting the job's guard "does not require `== null`" about a
+        // tree that DOES require it (measured, rc=1) — a false block AND a false statement. The
+        // unmodelled-shape path is `refuse` (rc 2), never a finding; this shape is modelled instead.
+        const keysIssue = /(?:github\.event\.issue\.pull_request\s*==\s*null|!\s*github\.event\.issue\.pull_request\b)/.test(
+          expr
+        );
         const escape = /\|\||\bfalse\b|(?<![=!<>])\btrue\b/.test(expr);
         if (!keysEvent || !keysIssue || escape) {
           findings.push(
@@ -980,6 +1044,9 @@ function checkPipelineComplianceUnchanged() {
     );
     return;
   }
+  // A DUPLICATE `types:` IS LAST-WINS TOO — see `singleKey`. Read before the rest of this section, and
+  // before the branch filter, so a duplicated key can never be answered from the first copy.
+  singleKey(t.keys, "types", "pull_request:");
   const entry = t.keys[idx];
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
@@ -1024,9 +1091,9 @@ function checkPipelineComplianceUnchanged() {
   // dangerous direction and was measured GREEN before this check existed: `pipeline-compliance` would
   // never run on a PR to `main`, GitHub keeps a non-triggered required check "Pending", and every PR to
   // `main` becomes unmergeable — the same unsatisfiable-context class as a `paths:` filter here.
-  const brIdx = t.keys.findIndex((k) => k.key === "branches");
-  if (brIdx >= 0) {
-    const branches = readList(t.keys[brIdx], valueLinesFor(t.keys[brIdx], t.lines));
+  const brEntry = singleKey(t.keys, "branches", "pull_request:");
+  if (brEntry) {
+    const branches = readList(brEntry, valueLinesFor(brEntry, t.lines));
     if (!branches.includes("main")) {
       findings.push(
         `pipeline-compliance.yml's \`pull_request: branches:\` is [${branches.join(", ") || "<none>"}], which no longer admits \`main\`. This is the repo's ONLY required status context: on a PR to \`main\` the workflow would never trigger, GitHub keeps an untriggered required check "Pending", and that PR can never merge. (An ABSENT \`branches:\` key is admissible — it fires for every target branch and therefore still includes \`main\`.)`
