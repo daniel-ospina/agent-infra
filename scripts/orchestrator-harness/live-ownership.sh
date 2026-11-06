@@ -368,6 +368,16 @@ lo_select() {
   local prs_why issues_why pr_waiting
   LO_CHOICE=none
   lo_num "$unowned" || unowned=""
+  # ⛔ A DIGIT STRING IS NOT A COUNT, AND AN OUT-OF-RANGE ONE FAILS **OPEN** HERE (review 2026-11-04,
+  # P1). `lo_num` accepts any run of digits, but `[ 99999999999999999999 -gt 0 ]` ERRORS — and in an
+  # `elif` chain an errored test is FALSE, so control falls past EVERY arm into the final `else`, which
+  # sets `LO_CHOICE=issue` and prints `DISPATCH`. Measured with the shipped function:
+  #   `15 PRs: 99999999999999999999 un-owned -> no un-owned PR left ; issues: DISPATCH (10 in backlog)`
+  # — a pass that prints a dispatch the batch loop then refuses (`CASCADE_ISSUE_SLOTS=0`), i.e. the
+  # false PASS this change's own comment says it prevents. The bound is the same 9 digits `is_limit`
+  # uses in the controller, applied where the arithmetic happens, and the count is treated as the
+  # UNREADABLE case (drain), which is the polarity the count already takes for a non-number.
+  if [ -n "$unowned" ] && [ "${#unowned}" -gt 9 ]; then unowned=""; fi
   lo_num "$parked"  || parked=0
   # ⛔ THE TWELFTH INPUT IS THE CASCADE (owner ruling 2026-11-04), and its ABSENCE is not "0". An older
   # caller that does not report it keeps the pre-change behaviour exactly (`pr_waiting=1` ⇒ PR work
