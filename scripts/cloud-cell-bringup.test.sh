@@ -1936,8 +1936,9 @@ esac
 # ⛔ AND THE MEASURED DEFECT IS NOT REOPENED BY THIS: cell-2's `/home/cmux/agent-infra` was a real
 # CLONE (`.git` a DIRECTORY) holding a DIFFERENT repo. If the `.git`-file exemption ever widened to `.git`
 # generally, or the walker stopped comparing real checkouts, this is the arm that would catch it.
-# `agent-infra` is a DECLARED exception name expecting agent-infra, so a tortoise checkout there is
-# exactly the "a DIFFERENT repo at this name is still refused" case.
+# `agent-infra` needs NO table row — it matches the repo the origin names — so this arm exercises the
+# plain comparison and its FATAL, not a declared row (review finding, P2: the earlier note here claimed a
+# row existed, which would have taught the next lane to edit the table for a name that needs nothing).
 mk_checkout "$T/ident-wt/home/agent-infra" "https://github.com/daniel-ospina/tortoise.git" w4 \
   && ok "fixture: a REAL CLONE (.git is a DIRECTORY) named agent-infra, holding tortoise" \
   || bad "fixture: could not create the lying clone"

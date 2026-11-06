@@ -277,7 +277,16 @@ repo_identity_declared() {
   # read FATAL, with a remedy inviting a rename or quarantine of a preserved copy on a healthy cell: the
   # start of exactly the conversation this table exists to prevent. Same expectation as `harness` itself.
   case "${1:-}" in harness.*) _pin_family=1 ;; *) _pin_family=0 ;; esac
-  if [ "$_pin_family" -eq 1 ] || [ "${1:-}" = 'harness' ] \
+  if [ "$_pin_family" -eq 1 ]; then
+    # ⛔ ITS OWN REASON (review finding, P2). A preserved/stale copy is NOT the pin root, and the row exists
+    # so the exception is named ACCURATELY at the one artifact an operator may otherwise be invited to
+    # touch: telling them `harness.preserved-012629` is "the harness PIN ROOT" mis-describes the tree this
+    # check was just stopped from refusing.
+    printf '%s\n%s\n' 'agent-infra' \
+      "a PRESERVED or STALE harness copy (disk-floor.sh's \`harness.stray-*\` / \`harness.preserved-*\` class) — the harness always comes from agent-infra, and the copy is kept, not deployed"
+    return 0
+  fi
+  if [ "${1:-}" = 'harness' ] \
      || { [ -n "${HARNESS_PIN_DIR:-}" ] && [ "${1:-}" = "${HARNESS_PIN_DIR##*/}" ]; }; then
     printf '%s\n%s\n' 'agent-infra' \
       'the harness PIN ROOT (or a legacy flat pin, where the root itself is a linked worktree at a commit) — the harness always comes from agent-infra, and the directory names its role, not the repo'
