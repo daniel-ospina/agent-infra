@@ -3008,8 +3008,8 @@ case "$n57dirty" in 'dirty=?') rcn57d=0 ;; *) rcn57d=1 ;; esac
 ck "N57d FIXTURE: …and the marker's dirty field is '?' over that warned listing, so no field presents a trusted count over an untrusted walk [$n57dirty]" $rcn57d
 # ⛔ N58 — EXIT 0 DOES NOT PROVE THE ARCHIVE'S TREE IS THE WORKTREE (fresh review at 4f50e6718, P1 —
 # REPRODUCED, and it FALSIFIED the premise round 18 used to leave this arm alone: "the callee skips no
-# paths on exit 0"). `scripts/bg-rescue-wip.sh` runs `git add -A` (`:182`), falls back to `git add -u` with
-# stderr DISCARDED (`:190`), then adds only `git ls-files -o` entries — UNTRACKED paths — collecting
+# paths on exit 0"). `scripts/bg-rescue-wip.sh` runs `git add -A` (`:201`), falls back to `git add -u` with
+# stderr DISCARDED (`:209`), then adds only `git ls-files -o` entries — UNTRACKED paths — collecting
 # `SKIPPED` from those alone. A TRACKED file git cannot read fails both adds, is never in the untracked
 # sweep, and is in NEITHER the archive NOR the skipped list — `write-tree` and the push still succeed and
 # the callee exits 0. The remedy said "the archive commit's TREE is the worktree as it was left" over
