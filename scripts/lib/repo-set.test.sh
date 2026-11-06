@@ -522,8 +522,6 @@ ck "j4 …and it says so rather than claiming the path does not exist" \
 ln -s "$T/definitely-not-here.conf" "$T/dangling.conf" 2>/dev/null
 ck "j8 a DANGLING SYMLINK at the config path is INVALID (5), not NO-REPO-SET (3)" \
    '[ "$(run_reader_rc "$T/dangling.conf" list)" = 5 ]'
-ck "j9 …and it says the LINK is broken, so the operator is not sent to create the file" \
-   'run_reader "$T/dangling.conf" list | grep -q "SYMLINK whose target does not exist"'
 
 # ⛔ THE DOCTOR'S SET-LEVEL TAG GUARD IS THE ONE WHOLE-SET REFUSAL THE READER CANNOT EXPRESS ITSELF
 # (review round 7, P2): `acme/tools-api` and `acme-tools/api` both render the tag `acme-tools-api`, so
@@ -537,6 +535,49 @@ ck "j10 a TAG collision is refused here, not left for the doctor to refuse after
    '[ "$(run_reader_rc "$T/tag-collide.conf" check)" = 1 ] && run_reader "$T/tag-collide.conf" check | grep -q "REFUSED set"'
 ck "j11 …and the wrapper never announces a count for it" \
    'REPO_SET_FILE="$T/tag-collide.conf" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q . ; [ $? -ne 0 ]'
+# ⛔ THE DANGLING ARM MUST NOT DIAGNOSE A CAUSE `[ ! -e ]` CANNOT ESTABLISH (review round 8, P2):
+# that test is false for EACCES/EPERM and for ELOOP too, and this file's own doctrine says absence can
+# never be PROVEN from inside a sandbox. The CODE (5) is right; the message must not claim "the target
+# does not exist" and send an operator whose target is merely unreachable to "fix the link".
+ck "j12 the dangling-link message names OBSERVATION + candidates, not a proven cause" \
+   'o="$(run_reader "$T/dangling.conf" list)"; printf "%s" "$o" | grep -q "does not RESOLVE" && printf "%s" "$o" | grep -q "denies this process" && ! printf "%s" "$o" | grep -q "whose target does not exist"'
+# and a link whose target EXISTS but is denied behind an ancestor must say so, not "target missing"
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$T/denied"
+  printf 'slug=o/n checkout=%s\n' "$T/tortoise" > "$T/denied/target.conf"
+  chmod 000 "$T/denied"
+  ln -s "$T/denied/target.conf" "$T/eacceslink.conf" 2>/dev/null
+  ck "j13 a link to an UNREACHABLE (not missing) target still reports the candidates, not a wrong cause" \
+     'o="$(run_reader "$T/eacceslink.conf" list)"; printf "%s" "$o" | grep -q "does not RESOLVE"'
+  chmod 755 "$T/denied" 2>/dev/null
+fi
+
+# ⛔ THE SHAPE ROUND-TRIP (review round 8, P2): `configured_repos()` splits on `[,\s]+`, so a separator
+# the reader does not enumerate (an NBSP, a vertical tab) split one line into a TRUNCATED real entry plus
+# a phantom repo. Round-tripping the rendered list through the doctor's own splitter closes the class.
+printf 'slug=daniel-ospina/tortoise checkout=%s/NBSP\302\240weird\n' "$T" > "$T/nbsp.conf"
+ck "j14 a value that the DOCTOR'S splitter would divide refuses (the round-trip, not a character list)" \
+   'o="$(run_reader "$T/nbsp.conf" check)"; [ "$(run_reader_rc "$T/nbsp.conf" check)" = 1 ] && printf "%s" "$o" | grep -q "REFUSED set"'
+
+# ⛔ THE DUPLICATE KEY IS THE DOCTOR'S NORMALIZED IDENTITY (review round 8, P2): `.git` is a spelling of
+# the same repo to every consumer, and `set_tag_collisions` compares NORMALIZED slugs so it cannot catch
+# the pair either — the doctor would then run one repo twice against one register.
+mkdir -p "$T/tor-plain"
+printf 'slug=daniel-ospina/tortoise checkout=%s\nslug=daniel-ospina/tortoise.git checkout=%s\n' \
+  "$T/tortoise" "$T/tor-plain" > "$T/dotgit-dup.conf"
+ck "j15 a .git suffix is the SAME repo -> DUPLICATE-SLUG (the doctor normalizes it too)" \
+   'o="$(run_reader "$T/dotgit-dup.conf" list)"; printf "%s" "$o" | grep -q "DUPLICATE-SLUG" && [ "$(run_reader_rc "$T/dotgit-dup.conf" list)" = 5 ]'
+
+# ⛔ NO `python3` ON PATH IS THE LAUNCHD SHAPE, and the reader must fall back exactly as the wrapper does
+# (review round 8, P2): with `command -v`-only resolution the tag guard silently no-op'd and the wrapper
+# announced a pass for a set the doctor refused wholesale.
+NODIR="$T/no-python3"; mkdir -p "$NODIR"
+for b in bash sed tr awk grep printf id dirname cat cut wc head mv rm mkdir ln chmod git date env basename uname; do
+  _p="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p" "$NODIR/$b" 2>/dev/null
+done
+ck "j16 with NO python3 on PATH the tag guard still refuses (absolute fallback, like the wrapper)" \
+   'o="$(REPO_SET_FILE="$T/tag-collide.conf" PATH="$NODIR" /bin/bash "$READER" check 2>&1)"; printf "%s" "$o" | grep -q "REFUSED set"'
+
 ck "j5 check PROPAGATES 3 for an absent set (a consumer must be able to tell it from a broken file)" \
    '[ "$(run_reader_rc "$nofile" check)" = 3 ]'
 ck "j6 check returns 1 for a set that PARSES but whose proof fails (a different fix from a broken file)" \
