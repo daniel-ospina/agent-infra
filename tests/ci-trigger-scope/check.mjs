@@ -215,8 +215,20 @@ function extraSet(names, allowed) {
 // guard was gone. Scoping by job is what makes the guard assertion non-vacuous.
 function jobBlock(text, name) {
   const lines = String(text ?? "").split("\n");
-  const start = lines.findIndex((l) => l === `  ${name}:`);
-  if (start < 0) return "";
+  // The START is matched by the same indent SHAPE as the terminator, never by exact string equality:
+  // a one-character edit to the required job's OWN header — a trailing comment
+  // (`  pipeline-compliance:  # the required context`) or a quoted name — made an exact matcher return
+  // "" and the caller report "the JOB does not carry the guard" while the guard was plainly present.
+  // That is a false block AND a misdiagnosis, and the natural repair for a wrong diagnosis is to
+  // loosen the guard regex, which is how a fail-open is born.
+  const headerRe = new RegExp(
+    `^ {2}(?:"${name}"|'${name}'|${name}):(?:\\s+#.*)?\\s*$`
+  );
+  const start = lines.findIndex((l) => headerRe.test(l));
+  // ⛔ Cannot-locate is NOT "the guard is missing". A reader that cannot find the job it was asked
+  // about has to say so (rc 2), because reporting it as a guard FINDING sends the reader after a
+  // fault that does not exist.
+  if (start < 0) refuse(`${PC_FILE}: no \`${name}\` job found under \`jobs:\` — cannot verify its \`if:\``);
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
     // ⛔ ANY 2-space-indent YAML key ends the job — matched by INDENT, not by header SHAPE. An
@@ -245,15 +257,46 @@ function jobKeyIs(block, key, valueRe) {
   const lines = String(block ?? "").split("\n");
   const header = lines[0] ?? "";
   const keyIndent = " ".repeat(header.length - header.trimStart().length + 2);
-  const re = new RegExp(`^${keyIndent}${key}:\\s*(?:${valueRe.source})\\s*$`);
-  // ⛔ EVERY own key line must match — not merely the FIRST one. A mapping with a DUPLICATE `if:` (the
-  // guarded one first, then `if: true`) has one matching line and one that re-opens the event, and a
-  // `.some()` reports the required job guarded by the line the effective value is not. `every()` on a
-  // non-empty list is also what keeps "no `if:` at all" a FINDING rather than a vacuous pass
-  // (`[].every()` is true).
-  const ownRe = new RegExp(`^${keyIndent}${key}:`);
-  const own = lines.filter((l) => ownRe.test(l));
-  return own.length > 0 && own.every((l) => re.test(l));
+  // ⛔ The key is matched in EVERY quoting YAML permits (`if:`, `"if":`, `'if':`). Matching only the
+  // bare spelling left a duplicate written `"if": true` invisible to `every()` — PyYAML confirms that
+  // is the value the workflow evaluates — so the gate read green over an `if: true`.
+  const ownRe = new RegExp(`^${keyIndent}(?:"${key}"|'${key}'|${key}):`);
+  // ⛔ And the VALUE is the YAML-FOLDED scalar, not the first line. A plain scalar continues on any
+  // following line indented deeper than the key, so
+  //
+  //     if: github.event_name != 'issue_comment'
+  //       || true
+  //
+  // evaluates to `<guard> || true` and the job RUNS on the comment event — while a line-by-line
+  // matcher sees only the first line, which is the guard verbatim, and reports green. Measured under
+  // PyYAML: the folded value is "… != 'issue_comment' || true" and a line-wise match returned ok/rc=0.
+  // Folding here means that continuation is examined by the SAME rule as the one-line form. Comment
+  // lines are skipped because YAML excludes them from the scalar, and an indent at or left of the key
+  // ends the value.
+  const values = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = ownRe.exec(lines[i]);
+    if (!m) continue;
+    let value = lines[i].slice(m[0].length).trim();
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j];
+      if (l.trim() === "" || /^\s*#/.test(l)) continue;
+      if (l.length - l.trimStart().length <= keyIndent.length) break;
+      value += " " + l.trim();
+    }
+    values.push(value);
+  }
+  // `every()` on a NON-EMPTY list: a duplicate key is caught by requiring EVERY own occurrence to
+  // match, and the `length > 0` half keeps "no such key at all" a FINDING rather than a vacuous pass
+  // (`[].every()` is `true`).
+  //
+  // ⛔ AND THE WHOLE VALUE MUST MATCH — `^(?:…)$`, never a bare `.test()`. The guard pattern's own
+  // shape is a PREFIX (the guard, then an optional `&&` tail), so an unanchored test accepts
+  // `github.event_name != 'issue_comment' || true` by matching the prefix and ignoring the tail —
+  // undoing the very fold above that exists to expose that tail. Measured: unanchored, the folded-`||`
+  // mutant read ok/rc=0.
+  const wholeRe = new RegExp(`^(?:${valueRe.source})\\s*$`);
+  return values.length > 0 && values.every((v) => wholeRe.test(v));
 }
 
 // ── the two facts this file owns ─────────────────────────────────────────────────────────────

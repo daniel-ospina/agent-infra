@@ -665,6 +665,82 @@ if apply_mutation "$PC" "$PC_DQUOTE" \
   run_check 0 "a DOUBLE-QUOTED \`issue_comment\` (YAML-identical) is ACCEPTED" PC_FILE="$PC_DQUOTE"
 fi
 
+echo "== 7h. MUTANT: the guard EXPRESSION's shape and YAML folding =="
+# ⛔ These arms exist because every one of them was a MEASURED false PASS or false block, not a
+# hypothetical. A guard is only useful if the gate reads the expression YAML actually evaluates.
+PC_GUARD_ANCHOR="    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'"
+PC_GUARD_KEPT="    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'"
+
+# (a) A YAML plain scalar CONTINUES on the next line when that line is indented deeper than the key.
+#     `if:` + a folded `|| true` therefore evaluates to TRUE and the required job RUNS on the comment
+#     event, while a line-wise reader sees the guard verbatim. Measured: ok/rc=0 before folding.
+PC_FOLDED_OR="$TMP/pc-folded-or.yml"
+if apply_mutation "$PC" "$PC_FOLDED_OR" "$PC_GUARD_ANCHOR" \
+  "$PC_GUARD_KEPT
+      || true" \
+  "a folded \`||\` continuation must be constructible"; then
+  run_check 1 "a \`||\` folded onto the guard's next line is REFUSED" PC_FILE="$PC_FOLDED_OR"
+fi
+
+# (b) …while the SAFE direction stays accepted: ANDing can only exclude more events. A gate that
+#     refused this would be a false block on a correctly guarded tree.
+PC_FOLDED_AND="$TMP/pc-folded-and.yml"
+if apply_mutation "$PC" "$PC_FOLDED_AND" "$PC_GUARD_ANCHOR" \
+  "$PC_GUARD_KEPT
+      && github.event.action != 'deleted'" \
+  "a folded \`&&\` narrowing must be constructible"; then
+  run_check 0 "a folded \`&&\` NARROWING is accepted (ANDing only excludes more events)" PC_FILE="$PC_FOLDED_AND"
+fi
+
+# (c) YAML permits the key quoted. A duplicate written `"if": true` is the value the workflow
+#     evaluates (PyYAML: `if = True`), so a reader that only matched the BARE spelling reads green
+#     over it. Measured: ok/rc=0 when only `if:` was matched.
+PC_DUP_IF="$TMP/pc-dup-if.yml"
+if apply_mutation "$PC" "$PC_DUP_IF" "$PC_GUARD_ANCHOR" \
+  "$PC_GUARD_KEPT
+    \"if\": true" \
+  "a duplicate quoted \`\"if\":\` must be constructible"; then
+  run_check 1 "a duplicate \`\"if\": true\` cannot hide behind the guarded \`if:\`" PC_FILE="$PC_DUP_IF"
+fi
+
+# (d) The required job's OWN header carrying a trailing comment (or a quoted name) must NOT be read as
+#     "the guard is missing": that was a false block AND a misdiagnosis of a correctly guarded tree.
+PC_OWN_HEADER="$TMP/pc-own-header.yml"
+if apply_mutation "$PC" "$PC_OWN_HEADER" "  pipeline-compliance:
+" \
+  "  pipeline-compliance:  # the required context
+" \
+  "the required job's own header must be commentable"; then
+  run_check 0 "a trailing comment on the REQUIRED job's own header does not look like a lost guard" PC_FILE="$PC_OWN_HEADER"
+fi
+
+# (e) `if: >-` is a block scalar this reader does NOT model — and it is the shortest path from a false
+#     block back to a fail-open, because a `>-` body of `guard` + `|| true` folds to TRUE. Both are
+#     REFUSED, so "add `>-` support" cannot be made to pass without meeting this arm.
+#     ⛔ These two are REGRESSION PINS, not a fixed bug: both read rc=1 before this section existed too
+#     (the shape simply failed the regex). They are here to keep the documented residual ENFORCED,
+#     because the natural next change is to teach the reader `>-` — and a `>-` reader that folds
+#     before it checks the operator is exactly the fail-open arms (a)/(c) guard against.
+PC_BLOCK_SCALAR="$TMP/pc-block-scalar.yml"
+if apply_mutation "$PC" "$PC_BLOCK_SCALAR" "$PC_GUARD_ANCHOR" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: >-
+      github.event_name != 'issue_comment'" \
+  "a \`>-\` block-scalar guard must be constructible"; then
+  run_check 1 "a guard written as an \`if: >-\` block scalar is REFUSED (not modelled)" PC_FILE="$PC_BLOCK_SCALAR"
+fi
+
+PC_BLOCK_SCALAR_OR="$TMP/pc-block-scalar-or.yml"
+if apply_mutation "$PC" "$PC_BLOCK_SCALAR_OR" "$PC_GUARD_ANCHOR" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: >-
+      github.event_name != 'issue_comment' || true" \
+  "a \`>-\` block scalar with \`||\` must be constructible"; then
+  run_check 1 "a \`>-\` body carrying \`|| true\` is REFUSED (that body folds to TRUE)" PC_FILE="$PC_BLOCK_SCALAR_OR"
+fi
+
 echo "== 8. ADMISSION: every path the doctor step can read is admitted =="
 # Each entry names the reader it belongs to. This list is the assertion: a filter that stops
 # admitting one of them is a coverage loss, and the mandate for this change is to err WIDE (#3001 —
