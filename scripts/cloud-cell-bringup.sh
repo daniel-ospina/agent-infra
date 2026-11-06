@@ -2160,7 +2160,17 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      log_line "CELL READY — all links verified (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
+      # ⛔ THE HEADLINE MUST NOT CONTRADICT THE TOKEN INSIDE THE SAME PARENTHESIS (review finding, P2).
+      # The line used to read `CELL READY — all links verified (one home, repo identity NOT verified (see
+      # the UNVERIFIED lines above), tools, …)`: the token was honest, but the sentence an operator and
+      # every log-scraper reads FIRST still asserted that all links were verified. That is the exact
+      # framing `REPO_IDENTITY_TOKEN` was introduced to remove, so the headline is now derived from what
+      # the check measured rather than hard-coded.
+      case "$REPO_IDENTITY_TOKEN" in
+        "repo identity") READY_HEADLINE="all links verified" ;;
+        *)                 READY_HEADLINE="links checked — one or more NOT fully verified (see the lines above)" ;;
+      esac
+      log_line "CELL READY — $READY_HEADLINE (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
       ;;
     *)
       log_line "unknown mode: $MODE (use --check)"; exit 2 ;;

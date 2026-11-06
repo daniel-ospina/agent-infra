@@ -386,8 +386,9 @@ repo_identity_fold() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 # "which of these trees does this cell resolve to" in a duplicate report and which repo the generic
 # cell-checkout names may carry (`repo_identity_own_repo`). They never decide whether a MISMATCH is fatal.
 repo_identity_scan() {
-  local -a _cd=() _slug=() _fold=() _head=() _base=() _sp=()
+  local -a _cd=() _slug=() _fold=() _head=() _base=() _sp=() _wt=()
   local root c r p base url slug hsha want exp reason decl own checked=0 fatal=0
+  local wt
   local i j n dup listed hlist resolves v pv rp where
 
   own="$(repo_identity_own_repo)"
@@ -411,6 +412,26 @@ repo_identity_scan() {
     # every directory against '' and would have refused the whole box.
     while [ "${#sp}" -gt 1 ] && [ "${sp%/}" != "$sp" ]; do sp="${sp%/}"; done
     [ -e "$sp/.git" ] || return 0
+    # ⛔ A LINKED WORKTREE (or a submodule) CARRIES `.git` AS A **FILE**, AND ITS NAME IS NOT A REPO
+    # NAME — it is a BRANCH (or a module name). So it is recorded (it still counts in the duplicate/head
+    # report) but it is NEVER name-compared: `wt[…]` = 1 means "this name is not a claim about the
+    # repo". This is the P0 a review found. The population line above says one level is deliberate
+    # because "a WORKTREE's directory is named after a BRANCH" — but it only excluded the `.worktrees/`
+    # SUBdirectory, while the fleet's OWN recipe is a worktree at DEPTH 1 under the cell home:
+    # `git worktree add $HOME/wt-<slug> -b <branch>` (scripts/lane-actions.py), measured as 8 trees under
+    # `/tmp/cell-home/wt-*` — and `$CELL_HOME` IS `/tmp/cell-home`. Those were reported FATAL, so every
+    # `cloud-cell-doctor` pass recorded a red on a healthy busy cell and `cloud-cell-bringup --check`
+    # refused a healthy cell, with a remedy inviting exactly the rename of a LIVE LANE's worktree that
+    # this check must never invite. A table row cannot close this: the `wt-<slug>` / `<repo>-wip` family
+    # is unbounded, so the discriminator is the `.git` TYPE, not the name.
+    # ⛔ AND THIS DOES NOT REOPEN THE MEASURED DEFECT. cell-2's `/home/cmux/agent-infra` was a real CLONE
+    # (`.git` a DIRECTORY), which is still name-compared and still FATAL. A lying WORKTREE still surfaces
+    # in the duplicate report, which lists every path and head.
+    wt=0
+    if [ -f "$sp/.git" ]; then wt=1
+    elif [ -d "$sp/.git" ]; then :
+    else return 0
+    fi
     rr="$( ( cd "$sp" 2>/dev/null && pwd -P ) )" || return 0
     [ -n "$rr" ] || return 0
     while [ "$k" -lt "${#_cd[@]}" ]; do
@@ -418,6 +439,7 @@ repo_identity_scan() {
       k=$((k + 1))
     done
     _cd[${#_cd[@]}]="$rr"; _sp[${#_sp[@]}]="$sp"; _base[${#_base[@]}]="${sp##*/}"
+    _wt[${#_wt[@]}]="$wt"
   }
 
   for root in "$@"; do
@@ -495,6 +517,15 @@ repo_identity_scan() {
     if [ -n "$exp" ] && { [ "$exp" = '*' ] || [ "$(repo_identity_fold "$exp")" = "$(repo_identity_fold "$want")" ]; }; then
       printf '%s\t%s\n' warn \
         "repo identity: ${_sp[$i]}$where is a checkout of $slug under the DECLARED exception name '$base' — $reason. Deliberate, not a defect; named so the exception stays visible, and a DIFFERENT repo at this name is still refused (agent-infra#3521)"
+      i=$((i + 1)); continue
+    fi
+    # ⛔ A LINKED WORKTREE / SUBMODULE IS NOT A DIRECTORY LYING ABOUT ITSELF (review finding, P0). Its
+    # name is a BRANCH (or a module name), so there is nothing to compare it against — reporting it FATAL
+    # reds every pass on a healthy cell that holds one live lane. It is still NAMED (never silent), and
+    # it still contributes its path+head to the duplicate report below.
+    if [ "${_wt[$i]}" -eq 1 ]; then
+      printf '%s\t%s\n' warn \
+        "repo identity: ${_sp[$i]}$where is a LINKED WORKTREE of $slug (its .git is a file, not a directory), so its directory name '$base' names a BRANCH, not a repository — nothing to compare against its origin, and it is never a directory lying about itself. Named so the tree is visible; the duplicate report below still lists every path and head (agent-infra#3521)"
       i=$((i + 1)); continue
     fi
     fatal=$((fatal + 1))
@@ -580,8 +611,13 @@ repo_identity_scan() {
   if [ "$checked" -eq 0 ]; then
     # An EMPTY population is not a pass: it means the walk found nothing to ask, which on a cell is
     # itself suspicious (a cell with no checkout of its own repo cannot be right).
+    # ⛔ THE WORD `UNVERIFIED` IS A CONTRACT, NOT PROSE (review finding, P1). The bring-up decides the
+    # `CELL READY` banner token by matching that LITERAL, so an empty population that said only "not a
+    # pass" left `seen_unverified` at 0 and the banner certified identity as VERIFIED — on the NORMAL
+    # first-bring-up path, where `check_repo_identity` runs before `check_repo` clones `$WORKDIR`, so the
+    # population is legitimately empty and then the clone happens. Keep the literal.
     printf '%s\t%s\n' warn \
-      "repo identity: NO checkout was found under any of the roots checked ($*), so nothing's name was verified against its origin — an empty population is not a pass (agent-infra#3521)"
+      "repo identity UNVERIFIED: NO checkout was found under any of the roots checked ($*), so nothing's name was verified against its origin — an empty population is not a pass (agent-infra#3521)"
   fi
   [ "$fatal" -eq 0 ] || return 1
   return 0

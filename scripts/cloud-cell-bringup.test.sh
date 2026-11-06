@@ -1732,6 +1732,15 @@ case "$EMPTY_OUT" in
   *"NO checkout was found"*"rc=0"*) ok "an empty population is reported, never silently passed" ;;
   *) bad "a walk that found no checkout said nothing — an empty population must not read as clean: $EMPTY_OUT" ;;
 esac
+# ⛔ THE WORD `UNVERIFIED` IS A CONTRACT (review finding, P1). The bring-up picks the `CELL READY` banner
+# token by matching that LITERAL, so a line that says only "not a pass" leaves the banner certifying
+# identity as VERIFIED — on the NORMAL first-bring-up path, where the population is legitimately empty
+# because `check_repo_identity` runs BEFORE `check_repo` clones `$WORKDIR`. Measured before this arm: the
+# token came back as `repo identity` (verified) on an empty population.
+case "$EMPTY_OUT" in
+  *"repo identity UNVERIFIED:"*"NO checkout was found"*) ok "…and the line carries the literal UNVERIFIED the banner token watches (else the banner certifies an identity nothing measured)" ;;
+  *) bad "the empty-population line does not carry the UNVERIFIED literal, so the CELL READY banner would claim repo identity WAS verified: $EMPTY_OUT" ;;
+esac
 
 say_case "repo identity: a LEGACY FLAT HARNESS PIN is a declared exception, never a directory to move"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P1. `HARNESS_PIN_DIR` defaults to `$CELL_HOME/harness` and
@@ -1756,6 +1765,61 @@ case "$BR_OUT" in
 esac
 [ -e "$T/ident-pin/home/harness/.git" ] && ok "the pin worktree is still in place (nothing was moved)" \
   || bad "the check removed or moved the harness pin"
+
+say_case "repo identity: a DEPTH-1 LINKED WORKTREE (\$CELL_HOME/wt-<slug>) is NAMED, never refused"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A **P0** — a false block on every healthy busy cell. The population
+# line says one level is deliberate because "a WORKTREE's directory is named after a BRANCH, not after a
+# repo" — but it only excluded the `.worktrees/` SUBdirectory. The fleet's OWN recipe is a worktree at
+# DEPTH 1 under the cell home: `git worktree add $HOME/wt-<slug> -b <branch>` (scripts/lane-actions.py),
+# measured as 8 trees under `/tmp/cell-home/wt-*` — and `$CELL_HOME` IS `/tmp/cell-home`. Each was
+# reported FATAL, so `cloud-cell-doctor` recorded a red on every pass of a healthy cell and
+# `cloud-cell-bringup --check` refused one, with a remedy inviting the rename of a LIVE LANE's worktree.
+# The discriminator is the `.git` TYPE (.git as a FILE = a worktree/submodule, whose name is a branch),
+# never the name — the `wt-<slug>` / `<repo>-wip` family is unbounded, so no table row can close it.
+mk_checkout "$T/ident-wt/repo" "https://github.com/daniel-ospina/tortoise.git" w1 \
+  && ok "fixture: the cell's OWN repo (tortoise) at the generic name 'repo' — `br` pins REPO_SLUG to tortoise" \
+  || bad "fixture: could not create the lane source checkout"
+# The worktree MUST branch from the cell's own repo, because that is the healthy state being tested: a
+# lane worktree of THIS repo at depth 1. A worktree of a DIFFERENT repo would be a lying directory in its
+# own right, which is a different arm (below).
+git -C "$T/ident-wt/repo" worktree add --detach "$T/ident-wt/home/wt-1735-identity" HEAD >/dev/null 2>&1 \
+  && ok "fixture: a lane worktree at DEPTH 1 under the cell home (.git is a FILE)" \
+  || bad "fixture: could not create the depth-1 lane worktree"
+BR_IDENT_ROOTS="$T/ident-wt/home" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a HEALTHY cell's live lane worktree was refused as a lying directory — and the remedy invites moving it" ;;
+  *) ok "a live lane worktree is not fatal (its name is a branch, not a claim about its repo)" ;;
+esac
+case "$BR_OUT" in
+  *"LINKED WORKTREE"*) ok "…and it is NAMED as a linked worktree, never silent" ;;
+  *) bad "the lane worktree was passed over in silence: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+[ -e "$T/ident-wt/home/wt-1735-identity/.git" ] && ok "the lane worktree is still in place (nothing was moved)" \
+  || bad "the check removed or moved a live lane's worktree"
+# ⛔ AND THE MEASURED DEFECT IS NOT REOPENED BY THIS: cell-2's `/home/cmux/agent-infra` was a real
+# CLONE (`.git` a DIRECTORY) holding a DIFFERENT repo. If the `.git`-file exemption ever widened to `.git`
+# generally, or the walker stopped comparing real checkouts, this is the arm that would catch it.
+# `agent-infra` is a DECLARED exception name expecting agent-infra, so a tortoise checkout there is
+# exactly the "a DIFFERENT repo at this name is still refused" case.
+mk_checkout "$T/ident-wt/home/agent-infra" "https://github.com/daniel-ospina/tortoise.git" w4 \
+  && ok "fixture: a REAL CLONE (.git is a DIRECTORY) named agent-infra, holding tortoise" \
+  || bad "fixture: could not create the lying clone"
+BR_IDENT_ROOTS="$T/ident-wt/home" br fail normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) ok "…while a REAL CLONE that lies about its repo is STILL refused (the cell-2 defect)" ;;
+  *) bad "the .git-is-a-file exemption widened to real checkouts — a lying CLONE now reads clean: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+
+say_case "the CELL READY headline cannot contradict the identity token in the same parenthesis"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P2. The line read `CELL READY — all links verified (one home, repo
+# identity NOT verified (see the UNVERIFIED lines above), …)`: the token was honest, but the sentence an
+# operator and every log-scraper reads FIRST still asserted all links were verified — the exact framing
+# the token exists to remove. Source-text tripwire against re-hardcoding the headline.
+if grep -qF 'CELL READY — all links verified (one home' "$BRINGUP"; then
+  bad "the CELL READY headline is hard-coded to 'all links verified', so it contradicts an UNVERIFIED token in the same line"
+else
+  ok "the CELL READY headline is derived from what was measured, not hard-coded"
+fi
 
 say_case "repo identity: two checkouts at the SAME head is reported as same-head, not as a divergence"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A FALSE ALARM. The head list was built with ", " and then split on
