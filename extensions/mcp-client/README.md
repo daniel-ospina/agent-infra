@@ -2,8 +2,12 @@
 
 Connects pi to MCP servers declared in `.mcp.json` and registers each tool as
 `mcp__<server>__<tool>`. Since #199, server lifecycle is **decoupled from the
-session lifecycle**: a small eager core is pre-loaded, everything else is
-discoverable via a catalog and loads on demand, then idle-stops.
+session lifecycle**: servers are discoverable via a catalog and load on demand
+(`mcp_load <server>`), then idle-stop. ⛔ NOTHING in the shipped base catalog is eager:
+`templates/.mcp.base.json` and the repo's `.mcp.json` mark every server `lazy: true`
+(graph-mcp-provision — the hosted graph's cold handshake exceeds pi's default connect budget,
+and the entry lands on memory-constrained cells where a core server would block every session
+start). Say `mcp_load tortoise` before you read the graph.
 
 ## Server tiers
 
@@ -90,17 +94,26 @@ Each server's transport is selected independently:
 Once a lazy server's tools are registered, they **self-heal**: if the idle sweep
 stops the server, the next tool call transparently reconnects it.
 
-## Pre-loaded core
+## Hosted graph server
 
-`tortoise` (memory graph) is the only always-eager core server; every other base
-server is lazy (`mcp_load` on demand). **There is no `exa`** — it was uninstalled by
+`tortoise` (memory graph) is the HOSTED HTTP server (`type: http`, `url:
+https://api.premiselabs.co/mcp/`, `Authorization: Bearer ${TORTOISE_MCP_API_KEY}`) and it is **lazy**:
+its cold handshake routinely exceeds pi's default connect budget, and the same entry ships to
+memory-constrained cloud cells where an eager server would block every session start. Call
+`mcp_load tortoise` before you read the graph.
+
+It was a local stdio server (`${TORTOISE_HOME}/.venv/bin/python3 -m tortoise.mcp_server` against a
+local FalkorDB) until `graph-mcp-provision`: that shape needs a tortoise checkout, a venv and a
+local database, none of which exists on a cell — so cells shipped no MCP config at all and every
+cell lane wrote `GRAPH-UNREACHABLE`. The database target is resolved SERVER-SIDE; a client needs
+only the endpoint and the key (`TORTOISE_MCP_API_KEY`, the standard name per `skills/research/SKILL.md` and #5153/#5343; the legacy `TORTOISE_API_KEY` is the alias). `tortoise` is lazy, and
+so is every other base server (`mcp_load` on demand) — the word "other" used to be here, which read
+as "tortoise is the one eager exception" in the paragraph that says it is lazy. **There is no `exa`** — it was uninstalled by
 owner ruling (2026-10-31: *"exa should be uninstalled because I never wanted it.
 external research should be perplexity"*), which reverses #419's "demote to lazy"
 arrangement. External search is Perplexity: the `seo-intelligence` MCP server
 (`perplexity_research` / `perplexity_search`, rung 1) or the built-in `web_search`
-tool (rung 2). `tortoise` is launched
-with `${TORTOISE_HOME}/.venv/bin/python3` (the venv has `fastmcp`; global
-python3 does not).
+tool (rung 2).
 
 ## Cold-start retry (#802)
 
