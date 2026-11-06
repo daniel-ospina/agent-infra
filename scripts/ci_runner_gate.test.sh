@@ -69,6 +69,20 @@ CMUX_LOG="$T/cmux.log"
 #                  would age out of (or into) the threshold as the suite runs. GH_QUEUE_OLDEST_AT
 #                  overrides it with a literal timestamp, which is how the unparseable case is built.
 #   GH_INPROGRESS  the in_progress count the absorption leg reads (default 2 — a repo being served)
+#   GH_QUEUE_ROWS_SPEC  the queue PAGE's runs OLDEST FIRST, as `id:age_seconds` pairs separated by
+#                  `;` — how the head scan (agent-infra#2344) is given a page whose HEAD is a ghost
+#                  run and whose real demand sits behind it. Ages are rendered AT CALL TIME for the
+#                  same reason as GH_QUEUE_OLDEST_AGE. Unset = ONE row: the head id at
+#                  GH_QUEUE_OLDEST_AGE, which is what every pre-#2344 arm means by "the queue".
+#   GH_DEMAND_GHOST_IDS  space-separated run ids whose jobs read answers "ZERO jobs in queued
+#                  status" — the GHOST SHAPE, which is rc 0 with no output, NOT a failure. The
+#                  distinction is the point of #2344: a readable zero discounts a run as backlog, a
+#                  failed read must not.
+#   GH_DEMAND_PAGE2_IDS  space-separated run ids whose QUEUED job lives beyond the FIRST page of
+#                  `.../jobs` — i.e. the read answers the ghost shape UNLESS it is paginated. GitHub
+#                  lists a run's jobs in creation order and defaults to 30 per page, so on a big
+#                  matrix run the jobs still queued are exactly the ones past page 1; a reader that
+#                  stops at page 1 sees "no queued job" on a run that has one (#2344 review P1).
 #   GH_MODE        queued-null | queued-empty | inprog-null | inprog-fail | oldest-junk |
 #                  enum-fail | enum-garbage | enum-badtab | ok
 #   GH_FALLBACK_N  per-page count of fallback-labelled runners (current_mode → github|local)
@@ -119,11 +133,31 @@ fi
 # minted when the suite starts would drift across (or into) the threshold while the suite runs.
 queue_oldest_at() {
   if [ -n "${GH_QUEUE_OLDEST_AT:-}" ]; then printf '%s' "$GH_QUEUE_OLDEST_AT"; return; fi
+  ts_ago "${GH_QUEUE_OLDEST_AGE:-30}"
+}
+# ts_ago <seconds> — an RFC-3339 UTC stamp rendered at CALL time (see queue_oldest_at).
+ts_ago() {
   python3 -c '
 import datetime, sys
 now = datetime.datetime.now(datetime.timezone.utc)
 print((now - datetime.timedelta(seconds=int(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))
-' "${GH_QUEUE_OLDEST_AGE:-30}"
+' "$1"
+}
+# queue_rows_field — the 4th field of the queue read: the page's `id,created_at` pairs, OLDEST
+# FIRST, `;`-joined. Derived from GH_QUEUE_ROWS_SPEC when set, else the single head row.
+queue_rows_field() {
+  if [ -n "${GH_QUEUE_ROWS_SPEC:-}" ]; then
+    _out=""; _rest="${GH_QUEUE_ROWS_SPEC}"
+    while [ -n "$_rest" ]; do
+      _pair="${_rest%%;*}"
+      case "$_rest" in *';'*) _rest="${_rest#*;}" ;; *) _rest="" ;; esac
+      [ -n "$_pair" ] || continue
+      _out="${_out:+$_out;}$(printf '%s' "${_pair%%:*}"),$(ts_ago "${_pair#*:}")"
+    done
+    printf '%s' "$_out"
+    return
+  fi
+  printf '%s,%s' "${GH_HEAD_RUN_ID-4001}" "$(queue_oldest_at)"
 }
 # ⛔ CONSUME `--input -` (the label PUT body), because the REAL gh does. The gate calls
 # `printf '%s' "$body" | gh api -X PUT … --input -` under `set -o pipefail`, so a double that
@@ -206,6 +240,28 @@ case "$*" in
       fail) printf 'HTTP 500: upstream error\n' >&2; exit 1 ;;
       none) exit 0 ;;
       *)
+        # ⛔ A RUN IN `status=queued` WHOSE JOBS WERE NEVER CREATED (#2344): the read SUCCEEDS and
+        # answers "no jobs in queued status", which the gate must read as rc 0 + empty output — the
+        # ghost shape — and never as a failed read. `GH_DEMAND_GHOST_IDS` names those runs; it is
+        # checked BEFORE the answer shapes below so a ghost can sit anywhere in the queue page.
+        # ⛔ THE RUN ID IS EXTRACTED FROM A URL THAT MAY CARRY A QUERY STRING (`?per_page=100`), and an
+        # EMPTY id must never be matched: `*" ${_rid} "*` with an empty id is `*"  "*`, which matches
+        # the empty id-list and answers the ghost shape for EVERY run — measured while adding the
+        # pagination arm, where it turned 300+ assertions red with a plausible-looking "all runs are
+        # ghosts" reading instead of a stub error.
+        _rid=""
+        for _a in "$@"; do
+          case "$_a" in */actions/runs/*/jobs*)
+            _rid="${_a#*/actions/runs/}"; _rid="${_rid%%/*}"; _rid="${_rid%%\?*}" ;;
+          esac
+        done
+        if [ -n "$_rid" ]; then
+          case " ${GH_DEMAND_GHOST_IDS:-} " in *" ${_rid} "*) exit 0 ;; esac
+          # …and the run whose queued job is on page 2 answers the same way to an UNPAGINATED read.
+          case " ${GH_DEMAND_PAGE2_IDS:-} " in
+            *" ${_rid} "*) case "$*" in *--paginate*) ;; *) exit 0 ;; esac ;;
+          esac
+        fi
         # ⛔ `GH_DEMAND_JOBS` IS `|`-SEPARATED, ONE ENTRY PER QUEUED JOB, and the stub renders the ANSWER
         # THE GATE'S jq ASKED FOR — per-job sets, or their UNION. Without that distinction a mutation
         # that reverts the gate to the union form cannot be detected here at all: the stub would hand
@@ -326,18 +382,31 @@ case "$*" in
     esac
     exit 0 ;;
   *"status=queued"*)
-    # The stub speaks the REAL jq shape: `<count> TAB <oldest created_at> TAB <oldest run id>`
-    # (`@tsv`), with empty trailing fields when nothing is queued. The head run id is the third field
-    # because the DEMAND read (`/actions/runs/{id}/jobs`, `actions:read`) hangs off it — agent-infra#2931.
+    # The stub speaks the REAL jq shape: `<count> TAB <oldest created_at> TAB <oldest run id> TAB
+    # <page order>` (`@tsv`), with empty trailing fields when nothing is queued. The head run id is
+    # the third field because the DEMAND read (`/actions/runs/{id}/jobs`, `actions:read`) hangs off
+    # it — agent-infra#2931 — and the fourth is the OLDEST-FIRST `id,created_at` pairs the head scan
+    # walks (agent-infra#2344): a run id alone cannot tell the scan WHICH run is older, and the age
+    # has to come from the run the scan chooses.
     case "${GH_MODE:-ok}" in
       queued-null)  printf 'null\t\n' ;;
       queued-empty) printf '\n' ;;
-      oldest-junk)  printf '%s\tWed Oct 27 13:00:00 2026\t%s\n' "${GH_QUEUED:-5}" "${GH_HEAD_RUN_ID-4001}" ;;
+      # The unparseable head stamp must be unparseable WHERE THE GATE NOW READS IT — the row the scan
+      # picks — so it is carried in the order field too; a fixture that only poisoned field 2 would
+      # leave the arm green for the wrong reason.
+      oldest-junk)  printf '%s\tWed Oct 27 13:00:00 2026\t%s\t%s,Wed Oct 27 13:00:00 2026\n' "${GH_QUEUED:-5}" "${GH_HEAD_RUN_ID-4001}" "${GH_HEAD_RUN_ID-4001}" ;;
       *)
         if [ "${GH_QUEUED:-5}" = 0 ]; then
-          printf '0\t\n'
+          printf '0\t\t\t\n'
         else
-          printf '%s\t%s\t%s\n' "${GH_QUEUED:-5}" "$(queue_oldest_at)" "${GH_HEAD_RUN_ID-4001}"
+          # ⛔ FIELD 2 IS THE HEAD OF THE SPEC, NOT A SEPARATE FIXTURE (agent-infra#2344). The pre-fix
+          # gate computed its age from `min(created_at)` i.e. from field 2 alone; a stub whose field 2
+          # disagreed with the row order would let the OLD gate compute a healthy 30 s age over a page
+          # whose real head is a 30-day ghost — and every #2344 arm would stay green against it, which
+          # is exactly the vacuity this suite exists to prevent.
+          _rows="$(queue_rows_field)"
+          _head="${_rows%%;*}"
+          printf '%s\t%s\t%s\t%s\n' "${GH_QUEUED:-5}" "${_head#*,}" "${_head%%,*}" "$_rows"
         fi ;;
     esac
     exit 0 ;;
@@ -864,6 +933,115 @@ assert_contains "$OUT" "queued=0" "an idle repo reports the zero it read"
 assert_not_contains "$OUT" "UNREADABLE" "an empty queue is a readable zero, not an unreadable one"
 assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "an idle repo records mode=github"
 
+# ⛔ agent-infra#2344 — A QUEUED *RUN* IS NOT A QUEUED *JOB*.
+# GitHub leaves a run whose jobs were never created in `status=queued` FOREVER (it cannot be
+# cancelled — 409 — or deleted), and such a run sits at the HEAD of the queue. Because the
+# throughput leg's age came from `min(created_at)` over every run GitHub calls queued, one such
+# record made the age clause true on EVERY pass for the rest of the repo's life. Measured
+# 2026-11-06: daniel-ospina/agent-infra's head was 2,612,687 s (30.2 days) old with ZERO jobs, over
+# a repo whose real demand was 11 h old. The consequence is not a wrong number in a log: the gate
+# engages the local pool whenever nothing happens to be executing, and routing CI onto the agent
+# fleet's own box is the 2026-10-12 harm the fallback-only rule exists to prevent.
+# The predicate is POSITIVE EVIDENCE, not age: a run is discounted only when a READABLE read shows
+# zero jobs in `queued` status. (Age cannot express it — measured the same day, tortoise's real
+# demand head was 28 h old WITH a queued job, and 8-11 h old zero-job runs exist too.)
+ echo "── #2344: a queue of GHOST runs is not a stall — nothing is waiting for a runner ──"
+run_gate ghost-only GH_QUEUED=3 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002 4003" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2591000;4003:2590000" --
+assert_eq "$RC" "0" "a ghost-only queue exits 0 (it acts, it does not fail)"
+assert_contains "$OUT" "ghost_runs=3" "the probe reports the ghost records it proved"
+assert_contains "$OUT" "queued_demanding=0" "none of the three is counted as demand"
+assert_contains "$OUT" "oldest_queued_s=0" "the age is the empty queue's, not a 30-day ghost's"
+assert_contains "$OUT" "ghost records, not backlog" "the pass NAMES why the records are not backlog"
+assert_not_contains "$OUT" "not absorbing" "a ghost-only queue is NOT read as a stall"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "a ghost-only queue keeps the gate on GitHub-hosted"
+assert_not_contains "$(put_body_for 101)" "ubuntu-latest" "a ghost-only queue never ARMS a runner (the fresh box's PUT is the strip to its own pool label)"
+
+# …and the real head BEHIND the ghosts is the one the age comes from: the ghosts are skipped, the
+# leg still fires on genuine stuck demand, and it fires on the demand's own age.
+echo "── #2344: with ghosts in front, the age is the OLDEST RUN THAT HAS A QUEUED JOB ──"
+run_gate ghost-head GH_QUEUED=3 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:9000;4003:60" --
+assert_eq "$RC" "0" "a queue with a ghost head still exits 0"
+assert_contains "$OUT" "ghost_runs=1" "exactly the ONE provable ghost is discounted"
+assert_contains "$OUT" "queue_head_run=4002" "the head is the oldest run that HAS a queued job"
+assert_not_contains "$OUT" "oldest_queued_s=259" "the ghost's 30-day age is NOT the queue's age"
+assert_contains "$OUT" "not absorbing" "the leg still fires on genuine stuck demand behind the ghost"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "stuck demand behind a ghost still engages the pool"
+
+# …and the LENGTH leg counts runs that could occupy a slot: ghosts inflate it, so three of them in a
+# ten-deep queue must not cross a threshold of ten.
+echo "── #2344: ghosts do not count toward the length threshold ──"
+run_gate ghost-count GH_QUEUED=10 GH_INPROGRESS=4 GH_DEMAND_GHOST_IDS="4001 4002 4003" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000;4003:2580000;4004:120" --
+assert_eq "$RC" "0" "a 10-deep queue with 3 ghosts exits 0"
+assert_contains "$OUT" "ghost_runs=3" "the ghost population is reported"
+assert_contains "$OUT" "queued_demanding=7" "the length leg sees 7 runs, not the raw 10"
+assert_not_contains "$OUT" "queue/component/incident leg" "3 ghosts do not push a 7-run queue over the threshold"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "an inflated count does not engage the pool"
+
+# ⛔ THE OTHER DIRECTION, and it is the one that would be silent: an UNREADABLE jobs read must never
+# be read as "no queued job". Discounting on a failed call drops real demand, so the run stays the
+# head and its age stands — the pre-#2344 behaviour, loudly.
+echo "── #2344: an unreadable jobs read discounts NOTHING (a failed read is not a ghost) ──"
+run_gate ghost-unreadable GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND_MODE=fail \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:9000" --
+assert_eq "$RC" "0" "an unreadable jobs read does not refuse the pass (demand is narrowed, not erased)"
+assert_contains "$OUT" "jobs read FAILED" "the failure is NAMED with the run it happened on"
+assert_contains "$OUT" "no discount" "the pass says the run was NOT discounted"
+assert_contains "$OUT" "ghost_runs=0" "nothing was proved a ghost, so nothing was discounted"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "the run's age still stands, so stuck demand still engages the pool"
+
+# ⛔ THE JOBS READ IS PAGINATED (#2344 review P1): GitHub lists a run's jobs in CREATION order,
+# 30 per page by default, so the jobs still `queued` on a >30-job matrix run are exactly the ones
+# past page 1. An unpaginated read answers "no queued job" and the head scan discounts a run that
+# HAS one — the fail-open direction, newly load-bearing because that shape is now positive evidence.
+echo "── #2344: a queued job BEYOND the first jobs page is still demand, not a ghost ──"
+run_gate ghost-page2 GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND_PAGE2_IDS="4001" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:9000" --
+assert_eq "$RC" "0" "a demand head on page 2 exits 0"
+assert_contains "$OUT" "ghost_runs=0" "the run with a queued job past page 1 is NOT discounted"
+assert_contains "$OUT" "queue_head_run=4001" "it stays the queue head (its age is the clock)"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "the age still stands, so stuck demand still engages the pool"
+
+# ⛔ THE SCAN IS BOUNDED, and a bound that runs out is a COULD-NOT-MEASURE — never "no demand" (that
+# would strip the pool during a real stall) and never "the ghost's age" (that is the defect).
+echo "── #2344: a scan window that is entirely ghosts, with more queue behind it, REFUSES ──"
+run_gate ghost-window GH_QUEUED=40 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002 4003 4004 4005" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000;4003:2580000;4004:2570000;4005:2560000;4006:120" \
+  CI_GATE_QUEUE_THRESHOLD=100 --
+assert_eq "$RC" "2" "a ghost-only scan window with real queue behind it → exit 2"
+assert_contains "$OUT" "beyond the 5-run scan window" "the refusal names the bound it ran out of"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a refused head scan advanced no state file"
+assert_not_contains "$(cat "$GH_LOG")" "-X PUT" "a refused head scan relabelled no runner"
+# …and the bound is an OPERAND like every other one here: a zero or non-numeric value would silently
+# disarm the leg (every non-empty queue unmeasurable), so it is refused instead of defaulted.
+echo "── #2344: the head-scan bound is shape-checked like every other operand ──"
+run_gate ghost-bound-zero GH_QUEUED=5 GH_INPROGRESS=2 CI_GATE_QUEUE_HEAD_SCAN_MAX=0 --
+assert_eq "$RC" "2" "a zero scan bound → exit 2 (it would disarm the leg, not bound it)"
+assert_contains "$OUT" "scan bound is ZERO" "a zero scan bound names the misconfiguration"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "a zero scan bound advanced no state file"
+run_gate ghost-bound-junk GH_QUEUED=5 GH_INPROGRESS=2 CI_GATE_QUEUE_HEAD_SCAN_MAX=abc --
+assert_eq "$RC" "2" "an unreadable scan bound → exit 2"
+assert_contains "$OUT" "scan bound UNREADABLE" "an unreadable scan bound names the read failure"
+# …and a read that CONTRADICTS ITSELF (more ghost rows than the depth it reports) is REFUSED rather
+# than clamped to "no demand" — the clamp is the direction that strips the pool during a real stall.
+echo "── #2344: a queue read that contradicts its own depth is REFUSED ──"
+run_gate ghost-inconsistent GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000;4003:9000" --
+assert_eq "$RC" "2" "more ghost rows than the reported depth → exit 2"
+assert_contains "$OUT" "INCONSISTENT" "the refusal names the contradiction, not a clamp"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "an inconsistent queue read advanced no state file"
+# ⛔ …AND THE SAME CONTRADICTION IS REFUSED ON THE ALL-GHOSTS PATH (review P2). There, `scanned` is
+# booked as the ghost count, so a `>=` test clamped the contradiction into a readable "no demand" —
+# the fail-open direction, on the very branch whose comment rejects clamping.
+run_gate ghost-inconsistent-all GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000" --
+assert_eq "$RC" "2" "two ghost rows over a depth of 1 → exit 2 on the all-ghosts path too"
+assert_contains "$OUT" "INCONSISTENT" "the all-ghosts contradiction is NAMED, never clamped to zero"
+assert_not_contains "$OUT" "ghost records, not backlog" "it is not read as a complete measurement"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "the all-ghosts contradiction advanced no state file"
+
 # ⛔ A LEG THAT ERRORS is neither healthy NOR unhealthy-but-act (#2904): every unreadable input below
 # must exit 2, leave the mode alone, notify nothing and relabel nothing.
 echo "── #2904: an unreadable absorption read must FAIL CLOSED (no action either way) ──"
@@ -949,7 +1127,7 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "local" "a stuc
 # signals it is supposed to combine, and the measured false positive (age alone) or the measured
 # transient (in_progress alone) would come back with a green suite.
 echo "── #2904: MUTATIONS — both halves of the leg are load-bearing ──"
-MUT_ANCHOR='  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then'
+MUT_ANCHOR='  if [ "$queued_demanding" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then'
 mutant_gate() { # <out> <replacement if-line>
   python3 - "$GATE" "$1" "$MUT_ANCHOR" "$2" <<'PY'
 import sys

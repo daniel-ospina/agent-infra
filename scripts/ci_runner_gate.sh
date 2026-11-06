@@ -99,6 +99,31 @@ QUEUE_THRESHOLD="${CI_GATE_QUEUE_THRESHOLD:-10}"
 # throughput leg's age is only the HEAD's age when the page held the WHOLE queue; a saturated page
 # turns it into a lower bound (review P2 — see the saturated-page refusal inside `evaluate`).
 QUEUE_PAGE=100
+# ⛔ HOW MANY QUEUED RUNS THE HEAD SCAN MAY READ (agent-infra#2344), and why a bound is enough.
+# A run in `status=queued` is NOT evidence that anything is waiting for a runner. GitHub leaves a run
+# whose jobs were never created in that state FOREVER, and such a run cannot be cancelled (409
+# "Cannot cancel a workflow run that has not been queued yet") or deleted. Measured 2026-11-06:
+# daniel-ospina/agent-infra carried three runs created 2026-10-07 that were still `queued` 30 days
+# later with ZERO jobs, and they sat at the HEAD of the queue — so `oldest_queued_s` read 2,612,687 s
+# (30.2 days) on a repo whose real demand was hours old. That number is not a measurement of the
+# queue: it makes the throughput leg's age clause true on EVERY pass for the rest of the repo's life,
+# i.e. it turns the fallback ON whenever nothing happens to be executing (the live gate logged
+# `demand: the queue HEAD (run 41278300739) has no QUEUED job` on 2026-11-01), and what that costs is
+# the 2026-10-12 harm the fallback-only rule exists to prevent — CI competing with the agent fleet on
+# the same box.
+# A run is discounted as a GHOST only when a READABLE jobs read shows ZERO jobs in `queued` status:
+# positive evidence, never an age guess. ⛔ AGE IS NOT THE PREDICATE, and the measurement says so —
+# the same day, tortoise's real demand head was 28 h old WITH a queued job (run 42064937107, 1 of its
+# 22 jobs queued), so an "ignore runs older than a day" rule would discard genuine backlog; while
+# 8-11 h old runs with zero queued jobs also exist (GitHub creates a run's jobs progressively), which
+# no age rule can separate from the 30-day ones. "Has a queued job" is also exactly the property that
+# makes the fallback ABLE to help: a run with no queued job has nothing to schedule onto the pool.
+# The scan is BOUNDED because each candidate costs one jobs read on the repo's `actions:read` surface.
+# Ghosts accumulate at the OLD end (they never start while newer runs come and go), which is both
+# where they are and where the age comes from; 5 covers the measured population (3 on agent-infra, 3
+# on tortoise) with headroom. A queue whose whole scan window is ghosts while MORE runs are still
+# queued behind it is refused rather than guessed at (see the scan in `evaluate`).
+QUEUE_HEAD_SCAN_MAX="${CI_GATE_QUEUE_HEAD_SCAN_MAX:-5}"
 # ── the THROUGHPUT (absorption) leg — agent-infra#2904 ─────────────────────────────────────────
 # ⛔ LENGTH IS NOT ABSORPTION. `queued` below the length threshold says "not a stampede"; it cannot
 # say "work is moving".
@@ -471,24 +496,42 @@ $labels" ;;
   return 0
 }
 
-# queue_demand <run id> — WHAT THE QUEUE IS ASKING FOR, from the jobs endpoint.
+# run_queued_demand <run id> — WHAT THE QUEUE IS ASKING FOR, from the jobs endpoint.
 # ⛔ THIS IS THE READABLE SUBSTITUTE, and it is readable on the boxes where the inventory is not:
 # `GET /repos/{o}/{r}/actions/runs/{id}/jobs` needs `actions:read` (measured 200 with the fleet
 # token), and each job carries the `labels` it requires. Measured 2026-10-28: the head job of
 # daniel-ospina/tortoise's 74-deep queue asked for exactly `ubuntu-latest`.
-# BOUND, stated: the demand is the label set of the QUEUED jobs of ONE run — normally the head (the
-# run that has waited longest, the one that decides whether the queue can move at all), with the
-# NEWEST queued run as a one-shot fallback when the head is a stale entry with no queued job left.
+# BOUND, stated: the demand is the label set of the QUEUED jobs of ONE run — the head of REAL
+# demand (the oldest run that has at least one job in `queued` status, the one that decides whether
+# the queue can move at all). ⛔ It used to fall back to the NEWEST queued run when the head had no
+# queued job; the head scan now walks the page oldest-first and stops at the first run that HAS one,
+# which answers the same question (a ghost head is skipped, not overruled by an arbitrary newer run)
+# and also fixes the AGE, which the newest-fallback never did (#2344).
 # A queue whose other runs ask for something else is not measured here, and the KV says `demand=`
 # per run, not "the whole queue".
-queue_demand() {
+#
+# ⛔ A QUEUED RUN IS NOT A QUEUED JOB (agent-infra#2344) — the primitive the head scan is built on.
+# rc 0 with NO output means the read SUCCEEDED and this run has no job in `queued` status: the GHOST
+# shape. rc 1 means the read could not be made, which is a DIFFERENT fact and must never be read as the
+# ghost one — that direction silently discounts real demand. `gh` propagates jq's failure, and an empty
+# array (`[]`) is a successful read that emits nothing, so the exit status alone carries the distinction
+# (measured against the live API 2026-11-06: the ghost run 37642335832 → rc 0, no output; a run with
+# queued jobs → rc 0, `ubuntu-latest`; a run id GitHub does not know → rc 1).
+run_queued_demand() {
   local rid="$1" out l sets=0
   case "$rid" in ''|*[!0-9]*) return 1 ;; esac
-  out="$(gh api "repos/$REPO/actions/runs/$rid/jobs" \
+  # ⛔ `--paginate` IS REQUIRED, NOT TIDINESS (review P1). GitHub's list endpoints default to 30 per
+  # page, and a RUN'S JOBS ARE LISTED IN CREATION ORDER — so on a run with more than 30 jobs the ones
+  # still in `queued` status are exactly the ones on a LATER page (this repo's own matrix runs create
+  # them progressively; the gate's census read carries the same rule at #1036/#1307, and
+  # `scripts/atomic-land.sh` measured 30-of-47 on a real check-runs response). Without it the first
+  # page answers "no queued job" on a run that HAS one, which is the GHOST shape — and since #2344
+  # made that shape load-bearing evidence, the under-read would silently DISCOUNT real demand and
+  # strip the pool during a stall. `per_page=100` keeps the ordinary run at one call; `--paginate`
+  # covers the rest, and gh applies `--jq` per page so the per-line output concatenates.
+  out="$(gh api "repos/$REPO/actions/runs/$rid/jobs?per_page=100" --paginate \
         --jq '[.jobs[]|select(.status=="queued")|.labels|sort|join(",")]|unique|.[]' 2>"$GH_ERR")" || return 1
-  # An empty answer is NOT "no demand": a matrix/`runs-on` form this read does not resolve leaves
-  # the demand unmeasured, and an unmeasured demand must not become a claim about matching.
-  [ -n "$out" ] || return 1
+  [ -n "$out" ] || return 0
   # Every LINE is one QUEUED JOB's set, and each must be spellable on its own: a job whose set cannot
   # be spelled is an UNMEASURED demand, never a claim about matching (checked per line, because a
   # multi-job run is now several lines — see DEMAND_LABELS).
@@ -500,6 +543,13 @@ queue_demand() {
   [ "$sets" -gt 0 ] || return 1
   printf '%s' "$out"
 }
+
+# ⛔ `queue_demand()` IS GONE (agent-infra#2344), and with it a contract that had no caller left: the
+# "any empty answer is unmeasured" wrapper existed for the pre-#2344 head/newest read, which the head
+# scan replaced with `run_queued_demand` — the caller that MUST tell a ghost from a failed read. A
+# retained wrapper would have been dead code whose docstring claimed a live contract; the one thing
+# worth keeping from it is its old rule, stated here: to anything that only wants LABELS, a ghost
+# run, an unspellable set and a failed read are indistinguishable, so all three are "unmeasured".
 
 # capacity_verdict <mode> — the CAPACITY answer from the counts above.
 # rc 0 = no capacity deny · rc 1 = DENY (this pass may not certify healthy capacity).
@@ -618,6 +668,12 @@ probe_status() {
 
 evaluate() {
   local summary queued comp incident parsed
+  # ⛔ DECLARED AT THE TOP, not where they are first assigned (agent-infra#2344). The head scan runs
+  # BEFORE the census and sets these; a `local X=0` further down would RESET the count the scan had
+  # already computed — a global re-declared mid-function is still a re-initialisation.
+  local QUEUE_GHOSTS=0 queued_demanding=${queued:-0} candidates scanned cand cand_id cand_created cand_demand
+  local demand_head_id demand_head_created oldest_created head_run_id
+
   summary="$(probe_status)" || { log "status probe FAILED (network/status api)"; return 2; }
 
   parsed="$(printf '%s' "$summary" | python3 -c '
@@ -661,6 +717,10 @@ print(comp, len(inc))
   # ⛔ ONE READ CARRIES BOTH QUEUE FACTS (agent-infra#2904): the count the existing leg already
   # used, and the `created_at` of the OLDEST queued run the throughput leg needs. `per_page=$QUEUE_PAGE`
   # rather than 1 so the page holds the whole queue and `min(created_at)` is the true head of it.
+  # ⛔ AND THE ROW ORDER, so the head scan (agent-infra#2344) can walk the queue oldest-first from
+  # ONE read instead of a second page fetch: `id,created_at` pairs, `;`-joined, oldest first. The
+  # whole page is emitted and the SCAN bound is applied in the shell, so the read has one shape and
+  # the bound has one home (a jq-level slice would put the same number in two places).
   # ⛔ THE PAGE CAP CAN HIDE THE OLDEST RUN (review P2 — this used to be asserted in prose only).
   # The runs endpoint is newest-first, so a queue LARGER than the page yields the newest page's min,
   # i.e. a LOWER BOUND on the head age. That was previously claimed to be harmless because "such a
@@ -670,20 +730,19 @@ print(comp, len(inc))
   # `queued >= QUEUE_THRESHOLD`), so the saturated page only matters where NOTHING can decide —
   # that case is now refused by name, before the throughput leg, further down.
   queue_row="$(gh api "repos/$REPO/actions/runs?status=queued&per_page=$QUEUE_PAGE" \
-      --jq '[.total_count, (([.workflow_runs[]]|min_by(.created_at)|.created_at)//""), (([.workflow_runs[]]|min_by(.created_at)|.id)//""), ((.workflow_runs[0].id)//"")]|@tsv' 2>/dev/null)" \
+      --jq '[.total_count, (([.workflow_runs[]]|min_by(.created_at)|.created_at)//""), (([.workflow_runs[]]|min_by(.created_at)|.id)//""), (([.workflow_runs[]]|sort_by(.created_at)|map("\(.id),\(.created_at)"))|join(";"))]|@tsv' 2>/dev/null)" \
     || { log "queue probe FAILED (gh api)"; return 2; }
-  # FOUR fields from one read: the count the length leg uses, the head's age for the throughput leg,
-  # and TWO run ids for the DEMAND read (agent-infra#2931 — "which label is the queue asking for" is
-  # answerable with `actions:read`, which the fleet token HAS, even where the runner inventory is
-  # 403): the OLDEST queued run (the head that has waited longest) and the NEWEST one. Both are
-  # needed because a STALE head has nothing to ask — measured 2026-10-28, daniel-ospina/agent-infra's
-  # queue head was 20.9 days old and its run returned ZERO jobs, so a head-only demand read reported
-  # `demand=unknown` over a queue that was asking for `ubuntu-latest` all along. Extra fields are
-  # optional: a two-field body still parses, and an absent id leaves the demand unmeasured instead of
-  # failing a pass that needs nothing else from it.
-  local q1 q2 q3 q4
+  # FOUR fields from one read: the count the length leg uses, the oldest run's `created_at`, the
+  # oldest run's id, and the whole page ORDERED OLDEST-FIRST (`id,created_at` pairs). The order is
+  # what the head scan walks (agent-infra#2344), and the id/age are what it falls back to when a
+  # proxy drops the new field. ⛔ THE RUN ID IS ALSO THE DEMAND READ's handle (agent-infra#2931 —
+  # "which label is the queue asking for" is answerable with `actions:read`, which the fleet token
+  # HAS, even where the runner inventory is 403). Extra fields are optional: a two-field body still
+  # parses, and an absent field leaves one question unmeasured instead of failing a pass that needs
+  # nothing else from it.
+  local q1 q2 q3 q4 queue_rows
   IFS=$'\t' read -r q1 q2 q3 q4 <<<"$queue_row"
-  queued="${q1:-}"; oldest_created="${q2:-}"; head_run_id="${q3:-}"; newest_run_id="${q4:-}"
+  queued="${q1:-}"; oldest_created="${q2:-}"; head_run_id="${q3:-}"; queue_rows="${q4:-}"
   # ⛔ THE SECOND READ IS THE ABSORPTION FIELD, and it is the ONLY input the throughput leg adds
   # (#2904). `in_progress` is the count of runs GitHub is currently executing for this repo; in
   # mode=github that is hosted executing, because the pool does not advertise `ubuntu-latest` and no
@@ -693,36 +752,11 @@ print(comp, len(inc))
   in_progress_raw="$(gh api "repos/$REPO/actions/runs?status=in_progress&per_page=1" --jq '.total_count' 2>"$GH_ERR")" \
     || { log "in-progress probe FAILED (gh api) — FAIL-CLOSED, changing nothing; $(head -c 300 "$GH_ERR" 2>/dev/null)"; return 2; }
   in_progress="${in_progress_raw%%$'\n'*}"
-  # THE QUEUE-WAIT CLOCK, computed here so the log line can carry seconds rather than a timestamp.
-  # Empty when there is no queued run to age (a readable zero, not a failed read); a timestamp that
-  # cannot be parsed, or one in the FUTURE (a clock skew no reading can resolve), leaves it empty and
-  # the shape check below refuses the whole pass — it is never rounded down to "recently queued" and
-  # never rounded up to "stalled".
-  oldest_queued_s=""
-  case "$oldest_created" in
-    '') : ;;
-    *)  oldest_queued_s="$(python3 -c '
-import datetime, sys
-t = sys.argv[1]
-try:
-    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
-except ValueError:
-    sys.exit(1)
-age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
-if age < 0:
-    sys.exit(1)
-print(age)
-' "$oldest_created" 2>/dev/null)" || oldest_queued_s="" ;;
-  esac
 
-  # A queue with NOTHING in it has no head to age. That is a readable zero (an idle repo), not a
-  # failed read: it leaves the leg inert instead of refusing the pass. Guarded as a STRING compare so
-  # it cannot run before `queued` has been shape-checked as a number.
-  if [ "$queued" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
-
-  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
-  ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
-
+  # ⛔ THE SHAPE CHECK NOW PRINTS THE VALUE AS `queued=<value>` (agent-infra#2344): the probe line
+  # below carries the SCAN's result and can only be written once `queued` is a number, so this
+  # message is what an unreadable count is reported by — and it names the value the same way the
+  # probe line does, so "the gate printed the value it could not read" stays true on both paths.
   # ⛔ SHAPE-CHECK THE COUNT TOO (agent-infra#1704). `comp` was shape-checked; `queued` was not, so
   # a successful probe that yielded `null`/empty (a schema change, a proxy body, a truncated read)
   # made `[ "$queued" -ge "$QUEUE_THRESHOLD" ]` ERROR (status 2) — and the `||` chain reads a failed
@@ -730,7 +764,7 @@ print(age)
   # local pool: a state change taken on a value that was never read. A count that is not a
   # non-negative integer is unreadable, so this is could-not-measure (return 2) — never healthy.
   case "$queued" in
-    '' | *[!0-9]*) log "queued count UNREADABLE ('${queued}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    '' | *[!0-9]*) log "queued count UNREADABLE (queued=${queued}) — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
   # ⛔ THE THRESHOLD IS THE OTHER OPERAND OF THE SAME NUMERIC TEST (review D1), so an unreadable
@@ -752,6 +786,126 @@ print(age)
     ??????????*) log "queue threshold OUT OF RANGE ('${QUEUE_THRESHOLD}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
 
+  # ── THE HEAD SCAN: WHICH QUEUED RUN IS THE QUEUE'S ACTUAL HEAD? (agent-infra#2344) ──────────────
+  # ⛔ THE QUESTION THIS ANSWERS, and why the answer was wrong before it existed. The throughput
+  # leg's age came from `min(created_at)` over `status=queued`, i.e. from the oldest run that is
+  # REPORTED as queued — and GitHub keeps a run whose jobs were never created in that state
+  # permanently (measured 2026-11-06: three runs on daniel-ospina/agent-infra created 2026-10-07
+  # were still `queued` 30 days later with zero jobs, so the leg measured 2,612,687 s of "queue
+  # wait" on a repo whose real demand was hours old). A run is demand for a RUNNER only if it has a
+  # job in `queued` status; nothing else can be scheduled, and nothing else is evidence that a
+  # runner is missing. So the head is the OLDEST run that has one, and each run in front of it that
+  # provably has none is a ghost — counted, reported, and excluded from the length leg too (it is a
+  # run that will never occupy a slot).
+  # ⛔ EVERY EXIT BELOW IS THE FILE'S OWN DOCTRINE: a ghost is discounted on POSITIVE evidence (a
+  # readable read showing zero queued jobs), never on an age guess, and an UNREADABLE read is not
+  # evidence of anything — it keeps the run as the head, which is exactly the pre-#2344 behaviour,
+  # rather than discounting real demand on a failed call.
+  case "$QUEUE_HEAD_SCAN_MAX" in
+    '' | *[!0-9]*) log "queue head scan bound UNREADABLE ('${QUEUE_HEAD_SCAN_MAX}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    ??????????*)  log "queue head scan bound OUT OF RANGE ('${QUEUE_HEAD_SCAN_MAX}') — FAIL-CLOSED, changing nothing"; return 2 ;;
+    0)            log "queue head scan bound is ZERO ('${QUEUE_HEAD_SCAN_MAX}') — a non-empty queue could never be measured, so this would disarm the leg rather than bound it; FAIL-CLOSED, changing nothing"; return 2 ;;
+  esac
+  QUEUE_GHOSTS=0
+  queued_demanding="$queued"
+  DEMAND_LABELS=""
+  demand_head_id=""; demand_head_created=""
+  if [ "$queued" -gt 0 ]; then
+    # Oldest-first candidates. An absent order field (a two-field body, or a proxy that drops it)
+    # degrades to the single head id the read DID carry, so the pass keeps pre-#2344 behaviour
+    # instead of failing over a field it never needed before.
+    candidates="$queue_rows"
+    if [ -z "$candidates" ] && [ -n "$head_run_id" ]; then
+      candidates="$head_run_id,$oldest_created"
+    fi
+    if [ -z "$candidates" ]; then
+      log "queue HEAD UNIDENTIFIABLE: queued=$queued but the read carried neither the row order nor a head run id — FAIL-CLOSED, changing nothing"; return 2
+    fi
+    scanned=0
+    while IFS= read -r cand; do
+      [ -n "$cand" ] || continue
+      scanned=$((scanned + 1))
+      if [ "$scanned" -gt "$QUEUE_HEAD_SCAN_MAX" ]; then scanned=$((scanned - 1)); break; fi
+      case "$cand" in
+        *,*) cand_id="${cand%%,*}"; cand_created="${cand#*,}" ;;
+        *)   cand_id="$cand"; cand_created="" ;;
+      esac
+      case "$cand_id" in '' | *[!0-9]*) log "queue candidate row UNREADABLE ('${cand}') — FAIL-CLOSED, changing nothing"; return 2 ;; esac
+      if cand_demand="$(run_queued_demand "$cand_id")"; then
+        if [ -n "$cand_demand" ]; then
+          demand_head_id="$cand_id"; demand_head_created="$cand_created"; DEMAND_LABELS="$cand_demand"
+          break
+        fi
+        QUEUE_GHOSTS=$((QUEUE_GHOSTS + 1))
+      else
+        log "queue candidate run $cand_id: jobs read FAILED — cannot prove it is a ghost, so it STAYS the queue head (no discount); $(head -c 200 "$GH_ERR" 2>/dev/null)"
+        demand_head_id="$cand_id"; demand_head_created="$cand_created"
+        break
+      fi
+    done <<< "$(printf '%s' "$candidates" | tr ';' '\n')"
+    if [ -z "$demand_head_id" ]; then
+      # ⛔ A READ THAT CONTRADICTS ITSELF IS REFUSED ON THIS PATH TOO (review P2). The page's rows
+      # cannot outnumber the `total_count` it came with, so `scanned > queued` means the two fields
+      # disagree about what the queue IS — and booking the ghost count as `$queued` would CLAMP that
+      # contradiction into a readable "no demand", which is the fail-open direction (it strips the
+      # pool during a real stall). Checked before the clamp, not after it.
+      if [ "$scanned" -gt "$queued" ]; then
+        log "queue reading INCONSISTENT: $scanned run(s) read from a page the API reports as $queued deep — FAIL-CLOSED, changing nothing"; return 2
+      fi
+      if [ "$scanned" -eq "$queued" ]; then
+        # The WHOLE queue was read and not one run has a queued job: a COMPLETE measurement whose
+        # answer is "nothing is waiting for a runner". Not a refusal — there is nothing unread.
+        log "queue: all $queued queued run(s) report ZERO jobs in 'queued' status — ghost records, not backlog (a run GitHub reports as queued whose jobs were never created; nothing is waiting for a runner)"
+        QUEUE_GHOSTS="$queued"
+      else
+        log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status (ghost records) and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing"
+        return 2
+      fi
+    fi
+    # ⛔ A READ THAT CONTRADICTS ITSELF IS REFUSED, NOT CLAMPED. The page's rows cannot outnumber the
+    # `total_count` it came with, so a ghost count above it means the two fields disagree about what
+    # the queue IS — and the arithmetic below would then be a number nobody measured. (Clamping to 0
+    # was the alternative and it is the fail-open direction: it reads as "no demand" and strips the
+    # pool during a real stall.)
+    if [ "$QUEUE_GHOSTS" -gt "$queued" ]; then
+      log "queue reading INCONSISTENT: $QUEUE_GHOSTS ghost run(s) read from a queue the API reports as $queued deep — FAIL-CLOSED, changing nothing"; return 2
+    fi
+    queued_demanding=$((queued - QUEUE_GHOSTS))
+  fi
+
+  # THE QUEUE-WAIT CLOCK, computed here so the log line can carry seconds rather than a timestamp.
+  # ⛔ IT IS THE AGE OF THE HEAD OF REAL DEMAND (#2344), i.e. of the oldest run that HAS a queued job
+  # — `demand_head_created` from the head scan above, not `min(created_at)` over every run GitHub
+  # calls queued (a ghost run's age is unbounded and means nothing). Empty when there is no such run
+  # to age (a readable zero, not a failed read); a timestamp that cannot be parsed, or one in the
+  # FUTURE (a clock skew no reading can resolve), leaves it empty and the shape check below refuses
+  # the whole pass — it is never rounded down to "recently queued" and never rounded up to "stalled".
+  oldest_queued_s=""
+  case "$demand_head_created" in
+    '') : ;;
+    *)  oldest_queued_s="$(python3 -c '
+import datetime, sys
+t = sys.argv[1]
+try:
+    d = datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=datetime.timezone.utc)
+except ValueError:
+    sys.exit(1)
+age = int(datetime.datetime.now(datetime.timezone.utc).timestamp() - d.timestamp())
+if age < 0:
+    sys.exit(1)
+print(age)
+' "$demand_head_created" 2>/dev/null)" || oldest_queued_s="" ;;
+  esac
+
+  # A queue with NOTHING DEMANDING in it has no head to age — either nothing is queued (an idle repo)
+  # or everything in the queue is a ghost run (#2344: read, proved, and reported separately). Both are
+  # readable zeros, not failed reads: they leave the leg inert instead of refusing the pass. Guarded
+  # as a STRING compare so it cannot run before `queued_demanding` has been shape-checked as a number.
+  if [ "$queued_demanding" = "0" ] && [ -z "$oldest_queued_s" ]; then oldest_queued_s=0; fi
+
+  log "probe: actions_component=$comp actions_incidents=$incident queued=$queued queued_demanding=$queued_demanding ghost_runs=$QUEUE_GHOSTS queue_head_run=${demand_head_id:-none} threshold=$QUEUE_THRESHOLD oldest_queued_s=$oldest_queued_s in_progress=$in_progress queue_stuck_after_s=$QUEUE_STUCK_AFTER_S"
+  ABSORPTION_OLDEST_S="$oldest_queued_s"; ABSORPTION_IN_PROGRESS="$in_progress"; ABSORPTION_QUEUED="$queued"
+
   # ⛔ THE THROUGHPUT LEG'S OPERANDS ARE SHAPE-CHECKED EXACTLY AS THE EXISTING ONES ARE, for the
   # same reason (agent-infra#1704): an unreadable number makes `[ … -gt … ]` ERROR, and the `||`
   # chain reads a failed test as FALSE — i.e. HEALTHY — which RELABELS the pool off `ubuntu-latest`
@@ -762,10 +916,11 @@ print(age)
     '' | *[!0-9]*) log "in_progress count UNREADABLE ('${in_progress}') — FAIL-CLOSED, changing nothing"; return 2 ;;
     ??????????*)  log "in_progress count OUT OF RANGE ('${in_progress}') — FAIL-CLOSED, changing nothing"; return 2 ;;
   esac
-  # A queued run exists, so its age MUST be a measurement: empty here means the timestamp did not
-  # parse (or was in the future), which is a failed read of the queue head, not "young queue".
-  if [ "$queued" -gt 0 ] && [ -z "$oldest_queued_s" ]; then
-    log "oldest queued timestamp UNREADABLE ('${oldest_created}') — FAIL-CLOSED, changing nothing"; return 2
+  # A run WITH A QUEUED JOB exists, so its age MUST be a measurement: empty here means the timestamp
+  # did not parse (or was in the future), which is a failed read of the queue head, not "young
+  # queue".
+  if [ "$queued_demanding" -gt 0 ] && [ -z "$oldest_queued_s" ]; then
+    log "oldest queued timestamp UNREADABLE ('${demand_head_created}') — FAIL-CLOSED, changing nothing"; return 2
   fi
   case "$oldest_queued_s" in
     '' | *[!0-9]*) log "oldest queued age UNREADABLE ('${oldest_queued_s}') — FAIL-CLOSED, changing nothing"; return 2 ;;
@@ -812,15 +967,12 @@ print(age)
   # reason the queue's side of the question stays measurable on a box whose inventory is 403. It does
   # NOT fail the pass: an unmeasured demand narrows the capacity claim (`demand=unknown`) instead of
   # erasing it, because the three STATES are still measured and are still worth reporting.
-  DEMAND_LABELS=""
-  if [ "$queued" -gt 0 ] && [ -n "$head_run_id" ]; then
-    DEMAND_LABELS="$(queue_demand "$head_run_id")" || DEMAND_LABELS=""
-    if [ -z "$DEMAND_LABELS" ] && [ -n "$newest_run_id" ] && [ "$newest_run_id" != "$head_run_id" ]; then
-      DEMAND_LABELS="$(queue_demand "$newest_run_id")" || DEMAND_LABELS=""
-      [ -n "$DEMAND_LABELS" ] && log "demand: the queue HEAD (run $head_run_id) has no QUEUED job — read from the newest queued run ($newest_run_id) instead"
-    fi
-    [ -n "$DEMAND_LABELS" ] || log "demand: UNMEASURED for queued=$queued (neither the head nor the newest queued run reported a queued job's labels) — the capacity claim is narrowed to the runner states only"
-  fi
+  # ⛔ THE READ ITSELF HAPPENS IN THE HEAD SCAN above (agent-infra#2344): the first run in oldest-first
+  # order that HAS a queued job gave BOTH the demand (`DEMAND_LABELS`) and the age, so the labels are
+  # never read from a run whose age is not the one the throughput leg uses — the two used to come from
+  # different runs (the age from `min(created_at)`, the labels from the head or the newest one).
+  [ -z "$DEMAND_LABELS" ] && [ "$queued" -gt 0 ] && \
+    log "demand: UNMEASURED for queued=$queued (no scanned run reported a queued job's labels) — the capacity claim is narrowed to the runner states only"
   # ONE LINE FOR THE KEY=VALUE SURFACES (`demand=` in the census KV, the log, the deny's reason), because
   # DEMAND_LABELS is one set per line now. `;` between sets, so the union that is WRONG to match is still
   # READABLE to a human: a matrix run reads `self-hosted-arm64;self-hosted-x64`.
@@ -842,8 +994,18 @@ print(age)
   capacity_verdict "${mode:-unknown}" || CAP_DENY=1
   log "capacity: verdict=${CENSUS_VERDICT} ${CENSUS_KV} (${CENSUS_DETAIL})"
 
-  if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued" -ge "$QUEUE_THRESHOLD" ]; then
-    UNHEALTHY_LEG="queue/component/incident leg: queued=$queued (threshold $QUEUE_THRESHOLD), component=$comp, incidents=$incident"
+  # ⛔ THE LENGTH LEG COUNTS RUNS THAT COULD OCCUPY A RUNNER (#2344): `queued_demanding`, i.e. the
+  # queue minus the runs a READABLE read proved have no job in `queued` status. A ghost run will never
+  # take a slot, so counting it as backlog engages the pool early; the raw count is still logged and
+  # still bounds the saturated-page refusal below, where being over-cautious costs a refusal and not
+  # an unwanted relabel.
+  # ⛔ THE REASON LINE NEVER SPELLS THE DISCOUNTED COUNT AS `queued=` (review P3): `write_verdict`
+  # publishes `queued=` from the RAW depth on the same line, so a second `queued=` here would give one
+  # line two different values for one key and break any `grep -o 'queued=[0-9]*'` reader. The
+  # machine-readable surface keeps the raw depth (what a queue-depth consumer wants); the discount is
+  # named `demand_runs=`/`ghost_runs=` in prose and in the log.
+  if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued_demanding" -ge "$QUEUE_THRESHOLD" ]; then
+    UNHEALTHY_LEG="queue/component/incident leg: demand_runs=$queued_demanding (threshold $QUEUE_THRESHOLD; raw queued=$queued, ghost_runs=$QUEUE_GHOSTS), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
   fi
   # ⛔ A SATURATED PAGE LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather than certified
@@ -866,12 +1028,15 @@ print(age)
   # for the few seconds between a push and its first dispatch, so it needs the age floor. Fail ⇒
   # "hosted is not absorbing", which is precisely the state whose sanctioned exit is this script's
   # own fallback path — NOT a change to when the pool is offered (see the header's decision).
+  # ⛔ ALL THREE OPERANDS ARE NOW ABOUT THE SAME WORK (#2344): `queued_demanding` counts runs that have
+  # a queued job, and `oldest_queued_s` is the age of the oldest such run. Before, the age was the age
+  # of the oldest run GitHub CALLS queued — which a permanently-stuck ghost record made true forever.
   # ⛔ IT IS A DENY-ONLY LEG, and the deny holds in BOTH modes: `in_progress == 0` with a stuck head
   # says nothing at all is executing (hosted or pool), so the pool stays engaged. It never CERTIFIES
   # absorption — falling through to `return 0` is the other legs' verdict, and the reason line says
   # the absorption figures are not attributable while the pool is the thing executing (review P1).
-  if [ "$queued" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then
-    UNHEALTHY_LEG="throughput leg: queued=$queued and NO run executing while the oldest queued run has waited ${oldest_queued_s}s > ${QUEUE_STUCK_AFTER_S}s — GitHub-hosted is not absorbing the queue"
+  if [ "$queued_demanding" -gt 0 ] && [ "$in_progress" -eq 0 ] && [ "$oldest_queued_s" -gt "$QUEUE_STUCK_AFTER_S" ]; then
+    UNHEALTHY_LEG="throughput leg: demand_runs=$queued_demanding and NO run executing while the oldest queued run has waited ${oldest_queued_s}s > ${QUEUE_STUCK_AFTER_S}s — GitHub-hosted is not absorbing the queue"
     return 1   # not absorbing -> prefer local
   fi
 
