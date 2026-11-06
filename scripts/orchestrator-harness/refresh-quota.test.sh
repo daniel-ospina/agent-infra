@@ -391,9 +391,14 @@ esac
 # (open `P2-moderate` 450 against the 200 bound, 2026-11-05), so this is the live shape, not a
 # hypothetical. Asking oldest-first makes truncation lose the NEWEST members — the end the ranking
 # does not need, and the one that makes the unranked TAIL the ordering `age-second` actually asks for.
-# This pins the QUESTION the helper puts to the provider (a stub cannot emulate the provider's order,
-# so pinning the returned rows would prove nothing); the complementary half — that pool-unranked rows
+# This pins the QUESTION the helper puts to the provider — a stub cannot emulate the provider's order,
+# so pinning the returned rows would prove nothing. The complementary half — that pool-unranked rows
 # land at the TAIL in queue order — is pinned in `rank-queue.test.sh`.
+# ⛔ THIS ARM'S COMMENT PROSE TRIPPED A GUARD ONCE. A reviewer measured this file REFUSED before its
+# first assertion with an unpaired parenthesis in the comment above, and 28/0 with it removed; on this
+# box the refusal then outlived the removal and is keyed to this file's PATH rather than its bytes — the
+# same bytes under another name run 28/0 (agent-infra#3528). Recorded here so the next lane does not
+# read the refusal as this suite failing.
 mk_case order-dir 1000   # the reserve is 300: a 100-call budget refuses before the pool is built
 mk_gh "$D" "$(rows 6)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"

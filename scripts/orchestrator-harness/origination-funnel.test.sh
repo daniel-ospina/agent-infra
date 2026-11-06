@@ -2560,7 +2560,14 @@ if [ ! -r "$_PINFILE" ]; then
   bad "pin/writer: cannot read this suite's own file (\`$_PINFILE\`) — every count below would compare \"\" with \"\" and report GREEN while asserting nothing"
 else
 # ── the ok record's `why=` template, and the substitution of its two variables ──────────────────────
-_why_ok="$(grep -o 'pass completed; queue depth [^"]*' "$REFRESH" | head -1)"
+# ⛔ COMMENTS ARE NOT CODE (review P2, cycle 25): every writer-side predicate below was an UNANCHORED
+# `grep` over 6 000 comment-dense lines, so the OLD bytes quoted in a comment — which is exactly how this
+# file records a previous wording — satisfied the pin while the writer no longer wrote them. Measured:
+# regressing `_head_why` and quoting the old string in a comment stayed 288/0 GREEN, and deleting an
+# `_head_rank` arm whose value survived in a comment kept `_narms=5`. The writer is read ONCE with its
+# comment lines removed and every predicate grades that view.
+_WCODE="$(grep -v '^[[:space:]]*#' "$REFRESH")"
+_why_ok="$(grep -o 'pass completed; queue depth [^"]*' <<<"$_WCODE" | head -1)"
 case "$_why_ok" in
   *'is what dispatch takes next'*)
     _fx_tmpl="$(grep -cE "^[[:space:]]*printf 'result=ok.*why=.*queue depth" "$_PINFILE" || true)"
@@ -2585,7 +2592,11 @@ case "$_why_ok" in
       # this check exists to forbid (`queue depth 9` beside `backlog=2`) stayed GREEN when written the way
       # this file already writes such fixtures (`backlog=%s\nhanded=%s`, line 1123). Measured.
       if [ -z "$_d" ] || [ -z "$_h" ] || [ -z "$_bk" ] || [ -z "$_hd" ]; then
-        _sub_ok=0; bad "pin/writer: line $_ln is not gradable — its 'queue depth'/'head #'/'backlog='/'handed=' values do not all resolve (depth='$_d' head='$_h' backlog='$_bk' handed='$_hd'); a fixture whose numbers come from \`printf\` placeholders must be checked by rendering it"
+        # ⛔ SAY WHAT THE CHECK REQUIRES (review P3): this one grades LITERAL numbers, and telling the
+        # author it "must be checked by rendering it" pointed at a path nothing in the suite provides. A
+        # fixture formatting its numbers through `printf` placeholders is fine for the ARITY checks above
+        # — it just cannot prove a SUBSTITUTION here, so the requirement is stated instead.
+        _sub_ok=0; bad "pin/writer: line $_ln cannot prove a substitution — this check grades LITERAL numbers, and its 'queue depth'/'head #'/'backlog='/'handed=' values do not all resolve as digits (depth='$_d' head='$_h' backlog='$_bk' handed='$_hd'). Write the ok fixtures with literal numbers, or assert their substitution beside the fixture that renders them"
       elif [ "$_d" != "$_bk" ] || [ "$_h" != "$_hd" ]; then
         _sub_ok=0; bad "pin/writer: line $_ln says 'queue depth $_d; head #$_h' but its own record holds backlog=$_bk handed=$_hd — the writer fills both from ONE variable, so this record cannot exist"
       fi
@@ -2595,7 +2606,7 @@ case "$_why_ok" in
 esac
 # ── the tombstone: the writer's whole sentence, the death clause included ────────────────────────────
 _DTH='if this line is what the beat reports, the pass died before finishing'
-if grep -qF -- "$_DTH" "$REFRESH"; then
+if grep -qF -- "$_DTH" <<<"$_WCODE"; then
   # 17 `result=running` record fixtures exist: 14 model the writer's tombstone, and 3 are the HAND-EDITED
   # ones (the arity pin and the two orphaned-record pins) which the writer cannot emit and which carry no
   # `why=` at all. All three numbers are pinned, so a fixture that changes SHAPE leaves its bucket instead
@@ -2618,7 +2629,7 @@ fi
 # does not create. The message now names what moved and what it grades.
 for _arm in 'judged CLEAN by THIS pass, and $_head_rank' 'carried over from an earlier pass — $_head_rank'; do
   for _form in "$_arm" "$(printf '%s' "$_arm" | sed 's/\$_head_rank/${_head_rank}/')"; do
-    grep -qF -- "$_form" "$REFRESH" && { _arm_found=1; break; }
+    grep -qF -- "$_form" <<<"$_WCODE" && { _arm_found=1; break; }
   done
   if [ "${_arm_found:-0}" = "1" ]; then
     ok "pin/writer: \`_head_why\` still ends in the rank clause (\`$_arm\`)"
@@ -2630,12 +2641,27 @@ done
 # ⛔ EVERY ARM THE WRITER CAN TAKE IS FAITHFUL (review P3): `_head_rank` has FIVE arms and only one says
 # "highest-ranked", so a fixture carrying the writer's exact `unranked`/`empty` sentence is CORRECT — the
 # previous pin called it wrong. A fixture value must end in SOME arm the writer actually writes.
-_head_ranks="$(grep -o '_head_rank="[^"]*"' "$REFRESH" | sed 's/^_head_rank="//; s/"$//')"
+_head_ranks="$(grep -o '_head_rank="[^"]*"' <<<"$_WCODE" | sed 's/^_head_rank="//; s/"$//')"
 _narms="$(grep -c . <<<"$_head_ranks" || true)"
 if [ "${_narms:-x}" = "5" ]; then
   ok "pin/writer: \`_head_rank\` still has its 5 arms (a fixture may model any of them)"
 else
   bad "pin/writer: the WRITER's \`_head_rank\` has ${_narms:-<unreadable>} arm(s) (want 5) — if you changed refresh-candidates.sh, re-baseline this expectation; if not, a fixture-side check below will name the line"
+fi
+# ⛔ THE PREFIXES COME FROM THE WRITER TOO (review P3): typed here, they let a writer-side rename print
+# "all 7 fixtures carry a writer prefix" while NO prefix the writer writes was carried by any fixture
+# (measured: the sibling assertion reddened but this sentence claimed a measurement never taken).
+_head_why_pref="$(grep -o '_head_why="[^"]*"' <<<"$_WCODE" | sed 's/^_head_why="//; s/"$//' \
+  | sed 's/\$_head_rank$//; s/\${_head_rank}$//' | grep -v '^$' || true)"
+if [ "$(grep -c . <<<"$_head_why_pref" || true)" = "2" ]; then
+  for _pfx in "$(sed -n 1p <<<"$_head_why_pref")" "$(sed -n 2p <<<"$_head_why_pref")"; do
+    grep -qF -- "$_pfx" <<<"$_WCODE" && _pfx_ok=1
+  done
+  [ "${_pfx_ok:-0}" = "1" ] && ok "pin/writer: both \`_head_why\` prefixes are read from the writer" \
+    || bad "pin/writer: a \`_head_why\` prefix does not appear in the writer's code"
+  _pfx_ok=0
+else
+  bad "pin/writer: could not read TWO \`_head_why\` prefixes from the writer (got $(grep -c . <<<"$_head_why_pref" || true)) — the fixture prefixes are ungraded"
 fi
 _hw_fx="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" || true)"
 _hw_bad=0
@@ -2645,11 +2671,16 @@ for _ln in $(grep -nE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" 
   # not start with it, so a fixture holding the BARE arm — a record the writer cannot emit, since it always
   # writes one of the two prefixes — was accepted. Measured: stripping the prefix from a fixture stayed
   # 288/0 GREEN, and a doubled prefix stayed GREEN too.
-  case "$_val" in
-    'judged CLEAN by THIS pass, and '*)       _tail="${_val#judged CLEAN by THIS pass, and }" ;;
-    'carried over from an earlier pass — '*) _tail="${_val#carried over from an earlier pass — }" ;;
-    *) _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` carries NEITHER \`_head_why\` prefix — the writer always writes one, so this value cannot exist: '$_val'"; continue ;;
-  esac
+  _tail=""; _matched=0
+  while IFS= read -r _pfx; do
+    [ -n "$_pfx" ] || continue
+    case "$_val" in
+      "$_pfx"*) _tail="${_val#"$_pfx"}"; _matched=1; break ;;
+    esac
+  done <<<"$_head_why_pref"
+  if [ "$_matched" = "0" ]; then
+    _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` carries NEITHER of the writer's \`_head_why\` prefixes — the writer always writes one, so this value cannot exist: '$_val'"; continue
+  fi
   if [ -z "$_tail" ]; then
     _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` has a prefix and an EMPTY rank clause — a dangling phrase in the durable record: '$_val'"
   elif ! grep -qxF -- "$_tail" <<<"$_head_ranks"; then
