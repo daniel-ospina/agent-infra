@@ -226,6 +226,8 @@ __all__ = [
     "CLAIM_REASONS",
     "claim_verdict",
     "Evidence",
+    "CpuSample",
+    "ChildEvidence",
     "Verdict",
     "CALL_DISCARDING_STOP_REASONS",
     "CALL_FAILED_STOP_REASONS",
@@ -670,6 +672,55 @@ class ClaimRead:
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class CpuSample:
+    """Tree STEP 2 as evidence: did this lane's own process advance CPU between two samples?
+
+    ``advanced`` is the tree's answer and it is **three-valued on purpose**: `True` (the delta exceeded
+    ``tolerance_s``), `False` (a measurable delta under it), or `None` (the sample could not be
+    attributed — `lane_cpu_busy()`'s exactly-one-pid rule declined, or the read failed). `None` must never
+    be read as `False`: an unattributable sample is the *absence of a reading*, and the tree's own lesson
+    is that a single unattributable signal may not classify a lane.
+
+    ``tolerance_s`` is part of the value, not a comment, because a sub-0.1 s twitch has the same signature
+    from a parked child, a prompt redraw and a timer wake — the tolerance is what makes the number mean
+    something. `window_ms` says over what interval, so the answer is auditable.
+    """
+
+    advanced: Optional[bool] = None
+    delta_s: Optional[float] = None
+    tolerance_s: float = 0.10
+    window_ms: Optional[int] = None
+    source: str = ""
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"advanced": self.advanced, "delta_s": self.delta_s,
+                "tolerance_s": self.tolerance_s, "window_ms": self.window_ms,
+                "source": self.source}
+
+
+@dataclass(frozen=True)
+class ChildEvidence:
+    """Tree STEP 3 as evidence: is a `task` child in flight under this lane, and is it still moving?
+
+    The tree's rule is that a lane waiting on a child is NOT a stalled lane — the child is a lane too and
+    Step 6 applies THIS SAME TREE to it. `in_flight` is the parent's veto; ``sid`` is the edge Step 6
+    follows, so the recursion needs no second rule. ``stale`` is `child_suppresses()`'s staleness reading,
+    carried separately so a caller can tell "a child exists and is moving" from "a child exists and has
+    stopped" without re-deriving it.
+    """
+
+    sid: str = ""
+    in_flight: bool = False
+    stale: bool = False
+    grew: Optional[bool] = None
+    source: str = ""
+
+    def to_dict(self) -> Dict[str, object]:
+        return {"sid": self.sid, "in_flight": self.in_flight, "stale": self.stale,
+                "grew": self.grew, "source": self.source}
+
+
 @dataclass
 class Evidence:
     """Everything a verdict may rest on. Absent fields are ``None``/defaults."""
@@ -695,6 +746,25 @@ class Evidence:
     # caller explicitly says "this is a log lane" (pinned by a test AND a
     # mutation, the same shape as the claim axis).
     log_read: Optional[LogRead] = None
+    # ── tree STEP 2 (CPU-time delta) and STEP 3 (child in flight) ────────────────────────────────
+    # ⛔ These two slots exist because the decision tree's steps 2 and 3 had NO home in this module
+    # (inventory `docs/ops/orchestrator-mcp-inventory.md` §4.1, F1): they lived only in
+    # `lane-status.py` (`lane_cpu_busy`, `child_suppresses`), so the module this fleet declares to be
+    # "the ONE verdict function" implemented a SUBSET of the tree. Issue #3382 §1.2 settles what to do
+    # about that in one sentence: *"If the tree is not fully implemented there today, implement the
+    # tree in it and say so."* This is that.
+    #
+    # BOTH DEFAULT TO `None` = NOT MEASURED, and a `None` slot can never move a verdict: every branch
+    # below is inert unless a caller supplied evidence. That is why adding them changes no existing
+    # verdict, and it is what an abstention is supposed to look like — absent evidence is not "no".
+    #
+    # `cpu` carries STEP 2's result as the tree states it — the cumulative-CPU delta over TWO samples
+    # with a STATED tolerance — never `ps -o pcpu` (a lifetime average: the tree's measured 3-of-73
+    # case). There is NO `attributable` field: `lane-status.py::lane_cpu_busy`'s exactly-one-lane-to-
+    # one-process guard is expressed as `advanced is None` ("sampled, but not attributable"), which is
+    # an abstention and never a park. `CpuSample`'s own fields are the whole contract.
+    cpu: Optional["CpuSample"] = None
+    child: Optional["ChildEvidence"] = None
     now_ms: int = 0
     idle_ms: int = IDLE_MS
     record_veto_ms: int = RECORD_VETO_MS
@@ -1859,14 +1929,22 @@ def evaluate(ev: Evidence) -> Verdict:
         # over a FAILED read — and a `frozen` log read then CONVICTED a lane on
         # evidence it had thrown away, which is strictly worse than the masking the
         # guard exists to stop.
+        # ⛔ AND THE TREE'S STEP 2/3 SLOTS ARE ON THIS LIST (rebased onto #3382's
+        # `CpuSample`/`ChildEvidence`). Neither side of the merge wrote this clause:
+        # on main the two slots did not exist, and on the #3382 branch this guard did
+        # not. A union that left them off would let the log axis silently DISCARD a
+        # supplied CPU delta or in-flight child — the `#1777 B7` shape reconstructed
+        # yet again, this time by the merge itself. A `None` slot is NOT evidence, so
+        # this only fires on a caller who actually supplied one.
         if ev.sid or ev.claim_read is not None or ev.candidates or ev.record is not None \
                 or ev.jsonl_grew is not None or ev.jsonl_age_ms is not None \
                 or ev.tool is not None or ev.jsonl_turn is not None \
+                or ev.cpu is not None or ev.child is not None \
                 or not ev.ps_ok or not ev.store_ok:
             return Verdict(
                 "unknown", "log-read-on-session-query",
-                detail="a log-lane query carries ONLY log_read; supplying session or claim "
-                       "evidence too would let this axis mask it (#1777 B7)")
+                detail="a log-lane query carries ONLY log_read; supplying session, claim, "
+                       "CPU or child evidence too would let this axis mask it (#1777 B7)")
         return log_lane_verdict(ev.log_read)
 
     # (1) Evidence availability. A failed read abstains with a NAMED reason —
@@ -1920,6 +1998,38 @@ def evaluate(ev: Evidence) -> Verdict:
     # (3) A fenced holder exists. Every "still working" signal is a VETO against
     #     `wedged`; the state ladder only runs once they are gone.
     holder = holders[0]
+
+    # (3a) TREE STEP 3 — CHILD IN FLIGHT (#3382 §4.1 F1). A lane whose `task` child is running is not a
+    #      stalled lane: the child is a lane too, and the tree's Step 6 says to apply THIS SAME TREE to
+    #      it. The measured cost of not having this here is on file — four lanes tabulated as false
+    #      IDLE/WEDGED/STALL in one evening, every one holding or presumed to hold a `task` child
+    #      (`state/FINDING-lane-classifier-ignores-task-children-2026-10-11.md`) — and the same defect
+    #      aimed the other way: a CPU-flat parent waiting on a provider response read as a park. The
+    #      veto is deliberately narrow: `in_flight` AND NOT `stale`. A stale child is exactly the case
+    #      the ladder must still be free to call wedged, so it does NOT veto.
+    if ev.child is not None and ev.child.in_flight and not ev.child.stale:
+        return Verdict("running-quiet", "child-in-flight", holder_pid=holder.pid,
+                       detail=("child %s" % ev.child.sid) if ev.child.sid else "")
+
+    # (3b) TREE STEP 2 — CPU-TIME DELTA (#3382 §4.1 F1). The tree's strongest cheap "is it actually
+    #      running" signal, and the one step this module simply did not have. Same veto family as 3a:
+    #      a positively-advancing process over the stated tolerance is working, whatever its transcript
+    #      says — a long tool call writes NOTHING to the transcript, which is why quiet alone is
+    #      worthless. `advanced is not True` (including the three-valued `None`) falls through: an
+    #      unattributable sample must never be read as a park, and must never be read as progress.
+    if ev.cpu is not None and ev.cpu.advanced is True:
+        # ⛔ AN UNREAD NUMBER RENDERS `?`, NEVER `0` — the rule `_n()` states a few lines down. The MCP
+        # path always constructs `CpuSample(advanced=…, delta_s=None, window_ms=None)`, so `or 0.0`
+        # printed `cpu +0.00s over 0s` beside a `running-quiet` state: the module's own
+        # contradicting-evidence class (the `bytes_delta=-990` fix), and a claim that a tolerance was
+        # measured over a window that was never sampled.
+        return Verdict("running-quiet", "cpu-advanced", holder_pid=holder.pid,
+                       detail=("cpu +%s over %s"
+                               % (_n(None if ev.cpu.delta_s is None else "%.2fs" % ev.cpu.delta_s),
+                                  _n(None if ev.cpu.window_ms is None
+                                     else "%.0fs" % (ev.cpu.window_ms / 1000.0)))
+                               + ("" if ev.cpu.delta_s is None
+                                  else " (tolerance %.2fs)" % ev.cpu.tolerance_s)))
 
     if ev.tool is not None and ev.tool.tools_in_flight > 0 and not tool_veto_expired(ev.tool):
         # Quiet is never a stall: the tool veto holds until the watchdog's own

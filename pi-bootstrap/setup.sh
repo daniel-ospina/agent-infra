@@ -628,6 +628,33 @@ for base in "${fleet_srcs[@]}"; do
   chmod +x "$dest" 2>/dev/null || true
   fleet_copied=$((fleet_copied+1))
 done
+
+# ── the orchestrator MCP's own harness module ────────────────────────────────────────────────
+# `lane_registry.py` lives in `scripts/orchestrator-harness/` but is farmed FLAT into
+# `$DEST/scripts/` deliberately: that flat path is one of the candidate locations the MCP server
+# itself searches (`_candidate_paths` in mcp-servers/orchestrator/server.py), so the install
+# layout and the server's own lookup cannot drift.
+# ⛔ It is NOT a member of `fleet_srcs`. That array resolves every source as
+# `$INFRA_ROOT/scripts/$base`, so listing a file that lives one directory DOWN made the install
+# treat it as missing, exit 1, and take the whole farm — guards, skills, every assertion after it —
+# down with it. Measured on #3486: `FAIL: install exited 1`, then `GUARD MISSING: …` × 6.
+# A `src` subdirectory with a flat `dest` is exactly what the installer's own reader models, so the
+# test's independent expectation stays a superset of this declaration with no change in semantics.
+mcp_harness_srcs=(lane_registry.py)
+for base in "${mcp_harness_srcs[@]}"; do
+  farm_declared_rel+="scripts/$base"$'\n'
+  f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
+  if [ ! -f "$f" ]; then
+    farm_missing+="scripts/$base"$'\n'
+    continue
+  fi
+  dest="$DEST/scripts/$base"
+  if [ -L "$dest" ]; then
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
+done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner gate, #1719)"
 
 # Shared-library farm (#1178): the fleet-scripts farm above copies pi-reap-idle.sh

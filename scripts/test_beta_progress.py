@@ -2161,3 +2161,155 @@ def test_a_cache_25_minutes_old_prints_25m_ago_not_zero(no_cache, capsys):
     assert "25m ago" in out, (
         "a 25-minute-old cache must print `25m ago` — an always-0m age makes a stale figure "
         "indistinguishable from a live one. got: %r" % out)
+
+# ── `--repo` must never relabel another repo's cached figures ──
+def test_a_repo_call_never_returns_another_repos_cached_figures(monkeypatch, no_cache, capsys):
+    """⛔ THE CACHE WAS REPO-BLIND, AND `--repo` CHANGED THE LABEL ON IT.
+
+    `--repo X` mutates the global `REPO`, but the cache was one file whose payload carried no repo
+    identity and the cache-HIT path is taken ABOVE `compute()` — so for the whole TTL (~15 beats of
+    16) a `--repo owner/other` call returned the cached TORTOISE counts printed as `owner/other`'s,
+    and in the other direction a miss wrote other-repo numbers into the file the no-arg beat renders
+    as tortoise's `DELIVERY:` line. `mcp-servers/orchestrator/server.py::_census` is exactly that
+    caller: it fans out with `["--repo", repo, "--json"]`.
+
+    Three arms, one per mechanism: a cache LABELLED with another repo is a miss; an UNLABELLED cache
+    away from the base path is a miss; and a `--repo` run writes its own labelled file while leaving
+    the base file byte-identical.
+    """
+    import json as _json
+    import time as _time
+
+    now = int(_time.time())
+    tortoise_cached = {"ts": now, "repo": "daniel-ospina/tortoise", "open_prs": 7, "merged_today": 3,
+                       "p0": {"open": 2, "with_pr": 1, "without": 1},
+                       "p1": {"open": 4, "with_pr": 2, "without": 2}}
+    other_cached = dict(tortoise_cached, repo="owner/other", open_prs=99, merged_today=99)
+
+    def fresh():
+        return {"ts": int(_time.time()), "repo": bp.REPO, "open_prs": 1, "merged_today": 0,
+                "p0": {"open": 9, "with_pr": 9, "without": 0},
+                "p1": {"open": 9, "with_pr": 9, "without": 0}}
+
+    # (1) A LABELLED cache for a DIFFERENT repo is never served under this repo's name.
+    monkeypatch.setattr(bp, "REPO", "owner/other")
+    pe = bp._cache_path()
+    monkeypatch.setattr(bp, "CACHE", str(no_cache))
+    assert bp._cache_path() != str(no_cache), "a non-default repo must not share the base file"
+    import pathlib
+    pathlib.Path(bp._cache_path()).write_text(_json.dumps(tortoise_cached))
+    monkeypatch.setattr(bp, "compute", fresh)
+    assert bp.main() == 0
+    out = capsys.readouterr().out
+    assert "7 open PRs" not in out, "TORTOISE'S CACHED COUNT was served as owner/other's: %s" % out
+    assert "99 open PRs" not in out
+    assert "1 open PRs" in out, "a mislabelled cache must be a MISS, so the fresh read is used: %s" % out
+
+    # (2) AN UNLABELLED cache away from the base path is a MISS (we cannot know what it measured).
+    pathlib.Path(bp._cache_path()).write_text(_json.dumps(
+        {k: v for k, v in other_cached.items() if k != "repo"}))
+    monkeypatch.setattr(bp, "compute", fresh)
+    assert bp.main() == 0
+    out = capsys.readouterr().out
+    assert "99 open PRs" not in out, "an unlabelled per-repo cache was adopted: %s" % out
+
+    # (3) AND A `--repo` RUN DOES NOT TOUCH THE BASE FILE (the beat's state).
+    monkeypatch.setattr(bp, "DEFAULT_REPO", "daniel-ospina/tortoise")
+    base_before = no_cache.read_bytes() if no_cache.exists() else b"<absent>"
+    monkeypatch.setattr(bp, "compute", fresh)
+    # ⛔ DRIVEN THROUGH THE REAL ARGV SURFACE. This arm used to call `bp.main()` with NO arguments
+    # and set `REPO` with monkeypatch, so the `--repo` branch was never entered by ANY arm in this
+    # file (all 11 call sites were bare `bp.main()`): deleting the whole `elif a == "--repo":` branch
+    # left every arm green, including this one, whose TITLE is "a `--repo` run does not touch the base
+    # file". `REPO` is reset to the base repo first so a deleted `--repo` branch is OBSERVABLE —
+    # without the reset the previous arm's monkeypatched value would make it pass anyway.
+    monkeypatch.setattr(bp, "REPO", "daniel-ospina/tortoise")
+    assert bp.main(["--repo", "owner/other"]) == 0
+    capsys.readouterr()
+    assert bp.REPO == "owner/other", "--repo did not reach the module's REPO: %r" % (bp.REPO,)
+    after = no_cache.read_bytes() if no_cache.exists() else b"<absent>"
+    assert after == base_before, "a --repo run overwrote the base cache the beat renders"
+    written = _json.loads(pathlib.Path(bp._cache_path()).read_text())
+    assert written["repo"] == "owner/other", written
+
+
+def test_the_cli_argv_surface_is_real(monkeypatch, no_cache, capsys):
+    """⛔ `--repo` AND `--json` ARE THE CONTRACT `_census` CALLS, so they must be driven AS ARGV.
+
+    `mcp-servers/orchestrator/server.py::_census` fans out with `["--repo", repo, "--json"]`, and
+    the module's previous body parsed NO argv at all (it hardcoded one repo), so this surface is the
+    thing the PR adds. Every other arm in this file sets `REPO` with monkeypatch and calls
+    `bp.main()`, which exercises the parser's DEFAULT path only — the two branches below could be
+    deleted with the suite green. This arm drives the branches themselves.
+    """
+    import json as _json
+    import time as _time
+
+    def fresh():
+        return {"ts": int(_time.time()), "repo": bp.REPO, "open_prs": 1, "merged_today": 0,
+                "p0": {"open": 9, "with_pr": 9, "without": 0},
+                "p1": {"open": 9, "with_pr": 9, "without": 0}}
+
+    monkeypatch.setattr(bp, "compute", fresh)
+    # (a) `--repo` + `--json`: both branches fire, and the payload is the labelled JSON.
+    assert bp.main(["--repo", "owner/other", "--json"]) == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["repo"] == "owner/other", payload
+    assert payload["readable"] is True, payload
+    assert payload["measured_at"], payload
+    # (b) `--json` ALONE is still the JSON surface, and without it the same run is PROSE — a `--json`
+    #     branch that never fired would print the prose line to a caller parsing JSON.
+    assert bp.main(["--repo", "owner/other", "--json"]) == 0
+    assert capsys.readouterr().out.lstrip().startswith("{"), "--json must emit JSON"
+    assert bp.main(["--repo", "owner/other"]) == 0
+    prose = capsys.readouterr().out
+    assert not prose.lstrip().startswith("{"), "without --json the line is prose: %r" % prose[:80]
+    # (c) A MALFORMED OR UNKNOWN ARGUMENT IS A USAGE ERROR (2), never a silent default.
+    for argv in (["--repo"], ["--repo", "noslash"], ["--bogus"]):
+        assert bp.main(argv) == 2, "%r must be a usage error (2)" % (argv,)
+
+
+def test_T_fix_repos_follows_the_repo_argument(monkeypatch, tmp_path):
+    """[P2, review cycle 7] The merge's `FIX_REPOS` re-derivation was unpinned AND too wide.
+
+    Two defects, one arm each: (a) `globals()["FIX_REPOS"] = _derive_fix_repos(REPO)` could be replaced by
+    `pass` with all 49 tests still green, because every `--repo` arm stubs `compute` and never consumes
+    FIX_REPOS; (b) `_derive_fix_repos` kept a hardcoded tail, so `--repo owner/other` also counted
+    agent-infra PRs as coverage for that repo's issues — the attribution failure the module forbids.
+    Deleting the re-derivation, or restoring the unconditional tail, must red this arm.
+    """
+    # ⛔ HERMETIC, LIKE EVERY SIBLING `--repo` ARM (review cycle 8, P2). Without these two lines the arm
+    # performed LIVE GitHub reads (measured 4.8-5.2 s per call, `rest read failed: HTTPError
+    # api.github.com/repos/owner/other/pulls`) and WROTE THE OPERATOR'S REAL STATE FILES — a suite run
+    # left `~/.pi/agent/state/beta-progress.json` with a real measurement in it, which is the file
+    # `scripts/merge-queue.py` and the beat read. Under CI's `--timeout=60` three live calls can also
+    # exceed the bound whenever the API degrades.
+    # ⛔ AND NOTHING IS LOST BY STUBBING `compute`: the FIX_REPOS re-derivation lives in the ARG PARSER,
+    # which runs before `compute` is ever reached — verified by mutation after this change (removing the
+    # re-derivation, or restoring the unconditional tail, still reds the arm).
+    monkeypatch.setattr(bp, "CACHE", str(tmp_path / "bp.json"))
+    monkeypatch.setattr(bp, "compute", lambda *a, **k: {
+        "ts": int(time.time()), "repo": bp.REPO, "open_prs": 1, "merged_today": 0,
+        "p0": {"open": 0, "with_pr": 0, "without": 0},
+        "p1": {"open": 0, "with_pr": 0, "without": 0},
+        "coverage": "test", "unavailable": None,
+    })
+    # ⛔ `main(["--repo", …])` MUTATES MODULE GLOBALS, so this arm restores them — without that it
+    # leaves REPO/FIX_REPOS repointed and every later arm inherits the wrong repo (measured: this test
+    # passes alone and failed in the full run for exactly that reason).
+    saved = (bp.REPO, bp.FIX_REPOS)
+    try:
+        # ⛔ DO NOT ASSERT THE AMBIENT DEFAULT: an earlier `--repo` arm in this file may already have
+        # repointed the globals (measured). Establish the baseline by ASKING for the tracker repo.
+        assert bp.main(["--repo", "daniel-ospina/tortoise", "--json"]) in (0, 1)
+        assert bp.FIX_REPOS == ("daniel-ospina/tortoise", "daniel-ospina/agent-infra"), bp.FIX_REPOS
+        assert bp.main(["--repo", "owner/other", "--json"]) in (0, 1), "usage must not fail"
+        # (a) the re-derivation actually ran…
+        assert bp.FIX_REPOS == ("owner/other",), bp.FIX_REPOS
+        # (b) …and it does NOT inherit the tortoise-specific tail
+        assert "daniel-ospina/agent-infra" not in bp.FIX_REPOS, bp.FIX_REPOS
+        # naming the tail repo explicitly is its own single-element set, not a duplicate
+        assert bp.main(["--repo", "daniel-ospina/agent-infra", "--json"]) in (0, 1)
+        assert bp.FIX_REPOS == ("daniel-ospina/agent-infra",), bp.FIX_REPOS
+    finally:
+        bp.REPO, bp.FIX_REPOS = saved
