@@ -429,7 +429,7 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**57 tests with 109 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**57 tests with 110 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
 > suite is **T32–T57**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
@@ -812,7 +812,7 @@ fails without its fix):
 
 ```bash
 python3 tools/fleet/liveness.test.py               # 57 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (109)
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (110)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -1631,6 +1631,16 @@ re-dispatch that re-does finished work, which is exactly the 2026-11-03 false-ne
 named reason. This is the same `no-log-evidence`-is-a-refusal rule the reaper already states (§11.2
 gate 3), applied to the diagnostic.
 
+**A LOG IS `readable` ONLY IF IT CAN BE OPENED.** `S_ISREG` says what the inode IS; it never says we
+may read it. Deciding readability from `stat` alone made a **mode-000** regular file a readable log
+whose byte channel was never read — and the second sample then computed
+`size_delta = st_size - st_size = 0` from that unread channel, publishing it as a positively FLAT
+reading, so a LIVE lane read `frozen/no-progress bytes_delta=0` (measured). The readability claim is
+therefore **proved with the open it depends on** (`S_ISREG` first, so a fifo/socket/device is never
+opened at all, then a single `open(…, "rb")`), and the two facts stay NAMED apart —
+`not-a-regular-file:` and `unreadable:` — because a reader routes on the reason. Pinned by T40 (both
+reasons) and T41 (the census arm).
+
 ### 13.3 The signals, and their measured resolution
 
 The progress contract is **copied from `scripts/orchestrator-harness/lane-bound.sh`, not invented**.
@@ -1965,7 +1975,7 @@ so it never is.
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
 Regression contract: `python3 tools/fleet/liveness.test.py` (57 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (109 mutations, each of which must make its paired
+`python3 tools/fleet/liveness.test.py --mutations` (110 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder); T43–T54 are the 2026-11-04 binding / corroboration / abstention rounds;

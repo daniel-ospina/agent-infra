@@ -939,8 +939,17 @@ done
 # 1.3.4 with `echo ab | mawk -v re=… 'BEGIN{r=re} $0 ~ r'`:
 #   PANIC rc=100   ^a{1,6}(b)   ^a{1,}(b)   ^a{,6}(b)   ^a{2}(b)   ^{1,6}(b)   a{1,6}(b)
 #   FINE  rc=0     ^a{1,6}$   ^a{1,6}[bc]   (a{1,6})(b)   ^a{1,6} (b)   ^a+(b)
-# — note `^a{1,6}$` is FINE while `^a{1,6}(b)` dies, so do NOT "fix" a panic here
-# by deleting the `$`, and do not assume a group without an alternation is safe.
+# Interval-then-`(` is NECESSARY BUT NOT SUFFICIENT — measured, the group body must also be
+# non-empty and not reducible to optional, so these are FINE despite matching the shape:
+#   FINE  rc=0     ^a{1,6}()   ^a{1,6}(|)   ^a{1,6}(|b)   ^a{1,6}(b|)   ^a{1,6}(())
+# So do NOT read this as a mawk grammar law and do not "explain" a panic from it: the
+# mechanism is mawk's business, and a rule narrower than reality has already cost two
+# review rounds here. What a maintainer needs is only this:
+#   (i)  `^a{1,6}$` is FINE while `^a{1,6}(b)` dies — never "fix" a panic by deleting `$`;
+#   (ii) if the panic is real it FAILS CLOSED anyway (`md026_rc -ne 0` is a hard `fail`,
+#        never an empty stdout read as clean), so the cost of a re-introduction is a red
+#        gate, not a false PASS; and
+#   (iii) any `{…}` followed by `(` is suspect until BOTH awks agree — run the check below.
 #
 # Verify any rewrite against BOTH awks over the same input; the two must agree on
 # every line, and mawk must not print an REcompile panic:

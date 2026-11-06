@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-57 tests with 109 paired mutations: every mutation re-
+57 tests with 110 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 57 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (109)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (110)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1906,8 +1906,44 @@ def t40():
 
         lr = liv.gather_log_lane(d, os.getpid(), sample=False, now_ms=NOW_MS)
         check(not lr.readable and lr.present, "present-but-unreadable is its own fact")
+        check((lr.detail or "").startswith("not-a-regular-file:"),
+              "and it NAMES that fact (`not-a-regular-file:`), rather than reporting a generic "
+              "unreadable — the doc gives them different reasons and a reader routes on it; "
+              "got %r" % (lr.detail,))
         check(liv.evaluate(liv.Evidence(log_read=lr)).state == "unknown",
               "an unreadable log must never publish a state")
+
+        # ⛔ A REGULAR FILE THAT STATS BUT CANNOT BE OPENED IS THE SAME FACT (measured
+        # false FROZEN). `S_ISREG` alone decided `readable`, so a mode-000 log passed the
+        # check, `_log_tail` swallowed the EACCES and returned "", and the second sample
+        # computed `size_delta = st_size - st_size = 0` from a channel it never read —
+        # published as a positively FLAT one, so a LIVE lane read `frozen/no-progress
+        # bytes_delta=0`. `skip` on a platform where the mode cannot be enforced (root).
+        noperm = os.path.join(d, "L-noperm.log")
+        with open(noperm, "w", encoding="utf-8") as fh:
+            fh.write("working...\n")
+        os.utime(noperm, (NOW_MS / 1000.0 - 7200, NOW_MS / 1000.0 - 7200))
+        os.chmod(noperm, 0)
+        try:
+            _probe = open(noperm, "rb")
+        except OSError:
+            _can_enforce = True
+        else:
+            _probe.close()
+            _can_enforce = False   # running as root: mode 000 does not deny us
+        if _can_enforce:
+            lr = liv.gather_log_lane(noperm, os.getpid(), sample=True, sleep_fn=lambda _s: None,
+                                     now_ms=NOW_MS)
+            check(lr.present and not lr.readable,
+                  "a mode-000 regular file is PRESENT but NOT READABLE; got present=%r "
+                  "readable=%r detail=%r" % (lr.present, lr.readable, lr.detail))
+            check(lr.size_delta is None,
+                  "its byte channel must NOT be published as a flat 0; got %r" % (lr.size_delta,))
+            v = liv.evaluate(liv.Evidence(log_read=lr))
+            check(v.state == "unknown" and v.reason == "log-unreadable",
+                  "a mode-000 log ABSTAINS, never `frozen` (measured: it froze a live lane); "
+                  "got %s/%s %s" % (v.state, v.reason, v.detail))
+        os.chmod(noperm, 0o600)
 
         # the verdict FILE outranks the log's tail, and the rc travels with it
         me = os.getpid()
@@ -2053,6 +2089,11 @@ def t41():
         check(by_pid["28"][0] == "unknown", "row 28: %r" % (by_pid["28"],))
         check(by_pid["29"][0] == "unknown",
               "a directory is not a readable log; got %r" % (by_pid["29"],))
+        # …and the census NAMES the fact, so the `S_ISREG` guard is pinned rather than
+        # merely subsumed by the read proof (a directory also fails `open()`).
+        d29 = full["29"][3] if len(full["29"]) > 3 else ""
+        check(d29.startswith("not-a-regular-file:"),
+              "the census must name `not-a-regular-file:`, not a generic unreadable; got %r" % (d29,))
         check(by_pid["30"][0] == "unknown",
               "a NEGATIVE cpu delta is a broken reading, not a flat one; got %r"
               % (by_pid["30"],))
@@ -3301,15 +3342,21 @@ MUTATIONS = [
         "T41", "module",
         '                    if stat.S_ISREG(st.st_mode):',
         '                    if True:',
-        "the census seam stops checking the path is a regular file, so a directory reads as "
-        "a readable log and its 0-byte delta looks flat",
+        "the census seam stops naming a non-regular path as its own FACT: it falls through to "
+        "the read proof, so a directory is reported as a generic `unreadable:` "
+        "(IsADirectoryError) instead of `not-a-regular-file:`. The state is the same, so this "
+        "is pinned by the DETAIL — the doc distinguishes the two facts and a reader routes on "
+        "the named reason",
     ),
     Mutation(
         "T40", "module",
         '        if not stat.S_ISREG(st.st_mode):',
         '        if False:',
-        "a path that stats but is not a regular file (a directory) reads as a readable log, "
-        "so its 0-byte delta looks flat",
+        "a path that stats but is not a regular file stops naming itself as that fact and falls "
+        "through to the read proof, so a directory is reported as `unreadable: "
+        "(IsADirectoryError)` instead of `not-a-regular-file:` — and, on a platform where the "
+        "open succeeds, a fifo/socket/device would be OPENED (a blocking read on every census "
+        "row). Pinned by the named detail",
     ),
     Mutation(
         "T1", "lib",
@@ -3978,6 +4025,14 @@ MUTATIONS = [
         "the tolerance goes back to a FIXED delta, so a lane WORKING at a short "
         "`--window-ms` reads `frozen` again (measured: cpu+9cs at `--window-ms 50`, "
         "cpu+4cs at 2000) — a false FROZEN on the state this axis exists to get right",
+    ),
+    Mutation(
+        "T40", "module",
+        '            try:\n                with open(log_path, "rb"):\n                    pass\n            except OSError as exc:',
+        '            try:\n                pass\n            except OSError as exc:',
+        "the READ PROOF is dropped, so `readable` is decided by `S_ISREG` alone again: a mode-000 "
+        "regular file passes, its byte channel is never read, and `size_delta = st_size - st_size "
+        "= 0` is published as a positively FLAT reading — a LIVE lane reads `frozen/no-progress`",
     ),
     Mutation(
         "T57", "module",

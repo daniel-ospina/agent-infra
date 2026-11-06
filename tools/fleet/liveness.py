@@ -2851,9 +2851,29 @@ def gather_log_lane(
             lr.readable = False
             lr.detail = "not-a-regular-file:%s mode=%o" % (log_path, st.st_mode)
         else:
-            lr.readable = True
-            lr.size = int(st.st_size)
-            lr.age_ms = max(0, int(now - st.st_mtime * 1000))
+            # ⛔ A REGULAR FILE THAT STATS FINE IS STILL NOT A READABLE LOG. `S_ISREG`
+            # says what the inode IS, never that we may READ it — a mode-000 file (or one
+            # under a directory we cannot traverse, or an EACCES/EPERM mount) stats,
+            # reports a size, and yields no bytes. Deciding `readable` from `stat` alone
+            # made that case publish `frozen/no-progress` with `bytes_delta=0`: the byte
+            # channel was NEVER READ (`_log_tail` swallows the OSError and returns ""),
+            # so an unread channel was published as a positively FLAT one — the exact
+            # "an unread value is not zero" rule this module applies to a negative CPU
+            # delta and to an unread CPU channel, and the exact failure the comment above
+            # describes for a directory. Measured at mode 000: `frozen/no-progress
+            # bytes_delta=0 ... cpu_delta_cs=0` on a file that was never opened.
+            # The READABILITY CLAIM IS THEREFORE PROVED WITH THE READ IT DEPENDS ON —
+            # one open, closed immediately; the size channel still comes from `stat`.
+            try:
+                with open(log_path, "rb"):
+                    pass
+            except OSError as exc:
+                lr.readable = False
+                lr.detail = "unreadable:%s (%s)" % (log_path, exc.__class__.__name__)
+            else:
+                lr.readable = True
+                lr.size = int(st.st_size)
+                lr.age_ms = max(0, int(now - st.st_mtime * 1000))
 
     # The verdict the supervisor writes. The FILE is preferred (it is the
     # programmatic surface); the log's own tail is the fallback, because a lane
@@ -3322,8 +3342,20 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
                     lr.detail = "unreadable:%s (%s)" % (path, exc.__class__.__name__)
                 else:
                     if stat.S_ISREG(st.st_mode):
-                        lr.readable = True
-                        lr.present = True
+                        # ⛔ THE SAME READ PROOF AS `gather_log_lane`: a regular file that
+                        # cannot be OPENED is not a readable log, and `readable=True` on it
+                        # publishes an unread byte channel as a flat one (mode 000 measured
+                        # as `frozen/no-progress`). One open per row; no read.
+                        try:
+                            with open(path, "rb"):
+                                pass
+                        except OSError as exc:
+                            lr.readable = False
+                            lr.present = True
+                            lr.detail = "unreadable:%s (%s)" % (path, exc.__class__.__name__)
+                        else:
+                            lr.readable = True
+                            lr.present = True
                     else:
                         lr.readable = False
                         lr.present = True
