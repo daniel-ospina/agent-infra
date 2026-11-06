@@ -429,9 +429,9 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**55 tests with 107 paired mutations**: the
+> all pinned by `tools/fleet/liveness.test.py` (**57 tests with 109 paired mutations**: the
 > #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
-> suite is **T32–T55**. The ids are
+> suite is **T32–T57**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
 > #1777 block, so definition order is not label order) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
@@ -811,8 +811,8 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 55 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (107)
+python3 tools/fleet/liveness.test.py               # 57 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (109)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
 python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
 python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
@@ -1813,7 +1813,7 @@ is **this** incarnation:
 
 | the line's `pid=` | binding | result |
 |---|---|---|
-| equals the queried pid | verified | the verdict is adopted |
+| equals the queried pid | **adopted by PID EQUALITY — this is NOT an incarnation fence** | the verdict is adopted; a RECYCLED pid can therefore carry a previous dispatch's verdict (see the named residual under this table) |
 | inside the queried pid's tree | verified (the ppid chain is walked) — **only while that tree is LIVE**; after it exits the chain is unreadable, so a genuine descendant degrades to `unbound-bound-verdict` → `no-verdict` (an abstention, never a false PASS) | adopted |
 | a live pid outside that tree | `stale-bound-verdict` | **dropped** → `no-verdict` |
 | a pid that cannot be resolved, **or the `?` "present but unusable" token** | `unbound-bound-verdict` | **dropped** → `no-verdict` |
@@ -1826,6 +1826,23 @@ supervised — not necessarily the tree root a caller asks about — which is wh
 `no-verdict`, never `finished` and never `dead`: an unverifiable binding over-refuses,
 which is the only acceptable direction for this state. §13.6 states the caller-side
 consequence: pass the pid `lane-bound.sh` itself supervised when you have it.
+
+⛔ **NAMED RESIDUAL — PID EQUALITY IS NOT AN INCARNATION FENCE.** The first row above is
+the WEAKEST arm and it is the one that survives a lane's exit (`_pid_within` returns `None`
+once the tree is gone, so only `child == root` remains). It proves the verdict came from a
+process with that PID NUMBER, not from THIS dispatch: `lane.sh` appends
+(`logs/lane-$N.log`, `tee -a`, never truncated), so a re-dispatched lane leaves the
+previous dispatch's `VERDICT … pid=` in the tail, and if the new dispatch draws a recycled
+pid and is killed hard (no bound line, no launcher line — the completion-watchdog shape
+§13.1 ranks as mechanism 3) the lane publishes **`finished` with work lost and nobody
+re-dispatching it**. The surface already holds the one fact that would settle it — the
+caller's `--start-seconds` — but it is used only to fence the LIVE `probe`, never the bound
+line, and no producer writes an incarnation or a start time onto that line. The launcher's
+`pid=`-carrying `[timeout] agent` line does not help: it carries the SAME bare pid and is
+consumed only for `runner_rc`. The real fix is an incarnation id (or `pid_start=`) on the
+produced line, bound together with the pid — a producer change, filed separately rather
+than half-built here. Until then, read this row as *"the same pid number reported it"*, never
+as *"this dispatch reported it"*.
 
 The verdict token and the `rc=` are parsed **separately** — the token alone, then that line's head
 (everything before ` log=`) scanned for `rc=` with the LAST occurrence winning — because one regex
@@ -1888,6 +1905,15 @@ call abstains instead of claiming a state), and `--window-ms` below 1 is REFUSED
 collapses both readings into one instant, making both signals trivially flat, so a live working lane
 would read `frozen`.
 
+⛔ **THE CPU TOLERANCE IS A RATE, AND IT SCALES WITH THE WINDOW (T56).** `LOG_CPU_TOL_CS` is quoted
+for a `LOG_WINDOW_MS` span, so applying the raw constant at a SHORTER window silently raised the bar:
+measured on one CPU burner at one instant, `--window-ms 30000` read `working progress:cpu cpu+2891cs`
+while `--window-ms 50` read `frozen no-progress … cpu_delta_cs=9` — a live, working lane convicted at
+every window under ~10 s (the break-even is `window <= 0.1 / f` seconds, i.e. 10 s for a lane at 1 %
+of a core). The tolerance is now `max(1, cpu_tol_cs * window_ms // LOG_WINDOW_MS)`, which restores the
+rate the constant states; a genuinely flat lane still reads `frozen` at every window. `window_ms=` in
+the detail is the span **actually sampled** (the tree walk plus the sleep), not the number requested.
+
 ⛔ **`--log-census` REFUSES every per-lane flag rather than ignoring it** (`--log`, `--pid`,
 `--verdict-file`, `--transcript`, `--start-seconds`, `--json`, `--no-sample`, `--window-ms`, exit 2). Accepting and
 dropping one is not harmless: a `--verdict-file` that makes the single-lane arm say `finished` was
@@ -1938,12 +1964,15 @@ so it never is.
 ⛔ **A CENSUS `rc=na` ROW IS `unknown`, NOT `finished`.** The census carries no launcher line, so it has
 no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (55 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (107 mutations, each of which must make its paired
+Regression contract: `python3 tools/fleet/liveness.test.py` (57 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (109 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
 `--log-census` decoder); T43–T54 are the 2026-11-04 binding / corroboration / abstention rounds;
-T55 is the masking-abstention guard re-landed after the #3404 train merge dropped its test. Their paired mutations re-introduce the exact pre-fix behaviours — the
+T55 is the masking-abstention guard re-landed after the #3404 train merge dropped its test;
+T56 is the CPU tolerance pinned as a RATE across `--window-ms` (a short window froze a working
+lane); T57 pins every conjunct of the masking refusal ALONE, because T36 exercised them only in
+aggregate and eight of the ten could be deleted with the suite still green. Their paired mutations re-introduce the exact pre-fix behaviours — the
 dropped progress veto, the exited process falling into the freeze ladder, the missing window, the
 absent log as a death witness, the log axis masking a session query, every bound verdict reading
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped

@@ -935,9 +935,9 @@ done
 # original and both awks accept it.
 #
 # The trigger is NOT the `$` and NOT the alternation: it is an INTERVAL EXPRESSION
-# ({m,n} or {m}) IMMEDIATELY FOLLOWED BY AN OPENING PARENTHESIS. Measured in mawk
+# ({m} {m,} {,n} {m,n}) IMMEDIATELY FOLLOWED BY AN OPENING PARENTHESIS. Measured in mawk
 # 1.3.4 with `echo ab | mawk -v re=… 'BEGIN{r=re} $0 ~ r'`:
-#   PANIC rc=100   ^a{1,6}(b)   ^a{2}(b)   ^{1,6}(b)   a{1,6}(b)
+#   PANIC rc=100   ^a{1,6}(b)   ^a{1,}(b)   ^a{,6}(b)   ^a{2}(b)   ^{1,6}(b)   a{1,6}(b)
 #   FINE  rc=0     ^a{1,6}$   ^a{1,6}[bc]   (a{1,6})(b)   ^a{1,6} (b)   ^a+(b)
 # — note `^a{1,6}$` is FINE while `^a{1,6}(b)` dies, so do NOT "fix" a panic here
 # by deleting the `$`, and do not assume a group without an alternation is safe.

@@ -1403,9 +1403,14 @@ def _pid_within(root: int, child: int, *, hops: int = 64):
     ``child == root`` short-circuit) survives, and a verdict naming a genuine
     DESCENDANT of the queried pid degrades to ``no-verdict``. That direction is the
     safe one (an abstention, never a false PASS) and it is why the doc's binding table
-    says row 2 holds only while the tree is live. A durable identity (the launcher's
-    ``pid=``-carrying ``[timeout] agent`` line, or a dispatch/incarnation id on the
-    bound line) is the real fix and is a separate change.
+    says row 2 holds only while the tree is live. ⛔ AND BARE EQUALITY IS NOT AN
+    INCARNATION FENCE: it proves a process with that PID NUMBER wrote the verdict, not that
+    THIS dispatch did, and `lane.sh` appends to one log file per lane number, so a recycled
+    pid can carry a previous dispatch's `finished`. The fix is an incarnation id (or
+    `pid_start=`) on the PRODUCED line, bound together with the pid — a producer change and
+    a separate one. The launcher's `pid=`-carrying `[timeout] agent` line is NOT it: it
+    carries the same bare pid and is consumed only for `runner_rc`. `docs/ops/fleet-liveness.md`
+    §13.4 states this as a named residual.
     """
     if child == root:
         return True
@@ -1712,10 +1717,30 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
         return Verdict("unknown", "process-identity-unreadable", detail=lr.detail)
 
     # (2) PROGRESS — a VETO. Either signal advancing is positive evidence of work.
+    #
+    # ⛔ THE TOLERANCE IS A RATE, NOT A FIXED DELTA. `cpu_tol_cs` is quoted for the
+    # `LOG_WINDOW_MS` sample span (10 cs / 30 s ~= 3.3 mCPU), but `--window-ms` is a
+    # caller-settable knob, so using the raw constant at any other window silently
+    # redefines the threshold: a lane burning ~1% of a core accumulates 5 cs in 5 s,
+    # which is BELOW 10 — so a LIVE, WORKING lane read `frozen/no-progress` for every
+    # `--window-ms` up to ~10 s. That is the `frozen`-on-a-working-lane class this axis
+    # exists to delete (§13.1 ranks it the ~50% false-negative), reachable by nothing
+    # more exotic than a diagnostic run that shortens the window for speed. Scaling the
+    # tolerance by the window restores the RATE the constant means:
+    #   delta_cs = f * span_s * 100, tol = rate * window_s * 100  =>  a lane at or above
+    #   the rated CPU rate reads `working` at EVERY window (span >= window, because the
+    #   second sample is taken after sleeping the window, so the scaling can only be
+    #   conservative). The `max(1, ...)` floor keeps a sub-`LOG_WINDOW_MS` window from
+    #   rounding the tolerance to 0 — which would make ANY CPU at all progress — while
+    #   still refusing to freeze a lane whose tree burns CPU at all.
+    eff_tol_cs = cpu_tol_cs
+    if lr.window_ms is not None and lr.window_ms > 0:
+        eff_tol_cs = max(1, (int(cpu_tol_cs) * int(lr.window_ms)) // LOG_WINDOW_MS)
+
     kinds = []
     if lr.size_delta is not None and lr.size_delta > 0:
         kinds.append("bytes")
-    if lr.cpu_delta_cs is not None and lr.cpu_delta_cs > cpu_tol_cs:
+    if lr.cpu_delta_cs is not None and lr.cpu_delta_cs > eff_tol_cs:
         kinds.append("cpu")
     if lr.transcript_grew is True:
         kinds.append("transcript")
@@ -1729,7 +1754,7 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
             numbers.append("transcript-grew")
         return Verdict("working", "progress:%s" % "+".join(kinds),
                        detail="%s window_ms=%s tol_cs=%d"
-                              % (" ".join(numbers), _n(lr.window_ms), cpu_tol_cs))
+                              % (" ".join(numbers), _n(lr.window_ms), eff_tol_cs))
 
     # (3) ANY single signal that could not be read is an ABSTENTION — never "flat".
     # ⛔ THE CONJUNCT IS `or`, AND THAT IS THE WHOLE SAFETY PROPERTY. With `and`, a
@@ -1798,7 +1823,7 @@ def log_lane_verdict(lr: Optional[LogRead], *, freeze_ms: int = LOG_FREEZE_MS,
                    detail="bytes_delta=%s transcript_grew=%s cpu_delta_cs=%s tol_cs=%d "
                           "age_ms=%d freeze_ms=%d window_ms=%s"
                           % (_n(lr.size_delta), _n(lr.transcript_grew), _n(lr.cpu_delta_cs),
-                             cpu_tol_cs, lr.age_ms, freeze_ms, _n(lr.window_ms)))
+                             eff_tol_cs, lr.age_ms, freeze_ms, _n(lr.window_ms)))
 
 
 def _n(v) -> str:
@@ -2946,9 +2971,18 @@ def gather_log_lane(
     # S1b, reading 1 — the transcript's size, when the lane HAS one.
     tsize0 = _size_or_none(transcript) if transcript else None
 
+    # ⛔ THE SPAN IS MEASURED, NOT ASSUMED. `window_ms` is the window the caller ASKED for;
+    # the walk of the process tree plus the sleep means the two deltas are actually taken
+    # over a longer stretch. Echoing the requested number as `window_ms=` (and, since the
+    # tolerance is a RATE, scaling by it) would under-report the span that was really
+    # sampled — the same "a number that names a different quantity" defect `freeze_ms=` /
+    # `window_ms=` were split to fix. So the span is taken from the clock and becomes the
+    # `window_ms` every later reader sees.
+    span_start = time.time()
     if sample and lr.readable:
         (sleep_fn or time.sleep)(max(0.0, window_ms / 1000.0))
         cpu1 = subtree_cpu_cs(pid)
+        lr.window_ms = max(1, int(round((time.time() - span_start) * 1000)))
         if cpu0 is None or cpu1 is None:
             lr.cpu_unreadable = True
             lr.cpu_delta_cs = None
@@ -3106,7 +3140,10 @@ def _log_lane_cli(argv: Sequence[str]) -> Optional[int]:
             window_ms_set = True
             # ⛔ A ZERO-LENGTH WINDOW CANNOT PRODUCE A DELTA. It collapses both readings
             # into one instant, so both progress signals are trivially flat and a LIVE,
-            # working lane reads `frozen` — measured end to end with a CPU burner.
+            # working lane reads `frozen` — measured end to end with a CPU burner. This
+            # refusal covers ONLY the undefined 0: every window >= 1 is legitimate because
+            # `log_lane_verdict` scales the CPU tolerance by the window it measured
+            # (T56) — a fixed tolerance froze a working lane at every window under ~10 s.
             if window_ms < 1:
                 print("liveness.py: --window-ms must be >= 1 (a zero-length window cannot "
                       "produce a delta)", file=sys.stderr)

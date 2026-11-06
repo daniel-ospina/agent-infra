@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-55 tests with 107 paired mutations: every mutation re-
+57 tests with 109 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -21,8 +21,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 55 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (107)
+    python3 tools/fleet/liveness.test.py                # the 57 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (109)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -3042,6 +3042,109 @@ def t55():
               % (label, v.state, v.reason))
 
 
+@test("T56 the CPU tolerance is a RATE — a short `--window-ms` cannot freeze a working lane")
+def t56():
+    """⛔ THE TOLERANCE IS A RATE, NOT A FIXED DELTA (measured false FROZEN).
+
+    `cpu_tol_cs` is quoted for `LOG_WINDOW_MS` (10 cs / 30 s ~= 3.3 mCPU), but
+    `--window-ms` is caller-settable. Applying the raw constant at a shorter window
+    silently raises the bar: a lane burning ~1% of a core accumulates 5 cs in 5 s,
+    which is BELOW 10 — so a LIVE, WORKING lane read `frozen/no-progress`.
+
+    Measured on this host, ONE CPU burner, the SAME instant:
+      --window-ms 30000 -> working progress:cpu cpu+2891cs
+      --window-ms 50    -> frozen no-progress ... cpu_delta_cs=9
+    ``frozen`` on a working lane is the ~50% false-negative class (§13.1) this whole
+    axis exists to delete, so the tolerance is scaled by the window that was used and
+    the effective threshold is echoed.
+    """
+    def lr(**kw):
+        base = dict(alive=True, size_delta=0, transcript_grew=False,
+                    age_ms=liv.LOG_FREEZE_MS + H)
+        base.update(kw)
+        return LR(**base)
+
+    # (a) THE DEFECT: at a short window, real CPU work IS progress.
+    for w, delta in ((50, 9), (1000, 4), (5000, 5), (5000, 26)):
+        v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=delta, window_ms=w)))
+        check(v.state == "working" and "cpu" in v.reason,
+              "window_ms=%d with cpu_delta_cs=%d is a WORKING lane; got %s/%s %s"
+              % (w, delta, v.state, v.reason, v.detail))
+
+    # (b) ⛔ NOT NEUTERED — a genuinely flat lane still freezes at EVERY window. This is
+    # the half that stops the fix from being "make everything progress".
+    for w in (50, 1000, 5000, liv.LOG_WINDOW_MS):
+        v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=0, window_ms=w)))
+        check(v.state == "frozen" and v.reason == "no-progress",
+              "a FLAT lane still freezes at window_ms=%d; got %s/%s" % (w, v.state, v.reason))
+
+    # …and the documented default threshold is unchanged and STRICT (`>`, not `>=`).
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=liv.LOG_CPU_TOL_CS,
+                                             window_ms=liv.LOG_WINDOW_MS)))
+    check(v.state == "frozen", "at the default window the tolerance is still STRICTLY above")
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=liv.LOG_CPU_TOL_CS + 1,
+                                             window_ms=liv.LOG_WINDOW_MS)))
+    check(v.state == "working", "one cs above the rated tolerance is progress")
+
+    # (c) THE ECHO IS THE THRESHOLD THAT DECIDED, so a reader is never told about a
+    # different number from the one applied.
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=5, window_ms=5000)))
+    check("tol_cs=1" in (v.detail or "") and "window_ms=5000" in (v.detail or ""),
+          "the detail echoes the SCALED tolerance actually applied; got %r" % (v.detail,))
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=0, window_ms=liv.LOG_WINDOW_MS)))
+    check("tol_cs=10" in (v.detail or ""), "at the default window the echo is the rated 10")
+    # An UNKNOWN window (the census seam, where the caller owns the samples) abstains from
+    # scaling rather than inventing one — the tolerance stays the rated constant.
+    v = liv.evaluate(liv.Evidence(log_read=lr(cpu_delta_cs=5, window_ms=None)))
+    check("tol_cs=10" in (v.detail or ""),
+          "window_ms=None does not scale (no span to scale by); got %r" % (v.detail,))
+
+
+@test("T57 EVERY conjunct of the masking refusal is pinned ALONE, not only in aggregate")
+def t57():
+    """⛔ EIGHT OF THE TEN CONJUNCTS COULD BE DELETED WITH THE SUITE STILL GREEN.
+
+    T36 drove the refusal through `ev()`, whose base sets `sid`, `jsonl_grew` AND
+    `jsonl_age_ms` TOGETHER — so any one surviving conjunct kept the guard firing and a
+    single deletion was invisible. Measured before this test, each of these removed
+    alone left `PASS=55 FAIL=0`: `ev.sid`, `ev.claim_read`, `ev.candidates`, `ev.record`,
+    `ev.jsonl_grew`, `ev.jsonl_age_ms`, `ev.tool`, `ev.jsonl_turn`.
+
+    That is the same defect the file already records once ("the guard listed only
+    POSITIVE session fields once" -> T55), and it lands as a false PASS in the MASKING
+    direction: drop one conjunct and `Evidence(log_read=frozen, claim_read=...)` resolves
+    to `frozen`, convicting a lane on evidence the query also carried, with a green suite
+    and `--mutations` at 107/107.
+    """
+    lr_frozen = LR(alive=True, size_delta=0, transcript_grew=False, cpu_delta_cs=0,
+                   age_ms=liv.LOG_FREEZE_MS + H, window_ms=liv.LOG_WINDOW_MS)
+
+    # CONTROL FIRST: with ONLY log_read, the convicting state is legitimate — otherwise
+    # "refuse everything" would pass this test.
+    check(liv.evaluate(liv.Evidence(log_read=lr_frozen)).state == "frozen",
+          "a clean log-only query still reaches frozen")
+
+    # ONE field at a time. The sentinels are never inspected: the refusal must fire on
+    # PRESENCE, which is exactly what masking is.
+    lone = [
+        ("sid", dict(sid="sid-1")),
+        ("claim_read", dict(claim_read=object())),
+        ("candidates", dict(candidates=[C(1, NOW_MS)])),
+        ("record", dict(record=object())),
+        ("jsonl_grew", dict(jsonl_grew=False)),
+        ("jsonl_age_ms", dict(jsonl_age_ms=H)),
+        ("tool", dict(tool=object())),
+        ("jsonl_turn", dict(jsonl_turn=object())),
+        ("ps_ok=False", dict(ps_ok=False)),
+        ("store_ok=False", dict(store_ok=False)),
+    ]
+    for label, kw in lone:
+        v = liv.evaluate(liv.Evidence(log_read=lr_frozen, **kw))
+        check(v.state == "unknown" and v.reason == "log-read-on-session-query",
+              "%s ALONE must refuse the log axis; got %s/%s %s"
+              % (label, v.state, v.reason, v.detail))
+
+
 class Mutation:
     def __init__(self, test_name, target, old, new, why):
         self.test_name = test_name
@@ -3867,6 +3970,22 @@ MUTATIONS = [
         "a marker line with NO `pid=` token is taken as the launcher report again: it asserts "
         "a pid token existed AND shadows an earlier readable witness, downgrading a "
         "corroborated `finished` to `unknown`",
+    ),
+    Mutation(
+        "T56", "module",
+        '        eff_tol_cs = max(1, (int(cpu_tol_cs) * int(lr.window_ms)) // LOG_WINDOW_MS)',
+        '        eff_tol_cs = cpu_tol_cs',
+        "the tolerance goes back to a FIXED delta, so a lane WORKING at a short "
+        "`--window-ms` reads `frozen` again (measured: cpu+9cs at `--window-ms 50`, "
+        "cpu+4cs at 2000) — a false FROZEN on the state this axis exists to get right",
+    ),
+    Mutation(
+        "T57", "module",
+        'or ev.candidates or ev.record is not None',
+        'or ev.record is not None',
+        "ONE conjunct of the masking refusal is dropped — invisible before T57 because the "
+        "guard was pinned only in aggregate (#1777 B7 rebuilt: a `frozen` log read then "
+        "convicts a lane whose claim/candidate evidence the query carried)",
     ),
 ]
 
