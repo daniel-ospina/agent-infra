@@ -2057,12 +2057,52 @@ claim_snapshot() {
   return 0
 }
 
+# claim_wip_line <issue> — the WIP clause a REAP prints and logs for an issue key (#3484).
+# ⛔ ONE READER: `brief-gate.sh --wip-refs` owns the ref matcher, so a reap cannot report a different
+# population than the dispatch gate refuses on. This function only FORMATS. An unreadable `refs/wip`
+# is reported as UNMEASURED and never as "none": #3382 invariant 1 (`unknown != zero`).
+claim_wip_line() {
+  local issue="${1:-}" bg out rc line r s
+  case "$issue" in ''|*[!0-9]*) printf 'n/a (this key carries no issue number)'; return 0 ;; esac
+  bg="$(dirname "${BASH_SOURCE[0]:-$0}")/brief-gate.sh"
+  if [ ! -f "$bg" ]; then
+    printf 'UNMEASURED (brief-gate.sh is not beside this registry, so refs/wip cannot be read for #%s)' "$issue"
+    return 0
+  fi
+  # ⛔ ABSOLUTISE BEFORE THE NEUTRAL-cwd `cd` (fresh-context review of #3484, P2). This registry
+  # supports `CLAIM_REPO="."` (a caller standing at a work-tree root); resolved from `/tmp` that path
+  # names a DIFFERENT tree, so the clause read UNMEASURED on a box whose origin answered fine.
+  local repo_abs=""
+  [ -n "${CLAIM_REPO:-}" ] && repo_abs="$(cd "$CLAIM_REPO" 2>/dev/null && pwd)"
+  out="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && bash "$bg" --wip-refs "$issue" "$repo_abs" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'UNMEASURED (refs/wip could not be read for #%s — unknown is not zero)' "$issue"
+    return 0
+  fi
+  line=""
+  while IFS=$'\t' read -r r s; do
+    [ -n "${r:-}" ] || continue
+    line="${line}${line:+, }$r @ ${s}"
+  done <<< "$out"
+  if [ -z "$line" ]; then
+    printf 'none — no refs/wip ref matched #%s (measured: brief-gate.sh --wip-refs %s)' "$issue" "$issue"
+    return 0
+  fi
+  printf '%s — read it before starting; do not re-derive it' "$line"
+  return 0
+}
+
 # claim_prune — delete EXPIRED, UNPARSEABLE-LEASE and ORPHANED-HOST claim refs (git refs are
 # unbounded), and reap LEAKED temp refs. Three arms, in this order: (1) EXPIRY — `_lease_is_live`
 # answers expired, so a future lease is still evidence of a holder; (2) UNPARSEABLE-LEASE — no reader
 # can parse the term, so it is reaped on a BOUNDED SCHEDULE measured from the claim's own commit time
 # (agent-infra#3203 — before this arm the class was eternal), which also takes the class OUT of arm 3;
 # (3) ORPHANED-HOST — only an orphaned host makes a future lease reaptable (agent-infra#2094).
+# (4) Every reap above also EMITS THE HANDOVER LINE for its key (#3484): the `refs/wip/*` snapshot (and
+# any issue-named dirty worktree) behind the claim, or `none`/`UNMEASURED` for that issue. `claim_prune`
+# deletes with no per-claim evidence and no record, so a reap used to read as "nothing happened here"
+# while the rescued work sat on origin; stdout is what `orch-loop.sh` redirects into $LOG
+# (`claim_prune >> "$LOG" 2>&1`), so a silent reclaim is no longer possible.
 claim_prune() {
   local now ref lease until owner ct age; now="$(date +%s)"
   # ⛔ THE CLOCK IS VALIDATED ONCE, BEFORE ANY ARITHMETIC (review, agent-infra#3203). TWO distinct
@@ -2099,7 +2139,10 @@ claim_prune() {
     # inline copy here would reap a claim every reader refuses to steal; since agent-infra#3203 the
     # third arm below is what ends that class's block, on its own bounded schedule).
     if ! _lease_is_live "$until" "$now"; then
-      _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null && echo "pruned expired $ref"
+      _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null && {
+        echo "pruned expired $ref"
+        echo "  WIP AT RELEASE: $(claim_wip_line "${ref##*/issue-}")"
+      }
       continue
     fi
     # ── AND BY THE BOUNDED EXPIRY FOR A LEASE NO READER CAN PARSE (agent-infra#3203) ──────────
@@ -2135,6 +2178,7 @@ claim_prune() {
       fi
       if _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null; then
         echo "pruned unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed and the claim commit is ${age}s old, PAST the ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s bound — agent-infra#3203)"
+        echo "  WIP AT RELEASE: $(claim_wip_line "${ref##*/issue-}")"
       else
         # ⛔ A FAILED DELETE MUST SAY SO. Silence here reads as "the pass had nothing to do", which is
         # how an eternal block comes back without anyone noticing — the arm's own rule is that every
@@ -2155,6 +2199,7 @@ claim_prune() {
     if why="$(claim_orphan_reason "$owner" "$ref")"; then
       if _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null; then
         echo "pruned orphaned-host $ref (owner $owner — $why)"
+        echo "  WIP AT RELEASE: $(claim_wip_line "${ref##*/issue-}")"
       fi
     fi
   done

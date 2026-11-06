@@ -422,6 +422,17 @@ as_box "$ORIG2" peerhost 'c="$(_claim_commit "peerhost:1" "$(( $(date +%s) + 108
 has_ref "$ORIG2" refs/claims/issue-9209411 && has_ref "$ORIG2" refs/claims/issue-9209412 \
   && has_ref "$ORIG2" refs/claims/issue-9209413
 ck "O2 (setup) the three fixture claims are on the origin" $?
+# ── O2b: THE RELEASE IS THE HANDOVER (#3484) ─────────────────────────────────────────────────────
+# A released claim reads as "nothing happened here" unless the pass says what was behind it. Measured
+# 2026-11-05: 222 rescued `refs/wip/*` archives existed on this repo and nothing told the next actor
+# to look. So `claim_prune` prints the WIP clause for EVERY reaped ref — matched, absent, or
+# unmeasurable — and this is the arm that keeps it from going quiet again.
+W_TREE="$("$REAL_GIT" -C "$T/repo" hash-object -t tree /dev/null 2>/dev/null)"
+W_SHA="$("$REAL_GIT" -C "$T/repo" -c user.name=wip -c user.email=wip@localhost \
+          commit-tree "$W_TREE" -m 'wip: fixture snapshot for issue 9209411' 2>/dev/null)"
+[ -n "$W_SHA" ] && "$REAL_GIT" -C "$T/repo" push -q origin "$W_SHA:refs/wip/issue-9209411-handover" 2>/dev/null
+has_ref "$ORIG2" refs/wip/issue-9209411-handover
+ck "O2b (setup) a rescued refs/wip snapshot sits on the origin for the issue under test" $?
 PRUNE="$(as_box "$ORIG2" newhost 'claim_prune' CLAIM_KNOWN_HOSTS='newhost peerhost')"
 grep -q 'refs/claims/issue-9209411' <<<"$PRUNE"; ck "O2 [RED→GREEN] claim_prune reaps the ORPHANED-HOST claim (lease had hours left)" $?
 grep -q -i 'orphan' <<<"$PRUNE"; ck "O2 [RED→GREEN] the orphan reap says so by name" $?
@@ -430,6 +441,12 @@ ck "O2 [RED→GREEN] the orphaned-host claim is gone from the origin" $rc
 grep -q 'refs/claims/issue-9209412' <<<"$PRUNE"; ck "O3 [PINNED] claim_prune still reaps the EXPIRED claim" $?
 has_ref "$ORIG2" "refs/claims/issue-9209412" && rc=1 || rc=0
 ck "O3 [PINNED] the expired claim is gone from the origin" $rc
+grep -q 'WIP AT RELEASE: refs/wip/issue-9209411-handover' <<<"$PRUNE"
+ck "O2b [RED→GREEN] the reap of #9209411 NAMES the rescued ref behind it (#3484)" $?
+grep -q 'read it before starting; do not re-derive it' <<<"$PRUNE"
+ck "O2b …and tells the next actor what to do with it, not just that it exists" $?
+grep -q 'WIP AT RELEASE: none — no refs/wip ref matched #9209412' <<<"$PRUNE"
+ck "O3b [PINNED] a reap with NO rescued ref says 'none' for THAT issue — the line is per ref, not a global" $?
 has_ref "$ORIG2" "refs/claims/issue-9209413"; ck "O4 [PINNED] the KNOWN live host's claim SURVIVED the prune" $?
 
 # ══ O8: the PRE-FLIGHT must read an orphaned claim as CLEAN, a live peer's as COLLISION ══
