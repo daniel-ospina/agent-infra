@@ -1254,6 +1254,22 @@ repro_script_log() {  # <path> <nodeid-to-echo> <request-log>
   chmod +x "$1"
 }
 
+# repro_script_pwd <path> <nodeid-to-echo> <request-log> <pwd-record>
+#
+# `repro_script_log` plus a record of the directory the seam ACTUALLY ran in. The
+# `ADMIN_MERGE_REPRO_CMD` contract is "no worktree is created and the command runs
+# in `$PWD`", and that contract is only observable if the seam reports where it
+# was — without this the shard arm silently relocating the pytest arm (measured in
+# review of #3415: one shared directory variable) cannot be asserted at all.
+repro_script_pwd() {  # <path> <nodeid-to-echo> <request-log> <pwd-record>
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'pwd -P > %q\n' "$4"
+    printf 'tee %q | grep -F %q | sed "s/^/FAILED /"\n' "$3" "$2"
+  } > "$1"
+  chmod +x "$1"
+}
+
 # Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
 # the fixture models the projection: `<status>\t<conclusion>\t<sha>:<run-id>`.
@@ -2552,6 +2568,27 @@ repro_base_shard() {  # <repo-relative path> <exit-code> [unlisted]
   repro_base_publish
 }
 
+# repro_pr_shard_copy <repo-relative path> <exit-code>
+#
+# OVERWRITES the shard in the PR WORKING TREE ONLY — never committed — so the PR
+# checkout's copy of the shard DISAGREES with the BASE COMMIT's. Without it the two
+# trees are byte-identical for that path, and "measured in the base tree" cannot be
+# distinguished from "measured in the PR checkout" (measured in review of #3415:
+# the mutant that ran the shard in `$PWD` instead of the base worktree left EVERY
+# assertion green, because the PR's copy was the same failing script). It also
+# writes a `pr-shard-ran` marker the scenarios assert is ABSENT, which states the
+# property directly instead of inferring it from an exit code.
+repro_pr_shard_copy() {  # <repo-relative path> <exit-code>
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# #3415 fixture: the PR WORKING TREE%ss copy of this shard — deliberately the\n' "'"
+    printf '# OTHER verdict from the base commit, so a rail that measures the PR checkout\n'
+    printf '# is caught instead of agreeing with itself.\n'
+    printf 'printf "ran-pr\\n" >> %q\n' "$SCEN/pr-shard-ran"
+    printf 'exit %s\n' "$2"
+  } > "$SCEN/$1"
+}
+
 # run_admin_repro <pytest-seam> <shard-seam> <rail args…> — the TWO #3715 seams,
 # either omitted when empty (an OMITTED seam means the PRODUCTION path for that
 # arm, which is what case 1 needs). The rail runs with ITS CWD SET TO THE SCENARIO,
@@ -2601,6 +2638,12 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3402"
 # NO SEAM AT ALL: this exercises the real worktree, the real `bash <path>`, and the
 # real containment check. `run_admin_cwd` also gives the rail the scenario AS ITS
 # CHECKOUT, which the production path needs in order to materialise the base.
+# ⛔ THE PR CHECKOUT'S COPY IS MADE TO DISAGREE (#3415 review 4): `repro_pr_shard_copy`
+# leaves a working-tree copy that exits 0 while the BASE COMMIT's exits 1. A rail that
+# measured the PR checkout would therefore see 0 and BLOCK, and the marker assertion
+# below names the property outright. Without this the fixture agreed with itself and
+# the mutant was invisible.
+repro_pr_shard_copy "$SHARD_BO" 0
 run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "#3415: a shard the BASE fails no longer blocks the PR (exit 0)" \
@@ -2608,6 +2651,9 @@ rc=$?
 [ -f "$SCEN/base-shard-ran" ] \
   && pass "#3415: the shard was EXECUTED in the base tree (measured, not inferred)" \
   || fail "#3415: the base shard never ran — the clearance (if any) did not come from a measurement"
+[ ! -f "$SCEN/pr-shard-ran" ] \
+  && pass "#3415: …and NOT from the PR checkout — the BASE tree's copy was the one measured" \
+  || fail "#3415: the shard RAN from the PR WORKING TREE — a rail that measures the PR's own copy clears every residual shard, and the PR's copy exits 0 here"
 grep -q "^   pre-existing: bash-shard::$SHARD_BO" "$SCEN/err" \
   && pass "#3415: the base-owned shard is reported pre-existing by its full id" \
   || { fail "#3415: the cleared shard was not reported pre-existing"; grep -n 'pre-existing\|reproduced' "$SCEN/err" | sed 's/^/      /' | head; }
@@ -2632,6 +2678,11 @@ log_failed_shard "$SHARD_PC" > "$SCEN/log-3411"
 cp "$SCEN/log-3411" "$SCEN/log-after-3411"
 lane_fail mainpc 3412 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3412"
+# ⛔ THE OPPOSITE DISAGREEMENT (#3415 review 4): here the BASE PASSES the shard
+# (exit 0) and the PR checkout's copy exits 1. A rail that measured the PR checkout
+# would read 1 as "the base fails it" and CLEAR a red the PR caused — so this half
+# of the discriminator is the fail-open one, and it needs the same fixture.
+repro_pr_shard_copy "$SHARD_PC" 1
 run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "#3415: a shard the PR broke still BLOCKS (exit $rc)" \
@@ -2639,6 +2690,9 @@ rc=$?
 [ -f "$SCEN/base-shard-ran" ] \
   && pass "#3415: …and the base shard really did run (the block rests on a measurement)" \
   || fail "#3415: the PR-caused case blocked without the base being measured — the assertion is vacuous"
+[ ! -f "$SCEN/pr-shard-ran" ] \
+  && pass "#3415: …measured in the BASE tree, not the PR checkout (whose copy exits 1 and would have cleared)" \
+  || fail "#3415: the PR-caused shard was measured from the PR WORKING TREE — its copy exits 1, i.e. the clearance came from the PR's own tree"
 grep -qF -- "bash-shard::$SHARD_PC" "$SCEN/err" \
   && pass "#3415: the surviving refusal NAMES the shard still in the residual" \
   || fail "#3415: the PR-caused shard vanished from the refusal"
@@ -2899,6 +2953,220 @@ grep -q "budget is EXHAUSTED" "$SCEN/err" \
 grep -q "^   pre-existing: bash-shard::" "$SCEN/err" \
   && fail "#3415: a shard was reported pre-existing off a bound-killed run" \
   || pass "#3415: …and nothing was cleared"
+
+# (12) A SIGNAL DEATH IS NOT A VERDICT — the CLASS, not just SIGALRM (#3415 review 4,
+# P1). The shard arm's verdict IS the exit status, so every status that did not come
+# FROM the shard is a non-measurement, and 142 is a MEMBER of that class (128+N =
+# death by signal N), not the class itself. Pinning only 142 left an OOM SIGKILL (137)
+# on a loaded box, or a reaper's SIGTERM (143), reading as "the base fails this
+# shard" — clearing a red the PR caused off a run that produced no verdict. The base
+# shard here is really SIGKILLed in the real worktree, so the case cannot be
+# satisfied by echoing a status through the seam.
+new_scen repro-shard-signal
+SHARD_SIG='tests/fixture-shard-sigkilled.sh'
+mkdir -p "$SCEN/$(dirname "$SHARD_SIG")"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# #3415 fixture: the BASE tree%ss run of this shard is KILLED by an outside\n' "'"
+  printf '# signal, so it never returns a verdict of its own. Records that it RAN first.\n'
+  printf 'printf "ran\\n" >> %q\n' "$SCEN/base-shard-ran"
+  printf 'kill -KILL $$\n'
+} > "$SCEN/$SHARD_SIG"
+git -C "$SCEN" add -- "$SHARD_SIG" >/dev/null 2>&1
+SCEN_SHARD_LIST="$SHARD_SIG"
+repro_base_publish
+HEAD_SSG="fcfc000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SSG" > "$SCEN/head"
+lane_fail "$HEAD_SSG" 3501 > "$SCEN/runs-$HEAD_SSG"
+log_failed_shard "$SHARD_SIG" > "$SCEN/log-3501"
+cp "$SCEN/log-3501" "$SCEN/log-after-3501"
+lane_fail mainsig 3502 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3502"
+run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ -f "$SCEN/base-shard-ran" ] \
+  && pass "#3415: the SIGNAL-killed base shard really did run (the case is not vacuous)" \
+  || fail "#3415: the signal case never executed the base shard — the fixture, not the guard, would be under test"
+[ "$rc" -ne 0 ] && pass "#3415: a base shard that DIED ON A SIGNAL is not a clearance (exit $rc)" \
+  || { fail "#3415: a signal-killed base run (137) was read as 'the base fails this shard' — the 128+N CLASS is unhandled, so any kill on a loaded box clears a PR-caused red"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "DIED ON SIGNAL 9 (status 137)" "$SCEN/err" \
+  && pass "#3415: the refusal names the SIGNAL, not only the alarm bound" \
+  || fail "#3415: a non-SIGALRM signal death was not reported as a non-measurement"
+grep -q "^   pre-existing: bash-shard::$SHARD_SIG" "$SCEN/err" \
+  && fail "#3415: a signal-killed shard was reported pre-existing" \
+  || pass "#3415: …and nothing was cleared"
+
+# (13) EACH ARM OWNS ITS DIRECTORY — the PYTEST SEAM stays in `$PWD` (#3415 review 4,
+# P2). The shard arm needs a base WORKTREE; the pytest seam's own documented contract
+# is the opposite ("when set, no worktree is created and the command runs in `$PWD`").
+# ONE shared directory variable let the shard arm's tree RELOCATE the seam, so a seam command
+# written relative to `$PWD` executed somewhere else. This is the mix the fleet
+# actually runs: a nodeid seam plus a production shard arm.
+new_scen repro-shard-seam-cwd
+SHARD_SC='tests/fixture-shard-seam-cwd.sh'
+repro_base_shard "$SHARD_SC" 1            # a REAL base commit, so the worktree materialises
+NODE_SC='tests/test_genuinely_new_3415_sc.py::test_pr_broke_it'
+HEAD_SSC="fdfd000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SSC" > "$SCEN/head"
+lane_fail "$HEAD_SSC" 3511 > "$SCEN/runs-$HEAD_SSC"
+{ log_failed "$NODE_SC"; log_failed_shard "$SHARD_SC"; } > "$SCEN/log-3511"
+cp "$SCEN/log-3511" "$SCEN/log-after-3511"
+lane_fail mainsc 3512 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3512"
+repro_script_pwd "$SCEN/repro-pwd.sh" "$NODE_SC" "$SCEN/repro-request.txt" "$SCEN/seam-pwd.txt"
+run_admin_repro "bash $SCEN/repro-pwd.sh" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+seam_pwd="$(cat "$SCEN/seam-pwd.txt" 2>/dev/null)"
+scen_real="$(cd "$SCEN" && pwd -P)"
+[ "$seam_pwd" = "$scen_real" ] \
+  && pass "#3415: the PYTEST SEAM ran in \$PWD — the shard arm's worktree did not relocate it" \
+  || fail "#3415: the pytest seam ran in '$seam_pwd', not the caller's \$PWD ('$scen_real') — the shard arm hijacked its cwd, breaking the documented seam contract"
+grep -q "^   pre-existing: $NODE_SC" "$SCEN/err" \
+  && pass "#3415: …and the nodeid still cleared through its seam" \
+  || { fail "#3415: the nodeid did not clear in the mixed residual — the seam arm was suppressed"; sed 's/^/      /' "$SCEN/err" | tail -30; }
+grep -q "^   pre-existing: bash-shard::$SHARD_SC" "$SCEN/err" \
+  && pass "#3415: …while the shard cleared through the PRODUCTION worktree arm beside it" \
+  || fail "#3415: the shard did not clear in the mixed seam/production residual"
+
+# (14) A WORKTREE THAT CANNOT BE MATERIALISED MUST NOT SUPPRESS THE OTHER ARM
+# (#3415 review 4, P2). The bogus base OID makes `git worktree add` fail; the old
+# code `return 1`ed there, BEFORE arm 1 ran — so the pytest seam, which needs no
+# worktree at all, never executed and cleared nothing. That is one arm's missing tree
+# becoming the other arm's verdict, which this function's own RETURN contract
+# ("one arm that could not run never suppresses the other arm's measurement")
+# forbids.
+new_scen repro-shard-seam-nobase
+NODE_NB='tests/test_genuinely_new_3415_nb.py::test_pr_broke_it'
+SHARD_NB='tests/fixture-shard-pr-tree-only.sh'
+repro_base_sha                             # a base OID that does NOT exist: `git worktree add` FAILS
+# ⛔ THE PR WORKING TREE CARRIES A *RUNNABLE* COPY of the shard AND its OWN shard
+# LIST (#3415 review 4, P1). That is what makes this case discriminating: with the
+# worktree creation failing and `shard_dir` left at `$PWD`, a rail that runs the
+# PRODUCTION arm anyway finds both, executes the PR's copy (which exits 1, i.e.
+# "fails") and CLEARS the PR's own red — a fail-open that is strictly worse than
+# the pre-change `return 1`, which cleared nothing. Without the list in the PR tree
+# the arm would refuse for the unrelated "unreadable list" reason and the assertion
+# below would go green for the wrong cause.
+mkdir -p "$SCEN/scripts" "$SCEN/$(dirname "$SHARD_NB")"
+printf '#!/usr/bin/env bash\n[ "${1:-}" = "--list" ] || exit 0\nprintf "%%s\\n" %q\n' "$SHARD_NB" \
+  > "$SCEN/scripts/run-bash-shards.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'printf "ran-pr\\n" >> %q\n' "$SCEN/pr-shard-ran"
+  printf 'exit 1\n'
+} > "$SCEN/$SHARD_NB"
+HEAD_SNB="fefe000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SNB" > "$SCEN/head"
+lane_fail "$HEAD_SNB" 3521 > "$SCEN/runs-$HEAD_SNB"
+{ log_failed "$NODE_NB"; log_failed_shard "$SHARD_NB"; } > "$SCEN/log-3521"
+cp "$SCEN/log-3521" "$SCEN/log-after-3521"
+lane_fail mainnb 3522 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3522"
+repro_script_log "$SCEN/repro-nb.sh" "$NODE_NB" "$SCEN/repro-request.txt"
+run_admin_repro "bash $SCEN/repro-nb.sh" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+grep -q "^   pre-existing: $NODE_NB" "$SCEN/err" \
+  && pass "#3415: a base worktree that could NOT be materialised does not suppress the seam arm" \
+  || { fail "#3415: the pytest seam never ran because the SHARD arm's worktree failed — one arm's tree suppressed the other arm's measurement"; sed 's/^/      /' "$SCEN/err" | tail -30; }
+grep -q "^   pre-existing: bash-shard::$SHARD_NB" "$SCEN/err" \
+  && fail "#3415: the shard cleared with no base worktree at all — the arm ran in the PR CHECKOUT and cleared a red the PR caused" \
+  || pass "#3415: …and nothing was cleared on the arm that HAD no tree (fail closed)"
+[ ! -f "$SCEN/pr-shard-ran" ] \
+  && pass "#3415: …and the PR working tree's copy of the shard was never EXECUTED" \
+  || fail "#3415: the production shard arm EXECUTED the PR working tree's copy — with no base worktree it measured the PR, not the base"
+grep -q "the shard arm needs the base worktree" "$SCEN/err" \
+  && pass "#3415: …and the refusal names the missing WORKTREE as the reason" \
+  || fail "#3415: the missing-worktree case was not reported as such (it may have been refused for an unrelated cause)"
+
+# (15) EVERY REFUSAL ARM IN `repro_shard_path`, NOT ONLY `..` (#3415 review 4, P2).
+# The token is attacker-influenced, and only the traversal arm was pinned — so
+# deleting the leading-`-` arm (the code's OWN documented `bash -c` OPTION INJECTION
+# hazard) or the absolute / percent-encoded arms could not turn any assertion red.
+# The shard seam here is `exit 1`, so a token that got EXECUTED would CLEAR: the
+# assertions fail on EXECUTION, not merely on a changed message. The last token is a
+# LISTED control that MUST clear, so "nothing was cleared" cannot be satisfied by an
+# arm that never ran.
+# ⛔ THE "NOTHING HOSTILE CLEARED" ASSERTION IS A COUNT, NOT A LITERAL PATTERN
+# (review round 5, P2). The obvious pattern — `pre-existing: bash-shard::tests/%2e%2e/`
+# — is DEAD TEXT: `ci_exemption._shard_token` percent-encodes `%` again, so the id the
+# rail actually emits is `tests/%252e%252e/…` and the literal never matches. A cleared
+# percent token would have gone unnoticed. Counting `pre-existing: bash-shard::` lines
+# and requiring EXACTLY ONE (the control) is encoding-independent: any hostile token
+# that clears takes the count to 2 and reddens, whatever the encoder did to it.
+# The `%` arm is additionally REDUNDANT with the alphabet arm by construction (`%` is
+# outside `[A-Za-z0-9_./-]`), so `*%*` is belt-and-braces; what these tokens pin is the
+# REFUSAL PATH for three shapes, not three independently-deletable arms.
+new_scen repro-shard-token-arms
+SHARD_CTL='tests/fixture-shard-token-control.sh'
+repro_base_shard "$SHARD_CTL" 1           # a listed, real base shard: the arm must RUN
+HEAD_STK="ffff000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_STK" > "$SCEN/head"
+lane_fail "$HEAD_STK" 3531 > "$SCEN/runs-$HEAD_STK"
+{
+  log_failed_shard '-c'
+  log_failed_shard '/etc/passwd'
+  log_failed_shard 'tests/%2e%2e/agent-infra-3415-evil.sh'
+  log_failed_shard "$SHARD_CTL"
+} > "$SCEN/log-3531"
+cp "$SCEN/log-3531" "$SCEN/log-after-3531"
+lane_fail maintk 3532 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3532"
+run_admin_repro "" 'exit 1' 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+refused="$(grep -c "does not name a repo-relative script" "$SCEN/err" 2>/dev/null)"
+[ -n "$refused" ] || refused=0
+[ "$refused" -ge 3 ] \
+  && pass "#3415: the leading '-', absolute and percent-encoded tokens are EACH refused by name ($refused)" \
+  || fail "#3415: only $refused of the 3 hostile tokens was refused by name — a repro_shard_path arm is unguarded"
+grep -q "^   pre-existing: bash-shard::$SHARD_CTL" "$SCEN/err" \
+  && pass "#3415: …and the LISTED control still cleared, so the arm really ran" \
+  || { fail "#3415: the control shard did not clear — 'nothing was cleared' would be vacuous here"; sed 's/^/      /' "$SCEN/err" | tail -30; }
+cleared_n="$(grep -c '^   pre-existing: bash-shard::' "$SCEN/err" 2>/dev/null)"
+[ -n "$cleared_n" ] || cleared_n=0
+[ "$cleared_n" -eq 1 ] \
+  && pass "#3415: …and EXACTLY ONE shard cleared — the listed control, not a hostile token" \
+  || fail "#3415: $cleared_n shard(s) were reported pre-existing — a hostile token was EXECUTED and cleared the residual"
+
+# (16) THE PRODUCTION PYTEST ARM NEEDS THE TREE TOO (#3415 review 4, P1). The SAME
+# fail-open as (14), one arm over: with the base worktree missing, the pytest arm's
+# directory falls back to the PR's own checkout, so an UNGATED arm 1 selects
+# `uv run --frozen pytest` against the PR tree, recovers the residual nodeid from ITS
+# capture and CLEARS it — a PR-caused red cleared with no base ever measured. Gating
+# only the shard arm does not cover this, which is why it is fixtured separately.
+# The `uv` stub is what makes the case DISCRIMINATE: with no real uv, or no uv.lock,
+# arm 1 refuses for "no runnable lane runner" and the assertions would go green for
+# the wrong cause.
+new_scen repro-pytest-nobase
+NODE_PN='tests/test_genuinely_new_3415_pn.py::test_pr_broke_it'
+repro_base_sha                             # a base OID that does NOT exist: `git worktree add` FAILS
+STUB_PN="$TMP/stubbin-3415-pn"; rm -rf "$STUB_PN"; mkdir -p "$STUB_PN"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# #3415 fixture: a uv that records WHERE it ran, then reports the nodeid on\n'
+  printf '# stdin as a pytest failure — the shape `ci_exemption.py ids` recovers.\n'
+  printf 'printf "ran-pytest-pr\\n" >> %q\n' "$SCEN/pr-pytest-ran"
+  printf 'sed "s/^/FAILED /"\n'
+} > "$STUB_PN/uv"
+chmod +x "$STUB_PN/uv"
+: > "$SCEN/uv.lock"                        # arm 1 takes the PRODUCTION runner selection
+HEAD_SPN="f0f0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SPN" > "$SCEN/head"
+lane_fail "$HEAD_SPN" 3541 > "$SCEN/runs-$HEAD_SPN"
+log_failed "$NODE_PN" > "$SCEN/log-3541"
+cp "$SCEN/log-3541" "$SCEN/log-after-3541"
+lane_fail mainpn 3542 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3542"
+PATH="$STUB_PN:$PATH" run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+grep -q "the pytest arm needs the base worktree" "$SCEN/err" \
+  && pass "#3415: the PRODUCTION pytest arm is REFUSED when the base worktree is missing" \
+  || fail "#3415: the missing-worktree case was not reported for the pytest arm (it may have refused for an unrelated cause)"
+[ ! -f "$SCEN/pr-pytest-ran" ] \
+  && pass "#3415: …and the PR working tree was never used as the pytest run's directory" \
+  || fail "#3415: the production pytest arm RAN in the PR working tree — with no base worktree it measured the PR, not the base"
+grep -q "^   pre-existing: $NODE_PN" "$SCEN/err" \
+  && fail "#3415: a PR-caused nodeid was CLEARED off a run in the PR checkout" \
+  || pass "#3415: …and nothing was cleared (fail closed)"
 
 # ── 5. extraction failure is fail-closed (the vacuous-pass guard) ──────────
 echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pass) =="

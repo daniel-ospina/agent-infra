@@ -6760,7 +6760,7 @@ PYTEST_REPRO_ID_RE="${SHARD_REPRO_ID_RE}|${NON_LOCAL_REPRO_ID_RE}"
 # ⛔ THE SHARD ARM'S "THE RUNNER NEVER STARTED" SENTINEL (#3415 review 3, P1).
 # The shard arm's verdict IS the exit status, so every non-zero status that is not
 # the bound's (142) is read as "the base fails this shard". A LAUNCH failure has
-# no verdict at all — `cd "$cmd_dir"` failing because the worktree was reaped
+# no verdict at all — `cd "$shard_dir"` failing because the worktree was reaped
 # mid-loop, or because $TMP vanished — and it must not be mistaken for one; that
 # is how a PR-caused red would be CLEARED by an infrastructure fault. 99 is chosen
 # because it cannot collide with a shard's own `exit`: it is the status the
@@ -6957,7 +6957,11 @@ repro_shard_path() {
 # RETURN: 0 = at least one arm ran (the capture was read; `$out` may be empty) ·
 # 1 = NO arm could run, so the caller clears NOTHING. "Found nothing" is NEVER
 # reported as "could not run", and one arm that could not run never suppresses
-# the other arm's measurement.
+# the other arm's measurement. ⛔ An arm that cannot get the BASE WORKTREE it needs
+# (#3415 review 4) is one of the ways an arm "could not run" — but it is a per-arm
+# condition, not a whole-function one: a SEAM arm still runs, so the other arm's
+# measurement survives, while a PRODUCTION arm that needs the tree is refused
+# rather than run against the PR's own checkout.
 reproduce_residual_on_base() {
   local residual="$1" out="$2" base="${3:-}"
   : > "$out"
@@ -7042,31 +7046,68 @@ reproduce_residual_on_base() {
   # measurement, because turning "one family could not run" into "nothing ran"
   # is the false block #3715 exists to remove. Nothing is cleared by an arm that
   # did not run: `$out` is only ever the intersection with what was measured.
-  local cmd_dir="$PWD" used_worktree=0 need_tree=0
-  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then need_tree=1; fi
-  if [ -n "$shards" ] && [ -z "${ADMIN_MERGE_REPRO_SHARD_CMD:-}" ]; then need_tree=1; fi
+  #
+  # ⛔ EACH ARM OWNS ITS OWN DIRECTORY (#3415 review 4, P2). ONE shared directory
+  # variable made the SHARD arm's need for a worktree silently RELOCATE the PYTEST
+  # arm into it, contradicting the `ADMIN_MERGE_REPRO_CMD` contract documented above
+  # ("when set, no worktree is created and the command runs in `$PWD`") and breaking
+  # any seam command written relative to `$PWD`. Worse, a worktree that could not be
+  # created `return`ed BEFORE arm 1 ran, so one arm's missing tree suppressed the
+  # other arm's measurement — the exact false block the paragraph above promises
+  # not to produce. The PRODUCTION path still measures the SAME tree for both arms;
+  # only a SEAM arm stays in `$PWD`.
+  #
+  # ⛔ AND A PRODUCTION ARM DOES NOT RUN WITHOUT THAT TREE (#3415 review 4, P1).
+  # Both dirs fall back to `$PWD`, which is the PR'S OWN CHECKOUT. An arm that ran
+  # anyway after a failed `git worktree add` would answer "does the PR fail this?"
+  # while the code promises "does the BASE fail it?" — and every residual id is one
+  # the PR IS failing, so a PR-caused red would be cleared off an artifact nothing
+  # measured on the base. That is strictly worse than the early `return` it
+  # replaced, so EACH production arm is gated on `tree_ok` below.
+  local pytest_dir="$PWD" shard_dir="$PWD" used_worktree=0 need_tree=0
+  local nodeid_tree=0 shard_tree=0 tree_ok=0
+  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then nodeid_tree=1; need_tree=1; fi
+  if [ -n "$shards" ] && [ -z "${ADMIN_MERGE_REPRO_SHARD_CMD:-}" ]; then shard_tree=1; need_tree=1; fi
   if [ "$need_tree" -eq 1 ]; then
     # PRODUCTION PATH: a pristine base worktree. No base ref, not a git repo, or a
-    # worktree that cannot be created -> clear NOTHING (fail closed).
-    [ -n "$base" ] || return 1
-    git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
-    if ! git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+    # worktree that cannot be created -> the arm that NEEDS the tree clears NOTHING
+    # (fail closed) — but a SEAM arm still runs, because one arm without a tree is
+    # not the other arm's measurement.
+    if [ -n "$base" ] \
+       && git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+       && git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+      tree_ok=1; used_worktree=1
+    else
       say_err "admin-merge: (reproduction) could not materialise the base '$base' as a worktree — the"
-      say_err "   residual is NOT reproduced and the rail blocks as before (fail closed)."
-      return 1
+      say_err "   residual is NOT reproduced there and the rail blocks as before (fail closed). A SEAM"
+      say_err "   arm still runs in \$PWD; a PRODUCTION arm that needs the base tree is REFUSED below."
     fi
-    cmd_dir="$work/tree"; used_worktree=1
+    if [ "$tree_ok" -eq 1 ]; then
+      if [ "$nodeid_tree" -eq 1 ]; then pytest_dir="$work/tree"; fi
+      if [ "$shard_tree" -eq 1 ]; then shard_dir="$work/tree"; fi
+    fi
   fi
 
   local reproduced_all="$work/reproduced.all" arms_ran=0
   : > "$reproduced_all"
 
   # ── ARM 1 — THE PYTEST NODEIDS (#3715) ───────────────────────────────────
-  if [ "${#nodeid_arr[@]}" -gt 0 ]; then
+  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ "$nodeid_tree" -eq 1 ] && [ "$tree_ok" -ne 1 ]; then
+    # ⛔ THE PRODUCTION PYTEST ARM NEEDS THE TREE TOO (#3415 review 4, P1). `pytest_dir`
+    # falls back to the PR's own checkout, so an arm 1 that ran anyway after a failed
+    # `git worktree add` would select `uv run --frozen pytest` against the PR tree,
+    # recover the residual nodeids from ITS capture and CLEAR them — measured: a
+    # PR-caused nodeid cleared with no base ever measured, while stderr claimed the
+    # rail "blocks as before". Only a SEAM arm (caller-supplied runner, explicit
+    # `$PWD` contract) runs without the tree.
+    say_err "admin-merge: (reproduction) the pytest arm needs the base worktree and there is none — the"
+    say_err "   nodeids are NOT reproduced here (running them in this checkout would measure the PR, not"
+    say_err "   the base) and none is cleared (fail closed)."
+  elif [ "${#nodeid_arr[@]}" -gt 0 ]; then
     local -a runner=()
     if [ -n "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
       runner=(bash -c "$ADMIN_MERGE_REPRO_CMD")
-    elif command -v uv >/dev/null 2>&1 && [ -f "$cmd_dir/uv.lock" ]; then
+    elif command -v uv >/dev/null 2>&1 && [ -f "$pytest_dir/uv.lock" ]; then
       runner=(uv run --frozen pytest "${nodeid_arr[@]}" -q -p no:cacheprovider)
     else
       say_err "admin-merge: (reproduction) no runnable lane runner (no ADMIN_MERGE_REPRO_CMD and no uv.lock)"
@@ -7075,7 +7116,7 @@ reproduce_residual_on_base() {
     if [ "${#runner[@]}" -gt 0 ]; then
       local raw="$work/repro.raw" run_rc=0 reproduced="" ids_rc=0
       (
-        cd "$cmd_dir" || exit 1
+        cd "$pytest_dir" || exit 1
         printf '%s\n' "$nodeids" > "$work/nodeids.txt"
         perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${runner[@]}" < "$work/nodeids.txt"
       ) > "$raw" 2> "$work/repro.err" || run_rc=$?
@@ -7149,7 +7190,20 @@ reproduce_residual_on_base() {
   # MEASUREMENT of the base: the token names a LISTED shard, that shard exists in
   # the base tree, its resolved path is inside it, and the run itself returned a
   # verdict (not the bound's, not the launcher's). Everything else refuses.
-  if [ -n "$shards" ]; then
+  # ⛔ THE ARM THAT NEEDS THE TREE DOES NOT RUN WITHOUT IT (#3415 review 4, P1).
+  # `shard_dir` falls back to `$PWD`, which is the PR'S OWN CHECKOUT — so an arm
+  # that ran anyway when the base worktree could not be materialised would answer
+  # "does the PR fail this shard?" while the comment above promises "does the BASE
+  # fail it?". Every residual shard is one the PR IS failing, so a PR-caused red
+  # would be cleared off an artifact nothing measured on the base: fail-open, and
+  # strictly worse than the pre-change `return 1`, which cleared nothing. The SEAM
+  # arm is different — its runner is supplied by the caller and its `$PWD`
+  # contract is explicit — so it keeps running; only the PRODUCTION arm is gated.
+  if [ -n "$shards" ] && [ "$shard_tree" -eq 1 ] && [ "$tree_ok" -ne 1 ]; then
+    say_err "admin-merge: (reproduction) the shard arm needs the base worktree and there is none — no shard"
+    say_err "   is executed here (running one in the PR checkout would measure the WRONG tree and"
+    say_err "   clear a red the PR caused), and none is cleared (fail closed)."
+  elif [ -n "$shards" ]; then
     local token spath sraw s_rc=0 shard_seam="${ADMIN_MERGE_REPRO_SHARD_CMD:-}" shard_n=0
     local tree_real="" leaf_real="" shard_list="" shard_list_ok=0
     # THE ARM'S TOTAL BOUND (#3415 review 3). `timeout_s` bounds ONE shard, so a
@@ -7170,11 +7224,11 @@ reproduce_residual_on_base() {
       # BEFORE its live-cell placement guard, so it stays readable everywhere,
       # including the operator cells the lanes run on). Unreadable or EMPTY list ->
       # NOTHING is executed: the refusal stands exactly as before #3415.
-      if [ ! -d "$cmd_dir" ]; then
-        say_err "admin-merge: (reproduction) the base worktree '$cmd_dir' is not a directory — no shard"
+      if [ ! -d "$shard_dir" ]; then
+        say_err "admin-merge: (reproduction) the base worktree '$shard_dir' is not a directory — no shard"
         say_err "   can be measured on it, and nothing is cleared (fail closed)."
         shard_list_ok=0
-      elif shard_list="$(cd "$cmd_dir" 2>/dev/null && bash scripts/run-bash-shards.sh --list 2>/dev/null)" \
+      elif shard_list="$(cd "$shard_dir" 2>/dev/null && bash scripts/run-bash-shards.sh --list 2>/dev/null)" \
            && [ -n "$shard_list" ]; then
         shard_list_ok=1
       else
@@ -7200,7 +7254,7 @@ reproduce_residual_on_base() {
         # is separate from the verdict. Checked BEFORE membership so the refusal
         # names the true fact for an added shard (the base does not HAVE it) instead
         # of the weaker "it is not in the base's list".
-        if [ ! -f "$cmd_dir/$spath" ]; then
+        if [ ! -f "$shard_dir/$spath" ]; then
           say_err "admin-merge: (reproduction) the base tree has no '$spath' — a shard this PR ADDS"
           say_err "   cannot be measured on the base, and 'absent there' is never 'fails there'. It"
           say_err "   stays refused (fail closed)."
@@ -7227,8 +7281,8 @@ reproduce_residual_on_base() {
         # unresolved `abs_path` would refuse every shard instead of checking it.
         # The resolved path must be inside the checked-out base; a path that cannot
         # be resolved is refused, because unresolvable is not a measurement either.
-        if [ -z "$tree_real" ]; then tree_real="$(cd "$cmd_dir" && pwd -P)"; fi
-        leaf_real="$(perl -MCwd -e 'print Cwd::abs_path($ARGV[0])' "$cmd_dir/$spath" 2>/dev/null)" || leaf_real=""
+        if [ -z "$tree_real" ]; then tree_real="$(cd "$shard_dir" && pwd -P)"; fi
+        leaf_real="$(perl -MCwd -e 'print Cwd::abs_path($ARGV[0])' "$shard_dir/$spath" 2>/dev/null)" || leaf_real=""
         case "$leaf_real" in
           "$tree_real"/*) ;;
           *) say_err "admin-merge: (reproduction) '$spath' resolves OUTSIDE the base worktree"
@@ -7255,16 +7309,16 @@ reproduce_residual_on_base() {
       }
       if [ -n "$shard_seam" ]; then
         (
-          cd "$cmd_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          cd "$shard_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
           perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash -c "$shard_seam" admin-merge-shard "$token"
         ) > "$sraw" 2>&1 || s_rc=$?
       else
         (
-          cd "$cmd_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          cd "$shard_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
           perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash "$spath"
         ) > "$sraw" 2>&1 || s_rc=$?
       fi
-      # ⛔ THE LAUNCH IS NOT THE VERDICT (#3415 review 3, P1). `cd "$cmd_dir"`
+      # ⛔ THE LAUNCH IS NOT THE VERDICT (#3415 review 3, P1). `cd "$shard_dir"`
       # failing (the worktree removed mid-run by a reaper, a $TMP that vanished)
       # exits with the sentinel, and without this arm that status was READ AS "the
       # base fails this shard" — clearing a red the PR caused. The pytest arm has
@@ -7276,13 +7330,31 @@ reproduce_residual_on_base() {
         say_err "   refused (fail closed)."
         continue
       fi
-      # ⛔ 142 = SIGALRM (128+14): THE BOUND KILLED IT, so the exit status is the
-      # BOUND's verdict and not the shard's. Reading it as "the base fails this
-      # shard" would clear a PR-caused red because main is slow — the fail-open
-      # direction, and the same rule the pytest arm applies above.
-      if [ "$s_rc" -eq 142 ]; then
-        say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' was KILLED by the ${shard_budget}s bound"
-        say_err "   (SIGALRM) — a run that could not finish is not a measurement that the base fails it."
+      # ⛔ A STATUS THAT DID NOT COME FROM THE SHARD IS NOT THE SHARD'S VERDICT
+      # (#3415 review 4, P1). This arm's verdict IS the status, so every status that
+      # is not an exit decision has to be excluded — and 142 is the MEMBER of a class,
+      # not the class. 128+N is death by signal N: the run was KILLED, never finished,
+      # and produced no verdict. Treating only 142 as special left every other signal
+      # death reading as "the base fails this shard": an OOM SIGKILL (137) on a loaded
+      # box, or a reaper's/operator's SIGTERM (143) mid-arm, would CLEAR a red the PR
+      # caused — a false PASS on an artifact nothing measured — while the pytest arm
+      # is fail-closed for the same event by construction (a killed run recovers no
+      # ids). 142 keeps its own message because the rail's own `${shard_budget}s`
+      # bound is the commonest cause and naming it is the actionable diagnostic.
+      # ⛔ NOT a catch-all: a status <= 128 IS the shard's own exit decision and stays
+      # the verdict. 124 in particular is a shard's OWN internal bound (the convention
+      # `run-bash-shards.sh` documents), i.e. a real failure on the base, so it must
+      # keep clearing — widening this past signals would restore the false block #3415
+      # exists to remove.
+      if [ "$s_rc" -gt 128 ]; then
+        if [ "$s_rc" -eq 142 ]; then
+          say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' was KILLED by the ${shard_budget}s bound"
+          say_err "   (SIGALRM) — a run that could not finish is not a measurement that the base fails it."
+        else
+          say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' DIED ON SIGNAL $((s_rc - 128)) (status $s_rc)"
+          say_err "   — a killed run never reached the shard's own verdict, so its status is not a measurement"
+          say_err "   that the base fails it."
+        fi
         say_err "   It stays refused (fail closed)."
         continue
       fi
