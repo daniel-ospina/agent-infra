@@ -118,8 +118,11 @@ cr_san() {
 #     arm escapes it as a string), so a new field flows through with no change.
 #   • cycle_stage_get / cycle_stages_valid (this file) — the only field-aware readers, and both
 #     answer rc 1 (absent) rather than failing on an old line.
-#   • the test suites (capacity-placement.test.sh, landing-read.test.sh) write OLD-format fixtures
-#     on purpose; cycle-stages.test.sh pins that those still parse.
+#   • the other bash suites build their OWN old-format fixtures (capacity-placement.test.sh,
+#     landing-read.test.sh) and must keep working — ⛔ but cycle-stages.test.sh does NOT invoke them:
+#     §7 builds its own OLD/NEW fixtures, so "those suites are pinned by §7" is NOT true and must not
+#     be claimed. A change that breaks their fixtures is caught only by those suites, which CI runs as
+#     shards — this file cannot speak for them.
 CR_STAGES_FIELD="stages"
 
 # cycle_stage_get <record> <stage> -> "<secs>" | "ns" on stdout; rc 1 when the record has no

@@ -187,10 +187,12 @@ FULL cycle their sum is the cycle's own duration, `l2_merge`/`l3_fix`/`l4_review
 overlays *inside* `sweep`, `prev_wait` is the carried post-record gap — the `CYC` nap, **one gap
 overwritten each cycle, not a running total** (the async backlog spawn is launched inside that window,
 but the post-nap stamp is taken after the launch, so its runtime overlaps the nap rather than adding), and `ns` means registered-but-never-sampled
-(distinct from a measured `0`). ⛔ A cycle that exits early — the disk-held and fork-starved arms
-`continue` before the end of the body — leaves the stages it never reached reading `ns`, so its tiled
+(distinct from a measured `0`). ⛔ A cycle that exits early — the **disk-held** arm `continue`s before
+the end of the body — leaves the stages it never reached reading `ns`, so its tiled
 sum is legitimately SHORT of `end - start`; check for `ns` before reading a shortfall as a broken
-instrument. It exists because `end - start` did not
+instrument. ⛔ The **fork-starved** arm is the opposite case and must not be lumped in with it: its
+record is written `start=$_ft0 end=$_ft0`, so `end - start = 0`, and its tiled sum (which includes a
+positive `boot`) can only be EQUAL or LONGER — never short. It exists because `end - start` did not
 track work: measured cycles of 2.2 / 17.5 / 131 / 145 / 161 minutes against `interval=240`, with the
 161-minute cycle spawning **zero** workers. `CYC` bounds only the nap — the body is unbounded, and
 until `stages=` existed that was also unobservable. Grammar and reader: `cycle_stages_valid` validates a
