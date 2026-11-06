@@ -1072,6 +1072,9 @@ new_scen() {
   fi
   git -C "$SCEN" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
   REPRO_CMD=true
+  # The #3415 base-tree shard LIST, scenario-scoped for the same reason REPRO_CMD
+  # is: a scenario that staged shards must not leak them into the next base tree.
+  SCEN_SHARD_LIST=""
   # The ≥3.12 interpreter the #6928 fixtures supply (see selector_interp_*). It is
   # scenario-scoped STATE, so it is reset here: a scenario that forgot to set it
   # must not silently inherit the previous scenario's interpreter and depend on
@@ -2502,10 +2505,37 @@ grep -q "pr merge 44 --admin" "$SCEN/calls" \
 #   6. the two runners' argv never cross: a shard id is not handed to pytest
 #      (exit 4 having run NOTHING), and a pytest capture cannot volunteer one.
 #
-# The base tree is a REAL COMMIT IN THE SCENARIO (`repro_base_shard`), because
-# the production path materialises it with `git worktree add --detach <oid>`.
-repro_base_shard() {  # <repo-relative path> <exit-code>
-  local p="$1" code="$2"
+# repro_base_publish — commit the staged base tree and publish its OID as the base
+# sha. It also stages the base's OWN shard runner, because #3415 review 3 made the
+# runner's `--list` the MEMBERSHIP source for what may be executed: a fixture base
+# that cannot answer `--list` would make every shard unmeasurable and the scenarios
+# below would pass for the wrong reason.
+repro_base_publish() {
+  mkdir -p "$SCEN/scripts"
+  printf '%s\n' "$SCEN_SHARD_LIST" > "$SCEN/.shard-list"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# #3415 fixture: the base tree%s shard LIST, in the shape the rail reads\n' "'"
+    printf '# (`run-bash-shards.sh --list`: one repo-relative path per line).\n'
+    printf '[ "${1:-}" = "--list" ] || exit 0\n'
+    printf '# AN EMPTY LIST IS A REFUSAL, exactly as the real runner refuses an empty derivation.\n'
+    printf '[ -s "$(dirname "$0")/../.shard-list" ] || { echo "empty shard list" >&2; exit 2; }\n'
+    printf 'cat "$(dirname "$0")/../.shard-list"\n'
+  } > "$SCEN/scripts/run-bash-shards.sh"
+  git -C "$SCEN" add -- .shard-list scripts/run-bash-shards.sh >/dev/null 2>&1
+  git -C "$SCEN" -c user.email=suite@example.invalid -c user.name=suite \
+      commit -q -m "base tree (#3415 fixture)" >/dev/null 2>&1
+  git -C "$SCEN" rev-parse HEAD > "$SCEN/main-sha"
+}
+
+# repro_base_shard <repo-relative path> <exit-code> [unlisted]
+#
+# Stages a shard SCRIPT in the base tree that a direct `bash <path>` runs to
+# <exit-code>, records it in the base's own shard list (unless `unlisted`), then
+# publishes the base OID. It also writes a marker the scenario can assert on, so
+# "the base was MEASURED" is distinguishable from "the base was assumed".
+repro_base_shard() {  # <repo-relative path> <exit-code> [unlisted]
+  local p="$1" code="$2" listed="${3:-listed}"
   mkdir -p "$SCEN/$(dirname "$p")"
   {
     printf '#!/usr/bin/env bash\n'
@@ -2515,9 +2545,11 @@ repro_base_shard() {  # <repo-relative path> <exit-code>
     printf 'exit %s\n' "$code"
   } > "$SCEN/$p"
   git -C "$SCEN" add -- "$p" >/dev/null 2>&1
-  git -C "$SCEN" -c user.email=suite@example.invalid -c user.name=suite \
-      commit -q -m "base tree: $p exits $code" >/dev/null 2>&1
-  git -C "$SCEN" rev-parse HEAD > "$SCEN/main-sha"
+  if [ "$listed" = "listed" ]; then
+    SCEN_SHARD_LIST="${SCEN_SHARD_LIST}${SCEN_SHARD_LIST:+
+}$p"
+  fi
+  repro_base_publish
 }
 
 # run_admin_repro <pytest-seam> <shard-seam> <rail args…> — the TWO #3715 seams,
@@ -2731,9 +2763,8 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$TMP/outside-3415.sh"   # OUTSIDE the 
 mkdir -p "$SCEN/$(dirname "$SHARD_SL")"
 ln -s "$TMP/outside-3415.sh" "$SCEN/$SHARD_SL"
 git -C "$SCEN" add -- "$SHARD_SL" >/dev/null 2>&1
-git -C "$SCEN" -c user.email=suite@example.invalid -c user.name=suite \
-    commit -q -m "base tree: symlinked shard leaf" >/dev/null 2>&1
-git -C "$SCEN" rev-parse HEAD > "$SCEN/main-sha"
+SCEN_SHARD_LIST="$SHARD_SL"          # the escape must be refused by CONTAINMENT, after membership
+repro_base_publish
 HEAD_SSL="f7f7000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_SSL" > "$SCEN/head"
 lane_fail "$HEAD_SSL" 3461 > "$SCEN/runs-$HEAD_SSL"
@@ -2783,6 +2814,91 @@ grep -q "^   pre-existing: bash-shard::$SHARD_VOL" "$SCEN/err" \
 grep -qF -- "bash-shard::$SHARD_VOL" "$SCEN/err" \
   && pass "#3415: the volunteered shard stays in the refusal (a capture is not a measurement of it)" \
   || fail "#3415: the volunteered shard vanished from the refusal"
+
+# (9) A FORGED TOKEN NAMING A REAL FILE THAT IS NOT A SHARD. The token is
+# PR-influenced, so without a membership check the arm would EXECUTE any file in
+# the base tree (`❌ failed shard: scripts/pi-reap-worktrees.sh`) out of band — main's
+# scripts are trusted code, but they are not written to be run with no arguments
+# by a merge rail. The base's own `run-bash-shards.sh --list` is the membership
+# source; the file here EXISTS in the base tree and is deliberately NOT listed.
+new_scen repro-shard-unlisted
+# A LISTED control first, so the base's list is READABLE (an empty list is a refusal,
+# as in the real runner) — this is also the positive control for the membership arm.
+repro_base_shard 'tests/fixture-listed-control.sh' 0
+repro_base_shard 'docs/fixture-not-a-shard.sh' 1 unlisted   # present, exits 1, NOT a listed shard
+SHARD_UNL='docs/fixture-not-a-shard.sh'
+HEAD_SUN="f9f9000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SUN" > "$SCEN/head"
+lane_fail "$HEAD_SUN" 3481 > "$SCEN/runs-$HEAD_SUN"
+log_failed_shard "$SHARD_UNL" > "$SCEN/log-3481"
+cp "$SCEN/log-3481" "$SCEN/log-after-3481"
+lane_fail mainunl 3482 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3482"
+run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a token naming an UNLISTED file is not cleared (exit $rc)" \
+  || { fail "#3415: a forged token naming an unlisted base file was EXECUTED and cleared the residual"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "is NOT a shard the base's own runner lists" "$SCEN/err" \
+  && pass "#3415: the refusal names MEMBERSHIP (the base's own list), not just the shape" \
+  || fail "#3415: the unlisted-file case was not refused by membership"
+[ -f "$SCEN/base-shard-ran" ] \
+  && fail "#3415: the unlisted file RAN in the base worktree — membership is enforced after execution" \
+  || pass "#3415: …and it was never executed"
+
+# (10) THE LAUNCH IS NOT THE VERDICT. The shard arm's verdict is the exit STATUS, so
+# an infrastructure failure to start the run (the worktree reaped mid-loop, a lost
+# $TMP) must not read as "the base fails this shard". The sentinel's contract is
+# pinned through the seam; the TRIGGER (a worktree disappearing between two shards)
+# is not fixtured — stated rather than implied.
+new_scen repro-shard-launchfail
+repro_base_sha
+SHARD_LF='tests/fixture-shard-launch.sh'
+HEAD_SLF="fafa000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SLF" > "$SCEN/head"
+lane_fail "$HEAD_SLF" 3491 > "$SCEN/runs-$HEAD_SLF"
+log_failed_shard "$SHARD_LF" > "$SCEN/log-3491"
+cp "$SCEN/log-3491" "$SCEN/log-after-3491"
+lane_fail mainlf 3492 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3492"
+run_admin_repro "" 'exit 99' 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a shard that could not be LAUNCHED is not a clearance (exit $rc)" \
+  || { fail "#3415: the launch-failure sentinel was read as 'the base fails this shard'"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "could not be LAUNCHED" "$SCEN/err" \
+  && pass "#3415: the refusal names the LAUNCH failure as a non-measurement" \
+  || fail "#3415: the launch failure was not reported as such"
+grep -q "^   pre-existing: bash-shard::$SHARD_LF" "$SCEN/err" \
+  && fail "#3415: a shard that never started was reported pre-existing" \
+  || pass "#3415: …and nothing was cleared"
+
+# (11) THE ARM HAS ONE BUDGET, NOT ONE PER SHARD. `ADMIN_MERGE_REPRO_TIMEOUT`
+# bounds the WHOLE arm (as it always bounded the pytest arm's run), so N hung
+# shards cannot cost N x the bound and outlive the rail's whole-attempt lease. The
+# observable is the EXHAUSTION refusal: the first shard eats the budget, and the
+# second is never run — it stays refused, which is the fail-closed direction.
+new_scen repro-shard-budget
+repro_base_sha
+SHARD_B1='tests/fixture-shard-slow-a.sh'
+SHARD_B2='tests/fixture-shard-slow-b.sh'
+HEAD_SB="fbfb000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SB" > "$SCEN/head"
+lane_fail "$HEAD_SB" 3496 > "$SCEN/runs-$HEAD_SB"
+{ log_failed_shard "$SHARD_B1"; log_failed_shard "$SHARD_B2"; } > "$SCEN/log-3496"
+cp "$SCEN/log-3496" "$SCEN/log-after-3496"
+lane_fail mainbud 3497 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3497"
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_REPRO_SHARD_CMD='sleep 3' ADMIN_MERGE_REPRO_TIMEOUT=2 \
+  ADMIN_MERGE_POLL_INTERVAL=0 bash "$ADM" 42 --main-runs 1 >"$SCEN/out" 2>"$SCEN/err"
+rc=$?
+[ "$rc" -ne 0 ] && pass "#3415: a shard arm that outran its budget clears nothing (exit $rc)" \
+  || { fail "#3415: the shard arm cleared a residual it never measured"; sed 's/^/      /' "$SCEN/err" | tail -30; }
+grep -q "budget is EXHAUSTED" "$SCEN/err" \
+  && pass "#3415: …and the arm STOPS at its budget instead of spending N x the bound" \
+  || fail "#3415: the arm had no total budget — each shard got the full bound again"
+grep -q "^   pre-existing: bash-shard::" "$SCEN/err" \
+  && fail "#3415: a shard was reported pre-existing off a bound-killed run" \
+  || pass "#3415: …and nothing was cleared"
 
 # ── 5. extraction failure is fail-closed (the vacuous-pass guard) ──────────
 echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pass) =="

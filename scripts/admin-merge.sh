@@ -6757,6 +6757,18 @@ SHARD_REPRO_ID_PREFIX='bash-shard::'
 SHARD_REPRO_ID_RE="^${SHARD_REPRO_ID_PREFIX}"
 PYTEST_REPRO_ID_RE="${SHARD_REPRO_ID_RE}|${NON_LOCAL_REPRO_ID_RE}"
 
+# ⛔ THE SHARD ARM'S "THE RUNNER NEVER STARTED" SENTINEL (#3415 review 3, P1).
+# The shard arm's verdict IS the exit status, so every non-zero status that is not
+# the bound's (142) is read as "the base fails this shard". A LAUNCH failure has
+# no verdict at all — `cd "$cmd_dir"` failing because the worktree was reaped
+# mid-loop, or because $TMP vanished — and it must not be mistaken for one; that
+# is how a PR-caused red would be CLEARED by an infrastructure fault. 99 is chosen
+# because it cannot collide with a shard's own `exit`: it is the status the
+# WRAPPER exits with, before any shard exists. (The pytest arm needs no sentinel:
+# its verdict comes from the CAPTURE, so a launcher that produced none is already
+# "could not run" by construction.)
+REPRO_LAUNCH_FAILED_RC=99
+
 # repro_shard_path <token> — the repo-relative script a `bash-shard::<token>` id
 # names, or return 1 when the token does not name one this rail may execute.
 #
@@ -6896,7 +6908,9 @@ repro_shard_path() {
 #   * it runs the exact NODEIDS as argv, never their whole files — that bounds
 #     WHICH TESTS RUN on the base (an unrelated failure in the same file is never
 #     executed) — and the exact SHARD PATHS, one `bash <path>` each, never the
-#     whole shard list (#3415). `intersect_sets` separately bounds WHAT MAY BE
+#     whole shard list (#3415), and only for a path the BASE'S OWN runner lists
+#     (`run-bash-shards.sh --list`), so a forged id cannot make the rail execute an
+#     arbitrary file from main. `intersect_sets` separately bounds WHAT MAY BE
 #     CLEARED, so a capture that NAMES an id outside its argv still clears nothing;
 #   * only nodeids the BASE ITSELF reports FAILED are cleared, and a nodeid whose
 #     reproduction cannot be parsed stays in the residual (fail-closed); a shard
@@ -6927,12 +6941,18 @@ repro_shard_path() {
 #                           it), which is the same contract `bash <path>` has in
 #                           the production path. Same spirit as the seam above:
 #                           when set, no worktree is created for the shard arm.
-#   ADMIN_MERGE_REPRO_TIMEOUT  seconds (default 900), applied to EVERY arm. The
-#                           bound is MANDATORY and VALIDATED (positive integer):
-#                           a value perl's `alarm` cannot numify cancels the
-#                           timer, and a hanging suite must become "not
-#                           reproduced" (a block), never an unbounded
-#                           merge-time stall.
+#   ADMIN_MERGE_REPRO_TIMEOUT  seconds (default 900), the bound of EVERY arm —
+#                           ONE budget per arm, not one per item. The pytest arm
+#                           has always run under a single alarm; the shard arm now
+#                           does too (each shard gets what is LEFT of the budget,
+#                           so N hung shards cost 900s and not N x 900), because
+#                           an arm that outlives the rail's whole-attempt lease is
+#                           a stall the lease TTL then reads as an abandoned
+#                           attempt. The bound is MANDATORY and VALIDATED (positive
+#                           integer): a value perl's `alarm` cannot numify cancels
+#                           the timer, and a hanging suite must become "not
+#                           reproduced" (a block), never an unbounded merge-time
+#                           stall.
 #
 # RETURN: 0 = at least one arm ran (the capture was read; `$out` may be empty) ·
 # 1 = NO arm could run, so the caller clears NOTHING. "Found nothing" is NEVER
@@ -7124,13 +7144,50 @@ reproduce_residual_on_base() {
   # answers the only question that matters — does the BASE fail this shard? A
   # non-zero exit IS the measurement (the shard's own verdict, not an inference
   # from one), and exit 0 is the answer that keeps the PR blocked.
+  #
+  # ⛔ THE ARM HAS EXACTLY FOUR WAYS TO CLEAR, and every one of them is a
+  # MEASUREMENT of the base: the token names a LISTED shard, that shard exists in
+  # the base tree, its resolved path is inside it, and the run itself returned a
+  # verdict (not the bound's, not the launcher's). Everything else refuses.
   if [ -n "$shards" ]; then
     local token spath sraw s_rc=0 shard_seam="${ADMIN_MERGE_REPRO_SHARD_CMD:-}" shard_n=0
-    local tree_real="" leaf_real=""
+    local tree_real="" leaf_real="" shard_list="" shard_list_ok=0
+    # THE ARM'S TOTAL BOUND (#3415 review 3). `timeout_s` bounds ONE shard, so a
+    # residual of N hung shards would cost N x timeout_s — more than the rail's
+    # whole-attempt lease for a large N, which is a stall the lease TTL then reads
+    # as an abandoned attempt. The arm therefore gets ONE budget, shaped exactly
+    # like the pytest arm's (one alarm for the whole run): each shard gets what is
+    # LEFT, and once nothing is left the arm stops measuring (those ids stay
+    # refused — fail closed) instead of outliving the attempt.
+    local arm_deadline=$((SECONDS + timeout_s)) shard_budget=0
+    if [ -z "$shard_seam" ]; then
+      # ⛔ THE MEMBERSHIP SOURCE IS THE BASE'S OWN RUNNER, NOT A SECOND LIST
+      # (#3415 review 3). A forged token can name ANY file in the base tree
+      # (`❌ failed shard: scripts/pi-reap-worktrees.sh`), and this arm would then
+      # EXECUTE it out of band — main's scripts are trusted code, but they are not
+      # written to be run with no arguments by a merge rail. `--list` is the one
+      # derivation of what a shard IS (`run-bash-shards.sh` exits on `--list`
+      # BEFORE its live-cell placement guard, so it stays readable everywhere,
+      # including the operator cells the lanes run on). Unreadable or EMPTY list ->
+      # NOTHING is executed: the refusal stands exactly as before #3415.
+      if [ ! -d "$cmd_dir" ]; then
+        say_err "admin-merge: (reproduction) the base worktree '$cmd_dir' is not a directory — no shard"
+        say_err "   can be measured on it, and nothing is cleared (fail closed)."
+        shard_list_ok=0
+      elif shard_list="$(cd "$cmd_dir" 2>/dev/null && bash scripts/run-bash-shards.sh --list 2>/dev/null)" \
+           && [ -n "$shard_list" ]; then
+        shard_list_ok=1
+      else
+        say_err "admin-merge: (reproduction) the base's own shard list ('bash scripts/run-bash-shards.sh --list'"
+        say_err "   in the base worktree) could not be read — no shard is executed and none is cleared"
+        say_err "   (fail closed)."
+        shard_list_ok=0
+      fi
+    fi
     while IFS= read -r token; do
       [ -n "$token" ] || continue
       if ! spath="$(repro_shard_path "$token")"; then
-        say_err "admin-merge: (reproduction) 'bash-shard::$token' does not name a repo-relative script this"
+        say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' does not name a repo-relative script this"
         say_err "   rail may execute (an absolute path, a '..' component, a leading '-', a percent-encoded"
         say_err "   byte, or a token outside the shard alphabet) — NOT measured, so it stays refused."
         continue
@@ -7140,11 +7197,24 @@ reproduce_residual_on_base() {
         # not exist on the base; `bash <missing>` exits 127, which under the
         # "non-zero means the base fails it" rule would CLEAR a failure the PR
         # itself introduced — the fail-open direction, and the reason this check
-        # is separate from the verdict.
+        # is separate from the verdict. Checked BEFORE membership so the refusal
+        # names the true fact for an added shard (the base does not HAVE it) instead
+        # of the weaker "it is not in the base's list".
         if [ ! -f "$cmd_dir/$spath" ]; then
           say_err "admin-merge: (reproduction) the base tree has no '$spath' — a shard this PR ADDS"
           say_err "   cannot be measured on the base, and 'absent there' is never 'fails there'. It"
           say_err "   stays refused (fail closed)."
+          continue
+        fi
+        if [ "$shard_list_ok" -ne 1 ]; then
+          say_err "admin-merge: (reproduction) '$spath' cannot be CHECKED against the base's shard list, so it is"
+          say_err "   not executed and stays refused (fail closed)."
+          continue
+        fi
+        if ! grep -qxF -- "$spath" <<<"$shard_list"; then
+          say_err "admin-merge: (reproduction) '$spath' is NOT a shard the base's own runner lists — a"
+          say_err "   forged or stale token is never executed, and an unlisted file is not a measurement of a"
+          say_err "   shard. It stays refused (fail closed)."
           continue
         fi
         # ⛔ CONTAINMENT RESOLVES THE LEAF, NOT ONLY ITS DIRECTORY — and a
@@ -7166,25 +7236,52 @@ reproduce_residual_on_base() {
              continue ;;
         esac
       fi
+      shard_budget=$((arm_deadline - SECONDS))
+      if [ "$shard_budget" -le 0 ]; then
+        say_err "admin-merge: (reproduction) the shard arm's ${timeout_s}s budget is EXHAUSTED — '$spath' and"
+        say_err "   any shard after it are NOT measured and stay refused (fail closed). Raise"
+        say_err "   ADMIN_MERGE_REPRO_TIMEOUT if this base needs longer."
+        break
+      fi
+      [ "$shard_budget" -gt "$timeout_s" ] && shard_budget="$timeout_s"
       shard_n=$((shard_n + 1))
       sraw="$work/shard-$shard_n.log"; s_rc=0
+      # ⛔ A LOG THAT CANNOT BE CREATED IS NOT A SHARD THAT FAILED. Checked BEFORE
+      # the run so a full/unwritable $TMP cannot be read as the base's verdict.
+      : > "$sraw" 2>/dev/null || {
+        say_err "admin-merge: (reproduction) cannot write the log for '$spath' ($sraw) — the shard was not"
+        say_err "   run and is NOT measured; it stays refused (fail closed)."
+        continue
+      }
       if [ -n "$shard_seam" ]; then
         (
-          cd "$cmd_dir" || exit 1
-          perl -e 'alarm shift; exec @ARGV' "$timeout_s" bash -c "$shard_seam" admin-merge-shard "$token"
+          cd "$cmd_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash -c "$shard_seam" admin-merge-shard "$token"
         ) > "$sraw" 2>&1 || s_rc=$?
       else
         (
-          cd "$cmd_dir" || exit 1
-          perl -e 'alarm shift; exec @ARGV' "$timeout_s" bash "$spath"
+          cd "$cmd_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash "$spath"
         ) > "$sraw" 2>&1 || s_rc=$?
+      fi
+      # ⛔ THE LAUNCH IS NOT THE VERDICT (#3415 review 3, P1). `cd "$cmd_dir"`
+      # failing (the worktree removed mid-run by a reaper, a $TMP that vanished)
+      # exits with the sentinel, and without this arm that status was READ AS "the
+      # base fails this shard" — clearing a red the PR caused. The pytest arm has
+      # the same protection by construction (its verdict comes from the CAPTURE);
+      # this arm's verdict is the STATUS, so the status needs the discriminator.
+      if [ "$s_rc" -eq "$REPRO_LAUNCH_FAILED_RC" ]; then
+        say_err "admin-merge: (reproduction) '$spath' could not be LAUNCHED in the base worktree (cd failed or"
+        say_err "   the tree disappeared) — an infrastructure failure is not a measurement, so it stays"
+        say_err "   refused (fail closed)."
+        continue
       fi
       # ⛔ 142 = SIGALRM (128+14): THE BOUND KILLED IT, so the exit status is the
       # BOUND's verdict and not the shard's. Reading it as "the base fails this
       # shard" would clear a PR-caused red because main is slow — the fail-open
       # direction, and the same rule the pytest arm applies above.
       if [ "$s_rc" -eq 142 ]; then
-        say_err "admin-merge: (reproduction) 'bash-shard::$token' was KILLED by the ${timeout_s}s bound"
+        say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' was KILLED by the ${shard_budget}s bound"
         say_err "   (SIGALRM) — a run that could not finish is not a measurement that the base fails it."
         say_err "   It stays refused (fail closed)."
         continue
