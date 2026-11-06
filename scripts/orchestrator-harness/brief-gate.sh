@@ -26,6 +26,11 @@
 #        RUNG: <1|2|3> — <tool>  which rung of the research ladder, and the tool it names
 #   2. ANYWHERE in the brief:
 #        CONTRADICTION TEST: <non-empty>   whether a RECORDED DECISION covers the work
+#   3. FOR THE `reviewer` ROLE AT ROUND >= 4 ONLY (agent-infra#3441), and INSIDE the research section
+#      like INTERNAL/EXTERNAL/RUNG (subsections allowed; a line under an unrelated heading does not
+#      count — round-3 review, P2: the validator enforced this while the schema did not say it):
+#        COMPARABLES: <non-empty>   what comparable / competitor implementations do for the mechanism
+#      A SEPARATE label, not a word inside EXTERNAL — see the round section below for why.
 #
 # Two labelled fields are not decoration: they are the two halves of the pass that the two measured
 # incidents each skipped, and the rung line is what stops "research" from degrading into "I thought
@@ -71,6 +76,29 @@
 # how-do-java-mutation-tools-differ/`, and the classic adoption blocker in the mutation-testing
 # literature). What it removes is the measured failure mode: a clean verdict with NO attribution at
 # all, which is indistinguishable from a guard nobody ever tried to break.
+# ── THE ROUND, AND WHY A GATE NEEDS ONE (#3441) ───────────────────────────────────────────────
+# Rounds 1-3 converge on "is this fix correct?" — a question local reading CAN answer. Past round 3
+# the loop has stopped converging, and the recurring cause is that we are re-deriving a decision the
+# field has already settled, or re-inventing a guard a comparable project has already hardened. So
+# from round 4 the brief must carry a `COMPARABLES:` line naming what COMPARABLE / COMPETITOR
+# implementations do for the mechanism under review. The round is supplied by the caller
+# (`merge-one.sh` derives it from `REV_ROUND` / `state/reviewround-<PR>`), because a brief generator
+# with no round input cannot tell round 1 from round 7 — which is the plumbing half of #3441.
+#
+# ⛔ WHY A LABEL AND NOT A WORD-SEARCH INSIDE `EXTERNAL:` (fresh review of #3441, P1). The first draft
+# matched /comparable|competitor/ against the `EXTERNAL:` line — and the CANONICAL BLOCK THIS FILE
+# EMITS already says "how comparable systems solve this", so the clause was satisfied by the gate's
+# OWN BOILERPLATE for every generated brief at every round. It could not fire on the one path #3441
+# exists for: it refused only a hand-written brief that happened to avoid those words — a gate whose
+# PASS was supplied by itself. A separate label cannot be satisfied that way: the round>=4 block emits
+# it with a placeholder, an earlier round's block does not emit it at all, and the validator requires
+# a non-empty value. So the refusal now means something checkable — "this brief was not built for a
+# round>=4 review" — which is exactly the missing-round-plumbing defect.
+#
+# ⚠️ THIS IS STILL A SHAPE CHECK, NOT A CONTENT CHECK. It requires the LABEL and a non-empty value; it
+# cannot tell a real survey from a token mention. That is stated here for the same reason RUNG's tool
+# vocabulary is: a green run is not evidence the research was good, and the contract's own section says
+# so.
 #
 # ── FAIL-CLOSED, ALWAYS ──────────────────────────────────────────────────────────────────────────
 # A missing brief, an unreadable brief, an EMPTY brief, an unknown role, or a validator that cannot
@@ -117,15 +145,58 @@ BRIEF_GATE_UNAVAILABLE=78
 # DO" above; the prohibition itself lives in the research skill and the owner's ruling.
 BRIEF_GATE_TOOLS='perplexity, web_search, web_fetch, context7'
 
-# brief_gate_missing <brief-file|-> — print ONE token per missing element, nothing when complete.
-# `-` reads stdin (pane orders are passed inline, not as files). An unreadable or empty brief prints
-# NO-FILE / EMPTY rather than pretending the parse failed for some subtler reason.
+# The review round from which a review brief must carry a `COMPARABLES:` line (#3441).
+# Owner ruling, 2026-11-04: past round 3 the question changes from "does this line work" to "what does
+# the field do", so the mandate starts at 4.
+BRIEF_GATE_COMPARABLE_ROUND=4
+
+# brief_gate_round_norm <value> — a round is a positive integer or it is 0 (unknown).
+# ⛔ NEVER default an unreadable round to 1 in a way that would let a round-7 brief claim round 1: every
+# coercion treats anything non-numeric as UNKNOWN (0), so a caller that loses the round never has it
+# silently upgraded by this function.
+# ⛔ BUT `0` IS BELOW THE THRESHOLD, SO THE COMPARABLE MANDATE IS SKIPPED AT UNKNOWN — state that
+# plainly, because it is a RESIDUAL, not a protection (round 4 review, P2). The earlier text here
+# claimed the opposite — "UNKNOWN is checked for the comparable clause as well — a caller that loses
+# the round does not thereby buy the round-3 contract" — and that is FALSE: the validator is
+# `(gr_round + 0) >= (gr_cmp + 0)`, so 0 >= 4 is false and no `EXTERNAL-COMPARABLES` is demanded.
+# Measured: `--missing <file> reviewer` and `--missing <file> reviewer banana` both print no such
+# token. The sibling arm comment by NAME ("ROUND ≥ 4 REQUIRES THE COMPARABLE CLAUSE", in
+# `BRIEF_GATE_AWK` below — cited by name, never by line: round 5 review, P3, an earlier cite of
+# `:~215` was already stale when it was written) and `brief-gate.test.sh` pin the REAL behaviour. A
+# false sentence is bad on its own, but
+# this one asserts a fail-open protection for a gate — a lane reading it would think deleting the
+# residual arms is safe, which is the missing-plumbing class #3441 exists to close. Reachability is
+# what bounds it: `merge-one.sh` always supplies the round for a review, so UNKNOWN is not a state any
+# harness review path reaches.
+# ⛔ NINE DIGITS, THE `is_limit` BOUND, because `$(( 10#… ))` on a longer value WRAPS INTO A NEGATIVE
+# number (fresh review of #3441, P2: 9223372036854775808 -> -9223372036854775808). A negative round is
+# neither 0 nor >= the threshold, so it would slip past the mandate — the exact fail-open arithmetic
+# class this tree's `is_limit` exists for. No harness path produces one today, and ⛔ THE BOUND IS NOT A
+# PROTECTION FOR THE MANDATE (round-15 review, P3 — this sentence used to claim exactly that, twelve
+# lines after the block above calls the same value a RESIDUAL): it coerces a malformed round
+# DETERMINISTICALLY TO UNKNOWN (0), and `0 >= 4` is false, so the round-4 mandate is SKIPPED either way.
+# What the bound buys is that the skip is a named, testable state (`(round-bound)` in
+# `brief-gate.test.sh` asserts `rc=0`) instead of an arbitrary wrapped integer. Claiming otherwise
+# would tell a lane the opposite of what the code does — the false-sentence class this file's own
+# comments were corrected for twice.
+brief_gate_round_norm() { # <value> -> integer (0 = unknown)
+  case "${1:-}" in
+    ''|*[!0-9]*) printf '0\n' ;;
+    *)
+      if [ "${#1}" -le 9 ]; then printf '%s\n' "$(( 10#${1} ))"; else printf '0\n'; fi ;;
+  esac
+}
+
+# brief_gate_missing <brief-file|-> [role] [round] — print ONE token per missing element, nothing
+# when complete. `-` reads stdin (pane orders are passed inline, not as files). An unreadable or empty
+# brief prints NO-FILE / EMPTY rather than pretending the parse failed for some subtler reason.
 #
 # ⛔ THE PARSE IS ONE awk PASS ON PURPOSE. It is the same shape #2148's suite drives and it needs no
 # python at dispatch time — a gate that adds an interpreter to every spawn is a gate that will
 # eventually be "temporarily" worked around on the box that lacks one.
-brief_gate_missing() { # brief_gate_missing <brief-file|-> [role]
-  local f="${1:--}" role="${2:-lane}" toks="" body=""
+brief_gate_missing() { # brief_gate_missing <brief-file|-> [role] [round]
+  local f="${1:--}" role="${2:-lane}" rnd toks="" body=""
+  rnd="$(brief_gate_round_norm "${3:-0}")"
   if [ "$f" != "-" ] && { [ ! -e "$f" ] || [ ! -r "$f" ]; }; then
     printf 'NO-FILE\n'
     return 0
@@ -138,12 +209,12 @@ brief_gate_missing() { # brief_gate_missing <brief-file|-> [role]
     # substitution strips it, and awk drops a final line that carries none.)
     body="$(cat)"
     if [ -z "$body" ]; then printf 'EMPTY\n'; return 0; fi
-    toks="$(printf '%s\n' "$body" | awk "$BRIEF_GATE_AWK")"
+    toks="$(printf '%s\n' "$body" | awk -v gr_role="$role" -v gr_round="$rnd" -v gr_cmp="$BRIEF_GATE_COMPARABLE_ROUND" "$BRIEF_GATE_AWK")"
     [ -z "$toks" ] || printf '%s\n' "$toks"
     if [ "$role" = "reviewer" ]; then printf '%s\n' "$body" | awk "$BRIEF_GATE_MUTATION_AWK"; fi
   else
     if [ ! -s "$f" ]; then printf 'EMPTY\n'; return 0; fi
-    toks="$(awk "$BRIEF_GATE_AWK" "$f")"
+    toks="$(awk -v gr_role="$role" -v gr_round="$rnd" -v gr_cmp="$BRIEF_GATE_COMPARABLE_ROUND" "$BRIEF_GATE_AWK" "$f")"
     [ -z "$toks" ] || printf '%s\n' "$toks"
     if [ "$role" = "reviewer" ]; then awk "$BRIEF_GATE_MUTATION_AWK" "$f"; fi
   fi
@@ -190,7 +261,7 @@ function _label(s,   t) {
   _lab = ""; _rest = ""
   return ""
 }
-BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 0 }
+BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 0; cmp = 0 }
 {
   line = $0
   lc = tolower(line)
@@ -212,7 +283,14 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
     if (_lab == "rung" && length(_rest) > 0 &&
         _rest ~ /(^|[^0-9])[1-3]([^0-9]|$)/ &&
         tolower(_rest) ~ /perplexity|web_search|web[ _-]?fetch|context7/) rung = 1
+    # ⛔ SCOPED LIKE ITS SIBLINGS (round 2 review, P2): a `COMPARABLES:` line under some OTHER heading
+    # must not satisfy the round>=4 clause — the same rule §A pins for EXTERNAL ("scoping is
+    # enforced"). The canonical round>=4 block emits the label INSIDE the research section, so the
+    # gate still cannot refuse its own advice.
+    if (_lab == "comparables" && length(_rest) > 0) cmp = 1
   }
+  # CONTRADICTION TEST is the one label allowed ANYWHERE (it may sit outside the section, and the
+  # schema says so). The COMPARABLES label is scoped to the section, above.
   if (_lab == "contradiction test" && length(_rest) > 0) ct = 1
 }
 END {
@@ -224,6 +302,11 @@ END {
     if (!rung)     print "RUNG"
   }
   if (!ct) print "CONTRADICTION-TEST"
+  # ⛔ ROUND ≥ 4 REQUIRES THE COMPARABLE CLAUSE, FOR THE REVIEWER ROLE ONLY (#3441). A lane brief at
+  # round 0 (a caller that passed no round) keeps the round-3 contract — stated as a residual, not
+  # hidden: the mandate is only reachable when the caller supplies the round, which `merge-one.sh`
+  # always does for a review (it derives it from `state/reviewround-<PR>`).
+  if (gr_role == "reviewer" && (gr_round + 0) >= (gr_cmp + 0) && !cmp) print "EXTERNAL-COMPARABLES"
 }
 '
 
@@ -452,10 +535,10 @@ END {
 }
 '
 
-# brief_gate_verify <brief-file|-> [role] — 0 = allowed, REFUSED with the teaching message, or
+# brief_gate_verify <brief-file|-> [role] [round] — 0 = allowed, REFUSED with the teaching message, or
 # UNAVAILABLE. Prints NOTHING on success (a silent pass is a pass; the callers already log).
-brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
-  local f="${1:--}" role="${2:-lane}" miss=""
+brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round]
+  local f="${1:--}" role="${2:-lane}" rnd miss=""
   case "$role" in
     lane|fixer|reviewer|worker) : ;;
     *)
@@ -465,7 +548,8 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
       return "$BRIEF_GATE_UNAVAILABLE" ;;
   esac
   # stdin is INHERITED through the command substitution, so `-` reads the caller's pipe.
-  miss="$(brief_gate_missing "$f" "$role")"
+  rnd="$(brief_gate_round_norm "${3:-0}")"
+  miss="$(brief_gate_missing "$f" "$role" "$rnd")"
   [ -n "$miss" ] || return 0
 
   # ── THE REFUSAL MUST TEACH (delivery D) ───────────────────────────────────────────────────────
@@ -494,16 +578,18 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
                  lines="${lines}  • …its table header must name \`assertion\`, \`mutant\` and \`reddened\` — a table of prose is not an attribution${nl}" ;;
       MUTATION-ROWS)
                  lines="${lines}  • …and it needs at least ONE data row (\`| <assertion> | <mutant> | <reddened row> | <observed> |\`), or a \`NO NEW ASSERTIONS: <why>\` line${nl}" ;;
+      EXTERNAL-COMPARABLES)
+                 lines="${lines}  • this is review ROUND ${rnd} (>= ${BRIEF_GATE_COMPARABLE_ROUND}), so the brief must carry a \`COMPARABLES:\` line naming at least one COMPARABLE / COMPETITOR implementation and how it solves the mechanism under review (#3441). Past round 3 the loop stopped converging on 'is this line correct', so the question changes to 'what does the field do', and a local read cannot answer it. ⛔ The line is EMITTED by \`brief-gate.sh --section reviewer <round>\` — a brief that lacks it was generated without the round, which is the defect${nl}" ;;
     esac
   done <<< "$miss"
 
   {
-    printf '[brief-gate] REFUSED — this dispatch does not carry its full contract. NOTHING WAS STARTED: no model call, no session, no claim.\n'
-    printf '[brief-gate]   brief: %s   role: %s\n' "$f" "$role"
+    printf '[brief-gate] REFUSED — this dispatch does not carry its full contract (research + non-vacuity + round). NOTHING WAS STARTED: no model call, no session, no claim.\n'
+    printf '[brief-gate]   brief: %s   role: %s   round: %s\n' "$f" "$role" "${rnd:-0}"
     printf '[brief-gate] missing:\n%s' "$lines"
     printf '[brief-gate] add exactly this to the brief, fill the <…> slots, and re-dispatch\n'
-    printf '[brief-gate] (the canonical block, byte-identical to `brief-gate.sh --section %s`):\n' "$role"
-    body="$(brief_gate_section "$role")"
+    printf '[brief-gate] (the canonical block, byte-identical to `brief-gate.sh --section %s %s`):\n' "$role" "${rnd:-0}"
+    body="$(brief_gate_section "$role" "$rnd")"
     printf '%s\n' "$body" | sed 's/^/[brief-gate]   /'
     printf '[brief-gate] why: two lanes in one day acted on a false premise because their brief never forced the pass — one re-derived a root the tracker already held, one opened a duplicate PR. Both were brief defects, not lane defects (agent-infra#2258).\n'
     printf '[brief-gate] the pass is checked for PRESENCE and SHAPE only — a green run is not evidence the research was good; you still review the substance.\n'
@@ -515,8 +601,9 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role]
 # brief splices it (`lane.sh`, `fix-one.sh`, `merge-one.sh`, `pr-doctor.py`) and every authored brief
 # copies it from `templates/LANE-BRIEF.md`; `brief-gate.test.sh` asserts the two agree AND that the
 # canonical block passes this validator, so the gate cannot drift into refusing its own advice.
-brief_gate_section() { # brief_gate_section [role]
-  local role="${1:-lane}" internal
+brief_gate_section() { # brief_gate_section [role] [round]
+  local role="${1:-lane}" rnd internal round_note=""
+  rnd="$(brief_gate_round_norm "${2:-0}")"
   case "$role" in
     lane|worker)
       internal='read what this repo and its tracker ALREADY hold, before you decide anything: the issue AND every comment (root-cause corrections live there), `git log --all --grep` for a prior attempt, the open PRs touching the same files, the architecture doc for the seam you are about to change. Quote file:line, issue and PR numbers. If the work is ALREADY DONE, already decided, or already decomposed into other issues, STOP and report that with evidence instead of re-deriving it.' ;;
@@ -528,6 +615,20 @@ brief_gate_section() { # brief_gate_section [role]
       printf 'brief-gate.sh: unknown role "%s" (expected lane|fixer|reviewer|worker)\n' "$role" >&2
       return "$BRIEF_GATE_UNAVAILABLE" ;;
   esac
+  # ⛔ ROUND >= 4 PUTS A LABELLED `COMPARABLES:` LINE IN THE CANONICAL BLOCK ITSELF (#3441), so the
+  # brief a dispatch actually splices carries the mandate instead of relying on an author to remember
+  # it — AND so the label is the thing the validator checks. Round<4 emits NO such label, which is what
+  # makes `--check <round-3 brief> reviewer 7` refuse: a brief built without the round is refused by
+  # the round it will be used at, which is the plumbing defect #3441 names.
+  if [ "$role" = "reviewer" ] && [ "$rnd" -ge "$BRIEF_GATE_COMPARABLE_ROUND" ]; then
+    round_note="COMPARABLES: name at least one COMPARABLE / COMPETITOR implementation — an agent harness, a CI
+    gate, an attestation or review-budget system — and say concretely how it solves the mechanism
+    under review. MANDATORY at review round ${rnd} (#3441): rounds 1-3 converge on \"is this line
+    correct\"; past round 3 the loop has stopped converging, and the recurring cause is re-deriving a
+    decision the field already settled. If a convergent external practice contradicts a RECORDED
+    DECISION, that is a REOPEN (argue it in the decision's own home), never a quiet adoption.
+"
+  fi
   cat <<BRIEF
 ## RESEARCH FIRST — before you decide anything (agent-infra#2258)
 
@@ -540,7 +641,7 @@ INTERNAL: ${internal}
 EXTERNAL: look OUTSIDE this repo for how comparable systems solve this — vendor docs, specs, the
     \`research\` skill (state the rung in the RUNG line below). Say what you looked up and what you
     took from it. Skipping the rung is not allowed; \`web_fetch\` on a primary source always exists.
-RUNG: 2 — web_search model="sonar"   ⛔ REPLACE with the rung you will actually use, naming the tool:
+${round_note}RUNG: 2 — web_search model="sonar"   ⛔ REPLACE with the rung you will actually use, naming the tool:
     1 = perplexity MCP (\`mcp__seo-intelligence__perplexity_search\`) · 2 = \`web_search\` with the model
     passed explicitly (\`sonar\`) · 3 = \`web_fetch\`. If the rung you wanted does
     not load, name the rung you took AND the error you saw — a silent fallback erases the config gap.
@@ -617,25 +718,25 @@ brief_gate_line() { # brief_gate_line [role]
 }
 
 # ── CLI: for callers, for tests, and for a human who wants the exact text ────────────────────────
-#   bash brief-gate.sh --check <file|-> [role]   → 0 pass · 80 refused (message on stderr) · 78 cannot verify
-#   bash brief-gate.sh --missing <file|-> [role]  → the missing tokens, one per line
+#   bash brief-gate.sh --check <file|-> [role] [round]  → 0 pass · 80 refused (message on stderr) · 78 cannot verify
+#   bash brief-gate.sh --missing <file|-> [role] [round] → the missing tokens, one per line
 #   bash brief-gate.sh --mutation-missing <file|-> → the NON-VACUITY tokens alone (the artifact verb;
 #                                                   `record-review.sh` calls this on a review comment)
-#   bash brief-gate.sh --section [role]          → the canonical brief block
+#   bash brief-gate.sh --section [role] [round]  → the canonical brief block
 #   bash brief-gate.sh --mutation-section        → the canonical NON-VACUITY block alone
 #   bash brief-gate.sh --line [role]             → the one-line disclosure
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
-    --check)   shift; brief_gate_verify "${1:--}" "${2:-lane}" ;;
-    --missing) shift; brief_gate_missing "${1:--}" "${2:-lane}" ;;
+    --check)   shift; brief_gate_verify "${1:--}" "${2:-lane}" "${3:-0}" ;;
+    --missing) shift; brief_gate_missing "${1:--}" "${2:-lane}" "${3:-0}" ;;
     --mutation-missing) shift; brief_gate_mutation_missing "${1:--}" ;;
-    --section) shift; brief_gate_section "${1:-lane}" ;;
+    --section) shift; brief_gate_section "${1:-lane}" "${2:-0}" ;;
     --mutation-section) brief_gate_mutation_section ;;
     --line)    shift; brief_gate_line "${1:-lane}" ;;
     *)
-      printf 'usage: %s --check <brief-file|-> [lane|fixer|reviewer|worker]\n' "$0" >&2
-      printf '       %s --missing <brief-file|-> [role] | --mutation-missing <file|->\n' "$0" >&2
-      printf '       %s --section [role] | --mutation-section | --line [role]\n' "$0" >&2
+      printf 'usage: %s --check <brief-file|-> [lane|fixer|reviewer|worker] [round]\n' "$0" >&2
+      printf '       %s --missing <brief-file|-> [role] [round] | --mutation-missing <file|->\n' "$0" >&2
+      printf '       %s --section [role] [round] | --mutation-section | --line [role]\n' "$0" >&2
       exit "$BRIEF_GATE_UNAVAILABLE" ;;
   esac
 fi

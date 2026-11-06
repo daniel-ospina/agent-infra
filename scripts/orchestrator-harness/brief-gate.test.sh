@@ -101,6 +101,129 @@ bash "$GATE" --check "$TMP/styled.txt" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "bold/bullet/numbered/subsection spellings are all admitted (got $rc)"
 
 echo
+# ── §A2 THE REVIEW ROUND (#3441) — the mandate PAST ROUND 3, and the round as a real input ──────
+# Owner ruling (2026-11-04): from round 4 a REVIEW brief must name what COMPARABLE / COMPETITOR
+# implementations do, because rounds 1-3 converge on "is this line correct" (a local read CAN answer)
+# and past round 3 the loop has stopped converging. Before this change the brief generator had NO
+# round input at all, so round 1 and round 7 were briefed identically and the mandate could not be
+# expressed — let alone enforced.
+echo "§A2 the review ROUND — the mandate past round 3, and the round as a real input (agent-infra#3441)"
+# ⛔ THE REQUIREMENT IS A LABEL (`COMPARABLES:`), NOT A WORD-SEARCH INSIDE `EXTERNAL:` — and that is a
+# fix a fresh review of this very change forced. The first draft matched /comparable|competitor/ in the
+# EXTERNAL line, and the canonical block THIS GATE EMITS says "how comparable systems solve this", so
+# the clause was satisfied by the gate own boilerplate for every generated brief at every round: a gate
+# whose PASS was supplied by itself, inert on the one path #3441 exists for. The fixtures below pin
+# both directions — a brief with the full research contract but NO `COMPARABLES:` line is admitted at
+# rounds 1-3 and refused from 4 — and the strongest arm is (r7-canon3): a brief built by the ROUND-3
+# generator is REFUSED when it is used at round 7, which is the missing-round-plumbing defect itself.
+# ⛔ EVERY FIXTURE BELOW ALSO CARRIES THE #3442 NON-VACUITY BLOCK, AND THAT IS PART OF THE MERGE, NOT
+# DECORATION. `main` added a THIRD reviewer requirement while this branch was open (a `MUTATION
+# ATTRIBUTION` section — #3442/#3481), so a reviewer brief that carries only the research contract is
+# now refused for a reason that has nothing to do with the round. Without the block these arms redden
+# with rc=80 at ROUND 1 as well, i.e. they would measure #3442 instead of the round they name — the
+# same "the arm cannot tell which contract failed" defect §A pins for the missing tokens. The block
+# is identical across the fixtures ON PURPOSE: the only variable any of these arms may move is the
+# `COMPARABLES:` line and the round.
+printf '## RESEARCH FIRST\nINTERNAL: read the diff at the head.\nEXTERNAL: vendor docs for the review gate only.\nRUNG: 2 — web_search model="sonar"\nCONTRADICTION TEST: no recorded decision reaches this work.\n\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n' > "$TMP/rev-vendor.txt"
+printf '## RESEARCH FIRST\nINTERNAL: read the diff at the head.\nEXTERNAL: vendor docs for the review gate only.\nCOMPARABLES: comparable harnesses (an agent CI gate) cap review rounds and escalate at the ceiling.\nRUNG: 2 — web_search model="sonar"\nCONTRADICTION TEST: no recorded decision reaches this work.\n\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n' > "$TMP/rev-cmp.txt"
+for r in 1 2 3; do
+  bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer "$r" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(r$r) a brief with NO comparables line is ADMITTED at round $r — the mandate starts at 4 (got $rc)"
+done
+for r in 4 7 12; do
+  bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer "$r" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 80 ]; ck $? "(r$r) the same brief is REFUSED with 80 at round $r (got $rc)"
+done
+bash "$GATE" --check "$TMP/rev-cmp.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "a round-7 brief that DOES carry comparables is admitted (got $rc)"
+# The refusal is ATTRIBUTABLE: the round clause has its own token, so a message that omitted it could
+# not pass as "the author already knows about comparables".
+bash "$GATE" --missing "$TMP/rev-vendor.txt" reviewer 7 2>/dev/null | grep -qx 'EXTERNAL-COMPARABLES'; ck $? "the missing token is EXTERNAL-COMPARABLES — one element, not a generic refusal"
+OUTR="$(bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer 7 2>&1)"
+grep -q 'COMPARABLE / COMPETITOR' <<<"$OUTR"; ck $? "the round-4 refusal TEACHES what is missing (a comparables line)"
+grep -q 'round: 7' <<<"$OUTR"; ck $? "…and names the round it was refused at, so the author can see the input took effect"
+# THE ROUND REACHES THE GENERATED BLOCK, which is the half a validator alone cannot give: every
+# briefing caller splices `--section`, so a mandate that only lived in the validator would be advice.
+bash "$GATE" --section reviewer 7 > "$TMP/sec-r7.txt" 2>/dev/null
+grep -q '^COMPARABLES:' "$TMP/sec-r7.txt"; ck $? "--section reviewer 7 emits a COMPARABLES: line (the round is an INPUT to the canonical text)"
+bash "$GATE" --section reviewer 3 > "$TMP/sec-r3.txt" 2>/dev/null
+grep -q '^COMPARABLES:' "$TMP/sec-r3.txt"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "--section reviewer 3 does NOT (round 3 was never the problem to solve)"
+bash "$GATE" --check "$TMP/sec-r7.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "the round-7 canonical block SATISFIES the round-7 validator (the gate cannot refuse its own advice) (got $rc)"
+# ⛔ STATED RESIDUAL, PINNED AS BEHAVIOUR (fresh review of #3441, P2): THIS IS A *DELIVERY* CHECK, NOT A
+# DEPTH CHECK. A brief whose `COMPARABLES:` line is nothing but the mandate's OWN wording names no
+# comparable at all, and it is ADMITTED — because the gate reads the BRIEF, and the answer to "what do
+# comparables do" lives in the reviewer's VERDICT. The alternative was worse: rejecting the placeholder
+# would refuse `merge-one.sh`'s own generated brief (it splices exactly this block) at exit 80, i.e. it
+# would break every round-≥4 review in order to make a text check look stronger than it is. So the
+# clause guarantees the mandate REACHES the reviewer and refuses a hand-authored brief that dropped the
+# label; it cannot guarantee the reviewer complied. Pinned here so the stronger reading — the one the
+# README used to carry — cannot be re-adopted by a later lane without reddening this arm.
+{ printf '## RESEARCH FIRST\nINTERNAL: read the head.\nEXTERNAL: vendor docs only.\nRUNG: 3 — web_fetch https://x\n'
+  printf 'COMPARABLES: name at least one COMPARABLE / COMPETITOR implementation and say how it solves it.\n'
+  printf 'CONTRADICTION TEST: none recorded.\n'
+  printf '\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n'; } > "$TMP/cmp-boilerplate.txt"
+bash "$GATE" --check "$TMP/cmp-boilerplate.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(residual) the mandate's own wording SATISFIES the clause — a DELIVERY check, not a depth check (got $rc)"
+# …and the delivery half is real and non-vacuous: the SAME brief with the label DELETED is refused. Without
+# this contrast the arm above would pin the clause as unfalsifiable rather than as a weakened one.
+grep -v '^COMPARABLES:' "$TMP/cmp-boilerplate.txt" > "$TMP/cmp-boilerplate-no.txt"
+bash "$GATE" --check "$TMP/cmp-boilerplate-no.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(residual) …but the SAME brief with the label DELETED is REFUSED — the clause is non-vacuous on delivery (got $rc)"
+# (r7-canon3) ⛔ THE ARM THAT WOULD HAVE CAUGHT THE VACUOUS GATE: a brief generated at the WRONG round
+# is refused by the round it is used at. This is the plumbing defect #3441 names, pinned as behaviour.
+bash "$GATE" --check "$TMP/sec-r3.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(r7-canon3) a ROUND-3 generated brief is REFUSED when used at round 7 — the round really is an input (got $rc)"
+# ⛔ THE LABEL IS SCOPED TO THE RESEARCH SECTION, LIKE ITS SIBLINGS (round 2 review, P2). `cmp` was set
+# outside the `ins` guard, so a `COMPARABLES:` line under an unrelated heading satisfied the round>=4
+# clause — the same trick §A refuses for `EXTERNAL:` ("scoping is enforced"). Pinned in both directions.
+{ printf '## RESEARCH FIRST\nINTERNAL: read the head.\nEXTERNAL: vendor docs only.\nRUNG: 3 — web_fetch https://x\n'
+  printf 'CONTRADICTION TEST: none recorded.\n\n## NOTES\nCOMPARABLES: out of the research section\n'
+  printf '\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n'; } > "$TMP/cmp-outside.txt"
+bash "$GATE" --check "$TMP/cmp-outside.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "a COMPARABLES line OUTSIDE the research section does NOT satisfy round 4+ (got $rc)"
+bash "$GATE" --check "$TMP/cmp-outside.txt" reviewer 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and the same brief is still admitted at round 3, where the clause does not apply (got $rc)"
+# STATED RESIDUAL, pinned as behaviour so nobody discovers it as a surprise: a caller that passes NO
+# round gets the round-3 contract. `merge-one.sh` always supplies one (`REV_ROUND`, else
+# `state/reviewround-<PR>`), so our own path cannot reach this — a HAND-authored brief can.
+bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(residual) NO round supplied => the round-3 contract applies (a lost round cannot buy the mandate) (got $rc)"
+bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer banana >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(residual) a GARBAGE round is treated as unknown, not as a high one (got $rc)"
+# ⛔ FAIL-OPEN ARITHMETIC ON THE ROUND (fresh review, P2): `$(( 10#… ))` on a longer-than-nine-digit
+# value WRAPS NEGATIVE, and a negative round is neither 0 nor >= the threshold — it would slip past the
+# mandate entirely. Pinned so the bound cannot be dropped.
+bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer 9223372036854775808 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(round-bound) an absurd-but-numeric round is coerced to UNKNOWN (0), never wrapped negative past the mandate (got $rc)"
+bash "$GATE" --check "$TMP/rev-cmp.txt" reviewer 9223372036854775808 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and the wrapped value does not REFUSE a brief either (the coercion is to 0, not to a huge round) (got $rc)"
+# ── NON-VACUITY, TWO MUTANTS because the arm makes TWO claims (#3441 acceptance: "mutation-test that
+# refusal"). Both are derived FROM THE SHIPPED FILE so they track it, and both assert the file CHANGED
+# — a sed whose anchor stopped matching yields an unchanged file and would prove nothing.
+MUT2="$TMP/mutant-nocmp.sh"
+sed 's/^  if (gr_role == "reviewer".*EXTERNAL-COMPARABLES"$/  # MUTANT: the round-4 refusal is removed/' "$GATE" > "$MUT2"
+diff -q "$GATE" "$MUT2" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "MUTANT-A really changed the file (the sed anchor still matches the awk refusal)"
+bash -n "$MUT2" && bash "$MUT2" --section reviewer 7 >/dev/null 2>&1; ck $? "MUTANT-A still parses and renders (a program, not a syntax error failing for the wrong reason)"
+bash "$MUT2" --check "$TMP/rev-vendor.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "MUTATION-A: 'a round-7 brief with no comparables is refused' now FAILS — the mutant admits it (rc=$rc, §A2 would report ❌)"
+bash "$MUT2" --check "$TMP/rev-vendor.txt" reviewer 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "MUTATION-A leaves the round-3 arm UNCHANGED — the refusal is scoped to the round, not blanket (rc=$rc)"
+MUT3="$TMP/mutant-nosection.sh"
+# MUTANT-B removes the round>=4 EMISSION from the generator — the plumbing half. It must redden
+# (r7-canon3)'s sibling: the round-7 canonical block would no longer satisfy the round-7 validator.
+# ⛔ MUTATE THE CONDITION, NOT THE STRING: `round_note` is a multi-line assignment, so replacing its
+# first line alone yields a file that does not parse — a mutant that fails for the wrong reason.
+sed 's/\[ "\$rnd" -ge "\$BRIEF_GATE_COMPARABLE_ROUND" \]/[ "$rnd" -ge 999 ]/' "$GATE" > "$MUT3"
+diff -q "$GATE" "$MUT3" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "MUTANT-B really removed the round>=4 emission (the sed anchor still matches)"
+bash -n "$MUT3" && bash "$MUT3" --section reviewer 7 > "$TMP/sec-m3.txt" 2>/dev/null; ck $? "MUTANT-B still parses and renders a section"
+bash "$MUT3" --check "$TMP/sec-m3.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "MUTATION-B: without the emission the round-7 canonical block is REFUSED by the round-7 validator — 'the gate cannot refuse its own advice' would report ❌ (rc=$rc)"
+
+echo
 echo "§B the refusal TEACHES — it names what is missing and prints a pasteable block"
 OUT="$(bash "$GATE" --check "$TMP/no-research.txt" lane 2>&1)"
 grep -q 'RESEARCH FIRST' <<<"$OUT"; ck $? "the refusal names the missing RESEARCH FIRST section"
