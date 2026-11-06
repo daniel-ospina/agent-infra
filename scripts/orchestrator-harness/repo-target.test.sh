@@ -335,13 +335,26 @@ d4=$?
 # assertion exits 72, but the branch half runs per ISSUE and can refuse a REUSED worktree (the lane
 # was left on another named branch) — then the loop `continue`s and the script exits 0 with `K` still
 # counting the claim. `dispatch-merge.sh` publishes what reached a spawn; the controller recounts.
-# ⛔ THERE ARE NOW **TWO** PER-ISSUE REFUSAL ARMS, AND BOTH MUST DROP THE ROW. #2033/#2102 moved the
-# worktree build into `wt_provision`, whose refusal ("path is a worktree of a DIFFERENT branch …") fires
-# BEFORE the post-build repo/branch assertion — so the arm this case was written for is no longer the
-# one that refuses this fixture. That newer arm skipped `drop_dispatched_rows`, which is the defect this
-# arm caught; the message match below therefore accepts EITHER arm, and the row-drop conjunct is what
-# keeps it discriminating.
+# ⛔ THERE ARE THREE PER-ISSUE CLEANUP SITES IN THE LOOP, AND EVERY ONE THAT RELEASES THE CLAIM MUST
+# ALSO DROP THE ROW. #2033/#2102 moved the worktree build into `wt_provision`, whose refusal ("path is
+# a worktree of a DIFFERENT branch …") fires BEFORE the post-build repo/branch assertion — so the arm
+# this case was written for is no longer the one that refuses this fixture. That newer arm skipped
+# `drop_dispatched_rows`, which is the defect this arm caught; the message match below therefore
+# accepts EITHER arm. #3511 review added the THIRD site (the chain-could-not-start arm that stops its
+# lane and releases the claim) which skipped the drop too — and it also made this case witness the
+# CLAIM RELEASE, not just the row: the arm's own claim is a THREE-WAY state (claim released, no
+# dispatch published, row dropped), and without the `released refs/claims/issue-` conjunct the release
+# could be deleted with this suite still green.
+# ⛔ THE MESSAGE MATCH IS SCOPED TO THIS ISSUE'S OWN LINE (`^#6001:`). The alternative for the newer
+# arm is a bare phrase match, so an unscoped `grep -E` would let ANY line in the batch output — a
+# peer's refusal, a library echo — satisfy the message conjunct. The batch here is one issue, so it
+# cannot cross-match today; the anchor is what keeps that true if the fixture ever grows.
 DMO5="$T/o-dm5"; mkdir -p "$DMO5/logs" "$DMO5/state"; printf '6001\n' > "$DMO5/dispatched.txt"
+# a STUB claims.sh, or `release_issue_claim_unspawned` returns at its `[ -f "$csh" ] || return 0`
+# guard and the claim-release conjunct below would be vacuously true (it would pass on a script that
+# never released anything). The stub only has to exist and answer the release call.
+printf '%s\n' 'claim_issue_release_record() { return 0; }' 'claim_issue_record_commit() { return 0; }' \
+  > "$DMO5/claims.sh"
 # the CI-queue gate must ALLOW this batch, or the deferral (rc 3) exits before the per-issue arm.
 printf '%s\n' 'ciq_read() { return 0; }' 'ciq_eval() { return 0; }' 'ciq_defer_note_here() { return 0; }' \
   'ciq_ci_allowed() { return 0; }' 'ciq_verdict() { return 0; }' 'ciq_is_count() { return 0; }' \
@@ -350,9 +363,10 @@ printf '%s\n' 'ciq_read() { return 0; }' 'ciq_eval() { return 0; }' 'ciq_defer_n
 $REAL_GIT -C "$TT" worktree add -q "$TT/.worktrees/tm-6001" -b d5-other 2>/dev/null || true
 O="$DMO5" bash "$DM" "$TT" daniel-ospina/tortoise 6001 > "$T/dm5.out" 2>&1
 d5=$?
-{ [ "$d5" -eq 0 ] && grep -Eq 'REFUSED \((branch|repo) assertion\)|refusing to reuse it' "$T/dm5.out" \
+{ [ "$d5" -eq 0 ] && grep -Eq '^#6001: .*(REFUSED \((branch|repo) assertion\)|refusing to reuse it)' "$T/dm5.out" \
+    && grep -q '^#6001: released refs/claims/issue-6001' "$T/dm5.out" \
     && [ -f "$DMO5/.dispatched-ids" ] && [ ! -s "$DMO5/.dispatched-ids" ] \
-    && ! grep -qx '6001' "$DMO5/dispatched.txt"; }; ck "D5 per-issue branch refusal -> exit 0 BUT .dispatched-ids is EMPTY and the row dropped (rc=$d5)" $?
+    && ! grep -qx '6001' "$DMO5/dispatched.txt"; }; ck "D5 per-issue branch refusal -> exit 0, claim RELEASED, .dispatched-ids EMPTY and the row dropped (rc=$d5)" $?
 # ...and the controller's recount, extracted from orch-loop.sh and driven through both shapes.
 sed -n '/# \[dmrecount:begin\]/,/# \[dmrecount:end\]/p' "$HERE/orch-loop.sh" | sed '1d;$d' > "$T/dmrecount.sh"
 sed -n '/^is_num() {/p' "$HERE/orch-loop.sh" > "$T/isnum.sh"

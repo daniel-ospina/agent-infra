@@ -383,6 +383,14 @@ for N in "$@"; do
     else
       echo "#$N: lane-$N stopped — releasing the issue claim"
       release_issue_claim_unspawned "$N"
+      # ⛔ AND DROP THE ROW, OR THE RELEASE IS HALF A RELEASE (agent-infra#3511). This is the THIRD
+      # per-issue cleanup site in this loop, and the release above makes the issue FREE — while a row
+      # left in `$O/dispatched.txt` is exactly what makes this box skip a FREE issue until the reaper
+      # prunes it (`orch-loop.sh` reads the file and `continue`s on a hit). Same pairing as the two
+      # refusal arms above (`:299`, `:319`): every arm that RELEASES the claim drops the row with it,
+      # so the two can never disagree about whether the issue is free. The reap outcome below is
+      # deliberately irrelevant to this: a kept worktree is residue, the issue is still free.
+      drop_dispatched_rows "$N"
       # ── and take its EMPTY worktree back (#2033) ─────────────────────────────────────────────
       # The lane is confirmed gone and no chain will ever look at this checkout, so an empty one is
       # residue by definition — and residue is what makes the issue undispatchable everywhere.

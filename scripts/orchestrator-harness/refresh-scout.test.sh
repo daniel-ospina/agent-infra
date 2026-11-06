@@ -2554,7 +2554,7 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
   # <lane alive> <kill succeeds> -> how many times the release ran
   run_branch() {
     ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
-      LANE_ALIVE="$1"; KILLABLE="$2"; released=0
+      LANE_ALIVE="$1"; KILLABLE="$2"; released=0; dropped=0
       # ⛔ THE SLICE IS THE LOOP BODY, SO THE LOOP'S LOCALS MUST BE SUPPLIED. `refresh-scout.test.sh`
       # runs under `set -u`, and the #2033 merge added `wt_reap_if_empty "$REPO" ".worktrees/$WT" …`
       # to this branch: `WT` is set two lines above the slice in the real script (`WT="tm-$N"`), but
@@ -2569,15 +2569,22 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
       wt_alive() { [ "$LANE_ALIVE" = 1 ]; }
       wt_close() { if [ "$KILLABLE" = 1 ]; then LANE_ALIVE=0; return 0; fi; return 1; }
       release_issue_claim_unspawned() { released=$(( released + 1 )); }
+      # ⛔ THE SLICE NOW DROPS THE DISPATCHED ROW TOO (#3511 review). Releasing the claim makes the
+      # issue FREE, so a row retained in `dispatched.txt` makes this box skip that free issue — the
+      # exact defect the arm above fixes for the two refusal arms, which this branch reproduced. The
+      # drop is COUNTED here rather than stubbed to a no-op: with only the release counted, deleting
+      # the `drop_dispatched_rows "$N"` call left this check green, which is a guard that cannot go
+      # red. The subshell has no `set -e`, so an unstubbed call would also have failed silently (127).
+      drop_dispatched_rows() { dropped=$(( dropped + 1 )); }
       . "$DM" >/dev/null 2>&1
-      printf '%s' "$released" )
+      printf '%s/%s' "$released" "$dropped" )
   }
-  [ "$(run_branch 1 1)" = "1" ] \
-    && ok "dispatch-merge: a chain that cannot start releases the claim AFTER stopping its lane" \
-    || bad "dispatch-merge: the stopped-lane path did not release exactly once (got '$(run_branch 1 1)')"
-  [ "$(run_branch 1 0)" = "0" ] \
-    && ok "dispatch-merge: a chain that cannot start KEEPS the claim while its lane is still alive" \
-    || bad "dispatch-merge: released the claim while lane-42 was STILL RUNNING — a peer would duplicate the work"
+  [ "$(run_branch 1 1)" = "1/1" ] \
+    && ok "dispatch-merge: a chain that cannot start releases the claim AFTER stopping its lane, and drops the row with it" \
+    || bad "dispatch-merge: the stopped-lane path did not release-and-drop exactly once (got '$(run_branch 1 1)' as released/dropped)"
+  [ "$(run_branch 1 0)" = "0/0" ] \
+    && ok "dispatch-merge: a chain that cannot start KEEPS the claim and the row while its lane is still alive" \
+    || bad "dispatch-merge: released/dropped while lane-42 was STILL RUNNING — a peer would duplicate the work (got '$(run_branch 1 0)')"
 else
   bad "dispatch-merge: could not extract the chain-failure branch (or it no longer releases)"
 fi
