@@ -596,7 +596,10 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
     `FAILED`, and the abstaining verdict for it: `FAILED` is only for the measured `rc=1`),
     `nothing` (the unpushed count read 0 — a statement about the LOCAL
     `refs/remotes/*` CACHE, not about the remote, which is why the sentence says so), `unmeasured`,
-    `detached`, `verify-unanswered`, `push-unreported`, `push-killed`, `FAILED` (the remote ANSWERED and
+    `detached`, `verify-head-unreadable` (the remote ANSWERED with a sha, but this worktree's OWN `HEAD`
+    could not be read, so NO COMPARISON WAS MADE — it asserts neither delivery nor loss, and it is a
+    DIFFERENT fact from `FAILED`; the usual cause is a partial/promisor clone or a corrupt odb),
+    `verify-unanswered`, `push-unreported`, `push-killed`, `FAILED` (the remote ANSWERED and
     the ref is absent or holds an unrelated sha), and the refusals: `refused-main-checkout` (a hub's
     branch is not a dying lane's to publish), `refused-protected` (the landing branch moves only through
     the rail), `refused-unknown-default` (the protected set could not be established — an unknown default

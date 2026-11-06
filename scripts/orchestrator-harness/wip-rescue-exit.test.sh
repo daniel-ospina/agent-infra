@@ -1240,6 +1240,41 @@ ck "N15d …a MAIN CHECKOUT holding an unpushed branch is REFUSED by name and NO
 mk15d="$O/state/lane-exit-hub.state"
 [ -s "$mk15d" ] && grep -qx 'push=refused-main-checkout' "$mk15d" && grep -q '^next=' "$mk15d"; rcn15e=$?
 ck "N15e …and the artifact records push=refused-main-checkout with a next=, so the refusal is visible to a reclaim pass [$(grep -m1 '^push=' "$mk15d" 2>/dev/null)]" $rcn15e
+# ⛔ N15f — R3's SECOND CLAUSE HAD NO ARM (review of PR #3399 round 11, P2). R3 reads "no unbounded network
+# call on the exit path; a missing bound is a REFUSAL, not a hang". The first clause is pinned hard
+# (N14/N14b, with N14c-e as the mutant controls); the second was pinned only by GREPPING that the refusal
+# block EXISTS in the source — and a grep cannot tell "refuses" from "pushes anyway", which is exactly why
+# N15d exists one block up. So the library is made genuinely UNFINDABLE rather than read about: an isolated
+# copy of the gate whose sibling `../lib/` has no `bounded.sh`, an `$O` with no `lib/`, and HOME +
+# AGENT_INFRA_PATH emptied so neither farmed home can answer either. The lane must refuse by name and
+# reach no origin.
+NB="$TMP/nobound"; rm -rf "$NB"; mkdir -p "$NB/harness"
+cp "$GATE" "$NB/harness/spawn-gate.sh"
+# The fixture must be a LINKED worktree (D0's rule) holding a REAL unpushed commit: `lane_end_push`
+# short-circuits on `unpushed <= 0`, so without one this arm would go green over a lane that never tried to
+# push at all — the vacuous-control shape the D8/D9 arms exist to prevent.
+git -C "$WT" worktree add -q "$TMP/wtnb" -b nobound 2>/dev/null
+pi_stub unpushed
+: > "$O/logs/nobound.log"; rm -f "$O/state/lane-exit-nobound.state"
+HOME="$TMP/emptyhome" AGENT_INFRA_PATH= PATH="$TMP/bin:$PATH" PI_LOG="$O/pi10.log" bash -c '
+  . "$1"
+  cd "$2" || exit 2
+  O="$3"; MAX_LOAD=999999999; DISK_MIN_FREE_MB=1; DISK_LANE_TREE_MB=0; DISK_LANE_RESERVE_MB=0
+  KIND=lane; TAG=2834
+  load1() { printf 1; }
+  run_agent 300 "$4" "$5" "no bound" >>"$4.agent" 2>&1
+' _ "$NB/harness/spawn-gate.sh" "$TMP/wtnb" "$O" "$O/logs/nobound.log" "$PROMPT"
+arm "$O/logs/nobound.log"
+# ⛔ AND THE FIXTURE IS ASSERTED, NOT ASSUMED (N15d0's discipline): the lane must really hold an unpushed
+# commit, and the isolated tree must really have NO bounded.sh — else this arm measures nothing.
+[ "$(git -C "$TMP/wtnb" rev-list --count HEAD --not --remotes)" -gt 0 ] && [ ! -e "$NB/lib/bounded.sh" ]; rcn15f0=$?
+ck "N15f0 FIXTURE: the isolated tree has NO lib/bounded.sh and the lane really holds an unpushed commit — else this arm has no subject" $rcn15f0
+grep -q 'scripts/lib/bounded.sh was not found' "$O/logs/nobound.log" \
+  && ! git -C "$BARE" rev-parse -q --verify refs/heads/nobound >/dev/null 2>&1; rcn15f=$?
+ck "N15f …a MISSING scripts/lib/bounded.sh REFUSES the push by name and reaches no origin (refs/heads/nobound absent) — R3's 'a missing bound is a refusal, not a hang', driven rather than grepped" $rcn15f
+mk15f="$O/state/lane-exit-nobound.state"
+[ -s "$mk15f" ] && grep -qx 'push=UNAVAILABLE' "$mk15f" && grep -q '^next=MANUAL' "$mk15f"; rcn15g=$?
+ck "N15g …and the artifact records push=UNAVAILABLE with next=MANUAL, so a reclaim pass cannot read an unbound exit as safe [$(grep -m1 '^push=' "$mk15f" 2>/dev/null)]" $rcn15g
 # ⛔ N23 — ANY DOMAIN THAT SAYS MANUAL OUTRANKS A DOMAIN THAT ONLY REPORTS (review cycle 8, P1).
 # `lane_end_next`'s arms are `return 0`, so arm ORDER decided the verdict: the push case ran first, and its
 # `refused-protected|refused-main-checkout` arm is a NON-MANUAL sentence, so a DIRTY tree whose archive
@@ -2080,6 +2115,32 @@ sc_u="$( bash -c '
   lane_end_next' _ "$GATE" 2>/dev/null )"
 case "$sc_u" in MANUAL*'does NOT classify'*) rcn32c=0 ;; *) rcn32c=1 ;; esac
 ck "N32c …but an UNCLASSIFIED push value (here: the pre-push EMPTY one) makes the SAME clean tree ABSTAIN — a removal licence is never a fall-through [${sc_u:0:60}]" $rcn32c
+# ⛔ N32e — THE SAME ARGUMENT IN THE **OTHER** DIMENSION (review of PR #3399 round 11, P2 — REPRODUCED).
+# N32c stopped the tail consulting a default for `push`, but it kept interpolating `${LANE_END_TREE:-clean}`,
+# so a FUTURE tree verdict reaching the tail with a safe push value was PUBLISHED as `tree=clean` together
+# with "may be removed". Measured on the pre-fix function: `LANE_END_TREE=submodule-dirty push=pushed`
+# printed "nothing at risk (tree=submodule-dirty …): … may be removed", while the same tree value with an
+# EMPTY push abstained — i.e. the fence existed for one dimension and not the one beside it. The value used
+# here (`submodule-dirty`) is deliberately OUTSIDE the six declared tree values, the same way N31c uses
+# `not-attempted`: it is the only reachable expression of the branch a FUTURE verdict lands on, so do not
+# "fix" it to a declared value, which would make the arm vacuous.
+sc_t="$( bash -c '
+  . "$1"
+  LANE_END_TREE=submodule-dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=pushed
+  LANE_END_UNPUSHED=0; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$sc_t" in MANUAL*'does NOT classify the tree value'*) rcn32e=0 ;; *) rcn32e=1 ;; esac
+ck "N32e …and an UNCLASSIFIED **tree** value abstains too, even with a safe push — the removal licence is not a fall-through in either dimension [${sc_t:0:70}]" $rcn32e
+case "$sc_t" in *'may be removed'*) rcn32e2=1 ;; *) rcn32e2=0 ;; esac
+ck "N32e2 …and it does NOT carry the affirmative 'may be removed' sentence over a tree nobody classified" $rcn32e2
+# …and the two declared-safe values are unchanged, so the fence above cannot be passing by refusing EVERYTHING.
+sc_ok="$( bash -c '
+  . "$1"
+  LANE_END_TREE=clean; LANE_END_RESCUE=nothing; LANE_END_PUSH=pushed
+  LANE_END_UNPUSHED=0; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$sc_ok" in 'nothing at risk'*'tree=clean'*'may be removed'*) rcn32e3=0 ;; *) rcn32e3=1 ;; esac
+ck "N32e3 …while tree=clean with push=pushed still gets the affirmative reclaim sentence (the fence is a fence, not a blanket refusal) [${sc_ok:0:50}]" $rcn32e3
 # ⛔ N32d — `unpushed=0` IS A MEASUREMENT ABOUT THE LOCAL TRACKING REFS, NOT ABOUT THE REMOTE (review of
 # PR #3399, P1 — REPRODUCED). The sentence claimed "every commit on <b> is already on a remote ref", an
 # OFF-BOX fact this path never measured: the count is `git rev-list --count HEAD --not --remotes`, i.e.
