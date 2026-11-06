@@ -3054,7 +3054,13 @@ cascade_wait() { # <nap_seconds> <lanes_at_pass_end> -> 0 a slot FREED · 1 the 
   is_num "${poll:-}" || poll=20
   [ "$poll" -ge 1 ] || poll=20
   [ "$left" -gt 0 ] || return 1
-  is_num "${base:-}" || return 1   # no baseline ⇒ nothing to compare against ⇒ let the interval run
+  # ⛔ NO BASELINE ⇒ SLEEP THE INTERVAL, DO NOT RETURN (review cycle 2, P1). "Let the interval run" was
+  # FALSE: this function is called INSTEAD of the nap, so returning here slept zero seconds and the
+  # pass re-ran immediately. A census we could not read is not evidence that a slot freed.
+  if ! is_num "${base:-}"; then
+    [ "$left" -gt 0 ] && { fork_free_sleep "$left" || sleep "$left" 2>/dev/null; }
+    return 1
+  fi
   while [ "$left" -gt 0 ]; do
     [ "$left" -lt "$poll" ] && poll="$left"
     fork_free_sleep "$poll" || sleep "$poll" 2>/dev/null
@@ -3162,7 +3168,6 @@ cascade_main_probe() {
 import sys
 GREEN = ("success", "neutral", "skipped", "cancelled", "stale")
 newest = {}
-any_row = False
 for line in sys.stdin:
     line = line.rstrip("\n")
     if not line:
@@ -3170,7 +3175,6 @@ for line in sys.stdin:
     f = line.split("\t")
     if len(f) < 5:
         continue
-    any_row = True
     try:
         cid = int(f[0])
     except ValueError:
@@ -6769,8 +6773,11 @@ PY
   # on a pass where the room was WITHHELD — the funnel would print "DISPATCH — CASCADE" and nothing
   # would dispatch, which is a false PASS rather than a wrong number.
   # ⛔ SAME RULE AS ABOVE: one logical line, no continuation, no brace group (the 3.2 parser in CI).
-  CASCADE_PRW=0
-  if [ -n "${MP_PRIORITY:-}" ] || [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ] || [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_PRW=1; fi
+  CASCADE_PRW=0; CASCADE_PRW_WHY=""
+  if [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_PRW=1; CASCADE_PRW_WHY="unreadable"
+  elif [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ]; then CASCADE_PRW=1; CASCADE_PRW_WHY="holds"
+  elif [ -n "${MP_PRIORITY:-}" ]; then CASCADE_PRW=1; CASCADE_PRW_WHY="priority"
+  fi
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && [ "${CASCADE_PRW:-0}" = "1" ]; then CASCADE_PR_WAITING=1; fi
   # [cascade:end]
   echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_BACKLOG:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
@@ -6981,7 +6988,7 @@ PY
   declare -f lo_select >/dev/null 2>&1 && LO_SELECT_DEFINED=1
   SEL_LINE=""
   if [ "$LO_SELECT_DEFINED" = "1" ]; then
-    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" "${PRDISP_ACTS:-}" "${PRDISP_WAITS:-}" "${PRDISP_REC:-unknown}" "${PRDISP_SPAWNS:-}" "${CASCADE_PR_WAITING:-}" > "$SELFILE" 2>/dev/null || true
+    lo_select "$SEL_TOTAL" "${OWN_N:-0}" "${UPN_WORK:-${UPN:-?}}" "${SEL_PARKED:-0}" "${FIRST_PR:--}" "${GATE_WHY:-}" "$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')" "${PRDISP_ACTS:-}" "${PRDISP_WAITS:-}" "${PRDISP_REC:-unknown}" "${PRDISP_SPAWNS:-}" "${CASCADE_PR_WAITING:-}" "${CASCADE_PRW_WHY:-}" > "$SELFILE" 2>/dev/null || true
     SEL_LINE="$(cat "$SELFILE" 2>/dev/null)"
   fi
   rm -f "$SELFILE"
@@ -7316,8 +7323,17 @@ PY
     # a suite/older caller that does not compute the cascade" (pr-owner-liveness.test.sh drives it
     # EXACTLY that way), and that case must keep the pre-change behaviour. Only an EXPLICIT 0 stands
     # the escape down, so the module's drivability is not traded away for this.
-    if [ "${CASCADE_ISSUE_SLOTS-1}" = "0" ]; then
-      echo "[dispatch] DRAIN ESCAPE WITHHELD — the PR path is inert, but the box has NO ROOM (issue slots=0 under MAX_LANES/mem/load), so opening the issue path would dispatch nothing. No escape is taken and no record is written; the cascade opens the issue path by itself the moment a slot frees (owner ruling 2026-11-04)." >> "$LOG"
+    # ⛔ THE WITHHOLD KEYS ON THE **ROOM**, NOT ON THE SLOTS (review cycle 2, P1). `CASCADE_ISSUE_SLOTS`
+    # is 0 in TWO different states: a genuinely full box, and a pass where a pyramid level is HOLDING
+    # the room (`CASCADE_LEVEL_HOLDS=1`, set while `MAX_LANES - LANES > 0`). Withholding on the slots
+    # therefore disabled the ONE valve that exists for "the PR path started nothing for N passes" in
+    # the one state it is for — a merge ceiling that keeps refusing leaves a level holding pass after
+    # pass — and printed a cause ("NO ROOM … under MAX_LANES/mem/load") that is false there.
+    # `CASCADE_ROOM` is the same arithmetic the allocator uses, derived in the cascade block above.
+    # An UNSET `CASCADE_ROOM` means an older caller/driver rig that does not compute the cascade, and
+    # that case keeps the pre-change behaviour (escape fires) — the same rule as `${SLOTS-1}`.
+    if [ "${CASCADE_ROOM:-1}" -le 0 ] 2>/dev/null; then
+      echo "[dispatch] DRAIN ESCAPE WITHHELD — the PR path is inert and the box has NO ROOM (lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?}, issue slots=0), so opening the issue path would dispatch nothing. No escape is taken and no record is written; the cascade opens the issue path by itself the moment a slot frees (owner ruling 2026-11-04)." >> "$LOG"
     else
     printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
     if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
@@ -7431,7 +7447,13 @@ PY
       [ -z "${ISS:-}" ] && continue
       # A pass with no room queues nothing — the invariant `cascade_issue_slots` encodes, restated at
       # the ONE place that spends it, so a future edit to the allocator cannot silently overshoot.
-      [ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] 2>/dev/null || break
+      # ⛔ `${CASCADE_ISSUE_SLOTS-1}`, NOT `:-0` (review cycle 2, P0 — CI RED). `:-0` reads an UNSET
+      # variable as "no room" and breaks immediately, and several SHIPPED suites drive this batch body
+      # standalone (`refresh-scout.test.sh:2232` sets `BATCH`, never the cascade), so nothing was ever
+      # queued: measured 446/9 against 455/0 on main. An unset value means "an older caller/the suite
+      # did not compute the cascade" and must keep the pre-change behaviour — the SAME terse-minus rule
+      # the escape block below already uses one place over.
+      [ "${CASCADE_ISSUE_SLOTS-1}" -ge 1 ] 2>/dev/null || break
       grep -qx "$ISS" "$O/dispatched.txt" 2>/dev/null && continue
       # ── DEDUP: ALREADY IN FLIGHT IS NOT A CANDIDATE (owner ruling 2026-11-04: "each pass must also
       # dedup — do not dispatch something already in flight"). `dispatched.txt` is the SAME-BOX ledger
@@ -8060,7 +8082,11 @@ PY
     # `cascade_wait` always consumes the interval (it returns early once a slot appears, never before
     # having slept), so this branch REPLACES the nap below rather than preceding it — a slot-poll on
     # top of a full nap would be the same wasted cycle with extra forks.
-    cascade_wait $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) || true
+    # ⛔ THE BASELINE IS MANDATORY AND THIS IS THE ONLY CALL SITE (review cycle 2, P1). The first
+    # version omitted it, so `cascade_wait` returned 1 BEFORE SLEEPING (`base` empty ⇒ nothing to
+    # compare) and `|| true` swallowed it — this branch REPLACES the nap, so a full box re-ran the
+    # whole pass (paginated main probe, PR listing, sweeps, ownership walks) with no delay at all.
+    cascade_wait $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) "${LANES:-}" || true
   else
     sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
   fi

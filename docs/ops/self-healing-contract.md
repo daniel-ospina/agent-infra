@@ -1006,7 +1006,7 @@ still where the next cut should start.
     make a rate-limited `gh` listing the one condition that dispatches new work.
   - **`merge-priority` no longer assigns `GATE_WHY`**, so it can no longer mask a capacity gate: it is
     computed into `MP_PRIORITY` and printed as a level, and the capacity arms decide the cycle.
-  - Graded by `test-cascade.sh` (102 assertions, 15 mutants — each mutation makes a named assertion go
+  - Graded by `test-cascade.sh` (127 assertions, 18 mutants — each mutation makes a named assertion go
     RED) plus the existing `test-gates.sh` vector tests, `live-ownership.test.sh` and
     `pr-owner-liveness.test.sh`.
   **OVERRIDES:** the "WIP limit / stop-starting threshold" reading of the 2026-10-18 ruling — i.e. the
