@@ -122,7 +122,12 @@ LOCK_MAX_S="${WORKER_SUPPLY_LOCK_MAX_S:-900}"          # an unverifiable lock is
 LOG_MAX_BYTES="${WORKER_SUPPLY_LOG_MAX_BYTES:-262144}"
 ORCH_PLIST="${WORKER_SUPPLY_ORCH_PLIST:-$HOME/Library/LaunchAgents/com.eldato.orchestrator-loop.plist}"
 DEFAULT_MAX_FIX=3
-DEFAULT_MAX_REVIEW=4
+# ⛔ 10, NOT 4 (#3441) — `MAX_REVIEW` is the reviewer-concurrency cap AND the per-PR review-ROUND
+# ceiling, and this is the third reader of the one number (with `orch-loop.sh` and `pr-doctor.py`).
+# Divergence here is not cosmetic: `limit_of` reads the plist first, so this fallback only binds on a
+# box with no plist (a cell, a manual run) — exactly where a value of 4 would throttle the drain
+# against a documented 10.
+DEFAULT_MAX_REVIEW=10
 
 LOCK_DIR="$STATE_DIR/worker-supply.lock"
 LEDGER="$STATE_DIR/worker-supply-offers.tsv"
