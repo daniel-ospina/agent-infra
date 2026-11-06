@@ -207,6 +207,23 @@ function extraSet(names, allowed) {
   return names.filter((n) => !allowed.includes(n));
 }
 
+// jobBlock(text, name) — the lines of ONE job under `jobs:`, from its `  <name>:` header up to the next
+// job header (or end of file). Needed because this file asserts things about a SPECIFIC job, and a
+// whole-file `includes()`/regex is satisfied by an identical line in a DIFFERENT job — measured here:
+// `if: github.event_name != 'issue_comment'` appears on BOTH `pipeline-compliance` and
+// `workflow-drift`, so a text-wide match would have reported the required job guarded while its own
+// guard was gone. Scoping by job is what makes the guard assertion non-vacuous.
+function jobBlock(text, name) {
+  const lines = String(text ?? "").split("\n");
+  const start = lines.findIndex((l) => l === `  ${name}:`);
+  if (start < 0) return "";
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^  [A-Za-z0-9_-]+:\s*$/.test(lines[i])) { end = i; break; }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
 // ── the two facts this file owns ─────────────────────────────────────────────────────────────
 
 function checkWorkflowLock() {
@@ -334,7 +351,28 @@ function checkPipelineComplianceUnchanged() {
 
   // `workflow_call` is legitimate here (consumers reuse this file); anything else is a new run site
   // on the repo's only required context, and a `push:` arm would attach its verdict to main.
-  const extraOn = extraSet(onKeys(region, childIndent), ["workflow_call", "pull_request"]);
+  //
+  // ⛔ `issue_comment` IS ADMITTED, AND ONLY AS A GUARDED PAIR. The comment-triggered revalidation job
+  // exists to re-read a gate verdict after a body edit, and the file's header states at length that it
+  // posts no marker, cannot turn a red green and holds no `contents: write`. But admitting the trigger
+  // by NAME alone would be the fail-open this whole file exists to prevent: the repo's ONLY required
+  // status context is `pipeline-compliance`, and if that JOB ever lost its own guard, a comment event
+  // would produce the verdict a PR head is gated on — a surface no PR head controls. So the widening is
+  // bound to the EVIDENCE that makes it safe (`PC_COMMENT_GUARD` below), and dropping the guard from
+  // the job is refused exactly like an unreviewed new trigger. A genuinely NEW trigger still lands in
+  // `refusedExtra` and is reported by name, so the arm that says "a new dispatch path must declare
+  // itself" keeps firing.
+  const PC_ALLOWED_ON = ["workflow_call", "pull_request"];
+  const PC_ADMITTED_EXTRA = ["issue_comment"];
+  const PC_COMMENT_GUARD = /^\s*if:\s*.*github\.event_name\s*!=\s*'issue_comment'\s*$/m;
+  const onNames = onKeys(region, childIndent);
+  const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
+  const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));
+  if (admitted.length && !PC_COMMENT_GUARD.test(jobBlock(text, "pipeline-compliance"))) {
+    findings.push(
+      `pipeline-compliance.yml declares \`${admitted.join(", ")}:\` but its \`pipeline-compliance\` JOB no longer carries \`if: github.event_name != 'issue_comment'\`. The comment trigger is admitted ONLY as a guarded pair: without that guard on the REQUIRED job the COMMENT event satisfies the repo's only required status context, so a comment — not a PR head — produces the verdict a merge is gated on. (A guard on any OTHER job does not satisfy this: \`workflow-drift\` carries its own for its own reasons.)`
+    );
+  }
   if (extraOn.length) {
     findings.push(
       `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\` and \`pull_request:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`

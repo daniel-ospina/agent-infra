@@ -39,6 +39,11 @@
 #      Pinning one trigger's filters is not enough: a second trigger re-opens all of it.
 #  7f. MUTANT: a `push:` trigger added to `pipeline-compliance.yml`  → must FAIL (the same `on:`
 #      key-set pin on the required context).
+#  7g. MUTANT: the required job's `issue_comment` guard dropped      → must FAIL. `issue_comment:` is
+#      ADMITTED here (a decided, documented trigger), but only as a GUARDED PAIR: bound to the
+#      `if: github.event_name != 'issue_comment'` line on the `pipeline-compliance` JOB — not on the
+#      `workflow-drift` twin, which carries the same text — so the required context can never be
+#      satisfied by a comment. A genuinely new trigger beside the admitted one is still refused BY NAME.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
@@ -392,6 +397,66 @@ if apply_mutation "$PC" "$PC_PUSH" \
   case "$FINDINGS" in
     *"declares [push]"*) pass "the refusal NAMES the added trigger" ;;
     *) fail "the refusal did not name the added trigger in its FINDING line" ;;
+  esac
+fi
+
+echo '== 7g. MUTANT: `issue_comment` admitted ONLY as a guarded pair =='
+# `issue_comment:` is on `pipeline-compliance.yml` ON PURPOSE — the comment-triggered revalidation job
+# re-reads a gate verdict after a body edit and the required job guards itself out of the event. That
+# makes the trigger DECIDED, so the allow-list admits it. But an allow-list entry by NAME alone would be
+# the fail-open this suite exists to prevent: the required status context must never be satisfiable by
+# a comment. So the admission is bound to the guard, and dropping the guard must be REFUSED.
+PC_NOGUARD="$TMP/pc-noguard.yml"
+if apply_mutation "$PC" "$PC_NOGUARD" \
+  "  pipeline-compliance:
+    name: pipeline-compliance
+    # \`issue_comment\` must never satisfy the required context: this job runs the
+    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "  pipeline-compliance:
+    name: pipeline-compliance" \
+  "the required job's comment guard must be removable"; then
+  run_check 1 "dropping the required job's \`issue_comment\` guard is REFUSED" PC_FILE="$PC_NOGUARD"
+  case "$FINDINGS" in
+    *"no longer carries"*"event_name != 'issue_comment'"*) pass "the refusal NAMES the guard the required job lost" ;;
+    *) fail "the refusal did not name the dropped guard in its FINDING line" ;;
+  esac
+fi
+
+# ⛔ AND THE GUARD MUST BE THE REQUIRED JOB'S OWN. `workflow-drift` carries the SAME line for its own
+# reasons, so a whole-file match would report the required job guarded while its guard was gone. This
+# mutant deletes ONLY the `pipeline-compliance` one and leaves `workflow-drift`'s in place — if the
+# reader is text-wide it reads green here, which is exactly the false pass being pinned out.
+PC_NOGUARD2="$TMP/pc-noguard2.yml"
+if apply_mutation "$PC" "$PC_NOGUARD2" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event." \
+  "the required job's guard must be removable while its twin survives"; then
+  if grep -c "event_name != 'issue_comment'" "$PC_NOGUARD2" | grep -qx 1; then
+    run_check 1 "the guard is matched on the REQUIRED job, not on \`workflow-drift\`'s twin" PC_FILE="$PC_NOGUARD2"
+  else
+    fail "could not construct the twin-guard mutant (the survivor count is not 1) — the arm would be vacuous"
+  fi
+fi
+
+# ⛔ AND A GENUINELY NEW TRIGGER IS STILL NAMED. The widening must not swallow the next one: adding
+# `issue_comment:` must not turn this arm into a permanent green for any extra trigger.
+PC_COMMENT_AND_PUSH="$TMP/pc-comment-push.yml"
+if apply_mutation "$PC" "$PC_COMMENT_AND_PUSH" \
+  "  pull_request:
+    branches:
+      - main" \
+  "  push:
+    branches: [main]
+  pull_request:
+    branches:
+      - main" \
+  "a push trigger beside the admitted comment trigger must be constructible"; then
+  run_check 1 "with \`issue_comment\` ADMITTED, an added \`push:\` is STILL refused" PC_FILE="$PC_COMMENT_AND_PUSH"
+  case "$FINDINGS" in
+    *"declares [push]"*) pass "…and the refusal names the NEW trigger, not the admitted one" ;;
+    *) fail "the refusal did not name the newly added trigger alone" ;;
   esac
 fi
 
