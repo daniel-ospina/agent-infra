@@ -177,7 +177,10 @@ RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "2j a store entry with an \`env\` map but NO \`key\` refuses NOTHING (rc=${RC:-<none>}) — pi may still resolve its own provider var" \
    "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
 hasnt "$OUT" "check=skipped reason=stored-credential " "2j2 …and does not claim the store answered (that claim was the false pass)"
-has "$OUT" "reason=stored-credential-unresolvable" "2j2b …and names the third answer instead: the entry is visible, its credential is not ours to resolve"
+# ⛔ AND IT SAYS THE RIGHT THIRD ANSWER (round 27, P3, measured): `stored-credential-unresolvable` described an entry
+# that HAS a value the gate cannot use; a key-less `api_key` entry has NO value at all, and pi falls back to the
+# provider's own built-in variable. The two facts now have two reasons, because the remedies differ.
+has "$OUT" "reason=stored-credential-keyless" "2j2b …and names the third answer: the entry is VALID and key-less, so pi uses its own built-in variable"
 # …and the inverse, so 2j cannot pass by refusing stores unconditionally: `key` ALONGSIDE `env` is the
 # shape `resolveConfigValue(credential.key, credential.env)` can actually use, so it must pass.
 HK="$(mkhome envpluskey "$DEEPSEEK_JSON")"
@@ -319,32 +322,6 @@ ck "2k6 a \`~/…\` override is EXPANDED like pi does, so a store that exists on
    "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
 has "$OUT" "agent_dir=$OV3" "2k7 …and it reads the expanded directory, not the home-relative default"
 
-# ⛔ AND A `file://` OVERRIDE IS A PATH TO pi, NOT A RELATIVE NAME (round 26, P2, measured): `normalizePath` converts a
-# `file:` URL with `fileURLToPath` BEFORE the absolute/relative test (`dist/utils/paths.js:78-80`), and `getAgentDir()`
-# runs the override through it. Joining the URL onto `cwd` answered about a directory pi never reads — measured:
-# `PI_CODING_AGENT_DIR=file://<tmp>/altagent` listed that directory's provider under `pi --list-models` while the gate
-# said `cannot-resolve-provider-credential ... from <cwd>/file://<tmp>/altagent/models.json`. Only the host-less absolute
-# form is reproduced (a percent-escape or `file://host/...` answers cannot-say rather than a path that is silently wrong).
-HFU="$(mkset fileurl "$TWO_JSON" ABSENT)"
-mkdir -p "$T/furl/agent"
-printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m"}]}}}\n' > "$T/furl/agent/models.json"
-OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HFU" KG_GATE="$KG" PI_CODING_AGENT_DIR="file://$T/furl/agent" \
-        bash -c 'set -u
-          . "$KG_GATE" || exit 99
-          printf "AGENT=%s\n" "$(key_gate_agent_dir "$HOME" "")"
-          printf "VAR=%s\n" "$(key_gate_var "$HOME" deepseek "")"' 2>&1)"
-has "$OUT" "AGENT=$T/furl/agent" \
-    "2k8 a file:// override resolves to the PATH pi reads, not to \$cwd/file://..."
-has "$OUT" "VAR=KG_CANARY_KEY" \
-    "2k9 ...so the models.json inside it is found"
-OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HFU" KG_GATE="$KG" PI_CODING_AGENT_DIR="file://host$T/furl/agent" \
-        bash -c 'set -u
-          . "$KG_GATE" || exit 99
-          printf "AGENT=%s\n" "$(key_gate_agent_dir "$HOME" "")"' 2>&1)"
-hasnt "$OUT" "host$T" \
-    "2k10 a file://HOST/... override answers cannot-say, not a joined path about a directory pi never reads"
-eqv "$(printf '%s\n' "$OUT" | sed -n 's/^AGENT=\(.*\)$/\1/p')" "" \
-    "2k11 …(it prints NO directory at all, which is the answer every caller turns into a cannot-say)"
 
 # ── 3. BLINDNESS IS NOT A REFUSAL (polarity, the direction that stops a fleet) ───────────────────
 for spec in "absent:ABSENT" \
@@ -1113,8 +1090,8 @@ printf '{"deepseek":{"type":"api_key"}}\n' > "$HJ/.pi/agent/auth.json"
 OUT="$(run_gate "$HJ")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "8T a typed entry with NO key refuses nothing (rc=${RC:-<none>})" \
    "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
-has "$OUT" "reason=stored-credential-unresolvable" \
-    "8T2 …and says the credential it can see is not ours to resolve"
+has "$OUT" "reason=stored-credential-keyless" \
+    "8T2 …and says the entry is valid but key-less, so pi falls back to its own built-in variable"
 # ...and an invalid entry for ANOTHER provider is not this provider's defect (measured: pi skipped it and ran on
 # the valid deepseek entry), so the store still answers for this one.
 HK="$(mkset storeotherbad "$TWO_JSON" ABSENT)"
@@ -1492,6 +1469,42 @@ ck "8L20 …while an ARRAY store is NOT refused — pi reaches the provider from
    "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
 has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
     "8L21 …so the null rule is not a blanket refusal of every non-object"
+# ⛔ AND AN `env` MAP HOLDING A NON-STRING IS STRINGIFIED BY pi, NOT A CRASH HERE (round 27, P1, measured): pi's
+# `resolveEnvConfigValue` returns the RAW value (`resolve-config-value.js:71-73`) and `resolveTemplate` concatenates it with
+# JS `+` (`:83-95`), so `{"A": 5}` yields the key `sk-5` — measured, pi SENT it (401) for all four of number, array,
+# object and boolean. `out += v` raised TypeError in this reader, python exited 1, and 1 is the POSITIVE "no credential
+# for this provider": the gate fell through to the environment, and with the template variable unset it REFUSED 82 a box
+# pi runs (measured end to end). A CRASH is also cannot-say at the caller now, because rc 1 with output means the reader
+# did not read the store.
+for _envv in '5' '["sk-a","sk-b"]' '{"x":1}' 'true'; do
+  HEN2="$(mkset "storenvscalar" "$TWO_JSON" ABSENT)"
+  printf '{"deepseek":{"type":"api_key","key":"sk-${A}","env":{"A":%s}}}\n' "$_envv" > "$HEN2/.pi/agent/auth.json"
+  OUT="$(run_gate "$HEN2")"; rc="$(rc_of "$OUT")"
+  ck "8L30.$_envv an env value of $_envv is a USABLE key to pi (rc=${rc:-<none>})" \
+     "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+  # ⛔ `reason=stored-credential provider=` AND NOT THE BARE PREFIX (measured on the mutant): `stored-credential` is a
+  # SUBSTRING of `stored-credential-unresolvable`, so the short form was satisfied by the cannot-say line — the arm
+  # could not tell "the store answered" from "the gate gave up on it".
+  has "$OUT" "check=skipped reason=stored-credential provider=deepseek" \
+      "8L31.$_envv …so the gate says the store ANSWERS, instead of refusing or abstaining"
+  hasnt "$OUT" "result=REFUSED" \
+      "8L32.$_envv …and never a refusal for a credential pi concatenated"
+done
+# ⛔ AND A CRASH IS CANNOT-SAY, NOT THE POSITIVE "NO CREDENTIAL" (round 27, P1, measured): python exits 1 on an
+# unhandled exception, and 1 is this mode's POSITIVE "there is no entry for this provider" — so a bug in the reader was
+# published as a fact about the BOX (the caller then fell through to the environment, or refused 82). The guard keeps
+# the stderr stream and treats "rc 1 WITH output" as cannot-say. Driven with a STUB `python3` that fails the way a
+# crash does, because no fixture reaches it once `resolve()` stringifies (the guard is what stands between a future bug
+# and a false block, so it is pinned behaviourally rather than by a source grep).
+mkdir -p "$T/stub/bin"
+printf '#!/bin/sh\necho "Traceback (most recent call last): boom" >&2\nexit 1\n' > "$T/stub/bin/python3"
+chmod +x "$T/stub/bin/python3"
+HSB="$(mkset storecrash "$TWO_JSON" ABSENT)"
+printf '{"deepseek":{"type":"api_key","key":"sk-x"}}\n' > "$HSB/.pi/agent/auth.json"
+SB_RC="$(env -i PATH="$T/stub/bin:/usr/bin:/bin" HOME="$HSB" KG_GATE="$KG" \
+  bash -c '. "$KG_GATE" || exit 99; key_gate_stored_credential "$HOME" deepseek ""; printf "rc=%s\n" "$?"' 2>&1 | sed -n "s/^rc=//p")"
+eqv "${SB_RC:-?}" "3" \
+    "8L33 a CRASHING store reader is 'cannot say' (rc=${SB_RC:-<none>}), never the positive rc 1"
 # ⛔ AND AN ENTRY THAT IS A FALSY SCALAR IS "NOTHING STORED" TO pi, WHICH THEN USES THE ENVIRONMENT (round 26, P1,
 # measured): `auth-storage.js:377-380` returns the raw entry and `pi-ai/dist/auth/resolve.js:24` branches on `if (stored)`
 # — JS TRUTHINESS — so `false`, `0`, `0.0`/`-0` and `""` are all absent, and measured with the key exported pi RAN
@@ -1652,6 +1665,8 @@ levelmapvalue|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id
 promptcachevalue|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","promptCache":{"short":-5}}]}}}
 imagesmax|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","inputLimits":{"images":{"maxPerMessage":0}}}]}}}
 imagesresize|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","inputLimits":{"images":{"resize":{"maxWidth":"wide"}}}}]}}}
+imagesjpeg|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","inputLimits":{"images":{"resize":{"jpegQuality":101}}}}]}}}
+compatfallbackmax|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"allowedFallbackModels":[{"provider":"a","model":"a","cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}},{"provider":"b","model":"b","cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}},{"provider":"c","model":"c","cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}},{"provider":"d","model":"d","cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}}]}}}}
 overridecost|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"cost":"cheap"}}}}}
 overridecostvalue|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","modelOverrides":{"m":{"cost":{"input":"1"}}}}}}
 compatprovider|{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"supportsStore":"yes"}}}}
@@ -1714,6 +1729,26 @@ for _pair in 'maxpriceextra|{"max_price":{"prompt":1,"weird":true}}' \
   has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
       "8M34.$_field an unknown key inside a routing block is legal — pi loads that file, so the credential is asserted"
 done
+# ⛔ AND THE TWO BOUNDS THAT `pi` ENFORCES HAVE LEGAL SIDE CONTROLS (round 27, P2, measured: `jpegQuality <= 100` and
+# `allowedFallbackModels` `maxItems: 3` had NO arm — deleting either left the suite fully green, so a false-PASS guard
+# could be removed silently). Without a legal case a stricter bound would satisfy the rows above, so both are pinned.
+# (The bodies are spliced at the RIGHT LEVEL: `inputLimits` is a MODEL field and `compat` a PROVIDER one. The first cut
+# put `inputLimits` on the provider — where an unknown key is legal — so the arm passed its rc check while the bound it
+# claims to control was never exercised at all.)
+HJL="$(mkset routingloadable-jpeglegal "$TWO_JSON" ABSENT)"
+printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m","inputLimits":{"images":{"resize":{"jpegQuality":100}}}}]}}}\n' > "$HJL/.pi/agent/models.json"
+OUT="$(run_gate "$HJL" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8M35.jpeglegal …while jpegQuality=100 (the bound) still answers (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+    "8M36.jpeglegal …check=ok, so the bound is exact and not merely strict"
+HFL="$(mkset routingloadable-fallbacklegal "$TWO_JSON" ABSENT)"
+printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","compat":{"allowedFallbackModels":[{"provider":"a","model":"a","cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}},{"provider":"b","model":"b","cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}},{"provider":"c","model":"c","cost":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0}}]},"models":[{"id":"m"}]}}}\n' > "$HFL/.pi/agent/models.json"
+OUT="$(run_gate "$HFL" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+ck "8M35.fallbacklegal …while exactly THREE fallbacks still answer (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+    "8M36.fallbacklegal …check=ok, so maxItems:3 is exact and not merely strict"
 # AND THE POSITIVE CONTROL: the SAME fields, VALID, must still pass — a mirror that rejects a legal template is
 # the false-82 polarity this whole file is written against, and it is the easier mistake to make when adding checks.
 # ⛔ AND THE MIRROR MUST NOT INVENT RULES pi DOES NOT HAVE (round 19, P3, measured): `ThinkingLevelMap` and
@@ -1912,6 +1947,48 @@ ck "8k7 …and exits 0 when that variable is set (rc=${rc:-<none>}) — so 8k5 i
    "$([ "$rc" = "0" ] && echo 0 || echo 1)"
 has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek model=deepseek-flash" \
     "8k8 …with the pass line the lane would print, model included"
+
+
+# ⛔ NOTE ON PLACEMENT: this block sits at the END of the suite ON PURPOSE. Its first version was placed with the
+# other override arms (before `mkset` is defined at ~line 595), so every call returned an EMPTY path, `HOME=` was
+# empty, `key_gate_agent_dir` answered nothing and the assertions passed for the wrong reason — measured with the
+# `file://` arm deleted, which left them green. An arm that cannot fail is worse than a missing one.
+# ⛔ AND A `file://` OVERRIDE IS A PATH TO pi, NOT A RELATIVE NAME (round 26, P2, measured): `normalizePath` converts a
+# `file:` URL with `fileURLToPath` BEFORE the absolute/relative test (`dist/utils/paths.js:78-80`), and `getAgentDir()`
+# runs the override through it. Joining the URL onto `cwd` answered about a directory pi never reads — measured:
+# `PI_CODING_AGENT_DIR=file://<tmp>/altagent` listed that directory's provider under `pi --list-models` while the gate
+# said `cannot-resolve-provider-credential ... from <cwd>/file://<tmp>/altagent/models.json`. Only the host-less absolute
+# form is reproduced (a percent-escape or `file://host/...` answers cannot-say rather than a path that is silently wrong).
+HFU="$(mkset fileurl "$TWO_JSON" ABSENT)"
+mkdir -p "$T/furl/agent"
+printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m"}]}}}\n' > "$T/furl/agent/models.json"
+OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HFU" KG_GATE="$KG" PI_CODING_AGENT_DIR="file://$T/furl/agent" \
+        bash -c 'set -u
+          . "$KG_GATE" || exit 99
+          printf "AGENT=%s\n" "$(key_gate_agent_dir "$HOME" "")"
+          printf "VAR=%s\n" "$(key_gate_var "$HOME" deepseek "")"' 2>&1)"
+has "$OUT" "AGENT=$T/furl/agent" \
+    "2k8 a file:// override resolves to the PATH pi reads, not to \$cwd/file://..."
+has "$OUT" "VAR=KG_CANARY_KEY" \
+    "2k9 ...so the models.json inside it is found"
+OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HFU" KG_GATE="$KG" PI_CODING_AGENT_DIR="file://host$T/furl/agent" \
+        bash -c 'set -u
+          . "$KG_GATE" || exit 99
+          printf "AGENT=%s\n" "$(key_gate_agent_dir "$HOME" "")"' 2>&1)"
+hasnt "$OUT" "host$T" \
+    "2k10 a file://HOST/... override answers cannot-say, not a joined path about a directory pi never reads"
+eqv "$(printf '%s\n' "$OUT" | sed -n 's/^AGENT=\(.*\)$/\1/p')" "" \
+    "2k11 …(it prints NO directory at all, which is the answer every caller turns into a cannot-say)"
+# ⛔ A PERCENT-ESCAPED `file://` IS CANNOT-SAY, NOT A PATH (round 27, P3, measured): `fileURLToPath` percent-DECODES
+# (`dist/utils/paths.js:78-80`), so `file:///tmp/a%20b` is `/tmp/a b` to pi and this gate cannot reproduce that without
+# re-implementing the URL decoder. Losing the guard would fall through to `$home/.pi/agent` — the hardcoded-home defect
+# the function exists to remove — and answer about a DIFFERENT store.
+OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HFU" KG_GATE="$KG" PI_CODING_AGENT_DIR="file://$T/furl/a%20b" \
+        bash -c 'set -u
+          . "$KG_GATE" || exit 99
+          printf "AGENT=%s\n" "$(key_gate_agent_dir "$HOME" "")"' 2>&1)"
+eqv "$(printf '%s\n' "$OUT" | sed -n 's/^AGENT=\(.*\)$/\1/p')" "" \
+    "2k12 a percent-escaped file:// override answers cannot-say rather than a path pi would not read"
 
 echo
 if [ "$FAIL" -gt 0 ]; then
