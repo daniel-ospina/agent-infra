@@ -1061,6 +1061,17 @@ _got="$(rrspend garbage 11 10)"
 _got="$(rrspend "$CAP" $(( CAP - 1 )) $(( CAP + 3 )))"
 [ "$_got" = "$(( CAP + 4 ))" ] && ok "(c4o) a book a CONCURRENT writer moved ahead is never overwritten: round $(( CAP - 1 )) against a book of $(( CAP + 3 )) lands $(( CAP + 4 )), not a REFUND back to $(( CAP - 1 ))" \
   || bad "(c4o) the spend wrote the TOP-OF-FILE round over a higher book (book=$(( CAP + 3 )) -> $(printf '%s' "$_got"), expected $(( CAP + 4 ))) — the counter moves BACKWARDS, so each such interleaving refunds a round and the per-PR ceiling is loose by exactly as many as happen"
+# ⛔ AND THE WRITER'S CLAMPS, WHICH WERE PINNED BY NOTHING (fresh review of #3441, P3). Both READERS
+# coerce a 10-digit book (the `(c4j)`/`(c4k)` arms above), so a writer that EMITS one is invisible until a
+# reader launders it. The reachable one is the SPEND'S OWN clamp, not the top-of-file one: the ceiling
+# check reads the book once, near the top, and the spend re-reads it afterwards, so a book that reached
+# 999999999 during an already-allowed review hands `+ 1` a 10-digit candidate. MUTANT (measured): delete
+# the `[ "${#REVIEW_ROUND}" -gt 9 ] && REVIEW_ROUND=999999999` line INSIDE the re-derivation block — the
+# top-of-file `if` is NOT this arm's mutant, and deleting that one leaves the book at 999999999 (the
+# re-derivation clamps first), which is why the note in merge-one.sh names the two clamps separately.
+_got="$(rrspend "$CAP" 5 999999999)"
+[ "$_got" = "999999999" ] && ok "(c4o) the WRITER clamps a spend on a book already at the 9-digit ceiling back to 999999999, never emitting a 10-digit value for a reader to launder" \
+  || bad "(c4o) the spend wrote a 10-digit book ($(printf '%s' "$_got"), expected 999999999) — the reachable clamp (the one inside the re-derivation) is gone, so the writer emits a numeral its own readers must coerce and its 9-digit invariant is false"
 sed 's/if _rr_report_only "${MAX_REVIEW:-}"; then/if false; then/' "$RRSPEND" > "$TMP/rrspend.rev.sh"
 diff -q "$RRSPEND" "$TMP/rrspend.rev.sh" >/dev/null 2>&1
 if [ $? -ne 0 ]; then
