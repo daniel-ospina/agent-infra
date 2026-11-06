@@ -833,6 +833,56 @@ if apply_mutation "$PC" "$PC_SHADOW_FLOW" \
   run_check 2 "a FLOW-MAPPED job header (which hides its \`name:\`) is CANNOT-VERIFY" PC_FILE="$PC_SHADOW_FLOW"
 fi
 
+# (c1e4) ⛔ AND A FLOW MAPPING IS NOT CONFINED TO ITS HEADER LINE. Inferring "no `name:` inside" from the
+#        header line's own text is unsound exactly when the mapping continues: `shadow: {` /
+#        `name: pipeline-compliance,` / `}` puts the context name on a FOLLOWING line, so the header text
+#        does not contain it, the job was skipped as a non-minter, and a real second minter went
+#        invisible — rc=0 while a comment event could satisfy the required context (measured, pyyaml
+#        shows both jobs named `pipeline-compliance`). The mapping is now read to its closing brace
+#        first, and both continuations are pinned: an opening brace on the header, and an opening brace
+#        on the NEXT line (which the header-only check read as a block mapping).
+PC_SHADOW_FLOW_MULTI="$TMP/pc-shadow-flow-multi.yml"
+if apply_mutation "$PC" "$PC_SHADOW_FLOW_MULTI" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow: {
+    name: pipeline-compliance,
+    if: true,
+    runs-on: ubuntu-latest }' \
+  "a multi-line flow mapping shadow must be constructible"; then
+  run_check 2 "a FLOW MAPPING continued over lines still COUNTS its minter" PC_FILE="$PC_SHADOW_FLOW_MULTI"
+fi
+
+PC_SHADOW_FLOW_NEXT="$TMP/pc-shadow-flow-next.yml"
+if apply_mutation "$PC" "$PC_SHADOW_FLOW_NEXT" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow:
+    {name: pipeline-compliance, if: true, runs-on: ubuntu-latest}' \
+  "a flow mapping starting on the NEXT line must be constructible"; then
+  run_check 2 "a FLOW MAPPING starting on the NEXT line still COUNTS its minter" PC_FILE="$PC_SHADOW_FLOW_NEXT"
+fi
+
+# (c1e5) ⛔ AND THE JOB'S KEY INDENT IS DERIVED, NOT ASSUMED. YAML requires only that a job's children
+#        be DEEPER than its header, so a shadow whose children sit at 6 spaces declared a `name:` that a
+#        hardcoded 4-space read never saw — a second minter invisible again (measured rc=0, pyyaml shows
+#        two). Both resolvers now take the indent from the job's first key line, which also un-reds the
+#        required job re-indented the same way (the mirror false block).
+PC_SHADOW_INDENT6="$TMP/pc-shadow-indent6.yml"
+if apply_mutation "$PC" "$PC_SHADOW_INDENT6" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow:
+      name: pipeline-compliance
+      if: true
+      runs-on: ubuntu-latest' \
+  "a shadow with 6-space children must be constructible"; then
+  run_check 2 "a shadow whose children are DEEPER-indented still COUNTS its minter" PC_FILE="$PC_SHADOW_INDENT6"
+fi
+
 # …while a trailing comment on the REQUIRED job's own `name:` is a comment, not a different context.
 PC_REQ_NAME_COMMENT="$TMP/pc-req-name-comment.yml"
 if apply_mutation "$PC" "$PC_REQ_NAME_COMMENT" \

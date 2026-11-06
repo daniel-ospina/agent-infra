@@ -354,7 +354,18 @@ function jobBlock(text, name) {
 function jobKeyIs(block, key, valueRe) {
   const lines = String(block ?? "").split("\n");
   const header = lines[0] ?? "";
-  const keyIndent = " ".repeat(header.length - header.trimStart().length + 2);
+  // ⛔ DERIVED FROM THE FIRST KEY LINE, not `header indent + 2`: YAML requires only that a job's
+  // children are DEEPER than the header, so a body indented to 6 spaces computed a 4-space key indent,
+  // matched no `if:`, and reported a guarded job as unguarded (measured rc=1 on a correct tree).
+  const firstKey = lines
+    .slice(1)
+    .map((l) => KEY_RE.exec(l))
+    .find((m) => m && m[1].length > (header.length - header.trimStart().length));
+  const keyIndent = " ".repeat(
+    firstKey
+      ? firstKey[1].length
+      : header.length - header.trimStart().length + 2
+  );
   // ⛔ The key is matched in EVERY quoting YAML permits (`if:`, `"if":`, `'if':`). Matching only the
   // bare spelling left a duplicate written `"if": true` invisible to `every()` — PyYAML confirms that
   // is the value the workflow evaluates — so the gate read green over an `if: true`.
@@ -531,6 +542,40 @@ function checkHarnessSingleSource() {
 // marker that `record-review.sh` writes AFTER the last push. Removing it there is the mistake this
 // change most invites ("finish the job"), and it would be a silent fail-open: a forged
 // `verdict=clean-micro` marker would ride a stale green check to merge.
+// flowHeaderText(headerValue, lines, i) — the whole of a flow mapping that STARTS on line i.
+//
+// ⛔ A FLOW MAPPING IS NOT CONFINED TO ITS HEADER LINE. `shadow: {` … `}` may run over several lines, so
+// inferring "no `name:` inside it" from the header line's own text is unsound exactly when the mapping
+// continues: the appended block `shadow: {` / `name: pipeline-compliance,` / `}` puts the context name
+// on a following line, the header text does not contain it, and skipping the job made a real second
+// minter invisible — gate ok/rc=0 while a comment event could satisfy the required context (measured).
+// So the header's flow mapping is read to its closing brace first, and `complete` records whether this
+// reader could see the whole of it.
+function flowHeaderText(headerValue, lines, i) {
+  const depth = (s) => {
+    let d = 0;
+    let q = null;
+    for (let k = 0; k < s.length; k += 1) {
+      const ch = s[k];
+      if (q) {
+        if (ch === q) q = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") q = ch;
+      else if (ch === "{") d += 1;
+      else if (ch === "}") d -= 1;
+    }
+    return d;
+  };
+  let text = String(headerValue ?? "");
+  let d = depth(text);
+  for (let j = i + 1; j < lines.length && d > 0; j += 1) {
+    text += " " + lines[j];
+    d = depth(text);
+  }
+  return { complete: d === 0, text };
+}
+
 // requiredContextJobId(text) — the JOB ID whose `name:` is the required status context.
 //
 // ⛔ BY NAME, AND IT MUST BE UNIQUE. The required context is a NAME (the workflow's header says main
@@ -588,32 +633,58 @@ function requiredContextJobId(text, contextName = "pipeline-compliance") {
     // ⛔ A JOB HEADER MUST BE A PLAIN BLOCK MAPPING. A flow-mapped header
     // (`shadow: {name: pipeline-compliance, if: true}`) declares a `name:` this reader never sees, so a
     // minter could hide inside it — refuse rather than read a job whose shape is not modelled.
-    if (/^\s*\{/.test(m[5] ?? "")) {
-      // ⛔ BUT ONLY WHEN IT COULD MINT THE CONTEXT. A blanket refusal over every flow-mapped job header
+    // A flow mapping may also BEGIN on the next line: `shadow:` then `{name: …, if: true}`. The header
+    // line is then empty, so it was read as a BLOCK mapping, its `name:` (inside the braces) was never
+    // matched at a key indent, and the job was counted as minting its id — a real second minter went
+    // invisible (measured rc=0 with pyyaml showing two). The first deeper non-blank, non-comment line
+    // decides which shape this is.
+    let flowSource = /^\s*\{/.test(m[5] ?? "") ? { value: m[5], at: i } : null;
+    if (!flowSource) {
+      for (let j = i + 1; j < lines.length; j += 1) {
+        const raw = lines[j];
+        if (raw.trim() === "" || /^\s*#/.test(raw)) continue;
+        if (raw.length - raw.trimStart().length <= 2) break; // next job / top-level key
+        if (/^\s*\{/.test(raw)) flowSource = { value: raw, at: j };
+        break;
+      }
+    }
+    if (flowSource) {
+      const flow = flowHeaderText(flowSource.value, lines, flowSource.at);
+      // ⛔ BUT ONLY WHEN IT COULD MINT THE CONTEXT — and the WHOLE mapping decides that, never the
+      // header line alone (see flowHeaderText). An INCOMPLETE one is refused because this reader
+      // cannot see the `name:` it may contain.
+      // A blanket refusal over every flow-mapped job header
       // turns a NON-minting sibling (`workflow-drift: {name: …}`) into CANNOT-VERIFY, which both
       // over-blocks a correct tree and destroys the ability of the block-terminator arms to distinguish
       // "the block ended here" from "the reader gave up" — measured: the terminator arm read rc=2
       // instead of rc=1 with the blanket rule. The header text is all a line reader has, so if the
       // CONTEXT NAME does not appear in it, no `name:` inside can equal the context and the job cannot
       // mint it; if it does appear, the reader genuinely cannot tell and refuses.
-      if ((m[5] ?? "").includes(contextName)) {
+      if (!flow.complete || flow.text.includes(contextName)) {
         refuse(
-          `line ${i + 1}: the \`${id}\` job header is a FLOW MAPPING carrying ${JSON.stringify(
-            contextName
-          )}, and this reader does not model flow mappings — the set of jobs minting the required context is UNVERIFIED.`
+          `line ${flowSource.at + 1}: the \`${id}\` job${
+            flow.complete ? ` carrying ${JSON.stringify(contextName)}` : " this reader cannot read to its close"
+          } is a FLOW MAPPING, and flow mappings are not modelled — the set of jobs minting the required context is UNVERIFIED.`
         );
       }
-      continue; // cannot mint the required context
+      continue; // a COMPLETE flow mapping that cannot name the context, so it cannot mint it
     }
     // GitHub uses `name:` when the job declares one, otherwise the id itself.
     let ctx = id;
     const nameLines = [];
+    // ⛔ THE KEY INDENT IS DERIVED, NOT ASSUMED TO BE 4. YAML only requires a job's children to be
+    // DEEPER than the header, so hardcoding four spaces read no `name:` at all when a job's children sat
+    // at six — a shadow minting the context became invisible (measured rc=0 with pyyaml showing two
+    // minters), and the correctly guarded required job re-indented the same way read as a lost guard.
+    // The first key line inside the job defines its key indent, exactly as `jobKeyIs` derives it.
+    let keyIndent = null;
     for (let j = i + 1; j < lines.length; j += 1) {
       const nm = KEY_RE.exec(lines[j]);
-      if (nm) {
-        if (nm[1].length <= 2) break; // next job header or a top-level key
-        if (nm[1].length === 4 && (nm[2] ?? nm[3] ?? nm[4]) === "name") nameLines.push(nm);
-      }
+      if (!nm) continue;
+      const ind = nm[1].length;
+      if (ind <= 2) break; // next job header or a top-level key
+      if (keyIndent === null) keyIndent = ind;
+      if (ind === keyIndent && (nm[2] ?? nm[3] ?? nm[4]) === "name") nameLines.push(nm);
     }
     if (nameLines.length > 1) {
       refuse(
