@@ -5143,9 +5143,11 @@ same 5.6 GB venv), and the marginal `tree` figure is only true while a warm shar
 cache that pressure prunes first. **The cost of that choice, stated:** a box at ~5 GB free refuses a
 harness lane the live gate would have admitted, until an operator states a smaller worst case.
 
-⚠️ **SCOPE:** these are the three LANE-creation paths. **Many** scripts create checkouts directly and
-are NOT gated here, which is a named residual of this change: `stall-fix.sh` (`git worktree add` for a
-throwaway mend checkout), `ai-drainer.sh` (the same), `refresh-candidates.sh`,
+⚠️ **SCOPE:** these are the three DISPATCH paths' route to a lane checkout — not the only route to
+one. **Many** scripts create checkouts directly and are NOT gated here, which is a named residual of
+this change: `stall-fix.sh` (`git worktree add` for a throwaway mend checkout), `ai-drainer.sh` (its
+own per-lane working checkout, `wt-drainer-<name>`, created with a bare `git worktree add` and no
+admission at all), `refresh-candidates.sh`,
 `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance checkouts), the merge rail's own
 base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (the live scout path) — among others.
 Their ENOSPC behaviour is exactly what it was; each is a place where a lane can still die on a full

@@ -412,15 +412,17 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 #   git worktree add -> fatal: cannot create directory at 'tools/ts': No space left on device
 #
 # and the dispatcher that produced it printed `df=` in a log line and asserted nothing. A `df` in a
-# log is a REPORT; a report is not a gate. So the same predicate is now ALSO callable from the one
-# place a LANE checkout is created (`wt-lifecycle.sh`'s `wt_provision`, which the three DISPATCH paths
-# route through: `dispatch-merge.sh`, `fix-one.sh`, `adopt-fix.sh`) and from a stable
+# log is a REPORT; a report is not a gate. So the same predicate is now ALSO callable from the shared
+# path the three DISPATCH paths use to create a lane checkout (`wt-lifecycle.sh`'s `wt_provision`, which
+# `dispatch-merge.sh`, `fix-one.sh` and `adopt-fix.sh` route through) and from a stable
 # verb, so a dispatcher that is not this tree's shell code (an ad-hoc pusher on another box) calls
 # THIS function instead of re-implementing `df`. That divergence — harness copy gated, ad-hoc copy
 # not — is the whole defect.
 # ⚠️ SCOPE, STATED (review rounds 2, 4 and 7): those three are the LANE creation paths, not every
 # checkout this tree ever creates. MANY scripts still call `git worktree add` directly and are NOT
-# gated here — `stall-fix.sh` and `ai-drainer.sh` (throwaway / mend checkouts), `refresh-candidates.sh`,
+# gated here — `stall-fix.sh` (a throwaway mend checkout), `ai-drainer.sh` (its own per-lane working
+# checkout, `wt-drainer-<name>`, created with a bare `git worktree add` and no admission at all),
+# `refresh-candidates.sh`,
 # `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance / hygiene checkouts), the
 # merge rail's own base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (on the live
 # scout path), among others.
