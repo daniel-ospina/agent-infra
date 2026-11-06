@@ -1266,6 +1266,16 @@ lane_bound_lib() {
 lane_end_push() {
   local label="$1" log="$2" root="$3" br="$4" unpushed="$5" uok="$6"
   local sym rc out lib
+  # ⛔ "ONLY ON THIS DISK" IS NOT WHAT THE COUNT MEASURES (fresh review of PR #3399, P2 — REPRODUCED).
+  # `unpushed` comes from `git rev-list --count HEAD --not --remotes`, an enumeration over this
+  # repository's LOCAL `refs/remotes/*` cache. A positive count establishes that no ref in that CACHE
+  # reaches HEAD; it does NOT establish that no remote holds the commit — a deleted remote branch, a
+  # peer's push under another name, or a `refs/pull/*` head are all invisible to it. TEN `[lane-exit]`
+  # lines stated the cache reading as an off-box absence ("exist ONLY on this disk", "are local-only"),
+  # which is the same defect this PR scopes in `lane_end_next` and in the `[wip]` NOTEs: those readers
+  # were counted, and this one was not. Defined ONCE and interpolated, so the ten lines cannot drift
+  # apart the way ten copies of one sentence would.
+  local loscope="held by NO ref in this repo's LOCAL refs/remotes/* cache (a CACHE — a deleted remote branch, and a ref some OTHER name holds, are not visible here, and this is NOT a claim about any remote)"
   LANE_END_PUSH=""; LANE_END_ORIGIN=""
   if [ "$uok" != "1" ]; then
     LANE_END_PUSH="unmeasured"
@@ -1280,7 +1290,7 @@ lane_end_push() {
   sym="$(git -C "$root" symbolic-ref --short -q HEAD 2>/dev/null)"
   if [ -z "$sym" ]; then
     LANE_END_PUSH="detached"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on a DETACHED head at $root exist ONLY on this disk, and a detached head has no branch to push them to. Nothing was pushed and nothing was invented: the head sha is in the marker. ⛔ Do NOT reap this worktree — get the commits off the box first (git branch <name> <sha> && git push origin <name>)" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on a DETACHED head at $root are $loscope, and a detached head has no branch to push them to. Nothing was pushed and nothing was invented: the head sha is in the marker. ⛔ Do NOT reap this worktree — get the commits off the box first (git branch <name> <sha> && git push origin <name>)" >> "$log" 2>/dev/null || true
     return 0
   fi
   # ⛔ TWO REFUSALS BEFORE ANY NETWORK CALL, AND NEITHER IS CEREMONY.
@@ -1304,17 +1314,17 @@ lane_end_push() {
   # measure — the shape-unknown arm says the read failed, not that $root is a main checkout.
   if [ -z "$gd" ] || [ -z "$cd" ]; then
     LANE_END_PUSH="UNAVAILABLE"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but this run could NOT establish whether $root is a lane worktree or the repo's MAIN CHECKOUT (git-dir='$gd' common-dir='$cd' — one of the two answered nothing), and a push of unknown shape could publish the hub's landing branch, which merges only through the rail. Nothing was pushed. Do NOT reap $root until this read works" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but this run could NOT establish whether $root is a lane worktree or the repo's MAIN CHECKOUT (git-dir='$gd' common-dir='$cd' — one of the two answered nothing), and a push of unknown shape could publish the hub's landing branch, which merges only through the rail. Nothing was pushed. Do NOT reap $root until this read works" >> "$log" 2>/dev/null || true
     return 0
   fi
   if [ "$gd" = "$cd" ]; then
     LANE_END_PUSH="refused-main-checkout"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but $root is the repo's MAIN CHECKOUT, not a lane worktree, so this exit path refuses to push from it ($sym may be the hub's landing branch, which merges only through the rail). Nothing was pushed. The hub's own commits are NOT this lane's to publish" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but $root is the repo's MAIN CHECKOUT, not a lane worktree, so this exit path refuses to push from it ($sym may be the hub's landing branch, which merges only through the rail). Nothing was pushed. The hub's own commits are NOT this lane's to publish" >> "$log" 2>/dev/null || true
     return 0
   fi
   if ! lib="$(lane_bound_lib)"; then
     LANE_END_PUSH="UNAVAILABLE"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $br exist ONLY on this disk and the push could NOT be attempted — scripts/lib/bounded.sh was not found (looked in \$O/lib, the repo's scripts/lib, \$AGENT_INFRA_PATH/scripts/lib and ~/.pi/agent/scripts/lib), and an UNBOUNDED push on the exit path can hang this lane instead of ending it. Install the library (or fix the pin) and re-run; until then do NOT reap $root" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $br are $loscope and the push could NOT be attempted — scripts/lib/bounded.sh was not found (looked in \$O/lib, the repo's scripts/lib, \$AGENT_INFRA_PATH/scripts/lib and ~/.pi/agent/scripts/lib), and an UNBOUNDED push on the exit path can hang this lane instead of ending it. Install the library (or fix the pin) and re-run; until then do NOT reap $root" >> "$log" 2>/dev/null || true
     return 0
   fi
   # ⛔ SOURCED AT MOST ONCE PER SHELL, AND ITS SCRATCH DIR IS RELEASED (review of PR #3399, P2 — REPRODUCED).
@@ -1330,7 +1340,7 @@ lane_end_push() {
     : # already sourced in this shell — re-sourcing would reset TB_BOUND_TMP and orphan the live scratch dir
   elif ! . "$lib" 2>/dev/null; then
     LANE_END_PUSH="UNAVAILABLE"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $br exist ONLY on this disk and $lib could not be sourced, so no bounded push was possible. Do NOT reap $root" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $br are $loscope and $lib could not be sourced, so no bounded push was possible. Do NOT reap $root" >> "$log" 2>/dev/null || true
     return 0
   fi
   # (2) NEVER THE LANDING BRANCH. A push of the default branch from an exit hook is a merge-gate
@@ -1397,14 +1407,14 @@ lane_end_push() {
   if [ "$pushurl_n" -eq 0 ]; then
     LANE_END_PUSH="refused-pushurl-unresolved"
     LANE_END_PUSH_URL="<unresolved: get-url --push answered nothing>"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but origin's push target could NOT BE RESOLVED — \`git -C $root remote get-url --push --all origin\` answered nothing (no origin remote, an unreadable config, or a git too old for the flag). Nothing was pushed, and no read was attempted either: with no resolved target there is nothing to prove the landing-branch set or the verifying read against. Configure a remote named origin for this checkout, or push the branch by hand from a lane branch (\`git push <url> HEAD:refs/heads/$sym\`); the commits stay in the local object store" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but origin's push target could NOT BE RESOLVED — \`git -C $root remote get-url --push --all origin\` answered nothing (no origin remote, an unreadable config, or a git too old for the flag). Nothing was pushed, and no read was attempted either: with no resolved target there is nothing to prove the landing-branch set or the verifying read against. Configure a remote named origin for this checkout, or push the branch by hand from a lane branch (\`git push <url> HEAD:refs/heads/$sym\`); the commits stay in the local object store" >> "$log" 2>/dev/null || true
     declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
   if [ "$pushurl_n" -ne 1 ]; then
     LANE_END_PUSH="refused-pushurl-divergent"
     LANE_END_PUSH_URL="$(printf '%s' "$pushurl" | tr '\n' ' ')"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but origin resolves to $pushurl_n push URLs ($(printf '%s' "$pushurl" | tr '\n' ' ')) — and a lane's exit path may not GUESS which repository receives its ref, so NOTHING was pushed. \`git remote get-url --push --all origin\` must print exactly one URL" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but origin resolves to $pushurl_n push URLs ($(printf '%s' "$pushurl" | tr '\n' ' ')) — and a lane's exit path may not GUESS which repository receives its ref, so NOTHING was pushed. \`git remote get-url --push --all origin\` must print exactly one URL" >> "$log" 2>/dev/null || true
     declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
@@ -1419,7 +1429,7 @@ lane_end_push() {
     LANE_END_PUSH="refused-pushurl-divergent"
     # The PUSH target is what the refusal is about (the read would reach `$proof`); the log names both.
     LANE_END_PUSH_URL="$pushurl"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but the repository a READ of this push target would reach is NOT the repository the push writes: push target = $pushurl, fetch-side expansion = ${proof:-<unresolvable>}. \`git ls-remote\` is a FETCH, so it re-applies \`url.<base>.insteadOf\` on top of origin's resolved push url; \`git push origin\` does not — so the landing-branch set below and the verifying read after it would describe ONE repository while the ref was written to ANOTHER. Nothing was pushed. Remove the rewrite that separates them (or push the branch by hand from a lane branch) and re-run; the commits stay in the local object store" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but the repository a READ of this push target would reach is NOT the repository the push writes: push target = $pushurl, fetch-side expansion = ${proof:-<unresolvable>}. \`git ls-remote\` is a FETCH, so it re-applies \`url.<base>.insteadOf\` on top of origin's resolved push url; \`git push origin\` does not — so the landing-branch set below and the verifying read after it would describe ONE repository while the ref was written to ANOTHER. Nothing was pushed. Remove the rewrite that separates them (or push the branch by hand from a lane branch) and re-run; the commits stay in the local object store" >> "$log" 2>/dev/null || true
     declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
@@ -1455,14 +1465,14 @@ lane_end_push() {
   # cannot reach the remote keeps its commits on disk and says so, and the remedy is printed.
   if [ -z "$def" ]; then
     LANE_END_PUSH="refused-unknown-default"
-    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but this run could NOT DETERMINE the remote's default branch — \`ls-remote --symref <push url> HEAD\` on the repository the push would actually reach ($pushurl) (bounded at 15 s; an empty answer is also what a TIMEOUT looks like) answered nothing. The clone's cached refs/remotes/origin/HEAD says '${c:-<none>}', and that is a CACHE, not an answer: a default that has been renamed leaves it stale (a plain \`git fetch\` does not re-point it), so it is honoured only as one MORE name to refuse on, never as proof of what the remote's default is. Pushing anyway could move a landing branch, so NOTHING was pushed. Re-run once the remote answers, or push by hand if you know $sym is not the default" >> "$log" 2>/dev/null || true
+    echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but this run could NOT DETERMINE the remote's default branch — \`ls-remote --symref <push url> HEAD\` on the repository the push would actually reach ($pushurl) (bounded at 15 s; an empty answer is also what a TIMEOUT looks like) answered nothing. The clone's cached refs/remotes/origin/HEAD says '${c:-<none>}', and that is a CACHE, not an answer: a default that has been renamed leaves it stale (a plain \`git fetch\` does not re-point it), so it is honoured only as one MORE name to refuse on, never as proof of what the remote's default is. Pushing anyway could move a landing branch, so NOTHING was pushed. Re-run once the remote answers, or push by hand if you know $sym is not the default" >> "$log" 2>/dev/null || true
     declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
     return 0
   fi
   case "$_protected" in
     *" $sym "*)
       LANE_END_PUSH="refused-protected"
-      echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are local-only, but $sym is a LANDING branch of this remote (checked against:$_protected) and this exit path will NOT push it — a landing branch moves only through the repo's merge rail with a recorded review, and a push from a dying lane would bypass both. Nothing was pushed; the commits are in the local object store" >> "$log" 2>/dev/null || true
+      echo "[lane-exit] ⛔ label=$label: $unpushed commit(s) on $sym are $loscope, but $sym is a LANDING branch of this remote (checked against:$_protected) and this exit path will NOT push it — a landing branch moves only through the repo's merge rail with a recorded review, and a push from a dying lane would bypass both. Nothing was pushed; the commits are in the local object store" >> "$log" 2>/dev/null || true
       declare -F tb_bound_cleanup >/dev/null 2>&1 && tb_bound_cleanup
       return 0 ;;
   esac

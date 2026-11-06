@@ -1452,32 +1452,21 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: "scripts/pi-reap-worktrees.test.sh G6e + G6f (rule 7, too-young)",
     note: "the reaper's too-young rule: NOTHING younger than this is removable, whatever else the rules say. It is the one clause that protects work a lane is actively writing, so it outranks the merged/aged/classification rules rather than being weighed beside them (#2756). NOTE the citation is deliberately only pi-reap-worktrees.test.sh: scripts/disk-reaper.test.sh:170 sets REAP_WT_MIN_AGE_MINUTES=0 in its own wrapper, i.e. it DISABLES rule 7 so its fixtures are not gated by it — it neither pins the 45 nor the behaviour, and citing it here would be a guard claim that reads backwards.",
   },
-  // — the #2788 root, reached again by #3405's second reaper bound —
-  // Measured 2026-11-04 at `9f7d20bd`: a clean detached `origin/main` worktree goes RED on the same
-  // reverse scan with `REAP_WT_PRESERVE_KEEP_DAYS`, i.e. red for every PR cut from that base and not
-  // attributable to any diff. Registered (not exempted): it IS a reap-axis bound whose value a change
-  // must be visible on, and it protects a `rm -rf` target chosen by a string, so the registry is
-  // exactly where a future edit of its default has to show up.
-  // ⛔ THIS ENTRY IS A BYTE-IDENTICAL COPY OF THE ONE PR #3431 REGISTERS, WHOSE WHOLE JOB IS THIS
-  // REGISTRATION (review round 5, P2 — the first cut was a SECOND, DIVERGENT registration: `axis:
-  // "retention"` against this one's `"reap"`, a different `guardedBy` and a different `note`, citing an
-  // `EV_` arm that does not exist). Nothing rejects a duplicate — `forwardViolations` is per-term and the
-  // test builds a Map by name — so the second copy would have validated silently and the two records could
-  // have drifted apart. The OBJECT below is copied verbatim so no reader can find two accounts of one
-  // bound; ⛔ AND THE MERGE IS NOT A NO-OP — saying it was would be the same kind of false claim this
-  // registry exists to prevent (review round 6, P2 — measured with `git merge-file`: the object alone
-  // merges clean, but this comment block is unique to this branch, so the two hunks collide and the merge
-  // is a one-line conflict resolved by deleting whichever copy loses). This PR needs the entry because
-  // `verify` is red on `origin/main` itself until one lands; #3431 is the dedicated fix, so whichever lands
-  // second should drop its own copy.
-  {
-    name: "REAP_WT_PRESERVE_KEEP_DAYS",
-    owners: ["scripts/pi-reap-worktrees.sh"],
-    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
-    axis: "reap",
-    guardedBy: "scripts/pi-reap-worktrees.test.sh G2aa (keep-days 0 keeps everything; a non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 — the WHOLE pass, not a skipped prune — and the refusal NAMES the seam, never a silent guess)",
-    note: "how long a dated subdirectory of the gate (b) evidence archive is kept. `0` keeps everything, so the bound can be disabled without deleting anything — the opposite polarity of a floor, which is why it is reasoned about here rather than folded into the age floors above. A non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 (the startup `is_pos_int` sweep over its listed numeric seams, before any rule runs): the WHOLE pass aborts, so prune_preserve_archive is never reached — it is not a silent skip of the prune. That is deliberate: defaulting to 0 on a garbage override would silently turn retention OFF, and defaulting to the 14 would silently destroy evidence an operator asked to keep. Note the blast radius is the whole reaper and not this term — on a box already under disk pressure (#2159) the typo disables ALL reaping, which is why the refusal is pass-wide and names the seam.",
-  },
+  // — REAP_WT_PRESERVE_KEEP_DAYS: REGISTERED ABOVE, NOT HERE —
+  // This branch used to carry its OWN registration for that term, and the merge at 74ce0d413 kept BOTH: the
+  // copy inherited from `origin/main` (#3503, `axis: "retention"`, `guardedBy: NONE`) at the REAP_WT_*
+  // block and this one (`axis: "reap"`, guarded by `pi-reap-worktrees.test.sh G2aa`). Nothing rejects a
+  // duplicate — `forwardViolations` is per-term and the test builds a `Map` by name — so the later entry
+  // silently shadowed the earlier and the registry whose stated job is to be the ONE place a bound's
+  // movement is visible held two accounts of it, differing in `axis`, `guardedBy` and `note` (fresh review
+  // of PR #3399, P2 — REPRODUCED: `origin/main` has one occurrence, this head had two).
+  // ⛔ THE COMMENT THAT STOOD HERE ALSO BECAME FALSE, WHICH IS WHY IT IS DELETED RATHER THAN REWORDED: it
+  // described itself as "a BYTE-IDENTICAL COPY of the one PR #3431 registers" — while the copy that landed
+  // (#3503) is not byte-identical to the one this branch wrote. It also said "whichever lands second should
+  // drop its own copy", which is now an instruction with an addressee: #3503 is on `main`, so THIS branch is
+  // the one that drops its copy. The term stays registered exactly once, by the entry that landed first.
+  // ⛔ AND NOTHING IS LOST BY DROPPING IT HERE: `verify`'s reverse scan wants the term registered, not
+  // registered twice, and #3503's entry is in the same file under REAP_WT_AGED_DAYS / REAP_WT_MERGED_AGE_DAYS.
   {
     name: "MIN_AGE",
     owners: ["scripts/orchestrator-harness/lane-container-reap.sh"],
