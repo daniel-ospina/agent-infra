@@ -2744,6 +2744,11 @@ _strip_bad=""
 # below by the length-probe range (the helper sat 90 lines lower and the cap read empty).
 _content_lines() { grep -c '[^[:space:]]' || true; }
 _content_lines_max() { awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }'; }
+# ⛔ THE COUNTER IS INCREMENTED BY THE COMPARISON, NOT BY THE LOOP (review P2, cycle 38). It used to be
+# `_n_len=$((_n_len + 1))` as the loop's first statement, which makes `_n_len -eq _LEN_CAP + 1` a TAUTOLOGY:
+# measured, wrapping the grading in `if (( _L % 2 )); then … fi` graded 535 of 1070 lengths and the suite
+# still printed "EVERY tail length … 1070 contiguous probes" and exited 0. Both `case` arms now increment,
+# so a length whose comparison was SKIPPED leaves the count short and the guard below fires naming it.
 _strip_len_bad=""; _n_len=0
 _raw_maxline="$(_content_lines_max < "$REFRESH")"
 if [ "${_raw_maxline:-0}" -lt 40 ]; then
@@ -2752,10 +2757,12 @@ else
   _LEN_CAP=$(( _raw_maxline + 5 ))
 fi
 for (( _L = 0; _L <= _LEN_CAP; _L++ )); do
-  _n_len=$((_n_len + 1))
   _tail="$(printf '%*s' "$_L" '' | tr ' ' x)"
   _got="$(printf '%s\n' "V=$_L # $_tail" | _strip_comments)"
-  [ "$_got" = "V=$_L " ] || _strip_len_bad="$_strip_len_bad $_L"
+  case "$_got" in
+    "V=$_L ") _n_len=$((_n_len + 1)) ;;
+    *) _strip_len_bad="$_strip_len_bad $_L"; _n_len=$((_n_len + 1)) ;;
+  esac
 done
 _len_max="$(_strip_ref 1 < "$REFRESH" | awk -F'\001' 'NF > 1 && $2 != "" { n = length($2) - 2; if (n < 0) n = 0; if (n > max) max = n } END { print max + 0 }')"
 if [ "${_n_len:-0}" -ne "$(( _LEN_CAP + 1 ))" ]; then
@@ -2892,6 +2899,20 @@ else
     | grep -qE '(^|[^[:alnum:]_])_strip_ref([^[:alnum:]_]|$)' && _wref=1
   printf '%s' "$_wcode_body" | grep -qE '(^|[^[:alnum:]_])_strip_marked([^[:alnum:]_]|$)' && _wpin=1
   [ -n "$_wmarked_body" ] || _wpin=0
+  # ⛔ AND THE DEPENDENCY IS GRADED AS A PROPERTY, NOT AS A SPELLING (review P2, cycle 38). Two rounds of
+  # textual matching were each defeated by delegating one level deeper than the names it looked at — the
+  # last one by a helper BETWEEN the stripper and the reference, which stayed GREEN with the graded view
+  # literally BEING the reference (the "unify the copies" mistake, made transitive). So the reference is
+  # made UNAVAILABLE and the strip must still produce the same bytes: any delegation, indirect call or
+  # variable indirection through `_strip_ref` fails loudly as `command not found` and changes nothing.
+  # Residual, stated rather than implied: RENAMING the reference and moving every call site defeats this
+  # too — no test can see that, and it would be a deliberate act on a comment that says DO NOT do it.
+  _wcode_nodep="$({ unset -f _strip_ref; _strip_comments < "$REFRESH"; } 2>&1)"
+  if [ "$_wcode_nodep" = "$_WCODE" ]; then
+    ok "pin/writer: the strip produces IDENTICAL output with the reference REMOVED (unset -f _strip_ref) — it genuinely does not depend on it, at any call depth"
+  else
+    bad "pin/writer: the strip's output CHANGES when the reference is removed — it delegates to \`_strip_ref\` somewhere the names above did not reach: '$(_diff_first "$_WCODE" "$_wcode_nodep")'"
+  fi
   _wline="$(grep -E '^_WCODE=' "$_PINFILE" | awk 'END { print }')"
   printf '%s' "$_wline" | grep -qE '\$\([^)]*_strip_comments[[:space:]<]' || _wpin=0
   printf '%s' "$_wline" | grep -qE '_strip_ref' && _wref=1

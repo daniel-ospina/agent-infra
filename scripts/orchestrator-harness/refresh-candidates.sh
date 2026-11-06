@@ -4166,7 +4166,12 @@ queue_order_from_pool() {
     # pool `bbb` → rows `bbb aaa`, and the durable `why=` said the order "could NOT be re-derived").
     # The rank COUNT is the witness of what happened; the head is only a witness of WHICH row leads.
     QUEUE_ORDER_STATE="severity"
-    echo "[refresh] queue order: the reorder WAS derived from the pool — $_inst_said: $_r ranked, $_u unranked, so the rows in $o/candidates.txt now lead with the pool-ranked ones; the HEAD cannot be named here because the count read back a head that is not a plain issue number"
+    # ⛔ AND THE CLIP IS PART OF THIS ANSWER TOO (review P3, cycle 38). Five of the seven installed arms
+    # carry `$_sat_said`; this one and the `unranked` arm below did not — and the WARN that would have
+    # carried it is gated on `_r > 0` for the second. The block head says the fact is "printed here"
+    # because "nothing else in the answer carries" it, so an arm that drops it leaves a truncated tier
+    # window invisible in the one line a reader gets.
+    echo "[refresh] queue order: the reorder WAS derived from the pool — $_inst_said: $_r ranked, $_u unranked, so the rows in $o/candidates.txt now lead with the pool-ranked ones; the HEAD cannot be named here because the count read back a head that is not a plain issue number$_sat_said"
   else
     # Not a silent degradation: nothing in the queue is ranked by the pool, so the ORDER MEANS NOTHING.
     # ⛔ AND IT IS NOT "ARRIVAL ORDER" EITHER (review P2). This arm rewrites the file with the rows in
@@ -4188,7 +4193,15 @@ queue_order_from_pool() {
     else
       _wrote_said="candidates.txt was left UNTOUCHED (byte-identical; the sequence was not re-derived here, and is NOT this pass's arrival order either)"
     fi
-    echo "[refresh] unranked: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
+    # ⛔ AND THE CAUSE IS NOT NAMED WHEN A TIER WAS CLIPPED (review P3, cycle 38): "no … row matched" is
+    # FALSE precisely when the row DID match and its own tier window clipped it — reachable whenever a
+    # truncated tier's rows are not the queued ones. The parenthetical only claims what was measured.
+    if [ -n "$_sat" ]; then
+      _why_none="no ranked row was left for this queue — a tier window was clipped, so its newest members were never ranked at all"
+    else
+      _why_none="no P0-blocker/P1-severe/P2-moderate row matched"
+    fi
+    echo "[refresh] unranked: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) ($_why_none), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\"$_sat_said"
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
     echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry$_sat_said"
