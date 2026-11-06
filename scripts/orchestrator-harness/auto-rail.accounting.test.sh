@@ -1026,6 +1026,35 @@ publish_review_state acme/widget 42 review-in-flight "$H"
 publish_review_state acme/widget 42 review-in-flight "$H"
 [ "$(_marker_count 'review-in-flight')" = "$(( _b4 + 1 ))" ] \
   || bad "the re-post must not become a per-pass duplicate (got $(_marker_count 'review-in-flight'), want $(( _b4 + 1 ))) — ONE re-post is enough, and a second adds nothing"
+# ⛔ AND `awaiting-review` MUST JOIN THE CORRECTIVE FAMILY WHEN IT CARRIES A HEAD (review round 6, P2,
+# measured). The discriminating shape is a correction, then a NEWER in-flight, then a second correction:
+# with plain presence the second correction is suppressed and the PR keeps claiming a live review for
+# ever (`refused` retries on time alone and never posts another state). A sequence that creates its
+# awaiting-review marker for the FIRST time cannot tell the two rules apart — measured, that version of
+# this arm stayed green with presence-only restored.
+# ⛔ A FRESH HEAD, so nothing published by an earlier arm can suppress either call: the shape under test is
+# "correction, then a NEWER in-flight, then a second correction", and a head that already carries markers
+# collapses it back to the case a presence check also passes.
+_H9=9999999999999999999999999999999999999999
+publish_review_state acme/widget 42 awaiting-review "$_H9"          # 1st: exists, so presence would stop here
+_ba=$(_marker_count 'awaiting-review')
+publish_review_state acme/widget 42 review-in-flight "$_H9"         # a newer in-flight claim
+publish_review_state acme/widget 42 awaiting-review "$_H9"          # 2nd correction MUST supersede it
+[ "$(_marker_count 'awaiting-review')" = "$(( _ba + 1 ))" ] \
+  || bad "a dispatch that finished WITHOUT a verdict must supersede a NEWER in-flight marker (got $(_marker_count 'awaiting-review'), want $(( _ba + 1 ))) — presence-keyed it corrects only the first time, leaving 'review in flight' as the PR's last word for ever while nothing runs"
+publish_review_state acme/widget 42 awaiting-review "$_H9"           # …and then be quiet
+[ "$(_marker_count 'awaiting-review')" = "$(( _ba + 1 ))" ] \
+  || bad "the corrective awaiting-review must not become a per-pass duplicate (got $(_marker_count 'awaiting-review'), want $(( _ba + 1 )))"
+# the HEADLESS call (cap deferral) must still be plain presence — one marker per PR, not per pass
+_bh=$(_marker_count 'awaiting-review')
+publish_review_state acme/widget 42 awaiting-review
+[ "$(_marker_count 'awaiting-review')" = "$(( _bh + 1 ))" ] \
+  || bad "the headless awaiting-review must post its own marker once (got $(_marker_count 'awaiting-review'), want $(( _bh + 1 )))"
+_bh2=$(_marker_count 'awaiting-review')
+publish_review_state acme/widget 42 awaiting-review
+[ "$(_marker_count 'awaiting-review')" = "$_bh2" ] \
+  || bad "the headless awaiting-review must stay presence-keyed (got $(_marker_count 'awaiting-review'), want $_bh2) — a cap deferral speaks about the PR, so it must not re-post on every pass"
+
 # ⛔ AND A RETRY THAT ALSO ROLLS BACK MUST RE-POST THE FAILURE (review round 5, measured on the real
 # functions): after a STARTED dispatch has re-posted in-flight, its last word is "a reviewer was
 # dispatched" — if the next retry rolls back and its notice is suppressed by its OWN older tag, that claim
@@ -1122,6 +1151,59 @@ grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"' <<<"$(
 # comment asserted money had been spent. The count is now windowed: a transient fault heals by itself
 # and the bound becomes a RATE (REVIEW_MAX_ATTEMPTS per window), the only form of bound that can be
 # honoured without turning an outage into a permanent block.
+# ⛔ AND THE TWO RECORDS MUST CARRY THE SAME EPOCH (review round 6, P3, measured): the forgiver now matches
+# the refusal's line by epoch, so the ledger entry `launch_review` appends must be the epoch it wrote into
+# the record — two `date +%s` calls can straddle a second boundary and silently disable forgiveness (or,
+# worse, match a previous paid line). Driven end to end against a reviewer that refuses immediately.
+_cr=$(mktemp); printf '#!/bin/bash\nexit 75\n' > "$_cr"; chmod +x "$_cr"
+_crout="$_rdir/e2e.epoch.out"; _crled="$_rdir/e2e.epoch.attempts"
+REVIEW_SCRIPT="$_cr"
+launch_review acme/widget 42 "$H" "$_crout" "$_crled" \
+  || bad "a fast-finish dispatch must read as started (record +1 line) — the epoch arm below depends on it"
+_crep=$(review_dispatched_at "$_crout")
+_crl=$(tail -1 "$_crled" 2>/dev/null)
+[ -n "$_crep" ] && [ "$_crl" = "$_crep" ] \
+  || bad "the ledger line must carry the RECORD's dispatch epoch (record='${_crep:-}', ledger='${_crl:-}') — matched by the forgiver, so a second \`date +%s\` silently disables forgiveness of exactly the refusals it exists for"
+review_forgive_refusal "$_crled" "$_crep"
+[ "$(review_attempts "$_crled")" = 0 ] \
+  || bad "with the epochs equal the forgiver must actually drop the refusal (got '$(review_attempts "$_crled")') — equality that never matches is the same defect as no forgiver"
+rm -f "$_cr"
+# ⛔ AND A MISMATCHED EPOCH MUST DROP NOTHING (review round 6, P3, measured): the caller runs the forgiver
+# on the STATE alone, and `launch_review` logs REVIEW-ATTEMPT-UNRECORDED when its own append fails — in
+# which case the newest line is a PAID dispatch, and an unguarded `sed '$d'` would forgive MONEY. The
+# refusal's dispatch epoch is the record's `at=` (same variable the ledger line uses), so the drop only
+# happens on an exact match; anything else leaves the entry counted, which is the fail-closed direction.
+_led="$_rdir/forgive.match.attempts"
+_n3=$(date +%s); _n2=$(( _n3 - 5 ))
+printf '%s\n%s\n' "$_n2" "$_n3" > "$_led"      # a PAID line newest; the "refusal" epoch is NOT there
+review_forgive_refusal "$_led" "$(( _n3 - 7 ))"
+[ "$(tr '\n' ' ' < "$_led")" = "$_n2 $_n3 " ] \
+  || bad "a refusal epoch that matches NO line must drop NOTHING (got '$(tr '\n' ' ' < "$_led")') — the forgiver runs on state alone, so an unmatched epoch means the newest line is a paid dispatch and dropping it forgives money"
+review_forgive_refusal "$_led" ""
+[ "$(tr '\n' ' ' < "$_led")" = "$_n2 $_n3 " ] \
+  || bad "a missing epoch must drop NOTHING (fail-closed) — got '$(tr '\n' ' ' < "$_led")'"
+review_forgive_refusal "$_led" "$_n3"
+[ "$(tr '\n' ' ' < "$_led")" = "$_n2 " ] \
+  || bad "the matching epoch must still drop its own line (got '$(tr '\n' ' ' < "$_led")') — fail-closed must not mean never"
+rm -f "$_led"
+# ⛔ AN UNREADABLE LEDGER MUST NOT READ AS "NOTHING SPENT" (review round 6, P2, measured): "no file" means
+# nothing has been spent, so 0 is correct there — but a ledger that EXISTS and cannot be read (mode 0200,
+# a root-owned leftover after a sudo run) is the opposite fact. Reading 0 while the append still succeeds
+# grows a ledger nothing can count: one full PAID review per review-duration, for ever, with no EXHAUSTED
+# state and no diagnostic. Every neighbouring counter in the file fails closed on an unreadable source;
+# this one must too, and it must STILL say 0 for a missing file (the first dispatch must not be blocked).
+_uled="$_rdir/unreadable.attempts"
+printf '%s\n' "$(date +%s)" > "$_uled"
+if chmod 000 "$_uled" 2>/dev/null && [ ! -r "$_uled" ]; then
+  _ua=$(review_attempts "$_uled")
+  [ "${_ua:-0}" -ge "$REVIEW_MAX_ATTEMPTS" ] \
+    || bad "an UNREADABLE ledger must fail CLOSED, i.e. report the head as EXHAUSTED (got '$_ua', want $REVIEW_MAX_ATTEMPTS) — read as 0, every pass dispatches a paid review for ever while the append keeps growing a ledger nothing can count"
+else
+  echo "SKIP: cannot make a file unreadable as $(id -un) (root?) — the unreadable-ledger arm is INERT on this host"
+fi
+chmod 600 "$_uled" 2>/dev/null; rm -f "$_uled"
+[ "$(review_attempts "$_rdir/absent.attempts")" = 0 ] \
+  || bad "a MISSING ledger must still read 0 (got '$(review_attempts "$_rdir/absent.attempts")') — failing closed on an unreadable file must not block the FIRST dispatch of a head"
 # ⛔ THE WINDOW IS NOT A SUBSTITUTE FOR THE REFUSAL FORGIVER, and an earlier version of this round
 # claimed it was. A window bounds how long damage LASTS; it does not stop a refusal CONSUMING the budget:
 # three load refusals fill the window's allowance, the box quiets, and the first real review is then
@@ -1152,7 +1234,7 @@ rm -f "$_led"
 _led="$_rdir/forgive.attempts"
 _now=$(date +%s)
 printf '%s\n%s\n%s\n' "$_now" "$_now" "$_now" > "$_led"   # paid, paid, refusal
-review_forgive_refusal "$_led"
+review_forgive_refusal "$_led" "$_now"
 [ "$(review_attempts "$_led")" = 2 ] \
   || bad "forgiving a refusal must drop exactly ONE line (got '$(review_attempts "$_led")', want 2) — dropping more forgives PAID attempts and re-opens the paid retry loop"
 # ⛔ AND IT MUST DROP THE NEWEST, NOT THE OLDEST (P2, non-vacuity — measured): the arm above asserts only
@@ -1168,7 +1250,7 @@ _led="$_rdir/forgive.order.attempts"
 # newest-from-oldest while still counting.
 _now2=$(date +%s); _o1=$(( _now2 - 30 )); _o2=$(( _now2 - 20 )); _o3=$(( _now2 - 10 ))
 printf '%s\n%s\n%s\n' "$_o1" "$_o2" "$_o3" > "$_led"   # paid, paid, refusal(newest)
-review_forgive_refusal "$_led"
+review_forgive_refusal "$_led" "$_o3"
 [ "$(tr '\n' ' ' < "$_led")" = "$_o1 $_o2 " ] \
   || bad "the forgiver must drop the NEWEST ledger entry (the refusal's own) and keep the earlier PAID ones — got '$(tr '\n' ' ' < "$_led")', want '$_o1 $_o2 '; dropping the oldest forgives a paid attempt and re-opens the paid retry loop"
 [ "$(review_attempts "$_led")" = 2 ] \
@@ -1184,11 +1266,11 @@ review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) "$(review_attempts "$_led")"
   || bad "CROSS-STATE: after forgiving ONE refusal, a paid retry with 2 of $REVIEW_MAX_ATTEMPTS spent must still DISPATCH (got $_crc on att=$(review_attempts "$_led")) — the refusal consumed a budget the next paid attempt reads"
 [ "$(review_attempts "$_led")" = 2 ] \
   || bad "the cross-state arm must see the 2 SURVIVING entries, not a deleted ledger (got '$(review_attempts "$_led")')"
-review_forgive_refusal "$_led"; review_forgive_refusal "$_led"
+review_forgive_refusal "$_led" "$_o2"; review_forgive_refusal "$_led" "$_o1"
 [ "$(review_attempts "$_led")" = 0 ] || bad "forgiving down to empty must leave 0, not a corrupt ledger (got '$(review_attempts "$_led")')"
-review_forgive_refusal "$_led"
+review_forgive_refusal "$_led" "$_o1"
 [ "$(review_attempts "$_led")" = 0 ] || bad "forgiving an EMPTY ledger must be a no-op"
-review_forgive_refusal "$_rdir/no-such.attempts" || bad "forgiving a ledger that does not exist must be a no-op, not an error"
+review_forgive_refusal "$_rdir/no-such.attempts" "$_o1" || bad "forgiving a ledger that does not exist must be a no-op, not an error"
 rm -f "$_led"
 grep -qF '[ "$_rstate" = refused ] && review_forgive_refusal "$_ratt"' "$SUT" \
   || bad "the loop must CALL review_forgive_refusal, GUARDED by the refused state — unguarded it drops a line on every dispatch, so the ledger never reaches the cap and the paid retry is unbounded again; guarded on any other state it forgives paid attempts"
@@ -1451,8 +1533,16 @@ grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
 # shadow it is forbidden outright.
 grep -qxE '^[[:space:]]*pending\)[[:space:]]+publish_review_state "\$repo" "\$pr" review-in-flight "\$head"[[:space:]]*;;' <<<"$_rdl" \
   || bad "the in-flight publish must BE the 'pending)' arm of the record gate — an ARM, not text that happens to appear near it; without the pending) label the branch is entered for every state and a finished dispatch re-publishes the false claim (INDENTATION IS NOT PINNED: a reformat must not redden this)"
-grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review[[:space:]]*;;' <<<"$_rdl" \
-  || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — and it must be its OWN arm: a catch-all makes this line unreachable while leaving its text intact, which is how the reverted defect stayed GREEN"
+grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review( "\$head")?[[:space:]]*;;' <<<"$_rdl" \
+  || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — and it must be its OWN arm: a catch-all makes this line unreachable while leaving its text intact, which is how the reverted defect stayed GREEN (the optional \"\$head\" argument is required by the corrective-position rule: headless, the publish could supersede an in-flight claim only ONCE)"
+# ⛔ AND THE HEAD ARGUMENT IS NOT DECORATION (review round 6, P2, measured): headless, this corrective
+# publish is presence-keyed and can supersede an in-flight claim only ONCE — a later
+# `review-in-flight:$head` then stays the PR's newest comment for ever, because `refused` retries on time
+# alone and never posts another state. The arm above accepts either form (its job is "own arm, not
+# catch-all"), so the argument is pinned here: dropping it alone is invisible to every other arm, which
+# is how this exact defect survived one round.
+grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review "\$head"[[:space:]]*;;' <<<"$_rdl" \
+  || bad "the corrective publish must pass \"\$head\" so it can supersede a NEWER in-flight marker (got: $(printf '%s' "$_rdl" | grep -n 'awaiting-review' | head -1)) — headless it corrects only the first time, leaving 'review in flight' as the PR's last word for ever while nothing runs"
 grep -qE '^[[:space:]]*\*\)' <<<"$_rdl" \
   && bad "no catch-all '*)' arm may exist in the record gate — a '*)' placed before 'refused|retry)' shadows the corrective publish and restores the retry branch's own false 'review in flight' claim (reproduced: the suite stayed GREEN with it)"
 [ "$(grep -cF 'publish_review_state "$repo" "$pr" review-in-flight "$head"' <<<"$_rdl")" -eq 1 ] \
