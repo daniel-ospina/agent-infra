@@ -435,9 +435,9 @@ grep -q '^unmeasured=0$' "$T/state-pru/wip-sweep.status" 2>/dev/null \
 grep -q '^skipped=1$' "$T/state-pru/wip-sweep.status" 2>/dev/null \
   && ok "J4 the prunable record is counted as skipped=1, NOT clean" \
   || bad "J4 a skipped record is missing from the skipped= counter"
-grep -qx 'clean=0' "$T/state-pru/wip-sweep.status" 2>/dev/null \
-  && ok "J5 clean=0 — a record nobody examined never inflates the clean count" \
-  || bad "J5 a skipped record was counted as clean"
+grep -qx 'clean=1' "$T/state-pru/wip-sweep.status" 2>/dev/null \
+  && ok "J5 clean=1 — only the EXAMINED main worktree is counted clean; the prunable record added nothing to it" \
+  || bad "J5 the clean counter does not match the ONE worktree that was actually examined: $(sed -n 's/^clean=//p' "$T/state-pru/wip-sweep.status" 2>/dev/null)"
 S_SEEN="$(sed -n 's/^seen=//p' "$T/state-pru/wip-sweep.status" 2>/dev/null)"
 S_CL="$(sed -n 's/^clean=//p' "$T/state-pru/wip-sweep.status" 2>/dev/null)"
 S_SK="$(sed -n 's/^skipped=//p' "$T/state-pru/wip-sweep.status" 2>/dev/null)"
