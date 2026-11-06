@@ -246,7 +246,14 @@ function jobKeyIs(block, key, valueRe) {
   const header = lines[0] ?? "";
   const keyIndent = " ".repeat(header.length - header.trimStart().length + 2);
   const re = new RegExp(`^${keyIndent}${key}:\\s*(?:${valueRe.source})\\s*$`);
-  return lines.some((l) => re.test(l));
+  // ⛔ EVERY own key line must match — not merely the FIRST one. A mapping with a DUPLICATE `if:` (the
+  // guarded one first, then `if: true`) has one matching line and one that re-opens the event, and a
+  // `.some()` reports the required job guarded by the line the effective value is not. `every()` on a
+  // non-empty list is also what keeps "no `if:` at all" a FINDING rather than a vacuous pass
+  // (`[].every()` is true).
+  const ownRe = new RegExp(`^${keyIndent}${key}:`);
+  const own = lines.filter((l) => ownRe.test(l));
+  return own.length > 0 && own.every((l) => re.test(l));
 }
 
 // ── the two facts this file owns ─────────────────────────────────────────────────────────────
@@ -399,8 +406,13 @@ function checkPipelineComplianceUnchanged() {
   // rc=1). So the shape is `<guard>` optionally followed by `&& …`, optionally wrapped in `${{ }}`
   // (GitHub documents the wrapper as equivalent, and refusing it is a false block on a guarded tree),
   // with the event name quotable either way — YAML permits both, and a formatter may switch them.
+  // The `&&` tail excludes `|` ON PURPOSE: `&&` binds tighter than `||`, so `… && x || true`
+  // evaluates to TRUE and the job runs on the comment event — a tail that merely "came after the
+  // guard" is NOT safe (measured: ok/rc=0 with `[^}]*`). A top-level `||` is a disjunction AROUND the
+  // guard, so any `||` in the tail is refused; that also refuses a nested `(a || b)`, which is safe in
+  // itself, and over-blocking is the direction this gate must err in.
   const PC_COMMENT_GUARD =
-    /(?:\$\{\{\s*)?github\.event_name\s*!=\s*['"]issue_comment['"](?:\s*&&[^}]*)?(?:\s*\}\})?/;
+    /(?:\$\{\{\s*)?(?:!cancelled\(\)\s*&&\s*)?github\.event_name\s*!=\s*['"]issue_comment['"](?:\s*&&[^|}]*)?(?:\s*\}\})?(?:\s+#.*)?/;
   const onNames = onKeys(region, childIndent);
   const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
   const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));
@@ -409,7 +421,13 @@ function checkPipelineComplianceUnchanged() {
     !jobKeyIs(jobBlock(text, "pipeline-compliance"), "if", PC_COMMENT_GUARD)
   ) {
     findings.push(
-      `pipeline-compliance.yml declares \`${admitted.join(", ")}:\` but its \`pipeline-compliance\` JOB no longer carries \`if: github.event_name != 'issue_comment'\`. The comment trigger is admitted ONLY as a guarded pair: without that guard on the REQUIRED job the COMMENT event satisfies the repo's only required status context, so a comment — not a PR head — produces the verdict a merge is gated on. (A guard on any OTHER job does not satisfy this: \`workflow-drift\` carries its own for its own reasons.)`
+      // ⛔ AND IT MUST NOT CLAIM THE GUARD IS *ABSENT*. This reader models a ONE-LINE plain scalar
+      // (optionally `&&`-narrowed, `${{ }}`-wrapped, `!cancelled()`-prefixed, trailing comment
+      // allowed) — NOT a `if: >-` block scalar. Saying "no longer carries" about a job whose guard is
+      // present in a spelling this reader does not model sends the reader after the wrong fault, and
+      // the natural repair for a wrong diagnosis is to loosen this regex, which is how a fail-open is
+      // born. So the message names both possibilities.
+      `pipeline-compliance.yml declares \`${admitted.join(", ")}:\` but its \`pipeline-compliance\` JOB does not carry \`if: github.event_name != 'issue_comment'\` as a WHOLE-EXPRESSION job-level \`if:\` (either the guard is missing, or it is written in a spelling this reader does not model — only a one-line plain scalar is understood, optionally \`&&\`-narrowed, \`\${{ }}\`-wrapped or \`!cancelled()\`-prefixed). The comment trigger is admitted ONLY as a guarded pair: without that guard on the REQUIRED job the COMMENT event satisfies the repo's only required status context, so a comment — not a PR head — produces the verdict a merge is gated on. (A guard on any OTHER job does not satisfy this: \`workflow-drift\` carries its own for its own reasons.)`
     );
   }
   if (extraOn.length) {

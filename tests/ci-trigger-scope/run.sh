@@ -45,10 +45,14 @@
 #      `workflow-drift` twin, which carries the same text — so the required context can never be
 #      satisfied by a comment. A genuinely new trigger beside the admitted one is still refused BY NAME.
 #      The GUARD'S SHAPE is pinned in both directions too: `if: true || <guard>` (contains the guard
-#      text, evaluates TRUE) must FAIL, while a NARROWING `… && …` suffix and the equivalent `${{ … }}`
-#      / double-quoted spellings must PASS — a tolerance that accepts the weakening half and refuses
-#      the safe half is backwards. And the block terminator is an INDENT test, so a flow-mapped job
-#      header (`  job: {name: x}`) ends the block just as a bare or commented one does.
+#      text, evaluates TRUE) and `if: <guard> && x || true` (the tail is a DISJUNCTION around the guard)
+#      must FAIL, while a NARROWING `… && …` suffix, a trailing YAML comment, a `!cancelled() &&`
+#      conjunct, and the equivalent `${{ … }}` / double-quoted spellings must PASS — a tolerance that
+#      accepts the weakening half and refuses the safe half is backwards. A DUPLICATE `if:` (guard,
+#      then `if: true`) must FAIL: one matching line does not guard a job. And the block terminator is
+#      an INDENT test, so a flow-mapped job header (`  job: {name: x}`) ends the block just as a bare or
+#      commented one does. Not modelled: an `if: >-` block scalar — refused, and the FINDING says so
+#      rather than claiming the guard is absent.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
@@ -423,7 +427,7 @@ if apply_mutation "$PC" "$PC_NOGUARD" \
   "the required job's comment guard must be removable"; then
   run_check 1 "dropping the required job's \`issue_comment\` guard is REFUSED" PC_FILE="$PC_NOGUARD"
   case "$FINDINGS" in
-    *"no longer carries"*"event_name != 'issue_comment'"*) pass "the refusal NAMES the guard the required job lost" ;;
+    *"does not carry"*"event_name != 'issue_comment'"*) pass "the refusal NAMES the guard the required job lost" ;;
     *) fail "the refusal did not name the dropped guard in its FINDING line" ;;
   esac
 fi
@@ -566,7 +570,7 @@ if apply_mutation "$PC" "$PC_ORGUARD" \
   "the required job's guard must be weakenable with an always-true prefix"; then
   run_check 1 "an always-true \`||\` prefix does NOT satisfy the required job's guard" PC_FILE="$PC_ORGUARD"
   case "$FINDINGS" in
-    *"no longer carries"*) pass "…and the refusal still says the job no longer carries the guard" ;;
+    *"does not carry"*) pass "…and the refusal still says the job does not carry the guard" ;;
     *) fail "the always-true-prefix refusal did not name the lost guard" ;;
   esac
 fi
@@ -582,6 +586,60 @@ if apply_mutation "$PC" "$PC_NARROW" \
     if: github.event_name != 'issue_comment' && github.event.action != 'deleted'" \
   "the required job's guard must be narrowable with a suffix"; then
   run_check 0 "a NARROWING suffix on the guard is ACCEPTED (it can only exclude more events)" PC_FILE="$PC_NARROW"
+fi
+
+# ⛔ AND THE SUFFIX TOLERANCE MUST NOT BECOME A DISJUNCTION. `&&` binds TIGHTER than `||`, so
+# `… && x || true` evaluates to TRUE and the required job runs on the comment event — "anything that
+# came after the guard" is exactly as unsafe as "anything that came before it". Pinned because the
+# first version of this tolerance accepted it (measured: ok/rc=0).
+PC_ORTAIL="$TMP/pc-ortail.yml"
+if apply_mutation "$PC" "$PC_ORTAIL" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment' && github.event.action != 'deleted' || true" \
+  "the required job's guard must be defeatable with a trailing disjunction"; then
+  run_check 1 "a trailing \`|| …\` DISJUNCTION does NOT satisfy the required job's guard" PC_FILE="$PC_ORTAIL"
+fi
+
+# …while a trailing YAML COMMENT carries no operator at all (YAML strips it), so refusing it would be a
+# false block on a guarded tree — and a false block is what invites the next loosening.
+PC_GUARDCOMMENT="$TMP/pc-guardcomment.yml"
+if apply_mutation "$PC" "$PC_GUARDCOMMENT" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'  # excludes the comment event" \
+  "the required job's guard must be commentable"; then
+  run_check 0 "a trailing YAML COMMENT on the guard is ACCEPTED (it carries no operator)" PC_FILE="$PC_GUARDCOMMENT"
+fi
+
+# …and `!cancelled() &&` is the idiom GitHub's own docs lead with, and it is a CONJUNCT: ANDing it in
+# can only exclude more events. Enumerated as that exact token, never as a `.*` prefix — an open prefix
+# is precisely the P1 shape ("anything, then the guard text").
+PC_NOTCANCELLED="$TMP/pc-notcancelled.yml"
+if apply_mutation "$PC" "$PC_NOTCANCELLED" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: \${{ !cancelled() && github.event_name != 'issue_comment' }}" \
+  "the required job's guard must be prefixable with \`!cancelled() &&\`"; then
+  run_check 0 "a \`!cancelled() &&\` CONJUNCT prefix is ACCEPTED, not a false block" PC_FILE="$PC_NOTCANCELLED"
+fi
+
+# ⛔ AND A DUPLICATE `if:` MUST NOT SATISFY THE ASSERTION. A job carrying the guard and then a second
+# `if: true` has one matching line and one that re-opens the event; a first-match reader reports it
+# guarded by the line the effective value is not. Every arm above would pass while the job ran on the
+# comment event, so this is the one shape that defeats the whole binding from inside it.
+PC_DUPIF="$TMP/pc-dupif.yml"
+if apply_mutation "$PC" "$PC_DUPIF" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'
+    if: true" \
+  "the required job's guard must be duplicable"; then
+  run_check 1 "a DUPLICATE \`if:\` that re-opens the event does not satisfy the guard" PC_FILE="$PC_DUPIF"
 fi
 
 # ⛔ AND AN EQUIVALENT SPELLING IS NOT A LOST GUARD. `${{ … }}` is the form GitHub documents as
