@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-57 tests with 110 paired mutations: every mutation re-
+57 tests with 112 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -22,7 +22,7 @@ defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
     python3 tools/fleet/liveness.test.py                # the 57 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (110)
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (112)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real
@@ -1898,6 +1898,30 @@ def t40():
         check(liv.evaluate(liv.Evidence(log_read=lr)).state == "unknown",
               "an unreadable identity/CPU abstains")
 
+        # ⛔ THE SECOND SAMPLE HAS ITS OWN FAILURE ARM, AND IT HAD ZERO COVERAGE. A log
+        # that disappears between the two readings must abstain (`unreadable-on-second-read`)
+        # and must NOT hand back a fabricated flat `size_delta=0` — the same "an unread value
+        # is not zero" rule as the mode-000 case, one door down. Replacing that arm with
+        # `lr.size_delta = 0` used to leave the suite at PASS=57 FAIL=0, which also made this
+        # test's own title ("every failure path") untrue.
+        vanish = os.path.join(d, "L-vanish.log")
+        with open(vanish, "w", encoding="utf-8") as fh:
+            fh.write("working...\n")
+
+        def _unlink_then_sleep(_seconds):
+            os.unlink(vanish)
+
+        lr = liv.gather_log_lane(vanish, os.getpid(), sample=True,
+                                 sleep_fn=_unlink_then_sleep, now_ms=NOW_MS)
+        check(not lr.readable and (lr.detail or "").startswith("unreadable-on-second-read:"),
+              "a log that vanishes between samples is UNREADABLE, said so; got readable=%r "
+              "detail=%r" % (lr.readable, lr.detail))
+        check(lr.size_delta is None,
+              "and its byte channel is NOT published as a flat 0; got %r" % (lr.size_delta,))
+        v = liv.evaluate(liv.Evidence(log_read=lr))
+        check(v.state == "unknown" and v.reason == "log-unreadable",
+              "so it ABSTAINS; got %s/%s %s" % (v.state, v.reason, v.detail))
+
         lr = liv.gather_log_lane(os.path.join(d, "nope.log"), os.getpid(), sample=False,
                                  now_ms=NOW_MS)
         check(not lr.readable and not lr.present, "absent is absent")
@@ -2094,6 +2118,32 @@ def t41():
         d29 = full["29"][3] if len(full["29"]) > 3 else ""
         check(d29.startswith("not-a-regular-file:"),
               "the census must name `not-a-regular-file:`, not a generic unreadable; got %r" % (d29,))
+
+        # ⛔ AND THE CENSUS'S OWN READ PROOF IS PINNED BY A MODE-000 ROW. A directory never
+        # reaches the `open()` (the `S_ISREG` check above refuses it first), so rows 29/27/28
+        # cannot see the census arm's read proof AT ALL: deleting it left the whole suite at
+        # PASS=57 FAIL=0 while the identical row read `frozen/no-progress bytes_delta=0` from a
+        # byte channel that was never read. `skip` where the mode cannot be enforced (root).
+        noperm = os.path.join(d, "L-census-noperm.log")
+        with open(noperm, "w", encoding="utf-8") as fh:
+            fh.write("x")
+        os.chmod(noperm, 0)
+        try:
+            open(noperm, "rb").close()
+        except OSError:
+            _census_can_enforce = True
+        else:
+            _census_can_enforce = False
+        if _census_can_enforce:
+            rc_np, rows_np = census(["77\t%s\t0\t0\t\t1\t3000000\t6\t0\t\t77" % noperm])
+            row_np = rows_np[0] if rows_np else ["", "", "", ""]
+            check(row_np[1] == "unknown" and row_np[2] == "log-unreadable",
+                  "a mode-000 census row must ABSTAIN (the census's read proof), not publish "
+                  "`frozen` from an unread byte channel; got %r rc=%r" % (row_np, rc_np))
+            d_np = row_np[3] if len(row_np) > 3 else ""
+            check(d_np.startswith("unreadable:"),
+                  "and it names `unreadable:`; got %r" % (d_np,))
+        os.chmod(noperm, 0o600)
         check(by_pid["30"][0] == "unknown",
               "a NEGATIVE cpu delta is a broken reading, not a flat one; got %r"
               % (by_pid["30"],))
@@ -4033,6 +4083,22 @@ MUTATIONS = [
         "the READ PROOF is dropped, so `readable` is decided by `S_ISREG` alone again: a mode-000 "
         "regular file passes, its byte channel is never read, and `size_delta = st_size - st_size "
         "= 0` is published as a positively FLAT reading — a LIVE lane reads `frozen/no-progress`",
+    ),
+    Mutation(
+        "T41", "module",
+        '                        try:\n                            with open(path, "rb"):\n                                pass',
+        '                        try:\n                            pass',
+        "the CENSUS read proof is dropped, so a mode-000 row publishes `frozen/no-progress "
+        "bytes_delta=0` from a byte channel it never read — measured on the census seam, the "
+        "surface §13.5 names as the fleet reader's home (T41 row 77 pins it)",
+    ),
+    Mutation(
+        "T40", "module",
+        '            lr.readable = False\n            lr.detail = "unreadable-on-second-read:%s" % log_path',
+        '            lr.size_delta = 0',
+        "a log that vanishes between the two samples is published as a fabricated FLAT "
+        "`size_delta=0` instead of abstaining — the same `unread is not zero` rule as the "
+        "mode-000 case, one door down (T40's vanish case pins it)",
     ),
     Mutation(
         "T57", "module",
