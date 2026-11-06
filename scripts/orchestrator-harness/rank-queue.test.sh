@@ -1727,8 +1727,21 @@ ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not rep
 # made the check unfailable — it reported a verified derivation while quoting the hard-coded fallback over a
 # source that contains no match. The raw value is tested, printed as `<none>` when absent, and only THEN
 # replaced, so a failed derivation is announced by a red line instead of passing silently.
-_wit="$(grep -o '^[[:space:]]*echo "\[[a-z]*\] [a-z -]*order' "$FNS" 2>/dev/null | sed 's/^[[:space:]]*echo "//' | head -1)"
-ck "the anti-vacuity witness prefix is derivable from the shipped source ('${_wit:-<none>}')" "$([ -n "$_wit" ] && echo 0 || echo 1)"
+# ⛔ AND IT MUST BE A LINE THE DRIVE ACTUALLY PRINTS (review P3, cycle 47). An indentation anchor still
+# matches a line that merely LOOKS like an echo: a heredoc BODY is printed text, not an executed statement,
+# and a decoy there became the witness — after which both guards were green over a function that printed
+# no arm at all (measured). So the candidates are filtered against a BASELINE drive of the unmutated source
+# and the first one it truly prints wins. That is a measurement, not an inference from the shape of a line.
+_base="$TMP/witness"; rm -rf "$_base"; mkdir -p "$_base/o"
+printf '300\n9\n200\n' > "$_base/o/candidates.txt"; printf '200\n300\n' > "$_base/o/.pool"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_base/drive.sh"
+( cd "$_base" && HOME="$_base" bash drive.sh "$_base/o" ) > "$_base/out" 2>&1
+_wit=""
+while IFS= read -r _cand; do
+  [ -n "$_cand" ] || continue
+  if grep -qF "$_cand" "$_base/out" 2>/dev/null; then _wit="$_cand"; break; fi
+done <<<"$(grep -o '^[[:space:]]*echo "\[[a-z]*\] [a-z -]*order' "$FNS" 2>/dev/null | sed 's/^[[:space:]]*echo "//' | sort -u)"
+ck "the anti-vacuity witness is a prefix the UNMUTATED drive actually prints ('${_wit:-<none>}')" "$([ -n "$_wit" ] && echo 0 || echo 1)"
 _wit="${_wit:-[refresh] queue order}"
 
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
@@ -1971,6 +1984,14 @@ _arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line>
   # 0-line shim and the drive then died on `command not found`.)
   awk -v needle="$2" '{ if (index($0, needle) && index($0, "$" "_sat_said")) sub(/[$]_sat_said/, ""); print }' \
     "$_amd/fns-ren.sh" > "$_amd/fns-shim.sh"
+  # ⛔ THE STRIP MUST HAVE HAPPENED (review P3, cycle 47). On a source that ALREADY lacks the clip on this
+  # arm the substitution is a no-op, and the check would report "✅ the clause disappears" for a strip it
+  # never performed — the false pass `§14c` gates against with `_mut_ok`. One byte comparison.
+  # ⛔ THE VERDICT IS A LINE OF THE OUTPUT, NOT A VARIABLE (review P3, cycle 47): this function runs inside
+  # a command substitution, i.e. a SUBSHELL, so a flag it sets never reaches the caller — measured: all four
+  # per-arm checks reported "the strip did NOT apply" for four successful strips. The first output line is
+  # the verdict; the drive's own output follows it.
+  if cmp -s "$_amd/fns-ren.sh" "$_amd/fns-shim.sh" 2>/dev/null; then printf '__STRIP_NOOP__\n'; else printf '__STRIP_OK__\n'; fi
   { drive_prologue; cat "$_amd/fns-shim.sh"
     printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; printf "%%s\\n" "%s" > "$4"; return $_rq_rc; }\n' "$3"
     printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
@@ -1988,7 +2009,11 @@ for _arm14m in \
   _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _rest="${_rest#*|}"
   _mc="${_rest%%|*}"; _mm="${_rest#*|}"
   _mo="$(_arm14_mut "$_ml" "$_mn" "$_mc")"
-  if grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
+  _mok=0
+  case "$_mo" in '__STRIP_OK__'*) _mok=1; _mo="$(printf '%s\n' "$_mo" | sed '1d')" ;; esac
+  if [ "$_mok" -ne 1 ]; then
+    rc=1; echo "      the strip did NOT apply to the $_ml arm — it already lacks the clip, so this check would report a mutation it never made"
+  elif grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
   else rc=1; echo "      stripped-$_ml '$(printf '%s' "$_mo" | tr '\n' '|' | head -c 340)'"; fi
   ck "non-vacuity: with the clip stripped from the $_ml arm ALONE its clause disappears" $rc
 done
