@@ -78,6 +78,24 @@ assert_bounded_arm() { # assert_bounded_arm <fixture> <label> [<want>]
   [ "${got:-0}" = "$want" ] \
     && ok "$l: BOTH pushes ran under the 45 s bound (an unbounded retry can hang the pre-kill rescue)" \
     || bad "$l: ${got:-0} bounded push(es) recorded (want $want) — this retry path is UNBOUNDED"
+  # ⛔ AND THE LOW-SPEED ABORT IS THE OTHER HALF OF "THE SAME BOUNDS" (review round 9, P2). `bounded 45`
+  # is a WALL CLOCK; `-c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20` is what ends an attempt on a
+  # remote that accepts the connection and then stalls. Nothing asserted it, so deleting the pair from
+  # either retry path was fully green — and a stalled retry then holds the pre-kill rescue for the full
+  # 45 s instead of aborting after 20 s of no progress.
+  local ls_bad=0 n=2 i=1 lo hi arg
+  while [ "$i" -le "$n" ]; do
+    lo=0; hi=0
+    while IFS= read -r arg; do
+      [ "$arg" = "http.lowSpeedLimit=1000" ] && lo=1
+      [ "$arg" = "http.lowSpeedTime=20" ] && hi=1
+    done < "$f/shim/argv.$i" 2>/dev/null
+    [ "$lo" -eq 1 ] && [ "$hi" -eq 1 ] || ls_bad=1
+    i=$((i+1))
+  done
+  [ "$ls_bad" -eq 0 ] \
+    && ok "$l: every attempt carries the low-speed abort (a stalled remote ends the attempt, not the kill window)" \
+    || bad "$l: an attempt is missing http.lowSpeedLimit/lowSpeedTime — a stalled remote holds the rescue for the full wall clock"
 }
 
 # mk_repo <name> — a bare "origin" plus a clone with one commit on branch fix/lane-one.
@@ -557,7 +575,17 @@ try_rescue() { # try_rescue <name> <mode> <branch> <retry-env>
   CFG_BEFORE="$(git -C "$d/wt" config --list --show-origin 2>/dev/null | sort)"
   # `$renv` is a deliberately word-split list of `env` arguments (an override assignment, or `-u VAR`)
   # owned by this file's own arms — never caller data.
-  OUT="$(env $renv PATH="$d/shim:$PATH" bash "$RR" "$d/wt" "workflow-bearing lane killed" 2>&1)"; RC=$?
+  # ⛔ GIT_TERMINAL_PROMPT IS PINNED HOSTILE, NOT INHERITED (review round 9, P1). The assertion that the
+  # retry runs with `GIT_TERMINAL_PROMPT=0` read the value git INHERITED — and pi's own bash tool exports
+  # `GIT_TERMINAL_PROMPT=0` for every tool call, so the arm was satisfied by the ambient env and deleting
+  # the export from BOTH retry branches was fully green (measured: green with the ambient value, red only
+  # under `env -u`). Setting it to `1` here makes the arm prove the script OVERRIDES a hostile parent,
+  # which is the actual property, on every host and every runner.
+  # ⛔ EVERY `-u` COMES BEFORE EVERY ASSIGNMENT — INCLUDING THIS ONE. `$renv` may START with `-u`, so
+  # the hostile pin has to be split: the unset goes FIRST, the assignment LAST. Writing
+  # `env -u X X=1 $renv …` made `env` exec `-u` (rc 127) on every arm — measured, 57 reds — the same
+  # POSIX option-order trap this file records elsewhere.
+  OUT="$(env -u GIT_TERMINAL_PROMPT $renv GIT_TERMINAL_PROMPT=1 PATH="$d/shim:$PATH" bash "$RR" "$d/wt" "workflow-bearing lane killed" 2>&1)"; RC=$?
   ATTEMPTS=0; [ -f "$d/shim/attempts" ] && ATTEMPTS="$(cat "$d/shim/attempts")"
   WHO=""; [ -f "$d/shim/attempts.who" ] && WHO="$(tr '\n' ' ' < "$d/shim/attempts.who")"
   return 0
@@ -1024,7 +1052,8 @@ printf 'the work that must survive\n' > "$P2/wt/lane-work.txt"
 mkdir -p "$P2/wt/extra"; git -C "$P2/wt/extra" init -q 2>/dev/null   # nested repo, unborn HEAD
 printf 'inner\n' > "$P2/wt/extra/inner.txt"
 mk_pushshim "$P2/shim" wf_then_ok fix-lane-one || echo "❌ shim failed (wfpartial)"
-OUT="$(env -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=osxkeychain \
+OUT="$(env -u GIT_TERMINAL_PROMPT -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN \
+  GIT_TERMINAL_PROMPT=1 BG_RESCUE_PUSH_HELPER=osxkeychain \
   PATH="$P2/shim:$PATH" bash "$RR" "$P2/wt" "workflow-bearing and partial" 2>&1)"; RC=$?
 PATT=0; [ -f "$P2/shim/attempts" ] && PATT="$(cat "$P2/shim/attempts")"
 [ "$PATT" = "2" ] \
