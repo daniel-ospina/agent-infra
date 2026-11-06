@@ -484,10 +484,13 @@ recipe() {
         # ⛔ THE NEGATION MUST BIND THE WRITE VERB, not merely appear on the line (round 12).
         # `avoid|skip|no longer|...` matched ANYWHERE, so `avoid an inline body: write the body to
         # THAT path with the write tool` — an affirmative instruction — red-ed the recipe arms. The
-        # pattern is `<negation> <verb>`: `avoid writing` negates, `avoid an inline body: write` does
-        # not. (`without` and the modals stay, because a following verb is what they bind.)
+        # MODAL forms bind a following verb: `avoid writing` negates, `avoid an inline body: write`
+        # does not. ⛔ THE PHRASE FORMS ARE SEPARATE for the same reason (round 13): binding a verb
+        # onto `no need to|not necessary|not required|without` silently dropped them, so
+        # `no need to write the body with the write tool` read as the AFFIRMATIVE instruction and arm
+        # C reported it green. Each phrase is its own alternative, and (d2) pins them one by one.
         if (printed != "" && !wrote && low ~ /write/ && low ~ /(write.*tool|tool.*write)/ \
-            && low !~ /(do not|don.t|never|must not|avoid|skip|need not|no longer|without)[ ]+(write|writing|use|using|put|putting|save|saving)/) wrote = 1
+            && low !~ /(do not|don.t|never|must not|no need to|not necessary|not required|without|avoid[ ]+(write|writing|use|using|put|putting|save|saving)|skip[ ]+(write|writing|use|using|put|putting|save|saving)|need not[ ]+(write|writing|use|using|put|putting|save|saving)|no longer[ ]+(write|writing|use|using|put|putting|save|saving))/) wrote = 1
         next
       }
       # an assignment: remembered, and it is the ONLY way a per-CALL derivation is legitimate.
@@ -895,14 +898,15 @@ TAUGHT_OFF=""; TAUGHT_SEEN=""
 for nm in $(printf '%s' "$README_TAUGHT" | tr '`' '\n' | awk 'NR % 2 == 0' | tr ' ' '\n' | grep -v '^$'); do
   case "$nm" in *,|and|\&) continue ;; esac
   TAUGHT_SEEN="$TAUGHT_SEEN $nm"
-  if printf '%s\n' "$CENSUS" | grep -qF "/skills/$nm"; then :
+  if printf '%s\n' "$CENSUS" | grep -qF "/skills/$nm/"; then :
   else
-    # ⛔ THE `/nm` SUFFIX ARM APPLIES ONLY TO A SLASHED NAME (round 12). Round 11 added it so
-    # `workflow/04-merge-deploy.md` resolves — but an unqualified suffix arm resolves ANY basename
-    # fragment, so appending `04-merge-deploy` or `SKILL.md` to the row passed and was printed back as
-    # a taught skill (measured: 63/0). A bare name must resolve as a real skill DIRECTORY.
+    # ⛔ THE MATCH IS TERMINATED, NOT A PREFIX (round 13). A bare name must be a real skill DIRECTORY
+    # (hence the trailing `/`), and a slashed name must be a path SUFFIX of a census line. Without the
+    # terminator, `issue` resolved to `skills/issue-creation` and `workflow/04` to
+    # `workflow/04-merge-deploy.md` — both accepted and printed back as taught skills (measured: 64/0).
     case "$nm" in
-      */*) printf '%s\n' "$CENSUS" | grep -qF "/$nm" || TAUGHT_OFF="$TAUGHT_OFF $nm" ;;
+      */*) printf '%s\n' "$CENSUS" | awk -v n="$nm" 'substr($0, length($0)-length(n)+1) == n { f=1; exit } END { exit(f ? 0 : 1) }' \
+             || TAUGHT_OFF="$TAUGHT_OFF $nm" ;;
       *) TAUGHT_OFF="$TAUGHT_OFF $nm" ;;
     esac
   fi
@@ -1638,6 +1642,58 @@ deriv_ok '/tmp/fixed.md' assign && DERIV_BAD="$DERIV_BAD [accepted a LITERAL pat
 [ -z "$DERIV_BAD" ] \
   && ok 'MUTATION: `deriv_ok` pins BOTH directions — a direct `$(mktemp)` is refused (two expansions are two files), an ASSIGNED one is accepted (one expansion, one file), and a literal path is refused whatever the via — so the accept branch cannot be silently narrowed to refuse the correct per-call form' \
   || bad "deriv_ok got a branch wrong:$DERIV_BAD"
+
+# (a3) `printed_via` — the PRINT own mediation, pinned in BOTH directions (round 13). Round 12 added the
+# field to close "print a direct `$(mktemp)`, file an assigned `$BODY`" and NOTHING could falsify it:
+# reverting the fix, or hardcoding `printed_via = "assign"`, both left 64/0. Synthesized fixtures, so
+# nothing here is anchored to a document spelling.
+{ printf '```bash\n'
+  printf 'echo "$(mktemp /tmp/pi-issue-body.XXXXXX)"\n'
+  printf 'BODY=$(mktemp /tmp/pi-issue-body.XXXXXX)\n'
+  printf 'gh issue create --title "fix: x" --body-file "$BODY"\n'
+  printf '```\n'; } > "$T/mut/print-direct.md"
+{ printf '```bash\n'
+  printf 'BODY=$(mktemp /tmp/pi-issue-body.XXXXXX)\n'
+  printf 'echo "$BODY"\n'
+  printf 'gh issue create --title "fix: x" --body-file "$BODY"\n'
+  printf '```\n'; } > "$T/mut/print-assigned.md"
+PV_BAD=""
+_rv() { printf '%s\n' "$(recipe "$1" 2>/dev/null)" | sed -n "s/^$2=//p" | head -1; }
+PD_P="$(_rv "$T/mut/print-direct.md" printed)"; PD_V="$(_rv "$T/mut/print-direct.md" printed_via)"
+PA_P="$(_rv "$T/mut/print-assigned.md" printed)"; PA_V="$(_rv "$T/mut/print-assigned.md" printed_via)"
+[ "$PD_V" = direct ] || PV_BAD="$PV_BAD [a direct print was recorded as printed_via=$PD_V]"
+[ "$PA_V" = assign ] || PV_BAD="$PV_BAD [an assigned print was recorded as printed_via=$PA_V]"
+# and the FIELD must be what the caller uses: the direct print of a per-call derivation is refused
+# even though the FILED value is legitimate, while the assigned print of the same value is accepted.
+deriv_ok "$PD_P" "$PD_V" && PV_BAD="$PV_BAD [call1-path accepted a direct per-call print — the printed file is not the filed one]"
+deriv_ok "$PA_P" "$PA_V" || PV_BAD="$PV_BAD [call1-path refused an ASSIGNED per-call print]"
+[ -z "$PV_BAD" ] \
+  && ok 'MUTATION: `printed_via` is the PRINT own mediation and both branches are live — a direct `$(mktemp)` print is refused even when the FILED value is a legitimate assignment (two expansions, two files, one empty), and an assigned print of the same value is accepted' \
+  || bad "printed_via got a branch wrong:$PV_BAD"
+
+# (d2) EVERY phrase negation is pinned one by one. Round 12 bound a verb onto the modal forms and
+# silently DROPPED `no need to|not necessary|not required|without`, so `no need to write the body with
+# the write tool` read as the affirmative instruction and arm C reported it green.
+NEG_BAD=""; NEG_NOOP=""
+for neg in 'no need to write the body with the `write` tool' \
+           'it is not necessary to write the body with the `write` tool' \
+           'it is not required to write the body with the `write` tool' \
+           'avoid writing the body with the `write` tool' \
+           'do NOT write the body with the `write` tool'; do
+  sed "s/write the body to THAT path with the \`write\` tool/$neg/" "$ROOT/$CANON" > "$T/mut/canon-negated.md"
+  if cmp -s "$T/mut/canon-negated.md" "$ROOT/$CANON"; then NEG_NOOP="yes"; continue; fi
+  case "$(canon_reasons_missing "$T/mut/canon-negated.md")" in
+    *call2-write*) : ;;
+    *) NEG_BAD="$NEG_BAD [$neg]" ;;
+  esac
+done
+if [ -n "$NEG_NOOP" ]; then
+  bad 'the negation fixtures no longer change the canonical — the CALL 2 sentence moved, so this arm measured nothing (fixture anchor moved, not a document defect)'
+elif [ -n "$NEG_BAD" ]; then
+  bad "arm C accepted a NEGATED write instruction as the instruction to write the body:$NEG_BAD — each of these reads as permission to skip the write, and the reader who follows it files a body that was never written"
+else
+  ok 'MUTATION: every phrase negation of the write instruction is REFUSED (no need to / not necessary / not required / avoid writing / do NOT) — the vocabulary is a list of pins, so a later widening or narrowing reds here instead of shipping silently'
+fi
 
 # (b) The TITLE must not be read as the body flag. `--title` precedes `--body-file` on every taught
 # command, and "fix: teach --body-file to the skills" is the natural title of an issue about this very
