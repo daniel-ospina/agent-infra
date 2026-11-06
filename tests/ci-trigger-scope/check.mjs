@@ -136,14 +136,14 @@ const KEY_RE = /^([ \t]*)(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))[ \t]*:(.*)$/;
 // and the content lock untouched — `workflow-lock.yml` is not one of the three locked paths), so
 // `edited` was silently re-addable one line away from the assertion that says it is gone. A
 // `pull_request:` trigger on `workflow-lock.yml` would ALSO collapse its trust split.
-function onKeys(region, childIndent) {
+function onKeys(region, childIndent, file = PC_FILE) {
   const own = region.filter((l) => l.indent === childIndent);
   // ⛔ A LINE THE READER CANNOT CLASSIFY IS CANNOT-VERIFY, NEVER A SILENT DROP. `.filter((k) => k !==
   // null)` discarded every line KEY_RE did not match — and YAML's EXPLICIT-KEY syntax (`? push`) is
   // legal, so a trigger written that way was invisible while being effective (measured: PyYAML key set
   // `['workflow_call','pull_request','issue_comment','push']`, gate read green). Dropping an
   // unparsed line is how a gate reports "as decided" about a file it did not fully read.
-  return own.map((l) => {
+  const names = own.map((l) => {
     const k = keyOf(l);
     if (k === null) {
       refuse(
@@ -154,6 +154,25 @@ function onKeys(region, childIndent) {
     }
     return k.key;
   });
+  // ⛔ A DUPLICATE TRIGGER NAME IS LAST-WINS TOO — AND IT IS ONE LEVEL ABOVE THE FILTER KEYS, so it
+  // discards the WHOLE block those pins read. Every other last-wins level is refused here (top-level
+  // `on:`, `jobs:`, the job id, a job's `if:`, and the filter keys via `singleKey`); a second
+  // `pull_request:`/`pull_request_target:`/`issue_comment:` block was the remaining hole, and it is the
+  // widest one: an appended second `pull_request:` carrying `branches: [develop]` + `types: [edited]`
+  // makes the required context UNSATISFIABLE on `main` while the reader answers about the FIRST block
+  // and exits 0 (measured, all three files). `trigger()` resolves a name with `findIndex`, i.e. first
+  // match, so nothing downstream can catch it.
+  const seen = new Map();
+  for (let i = 0; i < names.length; i++) {
+    const where = own[i].no === undefined ? "" : ` (first at line ${own[i].no})`;
+    if (seen.has(names[i])) {
+      refuse(
+        `${file}: \`on:\` declares \`${names[i]}:\` more than once${where}. YAML keeps only the LAST block and discards the rest, so which \`${names[i]}:\` is in force is UNANSWERABLE — a reader that takes the first would answer about the block that is NOT in force. Re-run after the duplicate is resolved.`
+      );
+    }
+    seen.set(names[i], own[i]);
+  }
+  return names;
 }
 
 function keyOf(line) {
@@ -574,7 +593,7 @@ function checkWorkflowLock() {
   const { region, childIndent } = onRegion(text, WL_FILE);
   const t = trigger(region, childIndent, "pull_request_target", WL_FILE);
 
-  const onSet = onKeys(region, childIndent);
+  const onSet = onKeys(region, childIndent, WL_FILE);
   const extraOn = extraSet(onSet, ["pull_request_target"]);
   if (extraOn.length) {
     findings.push(
@@ -607,9 +626,10 @@ function checkWorkflowLock() {
     );
     return;
   }
-  if (typesIdx < 0) {
-  }
-  const entry = t.keys[typesIdx];
+  // ⛔ THE ENTRY `singleKey` RETURNED IS THE ONE READ — not `t.keys[findIndex(...)]`. Binding the
+  // result and then re-finding the key is the first-match read the duplicate rule exists to forbid,
+  // one refactor away from answering about the block YAML discarded.
+  const entry = wlTypesEntry;
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`workflow-lock pull_request_target types: ${items.join(", ") || "<none>"}\n`);
@@ -636,7 +656,7 @@ function checkHarnessSingleSource() {
   const { region, childIndent } = onRegion(text, HSS_FILE);
   const t = trigger(region, childIndent, "pull_request", HSS_FILE);
 
-  const onSet = onKeys(region, childIndent);
+  const onSet = onKeys(region, childIndent, HSS_FILE);
   const extraOn = extraSet(onSet, ["pull_request"]);
   if (extraOn.length) {
     findings.push(
@@ -657,7 +677,7 @@ function checkHarnessSingleSource() {
   }
   // A DUPLICATE `paths:` IS LAST-WINS TOO — see `singleKey`.
   const hssPathsEntry = singleKey(t.keys, "paths", "pull_request:", HSS_FILE);
-  const pathsIdx = t.keys.findIndex((k) => k.key === "paths");
+  const pathsIdx = hssPathsEntry ? t.keys.indexOf(hssPathsEntry) : -1;
   const ignoreIdx = t.keys.findIndex((k) => k.key === "paths-ignore");
   if (ignoreIdx >= 0) {
     findings.push(
@@ -952,7 +972,7 @@ function checkPipelineComplianceUnchanged() {
   // itself, and over-blocking is the direction this gate must err in.
   const PC_COMMENT_GUARD =
     /(?:\$\{\{\s*)?(?:!cancelled\(\)\s*&&\s*)?github\.event_name\s*!=\s*['"]issue_comment['"](?:\s*&&[^|}]*)?(?:\s*\}\})?(?:\s+#.*)?/;
-  const onNames = onKeys(region, childIndent);
+  const onNames = onKeys(region, childIndent, PC_FILE);
   const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
   const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));
   // ⛔ THE REQUIRED CONTEXT IS THE JOB **NAME**, NOT THE JOB ID. The workflow's own header says main
@@ -1086,8 +1106,9 @@ function checkPipelineComplianceUnchanged() {
   }
   // A DUPLICATE `types:` IS LAST-WINS TOO — see `singleKey`. Read before the rest of this section, and
   // before the branch filter, so a duplicated key can never be answered from the first copy.
-  singleKey(t.keys, "types", "pull_request:");
-  const entry = t.keys[idx];
+  const singleEntry = singleKey(t.keys, "types", "pull_request:");
+  // ⛔ THE ENTRY `singleKey` RETURNED IS THE ONE READ — see the same note in `checkWorkflowLock`.
+  const entry = singleEntry;
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`pipeline-compliance pull_request types: ${items.join(", ") || "<none>"}\n`);

@@ -316,6 +316,26 @@ case "$OUT" in *"$T/peer6"*) ok "message carries the state dir it belongs to" ;;
 [ -s "$T/kills6" ] && bad "message-only: the supervisor KILLED the foreign session" \
                   || ok "message-only: nothing was killed (the remedy is printed, never executed)"
 
+# ⛔ AND THE OTHER BRANCH OF THE SAME PREDICATE IS DRIVEN HERE, BECAUSE THIS FIX MOVED THE ARM OFF IT.
+# The refusal above is selected by `doctor_session_orphaned_foreign()` returning nothing, i.e. the
+# foreign dir EXISTS. The complement — a foreign session whose named state dir is GONE — is the #2315
+# ruling: the supervisor REPLACES it, because with no way to clear a dead one, `start` could never
+# succeed again. Pinning only the refusal left that behaviour with no arm: a regression making the
+# dead-peer case fatal again would have left both this suite and the supervisor suite green
+# (cloud-cell-supervisor.test.sh pins the PREDICATE, never start_doctor_loop use of it). Same stub,
+# same library, one differing fact: the peer state dir does not exist.
+mkdir -p "$T/o6b/state/roles"
+OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6b" FOREIGN_O="$T/peer6-gone" OR=daniel-ospina/tortoise \
+        O="$T/o6b" HOME="$T" CELL_HOME="$T" ENV_FILE="$T/keys6b.env" \
+        bash -c '. "$1"; start_doctor_loop' _ "$SUPLIB" 2>&1 )"; RC=$?
+[ "$RC" -eq 0 ] && ok "a foreign session whose state dir is GONE is REPLACED, not fatal (rc=$RC)" \
+                || bad "a retired foreign state dir was treated as fatal (rc=$RC), which is #2315 reopened: $OUT"
+case "$OUT" in *"$T/peer6-gone"*"no longer exists"*|*"no longer exists"*"$T/peer6-gone"*) \
+     ok "message names the retired state dir and says it no longer exists" ;;
+  *) bad "the replacement message does not name the retired state dir — $OUT" ;; esac
+[ -s "$T/kills6b" ] && ok "the dead peer session was REPLACED (a kill was issued)" \
+                    || bad "the dead peer session was never cleared, so start could not succeed again (#2315)"
+
 # the controller half: a leftover inner-chain member is NAMED with its state dir
 PEER="$T/fakecell/orchestrator"; mkdir -p "$PEER"
 printf '#!/bin/sh\nsleep 30\n' > "$PEER/orch-loop.sh"

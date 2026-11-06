@@ -79,12 +79,20 @@
 #      STEP must FAIL (the job then runs on every event) while the step's own `if:` is never read as
 #      the job's; an unrelated step condition (`if: always()`) must PASS. A `keyIndent > headerIndent`
 #      test fails both ways — green over the substitution, and a FALSE BLOCK over the unrelated one.
-#      DELETING the event-owning job is `rc=1` with a FINDING (a fact) and never `rc=2` (a shrug).
+#      RENAMING the event-owning job is `rc=1` with a FINDING (a fact) and never `rc=2` (a shrug) —
+#      a header-only delete cannot be used: it reparents the body onto the previous job, which is
+#      (correctly) a duplicate `name:` and a different rc=2 finding (measured).
 #  7o. MUTANTS: a DUPLICATE `types:`/`branches:`/`paths:` is CANNOT-VERIFY (rc 2), never a green read
 #      of the first copy — in ALL THREE workflows this file pins. YAML is last-wins, so the question
 #      "which set is in force" is unanswerable, and a `findIndex` reader would answer about the block
 #      that is not in force (#3196's `edited` reduction, or a `paths: ['**']` no-op, re-addable one
 #      line away with the pin green).
+#  7o-bis. MUTANTS: a DUPLICATE TRIGGER NAME (`pull_request:`, `issue_comment:`, `pull_request_target:`)
+#      in any of the three workflows is CANNOT-VERIFY. It is the level ABOVE the filter keys, so it
+#      discards the whole block they pin: an appended second `pull_request:` carrying
+#      `branches: [develop]` makes the required context unsatisfiable on `main` while the reader answers
+#      about the first block, and an appended second `pull_request_target:` carrying `edited` reverts
+#      #3196 outright. Measured GREEN before this rule.
 #  7p. MUTANTS: legal YAML SPACING THAT CARRIES NO VALUE — a trailing comment on a block-sequence item,
 #      after a flow sequence, on the OWNER's one-line `if:` (whose wording must decide nothing), and on
 #      the KEY line itself — must all PASS. A reader that folds a comment into the value fabricates a
@@ -1403,7 +1411,7 @@ if apply_mutation "$PC" "$PC_RV_GONE" \
   "  revalidate-renamed:  # renamed: the event owner is gone under its expected name
 " \
   "the event-owning job must be renamable"; then
-  run_check 1 "DELETING the event-owning \`revalidate-on-issue-comment\` job is REFUSED (rc=1, not CANNOT-VERIFY)" \
+  run_check 1 "RENAMING the event-owning \`revalidate-on-issue-comment\` job is REFUSED (rc=1, not CANNOT-VERIFY)" \
     PC_FILE="$PC_RV_GONE"
   case "$FINDINGS" in
     *"no longer declares"*revalidate-on-issue-comment*) pass "the refusal says the JOB is gone, and names it" ;;
@@ -1455,6 +1463,74 @@ if apply_mutation "$WL" "$WL_DUPTYPES" \
   "a duplicated \`types:\` in workflow-lock must be constructible"; then
   run_check 2 "a DUPLICATED \`types:\` in workflow-lock.yml is CANNOT-VERIFY" WL_FILE="$WL_DUPTYPES"
 fi
+# ⛔ AND THE LEVEL ABOVE THE FILTER KEYS: A DUPLICATE TRIGGER NAME. `onKeys` refuses it now, because
+# YAML keeps the LAST block and discards the rest — so a second `pull_request:` makes the required
+# context unsatisfiable on `main` while the reader answers about the FIRST block. Measured GREEN on
+# all three workflows before this arm existed (each defeats the filter pins one level up: 7j, 7l, 7m
+# and #3196's `edited` reduction).
+PC_DUPTRIG="$TMP/pc-dup-trigger.yml"
+if apply_mutation "$PC" "$PC_DUPTRIG" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+  pull_request:
+    branches: [develop]
+    types: [edited]
+" \
+  "a duplicated \`pull_request:\` trigger must be constructible"; then
+  run_check 2 "a DUPLICATED \`pull_request:\` trigger is CANNOT-VERIFY (last-wins: the first block is not in force)" \
+    PC_FILE="$PC_DUPTRIG"
+  case "$LAST_OUT" in
+    *CANNOT-VERIFY*"pull_request"*) pass "the refusal names the duplicated trigger" ;;
+    *) fail "the refusal did not name the duplicated trigger" ;;
+  esac
+fi
+PC_DUPIC="$TMP/pc-dup-ictrigger.yml"
+if apply_mutation "$PC" "$PC_DUPIC" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+  issue_comment:
+    types: [created]
+" \
+  "a duplicated \`issue_comment:\` trigger must be constructible"; then
+  run_check 2 "a DUPLICATED \`issue_comment:\` trigger is CANNOT-VERIFY" PC_FILE="$PC_DUPIC"
+fi
+WL_DUPTRIG="$TMP/wl-dup-trigger.yml"
+if apply_mutation "$WL" "$WL_DUPTRIG" \
+  "    types: [opened, synchronize, reopened]
+" \
+  "    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+" \
+  "a duplicated \`pull_request_target:\` trigger must be constructible"; then
+  run_check 2 "a DUPLICATED \`pull_request_target:\` in workflow-lock.yml is CANNOT-VERIFY" WL_FILE="$WL_DUPTRIG"
+fi
+HSS_DUPTRIG="$TMP/hss-dup-trigger.yml"
+if apply_mutation "$HSS" "$HSS_DUPTRIG" \
+  "      - '.github/workflows/harness-single-source.yml'
+" \
+  "      - '.github/workflows/harness-single-source.yml'
+  pull_request:
+    types: [opened]
+" \
+  "a duplicated \`pull_request:\` trigger in harness-single-source must be constructible"; then
+  run_check 2 "a DUPLICATED \`pull_request:\` in harness-single-source.yml is CANNOT-VERIFY" HSS_FILE="$HSS_DUPTRIG"
+fi
+
 HSS_DUPPATHS="$TMP/hss-dup-paths.yml"
 if apply_mutation "$HSS" "$HSS_DUPPATHS" \
   "      - '.github/workflows/harness-single-source.yml'" \
