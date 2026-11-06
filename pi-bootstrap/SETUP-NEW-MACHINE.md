@@ -167,12 +167,20 @@ machine's pi instance.
   playwright-browser, gemini, tortoise (plus `seo-intelligence`, the Perplexity
   research server). **`exa` is not among them** — it was uninstalled by owner
   ruling (2026-10-31); do not re-add it.
-- **Tortoise MCP server:** the base config runs the local `tortoise.mcp_server`
-  stdio server. It needs `TORTOISE_HOME` pointing at your tortoise checkout
-  (setup.sh auto-wires it if the checkout is in a standard location, e.g.
-  `~/Documents/GitHub/tortoise` next to this clone) and a local FalkorDB on
-  `localhost:16379` for its DB target. If either is missing, the server
-  fails fast and pi continues without it (no crash).
+- **Tortoise MCP server:** the base config declares the **HOSTED** server —
+  `type: http`, `url: https://api.premiselabs.co/mcp/`, `Authorization: Bearer
+  ${TORTOISE_MCP_API_KEY}`, `lazy: true`. It needs **no tortoise checkout, no venv and no
+  local FalkorDB**: the DB target is resolved server-side. What it needs is a hosted key,
+  `TORTOISE_MCP_API_KEY` — the name in the entry, and the name this doc tells you to provision.
+  WHERE it goes depends on who reads it, and the two are different files
+  (mode 600 either way): an **interactive shell** gets keys from `~/pi-keys.env` (wired into the
+  shell profile by `setup.sh`), while **lanes a controller spawns** get them from `~/keys.env`
+  (the launch line sources it). Naming only one of them sends half the operators to a file that
+  nothing in their path reads. A plain `${VAR}`
+  expands to the EMPTY string when unset, so without the key the client sends `Bearer ` and
+  the server answers 401 — a set-up gap that reads like an auth bug (#5153). Self-host users
+  point `url` at their own daemon (`http://localhost:8000/mcp`) instead; `TORTOISE_HOME` is
+  still wired by `setup.sh` for local tooling but the base entry no longer reads it.
 - **What never syncs (by design):** your API keys and chat history — those
   stay per-machine.
 - On the main Mac, "publishing" just means committing work to agent-infra

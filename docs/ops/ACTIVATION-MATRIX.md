@@ -51,11 +51,12 @@ installer's promise. Where a row is a *state* that no file declares, it says so.
 | 14 | **skills + `AGENTS.md` + `settings.json` + sub-agents** | **provisioned** | **provisioned** | mac: `setup.sh`; cell: `cell-install.sh::install_skills` / `install_config` (`settings.json` merged, `AGENTS.md` installed only when absent) | **LOW** — measured present on `pi-lane-1` and `pi-cell-3`; **absent on `pi-cell-2`**, where `/tmp/cell-home/.pi/agent` holds only `audit/` and `skill-reads.json` — i.e. that box never received the layer at all (see 16) |
 | 15 | **state + reviews dirs** (`$O/state`, `$O/logs`, `~/.pi/agent/reviews`) | **provisioned (on demand)** | **provisioned (on demand)** | created by shipped code the first time it needs them, both sides: `orch-loop.sh:251`, `record-review.sh:2140` | **LOW** — an installer neither creates nor restores these, so they are listed under their own legend row rather than as provisioned |
 | 15b | **harness activation on a clock** (`harness-apply-pass.sh` → `cloud-cell-supervisor.sh apply` / `./sync.sh`) | **provisioned** | **provisioned** | `scripts/install-harness-apply-timer.sh`, run by `cloud-cell-bringup.sh --check` on a cell and by hand on a Mac (`com.eldato.harness-apply`); `--status` is the readiness gate | **HIGH until #2416** — this row did not exist, and the measured state was a Mac 91 commits behind `main` and a cell whose `HARNESS-PIN` named a commit its checkout did not have, with every signal reading `auto`. Rows 7-11 answer *what is deployed*; none of them answers *whether the deployed code is still main* — see `docs/ops/harness-apply.md` |
+| 15c | **runner pool autoscale on a clock** (`runner_autoscale.py` — measure the box, derive the ceiling, converge the local pool) | **absent** (source ships; no installer has run) | **improvised** (pi-cell-1 only: this lane ran the installer and armed it; no bring-up or schedule re-creates it) | `scripts/install-runner-autoscale-timer.sh` renders and converges both platforms (`templates/systemd/eldato-runner-autoscale.{service,timer}` / `templates/launchd/runner-autoscale/com.eldato.runner-autoscale.plist`), farmed by `pi-bootstrap/setup.sh`; `--status` reports installed / armed / drift / last tick | **HIGH until #2403** — the converger landed in #2877/#2900 and **nothing ran it**, so a box kept whatever runner count it happened to have: pi-cell-1 measured 5 live against a measured ceiling of 3 (8 cores) while tortoise CI sat at 16-34 queued runs. `--install` is dry-run; `--arm` is a separate dated owner step, and it refuses a box that cannot measure its own ceiling. ⛔ **NOTHING INVOKES THE INSTALLER YET** — no bring-up check, no schedule-of-schedules — which is why the mac column reads `absent` and the cell column reads `improvised` rather than `provisioned`: farming the installer is a copy, not an install (row 8's own precedent), and this lane installed and armed pi-cell-1 by hand. Wiring `install-runner-autoscale-timer.sh --install` into `cloud-cell-bringup.sh --check` (installing DISARMED, like the harness-apply timer it sits beside) is the follow-up that turns this row into `provisioned` — see `docs/ops/runner-autoscale.md` |
 | 16 | **a readiness verdict that measures the merge gate** | **improvised** | **absent** | `cloud-cell-bringup.sh --check` (`CELL READY`) probes home/tools/network/provider/gh auth/push/clone/dispatch-preflight/layer; `cloud-cell-supervisor.sh check` (`CELL CAN RUN A CONTROLLER`) probes `git python3 pi`, `gh auth status`. **Neither probes the admin-merge shim** — the supervisor's only shim probe is its own rate-limit layer (`PATH="$O/gh-limit:$PATH" … gh --version`, `cloud-cell-supervisor.sh:1206`) | **HIGH** — this is the two-definitions-of-ready defect. `gh auth status` answers "is gh authenticated", never "is gh guarded". Measured: `pi-cell-2` has **no operational layer at all**, and `pi-cell-3` has the layer with **no `shims/`** — both can reach their own green banner. ⛔ And the new `activation:` line is **discarded** by the path an operator runs: `cloud-cell-bringup.sh:441` greps the installer's output down to `mode=--verify\|LAYER VERIFIED` |
 
 ## What the matrix says
 
-Counting each **(component, platform)** pair: **7 improvised, 5 absent, 19 provisioned, 1 mixed**, plus 2 `provisioned (on demand)` — **34 pairs in all** (17 rows × 2). Recounted from the table on 2026-11-02, when row 1 moved from improvised/absent to provisioned/mixed.
+Counting each **(component, platform)** pair: **8 improvised, 6 absent, 19 provisioned, 1 mixed**, plus 2 `provisioned (on demand)` — **36 pairs in all** (18 rows × 2). Recounted from the table on 2026-11-02 (row 1 moved to provisioned/mixed, row 15c added as absent/improvised).
 
 The measured per-box state behind the cell column, so the generic verdicts above are not misread:
 
@@ -143,3 +144,86 @@ $ env -u AGENT_GH_SHIM_DIR CELL_HOME=$HOME cell-install.sh --verify | grep activ
                                 PATH is not measured by this line — see row 2. ⛔ ~/.pi/agent/shims/gh
                                 exists but it is never a resolution CANDIDATE …
 ```
+
+## The QUOTA layer is injected AHEAD of the argv guard (#3477)
+
+`withGhShim` now prefixes **two** directories, in this order:
+
+```
+export PATH="$O/gh-limit":"$HOME/.pi/agent/shims":"$PATH"
+```
+
+`resolveGhLimitDir()` resolves the first entry (`$O/gh-limit`, `$O` = the `O` env or
+`$HOME/orchestrator`). `AGENT_GH_LIMIT=0` drops only that entry (the admin-merge guard survives);
+`AGENT_GH_SHIM=0` still disables the whole injection.
+
+⛔ **Identity is the SENTINEL *plus* `--self`, never the sibling helper — and that is a measured
+rule, not a preference.** Two independent bypasses were recorded, in two review rounds.
+
+1. `gh-limit.py:3296` records that accepting “a `gh` beside a `../gh-limit.py`” as a layer
+   “SILENTLY SKIPPED any other `gh` sitting in such a directory — measured with the tree's own
+   admin-merge guard (`scripts/gh-shim/gh`) placed beside the helper: `gh pr merge --admin` then
+   reached the real gh UNGUARDED”.
+2. The sentinel alone is **not** the quota layer either: it identifies every entry point of the
+   family, and `scripts/orchestrator-harness/gh-rest/gh` carries it at bytes 2602 and 5988 *and* sits
+   beside the same `../gh-limit.py` (`LIMIT_HELPER=…`). That adapter skips harness layers by a
+   **whole-file** marker grep, so prepending it would skip `~/.pi/agent/shims/gh` and exec the real
+   `gh`.
+
+Because this entry is prepended **ahead of** the guard, a wrong directory here is worse than none.
+So `resolveGhLimitDir()` requires all of:
+
+| condition | where it is checked | why |
+|---|---|---|
+| `harness-gh-shim-marker` (byte 1100) | first 8 KiB of `<dir>/gh` | it is a harness entry point |
+| `--self` (byte 5886/6156) | first 8 KiB of `<dir>/gh` | it is THIS layer, not the `gh-rest` adapter (which never passes `--self`) |
+| a regular, executable `gh` | `<dir>/gh` | bash silently skips a PATH entry that is not |
+| the sibling helper | `<dir>/../gh-limit.py`, `existsSync` — **a separate file, no window** | without it the wrapper takes its fail-open arm |
+
+Absent any one of them it resolves to `null` and nothing is injected. The helper is a *different
+file* from the wrapper, so it has no 8 KiB window — the wrapper's own header merely *mentions* the
+path `$SELF_DIR/../gh-limit.py`, so a predicate that only scanned the first 8 KiB for those three
+strings would be satisfied by a layer whose helper is **absent**: the state the third condition
+exists to close, in which the wrapper prints “that call was NOT serialised or backed off” while the
+box believes the cache is in force.
+
+⛔ **The order is the correctness argument — and the GUARD is the half that survives it.** The
+chain is `gh-limit → gh-shim → real gh`. `gh-limit`'s `is_harness_shim` reads only the first 8 KiB,
+and `scripts/gh-shim/gh` keeps its own marker at byte **26405** — deliberately outside that window —
+so the quota layer resolves the argv guard as its CHILD and the #984 admin-merge gate stays in the
+chain.
+
+**Reverse the order and it is the QUOTA LAYER that is lost, not the guard** (measured, review round
+5). `scripts/gh-shim/gh`'s `_is_harness_layer` also reads the first 8 KiB, and `gh-limit`'s marker
+sits at byte **1100** — inside it — so the guard skips `gh-limit` and resolves the real `gh`. The
+failure an operator will actually meet with the wrong order is therefore **“gh-limit is still unused
+on this box”** (`averted=0`, the `839 gh-core-floor … read refused` state returning), not “merges are
+unguarded”. Stated in that direction because the opposite sends the diagnosis to the wrong place —
+and would have a future change that moves the quota dir after the guard reviewed as gate-destroying
+when it actually re-opens this defect.
+
+**Parity, stated precisely.** `lane.sh:83-84` prepends `$O/gh-limit` and then `$O/gh-rest`, so the
+resulting PATH has **`$O/gh-rest` first** (its own comment: “adapter last so `$O/gh-rest` … wins
+where it exists”). This extension composes the **cell** layer only — `resolveGhLimitDir` has no
+`gh-rest` candidate — so it establishes the quota-before-guard half of that order, not the whole of
+it. On a Mac, `install.sh` seeds `$O/gh-rest/gh` and `$O/gh-limit.py` but never creates
+`$O/gh-limit/`, so the resolver returns `null` and pane-spawned Mac lanes get no quota layer; that
+bypass is unchanged by this change and is named here rather than implied away.
+
+**Measured, cell `cmux`, 2026-11-05 — why it was needed.** 11 of 12 live lane `pi` processes had
+**no** `gh-limit` on PATH: they resolved `~/.pi/agent/shims/gh` and then the real `gh`, bypassing
+the cache, the budget and `--stats` entirely. The same box's `gh-limit` events log (21 h, 1005
+lines) recorded **839** `pressure: gh-core-floor … read refused` events and **zero**
+`read-cache: <class> hit`, **zero** `single-flight: shared` and **zero** `conditional: 304` —
+`--stats` read `averted=0` — with `core` at `0/5000` while `graphql` held `4159/5000`.
+Re-verification takes the emitted prefixes, not prose: `rg -c 'read-cache: .* hit' events.log`
+(the literal string `read-cache hit` is not emittable and would read 0 on a healthy cache).
+Cost of the extra hop, measured: `gh --version` 123 ms direct vs **278 ms** through the chain.
+
+**Residual, stated rather than implied.** The quota entry is `$O/gh-limit` (or
+`AGENT_GH_LIMIT_DIR`), which is an operator-controlled absolute path and is **not** neutralised the
+way the shim entry is. A home directory containing a gate word (`/home/admin/…`) therefore lands
+in the injected text, which is the VGATE #984 class that made a checkout path containing `admin`
+look like an admin merge. The default (`$HOME/orchestrator/gh-limit`) is clean and is asserted; a
+non-default `O`/`AGENT_GH_LIMIT_DIR` carrying a gate word is not, and is left visible here rather
+than silently guarded.
