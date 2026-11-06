@@ -854,16 +854,23 @@ case "$CC_OUT" in
   *"not a readable JSON object"*) ok "…and says why, instead of implying the credential is absent" ;;
   *) bad "the unreadable-store refusal is not explained: $CC_OUT" ;;
 esac
-# (e) A MALFORMED entry is not a credential. `key` must be a STRING: pi THROWS on this file, so every
-# provider in it is dead, and a check that reads "a key field exists" would certify it.
+# (e) A KEY pi CANNOT READ (`key: 123` makes a lane's `read()` THROW) is not a credential — but it is
+# REPAIRABLE, so with nothing delivered the refusal is the "no usable credential" one, and the box is
+# told to run the bring-up (which rewrites that key field). It must never be read as "present".
 printf '{"deepseek":{"type":"api_key","key":123}}\n' > "$AUTH"
 cellcheck 0
-[ "$CC_RC" -ne 0 ] && ok "check REFUSES a store entry pi cannot read (key is not a string)" \
-                   || bad "check counted a malformed entry as a usable credential — pi throws on that file"
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a store entry a lane cannot read (key is not a string)" \
+                   || bad "check counted an unreadable key as a usable credential — a lane throws on that file"
 case "$CC_OUT" in
-  *"pi REJECTS"*) ok "…naming the entry, not the provider or the network" ;;
-  *) bad "the malformed-entry refusal is not explained: $CC_OUT" ;;
+  *"has no usable 'deepseek' credential"*) ok "…as \"no usable credential\", not as an unreadable file" ;;
+  *) bad "the refusal does not classify the entry correctly: $CC_OUT" ;;
 esac
+# (e2) …and with the key DELIVERED it is not a refusal at all: the bring-up rewrites that one field.
+printf 'DEEPSEEK_API_KEY=sk_fixture_only\n' > "$F/keys.env"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "…and passes when keys.env delivers the key (the bring-up repairs the field)" \
+                   || bad "check false-blocked a repairable entry on a box whose keys.env carries the key: $CC_OUT"
+rm -f "$F/keys.env"
 # (f) An OAUTH entry WITH an access token is a real credential pi can use (`auth-storage` accepts
 # `{type:"oauth", access, refresh, expires}`), so it must PASS — and it must be reported as an entry
 # pi can use, not refused for having no `key` field.
@@ -875,15 +882,16 @@ case "$CC_OUT" in
   *"credential"*) ok "…reporting it as a credential pi can use" ;;
   *) bad "the oauth entry was not reported as a credential: $CC_OUT" ;;
 esac
-# (g) An entry of a type pi does not know is NOT "undecidable": pi's `load()` rejects it, so the whole
-# file throws and NO provider in it authenticates. Treating it as "cannot judge, pass" would be a
-# green `check` over a box whose every `pi` call dies at load.
+# (g) An entry of a type this file does not know is NOT "cannot judge, pass": nothing here may tell an
+# operator a credential resolves when it has not established that. It is refused, naming the entry as
+# one this check will not judge or replace — the distinction matters, because the remedy is to verify
+# BY EXECUTION, not to hand-edit a file nobody understands.
 printf '{"deepseek":{"type":"some_future_scheme","blob":"x"}}\n' > "$AUTH"
 cellcheck 0
-[ "$CC_RC" -ne 0 ] && ok "check REFUSES an entry of a type pi rejects (it is not 'cannot judge')" \
-                   || bad "check certified a store pi throws on (rc=$CC_RC): $CC_OUT"
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES an entry of an unknown type (not 'cannot judge, pass')" \
+                   || bad "check certified a store entry it never judged (rc=$CC_RC): $CC_OUT"
 case "$CC_OUT" in
-  *"pi REJECTS"*) ok "…naming the validation pi applies, so the operator can fix the entry" ;;
+  *"will not judge or replace"*) ok "…and says exactly that, naming execution as the way to settle it" ;;
   *) bad "the unknown-type refusal does not explain itself: $CC_OUT" ;;
 esac
 # (h) A VALID api_key entry with NO key is a sound file that supplies NOTHING (`read()` yields no key,

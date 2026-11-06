@@ -360,18 +360,30 @@ denied_copy_variant() {
   rest="${base#"$stem"}"
   [ "$rest" = "$base" ] && return 1          # does not start with the stem at all
   rest="${rest//.ts/}"; rest="${rest//.js/}"  # an extension suffix is not a marker
-  rest="${rest#.}"; rest="${rest#-}"; rest="${rest#_}"
+  # Leading separators repeat in real names (`.bak`, `-old`, ` -copy`), and a marker may carry a
+  # numeric/alnum suffix (`.bak2`, `-v2`, `.1`).
+  while :; do
+    case "$rest" in
+      [\ ._-]*) rest="${rest#?}" ;;
+      *) break ;;
+    esac
+  done
   [ -z "$rest" ] && return 0
   case "$rest" in
     bak|backup|old|orig|copy|save|keep|dist|local|tmp|disabled|off) return 0 ;;
+    bak[0-9]*|backup[0-9]*|old[0-9]*|orig[0-9]*|copy[0-9]*|save[0-9]*|disabled[0-9]*|off[0-9]*) return 0 ;;
+    v[0-9]*|[0-9]*) return 0 ;;
   esac
-  case "$rest" in [0-9]|[0-9][0-9]) return 0 ;; esac
   return 1
 }
 
 denied_extension_copies() { # <agent-dir>
-  local dir="${1%/}/extensions" d stem f fbase
+  local dir="${1%/}/extensions" d stem f fbase shipped
   [ -d "$dir" ] || return 0
+  # ⛔ READ ONCE. This function is always used on the left of a pipe, so its own assignments die with
+  # the subshell — a cache INSIDE denied_shipped_names therefore re-ran the python-backed manifest
+  # reader for every candidate (measured: the "cached for the run" comment was simply untrue).
+  shipped="$(denied_shipped_names)"
   for d in "${DENY_EXTENSIONS[@]}"; do
     stem="$(denied_extension_stem "$d")"
     for f in "$dir/$stem"*; do
@@ -390,7 +402,7 @@ denied_extension_copies() { # <agent-dir>
       # `rm -rf`) — and if the repo SHIPS such a name, install would ship it and this sweep delete
       # it, so `--verify` would fail `extension MISSING` on every run and the cell could never be
       # provisioned. So the remainder must be a copy MARKER, and a ship-list row is never a copy.
-      if denied_shipped_names | grep -Fxq "$fbase"; then continue; fi
+      if printf '%s\n' "$shipped" | grep -Fxq "$fbase"; then continue; fi
       denied_copy_variant "$fbase" "$stem" || continue
       loadable_extension_entry "$f" || continue
       printf '%s\n' "$f"

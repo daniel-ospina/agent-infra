@@ -699,28 +699,70 @@ case "$BR_OUT" in
   *) bad "the blank-key refusal does not say the value was empty: $BR_OUT" ;;
 esac
 
-# (i) AN ENTRY pi CANNOT READ is the cell's identity too: refused, never overwritten. `key` must be a
-# STRING — pi THROWS when it reads the file, so NO provider in it can authenticate.
-printf '{"deepseek":{"type":"api_key","key":123}}\n' > "$AUTH"
+# (i) (superseded by (j3) below: a `key` a lane cannot READ is now REPAIRED in place rather than
+# refused — the file is sound and one FIELD is wrong, so refusing it would be a false block. The
+# refusal that remains is for a shape this script will not rewrite at all, pinned in (i2).)
+# (i2) AN `oauth` ENTRY IS NEVER TOUCHED, and it is not counted as a repair this script can make: it
+# carries a refresh token it could not recreate, so the bring-up refuses and names the file.
+printf '{"deepseek":{"type":"oauth","access":"","refresh":"","expires":9}}\n' > "$AUTH"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 br ok normal --check
-[ "$BR_RC" -ne 0 ] && ok "a store entry pi cannot read REFUSES the cell (rc=$BR_RC)" \
-                   || bad "bring-up certified a box whose store pi throws on"
-[ "$(jq -c . "$AUTH" 2>/dev/null)" = '{"deepseek":{"type":"api_key","key":123}}' ] \
-  && ok "…and the entry was left BYTE-IDENTICAL (the cell's identity is never overwritten)" \
-  || bad "the bring-up overwrote an entry it could not read"
+[ "$BR_RC" -ne 0 ] && ok "an oauth entry this script will not rewrite REFUSES the cell (rc=$BR_RC)" \
+                   || bad "bring-up certified a box whose only credential it cannot judge"
+[ "$(jq -r '.deepseek.type // ""' "$AUTH" 2>/dev/null)" = "oauth" ] \
+  && ok "…and the oauth record is left untouched (a refresh token it could not recreate)" \
+  || bad "the bring-up overwrote an oauth record"
+case "$BR_OUT" in
+  *"does not rewrite"*) ok "…naming it as a shape the script will not judge or replace" ;;
+  *) bad "the oauth refusal does not say what it will not do: $BR_OUT" ;;
+esac
 
-# (j) A WHOLE-FILE INVALID STORE — an invalid entry for a provider NOBODY asked about still makes pi
-# THROW on the whole file (measured against pi's own `ReadOnlyAuthStorage.load()`), so it must be
-# refused rather than certified on the strength of the provider this run happens to want.
+# (j) AN INVALID ENTRY FOR ANOTHER PROVIDER IS NOT A REFUSAL — and this arm is why the ORACLE matters.
+# A lane boots `AuthStorage`, whose `parseStorageData` is a plain `JSON.parse` that does NOT validate
+# entries (measured: `read("deepseek")` on this exact file returns the good key). The strict validator
+# is `ReadOnlyAuthStorage`, used only by `pi auth --no-refresh`. Refusing this file was a FALSE BLOCK
+# on a box whose lanes run; the CLI-invalid entry is reported instead, and the file is not rewritten.
 printf '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":false}\n' > "$AUTH"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 br ok normal --check
-[ "$BR_RC" -ne 0 ] && ok "an INVALID entry for ANOTHER provider REFUSES the cell (pi throws on the file)" \
-                   || bad "bring-up certified a store pi throws on because the wanted provider looked fine"
 [ "$(cat "$AUTH")" = '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":false}' ] \
-  && ok "…and the file was left BYTE-IDENTICAL" \
-  || bad "the bring-up rewrote a store it should have refused"
+  && ok "a CLI-invalid entry for ANOTHER provider is left BYTE-IDENTICAL (not this script's to rewrite)" \
+  || bad "the bring-up rewrote an entry it does not own"
+case "$BR_OUT" in
+  *"the pi CLI would reject"*) ok "…and it is REPORTED (a lane is unaffected; 'pi auth' is not)" ;;
+  *) bad "a CLI-invalid entry for another provider is silent: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"pi REJECTS"*|*"NO provider in this file can authenticate"*)
+    bad "the run still claims pi cannot read the file — that is the CLI validator's rule, not a lane's" ;;
+  *) ok "…and the run does not claim the file is unreadable to pi" ;;
+esac
+
+# (j2) A TEMPLATE KEY is not a credential IN A CLEAN SHELL: `read()` resolves `$VAR` through the
+# environment, and a cell lane is launched with no environment. The repair writes a LITERAL key and
+# preserves the rest of the entry.
+printf '{"deepseek":{"type":"api_key","key":"$DEEPSEEK_API_KEY","note":"keep-me"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "a TEMPLATE key is replaced by the literal keys.env value (a clean-shell lane can use it)" \
+  || bad "a template key survives as a template — a clean-shell lane cannot resolve it: $(jq -c . "$AUTH" 2>/dev/null)"
+[ "$(jq -r '.deepseek.note // ""' "$AUTH" 2>/dev/null)" = "keep-me" ] \
+  && ok "…and the entry's other fields are PRESERVED" \
+  || bad "the repair dropped a field of the entry it merged into"
+
+# (j3) A KEY pi CANNOT READ (`key: 123` makes a lane THROW on `read()`) is repaired IN PLACE — the key
+# field is rewritten, nothing else is touched. Refusing the file instead would be a false block: the
+# store is sound and one field is wrong.
+printf '{"deepseek":{"type":"api_key","key":123,"note":"keep-me"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "a non-string key is repaired in place (a lane would THROW on it)" \
+  || bad "a non-string key survived — every lane read throws: $(jq -c . "$AUTH" 2>/dev/null)"
+[ "$(jq -r '.deepseek.note // ""' "$AUTH" 2>/dev/null)" = "keep-me" ] \
+  && ok "…preserving the entry's other fields" \
+  || bad "the repair dropped a field of the entry it merged into"
 
 # (k) A ROTATED KEY: the store WINS over keys.env (pi reads the store first), so a stale stored key
 # shadows a good one and the probe 401s. The repair must not overwrite the credential, but it must
