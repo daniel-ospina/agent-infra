@@ -3314,13 +3314,45 @@ GHOPEN3
   # superseded park is indistinguishable from a current one. Printing it UNLABELLED presents an
   # inflated human queue as a measured one; the stale line on the same path already names its
   # degradation, so the parked line must too. Driven, not grepped: two parks exist, NEITHER of which
-  # can be attributed on this path (that is the whole reason the count is raw).
-  # ⛔ ONE DEGRADED PATH NOW, NOT TWO. The "no checkout at all" half of this pair was retired by
-  # `resolve_repo` (see (9c) above — that state is a refusal, and it publishes no lines at all), so the
-  # provenance note is driven on the path report.sh still owns: a checkout whose listing is
-  # unreadable.
+  # can be attributed on these paths (that is the whole reason the count is raw).
+  # ⛔ TWO DEGRADED PATHS, AND BOTH ARE DRIVEN (review of this delta, P2 — a first cut of this block
+  # said "one degraded path now, not two", which was FALSE). `resolve_repo` retired the missing-
+  # CHECKOUT half of report.sh's `norepo` test ([ ! -d "$REPO" ] can no longer be true — that state is
+  # the refusal asserted in (9c) above), but the state itself is still reachable through the OTHER
+  # half, `! command -v gh`, and it prints the raw count with its own note (report.sh:285). No arm run
+  # by this suite drove that branch any more: every other `bash "$REPORT"` call here either puts a
+  # `gh` stub on PATH or fails at `REPO`, so the note had become unpinned.
   printf '%s\n' livehead > "$RPT/state/parked-6001"
   printf '%s\n' oldhead > "$RPT/state/parked-6999"
+  # ⛔ "NO gh" MUST BE CONSTRUCTED, NOT HOPED FOR. On every host this suite runs on (a CI runner, a
+  # cell, a laptop with the CLI installed) `command -v gh` succeeds, so simply not adding a stub still
+  # exercises the READABLE path while the arm passes. Filtering PATH directories cannot express it
+  # either: `gh` sits in `/usr/bin` beside `git`, and `resolve_repo` needs `git`. So the fixture is
+  # ONE bin dir of symlinks to every entry on PATH except `gh` — the shell, git and the coreutils all
+  # resolve, `command -v gh` fails. The three facts the run depends on are then ASSERTED (git and bash
+  # present, gh absent), so a host where this construction silently produced nothing is a fixture
+  # failure rather than a green arm over the wrong branch.
+  NOGH_BIN="$TMP/nogh-bin"; rm -rf "$NOGH_BIN"; mkdir -p "$NOGH_BIN"
+  _nogh_ifs="$IFS"; IFS=:
+  for _nogh_d in $PATH; do
+    [ -n "$_nogh_d" ] && [ -d "$_nogh_d" ] || continue
+    for _nogh_f in "$_nogh_d"/*; do
+      _nogh_n="${_nogh_f##*/}"
+      [ "$_nogh_n" = gh ] && continue
+      [ -e "$NOGH_BIN/$_nogh_n" ] && continue
+      ln -s "$_nogh_f" "$NOGH_BIN/$_nogh_n" 2>/dev/null || true
+    done
+  done
+  IFS="$_nogh_ifs"
+  if [ -x "$NOGH_BIN/git" ] && [ -x "$NOGH_BIN/bash" ] && [ ! -x "$NOGH_BIN/gh" ]; then
+    _rpt_nogh_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$NOGH_BIN" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
+    case "$_rpt_nogh_parked" in
+      *" 2  (raw marker count"*) echo "  ✅ with no gh on PATH the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
+      *) echo "  ❌ with no gh on PATH the parked line printed [$_rpt_nogh_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
+    esac
+  else
+    echo "  ❌ could not build a gh-less PATH (git=$([ -x "$NOGH_BIN/git" ] && echo yes || echo no) bash=$([ -x "$NOGH_BIN/bash" ] && echo yes || echo no) gh=$([ -x "$NOGH_BIN/gh" ] && echo present || echo absent)) — the no-gh arm is unproven"; FAIL=$((FAIL+1))
+  fi
   cat > "$TMP/ghstub/gh" <<'GHFAIL2'
 #!/bin/bash
 exit 1
