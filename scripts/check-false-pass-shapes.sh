@@ -63,7 +63,7 @@
 #   scripts/daily-backup.sh:282 · scripts/orchestrator-harness/fix-one.sh:139 ·
 #   scripts/orchestrator-harness/test-crossbox.sh:91
 # Widening the verdict half to a literal `return 0` was MEASURED against this scan set and reds
-# SEVEN further functions (check-pipeline-compliance.sh:503, cleanup-stale-branches.sh:905,1023,
+# SEVEN further functions (check-pipeline-compliance.sh:1025, cleanup-stale-branches.sh:905,1023,
 # pi-cache-reap.sh:677, reap-lane-venvs.sh:482, restore-smoke.sh:64, worktree-hygiene-sweep.sh:234)
 # — including restore-smoke.sh:64, whose `newest_backup_dir()` is FAIL-CLOSED, returning 1 when the
 # feeder is empty. Deciding which of those seven are real needs a per-function reading, and that is a
@@ -71,6 +71,15 @@
 # (it is deleted from CI within a week, taking the class with it). So the three named instances were
 # FIXED — the read's status is observed and an unreadable list is UNKNOWN rather than empty — instead
 # of baselined, and the residual is STATED here rather than implied by a green run.
+#
+# ⛔ The `check-pipeline-compliance.sh` entry above reads `:1025` where it used to read `:503` (#3509).
+# That one was NOT re-measured: the file has since grown 3456 → 5989 lines, and the function it named
+# changed shape — `has_review_record()` no longer ends on a literal `return 0` (its verdict is
+# `[ -n "$REVIEW_RECORD_MATCHED_LINE" ]`, and its loop terminates at `:609`), while the function in
+# this file that still does is `review_record_at_head()`, `return 0` at `:1023` inside the loop that
+# ends `done < <(review_store_candidates …)` at `:1025`. So the pointer was re-derived by READING the
+# two functions, not by re-running the widened arm — treat `:1025` as the function identity being
+# corrected and the line number as read, and re-measure the whole list before relying on it.
 # AMONG the shapes it cannot see, and not the only ones: a for-list SPLIT ACROSS LINES (`for x in \` then
 # `$out; do`) — the matcher is line-oriented, so the word list must be on one line, as it is for the
 # `for x in $(cmd)` arm — and a feeder filled by `read -r out < <(cmd)`, which is a read, not a capture.
