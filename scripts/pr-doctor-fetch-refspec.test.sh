@@ -432,6 +432,19 @@ run_shipped() { # <dir> <branch> <worktree> <text> -> rc
       eval "$4" ) >/dev/null 2>&1
 }
 
+# The PROVISIONING call needs its helper defined and `$REPO` bound, because that is what the shipped
+# line reads (`wt_provision "$REPO" "$WT" "$BR" "origin/$BR"`). Sourcing the SAME library the
+# script sources keeps the arm honest: the assertion is on the shipped CALL (its arguments included),
+# not on a re-implementation of the provisioning logic inside this test.
+run_shipped_provision() { # <dir> <branch> <worktree> <text> -> rc
+    ( cd "$1" || exit 99
+      REPO="$PWD"; BR="$2"; WT="$3"; PR="4242"; wt_registered=0
+      L="$WORK/shipped.log"; O="$WORK/o"
+      export REPO BR WT PR L O wt_registered
+      . "$HERE/../scripts/orchestrator-harness/wt-lifecycle.sh" >/dev/null 2>&1
+      eval "$4" ) >/dev/null 2>&1
+}
+
 mkdir -p "$WORK/o/logs"
 _SIB_N=0
 for _sib in scripts/orchestrator-harness/fix-one.sh \
@@ -473,16 +486,21 @@ done
 # DWIM, and DWIM does not consult the tracking ref — it resolves a bare name through
 # `remote.<name>.fetch` CONFIGURED refspecs. So `adopt-fix.sh` was still dying one line after a
 # now-green fetch, with the fixer never started, and the section above stayed green over it.
-# ⛔ DRIVEN AS A BLOCK, NOT A LINE: the script's own `if [ "$wt_registered" -eq 0 ]; then … fi` is
-# extracted and executed with `wt_registered=0`, so the branch it takes is the branch it ships. A decoy
-# `-b … origin/$BR` line inside a dead branch cannot satisfy this, because the block decides, not a grep.
+# ⛔ DRIVEN AS THE SHIPPED CALL: `adopt-fix.sh` no longer carries an inline worktree block — #2033/#2102
+# refactored it into `wt-lifecycle.sh`'s `wt_provision`, and the caller now just names its arguments:
+#     wt_provision "$REPO" "$WT" "$BR" "origin/$BR"
+# So the argv IS the decision here: the 4th argument is the BASE the branch is created from, and a
+# regression that names the bare `$BR` there resolves through no refspec on a single-branch clone and
+# dies exactly as the pre-fix DWIM line did. The call is extracted (comments skipped) and RUN against
+# the same library, so a decoy in a comment cannot satisfy it, and the MUTANT arm below proves the
+# arm still goes RED when that argument is reverted.
 _adoptf="$HERE/../scripts/orchestrator-harness/adopt-fix.sh"
 if [ ! -f "$_adoptf" ]; then
     bad "adopt-fix.sh is missing — its worktree block cannot be driven"
 else
     _ad="$WORK/sib-adopt"
     _afl="$(live_line "$_adoptf" 'git fetch origin' '$BR')"
-    _ablk="$(live_block "$_adoptf" 'if [ "$wt_registered" -eq 0 ]; then')"
+    _aprov="$(live_line "$_adoptf" 'wt_provision')"
     if git clone -q --single-branch --branch main "$WORK/origin.git" "$_ad" 2>/dev/null; then
         [ -n "$_afl" ] && run_shipped "$_ad" fix/some-branch "$WORK/wt-adopt" "$_afl"
         # ⛔ THE MUTANT (the PRE-FIX form): DWIM, on the SAME clone where the fixed fetch has just
@@ -495,18 +513,31 @@ else
         else
             bad "MUTANT: the DWIM form failed for a different reason: $(head -2 "$WORK/dwim.err" | tr '\n' ' ')"
         fi
-        if [ -z "$_ablk" ]; then
-            bad "adopt-fix.sh's worktree block ('if [ \"\$wt_registered\" -eq 0 ]') is not where this test looks — the arm cannot be driven"
-        elif run_shipped "$_ad" fix/some-branch "$WORK/wt-adopt" "$_ablk"; then
+        if [ -z "$_aprov" ]; then
+            bad "adopt-fix.sh's provisioning call ('wt_provision …') is not where this test looks — the arm cannot be driven"
+        elif run_shipped_provision "$_ad" fix/some-branch "$WORK/wt-adopt" "$_aprov"; then
             # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
             # `pipefail` is the exact bug adopt-fix.sh:31-34 documents (#864). Same idiom, same reason.
             _wtl="$(git -C "$_ad" worktree list --porcelain)"
             case "$_wtl" in
-                *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's OWN worktree block materialises the branch on a single-branch clone (driven)" ;;
-                *) bad "adopt-fix.sh's worktree block returned 0 but no worktree is on branch fix/some-branch" ;;
+                *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's OWN provisioning call materialises the branch on a single-branch clone (driven)" ;;
+                *) bad "adopt-fix.sh's provisioning call returned 0 but no worktree is on branch fix/some-branch" ;;
             esac
         else
-            bad "adopt-fix.sh's OWN worktree block FAILED on a single-branch clone — the fixer never starts (the pre-fix DWIM line?)"
+            bad "adopt-fix.sh's OWN provisioning call FAILED on a single-branch clone — the fixer never starts (the pre-fix DWIM line?)"
+        fi
+        # ⛔ MUTANT: the 4th argument reverted to the bare branch (the pre-#2033 shape). It must FAIL on
+        # the same clone where the shipped call has just succeeded — otherwise this arm tests nothing
+        # about the argument and would stay green over a regression that dropped `origin/`.
+        if [ -n "$_aprov" ]; then
+            _amut="$(printf '%s' "$_aprov" | sed 's|"origin/\$BR"|"$BR"|')"
+            if [ "$_amut" = "$_aprov" ]; then
+                bad "MUTANT: could not build the bare-base variant from the shipped call — the argv pin would be vacuous: $_aprov"
+            elif run_shipped_provision "$_ad" fix/some-branch "$WORK/wt-mut" "$_amut"; then
+                bad "MUTANT: the bare-branch base STILL materialised a worktree — the 4th argument is not load-bearing"
+            else
+                ok "MUTANT: the pre-#2033 bare-branch base FAILS on the same clone — the shipped 4th argument is load-bearing"
+            fi
         fi
         # ⛔ THE LOCAL-BRANCH ARM (the other half of the two-arm block this fix introduces). When
         # `refs/heads/$BR` already exists — a previous adopt whose worktree was pruned — the block must
@@ -516,7 +547,7 @@ else
         if git clone -q --single-branch --branch main "$WORK/origin.git" "$_ld" 2>/dev/null; then
             [ -n "$_afl" ] && run_shipped "$_ld" fix/some-branch "$WORK/wt-local" "$_afl"
             if git -C "$_ld" branch fix/some-branch refs/remotes/origin/fix/some-branch >/dev/null 2>&1; then
-                if run_shipped "$_ld" fix/some-branch "$WORK/wt-local" "$_ablk"; then
+                if run_shipped_provision "$_ld" fix/some-branch "$WORK/wt-local" "$_aprov"; then
                     _wtl2="$(git -C "$_ld" worktree list --porcelain)"
                     case "$_wtl2" in
                         *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's block also materialises an ALREADY-LOCAL branch (the re-adopt arm, no -b collision)" ;;
