@@ -2629,7 +2629,7 @@ awk -v mark="${1:-0}" '
     if (q == "") {
       if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; i++; continue }
       if (c == "\047" || c == "\"") {
-        ansi = (c == "\047" && i > 1 && substr($0, i - 1, 1) == "$" && substr($0, i - 2, 1) != "$");
+        ansi = (c == "\047" && i > 1 && substr($0, i - 1, 1) == "$" && (i < 3 || substr($0, i - 2, 1) != "$"));
         q = c; out = out c; prev = c; continue
       }
       if (c == "#" && (prev == "" || index(" \t;()|&<>", prev) > 0)) { rem = substr($0, i); break }
@@ -2651,6 +2651,42 @@ awk -v mark="${1:-0}" '
 # out of the population (four of them < 20 chars). The marked mode makes the population EXACTLY "every
 # comment this strip removes", at any length, in any spelling, with no floor and no selector to get wrong.
 _strip_comments() { _strip_marked 0; }
+# ⛔ A SECOND, FROZEN COPY OF THE RULE — AND IT IS DUPLICATION ON PURPOSE (review P2, cycle 32). The
+# checks below used to test the view's properties with the SAME stripper that produced it, which cannot
+# fail when the stripper itself is weakened: measured, a column-0-only `_strip_marked` left the view
+# un-stripped of 1,765 comments and STILL printed "FIXED POINT … a view that left any comment would remove
+# something here" — a fixed point of a weaker rule is a fixed point. The reference is frozen at this
+# version of the rule so a REAL weakening of `_strip_marked` diverges from it and reds; a legitimate
+# improvement to the rule reds it too, and the remedy is to update BOTH copies and the probe set.
+# ⛔ DO NOT "unify" this with `_strip_marked` — that restores exactly the blind spot it exists to remove.
+# What this grades, precisely: a change to ONE of the two copies (the realistic edit). A change applied
+# consistently to BOTH copies is indistinguishable from an intended rule change, and no test can tell
+# those apart — which is why the probe set is the independent check on the rule's shape, and why an
+# intended change must move the probes too.
+_strip_ref() {   # stdin → view, per the rule as reviewed; $1=1 also prints "view\001<removed>"
+awk -v mark="${1:-0}" '
+{
+  out = ""; rem = ""; q = ""; prev = ""; ansi = 0;
+  n = length($0);
+  for (i = 1; i <= n; i++) {
+    c = substr($0, i, 1);
+    if (q == "") {
+      if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; i++; continue }
+      if (c == "\047" || c == "\"") {
+        ansi = (c == "\047" && i > 1 && substr($0, i - 1, 1) == "$" && (i < 3 || substr($0, i - 2, 1) != "$"));
+        q = c; out = out c; prev = c; continue
+      }
+      if (c == "#" && (prev == "" || index(" \t;()|&<>", prev) > 0)) { rem = substr($0, i); break }
+    } else if (c == "\\" && (q == "\"" || ansi)) {
+      out = out c substr($0, i + 1, 1); prev = "x"; i++; continue
+    } else if (c == q) {
+      q = ""; ansi = 0; out = out c; prev = c; continue
+    }
+    out = out c; prev = c;
+  }
+  if (mark) print out "\001" rem; else print out
+}'
+}
 _WCODE="$(_strip_comments < "$REFRESH")"
 # ⛔ ONE PROBE PER BOUNDARY CHARACTER (review P3, cycles 28 and 29). The set is `prev == ""` plus NINE
 # characters — space, TAB, `;` `(` `)` `|` `&` `<` `>` — and the first probe set skipped TAB, `(` and
@@ -2673,11 +2709,11 @@ _WCODE="$(_strip_comments < "$REFRESH")"
 _strip_probe="$(printf '%s\n' 'A=1;# stale' '(echo hi)# stale' 'C=3|# stale' 'D=4&&# stale' \
   'E=5(# stale' 'F=6<# stale' 'I=7># stale' $'J=8\t# stale' \
   'K="head #5 is data"  # stale' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x # stale" 'O="a\"b" # stale' \
-  "P=\$'it\\'s' # stale" "Q=\$\$'a\\' # stale" | _strip_comments)"
+  "P=\$'it\\'s' # stale" "Q=\$\$'a\\' # stale" "$'it\\'s' # stale" | _strip_comments)"
 _strip_bad=""
 for _want in 'A=1;' '(echo hi)' 'C=3|' 'D=4&&' 'E=5(' 'F=6<' 'I=7>' $'J=8\t' \
               'K="head #5 is data"  ' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x " 'O="a\"b" ' \
-              "P=\$'it\\'s' " "Q=\$\$'a\\' "; do
+              "P=\$'it\\'s' " "Q=\$\$'a\\' " "$'it\\'s' "; do
   grep -qxF -- "$_want" <<<"$_strip_probe" || _strip_bad="$_strip_bad[$_want]"
 done
 if [ -z "$_strip_bad" ]; then
@@ -2705,6 +2741,11 @@ fi
 #       writer whose only `_head_rank=` arm hides behind a `;;#` must yield one fewer text than it
 #       contains. With `_WCODE="$(cat …)"` this stays GREEN while (a) reds, so (a) is what makes the strip
 #       non-removable and (b) is what makes a `;;#` arm count as absent.
+_diff_first() {   # <expected> <actual> → the first differing pair, for the message
+  diff <(printf '%s\n' "$1") <(printf '%s\n' "$2") | awk '/^</ { if (!a) { a = substr($0, 1, 80) } }
+                                                            /^>/ { if (!b) { b = substr($0, 1, 80); exit } }
+                                                            END { printf "%s  /  %s", (a == "" ? "<none>" : a), (b == "" ? "<none>" : b) }'
+}
 _content_lines() { grep -c '[^[:space:]]' || true; }
 # how many comments a marked pass removes, and the first one it removes
 _removed_n() {  awk -F'\001' 'NF > 1 && $2 != "" { n++ } END { print n + 0 }'; }
@@ -2732,28 +2773,23 @@ else
   # floor and no selector: re-run the SAME strip over its own output and require that it removes nothing.
   # A strip that leaves ANY comment — of any spelling, at any length — is not a fixed point, so it is
   # caught by construction rather than by enumerating what should have been caught.
-  # ⛔ AND THE STRIPPER'S RULE MUST NOT BE LENGTH-DEPENDENT (review P3, cycle 31). A fixed point is a
-  # fixed point OF ITS OWN RULE, so a stripper that deliberately ignores one length class is still a fixed
-  # point of itself — measured: a rule that skips exactly 5-character comments left the suite 293/0 GREEN.
-  # That is not hypothetical: the previous version of this check carried a `>= 20 chars` floor, and FIVE
-  # real comments this writer carries are shorter than that (`# <ref>` 5, `# <arm>` 5, `# <slug>
-  # [<reason>]` 17, `# table shape` 11, `# <pre-flight output>` 19). The coverage is asserted instead of
-  # assumed, on the writer's own bytes. What this does NOT cover, stated rather than implied: a rule that
-  # skips one EXACT length (measured: skipping only 5-character comments stays green here, and the probes
-  # all carry 7-character tails). No finite probe set closes that, so it is a disclosed residual — a
-  # length rule introduced deliberately would have to be a whole-class rule, and those are caught (a
-  # `< 20` floor reds the probes; a `>= 20` floor reds the probes AND this count).
-  _n_short="$(_strip_marked 1 < "$REFRESH" | awk -F'\001' 'NF > 1 && $2 != "" { n = length($2); if (n >= 4 && n <= 19) c++ } END { print c + 0 }')"
+  # ⛔ AND A LENGTH RULE MUST NOT HIDE A CLASS OF COMMENTS (review P3, cycles 31 and 32). The previous
+  # version asserted only a COUNT (`>= 5` removals under 20 characters) against an actual 27, so a rule
+  # that kept comments of 11-19 characters as data passed it — measured GREEN while 6 short comments had
+  # silently rejoined the graded view. The short comments this writer carries are therefore named BY THEIR
+  # OWN TEXT, derived from the writer and required to be REMOVED, so the class is covered exactly rather
+  # than counted.
+  _n_short="$(_strip_ref 1 < "$REFRESH" | awk -F'\001' 'NF > 1 && $2 != "" { n = length($2); if (n >= 4 && n <= 19) c++ } END { print c + 0 }')"
+  _ref_view="$(_strip_ref < "$REFRESH")"
   if [ "${_n_short:-0}" -lt 5 ]; then
-    bad "pin/writer: the strip removes only ${_n_short:-<unreadable>} comment(s) shorter than 20 characters (want >= 5) — a length rule has crept back in, and the short comments this writer carries are exactly what such a rule drops silently"
+    bad "pin/writer: the reference strip removes only ${_n_short:-<unreadable>} comment(s) shorter than 20 characters (want >= 5), so this writer no longer has a SHORT-comment population to grade — if comments were legitimately removed from the writer, lower this number deliberately"
   else
-    ok "pin/writer: the strip removes comments at every length — $_n_short of them are under 20 characters, so no length floor is hiding them"
+    ok "pin/writer: the short-comment population is $_n_short comments under 20 characters, and the view below must account for every one"
   fi
-  _n_re="$(_strip_marked 1 <<<"$_WCODE" | _removed_n)"
-  if [ "${_n_re:-x}" = "0" ]; then
-    ok "pin/writer: the graded view is a FIXED POINT of the strip — re-stripping it removes nothing, while the file yields $_n_strip ($_view_content content lines kept of $_raw_content). A view that left any comment, in any spelling, would remove something here"
+  if [ "$_WCODE" = "$_ref_view" ]; then
+    ok "pin/writer: the graded view is BYTE-IDENTICAL to the frozen reference strip ($_n_strip comments removed, $_n_short of them under 20 characters) — a weakened strip, a different wiring, a truncation or an un-stripped spelling all diverge here"
   else
-    bad "pin/writer: re-stripping the graded view still removes ${_n_re:-<unreadable>} comment(s) (first: '$(_strip_marked 1 <<<"$_WCODE" | _removed_first)') — the strip left them in, so every predicate below grades them as code"
+    bad "pin/writer: the graded view DIFFERS from the frozen reference strip — first divergence: '$(_diff_first "$_ref_view" "$_WCODE")'. The strip under test changed behaviour (weakened, or improved); if the change is INTENDED, update \`_strip_ref\` AND the probe set together, never one of them"
   fi
 fi
 _synth_writer="$(printf '%s\n' 'severity) _head_rank="the ranked one" ;;# was: unranked) _head_rank="the hidden one" ;;' \
