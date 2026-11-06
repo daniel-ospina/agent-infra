@@ -332,20 +332,12 @@ function checkPipelineComplianceUnchanged() {
   const { region, childIndent } = onRegion(text, PC_FILE);
   const t = trigger(region, childIndent, "pull_request", PC_FILE);
 
-  // `workflow_call` is legitimate here (consumers reuse this file) and so is `issue_comment` — the
-  // two NON-PR run sites are each guarded, and each is pinned by the workflow's own `if:` rather than
-  // by this reader: `pull_request` is the only trigger that can attach a verdict to a HEAD, and
-  // `issue_comment` cannot mint one at all (the required job carries
-  // `if: github.event_name != 'issue_comment'`, line 118, and the `revalidate-on-issue-comment` job
-  // owns the comment event — it re-runs the EXISTING run for each open PR cross-referencing the
-  // linked issue, which is #2467's fix for a required check whose (b)/(d) inputs come from the issue
-  // and therefore fire no `pull_request` event). Anything else is a new run site on the repo's only
-  // required context, and a `push:` arm would attach its verdict to main, not to a PR head — the
-  // refusal this pin exists for, and it still names the added trigger.
-  const extraOn = extraSet(onKeys(region, childIndent), ["workflow_call", "pull_request", "issue_comment"]);
+  // `workflow_call` is legitimate here (consumers reuse this file); anything else is a new run site
+  // on the repo's only required context, and a `push:` arm would attach its verdict to main.
+  const extraOn = extraSet(onKeys(region, childIndent), ["workflow_call", "pull_request"]);
   if (extraOn.length) {
     findings.push(
-      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\`, \`pull_request:\` and \`issue_comment:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
+      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\` and \`pull_request:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
     );
   }
 

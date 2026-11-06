@@ -16,15 +16,7 @@
 # WHAT IS PINNED, AND WHY EACH ARM CAN FAIL. Every assertion below is driven by a MUTATION of the
 # live file, never by a presence check: a pin that cannot fail is not a pin.
 #
-#   1. LIVE — the real tree is as decided (both files, plus the required context untouched). The
-#      required context's `on:` set is `workflow_call:` + `pull_request:` + `issue_comment:`: the
-#      comment arm is #2467's fix for a required check whose (b)/(d) inputs live on the LINKED ISSUE,
-#      and it is admissible because no comment event can attach a verdict to a head — the required
-#      job carries `if: github.event_name != 'issue_comment'` and `revalidate-on-issue-comment`
-#      re-runs the EXISTING run for each open PR cross-referencing that issue. It is in the pin
-#      because it landed AFTER this suite was written (#3204) and left the live arm red; the pin's
-#      job is to state the decided set, so a trigger the decision ADMITS belongs here, while `push:`
-#      and every other new run site stay refused by arm 7f and by the same key-set assertion.
+#   1. LIVE — the real tree is as decided (both files, plus the required context untouched).
 #   2. MUTANT: `edited` restored to workflow-lock's `types:`          → must FAIL.
 #   3. MUTANT: `synchronize` dropped from it                          → must FAIL.
 #  3b. MUTANT: a `paths:` filter added to the base-branch checker     → must FAIL (a filter there is
