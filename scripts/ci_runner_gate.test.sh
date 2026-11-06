@@ -83,8 +83,8 @@ CMUX_LOG="$T/cmux.log"
 #                  lists a run's jobs in creation order and defaults to 30 per page, so on a big
 #                  matrix run the jobs still queued are exactly the ones past page 1; a reader that
 #                  stops at page 1 sees "no queued job" on a run that has one (#2344 review P1).
-#   GH_MODE        queued-null | queued-empty | inprog-null | inprog-fail | oldest-junk |
-#                  enum-fail | enum-garbage | enum-badtab | ok
+#   GH_MODE        queued-null | queued-empty | queued-twofield | queued-countonly | inprog-null |
+#                  inprog-fail | oldest-junk | enum-fail | enum-garbage | enum-badtab | ok
 #   GH_FALLBACK_N  per-page count of fallback-labelled runners (current_mode → github|local)
 #   GH_POOL_IDS    the ids the enumeration returns (default ARM64 pool members, see below)
 #   GH_RUNNER_ROWS_FILE  a file of `<id>TAB<label>` rows — the REAL enumeration shape, used by the
@@ -391,6 +391,11 @@ case "$*" in
     case "${GH_MODE:-ok}" in
       queued-null)  printf 'null\t\n' ;;
       queued-empty) printf '\n' ;;
+      # A body carrying only the count and the oldest timestamp: no run id, no row order. This is the
+      # "two-field body" the gate's own comment promises still parses (#2344 review cycle 3).
+      queued-twofield) printf '%s\t%s\n' "${GH_QUEUED:-5}" "$(queue_oldest_at)" ;;
+      # A body carrying the count and NOTHING else: no id, no timestamp — unidentifiable, not degraded.
+      queued-countonly) printf '%s\n' "${GH_QUEUED:-5}" ;;
       # The unparseable head stamp must be unparseable WHERE THE GATE NOW READS IT — the row the scan
       # picks — so it is carried in the order field too; a fixture that only poisoned field 2 would
       # leave the arm green for the wrong reason.
@@ -1036,6 +1041,24 @@ assert_absent "$STATE_DIR/ci-runner-gate.state" "a zero scan bound advanced no s
 run_gate ghost-bound-junk GH_QUEUED=5 GH_INPROGRESS=2 CI_GATE_QUEUE_HEAD_SCAN_MAX=abc --
 assert_eq "$RC" "2" "an unreadable scan bound → exit 2"
 assert_contains "$OUT" "scan bound UNREADABLE" "an unreadable scan bound names the read failure"
+# ⛔ A DEGRADED BODY STILL GETS A VERDICT (#2344 review cycle 3): a read carrying only `count` and the
+# oldest timestamp has no run to read jobs for, so the ghost discount is impossible — the pass says so
+# and falls back to the run-level age, which is what it did before this change. Refusing here would
+# let a read-shape change turn the fleet's only CI-routing instrument into a silent `exit 2` before
+# the census runs (so not even the blind alarm would fire).
+echo "── #2344: a body with no run id still reaches a verdict, with the discount UNAVAILABLE ──"
+run_gate ghost-twofield GH_MODE=queued-twofield GH_QUEUED=5 GH_INPROGRESS=2 GH_FALLBACK_N=0 GH_QUEUE_OLDEST_AGE=30 --
+assert_eq "$RC" "0" "a two-field queue body still reaches a verdict"
+assert_contains "$OUT" "ghost discount is UNAVAILABLE" "the pass says the discount could not be applied"
+assert_contains "$OUT" "ghost_runs=0" "nothing was discounted"
+assert_contains "$OUT" "queued_demanding=5" "the whole queue counts, as it did before this change"
+assert_contains "$OUT" "oldest_queued_s=3" "the age comes from the timestamp the read DID carry"
+assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "the verdict is still reached on a degraded body"
+# …but a body with NOTHING identifiable has no age either, so there is nothing to measure.
+run_gate ghost-countonly GH_MODE=queued-countonly GH_QUEUED=5 GH_INPROGRESS=2 --
+assert_eq "$RC" "2" "a count-only queue body → exit 2 (nothing to measure)"
+assert_contains "$OUT" "queue HEAD UNIDENTIFIABLE" "the refusal names what was missing"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "an unidentifiable body advanced no state file"
 # …and a read that CONTRADICTS ITSELF (more ghost rows than the depth it reports) is REFUSED rather
 # than clamped to "no demand" — the clamp is the direction that strips the pool during a real stall.
 echo "── #2344: a queue read that contradicts its own depth is REFUSED ──"

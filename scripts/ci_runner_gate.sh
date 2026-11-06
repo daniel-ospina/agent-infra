@@ -529,7 +529,7 @@ run_queued_demand() {
   # ⛔ `--paginate` IS REQUIRED, NOT TIDINESS (review P1). GitHub's list endpoints default to 30 per
   # page, and a RUN'S JOBS ARE LISTED IN CREATION ORDER — so on a run with more than 30 jobs the ones
   # still in `queued` status are exactly the ones on a LATER page (this repo's own matrix runs create
-  # them progressively; the gate's census read carries the same rule at #1036/#1307, and
+  # them progressively; the gate's own census read carries the same rule — see `runner_rows`, and
   # `scripts/atomic-land.sh` measured 30-of-47 on a real check-runs response). Without it the first
   # page answers "no queued job" on a run that HAS one, which is the GHOST shape — and since #2344
   # made that shape load-bearing evidence, the under-read would silently DISCOUNT real demand and
@@ -817,16 +817,28 @@ print(comp, len(inc))
   DEMAND_LABELS=""
   demand_head_id=""; demand_head_created=""
   if [ "$queued" -gt 0 ]; then
-    # Oldest-first candidates. An absent order field (a two-field body, or a proxy that drops it)
-    # degrades to the single head id the read DID carry, so the pass keeps pre-#2344 behaviour
-    # instead of failing over a field it never needed before.
+    # Oldest-first candidates. A body that carries the oldest run's id but not the row order degrades
+    # to that single candidate, so the scan still runs on the one run it can name.
     candidates="$queue_rows"
     if [ -z "$candidates" ] && [ -n "$head_run_id" ]; then
       candidates="$head_run_id,$oldest_created"
     fi
-    if [ -z "$candidates" ]; then
-      log "queue HEAD UNIDENTIFIABLE: queued=$queued but the read carried neither the row order nor a head run id — FAIL-CLOSED, changing nothing"; return 2
+    if [ -z "$candidates" ] && [ -z "$oldest_created" ]; then
+      log "queue HEAD UNIDENTIFIABLE: queued=$queued but the read carried none of the row order, a head run id, or the oldest run's timestamp — FAIL-CLOSED, changing nothing"; return 2
     fi
+    # ⛔ A BODY WITH NEITHER THE ROW ORDER NOR A RUN ID STILL GETS A VERDICT, WITH PRE-#2344 SEMANTICS
+    # (review #3, cycle 3). `:746` promises "a two-field body still parses … instead of failing a pass
+    # that needs nothing else from it", and before this change a `count TAB created_at` body DID
+    # produce a verdict: the age came from that timestamp and the demand read simply found no id. Now
+    # the discount is impossible on such a body (there is nothing to read jobs for), so the pass says
+    # so and falls back to the run-level age — which may include a record with nothing in a
+    # schedulable state. The alternative, refusing, would let a shape change turn the fleet's only
+    # CI-routing instrument into a silent `exit 2` before the census even runs (no blind alarm).
+    if [ -z "$candidates" ]; then
+      log "queue rows UNIDENTIFIABLE (the read carried no run id and no row order): the ghost discount is UNAVAILABLE for this pass, so oldest_queued_s below is the oldest QUEUED RUN's age and may include a record with nothing in a schedulable state; demand stays unmeasured"
+      demand_head_created="$oldest_created"
+      queued_demanding="$queued"
+    else
     # ⛔ `scan_exhausted` IS THE COMPLETENESS EVIDENCE, NOT `scanned == queued` (review #2, blocking).
     # `scanned` is ALSO capped by the probe bound, so on a page carrying more rows than `total_count`
     # with `queued == QUEUE_HEAD_SCAN_MAX` the bound break left `scanned == queued` and the
@@ -871,8 +883,10 @@ print(comp, len(inc))
         log "queue: all $queued queued run(s) report ZERO jobs in 'queued' status — nothing is waiting for a runner (a run GitHub reports as queued with nothing in a schedulable state)"
         QUEUE_GHOSTS="$queued"
       elif [ "$scan_exhausted" = 1 ]; then
-        # The page ENDED before the queue did: a truncated read, not an empty one.
-        log "queue: the page carried only $scanned run row(s) for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the page is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing"; return 2
+        # The candidate list ENDED before the queue did: a truncated read, not an empty one. The
+        # wording is "readable run row(s)" because the list may be the PAGE's rows or the single
+        # candidate synthesised from a body that carried only a head id.
+        log "queue: only $scanned run row(s) were readable for a queue reported $queued deep, and all $scanned report ZERO jobs in 'queued' status — the read is TRUNCATED, so the head of real demand cannot be measured; FAIL-CLOSED, changing nothing"; return 2
       else
         log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing"; return 2
       fi
@@ -886,6 +900,7 @@ print(comp, len(inc))
       log "queue reading INCONSISTENT: $QUEUE_GHOSTS ghost run(s) read from a queue the API reports as $queued deep — FAIL-CLOSED, changing nothing"; return 2
     fi
     queued_demanding=$((queued - QUEUE_GHOSTS))
+    fi
   fi
 
   # THE QUEUE-WAIT CLOCK, computed here so the log line can carry seconds rather than a timestamp.
