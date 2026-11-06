@@ -1236,7 +1236,17 @@ fi
 # Adding the three files that gained remedies above (`lane.sh:3`, `lane-merge.sh:2`,
 # `spawn-gate.sh:3`) is the same doctrine applied to them: a file that gains a remedy gets a floor, or
 # arm (1) is silent on it and arm (2) is silent on a remedy replaced by prose.
-REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:23 dispatch-merge.sh:2 chain-merge.sh:1 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:2 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:3 lane-merge.sh:2 spawn-gate.sh:3"
+# ⛔ FIVE FLOORS RE-CUT 2026-11-06 (PR #3508, #3073 roots 2+3) — the same drift the two entries above
+# record, found again one round later. Seven remedies were reverted to the unverified depth-1 copy
+# (chain-merge.sh:307, dispatch-merge.sh:155, fix-one.sh:819, lane.sh:970,1010, spawn-gate.sh:2223,2257)
+# and the fix that restored them ALSO left all five floors at their pre-revert numbers, so each restore
+# was invisible to arm (1): reverting any ONE of the seven keeps the count at or above the old floor and
+# arm (1) stays GREEN. Arm (2) does catch the `cp *.sh` shape — that is how the class was found — but a
+# remedy DELETED or reworded to name a third mechanism is arm (2)'s blind spot, which is the case a
+# floor exists for. Re-cut to the measured counts, per the rule stated above:
+#   `lane.sh` 3→5, `spawn-gate.sh` 3→5, `fix-one.sh` 2→3, `dispatch-merge.sh` 2→3, `chain-merge.sh` 1→2.
+# Each new number is `grep -c 'deploy-harness\.sh' <file>` at this head; no entry was lowered.
+REMEDY_SITES_FLOOR="install.sh:4 orch-loop.sh:23 dispatch-merge.sh:3 chain-merge.sh:2 refresh-candidates.sh:5 check-deployed-drift.sh:1 report.sh:1 merge-one.sh:1 cloud-cell-supervisor.sh:1 fix-one.sh:3 nochk-guard.sh:2 launchd-controller.sh:1 lane.sh:5 lane-merge.sh:2 spawn-gate.sh:5"
 for _sf in $REMEDY_SITES_FLOOR; do
   _site="${_sf%%:*}"; _floor="${_sf##*:}"
   if [ -f "$HERE/$_site" ]; then _sp="$HERE/$_site"; elif [ -f "$HERE/../$_site" ]; then _sp="$HERE/../$_site"; else _sp=""; fi
