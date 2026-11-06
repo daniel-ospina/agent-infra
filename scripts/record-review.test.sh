@@ -6805,22 +6805,12 @@ assert_contains "$RECORD_ERR" "could not read the PR's BASE" "20d4 the refusal n
 # for the shape it exists to pin, which made 20e red for a reason it does not
 # measure. The clean shapes are what backward compat means here.
 EE=425108; rm -f "$(Q2 $EE)"
-# ⛔ #3442 — EACH VECTOR APPENDS $VACUITY_BLOCK. 20e's SUBJECT is the comment:/review: SHAPE, not
-# non-vacuity, and since agent-infra#3442 a FRESH `clean` mint is REFUSED when its artifact carries no
-# `## MUTATION ATTRIBUTION` block. Without the block these two vectors are refused by the NON-VACUITY
-# arm and would report on a rule they do not pin — the unrelated-row trap #3442 rule 2 names, and the
-# same fixture-contract change main's own default body and its §13l/§13q vectors already carry. The
-# behaviour asserted below is unchanged: a plain `comment:<id>` / `review:<id>` artifact still records.
-EV_REF="comment:42510801" run_record_ev $EE STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified, no issues.**
-
-$VACUITY_BLOCK"
+EV_REF="comment:42510801" run_record_ev $EE STUB_EVIDENCE_BODY='**Outcome: CLEAN — verified, no issues.**'
 assert_eq "$RECORD_RC" "0" "20e comment:<id> evidence still records clean (rc 0)"
 assert_contains "$(cat "$(Q2 $EE)" 2>/dev/null || true)" '"evidence":"comment:42510801"' "20e the record still names the comment"
 if grep -qF 'delta_' "$(Q2 $EE)" 2>/dev/null; then bad "20e a comment record grew delta fields"; else ok "20e a comment record carries NO delta fields (shape unchanged)"; fi
 EE2=425109; rm -f "$(Q2 $EE2)"
-EV_REF="review:42510901" run_record_ev $EE2 STUB_REVIEW_STATE=APPROVED STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified, no issues.**
-
-$VACUITY_BLOCK"
+EV_REF="review:42510901" run_record_ev $EE2 STUB_REVIEW_STATE=APPROVED STUB_EVIDENCE_BODY='**Outcome: CLEAN — verified, no issues.**'
 assert_eq "$RECORD_RC" "0" "20e review:<id> evidence still records clean (rc 0)"
 
 # ── 20f — the OTHER refusal arms ─────
@@ -7280,6 +7270,25 @@ EH20=425169; rm -f "$(Q2 $EH20)"
 run_record_delta $EH20 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516901" \
     STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
 assert_eq "$RECORD_RC" "3" "20h16 a cover naming A but PREDATING A is still refused (rc 3)"
+
+# 20h17 THE RANGE NOTATION MUST NOT CHANGE THE ANSWER. 20h15 pins that a NARROWER stated
+#       range is refused, and that arm is an ANTI-FAIL-OPEN check — so a one-character
+#       difference in the ARTIFACT must not be able to route around it. As first written the
+#       parser read `\.\.` ONLY: the IDENTICAL body in this repo's own three-dot compare
+#       notation (`gh api compare/<base>...<head>`) did not match, `stated_to` stayed empty,
+#       and control fell through to the bare-needle fallback — which is satisfied by a body
+#       naming B ALONE. The range was then never checked at all, and the record asserted a
+#       `delta_range` its own artifact contradicted, which is what that arm's message says it
+#       prevents. Both notations must refuse. (Found in review at PR #3401; ported here with
+#       the source fix rather than left as a known bypass.)
+EH21=425174; rm -f "$(Q2 $EH21)"
+run_record_delta $EH21 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42517501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1...$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h17 a body stating a NARROWER range in THREE-DOT form is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h17 the three-dot body reaches the RANGE arm, not the bare-needle fallback"
+assert_contains "$RECORD_ERR" "delta:${DG_A1:0:12}...${DG_HEAD:0:12}" "20h17 the refusal quotes the notation the ARTIFACT used, not the two-dot form misquoted back"
+[ -f "$(Q2 $EH21)" ] && bad "20h17 no record was written" || ok "20h17 no record was written"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7399,6 +7408,14 @@ mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_
 #       NARROWER range satisfy the claim for a wider one (20h15).
 MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
 mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+# M15 — THE SEPARATOR ITSELF. M14 breaks the ancestry test AFTER a match; M15 breaks the
+#       MATCH, so it exercises the FALL-THROUGH path (20h17) that a one-character change in
+#       the artifact used to reach. Reverting `(\.\.\.?)` to `(\.\.)` reproduces the pre-fix
+#       recorder exactly: the three-dot body stops matching, the bare-needle fallback accepts
+#       a body naming B alone, and the vector's refusal flips to ACCEPTED. Distinct from M14
+#       by construction, not by label.
+MUT="$(mk_mutant sepdots 'delta:([0-9a-f]{12,40})(\.\.\.?)([0-9a-f]{12,40})' 'delta:([0-9a-f]{12,40})(\.\.)([0-9a-f]{12,40})')"
+mut_check "M15 a three-dot narrower stated range is refused" 425174 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42517501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1...$DG_HEAD only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
@@ -7406,16 +7423,19 @@ mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_
 #       population was truncated.
 MUT="$(mk_mutant breakanchor '      : "${evil:=merge ${m:0:12} is NOT a clean merge' '      break; : "${evil:=merge ${m:0:12} is NOT a clean merge')"
 mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "delta:$DG_EV_L..$EM_CHILD+comment:42515002" accepted STUB_EVIDENCE_AT="2026-05-01T00:00:00Z"
-# M11 — THE CLAUSE-(E) POLARITY. An unnamed status from target_head_red must refuse.
-#       The mutant replaces the helper's answer with a status the case does not name
-#       (`3`); the shipped code refuses it (only an explicit green rc 1 proceeds),
-#       and a version whose case lists only 0 and 2 ACCEPTED it and minted `clean`
-#       over a head whose checks were never shown non-red — the enum fall-through the
-#       AGENTS.md verification-state rule forbids. The mutant is the SIMULATION of the
+# M11 — THE CLAUSE-(E) POLARITY. An UNNAMED answer from the check-surface predicate must
+#       refuse. (#3440) DELETED the `target_head_red` wrapper this cell used to mutate, so
+#       the anchor now targets the LIVE predicate — `check_surface_scan`, called directly by
+#       the delta arm — and injects an answer the `case` does not name (`weird_answer`).
+#       The shipped code refuses it, and a version whose case names only the known-bad
+#       values and lets everything else fall through as "not red" ACCEPTED it and minted
+#       `clean` over a head whose checks were never shown non-red — the enum fall-through
+#       the AGENTS.md verification-state rule forbids. The mutant is the SIMULATION of that
 #       drift, so this cell asserts REFUSED: it reddens precisely when the polarity
-#       regresses. It probes a real range (20a's), so the arm is actually reached.
-MUT="$(mk_mutant unnamedcheck '  thr=0
-  target_head_red "$to" || thr=$?' '  thr=3')"
+#       regresses. ⛔ Cite the live predicate, never a name that no longer exists in
+#       record-review.sh (the same rule 14.14d states).
+MUT="$(mk_mutant unnamedcheck '  E_OUT=""; E_RC=0
+  E_OUT="$(check_surface_scan "$to")" || E_RC=$?' '  E_OUT="weird_answer"; E_RC=0')"
 mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
 
 # M12 — THE RANGE CLAIM. Deleting the (10a) arm must mint `clean` from a cover that

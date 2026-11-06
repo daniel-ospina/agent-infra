@@ -1281,7 +1281,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_from_sha="" sfr="" range_ok=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_sep="" stated_from_sha="" sfr="" range_ok=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1319,23 +1319,34 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   # (4b) THE TARGET HEAD'S HEALTH — clause (E) of the carry, applied here for the
   # same reason it applies there. A delta re-attests an OLD verdict over a NEW
   # head, so it must not put a signed `clean` on a head whose own checks are
-  # measurably failing. POLARITY: only an EXPLICIT green (rc 1) proceeds — every
-  # other status refuses, including one this case does not name. Three outcomes are
-  # DOCUMENTED (#2342: red / unreadable / green), but a four-outcome future, or a
-  # helper whose own last command cannot run, must not fall through as "not red":
-  # that is the enum-allow-list error the verification-state rule in AGENTS.md names
-  # ("an unnamed value must never be allowed to fall through a gap"), and the carry
-  # arm 2,300 lines below already implements exactly this polarity — this arm was
-  # the odd one out (found by review: a stubbed rc 3 was ACCEPTED and minted clean).
-  thr=0
-  target_head_red "$to" || thr=$?
-  case "$thr" in
-    1) : ;;   # the ONLY green: measured, non-red
-    0) echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
+  # measurably failing.
+  # ⛔ `check_surface_scan` IS CALLED DIRECTLY, and that is the point: (#3440) DELETED
+  # the `target_head_red` wrapper this arm used to call — its last caller was this very
+  # arm — so that no second polarity with a divergent meaning is left behind. The mapping
+  # below is clause E's, taken verbatim from the carry arm: a REFUSED read (rc != 0)
+  # refuses, a `red` surface refuses, and a read-but-unanswered surface (`in_flight` /
+  # `empty` / `green`) proceeds. `empty` is NOT green — the record write below still
+  # classifies it `unknown` — but it is an ANSWER, and refusing on it here would be a
+  # polarity the arm this mirrors does not share.
+  # ⛔ AN UNNAMED ANSWER STILL MUST NOT FALL THROUGH. The old `case` on the helper's rc
+  # was the only thing enforcing that, so the enum is written out explicitly rather than
+  # implied by a helper nobody reading this arm can see; anything not named refuses.
+  E_OUT=""; E_RC=0
+  E_OUT="$(check_surface_scan "$to")" || E_RC=$?
+  case "$E_RC:${E_OUT%%$'\n'*}" in
+    0:green|0:in_flight|0:empty) : ;;   # read, answered, and no red group
+    0:red)
+       echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
+       echo "   red group(s): $(printf '%s\n' "$E_OUT" | command sed -n '2,$p' | command tr '\n' ' ')" >&2
        return 1 ;;
-    *) echo "   delta: the target head's check surface returned status '$thr', which is neither a measured green nor a known red — a read this code cannot interpret is not a pass, so the range is not verified. Retry rather than record." >&2
+    *)
+       echo "   delta: the target head's check surface could not be READ (rc $E_RC, answer '${E_OUT%%$'\n'*}'): neither a measured green nor a known red — and a read this code cannot interpret is not a pass, so the range is not verified. Retry rather than record." >&2
        return 1 ;;
   esac
+  # The read succeeded and is not red: keep it so the record write reuses this scan
+  # instead of paying for a second identical read of the SAME head (it is the same
+  # `$SHA`, because (3) already required the range's upper bound to BE the live head).
+  SURFACE_SCANNED_HEAD="$to"; SURFACE_SCANNED_OUT="$E_OUT"
   # (5) THE CHECKOUT. Fail closed: an unreadable range is not evidence.
   if ! root="$(delta_git_root)"; then
     echo "   delta: cannot read the range from a checkout of ${REPO:-<no repo>} (run inside the PR's worktree, or set DELTA_GIT_DIR). A range this box cannot read cannot be verified, and an unverified range is not evidence." >&2
@@ -1631,9 +1642,22 @@ $m"
       fi
     fi
     if [ "$DELTA_KIND" != "merge-only" ]; then
-    stated_from=""; stated_to=""
-    if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})\.\.([0-9a-f]{12,40}) ]]; then
-      stated_from="${BASH_REMATCH[1]}"; stated_to="${BASH_REMATCH[2]}"
+    stated_from=""; stated_to=""; stated_sep=""
+    # ⛔ TWO-DOT **AND** THREE-DOT, because the arm below is an anti-fail-open check and
+    # a one-character difference in the ARTIFACT must not be able to route around it
+    # (review finding, PR #3401). Reading only `..` made a body that states a NARROWER
+    # range in the three-dot form fall through to the bare-needle fallback below —
+    # which accepts an artifact that names B alone — so an artifact DECLARING it
+    # covered `fa28418...3e011ea` was accepted for a wider recorded range, silently,
+    # while the identical body in the two-dot form was refused. Three dots is not a
+    # tolerated spelling invented here: it is this repo's own range notation in the
+    # `gh api compare/<base>...<head>` reads. Git's three-dot means
+    # `merge-base(A,B)..B`, so treating it as `A..B` is the CONSERVATIVE reading — it
+    # still requires `stated_from` to be an ancestor of the recorded A, and refuses
+    # otherwise. The separator is CAPTURED rather than normalised, so the refusal
+    # quotes the notation the artifact actually used instead of misquoting it back.
+    if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})(\.\.\.?)([0-9a-f]{12,40}) ]]; then
+      stated_from="${BASH_REMATCH[1]}"; stated_sep="${BASH_REMATCH[2]}"; stated_to="${BASH_REMATCH[3]}"
     fi
     if [ -n "$stated_to" ]; then
       range_ok=0
@@ -1651,7 +1675,7 @@ $m"
       fi
       [ "$range_ok" = 1 ] && body_claim=1
       if [ "$range_ok" -ne 1 ]; then
-        echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}..${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts." >&2
+        echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts." >&2
         return 1
       fi
     else
@@ -5801,13 +5825,15 @@ if [ -n "$RECORD_SIG" ]; then
 else
   echo "⚠️ record-review: AI_REVIEW_GATE_KEY is not configured (env or ~/.pi/agent/.ai-review-gate-key), so the record FILE cannot be signed. #1224: the gate refuses an unauthenticated record file as evidence and falls back to the signed marker in the PR body/comment — write the record on a box with the key to make the record itself authoritative." >&2
 fi
-# ⛔ ALL fields are written, by ALL producers' rules: the #1224 signature covers the
-# record the #3440 surface fields are part of, and `SURFACE_FIELD` is the mint-time
-# check-surface observation the carry gate reads. `DELTA_FIELDS` is the #3299
-# range-attestation surface and sits with `evidence` for the same reason the
-# surface does. The format string carries one `%s` per field, so adding a field
-# means adding it in BOTH the format and the argument list — the surface sits
-# before `evidence` in both, so the two stay aligned.
+# ⛔ ALL THREE field families are written, by their producers' own rules: the #1224
+# signature covers the record the #3440 surface fields are part of, `SURFACE_FIELD` is
+# the mint-time check-surface observation the carry gate reads, and `DELTA_FIELDS` is the
+# #3299 range claim, keyed on `DELTA_EV_OK` (the FACT `delta_verify` records when it has
+# verified a range) rather than on a variable name a third feature could reuse.
+# The format string carries one `%s` per field, so adding a field means adding it in BOTH
+# the format and the argument list. The surface sits before `evidence` in both formats and
+# the delta block leads, so the three stay aligned — and the slot count is asserted, not
+# counted by eye (record-review.test.sh runs BOTH branches).
 if [ -n "$REPO" ]; then
   printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$CARRY_FIELDS" "$SURFACE_FIELD" "$EVIDENCE_FIELD" "$FINDINGS_FIELD" "$RECORD_SIG_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
