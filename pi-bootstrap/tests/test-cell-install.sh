@@ -2255,6 +2255,35 @@ PY
     && ok "a usable self-host is PRESERVED and certified — no over-block ($_good)" \
     || fail "a self-host the CLIENT accepts ($_good) was refused or replaced (rc=$rc) — a false block on a working config, and for a self-host the repair destroys it"
 done
+# ⛔ DOT-EQUIVALENT SPOOFS ARE REFUSED BY NAME (#3374 review, round 13 P1). `new URL` applies UTS46,
+# which maps U+3002/U+FF0E/U+FF61/U+FE52/U+2024 to `.` — so each of these resolves in the CLIENT to a
+# DIFFERENT host (`api.premiselabs.co。evil.example` -> `api.premiselabs.co.evil.example`) while the
+# predicate read one harmless label, printed `SELFHOSTED:` rc=0 and left
+# `Bearer ${TORTOISE_MCP_API_KEY}` attached: the tenant key blessed to an attacker's host. No arm
+# covered this class before — the table pinned `%40`, `|`, `^` and a genuine `münchen` IDN, and a
+# dot-equivalent is neither. The `_good` loop above is the other half: `münchen.example` must STAY
+# certified, so the fix cannot be "refuse all non-ASCII".
+for _spoof in "https://api.premiselabs.co$(printf '\u3002')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\uff0e')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\uff61')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\ufe52')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\u2024')evil.example/mcp/"; do
+  python3 - "$DEST/.mcp.json" "$_spoof" <<'PY'
+import json, sys
+p, u = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "url": u, "_selfHosted": True,
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+  run_verify
+  rc=$?
+  [ "$rc" -ne 0 ] && grep -qE "^(NOHOST|BADHOST):" "$LOG" \
+    && ok "a DOT-EQUIVALENT authority is REFUSED, never certified with the key attached ($_spoof)" \
+    || fail "a dot-equivalent spoof was CERTIFIED (rc=$rc, $_spoof) — the client resolves it to a different host while the gate prints SELFHOSTED with ${TORTOISE_MCP_API_KEY} attached"
+done
 # ⛔ AND THE TWO COPIES MUST AGREE — THE FILE SAYS SO TWICE AND NOTHING CHECKED IT (#3374 review,
 # round 2 P3). `cell-install.sh`'s marker and `merge-mcp.py` both claim "the SAME predicate under the
 # SAME name", and drift in EITHER direction is a severe defect this PR exists to close: install
@@ -2272,6 +2301,11 @@ table = ["https://api.premiselabs.co/mcp/", "http://localhost:8000/mcp", "https:
          "https://api.premiselabs.co%40evil.example/mcp/", "https://host:65536/mcp/",
          "https://host:-1/mcp/", "https://a..b/mcp/", "https://api.premiselabs.co|evil.example/mcp/",
          "https://a^b.example/mcp/", "https://a<b.example/mcp/", "https://١.example/mcp/",
+         "https://api.premiselabs.co\u3002evil.example/mcp/",
+         "https://api.premiselabs.co\uff0eevil.example/mcp/",
+         "https://api.premiselabs.co\uff61evil.example/mcp/",
+         "https://api.premiselabs.co\ufe52evil.example/mcp/",
+         "https://api.premiselabs.co\u2024evil.example/mcp/",
          "https://api.premiselabs.co:8443/mcp/"]
 spec = importlib.util.spec_from_file_location("mm", sys.argv[1])
 mm = importlib.util.module_from_spec(spec)

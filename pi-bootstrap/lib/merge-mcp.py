@@ -74,12 +74,17 @@ import os
 import re
 import stat
 import sys
+import unicodedata
 
 # The HOSTED endpoint's header must be the canonical shape: a `Bearer ` scheme plus one of the two
-# variable names the resolver actually reads. The client sends headers VERBATIM, so a header without
-# the scheme reaches the server as `Authorization: tt_…` (401), and a header naming a third variable
-# expands to the EMPTY STRING while the credential check reports a working key — both were
-# certifiable (and so PRESERVED, by install) before this was pinned.
+# variable names the resolver actually reads. ⛔ IT IS NOT "VERBATIM": the client DOES expand
+# `${VAR}` (`extensions/mcp-client/index.ts:819`), and `expandExpr` yields the EMPTY STRING for an
+# unset variable — that is the whole blank-key trap. What the client does NOT do is add a scheme, so
+# the value is sent as-is AFTER expansion: a header without the scheme reaches the server as
+# `Authorization: tt_…` (401), and a header naming a third variable expands to the EMPTY STRING while
+# the credential check reports a working key — both were certifiable (and so PRESERVED, by install)
+# before this was pinned. (An earlier draft of this comment said "verbatim, no expansion" and was
+# wrong; the per-shape conclusions did not depend on it.)
 HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$")
 
 # ⛔ THE HOSTED DEFAULT IS A FIXED FACT, NOT "WHATEVER THE TEMPLATE HAPPENS TO SAY". `usable()` asks
@@ -290,6 +295,24 @@ def on_hosted_authority(url):
 # the host predicate was added to close (#3374 review, round 2 P3).
 _HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
 
+# ⛔ DOT-EQUIVALENT CODE POINTS ARE STRUCTURE, NOT TEXT (#3374 review, round 13 P1). `new URL` applies
+# UTS46, which maps U+3002 IDEOGRAPHIC FULL STOP, U+FF0E FULLWIDTH FULL STOP, U+FF61 HALFWIDTH
+# IDEOGRAPHIC FULL STOP, U+FE52 SMALL FULL STOP and U+2024 ONE DOT LEADER to `.` — so
+# `https://api.premiselabs.co。evil.example/mcp/` is resolved by the CLIENT as host
+# `api.premiselabs.co.evil.example`, i.e. an ATTACKER'S host, while every check here read it as one
+# innocuous label. Measured: the entry was preserved, marked `_selfHosted: true` by the repair path and
+# then certified `SELFHOSTED:` rc=0 by `--verify` — WITH `Authorization: Bearer
+# ${TORTOISE_MCP_API_KEY}` still attached, so the gate blessed the tenant key going to evil.example.
+# Checked by NFKC (stdlib) BEFORE the idna branch on purpose: `_label_ok` accepts every non-ASCII label
+# when `idna` is absent (`_idna is None`), so an idna-only guard leaves a stdlib-only box open. NFKC
+# maps all five of the above to `.`, which no single DNS label may contain.
+_DOT_EQUIVALENT = "\u3002\uff0e\uff61\ufe52\u2024"
+
+# Common Cyrillic/Greek homoglyphs of ASCII letters, which `idna` PUNYCODES rather than rejecting, so
+# they are NOT the same class as a dot-equivalent (a punycoded homoglyph is a DIFFERENT host, never the
+# hosted one) and are deliberately not refused here: refusing them would be a false block on a
+# legitimate IDN self-host. The dot rule is the one that re-splits a name an operator cannot see.
+
 try:                                          # IDNA2008/UTS46 — the standard the client applies
     import idna as _idna
 except ImportError:                           # pragma: no cover — stdlib-only box
@@ -311,13 +334,19 @@ def _label_ok(lab):
         return False
     if any(ch in _HOST_FORBIDDEN for ch in lab):
         return False
+    # ⛔ A DOT-EQUIVALENT SPLITS ONE LABEL INTO TWO — see `_DOT_EQUIVALENT`. Checked on the NFKC form so
+    # it holds on a stdlib-only box (no `idna`) too, and so a future lookalike that normalises to `.` is
+    # caught by the same rule rather than by a growing blocklist of spellings.
+    if any(ch in _DOT_EQUIVALENT for ch in lab) or "." in unicodedata.normalize("NFKC", lab):
+        return False
     if lab.isascii() or _idna is None:
         return True
     try:
-        _idna.encode(lab, uts46=True)
+        encoded = _idna.encode(lab, uts46=True)
     except Exception:
         return False
-    return True
+    # Belt and braces: whatever the library maps to, a SINGLE label must encode to a SINGLE label.
+    return b"." not in encoded
 
 
 def authority_names_a_host(authority):

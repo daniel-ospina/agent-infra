@@ -9,7 +9,7 @@ aboutSubjects: organisation-design-team
 aboutObjects: agent-infra, issue-3275, issue-3256, issue-3289, issue-5153, pr-3374, mcp-client, pi-bootstrap, graph-mcp-provision
 ---
 
-<!-- research-path: none — in-repo references: `extensions/mcp-client/README.md` (header resolution), `pi-bootstrap/templates/.mcp.base.json`, `pi-bootstrap/cell-install.sh` LAYER VERIFIED block, `scripts/tortoise-graph.sh`, `scripts/tortoise_graph_client.py`, PR #3601 (tortoise: hosted entry), #3256 (fallback client), #3253 (first farm declaration). External rung: `web_fetch` on the MCP spec's `Authorization` transport section (HTTP headers are sent verbatim; a client performs NO shell expansion) — see `## External Research`. -->
+<!-- research-path: none — in-repo references: `extensions/mcp-client/README.md` (header resolution), `pi-bootstrap/templates/.mcp.base.json`, `pi-bootstrap/cell-install.sh` LAYER VERIFIED block, `scripts/tortoise-graph.sh`, `scripts/tortoise_graph_client.py`, PR #3601 (tortoise: hosted entry), #3256 (fallback client), #3253 (first farm declaration). External rung: `web_fetch` on the MCP spec's `Authorization` transport section plus `extensions/mcp-client/index.ts:819` (`expandEnvVars(config.headers)`) — the spec carries `headers` as request init and the CLIENT expands `${VAR}` (`expandExpr` yields the EMPTY STRING for an unset variable); the client adds no scheme, so the whole value is sent as-is AFTER expansion — see `## External Research`. -->
 
 # Hosted Tortoise MCP on every cell — implementation plan
 

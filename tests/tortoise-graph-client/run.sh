@@ -216,15 +216,28 @@ echo "== health and stats call the ADVERTISED handlers"
 mode ok
 call health
 name="$(last_call | cut -f1)"; args="$(last_call | cut -f2)"
-[ "$RC" -eq 0 ] && [ "$name" = "tortoise_overview" ] && [ "$args" = '{"section": "health"}' ] \
-  && pass "health calls tortoise_overview(section=\"health\") — tortoise_health is RETIRED (#3883)" \
-  || fail "health called '$name' $args (rc=$RC) — tortoise_health is retired; the advertised handler is tortoise_overview"
+[ "$RC" -eq 0 ] && [ "$name" = "tortoise_graph_overview" ] && [ "$args" = '{"section": "health"}' ] \
+  && pass "health calls tortoise_graph_overview(section=\"health\") — tortoise_health AND its tortoise_overview replacement are RETIRED (#3883)" \
+  || fail "health called '$name' $args (rc=$RC) — tortoise_health and tortoise_overview are both retired; the advertised handler is tortoise_graph_overview"
 mode ok
 call stats
 name="$(last_call | cut -f1)"; args="$(last_call | cut -f2)"
-[ "$RC" -eq 0 ] && [ "$name" = "tortoise_overview" ] && [ "$args" = '{"section": "pointkinds"}' ] \
-  && pass "stats calls tortoise_overview(section=\"pointkinds\") — tortoise_list_pointkinds is RETIRED" \
-  || fail "stats called '$name' $args (rc=$RC) — tortoise_list_pointkinds is retired"
+[ "$RC" -eq 0 ] && [ "$name" = "tortoise_graph_overview" ] && [ "$args" = '{"section": "pointkinds"}' ] \
+  && pass "stats calls tortoise_graph_overview(section=\"pointkinds\") — tortoise_list_pointkinds and tortoise_overview are RETIRED" \
+  || fail "stats called '$name' $args (rc=$RC) — tortoise_list_pointkinds and tortoise_overview are retired; the advertised handler is tortoise_graph_overview"
+# ⛔ SEARCH GOT NO PER-VERB ASSERTION AT ALL (#3374 review P2). health and stats each pinned their
+# handler AND arguments, but the client's most-used READ verb was covered only by the log-level
+# membership arm below — and that arm's non-vacuity guard accepts ANY non-empty call log. Measured: a
+# mutant making `search` return 0 without calling the server left the whole suite at `OK: 25 arms`,
+# exit 0, because `evidence`/`decision` still wrote 2 records. A verb may not be asserted only by a
+# neighbouring verb's traffic.
+mode ok
+call search 'attestation staleness'
+name="$(last_call | cut -f1)"; args="$(last_call | cut -f2)"
+[ "$RC" -eq 0 ] && [ "$name" = "tortoise_search" ] \
+  && case "$args" in *'attestation staleness'*) true ;; *) false ;; esac \
+  && pass "search calls tortoise_search with the query it was given (the graph mandate's most-used read verb)" \
+  || fail "search called '$name' $args (rc=$RC) — it must issue tortoise_search carrying the query"
 
 echo "== R5 as data: no verb calls a tool the surface does not advertise"
 mode ok

@@ -590,6 +590,7 @@ import ipaddress
 import json
 import re
 import sys
+import unicodedata
 
 p = sys.argv[1]
 # ⛔ THE TEMPLATE READ WAS THE ONE REMAINING RAW TRACEBACK ON THE VERIFY SIDE (#3374 review P3).
@@ -909,6 +910,15 @@ def _port_ok(port):
 # `SELFHOSTED:` rc=0 (#3374 review, round 2 P3). `merge-mcp.py` carries the SAME helpers.
 _HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
 
+# ⛔ DOT-EQUIVALENT CODE POINTS SPLIT ONE LABEL INTO TWO (#3374 review, round 13 P1). `new URL` applies
+# UTS46, which maps U+3002/U+FF0E/U+FF61/U+FE52/U+2024 to `.`, so
+# `https://api.premiselabs.co。evil.example/mcp/` resolves in the CLIENT to
+# `api.premiselabs.co.evil.example` — an attacker's host — while this predicate read it as one harmless
+# label and printed `SELFHOSTED:` rc=0 with `Bearer ${TORTOISE_MCP_API_KEY}` still attached. Checked on
+# the NFKC form and BEFORE the idna branch: a box with no `idna` accepts every non-ASCII label, so an
+# idna-only guard would leave it open. `merge-mcp.py` carries the SAME rule.
+_DOT_EQUIVALENT = "\u3002\uff0e\uff61\ufe52\u2024"
+
 try:                                          # IDNA2008/UTS46 — the standard the client applies
     import idna as _idna
 except ImportError:                           # pragma: no cover — stdlib-only box
@@ -920,13 +930,15 @@ def _label_ok(lab):
         return False
     if any(ch in _HOST_FORBIDDEN for ch in lab):
         return False
+    if any(ch in _DOT_EQUIVALENT for ch in lab) or "." in unicodedata.normalize("NFKC", lab):
+        return False
     if lab.isascii() or _idna is None:
         return True
     try:
-        _idna.encode(lab, uts46=True)
+        encoded = _idna.encode(lab, uts46=True)
     except Exception:
         return False
-    return True
+    return b"." not in encoded
 
 
 def authority_names_a_host(authority):
@@ -953,9 +965,10 @@ def authority_names_a_host(authority):
         return False
     labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
     return all(_label_ok(lab) for lab in labels)
-# ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client sends headers VERBATIM
-# (extensions/mcp-client/index.ts:819-821), so `Authorization: ${TORTOISE_MCP_API_KEY}` (no scheme) is
-# delivered as `Authorization: tt_…` and the server answers 401 — yet it contains "${" and used to
+# ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client DOES expand `${VAR}`
+# (extensions/mcp-client/index.ts:819-821) and then sends the value as-is — it adds no scheme — so
+# `Authorization: ${TORTOISE_MCP_API_KEY}` (no scheme) is delivered as `Authorization: tt_…` and the
+# server answers 401, yet it contains "${" and used to
 # be certified. Nor is any variable acceptable: the resolver reads TORTOISE_MCP_API_KEY (and the
 # LEGACY alias TORTOISE_API_KEY), so an entry naming a third variable would expand to the EMPTY STRING
 # while `LAYER VERIFIED` printed a green credential line beside it. Both names are allowed, nothing
@@ -1243,7 +1256,7 @@ PY
       LITERAL_AUTH*)
         fail ".mcp.json's tortoise entry carries a LITERAL bearer token instead of \${TORTOISE_MCP_API_KEY} — the shared file is the leak" ;;
       WRONG_AUTH:*)
-        fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_MCP_API_KEY}' (or the legacy 'Bearer \${TORTOISE_API_KEY}') — the client sends headers VERBATIM, so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
+        fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_MCP_API_KEY}' (or the legacy 'Bearer \${TORTOISE_API_KEY}') — the client expands the variable and sends the value as-is (it adds no scheme), so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
       INSECURE_URL:*)
         fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) is CLEARTEXT (non-https) and not loopback, in one of two shapes and both refused: it carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED — or it names the HOSTED host, which is https-only whether or not a credential is attached, so the cell would be certified over an endpoint that cannot answer. Use https, or point at your own local daemon (a self-host needs no key)" ;;
       BADDERS:*)
