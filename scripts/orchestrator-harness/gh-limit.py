@@ -1195,7 +1195,23 @@ def cred_kind(argv):
     if not argv:
         return "unproven"
     if argv[0] == "api":
-        return "write" if api_is_mutating(argv) else "read"
+        if api_is_mutating(argv):
+            return "write"             # a non-GET method, or data on a REST call: PROVEN a write
+        # ⛔ AND GRAPHQL IS NOT DECIDED BY `api_is_mutating`. That predicate returns FALSE for EVERY
+        # `gh api graphql` call — deliberately, and it says so: for PACING the cheap direction is to
+        # treat a GraphQL payload as a read (a false mutation costs a 1 s gap). Served a CREDENTIAL
+        # that reasoning inverts, exactly as it does under coalescing: `-f query='mutation{…}'`
+        # classified as a read and was handed to the read-only installation token. Found in review
+        # cycle 2, reproduced end-to-end (`SERVED_BY=tok-app`) for `mutation{…}`, for a multi-operation
+        # document selected by `operationName`, and for `-F query=@file`.
+        # The fail-closed answer already existed one function away, for precisely this reason
+        # (`_graphql_query_is_read`, which `flight_eligible` already consults), so the classifier
+        # asks THAT instead of re-deriving it — one predicate, one answer.
+        if _graphql_query_is_read(argv):
+            return "read"              # a payload we can PROVE is a query
+        if any(a == "graphql" or a.startswith("graphql=") for a in argv[1:2]):
+            return "unproven"          # `api graphql` we cannot prove is a query
+        return "read"                  # a plain REST GET: no method flag, no data
     if argv[0] in READ_BARE:
         return "read"
     if len(argv) >= 2 and (argv[0], argv[1]) in READ_SUBCOMMANDS:
@@ -1282,6 +1298,15 @@ def run(real_gh, argv, extra=None, timeout=None):
     env = dict(os.environ)
     env[REENTRANCY_ENV] = "1"       # a gh child that re-enters this helper must not deadlock on our lock
     cred = credential_for(list(argv))
+    # ⛔ THE CLASS THE CACHE WRITERS STAMP IS SET PER CALL, and it must be set HERE — not only in
+    # `main()`. `run()` can be called more than once per process (the dispatch retry loop calls it per
+    # attempt) and the fallback below mutates it, so leaving it on the previous call's value meant a
+    # LATER app-served call wrote its bytes into the shared caches stamped `cred: user` — a narrower
+    # app-side answer replayed as a HIT with rc 0 to user-credentialed callers, i.e. T3 failing in the
+    # reverse direction (found in review cycle 2). All four writers (`cache_put`, `read_cache_put`,
+    # `pass_cache_put`, `flight_publish`) run AFTER `run()` returns, so this is what they read.
+    global _CRED_CLASS
+    _CRED_CLASS = "app" if cred.credential == "app" else "user"
     if cred.token:
         # The app token is injected into the CHILD's env only. `os.environ` is left alone on purpose:
         # `_cred_digest()` and any nested child see the box's own credential, so the identity of the
@@ -1315,9 +1340,7 @@ def run(real_gh, argv, extra=None, timeout=None):
         # cache writers stamp must say so. It did not, and the result was the one case where the two
         # credentials PROVABLY differ in visibility (the app was refused, the user could see it) being
         # cached as `cred: app` and replayed to app-served callers — threat T3 defeated on the exact
-        # path it exists for (found in review). The writers all run AFTER `run()` returns, so setting
-        # the module global here is what they read.
-        global _CRED_CLASS
+        # path it exists for (found in review cycle 1). The writers all run AFTER `run()` returns.
         _CRED_CLASS = "user"
         retry_env = dict(os.environ)
         retry_env[REENTRANCY_ENV] = "1"

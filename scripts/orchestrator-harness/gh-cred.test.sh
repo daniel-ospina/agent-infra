@@ -326,6 +326,21 @@ ck "a PROVEN write (api -X POST) keeps the user credential" \
    "$([ "$(viah api -X POST repos/o/r/issues/1/comments -f body=x | cut -d' ' -f1)" = "$AMB|write" ] && echo 0 || echo 1)"
 ck "a PROVEN read (api GET) is served by the app — the allow-list is not so narrow it kills the fix" \
    "$([ "$(viah api repos/o/r/pulls/1 | cut -d' ' -f1)" = "tok-1|app" ] && echo 0 || echo 1)"
+
+# ⛔ GRAPHQL IS NOT DECIDED BY `api_is_mutating`, WHICH RETURNS False FOR EVERY `api graphql` CALL.
+# Found in review cycle 2, reproduced end-to-end: a GraphQL MUTATION was served by the installation
+# token through three different shapes. The fail-closed predicate already existed one function away
+# (`_graphql_query_is_read`), so these rows pin that the classifier asks it.
+ck "a GraphQL MUTATION keeps the user credential" \
+   "$([ "$(viah api graphql -f 'query=mutation{addComment(input:{body:\"x\"}){clientMutationId}}' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "a GraphQL SUBSCRIPTION keeps the user credential" \
+   "$([ "$(viah api graphql -f 'query=subscription{onEvent}' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "a multi-operation document selected by operationName keeps the user credential" \
+   "$([ "$(viah api graphql -f operationName=M -f 'query=query Foo{a} mutation M{b}' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "a payload we cannot read (-F query=@file) keeps the user credential" \
+   "$([ "$(viah api graphql -F 'query=@/tmp/nope.graphql' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "a PROVEN GraphQL QUERY is still served by the app (the guard is not a blanket refusal)" \
+   "$([ "$(viah api graphql -f 'query=query{viewer{login}}' | cut -d' ' -f1)" = "tok-1|app" ] && echo 0 || echo 1)"
 ck "a WRITE through the layer keeps the USER credential" \
    "$([ "$(viah pr merge 7 --squash | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
 ck "the METER through the layer keeps the USER credential" \
@@ -417,6 +432,32 @@ GH_LIMIT_DIR="$TMP/lenv" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE=0 GH_LIMIT_CO
 _envline="$(grep '^TOK=' "$GH_CRED_TEST_LOG" | tail -1)"
 ck "the app token is set for ALL four credential names (enterprise hosts read the pair, not GH_TOKEN)" \
    "$(printf '%s' "$_envline" | grep -q '^TOK=tok-.*ENT=tok-.*ENT2=tok-' && echo 0 || echo 1)"
+
+# ⛔ THE CLASS IS SET PER CALL, NOT ONCE PER PROCESS. `run()` can be called more than once in one
+# process (the dispatch retry loop calls it per attempt) and the fallback mutates the global, so a
+# LATER app-served call was writing its bytes stamped `cred: user` — a narrower app-side answer
+# replayed as a HIT with rc 0 to user-credentialed callers, i.e. T3 failing in the reverse direction
+# (found in review cycle 2). This pins the invariant directly: after an APP-served call, whatever the
+# global said before, it says `app`.
+cat >"$TMP/classprobe.py" <<'CP'
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("gh_limit", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+class D(object):
+    arm = "app"
+    credential = "app"
+    token = "tok-seeded"
+
+# Seed the per-(kind,purpose) decision cache so no mint and no helper is needed.
+m._CRED_CACHE[("read", "request")] = D()
+m._CRED_CLASS = "user"                      # the state a previous fallback leaves behind
+m.run(sys.argv[2], ["pr", "view", "1"])
+sys.stdout.write(m._CRED_CLASS)
+CP
+ck "after an APP-served call the stamped class is 'app' even if a previous call left it 'user'" \
+   "$([ "$(python3 "$TMP/classprobe.py" "$LIMIT" "$TMP/stub-gh" 2>/dev/null)" = app ] && echo 0 || echo 1)"
 
 # ⛔ NON-VACUITY: with the fallback predicate removed, the SAME read must FAIL. If this row passed
 # with the predicate gone, the three assertions above would be proven by nothing.
