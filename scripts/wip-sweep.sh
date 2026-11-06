@@ -166,6 +166,66 @@ cleanup_all() {
 }
 trap cleanup_all EXIT
 
+# The state dir must be resolved before ANYTHING writes to it: the pass-start marker now comes
+# BEFORE the bounded-lib refusal and the bound validations, because a refused pass must still be
+# visible to `--print-status` (its whole point). So this assignment precedes all three, and the
+# `--print-status` branch below reads the same values.
+STATE_DIR="${WIP_SWEEP_STATE_DIR:-${O:-${HOME:-/tmp}/orchestrator}/state}"
+RECORD="${WIP_SWEEP_RECORD:-$STATE_DIR/wip-sweep.tsv}"
+STATUS_FILE="${WIP_SWEEP_STATUS_FILE:-$STATE_DIR/wip-sweep.status}"
+
+MODE_WORD=dry-run
+[ "$DRY_RUN" -eq 0 ] && MODE_WORD=apply
+T0="$SECONDS"
+TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+NOW_S="$(date -u '+%s')"
+# ⛔ THE MARKER IS WRITTEN BEFORE EVERY REFUSAL THAT CAN FOLLOW, not just before the work
+# (review finding). It used to sit after the rescue / repo resolution, so a pass that REFUSED AT
+# STARTUP — a missing rescuer, no repo to scan — exited 3 having written nothing, and the PREVIOUS
+# pass's `status=ok` stayed in place and stayed fresh. Measured: a good pass, then uncommitted work
+# plus `WIP_SWEEP_RESCUE=/nonexistent` -> the sweep exits 3 and `--print-status` answers
+# `rc=0 status=ok`, i.e. a box being swept nowhere reads as swept WITH the work present on it.
+# So the state dir is created and marked here, BEFORE the delegate/repo refusals; a usage error
+# (exit 2) still comes earlier and deliberately does not touch the record, because a mistyped
+# argument is not a pass.
+# ⛔ AND NOT ON A READ (review of this restructure). `--print-status` is a READER: it exits inside its own
+# branch below, so the prologue must not run for it — the first cut of this move overwrote the very record
+# the reader had been asked about with `status=running`, so every `--print-status` answered `failed`/3
+# about itself. The guard is on MODE, not on a flag, so there is nothing to keep in sync.
+if [ "$MODE" != status ]; then
+mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR — REFUSING (a pass with no record has no alarm channel)"; exit 3; }
+# ⛔ A PASS IN FLIGHT SAYS SO, AND THAT IS THE WHOLE POINT OF THIS WRITE (review finding P1).
+# The record used to be written ONLY at the end. So a pass that crashed, was OOM-killed, was cut off by
+# a quiesce, or could not write its record at the end left the PREVIOUS pass's `status=ok` standing —
+# fresh, on the surface the doc nominates for a fleet instrument, for up to WIP_SWEEP_STALE_SECONDS. A
+# box being swept nowhere read as swept. Measured: an unwritable state dir with one prior good pass
+# exited 3 and `--print-status` still answered `rc=0 status=ok`.
+# Now the record is overwritten with `status=running` BEFORE any worktree is touched, and the verdict
+# write replaces it at the end. `--print-status`'s allow-list already maps an unnamed status to exit 3,
+# so an interrupted pass answers `failed` instead of `ok` — the same polarity `disk-reaper.sh` gets from
+# the scheduler's own exit status, held here without a scheduler.
+# ⛔ THE LIMIT, STATED: a state dir that is unwritable at BOTH ends cannot be marked at all — the old
+# record then stands, and the pass can only be loud on stderr and non-zero in its exit code. That is a
+# host problem to fix, and the READER cannot see it; it is not claimed away.
+if REC_TMP="$(mktemp "$STATE_DIR/.wip-sweep-status.XXXXXX" 2>/dev/null)"; then
+  {
+    printf 'status=running\n'
+    printf 'rc=?\n'
+    printf 'ts=%s\n' "$NOW_S"
+    printf 'mode=%s\n' "$MODE_WORD"
+    printf 'detail=pass started, no verdict recorded yet\n'
+  } > "$REC_TMP" 2>/dev/null && mv -f "$REC_TMP" "$STATUS_FILE" 2>/dev/null \
+    || { err "cannot write the pass-start marker $STATUS_FILE — an interrupted pass will NOT be distinguishable from the last good one"; }
+  REC_TMP=""
+else
+  err "cannot create a temp file in $STATE_DIR — a pass that dies will NOT be distinguishable from the last good one"
+fi
+# These two are needed by the sweep loop only, but they live here so the whole "this pass
+# started" prologue is in one place.
+ERRF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-err.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
+LISTF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-list.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
+fi
+
 # ── the bounded-execution helper — REFUSED when missing, never a silent different file ───────────
 # Every subprocess below is bounded: `git status` on a 179 GB worktree and a `git push` to a remote
 # that has stopped answering are both unbounded by nature, and this pass is what a cell quiesce calls
@@ -201,16 +261,18 @@ need_pos_int WIP_SWEEP_RESCUE_TIMEOUT  "$RESCUE_TIMEOUT"
 need_pos_int WIP_SWEEP_STALE_SECONDS   "$STALE_SECONDS"
 need_int WIP_SWEEP_MAX             "$MAX"
 
-STATE_DIR="${WIP_SWEEP_STATE_DIR:-${O:-${HOME:-/tmp}/orchestrator}/state}"
-RECORD="${WIP_SWEEP_RECORD:-$STATE_DIR/wip-sweep.tsv}"
-STATUS_FILE="${WIP_SWEEP_STATUS_FILE:-$STATE_DIR/wip-sweep.status}"
+
 
 # ── --print-status: answer "did the last pass run, and what did it find" from the RECORD alone ────
 # Same polarity as `disk-reaper.sh --print-status`: `never` and `stale` are NOT success, because a
 # sweeper that has not run is a box whose WIP is on the disk and nowhere else.
 if [ "$MODE" = status ]; then
   if [ ! -f "$STATUS_FILE" ]; then
+    # rc= IS PART OF THE DOCUMENTED SURFACE TOO (review finding). A consumer keyed on the derived
+    # `rc=` — the reader shape I7c exists for — found NO value at all on a never-run box (a fresh cell,
+    # a rotated state dir) and fell back to its own default instead of a value this tool derived.
     echo "status=never"
+    echo "rc=3"
     echo "detail=no pass record at $STATUS_FILE"
     exit 3
   fi
@@ -280,51 +342,6 @@ if [ "$MODE" = status ]; then
   esac
 fi
 
-MODE_WORD=dry-run
-[ "$DRY_RUN" -eq 0 ] && MODE_WORD=apply
-T0="$SECONDS"
-TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-NOW_S="$(date -u '+%s')"
-# ⛔ THE MARKER IS WRITTEN BEFORE EVERY REFUSAL THAT CAN FOLLOW, not just before the work
-# (review finding). It used to sit after the rescue / repo resolution, so a pass that REFUSED AT
-# STARTUP — a missing rescuer, no repo to scan — exited 3 having written nothing, and the PREVIOUS
-# pass's `status=ok` stayed in place and stayed fresh. Measured: a good pass, then uncommitted work
-# plus `WIP_SWEEP_RESCUE=/nonexistent` -> the sweep exits 3 and `--print-status` answers
-# `rc=0 status=ok`, i.e. a box being swept nowhere reads as swept WITH the work present on it.
-# So the state dir is created and marked here, BEFORE the delegate/repo refusals; a usage error
-# (exit 2) still comes earlier and deliberately does not touch the record, because a mistyped
-# argument is not a pass.
-mkdir -p "$STATE_DIR" 2>/dev/null || { err "cannot create the state dir $STATE_DIR — REFUSING (a pass with no record has no alarm channel)"; exit 3; }
-# ⛔ A PASS IN FLIGHT SAYS SO, AND THAT IS THE WHOLE POINT OF THIS WRITE (review finding P1).
-# The record used to be written ONLY at the end. So a pass that crashed, was OOM-killed, was cut off by
-# a quiesce, or could not write its record at the end left the PREVIOUS pass's `status=ok` standing —
-# fresh, on the surface the doc nominates for a fleet instrument, for up to WIP_SWEEP_STALE_SECONDS. A
-# box being swept nowhere read as swept. Measured: an unwritable state dir with one prior good pass
-# exited 3 and `--print-status` still answered `rc=0 status=ok`.
-# Now the record is overwritten with `status=running` BEFORE any worktree is touched, and the verdict
-# write replaces it at the end. `--print-status`'s allow-list already maps an unnamed status to exit 3,
-# so an interrupted pass answers `failed` instead of `ok` — the same polarity `disk-reaper.sh` gets from
-# the scheduler's own exit status, held here without a scheduler.
-# ⛔ THE LIMIT, STATED: a state dir that is unwritable at BOTH ends cannot be marked at all — the old
-# record then stands, and the pass can only be loud on stderr and non-zero in its exit code. That is a
-# host problem to fix, and the READER cannot see it; it is not claimed away.
-if REC_TMP="$(mktemp "$STATE_DIR/.wip-sweep-status.XXXXXX" 2>/dev/null)"; then
-  {
-    printf 'status=running\n'
-    printf 'rc=?\n'
-    printf 'ts=%s\n' "$NOW_S"
-    printf 'mode=%s\n' "$MODE_WORD"
-    printf 'detail=pass started, no verdict recorded yet\n'
-  } > "$REC_TMP" 2>/dev/null && mv -f "$REC_TMP" "$STATUS_FILE" 2>/dev/null \
-    || { err "cannot write the pass-start marker $STATUS_FILE — an interrupted pass will NOT be distinguishable from the last good one"; }
-  REC_TMP=""
-else
-  err "cannot create a temp file in $STATE_DIR — a pass that dies will NOT be distinguishable from the last good one"
-fi
-# These two are needed by the sweep loop only, but they live here so the whole "this pass
-# started" prologue is in one place.
-ERRF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-err.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
-LISTF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-list.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
 
 # ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
 RESCUE="${WIP_SWEEP_RESCUE:-}"
@@ -417,6 +434,24 @@ budget_exhausted() {
   [ $((SECONDS - T0)) -ge "$BUDGET" ]
 }
 
+# cap_timeout <bound> — min(<bound>, the pass budget's REMAINING seconds).
+# ⛔ THE BUDGET BOUNDS THE PASS, NOT JUST THE POINT BETWEEN TWO EXAMINATIONS (review finding). The budget
+# was tested at porcelain-record boundaries only, so the worst case was `WIP_SWEEP_BUDGET + one
+# examination` — up to `RESCUE_TIMEOUT + 4 x STATUS_TIMEOUT` (540 s with the defaults), and the reviewer
+# measured a 4 s pass on `WIP_SWEEP_BUDGET=1` whose deferred row appeared only after the rescue had run to
+# completion. That matters because the caller is a quiesce whose own reclaim timeout the operator sizes
+# against the documented bound: a rescue cut off mid-PUSH loses the very work the rescue exists to move.
+# So every bounded call inside an examination is clamped to what is left of the budget. `0` (no budget)
+# leaves the caller's own bound alone.
+cap_timeout() {
+  local b="$1" left
+  [ "$BUDGET" -gt 0 ] 2>/dev/null || { printf '%s' "$b"; return 0; }
+  left=$(( BUDGET - (SECONDS - T0) ))
+  [ "$left" -lt 1 ] && left=1
+  case "$b" in ''|*[!0-9]*) b=0 ;; esac
+  if [ "$b" -gt 0 ] && [ "$b" -lt "$left" ]; then printf '%s' "$b"; else printf '%s' "$left"; fi
+}
+
 # ── examine <repo> <path> <head> <branch-ref> <bare> <prunable> ───────────────────────────────────
 # One worktree. Everything it decides is recorded, including the reasons it decided nothing.
 examine() {
@@ -460,12 +495,28 @@ examine() {
     return 0
   fi
 
-  vout="$(tb_timeout "$STATUS_TIMEOUT" bash -- "$RESCUE" --verdict "$path" 2>"$ERRF")"
+  vout="$(tb_timeout "$(cap_timeout "$STATUS_TIMEOUT")" bash -- "$RESCUE" --verdict "$path" 2>"$ERRF")"
   vrc=$?
   verdict="$(printf '%s\n' "$vout" | sed -n 's/^verdict=\([a-z-][a-z-]*\).*$/\1/p')"
   paths="$(printf '%s\n' "$vout" | sed -n 's/.* paths=\([0-9][0-9]*\).*$/\1/p')"
   br="$(printf '%s\n' "$vout" | sed -n 's/.* branch=\([^ ]*\).*$/\1/p')"
   slug="$(printf '%s\n' "$vout" | sed -n 's/.* slug=\([^ ]*\).*$/\1/p')"
+
+  # ⛔ A VERDICT CUT OFF BY OUR OWN BUDGET IS A DEFERRAL, NOT UNMEASURED (review finding, and the same rule
+  # the rescue now follows). With every call clamped to the remaining budget, running out of pass budget
+  # surfaces on the CLASSIFY call first — as tb_timeout's 124 — and counting that as `cannot-verify` turned
+  # a "no time" into a FAILED pass (measured: `WIP_SWEEP_BUDGET=1` exited 3 where the documented answer is
+  # `incomplete`/1). A 124/137 that coincides with an exhausted budget is `unreached`, not unknown.
+  if { [ "$vrc" -eq 124 ] || [ "$vrc" -eq 137 ]; } && budget_exhausted; then
+    # STOP_EXAMINE too: the budget is spent, so there is no point classifying the rest — they are
+    # `unreached` by the flush path rather than by a call that would also time out.
+    BUDGET_STOPPED=1; STOP_EXAMINE=1
+    # `record` takes <branch> <head>; forget the normalisation and the head lands in the branch column.
+    record "$repo" "$path" "${bref#refs/heads/}" "$head" "unreached" "-" "-" "-" "-" "deferred-pass-budget"
+    N_DEFERRED=$((N_DEFERRED + 1))
+    err "DEFERRED — the pass budget ended before $path could be classified (bg-rescue-wip --verdict exit $vrc). Not a failure: this worktree never got its turn."
+    return 0
+  fi
 
   # ⛔ THE EXIT CODE AND THE WORD MUST AGREE. The classifier's contract is 0/1/2 = clean/dirty/
   # cannot-verify; a 124 (its status timed out), a 127 (the delegate is gone) or a word/exit mismatch
@@ -497,13 +548,13 @@ examine() {
   # claimed exit 0 = "nothing left at risk" over a worktree whose only copy of three commits was that
   # disk — which on the quiesce path is the same total loss, one state over. It is counted and printed
   # here, and named in the doc's "not covered" list; archiving it is a separate capability.
-  unpushed="$(tb_timeout "$STATUS_TIMEOUT" git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null)"
+  unpushed="$(tb_timeout "$(cap_timeout "$STATUS_TIMEOUT")" git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null)"
   case "${unpushed:-}" in
     ''|*[!0-9]*) unpushed="?" ;;
     *) if [ "$unpushed" -gt 0 ]; then N_UNPUSHED=$((N_UNPUSHED + 1)); err "COMMITS ONLY ON THIS DISK — $path is on '$br' with $unpushed commit(s) that no remote has. bg-rescue-wip archives UNCOMMITTED work only, so this pass does NOT save them."; fi ;;
   esac
 
-  ct="$(tb_timeout "$STATUS_TIMEOUT" git -C "$path" log -1 --format=%ct HEAD 2>/dev/null)"
+  ct="$(tb_timeout "$(cap_timeout "$STATUS_TIMEOUT")" git -C "$path" log -1 --format=%ct HEAD 2>/dev/null)"
   case "${ct:-}" in
     ''|*[!0-9]*) age="?" ;;
     *) age=$(( (NOW_S - ct) / 3600 )) ;;
@@ -540,7 +591,7 @@ examine() {
   fi
 
   # The rescue's note travels into the archive commit message, so the next actor sees WHY it exists.
-  vout="$(tb_timeout "$RESCUE_TIMEOUT" bash -- "$RESCUE" "$path" "wip-sweep: uncommitted work archived without a lane ending (agent-infra#3485)" 2>&1)"
+  vout="$(tb_timeout "$(cap_timeout "$RESCUE_TIMEOUT")" bash -- "$RESCUE" "$path" "wip-sweep: uncommitted work archived without a lane ending (agent-infra#3485)" 2>&1)"
   vrc=$?
   if [ "$vrc" -eq 0 ]; then
     # ⛔ EXIT 0 IS AMBIGUOUS, SO IT IS NOT THE EVIDENCE (review round 1, finding F3). The rescue exits 0
@@ -561,7 +612,7 @@ examine() {
     # Bounded, and the THREE verdicts are kept apart. `--exit-code` is what makes "no matching ref" a
     # distinct 2 instead of an empty success; any other non-zero (a network failure, a timeout) is
     # "could not read", which is NOT "not archived" and NOT "archived".
-    tb_timeout "$STATUS_TIMEOUT" git -C "$path" ls-remote --exit-code origin "$ref" >/dev/null 2>&1
+    tb_timeout "$(cap_timeout "$STATUS_TIMEOUT")" git -C "$path" ls-remote --exit-code origin "$ref" >/dev/null 2>&1
     case "$?" in
       0)
         N_ARCHIVED=$((N_ARCHIVED + 1))
@@ -578,6 +629,19 @@ examine() {
         record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "$ref" "archive-ref-unverifiable" "${unpushed:-?}"
         err "the rescue exited 0 for $path and named $ref, but origin could not be read back to confirm it — this is UNVERIFIED, not archived." ;;
     esac
+    return 0
+  fi
+
+  # ⛔ A RESCUE CUT OFF BY OUR OWN BUDGET IS A DEFERRAL, NOT A FAILURE (review finding). With the bounds
+  # above clamped to the remaining budget, running out of pass budget now surfaces as tb_timeout's 124 —
+  # and counting that as `rescue-exit-124` would report a rescue FAILURE for work this pass simply never
+  # got to. It is deferred, named as deferred, and the pass is INCOMPLETE (exit 1), which is the honest
+  # word for "there was no time", not "the archive broke".
+  if [ "$vrc" -eq 124 ] || [ "$vrc" -eq 137 ]; then
+    BUDGET_STOPPED=1
+    record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-pass-budget" "${unpushed:-?}"
+    N_DEFERRED=$((N_DEFERRED + 1))
+    err "DEFERRED — the pass budget ended before $path could be archived (exit $vrc). Not a failure: this worktree never got its turn."
     return 0
   fi
 

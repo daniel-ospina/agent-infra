@@ -254,10 +254,12 @@ grep -q 'budget_stopped=yes' "$T/state-bud/wip-sweep.status" 2>/dev/null \
 # EXACTLY one per un-reached worktree: `-ge 2` would also pass a regression that wrote the same row
 # twice (a flush at the record boundary AND at EOF), which is the duplicate this whole parser shape can
 # produce.
+# The fixture has THREE worktrees and the stub's `--verdict` alone outlasts `WIP_SWEEP_BUDGET=1`, so the
+# very first classification is the one the budget cuts off: every record is `unreached`, hence exactly 3.
 NUR="$(awk -F'\t' '$6 == "unreached" {c++} END {print c+0}' "$T/state-bud/wip-sweep.tsv" 2>/dev/null)"
-[ "${NUR:-0}" -eq 2 ] \
-  && ok "C5c exactly one unreached row per skipped worktree (${NUR:-0} of 2, counted in column 6)" \
-  || bad "C5c ${NUR:-0} unreached row(s) for 2 un-reached worktrees (want exactly 2)"
+[ "${NUR:-0}" -eq 3 ] \
+  && ok "C5c exactly one unreached row per worktree the budget cut off (${NUR:-0} of 3, counted in column 6)" \
+  || bad "C5c ${NUR:-0} unreached row(s) for 3 worktrees (want exactly 3)"
 # and the columns are not transposed: 4 is `branch`, 5 is `head`
 URBAD="$(awk -F'\t' '$6 == "unreached" && ($4 !~ /^fix\// || $5 !~ /^[0-9a-f]+$/) {print; exit}' "$T/state-bud/wip-sweep.tsv" 2>/dev/null)"
 [ -z "$URBAD" ] \

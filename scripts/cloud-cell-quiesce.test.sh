@@ -45,6 +45,31 @@ echo "==> cloud-cell-quiesce WIP hook ($HERE)"
 echo "    scratch: $T"
 HAS_PROC=0; [ -d /proc ] && [ -r "/proc/$$/environ" ] && HAS_PROC=1
 
+# ⛔ REFUSE TO RUN UNLESS THE STUBS ARE REALLY ON PATH (review finding, and it is a SAFETY gate, not
+# tidiness). A stub that exists but is not EXECUTABLE is SKIPPED by bash's PATH search, so the REAL
+# `tmux`/`pkill`/`ps` further down PATH runs instead — and this suite exercises `tmux kill-server` and
+# `pkill -f '[o]rch-loop\.sh'`. A `noexec` /tmp (common on hardened images) reproduces that with every
+# `chmod` still returning 0. So the preflight resolves each stub the way the SUT will and refuses to run a
+# single arm if any of them lands outside the scratch bin dir.
+PREFLIGHT_OK=1
+PREBIN="$(mktemp -d "${TMPDIR:-/tmp}/quiesce-bin.XXXXXX")" || PREFLIGHT_OK=0
+printf '#!/usr/bin/env bash\nexit 0\n' > "$PREBIN/probe" && chmod +x "$PREBIN/probe"
+for _tool in tmux pkill ps pgrep; do
+  printf '#!/usr/bin/env bash\nexit 0\n' > "$PREBIN/$_tool" && chmod +x "$PREBIN/$_tool" 2>/dev/null \
+    || PREFLIGHT_OK=0
+  _r="$(PATH="$PREBIN:$PATH" command -v "$_tool" 2>/dev/null)"
+  [ "$_r" = "$PREBIN/$_tool" ] || PREFLIGHT_OK=0
+done
+rm -rf "$PREBIN"
+if [ "$PREFLIGHT_OK" -ne 1 ]; then
+  echo "  ⛔ REFUSING TO RUN: a stub in ${TMPDIR:-/tmp} is not executable or does not win the PATH lookup,"
+  echo "     so the REAL tmux/pkill/ps would run against this host. This suite kills processes; it will not"
+  echo "     run where it cannot prove its stubs are the ones resolved. Re-run with TMPDIR set to an"
+  echo "     executable location (a noexec /tmp is the usual cause)."
+  echo "  PASS=0 FAIL=0 SKIP=0 (refused — nothing was run, and nothing on this host was touched)"
+  exit 0
+fi
+
 # mk_world <name> — a REPO with the stub supervisor + sweep, a HARNESS with claims.sh, a log.
 mk_world() {
   local n="$1" d="$T/$1"
@@ -142,6 +167,14 @@ esac
 case "$SWLINE" in
   *"--repo $D/repo"*) ok "A3 it names --repo \"\$REPO\" explicitly (no ambient repo selection)" ;;
   *) bad "A3 the sweep was not given the intended --repo: $SWLINE" ;;
+esac
+# ⛔ AND NO PER-PASS CAP ON THIS PATH (review finding). The sweep's default cap is 25 archives; here the
+# disk is about to stop existing and nothing re-runs the pass, so a cap is a silent PARTIAL archive — on a
+# cell with 40 dirty lane trees, 25 archived and 15 deferred, and the box handed on anyway. Only this
+# caller passes `--max 0`; a periodic pass keeps its cap.
+case "$SWLINE" in
+  *"--max 0"*) ok "A4 it disables the per-pass cap (--max 0) — this pass never gets a second run" ;;
+  *) bad "A4 the quiesce leaves the sweep's 25-archive cap in place, so a busy cell archives partially: $SWLINE" ;;
 esac
 # ORDER, read from the event log: kill sweep -> wip sweep -> controller start.
 KILL_AT="$(grep -n 'tmux:kill-server\|^pkill:' "$D/events" | head -1 | cut -d: -f1)"
