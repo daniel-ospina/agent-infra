@@ -83,8 +83,9 @@ CMUX_LOG="$T/cmux.log"
 #                  lists a run's jobs in creation order and defaults to 30 per page, so on a big
 #                  matrix run the jobs still queued are exactly the ones past page 1; a reader that
 #                  stops at page 1 sees "no queued job" on a run that has one (#2344 review P1).
-#   GH_MODE        queued-null | queued-empty | queued-twofield | queued-countonly | inprog-null |
-#                  inprog-fail | oldest-junk | enum-fail | enum-garbage | enum-badtab | ok
+#   GH_MODE        queued-null | queued-empty | queued-twofield | queued-threefield |
+#                  queued-countonly | inprog-null | inprog-fail | oldest-junk | enum-fail |
+#                  enum-garbage | enum-badtab | ok
 #   GH_FALLBACK_N  per-page count of fallback-labelled runners (current_mode → github|local)
 #   GH_POOL_IDS    the ids the enumeration returns (default ARM64 pool members, see below)
 #   GH_RUNNER_ROWS_FILE  a file of `<id>TAB<label>` rows — the REAL enumeration shape, used by the
@@ -394,6 +395,10 @@ case "$*" in
       # A body carrying only the count and the oldest timestamp: no run id, no row order. This is the
       # "two-field body" the gate's own comment promises still parses (#2344 review cycle 3).
       queued-twofield) printf '%s\t%s\n' "${GH_QUEUED:-5}" "$(queue_oldest_at)" ;;
+      # A body carrying the count, the oldest timestamp and a head run id, but NOT the row order: the
+      # scan still has one run it can name, so it runs on that single candidate instead of dropping to
+      # the run-level age.
+      queued-threefield) printf '%s\t%s\t%s\t\n' "${GH_QUEUED:-5}" "$(queue_oldest_at)" "${GH_HEAD_RUN_ID-4001}" ;;
       # A body carrying the count and NOTHING else: no id, no timestamp — unidentifiable, not degraded.
       queued-countonly) printf '%s\n' "${GH_QUEUED:-5}" ;;
       # The unparseable head stamp must be unparseable WHERE THE GATE NOW READS IT — the row the scan
@@ -1005,6 +1010,14 @@ assert_not_contains "$OUT" "queue < 10" "…and never claims a raw-depth bound i
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "queued=10" "the verdict file still publishes the RAW depth (a queue-depth consumer wants that)"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand_runs=7 < 10" "…and the reason beside it quotes the demanding count"
 assert_eq "$(grep -o 'queued=[0-9]*' "$STATE_DIR/ci-runner-gate.verdict" | wc -l | tr -d ' ')" "1" "exactly ONE queued= value on the line, so a key=value reader cannot see two numbers"
+# ⛔ THE SAME INVARIANT ON A DENY LINE (cycle-5 review, finding 2). The length-leg reason used to say
+# `raw queued=$queued`, which is a SECOND `queued=` token on the very line `write_verdict` builds —
+# the healthy-path arm above cannot see that, because the deny reason is a different string.
+run_gate ghost-deny-single-key GH_QUEUED=12 GH_INPROGRESS=4 GH_DEMAND_GHOST_IDS="4001" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:90" --
+assert_eq "$RC" "0" "a deny pass still runs"
+assert_contains "$OUT" "demand_runs=11 (threshold 10; raw depth 12, ghost_runs=1)" "the deny reason spells the raw depth WITHOUT a second queued= key"
+assert_eq "$(grep -o 'queued=[0-9]*' "$STATE_DIR/ci-runner-gate.verdict" | wc -l | tr -d ' ')" "1" "exactly ONE queued= value on a DENY line too"
 
 # ⛔ THE OTHER DIRECTION, and it is the one that would be silent: an UNREADABLE jobs read must never
 # be read as "no queued job". Discounting on a failed call drops real demand, so the run stays the
@@ -1079,6 +1092,17 @@ run_gate ghost-countonly GH_MODE=queued-countonly GH_QUEUED=5 GH_INPROGRESS=2 --
 assert_eq "$RC" "2" "a count-only queue body → exit 2 (nothing to measure)"
 assert_contains "$OUT" "queue HEAD UNIDENTIFIABLE" "the refusal names what was missing"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "an unidentifiable body advanced no state file"
+# ⛔ THE THREE-FIELD FALLBACK IS A BRANCH, SO IT GETS AN ARM (cycle-5 review, finding 3): a body with
+# the count, the oldest timestamp and a head run id but no row order still NAMES the head, so the scan
+# runs on that one candidate. Without the fallback the same body drops to the run-level age — i.e. the
+# #2344 ghost-age defect returns for that pass, which is the one thing this change exists to remove.
+echo "── #2344: a body without the row order still names a head for the scan ──"
+run_gate ghost-threefield GH_MODE=queued-threefield GH_QUEUED=3 GH_HEAD_RUN_ID=4001 GH_INPROGRESS=0 \
+  GH_QUEUE_OLDEST_AGE=9000 --
+assert_eq "$RC" "0" "a three-field queue body still reaches a verdict"
+assert_contains "$OUT" "queue_head_run=4001" "the scan ran on the head the read DID name"
+assert_not_contains "$OUT" "ghost discount is UNAVAILABLE" "it did NOT fall back to the run-level age"
+assert_contains "$OUT" "not absorbing" "the head's age drives the throughput leg, as a scanned head does"
 # …and a read that CONTRADICTS ITSELF (more ghost rows than the depth it reports) is REFUSED rather
 # than clamped to "no demand" — the clamp is the direction that strips the pool during a real stall.
 echo "── #2344: a queue read that contradicts its own depth is REFUSED ──"
@@ -1087,7 +1111,20 @@ run_gate ghost-inconsistent GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="400
 assert_eq "$RC" "2" "more ghost rows than the reported depth → exit 2"
 assert_contains "$OUT" "INCONSISTENT" "the refusal names the contradiction, not a clamp"
 assert_absent "$STATE_DIR/ci-runner-gate.state" "an inconsistent queue read advanced no state file"
-# ⛔ AND THE SAME CONTRADICTION IS REFUSED ON THE ALL-GHOSTS PATH (review P2). There, `scanned` is
+# ⛔ …AND ON THE PATH THAT FOUND A HEAD (cycle-5 review, finding 1). The contradiction check used to
+# live inside the "no demand found" branch, so a page ONE ROW longer than its depth — with the extra
+# row being the one that HAS demand — booked `ghosts == queued` and zeroed `queued_demanding` while
+# `queue_head_run` named a run that had waited 9000 s with nothing executing: the pass read HEALTHY and
+# stripped the fallback label. An invariant enforced only where no head exists does not protect the
+# case where a head exists.
+echo "── #2344: the contradiction is refused even when a demand head was measured ──"
+run_gate ghost-inconsistent-head GH_QUEUED=2 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \
+  GH_QUEUE_ROWS_SPEC="4001:2592000;4002:2590000;4003:9000" --
+assert_eq "$RC" "2" "a head measured off a page longer than its depth → exit 2"
+assert_contains "$OUT" "INCONSISTENT" "the refusal names the contradiction"
+assert_not_contains "$OUT" "demand_runs=0" "the measured head is never zeroed away"
+assert_absent "$STATE_DIR/ci-runner-gate.state" "the contradiction advanced no state file"
+# ⛔ AND A READ THAT CONTRADICTS ITSELF IS REFUSED ON THE ALL-GHOSTS PATH (review P2). There, `scanned` is
 # booked as the ghost count, so a `>=` test clamped the contradiction into a readable "no demand" —
 # the fail-open direction, on the very branch whose comment rejects clamping.
 run_gate ghost-inconsistent-all GH_QUEUED=1 GH_INPROGRESS=0 GH_DEMAND_GHOST_IDS="4001 4002" \

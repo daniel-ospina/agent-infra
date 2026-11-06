@@ -882,15 +882,18 @@ print(comp, len(inc))
         break
       fi
     done <<< "$(printf '%s' "$candidates" | tr ';' '\n')"
+    # ⛔ THE CONTRADICTION CHECK APPLIES TO BOTH OUTCOMES, AND THAT ORDER IS THE POINT (cycle-5 review,
+    # finding 1). It used to sit INSIDE the "no demand found" branch, so on the path that DID measure
+    # a head the check never ran: a page one row longer than its own depth, with the extra row being
+    # the one that HAS demand, booked `QUEUE_GHOSTS = scanned - 1 = queued` and the arithmetic below
+    # zeroed `queued_demanding` while `queue_head_run` named a run that had waited 9000 s with nothing
+    # executing — the pass then read HEALTHY and STRIPPED the fallback label. That is the same
+    # fail-open direction the branch-local check was added to close, one path over: an invariant
+    # enforced only where no head exists does not protect the case where a head exists.
+    if [ "$scanned" -gt "$queued" ]; then
+      log "queue reading INCONSISTENT: $scanned run(s) read from a page the API reports as $queued deep — FAIL-CLOSED, changing nothing"; return 2
+    fi
     if [ -z "$demand_head_id" ]; then
-      # ⛔ A READ THAT CONTRADICTS ITSELF IS REFUSED ON THIS PATH TOO (review P2). The page's rows
-      # cannot outnumber the `total_count` it came with, so `scanned > queued` means the two fields
-      # disagree about what the queue IS — and booking the ghost count as `$queued` would CLAMP that
-      # contradiction into a readable "no demand", which is the fail-open direction (it strips the
-      # pool during a real stall). Checked before the clamp, not after it.
-      if [ "$scanned" -gt "$queued" ]; then
-        log "queue reading INCONSISTENT: $scanned run(s) read from a page the API reports as $queued deep — FAIL-CLOSED, changing nothing"; return 2
-      fi
       if [ "$scan_exhausted" = 1 ] && [ "$scanned" -eq "$queued" ]; then
         # The scan ran out of rows with every reported run read, and not one of them has a queued
         # job: a COMPLETE measurement whose answer is "nothing is waiting for a runner". Not a
@@ -906,14 +909,9 @@ print(comp, len(inc))
         log "queue: the $scanned oldest of $queued queued run(s) ALL report ZERO jobs in 'queued' status and the head of real demand is beyond the ${QUEUE_HEAD_SCAN_MAX}-run scan window — FAIL-CLOSED, changing nothing"; return 2
       fi
     fi
-    # ⛔ A READ THAT CONTRADICTS ITSELF IS REFUSED, NOT CLAMPED. The page's rows cannot outnumber the
-    # `total_count` it came with, so a ghost count above it means the two fields disagree about what
-    # the queue IS — and the arithmetic below would then be a number nobody measured. (Clamping to 0
-    # was the alternative and it is the fail-open direction: it reads as "no demand" and strips the
-    # pool during a real stall.)
-    if [ "$QUEUE_GHOSTS" -gt "$queued" ]; then
-      log "queue reading INCONSISTENT: $QUEUE_GHOSTS ghost run(s) read from a queue the API reports as $queued deep — FAIL-CLOSED, changing nothing"; return 2
-    fi
+    # No ghost/depth re-check here: the contradiction was refused above for both outcomes, and the
+    # arithmetic below cannot go negative once it has been (a head found ⇒ ghosts ≤ scanned-1 <
+    # queued; no head ⇒ ghosts == queued exactly).
     queued_demanding=$((queued - QUEUE_GHOSTS))
     fi
   fi
@@ -1052,14 +1050,12 @@ print(age)
   # still bounds the saturated-page refusal below, where being over-cautious costs a refusal and not
   # an unwanted relabel.
   # ⛔ THE REASON LINE NEVER SPELLS THE DISCOUNTED COUNT AS `queued=` (review P3): `write_verdict`
-  # publishes `queued=` from the RAW depth on the same line, so a second `queued=` here would give one
-  # line two different values for one key and break any `grep -o 'queued=[0-9]*'` reader. The
-  # machine-readable surface keeps the raw depth (what a queue-depth consumer wants); the discount is
-  # named `demand_runs=`/`ghost_runs=` in prose and in the log. ⛔ AND THE HEALTHY REASON BELOW MUST
-  # QUOTE THE SAME OPERAND (cycle-4 review, finding 1): it used to say "queue < N" while the verdict
-  # line carried the raw depth, so a ghost-discounted pass printed `queued=10` beside `queue < 10`.
+  # publishes `queued=` from the RAW depth on the same line, so a second `queued=` in ANY reason would
+  # give one line two values for one key and break any `grep -o 'queued=[0-9]*'` reader (cycle-5
+  # review, finding 2 — the deny lines spell it `raw depth` for exactly this reason, and the capacity
+  # leg's `while queued=` had to change with them).
   if [ "$comp" != "operational" ] || [ "$incident" != "0" ] || [ "$queued_demanding" -ge "$QUEUE_THRESHOLD" ]; then
-    UNHEALTHY_LEG="queue/component/incident leg: demand_runs=$queued_demanding (threshold $QUEUE_THRESHOLD; raw queued=$queued, ghost_runs=$QUEUE_GHOSTS), component=$comp, incidents=$incident"
+    UNHEALTHY_LEG="queue/component/incident leg: demand_runs=$queued_demanding (threshold $QUEUE_THRESHOLD; raw depth $queued, ghost_runs=$QUEUE_GHOSTS), component=$comp, incidents=$incident"
     return 1   # unhealthy -> prefer local
   fi
   # ⛔ A SATURATED PAGE LEAVES NO TRUSTWORTHY READING, so the pass is REFUSED rather than certified
@@ -1103,7 +1099,7 @@ print(age)
   # in mode=github the pool is stripped by design, so "nothing offers ubuntu-latest" is CORRECT
   # there and denying on it would re-engage the fallback on every healthy tick).
   if [ "$CAP_DENY" = 1 ]; then
-    UNHEALTHY_LEG="capacity leg: mode=${mode:-unknown} and ${CENSUS_DETAIL}, not one online runner can accept the queue's demand (${DEMAND_SHOWN:-unknown}) while queued=$queued — the pool cannot take the work it is supposed to be serving"
+    UNHEALTHY_LEG="capacity leg: mode=${mode:-unknown} and ${CENSUS_DETAIL}, not one online runner can accept the queue's demand (${DEMAND_SHOWN:-unknown}) while demand_runs=$queued_demanding — the pool cannot take the work it is supposed to be serving"
     return 1
   fi
   return 0     # healthy   -> prefer GitHub
