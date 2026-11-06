@@ -2269,7 +2269,7 @@ def test_the_cli_argv_surface_is_real(monkeypatch, no_cache, capsys):
         assert bp.main(argv) == 2, "%r must be a usage error (2)" % (argv,)
 
 
-def test_T_fix_repos_follows_the_repo_argument():
+def test_T_fix_repos_follows_the_repo_argument(monkeypatch, tmp_path):
     """[P2, review cycle 7] The merge's `FIX_REPOS` re-derivation was unpinned AND too wide.
 
     Two defects, one arm each: (a) `globals()["FIX_REPOS"] = _derive_fix_repos(REPO)` could be replaced by
@@ -2278,6 +2278,22 @@ def test_T_fix_repos_follows_the_repo_argument():
     agent-infra PRs as coverage for that repo's issues — the attribution failure the module forbids.
     Deleting the re-derivation, or restoring the unconditional tail, must red this arm.
     """
+    # ⛔ HERMETIC, LIKE EVERY SIBLING `--repo` ARM (review cycle 8, P2). Without these two lines the arm
+    # performed LIVE GitHub reads (measured 4.8-5.2 s per call, `rest read failed: HTTPError
+    # api.github.com/repos/owner/other/pulls`) and WROTE THE OPERATOR'S REAL STATE FILES — a suite run
+    # left `~/.pi/agent/state/beta-progress.json` with a real measurement in it, which is the file
+    # `scripts/merge-queue.py` and the beat read. Under CI's `--timeout=60` three live calls can also
+    # exceed the bound whenever the API degrades.
+    # ⛔ AND NOTHING IS LOST BY STUBBING `compute`: the FIX_REPOS re-derivation lives in the ARG PARSER,
+    # which runs before `compute` is ever reached — verified by mutation after this change (removing the
+    # re-derivation, or restoring the unconditional tail, still reds the arm).
+    monkeypatch.setattr(bp, "CACHE", str(tmp_path / "bp.json"))
+    monkeypatch.setattr(bp, "compute", lambda *a, **k: {
+        "ts": int(time.time()), "repo": bp.REPO, "open_prs": 1, "merged_today": 0,
+        "p0": {"open": 0, "with_pr": 0, "without": 0},
+        "p1": {"open": 0, "with_pr": 0, "without": 0},
+        "coverage": "test", "unavailable": None,
+    })
     # ⛔ `main(["--repo", …])` MUTATES MODULE GLOBALS, so this arm restores them — without that it
     # leaves REPO/FIX_REPOS repointed and every later arm inherits the wrong repo (measured: this test
     # passes alone and failed in the full run for exactly that reason).
