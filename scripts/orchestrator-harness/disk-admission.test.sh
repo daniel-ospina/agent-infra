@@ -1237,8 +1237,10 @@ echo "── J) every suite that DRIVES the provision seam neutralises the admis
 #   (D2) it EXECUTES a shipped caller — an argument to `bash`/`sh`/`source` naming `fix-one.sh`,
 #        `adopt-fix.sh` or `dispatch-merge.sh`, tolerating leading `VAR=value` prefixes (the repo's own
 #        idiom: `( cd "$TT" && O=… bash "$RIG_MISS/fix-one.sh" … )`).
-# Measured over this population: D1 selects 3 suites, D2 selects 2 more, and NEITHER has a false
-# positive. A looser rule — "the file mentions a caller anywhere" — selects 18 and flags 12 suites that
+# Measured over this population: D1 selects 3 suites, D2 selects 3 more (`test-crossbox.sh` is D2-only
+# and is in scope now that the population reads `test-*.sh`), 6 in total — the same 6 arm J prints — and
+# NEITHER has a false positive. A looser rule — "the file mentions a caller anywhere" — selects 18 and
+# flags 12 suites that
 # only READ a script's text (`sed -n … "$HERE/fix-one.sh"`, `grep -qF … "$HARNESS/fix-one.sh"`); that
 # census would be deleted as cry-wolf, and it would take the real check with it.
 #
@@ -1253,12 +1255,14 @@ echo "── J) every suite that DRIVES the provision seam neutralises the admis
 #      PINNED below.
 #      ⛔ THE REASON PREVIOUSLY GIVEN HERE WAS FALSE (fresh review, P2 — MEASURED). It read "`fix-one-
 #      brief.test.sh`, which runs `fix-one.sh --section fixer` and therefore never provisions". It never
-#      RUNS `fix-one.sh` at all: it ASSIGNS `FIXER="$HERE/fix-one.sh"` (`:27`) and only READS the file
-#      — an `awk` heredoc extraction (`:82`) and a `bash -n` syntax check (`:111`). `--section` is not
-#      a `fix-one.sh` option either; it belongs to `brief-gate.sh` (`fix-one.sh:80` calls
-#      `bash "$brief_gate_sh" --section fixer`). The file is green because it EXECUTES NOTHING, not
-#      because a `--section` mode bypasses provisioning — a guard citation that does not exist, which
-#      is the class this file exists against.
+#      RUNS `fix-one.sh` as a program: it assigns `FIXER="$HERE/fix-one.sh"` (`:27`) and treats the file
+#      as TEXT — an `awk` heredoc extraction (`:82`) and a `bash -n` syntax check (`:111`). `--section`
+#      is not a `fix-one.sh` option either; it belongs to `brief-gate.sh` (`fix-one.sh:80` calls
+#      `bash "$brief_gate_sh" --section fixer`).
+#      ⛔ AND "IT EXECUTES NOTHING" WAS ALSO TOO STRONG (fresh review, P3 — MEASURED): the suite SOURCES
+#      the region it extracted (`:92`, `. "$T/region.sh"`), so a change to `fix-one.sh`'s brief heredoc
+#      CAN red this suite. What is true — and all that the exclusion needs — is that it never provisions,
+#      so it is correctly not a driver; the 4/4-green measurement above stands.
 #   ⛔ THE RESIDUAL, stated so this cannot be read as complete coverage: a FUTURE suite that reaches
 #      provisioning only through a variable-held caller path is NOT in the derived population. The pin
 #      covers the one such suite that exists today; it is not a general rule.
