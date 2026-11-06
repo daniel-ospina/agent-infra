@@ -3783,7 +3783,8 @@ ICR_INCOMPLETE=0; QUEUED=0
 POOL_SWEPT=1
 # ── CLAIM-DRIVEN OUTCOMES, COUNTED (agent-infra#2094) ──────────────────────────────────────────
 # Two different things a claim does to this pass, and they must never print the same line:
-#   ICR_HELD      a peer's LIVE claim withheld the candidate, so it is NOT queued — a pool full of
+#   ICR_HELD      a peer claim withheld the candidate, so it is NOT queued — either a LIVE holder or a
+#                 lease this reader cannot parse (an ABSTENTION, agent-infra#3203); a pool full of
 #                 these ends the pass at `backlog now 0`, the healthiest-looking line this script can
 #                 print and the one the incident produced over 192 readable candidates.
 #   ICR_RECLAIMED the only claim on the candidate was ORPHANED, so it WAS queued (the registry's
@@ -4915,7 +4916,7 @@ fi
 # what makes `backlog now 0` readable as "claims", not as "no work"; the reclaimed count is the
 # rename repair, which is a healthy event but must be visible.
 if [ "$ICR_HELD" -gt 0 ]; then
-  echo "[refresh] $ICR_HELD of $judged candidate(s) WITHHELD by a live cross-box claim (held-by-live) — a short backlog here is claims, not an empty pool (agent-infra#2094)"
+  echo "[refresh] $ICR_HELD of $judged candidate(s) WITHHELD by a cross-box claim (held-by-live, or a lease that cannot be parsed — an ABSTENTION, never a free one; agent-infra#3203) — a short backlog here is claims, not an empty pool (agent-infra#2094)"
 fi
 if [ "$ICR_RECLAIMED" -gt 0 ]; then
   echo "[refresh] $ICR_RECLAIMED of $judged candidate(s) queued although a claim EXISTS, because it is ORPHANED (held-by-orphan) — the holder host cannot be a live lane; the acquire still races the CAS (agent-infra#2094)"

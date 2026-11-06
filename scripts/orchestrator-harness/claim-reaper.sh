@@ -13,24 +13,35 @@
 # deletes, with no dry run, no per-claim evidence, no age threshold, no per-pass bound and no record —
 # and its orphan rules are deliberately narrow: the local-pid rule is PR-only, and the host rules only
 # fire for a name this box no longer answers to. A claim stamped by THIS box on an ISSUE, whose
-# controller and chain are both gone, therefore stays `held-by-live` until its lease runs out — and
-# forever if its lease cannot be parsed. See `claims.sh:claim_orphan_reason` and
-# `claims.sh:claim_prune`. This tool supplies the missing half: it TREATS NOTHING AS GONE WITHOUT
-# EVIDENCE, it PRINTS that evidence, it RECORDS every release, and the release itself is off by
-# default.
+# controller and chain are both gone, therefore stays `held-by-live` until its lease runs out — and,
+# for a lease NOBODY CAN PARSE, it stayed that way for ever until agent-infra#3203 gave the class a
+# BOUNDED expiry in `claim_prune` (claim-commit age > `CLAIM_UNREADABLE_LEASE_MAX_AGE`, 18000 s). See
+# `claims.sh:claim_orphan_reason` and `claims.sh:claim_prune`. This tool supplies the missing half: it
+# TREATS NOTHING AS GONE WITHOUT EVIDENCE, it PRINTS that evidence, it RECORDS every release, and the
+# release itself is off by default.
 #
 # ── THE RECORDED DECISIONS THIS OBEYS (contradiction test) ────────────────────────────────────────
 # These are decisions already recorded in this repo. This tool does NOT reverse any of them; each one
 # is a gate below, and the two that would be easiest to "improve away" are quoted verbatim:
 #
-#  (a) ⛔ "AN UNPARSEABLE LEASE IS LIVE AND IS NEVER RE-EXAMINED FOR ORPHANHOOD. The orphan rules
-#      below are a REASON TO STOP TRUSTING A TERM; they are not evidence about the holder."
-#      (claims.sh, `_claim_acquire_at`; restated in README §7.2b). ⇒ `cr_gate_lease`: a claim whose
-#      lease this reader cannot parse is REPORTED as UNREADABLE-LEASE and NEVER released, whatever
-#      the evidence says about the holder. It is the one verdict an operator must settle by hand.
-#      ⚠️ THE MEASURED FAILURE MAY BE THAT CLASS: an unparseable lease is read as LIVE forever and
-#      `claim_prune` skips it, which is exactly how a claim reaches 25 hours with nobody alive. This
-#      tool therefore does not silently "fix" it — it names it, and says what it did not do.
+#  (a) ⛔ "AN UNPARSEABLE LEASE IS NEVER RE-EXAMINED FOR ORPHANHOOD (the recorded decision,
+#      kept): the orphan rules below are a REASON TO STOP TRUSTING A TERM, not evidence about the
+#      holder" — and it is NOT read as a live window either (agent-infra#3203: `_claim_lease_state`
+#      answers `unreadable`, the acquire refuses with `held-by-unreadable-lease`, the snapshot word is
+#      `claim-lease-unreadable`).
+#      (claims.sh, `_claim_acquire_at`; restated in `claim_snapshot_verdict` and README §7.2b). ⇒
+#      `cr_gate_lease`: a claim whose lease this reader cannot parse is REPORTED as UNREADABLE-LEASE
+#      and NEVER released, whatever the evidence says about the holder. It is no longer ETERNAL when the
+#      claim commit's time is readable (claim_prune reaps it on the 18000 s bound) — see the AMENDED note
+#      below — but an UNMEASURABLE age is kept and named, so THAT case still reaches a human. This tool
+#      never decides its ending either way.
+#      ⚠️ THE MEASURED FAILURE WAS THAT CLASS: the claim reached 25 hours with nobody alive.
+#      ⚠️ AMENDED (NOT REVERSED) BY agent-infra#3203. The class is no longer "eternal", and it is no
+#      longer described as LIVE: `claim_prune` reaps it on a bounded schedule measured from the claim
+#      COMMIT (18000 s), and every reader REPORTS the abstention instead. That is a
+#      REAP-side schedule set in the registry itself, and it does not license THIS tool to release on
+#      holder evidence: the STOLEN direction is still banned here, and a claim this tool cannot judge
+#      is still NAMED and left to the prune's clock.
 #
 #  (b) ⛔ "THE LOCAL-PID RULE IS FOR **PR** CLAIMS ONLY … An ISSUE claim is minted by the CONTROLLER
 #      (`orch-loop.sh`) and released by the CHAIN, so the holder process and the work are DIFFERENT
@@ -100,8 +111,9 @@
 #
 # ── WHAT THIS TOOL DOES NOT DO ────────────────────────────────────────────────────────────────────
 #   • It never releases a claim on a box it cannot query (there is no remote-probe fiction here).
-#   • It never releases a claim whose lease it cannot parse (decision (a)) — that class is NAMED and
-#     left to a human, because reversing (a) is a policy change, not a bug fix.
+#   • It never releases a claim whose lease it cannot parse (decision (a)). That class is NAMED here,
+#     and its ending is `claim_prune`'s bounded schedule (agent-infra#3203) or a human — never this
+#     tool's judgement, because reversing (a) on the STEAL side is a policy change, not a bug fix.
 #   • A DRY RUN is read-only for CLAIMS, but claims.sh's host probe may idempotently append this box's
 #     own name to `state/claim-hosts` (the rename self-heal). That is stated on the summary line rather
 #     than hidden behind "changes nothing" (round-2 review).
@@ -204,7 +216,7 @@ fi
 # ⛔ A REGISTRY THAT CANNOT ANSWER IS NOT EVIDENCE OF FREEDOM (the same rule the pre-flight states).
 # A stale `$O/claims.sh` predating `_lease_unparseable` would make every gate below silently pass —
 # and a reaper whose gates default to "pass" deletes live work.
-for _fn in _git _lease_of _lease_unparseable _lease_is_live claim_host claim_former_hosts; do
+for _fn in _git _lease_of _lease_unparseable _lease_is_live _claim_commit_time claim_host claim_former_hosts; do
   if ! declare -f "$_fn" >/dev/null 2>&1; then
     printf '[claim-reaper] %s does not define %s — the registry PREDATES this tool, so no gate can be evaluated; refusing\n' "$CR_CLAIMS_SH" "$_fn" >&2
     exit 2
@@ -363,12 +375,16 @@ cr_gate_identity() {
   return 0
 } # MUT-ANCHOR:identity
 
-# GATE 2 — LEASE. Recorded decision (a): an unparseable lease is LIVE and is never re-examined for
-# orphanhood. It is REPORTED here, never released, even with overwhelming evidence about the holder.
+# GATE 2 — LEASE. Recorded decision (a): an unparseable lease is never read as EXPIRED and is never
+# re-examined for orphanhood. It is REPORTED here, never released, even with overwhelming evidence
+# about the holder — and since agent-infra#3203 it is no longer reported as LIVE either: the class is
+# an ABSTENTION (`held-by-unreadable-lease`, rc 1) whose block is bounded, because `claim_prune` reaps
+# the ref once the claim's own commit is older than `CLAIM_UNREADABLE_LEASE_MAX_AGE`. This tool still
+# never releases it on holder evidence; it reports what it sees and leaves the reap to that schedule.
 cr_gate_lease() {
   if _lease_unparseable "${CR_UNTIL:-}"; then
     CR_VERDICT=UNREADABLE-LEASE
-    CR_WHY="the lease (${CR_UNTIL:-<absent>}) cannot be parsed, and claims.sh's recorded rule is that an unparseable lease is LIVE and is never re-examined for orphanhood — a human must settle this one"
+    CR_WHY="the lease (${CR_UNTIL:-<absent>}) cannot be parsed, so it is an ABSTENTION, never a live window (claims.sh answers 'unreadable', rc 1, and never re-examines it for orphanhood) — and the block is bounded WHEN THE CLAIM'S OWN COMMIT TIME IS READABLE: claim_prune reaps it once that commit is older than CLAIM_UNREADABLE_LEASE_MAX_AGE. An UNMEASURABLE age (no committer stamp, a future-dated one, or an unreadable local clock) is KEPT and NAMED on every pass, so that case still needs a human — claims.sh's prune arm says so itself; this tool never releases either way"
     return 1
   fi
   return 0
@@ -377,7 +393,16 @@ cr_gate_lease() {
 # GATE 3 — AGE, read from the claim COMMIT (never a file mtime), against the stated threshold.
 cr_gate_age() {
   local ct
-  ct="$(_git log -1 --format=%ct "$CR_OBJ" 2>/dev/null)" || ct=""
+  # ⛔ ONE DATUM, ONE READER (review round 22, agent-infra#3203). This gate asked `git log
+  # --format=%ct` while `claim_prune` asks `_claim_commit_time`, and the two DISAGREED in the LIBERAL
+  # direction on LANDABLE objects: a `committer` line ending `1700000002<(space)>` (trailing space) or
+  # `1700000003 +000` (3-digit tz) is REJECTED by the oracle — its `sed` is anchored on `$`, so the
+  # stamp is unusable, the age is UNMEASURABLE and the claim is KEPT — while `log` printed the digits
+  # happily, so a claim MINUTES old computed an age of ~6.2e7s and cleared the `CR_MIN_AGE` floor
+  # (measured on 7 shapes: 4 disagree, 2 consequential and both peer-mintable). It is a defeated AGE
+  # FLOOR rather than a released live claim — gates 4-6 still refuse on holder evidence — but a floor
+  # a trailing space defeats is not a floor. Read the SAME function the prune arm reaps on.
+  ct="$(_claim_commit_time "$CR_OBJ" 2>/dev/null)" || ct=""
   cr_int "$ct" || { CR_VERDICT=UNMEASURABLE; CR_WHY="the claim commit's time could not be read, so its age is unknown"; return 1; }
   CR_AGE=$(( CR_NOW - ct ))
   if [ "$CR_AGE" -lt 0 ]; then CR_VERDICT=UNMEASURABLE; CR_WHY="the claim commit is dated in the future (ct=$ct), so its age cannot be measured"; return 1; fi

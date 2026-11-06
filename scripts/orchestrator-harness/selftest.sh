@@ -2531,7 +2531,8 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   [ -f "$O/state/mergeclaim-2.lock" ] && rc=1 || rc=0
   ck "shipped claim_live(): the stale claim file is removed" $rc
   # ⛔ A FOREIGN OVERSIZED (>= 2**63) LEASE (P2, fourth review round, 2026-10-14). claim_acquire()
-  # treats such a lease as unparseable => LIVE (claims.sh's 18-digit bound; test-claims.sh §P3e seeds
+  # treats such a lease as unparseable => an ABSTENTION (rc=1, never stolen; since #3203 it is not
+  # reported as live either; test-claims.sh §P3e seeds
   # the same value), but claim_live() read the SAME datum with a bare `[ "$now" -le "$until" ]`,
   # which ERRORS at 2**63 and — read as false — reported it DEAD. The two readers then disagreed
   # forever: the controller reached the spawn branch EVERY cycle, fix-one.sh was refused by
@@ -2551,11 +2552,13 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   [ "$spawn" = "no" ] && rc=0 || rc=1
   ck "shipped claim_live(): no spawn is attempted for an oversized-lease claim" $rc
   # ⛔ THE `0` SENTINEL IS NOT THE SAME AS ABSENT (P2, fifth review round, 2026-10-14). claims.sh
-  # documents `0` as "a claim exists whose lease is UNREADABLE" and treats it as LIVE (claim_acquire's
-  # `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via `[ "$until" != "0" ]`).
-  # `_lease_of` collapses a negative lease to the same `0` (its `[0-9]*` cannot match the minus sign),
+  # documents `0` as "a claim exists whose lease is UNREADABLE" and ABSTAINS on it — the acquire
+  # refuses rc 1 with `held-by-unreadable-lease` (`_lease_unparseable`), and since #3203 `claim_prune`
+  # reaps it once the claim commit passes `CLAIM_UNREADABLE_LEASE_MAX_AGE` rather than keeping it for ever.
+  # `_lease_of` collapses a negative lease to the same `0` (its anchored ASCII-digit match cannot match the minus sign),
   # so `lease_until=-5` ARRIVES HERE AS `0`. claim_live used to read that `0` as DEAD while
-  # claim_acquire read the same datum as LIVE — the SAME disagreement as the oversized class above,
+  # claim_acquire ABSTAINED on the same datum (its reason names the class: `held-by-unreadable-lease`;
+  # LIVE below is claim_live's OWN word for "do not steal") — the SAME disagreement as the oversized class above,
   # with the same consequence (refund_bailed_fixer un-parks the PR every cycle, so the cap never
   # trips). Drive the snapshot entry the function actually reads.
   printf 'refs/claims/5-%s\tforeignbox\t0\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
@@ -2569,7 +2572,7 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   # (never as reaped). The reader must AGREE on this row as well.
   printf 'refs/claims/6-%s\tforeignbox\t-5\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
   claim_live 6 "$CLSHA" && rc=0 || rc=1
-  ck "shipped claim_live(): a negative lease reports LIVE, matching claim_acquire/claim_prune" $rc
+  ck "shipped claim_live(): a negative lease reports LIVE, not dead (LIVE is this reader's own word for do-not-steal)" $rc
   # Non-vacuity: an entry ABSENT from the snapshot is still NOT live. Without this the fix could be
   # "return 0 always" and every assertion above would still pass.
   printf 'refs/claims/999-%s\tforeignbox\t1799999999\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
