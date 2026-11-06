@@ -1889,7 +1889,7 @@ lane_end_next() {
     # instead of the flat claim, because the flat claim tells an operator to hold and re-publish a branch
     # that already exists.
     detached)
-      printf 'MANUAL — nothing was pushed, and this worktree is on a DETACHED HEAD: its HEAD is not ATTACHED to any branch (measured — symbolic-ref answered nothing), so the %s commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them — do NOT reap %s and do NOT remove it — removing the worktree deletes its own HEAD and reflog, which are the only things referencing such a commit, so it becomes unreachable and is pruned by gc. Push them onto a branch first (`git -C %s push %s HEAD:NEW-BRANCH` — the name is yours to choose), then re-check. That the HEAD is not ATTACHED is measured; whether some OTHER branch or ref ALREADY holds these same commits is NOT (no for-each-ref --contains is run here, and the unpushed count enumerates the LOCAL refs/remotes/* cache of this repository only)%s%s\n' \
+      printf 'MANUAL — nothing was pushed, and this worktree is on a DETACHED HEAD: its HEAD is not ATTACHED to any branch (measured — symbolic-ref answered nothing), so the %s commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them — do NOT reap %s and do NOT remove it — removing the worktree deletes its own HEAD and reflog, which are the only things referencing such a commit — so IF no other ref reaches them, removing the worktree makes them unreachable and gc prunable. Push them onto a branch first (`git -C %s push %s HEAD:NEW-BRANCH` — the name is yours to choose), then re-check. That the HEAD is not ATTACHED is measured; whether some OTHER branch or ref ALREADY holds these same commits is NOT (no for-each-ref --contains is run here, and the unpushed count enumerates the LOCAL refs/remotes/* cache of this repository only)%s\n' \
         "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "$(lane_end_push_repo)" \
         "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
     UNAVAILABLE|refused-unknown-default|refused-pushurl-divergent|refused-pushurl-unresolved)
@@ -2044,7 +2044,7 @@ lane_end_next() {
         # configuration this code deliberately supports (and refuses across, when it cannot prove them
         # equal) — so naming `origin` here points the reader at a repository nobody read, while
         # `push_url=` two lines away in the same artifact names the right one. Same fix, both arms.
-        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so only the uncommitted work is local-only%s\n' \
+        printf 'retrieve the archive %s (the LOCAL pin — exit 2 ALSO covers a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository even though this row cannot name which) before removing %s; the BRANCH is the good half (push=pushed, %s holds %s), so only the uncommitted work is local-only%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
           "$(lane_end_push_repo)" "${LANE_END_ORIGIN:-<sha>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0 ;;
       nothing)
@@ -2059,11 +2059,11 @@ lane_end_next() {
         # bounded `ls-remote --heads` upgrades a row to `remote-holds:`. The sentence is now scoped to what
         # was read, so it cannot state more safety than the enumeration covered. The `unpushed=0` token is
         # kept literally (arms N31b pin it).
-        printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and only the uncommitted work is local-only%s\n' \
+        printf 'retrieve the archive %s (the LOCAL pin — exit 2 ALSO covers a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository even though this row cannot name which) before removing %s; unpushed=0 against the LOCAL refs/remotes/* tracking refs (a CACHE — `git fetch --prune` and a deleted remote branch are not visible here), so no commit on %s is unpushed THERE, and only the uncommitted work is local-only%s\n' \
           "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" \
           "${LANE_END_BRANCH:-<unknown>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0 ;;
     esac
-    printf 'retrieve the archive %s (local pin only — no off-box copy) before removing %s; the branch push recorded push=%s, which this artifact does NOT classify — it asserts neither delivery nor absence for it, so read the [lane-exit] line in the lane log before removing anything, and do NOT read the archive as the only copy of the branch%s\n' \
+    printf 'retrieve the archive %s (the LOCAL pin — exit 2 ALSO covers a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository even though this row cannot name which) before removing %s; the branch push recorded push=%s, which this artifact does NOT classify — it asserts neither delivery nor absence for it, so read the [lane-exit] line in the lane log before removing anything, and do NOT read the archive as the only copy of the branch%s\n' \
       "${LANE_END_REF:-refs/wip-local/<slug>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_PUSH:-<unset>}" "$ARCHIVE_MAY_BE_PARTIAL$(lane_end_tree_caveat)"; return 0
   fi
   # ⛔ `unpushed-only` IS NOT A DIRTY TREE (review cycle 2, finding 3 — REPRODUCED). `at_risk=0` for a
@@ -2110,10 +2110,10 @@ lane_end_next() {
         # the archive lands in the push repository and the artifact's own command answers `fatal:
         # couldn't find remote ref refs/wip/<slug>` — the round-3 failure verbatim, left hardcoded here.
         # `LANE_END_PUSH_URL` already holds the proven push url on every state that reaches this arm.
-        printf 'recover the uncommitted state: git fetch %s %s && git diff --stat HEAD FETCH_HEAD (%s); %s\n' \
+        printf 'recover the uncommitted state: git fetch %s %s && git diff --stat HEAD FETCH_HEAD (%s); %s%s\n' \
           "$(lane_end_push_repo)" "${LANE_END_RESCUE}" \
           "$ARCHIVE_TREE_NOT_PROVEN" \
-          "then re-dispatch"
+          "then re-dispatch" "$(lane_end_tree_caveat)"
         return 0 ;;
     esac
     # ⛔ NO `cannot-verify` BRANCH HERE ANY MORE (review cycle 13, P1). It used to be a MANUAL sentence at
@@ -2200,7 +2200,7 @@ lane_end_next() {
 # or the case list subtly different.
 lane_end_rescue_caveat() {
   case "${LANE_END_RESCUE:-}" in
-    FAILED|UNAVAILABLE) printf ' \u2014 AND the uncommitted work at %s is NOT archived either (rescue=%s)' "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE}" ;;
+    FAILED|UNAVAILABLE) printf ' \u2014 AND no ref this run wrote pins the uncommitted work at %s (rescue=%s) — which is NOT the same as nothing having been archived: the local pin write is guarded and the push runs after it, so an archive may exist at refs/wip/<slug> in the push repository; this row cannot tell you which' "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE}" ;;
     archived-local) printf ' \u2014 the uncommitted work is archived to the LOCAL pin %s only (no off-box copy)%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;;
   esac
 }
@@ -2648,7 +2648,7 @@ terminal_wip_rescue() {
           # this function: HEAD detached, one commit, `for-each-ref --contains HEAD` EMPTY, and the object
           # PRUNED by `gc --prune=now` after `worktree remove` — over a log line that had promised it would
           # survive exactly that.
-          echo "[wip] NOTE label=$label: this worktree is on a DETACHED HEAD — its HEAD is not ATTACHED to any branch — so the $unpushed commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them, and nothing but this worktree's own HEAD and reflog references such a commit, so removing the worktree makes them unreachable and gc prunable (the survival sentence in the other arms does NOT apply here). Whether some OTHER branch or ref ALREADY holds these same commits was NOT measured (this path runs no for-each-ref --contains). Do NOT remove or reap it until they are pushed onto a branch ('git -C $root push $(lane_end_push_repo) HEAD:refs/heads/<name>'). Nothing was pushed, and push=${LANE_END_PUSH:-not-attempted} says why in the [lane-exit] line above" >> "$log" ;;
+          echo "[wip] NOTE label=$label: this worktree is on a DETACHED HEAD — its HEAD is not ATTACHED to any branch — so the $unpushed commit(s) it holds are reachable ONLY from this worktree unless some OTHER branch or ref already reaches them, and nothing but this worktree's own HEAD and reflog references such a commit — so IF no other ref reaches them, removing the worktree makes them unreachable and gc prunable (the survival sentence in the other arms does NOT apply here). Whether some OTHER branch or ref ALREADY holds these same commits was NOT measured (this path runs no for-each-ref --contains). Do NOT remove or reap it until they are pushed onto a branch ('git -C $root push $(lane_end_push_repo) HEAD:refs/heads/<name>'). Nothing was pushed, and push=${LANE_END_PUSH:-not-attempted} says why in the [lane-exit] line above" >> "$log" ;;
         *)
           echo "[wip] NOTE label=$label: $unpushed commit(s) on $br are held by NO ref in this repository's LOCAL refs/remotes/* cache (a CACHE — 'git fetch --prune' and a deleted remote branch are not visible here, and this is NOT a claim about any remote) and nothing was pushed — push=${LANE_END_PUSH:-not-attempted}, and the [lane-exit] line above says why. They survive this WORKTREE being removed (they are in the repo's object database under the branch ref); they do NOT survive the BRANCH being deleted, and they do not survive a cell's volume being discarded either. This is named here so 'nothing at risk' is not read as 'the lane's work is on origin'" >> "$log" ;;
       esac
@@ -2734,7 +2734,7 @@ terminal_wip_rescue() {
       fi
       echo "[wip] end label=$label rc=$rc cap=$cap tree=$LANE_END_TREE rescue=$LANE_END_RESCUE unpushed=$unpushed_col ref=${LANE_END_REF:-<none>} — trigger: $note" >> "$log"
       if [ "$LANE_END_RESCUE" = "FAILED" ]; then
-        echo "[wip] ⛔ label=$label: the rescue could not archive/push this worktree (bg-rescue-wip.sh exit $rc2) and NO ref this run wrote pins anything — the work is STILL ONLY ON THIS DISK at $root. The cause is the line above this one; do NOT reap this worktree" >> "$log"
+        echo "[wip] ⛔ label=$label: the rescue reported failure (bg-rescue-wip.sh exit $rc2) AND no ref this run wrote pins this run's snapshot — so no LOCAL pin names it. ⛔ THAT IS NOT 'NOTHING WAS ARCHIVED': the local pin write is GUARDED (bg-rescue-wip.sh prints 'could not record refs/wip-local/<slug>' and carries on) and the PUSH runs AFTER it, so 'PARTIAL archive + push SUCCEEDED + pin write FAILED' reaches this row with the snapshot sitting on refs/wip/$slug in the push repository. This row cannot tell you which of those it was — read the replayed lines above, and check origin refs/wip/$slug BEFORE concluding the work is on this disk alone. The work is not pinned by this run; do NOT reap this worktree" >> "$log"
         if [ -n "$local_ref_before" ]; then
           echo "[wip] ⛔ label=$label: NOTE — refs/wip-local/$slug@$local_ref_before still exists, but it was written by an EARLIER rescue of this branch and this run did NOT update it. That snapshot may PREDATE the work now in the tree; do not read it as covering this lane" >> "$log"
         fi

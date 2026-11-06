@@ -3328,7 +3328,7 @@ n45_push_domain="pushed nothing running unmeasured detached verify-unanswered pu
       # the caveat for the value THAT CELL set is required.
       case "$n45_out" in *'could NOT be read (push=unmeasured)'*)
         case "$n45_rescue" in
-          FAILED|UNAVAILABLE) case "$n45_out" in *"NOT archived either (rescue=$n45_rescue)"*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
+          FAILED|UNAVAILABLE) case "$n45_out" in *"no ref this run wrote pins the uncommitted work at "*'the local pin write is guarded and the push runs after it'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
           archived-local) case "$n45_out" in *'archived to the LOCAL pin'*) : ;; *) n45_bad="$n45_bad $n45_cell(rescue-caveat)" ;; esac ;;
         esac
         case "$n45_tree" in
