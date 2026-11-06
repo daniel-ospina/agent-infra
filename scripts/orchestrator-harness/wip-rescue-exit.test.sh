@@ -2979,6 +2979,43 @@ chmod 755 "$N57W/sub" 2>/dev/null
 n57next="$(grep -m1 '^next=' "$O/state/lane-exit-n57.state" 2>/dev/null | sed 's/^next=//')"
 case "$n57next" in *'NOT PROVEN complete'*) rcn57c=0 ;; *) rcn57c=1 ;; esac
 ck "N57c FIXTURE: a REAL listing that names 'M top.txt' AND warns (chmod 000 sub/) sets the flag, so the caveat reaches an operator [$(grep -m1 '^state=' "$O/state/lane-exit-n57.state" 2>/dev/null)]" $rcn57c
+# ⛔ N58 — EXIT 0 DOES NOT PROVE THE ARCHIVE'S TREE IS THE WORKTREE (fresh review at 4f50e6718, P1 —
+# REPRODUCED, and it FALSIFIED the premise round 18 used to leave this arm alone: "the callee skips no
+# paths on exit 0"). `scripts/bg-rescue-wip.sh` runs `git add -A` (`:182`), falls back to `git add -u` with
+# stderr DISCARDED (`:190`), then adds only `git ls-files -o` entries — UNTRACKED paths — collecting
+# `SKIPPED` from those alone. A TRACKED file git cannot read fails both adds, is never in the untracked
+# sweep, and is in NEITHER the archive NOR the skipped list — `write-tree` and the push still succeed and
+# the callee exits 0. The remedy said "the archive commit's TREE is the worktree as it was left" over
+# exactly that shape, so an operator who fetched it, found the edit absent, and removed the worktree
+# destroyed the only copy.
+for _n58p in pushed nothing; do
+  n58="$( bash -c '
+    . "$1"
+    LANE_END_TREE=dirty; LANE_END_RESCUE=refs/wip/develop; LANE_END_REF=refs/wip-local/develop@abc1234
+    LANE_END_PUSH="$2"; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop; LANE_END_ORIGIN=deadbee
+    lane_end_next' _ "$GATE" "$_n58p" 2>/dev/null )"
+  case "$n58" in *'TREE is NOT PROVEN'*'before removing anything'*) rcn58=0 ;; *) rcn58=1 ;; esac
+  ck "N58 …the refs/wip/* remedy (push=$_n58p) does NOT claim the archive's tree IS the worktree — a tracked file git cannot read is in NEITHER the archive NOR the skipped list, on an exit 0" $rcn58
+done
+# …and the cannot-verify arm makes the same claim and must carry the same scoping.
+n58b="$( bash -c '
+  . "$1"
+  LANE_END_TREE=cannot-verify; LANE_END_RESCUE=refs/wip/develop; LANE_END_REF=refs/wip-local/develop@abc
+  LANE_END_PUSH=nothing; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n58b" in *'NOT PROVEN to be the worktree as it was left'*) rcn58b=0 ;; *) rcn58b=1 ;; esac
+ck "N58b …and so does the cannot-verify arm, which is the one state whose subject IS that the measurement was incomplete" $rcn58b
+# ⛔ N58c — A REFUSED PUSH ON A DIRTY TREE MAY NOT DROP THE INCOMPLETENESS FACT (fresh review, P2). The arm
+# appended only `lane_end_rescue_caveat`, which emits NOTHING for `rescue=refs/wip/*`, so the flag was
+# measured and never reported — on the arm the file calls "the fleet's worst reachable state".
+n58c="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=refs/wip/develop; LANE_END_REF=refs/wip-local/develop@abc
+  LANE_END_PUSH=refused-main-checkout; LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
+  LANE_END_LISTING_INCOMPLETE=1
+  lane_end_next' _ "$GATE" 2>/dev/null )"
+case "$n58c" in *'NOT PROVEN complete'*) rcn58c=0 ;; *) rcn58c=1 ;; esac
+ck "N58c …and a REFUSED push on a dirty tree still reports an INCOMPLETE listing instead of silencing it" $rcn58c
 echo
 
 # ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).

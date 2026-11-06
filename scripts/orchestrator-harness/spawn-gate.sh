@@ -1180,6 +1180,17 @@ LANE_END_LOCAL_SCOPE="held by NO ref in this repo's LOCAL refs/remotes/* cache (
 # restraint has to reach the REMEDY too, which is the line a reclaim pass actually obeys. Defined once and
 # appended through a %s slot by every `archived-local` remedy.
 ARCHIVE_MAY_BE_PARTIAL=" — AND this archive may be PARTIAL: bg-rescue-wip.sh exits 2 both for a partial archive and for a push that failed, so any path it reported as unarchivable is in NEITHER this ref NOR any other archive named here, and is on this disk alone — read the replayed rescue lines above and retrieve those paths by hand before removing anything"
+# ⛔ AND EXIT 0 DOES NOT PROVE THE ARCHIVE'S TREE IS THE WORKTREE (fresh review, P1 — REPRODUCED, and it
+# FALSIFIED the premise this branch used to leave the `refs/wip/*` arm untouched). Round 18 argued "the
+# callee skips no paths on exit 0", so "its tree is the worktree as it was left" was left standing. That is
+# wrong, and `scripts/bg-rescue-wip.sh` shows why: `git add -A` runs first (`:182`) and on failure falls back
+# to `git add -u` with stderr DISCARDED (`:190`), then adds each `git ls-files -o` entry — i.e. UNTRACKED
+# paths only — collecting `SKIPPED` from those alone (`:192-193`). A TRACKED file git cannot read fails both
+# the bulk add and `add -u`, is never in the untracked sweep, and so is in NEITHER the archive NOR the
+# skipped list — `write-tree` succeeds, the push succeeds, the callee exits 0. Reproduced: a tracked,
+# modified `notes.txt` with `chmod 000` produced `rescue=refs/wip/<slug>`, exit 0, no "could NOT be
+# archived" line, and an archive whose `notes.txt` holds the PRE-EDIT blob.
+ARCHIVE_TREE_NOT_PROVEN="the archive commit's TREE is NOT PROVEN to be the worktree as it was left — a TRACKED file git cannot read fails the bulk add AND the add -u fallback, is never in the untracked sweep, and so is in NEITHER the archive NOR the callee's skipped list, which still exits 0 — compare the archive's tree against the porcelain section before removing anything"
 LANE_WIP_RESCUE_SH=""   # resolved once, like LANE_BOUND_SH / REAP_LANE_VENV_SH
 # ── THE DURABLE EXIT ARTIFACT (the other half of #2834 ask 1; sibling of #3391) ─────────────────
 # ⛔ WHAT THE #2834 FIX DID NOT DO, AND WHY THAT HALF COSTS A CELL ITS DISK. The exit path above
@@ -1950,7 +1961,7 @@ lane_end_next() {
     cannot-verify)
       printf 'MANUAL — the tree at %s measured cannot-verify (rescue=%s): the listing was not PROVEN complete, so this terminal did NOT certify the tree and the rescue did not certify it either — which is NOT the same as the tree being clean. Do NOT reap %s on the strength of this row — read the [wip] line in the lane log%s%s\n' \
         "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_ROOT:-<unknown>}" \
-        "$(case "${LANE_END_RESCUE:-}" in refs/wip/*) printf ' — the archive is %s (its tree is the worktree as it was left, but the paths the INCOMPLETE listing never saw are in NEITHER)' "${LANE_END_RESCUE}" ;; archived-local) printf ' — AND the archive is the LOCAL pin %s only (no off-box copy), and it cannot cover the paths the incomplete listing never saw' "${LANE_END_REF:-refs/wip-local/<slug>}" ;; esac)" \
+        "$(case "${LANE_END_RESCUE:-}" in refs/wip/*) printf ' — the archive is %s (its tree is NOT PROVEN to be the worktree as it was left — a tracked file git cannot read lands in NEITHER the archive NOR the list the callee reports as skipped and still exits 0 — and the paths the INCOMPLETE listing never saw are in NEITHER)' "${LANE_END_RESCUE}" ;; archived-local) printf ' — AND the archive is the LOCAL pin %s only (no off-box copy), and it cannot cover the paths the incomplete listing never saw%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;; esac)" \
         "$(lane_end_push_caveat)"; return 0 ;;
   esac
   # ⛔ THE REFUSED-PUSH ARMS SIT **ABOVE** THE `archived-local` REPORTER (review cycle 12, P1 — REPRODUCED).
@@ -1983,7 +1994,7 @@ lane_end_next() {
           # from being structural.
           printf 'MANUAL — commit(s) on %s were NOT pushed (see the lane log) AND this terminal left uncommitted work at %s (tree=%s, rescue=%s, wip_ref=%s): do NOT reap it. Re-dispatch and push from a lane branch, and recover the uncommitted state from the rescue ref if one is named here%s\n' \
             "${LANE_END_BRANCH:-<unknown>}" "${LANE_END_ROOT:-<unknown>}" "${LANE_END_TREE}" \
-            "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_REF:-<none>}" "$(lane_end_rescue_caveat)"; return 0 ;;
+            "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_REF:-<none>}" "$(lane_end_rescue_caveat)$(lane_end_tree_caveat)"; return 0 ;;
       esac
       # ⛔ A CLEAN TREE IS NOT A LESSER RISK (review cycle 11, P2). This arm returned WITHOUT `MANUAL`,
       # while `refused-unknown-default` — a refusal that leaves the commits in exactly the same place, on
@@ -2101,7 +2112,7 @@ lane_end_next() {
         # `LANE_END_PUSH_URL` already holds the proven push url on every state that reaches this arm.
         printf 'recover the uncommitted state: git fetch %s %s && git diff --stat HEAD FETCH_HEAD (%s); %s\n' \
           "$(lane_end_push_repo)" "${LANE_END_RESCUE}" \
-          "the archive commit's TREE is the worktree as it was left" \
+          "$ARCHIVE_TREE_NOT_PROVEN" \
           "then re-dispatch"
         return 0 ;;
     esac
