@@ -947,8 +947,11 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
         # promises that `None` means "nothing is waiting"; returning it on `total > 0` would be
         # exactly the disarmed term that paragraph forbids — the age is only consulted when
         # `queue_age_s is not None`, so a null/absent `created_at` on a queue that HAS work would
-        # report "nothing is waiting". `ci_runner_gate.sh:299` refuses this same combination BY NAME
-        # ("A queued run exists, so its age MUST be a measurement").
+        # report "nothing is waiting". `ci_runner_gate.sh` refuses this same combination BY NAME
+        # ("A run WITH A QUEUED JOB exists, so its age MUST be a measurement") — named by its
+        # sentence rather than by a line number, because the number had already rotted (cycle-6
+        # review, finding 3) and #2344 has since narrowed that condition from "a queued run exists"
+        # to "a run with a queued job exists", which is the version this function should match.
         if total == 0:
             return None
         raise Unmeasurable(
