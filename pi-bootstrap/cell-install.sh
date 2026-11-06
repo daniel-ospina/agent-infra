@@ -944,11 +944,13 @@ def _dns_identity(label):
 
     Measured over all 0x110000 code points, so the justification above is a number and not a
     belief: UTS46 renames 6465 of them to a non-empty string, 2531 of those are invisible to this
-    predicate (1241 `Lu` + 27 `Lt` + 166 `Ll` case, plus 1097 non-case of which EVERY ONE satisfies
-    `NFKD(ch) == uts46_remap(ch)`, i.e. a compatibility decomposition rather than a substitution),
-    and **0 of the UTS46 DELETIONS are erased by `casefold`** — so the deleting class this rule
-    exists to catch can never hide here. (Earlier text claimed NFC-not-NFKC avoided the `ﬁ` fold;
-    that was false, `casefold` performs it too. The fold is intended; the claim was not.)
+    predicate — 1241 `Lu` + 27 `Lt` + 166 `Ll` case, plus 1097 non-case of which 1096 satisfy
+    `NFKD(ch) == uts46_remap(ch)` (a compatibility decomposition) and the 1 exception, U+0345
+    COMBINING GREEK YPOGEGRAMMENI, satisfies `casefold(ch) == uts46_remap(ch)` — its remap IS its
+    case fold. So no hidden rename is a substitution: every one is another spelling of the SAME
+    character. And **0 of the UTS46 DELETIONS are erased by `casefold`** — so the deleting class
+    this rule exists to catch can never hide here. (Earlier text claimed NFC-not-NFKC avoided the
+    `ﬁ` fold; that was false, `casefold` performs it too. The fold is intended; the claim was not.)
     """
     return unicodedata.normalize("NFC", label).casefold()
 

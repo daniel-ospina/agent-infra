@@ -2254,8 +2254,10 @@ done
 # suggested fix of comparing case-ONLY (`lower`) REFUSES this spelling, i.e. re-introduces the false
 # block on a legitimate IDN that the rule exists to remove — measured on this box, `_label_ok('a\ufb00b')`
 # is True under `casefold` and False under `lower`. Measured over all of Unicode: 0 of the UTS46
-# DELETIONS are erased by `casefold`, and every one of the 1097 non-case renames it hides satisfies
-# `NFKD(ch) == uts46_remap(ch)`. So the deleting class still cannot hide, and this spelling must stay.
+# DELETIONS are erased by `casefold`, and of the 1097 non-case renames it hides, 1096 satisfy
+# `NFKD(ch) == uts46_remap(ch)` while the 1 exception (U+0345 COMBINING GREEK YPOGEGRAMMENI)
+# satisfies `casefold(ch) == uts46_remap(ch)` — every hidden rename is another spelling of the SAME
+# character, never a substitution. So the deleting class still cannot hide, and this spelling must stay.
 for _good in 'https://localhost:8000/mcp' 'http://localhost:8000/mcp' \
              'https://127.0.0.1:8000/mcp' 'http://[::1]:8000/mcp' \
              'https://myhost.example./mcp/' 'https://my_host:8000/mcp' \
