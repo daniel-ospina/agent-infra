@@ -496,12 +496,71 @@ esac
 # ⛔ AND IT WAS PINNED FOR **ONE OF THREE** CALLERS (review round 8, P2 — MEASURED). This block named
 # the count "twice" and pinned only `adopt-fix.sh`; `dispatch-merge.sh` — a real `wt_provision` caller,
 # listed as one in this PR's own description — kept a SINGLE hardcoded "reclaim space" remedy for all
-# three REFUSED-UNKNOWN causes, and this suite stayed fully green. A count in a comment is not a
-# population: the loop below DERIVES the driven set from arm H's own caller census, so a fourth caller
-# cannot arrive unpinned the way the third did.
+# three REFUSED-UNKNOWN causes, and this suite stayed fully green.
 #
-# Each block is EXTRACTED FROM THE SHIPPED SCRIPT and EXECUTED with `$WT_RESULT` injected (the `arm_of`
-# idiom), so the assertion is on BEHAVIOUR and a regression breaks this arm rather than a copy of it.
+# ⛔ SO THE POPULATION IS NOW DERIVED, AND THE FIRST VERSION OF THIS COMMENT LIED ABOUT IT (review
+# cycle 9, P2 — MEASURED). That version claimed "the loop below DERIVES the driven set from arm H's
+# own caller census". There was no loop: `_af_sel` and `_dm_sel` below are TWO HAND-WRITTEN
+# extractions, so a FOURTH caller with a hardcoded remedy would still arrive unpinned — behind a
+# comment asserting it could not. A comment claiming a guard that does not exist is worse than no
+# comment: it is what stops the next reviewer looking. What is actually derived is the TOKEN census
+# immediately below (`arm_selects_remedy` over `census_pop`'s output), which is generic across caller
+# shapes and reds on a new caller; the BEHAVIOUR is driven per caller, because the three shipped
+# selectors do not share one extractable shape (`fix-one.sh`/`adopt-fix.sh` are multi-arm `case`
+# blocks; `dispatch-merge.sh` is a one-line `case … esac` plus an `if`, chosen so arm H's `arm_of`
+# still reaches its terminator). Stated, not implied.
+#
+# Each behaviour block is EXTRACTED FROM THE SHIPPED SCRIPT and EXECUTED with `$WT_RESULT` injected
+# (the `arm_of` idiom), so the assertion is on BEHAVIOUR and a regression breaks this arm rather than
+# a copy of it.
+
+# ⛔ ONE MATCHER AND ONE POPULATION PREDICATE, USED BY THE CENSUS **AND** BY ITS NON-VACUITY PROOF.
+# A second copy of either would let the check regress while its proof still passed — the `arm_of` idiom.
+arm_selects_remedy() { # <script> -> rc 0 when its rc-4 arm selects a remedy from the verdict
+  case "$(arm_of "$1")" in
+    *REFUSED-UNKNOWN*) return 0 ;;
+  esac
+  return 1
+}
+# ⛔ AN UNKNOWN REFUSAL MUST NOT USE THE WORD THAT SENDS AN OPERATOR TO FREE SPACE (review cycle 9,
+# P1 — MEASURED). The first version of these asserts keyed on the literal `"reclaim space"`, but ALL
+# THREE shipped UNKNOWN remedies said "Reclaiming space will NOT clear it" — a DIFFERENT spelling — so
+# the assert could not fire on the very text it was written about, and appending "you may also try
+# reclaiming space in the uv cache first" to `dispatch-merge.sh`'s UNKNOWN echo left the suite at
+# 78 passed / 0 failed. The remedies are reworded to "Waiting will NOT clear it" and the matcher is
+# widened to any use of the word, so either spelling of the wrong remedy is caught.
+remedy_names_reclaim() { # <remedy text> -> rc 0 when it tells the operator to reclaim space
+  case "$1" in *[Rr]eclaim*) return 0 ;; esac
+  return 1
+}
+
+# ══ THE DERIVED CENSUS: EVERY `wt_provision` CALLER MUST SELECT ITS REMEDY FROM THE VERDICT ══════
+# Over `census_pop`'s own output (the population arm H asserts as an EQUALITY), so a FOURTH caller reds
+# HERE instead of drifting in with one hardcoded remedy — the round-8 defect.
+_remedy_uncovered=""
+_remedy_covered=0
+for _rf in $(census_pop "$(cd "$HERE/.." && pwd)"); do
+  [ -f "$HERE/$_rf" ] || continue
+  if arm_selects_remedy "$HERE/$_rf"; then
+    _remedy_covered=$((_remedy_covered + 1))
+  else
+    _remedy_uncovered="$_remedy_uncovered $_rf"
+  fi
+done
+if [ -n "$_remedy_uncovered" ]; then
+  bad "H) these wt_provision caller(s) do NOT select a remedy from \$WT_RESULT:${_remedy_uncovered} — a REFUSED-UNKNOWN (probe failure / version skew) is reported as a full disk, the #2721 wrong-cause class"
+else
+  ok "H) every wt_provision caller ($_remedy_covered of them) selects its rc-4 remedy from \$WT_RESULT"
+fi
+# NON-VACUITY for that census: a caller with an rc-4 arm that does NOT mention REFUSED-UNKNOWN must be
+# flagged. Driven through the SAME predicate, on a scratch file — the real tree untouched.
+_rf_probe="$T/noremedy-caller.sh"
+printf '%s\n' 'case "$_wt_rc" in' '  4) echo "reclaim space and retry"; break ;;' 'esac' > "$_rf_probe"
+if arm_selects_remedy "$_rf_probe"; then
+  bad "H) the derived census is VACUOUS: a caller whose rc-4 arm hardcodes one remedy was counted as covered"
+else
+  ok "H) the derived census is non-vacuous: a hardcoded single-remedy caller IS flagged"
+fi
 _af_sel="$(awk '/^[[:space:]]*case "\$WT_RESULT" in/{f=1} f{print} f&&/^[[:space:]]*esac[[:space:]]*$/{exit}' "$HERE/adopt-fix.sh")"
 if [ -z "$_af_sel" ]; then
   bad "H) adopt-fix.sh's verdict-to-remedy selector is GONE or unextractable — two DIFFERENT causes would get one remedy"
@@ -516,11 +575,12 @@ else
       ok "H) an UNREADABLE probe gets its own remedy (it names the probe), selected from the verdict" ;;
     *) bad "H) adopt-fix.sh's REFUSED-UNKNOWN remedy does not name the PROBE — an unreadable df is reported as a full disk (the #2721 wrong-cause class)" ;;
   esac
-  case "$_af_unk" in
-    *"reclaim space"*)
-      bad "H) the REFUSED-UNKNOWN remedy tells the operator to RECLAIM SPACE — that remedy cannot arrive for a broken probe or a half-deployed box" ;;
-    *) ok "H) …and it does NOT tell an unreadable probe to reclaim space" ;;
-  esac
+  # Same matcher, widened: ANY use of the word, not one spelling (review cycle 9, P1).
+  if remedy_names_reclaim "$_af_unk"; then
+    bad "H) adopt-fix.sh's REFUSED-UNKNOWN remedy names RECLAIMING at all — an unreadable probe or a version skew is not a space problem"
+  else
+    ok "H) …and it does not name reclaiming in any spelling"
+  fi
   case "$_af_dsk" in
     *REFUSED-DISK*"reclaim space"*)
       ok "H) a genuine DISK refusal still gets the reclaim-space remedy (so the selector is not inert the other way)" ;;
@@ -547,11 +607,18 @@ else
       ok "H) dispatch-merge.sh's REFUSED-UNKNOWN remedy names the PROBE and the version skew, selected from the verdict" ;;
     *) bad "H) dispatch-merge.sh's REFUSED-UNKNOWN remedy does not name the probe/skew — an unreadable df or a half-deployed box is reported as a full disk (the #2721 wrong-cause class)" ;;
   esac
-  case "$_dm_unk" in
-    *"reclaim space"*)
-      bad "H) dispatch-merge.sh's REFUSED-UNKNOWN remedy tells the operator to RECLAIM SPACE — that remedy cannot arrive for a broken probe, and this arm stops the whole batch" ;;
-    *) ok "H) …and it does NOT tell an unreadable probe to reclaim space" ;;
-  esac
+  if remedy_names_reclaim "$_dm_unk"; then
+    bad "H) dispatch-merge.sh's REFUSED-UNKNOWN remedy names RECLAIMING at all — and this arm stops the WHOLE batch, so the wrong remedy compounds every cycle"
+  else
+    ok "H) …and it does not name reclaiming in any spelling"
+  fi
+  # NON-VACUITY FOR THE MATCHER ITSELF: the widening above must actually catch the spelling the old
+  # literal missed. Driven through the SAME predicate the asserts use.
+  if remedy_names_reclaim "Freeing things is pointless; you may also try reclaiming space in the uv cache first."; then
+    ok "H) the reclaim matcher is non-vacuous: the 'reclaiming space' spelling the old literal missed IS caught"
+  else
+    bad "H) the reclaim matcher cannot see 'reclaiming space' — the assert passes on the exact wrong remedy it exists to forbid"
+  fi
   case "$_dm_dsk" in
     *"reclaim space"*)
       ok "H) a genuine DISK refusal in dispatch-merge.sh still gets reclaim-space (the selector is not inert the other way)" ;;
