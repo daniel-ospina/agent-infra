@@ -2337,13 +2337,25 @@ rest_fail() {
 }
 
 # rest_list <issues|pulls> [--repo R] [--state S] [--limit N] [--label L] [--jq PROG]
+#                    [--sort S] [--direction D]
 #   The REST twin of the two `gh … list` forms this script uses. Prints the projected rows, one per
 #   line. rc 0 ONLY when every page was read AND the projection succeeded — the one property every
 #   caller below depends on. `--json` is NOT modelled on purpose: the caller's `--jq` names the
 #   fields it reads, and dropping a field an adapter does not model is the wrong-answer shape
 #   gh-rest's own header warns about. Messages go to stderr UNPREFIXED — the callers own the
 #   `[refresh]` tag (they both re-prefix what they collect, so a helper-side tag doubles it).
+#
+#   `--sort`/`--direction` ARE PART OF THE QUESTION, NOT A PREFERENCE: the provider's default order is
+#   created-DESCENDING, so an unqualified `--limit` window keeps the NEWEST rows. A caller that ranks
+#   AGE-SECOND must say `--sort created --direction asc`, or a truncated window silently loses the end
+#   its ranking values most (see the TIER WINDOWS paragraph below).
+#
+#   SIDE CHANNEL — `REST_WINDOW_FILLED` (0|1): set 1 when the run stopped with the window FULL while
+#   the provider still advertised a NEXT page. rc stays 0 (no caller's contract changes), so a caller
+#   that reads ABSENCE from the answer as evidence MUST test this flag; it is reset at ENTRY, so a
+#   value observed after a FAILED call is that call's, never the previous tier's.
 rest_list() {
+  REST_WINDOW_FILLED=0
   local kind="${1:-}"; [ $# -gt 0 ] && shift
   local repo="$OR" state="open" limit=30 label="" prog='.' ep q page=1 pages n tmp pf status more sort="" dir=""
   if [ -z "$kind" ]; then
@@ -2513,10 +2525,17 @@ rest_list() {
   # derived from `.pool`, would have pinned the OLDEST queued P2s to the TAIL on every pass, forever
   # (the window only moves further away as the board grows).
   # ⛔ SO EACH TIER ASKS OLDEST-FIRST (`--sort created --direction asc`), and truncation now loses the
-  # NEWEST rows instead. That is the end the ranking does not need, and it is the one that makes the
-  # unranked TAIL correct by construction: a queued row that fell out of a tier window is NEWER than
-  # every ranked row of its tier, so "after all ranked rows, in arrival order" is the ordering
-  # AGE-SECOND actually asks for. With the unsorted window the same placement was an INVERSION of it.
+  # NEWEST rows instead. Within ONE tier that is exactly the right end to lose, so a row that fell out
+  # of ITS OWN tier's window is newer than every ranked row of that tier.
+  # ⛔ AND THE TAIL IS NOT "CORRECT BY CONSTRUCTION" ACROSS TIERS — the previous wording claimed it was,
+  # and the claim was false (review cycle 33, P2). The tail is emitted after the last ranked row of
+  # EVERY tier, so a `P1-severe` issue pushed out of a FULL P1 window (a row created TODAY, the end the
+  # window now drops) lands BEHIND every ranked `P2-moderate`: the same severity inversion this change
+  # removes, arriving through the window instead of through the queue's order. It is silent — nothing in
+  # the answer says the window clipped — so the fix is a NAMED signal, not a stronger claim: each tier
+  # call records itself in `$O/.pool-sat` when `REST_WINDOW_FILLED` is 1, and `queue_order_from_pool`
+  # prints `windows=TRUNCATED(…)<tier>` on the order line. A truncated tier is then a fact the operator
+  # reads, and the residual is bounded by the tier's OWN bound (300/200/200), not by the backlog.
   # The BOUNDS are unchanged from the GraphQL form (`gh issue list --label … --limit 300/200/200` had
   # the same three windows), so the SPEND is untouched — only the end that is kept changes.
   # The alternative — fetching `limit` PROJECTED rows — means paging past the budget on the shared
@@ -2536,7 +2555,9 @@ rest_list() {
   # take the floor slot, which is the "never invent a class from a reading that did not answer" polarity
   # inverted. The rc stays 0 (no existing caller's contract changes); the flag is set instead, and the
   # floor's writer falls back to the conservative all-harness arm when it is set.
-  REST_WINDOW_FILLED=0
+  # ⛔ NOT RE-SEEDED HERE — IT WAS SEEDED AT ENTRY, so this assignment cannot be the only one. A run
+  # that returns early (the `--limit`/`--jq` refusals above) never reaches this line, and a flag that
+  # was only reset HERE left the PREVIOUS tier's value standing for the failed call.
   [ "${more:-0}" -ge 1 ] && REST_WINDOW_FILLED=1
   rm -rf "$tmp"
   return "$n"
@@ -3588,7 +3609,14 @@ touch "$O/checked.txt" "$O/candidates.txt" "$O/landed.txt"
 # that ANSWERED (even with zero rows), `.pool-err` the tier that did not — so UNREADABLE (nothing
 # answered) is a fact the parent can check rather than an inference from an empty error file, and
 # PARTIAL can NAME the tiers that were read instead of only the ones that failed.
-rm -f "$O/.pool-err" "$O/.pool-read"
+# ⛔ AND `.pool-sat` RECORDS THE TIERS WHOSE WINDOW WAS TRUNCATED (review cycle 33, P2). A tier whose
+# window ended FULL with a next page still advertised did not list its whole tier: with the
+# oldest-first order the NEWEST members of that tier are absent, and they are exactly the rows that
+# land in the unranked TAIL — behind every ranked row of every LOWER tier. Nothing else in the answer
+# says so, so the fact is written beside the read-state and read back by `queue_order_from_pool`,
+# which prints `windows=TRUNCATED(…)<tier>`. Same sentinel discipline as `.pool-read`: written from
+# the pipeline's own subshell, so the parent sees it; absent = no tier was truncated (or none ran).
+rm -f "$O/.pool-err" "$O/.pool-read" "$O/.pool-sat"
 {
   # ⛔ EVERY TIER WINDOW IS ASKED OLDEST-FIRST (`--sort created --direction asc`), because the pool
   # ranks AGE-SECOND (oldest-first inside a tier) and a truncated window must lose the end the ranking
@@ -3599,12 +3627,15 @@ rm -f "$O/.pool-err" "$O/.pool-read"
   # again here would restore the drift it removed, so the epoch below is the ONLY addition.
   if rest_list issues --repo "$OR" --state open --limit 300 --label P0-blocker --sort created --direction asc \
     --jq '.[]|'"$POOL_JQ"'|"0 \(.number)"' 2>>"$O/.pool-err"; then echo "P0-blocker" >> "$O/.pool-read"
+    [ "${REST_WINDOW_FILLED:-0}" = "1" ] && echo "P0-blocker" >> "$O/.pool-sat"
   else echo "P0-blocker" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P1-severe --sort created --direction asc \
     --jq '.[]|'"$POOL_JQ"'|"1 \(.number)"' 2>>"$O/.pool-err"; then echo "P1-severe" >> "$O/.pool-read"
+    [ "${REST_WINDOW_FILLED:-0}" = "1" ] && echo "P1-severe" >> "$O/.pool-sat"
   else echo "P1-severe" >> "$O/.pool-err"; fi
   if rest_list issues --repo "$OR" --state open --limit 200 --label P2-moderate --sort created --direction asc \
     --jq '.[]|'"$POOL_JQ"'|"2 \(.number)"' 2>>"$O/.pool-err"; then echo "P2-moderate" >> "$O/.pool-read"
+    [ "${REST_WINDOW_FILLED:-0}" = "1" ] && echo "P2-moderate" >> "$O/.pool-sat"
   else echo "P2-moderate" >> "$O/.pool-err"; fi
 # ⛔ ONE SORTED STREAM, ONE ARTIFACT. The rank map goes FIRST into the key (`-k1,1n`) and the
 # number is what is emitted, so the pool is priority-ordered, oldest-first inside a tier. (The fork's
@@ -3756,6 +3787,12 @@ queue_state_write "$POOL_STATE"
 # only its ORDER is re-derived from `.pool`, which depends on no verdict — and the line below says
 # `queue=READ(n)` first and `SKIPPED` second. #1736's vocabulary is preserved: READ/EMPTY describe the
 # queue, this describes the READER's decision.
+# ⛔ ONE EXCEPTION, NAMED RATHER THAN LEFT TO BE DISCOVERED 550 LINES LATER (review cycle 33, P2): if
+# the queue somehow carried a DUPLICATE row, `queue_order_from_pool`'s `qseen` collapses it and installs
+# the collapsed file — a row count CAN drop by one on a skipped pass. The absolute wording above read as
+# "membership is untouched", which contradicted the skip record's own sentence (the one that says
+# "a duplicate row, if the queue somehow carried one, is collapsed"). No DISTINCT row is ever added or
+# dropped: that is what "order, never membership" forbids.
 #
 # The token is written TWICE: `<digest> <epoch> <state> 0` BEFORE the loop and `… 1` after it only
 # when the loop exhausted the pool. So an interrupted pass (SIGKILL, a cycle timeout, a budget
@@ -3925,7 +3962,7 @@ queue_order_refuse() {
 # ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
 # silently inert, and a caller that skipped it would leave every assertion here green.
 queue_order_from_pool() {
-  local o="${1:-}" _r _u _h
+  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_said
   [ -n "$o" ] || return 1
   rm -f "$o/.queue-rank" "$o/.cand.ranked" 2>/dev/null
   if ! rank_queue_by_pool "$o/.pool" "$o/candidates.txt" "$o/.cand.ranked" "$o/.queue-rank"; then
@@ -4024,6 +4061,33 @@ queue_order_from_pool() {
   else
     _inst_said="the reorder was DERIVED and the queue already held exactly those bytes (nothing was written)"
   fi
+  # ⛔ A TRUNCATED TIER WINDOW IS NAMED ON THE ORDER LINE (review cycle 33, P2). `.pool-sat` is written by
+  # THE TIER READ (three lines above `queue_order_from_pool`'s caller): a tier whose window ended FULL
+  # with a next page still advertised did not list its whole tier. With the oldest-first order the tier's
+  # NEWEST members are the ones missing, so any of them that is queued lands in the unranked TAIL — behind
+  # every ranked row of every LOWER tier, which is a severity inversion the order line otherwise reports as
+  # a clean `severity-first`. Nothing else in the answer carries the fact, so it is printed here.
+  # ⛔ SANITISED, NOT ECHOED: only the three tier names are ever repeated, so a foreign or corrupt file
+  # cannot inject text into an operator-facing line. An unreadable mix is disclosed as such rather than
+  # printed. Absent file = no tier was truncated (the normal case) and no clause is added.
+  _sat=""; _sat_junk=0; _sat_tier=""
+  if [ -s "$o/.pool-sat" ]; then
+    while IFS= read -r _sat_tier; do
+      case "$_sat_tier" in
+        P0-blocker|P1-severe|P2-moderate) _sat="${_sat:+$_sat,}$_sat_tier" ;;
+        "") : ;;
+        *) _sat_junk=1 ;;
+      esac
+    done < "$o/.pool-sat" 2>/dev/null
+    [ -n "$_sat" ] || _sat="unrecognised"
+  fi
+  _sat_said=""
+  if [ -n "$_sat" ]; then
+    _sat_said=" — windows=TRUNCATED($_sat): a tier window ended FULL with a next page still advertised, so that tier's NEWEST members are NOT in .pool and any of them that is queued sits in the unranked TAIL, behind every ranked row of every LOWER tier"
+    if [ "$_sat_junk" -eq 1 ]; then
+      _sat_said="$_sat_said (the window record also carried a line that is not a tier name — it is NOT repeated here)"
+    fi
+  fi
   if [ -z "$_r" ] || [ -z "$_u" ]; then
     # ⛔ THE ORDER WAS DERIVED AND INSTALLED — ONLY THE COUNTS ARE UNKNOWN (review P2, cycle 10). This arm
     # said `priority-unreadable`, whose word for the ORDER is "UNVERIFIED (whatever the PREVIOUS pass
@@ -4079,7 +4143,7 @@ queue_order_from_pool() {
   fi
   if [ -n "$_h" ]; then
     QUEUE_ORDER_STATE="severity"
-    echo "[refresh] queue order: severity-first from the pool — head #$_h is the highest-ranked CLEAN entry still queued ($_r pool-ranked, $_u unranked at the tail)"
+    echo "[refresh] queue order: severity-first from the pool — head #$_h is the highest-ranked CLEAN entry still queued ($_r pool-ranked, $_u unranked at the tail)$_sat_said"
   elif [ "$_r" -gt 0 ]; then
     # ⛔ THE RANKED-NONE SENTENCE IS KEYED OFF WHAT WAS RANKED, NOT OFF THE HEAD (review P3, cycle 12).
     # `_h` is SANITISED above (`*[!0-9]*` -> ""), so a queue whose ranked rows are not plain issue
@@ -4115,7 +4179,7 @@ queue_order_from_pool() {
     echo "[refresh] unranked: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
-    echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry"
+    echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry$_sat_said"
   fi
   return 0
 }

@@ -1675,6 +1675,51 @@ if cmp -s "$MAINDRV" "$MHREV" 2>/dev/null; then rc=1; echo "      the revert mut
 fi
 ck "non-vacuity: the pre-fix UNGUARDED read makes the unreadable-queue fixture go RED (EMPTY + backlog=0 return)" $rc
 
+# ── 14) A CLIPPED TIER WINDOW IS NAMED, NOT LEFT TO BE INFERRED (review cycle 33, P2) ───────────
+# WHY THIS EXISTS. Each tier window is asked oldest-first so truncation loses the tier's NEWEST
+# members — the right end WITHIN that tier. But the tail is emitted after the last ranked row of
+# EVERY tier, so a clipped `P1-severe` row still lands BEHIND every ranked `P2-moderate`: the #8465
+# inversion this change removes, arriving through the window. The answer itself cannot say the window
+# clipped, so the tier read records it in `$o/.pool-sat` and the order line must NAMES it. A signal
+# nothing asserts is the inert-marker shape this suite exists to forbid: the ABSENT case is asserted
+# in the same check, and the red path is executed by mutation.
+drive sat "$FNS" '300
+9
+200
+' '200
+300
+' >/dev/null 2>&1
+sat_ctl="$(cat "$TMP/sat/out" 2>/dev/null)"
+printf 'P1-severe\n' > "$TMP/sat/o/.pool-sat"
+( cd "$TMP/sat" && HOME="$TMP/sat" bash drive.sh "$TMP/sat/o" ) > "$TMP/sat/out-sat" 2>&1
+sat_out="$(cat "$TMP/sat/out-sat" 2>/dev/null)"
+if [ -n "$sat_ctl" ] && ! grep -q 'windows=TRUNCATED' <<<"$sat_ctl" \
+   && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$sat_out"; then rc=0
+else rc=1; echo "      control (no .pool-sat) '$(printf '%s' "$sat_ctl" | tr '\n' '|' | head -c 200)' / saturated '$(printf '%s' "$sat_out" | tr '\n' '|' | head -c 260)'"; fi
+ck "a TRUNCATED tier window is NAMED on the order line, and the clause is ABSENT when no tier was clipped" $rc
+
+# 14b) THE NAME IS SANITISED — only the three tier names are ever repeated, so a corrupt/foreign
+#      `.pool-sat` cannot inject text into an operator-facing line (and an unrecognisable mix says so).
+printf 'EVIL;rm -rf /tmp/x\nP2-moderate\n' > "$TMP/sat/o/.pool-sat"
+( cd "$TMP/sat" && HOME="$TMP/sat" bash drive.sh "$TMP/sat/o" ) > "$TMP/sat/out-junk" 2>&1
+junk_out="$(cat "$TMP/sat/out-junk" 2>/dev/null)"
+if grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$junk_out" \
+   && ! grep -q 'EVIL' <<<"$junk_out"; then rc=0
+else rc=1; echo "      junk fixture '$(printf '%s' "$junk_out" | tr '\n' '|' | head -c 260)'"; fi
+ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not repeated into the log)" $rc
+
+# 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
+MUT_NOSAT="$TMP/fns-nosat.sh"
+sed 's/if \[ -s "\$o\/.pool-sat" \]; then/if false; then/' "$FNS" > "$MUT_NOSAT"
+if cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null; then rc=1; echo "      the .pool-sat mutation did not apply — the sed anchor drifted"; else
+  d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"
+  printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
+  { drive_prologue; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" bash drive.sh "$d/o" ) > "$d/out" 2>&1
+  if grep -q 'windows=TRUNCATED' "$d/out" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
+fi
+ck "non-vacuity: with the .pool-sat read removed the truncated-window clause disappears (the check can fail)" $rc
+
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0
