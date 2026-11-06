@@ -463,11 +463,21 @@ if [ "$ispush" -eq 1 ]; then
   echo "$n" > "$SHDIR/attempts"
   printf '%s\n' "$@" > "$SHDIR/argv.$n"
   echo "GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}" >> "$SHDIR/attempts.env.$n"
+  # ⛔ WHICH AMBIENT TOKEN THIS ATTEMPT SAW (#2292). The portable retry is "the same push with the
+  # ambient GH_TOKEN/GITHUB_TOKEN removed", so an arm has to be able to prove the shadow was PRESENT on
+  # attempt 1 and ABSENT on attempt 2. "It retried" alone passes an implementation that retries with the
+  # IDENTICAL credential, which cannot succeed.
+  echo "GH_TOKEN=${GH_TOKEN:-unset} GITHUB_TOKEN=${GITHUB_TOKEN:-unset}" >> "$SHDIR/attempts.env.$n"
   if [ "$iskey" -eq 1 ]; then echo keychain >> "$SHDIR/attempts.who"; else echo plain >> "$SHDIR/attempts.who"; fi
   case "$MODE" in
     wf_then_ok)   [ "$iskey" -eq 1 ] || { wf_reject; exit 1; } ;;
     wf_always)    wf_reject; exit 1 ;;
     wf_then_auth) if [ "$iskey" -eq 1 ]; then auth_reject; exit 1; else wf_reject; exit 1; fi ;;
+    # ⛔ THE CELL SHAPE (#3453/#3483): a stored credential that CAN push `workflow` files, shadowed by
+    # an ambient token that cannot. The remote refuses while the shadow variable is set and accepts the
+    # moment it is gone — so this mode measures whether the retry removed the shadow, not whether it
+    # said the words.
+    wf_shadowed)  if [ -n "${GH_TOKEN:-}${GITHUB_TOKEN:-}" ]; then wf_reject; exit 1; fi ;;
     plain_ok)     : ;;
     other)        [ "$iskey" -eq 1 ] || { other_reject; exit 1; } ;;
     authfail)     auth_reject; exit 1 ;;
@@ -487,10 +497,17 @@ SHIM
   bash -n "$d/git" 2>/dev/null || { echo "❌ generated stub is not valid bash: $d/git"; return 1; }
   return 0
 }
-# try_rescue <fixture> <mode> — build a worktree that touches .github/workflows, run the rescue under
-# the stub, and export RC/OUT/ATTEMPTS/WHO for the assertions.
-try_rescue() { # try_rescue <name> <mode> <branch>
-  local n="$1" mode="$2" br="${3:-fix/lane-one}" d="$T/$1"
+# try_rescue <fixture> <mode> [<branch>] [<retry-env>] — build a worktree that touches
+# .github/workflows, run the rescue under the stub, and export RC/OUT/ATTEMPTS/WHO for the assertions.
+# ⛔ THE RETRY CREDENTIAL IS PINNED FOR EVERY FIXTURE, ON PURPOSE. `retry_credential` picks per HOST
+# (osxkeychain on macOS, else "unshadow" an ambient token, else nothing), so an arm that asserts a
+# specific credential SHAPE would pass on one platform and fail on the other for reasons that have
+# nothing to do with the code — and the arms that assert `attempts=2` would be host-dependent too. The
+# fixture therefore pins the operator seam (`BG_RESCUE_PUSH_HELPER=osxkeychain`), which is also how the
+# macOS default is spelled. Arms that must exercise the DEFAULT selection pass `<retry-env>` explicitly
+# (an empty value means "no override"), and they assert the outcome they require rather than a shape.
+try_rescue() { # try_rescue <name> <mode> <branch> <retry-env>
+  local n="$1" mode="$2" br="${3:-fix/lane-one}" renv="${4-BG_RESCUE_PUSH_HELPER=osxkeychain}" d="$T/$1"
   mk_repo "$n" || { echo "❌ fixture failed ($n)"; return 1; }
   if [ "$br" != "fix/lane-one" ]; then git -C "$d/wt" checkout -q -b "$br"; fi
   mkdir -p "$d/wt/.github/workflows"
@@ -501,7 +518,9 @@ try_rescue() { # try_rescue <name> <mode> <branch>
   local slug; slug="$(printf '%s' "$br" | tr '/' '-')"
   mk_pushshim "$d/shim" "$mode" "$slug" || { echo "❌ shim failed ($n)"; return 1; }
   CFG_BEFORE="$(git -C "$d/wt" config --list --show-origin 2>/dev/null | sort)"
-  OUT="$(PATH="$d/shim:$PATH" bash "$RR" "$d/wt" "workflow-bearing lane killed" 2>&1)"; RC=$?
+  # `$renv` is a deliberately word-split list of `env` arguments (an override assignment, or `-u VAR`)
+  # owned by this file's own arms — never caller data.
+  OUT="$(env $renv PATH="$d/shim:$PATH" bash "$RR" "$d/wt" "workflow-bearing lane killed" 2>&1)"; RC=$?
   ATTEMPTS=0; [ -f "$d/shim/attempts" ] && ATTEMPTS="$(cat "$d/shim/attempts")"
   WHO=""; [ -f "$d/shim/attempts.who" ] && WHO="$(tr '\n' ' ' < "$d/shim/attempts.who")"
   return 0
@@ -687,6 +706,93 @@ case "$OUT" in
   *"cause: AUTHENTICATION"*) ok "authbad: names AUTHENTICATION as the cause" ;;
   *) bad "authbad: does not name the auth cause — $OUT" ;;
 esac
+
+echo; echo "── the retry's CREDENTIAL is chosen per host and never re-sends the refused one (#2292) ──"
+# ⛔ THE SHIPPED RETRY NAMED `osxkeychain` UNCONDITIONALLY. That helper exists only on macOS, so on a
+# Linux cell — every cell in this fleet, and the host class a lane is most likely to be reaped on — the
+# retry could never succeed, AND `-c credential.helper=` had already cleared the helper the box does
+# have, closing the only path to an off-box credential it had. The measured cell shape is not "no
+# credential exists" but "a stored credential that can push is SHADOWED by an ambient token that
+# cannot" (#3483 voided a review exactly this way; #3453 resolved a read-only PAT exactly this way), and
+# no push output says which of the two git used.
+#
+# These arms therefore measure AVAILABILITY (does the workflow-bearing snapshot reach origin on a host
+# with no osxkeychain), not the wording of a message.
+try_rescue wfshadow wf_shadowed fix/lane-one \
+  "-u BG_RESCUE_PUSH_HELPER -u GITHUB_TOKEN GH_TOKEN=shadow-readonly-pat"
+SH_SHA="$(ref_of "$T/wfshadow/origin.git" refs/wip/fix-lane-one)"
+[ "$RC" -eq 0 ] \
+  && ok "wfshadow: exit 0 — the snapshot is RESCUED on a host with no osxkeychain (the cell shape)" \
+  || bad "wfshadow: exit $RC (want 0) — the retry did not reach the stored credential — $OUT"
+[ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfshadow: exactly TWO attempts (one shadowed, one with the shadow removed)" \
+  || bad "wfshadow: ${ATTEMPTS:-0} attempt(s) (want exactly 2) — no retry, or a retry storm"
+grep -qx 'GH_TOKEN=shadow-readonly-pat GITHUB_TOKEN=unset' "$T/wfshadow/shim/attempts.env.1" 2>/dev/null \
+  && ok "wfshadow: attempt 1 really ran SHADOWED by the ambient token (so the arm is not vacuous)" \
+  || bad "wfshadow: attempt 1 did not see the shadow token — the fixture proves nothing: $(cat "$T/wfshadow/shim/attempts.env.1" 2>/dev/null)"
+grep -qx 'GH_TOKEN=unset GITHUB_TOKEN=unset' "$T/wfshadow/shim/attempts.env.2" 2>/dev/null \
+  && ok "wfshadow: attempt 2 ran with the ambient token REMOVED (that removal is the mechanism)" \
+  || bad "wfshadow: attempt 2 still carried the ambient token — the retry re-sent the credential that was just refused: $(cat "$T/wfshadow/shim/attempts.env.2" 2>/dev/null)"
+[ -n "$SH_SHA" ] && has_blob "$T/wfshadow/origin.git" "$SH_SHA" .github/workflows/ci.yml 'name: ci' \
+  && ok "wfshadow: the WORKFLOW FILE reached origin — the work left the disk without any keychain" \
+  || bad "wfshadow: origin has no snapshot carrying the workflow file (ref: ${SH_SHA:-none})"
+SH_RS1="$(tail -1 "$T/wfshadow/shim/argv.1" 2>/dev/null)"
+SH_RS2="$(tail -1 "$T/wfshadow/shim/argv.2" 2>/dev/null)"
+[ -n "$SH_RS1" ] && [ "$SH_RS1" = "$SH_RS2" ] \
+  && ok "wfshadow: both attempts push the SAME refspec (removing a variable cannot change WHAT is published)" \
+  || bad "wfshadow: the retry's refspec differs from the first push's ('${SH_RS1:-none}' vs '${SH_RS2:-none}')"
+SH_FORCE=0
+for _p in "$T/wfshadow/shim/argv.1" "$T/wfshadow/shim/argv.2"; do
+  [ -f "$_p" ] && grep -qE '^(\+|--force$|-f$)' "$_p" 2>/dev/null && SH_FORCE=1
+done
+[ "$SH_FORCE" -eq 0 ] \
+  && ok "wfshadow: NEITHER attempt carries a force form (a forced rescue can overwrite a peer clone's snapshot)" \
+  || bad "wfshadow: an attempt used a FORCE form"
+case "$OUT" in
+  *osxkeychain*|*OSXKEYCHAIN*) bad "wfshadow: claims the keychain credential on a host that has none — $OUT" ;;
+  *STORED*credential*) ok "wfshadow: names the credential that published it (the stored one, shadow removed)" ;;
+  *) bad "wfshadow: the success message does not name the credential used — $OUT" ;;
+esac
+
+# ⛔ AND WHEN NO CANDIDATE CAN BE A DIFFERENT CREDENTIAL, THERE IS NO RETRY. A second attempt carrying the
+# credential the remote just refused cannot succeed, and in the second before a cap kill it costs a
+# 45 s bound to re-learn what the first attempt said. What must NOT happen is that the run reads like "a
+# credential was rejected": the operator's action differs — supply one, via the documented seam.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  skip "wfnocred: the default candidate on macOS IS osxkeychain, so the no-second-credential arm cannot run here"
+else
+  try_rescue wfnocred wf_always fix/lane-one \
+    "-u BG_RESCUE_PUSH_HELPER -u GH_TOKEN -u GITHUB_TOKEN"
+  [ "$RC" -eq 2 ] \
+    && ok "wfnocred: exit 2 — still an honest local-only failure when there is nothing else to try" \
+    || bad "wfnocred: exit $RC (want 2) — $OUT"
+  [ "${ATTEMPTS:-0}" = "1" ] \
+    && ok "wfnocred: exactly ONE attempt — no retry is spent re-sending the refused credential" \
+    || bad "wfnocred: ${ATTEMPTS:-0} attempt(s) — a retry was spent on a credential that cannot differ"
+  [ -z "$(ref_of "$T/wfnocred/origin.git" refs/wip/fix-lane-one)" ] \
+    && ok "wfnocred: nothing was published, so the exit 2 is true" \
+    || bad "wfnocred: a ref landed on origin while the run reported failure"
+  case "$OUT" in
+    *"cause: WORKFLOW SCOPE"*) ok "wfnocred: still names WHY (workflow scope), not a bare 'push failed'" ;;
+    *) bad "wfnocred: the failure does not name its cause — $OUT" ;;
+  esac
+  case "$OUT" in
+    *"no second credential was tried"*) ok "wfnocred: says there was NO second credential (a different operator action from 'the retry failed')" ;;
+    *) bad "wfnocred: does not tell the operator that nothing else was tried — $OUT" ;;
+  esac
+  case "$OUT" in
+    *"BG_RESCUE_PUSH_HELPER"*) ok "wfnocred: names the seam that supplies one, instead of leaving the operator to guess" ;;
+    *) bad "wfnocred: names no way to supply a credential — $OUT" ;;
+  esac
+  case "$OUT" in
+    *"retrying ONCE"*) bad "wfnocred: claims a retry that was deliberately not made — $OUT" ;;
+    *) ok "wfnocred: does not claim a retry it did not make" ;;
+  esac
+  case "$OUT" in
+    *"STILL ONLY ON THIS DISK"*) ok "wfnocred: still says the work is on this disk only (never a cheerful exit)" ;;
+    *) bad "wfnocred: the at-risk warning is missing — $OUT" ;;
+  esac
+fi
 
 echo; echo "── a dispatcher that CALLS the rescue before it kills ──"
 # The contract that matters in production: the watchdog must rescue, not just the rescuer work.
