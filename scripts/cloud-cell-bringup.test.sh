@@ -1732,14 +1732,33 @@ case "$EMPTY_OUT" in
   *"NO checkout was found"*"rc=0"*) ok "an empty population is reported, never silently passed" ;;
   *) bad "a walk that found no checkout said nothing — an empty population must not read as clean: $EMPTY_OUT" ;;
 esac
-# ⛔ THE WORD `UNVERIFIED` IS A CONTRACT (review finding, P1). The bring-up picks the `CELL READY` banner
-# token by matching that LITERAL, so a line that says only "not a pass" leaves the banner certifying
-# identity as VERIFIED — on the NORMAL first-bring-up path, where the population is legitimately empty
-# because `check_repo_identity` runs BEFORE `check_repo` clones `$WORKDIR`. Measured before this arm: the
-# token came back as `repo identity` (verified) on an empty population.
+# ⛔ THE WORD `UNVERIFIED` IS STILL IN THE MESSAGE, AND THE CONTRACT IS STILL NOT THE WORD (two review
+# rounds met here). The bring-up once picked the `CELL READY` token by matching that LITERAL, so a line
+# saying only "not a pass" left the banner certifying identity as VERIFIED — on the NORMAL first-bring-up
+# path, where the population is legitimately empty because `check_repo_identity` runs BEFORE `check_repo`
+# clones `$WORKDIR`. That arm stays (an operator reads the message); the arm BELOW pins the real contract:
+# the walker's VERDICT, which a reworded message cannot change.
 case "$EMPTY_OUT" in
   *"repo identity UNVERIFIED:"*"NO checkout was found"*) ok "…and the line carries the literal UNVERIFIED the banner token watches (else the banner certifies an identity nothing measured)" ;;
-  *) bad "the empty-population line does not carry the UNVERIFIED literal, so the CELL READY banner would claim repo identity WAS verified: $EMPTY_OUT" ;;
+  *) bad "the empty-population line does not carry the UNVERIFIED literal, so a reader is not told: $EMPTY_OUT" ;;
+esac
+# ⛔ AND IT MAY NOT EARN THE BANNER TOKEN EITHER (review finding, P1 of the third round). The token was
+# decided by SUBSTRING-MATCHING "UNVERIFIED" out of a warning, and this is the one unverified verdict whose
+# text does not carry that word — so a box where the walk found NOTHING licensed `CELL READY — all links
+# verified (…, repo identity, …)`. The verdict is now its own token, so a reworded message cannot change
+# it and a caller cannot miss it.
+# (its own copy BESIDE A CURRENT library: with a stale or absent one the check returns before it can set
+# the token, and this arm would then pass without ever exercising the empty-population verdict)
+mkdir -p "$T/token-bringup/orchestrator-harness"
+sed 's/^main "\$@"$/:/' "$BRINGUP" > "$T/token-bringup/cloud-cell-bringup.sh"
+cp "$HERE/orchestrator-harness/repo-slug.sh" "$T/token-bringup/orchestrator-harness/repo-slug.sh"
+EMPTY_TOK="$(env -u WORKDIR -u REPO -u O REPO_IDENTITY_ROOTS="$T/ident-empty" REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; check_repo_identity >/dev/null 2>&1; printf "%s" "$REPO_IDENTITY_TOKEN"' _ \
+  "$T/token-bringup/cloud-cell-bringup.sh" 2>&1)"
+case "$EMPTY_TOK" in
+  "repo identity") bad "an EMPTY population earned the 'repo identity' banner token — the certification line lies about a check that measured nothing" ;;
+  *UNVERIFIED*|*PARTIAL*) ok "an empty population does not earn the token ($EMPTY_TOK)" ;;
+  *) bad "unexpected banner token for an empty population: $EMPTY_TOK" ;;
 esac
 
 say_case "repo identity: a LEGACY FLAT HARNESS PIN is a declared exception, never a directory to move"

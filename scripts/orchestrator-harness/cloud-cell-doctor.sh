@@ -2541,7 +2541,7 @@ service_controller_present() {
 # The verdicts come from `repo_identity_scan`, the SAME function the bring-up calls, so the two paths
 # cannot disagree about one box.
 repo_identity_report() {
-  local out v m rc=0 seen_fatal=0
+  local out v m rc=0 seen_fatal=0 seen_unverified=0
   if [ -z "$REPO_SLUG_LIB" ]; then
     if [ -n "$REPO_SLUG_LIB_STALE" ]; then
       log "[identity] CANNOT-VERIFY: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check (no repo_identity_scan in it) — it is the harness the LAST release deployed, so no checkout's name could be checked against its origin (an unanswered identity is not a pass; agent-infra#3521)"
@@ -2556,6 +2556,12 @@ repo_identity_report() {
     [ -n "$v" ] || continue
     case "$v" in
       fatal) seen_fatal=1; log "[identity] ⛔ FATAL: $m" ;;
+      # ⛔ AN UNANSWERED IDENTITY IS NOT A CLEAN PASS (review finding, P2). These used to arrive as `warn`
+      # and fold to rc=0, so `status` printed a green pass over a box where "does any checkout lie about
+      # its repo" was explicitly NOT answered — while the bring-up called the same box PARTIALLY verified.
+      # The walker's verdict now says so, and this role answers cannot-verify (3), the same way it does
+      # for every other dependency it could not measure.
+      unverified) seen_unverified=1; log "[identity] warn: $m" ;;
       warn)  log "[identity] warn: $m" ;;
       ok)    log "[identity] ok: $m" ;;
     esac
@@ -2566,6 +2572,10 @@ repo_identity_report() {
     return 3
   fi
   [ "$seen_fatal" -eq 0 ] || return 1
+  if [ "$seen_unverified" -eq 1 ]; then
+    log "[identity] CANNOT-VERIFY: at least one checkout on this box could not have its name checked against its origin (see the lines above) — an unanswered identity is never a pass (agent-infra#3521)"
+    return 3
+  fi
   return 0
 }
 

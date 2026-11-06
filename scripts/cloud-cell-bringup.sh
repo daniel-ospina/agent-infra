@@ -728,11 +728,13 @@ check_repo_identity() {
     [ -n "$v" ] || continue
     case "$v" in
       fatal) seen_fatal=1; die "CHECK FAILED [repo identity]: $m" ;;
-      warn)
-        # An UNVERIFIED line means this check did NOT answer the identity question for that directory,
-        # so the banner must not claim it did (see REPO_IDENTITY_TOKEN above).
-        case "$m" in *UNVERIFIED*) seen_unverified=1 ;; esac
-        warn "$m" ;;
+      # ⛔ READ THE VERDICT, NEVER THE MESSAGE TEXT (review finding, P1). This used to substring-match
+      # "UNVERIFIED" out of a `warn`, and the one unverified verdict whose text does not carry that word —
+      # an EMPTY population — then licensed the `CELL READY` banner to claim the check was verified.
+      # `unverified` is now its own verdict from the walker, so a caller cannot miss it and a reworded
+      # message cannot change a verdict.
+      unverified) seen_unverified=1; warn "$m" ;;
+      warn)  warn "$m" ;;
       ok)    ok "$m" ;;
     esac
   done <<< "$out"
@@ -2161,9 +2163,9 @@ main() {
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
       # ⛔ THE HEADLINE MUST NOT CONTRADICT THE TOKEN INSIDE THE SAME PARENTHESIS (review finding, P2).
-      # The line used to read `CELL READY — all links verified (one home, repo identity NOT verified (see
-      # the UNVERIFIED lines above), tools, …)`: the token was honest, but the sentence an operator and
-      # every log-scraper reads FIRST still asserted that all links were verified. That is the exact
+      # The line used to hard-code "all links verified" and then put the identity token inside the same
+      # parenthesis — so with an UNVERIFIED token the sentence an operator and every log-scraper reads
+      # FIRST still asserted that all links were verified. That is the exact
       # framing `REPO_IDENTITY_TOKEN` was introduced to remove, so the headline is now derived from what
       # the check measured rather than hard-coded.
       case "$REPO_IDENTITY_TOKEN" in

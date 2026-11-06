@@ -295,6 +295,16 @@ repo_identity_declared() {
     *-legacy-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9])
       printf '%s\n%s\n' '*' \
         'a dated QUARANTINE — a tree a repair set aside, kept because it may hold commits that exist nowhere else; the date is what keeps it reviewable' ;;
+    # ⛔ `*.not-a-worktree` — THE NAME THIS REPO'S OWN REMEDY CREATES (review finding, P1). When the pin
+    # root is not a worktree of the harness repo, `check_harness_pin` refuses and prints
+    # `mv '$HARNESS_PIN_DIR' '$HARNESS_PIN_DIR'.not-a-worktree`. An operator who does exactly that produced
+    # a directory with `.git` and the harness origin, under a name no row covered — so the NEXT `--check`
+    # DIED on it, with a remedy inviting a second rename of the tree the previous message had just called
+    # an impostor: two refusals in a row, contradictory remedies, nothing changed on the box. The row makes
+    # the tree the repo itself told the operator to create a declared quarantine.
+    *.not-a-worktree)
+      printf '%s\n%s\n' 'agent-infra' \
+        "a QUARANTINE created by this repo's own pin repair ('mv <pin> <pin>.not-a-worktree' — printed when the pin root is not a worktree of the harness repo), kept because it is the tree a previous bring-up was handed; the harness always comes from agent-infra" ;;
     # ⛔ THE GENERIC CELL-CHECKOUT NAMES, AND WHY THEY BELONG HERE RATHER THAN IN A REFUSAL. This repo's
     # OWN discovery code (`orchestrator-bringup.sh`'s `reseed_candidates`) names `$CELL_HOME/clone`,
     # `$CELL_HOME/repo` and `$CELL_HOME/cell-*` as the places a cell's checkout may live. A check that
@@ -385,7 +395,17 @@ repo_identity_own_repo() {
 repo_identity_fold() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
 # repo_identity_scan <root>... — ONE verdict per finding, as `<verdict><TAB><message>`:
-#     ok | warn | fatal
+#     ok | warn | unverified | fatal
+# ⛔ `unverified` IS A VERDICT, NOT A WORD IN A MESSAGE (review finding, P1). It used to be a `warn`
+# whose TEXT began "repo identity UNVERIFIED", and the bring-up decided whether the `CELL READY` banner
+# could claim the check by SUBSTRING-MATCHING that text — so the one verdict that does not carry the word
+# (an EMPTY population) certified as verified on the banner. A caller must never re-derive a verdict from
+# prose; the verdict is what the walker measured:
+#     ok          the name matches the repo the origin names (or several paths at one head)
+#     warn        deliberate and named — a declared exception, or a duplicate at different heads
+#     unverified  the question was NOT answered for this path (no readable origin, an origin that is not
+#                 a slug, a generic name with no declared repo, or a walk that found nothing to ask)
+#     fatal       the name claims one repo and the tree IS another
 # rc 0 = nothing fatal, 1 = at least one `fatal` line was printed. The CALLER owns the wording prefix
 # (`ok`/`warn`/`die` for the bring-up, a log line for the doctor) and the refusal itself; this function
 # owns the VERDICT, so the two callers cannot disagree about what a box is.
@@ -495,14 +515,14 @@ repo_identity_scan() {
       # name is all there is — and the name is exactly what this check refuses to trust, so it must not
       # pass on it either. It is not `fatal` because an unreadable origin cannot be shown to name a
       # WRONG repo, and refusing a bring-up on it would be a false block on a legitimate local mirror.
-      printf '%s\t%s\n' warn \
+      printf '%s\t%s\n' unverified \
         "repo identity UNVERIFIED: ${_sp[$i]}$where carries a .git but no readable 'origin' remote, so whether its name ($base) names the repo it actually is cannot be answered — an unanswered identity is not a pass (agent-infra#3521)"
       _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
       i=$((i + 1)); continue
     fi
     slug="$(repo_slug_from_remote "$url" 2>/dev/null)" || slug=""
     if [ -z "$slug" ]; then
-      printf '%s\t%s\n' warn \
+      printf '%s\t%s\n' unverified \
         "repo identity UNVERIFIED: ${_sp[$i]}$where origin ($url) is not an <owner>/<name> slug this fleet accepts, so its name ($base) cannot be checked against it — a readable origin that names no GitHub repo is still not an answer (agent-infra#3521)"
       _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
       i=$((i + 1)); continue
@@ -525,7 +545,7 @@ repo_identity_scan() {
     if [ "$exp" = '?' ]; then
       # A generic cell-checkout name on a box that declares no repo of its own: nothing was measured, so
       # this is UNVERIFIED — not a lie, and not a pass either.
-      printf '%s\t%s\n' warn \
+      printf '%s\t%s\n' unverified \
         "repo identity UNVERIFIED: ${_sp[$i]}$where is a checkout of $slug under the generic cell-checkout name '$base' — $reason (agent-infra#3521)"
       i=$((i + 1)); continue
     fi
@@ -556,16 +576,17 @@ repo_identity_scan() {
         i=$((i + 1)); continue ;;
     esac
     if [ "${_wt[$i]}" -eq 1 ]; then
-      # ⛔ THE `UNVERIFIED` LITERAL IS A CONTRACT, NOT PROSE — AND IT APPLIES HERE (review finding, P1).
-      # The bring-up picks the `CELL READY` token by matching that literal, so this line's own admission
-      # ("nothing to compare against its origin") must be machine-readable. Without it a worktree placed
-      # at a path named after ANOTHER repo — `…/agent-infra` holding tortoise, the measured cell-2 shape
-      # reached via `git worktree add` instead of `git clone` — left `seen_unverified` at 0 and the banner
-      # printed `CELL READY — all links verified`. TRADE-OFF, stated plainly: a cell that holds any linked
-      # worktree now reports `repo identity PARTIALLY verified`, because that name genuinely was not
-      # compared. That is the honest reading; a refinement (treat a branch-shaped name as "nothing to
-      # verify" rather than "unverified") is a separate change with its own evidence.
-      printf '%s\t%s\n' warn \
+      # ⛔ THIS NAME WAS NOT COMPARED, SO THE VERDICT SAYS SO — as a VERDICT, not as prose. It used to be
+      # a `warn` whose text carried the word "UNVERIFIED", which the bring-up matched to decide whether
+      # the `CELL READY` banner could claim the check; that is a contract made of a phrase, and it is the
+      # class this round removes. Without the distinction a worktree placed at a path named after ANOTHER
+      # repo — `…/agent-infra` holding tortoise, the measured cell-2 shape reached via `git worktree add`
+      # instead of `git clone` — read as verified and the banner printed `CELL READY — all links
+      # verified`. TRADE-OFF, stated plainly: a cell that holds any linked worktree reports
+      # `repo identity PARTIALLY verified`, because that name genuinely was not compared. That is the
+      # honest reading; a refinement (treat a branch-shaped name as "nothing to verify" rather than
+      # "unverified") is a separate change with its own evidence.
+      printf '%s\t%s\n' unverified \
         "repo identity UNVERIFIED: ${_sp[$i]}$where is a LINKED WORKTREE of $slug (its .git is a file, not a directory), so its directory name '$base' names a BRANCH, not a repository — nothing to compare against its origin, and it is never a directory lying about itself. Named so the tree is visible (agent-infra#3521)"
       i=$((i + 1)); continue
     fi
@@ -652,12 +673,13 @@ repo_identity_scan() {
   if [ "$checked" -eq 0 ]; then
     # An EMPTY population is not a pass: it means the walk found nothing to ask, which on a cell is
     # itself suspicious (a cell with no checkout of its own repo cannot be right).
-    # ⛔ THE WORD `UNVERIFIED` IS A CONTRACT, NOT PROSE (review finding, P1). The bring-up decides the
-    # `CELL READY` banner token by matching that LITERAL, so an empty population that said only "not a
-    # pass" left `seen_unverified` at 0 and the banner certified identity as VERIFIED — on the NORMAL
-    # first-bring-up path, where `check_repo_identity` runs before `check_repo` clones `$WORKDIR`, so the
-    # population is legitimately empty and then the clone happens. Keep the literal.
-    printf '%s\t%s\n' warn \
+    # ⛔ AND IT IS AN `unverified` VERDICT, NOT A `warn` WITH A MAGIC WORD (two review rounds met here).
+    # The bring-up once decided the `CELL READY` token by matching the LITERAL "UNVERIFIED" in the text, so
+    # an empty population that said only "not a pass" left the banner certifying identity as VERIFIED — on
+    # the NORMAL first-bring-up path, where `check_repo_identity` runs before `check_repo` clones
+    # `$WORKDIR` and the population is legitimately empty. The verdict is now the contract; the word stays
+    # in the message because it is true and operators read it.
+    printf '%s\t%s\n' unverified \
       "repo identity UNVERIFIED: NO checkout was found under any of the roots checked ($*), so nothing's name was verified against its origin — an empty population is not a pass (agent-infra#3521)"
   fi
   [ "$fatal" -eq 0 ] || return 1
