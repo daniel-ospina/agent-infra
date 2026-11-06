@@ -435,7 +435,7 @@ grep -q '^5150	deadbeef	' "$TRIED" || bad "a started launch must leave its ledge
 # (measured, review round 6) — the rollback only ever exercised the branch where another row survives.
 TRIED=$(mktemp)
 RAIL_SCRIPT="$_fakerail" LAUNCH_VERIFY_S=1
-launch_rail daniel-ospina/tortoise 5151 deadbeef /proc/no/such/dir/auto-x-5151.out 2>/dev/null && bad "a launch that never started must FAIL, not be recorded as a launch"
+launch_rail daniel-ospina/tortoise 5151 deadbeef /proc/no/such/dir/auto-x-5151.out 2>/dev/null && bad "a launch that never started must FAIL, not be recorded as a launch"  # portability-ok: this is a deliberately NON-EXISTENT fixture path handed to the launcher as an argument — not a procfs READ. Where /proc is absent (macOS) the path is still nonexistent, so the fixture behaves identically and the arm still discriminates.
 grep -q '^5151	deadbeef	' "$TRIED" && bad "a launch that never started must be ROLLED BACK — otherwise the next pass reports it as already railed for 6 h"
 [ -s "$TRIED" ] && bad "the rollback must leave an EMPTY ledger when the failed launch was its only row (got: $(cat "$TRIED"))"
 rm -rf "$_ldir" "$_fakerail"

@@ -348,9 +348,9 @@ case "$OS" in
     RENDER_HOME=""
     case "$D" in
       /etc/systemd/system|/etc/systemd/system/|/lib/systemd/system|/lib/systemd/system/|/usr/lib/systemd/system|/usr/lib/systemd/system/)
-        _owner="$(stat -c '%U' "$STATE_DIR" 2>/dev/null || true)"
+        _owner="$(stat -c '%U' "$STATE_DIR" 2>/dev/null || true)"  # portability-ok: `%U`/`%G` are OWNER/GROUP, not mtime — `box_mtime` returns an epoch and cannot supply either; and this block is reachable only for systemd unit dirs, i.e. Linux. The BSD arms above already carry the macOS path (a launchd agent runs as its owner).
         if [ -n "$_owner" ] && [ "$_owner" != root ]; then
-          _group="$(stat -c '%G' "$STATE_DIR" 2>/dev/null || true)"
+          _group="$(stat -c '%G' "$STATE_DIR" 2>/dev/null || true)"  # portability-ok: paired with the `%U` arm directly above — owner/group lookup, no portable shim; Linux-only by the enclosing systemd `case`.
           RENDER_HOME="$(getent passwd "$_owner" 2>/dev/null | cut -d: -f6)"
           if [ -z "$RENDER_HOME" ]; then RENDER_HOME="$(eval echo "~$_owner" 2>/dev/null)"; fi
           [ -n "$RENDER_HOME" ] || fail "cannot resolve HOME for $_owner (owner of $STATE_DIR) -- refusing to render a $(basename "$D") unit whose HOME would not match the state dir it writes"
