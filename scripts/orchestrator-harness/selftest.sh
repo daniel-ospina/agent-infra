@@ -1287,9 +1287,16 @@ PY
   ck "holder-only INCOMPLETE queued via the registry is also marked checked" $rc
   # (ii-b) the registry is NOT INSTALLED: nothing has answered the holder question, so refuse. This is
   # the arm that keeps the re-route from becoming "no registry, so nobody holds it".
+  # ⛔ IT MUST RUN THE REAL READER. `refreshloop-claim.sh` prepends a STUB whose whole body is
+  # `return 0`, so moving `claims.sh` away changed NOTHING: the stub answered CLEAN and #10 was
+  # queued — the fixture could no longer express the shape it is named for. #2466 (8a3e5359) moved
+  # the missing-file verdict INTO `issue_claim_verdict` (refresh-candidates.sh:1019-1024) and deleted
+  # the loop's own `[ -f "$O/claims.sh" ]` arm, so the stub became the only decider.
+  sed -n '/^issue_claim_verdict() {/,/^}$/p' "$REFRESH" > "$TMP/icv-real.sh"
+  { cat "$TMP/icv-real.sh"; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-real.sh"
   mv "$HI/claims.sh" "$HI/claims.sh.away"
   : > "$HI/candidates.txt"; : > "$HI/checked.txt"
-  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-noreg.out" 2>&1
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-real.sh" > "$TMP/holderinc-noreg.out" 2>&1
   case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "holder-only INCOMPLETE with NO claim registry on the box is NOT queued" $rc
   mv "$HI/claims.sh.away" "$HI/claims.sh"
@@ -1600,8 +1607,17 @@ REPORT
   # fail-open this whole substitution is shaped to avoid. (The pre-#2952 arm `(ii-b)` pins the same
   # wiring on the OLD wording; this one pins it on the producer's real one.)
   CELL2952B2="$(holder_report x "$CELL2952_REPORT")"
+  # ⛔ THE STUB ABOVE ANSWERS rc=2 WITH ITS OWN TEXT, so `rm -f claims.sh` was inert and the assertion
+  # below could never see the producer's real sentence. Rebuild the loop with the REAL reader extracted
+  # from the shipped script (the same seam `(ii-b)` uses) so the removal is load-bearing.
+  sed -n '/^issue_claim_verdict() {/,/^}$/p' "$REFRESH" > "$TMP/icv-real.sh"
+  { cat "$TMP/icv-real.sh"; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952-real.sh"
+  r2952_run_real() { # <dir> <name>
+    O="$1" LIMIT=5 SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" \
+      bash "$TMP/refreshloop-2952-real.sh" > "$TMP/2952-$2.out" 2>&1
+  }
   rm -f "$CELL2952B2/claims.sh"
-  r2952_run "$CELL2952B2" b2b
+  r2952_run_real "$CELL2952B2" b2b
   if r2952_is_queued "$CELL2952B2"; then rc=1; else rc=0; fi
   ck "(2952b) an ABSENT claims registry is still INCOMPLETE — not queued (no registry is not a free issue)" $rc
   case "$(cat "$TMP/2952-b2b.out")" in
@@ -1872,6 +1888,12 @@ ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray 
 # turning it into a refusal is a deliberate test edit with a stated reason — never a silent tightening
 # that refuses every local dev clone (`git init` + `remote add origin <path>`).
 XP="$TMP/repolocalpath"; mkdir -p "$XP/tools" "$XP/origin.git"
+# ⛔ THE FIXTURE'S $O MUST BE PROVISIONED, OR A DIFFERENT GATE ANSWERS. `--check` gained a claims gate
+# (#2466, 8a3e5359) that refuses an absent `$O/claims.sh` with its own NOT PROVISIONABLE, six days
+# after this arm was written — so the assertion below was reading the CLAIMS verdict, not the
+# resolver's tolerance. Seeding the registry makes the removal meaningful: only the local-path
+# resolver can then decide, which is the thing this arm is named for.
+mkdir -p "$XP/o"; printf 'claim_issue_preflight() { return 0; }\n' > "$XP/o/claims.sh"
 printf '# fixture: `--check` only tests that the pre-flight tool EXISTS (#1736)\n' > "$XP/tools/collision_preflight.py"
 git -C "$XP/origin.git" init -q --bare
 git -C "$XP" init -q; git -C "$XP" remote add origin "$XP/origin.git"
@@ -2362,8 +2384,13 @@ grep -q 'if wt_spawn "fix-\$PR"' "$LOOP" && rc=0 || rc=1
 ck "fixer spawn is attempted before the attempt is recorded" $rc
 grep -q 'PARKED after' "$LOOP" && rc=0 || rc=1
 ck "reaching MAX_FIX_TRIES parks the PR instead of re-reviewing forever" $rc
-grep -q 'claim_live "\$PR"' "$LOOP" && rc=0 || rc=1
-ck "controller honours the claim written by the chain path" $rc
+# ⛔ PIN THE DELEGATION, NOT A VARIABLE SPELLING. `claim_live "$PR"` was rewritten by 61b195ee
+# (#2831) so the spawn guards call `claim_live "$pr" "$sha"` inside a helper and the literal no longer
+# exists — a pin on the spelling reds on a rename while proving nothing. What the chain path depends on
+# is that the spawn guard consults the CROSS-BOX lease (which is exactly what the chain writes and
+# releases), so assert that call survives inside `claim_live()`.
+sed -n '/^claim_live() {/,/^}$/p' "$LOOP" | grep -q 'claim_lease_live "\$1"' && rc=0 || rc=1
+ck "controller honours the claim written by the chain path (the spawn guard consults the cross-box lease)" $rc
 
 # ── 10) template / renderer placeholder parity ───────────────────────────────────
 tpl="$(grep -oE '__[A-Z_]+__' "$HERE/launchd.plist.template" | sort -u)"
@@ -3536,7 +3563,13 @@ printf '#!/bin/bash\nexit 0\n' > "$BG/stub/tmux"
 chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
-GH_HOME_RECORD="$GH_HOME_RECORD" PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
+# ⛔ THE ONE-HOME GATE RUNS BEFORE `check_gh` (cloud-cell-bringup.sh:387-413 -> :1994-1995, 0d6d630c).
+# A sandbox `CELL_HOME` under the host temp dir is by design not this box's home, so the fixture must
+# supply the two seams the file itself declares: HOME equal to the cell home (the point of the arm —
+# a keys.env `HOME=` must not win), and `CELL_VOLATILE_ROOTS`, the documented FIXTURE SEAM at :327-332
+# that every hermetic cell suite already sets.
+GH_HOME_RECORD="$GH_HOME_RECORD" HOME="$BG/home" CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root \
+  PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
   WORKDIR="$BG/work" ENV_FILE= GH_TOKEN_FILE="$TMP/gh-tok" \
   bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
 if [ -s "$TMP/bg-gh-home.txt" ]; then
@@ -4091,12 +4124,16 @@ ck "install.sh derives _NCPU portably too (its MAX_LOAD must match the loop's on
 # through the last MAX_LOAD guard, so any guard added inside it is picked up automatically.
 sed -n '/^_NCPU=/,/^is_limit "${MAX_LOAD:-}"/p' "$INST" > "$TMP/ncpu-inst.sh"
 if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted"; then
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
+  # ⛔ THE FIXTURE DRIVES install.sh's GUARD, SO IT MUST NOT INHERIT THE CALLER'S MAX_LOAD. install.sh
+  # opens with `MAX_LOAD="${MAX_LOAD:-…}"`, so an ambient EXPORTED MAX_LOAD — a harness/agent shell
+  # sets one — short-circuits every arm below and all five red for a fact about the operator's shell,
+  # not the guard. `unset` inside each drive script makes it self-contained whichever way it is called.
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
   _nout="$(bash "$TMP/ncpu-drive.sh" 2>&1)"; _nrc=$?
   [ "$_nrc" -eq 0 ] && [ "$_nout" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU guard -> rc=$_nrc out='$_nout'"; }
   ck "install.sh falls back to 4 cores when sysctl succeeds but prints garbage (no arithmetic abort)" $rc
   # Non-vacuity: the stub really is the value being consulted, and a good one is still honoured.
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
   _nout2="$(bash "$TMP/ncpu-drive2.sh" 2>&1)"
   [ "$_nout2" = "120" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 120"; }
   ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 120)" $rc
@@ -4104,18 +4141,18 @@ if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted";
   # __MAX_LOAD__ into the LIVE plist, so an absurd-but-numeric `_NCPU` here — not in the loop — was
   # the one that actually wrote `MAX_LOAD=0` into a running box. 2**63 * 10 wraps to exactly 0 and
   # every guard accepts 0, so this is RED on the pre-fix install.sh (which had is_num only).
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 9223372036854775808; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive3.sh"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 9223372036854775808; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive3.sh"
   _nout3="$(bash "$TMP/ncpu-drive3.sh" 2>&1)"
   [ "$_nout3" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=2**63 -> plist MAX_LOAD='$_nout3', expected 40 (not 0)"; }
   ck "install.sh bounds an absurd _NCPU so the plist cannot get MAX_LOAD=0 (would dispatch nothing)" $rc
   # A 0-valued probe is a failed probe: the same guard as the loop's.
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 0; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive4.sh"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 0; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive4.sh"
   _nout4="$(bash "$TMP/ncpu-drive4.sh" 2>&1)"
   [ "$_nout4" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=0 -> plist MAX_LOAD='$_nout4', expected 40 (not 0)"; }
   ck "install.sh treats a 0-valued _NCPU probe as a failed probe (MAX_LOAD=40, not 0)" $rc
   # The other wrap a MAX_LOAD-only guard cannot see: a 9-digit probe is IN range, but its product is
   # 10 digits and never binds. Only the true-default fallback catches it.
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 999999999; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive5.sh"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 999999999; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive5.sh"
   _nout5="$(bash "$TMP/ncpu-drive5.sh" 2>&1)"
   [ "$_nout5" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=999999999 -> plist MAX_LOAD='$_nout5', expected 40"; }
   ck "install.sh falls back to 40 for a product that outgrows the 9-digit bound" $rc
