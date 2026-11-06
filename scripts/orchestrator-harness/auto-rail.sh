@@ -13,6 +13,19 @@ set -u
 # The log sink is bound FIRST, because every startup refusal below writes to it and a refusal that can
 # only reach a hardcoded path cannot be driven by a test (review round 5). Same default as before.
 LOG=${LOG:-/tmp/auto-rail.log}
+# ⛔ DIGITS ARE NOT ENOUGH: A VALUE BEYOND bash's LONG_MAX MAKES EVERY COMPARISON AN ERROR, AND AN ERROR
+# READS AS FALSE. The `case '':|*[!0-9]*` guards below accept `99999999999999999999`; `[ 0 -ge 999… ]`
+# prints "integer expression expected" and returns 2, which every `if` in this file reads as FALSE — so
+# REVIEW_PER_PASS stops bounding (one PAID reviewer per candidate per pass), REVIEW_COOLDOWN_S stops
+# delaying a second paid reviewer over a head already in flight, REVIEW_MAX_ATTEMPTS exhausts at ZERO
+# attempts, and REVIEW_ATTEMPT_WINDOW_S wraps `cut` negative so nothing ever expires. All four were
+# demonstrated by driving the shipped functions. A LENGTH bound makes the error path unreachable; nine
+# digits is ~31 years in seconds, so no lawful window or count is excluded.
+knob_fits() {  # $1 = knob name, $2 = its value; refuses a value whose LENGTH breaks `[ ]`
+  [ "${#2}" -le 9 ] && return 0
+  echo "$(date -u +%FT%TZ) REFUSED: $1='$2' is longer than 9 digits — bash's numeric comparison errors above LONG_MAX, and an ERROR reads as FALSE to every caller, i.e. no bound at all" >> "$LOG"
+  exit 3
+}
 # ⛔ THE SHIPPED DEFAULT IS 8. Review round 5 measured `MAX=${MAX:-2}` here and it is the recorded
 # SYMPTOM value, not a considered bound: it derived `MAX_TOTAL=4` where the body of the change promised
 # 16, and it re-shipped the exact incident this repo already has on record twice —
@@ -121,6 +134,11 @@ case "${COOLDOWN_TRANSIENT_S}" in ''|*[!0-9]*)
 REVIEW_COOLDOWN_S=${REVIEW_COOLDOWN_S:-2700}
 case "${REVIEW_COOLDOWN_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a positive integer — a non-numeric window makes every review-dispatch comparison a syntax error, i.e. no cooldown at all" >> "$LOG"; exit 3;; esac
+# ⛔ THE LENGTH BOUND RUNS **BEFORE** THE NUMERIC COMPARISONS: `[ 99999999999999999999 -gt 0 ]` is ITSELF
+# the error this guard exists to prevent, so a length check placed BELOW it never runs — measured, the
+# refusal then came from the `-gt 0` line saying "is not a POSITIVE integer", which is the wrong reason and
+# sends the operator looking for a zero they never set.
+knob_fits REVIEW_COOLDOWN_S "$REVIEW_COOLDOWN_S"
 [ "$REVIEW_COOLDOWN_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_COOLDOWN_S='${REVIEW_COOLDOWN_S}' is not a POSITIVE integer — 0 re-dispatches a paid reviewer every pass over a head that is already being reviewed" >> "$LOG"; exit 3; }
 # ⛔ AND A REVIEW IS NOT A RAIL: DO NOT EMPTY THE QUEUE IN ONE PASS. Measured on this box while
 # implementing this: agent-infra had 8 mergeable PRs with NO record and 16 with a STALE one, tortoise 4
@@ -160,11 +178,21 @@ case "${REVIEW_PER_PASS}" in ''|*[!0-9]*)
 REVIEW_ATTEMPT_WINDOW_S=${REVIEW_ATTEMPT_WINDOW_S:-21600}
 case "${REVIEW_ATTEMPT_WINDOW_S}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: REVIEW_ATTEMPT_WINDOW_S='${REVIEW_ATTEMPT_WINDOW_S}' is not a non-negative integer — a non-number makes the window comparison an ERROR, which reads as FALSE, i.e. every attempt ever counted and the bound permanent" >> "$LOG"; exit 3;; esac
+knob_fits REVIEW_ATTEMPT_WINDOW_S "$REVIEW_ATTEMPT_WINDOW_S"
 [ "$REVIEW_ATTEMPT_WINDOW_S" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_ATTEMPT_WINDOW_S='${REVIEW_ATTEMPT_WINDOW_S}' is not a POSITIVE integer — 0 makes every attempt expire the instant it is written, i.e. no bound at all, which is the paid loop this counter exists to stop" >> "$LOG"; exit 3; }
 REVIEW_MAX_ATTEMPTS=${REVIEW_MAX_ATTEMPTS:-3}
 case "${REVIEW_MAX_ATTEMPTS}" in ''|*[!0-9]*)
   echo "$(date -u +%FT%TZ) REFUSED: REVIEW_MAX_ATTEMPTS='${REVIEW_MAX_ATTEMPTS}' is not a non-negative integer — a non-number makes the attempt comparison an ERROR, which reads as FALSE, i.e. no bound at all" >> "$LOG"; exit 3;; esac
+knob_fits REVIEW_MAX_ATTEMPTS "$REVIEW_MAX_ATTEMPTS"
 [ "$REVIEW_MAX_ATTEMPTS" -gt 0 ] || { echo "$(date -u +%FT%TZ) REFUSED: REVIEW_MAX_ATTEMPTS='${REVIEW_MAX_ATTEMPTS}' is not a POSITIVE integer — 0 makes every head EXHAUSTED before its first dispatch, which is the review arm silently disabled while the log reads clean; REVIEW_PER_PASS=0 is the lawful way to disable it" >> "$LOG"; exit 3; }
+# ⛔ EVERY NUMERIC KNOB THIS STEP READS THAT HAS NO `-gt 0` COMPARISON OF ITS OWN. `LAUNCH_VERIFY_S` and
+# `COOLDOWN_TRANSIENT_S` were unvalidated for exactly this reason and are compared in the same `[ ]`
+# arithmetic — `COOLDOWN_TRANSIENT_S=abc` makes `[ "$age" -lt "$_cool" ]` an ERROR, which reads as FALSE,
+# i.e. no cooldown at all: re-railing/re-reviewing on every pass. `REVIEW_PER_PASS` is length-checked here
+# too (it has no `-gt 0`), so this is the only place its magnitude is bounded.
+knob_fits LAUNCH_VERIFY_S "$LAUNCH_VERIFY_S"
+knob_fits COOLDOWN_TRANSIENT_S "$COOLDOWN_TRANSIENT_S"
+knob_fits REVIEW_PER_PASS "$REVIEW_PER_PASS"
 # ⛔ THE RAIL MUST LIVE SOMEWHERE THAT SURVIVES. Measured 2026-10-30 08:20Z, on this very actuator:
 #    RAIL_SCRIPT defaulted to `/tmp/wt-regsync2/scripts/admin-merge.sh`  -> MISSING
 #    PARALLEL    defaulted to `/tmp/jobs2/rail-parallel.sh`              -> MISSING
@@ -786,7 +814,17 @@ review_should_defer() {  # $1 = reviews already dispatched for THIS repo in THIS
 # spends nothing. Defaulting to `review` would turn a parse surprise into a paid dispatch.
 review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; prints review|rail|skip
   case "$1:${2:-}" in
-    *:at-head)  printf 'rail\n';;    # an attestation at the head that would merge: today's path
+    *:at-head)  printf 'rail\n';;    # a CLEAN attestation at the head that would merge: today's path
+    # ⛔ A NON-CLEAN RECORD AT THE HEAD IS NOT `at-head`, AND ROUTING IT TO THE RAIL WAS AN INFINITE
+    # RE-RAIL (P1, measured 2026-11-06). `record-review.sh` mints `verdict=not-clean` as a first-class
+    # verdict for a review that found blocking issues (agent-infra#3400), and check (c) accepts ONLY
+    # `clean|clean-micro|clean-low` — so `at-head` on a not-clean marker launched a rail against a head
+    # the gate refuses for ever, re-railed every COOLDOWN_TRANSIENT_S, AND disabled the review arm (the
+    # one value that does) at the same time. Live on this repo when this was written: #3333, #3308 and
+    # #3231 all carry `verdict=not-clean @ <current head>`. The head HAS been reviewed; the remedy is a
+    # fix, so this is a terminal state that publishes itself — never a rail, never a second review of a
+    # revision whose verdict is already known.
+    *:rejected) printf 'skip\n';;    # head-bound record exists, but NOT a verdict the gate can accept
     green:*)    printf 'review\n';;  # no attestation for the head that would merge, and it could land
     red:absent) printf 'skip\n';;    # red, and nothing to carry: the red arm owns it
     *)          printf 'rail\n';;    # red WITH a marker (stale/nohead): hand it to the rail, as the base did
@@ -845,8 +883,18 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
 # once still leaves an outcome rather than a permanent `pending`. Exported (rather than inlined into
 # `nohup bash -c`) so the suite can drive it against a stub reviewer without spawning the loop.
 run_review() {  # $1 = reviewer script, $2 = PR, $3 = repo, $4 = output file
-  bash "$1" "$2" --repo "$3" >> "$4" 2>&1
-  printf 'REVIEW-EXIT rc=%s\n' "$?" >> "$4"
+  # ⛔ `< /dev/null` IS LOAD-BEARING: the loop's stdin is the CANDIDATE FILE (`done < "$_cand"`), and
+  # `pi` DRAINS PIPED STDIN into the first prompt. A child that inherits fd 0 therefore eats the rest of
+  # this repo's candidate list — measured with the shipped loop shape and a stdin-reading child: of four
+  # candidates, one was processed and the other three were consumed by the reviewer and prepended to its
+  # prompt. The pass line had already reported `candidates=4`, so the loss is silent.
+  bash "$1" "$2" --repo "$3" >> "$4" 2>&1 < /dev/null
+  # ⛔ THE EXIT LINE MUST START ITS OWN LINE (P2, measured). Appended bare, it GLUES onto a child whose
+  # last output has no trailing newline — reachable with the shipped reviewer, which prints `tail -80`
+  # of a transcript on the no-parsed-findings path, and `tail` adds none. `review_state` parses the line
+  # `^REVIEW-EXIT rc=`-anchored, so a glued line matched NOTHING: a rejected head read `pending`, was
+  # re-dispatched as a fresh PAID review after the cooldown, and never published `review-found-issues`.
+  printf '\nREVIEW-EXIT rc=%s\n' "$?" >> "$4"
 }
 export -f run_review
 # ── THE DISPATCH, VERIFIED THE SAME WAY `launch_rail` IS ────────────────────────────────────────────
@@ -864,7 +912,7 @@ launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file, $5 = attemp
   # `rm -f` here is the same rollback the verify-failure path below already performs.
   printf 'REVIEW-DISPATCHED at=%s head=%s repo=%s pr=%s\n' "$(date +%s)" "$head" "$repo" "$pr" > "$out" \
     || { rm -f "$out" 2>/dev/null; log_line "$repo #$pr REVIEW-LAUNCH-FAILED: cannot write the review record at $out — nothing was dispatched, no cooldown was consumed, and the truncated record was removed (a zero-byte record reads as a review in flight for ever)"; return 1; }
-  nohup bash -c 'run_review "$@"' _ "$REVIEW_SCRIPT" "$pr" "$repo" "$out" >> "$LOG" 2>&1 &
+  nohup bash -c 'run_review "$@"' _ "$REVIEW_SCRIPT" "$pr" "$repo" "$out" >> "$LOG" 2>&1 < /dev/null &
   pid=$!
   log_line "$repo #$pr no attestation at head $head -> dispatching reviewer (KIND=reviewer, $REVIEW_SCRIPT)"
   sleep "$LAUNCH_VERIFY_S"
@@ -1001,22 +1049,34 @@ CLEAN_MARKER_RE = re.compile(_HEAD_RE % r'(clean|clean-micro|clean-low)' + r'(?:
 NOTCLEAN_MARKER_RE = re.compile(_HEAD_RE % r'(not-clean)' + r'(?: findings=[0-9]+)?(?: note=.*)?(?: sig=[0-9a-f]{64})?$')
 
 def attestation(body, head, pr, repo):
-    "at-head | stale | absent | nohead — never an inference from a partial match."
+    "at-head | rejected | stale | absent | nohead — never an inference from a partial match."
     if not head:
         return "nohead"          # no head means nothing can be at it; the reviewer re-reads the head
     seen = []
+    clean = []
     for line in (body or "").splitlines():
         # `match` + the patterns' own `^`/`$`: the RECORD shape exactly, not a line that starts with one.
-        m = CLEAN_MARKER_RE.match(line) or NOTCLEAN_MARKER_RE.match(line)
+        # ⛔ WHICH PATTERN MATCHED IS THE VERDICT — there is no second list of "verdicts that may land" to
+        # drift from `CLEAN_MARKER_RE`, and `(clean|clean-micro|clean-low)` is check (c)'s own set. A line
+        # matching only `NOTCLEAN_MARKER_RE` is a review that HAPPENED at this head and did NOT pass.
+        mc = CLEAN_MARKER_RE.match(line)
+        m = mc or NOTCLEAN_MARKER_RE.match(line)
         if not m:
             continue                 # not a record line: indented, prefixed, or carrying prose after it
         if m.group(1) != str(pr):
             continue                 # a record for a DIFFERENT PR is not this PR's attestation
         if m.group(4).lower() != repo.lower():
             continue                 # the gate binds the repo; a marker naming another repo is not ours
-        seen.append(m.group(3).lower())
-    if head in seen:
+        # ⛔ `seen`/`clean` HOLD HEADS — a SHA is what `head in …` is asked about — and the VERDICT only
+        # decides which head lands in `clean`.
+        h = m.group(3).lower()
+        seen.append(h)
+        if mc:
+            clean.append(h)
+    if head in clean:
         return "at-head"
+    if head in seen:
+        return "rejected"         # reviewed AT this head, and the verdict is not one the gate can land
     return "stale" if seen else "absent"
 
 for p in prs:
@@ -1133,6 +1193,16 @@ PY
       if [ "$_att" != at-head ]; then
         _rarm=$(review_candidate_arm "$_kind" "$_att")
         if [ "$_rarm" = skip ]; then
+          # ⛔ A NON-CLEAN RECORD AT THIS HEAD IS ITS OWN STATE, NOT "THE RED ARM OWNS IT" (P1): the head
+          # was reviewed and the review found blocking issues, so nothing in the fleet may re-buy that
+          # verdict and the rail can never land it (check (c) accepts clean only). Publishing it is what
+          # makes a PR that is blocked ON ITS OWN REVIEW readable instead of looking like a PR nobody has
+          # looked at — and it is idempotent by (state, head), so it costs one comment per head.
+          if [ "$_att" = rejected ]; then
+            publish_review_state "$repo" "$pr" review-found-issues "$head"
+            log_line "$repo #$pr REVIEW-REJECTED at $head — a head-bound record EXISTS and its verdict is not one the gate accepts (not-clean), so the rail cannot land this revision and no second review is bought; the fix is a NEW head, which is a new key"
+            continue
+          fi
           log_line "$repo #$pr AWAITING-REVIEW ($_att) and its checks are RED — no marker at ANY head to carry and no review is bought for a red head (a red head must not be attested clean, #3440); the red arm owns this PR"
           continue
         fi

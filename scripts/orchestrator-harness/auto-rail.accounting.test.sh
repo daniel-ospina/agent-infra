@@ -336,6 +336,19 @@ _check_refusal "COOLDOWN_TRANSIENT_S=abc" "REFUSED: COOLDOWN_TRANSIENT_S=" "is n
 # dispatch, i.e. the review arm silently dead) were both unprotected, though this PR adds both guards.
 _check_refusal "REVIEW_MAX_ATTEMPTS=abc" "REFUSED: REVIEW_MAX_ATTEMPTS=" "no bound at all"
 _check_refusal "REVIEW_MAX_ATTEMPTS=0"   "REFUSED: REVIEW_MAX_ATTEMPTS=" "not a POSITIVE integer"
+# ⛔ THE TWO GUARDS THAT HAD NO ROW AT ALL (non-vacuity, measured by mutation: deleting BOTH
+# REVIEW_ATTEMPT_WINDOW_S guards, and the LAUNCH_VERIFY_S guard, left this suite GREEN).
+_check_refusal "REVIEW_ATTEMPT_WINDOW_S=abc" "REFUSED: REVIEW_ATTEMPT_WINDOW_S=" "the bound permanent"
+_check_refusal "REVIEW_ATTEMPT_WINDOW_S=0"   "REFUSED: REVIEW_ATTEMPT_WINDOW_S=" "not a POSITIVE integer"
+_check_refusal "LAUNCH_VERIFY_S=abc"         "REFUSED: LAUNCH_VERIFY_S="         "not a non-negative integer"
+# ⛔ AND DIGITS ARE NOT ENOUGH (P2, demonstrated by driving the shipped functions): `[ 0 -ge
+# 99999999999999999999 ]` ERRORS ("integer expression expected") and returns 2, which every `if` reads as
+# FALSE — so a too-large REVIEW_PER_PASS stopped bounding at all (one PAID reviewer per candidate per
+# pass), REVIEW_COOLDOWN_S stopped delaying a second reviewer over a head already in flight, and
+# REVIEW_MAX_ATTEMPTS exhausted at ZERO attempts. The startup guard bounds the LENGTH.
+_check_refusal "REVIEW_PER_PASS=99999999999999999999"          "REFUSED: REVIEW_PER_PASS="          "longer than 9 digits"
+_check_refusal "REVIEW_COOLDOWN_S=99999999999999999999"         "REFUSED: REVIEW_COOLDOWN_S="         "longer than 9 digits"
+_check_refusal "REVIEW_MAX_ATTEMPTS=99999999999999999999"       "REFUSED: REVIEW_MAX_ATTEMPTS="       "longer than 9 digits"
 
 # ⛔ THE RAIL-VERDICT DIRECTORY IS A PRECONDITION TOO — and its absence used to be invisible: a launch
 # whose redirect cannot be opened returns 0 to the caller, so the log said `launching rail` for a rail
@@ -554,6 +567,17 @@ _ckline() {  # $1 = the PR's JSON body text; $2 = headRefOid (or '' for absent);
 # STATE 1 — ATTESTED AT HEAD: the rail path, and nothing else, is what this PR is for.
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 diff=$(printf 'a%.0s' $(seq 1 64)) (daniel-ospina/tortoise)" "$H7" 'green\t7\tat-head' \
   "a clean record AT the current head must classify as at-head (the rail's own precondition)"
+# ⛔ AND A **NON-CLEAN** RECORD AT THE HEAD IS A DIFFERENT ANSWER (P1, measured 2026-11-06): check (c)
+# accepts ONLY clean|clean-micro|clean-low, while `record-review.sh` mints `verdict=not-clean` for every
+# review that found blocking issues (#3400) — live on this repo as #3333, #3308 and #3231. Calling that
+# `at-head` launched a rail the gate refuses for ever (one wasted MAX slot every COOLDOWN_TRANSIENT_S)
+# AND switched the review arm off, since at-head is the only value that does. The arm below is the one the
+# `_arm` table arms cannot see: they pass the attestation as a LITERAL, so nothing exercised the
+# CLASSIFIER's not-clean branch and `if head in seen: return "rejected"` was dead code with the suite green.
+_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3" "$H7" 'green\t7\trejected' \
+  "a NON-CLEAN record AT the current head must classify as 'rejected', not 'at-head' — the gate can never accept a not-clean verdict, so at-head railed an unlandable revision for ever and disabled the review arm at the same time"
+_ckline "review recorded: reviews/7.json verdict=not-clean @ 2222222222222222222222222222222222222222 (daniel-ospina/tortoise)" "$H7" 'green\t7\tstale' \
+  "a NON-CLEAN record at an OLDER head is stale, like any other marker bound to another head (a new head gets a new review)"
 # STATE 2 — STALE: a record for an OLDER head is not an attestation for the head that would merge.
 _ckline "review recorded: reviews/7.json verdict=clean @ 2222222222222222222222222222222222222222 (daniel-ospina/tortoise)" "$H7" 'green\t7\tstale' \
   "a record bound to an OLDER head must classify as stale, not at-head — 'there is a marker somewhere' is the substring rule this replaces"
@@ -588,14 +612,14 @@ _ckline "review recorded: reviews/7.json verdict=clean @ $H7 (daniel-ospina/tort
 # this anchoring had to keep: the SIGNED form, and the `not-clean` trailer appended AFTER `(<repo>)`.
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 diff=$(printf 'a%.0s' $(seq 1 64)) (daniel-ospina/tortoise) sig=$(printf 'b%.0s' $(seq 1 64))" "$H7" 'green\t7\tat-head' \
   "the SIGNED marker record-review.sh emits must still classify as at-head (a lexer that rejects the real shape turns every attested PR into a paid review and a permanent merge stall)"
-_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3" "$H7" 'green\t7\tat-head' \
-  "the not-clean trailer (' findings=N' appended AFTER '(repo)') must still be RECOGNISED — 'which verdicts may land' is the gate's decision, and this loop asks only whether a record exists at the head; silently un-classifying this shape would buy a review of a head already reviewed"
+_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3" "$H7" 'green\t7\trejected' \
+  "the not-clean trailer (' findings=N' appended AFTER '(repo)') must still be RECOGNISED as a record for THIS head — but as 'rejected', NOT 'at-head'. 'at-head' rails a revision check (c) refuses for ever (one wasted MAX slot per COOLDOWN_TRANSIENT_S) AND switches the review arm off, since at-head is the only value that does; 'absent' would buy a review of a head already reviewed. 'rejected' is the only answer that does neither"
 # ⛔ AND THE FREE-FORM NOTE IS THE SHAPE A `\\S+` SILENTLY DROPS (review round 5, P2, measured). The
 # recorder documents `note=1 open P2` as its OWN example — spaces and parentheses included — so a pattern
 # that refuses whitespace reads a REAL marker as `absent`, which on a green head buys a PAID review of a
 # head that already has a record (`review-pr.sh`'s E_ALREADY only short-circuits `verdict=clean`). Measured
 # live on agent-infra#3201: `findings=9 note=3 open P1 (…)+ 6 P2 sig=…`.
-_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=9 note=3 open P1 (User=root drop-in false PASS) + 6 P2 sig=$(printf 'b%.0s' $(seq 1 64))" "$H7" 'green\t7\tat-head' \
+_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=9 note=3 open P1 (User=root drop-in false PASS) + 6 P2 sig=$(printf 'b%.0s' $(seq 1 64))" "$H7" 'green\t7\trejected' \
   "the recorder's FREE-FORM note ('note=1 open P2' is its own documented example, so the value CONTAINS SPACES) must still classify — a whitespace-refusing pattern reads a real marker as 'absent' and buys a paid review of a head that already carries a record"
 # ⛔ THE PERMISSIVE TAIL IS BOUNDED TO `not-clean`, AND THAT BOUND IS PINNED HERE, NOT LEFT TO CHANCE (review
 # round 5, verifier). A note is free-form with no delimiter, so NOTHING can accept the real note shape and
@@ -604,7 +628,7 @@ _ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/
 # clean family, where the strict `$` is the guarantee that a quotation cannot disable the review arm. The
 # arm below states that asymmetry so a later "tidy-up" that merges the two patterns reddens instead of
 # silently widening the clean one.
-_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3 note=1 open P2 — pasted from the review" "$H7" 'green\t7\tat-head' \
+_ckline "review recorded: reviews/7.json verdict=not-clean @ $H7 (daniel-ospina/tortoise) findings=3 note=1 open P2 — pasted from the review" "$H7" 'green\t7\trejected' \
   "a not-clean marker with prose after its FREE-FORM note is ACCEPTED on purpose — there is no delimiter between the note and anything appended (§ above), and check (c) refuses a not-clean marker on every shape, so this cannot certify a landing; a strict tail here would read the REAL note shape as 'absent' and buy a paid re-review instead"
 # ⛔ AND THE CLEAN FAMILY KEEPS THE STRICT TAIL: the SAME prose on a CLEAN marker must still be refused,
 # or a quotation disables the review arm for ever (the #3489 stall). This is the pair that pins the split.
@@ -736,6 +760,18 @@ _arm() { review_candidate_arm "$1" "$2"; }
 [ "$(_arm red at-head)"   = rail ]   || bad "an ATTESTED RED candidate takes the RAIL path — the rail's exemption engine is what lands a red head whose reds are not its own (got '$(_arm red at-head)')"
 [ "$(_arm red absent)"    = skip ]   || bad "a RED candidate with NO marker at any head must buy NOTHING: there is no record for check (c) to carry and no review is bought for a red head, which must not be attested clean (#3440) (got '$(_arm red absent)')"
 [ "$(_arm red stale)"     = rail ]   || bad "a RED candidate carrying a marker at an OLDER head must go to the RAIL, not be dropped — check (c) accepts a stale marker whose diff= matches the live diff (#3315) and the rail's exemption engine lands it; the 'continue' that skipped this is the P1 finding (got '$(_arm red stale)')"
+# ⛔ A NON-CLEAN RECORD AT THE HEAD IS NOT `at-head` (P1, measured 2026-11-06). check (c) accepts ONLY
+# clean|clean-micro|clean-low, while `record-review.sh` mints `verdict=not-clean` for every review that
+# found blocking issues (#3400) — so `at-head` on a not-clean marker launched a rail the gate refuses
+# for ever, one wasted launch every COOLDOWN_TRANSIENT_S, AND switched the review arm off (at-head is
+# the only value that does) at the same time. Live instances on this repo when this was written: #3333,
+# #3308, #3231.
+[ "$(_arm green rejected)" = skip ] || bad "a GREEN candidate whose ONLY head-bound record is verdict=not-clean must NOT be handed to the rail — check (c) can never accept a non-clean verdict, so the rail refuses in one line on every pass for ever while at-head disables the review arm too (got '$(_arm green rejected)')"
+[ "$(_arm red rejected)"  = skip ] || bad "a RED candidate whose only head-bound record is verdict=not-clean must be SKIPPED, not re-reviewed and not railed (got '$(_arm red rejected)')"
+# …and the loop must PUBLISH that state rather than let it read as 'nobody has looked at this': the head
+# HAS been reviewed and rejected, and the remedy is a fix (a new head), which is what the message says.
+grep -A2 -F 'if [ "$_att" = rejected ]; then' "$SUT" | grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"' \
+  || bad "a NOT-CLEAN record at the head must PUBLISH 'review-found-issues' (head-bound) — otherwise a PR blocked on its own rejected review is indistinguishable from a PR nobody has looked at, which is the #3489 invisibility on the one class where at-head also disables the review arm"
 _empty_arm=$(_arm "" "")
 [ "$_empty_arm" = rail ] || bad "an UNCLASSIFIABLE candidate must default to the RAIL — the arm that spends nothing — never to a paid review (got '$_empty_arm')"
 # ⛔ AND THE LOOP MUST CONSULT IT, RESPECTING ALL THREE ANSWERS (review round 3, P1). A driven predicate
@@ -753,7 +789,10 @@ _branch_ln=$(grep -nF 'if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then'
   || bad "the predicate must be CONSULTED BEFORE the review branch that consumes it (predicate call at line ${_call_ln:-MISSING}, branch at ${_branch_ln:-MISSING}) — below it, '_rarm' keeps its 'rail' default, the review arm is never entered, and every unattested candidate is railed with the producer dead while this suite stays green"
 printf '%s\n' "$_branch" | grep -qF '[ "$_kind" != green ]' \
   && bad "the REVIEW branch must not carry its own red-kind guard — the red decision belongs to review_candidate_arm, and a second copy inside the branch is exactly the P1 (a 'continue' that bypasses the rail path)"
-grep -A3 -F 'if [ "$_rarm" = skip ]; then' "$SUT" | grep -qF 'continue' \
+# ⛔ THE SKIP ARM'S `continue` (window widened: the not-clean-record branch below added lines between
+# the `if` and the outer `continue`, so a tight -A window stopped reaching it and the arm failed for a
+# reason that had nothing to do with the guard).
+grep -A11 -F 'if [ "$_rarm" = skip ]; then' "$SUT" | grep -qF 'continue' \
   || bad "the 'skip' arm must CONTINUE (never fall through to the rail) — a red candidate with no marker anywhere has nothing for check (c) to carry, so railing it burns a MAX slot on the one class the base's filter deliberately dropped"
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH: a missing reviewer must be named per candidate, not dispatched
 # into. Unpinned, deleting the guard left the suite green while the loop wrote a dispatch record and
@@ -990,6 +1029,17 @@ printf '%s\n%s\n%s\n' "$_now" "$_now" "$_now" > "$_led"   # paid, paid, refusal
 review_forgive_refusal "$_led"
 [ "$(review_attempts "$_led")" = 2 ] \
   || bad "forgiving a refusal must drop exactly ONE line (got '$(review_attempts "$_led")', want 2) — dropping more forgives PAID attempts and re-opens the paid retry loop"
+# ⛔ AND IT MUST DROP THE NEWEST, NOT THE OLDEST (P2, non-vacuity — measured): the arm above asserts only
+# a COUNT on a ledger whose three entries are identical, so `sed '$d'` → `sed '1d'` SWAPPED left the suite
+# GREEN while the forgiver ate the OLDEST entry — a PAYED attempt. That is precisely the defect the
+# function was rewritten to prevent, restored by a one-character edit nothing could see. Timestamps are
+# now distinct and the surviving CONTENT is asserted, so oldest-vs-newest is observable.
+_led="$_rdir/forgive.order.attempts"
+printf '%s\n%s\n%s\n' 1001 1002 1003 > "$_led"   # paid, paid, refusal(newest)
+review_forgive_refusal "$_led"
+[ "$(tr '\n' ' ' < "$_led")" = "1001 1002 " ] \
+  || bad "the forgiver must drop the NEWEST ledger entry (the refusal's own) and keep the earlier PAID ones — got '$(tr '\n' ' ' < "$_led")', want '1001 1002 '; dropping the oldest forgives a paid attempt and re-opens the paid retry loop"
+rm -f "$_led"
 review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) "$(review_attempts "$_led")"; [ $? -eq 1 ] \
   || bad "CROSS-STATE: after forgivING one refusal, a paid retry with 2 of $REVIEW_MAX_ATTEMPTS spent must still DISPATCH (got $?) — the refusal consumed a budget the next paid attempt reads"
 review_forgive_refusal "$_led"; review_forgive_refusal "$_led"
@@ -1233,6 +1283,26 @@ launch_review acme/widget 42 "$H" "$_r8" "$_r8led" \
   || bad "a FINISHED dispatch must consume exactly one attempt (got '$(review_attempts "$_r8led")') — uncounted, the per-head bound is weaker than it says"
 rm -f "$_rfast"
 rm -f "$_rev_issues" "$_rev_clean" "$_rev_load"
+# ⛔ THE EXIT LINE MUST START ITS OWN LINE (P2, measured). `run_review` appends `REVIEW-EXIT rc=N` to the
+# same file the reviewer writes to, and `review_state` matches it `^`-anchored per line. A child whose last
+# output has NO trailing newline GLUES the exit line onto it, the parse matches NOTHING, and the head reads
+# `pending` — so a head the reviewer REJECTED was re-dispatched as a fresh PAID review after the cooldown
+# and never published `review-found-issues`. Reachable with the shipped reviewer: `review-pr.sh` prints
+# `tail -80` of a transcript on the no-parsed-findings path, and `tail` adds no newline when the file has
+# none. The wrapper now frames the line itself, so the arm drives a child that prints without one.
+_rnonl=$(mktemp); printf '#!/bin/bash\nprintf "%%s" "P0 something (no trailing newline)"\nexit 7\n' > "$_rnonl"; chmod +x "$_rnonl"
+_r9="$_rdir/r9.out"; run_review "$_rnonl" 42 acme/widget "$_r9"
+[ "$(review_state "$_r9")" = issues ] \
+  || bad "a reviewer whose last output has NO trailing newline must still be read as 'issues' (got '$(review_state "$_r9")') — the exit line glues onto its output, the anchored parse finds nothing, and a REJECTED head reads 'pending': it is re-dispatched as a fresh PAID review after the cooldown and 'review-found-issues' is never published"
+rm -f "$_rnonl"
+# ⛔ THE DISPATCH MUST NOT INHERIT THE CANDIDATE FILE AS STDIN (P2, measured). The loop reads candidates
+# with `done < "$_cand"`, so a background child inherits fd 0 pointed at that file; `pi` DRAINS PIPED
+# STDIN into its prompt, so a reviewer consumed the rest of the repo's candidate list — of four candidates
+# one was processed and three were eaten, while the pass line had already reported `candidates=4`.
+grep -qF 'bash "$1" "$2" --repo "$3" >> "$4" 2>&1 < /dev/null' "$SUT" \
+  || bad "run_review must run the reviewer with '< /dev/null' — the loop's stdin is the CANDIDATE FILE and pi drains piped stdin, so an inherited fd 0 makes the reviewer eat the remainder of this repo's candidate list (silently: the pass line already counted them)"
+grep -qF '"$out" >> "$LOG" 2>&1 < /dev/null &' "$SUT" \
+  || bad "the nohup dispatch must redirect stdin from /dev/null too — otherwise the background wrapper inherits the candidate file even if run_review's own redirection were dropped"
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"
 
