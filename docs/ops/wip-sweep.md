@@ -69,13 +69,17 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
   ⛔ **`0` is a disable for exactly those two and nothing else.** `tb_timeout 0 …` means *unbounded*, and
   a zero staleness window means *everything is stale* while reading as *do not check* — so
   `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT` and `WIP_SWEEP_STALE_SECONDS` must be greater
-  than zero and are refused otherwise (exit 2). Every subprocess — each verdict, each status, each phase
-  of a rescue, and the read-back below — runs under the shared `scripts/lib/bounded.sh` watchdog; there
-  is no unbounded call **that can block on the network or on a large tree** — those are the failures
-  this pass cannot survive, because it is what the quiesce runs before the box goes. (`mktemp`, `date`,
-  `sed` and the record write run outside the watchdog: a local syscall, not a hang surface.) What the
-  cap defers
-  is **named** (`deferred=N`, `status=incomplete`, exit `1`), never silently dropped.
+  than zero and are refused otherwise (exit 2). Every call THIS script makes that can block on the
+  network or on a large tree runs under the shared `scripts/lib/bounded.sh` watchdog — each verdict,
+  each status, each `git` call and the read-back below. The RESCUE is bounded as a WHOLE by
+  `WIP_SWEEP_RESCUE_TIMEOUT` through that same watchdog; its *internal* phases are bounded by
+  `bg-rescue-wip.sh`'s OWN private `bounded()` (its `bounded 25 git fetch` / `bounded 45 git push`),
+  which is a second implementation this doc does not claim is the shared one — audit that file for
+  rescue-phase bounds, not `scripts/lib/bounded.sh`. There is no unbounded call that can reach the
+  network; such a hang is the failure this pass cannot survive, because it is what the quiesce runs
+  before the box goes. (`mktemp`, `date`, `sed` and the record write run outside the watchdog: a local
+  syscall, not a hang surface.) What the cap defers is **named** (`deferred=N`,
+  `status=incomplete`, exit `1`), never silently dropped.
 - **The archive is READ BACK, not inferred from an exit code.** `bg-rescue-wip.sh` exits `0` both for
   *archived and pushed* and for *clean — nothing at risk*, so a worktree that goes clean between the
   verdict and the rescue would otherwise be recorded as archived with a ref that does not exist. After
@@ -119,8 +123,10 @@ ts  repo  path  branch  head  verdict  paths  age_h  issue  ref  note
 
 `issue` is derived from the branch (`feat/8090-tm`, `fix/3442-nonvacuity` → the issue number). A dirty
 worktree whose branch carries no issue number is **reported** (`issue=-`, a loud line, `no_issue=N`) —
-the archive still exists on origin, but nothing ties it to an issue, and searching 222 inconsistently
-named refs is not a substitute for an index. The typed version of this, and the ref-naming rule, is
+the archive still exists on origin, but nothing ties it to an issue, and searching the existing refs —
+whose names are inconsistent, because the slug is sometimes an issue number and sometimes a topic — is
+not a substitute for an index. (No count is quoted here: the live registry moves, and a number written
+into a doc goes stale silently.) The typed version of this, and the ref-naming rule, is
 **#3484**; this file records the link and does not re-decide the naming.
 
 `wip-sweep.status` (key=value, written atomically, the surface a fleet instrument should read):
@@ -130,9 +136,13 @@ status=ok|incomplete|failed   rc=…  ts=…  mode=apply|dry-run
 seen=… clean=… skipped=… dirty=… archived=… deferred=… unmeasured=… failed=… no_issue=… repos=… watchdog=…
 ```
 
-`seen = clean + skipped + dirty + unmeasured` holds, and **`skipped` is not folded into `clean`**. A
-bare repo and a record git itself calls `prunable` were *not examined*; counting them as clean would
-make a summary over an unexamined disk indistinguishable from one where nothing is at risk.
+`seen = clean + skipped + dirty + unmeasured` holds **over the worktrees examined**, and **`skipped`
+is not folded into `clean`**. A bare repo and a record git itself calls `prunable` were *not examined*;
+counting them as clean would make a summary over an unexamined disk indistinguishable from one where
+nothing is at risk. The one exception, stated rather than implied: a REPO-level failure (`git worktree
+list` refused, or a path that is not a repository) adds an `unmeasured` count and its own
+`cannot-verify` row and does **not** add to `seen` — it is a failure about the repository, not an
+examination of a worktree, and it always fails the pass (exit 3).
 
 `--print-status` answers from that record alone: `0` ok, `1` incomplete, `3` failed / stale / never.
 **`never` and `stale` are not success** — a sweeper that has not run is a box whose WIP is on the disk
@@ -147,22 +157,31 @@ and restarts one controller (step 3b). Lanes are dead by then, so their trees ar
 - A missing or failing sweep is **loud** (`FATAL:` lines) and makes the quiesce **exit non-zero**.
 - It does **not** abort the quiesce. Aborting would leave the cell with zero controllers — worse than
   the state the script exists to end. Supervision is restored, the run prints `NOT DONE`, and the exit
-  code carries the failure to `cloud-cell-bringup.sh --check` and the operator.
+  code is non-zero for whatever RAN the quiesce.
+  ⛔ And that is the whole alarm channel, stated so a green line is not read as more: **nothing reads
+  that exit code automatically.** `cloud-cell-bringup.sh` contains no `quiesce` reference and no
+  `wip`/sweep check — its siblings DO have one (`check_disk_reaper`, `check_reaping_armed`,
+  `check_harness_apply`), so a `check_wip_sweep` is the obvious follow-up and this change does not
+  claim it exists. Until then the failure reaches the operator who ran the quiesce, and the record at
+  `$O/state/wip-sweep.status` reaches whoever looks. Do not restate this as a wired monitor.
 
 ## What this does NOT do (stated, not implied)
 
 - **There is no timer yet.** The sweep is the mechanism; `cloud-cell-quiesce.sh` is the one lifecycle
   hook that runs it, and that closes the row of the matrix where the work is *destroyed* rather than
   merely at risk. A periodic clock (a launchd/systemd unit) is **not** shipped here: `fleet_srcs`
-  already delivers `install-disk-reaper-timer.sh` and `install-harness-apply-timer.sh`, each ~800 lines
-  of render-install-verify, and a third scheduling stack is a different change with its own review
-  surface. Until it exists, an OOM-killed lane on a box nobody quiesces keeps the pre-#3485 exposure —
+  already delivers `install-disk-reaper-timer.sh` and `install-harness-apply-timer.sh`, each a full
+  render -> install -> read-back -> verify stack for BOTH platforms, and a third scheduling stack is a
+  different change with its own review surface. Until it exists, an OOM-killed lane on a box nobody quiesces keeps the pre-#3485 exposure —
   and `refs/wip/*` from the next `run_agent` end, or from a manual `wip-sweep.sh --apply`, is what
   rescues it. Recorded here so a green PR is not read as "the clock exists".
 - **The quiesce's claim is REPO-scoped, not box-scoped.** It sweeps `--repo "$REPO"`, which is the one
   checkout the cell is being reset onto; another clone's worktrees on the same box are NOT swept and the
   success line says so. A box-wide sweep is `WIP_SWEEP_REPOS=A:B wip-sweep.sh --apply`.
-- **It never deletes.** It adds commits to `refs/wip/<slug>` on origin and writes nothing into the
-  worktrees it examines (`bg-rescue-wip.sh` uses a throwaway index and never moves the branch).
+- **It never deletes, and it changes no working tree.** It adds commits to `refs/wip/<slug>` on
+  ORIGIN; inside the examined worktree's own repository it writes only the local pin
+  `refs/wip-local/<slug>` plus the unreferenced commit/tree/blob objects that pin holds. The working
+  tree, the real index and the branch are untouched (`bg-rescue-wip.sh` stages into a throwaway index
+  and never moves the branch — pinned by the suite's A5/A6).
 - **A `cannot-verify` worktree is a failed pass, not a retry.** A record that is both unreadable and
   dirty needs a human; the sweep names it and stops short of claiming the box clean.
