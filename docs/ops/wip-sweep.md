@@ -187,8 +187,14 @@ startup refusal that follows it — then the verdict.** That is what makes an in
 pass that crashes, is OOM-killed, is cut off by a quiesce, **refuses at startup** (a missing rescuer, no
 repo to scan), or cannot write its verdict leaves `running` — which `--print-status` maps to
 `failed`/exit 3 — instead of the PREVIOUS pass's `status=ok` standing there, fresh, for up to
-`WIP_SWEEP_STALE_SECONDS`. A usage error (exit 2) comes earlier and deliberately does not touch the
-record: a mistyped argument is not a pass. The one limit is stated rather than implied: a state dir
+`WIP_SWEEP_STALE_SECONDS`. **Two kinds of `exit 2` are different, and only one is untouched**: a
+mistyped ARGUMENT is parsed before the record is resolved and leaves it alone; an ENVIRONMENT-BOUND
+refusal (`WIP_SWEEP_BUDGET`, `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT`,
+`WIP_SWEEP_STALE_SECONDS` that do not parse, or a zero watchdog) is the same failure mode as a missing
+rescuer — a pass that will refuse EVERY time until the box is fixed — so it marks the pass as started and
+`--print-status` answers `failed`/exit 3. Moving those validations above the marker would leave the
+previous `status=ok` standing over a box that is sweeping nothing, which is the stale-green class this
+marker exists to close. The one limit is stated rather than implied: a state dir
 unwritable at BOTH the start and the end cannot be marked at all, so the old record stands and the pass
 can only be loud on stderr with a non-zero exit — that is a host problem, and the reader cannot see it.
 (`disk-reaper.sh` gets its equivalent witness from the scheduler's own exit status; this pass has no
