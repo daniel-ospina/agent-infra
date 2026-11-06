@@ -39,6 +39,9 @@
 #      Pinning one trigger's filters is not enough: a second trigger re-opens all of it.
 #  7f. MUTANT: a `push:` trigger added to `pipeline-compliance.yml`  → must FAIL (the same `on:`
 #      key-set pin on the required context).
+#  7g. MUTANT: the REQUIRED job's `if:` guard dropped while `issue_comment:` stays → must FAIL, and
+#      the refusal must name the job. `issue_comment` is an ADMITTED trigger (#2467) only because the
+#      `pipeline-compliance` job refuses it; a name-only allow-list would read GREEN here.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
@@ -392,6 +395,33 @@ if apply_mutation "$PC" "$PC_PUSH" \
   case "$FINDINGS" in
     *"declares [push]"*) pass "the refusal NAMES the added trigger" ;;
     *) fail "the refusal did not name the added trigger in its FINDING line" ;;
+  esac
+fi
+
+echo "== 7g. MUTANT: the required job's guard dropped, issue_comment: kept =="
+# ⛔ THE ALLOWANCE ADDED FOR #2467 IS ONLY SOUND WITH THIS GUARD, SO THE GUARD IS PINNED, NOT DESCRIBED.
+# `issue_comment:` sits on the required context's `on:` because a comment on the LINKED ISSUE fires no
+# `pull_request` event (#2467) — it is a RE-RUN site. It is safe only because the `pipeline-compliance`
+# JOB refuses a comment event in its own `if:`; without that line the repo's only required status
+# context can report against an event with no PR head at all. A key-name allow-list cannot see the
+# difference, which is why this arm removes the guard FROM THE REQUIRED JOB ONLY — `workflow-drift`
+# keeps its textually identical guard, so an implementation that merely greps the FILE for the guard
+# stays green here and this arm catches it.
+PC_NOGUARD="$TMP/pc-noguard.yml"
+if apply_mutation "$PC" "$PC_NOGUARD" \
+  "    # \`issue_comment\` must never satisfy the required context: this job runs the
+    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # \`issue_comment\` must never satisfy the required context: this job runs the
+    # gate for a PR only. The revalidation job below owns the comment event.
+    # GUARD REMOVED BY THE MUTATION ARM" \
+  "the required job's comment-event guard must be removable"; then
+  run_check 1 "a required job with NO guard against the admitted \`issue_comment:\` trigger is REFUSED" \
+    PC_FILE="$PC_NOGUARD"
+  case "$FINDINGS" in
+    *"JOB carries no "*)
+      pass "the refusal names the JOB, so a file-wide grep for the guard cannot satisfy it" ;;
+    *) fail "the refusal did not name the required job's missing guard in its FINDING line" ;;
   esac
 fi
 
