@@ -1091,10 +1091,19 @@ STALE_DISPATCH_S = 90 * 60    # a dispatch with no state change this old is retr
 # the two readers share one model and neither duplicates the values. The environment wins when
 # present, so a cell's `keys.env`, a manual run or a test can supply them without a plist; the
 # shipped defaults are `orch-loop.sh`'s `${VAR:-…}` fallbacks (pinned equal by
-# `scripts/test_pr_doctor.py`) and are the last resort only.
+# `scripts/test_pr_doctor.py`) and are the last resort only. ⛔ THERE ARE THREE READERS OF
+# `MAX_REVIEW` NOW — this file, `orch-loop.sh` and `orchestrator-harness/worker-supply.sh` — and all
+# three must carry the same fallback (#3441); `install.sh` ships the fourth spelling and README §4 the
+# fifth. `test_pr_doctor.py` pins this one against the loop's own default.
 ORCH_PLIST = os.path.join(HOME, "Library", "LaunchAgents", "com.eldato.orchestrator-loop.plist")
 DEFAULT_MAX_FIX = 3
-DEFAULT_MAX_REVIEW = 4
+# ⛔ 10, NOT 4 (agent-infra#3441). `MAX_REVIEW` is now BOTH the reviewer-concurrency cap and the
+# per-PR review-ROUND ceiling `orch-loop.sh` enforces, so this fallback is the third reader of one
+# number — `test_pr_doctor.py` extracts the loop's `:-` default and asserts they agree, and CI runs
+# that file with `-x`, so a divergence is a red check rather than a silent throttle. Leaving it at 4
+# reproduced the defect this block's own history records: on a box with no plist and no env the
+# drain budgeted 4 reviews while the loop ran 10.
+DEFAULT_MAX_REVIEW = 10
 
 # ── SPAWN: the background dispatcher, and the worktree each worker gets ─────────────────
 # ⛔ THIS REPLACES THE LANE TABLE. This job used to pick an EXISTING idle lane out of a roster
@@ -3573,9 +3582,13 @@ _RESEARCH_SECTION = None
 # The role this file's brief is judged with. `nonblocking-dispatch.sh:175` -- the dispatcher every
 # `prfix` worker goes through -- regrades the brief it is about to send with `worker`, and `--section`
 # above is rendered for `worker`, so `worker` is the judge's role. The choice is NOT load-bearing for
-# the verdict: `brief-gate.sh --check` is role-independent across the four declared roles (measured --
-# a shipped section exits 0, a section with no `CONTRADICTION TEST:` exits 80, for both `lane` and
-# `worker`; only an UNKNOWN role yields 78, and 78 is now ungradable rather than a refusal). Grading
+# the verdict: at ROUND 0 (no round supplied), `brief-gate.sh --check` is role-independent across the
+# four declared roles (measured -- a shipped section exits 0, a section with no `CONTRADICTION TEST:`
+# exits 80, for both `lane` and `worker`; only an UNKNOWN role yields 78, and 78 is now ungradable
+# rather than a refusal). ⛔ THE ROUND QUALIFIER IS LOAD-BEARING SINCE agent-infra#3441: from review
+# round 4 a `reviewer` brief must also carry a `COMPARABLES:` line, so `--check … reviewer 7` and
+# `--check … worker 7` now disagree. This file passes no round and grades `worker`, so it is on the
+# round-0 contract — stated here because the old sentence ("role-independent, full stop") became false. Grading
 # with `lane` would therefore not admit anything `worker` refuses -- but stating that `lane` is "the
 # role that will judge the brief" was simply wrong, so it says `worker`.
 _BRIEF_GATE_ROLE = "worker"
