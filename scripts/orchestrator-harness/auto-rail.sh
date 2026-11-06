@@ -849,8 +849,15 @@ export -f run_review
 # REVIEW_COOLDOWN_S. So the record is removed on proof that nothing started.
 launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file, $5 = attempt ledger; rc 0 = started
   local repo=$1 pr=$2 head=$3 out=$4 led=${5:-} pid
+  # ⛔ THE FAILED WRITE MUST ALSO REMOVE THE FILE IT MAY HAVE TRUNCATED (P2, measured). `>` truncates the
+  # redirect target BEFORE the write runs, so a write that fails (ENOSPC/EDQUOT on a nearly-full volume —
+  # this repo ships `disk-floor.sh` for exactly that) leaves a ZERO-BYTE record and destroys the previous
+  # dispatch's state. An empty record has no exit line (-> `pending`) and no dispatch epoch (-> `_rage=0`,
+  # the value a real fresh dispatch carries), so `review_action pending 0 …` answers WAIT on every pass
+  # for ever: no dispatch, no publication, no exhaustion, and a log line that says a review is running.
+  # `rm -f` here is the same rollback the verify-failure path below already performs.
   printf 'REVIEW-DISPATCHED at=%s head=%s repo=%s pr=%s\n' "$(date +%s)" "$head" "$repo" "$pr" > "$out" \
-    || { log_line "$repo #$pr REVIEW-LAUNCH-FAILED: cannot write the review record at $out — nothing was dispatched and no cooldown was consumed"; return 1; }
+    || { rm -f "$out" 2>/dev/null; log_line "$repo #$pr REVIEW-LAUNCH-FAILED: cannot write the review record at $out — nothing was dispatched, no cooldown was consumed, and the truncated record was removed (a zero-byte record reads as a review in flight for ever)"; return 1; }
   nohup bash -c 'run_review "$@"' _ "$REVIEW_SCRIPT" "$pr" "$repo" "$out" >> "$LOG" 2>&1 &
   pid=$!
   log_line "$repo #$pr no attestation at head $head -> dispatching reviewer (KIND=reviewer, $REVIEW_SCRIPT)"

@@ -748,6 +748,13 @@ _rav_ln=$(grep -nF 'REVIEW-UNAVAILABLE' "$SUT" | head -1 | cut -d: -f1)
   || bad "REVIEW_AVAILABLE must be decided AFTER the rail-hub refresh (refresh at line ${_ref_ln:-MISSING}, availability at line ${_rav_ln:-MISSING}) — the reviewer lives in the clone the refresh updates, so an earlier test answers about the PREVIOUS clone and latches a false 'UNAVAILABLE' for the process lifetime"
 grep -qF '[ -s "$REVIEW_SCRIPT" ]' "$SUT" \
   || bad "the reviewer seam needs a CAPABILITY bar, not an existence check (this repo's own: -f, -x, -s, bash -n — gate-policy.sh) — a zero-byte review-pr.sh exits 0, which reads as a CLEAN review of a head nobody read, and clean is terminal"
+# ⛔ AND THE `bash -n` ARM OF THAT BAR NEEDED ITS OWN PIN (non-vacuity, measured): the arm above greps
+# only `[ -s … ]` and its MESSAGE claims "-f, -x, -s, bash -n", so deleting the parse check left the
+# suite GREEN. It is the only arm that catches an executable, NON-EMPTY, UNPARSABLE `review-pr.sh`: with
+# it gone REVIEW_AVAILABLE latches 1, every dispatch yields `bash: syntax error` → rc=2 → `retry`, the
+# attempt budget is spent, and the loop publishes a 'paid dispatch(es)' claim about money never spent.
+grep -qF 'bash -n "$REVIEW_SCRIPT"' "$SUT" \
+  || bad "the reviewer capability bar must PARSECHECK the reviewer ('bash -n \"\$REVIEW_SCRIPT\"') — without it an executable, non-empty, unparsable review-pr.sh latches REVIEW_AVAILABLE=1, burns the attempt budget on a reviewer that cannot run, and publishes a 'paid dispatch(es)' claim about money never spent"
 # …and a dispatch may never be invisible: the IN-FLIGHT marker is published BEFORE the launch. The two
 # call shapes are named exactly, because a looser match is satisfied by the found-issues publish further
 # up the branch — measured: deleting the in-flight publish entirely left a loose order assertion GREEN.
@@ -863,12 +870,40 @@ _badbt=$(awk '/text="/ { l=$0; gsub(/\\`/,"",l); if (index(l,"`")) print NR": "l
 # budget is spent, which is the one thing this state exists to stop.
 grep -qF 'if [ "$_ract" -eq 3 ]; then' "$SUT" \
   || bad "the EXHAUSTED publish must hang off the rc-3 arm ('if [ \"\$_ract\" -eq 3 ]; then') — pinned only by the state's name, an unreachable discriminator lets rc 3 fall through to launch_review and buy another paid review"
+# ⛔ AND THE WAIT BRANCH'S `continue` IS THE ANTI-THRASH GATE, NOT DECORATION (P1 non-vacuity, measured):
+# no arm covered it, so deleting it left the suite GREEN while control fell through the `-eq 3` / `-eq 2`
+# tests, past `review_should_defer 0` (false) and into `launch_review` — a SECOND concurrent PAID reviewer
+# on a head already being reviewed, rewriting `_rout` and resetting the dispatch epoch the cooldown is
+# measured from. At a 20–30 min review and 180 s passes that is ~10 concurrent paid reviews of one head,
+# each spending an attempt against a budget it was never supposed to consume.
+# An anchored on the WAIT branch's OWN LOG LINE rather than on the `if`: the `case "$_rstate"` block that
+# chooses `_rwin` sits between the `if` and the `continue`, so any `-A` window that reached the `continue`
+# from the `if` would also reach the NEXT arm's, and a tighter one fails for the wrong reason.
+printf '%s\n' "$_branch" | grep -A2 -F 'review $_rstate at $head — dispatched' | grep -qF 'continue' \
+  || bad "the WAIT branch's log line must be followed by CONTINUE — without it a head whose review is ALREADY IN FLIGHT falls through to the dispatch and buys a second concurrent paid review, resetting the cooldown key it is measured by, and nothing else in this file notices"
 # ⛔ AND THE ATTEMPT BUDGET MUST BE FED INTO THE DECISION, OR THE P1 PAID LOOP IS BACK (review round 2,
 # P2, measured): the loop's call is the ONLY thing that makes `$att` non-zero, so dropping the third
 # argument leaves the predicate's attempt term permanently 0, `return 3` unreachable, and a paid review
 # re-bought on every pass — with the suite green, because `_rattn` is still computed and still logged.
 grep -qF 'review_action "$_rstate" "$_rage" "$_rattn"' "$SUT" \
   || bad "the loop must pass the attempt count into review_action ('review_action \"\$_rstate\" \"\$_rage\" \"\$_rattn\"') — without it the EXHAUSTED branch is unreachable and the bounded retry is unbounded again"
+# ⛔ THE REMAINING STATE PUBLISHES WERE PINNED BY *TEXT*, NEVER BY A CALL (P1/P2 non-vacuity, measured
+# 2026-11-06 with a mutation harness). Driving `publish_review_state` directly proves the MESSAGE works,
+# never that anything posts it. Three call sites had no arm at all:
+#   * the CAP-DEFERRAL publish — deleted, the suite stayed GREEN, and that is the state a mergeable,
+#     unattested PR is in whenever the box is at MAX, i.e. the COMMON case: a log line only, which is
+#     #3489 itself (nothing on the PR, indistinguishable from a lane working it);
+#   * the BURST-BOUND publish — deleted, GREEN; a head queued behind this repo's own REVIEW_PER_PASS
+#     budget then reads as waiting on a lane;
+#   * the loop's `review-found-issues` CALL — only the state's TEXT and its marker count were pinned, so
+#     deleting the call left a head the reviewer REJECTED (and which the loop correctly refuses to
+#     re-review) exactly as invisible as before this change.
+grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ] && publish_review_state "$repo" "$pr" awaiting-review' "$SUT" \
+  || bad "the CAP-DEFERRAL arm must publish 'awaiting-review' for a green, unattested, deferred candidate — measured: deleting it left the suite GREEN, so the one state a mergeable unattested PR is in whenever the box is at MAX existed only in the log, which is #3489 on the most common path"
+grep -A2 -F 'if review_should_defer "$_rdispatched"; then' "$SUT" | grep -qF 'publish_review_state "$repo" "$pr" awaiting-review' \
+  || bad "the BURST-BOUND deferral must publish 'awaiting-review' — deleted, the suite stayed GREEN and a head queued behind this repo's REVIEW_PER_PASS budget reads as waiting on a lane"
+printf '%s\n' "$_branch" | grep -A3 -F 'if [ "$_ract" -eq 2 ]; then' | grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"' \
+  || bad "the loop must PUBLISH 'review-found-issues' from the '\$_ract -eq 2' / issues arm — the state's TEXT and its marker count are pinned, so deleting this CALL left the suite GREEN while a head the reviewer REJECTED (and which the loop will not re-review) stayed as invisible as #3489"
 # ⛔ AND A REFUSAL MUST HAND THE BUDGET BACK (review round 2, P2): `refused` ignores `$att`, so without
 # this reset a run of load refusals leaves the ledger saturated and the FIRST real review that then
 # fails is EXHAUSTED on its first retry — the refusal spent money that was never spent.
@@ -948,7 +983,7 @@ launch_review acme/widget 42 "$H" "$_rout" "$_rdir/attempts-a" || bad "the dispa
   || bad "a dispatch that has produced no exit line is PENDING (got '$(review_state "$_rout")') — a live review read as a failure gets a duplicate paid for next pass"
 review_action pending 0; [ $? -eq 0 ] || bad "a fresh pending review must WAIT (no second dispatch)"
 review_action pending $(( REVIEW_COOLDOWN_S - 1 )); [ $? -eq 0 ] || bad "one second INSIDE the cooldown must still WAIT — the boundary is the whole arm"
-review_action pending $(( REVIEW_COOLDOWN_S + 1 )); [ $? -eq 1 ] || bad "a pending review past the cooldown must be RETRIED — `review-pr.sh` caps itself at 1800 s, so 2700 s of silence is not a slow review, it is a dead one, and waiting for ever is a stall"
+review_action pending $(( REVIEW_COOLDOWN_S + 1 )); [ $? -eq 1 ] || bad "a pending review past the cooldown must be RETRIED — review-pr.sh caps itself at 1800 s, so 2700 s of silence is not a slow review, it is a dead one, and waiting for ever is a stall"
 # ⛔ THE WINDOWS MUST BE READ, NOT HARDCODED (review round 3, measured). The arms above and below probe
 # the cooldowns only at their SHIPPED defaults (2700 / 900), so replacing `[ "$age" -lt "$REVIEW_COOLDOWN_S" ]`
 # with `[ "$age" -lt 2700 ]` — the operator knob silently disarmed — left the suite GREEN (measured).
@@ -1023,7 +1058,7 @@ _r4="$_rdir/r4.out"; run_review "$_rev_load" 42 acme/widget "$_r4"
 rev_4=$(mktemp); printf '#!/bin/bash\nexit 4\n' > "$rev_4"; chmod +x "$rev_4"
 _r4b="$_rdir/r4b.out"; run_review "$rev_4" 42 acme/widget "$_r4b"
 [ "$(review_state "$_r4b")" = refused ] \
-  || bad "rc=4 (`pi` unavailable, before any review is paid for) must read as 'refused' (got '$(review_state "$_r4b")')"
+  || bad "rc=4 (pi unavailable, before any review is paid for) must read as 'refused' (got '$(review_state "$_r4b")')"
 rm -f "$rev_4"
 review_action refused 0 "$REVIEW_MAX_ATTEMPTS"; [ $? -eq 0 ] \
   || bad "a load refusal must WAIT out the short retry window, not re-dispatch into a still-busy box"
@@ -1103,6 +1138,17 @@ _r5="$_rdir/r5.out"; run_review /nonexistent/reviewer.sh 42 acme/widget "$_r5"
 # ── AND A DISPATCH THAT CANNOT EVEN RECORD ITSELF CONSUMES NOTHING (mirrors `launch_rail`) ──────
 : > "$_sutlog"
 launch_review acme/widget 42 "$H" /proc/no/such/dir/r6.out 2>/dev/null && bad "a dispatch that cannot write its record must not read as started"
+# ⛔ AND A FAILED WRITE MUST REMOVE THE RECORD IT TRUNCATED (P2). `>` truncates the target BEFORE the write
+# runs, so a write that fails on a nearly-full volume (`disk-floor.sh` exists because that happens) leaves
+# a ZERO-BYTE record: no exit line (-> `pending`) and no dispatch epoch (-> `_rage=0`, the value a real
+# fresh dispatch carries), so `review_action pending 0 …` answers WAIT on every pass for ever — no
+# dispatch, no publication, no exhaustion — with a log line that says a review is running.
+# ⛔ PINNED BY SHAPE, AND THAT IS THE HONEST CEILING: the arm above fails AT THE OPEN (the directory does
+# not exist, so nothing is truncated and there is nothing to remove), and the truncate-then-fail path
+# needs a volume that fills between the two, which this suite cannot simulate without `ulimit -f` killing
+# the run on SIGXFSZ. So the rollback is pinned where it lives, and deleting it reddens here.
+grep -qF '|| { rm -f "$out" 2>/dev/null; log_line' "$SUT" \
+  || bad "a FAILED record write must roll the truncated record back ('|| { rm -f \"\$out\" …') — left behind, a zero-byte record reads as a review in flight for ever: no exit line, no dispatch epoch, so the state machine answers WAIT on every pass and nothing is ever published or exhausted"
 grep -q 'REVIEW-LAUNCH-FAILED' "$_sutlog" || bad "the failed dispatch must name itself in the log (a dispatch nobody records is a review nobody knows about)"
 # ⛔ AND THE **VERIFIED-LAUNCH ROLLBACK** — THE BRANCH THE ARM ABOVE DOES NOT REACH (review, P2). The
 # /proc arm fails one branch EARLIER, at the record write, and prints the SAME `REVIEW-LAUNCH-FAILED`
@@ -1124,6 +1170,25 @@ grep -q 'REVIEW-LAUNCH-FAILED' "$_sutlog" || bad "the rolled-back dispatch must 
 # restore the wrapper the rollback arm removed, so nothing after this point runs under it
 eval "$(sed -n '/^run_review() {/,/^}$/p' "$SUT")"; export -f run_review
 command -v run_review >/dev/null || bad "run_review must be restorable after the rollback arm"; echo
+# ⛔ A DISPATCH WHOSE REVIEWER ALREADY *FINISHED* IS STARTED, NOT ROLLED BACK (P1 non-vacuity, measured).
+# The verification is `kill -0 "$pid" || [ "$(wc -l < "$out")" -gt 1 ]`, and the SECOND clause is the only
+# thing that separates "never started" from "started AND finished inside LAUNCH_VERIFY_S". Deleting it
+# left this suite GREEN while the shipped function rolled a REAL, COMPLETED outcome back to `none`, threw
+# its verdict away and counted no attempt — and the next pass re-bought it. Every FAST reviewer is hit:
+# rc=4 (no `pi`) and rc=75 (the load gate) exit immediately, so the `refused` state became UNREACHABLE
+# from the loop and a paid review that finished quickly was paid for again, unbounded, because the
+# rollback path deliberately spends no attempt.
+_rfast=$(mktemp); printf '#!/bin/bash\nexit 4\n' > "$_rfast"; chmod +x "$_rfast"
+_r8="$_rdir/r8.out"; _r8led="$_rdir/r8.attempts"
+REVIEW_SCRIPT="$_rfast"
+launch_review acme/widget 42 "$H" "$_r8" "$_r8led" \
+  || bad "a reviewer that STARTED and FINISHED inside ${LAUNCH_VERIFY_S}s must read as a started dispatch (rc 0) — the 'nothing beyond the dispatch line' test is what separates it from a child that never ran, and without it every fast reviewer (rc=4/75) is rolled back and re-bought on every pass"
+[ -f "$_r8" ] || bad "a FINISHED dispatch must keep its record — removing it discards a real outcome and re-buys the review"
+[ "$(review_state "$_r8")" = refused ] \
+  || bad "the kept record must read 'refused' from its own exit line (got '$(review_state "$_r8")') — the recorded rc IS the outcome"
+[ "$(review_attempts "$_r8led")" = 1 ] \
+  || bad "a FINISHED dispatch must consume exactly one attempt (got '$(review_attempts "$_r8led")') — uncounted, the per-head bound is weaker than it says"
+rm -f "$_rfast"
 rm -f "$_rev_issues" "$_rev_clean" "$_rev_load"
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"
