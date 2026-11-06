@@ -612,7 +612,9 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
 #     5  a clean record already exists at this head (a lost race in the good direction: nothing owed)
 #     7  the reviewer FOUND ISSUES — not recorded, findings posted as the comment
 #     8  the head moved during the review        9  the record/artifact arm failed
-#     75 a spawn-point load refusal (nothing was consumed)
+#     4  no `pi`                                 75 a spawn-point load refusal
+#     → 0/5 clean, 7 issues, 4/75 REFUSED (nothing was consumed: see `refused` in review_action),
+#       everything else retry (the review may have been paid for, so the attempt budget applies).
 # ⛔ A STALE RECORD IS TREATED AS "NO ATTESTATION FOR THE HEAD THAT WOULD MERGE", WHICH IS A DELIBERATE
 # COST, STATED RATHER THAN HIDDEN. `record-review.sh --check-carry` would sometimes answer that the
 # reviewed DIFF is unchanged and the record carries (#3315) — and in that case this actuator buys a
@@ -626,7 +628,7 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
 # ⛔ 7 IS TERMINAL AT THIS HEAD, AND THAT IS THE POINT: re-dispatching a head the reviewer already
 # rejected pays for the SAME verdict again for ever. The fix is a new head, and a new head is a
 # different key (the file is named for the head), so a new head gets a review by construction.
-review_state() {  # $1 = the review's output file; prints none|pending|clean|issues|retry
+review_state() {  # $1 = the review's output file; prints none|pending|clean|issues|retry|refused
   [ -f "$1" ] || { printf 'none\n'; return 0; }
   local rc
   # `tail` FIRST: the exit line is the LAST line, and a reviewer transcript is tens of KB that every pass
@@ -638,6 +640,12 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
   case "$rc" in
     0|5) printf 'clean\n';;
     7)   printf 'issues\n';;
+    # ⛔ A REFUSAL IS NOT A REVIEW (review round 2, P2). rc=4 (no `pi`) and rc=75 (the load gate) are
+    # documented as consuming NOTHING, so they must not spend the PAID attempt budget: three load
+    # refusals would otherwise mark a head nobody ever read as EXHAUSTED, permanently, and the comment
+    # published for it would claim the review had been paid for. Their own state retries on TIME alone.
+    # rc=3 is deliberately NOT here: `review-pr.sh` exits 3 on several paths AFTER the reviewer ran.
+    4|75) printf 'refused\n';;
     *)   printf 'retry\n';;
   esac
 }
@@ -659,6 +667,29 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the dispatch c
   case "${n:-}" in ''|*[!0-9]*) printf '0\n'; return 0;; esac
   printf '%s\n' "$n"
 }
+# ── FORGIVING A REFUSAL, PRECISELY ───────────────────────────────────────────────────────────────
+# ⛔ IT DROPS **ONE** LINE — THE REFUSAL'S OWN — AND NEVER THE WHOLE LEDGER (review round 2, verifier).
+# `launch_review` counts every VERIFIED dispatch, and a refusal IS verified (its child starts, and
+# `run_review` appends its REVIEW-EXIT line, so the record is past the dispatch line), so the refusal's
+# attempt IS in the ledger. Truncating the file therefore forgave every PAID attempt before it: two paid
+# failures (att=2) followed by one load refusal (att=3) reset the budget to 0 and bought three more paid
+# reviews — the unbounded paid loop this PR exists to bound, re-opened by its own fix, and reachable on
+# exactly the intermittently-loaded box where the gate fires. Each dispatch appends exactly one line and
+# this runs only when the LAST dispatch is the refusal, so dropping that line is exact.
+# A failure here leaves the refusal counted, i.e. the budget is TIGHTER than intended — fail-closed, which
+# is the right direction for a bound.
+review_forgive_refusal() {  # $1 = attempt ledger; drops the newest entry if there is one
+  local f=$1 n tmp
+  [ -f "$f" ] || return 0
+  n=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
+  case "${n:-}" in ''|*[!0-9]*) return 0;; esac
+  [ "$n" -gt 0 ] || return 0
+  tmp="$f.tmp.$$"
+  sed '$d' "$f" > "$tmp" 2>/dev/null && mv "$tmp" "$f" && return 0
+  rm -f "$tmp" 2>/dev/null
+  log_line "$f REVIEW-FORGIVE-FAILED: could not drop the refusal's attempt line — this head is one attempt tighter than intended (fail-closed)"
+  return 0
+}
 # ── THE ACTION, IN ONE PLACE ───────────────────────────────────────────────────────────────────────
 # rc 0 = WAIT (a review is already owed at this head), 1 = DISPATCH now, 2 = TERMINAL at this head (a
 # fix or the recorder is owed — never another review), 3 = EXHAUSTED (this head has spent its paid
@@ -674,13 +705,18 @@ review_action() {  # $1 = state, $2 = seconds since dispatch, $3 = attempts alre
     pending) [ "$age" -lt "$REVIEW_COOLDOWN_S" ] && return 0
              [ "$att" -lt "$REVIEW_MAX_ATTEMPTS" ] && return 1
              return 3;;
-    # It RAN AND LEFT NO VERDICT (or was refused before it started). ⛔ THIS IS THE ARM THAT MUST BE
-    # BOUNDED (review, P1): rc=6/9/10 arrive AFTER the review was paid for, so their age is already
-    # past the short window and an unbounded retry is one paid review per review-duration, for ever, at
-    # one head. Cheap refusals (rc=3/4/75, nothing consumed) ride the same counter and never reach it.
+    # It RAN AND LEFT NO VERDICT. ⛔ THIS IS THE ARM THAT MUST BE BOUNDED (review, P1): rc=6/9/10 arrive
+    # AFTER the review was paid for, so their age is already past the short window and an unbounded
+    # retry is one paid review per review-duration, for ever, at one head.
     retry)   [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0
              [ "$att" -lt "$REVIEW_MAX_ATTEMPTS" ] && return 1
              return 3;;
+    # ⛔ NOTHING WAS CONSUMED, SO NOTHING IS EXHAUSTED (review round 2, P2). A refusal waits out the
+    # short window and is retried whatever the attempt count says: an environment fault (a loaded box,
+    # no `pi`) must recover BY ITSELF, not permanently block the head with a message about money that
+    # was never spent. The loop clears the ledger when it dispatches out of this state, so a refusal
+    # never eats the paid budget either.
+    refused) [ "$age" -lt "$COOLDOWN_TRANSIENT_S" ] && return 0; return 1;;
     *)       return 1;;
   esac
 }
@@ -1045,6 +1081,10 @@ PY
           log_line "$repo #$pr AWAITING-REVIEW ($_att at $head) — $_rdispatched review(s) already dispatched for this repo this pass (cap $REVIEW_PER_PASS); this head is next in the queue"
           continue
         fi
+        # ⛔ A REFUSAL SPENT NOTHING, SO IT MUST NOT SPEND THE PAID BUDGET — AND ONLY ITS OWN LINE COMES
+        # OFF (review round 2; the truncate-all version forgave paid attempts and re-opened the paid
+        # loop). `review_forgive_refusal` is a driven function for exactly that reason.
+        [ "$_rstate" = refused ] && review_forgive_refusal "$_ratt"
         publish_review_state "$repo" "$pr" review-in-flight "$head"
         launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" || continue
         _rdispatched=$(( _rdispatched + 1 ))

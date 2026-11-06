@@ -330,6 +330,12 @@ _check_refusal "REVIEW_COOLDOWN_S=abc" "REFUSED: REVIEW_COOLDOWN_S=" "no cooldow
 _check_refusal "REVIEW_COOLDOWN_S=0"   "REFUSED: REVIEW_COOLDOWN_S=" "already being reviewed"
 _check_refusal "REVIEW_PER_PASS=abc"   "REFUSED: REVIEW_PER_PASS="   "not a non-negative integer"
 _check_refusal "COOLDOWN_TRANSIENT_S=abc" "REFUSED: COOLDOWN_TRANSIENT_S=" "is not a positive integer"
+# ⛔ REVIEW_MAX_ATTEMPTS GETS THE SAME ROWS (review round 2, P1, measured): deleting BOTH of its startup
+# guards left the suite GREEN, so `REVIEW_MAX_ATTEMPTS=abc` (an error in the attempt comparison, which
+# reads FALSE — no bound at all) and `REVIEW_MAX_ATTEMPTS=0` (every head EXHAUSTED before its first
+# dispatch, i.e. the review arm silently dead) were both unprotected, though this PR adds both guards.
+_check_refusal "REVIEW_MAX_ATTEMPTS=abc" "REFUSED: REVIEW_MAX_ATTEMPTS=" "no bound at all"
+_check_refusal "REVIEW_MAX_ATTEMPTS=0"   "REFUSED: REVIEW_MAX_ATTEMPTS=" "not a POSITIVE integer"
 
 # ⛔ THE RAIL-VERDICT DIRECTORY IS A PRECONDITION TOO — and its absence used to be invisible: a launch
 # whose redirect cannot be opened returns 0 to the caller, so the log said `launching rail` for a rail
@@ -474,7 +480,13 @@ lock_holder_is_live "$_lk.d" && bad "a RECYCLED pid must not read as a live hold
 acquire_lock || bad "an aged lock with a recycled pid must be RECLAIMED, not honoured for ever"
 [ "$(cat "$_lk.d/pid" 2>/dev/null)" = "$$" ] || bad "a reclaimed lock must carry the new holder's pid"
 # …but the same recycled pid on a FRESH lock is still treated as held (fail-closed, no steal).
+# ⛔ AND THE LOCK MUST NAME THE *RECYCLED* PID WHEN THIS ARM RUNS (review round 2, P2, measured): after
+# `acquire_lock` reclaimed the lock, the pid in it is the SUITE's own, and under `bash -c` the suite's
+# argv contains `auto-rail.sh` — so the function returned 0 at the "real holder" branch and this arm
+# never reached the fail-closed rule it names. (Instrumented: pid_in_lock=suite_pid, holder_args_match=1.)
+# Writing the spawned pid back is what makes the assertion about the fresh-lock rule.
 touch "$_lk.d"
+printf '%s\n' "$_rcl" > "$_lk.d/pid"
 lock_holder_is_live "$_lk.d" || bad "a fresh lock naming a live-but-unrelated pid must be treated as HELD until it ages out"
 kill "$_rcl" 2>/dev/null || true
 rm -rf "$_lk.d"
@@ -572,6 +584,7 @@ rm -rf "$_pydir" "$_badbin" "$_sutlog"
 eval "$(sed -n '/^review_state() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_dispatched_at() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_attempts() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^review_forgive_refusal() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_action() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^review_should_defer() {/,/^}$/p' "$SUT")"
 eval "$(sed -n '/^publish_review_state() {/,/^}$/p' "$SUT")"
@@ -662,13 +675,19 @@ esac
 # all", and the suite pinned its EMISSION (`red\t9\tat-head`) but nothing pinned the refusal. With this
 # guard deleted, every red + unattested candidate buys a paid review per repo per pass on a head that
 # cannot land — and publishes `review-in-flight` for it — with the suite green.
-printf '%s\n' "$_branch" | grep -qF '[ "$_kind" != green ]' \
-  || bad "the review branch must REFUSE to buy a review for a RED head (no '[ \"\$_kind\" != green ]' guard): a red head has to change before an attestation can land it, so the money is spent on a dying revision"
+# ⛔ PINNING THE EXPRESSION IS NOT PINNING THE GATE (review round 2, P1, measured): deleting only the
+# `continue` — the guard expression untouched — left the suite GREEN while the loop logged "no review is
+# bought for a head that has to change" and then fell straight through to publish `review-in-flight` and
+# call `launch_review`. The `continue` IS the gate, so the ARM has to require it.
+printf '%s\n' "$_branch" | grep -A2 -F '[ "$_kind" != green ]' | grep -qF 'continue' \
+  || bad "the review branch must REFUSE to buy a review for a RED head — the '[ \"\$_kind\" != green ]' guard must be followed by a 'continue'; without it a red head dispatches a paid reviewer AND publishes 'review in flight', money spent on a revision that cannot land"
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH: a missing reviewer must be named per candidate, not dispatched
 # into. Unpinned, deleting the guard left the suite green while the loop wrote a dispatch record and
 # published `review-in-flight` — a claim that something is running — on a box with no reviewer at all.
-printf '%s\n' "$_branch" | grep -qF '[ "$REVIEW_AVAILABLE" != 1 ]' \
-  || bad "the review branch must REFUSE to dispatch when no reviewer is available ('[ \"\$REVIEW_AVAILABLE\" != 1 ]') — a dispatch nobody can serve is published as 'review in flight' and reads as progress"
+# ⛔ AND NO REVIEWER MEANS NO DISPATCH. Same gate-vs-text distinction: the expression alone is satisfied
+# while the loop dispatches into a reviewer that does not exist and publishes 'review in flight' for it.
+printf '%s\n' "$_branch" | grep -A2 -F '[ "$REVIEW_AVAILABLE" != 1 ]' | grep -qF 'continue' \
+  || bad "the review branch must REFUSE to dispatch when no reviewer is available — the '[ \"\$REVIEW_AVAILABLE\" != 1 ]' guard must be followed by a 'continue'; without it a box with no reviewer records a dispatch, counts an attempt against the cap, and tells the PR 'review in flight'"
 # ⛔ THE TWO STATES THE LOOP MUST PUBLISH FOR ITSELF, PINNED WHERE THE LOOP CALLS THEM (review, P1/P2).
 # Driving `publish_review_state` directly proves the TEXT works, not that anything ever posts it —
 # measured with this very harness: deleting the loop's `review-record-unbound` publish left the suite
@@ -678,6 +697,15 @@ printf '%s\n' "$_branch" | grep -qF 'review-record-unbound' \
   || bad "the CLEAN-but-unbound arm must PUBLISH 'review-record-unbound' — logging 're-running the recorder is the remedy' while nothing performs it and nothing appears on the PR is the #3489 invisibility again, permanently, because the key never changes without a new head"
 printf '%s\n' "$_branch" | grep -qF 'review-retries-exhausted' \
   || bad "the review branch must PUBLISH 'review-retries-exhausted' when the attempts are spent — otherwise a head nobody can review reads exactly like a head waiting on a lane"
+# ⛔ AND BOTH MUST BE HEAD-BOUND, ON THE EXACT CALL SHAPE (review round 2, P2, measured): a bare name
+# match is satisfied by dropping the head argument, which collapses the tag to a headless
+# `<!-- auto-rail-review:<state> -->` — so the second head of that PR can never publish its own marker
+# (it is already present) and the message renders with nothing after "at". That is the exact invisibility
+# these two states exist to remove. The `review-in-flight` arm above shows the shape: the literal call.
+printf '%s\n' "$_branch" | grep -qF 'publish_review_state "$repo" "$pr" review-retries-exhausted "$head"' \
+  || bad "EXHAUSTED must be published HEAD-BOUND ('publish_review_state \"\$repo\" \"\$pr\" review-retries-exhausted \"\$head\"') — a headless tag means the next head in the same state can never publish, so the PR goes invisible again"
+printf '%s\n' "$_branch" | grep -qF 'publish_review_state "$repo" "$pr" review-record-unbound "$head"' \
+  || bad "the unbound-record remedy must be published HEAD-BOUND ('… review-record-unbound \"\$head\"') — a headless tag is invisible on the next head, which is the #3489 defect itself"
 # ⛔ AND THE AVAILABILITY ITSELF MUST BE AN HONEST ANSWER (review, P2 + P2): computed BEFORE the
 # rail-hub refresh, it latches the PREVIOUS clone's contents — the exact file the refresh is what
 # creates — so a job that starts while the hub is behind logs "no reviewer" for its whole lifetime and
@@ -748,13 +776,66 @@ REVIEW_PER_PASS=1
 # REVIEW_PER_PASS inert. The increment has the mirror problem: "exists somewhere" is satisfied by an
 # increment ABOVE `launch_review`, which spends the repo's only slot on a dispatch that FAILED.
 _while_ln=$(grep -nF 'read -r _kind pr _att; do' "$SUT" | head -1 | cut -d: -f1)
+_forrepo_ln=$(grep -nF 'for repo in $REPOS; do' "$SUT" | head -1 | cut -d: -f1)
 _reset_ln=$(grep -nE '^[[:space:]]*_rdispatched=0$' "$SUT" | head -1 | cut -d: -f1)
 _inc_ln=$(grep -nE '^[[:space:]]*_rdispatched=\$\(\( _rdispatched \+ 1 \)\)$' "$SUT" | head -1 | cut -d: -f1)
 _lau_ln=$(grep -nF 'launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt"' "$SUT" | head -1 | cut -d: -f1)
+# ⛔ THE RESET NEEDS BOTH BOUNDS, NOT JUST ONE (review round 2, P2, measured): `reset < candidate loop`
+# is satisfied by a reset ABOVE the `for repo` loop, which makes the budget PER PASS — repo A spends it
+# and repo B gets `awaiting-review` and no review — the exact failure the arm's message names. Pinning
+# the upper bound alone left that edit GREEN.
+[ -n "$_forrepo_ln" ] && [ -n "$_reset_ln" ] && [ "$_forrepo_ln" -lt "$_reset_ln" ] \
+  || bad "the per-pass review counter must be RESET INSIDE the per-repo loop, not above it (repo loop at line ${_forrepo_ln:-MISSING}, reset at line ${_reset_ln:-MISSING}) — above it the budget is PER PASS, so the first repo spends it and every later repo is published 'awaiting-review' and never reviewed"
 [ -n "$_while_ln" ] && [ -n "$_reset_ln" ] && [ "$_reset_ln" -lt "$_while_ln" ] \
-  || bad "the per-pass review counter must be RESET BEFORE the candidate loop (reset at line ${_reset_ln:-MISSING}, candidate loop at line ${_while_ln:-MISSING}) — reset inside the loop is a per-CANDIDATE budget, which makes REVIEW_PER_PASS inert, and spent on repo A it would silently deny repo B"
+  || bad "the per-pass review counter must be RESET BEFORE the candidate loop (reset at line ${_reset_ln:-MISSING}, candidate loop at line ${_while_ln:-MISSING}) — reset inside the loop is a per-CANDIDATE budget, which makes REVIEW_PER_PASS inert"
 [ -n "$_inc_ln" ] && [ -n "$_lau_ln" ] && [ "$_inc_ln" -gt "$_lau_ln" ] \
   || bad "the per-pass review counter must be INCREMENTED only AFTER a successful dispatch (increment at line ${_inc_ln:-MISSING}, launch at line ${_lau_ln:-MISSING}) — incremented before it, one REVIEW-LAUNCH-FAILED consumes the repo's only slot and starves it for the whole pass"
+# ⛔ AND "AFTER a successful dispatch" IS THE `|| continue`, NOT THE LINE ORDER (review round 2, P1,
+# measured): swapping `|| continue` for `|| true` keeps the increment after the launch and left the suite
+# GREEN, while a rolled-back launch still burns the repo's only slot. The guard IS the condition.
+grep -qF 'launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" || continue' "$SUT" \
+  || bad "the dispatch must GUARD the counter increment ('launch_review … || continue') — without it a REVIEW-LAUNCH-FAILED (rolled back, nothing consumed) still increments the per-pass counter and starves every remaining candidate of that repo"
+# ⛔ AND THE ATTEMPT BUDGET MUST BE FED INTO THE DECISION, OR THE P1 PAID LOOP IS BACK (review round 2,
+# P2, measured): the loop's call is the ONLY thing that makes `$att` non-zero, so dropping the third
+# argument leaves the predicate's attempt term permanently 0, `return 3` unreachable, and a paid review
+# re-bought on every pass — with the suite green, because `_rattn` is still computed and still logged.
+grep -qF 'review_action "$_rstate" "$_rage" "$_rattn"' "$SUT" \
+  || bad "the loop must pass the attempt count into review_action ('review_action \"\$_rstate\" \"\$_rage\" \"\$_rattn\"') — without it the EXHAUSTED branch is unreachable and the bounded retry is unbounded again"
+# ⛔ AND A REFUSAL MUST HAND THE BUDGET BACK (review round 2, P2): `refused` ignores `$att`, so without
+# this reset a run of load refusals leaves the ledger saturated and the FIRST real review that then
+# fails is EXHAUSTED on its first retry — the refusal spent money that was never spent.
+# ⛔ AND A REFUSAL MUST HAND THE BUDGET BACK WITHOUT FORGIVING PAID ATTEMPTS (review round 2, verifier):
+# the first version truncated the WHOLE ledger, so two paid failures followed by one load refusal reset
+# the budget to 0 and bought three more paid reviews — the P1 loop re-opened by its own fix, on exactly
+# the intermittently-loaded box where the gate fires. These arms drive the shipped function: the refusal's
+# own line goes, the paid entries before it stay.
+_led="$_rdir/forgive.attempts"
+printf '1\n2\n3\n' > "$_led"
+review_forgive_refusal "$_led"
+[ "$(review_attempts "$_led")" = 2 ] \
+  || bad "forgiving a refusal must drop exactly ONE line (got '$(review_attempts "$_led")', want 2) — dropping the whole ledger forgives PAID attempts and re-opens the paid retry loop"
+printf '1\n2\n' > "$_led"
+review_forgive_refusal "$_led"
+[ "$(review_attempts "$_led")" = 1 ] \
+  || bad "forgiving a refusal must leave the earlier PAID entries counted (got '$(review_attempts "$_led")', want 1)"
+printf '1\n' > "$_led"
+review_forgive_refusal "$_led"
+[ "$(review_attempts "$_led")" = 0 ] || bad "forgiving the only entry must leave an empty ledger, not a corrupt one"
+review_forgive_refusal "$_led"
+[ "$(review_attempts "$_led")" = 0 ] || bad "forgiving an EMPTY ledger must be a no-op (got '$(review_attempts "$_led")')"
+review_forgive_refusal "$_rdir/no-such.attempts" || bad "forgiving a ledger that does not exist must be a no-op, not an error"
+rm -f "$_led"
+grep -qF 'review_forgive_refusal "$_ratt"' "$SUT" \
+  || bad "the loop must CALL review_forgive_refusal when dispatching out of 'refused' — without it a run of load refusals leaves the ledger saturated and the next real review is EXHAUSTED on its first paid failure"
+# ⛔ AND THE LEDGER IS KEYED BY THE HEAD, like the record it bounds (review round 2, P2, measured):
+# dropping the head from the ledger name turns a PER-HOST/PER-HEAD budget into a PR-LIFETIME one, so the
+# first head that spends 3 attempts poisons every later head of that PR — each new head reads 3, is
+# published EXHAUSTED before dispatching anything, and the review arm is dead for that PR with a clean log.
+_ratt_line=$(sed -n 's/^[[:space:]]*_ratt="\(.*\)"$/\1/p' "$SUT")
+case "$_ratt_line" in
+  *'$pr-$head.attempts') ;;
+  *) bad "the attempt ledger must be KEYED BY THE HEAD (got '${_ratt_line:-MISSING}') — keyed by PR it accumulates across heads, so a fixed head starts with a pre-spent budget and is EXHAUSTED before its first dispatch" ;;
+esac
 # ── STATE 3 — REVIEW IN FLIGHT: the next cycle WAITS (no second dispatch, no second marker) ──────
 # ⛔ THE ANTI-THRASH ARM. This is the state a slow review is in for 5-30 minutes, i.e. 2-10 passes.
 _fakerev=$(mktemp); printf '#!/bin/bash\necho "reviewing"\nsleep 30\n' > "$_fakerev"; chmod +x "$_fakerev"
@@ -819,10 +900,45 @@ review_action clean 0; [ $? -eq 2 ] \
   || bad "a CLEAN review whose marker the body does not carry yet must not be re-dispatched — re-running the recorder is the remedy, and a fresh review neither helps nor is honest"
 _rev_load=$(mktemp); printf '#!/bin/bash\nexit 75\n' > "$_rev_load"; chmod +x "$_rev_load"
 _r4="$_rdir/r4.out"; run_review "$_rev_load" 42 acme/widget "$_r4"
-[ "$(review_state "$_r4")" = retry ] || bad "rc=75 (a load refusal: nothing was consumed) must read as 'retry' (got '$(review_state "$_r4")')"
-review_action retry 0; [ $? -eq 0 ] || bad "a load refusal must WAIT out the short retry window, not re-dispatch into a still-busy box"
-review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) 0; [ $? -eq 1 ] \
-  || bad "a refusal past the short window must be retried (an unused head still gets its first review)"
+# ⛔ A REFUSAL IS ITS OWN STATE, NOT `retry` (review round 2, P2, measured). rc=75 (the load gate) and
+# rc=4 (no `pi`) are documented as consuming NOTHING, but they used to enter the SAME arm as the paid
+# failures — and every verified launch was counted — so three load refusals marked a head that had never
+# been read as EXHAUSTED, permanently, and published "the review was paid for" about money never spent.
+[ "$(review_state "$_r4")" = refused ] \
+  || bad "rc=75 (a load refusal: nothing was consumed) must read as 'refused' (got '$(review_state "$_r4")') — folded into 'retry' it spends the PAID attempt budget on a dispatch that cost nothing, and three refusals permanently EXHAUST a head nobody read"
+rev_4=$(mktemp); printf '#!/bin/bash\nexit 4\n' > "$rev_4"; chmod +x "$rev_4"
+_r4b="$_rdir/r4b.out"; run_review "$rev_4" 42 acme/widget "$_r4b"
+[ "$(review_state "$_r4b")" = refused ] \
+  || bad "rc=4 (`pi` unavailable, before any review is paid for) must read as 'refused' (got '$(review_state "$_r4b")')"
+rm -f "$rev_4"
+review_action refused 0 "$REVIEW_MAX_ATTEMPTS"; [ $? -eq 0 ] \
+  || bad "a load refusal must WAIT out the short retry window, not re-dispatch into a still-busy box"
+review_action refused $(( COOLDOWN_TRANSIENT_S + 1 )) 0; [ $? -eq 1 ] \
+  || bad "a refusal past the short window must be retried (it consumed nothing, so it still owes a first review)"
+# ⛔ AND THE POINT OF THE SPLIT: a refusal must NOT be exhausted even when the ledger is saturated,
+# because the ledger counts PAID attempts and a refusal spent none. This is the exact input that used to
+# mark an unread head EXHAUSTED for ever.
+# …and the cap must be READ, not hardcoded (review round 2, P2, measured): every arm above fixes the
+# cap at 3 and probes att ∈ {0,1,3}, so `[ "$att" -lt 3 ]` satisfied all of them. That is exactly the
+# class the REVIEW_PER_PASS arms below guard against ("must be READ, not hardcoded to 1"); the same
+# guard is owed to the knob this PR adds, because a hardcoded 2 silently shortens the paid budget.
+REVIEW_MAX_ATTEMPTS=2
+review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) 1; [ $? -eq 1 ] \
+  || bad "with REVIEW_MAX_ATTEMPTS=2 and one attempt spent, a past-window retry must still DISPATCH (got $?) — a hardcoded cap ignores the knob"
+review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) 2; [ $? -eq 3 ] \
+  || bad "with REVIEW_MAX_ATTEMPTS=2 and two attempts spent, a retry must be EXHAUSTED (got $?) — a hardcoded cap of 3 would keep paying"
+# …and the PENDING path reads it too: hardcoded there, a dead review is retried (or exhausted) on the
+# wrong count, and this probe is the only thing that sees it — att=0 and att=3 answer the same either way.
+review_action pending $(( REVIEW_COOLDOWN_S + 1 )) 1; [ $? -eq 1 ] \
+  || bad "with REVIEW_MAX_ATTEMPTS=2 and one attempt spent, a DEAD pending review must DISPATCH (got $?) — a hardcoded cap ignores the knob on this path too"
+review_action pending $(( REVIEW_COOLDOWN_S + 1 )) 2; [ $? -eq 3 ] \
+  || bad "with REVIEW_MAX_ATTEMPTS=2 and two attempts spent, a DEAD pending review must be EXHAUSTED (got $?)"
+REVIEW_MAX_ATTEMPTS=3
+review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) 2; [ $? -eq 1 ] \
+  || bad "with REVIEW_MAX_ATTEMPTS back at 3 and two spent, a retry must DISPATCH again (got $?) — the cap is restored, not sticky"
+# …while the paid failures stay bounded by the same ledger.
+review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) "$REVIEW_MAX_ATTEMPTS"; [ $? -eq 3 ] \
+  || bad "a PAID failure (rc=6/9/10/143) with the budget spent must be EXHAUSTED (rc 3, got $?)"
 # ⛔ THE ATTEMPT BOUND — THE PAID LOOP (review, P1). `retry` used to re-dispatch for ever: rc=6/9/10
 # arrive AFTER the review was paid for, so their age is ALREADY past COOLDOWN_TRANSIENT_S (the review
 # itself outlasts it), which means "past the window → dispatch" was true on every pass — one full paid
@@ -852,6 +968,15 @@ publish_review_state acme/widget 42 review-retries-exhausted "$H"
 publish_review_state acme/widget 42 review-record-unbound "$H"
 [ "$(_marker_count 'review-record-unbound')" = 1 ] \
   || bad "a clean-but-unbound record must be PUBLISHED on the PR (got $(_marker_count 'review-record-unbound')) — the remedy lives in a comment, and this actuator never writes records"
+# …and proved OUT OF BAND: drive the shipped function twice and require a SECOND head to publish its own
+# marker. Without head-keying the second is suppressed by the first, which no single-head arm can see.
+_H2=5555555555555555555555555555555555555555
+publish_review_state acme/widget 42 review-retries-exhausted "$_H2"
+publish_review_state acme/widget 42 review-record-unbound "$_H2"
+[ "$(_marker_count 'review-retries-exhausted')" = 2 ] \
+  || bad "a NEW head must be able to publish its own EXHAUSTED marker (got $(_marker_count 'review-retries-exhausted'), want 2) — head-keyed state is what stops a marker outliving the revision it describes"
+[ "$(_marker_count 'review-record-unbound')" = 2 ] \
+  || bad "a NEW head must be able to publish its own unbound-record marker (got $(_marker_count 'review-record-unbound'), want 2)"
 # ⛔ A REVIEWER THAT DIES AT ONCE STILL LEAVES AN OUTCOME. `bash /nonexistent` exits 127; without the
 # unconditional exit line the state would be `pending` for ever and the head would never be retried.
 _r5="$_rdir/r5.out"; run_review /nonexistent/reviewer.sh 42 acme/widget "$_r5"
