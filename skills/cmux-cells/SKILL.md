@@ -55,7 +55,13 @@ under the `HOME` a lane runs with; and the harness's own `lane-env.sh` sources `
 one. So the one setting that makes the operational layer work is the setting that hides the credential: `pi` starts, finds no
 key, and exits having done nothing. Since #3331 `lane.sh` REFUSES that shape before spawning `pi` — `[key-gate] … check=fail
 result=REFUSED var=<NAME> model=<id>` naming the variable, the provider, the model, `models.json` and every candidate file,
-exit **82** — and every lane log now ends with `outcome=<done|refused|failed|died> reason=<token>`. ⛔ **BUT THE KEY IS ONE OF
+exit **82** — and every lane log now ends with `outcome=<done|refused|failed|died> reason=<token>`. ⛔ **AND SINCE #3443 IT
+ANSWERS ON THIS EXACT SHAPE, WITH NO `models.json` AT ALL**: a provider `pi` ships is provisioned from its OWN variable
+(`dist/env-api-keys.js`; `deepseek` → `DEEPSEEK_API_KEY`, and a multi-variable provider passes on ANY of its variables), so
+the refusal names the real variable instead of saying `cannot-resolve-provider-credential` — that silence WAS the #3443
+report. Two shapes still cannot be decided and refuse nothing: a provider whose credential needs more than one environment
+value (`azure`, `google-vertex`, `cloudflare-*`, `github-copilot`, `radius` → `check=warn reason=provider-credential-unverifiable`
+naming the variable to check), and a provider `pi` does not ship and `models.json` does not declare. ⛔ **BUT THE KEY IS ONE OF
 FOUR FALSIFIED CAUSES, NOT THE CAUSE** (see “the launch directory” below): the same issue's record shows `keys.env` sourced,
 `api-key-errors=0`, and the lane STILL dying silently. Do not conclude “a key fixed it” from a green key gate — that gate
 closes the *reporting* half, it does not make a lane run.
@@ -68,7 +74,9 @@ that model silently. What worked was the invocation — `pi -p --no-session --mo
 `--provider`, spell the model as `provider/id`, which resolves unambiguously) — so **pin the pair; do not go looking for a keys file to
 source.** Since #3443 the gate also emits `check=warn reason=box-default-not-provisioned box_default=… model=… var=…` when the box's
 STARTUP model (`settings.json` `defaultProvider`/`defaultModel`) has no credential: that is about a bare `pi`, and it does
-not stop the lane, which pins its own pair. If the box sets `enabledModels`, `pi` picks the startup model from that SCOPE
+not stop the lane, which pins its own pair. The standalone `key-gate.sh --probe --box-default` REFUSES 82 for the same pin,
+but only when the variable can be NAMED (a `models.json` template, or pi's built-in table for a provider it ships); with
+neither it abstains with `check=skipped` and says so, so read the line rather than assuming a green/skip means provisioned. If the box sets `enabledModels`, `pi` picks the startup model from that SCOPE
 first — unless the pinned pair is itself in the scope — so the probe says `check=skipped reason=enabled-models-scoped` instead of answering from the pin — unset it (or
 launch with `--provider … --model …`) before trusting a green pin reading. **If the terminal line is absent**, three things produce that: a box that predates #3331, a
 lane the kernel or `lane-bound.sh` KILLed (no trap runs after SIGKILL), or a cleanup that outran the TERM→KILL grace — so
