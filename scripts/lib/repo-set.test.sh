@@ -42,6 +42,7 @@ done
 T="$(mktemp -d 2>/dev/null)" || { echo "FATAL: mktemp -d failed" >&2; exit 2; }
 trap 'rm -rf "$T"' EXIT
 
+TAB=$'\t'
 PASS=0; FAIL=0
 ok()  { PASS=$(( PASS + 1 )); printf 'ok   %s\n' "$*"; }
 bad() { FAIL=$(( FAIL + 1 )); printf 'FAIL %s\n' "$*"; }
@@ -145,7 +146,12 @@ proof_arm() { # proof_arm <label> <expected-fragment> <conf-body>
   if [ "$rc" = 1 ] && printf '%s' "$o" | grep -q -- "$frag"; then ok "d-$label"
   else bad "d-$label: expected rc 1 + '$frag', got rc=$rc"; printf '%s\n' "$o" | sed 's/^/       /'; fi
 }
-proof_arm missing-dir      "does not exist"                     "slug=o/n checkout=$T/nope"
+# ⛔ ABSENCE IS **NOT PROVABLE** FROM INSIDE A SANDBOX, so a missing checkout WARNS (round 4, P1).
+# `test -e` is a `stat`, and macOS TCC denies at the ANCESTOR (`~/Documents`), so `-e` is false for a
+# checkout that exists — the round-3 fix's `[ ! -e ]` refusal was the same defect one syscall over.
+printf 'slug=o/n checkout=%s\n' "$T/nope" > "$T/missing-dir.conf"
+ck "d-missing-dir WARNS and passes (absence cannot be proven from inside a sandbox)" \
+   'o="$(run_reader "$T/missing-dir.conf" check)"; printf "%s" "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/missing-dir.conf" check)" = 0 ]'
 # ⛔ A NON-WORK-TREE IS A **WARN**, NOT A REFUSAL (review round 3, P1). "There is no git work tree here"
 # cannot be distinguished from "this process could not look" without privilege the reader does not
 # have, and refusing on the second discarded a read-only pass the doctor completes. Only PROVEN faults
@@ -185,6 +191,21 @@ else
   else
     bad "d-unreadable-checkout: expected WARN + rc 0, got rc=$(run_reader_rc "$T/unreadable-checkout.conf" check)"; printf '%s\n' "$o" | sed 's/^/       /'
   fi
+  # ⛔ THE SHAPE macOS TCC ACTUALLY PRODUCES: the denial is at an ANCESTOR (`~/Documents`), so `stat` on
+  # the checkout itself fails with EACCES/EPERM. The self-chmod arm above does NOT reproduce it (stat
+  # on a directory needs only its PARENT's `x` bit), which is exactly why the `[ ! -e ]` refusal
+  # survived a review round: this is the arm that reddens on it.
+  mkdir -p "$T/locked/inner"
+  mkdir -p "$T/locked/inner/behind"
+  chmod 000 "$T/locked"
+  printf 'slug=o/n checkout=%s\n' "$T/locked/inner/behind" > "$T/ancestor-denied.conf"
+  o="$(run_reader "$T/ancestor-denied.conf" check)"
+  if printf '%s' "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/ancestor-denied.conf" check)" = 0 ]; then
+    ok "d-ancestor-denied WARNS and passes (the TCC shape: stat fails EACCES on a checkout that EXISTS)"
+  else
+    bad "d-ancestor-denied: expected WARN + rc 0, got rc=$(run_reader_rc "$T/ancestor-denied.conf" check)"; printf '%s\n' "$o" | sed 's/^/       /'
+  fi
+  chmod 755 "$T/locked" 2>/dev/null
 fi
 chmod 755 "$T/hidden" 2>/dev/null
 printf 'slug=o/n checkout=%s\n' "$T/no-origin" > "$T/warn.conf"
@@ -246,10 +267,23 @@ ck "e4e …while the names still appear in setup.sh PROSE (so a file-wide grep w
 W="$T/wrapper"; mkdir -p "$W/lib"
 cp "$READER" "$W/lib/repo-set.sh"
 cp "$WRAPPER" "$W/pr-doctor-machine.sh"
-cat > "$W/pr-doctor.py" <<'PY'
-import os, sys
-print("ARGV " + " ".join(sys.argv[1:]))
-print("SET " + (os.environ.get("PR_DOCTOR_REPOS") or "<unset>"))
+# ⛔ THE STUB MUST CARRY THE DOCTOR'S PROOF FUNCTIONS, NOT JUST AN argv ECHO. The reader and the
+# wrapper now ASK this sibling module for a proof (`_rs_with_doctor` execs it and calls
+# `_normalize_slug` / `_origin_slug`), so a stub that only printed argv made every degraded arm read
+# "not owner/name" and made `f7` grade a wrong-provenance set at rc 0. It re-exports the REAL
+# doctor's own functions, which is also the honest fixture: the stub stands in for the doctor's
+# ENTRY POINT, not for its resolver.
+cat > "$W/pr-doctor.py" <<PY
+import importlib.util, os, sys
+_spec = importlib.util.spec_from_file_location("_real_doctor", r"$REPO_ROOT/scripts/pr-doctor.py")
+_real = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_real)
+_slug_from_remote = _real._slug_from_remote
+_normalize_slug = _real._normalize_slug
+_origin_slug = _real._origin_slug
+if __name__ == "__main__":
+    print("ARGV " + " ".join(sys.argv[1:]))
+    print("SET " + (os.environ.get("PR_DOCTOR_REPOS") or "<unset>"))
 PY
 run_wrapper() { REPO_SET_FILE="$1" HOME="$T" bash "$W/pr-doctor-machine.sh" ; }   # stdout only
 run_wrapper_err() { REPO_SET_FILE="$1" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null; }
@@ -318,6 +352,13 @@ ck "f21 no set + PR_DOCTOR_REPO (rank 2) -> the pass RUNS (the doctor honours it
    'REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=daniel-ospina/agent-infra HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
 ck "f22 no set + PR_DOCTOR_REPO that is NOT a slug -> REFUSES, never claims to be grading" \
    'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=notaslug HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "is not an owner/name slug" && ! printf "%s" "$o" | grep -q "Grading the ONE repo"'
+# ⛔ RANK 2 IS DECISIVE, BOTH WAYS (review round 4, P2; round 3's rule applied one rank higher).
+ck "f23 no set + PR_DOCTOR_REPO INVALID but OR valid -> REFUSES (rank 2 consumes the decision)" \
+   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "PR_DOCTOR_REPO=.Not A Slug. is not an owner/name slug" && ! printf "%s" "$o" | grep -q "Grading the ONE repo"'
+ck "f24 no set + PR_DOCTOR_REPO as a URL -> RUNS (the doctor own parser normalises it)" \
+   'REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=https://github.com/daniel-ospina/agent-infra.git HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+ck "f25 no set + PR_DOCTOR_REPO and a PR_DOCTOR_REPO_DIR of ANOTHER repo -> REFUSES" \
+   '[ "$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=daniel-ospina/tortoise PR_DOCTOR_REPO_DIR="$T/decoy" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
@@ -372,6 +413,49 @@ ck "h1 the shipped unit passes e2/e3" \
    '! printf "%s" "$PROG" | grep -qE "<string>(--repo|--all-repos|daniel-ospina/)"'
 ck "h2 the PRE-#2281 argv would FAIL e2 (the assertion discriminates the change)" \
    'printf "%s" "$OLDPROG" | grep -qE "<string>(--repo|daniel-ospina/)"'
+
+# ── (h2) PARITY: the reader's proof must BE the doctor's, not a second parser ────────────
+# `_rs_origin_slug` delegates to `pr-doctor.py`'s `_origin_slug()` and `_rs_normalize_slug` to
+# `_normalize_slug`. Delegation is proved the only way that cannot be faked: put a SENTINEL in a COPY
+# of the doctor and require the reader to return it. A hand-written parser here cannot produce a
+# sentinel it never read — which is the defect review round 4 measured (`notgithub.com/o/n` and
+# `mirror.github.com/o/n` "proved" a GitHub repo the doctor refuses to attest).
+PD="$T/mutdoc"; mkdir -p "$PD"
+python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$PD/pr-doctor.py" <<'PY_DOC'
+import re, sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+# _slug_from_remote -> sentinel for every input; _normalize_slug -> sentinel for every input.
+body = '    return "sentinel/owner"\n'
+# ⛔ APPENDED, NOT REGEXED INTO THE BODY. A body regex swallowed only the first line of a multi-line
+# docstring, leaving an UNCOMPILABLE mutant — the arm then "passed" its substitution assert and read
+# the reader's graceful "could not be asked" branch, proving nothing. Appending a redefinition works
+# because Python binds at call time, and it cannot corrupt the file it copies.
+t += (
+    "\n\ndef _slug_from_remote(url):\n" + body +
+    "\n\ndef _normalize_slug(value):\n" + body
+)
+open(dst, "w").write(t)
+PY_DOC
+# Call ONE reader function in a child shell, with REPO_SET_DOCTOR inherited: `rs_call <fn> [args...]`.
+rs_call() { local fn="$1"; shift; bash -c '. "$1"; shift; "$@"' _ "$READER" "$fn" "$@"; }
+
+ck "h2a with the doctor's _slug_from_remote replaced by a SENTINEL, the reader returns the sentinel" \
+   '[ "$(REPO_SET_DOCTOR="$PD/pr-doctor.py" rs_call _rs_origin_slug "$T/tortoise")" = "sentinel/owner${TAB}" ]'
+ck "h2b with the doctor's _normalize_slug replaced by a SENTINEL, the reader returns the sentinel" \
+   '[ "$(REPO_SET_DOCTOR="$PD/pr-doctor.py" rs_call _rs_normalize_slug "anything")" = "sentinel/owner" ]'
+# …and on the SHIPPED doctor, a host it will not attest proves NOTHING (the round-4 finding).
+cp -R "$T/tortoise" "$T/ngh" 2>/dev/null
+python3 - "$T/ngh/.git/config" <<'PY_CFG'
+import re, sys
+p = sys.argv[1]
+t = open(p).read()
+t = re.sub(r"(\[remote \"origin\"\]\n(?:\t[^\n]*\n)*?\turl = )[^\n]*",
+           r"\1https://notgithub.com/o/n.git", t)
+open(p, "w").write(t)
+PY_CFG
+ck "h2c a host the doctor will not attest (notgithub.com) proves NOTHING through the reader" \
+   '[ -z "$(rs_call _rs_origin_slug "$T/ngh" | cut -f1)" ]'
 
 # ── (i) the CASE FOLD: the doctor is case-insensitive, so this reader must be too ───────────────
 # `resolve_repo()` accepts a case-differing slug, `repo_tag()` lowercases the state file, and

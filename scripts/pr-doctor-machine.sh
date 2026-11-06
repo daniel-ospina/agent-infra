@@ -165,41 +165,64 @@ case "$_rc" in
     _degraded=""
     _why_not=""
     _seam="$(printf '%s' "${PR_DOCTOR_REPO:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    _seam_dir="${PR_DOCTOR_REPO_DIR:-}"
     _or="$(printf '%s' "${OR:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
     _proved=""; _proved_why=""
     if [ -n "${REPO:-}" ]; then
-      # The reader's own proof function — the same one `check` uses, so the two cannot disagree.
-      _p="$(_rs_origin_slug "$REPO")"; _proved_why="${_p#*$'	'}"; _proved="${_p%%$'	'*}"
+      # The reader's own proof function — the same one `check` uses, and it is pr-doctor's own
+      # `_origin_slug()` underneath, so the two cannot disagree.
+      _p="$(_rs_origin_slug "$REPO")"; _proved_why="${_p#*$'\t'}"; _proved="${_p%%$'\t'*}"
     fi
-    if [ -n "$_seam" ]; then
-      if _rs_slug_ok "$_seam"; then
-        _degraded="$_seam"; _say "  Grading the ONE repo this unit declares in PR_DOCTOR_REPO=$_seam."
-      else
+
+    # ⛔ EACH SEAM IS DECISIVE AT ITS OWN RANK, exactly as `resolve_repo()` treats it: rank 2
+    # `PR_DOCTOR_REPO` is consulted FIRST and consumes the decision, rank 3 `OR` next, rank 4 `REPO`'s
+    # proved origin last. "Decisive" cuts BOTH ways, and the first version of this block got it wrong in
+    # both: it adopted `OR` verbatim (an invalid `OR` printed "Grading the ONE repo" while the doctor
+    # refused) and it ignored `PR_DOCTOR_REPO` entirely (a box that sets it was refused here while the
+    # doctor would have run a full pass). Measured in review rounds 3 and 4.
+    #
+    # ⛔ AND THE VALUES ARE NORMALISED BY THE DOCTOR'S OWN PARSER (`_rs_normalize_slug` ->
+    # `_normalize_slug`). A stricter reader refused `https://github.com/owner/name` where the doctor
+    # returns `owner/name` and runs — the reader would have refused a pass, which is the same class as
+    # claiming one it cannot deliver.
+    _decided=0
+    if [ -n "$_seam" ] && [ "$_decided" = 0 ]; then
+      _decided=1
+      _seam_n="$(_rs_normalize_slug "$_seam")"
+      if [ -z "$_seam_n" ]; then
         _why_not="PR_DOCTOR_REPO='$_seam' is not an owner/name slug"
+      else
+        # Rank 2's checkout, when the launcher named one: a PROVEN disagreement is refused by the
+        # doctor too, so it is refused here with both values visible.
+        _sd_proof=""
+        if [ -n "$_seam_dir" ]; then
+          _sd="$(_rs_origin_slug "$_seam_dir")"; _sd_proof="${_sd%%$'\t'*}"
+        fi
+        if [ -n "$_sd_proof" ] && [ "$(_rs_lower "$_sd_proof")" != "$(_rs_lower "$_seam_n")" ]; then
+          _why_not="PR_DOCTOR_REPO=$_seam_n but PR_DOCTOR_REPO_DIR=$_seam_dir is a checkout of $_sd_proof"
+        else
+          _degraded="$_seam_n"; _say "  Grading the ONE repo this unit declares in PR_DOCTOR_REPO=$_seam_n."
+        fi
       fi
     fi
-    # ⛔ AN `OR` THAT IS SET CONSUMES RANK 3, so it is decisive — valid-and-agreeing, or a refusal.
-    # It is NOT a hurdle to fall past: pr-doctor enters its rank-3 arm whenever `OR` is present and
-    # refuses an invalid one or a pair that names two repos, so falling through to `REPO`'s proof here
-    # would pick a repo the doctor then refuses (measured in review round 3: `OR=tortoise` with a
-    # `REPO` checkout of agent-infra ran, where the doctor refuses the pair).
-    _or_decisive=0
-    if [ -z "$_degraded" ] && [ -n "$_or" ]; then
-      _or_decisive=1
-      if ! _rs_slug_ok "$_or"; then
+    if [ -n "$_or" ] && [ "$_decided" = 0 ]; then
+      _decided=1
+      _or_n="$(_rs_normalize_slug "$_or")"
+      if [ -z "$_or_n" ]; then
         _why_not="OR='$_or' is not an owner/name slug"
-      elif [ -n "$_proved" ] && [ "$(_rs_lower "$_proved")" != "$(_rs_lower "$_or")" ]; then
+      elif [ -n "$_proved" ] && [ "$(_rs_lower "$_proved")" != "$(_rs_lower "$_or_n")" ]; then
         _why_not="the box names two different repos: OR=$_or but REPO=$REPO is a checkout of $_proved"
       else
-        _degraded="$_or"; _say "  Grading the ONE repo this unit declares in OR=$_or."
+        _degraded="$_or_n"; _say "  Grading the ONE repo this unit declares in OR=$_or_n."
       fi
     fi
-    if [ -z "$_degraded" ] && [ "$_or_decisive" = 0 ] && [ -n "$_proved" ]; then
+    if [ "$_decided" = 0 ] && [ -n "$_proved" ]; then
       _degraded="$_proved"; _say "  Grading the ONE repo REPO proves: $_proved (from $REPO)."
     fi
+
     if [ -z "$_degraded" ]; then
       if [ -n "$_why_not" ]; then _say "  $_why_not — so this pass has NO usable repo."; fi
-      if [ -n "${REPO:-}" ] && [ -z "$_proved" ]; then
+      if [ -n "${REPO:-}" ] && [ -z "$_proved" ] && [ "$_decided" = 0 ]; then
         _say "  REPO=$REPO proves no repo ($_proved_why)."
       elif [ -z "${REPO:-}" ] && [ -z "$_seam" ] && [ -z "$_or" ]; then
         _say "  Neither PR_DOCTOR_REPO, OR nor REPO is set — so this pass has NO repo to name."
