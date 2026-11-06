@@ -279,6 +279,21 @@ def template_parts(cfg):
     return "template", names
 
 
+def _js_str(v):
+    """The result of JS `+` on a non-string: `true`/`false`, numbers, and the joining forms for arrays/objects.
+    ⛔ A faithful-enough port for a CREDENTIAL STRING: pi only needs the concatenation to produce something, and every
+    branch here is reachable from a fixture (round 27, P1)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return repr(v) if isinstance(v, float) else str(v)
+    if isinstance(v, list):
+        return ",".join("" if x is None else _js_str(x) for x in v)
+    if isinstance(v, dict):
+        return "[object Object]"
+    return str(v)
+
+
 def resolve(cfg, env):
     """-> (status, value) with status in {ok, missing, cmd}; pi\x27s resolveConfigValue + truthiness."""
     kind, names = template_parts(cfg)
@@ -295,7 +310,14 @@ def resolve(cfg, env):
             v = os.environ.get(nm) or None
         if v is None:
             return "missing", None
-        out += v
+        # ⛔ JS `+` STRINGIFIES, PYTHON RAISES (round 27, P1, measured): `resolveEnvConfigValue` returns the RAW value
+        # (`resolve-config-value.js:71-73`) and `resolveTemplate` does `resolved += envValue` (`:83-95`), so an `env` map
+        # like `{"A": 5}` yields the key `sk-5` — measured: pi sent `sk-5` (401) for `{"deepseek":{"type":"api_key",
+        # "key":"sk-${A}","env":{"A":5}}}` and the same for an array/object/`true`. `out += v` raised TypeError here,
+        # the interpreter exited 1, and rc 1 is the POSITIVE "no credential for this provider" — so the gate refused a
+        # box pi runs, and with the template variable exported it asserted "auth.json has NO entry for this provider"
+        # about an entry that IS the source pi resolves. The four JS scalar renderings are reproduced exactly.
+        out += _js_str(v)
     return ("ok", out) if out.strip() else ("missing", None)
 
 
@@ -763,6 +785,12 @@ if sys.argv[2] == "var":
     raise SystemExit(0)
 
 # MODE=store
+# ⛔ AN UNEXPECTED EXCEPTION IN A POSITIVE ARM IS CANNOT-SAY, NOT THE POSITIVE ANSWER (round 27, P1, measured): rc 1 is
+# the claim "this store holds NO credential for this provider", so a bug in this interpreter must never produce it —
+# and a `TypeError` in `resolve()` did exactly that (exit 1 -> rc 1 -> the environment arm decides -> a false 82 on a box
+# pi runs). Only the explicit `raise SystemExit(...)` arms may speak. Enforced at the CALLER rather than with a `try:`
+# here: python exits 1 on an unhandled exception, and 1 is the code this mode uses for the POSITIVE "no credential", so
+# `key_gate_stored_credential` keeps the stderr stream and treats rc 1 WITH output as cannot-say.
 # ⛔ `null` IS NOT "NO STORED CREDENTIAL" (round 25, P1, measured): a whole-document `null` parses fine, and pi then
 # evaluates `readState.data[provider]` on it - `Credential store read failed for <provider>: Cannot read properties of
 # null (reading \x27<provider>\x27)`, exit 1, WITH the provider key exported. The old reader folded every non-dict into the
@@ -1049,10 +1077,21 @@ key_gate_stored_credential() {
   # absent-file arm is the probe's `except` branch: `var` mode is silent, `store` mode is rc 1, because
   # "this box has no store" is a datum we DID read.
   command -v python3 >/dev/null 2>&1 || return 1
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$aj" store "$prov" 2>/dev/null
+  # ⛔ A CRASH AND A POSITIVE "NO CREDENTIAL" BOTH EXIT 1 (round 27, P1, measured): python exits 1 on an unhandled
+  # exception, and 1 is this mode's POSITIVE "there is no entry for this provider" — so a `TypeError` in `resolve()` (an
+  # `env` map holding a NUMBER, `{"A": 5}`) published a bug as that claim, the gate fell through to the environment, and
+  # a box pi runs was refused 82. Keep the stderr stream: the explicit arms print nothing, a traceback does.
+  local errf rc
+  errf="$(mktemp "${TMPDIR:-/tmp}/key-gate-store.XXXXXX" 2>/dev/null)" || errf=""
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$aj" store "$prov" 2>"${errf:-/dev/null}"
   # rc 0 = a credential that RESOLVES; 3 = cannot say; anything else = no credential. The bound's own
   # kill status (143/124/…) lands in the "cannot say" bucket because it is not a positive "absent".
-  local rc=$?
+  rc=$?
+  if [ "$rc" = "1" ] && [ -n "$errf" ] && [ -s "$errf" ]; then
+    # CANNOT-SAY, NEVER "NO CREDENTIAL": this reader crashed, so it did not read the store.
+    rc=3
+  fi
+  [ -n "$errf" ] && rm -f "$errf" 2>/dev/null
   # 0 = a credential that RESOLVES · 1 = no entry for this provider · 3/4 = cannot say · anything else
   # (a bound's 143/124/137, a crash) = cannot say too. ⛔ THE WILDCARD IS NOT rc 1 (review cycle 2, P2):
   # folding "the read did not finish" into "no credential" refuses a box whose credential is in the
@@ -1070,6 +1109,11 @@ key_gate_stored_credential() {
     # "holds an entry for this provider whose value this gate cannot resolve (a `!command`, an `oauth`
     # credential ...)" about a file that holds no entry at all, and let a certain death through as a skip.
     6) return 6 ;;
+    # 4 = the entry is VALID but yields no value (an `api_key` entry with no `key`, or a template this environment
+    # cannot resolve). It reached the cannot-say bucket through the wildcard until round 27 (P3, measured: the
+    # call site's `= "4"` comparison could never be true); propagating it makes the distinction visible, and the
+    # call sites now give it its own line — because the causes differ from a `!command`/`oauth` entry.
+    4) return 4 ;;
     *) return 3 ;;
   esac
 }
@@ -1474,6 +1518,13 @@ key_gate_box_default_assert() {
       printf '[key-gate] %s check=skipped reason=stored-credential box_default=%s model=%s provider=%s settings_json=%s — the credential for this pin is a STORED one under %s/auth.json (what `pi /login` writes, and the FIRST source pi consults), so whether the environment has to supply $%s at all is pi\x27s answer; nothing is asserted here, and the pin is NOT refused\n' \
         "$label" "$dm" "$dm" "$prov" "$sj" "${agent_dir:-<none>}" "$(printf '%s\n' "$names" | paste -sd ',' - 2>/dev/null)"
       return 0 ;;
+    4)
+      # ⛔ see the lane-path arm: a key-less `api_key` entry is VALID, and pi falls back to the provider's own built-in
+      # variable rather than to this template (round 27, P3, measured).
+      [ "$quiet" = 1 ] && return 0
+      printf '[key-gate] %s check=skipped reason=stored-credential-keyless model=%s box_default=%s provider=%s settings_json=%s — %s/auth.json has a VALID `api_key` entry for this provider with NO `key`, so pi falls back to the provider's own built-in variable rather than to the models.json template this gate follows; whether that yields a key is pi's answer alone, so nothing is asserted about this pin\n' \
+        "$label" "$dm" "$dm" "$prov" "$sj" "${agent_dir:-<none>}"
+      return 0 ;;
     1) : ;;
     *)
       [ "$quiet" = 1 ] && return 0
@@ -1614,7 +1665,18 @@ key_gate_assert_main() {
       "$label" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${tmpl_names:-<none>}" "${tmpl_names:-<none>}"
     return 0
   fi
-  if [ "$store_rc" = "3" ] || [ "$store_rc" = "4" ]; then
+  if [ "$store_rc" = "4" ]; then
+    # ⛔ A VALID ENTRY WITH NO VALUE IS NOT AN UNRESOLVABLE ONE (round 27, P3, measured): `{"type":"api_key"}` with no
+    # `key` at all reached the "whose value this gate cannot resolve (a `!command`, an `oauth` credential …)" line, which
+    # describes an entry that HAS a value the gate cannot use — and tells the operator to look at a file that is fine.
+    # What pi does with a key-less entry is fall back to the PROVIDER'S OWN built-in variable (measured: with
+    # `DEEPSEEK_API_KEY` exported, pi ran), which is not the `models.json` template this gate asserts.
+    printf '[key-gate] %s check=skipped reason=stored-credential-keyless provider=%s model=%s home=%s agent_dir=%s — %s/auth.json has a VALID `api_key` entry for this provider with NO `key`, so pi falls back to the provider\x27s own built-in variable (e.g. `DEEPSEEK_API_KEY`), NOT to the models.json template this gate follows; whether that variable yields a key is pi\x27s answer alone, so NOTHING is asserted here
+' \
+      "$label" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${home:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}" "${KEY_GATE_AGENT_DIR:-<none>}"
+    return 0
+  fi
+  if [ "$store_rc" = "3" ]; then
     # ⛔ A STORE ENTRY THIS GATE CANNOT RESOLVE IS NOT A CREDENTIAL AND IS NOT A REFUSAL (review cycle 1,
     # P2): `auth.json` holds a `!command` value, so only pi can say whether it yields a key. Saying
     # `holds a credential` here would be the same FALSE PASS the `env`-without-`key` arm was fixed for; a
