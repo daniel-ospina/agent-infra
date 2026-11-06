@@ -124,10 +124,12 @@ def parked(W, monkeypatch):
     NOT, and reaches the REAL probe through a `subprocess.run` stub — that polarity stays.
 
     `_age_seconds` is stubbed for the SAME reason, and it was the second input short (cycle-2
-    review): it shells out to `ps -o etime=`, so the gate-1 tests were making ten real `ps` calls
-    whose answers came back `None` for pids that do not exist. No assertion reads `age_s` today, so
-    it could not flip a verdict yet — the defect was a docblock claiming hermeticity one input
-    short, and the first `age_s` assertion anyone added would have inherited the host dependence.
+    review): it shells out to `ps -o etime=`, so the gate-1 tests were making real `ps` calls whose
+    answers came back `None` for pids that do not exist. (No COUNT is quoted here on purpose — the
+    first draft said "ten" and the measured number was six, and it moves whenever a test is added.)
+    No assertion reads `age_s` today, so it could not flip a verdict yet — the defect was a docblock
+    claiming hermeticity one input short, and the first `age_s` assertion anyone added would have
+    inherited the host dependence.
     """
     monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
     monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
@@ -200,17 +202,18 @@ def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W, monkeypatch
 
 
 def test_a_busy_descendant_is_excluded_by_the_SUBTREE_sum_not_by_its_kind(W, monkeypatch):
-    """⛔ THE SHAPE WHERE GATE 1's SUBTREE SUM IS THE ONLY THING THAT CAN REFUSE.
+    """A parked `pi` whose busy descendant is ANOTHER `pi` is refused by the SUBTREE SUM alone.
 
-    `test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate` states "THE SUBTREE, NOT THE
-    PROCESS" as its subject, but its grandchild is a `curl` -- a NON-`pi` descendant -- so the
-    "only `pi` may be under a candidate" rule excludes that parent FIRST and gate 1's subtree
-    accumulation is never load-bearing. EXECUTED: mutating the sum to `for q in [pid]:` (process
-    only, ignoring every descendant) left that test, and the whole file's failure set, unchanged.
+    ⛔ THIS IS THE ONE SHAPE WHERE THE TWO GATES DISAGREE, AND THAT IS THE WHOLE REASON IT EXISTS.
+    `frozen_subtrees` evaluates the subtree CPU sum FIRST (`lane-watchdog.py:363`) and the
+    "only `pi` may be under a candidate" kind rule after it (`:379`), so every fixture whose
+    descendant is a non-`pi` is refused by the sum anyway and proves nothing about the rule. Here
+    the descendant (400) is a `pi` — the one kind the rule ALLOWS — while it burns 5.0 CPU-s, so the
+    KIND rule would let the parent through and ONLY the sum can refuse it.
 
-    A nested dispatch is the one shape where the two gates disagree: `pi -> pi` is ALLOWED by the
-    kind rule, so a parked parent whose nested `pi` child is burning CPU is refused ONLY by the
-    subtree sum. MUTANT that reddens this: the process-only sum above.
+    MUTANT that reddens this: the process-only sum (`for q in [pid]:`), which ignores every
+    descendant. MEASURED — that mutant leaves every other gate-1 test green, including the
+    busy-grandchild one, and reddens this test and this test only.
     """
     parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 400: T(300, cpu=5.0, cmd="pi")}
@@ -838,6 +841,7 @@ def test_an_unknown_connection_state_refuses(W, monkeypatch):
 
 def test_a_child_with_no_connection_is_still_a_candidate(W, monkeypatch):
     """The gate must not make the detector a no-op: the measured orphan held no connection."""
+    parked(W, monkeypatch)          # age + connection stubs; the setattr below sets the POLARITY
     monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
@@ -909,6 +913,7 @@ def test_a_live_connection_anywhere_in_the_subtree_refuses_the_candidate(W, monk
     provider call this gate exists to protect was killed through its parent.
     """
     tbl = {**BASE, 10: T(100, cpu=1.0), 50: T(10, cpu=1.0), 60: T(50, cpu=1.0)}
+    parked(W, monkeypatch)          # age + connection stubs; the setattrs below set the POLARITY
     monkeypatch.setattr(W, "has_live_connection", lambda pid: pid == 60)
     assert W.frozen_subtrees(tbl, tbl) == [], (
         "a live connection in the subtree must refuse the candidate that would signal it")
@@ -1020,6 +1025,7 @@ def test_a_working_probe_is_still_decisive_in_both_directions(W, monkeypatch):
     """The mirror, so the new refusal cannot swallow a working probe: False (no connection) must
     still yield the candidate, and True (an established connection) must still spare it."""
     table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    parked(W, monkeypatch)          # age + connection stubs; the setattrs below set the POLARITY
     monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
     unreadable = []
     assert [c["pid"] for c in W.frozen_subtrees(table, table, unreadable=unreadable)] == [300]

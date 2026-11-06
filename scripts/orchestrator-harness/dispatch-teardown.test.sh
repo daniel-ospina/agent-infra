@@ -225,8 +225,10 @@ assert_contains "$T/t5/log" "chain-2047 could NOT be started" "T5 the fixture re
 assert_nodir "$REPO/.worktrees/tm-2047" "T5 the checkout is GONE"
 assert_nobranch "$REPO" feat/2047-tm "T5 …and its 0-ahead branch"
 assert_clean_of "$REPO" 2047 "T5 nothing named 2047 is left on this box"
-# The no-chain path is the ONE path that releases (the lane is confirmed gone and no chain will ever
-# look at this checkout) — asserted so the ordering it was built for is still observable.
+# The no-chain path is the one of the TWO TAKE-BACK paths that releases (the lane is confirmed gone
+# and no chain will ever look at this checkout) — asserted so the ordering it was built for is still
+# observable. ⚠️ SCOPED (cycle-4 review, P2): unscoped, "the ONE path that releases" was false —
+# dispatch-merge.sh releases claims at the batch/no-target/per-issue refusals and elsewhere too.
 assert_releases "$O/claim-releases.log" 1 "T5 the no-chain path released the issue claim exactly once (and only after the lane was confirmed gone)"
 
 echo "── T6: the shipped dispatcher is the one under test (a moved script would prove nothing)"

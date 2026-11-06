@@ -422,9 +422,11 @@ for N in "$@"; do
   # ⛔ IF THE CHAIN CANNOT BE STARTED, NO TRAP WILL EVER RELEASE THE CLAIM (2026-10-16 review): this
   # was the second no-chain path, and it was covered by nothing. A stale `chain-$N` session name, a
   # dead tmux server or tmux missing all land here, and the issue then stays claimed on every box for
-  # the whole lease. (A failed LANE spawn is deliberately NOT released here: the chain IS alive and
-  # waiting for that PR, so releasing would let a peer duplicate the work. That wait is bounded —
-  # 90 minutes, then chain-merge.sh's own trap releases it.)
+  # the whole lease. (A failed LANE spawn is not released by the lane-spawn arm above; the NO-CHAIN arm
+  # below releases it once the lane is proven gone. If the chain DOES start, its wait is bounded —
+  # 90 minutes, then chain-merge.sh's own trap releases it. ⚠️ This sentence read "the chain IS alive
+  # and waiting for that PR", which is false on the doubly-failed dispatch — no chain exists to trap —
+  # and contradicted the corrected header above. Cycle-4 review, P1.)
   # ⛔ HAND THE CHAIN ITS GENERATION (adversarial review). The record here is the one THIS dispatch
   # wrote — the one fact a chain cannot safely discover for itself later (see chain-merge.sh's comment).
   # ⚠️ The window is NOT microseconds for every member of a batch: the loop sleeps between issues, so
