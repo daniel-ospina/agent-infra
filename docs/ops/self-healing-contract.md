@@ -182,8 +182,11 @@ place the batch, spawn workers, and **record what it decided** — for as long a
 `cycle-record.sh`; `cycle_verdict` grades its **newest** record and exits **0 HEALTHY · 1
 DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (never a pass)** (`cycle-record.sh`, its header `EXIT` line).
 **Where the cycle's TIME went** is the sibling question, and it is answered by the same line's
-`stages=` field (`bash cycle-record.sh stages --dir $O`): the **tiled** stages tile the body so on a
-FULL cycle their sum is the cycle's own duration, `l2_merge`/`l3_fix`/`l4_review` are cascade-level
+`stages=` field (`bash cycle-record.sh stages --dir $O`): the **tiled** stages tile the body, so on a
+FULL cycle their sum is the cycle's own duration **within a tolerance of a few seconds** — each stage is
+truncated to whole seconds when emitted (up to ~11 s short across eleven of them), `boot` opens before
+`CYCLE_T0`, and the tail after `stg_mark record` is unmeasured. `fleet-capacity.md` states the three
+movers; do not read a few-second gap as a broken instrument. `l2_merge`/`l3_fix`/`l4_review` are cascade-level
 overlays *inside* `sweep`, `prev_wait` is the carried post-record gap — the `CYC` nap, **one gap
 overwritten each cycle, not a running total** (the async backlog spawn is launched inside that window,
 but the post-nap stamp is taken after the launch, so its runtime overlaps the nap rather than adding), and `ns` means registered-but-never-sampled
@@ -191,8 +194,9 @@ but the post-nap stamp is taken after the launch, so its runtime overlaps the na
 the end of the body — leaves the stages it never reached reading `ns`, so its tiled
 sum is legitimately SHORT of `end - start`; check for `ns` before reading a shortfall as a broken
 instrument. ⛔ The **fork-starved** arm is the opposite case and must not be lumped in with it: its
-record is written `start=$_ft0 end=$_ft0`, so `end - start = 0`, and its tiled sum (which includes a
-positive `boot`) can only be EQUAL or LONGER — never short. It exists because `end - start` did not
+record is written `start=$_ft0 end=$_ft0`, so `end - start = 0`, and its tiled sum (which includes
+`boot` — usually positive, though each stage truncates to whole seconds, so a sub-second fork-starved
+start emits `boot:0`) can only be EQUAL or LONGER — never short. It exists because `end - start` did not
 track work: measured cycles of 2.2 / 17.5 / 131 / 145 / 161 minutes against `interval=240`, with the
 161-minute cycle spawning **zero** workers. `CYC` bounds only the nap — the body is unbounded, and
 until `stages=` existed that was also unobservable. Grammar and reader: `cycle_stages_valid` validates a

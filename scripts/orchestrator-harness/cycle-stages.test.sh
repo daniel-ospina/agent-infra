@@ -716,5 +716,45 @@ ck "the shipped 'stg_mark record' is immediately before 'stg_field' (the only pl
    "$(if printf '%s\n' "$_loop_nc" | awk 'prev ~ /^[[:space:]]*stg_mark record[[:space:]]*$/ && $0 ~ /^[[:space:]]*stg_field/ {found=1} {prev=$0} END {exit !found}'; then echo 0; else echo 1; fi)"
 
 echo
+# 9.1i THE FORK-STARVED RECORD'S `start=` AND `end=` MUST BE THE SAME TOKEN.
+# The doc sentence that the starved arm can only be EQUAL or LONGER rests entirely on `end - start = 0`,
+# i.e. on BOTH fields being that ONE token. ⛔ NOTHING GRADED IT: `end="$(date +%s)"` at that site left
+# this suite GREEN at this head (verified), and it would ALSO put a fork on the agent-infra#2293 path.
+# Derived, not spelled: the two expansions are pulled from the starved record site and compared.
+_starved_rec="$(printf '%s\n' "$_loop_nc" | awk '/FORK_STARVED:-0.*= "1"/{f=1} f && /^[[:space:]]*start=/{print; exit}')"
+_st_tok="$(printf '%s' "$_starved_rec" | sed -n 's/.*start="\${*\([A-Za-z0-9_]*\):-0}.*/\1/p')"
+_en_tok="$(printf '%s' "$_starved_rec" | sed -n 's/.*end="\${*\([A-Za-z0-9_]*\):-0}.*/\1/p')"
+ck "the fork-starved record writes start= and end= from the SAME token (got '${_st_tok:-none}' / '${_en_tok:-none}') — 'end - start = 0' is the docs' whole basis" \
+   "$(if [ -n "$_st_tok" ] && [ "$_st_tok" = "$_en_tok" ]; then echo 0; else echo 1; fi)"
+
+# 9.1j THE FORK-STARVED ARM'S RECORD WRITE IS FORK-FREE.
+# §6 scans only the extracted clock block, so `cycle="$(printf …)"` inside the starved record write —
+# the ONE path where a `$( )` TERMINATES bash (agent-infra#2293), and the path this change adds its
+# `stages=` line to — left the suite GREEN at this head (verified). The scan is the RECORD-WRITE
+# STATEMENT itself (`cycle_record_write` … through `stages=`), not the whole arm body: the body carries
+# inline comments and printf MESSAGES that name `$( )`, `date` and backticks to explain the ban, and a
+# match inside prose is exactly the vacuating shape §6 already had to strip once.
+_starved_body="$(printf '%s\n' "$_loop_nc" | awk '/FORK_STARVED:-0.*= "1"/{f=1} f && /cycle_record_write/{r=1} r{print} r && /stages=/ {exit}' | sed 's/\$((//g')"
+_sb_n="$(printf '%s\n' "$_starved_body" | grep -c . || true)"
+ck "no command substitution in the FORK-STARVED arm's record write (${_sb_n:-0} lines scanned)" \
+   "$(if [ -n "$_starved_body" ] && ! qF '$(' "$_starved_body"; then echo 0; else echo 1; fi)"
+ck "  …nor a backtick or a 'date' fork in it" \
+   "$(if [ -n "$_starved_body" ] && ! qF '`' "$_starved_body" && ! qF 'date ' "$_starved_body"; then echo 0; else echo 1; fi)"
+
+# 9.1k A QUEUED INTERVAL MUST NOT SURVIVE INTO THE NEXT CYCLE.
+# `stg_cycle_reset` truncates `$STG_LVL_TMP` so an interval queued AFTER the last fold cannot be added
+# to the NEXT cycle's level — that would be a level reporting time it did not spend, the one defect
+# class this field exists to end. ⛔ Deleting just that truncation left the suite GREEN at this head
+# (verified), so the guard was ungraded. Driven: queue a stale 9 s interval, reset, then emit.
+STG_LVL_TMP="$TMP/lvlq-reset"; : >"$STG_LVL_TMP"
+printf '%s %s\n' l3_fix 9000000 >>"$STG_LVL_TMP"
+stg_cycle_reset
+STG_FIELD=""
+stg_field STG_FIELD
+_stale="$(cycle_stage_get "stages=$STG_FIELD" l3_fix 2>/dev/null || echo absent)"
+ck "stg_cycle_reset TRUNCATES the overlay queue — a stale interval cannot leak into the next cycle (l3_fix reads '${_stale}', want 'ns')" \
+   "$(if [ "$_stale" = "ns" ]; then echo 0; else echo 1; fi)"
+
+echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]
