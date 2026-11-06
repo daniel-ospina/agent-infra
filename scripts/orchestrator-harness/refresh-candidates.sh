@@ -3962,7 +3962,7 @@ queue_order_refuse() {
 # ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
 # silently inert, and a caller that skipped it would leave every assertion here green.
 queue_order_from_pool() {
-  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_said
+  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_said _why_none
   [ -n "$o" ] || return 1
   rm -f "$o/.queue-rank" "$o/.cand.ranked" 2>/dev/null
   if ! rank_queue_by_pool "$o/.pool" "$o/candidates.txt" "$o/.cand.ranked" "$o/.queue-rank"; then
@@ -4196,11 +4196,15 @@ queue_order_from_pool() {
     # ⛔ AND THE CAUSE IS NOT NAMED WHEN A TIER WAS CLIPPED (review P3, cycle 38): "no … row matched" is
     # FALSE precisely when the row DID match and its own tier window clipped it — reachable whenever a
     # truncated tier's rows are not the queued ones. The parenthetical only claims what was measured.
-    if [ -n "$_sat" ]; then
-      _why_none="no ranked row was left for this queue — a tier window was clipped, so its newest members were never ranked at all"
-    else
-      _why_none="no P0-blocker/P1-severe/P2-moderate row matched"
-    fi
+    # ⛔ `unrecognised` IS NOT "A TIER WAS CLIPPED" (review P3, cycle 39): `_sat` carries that literal
+    # when `.pool-sat` EXISTS but holds no tier name this code knows — the state whose whole meaning is
+    # "the pass could not tell WHICH tier was clipped". Asserting a clip there is a claim the pass did not
+    # take, on a corrupt/foreign record. Only a RECOGNISED tier name makes the clip a fact.
+    case "$_sat" in
+      "") _why_none="no P0-blocker/P1-severe/P2-moderate row matched" ;;
+      unrecognised) _why_none="no ranked row was left for this queue, and its window record names no tier this code recognises, so no cause is asserted" ;;
+      *) _why_none="no ranked row was left for this queue — the $_sat tier window was clipped, so its newest members were never ranked at all" ;;
+    esac
     echo "[refresh] unranked: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) ($_why_none), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\"$_sat_said"
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then

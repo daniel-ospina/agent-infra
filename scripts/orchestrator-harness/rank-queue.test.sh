@@ -1720,6 +1720,54 @@ if cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null; then rc=1; echo "      the .pool-sat 
 fi
 ck "non-vacuity: with the .pool-sat read removed the truncated-window clause disappears (the check can fail)" $rc
 
+# ── 14d) EVERY INSTALLED ARM CARRIES THE CLIP (review P2, cycle 39) ────────────────────────────────
+# WHY THIS EXISTS. Cycle 38 appended `$_sat_said` to two arms of `queue_order_from_pool` and made the
+# `unranked` parenthetical name the clip instead of claiming "no P0-blocker/P1-severe/P2-moderate row
+# matched". Nothing graded any of it: reverting BOTH hunks left every suite green (measured 106/0,
+# 299/0, 31/0, 215/0), so the false cause was free to come back. The three drives below cover the two
+# arms that changed plus the `unrecognised` record, which must NOT be reported as a measured clip:
+#   (a) `unranked` (nothing ranked) + a RECOGNISED tier  -> names the clip AND windows=TRUNCATED(<tier>)
+#   (b) `unranked` + an UNRECOGNISED record              -> names no cause, never "was clipped"
+#   (c) ranked head that is NOT a plain issue number     -> still carries windows=TRUNCATED(<tier>)
+_d14="$TMP/arm-clip"; rm -rf "$_d14"; mkdir -p "$_d14/o"
+printf 'aaa\nbbb\n' > "$_d14/o/candidates.txt"; printf '200\n' > "$_d14/o/.pool"
+printf 'P2-moderate\n' > "$_d14/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14/drive.sh"
+( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unranked" 2>&1
+_u14="$(cat "$_d14/out-unranked" 2>/dev/null)"
+if grep -q 'unranked:' <<<"$_u14" && grep -q 'P2-moderate tier window was clipped' <<<"$_u14" \
+   && grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$_u14"; then rc=0
+else rc=1; echo "      (a) unranked+clip '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) the UNRANKED arm names a RECOGNISED clipped tier (and carries windows=TRUNCATED)" $rc
+
+printf 'EVIL-not-a-tier\n' > "$_d14/o/.pool-sat"
+( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unrec" 2>&1
+_r14="$(cat "$_d14/out-unrec" 2>/dev/null)"
+if grep -q 'unranked:' <<<"$_r14" && grep -q 'names no tier this code recognises' <<<"$_r14" \
+   && ! grep -q 'tier window was clipped' <<<"$_r14"; then rc=0
+else rc=1; echo "      (b) unranked+unrecognised '$(printf '%s' "$_r14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) an UNRECOGNISED window record is NOT reported as a clip this pass measured" $rc
+
+_d14b="$TMP/arm-clip-head"; rm -rf "$_d14b"; mkdir -p "$_d14b/o"
+printf 'aaa\nbbb\n' > "$_d14b/o/candidates.txt"; printf 'bbb\n' > "$_d14b/o/.pool"
+printf 'P1-severe\n' > "$_d14b/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14b/drive.sh"
+( cd "$_d14b" && HOME="$_d14b" bash drive.sh "$_d14b/o" ) > "$_d14b/out-head" 2>&1
+_h14="$(cat "$_d14b/out-head" 2>/dev/null)"
+if grep -q 'HEAD cannot be named here' <<<"$_h14" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_h14"; then rc=0
+else rc=1; echo "      (c) non-numeric head '$(printf '%s' "$_h14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) the HEAD-NOT-NUMERIC arm still carries windows=TRUNCATED (it used to drop the clause)" $rc
+
+# 14e) NON-VACUITY — remove the clause from the arms and the checks above must redden.
+MUT_NOSAT2="$TMP/fns-nosat2.sh"
+sed -e 's/\$_sat_said"$/"/' -e 's/^\$_sat_said$//' "$FNS" > "$MUT_NOSAT2"
+if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said mutation did not apply — the sed anchor drifted"; else
+  _d="$_d14b"; { drive_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
+  ( cd "$_d" && HOME="$_d" bash drive-mut.sh "$_d/o" ) > "$_d/out-mut" 2>&1
+  if grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
+fi
+ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappears (the checks can fail)" $rc
+
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

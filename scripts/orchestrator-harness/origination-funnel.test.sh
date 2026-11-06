@@ -2907,12 +2907,21 @@ else
   # variable indirection through `_strip_ref` fails loudly as `command not found` and changes nothing.
   # Residual, stated rather than implied: RENAMING the reference and moving every call site defeats this
   # too — no test can see that, and it would be a deliberate act on a comment that says DO NOT do it.
-  _wcode_nodep="$({ unset -f _strip_ref; _strip_comments < "$REFRESH"; } 2>&1)"
-  if [ "$_wcode_nodep" = "$_WCODE" ]; then
-    ok "pin/writer: the strip produces IDENTICAL output with the reference REMOVED (unset -f _strip_ref) — it genuinely does not depend on it, at any call depth"
-  else
-    bad "pin/writer: the strip's output CHANGES when the reference is removed — it delegates to \`_strip_ref\` somewhere the names above did not reach: '$(_diff_first "$_WCODE" "$_wcode_nodep")'"
-  fi
+  # ⛔ A SENTINEL STUB, NOT A REMOVAL (review P2, cycle 39). `unset -f` only reddens a delegation whose
+  # FAILURE changes the bytes: a helper that prefers the reference and falls back to an equivalent copy
+  # caught the `command not found` and produced identical output, so the property held while the graded
+  # view literally WAS the reference — measured GREEN, with the ok line asserting a dependence that
+  # existed. Replacing the reference with a stub makes a SUCCESSFUL delegation visible (it emits
+  # `REF-USED`), while a failed one still cannot hide.
+  _wcode_nodep="$({ _strip_ref() { printf 'REF-USED\n'; }; _strip_comments < "$REFRESH"; } 2>&1)"
+  case "$_wcode_nodep" in
+    *'REF-USED'*) bad "pin/writer: the strip CALLS \`_strip_ref\` — the reference answered with a sentinel, so the graded view is the REFERENCE and every predicate below it is a tautology" ;;
+    *) if [ "$_wcode_nodep" = "$_WCODE" ]; then
+         ok "pin/writer: the strip produces IDENTICAL output when \`_strip_ref\` is replaced by a SENTINEL STUB — it genuinely does not call it, at any call depth"
+       else
+         bad "pin/writer: the strip's output CHANGES when the reference is stubbed — it reaches \`_strip_ref\` somewhere the names above did not: '$(_diff_first "$_WCODE" "$_wcode_nodep")'"
+       fi ;;
+  esac
   _wline="$(grep -E '^_WCODE=' "$_PINFILE" | awk 'END { print }')"
   printf '%s' "$_wline" | grep -qE '\$\([^)]*_strip_comments[[:space:]<]' || _wpin=0
   printf '%s' "$_wline" | grep -qE '_strip_ref' && _wref=1
