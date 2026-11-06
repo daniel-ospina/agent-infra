@@ -16585,8 +16585,9 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
 # fails the same suite under the equivalent name declared by `declared_base_equivalent`,
 # on a workflow that declares no PR trigger.
 # (b)/(c)/(d) are the guards that stop this becoming a blanket exemption, (f) is the arm
-# that keeps a NON-CODE tree red out of it, and (e) is the mutant: the fix's own arm must
-# go RED when the exclusion is deleted.
+# that keeps a NON-CODE tree red out of it, (g)/(h) pin the two ways a NAME-ONLY set could
+# excuse something the base evidence does not support, and (e) is the mutant: the fix's own
+# arm must go RED when the exclusion is deleted.
 echo "== 80. #3322: a check MAIN ITSELF FAILS is excluded from the required surface =="
 
 # (a) THE FIX — the observed block. main fails `script-validate` (push-only ci-main.yml,
@@ -16616,12 +16617,18 @@ grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge actually happened
 # AN EXCLUSION THAT IS ONLY AN ABSENCE IS A SILENT DROP: stderr must NAME the red it set
 # aside AND the base check that owns it, or the operator cannot tell "the repo is red"
 # from "the PR is clean". Deleting the TREE_REDS_BASEOWNED print must fail THIS arm.
+# ⛔ THREE INDEPENDENT GREPS ARE NOT A CONJUNCTION (review cycle 2). `grep -q "script-validate"`
+# is satisfied by step 2c's own "Base red(s) reported but NOT blocking" block, and
+# `grep -q "bash-suites (3)"` by the exclusion line's ${job} — so deleting the OWNER NAME from
+# that line left this arm GREEN. The phrase `the base itself fails '<name>'` is emitted ONLY
+# by the exclusion line (stderr) and by the evidence comment's exclusion block, so it is the
+# one string that makes the "with the base check that owns it" claim deny-able.
 if grep -q "EXCLUDED from the required surface" "$SCEN/err" \
-   && grep -q "bash-suites (3)" "$SCEN/err" \
-   && grep -q "script-validate" "$SCEN/err"; then
+   && grep -q "the base itself fails 'script-validate'" "$SCEN/err" \
+   && grep -q "bash-suites (3)" "$SCEN/err"; then
   pass "(a) …and the excluded red is REPORTED by name, with the base check that owns it"
 else
-  fail "(a) the exclusion is SILENT — an excluded red must be named, not merely dropped: $(grep -n 'EXCLUDED\|bash-suites' "$SCEN/err" 2>/dev/null | head -3)"
+  fail "(a) the exclusion is SILENT or UNATTRIBUTED — an excluded red must be named WITH the base check that owns it: $(grep -n 'EXCLUDED\|bash-suites\|base itself fails' "$SCEN/err" 2>/dev/null | head -3)"
 fi
 grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
   && fail "(a) the rail still refused at §4.5" || pass "(a) …and §4.5 did not refuse"
@@ -16637,6 +16644,7 @@ grep -q "NOT pull-request-evaluable" "$SCEN/err" \
 # indistinguishable there from a silent drop (the #6807 rule, same reason).
 if [ -f "$SCEN/comment" ] \
    && grep -q "Tree red(s) EXCLUDED from the required surface" "$SCEN/comment" \
+   && grep -q "the base itself fails 'script-validate'" "$SCEN/comment" \
    && grep -q "bash-suites (3)" "$SCEN/comment"; then
   pass "(a) …and the DURABLE evidence comment carries the excluded red, not just stderr"
 else
@@ -16838,6 +16846,77 @@ grep -q "NOT EXEMPT ON THIS SURFACE" "$SCEN/err" \
   && pass "(f) …saying the non-code exemption does not apply on the evaluated tree" \
   || fail "(f) the refusal does not state that the non-code exemption is base-only"
 grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted over an excluded non-code tree red" || pass "(f) …and no merge attempted"
+
+# (g) THE FOURTH GUARD — ONE NAME, TWO ROWS, ONE OF THEM BLOCKING. The base-owned set is
+# built from the base's `exempt: this workflow declares no PR trigger` rows, but the base can
+# publish the SAME check name from two different apps/workflows: exempt on a push-only lane
+# AND blocking on a PR-evaluable one. A set that takes the name from the exempt row and
+# ignores the blocking row contradicts the header's own rule ("the base red is on a workflow
+# that DOES declare a PR trigger -> it is a BLOCKING base red, deliberately NOT in the set:
+# that is the repair direction") — and it would exclude the PR's shard red on evidence the
+# base actively contradicts. This arm fails if the `blocked[n]` condition is dropped.
+new_scen baseowned-same-name-blocked
+HEAD_BO7="b0b7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO7" > "$SCEN/head"
+lane_pass "$HEAD_BO7" 7161 > "$SCEN/runs-$HEAD_BO7"
+lane_pass mainbo7 7162 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5161 'ci / lint' completed success 7261)" \
+  "$(check_run 5162 'bash-suites (3)' completed failure 7262)"
+pr_run_map 7261 pull_request 'CI'
+pr_run_map 7262 pull_request 'CI'
+# THE SAME NAME, twice — but from TWO DIFFERENT APPS, which is what makes this arm bite.
+# ⛔ WHY NOT TWO `check_run` ROWS (verifier finding, round 3): `check_run` hardcodes
+# `app.slug` to `github-actions`, and the probe keys its de-duplication on (app, name) with
+# newest-id-wins — so two same-named `check_run` rows COLLAPSE into one (the blocking one)
+# before the bash ever sees them, and the arm would pass with or without the `blocked[n]`
+# guard. The second row is therefore written raw with a different app slug: two identities,
+# one name — the real shape of "two apps publish the same check name".
+write_main_checks \
+  "$(check_run 6161 'script-validate' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(printf '{"id":6162,"name":"script-validate","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
+main_run_map 8261 push 'CI on main' 8262 pull_request 'CI'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8261"
+printf 'pull_request\tCI\t.github/workflows/ci.yml\n' > "$SCEN/run-8262"
+wf_declares .github/workflows/ci-main.yml push
+wf_declares .github/workflows/ci.yml pull_request
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a base name that is ALSO red on a PR-evaluable workflow does NOT excuse the tree red (exit $rc)" \
+  || fail "(g) the base-owned set was built from the exempt row ALONE — a name the base also fails on a PR-evaluable workflow excluded the PR's red"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(g) …as the §4.5 tree-red refusal" || fail "(g) the refusal is not the tree-red one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(g) a red the base BLOCKS on was excluded as base-owned — the set ignored a contradicting row" \
+  || pass "(g) …and nothing was excluded"
+
+# (h) THE FIFTH GUARD — A PLACEHOLDER IS NOT A NAME. The probe gives a nameless row the
+# identity `(unnamed check)`. If that placeholder enters the name set, ONE unnamed base red
+# excuses ANY unnamed tree red — the #1353 property ("an unnamed red must never vanish")
+# inverted into a waiver, on evidence that establishes nothing about the tree's unnamed row.
+# This arm fails if the placeholder exclusion is dropped from the awk.
+new_scen baseowned-unnamed
+HEAD_BO8="b0b8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO8" > "$SCEN/head"
+lane_pass "$HEAD_BO8" 7171 > "$SCEN/runs-$HEAD_BO8"
+lane_pass mainbo8 7172 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5171 '' completed failure 7271)"
+pr_run_map 7271 pull_request 'CI'
+write_main_checks "$(check_run 6171 '' completed failure 8271 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8271 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8271"
+wf_declares .github/workflows/ci-main.yml push
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) an UNNAMED base red does not excuse an UNNAMED tree red (exit $rc)" \
+  || fail "(h) the '(unnamed check)' PLACEHOLDER matched itself and the tree red was excluded — a nameless row is not a name"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(h) …as the §4.5 tree-red refusal" || fail "(h) the refusal is not the tree-red one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(h) an unnamed tree red was excluded on an unnamed base red" \
+  || pass "(h) …and nothing was excluded"
 
 # #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
 # file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is

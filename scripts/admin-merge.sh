@@ -179,11 +179,12 @@
 #       `bash-suites (<n>)` == `script-validate`).
 # So the evidence is MAIN'S OWN MEASURED SURFACE, and the exclusion fires only where
 # main is red on that suite at read time. Every fail-closed path holds:
-#   * the base surface UNREADABLE / UNMEASURED -> no `exempt:` row is ever written, so the
-#     set is EMPTY -> nothing is excluded -> §4.5 refuses as before (a base read that failed
-#     can never excuse a red); a PARTIAL base is the same empty-vs-seeded question but never
-#     reaches the tree at all — step 2c `exit 1`s on it (a half-read base is the #1261
-#     disarm), so the seeded set is not consulted. Either way nothing is excused;
+#   * an UNREADABLE or PARTIAL base read excuses NOTHING, but not because the set is empty:
+#     step 2c `exit 1`s on BOTH (a base the rail could not read is not a certificate, and
+#     4.6/4.7 are both gated on the base being RED), and that exit comes AFTER the name file
+#     is seeded — so the set may well be non-empty and §4.5 simply never consults it. An
+#     UNMEASURED base (0 checks, 0 statuses) writes no `exempt:` row at all, so there the set
+#     IS empty and §4.5 refuses as before. Nothing is excused on any of the three paths;
 #   * the base read is CLEAN -> no set -> the PR's red is its own and blocks, which is
 #     the #1261 incident (a lint red main does NOT carry) and every real regression;
 #   * the base red is on a workflow that DOES declare a PR trigger -> it is a BLOCKING
@@ -194,12 +195,25 @@
 # PR-side red named `bash-suites (3)` on a base whose `script-validate` is GREEN stays
 # blocking; deleting the base measurement from the rule would make every shell red
 # base-caused — the blanket excuse the #2610 mapping's own requirements forbid.
-# ⛔ THE DECLARED RESIDUAL. A suite main NEVER RUNS cannot be shown to be "a check main
-# itself fails", so there is no evidence to exclude it and it keeps blocking. Measured
-# on this repo: `verify`'s programs are run by `ci.yml` only (5 of its 6 programs appear
-# nowhere in ci-main.yml), so `verify` is NOT covered by this rule — it is #3415's
-# "base-owned but unmeasurable from the base" family, not this one. That is a refusal
-# with a reason, never a silent pass.
+# ⛔ THE DECLARED RESIDUAL. A check NAME main never publishes cannot be shown to be "a check
+# main itself fails", so there is no evidence to exclude it and it keeps blocking. Measured on
+# this repo: `ci.yml` declares a `verify` job; `ci-main.yml` declares NO `verify` job at all
+# (its jobs are extension-tests, script-validate, skill-lint, cost-config-guard,
+# sigpipe-grep-guard, pi-config-extensions-guard, python-ci, auto-file-on-failure), so main can
+# never publish that NAME and this rule can never fire for it.
+# ⛔ THE UNIT HERE IS THE NAME, NOT THE PROGRAM, and the difference decides which fix is owed.
+# Many of the programs the `verify` job runs DO run on main — some named literally in
+# ci-main.yml, others picked up by the `extension-tests` job's globs — but under OTHER JOB
+# names (`extension-tests / …`) that `declared_base_equivalent` has no arm for. It is also NOT
+# a clean split by "appears in the file", because a glob match is invisible to a text search:
+# do not restate this as a count without resolving the globs. So the residual is two things,
+# and neither is excused here:
+#   • a program main DOES run under an UNMAPPED job name needs a MAPPING arm — the
+#     `bash-suites-gate`-shaped residual stated in `declared_base_equivalent`'s docblock;
+#   • a program main truly never runs is #3415's "base-owned but unmeasurable from the base"
+#     family, where a base-side reproduction — never a name match — is the only evidence that
+#     could exist.
+# That is a refusal with a reason, never a silent pass.
 # ⛔ THE SECOND RESIDUAL, NAMED: THE EXCLUSION IS LANE-GRANULAR, NOT SHARD-GRANULAR.
 # `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base
 # check `script-validate`, so while main is red on it, EVERY shard is excluded — including
@@ -9910,15 +9924,38 @@ main() {
   # so §4.5/§4.6 must keep insisting the repair PR clear it (#1261). A NON-code
   # event is not in it either: that red is noise from a cron lane, and a PR red
   # that merely shares its name is not the same measurement.
-  # ⛔ EMPTY IS THE FAIL-CLOSED ANSWER and it is the common one: a base that was
-  # unread/PARTIAL/UNMEASURED, a clean base, and a base whose only reds are
-  # PR-evaluable all leave this file empty, which admits no exclusion at all.
+  # ⛔ EMPTY IS THE FAIL-CLOSED ANSWER and it is the common one: an UNMEASURED base (0 checks,
+  # 0 statuses), a clean base, and a base whose only reds are PR-evaluable all leave this file
+  # empty, which admits no exclusion at all. An UNREADABLE or PARTIAL base ALSO seeds nothing
+  # usable in effect — not because this file stays empty (step 2c seeds it and then `exit 1`s
+  # before §4.5 reads it), but because the rail never gets that far.
   BASE_ALL_REDS="$MAIN_HEALTH_ALL_REDS"
   BASE_OWNED_REDS="$TMP/base-owned-reds.txt"
   : > "$BASE_OWNED_REDS"
   if [ -n "$BASE_ALL_REDS" ]; then
+    # ⛔ THE SET IS NOT A FLAT NAME LIST. Two conditions, both fail-closed, both load-bearing:
+    #   (1) A NAME THAT ALSO HAS A `blocking:` ROW IS NOT EMITTED. The base can publish one
+    #       check NAME from two different apps/workflows — exempt on a push-only lane and
+    #       BLOCKING on a PR-evaluable one. Taking the name from the exempt row and ignoring
+    #       the blocking row would exclude a PR red on evidence the base contradicts (the
+    #       header: "the base red is on a workflow that DOES declare a PR trigger -> it is a
+    #       BLOCKING base red, deliberately NOT in the set").
+    #   (2) NEITHER NAMELESS PLACEHOLDER IS EMITTED. `(unnamed check)` / `(unnamed status)` are
+    #       the identities the probe gives a row with no name — they are not the NAME of
+    #       anything, so matching them would let ONE unnamed base red excuse ANY unnamed tree
+    #       red (#1353's "an unnamed red must never vanish", inverted into a waiver).
+    # Both are pinned by §80(g)/(h); the awk is the ONE place either rule lives.
     printf '%s\n' "$BASE_ALL_REDS" \
-      | awk -F'\t' '$2 == "exempt: this workflow declares no PR trigger, so a PR can never run it" { print $1 }' \
+      | awk -F'\t' '
+          $2 ~ /^blocking:/ { blocked[$1] = 1 }
+          { row[$1] = row[$1] "\n" $2 }
+          END {
+            for (n in row) {
+              if (blocked[n]) continue
+              if (n == "(unnamed check)" || n == "(unnamed status)") continue
+              if (row[n] ~ /exempt: this workflow declares no PR trigger, so a PR can never run it/) print n
+            }
+          }' \
       | sort -u > "$BASE_OWNED_REDS"
   fi
   BASE_TOTAL="$MAIN_HEALTH_TOTAL"; BASE_RED="$MAIN_HEALTH_RED"; BASE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
