@@ -561,7 +561,11 @@ WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
 wf_force=0
 for _n in 1 2; do
   _p="$T/wfretry/shim/argv.$_n"
-  if [ -f "$_p" ] && grep -qE '^(\+|--force$|-f$)' "$_p" 2>/dev/null; then
+  # ⛔ THE PATTERN MUST MATCH EVERY FORCE SPELLING, INCLUDING THE TWO `--force-*` FORMS (review round 3,
+  # P2). `--force$` let `--force-with-lease` and `--force-if-includes` through GREEN — measured — and
+  # `--force-with-lease` is precisely what a fixer adds when a peer clone moved `refs/wip/<slug>`, i.e.
+  # the one force this arm exists to refuse. `--force` as a PREFIX covers all three spellings.
+  if [ -f "$_p" ] && grep -qE '^(\+|-f$|-[fF]$|--force)' "$_p" 2>/dev/null; then
     wf_force=1; bad "wfretry: attempt $_n used a FORCE form (a forced rescue can overwrite a peer clone's snapshot): $(tr '\n' ' ' < "$_p")"
   fi
 done
@@ -766,11 +770,19 @@ assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label>
     && ok "$l: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
     || bad "$l: the stored-credential retry did not disable the terminal prompt — a missing store entry could hang the rescue"
   for p in "$f/shim/argv.1" "$f/shim/argv.2"; do
-    [ -f "$p" ] && grep -qE '^(\+|--force$|-f$)' "$p" 2>/dev/null && force=1
+    [ -f "$p" ] && grep -qE '^(\+|-f$|-[fF]$|--force)' "$p" 2>/dev/null && force=1
   done
   [ "$force" -eq 0 ] \
     && ok "$l: NEITHER attempt carries a force form (a forced rescue can overwrite a peer clone's snapshot)" \
     || bad "$l: an attempt used a FORCE form"
+  # ⛔ AND THE STORED-CREDENTIAL PATH MAY NOT WRITE GIT CONFIG EITHER (review round 3, P2). This was
+  # asserted only on the helper arm, so a `git config credential.helper store` planted in
+  # `push_unshadowed` — a fixer "making the store answer" instead of removing the ambient token — was
+  # fully GREEN, and the write persists on the machine that ran the suite. ALL SCOPES, via
+  # `--show-origin`: a `--local` comparison cannot see a `$HOME/.gitconfig` write.
+  [ "$(git -C "$f/wt" config --list --show-origin 2>/dev/null | sort)" = "$CFG_BEFORE" ] \
+    && ok "$l: git config is byte-identical at EVERY scope after the retry (read-only rescue, global included)" \
+    || bad "$l: the stored-credential rescue WROTE git config (any scope) — a rescue must not change the state it is rescuing"
   case "$OUT" in
     *osxkeychain*|*OSXKEYCHAIN*) bad "$l: claims the keychain credential on a host that has none — $OUT" ;;
     *STORED*credential*) ok "$l: names the credential that published it (the stored one, shadow removed)" ;;

@@ -50,7 +50,9 @@
 #     to reach that candidate on macOS), then the platform default — `osxkeychain` on macOS, else the
 #     STORED credential with an ambient `GH_TOKEN`/`GITHUB_TOKEN` removed for that attempt (the cell
 #     shape). On a host where none of those can be a DIFFERENT credential, no retry is attempted and
-#     the run says so rather than spending 45 s re-sending the same token.
+#     the run says so rather than spending 45 s re-sending the same token. ⛔ DECLARED RESIDUAL: the
+#     stored-credential candidate fires when an ambient token is SET, and a helper that never read it
+#     (`store`, `cache`) then re-sends the same credential — see section 6.
 #   - a host with NO workflow-scoped credential at all still ends local-only, loudly (cause + a valid
 #     `refs/wip-local/<slug>` + exit 2). That is what SHIPS today and the alternatives are OPEN with the
 #     owner on #2292 — an off-box channel that keeps the snapshot whole (`git bundle` as a release
@@ -332,7 +334,15 @@ push_with_helper() {  # push_with_helper <helper-name> — clear the configured 
 # env var voiding a review, #3453's dispatcher resolving a read-only PAT) — and nothing in the push
 # output says which of the two was used. Removing those two variables for THIS INVOCATION ONLY lets the
 # configured helper answer from its store; it is not a config write, it is never a force, and it cannot
-# reach a credential the first push would not: same repo, same refspec, same sha.
+# PUBLISH anything the first push would not (same repo, same refspec, same sha) — what it reaches is a
+# credential the first push never CONSULTED, which is the point. ⛔ THE PREDICATE IS "an ambient token is
+# SET", NOT "the configured helper READS it" (review round 3, P2). On a host whose helper is `store` or
+# `cache` — a common setup where `GH_TOKEN` is exported for the `gh` CLI rather than for git — the retry
+# removes a variable that helper never read, so it re-sends the SAME credential the remote just
+# refused. Detecting "does this helper consult the environment" is not something this script can know
+# cheaply, so the predicate stays what it is and the DECLARED RESIDUAL is that shape; the messages below
+# are worded for it ("if the configured helper reads them") rather than claiming a shadow that may not
+# exist — a false mechanism claim is worse than an imprecise one.
 push_unshadowed() {
   bounded 45 env -u GH_TOKEN -u GITHUB_TOKEN \
     git -C "$WT" -c http.lowSpeedLimit=1000 -c http.lowSpeedTime=20 \
@@ -423,9 +433,9 @@ else
         fi
         ;;
       'unshadow')
-        RETRIED=1; RETRY_GOT="the STORED credential (GH_TOKEN/GITHUB_TOKEN removed for that attempt)"
+        RETRIED=1; RETRY_GOT="the STORED credential (the ambient GH_TOKEN/GITHUB_TOKEN was removed for that attempt)"
         GIT_TERMINAL_PROMPT=0; export GIT_TERMINAL_PROMPT
-        echo "bg-rescue-wip: the push was refused for WORKFLOW SCOPE — retrying ONCE with the STORED credential (GH_TOKEN/GITHUB_TOKEN removed from THIS attempt only, so the ambient token cannot shadow it; no force, no config written)" >&2
+        echo "bg-rescue-wip: the push was refused for WORKFLOW SCOPE — retrying ONCE with the STORED credential (GH_TOKEN/GITHUB_TOKEN removed from THIS attempt only, so if the configured helper reads them the stored credential can answer; no force, no config written)" >&2
         if push_unshadowed; then
           PUSHED=1
         else
