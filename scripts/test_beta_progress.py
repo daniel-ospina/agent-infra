@@ -32,7 +32,9 @@ Run:  python3 -m pytest scripts/test_beta_progress.py -q
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
+import time
 
 import pytest
 
@@ -1001,3 +1003,80 @@ def test_a_limit_that_is_not_a_multiple_of_100_keeps_the_page_offsets_sound(monk
     assert numbers == list(range(1, 251)), "hole or duplicate: the window is not the window"
     assert [u.split("per_page=")[1].split("&")[0] for u in seen_urls] == ["100", "100", "100"]
     assert len(seen_urls) == 3
+
+
+# ── the PRODUCER'S contract: a failed read is UNKNOWN (None), never an empty list ──
+def test_gh_returns_None_on_any_failure_and_never_an_empty_list(monkeypatch):
+    """⛔ MUTATION-SURVIVED (measured 2026-11-03) BEFORE THIS TEST EXISTED.
+
+    `test_both_sources_failing_keeps_the_unavailable_path` monkeypatches `bp.gh` itself, so it
+    proves the CALLERS honour None and stays green when `gh()` is mutated back to the pre-fix
+    `return []` on failure: every mutant of the producer passed the whole suite. That is defect
+    (1) in this module's header — `json.loads(r.stdout or "[]")` turned a FAILED read into a
+    VALID EMPTY LIST, so every `is None` guard became dead code and the fleet read "0 open PRs"
+    while 100 were open. The invariant "unknown is not zero" has to be pinned where the
+    regression lives, at the producer.
+    """
+    class R:
+        def __init__(self, rc, out):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = ""
+
+    # A failing gh (auth refusal, rate limit, network) is UNKNOWN whatever it printed.
+    for rc, out in ((1, ""), (1, "[]"), (2, "[]"), (0, ""), (0, "   \n")):
+        monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(rc, out))
+        assert bp.gh("issue", "list") is None, (
+            "rc=%r stdout=%r must be UNKNOWN (None) -- an empty list renders as a measured zero"
+            % (rc, out))
+
+    # ⛔ …AND THE TWO `except` ARMS WERE STILL UNPINNED (review cycle 11, finding 1). Every case
+    # above hands `gh()` a COMPLETED command with empty-or-`[]` stdout, so it never reaches either
+    # exception path: `(0, "")` and `(0, "   \n")` short-circuit at the `if not out: return None`
+    # guard BEFORE the parse, and nothing makes `subprocess.run` raise. Measured: mutating EITHER
+    # arm's `return None` to the pre-fix `return []` left the suite at `22 passed` — the same
+    # mutation-survival this test exists to end, one arm over. Both are reachable in production:
+    # a truncated body, an HTML rate-limit page, or a layer warning on stdout takes the PARSE arm;
+    # a missing or unelevatable `gh` binary takes the SPAWN arm. Both mean UNKNOWN.
+    for out in ("not json", '{"truncated"', "<html>rate limited</html>"):
+        monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(0, out))
+        assert bp.gh("issue", "list") is None, (
+            "rc=0 stdout=%r is not JSON -- a parse failure is UNKNOWN, never an empty list" % out)
+
+    def _cannot_spawn(*a, **k):
+        raise OSError("gh is not on PATH")
+
+    monkeypatch.setattr(bp.subprocess, "run", _cannot_spawn)
+    assert bp.gh("issue", "list") is None, (
+        "a gh that could not be spawned is UNKNOWN -- the spawn arm must not render as []")
+
+    # ... and a SUCCESSFUL read that genuinely returns [] is a real answer, not an abstention.
+    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(0, "[]"))
+    assert bp.gh("issue", "list") == []
+
+
+# ── the age's POSITIVE half: a stale cache must SAY it is stale ──
+def test_a_cache_25_minutes_old_prints_25m_ago_not_zero(no_cache, capsys):
+    """⛔ ONLY THE NEGATIVE HALF OF THE AGE WAS PINNED (measured 2026-11-03).
+
+    `test_a_slightly_future_cache_stamp_never_prints_a_negative_age` covers `-Nm ago`; nothing
+    asserted a POSITIVE age, so `age_m = 0` — the reported "always 0m ago" defect, which defeats
+    the entire purpose of printing an age — survived the whole suite when mutated in. The header's
+    own evidence is a line that read "P0 21 open" for ~50 minutes while the truth was 19, and the
+    orchestrator nearly dispatched on it: a stale figure is read as LIVE unless the age says
+    otherwise.
+
+    The stamp is 25 min old, inside the 1800 s TTL, so this exercises the CACHE-HIT path — the
+    one taken on ~15 of every 16 beats — rather than a recompute that would print 0m correctly.
+    """
+    stamp = int(time.time()) - 25 * 60
+    with open(bp.CACHE, "w") as fh:
+        json.dump({"ts": stamp, "open_prs": 5, "merged_today": 2,
+                   "p0": {"open": 3, "with_pr": 2, "without": 1},
+                   "p1": {"open": 4, "with_pr": 4, "without": 0}}, fh)
+
+    assert bp.main() == 0
+    out = capsys.readouterr().out
+    assert "25m ago" in out, (
+        "a 25-minute-old cache must print `25m ago` — an always-0m age makes a stale figure "
+        "indistinguishable from a live one. got: %r" % out)
