@@ -1760,7 +1760,7 @@ sleep 300 & LANDER_PID=$!
 printf '%s\n' "$LANDER_PID" > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
 rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc=$?
 [ "$plrc" -eq 0 ]; rc=$?
 ck "a fixer DEFERS (rc=0) when the LANDER holds the PR-owner lock (rc=$plrc) — contention is not a failure" $rc
@@ -1786,7 +1786,7 @@ kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
 sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
 printf '%s\n' "$STALE_PID" > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
 { [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG" && grep -q 'RECLAIMED a STALE claim' "$RO/logs/fix-7.log"; }; rc=$?
 ck "a STALE claim is TAKEN OVER, not refused: the fixer runs holding it and the chain re-runs (rc=$plrc2)" $rc
@@ -1858,7 +1858,7 @@ ck "an unrestorable displacement is reported as its OWN outcome (rc=2 + a WARNIN
 # mid-claim. The fixer must treat it as LIVE: defer, and leave it exactly as it found it.
 : > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2b=$?
 { [ "$plrc2b" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an EMPTY claim record is treated as LIVE and DEFERS (rc=$plrc2b, no agent) — a lander mid-claim is not a dead one" $rc
@@ -1884,7 +1884,7 @@ aged_empty() { # <writer> -> installs an AGED record at the fixer's lock path
 run_fixer() { # one fixer run against whatever record is installed; leaves PI_LOG/MERGE_LOG/log fresh
   fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
   rm -f "$RO/state/fixbail-7-"*
-  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
       PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1
 }
 aged_empty ': > "$PRLOCK7"'
@@ -1943,7 +1943,7 @@ ck "(9b-orphan) …and no deferral is spelled with the raw lock path as its caus
 rm -f "$PRLOCK7"; mkdir -p "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
 rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc4=$?
 { [ "$plrc4" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an UNUSABLE lock path (a directory) refuses before any agent runs (rc=$plrc4)" $rc
@@ -1963,7 +1963,7 @@ rmdir "$PRLOCK7" 2>/dev/null || rm -rf "$PRLOCK7"
 # exists for.
 RO3="$RIG/O3"; rm -rf "$RO3"; mkdir -p "$RO3/logs"; : > "$RO3/state"
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$RO3/state/mergeclaim-7.lock" bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; plrc5=$?
 { [ "$plrc5" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an UNWRITABLE state dir refuses before any agent runs (rc=$plrc5) — the second non-refundable arm" $rc
@@ -1977,7 +1977,7 @@ ck "...and names the CAUSE it measured (the create failed on an absent path), no
 # (otherwise merge-one.sh takes the same lock first and exits "already owns this PR", skipping the
 # fixer's own re-review — #2132's strand).
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc3=$?
 { [ "$plrc3" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
 ck "POSITIVE CONTROL: with no lander the fixer RUNS and the chain is re-run (rc=$plrc3)" $rc
@@ -2003,7 +2003,7 @@ PI_STOP="$TMP/pi.stop"; rm -f "$PI_STOP"
 pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; i=0; while [ "$i" -lt 600 ]; do [ -f "${PI_STOP:-/nonexistent}" ] && return 0; sleep 0.1; i=$((i+1)); done; return 0; }
 export -f pi
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PI_STOP="$PI_STOP" PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1 & fixpid=$!
 i=0; while ! grep -q PI_RAN "$PI_LOG" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
 held="$(cat "$PRLOCK7" 2>/dev/null)"
@@ -2183,7 +2183,7 @@ ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not 
 sleep 300 & ADOPT_LANDER=$!
 printf '%s\n' "$ADOPT_LANDER" > "$RO/state/mergeclaim-7.lock"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79=$?
 [ "$arc79" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS for a run that pushed nothing" $rc
@@ -2191,7 +2191,7 @@ ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS 
 # who reads only adopt-<PR>.log unless this wrapper names it.
 rm -f "$RO/state/mergeclaim-7.lock"; mkdir -p "$RO/state/mergeclaim-7.lock"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79b=$?
 [ "$arc79b" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports an UNUSABLE PR-owner lock as 79 (got $arc79b) — not SUCCESS" $rc
