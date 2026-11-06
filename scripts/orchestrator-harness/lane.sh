@@ -675,8 +675,8 @@ bash "$brief_gate_sh" --check "$O/logs/prompt-$N.txt" lane 2>>"$O/logs/lane-$N.l
 #     `orch-loop.sh`'s `capacity_yield_live()`.
 #
 # FORMAT — one line, three tab-separated fields, and the field ORDER is the contract with both
-# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the SEVEN refusal gates
-# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`.
+# readers: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the EIGHT refusal gates
+# `cap_refusal_gate` below classifies: `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key`, `mem`.
 # ⛔ THIS SENTENCE USED TO SAY "`load`, `disk` or `land`" AND THAT WAS A TRAP (review P2): the writer has
 # emitted SIX since the fork/capability/skew/key gates were added — and it says SEVEN here because that
 # stale count is exactly how this comment drifted the first time (review cycle 1, P2: it read "SIX"
@@ -989,9 +989,13 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # of THIS box, so yielding the issue to a peer is exactly the right remedy (the brief-refusal
     # argument, read in the other direction). Tolerant default for the same $O-skew reason as the rest:
     # a helper predating the code can never return it.
+    # ⛔ AND `mem` TAKES THE SAME YIELD PATH FOR THE SAME REASON (#2387): `mem` is transferable like
+    # `load` — a peer box with free RAM can run the work this box's memory floor refused — which is
+    # why it is a capacity value and NOT a `land` stand-down. Its code is 81, outside the band the
+    # other gates occupy, so a future renumbering cannot quietly make this arm unreachable.
     if [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then _cap_gate=fork
     elif [ "$rc" = "${AGENT_DISK_REFUSED:-77}" ]; then _cap_gate=disk
-    elif [ "$rc" = "${AGENT_MEM_REFUSED:-73}" ]; then _cap_gate=mem
+    elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then _cap_gate=mem
     elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then _cap_gate=land
     elif [ "$rc" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then _cap_gate=skew
     elif [ "$rc" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then _cap_gate=capability
@@ -1049,11 +1053,11 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # had been MET — a false cause, and the same #1765 class (a remedy for the wrong condition) this
     # block exists to prevent. Both are named, and the refusing line above carries the numbers.
     echo "[lane $N] NOT started: DISK gate refused — either the filesystem is below DISK_MIN_FREE_MB, or it is above the floor but has no headroom for one lane's dependency tree (DISK-NOHEADROOM, agent-infra#2721). The '[disk-gate] REFUSED' line above says which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches; --scratch for /tmp) before re-dispatching; this will NOT clear by waiting." >> "$O/logs/lane-$N.log"
-  elif [ "$rc" = "${AGENT_MEM_REFUSED:-73}" ]; then
+  elif [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then
     # ⛔ THE MEMORY GATE'S OWN NAME (#2387), for the disk branch's reason: an operator told "load"
     # watches a 1-min average that is fine while the OOM killer takes their lanes. The reading, the
     # floor and the arithmetic are on the `[mem-gate] REFUSED` line in the same log.
-    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB (one pi lane plus one pytest shard, measured). This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool." >> "$O/logs/lane-$N.log"
+    echo "[lane $N] NOT started: MEMORY gate refused — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes FINISH and release their working set; it will NOT clear by waiting for load. Issue returns to the pool. (The reading, the floor and how the floor was derived — a measured reserve, or an operator-set MEM_MIN_AVAIL_MB — are on the [mem-gate] REFUSED line in this log.)" >> "$O/logs/lane-$N.log"
   elif [ "$rc" = "${AGENT_LAND_BACKLOG:-74}" ]; then
     # ⛔ NAMED, AND NAMEABLE AS SOMETHING OTHER THAN CAPACITY (#1765's rule, applied to a gate whose
     # remedy is not on this box at all). An operator told "load gate" here waits for a box that is

@@ -900,7 +900,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
     # operator a full filesystem was the cause when it was not.
     why="disk gate: either below DISK_MIN_FREE_MB, or no headroom for one lane's dependency tree (DISK-NOHEADROOM) — the '[disk-gate] REFUSED' line above names which, with both terms; reclaim space (cloud-cell-supervisor.sh prune --caches) — this will NOT clear by waiting"
-  elif [ "$ar" = "${AGENT_MEM_REFUSED:-73}" ]; then
+  elif [ "$ar" = "${AGENT_MEM_REFUSED:-81}" ]; then
     # ⛔ THE MEMORY GATE'S OWN WORDING (agent-infra#2387), for the reason the disk branch exists: the
     # remedies differ and the wrong name sends the operator to the wrong number. "load" would have
     # them watch a 1-min average on a box whose load is fine while the OOM killer takes lanes; the

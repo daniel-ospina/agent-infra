@@ -130,6 +130,9 @@ cap_refusal_gate() { # -> prints `fork|load|mem|disk|land|capability|skew|key` a
   # measured on the merged tree with a `gate=capability` record, `exit=75`, log `refused at the load
   # gate`. The arm below and this line are ONE unit; a suite arm now drives each gate through this
   # file and pins the exit code, so the pair cannot drift apart again.
+  # ⛔ `mem` is named here for the same reason (#2387): its arm exists below, so folding the word into
+  # `*` would route a MEMORY refusal through the load remedy — the very defect the paragraph above
+  # records, one gate later.
   case "${gate:-}" in
     disk) printf 'disk' ;;
     fork) printf 'fork' ;;
@@ -275,6 +278,11 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # anything. The exit code must differ for the same reason 75 and 77 differ from each other —
       # the remedy is different — and it must be a STOP here for the same reason: no PR can appear.
       land) _cap_rc=74 ;;
+      # 81 is spawn-gate.sh's AGENT_MEM_REFUSED (#2387): available memory is below the spawn gate's
+      # floor. A capacity refusal like load — a peer with free RAM can take the issue — but a
+      # DIFFERENT reading whose remedy is a DIFFERENT event (resident lanes finishing, not the load)
+      # so it exits with its own code rather than reporting 75.
+      mem)  _cap_rc="${AGENT_MEM_REFUSED:-81}" ;;
       # 71 is spawn-gate.sh's AGENT_CAPABILITY_REFUSED (#2935): the box could not complete one model
       # call and RETURN. Distinct from 75 for the usual reason — the remedy differs — and it lands in
       # the SAME yield path as load, deliberately: a capability refusal is a property of THIS box, so
@@ -287,10 +295,6 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
       # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
-      # 81 is spawn-gate.sh's AGENT_MEM_REFUSED (#2387): available memory is below the spawn gate's
-      # floor. A capacity refusal like load — a peer with free RAM can take the issue — but a
-      # DIFFERENT reading, so it exits with its own code rather than reporting 75.
-      mem)  _cap_rc="${AGENT_MEM_REFUSED:-81}" ;;
       # 83 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
       # and either rejected its own arguments (a usage/version skew between the caller and the deployed
       # helper) or died without a verdict (`rc=2` on a corrupt copy). ⛔ IT MUST NOT BE 71: every reader
@@ -509,14 +513,14 @@ rc=$?
 # HERE, in the log the operator reads for this chain — the reviewer's own line is inside
 # merge-$PR.log, and on a box with no controller running nothing else would ever re-dispatch it.
 # ⛔ ONE CAUSE PER CODE (#2387 review P3): this block used to test `rc = 75` only, so a memory
-# refusal — merge-one.sh's own PI_GATE_MEM_REFUSED arm now exits 73 — propagated the right code and
+# refusal — merge-one.sh's own PI_GATE_MEM_REFUSED arm now exits 81 — propagated the right code and
 # said NOTHING, on the very path (chain-<N>, no controller running) the line exists to cover. The
 # remedies differ, so they are separate arms rather than a shared "capacity" sentence: a load floor
 # clears when the box quietens, a memory floor only when resident lanes finish or are stopped.
 echo "[chain $N] merge-one rc=$rc $(date)" >> "$LOG"
 case "$rc" in
   75) echo "[chain $N] reviewer NOT started (load gate) — re-run this chain (or let the controller re-dispatch it) when 1-min load is below MAX_LOAD" >> "$LOG" ;;
-  73) echo "[chain $N] reviewer NOT started (MEMORY gate) — nothing was consumed. Re-run this chain when resident lanes have finished and released their working set (this will NOT clear by waiting for load); the reading, the floor and its derivation are on the [mem-gate] REFUSED line in merge-$PR.log" >> "$LOG" ;;
+  81) echo "[chain $N] reviewer NOT started (MEMORY gate) — nothing was consumed. Re-run this chain when resident lanes have finished and released their working set (this will NOT clear by waiting for load); the reading, the floor and its derivation are on the [mem-gate] REFUSED line in merge-$PR.log" >> "$LOG" ;;
 esac
 echo "[chain $N] done $(date)" >> "$LOG"
 # ⛔ EXIT WITH merge-one.sh's STATUS (#1720 review). This script used to end on the `echo …done…`

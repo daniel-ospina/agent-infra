@@ -123,7 +123,7 @@ chmod +x "$LSHIMDIR/sysctl"
 # FAKE_LOAD / MAX_LOAD / TAG / PI_FAKE_RC come from the caller's environment.
 # ⛔ MEM_MIN_AVAIL_MB=1 IS THE MEMORY GATE'S NEUTRALISER, for the same reason $LSHIMDIR stubs the LOAD
 # probe: every arm below is about the LOAD ceiling, and since agent-infra#2387 the shim consults
-# available memory BEFORE load. Without this a memory-tight box answers 72 to a load arm and the arm
+# available memory BEFORE load. Without this a memory-tight box answers 84 to a load arm and the arm
 # reports a #1884 regression that is not one. Section 12 drives the memory arm on purpose, at a floor
 # this box cannot meet; the SHIPPED default floor is asserted in spawn-gate.test.sh (env -u), which owns
 # the arithmetic.
@@ -399,11 +399,12 @@ reset_probe
 before="$(ledger_rows)"
 err="$(TAG=mem-2387 FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=999999999 run_shim runner 2>&1 >/dev/null)"; rc=$?
 after="$(ledger_rows)"
-# ⛔ 82, NOT 72 (renumbered at the merge onto main): 72 is `REPO_TARGET_REFUSED` (#2694) there, so the
-# draft's number asserted a code the shim no longer returns — and 72 would have made a memory refusal
-# indistinguishable from a repo-identity refusal in every caller.
-[ "$rc" -eq 82 ] \
-  && pass "the spawn point REFUSES on memory with its own code (82), distinct from the load one (76)" \
+# ⛔ 84, NOT 72 AND NOT 82 (renumbered twice at the merge onto main): 72 is `REPO_TARGET_REFUSED`
+# (#2694) and 82 is `KEY_GATE_REFUSED` (#3331), so each draft number asserted a code the shim no longer
+# returns — and either would have made a memory refusal indistinguishable from another gate's in every
+# caller. The deploy-unit census in spawn-gate.test.sh is the arm that pins this.
+[ "$rc" -eq 84 ] \
+  && pass "the spawn point REFUSES on memory with its own code (84), distinct from the load one (76)" \
   || fail "a memory-refused spawn returned $rc — 76 would make every caller report a load refusal"
 [ ! -s "$TMP/probe" ] \
   && pass "…and the real pi was NOT started on that refusal" \
@@ -427,20 +428,20 @@ FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 run_shim runner >/dev/null 2>&
 [ "$rc" -eq 0 ] && [ -s "$TMP/probe" ] \
   && pass "POSITIVE CONTROL: with a floor this box meets, the spawn point RUNS the real pi (rc=$rc)" \
   || fail "the memory gate refused a spawn the box could afford (rc=$rc)"
-# ── and the TRANSLATION, 82 -> AGENT_MEM_REFUSED, so no caller learns a new code ──
+# ── and the TRANSLATION, 84 -> AGENT_MEM_REFUSED, so no caller learns a new code ──
 # ⛔ THE BRIEF IS RE-RENDERED HERE (review, P2). `$TMP/brief.txt` is the SHARED fixture, and the fake
 # lane runner above writes `aligned` into it on every `run_shim runner` call — so by the time this arm
 # ran, `run_agent`'s research-first gate read `aligned` and refused 80 (`AGENT_BRIEF_REFUSED`) before
 # the spawn point was ever reached. Measured: `rc=80 started=0`, with `[brief-gate] REFUSED` as the
 # only line in the log — the arm reported the MEMORY translation as broken while it had never run.
 "$ROOT/scripts/orchestrator-harness/brief-gate.sh" --section lane > "$TMP/brief.txt"
-mkdir -p "$TMP/bin82"
-printf '#!/usr/bin/env bash\nexit 82\n' > "$TMP/bin82/pi"
-chmod +x "$TMP/bin82/pi"
-cp "$TMP/bin76/gh" "$TMP/bin82/gh" 2>/dev/null || printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin82/gh"
-chmod +x "$TMP/bin82/gh"
+mkdir -p "$TMP/bin84"
+printf '#!/usr/bin/env bash\nexit 84\n' > "$TMP/bin84/pi"
+chmod +x "$TMP/bin84/pi"
+cp "$TMP/bin76/gh" "$TMP/bin84/gh" 2>/dev/null || printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin82/gh"
+chmod +x "$TMP/bin84/gh"
 rm -f "$TMP/O/state/walltime.tsv"; : > "$TMP/agent.log"
-res="$(PATH="$TMP/bin82:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 bash -c '
+res="$(PATH="$TMP/bin84:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "1"; }
@@ -450,7 +451,7 @@ res="$(PATH="$TMP/bin82:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 
 # ⛔ 81, NOT 73: 73 is `AGENT_FORK_REFUSED` on main, so asserting it here would accept the FORK code as
 # proof of the memory translation.
 [ "$res" = "rc=81 started=0" ] \
-  && pass "run_agent turns the spawn point's 82 into AGENT_MEM_REFUSED with AGENT_STARTED=0 ($res)" \
+  && pass "run_agent turns the spawn point's 84 into AGENT_MEM_REFUSED with AGENT_STARTED=0 ($res)" \
   || fail "a spawn-point MEMORY refusal was not translated for the callers ($res)"
 grep -q '\[mem-gate\] REFUSED .*spawn point refused the launch for MEMORY' "$TMP/agent.log" \
   && pass "…and the translated line NAMES memory (not load), which is what the callers' remedy keys on" \
@@ -480,9 +481,9 @@ else
   err="$(PI_PROBE="$TMP/probe" BRIEF="$TMP/brief.txt" TAG=mem-unreadable MAX_LOAD=999999999 \
     PATH="$TMP/unreadshim:$LSHIMDIR:$TMP/shim:$TMP/real:$PATH" \
     bash -c 'pi -p x' 2>&1 >/dev/null)"; rc=$?
-  [ "$rc" -eq 72 ] \
+  [ "$rc" -eq 84 ] \
     && pass "an UNREADABLE probe REFUSES (rc=$rc) — fail-closed, not fail-open like the disk gate" \
-    || fail "an unreadable memory probe returned $rc instead of refusing with 72 (fail-OPEN)"
+    || fail "an unreadable memory probe returned $rc instead of refusing with 84 (fail-OPEN)"
   [ ! -s "$TMP/probe" ] \
     && pass "…and the real pi did NOT start on it" \
     || fail "an unreadable probe still started pi: $(tr '\n' ' ' < "$TMP/probe")"

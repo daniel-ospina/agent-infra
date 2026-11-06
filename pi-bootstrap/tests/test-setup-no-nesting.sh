@@ -2463,13 +2463,17 @@ mkdir -p "$TMP/gate-real"
 printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
 chmod +x "$TMP/gate-real/pi"
 rm -f "$TMP/gate-ran"
-HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1
-_grc=$?
+# ⛔ THE REFUSAL IS THE EXPECTED OUTCOME, SO IT MUST NOT TRIP `set -e` (line 23). Written as
+# `pi … ; _grc=$?` the shell ABORTED on the gate's own 76 before `_grc` was ever assigned — the suite
+# exited 76 with 239 log lines and no recap, so the two real FAILs below were never reported and the
+# arm read as a harness crash. Capture the status the way the positive control below already does.
+_grc=0
+HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || _grc=$?
 if [ "$_grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
   echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 with the LOAD code 76 (the real pi never ran)"
 elif [ ! -e "$TMP/gate-ran" ]; then
   # ⛔ A REFUSAL FOR ANOTHER CAUSE IS NOT THIS ARM'S SUBJECT (review, P2). Without the code check a
-  # memory (72) or fork (73) refusal satisfied a LOAD assertion, and the positive control below then
+  # memory (the gate's own PI_GATE_MEM_REFUSED) or fork (78) refusal satisfied a LOAD assertion, and the positive control below then
   # failed — the suite reporting its own subject as broken on a box where nothing was wrong with it.
   fail "the installed gate refused at MAX_LOAD=0 for some OTHER cause (rc=$_grc, expected 76) — the load arm cannot be asserted over it"
 else
