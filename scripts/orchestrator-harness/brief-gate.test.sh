@@ -425,11 +425,39 @@ bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=
 # 262144 → pi renders `262k`); unlike the heartbeat's probe, safe-send's has NO `(auto)` or
 # model-bullet rescue arm, so an unlisted window is an outright refusal. Pin every shipped window
 # here, not just the current clamp.
+# ⛔ THE LATER GATE MUST BE THE FIXTURE'S, NOT THIS HOST'S. `safe-send.sh` delegates busy/idle to
+# `lane-guard.py`, whose `cmux` calls run through `lane-status.py`'s `env=CMUX` with four HARD-CODED
+# absolute bin dirs PREPENDED to PATH (`_CMUX_BIN_DIRS` is `:49-54`; the prepend itself is `:58`,
+# `CMUX["PATH"] = os.pathsep.join(_present + …)`, guarded by `:57 if _present:`). So the `$TMP/bin/cmux` stub below is
+# SHADOWED wherever a real `cmux` sits in one of the four dirs that EXIST on the box — `/usr/local/bin` or
+# `~/.local/bin` on a Linux box, `/opt/homebrew/bin` or the macOS app dir on a Mac — and is reached only
+# when none of them holds one (CI: ubuntu-latest). This is NOT a Mac-only condition: measured on the
+# Linux box this was diagnosed on, `cmux` resolves at `/usr/local/bin/cmux`, `/usr/local/bin` is one of
+# the four, and the real gate therefore ran and satisfied the grep. Wherever it runs, its empty read
+# produces the SAME message this arm wants, purely by accident. Measured both ways: the green was a
+# property of the HOST, not of `safe-send.sh`.
+#
+# SO WHAT GETS PINNED HERE IS THE **CONSUMER** SIDE, AND ONLY THROUGH A SENTINEL. This arm pins
+# `safe-send.sh:182-189`: that it READS `SAFE_SEND_GUARD` (`:182`), runs it (`:183`), and turns a
+# non-zero rc (`:185`) into its `REFUSED … Not consumable` message with `exit 3` (`:189`). ⛔ But a fixture that emits the REAL gate's message cannot prove the
+# seam was honoured at all — the real `lane-guard.py` emits `REFUSED [3.1s] pane UNREADABLE — busy/idle
+# UNKNOWN, not idle`, which satisfies a bare `pane UNREADABLE` grep. Measured: deleting the seam
+# (`GUARD="$SCRIPTS/lane-guard.py"`, so `SAFE_SEND_GUARD` is never read) left this suite at an IDENTICAL
+# `118 passed, 1 failed` — the arm was grading the host again, one layer down. So the fixture prints a
+# `FIXTURE-GUARD:` sentinel that the real gate never emits, and the positive arms assert on THAT. Re-run
+# the same mutation after any edit here: it must go RED.
+# The real `lane-guard.py` is STUBBED, not pinned: it has no host-independent seam to drive (`lane-status.py`
+# hard-codes `_CMUX_BIN_DIRS` with no env override), which is precisely why the stub `cmux` could never
+# reach it. ⛔ RESIDUAL, named rather than absorbed: on a host WITH `cmux` this arm used to execute the real
+# gate incidentally, and on CI it always did; after this change NO arm in this suite executes
+# `lane-guard.py`, so a regression in its busy/idle refusal ships with nothing red here. Tracked at #3524.
+printf 'import sys\nprint("REFUSED [0.0s] FIXTURE-GUARD: pane UNREADABLE — busy/idle UNKNOWN, not idle")\nsys.exit(3)\n' > "$TMP/bin/fake-guard.py"
 for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
   printf '#!/bin/sh\necho "CMUX_RAN $*" >> "$CMUX_LOG"\ncase "$1 $2" in "read-screen --workspace") echo "~/Documents/GitHub/agent-infra"; echo "  deepseek-flash %s";; esac\nexit 0\n' "$_budget" > "$TMP/bin/cmux"
   chmod +x "$TMP/bin/cmux"
   : > "$CMUX_LOG"
   PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" SAFE_SEND_DISPATCH=/bin/true \
+    SAFE_SEND_GUARD="$TMP/bin/fake-guard.py" \
     bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 pane-probe "$ALERT" --notice >"$TMP/probe.out" 2>&1; rc=$?
   if [ "$_budget" = '%/500k' ]; then
     grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; ck $? "negative control: a budget pi never draws (%/500k) is still REFUSED as 'no pi' (rc=$rc)"
@@ -440,7 +468,24 @@ for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
     # "pane UNREADABLE" and ALSO exits 3 — so an rc-only assertion cannot tell them apart, and a
     # probe that rejected the live footer would print the message this arm forbids.
     grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; [ $? -ne 0 ]; ck $? "the pane probe ACCEPTS the live footer budget ${_budget} (it does not report 'NO pi IN THIS PANE')"
-    grep -q 'pane UNREADABLE' "$TMP/probe.out"; ck $? "…and the refusal it DOES hit is the later busy/idle gate, so the probe admitted ${_budget}"
+    # ⛔ THE SENTINEL IS THE POINT: 'pane UNREADABLE' alone is emitted by the REAL `lane-guard.py` too, so a
+    # bare grep passes when `SAFE_SEND_GUARD` is ignored and the host's gate runs instead of the fixture.
+    # 'FIXTURE-GUARD:' is a string the real gate never prints, so this assertion can only be satisfied by
+    # the fixture the seam installed — re-run the seam-deletion mutation to confirm it goes red.
+    grep -q 'FIXTURE-GUARD: pane UNREADABLE' "$TMP/probe.out"; ck $? "…and the refusal it DOES hit is the FIXTURE busy/idle gate, so the probe admitted ${_budget}"
+    # ⛔ AND THE REFUSAL MUST REACH THE CALLER AS A REFUSAL. The two greps above are blind to the exit
+    # code, so a `safe-send.sh` that prints its busy/idle refusal and then reports SUCCESS is green
+    # everywhere — measured: mutating `safe-send.sh:189` `exit 3` → `exit 0` left this suite at an
+    # IDENTICAL `118 passed, 1 failed`. That is the regression worth catching, because the rc IS the
+    # verdict: `tools/fleet/outcome_canary.py:2944` renders it through `SAFE_SEND_RC`
+    # (`0: "DELIVERED (consumed)"`, `3: "REFUSED (lane busy or state unknown)"`), so a refusal that
+    # returned 0 would be recorded as delivered. (⛔ NOT `lane.sh`/`fix-one.sh`: they LAUNCH an agent and
+    # never send into a pane — `grep -c safe-send` is 0 in both, and `lane-status.py` records that
+    # `safe-send.sh` is manual-only now. Citing them here was a round-7 review finding.)
+    # `-eq 3` pins the CODE, not the identity of the refuser: the pane probe's own refusals are also 3
+    # (`safe-send.sh:130`, `:155`), and so is the real host gate's — which is why WHICH gate refused is
+    # settled by the `FIXTURE-GUARD:` sentinel above and only there.
+    [ "$rc" -eq 3 ]; ck $? "…and the busy/idle refusal is a REFUSAL to the caller (3), never a success (rc=$rc)"
   fi
 done
 
