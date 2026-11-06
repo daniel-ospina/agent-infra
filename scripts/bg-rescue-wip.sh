@@ -58,16 +58,33 @@
 # copy is a second answer, and the whole point of this file is that a FAILED status is never read as
 # `clean`. Exit in that mode: 0 = clean, 1 = dirty, 2 = CANNOT VERIFY (unmeasured — never "nothing to
 # rescue"), and every path this file cannot resolve is 2 as well, because a worktree it cannot read is
-# unmeasured. (A MISSING ARGUMENT is not one of those cases: `${1:?}` is the shell's own usage failure
-# and exits 1 in both modes.)
+# unmeasured. ⛔ THE USAGE FAILURES ARE 2 TOO, INCLUDING A MISSING ARGUMENT: `1` in this mode already
+# means `dirty`, so no refusal of any kind may answer with it — an exit-code reader would otherwise read
+# "dirty" (or, worse, 0 = clean) out of an invocation that answered nothing. The ordinary mode keeps its
+# shipped codes untouched: a missing argument there is still the shell's own usage failure, exit 1.
+#
+# `--slug <branch>` and `--verdict` are both READ-ONLY modes that return before any archive work, and
+# they are MUTUALLY EXCLUSIVE: combining them is a usage error (2 under `--verdict`), never a silent
+# answer to the other question at the wrong exit code.
 set -uo pipefail
 
 # Two ADDITIVE read-only modes, each of which returns before any archive work (#3484's `--slug`, and
-# #3485's `--verdict`). They are parsed here, in order, so either can be the first argument; neither
-# moves the ordinary mode's exit codes.
+# #3485's `--verdict`). They are MUTUALLY EXCLUSIVE and each is parsed once, so neither can silently
+# answer the other's question. Neither moves the ordinary mode's exit codes.
 VERDICT_ONLY=0
-if [ "${1:-}" = "--verdict" ]; then VERDICT_ONLY=1; shift; fi
-WT="${1:?usage: bg-rescue-wip.sh [--verdict] <worktree> [note] | bg-rescue-wip.sh --slug <branch>}"
+case "${1:-}" in
+  --verdict) VERDICT_ONLY=1; shift ;;
+esac
+
+# A USAGE FAILURE IS 1 IN THE ORDINARY MODE (shipped, must not move) AND 2 UNDER `--verdict`, whose 1
+# already means `dirty`. One helper, so no refusal can answer with a verdict code it does not own.
+usage_fail() {
+  echo "usage: bg-rescue-wip.sh [--verdict] <worktree> [note] | bg-rescue-wip.sh --slug <branch>" >&2
+  [ "$VERDICT_ONLY" -eq 1 ] && exit 2
+  exit 1
+}
+[ -n "${1:-}" ] || usage_fail
+WT="$1"
 NOTE="${2:-a lane hit its cap}"
 
 # ── THE REF SLUG, AND ITS ONE HOME (agent-infra#3484) ───────────────────────────────────
@@ -115,6 +132,10 @@ wip_ref_parts() { # wip_ref_parts <branch>
 # `--slug <branch>`: print the ref component for a branch and nothing else — the ONE derivation, so a
 # reader cannot disagree with the writer about which ref exists.
 if [ "${1:-}" = "--slug" ]; then
+  # ⛔ THE MODES ARE EXCLUSIVE. `--verdict --slug x` used to fall through to this branch (the verdict
+  # shift left `--slug` as $1), answer the SLUG question, and exit 0 — which in verdict mode means
+  # `clean`. A refusal, so it cannot be read as an answer either way.
+  [ "$VERDICT_ONLY" -eq 0 ] || usage_fail
   case "${2:-}" in ''|--*) echo "usage: bg-rescue-wip.sh --slug <branch>" >&2; exit 1 ;; esac
   wip_ref_parts "$2"
   printf '%s\n' "$SLUG"
@@ -225,21 +246,25 @@ wip_ref_parts "$BR"   # sets WIP_ISSUE and SLUG — ONE derivation, shared with 
 # `cannot-verify`. A sweeper that re-derived that rule from its own `git status` would be a second
 # implementation of it — and the day one of them drifts, the sweeper silently archives nothing and
 # reports a clean fleet. So there is exactly one classifier and this is its read-only mode.
-# ONE LINE, machine-readable, with the classifier's OWN branch and slug so a caller never re-derives
-# the ref name (`SLUG` is the ref component this file actually pushes under, §6).
+# ONE LINE, machine-readable, with the classifier's OWN branch, slug AND ISSUE so a caller never
+# re-derives any of them (`SLUG` is the ref component this file actually pushes under, §6, and
+# `WIP_ISSUE` is what `wip_ref_parts` read out of the branch — the SAME derivation the ref name came
+# from, so the index can never assert a link the ref does not carry). `issue=-` when the branch carries
+# none: the caller reports that, and must not invent a number of its own.
+#
+# `paths=` is deliberately ABSENT on `cannot-verify`: an unenumerated tree has NO path count, and
+# printing 0 there is the exact "empty = clean" confusion this mode exists to remove.
 if [ "$VERDICT_ONLY" -eq 1 ]; then
-  # `paths=` is deliberately ABSENT on `cannot-verify`: an unenumerated tree has NO path count, and
-  # printing 0 there is the exact "empty = clean" confusion this mode exists to remove.
   if [ "$AT_RISK" -eq 0 ]; then
-    echo "verdict=clean paths=0 branch=$BR slug=$SLUG"
+    echo "verdict=clean paths=0 branch=$BR slug=$SLUG issue=${WIP_ISSUE:--}"
     exit 0
   fi
   if [ "$ST_RC" -ne 0 ] || [ "$ENUM_INCOMPLETE" -eq 1 ]; then
-    echo "verdict=cannot-verify branch=$BR slug=$SLUG"
+    echo "verdict=cannot-verify branch=$BR slug=$SLUG issue=${WIP_ISSUE:--}"
     exit 2
   fi
   N_VERDICT_PATHS="$(printf '%s\n' "$ST_OUT" | grep -c '' 2>/dev/null || true)"
-  echo "verdict=dirty paths=${N_VERDICT_PATHS:-?} branch=$BR slug=$SLUG"
+  echo "verdict=dirty paths=${N_VERDICT_PATHS:-?} branch=$BR slug=$SLUG issue=${WIP_ISSUE:--}"
   exit 1
 fi
 

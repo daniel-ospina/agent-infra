@@ -813,6 +813,23 @@ case "$OVO" in
   *" slug=fix-lane-one"*) ok "V3 the verdict carries the file's OWN slug, so a caller never re-derives the ref name" ;;
   *) bad "V3 the verdict did not carry slug=: $OVO" ;;
 esac
+# ⛔ THE ISSUE TRAVELS WITH THE SLUG, FROM THE SAME DERIVATION (review finding P2). `wip_ref_parts`
+# already answers "which issue does this branch name" to build the ref, so `--verdict` reports that
+# answer instead of letting every caller re-derive it — a second rule disagreed with the ref in both
+# directions (`fix/lane-3485` claimed 3485 over a ref carrying none; `fix/1-x` claimed nothing over a
+# ref carrying `issue-1-x`). V3b pins that the two fields AGREE; V3c pins the non-typed branch says `-`.
+case "$OVO" in
+  *" issue=-"*) ok "V3b an untyped branch reports issue=- (the field exists, and claims no link)" ;;
+  *) bad "V3b the verdict carries no issue= field: $OVO" ;;
+esac
+mk_repo viss fix/4242-vissue || { echo "❌ fixture failed (viss)"; exit 1; }
+printf 'wip\n' >> "$T/viss/wt/base.txt"
+OVO="$(bash "$RR" --verdict "$T/viss/wt" 2>&1)"; RCVO=$?
+case "$OVO" in
+  *" slug=issue-4242-vissue issue=4242"*)
+    ok "V3c a typed branch reports slug=issue-4242-vissue AND issue=4242 — one derivation supplies both" ;;
+  *) bad "V3c slug= and issue= disagree with each other: $OVO" ;;
+esac
 # The mode must not archive: no ref may exist after a verdict run on a dirty tree.
 [ -z "$(ref_of "$V/origin.git" refs/wip/fix-lane-one)" ] \
   && ok "V4 --verdict archived NOTHING (it returns before §3: no tree, no commit, no push)" \
@@ -837,6 +854,28 @@ bash "$RR" "$V/origin.git" >/dev/null 2>&1; RCVO=$?
 [ "$RCVO" -eq 1 ] \
   && ok "V7 plain mode still exits 1 for a non-worktree — the mode is ADDITIVE, no shipped code moved" \
   || bad "V7 plain-mode exit code moved for a non-worktree (rc=$RCVO, want 1)"
+
+# ── V8/V9: NO REFUSAL MAY ANSWER WITH A VERDICT CODE (review finding P2) ────────────────────────
+# `0` means clean and `1` means dirty in this mode, so an invocation that answered NOTHING must not
+# exit 0 or 1 — an exit-code reader would read a verdict out of a refusal. Both were measured on the
+# rebased tree: `--verdict --slug fix/x` fell through to the --slug branch and exited 0 ("clean"), and
+# `--verdict` with no path died on `${1:?}` with 1 ("dirty").
+OVO="$(bash "$RR" --verdict --slug fix/3485-x 2>&1)"; RCVO=$?
+[ "$RCVO" -eq 2 ] \
+  && ok "V8a --verdict --slug is REFUSED with 2 (the modes are exclusive, not silently re-ordered)" \
+  || bad "V8a --verdict --slug exited $RCVO (want 2 — 0 would read as 'clean'): $OVO"
+case "$OVO" in
+  *verdict=*) bad "V8b the refusal still printed a verdict= line: $OVO" ;;
+  *) ok "V8b …and it prints no verdict= line, so nothing can read it as an answer" ;;
+esac
+bash "$RR" --verdict >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 2 ] \
+  && ok "V9 a MISSING ARGUMENT under --verdict exits 2 (cannot-verify), never 1 (= dirty)" \
+  || bad "V9 --verdict with no path exited $RCVO (want 2, never 1)"
+bash "$RR" >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 1 ] \
+  && ok "V9b …while the ORDINARY mode keeps its shipped exit 1 for a missing argument" \
+  || bad "V9b plain-mode missing-argument exit moved (rc=$RCVO, want 1)"
 
 echo; echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

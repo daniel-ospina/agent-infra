@@ -269,8 +269,13 @@ fi
 # out of the library resolution with NO `status=`/`rc=` line at all.
 # ⛔ BUT THE SEAMS IT **DOES** DEPEND ON ARE STILL VALIDATED, with the same rules as pass mode — a zero
 # staleness window would make a 1970 record read `ok`, and a zero watchdog means this box cannot sweep at
-# all, so a reader that answered `ok` there would be the stale-green class again. Those two refusals are
-# config errors (exit 2, exactly as in pass mode); everything else the reader can answer from the record.
+# all, so a reader that answered `ok` there would be the stale-green class again. Those refusals keep
+# their VALIDATION but answer on the READER's own surface — `status=failed` / `rc=3`, through
+# `refuse_startup`, which is what the doc and arms R2/R3 pin — while pass mode keeps its own exit 2. A
+# reader that exited 2 here would fail the contract an instrument reads (`status=`/`rc=` on every run),
+# which is precisely the bug the paragraph above is about. FOUR seams are validated, not two:
+# `WIP_SWEEP_BUDGET`, `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT`, `WIP_SWEEP_STALE_SECONDS`;
+# everything else the reader can answer from the record.
 STALE_SECONDS="${WIP_SWEEP_STALE_SECONDS:-86400}"
 STATUS_TIMEOUT="${WIP_SWEEP_STATUS_TIMEOUT:-60}"
 RESCUE_TIMEOUT="${WIP_SWEEP_RESCUE_TIMEOUT:-300}"
@@ -494,18 +499,26 @@ N_SEEN=0; N_CLEAN=0; N_SKIPPED=0; N_DIRTY=0; N_ARCHIVED=0; N_DEFERRED=0; N_UNMEA
 DETAIL=""
 FAILED=0   # latched: once this pass has failed to measure or to archive, it never ends clean
 
-# issue_of <branch> — the first 2-8 digit run, or "" (see THE INDEX above for what it is for).
-# ⛔ A DETACHED HEAD IS NOT AN ISSUE LINK (review finding). `bg-rescue-wip.sh` synthesises
-# `detached-<short-sha>` as the branch for a detached worktree, and the 2-8 digit run below matches HEX:
-# `detached-a1234bc` reported `issue=1234` and `detached-45df0df` reported `issue=45`, so the index
-# asserted a false attribution AND the `NO ISSUE LINK` report never fired — on a worktree shape that
-# really occurs (a bisect, a review checkout). The synthetic branch is excluded by name.
-issue_of() {
-  local b="$1"
-  case "$b" in detached-*|'-'|'') return 0 ;; esac
-  if [[ "$b" =~ (^|[^0-9])([0-9]{2,8})([^0-9]|$) ]]; then
-    printf '%s' "${BASH_REMATCH[2]}"
-  fi
+# ⛔ THE ISSUE HAS ONE HOME, AND IT IS NOT HERE (review finding P2). This function used to scan the
+# branch for "the first 2-8 digit run" while `bg-rescue-wip.sh`'s `wip_ref_parts` trusts only a
+# `<type>/<N>` prefix — TWO rules, so two answers, on the surface #3484 exists to make trustworthy:
+#   `fix/lane-3485` → classifier slug `fix-lane-3485` (NO issue link, and #3484's report fires) but this
+#                     scan said `3485`, so the index asserted a link the ref does not carry AND the
+#                     `NO ISSUE LINK` line never fired;
+#   `fix/1-x`       → classifier `issue-1-x` (carries the link) but this scan required 2+ digits, said
+#                     "", and reported a link that IS there as missing.
+# The classifier now prints `issue=` next to `slug=`, derived by the SAME `wip_ref_parts` that named the
+# ref, and this script reads that field. A caller that re-derives cannot agree with the writer by
+# accident; here it never re-derives at all.
+#
+# ⛔ AND A MISSING FIELD NEVER BECOMES A LINK. An older or substituted classifier that prints no
+# `issue=` is read as `issue=-`, which UNDER-claims (loud report, `no_issue=N`) — the direction that
+# costs a report, never the direction that asserts a mapping nothing backs.
+issue_from_verdict() { # reads the classifier's own `issue=` field from the verdict line
+  local v
+  v="$(printf '%s\n' "$1" | sed -n 's/.* issue=\([^ ]*\).*$/\1/p' | head -1)"
+  case "$v" in ''|'-') return 0 ;; esac
+  printf '%s' "$v"
 }
 
 # record <repo> <path> <branch> <head> <verdict> <paths> <age_h> <issue> <ref> <note> [unpushed]
@@ -635,7 +648,7 @@ examine() {
   [ "$br" = "-" ] && br=""
   [ -n "$br" ] || br="${bref#refs/heads/}"
   [ -n "$br" ] || br="-"
-  issue="$(issue_of "$br")"
+  issue="$(issue_from_verdict "$vout")"
 
   if [ "$verdict" = cannot-verify ]; then
     N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1

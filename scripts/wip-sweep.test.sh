@@ -242,7 +242,7 @@ git -C "$T/bud/wt" worktree add -q "$T/bud/w2" -b fix/3485-bud-b 2>/dev/null
 git -C "$T/bud/wt" worktree add -q "$T/bud/w3" -b fix/3485-bud-c 2>/dev/null
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
-  '  *" --verdict "*) sleep 2; echo "verdict=clean paths=0 branch=x slug=x"; exit 0 ;;' \
+  '  *" --verdict "*) sleep 2; echo "verdict=clean paths=0 branch=x slug=x issue=-"; exit 0 ;;' \
   'esac' \
   'exit 0' > "$T/stub-slow.sh"
 chmod +x "$T/stub-slow.sh"
@@ -332,7 +332,7 @@ mk_fixture toc fix/3485-toc || { echo "❌ fixture failed (toc)"; exit 1; }
 STUB="$T/stub-rescue.sh"
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
-  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-toc slug=fix-3485-toc"; exit 1 ;;' \
+  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-toc slug=issue-3485-toc issue=3485"; exit 1 ;;' \
   'esac' \
   'exit 0' > "$STUB"
 chmod +x "$STUB"
@@ -351,7 +351,7 @@ grep -q '^archived=0$' "$T/state-toc/wip-sweep.status" 2>/dev/null \
 mk_fixture tcu fix/3485-tcu || { echo "❌ fixture failed (tcu)"; exit 1; }
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
-  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-tcu slug=fix-3485-tcu"; exit 1 ;;' \
+  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-tcu slug=issue-3485-tcu issue=3485"; exit 1 ;;' \
   'esac' \
   'exit 0' > "$T/stub-rescue2.sh"
 chmod +x "$T/stub-rescue2.sh"
@@ -399,6 +399,53 @@ ISSUECOL="$(awk -F'\t' '$4 ~ /^detached-/ {print $9; exit}' "$T/state-det/wip-sw
 [ "$ISSUECOL" = "-" ] \
   && ok "F5c the detached row records issue=- (no number fabricated out of the short sha)" \
   || bad "F5c the detached row carries an issue it cannot have: '$ISSUECOL'"
+
+# ⛔ THE ISSUE HAS ONE HOME: the CLASSIFIER'S answer, not a regex of our own (review finding P2).
+# The index used to scan the branch for "the first 2-8 digit run" while `wip_ref_parts` trusts only a
+# `<type>/<N>` prefix — so the two rules disagreed, in BOTH directions, on the surface #3484 exists to
+# make trustworthy. Each direction is pinned against the REAL classifier, because a stub would only
+# prove that our stub and our parser agree.
+#
+# DIRECTION 1 — OVER-CLAIM: digits that are NOT in the `<type>/<N>` position. The ref carries no issue,
+# so the index must not assert one, and #3484's report MUST fire.
+mk_fixture ovc fix/lane-3485 || { echo "❌ fixture failed (ovc)"; exit 1; }
+printf 'work\n' >> "$T/ovc/wt/base.txt"
+O="$(sweep "$T/state-ovc" --apply --repo "$T/ovc/wt" 2>&1)"; RC=$?
+has "$O" 'NO ISSUE LINK' \
+  && ok "F6 a branch whose digits are not in <type>/<N> position is REPORTED as unlinked (no invented link)" \
+  || bad "F6 an unlinkable branch was silently given an issue: $O"
+OVCCOL="$(awk -F'\t' '$4 == "fix/lane-3485" {print $9; exit}' "$T/state-ovc/wip-sweep.tsv" 2>/dev/null)"
+[ "$OVCCOL" = "-" ] \
+  && ok "F6b …and the index records issue=- — it does not assert a link the ref does not carry" \
+  || bad "F6b the index asserted issue='$OVCCOL' for a ref that carries none"
+grep -q '^no_issue=1$' "$T/state-ovc/wip-sweep.status" 2>/dev/null \
+  && ok "F6c …and no_issue counts it, so the pass record does not hide the gap" \
+  || bad "F6c no_issue did not count an unlinkable branch"
+# DIRECTION 2 — UNDER-CLAIM: a SINGLE-digit issue is still a typed link. The old 2-8 digit floor said
+# "no link" about a ref that plainly carries one.
+mk_fixture unc fix/1-x || { echo "❌ fixture failed (unc)"; exit 1; }
+printf 'work\n' >> "$T/unc/wt/base.txt"
+O="$(sweep "$T/state-unc" --apply --repo "$T/unc/wt" 2>&1)"; RC=$?
+has "$O" 'NO ISSUE LINK' \
+  && bad "F7 a branch that DOES carry an issue was reported as unlinked: $O" \
+  || ok "F7 a single-digit issue is a link — no false NO ISSUE LINK report"
+UNCCOL="$(awk -F'\t' '$4 == "fix/1-x" {print $9; exit}' "$T/state-unc/wip-sweep.tsv" 2>/dev/null)"
+[ "$UNCCOL" = "1" ] \
+  && ok "F7b the index records the classifier's issue=1 for fix/1-x" \
+  || bad "F7b the index recorded issue='$UNCCOL' for fix/1-x (want 1)"
+# DIRECTION 3 — FAIL-CLOSED on a classifier that prints no `issue=` at all. The field is the only thing
+# that may create a link, so its ABSENCE must under-claim (report) rather than fall back to a scan.
+STUB_NOISS="$T/stub-noissue.sh"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-3435 slug=issue-3485-3435"; exit 1 ;;' \
+  'esac' 'exit 0' > "$STUB_NOISS"
+chmod +x "$STUB_NOISS"
+O="$(WIP_SWEEP_RESCUE="$STUB_NOISS" sweep "$T/state-noiss" --apply --repo "$T/acc/wt" 2>&1)"; RC=$?
+NOISCOL="$(awk -F'\t' '$4 == "fix/3485-3435" {print $9; exit}' "$T/state-noiss/wip-sweep.tsv" 2>/dev/null)"
+[ "$NOISCOL" = "-" ] \
+  && ok "F8 a classifier that prints NO issue= field yields issue=- (under-claim, never a fallback scan)" \
+  || bad "F8 a missing issue= field produced issue='$NOISCOL' — a second rule crept back in"
 
 
 # ── G) NO REPO / NO DELEGATE: REFUSE, NEVER "NOTHING TO RESCUE" ───────────────────────────────────
@@ -589,7 +636,7 @@ O="$(cd "$T" && WIP_SWEEP_BUDGET=0 WIP_SWEEP_STATE_DIR="$T/state-bd0" bash "$SW"
 mk_fixture mk fix/3485-mk || { echo "x fixture failed (mk)"; exit 1; }
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
-  '  *" --verdict "*) sleep 3; echo "verdict=clean paths=0 branch=x slug=x"; exit 0 ;;' \
+  '  *" --verdict "*) sleep 3; echo "verdict=clean paths=0 branch=x slug=x issue=-"; exit 0 ;;' \
   'esac' \
   'exit 0' > "$T/stub-slow2.sh"
 chmod +x "$T/stub-slow2.sh"
@@ -717,7 +764,7 @@ mk_fixture rto fix/3485-rto || { echo "❌ fixture failed (rto)"; exit 1; }
 printf 'uncommitted edit\n' >> "$T/rto/wt/base.txt"
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
-  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-rto slug=fix-3485-rto"; exit 1 ;;' \
+  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-rto slug=issue-3485-rto issue=3485"; exit 1 ;;' \
   'esac' \
   'sleep 10' \
   'exit 0' > "$T/stub-hang.sh"
