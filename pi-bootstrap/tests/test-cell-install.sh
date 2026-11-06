@@ -1685,7 +1685,15 @@ run_verify
 # spelling was kept, marked, and printed `SELFHOSTED:` rc=0 beside a note saying "a self-hosted
 # daemon needs none" about the HOSTED host. WHATWG drops a default port (`new URL(':443')` href is the
 # canonical form), so the two spellings ARE one endpoint; `endpoint_key()` is that identity.
-for _SPELL in "https://api.premiselabs.co:443/mcp/" "https://api.premiselabs.co:/mcp/"; do
+# ⛔ AND A LEADING ZERO IS THE SAME PORT (#3374 round 12 residual, found by adversarial measurement AFTER
+# the fix above): `new URL('https://api.premiselabs.co:0443/mcp/').href` is the CANONICAL hosted url —
+# the parser reads the DIGITS — so `:0443` and `:00443` were the hosted endpoint spelled differently and
+# still took the self-host exemption: measured pre-fix, install PRESERVED `:0443` + marked `_selfHosted`
+# + `--verify` certified `SELFHOSTED:`, beside a `${SOME_OTHER_VAR}` header that expands to an EMPTY
+# Bearer. Both spellings are in the loop, because a rule that only normalises the spelling its author
+# typed is the class this PR keeps closing.
+for _SPELL in "https://api.premiselabs.co:443/mcp/" "https://api.premiselabs.co:/mcp/" \
+             "https://api.premiselabs.co:0443/mcp/" "https://api.premiselabs.co:00443/mcp/"; do
   python3 - "$DEST/.mcp.json" "$_SPELL" <<'PY'
 import json, sys
 p, spell = sys.argv[1], sys.argv[2]
@@ -1708,33 +1716,49 @@ sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/"
          and t.get("headers", {}).get("Authorization") == "Bearer ${TORTOISE_MCP_API_KEY}" else 1)
 PY
   run_verify
-  [ $? -eq 0 ] && ok "...and --verify CERTIFIES what install wrote — the repair loop converges on the hosted credential" \
-    || fail "--verify refuses the entry install just produced from a default-port spelling — verify -> install -> verify never converges"
+  # ⛔ AN rc-ONLY ASSERTION HERE IS GREEN WITH THE FIX REVERTED (#3374 review, round 12 P2). Pre-fix,
+  # `--verify` answered `SELFHOSTED:<the :443 spelling>` rc=0 for an entry STILL carrying
+  # `${SOME_OTHER_VAR}`, so `[ $? -eq 0 ]` reported convergence on exactly the bypass. The marker is
+  # the property: the canonical endpoint CERTIFIED, and no exemption claimed for a hosted url.
+  [ $? -eq 0 ] && grep -qF 'OK:https://api.premiselabs.co/mcp/:${TORTOISE_MCP_API_KEY}' "$LOG" \
+    && ! grep -qE 'SELFHOSTED:' "$LOG" \
+    && ok "...and --verify CERTIFIES what install wrote — the repair loop converges on the hosted credential" \
+    || fail "--verify did not certify the canonical hosted entry install just produced from a default-port spelling (or certified it as a SELF-HOST) — verify -> install -> verify never converges on the hosted credential"
 done
 # …and the CONTROL: a NON-default port is a genuinely different endpoint. It must stay a preserved,
 # named self-host — so the arm above cannot pass by deleting the self-host exemption outright (that
 # would repoint every operator's own daemon, the silent-repoint defect this file's rule 3 forbids).
-python3 - "$DEST/.mcp.json" <<'PY'
+# ⛔ THE CONTROL IS A LOOP FOR THE SAME REASON THE ARM IS: the leading-zero fix above normalises the
+# PORT DIGITS, so a leading-zero NON-default port must still be a DIFFERENT endpoint (`:08443` is the
+# operator's daemon on 8443, not a typo of anything). A control that only ever proved `:8443` would be
+# green over a rule that had started eating `:08443` as well.
+for _OWN in "8443" "08443"; do
+python3 - "$DEST/.mcp.json" "$_OWN" <<'PY'
 import json, sys
-p = sys.argv[1]
+p, port = sys.argv[1], sys.argv[2]
 d = json.load(open(p))
 d["mcpServers"]["tortoise"] = {
     "type": "http",
-    "url": "https://api.premiselabs.co:8443/mcp/",
+    "url": "https://api.premiselabs.co:%s/mcp/" % port,
     "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
 }
 json.dump(d, open(p, "w"), indent=2)
 PY
 run_install
-python3 - "$DEST/.mcp.json" <<'PY' && ok "…while a NON-DEFAULT port (8443) is still PRESERVED and marked a self-host (the rule was narrowed to DEFAULT ports, not disabled)" \
-  || fail "install repointed an operator's own daemon on a non-default port — a non-default port IS part of the endpoint, and repointing it is the silent-repoint defect this merge exists to prevent"
-import json, sys
+python3 - "$DEST/.mcp.json" "$_OWN" <<'PY' && ok "…while a NON-DEFAULT port ($_OWN) is still PRESERVED and marked a self-host (the rule was narrowed to DEFAULT ports, not disabled)" \
+  || fail "install repointed an operator's own daemon on a non-default port ($_OWN) — a non-default port IS part of the endpoint, and repointing it is the silent-repoint defect this merge exists to prevent"
+import json, re, sys
 t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
-sys.exit(0 if t.get("url") == "https://api.premiselabs.co:8443/mcp/" and t.get("_selfHosted") else 1)
+m = re.match(r"^https://api\.premiselabs\.co:(\d+)/mcp/$", t.get("url") or "")
+# The BYTES are preserved as written (a merge never rewrites an operator's daemon), so the port is
+# compared NUMERICALLY — that is the same rule `endpoint_key` applies, and it is what makes `08443`
+# and `8443` the one endpoint they are.
+sys.exit(0 if m and int(m.group(1)) == int(sys.argv[2]) and t.get("_selfHosted") else 1)
 PY
 run_verify
 [ $? -eq 0 ] && ok "...and --verify certifies it BY NAME (SELFHOSTED:)" \
-  || fail "--verify refused a preserved non-default-port self-host — install and verify disagree about one file"
+  || fail "--verify refused a preserved non-default-port self-host ($_OWN) — install and verify disagree about one file"
+done
 run_install >/dev/null 2>&1
 # ⛔ THE MARKER THAT FIRES FOR THE COMMON CASE ECHOED THE RAW URL (#3374 review, round 12 P2), and a
 # url may carry a userinfo PASSWORD. `URL_NOT_DEFAULT` is the arm an operator sees whenever an entry
@@ -1785,10 +1809,46 @@ rc=$?
   && ok "WRONG_AUTH names the VARIABLE and withholds everything after it (a trailing literal, which redact() never sees, stayed in the log)" \
   || fail "WRONG_AUTH echoed the header verbatim into the log (rc=$rc) — a credential that is not tt_/tk_-shaped still lands in a pasted log"
 run_install >/dev/null 2>&1
+# ⛔ THE LEAK ALSO SAT ONE BRANCH OVER, ON THE BRANCH THAT FIRES FOR A *CORRECT* CONFIG (#3374 review,
+# round 12 P2). The success marker printed the Authorization header VERBATIM, and `HOSTED_AUTH`
+# admits `${VAR:-<anything>}` — a spelling the client really supports (`extensions/mcp-client/index.ts`:
+# "${VAR:-default}", expanded recursively) — so a literal DEFAULT is a value that reaches the wire and
+# it went into BOTH the `--verify` and the `--install` log. Measured pre-fix:
+# `OK:https://api.premiselabs.co/mcp/:Bearer ${TORTOISE_MCP_API_KEY:-hunter2NOTATOKEN}` rc=0.
+python3 - "$DEST/.mcp.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselabs.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY:-hunter2NOTATOKEN}"},
+}
+json.dump(d, open(p, "w"), indent=2)
+PY
+run_verify
+rc=$?
+[ "$rc" -eq 0 ] && grep -qE 'OK:https://api.premiselabs.co/mcp/' "$LOG" && ! grep -qF 'hunter2NOTATOKEN' "$LOG" \
+  && ok "the OK: marker reports WHICH VARIABLE and withholds a \${VAR:-default}'s literal — a supported spelling whose default is a real credential (rc=$rc)" \
+  || fail "the success marker echoed the Authorization header verbatim (rc=$rc) — a \${VAR:-literal} default landed in a bring-up log that gets pasted into issues"
+run_install >/dev/null 2>&1
 # ⛔ THE INSTALL SUMMARY CLAIMED "hosted" OVER A SELF-HOST TEMPLATE (#3374 review, round 12 P3).
 # `merge_tortoise_is_hosted` compared the written file against the TEMPLATE's url, so a cell correctly
 # matching its own `localhost` daemon satisfied it and the log said "hosted tortoise entry installed"
 # about an entry pointing at localhost — the same false-sentence class round 11 fixed one file over.
+# ⛔ AND THE FIXTURE MUST ACTUALLY PLANT THAT STATE (#3374 review, round 12 P2). The first version of
+# this arm ran over a `.mcp.json` that still held the HOSTED url, and BOTH predicates answer 1 for it
+# (pre-fix: have==want; post-fix: want is not hosted), so the arm printed `ok` against the PRE-FIX
+# code — it was measuring its own silence. Planting the entry at the template's own url makes it
+# discriminating: measured, pre-fix prints "hosted tortoise entry installed" (RED) and the fix prints
+# "NOT the hosted default" (green).
+python3 - "$DEST/.mcp.json" "$SELFTPL/templates/.mcp.base.json" <<'PY'
+import json, sys
+p, tpl = sys.argv[1], sys.argv[2]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"] = dict(json.load(open(tpl))["mcpServers"]["tortoise"])
+json.dump(d, open(p, "w"), indent=2)
+PY
 run_install_root "$SELFTPL" >/dev/null 2>&1
 ! grep -q 'hosted tortoise entry installed' "$LOG" \
   && grep -q 'NOT the hosted default' "$LOG" \
@@ -2401,6 +2461,72 @@ PY
     fail "a self-host template installed but \`--verify\` answered '${_mk}' (rc=$_mrc) — install wrote a file verify refuses, so verify → install → verify can never converge"
   fi
 done
+# ⛔ THE SELF-HOST EXEMPTION USED TO REACH THE HOSTED ENDPOINT ITSELF, AND THAT IS A FALSE PASS
+# (#3374 review, round 12 P2). Both paths into `_selfhosted_shape` ask about the TEMPLATE and the
+# marker; neither asked whether the url IS the hosted endpoint. So with a self-host TEMPLATE, a
+# `_selfHosted`-marked entry AT the hosted url — a marker `merge-mcp.py` minted itself, see the arm
+# below — was certified `SELFHOSTED:` rc=0 without ever reading its credential. Measured pre-fix:
+# `SELFHOSTED:https://api.premiselabs.co/mcp/` rc=0 over `Bearer ${SOME_OTHER_VAR}` (an EMPTY Bearer),
+# while the SAME file against the shipped template is refused `WRONG_AUTH`. The endpoint decides, not
+# the marker and not the template — so the marker must not exonerate it.
+_sha_marked="$TMP/selfhost-marked-hosted.json"
+python3 - "$ROOT/templates/.mcp.base.json" "$_sha_marked" 'Bearer ${SOME_OTHER_VAR}' <<'PY'
+import json, sys
+base, out, auth = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(base))
+t = d["mcpServers"]["tortoise"]
+t["headers"] = {"Authorization": auth}
+t["_selfHosted"] = True          # the marker the merge used to mint, and the verifier used to honour
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(out, "w"), indent=2)
+PY
+_mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_sha_marked" "$SELFTPL/templates/.mcp.base.json" 2>&1)"; _mrc=$?
+[ "$_mrc" -eq 1 ] && grep -qF 'WRONG_AUTH:' <<<"$_mk" \
+  && ok "a _selfHosted-marked entry AT THE HOSTED URL still needs the hosted credential — the exemption does not exonerate the endpoint that requires it" \
+  || fail "--verify certified the HOSTED endpoint as a SELF-HOST (rc=$_mrc, '${_mk}') — a marker or a self-host template can exempt the hosted url from its own credential check, so an empty Bearer is certified LAYER VERIFIED"
+# …and the FALSE-BLOCK direction: the same marked shape WITH the hosted credential is certified, so
+# the fix is "the hosted endpoint is judged as the hosted endpoint", not "a marked entry is refused".
+python3 - "$_sha_marked" <<'PY'
+import json, sys
+p = sys.argv[1]
+d = json.load(open(p))
+d["mcpServers"]["tortoise"]["headers"] = {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}
+json.dump(d, open(p, "w"), indent=2)
+PY
+_mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_sha_marked" "$SELFTPL/templates/.mcp.base.json" 2>&1)"; _mrc=$?
+[ "$_mrc" -eq 0 ] && grep -qF 'OK:https://api.premiselabs.co/mcp/:${TORTOISE_MCP_API_KEY}' <<<"$_mk" \
+  && ok "…and WITH the hosted credential the same marked entry is certified normally (the rule is not 'refuse anything marked')" \
+  || fail "--verify refused a marked entry that carries the hosted endpoint AND the hosted credential (rc=$_mrc, '${_mk}') — that is a false block on a config that works"
+# ⛔ THE PRODUCER OF THAT MARKER, ON THE REAL MERGE PATH (#3374 review, round 12 P2). With a SELF-HOST
+# template, the merge's `elif ok_entry` branch marked ANY url differing from the template — including
+# the HOSTED one, printing "kept this machine's own tortoise url (https://api.premiselabs.co/mcp/)".
+# Measured pre-fix: `_selfHosted: true` written onto the hosted url, and `--verify` then took the
+# exemption. The hosted endpoint is never "this machine's own", so it is never marked — and the pair
+# must CONVERGE: the file the merge writes is one `--verify` certifies.
+_shm_dst="$TMP/selfhost-marked-merge.json"; rm -f "$_shm_dst"
+python3 - "$ROOT/templates/.mcp.base.json" "$_shm_dst" <<'PY'
+import json, sys
+base, out = sys.argv[1], sys.argv[2]
+d = json.load(open(base))
+d["mcpServers"]["tortoise"] = {
+    "type": "http",
+    "url": "https://api.premiselabs.co/mcp/",
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"},
+}
+json.dump(d, open(out, "w"), indent=2)
+PY
+python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$SELFTPL/templates/.mcp.base.json" "$_shm_dst" --cell > "$TMP/selfhost-marked-merge.out" 2>&1
+rc=$?
+python3 - "$_shm_dst" <<'PY' && ok "…so a self-host template does NOT mark this cell's HOSTED entry _selfHosted, and the sentence no longer calls the hosted url 'this machine's own'" \
+  || fail "install marked the HOSTED url _selfHosted under a self-host template — that marker is what let --verify skip the hosted credential check, and the NOTE called the hosted endpoint 'this machine's own'"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" and not t.get("_selfHosted") else 1)
+PY
+_mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_shm_dst" "$SELFTPL/templates/.mcp.base.json" 2>&1)"; _mrc=$?
+[ "$_mrc" -eq 0 ] && grep -qF 'OK:https://api.premiselabs.co/mcp/:${TORTOISE_MCP_API_KEY}' <<<"$_mk" \
+  && ok "…and the file that merge just wrote is one --verify CERTIFIES (verify -> install -> verify converges, rather than repairing a certification into a refusal or back)" \
+  || fail "the merge wrote a file --verify refuses (rc=$_mrc, '${_mk}') — a self-hosting checkout could never bring a hosted cell up"
 # ⛔ THE HOSTED DEFAULT IS NOW A DEFINED FACT IN TWO LANGUAGES (and in THREE assignments), SO PIN
 # EVERY ONE OF THEM TO THE ARTIFACT IT NAMES. `HOSTED_DEFAULT_URL` in merge-mcp.py and in
 # cell-install.sh's verifier, plus `GRAPH_HOSTED_DEFAULT_URL` in cell-install.sh's BASH, must all equal

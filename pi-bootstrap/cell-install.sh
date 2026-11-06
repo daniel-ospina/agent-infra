@@ -927,6 +927,12 @@ def _endpoint_key(u):
     # takes the hosted path and skips the arm that refuses userinfo outright.
     authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT — `:0443` IS `:443` (MUST MATCH `merge-mcp.py`,
+    # which carries the full rationale and the measurement: the client's own parser normalises all
+    # three spellings to the canonical hosted url). Without this a leading-zero default port took
+    # the self-host exemption and was certified without any credential check.
+    if port:
+        port = port.lstrip("0") or "0"
     if port == "" or (port is not None and ((scheme == "https" and port == "443")
                                             or (scheme == "http" and port == "80"))):
         port = None
@@ -957,6 +963,18 @@ elif want_url and _endpoint_key(want_url) != _endpoint_key(HOSTED_DEFAULT_URL):
     # The TEMPLATE requests a non-hosted endpoint and the cell points exactly there: the operator
     # declared it once, in the file this cell was built from, so no per-box `_selfHosted` is owed.
     _selfhosted_shape = True
+# ⛔ THE EXEMPTION MAY NOT REACH THE HOSTED ENDPOINT (#3374 review, round 12 P2 — a FALSE PASS).
+# Both arms above ask about the TEMPLATE and the marker; neither asked whether the url IS the hosted
+# endpoint. So a `_selfHosted`-marked entry AT the hosted url (which `merge-mcp.py` minted itself when
+# the template named a self-host — it marked "this machine's own url" on the hosted one) was certified
+# `SELFHOSTED:` WITHOUT EVER LOOKING AT ITS CREDENTIAL. Measured: `.mcp.json` = hosted url +
+# `Bearer ${SOME_OTHER_VAR}` (an EMPTY Bearer, #3275/#3289) + `_selfHosted: true`, template url
+# `https://192.168.1.5/mcp` → `SELFHOSTED:https://api.premiselabs.co/mcp/` rc=0 and LAYER VERIFIED,
+# while the SAME file against the shipped template is refused `WRONG_AUTH:${SOME_OTHER_VAR}` rc=1. The
+# endpoint that needs the key cannot be exempted from needing it by a marker or a template; the hosted
+# path is decided by the ENDPOINT, so it is decided here by key and the hosted credential is required.
+if _selfhosted_shape and _endpoint_key(url) == _endpoint_key(HOSTED_DEFAULT_URL):
+    _selfhosted_shape = False
 if _selfhosted_shape:
     # ⛔ `_selfHosted` IS AN EXEMPTION, NOT A LICENCE TO CERTIFY ANY STRING (#3374 review P2). The
     # branch used to print SELFHOSTED and exit 0 for ANY marked url — including a SCHEME-LESS one
@@ -1012,7 +1030,15 @@ else:
         print("WRONG_AUTH:%s" % (("${%s}" % _m.group(1)) if _m
                                  else "<a literal, not a ${VAR} reference — value withheld>"))
         sys.exit(1)
-    print("OK:%s:%s" % (shown_url(url), auth))
+    # ⛔ THE SUCCESS MARKER PRINTED THE HEADER VERBATIM, SO THE LEAK SURVIVED ONE BRANCH OVER (#3374
+    # review, round 12 P2). `HOSTED_AUTH` admits `${VAR:-<anything>}` — a spelling the client DOES
+    # support (`extensions/mcp-client/index.ts`: `${VAR:-default}`, expanded recursively) — so a
+    # literal default is a value that reaches the wire, and it went into BOTH the `--verify` and the
+    # `--install` log on the branch that fires for a CORRECT config: measured,
+    # `Bearer ${TORTOISE_MCP_API_KEY:-hunter2NOTATOKEN}` printed in full, `rc=0`. An operator needs
+    # WHICH VARIABLE, and a name is not a secret; a default is a value, so it is withheld.
+    _m = re.match(r"^Bearer\s+(\$\{[A-Za-z_][A-Za-z0-9_]*)", (auth or "").strip())
+    print("OK:%s:%s" % (shown_url(url), _m.group(1) if _m else "<a header this verifier did not recognise — withheld>"))
 PY
 }
 
@@ -1605,6 +1631,12 @@ def key(u):
     # takes the hosted path and skips the arm that refuses userinfo outright.
     authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT — `:0443` IS `:443` (MUST MATCH `merge-mcp.py`,
+    # which carries the full rationale and the measurement: the client's own parser normalises all
+    # three spellings to the canonical hosted url). Without this a leading-zero default port took
+    # the self-host exemption and was certified without any credential check.
+    if port:
+        port = port.lstrip("0") or "0"
     if port == "" or (port is not None and ((scheme == "https" and port == "443")
                                             or (scheme == "http" and port == "80"))):
         port = None
