@@ -239,11 +239,13 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # names the cause in `$WT_RESULT`, which is logged on the line above — this comment does not restate
     # the cause list, because a list here is a second definition that goes stale the next time the
     # helper grows an arm.
-    # ⛔ NOT `prlock_refuse`'s RULE (`:528`, note at `:519-527`), which CONSUMES the attempt: a
-    # `$PRLOCK` that is not a regular file, or a `$O/state` this box cannot write, is bookkeeping no
-    # re-dispatch can change, so refunding it spins for ever (`fixcount` nets to zero, MAX_FIX_TRIES
-    # never trips, nothing parks). The distinction is causal, not positional: those refusals are not
-    # about a checkout, while here the checkout IS what failed and each cycle names its repair.
+    # ⛔ NOT `prlock_refuse`'s RULE (the function below, with its note above it), which CONSUMES the
+    # attempt: a `$PRLOCK` that is not a regular file, or a `$O/state` this box cannot write, is
+    # bookkeeping no re-dispatch can change, so refunding it spins for ever (`fixcount` nets to zero,
+    # MAX_FIX_TRIES never trips, nothing parks). The distinction is causal, not positional: those
+    # refusals are not about a checkout, while here the checkout IS what failed and each cycle names
+    # its repair. ⛔ No line numbers in this block on purpose: a citation here already rotted once when
+    # an edit to this very comment shifted the function it pointed at.
     refund_gate_attempt
     exit 1
   fi
