@@ -6,7 +6,7 @@
 # Exits 0 when ALL assertions pass, 1 on any failure. Hermetic: every log and
 # lock is a fixture in a temp directory, and the scripts are driven with `HOME`
 # pointed there, so no real state is read or written. Host facilities used:
-# `mktemp`, `mkdir`, `grep`, `sed`, `basename`, `date`, `touch`, and `bash -n`.
+# `mktemp`, `mkdir`, `grep`, `sed`, `wc`, `tr`, `cat`, `basename`, `date`, `touch`, and `bash -n`.
 #
 # ⛔ THREE SCRIPTS, TWO KINDS OF PROBE. `stat -f %m` (mtime) is repaired in
 # `monitor-worker.sh` and `lane-scan-fallback.sh`; `stat -f %z` (size) is repaired in
@@ -131,7 +131,14 @@ echo "── lane-scan-fallback.sh: the LOCK AGE is computed (behavioural, not t
 # probe runs end-to-end and nothing heavy is reached.
 LH="$T/lane-home"
 mkdir -p "$LH/.pi/agent/state/lane-scan-fallback.lock"
-HOME="$LH" bash "$LANE_SCAN" >/dev/null 2>&1; rc=$?
+# ⛔ CAPTURE STDERR, DO NOT DISCARD IT (#3509 review round 5). `File: unbound variable` is printed
+# by the SHELL, and `log()` is the only writer of $LLOG — so on the pre-fix script the arithmetic at
+# `:58` aborts BEFORE any `log()` call, $LLOG is never even created, and an arm that greps $LLOG for
+# `unbound variable` is a check that CANNOT FAIL: measured on `origin/main`'s script, the abort is on
+# stderr (`line 53: File: unbound variable`, rc=1) while the state dir holds only the lock, so
+# `cat $LLOG 2>/dev/null` yields the empty string and the arm printed ✅. `2>&1 >/dev/null` takes
+# stderr to the capture and only then sends stdout to /dev/null — the order is load-bearing.
+err="$(HOME="$LH" bash "$LANE_SCAN" 2>&1 >/dev/null)"; rc=$?
 LLOG="$LH/.pi/agent/state/orchestrator-heartbeat.log"
 assert_eq "$rc" 0 "a FRESH lock exits 0 (the age was computable)"
 # ⛔ BOUNDED, not exact. The lock is created immediately before this call, so the true age is 0s —
@@ -144,8 +151,8 @@ if grep -Eq 'already running \(lock [0-9]{1,2}s old\)' "$LLOG" 2>/dev/null; then
 else
     bad "the lock age is a computed number (0-99s), not a filesystem block (missing: already running (lock <N>s old))"
 fi
-assert_not_contains "$(cat "$LLOG" 2>/dev/null)" 'unbound variable' \
-    "the lock age arithmetic did not die"
+assert_not_contains "$err" 'unbound variable' \
+    "the lock age arithmetic did not die (read from STDERR — $LLOG only exists IF the arithmetic worked)"
 
 echo
 # ⛔ THIS ARM EXISTS BECAUSE THE TEXT PINS ALONE WERE NOT ENOUGH (agent-infra#3509 review round 4).
@@ -179,8 +186,11 @@ assert_contains "$out" 'PARENT RESUMED' "the resumed parent is reported as resum
 # The two sizes in that line must be the exact byte lengths. `session 16 -> 37 bytes`.
 assert_contains "$out" "session $BEFORE_BYTES -> $AFTER_BYTES bytes" \
     "the reported sizes are the file's exact byte counts ($BEFORE_BYTES -> $AFTER_BYTES), not a filesystem block"
-assert_not_contains "$out" 'No such file or directory' \
-    "no shell redirection error leaked into the report"
+# ⛔ NOT an arm: "no `No such file or directory` in the report" was DELETED here (#3509 review round 5).
+# The fixture above guarantees `$F` resolves, so no input redirection can fail in that run and the
+# assertion could never fire — measured: the leaking-order mutant scored PASS=23 FAIL=1, red only on
+# the textual arm below. An arm that cannot fail is a false PASS inside the very suite that exists to
+# stop false PASSes, so the leak is pinned where it can actually be seen — on the executable text.
 # …and the same redirection-order trap, pinned on the executable text rather than by driving the
 # 90 s not-resumed path: a command's redirections are applied LEFT TO RIGHT, and a failing `<"$F"`
 # is reported by the SHELL before `2>/dev/null` takes effect — so `wc -c <"$F" 2>/dev/null` prints
