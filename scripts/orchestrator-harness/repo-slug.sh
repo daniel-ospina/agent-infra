@@ -269,7 +269,15 @@ repo_identity_declared() {
   # (`HARNESS_PIN_DIR=$HOME/.harness`) is not handed a false block by a name this table did not guess.
   # ${HARNESS_PIN_DIR:-} because this file is sourced under `set -u` — and NOT inside the `case` pattern
   # below, where an unset variable would be a fatal expansion rather than an empty match.
-  if [ "${1:-}" = 'harness' ] || { [ -n "${HARNESS_PIN_DIR:-}" ] && [ "${1:-}" = "${HARNESS_PIN_DIR##*/}" ]; }; then
+  # ⛔ AND ITS PRESERVED COPIES — `harness.<suffix>` (review finding, P2). `disk-floor.sh` names
+  # `$O/harness.stray-*` / `$O/harness.preserved-*` as its stale-copy class and refuses to delete any
+  # candidate that carries `.git` "whatever it is called", and `docs/ops/disk-consumers.md` MEASURES
+  # `harness.preserved-012629` (180 MB) inside `/tmp/cell-home` — a default ROOT of both the bring-up and
+  # the doctor. A preserved copy is a real clone of agent-infra, so `harness.old` / `harness.preserved-…`
+  # read FATAL, with a remedy inviting a rename or quarantine of a preserved copy on a healthy cell: the
+  # start of exactly the conversation this table exists to prevent. Same expectation as `harness` itself.
+  if [ "${1:-}" = 'harness' ] \
+     || { [ -n "${HARNESS_PIN_DIR:-}" ] && [ "${1:-}" = "${HARNESS_PIN_DIR##*/}" ]; }; then
     printf '%s\n%s\n' 'agent-infra' \
       'the harness PIN ROOT (or a legacy flat pin, where the root itself is a linked worktree at a commit) — the harness always comes from agent-infra, and the directory names its role, not the repo'
     return 0
@@ -326,6 +334,18 @@ repo_identity_declared() {
         printf '%s\n%s\n' '?' \
           "a generic CELL CHECKOUT name (orchestrator-bringup.sh's own candidate list), but this box declares no repo of its own (no \$REPO origin, no \$REPO_SLUG, no \$OR) — so WHICH repo may sit here cannot be decided"
       fi ;;
+    # ⛔ PRESERVED / STALE HARNESS COPIES — LAST, SO THE TABLE'S OWN ORDER IS THE PRIORITY (review
+    # finding, P2). `disk-floor.sh` names `$O/harness.stray-*` / `$O/harness.preserved-*` as its stale-copy
+    # class and refuses to delete anything carrying `.git`; `docs/ops/disk-consumers.md` MEASURES
+    # `harness.preserved-012629` (180 MB) inside `/tmp/cell-home`, a default root of both the bring-up and
+    # the doctor. Such a copy is a real clone of agent-infra, so before this row it read FATAL — a remedy
+    # inviting a rename of a preserved copy on a healthy cell.
+    # ⛔ IT IS THE LAST ARM ON PURPOSE. An earlier version excluded `*.not-a-worktree` and
+    # `*-legacy-YYYYMMDD` in a hardcoded pre-filter, which made any FUTURE `harness.*`-named row silently
+    # unreachable; as the last arm, every specific row above it wins by the table's own order.
+    harness.*)
+      printf '%s\n%s\n' 'agent-infra' \
+        "a PRESERVED or STALE harness copy (disk-floor.sh's \`harness.stray-*\` / \`harness.preserved-*\` class) — the harness always comes from agent-infra, and the copy is kept, not deployed" ;;
     *)
       return 1 ;;
   esac
@@ -597,16 +617,6 @@ repo_identity_scan() {
         i=$((i + 1)); continue ;;
     esac
     if [ "${_wt[$i]}" -eq 1 ]; then
-      # ⛔ THIS NAME WAS NOT COMPARED, SO THE VERDICT SAYS SO — as a VERDICT, not as prose. It used to be
-      # a `warn` whose text carried the word "UNVERIFIED", which the bring-up matched to decide whether
-      # the `CELL READY` banner could claim the check; that is a contract made of a phrase, and it is the
-      # class this round removes. Without the distinction a worktree placed at a path named after ANOTHER
-      # repo — `…/agent-infra` holding tortoise, the measured cell-2 shape reached via `git worktree add`
-      # instead of `git clone` — read as verified and the banner printed `CELL READY — all links
-      # verified`. TRADE-OFF, stated plainly: a cell that holds any linked worktree reports
-      # `repo identity PARTIALLY verified`, because that name genuinely was not compared. That is the
-      # honest reading; a refinement (treat a branch-shaped name as "nothing to verify" rather than
-      # "unverified") is a separate change with its own evidence.
       # ⛔ `ok`, NOT `unverified` (review finding, P1 — and it reverses a call this file made two commits
       # ago). A linked worktree's name is a BRANCH, not a claim about a repository, so there is nothing
       # unanswered about THIS BOX — while the fleet's own launcher recipe is `git worktree add
@@ -672,9 +682,16 @@ repo_identity_scan() {
             [ -n "$pv" ] || continue
             rp="$( ( cd "$pv" 2>/dev/null && pwd -P ) )" || rp=""
             [ -n "$rp" ] || continue
+            # ⛔ SCOPED TO THIS GROUP (review finding, P2). This matched `$rp` against EVERY scanned
+            # checkout, so with two duplicated repos the tortoise line reported the AGENT-INFRA path as
+            # the tree `REPO` resolves to — a false attribution on the one line an operator uses to pick
+            # a canonical tree — and the non-empty `resolves` then SUPPRESSED the honest "nothing here
+            # resolves" sentence below, replacing a true statement with a false one.
             j=0
             while [ "$j" -lt "${#_cd[@]}" ]; do
-              [ "${_cd[$j]}" = "$rp" ] && resolves="${resolves}${resolves:+, }${v}->${_cd[$j]}"
+              if [ "${_cd[$j]}" = "$rp" ] && [ "${_fold[$j]:-}" = "${_fold[$i]}" ]; then
+                resolves="${resolves}${resolves:+, }${v}->${_cd[$j]}"
+              fi
               j=$((j + 1))
             done
           done
@@ -690,13 +707,27 @@ repo_identity_scan() {
           fi
           # Are all the heads the same? Then nothing is at stake YET — say so at `ok`, but say it: the
           # divergence this reports is only invisible until someone commits.
+          # ⛔ AND AN UNREAD HEAD IS NOT A HEAD THAT AGREES (review finding, P2). `_head` carries the
+          # sentinel `<unreadable>` when `rev-parse` answered nothing (an unborn HEAD from `git init` +
+          # `remote add`, an empty remote, an orphan branch), so a group of two could not be told apart
+          # from a group of two that agree — and the report announced "all at the same head" about data
+          # nothing read. That is the `, `-separator bug INVERTED: this message invents a convergence
+          # instead of a divergence, and it is the line an operator picks a canonical tree from.
+          # ⛔ DIVERGENCE FIRST, THEN UNREAD, THEN SAME-HEAD (review finding, P2). Ordering the unread arm
+          # first made a group with two READABLE heads at different commits plus one unborn head say "not a
+          # divergence" — a false statement about data the check DID read, and it dropped the "a lane that
+          # cd's into the wrong one builds against a different tree" sentence. Only the READABLE heads can
+          # establish a divergence; the unread one is still named in the listing either way.
           slug="${_slug[$i]}"
-          if [ "$(printf '%s' "$hlist" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
-            printf '%s\t%s\n' ok \
-              "repo identity: $slug is checked out at $n paths ($dup — all at the same head) and $resolves; several trees can be legitimate, so this is reported rather than refused (agent-infra#3521)"
-          else
+          if [ "$(printf '%s' "$hlist" | tr ',' '\n' | grep -vF '<unreadable>' | sort -u | grep -c .)" -gt 1 ]; then
             printf '%s\t%s\n' warn \
               "repo identity: $slug is checked out at $n paths at DIFFERENT heads ($dup) and $resolves. A lane that cd's into the wrong one builds against a different tree, and nothing in either tree says which is canonical (measured on cell-1, four agent-infra checkouts at four heads) — not fatal, since several can be legitimate, but silence here is how the stale one gets used (agent-infra#3521)"
+          elif [ "$(printf '%s' "$dup" | tr ',' '\n' | grep -cF '<unreadable>')" -gt 0 ]; then
+            printf '%s\t%s\n' warn \
+              "repo identity: $slug is checked out at $n paths ($dup) and $resolves. At least one HEAD could not be READ, so whether these trees are on the same commit is unknown — no readable pair differs, and these trees are not shown to ALL agree (agent-infra#3521)"
+          elif [ "$(printf '%s' "$hlist" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
+            printf '%s\t%s\n' ok \
+              "repo identity: $slug is checked out at $n paths ($dup — all at the same head) and $resolves; several trees can be legitimate, so this is reported rather than refused (agent-infra#3521)"
           fi
         fi
       fi
