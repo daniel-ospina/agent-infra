@@ -2618,11 +2618,20 @@ lane_registry_begin() {
   # when the shape is unrecognisable, because a wrong repo is worse than an absent one.
   repo=""
   if _url="$(git remote get-url origin 2>/dev/null)" && [ -n "$_url" ]; then
-    _slug_repo="$(printf '%s' "$_url" | sed -e 's#\.git$##' \
-                   | awk -F'[/:]' '{ if (NF >= 2) print $(NF-1)"/"$NF }')"
-    case "$_slug_repo" in
-      ''|/*|*/|*/*/*) : ;;          # empty, or more than the two components we expect
-      ?*/?*) repo="$_slug_repo" ;;
+    # ⛔ ONLY A REMOTE URL HAS AN `owner/name` TO DERIVE, AND THE CASE GUARD BELOW COULD NOT TELL.
+    # A LOCAL-PATH remote has two path components too, so `/tmp/lrt/origin.git` minted `lrt/origin`
+    # and `file:///tmp/x/y.git` minted `x/y` — a plausible-looking but WRONG repo written into every
+    # record's `repo` field, which `lane.list --repo owner/name` then filters on. "A wrong repo is
+    # worse than an absent one" is this block's own contract, so the SHAPE is screened first:
+    # anything that is not a remote is UNRECOGNISABLE and publishes nothing.
+    case "$_url" in
+      git@*:*|ssh://*|git://*|http://*|https://*)
+        _slug_repo="$(printf '%s' "$_url" | sed -e 's#\.git$##' \
+                       | awk -F'[/:]' '{ if (NF >= 2) print $(NF-1)"/"$NF }')"
+        case "$_slug_repo" in
+          ''|/*|*/|*/*/*) : ;;          # empty, or more than the two components we expect
+          ?*/?*) repo="$_slug_repo" ;;
+        esac ;;
     esac
   fi
   # ── the LEASE. It must OUTLIVE the lane, or the lane reads EXPIRED to a peer before its terminal record
@@ -2691,7 +2700,15 @@ lane_registry_end() {
   artargs+=(--artifact "log:$log")
   if git rev-parse --git-dir >/dev/null 2>&1; then
     local _br _sha
-    _br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" && [ -n "$_br" ] && artargs+=(--artifact "branch:$_br")
+    # ⛔ `git rev-parse --abbrev-ref HEAD` SUCCEEDS ON A DETACHED HEAD — IT PRINTS `HEAD`. Testing the
+    # status therefore proves nothing here: `_br` is non-empty and `branch:HEAD` was published as
+    # EVIDENCE, a value that names no branch and can never be verified. A detached worktree is not a
+    # corner case on this fleet — it is the documented shape of a fork-PR repair lane
+    # (`refs/pull/<n>/head`), and this file's own header records the stdout-on-failure trap. Screen
+    # the value exactly as `land_backlog_open_pr_evidence()` already does.
+    _br="$(git rev-parse --abbrev-ref HEAD 2>/dev/null)" || _br=""
+    case "$_br" in ''|HEAD|*[!A-Za-z0-9._/-]*) _br="" ;; esac
+    [ -n "$_br" ] && artargs+=(--artifact "branch:$_br")
     _sha="$(git rev-parse HEAD 2>/dev/null)" && [ -n "$_sha" ] && artargs+=(--artifact "sha:$_sha")
     artargs+=(--artifact "worktree:$(pwd)")
   fi

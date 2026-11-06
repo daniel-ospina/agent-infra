@@ -122,8 +122,22 @@ def collect(key, chars=400, want=1):
                        unmeasured=("UNMEASURED(session file for sid %s + not found under %s: the "
                                    "lane's activity cannot be read, so it is NOT known idle)"
                                    % (str(sid)[:8] or "<none>", SESS)))
-    age_m = (time.time() - os.path.getmtime(path)) / 60.0
-    turns_read = turns(path, want)
+    # ⛔ A PRESENT-BUT-UNREADABLE SESSION FILE IS STILL `3`, NOT A CRASH. `session_file()` proves the
+    # path EXISTS; it does not prove it can be READ. `getmtime()`/`open()` on a file owned by another
+    # user, rotated away between the glob and the open, or a DIRECTORY matching the glob raised out of
+    # `collect()`, out of `main()`, and the process died with rc=**1** and empty stdout — the one code
+    # this contract retires, on exactly the path its own justification names ("the lane matched but its
+    # activity could NOT be read"). Measured before this guard: `IsADirectoryError` from `turns()`, and
+    # `PermissionError`/`FileNotFoundError` from the `getmtime()` above.
+    try:
+        age_m = (time.time() - os.path.getmtime(path)) / 60.0
+        turns_read = turns(path, want)
+    except OSError as exc:
+        return 3, dict(base, lane=row.get("lane"), ws=row.get("ws"), sid=sid, verdict=verdict,
+                       session_file=path,
+                       unmeasured=("UNMEASURED(session file %s + unreadable: %s — the lane's activity "
+                                   "cannot be read, so it is NOT known idle)"
+                                   % (path, exc.strerror or exc.__class__.__name__)))
     # ⛔ THE TRUNCATION MARKER IS APPLIED HERE, ONCE, so the prose and the JSON cannot disagree —
     # the contract this payload exists to keep. The rewrite that introduced `collect()` dropped the
     # `("…" if len(t) > chars)` the prose branch used to carry, so an operator could no longer tell a

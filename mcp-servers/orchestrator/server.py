@@ -111,8 +111,16 @@ WRAPPED: Tuple[Tuple[str, str, str, str], ...] = (
 EXTERNAL: Tuple[Tuple[str, str], ...] = (("cmux", "cmux"), ("gh", "gh"))
 
 # ── the surface, with ALL FOUR annotations on every tool ─────────────────────────────────────
+# ⛔ `openWorldHint` IS TRUE ON THE READ ROWS TOO, AND `False` WAS A MISDECLARATION. The spec's
+# definition is "may interact with an OPEN WORLD of external entities", NOT "may write": every one of
+# the eight read tools reaches OUTSIDE this process — `lane.list`/`lane.show`/`lane.artifact` read the
+# registry's git REMOTE and the cells, `fleet.census`/`pr.queue`/`pr.closure_audit` run `gh` against
+# GitHub, `claim.check` reads a remote ref namespace, `pr.review_record` fetches the PR diff. A client
+# reads `readOnlyHint: true` + `openWorldHint: false` as the "safe, closed, local" quadrant it may
+# auto-approve, so declaring `False` here was wrong in the PERMISSIVE direction — the exact error the
+# box.exec row's own comment warns about, in the other half of the table.
 _READ = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True,
-         "openWorldHint": False}
+         "openWorldHint": True}
 
 TOOLS: List[Dict[str, Any]] = [
     {
@@ -686,6 +694,16 @@ def _decode(raw: bytes, cap: int) -> Tuple[str, bool]:
 # invariant 1: unknown is not zero) this PR exists to remove, introduced by its own bound. A guard arm
 # parses this file and reds if any call site declares more than the constant.
 MAX_TIMEOUT_S = 420          # > the largest declared call site (400.0, `pr_state`)
+# ⛔ THE CHANNEL'S MARGIN HAS TO FIT *INSIDE* THE BOUND, NOT SIT ABOVE IT. `box.exec` asks the channel
+# for `timeout_s + CHANNEL_MARGIN_S` ON PURPOSE — the transport's own `--timeout` must answer before the
+# local kill, or the answer is discarded as `CHANNEL-TIMEOUT`. The clamp used the SAME `MAX_TIMEOUT_S`
+# on both halves of that expression, so for any `timeout_s > MAX_TIMEOUT_S - CHANNEL_MARGIN_S` the
+# margin was clamped straight back off: the local kill fired at the instant the transport would have
+# answered, rc was None, and a slow-but-legitimate exec was reported as a channel timeout. That is the
+# "clamp silently rewrites a declared call site" class inside the one site the literal-only guard arm
+# could not see (`timeout=timeout_s + 30` is not a literal).
+CHANNEL_MARGIN_S = 30        # the local kill fires this long AFTER the transport's own --timeout
+MAX_CHANNEL_TIMEOUT_S = MAX_TIMEOUT_S + CHANNEL_MARGIN_S
 MAX_CAP = 2_000_000          # a declared maximum for the returned-bytes cap
 _DEFAULT_TIMEOUT_S = 60.0    # what a degenerate/absent request falls back to
 _DEFAULT_CAP = 200_000
@@ -730,8 +748,11 @@ def run(argv: List[str], timeout: float = 60.0, cap: int = 200_000,
         timeout = _DEFAULT_TIMEOUT_S
     if not (timeout > 0):
         timeout = _DEFAULT_TIMEOUT_S
-    elif timeout > MAX_TIMEOUT_S:
-        timeout = MAX_TIMEOUT_S
+    elif timeout > MAX_CHANNEL_TIMEOUT_S:
+        # The CHANNEL bound, not the caller bound: a call site may legitimately request the caller's
+        # maximum PLUS its declared margin (see CHANNEL_MARGIN_S), and clamping that back to the caller
+        # bound would silently discard the margin the caller asked for.
+        timeout = MAX_CHANNEL_TIMEOUT_S
     try:
         cap = int(cap)
     except (TypeError, ValueError):
@@ -1784,6 +1805,13 @@ GIT_OK_VERBS = ("status", "log", "rev-parse", "ls-files", "show", "diff")
 # diagnostic was refused with "writes a file the caller names" — wrong about the command and wrong
 # about the reason. Scope the ban to the program whose option actually behaves that way.
 WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
+# ⛔ A THIRD SHAPE: THESE FLAGS MAKE GIT EXECUTE A PROGRAM. `--ext-diff` runs `diff.external` (or a
+# `diff.<driver>.command`) and `--textconv` runs a `textconv` driver — both NAMED IN THE TARGET REPO's
+# config / `.gitattributes`, i.e. chosen by anything that can write the checkout the exec lands in.
+# Same class as the `["/tmp/evil/git", …]` bypass above (a caller-chosen program running under this
+# surface's authority), reached through a verb that IS read-only — so the verb gate cannot see it, and
+# neither can the metacharacter filter (there is no shell metacharacter in either flag).
+EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv")
 # ⛔ A BARE ARGUMENT TO `hostname` IS THE SETTER FORM, NOT A QUERY. `hostname NAME` and
 # `hostname -F <file>` RENAME the box (`hostname --help`: `{hostname|-F file}  set host name`), and
 # `ALLOWLIST["hostname"] = ([], 1)` bounds only the COUNT — so `["hostname", "pwned-cell"]` passed this
@@ -1881,7 +1909,7 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
     payload["resolution"] = resolution
     target = resolution.get("name") or box
     ran = run([cmux, "vm", "exec", "--timeout", str(timeout_s), target, "--"] + list(argv),
-              timeout=timeout_s + 30, cap=cap)
+              timeout=timeout_s + CHANNEL_MARGIN_S, cap=cap)
     payload.update({
         "rc": ran.rc,
         "stdout": ran.stdout,
@@ -1943,6 +1971,12 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
                 if low == bad or low.startswith(bad + "="):
                     return False, ("refusing %r: %s writes a file the caller names — an argv surface "
                                    "allowlisted for READING is not a write channel" % (token, bad))
+            # ⛔ AND AN EXEC-ESCAPE IS NEITHER A METACHARACTER NOR A WRITE (see EXEC_ESCAPE_TOKENS).
+            for bad in EXEC_ESCAPE_TOKENS:
+                if low == bad or low.startswith(bad + "="):
+                    return False, ("refusing %r: %s makes git EXECUTE a program named by the target "
+                                   "repo's config/.gitattributes — an argv surface allowlisted for "
+                                   "READING is not an execution channel" % (token, bad))
     # ⛔ `hostname` WITH A BARE ARGUMENT RENAMES THE BOX (see HOSTNAME_OK_FLAGS). Flags only.
     if prog == "hostname":
         for token in rest:

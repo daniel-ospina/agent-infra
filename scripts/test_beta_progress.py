@@ -1058,9 +1058,53 @@ def test_a_repo_call_never_returns_another_repos_cached_figures(monkeypatch, no_
     monkeypatch.setattr(bp, "DEFAULT_REPO", "daniel-ospina/tortoise")
     base_before = no_cache.read_bytes() if no_cache.exists() else b"<absent>"
     monkeypatch.setattr(bp, "compute", fresh)
-    assert bp.main() == 0
+    # ⛔ DRIVEN THROUGH THE REAL ARGV SURFACE. This arm used to call `bp.main()` with NO arguments
+    # and set `REPO` with monkeypatch, so the `--repo` branch was never entered by ANY arm in this
+    # file (all 11 call sites were bare `bp.main()`): deleting the whole `elif a == "--repo":` branch
+    # left every arm green, including this one, whose TITLE is "a `--repo` run does not touch the base
+    # file". `REPO` is reset to the base repo first so a deleted `--repo` branch is OBSERVABLE —
+    # without the reset the previous arm's monkeypatched value would make it pass anyway.
+    monkeypatch.setattr(bp, "REPO", "daniel-ospina/tortoise")
+    assert bp.main(["--repo", "owner/other"]) == 0
     capsys.readouterr()
+    assert bp.REPO == "owner/other", "--repo did not reach the module's REPO: %r" % (bp.REPO,)
     after = no_cache.read_bytes() if no_cache.exists() else b"<absent>"
     assert after == base_before, "a --repo run overwrote the base cache the beat renders"
     written = _json.loads(pathlib.Path(bp._cache_path()).read_text())
     assert written["repo"] == "owner/other", written
+
+
+def test_the_cli_argv_surface_is_real(monkeypatch, no_cache, capsys):
+    """⛔ `--repo` AND `--json` ARE THE CONTRACT `_census` CALLS, so they must be driven AS ARGV.
+
+    `mcp-servers/orchestrator/server.py::_census` fans out with `["--repo", repo, "--json"]`, and
+    the module's previous body parsed NO argv at all (it hardcoded one repo), so this surface is the
+    thing the PR adds. Every other arm in this file sets `REPO` with monkeypatch and calls
+    `bp.main()`, which exercises the parser's DEFAULT path only — the two branches below could be
+    deleted with the suite green. This arm drives the branches themselves.
+    """
+    import json as _json
+    import time as _time
+
+    def fresh():
+        return {"ts": int(_time.time()), "repo": bp.REPO, "open_prs": 1, "merged_today": 0,
+                "p0": {"open": 9, "with_pr": 9, "without": 0},
+                "p1": {"open": 9, "with_pr": 9, "without": 0}}
+
+    monkeypatch.setattr(bp, "compute", fresh)
+    # (a) `--repo` + `--json`: both branches fire, and the payload is the labelled JSON.
+    assert bp.main(["--repo", "owner/other", "--json"]) == 0
+    payload = _json.loads(capsys.readouterr().out)
+    assert payload["repo"] == "owner/other", payload
+    assert payload["readable"] is True, payload
+    assert payload["measured_at"], payload
+    # (b) `--json` ALONE is still the JSON surface, and without it the same run is PROSE — a `--json`
+    #     branch that never fired would print the prose line to a caller parsing JSON.
+    assert bp.main(["--repo", "owner/other", "--json"]) == 0
+    assert capsys.readouterr().out.lstrip().startswith("{"), "--json must emit JSON"
+    assert bp.main(["--repo", "owner/other"]) == 0
+    prose = capsys.readouterr().out
+    assert not prose.lstrip().startswith("{"), "without --json the line is prose: %r" % prose[:80]
+    # (c) A MALFORMED OR UNKNOWN ARGUMENT IS A USAGE ERROR (2), never a silent default.
+    for argv in (["--repo"], ["--repo", "noslash"], ["--bogus"]):
+        assert bp.main(argv) == 2, "%r must be a usage error (2)" % (argv,)

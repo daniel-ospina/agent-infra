@@ -186,7 +186,11 @@ def test_S3_the_surface_is_EXACTLY_the_approved_set_with_all_four_annotations(en
         # a read-only tool must not name a mutating verb
         if tool["name"] in READ_ONLY_NAMES:
             assert annotations["readOnlyHint"] is True, tool["name"]
-            assert annotations["openWorldHint"] is False, tool["name"]
+            # ⛔ AND IT IS STILL OPEN-WORLD: "read-only" is about WRITES, "open-world" is about
+            # reaching OUTSIDE. Every read row here fetches from a git remote, `gh`, or a cell, so
+            # `False` was the permissive half of the pair — and pinning `False` made a FUTURE CORRECT
+            # value red. Pin the true one.
+            assert annotations["openWorldHint"] is True, tool["name"]
             for verb in ("start", "beat", "done", "fail", "write", "delete", "push", "exec"):
                 assert verb not in tool["name"], tool["name"]
     by_name = {t["name"]: t["annotations"] for t in tools}
@@ -492,7 +496,8 @@ def test_I1_a_failed_read_is_unmeasured_and_the_reason_names_the_cause(tmp_path,
     ran = mod.run([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.4)
     assert ran.timed_out and ran.rc is None
     assert "timeout after 0.4s" in ran.reason(), ran.reason()
-    assert "timeout" in ran.unmeasured() and ran.cmd.startswith(sys.executable.split("/")[0]) or True
+    assert "timeout" in ran.unmeasured() and sys.executable in ran.cmd, (
+        ran.unmeasured(), ran.cmd)
     assert "UNMEASURED(" in ran.unmeasured()
 
     # (d) …and none of the three is ever a ZERO
@@ -1103,6 +1108,20 @@ def test_T_the_clamp_never_rewrites_a_declared_call_site():
     assert max(timeouts) <= mod.MAX_TIMEOUT_S, (
         "a call site declares timeout=%s but MAX_TIMEOUT_S=%s, so the clamp silently shortens it "
         "(a slow-but-legitimate read becomes a false UNMEASURED)" % (max(timeouts), mod.MAX_TIMEOUT_S))
+    # ⛔ AND THE SCAN MUST SEE THE FORM IT COULD NOT: a COMPUTED call site. `box.exec` asks for
+    # `timeout_s + CHANNEL_MARGIN_S` DELIBERATELY — see CHANNEL_MARGIN_S — so the literal-only regex
+    # above skipped the one site that exceeds the caller's clamp by design, and this arm (whose whole
+    # job is "no declared call site may be silently rewritten") passed over the site where that was
+    # happening. The computed site's worst case is the caller's maximum PLUS its declared margin, and
+    # the channel bound must cover it.
+    margins = [int(x) for x in re.findall(r"\btimeout=\w+\s*\+\s*([0-9]+)\b", src)]
+    assert margins, ("the scan found no `timeout=<ident> + <int>` call site — the regex has drifted, "
+                     "or the declared channel margin was removed")
+    assert mod.MAX_CHANNEL_TIMEOUT_S == mod.MAX_TIMEOUT_S + mod.CHANNEL_MARGIN_S
+    assert mod.MAX_TIMEOUT_S + max(margins) <= mod.MAX_CHANNEL_TIMEOUT_S, (
+        "a computed call site asks for <clamp>+%s but MAX_CHANNEL_TIMEOUT_S=%s, so the clamp still "
+        "rewrites it and the transport's own answer is discarded as CHANNEL-TIMEOUT"
+        % (max(margins), mod.MAX_CHANNEL_TIMEOUT_S))
     assert max(caps) <= mod.MAX_CAP, (
         "a call site declares cap=%s but MAX_CAP=%s" % (max(caps), mod.MAX_CAP))
 
@@ -1229,7 +1248,13 @@ def test_T_read_only_mode_refuses_every_mutating_tool(tmp_path, monkeypatch):
 
 
 def test_T_the_registry_is_read_only_across_the_whole_surface(env):
-    """S10, widened: a full session over EVERY tool leaves the registry's refs byte-identical."""
+    """S10: a session over the registry-touching READ tools leaves the registry's refs byte-identical.
+
+    ⛔ NOT "over EVERY tool", which is what this said: the session below drives `tools/list` plus the
+    two registry reads. The MUTATING names are covered by the read-only arm above, which requires each
+    of them to be REFUSED before it touches anything — not by this comparison. A docstring that claims
+    a wider scope than the body executes is the false-coverage class this suite exists to red.
+    """
     mod_reg, origin, _repo, _tmp = env
     monkeypatch = pytest.MonkeyPatch()
     try:

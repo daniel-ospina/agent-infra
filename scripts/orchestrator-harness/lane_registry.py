@@ -142,7 +142,14 @@ WRITABLE = ("RUNNING", "DONE", "FAILED")   # `EXPIRED` is DERIVED — see the mo
 # places: minting (`new_lane_id`), reading (`_record_problem`) and writing (`_write_local`). It must
 # start with an alnum (a leading `.` hides the file and is not a legal ref component), contain no `/`,
 # `..`, `~`, `^`, `:`, `?`, `*`, `[`, `\\`, space or NUL, and stay short enough for a path component.
-LANE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$")
+# ⛔ AND IT MUST BE A LEGAL REF COMPONENT, NOT JUST A LEGAL FILENAME. The old pattern accepted `a..b`,
+# `a.` and `a.lock` — all of which GIT REFUSES in a ref name (`invalid refspec`, rc 6, measured). The id
+# was validated, the local witness written, the handle PRINTED, and only then did the push fail, so the
+# lane reads `LOCAL-ONLY`/`EXPIRED` to every peer forever while `start`'s own warning says peers
+# "cannot see this lane until it is" pushed. `?`-free by construction: git's rules for a ref component
+# are `..`, a trailing `.`, `.lock` and the control characters, and this pattern is the one place they
+# belong. See T17b for the shapes.
+LANE_ID_RE = re.compile(r"^(?!.*\.\.)(?!.*\.lock$)[A-Za-z0-9](?:[A-Za-z0-9._-]{0,158}[A-Za-z0-9_-])?$")
 
 DEFAULT_BUDGET_S = 7200      # == spawn-gate.sh's LANE_BACKSTOP_S (the lane's absolute backstop)
 DEFAULT_BEAT_S = 60

@@ -75,9 +75,9 @@
       "cwd": "${AGENT_INFRA_PATH}",
       "lazy": true,
       "idleTimeoutMs": 900000,
-      "purpose": "Lane STATE records \u2014 lane.list / lane.show over refs/lanes/* (agent-infra#3382 slice 1). Four states only: RUNNING | DONE | FAILED | EXPIRED. Read-only.",
-      "whenToLoad": "whenever the question is 'did this lane finish?' / 'which lanes are running?' / 'what expired?' \u2014 i.e. any beat's lane census. NOT a substitute for tools/fleet/liveness.py (the one liveness verdict): the registry answers about the RECORD, liveness answers about the process.",
-      "cost": "zero while sleeping (lazy); 1 python process + 1 git fetch per call"
+      "purpose": "Fleet/orchestrator surface — 11 tools / 12 MCP names (agent-infra#3382): lane.list, lane.show, lane.artifact, fleet.census, pr.queue, claim.check, lane.dispatch, box.exec, pr.review_record, pr.closure_audit, fleet.reminder, fleet.beat_checkpoint. EIGHT are reads; lane.dispatch, box.exec, fleet.reminder and fleet.beat_checkpoint MUTATE, so this entry is NOT read-only — launch it with --read-only (or ORCH_MCP_READ_ONLY=1) to refuse every mutating tool. box.exec is destructiveHint/openWorldHint and runs allowlisted ARGV commands on cells.",
+      "whenToLoad": "whenever the question is 'did this lane finish?' / 'which lanes are running?' / 'what expired?' — i.e. any beat's lane census — plus PR review state (pr.review_record), closure audits and claim checks. NOT a substitute for tools/fleet/liveness.py (the one liveness verdict): the registry answers about the RECORD, liveness answers about the process.",
+      "cost": "zero while sleeping (lazy); 1 python process per call plus the wrapped CLI's own cost (1 git fetch for lane reads, 1+ gh call for pr/claim reads, 1 cmux exec for box.exec)"
     }
   }
 }

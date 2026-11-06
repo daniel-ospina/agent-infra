@@ -8,10 +8,17 @@ all**, so the orchestrator answered "did it finish?" from a proxy and got it wro
 2026-11-03/04 (`lane_registry.py`'s docstring lists them; the FALSE-DEATH x3 in #3382 §"Why this exists"
 is the same failure in the other direction).
 
-A test that merely exercises the new code proves nothing about whether it discriminates. So every
-LOAD-BEARING assertion below is paired with a **mutation** (`_MUTANTS`): the module is re-derived with the
-one line the assertion exists to protect replaced by the plausible-looking wrong version, and the test
-must then FAIL. If a mutant survives, the test is decoration and this suite says so out loud.
+A test that merely exercises the new code proves nothing about whether it discriminates. T1–T5 are each
+paired with an in-body **mutation** (the `mod._derived = …` / `mod.terminal_refusal = …` arms the test
+installs and then restores): the one line the assertion exists to protect is replaced by the
+plausible-looking wrong version, and the test must then FAIL.
+
+⛔ T6–T27 ARE **NOT** MUTATION-PAIRED, AND THIS HEADER USED TO SAY THEY WERE. It claimed every
+load-bearing assertion was paired by a `_MUTANTS` table that re-derives the module from a modified copy.
+No such table or runner exists in this tree — the name appears only in that sentence, so a reader was
+told a suite-wide assurance existed when only five assertions had one. A claim of assurance is worse
+than an honest gap: the seam an external mutation run needs is `LANE_REGISTRY_UNDER_TEST` (see
+`_MODULE` below), and running one is a follow-up, not something this file can pretend it did.
 
     T1   a stale heartbeat with NO terminal record reports EXPIRED          (+ mutant: "RUNNING forever")
     T2   an open lease reports RUNNING                                      (+ mutant: "always EXPIRED")
@@ -64,7 +71,8 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # ⛔ OVERRIDABLE, SO THE GUARDS CAN BE MUTATION-TESTED FROM THE OUTSIDE. A mutation run that cannot point
 # the suite at a modified copy is a mutation run against the ORIGINAL module, which reports "green" and
 # proves the opposite of what it claims — measured while writing T24..T27 (38 "passed" against an
-# unmodified file, with five mutants reported as surviving).
+# unmodified file, with five mutants reported as surviving). NOTHING IN THIS FILE SETS IT: it is the
+# seam an external run uses (`LANE_REGISTRY_UNDER_TEST=<modified copy> pytest scripts/test_lane_registry.py`).
 _MODULE = os.environ.get("LANE_REGISTRY_UNDER_TEST") or os.path.join(_HERE, "orchestrator-harness",
                                                                      "lane_registry.py")
 
@@ -615,9 +623,17 @@ def test_T17b_a_lane_id_cannot_escape_the_namespace(box, tmp_path):
 
     `start --tag` is slugged (a tag is free text), so the guard is tested where the id is actually
     trusted: `_push` (ref component) and `_write_local` (file name).
+
+    ⛔ THE ESCAPE SHAPES WERE NOT THE ONLY CLASS. `a..b`, `a.` and `a.lock` escaped nothing and are
+    legal FILE names — but git REFUSES every one of them as a ref component (measured: `fatal: invalid
+    refspec`, rc 6). They passed validation, wrote the local witness, PRINTED a handle, and the push
+    then failed permanently — so the lane reads `LOCAL-ONLY`/`EXPIRED` to every peer forever. A regex
+    stricter than git is the point; a regex LOOSER than it is a handle that lies.
     """
     mod, origin, tmp_path = box
-    for bad in ("../escape", "a/b", "", ".hidden", "-dash", "x" * 200, "a\n b"):
+    for bad in ("../escape", "a/b", "", ".hidden", "-dash", "x" * 200, "a\n b",
+                # ⛔ ref-ILLEGAL but regex-plausible before this arm existed:
+                "a..b", "a.", "a.lock"):
         pushed, detail = mod._push({"lane_id": bad, "state": "RUNNING", "host": "h",
                                     "heartbeat_at": 1, "budget_s": 1, "lease_until": 2,
                                     "started_at": 1}, origin, 20.0)

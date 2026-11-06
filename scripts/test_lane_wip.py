@@ -107,3 +107,33 @@ def test_the_exit_contract_separates_a_failed_read_from_no_match(monkeypatch):
     assert lw.lane_rows() == [], "an empty fleet is a READ answer, not an abstention"
     rc, p = lw.collect("NOPE")
     assert rc == 2 and p.get("note"), (rc, p)
+
+
+def test_an_unreadable_session_file_is_still_UNMEASURED_not_exit_1(monkeypatch, tmp_path):
+    """⛔ `session_file()` PROVES THE PATH EXISTS, NOT THAT IT CAN BE READ.
+
+    The exit contract retires rc 1 precisely so "the lane matched but its activity could not be
+    read" has a name. But `getmtime()` and `open()` were unguarded, so a file owned by another user,
+    one rotated away between the glob and the open, or a DIRECTORY matching the glob raised straight
+    out of `collect()` and `main()` — the process died with rc 1 and EMPTY stdout, i.e. the retired
+    code on the one path the contract exists for. Measured: `IsADirectoryError` from `turns()`.
+
+    The stub returns a path that is REAL and matches the shape `session_file()` returns, but is a
+    directory — so the failure is the production one, not a stub artefact.
+    """
+    lw = _load()
+    vanished = tmp_path / "sid-abc12345.jsonl"
+    vanished.mkdir()                      # a DIRECTORY, as `turns()`'s `open()` would find it
+    monkeypatch.setattr(lw, "lane_rows",
+                        lambda: [{"ws": "WS1", "lane": "L1", "sid": "sid-abc12345",
+                                  "verdict": "WORKING"}])
+    monkeypatch.setattr(lw, "session_file", lambda sid: str(vanished))
+    rc, p = lw.collect("WS1")
+    assert rc == 3, "an unreadable session file is UNMEASURED (3), never the retired rc 1: %r" % (rc,)
+    assert "UNMEASURED(" in (p.get("unmeasured") or ""), p.get("unmeasured")
+    assert "unreadable" in p["unmeasured"], p["unmeasured"]
+
+    # …and the same for a file that VANISHED between the glob and the read.
+    monkeypatch.setattr(lw, "session_file", lambda sid: str(tmp_path / "gone.jsonl"))
+    rc, p = lw.collect("WS1")
+    assert rc == 3 and "UNMEASURED(" in (p.get("unmeasured") or ""), (rc, p)
