@@ -15,8 +15,9 @@
 #
 # ── WHY THIS EXISTS: tortoise#10114 ─────────────────────────────────────────────────────────────
 # MEASURED 2026-10-26 on the orchestrator box. `~/.pi/agent/scripts/pr-doctor.py` — the copy that
-# launchd ACTUALLY EXECUTES (`templates/launchd/com.tortoise.pr-doctor.plist`, ProgramArguments =
-# `{{HOME}}/.pi/agent/scripts/pr-doctor.py`) — was a 2728-line copy that predated `brief-gate.sh`'s
+# launchd ACTUALLY EXECUTES (the `com.tortoise.pr-doctor` unit's target; since agent-infra#2281 that
+# target is the wrapper `pr-doctor-machine.sh`, which `exec`s this same `pr-doctor.py` beside it, so
+# the stale-bytes class lands identically) — was a 2728-line copy that predated `brief-gate.sh`'s
 # research contract and had no `research_section()` at all. Every dispatch it built was refused
 # `rc=80`, so the entire PR-repair fleet dispatched **0 of 13** orders and the pass still reported
 # `rc=0` at the fleet level. Nine hours, no alarm.

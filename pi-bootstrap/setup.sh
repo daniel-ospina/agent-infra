@@ -634,7 +634,14 @@ fi
 # is not itself farmed; the unit names the checkout copy, which is the artifact #2877 landed and the
 # path this installer verifies before rendering. It ships DISARMED: `--install` renders a dry-run
 # unit and timer, and `--arm` (a dated owner step) is what lets the pass ACT.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
+# agent-infra#2281 §1 adds pr-doctor-machine.sh: the MACHINE-scoped entry point the
+# `com.tortoise.pr-doctor` unit execs. Before it the unit asserted ONE repo in its argv
+# (`--repo daniel-ospina/tortoise`), so a box running two repos graded exactly one and the second
+# repo's queue was read by nothing. The wrapper reads the machine repo SET (lib_srcs' repo-set.sh,
+# below) and grades every repo in it; with no set it runs the single-repo form and LOGS
+# `DEGRADED — NO-REPO-SET` every pass. Farming the unit's target is what makes it resolvable on a
+# fresh box; install-launchd.sh hard-fails the job otherwise (the same rule every farmed job gets).
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor-machine.sh pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -729,7 +736,12 @@ echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner
 # checker makes EVERY orchestrator dispatch REFUSE with `NOT SENT` (exit 7) and type nothing —
 # a fail-closed FALSE BLOCK on every lane order, which is the right direction and still a box that
 # cannot dispatch. Farm them together. (main meanwhile added `live-paths.sh`; both are carried.)
-lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py)
+# agent-infra#2281 §4 adds repo-set.sh: the machine's repo SET and the ONE reader of it. Its consumer
+# `pr-doctor-machine.sh` (fleet_srcs, above) resolves it as `$(dirname "${BASH_SOURCE[0]}")/lib/repo-set.sh`
+# — the same sibling contract and the same `lib/` → `$DEST/scripts/lib/` layout as the seven above.
+# Farming the wrapper WITHOUT this reader is a machine-wide unit that refuses every pass with a named
+# farm gap (see the wrapper's header), so the pair is delivered together.
+lib_srcs=(pid-identity.sh diff-normalize.py beat-pair.sh bounded.sh transcript-patterns.sh live-paths.sh cmux_payload.py repo-set.sh)
 mkdir -p "$DEST/scripts/lib"
 lib_copied=0
 lib_failed=0
@@ -1174,7 +1186,8 @@ fi
 # not the tree this box is pinned to. That is exactly how the original defect survived a "successful"
 # install: the farm refreshed from an Aug-7 checkout while the box was pinned elsewhere, so every
 # file it wrote was stale and NOTHING said so. launchd then executed that stale copy
-# (`com.tortoise.pr-doctor.plist` targets $DEST/scripts/pr-doctor.py) and the whole PR-repair fleet
+# (the `com.tortoise.pr-doctor` unit targets $DEST/scripts/pr-doctor-machine.sh, which `exec`s the
+# `pr-doctor.py` beside it — one farm, one stale-bytes class) and the whole PR-repair fleet
 # dispatched 0 orders for nine hours while each pass reported rc=0.
 #
 # So the deploy ends by GRADING ITS OWN RESULT: `check-farm-drift.sh` compares every deployed file
