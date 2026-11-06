@@ -1977,7 +1977,10 @@ PYEOF
   # ── THE FUNNEL'S ARITHMETIC CLOSES IN THE FLOOR BRANCH (review cycle 3, P2) ─────────────────
   # In the fail-closed floor the population IS the listing, so the swept set's parked count must not
   # be printed as an extra part: `26 PRs: 26 un-owned (0 owned, 5 parked)` does not add up.
-  grep -q 'SEL_PARKED=0' <<<"$FLOOR_SRC" 2>/dev/null || true
+  # ⛔ THE DEAD LINE THAT USED TO SIT HERE IS GONE (review cycle 5, P2 — measured). It read
+  # `grep -q 'SEL_PARKED=0' <<<"$FLOOR_SRC" 2>/dev/null || true` BEFORE `_FLOOR_SRC` was assigned, so
+  # every green run printed `line N: FLOOR_SRC: unbound variable` to stderr (and CI logged it): an
+  # assertion-shaped statement that could never assert anything. The real assertion is the `if` below.
   _FLOOR_SRC="$(sed -n '/⛔ AND THE PARKED PART DIES WITH THE POPULATION/,/FLOOR_NOTE=/p' "$ORCH")"
   if grep -q 'SEL_PARKED=0' <<<"$_FLOOR_SRC"; then
     echo "  ok the fail-closed floor re-bases the parked part (funnel arithmetic closes)"; PASS=$((PASS+1))
