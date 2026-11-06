@@ -1805,7 +1805,11 @@ def _dispatch(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         if not local_has and (remote_exists is None or not local_measured):
             payload["refused"] = "branch-existence-unmeasured"
             payload["branch"] = branch
-            payload["local"] = exists.unmeasured() if not exists.ok() else False
+            # ⛔ `exists.ok()` IS NOT "MEASURED" (review cycle 3, P2): rc=1 is a MEASURED ABSENCE, so
+            # labelling by `ok()` sent the reader to debug a local probe that had answered correctly,
+            # while the arm that actually needed fixing was the remote. The decision was right and the
+            # field lied about why.
+            payload["local"] = exists.unmeasured() if not local_measured else False
             payload["remote"] = (claimed.unmeasured() if remote_exists is None
                                  else bool(claimed.stdout.strip()))
             payload["note"] = ("the branch-existence probe could not be read, so 'free' cannot be "
@@ -1902,17 +1906,31 @@ ALLOWLIST = {
     "pgrep": (None, 4),
 }
 
-GIT_OK_VERBS = ("status", "log", "rev-parse", "ls-files", "show", "diff")
+# ⛔ THE VERB LIST IS THE BOUNDARY, NOT THE FLAG LIST (review cycle 3, P1). Three cycles tried to
+# close this class by refusing a spelling — `--output`, then `--no-index` — and each time git reached
+# the same capability another way: `git diff <file> <file>` IMPLIES `--no-index` whenever the operands
+# are not repo pathspecs, which is ALWAYS true on a cell (measured: `cmux vm exec … pwd` → `/`, and
+# `git rev-parse --is-inside-work-tree` → "not a git repository"). No flag is involved, so no flag rule
+# can see it, and `_box_exec` returns stdout whatever the rc.
+# So the surface admits only verbs that emit METADATA — never file CONTENT:
+#   status      · the worktree summary
+#   rev-parse   · object names
+#   ls-files    · path names
+# `diff`, `show` and `log` are REMOVED: each can print the contents of a file the caller names
+# (`git diff a b`, `git show HEAD:path`, `git log -p -- path`), which is the `cat` capability wearing an
+# allowlisted program. Diagnostics that genuinely need a diff belong in a lane's own shell, not in a
+# model-facing exec surface whose whole contract is "allowlisted for READING".
+GIT_OK_VERBS = ("status", "rev-parse", "ls-files")
 # ⛔ `DISK_OK_VERBS` USED TO SIT HERE AND WAS REFERENCED NOWHERE (review finding, P2). Every verb it
 # would have gated passes `None` as its prefix, so it constrained nothing while reading like an
 # enforced rule — a reader could trust it or delete it and the behaviour was identical. Deleted rather
 # than wired in: `ls` is bounded by `max_args`, which is the limit that actually applies.
-# ⛔ `--output` IS A FILE WRITE, AND THE ALLOWLIST ABOVE GATES THE VERB ONLY. Measured on this tree:
-# `git show --output=/tmp/x HEAD` → rc=0, 7762 B written; `git log --output=/tmp/x -1` → 2038 B;
-# `git diff --output=/tmp/x` likewise. The metacharacter filter does not catch it (there is no `>`), so a
-# `box.exec` call whose argv is `["git", "show", "--output=<path>"]` WRITES an arbitrary file on a
-# cell — through a gate whose own refusal text says "FAIL-CLOSED: never a pass-through" — and every
-# read-only verb above accepts it. `cat` is the same escape in reverse: plant content, read it back.
+# ⛔ `--output` IS A FILE WRITE, AND THE ALLOWLIST GATES THE VERB ONLY. MEASURED BEFORE THE VERB
+# BOUNDARY (when `show`/`log`/`diff` were still admitted): `git show --output=/tmp/x HEAD` → rc=0,
+# 7762 B written; `git log --output=/tmp/x -1` → 2038 B. Those verbs are NOT admitted any more, so that
+# route is closed twice over; the token rule is kept because it REFUSES BY SHAPE — it fires on any verb
+# that ever takes a caller-named output, including one re-admitted later. `cat` was the same escape in
+# reverse (plant content, read it back).
 # The check is a REFUSAL BY SHAPE, before the verb check, so it also covers a future verb added above.
 # ⛔ AND IT IS SCOPED TO `git`, WHICH IS THE ONLY ALLOWLISTED PROGRAM IN THIS SET WITH A CALLER-NAMED
 # OUTPUT FILE. A blanket ban false-blocked a READ-ONLY call and stated a falsehood doing it: GNU
@@ -1921,18 +1939,20 @@ GIT_OK_VERBS = ("status", "log", "rev-parse", "ls-files", "show", "diff")
 # about the reason. Scope the ban to the program whose option actually behaves that way.
 WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
 # ⛔ `--no-index` READS ARBITRARY FILES BACK, SO REMOVING `cat` CLOSED NOTHING ON ITS OWN (review cycle
-# 2, P1). Measured: `["git","diff","--no-index","<home>/.pi/agent/jev-config.json","/dev/null"]` is
-# allowlisted, hardens intact, needs no repo, and `_box_exec` returns `ran.stdout` regardless of rc — so
-# the whole file (the 0600 key store included) lands in the response, rc=1. This is the same escape the
-# code's own note describes ("plant content, read it back"), through a program that is still allowlisted.
-# Refused BY SHAPE, like `--output`, so a future verb inherits the refusal.
+# 2, P1). MEASURED BEFORE THE VERB BOUNDARY: `["git","diff","--no-index","<home>/.pi/agent/jev-config.json",
+# "/dev/null"]` passed the allowlist, hardened intact, needed no repo, and `_box_exec` returns
+# `ran.stdout` regardless of rc — so the whole file (the 0600 key store included) landed in the response.
+# The verb is refused now, so this token rule is BELT-AND-BRACES: it refuses BY SHAPE and therefore
+# covers any content-emitting verb that is ever re-admitted, without depending on that verb's identity.
 READ_ESCAPE_TOKENS = ("--no-index",)
 # ⛔ A THIRD SHAPE: THESE FLAGS MAKE GIT EXECUTE A PROGRAM. `--ext-diff` runs `diff.external` (or a
 # `diff.<driver>.command`) and `--textconv` runs a `textconv` driver — both NAMED IN THE TARGET REPO's
 # config / `.gitattributes`, i.e. chosen by anything that can write the checkout the exec lands in.
 # Same class as the `["/tmp/evil/git", …]` bypass above (a caller-chosen program running under this
-# surface's authority), reached through a verb that IS read-only — so the verb gate cannot see it, and
-# neither can the metacharacter filter (there is no shell metacharacter in either flag).
+# surface's authority). Historically these were reached through a verb that WAS read-only, so the verb
+# gate could not see them; today `diff`/`show`/`log` are refused, and these flags are refused by shape
+# so a re-admitted verb inherits the refusal. Neither flag carries a shell metacharacter, so the
+# metacharacter filter could never see them either.
 EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature", "--remerge-diff")
 # ⛔ ABBREVIATIONS ARE NOT A HOLE, AND THIS COMMENT SAID THEY WERE. `--ext-diff`/`--textconv` are
 # parsed EXACT-MATCH in git's diff.c, so `--ext`, `--ext-d`, `--textc`, `--textco` all give
@@ -1943,11 +1963,15 @@ EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature", "--remerge
 # whole flag surface; the CONFIG surface is pinned in `GIT_PIN_CONFIG`.
 # ⛔ AND REFUSING TWO FLAG SPELLINGS DOES NOT CLOSE THE CLASS — THE TRIGGER IS THE TARGET REPO'S
 # CONFIG, NOT A FLAG. Porcelain git runs repo-configured helpers BY DEFAULT, with no flag at all.
-# Every key below NAMES A PROGRAM that a READ verb on this surface can reach; each is pinned to a fixed
-# value so the program that runs (if any) is ours, never the repo's:
+# Every key below NAMES A PROGRAM that a READ verb on this surface can reach TODAY, or could reach if a
+# content-emitting verb returns; each is pinned to a fixed value so the program that runs (if any) is
+# ours, never the repo's. The per-key annotations say which is which:
 #   core.fsmonitor            -> runs on `status` (and any index read)
-#   core.alternateRefsCommand -> a SHELL command, run by `log --alternate-refs`
-#   log.showSignature=true    -> turns every plain `log`/`show` into a gpg invocation
+#   core.alternateRefsCommand -> a SHELL command, reachable only from `log --alternate-refs`; `log` is
+#                                NOT an admitted verb, so nothing on this surface reaches it — pinned
+#                                anyway, so a future content-emitting verb cannot arrive with this open
+#   log.showSignature=true    -> turns a plain `log`/`show` into a gpg invocation; same position
+#                                (neither verb is admitted), same reason to keep the pin
 #   gpg.program               -> the OPENPGP verifier; `gpg.<format>.program` is a SEPARATE key per
 #                                format (`git help --config` lists all three), so pinning only this
 #                                one left x509/ssh signatures running a repo-named program
@@ -1959,8 +1983,9 @@ EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature", "--remerge
 # deliberately NOT here, with the reason each is out of reach: `core.editor`, `sequence.editor`
 # (commit/rebase); `notes.rewrite.<command>` (commit/amend); `gpg.ssh.defaultKeyCommand` (SIGNING —
 # verification uses `gpg.ssh.program`, which IS pinned); `diff.external`, `diff.<driver>.command`,
-# `diff.<driver>.textconv`, `diff.<driver>.cachetextconv` (the diff machinery — disarmed per-argv by
-# GIT_HOOK_FLAGS, which also covers a driver a caller cannot anticipate); `completion.commands`,
+# `diff.<driver>.textconv`, `diff.<driver>.cachetextconv` (the diff machinery — out of reach because
+# `diff`/`show`/`log` are NOT ADMITTED VERBS any more, so no per-argv disarm is needed or emitted;
+# the boundary is the verb list, not a flag); `completion.commands`,
 # `rebase.abbreviateCommands`, `color.pager` (not executables a read verb runs); `gc.recentObjectsHook`,
 # `uploadpack.packObjectsHook`, `browser.<tool>.cmd`, `man.<tool>.cmd`, `difftool.<tool>.cmd`,
 # `sendemail.*Cmd`, `interactive.diffFilter` (verbs/flows `GIT_OK_VERBS` never admits).
@@ -1988,16 +2013,25 @@ GIT_PIN_CONFIG = (
 # `--no-pager` is a GLOBAL option and the only thing that neutralises `pager.<cmd>`, which takes
 # precedence over `core.pager` PER COMMAND and cannot be enumerated.
 GIT_GLOBAL_FLAGS = ("--no-pager",)
-GIT_DIFF_VERBS = ("diff", "log", "show")
-GIT_HOOK_FLAGS = ("--no-ext-diff", "--no-textconv")
+# ⛔ `GIT_DIFF_VERBS`/`GIT_HOOK_FLAGS` USED TO SIT HERE, appending `--no-ext-diff --no-textconv` for
+# `diff`/`log`/`show`. They are GONE: once the VERB LIST became the boundary those three stopped being
+# admitted, so the constants were disjoint from `GIT_OK_VERBS` and the branch could never fire — an
+# inert enforcer that still read as the protection against a config-named diff driver. Same call this
+# file already made for `DISK_OK_VERBS`. Keeping it "in case the boundary loosens" would be a guard no
+# test can reach and no run can exercise. If a content-emitting verb is ever re-admitted, the disarm
+# comes back WITH the verb and with an arm that reds when it is removed — that is a boundary change,
+# never a flag re-added silently.
 # ⛔ THE CLASS THAT CANNOT BE PINNED, AND WHY ENUMERATING KEYS WAS THE WRONG SHAPE. These keys' names
 # are UNBOUNDED and come from the checkout itself (a driver name in `.gitattributes`, a remote name),
 # so there is nothing to write into `GIT_PIN_CONFIG`:
-#   filter.<driver>.clean|smudge|process -> runs for `status`/`diff` on ANY dirty path whose attributes
-#       name the driver, and its STDOUT becomes the blob content (so it can also forge what those
-#       verbs report). Measured: a plain `git status` in a repo with `filter.evil.clean` runs it.
-#   merge.<driver>.driver -> runs for `log`/`show --remerge-diff`. A MERGE driver, not a diff driver,
-#       so `--no-ext-diff`/`--no-textconv` do not disarm it.
+#   filter.<driver>.clean|smudge|process -> runs for `status` on ANY dirty path whose attributes name
+#       the driver, and its STDOUT becomes the blob content (so it can also forge what that verb
+#       reports). Measured: a plain `git status` in a repo with `filter.evil.clean` runs it. THIS ONE
+#       IS STILL LIVE — `status` IS an admitted verb — which is why the class is refused by shape in
+#       `_allowlisted` rather than left to the pins.
+#   merge.<driver>.driver -> a MERGE driver, reachable only from `show --remerge-diff`, and `show` is
+#       not an admitted verb. Kept in the refusal set because its KEY NAME comes from the checkout and
+#       cannot be pinned; do not read it as a live reach.
 #   a PARTIAL CLONE / promisor remote turns an OBJECT READ into a LAZY FETCH, which runs the repo's
 #       TRANSPORT program: `core.sshCommand`, `remote.<name>.proxy`, or `remote.<name>.url =
 #       ext::<program>` (the last survives pinning the helpers, which is exactly why the pins alone
@@ -2153,43 +2187,23 @@ def _repo_config_fault(cmux: str, target: str, timeout_s: int) -> Tuple[str, boo
 
 
 def _harden_argv(argv: List[str]) -> List[str]:
-    """Close the configuration escapes that no allowlist entry can see.
+    """Pin git configuration that NAMES A PROGRAM, so an admitted verb cannot reach it.
 
-    A plain, fully-allowlisted `git diff` still spawns a program named in git CONFIG
-    (`diff.external`, `diff.<driver>.textconv`) or in `GIT_EXTERNAL_DIFF`; `git log -p` and
-    `git show` reach the SAME diff machinery; and `git status` runs `core.fsmonitor`. The program
-    allowlist bounds the PROGRAM and the argv bounds the FLAGS — configuration escaped both, which is
-    the same class as the `--output` write the surface already refuses.
+    ⛔ THIS IS NO LONGER A DIFF-DISARM, AND SAYING IT WAS WOULD TEACH THE WRONG LAYER. Every admitted
+    git verb (`status`, `rev-parse`, `ls-files`) runs under `GIT_PIN_CONFIG` + `GIT_GLOBAL_FLAGS`, so a
+    program named in config — `core.fsmonitor`, `pager.<cmd>`, `gpg.*.program`, `core.sshCommand`,
+    `core.gitProxy`, credential helpers — cannot be reached by the verb alone. That is the class behind
+    the `--output`, `--no-index` and implicit-`--no-index` escapes in sequence: each closed one
+    spelling, and the boundary finally moved to the VERB.
 
-    `cmux vm exec` forwards no environment, so a hardened env cannot be passed: the guarantee has to
-    travel inside the argv. Three placement rules, each load-bearing:
+    `diff`, `log` and `show` are NOT admitted any more (they can print a file's contents — `git diff
+    <file> <file>` implies `--no-index` outside a repo, and a cell's exec cwd is `/`), so the
+    `--no-ext-diff --no-textconv` pair is no longer emitted here: it became inert the moment the verb
+    list became the boundary, and an inert guard that reads as the protection is worse than its absence.
 
-    * `-c <key>=…` pins every repo-config key that NAMES A PROGRAM and is reachable by the verbs this
-      surface allows (`GIT_PIN_CONFIG`), and `--no-pager` is a GLOBAL option (so it precedes the verb)
-      and the only thing that neutralises `pager.<cmd>`. `-c` beats every config FILE, including one
-      pulled in by `include.path`.
-    * `--no-ext-diff`/`--no-textconv` are DIFF options, so they follow the verb, and they are emitted
-      TWICE: once IMMEDIATELY after the verb, and once LAST among options. Both copies are
-      load-bearing, and neither alone is enough:
-        - the LAST copy is what beats a caller flag that would re-enable a hook (git honours the last
-          occurrence) — but a caller-supplied VALUE-TAKING option swallows it: measured,
-          `git diff --dst-prefix --no-ext-diff --no-textconv` makes `--dst-prefix` consume
-          `--no-ext-diff` as its VALUE (rc 0, no "invalid option", and `diff.external` runs), so
-          "last" is only last among the tokens that ARE flags;
-        - the FIRST copy cannot be swallowed by anything, because it is the first token after the
-          verb and no caller token can precede it — so the disables are applied whatever the caller
-          does afterwards.
-      Together they mean a caller cannot both re-enable a hook and swallow the disarm. There is
-      deliberately NO abbreviation rule to go with them: `--ext-diff`, `--textconv` and
-      `--show-signature` are parsed EXACT-MATCH by git (`--ext`, `--textc`, `--show-sig` are all
-      `error: invalid option`, measured), so a prefix cannot reach them — and an earlier revision
-      that refused every `--ex…` FALSE-BLOCKED `git ls-files --others --exclude-standard`.
-    * LAST means last BEFORE the `--` separator, never after it: everything following `--` is a
-      PATHSPEC. Appending past it would harden NOTHING and add a bogus path, so the completely
-      ordinary `git diff -- .` would silently defeat the guard.
-
-    `git log` is covered with `diff`/`show` because `git log -p` consults the same diff machinery. A
-    non-git argv is returned as a copy, unchanged.
+    `cmux vm exec` forwards no environment, so a hardened env cannot be passed: the guarantee travels
+    inside the argv. `-c <key>=…` beats every config FILE (including one reached through
+    `include.path`), and `--no-pager` is a GLOBAL option, so it precedes the verb.
     """
     out = list(argv)
     if not out or out[0] != "git":
@@ -2205,13 +2219,6 @@ def _harden_argv(argv: List[str]) -> List[str]:
         head += ["-c", pin]
     head += list(GIT_GLOBAL_FLAGS)
     out = head + [verb] + rest[1:]
-    if verb in GIT_DIFF_VERBS:
-        # FIRST copy: immediately after the verb, where no caller token can precede it (or swallow
-        # it), so the disables are applied whatever the caller does later.
-        out = head + [verb] + list(GIT_HOOK_FLAGS) + rest[1:]
-        # LAST copy: at the end of the options, so it beats a caller flag that re-enables a hook.
-        sep = out.index("--") if "--" in out else len(out)
-        out = out[:sep] + list(GIT_HOOK_FLAGS) + out[sep:]
     return out
 
 def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[bool, Dict[str, Any]]:
@@ -2316,7 +2323,7 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
 def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
     # ⛔ THE ALLOWLIST PINS A **NAME**, SO THE NAME IS EXACTLY WHAT MAY BE PASSED. Matching
     # `basename(argv[0])` let `["/tmp/evil/git", "status"]`, `["./git", "status"]` and
-    # `["../../bin/git", "log"]` all pass (verified) — i.e. any file named an allowlisted program, at
+    # `["../../bin/git", "status"]` all pass (verified) — i.e. any file named an allowlisted program, at
     # a CALLER-CHOSEN path, executed under this surface's authority. `/tmp` on a cell is writable by
     # anything else running there, so a planted `git`/`cat`/`ls` was reachable through a gate whose own
     # contract says "a command that is not on the allowlist is a TYPED REFUSAL, never a pass-through"

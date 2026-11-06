@@ -1469,11 +1469,14 @@ def test_T_saved_work_unreadable_is_unmeasured_never_none(tmp_path):
 def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, monkeypatch):
     """⛔ THE CLASS THAT CANNOT BE PINNED, SO IT IS REFUSED INSTEAD.
 
-    `filter.<driver>.clean` runs for `status`/`diff` on any dirty path whose `.gitattributes` names
-    the driver — measured: a plain `git status` in a repo with `filter.evil.clean` executes it, and
-    its STDOUT becomes the blob content (so it can also forge what the verb reports).
-    `merge.<driver>.driver` is a MERGE driver, reached by `show --remerge-diff`; neither is disarmed by
-    `--no-ext-diff`/`--no-textconv`. Their KEY NAMES come from the checkout, so no `-c` pin can address
+    `filter.<driver>.clean` runs for `status` on any dirty path whose `.gitattributes` names the
+    driver — `status` is the ONLY admitted verb that reaches it (the `diff` half of this class is gone
+    with the verb boundary). Measured: a plain `git status` in a repo with `filter.evil.clean` executes
+    it, and its STDOUT becomes the blob content (so it can also forge what the verb reports).
+    `merge.<driver>.driver` is a MERGE driver whose only route in was `show --remerge-diff` — and
+    `show` is not an admitted verb any more, so that route is closed at the verb boundary; the key stays
+    unpinnable (its NAME comes from the checkout) and refusing it remains correct either way. Their KEY
+    NAMES come from the checkout, so no `-c` pin can address
     them. And a PARTIAL CLONE turns an object read into a LAZY FETCH, which runs the repo's transport
     program (`core.sshCommand`, `remote.<name>.proxy`, or an `ext::<program>` URL that survives pinning
     the helpers).
@@ -1649,7 +1652,7 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
 
 
 def test_T_box_exec_disables_the_program_git_config_can_name():
-    """[P1, review] A fully-allowlisted `git diff` still runs `diff.external` FROM CONFIG, with no flag.
+    """[P1, review] BEFORE THE VERB BOUNDARY, a fully-allowlisted `git diff` ran `diff.external` FROM CONFIG.
 
     Measured before this fix: with `diff.external` set (or `GIT_EXTERNAL_DIFF` in the env), argv
     `["git","diff"]` — every element allowlisted — spawned that program. The program allowlist bounded
@@ -1667,8 +1670,8 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
                 "gpg.program=/bin/false", "core.pager=cat", "core.hooksPath=/dev/null",
                 # ⛔ `gpg.program` IS THE OPENPGP VERIFIER ONLY. `gpg.<format>.program` is a SEPARATE
                 # key per format (all three are listed by `git help --config`), so pinning the first
-                # left x509/ssh signatures running a repo-named program — measured through a fully
-                # allowlisted `git log --show-signature`.
+                # left x509/ssh signatures running a repo-named program — MEASURED, when `log` was
+                # still an allowlisted verb, through `git log --show-signature`.
                 "gpg.openpgp.program=/bin/false", "gpg.x509.program=/bin/false",
                 "gpg.ssh.program=/bin/false"):
         assert key in mod.GIT_PIN_CONFIG, key
@@ -1677,47 +1680,39 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     for pin in mod.GIT_PIN_CONFIG:
         expected_head += ["-c", pin]
     expected_head += list(mod.GIT_GLOBAL_FLAGS)
-    assert mod._harden_argv(["git", "diff"])[:len(expected_head)] == expected_head, \
-        mod._harden_argv(["git", "diff"])
-    tail = mod._harden_argv(["git", "diff"])[len(expected_head):]
-    assert tail == ["diff", "--no-ext-diff", "--no-textconv", "--no-ext-diff", "--no-textconv"], \
-        tail
+    # ⛔ `diff` IS NO LONGER AN ADMITTED VERB (review cycle 3, P1 — the boundary moved from the flag to
+    # the verb), and `_harden_argv` pins only admitted verbs, so a diff argv now comes back untouched.
+    # That is the correct shape: the argv is refused BEFORE execution, so hardening it would only
+    # matter to a future reader. The disarm contract is therefore pinned on the admitted verbs.
+    assert mod._harden_argv(["git", "diff"]) == ["git", "diff"], mod._harden_argv(["git", "diff"])
+    for admitted in ("status", "rev-parse", "ls-files"):
+        pinned = mod._harden_argv(["git", admitted])
+        assert pinned[:len(expected_head)] == expected_head, (admitted, pinned)
+        assert pinned[len(expected_head):] == [admitted], pinned
     # `status` carries the pins and nothing else — it has no diff machinery to disarm
     assert mod._harden_argv(["git", "status"])[-1] == "status"
     assert "--no-ext-diff" not in mod._harden_argv(["git", "status"])
-    # ⛔ THE PAIR IS EMITTED TWICE, AND BOTH COPIES ARE LOAD-BEARING — see `_harden_argv`. The FIRST
-    # copy is the only one a value-taking option cannot swallow (nothing can precede it); the LAST is
-    # the only one that beats a caller flag that would re-enable a hook. Measured with
-    # `git diff --dst-prefix --no-ext-diff --no-textconv`: `--dst-prefix` consumes `--no-ext-diff` as
-    # its VALUE (rc 0, no "invalid option") and the external driver runs.
-    hardened = mod._harden_argv(["git", "diff", "--dst-prefix"])
-    assert hardened.count("--no-ext-diff") == 2 and hardened.count("--no-textconv") == 2, hardened
-    # ⛔ AND THE RE-ENABLING SPELLINGS NEVER REACH THE ARGV: both are refused by exact token, and their
-    # abbreviations are `invalid option` IN GIT (measured) — so no stem rule is needed, and none is
-    # applied (an earlier revision refused every `--ex…` and thereby FALSE-BLOCKED the bounded-search
-    # primitive `git ls-files --others --exclude-standard`, which is pinned allowed below).
+    # ⛔ THE DISARM CONTRACT IS NOW MOOT FOR THE ALLOWLISTED VERBS, AND THAT IS THE POINT (review cycle
+    # 3, P1). The pair below used to be emitted for `diff`/`show`/`log`; those verbs are REFUSED at the
+    # verb boundary now, because `git diff <file> <file>` reaches the same file contents with NO flag at
+    # all (it implies `--no-index` outside a repo, and a cell's exec cwd is `/`). `_harden_argv`
+    # therefore leaves a refused verb untouched — pinning a flag on an argv that never runs would be
+    # decoration, and the earlier "two copies" assertions were pinning exactly that.
+    assert mod._harden_argv(["git", "diff", "--dst-prefix"]) == ["git", "diff", "--dst-prefix"], \
+        mod._harden_argv(["git", "diff", "--dst-prefix"])
+    # ⛔ AND THE RE-ENABLING SPELLINGS NEVER REACH THE ARGV: the verb itself is refused, so no token
+    # rule is needed. (An earlier revision refused every `--ex…` and thereby FALSE-BLOCKED the
+    # bounded-search primitive `git ls-files --others --exclude-standard`, pinned allowed below.)
     for tok in ("--ext-diff", "--textconv", "--show-signature", "--remerge-diff"):
         assert mod._allowlisted(["git", "diff", tok])[0] is False, tok
     # the transport axis is pinned as defence in depth (the CONTROL is the fail-closed pre-check)
     assert "protocol.ext.allow=never" in mod.GIT_PIN_CONFIG
     assert "core.sshCommand=/bin/false" in mod.GIT_PIN_CONFIG
-    for argv in (["git", "ls-files", "--others", "--exclude-standard"],
-                 ["git", "ls-files", "--exclude=*.pyc"],
-                 ["git", "log", "--extended-regexp", "--grep=one"],
-                 ["git", "log", "--text"]):
-        assert mod._allowlisted(argv)[0] is True, argv
-    # ⛔ AND LAST MEANS LAST BEFORE `--`, NEVER AFTER IT. Everything following the separator is a
-    # PATHSPEC, so an append past it hardens NOTHING and adds a bogus path — `git diff -- .` is an
-    # ordinary invocation, so that placement would let a caller defeat the guard by accident.
-    assert mod._harden_argv(["git", "diff", "--", "src/"])[-4:] == [
-        "--no-ext-diff", "--no-textconv", "--", "src/"], \
-        mod._harden_argv(["git", "diff", "--", "src/"])
-    # `git log -p` reaches the SAME diff machinery, so it is covered with `diff`/`show`.
-    assert mod._harden_argv(["git", "log", "-p"])[-2:] == ["--no-ext-diff", "--no-textconv"], \
-        mod._harden_argv(["git", "log", "-p"])
-    # a non-git program and a non-verb are untouched — the hardening is scoped, not a blanket append
-    assert mod._harden_argv(["cat", "/etc/hostname"]) == ["cat", "/etc/hostname"]
-    assert mod._harden_argv(["git", "--version"]) == ["git", "--version"]
+    # ⛔ THE ONE BOUNDED-SEARCH PRIMITIVE THAT MUST STAY ALLOWED — it is the reason a stem rule on
+    # `--ex…` was reverted.
+    assert mod._allowlisted(["git", "ls-files", "--others", "--exclude-standard"])[0] is True
+    assert mod._allowlisted(["git", "ls-files", "--exclude=*.pyc"])[0] is True
+
 
 
 def test_T_lane_dispatch_refuses_when_branch_existence_cannot_be_read(tmp_path, monkeypatch):
@@ -1772,11 +1767,19 @@ def test_T_box_exec_refuses_the_read_back_escapes_cat_left_open():
     for probe in (["git", "diff", "--no-index", "/etc/shadow", "/dev/null"],
                   ["git", "diff", "--no-index=/etc/shadow", "/dev/null"]):
         ok, why = mod._allowlisted(probe)
-        assert not ok and "--no-index" in why, (probe, ok, why)
-    # the legitimate forms still pass
-    assert mod._allowlisted(["git", "diff"])[0]
-    assert mod._allowlisted(["git", "status"])[0]
-    assert mod._allowlisted(["ls", "/tmp"])[0]
+        # the refusal may name the token (flag era) or the verb (the current boundary) — both are
+        # refusals, and pinning the exact wording would break the next time the boundary tightens
+        assert not ok and ("--no-index" in why or "not on the allowlist" in why), (probe, ok, why)
+    # ⛔ THE BOUNDARY IS THE VERB, NOT THE FLAG (review cycle 3, P1). `git diff` reached file contents
+    # WITHOUT any flag — `git diff <file> <file>` implies `--no-index` when the operands are not repo
+    # pathspecs, which is always true on a cell (its exec cwd is `/`). So `diff`/`show`/`log` are gone
+    # from the allowlist entirely, and the legitimate forms are the METADATA verbs.
+    for verb in ("diff", "show", "log"):
+        ok, why = mod._allowlisted(["git", verb])
+        assert not ok, (verb, ok, why)
+        assert "not read-only" in why or "not on the allowlist" in why, (verb, why)
+    for probe in (["git", "status"], ["git", "rev-parse", "HEAD"], ["git", "ls-files"], ["ls", "/tmp"]):
+        assert mod._allowlisted(probe)[0], probe
 
 
 def test_T_pr_queue_refuses_every_unrecognised_shape_not_just_one(tmp_path, monkeypatch):
@@ -1842,5 +1845,53 @@ def test_T_lane_dispatch_fresh_branch_proceeds_and_remote_only_refuses(tmp_path,
         is_err, payload = one(mod, "lane.dispatch", {"name": "F2", "worktree": str(wt),
                                                     "brief": str(brief), "branch": "remote-only"})
         assert is_err and payload["refused"] == "branch-exists", payload
+    finally:
+        monkeypatch.undo()
+
+
+def test_T_lane_dispatch_local_field_and_unreadable_local_probe(tmp_path, monkeypatch):
+    """[P2 x2, review cycle 3] Two halves of the same guard that nothing pinned.
+
+    (a) A MEASURED absence (rc=1 from `rev-parse --verify --quiet`) must not be labelled UNMEASURED. The
+        decision was right and the field lied about why, sending the reader to debug a local probe that
+        had answered correctly while the remote was the thing that needed fixing.
+    (b) `exists.rc in (0, 1)` is load-bearing: without it, a probe that could not RUN (rc=128 — a
+        non-repo worktree) reads as a measured absence and the dispatch proceeds. That mutation left the
+        whole selection green, so this arm constructs the case.
+    """
+    import subprocess
+    mod = _saved_mod()
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        brief = tmp_path / "b.md"
+        brief.write_text("x")
+        monkeypatch.setenv("O", str(tmp_path / "o"))
+        (tmp_path / "o" / "bg").mkdir(parents=True)
+
+        # (a) repo WITH a worktree but NO origin → local probe ANSWERS (rc=1, measured absent),
+        #     remote probe fails → refusal, and `local` must be False, not UNMEASURED.
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        subprocess.run(["git", "init", "-q", str(wt)], check=True)
+        subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        is_err, payload = one(mod, "lane.dispatch", {"name": "P1", "worktree": str(wt),
+                                                    "brief": str(brief), "branch": "nope-1"})
+        assert is_err and payload["refused"] == "branch-existence-unmeasured", payload
+        assert payload["local"] is False, payload          # MEASURED, not UNMEASURED
+        assert "UNMEASURED(" in str(payload["remote"]), payload
+
+        # (b) worktree is NOT a repo at all → the local probe cannot RUN (rc=128) → still a refusal,
+        #     even with a readable origin whose branch list is empty.
+        origin = tmp_path / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        notrepo = tmp_path / "notrepo"
+        notrepo.mkdir()
+        (tmp_path / "o" / "bg" / "P2.pid").write_text("777\n")
+        monkeypatch.setenv("ORCH_MCP_DISPATCH", stub(tmp_path, "d-ok2.sh", "print('launched')"))
+        is_err, payload = one(mod, "lane.dispatch", {"name": "P2", "worktree": str(notrepo),
+                                                    "brief": str(brief), "branch": "nope-2"})
+        assert is_err and payload["refused"] == "branch-existence-unmeasured", payload
+        assert "UNMEASURED(" in str(payload["local"]), payload
     finally:
         monkeypatch.undo()
