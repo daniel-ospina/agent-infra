@@ -44,7 +44,7 @@ CTL, PORT = sys.argv[1], int(sys.argv[2])
 # which is exactly the drift the single-source rule exists to make impossible.
 ADVERTISED = {
     "tortoise_get_entity",
-    "tortoise_overview",
+    "tortoise_graph_overview",
     "tortoise_search",
     "tortoise_create_point",
     "tortoise_create_operator",
@@ -59,19 +59,25 @@ ADVERTISED = {
 # argument KEYS against these declared properties, and the write tools' `required` against the
 # declared essential set.
 #
-# MEASURED, not assumed: read from the hosted surface's own `tools/list` (69 tools) with
-# scripts/tortoise_graph_client.py on 2026-11-05. The COUNT moves as the surface moves, so it is
-# dated; the PROPERTIES below are what the assertions read, and re-measuring them is the way to
-# refresh this fixture when the surface changes. `semantics` is the current spelling on
-# `tortoise_create_operator` — `label` (the self-hosted SDK's name) is NOT declared, which is the
-# whole point of the arm.
+# MEASURED, not assumed: read from the hosted surface's own `tools/list` with
+# `scripts/tortoise_graph_client.py` and a direct keyed `tools/list` call on **2026-11-06** (66 tools).
+# ⛔ THE PREVIOUS PIN WAS ONE DAY STALE AND IT PINNED A RETIRED TOOL. It was dated 2026-11-05 with 69
+# tools and listed `tortoise_overview` as advertised; #3883 retired that handler, so `health`/`stats`
+# called a name the surface no longer advertises and the client's own RETIRED guard turned both verbs
+# into exit 4 — WHILE ALL 25 ARMS STAYED GREEN, because the fixture asserted the retired name. That is
+# the whole failure mode a fixture has: it does not detect drift, it FREEZES it. Re-measure against the
+# live surface when this goes stale; do not hand-edit a property list from memory.
+# The COUNT moves as the surface moves, so it is dated; the PROPERTIES below are what the assertions
+# read, and re-measuring them is the way to refresh this fixture when the surface changes. `semantics`
+# is the current spelling on `tortoise_create_operator` — `label` (the self-hosted SDK's name) is NOT
+# declared, which is the whole point of the arm.
 SERVED_SCHEMA = {
     "tortoise_get_entity": {
         "properties": ["graph", "id", "limit", "type"],
         "required": [],
     },
-    "tortoise_overview": {
-        "properties": ["days", "entity_id", "graph", "limit", "section"],
+    "tortoise_graph_overview": {
+        "properties": ["days", "domain", "entity_id", "graph", "limit", "point_kinds", "section"],
         "required": [],
     },
     "tortoise_search": {

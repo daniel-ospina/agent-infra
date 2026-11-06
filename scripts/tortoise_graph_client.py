@@ -106,7 +106,11 @@ def tool(name, args=None, allow_empty=True):
     # payload — so `get`/`health`/`stats` printed their JSON *plus* a paragraph, and the documented
     # contract ("prints the tool result as JSON on stdout") silently stopped holding while every exit
     # code stayed 0 (#3883 retired `tortoise_get_point`, `tortoise_health` and
-    # `tortoise_list_pointkinds` after the verbs below were written). Failing CLOSED here, rather than
+    # `tortoise_list_pointkinds` after the verbs below were written). ⛔ AND #3883 KEPT GOING: it also
+    # retired `tortoise_overview`, the handler those first three were pointed AT, so the replacement
+    # can itself be retired out from under this file. `tortoise_graph_overview(section=…)` is the
+    # currently advertised orientation handler; verify with `tools/list`, never with this comment.
+    # Failing CLOSED here, rather than
     # stripping the notice, is deliberate: stripping would hide the NEXT retirement behind a clean
     # exit 0, which is the failure this whole file exists to prevent. The verbs below call the
     # ADVERTISED handlers; this arm is what makes a future retirement loud instead of corrupt.
@@ -114,7 +118,7 @@ def tool(name, args=None, allow_empty=True):
         sys.stderr.write(
             "GRAPH-RETIRED-TOOL(%s): the server reports this tool as RETIRED and mixes the notice into "
             "the payload, so its answer is not the tool's result. Call the advertised handler instead "
-            "(`tortoise_overview`, `tortoise_get_entity`, `tools/list`). Refusing to print it.\n" % name
+            "(`tortoise_graph_overview`, `tortoise_get_entity`, `tools/list`). Refusing to print it.\n" % name
         )
         sys.stderr.write("  server notice: %s\n" % RETIRED.search(text).group(0)[:300])
         sys.exit(4)
@@ -145,9 +149,11 @@ def main(argv):
 
     if verb == "health":
         # ⛔ `tortoise_health` is RETIRED (#3883): it still answers, but is no longer advertised and
-        # appends a retirement notice to its payload. `tortoise_overview(section="health")` is the
-        # advertised handler and returns the SAME object (measured at 30629-point graph size).
-        print(tool("tortoise_overview", {"section": "health"}))
+        # appends a retirement notice to its payload. `tortoise_graph_overview(section="health")` is
+        # the advertised handler and returns the SAME object (measured live at a 31248-point graph
+        # size — `tools/list` advertises `tortoise_graph_overview` and NOT `tortoise_overview`, which
+        # #3883 also retired; calling the retired name made this verb exit 4 on every box).
+        print(tool("tortoise_graph_overview", {"section": "health"}))
         return 0
 
     if verb == "search":
@@ -173,7 +179,7 @@ def main(argv):
     if verb == "stats":
         # also retired (#3883); the `pointkinds` section is the advertised equivalent and returns the
         # identical `[{"kind": …, "count": …}, …]` payload.
-        print(tool("tortoise_overview", {"section": "pointkinds"}))
+        print(tool("tortoise_graph_overview", {"section": "pointkinds"}))
         return 0
 
     if verb in ("evidence", "decision"):
