@@ -154,6 +154,42 @@ function forkw(p,   q) {
   if (!sub(/(for|select)$/, "", q)) return 0
   return (q ~ /(^|[;&|({})])[ \t"']*$/)
 }
+# ⛔ ARITHMETIC CONTEXT IS A PROPERTY OF THE LINE, NOT OF THE TOKEN'S IMMEDIATE LEFT (review round 5,
+# P2 — measured). `(( (X[0] = 83) ))` and `(( 1 && (X[0] = 83) ))` ASSIGN 83 (`bash -c 'unset X;
+# (( 1 && (X[0] = 83) )); echo $X'` → 83), and a test anchored at the token (`\(\([^()]*$`) sees only
+# the parens it happens to stand behind — one paren deeper it matches nothing and the line reads GREEN
+# with 0 rows. Count DEPTH instead: an UNBALANCED run of `(` that CONTAINS a `((` is a context still
+# open at the token. `while (( i < n )); do X[0] = 83` is correctly OUTSIDE it (the `))` closed), and
+# `(( a[0] = 83 )) && (( b[0] = 83 ))` correctly inside it on BOTH tokens — the case a naive
+# "has `((` and no `))`" test would fail OPEN on. A closed `((` in an earlier statement therefore
+# cannot silence a later declaration, which is the property that makes depth right and a substring
+# test wrong. The string case (`echo "(( "`) only makes this more eager — a FALSE RED, the visible
+# direction this file deliberately chooses over a silent drop.
+function arithctx(p,   i, depth, st, ch) {
+  depth = 0
+  st = 0
+  for (i = 1; i <= length(p); i++) {
+    ch = substr(p, i, 1)
+    if (ch == "(") { depth++; if (substr(p, i, 2) == "((") st = 1 }
+    else if (ch == ")") depth--
+  }
+  return (st && depth > 0)
+}
+# ⛔ ONE PREFIX-ASSIGNMENT OPERAND IS A COMMAND BOUNDARY (review round 5, P2 — measured). The foreign
+# net asked `cmdpos || decl_operand` of the text before the name, and `FOO=1 ` is neither — so
+# `FOO=1 AGENT_MEM_GATE=81` bound 81 into the variable and emitted NO ROW, while the FAMILY net refused
+# the identical `FOO=1 AGENT_NEW_GATE_REFUSED=83` (0 rows vs RED, decided by the name's namespace — the
+# asymmetry `residual()` already records as fixed on its own path). A pure `WORD=value …` prefix list
+# is a command position. It is NOT a licence for `echo AGENT_MEM_GATE=81`: the whole remainder must be
+# assignment tokens, so the leading command name fails the test.
+function prefixonly(q,   t) {
+  if (q == "") return 0
+  # ⛔ THE TRAILING SEPARATOR IS PART OF THE SHAPE — never `gsub` it away (measured: stripping it made
+  # `FOO=1` the whole operand and the `[ \t]+` that proves "this token ended" had nothing to match, so
+  # the arm silently never fired).
+  t = q
+  return (t ~ /(^|[;&|({})])[ \t"']*([A-Za-z_][A-Za-z0-9_]*=[^ \t]*[ \t]+)+$/)
+}
 # The value: everything up to the first character that can end it (`X=$y`, `X=83;`, `X=83 # note`,
 # `${X:-83}`), or up to the matching quote when the operand is QUOTED (`${X:-"81"}`, `X='83'`). The
 # quoted form is not decoration: cutting at the leading quote turned `${X:-"81"}` into an EMPTY value,
@@ -299,8 +335,8 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v, _r, _arith) {
   # while the real assignment `(( X[0] = 83 ))` one space away read GREEN. `[^=]` after the `=` is the
   # same exclusion the sibling `^=([^=]|$)` arm already uses; `[^=]` still matches every operand that
   # declares a code (`=83`, `="83"`, `:=83`, `+=83`), so nothing is lost on the fail-closed side.
-  _arith = (pre ~ /\(\([ \t]*$/)
-  if (tail ~ /^\[.*\][:]?\+?=[^=]/ || (_arith && tail ~ /^\[.*\][ \t]*:?[+]?=[^=]/)) {
+  _arith = arithctx(pre)
+  if (tail ~ /^\[.*\][:]?\+?=([^=]|$)/ || (_arith && tail ~ /^\[.*\][ \t]*:?[+]?=([^=]|$)/)) {
     print "unparseable", name, s, f, ln; return
   }
   # ⛔ A QUOTED OPERAND IS STILL THE SAME BUILTIN: `printf -v "X" %d 83` and `read -r -d "" X`. The
@@ -378,7 +414,7 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v, _r, _arith) {
   # fail-open past the collision check (`(( X = 84 - 1 ))` claimed 84). The same value written as
   # `X=$(( 70 + 13 ))` is already refused, so the two paths disagreed. Claim only a single literal;
   # anything computed is `unparseable`.
-  if (p ~ /\(\([^()]*$/ && tail ~ /^[ \t]*(:|\+)?=([^=]|$)/) {
+  if (arithctx(p) && tail ~ /^[ \t]*(:|\+)?=([^=]|$)/) {
     t2 = tail
     sub(/^[ \t]+/, "", t2)
     sub(/^(:|\+)?=/, "", t2)      # the OPERATOR is the declaration, not the value
@@ -638,7 +674,7 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
       _t5 = substr(_t5, length(_t4) + 1)
       if (iscode(_t4) && _t5 ~ /^["']?[ \t]*([;&]|$)/) _vv = _t4
     } else {
-      if (!cmdpos(_p) && !decl_operand(_p)) continue
+      if (!cmdpos(_p) && !decl_operand(_p) && !prefixonly(_p)) continue
       _vv = codeval(_fr)
     }
     if (_vv != "") print "foreign", _nm, _vv + 0, f, LN
@@ -2901,6 +2937,17 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"foreign: spawn-gate.sh:B_GATE_MEM"*) rc=1 ;; *) rc=0 ;; esac
 ck "(loop/stale-value) an UNREADABLE loop operand does not inherit the PREVIOUS name's code — no \`foreign: …B_GATE_MEM\` row naming a declaration that does not exist (rc=$CODE_RC; $CODE_MSG)" $rc
 
+# (d7) A PREFIX-ASSIGNMENT LIST IS A COMMAND BOUNDARY (review round 5, P2 — measured). The foreign net
+# required `cmdpos || decl_operand` of the text before the name, and `FOO=1 ` is neither, so
+# `FOO=1 AGENT_MEM_GATE=81` bound 81 into the variable and emitted NO ROW — while the FAMILY net
+# refused the identical `FOO=1 AGENT_NEW_GATE_REFUSED=83`. Namespace deciding whether a declaration is
+# seen is the asymmetry this file records as fixed on the family path; it was still alive here.
+_codemut_dir="$(_codemut prefix-assignment)"
+printf '\nFOO=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
+ck "(prefix-assignment) a code after a \`FOO=1\` prefix assignment is a \`foreign\` row — the family net already refused the same shape, so the namespace must not decide whether a declaration is seen (rc=$CODE_RC; $CODE_MSG)" $rc
+
 _codemut_dir="$(_codemut decl-not-builtin)"
 printf '\necho AGENT_DEBUG=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
@@ -3016,6 +3063,9 @@ printf-v-glued|claim|printf -vAGENT_NEW_GATE_REFUSED %d 83
 array-subscript-eq|unparseable|AGENT_NEW_GATE_REFUSED[a==b]=83
 arith-array-spaced|unparseable|(( AGENT_NEW_GATE_REFUSED[0] = 83 ))
 arith-array-pluseq|unparseable|(( AGENT_NEW_GATE_REFUSED[0] += 83 ))
+arith-array-nested|unparseable|(( (AGENT_NEW_GATE_REFUSED[0] = 83) ))
+arith-array-and|unparseable|(( 1 && (AGENT_NEW_GATE_REFUSED[0] = 83) ))
+arith-array-empty|unparseable|AGENT_NEW_GATE_REFUSED[0]=
 subscript-prefix-assign|unparseable|FOO=1 AGENT_NEW_GATE_REFUSED[0]=83
 arith-computed|unparseable|(( AGENT_NEW_GATE_REFUSED = 70 + 13 ))
 read-flag-operand|unparseable|read -u 3 AGENT_NEW_GATE_REFUSED
@@ -3057,7 +3107,7 @@ ck "...and EVERY one of them REDDENS the code check as a NAMED collision or 'unp
 # element COMPARISON (which was red when unquoted and silent when quoted — punctuation deciding a
 # verdict), a `${X#*=}` strip, and a bare `exit "$X"`.
 _codemut_dir="$(_codemut residual-control)"
-printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\n(( AGENT_NEW_GATE_REFUSED[0]==83 ))\n(( AGENT_NEW_GATE_REFUSED[0] == 83 ))\n(( AGENT_NEW_GATE_REFUSED[0] != 83 ))\n' >> "$_codemut_dir/spawn-gate.sh"
+printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\n(( AGENT_NEW_GATE_REFUSED[0]==83 ))\n(( AGENT_NEW_GATE_REFUSED[0] == 83 ))\n(( AGENT_NEW_GATE_REFUSED[0] != 83 ))\nwhile (( _i < 3 )); do AGENT_NEW_GATE_REFUSED[0] = 83; done\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
 ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip, a bare exit \"\$X\", and an ARITHMETIC \`==\` in BOTH spellings all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
