@@ -1714,14 +1714,22 @@ if grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$junk_out" \
 else rc=1; echo "      junk fixture '$(printf '%s' "$junk_out" | tr '\n' '|' | head -c 260)'"; fi
 ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not repeated into the log)" $rc
 
-# ⛔ THE DRIVE'S OWN WITNESS IS DERIVED FROM THE SHIPPED SOURCE, NOT SPELLED HERE (review P3, cycle 45). The
-# anti-vacuity checks below need proof that the MUTATED driver ran — but a literal copy of the product's
+# ⛔ THE DRIVE'S OWN WITNESS IS DERIVED FROM THE SHIPPED SOURCE, NOT SPELLED HERE (review P3, cycle 45).
+# The anti-vacuity checks below need proof that the MUTATED driver ran — but a literal copy of the product's
 # log prefix turns a cosmetic rename of that line into a false "the mutant did not run", pointing at the
-# wrong defect. It is read out of `$FNS` instead, and the literal survives only as a FALLBACK, so a failed
-# derivation is fail-CLOSED (a possible false red) and never a check that passes on a dead drive.
-_wit="$(grep -o '\[[a-z]*\] [a-z -]*order' "$FNS" 2>/dev/null | head -1)"
-[ -n "$_wit" ] || _wit='[refresh] queue order'
-ck "the anti-vacuity witness prefix is derivable from the shipped source ('$_wit')" "$([ -n "$_wit" ] && echo 0 || echo 1)"
+# wrong defect.
+# ⛔ AND THE DERIVATION READS CODE, NOT COMMENTS (review P3, cycle 46). `$FNS` is mostly comment text, and
+# `head -1` over the WHOLE file took the first phrase that happened to look like one — measured: a single
+# added comment line reading "logs this under `[refresh] pool order`" became the witness, the drive printed
+# nothing matching it, and BOTH anti-vacuity checks reddened with "the mutant did not run" for a source that
+# was fine. Anchoring on an actual `echo "…"` statement is what makes the match the line the drive emits.
+# ⛔ THE CHECK MEASURES THE DERIVATION, NOT THE FALLBACK (review P2, cycle 46). Assigning the literal first
+# made the check unfailable — it reported a verified derivation while quoting the hard-coded fallback over a
+# source that contains no match. The raw value is tested, printed as `<none>` when absent, and only THEN
+# replaced, so a failed derivation is announced by a red line instead of passing silently.
+_wit="$(grep -o '^[[:space:]]*echo "\[[a-z]*\] [a-z -]*order' "$FNS" 2>/dev/null | sed 's/^[[:space:]]*echo "//' | head -1)"
+ck "the anti-vacuity witness prefix is derivable from the shipped source ('${_wit:-<none>}')" "$([ -n "$_wit" ] && echo 0 || echo 1)"
+_wit="${_wit:-[refresh] queue order}"
 
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
 MUT_NOSAT="$TMP/fns-nosat.sh"
@@ -1969,12 +1977,18 @@ _arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line>
   } > "$_amd/drive.sh"
   ( cd "$_amd" && HOME="$_amd" bash drive.sh "$_amd/o" ) 2>&1
 }
+# The tuple is `arm|SOURCE-needle|count|OUTPUT-marker`: the needle locates the echo line in the SCRIPT
+# (`names head #$_h`), the marker is that line once RENDERED (`names head #999`). Using the rendered text as
+# the needle silently matched nothing, and the "mutant" was a no-op that reddened nothing (measured).
 for _arm14m in \
-  'severity|severity-first from the pool|2 0 200' \
-  'uncounted|COUNT could not be read back|-'; do
-  _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _mc="${_rest#*|}"
+  'severity|severity-first from the pool|2 0 200|severity-first from the pool' \
+  'uncounted|COUNT could not be read back|-|COUNT could not be read back' \
+  'totals|does not add up to the queue|1 0 200|does not add up to the queue' \
+  'head|names head #$_h|2 0 999|names head #999'; do
+  _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _rest="${_rest#*|}"
+  _mc="${_rest%%|*}"; _mm="${_rest#*|}"
   _mo="$(_arm14_mut "$_ml" "$_mn" "$_mc")"
-  if grep -qF "$_mn" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
+  if grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
   else rc=1; echo "      stripped-$_ml '$(printf '%s' "$_mo" | tr '\n' '|' | head -c 340)'"; fi
   ck "non-vacuity: with the clip stripped from the $_ml arm ALONE its clause disappears" $rc
 done
