@@ -720,22 +720,6 @@ fi
 # to be discovered as silence. These cases drive the SHIPPED supervisor against a stub probe.
 say_case "the check gate refuses a repo that cannot provision dispatch (#1736)"
 F="$T/cellcheck"; mkdir -p "$F/home" "$F/o" "$F/bin"
-# (j) THE KEY-QUESTION IS `read()`'s: a `!command` key is EXECUTED by pi (no environment needed), so
-# it is a credential this check cannot judge — and refusing to guess is not a refusal of the box.
-printf '{"deepseek":{"type":"api_key","key":"!printf %s sk-from-op"}}\n' > "$AUTH"
-cellcheck 0
-[ "$CC_RC" -ne 0 ] && ok "check REFUSES a '!command' key it cannot judge offline (not 'cannot judge, pass')" \
-                   || bad "check passed a box on the strength of a command key it never ran"
-case "$CC_OUT" in
-  *"will not judge or replace"*) ok "…naming execution as the way to settle it" ;;
-  *) bad "the command-key refusal does not say what to do: $CC_OUT" ;;
-esac
-# …and a literal key with an unusable `env` map IS a credential: pi never consults `env` for a literal.
-printf '{"deepseek":{"type":"api_key","key":"sk-literal","env":null}}\n' > "$AUTH"
-cellcheck 0
-[ "$CC_RC" -eq 0 ] && ok "check PASSES a literal key with env:null (pi ignores env for literals)" \
-                   || bad "check false-blocked a working literal credential over an env field pi ignores"
-seed_provider_store "$F/home"
 ai_init_repo "$F/repo"
 ai_worktree "$F/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
@@ -926,6 +910,23 @@ rm -f "$F/keys.env"; seed_provider_store "$F/home"
 cellcheck 0
 [ "$CC_RC" -eq 0 ] && ok "the fixture verifies again once its store is restored (the seed is live, not inert)" \
                    || bad "the restored fixture still refuses — later arms would measure the wrong state: $CC_OUT"
+# (j) THE KEY-QUESTION IS `read()`'s: a `!command` key is EXECUTED by pi (no environment needed), so
+# it is a credential this check cannot judge — and refusing to guess is not a refusal of the box.
+printf '{"deepseek":{"type":"api_key","key":"!printf %s sk-from-op"}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a '!command' key it cannot judge offline (not 'cannot judge, pass')" \
+                   || bad "check passed a box on the strength of a command key it never ran"
+case "$CC_OUT" in
+  *"will not judge or replace"*) ok "…naming execution as the way to settle it" ;;
+  *) bad "the command-key refusal does not say what to do: $CC_OUT" ;;
+esac
+# …and a literal key with an unusable `env` map IS a credential: pi never consults `env` for a literal.
+printf '{"deepseek":{"type":"api_key","key":"sk-literal","env":null}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check PASSES a literal key with env:null (pi ignores env for literals)" \
+                   || bad "check false-blocked a working literal credential over an env field pi ignores"
+seed_provider_store "$F/home"
+
 # (i) A PROVIDER THIS FILE DOES NOT LIST must still be judged. `PI_LANE_PROVIDER=zai` is a real
 # fixture in this repo (key-gate.test.sh), and an earlier "this file does not know the variable, so
 # NOT VERIFIED" path printed the banner over a box with `{}` and an empty keys.env — the #2024 death,
