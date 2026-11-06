@@ -9738,11 +9738,12 @@ export default function (pi: ExtensionAPI) {
       // task_collect") named the lenient verb as the remedy. One rule, both verbs: no payload, no
       // verdict.
       //
-      // ⛔ ABSENCE IS NOT A VERDICT. It is a missing datum, and it is NOT written to the ATTEMPT
-      // ledger either: that ledger's vocabulary describes spawn OUTCOMES (refused/cut/failed), and
-      // "the producer did not carry a field" is not one — recording it there would ship a false
+      // ⛔ ABSENCE IS NOT A VERDICT — and where the view alone WOULD be one, it is not written to the
+      // ATTEMPT ledger either: that ledger's vocabulary describes spawn OUTCOMES (refused/cut/failed),
+      // and "the producer did not carry a field" is not one — recording it there would ship a false
       // capacity/refusal claim to the refusal text (#2665's fix exists to stop exactly that), so the
-      // console line is the record.
+      // console line is the record. (Where the view's own `status` IS such an outcome, the paragraph
+      // below explains why it must be read as one instead of discarded.)
       //
       // ⛔ AND IT SITS BEFORE THE DEDUPE, DELIBERATELY. Marking an uncertifiable reap as "already
       // counted" would spend that run's ONE slot on a reap that counted nothing, so a later
@@ -9752,13 +9753,39 @@ export default function (pi: ExtensionAPI) {
         : isTerminalStatus
           ? composedDetailsOf((reviewDetails as { final_details?: unknown })?.final_details)
           : null;
+      // ⛔ A MISSING PAYLOAD IS ONLY UNCERTIFIABLE WHEN THE VIEW ALONE WOULD OTHERWISE BE A VERDICT
+      // (fresh review, P1). The view's OWN `status`/`reason` is a datum too, and it is one this
+      // ledger's vocabulary already speaks: the producer deliberately writes
+      // `{ status: "failed", reason: "zero-output" }` with NO composed payload for a background
+      // child that produced nothing and was reaped by the hard cap, the silence threshold or the
+      // backstop (`doResolve(undefined)` → `classifyBackgroundOutcome(undefined)`; the #271/#208
+      // "resolveUndefined = !hasOutput" RETRYABLE contract), and the settle writer's
+      // `final_details: result?.details` is then dropped by JSON. Refusing here BEFORE
+      // classification read that record's absence as its only datum and threw the outcome beside it
+      // away, which re-created #2665's headline defect on BOTH verbs: a capacity/retry-exhaustion
+      // death was reported to the lane as "No reviewers were dispatched in this session" and
+      // `spawnAttempts` stayed 0, so `REVIEW-GATE-UNSPAWNABLE` — the one text that tells a lane its
+      // dispatches are dying rather than missing — never fired. (Measured on main and on this
+      // branch's first commit: `task_collect` on that record DID render the capacity diagnosis;
+      // this guard removed it.)
+      //
+      // So classify the VIEW alone first. A NON-verdict outcome is an ATTEMPT and falls through to
+      // the shared dedupe + classification below — the same thing the collect arm always did with a
+      // null payload. Only a view-alone VERDICT (a `done` label with nothing behind it) is
+      // uncertifiable: there the absence really is the only datum, and it fails CLOSED.
       if ((isTerminalCollect || isTerminalStatus) && reapComposedDetails === null) {
-        console.error(
-          `[review-enforcer] ⚠️ a TERMINAL ${event.toolName} carried no composed details — NOT counted ` +
-            "as a reviewer dispatch (#3155): a run whose payload is missing cannot be certified as a " +
-            "verdict, and its own `status` label must not stand in for one."
-        );
-        return undefined;
+        const viewAlone = classifySpawnOutcome({
+          details: reviewDetails as Record<string, unknown> | undefined,
+          isError: (event as { isError?: unknown }).isError,
+        });
+        if (viewAlone.outcome === "verdict") {
+          console.error(
+            `[review-enforcer] ⚠️ a TERMINAL ${event.toolName} carried no composed details — NOT counted ` +
+              "as a reviewer dispatch (#3155): a run whose payload is missing cannot be certified as a " +
+              "verdict, and its own `status` label must not stand in for one."
+          );
+          return undefined;
+        }
       }
 
       // #1662 review / #3155: both reap verbs are repeatable — `task_collect` is idempotent and a

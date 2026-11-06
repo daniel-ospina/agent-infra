@@ -2202,6 +2202,66 @@ testAsync("#3155: status-then-collect of the SAME run counts ONCE (one dedupe, b
   });
 });
 
+testAsync("#3155 review: a payload-less reap whose VIEW says the child FAILED is an ATTEMPT — a CAPACITY fault, never 'no reviewers dispatched'", async () => {
+  // THE REAL PRODUCER SHAPE, and the one the certification guard used to throw away. A background
+  // child that produced NOTHING resolves `undefined` (`doResolve(undefined, { reason: "hard-cap" |
+  // "silence-threshold" | "backstop" })` — the #271/#208 "resolveUndefined = !hasOutput" RETRYABLE
+  // arms), so `classifyBackgroundOutcome(undefined)` maps it to
+  // `{ status: "failed", exitCode: null, reason: "zero-output" }`, and the settle writer's
+  // `final_details: result?.details` is dropped by JSON. The record therefore has NO composed
+  // payload but DOES carry an outcome in the classifier's own vocabulary (`shared/spawn-capacity.ts`
+  // reads `details.status`).
+  const cmd = ["git", "commit", "-m", "x"].join(" ");
+  const reap = async (tool: string, details: Record<string, unknown>) => {
+    process.env.PI_MODE = "print";
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start");
+    await fire("tool_result", { toolName: tool, details });
+    const blocked = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+    return {
+      blocked: blocked && (blocked as any).block === true,
+      reason: String((blocked && (blocked as any).reason) || ""),
+      dispatchRows: readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch").length,
+    };
+  };
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      try {
+        // ⛔ BOTH VERBS, ONE RULE. The certification guard ran BEFORE classification, so this
+        // record's own `status: "failed"` was never read: the lane was told "No reviewers were
+        // dispatched in this session" — the compliance headline #2665 exists to stop a capacity
+        // fault from wearing — and `spawnAttempts` stayed 0, so `REVIEW-GATE-UNSPAWNABLE` (the one
+        // text that says the dispatches are DYING, not missing) never fired. Measured on `main`:
+        // `task_collect` on this exact record DID render the capacity diagnosis; the guard removed
+        // it, so this is a regression, not a missing nicety.
+        for (const [tool, details] of [
+          ["task_status", { terminal: true, status: "failed", reason: "zero-output", exit_code: null, run_id: "RUN-ZERO-S" }],
+          ["task_collect", { terminal: true, status: "failed", details: null, run_id: "RUN-ZERO-C" }],
+        ] as const) {
+          const r = await reap(tool, details as Record<string, unknown>);
+          ok(r.blocked, `${tool}: a child that produced nothing is NOT a verdict — still refused`);
+          ok(/REVIEW-GATE-UNSPAWNABLE/.test(r.reason), `${tool}: the refusal renders the spawn-fault diagnosis the record reports`);
+          ok(/CAPACITY fault/.test(r.reason), `${tool}: …and names it as a CAPACITY fault`);
+          ok(!/No reviewers were dispatched in this session/.test(r.reason), `${tool}: …never the compliance headline (#2665)`);
+          equal(r.dispatchRows, 0, `${tool}: an ATTEMPT is not a dispatch — nothing was counted`);
+        }
+
+        // ⛔ AND THE GUARD'S OWN JOB SURVIVES: a `done` VIEW WITH NOTHING BEHIND IT is still
+        // uncertifiable — refused, counted nothing, and recorded as NO attempt (there the absence
+        // really is the only datum: the label says "done" and the evidence says nothing).
+        const noPayload = await reap("task_status", { terminal: true, status: "done", exit_code: 0, run_id: "RUN-DONE-NOPAYLOAD" });
+        ok(noPayload.blocked, "a `done` label with nothing behind it is NOT counted");
+        ok(!/REVIEW-GATE-UNSPAWNABLE/.test(noPayload.reason), "…and it records NO attempt — there the missing DATUM is the failure, not the child");
+        equal(noPayload.dispatchRows, 0, "…and it counts nothing");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 testAsync("#1662 review: a refused background dispatch is not counted as a completed reviewer", async () => {
   await withTempHome(async () => {
     await withMarkerIsolated(async () => {
