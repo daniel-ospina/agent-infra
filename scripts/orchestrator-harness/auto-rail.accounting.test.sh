@@ -1772,42 +1772,64 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
     case "$_RCAPTXT" in
       *'$_rattn'*) bad "the CAP log line must NOT print \$_rattn — that value IS the fail-closed cap, so putting it in this line asserts a past-tense measurement the loop never took, which is precisely the defect (adding it back kept this suite green before this arm existed)" ;;
     esac
-    # ⛔ EVERY DECIDING ARM IN THIS BRANCH MUST END IN ITS OWN `continue` — THE WHOLE CLASS, NOT ONE CASE
-    # (review round 5, P1/P2, REPRODUCED). Pinning the rc-3 drain alone left five SIBLING arms wider found by a
-    # deletion sweep: the `rail_says_skip` skip (falls through to launch a SECOND rail for the same PR), the
-    # `candidate_deferred` cap deferral (falls through and spends the budget it just deferred on), the
-    # `_att = rejected` publish (falls through toward the rail), the `_rarm = review` launch path (falls
-    # through into the RAIL path, so one candidate gets a review AND a rail), and `review_should_defer` —
-    # the worst — which publishes "this head is next in the queue" and then BUYs a PAID review over the
-    # `REVIEW_PER_PASS` burst bound it just deferred on. Each single-word deletion left this suite GREEN,
-    # because the existing arm at the deferral sees only the `if`+1/`if`+2 window, not the terminator.
-    # The rule is structural and needs no per-arm table: an arm opens at some indent, closes at the next
-    # `fi` AT THAT SAME indent, and the line immediately before that close must be the `continue`. So a new
-    # arm added inside any of them cannot quietly fall through, and the earlier `-eq 2` pin is folded in.
+    # ⛔ EVERY DECIDING ARM IN THIS BRANCH MUST END IN ITS OWN `continue` (review round 5, P1/P2, REPRODUCED).
+    # The rc-3 drain was pinned alone first, which left FIVE SIBLING arms wider found by a deletion sweep: the
+    # `rail_says_skip` skip (falls through to launch a SECOND rail for the same PR), the `candidate_deferred` cap
+    # deferral (falls through and spends the budget it just deferred on), the `_att = rejected` publish (falls
+    # through toward the rail), the `_rarm = review` launch path (falls through into the RAIL path, so one
+    # candidate gets a review AND a rail), and `review_should_defer` — the worst — which publishes "this head
+    # is next in the queue" and then BUYs a PAID review over the `REVIEW_PER_PASS` burst bound it just deferred
+    # on. Each single-word deletion left this suite GREEN, because the existing arm at the deferral sees only
+    # the `if`+1/`if`+2 window, not the terminator. Round 6's own independent re-derivation then found an
+    # ELEVENTH: the rail-cooldown arm (`if [ "$age" -lt "$_cool" ]`) — deleting its `continue` republishes
+    # "already railed, retry in 15m" and then RAILS IT ANYWAY, once per pass, because `launch_rail` has no
+    # cooldown check of its own. THE LIST BELOW IS THE COMPLETE SET of multi-line terminating arms in the loop
+    # body; it is enumerated, not inferred — a sweep that claims to cover arms it does not name is the
+    # overclaim this file's header (and its reviewers) forbid.
+    # ⛔ HONEST SCOPE — WHAT THIS DOES **NOT** COVER. (a) A **NEW** arm: this is a LIST, so an arm added later is
+    # invisible until its opener is added below — the sweep pins these arms, it does not police future ones.
+    # (b) An **INLINE** terminator (`if …; then …; continue; fi`), which the "line before the close" rule cannot
+    # express at all; the one such arm in the branch (the DENIED gate) is pinned explicitly, as a whole line,
+    # further down. Both are stated rather than left to be inferred from a green suite.
+    # The rule needs no per-arm table: an arm opens at some indent, closes at the NEXT `fi` at or above that
+    # indent, and the line immediately before that close must be the `continue`. The close is bounded at the
+    # first `fi` whose indent is ≤ the opener's: unbounded, a RE-INDENTED close would be silently measured
+    # against a LATER sibling's `fi` (which trivially ends in its own `continue`), reporting PASS on an arm whose
+    # terminator was deleted — reproduced by review round 6, and the reason the `RLENGTH<=n` stop is load-bearing.
     for _anchor in \
       'if [ "$_ract" -eq 2 ]; then' \
       'if rail_says_skip "$_rail_rc"; then' \
       'if candidate_deferred "$repo" $REPOS; then' \
       'if [ "$_att" = rejected ]; then' \
       'if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then' \
-      'if review_should_defer "$_rdispatched"; then'
+      'if review_should_defer "$_rdispatched"; then' \
+      'if [ "$age" -lt "$_cool" ]; then'
     do
       _ol=$(grep -nF -- "$_anchor" "$SUT" | head -1 | cut -d: -f1)
       case "${_ol:-x}" in
-        *[!0-9]*) bad "the arm '${_anchor}' could not be located in ${_SUTNAME:-the SUT} — the review branch changed shape, so its fall-through cannot be measured" ;;
+        *[!0-9]*) bad "the arm '${_anchor}' could not be located in the SUT — the review branch changed shape, so its fall-through cannot be measured" ;;
         *)
           _ind=$(awk -v a="$_ol" 'NR==a { match($0, /^ */); print RLENGTH; exit }' "$SUT" 2>/dev/null)
           _ind=${_ind:-0}
-          _close=$(awk -v a="$_ol" -v n="$_ind" 'NR>a { match($0, /^ */); if (RLENGTH==n && substr($0, n+1)=="fi") {print NR; exit} }' "$SUT")
+          # BOUNDED at the first `fi` at indent ≤ the opener's; print it only when it is exactly the opener's
+          # indent. A shallower close leaves `_close` empty and the diagnostic below fires (fail closed).
+          _close=$(awk -v a="$_ol" -v n="$_ind" 'NR>a { match($0, /^ */); if (substr($0, RLENGTH+1)=="fi" && RLENGTH<=n) { if (RLENGTH==n) print NR; exit } }' "$SUT")
           case "${_close:-x}" in
             *[!0-9]*) bad "the arm '${_anchor}' (line ${_ol}, indent ${_ind}) has no closing \`fi\` at its own indent — its terminator cannot be measured" ;;
             *)
               _prev=$(sed -n "$(( _close - 1 ))p" "$SUT" | sed 's/^[[:space:]]*//')
               [ "$_prev" = continue ] \
-                || bad "the arm '${_anchor}' (opens ${_ol}, closes ${_close}) must END IN ITS OWN \`continue\`, but the line before that close is '${_prev}' — without the terminator the arm falls out of its own decision into the next one and, for every arm in this list, that means acting on the decision it just refused, announced or deferred (a second rail, a bypassed budget, a review bought over the burst bound, or a rail launched beside an in-flight review); all five deletions left this suite GREEN before this sweep (reproduced, review round 5)" ;;
+                || bad "the arm '${_anchor}' (opens ${_ol}, closes ${_close}) must END IN ITS OWN \`continue\`, but the line before that close is '${_prev}' — without the terminator the arm falls out of its own decision into the next one and, for every arm in this list, that means acting on the decision it just refused, announced or deferred (a second rail, a bypassed budget, a review bought over the burst bound, a rail launched beside an in-flight review, or a head railed again on a live cooldown); each of those deletions left this suite GREEN before it was pinned (reproduced, review rounds 5 and 6)" ;;
           esac ;;
       esac
-    done ;;
+    done
+    # ⛔ AND THE INLINE FORM, PINNED AS ITS OWN WHOLE LINE (review round 6, P2, REPRODUCED). `if denied …; then
+    # log_line …; continue; fi` puts its terminator on the SAME line, so the rule above cannot express it: deleting
+    # just `continue` left this suite GREEN while a DENIED (duplicate-pair / contradictory) candidate fell through
+    # to `rail_already_running` → `candidate_deferred` → `launch_rail`, i.e. a rail launched on the pair the pass
+    # has just declared it must not act on. Anchored whole-line, terminator included.
+    grep -qE '^[[:space:]]*if denied "\$repo" "\$pr"; then log_line .*; continue; fi[[:space:]]*$' "$SUT" \
+      || bad "the DENIED arm must keep its INLINE terminator ('if denied \"\$repo\" \"\$pr\"; then log_line …; continue; fi') — without the \`continue\` a denied candidate falls through to the rail path and a rail is launched on the pair this pass just declared it must not act on (deleting that one word kept this suite GREEN)" ;;
 esac
 
 # ⛔ THE POSITIONAL FAMILY HAS THREE MEMBERS (review round 7, P2, measured): `awaiting-review:<head>` joins
