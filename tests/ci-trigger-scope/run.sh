@@ -803,6 +803,47 @@ if apply_mutation "$PC" "$PC_SHADOW_JOB" \
   run_check 2 "a SECOND job minting the required context NAME is CANNOT-VERIFY" PC_FILE="$PC_SHADOW_JOB"
 fi
 
+# (c1e3) ⛔ AND THE MINTER'S `name:` MUST BE READ AS A YAML SCALAR, NOT AS RAW TEXT. The uniqueness
+#        check compared the raw line text, so `name: pipeline-compliance  # mints the required context`
+#        resolved to a DIFFERENT context — the shadow became an invisible minter, exactly one job
+#        appeared to mint, and the gate read ok/rc=0 while the only job minting the context on a comment
+#        event was the unguarded one (measured). The mirror fired too: the required job's own `name:`
+#        carrying a comment read as "0 job(s) mint", a false block on a correct tree. A flow-mapped job
+#        header (`shadow: {name: …}`) hides a `name:` from a line reader entirely, so it is refused.
+PC_SHADOW_COMMENT="$TMP/pc-shadow-comment.yml"
+if apply_mutation "$PC" "$PC_SHADOW_COMMENT" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow:
+    name: pipeline-compliance  # mints the required context
+    if: true
+    runs-on: ubuntu-latest' \
+  "a shadow minter whose name carries a comment must be constructible"; then
+  run_check 2 "a shadow minter whose \`name:\` carries a COMMENT is still counted" PC_FILE="$PC_SHADOW_COMMENT"
+fi
+
+PC_SHADOW_FLOW="$TMP/pc-shadow-flow.yml"
+if apply_mutation "$PC" "$PC_SHADOW_FLOW" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+  shadow: {name: pipeline-compliance, if: true, runs-on: ubuntu-latest}' \
+  "a flow-mapped shadow job must be constructible"; then
+  run_check 2 "a FLOW-MAPPED job header (which hides its \`name:\`) is CANNOT-VERIFY" PC_FILE="$PC_SHADOW_FLOW"
+fi
+
+# …while a trailing comment on the REQUIRED job's own `name:` is a comment, not a different context.
+PC_REQ_NAME_COMMENT="$TMP/pc-req-name-comment.yml"
+if apply_mutation "$PC" "$PC_REQ_NAME_COMMENT" \
+  "    name: pipeline-compliance
+" \
+  "    name: pipeline-compliance  # the required status context
+" \
+  "the required job's name must be commentable"; then
+  run_check 0 "a trailing COMMENT on the required job's \`name:\` is ACCEPTED" PC_FILE="$PC_REQ_NAME_COMMENT"
+fi
+
 # (c1f0) ⛔ AND AN EXPLICIT KEY AT THE JOB *KEY* INDENT IS THE SAME UNMODELLED SHAPE. The refusal was
 #        gated on the 2-space HEADER indent, so `? if` / `: true` at 4 spaces was neither matched by
 #        `ownRe` nor refused: gate ok/rc=0 while YAML's effective `if` is `True` — a duplicate `if:`

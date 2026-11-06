@@ -539,6 +539,44 @@ function checkHarnessSingleSource() {
 // event satisfies the required context through the unguarded one while every assertion about the
 // guarded job's own `if:` still passes. Measured: rc=0 with a shadow job `name: pipeline-compliance,
 // if: True`. Zero or several matches is a refusal, never a guess.
+// yamlScalar(raw) — the scalar a `key: <raw>` line evaluates to, or null when this reader does not
+// model the shape.
+//
+// ⛔ "THE SAME STRING AS THE TEXT" IS NOT THE SAME AS "THE SAME VALUE". Reading `name:` out of the raw
+// line made a trailing comment (`name: pipeline-compliance  # mints the context`) a DIFFERENT context,
+// so that job became an invisible minter and a shadow declaring the required context went uncounted —
+// rc=0 while the only job minting the context on a comment event was the unguarded one (measured). The
+// mirror also fired: the required job's OWN `name:` carrying a comment read as "0 job(s) mint". YAML
+// drops comments and one matching quote pair and ignores an anchor here, so this does too.
+function yamlScalar(raw) {
+  const s = String(raw ?? "");
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      out += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    // A `#` only starts a comment at a token boundary; YAML requires whitespace before it.
+    if (ch === "#" && (i === 0 || /\s/.test(s[i - 1]))) break;
+    out += ch;
+  }
+  out = out.trim();
+  if (out === "") return null;
+  out = out.replace(/^&\S+\s*/, ""); // anchor — not part of the value
+  const m = /^(['"])([\s\S]*)\1$/.exec(out);
+  if (m) out = m[2];
+  else if (/^[|>{[]/.test(out) || /^[*&!]/.test(out)) return null; // block/flow/alias: not modelled
+  return out;
+}
+
 function requiredContextJobId(text, contextName = "pipeline-compliance") {
   const lines = String(text ?? "").split("\n");
   const ids = [];
@@ -547,17 +585,52 @@ function requiredContextJobId(text, contextName = "pipeline-compliance") {
     if (!m || m[1].length !== 2) continue;
     const id = (m[2] ?? m[3] ?? m[4] ?? "").trim();
     if (!id) continue;
+    // ⛔ A JOB HEADER MUST BE A PLAIN BLOCK MAPPING. A flow-mapped header
+    // (`shadow: {name: pipeline-compliance, if: true}`) declares a `name:` this reader never sees, so a
+    // minter could hide inside it — refuse rather than read a job whose shape is not modelled.
+    if (/^\s*\{/.test(m[5] ?? "")) {
+      // ⛔ BUT ONLY WHEN IT COULD MINT THE CONTEXT. A blanket refusal over every flow-mapped job header
+      // turns a NON-minting sibling (`workflow-drift: {name: …}`) into CANNOT-VERIFY, which both
+      // over-blocks a correct tree and destroys the ability of the block-terminator arms to distinguish
+      // "the block ended here" from "the reader gave up" — measured: the terminator arm read rc=2
+      // instead of rc=1 with the blanket rule. The header text is all a line reader has, so if the
+      // CONTEXT NAME does not appear in it, no `name:` inside can equal the context and the job cannot
+      // mint it; if it does appear, the reader genuinely cannot tell and refuses.
+      if ((m[5] ?? "").includes(contextName)) {
+        refuse(
+          `line ${i + 1}: the \`${id}\` job header is a FLOW MAPPING carrying ${JSON.stringify(
+            contextName
+          )}, and this reader does not model flow mappings — the set of jobs minting the required context is UNVERIFIED.`
+        );
+      }
+      continue; // cannot mint the required context
+    }
     // GitHub uses `name:` when the job declares one, otherwise the id itself.
     let ctx = id;
+    const nameLines = [];
     for (let j = i + 1; j < lines.length; j += 1) {
       const nm = KEY_RE.exec(lines[j]);
       if (nm) {
         if (nm[1].length <= 2) break; // next job header or a top-level key
-        if (nm[1].length === 4 && (nm[2] ?? nm[3] ?? nm[4]) === "name") {
-          ctx = (nm[5] ?? "").trim().replace(/^(['"])([\s\S]*)\1$/, "$2");
-          break;
-        }
+        if (nm[1].length === 4 && (nm[2] ?? nm[3] ?? nm[4]) === "name") nameLines.push(nm);
       }
+    }
+    if (nameLines.length > 1) {
+      refuse(
+        `line ${i + 1}: the \`${id}\` job declares \`name:\` ${nameLines.length} times. YAML keeps the LAST, so which context it mints is not something this reader can answer — UNVERIFIED.`
+      );
+    }
+    if (nameLines.length === 1) {
+      const raw = nameLines[0][5] ?? "";
+      const v = yamlScalar(raw);
+      if (v === null) {
+        refuse(
+          `line ${i + 1}: cannot read the \`name:\` value ${JSON.stringify(
+            raw.trim()
+          )} of job \`${id}\` — the context it mints is UNVERIFIED.`
+        );
+      }
+      ctx = v;
     }
     ids.push({ id, ctx });
   }
