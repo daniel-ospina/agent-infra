@@ -1499,16 +1499,22 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     monkeypatch.setenv("FAKE_GIT_CONFIG", str(cfg))
     monkeypatch.setenv("FAKE_ARGV_LOG", str(argv_log))
 
-    def z(*records):
-        """Render a REAL `git config --includes --list -z` listing: `key\nvalue\0` per record.
+    REPO_ORIGIN = "file:/box/repo/.git/config"
+    GLOBAL_ORIGIN = "file:/box/.gitconfig"
 
-        A bare string is a VALUELESS key (git prints just the key); a tuple is (key, value). The
-        distinction matters: a key may itself contain `=`, which is why the parser must not split on it.
+    def z(*records, origin=REPO_ORIGIN):
+        """Render a REAL `git config --includes --list -z --show-origin` listing.
+
+        The shape is `ORIGIN \0 KEY\nVALUE \0 ORIGIN \0 …` (verified against git 2.43). A bare string
+        is a VALUELESS key (git prints just the key) and a tuple is (key, value); the distinction
+        matters because a key may itself contain `=`, which is why the parser must not split on it.
+        `origin` is how the pre-check tells a checkout's own config from a global one without a
+        second exec.
         """
         out = []
         for rec in records:
             key, value = rec if isinstance(rec, tuple) else (rec, None)
-            out.append(key + ("\0" if value is None else "\n%s\0" % value))
+            out.append("%s\0%s%s\0" % (origin, key, "" if value is None else "\n%s" % value))
         return "".join(out)
 
     for config, needle in ((z(("user.email", "a@b"), ("filter.evil.clean", "/tmp/x.sh")),
@@ -1572,12 +1578,29 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     try:
         mod.run = lambda *a, **kw: mod.Ran(
             ["git"], rc=None, timed_out=True,
-            stdout="filter.evil.clean\n/tmp/x.sh\0")
-        fault, measured = mod._repo_config_fault("cmux", "box")
+            stdout=z(("core.repositoryformatversion", "0"),
+                     ("filter.evil.clean", "/tmp/x.sh")))
+        fault, measured = mod._repo_config_fault("cmux", "box", 60)
         assert "filter.evil.clean" in fault, fault          # the drained stdout is PARSED, not discarded
         assert measured is True
         mod.run = lambda *a, **kw: mod.Ran(["git"], rc=None, error="OSError: boom")
-        fault, measured = mod._repo_config_fault("cmux", "box")
+        fault, measured = mod._repo_config_fault("cmux", "box", 60)
+        assert fault and "could not be READ" in fault, fault
+        # ⛔ AND A TIMEOUT OVER A **CLEAN** LISTING STILL REFUSES. Without this the timeout branch was
+        # reached only AFTER the fault scan had already returned, so deleting `got.timed_out` from the
+        # condition left the suite green — the exact "arm that cannot fail" shape.
+        mod.run = lambda *a, **kw: mod.Ran(
+            ["git"], rc=None, timed_out=True,
+            stdout=z(("core.repositoryformatversion", "0")))
+        fault, measured = mod._repo_config_fault("cmux", "box", 60)
+        assert fault and "could not be READ" in fault, fault
+        # ⛔ AND THE TRANSPORT'S OWN TIMEOUT IS rc 124, NOT `timed_out` — with the shared budget it can
+        # no longer answer first, but if it does, a non-zero status must still refuse rather than
+        # report `unmeasured` and run the verb.
+        mod.run = lambda *a, **kw: mod.Ran(
+            ["git"], rc=124, stderr="cmux: operation timed out after 60s",
+            stdout=z(("core.repositoryformatversion", "0")))
+        fault, measured = mod._repo_config_fault("cmux", "box", 60)
         assert fault and "could not be READ" in fault, fault
     finally:
         mod.run = real_run
@@ -1586,10 +1609,19 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     # outside a checkout (global+system scope only), so "no checkout" would report `clean` — the
     # conflation the tri-state exists to end. `git init` always writes `core.repositoryformatversion`,
     # so its ABSENCE is the signal.
-    cfg.write_text(z(("user.email", "a@b"), ("core.pager", "less")))
+    cfg.write_text(z(("user.email", "a@b"), ("core.pager", "less"), origin=GLOBAL_ORIGIN))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
     assert payload.get("refused") is None, payload
     assert payload["repo_config"] == "unmeasured", payload
+
+    # ⛔ BUT A CHECKOUT WHOSE `core.repositoryformatversion` WAS UNSET IS STILL A CHECKOUT. Deciding
+    # repo presence from that ONE optional key mislabelled a real repo `unmeasured` forever — a false
+    # "the check did not run" for a config that was read and clean. An origin under `/.git/` is the
+    # second, and stronger, piece of evidence.
+    cfg.write_text(z(("user.email", "a@b")))          # REPO_ORIGIN, no version key
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
+    assert payload.get("refused") is None, payload
+    assert payload["repo_config"] == "clean", payload
 
     # a NON-git program never pays the pre-check — asserted on the REAL argv log (the cmux stub above is
     # still installed: it logs every `config` invocation), not on its stdout.

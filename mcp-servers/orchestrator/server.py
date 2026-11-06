@@ -1956,7 +1956,7 @@ HOSTNAME_OK_FLAGS = ("-a", "-A", "-d", "-f", "-i", "-I", "-s", "-y", "-V", "--ve
 
 
 
-def _repo_config_fault(cmux: str, target: str) -> Tuple[str, bool]:
+def _repo_config_fault(cmux: str, target: str, timeout_s: int) -> Tuple[str, bool]:
     """(refusal reason, MEASURED). See GIT_UNPINNABLE_KEY_RE for why this check exists.
 
     ⛔ IT MUST READ THE SAME SCOPES THE VERB READS, OR IT IS THEATRE. `--local` was one scope only: a
@@ -1979,15 +1979,28 @@ def _repo_config_fault(cmux: str, target: str) -> Tuple[str, bool]:
     failed) — the caller reports that as `unmeasured` rather than `clean`, because a control that did
     not run must not read as one that passed.
     """
-    got = run([cmux, "vm", "exec", "--timeout", "20", target, "--",
-               "git", "config", "--includes", "--list", "-z"], timeout=45.0, cap=MAX_CAP)
+    # ⛔ THE PRE-CHECK GETS THE EXEC'S OWN BUDGET. It used to ask the transport for 20 s while the
+    # local kill sat at 45 s — and the transport answers FIRST (that is the whole point of
+    # CHANNEL_MARGIN_S). A config read that timed out at the transport level therefore came back as an
+    # ordinary `Ran` with timed_out=False and rc=124, which `rc != 0` mapped to `unmeasured`, and the
+    # git command RAN with a budget 3x the one that cut the check. Same budget now, so the local kill
+    # is the authority, and any non-zero status is a REFUSAL (below).
+    got = run([cmux, "vm", "exec", "--timeout", str(timeout_s), target, "--",
+               "git", "config", "--includes", "--list", "-z", "--show-origin"],
+              timeout=timeout_s + CHANNEL_MARGIN_S, cap=MAX_CAP)
     # ⛔ PARSE WHATEVER WAS ALREADY DRAINED, BEFORE JUDGING THE READ. `run()` drains into stdout even
     # on a timeout, so a key it already printed must still refuse — discarding it would be the same
     # "cut short is clean" mistake the truncation branch exists to prevent.
     listing = (got.stdout or "")
     fault = ""
     saw_repo = False
-    for record in listing.split("\0"):
+    # `-z --show-origin` alternates tokens: ORIGIN \0 KEY\nVALUE \0 ORIGIN \0 … — so the origin is
+    # how we tell a checkout's own config from a global/system one without a second exec.
+    tokens = listing.split("\0")
+    for k in range(0, len(tokens) - 1, 2):
+        origin, record = tokens[k], tokens[k + 1]
+        if "/.git/" in origin:
+            saw_repo = True
         if not record:
             continue
         key, _, value = record.partition("\n")
@@ -2016,24 +2029,26 @@ def _repo_config_fault(cmux: str, target: str) -> Tuple[str, bool]:
                                   "read can trigger a LAZY FETCH that runs a transport program" % key)
     if fault:
         return fault, True
-    # ⛔ A READ THAT DID NOT FINISH IS NOT EVIDENCE, AND IT MUST NOT FALL THROUGH TO THE EXEC.
-    # `run()` returns rc=None on a TIMEOUT — a read cut short, the same category as truncation and the
-    # opposite of a clean answer. (The pre-check budget is deliberately smaller than the exec's, so a
-    # slow config is exactly the case that can lose the pre-check and still finish the verb.)
-    if got.timed_out or got.error:
+    # ⛔ ANY NON-ZERO STATUS IS A REFUSAL. `--local` is not used (it misses worktree/global scope), so
+    # `git config --list` now SUCCEEDS outside a checkout and a non-zero status means the read itself
+    # failed — a transport timeout (rc 124), a missing git, a corrupt config. A read that did not
+    # succeed is not evidence, and it must not fall through to the exec.
+    if got.timed_out or got.error or got.rc != 0:
+        detail = got.error or ("rc=%s%s" % (got.rc, (": " + (got.stderr or "").strip()[:120])
+                                            if (got.stderr or "").strip() else ""))
         return ("the target checkout's config could not be READ (%s), so it cannot be checked for a "
-                "program-naming key — refused rather than run with an unread config"
-                % (got.error or "timed out"), True)
+                "program-naming key — refused rather than run with an unread config" % detail), True
     if got.truncated:
         return ("the target checkout's config listing was CUT SHORT by the %s-byte channel cap "
                 "(truncated is a CHANNEL fact over stdout+stderr, not a statement about the "
                 "listing), so it could not be checked for a program-naming key" % got.cap), True
     if got.rc != 0:
         return "", False
-    # ⛔ AND `rc 0` DOES NOT PROVE A REPOSITORY WAS READ. Without `--local`, `git config --list`
-    # SUCCEEDS OUTSIDE a repository (global+system scope only), so "not a checkout" would report
-    # `clean` — the conflation the tri-state exists to end. `git init` always writes
-    # `core.repositoryformatversion`, so its absence means no checkout was consulted.
+    # ⛔ AND `rc 0` DOES NOT BY ITSELF PROVE A REPOSITORY WAS READ. Without `--local`, `git config
+    # --list` SUCCEEDS OUTSIDE a repository (global+system scope only), so "not a checkout" would
+    # report `clean` — the conflation the tri-state exists to end. Evidence is EITHER the format key a
+    # `git init` always writes, OR a config file under `/.git/` in the listing's origins — the second
+    # so a real checkout whose key was unset is NOT mislabelled `unmeasured` forever.
     if not saw_repo:
         return "", False
     return "", True
@@ -2156,7 +2171,7 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         # ⛔ FAIL CLOSED ON THE CLASS THAT CANNOT BE PINNED. See GIT_UNPINNABLE_KEY_RE: a filter or
         # merge driver is named by the CHECKOUT, so the only defence is to read the checkout's own
         # config and refuse. Runs before the exec, on the same box, with the same cwd.
-        fault, measured = _repo_config_fault(cmux, target)
+        fault, measured = _repo_config_fault(cmux, target, timeout_s)
         if fault:
             payload["refused"] = "repo-config-names-a-program"
             payload["argv"] = list(argv)
