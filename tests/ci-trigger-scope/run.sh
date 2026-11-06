@@ -79,11 +79,16 @@
 #      STEP must FAIL (the job then runs on every event) while the step's own `if:` is never read as
 #      the job's; an unrelated step condition (`if: always()`) must PASS. A `keyIndent > headerIndent`
 #      test fails both ways — green over the substitution, and a FALSE BLOCK over the unrelated one.
-#  7o. MUTANTS: a DUPLICATE `types:`/`branches:` is CANNOT-VERIFY (rc 2), never a green read of the
-#      first copy. YAML is last-wins, so the question "which set is in force" is unanswerable.
-#  7p. MUTANTS: a legal trailing YAML comment (`- opened  # first gate run`, and after a flow sequence)
-#      must PASS — a reader that folds the comment into the value fabricates a set and refuses a
-#      correct workflow.
+#      DELETING the event-owning job is `rc=1` with a FINDING (a fact) and never `rc=2` (a shrug).
+#  7o. MUTANTS: a DUPLICATE `types:`/`branches:`/`paths:` is CANNOT-VERIFY (rc 2), never a green read
+#      of the first copy — in ALL THREE workflows this file pins. YAML is last-wins, so the question
+#      "which set is in force" is unanswerable, and a `findIndex` reader would answer about the block
+#      that is not in force (#3196's `edited` reduction, or a `paths: ['**']` no-op, re-addable one
+#      line away with the pin green).
+#  7p. MUTANTS: legal YAML SPACING THAT CARRIES NO VALUE — a trailing comment on a block-sequence item,
+#      after a flow sequence, on the OWNER's one-line `if:` (whose wording must decide nothing), and on
+#      the KEY line itself — must all PASS. A reader that folds a comment into the value fabricates a
+#      set or a truthiness term and refuses a correct workflow.
 #  7q. MUTANT: `!github.event.issue.pull_request` must PASS — it is the same predicate as `== null`
 #      on a comment event, and a shape the reader DOES model may never be reported as a finding.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
@@ -1382,6 +1387,30 @@ if apply_mutation "$PC" "$PC_RVSTEP_ALWAYS" \
   run_check 0 "an unrelated STEP condition (\`if: always()\`) does not make the JOB's guard wrong" PC_FILE="$PC_RVSTEP_ALWAYS"
 fi
 
+# ⛔ AND THE ABSENCE OF THE OWNER IS A FACT THIS READER STATES (rc=1), NOT A CANNOT-VERIFY (rc=2).
+# `jobBlock` REFUSES when it cannot locate a job — the right answer for "cannot verify this job's guard",
+# and the wrong one here, because "the job that owns the admitted event is gone" is answerable. The
+# presence check runs FIRST for that reason; this arm is what keeps it first (a refactor back to
+# `jobBlock`-first would silently move the answer to rc=2 with the suite still green).
+PC_RV_GONE="$TMP/pc-rv-gone.yml"
+# ⛔ RENAMED, NOT HEADER-DELETED: deleting only the header leaves the job BODY attached to the previous
+# job, which (correctly) reads as a duplicate `name:` and answers CANNOT-VERIFY — a different finding
+# about a different defect. A rename leaves a syntactically valid workflow in which the admitted event
+# has no owner under the name the decision gives it, which is the state this arm is about.
+if apply_mutation "$PC" "$PC_RV_GONE" \
+  "  revalidate-on-issue-comment:
+" \
+  "  revalidate-renamed:  # renamed: the event owner is gone under its expected name
+" \
+  "the event-owning job must be renamable"; then
+  run_check 1 "DELETING the event-owning \`revalidate-on-issue-comment\` job is REFUSED (rc=1, not CANNOT-VERIFY)" \
+    PC_FILE="$PC_RV_GONE"
+  case "$FINDINGS" in
+    *"no longer declares"*revalidate-on-issue-comment*) pass "the refusal says the JOB is gone, and names it" ;;
+    *) fail "the refusal did not name the missing event owner" ;;
+  esac
+fi
+
 echo "== 7o. MUTANTS: a DUPLICATE filter key is LAST-WINS, so it is CANNOT-VERIFY =="
 # ⛔ YAML KEEPS THE LAST `types:`/`branches:` AND DISCARDS THE REST. A `findIndex` reader answers about
 # the FIRST copy, i.e. about the block that is NOT in force — measured GREEN in both arms below before
@@ -1414,6 +1443,27 @@ if apply_mutation "$PC" "$PC_DUPBR" \
   "a duplicated \`branches:\` must be constructible"; then
   run_check 2 "a DUPLICATED \`pull_request: branches:\` is CANNOT-VERIFY" PC_FILE="$PC_DUPBR"
 fi
+# ⛔ THE SAME RULE OWES THE OTHER TWO WORKFLOWS THIS FILE PINS. `workflow-lock.yml` and
+# `harness-single-source.yml` are read with the same `types:`/`paths:` handling, and an appended second
+# key there is the SAME last-wins trap: #3196's `edited` reduction (or a `paths: ['**']` no-op) becomes
+# re-addable one line away with the pin still green. Measured before this rule: rc=0 for both.
+WL_DUPTYPES="$TMP/wl-dup-types.yml"
+if apply_mutation "$WL" "$WL_DUPTYPES" \
+  "    types: [opened, synchronize, reopened]" \
+  "    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]" \
+  "a duplicated \`types:\` in workflow-lock must be constructible"; then
+  run_check 2 "a DUPLICATED \`types:\` in workflow-lock.yml is CANNOT-VERIFY" WL_FILE="$WL_DUPTYPES"
+fi
+HSS_DUPPATHS="$TMP/hss-dup-paths.yml"
+if apply_mutation "$HSS" "$HSS_DUPPATHS" \
+  "      - '.github/workflows/harness-single-source.yml'" \
+  "      - '.github/workflows/harness-single-source.yml'
+    paths:
+      - '**'" \
+  "a duplicated \`paths:\` in harness-single-source must be constructible"; then
+  run_check 2 "a DUPLICATED \`paths:\` in harness-single-source.yml is CANNOT-VERIFY" HSS_FILE="$HSS_DUPPATHS"
+fi
 
 echo "== 7p. MUTANTS: a legal trailing YAML COMMENT is not part of the value =="
 # YAML starts a comment at a `#` PRECEDED BY WHITESPACE, so `- opened  # first gate run` is the item
@@ -1441,6 +1491,38 @@ if apply_mutation "$PC" "$PC_CMT_FLOW" \
   "    types: [opened, synchronize, reopened, edited]  # the decided set" \
   "a commented flow sequence must be constructible"; then
   run_check 0 "a trailing comment after a FLOW sequence does not make the activity set wrong" PC_FILE="$PC_CMT_FLOW"
+fi
+# ⛔ AND THE OWNER'S `if:` TAKES ONE TOO — ITS WORDING DECIDED THE VERDICT BEFORE THIS ARM EXISTED.
+# The folded value was scanned for `||` / bare `true` / `false` WITH THE COMMENT INCLUDED, so a
+# byte-for-byte correct guard was refused whenever its comment happened to say "true". Measured:
+# `… = null  # holds true only for plain issues` -> rc=1, while `# owns the comment event` -> rc=0.
+PC_RV_CMT="$TMP/pc-rv-comment.yml"
+if apply_mutation "$PC" "$PC_RV_CMT" \
+  "    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "    if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null  # holds true only for plain issues" \
+  "a commented owner guard must be constructible"; then
+  run_check 0 "a trailing comment on the OWNER's one-line \`if:\` is not part of the expression (its wording decides nothing)" \
+    PC_FILE="$PC_RV_CMT"
+fi
+# ⛔ AND A COMMENT AFTER THE KEY IS NOT A VALUE: `types:  # note` with the block sequence below it is
+# the same list. A reader that took the comment for the value read the key as "declared with a value"
+# and refused a correct workflow.
+PC_KEY_CMT="$TMP/pc-key-comment.yml"
+if apply_mutation "$PC" "$PC_KEY_CMT" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:  # the decided set, in the decision's own order
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "a commented key must be constructible"; then
+  run_check 0 "a trailing comment ON THE KEY line is not a value — the block sequence below still reads" PC_FILE="$PC_KEY_CMT"
 fi
 
 echo "== 7q. MUTANT: the equivalent NULL test on the revalidation guard =="

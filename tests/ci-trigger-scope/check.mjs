@@ -208,17 +208,41 @@ function valueLinesFor(entry, lines) {
 // WHITESPACE (outside quotes), so `- opened  # first gate run` is the item `opened`. Reading the whole
 // rest of the line fabricated a list like `[opened # first gate run, synchronize # every push]`, which a
 // SET comparison then reported as "LOST [opened, synchronize]" — rc=1 over a correct workflow, the
-// same "the printed list was FABRICATED" class the value-line reader was fixed for. Quotes are honoured:
-// `- 'a # b'` is one item, comment and all.
+// same "the printed list was FABRICATED" class the value-line reader was fixed for.
+// ⛔ QUOTE STATE IS TRACKED ACROSS THE WHOLE SCALAR, not per character-pair. `indexOf(close, 1)` looked
+// right and is not: YAML's single-quoted escape is a DOUBLED quote, so `'it''s # x'` is the value
+// `it's # x` and a first-match scan truncated it to `it`. A corrupted item is then reported as a
+// missing/extra member — the over-block direction this whole function exists to remove.
+// ⛔ AND A SCALAR THAT *BEGINS* WITH `#` IS A COMMENT, i.e. NO ITEM AT ALL (`- #x` in a block sequence,
+// `types: # note` before a nested sequence). Returning it literally fabricated the item `#x`.
 function stripYamlComment(s) {
   const t = String(s);
-  const open = t[0];
-  if (open === '"' || open === "'") {
-    const close = t.indexOf(open, 1);
-    if (close > 0) return t.slice(0, close + 1);
-    return t;
+  if (t.trimStart().startsWith("#")) return "";
+  let quote = null;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (quote) {
+      if (quote === '"' && ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === quote) {
+        // A doubled quote inside a SINGLE-quoted scalar is the escape, not the close.
+        if (quote === "'" && t[i + 1] === "'") {
+          i++;
+          continue;
+        }
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "#" && i > 0 && /\s/.test(t[i - 1])) return t.slice(0, i).trim();
   }
-  return t.replace(/\s+#.*$/, "");
+  return t;
 }
 
 // readList(entry, valueLines) — a flow list on the key's own line, or a block sequence below it.
@@ -252,11 +276,11 @@ function readList(entry, valueLines) {
 // the same verdict is owed here: CANNOT-VERIFY, never a green read of the wrong block. (The repo's own
 // parser refuses a duplicate key outright — `scripts/workflow-yaml.mjs` throws on it — so this can only
 // fire on a file that is already broken.)
-function singleKey(keys, key, where) {
+function singleKey(keys, key, where, file = PC_FILE) {
   const hits = keys.filter((k) => k.key === key);
   if (hits.length > 1) {
     refuse(
-      `${PC_FILE}: \`${where}\` declares \`${key}:\` ${hits.length} times. YAML keeps the LAST one and discards the rest, so which ${key} set is in force here is UNANSWERABLE — and a reader that takes the first would answer about the wrong block. Re-run after the duplicate is resolved.`
+      `${file}: \`${where}\` declares \`${key}:\` ${hits.length} times. YAML keeps the LAST one and discards the rest, so which ${key} set is in force here is UNANSWERABLE — and a reader that takes the first would answer about the wrong block. Re-run after the duplicate is resolved.`
     );
   }
   return hits[0] ?? null;
@@ -457,6 +481,15 @@ function jobIfExprs(block) {
       v += (v === "" ? "" : " ") + l.trim();
     }
     v = v.replace(/^(?:[>|][+-]?\d?)\s*/, "").trim();
+    // ⛔ A TRAILING YAML COMMENT ON THE GUARD IS NOT PART OF THE EXPRESSION — and here it decides the
+    // verdict. This reader folds the value and then scans it for `||` / bare `true` / `false`, so a
+    // comment whose WORDING contains one of those words turned a byte-for-byte correct guard into a
+    // FINDING that quoted the comment back as if it were the expression (measured: `… = null  # holds
+    // true only for plain issues` -> rc=1; the same line commented `# owns the comment event` -> rc=0).
+    // Every other reader in this file already strips a comment (`PC_COMMENT_GUARD`'s `(?:\s+#.*)?`, and
+    // `stripYamlComment` for lists); this one is stripped by the SAME helper, quote-aware, so `#` inside
+    // a quoted whole-scalar value survives.
+    v = stripYamlComment(v).trim();
     v = v.replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
     out.push(v);
   }
@@ -564,12 +597,17 @@ function checkWorkflowLock() {
   // The trigger must stay a pull_request_target: it is the reason the job runs from a copy the PR
   // cannot rewrite (see the workflow's own header). Losing it is not a narrowing, it is the gate
   // existing at all.
+  // A DUPLICATE `types:` IS LAST-WINS TOO — routed through `singleKey` so the first copy can never be
+  // answered for the block YAML actually keeps.
+  const wlTypesEntry = singleKey(t.keys, "types", "pull_request_target:", WL_FILE);
   const typesIdx = t.keys.findIndex((k) => k.key === "types");
-  if (typesIdx < 0) {
+  if (!wlTypesEntry) {
     findings.push(
       "workflow-lock.yml declares no `types:` under `pull_request_target:`. GitHub's default set happens to be the same three types, but an implicit default carries no artifact: the decision recorded above the trigger stops being readable, and the next editor cannot tell a deliberate three-type set from an inherited one. Write `types: [opened, synchronize, reopened]`."
     );
     return;
+  }
+  if (typesIdx < 0) {
   }
   const entry = t.keys[typesIdx];
   const valueLines = valueLinesFor(entry, t.lines);
@@ -617,6 +655,8 @@ function checkHarnessSingleSource() {
       `harness-single-source.yml's \`pull_request:\` declares [${extraHss.join(", ")}] besides \`paths:\`. Each of those is a COVERAGE NARROWING on a guard whose whole job is to red a reappearing fork or a drifting deployed copy: \`types: [opened]\` drops every \`synchronize\` (so no later head is ever measured), and \`branches-ignore: [main]\` stops the job firing on any PR in this repo at all — while the path arm stays true. The trigger's only filter is \`paths:\`.`
     );
   }
+  // A DUPLICATE `paths:` IS LAST-WINS TOO — see `singleKey`.
+  const hssPathsEntry = singleKey(t.keys, "paths", "pull_request:", HSS_FILE);
   const pathsIdx = t.keys.findIndex((k) => k.key === "paths");
   const ignoreIdx = t.keys.findIndex((k) => k.key === "paths-ignore");
   if (ignoreIdx >= 0) {
