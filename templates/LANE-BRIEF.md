@@ -60,6 +60,29 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
     decision, it is NOT a candidate for adoption: reopen the decision and argue it in its own home;
     never adopt over it.
 
+## PREVIOUS WORK — did someone already start this? (agent-infra#3484)
+
+A released claim reads as "nothing happened here" unless someone looks, and 222 rescued `refs/wip/*`
+snapshots existed on this repo that nothing told the next actor about. Measure the four facts below
+and paste the MEASUREMENT — this is the handover the reaper cannot write for you, because only you
+know what the previous attempt concluded.
+
+⛔ `WIP:` MUST START WITH THE KEY (`issue-<N>`, or `pr-<N>` for a fixer's PR key). That is what
+makes the absence claim checkable instead of unfalsifiable: a `WIP:` value that names no
+`refs/wip/…` ref is read as "there is none", and the dispatch is REFUSED when `refs/wip/*` holds
+a snapshot for that issue. Silence is not freedom.
+
+CLAIM:     refs/claims/issue-<N> -> <holder>:<pid>, lease_until <ts>   ·   or "unclaimed"
+WIP:       issue-<N> -> refs/wip/<ref> @ <sha12>   ·   or   issue-<N> -> none (measured: <cmd> at <ts>)
+           ·   or   keyless — <why this dispatch has no issue/PR key>
+BRANCH:    fix/<N> / rescue/<N> -> <head>, <N> commits ahead, reviewed | unreviewed   ·   or "none"
+WORKTREE:  <path> -> clean | <N> dirty files   ·   or "none"
+PRIOR:     what the previous attempt concluded, and why it stopped   ·   or "no previous attempt"
+
+Commands that answer it: `git ls-remote origin 'refs/claims/*' 'refs/wip/*'`,
+`git ls-remote --heads origin 'fix/<N>*' 'rescue/<N>*'`, `git worktree list`, and
+`bash scripts/orchestrator-harness/brief-gate.sh --wip-refs <N>` (the typed form of the WIP line).
+
 ## Setup
 
 You are ALREADY inside your own worktree (that is your cwd, on branch `<BRANCH>`). Do NOT create,
