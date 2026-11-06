@@ -2925,9 +2925,7 @@ ck "§27b box-status REFUSES the same shape and names the pointer as the reason"
 # ⛔ `GIT_COMMON_DIR` IS OBSERVABLE ONLY ON AN **ACCEPTED** CANDIDATE (round-9 review, measured): on a repo the
 # marker test already refuses it changes nothing, so a pin there is vacuous. The read it corrupts is the
 # RELATION — git takes OBJECTS from the inherited common dir, so a pin that is not an object in THIS repo is
-# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history. Asserted
-# against an ACCEPTED candidate with a resolvable `origin/main` (see the fixture note on `--repo` below);
-# `$HERE_TOP` was neither guaranteed.
+# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history.
 # The pin is a commit that EXISTS in the FOREIGN repo and NOT in this one: an inherited common dir makes
 # `cat-file -e` succeed for it, which is what turns `[unknown]` into `[diverged]`. A synthetic zero sha would
 # be absent from both repos and the case would pass for the wrong reason.
@@ -2940,11 +2938,18 @@ ck "§27b box-status REFUSES the same shape and names the pointer as the reason"
 # `$REPO_SRC` is this suite's own harness fixture: it tracks the marker, so the candidate is ACCEPTED
 # (which this arm requires — on a REFUSED candidate the pin changes nothing and the arm is vacuous by
 # design), and it has its own `origin/main`, so the relation is actually computed.
+# ⛔ AND THE ASSERTION PINS THE ACCEPTANCE ITSELF (#3512 review, cycle 2, P2). `harness: … [unknown]`
+# alone cannot tell "accepted candidate, relation computed, no hijack" from "candidate REFUSED, relation
+# never computed" — the refusal path still prints the pin, so both look identical and the arm would pass
+# on a broken reader. The `ref: origin/main=` conjunct (the shape the subdirectory arm above already
+# uses) is what makes "the relation was actually computed" an assertion rather than an assumption, and
+# it also protects the arm if this fixture ever loses its `origin/main`.
 git -C "$PLAIN" rev-parse HEAD > "$TMP/pin-foreign"
 out="$(env REPO= HARNESS_PIN="$TMP/pin-foreign" GIT_COMMON_DIR="$PLAIN/.git" HOME="$TMP/home" FIXTURE="$FX" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$TMP/o" --repo "$REPO_SRC" 2>&1)"
 ck "§27b box-status is not hijacked by an inherited GIT_COMMON_DIR (an absent pin stays [unknown])" \
-   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" \
+      && grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
 
 # ⛔ A **TRACKED SYMLINK** AT THE MARKER PATH IS NOT THE HARNESS (round-4 review follow-up, BLOCKING-adjacent:
 # measured that `git ls-files --error-unmatch` is satisfied by a mode-120000 index entry, so a repo that
