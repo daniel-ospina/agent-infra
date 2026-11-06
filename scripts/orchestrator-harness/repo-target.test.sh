@@ -298,10 +298,12 @@ c4=$?
 
 # ⛔ A WORKTREE-MATERIALISATION REFUSAL MUST REFUND TOO (#3511). This arm exited without refunding
 # while the identity refusals above do, and the rule is the file's own (#1720 above `refund_gate_attempt`,
-# #2223 inside it): the controller books the attempt UPSTREAM of every gate, so a refusal that
-# ran no fixer must give it back — otherwise three refusals reach MAX_FIX_TRIES and the PR is PARKED
-# "needs a human" having never had a single fixer run. The exit code is the whole test: any non-zero
-# `wt_provision` rc refunds, and the helper names the cause in `$WT_RESULT` (logged as `ABORT:`). No
+# #2223 inside it): a refusal that ran no fixer must give the attempt back — otherwise three refusals
+# reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never had a single fixer run. (⛔ The
+# DELIVERY depends on the controller's booking order — the arm's comment in `fix-one.sh` names the three
+# spawn arms that still book after the spawn, #3562 — so this asserts the refund, not that it always
+# lands.) The exit code is the whole test: any non-zero `wt_provision` rc refunds, and the helper
+# names the cause in `$WT_RESULT` (logged as `ABORT:`). No
 # cause list is restated here or in the source — see the arm's comment in `fix-one.sh` for why.
 # The refusal is driven through the UNREGISTERED-DIRECTORY arm (a foreign directory at the worktree
 # path), which is `wt_provision`'s other rc=2 and needs no git state to set up.

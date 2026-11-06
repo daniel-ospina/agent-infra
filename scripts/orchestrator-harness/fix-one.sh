@@ -232,9 +232,17 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   if [ "$?" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
     # ⛔ REFUND HERE TOO (#3511). This arm exited without refunding while the branch refusal above
-    # does. The rule is #1720's: the controller books the attempt UPSTREAM of every gate, so a refusal
-    # that ran no fixer gives it back — otherwise three refusals reach MAX_FIX_TRIES and the PR is
-    # PARKED "needs a human" having never had a single fixer run.
+    # does. The rule is #1720's: a refusal that ran no fixer gives the attempt back — otherwise three
+    # refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never had a single fixer
+    # run.
+    # ⛔ THE DELIVERY DEPENDS ON WHERE THE CONTROLLER BOOKS, AND ONLY ONE OF THE FOUR SPAWN ARMS
+    # PRE-BOOKS. The red-tree arm books `fixcount` BEFORE `wt_spawn` (that ordering was a fix in its own
+    # right: booking after the spawn let the child's decrement be overwritten by the controller's
+    # pre-refusal value). The CONFLICTED, NEEDS-FIX and CI-red arms still book AFTER the spawn, so a
+    # refund landing in that window is overwritten and the attempt is consumed anyway — and the per-head
+    # `fixgate-<PR>-<HEAD>` marker, which this call writes too, is consumed only by the red-tree arm.
+    # That residual is filed (#3562); this call is still correct and still the fix, because the arm that
+    # most needs it pre-books and the others shrink the window rather than widening it.
     # The test is the exit code and nothing else: ANY non-zero `wt_provision` rc refunds. The helper
     # names the cause in `$WT_RESULT`, which is logged on the line above — this comment does not restate
     # the cause list, because a list here is a second definition that goes stale the next time the
@@ -247,12 +255,12 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # note inside `refund_gate_attempt` refunds a DISK refusal whose comment says outright it "never
     # clears by waiting". The trade is stated there and applies here: parking the PR on "attempts
     # exhausted" is a FALSE sentence about work that never ran, so a sticky refusal is left LOUD in
-    # `fix-$PR.log` and re-spawned rather than silently parked, and the conflicted arm's `$MF`
-    # fix-lane ceiling / cross-box claim / `can_spawn` bound the re-spawn (it is not unbounded).
-    # ⛔ And `wt_provision`'s refusals carry NO `REPAIR:` token, unlike `prlock_refuse`'s — so what a
-    # human gets from a sticky one is the cause without the fix (filed separately). No line numbers in
-    # this block on purpose: a citation here already rotted once when an edit to this comment shifted
-    # the function it pointed at.
+    # `fix-$PR.log` and re-spawned rather than silently parked. ⛔ What bounds that re-spawn is per-cycle
+    # capacity only (the `$MF` fix-lane ceiling, the cross-box claim, `can_spawn`) — it is THROTTLED per
+    # cycle, not bounded across cycles, and the fix that would let it park is a `REPAIR:` line in
+    # `wt_provision`'s refusals, which carries none today (recorded on #2632; no repair text is what a
+    # human gets from a sticky one). No line numbers in this block on purpose: a citation here already
+    # rotted once when an edit to this comment shifted the function it pointed at.
     refund_gate_attempt
     exit 1
   fi
