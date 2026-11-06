@@ -54,10 +54,21 @@ unset AI_REVIEW_GATE_KEY
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RAIL="${ATOMIC_LAND_SUITE_RAIL:-$ROOT/scripts/atomic-land.sh}"
+# The watchdog's reaper and the liveness rules are SHARED with the guard process that
+# actually reaps a hung rail (#1845) — one statement of "is it alive / is it still the
+# same process / kill it and prove it", not two that can drift.
+GUARD="$ROOT/tests/atomic-land/rail-guard.sh"
+# shellcheck source=/dev/null
+. "$ROOT/tests/atomic-land/reap-lib.sh"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/atomic-land-suite.XXXXXX")"
 checks=0
 failures=0
 
+# #1845: the rail in flight is reaped by `rail-guard.sh` — a SEPARATE process, so it
+# outlives a suite that is killed mid-scenario. Nothing in this script's teardown reaps
+# the rail, deliberately: the suite's EXIT trap is INHERITED by any forked subshell, so a
+# cleanup arm here would be a second, racier owner of the same kill (measured: a TERM'd
+# guard ran the suite's cleanup and `rm -rf`'d the live temp dir mid-run).
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -478,6 +489,10 @@ new_scen() {
   SCEN_REGISTRY_SYNC=
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
+  # #1845: the guard's evidence files are per scenario. A stale sentinel would make a
+  # watchdog report 124 for a rail that stopped by itself (a false red, and the wrong
+  # reason for it).
+  rm -f "$SCEN/wd-fired" "$SCEN/guard-fired" "$SCEN/victim-pid" 2>/dev/null || true
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
   # default) so every pre-existing scenario keeps refreshing exactly as before.
   rm -f "$SCEN/strict" "$SCEN/mergeable" 2>/dev/null || true
@@ -627,6 +642,29 @@ print(summary, end="")
 PY
 }
 
+# ── reaping a rail: the bound must not depend on the SUITE surviving ─────
+# #1845. The watchdog's kill was already aimed at the RIGHT process (`rail_exec` ends
+# in `exec`, so `$!` is the rail — #1532), and it still leaked: the poll-and-kill loop
+# lived in THIS script, so the moment the suite was killed mid-scenario (a shard
+# timeout, a lane's own watchdog, an operator, a cancelled CI job) nothing bounded the
+# rail any more. The orphan's own state says so — `ppid 1`, cwd `(deleted)`, fd 255 on
+# the deleted mutated rail, still spinning at 10-12% CPU 4h12m to 1d19h later, one per
+# suite run, on a box other lanes share. An enforcer whose termination condition
+# cannot fire is not an enforcer.
+#
+# So the loop lives in `rail-guard.sh`: a separate process, which keeps running after the
+# suite dies and fires on EITHER the limit expiring or the supervisor it was handed being
+# gone. Firing reaps the rail and VERIFIES it is gone; a reap it cannot prove is reported
+# as a survivor, never as success. `tests/atomic-land/reap-lib.sh` holds the rules it
+# shares with this script; `rail-guard.sh`'s own header explains why it must be a SEPARATE
+# process rather than a backgrounded function (an inherited EXIT trap `rm -rf`'d the live
+# suite temp dir — measured, 136 false reds).
+#
+# Why not `scripts/lib/bounded.sh`: `tb_timeout` bounds a command's DURATION and its timer
+# is a child of the CALLER, so it dies with the caller — it cannot stand in for this. The
+# same supervisor hole exists there for the reaper family; folding this arm in would
+# change live reapers, so it is deliberately not done in this change.
+
 # Run the rail under a hard wall-clock watchdog and report its exit status.
 #
 # This exists because the wait bound can fail by HANGING rather than by
@@ -638,21 +676,37 @@ PY
 # The rail is launched through `rail_exec` directly (NOT `( run_rail ... ) &`) so
 # that `$!` is the RAIL: killing a wrapper subshell would leave the rail
 # orphaned, and an orphan on the wait bound spins forever.
+#
+# The KILLING is not done here (#1845): this function only waits, and `rail-guard.sh` —
+# a separate process that survives this script — does the reaping and records WHY it
+# fired in `$SCEN/wd-fired`, so 124 can never be confused with the rail's own exit status.
+LAST_RAIL_PID=""
 run_rail_watchdog() { # <limit-secs> <extra args...>
   local limit="$1"; shift
+  local sentinel="$SCEN/wd-fired" rc=0 gpid ident
+  rm -f "$sentinel"
   rail_exec "$@" >"$SCEN/out" 2>"$SCEN/err" &
-  local pid=$! waited=0
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ "$waited" -ge "$limit" ]; then
-      kill -9 "$pid" 2>/dev/null
-      wait "$pid" 2>/dev/null
-      return 124
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  wait "$pid" 2>/dev/null
-  return $?
+  local pid=$!
+  ident="$(proc_ident "$pid")"
+  LAST_RAIL_PID="$pid"
+  # A SEPARATE `bash` (not a backgrounded function): it must survive this script's death,
+  # and a fork inherits this script's EXIT trap — see rail-guard.sh's header.
+  bash "$GUARD" "$$" "$limit" "$sentinel" "$pid" "$ident" &
+  gpid=$!
+  wait "$pid" 2>/dev/null || rc=$?
+  # ⛔ THE GUARD IS NEVER SIGNALLED — `wait` only. It exits by itself within one poll of the
+  # rail's death (its loop is `while still_ours "$pid" "$ident"`), so the only cost is
+  # that poll.
+  # MEASURED, and this is why the TERM is gone: bash runs an EXIT trap when the shell is
+  # KILLED BY A SIGNAL, and a backgrounded command is briefly a FORK OF THIS SHELL that has
+  # not exec'd yet. A `kill -TERM` landing in that window killed the fork, which then ran the
+  # INHERITED `trap cleanup EXIT` and `rm -rf`'d the live suite temp dir mid-run — 136 of 456
+  # assertions reddened, and all 71 mutation children "reddened" for the same reason, so the
+  # coverage gate printed ✅ while covering nothing. Reproduced 5/5 on the pre-exec window and
+  # 0/1 when the TERM was delayed. Removing the signal removes the window.
+  wait "$gpid" 2>/dev/null
+  if [ -e "$sentinel" ]; then rm -f "$sentinel"; return 124; fi
+  return $rc
 }
 
 # ═══ 1. the ordered atomic unit on a BEHIND PR ═══════════════════════════
@@ -1145,6 +1199,15 @@ fi
 called "record-review" && fail "recorded without terminal checks" || pass "no record before terminal checks"
 called "admin-merge" && fail "landed without terminal checks" || pass "no land before terminal checks"
 grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
+# #1845: `124` on its own is NOT evidence the rail stopped — the old watchdog returned
+# 124 either way, so the suite reported its expected failure and forgot the process.
+# The rail must be PROVABLY gone before the suite moves on.
+if is_running "$LAST_RAIL_PID"; then
+  fail "the rail SURVIVED the watchdog (pid $LAST_RAIL_PID is still running) — a leak, not a bound"
+  kill -9 "$LAST_RAIL_PID" 2>/dev/null
+else
+  pass "the watchdog left no survivor behind (pid $LAST_RAIL_PID is gone)"
+fi
 
 # ═══ 7c. an unrepresentable wait bound is refused, not silently inert ════
 echo "── 7c. an oversized --wait-timeout is refused instead of disabling the bound"
@@ -1237,6 +1300,60 @@ elif grep -q "value too great for base" "$SCEN/err"; then
   fail "the arithmetic read 08 as octal and aborted silently (no stop, no record)"
 else
   fail "expected a bounded stop naming the wait, got rc $rc"
+fi
+if is_running "$LAST_RAIL_PID"; then
+  fail "the rail SURVIVED the watchdog (pid $LAST_RAIL_PID is still running) — a leak, not a bound"
+  kill -9 "$LAST_RAIL_PID" 2>/dev/null
+else
+  pass "the watchdog left no survivor behind (pid $LAST_RAIL_PID is gone)"
+fi
+
+# ═══ 7g. a guarded process cannot outlive its SUPERVISOR (#1845) ══════
+# The measured leak is NOT "the kill was aimed at the wrong process" — `$!` has been the
+# rail since #1532. It is that the kill lives in the suite: a suite killed mid-scenario
+# (shard timeout, a lane's watchdog, an operator, a cancelled CI job) leaves its rail
+# with nothing to bound it, and a rail whose wait bound the B14 mutation has made
+# unreachable then spins forever at 10-12% CPU on a box other lanes share (measured:
+# 4h12m to 1d19h, `ppid 1`, cwd `(deleted)`, one per suite run).
+# This drives the GUARD directly: the assertion is about the mechanism that has to fire
+# when the suite is gone, and using a rail instead would make it vacuous on a healthy
+# rail (which stops at its own bound and never needs the guard).
+echo "── 7g. a guarded child is reaped when its SUPERVISOR disappears (#1845)"
+new_scen orphan-guard
+# A supervisor pid that is ALREADY GONE: a child we start and REAP. `wait` reaps it, so
+# this is a dead pid — not a zombie, which `kill -0` would answer TRUE for.
+sleep 1 & _dead_sup=$!
+wait "$_dead_sup" 2>/dev/null
+# A victim whose PARENT exits, so it reparents to init (the field orphan's own shape).
+# Without that, a reaped victim would linger as a ZOMBIE OF THIS SUITE and `kill -0`
+# would answer TRUE forever — no assertion about "is it gone" could ever fail, which is
+# how a test for this class passes while the leak is live.
+bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-pid"
+_victim="$(cat "$SCEN/victim-pid" 2>/dev/null)"
+if [ -z "$_victim" ]; then
+  fail "7g could not start its victim (no pid was recorded)"
+else
+  _vident="$(proc_ident "$_victim")"
+  # limit 120s vs a 15s observation window: the LIMIT cannot be what saves us, so only
+  # the supervisor-death arm can make this pass. The guard is invoked as the SUITE invokes
+  # it — same script, same argv shape — so this pins the shipped mechanism, not a copy.
+  bash "$GUARD" "$_dead_sup" 120 "$SCEN/guard-fired" "$_victim" "$_vident" &
+  _guard=$!
+  _waited=0
+  while is_running "$_victim" && [ "$_waited" -lt 15 ]; do
+    sleep 1
+    _waited=$((_waited + 1))
+  done
+  if is_running "$_victim"; then
+    fail "a guarded child OUTLIVED its supervisor (${_waited}s and still running, limit 120) — the #1845 leak"
+    reap_pid "$_victim" "$_vident"
+  else
+    pass "the guard reaped the child once its supervisor was gone (${_waited}s, limit 120)"
+  fi
+  wait "$_guard" 2>/dev/null
+  [ -e "$SCEN/guard-fired" ] \
+    && pass "the guard recorded WHY it fired, so 124 is attributable and not a guess" \
+    || fail "the guard fired without recording why (no sentinel)"
 fi
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
