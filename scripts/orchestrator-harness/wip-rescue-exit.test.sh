@@ -1322,8 +1322,15 @@ nx2="$( bash -c '
   LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=pushed
   LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
   lane_end_next' _ "$GATE" 2>/dev/null )"
-case "$nx2" in MANUAL*"NOT archived"*) rcn23b=0 ;; *) rcn23b=1 ;; esac
-ck "N23b …and the SAME tree with push=pushed still reaches the NOT-archived / do-not-reap sentence (the union does not depend on the push verdict)" $rcn23b
+# ⛔ "NOT archived" IS NOT A MEASURABLE CLAIM ON THIS ARM (P1 — REPRODUCED). `FAILED` is `rc2 != 0` AND no
+# ref THIS RUN wrote, and `bg-rescue-wip.sh` exits 2 for a PARTIAL archive whose push SUCCEEDED and for a
+# chain failure — so the flat "uncommitted work … is NOT archived" it used to print denied an archive that
+# can be sitting on origin, and contradicted the log line for the SAME terminal. The scoped rescue fact is
+# asserted FOR, the flat claim AGAINST, and the union (push=pushed must not silence it) is unchanged.
+case "$nx2" in MANUAL*"do NOT reap"*) rcn23b=0 ;; *) rcn23b=1 ;; esac
+case "$nx2" in *"is NOT archived"*) rcn23b=1 ;; *) : ;; esac
+case "$nx2" in *"no ref this run wrote pins the uncommitted work"*) : ;; *) rcn23b=1 ;; esac
+ck "N23b …and the SAME tree with push=pushed still reaches a MANUAL / do-not-reap sentence that SCOPES the rescue fact to this run (exit 2 also covers a PARTIAL archive that pushed, so a flat NOT-archived is unprovable) [${nx2:0:64}]" $rcn23b
 nx3="$( bash -c '
   . "$1"
   LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=refused-main-checkout
@@ -2330,7 +2337,10 @@ nx27e="$( bash -c '
   LANE_END_TREE=dirty; LANE_END_RESCUE=FAILED; LANE_END_PUSH=refused-main-checkout
   LANE_END_ROOT=/tmp/wt; LANE_END_BRANCH=develop
   lane_end_next' _ "$GATE" 2>/dev/null )"
-case "$nx27e" in MANUAL*"NOT archived"*) rcn27e=0 ;; *) rcn27e=1 ;; esac
+case "$nx27e" in MANUAL*"do NOT reap"*) rcn27e=0 ;; *) rcn27e=1 ;; esac
+# the flat claim is gone; the scoped one is what this arm may say (see N23b for why).
+case "$nx27e" in *"is NOT archived"*) rcn27e=1 ;; *) : ;; esac
+case "$nx27e" in *"no ref this run wrote pins the uncommitted work"*) : ;; *) rcn27e=1 ;; esac
 # ⛔ THE SECOND CLAUSE USED TO PIN `*"NOT on origin"*` — the very claim round 13 correctly REMOVED (review
 # of PR #3399 round 13, P2). Leaving it here would have made this arm a tombstone that forces the off-box
 # absence back in. N27e's actual subject is the UNION (both domains named), so it asserts the push verdict
@@ -2699,8 +2709,9 @@ case "$n49" in
 esac
 ck "N49 the SHARED push caveat scopes its absence claim to the LOCAL cache too, on the state the reviewer reproduced (dirty + rescue=FAILED + refused-main-checkout) [${n49:0:70}]" $rcn49
 # …and the caveat is still APPENDED there, so N49 cannot be passing by dropping the domain's fact.
-case "$n49" in MANUAL*'NOT archived'*'refused-main-checkout'*) rcn49b=0 ;; *) rcn49b=1 ;; esac
-ck "N49b …while the tree domain's MANUAL fact survives in the same sentence (the caveat is scoped, not deleted)" $rcn49b
+case "$n49" in MANUAL*'no ref this run wrote pins the uncommitted work'*'refused-main-checkout'*) rcn49b=0 ;; *) rcn49b=1 ;; esac
+case "$n49" in *'is NOT archived'*) rcn49b=1 ;; *) : ;; esac
+ck "N49b …while the tree domain's MANUAL fact survives in the same sentence, scoped to this run (the caveat is not deleted, and the flat NOT-archived claim this class forbids is gone)" $rcn49b
 # …and it is not vacuous for the OTHER member of that group either.
 n49c="$( bash -c '
   . "$1"

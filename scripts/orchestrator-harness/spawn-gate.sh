@@ -1933,9 +1933,9 @@ lane_end_next() {
   # sole violator of the rule stated above it: a MANUAL arm may not silence another domain's MANUAL fact.
   case "${LANE_END_RESCUE:-}" in
     FAILED)
-      printf 'MANUAL — uncommitted work at %s is NOT archived; do NOT reap it. re-run bg-rescue-wip.sh and read its refusal%s\n' \
+      printf 'MANUAL — the rescue reported failure (rescue=FAILED) over uncommitted work at %s; do NOT reap it. re-run bg-rescue-wip.sh and read its refusal%s%s\n' \
         "${LANE_END_ROOT:-<unknown>}" \
-        "$(lane_end_push_caveat)$(lane_end_tree_caveat)"; return 0 ;;
+        "$(lane_end_rescue_caveat)$(lane_end_push_caveat)$(lane_end_tree_caveat)"; return 0 ;;
     UNAVAILABLE)
       # ⛔ `UNAVAILABLE` IS A DIFFERENT CAUSE WITH A DIFFERENT REMEDY (review cycle 14, P2). The rescuer was
       # not FOUND, so "re-run bg-rescue-wip.sh" is a command the operator cannot run — and the log for this
@@ -1961,7 +1961,7 @@ lane_end_next() {
     cannot-verify)
       printf 'MANUAL — the tree at %s measured cannot-verify (rescue=%s): the listing was not PROVEN complete, so this terminal did NOT certify the tree and the rescue did not certify it either — which is NOT the same as the tree being clean. Do NOT reap %s on the strength of this row — read the [wip] line in the lane log%s%s\n' \
         "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE:-not-yet-run}" "${LANE_END_ROOT:-<unknown>}" \
-        "$(case "${LANE_END_RESCUE:-}" in refs/wip/*) printf ' — the archive is %s (its tree is NOT PROVEN to be the worktree as it was left — a tracked file git cannot read lands in NEITHER the archive NOR the list the callee reports as skipped and still exits 0 — and the paths the INCOMPLETE listing never saw are in NEITHER)' "${LANE_END_RESCUE}" ;; archived-local) printf ' — AND the archive is the LOCAL pin %s, which this row does NOT establish to be the only copy (bg-rescue-wip.sh exits 2 both for a push that FAILED and for a PARTIAL archive whose push SUCCEEDED, so check refs/wip/<slug> in the push repository), and it cannot cover the paths the incomplete listing never saw%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;; esac)" \
+        "$(case "${LANE_END_RESCUE:-}" in refs/wip/*) printf ' — the archive is %s (its tree is NOT PROVEN to be the worktree as it was left — a tracked file git cannot read lands in NEITHER the archive NOR the list the callee reports as skipped and still exits 0 — and the paths the INCOMPLETE listing never saw are in NEITHER)' "${LANE_END_RESCUE}" ;; archived-local) printf ' — AND the archive is the LOCAL pin %s, which this row does NOT establish to be the only copy (bg-rescue-wip.sh exits 2 for a failed push, for a PARTIAL archive whose push SUCCEEDED, and for a chain failure that leaves refs/wip/<slug> at an EARLIER commit than this pin — so a ref found there may be an older snapshot: compare shas), and it cannot cover the paths the incomplete listing never saw%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;; esac)" \
         "$(lane_end_push_caveat)"; return 0 ;;
   esac
   # ⛔ THE REFUSED-PUSH ARMS SIT **ABOVE** THE `archived-local` REPORTER (review cycle 12, P1 — REPRODUCED).
@@ -2204,7 +2204,7 @@ lane_end_next() {
 lane_end_rescue_caveat() {
   case "${LANE_END_RESCUE:-}" in
     FAILED|UNAVAILABLE) printf ' \u2014 AND no ref this run wrote pins the uncommitted work at %s (rescue=%s) — which is NOT the same as nothing having been archived: the local pin write is guarded and the push runs after it, so an archive may exist at refs/wip/<slug> in the push repository; this row cannot tell you which' "${LANE_END_ROOT:-<unknown>}" "${LANE_END_RESCUE}" ;;
-    archived-local) printf ' \u2014 the uncommitted work is archived to the LOCAL pin %s, and this row does NOT establish that the pin is the only copy: bg-rescue-wip.sh exits 2 both for a push that FAILED and for a PARTIAL archive whose push SUCCEEDED, so an off-box copy may exist at refs/wip/<slug> in the push repository \u2014 check it there before treating this pin as the last copy%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;;
+    archived-local) printf ' \u2014 the uncommitted work is archived to the LOCAL pin %s, and this row does NOT establish that the pin is the only copy: bg-rescue-wip.sh exits 2 both for a push that FAILED and for a PARTIAL archive whose push SUCCEEDED, and it also exits 2 when it could not chain onto the tip the remote already holds, which leaves refs/wip/<slug> holding an EARLIER commit than the one in the ref column \u2014 so check it there, compare that sha against the pin, and only then decide whether this pin is the last copy%s' "${LANE_END_REF:-refs/wip-local/<slug>}" "$ARCHIVE_MAY_BE_PARTIAL" ;;
   esac
 }
 # ⛔ THE PUSH DOMAIN'S MANUAL FACT, EXPRESSED ONCE (review cycle 19, P2). The two rescue MANUAL arms
