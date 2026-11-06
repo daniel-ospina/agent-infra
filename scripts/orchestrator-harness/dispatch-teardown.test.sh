@@ -267,17 +267,23 @@ echo "── T7: a take-back that CANNOT RUN must not bill a stale verdict (the 
 # residue it was reporting survived. A behaviour-only arm cannot reach this without shipping a
 # broken module into the fixture, so it is pinned on the helper's executable text — and T6 shows
 # what a pin over non-comment code is worth here.
+# ⛔ HERE-STRINGS, NOT PIPES (#841/#864, `sigpipe-grep`). `printf … | grep -q` is the SIGPIPE
+# false-negative idiom: under `pipefail` the quiet grep exits at its FIRST match, the writer takes
+# SIGPIPE (141), and the pipeline status becomes non-zero — so a string that IS present reads as
+# absent and these three pins would report the defect they exist to catch, on a file that does not
+# have it. A here-string has no earlier writer to kill. Measured: the piped form is what this file
+# shipped and `scripts/check-no-sigpipe-grep.sh` flagged all three as undeclared.
 T7_CODE="$(sed -n '/^reap_unused_worktree() {/,/^}$/p' "$DM_REL" | grep -v '^[[:space:]]*#')"
-printf '%s\n' "$T7_CODE" | grep -qF 'WT_RESULT=""' \
+grep -qF 'WT_RESULT=""' <<<"$T7_CODE" \
     && ok "T7 the helper clears WT_RESULT before the call (a stale provision verdict cannot become the reap verdict)" \
     || bad "T7 the helper leaves WT_RESULT as wt_provision set it — a missing verb would report 'created …' as why the reap failed"
-if printf '%s\n' "$T7_CODE" | grep -qF 'command -v wt_reap_if_empty'; then
+if grep -qF 'command -v wt_reap_if_empty' <<<"$T7_CODE"; then
     ok "T7 …and it proves the verb exists, naming the missing verb instead of a wrong cause"
 else
     bad "T7 the helper calls wt_reap_if_empty unguarded — an older module turns the failure arm into a wrong-cause report"
 fi
 
-if ! printf '%s\n' "$T7_CODE" | grep -qF 'taking the checkout back'; then
+if ! grep -qF 'taking the checkout back' <<<"$T7_CODE"; then
     ok "T7 …and it announces no verdict before the call (the verdict lines are the only claim)"
 else
     bad "T7 the helper still announces 'taking the checkout back' before it knows the verdict"
