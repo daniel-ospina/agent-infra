@@ -819,8 +819,8 @@ clause 3 behaving correctly from day one. The transport is a seam (`RUNNER_FLEET
 one-line #2345 fix lands there without touching the aggregation, attribution or exit contract. The
 tool is NOT allowed to route around it with a hand-rolled `--carrier` socket (AGENTS "Fix Broken
 Infrastructure"); its suite proves the aggregation and the reconciliation hermetically
-(`scripts/ci_runner_fleet.test.sh`), with four mutants keeping the measured gate, the producer-rc gate,
-the attribution guard and the claim key honest.
+(`scripts/ci_runner_fleet.test.sh`), with five mutants keeping the measured gate, the producer-rc gate,
+the attribution guard, the claim key and the registry-side `unjoinable` counter honest.
 
 ⚠️ Two smaller residuals, stated: the tool reads every cell **through** the transport, including the
 box it runs on (use `ci_runner_pool.sh status` for that one); and `RUNNER_FLEET_ROOTS` exists because a

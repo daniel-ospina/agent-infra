@@ -266,7 +266,7 @@ function tok(name,   i, kv) {
 # measured: an instance directory whose name contains a space (`my runner  111  live  pi-runner-1`)
 # was split into NAME=my, LISTENER=runner, STATE=111, printed as a fabricated row, and the REAL
 # registration it carried was then reported as a PHANTOM on a fully measured fleet
-# (`registry-unclaimed … reason=no-measured-cell-claims-it`) — the exact harm the attribution rule
+# (`registry-unclaimed … reason=no-running-cell-claims-it`, after the round-5 rename) — the exact harm the attribution rule
 # of clause 2 exists to prevent. Refusing the cell cannot invent a defect.
 function isstate(s) {
   return (s == "live" || s == "DEAD" || s == "ORPHANED" || s == "QUARANTINE" || s == "LIVE-QUAR" || s == "UNPROBED")
@@ -380,7 +380,8 @@ skipped=0; reg_scope=0; reg_tokens=0; missing_seen=""
 # ⛔ A BOX DELIBERATELY EXCLUDED BY --box IS NOT A BOX THAT FAILED (review cycle 2, P1). Leaving it
 # uncounted made the attribution guard read a scoped run as a COMPLETE one, so `--box cell-a` on a
 # healthy two-cell fleet printed cell-b's registration as `registry-unclaimed …
-# reason=no-measured-cell-claims-it` and exited 3 — advice whose printed remedy is `reclaim`, aimed at
+# reason=no-running-cell-claims-it` (the token was renamed in round 5) and exited 3 — advice whose
+# printed remedy is `reclaim`, aimed at
 # a live registration on a box nobody asked about. Excluded boxes are counted (`skipped=`) and the
 # guard refuses a phantom claim while any exist; they do NOT force exit 2, because the operator asked
 # for a SCOPE, not a full fleet.
@@ -388,8 +389,13 @@ skipped=0; reg_scope=0; reg_tokens=0; missing_seen=""
 : >"$TMPD/claim"   # github_name<TAB>cell<TAB>name
 
 # ── 1. the registries (independent of the cells, so a fleet with no reachable cell still gets them) ─
+# ⛔ A REPO LISTED TWICE IS ONE REGISTRY (review round 6, P3). Without this, `RUNNER_FLEET_REPOS="o/a
+# o/a"` writes every name twice into the registry table, the ambiguity table then calls EVERY name
+# ambiguous, and a fully measured, agreeing fleet is refused (exit 2) with
+# `name-carried-by-more-than-one-registry` — a claim that is false, about an ambiguity that does not
+# exist. Same dedupe the roster got, for the same reason.
 reg_tokens=0
-for repo in $FLEET_REPOS; do
+for repo in $(printf '%s\n' $FLEET_REPOS | awk 'NF && !seen[$1]++ {print $1}'); do
   reg_tokens=$((reg_tokens + 1))
   # ⛔ A MALFORMED REPO TOKEN IS AN UNREAD REGISTRY, NOT A SKIP (review P1-3, related). It used to
   # `continue` with no counter, so a typo'd seam left the registry half EMPTY while `summary …
@@ -657,8 +663,17 @@ done 3<"$TMPD/roster"
 # attributed to the FIRST and the rest are an abstention, named.
 # ⛔ NO PIPE INTO A QUIET GREP (scripts/check-no-sigpipe-grep.sh's class): both tables are built once,
 # then read as FILE ARGUMENTS, so a truncated reader cannot turn a valid answer into a SIGPIPE failure.
-while IFS=$'\t' read -r rname rrepo2 rstatus2 rbusy2; do
-  [ -n "$rname" ] || continue
+# ⛔ UNPACKED BY HAND, NOT `IFS=$'\t' read` (review round 6, P3). A tab IS IFS-whitespace, so `read`
+# COLLAPSES a run of them: a registry row with an EMPTY status (`name<TAB>repo<TAB><TAB>false`, which
+# gh's @tsv produces for a null status — case O's own rationale) shifted left and printed
+# `status=false` — the busy value in the status field, on the line whose advice is `reclaim`. The join
+# path uses `cut -f3/-f4`, which preserves the empty field, so the two readers disagreed about one
+# file. Parameter expansion keeps every field where it is.
+while IFS= read -r rline; do
+  [ -n "$rline" ] || continue
+  rname="${rline%%$'\t'*}"; rline="${rline#*$'\t'}"
+  rrepo2="${rline%%$'\t'*}"; rline="${rline#*$'\t'}"
+  rstatus2="${rline%%$'\t'*}"; rbusy2="${rline#*$'\t'}"
   if grep -qxF -- "$rname" "$TMPD/ambig"; then
     reg_unclaimed=$((reg_unclaimed + 1)); unjoinable=$((unjoinable + 1))
     printf 'registry-unclaimed name=%s registry=%s status=%s reason=cannot-attribute(name-carried-by-more-than-one-registry)\n' \
@@ -669,6 +684,9 @@ while IFS=$'\t' read -r rname rrepo2 rstatus2 rbusy2; do
     reg_claimed=$((reg_claimed + 1)); continue
   fi
   reg_unclaimed=$((reg_unclaimed + 1))
+  # an EMPTY status is a value the registry did not give us; printing it blank on the line that invites
+  # `reclaim` reads as "no status", so it is named.
+  [ -n "$rstatus2" ] || rstatus2="unread"
   if [ "$unmeasured" -eq 0 ] && [ "$skipped" -eq 0 ] && [ "$reg_unread" -eq 0 ]; then
     # ⛔ THE CLAIM IS BOUNDED BY WHICH BOXES EXIST, AND THE BOUNDARY IS NAMED (review round 5, P2).
     # The roster is the provider RUNNING inventory (`cap_fleet_inventory` deliberately drops a

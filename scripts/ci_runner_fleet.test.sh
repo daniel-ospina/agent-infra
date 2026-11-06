@@ -27,8 +27,8 @@
 #     alternative is `cells=0` + exit 0 — a clean bill of health built from nothing;
 #   * the ROOT RETRY is driven by the refusal's own `outside=` list, happens ONCE, never overrides a
 #     root a human pinned, and does NOT resolve an ambiguity it cannot satisfy (two parents);
-#   * MUTANTS at the end prove three assertions are live: the measured gate, the attribution guard,
-#     and the claim key.
+#   * MUTANTS at the end prove FIVE assertions are live: the measured gate, the producer-rc gate, the
+#     attribution guard, the claim key, and the registry-side `unjoinable` counter.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -391,7 +391,7 @@ assert_omits "$OUT" "verdict=tmpdir-missing" "Q: and does not mislabel it as mis
 
 # ══ S. --box IS A SCOPE, NOT A CLAIM THAT THE REST OF THE FLEET DOES NOT EXIST (cycle-2 P1) ══════
 # Leaving excluded boxes uncounted made the attribution guard read a scoped run as a COMPLETE one, so
-# `--box cell-a` printed cell-b's registration as `registry-unclaimed … no-measured-cell-claims-it`
+# `--box cell-a` printed cell-b's registration as `registry-unclaimed … no-running-cell-claims-it`
 # and exited 3 — advice whose printed remedy is `reclaim`, aimed at a live registration on a box
 # nobody asked about.
 world
@@ -504,6 +504,26 @@ run_fleet env RUNNER_FLEET_BOXES="cell-a cell-a" bash "$FLEET"
 assert_eq "$RC" 0 "AA: a duplicated roster label is one box, not a collision"
 assert_omits "$OUT" "name-collision" "AA: and it does not manufacture a name collision"
 assert_contains "$OUT" "cells=1 " "AA: the roster is deduped before the sweep"
+
+# ══ AB. A REPO LISTED TWICE IS ONE REGISTRY, NOT AN AMBIGUITY (round-6 P3) ═══════════
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 0)"
+reg o/a pi-runner-a-1 online false
+run_fleet env RUNNER_FLEET_REPOS="o/a o/a" bash "$FLEET"
+assert_eq "$RC" 0 "AB: a seam naming one registry twice is that one registry"
+assert_contains "$OUT" "busy=false registry=o/a verdict=ok" "AB: the row is joined normally"
+assert_omits "$OUT" "name-carried-by-more-than-one-registry" "AB: and no phantom ambiguity is claimed"
+
+# ══ AC. AN EMPTY STATUS SURVIVES TO THE UNCLAIMED LINE (round-6 P3) ══════════════════
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 0 "$(block cell-a 8 3 0 14375 3584 "" 0 0 0 0 0 0)"
+printf 'pi-runner-ghost-1\t\tfalse\n' >"$FIXTURE/gh.o_a"
+run_fleet bash "$FLEET"
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-ghost-1 registry=o/a status=unread" \
+  "AC: the empty status is NAMED, not replaced by the busy value"
+assert_omits "$OUT" "status=false" "AC: the busy field never migrates into the status field"
 
 # ══ R. THE MUTANTS — each one must make a named case FAIL ══════════════════════════════════════
 # ⛔ A TEST THAT PASSES AGAINST THE MUTANT PINS NOTHING. Each mutant below removes exactly ONE guard
