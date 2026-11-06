@@ -3845,8 +3845,12 @@ head; `fix-one.sh` takes the **same** claim on the current head for the fixer's 
 releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim left two boxes free
 to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
 cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
-**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
-reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
+**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + _gw + 300` for the
+reviewer (`_gw` is the gate wait, `GATE_POLL_TRIES` x `GATE_POLL_SECS`, 900 s at the defaults) and
+`FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. *(Corrected: this sentence said
+`REVIEW_TIMEOUT + 1200` for the reviewer. The two forms agree only at the default gate wait — 1800 +
+900 + 300 = 1800 + 1200 = 3000 s — so on a box with `GATE_POLL_SECS=60` the code leases 3900 s while
+a reader computed 3000 s. Same stale derivation as the paragraph on the ceiling, ~140 lines below.)*
 
 #### Selection consults the registry, and an unreadable registry is not freedom (agent-infra#2466)
 
@@ -3908,8 +3912,9 @@ THIS MACHINE owns, so a name handed to another box afterwards makes every claim 
 this box's own dead claim — for every keying — and the local-pid rule then probes the foreign pid HERE,
 reads a local absence, and calls a LIVE remote worker's PR claim orphaned: the steal direction, from a
 name that is no longer ours. The self-limiting claim holds only while the name is exclusive to this
-box. Remedy: once no outstanding claim can still carry the name (after `CLAIM_TTL_MAX` / `CLAIM_ISSUE_TTL`),
-delete the line from `state/claim-hosts` before the name is reused elsewhere.
+box. Remedy: once no outstanding claim can still carry the name (after the LONGEST ceiling across every
+keying — `CLAIM_TTL_MAX` 9600 / `CLAIM_ISSUE_TTL` 18000 / `CLAIM_BRANCH_TTL` 14400 — so 18000), delete the
+line from `state/claim-hosts` before the name is reused elsewhere.
 
 ⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
 
@@ -3973,13 +3978,24 @@ claim withheld and how many were queued *although a claim existed* (its only cla
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(14400s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive)
-are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
-caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
+(18000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
+outlive, and 14400s -> 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
+#2999) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
+`CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
+`CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
+expire a live batch mid-flight (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
+case 10). *(Corrected in a later round: this paragraph said 14400s for `CLAIM_ISSUE_TTL` and 7200s
+for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLAIM_TTL` (1800s) was
+never wrong.)*
+Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
-stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
-either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or
-the claim expires before the review it was taken for. The verification is `claim-orphan.test.sh`,
+stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one; `_gw` is the gate wait, 900 s at
+the defaults, so that lease is 3000 s and the clamp threshold — `CLAIM_TTL_MAX - (_gw + 300)` — is
+8400 s) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one): raising either timeout past its own threshold
+requires raising `CLAIM_TTL_MAX` in the same change, or the claim is clamped below the term the worker
+asked for — and past `CLAIM_TTL_MAX` itself it expires before the review it was taken for. *(Corrected: this sentence
+said `REVIEW_TIMEOUT + 1200` and a flat `CLAIM_TTL_MAX - 1200`, which was right only for the fixer and
+only at the default gate wait.)* The verification is `claim-orphan.test.sh`,
 which reads the stamped term back out of the **pushed claim commit**. Both tunables are
 validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
 `claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the

@@ -452,13 +452,16 @@ esac
 
 # ══ O7: the stamped term is bounded by the TTL that governs the keying ══
 # ⛔ THE BOUND IS PER KEYING AND IT IS A CEILING, NOT THE DEFAULT. The shipped callers lease a PR
-# claim for MORE than `CLAIM_TTL`: merge-one.sh asks REVIEW_TIMEOUT+1200 (=3000s) and fix-one.sh asks
-# FIX_TIMEOUT+1200 (=3600s), both deliberately, because the lease has to cover the review+merge the
-# claim is taken for. So "term <= 1800" is NOT the invariant — an assertion of it would redden the
-# merge path. What must hold, and what the incident actually violated, is that no lease can exceed
-# the DOCUMENTED CEILING for its keying (`CLAIM_TTL_MAX`, `CLAIM_ISSUE_TTL`) — i.e. no caller can
-# silently mint a term that outlives every reaper's reach, which is how a 157-minute lease on a
-# renamed host became unreclaimable.
+# claim for MORE than `CLAIM_TTL`: merge-one.sh asks REVIEW_TIMEOUT + _gw + 300 (=3000s at the
+# default 900s gate wait; more when GATE_POLL_SECS raises `_gw`) and fix-one.sh asks FIX_TIMEOUT+1200
+# (=8400s at the current 7200s LANE_BACKSTOP_S, not the 3600s this sentence carried from before
+# agent-infra#2888 raised the backstop), both deliberately, because the lease has to cover the
+# review+merge the claim is taken for. So "term <= 1800" is NOT the invariant — an assertion of it
+# would redden the merge path. What must hold, and what the incident actually violated, is that no
+# lease can exceed the DOCUMENTED CEILING for its keying (`CLAIM_TTL_MAX` for the per-head/PR keys,
+# `CLAIM_ISSUE_TTL` for issue keys, `CLAIM_BRANCH_TTL` for branch keys — three ceilings, not one) —
+# i.e. no caller can silently mint a term that outlives every reaper's reach, which is how a
+# 157-minute lease on a renamed host became unreclaimable.
 echo "── O7: the stamped lease term <= the CEILING for that keying (no silent extension) ──"
 ORIG7="$(mk_origin o7)"; ensure_work_repo "$ORIG7" || { echo "❌ fixture"; exit 2; }
 PVAL="$(as_box "$ORIG7" tbox 'printf "%s\n" "$CLAIM_TTL"')"
@@ -696,6 +699,19 @@ grep -q 'clamped' <<<"$CLAMP"
 ck "O14 [RED→GREEN] a ttl above the ceiling reports the clamp (stderr) instead of shortening silently" $?
 grep -q 'CLAIM_TTL_MAX' <<<"$CLAMP"
 ck "O14 [RED→GREEN] the clamp message names the ceiling knob to raise" $?
+# ⛔ AND THE NUMBER IT PRINTS IS `$max`, NOT `$dflt` (review round 13, P3) — an arm that can only live
+# on THIS keying. `claim_acquire` passes `CLAIM_TTL` (1800) as `dflt` and `CLAIM_TTL_MAX` (9600) as
+# `max`, so the two are distinguishable here; the branch keying passes the SAME variable for both, so
+# `branch-claim.test.sh` cannot tell a `%ss`-from-`$max` message from one that prints `$dflt`, and
+# measured, swapping `"$max"` for `"$dflt"` in the clamp's `printf` left branch-claim.test.sh 48/0
+# and this suite green. The regression that survives that is the one this PR exists to remove: the
+# message would print `ceiling (1800s)` while clamping to the real 9600 s ceiling — a fixer reads a
+# number that is not the ceiling. The two knobs are passed EXPLICITLY so an ambient raise cannot make
+# this arm assert a number the run did not use.
+CLAMP2="$(as_box "$ORIG14" tbox 'claim_acquire "" 9209441 0123456789abcdef0123 999999999 >/dev/null
+  printf "DONE=%s\n" "$?"' 2>&1 CLAIM_TTL=1800 CLAIM_TTL_MAX=9600)"
+grep -qE 'ceiling \(9600s\)' <<<"$CLAMP2"
+ck "O14 [RED→GREEN] the clamp message's operative ceiling is the CEILING (9600s), not the shorter PR default (1800s)" $?
 
 # ══ O16: `claim_live()` (orch-loop's PR-keyed reader) applies the SAME orphan rules ══
 # ⛔ THE FOURTH CALL SITE, AND THE ONE NO SUITE DROVE (agent-infra#2094 cycle-3 review). An orphan rule

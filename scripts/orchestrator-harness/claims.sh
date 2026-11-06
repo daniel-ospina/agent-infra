@@ -106,9 +106,18 @@ esac
 #                                           interval (agent-infra#1909), so the ceiling below is a
 #                                           ceiling and no longer the normal cost of a refused lane
 #   chain-merge.sh merge-phase wait 1890s  (LANE_PHASE_GRACE 90 + LANE_HANDOFF_WAIT 1800, #2029)
-#   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
+#   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + _gw + 300 — `_gw` is the gate wait,
+#                                           900 s at the defaults, so 1800+900+300; NOT a constant
+#                                           1200, and the `REVIEW_TIMEOUT + 1200` form that stood
+#                                           here was right only at that default)
 #                                 ------  =======
 #                                 17490s  -> 18000s (5 h)
+#
+#   ⛔ THIS SUM IS THE DEFAULT-GATE-WAIT SUM, AND THE ROW ABOVE IS WHY IT IS STATED AS A FORMULA.
+#   `_gw` is `GATE_POLL_TRIES x GATE_POLL_SECS` clamped to [900, 86400] (merge-one.sh), so on a box
+#   running `GATE_POLL_SECS=60` the merge term is 3900 s and this sum is 18390 s — OVER the 18000 s
+#   default below. Nothing here raises that default (it is a behaviour change, not a prose fix); the
+#   arithmetic is written out so the operator who raises the gate wait sees which default it crosses.
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
@@ -128,16 +137,19 @@ case "${CLAIM_ISSUE_TTL:-}" in
 esac
 
 # ── THE BRANCH CLAIM'S LEASE (agent-infra#3328) ─────────────────────────────────────────────
-# ⛔ THE CEILING IS THIS KEY'S OWN TERM (14400), NOT CLAIM_TTL_MAX (7200): `claim_branch_acquire`
-# passes CLAIM_BRANCH_TTL as BOTH the default and the ceiling, because a batch legitimately outlives the
-# 2 h PR/merge ceiling and clamping to it would expire a live batch mid-flight. Stated because the
-# comment below used to claim the opposite.
+# ⛔ THE CEILING IS THIS KEY'S OWN TERM (14400), AND `CLAIM_TTL_MAX` DOES NOT APPLY TO IT.
+# `claim_branch_acquire` passes `CLAIM_BRANCH_TTL` as BOTH the default and the ceiling (its 3rd and 4th
+# args to `_claim_acquire_at`), so a caller cannot mint a longer term while a batch legitimately
+# outlives the PR/merge ceiling: 14400 is ABOVE `CLAIM_TTL_MAX`'s 9600 default, deliberately, and a
+# clamp to `CLAIM_TTL_MAX` would expire a live batch mid-flight.
 # A BATCH BRANCH is held for the whole batch, which is longer than any single lane: the owner takes
-# it before the first lane pushes and releases it after the last one lands. Its term is therefore the
-# issue claim's ceiling, not the PR claim's 1800s — a batch claim that expires MID-BATCH lets a peer
-# reclaim it and push, which is the exact loss this key exists to prevent. It is capped by
-# CLAIM_TTL_MAX for the same reason every other key is (claim_branch_acquire passes it as its own
-# ceiling), so a caller cannot mint a term no reaper can reach.
+# it before the first lane pushes and releases it after the last one lands. Its term is therefore its
+# own, not the PR claim's 1800s — a batch claim that expires MID-BATCH lets a peer reclaim it and
+# push, which is the exact loss this key exists to prevent. Raising the env var raises the default and
+# the ceiling together, so the term stays a single knob and never splits into "longer than its own
+# clamp". *(This block is the one #3328 comment that contradicted ITSELF: it said "not CLAIM_TTL_MAX"
+# and then "capped by CLAIM_TTL_MAX", and it cited CLAIM_TTL_MAX as 7200 when the value is 9600. The
+# assertions that pin the real behaviour are `branch-claim.test.sh` case 10.)*
 # ⛔ THE HOLDER RELEASES ON COMPLETION, so the full term is only ever spent by a box that died.
 CLAIM_BRANCH_TTL="${CLAIM_BRANCH_TTL:-14400}"
 case "${CLAIM_BRANCH_TTL:-}" in
@@ -149,17 +161,24 @@ esac
 # ⛔ `CLAIM_TTL_MAX` IS A CEILING, NOT THE DEFAULT, and the difference is load-bearing. The shipped
 # merge/fix paths lease a PR claim for MORE than `CLAIM_TTL` on purpose, because the lease must cover
 # the review+merge the claim is taken for:
-#     merge-one.sh   CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))  -> 3000s
+#     merge-one.sh   CLAIM_LEASE=$(( ${REVIEW_TIMEOUT:-1800} + _gw + 300 ))  -> 3000s at the defaults
+#                    (`_gw` is the gate wait, 900 s at the defaults — NOT a constant 1200)
 #     fix-one.sh     FIX_LEASE=$(( ${FIX_TIMEOUT:-$LANE_BACKSTOP_S} + 1200 )) -> 8400s
 #                    (3600s before agent-infra#2888: the fixer ran 2400 s, now the 7200 s backstop)
 # So a clamp at 1800 would expire a claim MID-MERGE and hand the same head to a peer — the duplicate
 # work this registry exists to prevent. But before this bound there was no ceiling at ALL: the only
 # check was "at most 9 digits", so a caller could mint `lease_until = now + 999999999` (31 years) —
 # the silent extension the #2094 incident exposed, a term no reaper's reach outlives.
-# ⚠️ THE CEILING IS COUPLED TO THOSE TWO CALLERS, exactly as CLAIM_ISSUE_TTL is coupled to LANE_TIMEOUT:
-# raising REVIEW_TIMEOUT or FIX_TIMEOUT above (CLAIM_TTL_MAX - 1200) makes `_claim_acquire_at` CLAMP the
-# lease below the review window, which is the mid-review expiry this block exists to prevent — so raise
-# CLAIM_TTL_MAX at the same time. The clamp is not silent: it reports itself on stderr.
+# ⚠️ THE CEILING IS COUPLED TO THOSE TWO CALLERS, exactly as CLAIM_ISSUE_TTL is coupled to LANE_TIMEOUT.
+# A caller's lease is `timeout + 1200` (`FIX_LEASE`, fix-one) or `timeout + _gw + 300` (`CLAIM_LEASE`,
+# merge-one — `_gw` is the gate wait, 900 s at the defaults, so that lease is 3000 s and the clamp
+# threshold is `CLAIM_TTL_MAX - (_gw + 300)` = 8400 s), so raising either timeout past
+# `CLAIM_TTL_MAX - 1200` (the fixer) or `CLAIM_TTL_MAX - (_gw + 300)` (the reviewer) makes
+# `_claim_acquire_at` CLAMP the lease below what the worker asked for, spending the post-review
+# headroom — and above `CLAIM_TTL_MAX` itself the claim expires under a worker that is still running,
+# which is the mid-review expiry this block exists to prevent. So raise CLAIM_TTL_MAX at the same
+# time. The clamp is not silent: it reports itself on stderr. ⛔ The single `- 1200` form that used to
+# stand here was right only for the fixer and only at the default gate wait.
 # Same digit clamp as the two TTLs above: an unparseable ceiling is worse than the default.
 CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-9600}"   # 2 h 40 m — above fix-one's 8400s lease, the longest shipped one
 case "${CLAIM_TTL_MAX:-}" in
@@ -517,7 +536,9 @@ claim_former_hosts() { # -> space-separated host names this box has used, EXCLUD
 #      rename leaves every peer's roster stale in exactly that way, so abstaining is what keeps a
 #      rename from turning into a fleet-wide STEAL (under-reap: the lease still bounds it).
 # ⛔ PID REUSE IS AN UNDER-REAP, ON PURPOSE: a recycled pid reads alive and the claim simply runs to
-# its lease (bounded by CLAIM_TTL_MAX / CLAIM_ISSUE_TTL). The opposite polarity steals live work.
+# its lease (bounded by THAT KEYING'S OWN ceiling — CLAIM_TTL_MAX for the per-head/PR keys, 9600;
+# CLAIM_ISSUE_TTL for issue keys, 18000; CLAIM_BRANCH_TTL for branch keys, 14400). Naming only the
+# first two was wrong for branch keys, whose ceiling is neither. The opposite polarity steals live work.
 # ⛔ `ps -p` NOT `kill -0`: `kill -0` reports EPERM for a LIVE pid owned by another user, i.e. it
 # reads a running lane as dead and reclaims its claim.
 # ⛔ AND `ps` MUST BE PROVEN ABLE TO ANSWER AT ALL. `ps -p` has THREE outcomes — found, absent, and
@@ -1090,7 +1111,8 @@ claim_issue_acquire() {
 # caller that already handles rc=1 (another box owns it) and rc=2 (infra) needs no new vocabulary.
 # ⛔ The default lease is the PR claim's own CLAIM_TTL, not the issue claim's 3 h: this claim covers
 #    a review-plus-merge, exactly like the per-head claim it is taken alongside, and merge-one.sh
-#    passes its derived `REVIEW_TIMEOUT + 1200` explicitly rather than relying on either default.
+#    passes its own derived `REVIEW_TIMEOUT + _gw + 300` (`_gw` = the gate wait) explicitly rather
+#    than relying on either default.
 claim_pr_acquire() {
   _claim_acquire_at "$(claim_pr_ref "$2")" "${3:-$CLAIM_TTL}" "$CLAIM_TTL" "$CLAIM_TTL_MAX"
 }
@@ -1147,7 +1169,28 @@ _claim_acquire_at() {
     # ⛔ LOUD, NOT SILENT. A clamp shortens a lease below what the caller asked for, and for
     # merge-one/fix-one that means expiring before the review window closes — a peer takes the same
     # head and the merge runs twice. That is the one consequence this bound must never hide.
-    printf '[claims] lease ttl %ss exceeds this keying ceiling (CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = %ss) — clamped. If REVIEW_TIMEOUT/FIX_TIMEOUT were raised, raise the ceiling at the same time (agent-infra#2094).\n' \
+    # ⛔ THE MESSAGE NAMES NO SINGLE KNOB AS THE CEILING, BECAUSE `max` IS NOT ALWAYS ONE (review
+    # round 2, P2; the headline was over-stated until round 5). It used to read
+    # "(CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = %ss)" — and for a BRANCH key `max` is CLAIM_BRANCH_TTL
+    # (14400), which is neither of those two variables (9600 / 18000). Measured on the real code, a
+    # branch-key clamp printed "CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s", sending a fixer to raise a
+    # knob that is not the ceiling. The number was right and the two names were wrong — the same
+    # misdirection this block's own prose correction exists to remove. What the message now does: it
+    # states the CEILING VALUE inside `ceiling ( … )` and nothing else, then lists the three ceiling
+    # variables as CANDIDATES for "raise the ceiling for that keying". No caller names its variable —
+    # `_claim_acquire_at` receives only `ref/ttl/dflt/max` — so the list is a literal here. What the
+    # tests pin, split by what each KEYING can express: `branch-claim.test.sh` case 10 pins the
+    # branch keying's value, its knob-following and its candidate list; the value being `$max` and
+    # NOT `$dflt` is only observable on a keying where the two DIFFER, and that arm lives in
+    # `claim-orphan.test.sh` O14 (`claim_acquire`, whose `dflt` is `CLAIM_TTL` and whose `max` is
+    # `CLAIM_TTL_MAX`) — the branch keying passes one variable for both, so it cannot tell them
+    # apart. ⛔ AND THE CALL SITES ARE NAMED,
+    # NOT NUMBERED (review round 7, P2): this comment used to cite line numbers
+    # (836/1079/1088/1098), which were exact at fe99acb92 and became WRONG the moment round 7
+    # inserted two lines above them — stale references shipped by the very commit that exists to
+    # remove stale references. The four callers are `claim_branch_acquire`, `claim_acquire`,
+    # `claim_issue_acquire` and `claim_pr_acquire`, in that order; names cannot rot.
+    printf '[claims] lease ttl %ss exceeds this keying ceiling (%ss) — clamped. Raise the ceiling for that keying (CLAIM_TTL_MAX / CLAIM_ISSUE_TTL / CLAIM_BRANCH_TTL) if its timeout was raised (agent-infra#2094).\n' \
       "$ttl" "$max" >&2
     ttl="$max"
   fi
@@ -1183,7 +1226,8 @@ _claim_acquire_at() {
     if [ "$back" != "$commit" ]; then
       # P2 (2026-10-14 adversarial review): the push may have CREATED the ref and only the read-back
       # failed. Surface the commit we pushed so the caller can attempt a FENCED release — otherwise
-      # the claim is orphaned for the whole lease (up to REVIEW_TIMEOUT+1200 = 50 min) and every box
+      # the claim is orphaned for the whole lease (up to `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300,
+      # 50 min at the defaults) and every box
       # refuses that head until it expires. merge-one.sh consumes CLAIM_COMMIT on rc=2.
       CLAIM_COMMIT="$commit"
       CLAIM_RESULT="push reported success but read-back differs ($back != $commit)"
@@ -1285,7 +1329,8 @@ _claim_acquire_at() {
     # in exactly that window). Returning 2 without the commit left merge-one.sh's
     # `if [ -n "${CLAIM_COMMIT:-}" ]` false, so it never attempted the fenced release — and the box
     # PROCEEDED fail-open while genuinely owning the ref, so every other box refused that head until
-    # the lease expired (up to REVIEW_TIMEOUT+1200 = 50 min). Safe to set unconditionally: the
+    # the lease expired (up to `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300, 50 min at the defaults).
+    # Safe to set unconditionally: the
     # fenced release is a no-op when the ref is still `$cur` (the lease does not match), so it can
     # never delete another box's claim.
     CLAIM_COMMIT="$commit"

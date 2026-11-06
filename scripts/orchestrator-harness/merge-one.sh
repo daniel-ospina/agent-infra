@@ -331,7 +331,8 @@ PR_RC=0
 # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
 # release that would eventually have succeeded — a `git push` slower than 20s is TERM'd, the fenced
 # push leaves the ref intact, and every box then refuses that head until the lease expires (up to
-# REVIEW_TIMEOUT+1200 = 50 min). That is accepted because the alternative is strictly worse: an
+# `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300; 50 min at the defaults, longer on a box whose gate wait
+# is raised). That is accepted because the alternative is strictly worse: an
 # UNBOUNDED exit path (and, before the ordering fix above, one that dropped the local lock FIRST)
 # lets the controller spawn a second worker for the same head. DO NOT remove the bound — the
 # ordering defect it fixes is real. A future improvement is to move the release OFF the exit path
@@ -409,8 +410,8 @@ if [ -f "$O/claims.sh" ]; then
   # is < 2**31. claims.sh clamps the ttl a second time at its own arithmetic site, so a future caller
   # that skips this guard still cannot mint a lease the reader is unable to parse.
   # ⛔ SIZED FROM THE EFFECTIVE WAIT, NOT THE DEFAULT (review round 7 P2-3). The wait is a first-class
-  # tunable (`GATE_POLL_TRIES` x `GATE_POLL_SECS`), so a box running `GATE_POLL_SECS=60` has a 3600 s
-  # worst case — longer than the old fixed 3000 s lease, which would then expire mid-wait and let
+  # tunable (`GATE_POLL_TRIES` x `GATE_POLL_SECS`), so a box running `GATE_POLL_SECS=60` has an 1800 s
+  # gate wait (30 x 60) and an 1800 + 1800 + 300 = 3900 s lease — longer than the old fixed 3000 s lease, which would then expire mid-wait and let
   # another box acquire the PR and run a DUPLICATE paid review (#1908, the duplicate this lease exists
   # to prevent). Defaults are unchanged: 1800 + (30 x 30) + 300 = 3000.
   # ⛔ `is_limit`, NOT A `case ''|*[!0-9]*` GUARD: that idiom (this file's own header names it) ACCEPTS
@@ -509,7 +510,8 @@ if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
     *) echo "[merge $PR] cross-box claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding on the local lock alone" >> "$L.log"
        # P2 (2026-10-14 adversarial review): the CREATE path can SUCCEED on the remote and fail only
        # the read-back. claims.sh surfaces the commit it pushed; release it, fenced, so the PR is not
-       # stalled fleet-wide until the lease expires (up to REVIEW_TIMEOUT+1200 = 50 min of every box
+       # stalled fleet-wide until the lease expires (up to `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300;
+       # 50 min at the defaults, longer on a box whose gate wait is raised) of every box
        # refusing to review it). CROSS_OWN stays set only when this fenced release FAILS, so the EXIT
        # trap retries it.
        if [ -n "${CLAIM_COMMIT:-}" ]; then
@@ -1464,13 +1466,37 @@ REV_STARTED=1
 # Nothing warns when a reviewer is censored at 1800 s; that is a KNOWN gap recorded here rather than a
 # claim about a warning nobody emits.
 #
-# It is not fixed here because the bound is not free to raise: `CLAIM_LEASE=$(( REVIEW_TIMEOUT + 1200 ))`
-# below, and `claims.sh` CLAMPS any lease above `CLAIM_TTL_MAX - 1200` = 6000 s. Raising REVIEW_TIMEOUT
-# to the 7200 s backstop would therefore produce a 7200 s reviewer holding a claim that expires at 6000
-# — a second lane free to take the claim mid-review, which is the exact silent-park `claims.sh` guards
-# against. The two numbers are one decision: raise `CLAIM_TTL_MAX` with the reviewer bound, in one
-# change, with `claim-orphan.test.sh` re-derived. Tracked on agent-infra#2888 (comment), not as a peer
-# issue: same root cause, different call site.
+# It is not fixed here because the bound is not free to raise ALONE. `CLAIM_LEASE` is
+# `${REVIEW_TIMEOUT:-1800} + _gw + 300` — assigned ABOVE this block, from the EFFECTIVE wait — and
+# `_gw` is `GATE_POLL_TRIES x GATE_POLL_SECS` clamped to [900, 86400]: 900 s at the defaults, but
+# 1800 s on a box running `GATE_POLL_SECS=60`, and up to 86400 s. `claims.sh` CLAMPS any lease ABOVE
+# that keying's ceiling `CLAIM_TTL_MAX` (9600), and its test is a STRICT `-gt`, so a lease of exactly
+# the ceiling is never clamped. The reviewer bound therefore stays un-clamped only while
+# `REVIEW_TIMEOUT + _gw + 300 <= 9600` — 8400 s at the default 900 s gate wait, but only 7500 s on a
+# box running `GATE_POLL_SECS=60`. Past that threshold the lease is pinned at 9600 and the clamp
+# erodes the post-review headroom, reaching ZERO at `REVIEW_TIMEOUT` = 9600; only ABOVE 9600 does the
+# claim actually expire under a reviewer that is still running — a second lane free to take the claim
+# mid-review, which is the exact silent-park `claims.sh` guards against.
+# ⛔ NO LINE NUMBERS IN THIS PARAGRAPH, ON PURPOSE. Round 8 cited `:364` and `claims.sh:1151`; they
+# were exact when written, and the round-8 review then found that round 7 had shipped four stale line
+# references by inserting two lines above them. A reference that has to be re-counted is a reference
+# that will rot, so the anchors here are the code text and the paragraph above.
+# ⛔ CORRECTION (review round 7, P2 — re-verified against the clamp test and the `CLAIM_LEASE`
+# assignment, both anchored by code text above): this
+# block used to read `CLAIM_TTL_MAX - 1200` = **6000** s, and to conclude that the 7200 s backstop
+# "would produce a 7200 s reviewer holding a claim that expires at 6000". That arithmetic is from when
+# `CLAIM_TTL_MAX` was 7200; #2999 raised it to 9600, so the threshold is 8400 at the default gate wait
+# and the conclusion was false on both of its numbers — a 7200 s bound yields an 8400 s lease, which
+# is NOT clamped at all. It is the same stale-9600 arithmetic this PR corrects in `claims.sh` and in
+# BOTH of the README's statements of the derivation (the ceiling paragraph and, since review round 12,
+# the `REVIEW_TIMEOUT + 1200` form in the registry section — a count is not given here, because the
+# round that wrote "the third place" left a fourth live in `claim-orphan.test.sh`). What is true now: the 7200 s backstop is INSIDE the
+# headroom at the default gate wait (8400 <= 9600), so the clamp is no longer the reason this bound
+# stays at 1800 — raising it is simply a change nobody has made. The two numbers are still one
+# decision (raise `CLAIM_TTL_MAX` with the reviewer bound, in one change, with `claim-orphan.test.sh`
+# re-derived), because a bound past the threshold pins the lease at 9600 and spends the merge
+# headroom. Tracked on agent-infra#2888 (comment), not as a peer issue: same root cause, different
+# call site.
 run_agent "${REVIEW_TIMEOUT:-1800}" "$L.log" "$L-reviewer.txt"
 AGENT_RC=$?
 # ⛔ A REFUSAL AT THE SPAWN POINT IS NOT A VERDICT (agent-infra#1884). This file carries its OWN
