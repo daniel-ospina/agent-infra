@@ -19,7 +19,7 @@
 #   C  a claim whose holder is unidentifiable is REPORTED, never released
 #   D  the dry run lists every candidate WITH ITS EVIDENCE and changes nothing
 #   E  the per-pass bound (`--max`) holds
-#   F  an unparseable lease is LIVENESS, never staleness (claims.sh's recorded rule) — reported only
+#   F  an unparseable lease is an ABSTENTION (never LIVENESS, never staleness — agent-infra#3203) (claims.sh's recorded rule) — reported only
 #   G  a holder box this process cannot query is not evidence of a dead lane — reported only; the one
 #      exception is an explicit `CLAIM_DEAD_HOSTS` declaration WITH an expired lease
 #   H  an instrument that cannot see THIS process cannot witness a holder's death (no release)
@@ -116,6 +116,22 @@ mkclaim() {
   git -C "$WS/work" push -q origin "$sha:refs/claims/$key" 2>/dev/null || { echo "❌ fixture: could not push refs/claims/$key"; exit 2; }
 }
 
+# mkraw <ref-suffix> <owner> <lease_until> <committer-line-tail>
+# A RAW commit object whose `committer` line is SHAPE-BROKEN — a trailing space, a 3-digit tz — which
+# `git commit-tree` will not produce but a peer CAN mint (`git hash-object --literally -w`) and a plain
+# `git push` ACCEPTS (measured). Used to prove this tool measures the claim's age through claims.sh's
+# oracle (`_claim_commit_time`, whose `sed` is anchored on `$`) and not through `git log --format=%ct`.
+mkraw() {
+  local key="$1" owner="$2" until="$3" tail="$4" ct raw sha
+  ct=$(( $(date +%s) - 90000 ))
+  raw="$(printf 'tree %s\nauthor fleet-claim <claims@localhost> %s +0000\ncommitter fleet-claim <claims@localhost> %s %s\n\nclaim owner=%s lease_until=%s nonce=suite$$-%s\n' \
+          "$EMPTY_TREE" "$ct" "$ct" "$tail" "$owner" "$until" "$key")"
+  sha="$(printf '%s' "$raw" | git -C "$WS/work" hash-object -t commit --literally -w --stdin 2>/dev/null)" \
+    || { echo "❌ fixture: could not write a raw commit for $key"; exit 2; }
+  git -C "$WS/work" push -q origin "$sha:refs/claims/$key" 2>/dev/null \
+    || { echo "❌ fixture: could not push refs/claims/$key"; exit 2; }
+}
+
 # cr <args…> — run the reaper against the fixture registry with the fixture probes.
 # ⛔ THE BINARY IS RESOLVED PER CALL, not once at load: `--mutations` runs a case in a subshell with
 # `CLAIM_REAPER_BIN` pointing at a gate-disabled COPY, and a load-time resolution silently ran the
@@ -192,6 +208,24 @@ case_A() {
   : > "$WS/empty.tsv"
   out="$(CR_LIVE_ROWS="$WS/empty.tsv" cr)"
   ckg "A: an EMPTY-but-answered census is absence, not unmeasured" "verdict=RELEASABLE" "$out"
+
+  # ⛔ THE AGE COMES FROM THE ORACLE, NOT FROM `git log` (review round 22, agent-infra#3203). This gate
+  # asked `git log --format=%ct` while `claim_prune` asks `_claim_commit_time`, and on these two stamps
+  # (BOTH peer-mintable and BOTH accepted by a plain `git push` — measured) the ANS was LIBERAL: the
+  # oracle's `sed` is anchored on `$`, so a trailing space or a 3-digit tz makes the stamp unusable and
+  # the age UNMEASURABLE, while `log` printed the digits and computed an age of ~6.2e7s for a claim
+  # minutes old — clearing the `CR_MIN_AGE` floor and releasing it.
+  DEAD_PIDS="910051 910052 910053"
+  mkraw "issue-8211" "$HOSTN:910052" "$(( $(date +%s) + 3600 ))" "+0000 "   # trailing space
+  mkraw "issue-8212" "$HOSTN:910053" "$(( $(date +%s) + 3600 ))" "+000"    # 3-digit tz
+  out="$(cr --release)"
+  ck  "A: both shape-broken committer stamps are UNMEASURABLE" "2" \
+      "$(printf '%s\n' "$out" | grep -c 'verdict=UNMEASURABLE')"
+  ckg "A: ...the refusal names the unreadable age" "could not be read" "$out"
+  ck  "A: ...and NEITHER is released, however dead its holder is" "present" \
+      "$(has_ref issue-8211 && echo present || echo absent)"
+  ck  "A: ...the 3-digit-tz claim survives too" "present" \
+      "$(has_ref issue-8212 && echo present || echo absent)"
 }
 
 # ── B. a present holder — or present WORK — is never released ───────────────────────────────────
@@ -303,7 +337,10 @@ case_E() {
   ck  "E: an overflowing --max is refused (exit 3)" "3" "$(cr --release --max 99999999999999999999 >/dev/null; echo $?)"
 }
 
-# ── F. an unparseable lease is LIVENESS, never staleness (claims.sh's recorded rule) ────────────
+# ── F. an unparseable lease is an ABSTENTION (never LIVENESS, never staleness — agent-infra#3203) (claims.sh's recorded rule) ────────────
+# ⚠️ agent-infra#3203 changed what the report SAYS about that rule (the class is an ABSTENTION, and
+# its block is bounded by claim_prune) — not what this tool DOES with it: still never released on
+# holder evidence. The quoted-rule assertion follows the wording, so a stale quote cannot linger.
 case_F() {
   setup
   DEAD_PIDS="910051"
@@ -311,7 +348,8 @@ case_F() {
 
   out="$(cr --release)"
   ckg "F: an unparseable lease is reported as UNREADABLE-LEASE" "verdict=UNREADABLE-LEASE" "$out"
-  ckg "F: the report quotes the recorded rule it obeys" "an unparseable lease is LIVE and is never re-examined for orphanhood" "$out"
+  ckg "F: the report quotes the recorded rule it obeys" "never a live window" "$out"
+  ckg "F: ...and names the bounded reap that ends the block" "CLAIM_UNREADABLE_LEASE_MAX_AGE" "$out"
   ck  "F: the claim is NOT released, however dead its holder is" "present" "$(has_ref issue-8201 && echo present || echo absent)"
   ck  "F: nothing was recorded" "0" "$(records_n)"
 }

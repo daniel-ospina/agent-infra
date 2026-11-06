@@ -3643,8 +3643,11 @@ cover), and a later cycle reaps a DEAD-pid lock **only when no landing attempt i
 pid proves nobody holds the lock, not that no rail is in flight. A live pid is never reaped or taken
 over. The same re-verification applies to claims: an **expired lease is free**, exactly as
 `claims.sh`'s `_lease_is_live` defines it, because a box that died mid-review would otherwise block
-the PR forever; an unparseable lease stays LIVE (fail-closed), matching `_lease_unparseable` — **including the
-`0` sentinel**, which `test-claims.sh` pins as "UNPARSEABLE => LIVE". The claim message is read from a
+the PR forever; an unparseable lease is never read as EXPIRED (fail-closed: nothing is reclaimed on a
+term nobody can read), matching `_claim_lease_state`'s `unreadable` answer — since #3203 that is
+REPORTED as an abstention, never as live — **including the
+`0` sentinel**, which `test-claims.sh` pins as "an oversized (>=2**63) lease reads as UNPARSEABLE =>
+ABSTENTION (rc=1, never stolen)". The claim message is read from a
 PRIVATE ref, never `FETCH_HEAD` (one per `.git`, rewritten by any concurrent fetch), and its shape is
 `claims.sh`'s (`claim owner=… lease_until=<epoch> nonce=…`).
 Stated residual: two REMINDERS on two boxes with no claim held can both dispatch; the rail's
@@ -3863,7 +3866,7 @@ writer (`CLAIM_OWNER_HOST=cell-2`, `refs/claims/9777-abc123def456`, live 1800 s 
 read OWNED; an **absent** snapshot and an **empty** one both read UNOWNED.
 
 One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `_lease_is_live` and
-`claim_orphan_reason` (no second verdict path). It publishes five words:
+`claim_orphan_reason` (no second verdict path). It publishes six words:
 
 | verdict | rc | meaning for SELECTION |
 |---|---|---|
@@ -3871,6 +3874,7 @@ One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `
 | `claim-expired` | 0 | an entry whose lease window has passed → free |
 | `claim-orphaned` | 0 | a live window whose holder cannot be a live lane (agent-infra#2094) → free |
 | `claim-held` | 1 | a live, non-orphaned window → **skip** (owner + `until` in the log line) |
+| `claim-lease-unreadable` | 1 | a claim EXISTS whose LEASE cannot be parsed → **skip** (an ABSTENTION: not a live claim, not a free one — agent-infra#3203; `claim_prune` reaps it past `CLAIM_UNREADABLE_LEASE_MAX_AGE`) |
 | `claim-unreadable` | 2 | the registry could not answer → **nothing is spawned, armed or merged** |
 
 Freshness is part of the verdict, not a separate guard: `claim_snapshot` writes a
@@ -3968,10 +3972,22 @@ box with lanes in flight, expect the next prune to free their issue claims and l
 keying (where the minting pid IS the worker) is unaffected.
 
 An orphaned holder is reclaimable **regardless of `lease_until`**, the pre-flight reports it CLEAN
-(the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease keeps its
-existing polarity — LIVE — and is never re-examined for orphanhood: those rules are a reason to stop
-trusting a *term*, not evidence about a *holder*. Every `held by …` hold reason and every pre-flight
-COLLISION carries a machine-readable token, `held-by-live` or `held-by-orphan` (the lost-CAS refusal
+(the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease ABSTAINS
+(agent-infra#3203): the acquire and the pre-flight still refuse it (rc 1 — nothing is ever stolen),
+it is never re-examined for orphanhood (those rules are a reason to stop trusting a *term*, not
+evidence about a *holder*), and it is no longer reported as a LIVE window — the token is
+`held-by-unreadable-lease` and the snapshot word is `claim-lease-unreadable`. The block it creates is
+BOUNDED: `claim_prune` reaps the ref once the claim's own COMMIT is older than
+`CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s = `CLAIM_ISSUE_TTL`, the longest shipped lease), naming the
+fault and the age on its output line; before that bound the pass NAMES it as kept instead of skipping
+it silently. Every `held by …` hold reason and every pre-flight
+COLLISION carries a machine-readable token — `held-by-live`, `held-by-orphan`,
+`held-by-unreadable-lease`, or `held-by-unreadable-clock` for the LOCAL CLOCK itself being unreadable
+(a clock this box cannot read must not mint a term: `$(( now + ttl ))` would be `0 + ttl`, i.e. a lease
+stamped in 1970 that every peer reads EXPIRED and may steal the same second; an oversized clock WRAPS
+and mints the same term — so the acquire REFUSES the mint at **rc 1**, the code every PR-claim
+consumer refuses on, and nothing is written; rc 2 would be read as "registry unavailable, proceed" and
+would drop the cross-box exclusion. Pinned by `test-claims.sh` P4 A25–A29) (the lost-CAS refusal
 `lost the reclaim race for <ref>` carries neither — it reports a race, not a hold), and
 `refresh-candidates.sh` reports how many candidates a live
 claim withheld and how many were queued *although a claim existed* (its only claim is orphaned), so a
@@ -3999,9 +4015,11 @@ only at the default gate wait.)* The verification is `claim-orphan.test.sh`,
 which reads the stamped term back out of the **pushed claim commit**. Both tunables are
 validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
 `claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
-worst kind of failure: it goes **negative**, `_lease_of`'s `[0-9]*` cannot parse the minus sign, an
-unparseable lease is read as **LIVE**, and `claim_prune` can never reap it, so that PR/head is frozen
-across every box with no automatic recovery. Every
+worst kind of failure: it goes **negative**, and `_lease_of`'s anchored, spelled-out ASCII-digit
+match cannot parse the minus sign either — an unparseable lease is never read as expired, so
+`claim_prune` could never reap it — before #3203
+that PR/head was frozen across every box with no automatic recovery. The class is now an ABSTENTION
+reaped once the claim's own commit passes `CLAIM_UNREADABLE_LEASE_MAX_AGE`. Every
 release/reclaim is `--force-with-lease`, so a box holding a **stale** commit (one that is no longer
 the ref's tip) cannot release the winner's claim. Three hardening points from the adversarial
 review of this PR: a **read-back failure on the create path still surfaces the commit we pushed**,
@@ -4029,6 +4047,25 @@ it deletes with no dry run, no per-claim evidence, no age threshold, no per-pass
 record — and its orphan rules are deliberately narrow (the local-pid rule is PR-only; the host rules
 only fire for a name this box no longer answers to), so a claim stamped by THIS box on an ISSUE, whose
 controller and chain are both gone, stays `held-by-live` until its lease runs out.
+⛔ **AND A CLAIM WHOSE LEASE CANNOT BE PARSED IS NO LONGER THE OPERATOR'S PROBLEM ALONE
+(agent-infra#3203).** `claim_prune` now reaps that class on a bounded schedule — once the claim's own
+COMMIT is older than `CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s) — so the 25-hour, unparseable,
+nobody-alive ref that motivated this tool no longer needs a human. The class is still NAMED on every
+pass (`kept unreadable-lease …` / `pruned unreadable-lease …`), and THIS tool still refuses to release
+it on holder evidence alone: the schedule is the reaper's, the judgement is not this tool's.
+
+⛔ **AND NEITHER A SHAPE NOR A COMPARISON MAY DECIDE THE CLASS ON ITS OWN.** Three defects in the
+same line came out of review rounds 7–8, each measured on the shipped file, and each failing toward
+*FREE* rather than toward the abstention: (a) the age came from **the whole commit object**, so a
+`committer … 1 +0000` line in the peer-writable MESSAGE dated the claim 1970 and had it reaped while
+`git log --format=%ct` called it seconds old — the stamp is now read from the **header block only**;
+(b) **`[ "$now" -le "$lease" ]` returns 2** when an operand is not an integer, and `if` reads that as
+FALSE ⇒ `expired` ⇒ reclaimable — so the reader reads `$?` and answers `unknown` for anything it
+cannot compare; (c) POSIX bracket RANGES are COLLATION-based, so under a UTF-8 locale `[!0-9]` does
+**not** exclude `U+0663`, and `lease_until=1٣` walked past the parser into the failing comparison —
+every digit class in `claims.sh` is now the enumerated ASCII class `[!0123456789]`. The lease is also
+bounded by **magnitude** (13+ digits: `$(( ))` and `[` both overflow, and a wrapped clock mints an
+epoch-1970 term or reaps a seconds-old claim), not merely by shape.
 
 `claim-reaper.sh` supplies that half. It is **report-only by default** and releases only with
 `--release`:
@@ -4040,8 +4077,8 @@ claim-reaper.sh --records             # what this box has reclaimed, and why
 ```
 
 Every claim passes the same ladder, each rung FAIL-CLOSED: **identity** (the claim names a
-`<box>:<pid>`) → **lease** (it parses: an unparseable lease is LIVE and is never re-examined for
-orphanhood, per `_claim_acquire_at`) → **age** (the claim's own commit time is older than `--min-age`,
+`<box>:<pid>`) → **lease** (it parses: an unparseable lease is never read as expired — an
+ABSTENTION answered before any orphan consult, per `_claim_acquire_at`) → **age** (the claim's own commit time, read with `_claim_commit_time` — the SAME reader `claim_prune` reaps on, never `git log --format=%ct`, which accepted stamps the oracle rejects and so cleared the floor for a claim minutes old — is older than `--min-age`,
 default 10800s = `CLAIM_ISSUE_TTL`) → **host** (the holder is this box, one of its former names, or a
 host declared on `CLAIM_DEAD_HOSTS` **with an expired lease**) → **pid** (`ps` first proves it can see
 *this* process, then reports the holder absent) → **work** (ISSUE claims only: no live process
@@ -4150,7 +4187,8 @@ reap. The decisions that are not obvious:
   output text: **0 CLEAN** (no claim, the only claim expired, **or the only claim is ORPHANED** —
   #2094: its holder cannot be a live lane, so the pre-flight reports what the acquire will do and the
   acquire still has to win the CAS) queues the issue; **1 COLLISION**
-  (a live claim, or a lease that cannot be parsed — a lease nobody can read is treated as live) is
+  (a live claim, or a lease that cannot be parsed — a lease nobody can read is an ABSTENTION, never
+  free: the acquire refuses it and `claim_prune` reaps it past `CLAIM_UNREADABLE_LEASE_MAX_AGE`) is
   left unchecked, so the window is re-attempted when it closes; **2 INCOMPLETE** (the registry could
   not be READ — `git ls-remote` failed, or the local clock is unreadable) is never queued and counts
   toward the run's aggregate `INCOMPLETE=n` line, and a pass that produced **no usable verdict at
@@ -4311,11 +4349,13 @@ no-chain path** in `dispatch-merge.sh`: that release runs seconds after the reco
 the record *is* that dispatch's generation — there is no older holder to refuse, and the fence is the
 record's value. It earns its keep in `chain-merge.sh`, whose trap can fire hours later, after the same
 box has re-acquired and overwritten the record.
-- **The lease polarity has ONE implementation** (`_lease_unparseable` / `_lease_is_live`) shared by
-`claim_acquire`, `claim_issue_preflight` and `claim_prune` — three copies of the same comparison, and
-"a lease that cannot be read is live" is exactly the predicate they must not answer differently.
-(`orch-loop.sh`'s `claim_live` keeps a fourth deliberately: it reads the local SNAPSHOT rather than a
-ref and `selftest.sh` extracts it standalone, so it cannot share an in-process helper.)
+- **The lease polarity has ONE implementation** — since #3203 a four-way `_claim_lease_state`
+(`live|expired|unreadable|unknown`), with `_lease_is_live` delegating to it — shared by
+`claim_acquire`, `claim_issue_preflight` and `claim_prune`: one derivation, and
+"may this be stolen?" is exactly the question they must not answer differently.
+(`orch-loop.sh`'s `claim_live` is a third SURFACE, not a third polarity: `claim_lease_live` maps
+`claim_snapshot_verdict`'s rc onto that reader's own words — `LIVE` is its word for "do not steal" —
+and `selftest.sh` extracts both standalone.)
 
 ### 7.2d Does a claim EXCLUDE? — **MEASURED, per operation** (agent-infra#1908)
 

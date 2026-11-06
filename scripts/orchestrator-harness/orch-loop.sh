@@ -1073,12 +1073,15 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 # `_lease_is_live` and `claim_orphan_reason` — and the tests that pinned them (`selftest.sh` §14,
 # `test-gates.sh` (2)-(3)) drive the SHIPPED functions, so moving the mechanism did not move the
 # answers:
-#   • an OVERSIZED (>= 2**63) lease is UNPARSEABLE, and unparseable means LIVE (P2, 4th round) —
+#   • an OVERSIZED (>= 2**63) lease is UNPARSEABLE, and unparseable means NOT EXPIRED — this reader
+#     reports it IN FLIGHT (its own word for "do not steal"; since #3203 the claim's REPORTED label is
+#     the `unreadable` abstention, not live) (P2, 4th round) —
 #     the bare `[ "$now" -le "$until" ]` ERRORS there and an errored test is FALSE, so the old
 #     reader called a live foreign claim DEAD and the controller spawned for it every cycle while
 #     `claim_acquire` refused the head;
 #   • the `0` sentinel is NOT the ABSENT case — a claim EXISTS whose lease cannot be parsed, so it
-#     is LIVE, and a negative lease collapses to the same `0` (`_lease_of`'s `[0-9]*` cannot match
+#     is NOT EXPIRED (never free, never reported as live), and a negative lease collapses to the same `0` (`_lease_of`'s anchored
+#     ASCII-digit match cannot match
 #     a minus sign) as does any other non-digit;
 #   • an entry ABSENT from a snapshot that was READ is free — but only if the read is TRUSTWORTHY
 #     (that qualifier is new, and it is the whole of agent-infra#2466);
@@ -3294,7 +3297,10 @@ pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently wor
 
 # claim_selection_verdict <pr> <head-sha> -> the PUBLISHED verdict for SELECTION
 #   rc 0 = FREE  (claim-absent | claim-expired | claim-orphaned | claim-own)
-#   rc 1 = HELD  (claim-held — a foreign, live, non-orphaned window: SKIP this head)
+#   rc 1 = HELD  (claim-held — a foreign, live, non-orphaned window: SKIP this head; or
+#                 claim-lease-unreadable — an ABSTENTION: the lease cannot be read, so this head is
+#                 neither stealable nor free. SKIP it too, and say WHICH: it is not a window and it
+#                 has no deadline the reader can name. agent-infra#3203)
 #   rc 2 = UNREADABLE (claim-unreadable — the registry could not answer; NOT freedom)
 # Globals: CLAIM_SEL_VERDICT (the word), CLAIM_SEL_OWNER, CLAIM_SEL_UNTIL, CLAIM_SEL_WHY.
 #
@@ -4478,8 +4484,18 @@ while true; do
          # its window or its holder is gone), `claim-own` (this box's own claim — only a live process
          # proves work, which the arms below do).
          echo "#$PR claim-free (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-the registry answered and holds nothing}) — the sweep may act on this head" >>"$LOG" ;;
-      1) echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?} — a peer's declared window, not this box's work)" >>"$LOG"
-         disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?}"
+      1) # ⛔ TWO CLASSES RETURN rc 1 AND ONLY ONE OF THEM OWNS A WINDOW (review round 13,
+         # agent-infra#3203). `claim-lease-unreadable` is the ABSTENTION: the term cannot be parsed, so
+         # `CLAIM_SEL_UNTIL` is `0` — and the old line narrated that as "peerbox holds this head until 0
+         # — a peer's declared window", asserting the one fact this reader has just said it cannot
+         # know. Name the class, print the reason, and never invent a deadline.
+         if [ "$CLAIM_SEL_VERDICT" = "claim-lease-unreadable" ]; then
+           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head with a lease this box CANNOT READ — an ABSTENTION, not a window; claim_prune reaps it once the claim commit passes ${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}s)" >>"$LOG"
+           disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} lease unreadable — abstaining (bounded reap, not a window)"
+         else
+           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?} — a peer's declared window, not this box's work)" >>"$LOG"
+           disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?}"
+         fi
          continue ;;
       *) echo "#$PR NOT ACTED ON (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-the registry could not answer}) — an unreadable claim registry is NOT freedom; nothing is spawned or armed for this head" >>"$LOG"
          disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-registry unreadable} (fail-closed)"

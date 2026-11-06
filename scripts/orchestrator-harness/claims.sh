@@ -71,22 +71,24 @@ CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache}"
 # — not just refs that came from the source. The controller and the workers share ONE repo
 # (CLAIM_REPO="$REPO"), so a snapshot fetch used to delete a concurrent worker's `read-…` /
 # `status-…` / `prune-…` temp ref mid-read; `_lease_of` then returned "?\t0", and an unparseable
-# lease is treated as LIVE, so the merge was refused while nobody owned it — every cycle
+# lease is treated as NOT EXPIRED (never stolen — since #3203 that abstention is REPORTED as
+# `unreadable`, never as live), so the merge was refused while nobody owned it — every cycle
 # (P2, 2026-10-14 adversarial review). Keeping temp refs out of the pruned namespace removes the
 # race. If you add a temp ref anywhere below, put it under CLAIM_TMP_NS.
 CLAIM_TMP_NS="${CLAIM_TMP_NS:-refs/claims-tmp}"
 CLAIM_TTL="${CLAIM_TTL:-1800}"   # 30 min default lease
 # ⛔ EVERY LEASE MUST BE A MAGNITUDE, NOT JUST A DIGIT STRING (P2, third review round, 2026-10-14).
 # `ttl` feeds `until=$(( now + ttl ))`, and a ttl at or above 2**63 WRAPS that NEGATIVE. `_lease_of`'s
-# `[0-9]*` pattern cannot parse a minus sign, so the lease reads as absent — and an absent lease is
-# treated as LIVE forever (below), while `claim_prune` can never reap it (`[ "$now" -gt "-" ]` is an
-# error, not a match). One bad tunable therefore froze a PR/head across ALL boxes with no automatic
-# recovery: FAIL-CLOSED, the opposite of this file's stated fail-open policy. The callers validate
+# `sed` match is anchored and spelled with the ASCII digits themselves (POSIX ranges are collation
+# questions), so it cannot parse a minus sign either — the lease reads as absent: an unparseable claim,
+# which every reader refuses and (before agent-infra#3203's bounded arm) `claim_prune` could never
+# reap (`[ "$now" -gt "-" ]` is an error, not a match). One bad tunable therefore froze a PR/head
+# across ALL boxes: FAIL-CLOSED, the opposite of this file's stated fail-open policy. The callers validate
 # their own tunables with `is_limit`; this clamps the primitive as well, so NO caller can mint an
 # unprunable lease. Accept only `0` or `[1-9][0-9]*` (leading zeros are read as octal by `$(( ))`),
 # at most 9 digits (9 digits + an epoch second cannot overflow).
 case "${CLAIM_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_TTL=1800 ;;
+  ''|*[!0123456789]*|0*) CLAIM_TTL=1800 ;;
   *) [ "${#CLAIM_TTL}" -le 9 ] || CLAIM_TTL=1800 ;;
 esac
 
@@ -132,7 +134,7 @@ esac
 # The same digit clamp as CLAIM_TTL: an unparseable lease is worse than the default (see above).
 CLAIM_ISSUE_TTL="${CLAIM_ISSUE_TTL:-18000}"
 case "${CLAIM_ISSUE_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_ISSUE_TTL=18000 ;;
+  ''|*[!0123456789]*|0*) CLAIM_ISSUE_TTL=18000 ;;
   *) [ "${#CLAIM_ISSUE_TTL}" -le 9 ] || CLAIM_ISSUE_TTL=18000 ;;
 esac
 
@@ -153,7 +155,7 @@ esac
 # ⛔ THE HOLDER RELEASES ON COMPLETION, so the full term is only ever spent by a box that died.
 CLAIM_BRANCH_TTL="${CLAIM_BRANCH_TTL:-14400}"
 case "${CLAIM_BRANCH_TTL:-}" in
-  ''|*[!0-9]*|0*) CLAIM_BRANCH_TTL=14400 ;;
+  ''|*[!0123456789]*|0*) CLAIM_BRANCH_TTL=14400 ;;
   *) [ "${#CLAIM_BRANCH_TTL}" -le 9 ] || CLAIM_BRANCH_TTL=14400 ;;
 esac
 
@@ -182,10 +184,53 @@ esac
 # Same digit clamp as the two TTLs above: an unparseable ceiling is worse than the default.
 CLAIM_TTL_MAX="${CLAIM_TTL_MAX:-9600}"   # 2 h 40 m — above fix-one's 8400s lease, the longest shipped one
 case "${CLAIM_TTL_MAX:-}" in
-  ''|*[!0-9]*|0*) CLAIM_TTL_MAX=9600 ;;
+  ''|*[!0123456789]*|0*) CLAIM_TTL_MAX=9600 ;;
   *) [ "${#CLAIM_TTL_MAX}" -le 9 ] || CLAIM_TTL_MAX=9600 ;;
 esac
 [ "$CLAIM_TTL_MAX" -ge "$CLAIM_TTL" ] || CLAIM_TTL_MAX="$CLAIM_TTL"
+
+# ── THE BOUNDED EXPIRY FOR A LEASE NO READER CAN PARSE (agent-infra#3203) ─────────────────────
+# ⛔ THE CLASS THIS BOUNDS, AND WHY IT NEEDED ITS OWN BOUND. `_lease_unparseable` names a claim that
+# EXISTS whose term this reader cannot read (an absent value, the `0` sentinel, a negative, any
+# non-digit, 19+ digits). The STEAL guard is right to refuse it: `claims.sh`'s own record of the
+# 2026-10-14 incident is that an errored `[` at or above 2**63 tested FALSE and STOLE a live claim.
+# But REFUSING TO STEAL IS NOT REFUSING TO REAP — and before this bound nothing in the fleet could
+# reap one: the expiry arm read the term as live, and `claim_prune`'s orphan arm was explicitly
+# skipped for this class, so the ONLY cure was a human `git push origin :refs/claims/<key>`. That is
+# the #8175 shape (a gate clearable only by hand), and a batch claim that folds N PRs inherits it N
+# times (#3203).
+#
+# The bound is on the claim COMMIT's own committer time — NOT on the lease (the very datum that
+# cannot be read) and NOT on a ref mtime (`claim_prune` already says why for its temp-ref arm: an
+# mtime is when THIS checkout last touched the ref). 18000 = `CLAIM_ISSUE_TTL`, the LONGEST lease any
+# shipped caller mints (see the arithmetic above), so a claim whose commit is older than this has
+# outlived every term it could possibly have carried.
+# ⛔ IT IS A BOUND ON WAITING, NOT A LICENCE TO STEAL. Only `claim_prune` acts on it, and only by
+# DELETING a ref on an output line that names the fault; every READER keeps answering ABSTENTION, so
+# nothing is ever "granted" by the passage of time — a reader that treated age alone as expiry would
+# be the fail-open the steal guard exists to prevent.
+# ⛔ AND AN UNMEASURABLE AGE IS NOT EVIDENCE OF EXPIRY: no committer line, an unparseable stamp, or a
+# stamp AHEAD of this box's clock keeps the claim and NAMES it on every pass. That is the honest
+# floor: the operator sees the class instead of having it guessed away.
+CLAIM_UNREADABLE_LEASE_MAX_AGE="${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}"
+case "${CLAIM_UNREADABLE_LEASE_MAX_AGE:-}" in
+  ''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;
+  *) [ "${#CLAIM_UNREADABLE_LEASE_MAX_AGE}" -le 9 ] || CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;
+esac
+# ⛔ AND A CEILING, OR THE BOUND IS DECORATIVE (review, agent-infra#3203). A 9-digit value is ~31
+# years: `CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999` in an ambient environment re-creates the exact
+# eternal block this arm exists to end, while looking like a configured bound. 7 days is far past
+# every shipped lease (1800-14400 s) and still bounded, so a typo cannot put the gate back.
+CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL="${CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL:-604800}"
+case "${CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL:-}" in
+  ''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=604800 ;;
+  *) [ "${#CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL}" -le 9 ] || CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=604800 ;;
+esac
+# ⛔ THE CEILING ITSELF IS HARD-CAPPED (review, agent-infra#3203): an override that can raise the
+# ceiling only re-opens the hole from one level up, so 30 days is a LITERAL, not a knob.
+[ "$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL" -gt 2592000 ] && CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=2592000
+[ "$CLAIM_UNREADABLE_LEASE_MAX_AGE" -gt "$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL" ] \
+  && CLAIM_UNREADABLE_LEASE_MAX_AGE="$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL"
 
 # ── HOW OLD MAY A SNAPSHOT BE AND STILL BE BELIEVED? (agent-infra#2466) ─────────────────────────
 # `claim_snapshot` is refreshed once per controller cycle, and every PR/issue SELECTION
@@ -203,7 +248,7 @@ esac
 # The same digit clamp as every other tunable here: an unparseable bound is worse than the default.
 CLAIM_SNAPSHOT_MAX_AGE="${CLAIM_SNAPSHOT_MAX_AGE:-900}"
 case "${CLAIM_SNAPSHOT_MAX_AGE:-}" in
-  ''|*[!0-9]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;
+  ''|*[!0123456789]*|0*) CLAIM_SNAPSHOT_MAX_AGE=900 ;;
   *) [ "${#CLAIM_SNAPSHOT_MAX_AGE}" -le 9 ] || CLAIM_SNAPSHOT_MAX_AGE=900 ;;
 esac
 # The repository every git call runs against. Resolution order:
@@ -684,7 +729,7 @@ claim_orphan_reason() {
         fi
       fi
       if [ "$have_pid" = 1 ] && [ "$is_local" = 1 ]; then
-        case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+        case "$pid" in ''|*[!0123456789]*) return 1 ;; esac
         if [ "$pid" -le 1 ] 2>/dev/null; then return 1; fi
         # the control probe: only a `ps` that can see THIS process may witness an absence.
         ps -p "$$" >/dev/null 2>&1 || return 1
@@ -980,9 +1025,25 @@ claim_branch_guard() {
     echo "$CLAIM_RESULT"; return 2
   fi
   now="$(date +%s 2>/dev/null)"
+  # ⛔ SHAPE **AND MAGNITUDE**, THE SAME ARM AS EVERY OTHER CLOCK GUARD (review round 11,
+  # agent-infra#3203). Shape alone let `0`, a leading-zero clock and a 20-digit one through to
+  # `_lease_is_live` → `_claim_lease_state` → `unknown`, which this guard then published as
+  # `reason=held-by-live` with the remedy "wait for the lease to expire" — a nominal LIVE holder for a
+  # window nobody can judge, and a remedy that can never fire. Every sibling guard names the clock; so
+  # must this one.
   case "${now:-}" in
-    ''|*[!0-9]*) CLAIM_RESULT="branch-claim: REFUSED branch=$br holder=$owner reason=clock-unreadable — the lease cannot be judged, so ownership cannot be proven"; echo "$CLAIM_RESULT"; return 2 ;;
+    ''|0|0?*|*[!0123456789]*|?????????????*) CLAIM_RESULT="branch-claim: REFUSED branch=$br holder=$owner reason=clock-unreadable — the lease cannot be judged, so ownership cannot be proven"; echo "$CLAIM_RESULT"; return 2 ;;
   esac
+  # ⛔ AN UNPARSEABLE TERM IS ITS OWN REFUSAL (agent-infra#3203). The refusal itself is unchanged and
+  # correct — the guard does not take claims, so an unjudgeable term still refuses the push — but
+  # publishing it as `held-by-live` told every reader this branch has a LIVE holder, which is the one
+  # thing this reader cannot know. The token says what is true: the CLASS is unreadable, and the
+  # bounded reap (`claim_prune`, claim-commit age > CLAIM_UNREADABLE_LEASE_MAX_AGE) or the named
+  # hand remedy is how it ends.
+  if _lease_unparseable "$until"; then
+    CLAIM_RESULT="branch-claim: REFUSED branch=$br holder=$owner reason=lease-unreadable — the claim's lease ('$until') cannot be parsed, so its window is UNKNOWN: an ABSTENTION, never read as a live claim and never treated as free. claim_prune reaps it once the claim commit is older than ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s, or ask $owner to release it (branch-claim.sh release $br); deleting the ref by hand also works (agent-infra#3203)"
+    echo "$CLAIM_RESULT"; return 1
+  fi
   if _lease_is_live "$until" "$now"; then
     # ⛔ AN ORPHANED HOLDER IS REPORTED, NOT SILENTLY OBEYED OR SILENTLY IGNORED. A dead holder's
     # term remains a refusal HERE (unlike the pre-flight, which reports it reclaimable) because the
@@ -1041,23 +1102,112 @@ _claim_commit() {
 
 # _lease_of <ref> -> "owner lease_until" parsed from the claim commit message ("" if absent)
 _lease_of() {
-  local msg
-  msg="$(_git cat-file commit "$1" 2>/dev/null | sed -n '/^$/,$p' | tail -n +2 | tr -d '\r')"
-  local o u
-  o="$(printf '%s' "$msg" | sed -n 's/.*owner=\([^ ]*\).*/\1/p')"
-  u="$(printf '%s' "$msg" | sed -n 's/.*lease_until=\([0-9]*\).*/\1/p')"
+  local msg line o u
+  msg="$(_git cat-file commit "${1:-}" 2>/dev/null | sed -n '/^$/,$p' | tail -n +2 | tr -d '\r')"
+  # ⛔ ONE LINE IN, ONE ANSWER OUT — AND THE FIRST FAITHFUL TOKEN OF EACH FIELD (review rounds 11–12,
+  # agent-infra#3203). Two separate defects lived in the old two-`sed` form, and both were measured:
+  #   * a greedy leading `.*` bound the LAST occurrence on the line, while `claim_lanes.py`
+  #     (`re.findall` → first) and `merge-reminder.py` (`re.search` → leftmost) take the FIRST — so
+  #     `lease_until=9999999999 … lease_until=1` read EXPIRED/FREE here and LIVE there;
+  #   * and simply dropping the `.*` is not the fix either: `sed 's/lease_until=\([0-9]*\)…/\1/p'`
+  #     prints the WHOLE line with the match replaced, so the capture came back wrapped in
+  #     "claim owner=… " — a broken reader that still looked plausible.
+  # So: the FIRST non-empty line of the body (the line the writer minted), split into WORDS, and the
+  # first word of each field taken whole. A second `claim …` line, or a repeated field, is peer-planted
+  # junk and cannot contribute — which is also why `lease_until=1junk` yields nothing at all (the token
+  # must be ALL digits): the value is a value or it is unparseable, never a truncated prefix.
+  line="$(printf '%s' "$msg" | awk 'NF { print; exit }')"
+  o="$(printf '%s' "$line" | tr ' \t' '\n\n' | sed -n 's/^owner=//p' | head -n 1)"
+  u="$(printf '%s' "$line" | tr ' \t' '\n\n' | sed -n 's/^lease_until=\([0123456789][0123456789]*\)$/\1/p' | head -n 1)"
   printf '%s\t%s' "${o:-?}" "${u:-0}"
+}
+
+# _claim_commit_time <rev> -> the claim commit's OWN committer epoch on stdout, rc=1 when unreadable
+#
+# ⛔ THIS IS THE BOUNDED-SCHEDULE INPUT (agent-infra#3203), AND IT IS READ FROM THE OBJECT, NOT FROM
+# `git log`: the claim ref may already be deleted by the time a caller wants the age, and a dangling
+# commit resolves only until the next `gc`/`prune` — a bound that reads its own input only sometimes
+# is not a bounded schedule. `cat-file commit` is also the verb `_lease_of` already uses, so the
+# test harness's static verb allow-list needs no new arm.
+# ⛔ AN UNREADABLE OR FUTURE STAMP RETURNS NOTHING (rc=1 is only for "cannot read"; a future stamp is
+# reported by the CALLER, which is the only place that knows what "future" means here).
+_claim_commit_time() {
+  local raw ct
+  raw="$(_git cat-file commit "${1:-}" 2>/dev/null)" || return 1
+  # ⛔ THE HEADER BLOCK ONLY (`sed -n '/^$/q;p'` stops at the blank line git puts before the
+  # message). The lease body is PEER-WRITABLE, so a commit whose MESSAGE carries a line shaped like
+  # `committer Evil <e@x> 1 +0000` used to supply the age: git dates the commit from the header and
+  # this parse from the last shaped line anywhere in the object — so the message line wins, age ≈ 1.7e9
+  # and the reaper deletes a claim `git log --format=%ct` dates as seconds old (measured; a FUTURE-dated
+  # message line pins it past the bound for ever). _lease_of already scopes to the body the same way.
+  # ⛔ EVERY DIGIT CLASS SPELLED OUT (review round 19, agent-infra#3203). This sed was added by THIS
+  # change and used `[0-9]`, the one construct the rest of the change bans: a POSIX bracket RANGE is a
+  # COLLATION question, and under `en_US.utf8` (installed here, macOS's default) it matches U+0663 —
+  # measured: `sed s/[0-9]/X/` turned `٣` into X, `sed s/[0123456789]/X/` did not. The enumerated `case`
+  # below rejects the result, so there is no fail-open today, but the parse must not depend on the
+  # downstream guard to stay ASCII.
+  ct="$(printf '%s' "$raw" | sed -n '/^$/q;p' | sed -n 's/^committer .* \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p' | tail -n 1)"
+  # ⛔ TAIL, NOT HEAD — GIT TAKES THE LAST COMMITTER LINE (review, agent-infra#3203). A crafted commit
+  # carrying two `committer` headers (`git hash-object -t commit --literally`, which a strict fsck still
+  # accepts) is dated by GIT from the LAST one and by `head -n 1` from the FIRST — so an attacker writes
+  # `committer … 1 +0000` then `committer … <now> +0000`, the reaper reads a 1-second-old claim and
+  # reaps it while `git log` says it is fresh. Same parse as git, or the bound is a guess.
+  # ⛔ DIGIT SHAPE IS NOT ENOUGH — THE VALUE BECOMES AN ARITHMETIC OPERAND (review, agent-infra#3203).
+  # `$(( now - ct ))` reads a LEADING-ZERO operand as OCTAL, so a peer-writable `0000009999` aborts the
+  # arithmetic with `value too great for base` — a FATAL error that kills claim_prune's `| while read`
+  # subshell, so every ref after it is never examined, nothing is printed, and the pass still exits 0.
+  # That re-creates the permanent unreapable block this arm exists to end, and `git fast-import` writes
+  # such a stamp with no flags. `0?*` is the same leading-zero arm `_lease_of`/the ttl clamps use; the
+  # 12-digit cap keeps an epoch second (10 digits today) from ever reaching the comparison.
+  case "${ct:-}" in ''|*[!0123456789]*|0?*) return 1 ;; esac
+  [ "${#ct}" -le 12 ] || return 1
+  printf '%s' "$ct"
 }
 
 # _lease_unparseable <lease_until> -> 0 when this reader cannot parse the lease at all
 _lease_unparseable() {
   case "${1:-}" in
-    ''|0|*[!0-9]*) return 0 ;;
+    # ⛔ A LEADING-ZERO LEASE IS UNPARSEABLE TOO (review, agent-infra#3203). `[` compares DECIMALLY, so
+    # `0000009999` silently becomes 9999 — a 1970 window — and the five readers then call a planted
+    # term EXPIRED and free: the acquire reclaims a peer's claim, `claim_prune` deletes it, and the
+    # snapshot verdict answers `claim-expired` so the controller SPAWNS for that key. No legitimate
+    # writer can mint one (the arithmetic and the ttl clamp both forbid it), which is exactly why the
+    # answer must be the abstention, not a guess at what the writer meant. One arm, no fifth polarity.
+    ''|0|0?*|*[!0123456789]*) return 0 ;;
   esac
   [ "${#1}" -gt 18 ]
 }
 
-# _lease_is_live <lease_until> <now> -> 0 LIVE (do not steal), 1 expired
+# _claim_lease_state <lease_until> <now> -> live | expired | unreadable | unknown
+#
+# ⛔ FOUR ANSWERS, BECAUSE THE OLD TWO COLLAPSED A DISTINCTION THE FLEET COULD NOT AFFORD
+# (agent-infra#3203). "live" and "unreadable" are the SAME answer to the ONE question this file's
+# guard asks ("may I steal it?": no), and DIFFERENT answers to "what is this claim?" — and the
+# second question is what every human and every log line reads. Publishing an unparseable lease as
+# LIVE is how an eternal, unreapable block looked like a healthy busy fleet. `unreadable` is a claim
+# that EXISTS whose term cannot be read; `unknown` is a parseable term with an unreadable LOCAL
+# CLOCK. Neither is free, and neither is live.
+_claim_lease_state() {
+  _lease_unparseable "${1:-}" && { printf 'unreadable'; return 0; }
+  # ⛔ THE CLOCK IS GUARDED EXACTLY LIKE THE WRITE SIDE GUARDS IT, AND THE COMPARISON IS NEVER
+  # TRUSTED TO ANSWER WHEN IT ERRORS (review, agent-infra#3203 — a P1 the six earlier rounds missed).
+  # `[ "$2" -le "$1" ]` returns **2** when an operand is not an integer, and `if [ … ]` reads that
+  # exit as FALSE ⇒ the function said `expired` ⇒ every caller said FREE. Two ways to reach it, both
+  # measured on the shipped file: a 20-digit clock (above 2**63) and a locale-collated non-ASCII
+  # digit that slipped the old `[!0-9]`. The write side already refuses both shapes and the lease
+  # side already bounds its own; the READ side is where the steal happens, so it must answer
+  # `unknown` (an abstention) for anything it cannot compare, and a `$?` of neither 0 nor 1 is
+  # exactly that case.
+  case "${2:-}" in ''|0|0?*|*[!0123456789]*|?????????????*) printf 'unknown'; return 0 ;; esac
+  [ "$2" -le "$1" ] 2>/dev/null
+  case "$?" in
+    0) printf 'live' ;;
+    1) printf 'expired' ;;
+    *) printf 'unknown' ;;   # neither live nor expired: the comparison itself failed
+  esac
+}
+
+# _lease_is_live <lease_until> <now> -> 0 DO NOT STEAL (live, unreadable or unknown clock), 1 expired
 #
 # ⛔ THE ONE IMPLEMENTATION OF THE LEASE POLARITY (2026-10-16 review). Four readers used to derive
 # it independently — claim_acquire, claim_issue_preflight, claim_prune and orch-loop.sh's
@@ -1071,22 +1221,30 @@ _lease_unparseable() {
 # it standalone"; that is no longer true of the code, and the suites now source this file alongside
 # the extraction, so the exception it described is gone.)
 #
-# ⛔ AN UNPARSEABLE LEASE IS LIVE, NEVER FREE. An absent value, the `0` sentinel, any non-digit (a
-# negative collapses to `0` in _lease_of, whose `[0-9]*` cannot match a minus sign) and a 19+-digit
-# value all mean "a claim EXISTS whose lease this reader cannot parse". The 18-digit bound is not
-# tidiness: `[` ERRORS at or above 2**63 and an errored test is FALSE, so a full-width lease used to
-# fall through to the reclaim path and STEAL a live claim. And the bound is 18, NOT 9, because a
-# lease is an EPOCH SECOND (10 digits today) — a 9-digit bound would call every legitimate lease
-# unparseable, so nothing would ever expire and the fleet would deadlock.
+# ⛔ AN UNPARSEABLE LEASE IS NEVER FREE — AND, SINCE agent-infra#3203, NEVER *CALLED* LIVE. An absent
+# value, the `0` sentinel, any non-digit (a negative collapses to `0` in _lease_of, whose anchored
+# ASCII-digit match
+# cannot match a minus sign) and a 19+-digit value all mean "a claim EXISTS whose lease this reader
+# cannot parse". The 18-digit bound is not tidiness: `[` ERRORS at or above 2**63 and an errored test
+# is FALSE, so a full-width lease used to fall through to the reclaim path and STEAL a live claim.
+# And the bound is 18, NOT 9, because a lease is an EPOCH SECOND (10 digits today) — a 9-digit bound
+# would call every legitimate lease unparseable, so nothing would ever expire and the fleet would
+# deadlock.
+# ⛔ THE ANSWER AND THE CLASSIFICATION ARE NOW SEPARATE. This function still answers "do not steal"
+# for `unreadable` (the recorded decision stands, and it is pinned): what changed is that it is now
+# expressed through `_claim_lease_state`, so a reader that needs the CLASSIFICATION gets `unreadable`
+# instead of a false "live", and the block is bounded on the REAP side (`claim_prune`,
+# `CLAIM_UNREADABLE_LEASE_MAX_AGE`) rather than eternal.
 #
 # ⛔ AND AN UNREADABLE CLOCK IS NOT EVIDENCE OF EXPIRY (2026-10-16 review). `[ "" -le "$until" ]`
 # prints "integer expression expected" and evaluates FALSE, and the OLD shape — two sequential `if`s
 # whose fall-through was the CLEAN return — therefore reported a FALSE CLEAN whenever `date` could
 # not be read. That is the one direction this gate must never fail in: it duplicates the work.
 _lease_is_live() {
-  _lease_unparseable "${1:-}" && return 0
-  case "${2:-}" in ''|*[!0-9]*) return 0 ;; esac
-  [ "$2" -le "$1" ]
+  # ⛔ ONE DERIVATION, NOT TWO: the four-way classification above is the only place the ordering is
+  # written, so "what is this?" and "may I steal it?" can never disagree about one datum (the
+  # 2026-10-14 incident recorded above is exactly that disagreement).
+  [ "$(_claim_lease_state "${1:-}" "${2:-}")" != "expired" ]
 }
 
 # claim_acquire <repo> <pr> <head-sha> [ttl]
@@ -1135,7 +1293,7 @@ _claim_acquire_at() {
   claim_host_warn_seam
   local now until commit back cur tmp perr after
   # A ceiling that arrived from a caller must obey the same digit clamp as the shipped one.
-  case "${max:-}" in ''|*[!0-9]*|0*) max="$CLAIM_TTL_MAX" ;; esac
+  case "${max:-}" in ''|*[!0123456789]*|0*) max="$CLAIM_TTL_MAX" ;; esac
   [ "${#max}" -le 9 ] || max="$CLAIM_TTL_MAX"
 
   # Same bound as CLAIM_TTL above, at the ARITHMETIC SITE, because `ttl` may arrive from the caller:
@@ -1145,7 +1303,7 @@ _claim_acquire_at() {
   # ISSUE claim must not silently become the PR claim's 1800s, which is SHORTER than LANE_TIMEOUT —
   # it would expire mid-lane and hand the issue to a peer (agent-infra#1850).
   case "${ttl:-}" in
-    ''|*[!0-9]*|0?*) ttl="$dflt" ;;
+    ''|*[!0123456789]*|0?*) ttl="$dflt" ;;
     0) ;;
     # ⛔ ABOVE THE CEILING CLAMPS TO THE CEILING, NOT TO THE DEFAULT (agent-infra#2094).
     # Falling back to `$dflt` here would silently SHORTEN a legitimate long lease (merge-one's 3000s
@@ -1206,7 +1364,28 @@ _claim_acquire_at() {
   # moved) but the state written and the log line were about the wrong issue. Cleared here, the value
   # always means "the commit THIS attempt may have pushed".
   CLAIM_COMMIT=""
-  now="$(date +%s)"; until=$(( now + ttl ))
+  now="$(date +%s)"
+  # ⛔ THE WRITER MUST NOT MINT ON A CLOCK IT CANNOT READ (review, agent-infra#3203). `until=$(( now + ttl ))`
+  # with an empty `now` is `0 + ttl`, i.e. a lease stamped in 1970 — `_lease_is_live` reads it EXPIRED the
+  # same second it was pushed, so any peer may STEAL the claim this box just acquired. Refusing is the
+  # only fail-closed answer: an agent cannot defeat this by breaking `date`, and no term is invented.
+  case "${now:-}" in
+    # ⛔ `0`, A LEADING-ZERO CLOCK, AND AN OVERSIZED ONE ARE UNREADABLE (review, agent-infra#3203).
+    # A `date` shim that prints `0` mints `until=ttl` — epoch 1970 — which every peer then reclaims as
+    # EXPIRED; a leading zero aborts the arithmetic as OCTAL; and a value at or above 2**64 WRAPS, so
+    # `until` wraps with it and the same 1970 term is minted from a 20-digit "clock". `?????????????*`
+    # is 13+ characters: an epoch second is 10 digits today and the sibling `_claim_commit_time` caps at
+    # 12, so nothing this box or a peer can legitimately report is rejected.
+    ''|0|0?*|*[!0123456789]*|?????????????*)
+      # ⛔ rc 1, NOT rc 2 (review, agent-infra#3203). rc 2 is the acquire's INFRA code: every PR-claim
+      # consumer treats it as "the registry is unavailable, proceed on the local lock alone"
+      # (`merge-one.sh`, `fix-one.sh`), so returning 2 here would let a broken `date` drop the cross-box
+      # exclusion entirely — the guard would REFUSE in name and GRANT in effect. rc 1 is the answer all
+      # those consumers refuse on, which is the polarity this class already has.
+      CLAIM_RESULT="could not mint a claim: the LOCAL CLOCK is unreadable, so no lease deadline can be computed (refusing rather than minting an already-expired term; held-by-unreadable-clock)"
+      echo "$CLAIM_RESULT"; return 1 ;;
+  esac
+  until=$(( now + ttl ))
   # ⛔ NOT `commit="$(_claim_commit …)"`: that runs in a SUBSHELL, so the reason this function sets
   # would be discarded and the caller would be back to an empty explanation. Called directly, the
   # globals survive; `>/dev/null` drops the echoed sha we already have in CLAIM_COMMIT_OUT.
@@ -1252,34 +1431,42 @@ _claim_acquire_at() {
 
   # ⛔ AN OVERSIZED BUT NUMERIC LEASE IS ALSO UNPARSEABLE (P3, third review round, 2026-10-14). A
   # value at or above 2**63 makes `[ "$now" -le "$held_until" ]` ERROR (rc=2, test FALSE), so control
-  # fell through to the RECLAIM CAS and STOLE a claim this code means to treat as live. The "no
+  # fell through to the RECLAIM CAS and STOLE a claim this code means to treat as NOT EXPIRED. The "no
   # parseable lease" branch below covers an absent value; it did not cover one a foreign or older
   # writer minted at full width. Bound the digits BEFORE the comparison, exactly as the writer side
   # now does. Not reachable from the shipped writers (they clamp), so this is defence in depth.
   #
   # ⛔ THE BOUND IS 18 DIGITS, NOT 9. The review finding asked for "longer than 9 digits", but
   # `lease_until` is an EPOCH SECOND, which is 10 digits TODAY (`date +%s` = 1792001642) — a 9-digit
-  # bound would call every legitimate lease unparseable and treat it as LIVE forever, so no claim
-  # would ever expire or be reclaimed (a fleet-wide fail-closed, and test-claims.sh's expiry steps
+  # bound would call every legitimate lease unparseable and withhold it forever (the do-not-steal
+  # direction), so no claim would ever expire or be reclaimed (a fleet-wide fail-closed, and test-claims.sh's expiry steps
   # go RED). The overflow threshold is 2**63-1 = 9223372036854775807 (19 digits): 18 digits max is
   # 999999999999999999 < 2**63, so the comparison cannot error. Rejecting 19+ digits is therefore the
   # precise magnitude guard — and it is the CONSERVATIVE direction (a foreign full-width lease reads
-  # as live, never as stolen).
+  # as NOT EXPIRED, never as stolen).
   # ── HELD, EXPIRED or ORPHANED — the one decision, in the order that cannot steal work ──────
-  # ⛔ AN UNPARSEABLE LEASE IS LIVE AND IS NEVER RE-EXAMINED FOR ORPHANHOOD. The orphan rules below
-  # are a REASON TO STOP TRUSTING A TERM; they are not evidence about the holder. A lease this reader
-  # cannot parse must keep its existing polarity (live, do not steal), or the orphan arm becomes a new
-  # way to reclaim a claim whose term simply arrived from a foreign or older writer.
+  # ⛔ AN UNPARSEABLE LEASE IS NEVER RE-EXAMINED FOR ORPHANHOOD (the recorded decision, kept): the
+  # orphan rules below are a REASON TO STOP TRUSTING A TERM, not evidence about the holder, so the
+  # orphan arm must never become a new way to reclaim a claim whose term arrived from a foreign or
+  # older writer.
+  # ⚠️ AMENDED BY agent-infra#3203 — THE REFUSAL STANDS, THE LABEL DOES NOT. This branch still
+  # returns rc=1 before the orphan arm (nothing is stolen), but it is no longer reported as `live`:
+  # an unreadable term is an ABSTENTION, and `held-by-unreadable-lease` is its token, exactly as
+  # `held-by-orphan` distinguishes its own class (the reason carries a machine-readable token so a
+  # controller can tell "a peer is working" from "nobody can ever work this"). Calling it live made
+  # an eternal, unreapable block indistinguishable from a healthy busy fleet, and the block is now
+  # bounded on the reap side: `claim_prune` deletes a ref in this class once the claim's own COMMIT
+  # is older than `CLAIM_UNREADABLE_LEASE_MAX_AGE`, so the abstention can name its own deadline.
   local reclaim_why="" orph
   if _lease_unparseable "$held_until"; then
-    CLAIM_RESULT="held by $held_owner (no parseable lease — treating as live; held-by-live)"
+    CLAIM_RESULT="held by $held_owner (no parseable lease — ABSTAINING, rc=1: neither a live claim nor a free one; held-by-unreadable-lease; claim_prune reaps it once the claim commit is older than ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s; agent-infra#3203)"
     echo "$CLAIM_RESULT"; return 1
   fi
-  case "${now:-}" in
-    ''|*[!0-9]*)
-      CLAIM_RESULT="held by $held_owner (local clock unreadable — treating as live; held-by-live)"
-      echo "$CLAIM_RESULT"; return 1 ;;
-  esac
+  # ⛔ NO CLOCK BRANCH HERE ANY MORE (review, agent-infra#3203): the MINT guard above already refuses
+  # (**rc 1, NOT rc 2** — rc 2 is read by merge-one.sh/fix-one.sh as "registry unavailable, proceed",
+  # which would drop the cross-box exclusion) on an unreadable clock BEFORE this point is reachable, so
+  # a `case "${now:-}"` here would be dead code that looks like a defence. The judgement below can only
+  # run with a clock this box could read.
   if _lease_is_live "$held_until" "$now"; then
     orph="$(claim_orphan_reason "$held_owner" "$CLAIM_REF")" || orph=""
     if [ -z "$orph" ]; then
@@ -1416,8 +1603,9 @@ _claim_status_at() {
 
 # claim_issue_preflight <issue> — THE PRE-FLIGHT'S REGISTRY READ (agent-infra#1850)
 #   0 CLEAN      — no issue claim is visible: the issue may be certified dispatchable
-#   1 COLLISION  — a LIVE claim is held (or one whose lease is unreadable, which claim_acquire also
-#                  treats as live): another box owns this issue
+#   1 COLLISION  — a LIVE claim is held (or one whose lease is unreadable: claim_acquire never
+#                  steals that class — it ABSTAINS at rc 1, and `claim_prune` reaps it past its
+#                  commit-age bound): another box owns this issue
 #   2 INCOMPLETE — the registry could NOT be read. NEVER a CLEAN: a registry outage must not become
 #                  a duplicate dispatch (#1850). This is the fail-CLOSED direction, and it is
 #                  deliberately the opposite of claim_acquire's infra rc=2 (which fails OPEN so a
@@ -1482,7 +1670,7 @@ _claim_preflight_at() {
   fi
   lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
   owner="${lease%%$'\t'*}"; until="${lease##*$'\t'}"
-  # ⛔ THE SAME UNPARSEABLE-IS-LIVE POLARITY AS claim_acquire(), taken from the ONE function that
+  # ⛔ THE SAME NEVER-EXPIRED POLARITY AS claim_acquire(), taken from the ONE function that
   # owns it (§_lease_is_live): an absent lease, the `0` sentinel, a negative, or an oversized value
   # all mean "a claim EXISTS whose lease this reader cannot parse" — never "free". Reading any of
   # them as free would steal a live claim, and the snapshot reader (orch-loop.sh's claim_live)
@@ -1492,12 +1680,23 @@ _claim_preflight_at() {
   # used to fall THROUGH that comparison to `return 0` — a FALSE CLEAN from a registry that could not
   # answer, which is the one direction this gate must never fail in (it duplicates the work).
   now="$(date +%s)"
+  # ⛔ AN UNREADABLE LEASE IS AN ABSTENTION THAT IS NEVER CLEAN (agent-infra#3203). rc=1 is kept —
+  # a pre-flight must not queue what the acquire will refuse, and the acquire still refuses — but
+  # the reason no longer claims the lease is LIVE: it names the fault, the token `held-by-unreadable-
+  # lease`, and the bounded schedule that will free it (`claim_prune`, claim-commit age >
+  # `CLAIM_UNREADABLE_LEASE_MAX_AGE`). An abstention must carry a NAMED reason
+  # (docs/ops/fleet-liveness.md §4); "treated as live" was a claim this reader could not support.
   if _lease_unparseable "$until"; then
-    CLAIM_RESULT="a claim on $label is held by ${owner:-?} (lease unreadable — treated as live; held-by-live)"
+    CLAIM_RESULT="a claim on $label is held by ${owner:-?} (lease unreadable — ABSTAINING, never CLEAN: neither a live claim nor a free one; held-by-unreadable-lease; claim_prune reaps it once the claim commit is older than ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s; agent-infra#3203)"
     echo "$CLAIM_RESULT"; return 1
   fi
+  # ⛔ THE SAME SHAPE **AND MAGNITUDE** RULE AS EVERY OTHER CLOCK GUARD (review, agent-infra#3203).
+  # Shape alone let a leading-zero clock through to `$(( ))`, where bash read it as OCTAL, aborted, and
+  # left `CLAIM_RESULT` EMPTY — an abstention with no word, no reason and no token, which is a verdict
+  # nobody can act on — and let a 20-digit clock WRAP, so `$(( until - now ))` printed a negative
+  # "s left". Fail-closed either way, but the NAME is the whole product here.
   case "${now:-}" in
-    ''|*[!0-9]*)
+    ''|0|0?*|*[!0123456789]*|?????????????*)
       CLAIM_RESULT="the local clock is unreadable (date +%s -> '${now:-}') — INCOMPLETE, never CLEAN"
       echo "$CLAIM_RESULT"; return 2 ;;
   esac
@@ -1606,7 +1805,10 @@ claim_issue_release_record() {
 #   claim-absent      rc 0  the registry was READ, is FRESH, and has no entry for this key -> free
 #   claim-expired     rc 0  an entry whose lease window has passed -> free
 #   claim-orphaned    rc 0  a live window whose HOLDER cannot be a live lane (claim_orphan_reason)
-#   claim-held        rc 1  a live, non-orphaned window -> SKIP (owner in CLAIM_SNAPSHOT_OWNER)
+#   claim-held          rc 1  a live, non-orphaned window -> SKIP (owner in CLAIM_SNAPSHOT_OWNER)
+#   claim-lease-unreadable rc 1  a claim EXISTS whose LEASE cannot be parsed (agent-infra#3203): an
+#                             ABSTENTION, not a live claim and not a free one. rc stays 1 on purpose
+#                             — see the block at the verdict itself — so this word is the abstention.
 #   claim-unreadable  rc 2  the registry could not answer. NOT free: no spawn, no merge, no arm.
 # Globals: CLAIM_VERDICT, CLAIM_VERDICT_WHY, CLAIM_SNAPSHOT_OWNER, CLAIM_SNAPSHOT_UNTIL.
 # ⛔ GLOBALS, NOT ONLY STDOUT: the caller idiom is `claim_snapshot_verdict …; rc=$?` — a `$( )`
@@ -1650,15 +1852,27 @@ claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
         # this reader cannot parse, and falling back to mtime would believe it on the strength of the
         # copy that carried it. Say so instead.
         case "${read_at:-}" in
-          ''|*[!0-9]*) why="the claim snapshot at $f carries a '#claim-snapshot' header with no usable read instant ('${read_at:-}') — the writer is not one this reader can parse" ;;
+          ''|*[!0123456789]*) why="the claim snapshot at $f carries a '#claim-snapshot' header with no usable read instant ('${read_at:-}') — the writer is not one this reader can parse" ;;
         esac ;;
       *) read_at=""; fetch="" ;;   # a writer older than this reader: mtime is the only age available
     esac
     [ -n "$why" ] || [ -n "$read_at" ] || read_at="$(claim_file_mtime "$f")"
     now="$(date +%s 2>/dev/null || true)"
-    case "${now:-}" in ''|*[!0-9]*) [ -n "$why" ] || why="the local clock is unreadable (date +%s -> '${now:-}')" ;; esac
+    # ⛔ THE LAST SHAPE-ONLY CLOCK GUARD, AND THE ONE THAT HURTS MOST (review round 12,
+    # agent-infra#3203). The magnitude arm was added to `read_at` below but not to `now`, and `now`
+    # feeds `age=$(( now - read_at ))` 10 lines down. A leading-zero clock makes bash abort the
+    # ARITHMETIC as OCTAL — and because `claim_selection_verdict` calls this function DIRECTLY (not in
+    # `$( )`, so no subshell absorbs it), `orch-loop.sh` DIES MID-SWEEP: no verdict, no error line the
+    # sweep can read, the candidate never examined. A 20-digit clock WRAPS instead, so
+    # `CLAIM_SNAPSHOT_MAX_AGE` is silently skipped. Both are now named, which is what this arm is for.
+    case "${now:-}" in ''|0|0?*|*[!0123456789]*|?????????????*) [ -n "$why" ] || why="the local clock is unreadable (date +%s -> '${now:-}')" ;; esac
+    # ⛔ SHAPE AND MAGNITUDE, exactly as `claim_prune` and the mint guard require (review,
+    # agent-infra#3203): with shape only, a leading-zero `read_at` aborts `$(( now - read_at ))` as
+    # OCTAL, `age` stays empty, NEITHER the fresh nor the stale test fires, and the verdict falls
+    # through to a bare `claim-unreadable` with no reason — and a 20-digit one wraps into a negative
+    # age. The bound is what this arm exists to apply; an unusable clock must not skip it silently.
     case "${read_at:-}" in
-      ''|*[!0-9]*) [ -n "$why" ] || why="the snapshot's read instant could not be read (header and mtime both unusable)" ;;
+      ''|0|0?*|*[!0123456789]*|?????????????*) [ -n "$why" ] || why="the snapshot's read instant could not be read (header and mtime both unusable)" ;;
     esac
     if [ -z "$why" ]; then
       age=$(( now - read_at ))
@@ -1698,14 +1912,30 @@ claim_snapshot_verdict() { # <snapshot-file> <ref> -> verdict word on stdout
   owner="$(printf '%s' "$entry" | cut -f2)"
   until_or_0="$(printf '%s' "$entry" | cut -f3)"
   CLAIM_SNAPSHOT_OWNER="${owner:-?}"; CLAIM_SNAPSHOT_UNTIL="${until_or_0:-0}"
-  # ⛔ AN UNPARSEABLE LEASE IS LIVE AND IS NEVER RE-EXAMINED FOR ORPHANHOOD (agent-infra#2094,
-  # pinned by claim-orphan.test.sh O16). The orphan rules are a reason to STOP TRUSTING A TERM; they
-  # are not evidence about the HOLDER. A lease this reader cannot parse must keep its existing
-  # polarity, or the orphan arm becomes a new way to reclaim a claim whose term simply arrived from a
-  # foreign or older writer. This ordering came from `claim_acquire`, and it is reproduced here rather
-  # than re-derived: unparseable/absent → HELD, before any orphan consult.
+  # ⛔ AN UNPARSEABLE LEASE IS NEVER RE-EXAMINED FOR ORPHANHOOD (agent-infra#2094, pinned by
+  # claim-orphan.test.sh O16). The orphan rules are a reason to STOP TRUSTING A TERM; they are not
+  # evidence about the HOLDER. A lease this reader cannot parse must keep its existing
+  # do-not-steal polarity (rc 1, nothing reclaimed), or the orphan arm becomes a new way to reclaim a
+  # claim whose term simply arrived from a foreign or older writer. This ordering came from
+  # `claim_acquire`, and it is reproduced here rather than re-derived: unparseable/absent → an
+  # ABSTENTION answered BEFORE any orphan consult — never free, and (agent-infra#3203) never
+  # `claim-held` either, which is why the word below is `claim-lease-unreadable`.
+  # ⛔ THE VERDICT WORD IS AN ABSTENTION, NOT `claim-held` (agent-infra#3203). `claim-held` means
+  # "a live, non-orphaned window" to every reader of the published list above, and an unparseable
+  # term is not that window — it is UNKNOWN. Publishing it as held is the "read as a live claim"
+  # defect this fix exists to remove.
+  # ⛔ rc STAYS 1, AND THAT IS DELIBERATE — NOT AN OVERSIGHT. rc 2 (`claim-unreadable`) means "the
+  # REGISTRY could not answer", and two consumers act on that meaning: `claim_foreign_live` counts
+  # only rc 1 as owned, and `claim_selection_verdict` hands rc 2 to the sweep as UNREADABLE. Moving
+  # this class to rc 2 would make a live peer's head read NOT-OWNED, so the controller would spawn a
+  # worker that the acquire then refuses — the "re-spawn a refused fixer EVERY cycle" regression
+  # this very function was created to end. Both rcs block; rc 1 blocks WITHOUT the churn, and the
+  # abstention is carried by the WORD (`claim-lease-unreadable`) plus a why that names the fault, the
+  # remedy and the deadline. The forward remedy is not this read: `claim_prune` deletes the ref
+  # (`CLAIM_UNREADABLE_LEASE_MAX_AGE`), after which this key answers `claim-absent`.
   if _lease_unparseable "$until_or_0"; then
-    CLAIM_VERDICT="claim-held"; CLAIM_VERDICT_WHY="held by ${owner:-?} (lease unreadable — treated as live, never re-examined for orphanhood)"
+    CLAIM_VERDICT="claim-lease-unreadable"
+    CLAIM_VERDICT_WHY="held by ${owner:-?} — the lease it records ('${until_or_0}') is one this reader cannot parse, so its window is UNKNOWN: an ABSTENTION, never a live claim and never a free one; claim_prune reaps it once the claim commit is older than ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s (agent-infra#3203)"
     echo "$CLAIM_VERDICT"; return 1
   fi
   # THE ONE LEASE POLARITY — never a fifth derivation of it.
@@ -1791,9 +2021,9 @@ claim_snapshot() {
     printf '%s\t%s\t%s\n' "${CLAIM_NS}/${ref#"$CLAIM_CACHE_NS"/}" "${owner:-?}" "${until:-0}"
   done > "$body"
   n="$(wc -l < "$body" 2>/dev/null | tr -d ' ')"
-  case "${n:-}" in ''|*[!0-9]*) n=0 ;; esac
+  case "${n:-}" in ''|*[!0123456789]*) n=0 ;; esac
   now="$(date +%s 2>/dev/null || true)"
-  case "${now:-}" in ''|*[!0-9]*) now=0 ;; esac
+  case "${now:-}" in ''|0|0?*|*[!0123456789]*|?????????????*) now=0 ;; esac
   # A read instant of 0 is NOT a fresh read: the reader treats it as unreadable (0 is in the past by
   # every clock), which is the fail-closed direction on a box whose `date` cannot answer.
   # ⛔ A FAILED WRITE MUST NOT PUBLISH AN EMPTY SNAPSHOT (review, P2). The brace below used to
@@ -1827,11 +2057,28 @@ claim_snapshot() {
   return 0
 }
 
-# claim_prune — delete EXPIRED and ORPHANED-HOST claim refs (git refs are unbounded), and reap
-# LEAKED temp refs. Two arms, in that order: a future lease is still evidence of a live holder when
-# its host can be believed, and only an orphaned host makes a future lease reaptable (agent-infra#2094).
+# claim_prune — delete EXPIRED, UNPARSEABLE-LEASE and ORPHANED-HOST claim refs (git refs are
+# unbounded), and reap LEAKED temp refs. Three arms, in this order: (1) EXPIRY — `_lease_is_live`
+# answers expired, so a future lease is still evidence of a holder; (2) UNPARSEABLE-LEASE — no reader
+# can parse the term, so it is reaped on a BOUNDED SCHEDULE measured from the claim's own commit time
+# (agent-infra#3203 — before this arm the class was eternal), which also takes the class OUT of arm 3;
+# (3) ORPHANED-HOST — only an orphaned host makes a future lease reaptable (agent-infra#2094).
 claim_prune() {
-  local now ref lease until owner; now="$(date +%s)"
+  local now ref lease until owner ct age; now="$(date +%s)"
+  # ⛔ THE CLOCK IS VALIDATED ONCE, BEFORE ANY ARITHMETIC (review, agent-infra#3203). TWO distinct
+  # pre-fix failures, both silent: (a) an EMPTY `date` made `$(( now - ct ))` read `now` as EPOCH 0, so
+  # every claim in the unparseable-lease class looked decades AHEAD of this box's clock and the pass
+  # reported a clock-SKEW it had no evidence for; (b) a value that is
+  # not arithmetic syntax at all (e.g. `12:34:56`) makes `$(( now - ct ))` a SYNTAX ERROR, which kills
+  # this subshell — nothing after that ref is reaped and nothing says the pass stopped. (A plain
+  # non-numeric word like `abc` does NOT error: bash resolves a variable's value recursively, so it is
+  # the epoch-0 / syntax-error shapes that bite.) `_claim_acquire_at` needed the same guard for a worse
+  # reason and now has it (no lease is minted on an unreadable clock). With an unreadable clock the
+  # UNPARSEABLE-LEASE arm below reaps nothing (fail-closed) and says WHICH datum was missing — the
+  # orphaned-host arm is a separate judgement that never consults the clock, so it is unaffected.
+  # ⛔ MAGNITUDE, NOT JUST SHAPE (review, agent-infra#3203): a 20-digit clock WRAPS through `$(( ))` and
+  # reaps a 5-second-old claim as "7766279629658291713s old, past the bound". `?????????????*` = 13+ chars.
+  case "${now:-}" in ''|0|0?*|*[!0123456789]*|?????????????*) now="" ;; esac
   _git ls-remote origin "$CLAIM_NS/*" 2>/dev/null | awk '{print $2}' | while read -r ref; do
     [ -n "$ref" ] || continue
     local cur tmp
@@ -1839,23 +2086,71 @@ claim_prune() {
     [ -n "$cur" ] || continue
     tmp="$CLAIM_TMP_NS/prune-$RANDOM$$"
     _git fetch -q origin "+$ref:$tmp" 2>/dev/null || continue
+    # ⛔ THE COMMIT TIME IS READ HERE, WHILE THE OBJECT IS REACHABLE (agent-infra#3203). After the
+    # `update-ref -d` below the claim commit is DANGLING: `cat-file` still resolves it until the next
+    # `gc`/`prune`, so reading it afterwards is intermittent by construction — and a bound whose input
+    # is readable only sometimes is not a bounded schedule.
+    ct="$(_claim_commit_time "$tmp")" || ct=""
     lease="$(_lease_of "$tmp")"; _git update-ref -d "$tmp" 2>/dev/null
     until="${lease##*$'\t'}"; owner="${lease%%$'\t'*}"
     # The polarity is `_lease_is_live`'s, not a fourth derivation of it: reap exactly what that
-    # function calls expired. "Still live, do not reap" covers the absent, the `0` sentinel, the
+    # function calls expired. "Not expired — do not reap" covers the absent, the `0` sentinel, the
     # non-digit and the 19+-digit lease (which ERRORS `[` at 2**63 — an errored test is FALSE, so an
-    # inline copy here would reap a claim the readers call live).
+    # inline copy here would reap a claim every reader refuses to steal; since agent-infra#3203 the
+    # third arm below is what ends that class's block, on its own bounded schedule).
     if ! _lease_is_live "$until" "$now"; then
       _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null && echo "pruned expired $ref"
+      continue
+    fi
+    # ── AND BY THE BOUNDED EXPIRY FOR A LEASE NO READER CAN PARSE (agent-infra#3203) ──────────
+    # ⛔ WHY A THIRD ARM. Refusing to STEAL on an unparseable term is a recorded decision and it
+    # stays (the readers still refuse, above); this arm runs on the REAP path only, where the old
+    # answer was "never" — the expiry arm above reads the term as NOT EXPIRED and the orphan arm below is
+    # skipped for this class, so a human `git push origin :<ref>` was the only cure. That is the
+    # #8175 shape, and a batch claim multiplies it by N.
+    # ⛔ EVERY PASS SAYS SOMETHING. A claim this arm keeps is NAMED (`kept unreadable-lease`) with its
+    # age, and one it deletes is NAMED (`pruned unreadable-lease`) with the bound it passed: an
+    # abstention reaches the operator, and a deletion carries its own evidence instead of being a
+    # silent grant. The age is the claim COMMIT's (read above), never a ref mtime and never the lease.
+    # ⛔ AN UNMEASURABLE AGE IS NOT EVIDENCE OF EXPIRY: no readable committer stamp, or a stamp AHEAD
+    # of this box's clock, keeps the claim and says why. That is the fail-closed direction, and it is
+    # the only case where this class still needs a human — stated, not hidden.
+    if _lease_unparseable "$until"; then
+      if [ -z "${now:-}" ]; then
+        echo "kept unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed AND the LOCAL CLOCK is unreadable, so this claim's age cannot be established: nothing in the unparseable-lease class is reaped on a clock this box cannot read (the orphaned-host arm still is, which is why it still runs) — agent-infra#3203)"
+        continue
+      fi
+      if [ -z "$ct" ]; then
+        echo "kept unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed and the claim commit's time cannot be read, so its AGE IS UNMEASURABLE: an unmeasurable age is not evidence of expiry — agent-infra#3203)"
+        continue
+      fi
+      age=$(( now - ct ))
+      if [ "$age" -lt 0 ]; then
+        echo "kept unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed and the claim commit is dated ${age#-}s AHEAD of this box's clock, so its age cannot be established — agent-infra#3203)"
+        continue
+      fi
+      if [ "$age" -le "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ]; then
+        echo "kept unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed; the claim commit is ${age}s old, INSIDE the ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s bound — agent-infra#3203)"
+        continue
+      fi
+      if _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null; then
+        echo "pruned unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed and the claim commit is ${age}s old, PAST the ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s bound — agent-infra#3203)"
+      else
+        # ⛔ A FAILED DELETE MUST SAY SO. Silence here reads as "the pass had nothing to do", which is
+        # how an eternal block comes back without anyone noticing — the arm's own rule is that every
+        # pass says something.
+        echo "kept unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed and the claim commit is ${age}s old, PAST the ${CLAIM_UNREADABLE_LEASE_MAX_AGE}s bound, but the reap push FAILED: the ref is still there — agent-infra#3203)"
+      fi
       continue
     fi
     # ── AND BY ORPHANED HOST (agent-infra#2094) ───────────────────────────────────────────────
     # Expiry alone is the incident: a lease stamped under a host that no longer exists keeps a
     # FUTURE `lease_until`, so this loop skipped it for its whole term and nothing else could ever
     # free it. An orphaned holder is not a live lane, so the term is irrelevant to the decision.
-    # ⛔ THE UNPARSEABLE-IS-LIVE POLARITY ABOVE STILL WINS: a lease this reader cannot parse is not
-    # evidence about the HOLDER either, so it is left alone rather than reaped on an orphan guess.
-    if _lease_unparseable "$until"; then continue; fi
+    # ⛔ THE UNPARSEABLE CLASS NEVER REACHES THIS ARM — it is handled by the bounded arm above,
+    # which decides from the claim's OWN age and skips this loop with a `continue`. That is the
+    # recorded decision kept intact: an unparseable lease is not evidence about the HOLDER either,
+    # so the orphan rules are never consulted for it (agent-infra#2094, agent-infra#3203).
     local why
     if why="$(claim_orphan_reason "$owner" "$ref")"; then
       if _git push -q --force-with-lease="$ref:$cur" origin ":$ref" 2>/dev/null; then
@@ -1871,7 +2166,7 @@ claim_prune() {
   # ⛔ The age is the REF FILE's mtime — when THIS box wrote the ref — NOT the claim commit's date.
   # The commit may be minutes old while the read ref was created a second ago, so a commit-date bound
   # would delete the ref underneath a LIVE concurrent read; `_lease_of` would then return "?\t0"
-  # (unparseable = treated as LIVE) and the merge would be falsely refused — the exact race this
+  # (unparseable = treated as NOT EXPIRED, so not stealable) and the merge would be falsely refused — the exact race this
   # namespace exists to avoid. A read takes seconds, so a 2-hour bound cannot touch a live one.
   _git for-each-ref --format='%(refname)' "$CLAIM_TMP_NS" 2>/dev/null | while read -r ref; do
     [ -n "$ref" ] || continue
@@ -1937,7 +2232,7 @@ claim_action_proof() {
   local pr="${1:-}" head="${2:-}" own="${3:-}"
   local ref cur tmp lease owner until now orph host held_owner
   # ⛔ VALIDATE AT THE DOOR — an unreadable input is a REFUSAL (rc 2), never a pass.
-  case "$pr" in ''|*[!0-9]*)
+  case "$pr" in ''|*[!0123456789]*)
     CLAIM_ACTION_RESULT="claim-action-proof: REFUSED pr=<unreadable> reason=non-numeric-pr"
     echo "$CLAIM_ACTION_RESULT"; return 2 ;; esac
   case "$head" in ''|*[!0-9a-fA-F]*)

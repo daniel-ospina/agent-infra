@@ -25,8 +25,9 @@ case "${PR:-}" in ''|*[!0-9]*) echo "[fix] refusing non-numeric PR: ${PR:-<empty
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 # ⛔ MAGNITUDE, NOT JUST SHAPE (P2, third review round, 2026-10-14). `is_num` is UNBOUNDED, so it
 # accepted `9223372036854775807`; `FIX_LEASE=$(( FIX_TIMEOUT + 1200 ))` then wrapped NEGATIVE, the
-# lease failed to parse (`_lease_of`'s `[0-9]*` cannot match a minus sign), and an unparseable lease
-# is read as LIVE — so the head was frozen across ALL boxes and `claim_prune` could never reap it.
+# lease failed to parse (`_lease_of`'s anchored ASCII-digit match cannot match a minus sign), and an unparseable lease
+# is never read as EXPIRED — so the head was frozen across ALL boxes and `claim_prune` could not
+# reap it before #3203's bounded arm.
 # FAIL-CLOSED, the opposite of the design's fail-open policy. `is_limit` (is_num AND at most 9
 # digits) is the predicate orch-loop.sh applies to every other tunable for exactly this reason.
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }

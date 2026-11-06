@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """tools/fleet/claim_lanes.test.py — the #1777 ref-claim reader acceptance suite.
 
-Twenty-six tests with thirty paired mutations: every mutation re-introduces
+Thirty-six tests with forty-seven paired mutations: every mutation re-introduces
 the defect its test exists to catch, so "the test fails without the fix" is an
 EXECUTED claim rather than an asserted one (the standard this repo's
 ``liveness.test.py`` set).
 
-    python3.12 tools/fleet/claim_lanes.test.py              # the 26 tests, green
+    python3.12 tools/fleet/claim_lanes.test.py              # the 36 tests, green
     python3.12 tools/fleet/claim_lanes.test.py --mutations  # each mutation, RED
 
 `--mutations` writes BOTH modules — a mutated copy of one and a verbatim copy of
@@ -440,6 +440,44 @@ def l10_lease_parity_with_shipped_shell():
             ("nineteen", "9" * 19, "unknown"),  # > 2**63-1 would ERROR the shell comparison
             ("eighteen", "9" * 18, "live"),     # the precise magnitude bound is still numeric
             ("nondigit", "soon", "unknown"),
+            # ⛔ A LEADING ZERO IS UNPARSEABLE IN BOTH READERS (agent-infra#3203). The shell rejects it
+            # because `[` compares decimally (`0000009999` would read as a 1970 window), and Python's
+            # `int()` would do exactly the same — so the reader must refuse the shape BEFORE converting,
+            # or the two readers disagree in the FREE direction: this one passes a claim gate on a
+            # lease claims.sh ABSTAINS over.
+            ("leading-zero", "0" + str(NOW_S), "unknown"),
+            ("one-then-digits", "0999", "unknown"),
+            ("garbled-suffix", "1junk", "unknown"),
+            ("garbled-non-ascii", "17\u06692000000", "unknown"),
+            # ⛔ THE WHOLE SEPARATOR CLASS, NOT ONE CHARACTER (review round 15, agent-infra#3203).
+            # Every one of these terminates a line in PYTHON (`str.splitlines`, `\s`) and does NOT in
+            # the shell — which reads `\n`/space/TAB only. Each must therefore be UNPARSEABLE in both
+            # readers; the loop compares this reader's EXTRACTOR against the shipped `_lease_of`, so a
+            # divergence in either direction reddens HERE rather than in production.
+            ("vt", "1\x0b", "unknown"),
+            ("ff", "1\x0c", "unknown"),
+            ("fs", "1\x1c", "unknown"),
+            ("gs", "1\x1d", "unknown"),
+            ("rs", "1\x1e", "unknown"),
+            ("nel", "1\u0085", "unknown"),
+            ("ls", "1\u2028", "unknown"),
+            ("ps", "1\u2029", "unknown"),
+            ("nbsp", "1\xa0", "unknown"),
+            ("emspace", "1\u2003", "unknown"),
+            # ⛔ CR IS THE ONE SEPARATOR THE SHELL *DELETES* (review round 16, agent-infra#3203).
+            # `_lease_of` runs `tr -d '\r'`, so `lease_until=A<CR>lease_until=B` is ONE token to the
+            # shell (the last digits win) — while Python's `text=True` (universal newlines) had already
+            # turned that CR into a LINE BREAK at decode, so this reader saw two lines and took the
+            # first. That is why CR is its own class: it is not "content" and not "a break", it is
+            # REMOVED. Pinned here through the shipped `_lease_of`, which is the oracle.
+            # The DISCRIMINATING shape: the shell DELETES the CR and the two tokens FUSE —
+            # `lease_until=1<CR>lease_until=9999999999` becomes the single word
+            # `lease_until=1lease_until=9999999999`, which is not a faithful token ⇒ UNPARSEABLE. A
+            # reader that let universal newlines turn the CR into a LINE BREAK would take line 1's `1`
+            # and answer EXPIRED, i.e. FREE (measured). The digits-join case is pinned too.
+            ("cr-fuse", "1\rlease_until=9999999999", "unknown"),
+            ("cr-mid", "1792009999\r1", "live"),
+            ("cr-after", "1\r", "expired"),
             ("absent", "", "unknown"),
         ]
         driver = os.path.join(d, "driver.sh")
@@ -456,6 +494,13 @@ def l10_lease_parity_with_shipped_shell():
         for label, raw, want in cases:
             proc = subprocess.run(["bash", driver, d, CLAIMS_SH, "%s:31337" % HOST, raw],
                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            # the exact commit message the shipped writer minted for this case
+            # ⛔ BYTES, NOT `text=True` (review round 16): universal newlines would turn a crafted
+            # CR into a line break HERE, in the fixture reader, and hide the divergence the case exists
+            # to pin — `_lease_of` DELETES the CR (`tr -d '\r'`), so the bytes are the faithful read.
+            proc_msg = subprocess.run(
+                ["git", "-C", d, "log", "-1", "--format=%B", "refs/parity"],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.decode("utf-8", "replace")
             check(proc.returncode == 0, "claims.sh primitives failed for %s: %s"
                   % (label, proc.stderr.strip()))
             shell_owner, _tab, shell_until = proc.stdout.rstrip("\n").partition("\t")
@@ -464,6 +509,16 @@ def l10_lease_parity_with_shipped_shell():
             until, state = cl.parse_lease(shell_until, NOW_S)
             check(state == want, "case %s (shell emitted %r) => the reader said %s, expected %s"
                   % (label, shell_until, state, want))
+            # ⛔ THE EXTRACTOR TOO, NOT JUST THE PARSER (review round 10, agent-infra#3203): the loop
+            # above compares `parse_lease` against the SHELL's `_lease_of` output, so a Python
+            # EXTRACTOR that disagreed — `lease_until=1junk` was captured as `1` by an unanchored
+            # `[0-9]*`, i.e. expired/FREE, while the shell's anchored reader said unparseable — was
+            # invisible to every case here. One datum, one answer, or the free-direction divergence
+            # this PR exists to remove is simply re-created one layer down.
+            py_owner, py_until = cl._owner_and_lease(proc_msg)
+            check(py_until == shell_until,
+                  "case %s: the EXTRACTOR diverged from the shell: %r vs %r"
+                  % (label, py_until, shell_until))
             oh, opid, scope = cl.parse_owner(shell_owner, HOST)
             check((oh, opid, scope) == (HOST, 31337, "local"),
                   "case %s: owner parity broke: %r -> %r" % (label, shell_owner, (oh, opid, scope)))
@@ -634,6 +689,255 @@ def l14_repo_binding():
                 check("1-111111111111" not in keys, "the cwd's claim must NOT appear")
                 check(payload["readable"] is True and payload["verdict"]["state"] == "unknown",
                       "and the verdict stays an abstention")
+
+
+@test("L10d a refname carrying U+2028 is not a claim at the canonical key (splitlines decoy)")
+def l10d_ls2028_decoy():
+    # ⛔ `git check-ref-format` ACCEPTS U+2028 in a refname, and `str.splitlines()` breaks on it — so a
+    # peer pushing `refs/claims/<pr>-<sha12><LS>junk` made `read_pull` report a claim at the canonical
+    # key, which does not exist (review round 17, agent-infra#3203; measured: this reader "readable, 1
+    # claim", the shell `claim-absent`). Over-block, not a grant — but the shell splits `ls-remote` on
+    # `\n` alone and so must this reader.
+    # ⛔ AND IT MUST BE BOTH-SIDED (review round 18, agent-infra#3203). The first draft only forbade
+    # the canonical phantom, so a mutant that DROPS every non-ASCII ref (`present=False` ⇒
+    # `no-claim-visible`) passed it — the "presence lost" direction was unasserted. And the datum was
+    # LS-INTERIOR, where a bare `.strip()` is inert; the trim is what turns a TRAILING U+2028 into the
+    # canonical key, so both positions are pinned now.
+    for suffix in ("\u2028junk", "\u2028", "\u00a0", "\u2003", "\u2029"):
+        with bare_remote([("refs/claims/9-bbbbbbbbbbbb" + suffix, "decoy", "9999999999")]) as remote:
+            cr = cl.read_pull(remote, host=HOST, now=NOW_S)
+        keys = [c.ref for c in cr.claims]
+        check(cr.readable is True, "the read itself succeeds; got %r" % (cr.detail,))
+        check(cr.present is True and len(cr.claims) == 1,
+              "the decoy IS a claim (it must not be dropped); suffix=%r got %r present=%r"
+              % (suffix, keys, cr.present))
+        check(keys[0] == "refs/claims/9-bbbbbbbbbbbb" + suffix,
+              "the refname is kept VERBATIM, never trimmed to the canonical key; suffix=%r got %r"
+              % (suffix, keys))
+        check("refs/claims/9-bbbbbbbbbbbb" not in keys,
+              "and it must not surface as the canonical key; suffix=%r got %r" % (suffix, keys))
+
+
+@test("L32 a NUL in the claim line is DELETED (bash does), not carried or truncated at")
+def l32_nul_is_deleted():
+    # ⛔ review round 19, agent-infra#3203. `_lease_of` reads the object through `$( )`, and a command
+    # substitution DROPS NUL bytes — so `lease_until=1<NUL>lease_until=1792009999` is ONE fused, invalid
+    # token to the shell (UNPARSEABLE ⇒ abstain). A reader that KEPT the NUL saw two words and took the
+    # first (`1` ⇒ expired ⇒ FREE). `git commit-tree` refuses a NUL in argv; `hash-object --literally`
+    # writes it and a plain push accepts it, so this is a peer-mintable object.
+    d = tempfile.mkdtemp(prefix="nul-cl-")
+    try:
+        git(["init", "-q", d])
+        git(["-C", d, "config", "user.email", "a@b"])
+        git(["-C", d, "config", "user.name", "a"])
+        with open(os.path.join(d, "f"), "w") as fh:
+            fh.write("x\n")
+        git(["-C", d, "add", "f"])
+        git(["-C", d, "commit", "-qm", "base"])
+        tree = git(["-C", d, "rev-parse", "HEAD^{tree}"]).stdout.strip()
+        raw = ("tree %s\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\n"
+               "claim owner=peerbox:7 lease_until=1\x00lease_until=1792009999 nonce=n\n" % tree)
+        sha = subprocess.run(
+            ["git", "-C", d, "hash-object", "-t", "commit", "--literally", "-w", "--stdin"],
+            input=raw.encode(), check=True, capture_output=True).stdout.decode().strip()
+        # the body the reader gets must be NUL-FREE, exactly as bash hands it to `_lease_of`
+        obj = subprocess.run(["git", "-C", d, "cat-file", "commit", sha],
+                             check=True, capture_output=True).stdout.decode("utf-8", "replace")
+        body = cl._commit_body(obj)
+        check("\x00" not in body, "the body carries no NUL (bash deletes them); got %r" % (body,))
+        owner, until = cl._owner_and_lease(body)
+        check(until == "0",
+              "so the two tokens FUSE into one invalid word ⇒ unparseable, not the first "
+              "one taken; got %r/%r" % (owner, until))
+        check(cl.parse_lease(until, NOW_S)[1] == "unknown",
+              "and the reader abstains rather than publishing the first token as expired")
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+@test("L31 parse_owner does not trim a Unicode separator off the owner token")
+def l31_owner_no_unicode_trim():
+    # ⛔ review round 18, agent-infra#3203: `parse_owner((owner or "").strip())` turned `boxA:7<U+2028>`
+    # into a PARSED `("boxA", 7, "foreign")`, where the shell's owner word is `boxA:7<U+2028>` (its
+    # split is `tr ' \t'` only). Not a grant — the oracle's orphan arm refuses every variant and this
+    # reader never probes a local pid — but a label invented from a value nobody wrote.
+    for sep in ("\u2028", "\u00a0", "\u2003", "\u0085"):
+        host, pid, scope = cl.parse_owner("boxA:7" + sep, "thisbox")
+        check(scope == "unknown", "owner %r must be UNUSABLE, not parsed; got %r"
+              % ("boxA:7" + sep, (host, pid, scope)))
+    check(cl.parse_owner("boxA:7", "thisbox") == ("boxA", 7, "foreign"),
+          "a clean owner still parses")
+
+
+@test("L30 the committer stamp is accepted exactly as the shell accepts it (no trailing ws, 12-digit cap)")
+def l30_committer_acceptance():
+    # ⛔ ONE DATUM, ONE ANSWER — in the field the bounded reap is MEASURED FROM (review round 18,
+    # agent-infra#3203). `claims.sh`'s `_claim_commit_time` takes the stamp with
+    # `sed -n 's/^committer .* \([0123456789]\{1,\}\) [+-][0123456789]\{4\}$/\1/p'` — NOTHING may
+    # follow the tz digits — and then rejects a stamp longer than 12 digits as UNMEASURABLE
+    # (`case … |?????????????*`), which is what keeps `now - ct` out of a wrapped negative. This
+    # reader allowed `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and
+    # a fresh/aged stamp here.
+    def obj(headers, body="claim owner=c lease_until=9999999999 nonce=x"):
+        # a commit object is `<headers>\n\n<body>`; `_commit_time` reads the header block only
+        return "tree " + "0" * 39 + "\n" + headers + "\n\n" + body + "\n"
+    ok = "committer a <a@b> 1700000000 +0000"
+    cases = [
+        (ok, 1700000000),
+        (ok + " ", None),                       # trailing space: the shell's `...$` refuses it
+        (ok + "\t", None),
+        ("committer a <a@b> 17000000000 +0000", 17000000000),   # 11 digits: accepted by both
+        ("committer a <a@b> 170000000000 +0000", 170000000000), # 12 digits: still accepted
+        ("committer a <a@b> 1700000000000 +0000", None),        # 13+ ⇒ `?????????????*`: UNMEASURABLE
+        # ⛔ THE THIRD REJECTION ARM (review round 20): `_claim_commit_time` also rejects `0?*`, because a
+        # leading-zero operand aborts `$(( now - ct ))` as OCTAL. Round 19 added the arm here and no case
+        # pinned it — a mutant that deletes it left the whole suite green.
+        ("committer a <a@b> 0999 +0000", None),
+        # ⛔ A BARE `0` IS ACCEPTED BY THE SHELL (its arm is `''|*[!0123456789]*|0?*` — `0?*` needs at
+        # least two characters), so a 1970 stamp is a real, reaped-as-ancient date and this reader must
+        # agree. Only `0` FOLLOWED BY DIGITS is the octal hazard.
+        ("committer a <a@b> 0 +0000", 0),
+    ]
+    for line, want in cases:
+        got = cl._commit_time(obj(line))
+        check(got == want, "%r -> %r (want %r), as the shell's anchored+12-digit rule does"
+              % (line, got, want))
+    # the header block still ends at the first blank line (a `committer` word in the BODY is content)
+    check(cl._commit_time(obj(ok, "committer a <a@b> 9999999999 +0000")) == 1700000000,
+          "a `committer`-shaped line in the BODY is not a header; got %r"
+          % (cl._commit_time(obj(ok, "committer a <a@b> 9999999999 +0000")),))
+    # ⛔ AND A LAST HEADER THAT IS PRESENT BUT UNUSABLE DOES NOT FALL BACK (review round 20,
+    # agent-infra#3203). `_claim_commit_time` reads `tail -n 1` of the matching lines and then rejects the
+    # OBJECT — it never considers an earlier `committer` line. A bounded `{1,12}` quantifier made
+    # `findall` skip the unusable line and return the FIRST one's stamp (measured: shell unmeasurable,
+    # this reader 1700000000).
+    # ⛔ TWO SHAPES THE ORACLE *DOES* MEASURE (review round 21): its `sed` matches per line with an
+    # UNBOUNDED run, so a LAST line whose SHAPE does not match (trailing space, 3-digit tz) is SKIPPED and
+    # an earlier valid line wins; and with NO blank line the `sed -n '/^$/q;p'` prints the WHOLE object.
+    # Round 20 refused both (8 of 64 combinations, all conservative). These pin the measured ones.
+    shape_bad_last = "committer a <a@b> 1700000000 +0000\ncommitter a <a@b> 1700000001 +0000 "
+    check(cl._commit_time(obj(shape_bad_last)) == 1700000000,
+          "a shape-broken LAST line is SKIPPED, so the earlier valid stamp wins; got %r"
+          % (cl._commit_time(obj(shape_bad_last)),))
+    tz_short = "committer a <a@b> 1700000000 +0000\ncommitter a <a@b> 1700000001 +000"
+    check(cl._commit_time(obj(tz_short)) == 1700000000,
+          "a 3-digit tz is a shape mismatch too; got %r" % (cl._commit_time(obj(tz_short)),))
+    no_blank = "tree " + "0" * 39 + "\ncommitter a <a@b> 1700000000 +0000\n"
+    check(cl._commit_time(no_blank) == 1700000000,
+          "with NO blank line the shell prints the whole object, so the stamp is still found; got %r"
+          % (cl._commit_time(no_blank),))
+    two = "committer a <a@b> 1700000000 +0000\ncommitter a <a@b> 1700000000000 +0000"
+    check(cl._commit_time(obj(two)) is None,
+          "a 13-digit LAST stamp makes the object UNMEASURABLE, not the first header's date; got %r"
+          % (cl._commit_time(obj(two)),))
+    two2 = "committer a <a@b> 1700000000 +0000\ncommitter a <a@b> 0999 +0000"
+    check(cl._commit_time(obj(two2)) is None,
+          "a leading-zero LAST stamp is unmeasurable too, not the first header's date; got %r"
+          % (cl._commit_time(obj(two2)),))
+    # and the NUL arm: bash deletes NULs before the sed, so a NUL inside the stamp FUSES into one
+    # (`\x00` consumes exactly two hex digits, so the two halves are concatenated explicitly.)
+    # ⛔ AND A FIRST LINE THAT IS EMPTY MAKES THE WHOLE OBJECT EMPTY TO THE ORACLE (review round 22,
+    # agent-infra#3203). `sed -n '/^$/q;p'` QUITS ON LINE 1 having printed nothing, so
+    # `_claim_commit_time` exits 1 and the claim is KEPT as unmeasurable. The old `partition("\n\n")`
+    # expression found no separator on this shape and scanned everything, inventing a stamp the shell
+    # refuses. (The shape is not pushable — `git push` rejects it and `fast-import` emits `tree` first —
+    # which is why it was P3: closed by construction, not by a live exploit.)
+    lead_blank = "\ncommitter a <a@b> 1700000000 +0000\n\nclaim owner=c lease_until=9999999999\n"
+    check(cl._commit_time(lead_blank) is None,
+          "a LEADING blank line makes the object unmeasurable to the shell; got %r"
+          % (cl._commit_time(lead_blank),))
+    # ...while a blank line AFTER headers still scopes to the headers (the sed prints them, then quits).
+    check(cl._commit_time(obj(ok)) == 1700000000,
+          "a normal object still measures (the takewhile must not over-scope); got %r"
+          % (cl._commit_time(obj(ok)),))
+    nul = "committer a <a@b> " + "17" + "\x00" + "0000000000" + " +0000"
+    check(cl._commit_time(obj(nul)) == 170000000000,
+          "a NUL inside the committer stamp fuses as bash deletes it; got %r"
+          % (cl._commit_time(obj(nul)),))
+
+
+@test("L10c a CR-fused claim reads UNPARSEABLE through read_pull itself (not just the extractor)")
+def l10c_cr_fused_through_read_pull():
+    # ⛔ THE PRODUCTION READ PATH, NOT THE EXTRACTOR (review round 16, agent-infra#3203). `L10` feeds
+    # `_owner_and_lease` a byte-faithful message read by the TEST, so a SUT whose own git read used
+    # `text=True` (universal newlines) would still pass: that read is where the CR was being decoded as
+    # a LINE BREAK, while `_lease_of` DELETES CRs (`tr -d '\r'`) and therefore sees one fused, invalid
+    # token. `read_pull` is the path the fleet actually takes, so the polarity is pinned THERE.
+    fused = "1\rlease_until=9999999999"   # shell: `lease_until=1lease_until=9999999999` -> not a token
+    with bare_remote([("refs/claims/9-bbbbbbbbbbbb", "peerbox:1", fused)]) as remote:
+        cr = cl.read_pull(remote, host=HOST, now=NOW_S)
+    check(cr.readable is True and len(cr.claims) == 1, "one claim is read; got %r" % (cr.claims,))
+    c = cr.claims[0]
+    check(c.lease_state == "unknown",
+          "a CR-fused term is UNPARSEABLE, exactly as the shell reads it; got %s (until %r)"
+          % (c.lease_state, c.lease_until))
+    v = liv.evaluate(cl.to_evidence(cr, now_ms=NOW_S * 1000))
+    check(v.state == "unknown", "and the fleet verdict is an abstention; got %s/%s" % (v.state, v.reason))
+
+
+@test("L10b the EXTRACTOR takes the FIRST claim line, as _lease_of does, and the LAST committer header")
+def l10b_first_line_and_last_header():
+    # A claim commit carries ONE `claim …` line; a second one is peer-planted junk. `_lease_of` reads
+    # the FIRST (it pipes both extractions through `head -n 1`), so this reader must too: with
+    # `lease_until=9999999999` on line 1 and `lease_until=1` on line 2, the shell says LIVE and a
+    # last-match reader says `expired` — i.e. FREE for a claim nobody may steal (review round 11).
+    # ⛔ DISTINCT OWNERS PER LINE (review round 19, agent-infra#3203): with `owner=peerbox` on BOTH
+    # lines, a last-match-wins reader produced the same answer and this assertion could not see the
+    # defect it names — measured GREEN under that mutant.
+    msg = ("claim owner=peerbox lease_until=9999999999 nonce=1\n"
+           "claim owner=otherbox lease_until=1 nonce=2")
+    owner, lease = cl._owner_and_lease(msg)
+    check((owner, lease) == ("peerbox", "9999999999"),
+          "the FIRST claim line wins, as in the shell; got %r" % ((owner, lease),))
+    msg2 = ("claim owner=peerbox lease_until=9999999999 nonce=1\n"
+            "claim owner=otherbox lease_until=1 nonce=2")
+    check(cl._owner_and_lease(msg2) == ("peerbox", "9999999999"),
+          "a full second `claim …` line does not contribute either field; got %r"
+          % (cl._owner_and_lease(msg2),))
+    # and GIT's rule for a duplicated header: the LAST one dates the commit (claims.sh: tail -n 1).
+    obj = ("tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\n"
+           "author a <a@b> 1 +0000\n"
+           "committer a <a@b> 1 +0000\n"
+           "committer a <a@b> 1793962674 +0000\n"
+           "\nbody\n")
+    check(cl._commit_time(obj) == 1793962674,
+          "the LAST committer header is the commit's date, as git and claims.sh read it; got %r"
+          % (cl._commit_time(obj),))
+    # and the SAME FIELD TWICE ON ONE LINE: both layers take the FIRST token (review round 12).
+    # ⛔ AND THE FIRST-LINE RULE ITSELF (review round 13): the shell reads line 1 ONLY, so a lease
+    # token on line 2 is not the claim's term — it is an ABSTENTION. A whole-body scan published
+    # `expired` for exactly this shape, i.e. FREE, and that is what `merge-reminder` feeds to its
+    # `decide()` as a PASSING claim gate.
+    # ⛔ AND THE DATUM MUST NOT BE EXPLAINED BY THE WORDBOUNDARY (review round 19): `\nlease_until=1`
+    # puts the token at a LINE START, where `(?<![^ \t])` refuses it whether or not the first-line rule
+    # exists — so the pre-round-13 whole-body mutant stayed GREEN on it. The discriminating datums are a
+    # full SPACE-PRECEDED token on line 2, in both the bare and the `claim …` form.
+    for later in ("lease_until=1", "claim owner=otherbox lease_until=1 nonce=2"):
+        two_lines = "claim owner=peerbox nonce=1\n" + later
+        check(cl._owner_and_lease(two_lines) == ("peerbox", "0"),
+              "a lease token on a LATER line (%r) is not the claim's term; got %r"
+              % (later, cl._owner_and_lease(two_lines)))
+    check(cl.parse_lease(cl._owner_and_lease(two_lines)[1], NOW_S)[1] == "unknown",
+          "so the reader stays in the abstention, never `expired`")
+    # ⛔ AND A UNICODE SPACE IS NOT A WORD BOUNDARY (review round 14): `_lease_of` splits on
+    # space/TAB only, so an NBSP between the fields makes ONE word to the shell — no `lease_until=`
+    # field, i.e. the ABSTENTION — while Python's `\s`/`(?<!\S)` treated it as a boundary and
+    # published `expired` = FREE.
+    nbsp = "claim owner=peerbox:9\u00a0lease_until=1 nonce=x"
+    check(cl._owner_and_lease(nbsp)[1] == "0",
+          "an NBSP-separated field is not a field to the shell, so not to this reader; got %r"
+          % (cl._owner_and_lease(nbsp),))
+    check(cl.parse_lease(cl._owner_and_lease(nbsp)[1], NOW_S)[1] == "unknown",
+          "and the reader stays in the abstention")
+    # a token the shell's word-anchoring would not accept either
+    check(cl._owner_and_lease("claim owner=peerbox xlease_until=1 nonce=y") == ("peerbox", "0"),
+          "a mid-word token is not a field, as in the shell")
+    twice = "claim owner=peerbox lease_until=9999999999 lease_until=1 nonce=x"
+    check(cl._owner_and_lease(twice) == ("peerbox", "9999999999"),
+          "a repeated on-line token resolves to the FIRST, as the shell does; got %r"
+          % (cl._owner_and_lease(twice),))
+    obj2 = obj.replace("committer a <a@b> 1793962674 +0000\n", "")
+    check(cl._commit_time(obj2) == 1, "and a single header is simply that header")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1049,6 +1353,47 @@ def l24_origin_without_repo_is_usage():
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# L33 — resolving `origin` from a NON-UTF-8 `remote.origin.url` is a VERDICT, not a traceback
+# ══════════════════════════════════════════════════════════════════════════
+@test("L33 a non-UTF-8 `remote.origin.url` yields an abstention verdict, never a UnicodeDecodeError")
+def l33_non_utf8_remote_url_is_a_verdict():
+    # ⛔ THE LAST `text=True` SITE (review rounds 21–22, agent-infra#3203). `_resolve_remote` read the
+    # resolved URL with `_git` — `text=True`, no `errors=` — so a byte the UTF-8 decoder cannot handle
+    # (`0xff`) raised `UnicodeDecodeError` straight OUT of the reader: exit 1, no verdict at all, from a
+    # value git accepts verbatim in `.git/config`. The contract everywhere else in this tool is an
+    # abstention, and an abstention is a VERDICT (exit 2/3), so this pins the polarity through the CLI.
+    # The URL is LOCAL (the caller's own config), which is why this is the last site rather than the
+    # first — but "local" is not "trusted": `git clone` writes whatever the remote advertises.
+    with bare_remote() as remote, work_repo(remote) as work:
+        cfg_path = os.path.join(work, ".git", "config")
+        with open(cfg_path, "rb") as fh:
+            cfg = fh.read()
+        bad = os.fsencode(remote).rstrip(b"\n")
+        check(bad in cfg, "fixture: the origin URL must be in .git/config as raw bytes")
+        with open(cfg_path, "wb") as fh:
+            fh.write(cfg.replace(bad, b"file:///tmp/\xff-not-utf8.git", 1))
+        try:
+            got = cl._resolve_remote("origin", work, 5.0)
+        except cl.UsageError:
+            got = None          # an abstention at the unit is fine too; both are verdicts
+        except UnicodeDecodeError as exc:
+            raise Failure("a non-UTF-8 remote URL escaped as UnicodeDecodeError: %s" % (exc,))
+        check(got is None or isinstance(got, str),
+              "the unit must answer a str or abstain \u2014 never raise out of the decoder; got %r" % (got,))
+        # ⛔ THE CONTRACT IS AT THE CLI, because that is where the contract lives: `_git_bytes` decodes
+        # with `errors="replace"`, so the URL comes back with U+FFFD in it and the FETCH then fails —
+        # a verdict (rc 3, "not answerable"), with no traceback. The pre-fix form (`_git`, `text=True`,
+        # no `errors=`) raised UnicodeDecodeError one frame earlier: rc 1 and a `Traceback` on stderr,
+        # which is indistinguishable from a bug in this tool.
+        proc = _cli(["--remote-url", "origin", "--repo", work, "--pr", "5"])
+        check(proc.returncode in (2, 3),
+              "the CLI must exit 2 (usage) or 3 (unanswerable), never 1 (a traceback); got %r"
+              % (proc.returncode,))
+        check("Traceback" not in proc.stderr and "UnicodeDecodeError" not in proc.stderr,
+              "no traceback may reach the operator; stderr was %r" % (proc.stderr[:200],))
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # L25 — `issue-<N>` shares the namespace and NEVER answers for a head
 # ══════════════════════════════════════════════════════════════════════════
 @test("L25 `issue-<N>` keys share the namespace and never answer for a head (#1784)")
@@ -1248,13 +1593,62 @@ def l27_snapshot_header_is_the_contract():
 # ══════════════════════════════════════════════════════════════════════════
 # L28 — CROSS-LANGUAGE PIN: the file claims.sh WRITES is the file this reads
 # ══════════════════════════════════════════════════════════════════════════
+@test("L29 a VT inside the OWNER field does not make the snapshot unreadable for every key")
+def l29_vt_in_owner():
+    # ⛔ THE SNAPSHOT READ WAS THE SAME TRAP (review round 17, agent-infra#3203). `read_snapshot` opened
+    # the file in text mode (`newline=None`) and split with `splitlines()`, which breaks on VT/FF/NEL/
+    # LS/PS/U+2028 — but the WRITER's owner comes from `_lease_of`'s space/TAB word split, so it can
+    # legitimately CONTAIN one. One peer-minted claim then shifted every line's field count and the
+    # whole snapshot read `unreadable` for ALL keys on the box (measured: "expected 3 tab-separated
+    # fields, got 2"). Fail-closed, but one bad row must not blind the registry.
+    d = tempfile.mkdtemp(prefix="snap-vt-")
+    try:
+        f = os.path.join(d, "snapshot.tsv")
+        # ⛔ THE SEPARATOR MUST BE **TRAILING** TOO (review round 18, agent-infra#3203): the round-17
+        # fixture put the VT in the MIDDLE (`c\x0b1`), where a bare `.strip()` changes nothing, so it
+        # discriminated `splitlines()` but not the trim — the exact defect round 17 fixed one file away.
+        # Each field gets a row whose separator is at its END, which is the shape `.strip()` repairs.
+        rows = [
+            ("refs/claims/9-bbbbbbbbbbbb", "c\x0b1", "9999999999"),      # interior (round 17)
+            ("refs/claims/9-bbbbbbbbbbbb\x0b", "c", "9999999999"),       # trailing ref
+            ("refs/claims/9-bbbbbbbbbbbb", "c\x0b", "9999999999"),       # trailing owner
+            ("refs/claims/9-bbbbbbbbbbbb", "c", "9999999999\x0b"),       # trailing lease
+            ("refs/claims/9-bbbbbbbbbbbb", "c", "9999999999\u00a0"),
+            ("refs/claims/9-bbbbbbbbbbbb", "c", "9999999999\u2003"),
+        ]
+        with open(f, "w", encoding="utf-8") as fh:
+            fh.write("#claim-snapshot\t%d\tok\t%d\n" % (NOW_S, len(rows)))
+            for r, o, u in rows:
+                fh.write("%s\t%s\t%s\n" % (r, o, u))
+        cr = cl.read_snapshot(f, host=HOST, max_age_s=3600, now=NOW_S)
+        check(cr.readable is True, "a separator is CONTENT, not a line break; got %r"
+              % (cr.detail,))
+        check(len(cr.claims) == len(rows), "every row survives; got %r"
+              % ([c.ref for c in cr.claims],))
+        check([c.ref for c in cr.claims] == [r for r, _o, _u in rows],
+              "every refname is kept VERBATIM (a trailing separator is not trimmed away); got %r"
+              % ([c.ref for c in cr.claims],))
+        check([c.owner for c in cr.claims] == [o for _r, o, _u in rows],
+              "every owner is kept VERBATIM; got %r" % ([c.owner for c in cr.claims],))
+        # and the FIELD that decides free-or-not: a lease with a TRAILING separator is not a term (the
+        # first three rows carry a clean `9999999999`, which is genuinely LIVE — the ref/owner
+        # separators must not disturb it, which is the other half of the property).
+        want_state = ["live", "live", "live", "unknown", "unknown", "unknown"]
+        check([c.lease_state for c in cr.claims] == want_state,
+              "a lease with a trailing non-ASCII separator is UNPARSEABLE, and a separator in the "
+              "ref/owner does not disturb a clean term; want %r got %r"
+              % (want_state, [c.lease_state for c in cr.claims]))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
 @test("L28 the SHIPPED claim_snapshot's output reads back here (#2534 review P1)")
 def l28_shell_written_snapshot_reads_back():
     """The only pin that makes this class self-identifying: run the real writer.
 
     Every fixture in this file is hand-written, so it can drift from the shape the shell
     actually publishes — which is exactly how a 4-field header shipped past a 3-field
-    reader with this suite 26/26 green. Here the bytes come from `claim_snapshot` itself.
+    reader with this suite 36/36 green. Here the bytes come from `claim_snapshot` itself.
     """
     live_until = int(time.time()) + 1800
     with bare_remote([("refs/claims/5-abcdef123456", "%s:1" % OTHER_HOST, str(live_until))]) as remote:
@@ -1401,11 +1795,119 @@ MUTATIONS = [
     ),
     Mutation(
         "L10", "reader",
+        # The anchor is the SHIPPED guard, and it must stay a CONTIGUOUS substring of the source: the
+        # round-19 comment block sits between these lines and the final return, so the mutation replaces
+        # only the guard (the code after it becomes dead, which is what "no guard" means here).
         '    _headers, sep, body = (obj or "").partition("\\n\\n")\n'
-        '    return body.replace("\\r", "") if sep else ""',
+        '    if not sep:\n'
+        '        return ""',
         '    return (obj or "").replace("\\r", "")',
         "the commit HEADERS are parsed as if they were the message, so a header supplies "
         "owner=/lease_until= and the reader disagrees with claims.sh about one lease",
+    ),
+    # ── the tests THIS CHANGE added (agent-infra#3203). The file's contract is that every mutation
+    # re-introduces the defect its paired test exists to catch; without these entries seven new
+    # assertions had no recorded defect, which is how an assertion becomes vacuous unnoticed.
+    Mutation(
+        "L10b", "reader",
+        '        if _cand.strip(" \\t"):\n            line = _cand\n            break',
+        '        if _cand.strip(" \\t"):\n            line = _cand\n            continue',
+        "the reader SCANS PAST the first non-empty line (the pre-round-13 whole-body read), so a lease "
+        "token on a later line becomes the claim's term \u2014 `expired` where the shell ABSTAINS",
+    ),
+    Mutation(
+        "L10b", "reader",
+        '    u = re.findall(r"(?<![^ \\t])lease_until=([0-9]+)(?=[ \\t]|$)", line)',
+        '    u = re.findall(r"lease_until=([0-9]+)", line)',
+        "the lease token loses its WORD anchoring, so `xlease_until=1` is read as a field the shell "
+        "ignores \u2014 a term invented from a word nobody wrote",
+    ),
+    Mutation(
+        "L33", "reader",
+        '        rc, out, _err, failure = _git_bytes(["-C", repo, "remote", "get-url", "origin"], timeout)',
+        '        rc, out, _err, failure = _git(["-C", repo, "remote", "get-url", "origin"], timeout)',
+        "the resolved URL is decoded with `text=True` and no `errors=`, so a non-UTF-8 "
+        "`remote.origin.url` raises UnicodeDecodeError out of the reader \u2014 exit 1, no verdict",
+    ),
+    Mutation(
+        "L10c", "reader",
+        '    crc, cout, _cerr, cfail = _git_bytes(["-C", tmp, "cat-file", "commit", sha_hex], timeout)',
+        '    crc, cout, _cerr, cfail = _git(["-C", tmp, "cat-file", "commit", sha_hex], timeout)',
+        "the object is decoded with universal newlines, so a lone CR becomes a LINE BREAK and the "
+        "reader takes the first line's term \u2014 FREE for a claim the shell fuses into one invalid token",
+    ),
+    Mutation(
+        "L10d", "reader",
+        '    for line in out.split("\\n"):',
+        '    for line in out.splitlines():',
+        "`ls-remote` is split on Unicode line boundaries, so a legal refname carrying U+2028 surfaces "
+        "as a claim at the CANONICAL key \u2014 a phantom held",
+    ),
+    Mutation(
+        "L10d", "reader",
+        '        sha_hex, ref = parts[0].strip(" \\t"), parts[1].strip(" \\t")',
+        '        sha_hex, ref = parts[0].strip(), parts[1].strip()',
+        "the refname is Unicode-trimmed, so `refs/claims/<pr>-<sha12><U+2028>` collapses onto the "
+        "canonical key \u2014 a claim at a ref nobody pushed",
+    ),
+    Mutation(
+        "L29", "reader",
+        '    for lineno, raw in enumerate(text.split("\\n"), 1):',
+        '    for lineno, raw in enumerate(text.splitlines(), 1):',
+        "the SNAPSHOT is split on Unicode line boundaries, so a VT/LS inside the writer's OWNER field "
+        "(legal: `_lease_of` splits on space/TAB only) makes every row SHAPE DRIFT \u2014 the whole "
+        "registry unreadable for every key on the box",
+    ),
+    Mutation(
+        "L29", "reader",
+        '        claims.append(_row(ref.strip(" \\t"), owner.strip(" \\t"), raw_until.strip(" \\t"),',
+        '        claims.append(_row(ref.strip(), owner.strip(), raw_until.strip(),',
+        "the snapshot fields are Unicode-trimmed, so a lease with a TRAILING separator becomes a pure "
+        "digit string and reads as a real (expired) term \u2014 FREE",
+    ),
+    Mutation(
+        "L30", "reader",
+        '_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}$", re.M)',
+        '_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}[ \\t]*$", re.M)',
+        "the committer stamp is accepted with trailing whitespace and any length, so an object the "
+        "oracle calls UNMEASURABLE is dated here and the bounded reap is measured from a guess",
+    ),
+    Mutation(
+        "L30", "reader",
+        '    head = "\\n".join(itertools.takewhile(lambda _l: _l != "", text.split("\\n")))',
+        '    head = text.partition("\\n\\n")[0] if "\\n\\n" in text else text',
+        "the scope is `partition` rather than `sed -n '/^$/q;p'`, so an object whose FIRST line is empty "
+        "is scanned whole \u2014 a stamp the oracle refuses (an unmeasurable age read as measurable)",
+    ),
+    Mutation(
+        "L30", "reader",
+        '    m = _COMMITTER_TIME_RE.findall(head)',
+        '    m = _COMMITTER_TIME_RE.findall(text)',
+        "the reader scans the WHOLE object, so a `committer`-shaped line in the peer-writable "
+        "MESSAGE supplies the age \u2014 the oracle's `sed -n '/^$/q;p'` never looks there",
+    ),
+    Mutation(
+        "L30", "reader",
+        '    if m[-1].startswith("0") and len(m[-1]) > 1:\n'
+        '        return None',
+        '    if False:\n'
+        '        return None',
+        "the leading-zero arm is deleted, so a peer-writable `0000009999` stamp becomes a 1970 date "
+        "here while the oracle calls the age UNMEASURABLE",
+    ),
+    Mutation(
+        "L31", "reader",
+        '    m = _OWNER_RE.match((owner or "").strip(" \\t"))',
+        '    m = _OWNER_RE.match((owner or "").strip())',
+        "the owner is Unicode-trimmed, so `boxA:7<U+2028>` parses as a real owner (a label invented "
+        "from a value nobody wrote)",
+    ),
+    Mutation(
+        "L32", "reader",
+        '    return body.replace("\\x00", "").replace("\\r", "")',
+        '    return body.replace("\\r", "")',
+        "NUL bytes are carried instead of deleted, so `lease_until=1<NUL>lease_until=<live>` reads as "
+        "TWO words and the first is taken \u2014 FREE, where bash's `$( )` fuses them into one invalid token",
     ),
     Mutation(
         "L11", "reader",
@@ -1416,7 +1918,7 @@ MUTATIONS = [
     ),
     Mutation(
         "L12", "reader",
-        '    rc, out, err, failure = _git(["ls-remote", url, "%s/*" % ns], timeout)',
+        '    rc, out, err, failure = _git_bytes(["ls-remote", url, "%s/*" % ns], timeout)',
         '    rc, out, err, failure = _git(\n'
         '        ["-C", repo or ".", "for-each-ref", "--format=%(objectname)\\t%(refname)", ns], timeout)',
         "the LOCAL ref space is read, so a stale local claim decides instead of the registry",
