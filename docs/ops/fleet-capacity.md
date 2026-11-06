@@ -722,17 +722,63 @@ above) and the same box reports its real slots and can restart its real registra
   arming it (which boxes, which interval) is an operator decision, and this change deliberately does
   not self-arm a timer.
 
-`status --all` is scoped to **this box**: nothing in this repo reports runners **per cell** —
-`capacity.sh`'s probe knows host, cores, load, lanes and disk/memory and **nothing about runners**, and
-neither does the fleet inventory. Nor does any tool list the GitHub-side registry:
-`scripts/ci_runner_gate.sh --status` prints only the gate's mode (`mode=… repo=…`) and counts
-`ubuntu-latest` runners without naming them. The per-cell runner report #2373's clause 2 words is **not**
-delivered by this change; the registry itself is only readable directly, e.g.
-`gh api repos/<owner/name>/actions/runners --jq '.runners[] | {name, status, busy}'`. Within this box the
-table is complete, so a runner this box registered and
-then lost the local evidence for is not in the table — that is why an add whose listener fails keeps
-its `.runner` and says so. `--all` widens nothing: the default view already lists every runner on this
-box, and the flag exists because #2373's clause names it.
+`status --all` is scoped to **this box** — `capacity.sh`'s probe knows host, cores, load, lanes and
+disk/memory and **nothing about runners**, and neither does the fleet inventory. `--all` widens
+nothing: the default view already lists every runner on this box, and the flag exists because #2373's
+clause names it. Within this box the table is complete, so a runner this box registered and then lost
+the local evidence for is not in the table — that is why an add whose listener fails keeps its
+`.runner` and says so.
+
+### 8a. The CROSS-CELL report — `scripts/ci_runner_fleet.sh` (#2429)
+
+One command for the question clause 2 actually asks, which needs **two sources reconciled, never
+summed**: the LOCAL pool on each box (the only place a **dead listener** is visible — a registration
+that is still valid on GitHub and serving no work) and GitHub's registry (the only place a
+registration that **lost its box** is visible — a `/tmp` wipe leaves registrations with no local
+evidence, and a hand-added runner can have a listener with no registration).
+
+```bash
+bash scripts/ci_runner_fleet.sh                     # every running box, per cell, reconciled
+bash scripts/ci_runner_fleet.sh --root /opt         # when a box's installs are all under one parent
+bash scripts/ci_runner_fleet.sh --box pi-cell-3     # one cell (a label the roster does not carry is a
+                                                   # refusal, never a smaller fleet)
+```
+
+It is an **aggregator, not a second probe**: it runs `ci_runner_pool.sh status` ON each cell over the
+fleet's exec transport (`cmux vm exec`) and parses the machine-readable block that tool already
+prints, so the four facts (#2373 clause 2) come from the box itself. Output is one line per cell
+(`cell label=… read=ok host=… ncpu=… ceiling=… slots=… mem_available_mb=… floor_mb=… live=… dead=…`),
+one line per runner (`runner cell=… name=… github_name=… listener=… local=live|DEAD|ORPHANED github=online|offline|ABSENT … verdict=…`), then `registry-unclaimed` / `name-collision` / `summary`.
+
+⛔ **The claim key is the `github_name`** (the agentName in `.runner`), never the instance directory —
+measured on `pi-cell-5`, directory `gh-runner-x64-2` carries agentName `pi-runner-c5-x64-2`, so
+matching on the directory reports a healthy runner as BOTH unregistered and a phantom.
+
+⛔ **Fail-closed, per cell (#2429 clause 3).** A cell whose pool cannot be read reports
+`read=cannot-measure why=…` — never `0 runners`, the class #2381 closed one layer down. The same holds
+for the registry (an unreadable registry is not an empty one) and for **attribution**: a registry name
+no cell claims is a phantom only when **every** requested cell was measured; while one is unread, it is
+`cannot-attribute`, because that registration may be serving jobs on the box nobody could read. Exit
+`0` all measured and agreed · `2` cannot measure (outranks 3) · `3` measured with a named defect.
+
+⚠️ **The transport is the current blocker, and it is not this tool's:** measured 2026-11-06 from
+`pi-cell-5`, `cmux vm exec <peer> -- hostname` fails for every peer (`no known daemon matches this
+route; connect with an invitation`) while `cmux vm ls` prints `running reachable linked` —
+**[#2345](https://github.com/daniel-ospina/agent-infra/issues/2345)**, whose own comments record that
+the `--carrier` mode connects fine and the `vm exec` link path simply never spends it. So on the fleet
+as it stands the report returns `cannot-measure` for every cell and exits 2: the honest reading, and
+clause 3 behaving correctly from day one. The transport is a seam (`RUNNER_FLEET_EXEC`), so the
+one-line #2345 fix lands there without touching the aggregation, attribution or exit contract. The
+tool is NOT allowed to route around it with a hand-rolled `--carrier` socket (AGENTS "Fix Broken
+Infrastructure"); its suite proves the aggregation and the reconciliation hermetically
+(`scripts/ci_runner_fleet.test.sh`), with three mutants keeping the measured gate, the attribution
+guard and the claim key honest.
+
+⚠️ Two smaller residuals, stated: the tool reads every cell **through** the transport, including the
+box it runs on (use `ci_runner_pool.sh status` for that one); and `RUNNER_FLEET_ROOTS` exists because a
+box whose installs sit under `/opt` must be read with `RUNNER_ROOT=/opt` while one under
+`/tmp/actions-runner` must not — the tool retries ONCE from the `outside=` list a `pool-root-incomplete`
+refusal names, and leaves a two-parent ambiguity unmeasured rather than picking a root.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
 message names) · 3 REFUSED, nothing changed — `add`: a gate verdict (floor/ceiling); `restart`: no

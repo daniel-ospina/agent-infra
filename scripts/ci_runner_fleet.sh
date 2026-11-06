@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# ci_runner_fleet.sh — ONE command that reports the CI runner pool PER CELL, and RECONCILES the two
+# sources that can see it (agent-infra#2429; #2373 clause 2).
+#
+# WHY THIS EXISTS
+#   #2373 clause 2 asks for "a `runner-ctl status --all` that reports per-cell: registered names,
+#   listener count, live/offline, and the memory reading". #2381 delivered those four facts FOR THE
+#   BOX THE TOOL RUNS ON (`ci_runner_pool.sh status`), and said so plainly: "nothing in this repo
+#   reports runners per cell". So a capacity decision still needed one session per cell — which is
+#   exactly the hand-read sequence that produced #2373 (measured 2026-10-22: the pool went 6 -> 12
+#   online entirely by hand, and two runners GitHub showed OFFLINE had DEAD LISTENERS).
+#
+# ⛔ THE per-box TOOL IS THE SUBSTRATE — THIS IS THE AGGREGATOR, NOT A SECOND PROBE. #2381's `status`
+#   output is documented as deliberately machine-readable (`host=… ncpu=… ceiling=… slots=…
+#   mem_available=… floor=…`, one `<name> <listener> <state> <github_name>` row per registration, then
+#   a `summary …` line) precisely so a cross-cell reader can aggregate it instead of re-implementing
+#   the probe. Nothing here re-derives a listener, a slot count or a memory reading: those come from
+#   the cell's own `ci_runner_pool.sh`, run ON the cell.
+#
+# ⛔ TWO SOURCES, RECONCILED — NEVER SUMMED (#2429 clause 2). They disagree in BOTH directions and
+#   neither is a superset of the other:
+#     * the LOCAL view (`$RUNNER_ROOT` on the box) is the only place a DEAD LISTENER is visible — a
+#       registration that is still perfectly valid on GitHub, serving no work;
+#     * GitHub's registry (`gh api …/actions/runners`) is the only place a registration that LOST ITS
+#       BOX is visible — a `/tmp` wipe leaves registrations on GitHub with no local evidence at all,
+#       and a hand-added runner can have a listener with no registration.
+#   So a "total" that adds them double-counts, and a total that takes either alone is silently missing
+#   one of the two failure classes. A local row is therefore CLAIMED BY ITS `GITHUB_NAME` — the
+#   agentName in the instance's `.runner`, which is the identity GitHub knows and is NOT the instance
+#   directory's basename (measured on `pi-cell-5`: dir `gh-runner-x64-2` carries agentName
+#   `pi-runner-c5-x64-2`; matching on the directory name would report a healthy runner as a phantom).
+#
+# ⛔ FAIL-CLOSED ON AN UNREADABLE CELL (#2429 clause 3; the class #2381 closed per box). A cell whose
+#   pool cannot be read reports `cannot-measure` FOR THAT CELL — never "0 runners". #2381's incident was
+#   precisely an unlistable pool read as an empty one, which defused the ceiling. The same rule applies
+#   to the registry: an unreadable registry is `read=cannot-measure`, never "0 registrations". And it
+#   applies to ATTRIBUTION: a registry name no measured cell claims is a PHANTOM only when every
+#   requested cell was measured — while a cell is unmeasured that name may live there, so it is
+#   reported as `cannot-attribute`, not as a phantom.
+#
+# THE TRANSPORT (and the defect it currently meets)
+#   Reading a cell needs a channel; the fleet's is `cmux vm exec` (the same one `lane-artifacts.sh`
+#   pulls cell artifacts through). ⛔ MEASURED 2026-11-06 FROM `pi-cell-5`, and it is NOT this tool's
+#   bug: `cmux vm exec <peer> -- hostname` fails for EVERY peer with
+#       cmux: link to '<peer>' exited; see ~/.cmux/peer-links/<peer>.log
+#       cmux-tui: no known daemon matches this route; connect with an invitation
+#   while `cmux vm ls` prints `running reachable linked` for the same five boxes. That is
+#   agent-infra#2345 (P1-severe, open) — the `vm exec` link path does not spend the `--carrier` mode
+#   that DOES connect (its own comments record a successful `remote connect … --carrier` against the
+#   same peer). This tool is NOT allowed to route around it (AGENTS "Fix Broken Infrastructure"), so
+#   today it reports `read=cannot-measure why=transport-unreachable` for every cell and exits 2 — the
+#   honest state of the fleet, and exactly clause 3's behaviour, from the first day.
+#   `RUNNER_FLEET_EXEC` is the seam where the (one-line) #2345 fix — or the carrier recipe — lands,
+#   without touching the aggregation, attribution or exit contract below.
+#
+# USAGE   ci_runner_fleet.sh [--box LABEL]… [--root PATH] [--no-root-derive]   (see --help)
+#
+# EXIT  0 every requested cell measured, every row agreed, every registration claimed
+#       1 usage
+#       2 CANNOT MEASURE — a cell, the roster or a registry could not be read, so no verdict is
+#         claimed about what it holds (this OUTRANKS 3: a report that cannot see one cell cannot
+#         certify the rest)
+#       3 measured, and the report names a defect (a dead/orphaned listener, a tmpdir defect, a
+#         registration no cell claims, a local registration GitHub does not have, or a name claimed
+#         by two cells)
+set -uo pipefail
+
+SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SELF="$SELF_DIR/$(basename "${BASH_SOURCE[0]}")"
+
+# ── the fleet's ONE box inventory, and its ONE bounded-read helper ────────────────────────────────
+# `capacity.sh` is a library (its own header documents `. capacity.sh`), already sourced this way by
+# `ci_runner_pool.test.sh` and by `orch-loop.sh`. Reusing `cap_fleet_inventory` means this report
+# cannot disagree with the placement path about WHICH BOXES EXIST — a second parser of the provider's
+# JSON is how one instrument comes to read `expected=5` while another reads `expected=4`.
+CAPACITY_LIB="${CAPACITY_LIB:-$SELF_DIR/orchestrator-harness/capacity.sh}"
+if [ -r "$CAPACITY_LIB" ]; then
+  # shellcheck source=scripts/orchestrator-harness/capacity.sh
+  . "$CAPACITY_LIB" >/dev/null 2>&1 || true
+fi
+if ! declare -f cap_fleet_inventory >/dev/null 2>&1 || ! declare -f cap_bounded >/dev/null 2>&1; then
+  printf '%s\n' "ci_runner_fleet: cannot-measure why=capacity-lib-absent ($CAPACITY_LIB) — the box inventory and the bounded-read helper are the fleet's ONE copy; this report does not carry a second"
+  exit 2
+fi
+
+PROG="ci_runner_fleet"
+err() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+
+# ── seams ─────────────────────────────────────────────────────────────────────────────────────────
+# ⛔ THE ROSTER. `cmux vm list --json` via capacity.sh by default; an explicit roster when a host has no
+# provider CLI (a cell carries none in some images — capacity.sh says so by name), which is the same
+# precedence `cap_expected_boxes` applies. NEVER a default that silently shrinks to "the boxes I could
+# reach": that is the absence-reads-as-healthy defect (#3446).
+FLEET_BOXES="${RUNNER_FLEET_BOXES:-}"
+# ⛔ THE EXEC TEMPLATE, NOT A TRANSPORT IMPLEMENTATION. `{box}` is replaced by the box label and the
+# remote argv is APPENDED, so the #2345 fix (or the carrier recipe its own comments record) is a seam
+# change, not a rewrite of this file.
+# ⛔ TWO STEPS ON PURPOSE: `{box}` inside a `${VAR:-default}` word ends the parameter expansion at the
+# FIRST `}`, so the one-line form silently produced `cmux vm exec {box --}` — a template with no
+# `{box}` placeholder, which the runner then refused for every cell.
+FLEET_EXEC="${RUNNER_FLEET_EXEC:-}"
+[ -n "$FLEET_EXEC" ] || FLEET_EXEC='cmux vm exec {box} --'
+# ⛔ THE REGISTRIES. A cell carries installs registered into MORE THAN ONE repo — MEASURED 2026-11-06
+# on `pi-cell-5`: `/opt/gh-runner-*` carry agentNames registered in `daniel-ospina/tortoise` while
+# `/opt/ai-runner-cell5-*` carry names registered in `daniel-ospina/agent-infra`. A single-repo default
+# would report every install of the other repo as `unregistered` — i.e. as a defect — on a healthy box.
+FLEET_REPOS="${RUNNER_FLEET_REPOS:-daniel-ospina/tortoise daniel-ospina/agent-infra}"
+FLEET_TIMEOUT="${RUNNER_FLEET_TIMEOUT:-60}"          # per box, and per registry page walk
+FLEET_GH="${RUNNER_FLEET_GH:-gh}"
+FLEET_ROOT="${RUNNER_FLEET_ROOT:-}"                  # RUNNER_ROOT for every box ('' = the box's own)
+FLEET_ROOTS="${RUNNER_FLEET_ROOTS:-}"                # per-box map: "label=/path label=/path"
+ROOT_DERIVE=1                                        # retry from the refusal's own `outside=` list
+ONLY_BOXES=""
+
+usage() {
+  local rc="${1:-1}"
+  cat >&2 <<'EOF'
+usage: ci_runner_fleet.sh [report] [options]
+
+  One line per cell, then one line per runner, reconciled against GitHub's registry.
+  THE REPORT IS ON STDOUT (machine-readable, one fact per line); diagnostics are on stderr.
+
+  --box LABEL        report only this cell (repeatable). A label the roster does not carry is a
+                     CANNOT MEASURE, never a silently smaller fleet (exit 2).
+  --root PATH        set RUNNER_ROOT on EVERY cell (default: each cell's own).
+  --no-root-derive   do not retry a cell whose pool read was refused as
+                     `cannot-measure why=pool-root-incomplete` using the parents of the directories
+                     that refusal NAMED. Use when a root is pinned deliberately and must not move.
+  -h, --help         this text.
+
+  Report lines:
+    registry repo=<name> read=ok runners=…            | read=cannot-measure why=… detail=…
+    cell     label=… read=ok host=… ncpu=… ceiling=… slots=… mem_available_mb=… floor_mb=…
+             live=… dead=… orphaned=… quarantine=… registrations=… tmpdir_defects=… rc=…
+    cell     label=… read=cannot-measure why=… detail=…     (ONE line per requested cell, ALWAYS)
+    cell-note label=… root_derived=…                        (a retry that succeeded)
+    runner   cell=… name=… github_name=… listener=… local=… github=… busy=… registry=… verdict=…
+             verdict ∈ ok | dead-listener | orphaned | tmpdir-missing | quarantine |
+                       github-offline | unregistered
+    registry-unclaimed name=… registry=… status=… reason=no-measured-cell-claims-it
+                                                        | cannot-attribute(<N>-cell-unmeasured)
+    name-collision name=… cells=…
+    summary  cells=… measured=… unmeasured=… registry=… claimed=… unclaimed=… unregistered=…
+             disagreements=… collisions=… not_ok=…
+
+  Seams: RUNNER_FLEET_BOXES (explicit roster), RUNNER_FLEET_EXEC (exec template, `{box}` substituted),
+  RUNNER_FLEET_REPOS (registry repos), RUNNER_FLEET_ROOT / RUNNER_FLEET_ROOTS (RUNNER_ROOT per fleet /
+  per cell), RUNNER_FLEET_TIMEOUT (per-read bound, seconds), RUNNER_FLEET_GH (gh binary), CAPACITY_LIB.
+EOF
+  exit "$rc"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    report) shift ;;
+    --box)  [ "$#" -ge 2 ] || usage
+            case "$2" in ''|-*) err "--box needs a label"; usage ;; esac
+            ONLY_BOXES="$ONLY_BOXES $2"; shift 2 ;;
+    # ⛔ THE ROOT IS INLINED INTO THE REMOTE SNIPPET, so it is validated HERE, against a charset that
+    # cannot carry a quote, a space or a `$`: a value outside it is a usage error, not a remote word.
+    --root) [ "$#" -ge 2 ] || usage
+            case "$2" in *[!A-Za-z0-9._/-]*|'') err "--root '$2' is not a plain path (allowed: A-Za-z0-9._/-)"; usage ;; esac
+            FLEET_ROOT="$2"; shift 2 ;;
+    --no-root-derive) ROOT_DERIVE=0; shift ;;
+    -h|--help) usage 0 ;;
+    *) err "unknown argument '$1'"; usage ;;
+  esac
+done
+
+TMPD="$(mktemp -d "${TMPDIR:-/tmp}/ci-runner-fleet.XXXXXX")" || { err "cannot-measure why=tmpdir"; exit 2; }
+trap 'rm -rf "$TMPD" 2>/dev/null' EXIT
+trap 'exit 143' TERM INT HUP
+
+# ── the remote probe ─────────────────────────────────────────────────────────────────────────────
+# ⛔ ONE argv WORD, and `@ROOT@` is a SUBSTITUTION, never an eval: the snippet travels as a single
+# quoted argument through `cmux vm exec`, so it is a program for the peer's shell, not a re-parse of
+# our argv. It searches the documented clone locations because a cell's tree is NOT at this box's
+# path (`/tmp/cell-ai` is the canonical cell clone); a box with none of them says so BY NAME.
+read -r -d '' PROBE_TMPL <<'SH' || true
+@ROOT@
+for d in /tmp/cell-ai "$HOME/agent-infra" /home/cmux/agent-infra; do
+  [ -f "$d/scripts/ci_runner_pool.sh" ] || continue
+  cd "$d" || exit 2
+  exec bash scripts/ci_runner_pool.sh status
+done
+echo "cannot-measure why=pool-tool-absent searched=/tmp/cell-ai:\$HOME/agent-infra:/home/cmux/agent-infra" >&2
+exit 2
+SH
+
+probe_for_root() {  # <root|''> -> the snippet, with the root exported (or nothing)
+  local pre="" snip="$PROBE_TMPL"
+  [ -n "$1" ] && pre="RUNNER_ROOT='$1'; export RUNNER_ROOT"
+  printf '%s' "${snip//@ROOT@/$pre}"
+}
+
+# ── reading one cell ─────────────────────────────────────────────────────────────────────────────
+# exec_box <label> <snippet> -> combined stdout+stderr of the remote probe; rc is the REMOTE rc
+# (cap_bounded normalises a timeout to 124). ⛔ STDERR IS MERGED ON PURPOSE: the pool tool prints
+# `cannot-measure …` / `defect …` on stderr and its rows on stdout, and `cmux vm exec`'s own refusal
+# arrives on stderr — a reader that kept the streams apart would have to guess which side a failure
+# took, and the transport failure IS the diagnostic that has to be printed.
+# ⛔ STDIN IS /dev/null: the real `cmux vm exec` READS THE CALLER'S STDIN (measured; `lane-artifacts`
+# models it), and this reporter drives the call from inside a `while read` over the roster — a
+# transport that ate that stream would silently shorten the fleet.
+exec_box() {
+  local box="$1" snip="$2" have=0 tok
+  local -a argv=()
+  # shellcheck disable=SC2086
+  for tok in $FLEET_EXEC; do
+    case "$tok" in '{box}') argv[${#argv[@]}]="$box"; have=1 ;; *) argv[${#argv[@]}]="$tok" ;; esac
+  done
+  [ "$have" = 1 ] || { printf 'cannot-measure why=exec-template-without-box (RUNNER_FLEET_EXEC=%s)\n' "$FLEET_EXEC"; return 2; }
+  argv[${#argv[@]}]="sh"
+  argv[${#argv[@]}]="-lc"
+  argv[${#argv[@]}]="$snip"
+  cap_bounded "$FLEET_TIMEOUT" sh -c 'exec "$@" 2>&1' _ "${argv[@]}" </dev/null
+}
+
+# BOX_AWK — the per-box block reader. Input: the remote probe's combined output. Output: the three
+# line kinds this report aggregates (`K|…` per box, `R|…` per registration, `Q|…` per non-registration
+# row). ⛔ IT IS THE ONLY PARSER: the row grammar it must survive is #2381's (fixed-width
+# NAME/LISTENER/STATE/GITHUB_NAME), and it classifies by the STATE TOKEN rather than a byte offset,
+# because the QUARANTINE rows carry prose in the fourth column and a width-based read would put that
+# prose in `github_name` and report a retired install as an unregistered runner.
+BOX_AWK='
+function tok(name,   i, kv) {
+  for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == name) return kv[2] }
+  return ""
+}
+/^host=/ {
+  H = tok("host"); NCPU = tok("ncpu"); CEIL = tok("ceiling"); SLOTS = tok("slots")
+  MEM = tok("mem_available"); FLOOR = tok("floor"); seen_host = 1; next
+}
+/^summary / {
+  LIVE = tok("live"); DEAD = tok("dead"); ORPH = tok("orphaned"); QN = tok("quarantine")
+  REGS = tok("registrations"); TDEF = tok("tmpdir_defects"); seen_sum = 1; next
+}
+/^defect / { d = tok("name"); if (d != "") defect[d] = 1; next }
+/^cannot-measure / { CM = $0; next }
+/^NAME[ \t]/ { next }
+/^[A-Za-z0-9._-]+[ \t]+/ {
+  # ⛔ NOT `RS`: that name is the awk RECORD SEPARATOR builtin, and indexing it is a syntax error
+  # under mawk (the awk every cell ships, #2637). The state column is `ST[n]`.
+  n++; RN[n] = $1; RL[n] = $2; ST[n] = $3
+  if ($3 == "live" || $3 == "DEAD" || $3 == "ORPHANED") RG[n] = $4; else RG[n] = ""
+  next
+}
+END {
+  # ⛔ MEASURED MEANS BOTH LINES CAME. A `host=` line without the `summary` is a truncated read (a
+  # killed transport, a half-written pipe), and certifying a box from it would publish `slots=0` —
+  # the empty-pool-reads-as-zero defect #2381 closed one layer down.
+  if (!seen_host || !seen_sum) { print "M|0"; if (CM != "") print "C|" CM; exit 0 }
+  print "M|1"
+  printf "K|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", H, NCPU, CEIL, SLOTS, MEM, FLOOR, LIVE, DEAD, ORPH, QN, REGS, TDEF
+  for (i = 1; i <= n; i++) printf "R|%s|%s|%s|%s|%d\n", RN[i], RL[i], ST[i], RG[i], (RN[i] in defect)
+  if (CM != "") print "C|" CM
+}'
+
+# derive_root <probe-output> -> the ONE parent directory the `pool-root-incomplete` refusal enables,
+# or empty when the refusal does not name a single parent. ⛔ THIS IS NOT A GUESS: the per-box tool
+# REFUSES with the directories it could see (`outside=/opt/a,/opt/b`), and its documented remedy is
+# "set RUNNER_ROOT to the directory that CONTAINS every instance dir". Two distinct parents cannot be
+# satisfied by one root, so the ambiguity stays `cannot-measure` rather than being resolved by picking.
+derive_root() {
+  local line dirs d parent parents="" ifs_save="$IFS"
+  line="$(printf '%s\n' "$1" | awk '/^cannot-measure / && /why=pool-root-incomplete/ {print; exit}')"
+  [ -n "$line" ] || return 0
+  dirs="$(printf '%s\n' "$line" | awk '{ for (i = 1; i <= NF; i++) if (index($i, "outside=") == 1) { print substr($i, 9); exit } }')"
+  [ -n "$dirs" ] || return 0
+  IFS=','
+  for d in $dirs; do
+    [ -n "$d" ] || continue
+    parent="${d%/*}"; [ -n "$parent" ] || parent="/"
+    case " $parents " in *" $parent "*) : ;; *) parents="$parents $parent" ;; esac
+  done
+  IFS="$ifs_save"
+  # shellcheck disable=SC2086
+  set -- $parents
+  [ "$#" -eq 1 ] || return 0
+  printf '%s' "$1"
+}
+
+# ── reading the registries ──────────────────────────────────────────────────────────────────────
+# registry_read <owner/name> -> `name<TAB>status<TAB>busy` lines, rc 0; else rc != 0 (stderr kept by
+# the caller). ⛔ `--paginate` WITH `--jq` APPLIES THE FILTER PER PAGE (gh's documented behaviour), so
+# a pool larger than one page is never truncated to its first 100 — the same reason
+# `ci_runner_gate.sh` paginates.
+registry_read() {
+  cap_bounded "$FLEET_TIMEOUT" "$FLEET_GH" api --paginate \
+    "repos/$1/actions/runners?per_page=100" \
+    --jq '.runners[] | [.name, .status, (.busy|tostring)] | @tsv' </dev/null
+}
+
+# ══ RUN ═════════════════════════════════════════════════════════════════════════════════════════
+unmeasured=0; measured=0; cells=0
+reg_total=0; reg_claimed=0; reg_unclaimed=0
+local_rows=0; unregistered=0; disagreements=0; not_ok=0; collision=0
+: >"$TMPD/reg"     # name<TAB>repo<TAB>status<TAB>busy
+: >"$TMPD/claim"   # github_name<TAB>cell<TAB>name
+
+# ── 1. the registries (independent of the cells, so a fleet with no reachable cell still gets them) ─
+for repo in $FLEET_REPOS; do
+  case "$repo" in */*) : ;; *) err "registry '$repo' is not owner/name"; continue ;; esac
+  short="${repo#*/}"
+  : >"$TMPD/regerr"
+  if reg_out="$(registry_read "$repo" 2>"$TMPD/regerr")"; then
+    # ⛔ AN EMPTY REGISTRY IS A LEGITIMATE READING (a repo whose jobs run on GitHub-hosted runners —
+    # `ci-queue.sh` names that shape). It is NOT `cannot-measure`, and it is NOT "the fleet is gone".
+    n="$(printf '%s\n' "$reg_out" | awk 'NF' | wc -l)"; n=$((n))
+    printf 'registry repo=%s read=ok runners=%s\n' "$short" "$n"
+    printf '%s\n' "$reg_out" | awk -v R="$short" 'NF { printf "%s\t%s\t%s\t%s\n", $1, R, $2, $3 }' >>"$TMPD/reg"
+  else
+    why="$(awk 'NF {print; exit}' "$TMPD/regerr")"
+    printf 'registry repo=%s read=cannot-measure why=registry-unreadable detail=%s\n' "$short" "${why:-no-output}"
+    unmeasured=$((unmeasured + 1))
+  fi
+done
+reg_total="$(awk 'NF' "$TMPD/reg" | wc -l)"; reg_total=$((reg_total))
+
+# ── 2. the roster ────────────────────────────────────────────────────────────────────────────────
+if [ -n "$FLEET_BOXES" ]; then
+  # shellcheck disable=SC2086
+  printf '%s\n' $FLEET_BOXES >"$TMPD/roster"
+else
+  roster="$(cap_fleet_inventory)"; rrc=$?
+  if [ "$rrc" -ne 0 ]; then
+    printf 'cell roster=cannot-measure why=roster-unreadable detail=%s\n' "${roster#UNKNOWN }"
+    printf 'summary cells=UNKNOWN measured=0 unmeasured=UNKNOWN registry=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' "$reg_total"
+    exit 2
+  fi
+  printf '%s\n' "$roster" | awk 'NF { print $1 }' >"$TMPD/roster"
+fi
+
+# ⛔ A `--box` THE ROSTER DOES NOT CARRY IS A REFUSAL, NOT A SMALLER FLEET. A typo (or a label the
+# provider renamed) otherwise reports `cells=0` and exits 0 — a clean bill of health built from
+# nothing, the shape `cap_expected_boxes` refuses one namespace over.
+for want in $ONLY_BOXES; do
+  if ! grep -qxF -- "$want" "$TMPD/roster"; then
+    cells=$((cells + 1)); unmeasured=$((unmeasured + 1))
+    printf 'cell label=%s read=cannot-measure why=box-not-in-roster detail=not-in-cmux-vm-list\n' "$want"
+  fi
+done
+
+# ── 3. every cell, one at a time ─────────────────────────────────────────────────────────────────
+while read -r box <&3; do
+  [ -n "$box" ] || continue
+  if [ -n "$ONLY_BOXES" ]; then
+    case " $ONLY_BOXES " in *" $box "*) : ;; *) continue ;; esac
+  fi
+  cells=$((cells + 1))
+  root="$FLEET_ROOT"; note=""
+  # the per-cell map wins over the fleet-wide default (a box laid out under /opt beside one under /tmp)
+  for pair in $FLEET_ROOTS; do
+    case "$pair" in "$box="*) root="${pair#*=}" ;; esac
+  done
+  out="$(exec_box "$box" "$(probe_for_root "$root")")"; rc=$?
+  # ⛔ ONE RETRY, DRIVEN BY THE REFUSAL ITSELF, AND ONLY WHEN NO ROOT WAS PINNED. Moving a root a
+  # human chose would be the tool overriding its operator; deriving it from the directories the pool
+  # tool NAMED is the pool tool's own documented remedy, executed once.
+  if [ "$ROOT_DERIVE" = 1 ] && [ -z "$root" ] && [ "$rc" -eq 2 ]; then
+    derived="$(derive_root "$out")"
+    if [ -n "$derived" ]; then
+      out="$(exec_box "$box" "$(probe_for_root "$derived")")"; rc=$?
+      note="root_derived=$derived"
+    fi
+  fi
+  printf '%s\n' "$out" | awk "$BOX_AWK" >"$TMPD/parsed"
+  if ! grep -qxF 'M|1' "$TMPD/parsed"; then
+    # ⛔ THE DETAIL IS THE TRANSPORT'S OR THE PROBE'S OWN FIRST LINE — never a summary this tool
+    # invented, because the operator's next step depends on which failure it was.
+    why="$(printf '%s\n' "$out" | awk 'NF {print; exit}')"
+    case "$rc" in
+      124) tok="transport-timeout" ;;
+      127) tok="pool-tool-absent" ;;
+      2)   tok="pool-unreadable" ;;
+      *)   tok="transport-unreachable" ;;
+    esac
+    printf 'cell label=%s read=cannot-measure why=%s rc=%s detail=%s\n' "$box" "$tok" "$rc" "${why:-no-output}"
+    unmeasured=$((unmeasured + 1))
+    continue
+  fi
+  measured=$((measured + 1))
+  IFS='|' read -r _ kh kncpu kceil kslots kmem kfloor klive kdead korph kq kregs ktdef < <(awk -F'|' '$1=="K"' "$TMPD/parsed")
+  printf 'cell label=%s read=ok host=%s ncpu=%s ceiling=%s slots=%s mem_available_mb=%s floor_mb=%s live=%s dead=%s orphaned=%s quarantine=%s registrations=%s tmpdir_defects=%s rc=%s\n' \
+    "$box" "${kh:--}" "${kncpu:--}" "${kceil:--}" "${kslots:--}" "${kmem:--}" "${kfloor:--}" \
+    "${klive:--}" "${kdead:--}" "${korph:--}" "${kq:--}" "${kregs:--}" "${ktdef:--}" "$rc"
+  [ -n "$note" ] && printf 'cell-note label=%s %s\n' "$box" "$note"
+  # ── the rows, joined to the registry BY agentName ──────────────────────────────────────────────
+  while IFS='|' read -r kind name listener state ghname tmpdef; do
+    [ "$kind" = "R" ] || continue
+    local_rows=$((local_rows + 1))
+    rstatus=""; rbusy=""; rrepo=""
+    if [ -n "$ghname" ]; then
+      hit="$(awk -F'\t' -v n="$ghname" '$1==n {print; exit}' "$TMPD/reg")"
+      if [ -n "$hit" ]; then
+        rstatus="$(printf '%s' "$hit" | cut -f3)"
+        rbusy="$(printf '%s' "$hit" | cut -f4)"
+        rrepo="$(printf '%s' "$hit" | cut -f2)"
+      fi
+    fi
+    # ⛔ THE VERDICT ORDER IS THE SAFETY ORDER: a registration GitHub does not have cannot serve work
+    # whatever its listener says; an ORPHANED row is not fixed by `restart` (rc 6) and needs `reclaim`;
+    # a DEAD listener is capacity one start away; a live listener GitHub reports offline is up but not
+    # connected, which is capacity the queue cannot use either.
+    if [ "$state" != "live" ] && [ "$state" != "DEAD" ] && [ "$state" != "ORPHANED" ]; then
+      verdict="quarantine"; not_ok=$((not_ok + 1))
+    elif [ -z "$ghname" ] || [ -z "$rstatus" ]; then
+      verdict="unregistered"; unregistered=$((unregistered + 1)); not_ok=$((not_ok + 1))
+    elif [ "$state" = "ORPHANED" ]; then
+      verdict="orphaned"; not_ok=$((not_ok + 1))
+    elif [ "$state" = "DEAD" ]; then
+      verdict="dead-listener"; not_ok=$((not_ok + 1)); disagreements=$((disagreements + 1))
+    elif [ "$tmpdef" = "1" ]; then
+      verdict="tmpdir-missing"; not_ok=$((not_ok + 1))
+    elif [ "$rstatus" = "offline" ]; then
+      verdict="github-offline"; not_ok=$((not_ok + 1)); disagreements=$((disagreements + 1))
+    else
+      verdict="ok"
+    fi
+    printf 'runner cell=%s name=%s github_name=%s listener=%s local=%s github=%s busy=%s registry=%s verdict=%s\n' \
+      "$box" "$name" "${ghname:--}" "${listener:--}" "$state" "${rstatus:-ABSENT}" "${rbusy:-?}" "${rrepo:--}" "$verdict"
+    [ -n "$ghname" ] && printf '%s\t%s\t%s\n' "$ghname" "$box" "$name" >>"$TMPD/claim"
+  done <"$TMPD/parsed"
+done 3<"$TMPD/roster"
+
+# ── 4. the registry names no measured cell claims ────────────────────────────────────────────────
+# ⛔ THE ATTRIBUTION RULE IS WHERE CLAUSE 3 ACTUALLY BITES. A name is a PHANTOM only when every
+# requested cell was measured; while ANY cell is unmeasured the name may live there, and calling it a
+# phantom would send an operator to `reclaim` a registration that is serving jobs.
+while IFS=$'\t' read -r rname rrepo2 rstatus2 rbusy2; do
+  [ -n "$rname" ] || continue
+  if awk -F'\t' -v n="$rname" '$1==n {found=1} END {exit !found}' "$TMPD/claim"; then
+    reg_claimed=$((reg_claimed + 1)); continue
+  fi
+  reg_unclaimed=$((reg_unclaimed + 1))
+  if [ "$unmeasured" -eq 0 ]; then
+    printf 'registry-unclaimed name=%s registry=%s status=%s reason=no-measured-cell-claims-it\n' "$rname" "$rrepo2" "$rstatus2"
+    not_ok=$((not_ok + 1))
+  else
+    printf 'registry-unclaimed name=%s registry=%s status=%s reason=cannot-attribute(%s-cell-unmeasured)\n' "$rname" "$rrepo2" "$rstatus2" "$unmeasured"
+  fi
+done <"$TMPD/reg"
+
+# ── 5. one agentName claimed by two cells ────────────────────────────────────────────────────────
+# GitHub runner NAMES are unique per repo, so two local installs carrying one agentName are one
+# registration (or a stale `.runner`), and starting both is not twice the capacity — the rule #2381
+# encodes as "DEDUPED BY agentName".
+for dup in $(awk -F'\t' '{c[$1]++; cell[$1]=cell[$1] "," $2} END {for (n in c) if (c[n] > 1) print n}' "$TMPD/claim"); do
+  printf 'name-collision name=%s cells=%s\n' "$dup" "$(awk -F'\t' -v n="$dup" '$1==n {printf "%s,", $2}' "$TMPD/claim" | sed 's/,$//')"
+  collision=$((collision + 1)); not_ok=$((not_ok + 1))
+done
+
+# ── 6. the verdict ───────────────────────────────────────────────────────────────────────────────
+printf 'summary cells=%s measured=%s unmeasured=%s registry=%s claimed=%s unclaimed=%s unregistered=%s disagreements=%s collisions=%s not_ok=%s\n' \
+  "$cells" "$measured" "$unmeasured" "$reg_total" "$reg_claimed" "$reg_unclaimed" "$unregistered" "$disagreements" "$collision" "$not_ok"
+# ⛔ 2 OUTRANKS 3: a report that could not read a cell (or a registry) cannot certify anything about
+# what it holds, so "a defect was found" is the weaker claim and must not mask the unmeasured one.
+if [ "$unmeasured" -gt 0 ]; then exit 2; fi
+[ "$not_ok" -eq 0 ] || exit 3
+exit 0
