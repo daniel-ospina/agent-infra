@@ -1714,6 +1714,15 @@ if grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$junk_out" \
 else rc=1; echo "      junk fixture '$(printf '%s' "$junk_out" | tr '\n' '|' | head -c 260)'"; fi
 ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not repeated into the log)" $rc
 
+# ⛔ THE DRIVE'S OWN WITNESS IS DERIVED FROM THE SHIPPED SOURCE, NOT SPELLED HERE (review P3, cycle 45). The
+# anti-vacuity checks below need proof that the MUTATED driver ran — but a literal copy of the product's
+# log prefix turns a cosmetic rename of that line into a false "the mutant did not run", pointing at the
+# wrong defect. It is read out of `$FNS` instead, and the literal survives only as a FALLBACK, so a failed
+# derivation is fail-CLOSED (a possible false red) and never a check that passes on a dead drive.
+_wit="$(grep -o '\[[a-z]*\] [a-z -]*order' "$FNS" 2>/dev/null | head -1)"
+[ -n "$_wit" ] || _wit='[refresh] queue order'
+ck "the anti-vacuity witness prefix is derivable from the shipped source ('$_wit')" "$([ -n "$_wit" ] && echo 0 || echo 1)"
+
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
 MUT_NOSAT="$TMP/fns-nosat.sh"
 # The anchor is the READ itself, so it survives a change of guard shape (it has drifted twice, from
@@ -1739,7 +1748,7 @@ else
   # all three, the drive dies, and the only predicate (absence of the clause) is satisfied by the failure —
   # the same "green on `command not found`" the drift guard was hardened for. The drive's own line is the
   # witness (measured: the correct mutation prints exactly one, a syntax-error mutant zero).
-  if ! grep -q '^\[refresh\] queue order' "$d/out" 2>/dev/null; then
+  if ! grep -qF "$_wit" "$d/out" 2>/dev/null; then
     rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
   elif grep -q 'windows=TRUNCATED' "$d/out" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
 fi
@@ -1906,13 +1915,82 @@ if ! grep -q 'windows=TRUNCATED' <<<"$_w14" && grep -q 'NO clip is asserted' <<<
 else rc=1; echo "      NUL mid-tier '$(printf '%s' "$_w14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) a NUL INSIDE a tier name is not promoted to a recognised tier" $rc
 
+# 14f) EVERY ARM THAT CAN CARRY THE CLIP DOES — INCLUDING THE ONES A NON-RACING PASS NEVER REACHES
+#      (review P2, cycle 45). §14d grades the two arms a normal pass reaches, so deleting `$_sat_said` from
+#      the severity / severity-uncounted / totals / head arms left EVERY suite green: four disclosures the
+#      product promises and no test could miss. The counts the function reads back come from
+#      `rank_queue_by_pool`, so a pass cannot be made to land in a degraded arm without a race — unless the
+#      count is SHIMMED, which is what `_arm14` below does. The shim renames the shipped ranker, calls it,
+#      then writes the count the arm needs (`-` = remove the file). Nothing in the product changes.
+_arm14() {  # _arm14 <label> <count-content|-> -> print the drive's output
+  _ad="$TMP/arm14-$1"; rm -rf "$_ad"; mkdir -p "$_ad/o"
+  printf '200\n300\n' > "$_ad/o/candidates.txt"; printf '200\n300\n' > "$_ad/o/.pool"
+  printf 'P1-severe\n' > "$_ad/o/.pool-sat"
+  sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_ad/fns-shim.sh"
+  { drive_prologue; cat "$_ad/fns-shim.sh"
+    printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; '
+    if [ "$2" = "-" ]; then printf 'rm -f "$4"'; else printf 'printf "%%s\\n" "%s" > "$4"' "$2"; fi
+    printf '; return $_rq_rc; }\n'
+    printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
+  } > "$_ad/drive.sh"
+  ( cd "$_ad" && HOME="$_ad" bash drive.sh "$_ad/o" ) 2>&1
+}
+
+for _arm14_case in \
+  'severity|2 0 200|severity-first from the pool' \
+  'uncounted|-|COUNT could not be read back' \
+  'totals|1 0 200|does not add up to the queue' \
+  'head|2 0 999|names head #999'; do
+  _al="${_arm14_case%%|*}"; _rest="${_arm14_case#*|}"
+  _ac="${_rest%%|*}"; _am="${_rest#*|}"
+  _ao="$(_arm14 "$_al" "$_ac")"
+  if grep -qF "$_am" <<<"$_ao" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_ao"; then rc=0
+  else rc=1; echo "      the $_al arm '$(printf '%s' "$_ao" | tr '\n' '|' | head -c 340)'"; fi
+  ck "the $_al arm of the order line carries the clip (its sentence is '$_am')" $rc
+done
+
+# 14f-bis) NON-VACUITY, PER ARM — strip `$_sat_said` from ONE arm's echo line and that arm's check must
+# redden while the others stay green (the shim makes each arm independently reachable, so a global
+# `sed` over all of them would not prove attribution).
+_arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line> -> drive output
+  _amd="$TMP/arm14mut-$1"; rm -rf "$_amd"; mkdir -p "$_amd/o"
+  printf '200\n300\n' > "$_amd/o/candidates.txt"; printf '200\n300\n' > "$_amd/o/.pool"
+  printf 'P1-severe\n' > "$_amd/o/.pool-sat"
+  sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_amd/fns-ren.sh"
+  # `sub(/[$]_sat_said/, "")` — the `[$]` bracket keeps the `$` out of the regex as an anchor, and the
+  # VARIABLE is deleted while the closing quote is left standing, so the echo stays valid shell. (A
+  # replacement string spelled `"\""` is a syntax error in this awk: measured, it silently produced a
+  # 0-line shim and the drive then died on `command not found`.)
+  awk -v needle="$2" '{ if (index($0, needle) && index($0, "$" "_sat_said")) sub(/[$]_sat_said/, ""); print }' \
+    "$_amd/fns-ren.sh" > "$_amd/fns-shim.sh"
+  { drive_prologue; cat "$_amd/fns-shim.sh"
+    printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; printf "%%s\\n" "%s" > "$4"; return $_rq_rc; }\n' "$3"
+    printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
+  } > "$_amd/drive.sh"
+  ( cd "$_amd" && HOME="$_amd" bash drive.sh "$_amd/o" ) 2>&1
+}
+for _arm14m in \
+  'severity|severity-first from the pool|2 0 200' \
+  'uncounted|COUNT could not be read back|-'; do
+  _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _mc="${_rest#*|}"
+  _mo="$(_arm14_mut "$_ml" "$_mn" "$_mc")"
+  if grep -qF "$_mn" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
+  else rc=1; echo "      stripped-$_ml '$(printf '%s' "$_mo" | tr '\n' '|' | head -c 340)'"; fi
+  ck "non-vacuity: with the clip stripped from the $_ml arm ALONE its clause disappears" $rc
+done
+
 # 14e) NON-VACUITY — remove the clause from the arms and the checks above must redden.
 MUT_NOSAT2="$TMP/fns-nosat2.sh"
 sed -e 's/\$_sat_said"$/"/' -e 's/^\$_sat_said$//' "$FNS" > "$MUT_NOSAT2"
 if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said mutation did not apply — the sed anchor drifted"; else
   _d="$_d14b"; { drive_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
   ( cd "$_d" && HOME="$_d" bash drive-mut.sh "$_d/o" ) > "$_d/out-mut" 2>&1
-  if grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
+  # ⛔ AND THE MUTANT MUST HAVE RUN HERE TOO (review P3, cycle 45). This check had exactly the defect §14c
+  # was hardened for one commit earlier: a dead driver satisfies "the clause is absent" for the wrong
+  # reason. Same witness, derived the same way.
+  if ! grep -qF "$_wit" "$_d/out-mut" 2>/dev/null; then
+    rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
+  elif grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
 fi
 ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappears (the checks can fail)" $rc
 

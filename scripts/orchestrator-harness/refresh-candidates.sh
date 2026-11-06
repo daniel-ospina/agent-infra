@@ -4061,15 +4061,16 @@ queue_order_from_pool() {
   case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
   # ⛔ WHETHER THE BYTES MOVED IS REPORTED, NOT TYPED (review P3, cycle 10). Every arm below runs after EITHER
   # the `mv` OR the byte-identical `cmp` branch, so "INSTALLED" is false half the time — and the ranked-none
-  # arm forty lines up already uses `_wrote` for exactly this reason ("whether the bytes moved is reported,
-  # not assumed"). One sentence, decided by the write that actually happened.
+  # (`rank_queue_by_pool`'s ranked-none arm uses `_wrote` for exactly this reason: "whether the bytes moved
+  # is reported, not assumed"). One sentence, decided by the write that actually happened.
   if [ "${_wrote:-0}" -eq 1 ]; then
     _inst_said="the reorder was DERIVED AND INSTALLED"
   else
     _inst_said="the reorder was DERIVED and the queue already held exactly those bytes (nothing was written)"
   fi
   # ⛔ A TRUNCATED TIER WINDOW IS NAMED ON THE ORDER LINE (review cycle 33, P2). `.pool-sat` is written by
-  # THE TIER READ (three lines above `queue_order_from_pool`'s caller): a tier whose window ended FULL
+  # THE TIER READ (the `rest_list` block that writes `.pool`, `.pool-read` and `.pool-sat`): a tier whose
+  # window ended FULL
   # with a next page still advertised did not list its whole tier. With the oldest-first order the tier's
   # NEWEST members are the ones missing, so any of them that is queued lands in the unranked TAIL — behind
   # every ranked row of every LOWER tier, which is a severity inversion the order line otherwise reports as
@@ -4078,26 +4079,22 @@ queue_order_from_pool() {
   # cannot inject text into an operator-facing line. An unreadable mix is disclosed as such rather than
   # printed. Absent file = no tier was truncated (the normal case) and no clause is added.
   _sat=""; _sat_junk=0; _sat_tier=""; _sat_unread=0; _sat_notopen=0
-  # ⛔ THE READ IS GUARDED, AND THE GUARD IS THE READ ITSELF (review P3, cycle 40; hardened cycle 41). A
-  # `[ -r ]` test is a TOCTOU, not a read guard: a directory passes `[ -s ]` AND `[ -r ]`, is never read,
-  # and was then reported as "held nothing this code could classify" — a measured claim over zero bytes.
-  # A record REMOVED between the test and the `done <` redirect (reachable: a concurrent pass deletes this
-  # file at its own entry, see the note above `queue_order_from_pool`) landed in the same state AND printed
-  # the shell's own message, because `2>/dev/null` on a `done` compound does not cover the redirect that
-  # opens it — the same mechanism the `.queue-rank` comment twenty lines up documents. `cat` gives an
-  # OBSERVABLE status for every shape at once, so the read cannot fail silently and the two cases below
-  # are decided by what actually happened. Absent record: no clause, and `_sat_unread` stays 0.
-  # ⛔ `[ -f ]` BEFORE THE READ, AND THE READ ITSELF IS THE SECOND TEST (review P3, cycle 42). `cat` on a
-  # FIFO or a `/dev/zero` symlink is UNBOUNDED — there is no timeout anywhere on this path — and `-s` was
-  # false for both, so the previous test-shaped guard never opened them while a plain `cat` would hang the
-  # pass. Only a REGULAR file is read (a symlink to one still is), and a non-regular shape is classified
-  # NOT OPENED rather than opened. A NUL is RE-PLACED, not deleted, so it never reaches the substitution's
-  # warning AND it survives as data instead of being cleaned into a tier name it is not.
-  # ⛔ THE READ IS WRAPPED IN A BRACE GROUP SO ITS REDIRECT FAILURE IS SUPPRESSIBLE (review P2, cycle 42).
-  # `tr -d ... < "$o/.pool-sat" 2>/dev/null` does NOT cover the `<` — that redirect is set up before the
-  # `2>/dev/null` applies, exactly as the `.queue-rank` comment above documents, so an unreadable record
-  # still printed `Permission denied` and §14d-bis reddened on it. The group's stderr covers the redirect
-  # AND the command substitution still carries the failing status, which is what the branch tests.
+  # ⛔ FOUR THINGS THIS READ HAS TO GET RIGHT, each one a defect this PR shipped and fixed:
+  # 1. AN EXISTENCE GATE BEFORE ANY READING. Absent is the NORMAL case (no tier was clipped) and must print
+  #    nothing; without the gate every ordinary pass would claim an unreadable record.
+  # 2. THE SHAPE IS DECIDED BEFORE THE READ, AND A FAILING READ IS A SECOND, SEPARATE TEST. Testing
+  #    readability instead (`[ -r ]`) is a TOCTOU: a directory passes it AND `[ -s ]`, is never read, and
+  #    was then reported over zero bytes. Only a REGULAR file is read, so nothing here can block on a FIFO
+  #    or drain a device (there is no timeout anywhere on this path). A non-regular shape is NOT OPENED.
+  # 3. THE READ'S OWN FAILURE IS BOTH OBSERVABLE AND SILENT. `tr ... < "$o/.pool-sat"` puts the redirect
+  #    BEFORE any `2>/dev/null` on the same command, so a failure there still printed the shell's own
+  #    `Permission denied` above the honest line — the mechanism the `.queue-rank` read documents. Wrapping
+  #    the read in a brace group whose stderr is discarded covers the redirect AND still lets the command
+  #    substitution carry the failing status, which is what the branch tests.
+  # 4. A NUL IS RE-PLACED, NOT DELETED. Deleting it cleaned `P0-blo\0cker` into the `P0-blocker` tier —
+  #    a clip asserted from corrupted bytes — and folded a NUL-only record into "empty". Re-placed, the
+  #    byte survives as data: no line carrying it can equal a tier name, so the record is JUNK, and the
+  #    shell still emits no "ignored null byte" warning.
   # ⛔ TWO FAILURES, TWO SENTENCES (review P3, cycle 43). "Not a regular file, so this pass did NOT open
   # it" and "it EXISTS but could not be READ" are different facts, and the old single sentence asserted the
   # second for the first — false for the very shape the device fixture uses, where a read would HAVE
