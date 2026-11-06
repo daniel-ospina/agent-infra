@@ -291,7 +291,10 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
       # ⛔ AND IT IS 83, NOT 81 (2026-11-01): 81 belongs to `AGENT_MEM_REFUSED` (#2387), which claimed it
       # nine days before this gate was written, and this literal is what pinned the collision into a
-      # second caller.
+      # second caller. ⛔ SCOPED, NOT OWNED: #2387 is a BRANCH, so nothing on THIS tree declares 81 and
+      # the derived distinctness guard in `spawn-gate.test.sh` cannot see it — a lane that re-derives
+      # "which codes are free" from the tree alone reads 81 as free and re-claims it green. That is the
+      # exact failure this PR exists to prevent, so the sentence must not be read as a registry entry.
       skew) _cap_rc=83 ;;
       # 82 is key-gate.sh's KEY_GATE_REFUSED (#3331): the lane REFUSED before spawning the agent because
       # its environment holds no model credential for the provider. Named rather than folded, for the
