@@ -5300,12 +5300,24 @@ done
 # ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
-# that does not exist, with this box's local witness removed so no fallback can answer either.
+# that does not exist, with the local witness removed so no fallback can answer either.
+# ⛔ AND "THE LOCAL WITNESS" MEANS ONE OF ITS OWN, PINNED BY NAME (2026-11-06). The probe below used to
+# run with the ambient environment, so `lane_registry.py` resolved its fallback witness through
+# `state_root()` → this BOX's registry (`AGENT_INFRA_PATH`/`CELL_HOME`) and found 194 real records: the
+# remote was unreachable and the read still answered `readable: true`, rc 0, from a peer trunk the
+# fixture never created. So the arm asserted a property of whatever machine ran it — green on a clean CI
+# runner, red on every cell and dev box, and never about the code.
+# ⛔ AND IT CANNOT BE `$RREG/state/lanes` EITHER: the `rdrive` below runs with `LANE_REGISTRY=1` and
+# therefore WRITES a lane record into that directory on every pass, so pinning the probe there still
+# answered `readable: true` from the fixture's own just-written record. The probe gets an empty witness
+# nothing in this arm writes to; that is the state the arm has always meant ("no fallback can answer").
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
 rm -rf "$RREG/state/lanes"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+R4_WITNESS="$TMP/r4-empty-witness"; rm -rf "$R4_WITNESS"
+unreachable="$(LANE_REGISTRY_LOCAL="$R4_WITNESS" LANE_REGISTRY_REPO="$RREG/work" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
