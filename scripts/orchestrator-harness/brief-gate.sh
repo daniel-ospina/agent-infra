@@ -55,14 +55,21 @@
 # registry. The check is a CONTRADICTION test, not a substance test: it cannot tell whether the
 # author READ the ref, and the next actor still has to read it.
 #
-# ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO. It needs a repository
-# and a reachable `origin`; when either is missing the gate says so LOUDLY on stderr
-# (`PREVIOUS-WORK-WIP-UNMEASURED` / `-NOREPO`) and ADMITS the brief, because refusing every dispatch
-# on a moment's network failure converts a memory gap into a fleet-wide outage. It bites whenever the
-# box can reach origin, which is the normal case — the claim pre-flight on this same dispatch path
-# already hard-depends on exactly that. The refusal is deterministic and per-issue, so it is a real
-# check rather than a hopeful one; and `--wip-refs` (the verb `claim-reaper.sh` and `claims.sh`
-# consume) fails CLOSED for the handover record, where abstaining costs nothing.
+# ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO, IN THREE WAYS.
+#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number. The canonical
+#       block ships the slot `issue-<N>`, so a brief that still carries the slot is admitted by SHAPE —
+#       exactly as the research contract admits its own `<…>` slots. This is a presence-and-shape gate,
+#       and the number is the one field it cannot invent for the author.
+#   (b) MEASUREMENT: it needs a repository and a reachable `origin`. With neither, the gate says so on
+#       stderr (`UNVERIFIED` / `PREVIOUS-WORK-WIP-UNMEASURED`) and ADMITS the brief, because refusing
+#       every dispatch on a moment's network failure converts a memory gap into a fleet-wide outage.
+#       The claim pre-flight on this same dispatch path already hard-depends on that reachability, so
+#       the ordinary case is the measured one.
+#   (c) NAME, NOT CONTENT: it can prove that a snapshot EXISTS for an issue, never that the snapshot
+#       contains the work you need. Reading it is the next actor's job — which is why the line says so.
+# The refusal is deterministic and per-issue, so (a) and (b) are boundaries of a real check rather than
+# a hopeful one; and `--wip-refs` (the verb `claim-reaper.sh` and `claims.sh` consume) fails CLOSED for
+# the handover record, where abstaining costs nothing.
 
 # ── THE SECOND CONTRACT, AND WHY IT LIVES IN THIS FILE (#3442) ───────────────────────────────────
 # For role `reviewer` there is a THIRD requirement, on top of the two above:
@@ -257,16 +264,49 @@ brief_gate_missing() { # brief_gate_missing <brief-file|-> [role] [round]
 # is a handover that silently stops being reported.
 # shellcheck disable=SC2016
 BRIEF_GATE_WIP_AWK='
+# ⛔ QUOTED MATERIAL IS NOT A CLAIM — the rule the NON-VACUITY parser states, applied to BOTH carrier
+# contracts as well (fresh-context review of #3484, P1). Without it a brief could satisfy the WHOLE
+# PREVIOUS WORK block by pasting the canonical block inside a fence, and the cross-check would then read
+# the QUOTED `issue-<N> -> refs/wip/<ref>` as the author’s own claim and switch itself off — a
+# fail-open in the one machine check this change adds. Indentation is measured in COLUMNS (a TAB is the
+# next 4-column stop), because four columns is an indented CODE BLOCK to every renderer.
+# Returns the content of `s` after its leading whitespace, or a sentinel for an indented code block.
+function _qskip(s,   col, ln, q, c, tw, ind) {
+  col = 0; ind = 0; ln = length(s)
+  for (q = 1; q <= ln; q++) {
+    c = substr(s, q, 1)
+    if (c == " ") { col++; ind++; continue }
+    if (c == "\t") { tw = 4 - (col % 4); col += tw; ind += tw; continue }
+    break
+  }
+  if (ind >= 4) return "\001"
+  return substr(s, q)
+}
+# ⛔ A FENCE IS CLOSED ONLY BY ITS OWN CHARACTER, IN A RUN AT LEAST AS LONG, AND WITH NO INFO STRING —
+# the three CommonMark rules the NON-VACUITY parser already had to learn twice. Sets `fence`.
+function _fence(s,   fc, fl, q, rest) {
+  fc = substr(s, 3, 1)
+  fl = 0
+  for (q = 3; substr(s, q, 1) == fc; q++) fl++
+  rest = substr(s, q)
+  if (!fence) { fence = 1; fencec = fc; fencelen = fl }
+  else if (fc == fencec && fl >= fencelen && rest ~ /^[ \t]*$/) fence = 0
+  return 1
+}
 function _strip(s) { sub(/^[ \t]+/, "", s); sub(/^[-*+][ \t]+/, "", s); sub(/^[0-9]+[.)][ \t]+/, "", s);
   sub(/^(\*\*|__)/, "", s); sub(/^[ \t]+/, "", s); return s }
-BEGIN { ins = 0; depth = 0; val = "" }
+BEGIN { ins = 0; depth = 0; val = ""; fence = 0; fencec = ""; fencelen = 0 }
 {
-  lc = tolower($0); nh = 0
+  line = _qskip($0)
+  if (line == "\001") next
+  if (match(line, /^(```|~~~)/)) { _fence(line); next }
+  if (fence) next
+  lc = tolower(line); nh = 0
   if (lc ~ /^#+/) { match(lc, /^#+/); nh = RLENGTH }
   if (ins && nh > 0 && nh <= depth) ins = 0
   if (!ins && nh > 0 && lc ~ /^#+[ \t]*previous[ -]work/) { ins = 1; depth = nh; next }
   if (!ins) next
-  t = _strip($0)
+  t = _strip(line)
   if (tolower(t) ~ /^wip[ \t]*:/) {
     sub(/^[^:]*:/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
@@ -327,6 +367,38 @@ brief_gate_repo() { # brief_gate_repo [explicit]
 # match would report every one of them as unlinked and the reader would be blind to the whole
 # population it exists for. `bg-rescue-wip.sh` now writes the `issue-<N>-` form for new rescues — which
 # this rule also matches, so both families are covered by one rule.
+# brief_gate_bounded <secs> <cmd...> — run <cmd> under the repo ONE portable time bound (#2046),
+# printing its stdout and returning its status, or 124 on a timeout.
+# ⛔ IT NEVER FALLS BACK TO AN UNBOUNDED NETWORK CALL (fresh-context review of #3484, P2). The first
+# draft used `timeout` when present and the BARE call otherwise — on macOS, where `timeout` ships
+# nowhere and this harness runs, a black-holed origin would stall every dispatch that carries a keyed
+# absence claim, with no bound at all. That is the exact defect `scripts/lib/bounded.sh` exists for, so
+# the bound comes from there (one place, one order: `timeout` -> `gtimeout` -> its internal watchdog).
+# With NO bounded mechanism available the answer is rc 2 — UNMEASURED, never a hang and never a pass.
+brief_gate_bounded() { # brief_gate_bounded <secs> <cmd...>
+  local secs="${1:-20}"; shift
+  if [ -z "${BRIEF_GATE_BOUNDED_TRIED:-}" ]; then
+    BRIEF_GATE_BOUNDED_TRIED=1
+    local c here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
+    for c in "${O:-}/lib/bounded.sh" "$here/lib/bounded.sh" \
+             "${AGENT_INFRA_PATH:-}/scripts/lib/bounded.sh" \
+             "${HOME:-}/.pi/agent/scripts/lib/bounded.sh"; do
+      [ -n "$c" ] && [ -f "$c" ] || continue
+      # shellcheck source=/dev/null
+      . "$c" >/dev/null 2>&1 && break
+    done
+  fi
+  declare -f tb_timeout >/dev/null 2>&1 || return 2
+  tb_resolve_timeout >/dev/null 2>&1 || return 2
+  local out rc
+  out="$(tb_timeout "$secs" "$@" 2>/dev/null)"; rc=$?
+  tb_watchdogs_reap >/dev/null 2>&1 || :
+  tb_bound_cleanup >/dev/null 2>&1 || :
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return "$rc"
+}
+
 brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
   local issue="${1:-}" repo="${2:-}" out rc
   case "$issue" in ''|*[!0-9]*) printf '[brief-gate] --wip-refs needs an ISSUE NUMBER (got "%s")\n' "$issue" >&2; return 2 ;; esac
@@ -335,15 +407,18 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
     printf '[brief-gate] --wip-refs: no repository to read refs/wip from (repo=%s)\n' "${repo:-<none>}" >&2
     return 2
   fi
-  # BOUNDED, because this runs on the dispatch path. `timeout` is absent on macOS — the harness runs
-  # there — so its absence falls back to the unbounded call rather than skipping the check entirely.
-  if command -v timeout >/dev/null 2>&1; then
-    out="$(timeout 20 git -C "$repo" ls-remote --refs origin 'refs/wip/*' 2>/dev/null)"; rc=$?
-  else
-    out="$(git -C "$repo" ls-remote --refs origin 'refs/wip/*' 2>/dev/null)"; rc=$?
+  # ⛔ ABSOLUTISE BEFORE ANY `cd` (fresh-context review of #3484, P2). `claims.sh` supports
+  # `CLAIM_REPO="."` (a caller standing at a work-tree root), and a relative path resolved AFTER the
+  # caller moved to a neutral cwd points somewhere else entirely — measured: `.` became `/tmp`, the
+  # listing failed, and the handover line read UNMEASURED on a box whose origin answered fine.
+  repo="$(cd "$repo" 2>/dev/null && pwd)" || repo=""
+  if [ -z "$repo" ]; then
+    printf '[brief-gate] --wip-refs: the repository path could not be resolved\n' >&2
+    return 2
   fi
+  out="$(brief_gate_bounded 20 git -C "$repo" ls-remote --refs origin 'refs/wip/*')"; rc=$?
   if [ "$rc" -ne 0 ]; then
-    printf '[brief-gate] --wip-refs: `git ls-remote origin refs/wip/*` exited %s in %s — UNMEASURED (unknown is not zero)\n' "$rc" "$repo" >&2
+    printf '[brief-gate] --wip-refs: `git ls-remote origin refs/wip/*` could not answer (rc=%s) in %s — UNMEASURED (unknown is not zero)\n' "$rc" "$repo" >&2
     return 2
   fi
   printf '%s\n' "$out" | awk -v n="$issue" '
@@ -414,6 +489,35 @@ brief_gate_mutation_missing() { # brief_gate_mutation_missing <file|->
 # `_label`: `_lab` (lowercased label) and `_rest` (the value after the colon).
 # shellcheck disable=SC2016
 BRIEF_GATE_AWK='
+# ⛔ QUOTED MATERIAL IS NOT A CLAIM — the rule the NON-VACUITY parser states, applied to BOTH carrier
+# contracts as well (fresh-context review of #3484, P1). Without it a brief could satisfy the WHOLE
+# PREVIOUS WORK block by pasting the canonical block inside a fence, and the cross-check would then read
+# the QUOTED `issue-<N> -> refs/wip/<ref>` as the author’s own claim and switch itself off — a
+# fail-open in the one machine check this change adds. Indentation is measured in COLUMNS (a TAB is the
+# next 4-column stop), because four columns is an indented CODE BLOCK to every renderer.
+# Returns the content of `s` after its leading whitespace, or a sentinel for an indented code block.
+function _qskip(s,   col, ln, q, c, tw, ind) {
+  col = 0; ind = 0; ln = length(s)
+  for (q = 1; q <= ln; q++) {
+    c = substr(s, q, 1)
+    if (c == " ") { col++; ind++; continue }
+    if (c == "\t") { tw = 4 - (col % 4); col += tw; ind += tw; continue }
+    break
+  }
+  if (ind >= 4) return "\001"
+  return substr(s, q)
+}
+# ⛔ A FENCE IS CLOSED ONLY BY ITS OWN CHARACTER, IN A RUN AT LEAST AS LONG, AND WITH NO INFO STRING —
+# the three CommonMark rules the NON-VACUITY parser already had to learn twice. Sets `fence`.
+function _fence(s,   fc, fl, q, rest) {
+  fc = substr(s, 3, 1)
+  fl = 0
+  for (q = 3; substr(s, q, 1) == fc; q++) fl++
+  rest = substr(s, q)
+  if (!fence) { fence = 1; fencec = fc; fencelen = fl }
+  else if (fc == fencec && fl >= fencelen && rest ~ /^[ \t]*$/) fence = 0
+  return 1
+}
 function _label(s,   t) {
   t = s
   sub(/^[ \t]+/, "", t)
@@ -442,9 +546,13 @@ function _label(s,   t) {
   return ""
 }
 BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 0; cmp = 0
-        pins = 0; pdepth = 0; pwsec = 0; pwcla = 0; pwwip = 0; pwbr = 0; pwwt = 0; pwpri = 0 }
+        pins = 0; pdepth = 0; pwsec = 0; pwcla = 0; pwwip = 0; pwbr = 0; pwwt = 0; pwpri = 0
+        fence = 0; fencec = ""; fencelen = 0 }
 {
-  line = $0
+  line = _qskip($0)
+  if (line == "\001") next
+  if (match(line, /^(```|~~~)/)) { _fence(line); next }
+  if (fence) next
   lc = tolower(line)
   nh = 0
   if (lc ~ /^#+/) { match(lc, /^#+/); nh = RLENGTH }
@@ -750,7 +858,29 @@ END {
 }
 '
 
-# brief_gate_verify <brief-file|-> [role] [round] — 0 = allowed, REFUSED with the teaching message, or
+# brief_gate_missing_all <file|-> [role] [round] [repo] — every missing token for a dispatch: the SHAPE
+# tokens plus the PREVIOUS WORK cross-check. `--missing` is the verb an author iterates with, so it must
+# see the same body `--check` sees.
+# ⛔ STDIN IS MATERIALISED ONCE HERE TOO (fresh-context review of #3484, P2). `brief_gate_missing` and
+# `brief_gate_previous_work` are two readers; with `-` the first drains the pipe and the second sits at
+# EOF, so `--missing -` reported "complete, rc=0" for a brief that `--check -` refuses — the diagnostic
+# verb disagreeing with the gate is how an author is told their brief is fine when it is not.
+brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [repo]
+  local f="${1:--}" role="${2:-lane}" rnd repo="${4:-}" tmpf=""
+  rnd="$(brief_gate_round_norm "${3:-0}")"
+  if [ "$f" = "-" ]; then
+    tmpf="$(mktemp "${TMPDIR:-/tmp}/brief-gate.XXXXXX" 2>/dev/null)" || {
+      printf 'NO-FILE\n'; return 0; }
+    cat > "$tmpf"
+    f="$tmpf"
+  fi
+  brief_gate_missing "$f" "$role" "$rnd"
+  brief_gate_previous_work "$f" "$repo"
+  [ -n "$tmpf" ] && rm -f "$tmpf"
+  return 0
+}
+
+# brief_gate_verify <brief-file|-> [role] [round] [repo] — 0 = allowed, REFUSED with the teaching message, or
 # UNAVAILABLE. Prints NOTHING on success (a silent pass is a pass; the callers already log).
 brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
   local f="${1:--}" role="${2:-lane}" rnd miss="" repo="${4:-}" tmpf="" pw=""
@@ -1009,7 +1139,7 @@ brief_gate_line() { # brief_gate_line [role]
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   case "${1:-}" in
     --check)   shift; brief_gate_verify "${1:--}" "${2:-lane}" "${3:-0}" "${4:-}" ;;
-    --missing) shift; brief_gate_missing "${1:--}" "${2:-lane}" "${3:-0}"; brief_gate_previous_work "${1:--}" "${4:-}" ;;
+    --missing) shift; brief_gate_missing_all "${1:--}" "${2:-lane}" "${3:-0}" "${4:-}" ;;
     --wip-refs) shift; brief_gate_wip_refs "${1:-}" "${2:-}" ;;
     --mutation-missing) shift; brief_gate_mutation_missing "${1:--}" ;;
     --section) shift; brief_gate_section "${1:-lane}" "${2:-0}" ;;

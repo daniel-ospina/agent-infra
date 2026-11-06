@@ -906,6 +906,33 @@ git init -q "$HW/noremote" 2>/dev/null
 PW_OUT="$(bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/noremote" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(viii) an UNREADABLE refs/wip ADMITS the brief (documented residual) (got $rc)"
 grep -q 'UNVERIFIED' <<<"$PW_OUT"; ck $? "(viii-b) …and says the absence claim is UNVERIFIED on stderr, so the pass is never silent"
+
+# ── QUOTED MATERIAL IS NOT A CLAIM (fresh-context review of #3484, P1) ──────────────────────────
+# The first cut's WIP reader took the LAST `WIP:` label anywhere in the section with no fence or indent
+# awareness, so pasting the canonical block as a REFERENCE both satisfied the shape and switched the
+# cross-check off: `issue-<N> -> refs/wip/<ref>` inside a fence read as the author's own claim. Measured
+# before the fix: a brief claiming `issue-4242 -> none` was refused (80) alone, and ADMITTED (0) once a
+# fenced copy of the block was pasted after it. Two arms, one per carrier of the paste.
+{ sed 's|^PRIOR:.*|PRIOR: no previous attempt|' "$TMP/pw-contradicted.txt"
+  printf '\nReference (the shape the harness hands you):\n\n```\nWIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n```\n'; } > "$TMP/pw-fenced-after.txt"
+grep -q 'issue-4242 -> none' "$TMP/pw-fenced-after.txt"; ck $? "§H fixture: the LIVE claim is still the absence claim (the fenced copy comes after it)"
+bash "$GATE" --check "$TMP/pw-fenced-after.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xi) a FENCED quotation of a ref does not switch the cross-check off — the live absence claim is still REFUSED (got $rc)"
+{ printf '# a brief\n\n```\n'
+  sed -n '/^## PREVIOUS WORK/,/^PRIOR:/p' "$CANON"
+  printf '```\n'; } > "$TMP/pw-only-fenced.txt"
+bash "$GATE" --missing "$TMP/pw-only-fenced.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(xii) a PREVIOUS WORK block that exists ONLY inside a fence is QUOTED, not claimed — the section is still missing"
+# …and the four-column carrier, which is the same quote in CommonMark's other spelling.
+awk '{ print "    " $0 }' "$TMP/pw-contradicted.txt" > "$TMP/pw-indented.txt"
+bash "$GATE" --missing "$TMP/pw-indented.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(xiii) …and an INDENTED copy (a code block) is quoted too, so the whole brief is refused as having no section"
+# ── THE DIAGNOSTIC VERB MUST AGREE WITH THE GATE (fresh-context review of #3484, P2). `--missing` is
+# what an author iterates with; reading stdin twice made it report "complete, rc=0" for a brief `--check`
+# refuses on the SAME bytes.
+miss="$(bash "$GATE" --missing - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(xiv) --missing on STDIN sees the SAME body --check does (no second EOF reader)"
+bash "$GATE" --check - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xiv-b) …and --check on the same bytes refuses it, so (xiv) is not a green over a broken pipe (got $rc)"
+
 # ── NON-VACUITY: remove the check and the arms above go green.
 MUT_PW="$TMP/mutant-pw.sh"
 sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"

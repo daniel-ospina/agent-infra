@@ -793,6 +793,15 @@ case_O() {
   ckg "O: the record CARRIES the WIP line" "wip=refs/wip/issue-9501-first-attempt @" "$rec"
   ckg "O: …and the next-actor instruction" "wip_next_actor=read that before starting" "$rec"
   ckg "O: --records prints it for the lane that comes back" "wip=refs/wip/issue-9501-first-attempt" "$(cr --records)"
+
+  # ── A RELATIVE `CLAIM_REPO` IS STILL MEASURED (fresh-context review of #3484, P2). `claims.sh`
+  # supports `CLAIM_REPO="."` for a caller standing at a work-tree root, and the handover line resolves
+  # the repository from a NEUTRAL cwd; `.` resolved from /tmp names a different tree, so the line read
+  # UNMEASURED on a box whose origin answered fine. Measured before the fix; this arm pins the cure.
+  W_REL="$(cd "$WS/work" && env CLAIM_REPO=. bash -c '. "$1"; claim_wip_line 9501' _ "$HERE/claims.sh" 2>/dev/null)"
+  ckg "O: a RELATIVE CLAIM_REPO ('.') still finds the refs/wip snapshot" "refs/wip/issue-9501-first-attempt" "$W_REL"
+  case "$W_REL" in *UNMEASURED*) bad "O: …and it is not reported UNMEASURED (the repository was resolvable)" ;; *) ok "O: …and it is not reported UNMEASURED (the repository was resolvable)" ;; esac
+
   # ⛔ UNMEASURED IS NOT "NONE" (#3382 invariant 1). A box where refs/wip cannot be read must say so;
   # rendering it as "none" would be the false-clean this tool refuses everywhere else. The state is
   # reached the way a box reaches it: the tool installed WITHOUT `brief-gate.sh` beside it.
@@ -856,10 +865,15 @@ mutate_to() { # <gate> <out-file>
   case "$g" in wip) fn="cr_wip_evidence" ;; *) fn="cr_gate_$g" ;; esac
   awk -v fn="$fn" -v g="$g" '
     $0 == fn "() {" { print fn "() { return 0; } # MUT-ANCHOR:" g; skip = 1; n++; next }
-    skip == 1 && index($0, "} # MUT-ANCHOR:") == 1 { skip = 0; next }
+    skip == 1 && index($0, "} # MUT-ANCHOR:") == 1 { skip = 0; t++; next }
     skip == 1 { next }
     { print }
-    END { if (n != 1) exit 3 }' "$CR_BIN" > "$out" || return 1
+    # ⛔ BOTH ENDS ARE ASSERTED (fresh-context review of #3484, P1). Without the terminator count, a
+    # function that forgot its `} # MUT-ANCHOR:` silently swallowed EVERY REMAINING LINE of the tool:
+    # the `wip` mutant became a 616-line file with no `cr_judge` and no release loop, so its case went
+    # RED because the program could not run — a mutation that proves nothing, reported as proof. A
+    # missing anchor is a failure of THIS driver, in either direction.
+    END { if (n != 1 || t != 1) exit 3 }' "$CR_BIN" > "$out" || return 1
   bash -n "$out" 2>/dev/null || return 1
   chmod +x "$out" 2>/dev/null || return 1   # an unexecutable copy fails with EACCES, which reads as
                                             # "the gate held" if only the assertions are inspected

@@ -2069,7 +2069,12 @@ claim_wip_line() {
     printf 'UNMEASURED (brief-gate.sh is not beside this registry, so refs/wip cannot be read for #%s)' "$issue"
     return 0
   fi
-  out="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && bash "$bg" --wip-refs "$issue" "${CLAIM_REPO:-}" 2>/dev/null)"; rc=$?
+  # ⛔ ABSOLUTISE BEFORE THE NEUTRAL-cwd `cd` (fresh-context review of #3484, P2). This registry
+  # supports `CLAIM_REPO="."` (a caller standing at a work-tree root); resolved from `/tmp` that path
+  # names a DIFFERENT tree, so the clause read UNMEASURED on a box whose origin answered fine.
+  local repo_abs=""
+  [ -n "${CLAIM_REPO:-}" ] && repo_abs="$(cd "$CLAIM_REPO" 2>/dev/null && pwd)"
+  out="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && bash "$bg" --wip-refs "$issue" "$repo_abs" 2>/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     printf 'UNMEASURED (refs/wip could not be read for #%s — unknown is not zero)' "$issue"
     return 0

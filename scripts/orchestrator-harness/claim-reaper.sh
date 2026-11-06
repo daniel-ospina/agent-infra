@@ -629,7 +629,13 @@ cr_wip_evidence() {
   fi
   # ⛔ THE PROBES RUN FROM A NEUTRAL CWD, for the reason gate 6 states: a child that inherited an
   # issue-named cwd would carry the issue in the census this tool reads.
-  refs="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && bash "$brief" --wip-refs "$CR_ISSUE" "${CLAIM_REPO:-}" 2>/dev/null)"; rc=$?
+  # ⛔ THE REPOSITORY IS ABSOLUTISED BEFORE THE NEUTRAL-cwd `cd` (fresh-context review of #3484, P2).
+  # `claims.sh` supports `CLAIM_REPO="."`, and `.` resolved from `/tmp` names a different tree —
+  # measured: the handover line read UNMEASURED on a box whose origin answered fine. Absent/unresolvable
+  # stays EMPTY, so the probe still abstains rather than measuring the wrong repository.
+  local repo_abs=""
+  [ -n "${CLAIM_REPO:-}" ] && repo_abs="$(cd "$CLAIM_REPO" 2>/dev/null && pwd)"
+  refs="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && bash "$brief" --wip-refs "$CR_ISSUE" "$repo_abs" 2>/dev/null)"; rc=$?
   if [ "$rc" -ne 0 ]; then
     CR_WIP="UNMEASURED (refs/wip could not be read for #$CR_ISSUE — unknown is not zero)"
     return 0
@@ -643,8 +649,8 @@ cr_wip_evidence() {
   # gate already over-matches, and a checkout named after the issue is the likeliest place a
   # predecessor's half-finished tree still sits. Best-effort — an unreadable listing omits this half.
   wt=""; dirty=""
-  if [ -n "${CLAIM_REPO:-}" ] && [ -d "$CLAIM_REPO" ]; then
-    wt="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && git -C "$CLAIM_REPO" worktree list --porcelain 2>/dev/null \
+  if [ -n "$repo_abs" ] && [ -d "$repo_abs" ]; then
+    wt="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && git -C "$repo_abs" worktree list --porcelain 2>/dev/null \
           | awk -v n="$CR_ISSUE" '/^worktree /{ p = substr($0, 10); if (p ~ ("(^|[^0-9])" n "([^0-9]|$)")) print p }' | head -1)"
     if [ -n "$wt" ] && [ -d "$wt" ]; then
       hits="$(cd "${TMPDIR:-/tmp}" 2>/dev/null && GIT_OPTIONAL_LOCKS=0 git -C "$wt" status --porcelain -uall 2>/dev/null | grep -c '' 2>/dev/null)"
@@ -661,7 +667,7 @@ cr_wip_evidence() {
   CR_WIP="${line:-no refs/wip ref found}${wt:+; worktree $wt}"
   CR_WIP_NEXT="read that before starting — do not re-derive it"
   return 0
-}
+} # MUT-ANCHOR:wip
 
 # ── judgement ───────────────────────────────────────────────────────────────────────────────────
 # cr_judge <ref> <sha> — fill the CR_* facts, then run the evidence gates in order.

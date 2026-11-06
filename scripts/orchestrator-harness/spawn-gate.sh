@@ -2456,6 +2456,7 @@ terminal_wip_rescue() {
   local label="${1:-agent}" rc="${2:-0}" cap="${3:-0}" log="${4:-/dev/null}"
   local root out outf rc2 slug br note st_out st_rc head_ok unpushed=0 unpushed_ok=1 unpushed_col=0 at_risk=0 l local_ref=""
   local local_ref_before="" local_ref_after=""
+  local _slug_resc=""   # #3484: resolved inside the loop; declared here so it does not leak to the caller
   local st_errf="" st_noise=0 st_note="" cv_status=0 root_top root_real root_top_real why=""
   root="${WIP_PATH:-$PWD}"
   LANE_END_TREE=""; LANE_END_RESCUE=""; LANE_END_REF=""; LANE_END_UNPUSHED=0; LANE_END_ROOT="$root"
