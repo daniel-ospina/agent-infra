@@ -3422,5 +3422,31 @@ done
 ck "N45c …and every push verdict the CODE can assign is in the matrix's list, derived from source (${n45_derived_count:-$(printf '%s\n' $n45_derived | wc -l | tr -d ' ')} values${n45_missing:+, MISSING:$n45_missing}) — so a new verdict cannot be forgotten the way this one was" $n45_bad3
 echo
 
+# ── PW1 THE WRITE AND THE READ-BACK DERIVE THE SAME REF (#3484) ───────────────────────────────────
+# ⛔ THE DEFECT THIS WOULD HAVE CAUGHT. `bg-rescue-wip.sh` now names a ref after the ISSUE
+# (`fix/4242-first-attempt` → `refs/wip/issue-4242-first-attempt`), but the exit path in `spawn-gate.sh`
+# computed its own slug from the branch (`fix-4242-first-attempt`). The read-back would then name a ref
+# nobody wrote: the lane-end ledger's `rescue=`/`ref=` columns would point at nothing while the real
+# archive sat on origin — the exact "released and unrecorded" shape #3484 removes, one layer down. The
+# slug now has ONE home (`bg-rescue-wip.sh --slug`), and this arm drives the real path on an
+# ISSUE-NAMED branch to prove the two sides agree.
+git -C "$WT" checkout -q -b fix/4242-first-attempt 2>/dev/null
+git -C "$WT" push -q -u origin fix/4242-first-attempt 2>/dev/null
+pi_stub dirty
+: > "$O/logs/lane.log"
+PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+  drive "$GATE" 300 "issue-shaped" >/dev/null 2>&1
+arm "$O/logs/lane.log"
+PW_REF="$(git -C "$BARE" for-each-ref --format='%(refname)' 'refs/wip/*' 2>/dev/null | grep -c 'refs/wip/issue-4242-first-attempt$' || true)"
+ck "PW1 an ISSUE-NAMED branch rescues to a ref that carries the issue (refs/wip/issue-4242-first-attempt)" \
+   $([ "${PW_REF:-0}" = "1" ] && echo 0 || echo 1)
+grep -q 'rescue=refs/wip/issue-4242-first-attempt' "$O/logs/lane.log"; rc=$?
+ck "PW2 …and the exit path's OWN record names THAT ref — its read-back is not derived from a divergent copy" $rc
+grep -q 'ref=refs/wip-local/issue-4242-first-attempt@' "$O/logs/lane.log"; rc=$?
+ck "PW3 …including the local pin, so the ledger names a ref this run really wrote" $rc
+grep -q 'ref=refs/wip-local/fix-4242-first-attempt@' "$O/logs/lane.log"; rc=$?
+ck "PW4 NON-VACUITY: the exit path does NOT name the branch-mangled ref the old divergent copy produced" \
+   $([ "$rc" -ne 0 ] && echo 0 || echo 1)
+
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
 [ "$FAIL" -eq 0 ]

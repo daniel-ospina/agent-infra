@@ -315,11 +315,18 @@ brief_gate_repo() { # brief_gate_repo [explicit]
 # `<ref>\t<sha12>` per line on stdout.
 # Exit: 0 the remote answered (an EMPTY answer is a real answer: no ref for this issue), 2 UNMEASURED
 #       (no repository, no issue, or `git ls-remote` could not answer — never a pass, never "none").
-# ⛔ THE MATCH IS THE DECLARED NAMING RULE, AND IT IS LOOSE ON PURPOSE. `bg-rescue-wip.sh` now names a
-# new ref `refs/wip/issue-<N>-<slug>`, but the 222 archives that already exist are named from the
-# BRANCH (`fix-3442`, `ai-3194`, `fix-3442-nonvacuity`), so a strict prefix match would report every
-# one of them as unlinked and the reader would be blind to the whole population it exists for. A ref
-# matches when its slug carries <N> as a STANDALONE number token — which both families do.
+# ⛔ THE MATCH IS THE DECLARED NAMING RULE — AND IT IS LITERALLY THE ONE #3382 ALREADY PUBLISHES.
+# `refs/wip/<slug>` belongs to issue N iff N is a HYPHEN-DELIMITED SEGMENT of <slug>
+# (`ai-3194` -> yes; `ai-31940` -> no; `fix-3442-nonvacuity` -> yes). That is verbatim
+# `mcp-servers/orchestrator/server.py`'s `match_rule` (`str(issue) in slug.split("-")`), so the typed
+# saved-work tool and this gate cannot disagree about which snapshots belong to an issue. Written as a
+# segment comparison rather than a substring test on purpose: a substring would over-match
+# (`fix-4242a`) and the two surfaces would then answer the same question differently.
+# The rule is deliberately LOOSE about the prefix, because the 222 archives that already exist are
+# named from the BRANCH (`fix-3442`, `ai-3194`, `fix-3442-nonvacuity`): a strict `issue-<N>-` prefix
+# match would report every one of them as unlinked and the reader would be blind to the whole
+# population it exists for. `bg-rescue-wip.sh` now writes the `issue-<N>-` form for new rescues — which
+# this rule also matches, so both families are covered by one rule.
 brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
   local issue="${1:-}" repo="${2:-}" out rc
   case "$issue" in ''|*[!0-9]*) printf '[brief-gate] --wip-refs needs an ISSUE NUMBER (got "%s")\n' "$issue" >&2; return 2 ;; esac
@@ -342,7 +349,8 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
   printf '%s\n' "$out" | awk -v n="$issue" '
     NF >= 2 && $2 ~ /^refs\/wip\// {
       slug = $2; sub(/^refs\/wip\//, "", slug)
-      if (slug ~ ("(^|[^0-9])" n "([^0-9]|$)")) printf "%s\t%s\n", $2, substr($1, 1, 12)
+      k = split(slug, seg, "-")
+      for (i = 1; i <= k; i++) if (seg[i] == n) { printf "%s\t%s\n", $2, substr($1, 1, 12); break }
     }'
   return 0
 }

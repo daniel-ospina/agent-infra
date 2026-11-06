@@ -2590,7 +2590,16 @@ terminal_wip_rescue() {
   fi
   br="$(git -C "$root" branch --show-current 2>/dev/null)"
   [ -n "$br" ] || br="detached-$(git -C "$root" rev-parse --short HEAD 2>/dev/null || echo unborn)"
-  slug="$(printf '%s' "$br" | tr '/' '-')"
+  # ⛔ THE REF SLUG HAS ONE HOME (#3484): the tool that WRITES the ref derives it, and this exit path
+  # ASKS rather than deriving it again. A divergent copy here (it was `tr '/' '-'`) named
+  # `refs/wip-local/fix-4242-x` while the rescue wrote `refs/wip-local/issue-4242-x`, so the lane-end
+  # ledger's `rescue=`/`ref=` columns pointed at a ref nobody created — the "released and unrecorded"
+  # shape #3484 removes, one layer down. The fallback is only for a box whose rescuer is too old to
+  # answer `--slug`; on such a box the rescue is the branch-mangled form too, so the two still agree.
+  _slug_resc="$(wip_rescue_path 2>/dev/null || true)"
+  slug=""
+  [ -n "$_slug_resc" ] && slug="$(bash "$_slug_resc" --slug "$br" 2>/dev/null)"
+  case "${slug:-}" in ''|*' '*|*/*) slug="$(printf '%s' "$br" | tr '/' '-')" ;; esac
   # ── the DURABLE exit artifact (see the note beside LANE_END_BRANCH) ─────────────────────────────
   # These reads are all LOCAL and already taken above; the only network call is the push, and it is
   # reached only when the measurement says commits exist nowhere but this disk.
