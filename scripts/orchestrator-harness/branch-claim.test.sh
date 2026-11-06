@@ -255,6 +255,7 @@ lease_arm() { # <label> <expected-seconds> <lease_until-epoch>
 }
 BR_LEASE=integration/lease-default
 BR_LEASE_CEIL=integration/lease-ceiling
+BR_LEASE_FALLBACK=integration/lease-fallback
 BR_LEASE_KNOB=integration/lease-knob
 BR_LEASE_KNOB_DEF=integration/lease-knob-default
 NOW=$(date +%s)
@@ -262,12 +263,34 @@ acquire_from owner "$BR_LEASE"
 eq "acquire with NO explicit ttl succeeds" "$?" "0"
 L1="$(lease_of refs/claims/branch-integration-lease-default)"
 if [ -n "$L1" ]; then lease_arm "the DEFAULT lease is the branch key's own 14400s, not the PR claim's 1800s" 14400 "$L1"; else bad "no lease_until on the default-acquire claim ref"; fi
+# ⛔ AND THE CORE'S OWN `dflt` ARGUMENT (review of this change, P2). `claim_branch_acquire` passes
+# FOUR things to `_claim_acquire_at` — ref, ttl, dflt, max — and the arm above pins only the
+# CALLER-side default (`${3:-$CLAIM_BRANCH_TTL}`). Nothing pinned arg 3, which is what an UNPARSEABLE
+# ttl falls back to (`claims.sh`: `''|*[!0-9]*|0?*) ttl="$dflt"`); measured, changing arg 3 alone to
+# `$CLAIM_TTL` left THIS SUITE 44/0 and `claim-orphan.test.sh` 138/0 — both fully green. That is the
+# same class this case exists to remove, one level down, and it is REACHABLE: `branch-claim.sh`'s
+# `cmd_acquire` passes the CLI ttl through unvalidated (`acquire <branch> 07`), so a typo would hand a
+# live batch the PR claim's 1800s term. The issue keying's equivalent property is already pinned next
+# door (`claim-orphan.test.sh`, "an unparseable ttl falls back to the ISSUE default … never the PR's
+# shorter one"); the branch keying was the one left out.
+NOW=$(date +%s)
+acquire_from owner "$BR_LEASE_FALLBACK" 07
+L1B="$(lease_of refs/claims/branch-integration-lease-fallback)"
+if [ -n "$L1B" ]; then lease_arm "an UNPARSEABLE ttl falls back to the BRANCH default (14400s), never the PR claim's 1800s" 14400 "$L1B"; else bad "no lease_until on the unparseable-ttl claim ref"; fi
 # ⛔ THE CEILING ARM. An explicit over-ceiling request must clamp to THIS KEY's ceiling (14400) and say
 # so — not to CLAIM_TTL_MAX (9600). A clamp to 9600 shreds 33 % of a batch's term (14400 -> 9600).
 NOW=$(date +%s)
-acquire_from owner "$BR_LEASE_CEIL" 999999
-grep -q 'exceeds this keying ceiling' "$T/acq.out" && ok "an over-ceiling ttl is clamped LOUDLY, not silently" \
-  || bad "no clamp warning for an over-ceiling branch ttl: $(cat "$T/acq.out")"
+# ⛔ THE WARNING MUST BE ON STDERR, AND THAT IS ASSERTED ON THE STREAM ITSELF (review of this change,
+# P3). `acquire_from` merges `2>&1` into `$T/acq.out`, so it proves only that SOME stream carries the
+# warning while this case's stated subject is "clamped LOUDLY on stderr". Measured: deleting `>&2`
+# from the clamp left this suite 44/0 — and stderr is the ONLY stream that survives the shipped call
+# site, because `merge-one.sh` runs its acquire with `>/dev/null`: a stdout warning would be
+# completely invisible in the log, which is the one consequence this bound must never hide. So the
+# streams are split for this arm, then recombined so every later assertion still reads `acq.out`.
+( cd "$T/owner" && "$BC" acquire "$BR_LEASE_CEIL" 999999 >"$T/acq.stdout" 2>"$T/acq.stderr" )
+cat "$T/acq.stderr" "$T/acq.stdout" >"$T/acq.out"
+grep -q 'exceeds this keying ceiling' "$T/acq.stderr" && ok "an over-ceiling ttl is clamped LOUDLY on STDERR (the stream merge-one cannot discard)" \
+  || bad "the clamp warning is NOT on stderr — merge-one runs the acquire with stdout discarded, so it would be silent: $(cat "$T/acq.stdout")"
 # ⛔ AND IT MUST NOT NAME ANOTHER KEYING'S KNOB AS THE CEILING (review round 2, P2; round 5 widened
 # it). The warning used to read "(CLAIM_TTL_MAX/CLAIM_ISSUE_TTL = 14400s)" — for a branch key BOTH
 # names are wrong (9600 / 18000), so a fixer was sent to raise a knob that is not the ceiling. Two

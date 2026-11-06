@@ -3647,8 +3647,12 @@ head; `fix-one.sh` takes the **same** claim on the current head for the fixer's 
 releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim left two boxes free
 to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
 cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
-**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
-reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
+**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + _gw + 300` for the
+reviewer (`_gw` is the gate wait, `GATE_POLL_TRIES` x `GATE_POLL_SECS`, 900 s at the defaults) and
+`FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. *(Corrected: this sentence said
+`REVIEW_TIMEOUT + 1200` for the reviewer. The two forms agree only at the default gate wait — 1800 +
+900 + 300 = 1800 + 1200 = 3000 s — so on a box with `GATE_POLL_SECS=60` the code leases 3900 s while
+a reader computed 3000 s. Same stale derivation as the paragraph on the ceiling, ~140 lines below.)*
 
 #### Selection consults the registry, and an unreadable registry is not freedom (agent-infra#2466)
 

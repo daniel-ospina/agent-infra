@@ -1258,8 +1258,10 @@ REV_STARTED=1
 # "would produce a 7200 s reviewer holding a claim that expires at 6000". That arithmetic is from when
 # `CLAIM_TTL_MAX` was 7200; #2999 raised it to 9600, so the threshold is 8400 at the default gate wait
 # and the conclusion was false on both of its numbers — a 7200 s bound yields an 8400 s lease, which
-# is NOT clamped at all. It is the same stale-9600 arithmetic this PR corrects in `claims.sh` and its
-# README, in the third place it was live. What is true now: the 7200 s backstop is INSIDE the
+# is NOT clamped at all. It is the same stale-9600 arithmetic this PR corrects in `claims.sh` and in
+# BOTH of the README's statements of the derivation (the ceiling paragraph and, since review round 12,
+# the `REVIEW_TIMEOUT + 1200` form in the registry section — a count is not given here, because the
+# round that wrote "the third place" left a fourth live in `claim-orphan.test.sh`). What is true now: the 7200 s backstop is INSIDE the
 # headroom at the default gate wait (8400 <= 9600), so the clamp is no longer the reason this bound
 # stays at 1800 — raising it is simply a change nobody has made. The two numbers are still one
 # decision (raise `CLAIM_TTL_MAX` with the reviewer bound, in one change, with `claim-orphan.test.sh`
