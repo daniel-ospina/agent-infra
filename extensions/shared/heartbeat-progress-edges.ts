@@ -998,7 +998,8 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
     axis: "retention",
-    guardedBy: NONE,
+    guardedBy:
+      "scripts/pi-reap-worktrees.test.sh §G2aa (the archive sink is BOUNDED) — a dated dir older than the floor is PRUNED by `--apply` (and only REPORTED by a dry run), a RECENT dated dir survives, a non-date name and a MALFORMED/prefixed date-shaped name are left alone (only an exact `YYYY-MM-DD` is ever a candidate), `0` keeps EVERYTHING (disabled, not everything-expired), and a non-numeric value is REFUSED by seam validation at exit 2 with the seam NAMED and nothing pruned; the same bound is driven on the FALLBACK root, which is where writes land when the configured root is full or read-only",
     note: "#3405 review round 2 — the ARCHIVE bound on the reclaim path: a reclaimed worktree's evidence is copied into a dated archive, and only subdirectories strictly older than this many days are swept (0 disables the sweep entirely). It is a retention bound in the same family as REAP_WT_AGED_DAYS / REAP_WT_MERGED_AGE_DAYS above, so it is REGISTERED rather than exempted — a reader must be able to see the archive's retention move. It was missing from this registry when the bound shipped, which is why `verify`'s reverse scan failed on main for EVERY PR: the declaration landed, the registration did not, so a base-owned failure on a single unregistered constant held every open PR to a red check none of them caused.",
   },
   {
